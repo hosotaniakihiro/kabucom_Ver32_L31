@@ -1,0 +1,453 @@
+# ============================================================
+# File   : AI/entry_gate.py
+# Version: Ver26.28-FINAL-ENTRY-GATE-EARLY-SCALP-3M5M-CONF-INTEGRATED
+# ------------------------------------------------------------
+# ✔ ENTRY 最終ゲート（唯一の判断場所）
+# ✔ 副作用ゼロ（pending_entries を絶対に触らない）
+# ✔ 戻り値は AI_RESULT 固定スキーマ
+# ✔ score → 構造 → 流動性 → RANKING → MTF → 即益 → 勢い
+# ✔ → confidence → 3m/5m補正 → bias → lot
+# ✔ SUMMARY / RANKING / EARLY_SCALP を source で完全分離
+# ✔ ranking_score_direct を hard gate + final_score に直結
+# ✔ EARLY_SCALP は AI を BLOCK 専用で使用
+# ✔ None / NaN / 未供給フィールド完全防御
+# ============================================================
+
+import logging
+import math
+import datetime as dt
+
+from AI.predict_mtf import predict_mtf
+from AI.train.entry.entry_immediate_profit import predict_immediate_profit
+from AI.inference.ranking_entry_predictor import (
+    predict_entry as predict_ranking_entry,
+)
+
+# ------------------------------------------------------------
+# ranking score direct
+# ------------------------------------------------------------
+from AI.features.ranking_score_direct import build_ranking_direct_score
+
+# ------------------------------------------------------------
+# confidence bias（実損益ベース）
+# ------------------------------------------------------------
+try:
+    from AI.confidence.confidence_bias import apply_confidence_bias
+except Exception:
+    apply_confidence_bias = None
+
+# ------------------------------------------------------------
+# EARLY SCALP config
+# ------------------------------------------------------------
+try:
+    from config.early_scalp_config import EARLY_SCALP_CONFIG
+except Exception:
+    EARLY_SCALP_CONFIG = None
+
+from config import global_config
+from global_state import global_data
+
+logger = logging.getLogger(__name__)
+_WARNED_MISSING_RANKING_FIELDS = set()
+
+
+# ============================================================
+# helpers
+# ============================================================
+
+def _cfg(key: str, default):
+    try:
+        return global_config.get(key, default)
+    except Exception:
+        return default
+
+
+def _safe_float(v, default: float = 0.0) -> float:
+    try:
+        v = float(v)
+        return v if math.isfinite(v) else default
+    except Exception:
+        return default
+
+
+def _norm_side(v):
+    if v is None:
+        return None
+    try:
+        s = str(v).upper()
+    except Exception:
+        return None
+    return s if s in ("BUY", "SELL") else None
+
+
+def _is_market_open(now: dt.datetime | None = None) -> bool:
+    now = now or dt.datetime.now()
+    t = now.time()
+    return (
+        (dt.time(9, 0) <= t <= dt.time(11, 30)) or
+        (dt.time(12, 30) <= t <= dt.time(15, 30))
+    )
+
+
+def _warn_missing_ranking_field(symbol: str, field: str, row: dict):
+    key = (symbol, field)
+    if key in _WARNED_MISSING_RANKING_FIELDS:
+        return
+    _WARNED_MISSING_RANKING_FIELDS.add(key)
+    logger.warning(
+        "[RANKING FEATURE MISSING] symbol=%s field=%s source=%s keys=%s",
+        symbol,
+        field,
+        row.get("source"),
+        sorted(row.keys()),
+    )
+
+
+# ============================================================
+# AI RESULT schema
+# ============================================================
+
+def _block(reason: str, confidence: float = 0.0, model_used: str = "NONE") -> dict:
+    return {
+        "allow": False,
+        "confidence": float(confidence),
+        "reason": str(reason),
+        "model_used": model_used,
+    }
+
+
+def _allow(
+    *,
+    confidence: float,
+    lot_multiplier: float,
+    reason: str,
+    model_used: str,
+) -> dict:
+    return {
+        "allow": True,
+        "confidence": float(confidence),
+        "lot_multiplier": float(lot_multiplier),
+        "reason": str(reason),
+        "model_used": model_used,
+    }
+
+
+# ============================================================
+# ranking momentum boost（confidence 専用）
+# ============================================================
+
+def _ranking_momentum_boost(row: dict) -> float:
+    rsi = _safe_float(row.get("ranking_rsi"))
+    rsi_prev = _safe_float(row.get("ranking_rsi_prev"), rsi)
+
+    ma5 = _safe_float(row.get("ranking_ma5"))
+    ma25 = _safe_float(row.get("ranking_ma25"))
+
+    rsi_level = 1.10 if rsi >= 70 else 1.05 if rsi >= 60 else 1.00 if rsi >= 50 else 0.90
+    rsi_delta = rsi - rsi_prev
+    rsi_slope = 1.05 if rsi_delta >= 2.0 else 0.95 if rsi_delta <= -2.0 else 1.00
+
+    if ma5 > 0 and ma25 > 0:
+        ma_trend = 1.05 if ma5 >= ma25 else 0.95
+        ma_diff_boost = min(1.10, 1.0 + abs(ma5 - ma25) / max(ma25, 1e-6))
+    else:
+        ma_trend = ma_diff_boost = 1.00
+
+    boost = rsi_level * rsi_slope * ma_trend * ma_diff_boost
+    return max(0.80, min(1.30, boost))
+
+
+# ============================================================
+# EARLY SCALP 判定（独立・BLOCK専用）
+# ============================================================
+
+def _early_scalp_entry_ok(row: dict) -> tuple[bool, str]:
+    if not EARLY_SCALP_CONFIG:
+        return False, "early_cfg_missing"
+
+    e = EARLY_SCALP_CONFIG["ENTRY"]
+
+    volume_speed = _safe_float(row.get("volume_speed"))
+    fast_return = _safe_float(row.get("fast_return"))
+    price = _safe_float(row.get("close_price") or row.get("price"))
+    vwap = _safe_float(row.get("vwap"))
+    ma5 = _safe_float(row.get("ma5"))
+    spread = _safe_float(row.get("spread"))
+
+    if volume_speed < e["MIN_VOLUME_SPEED"]:
+        return False, "es_volume_low"
+    if fast_return < e["MIN_FAST_RETURN"]:
+        return False, "es_fast_return_low"
+    if e["REQUIRE_ABOVE_VWAP"] and price < vwap:
+        return False, "es_below_vwap"
+    if e["REQUIRE_ABOVE_MA5"] and price < ma5:
+        return False, "es_below_ma5"
+    if spread > e["MAX_SPREAD"]:
+        return False, "es_spread_wide"
+
+    return True, "early_scalp_ok"
+
+def apply_mtf_boost(entry_row, mtf_summary):
+
+    symbol = entry_row["symbol"]
+
+    mtf_score = 0.0
+    if symbol in mtf_summary:
+        mtf_score = mtf_summary[symbol]["mtf_score"]
+
+    # 攻撃型倍率
+    boost = 1 + (mtf_score * 0.05)
+
+    entry_row["final_score"] *= boost
+    entry_row["mtf_boost"] = boost
+
+    return entry_row
+
+# ============================================================
+# ENTRY FINAL GATE
+# ============================================================
+
+def ai_final_entry_check(row: dict) -> dict:
+
+    if not isinstance(row, dict):
+        return _block("invalid_row")
+
+    symbol = str(row.get("symbol") or "")
+    if not symbol:
+        return _block("no_symbol")
+
+    interval = int(row.get("interval") or 1)
+    raw_source = str(row.get("source") or "SUMMARY").upper()
+
+    # ========================================================
+    # EARLY SCALP（最初に分岐）
+    # ========================================================
+    if raw_source == "EARLY_SCALP":
+
+        ok, reason = _early_scalp_entry_ok(row)
+        if not ok:
+            return _block(reason, 0.0, "EARLY_SCALP_RULE")
+
+        feats = getattr(global_data, "latest_features", {}).get(symbol)
+
+        if feats:
+            imm_p = _safe_float(predict_immediate_profit(feats), 1.0)
+            if imm_p < 0.4:
+                return _block("es_immediate_low", imm_p, "IMMEDIATE")
+
+        return _allow(
+            confidence=0.65,
+            lot_multiplier=EARLY_SCALP_CONFIG["RISK"]["LOT_RATIO"],
+            reason="early_scalp_entry",
+            model_used="EARLY_SCALP",
+        )
+
+    # ========================================================
+    # SUMMARY / RANKING
+    # ========================================================
+    source = "RANKING" if raw_source == "RANKING" else "SUMMARY"
+    is_ranking = source == "RANKING"
+
+    if is_ranking:
+        MIN_SCORE = _cfg("MIN_ENTRY_SCORE_RANKING", 2)
+        MIN_TURNOVER = _cfg("MIN_TURNOVER_RANKING", 1_000_000)
+        MIN_DOM = _cfg("MIN_DOMINANT_RATIO_RANKING", 0.0)
+        MIN_MTF = _cfg("MIN_MTF_CONFIDENCE_RANKING", 0.55)
+        MIN_RANK_SCORE = _cfg("MIN_RANKING_DIRECT_SCORE", 0.15)
+    else:
+        MIN_SCORE = _cfg("MIN_ENTRY_SCORE", 5)
+        MIN_TURNOVER = _cfg("MIN_TURNOVER_1M", 3_000_000)
+        MIN_DOM = _cfg("MIN_DOMINANT_RATIO_SUMMARY", 0.58)
+        MIN_MTF = _cfg("MIN_MTF_CONFIDENCE", 0.55)
+
+    # ========================================================
+    # NaN完全防御 score取得
+    # ========================================================
+    def _safe_int(v):
+        try:
+            if v is None:
+                return 0
+            if isinstance(v, float):
+                if v != v:  # NaN
+                    return 0
+            return int(v)
+        except Exception:
+            return 0
+
+    buy_score = _safe_int(row.get("buy_score"))
+    sell_score = _safe_int(row.get("sell_score"))
+    total_score = _safe_int(row.get("score_total"))
+
+    score_total = (
+        total_score
+        if is_ranking
+        else max(
+            buy_score,
+            sell_score,
+            total_score,
+        )
+    )
+
+    turnover = _safe_float(row.get("turnover"))
+    dominant_ratio = _safe_float(row.get("dominant_ratio"))
+
+    if score_total < MIN_SCORE:
+        return _block("score_low", score_total)
+
+    if interval == 1 and _is_market_open() and turnover < MIN_TURNOVER:
+        return _block("low_turnover", 0.0, "TURNOVER")
+
+    if dominant_ratio < MIN_DOM:
+        return _block("dominant_low", dominant_ratio)
+
+    decision = _norm_side(row.get("entry_decision") or row.get("side"))
+    dominant_side = _norm_side(row.get("dominant_side"))
+
+    if not decision:
+        return _block("decision_none")
+
+    if dominant_side and decision != dominant_side:
+        return _block("direction_mismatch")
+
+    # ========================================================
+    # RANKING AI
+    # ========================================================
+    ranking_conf = 1.0
+
+    if is_ranking:
+        try:
+            r = predict_ranking_entry(row)
+
+            if r.get("action") and r.get("action") != decision:
+                return _block(
+                    "ranking_ai_mismatch",
+                    r.get("confidence"),
+                    "RANKING_LGBM",
+                )
+
+            ranking_conf = _safe_float(r.get("confidence"), 1.0)
+
+        except Exception as e:
+            logger.warning("[RANKING AI SKIP] %s: %s", symbol, e)
+
+    # ========================================================
+    # MTF AI
+    # ========================================================
+    mtf_conf = 1.0
+
+    if not (source == "SUMMARY" and interval == 1):
+
+        pred = predict_mtf(
+            symbol,
+            row.get("close_price"),
+            interval,
+            row.get("datetime"),
+        )
+
+        mtf_conf = _safe_float(
+            pred.get("prob_up" if decision == "BUY" else "prob_down")
+        )
+
+        if mtf_conf < MIN_MTF:
+            return _block("mtf_low", mtf_conf, "MTF")
+
+    # ========================================================
+    # IMMEDIATE PROFIT AI
+    # ========================================================
+    feats = getattr(global_data, "latest_features", {}).get(symbol)
+
+    immediate_p = (
+        _safe_float(predict_immediate_profit(feats), 1.0)
+        if feats
+        else 1.0
+    )
+
+    # ========================================================
+    # RANKING DIRECT SCORE
+    # ========================================================
+    ranking_score_final = 0.0
+
+    if is_ranking:
+
+        rank_feats = {
+
+            "ranking_session_rank_ret":
+                _safe_float(row.get("ranking_session_rank_ret")),
+
+            "ranking_session_quality":
+                _safe_float(row.get("ranking_session_quality"), 0.3),
+
+            "ranking_mtf_alignment":
+                _safe_float(row.get("ranking_mtf_alignment")),
+        }
+
+        pack = build_ranking_direct_score(rank_feats)
+
+        ranking_score_final = _safe_float(
+            pack.get("ranking_score_final")
+        )
+
+        if ranking_score_final < MIN_RANK_SCORE:
+            return _block(
+                "ranking_direct_low",
+                ranking_score_final,
+                "RANKING_DIRECT",
+            )
+
+    # ========================================================
+    # momentum boost
+    # ========================================================
+    momentum_boost = _ranking_momentum_boost(row) if is_ranking else 1.0
+
+    final_conf = (
+        dominant_ratio
+        * ranking_conf
+        * mtf_conf
+        * immediate_p
+        * momentum_boost
+    )
+
+    # ========================================================
+    # 3m / 5m confidence補正
+    # ========================================================
+    score_3m = _safe_float(row.get("score_3m"))
+    score_5m = _safe_float(row.get("score_5m"))
+
+    if score_3m >= 4.0:
+        final_conf *= 1.10
+
+    if score_5m >= 3.5:
+        final_conf *= 1.10
+
+    final_conf = min(final_conf, 1.50)
+
+    # ========================================================
+    # confidence bias
+    # ========================================================
+    if apply_confidence_bias:
+        try:
+            final_conf = apply_confidence_bias(
+                symbol=symbol,
+                confidence=final_conf,
+            )
+        except Exception:
+            pass
+
+    lot_multiplier = max(0.5, min(2.0, 0.5 + final_conf))
+
+    return _allow(
+        confidence=final_conf,
+        lot_multiplier=lot_multiplier,
+        reason=(
+            f"rankScore={ranking_score_final:.3f}|"
+            f"mtf={mtf_conf:.2f}|"
+            f"rank={ranking_conf:.2f}|"
+            f"imm={immediate_p:.2f}|"
+            f"dom={dominant_ratio:.2f}|"
+            f"boost={momentum_boost:.2f}|"
+            f"3m={score_3m:.2f}|"
+            f"5m={score_5m:.2f}|"
+            f"src={source}"
+        ),
+        model_used=("RANKING_LGBM+MTF" if is_ranking else "MTF"),
+    )
