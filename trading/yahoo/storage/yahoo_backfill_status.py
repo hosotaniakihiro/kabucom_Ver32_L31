@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/yahoo/storage/yahoo_backfill_status.py
-# Version: PRODUCTION-STABLE-REV1.1-YAHOO-BACKFILL-STATUS-DB-DATED
+# Version: PRODUCTION-STABLE-REV1.2-YAHOO-BACKFILL-STATUS-LOCK-SAFE-BDAY
 # ------------------------------------------------------------
 # 【概要】
 #   Yahoo補完の取得状態を日付別DBで管理する。
@@ -27,38 +27,275 @@
 #       error TEXT
 #       updated_at TEXT
 #       PRIMARY KEY(symbol, trade_date)
+#
+# 【REV1.2 修正】
+#   ✔ sqlite database is locked 対策
+#      - busy_timeout
+#      - WAL
+#      - retry
+#      - locked時だけsleepして再試行
+#   ✔ trade_date を営業日に正規化
+#      - 土日祝日なら直近営業日へ寄せる
+#      - 例: 20260503(日) -> 20260501(金)
+#   ✔ ensure / read / write / delete 全体に lock-safe 接続を適用
 # ============================================================
 
 from __future__ import annotations
 
 import os
+import time
 import sqlite3
 import logging
 import datetime as dt
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Callable, TypeVar
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_DIR = r"\\192.168.0.22\AutoStockBuyAndSell"
 
+SQLITE_TIMEOUT_SEC = 30.0
+SQLITE_BUSY_TIMEOUT_MS = 30000
+SQLITE_RETRY_MAX = 6
+SQLITE_RETRY_BASE_SLEEP_SEC = 0.25
+
+_T = TypeVar("_T")
+
+
+# ============================================================
+# lock helpers
+# ============================================================
+
+def _is_sqlite_locked_error(e: Exception) -> bool:
+    s = str(e).lower()
+    return (
+        "database is locked" in s
+        or "database table is locked" in s
+        or "database schema is locked" in s
+        or "locked" in s
+    )
+
+
+def _connect(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(
+        db_path,
+        timeout=SQLITE_TIMEOUT_SEC,
+        isolation_level=None,
+    )
+
+    try:
+        conn.execute(f"PRAGMA busy_timeout={int(SQLITE_BUSY_TIMEOUT_MS)}")
+    except Exception:
+        pass
+
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        # NAS上や既存接続状態によって失敗することがあるため落とさない
+        pass
+
+    try:
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass
+
+    return conn
+
+
+def _with_sqlite_retry(
+    *,
+    label: str,
+    db_path: str,
+    fn: Callable[[sqlite3.Connection], _T],
+    retry_max: int = SQLITE_RETRY_MAX,
+    base_sleep: float = SQLITE_RETRY_BASE_SLEEP_SEC,
+) -> Optional[_T]:
+    """
+    SQLite処理を lock-safe に実行する。
+
+    - database is locked の時だけ retry
+    - それ以外の sqlite error は即ログして None
+    - fn内で commit する想定でも、ここで最後にcommit保険をかける
+    """
+    last_err: Exception | None = None
+
+    for attempt in range(1, int(retry_max) + 1):
+        conn: sqlite3.Connection | None = None
+
+        try:
+            conn = _connect(db_path)
+
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as e:
+                # BEGINでlockedになることが多い
+                if _is_sqlite_locked_error(e):
+                    raise
+                # 読み取り系などでBEGIN不要な場合の保険
+                pass
+
+            ret = fn(conn)
+
+            try:
+                conn.commit()
+            except Exception:
+                pass
+
+            return ret
+
+        except sqlite3.OperationalError as e:
+            last_err = e
+
+            try:
+                if conn is not None:
+                    conn.rollback()
+            except Exception:
+                pass
+
+            if _is_sqlite_locked_error(e):
+                sleep_sec = float(base_sleep) * attempt
+                logger.warning(
+                    "[YAHOO BACKFILL STATUS] sqlite locked retry label=%s attempt=%s/%s sleep=%.2fs db=%s err=%s",
+                    label,
+                    attempt,
+                    retry_max,
+                    sleep_sec,
+                    db_path,
+                    e,
+                )
+                time.sleep(sleep_sec)
+                continue
+
+            logger.exception(
+                "[YAHOO BACKFILL STATUS] sqlite operational error label=%s db=%s",
+                label,
+                db_path,
+            )
+            return None
+
+        except Exception as e:
+            last_err = e
+
+            try:
+                if conn is not None:
+                    conn.rollback()
+            except Exception:
+                pass
+
+            logger.exception(
+                "[YAHOO BACKFILL STATUS] sqlite operation failed label=%s db=%s",
+                label,
+                db_path,
+            )
+            return None
+
+        finally:
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+
+    logger.error(
+        "[YAHOO BACKFILL STATUS] sqlite retry exhausted label=%s db=%s err=%s",
+        label,
+        db_path,
+        last_err,
+    )
+    return None
+
+
+# ============================================================
+# date helpers
+# ============================================================
+
+def _parse_ymd_to_date(value: dt.date | str | None) -> Optional[dt.date]:
+    if value is None:
+        return None
+
+    if isinstance(value, dt.datetime):
+        return value.date()
+
+    if isinstance(value, dt.date):
+        return value
+
+    s = str(value).strip()
+
+    if not s:
+        return None
+
+    s = s.replace("-", "").replace("/", "")[:8]
+
+    try:
+        return dt.datetime.strptime(s, "%Y%m%d").date()
+    except Exception:
+        return None
+
+
+def _to_business_trade_date(d: dt.date) -> dt.date:
+    """
+    trade_date を営業日に正規化する。
+    土日祝日なら直近営業日へ寄せる。
+    """
+    try:
+        from utils.business_day_utils import is_business_day, get_previous_business_day
+
+        if is_business_day(d):
+            return d
+
+        return get_previous_business_day(d)
+
+    except Exception:
+        # business_day_utilsが使えない場合は土日だけ最低限補正
+        try:
+            if d.weekday() < 5:
+                return d
+
+            x = d
+            while x.weekday() >= 5:
+                x -= dt.timedelta(days=1)
+            return x
+        except Exception:
+            return d
+
+
+def _normalize_trade_date(
+    trade_date: dt.date | str | None = None,
+    *,
+    normalize_to_business_day: bool = True,
+) -> str:
+    """
+    trade_date を YYYYMMDD に正規化する。
+
+    REV1.2:
+      normalize_to_business_day=True の場合、
+      土日祝日は直近営業日に寄せる。
+    """
+    d = _parse_ymd_to_date(trade_date)
+
+    if d is None:
+        try:
+            from utils.business_day_utils import get_effective_trade_date_for_startup
+
+            d = get_effective_trade_date_for_startup()
+        except Exception:
+            d = dt.date.today()
+
+    if normalize_to_business_day:
+        d2 = _to_business_trade_date(d)
+        if d2 != d:
+            logger.info(
+                "[YAHOO BACKFILL STATUS] trade_date normalized to business day: %s -> %s",
+                d.strftime("%Y%m%d"),
+                d2.strftime("%Y%m%d"),
+            )
+        d = d2
+
+    return d.strftime("%Y%m%d")
+
 
 # ============================================================
 # path helpers
 # ============================================================
-
-def _normalize_trade_date(trade_date: dt.date | str | None = None) -> str:
-    if trade_date is None:
-        return dt.date.today().strftime("%Y%m%d")
-
-    if isinstance(trade_date, dt.date):
-        return trade_date.strftime("%Y%m%d")
-
-    s = str(trade_date).strip()
-    if not s:
-        return dt.date.today().strftime("%Y%m%d")
-
-    return s.replace("-", "").replace("/", "")
-
 
 def get_yahoo_status_db_path(
     trade_date: dt.date | str | None = None,
@@ -75,10 +312,12 @@ def _normalize_symbol(symbol: object) -> str:
         return ""
 
     s = str(symbol).strip()
+
     if not s:
         return ""
 
     s = s.replace(".T", "").replace(".JP", "").strip()
+
     if s.endswith(".0"):
         s = s[:-2]
 
@@ -91,8 +330,10 @@ def _normalize_symbols(symbols: Iterable[object]) -> list[str]:
 
     for s in symbols or []:
         ns = _normalize_symbol(s)
+
         if not ns or ns in seen:
             continue
+
         seen.add(ns)
         out.append(ns)
 
@@ -125,7 +366,8 @@ def ensure_yahoo_backfill_status_db(
     trade_date: dt.date | str | None = None,
     base_dir: str = DEFAULT_BASE_DIR,
 ) -> str:
-    db_path = get_yahoo_status_db_path(trade_date=trade_date, base_dir=base_dir)
+    tdate = _normalize_trade_date(trade_date)
+    db_path = get_yahoo_status_db_path(trade_date=tdate, base_dir=base_dir)
 
     sql_table = """
     CREATE TABLE IF NOT EXISTS yahoo_backfill_status (
@@ -152,22 +394,24 @@ def ensure_yahoo_backfill_status_db(
     ON yahoo_backfill_status(status)
     """
 
-    try:
-        with sqlite3.connect(db_path, timeout=30) as conn:
-            conn.execute("PRAGMA busy_timeout=30000")
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute(sql_table)
-            conn.execute(sql_index1)
-            conn.execute(sql_index2)
-            conn.commit()
+    def _op(conn: sqlite3.Connection) -> bool:
+        conn.execute(sql_table)
+        conn.execute(sql_index1)
+        conn.execute(sql_index2)
+        return True
 
+    ok = _with_sqlite_retry(
+        label="ensure_db",
+        db_path=db_path,
+        fn=_op,
+    )
+
+    if ok:
         logger.info("[YAHOO BACKFILL STATUS] ensured db=%s", db_path)
-        return db_path
+    else:
+        logger.error("[YAHOO BACKFILL STATUS] ensure db failed path=%s", db_path)
 
-    except Exception:
-        logger.exception("[YAHOO BACKFILL STATUS] ensure db failed path=%s", db_path)
-        return db_path
+    return db_path
 
 
 # ============================================================
@@ -218,31 +462,37 @@ def upsert_backfill_status(
         updated_at         = excluded.updated_at
     """
 
-    try:
-        with sqlite3.connect(db_path, timeout=30) as conn:
-            conn.execute("PRAGMA busy_timeout=30000")
-            conn.execute(sql, (
-                sym,
-                tdate,
-                int(full_day_done or 0),
-                status,
-                _to_dt_str(last_downloaded_at),
-                _to_dt_str(last_bar_datetime),
-                int(rows or 0),
-                error,
-                _utc_now_str(),
-            ))
-            conn.commit()
+    params = (
+        sym,
+        tdate,
+        int(full_day_done or 0),
+        status,
+        _to_dt_str(last_downloaded_at),
+        _to_dt_str(last_bar_datetime),
+        int(rows or 0),
+        error,
+        _utc_now_str(),
+    )
 
+    def _op(conn: sqlite3.Connection) -> bool:
+        conn.execute(sql, params)
         return True
 
-    except Exception:
-        logger.exception(
-            "[YAHOO BACKFILL STATUS] upsert failed symbol=%s trade_date=%s",
-            sym,
-            tdate,
-        )
-        return False
+    ok = _with_sqlite_retry(
+        label=f"upsert_status:{sym}:{tdate}",
+        db_path=db_path,
+        fn=_op,
+    )
+
+    if ok:
+        return True
+
+    logger.error(
+        "[YAHOO BACKFILL STATUS] upsert failed after retry symbol=%s trade_date=%s",
+        sym,
+        tdate,
+    )
+    return False
 
 
 def mark_backfill_success(
@@ -254,6 +504,7 @@ def mark_backfill_success(
     base_dir: str = DEFAULT_BASE_DIR,
 ) -> int:
     normalized = _normalize_symbols(symbols)
+
     if not normalized:
         return 0
 
@@ -272,6 +523,7 @@ def mark_backfill_success(
             error=None,
             base_dir=base_dir,
         )
+
         if ok:
             done += 1
 
@@ -291,6 +543,7 @@ def mark_backfill_failed(
     base_dir: str = DEFAULT_BASE_DIR,
 ) -> int:
     normalized = _normalize_symbols(symbols)
+
     if not normalized:
         return 0
 
@@ -309,6 +562,7 @@ def mark_backfill_failed(
             error=error,
             base_dir=base_dir,
         )
+
         if ok:
             done += 1
 
@@ -327,6 +581,7 @@ def mark_backfill_pending(
     base_dir: str = DEFAULT_BASE_DIR,
 ) -> int:
     normalized = _normalize_symbols(symbols)
+
     if not normalized:
         return 0
 
@@ -345,6 +600,7 @@ def mark_backfill_pending(
             error=None,
             base_dir=base_dir,
         )
+
         if ok:
             done += 1
 
@@ -376,31 +632,28 @@ def get_backfilled_symbols(
       AND status = 'success'
     """
 
+    def _op(conn: sqlite3.Connection) -> list[tuple]:
+        return conn.execute(sql, (tdate,)).fetchall()
+
+    rows = _with_sqlite_retry(
+        label=f"get_backfilled_symbols:{tdate}",
+        db_path=db_path,
+        fn=_op,
+    )
+
     out: set[str] = set()
 
-    try:
-        with sqlite3.connect(db_path, timeout=30) as conn:
-            conn.execute("PRAGMA busy_timeout=30000")
-            rows = conn.execute(sql, (tdate,)).fetchall()
+    for row in rows or []:
+        sym = _normalize_symbol(row[0] if row else None)
+        if sym:
+            out.add(sym)
 
-        for row in rows:
-            sym = _normalize_symbol(row[0] if row else None)
-            if sym:
-                out.add(sym)
-
-        logger.info(
-            "[YAHOO BACKFILL STATUS] loaded success symbols=%s trade_date=%s",
-            len(out),
-            tdate,
-        )
-        return out
-
-    except Exception:
-        logger.exception(
-            "[YAHOO BACKFILL STATUS] load success symbols failed trade_date=%s",
-            tdate,
-        )
-        return set()
+    logger.info(
+        "[YAHOO BACKFILL STATUS] loaded success symbols=%s trade_date=%s",
+        len(out),
+        tdate,
+    )
+    return out
 
 
 def get_failed_symbols(
@@ -418,26 +671,23 @@ def get_failed_symbols(
       AND status = 'failed'
     """
 
+    def _op(conn: sqlite3.Connection) -> list[tuple]:
+        return conn.execute(sql, (tdate,)).fetchall()
+
+    rows = _with_sqlite_retry(
+        label=f"get_failed_symbols:{tdate}",
+        db_path=db_path,
+        fn=_op,
+    )
+
     out: set[str] = set()
 
-    try:
-        with sqlite3.connect(db_path, timeout=30) as conn:
-            conn.execute("PRAGMA busy_timeout=30000")
-            rows = conn.execute(sql, (tdate,)).fetchall()
+    for row in rows or []:
+        sym = _normalize_symbol(row[0] if row else None)
+        if sym:
+            out.add(sym)
 
-        for row in rows:
-            sym = _normalize_symbol(row[0] if row else None)
-            if sym:
-                out.add(sym)
-
-        return out
-
-    except Exception:
-        logger.exception(
-            "[YAHOO BACKFILL STATUS] load failed symbols failed trade_date=%s",
-            tdate,
-        )
-        return set()
+    return out
 
 
 def get_pending_symbols(
@@ -456,26 +706,23 @@ def get_pending_symbols(
       AND full_day_done = 0
     """
 
+    def _op(conn: sqlite3.Connection) -> list[tuple]:
+        return conn.execute(sql, (tdate,)).fetchall()
+
+    rows = _with_sqlite_retry(
+        label=f"get_pending_symbols:{tdate}",
+        db_path=db_path,
+        fn=_op,
+    )
+
     out: set[str] = set()
 
-    try:
-        with sqlite3.connect(db_path, timeout=30) as conn:
-            conn.execute("PRAGMA busy_timeout=30000")
-            rows = conn.execute(sql, (tdate,)).fetchall()
+    for row in rows or []:
+        sym = _normalize_symbol(row[0] if row else None)
+        if sym:
+            out.add(sym)
 
-        for row in rows:
-            sym = _normalize_symbol(row[0] if row else None)
-            if sym:
-                out.add(sym)
-
-        return out
-
-    except Exception:
-        logger.exception(
-            "[YAHOO BACKFILL STATUS] load pending symbols failed trade_date=%s",
-            tdate,
-        )
-        return set()
+    return out
 
 
 def get_status_rows(
@@ -502,26 +749,29 @@ def get_status_rows(
     ORDER BY symbol
     """
 
+    def _op(conn: sqlite3.Connection) -> tuple[list[str], list[tuple]]:
+        cur = conn.execute(sql, (tdate,))
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+        return cols, rows
+
+    ret = _with_sqlite_retry(
+        label=f"get_status_rows:{tdate}",
+        db_path=db_path,
+        fn=_op,
+    )
+
     out: list[dict] = []
 
-    try:
-        with sqlite3.connect(db_path, timeout=30) as conn:
-            conn.execute("PRAGMA busy_timeout=30000")
-            cur = conn.execute(sql, (tdate,))
-            cols = [d[0] for d in cur.description]
-            rows = cur.fetchall()
-
-        for row in rows:
-            out.append(dict(zip(cols, row)))
-
+    if not ret:
         return out
 
-    except Exception:
-        logger.exception(
-            "[YAHOO BACKFILL STATUS] load status rows failed trade_date=%s",
-            tdate,
-        )
-        return []
+    cols, rows = ret
+
+    for row in rows:
+        out.append(dict(zip(cols, row)))
+
+    return out
 
 
 # ============================================================
@@ -538,11 +788,13 @@ def restore_backfilled_symbols_to_runtime(
     """
     tdate = _normalize_trade_date(trade_date)
     symbols = get_backfilled_symbols(trade_date=tdate, base_dir=base_dir)
+
     if not symbols:
         return 0
 
     try:
         from trading.ranking.runtime_symbols import mark_yahoo_backfilled
+
         mark_yahoo_backfilled(symbols, target_date=tdate)
 
         logger.info(
@@ -563,16 +815,23 @@ def restore_backfilled_symbols_to_runtime(
 def _to_datetime_or_none(value) -> Optional[dt.datetime]:
     if value is None:
         return None
+
     if isinstance(value, dt.datetime):
         return value.replace(second=0, microsecond=0)
+
     if isinstance(value, dt.date):
         return dt.datetime.combine(value, dt.time.min)
+
     try:
-        import pandas as pd  # local import to keep this module lightweight
+        import pandas as pd
+
         ts = pd.to_datetime(value, errors="coerce")
+
         if pd.isna(ts):
             return None
+
         return ts.to_pydatetime().replace(second=0, microsecond=0)
+
     except Exception:
         return None
 
@@ -584,15 +843,17 @@ def get_status_map(
 ) -> dict[str, dict]:
     """
     symbol -> status row の辞書を返す。
-    Yahoo補完では「一度成功したら終了」ではなく、last_bar_datetime を見て
-    20分遅れの到達時刻まで追いついているかを判定するために使う。
     """
     rows = get_status_rows(trade_date=trade_date, base_dir=base_dir)
+
     out: dict[str, dict] = {}
+
     for row in rows:
         sym = _normalize_symbol(row.get("symbol"))
+
         if sym:
             out[sym] = row
+
     return out
 
 
@@ -607,23 +868,20 @@ def compute_download_target_symbols(
     """
     Yahoo取得対象を返す。
 
-    旧仕様:
-      当日ランキング銘柄 - DB上の success 銘柄
-      → 一度成功すると、その後の20分遅れ更新対象から外れてしまう。
-
-    新仕様:
-      target_end_dt がある場合は、当日ランキング銘柄のうち
+    target_end_dt がある場合:
       last_bar_datetime < target_end_dt - fresh_margin_minutes の銘柄を返す。
-      つまり、一度成功しても Yahoo の20分遅れ到達時刻まで未反映なら再取得する。
 
-    target_end_dt がない場合だけ、後方互換として旧仕様を使う。
+    target_end_dt がない場合:
+      後方互換として success済み銘柄を除外する。
     """
     tdate = _normalize_trade_date(trade_date)
     ranking_set = set(_normalize_symbols(ranking_symbols))
+
     if not ranking_set:
         return set()
 
     target_end = _to_datetime_or_none(target_end_dt)
+
     if target_end is None:
         done_set = get_backfilled_symbols(trade_date=tdate, base_dir=base_dir)
         return ranking_set - done_set
@@ -632,13 +890,16 @@ def compute_download_target_symbols(
     status_map = get_status_map(trade_date=tdate, base_dir=base_dir)
 
     targets: set[str] = set()
+
     for sym in ranking_set:
         row = status_map.get(sym)
+
         if not row:
             targets.add(sym)
             continue
 
         last_bar = _to_datetime_or_none(row.get("last_bar_datetime"))
+
         if last_bar is None or last_bar < threshold:
             targets.add(sym)
 
@@ -650,6 +911,7 @@ def compute_download_target_symbols(
         threshold,
         tdate,
     )
+
     return targets
 
 
@@ -667,26 +929,25 @@ def delete_trade_date(
 
     sql = "DELETE FROM yahoo_backfill_status WHERE trade_date = ?"
 
-    try:
-        with sqlite3.connect(db_path, timeout=30) as conn:
-            conn.execute("PRAGMA busy_timeout=30000")
-            cur = conn.execute(sql, (tdate,))
-            conn.commit()
-            count = cur.rowcount if cur.rowcount is not None else 0
+    def _op(conn: sqlite3.Connection) -> int:
+        cur = conn.execute(sql, (tdate,))
+        return int(cur.rowcount if cur.rowcount is not None else 0)
 
-        logger.warning(
-            "[YAHOO BACKFILL STATUS] deleted rows=%s trade_date=%s",
-            count,
-            tdate,
-        )
-        return int(count)
+    count = _with_sqlite_retry(
+        label=f"delete_trade_date:{tdate}",
+        db_path=db_path,
+        fn=_op,
+    )
 
-    except Exception:
-        logger.exception(
-            "[YAHOO BACKFILL STATUS] delete trade_date failed trade_date=%s",
-            tdate,
-        )
-        return 0
+    count = int(count or 0)
+
+    logger.warning(
+        "[YAHOO BACKFILL STATUS] deleted rows=%s trade_date=%s",
+        count,
+        tdate,
+    )
+
+    return count
 
 
 __all__ = [

@@ -578,12 +578,12 @@ def _http_json_request(
             except Exception:
                 content = raw.decode("utf-8", errors="ignore")
 
-            logger.info(
+            """logger.info(
                 "[SUB MANAGER] HTTP %s ok url=%s status=%s",
                 method,
                 url,
                 getattr(res, "status", None),
-            )
+            )"""
             return True, content
 
     except urllib.error.HTTPError as e:
@@ -601,14 +601,14 @@ def _http_json_request(
             except Exception:
                 content = str(e)
 
-        logger.warning(
+        """logger.warning(
             "[SUB MANAGER] HTTP %s failed url=%s code=%s reason=%s content=%r",
             method,
             url,
             getattr(e, "code", None),
             getattr(e, "reason", None),
             content,
-        )
+        )"""
         return False, content
 
     except Exception as e:
@@ -716,12 +716,12 @@ def run_register_chunks(
         "Symbols": make_symbol_objects(normalized, exchange=exchange),
     }
 
-    logger.info(
+    """logger.info(
         "[SUB MANAGER] HTTP register size=%d head=%s url=%s",
         len(normalized),
         normalized[:10],
         url,
-    )
+    )"""
 
     ok, content = _http_json_request(
         url=url,

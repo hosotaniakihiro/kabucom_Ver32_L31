@@ -56,7 +56,7 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_TOP_N = 10
+DEFAULT_TOP_N = 20
 DEFAULT_MIN_BUY_SCORE = 5.0
 DEFAULT_MAX_SELL_SCORE = 2.0
 DEFAULT_MIN_VOLUME = 1.0

@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/ws_callbacks.py
-# Version: Ver1.2-PUSH-STREAM-WS-CALLBACKS-5SEC-BAR
+# Version: Ver1.3-PUSH-STREAM-WS-CALLBACKS-5SEC-BAR-LATEST-PRICE-CACHE
 # ------------------------------------------------------------
 # 【概要】
 #   PUSH WebSocket callback。
@@ -9,6 +9,11 @@
 #   ✔ PUSH row 正規化直後に5秒足生成を接続
 #   ✔ 5秒足はENTRY/SUMMARYには使わず EXIT 用にGC.monitorへ保存
 #   ✔ 失敗してもPUSH処理本体は止めない
+#
+# 【REV1.3】
+#   ✔ PUSH row 正規化直後に latest_price_cache を更新
+#   ✔ EXIT 5秒監視が global_data.latest_price_map から現在値を取得可能
+#   ✔ latest_price_cache 失敗でもPUSH処理本体は止めない
 # ============================================================
 
 from __future__ import annotations
@@ -49,6 +54,35 @@ def _safe_row_head(row: Any) -> str:
         return f"type={type(row).__name__}"
     except Exception:
         return "unknown"
+
+
+# ============================================================
+# 最新価格キャッシュ更新
+# ============================================================
+
+def _update_latest_price_cache_safe(row: dict) -> None:
+    """
+    PUSH row から最新価格キャッシュを更新する。
+
+    重要:
+      - global_data.latest_price_map / latest_tick_map へ保存
+      - EXIT 5秒監視がここを見る
+      - DB保存前に更新するため反応が早い
+      - 失敗してもPUSH処理本体は止めない
+    """
+    try:
+        if not isinstance(row, dict):
+            return
+
+        from trading.push.latest_price_cache import update_latest_price_from_push
+
+        update_latest_price_from_push(row, source="push_stream")
+
+    except Exception:
+        logger.exception(
+            "[PUSH PRICE CACHE] update from push_stream row failed row=%s",
+            _safe_row_head(row),
+        )
 
 
 # ============================================================
@@ -108,6 +142,13 @@ def on_message(ws: websocket.WebSocketApp, message: Any) -> None:
                 _safe_payload_head(payload),
             )
             return
+
+        # ----------------------------------------------------
+        # 最新価格キャッシュ更新
+        # PUSH受信直後に global_data.latest_price_map へ保存する。
+        # EXIT 5秒監視が最新価格をすぐ使えるようにする。
+        # ----------------------------------------------------
+        _update_latest_price_cache_safe(row)
 
         # ----------------------------------------------------
         # 5秒足生成
