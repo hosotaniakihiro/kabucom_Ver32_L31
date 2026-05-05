@@ -6,6 +6,7 @@
 # ✔ 列ズレ完全防止
 # ✔ NULL / 空補完
 # ✔ production safe
+# ✔ ChatGPT write permission test
 # ============================================================
 
 import sqlite3
