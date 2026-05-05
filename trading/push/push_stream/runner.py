@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/runner.py
-# Version: Ver1.3-PRODUCTION-PUSH-STREAM-RUNNER-AUTO-REFRESH-CALLABLE
+# Version: Ver1.4-PRODUCTION-PUSH-STREAM-RUNNER-ROTATION-CORE
 # ------------------------------------------------------------
 # 【概要】
 #   kabu Station PUSH WebSocket runner
@@ -10,7 +10,7 @@
 #   - on_open / on_message / on_error / on_close callback 接続
 #   - PUSH queue flush worker 起動
 #   - monitor worker 起動
-#   - rotation worker 起動
+#   - rotation_core worker 起動
 #   - stream writer / order book writer 初期化
 #   - runtime flags / status 管理
 #
@@ -26,6 +26,11 @@
 #   ✔ push_stream 側では ws.send 登録を行わず、登録更新は
 #     subscription_manager に委譲する設計を維持
 #   ✔ trading/push/push_stream/core.py が無い構成でも動作
+#
+# 【REV1.4】
+#   ✔ rotation.py ではなく rotation_core.py の薄い制御本体を起動
+#   ✔ rotation_settings / rotation_symbols / rotation_register / rotation_logging
+#     への段階的分割構成へ移行
 # ============================================================
 
 from __future__ import annotations
@@ -55,13 +60,13 @@ from .transport import (
 from .dataframe import _init_ring_buffer
 from .writers import _init_stream_writer, _init_order_book_writer, _flush_worker
 from .monitor import _monitor_worker
-from .rotation import _rotation_worker, enable_rotation
+from .rotation_core import _rotation_worker, enable_rotation
 from .ws_callbacks import on_open, on_message, on_error, on_close
 from .constants import RECONNECT_WAIT_SEC
 
 logger = logging.getLogger(__name__)
 
-VERSION = "Ver1.3-PRODUCTION-PUSH-STREAM-RUNNER-AUTO-REFRESH-CALLABLE"
+VERSION = "Ver1.4-PRODUCTION-PUSH-STREAM-RUNNER-ROTATION-CORE"
 
 
 # ============================================================
