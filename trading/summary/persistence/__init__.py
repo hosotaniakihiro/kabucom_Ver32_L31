@@ -1,20 +1,14 @@
 # ============================================================
-# File   : trading/ranking/summary/persistence/__init__.py
-# Version: PRODUCTION-COMPAT-RANKING-SUMMARY-PERSISTENCE-EXPORT-V2
+# File   : trading/summary/persistence/__init__.py
+# Version: PRODUCTION-COMPAT-SUMMARY-PERSISTENCE-EXPORT-V3-DAILY-MTF-PATCH
 # ------------------------------------------------------------
 # Purpose:
-#   trading.ranking.summary.__init__ / runner / bootstrap から参照される
-#   save_ranking_summary 系APIを互換exportする。
+#   - 既存互換APIを維持する
+#   - summary_saver_bulk 読み込み時に日足MA-MTFパッチを自動インストールする
 #
-# Fix:
-#   ImportError:
-#     cannot import name 'save_ranking_summary'
-#     from trading.ranking.summary.persistence
-#
-# Policy:
-#   - 既存実装があればそれを優先
-#   - なければ database.crud.crud_ranking_summary へフォールバック
-#   - さらに失敗しても import 自体は落とさない
+# Notes:
+#   - 元ファイルには ranking summary persistence 互換exportが含まれていたため維持
+#   - 日足MA-MTFパッチは失敗しても import 自体を落とさない
 # ============================================================
 
 from __future__ import annotations
@@ -27,6 +21,35 @@ from typing import Any, Optional
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# daily MA-MTF patch bootstrap
+# ============================================================
+
+def _install_daily_mtf_patch_on_import() -> None:
+    """
+    summary_saver_bulk の bulk_upsert_summary / save_summary_bulk / save_summary_df を
+    日足MA-MTF付与版へ安全にラップする。
+
+    ここで失敗しても、既存のsummary保存処理は止めない。
+    """
+    try:
+        from trading.summary.mtf.daily_mtf_summary_patch import (
+            install_daily_mtf_summary_patch,
+        )
+
+        ok = install_daily_mtf_summary_patch()
+        if ok:
+            logger.warning("[SUMMARY PERSISTENCE] daily MA-MTF patch installed")
+        else:
+            logger.warning("[SUMMARY PERSISTENCE] daily MA-MTF patch not installed")
+
+    except Exception:
+        logger.exception("[SUMMARY PERSISTENCE] daily MA-MTF patch install failed")
+
+
+_install_daily_mtf_patch_on_import()
 
 
 # ============================================================
@@ -94,7 +117,6 @@ def _call_backend_safely(backend, df: pd.DataFrame, **kwargs: Any) -> Any:
         return backend(df, **call_kwargs)
 
     except TypeError:
-        # 旧実装向け
         try:
             return backend(df)
         except Exception:
@@ -128,11 +150,6 @@ def save_ranking_summary(
 
     既存 runner / __init__ / bootstrap がこの名前を import するため、
     必ずこの関数を公開する。
-
-    Returns
-    -------
-    int
-        保存行数。失敗時は 0。
     """
     if df is None:
         logger.warning("[ranking.summary.persistence] save skipped df=None")
@@ -183,9 +200,6 @@ def save_ranking_summary_df(
     *args: Any,
     **kwargs: Any,
 ) -> int:
-    """
-    別名互換。
-    """
     return save_ranking_summary(df, *args, **kwargs)
 
 
@@ -194,9 +208,6 @@ def persist_ranking_summary(
     *args: Any,
     **kwargs: Any,
 ) -> int:
-    """
-    別名互換。
-    """
     return save_ranking_summary(df, *args, **kwargs)
 
 
@@ -205,9 +216,6 @@ def save(
     *args: Any,
     **kwargs: Any,
 ) -> int:
-    """
-    短縮名互換。
-    """
     return save_ranking_summary(df, *args, **kwargs)
 
 
