@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/constants.py
-# Version: Ver1.0-PUSH-STREAM-CONSTANTS
+# Version: Ver1.1-PUSH-STREAM-CONSTANTS-ROTATION-4P8
 # ============================================================
 
 DEFAULT_WS_URL = "ws://localhost:18080/kabusapi/websocket"
@@ -18,4 +18,7 @@ MAX_RAW_LOG_CHARS = 1200
 
 DEFAULT_REGISTER_CHUNK_SIZE = 50
 DEFAULT_REGISTER_MAX_SYMBOLS = 100
-DEFAULT_ROTATE_WAIT_SEC = 5.0
+
+# PUSHローテーションのデフォルト登録維持時間。
+# 50銘柄登録 -> 4.8秒維持 -> 全解除 -> 0.2秒待機 -> 次の50銘柄登録、を想定する。
+DEFAULT_ROTATE_WAIT_SEC = 4.8
