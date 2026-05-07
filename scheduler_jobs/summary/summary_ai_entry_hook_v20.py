@@ -1,6 +1,6 @@
 # ============================================================
 # File   : scheduler_jobs/summary/summary_ai_entry_hook_v20.py
-# Version: PRODUCTION-STABLE-SUMMARY-AI-ENTRY-HOOK-V22-AI-NG-DIAG
+# Version: PRODUCTION-STABLE-SUMMARY-AI-ENTRY-HOOK-V23-TONOSAMA-OFF
 # ------------------------------------------------------------
 # Purpose:
 #   - 定時サマリー計算後のAI判定hook
@@ -9,10 +9,12 @@
 #   - AI前段で候補が全消えしないよう、pre slope filter は既定OFF
 #   - min_buy_score 既定を 5.0 -> 4.0 に緩和
 #   - AI_OK=0 の原因を reason/confidence/symbol 単位でログ出力する
+#   - 通常SUMMARY/PUSH/Yahoo由来では tonosama filter を既定OFF
 #
 # Notes:
 #   - 既存 summary_ai_entry_hook.py は長大なので壊さず残す
 #   - runner_core.py / ranking_summary_jobs.py からこの軽量hookを呼ぶ
+#   - 殿様イナゴは別ルートで動かし、通常SUMMARY AI entryには混ぜない
 # ============================================================
 
 from __future__ import annotations
@@ -76,9 +78,22 @@ def _safe_min_slope() -> float:
 
 
 def _effective_use_tonosama_filter(source: str) -> bool:
+    """
+    通常SUMMARY/PUSH/Yahoo由来のAI entryでは tonosama filter を既定OFFにする。
+
+    理由:
+      - PUSHサマリーAI entryの候補抽出前に殿様フィルタを通すと、
+        候補が絞られすぎる・DB参照で重くなる・AI DIAGまで進みにくい。
+      - 殿様イナゴは別ルートで検知/AI判定へ回す方が安定する。
+
+    明示的に戻したい場合だけ:
+      SUMMARY_AI_ENTRY_USE_TONOSAMA_FILTER=1
+    """
     if _is_ranking_source(source):
         return False
-    return env_bool("SUMMARY_AI_ENTRY_USE_TONOSAMA_FILTER", True)
+    if _is_tonosama_source(source):
+        return True
+    return env_bool("SUMMARY_AI_ENTRY_USE_TONOSAMA_FILTER", False)
 
 
 def _effective_use_pre_slope_filter(source: str) -> bool:
@@ -117,7 +132,7 @@ def _resolve_runner() -> Optional[Callable[..., Any]]:
             if callable(fn):
                 _RUNNER_CACHE = fn
                 logger.warning(
-                    "[summary.runners] AI hook v22 runner resolved %s.%s file=%s",
+                    "[summary.runners] AI hook v23 runner resolved %s.%s file=%s",
                     module_name,
                     func_name,
                     getattr(mod, "__file__", None),
@@ -125,13 +140,13 @@ def _resolve_runner() -> Optional[Callable[..., Any]]:
                 return fn
         except Exception:
             logger.debug(
-                "[summary.runners] AI hook v22 runner resolve failed %s.%s",
+                "[summary.runners] AI hook v23 runner resolve failed %s.%s",
                 module_name,
                 func_name,
                 exc_info=True,
             )
 
-    logger.error("[summary.runners] AI hook v22 runner resolve failed all candidates")
+    logger.error("[summary.runners] AI hook v23 runner resolve failed all candidates")
     return None
 
 
@@ -250,8 +265,6 @@ def _diagnose_ai_entry_result(
     try:
         cand_rows = _records_any(candidates, limit=60)
         result_rows = _records_any(ai_results, limit=120)
-        ok_rows = _records_any(ai_ok, limit=60)
-        sell_ok_rows = _records_any(sell_ai_ok, limit=60)
         exec_dict = execution if isinstance(execution, dict) else {}
 
         reason_counter: Counter[str] = Counter()
@@ -389,7 +402,7 @@ def run_summary_ai_entry_safe(
     try:
         if not env_bool("SUMMARY_AI_ENTRY_ENABLED", True):
             logger.info(
-                "[summary.runners] summary AI entry v22 skipped interval=%s source=%s reason=disabled_env",
+                "[summary.runners] summary AI entry v23 skipped interval=%s source=%s reason=disabled_env",
                 interval,
                 source_s,
             )
@@ -397,7 +410,7 @@ def run_summary_ai_entry_safe(
 
         if df is None or not isinstance(df, pd.DataFrame) or not is_nonempty_df(df):
             logger.warning(
-                "[summary.runners] summary AI entry v22 skipped interval=%s source=%s reason=empty_or_invalid_df type=%s",
+                "[summary.runners] summary AI entry v23 skipped interval=%s source=%s reason=empty_or_invalid_df type=%s",
                 interval,
                 source_s,
                 type(df).__name__,
@@ -407,7 +420,7 @@ def run_summary_ai_entry_safe(
         fn = _resolve_runner()
         if not callable(fn):
             logger.warning(
-                "[summary.runners] summary AI entry v22 skipped interval=%s source=%s reason=runner_unavailable",
+                "[summary.runners] summary AI entry v23 skipped interval=%s source=%s reason=runner_unavailable",
                 interval,
                 source_s,
             )
@@ -459,7 +472,7 @@ def run_summary_ai_entry_safe(
         call_kwargs = _filter_kwargs(fn, kwargs)
 
         logger.warning(
-            "[summary.runners] summary AI entry v22 start interval=%s source=%s rows=%s runner=%s top_n=%s dry_run=%s require_market_open=%s min_conf=%.2f min_buy=%.2f max_sell=%.2f tonosama=%s pre_slope=%s min_slope=%.4f",
+            "[summary.runners] summary AI entry v23 start interval=%s source=%s rows=%s runner=%s top_n=%s dry_run=%s require_market_open=%s min_conf=%.2f min_buy=%.2f max_sell=%.2f tonosama=%s pre_slope=%s min_slope=%.4f",
             interval,
             source_s,
             len(df),
@@ -496,7 +509,7 @@ def run_summary_ai_entry_safe(
         )
 
         logger.warning(
-            "[summary.runners] summary AI entry v22 done interval=%s source=%s candidates=%s ai_results=%s ai_ok=%s sell_ai_ok=%s executed=%s skip=%s",
+            "[summary.runners] summary AI entry v23 done interval=%s source=%s candidates=%s ai_results=%s ai_ok=%s sell_ai_ok=%s executed=%s skip=%s",
             interval,
             source_s,
             _len_any(candidates),
@@ -510,7 +523,7 @@ def run_summary_ai_entry_safe(
 
     except Exception:
         logger.exception(
-            "[summary.runners] summary AI entry v22 failed interval=%s source=%s",
+            "[summary.runners] summary AI entry v23 failed interval=%s source=%s",
             interval,
             source_s,
         )
