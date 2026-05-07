@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/summary/mtf/daily_mtf_summary_patch.py
-# Version: PRODUCTION-STABLE-DAILY-MTF-SUMMARY-PATCH-REV1.1
+# Version: PRODUCTION-STABLE-DAILY-MTF-SUMMARY-PATCH-REV1.2
 # ------------------------------------------------------------
 # Purpose:
 #   - summary_saver_bulk の保存入口を安全にラップする
@@ -14,6 +14,7 @@
 #   - DB列追加に失敗しても、元のsummary保存は止めない
 #   - すでに patch 済みなら二重patchしない
 #   - SQLAlchemy raw_connection() は context manager にしない
+#   - lock_timeout / lock_timeout_sec の別名差を吸収する
 # ============================================================
 
 from __future__ import annotations
@@ -162,6 +163,26 @@ def _attach_daily_mtf_safely(df: pd.DataFrame, *, interval: int, save_reason: st
         return df
 
 
+def _pop_lock_timeout_aliases(kwargs: dict[str, Any], lock_timeout_sec: Any) -> Any:
+    """
+    呼び出し元によって lock_timeout / lock_timeout_sec の名前が混在している。
+
+    summary_saver_bulk.bulk_upsert_summary 本体は lock_timeout_sec を受けるため、
+    MTFラッパーで別名を吸収し、元関数へ未知keywordを渡さない。
+    """
+    if lock_timeout_sec is None and "lock_timeout_sec" in kwargs:
+        lock_timeout_sec = kwargs.pop("lock_timeout_sec")
+    else:
+        kwargs.pop("lock_timeout_sec", None)
+
+    if lock_timeout_sec is None and "lock_timeout" in kwargs:
+        lock_timeout_sec = kwargs.pop("lock_timeout")
+    else:
+        kwargs.pop("lock_timeout", None)
+
+    return lock_timeout_sec
+
+
 def install_daily_mtf_summary_patch() -> bool:
     """
     summary_saver_bulk の public API をラップして日足MTFを自動付与する。
@@ -198,6 +219,9 @@ def install_daily_mtf_summary_patch() -> bool:
         ) -> int:
             interval_i = int(interval)
 
+            call_kwargs = dict(kwargs)
+            lock_timeout_sec2 = _pop_lock_timeout_aliases(call_kwargs, lock_timeout_sec)
+
             try:
                 _ensure_summary_daily_mtf_columns(saver, interval_i)
             except Exception:
@@ -209,9 +233,8 @@ def install_daily_mtf_summary_patch() -> bool:
                 save_reason=save_reason,
             )
 
-            call_kwargs = dict(kwargs)
-            if lock_timeout_sec is not None:
-                call_kwargs["lock_timeout_sec"] = lock_timeout_sec
+            if lock_timeout_sec2 is not None:
+                call_kwargs["lock_timeout_sec"] = lock_timeout_sec2
             call_kwargs["skip_if_busy"] = skip_if_busy
             call_kwargs["latest_only"] = latest_only
             call_kwargs["save_reason"] = save_reason
@@ -233,15 +256,18 @@ def install_daily_mtf_summary_patch() -> bool:
             *args,
             **kwargs,
         ) -> int:
+            call_kwargs = dict(kwargs)
+            lock_timeout_sec2 = _pop_lock_timeout_aliases(call_kwargs, lock_timeout_sec)
+
             return bulk_upsert_summary_with_daily_mtf(
                 df=df,
                 interval=interval,
-                lock_timeout_sec=lock_timeout_sec,
+                lock_timeout_sec=lock_timeout_sec2,
                 skip_if_busy=skip_if_busy,
                 latest_only=latest_only,
                 save_reason=save_reason,
                 *args,
-                **kwargs,
+                **call_kwargs,
             )
 
         saver.bulk_upsert_summary = bulk_upsert_summary_with_daily_mtf
