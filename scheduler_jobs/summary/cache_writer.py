@@ -1,6 +1,6 @@
 # ============================================================
 # File   : scheduler_jobs/summary/cache_writer.py
-# Ver    : PRODUCTION-STABLE-SUMMARY-CACHE-WRITER-V1.3-LOCK-TIMEOUT-SEC
+# Ver    : PRODUCTION-STABLE-SUMMARY-CACHE-WRITER-V1.4-SAFE-KWARGS-CALLER
 # ------------------------------------------------------------
 # ✔ merged cache 保存
 # ✔ uncomputed DF の cache 汚染防止
@@ -11,6 +11,8 @@
 # ✔ interval=1 のDB保存ロック詰まり対策
 # ✔ bulk_upsert_summary に lock_timeout_sec / skip_if_busy / latest_only を渡す
 # ✔ lock_timeout 旧名を使わず、summary_saver_bulk の正式名 lock_timeout_sec に統一
+# ✔ 関数内部の TypeError を signature 不明と誤判定しない
+# ✔ fallback 呼び出しでも interval を positional で渡して欠落を防ぐ
 # ============================================================
 
 from __future__ import annotations
@@ -93,42 +95,42 @@ def _call_with_supported_kwargs(func: Any, *args: Any, **kwargs: Any) -> Any:
     """
     関数が受け取れる keyword だけ渡す互換呼び出し。
 
-    目的:
-      - 古い bulk_upsert_summary が lock_timeout_sec 等を未対応でも落とさない
-      - 新しい bulk_upsert_summary では lock_timeout_sec / skip_if_busy を有効化する
+    重要:
+      - inspect.signature() が取れない場合だけ optional kwargs を落とす。
+      - func 実行中に発生した TypeError は握り潰さない。
+        ここで握り潰すと、本当の保存エラーが見えなくなり、
+        さらに func(*args) 再実行で interval が欠落することがある。
     """
     try:
         sig = inspect.signature(func)
-        params = sig.parameters
-
-        accepts_var_kw = any(
-            p.kind == inspect.Parameter.VAR_KEYWORD
-            for p in params.values()
-        )
-
-        if accepts_var_kw:
-            return func(*args, **kwargs)
-
-        filtered = {k: v for k, v in kwargs.items() if k in params}
-        dropped = sorted(set(kwargs) - set(filtered))
-
-        if dropped:
-            logger.info(
-                "[summary.cache_writer] dropped unsupported kwargs func=%s dropped=%s",
-                getattr(func, "__name__", str(func)),
-                dropped,
-            )
-
-        return func(*args, **filtered)
-
     except (TypeError, ValueError):
-        # signature が取れない場合は従来互換で呼ぶ
         logger.debug(
-            "[summary.cache_writer] signature unavailable func=%s; call without optional kwargs",
+            "[summary.cache_writer] signature unavailable func=%s; call with original args/kwargs",
             getattr(func, "__name__", str(func)),
             exc_info=True,
         )
-        return func(*args)
+        return func(*args, **kwargs)
+
+    params = sig.parameters
+    accepts_var_kw = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in params.values()
+    )
+
+    if accepts_var_kw:
+        return func(*args, **kwargs)
+
+    filtered = {k: v for k, v in kwargs.items() if k in params}
+    dropped = sorted(set(kwargs) - set(filtered))
+
+    if dropped:
+        logger.info(
+            "[summary.cache_writer] dropped unsupported kwargs func=%s dropped=%s",
+            getattr(func, "__name__", str(func)),
+            dropped,
+        )
+
+    return func(*args, **filtered)
 
 
 def _db_upsert_options(interval: int, source: str) -> dict[str, Any]:
@@ -342,7 +344,7 @@ def _try_db_upsert(df: pd.DataFrame, interval: int, source: str) -> int:
         ret = _call_with_supported_kwargs(
             bulk_upsert_summary,
             work,
-            interval=interval,
+            interval,
             **opts,
         )
         saved = int(ret) if isinstance(ret, (int, float)) else len(work)
@@ -384,7 +386,7 @@ def _try_db_upsert(df: pd.DataFrame, interval: int, source: str) -> int:
         ret = _call_with_supported_kwargs(
             save_summary_bulk,
             work,
-            interval=interval,
+            interval,
             **opts,
         )
         saved = int(ret) if isinstance(ret, (int, float)) else len(work)
@@ -426,14 +428,14 @@ def _try_db_upsert(df: pd.DataFrame, interval: int, source: str) -> int:
         rows = work.to_dict(orient="records")
 
         executor_opts = {
-            "skip_if_busy": opts.get("skip_if_busy"),
+            "skip_if_busy": False,
         }
 
         saved = int(
             _call_with_supported_kwargs(
                 execute_upsert,
                 rows,
-                interval=interval,
+                interval,
                 **executor_opts,
             )
         )
@@ -534,12 +536,13 @@ def save_merged_summary(df: pd.DataFrame, interval: int, *, source: str) -> None
     """
     summary 保存入口。
 
-    REV1.3:
+    REV1.4:
       - まず summary DB へ upsert
       - その後 global_data cache へ保存
       - cache保存だけでDB未保存になる状態を防ぐ
       - interval=1 の PUSH 保存はロック待ちを短くして詰まりを防ぐ
       - lock_timeout 旧名ではなく lock_timeout_sec を使う
+      - fallback直呼びでも interval を positional で渡す
     """
     interval = int(interval)
     source = _normalize_source(source)
