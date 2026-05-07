@@ -1,17 +1,22 @@
 # ============================================================
 # File   : data_collectors/db_prepare.py
-# Version: DATA-COLLECTORS-DB-PREPARE-V1
+# Version: DATA-COLLECTORS-DB-PREPARE-V2-LOCK-TOLERANT
 # ------------------------------------------------------------
 # Purpose:
 #   - 当日DBを作成し、最低限のテーブル・INDEX・WALを準備する
 #   - 既存データは削除しない
+#   - PUSH / ranking / subscription DB を最優先で準備する
+#   - summary DB が main.py 等に掴まれていても data_collectors 全体を落とさない
 # ============================================================
 
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
+import time
 from pathlib import Path
+from typing import Callable
 
 from data_collectors.config import (
     SQLITE_BUSY_TIMEOUT_MS,
@@ -25,15 +30,86 @@ from data_collectors.config import (
 
 logger = logging.getLogger(__name__)
 
+DB_PREPARE_RETRY_MAX = int(os.environ.get("DB_PREPARE_RETRY_MAX", "3"))
+DB_PREPARE_RETRY_SLEEP_SEC = float(os.environ.get("DB_PREPARE_RETRY_SLEEP_SEC", "2.0"))
+
+# data_collectors は「DB作成・ランキング取得・PUSH受信」が主目的。
+# summary DB は main.py 側でも準備されるため、ロック時は非致命扱いにする。
+DB_PREPARE_SUMMARY_FATAL = str(os.environ.get("DB_PREPARE_SUMMARY_FATAL", "0")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+def _is_locked_error(e: BaseException) -> bool:
+    s = str(e).lower()
+    return "database is locked" in s or "database table is locked" in s or "locked" in s
+
 
 def _connect(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=SQLITE_TIMEOUT_SEC)
     conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-    conn.execute("PRAGMA journal_mode=WAL")
+
+    # journal_mode=WAL は既存接続状況によってロックを踏むことがある。
+    # 失敗しても CREATE TABLE / INDEX へ進ませたいので警告止まりにする。
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError as e:
+        if _is_locked_error(e):
+            logger.warning("[DB PREPARE] WAL pragma skipped because locked path=%s err=%s", path, e)
+        else:
+            raise
+
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA temp_store=MEMORY")
     return conn
+
+
+def _run_with_retry(label: str, path: Path, fn: Callable[[Path], None], *, fatal: bool = True) -> bool:
+    last_exc: BaseException | None = None
+
+    for attempt in range(1, DB_PREPARE_RETRY_MAX + 1):
+        try:
+            fn(path)
+            return True
+        except sqlite3.OperationalError as e:
+            last_exc = e
+            if not _is_locked_error(e):
+                if fatal:
+                    raise
+                logger.exception("[DB PREPARE] %s failed non-locked but non-fatal path=%s", label, path)
+                return False
+
+            logger.warning(
+                "[DB PREPARE] %s locked attempt=%d/%d path=%s err=%s",
+                label,
+                attempt,
+                DB_PREPARE_RETRY_MAX,
+                path,
+                e,
+            )
+            if attempt < DB_PREPARE_RETRY_MAX:
+                time.sleep(DB_PREPARE_RETRY_SLEEP_SEC * attempt)
+        except Exception as e:
+            last_exc = e
+            if fatal:
+                raise
+            logger.exception("[DB PREPARE] %s failed but non-fatal path=%s", label, path)
+            return False
+
+    if fatal:
+        raise RuntimeError(f"{label} failed after retry path={path}: {last_exc}") from last_exc
+
+    logger.error(
+        "[DB PREPARE] %s skipped after retry because locked/non-fatal path=%s last_err=%s",
+        label,
+        path,
+        last_exc,
+    )
+    return False
 
 
 def _ensure_push_db(path: Path) -> None:
@@ -219,9 +295,28 @@ def prepare_all_daily_dbs(trade_date: str | None = None) -> None:
     d = trade_date or trade_date_yyyymmdd()
     logger.info("[DB PREPARE] start trade_date=%s", d)
 
-    _ensure_push_db(push_db_path(d))
-    _ensure_ranking_db(ranking_db_path(d))
-    _ensure_summary_db(summary_db_path(d))
-    _ensure_subscription_db(subscription_db_path(d))
+    push_ok = _run_with_retry("push db", push_db_path(d), _ensure_push_db, fatal=True)
+    ranking_ok = _run_with_retry("ranking db", ranking_db_path(d), _ensure_ranking_db, fatal=True)
+    subscription_ok = _run_with_retry(
+        "subscription db",
+        subscription_db_path(d),
+        _ensure_subscription_db,
+        fatal=True,
+    )
 
-    logger.info("[DB PREPARE] done trade_date=%s", d)
+    summary_ok = _run_with_retry(
+        "summary db",
+        summary_db_path(d),
+        _ensure_summary_db,
+        fatal=DB_PREPARE_SUMMARY_FATAL,
+    )
+
+    logger.info(
+        "[DB PREPARE] done trade_date=%s push=%s ranking=%s subscription=%s summary=%s summary_fatal=%s",
+        d,
+        push_ok,
+        ranking_ok,
+        subscription_ok,
+        summary_ok,
+        DB_PREPARE_SUMMARY_FATAL,
+    )
