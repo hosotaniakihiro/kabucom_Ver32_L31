@@ -1,6 +1,6 @@
 # ============================================================
 # File   : scheduler_jobs/summary/ranking_summary_jobs.py
-# Ver    : PRODUCTION-STABLE-REV1.0-RANKING-SUMMARY-JOBS
+# Ver    : PRODUCTION-STABLE-REV1.1-RANKING-SUMMARY-JOBS-AI-HOOK-V20
 # ------------------------------------------------------------
 # 【概要】
 #   ランキング由来サマリー専用の定時ジョブ入口
@@ -11,19 +11,12 @@
 #   - ranking_snapshot_1min.current_price を close として扱う
 #   - Yahoo 1分足 close はランキング価格系列補完として利用
 #   - ranking_summary_1min / 3min / 5min に保存
+#   - 保存/表示後、summary_ai_entry_hook_v20 へ通す
 #
-# 【スケジューラ接続】
-#   - job_ranking_summary_1m()
-#   - job_ranking_summary_3m()
-#   - job_ranking_summary_5m()
-#   - job_ranking_summary_all()
-#
-# 【期待ログ】
-#   - [RANKING SUMMARY JOB] start interval=1
-#   - [RANKING SUMMARY RUNNER] start interval=1
-#   - [RANKING TECH] indicators added ...
-#   - [RANKING SUMMARY SAVE] saved table=ranking_summary_1min ...
-#   - 📊 RANKING SUMMARY TOP10
+# REV1.1:
+#   - ランキング専用定時ジョブからもAI hook v20を直接呼ぶ
+#   - BUY TOP20 / SELL TOP20 をAIへ渡す
+#   - ログで hook=v20 を明示
 # ============================================================
 
 from __future__ import annotations
@@ -38,10 +31,6 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-
-# ============================================================
-# Global guards
-# ============================================================
 
 _LOCKS: dict[int, threading.Lock] = {
     1: threading.Lock(),
@@ -61,10 +50,6 @@ _MIN_INTERVAL_SEC: dict[int, float] = {
     5: 40.0,
 }
 
-
-# ============================================================
-# Optional global_data sync
-# ============================================================
 
 def _get_global_data():
     try:
@@ -103,80 +88,40 @@ def _get_global_attr(name: str, default=None):
 
 
 def _store_ranking_summary_cache(interval: int, df: pd.DataFrame) -> None:
-    """
-    global_data にランキング由来サマリーを保存する。
-    PUSH由来 summary とは別名で保持する。
-    """
     if df is None:
         return
 
     cache_name = f"ranking_summary_{interval}min_df"
     _set_global_attr(cache_name, df)
 
-    # 汎用dictも用意
     cache = _get_global_attr("ranking_summary_cache", None)
     if cache is None or not isinstance(cache, dict):
         cache = {}
 
     cache[int(interval)] = df
     _set_global_attr("ranking_summary_cache", cache)
-
     _set_global_attr("last_ranking_summary_updated_at", dt.datetime.now())
 
-
-# ============================================================
-# Time helpers
-# ============================================================
 
 def _now() -> dt.datetime:
     return dt.datetime.now()
 
 
 def _is_market_related_time(now: Optional[dt.datetime] = None) -> bool:
-    """
-    厳密な市場時間判定ではなく、ランキングサマリー実行許可の広め判定。
-
-    理由:
-      - 時間外でも最新計算済み結果を表示したい
-      - 引け直後はYahoo補完で計算が変わる
-      - 起動確認・DB確認のため、完全停止しない方が安全
-    """
     now = now or _now()
     t = now.time()
-
-    start = dt.time(8, 30)
-    end = dt.time(16, 30)
-
-    return start <= t <= end
+    return dt.time(8, 30) <= t <= dt.time(16, 30)
 
 
 def _should_run_by_clock(interval: int, now: Optional[dt.datetime] = None) -> bool:
-    """
-    毎時00分起点の interval 分判定。
-
-    1min:
-      毎分
-
-    3min:
-      :00, :03, :06, ... :57
-
-    5min:
-      :00, :05, :10, ... :55
-    """
     now = now or _now()
     interval = int(interval)
-
     if interval <= 1:
         return True
-
     return now.minute % interval == 0
 
 
 def _guard_duplicate_run(interval: int) -> bool:
-    """
-    スケジューラ多重発火対策。
-    True なら実行OK。
-    """
     interval = int(interval)
     now_ts = time.time()
     last = _LAST_RUN_AT.get(interval, 0.0)
@@ -195,9 +140,50 @@ def _guard_duplicate_run(interval: int) -> bool:
     return True
 
 
-# ============================================================
-# Core execution
-# ============================================================
+def _run_ranking_ai_hook_v20(*, interval: int, now: dt.datetime, df: pd.DataFrame) -> bool:
+    """
+    ランキング由来サマリーをPUSH同様にAI判定へ渡す。
+    ranking_summary_jobs.py は runner_core.py を経由しない起動ルートがあるため、ここで直接呼ぶ。
+    """
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            logger.warning(
+                "[RANKING SUMMARY JOB] AI hook=v20 skipped interval=%s reason=empty_df",
+                interval,
+            )
+            return False
+
+        from scheduler_jobs.summary.summary_ai_entry_hook_v20 import run_summary_ai_entry_safe
+
+        logger.warning(
+            "[RANKING SUMMARY JOB] AI hook=v20 requested interval=%s rows=%s symbols=%s now=%s source=RANKING",
+            interval,
+            len(df),
+            df["symbol"].nunique() if "symbol" in df.columns else 0,
+            now,
+        )
+
+        ok = run_summary_ai_entry_safe(
+            interval=int(interval),
+            now=now,
+            df=df,
+            source="RANKING",
+        )
+
+        logger.warning(
+            "[RANKING SUMMARY JOB] AI hook=v20 done interval=%s ok=%s source=RANKING",
+            interval,
+            ok,
+        )
+        return bool(ok)
+
+    except Exception:
+        logger.exception(
+            "[RANKING SUMMARY JOB] AI hook=v20 failed interval=%s source=RANKING",
+            interval,
+        )
+        return False
+
 
 def _run_interval(
     *,
@@ -208,11 +194,9 @@ def _run_interval(
     use_yahoo_fill: bool = True,
     persist: bool = True,
     display: bool = True,
-    top_n: int = 10,
+    top_n: int = 20,
+    run_entry: bool = True,
 ) -> pd.DataFrame:
-    """
-    指定intervalのランキング由来サマリーを実行。
-    """
     interval = int(interval)
     if interval not in (1, 3, 5):
         raise ValueError(f"unsupported interval: {interval}")
@@ -242,14 +226,15 @@ def _run_interval(
 
     try:
         logger.info(
-            "[RANKING SUMMARY JOB] start interval=%s force=%s "
-            "lookback=%s yahoo_fill=%s persist=%s display=%s",
+            "[RANKING SUMMARY JOB] start interval=%s force=%s lookback=%s yahoo_fill=%s persist=%s display=%s top_n=%s run_entry=%s",
             interval,
             force,
             lookback_minutes,
             use_yahoo_fill,
             persist,
             display,
+            top_n,
+            run_entry,
         )
 
         _set_global_attr("ranking_summary_running", True)
@@ -264,21 +249,29 @@ def _run_interval(
             use_yahoo_fill=use_yahoo_fill,
             persist=persist,
             display=display,
-            top_n=top_n,
+            top_n=max(20, int(top_n or 20)),
         )
 
         if df is not None and not df.empty:
             _store_ranking_summary_cache(interval, df)
 
             logger.info(
-                "[RANKING SUMMARY JOB] done interval=%s rows=%s symbols=%s "
-                "rsi_non_null=%s macd_non_null=%s",
+                "[RANKING SUMMARY JOB] done interval=%s rows=%s symbols=%s rsi_non_null=%s macd_non_null=%s",
                 interval,
                 len(df),
                 df["symbol"].nunique() if "symbol" in df.columns else 0,
                 int(df["rsi"].notna().sum()) if "rsi" in df.columns else 0,
                 int(df["macd"].notna().sum()) if "macd" in df.columns else 0,
             )
+
+            if bool(run_entry):
+                _run_ranking_ai_hook_v20(interval=interval, now=now, df=df)
+            else:
+                logger.info(
+                    "[RANKING SUMMARY JOB] AI hook=v20 skipped interval=%s reason=run_entry_false",
+                    interval,
+                )
+
         else:
             logger.warning(
                 "[RANKING SUMMARY JOB] done empty interval=%s",
@@ -303,10 +296,6 @@ def _run_interval(
             pass
 
 
-# ============================================================
-# Public jobs
-# ============================================================
-
 def job_ranking_summary_1m(
     *,
     force: bool = False,
@@ -315,11 +304,9 @@ def job_ranking_summary_1m(
     use_yahoo_fill: bool = True,
     persist: bool = True,
     display: bool = True,
-    top_n: int = 10,
+    top_n: int = 20,
+    run_entry: bool = True,
 ) -> pd.DataFrame:
-    """
-    1分足ランキング由来サマリー定時ジョブ。
-    """
     return _run_interval(
         interval=1,
         force=force,
@@ -329,6 +316,7 @@ def job_ranking_summary_1m(
         persist=persist,
         display=display,
         top_n=top_n,
+        run_entry=run_entry,
     )
 
 
@@ -340,11 +328,9 @@ def job_ranking_summary_3m(
     use_yahoo_fill: bool = True,
     persist: bool = True,
     display: bool = True,
-    top_n: int = 10,
+    top_n: int = 20,
+    run_entry: bool = True,
 ) -> pd.DataFrame:
-    """
-    3分足ランキング由来サマリー定時ジョブ。
-    """
     return _run_interval(
         interval=3,
         force=force,
@@ -354,6 +340,7 @@ def job_ranking_summary_3m(
         persist=persist,
         display=display,
         top_n=top_n,
+        run_entry=run_entry,
     )
 
 
@@ -365,11 +352,9 @@ def job_ranking_summary_5m(
     use_yahoo_fill: bool = True,
     persist: bool = True,
     display: bool = True,
-    top_n: int = 10,
+    top_n: int = 20,
+    run_entry: bool = True,
 ) -> pd.DataFrame:
-    """
-    5分足ランキング由来サマリー定時ジョブ。
-    """
     return _run_interval(
         interval=5,
         force=force,
@@ -379,6 +364,7 @@ def job_ranking_summary_5m(
         persist=persist,
         display=display,
         top_n=top_n,
+        run_entry=run_entry,
     )
 
 
@@ -390,24 +376,12 @@ def job_ranking_summary_all(
     use_yahoo_fill: bool = True,
     persist: bool = True,
     display: bool = True,
-    top_n: int = 10,
+    top_n: int = 20,
+    run_entry: bool = True,
 ) -> dict[int, pd.DataFrame]:
-    """
-    現在時刻に応じて 1min / 3min / 5min を実行する。
-
-    毎分:
-      1min は実行
-
-    :00, :03, :06...
-      3min も実行
-
-    :00, :05, :10...
-      5min も実行
-    """
     now = _now()
     results: dict[int, pd.DataFrame] = {}
 
-    # 1minは毎回
     results[1] = job_ranking_summary_1m(
         force=force,
         trade_date=trade_date,
@@ -416,9 +390,9 @@ def job_ranking_summary_all(
         persist=persist,
         display=display,
         top_n=top_n,
+        run_entry=run_entry,
     )
 
-    # 3min
     if force or now.minute % 3 == 0:
         results[3] = job_ranking_summary_3m(
             force=force,
@@ -428,11 +402,11 @@ def job_ranking_summary_all(
             persist=persist,
             display=display,
             top_n=top_n,
+            run_entry=run_entry,
         )
     else:
         results[3] = pd.DataFrame()
 
-    # 5min
     if force or now.minute % 5 == 0:
         results[5] = job_ranking_summary_5m(
             force=force,
@@ -442,16 +416,13 @@ def job_ranking_summary_all(
             persist=persist,
             display=display,
             top_n=top_n,
+            run_entry=run_entry,
         )
     else:
         results[5] = pd.DataFrame()
 
     return results
 
-
-# ============================================================
-# Compatibility aliases
-# ============================================================
 
 def run_ranking_summary_job(**kwargs):
     return job_ranking_summary_all(**kwargs)
