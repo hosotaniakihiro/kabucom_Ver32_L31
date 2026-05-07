@@ -3,7 +3,7 @@
 #====================================================================================================
 # ============================================================
 # File   : scheduler_jobs/summary/runner_core.py
-# Version: PRODUCTION-STABLE-SUMMARY-RUNNER-CORE-V1.2-RANKING-SAME-PIPELINE
+# Version: PRODUCTION-STABLE-SUMMARY-RUNNER-CORE-V1.3-FORCE-TOP20-AI-HOOK
 # ------------------------------------------------------------
 # 【概要】
 #   PUSH / RANKING サマリーの実行本体。
@@ -21,11 +21,10 @@
 #   - PUSH は source="SUMMARY"
 #   - RANKING は source="RANKING"
 #
-# REV1.2:
-#   - ranking shortcut jobs も run_entry を受け取る
-#   - job_ranking_summary の run_entry デフォルトを True に変更
-#   - run_ranking_summary_job の run_entry デフォルトを True に変更
-#   - RANKING由来も PUSH由来同様、保存→表示→AI TOP20判定へ通す
+# REV1.3:
+#   - summary_ai_entry_hook_v20 を使用
+#   - PUSH/RANKINGとも BUY TOP20 + SELL TOP20 をAIへ渡す
+#   - RANKINGではAI前段のtonosama/slopeフィルタをhook側でOFFにする
 # ============================================================
 
 from __future__ import annotations
@@ -55,7 +54,7 @@ from .safe_io import (
     display_push_summary_safe,
     display_ranking_summary_safe,
 )
-from .summary_ai_entry_hook import run_summary_ai_entry_safe
+from .summary_ai_entry_hook_v20 import run_summary_ai_entry_safe
 from .time_utils import (
     now_naive,
     floor_to_interval,
@@ -135,10 +134,6 @@ def job_summary(
     run_entry: bool = True,
     **kwargs,
 ) -> pd.DataFrame:
-    """
-    PUSH由来サマリー専用ジョブ。
-    ranking 系の df をここへ混ぜない。
-    """
     interval = int(interval)
     now = (now or now_naive()).replace(microsecond=0)
 
@@ -184,7 +179,6 @@ def job_summary(
     )
 
     df, meta = normalize_runner_output(result)
-
     log_df_state("push_after_normalize_runner_output", interval, df)
 
     df = normalize_df(df)
@@ -252,7 +246,7 @@ def job_summary(
 
     if run_entry and interval in (1, 3, 5):
         logger.info(
-            "[summary.runners] push AI entry requested interval=%s now=%s source=SUMMARY",
+            "[summary.runners] push AI entry requested interval=%s now=%s source=SUMMARY hook=v20",
             interval,
             now,
         )
@@ -279,14 +273,6 @@ def job_ranking_summary(
     run_entry: bool = True,
     **kwargs,
 ) -> pd.DataFrame:
-    """
-    ランキング由来サマリー専用ジョブ。
-    push 系の df をここへ混ぜない。
-
-    PUSH と同様に、正常な df が得られたら、
-      save_summary_safe -> display_ranking_summary_safe -> run_summary_ai_entry_safe
-    の出口パイプラインへ通す。
-    """
     interval = int(interval)
     now = (now or now_naive()).replace(microsecond=0)
 
@@ -320,7 +306,6 @@ def job_ranking_summary(
     )
 
     df, meta = normalize_runner_output(result)
-
     log_df_state("ranking_after_normalize_runner_output", interval, df)
 
     df = normalize_df(df)
@@ -379,7 +364,7 @@ def job_ranking_summary(
 
     if run_entry and interval in (1, 3, 5) and is_market_session(now):
         logger.info(
-            "[summary.runners] ranking AI entry requested interval=%s now=%s source=RANKING",
+            "[summary.runners] ranking AI entry requested interval=%s now=%s source=RANKING hook=v20",
             interval,
             now,
         )
