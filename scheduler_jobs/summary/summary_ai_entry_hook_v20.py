@@ -1,6 +1,6 @@
 # ============================================================
 # File   : scheduler_jobs/summary/summary_ai_entry_hook_v20.py
-# Version: PRODUCTION-STABLE-SUMMARY-AI-ENTRY-HOOK-V21-ENTRY-FIRE-RELAXED
+# Version: PRODUCTION-STABLE-SUMMARY-AI-ENTRY-HOOK-V22-AI-NG-DIAG
 # ------------------------------------------------------------
 # Purpose:
 #   - 定時サマリー計算後のAI判定hook
@@ -8,6 +8,7 @@
 #   - BUY TOP20 / SELL TOP20 を確実にAIへ渡す
 #   - AI前段で候補が全消えしないよう、pre slope filter は既定OFF
 #   - min_buy_score 既定を 5.0 -> 4.0 に緩和
+#   - AI_OK=0 の原因を reason/confidence/symbol 単位でログ出力する
 #
 # Notes:
 #   - 既存 summary_ai_entry_hook.py は長大なので壊さず残す
@@ -21,6 +22,7 @@ import importlib
 import inspect
 import logging
 import os
+from collections import Counter
 from typing import Any, Callable, Optional
 
 import pandas as pd
@@ -76,7 +78,6 @@ def _safe_min_slope() -> float:
 def _effective_use_tonosama_filter(source: str) -> bool:
     if _is_ranking_source(source):
         return False
-    # 候補が消えすぎる場合は env で OFF にできる。既定は従来通りON。
     return env_bool("SUMMARY_AI_ENTRY_USE_TONOSAMA_FILTER", True)
 
 
@@ -116,7 +117,7 @@ def _resolve_runner() -> Optional[Callable[..., Any]]:
             if callable(fn):
                 _RUNNER_CACHE = fn
                 logger.warning(
-                    "[summary.runners] AI hook v21 runner resolved %s.%s file=%s",
+                    "[summary.runners] AI hook v22 runner resolved %s.%s file=%s",
                     module_name,
                     func_name,
                     getattr(mod, "__file__", None),
@@ -124,13 +125,13 @@ def _resolve_runner() -> Optional[Callable[..., Any]]:
                 return fn
         except Exception:
             logger.debug(
-                "[summary.runners] AI hook v21 runner resolve failed %s.%s",
+                "[summary.runners] AI hook v22 runner resolve failed %s.%s",
                 module_name,
                 func_name,
                 exc_info=True,
             )
 
-    logger.error("[summary.runners] AI hook v21 runner resolve failed all candidates")
+    logger.error("[summary.runners] AI hook v22 runner resolve failed all candidates")
     return None
 
 
@@ -182,6 +183,198 @@ def _len_any(v: Any) -> int:
         return 0
 
 
+def _records_any(v: Any, *, limit: int = 200) -> list[dict[str, Any]]:
+    try:
+        if v is None:
+            return []
+        if isinstance(v, pd.DataFrame):
+            return v.head(limit).to_dict(orient="records")
+        if isinstance(v, list):
+            return [x for x in v[:limit] if isinstance(x, dict)]
+        if isinstance(v, tuple):
+            return [x for x in list(v)[:limit] if isinstance(x, dict)]
+    except Exception:
+        return []
+    return []
+
+
+def _compact_reason(row: dict[str, Any]) -> str:
+    for key in (
+        "reason",
+        "ng_reason",
+        "skip_reason",
+        "reject_reason",
+        "error",
+        "message",
+        "ai_reason",
+        "decision_reason",
+    ):
+        v = row.get(key)
+        if v is not None and str(v).strip() != "":
+            s = str(v).strip()
+            return s[:160]
+    allow = row.get("allow")
+    if allow is False:
+        return "allow_false_no_reason"
+    return "unknown"
+
+
+def _safe_num(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or v == "":
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def _symbol_of(row: dict[str, Any]) -> str:
+    return str(row.get("symbol") or row.get("code") or row.get("stock_code") or "").strip()
+
+
+def _diagnose_ai_entry_result(
+    *,
+    interval: int,
+    source: str,
+    candidates: Any,
+    ai_results: Any,
+    ai_ok: Any,
+    sell_ai_ok: Any,
+    execution: Any,
+    min_conf: float,
+) -> None:
+    """
+    AI_OK=0 / executed=False の理由をログで分解する。
+    runner本体に手を入れず、返却payloadから原因を読む安全診断。
+    """
+    try:
+        cand_rows = _records_any(candidates, limit=60)
+        result_rows = _records_any(ai_results, limit=120)
+        ok_rows = _records_any(ai_ok, limit=60)
+        sell_ok_rows = _records_any(sell_ai_ok, limit=60)
+        exec_dict = execution if isinstance(execution, dict) else {}
+
+        reason_counter: Counter[str] = Counter()
+        conf_low = 0
+        allow_true = 0
+        allow_false = 0
+        unknown_allow = 0
+
+        ng_head: list[dict[str, Any]] = []
+        ok_head: list[dict[str, Any]] = []
+
+        for row in result_rows:
+            allow = bool(row.get("allow"))
+            conf = _safe_num(
+                row.get("confidence")
+                or row.get("conf")
+                or row.get("ai_confidence")
+                or row.get("score_confidence"),
+                default=0.0,
+            )
+
+            if allow:
+                allow_true += 1
+                if len(ok_head) < 20:
+                    ok_head.append(
+                        {
+                            "symbol": _symbol_of(row),
+                            "conf": conf,
+                            "reason": _compact_reason(row),
+                        }
+                    )
+                continue
+
+            if row.get("allow") is False:
+                allow_false += 1
+            else:
+                unknown_allow += 1
+
+            reason = _compact_reason(row)
+            reason_counter[reason] += 1
+            if conf < float(min_conf):
+                conf_low += 1
+
+            if len(ng_head) < 30:
+                ng_head.append(
+                    {
+                        "symbol": _symbol_of(row),
+                        "conf": conf,
+                        "reason": reason,
+                        "side": row.get("side") or row.get("signal") or row.get("entry_side"),
+                        "buy_score": row.get("buy_score") or row.get("score_buy") or row.get("score"),
+                        "sell_score": row.get("sell_score") or row.get("score_sell"),
+                    }
+                )
+
+        cand_head: list[dict[str, Any]] = []
+        for row in cand_rows[:30]:
+            cand_head.append(
+                {
+                    "symbol": _symbol_of(row),
+                    "side": row.get("side") or row.get("signal") or row.get("entry_side"),
+                    "score": row.get("score") or row.get("final_score") or row.get("display_score"),
+                    "buy_score": row.get("buy_score") or row.get("score_buy"),
+                    "sell_score": row.get("sell_score") or row.get("score_sell"),
+                    "close": row.get("close") or row.get("close_price") or row.get("price"),
+                    "slope": row.get("slope_atr_scaled") or row.get("slope") or row.get("score_slope"),
+                    "rsi": row.get("rsi"),
+                    "macd": row.get("macd"),
+                    "mtf": row.get("mtf") or row.get("score_mtf"),
+                }
+            )
+
+        logger.warning(
+            "[SUMMARY AI DIAG] interval=%s source=%s candidates=%s ai_results=%s allow_true=%s allow_false=%s allow_unknown=%s ai_ok=%s sell_ai_ok=%s executed=%s skip=%s min_conf=%.2f conf_low=%s",
+            interval,
+            source,
+            _len_any(candidates),
+            _len_any(ai_results),
+            allow_true,
+            allow_false,
+            unknown_allow,
+            _len_any(ai_ok),
+            _len_any(sell_ai_ok),
+            bool(exec_dict.get("executed")) if isinstance(exec_dict, dict) else False,
+            exec_dict.get("skip_reason") if isinstance(exec_dict, dict) else None,
+            float(min_conf),
+            conf_low,
+        )
+        logger.warning(
+            "[SUMMARY AI DIAG] interval=%s source=%s ng_reason_counts=%s",
+            interval,
+            source,
+            dict(reason_counter.most_common(20)),
+        )
+        logger.warning(
+            "[SUMMARY AI DIAG] interval=%s source=%s ng_head=%s",
+            interval,
+            source,
+            ng_head,
+        )
+        if ok_head:
+            logger.warning(
+                "[SUMMARY AI DIAG] interval=%s source=%s ok_head=%s",
+                interval,
+                source,
+                ok_head,
+            )
+        if cand_head:
+            logger.warning(
+                "[SUMMARY AI DIAG] interval=%s source=%s candidate_head=%s",
+                interval,
+                source,
+                cand_head,
+            )
+    except Exception:
+        logger.debug(
+            "[SUMMARY AI DIAG] failed interval=%s source=%s",
+            interval,
+            source,
+            exc_info=True,
+        )
+
+
 def run_summary_ai_entry_safe(
     interval: int,
     now: dt.datetime,
@@ -196,7 +389,7 @@ def run_summary_ai_entry_safe(
     try:
         if not env_bool("SUMMARY_AI_ENTRY_ENABLED", True):
             logger.info(
-                "[summary.runners] summary AI entry v21 skipped interval=%s source=%s reason=disabled_env",
+                "[summary.runners] summary AI entry v22 skipped interval=%s source=%s reason=disabled_env",
                 interval,
                 source_s,
             )
@@ -204,7 +397,7 @@ def run_summary_ai_entry_safe(
 
         if df is None or not isinstance(df, pd.DataFrame) or not is_nonempty_df(df):
             logger.warning(
-                "[summary.runners] summary AI entry v21 skipped interval=%s source=%s reason=empty_or_invalid_df type=%s",
+                "[summary.runners] summary AI entry v22 skipped interval=%s source=%s reason=empty_or_invalid_df type=%s",
                 interval,
                 source_s,
                 type(df).__name__,
@@ -214,7 +407,7 @@ def run_summary_ai_entry_safe(
         fn = _resolve_runner()
         if not callable(fn):
             logger.warning(
-                "[summary.runners] summary AI entry v21 skipped interval=%s source=%s reason=runner_unavailable",
+                "[summary.runners] summary AI entry v22 skipped interval=%s source=%s reason=runner_unavailable",
                 interval,
                 source_s,
             )
@@ -266,7 +459,7 @@ def run_summary_ai_entry_safe(
         call_kwargs = _filter_kwargs(fn, kwargs)
 
         logger.warning(
-            "[summary.runners] summary AI entry v21 start interval=%s source=%s rows=%s runner=%s top_n=%s dry_run=%s require_market_open=%s min_buy=%.2f max_sell=%.2f tonosama=%s pre_slope=%s min_slope=%.4f",
+            "[summary.runners] summary AI entry v22 start interval=%s source=%s rows=%s runner=%s top_n=%s dry_run=%s require_market_open=%s min_conf=%.2f min_buy=%.2f max_sell=%.2f tonosama=%s pre_slope=%s min_slope=%.4f",
             interval,
             source_s,
             len(df),
@@ -274,6 +467,7 @@ def run_summary_ai_entry_safe(
             top_n,
             dry_run,
             require_market_open,
+            min_conf,
             min_buy_score,
             max_sell_score,
             use_tonosama,
@@ -290,8 +484,19 @@ def run_summary_ai_entry_safe(
         sell_ai_ok = result_dict.get("sell_ai_ok") or []
         execution = result_dict.get("execution") or {}
 
+        _diagnose_ai_entry_result(
+            interval=interval,
+            source=source_s,
+            candidates=candidates,
+            ai_results=ai_results,
+            ai_ok=ai_ok,
+            sell_ai_ok=sell_ai_ok,
+            execution=execution,
+            min_conf=min_conf,
+        )
+
         logger.warning(
-            "[summary.runners] summary AI entry v21 done interval=%s source=%s candidates=%s ai_results=%s ai_ok=%s sell_ai_ok=%s executed=%s skip=%s",
+            "[summary.runners] summary AI entry v22 done interval=%s source=%s candidates=%s ai_results=%s ai_ok=%s sell_ai_ok=%s executed=%s skip=%s",
             interval,
             source_s,
             _len_any(candidates),
@@ -305,7 +510,7 @@ def run_summary_ai_entry_safe(
 
     except Exception:
         logger.exception(
-            "[summary.runners] summary AI entry v21 failed interval=%s source=%s",
+            "[summary.runners] summary AI entry v22 failed interval=%s source=%s",
             interval,
             source_s,
         )
