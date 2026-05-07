@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/startup_runtime.py
-# Version: REV1.0-STARTUP-RUNTIME
+# Version: REV1.1-STARTUP-RUNTIME-SPLIT-MODE
 # ------------------------------------------------------------
 # 【概要】
 #   startup の runtime / engine / migration phase を分離
@@ -10,6 +10,11 @@
 #   - engine dispose
 #   - global_data.clear_all
 #   - safe migration phase
+#
+# Split mode:
+#   - main_database.py が DB作成 / ranking取得 / PUSH受信を担当
+#   - main.py 側では push/ranking engine の factory を呼ばない
+#   - main.py 側では DB migration を走らせず、summary engine の解決だけ行う
 #
 # 【重要】
 #   from database.session import summary_engine の固定参照は使わない。
@@ -30,9 +35,19 @@ from core.startup.db_bootstrap import bootstrap_database
 logger = logging.getLogger(__name__)
 
 
+def _split_mode_skip_data_collector_work() -> bool:
+    try:
+        from data_collectors.split_mode import should_skip_data_collector_work_in_main
+        return bool(should_skip_data_collector_work_in_main())
+    except Exception:
+        return False
+
+
 def resolve_engine_from_database_session(
     attr_names: tuple[str, ...],
     factory_names: tuple[str, ...],
+    *,
+    allow_factory: bool = True,
 ) -> Engine | None:
     try:
         session_mod = importlib.import_module("database.session")
@@ -52,6 +67,14 @@ def resolve_engine_from_database_session(
                 exc_info=True,
             )
 
+    if not allow_factory:
+        logger.info(
+            "[STARTUP.RUNTIME] engine factory skipped attr_names=%s split_mode=%s",
+            attr_names,
+            _split_mode_skip_data_collector_work(),
+        )
+        return None
+
     for fn_name in factory_names:
         try:
             fn = getattr(session_mod, fn_name, None)
@@ -69,7 +92,7 @@ def resolve_engine_from_database_session(
     return None
 
 
-def resolve_summary_engine_dynamic() -> Engine | None:
+def resolve_summary_engine_dynamic(*, allow_factory: bool = True) -> Engine | None:
     return resolve_engine_from_database_session(
         attr_names=(
             "summary_engine",
@@ -82,10 +105,11 @@ def resolve_summary_engine_dynamic() -> Engine | None:
             "get_engine_summary",
             "summary_engine_factory",
         ),
+        allow_factory=allow_factory,
     )
 
 
-def resolve_ranking_engine_dynamic() -> Engine | None:
+def resolve_ranking_engine_dynamic(*, allow_factory: bool = True) -> Engine | None:
     return resolve_engine_from_database_session(
         attr_names=(
             "ranking_engine",
@@ -98,10 +122,11 @@ def resolve_ranking_engine_dynamic() -> Engine | None:
             "get_engine_ranking",
             "ranking_engine_factory",
         ),
+        allow_factory=allow_factory,
     )
 
 
-def resolve_push_engine_dynamic() -> Engine | None:
+def resolve_push_engine_dynamic(*, allow_factory: bool = True) -> Engine | None:
     return resolve_engine_from_database_session(
         attr_names=(
             "push_engine",
@@ -114,15 +139,28 @@ def resolve_push_engine_dynamic() -> Engine | None:
             "get_engine_push",
             "push_engine_factory",
         ),
+        allow_factory=allow_factory,
     )
 
 
 def dispose_all_engines() -> None:
-    for eng in (
-        resolve_summary_engine_dynamic(),
-        resolve_ranking_engine_dynamic(),
-        resolve_push_engine_dynamic(),
-    ):
+    split = _split_mode_skip_data_collector_work()
+
+    if split:
+        logger.warning(
+            "[STARTUP.RUNTIME] split mode: skip resolving/dispose push/ranking engines in main process"
+        )
+        engines = (
+            resolve_summary_engine_dynamic(allow_factory=False),
+        )
+    else:
+        engines = (
+            resolve_summary_engine_dynamic(),
+            resolve_ranking_engine_dynamic(),
+            resolve_push_engine_dynamic(),
+        )
+
+    for eng in engines:
         try:
             if eng:
                 eng.dispose()
@@ -142,10 +180,21 @@ def safe_migration_phase(summary_dir, ranking_dir) -> None:
     logger.info("📁 SAFE MIGRATION summary_dir=%s", summary_dir)
     logger.info("📁 SAFE MIGRATION ranking_dir=%s", ranking_dir)
 
+    split = _split_mode_skip_data_collector_work()
+    if split:
+        logger.warning(
+            "[STARTUP.RUNTIME] split mode active: main.py will not create/migrate PUSH/RANKING DB. "
+            "main_database.py handles DB作成 / ranking取得 / PUSH受信."
+        )
+
     dispose_all_engines()
     clear_runtime_memory()
 
-    bootstrap_database(summary_dir, ranking_dir)
+    bootstrap_database(
+        summary_dir,
+        None if split else ranking_dir,
+        skip_migration=split,
+    )
     logger.info("✅ SAFE MIGRATION COMPLETE")
 
 
