@@ -1,6 +1,6 @@
 # ============================================================
 # File   : scheduler_jobs/summary/cache_writer.py
-# Ver    : PRODUCTION-STABLE-SUMMARY-CACHE-WRITER-V1.2-LOCK-SAFE
+# Ver    : PRODUCTION-STABLE-SUMMARY-CACHE-WRITER-V1.3-LOCK-TIMEOUT-SEC
 # ------------------------------------------------------------
 # ✔ merged cache 保存
 # ✔ uncomputed DF の cache 汚染防止
@@ -9,7 +9,8 @@
 # ✔ PUSH / RANKING の source を保持
 # ✔ 例外安全化
 # ✔ interval=1 のDB保存ロック詰まり対策
-# ✔ bulk_upsert_summary に lock_timeout / skip_if_busy / latest_only を渡す
+# ✔ bulk_upsert_summary に lock_timeout_sec / skip_if_busy / latest_only を渡す
+# ✔ lock_timeout 旧名を使わず、summary_saver_bulk の正式名 lock_timeout_sec に統一
 # ============================================================
 
 from __future__ import annotations
@@ -93,8 +94,8 @@ def _call_with_supported_kwargs(func: Any, *args: Any, **kwargs: Any) -> Any:
     関数が受け取れる keyword だけ渡す互換呼び出し。
 
     目的:
-      - 古い bulk_upsert_summary が lock_timeout 等を未対応でも落とさない
-      - 新しい bulk_upsert_summary では lock_timeout / skip_if_busy を有効化する
+      - 古い bulk_upsert_summary が lock_timeout_sec 等を未対応でも落とさない
+      - 新しい bulk_upsert_summary では lock_timeout_sec / skip_if_busy を有効化する
     """
     try:
         sig = inspect.signature(func)
@@ -138,13 +139,17 @@ def _db_upsert_options(interval: int, source: str) -> dict[str, Any]:
     ロックが取れない場合は短時間で諦め、次の最新データを優先する。
 
     interval=3/5 は頻度が低いため、少し長めに待って保存成功を優先する。
+
+    重要:
+      - summary_saver_bulk.bulk_upsert_summary の正式引数名は lock_timeout_sec。
+      - lock_timeout 旧名は使わない。
     """
     interval = int(interval)
     source = _normalize_source(source)
 
     if interval == 1:
         return {
-            "lock_timeout": 3.0,
+            "lock_timeout_sec": 3.0,
             "skip_if_busy": True,
             "latest_only": True,
             "save_reason": f"cache_writer_{source}",
@@ -152,7 +157,7 @@ def _db_upsert_options(interval: int, source: str) -> dict[str, Any]:
 
     if interval == 3:
         return {
-            "lock_timeout": 8.0,
+            "lock_timeout_sec": 8.0,
             "skip_if_busy": True,
             "latest_only": False,
             "save_reason": f"cache_writer_{source}",
@@ -160,14 +165,14 @@ def _db_upsert_options(interval: int, source: str) -> dict[str, Any]:
 
     if interval == 5:
         return {
-            "lock_timeout": 10.0,
+            "lock_timeout_sec": 10.0,
             "skip_if_busy": True,
             "latest_only": False,
             "save_reason": f"cache_writer_{source}",
         }
 
     return {
-        "lock_timeout": 5.0,
+        "lock_timeout_sec": 5.0,
         "skip_if_busy": True,
         "latest_only": False,
         "save_reason": f"cache_writer_{source}",
@@ -421,10 +426,7 @@ def _try_db_upsert(df: pd.DataFrame, interval: int, source: str) -> int:
         rows = work.to_dict(orient="records")
 
         executor_opts = {
-            "lock_timeout": opts.get("lock_timeout"),
             "skip_if_busy": opts.get("skip_if_busy"),
-            "latest_only": opts.get("latest_only"),
-            "save_reason": opts.get("save_reason"),
         }
 
         saved = int(
@@ -532,11 +534,12 @@ def save_merged_summary(df: pd.DataFrame, interval: int, *, source: str) -> None
     """
     summary 保存入口。
 
-    REV1.2:
+    REV1.3:
       - まず summary DB へ upsert
       - その後 global_data cache へ保存
       - cache保存だけでDB未保存になる状態を防ぐ
       - interval=1 の PUSH 保存はロック待ちを短くして詰まりを防ぐ
+      - lock_timeout 旧名ではなく lock_timeout_sec を使う
     """
     interval = int(interval)
     source = _normalize_source(source)
