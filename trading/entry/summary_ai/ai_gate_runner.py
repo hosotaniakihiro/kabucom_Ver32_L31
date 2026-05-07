@@ -1,12 +1,12 @@
 # ============================================================
 # File   : trading/entry/summary_ai/ai_gate_runner.py
-# Version: PRODUCTION-STABLE-REV3.1-AI-GATE-PER-ROW-SIDE
+# Version: PRODUCTION-STABLE-REV3.2-AI-GATE-TOP20-CONSOLE
 # ------------------------------------------------------------
 # Purpose:
 #   - summary候補 DataFrame を AI gate に通す
 #   - BUY / SELL の side を明示して AI に渡す
 #   - row側に side / ai_side がある場合は行ごとに BUY/SELL を切り替える
-#   - 旧呼び出しは side="BUY" のまま動作
+#   - AI判定後、BUY/SELL別にTOP20 + AI可否結果をコンソールログへ表示する
 # ============================================================
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from .utils import get_ai_final_entry_check, safe_df, safe_float, safe_str
 logger = logging.getLogger(__name__)
 
 DEFAULT_MIN_AI_CONFIDENCE = 0.65
+DEFAULT_CONSOLE_TOP_N = 20
 
 
 def _append_reason(base: str, extra: str) -> str:
@@ -106,6 +107,112 @@ def _inject_daily_fields_to_ai_row(ai_row: Dict[str, Any], row: pd.Series) -> Di
     ai_row["daily_trend_ok"] = _safe_bool(ai_row.get("daily_ok_buy"), False)
     ai_row["daily_exit_risk"] = _safe_bool(ai_row.get("daily_exit_warn"), False)
     return ai_row
+
+
+def _sort_for_console(items: list[dict[str, Any]], side: str) -> list[dict[str, Any]]:
+    side_s = _side_value(side)
+    rows = [x for x in items if str(x.get("side") or x.get("ai_side") or "").upper() == side_s]
+
+    def key_buy(x: dict[str, Any]):
+        return (
+            safe_float(x.get("buy_score")),
+            safe_float(x.get("score_total")),
+            safe_float(x.get("final_score")),
+            safe_float(x.get("confidence")),
+        )
+
+    def key_sell(x: dict[str, Any]):
+        return (
+            safe_float(x.get("sell_score")),
+            -safe_float(x.get("score_total")),
+            -safe_float(x.get("final_score")),
+            safe_float(x.get("confidence")),
+        )
+
+    return sorted(rows, key=key_buy if side_s == "BUY" else key_sell, reverse=True)
+
+
+def _print_summary_ai_top20_console(
+    results: list[dict[str, Any]],
+    *,
+    interval: int | str,
+    source: str,
+    top_n: int = DEFAULT_CONSOLE_TOP_N,
+) -> None:
+    """
+    サマリーTOP20とAI可否を同じブロックでコンソールへ出す。
+    console_teeが有効ならこのままコンソールログにも保存される。
+    """
+    try:
+        if not results:
+            logger.warning(
+                "[SUMMARY AI TOP20 RESULT] empty interval=%s source=%s",
+                interval,
+                source,
+            )
+            return
+
+        for side in ("BUY", "SELL"):
+            rows = _sort_for_console(results, side)[: int(top_n)]
+            if not rows:
+                logger.warning(
+                    "\n========== SUMMARY AI %s TOP20 RESULT interval=%s source=%s rows=0 ==========" ,
+                    side,
+                    interval,
+                    source,
+                )
+                continue
+
+            logger.warning(
+                "\n========== SUMMARY AI %s TOP20 RESULT interval=%s source=%s rows=%s ==========" ,
+                side,
+                interval,
+                source,
+                len(rows),
+            )
+
+            for i, r in enumerate(rows, start=1):
+                status = "AI_OK" if bool(r.get("allow")) else "AI_NG"
+                symbol = safe_str(r.get("symbol"), "")
+                name = safe_str(r.get("symbolname"), "")
+                conf = safe_float(r.get("confidence"), 0.0)
+                buy = safe_float(r.get("buy_score"), 0.0)
+                sell = safe_float(r.get("sell_score"), 0.0)
+                total = safe_float(r.get("score_total"), 0.0)
+                final = safe_float(r.get("final_score"), 0.0)
+                close = safe_float(r.get("close_price"), 0.0)
+                reason = safe_str(r.get("reason"), "")
+                model = safe_str(r.get("model_used"), "")
+
+                logger.warning(
+                    "%2d. %-5s %-18s %s conf=%.3f C=%.1f buy=%.2f sell=%.2f total=%.2f final=%.2f model=%s reason=%s",
+                    i,
+                    symbol,
+                    name[:18],
+                    status,
+                    conf,
+                    close,
+                    buy,
+                    sell,
+                    total,
+                    final,
+                    model,
+                    reason,
+                )
+
+            logger.warning(
+                "========== END SUMMARY AI %s TOP20 RESULT interval=%s source=%s ==========\n",
+                side,
+                interval,
+                source,
+            )
+
+    except Exception:
+        logger.exception(
+            "[SUMMARY AI TOP20 RESULT] console print failed interval=%s source=%s",
+            interval,
+            source,
+        )
 
 
 def run_ai_gate_for_candidates(
@@ -272,6 +379,14 @@ def run_ai_gate_for_candidates(
         interval,
         source,
     )
+
+    _print_summary_ai_top20_console(
+        results,
+        interval=interval,
+        source=source,
+        top_n=DEFAULT_CONSOLE_TOP_N,
+    )
+
     return results
 
 
