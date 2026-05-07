@@ -1,10 +1,16 @@
 # ============================================================
 # File   : data_collectors/ranking_runtime.py
-# Version: DATA-COLLECTORS-RANKING-RUNTIME-V1
+# Version: DATA-COLLECTORS-RANKING-RUNTIME-V2
 # ------------------------------------------------------------
 # Purpose:
 #   - ランキング取得本体を main.py から独立して起動する
 #   - 既存プロジェクトの起動関数を候補順に解決して呼び出す
+#
+# Notes:
+#   - Ver32_L31 の既存構成では、
+#       core.startup.scheduler_ranking_bootstrap.start_ranking_db_writer_safe
+#       trading.ranking.ranking_db_writer.ensure_ranking_writer_started
+#     が ranking DB writer 起動の本命。
 # ============================================================
 
 from __future__ import annotations
@@ -20,11 +26,21 @@ logger = logging.getLogger(__name__)
 
 
 RANKING_START_CANDIDATES = [
-    # 既存候補。プロジェクト側の実名に合わせて必要なら追加してください。
+    # Ver32_L31 本命候補
+    ("core.startup.scheduler_ranking_bootstrap", "start_ranking_db_writer_safe"),
+    ("trading.ranking.ranking_db_writer", "ensure_ranking_writer_started"),
+
+    # startup thin wrapper / 旧名候補
+    ("core.startup.scheduler_startup", "start_ranking_db_writer_safe"),
     ("core.startup.scheduler_startup", "start_ranking_db_writer"),
     ("core.startup.scheduler_startup", "bootstrap_ranking_db_writer"),
+
+    # ranking writer 旧名候補
     ("trading.ranking.ranking_db_writer", "start_ranking_db_writer"),
     ("trading.ranking.ranking_db_writer", "start"),
+    ("trading.ranking.ranking_db_writer", "run_background"),
+
+    # scheduler job 系候補
     ("scheduler_jobs.ranking_save.runner", "register_ranking_save_tasks"),
     ("scheduler_jobs.ranking.runner", "register_ranking_tasks"),
     ("scheduler_jobs.ranking_save", "register_ranking_save_tasks"),
