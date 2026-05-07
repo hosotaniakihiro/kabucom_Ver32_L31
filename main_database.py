@@ -1,6 +1,6 @@
 # ============================================================
 # File   : main_database.py
-# Version: DATA-COLLECTORS-MAIN-DATABASE-ENTRY-V1
+# Version: DATA-COLLECTORS-MAIN-DATABASE-ENTRY-V2-SPLIT-MODE
 # ------------------------------------------------------------
 # Purpose:
 #   - DB作成 / ランキング取得 / PUSH銘柄登録 / PUSH受信 を起動する入口
@@ -26,7 +26,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -40,6 +39,17 @@ def main() -> int:
       3. push_receiver_runner.py
       4. 子プロセス監視
     """
+    try:
+        from data_collectors.split_mode import mark_as_data_collector_process
+        mark_as_data_collector_process()
+    except Exception:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        )
+        logger.exception("[MAIN DATABASE] failed to mark data collector process")
+        return 1
+
     try:
         from scripts.data_collectors_runner import main as data_collectors_main
     except Exception:
