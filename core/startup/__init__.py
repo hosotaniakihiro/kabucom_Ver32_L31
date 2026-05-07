@@ -1,10 +1,10 @@
 # ============================================================
 # File   : core/startup/__init__.py
-# Ver    : PRODUCTION-STABLE-REV20.1-STARTUP-PACKAGE-STALE-GUARD
+# Ver    : PRODUCTION-STABLE-REV20.2-STARTUP-PACKAGE-STALE-GUARD-TIMEOUT-PATCH
 # ------------------------------------------------------------
 # 【概要】
 #   core.startup パッケージの公開入口
-#   schedule loop stale guard patch を自動適用する。
+#   schedule loop stale guard patch / summary scheduler timeout patch を自動適用する。
 # ============================================================
 
 from __future__ import annotations
@@ -19,6 +19,13 @@ try:
     install_schedule_loop_stale_patch()
 except Exception:
     logger.exception("[core.startup] schedule loop stale patch install failed")
+
+try:
+    from .summary_scheduler_timeout_patch import install_summary_scheduler_timeout_patch
+
+    install_summary_scheduler_timeout_patch()
+except Exception:
+    logger.exception("[core.startup] summary scheduler timeout patch install failed")
 
 from .startup import system_startup
 from .summary_bootstrap import (
