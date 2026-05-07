@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/summary/persistence/core/upsert_executor.py
-# Version: PRODUCTION-STABLE-UPSERT-EXECUTOR-V7-DB-SQLITE-COMMON
+# Version: PRODUCTION-STABLE-UPSERT-EXECUTOR-V8-DROP-AUTOINCREMENT-ID
 # ------------------------------------------------------------
 # Purpose:
 #   summary 系テーブルへの bulk upsert 公開API。
@@ -17,6 +17,11 @@
 #   - table_filter.py
 #   - sql_builder.py
 #   - delete_insert_fallback.py
+#
+# REV8:
+#   - stock_summary_* への保存時、DataFrame 由来の id を必ず除外する
+#   - id は SQLite 側の自動採番主キーとして扱う
+#   - ON CONFLICT(symbol, datetime) UPSERT 中の UNIQUE(id) 衝突を防ぐ
 # ============================================================
 
 from __future__ import annotations
@@ -74,6 +79,55 @@ def _get_engine(engine: Optional[Engine] = None) -> Engine:
     raise RuntimeError("summary engine is not available")
 
 
+def _drop_summary_autoincrement_id(rows: List[dict], *, table_name: str, interval: int) -> List[dict]:
+    """
+    stock_summary_* の id は SQLite 側の自動採番主キーとして扱う。
+
+    DataFrame に古い id が混入したまま INSERT/UPSERT すると、
+    ON CONFLICT(symbol, datetime) の対象外である UNIQUE(id) に衝突し、
+    次のようなエラーになる。
+
+      sqlite3.IntegrityError: UNIQUE constraint failed: stock_summary_1min.id
+
+    そのため summary 保存では id を SQL に渡さない。
+    """
+    if not rows:
+        return rows
+
+    table = str(table_name or "")
+    if not table.startswith("stock_summary_"):
+        return rows
+
+    has_id = any(isinstance(r, dict) and "id" in r for r in rows)
+    if not has_id:
+        return rows
+
+    out: List[dict] = []
+    dropped = 0
+
+    for r in rows:
+        if not isinstance(r, dict):
+            out.append(r)
+            continue
+
+        if "id" in r:
+            nr = dict(r)
+            nr.pop("id", None)
+            out.append(nr)
+            dropped += 1
+        else:
+            out.append(r)
+
+    logger.warning(
+        "[UPSERT] dropped autoincrement id before summary save interval=%s table=%s rows=%s dropped=%s",
+        interval,
+        table_name,
+        len(rows),
+        dropped,
+    )
+    return out
+
+
 def execute_chunk_with_retry(
     *,
     engine: Engine,
@@ -92,6 +146,11 @@ def execute_chunk_with_retry(
     """
     safe_chunk = normalize_rows_for_sqlite(chunk)
     safe_chunk = filter_rows_to_existing_columns(engine, table_name, safe_chunk)
+    safe_chunk = _drop_summary_autoincrement_id(
+        safe_chunk,
+        table_name=table_name,
+        interval=int(interval),
+    )
 
     if not safe_chunk:
         logger.warning(
@@ -143,6 +202,15 @@ def execute_upsert(
     eng = _get_engine(engine)
     table = table_name or _table_name_from_interval(int(interval))
 
+    # SQL生成前に id を除外する。
+    # ここで除外しないと INSERT列 / UPDATE SET の両方に id が含まれ、
+    # UNIQUE(id) と ON CONFLICT(symbol, datetime) が噛み合わず失敗する。
+    work = _drop_summary_autoincrement_id(
+        work,
+        table_name=table,
+        interval=int(interval),
+    )
+
     chunk_size = max(1, int(chunk_size or _DEFAULT_CHUNK_SIZE))
     retry = max(1, int(retry or _DEFAULT_RETRY))
     sleep_base = max(0.05, float(sleep_base or _DEFAULT_SLEEP_BASE))
@@ -164,6 +232,12 @@ def execute_upsert(
             return 0
 
         work = filter_rows_to_existing_columns(eng, table, work)
+        work = _drop_summary_autoincrement_id(
+            work,
+            table_name=table,
+            interval=int(interval),
+        )
+
         if not work:
             logger.warning(
                 "[UPSERT] no rows after table-column filter interval=%s table=%s",
@@ -231,10 +305,15 @@ def execute_upsert(
         )
 
         for chunk_no, total_chunks, chunk in chunked(work, chunk_size):
+            safe_chunk = _drop_summary_autoincrement_id(
+                list(chunk),
+                table_name=table,
+                interval=int(interval),
+            )
             delete_then_insert_chunk(
                 engine=eng,
                 table_name=table,
-                chunk=chunk,
+                chunk=safe_chunk,
                 interval=int(interval),
                 chunk_no=chunk_no,
                 total_chunks=total_chunks,
