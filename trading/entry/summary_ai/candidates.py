@@ -1,17 +1,16 @@
 # ============================================================
 # File   : trading/entry/summary_ai/candidates.py
-# Version: PRODUCTION-STABLE-REV2.0-BUY-SELL-TOP20-CANDIDATES
+# Version: PRODUCTION-STABLE-REV2.1-FORCE-TOP20-RANKING-SAFE
 # ------------------------------------------------------------
 # Purpose:
 #   - SUMMARY / RANKING SUMMARY の DataFrame からAI gate候補を作る
 #   - build_summary_ai_entry_candidates() で BUY TOP20 と SELL TOP20 を同時に返す
 #   - 各行に ai_side / side = BUY or SELL を付与し、AI gate側で行ごとに判定する
 #
-# Important:
-#   - 既存runnerが build_summary_ai_entry_candidates() だけを呼んでも、
-#     BUY候補とSELL候補の両方がAIへ渡る
-#   - BUY候補: close > 200, volume条件, slope > 閾値, buy score優勢
-#   - SELL候補: close > 200, volume条件, slope < 閾値, sell score優勢
+# REV2.1:
+#   - hook 側から top_n=10 が渡っても、最低20件ずつ候補化する
+#   - RANKING由来では slope の厳格条件を使わず、ランキングスコア/方向性を優先する
+#   - PUSH由来では従来どおり slope 条件を維持する
 # ============================================================
 
 from __future__ import annotations
@@ -65,6 +64,25 @@ def _env_bool(name: str, default: bool = False) -> bool:
         return bool(default)
     except Exception:
         return bool(default)
+
+
+def _is_ranking_source(source: str) -> bool:
+    try:
+        return "RANKING" in str(source or "").upper()
+    except Exception:
+        return False
+
+
+def _resolve_top_n(top_n: int | str | None) -> int:
+    """
+    AIに渡す候補は最低20件。
+    hook側が古く top_n=10 を渡しても、ここで20に補正する。
+    """
+    try:
+        n = int(top_n or DEFAULT_TOP_N)
+    except Exception:
+        n = DEFAULT_TOP_N
+    return max(DEFAULT_TOP_N, n)
 
 
 def _entry_min_price(default: float = DEFAULT_MIN_PRICE) -> float:
@@ -240,18 +258,30 @@ def _prepare_base(summary_df: pd.DataFrame, *, require_buy_target: bool, exclude
 def _buy_candidates_from_prepared(df: pd.DataFrame, *, interval: int | str, top_n: int, min_buy_score: float, max_sell_score: float, min_volume: float, min_price: float, source: str) -> pd.DataFrame:
     if df.empty:
         return df
+    top_n = _resolve_top_n(top_n)
     resolved_min_price = max(float(min_price), _entry_min_price(DEFAULT_MIN_PRICE))
     resolved_min_buy_slope = _entry_min_buy_slope()
     before = len(df)
-    out = df[
+
+    base_mask = (
         (pd.to_numeric(df["ai_disp_buy_score"], errors="coerce").fillna(0.0) >= float(min_buy_score))
         & (pd.to_numeric(df["ai_disp_sell_score"], errors="coerce").fillna(0.0) <= float(max_sell_score))
         & (pd.to_numeric(df["ai_disp_close"], errors="coerce").fillna(0.0) > float(resolved_min_price))
         & (pd.to_numeric(df["ai_disp_volume"], errors="coerce").fillna(0.0) >= float(min_volume))
-        & (pd.to_numeric(df["ai_disp_slope"], errors="coerce").fillna(0.0) > float(resolved_min_buy_slope))
-    ].copy()
+    )
+    if not _is_ranking_source(source):
+        base_mask = base_mask & (pd.to_numeric(df["ai_disp_slope"], errors="coerce").fillna(0.0) > float(resolved_min_buy_slope))
+
+    out = df[base_mask].copy()
     if out.empty:
-        logger.warning("[SUMMARY AI CANDIDATES] BUY empty interval=%s source=%s before=%s", interval, source, before)
+        logger.warning(
+            "[SUMMARY AI CANDIDATES] BUY empty interval=%s source=%s before=%s ranking_source=%s slope_gate=%s",
+            interval,
+            source,
+            before,
+            _is_ranking_source(source),
+            not _is_ranking_source(source),
+        )
         return out
     out["_ai_sort_score"] = (
         pd.to_numeric(out["ai_disp_buy_score"], errors="coerce").fillna(0.0) * 10.0
@@ -260,30 +290,42 @@ def _buy_candidates_from_prepared(df: pd.DataFrame, *, interval: int | str, top_
         + pd.to_numeric(out["ai_disp_slope"], errors="coerce").fillna(0.0)
         - pd.to_numeric(out["ai_disp_sell_score"], errors="coerce").fillna(0.0) * 5.0
     )
-    out = out.sort_values(["_ai_sort_score", "ai_disp_buy_score", "ai_disp_total_score"], ascending=[False, False, False], na_position="last", kind="mergesort").head(int(top_n))
+    out = out.sort_values(["_ai_sort_score", "ai_disp_buy_score", "ai_disp_total_score"], ascending=[False, False, False], na_position="last", kind="mergesort").head(top_n)
     out = out.drop(columns=["_ai_sort_score"], errors="ignore").reset_index(drop=True)
     out["ai_side"] = "BUY"
     out["side"] = "BUY"
     out["entry_decision"] = "BUY"
-    logger.warning("[SUMMARY AI CANDIDATES] BUY_TOP_READY interval=%s source=%s count=%s top_n=%s symbols=%s", interval, source, len(out), top_n, _safe_symbols(out, int(top_n)))
+    logger.warning("[SUMMARY AI CANDIDATES] BUY_TOP_READY interval=%s source=%s count=%s top_n=%s symbols=%s", interval, source, len(out), top_n, _safe_symbols(out, top_n))
     return out
 
 
 def _sell_candidates_from_prepared(df: pd.DataFrame, *, interval: int | str, top_n: int, min_sell_score: float, max_buy_score: float, min_volume: float, min_price: float, source: str) -> pd.DataFrame:
     if df.empty:
         return df
+    top_n = _resolve_top_n(top_n)
     resolved_min_price = max(float(min_price), _entry_min_price(DEFAULT_MIN_PRICE))
     resolved_max_sell_slope = _entry_max_sell_slope()
     before = len(df)
-    out = df[
+
+    base_mask = (
         (pd.to_numeric(df["ai_disp_sell_score"], errors="coerce").fillna(0.0) >= float(min_sell_score))
         & (pd.to_numeric(df["ai_disp_buy_score"], errors="coerce").fillna(0.0) <= float(max_buy_score))
         & (pd.to_numeric(df["ai_disp_close"], errors="coerce").fillna(0.0) > float(resolved_min_price))
         & (pd.to_numeric(df["ai_disp_volume"], errors="coerce").fillna(0.0) >= float(min_volume))
-        & (pd.to_numeric(df["ai_disp_slope"], errors="coerce").fillna(0.0) < float(resolved_max_sell_slope))
-    ].copy()
+    )
+    if not _is_ranking_source(source):
+        base_mask = base_mask & (pd.to_numeric(df["ai_disp_slope"], errors="coerce").fillna(0.0) < float(resolved_max_sell_slope))
+
+    out = df[base_mask].copy()
     if out.empty:
-        logger.warning("[SUMMARY AI CANDIDATES] SELL empty interval=%s source=%s before=%s", interval, source, before)
+        logger.warning(
+            "[SUMMARY AI CANDIDATES] SELL empty interval=%s source=%s before=%s ranking_source=%s slope_gate=%s",
+            interval,
+            source,
+            before,
+            _is_ranking_source(source),
+            not _is_ranking_source(source),
+        )
         return out
     out["_ai_sort_score"] = (
         pd.to_numeric(out["ai_disp_sell_score"], errors="coerce").fillna(0.0) * 10.0
@@ -291,12 +333,12 @@ def _sell_candidates_from_prepared(df: pd.DataFrame, *, interval: int | str, top
         - pd.to_numeric(out["ai_disp_slope"], errors="coerce").fillna(0.0) * 3.0
         - pd.to_numeric(out["ai_disp_total_score"], errors="coerce").fillna(0.0)
     )
-    out = out.sort_values(["_ai_sort_score", "ai_disp_sell_score"], ascending=[False, False], na_position="last", kind="mergesort").head(int(top_n))
+    out = out.sort_values(["_ai_sort_score", "ai_disp_sell_score"], ascending=[False, False], na_position="last", kind="mergesort").head(top_n)
     out = out.drop(columns=["_ai_sort_score"], errors="ignore").reset_index(drop=True)
     out["ai_side"] = "SELL"
     out["side"] = "SELL"
     out["entry_decision"] = "SELL"
-    logger.warning("[SUMMARY AI CANDIDATES] SELL_TOP_READY interval=%s source=%s count=%s top_n=%s symbols=%s", interval, source, len(out), top_n, _safe_symbols(out, int(top_n)))
+    logger.warning("[SUMMARY AI CANDIDATES] SELL_TOP_READY interval=%s source=%s count=%s top_n=%s symbols=%s", interval, source, len(out), top_n, _safe_symbols(out, top_n))
     return out
 
 
@@ -320,10 +362,7 @@ def build_summary_ai_entry_candidates(
       既存runnerはこの関数しか呼ばないため、ここでBUY TOP20とSELL TOP20を結合して返す。
       ai_gate_runner.py は行ごとの ai_side / side を読んで BUY/SELL としてAIに渡す。
     """
-    try:
-        top_n = max(1, int(top_n or DEFAULT_TOP_N))
-    except Exception:
-        top_n = DEFAULT_TOP_N
+    top_n = _resolve_top_n(top_n)
 
     base = _prepare_base(summary_df, require_buy_target=require_buy_target, exclude_etf_fund=exclude_etf_fund)
     if base.empty:
@@ -384,13 +423,14 @@ def build_summary_ai_sell_entry_candidates(
     exclude_etf_fund: bool = True,
     source: str = "SUMMARY",
 ) -> pd.DataFrame:
+    top_n = _resolve_top_n(top_n)
     base = _prepare_base(summary_df, require_buy_target=require_buy_target, exclude_etf_fund=exclude_etf_fund)
     if base.empty:
         return base
     return _sell_candidates_from_prepared(
         base,
         interval=interval,
-        top_n=int(top_n or DEFAULT_TOP_N),
+        top_n=top_n,
         min_sell_score=min_sell_score,
         max_buy_score=max_buy_score,
         min_volume=min_volume,
