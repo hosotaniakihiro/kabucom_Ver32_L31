@@ -1,16 +1,12 @@
 # ============================================================
 # File   : trading/entry/summary_ai/ai_gate_runner.py
-# Version: PRODUCTION-STABLE-REV3.0-AI-GATE-BUY-SELL-SIDE
+# Version: PRODUCTION-STABLE-REV3.1-AI-GATE-PER-ROW-SIDE
 # ------------------------------------------------------------
 # Purpose:
 #   - summary候補 DataFrame を AI gate に通す
 #   - BUY / SELL の side を明示して AI に渡す
-#   - 既存の run_push_summary_ai_entry 互換APIは維持する
-#
-# Important:
-#   - run_ai_gate_for_candidates(..., side="BUY"/"SELL") を追加
+#   - row側に side / ai_side がある場合は行ごとに BUY/SELL を切り替える
 #   - 旧呼び出しは side="BUY" のまま動作
-#   - 実エントリー送信は従来通り BUY 側だけの互換処理
 # ============================================================
 
 from __future__ import annotations
@@ -59,6 +55,18 @@ def _side_value(side: Any) -> str:
     if s not in {"BUY", "SELL"}:
         s = "BUY"
     return s
+
+
+def _row_side(row: pd.Series, default_side: str) -> str:
+    for c in ("ai_side", "side", "entry_decision", "signal"):
+        try:
+            if c in row.index:
+                v = str(row.get(c) or "").strip().upper()
+                if v in {"BUY", "SELL"}:
+                    return v
+        except Exception:
+            pass
+    return _side_value(default_side)
 
 
 def _get_place_entry_buy():
@@ -113,13 +121,6 @@ def run_ai_gate_for_candidates(
     daily_hard_block_exit_warn: bool = False,
     daily_min_score: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    candidates_df を AI gate に渡す。
-
-    side:
-      BUY  - 上昇/買い候補として評価
-      SELL - 下落/売り/警戒候補として評価
-    """
     df = safe_df(candidates_df)
     if df.empty:
         logger.warning(
@@ -130,34 +131,42 @@ def run_ai_gate_for_candidates(
         )
         return []
 
-    side_s = _side_value(side)
+    default_side = _side_value(side)
     ai_check = get_ai_final_entry_check()
     if ai_check is None:
-        logger.error("[SUMMARY AI GATE] ai_final_entry_check not found side=%s", side_s)
+        logger.error("[SUMMARY AI GATE] ai_final_entry_check not found side=%s", default_side)
         return []
 
-    results: List[Dict[str, Any]] = []
+    try:
+        side_counts = df.get("ai_side", df.get("side", pd.Series([default_side] * len(df)))).astype(str).str.upper().value_counts().to_dict()
+    except Exception:
+        side_counts = {default_side: len(df)}
 
     logger.warning(
-        "[SUMMARY AI GATE] SEND_TO_AI start side=%s rows=%s interval=%s source=%s min_conf=%.2f symbols=%s",
-        side_s,
+        "[SUMMARY AI GATE] SEND_TO_AI start default_side=%s rows=%s side_counts=%s interval=%s source=%s min_conf=%.2f symbols=%s",
+        default_side,
         len(df),
+        side_counts,
         interval,
         source,
         float(min_ai_confidence),
-        list(df["symbol"].astype(str).head(30)) if "symbol" in df.columns else [],
+        list(df["symbol"].astype(str).head(40)) if "symbol" in df.columns else [],
     )
 
+    results: List[Dict[str, Any]] = []
+
     for _, row in df.iterrows():
+        row_side = _row_side(row, default_side)
+
         ai_row = convert_summary_row_to_ai_gate_row(
             row,
             interval=interval,
             source=source,
             default_dominant_ratio=default_dominant_ratio,
-            side=side_s,
+            side=row_side,
         )
-        ai_row["side"] = side_s
-        ai_row["ai_side"] = side_s
+        ai_row["side"] = row_side
+        ai_row["ai_side"] = row_side
         ai_row = _inject_daily_fields_to_ai_row(ai_row, row)
 
         symbol = safe_str(ai_row.get("symbol"), "")
@@ -173,7 +182,7 @@ def run_ai_gate_for_candidates(
                     "model_used": "UNKNOWN",
                 }
         except Exception:
-            logger.exception("[SUMMARY AI GATE] AI gate failed side=%s symbol=%s", side_s, symbol)
+            logger.exception("[SUMMARY AI GATE] AI gate failed side=%s symbol=%s", row_side, symbol)
             gate_result = {
                 "allow": False,
                 "confidence": 0.0,
@@ -190,7 +199,7 @@ def run_ai_gate_for_candidates(
             allow = False
             reason = _append_reason(reason, f"confidence_low:{conf:.3f}<{float(min_ai_confidence):.3f}")
 
-        if allow and side_s == "BUY" and daily_hard_block_exit_warn:
+        if allow and row_side == "BUY" and daily_hard_block_exit_warn:
             if _safe_bool(ai_row.get("daily_exit_warn"), False):
                 allow = False
                 reason = _append_reason(reason, "daily_exit_warn")
@@ -210,8 +219,8 @@ def run_ai_gate_for_candidates(
             "reason": reason,
             "model_used": model_used,
             "lot_multiplier": safe_float(gate_result.get("lot_multiplier"), 1.0),
-            "side": side_s,
-            "ai_side": side_s,
+            "side": row_side,
+            "ai_side": row_side,
             "ai_row": ai_row,
             "source_row": dict(row),
             "symbol": symbol,
@@ -236,7 +245,7 @@ def run_ai_gate_for_candidates(
         logger.info(
             "[SUMMARY AI GATE] AI_%s side=%s symbol=%s name=%s conf=%.3f buy=%.2f sell=%.2f total=%.2f close=%.1f reason=%s model=%s",
             "OK" if allow else "NG",
-            side_s,
+            row_side,
             symbol,
             symbolname,
             conf,
@@ -248,12 +257,18 @@ def run_ai_gate_for_candidates(
             model_used,
         )
 
+    buy_sent = len([x for x in results if str(x.get("side")).upper() == "BUY"])
+    sell_sent = len([x for x in results if str(x.get("side")).upper() == "SELL"])
+    buy_ok = len([x for x in results if str(x.get("side")).upper() == "BUY" and bool(x.get("allow"))])
+    sell_ok = len([x for x in results if str(x.get("side")).upper() == "SELL" and bool(x.get("allow"))])
+
     logger.warning(
-        "[SUMMARY AI GATE] SEND_TO_AI done side=%s sent=%s ok=%s ng=%s interval=%s source=%s",
-        side_s,
+        "[SUMMARY AI GATE] SEND_TO_AI done sent=%s buy_sent=%s sell_sent=%s buy_ok=%s sell_ok=%s interval=%s source=%s",
         len(results),
-        len([x for x in results if bool(x.get("allow"))]),
-        len([x for x in results if not bool(x.get("allow"))]),
+        buy_sent,
+        sell_sent,
+        buy_ok,
+        sell_ok,
         interval,
         source,
     )
@@ -295,10 +310,6 @@ def run_push_summary_ai_entry(
     side: str = "BUY",
     **kwargs,
 ) -> Dict[str, Any]:
-    """
-    旧互換: 渡されたDFの先頭 top_n をAIへ渡す。
-    実発注互換は BUY side の AI_OK のみ対象。
-    """
     base_df = summary_df if isinstance(summary_df, pd.DataFrame) else df
     base_df = safe_df(base_df)
 
@@ -360,6 +371,8 @@ def run_push_summary_ai_entry(
         max_entries_i = 1
 
     for r in ai_ok[:max_entries_i]:
+        if str(r.get("side", "BUY")).upper() != "BUY":
+            continue
         v = _extract_entry_values(r)
         if not v["symbol"]:
             continue
