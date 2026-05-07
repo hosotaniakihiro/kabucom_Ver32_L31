@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/summary/mtf/daily_mtf_summary_patch.py
-# Version: PRODUCTION-STABLE-DAILY-MTF-SUMMARY-PATCH-REV1.0
+# Version: PRODUCTION-STABLE-DAILY-MTF-SUMMARY-PATCH-REV1.1
 # ------------------------------------------------------------
 # Purpose:
 #   - summary_saver_bulk の保存入口を安全にラップする
@@ -13,6 +13,7 @@
 #   - 日足DB読み込みに失敗しても、元のsummary保存は止めない
 #   - DB列追加に失敗しても、元のsummary保存は止めない
 #   - すでに patch 済みなら二重patchしない
+#   - SQLAlchemy raw_connection() は context manager にしない
 # ============================================================
 
 from __future__ import annotations
@@ -63,7 +64,13 @@ def _ensure_summary_daily_mtf_columns(summary_saver_bulk_module: Any, interval: 
     """
     summary DB の対象テーブルに daily_mtf 用カラムを追加する。
     summary_saver_bulk._resolve_summary_engine() が使える場合だけ実行。
+
+    Notes
+    -----
+    SQLAlchemy の engine.raw_connection() が返す _ConnectionFairy は、
+    環境によって context manager 非対応のため、with ではなく明示 close する。
     """
+    raw_conn = None
     try:
         resolver = getattr(summary_saver_bulk_module, "_resolve_summary_engine", None)
         if not callable(resolver):
@@ -78,14 +85,33 @@ def _ensure_summary_daily_mtf_columns(summary_saver_bulk_module: Any, interval: 
         table_name = _summary_table_name(interval)
 
         # SQLAlchemy engine想定。raw sqlite connection に落として列追加する。
-        with engine.raw_connection() as raw_conn:  # type: ignore[attr-defined]
-            ensure_daily_mtf_columns_sqlite(raw_conn, table_name)
+        # raw_connection() は context manager として使わない。
+        raw_conn = engine.raw_connection()  # type: ignore[attr-defined]
+        ensure_daily_mtf_columns_sqlite(raw_conn, table_name)
+
+        try:
+            raw_conn.commit()
+        except Exception:
+            # ensure_daily_mtf_columns_sqlite 側で commit 済みの実装にも対応。
+            logger.debug("[DAILY MTF PATCH] raw_conn.commit skipped/failed", exc_info=True)
 
     except Exception:
         logger.exception(
             "[DAILY MTF PATCH] ensure summary columns failed interval=%s",
             interval,
         )
+        try:
+            if raw_conn is not None:
+                raw_conn.rollback()
+        except Exception:
+            pass
+
+    finally:
+        try:
+            if raw_conn is not None:
+                raw_conn.close()
+        except Exception:
+            pass
 
 
 def _attach_daily_mtf_safely(df: pd.DataFrame, *, interval: int, save_reason: str = "") -> pd.DataFrame:
