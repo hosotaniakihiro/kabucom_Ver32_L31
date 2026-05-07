@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/runner.py
-# Version: Ver1.4-PRODUCTION-PUSH-STREAM-RUNNER-ROTATION-CORE
+# Version: Ver1.5-PRODUCTION-PUSH-STREAM-RUNNER-MEMORY-ONLY-MODE
 # ------------------------------------------------------------
 # 【概要】
 #   kabu Station PUSH WebSocket runner
@@ -14,29 +14,19 @@
 #   - stream writer / order book writer 初期化
 #   - runtime flags / status 管理
 #
-# 【REV1.2】
-#   ✔ callback 配線ログを追加
-#   ✔ run loop finally で ws_app を安全クリア
-#   ✔ 受信切り分け用ログ強化
-#
-# 【REV1.3】
-#   ✔ refresh_callable=None の場合でも subscription_manager 側の
-#     refresh 関数を自動探索して set_refresh_callable する
-#   ✔ refresh_callable=False による rotation_A / rotation_B 空振りを防止
-#   ✔ push_stream 側では ws.send 登録を行わず、登録更新は
-#     subscription_manager に委譲する設計を維持
-#   ✔ trading/push/push_stream/core.py が無い構成でも動作
-#
-# 【REV1.4】
-#   ✔ rotation.py ではなく rotation_core.py の薄い制御本体を起動
-#   ✔ rotation_settings / rotation_symbols / rotation_register / rotation_logging
-#     への段階的分割構成へ移行
+# REV1.5:
+#   ✔ main_database.py と main.py を併用するための memory_only mode 追加
+#   ✔ stream_writer=False または PUSH_STREAM_DB_WRITE=0 でDB保存workerを起動しない
+#   ✔ order_book_writer=False または PUSH_STREAM_ORDER_BOOK_WRITE=0 で板DB writerを起動しない
+#   ✔ enable_rotate=False でmain.py側の銘柄登録ローテーションを止める
+#   ✔ WebSocket受信・df更新・latest_price_cache更新は継続
 # ============================================================
 
 from __future__ import annotations
 
 import importlib
 import logging
+import os
 import threading
 import time
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -66,7 +56,22 @@ from .constants import RECONNECT_WAIT_SEC
 
 logger = logging.getLogger(__name__)
 
-VERSION = "Ver1.4-PRODUCTION-PUSH-STREAM-RUNNER-ROTATION-CORE"
+VERSION = "Ver1.5-PRODUCTION-PUSH-STREAM-RUNNER-MEMORY-ONLY-MODE"
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.environ.get(name)
+        if v is None:
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on"}:
+            return True
+        if s in {"0", "false", "no", "n", "off"}:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
 
 
 # ============================================================
@@ -88,10 +93,6 @@ def _is_refresh_callable_alive() -> bool:
 
 
 def _is_self_refresh_callable(fn: Any) -> bool:
-    """
-    push_stream.transport.refresh_subscriptions 自身を refresh_callable にすると
-    再帰になるため禁止する。
-    """
     try:
         return fn is refresh_subscriptions
     except Exception:
@@ -99,28 +100,6 @@ def _is_self_refresh_callable(fn: Any) -> bool:
 
 
 def _auto_resolve_subscription_refresh_callable() -> Optional[Callable[..., Any]]:
-    """
-    push_stream rotation から kabu Station 登録更新へ委譲する callable を自動解決する。
-
-    目的:
-      - start_push_stream(refresh_callable=None) でも rotation が実登録できるようにする
-      - refresh_callable=False による rotation_A / rotation_B 空振りを防ぐ
-      - push_stream 側では ws.send 登録を行わず、subscription_manager に委譲する
-
-    探索優先順位:
-      1. trading.push.subscription_manager.core.refresh_subscriptions
-      2. trading.push.subscription_manager.core.refresh_subscription_symbols
-      3. trading.push.subscription_manager.core.refresh_register_symbols
-      4. trading.push.subscription_manager.refresh_subscriptions
-      5. trading.push.subscription_manager.refresh_subscription_symbols
-      6. trading.push.subscription_manager.refresh_register_symbols
-      7. trading.push.subscription_manager.core.register_symbols
-      8. trading.push.subscription_manager.register_symbols
-
-    注意:
-      - push_stream.transport.refresh_subscriptions 自身は候補から除外する
-      - import 失敗は debug ログのみ
-    """
     candidates: Tuple[Tuple[str, str], ...] = (
         ("trading.push.subscription_manager.core", "refresh_subscriptions"),
         ("trading.push.subscription_manager.core", "refresh_subscription_symbols"),
@@ -146,11 +125,6 @@ def _auto_resolve_subscription_refresh_callable() -> Optional[Callable[..., Any]
             continue
 
         if not callable(fn):
-            logger.debug(
-                "[push_stream] auto resolve refresh callable skipped not callable module=%s func=%s",
-                module_name,
-                func_name,
-            )
             continue
 
         if _is_self_refresh_callable(fn):
@@ -176,15 +150,6 @@ def _auto_resolve_subscription_refresh_callable() -> Optional[Callable[..., Any]
 
 
 def _set_refresh_callable_preserve(refresh_callable: Optional[Any]) -> bool:
-    """
-    refresh_callable を安全に設定する。
-
-    重要:
-      - refresh_callable が明示指定された場合はそれを使う
-      - None の場合、既存 callable があれば維持
-      - 既存 callable が無ければ subscription_manager から自動探索
-      - push_stream.transport.refresh_subscriptions 自身は再帰になるため拒否
-    """
     existing = _get_existing_refresh_callable()
 
     if refresh_callable is None:
@@ -208,20 +173,16 @@ def _set_refresh_callable_preserve(refresh_callable: Optional[Any]) -> bool:
                     getattr(auto_fn, "__name__", type(auto_fn).__name__),
                 )
                 return ok
-
             except Exception:
                 logger.exception("[push_stream] auto set_refresh_callable failed")
                 return False
 
-        logger.warning(
-            "[push_stream] refresh_callable missing and auto resolve failed"
-        )
+        logger.warning("[push_stream] refresh_callable missing and auto resolve failed")
         return False
 
     if _is_self_refresh_callable(refresh_callable):
         logger.warning(
-            "[push_stream] start_push_stream received self refresh callable -> "
-            "ignore and keep existing existing=%s",
+            "[push_stream] start_push_stream received self refresh callable -> ignore and keep existing existing=%s",
             callable(existing),
         )
         return callable(existing)
@@ -245,22 +206,12 @@ def _set_refresh_callable_preserve(refresh_callable: Optional[Any]) -> bool:
             getattr(refresh_callable, "__name__", type(refresh_callable).__name__),
         )
         return ok
-
     except Exception:
-        logger.exception(
-            "[push_stream] set_refresh_callable failed; keep existing=%s",
-            callable(existing),
-        )
+        logger.exception("[push_stream] set_refresh_callable failed; keep existing=%s", callable(existing))
         return callable(existing)
 
 
 def _set_rotation_preserve(enable_rotate: Optional[bool]) -> bool:
-    """
-    rotation 有効/無効を設定する。
-
-    enable_rotate=None の場合:
-      - 既存設定を維持する
-    """
     if enable_rotate is None:
         current = bool(getattr(state, "_rotation_enabled", False))
         logger.info("[push_stream] preserve rotation enabled=%s", current)
@@ -274,14 +225,8 @@ def _set_rotation_preserve(enable_rotate: Optional[bool]) -> bool:
     return bool(getattr(state, "_rotation_enabled", False))
 
 
-def _start_thread_if_needed(
-    *,
-    attr_name: str,
-    target: Any,
-    name: str,
-) -> threading.Thread:
+def _start_thread_if_needed(*, attr_name: str, target: Any, name: str) -> threading.Thread:
     th = getattr(state, attr_name, None)
-
     try:
         if th is not None and th.is_alive():
             logger.info("[push_stream] thread already alive name=%s", name)
@@ -289,14 +234,9 @@ def _start_thread_if_needed(
     except Exception:
         pass
 
-    th = threading.Thread(
-        target=target,
-        name=name,
-        daemon=True,
-    )
+    th = threading.Thread(target=target, name=name, daemon=True)
     setattr(state, attr_name, th)
     th.start()
-
     logger.info("[push_stream] thread started name=%s", name)
     return th
 
@@ -304,10 +244,7 @@ def _start_thread_if_needed(
 def _sync_runtime_status_after_start() -> None:
     try:
         _safe_set_runtime("push_stream_running", True)
-        _safe_set_runtime(
-            "push_writer_running",
-            bool(state._flush_thread and state._flush_thread.is_alive()),
-        )
+        _safe_set_runtime("push_writer_running", bool(state._flush_thread and state._flush_thread.is_alive()))
         _safe_set_runtime("subscription_refresh_running", _is_refresh_callable_alive())
         _safe_set_runtime("rotation_enabled", bool(getattr(state, "_rotation_enabled", False)))
     except Exception:
@@ -326,7 +263,6 @@ def _run_forever_loop() -> None:
     while not state._stop_event.is_set():
         try:
             _safe_set_runtime("push_ws_url", ws_url)
-
             ws_app = websocket.WebSocketApp(
                 ws_url,
                 on_open=on_open,
@@ -347,20 +283,12 @@ def _run_forever_loop() -> None:
             )
 
             try:
-                ws_app.run_forever(
-                    ping_interval=20,
-                    ping_timeout=10,
-                    reconnect=0,
-                )
+                ws_app.run_forever(ping_interval=20, ping_timeout=10, reconnect=0)
             except TypeError:
-                ws_app.run_forever(
-                    ping_interval=20,
-                    ping_timeout=10,
-                )
+                ws_app.run_forever(ping_interval=20, ping_timeout=10)
 
         except Exception:
             logger.exception("[push_stream] run_forever crashed")
-
         finally:
             try:
                 with state._ws_state_lock:
@@ -389,29 +317,7 @@ def start_push_stream(
     refresh_callable: Optional[Any] = None,
     enable_rotate: Optional[bool] = None,
 ) -> None:
-    """
-    PUSH WebSocket をバックグラウンド起動する。
-
-    Parameters
-    ----------
-    ws_url:
-        WebSocket URL。None の場合は runtime/settings から解決。
-
-    stream_writer:
-        PUSH 約定/板等の保存 writer。None の場合は標準 writer を初期化。
-
-    order_book_writer:
-        order book writer。None の場合は標準 writer を初期化。
-
-    refresh_callable:
-        kabu Station への登録銘柄更新関数。
-        None の場合でも subscription_manager から自動探索する。
-
-    enable_rotate:
-        True  : rotation 有効
-        False : rotation 無効
-        None  : 既存状態維持
-    """
+    """PUSH WebSocket をバックグラウンド起動する。"""
     with state._runtime_lock:
         if state._ws_thread is not None and state._ws_thread.is_alive():
             logger.info(
@@ -427,63 +333,61 @@ def start_push_stream(
 
         state._stop_event.clear()
         _ensure_runtime_flags()
-
         state._ring_buffer = _init_ring_buffer()
 
-        state._stream_writer = (
-            stream_writer
-            if stream_writer is not None
-            else _init_stream_writer()
-        )
+        db_write_enabled = _env_bool("PUSH_STREAM_DB_WRITE", True) and stream_writer is not False
+        order_book_write_enabled = _env_bool("PUSH_STREAM_ORDER_BOOK_WRITE", True) and order_book_writer is not False
 
-        state._order_book_writer = (
-            order_book_writer
-            if order_book_writer is not None
-            else _init_order_book_writer()
-        )
+        if db_write_enabled:
+            state._stream_writer = stream_writer if stream_writer is not None else _init_stream_writer()
+        else:
+            state._stream_writer = None
+            _safe_set_runtime("push_stream_db_write_enabled", False)
+            logger.warning("[push_stream] DB write disabled; WebSocket updates memory df/latest cache only")
 
-        refresh_alive = _set_refresh_callable_preserve(refresh_callable)
+        if order_book_write_enabled:
+            state._order_book_writer = order_book_writer if order_book_writer is not None else _init_order_book_writer()
+        else:
+            state._order_book_writer = None
+            _safe_set_runtime("push_stream_order_book_write_enabled", False)
+            logger.warning("[push_stream] order book DB write disabled")
+
+        refresh_alive = _set_refresh_callable_preserve(refresh_callable) if enable_rotate is not False else False
         rotation_enabled = _set_rotation_preserve(enable_rotate)
 
         logger.info(
-            "[push_stream] start config refresh_callable=%s rotation_enabled=%s enable_rotate_arg=%s version=%s",
+            "[push_stream] start config refresh_callable=%s rotation_enabled=%s enable_rotate_arg=%s db_write=%s order_book_write=%s version=%s",
             refresh_alive,
             rotation_enabled,
             enable_rotate,
+            db_write_enabled,
+            order_book_write_enabled,
             VERSION,
         )
 
-        _start_thread_if_needed(
-            attr_name="_flush_thread",
-            target=_flush_worker,
-            name="push-flush-worker",
-        )
+        if db_write_enabled:
+            _start_thread_if_needed(attr_name="_flush_thread", target=_flush_worker, name="push-flush-worker")
+        else:
+            state._flush_thread = None
+            _safe_set_runtime("push_writer_running", False)
 
-        _start_thread_if_needed(
-            attr_name="_monitor_thread",
-            target=_monitor_worker,
-            name="push-monitor-worker",
-        )
+        _start_thread_if_needed(attr_name="_monitor_thread", target=_monitor_worker, name="push-monitor-worker")
 
-        _start_thread_if_needed(
-            attr_name="_rotate_thread",
-            target=_rotation_worker,
-            name="push-rotation-worker",
-        )
+        if rotation_enabled:
+            _start_thread_if_needed(attr_name="_rotate_thread", target=_rotation_worker, name="push-rotation-worker")
+        else:
+            state._rotate_thread = None
+            logger.warning("[push_stream] rotation worker not started because rotation_enabled=False")
 
-        _start_thread_if_needed(
-            attr_name="_ws_thread",
-            target=_run_forever_loop,
-            name="push-ws-thread",
-        )
-
+        _start_thread_if_needed(attr_name="_ws_thread", target=_run_forever_loop, name="push-ws-thread")
         _sync_runtime_status_after_start()
 
         logger.info(
-            "[push_stream] started version=%s refresh_callable=%s rotation_enabled=%s",
+            "[push_stream] started version=%s refresh_callable=%s rotation_enabled=%s db_write=%s",
             VERSION,
             _is_refresh_callable_alive(),
             bool(getattr(state, "_rotation_enabled", False)),
+            db_write_enabled,
         )
 
 
@@ -499,12 +403,7 @@ def stop_push_stream(wait: float = 5.0) -> None:
             logger.exception("[push_stream] ws close failed")
 
         started = time.time()
-        for th in [
-            state._ws_thread,
-            state._flush_thread,
-            state._monitor_thread,
-            state._rotate_thread,
-        ]:
+        for th in [state._ws_thread, state._flush_thread, state._monitor_thread, state._rotate_thread]:
             try:
                 if th is not None and th.is_alive():
                     remain = max(0.1, wait - (time.time() - started))
@@ -514,12 +413,10 @@ def stop_push_stream(wait: float = 5.0) -> None:
 
         state._connected_event.clear()
         _clear_sender()
-
         _safe_set_runtime("ws_connected", False)
         _safe_set_runtime("push_stream_running", False)
         _safe_set_runtime("push_writer_running", False)
         _safe_set_runtime("subscription_refresh_running", False)
-
         logger.info("[push_stream] stopped")
 
 
@@ -556,10 +453,4 @@ def run_background(*args: Any, **kwargs: Any) -> None:
     return start_push_stream(*args, **kwargs)
 
 
-__all__ = [
-    "start_push_stream",
-    "stop_push_stream",
-    "get_status",
-    "start",
-    "run_background",
-]
+__all__ = ["start_push_stream", "stop_push_stream", "get_status", "start", "run_background"]
