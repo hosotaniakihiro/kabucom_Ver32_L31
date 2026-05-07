@@ -1,11 +1,13 @@
 # =========================================
 # optional_main.py
+# Version: PRODUCTION-STABLE-REV2-DAILY-MTF-RUNTIME-BOOT
 # =========================================
 # ・optional 系 日次バッチのエントリポイント
 # ・paths.py 前提
 # ・DB migrate → ingest を起動時に1回だけ実行
 # ・runtime（summary / ranking）とは別プロセスで実行する
-# ・optional_data を global_data にロード（NEW）
+# ・optional_data を global_data にロード
+# ・日足DB由来のMA/MTFを global_data.daily_mtf_df にロードし、AI判定前merge patchを導入
 # =========================================
 
 import logging
@@ -53,6 +55,34 @@ from optional.batch.ingest_all_optional_data import ingest_all
 
 # optional DB reader
 from optional.db.reader import load_optional_dataframe
+
+
+# ---------------------------------
+# daily MTF runtime boot
+# ---------------------------------
+def install_daily_mtf_runtime_safe() -> None:
+    """
+    旧main.pyで読んでいた日足DB由来のMA/MTFを復活させる。
+
+    - 日足DBを global_data.daily_mtf_df へロード
+    - summary AI runner へ渡る直前に daily MA/MTF を自動merge
+    - 失敗しても optional/main boot は止めない
+    """
+    try:
+        from trading.summary.mtf.daily_runtime_patch import install_daily_mtf_runtime_patch
+
+        logger.info("⏳ DAILY MTF runtime patch install start")
+        install_daily_mtf_runtime_patch()
+        logger.info(
+            "✅ DAILY MTF runtime patch installed rows=%s latest=%s db=%s table=%s",
+            getattr(global_data, "daily_mtf_loaded_rows", None),
+            getattr(global_data, "daily_mtf_latest_date", None),
+            getattr(global_data, "daily_mtf_db_path", None),
+            getattr(global_data, "daily_mtf_table", None),
+        )
+
+    except Exception:
+        logger.exception("❌ DAILY MTF runtime patch install failed (continue)")
 
 
 # ---------------------------------
@@ -109,7 +139,7 @@ def optional_main():
         raise
 
     # -------------------------------------------------
-    # ③ optional DB → DataFrame load（NEW）
+    # ③ optional DB → DataFrame load
     # -------------------------------------------------
 
     try:
@@ -133,6 +163,11 @@ def optional_main():
         logger.exception("❌ optional dataframe load failed")
 
         global_data.optional_data = pd.DataFrame()
+
+    # -------------------------------------------------
+    # ④ 日足DB → daily_mtf_df load + AI前merge patch
+    # -------------------------------------------------
+    install_daily_mtf_runtime_safe()
 
     logger.info("=" * 60)
     logger.info("🎉 OPTIONAL DAILY BOOT COMPLETED")
