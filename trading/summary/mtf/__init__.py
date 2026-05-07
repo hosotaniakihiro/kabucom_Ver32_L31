@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/summary/mtf/__init__.py
-# Version: PRODUCTION-STABLE-MTF-PACKAGE-REV1.0
+# Version: PRODUCTION-STABLE-MTF-PACKAGE-REV1.1-DAILY-RUNTIME-PATCH
 # ============================================================
 
 from __future__ import annotations
@@ -17,6 +17,11 @@ from .daily_mtf_loader import (
     load_daily_mtf_latest_df,
     load_daily_mtf_latest_map,
 )
+from .daily_runtime_patch import (
+    install_daily_mtf_runtime_patch,
+    load_daily_mtf_runtime_df,
+    merge_daily_mtf_for_ai,
+)
 
 __all__ = [
     "DAILY_MTF_SUMMARY_COLUMNS_SQLITE",
@@ -27,4 +32,7 @@ __all__ = [
     "ensure_daily_mtf_columns_sqlite",
     "load_daily_mtf_latest_df",
     "load_daily_mtf_latest_map",
+    "install_daily_mtf_runtime_patch",
+    "load_daily_mtf_runtime_df",
+    "merge_daily_mtf_for_ai",
 ]
