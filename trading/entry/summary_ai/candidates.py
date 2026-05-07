@@ -1,38 +1,17 @@
 # ============================================================
 # File   : trading/entry/summary_ai/candidates.py
-# Version: PRODUCTION-STABLE-REV1.1-SUMMARY-AI-CANDIDATES-ENTRY-GUARD
+# Version: PRODUCTION-STABLE-REV2.0-BUY-SELL-TOP20-CANDIDATES
 # ------------------------------------------------------------
-# 【概要】
-#   SUMMARY / RANKING SUMMARY の DataFrame から、
-#   AI gate に確認するエントリー候補を作成する。
+# Purpose:
+#   - SUMMARY / RANKING SUMMARY の DataFrame からAI gate候補を作る
+#   - build_summary_ai_entry_candidates() で BUY TOP20 と SELL TOP20 を同時に返す
+#   - 各行に ai_side / side = BUY or SELL を付与し、AI gate側で行ごとに判定する
 #
-# 【主な機能】
-#   - display.py を通っていないDFでも ai_disp_* を補完
-#   - ETF / FUND / REIT 除外
-#   - buy_target 任意チェック
-#   - symbol ごと1行へ重複除去
-#   - buy score / sell score / volume / price filter
-#   - TOP N 抽出
-#
-# 【REV1.1 修正】
-#   - エントリー候補の最低株価を 200円超に変更
-#   - BUY候補は slope > 0.03 のみ通過
-#   - SELL候補は slope < -0.03 のみ通過
-#   - close <= 200 は AI gate / entry候補から除外
-#
-# 【重要条件】
-#   BUY:
-#       close > 200
-#       slope > 0.03
-#
-#   SELL:
-#       close > 200
-#       slope < -0.03
-#
-#   つまり、
-#       close = 200.0 は対象外
-#       BUY slope = 0.03 は対象外
-#       SELL slope = -0.03 は対象外
+# Important:
+#   - 既存runnerが build_summary_ai_entry_candidates() だけを呼んでも、
+#     BUY候補とSELL候補の両方がAIへ渡る
+#   - BUY候補: close > 200, volume条件, slope > 閾値, buy score優勢
+#   - SELL候補: close > 200, volume条件, slope < 閾値, sell score優勢
 # ============================================================
 
 from __future__ import annotations
@@ -41,7 +20,6 @@ import logging
 import os
 from typing import Optional
 
-import numpy as np
 import pandas as pd
 
 from .utils import (
@@ -55,25 +33,14 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
-
 DEFAULT_TOP_N = 20
 DEFAULT_MIN_BUY_SCORE = 5.0
 DEFAULT_MAX_SELL_SCORE = 2.0
 DEFAULT_MIN_VOLUME = 1.0
-
-# 200円以下はエントリー候補から除外
 DEFAULT_MIN_PRICE = 200.0
-
-# BUYは 0.03 以下を除外
 DEFAULT_MIN_BUY_SLOPE = 0.01
-
-# SELLは -0.03 以上を除外
 DEFAULT_MAX_SELL_SLOPE = -0.01
 
-
-# ============================================================
-# env helpers
-# ============================================================
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -85,74 +52,55 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None:
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "on", "y"}:
+            return True
+        if s in {"0", "false", "no", "off", "n", ""}:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
+
+
 def _entry_min_price(default: float = DEFAULT_MIN_PRICE) -> float:
-    """
-    エントリー候補の最低株価。
-
-    優先順位:
-      1. ENTRY_MIN_PRICE
-      2. SUMMARY_AI_ENTRY_MIN_PRICE
-      3. default
-
-    判定は close > min_price。
-    """
-    v1 = os.getenv("ENTRY_MIN_PRICE")
-    if v1 is not None and str(v1).strip() != "":
-        return _env_float("ENTRY_MIN_PRICE", default)
-
-    v2 = os.getenv("SUMMARY_AI_ENTRY_MIN_PRICE")
-    if v2 is not None and str(v2).strip() != "":
-        return _env_float("SUMMARY_AI_ENTRY_MIN_PRICE", default)
-
+    for name in ("ENTRY_MIN_PRICE", "SUMMARY_AI_ENTRY_MIN_PRICE"):
+        v = os.getenv(name)
+        if v is not None and str(v).strip() != "":
+            return _env_float(name, default)
     return float(default)
 
 
 def _entry_min_buy_slope() -> float:
-    """
-    BUY候補の最低slope。
-
-    判定は slope > min_buy_slope。
-    """
-    v1 = os.getenv("ENTRY_MIN_BUY_SLOPE")
-    if v1 is not None and str(v1).strip() != "":
-        return _env_float("ENTRY_MIN_BUY_SLOPE", DEFAULT_MIN_BUY_SLOPE)
-
-    v2 = os.getenv("SUMMARY_AI_MIN_BUY_SLOPE")
-    if v2 is not None and str(v2).strip() != "":
-        return _env_float("SUMMARY_AI_MIN_BUY_SLOPE", DEFAULT_MIN_BUY_SLOPE)
-
+    for name in ("ENTRY_MIN_BUY_SLOPE", "SUMMARY_AI_MIN_BUY_SLOPE"):
+        v = os.getenv(name)
+        if v is not None and str(v).strip() != "":
+            return _env_float(name, DEFAULT_MIN_BUY_SLOPE)
     return float(DEFAULT_MIN_BUY_SLOPE)
 
 
 def _entry_max_sell_slope() -> float:
-    """
-    SELL候補の最大slope。
-
-    判定は slope < max_sell_slope。
-    max_sell_slope=-0.03 の場合、
-      slope=-0.03 は対象外
-      slope=-0.031 は通過
-    """
-    v1 = os.getenv("ENTRY_MAX_SELL_SLOPE")
-    if v1 is not None and str(v1).strip() != "":
-        return _env_float("ENTRY_MAX_SELL_SLOPE", DEFAULT_MAX_SELL_SLOPE)
-
-    v2 = os.getenv("SUMMARY_AI_MAX_SELL_SLOPE")
-    if v2 is not None and str(v2).strip() != "":
-        return _env_float("SUMMARY_AI_MAX_SELL_SLOPE", DEFAULT_MAX_SELL_SLOPE)
-
+    for name in ("ENTRY_MAX_SELL_SLOPE", "SUMMARY_AI_MAX_SELL_SLOPE"):
+        v = os.getenv(name)
+        if v is not None and str(v).strip() != "":
+            return _env_float(name, DEFAULT_MAX_SELL_SLOPE)
     return float(DEFAULT_MAX_SELL_SLOPE)
 
 
-# ============================================================
-# display-like column attach
-# ============================================================
+def _safe_symbols(df: pd.DataFrame, n: int = 30) -> list[str]:
+    try:
+        if isinstance(df, pd.DataFrame) and not df.empty and "symbol" in df.columns:
+            return list(df["symbol"].astype(str).head(n))
+    except Exception:
+        pass
+    return []
+
 
 def attach_display_like_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    display.py を通っていない DataFrame でも TOP10 抽出できるように、
-    ai_disp_* 系の列を補完する。
-    """
     out = safe_df(df)
     if out.empty:
         return out
@@ -170,127 +118,28 @@ def attach_display_like_columns(df: pd.DataFrame) -> pd.DataFrame:
         symbolname = pick_text_series(out, ["symbolname", "name", "display_name"], "")
         out["symbolname_view"] = symbolname.mask(symbolname.str.strip().eq(""), out["symbol"])
 
-    out["ai_disp_buy_score"] = pick_num_series(
-        out,
-        ["disp_buy_score", "score_buy", "buy_score", "buy"],
-        0.0,
-    )
-
-    out["ai_disp_sell_score"] = pick_num_series(
-        out,
-        ["disp_sell_score", "score_sell", "sell_score", "sell"],
-        0.0,
-    ).abs()
-
-    out["ai_disp_score"] = pick_num_series(
-        out,
-        ["disp_score", "display_score", "score", "final_score"],
-        0.0,
-    )
-
-    out["ai_disp_total_score"] = pick_num_series(
-        out,
-        [
-            "disp_total_score",
-            "score_total",
-            "total_score",
-            "combined_score",
-            "final_score",
-            "display_score",
-            "score",
-        ],
-        0.0,
-    )
-
+    out["ai_disp_buy_score"] = pick_num_series(out, ["disp_buy_score", "score_buy", "buy_score", "buy"], 0.0)
+    out["ai_disp_sell_score"] = pick_num_series(out, ["disp_sell_score", "score_sell", "sell_score", "sell"], 0.0).abs()
+    out["ai_disp_score"] = pick_num_series(out, ["disp_score", "display_score", "score", "final_score"], 0.0)
+    out["ai_disp_total_score"] = pick_num_series(out, ["disp_total_score", "score_total", "total_score", "combined_score", "final_score", "display_score", "score"], 0.0)
     if float(out["ai_disp_total_score"].abs().sum()) == 0.0:
         out["ai_disp_total_score"] = out["ai_disp_buy_score"] - out["ai_disp_sell_score"]
-
-    out["ai_disp_final_score"] = pick_num_series(
-        out,
-        ["disp_final_score", "final_score", "display_score", "score_total", "score"],
-        0.0,
-    )
-
-    out["ai_disp_close"] = pick_num_series(
-        out,
-        ["disp_close", "close", "close_price", "current_price", "price", "last_price"],
-        0.0,
-    )
-
-    out["ai_disp_volume"] = pick_num_series(
-        out,
-        ["volume", "trading_volume", "出来高"],
-        0.0,
-    )
-
-    out["ai_disp_turnover"] = pick_num_series(
-        out,
-        ["turnover", "trading_value", "売買代金", "ai_turnover"],
-        0.0,
-    )
-
+    out["ai_disp_final_score"] = pick_num_series(out, ["disp_final_score", "final_score", "display_score", "score_total", "score"], 0.0)
+    out["ai_disp_close"] = pick_num_series(out, ["disp_close", "close", "close_price", "current_price", "price", "last_price"], 0.0)
+    out["ai_disp_volume"] = pick_num_series(out, ["volume", "trading_volume", "出来高"], 0.0)
+    out["ai_disp_turnover"] = pick_num_series(out, ["turnover", "trading_value", "売買代金", "ai_turnover"], 0.0)
     if float(out["ai_disp_turnover"].abs().sum()) == 0.0:
         out["ai_disp_turnover"] = out["ai_disp_close"] * out["ai_disp_volume"]
-
-    out["ai_disp_slope"] = pick_num_series(
-        out,
-        ["disp_slope", "slope", "slope_atr_scaled", "score_slope"],
-        0.0,
-    )
-
-    out["ai_disp_mtf"] = pick_num_series(
-        out,
-        ["disp_mtf", "score_mtf", "mtf_score", "mtf"],
-        0.0,
-    )
-
-    out["ai_disp_rsi"] = pick_num_series(
-        out,
-        ["disp_rsi", "rsi", "RSI"],
-        50.0,
-    )
-
-    out["ai_disp_macd"] = pick_num_series(
-        out,
-        ["disp_macd", "macd", "MACD"],
-        0.0,
-    )
-
-    out["ai_disp_signal"] = pick_num_series(
-        out,
-        ["disp_signal", "signal", "macd_signal", "SIGNAL"],
-        0.0,
-    )
-
-    out["ai_score_base"] = pick_num_series(
-        out,
-        ["disp_base", "score_base", "breakdown_base", "base"],
-        0.0,
-    )
-
-    out["ai_score_trend"] = pick_num_series(
-        out,
-        ["disp_trend", "score_trend", "breakdown_trend", "trend"],
-        0.0,
-    )
-
-    out["ai_score_momentum"] = pick_num_series(
-        out,
-        ["disp_mom", "score_momentum", "breakdown_mom", "mom", "momentum"],
-        0.0,
-    )
-
-    out["ai_score_velocity"] = pick_num_series(
-        out,
-        ["disp_vel", "score_velocity", "breakdown_vel", "vel", "velocity"],
-        0.0,
-    )
-
-    out["ai_score_penalty"] = pick_num_series(
-        out,
-        ["disp_pen", "score_penalty", "breakdown_pen", "pen", "penalty"],
-        0.0,
-    )
+    out["ai_disp_slope"] = pick_num_series(out, ["disp_slope", "slope", "slope_atr_scaled", "score_slope"], 0.0)
+    out["ai_disp_mtf"] = pick_num_series(out, ["disp_mtf", "score_mtf", "mtf_score", "mtf"], 0.0)
+    out["ai_disp_rsi"] = pick_num_series(out, ["disp_rsi", "rsi", "RSI"], 50.0)
+    out["ai_disp_macd"] = pick_num_series(out, ["disp_macd", "macd", "MACD"], 0.0)
+    out["ai_disp_signal"] = pick_num_series(out, ["disp_signal", "signal", "macd_signal", "SIGNAL"], 0.0)
+    out["ai_score_base"] = pick_num_series(out, ["disp_base", "score_base", "breakdown_base", "base"], 0.0)
+    out["ai_score_trend"] = pick_num_series(out, ["disp_trend", "score_trend", "breakdown_trend", "trend"], 0.0)
+    out["ai_score_momentum"] = pick_num_series(out, ["disp_mom", "score_momentum", "breakdown_mom", "mom", "momentum"], 0.0)
+    out["ai_score_velocity"] = pick_num_series(out, ["disp_vel", "score_velocity", "breakdown_vel", "vel", "velocity"], 0.0)
+    out["ai_score_penalty"] = pick_num_series(out, ["disp_pen", "score_penalty", "breakdown_pen", "pen", "penalty"], 0.0)
 
     if "datetime" in out.columns:
         try:
@@ -305,17 +154,7 @@ def attach_display_like_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-# ============================================================
-# common filters
-# ============================================================
-
-def filter_common_stock_rows(
-    df: pd.DataFrame,
-    *,
-    require_buy_target: bool = False,
-    exclude_etf_fund: bool = True,
-    allowed_market_types: Optional[set[str]] = None,
-) -> pd.DataFrame:
+def filter_common_stock_rows(df: pd.DataFrame, *, require_buy_target: bool = False, exclude_etf_fund: bool = True, allowed_market_types: Optional[set[str]] = None) -> pd.DataFrame:
     out = safe_df(df)
     if out.empty:
         return out
@@ -331,12 +170,7 @@ def filter_common_stock_rows(
                 if col in out.columns:
                     out = out[~out[col].map(lambda x: is_truthy(x, False))].copy()
 
-            name_col = None
-            for c in ("symbolname_view", "symbolname", "name"):
-                if c in out.columns:
-                    name_col = c
-                    break
-
+            name_col = next((c for c in ("symbolname_view", "symbolname", "name") if c in out.columns), None)
             if name_col:
                 s = out[name_col].fillna("").astype(str).str.upper()
                 mask = (
@@ -352,8 +186,7 @@ def filter_common_stock_rows(
 
         if "market_type" in out.columns:
             mt = out["market_type"].fillna("").astype(str).str.strip()
-            mask = mt.isin(allowed_market_types) | mt.eq("")
-            out = out[mask].copy()
+            out = out[mt.isin(allowed_market_types) | mt.eq("")].copy()
 
     except Exception:
         logger.debug("[SUMMARY AI CANDIDATES] common stock filter failed", exc_info=True)
@@ -368,148 +201,104 @@ def dedupe_one_row_per_symbol(df: pd.DataFrame) -> pd.DataFrame:
 
     try:
         quality = pd.Series(0, index=out.index, dtype="int64")
-
         for col, weight in [
             ("ai_disp_buy_score", 10),
+            ("ai_disp_sell_score", 10),
             ("ai_disp_total_score", 8),
             ("ai_disp_final_score", 8),
             ("ai_disp_close", 4),
             ("ai_disp_volume", 3),
             ("ai_disp_rsi", 2),
             ("ai_disp_macd", 2),
-            ("ai_score_base", 1),
-            ("ai_score_trend", 1),
-            ("ai_score_momentum", 1),
-            ("ai_score_velocity", 1),
-            ("ai_score_penalty", 1),
         ]:
-            if col not in out.columns:
-                continue
-
-            s = pd.to_numeric(out[col], errors="coerce")
-            quality += s.notna().astype(int) * weight
-
+            if col in out.columns:
+                quality += pd.to_numeric(out[col], errors="coerce").notna().astype(int) * weight
         out["_ai_quality"] = quality
-
         sort_cols = ["symbol", "_ai_quality"]
         ascending = [True, False]
-
         if "datetime" in out.columns:
             sort_cols.append("datetime")
             ascending.append(False)
-
-        out = out.sort_values(
-            sort_cols,
-            ascending=ascending,
-            na_position="last",
-            kind="mergesort",
-        )
+        out = out.sort_values(sort_cols, ascending=ascending, na_position="last", kind="mergesort")
         out = out.drop_duplicates(subset=["symbol"], keep="first")
         return out.drop(columns=["_ai_quality"], errors="ignore").reset_index(drop=True)
-
     except Exception:
         logger.exception("[SUMMARY AI CANDIDATES] dedupe failed")
-        return out
+        return out.reset_index(drop=True)
 
 
-# ============================================================
-# entry candidate guards
-# ============================================================
+def _prepare_base(summary_df: pd.DataFrame, *, require_buy_target: bool, exclude_etf_fund: bool) -> pd.DataFrame:
+    df = attach_display_like_columns(summary_df)
+    if df.empty:
+        return df
+    df = filter_common_stock_rows(df, require_buy_target=require_buy_target, exclude_etf_fund=exclude_etf_fund)
+    if df.empty:
+        return df
+    return dedupe_one_row_per_symbol(df)
 
-def _apply_buy_entry_guard(
-    df: pd.DataFrame,
-    *,
-    interval: int | str,
-    source: str,
-    min_price: float,
-    min_buy_slope: float,
-) -> pd.DataFrame:
-    """
-    BUY entry候補の最終ガード。
 
-    条件:
-      ai_disp_close > min_price
-      ai_disp_slope > min_buy_slope
-    """
-    out = safe_df(df)
-    if out.empty:
-        return out
-
-    before = len(out)
-
-    close_s = pd.to_numeric(out["ai_disp_close"], errors="coerce").fillna(0.0)
-    slope_s = pd.to_numeric(out["ai_disp_slope"], errors="coerce").fillna(0.0)
-
-    out = out[
-        (close_s > float(min_price))
-        & (slope_s > float(min_buy_slope))
+def _buy_candidates_from_prepared(df: pd.DataFrame, *, interval: int | str, top_n: int, min_buy_score: float, max_sell_score: float, min_volume: float, min_price: float, source: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    resolved_min_price = max(float(min_price), _entry_min_price(DEFAULT_MIN_PRICE))
+    resolved_min_buy_slope = _entry_min_buy_slope()
+    before = len(df)
+    out = df[
+        (pd.to_numeric(df["ai_disp_buy_score"], errors="coerce").fillna(0.0) >= float(min_buy_score))
+        & (pd.to_numeric(df["ai_disp_sell_score"], errors="coerce").fillna(0.0) <= float(max_sell_score))
+        & (pd.to_numeric(df["ai_disp_close"], errors="coerce").fillna(0.0) > float(resolved_min_price))
+        & (pd.to_numeric(df["ai_disp_volume"], errors="coerce").fillna(0.0) >= float(min_volume))
+        & (pd.to_numeric(df["ai_disp_slope"], errors="coerce").fillna(0.0) > float(resolved_min_buy_slope))
     ].copy()
-
-    logger.info(
-        "[SUMMARY AI CANDIDATES] BUY entry guard interval=%s source=%s "
-        "condition='close > %.1f and slope > %.4f' before=%s after=%s skipped=%s",
-        interval,
-        source,
-        float(min_price),
-        float(min_buy_slope),
-        before,
-        len(out),
-        before - len(out),
-    )
-
-    return out.reset_index(drop=True)
-
-
-def _apply_sell_entry_guard(
-    df: pd.DataFrame,
-    *,
-    interval: int | str,
-    source: str,
-    min_price: float,
-    max_sell_slope: float,
-) -> pd.DataFrame:
-    """
-    SELL entry候補の最終ガード。
-
-    条件:
-      ai_disp_close > min_price
-      ai_disp_slope < max_sell_slope
-
-    max_sell_slope=-0.03 の場合、
-      -0.03 以上は対象外。
-    """
-    out = safe_df(df)
     if out.empty:
+        logger.warning("[SUMMARY AI CANDIDATES] BUY empty interval=%s source=%s before=%s", interval, source, before)
         return out
-
-    before = len(out)
-
-    close_s = pd.to_numeric(out["ai_disp_close"], errors="coerce").fillna(0.0)
-    slope_s = pd.to_numeric(out["ai_disp_slope"], errors="coerce").fillna(0.0)
-
-    out = out[
-        (close_s > float(min_price))
-        & (slope_s < float(max_sell_slope))
-    ].copy()
-
-    logger.info(
-        "[SUMMARY AI CANDIDATES] SELL entry guard interval=%s source=%s "
-        "condition='close > %.1f and slope < %.4f' before=%s after=%s skipped=%s",
-        interval,
-        source,
-        float(min_price),
-        float(max_sell_slope),
-        before,
-        len(out),
-        before - len(out),
+    out["_ai_sort_score"] = (
+        pd.to_numeric(out["ai_disp_buy_score"], errors="coerce").fillna(0.0) * 10.0
+        + pd.to_numeric(out["ai_disp_total_score"], errors="coerce").fillna(0.0) * 3.0
+        + pd.to_numeric(out["ai_disp_mtf"], errors="coerce").fillna(0.0)
+        + pd.to_numeric(out["ai_disp_slope"], errors="coerce").fillna(0.0)
+        - pd.to_numeric(out["ai_disp_sell_score"], errors="coerce").fillna(0.0) * 5.0
     )
+    out = out.sort_values(["_ai_sort_score", "ai_disp_buy_score", "ai_disp_total_score"], ascending=[False, False, False], na_position="last", kind="mergesort").head(int(top_n))
+    out = out.drop(columns=["_ai_sort_score"], errors="ignore").reset_index(drop=True)
+    out["ai_side"] = "BUY"
+    out["side"] = "BUY"
+    out["entry_decision"] = "BUY"
+    logger.warning("[SUMMARY AI CANDIDATES] BUY_TOP_READY interval=%s source=%s count=%s top_n=%s symbols=%s", interval, source, len(out), top_n, _safe_symbols(out, int(top_n)))
+    return out
 
-    return out.reset_index(drop=True)
 
+def _sell_candidates_from_prepared(df: pd.DataFrame, *, interval: int | str, top_n: int, min_sell_score: float, max_buy_score: float, min_volume: float, min_price: float, source: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    resolved_min_price = max(float(min_price), _entry_min_price(DEFAULT_MIN_PRICE))
+    resolved_max_sell_slope = _entry_max_sell_slope()
+    before = len(df)
+    out = df[
+        (pd.to_numeric(df["ai_disp_sell_score"], errors="coerce").fillna(0.0) >= float(min_sell_score))
+        & (pd.to_numeric(df["ai_disp_buy_score"], errors="coerce").fillna(0.0) <= float(max_buy_score))
+        & (pd.to_numeric(df["ai_disp_close"], errors="coerce").fillna(0.0) > float(resolved_min_price))
+        & (pd.to_numeric(df["ai_disp_volume"], errors="coerce").fillna(0.0) >= float(min_volume))
+        & (pd.to_numeric(df["ai_disp_slope"], errors="coerce").fillna(0.0) < float(resolved_max_sell_slope))
+    ].copy()
+    if out.empty:
+        logger.warning("[SUMMARY AI CANDIDATES] SELL empty interval=%s source=%s before=%s", interval, source, before)
+        return out
+    out["_ai_sort_score"] = (
+        pd.to_numeric(out["ai_disp_sell_score"], errors="coerce").fillna(0.0) * 10.0
+        - pd.to_numeric(out["ai_disp_buy_score"], errors="coerce").fillna(0.0) * 5.0
+        - pd.to_numeric(out["ai_disp_slope"], errors="coerce").fillna(0.0) * 3.0
+        - pd.to_numeric(out["ai_disp_total_score"], errors="coerce").fillna(0.0)
+    )
+    out = out.sort_values(["_ai_sort_score", "ai_disp_sell_score"], ascending=[False, False], na_position="last", kind="mergesort").head(int(top_n))
+    out = out.drop(columns=["_ai_sort_score"], errors="ignore").reset_index(drop=True)
+    out["ai_side"] = "SELL"
+    out["side"] = "SELL"
+    out["entry_decision"] = "SELL"
+    logger.warning("[SUMMARY AI CANDIDATES] SELL_TOP_READY interval=%s source=%s count=%s top_n=%s symbols=%s", interval, source, len(out), top_n, _safe_symbols(out, int(top_n)))
+    return out
 
-# ============================================================
-# public candidate builders
-# ============================================================
 
 def build_summary_ai_entry_candidates(
     summary_df: pd.DataFrame,
@@ -525,90 +314,61 @@ def build_summary_ai_entry_candidates(
     source: str = "SUMMARY",
 ) -> pd.DataFrame:
     """
-    summary_df から AI に確認する BUY TOP candidates を作る。
+    既存runner互換の候補作成入口。
 
-    BUY候補条件:
-      - score_buy >= min_buy_score
-      - score_sell <= max_sell_score
-      - close > 200
-      - volume >= min_volume
-      - slope > 0.03
+    重要:
+      既存runnerはこの関数しか呼ばないため、ここでBUY TOP20とSELL TOP20を結合して返す。
+      ai_gate_runner.py は行ごとの ai_side / side を読んで BUY/SELL としてAIに渡す。
     """
-    df = attach_display_like_columns(summary_df)
-    if df.empty:
-        logger.info("[SUMMARY AI CANDIDATES] no summary rows")
-        return df
+    try:
+        top_n = max(1, int(top_n or DEFAULT_TOP_N))
+    except Exception:
+        top_n = DEFAULT_TOP_N
 
-    df = filter_common_stock_rows(
-        df,
-        require_buy_target=require_buy_target,
-        exclude_etf_fund=exclude_etf_fund,
-    )
-    if df.empty:
-        logger.info("[SUMMARY AI CANDIDATES] no rows after common stock filter")
-        return df
+    base = _prepare_base(summary_df, require_buy_target=require_buy_target, exclude_etf_fund=exclude_etf_fund)
+    if base.empty:
+        logger.info("[SUMMARY AI CANDIDATES] no rows after base prepare interval=%s source=%s", interval, source)
+        return base
 
-    df = dedupe_one_row_per_symbol(df)
-    if df.empty:
-        return df
-
-    # runner.py から min_price=1.0 が渡ってきても、実質200円超を強制する。
-    resolved_min_price = max(float(min_price), _entry_min_price(DEFAULT_MIN_PRICE))
-    resolved_min_buy_slope = _entry_min_buy_slope()
-
-    before = len(df)
-
-    df = df[
-        (pd.to_numeric(df["ai_disp_buy_score"], errors="coerce").fillna(0.0) >= float(min_buy_score))
-        & (pd.to_numeric(df["ai_disp_sell_score"], errors="coerce").fillna(0.0) <= float(max_sell_score))
-        & (pd.to_numeric(df["ai_disp_close"], errors="coerce").fillna(0.0) > float(resolved_min_price))
-        & (pd.to_numeric(df["ai_disp_volume"], errors="coerce").fillna(0.0) >= float(min_volume))
-    ].copy()
-
-    after_basic = len(df)
-
-    df = _apply_buy_entry_guard(
-        df,
+    buy_df = _buy_candidates_from_prepared(
+        base,
         interval=interval,
+        top_n=top_n,
+        min_buy_score=min_buy_score,
+        max_sell_score=max_sell_score,
+        min_volume=min_volume,
+        min_price=min_price,
         source=source,
-        min_price=resolved_min_price,
-        min_buy_slope=resolved_min_buy_slope,
+    )
+    sell_df = _sell_candidates_from_prepared(
+        base,
+        interval=interval,
+        top_n=top_n,
+        min_sell_score=0.01,
+        max_buy_score=999999.0,
+        min_volume=min_volume,
+        min_price=min_price,
+        source=source,
     )
 
-    logger.info(
-        "[SUMMARY AI CANDIDATES] BUY candidate filter interval=%s source=%s before=%s after_basic=%s after_guard=%s "
-        "min_buy_score=%.2f max_sell_score=%.2f min_volume=%.1f min_price=%.1f min_buy_slope=%.4f",
+    frames = [x for x in (buy_df, sell_df) if isinstance(x, pd.DataFrame) and not x.empty]
+    if not frames:
+        logger.warning("[SUMMARY AI CANDIDATES] BUY_SELL combined empty interval=%s source=%s base_rows=%s", interval, source, len(base))
+        return pd.DataFrame()
+
+    out = pd.concat(frames, ignore_index=True, sort=False)
+    logger.warning(
+        "[SUMMARY AI CANDIDATES] BUY_SELL_COMBINED_READY interval=%s source=%s buy_count=%s sell_count=%s total=%s top_n_each=%s buy_symbols=%s sell_symbols=%s",
         interval,
         source,
-        before,
-        after_basic,
-        len(df),
-        min_buy_score,
-        max_sell_score,
-        min_volume,
-        resolved_min_price,
-        resolved_min_buy_slope,
+        len(buy_df) if isinstance(buy_df, pd.DataFrame) else 0,
+        len(sell_df) if isinstance(sell_df, pd.DataFrame) else 0,
+        len(out),
+        top_n,
+        _safe_symbols(buy_df, top_n),
+        _safe_symbols(sell_df, top_n),
     )
-
-    if df.empty:
-        return df
-
-    df["_ai_sort_score"] = (
-        pd.to_numeric(df["ai_disp_buy_score"], errors="coerce").fillna(0.0) * 10.0
-        + pd.to_numeric(df["ai_disp_total_score"], errors="coerce").fillna(0.0) * 3.0
-        + pd.to_numeric(df["ai_disp_mtf"], errors="coerce").fillna(0.0)
-        + pd.to_numeric(df["ai_disp_slope"], errors="coerce").fillna(0.0)
-        - pd.to_numeric(df["ai_disp_sell_score"], errors="coerce").fillna(0.0) * 5.0
-    )
-
-    df = df.sort_values(
-        by=["_ai_sort_score", "ai_disp_buy_score", "ai_disp_total_score"],
-        ascending=[False, False, False],
-        na_position="last",
-        kind="mergesort",
-    ).head(int(top_n))
-
-    return df.drop(columns=["_ai_sort_score"], errors="ignore").reset_index(drop=True)
+    return out.reset_index(drop=True)
 
 
 def build_summary_ai_sell_entry_candidates(
@@ -624,92 +384,19 @@ def build_summary_ai_sell_entry_candidates(
     exclude_etf_fund: bool = True,
     source: str = "SUMMARY",
 ) -> pd.DataFrame:
-    """
-    summary_df から AI に確認する SELL candidates を作る。
-
-    SELL候補条件:
-      - score_sell >= min_sell_score
-      - score_buy <= max_buy_score
-      - close > 200
-      - volume >= min_volume
-      - slope < -0.03
-
-    既存側がこの関数を呼ばない場合でも、
-    将来 SELL AI entry を使う時のために用意しておく。
-    """
-    df = attach_display_like_columns(summary_df)
-    if df.empty:
-        logger.info("[SUMMARY AI SELL CANDIDATES] no summary rows")
-        return df
-
-    df = filter_common_stock_rows(
-        df,
-        require_buy_target=require_buy_target,
-        exclude_etf_fund=exclude_etf_fund,
-    )
-    if df.empty:
-        logger.info("[SUMMARY AI SELL CANDIDATES] no rows after common stock filter")
-        return df
-
-    df = dedupe_one_row_per_symbol(df)
-    if df.empty:
-        return df
-
-    resolved_min_price = max(float(min_price), _entry_min_price(DEFAULT_MIN_PRICE))
-    resolved_max_sell_slope = _entry_max_sell_slope()
-
-    before = len(df)
-
-    df = df[
-        (pd.to_numeric(df["ai_disp_sell_score"], errors="coerce").fillna(0.0) >= float(min_sell_score))
-        & (pd.to_numeric(df["ai_disp_buy_score"], errors="coerce").fillna(0.0) <= float(max_buy_score))
-        & (pd.to_numeric(df["ai_disp_close"], errors="coerce").fillna(0.0) > float(resolved_min_price))
-        & (pd.to_numeric(df["ai_disp_volume"], errors="coerce").fillna(0.0) >= float(min_volume))
-    ].copy()
-
-    after_basic = len(df)
-
-    df = _apply_sell_entry_guard(
-        df,
+    base = _prepare_base(summary_df, require_buy_target=require_buy_target, exclude_etf_fund=exclude_etf_fund)
+    if base.empty:
+        return base
+    return _sell_candidates_from_prepared(
+        base,
         interval=interval,
+        top_n=int(top_n or DEFAULT_TOP_N),
+        min_sell_score=min_sell_score,
+        max_buy_score=max_buy_score,
+        min_volume=min_volume,
+        min_price=min_price,
         source=source,
-        min_price=resolved_min_price,
-        max_sell_slope=resolved_max_sell_slope,
     )
-
-    logger.info(
-        "[SUMMARY AI CANDIDATES] SELL candidate filter interval=%s source=%s before=%s after_basic=%s after_guard=%s "
-        "min_sell_score=%.2f max_buy_score=%.2f min_volume=%.1f min_price=%.1f max_sell_slope=%.4f",
-        interval,
-        source,
-        before,
-        after_basic,
-        len(df),
-        min_sell_score,
-        max_buy_score,
-        min_volume,
-        resolved_min_price,
-        resolved_max_sell_slope,
-    )
-
-    if df.empty:
-        return df
-
-    df["_ai_sort_score"] = (
-        pd.to_numeric(df["ai_disp_sell_score"], errors="coerce").fillna(0.0) * 10.0
-        - pd.to_numeric(df["ai_disp_buy_score"], errors="coerce").fillna(0.0) * 5.0
-        - pd.to_numeric(df["ai_disp_slope"], errors="coerce").fillna(0.0) * 3.0
-        - pd.to_numeric(df["ai_disp_total_score"], errors="coerce").fillna(0.0)
-    )
-
-    df = df.sort_values(
-        by=["_ai_sort_score", "ai_disp_sell_score"],
-        ascending=[False, False],
-        na_position="last",
-        kind="mergesort",
-    ).head(int(top_n))
-
-    return df.drop(columns=["_ai_sort_score"], errors="ignore").reset_index(drop=True)
 
 
 __all__ = [
