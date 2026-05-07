@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/push_storage_bootstrap.py
-# Ver    : PRODUCTION-STABLE-REV2.0-PUSH-STORAGE-SINGLETON-START
+# Ver    : PRODUCTION-STABLE-REV2.1-PUSH-STORAGE-SPLIT-MODE
 # ------------------------------------------------------------
 # 【概要】
 #   PUSH tick DB 保存 writer の起動 bootstrap
@@ -10,6 +10,7 @@
 #   - trading.push.push_db_writer.stream_writer singleton を優先使用
 #   - push_stream 側と保存 writer インスタンスが分裂する問題を防ぐ
 #   - order_book writer だけ起動して stream_data writer が起動しない問題を防ぐ
+#   - main_database.py 分離運用時は main.py 側からのPUSH writer起動をno-op化
 #
 # 【重要】
 #   - push_bootstrap は既存PUSH読み込み/初期化系
@@ -27,6 +28,14 @@ logger = logging.getLogger(__name__)
 
 _storage_lock = threading.RLock()
 _stream_writer_instance: Optional[Any] = None
+
+
+def _should_skip_push_storage_start_in_main() -> bool:
+    try:
+        from data_collectors.split_mode import should_skip_data_collector_work_in_main
+        return bool(should_skip_data_collector_work_in_main())
+    except Exception:
+        return False
 
 
 def _resolve_stream_writer(buffer_size: int = 100):
@@ -65,11 +74,22 @@ def start_push_storage(buffer_size: int = 100) -> None:
     """
     PUSH DB writer を起動する。
 
+    main_database.py 分離運用時:
+      - main.py 側からの呼び出しは no-op
+      - main_database.py / push_receiver_runner.py 側からの呼び出しは通常起動
+
     正常なら以下ログが出る:
       [StreamDB] connected → ...pushYYYYMMDD.db
       [StreamDB] writer loop started
     """
     global _stream_writer_instance
+
+    if _should_skip_push_storage_start_in_main():
+        logger.warning(
+            "[PushStorage] start skipped in main process because "
+            "AUTOSTOCK_EXTERNAL_DATA_COLLECTORS=1; main_database.py handles PUSH storage."
+        )
+        return
 
     with _storage_lock:
         try:
