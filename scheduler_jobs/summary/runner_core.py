@@ -1,10 +1,9 @@
-
 #====================================================================================================
 # scheduler_jobs/summary/runner_core.py
 #====================================================================================================
 # ============================================================
 # File   : scheduler_jobs/summary/runner_core.py
-# Version: PRODUCTION-STABLE-SUMMARY-RUNNER-CORE-V1.1-CLOSED-REBUILD-AWARE
+# Version: PRODUCTION-STABLE-SUMMARY-RUNNER-CORE-V1.2-RANKING-SAME-PIPELINE
 # ------------------------------------------------------------
 # 【概要】
 #   PUSH / RANKING サマリーの実行本体。
@@ -17,10 +16,16 @@
 #   - run_push_summary_job / run_ranking_summary_job
 #
 # 【分離方針】
-#   - 保存/表示は safe_io に委譲
-#   - 時間外表示は closed_market_display に委譲
-#   - AI entry は summary_ai_entry_hook に委譲
-#   - normalizeは output_normalizer に委譲
+#   - 入力生成ルートは PUSH と RANKING で分離する
+#   - 保存/表示/AI hook の出口パイプラインは同じ形に揃える
+#   - PUSH は source="SUMMARY"
+#   - RANKING は source="RANKING"
+#
+# REV1.2:
+#   - ranking shortcut jobs も run_entry を受け取る
+#   - job_ranking_summary の run_entry デフォルトを True に変更
+#   - run_ranking_summary_job の run_entry デフォルトを True に変更
+#   - RANKING由来も PUSH由来同様、保存→表示→AI TOP20判定へ通す
 # ============================================================
 
 from __future__ import annotations
@@ -44,7 +49,7 @@ from .fallback_loader import (
 )
 from .output_normalizer import normalize_runner_output, log_job_result
 from .quality_guards import looks_uncomputed_push_df, looks_uncomputed_ranking_df
-from .runner_utils import call_runner_with_optional_now, is_nonempty_df, log_df_state
+from .runner_utils import call_runner_with_optional_now, log_df_state
 from .safe_io import (
     save_summary_safe,
     display_push_summary_safe,
@@ -95,25 +100,28 @@ def job_5m(
 def job_ranking_1m(
     display: bool = True,
     now: Optional[dt.datetime] = None,
+    run_entry: bool = True,
 ) -> pd.DataFrame:
-    logger.info("[summary.runners] job_ranking_1m start display=%s now=%s", display, now)
-    return job_ranking_summary(1, display=display, now=now)
+    logger.info("[summary.runners] job_ranking_1m start display=%s now=%s run_entry=%s", display, now, run_entry)
+    return job_ranking_summary(1, display=display, now=now, run_entry=run_entry)
 
 
 def job_ranking_3m(
     display: bool = True,
     now: Optional[dt.datetime] = None,
+    run_entry: bool = True,
 ) -> pd.DataFrame:
-    logger.info("[summary.runners] job_ranking_3m start display=%s now=%s", display, now)
-    return job_ranking_summary(3, display=display, now=now)
+    logger.info("[summary.runners] job_ranking_3m start display=%s now=%s run_entry=%s", display, now, run_entry)
+    return job_ranking_summary(3, display=display, now=now, run_entry=run_entry)
 
 
 def job_ranking_5m(
     display: bool = True,
     now: Optional[dt.datetime] = None,
+    run_entry: bool = True,
 ) -> pd.DataFrame:
-    logger.info("[summary.runners] job_ranking_5m start display=%s now=%s", display, now)
-    return job_ranking_summary(5, display=display, now=now)
+    logger.info("[summary.runners] job_ranking_5m start display=%s now=%s run_entry=%s", display, now, run_entry)
+    return job_ranking_summary(5, display=display, now=now, run_entry=run_entry)
 
 
 # ============================================================
@@ -242,8 +250,12 @@ def job_summary(
     else:
         logger.info("[summary.runners] display skipped interval=%s source=push reason=display_false", interval)
 
-    # 時間内のみ、summary AI entry pipeline を安全起動
     if run_entry and interval in (1, 3, 5):
+        logger.info(
+            "[summary.runners] push AI entry requested interval=%s now=%s source=SUMMARY",
+            interval,
+            now,
+        )
         run_summary_ai_entry_safe(interval=interval, now=now, df=df, source="SUMMARY")
     else:
         logger.info(
@@ -264,16 +276,16 @@ def job_ranking_summary(
     interval: int,
     display: bool = True,
     now: Optional[dt.datetime] = None,
-    run_entry: bool = False,
+    run_entry: bool = True,
     **kwargs,
 ) -> pd.DataFrame:
     """
     ランキング由来サマリー専用ジョブ。
     push 系の df をここへ混ぜない。
 
-    注意:
-      RANKING summary からの AI entry はデフォルト無効。
-      必要な場合は run_entry=True で明示する。
+    PUSH と同様に、正常な df が得られたら、
+      save_summary_safe -> display_ranking_summary_safe -> run_summary_ai_entry_safe
+    の出口パイプラインへ通す。
     """
     interval = int(interval)
     now = (now or now_naive()).replace(microsecond=0)
@@ -367,11 +379,19 @@ def job_ranking_summary(
 
     if run_entry and interval in (1, 3, 5) and is_market_session(now):
         logger.info(
-            "[summary.runners] ranking AI entry requested interval=%s now=%s",
+            "[summary.runners] ranking AI entry requested interval=%s now=%s source=RANKING",
             interval,
             now,
         )
         run_summary_ai_entry_safe(interval=interval, now=now, df=df, source="RANKING")
+    else:
+        logger.info(
+            "[summary.runners] ranking AI entry skipped interval=%s run_entry=%s in_session=%s reason=%s",
+            interval,
+            run_entry,
+            is_market_session(now),
+            "interval_not_enabled" if interval not in (1, 3, 5) else "run_entry_false_or_closed_market",
+        )
 
     return df
 
@@ -394,9 +414,21 @@ def run_ranking_summary_job(
     interval: int | str = 1,
     display: bool = True,
     now: Optional[dt.datetime] = None,
-    run_entry: bool = False,
+    run_entry: bool = True,
     **kwargs,
 ) -> pd.DataFrame:
     return job_ranking_summary(int(interval), display=display, now=now, run_entry=run_entry, **kwargs)
 
 
+__all__ = [
+    "job_1m",
+    "job_3m",
+    "job_5m",
+    "job_summary",
+    "job_ranking_1m",
+    "job_ranking_3m",
+    "job_ranking_5m",
+    "job_ranking_summary",
+    "run_push_summary_job",
+    "run_ranking_summary_job",
+]
