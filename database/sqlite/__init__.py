@@ -1,7 +1,13 @@
 # ============================================================
 # File   : database/sqlite/__init__.py
-# Version: PRODUCTION-STABLE-REV1.1
+# Version: PRODUCTION-STABLE-REV1.2-NAS-IO-PATCH
 # ============================================================
+
+from __future__ import annotations
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 from .retry import (
     DEFAULT_BUSY_TIMEOUT_MS,
@@ -11,6 +17,22 @@ from .retry import (
     prepare_sqlite_connection,
     run_sql_many_with_retry,
 )
+
+try:
+    from .retry_io_patch import install_retry_io_patch
+
+    if install_retry_io_patch():
+        from .retry_io_patch import (
+            DEFAULT_BUSY_TIMEOUT_MS,
+            is_lock_error,
+            lock_sleep_seconds,
+            normal_sleep_seconds,
+            prepare_sqlite_connection,
+            run_sql_many_with_retry,
+        )
+except Exception:
+    logger.exception("[database.sqlite] retry_io_patch install failed")
+
 from .normalize import (
     is_null_like,
     normalize_datetime_value,
