@@ -1,16 +1,17 @@
 # ============================================================
 # File   : scheduler_jobs/summary/summary_ai_entry_hook_v20.py
-# Version: PRODUCTION-STABLE-SUMMARY-AI-ENTRY-HOOK-V20-FORCE-TOP20
+# Version: PRODUCTION-STABLE-SUMMARY-AI-ENTRY-HOOK-V21-ENTRY-FIRE-RELAXED
 # ------------------------------------------------------------
 # Purpose:
 #   - 定時サマリー計算後のAI判定hook
 #   - PUSH由来 / RANKING由来を同じ出口AIパイプラインへ通す
 #   - BUY TOP20 / SELL TOP20 を確実にAIへ渡す
-#   - RANKING由来では tonosama filter / pre slope filter をOFFにする
+#   - AI前段で候補が全消えしないよう、pre slope filter は既定OFF
+#   - min_buy_score 既定を 5.0 -> 4.0 に緩和
 #
 # Notes:
 #   - 既存 summary_ai_entry_hook.py は長大なので壊さず残す
-#   - runner_core.py からこの軽量hookを呼ぶ
+#   - runner_core.py / ranking_summary_jobs.py からこの軽量hookを呼ぶ
 # ============================================================
 
 from __future__ import annotations
@@ -33,11 +34,11 @@ _RUNNER_CACHE: Optional[Callable[..., Any]] = None
 DEFAULT_TOP_N = 20
 DEFAULT_MAX_ENTRIES = 3
 DEFAULT_MIN_CONFIDENCE = 0.65
-DEFAULT_MIN_BUY_SCORE = 5.0
+DEFAULT_MIN_BUY_SCORE = 4.0
 DEFAULT_MAX_SELL_SCORE = 2.0
 DEFAULT_MIN_VOLUME = 1.0
 DEFAULT_MIN_PRICE = 200.0
-DEFAULT_MIN_SLOPE = 0.01
+DEFAULT_MIN_SLOPE = 0.001
 
 
 def _normalize_source(source: Any) -> str:
@@ -54,7 +55,6 @@ def _is_tonosama_source(source: Any) -> bool:
 
 
 def _safe_top_n() -> int:
-    # 旧hookや環境変数で10が指定されても、最低20に補正する。
     return max(DEFAULT_TOP_N, env_int("SUMMARY_AI_ENTRY_TOP_N", DEFAULT_TOP_N))
 
 
@@ -63,7 +63,6 @@ def _safe_tonosama_max() -> int:
 
 
 def _safe_min_price() -> float:
-    # 1円だと低位株が混ざりやすいため、未指定時は200円。
     return env_float("SUMMARY_AI_ENTRY_MIN_PRICE", DEFAULT_MIN_PRICE)
 
 
@@ -77,15 +76,22 @@ def _safe_min_slope() -> float:
 def _effective_use_tonosama_filter(source: str) -> bool:
     if _is_ranking_source(source):
         return False
+    # 候補が消えすぎる場合は env で OFF にできる。既定は従来通りON。
     return env_bool("SUMMARY_AI_ENTRY_USE_TONOSAMA_FILTER", True)
 
 
 def _effective_use_pre_slope_filter(source: str) -> bool:
+    """
+    エントリーが発火しない原因の多くがAI前段のslope全落ちだったため、既定OFF。
+
+    必要なら PyCharm 環境変数で明示的にONに戻せる:
+      SUMMARY_AI_ENTRY_USE_PRE_SLOPE_FILTER=1
+    """
     if _is_ranking_source(source):
         return False
     if _is_tonosama_source(source):
         return False
-    return True
+    return env_bool("SUMMARY_AI_ENTRY_USE_PRE_SLOPE_FILTER", False)
 
 
 def _resolve_runner() -> Optional[Callable[..., Any]]:
@@ -110,7 +116,7 @@ def _resolve_runner() -> Optional[Callable[..., Any]]:
             if callable(fn):
                 _RUNNER_CACHE = fn
                 logger.warning(
-                    "[summary.runners] AI hook v20 runner resolved %s.%s file=%s",
+                    "[summary.runners] AI hook v21 runner resolved %s.%s file=%s",
                     module_name,
                     func_name,
                     getattr(mod, "__file__", None),
@@ -118,13 +124,13 @@ def _resolve_runner() -> Optional[Callable[..., Any]]:
                 return fn
         except Exception:
             logger.debug(
-                "[summary.runners] AI hook v20 runner resolve failed %s.%s",
+                "[summary.runners] AI hook v21 runner resolve failed %s.%s",
                 module_name,
                 func_name,
                 exc_info=True,
             )
 
-    logger.error("[summary.runners] AI hook v20 runner resolve failed all candidates")
+    logger.error("[summary.runners] AI hook v21 runner resolve failed all candidates")
     return None
 
 
@@ -143,10 +149,28 @@ def _result_to_dict(result: Any) -> dict[str, Any]:
     if isinstance(result, dict):
         return result
     if isinstance(result, pd.DataFrame):
-        return {"candidates": result, "ai_results": result, "ai_ok": [], "approved_rows": [], "execution": {"executed": False, "skip_reason": "runner_returned_dataframe"}}
+        return {
+            "candidates": result,
+            "ai_results": result,
+            "ai_ok": [],
+            "approved_rows": [],
+            "execution": {"executed": False, "skip_reason": "runner_returned_dataframe"},
+        }
     if isinstance(result, list):
-        return {"candidates": result, "ai_results": result, "ai_ok": [x for x in result if isinstance(x, dict) and x.get("allow")], "approved_rows": [], "execution": {"executed": False, "skip_reason": "runner_returned_list"}}
-    return {"candidates": [], "ai_results": [], "ai_ok": [], "approved_rows": [], "execution": {"executed": False, "skip_reason": f"runner_returned_{type(result).__name__}"}}
+        return {
+            "candidates": result,
+            "ai_results": result,
+            "ai_ok": [x for x in result if isinstance(x, dict) and x.get("allow")],
+            "approved_rows": [],
+            "execution": {"executed": False, "skip_reason": "runner_returned_list"},
+        }
+    return {
+        "candidates": [],
+        "ai_results": [],
+        "ai_ok": [],
+        "approved_rows": [],
+        "execution": {"executed": False, "skip_reason": f"runner_returned_{type(result).__name__}"},
+    }
 
 
 def _len_any(v: Any) -> int:
@@ -165,13 +189,6 @@ def run_summary_ai_entry_safe(
     *,
     source: str = "SUMMARY",
 ) -> bool:
-    """
-    PUSH/RANKING共通のAI hook。
-
-    - top_nは最低20
-    - candidates.py側でBUY TOP20 + SELL TOP20へ展開
-    - ai_gate_runner.py側でAI_OK/AI_NG結果付きTOP20をコンソール表示
-    """
     interval = int(interval)
     now = (now or dt.datetime.now()).replace(microsecond=0)
     source_s = _normalize_source(source)
@@ -179,7 +196,7 @@ def run_summary_ai_entry_safe(
     try:
         if not env_bool("SUMMARY_AI_ENTRY_ENABLED", True):
             logger.info(
-                "[summary.runners] summary AI entry v20 skipped interval=%s source=%s reason=disabled_env",
+                "[summary.runners] summary AI entry v21 skipped interval=%s source=%s reason=disabled_env",
                 interval,
                 source_s,
             )
@@ -187,7 +204,7 @@ def run_summary_ai_entry_safe(
 
         if df is None or not isinstance(df, pd.DataFrame) or not is_nonempty_df(df):
             logger.warning(
-                "[summary.runners] summary AI entry v20 skipped interval=%s source=%s reason=empty_or_invalid_df type=%s",
+                "[summary.runners] summary AI entry v21 skipped interval=%s source=%s reason=empty_or_invalid_df type=%s",
                 interval,
                 source_s,
                 type(df).__name__,
@@ -197,7 +214,7 @@ def run_summary_ai_entry_safe(
         fn = _resolve_runner()
         if not callable(fn):
             logger.warning(
-                "[summary.runners] summary AI entry v20 skipped interval=%s source=%s reason=runner_unavailable",
+                "[summary.runners] summary AI entry v21 skipped interval=%s source=%s reason=runner_unavailable",
                 interval,
                 source_s,
             )
@@ -210,6 +227,8 @@ def run_summary_ai_entry_safe(
         require_market_open = env_bool("SUMMARY_AI_ENTRY_REQUIRE_MARKET_OPEN", True)
         use_tonosama = _effective_use_tonosama_filter(source_s)
         use_pre_slope = _effective_use_pre_slope_filter(source_s)
+        min_buy_score = env_float("SUMMARY_AI_ENTRY_MIN_BUY_SCORE", DEFAULT_MIN_BUY_SCORE)
+        max_sell_score = env_float("SUMMARY_AI_ENTRY_MAX_SELL_SCORE", DEFAULT_MAX_SELL_SCORE)
 
         kwargs = {
             "summary_df": df,
@@ -223,8 +242,8 @@ def run_summary_ai_entry_safe(
             "min_ai_confidence": min_conf,
             "min_confidence": min_conf,
             "min_conf": min_conf,
-            "min_buy_score": env_float("SUMMARY_AI_ENTRY_MIN_BUY_SCORE", DEFAULT_MIN_BUY_SCORE),
-            "max_sell_score": env_float("SUMMARY_AI_ENTRY_MAX_SELL_SCORE", DEFAULT_MAX_SELL_SCORE),
+            "min_buy_score": min_buy_score,
+            "max_sell_score": max_sell_score,
             "min_volume": env_float("SUMMARY_AI_ENTRY_MIN_VOLUME", DEFAULT_MIN_VOLUME),
             "min_price": _safe_min_price(),
             "require_buy_target": False,
@@ -247,7 +266,7 @@ def run_summary_ai_entry_safe(
         call_kwargs = _filter_kwargs(fn, kwargs)
 
         logger.warning(
-            "[summary.runners] summary AI entry v20 start interval=%s source=%s rows=%s runner=%s top_n=%s dry_run=%s require_market_open=%s tonosama=%s pre_slope=%s min_slope=%.4f",
+            "[summary.runners] summary AI entry v21 start interval=%s source=%s rows=%s runner=%s top_n=%s dry_run=%s require_market_open=%s min_buy=%.2f max_sell=%.2f tonosama=%s pre_slope=%s min_slope=%.4f",
             interval,
             source_s,
             len(df),
@@ -255,6 +274,8 @@ def run_summary_ai_entry_safe(
             top_n,
             dry_run,
             require_market_open,
+            min_buy_score,
+            max_sell_score,
             use_tonosama,
             use_pre_slope,
             _safe_min_slope(),
@@ -270,7 +291,7 @@ def run_summary_ai_entry_safe(
         execution = result_dict.get("execution") or {}
 
         logger.warning(
-            "[summary.runners] summary AI entry v20 done interval=%s source=%s candidates=%s ai_results=%s ai_ok=%s sell_ai_ok=%s executed=%s skip=%s",
+            "[summary.runners] summary AI entry v21 done interval=%s source=%s candidates=%s ai_results=%s ai_ok=%s sell_ai_ok=%s executed=%s skip=%s",
             interval,
             source_s,
             _len_any(candidates),
@@ -284,7 +305,7 @@ def run_summary_ai_entry_safe(
 
     except Exception:
         logger.exception(
-            "[summary.runners] summary AI entry v20 failed interval=%s source=%s",
+            "[summary.runners] summary AI entry v21 failed interval=%s source=%s",
             interval,
             source_s,
         )
