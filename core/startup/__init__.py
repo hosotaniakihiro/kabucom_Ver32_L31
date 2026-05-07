@@ -1,12 +1,13 @@
 # ============================================================
 # File   : core/startup/__init__.py
-# Ver    : PRODUCTION-STABLE-REV20.5-STARTUP-PACKAGE-SUMMARY-WRITE-GATE-PATCH
+# Ver    : PRODUCTION-STABLE-REV20.6-STARTUP-PACKAGE-RANKING-SUMMARY-LOCK-PATCH
 # ------------------------------------------------------------
 # 【概要】
 #   core.startup パッケージの公開入口
 #   schedule loop stale guard patch / summary scheduler timeout patch /
 #   summary AI slope env patch / summary AI score env patch /
-#   summary write gate runtime patch を自動適用する。
+#   summary write gate runtime patch / ranking summary persistence lock patch
+#   を自動適用する。
 # ============================================================
 
 from __future__ import annotations
@@ -49,6 +50,13 @@ try:
     install_summary_write_gate_runtime_patch()
 except Exception:
     logger.exception("[core.startup] summary write gate runtime patch install failed")
+
+try:
+    from .ranking_summary_persistence_lock_patch import install_ranking_summary_persistence_lock_patch
+
+    install_ranking_summary_persistence_lock_patch()
+except Exception:
+    logger.exception("[core.startup] ranking summary persistence lock patch install failed")
 
 from .startup import system_startup
 from .summary_bootstrap import (
