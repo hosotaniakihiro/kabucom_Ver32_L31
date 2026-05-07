@@ -1,6 +1,6 @@
 # ============================================================
 # File   : AI/entry_gate.py
-# Version: Ver26.28-FINAL-ENTRY-GATE-EARLY-SCALP-3M5M-CONF-INTEGRATED
+# Version: Ver26.29-FINAL-ENTRY-GATE-SUMMARY-SCORE-4-FLOAT
 # ------------------------------------------------------------
 # ✔ ENTRY 最終ゲート（唯一の判断場所）
 # ✔ 副作用ゼロ（pending_entries を絶対に触らない）
@@ -11,11 +11,14 @@
 # ✔ ranking_score_direct を hard gate + final_score に直結
 # ✔ EARLY_SCALP は AI を BLOCK 専用で使用
 # ✔ None / NaN / 未供給フィールド完全防御
+# ✔ SUMMARYのscore_low閾値を候補生成側 min_buy=4.0 と整合
+# ✔ scoreをint丸めせず小数のまま判定（4.39を4に落とさない）
 # ============================================================
 
 import logging
 import math
 import datetime as dt
+import os
 
 from AI.predict_mtf import predict_mtf
 from AI.train.entry.entry_immediate_profit import predict_immediate_profit
@@ -60,6 +63,33 @@ def _cfg(key: str, default):
         return global_config.get(key, default)
     except Exception:
         return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        x = float(v)
+        return x if math.isfinite(x) else float(default)
+    except Exception:
+        return float(default)
+
+
+def _cfg_float(key: str, default: float, *, env_name: str | None = None) -> float:
+    """
+    global_config と環境変数の両対応。
+    環境変数があれば環境変数を優先する。
+    """
+    if env_name:
+        v = os.environ.get(env_name)
+        if v is not None and str(v).strip() != "":
+            return _env_float(env_name, default)
+    try:
+        x = float(_cfg(key, default))
+        return x if math.isfinite(x) else float(default)
+    except Exception:
+        return float(default)
 
 
 def _safe_float(v, default: float = 0.0) -> float:
@@ -187,8 +217,8 @@ def _early_scalp_entry_ok(row: dict) -> tuple[bool, str]:
 
     return True, "early_scalp_ok"
 
-def apply_mtf_boost(entry_row, mtf_summary):
 
+def apply_mtf_boost(entry_row, mtf_summary):
     symbol = entry_row["symbol"]
 
     mtf_score = 0.0
@@ -202,6 +232,7 @@ def apply_mtf_boost(entry_row, mtf_summary):
     entry_row["mtf_boost"] = boost
 
     return entry_row
+
 
 # ============================================================
 # ENTRY FINAL GATE
@@ -249,34 +280,27 @@ def ai_final_entry_check(row: dict) -> dict:
     is_ranking = source == "RANKING"
 
     if is_ranking:
-        MIN_SCORE = _cfg("MIN_ENTRY_SCORE_RANKING", 2)
-        MIN_TURNOVER = _cfg("MIN_TURNOVER_RANKING", 1_000_000)
-        MIN_DOM = _cfg("MIN_DOMINANT_RATIO_RANKING", 0.0)
-        MIN_MTF = _cfg("MIN_MTF_CONFIDENCE_RANKING", 0.55)
-        MIN_RANK_SCORE = _cfg("MIN_RANKING_DIRECT_SCORE", 0.15)
+        MIN_SCORE = _cfg_float("MIN_ENTRY_SCORE_RANKING", 2.0, env_name="MIN_ENTRY_SCORE_RANKING")
+        MIN_TURNOVER = _cfg_float("MIN_TURNOVER_RANKING", 1_000_000, env_name="MIN_TURNOVER_RANKING")
+        MIN_DOM = _cfg_float("MIN_DOMINANT_RATIO_RANKING", 0.0, env_name="MIN_DOMINANT_RATIO_RANKING")
+        MIN_MTF = _cfg_float("MIN_MTF_CONFIDENCE_RANKING", 0.55, env_name="MIN_MTF_CONFIDENCE_RANKING")
+        MIN_RANK_SCORE = _cfg_float("MIN_RANKING_DIRECT_SCORE", 0.15, env_name="MIN_RANKING_DIRECT_SCORE")
     else:
-        MIN_SCORE = _cfg("MIN_ENTRY_SCORE", 5)
-        MIN_TURNOVER = _cfg("MIN_TURNOVER_1M", 3_000_000)
-        MIN_DOM = _cfg("MIN_DOMINANT_RATIO_SUMMARY", 0.58)
-        MIN_MTF = _cfg("MIN_MTF_CONFIDENCE", 0.55)
+        # SUMMARY/PUSH側の候補生成は min_buy_score=4.0 で通している。
+        # ここが既定5.0だと buy_score=4.39 が score_low で落ちるため、既定4.0に統一。
+        MIN_SCORE = _cfg_float("MIN_ENTRY_SCORE", 4.0, env_name="MIN_ENTRY_SCORE")
+        MIN_TURNOVER = _cfg_float("MIN_TURNOVER_1M", 3_000_000, env_name="MIN_TURNOVER_1M")
+        MIN_DOM = _cfg_float("MIN_DOMINANT_RATIO_SUMMARY", 0.58, env_name="MIN_DOMINANT_RATIO_SUMMARY")
+        MIN_MTF = _cfg_float("MIN_MTF_CONFIDENCE", 0.55, env_name="MIN_MTF_CONFIDENCE")
 
     # ========================================================
     # NaN完全防御 score取得
+    #   - 旧実装は int() 化で 4.39 -> 4 に丸めていた。
+    #   - score_low の誤判定を避けるため float のまま評価する。
     # ========================================================
-    def _safe_int(v):
-        try:
-            if v is None:
-                return 0
-            if isinstance(v, float):
-                if v != v:  # NaN
-                    return 0
-            return int(v)
-        except Exception:
-            return 0
-
-    buy_score = _safe_int(row.get("buy_score"))
-    sell_score = _safe_int(row.get("sell_score"))
-    total_score = _safe_int(row.get("score_total"))
+    buy_score = _safe_float(row.get("buy_score"))
+    sell_score = _safe_float(row.get("sell_score"))
+    total_score = _safe_float(row.get("score_total"))
 
     score_total = (
         total_score
@@ -292,7 +316,18 @@ def ai_final_entry_check(row: dict) -> dict:
     dominant_ratio = _safe_float(row.get("dominant_ratio"))
 
     if score_total < MIN_SCORE:
-        return _block("score_low", score_total)
+        logger.info(
+            "[ENTRY GATE] block score_low symbol=%s source=%s interval=%s score=%.4f min_score=%.4f buy=%.4f sell=%.4f total=%.4f",
+            symbol,
+            source,
+            interval,
+            score_total,
+            MIN_SCORE,
+            buy_score,
+            sell_score,
+            total_score,
+        )
+        return _block(f"score_low:{score_total:.3f}<{MIN_SCORE:.3f}", score_total)
 
     if interval == 1 and _is_market_open() and turnover < MIN_TURNOVER:
         return _block("low_turnover", 0.0, "TURNOVER")
@@ -370,7 +405,6 @@ def ai_final_entry_check(row: dict) -> dict:
     if is_ranking:
 
         rank_feats = {
-
             "ranking_session_rank_ret":
                 _safe_float(row.get("ranking_session_rank_ret")),
 
