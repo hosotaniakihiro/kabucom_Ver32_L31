@@ -1,12 +1,13 @@
 # ============================================================
 # File   : data_collectors/push_runtime.py
-# Version: DATA-COLLECTORS-PUSH-RUNTIME-V2-ENABLE-ROTATION
+# Version: DATA-COLLECTORS-PUSH-RUNTIME-V3-SEED-ACTIVE-SYMBOLS
 # ------------------------------------------------------------
 # Purpose:
 #   - PUSH受信本体を main.py から独立して起動する
 #   - PUSH A/B 50銘柄ローテーションを明示的に有効化する
 #   - rotation worker から subscription_manager.refresh_subscriptions を呼び、
 #     株ステーションへの登録を実行する
+#   - main.py から切り離したため、main_database.py 側でPUSH登録対象を生成・注入する
 # ============================================================
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ import logging
 import os
 import schedule
 import time
-from typing import Any
+from typing import Any, Iterable, List
 
 from data_collectors.config import (
     PUSH_BATCH_SIZE,
@@ -88,14 +89,212 @@ def _call_with_fallback(fn, *args, **kwargs) -> Any:
     return fn(*args, **kwargs)
 
 
-def configure_push_rotation_if_supported() -> None:
-    """
-    既存側にローテーション設定関数があれば、
-    4.8秒登録 + 0.2秒切替ギャップを渡す。
+def _normalize_symbol(x: Any) -> str | None:
+    if x is None:
+        return None
+    s = str(x).strip().upper()
+    if not s or s in {"NONE", "NULL", "NAN", "NA", "-", "0"}:
+        return None
+    if s.startswith("FILLER"):
+        return None
+    if s.endswith(".T"):
+        s = s[:-2]
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+    if not s.isalnum():
+        return None
+    if not (3 <= len(s) <= 5):
+        return None
+    return s
 
-    Ver32_L31 では rotation_core / rotation_settings 側で既に
-    4.8 / 0.2 が反映済みのため、関数が無くても致命ではない。
+
+def _dedupe_symbols(items: Iterable[Any]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for x in items or []:
+        s = _normalize_symbol(x)
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _extract_symbols(src: Any) -> List[str]:
+    if src is None:
+        return []
+
+    try:
+        if hasattr(src, "columns"):
+            cols = list(getattr(src, "columns", []))
+            for c in ("symbol", "Symbol", "code", "Code", "stock_code", "銘柄コード"):
+                if c in cols:
+                    return _dedupe_symbols(src[c].tolist())
+    except Exception:
+        pass
+
+    if isinstance(src, dict):
+        for key in (
+            "symbols",
+            "codes",
+            "items",
+            "data",
+            "active_symbols",
+            "monitor_symbols",
+            "push_symbols",
+            "register_symbols",
+            "subscription_symbols",
+            "daily_watchlist_symbols",
+        ):
+            if key in src and src[key]:
+                return _extract_symbols(src[key])
+        return _dedupe_symbols(src.keys())
+
+    if isinstance(src, str):
+        return _dedupe_symbols([src])
+
+    try:
+        return _dedupe_symbols(list(src))
+    except Exception:
+        return []
+
+
+def _set_global_symbols(symbols: List[str], *, source: str) -> None:
+    """push_stream.rotation_symbols が読む global_data/runtime attr へ同じ100銘柄を注入する。"""
+    if not symbols:
+        return
+
+    try:
+        from global_state import global_data
+    except Exception:
+        global_data = None
+
+    attrs = (
+        "monitor_symbols",
+        "candidate_push_symbols",
+        "push_candidate_symbols",
+        "push_symbols_100",
+        "active_symbols",
+        "ats_register_targets",
+        "ats_targets",
+        "should_register_symbols",
+        "push_symbols",
+        "register_symbols",
+        "subscription_symbols",
+        "daily_watchlist_symbols",
+    )
+
+    if global_data is not None:
+        for attr in attrs:
+            try:
+                setattr(global_data, attr, list(symbols))
+            except Exception:
+                logger.debug("[PUSH RUNTIME] failed to set global_data.%s", attr, exc_info=True)
+        try:
+            global_data.symbols_active = set(symbols)
+            global_data.active_symbol_source = source
+            global_data.push_symbol_seed_source = source
+            global_data.push_symbol_seed_count = len(symbols)
+        except Exception:
+            pass
+
+    try:
+        from trading.push.push_stream.runtime import _safe_set_runtime
+        for attr in attrs:
+            _safe_set_runtime(attr, list(symbols))
+        _safe_set_runtime("symbols_active", list(symbols))
+        _safe_set_runtime("push_symbol_seed_source", source)
+        _safe_set_runtime("push_symbol_seed_count", len(symbols))
+    except Exception:
+        logger.debug("[PUSH RUNTIME] failed to set push_stream runtime symbols", exc_info=True)
+
+    logger.warning(
+        "[PUSH RUNTIME] seeded push/register symbols source=%s count=%d head=%s",
+        source,
+        len(symbols),
+        symbols[:20],
+    )
+
+
+def _provider_call(fn) -> Any:
+    patterns = (
+        lambda: fn(force=True),
+        lambda: fn(limit=PUSH_TARGET_TOTAL),
+        lambda: fn(max_symbols=PUSH_TARGET_TOTAL),
+        lambda: fn(PUSH_TARGET_TOTAL),
+        lambda: fn(),
+    )
+    last_err: BaseException | None = None
+    for caller in patterns:
+        try:
+            return caller()
+        except TypeError as e:
+            last_err = e
+            continue
+        except Exception:
+            logger.debug("[PUSH RUNTIME] provider call failed fn=%s", fn, exc_info=True)
+            return None
+    if last_err is not None:
+        logger.debug("[PUSH RUNTIME] provider signature mismatch fn=%s err=%s", fn, last_err)
+    return None
+
+
+def seed_push_symbols_once() -> List[str]:
     """
+    main.py からPUSH stackを切り離したため、main_database.py側で
+    active_symbol_manager.update_active_symbols() を明示実行して登録対象を作る。
+    """
+    providers = [
+        ("trading.ranking.active_symbol_manager", "update_active_symbols"),
+        ("trading.ranking.active_symbol_manager", "get_register_symbols"),
+        ("trading.ranking.active_symbol_manager", "get_push_symbols"),
+        ("trading.ranking.active_symbol_manager", "get_active_symbols"),
+        ("optional.batch.daily_watchlist", "load_daily_watchlist_symbols"),
+        ("optional.batch.daily_watchlist", "get_daily_watchlist_symbols"),
+    ]
+
+    for module_name, func_name in providers:
+        try:
+            import importlib
+            mod = importlib.import_module(module_name)
+            fn = getattr(mod, func_name, None)
+        except Exception:
+            logger.debug("[PUSH RUNTIME] symbol seed import failed %s.%s", module_name, func_name, exc_info=True)
+            continue
+
+        if not callable(fn):
+            continue
+
+        src = _provider_call(fn)
+        symbols = _extract_symbols(src)[:PUSH_TARGET_TOTAL]
+        logger.info(
+            "[PUSH RUNTIME] symbol seed provider=%s.%s count=%d head=%s",
+            module_name,
+            func_name,
+            len(symbols),
+            symbols[:10],
+        )
+        if symbols:
+            _set_global_symbols(symbols, source=f"{module_name}.{func_name}")
+            return symbols
+
+    logger.error("[PUSH RUNTIME] failed to seed push/register symbols: all providers returned empty")
+    return []
+
+
+def schedule_symbol_seed_refresh() -> None:
+    """
+    ranking DB writer が後からランキングを取り込む場合に備えて、
+    PUSH登録対象を定期更新する。
+    """
+    try:
+        schedule.every(30).seconds.do(seed_push_symbols_once).tag("data_collectors_push_symbol_seed")
+        logger.info("[PUSH RUNTIME] scheduled symbol seed refresh every 30 seconds")
+    except Exception:
+        logger.exception("[PUSH RUNTIME] failed to schedule symbol seed refresh")
+
+
+def configure_push_rotation_if_supported() -> None:
     fn = resolve_callable(ROTATION_CONFIG_CANDIDATES, required=False)
     if fn is None:
         logger.info(
@@ -119,20 +318,10 @@ def configure_push_rotation_if_supported() -> None:
 
 
 def resolve_subscription_refresh_callable():
-    """
-    push_stream rotation worker が呼ぶ登録更新関数を解決する。
-    start_symbol_subscription_manager の60秒background_loopではなく、
-    rotation_A / rotation_B から直接 refresh_subscriptions を呼ぶ。
-    """
     return resolve_callable(SUBSCRIPTION_REFRESH_CANDIDATES, required=False)
 
 
 def start_subscription_manager_if_requested() -> bool:
-    """
-    互換用。
-    通常は rotation worker が登録を行うため、60秒 background_loop は起動しない。
-    必要な場合だけ DATA_COLLECTORS_START_SUB_MANAGER_LOOP=1 で有効化する。
-    """
     if not _env_bool("DATA_COLLECTORS_START_SUB_MANAGER_LOOP", False):
         logger.info("[PUSH RUNTIME] subscription manager background loop skipped; rotation worker handles registration")
         return True
@@ -154,7 +343,6 @@ def start_subscription_manager_if_requested() -> bool:
 
 
 def start_push_stream() -> bool:
-    """PUSH WebSocket / PUSH受信本体を開始し、rotationを明示的に有効化する。"""
     fn = resolve_callable(PUSH_START_CANDIDATES, required=False)
     if fn is None:
         logger.error("[PUSH RUNTIME] no push start function resolved")
@@ -191,7 +379,6 @@ def run_forever() -> int:
         PUSH_SWITCH_GAP_SEC,
     )
 
-    # 既存 rotation_settings が import 時に読む可能性があるため、先に注入する。
     os.environ.setdefault("PUSH_REGISTER_SEC", str(PUSH_REGISTER_SEC))
     os.environ.setdefault("PUSH_SWITCH_GAP_SEC", str(PUSH_SWITCH_GAP_SEC))
     os.environ.setdefault("PUSH_ROTATION_HOLD_SEC", str(PUSH_REGISTER_SEC))
@@ -199,12 +386,13 @@ def run_forever() -> int:
     os.environ.setdefault("PUSH_BATCH_SIZE", str(PUSH_BATCH_SIZE))
     os.environ.setdefault("PUSH_TARGET_TOTAL", str(PUSH_TARGET_TOTAL))
 
+    # 重要:
+    #   main.pyから切り離したため、PUSH登録対象100銘柄をこのプロセス内で作る。
+    seed_push_symbols_once()
+    schedule_symbol_seed_refresh()
+
     configure_push_rotation_if_supported()
 
-    # 重要:
-    #   先に 60秒 background_loop を動かすと reason=background_loop で登録され、
-    #   4.8秒A/Bローテーションにならない。
-    #   そのため通常は push_stream rotation worker に登録を任せる。
     sub_loop_ok = start_subscription_manager_if_requested()
     push_ok = start_push_stream()
 
