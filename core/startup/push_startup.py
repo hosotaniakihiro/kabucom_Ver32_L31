@@ -1,21 +1,18 @@
 # ============================================================
 # File   : core/startup/push_startup.py
-# Version: FINAL-PRODUCTION-REV23.1-PUSH-STARTUP-SPLIT-MODE
+# Version: FINAL-PRODUCTION-REV23.2-PUSH-STARTUP-FULL-SPLIT-MODE
 # ------------------------------------------------------------
 # 【概要】
 #   PUSH 関連の起動処理を担当
 #
-# 【機能】
-#   ✔ PUSH保存 writer 起動
-#   ✔ 既存 PUSH DB 読込 bootstrap
-#   ✔ symbol bootstrap
-#   ✔ 実銘柄100件 bridge
-#   ✔ PUSH WebSocket stream 早期起動
-#   ✔ PUSH WebSocket fallback 起動
-#
 # Split mode:
-#   - main_database.py が PUSH保存 / PUSH受信 / 銘柄登録を担当する
-#   - main.py 側では二重起動防止のため PUSH writer / PUSH stream は skip
+#   - main_database.py が PUSH保存 / PUSH受信 / 銘柄登録 / PUSH DB準備を担当する
+#   - main.py 側では PUSH DB読込 bootstrap / PUSH writer / PUSH stream / symbol bridge を起動しない
+#
+# 理由:
+#   - push_bootstrap / symbol_bootstrap / push_symbol_bridge 経由で
+#     database.session.init_engines() が走り、main.py 側で push/ranking DB が作成されるため
+#   - 完全に main_database.py へ切り離すには、main.py側の PUSH stack 全体を skip する必要がある
 # ============================================================
 
 from __future__ import annotations
@@ -42,7 +39,7 @@ from core.startup.startup_config import (
 
 logger = logging.getLogger(__name__)
 
-VERSION = "FINAL-PRODUCTION-REV23.1-PUSH-STARTUP-SPLIT-MODE"
+VERSION = "FINAL-PRODUCTION-REV23.2-PUSH-STARTUP-FULL-SPLIT-MODE"
 
 
 def _should_skip_push_collection_in_main() -> bool:
@@ -58,14 +55,6 @@ def _should_skip_push_collection_in_main() -> bool:
 # ============================================================
 
 def start_push_storage_safe() -> None:
-    """
-    PUSH保存 writer を起動する。
-
-    注意:
-      - market_open に関係なく起動する
-      - 注文可否だけ market_open で制御する
-      - split mode では main_database.py 側が担当するため main.py 側は skip
-    """
     if _should_skip_push_collection_in_main():
         logger.warning(
             "📡 push storage bootstrap skipped in main process because "
@@ -81,7 +70,6 @@ def start_push_storage_safe() -> None:
 
     try:
         logger.info("📡 push storage bootstrap start")
-
         start_push_storage(buffer_size=100)
 
         running = False
@@ -105,24 +93,27 @@ def start_push_storage_safe() -> None:
                 "⚠ push storage bootstrap completed but writer is not running. "
                 "Check core.startup.push_storage_bootstrap and push_db_writer logs."
             )
-
     except Exception:
         try:
             global_data.push_writer_running = False
             global_data.push_storage_running = False
         except Exception:
             pass
-
         logger.exception("❌ push storage bootstrap failed")
 
 
 def bootstrap_push_safe() -> None:
-    """
-    既存PUSHデータ読込 / PUSH関連初期化。
-    保存 writer 起動とは別。
+    if _should_skip_push_collection_in_main():
+        logger.warning(
+            "📡 push bootstrap skipped in main process because "
+            "main_database.py handles PUSH DB read/write collection."
+        )
+        try:
+            global_data.push_bootstrap_skipped_external = True
+        except Exception:
+            pass
+        return
 
-    split modeでも、main.py側が既存PUSH DBを読み込む用途は残す。
-    """
     try:
         bootstrap_push(PUSH_DIR)
     except Exception:
@@ -130,7 +121,17 @@ def bootstrap_push_safe() -> None:
 
 
 def bootstrap_symbols_safe() -> None:
-    """監視銘柄 / symbol flags 等の初期化。"""
+    if _should_skip_push_collection_in_main():
+        logger.warning(
+            "🔖 symbol bootstrap skipped from PUSH stack in main process because "
+            "main_database.py handles collector-side symbol registration."
+        )
+        try:
+            global_data.push_symbol_bootstrap_skipped_external = True
+        except Exception:
+            pass
+        return
+
     try:
         bootstrap_symbols()
     except Exception:
@@ -175,14 +176,21 @@ def inspect_global_push_symbols(label: str) -> None:
 
 
 def install_real_push_symbols_safe() -> list[str]:
-    """
-    symbol_bootstrap 後、push_stream 起動前に必ず実銘柄100件を注入する。
+    if _should_skip_push_collection_in_main():
+        logger.warning(
+            "🔗 push real-symbol bridge skipped in main process because "
+            "main_database.py handles PUSH registration targets."
+        )
+        try:
+            global_data.push_symbol_bridge_installed = False
+            global_data.push_symbol_bridge_count = 0
+            global_data.push_symbol_bridge_symbols = []
+            global_data.push_symbol_bridge_skipped_external = True
+        except Exception:
+            pass
+        return []
 
-    split modeでは登録自体は main_database.py 側が行うが、
-    main.py 側の表示・entry候補確認用に symbol bridge は残す。
-    """
     logger.info("🔗 push real-symbol bridge start")
-
     inspect_global_push_symbols("before-bridge")
 
     try:
@@ -251,7 +259,6 @@ def install_real_push_symbols_safe() -> list[str]:
 # ============================================================
 
 def resolve_push_stream_start_callable() -> Optional[Callable[..., Any]]:
-    """push_stream_bootstrap 側の関数名差異を吸収する。"""
     candidates = (
         ("core.startup.push_stream_bootstrap", "start_push_stream_runner_safe"),
         ("core.startup.push_stream_bootstrap", "start_push_stream_bootstrap"),
@@ -274,7 +281,6 @@ def resolve_push_stream_start_callable() -> Optional[Callable[..., Any]]:
 
 
 def start_push_stream_runner_safe() -> bool:
-    """PUSH WebSocket runner を安全に起動する。"""
     if _should_skip_push_collection_in_main():
         logger.warning(
             "📡 push stream runner bootstrap skipped in main process because "
@@ -318,7 +324,6 @@ def start_push_stream_runner_safe() -> bool:
 
 
 def start_push_stream_early_safe() -> bool:
-    """startup_summary_restore より前に PUSH WebSocket を起動する。"""
     if _should_skip_push_collection_in_main():
         logger.warning(
             "📡 push stream early bootstrap skipped in main process because "
@@ -374,10 +379,6 @@ def start_push_stream_early_safe() -> bool:
 
 
 def start_push_stream_fallback_safe() -> bool:
-    """
-    startup_summary_restore 後の保険起動。
-    早期起動済みなら skip。
-    """
     if _should_skip_push_collection_in_main():
         logger.warning(
             "📡 push stream fallback skipped in main process because "
@@ -410,9 +411,7 @@ def start_push_stream_fallback_safe() -> bool:
     )
 
     ok = start_push_stream_runner_safe()
-
     logger.info("📡 push stream fallback bootstrap result ok=%s", ok)
-
     return bool(ok)
 
 
@@ -424,22 +423,24 @@ def start_push_stack_before_scheduler() -> list[str]:
     """
     PUSH保存 writer / PUSH読込 / symbol bootstrap / bridge / WebSocket を起動する。
 
-    split modeでは、PUSH保存 writer と WebSocket は main_database.py に任せる。
-    ただし main.py 側のsummary/entry用に、既存PUSH DB読込・symbol bootstrap・bridgeは残す。
+    split modeでは、main.py側の PUSH stack 全体を起動しない。
     """
     if _should_skip_push_collection_in_main():
         logger.warning(
-            "📡 push collection startup partially skipped in main process: "
-            "main_database.py handles PUSH writer / PUSH stream / registration."
+            "📡 push collection startup fully skipped in main process: "
+            "main_database.py handles DB作成 / PUSH DB read-write / PUSH writer / PUSH stream / registration."
         )
-        bootstrap_push_safe()
-        bootstrap_symbols_safe()
-        symbols = install_real_push_symbols_safe()
         try:
             global_data.push_collection_skipped_external = True
+            global_data.push_writer_running = False
+            global_data.push_storage_running = False
+            global_data.push_stream_running = False
+            global_data.push_symbol_bridge_installed = False
+            global_data.push_symbol_bridge_count = 0
+            global_data.push_symbol_bridge_symbols = []
         except Exception:
             pass
-        return symbols
+        return []
 
     start_push_storage_safe()
     bootstrap_push_safe()
@@ -453,7 +454,6 @@ def start_push_stack_before_scheduler() -> list[str]:
         )
 
     start_push_stream_early_safe()
-
     return symbols
 
 
