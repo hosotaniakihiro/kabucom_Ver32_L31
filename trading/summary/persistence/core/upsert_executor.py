@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/summary/persistence/core/upsert_executor.py
-# Version: PRODUCTION-STABLE-UPSERT-EXECUTOR-V8-DROP-AUTOINCREMENT-ID
+# Version: PRODUCTION-STABLE-UPSERT-EXECUTOR-V9-VERIFY-CHECKPOINT
 # ------------------------------------------------------------
 # Purpose:
 #   summary 系テーブルへの bulk upsert 公開API。
@@ -22,6 +22,11 @@
 #   - stock_summary_* への保存時、DataFrame 由来の id を必ず除外する
 #   - id は SQLite 側の自動採番主キーとして扱う
 #   - ON CONFLICT(symbol, datetime) UPSERT 中の UNIQUE(id) 衝突を防ぐ
+#
+# REV9:
+#   - UPSERT成功後に count/max(datetime) を読み戻してログ出力
+#   - SQLite WAL に残ってDBビューアで見えにくいケースに備え、
+#     PRAGMA wal_checkpoint(PASSIVE) を安全実行
 # ============================================================
 
 from __future__ import annotations
@@ -56,6 +61,7 @@ except Exception:
 _DEFAULT_CHUNK_SIZE = int(os.environ.get("SUMMARY_UPSERT_CHUNK_SIZE", "75"))
 _DEFAULT_RETRY = int(os.environ.get("SUMMARY_UPSERT_RETRY", "12"))
 _DEFAULT_SLEEP_BASE = float(os.environ.get("SUMMARY_UPSERT_SLEEP_BASE", "0.45"))
+_CHECKPOINT_AFTER_UPSERT = os.environ.get("SUMMARY_UPSERT_WAL_CHECKPOINT", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _table_name_from_interval(interval: int) -> str:
@@ -126,6 +132,70 @@ def _drop_summary_autoincrement_id(rows: List[dict], *, table_name: str, interva
         dropped,
     )
     return out
+
+
+def _checkpoint_and_verify_summary_db(engine: Engine, table_name: str, interval: int, saved_rows: int) -> None:
+    """
+    UPSERT後の見える化。
+
+    - count / max(datetime) を同じ engine で読み戻してログに出す。
+    - WALモードでは書き込み直後の変更が -wal 側に残るため、
+      DBビューアや別プロセスで見えにくい場合がある。
+      そのため PASSIVE checkpoint を軽く実行する。
+
+    失敗しても保存結果は成功扱いのままにする。
+    """
+    if not str(table_name or "").startswith("stock_summary_"):
+        return
+
+    try:
+        with engine.connect() as conn:
+            try:
+                row = conn.exec_driver_sql(
+                    f'SELECT COUNT(*) AS cnt, MAX(datetime) AS max_dt FROM "{table_name}"'
+                ).fetchone()
+                cnt = row[0] if row is not None and len(row) > 0 else None
+                max_dt = row[1] if row is not None and len(row) > 1 else None
+                logger.warning(
+                    "[UPSERT VERIFY] summary table=%s interval=%s saved_rows=%s db_count=%s db_max_datetime=%s",
+                    table_name,
+                    interval,
+                    saved_rows,
+                    cnt,
+                    max_dt,
+                )
+            except Exception:
+                logger.debug(
+                    "[UPSERT VERIFY] readback failed interval=%s table=%s",
+                    interval,
+                    table_name,
+                    exc_info=True,
+                )
+
+            if _CHECKPOINT_AFTER_UPSERT:
+                try:
+                    ck = conn.exec_driver_sql("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                    logger.warning(
+                        "[UPSERT CHECKPOINT] summary table=%s interval=%s result=%s",
+                        table_name,
+                        interval,
+                        tuple(ck) if ck is not None else None,
+                    )
+                except Exception:
+                    logger.debug(
+                        "[UPSERT CHECKPOINT] skipped/failed interval=%s table=%s",
+                        interval,
+                        table_name,
+                        exc_info=True,
+                    )
+
+    except Exception:
+        logger.debug(
+            "[UPSERT VERIFY] connect failed interval=%s table=%s",
+            interval,
+            table_name,
+            exc_info=True,
+        )
 
 
 def execute_chunk_with_retry(
@@ -293,7 +363,9 @@ def execute_upsert(
                     raise
 
             if has_unique:
-                return len(work)
+                saved = len(work)
+                _checkpoint_and_verify_summary_db(eng, table, int(interval), saved)
+                return saved
 
         logger.warning(
             "[UPSERT] using delete+insert fallback interval=%s table=%s rows=%s chunk_size=%s retry=%s",
@@ -321,7 +393,9 @@ def execute_upsert(
                 sleep_base=sleep_base,
             )
 
-        return len(work)
+        saved = len(work)
+        _checkpoint_and_verify_summary_db(eng, table, int(interval), saved)
+        return saved
 
 
 def execute_chunk_with_retry_compat(
