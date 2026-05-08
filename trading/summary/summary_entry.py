@@ -1,6 +1,6 @@
 # ==========================================================
 # File   : trading/summary/summary_entry.py
-# Version: Ver1.6-PRODUCTION-SUMMARY-ENTRY-PRESERVE-AI-SIDE-BUY-ONLY
+# Version: Ver1.7-PRODUCTION-SUMMARY-ENTRY-AI-SIDE-FIRST-BUY-ONLY
 # ----------------------------------------------------------
 # ✔ summary entry実行責務
 # ✔ approved_rows: list[dict] / DataFrame / Series / dict 両対応
@@ -19,7 +19,7 @@
 # ✔ pipeline_source / interval を entry_controller に伝搬
 # ✔ interval 正規化
 # ✔ price/current_price/atr系の引き継ぎ強化
-# ✔ ai_side / ai_decision / side を正しく引き継ぐ
+# ✔ ai_side を entry_decision より優先
 # ✔ 通常SUMMARY_AIの買いエントリーではSELL候補をpending化しない
 # ✔ 本番安定設計
 # ==========================================================
@@ -97,6 +97,14 @@ def _clean_nan_values(row: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _norm_side_value(v: Any) -> str:
+    try:
+        side = str(v or "").strip().upper()
+        return side if side in ("BUY", "SELL") else ""
+    except Exception:
+        return ""
+
+
 def _normalize_entry_type(raw: Dict[str, Any]) -> str:
     try:
         entry_type = str(raw.get("entry_type") or "").strip()
@@ -131,22 +139,17 @@ def _normalize_source(raw: Dict[str, Any]) -> str:
 
 
 def _normalize_side(raw: Dict[str, Any]) -> str:
+    """
+    重要:
+      row_adapter / AI gate 側で entry_decision=BUY が既定値として残ることがある。
+      その場合でも ai_side=SELL があれば SELL を優先する。
+    """
     try:
-        side = str(
-            raw.get("entry_decision")
-            or raw.get("ai_entry_decision")
-            or raw.get("ai_decision")
-            or raw.get("ai_side")
-            or raw.get("side")
-            or raw.get("decision")
-            or DEFAULT_SIDE
-        ).strip().upper()
-
-        if side in ("BUY", "SELL"):
-            return side
-
+        for key in ("ai_side", "ai_entry_decision", "ai_decision", "entry_decision", "side", "decision"):
+            side = _norm_side_value(raw.get(key))
+            if side:
+                return side
         return DEFAULT_SIDE
-
     except Exception:
         return DEFAULT_SIDE
 
@@ -298,16 +301,18 @@ def build_entry_rows(
                 raw["symbol"] = symbol
                 raw["entry_type"] = _normalize_entry_type(raw)
                 raw["source"] = _normalize_source(raw)
-                raw["entry_decision"] = _normalize_side(raw)
-                raw["side"] = raw["entry_decision"]
-                raw["ai_side"] = raw.get("ai_side") or raw["side"]
+                side = _normalize_side(raw)
+                raw["entry_decision"] = side
+                raw["side"] = side
+                raw["ai_side"] = raw.get("ai_side") or side
                 raw["interval"] = _safe_interval(raw.get("interval"))
 
-                if SUMMARY_AI_BUY_ONLY and raw.get("entry_type") == DEFAULT_ENTRY_TYPE and raw["side"] != "BUY":
+                if SUMMARY_AI_BUY_ONLY and raw.get("entry_type") == DEFAULT_ENTRY_TYPE and side != "BUY":
                     logger.info(
-                        "[SUMMARY_ENTRY] skip non-buy summary AI row symbol=%s side=%s buy_score=%s sell_score=%s",
+                        "[SUMMARY_ENTRY] skip non-buy summary AI row symbol=%s side=%s ai_side=%s buy_score=%s sell_score=%s",
                         symbol,
-                        raw.get("side"),
+                        side,
+                        raw.get("ai_side"),
                         raw.get("score_buy", raw.get("buy_score")),
                         raw.get("score_sell", raw.get("sell_score")),
                     )
@@ -333,9 +338,9 @@ def build_entry_rows(
 
                 entry["symbol"] = _safe_symbol(entry) or symbol
                 entry["entry_type"] = raw.get("entry_type") or DEFAULT_ENTRY_TYPE
-                entry["side"] = raw.get("entry_decision", raw.get("side", DEFAULT_SIDE))
-                entry["entry_decision"] = entry["side"]
-                entry["ai_side"] = raw.get("ai_side") or entry["side"]
+                entry["side"] = side
+                entry["entry_decision"] = side
+                entry["ai_side"] = raw.get("ai_side") or side
 
                 entry["confidence"] = raw.get(
                     "confidence",
@@ -476,14 +481,16 @@ def register_pending_entries(
                 entry["symbol"] = symbol
                 entry["entry_type"] = entry.get("entry_type") or DEFAULT_ENTRY_TYPE
                 entry["source"] = entry.get("source") or DEFAULT_SOURCE
-                entry["side"] = _normalize_side(entry)
-                entry["entry_decision"] = entry["side"]
+                side = _normalize_side(entry)
+                entry["side"] = side
+                entry["entry_decision"] = side
                 entry["interval"] = _safe_interval(entry.get("interval"))
 
                 logger.info(
-                    "[SUMMARY_ENTRY] pending add request symbol=%s side=%s entry_type=%s source=%s interval=%s",
+                    "[SUMMARY_ENTRY] pending add request symbol=%s side=%s ai_side=%s entry_type=%s source=%s interval=%s",
                     entry.get("symbol"),
                     entry.get("side"),
+                    entry.get("ai_side"),
                     entry.get("entry_type"),
                     entry.get("source"),
                     entry.get("interval"),
