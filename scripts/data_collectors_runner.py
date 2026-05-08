@@ -1,15 +1,20 @@
 # ============================================================
 # File   : scripts/data_collectors_runner.py
-# Version: DATA-COLLECTORS-PARENT-RUNNER-V2-WITH-YAHOO-COMPLEMENT
+# Version: DATA-COLLECTORS-PARENT-RUNNER-V3-WITH-SUMMARY-DB-RUNNER
 # ------------------------------------------------------------
 # Purpose:
-#   - DB作成 / ランキング取得 / PUSH受信 / Yahoo補完を一括起動する親runner
+#   - DB作成 / ランキング取得 / PUSH受信 / Yahoo補完 / サマリーDB保存を一括起動する親runner
 #   - main.py とは別プロセスで動かす
 #
 # V2:
 #   ✔ yahoo_complement_runner.py を子プロセスとして起動
 #   ✔ Yahoo取得・Yahoo 1分足保存・YahooサマリーDB反映は main_database 側に集約
 #   ✔ main.py 側はDBに保存済みのYahoo補完サマリーを読むだけにする
+#
+# V3:
+#   ✔ summary_database_runner.py を子プロセスとして起動
+#   ✔ 定時サマリー計算・DB保存を main_database 側でも実行
+#   ✔ main.py 側は計算・表示・AI/entry、main_database 側は計算・保存という分離を可能にする
 # ============================================================
 
 from __future__ import annotations
@@ -38,11 +43,13 @@ DB_PREPARE_RUNNER = SCRIPTS_DIR / "db_prepare_runner.py"
 RANKING_COLLECTOR_RUNNER = SCRIPTS_DIR / "ranking_collector_runner.py"
 PUSH_RECEIVER_RUNNER = SCRIPTS_DIR / "push_receiver_runner.py"
 YAHOO_COMPLEMENT_RUNNER = SCRIPTS_DIR / "yahoo_complement_runner.py"
+SUMMARY_DATABASE_RUNNER = SCRIPTS_DIR / "summary_database_runner.py"
 
 PROCESS_SPECS = {
     "ranking_collector": RANKING_COLLECTOR_RUNNER,
     "push_receiver": PUSH_RECEIVER_RUNNER,
     "yahoo_complement": YAHOO_COMPLEMENT_RUNNER,
+    "summary_database": SUMMARY_DATABASE_RUNNER,
 }
 
 _STOP = False
@@ -58,11 +65,13 @@ def _build_env() -> dict[str, str]:
     root = str(PROJECT_ROOT)
     env["PYTHONPATH"] = root + (os.pathsep + old if old else "")
 
-    # data collectors 側が Yahoo補完保存の owner。
-    # main.py 側はこの処理を直接起動しない。
+    # data collectors 側が Yahoo補完保存 / サマリーDB保存の owner。
+    # main.py 側は計算・表示・AI/entryを担当し、DB保存は原則 database 側へ寄せる。
     env["AUTOSTOCK_DATA_COLLECTORS_PROCESS"] = "1"
+    env["AUTOSTOCK_MAIN_DATABASE_PROCESS"] = "1"
     env.setdefault("AUTOSTOCK_EXTERNAL_DATA_COLLECTORS", "1")
     env.setdefault("AUTOSTOCK_YAHOO_COMPLEMENT_OWNER", "database")
+    env.setdefault("AUTOSTOCK_SUMMARY_SAVE_OWNER", "database")
 
     return env
 
@@ -140,6 +149,7 @@ def main() -> int:
     logger.info("[DATA COLLECTORS] PROJECT_ROOT=%s", PROJECT_ROOT)
     logger.info("[DATA COLLECTORS] PYTHON=%s", _python_exe())
     logger.info("[DATA COLLECTORS] process_specs=%s", {k: str(v) for k, v in PROCESS_SPECS.items()})
+    logger.info("[DATA COLLECTORS] AUTOSTOCK_SUMMARY_SAVE_OWNER=%s", _build_env().get("AUTOSTOCK_SUMMARY_SAVE_OWNER"))
     logger.info("=" * 80)
 
     try:
