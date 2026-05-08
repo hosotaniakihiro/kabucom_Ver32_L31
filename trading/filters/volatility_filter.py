@@ -1,6 +1,6 @@
 # ==========================================================
 # File   : trading/filters/volatility_filter.py
-# Version: PRODUCTION-STABLE-VOLATILITY-FILTER-V2-CALL-COMPAT
+# Version: PRODUCTION-STABLE-VOLATILITY-FILTER-V3-FAIL-OPEN-INSUFFICIENT-BARS
 # ----------------------------------------------------------
 # ✔ ENTRY前専用・副作用ゼロ
 # ✔ ATR(1m) + 直近5分値幅 で「動く銘柄だけ」通す
@@ -9,6 +9,7 @@
 # ✔ 旧API: atr_1m_filter(df_1m=..., symbol=...) -> (ng, detail)
 # ✔ 新/誤用互換: atr_1m_filter(entry_row) -> bool allow
 # ✔ entry_controller.py の TypeError を防止
+# ✔ entry_row経由では本数不足/未生成/列不足は fail-open
 # ==========================================================
 
 from __future__ import annotations
@@ -149,6 +150,19 @@ def _ensure_ohlc_aliases(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
 
+def _is_data_insufficient_reason(reason: Any) -> bool:
+    s = str(reason or "")
+    return s in {
+        "1m未生成",
+        "1m本数不足",
+        "ATR計算不可",
+        "symbol列なし",
+        "OHLC列不足",
+        "5m未生成",
+        "5mデータなし",
+    }
+
+
 # ==========================================================
 # entry_row compatibility mode
 # ==========================================================
@@ -164,10 +178,10 @@ def _atr_1m_filter_from_entry_row(entry_row: Any, min_ratio: float = 0.0025) -> 
         False = ENTRY拒否
 
     重要:
-      entry_row にATR情報が無いだけで全落ちさせると、
-      SUMMARY_AI の発注経路が止まる。
-      そのため、entry_rowから判定不能な場合は global_data の1分足を試し、
-      それでも無ければ fail-open で通す。
+      SUMMARY_AI は起動直後・銘柄ローテーション直後に symbol_hist_len が短く、
+      1m本数不足だけで全落ちしやすい。
+      そのため entry_row 経由では、ATRが計算不能なだけなら fail-open で通し、
+      ATRが計算できて明確に ATR不足の時だけ止める。
     """
     row = _row_to_dict(entry_row)
     symbol = _normalize_symbol(
@@ -205,6 +219,20 @@ def _atr_1m_filter_from_entry_row(entry_row: Any, min_ratio: float = 0.0025) -> 
         if isinstance(df_1m, pd.DataFrame) and not df_1m.empty:
             try:
                 ng, detail = atr_1m_filter(df_1m=df_1m, symbol=symbol, min_ratio=min_ratio)
+                reason = (detail or {}).get("reason") if isinstance(detail, dict) else None
+                bars = (detail or {}).get("bars") if isinstance(detail, dict) else None
+
+                # 本数不足/未生成/列不足は「判定不能」なので、entry_row経由では通す。
+                if bool(ng) and _is_data_insufficient_reason(reason):
+                    logger.warning(
+                        "[VOL FILTER] ATR df fallback fail-open symbol=%s reason=%s bars=%s detail=%s",
+                        symbol,
+                        reason,
+                        bars,
+                        detail,
+                    )
+                    return True
+
                 logger.info(
                     "[VOL FILTER] ATR df fallback symbol=%s allow=%s detail=%s",
                     symbol,
@@ -264,6 +292,16 @@ def _range_5m_filter_from_entry_row(entry_row: Any, min_pct: float = 0.008) -> b
         if isinstance(df_5m, pd.DataFrame) and not df_5m.empty:
             try:
                 ng, detail = range_5m_filter(df_5m=df_5m, symbol=symbol, min_pct=min_pct)
+                reason = (detail or {}).get("reason") if isinstance(detail, dict) else None
+                if bool(ng) and _is_data_insufficient_reason(reason):
+                    logger.warning(
+                        "[VOL FILTER] RANGE df fallback fail-open symbol=%s reason=%s detail=%s",
+                        symbol,
+                        reason,
+                        detail,
+                    )
+                    return True
+
                 logger.info(
                     "[VOL FILTER] RANGE df fallback symbol=%s allow=%s detail=%s",
                     symbol,
