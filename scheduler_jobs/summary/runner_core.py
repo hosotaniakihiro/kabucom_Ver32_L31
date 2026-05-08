@@ -3,7 +3,7 @@
 #====================================================================================================
 # ============================================================
 # File   : scheduler_jobs/summary/runner_core.py
-# Version: PRODUCTION-STABLE-SUMMARY-RUNNER-CORE-V1.3-FORCE-TOP20-AI-HOOK
+# Version: PRODUCTION-STABLE-SUMMARY-RUNNER-CORE-V1.4-SAVE-OWNER-SPLIT
 # ------------------------------------------------------------
 # 【概要】
 #   PUSH / RANKING サマリーの実行本体。
@@ -25,12 +25,19 @@
 #   - summary_ai_entry_hook_v20 を使用
 #   - PUSH/RANKINGとも BUY TOP20 + SELL TOP20 をAIへ渡す
 #   - RANKINGではAI前段のtonosama/slopeフィルタをhook側でOFFにする
+#
+# REV1.4:
+#   - サマリー計算は main.py / main_database.py 両方で実行可能
+#   - DB保存は環境変数 AUTOSTOCK_SUMMARY_SAVE_OWNER で owner を制御
+#   - owner=database の場合、data collector/main_database 側だけ保存
+#   - main.py 側は計算・表示・AI/entryを継続し、DB保存だけskip可能
 # ============================================================
 
 from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 from typing import Optional
 
 import pandas as pd
@@ -59,10 +66,107 @@ from .time_utils import (
     now_naive,
     floor_to_interval,
     is_market_session,
-    resolve_display_slot,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# save owner gate
+# ============================================================
+
+def _env_flag_value(name: str) -> str:
+    try:
+        return str(os.getenv(name, "")).strip().lower()
+    except Exception:
+        return ""
+
+
+def _env_true(name: str) -> bool:
+    raw = _env_flag_value(name)
+    return raw in ("1", "true", "yes", "on", "enable", "enabled")
+
+
+def _env_false(name: str) -> bool:
+    raw = _env_flag_value(name)
+    return raw in ("0", "false", "no", "off", "disable", "disabled")
+
+
+def _is_database_process() -> bool:
+    """
+    main_database.py / data_collectors_runner 配下のプロセス判定。
+    """
+    return any(
+        _env_true(name)
+        for name in (
+            "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+            "AUTOSTOCK_SUMMARY_DB_WRITER",
+            "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+        )
+    )
+
+
+def _summary_save_enabled() -> bool:
+    """
+    サマリーDB保存の owner をプロセスごとに切り替える。
+
+    環境変数:
+      AUTOSTOCK_SUMMARY_SAVE_MODE=disabled / calculate_only / no_save
+        -> 常に保存しない
+
+      AUTOSTOCK_SUMMARY_SAVE_MODE=enabled / save
+        -> 常に保存する
+
+      AUTOSTOCK_SUMMARY_SAVE_OWNER=database
+        -> main_database.py / data collectors 側だけ保存する
+
+      AUTOSTOCK_SUMMARY_SAVE_OWNER=main
+        -> main.py 側だけ保存する
+
+      未指定:
+        -> 従来互換として保存する
+    """
+    mode = _env_flag_value("AUTOSTOCK_SUMMARY_SAVE_MODE")
+    if mode in ("disabled", "disable", "calculate_only", "calc_only", "no_save", "skip", "off"):
+        return False
+    if mode in ("enabled", "enable", "save", "on"):
+        return True
+
+    owner = _env_flag_value("AUTOSTOCK_SUMMARY_SAVE_OWNER")
+    if owner in ("database", "main_database", "data_collector", "data_collectors", "db"):
+        return _is_database_process()
+    if owner in ("main", "main.py", "realtime", "entry"):
+        return not _is_database_process()
+    if owner in ("both", "all", "any"):
+        return True
+    if owner in ("none", "off", "disabled", "no_save"):
+        return False
+
+    # owner未指定時は従来互換: 保存する
+    return True
+
+
+def _save_summary_if_owner(df: pd.DataFrame, interval: int, *, source: str) -> None:
+    if _summary_save_enabled():
+        logger.info(
+            "[summary.runners] DB save enabled interval=%s source=%s owner=%s db_process=%s",
+            interval,
+            source,
+            os.getenv("AUTOSTOCK_SUMMARY_SAVE_OWNER", ""),
+            _is_database_process(),
+        )
+        save_summary_safe(df, interval, source=source)
+        return
+
+    logger.info(
+        "[summary.runners] DB save skipped interval=%s source=%s owner=%s mode=%s db_process=%s "
+        "reason=summary_save_owner_gate",
+        interval,
+        source,
+        os.getenv("AUTOSTOCK_SUMMARY_SAVE_OWNER", ""),
+        os.getenv("AUTOSTOCK_SUMMARY_SAVE_MODE", ""),
+        _is_database_process(),
+    )
 
 
 # ============================================================
@@ -139,7 +243,7 @@ def job_summary(
 
     logger.info(
         "[summary.runners] job_summary(PUSH) start interval=%s display=%s run_entry=%s "
-        "now=%s slot=%s in_session=%s extra_keys=%s",
+        "now=%s slot=%s in_session=%s extra_keys=%s save_enabled=%s db_process=%s",
         interval,
         display,
         run_entry,
@@ -147,6 +251,8 @@ def job_summary(
         floor_to_interval(now, interval),
         is_market_session(now),
         sorted(list(kwargs.keys())),
+        _summary_save_enabled(),
+        _is_database_process(),
     )
 
     if not is_market_session(now):
@@ -155,7 +261,7 @@ def job_summary(
             "-> display latest persisted summary / fallback / rebuild if empty",
             interval,
             now,
-            resolve_display_slot(now),
+            floor_to_interval(now, interval),
         )
         df = display_closed_market_push_summary(interval=interval, now=now)
         log_job_result("job_summary(PUSH-CLOSED)", interval, df, {})
@@ -236,7 +342,7 @@ def job_summary(
         log_job_result("job_summary(PUSH-EMPTY)", interval, df, meta)
         return df
 
-    save_summary_safe(df, interval, source="push")
+    _save_summary_if_owner(df, interval, source="push")
     log_job_result("job_summary(PUSH)", interval, df, meta)
 
     if display:
@@ -278,7 +384,7 @@ def job_ranking_summary(
 
     logger.info(
         "[summary.runners] job_ranking_summary(RANKING) start interval=%s display=%s run_entry=%s "
-        "now=%s slot=%s in_session=%s extra_keys=%s",
+        "now=%s slot=%s in_session=%s extra_keys=%s save_enabled=%s db_process=%s",
         interval,
         display,
         run_entry,
@@ -286,6 +392,8 @@ def job_ranking_summary(
         floor_to_interval(now, interval),
         is_market_session(now),
         sorted(list(kwargs.keys())),
+        _summary_save_enabled(),
+        _is_database_process(),
     )
 
     runner = resolve_ranking_summary_runner()
@@ -354,7 +462,7 @@ def job_ranking_summary(
         log_job_result("job_ranking_summary(RANKING-EMPTY)", interval, df, meta)
         return df
 
-    save_summary_safe(df, interval, source="ranking")
+    _save_summary_if_owner(df, interval, source="ranking")
     log_job_result("job_ranking_summary(RANKING)", interval, df, meta)
 
     if display:
