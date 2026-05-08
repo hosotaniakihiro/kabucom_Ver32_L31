@@ -1,12 +1,13 @@
 # ============================================================
 # File   : core/startup/summary_startup.py
-# Version: FINAL-PRODUCTION-REV23.0-SUMMARY-STARTUP
+# Version: FINAL-PRODUCTION-REV23.1-SUMMARY-STARTUP-PUSH-INCREMENTAL-MA75
 # ------------------------------------------------------------
 # 【概要】
-#   startup summary restore / summary fast boot / MTF history を担当
+#   startup summary restore / push incremental MA75 / summary fast boot / MTF history を担当
 #
 # 【機能】
 #   ✔ startup_summary_restore
+#   ✔ 保存済み1/3/5分足summary最新以降のPUSHを読み込みMA75を継続作成
 #   ✔ summary fast boot async
 #   ✔ MTF history bootstrap
 # ============================================================
@@ -24,7 +25,7 @@ from core.startup.startup_config import resolve_attr
 
 logger = logging.getLogger(__name__)
 
-VERSION = "FINAL-PRODUCTION-REV23.0-SUMMARY-STARTUP"
+VERSION = "FINAL-PRODUCTION-REV23.1-SUMMARY-STARTUP-PUSH-INCREMENTAL-MA75"
 
 
 # ============================================================
@@ -135,6 +136,82 @@ def run_startup_summary_restore_safe() -> Any:
 
 
 # ============================================================
+# push incremental MA75
+# ============================================================
+
+def run_push_incremental_ma75_startup_safe() -> Any:
+    """
+    保存済み1分/3分/5分足サマリーの最新以降のPUSHだけを読み込み、
+    既存tailと結合して MA75 を含む指標を作る。
+
+    重要:
+      - 起動を止めない
+      - DB保存はここでは必須にしない
+      - global cache を更新して、起動直後の表示/ENTRYで75MAが使えるようにする
+    """
+    logger.info("📈 [PUSH INCR MA75] startup begin")
+
+    try:
+        global_data.push_incremental_ma75_started = True
+        global_data.push_incremental_ma75_done = False
+        global_data.push_incremental_ma75_failed = False
+        global_data.push_incremental_ma75_result = None
+    except Exception:
+        pass
+
+    try:
+        from core.startup.startup_push_incremental_ma75 import build_push_incremental_ma75_on_startup
+
+        result = build_push_incremental_ma75_on_startup(
+            intervals=(1, 3, 5),
+            update_global_cache=True,
+        )
+
+        ok = bool(getattr(result, "ok", False))
+        try:
+            global_data.push_incremental_ma75_done = ok
+            global_data.push_incremental_ma75_failed = not ok
+            global_data.push_incremental_ma75_result = result
+        except Exception:
+            pass
+
+        logger.info(
+            "✅ [PUSH INCR MA75] startup result ok=%s msg=%s "
+            "summary_db=%s push_db=%s push_rows=%s new_rows=%s cache_rows=%s ma75_nonnull=%s latest=%s",
+            ok,
+            getattr(result, "message", ""),
+            getattr(result, "summary_db", None),
+            getattr(result, "push_db", None),
+            getattr(result, "push_rows", None),
+            getattr(result, "new_rows", None),
+            getattr(result, "cache_rows", None),
+            getattr(result, "ma75_nonnull", None),
+            getattr(result, "latest", None),
+        )
+
+        return result
+
+    except Exception as e:
+        try:
+            global_data.push_incremental_ma75_done = False
+            global_data.push_incremental_ma75_failed = True
+            global_data.push_incremental_ma75_result = {
+                "ok": False,
+                "message": str(e),
+            }
+        except Exception:
+            pass
+        logger.exception("❌ [PUSH INCR MA75] startup failed")
+        return None
+
+    finally:
+        try:
+            global_data.push_incremental_ma75_started = False
+        except Exception:
+            pass
+
+
+# ============================================================
 # summary fast boot / MTF
 # ============================================================
 
@@ -160,9 +237,10 @@ def run_mtf_history_bootstrap_startup_safe(*, market_open_now: bool) -> None:
 
 def start_summary_stack_after_scheduler(*, market_open_now: bool) -> None:
     """
-    startup summary restore / summary fast boot / MTF history を実行。
+    startup summary restore / push incremental MA75 / summary fast boot / MTF history を実行。
     """
     run_startup_summary_restore_safe()
+    run_push_incremental_ma75_startup_safe()
     start_summary_fast_boot_safe()
     run_mtf_history_bootstrap_startup_safe(market_open_now=market_open_now)
 
@@ -170,6 +248,7 @@ def start_summary_stack_after_scheduler(*, market_open_now: bool) -> None:
 __all__ = [
     "VERSION",
     "run_startup_summary_restore_safe",
+    "run_push_incremental_ma75_startup_safe",
     "start_summary_fast_boot_safe",
     "run_mtf_history_bootstrap_startup_safe",
     "start_summary_stack_after_scheduler",
