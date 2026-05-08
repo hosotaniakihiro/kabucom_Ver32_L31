@@ -1,9 +1,10 @@
 # ============================================================
 # File   : core/startup/push_bootstrap.py
-# Ver    : PRODUCTION-STABLE-REV3-MERGE-READY-PUSH-DF
+# Ver    : PRODUCTION-STABLE-REV4-FAST-RECENT-PUSH-RESTORE
 # ------------------------------------------------------------
 # ✔ pushDB 復元（当日分）
-# ✔ 最大取得件数制限（メモリ保護）
+# ✔ 起動時は全日分を読まず、直近ウィンドウだけ高速復元
+# ✔ 最大取得件数制限（メモリ/起動時間保護）
 # ✔ time列安全パース
 # ✔ datetime列を必ず補完
 # ✔ タイムゾーン安全処理
@@ -32,7 +33,21 @@ logger = logging.getLogger(__name__)
 # 設定
 # ------------------------------------------------------------
 
-MAX_RESTORE_ROWS = int(os.environ.get("PUSH_BOOTSTRAP_MAX_RESTORE_ROWS", "50000"))
+# 旧既定 50000 は起動時に 30,000行超を読むと数十秒かかる。
+# 起動直後の summary / WebSocket merge 用なら直近データで十分。
+# 必要なら環境変数で戻せる。
+MAX_RESTORE_ROWS = int(os.environ.get("PUSH_BOOTSTRAP_MAX_RESTORE_ROWS", "8000"))
+RESTORE_LOOKBACK_MINUTES = int(os.environ.get("PUSH_BOOTSTRAP_LOOKBACK_MINUTES", "120"))
+
+# DB検索で使う時刻列候補。存在する列を使う。
+_TIME_COLUMN_CANDIDATES = (
+    "time",
+    "datetime",
+    "timestamp",
+    "current_price_time",
+    "received_at",
+    "inserted_at",
+)
 
 # 市場時間（東京証券取引所）
 MARKET_OPEN_TIME = dt.time(9, 0)
@@ -73,24 +88,98 @@ def _safe_parse_time(value) -> Optional[dt.datetime]:
 # 内部：pushDB 読み込み
 # ============================================================
 
-def _load_push_db(db_path: str) -> pd.DataFrame:
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     try:
-        with sqlite3.connect(db_path, timeout=10.0) as conn:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return {str(r[1]).strip().lower() for r in rows if len(r) >= 2}
+    except Exception:
+        return set()
+
+
+def _resolve_time_column(cols: set[str]) -> str | None:
+    lower = {str(c).strip().lower() for c in cols}
+    for c in _TIME_COLUMN_CANDIDATES:
+        if c.lower() in lower:
+            return c.lower()
+    return None
+
+
+def _load_push_db(db_path: str) -> pd.DataFrame:
+    started = dt.datetime.now()
+    cutoff_dt = started - dt.timedelta(minutes=max(RESTORE_LOOKBACK_MINUTES, 1))
+    cutoff_text = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        with sqlite3.connect(db_path, timeout=5.0) as conn:
             try:
-                conn.execute("PRAGMA busy_timeout=10000")
+                conn.execute("PRAGMA busy_timeout=5000")
+                conn.execute("PRAGMA query_only=ON")
             except Exception:
                 pass
 
+            cols = _table_columns(conn, "stream_data")
+            time_col = _resolve_time_column(cols)
+
+            # ------------------------------------------------
+            # まず直近時間で絞る。
+            # 文字列時刻が ISO 系であればSQLite側でかなり行数を削れる。
+            # ------------------------------------------------
+            if time_col:
+                try:
+                    sql = f"""
+                    SELECT *
+                    FROM stream_data
+                    WHERE {time_col} >= ?
+                    ORDER BY rowid DESC
+                    LIMIT ?
+                    """
+                    df = pd.read_sql(sql, conn, params=(cutoff_text, int(MAX_RESTORE_ROWS)))
+
+                    if isinstance(df, pd.DataFrame) and not df.empty:
+                        logger.info(
+                            "📡 pushDB recent restore query rows=%d time_col=%s cutoff=%s limit=%d elapsed=%.3fs",
+                            len(df),
+                            time_col,
+                            cutoff_text,
+                            MAX_RESTORE_ROWS,
+                            (dt.datetime.now() - started).total_seconds(),
+                        )
+                        return df
+
+                    logger.warning(
+                        "⚠ pushDB recent restore returned empty time_col=%s cutoff=%s -> fallback latest rows",
+                        time_col,
+                        cutoff_text,
+                    )
+                except Exception:
+                    logger.warning(
+                        "⚠ pushDB recent restore query failed time_col=%s -> fallback latest rows",
+                        time_col,
+                        exc_info=True,
+                    )
+
+            # ------------------------------------------------
+            # fallback: rowid降順で最大行だけ取得。
+            # 旧版の 50000 ではなく既定 8000。
+            # ------------------------------------------------
             df = pd.read_sql(
-                f"""
+                """
                 SELECT *
                 FROM stream_data
                 ORDER BY rowid DESC
-                LIMIT {MAX_RESTORE_ROWS}
+                LIMIT ?
                 """,
                 conn,
+                params=(int(MAX_RESTORE_ROWS),),
             )
-        return df
+
+            logger.info(
+                "📡 pushDB fallback restore query rows=%d limit=%d elapsed=%.3fs",
+                len(df),
+                MAX_RESTORE_ROWS,
+                (dt.datetime.now() - started).total_seconds(),
+            )
+            return df
 
     except Exception:
         logger.exception("❌ pushDB restore failed")
@@ -98,6 +187,8 @@ def _load_push_db(db_path: str) -> pd.DataFrame:
 
 
 def _normalize_push_df_for_summary(df: pd.DataFrame) -> pd.DataFrame:
+    norm_started = dt.datetime.now()
+
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -143,7 +234,18 @@ def _normalize_push_df_for_summary(df: pd.DataFrame) -> pd.DataFrame:
         logger.warning("⚠ pushDB missing time-like column")
         return pd.DataFrame()
 
-    out["time"] = out["time"].apply(_safe_parse_time)
+    out["time"] = pd.to_datetime(out["time"], errors="coerce")
+
+    # タイムゾーン安全処理
+    try:
+        if getattr(out["time"].dt, "tz", None) is not None:
+            out["time"] = out["time"].dt.tz_convert("Asia/Tokyo").dt.tz_localize(None)
+    except Exception:
+        try:
+            out["time"] = out["time"].dt.tz_localize(None)
+        except Exception:
+            pass
+
     out = out.dropna(subset=["time"])
 
     if out.empty:
@@ -154,7 +256,7 @@ def _normalize_push_df_for_summary(df: pd.DataFrame) -> pd.DataFrame:
         out["datetime"] = out["time"]
     else:
         try:
-            out["datetime"] = out["datetime"].apply(_safe_parse_time)
+            out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
             out["datetime"] = out["datetime"].fillna(out["time"])
         except Exception:
             out["datetime"] = out["time"]
@@ -198,6 +300,12 @@ def _normalize_push_df_for_summary(df: pd.DataFrame) -> pd.DataFrame:
     if len(out) > MAX_RESTORE_ROWS:
         out = out.tail(MAX_RESTORE_ROWS).reset_index(drop=True)
 
+    logger.info(
+        "📡 pushDB normalize done rows=%d elapsed=%.3fs",
+        len(out),
+        (dt.datetime.now() - norm_started).total_seconds(),
+    )
+
     return out.reset_index(drop=True)
 
 
@@ -211,6 +319,7 @@ def bootstrap_push(push_dir: str):
     global_data.push_df へ格納する。
     """
 
+    boot_started = dt.datetime.now()
     logger.info("📡 push bootstrap start")
 
     today_str = dt.datetime.now().strftime("%Y%m%d")
@@ -265,15 +374,20 @@ def bootstrap_push(push_dir: str):
     try:
         global_data.push_bootstrap_db_path = db_path
         global_data.push_bootstrap_rows = int(len(df))
+        global_data.push_bootstrap_raw_rows = int(len(raw))
         global_data.push_bootstrap_latest_datetime = df["datetime"].max() if "datetime" in df.columns else None
+        global_data.push_bootstrap_lookback_minutes = int(RESTORE_LOOKBACK_MINUTES)
+        global_data.push_bootstrap_max_restore_rows = int(MAX_RESTORE_ROWS)
     except Exception:
         pass
 
     logger.info(
-        "📡 push bootstrap complete rows=%d raw_rows=%d latest=%s limited=%d path=%s",
+        "📡 push bootstrap complete rows=%d raw_rows=%d latest=%s lookback_min=%d limited=%d elapsed=%.3fs path=%s",
         len(df),
         len(raw),
         df["datetime"].max() if "datetime" in df.columns else None,
+        RESTORE_LOOKBACK_MINUTES,
         MAX_RESTORE_ROWS,
+        (dt.datetime.now() - boot_started).total_seconds(),
         db_path,
     )
