@@ -7,7 +7,7 @@
 #   - market / risk / AI health / index shock / credit / volatility
 #     などの各種ガードを通過した銘柄のみエントリーする
 # ------------------------------------------------------------
-# Version: Ver2.3-PRODUCTION-SUMMARY-AI-NO-TONOSAMA-GATE
+# Version: Ver2.4-PRODUCTION-SUMMARY-SELL-THRESHOLD-ALIGNED
 # ------------------------------------------------------------
 # ✔ TOP候補を全件AI確認
 # ✔ AI allow / confidence / summary score で最終判定
@@ -23,7 +23,8 @@
 # ✔ quantity / order build / submit ログ強化
 # ✔ entry_handler / kabu_api.buy_sell_entry の qty passthrough と整合
 # ✔ SUMMARY_AI は tonosama gate を通さない
-# ✔ SUMMARY_AI の最終 score threshold を 5点台候補に合わせる
+# ✔ SUMMARY_AI BUY は5点台候補に合わせる
+# ✔ SUMMARY_AI SELL はAI gate側 minScore=1.00 と整合
 # ✔ production hardened
 # ============================================================
 
@@ -118,13 +119,15 @@ BOOST_SIZE_MULTIPLIER = 1.5
 MIN_AI_CONFIDENCE_BUY = 0.60
 MIN_AI_CONFIDENCE_SELL = 0.55
 
-# SUMMARY AI gate 側では 5点台の候補が AI_OK になっているため、
-# entry_controller の最終gateだけ 8点必須にすると全落ちする。
+# SUMMARY AI gate 側の実際の閾値と合わせる。
+# BUY: runner/entry_gate は強い買いだけを入れるため5.0維持。
+# SELL: runner/entry_gate は MIN_ENTRY_SCORE_SELL_SUMMARY=1.0 でAI_OKにしている。
+#       ここが5.0のままだと SELL_SCORE_LOW:1.xxx で最終的に全落ちする。
 MIN_SUMMARY_SCORE_BUY = 5.0
-MIN_SUMMARY_SCORE_SELL = 5.0
+MIN_SUMMARY_SCORE_SELL = 1.0
 
 MIN_COMPOSITE_SCORE_BUY = 5.0
-MIN_COMPOSITE_SCORE_SELL = 4.5
+MIN_COMPOSITE_SCORE_SELL = 1.0
 
 MAX_CANDIDATES_PER_SYMBOL = 10
 MAX_APPROVED_PER_RUN = 3
