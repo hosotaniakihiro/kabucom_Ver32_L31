@@ -1,12 +1,17 @@
 # ============================================================
 # File   : start_all.py
-# Version: START-ALL-LAUNCHER-V1
+# Version: START-ALL-LAUNCHER-V2-SUMMARY-SAVE-OWNER
 # ------------------------------------------------------------
 # Purpose:
 #   - main_database.py と main.py を一括起動するランチャー
 #   - main_database.py を先に起動して token / DB / ranking / PUSH 受信側を開始
 #   - 少し待ってから main.py を起動して summary / AI / entry / 表示側を開始
 #   - どちらかが終了した場合もログで検知できるように親プロセスで監視
+#
+# V2:
+#   - 定時サマリー計算は main.py / main_database.py 両方で実施
+#   - DB保存 owner は main_database.py 側へ寄せる
+#   - main.py は計算・表示・AI/entryを継続し、DB保存だけskip
 #
 # Usage:
 #   python start_all.py
@@ -15,12 +20,6 @@
 #
 # Windows recommended:
 #   start_all.bat をダブルクリック、または PowerShell/CMD から実行
-#
-# Notes:
-#   - 既存 main.py / main_database.py は直接変更しない
-#   - cwd は必ず PROJECT_ROOT に固定
-#   - Python 実行ファイルはデフォルトで現在の sys.executable を使用
-#   - 環境変数 KABU_PYTHON_EXE があればそれを優先
 # ============================================================
 
 from __future__ import annotations
@@ -72,7 +71,7 @@ def _validate_file(path: Path) -> None:
         raise FileNotFoundError(f"required path is not a file: {path}")
 
 
-def _build_env() -> Dict[str, str]:
+def _build_env(overrides: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env["KABU_PROJECT_ROOT"] = str(PROJECT_ROOT)
@@ -82,6 +81,9 @@ def _build_env() -> Dict[str, str]:
         env["PYTHONPATH"] = str(PROJECT_ROOT) + os.pathsep + old_pythonpath
     else:
         env["PYTHONPATH"] = str(PROJECT_ROOT)
+
+    if overrides:
+        env.update({str(k): str(v) for k, v in overrides.items()})
 
     return env
 
@@ -107,17 +109,27 @@ def _start_process(
     python_exe: str,
     script_path: Path,
     new_console: bool,
+    env_overrides: Optional[Dict[str, str]] = None,
 ) -> subprocess.Popen:
     _validate_file(script_path)
 
     cmd = [python_exe, str(script_path)]
+    child_env = _build_env(env_overrides)
 
     _log(f"launch {name}: {' '.join(cmd)}")
+    _log(
+        f"env {name}: AUTOSTOCK_SUMMARY_SAVE_OWNER="
+        f"{child_env.get('AUTOSTOCK_SUMMARY_SAVE_OWNER', '')} "
+        f"AUTOSTOCK_DATA_COLLECTORS_PROCESS="
+        f"{child_env.get('AUTOSTOCK_DATA_COLLECTORS_PROCESS', '')} "
+        f"AUTOSTOCK_SUMMARY_DB_WRITER="
+        f"{child_env.get('AUTOSTOCK_SUMMARY_DB_WRITER', '')}"
+    )
 
     proc = subprocess.Popen(
         cmd,
         cwd=str(PROJECT_ROOT),
-        env=_build_env(),
+        env=child_env,
         creationflags=_creation_flags(new_console),
     )
 
@@ -223,13 +235,28 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     processes: List[Tuple[str, subprocess.Popen]] = []
 
+    main_database_env = {
+        "AUTOSTOCK_DATA_COLLECTORS_PROCESS": "1",
+        "AUTOSTOCK_MAIN_DATABASE_PROCESS": "1",
+        "AUTOSTOCK_SUMMARY_SAVE_OWNER": "database",
+    }
+
+    main_env = {
+        # main.py でもサマリー計算は行うが、DB保存は database owner に任せる。
+        "AUTOSTOCK_SUMMARY_SAVE_OWNER": "database",
+        "AUTOSTOCK_DATA_COLLECTORS_PROCESS": "0",
+        "AUTOSTOCK_SUMMARY_DB_WRITER": "0",
+        "AUTOSTOCK_MAIN_DATABASE_PROCESS": "0",
+    }
+
     try:
-        # 1) DB / ranking / PUSH 受信側を先に起動
+        # 1) DB / ranking / PUSH 受信 / サマリーDB保存側を先に起動
         main_database_proc = _start_process(
             name="main_database.py",
             python_exe=python_exe,
             script_path=main_database_path,
             new_console=new_console,
+            env_overrides=main_database_env,
         )
         processes.append(("main_database.py", main_database_proc))
 
@@ -247,12 +274,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             return int(rc) if isinstance(rc, int) else 1
 
-        # 2) summary / AI / entry / 表示側を起動
+        # 2) summary / AI / entry / 表示側を起動。DB保存はskipされる。
         main_proc = _start_process(
             name="main.py",
             python_exe=python_exe,
             script_path=main_path,
             new_console=new_console,
+            env_overrides=main_env,
         )
         processes.append(("main.py", main_proc))
 
