@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/yahoo_tasks.py
-# Version: PRODUCTION-STABLE-REV2.0-YAHOO-TASKS-NONBLOCKING
+# Version: PRODUCTION-STABLE-REV3.0-YAHOO-TASKS-DATABASE-OWNER-GUARD
 # ------------------------------------------------------------
 # 【概要】
 #   Yahoo補完タスク登録と実行ラッパ。
@@ -11,11 +11,12 @@
 #   - 9:20 より前は実行しない
 #   - 二重起動を防ぐ
 #   - stale 実行状態を一定時間で解放する
+#   - main_database.py 側だけでYahoo補完の取得・DB保存を動かせる
 #
-# 【重要】
-#   - schedule スレッドからは直接重い処理を実行しない
-#   - 補完本体は別スレッドへ委譲する
-#   - finally で必ず running フラグを戻す
+# REV3:
+#   ✔ data_collectors.split_mode の Yahoo owner 設定を尊重
+#   ✔ 既定 owner=database のため main.py では Yahoo保存ジョブを登録しない
+#   ✔ main_database.py 側の yahoo_complement_runner.py では登録する
 # ============================================================
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ logger = logging.getLogger(__name__)
 YAHOO_START_TIME = dt.time(9, 20)
 YAHOO_TASK_TIMEOUT_SEC = 90
 YAHOO_TASK_JOIN_WARN_SEC = 1.0
+_TAG_YAHOO_COMPLEMENT = "yahoo_complement_database_owner"
 
 # ------------------------------------------------------------
 # runtime state
@@ -90,6 +92,29 @@ def _reset_stale_running_if_needed(now_ts: float) -> None:
     _yahoo_running = False
     _yahoo_started_at_epoch = 0.0
     _yahoo_worker_thread = None
+
+
+def _should_register_yahoo_here() -> bool:
+    try:
+        from data_collectors.split_mode import (
+            should_run_yahoo_complement_in_this_process,
+            yahoo_complement_owner,
+            is_data_collector_process,
+        )
+
+        ok = bool(should_run_yahoo_complement_in_this_process())
+        logger.info(
+            "[YAHOO TASK] owner check ok=%s owner=%s is_data_collector=%s",
+            ok,
+            yahoo_complement_owner(),
+            is_data_collector_process(),
+        )
+        return ok
+
+    except Exception:
+        # split_modeが無い古い環境では従来通り登録する。
+        logger.warning("[YAHOO TASK] owner check failed -> allow registration", exc_info=True)
+        return True
 
 
 def _run_yahoo_job_body(started_at: dt.datetime) -> None:
@@ -206,14 +231,36 @@ def get_yahoo_task_status() -> dict:
         "thread_name": thread_name,
         "timeout_sec": YAHOO_TASK_TIMEOUT_SEC,
         "start_time": str(YAHOO_START_TIME),
+        "tag": _TAG_YAHOO_COMPLEMENT,
     }
 
 
 def register_yahoo_tasks():
+    if not _should_register_yahoo_here():
+        logger.warning(
+            "Yahoo補完タスク登録スキップ: this process is not Yahoo complement owner"
+        )
+        return False
+
+    try:
+        schedule.clear(_TAG_YAHOO_COMPLEMENT)
+    except Exception:
+        pass
+
     # 衝突しない毎分 :10 に設定
-    schedule.every().minute.at(":10").do(_yahoo_wrapper)
+    job = schedule.every().minute.at(":10").do(_yahoo_wrapper)
+    try:
+        job.tag(_TAG_YAHOO_COMPLEMENT)
+    except Exception:
+        pass
+
     logger.info(
-        "Yahoo補完タスク登録済み（%s以降実行, nonblocking, timeout=%ss）",
+        "Yahoo補完タスク登録済み（%s以降実行, nonblocking, timeout=%ss, tag=%s）",
         YAHOO_START_TIME.strftime("%H:%M"),
         YAHOO_TASK_TIMEOUT_SEC,
+        _TAG_YAHOO_COMPLEMENT,
     )
+    return True
+
+
+__all__ = ["yahoo_minutely_complement_job", "register_yahoo_tasks", "get_yahoo_task_status"]
