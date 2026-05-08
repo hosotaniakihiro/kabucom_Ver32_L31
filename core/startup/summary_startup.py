@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/summary_startup.py
-# Version: FINAL-PRODUCTION-REV23.1-SUMMARY-STARTUP-PUSH-INCREMENTAL-MA75
+# Version: FINAL-PRODUCTION-REV23.2-SUMMARY-STARTUP-PUSH-INCREMENTAL-MA75-TAIL120
 # ------------------------------------------------------------
 # 【概要】
 #   startup summary restore / push incremental MA75 / summary fast boot / MTF history を担当
@@ -8,6 +8,8 @@
 # 【機能】
 #   ✔ startup_summary_restore
 #   ✔ 保存済み1/3/5分足summary最新以降のPUSHを読み込みMA75を継続作成
+#   ✔ 各銘柄75MA計算用に最低75本以上、標準120本のsummary tailを読む
+#   ✔ orchestrator が run_startup_summary_restore_safe() だけ呼ぶ構成でもMA75処理を必ず実行
 #   ✔ summary fast boot async
 #   ✔ MTF history bootstrap
 # ============================================================
@@ -25,7 +27,93 @@ from core.startup.startup_config import resolve_attr
 
 logger = logging.getLogger(__name__)
 
-VERSION = "FINAL-PRODUCTION-REV23.1-SUMMARY-STARTUP-PUSH-INCREMENTAL-MA75"
+VERSION = "FINAL-PRODUCTION-REV23.2-SUMMARY-STARTUP-PUSH-INCREMENTAL-MA75-TAIL120"
+
+
+# ============================================================
+# push incremental MA75
+# ============================================================
+
+def run_push_incremental_ma75_startup_safe(*, force: bool = False) -> Any:
+    """
+    保存済み1分/3分/5分足サマリーの最新以降のPUSHだけを読み込み、
+    既存tailと結合して MA75 を含む指標を作る。
+
+    重要:
+      - 起動を止めない
+      - DB保存はここでは必須にしない
+      - global cache を更新して、起動直後の表示/ENTRYで75MAが使えるようにする
+      - 既に成功済みの場合は重複実行しない
+    """
+    try:
+        if not force and bool(getattr(global_data, "push_incremental_ma75_done", False)):
+            logger.info("📈 [PUSH INCR MA75] startup skip because already done")
+            return getattr(global_data, "push_incremental_ma75_result", None)
+    except Exception:
+        pass
+
+    logger.info("📈 [PUSH INCR MA75] startup begin")
+
+    try:
+        global_data.push_incremental_ma75_started = True
+        global_data.push_incremental_ma75_done = False
+        global_data.push_incremental_ma75_failed = False
+        global_data.push_incremental_ma75_result = None
+    except Exception:
+        pass
+
+    try:
+        from core.startup.startup_push_incremental_ma75 import build_push_incremental_ma75_on_startup
+
+        result = build_push_incremental_ma75_on_startup(
+            intervals=(1, 3, 5),
+            update_global_cache=True,
+        )
+
+        ok = bool(getattr(result, "ok", False))
+        try:
+            global_data.push_incremental_ma75_done = ok
+            global_data.push_incremental_ma75_failed = not ok
+            global_data.push_incremental_ma75_result = result
+        except Exception:
+            pass
+
+        logger.info(
+            "✅ [PUSH INCR MA75] startup result ok=%s msg=%s "
+            "summary_db=%s push_db=%s push_rows=%s loaded_summary_rows=%s "
+            "new_rows=%s cache_rows=%s ma75_nonnull=%s latest=%s",
+            ok,
+            getattr(result, "message", ""),
+            getattr(result, "summary_db", None),
+            getattr(result, "push_db", None),
+            getattr(result, "push_rows", None),
+            getattr(result, "loaded_summary_rows", None),
+            getattr(result, "new_rows", None),
+            getattr(result, "cache_rows", None),
+            getattr(result, "ma75_nonnull", None),
+            getattr(result, "latest", None),
+        )
+
+        return result
+
+    except Exception as e:
+        try:
+            global_data.push_incremental_ma75_done = False
+            global_data.push_incremental_ma75_failed = True
+            global_data.push_incremental_ma75_result = {
+                "ok": False,
+                "message": str(e),
+            }
+        except Exception:
+            pass
+        logger.exception("❌ [PUSH INCR MA75] startup failed")
+        return None
+
+    finally:
+        try:
+            global_data.push_incremental_ma75_started = False
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -35,6 +123,10 @@ VERSION = "FINAL-PRODUCTION-REV23.1-SUMMARY-STARTUP-PUSH-INCREMENTAL-MA75"
 def run_startup_summary_restore_safe() -> Any:
     """
     起動時に summary DB / PUSH DB から必要最小限のデータを復元する。
+
+    重要:
+      orchestrator はこの関数だけを直接呼ぶため、ここから必ず
+      push incremental MA75 を続けて実行する。
     """
     logger.info("📊 startup summary restore start")
 
@@ -45,6 +137,8 @@ def run_startup_summary_restore_safe() -> Any:
         global_data.startup_summary_restore_result = None
     except Exception:
         pass
+
+    result = None
 
     try:
         restore_fn = resolve_attr(
@@ -74,7 +168,8 @@ def run_startup_summary_restore_safe() -> Any:
             intervals=(1, 3, 5),
             display=True,
             save_missing=True,
-            tail_rows=100,
+            # 75MA用。75本ちょうどでは欠損/途中足/重複除去で足りなくなるため120本読む。
+            tail_rows=120,
             one_min_lookback_minutes=15,
         )
 
@@ -96,7 +191,7 @@ def run_startup_summary_restore_safe() -> Any:
             "existing3=%s existing5=%s "
             "new3=%s new5=%s "
             "saved3=%s saved5=%s "
-            "load_from=%s",
+            "load_from=%s tail_rows=%s",
             ok,
             msg,
             getattr(result, "summary_db", None),
@@ -110,6 +205,7 @@ def run_startup_summary_restore_safe() -> Any:
             getattr(result, "saved_3min_rows", None),
             getattr(result, "saved_5min_rows", None),
             getattr(result, "one_min_load_from", None),
+            120,
         )
 
         if not ok:
@@ -134,81 +230,14 @@ def run_startup_summary_restore_safe() -> Any:
         logger.exception("❌ startup summary restore failed")
         return None
 
-
-# ============================================================
-# push incremental MA75
-# ============================================================
-
-def run_push_incremental_ma75_startup_safe() -> Any:
-    """
-    保存済み1分/3分/5分足サマリーの最新以降のPUSHだけを読み込み、
-    既存tailと結合して MA75 を含む指標を作る。
-
-    重要:
-      - 起動を止めない
-      - DB保存はここでは必須にしない
-      - global cache を更新して、起動直後の表示/ENTRYで75MAが使えるようにする
-    """
-    logger.info("📈 [PUSH INCR MA75] startup begin")
-
-    try:
-        global_data.push_incremental_ma75_started = True
-        global_data.push_incremental_ma75_done = False
-        global_data.push_incremental_ma75_failed = False
-        global_data.push_incremental_ma75_result = None
-    except Exception:
-        pass
-
-    try:
-        from core.startup.startup_push_incremental_ma75 import build_push_incremental_ma75_on_startup
-
-        result = build_push_incremental_ma75_on_startup(
-            intervals=(1, 3, 5),
-            update_global_cache=True,
-        )
-
-        ok = bool(getattr(result, "ok", False))
-        try:
-            global_data.push_incremental_ma75_done = ok
-            global_data.push_incremental_ma75_failed = not ok
-            global_data.push_incremental_ma75_result = result
-        except Exception:
-            pass
-
-        logger.info(
-            "✅ [PUSH INCR MA75] startup result ok=%s msg=%s "
-            "summary_db=%s push_db=%s push_rows=%s new_rows=%s cache_rows=%s ma75_nonnull=%s latest=%s",
-            ok,
-            getattr(result, "message", ""),
-            getattr(result, "summary_db", None),
-            getattr(result, "push_db", None),
-            getattr(result, "push_rows", None),
-            getattr(result, "new_rows", None),
-            getattr(result, "cache_rows", None),
-            getattr(result, "ma75_nonnull", None),
-            getattr(result, "latest", None),
-        )
-
-        return result
-
-    except Exception as e:
-        try:
-            global_data.push_incremental_ma75_done = False
-            global_data.push_incremental_ma75_failed = True
-            global_data.push_incremental_ma75_result = {
-                "ok": False,
-                "message": str(e),
-            }
-        except Exception:
-            pass
-        logger.exception("❌ [PUSH INCR MA75] startup failed")
-        return None
-
     finally:
+        # orchestrator は run_startup_summary_restore_safe() しか直接呼ばないため、
+        # ここで必ずMA75用の銘柄別tail読み込み・PUSH差分結合を実行する。
         try:
-            global_data.push_incremental_ma75_started = False
+            logger.info("📈 [PUSH INCR MA75] chained after startup summary restore")
+            run_push_incremental_ma75_startup_safe()
         except Exception:
-            pass
+            logger.exception("❌ [PUSH INCR MA75] chained startup call failed")
 
 
 # ============================================================
