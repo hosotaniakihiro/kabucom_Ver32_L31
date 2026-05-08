@@ -1,6 +1,6 @@
 # ==========================================================
 # File   : trading/summary/summary_entry.py
-# Version: Ver1.5-PRODUCTION-SUMMARY-ENTRY-PIPELINE-FILTER-LATEST
+# Version: Ver1.6-PRODUCTION-SUMMARY-ENTRY-PRESERVE-AI-SIDE-BUY-ONLY
 # ----------------------------------------------------------
 # ✔ summary entry実行責務
 # ✔ approved_rows: list[dict] / DataFrame / Series / dict 両対応
@@ -19,7 +19,8 @@
 # ✔ pipeline_source / interval を entry_controller に伝搬
 # ✔ interval 正規化
 # ✔ price/current_price/atr系の引き継ぎ強化
-# ✔ 副作用最小化
+# ✔ ai_side / ai_decision / side を正しく引き継ぐ
+# ✔ 通常SUMMARY_AIの買いエントリーではSELL候補をpending化しない
 # ✔ 本番安定設計
 # ==========================================================
 
@@ -46,6 +47,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_ENTRY_TYPE = "SUMMARY_AI"
 DEFAULT_SOURCE = "SUMMARY"
 DEFAULT_SIDE = "BUY"
+SUMMARY_AI_BUY_ONLY = True
 
 
 # ==========================================================
@@ -132,7 +134,11 @@ def _normalize_side(raw: Dict[str, Any]) -> str:
     try:
         side = str(
             raw.get("entry_decision")
+            or raw.get("ai_entry_decision")
+            or raw.get("ai_decision")
+            or raw.get("ai_side")
             or raw.get("side")
+            or raw.get("decision")
             or DEFAULT_SIDE
         ).strip().upper()
 
@@ -294,7 +300,18 @@ def build_entry_rows(
                 raw["source"] = _normalize_source(raw)
                 raw["entry_decision"] = _normalize_side(raw)
                 raw["side"] = raw["entry_decision"]
+                raw["ai_side"] = raw.get("ai_side") or raw["side"]
                 raw["interval"] = _safe_interval(raw.get("interval"))
+
+                if SUMMARY_AI_BUY_ONLY and raw.get("entry_type") == DEFAULT_ENTRY_TYPE and raw["side"] != "BUY":
+                    logger.info(
+                        "[SUMMARY_ENTRY] skip non-buy summary AI row symbol=%s side=%s buy_score=%s sell_score=%s",
+                        symbol,
+                        raw.get("side"),
+                        raw.get("score_buy", raw.get("buy_score")),
+                        raw.get("score_sell", raw.get("sell_score")),
+                    )
+                    continue
 
                 entry = build_entry_row(raw)
 
@@ -316,11 +333,9 @@ def build_entry_rows(
 
                 entry["symbol"] = _safe_symbol(entry) or symbol
                 entry["entry_type"] = raw.get("entry_type") or DEFAULT_ENTRY_TYPE
-                entry["side"] = raw.get(
-                    "entry_decision",
-                    raw.get("side", DEFAULT_SIDE),
-                )
+                entry["side"] = raw.get("entry_decision", raw.get("side", DEFAULT_SIDE))
                 entry["entry_decision"] = entry["side"]
+                entry["ai_side"] = raw.get("ai_side") or entry["side"]
 
                 entry["confidence"] = raw.get(
                     "confidence",
@@ -382,6 +397,7 @@ def build_entry_rows(
                         "datetime",
                         "ai_gate_allow",
                         "ai_confidence",
+                        "ai_side",
                         "lot_multiplier",
                         "score_base",
                         "score_trend",
@@ -401,10 +417,11 @@ def build_entry_rows(
                 entries.append(entry)
 
                 logger.info(
-                    "[SUMMARY_ENTRY] entry row built symbol=%s side=%s entry_type=%s confidence=%s "
+                    "[SUMMARY_ENTRY] entry row built symbol=%s side=%s ai_side=%s entry_type=%s confidence=%s "
                     "source=%s interval=%s score_buy=%s score_sell=%s",
                     entry.get("symbol"),
                     entry.get("side"),
+                    entry.get("ai_side"),
                     entry.get("entry_type"),
                     entry.get("confidence"),
                     entry.get("source"),
