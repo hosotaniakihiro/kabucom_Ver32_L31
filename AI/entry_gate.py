@@ -1,6 +1,6 @@
 # ============================================================
 # File   : AI/entry_gate.py
-# Version: Ver26.29-FINAL-ENTRY-GATE-SUMMARY-SCORE-4-FLOAT
+# Version: Ver26.30-FINAL-ENTRY-GATE-SUMMARY-AI-PENDING-SCORE-FIX
 # ------------------------------------------------------------
 # ✔ ENTRY 最終ゲート（唯一の判断場所）
 # ✔ 副作用ゼロ（pending_entries を絶対に触らない）
@@ -13,6 +13,8 @@
 # ✔ None / NaN / 未供給フィールド完全防御
 # ✔ SUMMARYのscore_low閾値を候補生成側 min_buy=4.0 と整合
 # ✔ scoreをint丸めせず小数のまま判定（4.39を4に落とさない）
+# ✔ SUMMARY_AI pending の score_buy/score_sell 欠落を score から復元
+# ✔ SUMMARY_AI pending の dominant_ratio 欠落は 1.0 として fail-open
 # ============================================================
 
 import logging
@@ -110,6 +112,15 @@ def _norm_side(v):
     return s if s in ("BUY", "SELL") else None
 
 
+def _norm_text(v) -> str:
+    try:
+        if v is None:
+            return ""
+        return str(v).strip().upper()
+    except Exception:
+        return ""
+
+
 def _is_market_open(now: dt.datetime | None = None) -> bool:
     now = now or dt.datetime.now()
     t = now.time()
@@ -131,6 +142,52 @@ def _warn_missing_ranking_field(symbol: str, field: str, row: dict):
         row.get("source"),
         sorted(row.keys()),
     )
+
+
+def _coalesce_float(row: dict, keys: tuple[str, ...], default: float = 0.0) -> float:
+    for key in keys:
+        try:
+            if key in row and row.get(key) not in (None, ""):
+                v = _safe_float(row.get(key), default)
+                if v != default or str(row.get(key)).strip() in ("0", "0.0"):
+                    return v
+        except Exception:
+            pass
+    return default
+
+
+def _is_summary_ai_pending(row: dict, source: str) -> bool:
+    entry_type = _norm_text(row.get("entry_type") or row.get("entryType"))
+    raw_source = _norm_text(row.get("source"))
+    return source == "SUMMARY" and (entry_type == "SUMMARY_AI" or raw_source == "SUMMARY")
+
+
+def _resolve_summary_scores(row: dict, *, source: str, decision: str | None) -> tuple[float, float, float, float]:
+    """
+    SUMMARY_AI pending では build_entry_row 後に buy_score/sell_score が欠け、
+    score だけが -6.0 のように残る場合がある。
+    その場合、SELL は abs(score) を sell_score として復元する。
+    """
+    buy_score = _coalesce_float(row, ("buy_score", "score_buy"), 0.0)
+    sell_score = _coalesce_float(row, ("sell_score", "score_sell"), 0.0)
+    total_score = _coalesce_float(row, ("score_total", "total_score"), 0.0)
+    raw_score = _coalesce_float(row, ("score", "final_score", "display_score"), 0.0)
+
+    if source == "SUMMARY":
+        if decision == "BUY":
+            if buy_score <= 0 and raw_score > 0:
+                buy_score = raw_score
+        elif decision == "SELL":
+            if sell_score <= 0:
+                if raw_score < 0:
+                    sell_score = abs(raw_score)
+                elif raw_score > 0:
+                    sell_score = raw_score
+
+        if total_score <= 0:
+            total_score = max(buy_score, sell_score, abs(raw_score))
+
+    return buy_score, sell_score, total_score, raw_score
 
 
 # ============================================================
@@ -293,14 +350,19 @@ def ai_final_entry_check(row: dict) -> dict:
         MIN_DOM = _cfg_float("MIN_DOMINANT_RATIO_SUMMARY", 0.58, env_name="MIN_DOMINANT_RATIO_SUMMARY")
         MIN_MTF = _cfg_float("MIN_MTF_CONFIDENCE", 0.55, env_name="MIN_MTF_CONFIDENCE")
 
+    decision = _norm_side(row.get("entry_decision") or row.get("side"))
+
     # ========================================================
     # NaN完全防御 score取得
     #   - 旧実装は int() 化で 4.39 -> 4 に丸めていた。
-    #   - score_low の誤判定を避けるため float のまま評価する。
+    #   - SUMMARY_AI pending では score_buy/score_sell が欠けることがあるため、
+    #     score / final_score / display_score から復元する。
     # ========================================================
-    buy_score = _safe_float(row.get("buy_score"))
-    sell_score = _safe_float(row.get("sell_score"))
-    total_score = _safe_float(row.get("score_total"))
+    buy_score, sell_score, total_score, raw_score = _resolve_summary_scores(
+        row,
+        source=source,
+        decision=decision,
+    )
 
     score_total = (
         total_score
@@ -309,15 +371,28 @@ def ai_final_entry_check(row: dict) -> dict:
             buy_score,
             sell_score,
             total_score,
+            abs(raw_score),
         )
     )
 
     turnover = _safe_float(row.get("turnover"))
     dominant_ratio = _safe_float(row.get("dominant_ratio"))
 
+    summary_ai_pending = _is_summary_ai_pending(row, source)
+    if summary_ai_pending and dominant_ratio <= 0:
+        dominant_ratio = 1.0
+        logger.info(
+            "[ENTRY GATE] SUMMARY_AI dominant_ratio fail-open symbol=%s side=%s score=%.4f buy=%.4f sell=%.4f",
+            symbol,
+            decision,
+            score_total,
+            buy_score,
+            sell_score,
+        )
+
     if score_total < MIN_SCORE:
         logger.info(
-            "[ENTRY GATE] block score_low symbol=%s source=%s interval=%s score=%.4f min_score=%.4f buy=%.4f sell=%.4f total=%.4f",
+            "[ENTRY GATE] block score_low symbol=%s source=%s interval=%s score=%.4f min_score=%.4f buy=%.4f sell=%.4f total=%.4f raw=%.4f entry_type=%s",
             symbol,
             source,
             interval,
@@ -326,6 +401,8 @@ def ai_final_entry_check(row: dict) -> dict:
             buy_score,
             sell_score,
             total_score,
+            raw_score,
+            row.get("entry_type"),
         )
         return _block(f"score_low:{score_total:.3f}<{MIN_SCORE:.3f}", score_total)
 
@@ -335,7 +412,6 @@ def ai_final_entry_check(row: dict) -> dict:
     if dominant_ratio < MIN_DOM:
         return _block("dominant_low", dominant_ratio)
 
-    decision = _norm_side(row.get("entry_decision") or row.get("side"))
     dominant_side = _norm_side(row.get("dominant_side"))
 
     if not decision:
