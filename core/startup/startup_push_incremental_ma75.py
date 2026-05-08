@@ -1,37 +1,39 @@
 # ============================================================
 # File   : core/startup/startup_push_incremental_ma75.py
-# Version: PRODUCTION-STABLE-V1-PUSH-INCREMENTAL-MA75
+# Version: PRODUCTION-STABLE-V2-PUSH-INCREMENTAL-MA75-MULTIDAY
 # ------------------------------------------------------------
 # Purpose:
 #   起動時に、銘柄ごとの保存済み 1分/3分/5分サマリー最新時刻以降の
 #   PUSHだけを読み込み、既存tailと結合して MA75 を含む指標を作る。
 #
-# Why:
-#   - PUSH bootstrap は生PUSHを復元するだけ
-#   - startup_summary_restore は既存3/5分足tailを使うが、PUSH time列が
-#     HH:MM:SS / HHMMSS の時刻のみの場合に差分抽出が弱い
-#   - 起動直後から 75MA を途切れさせないため、保存済みsummary tailを
-#     75本以上読み、最新以降のPUSHだけで追加足を作る
+# Important:
+#   - 5分足の75MAには 75本 * 5分 = 375分 が必要。
+#   - 東証の1営業日は約330分なので、当日DBだけでは5分足75本に届かない。
+#   - そのため summaryYYYYMMDD.db だけでなく、前日/前々日を含む
+#     複数日のsummary DBから銘柄別tailを読む。
 #
 # Design:
-#   1. summaryYYYYMMDD.db の stock_summary_1min/3min/5min tail を読む
-#   2. 銘柄ごとの latest datetime を作る
-#   3. pushYYYYMMDD.db の stream_data から直近PUSHを読む
-#   4. PUSHを1分足へ丸め、銘柄ごとに latest_1min より後だけ採用
-#   5. 1分足から3分足/5分足を作り、銘柄ごとの latest_3/5 より後だけ採用
-#   6. 既存tail + 新規足で indicator_pipeline を通し、MA75を作る
+#   1. summary DBを当日から最大3営業日相当分読む
+#      例: summary20260508.db, summary20260507.db, summary20260506.db
+#   2. stock_summary_1min/3min/5min の銘柄別tailを各120本以上確保
+#   3. pushYYYYMMDD.db のstream_dataから直近PUSHを読む
+#   4. PUSHを1分足へ丸め、保存済みsummary最新以降のみ採用
+#   5. 1分足から3分足/5分足を生成
+#   6. 既存tail + 新規足でindicator_pipelineを通し、MA75を作る
 #   7. global_data の merged summary cache へ反映する
 #
-# Notes:
-#   - DB保存は既存scheduler/summary_saverに任せる。ここでは起動直後の
-#     global cache 復元・MA75連続性を優先する。
-#   - 失敗してもstartupを止めない。
+# Env:
+#   PUSH_INCREMENTAL_MA75_TAIL_ROWS=120
+#   PUSH_INCREMENTAL_MA75_SUMMARY_LOOKBACK_DAYS=3
+#   PUSH_INCREMENTAL_MA75_PUSH_MAX_ROWS=50000
+#   PUSH_INCREMENTAL_MA75_LOOKBACK_MINUTES=240
 # ============================================================
 
 from __future__ import annotations
 
 import datetime as dt
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -55,6 +57,7 @@ SUMMARY_TABLE_BY_INTERVAL = {
 }
 
 TAIL_ROWS_PER_SYMBOL = int(os.environ.get("PUSH_INCREMENTAL_MA75_TAIL_ROWS", "120"))
+SUMMARY_LOOKBACK_DAYS = int(os.environ.get("PUSH_INCREMENTAL_MA75_SUMMARY_LOOKBACK_DAYS", "3"))
 PUSH_MAX_ROWS = int(os.environ.get("PUSH_INCREMENTAL_MA75_PUSH_MAX_ROWS", "50000"))
 PUSH_LOOKBACK_MINUTES = int(os.environ.get("PUSH_INCREMENTAL_MA75_LOOKBACK_MINUTES", "240"))
 
@@ -66,6 +69,7 @@ MARKET_CLOSE_TIME = dt.time(15, 30)
 class PushIncrementalMA75Result:
     ok: bool
     summary_db: Optional[str] = None
+    summary_dbs: list[str] = field(default_factory=list)
     push_db: Optional[str] = None
     loaded_summary_rows: dict[int, int] = field(default_factory=dict)
     existing_latest: dict[int, Optional[str]] = field(default_factory=dict)
@@ -97,6 +101,21 @@ def _trade_date_obj(trade_date: dt.date | str | None = None) -> dt.date:
     return dt.datetime.strptime(ymd, "%Y%m%d").date()
 
 
+def _extract_ymd_from_path(path: str | Path, prefix: str = "summary") -> Optional[str]:
+    name = Path(path).name
+    m = re.search(rf"{re.escape(prefix)}(\d{{8}})\.db$", name, flags=re.IGNORECASE)
+    return m.group(1) if m else None
+
+
+def _ymd_to_date(ymd: str | None, fallback: dt.date) -> dt.date:
+    try:
+        if ymd and len(str(ymd)) == 8:
+            return dt.datetime.strptime(str(ymd), "%Y%m%d").date()
+    except Exception:
+        pass
+    return fallback
+
+
 def _resolve_db(dir_path: str, prefix: str, trade_date: dt.date | str | None = None) -> Optional[str]:
     ymd = _trade_date_str(trade_date)
     direct = Path(dir_path) / f"{prefix}{ymd}.db"
@@ -107,6 +126,44 @@ def _resolve_db(dir_path: str, prefix: str, trade_date: dt.date | str | None = N
         return None
     files = sorted(base.glob(f"{prefix}*.db"), reverse=True)
     return str(files[0]) if files else None
+
+
+def _resolve_summary_dbs(
+    dir_path: str,
+    *,
+    trade_date: dt.date | str | None = None,
+    lookback_days: int = SUMMARY_LOOKBACK_DAYS,
+) -> list[str]:
+    """
+    当日から過去方向にsummary DBを複数取得する。
+
+    注意:
+      - カレンダー営業日判定ではなく、実在するDBファイルを日付降順で採用する。
+      - 祝日/休日をまたぐ場合でも、存在する直近DBを拾える。
+      - 5分足75MAのため、標準3DBを読む。
+    """
+    base = Path(dir_path)
+    if not base.exists():
+        return []
+
+    target_ymd = _trade_date_str(trade_date)
+    rows: list[tuple[str, str]] = []
+    for p in base.glob("summary*.db"):
+        ymd = _extract_ymd_from_path(p, "summary")
+        if not ymd:
+            continue
+        if ymd <= target_ymd:
+            rows.append((ymd, str(p)))
+
+    rows.sort(key=lambda x: x[0], reverse=True)
+    out: list[str] = []
+    for _, path in rows:
+        if path not in out:
+            out.append(path)
+        if len(out) >= max(int(lookback_days), 1):
+            break
+
+    return out
 
 
 def _table_exists(db_path: str, table: str) -> bool:
@@ -216,12 +273,6 @@ def _first_existing_col(df: pd.DataFrame, candidates: tuple[str, ...]) -> Option
     return None
 
 
-def _num(df: pd.DataFrame, col: str, default=np.nan) -> pd.Series:
-    if col not in df.columns:
-        return pd.Series(default, index=df.index, dtype="float64")
-    return pd.to_numeric(df[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
-
-
 def _normalize_symbol(s: pd.Series) -> pd.Series:
     return (
         s.astype(str)
@@ -257,11 +308,11 @@ def _load_summary_tail(summary_db: str, interval: int, *, tail_rows: int, trade_
     cols = _table_columns(summary_db, table)
     dt_expr = _datetime_expr(cols)
     if not dt_expr:
-        logger.warning("[PUSH INCR MA75] datetime expr unavailable table=%s cols=%s", table, cols)
+        logger.warning("[PUSH INCR MA75] datetime expr unavailable table=%s cols=%s db=%s", table, cols, summary_db)
         return pd.DataFrame()
 
-    # 多めに読み、pandas側で銘柄別tailにする。
-    limit = max(int(tail_rows) * 1200, int(tail_rows))
+    # DB単位では多めに読む。複数日concat後に銘柄別tailへ削る。
+    limit = max(int(tail_rows) * 1600, int(tail_rows))
     sql = f"""
         SELECT *
         FROM "{table}"
@@ -313,7 +364,33 @@ def _load_summary_tail(summary_db: str, interval: int, *, tail_rows: int, trade_
 
     df["interval"] = int(interval)
     df["source"] = df.get("source", "summary_db_tail")
+    df["_source_db"] = str(summary_db)
 
+    return df.reset_index(drop=True)
+
+
+def _load_summary_tail_from_dbs(
+    summary_dbs: list[str],
+    interval: int,
+    *,
+    tail_rows: int,
+    fallback_trade_day: dt.date,
+) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    for db in summary_dbs:
+        ymd = _extract_ymd_from_path(db, "summary")
+        trade_day = _ymd_to_date(ymd, fallback_trade_day)
+        x = _load_summary_tail(db, interval, tail_rows=tail_rows, trade_day=trade_day)
+        if not x.empty:
+            frames.append(x)
+
+    if not frames:
+        return pd.DataFrame()
+
+    df = pd.concat(frames, ignore_index=True, sort=False)
+    df["symbol"] = _normalize_symbol(df["symbol"])
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df = df[df["symbol"].ne("") & df["datetime"].notna()].copy()
     df = df.sort_values(["symbol", "datetime"])
     df = df.drop_duplicates(["symbol", "datetime"], keep="last")
     df = df.groupby("symbol", group_keys=False).tail(int(tail_rows))
@@ -407,7 +484,6 @@ def _normalize_push_ticks(raw: pd.DataFrame, trade_day: dt.date) -> pd.DataFrame
     if out.empty:
         return out
 
-    # 起動時処理を軽くするため、過去N分に制限
     cutoff = pd.Timestamp(dt.datetime.now() - dt.timedelta(minutes=max(PUSH_LOOKBACK_MINUTES, 1)))
     out = out[out["datetime"] >= cutoff].copy()
     return out.sort_values(["symbol", "datetime"]).reset_index(drop=True)
@@ -540,10 +616,11 @@ def _apply_indicators(df: pd.DataFrame, interval: int) -> pd.DataFrame:
     except Exception:
         logger.exception("[PUSH INCR MA75] indicator pipeline failed interval=%s", interval)
 
-    # fallback: at least ma75
     out = df.copy()
     out = out.sort_values(["symbol", "datetime"])
-    out["ma75"] = out.groupby("symbol")["close"].transform(lambda x: pd.to_numeric(x, errors="coerce").rolling(75, min_periods=75).mean())
+    out["ma75"] = out.groupby("symbol")["close"].transform(
+        lambda x: pd.to_numeric(x, errors="coerce").rolling(75, min_periods=75).mean()
+    )
     return out
 
 
@@ -551,7 +628,6 @@ def _set_global_cache(df: pd.DataFrame, interval: int) -> None:
     if df is None or df.empty:
         return
 
-    # まず既存 controller_cache を使う
     try:
         from trading.summary.controller_cache import safe_global_set_merged_summary
         safe_global_set_merged_summary(int(interval), "push", df)
@@ -559,7 +635,6 @@ def _set_global_cache(df: pd.DataFrame, interval: int) -> None:
     except Exception:
         logger.debug("[PUSH INCR MA75] safe_global_set_merged_summary unavailable", exc_info=True)
 
-    # fallback: global_dataへ直接
     try:
         from global_state import global_data
         setattr(global_data, f"summary_{int(interval)}min_df", df)
@@ -587,6 +662,15 @@ def _ma75_nonnull(df: pd.DataFrame) -> int:
         return 0
 
 
+def _safe_nunique(df: pd.DataFrame, col: str) -> int:
+    try:
+        if df is None or df.empty or col not in df.columns:
+            return 0
+        return int(df[col].nunique())
+    except Exception:
+        return 0
+
+
 # ============================================================
 # public
 # ============================================================
@@ -604,14 +688,27 @@ def build_push_incremental_ma75_on_startup(
     trade_day = _trade_date_obj(trade_date)
 
     try:
-        summary_db = summary_db_path or _resolve_db(DEFAULT_SUMMARY_DIR, "summary", trade_day)
+        if summary_db_path:
+            summary_dbs = [summary_db_path]
+        else:
+            summary_dbs = _resolve_summary_dbs(
+                DEFAULT_SUMMARY_DIR,
+                trade_date=trade_day,
+                lookback_days=SUMMARY_LOOKBACK_DAYS,
+            )
+        summary_db = summary_dbs[0] if summary_dbs else None
         push_db = push_db_path or _resolve_db(DEFAULT_PUSH_DIR, "push", trade_day)
+
         result.summary_db = summary_db
+        result.summary_dbs = list(summary_dbs)
         result.push_db = push_db
 
         logger.info(
-            "[PUSH INCR MA75] start summary_db=%s push_db=%s tail=%d push_limit=%d lookback=%d intervals=%s",
+            "[PUSH INCR MA75] start summary_db=%s summary_dbs=%s summary_lookback_days=%d "
+            "push_db=%s tail=%d push_limit=%d lookback=%d intervals=%s",
             summary_db,
+            summary_dbs,
+            SUMMARY_LOOKBACK_DAYS,
             push_db,
             TAIL_ROWS_PER_SYMBOL,
             PUSH_MAX_ROWS,
@@ -619,8 +716,8 @@ def build_push_incremental_ma75_on_startup(
             intervals,
         )
 
-        if not summary_db or not Path(summary_db).exists():
-            result.message = f"summary db not found: {summary_db}"
+        if not summary_dbs:
+            result.message = "summary dbs not found"
             logger.warning("[PUSH INCR MA75] %s", result.message)
             return result
         if not push_db or not Path(push_db).exists():
@@ -632,17 +729,24 @@ def build_push_incremental_ma75_on_startup(
         latest_maps: dict[int, dict[str, pd.Timestamp]] = {}
 
         for iv in intervals:
-            x = _load_summary_tail(summary_db, int(iv), tail_rows=TAIL_ROWS_PER_SYMBOL, trade_day=trade_day)
+            x = _load_summary_tail_from_dbs(
+                summary_dbs,
+                int(iv),
+                tail_rows=TAIL_ROWS_PER_SYMBOL,
+                fallback_trade_day=trade_day,
+            )
             existing[int(iv)] = x
             latest_maps[int(iv)] = _latest_map(x)
             result.loaded_summary_rows[int(iv)] = int(len(x))
             result.existing_latest[int(iv)] = _latest_str(x)
             logger.info(
-                "[PUSH INCR MA75] existing interval=%s rows=%d symbols=%d latest=%s",
+                "[PUSH INCR MA75] existing interval=%s rows=%d symbols=%d latest=%s dbs=%d tail_per_symbol=%d",
                 iv,
                 len(x),
-                x["symbol"].nunique() if not x.empty and "symbol" in x.columns else 0,
+                _safe_nunique(x, "symbol"),
                 _latest_str(x),
+                len(summary_dbs),
+                TAIL_ROWS_PER_SYMBOL,
             )
 
         raw_push = _load_recent_push_rows(push_db)
@@ -656,8 +760,23 @@ def build_push_incremental_ma75_on_startup(
         )
 
         if ticks.empty:
+            # PUSH差分がなくても、複数日tailからMA75を作ってcacheへ反映する。
+            for iv in intervals:
+                cache = _apply_indicators(existing.get(int(iv), pd.DataFrame()), int(iv))
+                result.cache_rows[int(iv)] = int(len(cache))
+                result.ma75_nonnull[int(iv)] = _ma75_nonnull(cache)
+                result.latest[int(iv)] = _latest_str(cache)
+                if update_global_cache and not cache.empty:
+                    _set_global_cache(cache, int(iv))
             result.ok = True
-            result.message = "no push ticks to append"
+            result.message = "no push ticks to append; multiday summary tail cached"
+            logger.info(
+                "[PUSH INCR MA75] done ok=True no_push cache_rows=%s ma75_nonnull=%s latest=%s elapsed=%.3fs",
+                result.cache_rows,
+                result.ma75_nonnull,
+                result.latest,
+                (dt.datetime.now() - started).total_seconds(),
+            )
             return result
 
         one_new_all = _ticks_to_1min(ticks)
@@ -672,11 +791,11 @@ def build_push_incremental_ma75_on_startup(
         if update_global_cache and not cache_1.empty:
             _set_global_cache(cache_1, 1)
 
-        # 3分/5分は 1分足 tail + 新規PUSHから作る
+        # 3分/5分は 1分足 tail + 新規PUSHから生成した新規足も作る。
+        base_for_resample = _combine_tail_and_new(existing.get(1, pd.DataFrame()), one_new, 1)
         for iv in (3, 5):
             if iv not in intervals:
                 continue
-            base_for_resample = _combine_tail_and_new(existing.get(1, pd.DataFrame()), one_new, 1)
             generated = _resample_from_1min(base_for_resample, iv)
             new_iv = _filter_after_latest_by_symbol(generated, latest_maps.get(iv, {}))
             result.new_rows[iv] = int(len(new_iv))
@@ -700,7 +819,8 @@ def build_push_incremental_ma75_on_startup(
             )
 
         logger.info(
-            "[PUSH INCR MA75] done ok=True new_rows=%s cache_rows=%s ma75_nonnull=%s latest=%s elapsed=%.3fs",
+            "[PUSH INCR MA75] done ok=True summary_dbs=%s new_rows=%s cache_rows=%s ma75_nonnull=%s latest=%s elapsed=%.3fs",
+            summary_dbs,
             result.new_rows,
             result.cache_rows,
             result.ma75_nonnull,
@@ -709,7 +829,7 @@ def build_push_incremental_ma75_on_startup(
         )
 
         result.ok = True
-        result.message = "push incremental MA75 cache built"
+        result.message = "push incremental MA75 cache built from multiday summary tail"
         return result
 
     except Exception as e:
