@@ -1,11 +1,13 @@
 # ============================================================
 # File   : trading/summary/pipeline/entry_pipeline.py
-# Version: Ver2.2-PRODUCTION-HARDENED-SUMMARY-AI-LIQUIDITY-SEPARATED
+# Version: Ver2.3-PRODUCTION-HARDENED-POSITION-COMPAT-FIX
 # ------------------------------------------------------------
 # ✔ AI approved rows → entry execution
 # ✔ DataFrame / list / dict / Series 両対応
 # ✔ 重複エントリー防止
 # ✔ positionチェック
+# ✔ positionチェック dict/list/DataFrame/Series 互換
+# ✔ global_data.get_positions 不在でも落とさない fallback
 # ✔ blowoff top filter
 # ✔ run_summary_entry_executor 呼び出し
 # ✔ NaN / None 防御
@@ -157,15 +159,24 @@ def _first(row: dict, keys: list[str], default: Any = None) -> Any:
 # safe symbol
 # ============================================================
 
+def _normalize_symbol(value: Any) -> str:
+    try:
+        s = str(value).strip()
+        if not s or s.lower() in ("none", "nan", "nat"):
+            return ""
+        if s.endswith(".0"):
+            ss = s[:-2]
+            if ss.isdigit():
+                return ss
+        return s
+    except Exception:
+        return ""
+
+
 def _get_symbol(row: Any) -> str:
     try:
         d = _row_to_dict(row)
-        symbol = str(d.get("symbol", "")).strip()
-        if symbol.endswith(".0"):
-            ss = symbol[:-2]
-            if ss.isdigit():
-                return ss
-        return symbol
+        return _normalize_symbol(d.get("symbol", ""))
     except Exception:
         return ""
 
@@ -174,24 +185,91 @@ def _get_symbol(row: Any) -> str:
 # duplicate / position check
 # ============================================================
 
-def _already_in_position(symbol: str) -> bool:
+def _extract_position_symbol(position: Any) -> str:
     try:
-        positions = global_data.get_positions()
+        if position is None:
+            return ""
 
-        if not positions:
+        if isinstance(position, pd.Series):
+            position = position.to_dict()
+
+        if isinstance(position, dict):
+            for key in ("symbol", "Symbol", "銘柄コード", "code", "stock_code", "StockCode"):
+                if key in position:
+                    sym = _normalize_symbol(position.get(key))
+                    if sym:
+                        return sym
+            return ""
+
+        return _normalize_symbol(position)
+
+    except Exception:
+        return ""
+
+
+def _positions_contains_symbol(positions: Any, symbol: str) -> bool:
+    target = _normalize_symbol(symbol)
+    if not target:
+        return False
+
+    try:
+        if positions is None:
             return False
 
-        for p in positions:
-            try:
-                if str(p.get("symbol")).strip() == str(symbol).strip():
+        if isinstance(positions, pd.DataFrame):
+            if positions.empty:
+                return False
+            for col in ("symbol", "Symbol", "銘柄コード", "code", "stock_code", "StockCode"):
+                if col in positions.columns:
+                    s = positions[col].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+                    return bool((s == target).any())
+            return False
+
+        if isinstance(positions, pd.Series):
+            return _extract_position_symbol(positions) == target
+
+        if isinstance(positions, dict):
+            # {symbol: position} 形式
+            if target in {_normalize_symbol(k) for k in positions.keys()}:
+                return True
+            # 1ポジションdict、または values に position dict が入る形式
+            if _extract_position_symbol(positions) == target:
+                return True
+            for v in positions.values():
+                if _extract_position_symbol(v) == target:
                     return True
-            except Exception:
-                continue
+            return False
+
+        if isinstance(positions, (list, tuple, set)):
+            for p in positions:
+                if _extract_position_symbol(p) == target:
+                    return True
+            return False
 
         return False
 
     except Exception:
-        logger.exception("[entry_pipeline] position check failed")
+        logger.exception("[entry_pipeline] positions contains check failed symbol=%s", symbol)
+        return False
+
+
+def _already_in_position(symbol: str) -> bool:
+    try:
+        positions_getter = getattr(global_data, "get_positions", None)
+
+        if callable(positions_getter):
+            positions = positions_getter()
+        else:
+            logger.warning(
+                "[entry_pipeline] global_data.get_positions not found; fallback open_positions symbol=%s",
+                symbol,
+            )
+            positions = getattr(global_data, "open_positions", None)
+
+        return _positions_contains_symbol(positions, symbol)
+
+    except Exception:
+        logger.exception("[entry_pipeline] position check failed symbol=%s", symbol)
         return False
 
 
