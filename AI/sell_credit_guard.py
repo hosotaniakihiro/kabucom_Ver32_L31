@@ -1,6 +1,6 @@
 # ============================================================
 # File: AI/sell_credit_guard.py
-# Version: PRODUCTION-STABLE-V2-SAFE-INPUT
+# Version: PRODUCTION-STABLE-V3-GLOBAL-SYMBOL-FLAGS-CACHE
 # ------------------------------------------------------------
 # 殿様イナゴ（SELL）専用 信用・売禁ガード
 #
@@ -9,7 +9,9 @@
 # ✔ ENTRY ロジックとは完全独立
 # ✔ True / False のみを返す純関数
 # ✔ symbol 文字列 / dict / pandas.Series / object の型揺れで落ちない
-# ✔ entry_controller から can_sell_symbol("4970") が来ても AttributeError を出さない
+# ✔ can_sell_symbol("4970") のような symbol のみ入力時は
+#   起動時に global_data へ保持した symbol_flags_info_map を参照
+# ✔ symbol_flags.sell_target / short_ok / credit_type=貸借銘柄 を信用売り可否に利用
 # ============================================================
 
 from __future__ import annotations
@@ -43,6 +45,7 @@ _TRUE_VALUES = {
     "可",
     "信用売可",
     "信用売り可",
+    "貸借銘柄",
     "short_sellable",
 }
 
@@ -63,6 +66,8 @@ _FALSE_VALUES = {
     "売禁",
     "信用売不可",
     "信用売り不可",
+    "信用銘柄",
+    "非貸借",
 }
 
 
@@ -70,12 +75,21 @@ _FALSE_VALUES = {
 # 内部ユーティリティ
 # ============================================================
 
+def _normalize_symbol(v: Any) -> str:
+    try:
+        if v is None:
+            return ""
+        s = str(v).strip()
+        if s.endswith(".0"):
+            s = s[:-2]
+        return s
+    except Exception:
+        return ""
+
+
 def _to_dict(value: Any) -> Dict[str, Any]:
     """
     dict / pandas.Series / str / int / object を安全に dict 化する。
-
-    旧実装は dict 前提だったため、entry_controller から symbol 文字列だけが
-    渡ると AttributeError: 'str' object has no attribute 'get' で落ちていた。
     """
     if value is None:
         return {}
@@ -83,7 +97,6 @@ def _to_dict(value: Any) -> Dict[str, Any]:
     if isinstance(value, dict):
         return dict(value)
 
-    # pandas.Series / dataclass 風オブジェクト対応
     if hasattr(value, "to_dict"):
         try:
             d = value.to_dict()
@@ -92,24 +105,26 @@ def _to_dict(value: Any) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # symbol だけが渡された場合
     if isinstance(value, (str, int)):
-        s = str(value).strip()
+        s = _normalize_symbol(value)
         return {"symbol": s} if s else {}
 
-    # 汎用オブジェクトから主要属性だけ吸収
     result: Dict[str, Any] = {}
     for key in (
         "symbol",
         "code",
         "stock_code",
         "short_sellable",
+        "short_ok",
         "margin_sellable",
         "credit_sellable",
         "can_short",
         "is_shortable",
         "shortable",
+        "sell_target",
+        "credit_type",
         "sell_ban",
+        "is_attention",
         "margin_rate",
     ):
         try:
@@ -123,9 +138,9 @@ def _to_dict(value: Any) -> Dict[str, Any]:
 
 def _pick_symbol(flags: Dict[str, Any]) -> str:
     for key in ("symbol", "code", "stock_code", "Symbol", "Code"):
-        v = flags.get(key)
-        if v is not None and str(v).strip():
-            return str(v).strip()
+        s = _normalize_symbol(flags.get(key))
+        if s:
+            return s
     return "-"
 
 
@@ -156,6 +171,81 @@ def _get_first(flags: Dict[str, Any], keys: tuple[str, ...], default: Any = None
     return default
 
 
+def _load_flags_from_global_cache(symbol: str) -> Dict[str, Any]:
+    symbol = _normalize_symbol(symbol)
+    if not symbol or symbol == "-":
+        return {}
+
+    try:
+        from global_state import global_data
+    except Exception:
+        return {}
+
+    for attr in (
+        "symbol_flags_info_map",
+        "symbol_flag_info_map",
+        "symbol_flags_map",
+        "symbol_info_map",
+    ):
+        try:
+            m = getattr(global_data, attr, None)
+            if isinstance(m, dict):
+                d = m.get(symbol) or m.get(str(symbol))
+                if isinstance(d, dict):
+                    out = dict(d)
+                    out["symbol"] = symbol
+                    return out
+        except Exception:
+            pass
+
+    # eligible set だけでもあれば、売建対象かの最低限判断に使う。
+    try:
+        eligible = getattr(global_data, "symbol_flags_eligible_symbols", None)
+        if eligible and symbol in eligible:
+            return {"symbol": symbol, "sell_target": 1}
+    except Exception:
+        pass
+
+    return {}
+
+
+def _merge_global_flags_if_needed(flags: Dict[str, Any]) -> Dict[str, Any]:
+    symbol = _pick_symbol(flags)
+    if not symbol or symbol == "-":
+        return flags
+
+    known_keys = {
+        "short_sellable",
+        "short_ok",
+        "margin_sellable",
+        "credit_sellable",
+        "can_short",
+        "is_shortable",
+        "shortable",
+        "is_margin_sellable",
+        "sell_target",
+        "credit_type",
+    }
+    if any(k in flags for k in known_keys):
+        return flags
+
+    cache_flags = _load_flags_from_global_cache(symbol)
+    if not cache_flags:
+        return flags
+
+    merged = dict(cache_flags)
+    merged.update({k: v for k, v in flags.items() if v is not None})
+
+    logger.info(
+        "[SELL_CREDIT_GUARD] global flags used symbol=%s sell_target=%s short_ok=%s credit_type=%s",
+        symbol,
+        merged.get("sell_target"),
+        merged.get("short_ok"),
+        merged.get("credit_type"),
+    )
+    return merged
+
+
 # ============================================================
 # メイン API
 # ============================================================
@@ -164,34 +254,13 @@ def can_sell_symbol(symbol_flags: Any, *, default: bool = False) -> bool:
     """
     SELL 殿様で信用売り可能かを判定する。
 
-    Parameters
-    ----------
-    symbol_flags : Any
-        推奨は dict。
-
-        例:
-        {
-            "symbol": "4970",
-            "short_sellable": True,
-            "sell_ban": False,
-            "margin_rate": 1.0,
-        }
-
-        ただし既存コード互換のため、"4970" のような symbol 文字列が来ても
-        例外を出さず False を返す。
-
-    default : bool
-        情報不足時の戻り値。
-        新規信用売りは危険側なので、デフォルトは False。
-
-    Returns
-    -------
-    bool
-        True  : SELL 可
-        False : SELL 禁止 / 情報不足 / 規制あり
+    symbol 文字列だけが渡された場合も、起動時に global_data へ保持した
+    symbol_flags_info_map から sell_target / short_ok / credit_type を読んで判定する。
     """
 
     flags = _to_dict(symbol_flags)
+    symbol = _pick_symbol(flags)
+    flags = _merge_global_flags_if_needed(flags)
     symbol = _pick_symbol(flags)
 
     if not flags:
@@ -202,8 +271,6 @@ def can_sell_symbol(symbol_flags: Any, *, default: bool = False) -> bool:
         )
         return bool(default)
 
-    # symbol 文字列だけでは信用売り可否は判定できない。
-    # ここで例外を出さず、安全側に倒して False を返す。
     if set(flags.keys()) <= {"symbol"}:
         logger.info(
             "[SELL_CREDIT_GUARD] NG symbol=%s reason=symbol_only_no_short_sellable_info",
@@ -218,26 +285,34 @@ def can_sell_symbol(symbol_flags: Any, *, default: bool = False) -> bool:
         flags,
         (
             "short_sellable",
+            "short_ok",
             "margin_sellable",
             "credit_sellable",
             "can_short",
             "is_shortable",
             "shortable",
             "is_margin_sellable",
+            "sell_target",
         ),
         default,
     )
 
-    if not _as_bool(short_sellable, default=default):
+    credit_type = str(flags.get("credit_type") or "").strip()
+    credit_type_ok = credit_type == "貸借銘柄"
+
+    if not (_as_bool(short_sellable, default=default) or credit_type_ok):
         logger.info(
-            "[SELL_CREDIT_GUARD] NG symbol=%s reason=not_short_sellable value=%r",
+            "[SELL_CREDIT_GUARD] NG symbol=%s reason=not_short_sellable value=%r credit_type=%s sell_target=%r short_ok=%r",
             symbol,
             short_sellable,
+            credit_type,
+            flags.get("sell_target"),
+            flags.get("short_ok"),
         )
         return False
 
     # --------------------------------------------------------
-    # 売禁
+    # 売禁 / 注意銘柄
     # --------------------------------------------------------
     sell_ban = _get_first(
         flags,
@@ -249,6 +324,15 @@ def can_sell_symbol(symbol_flags: Any, *, default: bool = False) -> bool:
             "[SELL_CREDIT_GUARD] NG symbol=%s reason=sell_ban value=%r",
             symbol,
             sell_ban,
+        )
+        return False
+
+    is_attention = _get_first(flags, ("is_attention", "attention", "regulation_attention"), False)
+    if _as_bool(is_attention, default=False):
+        logger.info(
+            "[SELL_CREDIT_GUARD] NG symbol=%s reason=is_attention value=%r",
+            symbol,
+            is_attention,
         )
         return False
 
@@ -277,5 +361,12 @@ def can_sell_symbol(symbol_flags: Any, *, default: bool = False) -> bool:
             )
             return False
 
-    logger.debug("[SELL_CREDIT_GUARD] OK symbol=%s", symbol)
+    logger.info(
+        "[SELL_CREDIT_GUARD] OK symbol=%s short_sellable=%r sell_target=%r short_ok=%r credit_type=%s",
+        symbol,
+        short_sellable,
+        flags.get("sell_target"),
+        flags.get("short_ok"),
+        credit_type,
+    )
     return True
