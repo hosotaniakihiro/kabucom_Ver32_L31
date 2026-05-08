@@ -1,6 +1,6 @@
 # ============================================================
 # File   : AI/entry_gate.py
-# Version: Ver26.31-FINAL-ENTRY-GATE-SIDE-AWARE-SUMMARY-SELL-SCORE
+# Version: Ver26.32-FINAL-ENTRY-GATE-SUMMARY-MTF-UNREADY-FAILOPEN
 # ------------------------------------------------------------
 # ✔ ENTRY 最終ゲート（唯一の判断場所）
 # ✔ 副作用ゼロ（pending_entries を絶対に触らない）
@@ -16,6 +16,7 @@
 # ✔ SUMMARY_AI pending の score_buy/score_sell 欠落を score から復元
 # ✔ SUMMARY_AI pending の dominant_ratio 欠落は 1.0 として fail-open
 # ✔ SUMMARY SELL は BUY と別閾値 MIN_ENTRY_SCORE_SELL_SUMMARY で判定
+# ✔ SUMMARY 3m/5m の technical_ready=False / hist不足時は MTF hard block しない
 # ============================================================
 
 import logging
@@ -157,6 +158,22 @@ def _coalesce_float(row: dict, keys: tuple[str, ...], default: float = 0.0) -> f
     return default
 
 
+def _bool_like(v, default: bool = False) -> bool:
+    try:
+        if isinstance(v, bool):
+            return v
+        if v is None:
+            return default
+        s = str(v).strip().lower()
+        if s in ("1", "true", "yes", "y", "on", "ok"):
+            return True
+        if s in ("0", "false", "no", "n", "off", "ng", ""):
+            return False
+        return default
+    except Exception:
+        return default
+
+
 def _is_summary_ai_pending(row: dict, source: str) -> bool:
     entry_type = _norm_text(row.get("entry_type") or row.get("entryType"))
     raw_source = _norm_text(row.get("source"))
@@ -233,6 +250,44 @@ def _resolve_min_score_for_side(*, source: str, is_ranking: bool, decision: str 
         )
 
     return _cfg_float("MIN_ENTRY_SCORE", 4.0, env_name="MIN_ENTRY_SCORE")
+
+
+def _should_fail_open_summary_mtf(row: dict, *, source: str, interval: int) -> tuple[bool, str]:
+    """
+    SUMMARY 3m/5m で履歴不足・テクニカル未成熟の場合、MTFをhard blockにしない。
+
+    最新ログでは ready_rows=0 / technical_ready=False / macd=0 / slope=0 / hist_len=1 の状態で
+    3m候補が全て mtf_low になっていた。これは「まだテクニカルが作れていない」状態であり、
+    銘柄の方向性が否定されたわけではないため、score/流動性/信用売りガードへ後続判断を任せる。
+    """
+    if source != "SUMMARY":
+        return False, "not_summary"
+
+    if _env_float("SUMMARY_ENTRY_FORCE_MTF_CHECK", 0.0) > 0:
+        return False, "force_mtf_check"
+
+    if interval == 1:
+        return True, "summary_1min_skip_mtf"
+
+    technical_ready = _bool_like(row.get("technical_ready"), False)
+    hist_len = _safe_float(row.get("symbol_hist_len"), 0.0)
+    rsi = _safe_float(row.get("rsi"), 0.0)
+    macd = _safe_float(row.get("macd"), 0.0)
+    signal = _safe_float(row.get("signal"), 0.0)
+    slope = _safe_float(row.get("slope"), 0.0)
+    slope_atr = _safe_float(row.get("slope_atr_scaled"), 0.0)
+    mtf_score = _safe_float(row.get("score_mtf") or row.get("mtf_score") or row.get("mtf"), 0.0)
+
+    if not technical_ready:
+        return True, "technical_not_ready"
+
+    if hist_len and hist_len < 14:
+        return True, f"hist_short:{hist_len:.0f}"
+
+    if rsi in (0.0, 50.0) and macd == 0.0 and signal == 0.0 and slope == 0.0 and slope_atr == 0.0 and mtf_score == 0.0:
+        return True, "indicators_flat_or_missing"
+
+    return False, "mtf_available"
 
 
 # ============================================================
@@ -489,9 +544,20 @@ def ai_final_entry_check(row: dict) -> dict:
     # MTF AI
     # ========================================================
     mtf_conf = 1.0
+    summary_mtf_fail_open, summary_mtf_reason = _should_fail_open_summary_mtf(row, source=source, interval=interval)
 
-    if not (source == "SUMMARY" and interval == 1):
-
+    if summary_mtf_fail_open:
+        logger.info(
+            "[ENTRY GATE] SUMMARY MTF fail-open symbol=%s interval=%s side=%s reason=%s score=%.4f buy=%.4f sell=%.4f",
+            symbol,
+            interval,
+            decision,
+            summary_mtf_reason,
+            score_total,
+            buy_score,
+            sell_score,
+        )
+    else:
         pred = predict_mtf(
             symbol,
             row.get("close_price"),
