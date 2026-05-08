@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/ranking/active_symbols/symbol_flags.py
-# Version: Ver1.0-ACTIVE-SYMBOLS-SYMBOL-FLAGS
+# Version: Ver1.1-ACTIVE-SYMBOLS-SYMBOL-FLAGS-CREDIT-TYPE-CACHE
 # ============================================================
 from __future__ import annotations
 import logging, sqlite3
@@ -57,7 +57,21 @@ def load_symbol_flags_eligible_symbols(*, db_path: str | Path = SYMBOL_FLAGS_DB,
                 logger.warning("[ACTIVE FLAGS] table not found db=%s table=%s", p, table)
                 return eligible, info_map
             cols = _get_table_columns(conn, table)
-            wanted_cols = ["symbol", "symbolname", "buy_target", "sell_target", "is_etf", "market", "market_type", "ats_ok", "short_ok", "is_margin"]
+            wanted_cols = [
+                "symbol",
+                "symbolname",
+                "buy_target",
+                "sell_target",
+                "is_etf",
+                "market",
+                "market_type",
+                "ats_ok",
+                "short_ok",
+                "is_margin",
+                "credit_type",
+                "is_attention",
+                "updated_at",
+            ]
             select_cols = [c for c in wanted_cols if c in cols]
             if "symbol" not in select_cols:
                 logger.warning("[ACTIVE FLAGS] symbol column missing db=%s cols=%s", p, cols)
@@ -82,7 +96,15 @@ def load_symbol_flags_eligible_symbols(*, db_path: str | Path = SYMBOL_FLAGS_DB,
                     continue
                 eligible.add(sym)
                 info_map[sym] = d
-        logger.info("[ACTIVE FLAGS] eligible loaded db=%s eligible=%d buy=%s sell=%s exclude_etf=%s", p, len(eligible), ACTIVE_ALLOW_BUY_TARGET, ACTIVE_ALLOW_SELL_TARGET, ACTIVE_EXCLUDE_ETF)
+        logger.info(
+            "[ACTIVE FLAGS] eligible loaded db=%s eligible=%d buy=%s sell=%s exclude_etf=%s info_cols=%s",
+            p,
+            len(eligible),
+            ACTIVE_ALLOW_BUY_TARGET,
+            ACTIVE_ALLOW_SELL_TARGET,
+            ACTIVE_EXCLUDE_ETF,
+            select_cols,
+        )
         return eligible, info_map
     except Exception:
         logger.exception("[ACTIVE FLAGS] load failed db=%s", p)
