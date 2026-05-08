@@ -1,13 +1,14 @@
 # ============================================================
 # File   : core/startup/push_bootstrap.py
-# Ver    : PRODUCTION-STABLE-REV4-FAST-RECENT-PUSH-RESTORE
+# Ver    : PRODUCTION-STABLE-REV5-FAST-RESTORE-TIME-PARSE-FIX
 # ------------------------------------------------------------
 # ✔ pushDB 復元（当日分）
-# ✔ 起動時は全日分を読まず、直近ウィンドウだけ高速復元
-# ✔ 最大取得件数制限（メモリ/起動時間保護）
-# ✔ time列安全パース
+# ✔ 起動時は全日分を読まず、最大行だけ高速復元
+# ✔ time列が HH:MM:SS / HHMMSS / 時刻のみ でも当日datetimeへ補完
+# ✔ time列には日付付きcutoff検索を使わず、空振りwarningを防止
+# ✔ datetime/received_at 等の日付付き列がある場合だけSQLite側で直近検索
+# ✔ pandas dateutil warning を抑制
 # ✔ datetime列を必ず補完
-# ✔ タイムゾーン安全処理
 # ✔ 市場時間外データ除外
 # ✔ 列名小文字正規化
 # ✔ 例外完全吸収
@@ -18,10 +19,11 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import logging
 import datetime as dt
-from typing import Optional
+from typing import Optional, Any
 
 import pandas as pd
 
@@ -33,13 +35,20 @@ logger = logging.getLogger(__name__)
 # 設定
 # ------------------------------------------------------------
 
-# 旧既定 50000 は起動時に 30,000行超を読むと数十秒かかる。
-# 起動直後の summary / WebSocket merge 用なら直近データで十分。
-# 必要なら環境変数で戻せる。
 MAX_RESTORE_ROWS = int(os.environ.get("PUSH_BOOTSTRAP_MAX_RESTORE_ROWS", "8000"))
 RESTORE_LOOKBACK_MINUTES = int(os.environ.get("PUSH_BOOTSTRAP_LOOKBACK_MINUTES", "120"))
 
-# DB検索で使う時刻列候補。存在する列を使う。
+# SQLite側で WHERE に使ってよい「日付を含む可能性が高い」列だけ。
+# time は HH:MM:SS / HHMMSS の時刻のみであることが多いため除外する。
+_SQLITE_DATETIME_COLUMN_CANDIDATES = (
+    "datetime",
+    "timestamp",
+    "current_price_time",
+    "received_at",
+    "inserted_at",
+)
+
+# pandas側で時刻復元に使う候補。time は最優先。
 _TIME_COLUMN_CANDIDATES = (
     "time",
     "datetime",
@@ -49,7 +58,6 @@ _TIME_COLUMN_CANDIDATES = (
     "inserted_at",
 )
 
-# 市場時間（東京証券取引所）
 MARKET_OPEN_TIME = dt.time(9, 0)
 MARKET_CLOSE_TIME = dt.time(15, 30)
 
@@ -58,19 +66,88 @@ MARKET_CLOSE_TIME = dt.time(15, 30)
 # 内部：安全時間パース
 # ============================================================
 
-def _safe_parse_time(value) -> Optional[dt.datetime]:
-    """例外を絶対に投げない time パーサー。"""
+def _today_date() -> dt.date:
+    try:
+        return dt.datetime.now().date()
+    except Exception:
+        return dt.date.today()
+
+
+def _parse_time_only_to_today(value: Any, trade_date: dt.date | None = None) -> Optional[dt.datetime]:
+    """
+    time列が時刻だけの場合に、当日の日付を付けて datetime 化する。
+
+    対応例:
+      - 14:51:10
+      - 14:51:10.123
+      - 145110
+      - 145110.123
+      - 95110
+      - 09:51
+    """
     if value is None:
         return None
 
+    trade_date = trade_date or _today_date()
+
     try:
-        ts = pd.to_datetime(str(value), errors="coerce")
+        s = str(value).strip()
+        if not s or s.lower() in {"nan", "none", "nat", "<na>"}:
+            return None
+
+        # 既に日付を含むものはここでは扱わない
+        if re.search(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", s):
+            return None
+
+        # HH:MM[:SS[.ffffff]]
+        m = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2})(?:\.(\d{1,6}))?)?$", s)
+        if m:
+            hh = int(m.group(1))
+            mm = int(m.group(2))
+            ss = int(m.group(3) or 0)
+            micros = int((m.group(4) or "0").ljust(6, "0")[:6])
+            if 0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59:
+                return dt.datetime.combine(trade_date, dt.time(hh, mm, ss, micros))
+            return None
+
+        # HHMMSS / HMMSS / HHMMSS.xxx
+        s2 = s.split(".", 1)[0]
+        if s2.isdigit() and 3 <= len(s2) <= 6:
+            s2 = s2.zfill(6)
+            hh = int(s2[0:2])
+            mm = int(s2[2:4])
+            ss = int(s2[4:6])
+            if 0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59:
+                return dt.datetime.combine(trade_date, dt.time(hh, mm, ss))
+            return None
+
+        return None
+
+    except Exception:
+        return None
+
+
+def _safe_parse_datetime_value(value: Any, trade_date: dt.date | None = None) -> Optional[dt.datetime]:
+    """日付付き/時刻のみの両方を安全に datetime 化する。"""
+    if value is None:
+        return None
+
+    # まず時刻のみを明示処理する。これで dateutil warning と誤変換を避ける。
+    t_only = _parse_time_only_to_today(value, trade_date=trade_date)
+    if t_only is not None:
+        return t_only
+
+    try:
+        s = str(value).strip()
+        if not s or s.lower() in {"nan", "none", "nat", "<na>"}:
+            return None
+
+        ts = pd.to_datetime(s, errors="coerce")
         if pd.isna(ts):
             return None
 
-        # タイムゾーン付きなら東京へ正規化
         try:
-            if ts.tzinfo is not None:
+            if getattr(ts, "tzinfo", None) is not None:
                 ts = ts.tz_convert("Asia/Tokyo").tz_localize(None)
         except Exception:
             try:
@@ -78,10 +155,32 @@ def _safe_parse_time(value) -> Optional[dt.datetime]:
             except Exception:
                 pass
 
-        return ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+        py = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+
+        # pandas が数値を 1970年などに誤変換した場合は無効扱い
+        if isinstance(py, dt.datetime) and py.year < 2000:
+            return None
+
+        return py
 
     except Exception:
         return None
+
+
+def _parse_datetime_series(series: pd.Series, trade_date: dt.date | None = None) -> pd.Series:
+    if series is None:
+        return pd.Series(dtype="datetime64[ns]")
+
+    trade_date = trade_date or _today_date()
+
+    try:
+        out = series.apply(lambda x: _safe_parse_datetime_value(x, trade_date=trade_date))
+        return pd.to_datetime(out, errors="coerce")
+    except Exception:
+        try:
+            return pd.to_datetime(series, errors="coerce")
+        except Exception:
+            return pd.Series(pd.NaT, index=getattr(series, "index", None), dtype="datetime64[ns]")
 
 
 # ============================================================
@@ -96,9 +195,9 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
         return set()
 
 
-def _resolve_time_column(cols: set[str]) -> str | None:
+def _resolve_sqlite_datetime_column(cols: set[str]) -> str | None:
     lower = {str(c).strip().lower() for c in cols}
-    for c in _TIME_COLUMN_CANDIDATES:
+    for c in _SQLITE_DATETIME_COLUMN_CANDIDATES:
         if c.lower() in lower:
             return c.lower()
     return None
@@ -118,18 +217,14 @@ def _load_push_db(db_path: str) -> pd.DataFrame:
                 pass
 
             cols = _table_columns(conn, "stream_data")
-            time_col = _resolve_time_column(cols)
+            dt_col = _resolve_sqlite_datetime_column(cols)
 
-            # ------------------------------------------------
-            # まず直近時間で絞る。
-            # 文字列時刻が ISO 系であればSQLite側でかなり行数を削れる。
-            # ------------------------------------------------
-            if time_col:
+            if dt_col:
                 try:
                     sql = f"""
                     SELECT *
                     FROM stream_data
-                    WHERE {time_col} >= ?
+                    WHERE {dt_col} >= ?
                     ORDER BY rowid DESC
                     LIMIT ?
                     """
@@ -137,9 +232,9 @@ def _load_push_db(db_path: str) -> pd.DataFrame:
 
                     if isinstance(df, pd.DataFrame) and not df.empty:
                         logger.info(
-                            "📡 pushDB recent restore query rows=%d time_col=%s cutoff=%s limit=%d elapsed=%.3fs",
+                            "📡 pushDB recent restore query rows=%d dt_col=%s cutoff=%s limit=%d elapsed=%.3fs",
                             len(df),
-                            time_col,
+                            dt_col,
                             cutoff_text,
                             MAX_RESTORE_ROWS,
                             (dt.datetime.now() - started).total_seconds(),
@@ -147,21 +242,17 @@ def _load_push_db(db_path: str) -> pd.DataFrame:
                         return df
 
                     logger.warning(
-                        "⚠ pushDB recent restore returned empty time_col=%s cutoff=%s -> fallback latest rows",
-                        time_col,
+                        "⚠ pushDB recent restore returned empty dt_col=%s cutoff=%s -> fallback latest rows",
+                        dt_col,
                         cutoff_text,
                     )
                 except Exception:
                     logger.warning(
-                        "⚠ pushDB recent restore query failed time_col=%s -> fallback latest rows",
-                        time_col,
+                        "⚠ pushDB recent restore query failed dt_col=%s -> fallback latest rows",
+                        dt_col,
                         exc_info=True,
                     )
 
-            # ------------------------------------------------
-            # fallback: rowid降順で最大行だけ取得。
-            # 旧版の 50000 ではなく既定 8000。
-            # ------------------------------------------------
             df = pd.read_sql(
                 """
                 SELECT *
@@ -186,22 +277,24 @@ def _load_push_db(db_path: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _pick_time_source_column(out: pd.DataFrame) -> str | None:
+    cols = {str(c).strip().lower() for c in out.columns}
+    for c in _TIME_COLUMN_CANDIDATES:
+        if c.lower() in cols:
+            return c.lower()
+    return None
+
+
 def _normalize_push_df_for_summary(df: pd.DataFrame) -> pd.DataFrame:
     norm_started = dt.datetime.now()
+    trade_date = _today_date()
 
     if df is None or df.empty:
         return pd.DataFrame()
 
     out = df.copy()
-
-    # --------------------------------------------------------
-    # 列名正規化
-    # --------------------------------------------------------
     out.columns = [str(c).strip().lower() for c in out.columns]
 
-    # --------------------------------------------------------
-    # symbol補完
-    # --------------------------------------------------------
     if "symbol" not in out.columns:
         for c in ("code", "symbol_code", "銘柄コード"):
             if c in out.columns:
@@ -221,49 +314,27 @@ def _normalize_push_df_for_summary(df: pd.DataFrame) -> pd.DataFrame:
         except Exception:
             pass
 
-    # --------------------------------------------------------
-    # time / datetime 補完
-    # --------------------------------------------------------
-    if "time" not in out.columns:
-        for c in ("datetime", "timestamp", "current_price_time", "received_at", "inserted_at"):
-            if c in out.columns:
-                out["time"] = out[c]
-                break
-
-    if "time" not in out.columns:
+    time_src = _pick_time_source_column(out)
+    if time_src is None:
         logger.warning("⚠ pushDB missing time-like column")
         return pd.DataFrame()
 
-    out["time"] = pd.to_datetime(out["time"], errors="coerce")
-
-    # タイムゾーン安全処理
-    try:
-        if getattr(out["time"].dt, "tz", None) is not None:
-            out["time"] = out["time"].dt.tz_convert("Asia/Tokyo").dt.tz_localize(None)
-    except Exception:
-        try:
-            out["time"] = out["time"].dt.tz_localize(None)
-        except Exception:
-            pass
+    parsed_time = _parse_datetime_series(out[time_src], trade_date=trade_date)
+    out["time"] = parsed_time
 
     out = out.dropna(subset=["time"])
-
     if out.empty:
-        logger.warning("⚠ pushDB all time parse failed")
+        logger.warning("⚠ pushDB all time parse failed time_src=%s", time_src)
         return pd.DataFrame()
 
-    if "datetime" not in out.columns:
-        out["datetime"] = out["time"]
+    # datetime は、元datetime列が日付付きで有効な場合はそれを優先。
+    # 無効/時刻のみなら time で補完。
+    if "datetime" in out.columns and time_src != "datetime":
+        parsed_dt = _parse_datetime_series(out["datetime"], trade_date=trade_date)
+        out["datetime"] = parsed_dt.fillna(out["time"])
     else:
-        try:
-            out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
-            out["datetime"] = out["datetime"].fillna(out["time"])
-        except Exception:
-            out["datetime"] = out["time"]
+        out["datetime"] = out["time"]
 
-    # --------------------------------------------------------
-    # 市場時間帯フィルタ
-    # --------------------------------------------------------
     try:
         out = out[out["time"].dt.time.between(MARKET_OPEN_TIME, MARKET_CLOSE_TIME)]
     except Exception:
@@ -272,9 +343,6 @@ def _normalize_push_df_for_summary(df: pd.DataFrame) -> pd.DataFrame:
     if out.empty:
         return pd.DataFrame()
 
-    # --------------------------------------------------------
-    # 価格列補完
-    # --------------------------------------------------------
     if "price" not in out.columns:
         for c in ("current_price", "close", "close_price", "last_price"):
             if c in out.columns:
@@ -284,9 +352,6 @@ def _normalize_push_df_for_summary(df: pd.DataFrame) -> pd.DataFrame:
     if "current_price" not in out.columns and "price" in out.columns:
         out["current_price"] = out["price"]
 
-    # --------------------------------------------------------
-    # 重複除外（symbol + datetime）
-    # --------------------------------------------------------
     if {"symbol", "datetime"}.issubset(out.columns):
         out = (
             out.sort_values("datetime")
@@ -294,15 +359,15 @@ def _normalize_push_df_for_summary(df: pd.DataFrame) -> pd.DataFrame:
             .reset_index(drop=True)
         )
 
-    # --------------------------------------------------------
-    # メモリ保護
-    # --------------------------------------------------------
     if len(out) > MAX_RESTORE_ROWS:
         out = out.tail(MAX_RESTORE_ROWS).reset_index(drop=True)
 
+    latest = out["datetime"].max() if "datetime" in out.columns else None
     logger.info(
-        "📡 pushDB normalize done rows=%d elapsed=%.3fs",
+        "📡 pushDB normalize done rows=%d time_src=%s latest=%s elapsed=%.3fs",
         len(out),
+        time_src,
+        latest,
         (dt.datetime.now() - norm_started).total_seconds(),
     )
 
@@ -325,9 +390,6 @@ def bootstrap_push(push_dir: str):
     today_str = dt.datetime.now().strftime("%Y%m%d")
     db_path = os.path.join(push_dir, f"push{today_str}.db")
 
-    # --------------------------------------------------------
-    # DB存在確認
-    # --------------------------------------------------------
     if not os.path.exists(db_path):
         empty = pd.DataFrame()
         global_data.push_df = empty
@@ -362,20 +424,19 @@ def bootstrap_push(push_dir: str):
         logger.warning("⚠ pushDB normalize resulted empty raw_rows=%d path=%s", len(raw), db_path)
         return
 
-    # --------------------------------------------------------
-    # 安全格納
-    # --------------------------------------------------------
     global_data.push_df = df
     try:
         global_data.set_push_df(df)
     except Exception:
         pass
 
+    latest = df["datetime"].max() if "datetime" in df.columns else None
+
     try:
         global_data.push_bootstrap_db_path = db_path
         global_data.push_bootstrap_rows = int(len(df))
         global_data.push_bootstrap_raw_rows = int(len(raw))
-        global_data.push_bootstrap_latest_datetime = df["datetime"].max() if "datetime" in df.columns else None
+        global_data.push_bootstrap_latest_datetime = latest
         global_data.push_bootstrap_lookback_minutes = int(RESTORE_LOOKBACK_MINUTES)
         global_data.push_bootstrap_max_restore_rows = int(MAX_RESTORE_ROWS)
     except Exception:
@@ -385,7 +446,7 @@ def bootstrap_push(push_dir: str):
         "📡 push bootstrap complete rows=%d raw_rows=%d latest=%s lookback_min=%d limited=%d elapsed=%.3fs path=%s",
         len(df),
         len(raw),
-        df["datetime"].max() if "datetime" in df.columns else None,
+        latest,
         RESTORE_LOOKBACK_MINUTES,
         MAX_RESTORE_ROWS,
         (dt.datetime.now() - boot_started).total_seconds(),
