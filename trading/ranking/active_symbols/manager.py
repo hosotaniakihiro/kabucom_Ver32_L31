@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/ranking/active_symbols/manager.py
-# Version: Ver1.0-ACTIVE-SYMBOLS-MANAGER
+# Version: Ver1.1-ACTIVE-SYMBOLS-MANAGER-SYMBOL-FLAGS-GLOBAL-CACHE
 # ============================================================
 from __future__ import annotations
 import datetime as dt, logging
@@ -17,6 +17,24 @@ from .reflect import reflect_active_to_global
 from .symbol_flags import filter_by_symbol_flags, load_symbol_flags_eligible_symbols
 
 logger = logging.getLogger(__name__)
+
+
+def _publish_symbol_flags_cache(eligible_symbols: Set[str], flag_info: dict) -> None:
+    """
+    起動時 / active symbol 更新時に読み込んだ symbol_flags 情報を
+    entry_controller / SELL_CREDIT_GUARD から参照できるように global_data へ保持する。
+    """
+    try:
+        global_data.symbol_flags_eligible_symbols = set(eligible_symbols or set())
+        global_data.symbol_flags_info_map = dict(flag_info or {})
+        global_data.symbol_flags_loaded_at = dt.datetime.now()
+        logger.info(
+            "[ACTIVE FLAGS] global cache published eligible=%d info=%d",
+            len(global_data.symbol_flags_eligible_symbols),
+            len(global_data.symbol_flags_info_map),
+        )
+    except Exception:
+        logger.exception("[ACTIVE FLAGS] global cache publish failed")
 
 
 def _build_today_ranking_candidates(*, now: dt.datetime, eligible_symbols: Set[str], protected: Set[str], liquidity_map: dict[str, dict[str, float]]) -> Tuple[List[str], Set[str], str]:
@@ -95,6 +113,7 @@ def _update_active_symbols_impl(force: bool = False) -> List[str]:
     protected = get_protected_symbols()
     update_last_seen_from_ranking(n)
     eligible_symbols, _flag_info = load_symbol_flags_eligible_symbols()
+    _publish_symbol_flags_cache(eligible_symbols, _flag_info)
     liquidity_map = build_liquidity_map()
     today_available = today_ranking_available(now=n)
     premarket_mode = ENABLE_PREMARKET_SBI and (is_premarket_time(n) or (USE_PREMARKET_WHEN_TODAY_RANKING_EMPTY and not today_available))
@@ -159,19 +178,14 @@ def get_active_symbols(*args, **kwargs) -> List[str]:
 
 def get_current_active_symbols(*args, **kwargs) -> List[str]:
     return get_active_symbols()
-
 def get_monitor_symbols(*args, **kwargs) -> List[str]:
     return get_active_symbols()[:MAX_ACTIVE_SYMBOLS]
-
 def get_push_symbols(*args, **kwargs) -> List[str]:
     return get_active_symbols()[:MAX_ACTIVE_SYMBOLS]
-
 def get_register_symbols(*args, **kwargs) -> List[str]:
     return get_active_symbols()[:MAX_ACTIVE_SYMBOLS]
-
 def get_subscription_symbols(*args, **kwargs) -> List[str]:
     return get_active_symbols()[:MAX_ACTIVE_SYMBOLS]
-
 def get_rotation_symbols(*args, **kwargs) -> List[str]:
     return get_active_symbols()[:MAX_ACTIVE_SYMBOLS]
 
