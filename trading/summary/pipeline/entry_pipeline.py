@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/summary/pipeline/entry_pipeline.py
-# Version: Ver2.3-PRODUCTION-HARDENED-POSITION-COMPAT-FIX
+# Version: Ver2.4-PRODUCTION-SIDE-AWARE-LIQUIDITY-SCORE
 # ------------------------------------------------------------
 # ✔ AI approved rows → entry execution
 # ✔ DataFrame / list / dict / Series 両対応
@@ -16,6 +16,7 @@
 # ✔ skip理由の件数可視化
 # ✔ production hardened
 # ✔ SUMMARY AI通常エントリーとイナゴ liquidity_shock 条件を分離
+# ✔ SUMMARY liquidity の min_score を BUY / SELL で分離
 # ============================================================
 
 from __future__ import annotations
@@ -153,6 +154,73 @@ def _first(row: dict, keys: list[str], default: Any = None) -> Any:
         except Exception:
             pass
     return default
+
+
+def _norm_side(v: Any) -> str:
+    try:
+        if v is None:
+            return ""
+        s = str(v).strip().upper()
+        return s if s in ("BUY", "SELL") else ""
+    except Exception:
+        return ""
+
+
+def _resolve_side(row: dict, *, buy_score: float, sell_score: float, raw_score: float) -> str:
+    side = _norm_side(
+        row.get("side")
+        or row.get("entry_decision")
+        or row.get("ai_side")
+        or row.get("decision")
+    )
+    if side:
+        return side
+
+    if sell_score > buy_score and sell_score > 0:
+        return "SELL"
+    if buy_score > sell_score and buy_score > 0:
+        return "BUY"
+    if raw_score < 0:
+        return "SELL"
+    if raw_score > 0:
+        return "BUY"
+    return ""
+
+
+def _resolve_summary_liquidity_min_score(row: dict, *, side: str) -> float:
+    """
+    SUMMARY AI の最終 executor 直前フィルタ用 min_score。
+
+    AI.entry_gate では SUMMARY SELL の既定 minScore を 1.0 にしている。
+    ここが従来どおり 3.0 固定だと、AI_OK 後に
+    [entry_pipeline] summary liquidity deny ... score=1.000 min_score=3.00
+    で全落ちするため、BUY / SELL で閾値を分ける。
+
+    優先順位:
+      1. SUMMARY_ENTRY_MIN_LIQUIDITY_SCORE_BUY / SELL
+      2. SUMMARY_ENTRY_MIN_SCORE_BUY / SELL
+      3. 従来の SUMMARY_ENTRY_MIN_LIQUIDITY_SCORE
+      4. 既定 BUY=3.0 / SELL=1.0
+    """
+    if side == "SELL":
+        return _env_float(
+            "SUMMARY_ENTRY_MIN_LIQUIDITY_SCORE_SELL",
+            _env_float(
+                "SUMMARY_ENTRY_MIN_SCORE_SELL",
+                _env_float("MIN_ENTRY_SCORE_SELL_SUMMARY", 1.0),
+            ),
+        )
+
+    if side == "BUY":
+        return _env_float(
+            "SUMMARY_ENTRY_MIN_LIQUIDITY_SCORE_BUY",
+            _env_float(
+                "SUMMARY_ENTRY_MIN_SCORE_BUY",
+                _env_float("SUMMARY_ENTRY_MIN_LIQUIDITY_SCORE", 3.0),
+            ),
+        )
+
+    return _env_float("SUMMARY_ENTRY_MIN_LIQUIDITY_SCORE", 3.0)
 
 
 # ============================================================
@@ -299,15 +367,17 @@ def _allow_summary_ai_liquidity(row: dict, *, symbol: str, interval: int) -> boo
     if turnover <= 0 and close > 0 and volume > 0:
         turnover = close * volume
 
-    score = abs(_safe_float(_first(row, ["score", "score_total", "final_score", "display_score"], 0.0), 0.0))
+    raw_score = _safe_float(_first(row, ["score", "score_total", "final_score", "display_score"], 0.0), 0.0)
+    score = abs(raw_score)
     buy_score = _safe_float(_first(row, ["buy_score", "score_buy"], 0.0), 0.0)
     sell_score = _safe_float(_first(row, ["sell_score", "score_sell"], 0.0), 0.0)
     effective_score = max(score, buy_score, sell_score)
+    side = _resolve_side(row, buy_score=buy_score, sell_score=sell_score, raw_score=raw_score)
 
     min_price = _env_float("SUMMARY_ENTRY_MIN_PRICE", _env_float("ENTRY_MIN_PRICE", 200.0))
     min_volume = _env_float("SUMMARY_ENTRY_MIN_VOLUME", _env_float("ENTRY_MIN_VOLUME", 3000.0))
     min_turnover = _env_float("SUMMARY_ENTRY_MIN_TURNOVER", _env_float("ENTRY_MIN_TURNOVER", 3_000_000.0))
-    min_score = _env_float("SUMMARY_ENTRY_MIN_LIQUIDITY_SCORE", 3.0)
+    min_score = _resolve_summary_liquidity_min_score(row, side=side)
 
     ok = (
         close > min_price
@@ -318,20 +388,23 @@ def _allow_summary_ai_liquidity(row: dict, *, symbol: str, interval: int) -> boo
 
     if ok:
         logger.info(
-            "[entry_pipeline] summary liquidity allow symbol=%s interval=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f",
+            "[entry_pipeline] summary liquidity allow symbol=%s interval=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f min_score=%.2f",
             symbol,
             interval,
+            side,
             close,
             volume,
             turnover,
             effective_score,
+            min_score,
         )
         return True
 
     logger.info(
-        "[entry_pipeline] summary liquidity deny symbol=%s interval=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f min_price=%.1f min_volume=%.0f min_turnover=%.0f min_score=%.2f",
+        "[entry_pipeline] summary liquidity deny symbol=%s interval=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f min_price=%.1f min_volume=%.0f min_turnover=%.0f min_score=%.2f",
         symbol,
         interval,
+        side,
         close,
         volume,
         turnover,
