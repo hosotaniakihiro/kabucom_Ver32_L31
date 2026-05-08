@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/summary/pipeline/entry_pipeline.py
-# Version: Ver2.1-PRODUCTION-HARDENED-ENTRY-PIPELINE-INTEGRATED
+# Version: Ver2.2-PRODUCTION-HARDENED-SUMMARY-AI-LIQUIDITY-SEPARATED
 # ------------------------------------------------------------
 # ✔ AI approved rows → entry execution
 # ✔ DataFrame / list / dict / Series 両対応
@@ -13,11 +13,14 @@
 # ✔ summary→pending→entry_controller 整合
 # ✔ skip理由の件数可視化
 # ✔ production hardened
+# ✔ SUMMARY AI通常エントリーとイナゴ liquidity_shock 条件を分離
 # ============================================================
 
 from __future__ import annotations
 
 import logging
+import math
+import os
 from typing import Any, List
 
 import pandas as pd
@@ -103,6 +106,25 @@ def _safe_interval(v: Any) -> int | None:
         return None
 
 
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        x = float(v)
+        return x if math.isfinite(x) else float(default)
+    except Exception:
+        return float(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        x = float(v)
+        return x if math.isfinite(x) else float(default)
+    except Exception:
+        return float(default)
+
+
 def _clean_nan_dict(d: dict) -> dict:
     out = {}
     try:
@@ -118,6 +140,17 @@ def _clean_nan_dict(d: dict) -> dict:
     except Exception:
         logger.exception("[entry_pipeline] clean_nan_dict failed")
         return d
+
+
+def _first(row: dict, keys: list[str], default: Any = None) -> Any:
+    for k in keys:
+        try:
+            v = row.get(k)
+            if v is not None and str(v).strip() != "":
+                return v
+        except Exception:
+            pass
+    return default
 
 
 # ============================================================
@@ -160,6 +193,87 @@ def _already_in_position(symbol: str) -> bool:
     except Exception:
         logger.exception("[entry_pipeline] position check failed")
         return False
+
+
+# ============================================================
+# liquidity filters
+# ============================================================
+
+def _is_inago_source(row: dict) -> bool:
+    source = str(row.get("source") or "").upper()
+    strategy = str(row.get("strategy") or row.get("entry_strategy") or "").upper()
+    reason = str(row.get("reason") or row.get("ai_reason") or "").upper()
+    return (
+        "INAGO" in source
+        or "TONOSAMA" in source
+        or "LIQUIDITY_SHOCK" in source
+        or "INAGO" in strategy
+        or "TONOSAMA" in strategy
+        or "LIQUIDITY_SHOCK" in strategy
+        or "LIQUIDITY" in reason and "SHOCK" in reason
+    )
+
+
+def _allow_summary_ai_liquidity(row: dict, *, symbol: str, interval: int) -> bool:
+    close = _safe_float(_first(row, ["close", "close_price", "price", "current_price"], 0.0), 0.0)
+    volume = _safe_float(_first(row, ["volume", "trading_volume", "出来高"], 0.0), 0.0)
+    turnover = _safe_float(_first(row, ["turnover", "trading_value", "売買代金"], 0.0), 0.0)
+    if turnover <= 0 and close > 0 and volume > 0:
+        turnover = close * volume
+
+    score = abs(_safe_float(_first(row, ["score", "score_total", "final_score", "display_score"], 0.0), 0.0))
+    buy_score = _safe_float(_first(row, ["buy_score", "score_buy"], 0.0), 0.0)
+    sell_score = _safe_float(_first(row, ["sell_score", "score_sell"], 0.0), 0.0)
+    effective_score = max(score, buy_score, sell_score)
+
+    min_price = _env_float("SUMMARY_ENTRY_MIN_PRICE", _env_float("ENTRY_MIN_PRICE", 200.0))
+    min_volume = _env_float("SUMMARY_ENTRY_MIN_VOLUME", _env_float("ENTRY_MIN_VOLUME", 3000.0))
+    min_turnover = _env_float("SUMMARY_ENTRY_MIN_TURNOVER", _env_float("ENTRY_MIN_TURNOVER", 3_000_000.0))
+    min_score = _env_float("SUMMARY_ENTRY_MIN_LIQUIDITY_SCORE", 3.0)
+
+    ok = (
+        close > min_price
+        and volume >= min_volume
+        and turnover >= min_turnover
+        and effective_score >= min_score
+    )
+
+    if ok:
+        logger.info(
+            "[entry_pipeline] summary liquidity allow symbol=%s interval=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f",
+            symbol,
+            interval,
+            close,
+            volume,
+            turnover,
+            effective_score,
+        )
+        return True
+
+    logger.info(
+        "[entry_pipeline] summary liquidity deny symbol=%s interval=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f min_price=%.1f min_volume=%.0f min_turnover=%.0f min_score=%.2f",
+        symbol,
+        interval,
+        close,
+        volume,
+        turnover,
+        effective_score,
+        min_price,
+        min_volume,
+        min_turnover,
+        min_score,
+    )
+    return False
+
+
+def _allow_entry_liquidity(row: dict, *, symbol: str, interval: int) -> bool:
+    if _is_inago_source(row):
+        ok = bool(allow_liquidity_entry(row))
+        if not ok:
+            logger.info("[entry_pipeline] inago liquidity deny symbol=%s interval=%s", symbol, interval)
+        return ok
+
+    return _allow_summary_ai_liquidity(row, symbol=symbol, interval=interval)
 
 
 # ============================================================
@@ -296,12 +410,13 @@ def run_entry_pipeline(approved_rows: Any, df_summary: pd.DataFrame | None, inte
                 else:
                     row_dict["interval"] = _safe_interval(row_dict.get("interval"))
 
-                if not allow_liquidity_entry(row_dict):
+                if not _allow_entry_liquidity(row_dict, symbol=symbol, interval=int(interval)):
                     skipped_liquidity += 1
                     logger.info(
-                        "[entry_pipeline] skip liquidity symbol=%s interval=%s",
+                        "[entry_pipeline] skip liquidity symbol=%s interval=%s source=%s",
                         symbol,
                         interval,
+                        row_dict.get("source"),
                     )
                     continue
 
