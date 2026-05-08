@@ -1,6 +1,6 @@
 # ==========================================================
 # File   : trading/summary/summary_entry.py
-# Version: Ver1.7-PRODUCTION-SUMMARY-ENTRY-AI-SIDE-FIRST-BUY-ONLY
+# Version: Ver1.8-PRODUCTION-SUMMARY-ENTRY-AI-SIDE-FIRST-BUY-SELL
 # ----------------------------------------------------------
 # ✔ summary entry実行責務
 # ✔ approved_rows: list[dict] / DataFrame / Series / dict 両対応
@@ -20,13 +20,15 @@
 # ✔ interval 正規化
 # ✔ price/current_price/atr系の引き継ぎ強化
 # ✔ ai_side を entry_decision より優先
-# ✔ 通常SUMMARY_AIの買いエントリーではSELL候補をpending化しない
+# ✔ SELL候補をBUYに誤変換しない
+# ✔ SUMMARY_AI SELL候補はSELLとしてpending化する
 # ✔ 本番安定設計
 # ==========================================================
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, Iterable, List
 
 import pandas as pd
@@ -47,12 +49,42 @@ logger = logging.getLogger(__name__)
 DEFAULT_ENTRY_TYPE = "SUMMARY_AI"
 DEFAULT_SOURCE = "SUMMARY"
 DEFAULT_SIDE = "BUY"
-SUMMARY_AI_BUY_ONLY = True
+
+_TRUE_VALUES = {"1", "true", "yes", "on", "y"}
+_FALSE_VALUES = {"0", "false", "no", "off", "n"}
 
 
 # ==========================================================
 # helpers
 # ==========================================================
+
+def _env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in _TRUE_VALUES:
+            return True
+        if s in _FALSE_VALUES:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
+
+
+def _allow_summary_ai_sell_entry() -> bool:
+    """
+    SUMMARY AI の SELL候補を SELL新規/信用売りとして流すか。
+
+    重要:
+      - 以前は SELL が BUY に誤変換されていたため危険だった。
+      - Ver1.8 では side=SELL を保持したまま entry_controller へ渡す。
+      - 実際の発注可否は entry_controller 側の can_sell_symbol / order builder が最終防衛する。
+      - 無効化したい場合は SUMMARY_AI_ALLOW_SELL_ENTRY=0 を設定する。
+    """
+    return _env_bool("SUMMARY_AI_ALLOW_SELL_ENTRY", True)
+
 
 def _safe_dict(d: Any) -> Dict[str, Any]:
     try:
@@ -285,6 +317,8 @@ def build_entry_rows(
             logger.info("[SUMMARY_ENTRY] build_entry_rows skipped reason=no_approved_rows")
             return entries
 
+        allow_sell_entry = _allow_summary_ai_sell_entry()
+
         for raw in rows:
             try:
                 if not isinstance(raw, dict):
@@ -307,9 +341,9 @@ def build_entry_rows(
                 raw["ai_side"] = raw.get("ai_side") or side
                 raw["interval"] = _safe_interval(raw.get("interval"))
 
-                if SUMMARY_AI_BUY_ONLY and raw.get("entry_type") == DEFAULT_ENTRY_TYPE and side != "BUY":
+                if raw.get("entry_type") == DEFAULT_ENTRY_TYPE and side == "SELL" and not allow_sell_entry:
                     logger.info(
-                        "[SUMMARY_ENTRY] skip non-buy summary AI row symbol=%s side=%s ai_side=%s buy_score=%s sell_score=%s",
+                        "[SUMMARY_ENTRY] skip summary AI SELL row by env symbol=%s side=%s ai_side=%s buy_score=%s sell_score=%s",
                         symbol,
                         side,
                         raw.get("ai_side"),
@@ -322,9 +356,10 @@ def build_entry_rows(
 
                 if not entry:
                     logger.warning(
-                        "[SUMMARY_ENTRY] build_entry_row returned empty symbol=%s keys=%s",
+                        "[SUMMARY_ENTRY] build_entry_row returned empty symbol=%s keys=%s side=%s",
                         symbol,
                         sorted(raw.keys()),
+                        side,
                     )
                     continue
 
@@ -439,9 +474,10 @@ def build_entry_rows(
                 logger.exception("[SUMMARY_ENTRY] build one entry failed raw=%s", raw)
 
         logger.info(
-            "[SUMMARY_ENTRY] build_entry_rows done approved=%s entries=%s",
+            "[SUMMARY_ENTRY] build_entry_rows done approved=%s entries=%s allow_sell_entry=%s",
             len(rows),
             len(entries),
+            allow_sell_entry,
         )
 
         return entries
