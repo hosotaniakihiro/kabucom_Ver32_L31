@@ -1,6 +1,6 @@
 # ============================================================
 # File   : global_state.py
-# Version: V59.1-PRODUCTION-THIN-COMPAT-LAYER-SOURCE-AWARE
+# Version: V59.2-PRODUCTION-THIN-COMPAT-LAYER-POSITIONS-API-FIX
 # ------------------------------------------------------------
 # ✔ V59 全機能保持
 # ✔ GlobalContext完全委譲
@@ -19,14 +19,18 @@
 # ✔ ranking engine compatibility
 # ✔ NEW: set/get_merged_summary に source 引数対応
 # ✔ NEW: set/get_multi_summary に source 引数対応
-# ✔ NEW: 旧呼び出し互換を維持
+# ✔ NEW: get_positions() 旧API互換を追加
+# ✔ NEW: positions dataframe/dict/list fallback 対応
 # ✔ FIX: entry_inflight_lock / push_lock / orderflow_lock の None fallback 強化
 # ✔ FIX: positions 側 lock 未初期化時でも with 文で落ちない
+# ✔ FIX: entry_pipeline の global_data.get_positions AttributeError 対応
 # ============================================================
 
 from __future__ import annotations
 
 import threading
+from typing import Any
+
 import pandas as pd
 from core.global_context.context import global_context as GC
 
@@ -71,6 +75,40 @@ class GlobalDataCompat(_LegacyGlobalData):
             return lock
         except Exception:
             return threading.RLock()
+
+    @staticmethod
+    def _normalize_position_collection(value: Any):
+        """
+        旧コード互換用に position collection を返す。
+
+        entry_pipeline.py 旧実装は list[dict] を想定していたため、
+        dict snapshot の場合は values() を list 化する。
+        ただし DataFrame/list/tuple/set はそのまま扱える形で返す。
+        """
+        try:
+            if value is None:
+                return []
+
+            if isinstance(value, pd.DataFrame):
+                return value
+
+            if isinstance(value, dict):
+                # {symbol: position_dict} 形式を優先して list[dict] にする
+                vals = list(value.values())
+                if vals and all(isinstance(v, dict) for v in vals):
+                    return vals
+                # 1ポジション分の dict の可能性
+                if any(k in value for k in ("symbol", "Symbol", "銘柄コード", "code", "stock_code")):
+                    return [value]
+                return vals
+
+            if isinstance(value, (list, tuple, set)):
+                return list(value)
+
+            return []
+
+        except Exception:
+            return []
 
     # ============================================================
     # PUSH
@@ -345,7 +383,7 @@ class GlobalDataCompat(_LegacyGlobalData):
             return {}
 
     # ------------------------------------------------------------
-    # ranking snapshot dataframe (NEW)
+    # ranking snapshot dataframe
     # ------------------------------------------------------------
 
     def get_ranking_snapshot(self):
@@ -397,6 +435,65 @@ class GlobalDataCompat(_LegacyGlobalData):
             return GC.positions.snapshot_dict()
         except Exception:
             return {}
+
+    def get_positions(self):
+        """
+        旧 GlobalData 互換API。
+
+        entry_pipeline.py など既存コードが
+            global_data.get_positions()
+        を呼ぶため、GlobalDataCompat でも必ず提供する。
+
+        戻り値は旧実装に寄せて list[dict] を基本とする。
+        DataFrame で保持されている場合は DataFrame のまま返す。
+        何も取得できない場合は [] を返し、発注処理を AttributeError で止めない。
+        """
+        candidates = []
+
+        try:
+            if hasattr(GC.positions, "snapshot_dict"):
+                candidates.append(GC.positions.snapshot_dict())
+        except Exception:
+            pass
+
+        try:
+            if hasattr(GC.positions, "snapshot"):
+                candidates.append(GC.positions.snapshot())
+        except Exception:
+            pass
+
+        for attr in (
+            "positions",
+            "open_positions",
+            "current_positions",
+            "holdings",
+            "position_cache",
+            "positions_cache",
+            "position_df",
+            "positions_df",
+            "_positions",
+            "_open_positions",
+            "_holdings",
+            "_position_cache",
+        ):
+            try:
+                if hasattr(GC.positions, attr):
+                    candidates.append(getattr(GC.positions, attr))
+            except Exception:
+                pass
+
+        for value in candidates:
+            normalized = self._normalize_position_collection(value)
+            try:
+                if isinstance(normalized, pd.DataFrame):
+                    if not normalized.empty:
+                        return normalized
+                elif normalized:
+                    return normalized
+            except Exception:
+                continue
+
+        return []
 
     def get_position(self, symbol):
 
