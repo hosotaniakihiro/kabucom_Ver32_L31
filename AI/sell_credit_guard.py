@@ -1,6 +1,6 @@
 # ============================================================
 # File: AI/sell_credit_guard.py
-# Version: PRODUCTION-STABLE-V3-GLOBAL-SYMBOL-FLAGS-CACHE
+# Version: PRODUCTION-STABLE-V4-GLOBAL-CACHE-ATTENTION-WARN
 # ------------------------------------------------------------
 # 殿様イナゴ（SELL）専用 信用・売禁ガード
 #
@@ -12,6 +12,7 @@
 # ✔ can_sell_symbol("4970") のような symbol のみ入力時は
 #   起動時に global_data へ保持した symbol_flags_info_map を参照
 # ✔ symbol_flags.sell_target / short_ok / credit_type=貸借銘柄 を信用売り可否に利用
+# ✔ is_attention=1 は売禁ではないため遮断せず、警告ログのみ出す
 # ============================================================
 
 from __future__ import annotations
@@ -237,11 +238,12 @@ def _merge_global_flags_if_needed(flags: Dict[str, Any]) -> Dict[str, Any]:
     merged.update({k: v for k, v in flags.items() if v is not None})
 
     logger.info(
-        "[SELL_CREDIT_GUARD] global flags used symbol=%s sell_target=%s short_ok=%s credit_type=%s",
+        "[SELL_CREDIT_GUARD] global flags used symbol=%s sell_target=%s short_ok=%s credit_type=%s is_attention=%s",
         symbol,
         merged.get("sell_target"),
         merged.get("short_ok"),
         merged.get("credit_type"),
+        merged.get("is_attention"),
     )
     return merged
 
@@ -256,6 +258,10 @@ def can_sell_symbol(symbol_flags: Any, *, default: bool = False) -> bool:
 
     symbol 文字列だけが渡された場合も、起動時に global_data へ保持した
     symbol_flags_info_map から sell_target / short_ok / credit_type を読んで判定する。
+
+    注意:
+      is_attention=1 は「注意銘柄」であり、必ずしも売禁ではない。
+      sell_ban や高保証金率とは分けて扱い、ここでは警告ログのみとする。
     """
 
     flags = _to_dict(symbol_flags)
@@ -312,7 +318,7 @@ def can_sell_symbol(symbol_flags: Any, *, default: bool = False) -> bool:
         return False
 
     # --------------------------------------------------------
-    # 売禁 / 注意銘柄
+    # 売禁
     # --------------------------------------------------------
     sell_ban = _get_first(
         flags,
@@ -327,14 +333,17 @@ def can_sell_symbol(symbol_flags: Any, *, default: bool = False) -> bool:
         )
         return False
 
+    # 注意銘柄は売禁とは別扱い。ここで止めると sell_target/credit_type が有効でも全落ちする。
     is_attention = _get_first(flags, ("is_attention", "attention", "regulation_attention"), False)
     if _as_bool(is_attention, default=False):
-        logger.info(
-            "[SELL_CREDIT_GUARD] NG symbol=%s reason=is_attention value=%r",
+        logger.warning(
+            "[SELL_CREDIT_GUARD] WARN symbol=%s reason=is_attention_but_allowed value=%r sell_target=%r short_ok=%r credit_type=%s",
             symbol,
             is_attention,
+            flags.get("sell_target"),
+            flags.get("short_ok"),
+            credit_type,
         )
-        return False
 
     # --------------------------------------------------------
     # 高保証金率（踏み上げ地雷）
@@ -362,11 +371,12 @@ def can_sell_symbol(symbol_flags: Any, *, default: bool = False) -> bool:
             return False
 
     logger.info(
-        "[SELL_CREDIT_GUARD] OK symbol=%s short_sellable=%r sell_target=%r short_ok=%r credit_type=%s",
+        "[SELL_CREDIT_GUARD] OK symbol=%s short_sellable=%r sell_target=%r short_ok=%r credit_type=%s is_attention=%r",
         symbol,
         short_sellable,
         flags.get("sell_target"),
         flags.get("short_ok"),
         credit_type,
+        flags.get("is_attention"),
     )
     return True
