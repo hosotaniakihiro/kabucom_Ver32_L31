@@ -1,6 +1,6 @@
 # ============================================================
 # File   : AI/entry_gate.py
-# Version: Ver26.30-FINAL-ENTRY-GATE-SUMMARY-AI-PENDING-SCORE-FIX
+# Version: Ver26.31-FINAL-ENTRY-GATE-SIDE-AWARE-SUMMARY-SELL-SCORE
 # ------------------------------------------------------------
 # ✔ ENTRY 最終ゲート（唯一の判断場所）
 # ✔ 副作用ゼロ（pending_entries を絶対に触らない）
@@ -15,6 +15,7 @@
 # ✔ scoreをint丸めせず小数のまま判定（4.39を4に落とさない）
 # ✔ SUMMARY_AI pending の score_buy/score_sell 欠落を score から復元
 # ✔ SUMMARY_AI pending の dominant_ratio 欠落は 1.0 として fail-open
+# ✔ SUMMARY SELL は BUY と別閾値 MIN_ENTRY_SCORE_SELL_SUMMARY で判定
 # ============================================================
 
 import logging
@@ -190,6 +191,50 @@ def _resolve_summary_scores(row: dict, *, source: str, decision: str | None) -> 
     return buy_score, sell_score, total_score, raw_score
 
 
+def _resolve_min_score_for_side(*, source: str, is_ranking: bool, decision: str | None) -> float:
+    """
+    BUY と SELL で最終ゲートの score 閾値を分ける。
+
+    SUMMARY AI runner は SELL 側を max_sell=2.00 で候補化しているため、
+    entry_gate 側で BUY と同じ 3〜4点を必須にすると SELL が全滅する。
+    既定値:
+      - RANKING: 2.0
+      - SUMMARY BUY : 4.0
+      - SUMMARY SELL: 1.0
+    必要なら環境変数または global_config で上書き可能。
+    """
+    if is_ranking:
+        if decision == "SELL":
+            return _cfg_float(
+                "MIN_ENTRY_SCORE_SELL_RANKING",
+                _cfg_float("MIN_ENTRY_SCORE_RANKING", 2.0, env_name="MIN_ENTRY_SCORE_RANKING"),
+                env_name="MIN_ENTRY_SCORE_SELL_RANKING",
+            )
+        if decision == "BUY":
+            return _cfg_float(
+                "MIN_ENTRY_SCORE_BUY_RANKING",
+                _cfg_float("MIN_ENTRY_SCORE_RANKING", 2.0, env_name="MIN_ENTRY_SCORE_RANKING"),
+                env_name="MIN_ENTRY_SCORE_BUY_RANKING",
+            )
+        return _cfg_float("MIN_ENTRY_SCORE_RANKING", 2.0, env_name="MIN_ENTRY_SCORE_RANKING")
+
+    if source == "SUMMARY" and decision == "SELL":
+        return _cfg_float(
+            "MIN_ENTRY_SCORE_SELL_SUMMARY",
+            _cfg_float("MIN_ENTRY_SCORE_SELL", 1.0, env_name="MIN_ENTRY_SCORE_SELL"),
+            env_name="MIN_ENTRY_SCORE_SELL_SUMMARY",
+        )
+
+    if source == "SUMMARY" and decision == "BUY":
+        return _cfg_float(
+            "MIN_ENTRY_SCORE_BUY_SUMMARY",
+            _cfg_float("MIN_ENTRY_SCORE", 4.0, env_name="MIN_ENTRY_SCORE"),
+            env_name="MIN_ENTRY_SCORE_BUY_SUMMARY",
+        )
+
+    return _cfg_float("MIN_ENTRY_SCORE", 4.0, env_name="MIN_ENTRY_SCORE")
+
+
 # ============================================================
 # AI RESULT schema
 # ============================================================
@@ -337,20 +382,17 @@ def ai_final_entry_check(row: dict) -> dict:
     is_ranking = source == "RANKING"
 
     if is_ranking:
-        MIN_SCORE = _cfg_float("MIN_ENTRY_SCORE_RANKING", 2.0, env_name="MIN_ENTRY_SCORE_RANKING")
         MIN_TURNOVER = _cfg_float("MIN_TURNOVER_RANKING", 1_000_000, env_name="MIN_TURNOVER_RANKING")
         MIN_DOM = _cfg_float("MIN_DOMINANT_RATIO_RANKING", 0.0, env_name="MIN_DOMINANT_RATIO_RANKING")
         MIN_MTF = _cfg_float("MIN_MTF_CONFIDENCE_RANKING", 0.55, env_name="MIN_MTF_CONFIDENCE_RANKING")
         MIN_RANK_SCORE = _cfg_float("MIN_RANKING_DIRECT_SCORE", 0.15, env_name="MIN_RANKING_DIRECT_SCORE")
     else:
-        # SUMMARY/PUSH側の候補生成は min_buy_score=4.0 で通している。
-        # ここが既定5.0だと buy_score=4.39 が score_low で落ちるため、既定4.0に統一。
-        MIN_SCORE = _cfg_float("MIN_ENTRY_SCORE", 4.0, env_name="MIN_ENTRY_SCORE")
         MIN_TURNOVER = _cfg_float("MIN_TURNOVER_1M", 3_000_000, env_name="MIN_TURNOVER_1M")
         MIN_DOM = _cfg_float("MIN_DOMINANT_RATIO_SUMMARY", 0.58, env_name="MIN_DOMINANT_RATIO_SUMMARY")
         MIN_MTF = _cfg_float("MIN_MTF_CONFIDENCE", 0.55, env_name="MIN_MTF_CONFIDENCE")
 
     decision = _norm_side(row.get("entry_decision") or row.get("side"))
+    MIN_SCORE = _resolve_min_score_for_side(source=source, is_ranking=is_ranking, decision=decision)
 
     # ========================================================
     # NaN完全防御 score取得
@@ -382,20 +424,22 @@ def ai_final_entry_check(row: dict) -> dict:
     if summary_ai_pending and dominant_ratio <= 0:
         dominant_ratio = 1.0
         logger.info(
-            "[ENTRY GATE] SUMMARY_AI dominant_ratio fail-open symbol=%s side=%s score=%.4f buy=%.4f sell=%.4f",
+            "[ENTRY GATE] SUMMARY_AI dominant_ratio fail-open symbol=%s side=%s score=%.4f buy=%.4f sell=%.4f min_score=%.4f",
             symbol,
             decision,
             score_total,
             buy_score,
             sell_score,
+            MIN_SCORE,
         )
 
     if score_total < MIN_SCORE:
         logger.info(
-            "[ENTRY GATE] block score_low symbol=%s source=%s interval=%s score=%.4f min_score=%.4f buy=%.4f sell=%.4f total=%.4f raw=%.4f entry_type=%s",
+            "[ENTRY GATE] block score_low symbol=%s source=%s interval=%s side=%s score=%.4f min_score=%.4f buy=%.4f sell=%.4f total=%.4f raw=%.4f entry_type=%s",
             symbol,
             source,
             interval,
+            decision,
             score_total,
             MIN_SCORE,
             buy_score,
@@ -557,7 +601,8 @@ def ai_final_entry_check(row: dict) -> dict:
             f"boost={momentum_boost:.2f}|"
             f"3m={score_3m:.2f}|"
             f"5m={score_5m:.2f}|"
-            f"src={source}"
+            f"src={source}|"
+            f"minScore={MIN_SCORE:.2f}"
         ),
         model_used=("RANKING_LGBM+MTF" if is_ranking else "MTF"),
     )
