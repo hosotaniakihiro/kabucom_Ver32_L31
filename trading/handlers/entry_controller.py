@@ -4,10 +4,10 @@
 #   - pending_entries に入った候補を最終審査して発注する
 #   - AI final gate により全候補を評価し、期待値順にランキングする
 #   - BUY / SELL 候補を比較し、priority の高い銘柄から発注する
-#   - market / risk / AI health / index shock / tonosama / credit / volatility
+#   - market / risk / AI health / index shock / credit / volatility
 #     などの各種ガードを通過した銘柄のみエントリーする
 # ------------------------------------------------------------
-# Version: Ver2.2-PRODUCTION-ENTRY-CONTROLLER-QTY-PASSTHROUGH-FINAL
+# Version: Ver2.3-PRODUCTION-SUMMARY-AI-NO-TONOSAMA-GATE
 # ------------------------------------------------------------
 # ✔ TOP候補を全件AI確認
 # ✔ AI allow / confidence / summary score で最終判定
@@ -22,6 +22,8 @@
 # ✔ open_positions 型揺れ耐性
 # ✔ quantity / order build / submit ログ強化
 # ✔ entry_handler / kabu_api.buy_sell_entry の qty passthrough と整合
+# ✔ SUMMARY_AI は tonosama gate を通さない
+# ✔ SUMMARY_AI の最終 score threshold を 5点台候補に合わせる
 # ✔ production hardened
 # ============================================================
 
@@ -116,11 +118,13 @@ BOOST_SIZE_MULTIPLIER = 1.5
 MIN_AI_CONFIDENCE_BUY = 0.60
 MIN_AI_CONFIDENCE_SELL = 0.55
 
-MIN_SUMMARY_SCORE_BUY = 8.0
-MIN_SUMMARY_SCORE_SELL = 8.0
+# SUMMARY AI gate 側では 5点台の候補が AI_OK になっているため、
+# entry_controller の最終gateだけ 8点必須にすると全落ちする。
+MIN_SUMMARY_SCORE_BUY = 5.0
+MIN_SUMMARY_SCORE_SELL = 5.0
 
-MIN_COMPOSITE_SCORE_BUY = 6.0
-MIN_COMPOSITE_SCORE_SELL = 5.5
+MIN_COMPOSITE_SCORE_BUY = 5.0
+MIN_COMPOSITE_SCORE_SELL = 4.5
 
 MAX_CANDIDATES_PER_SYMBOL = 10
 MAX_APPROVED_PER_RUN = 3
@@ -233,6 +237,12 @@ def _log_skip(symbol: str, reason: str, **detail):
         reason,
         detail,
     )
+
+
+def _is_tonosama_entry(entry_type: Any, source: Any) -> bool:
+    et = _normalize_source(entry_type)
+    src = _normalize_source(source)
+    return et == "TONOSAMA" or src == "TONOSAMA"
 
 
 def _api_rate_limited() -> bool:
@@ -433,6 +443,7 @@ def _build_scored_candidates(
                 or entry_row.get("source")
                 or entry.get("source")
             )
+            source = entry_row.get("source") or entry.get("source")
 
             side = entry_row.get("entry_decision") or entry.get("entry_decision") or entry.get("side")
             side = _safe_str(side).upper()
@@ -449,9 +460,11 @@ def _build_scored_candidates(
                 _log_skip(symbol, "SYMBOL_TRADE_RESTRICTED", side=side)
                 continue
 
-            if not can_entry_symbol(symbol, side):
+            if not can_entry_symbol(symbol, side, source=_normalize_source(source) or "SUMMARY"):
                 _log_skip(symbol, "POSITION_FILTER_NG", side=side)
                 continue
+
+            tonosama_required = _is_tonosama_entry(entry_type, source)
 
             if side == "SELL":
                 try:
@@ -462,18 +475,19 @@ def _build_scored_candidates(
                     logger.exception("SELL_CREDIT_GUARD failed symbol=%s", symbol)
                     continue
 
-                try:
-                    if not allow_sell_tonosama_entry(symbol):
-                        _log_skip(symbol, "SELL_TONOSAMA_NG", side=side)
+                if tonosama_required:
+                    try:
+                        if not allow_sell_tonosama_entry(symbol):
+                            _log_skip(symbol, "SELL_TONOSAMA_NG", side=side, entry_type=entry_type, source=source)
+                            continue
+                    except Exception:
+                        logger.exception("SELL_TONOSAMA failed symbol=%s", symbol)
                         continue
-                except Exception:
-                    logger.exception("SELL_TONOSAMA failed symbol=%s", symbol)
-                    continue
 
-            if side == "BUY":
+            if side == "BUY" and tonosama_required:
                 try:
                     if not allow_tonosama_entry(symbol):
-                        _log_skip(symbol, "BUY_TONOSAMA_NG", side=side)
+                        _log_skip(symbol, "BUY_TONOSAMA_NG", side=side, entry_type=entry_type, source=source)
                         continue
                 except Exception:
                     logger.exception("BUY_TONOSAMA failed symbol=%s", symbol)
