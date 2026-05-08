@@ -7,7 +7,7 @@
 #   - market / risk / AI health / index shock / credit / volatility
 #     などの各種ガードを通過した銘柄のみエントリーする
 # ------------------------------------------------------------
-# Version: Ver2.4-PRODUCTION-SUMMARY-SELL-THRESHOLD-ALIGNED
+# Version: Ver2.5-PRODUCTION-ORDER-ID-EMPTY-NO-LONG-RESTRICT
 # ------------------------------------------------------------
 # ✔ TOP候補を全件AI確認
 # ✔ AI allow / confidence / summary score で最終判定
@@ -25,6 +25,7 @@
 # ✔ SUMMARY_AI は tonosama gate を通さない
 # ✔ SUMMARY_AI BUY は5点台候補に合わせる
 # ✔ SUMMARY_AI SELL はAI gate側 minScore=1.00 と整合
+# ✔ ORDER_ID_EMPTY では30分の銘柄停止にしない
 # ✔ production hardened
 # ============================================================
 
@@ -688,10 +689,21 @@ def _execute_best_candidate(item: dict, boost_active: bool) -> bool:
     )
 
     if not order_id:
-        mark_symbol_trade_restricted(symbol)
+        # ORDER_ID_EMPTY は、板取得失敗・一時的な API 応答なし・kabu station 側の瞬断でも発生する。
+        # ここで30分 trade_restricted にすると、候補が生きていても再試行できず、
+        # 「ENTRY_DISPATCH まで行くが発火しない」状態が長く続く。
+        # API 429 等の明確な rate limit は send_order 側や global guard 側で別途制御する。
+        logger.warning(
+            "⚠ ORDER_ID_EMPTY_NO_LONG_RESTRICT symbol=%s side=%s qty=%s order_type=%s price=%s -> retry allowed next cycle",
+            symbol,
+            side,
+            order_qty,
+            order_type,
+            order_price,
+        )
         _log_skip(
             symbol,
-            "ORDER_ID_EMPTY",
+            "ORDER_ID_EMPTY_RETRYABLE",
             side=side,
             qty=order_qty,
             order_type=order_type,
