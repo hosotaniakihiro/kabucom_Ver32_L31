@@ -1,10 +1,11 @@
 # ============================================================
 # File   : trading/yahoo/symbol/yahoo_symbol_provider.py
-# Version: Ver6.0-PRODUCTION-YAHOO-SYMBOL-PROVIDER-RANKING-RAW-SNAPSHOT-FIX
+# Version: Ver6.1-PRODUCTION-YAHOO-SYMBOL-PROVIDER-SCHEMA-SAFE
 # ------------------------------------------------------------
 # ✔ Yahoo補完対象銘柄生成
 # ✔ ranking_raw_1min を正本にする
-# ✔ date / datetime が NULL でも snapshot_time / inserted_at で当日全銘柄を抽出
+# ✔ ranking_raw_1min の実在列だけを使って当日全銘柄を抽出
+# ✔ date / datetime / inserted_at / snapshot_time の列欠損に耐える
 # ✔ max_symbols デフォルト上限撤廃
 # ✔ runtime/backfill status では対象を絞らない
 # ✔ scheduler安全
@@ -24,6 +25,9 @@ logger = logging.getLogger(__name__)
 
 # 終日補完ではランキング登場全銘柄が対象。デフォルト上限は設けない。
 MAX_YAHOO_FETCH: int | None = None
+
+RANKING_RAW_TABLE = "ranking_raw_1min"
+TIME_COLUMNS_PRIORITY = ("snapshot_time", "inserted_at", "datetime", "date")
 
 
 # ============================================================
@@ -73,49 +77,145 @@ def _target_date_values(target_date: dt.date) -> dict[str, str]:
     }
 
 
+def _get_table_columns(s, table_name: str = RANKING_RAW_TABLE) -> set[str]:
+    """
+    SQLiteの実テーブル列を取得する。
+
+    重要:
+      過去版DB/当日DBで ranking_raw_1min の列構成が揺れるため、
+      SQL内で存在しない列を固定参照しない。
+    """
+    try:
+        rows = s.execute(text(f"PRAGMA table_info({table_name})")).fetchall()
+        return {str(r[1]) for r in rows if len(r) > 1 and r[1] is not None}
+    except Exception:
+        logger.exception("[YAHOO SYMBOL PROVIDER] table_info failed table=%s", table_name)
+        return set()
+
+
+def _existing_time_columns(cols: set[str]) -> list[str]:
+    return [c for c in TIME_COLUMNS_PRIORITY if c in cols]
+
+
+def _build_latest_time_sql(time_cols: list[str]) -> text | None:
+    if not time_cols:
+        return None
+
+    max_expr = ", ".join([f"MAX({c})" for c in time_cols])
+    return text(
+        f"""
+        SELECT COALESCE({max_expr}) AS latest_time
+        FROM {RANKING_RAW_TABLE}
+        WHERE symbol IS NOT NULL
+          AND TRIM(CAST(symbol AS TEXT)) <> ''
+        """
+    )
+
+
+def _build_latest_symbol_sql(time_cols: list[str]) -> text | None:
+    if not time_cols:
+        return None
+
+    conditions = " OR ".join([f"{c} = :latest_time" for c in time_cols])
+    return text(
+        f"""
+        SELECT DISTINCT CAST(symbol AS TEXT) AS symbol
+        FROM {RANKING_RAW_TABLE}
+        WHERE symbol IS NOT NULL
+          AND TRIM(CAST(symbol AS TEXT)) <> ''
+          AND ({conditions})
+        ORDER BY symbol
+        """
+    )
+
+
+def _build_today_symbol_sql(time_cols: list[str]) -> text | None:
+    """
+    実在する日時列だけを使って、当日登場銘柄抽出SQLを組み立てる。
+
+    snapshot_time/inserted_at/datetime は日時文字列として範囲比較とLIKEを使う。
+    date は YYYY-MM-DD / YYYYMMDD の完全一致とLIKEを使う。
+    """
+    conditions: list[str] = []
+
+    for col in time_cols:
+        if col == "date":
+            conditions.append("date = :date_hyphen")
+            conditions.append("date = :date_compact")
+            conditions.append("date LIKE :like_hyphen")
+            conditions.append("date LIKE :like_compact")
+            continue
+
+        conditions.append(f"({col} >= :start_dt AND {col} < :end_dt)")
+        conditions.append(f"({col} >= :start_dt_us AND {col} < :end_dt_us)")
+        conditions.append(f"{col} LIKE :like_hyphen")
+        conditions.append(f"{col} LIKE :like_compact")
+
+    if not conditions:
+        return None
+
+    where_time = "\n                 OR ".join(conditions)
+
+    return text(
+        f"""
+        SELECT DISTINCT CAST(symbol AS TEXT) AS symbol
+        FROM {RANKING_RAW_TABLE}
+        WHERE symbol IS NOT NULL
+          AND TRIM(CAST(symbol AS TEXT)) <> ''
+          AND (
+                {where_time}
+          )
+        ORDER BY symbol
+        """
+    )
+
+
 # ============================================================
 # ranking symbols
 # ============================================================
 
 def get_latest_ranking_symbols() -> List[str]:
     """
-    fallback: ranking_raw_1min の最新 snapshot_time / inserted_at から取得。
+    fallback: ranking_raw_1min の最新 snapshot_time / inserted_at / datetime / date から取得。
+
+    DBによって存在列が違うため、PRAGMA table_info で確認してからSQLを組み立てる。
     """
     symbols: list[str] = []
 
     try:
-        sql_latest = text(
-            """
-            SELECT COALESCE(MAX(snapshot_time), MAX(inserted_at), MAX(datetime)) AS latest_time
-            FROM ranking_raw_1min
-            WHERE symbol IS NOT NULL AND TRIM(CAST(symbol AS TEXT)) <> ''
-            """
-        )
-
         with session.Session_ranking() as s:
+            cols = _get_table_columns(s)
+
+            if "symbol" not in cols:
+                logger.warning(
+                    "[YAHOO SYMBOL PROVIDER] %s has no symbol column cols=%s",
+                    RANKING_RAW_TABLE,
+                    sorted(cols),
+                )
+                return []
+
+            time_cols = _existing_time_columns(cols)
+            if not time_cols:
+                logger.warning(
+                    "[YAHOO SYMBOL PROVIDER] latest ranking time columns not found cols=%s",
+                    sorted(cols),
+                )
+                return []
+
+            sql_latest = _build_latest_time_sql(time_cols)
+            if sql_latest is None:
+                return []
+
             latest_time = s.execute(sql_latest).scalar()
             if not latest_time:
                 logger.warning("[YAHOO SYMBOL PROVIDER] latest ranking time not found")
                 return []
 
-            rows = s.execute(
-                text(
-                    """
-                    SELECT DISTINCT CAST(symbol AS TEXT) AS symbol
-                    FROM ranking_raw_1min
-                    WHERE symbol IS NOT NULL
-                      AND TRIM(CAST(symbol AS TEXT)) <> ''
-                      AND (
-                            snapshot_time = :latest_time
-                         OR inserted_at = :latest_time
-                         OR datetime = :latest_time
-                      )
-                    ORDER BY symbol
-                    """
-                ),
-                {"latest_time": str(latest_time)},
-            ).fetchall()
+            sql_symbols = _build_latest_symbol_sql(time_cols)
+            if sql_symbols is None:
+                return []
 
+            rows = s.execute(sql_symbols, {"latest_time": str(latest_time)}).fetchall()
             symbols = [r[0] for r in rows]
 
     except Exception:
@@ -133,8 +233,9 @@ def get_today_ranking_symbols_all(
     その日に ranking_raw_1min に1回でも登場した銘柄を全件返す。
 
     重要:
-      ranking_raw_1min は date / datetime が NULL のケースがあるため、
-      snapshot_time を最優先にし、inserted_at / datetime / date を保険にする。
+      ranking_raw_1min はDB作成時期により date / datetime / inserted_at / snapshot_time
+      の列構成が揺れる。存在しない列をSQLに含めると SQLite が
+      "no such column" で落ちるため、実在列だけを使ってWHEREを作る。
     """
     symbols: list[str] = []
 
@@ -144,35 +245,29 @@ def get_today_ranking_symbols_all(
 
         params = _target_date_values(target_date)
 
-        sql = text(
-            """
-            SELECT DISTINCT CAST(symbol AS TEXT) AS symbol
-            FROM ranking_raw_1min
-            WHERE symbol IS NOT NULL
-              AND TRIM(CAST(symbol AS TEXT)) <> ''
-              AND (
-                    (snapshot_time >= :start_dt AND snapshot_time < :end_dt)
-                 OR (snapshot_time >= :start_dt_us AND snapshot_time < :end_dt_us)
-                 OR (inserted_at   >= :start_dt AND inserted_at   < :end_dt)
-                 OR (inserted_at   >= :start_dt_us AND inserted_at   < :end_dt_us)
-                 OR (datetime      >= :start_dt AND datetime      < :end_dt)
-                 OR (datetime      >= :start_dt_us AND datetime      < :end_dt_us)
-                 OR date = :date_hyphen
-                 OR date = :date_compact
-                 OR snapshot_time LIKE :like_hyphen
-                 OR inserted_at   LIKE :like_hyphen
-                 OR datetime      LIKE :like_hyphen
-                 OR date          LIKE :like_hyphen
-                 OR snapshot_time LIKE :like_compact
-                 OR inserted_at   LIKE :like_compact
-                 OR datetime      LIKE :like_compact
-                 OR date          LIKE :like_compact
-              )
-            ORDER BY symbol
-            """
-        )
-
         with session.Session_ranking() as s:
+            cols = _get_table_columns(s)
+
+            if "symbol" not in cols:
+                logger.warning(
+                    "[YAHOO SYMBOL PROVIDER] %s has no symbol column cols=%s",
+                    RANKING_RAW_TABLE,
+                    sorted(cols),
+                )
+                return []
+
+            time_cols = _existing_time_columns(cols)
+            if not time_cols:
+                logger.warning(
+                    "[YAHOO SYMBOL PROVIDER] usable date/time columns not found cols=%s",
+                    sorted(cols),
+                )
+                return []
+
+            sql = _build_today_symbol_sql(time_cols)
+            if sql is None:
+                return []
+
             rows = s.execute(sql, params).fetchall()
             symbols = [r[0] for r in rows]
 
@@ -183,9 +278,11 @@ def get_today_ranking_symbols_all(
     out = _sanitize_symbols(symbols)
 
     logger.info(
-        "[YAHOO SYMBOL PROVIDER] today ranking all symbols=%d date=%s source=ranking_raw_1min time_col=snapshot_time/inserted_at/datetime/date",
+        "[YAHOO SYMBOL PROVIDER] today ranking all symbols=%d date=%s source=%s time_cols=%s",
         len(out),
         target_date,
+        RANKING_RAW_TABLE,
+        "/".join(_existing_time_columns(set(TIME_COLUMNS_PRIORITY))),
     )
     return out
 
