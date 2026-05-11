@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/handlers/entry_handler.py
-# Version: Ver27.9.0-FINAL-MARKET-REFERENCE-PRICE-PASSTHROUGH
+# Version: Ver27.10.0-FINAL-MARKET-REFERENCE-PRICE-RECOVERY
 # ------------------------------------------------------------
 # ✔ kabu_api.buy_sell_entry に完全準拠
 # ✔ 注文実行専用（低レイヤ）
@@ -15,6 +15,7 @@
 # ✔ qty passthrough を明示ログ化
 # ✔ kabu low-layer 戻り値(order_id, price, qty)を診断ログ化
 # ✔ MARKET注文へ上位レイヤpriceをreference_priceとして渡す
+# ✔ order_price=None の場合は pending/global_data から reference_price を復元
 # ============================================================
 
 import logging
@@ -60,6 +61,26 @@ def _safe_int(v: Any) -> Optional[int]:
         return None
 
 
+def _safe_float(v: Any) -> Optional[float]:
+    try:
+        if v is None or v == "":
+            return None
+        p = float(v)
+        return p if p > 0 else None
+    except Exception:
+        return None
+
+
+def _norm_symbol(v: Any) -> str:
+    try:
+        s = str(v).strip()
+        if s.endswith(".0"):
+            s = s[:-2]
+        return s
+    except Exception:
+        return ""
+
+
 def _normalize_result(res):
     """
     kabu_api の戻り値を正規化
@@ -96,13 +117,123 @@ def _safe_qty(qty: Optional[int]) -> Optional[int]:
 
 
 def _safe_price(price: Any) -> Optional[float]:
+    return _safe_float(price)
+
+
+def _pick_price_from_df(df, symbol: str) -> Optional[float]:
     try:
-        if price is None or price == "":
+        if df is None or not hasattr(df, "empty") or df.empty:
             return None
-        p = float(price)
-        return p if p > 0 else None
+        if "symbol" not in getattr(df, "columns", []):
+            return None
+
+        sym = _norm_symbol(symbol)
+        x = df.copy()
+        x["_sym_norm"] = x["symbol"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+        x = x[x["_sym_norm"] == sym]
+        if x.empty:
+            return None
+
+        if "datetime" in x.columns:
+            try:
+                x = x.sort_values("datetime")
+            except Exception:
+                pass
+
+        row = x.iloc[-1]
+        for col in ("close_price", "price", "current_price", "close"):
+            if col in x.columns:
+                p = _safe_float(row.get(col))
+                if p and p > 0:
+                    return p
+        return None
     except Exception:
         return None
+
+
+def _recover_reference_price(symbol: str) -> Optional[float]:
+    """
+    entry_controller の order_price が MARKET で None になった場合の保険。
+    pending_entries と global_data の最新summaryから価格を復元する。
+    """
+    sym = _norm_symbol(symbol)
+
+    # 1) pending_entries の同一銘柄 bucket から復元
+    try:
+        root = getattr(global_data, "pending_entries", {}) or {}
+        bucket = root.get(sym) or root.get(str(symbol)) or []
+        for e in reversed(list(bucket)):
+            if not isinstance(e, dict):
+                continue
+            for col in ("close_price", "price", "current_price", "close"):
+                p = _safe_float(e.get(col))
+                if p and p > 0:
+                    logger.warning(
+                        "[ENTRY PRICE RECOVER] symbol=%s source=pending col=%s price=%s",
+                        sym,
+                        col,
+                        p,
+                    )
+                    return p
+    except Exception:
+        pass
+
+    # 2) get_merged_summary から復元
+    try:
+        getter = getattr(global_data, "get_merged_summary", None)
+        if callable(getter):
+            for tf in (1, 3, 5):
+                for source in ("push", "SUMMARY", None):
+                    try:
+                        df = getter(tf=tf, source=source) if source is not None else getter(tf=tf)
+                    except TypeError:
+                        try:
+                            df = getter(tf)
+                        except Exception:
+                            df = None
+                    except Exception:
+                        df = None
+                    p = _pick_price_from_df(df, sym)
+                    if p and p > 0:
+                        logger.warning(
+                            "[ENTRY PRICE RECOVER] symbol=%s source=get_merged_summary tf=%s src=%s price=%s",
+                            sym,
+                            tf,
+                            source,
+                            p,
+                        )
+                        return p
+    except Exception:
+        pass
+
+    # 3) よく使うglobal_data属性から復元
+    attr_names = []
+    for tf in (1, 3, 5):
+        attr_names.extend([
+            f"push_merged_summary_{tf}min",
+            f"push_summary_{tf}min",
+            f"merged_summary_{tf}min",
+            f"summary_{tf}min",
+            f"push_merged_summary_{tf}m",
+            f"push_summary_{tf}m",
+        ])
+
+    for name in attr_names:
+        try:
+            df = getattr(global_data, name, None)
+            p = _pick_price_from_df(df, sym)
+            if p and p > 0:
+                logger.warning(
+                    "[ENTRY PRICE RECOVER] symbol=%s source=global_data.%s price=%s",
+                    sym,
+                    name,
+                    p,
+                )
+                return p
+        except Exception:
+            continue
+
+    return None
 
 
 def _normalize_args(
@@ -113,12 +244,19 @@ def _normalize_args(
     order_type: Optional[str],
     qty: Optional[int],
 ):
+    sym = str(symbol).strip() if symbol is not None else ""
+    p = _safe_price(price)
+    ot = (order_type or "LIMIT").upper()
+
+    if p is None and ot == "MARKET" and sym:
+        p = _recover_reference_price(sym)
+
     return {
-        "symbol": str(symbol).strip() if symbol is not None else "",
+        "symbol": sym,
         "symbolname": symbolname or "",
-        "price": _safe_price(price),
+        "price": p,
         "reason": reason or "",
-        "order_type": (order_type or "LIMIT").upper(),
+        "order_type": ot,
         "qty": _safe_qty(qty),
     }
 
