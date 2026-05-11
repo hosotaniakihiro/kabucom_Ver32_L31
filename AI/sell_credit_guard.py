@@ -1,6 +1,6 @@
 # ============================================================
 # File: AI/sell_credit_guard.py
-# Version: PRODUCTION-STABLE-V4-GLOBAL-CACHE-ATTENTION-WARN
+# Version: PRODUCTION-STABLE-V5-RUNTIME-REJECT-CACHE
 # ------------------------------------------------------------
 # 殿様イナゴ（SELL）専用 信用・売禁ガード
 #
@@ -13,6 +13,7 @@
 #   起動時に global_data へ保持した symbol_flags_info_map を参照
 # ✔ symbol_flags.sell_target / short_ok / credit_type=貸借銘柄 を信用売り可否に利用
 # ✔ is_attention=1 は売禁ではないため遮断せず、警告ログのみ出す
+# ✔ kabu API Code=100368 のランタイム拒否キャッシュを最優先で遮断
 # ============================================================
 
 from __future__ import annotations
@@ -248,6 +249,23 @@ def _merge_global_flags_if_needed(flags: Dict[str, Any]) -> Dict[str, Any]:
     return merged
 
 
+def _is_runtime_rejected(symbol: str) -> bool:
+    try:
+        from AI.sell_order_reject_cache import is_sell_rejected, get_sell_reject_reason
+
+        if is_sell_rejected(symbol):
+            logger.info(
+                "[SELL_CREDIT_GUARD] NG symbol=%s reason=runtime_api_reject %s",
+                symbol,
+                get_sell_reject_reason(symbol),
+            )
+            return True
+    except Exception:
+        # reject cache が無くても既存判定は継続する
+        return False
+    return False
+
+
 # ============================================================
 # メイン API
 # ============================================================
@@ -266,8 +284,16 @@ def can_sell_symbol(symbol_flags: Any, *, default: bool = False) -> bool:
 
     flags = _to_dict(symbol_flags)
     symbol = _pick_symbol(flags)
+
+    # API側で一度 Code=100368 になった銘柄は、DB上の short_ok より優先して止める。
+    if symbol and symbol != "-" and _is_runtime_rejected(symbol):
+        return False
+
     flags = _merge_global_flags_if_needed(flags)
     symbol = _pick_symbol(flags)
+
+    if symbol and symbol != "-" and _is_runtime_rejected(symbol):
+        return False
 
     if not flags:
         logger.info(
