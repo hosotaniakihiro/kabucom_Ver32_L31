@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/summary/pipeline/entry_pipeline.py
-# Version: Ver2.4-PRODUCTION-SIDE-AWARE-LIQUIDITY-SCORE
+# Version: Ver2.5-PRODUCTION-PRE-PENDING-SELL-CREDIT-GUARD
 # ------------------------------------------------------------
 # ✔ AI approved rows → entry execution
 # ✔ DataFrame / list / dict / Series 両対応
@@ -17,6 +17,7 @@
 # ✔ production hardened
 # ✔ SUMMARY AI通常エントリーとイナゴ liquidity_shock 条件を分離
 # ✔ SUMMARY liquidity の min_score を BUY / SELL で分離
+# ✔ SELL信用売り不可銘柄を pending 登録前に除外
 # ============================================================
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from global_state import global_data
 from trading.summary.summary_entry import run_summary_entry_executor
 from trading.ai.blowoff_top_detector import detect_blowoff_top
 from trading.ai.liquidity_shock_detector import allow_liquidity_entry
+from AI.sell_credit_guard import can_sell_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -185,6 +187,13 @@ def _resolve_side(row: dict, *, buy_score: float, sell_score: float, raw_score: 
     if raw_score > 0:
         return "BUY"
     return ""
+
+
+def _resolve_side_from_row(row: dict) -> str:
+    raw_score = _safe_float(_first(row, ["score", "score_total", "final_score", "display_score"], 0.0), 0.0)
+    buy_score = _safe_float(_first(row, ["buy_score", "score_buy"], 0.0), 0.0)
+    sell_score = _safe_float(_first(row, ["sell_score", "score_sell"], 0.0), 0.0)
+    return _resolve_side(row, buy_score=buy_score, sell_score=sell_score, raw_score=raw_score)
 
 
 def _resolve_summary_liquidity_min_score(row: dict, *, side: str) -> float:
@@ -342,7 +351,7 @@ def _already_in_position(symbol: str) -> bool:
 
 
 # ============================================================
-# liquidity filters
+# liquidity / credit filters
 # ============================================================
 
 def _is_inago_source(row: dict) -> bool:
@@ -425,6 +434,45 @@ def _allow_entry_liquidity(row: dict, *, symbol: str, interval: int) -> bool:
         return ok
 
     return _allow_summary_ai_liquidity(row, symbol=symbol, interval=interval)
+
+
+def _allow_sell_credit_before_pending(row: dict, *, symbol: str, interval: int) -> bool:
+    """
+    SELL候補を pending に入れる前の信用売りガード。
+
+    entry_controller 側にも最終ガードは残すが、ここで落とすことで
+    short_ok=0 / sell_target=0 の銘柄が pending に残り続けることを防ぐ。
+    """
+    side = _resolve_side_from_row(row)
+    if side != "SELL":
+        return True
+
+    try:
+        ok = bool(can_sell_symbol(symbol))
+    except Exception:
+        logger.exception(
+            "[entry_pipeline] sell credit precheck failed symbol=%s interval=%s -> skip safe",
+            symbol,
+            interval,
+        )
+        return False
+
+    if ok:
+        logger.info(
+            "[entry_pipeline] sell credit allow symbol=%s interval=%s side=%s",
+            symbol,
+            interval,
+            side,
+        )
+        return True
+
+    logger.info(
+        "[entry_pipeline] skip sell credit guard symbol=%s interval=%s side=%s reason=not_short_sellable_pre_pending",
+        symbol,
+        interval,
+        side,
+    )
+    return False
 
 
 # ============================================================
@@ -539,6 +587,7 @@ def run_entry_pipeline(approved_rows: Any, df_summary: pd.DataFrame | None, inte
         total_in = len(rows)
         skipped_no_symbol = 0
         skipped_liquidity = 0
+        skipped_sell_credit = 0
         skipped_position = 0
 
         filtered: List[Any] = []
@@ -571,8 +620,12 @@ def run_entry_pipeline(approved_rows: Any, df_summary: pd.DataFrame | None, inte
                     )
                     continue
 
+                if not _allow_sell_credit_before_pending(row_dict, symbol=symbol, interval=int(interval)):
+                    skipped_sell_credit += 1
+                    continue
+
             except Exception:
-                logger.exception("[entry_pipeline] liquidity filter failed symbol=%s", symbol)
+                logger.exception("[entry_pipeline] pre-entry filters failed symbol=%s", symbol)
                 skipped_liquidity += 1
                 continue
 
@@ -594,11 +647,12 @@ def run_entry_pipeline(approved_rows: Any, df_summary: pd.DataFrame | None, inte
 
         logger.info(
             "[entry_pipeline] summary interval=%s approved=%s no_symbol=%s liquidity_skip=%s "
-            "position_skip=%s blowoff_skip=%s executable=%s",
+            "sell_credit_skip=%s position_skip=%s blowoff_skip=%s executable=%s",
             interval,
             total_in,
             skipped_no_symbol,
             skipped_liquidity,
+            skipped_sell_credit,
             skipped_position,
             skipped_blowoff,
             len(filtered),
