@@ -1,6 +1,6 @@
 # ============================================================
 # File   : AI/sell_order_reject_cache.py
-# Version: PRODUCTION-RUNTIME-SELL-REJECT-CACHE-V1
+# Version: PRODUCTION-RUNTIME-SELL-REJECT-CACHE-V2-100033
 # ------------------------------------------------------------
 # kabuステーションAPIで信用新規売りが拒否された銘柄を、
 # 当日ランタイム中だけ SELL NG として記録する。
@@ -8,9 +8,10 @@
 # 主目的:
 #   - Code=100368
 #     「現在、株式信用新規の注文は抑止されております。」
-#     が返った銘柄を再発注しない。
+#   - Code=100033
+#     「この銘柄のお取引は制限されています。」
 #   - symbol_flags.db 上は貸借 / sell_target=1 でも、API側で
-#     実際に抑止される銘柄を学習して止める。
+#     実際に拒否される銘柄を学習して止める。
 #   - pending_entries に残っている同銘柄 SELL 候補も掃除する。
 # ============================================================
 
@@ -22,8 +23,14 @@ from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
 
-# kabuステーションAPIの信用新規注文抑止
+# kabuステーションAPIの信用新規注文抑止 / 取引制限
 KABU_CODE_CREDIT_NEW_ORDER_REJECTED = "100368"
+KABU_CODE_SYMBOL_TRADE_RESTRICTED = "100033"
+
+_REJECT_CODES = {
+    KABU_CODE_CREDIT_NEW_ORDER_REJECTED,
+    KABU_CODE_SYMBOL_TRADE_RESTRICTED,
+}
 
 # 念のため、同系統の文言でも拾う
 _REJECT_MESSAGE_HINTS = (
@@ -31,6 +38,10 @@ _REJECT_MESSAGE_HINTS = (
     "信用新規の注文は抑止",
     "信用新規",
     "抑止",
+    "この銘柄のお取引は制限",
+    "お取引は制限",
+    "取引制限",
+    "取引注意情報",
 )
 
 _DEFAULT_BLOCK_MINUTES = 360  # 当日中運用想定。ランタイム中は十分長めに止める。
@@ -62,17 +73,20 @@ def _normalize_code(v: Any) -> str:
 
 def is_credit_new_order_reject(code: Any = None, message: Any = None) -> bool:
     """
-    kabu API の信用新規注文抑止かどうかを判定する。
+    kabu API の信用新規注文抑止 / 銘柄取引制限かどうかを判定する。
     """
     c = _normalize_code(code)
-    if c == KABU_CODE_CREDIT_NEW_ORDER_REJECTED:
+    if c in _REJECT_CODES:
         return True
 
     msg = str(message or "")
     if not msg:
         return False
 
-    return all(h in msg for h in ("信用新規", "抑止")) or any(h in msg for h in _REJECT_MESSAGE_HINTS[:2])
+    if all(h in msg for h in ("信用新規", "抑止")):
+        return True
+
+    return any(h in msg for h in _REJECT_MESSAGE_HINTS)
 
 
 def _get_runtime_cache() -> Dict[str, Dict[str, Any]]:
