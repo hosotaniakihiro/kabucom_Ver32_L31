@@ -1,8 +1,8 @@
 # ============================================================
 # File   : kabu_api/buy_sell_entry.py
-# Version: Ver25-PRODUCTION-QTY-PASSTHROUGH-HARDENED-FULL
+# Version: Ver26-PRODUCTION-MARKET-REFERENCE-PRICE-FIX
 # ------------------------------------------------------------
-# ✔ Ver24 完全互換ベース
+# ✔ Ver25 完全互換ベース
 # ✔ 機能削除ゼロ
 # ✔ 上位レイヤ計算 qty を優先使用
 # ✔ qty=None のときのみ固定100株互換
@@ -13,6 +13,7 @@
 # ✔ send_order_common 完全診断ログ
 # ✔ kabu API レスポンス完全可視化
 # ✔ None発生原因完全特定
+# ✔ MARKET注文で板が取れない場合も reference_price があれば数量防衛して発注継続
 # ============================================================
 
 import logging
@@ -120,6 +121,51 @@ def _normalize_qty_to_unit(symbol, qty: int) -> int:
     except Exception:
         logger.error("❌ _normalize_qty_to_unit エラー", exc_info=True)
         return 0
+
+
+def _resolve_market_reference_price(symbol, quotes, reference_price, *, side: str) -> float:
+    """
+    MARKET注文の数量防衛・50万円制限用の参考価格を解決する。
+
+    成行payload自体は Price=0 のまま送るが、数量計算には価格が必要。
+    板が取得できる場合は BUY=ask / SELL=bid を優先し、
+    板が無い場合は上位レイヤが渡した summary close 等の reference_price を使う。
+    """
+    try:
+        side_u = str(side or "").upper()
+        q_price = 0.0
+
+        if isinstance(quotes, dict):
+            if side_u == "BUY":
+                q_price = _safe_float(quotes.get("ask_price"), 0.0)
+            else:
+                q_price = _safe_float(quotes.get("bid_price"), 0.0)
+
+        if q_price > 0:
+            return q_price
+
+        ref = _safe_float(reference_price, 0.0)
+        if ref > 0:
+            logger.warning(
+                "⚠ %s: MARKET %s 板価格なし -> reference_price 使用 price=%s",
+                symbol,
+                side_u,
+                ref,
+            )
+            return ref
+
+        logger.warning(
+            "⚠ %s: MARKET %s 参考価格なし quotes=%s reference_price=%s",
+            symbol,
+            side_u,
+            quotes,
+            reference_price,
+        )
+        return 0.0
+
+    except Exception:
+        logger.error("❌ _resolve_market_reference_price エラー symbol=%s", symbol, exc_info=True)
+        return 0.0
 
 
 # ============================================================
@@ -386,21 +432,32 @@ def execute_short_at_best_bid(symbol, qty=None, lot_yen=500000, exchange=1):
 # BUY（成行）
 # ============================================================
 
-def execute_buy_market(symbol, qty=None, exchange=1):
+def execute_buy_market(symbol, qty=None, reference_price=None, exchange=1):
     try:
         quotes = get_latest_bid_ask(symbol)
+        price_for_guard = _resolve_market_reference_price(
+            symbol,
+            quotes,
+            reference_price,
+            side="BUY",
+        )
 
-        if not quotes:
-            logger.warning("⚠ %s: 板なし → MARKET BUY スキップ", symbol)
+        if price_for_guard <= 0:
+            logger.warning("⚠ %s: MARKET BUY 参考価格なし → スキップ", symbol)
             return None
 
-        price = quotes.get("ask_price")
-        actual_qty = _resolve_actual_qty(symbol, price, qty)
+        actual_qty = _resolve_actual_qty(symbol, price_for_guard, qty)
 
         if actual_qty <= 0:
             return None
 
-        logger.info("[MARKET BUY] %s × %s", symbol, actual_qty)
+        logger.info(
+            "[MARKET BUY] %s × %s reference_price=%s quotes_available=%s",
+            symbol,
+            actual_qty,
+            price_for_guard,
+            bool(quotes),
+        )
 
         payload = _make_payload(
             symbol,
@@ -427,21 +484,32 @@ def execute_buy_market(symbol, qty=None, exchange=1):
 # SELL（成行）
 # ============================================================
 
-def execute_sell_market(symbol, qty=None, exchange=1):
+def execute_sell_market(symbol, qty=None, reference_price=None, exchange=1):
     try:
         quotes = get_latest_bid_ask(symbol)
+        price_for_guard = _resolve_market_reference_price(
+            symbol,
+            quotes,
+            reference_price,
+            side="SELL",
+        )
 
-        if not quotes:
-            logger.warning("⚠ %s: 板なし → MARKET SELL スキップ", symbol)
+        if price_for_guard <= 0:
+            logger.warning("⚠ %s: MARKET SELL 参考価格なし → スキップ", symbol)
             return None
 
-        price = quotes.get("bid_price")
-        actual_qty = _resolve_actual_qty(symbol, price, qty)
+        actual_qty = _resolve_actual_qty(symbol, price_for_guard, qty)
 
         if actual_qty <= 0:
             return None
 
-        logger.info("[MARKET SELL] %s × %s", symbol, actual_qty)
+        logger.info(
+            "[MARKET SELL] %s × %s reference_price=%s quotes_available=%s",
+            symbol,
+            actual_qty,
+            price_for_guard,
+            bool(quotes),
+        )
 
         payload = _make_payload(
             symbol,
