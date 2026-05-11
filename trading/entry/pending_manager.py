@@ -5,17 +5,18 @@
 # ✔ pending_entries = dict[str, list[dict]] を絶対保証
 # ✔ 直代入 / 型崩れを STACKTRACE 付きで検出
 # ✔ source 単位ではなく identity(source, entry_type, side, interval) で重複防止
-# ✔ entry_controller 向け安全API追加（iter / pop）
+# ✔ entry_controller 向け安全API追加（iter / pop / prune）
 # ✔ Scheduler Loop を絶対に落とさない
 # ✔ ROOT 可視化・件数監視・空状態の原因追跡を強化
 # ✔ reject理由を可視化
+# ✔ interval違い / SELL不可 / 古い候補を安全に掃除できる prune_entries を追加
 # ============================================================
 
 from __future__ import annotations
 
 import logging
 import traceback
-from typing import Dict, List, Any, Iterator, Tuple
+from typing import Dict, List, Any, Iterator, Tuple, Callable
 
 from global_state import global_data
 
@@ -140,10 +141,13 @@ def snapshot_root() -> Dict[str, int]:
     """
     _ensure_root()
     snap: Dict[str, int] = {}
-    for sym, bucket in global_data.pending_entries.items():
+    for sym, bucket in list(global_data.pending_entries.items()):
         normalized = _normalize_bucket(bucket, sym)
-        global_data.pending_entries[sym] = normalized
-        snap[sym] = len(normalized)
+        if normalized:
+            global_data.pending_entries[sym] = normalized
+            snap[sym] = len(normalized)
+        else:
+            global_data.pending_entries.pop(sym, None)
     return snap
 
 
@@ -155,7 +159,10 @@ def get_bucket(symbol: str) -> List[Dict]:
     sym = str(symbol)
     raw = global_data.pending_entries.get(sym)
     normalized = _normalize_bucket(raw, sym)
-    global_data.pending_entries[sym] = normalized
+    if normalized:
+        global_data.pending_entries[sym] = normalized
+    else:
+        global_data.pending_entries.pop(sym, None)
     return list(normalized)
 
 
@@ -166,7 +173,10 @@ def replace_bucket(symbol: str, new_bucket: List[Dict]) -> None:
     _ensure_root()
     sym = str(symbol)
     normalized = _normalize_bucket(new_bucket, sym)
-    global_data.pending_entries[sym] = normalized
+    if normalized:
+        global_data.pending_entries[sym] = normalized
+    else:
+        global_data.pending_entries.pop(sym, None)
     logger.debug(
         "🔁 pending bucket replaced symbol=%s size=%d",
         sym,
@@ -278,7 +288,11 @@ def iter_entries() -> Iterator[Tuple[str, Dict]]:
     _ensure_root()
     for sym, bucket in list(global_data.pending_entries.items()):
         normalized = _normalize_bucket(bucket, sym)
-        global_data.pending_entries[sym] = normalized
+        if normalized:
+            global_data.pending_entries[sym] = normalized
+        else:
+            global_data.pending_entries.pop(sym, None)
+            continue
         for entry in normalized:
             yield sym, entry
 
@@ -294,22 +308,87 @@ def pop_entry(symbol: str, entry: Dict) -> None:
     sym = str(symbol)
     bucket = get_bucket(sym)
 
-    new_bucket = [
-        e for e in bucket
-        if e is not entry
-    ]
+    target_identity = _entry_identity(entry) if isinstance(entry, dict) else None
+    removed = False
+    new_bucket: List[Dict] = []
 
-    if new_bucket:
-        replace_bucket(sym, new_bucket)
-    else:
-        if sym in global_data.pending_entries:
-            del global_data.pending_entries[sym]
+    for e in bucket:
+        if not removed and (e is entry or (target_identity is not None and _entry_identity(e) == target_identity)):
+            removed = True
+            continue
+        new_bucket.append(e)
+
+    replace_bucket(sym, new_bucket)
 
     logger.info(
-        "🧹 pending popped symbol=%s remain=%d",
+        "🧹 pending popped symbol=%s removed=%s remain=%d",
         sym,
+        removed,
         len(new_bucket),
     )
+
+
+# ============================================================
+# entry_controller 用: 条件一致 entry を安全に削除
+# ============================================================
+def prune_entries(
+    predicate: Callable[[str, Dict[str, Any]], bool],
+    *,
+    reason: str = "PRUNE",
+    max_remove: int | None = None,
+) -> int:
+    """
+    predicate(symbol, entry) が True を返した pending entry を削除する。
+
+    用途:
+      - PIPELINE_FILTER_MISMATCH の古い interval 候補削除
+      - SELL_CREDIT_GUARD_NG の空売り不可候補削除
+      - POSITION_FILTER_NG 等の再評価不要候補削除
+
+    例:
+        prune_entries(lambda sym, e: e.get("source") == "SUMMARY" and e.get("interval") == 1)
+    """
+    _ensure_root()
+    removed = 0
+
+    for sym, bucket in list(global_data.pending_entries.items()):
+        normalized = _normalize_bucket(bucket, sym)
+        kept: List[Dict[str, Any]] = []
+
+        for entry in normalized:
+            try:
+                if max_remove is not None and removed >= max_remove:
+                    kept.append(entry)
+                    continue
+
+                if predicate(str(sym), entry):
+                    removed += 1
+                    logger.info(
+                        "🧹 pending pruned symbol=%s reason=%s identity=%s entry=%s",
+                        sym,
+                        reason,
+                        _entry_identity(entry),
+                        {
+                            "source": entry.get("source"),
+                            "entry_type": entry.get("entry_type"),
+                            "side": entry.get("side"),
+                            "interval": entry.get("interval"),
+                            "score": entry.get("score"),
+                        },
+                    )
+                    continue
+
+                kept.append(entry)
+
+            except Exception:
+                logger.exception("pending prune predicate failed symbol=%s entry=%r", sym, entry)
+                kept.append(entry)
+
+        replace_bucket(str(sym), kept)
+
+    if removed:
+        logger.info("🧹 pending prune done reason=%s removed=%d root=%s", reason, removed, snapshot_root())
+    return removed
 
 
 # ============================================================
