@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/handlers/entry_handler.py
-# Version: Ver27.8.0-FINAL-EXECUTOR-QTY-PASSTHROUGH-DIAGNOSTIC
+# Version: Ver27.9.0-FINAL-MARKET-REFERENCE-PRICE-PASSTHROUGH
 # ------------------------------------------------------------
 # ✔ kabu_api.buy_sell_entry に完全準拠
 # ✔ 注文実行専用（低レイヤ）
@@ -14,6 +14,7 @@
 # ✔ 位置引数 / キーワード引数 両対応（後方互換）
 # ✔ qty passthrough を明示ログ化
 # ✔ kabu low-layer 戻り値(order_id, price, qty)を診断ログ化
+# ✔ MARKET注文へ上位レイヤpriceをreference_priceとして渡す
 # ============================================================
 
 import logging
@@ -94,6 +95,16 @@ def _safe_qty(qty: Optional[int]) -> Optional[int]:
     return _safe_int(qty)
 
 
+def _safe_price(price: Any) -> Optional[float]:
+    try:
+        if price is None or price == "":
+            return None
+        p = float(price)
+        return p if p > 0 else None
+    except Exception:
+        return None
+
+
 def _normalize_args(
     symbol: str,
     symbolname: str,
@@ -105,7 +116,7 @@ def _normalize_args(
     return {
         "symbol": str(symbol).strip() if symbol is not None else "",
         "symbolname": symbolname or "",
-        "price": price,
+        "price": _safe_price(price),
         "reason": reason or "",
         "order_type": (order_type or "LIMIT").upper(),
         "qty": _safe_qty(qty),
@@ -152,10 +163,10 @@ def place_entry_buy(
                 raise ValueError("MARKET BUY requires qty")
 
             logger.info(
-                "[ENTRY BUY DISPATCH] MARKET symbol=%s qty=%s",
-                p["symbol"], p["qty"],
+                "[ENTRY BUY DISPATCH] MARKET symbol=%s qty=%s reference_price=%s",
+                p["symbol"], p["qty"], p["price"],
             )
-            res = execute_buy_market(p["symbol"], p["qty"])
+            res = execute_buy_market(p["symbol"], p["qty"], reference_price=p["price"])
 
         elif p["order_type"] == "STOP":
             if p["price"] is None or p["qty"] is None:
@@ -237,10 +248,10 @@ def place_entry_sell(
                 raise ValueError("MARKET SELL requires qty")
 
             logger.info(
-                "[ENTRY SELL DISPATCH] MARKET symbol=%s qty=%s",
-                p["symbol"], p["qty"],
+                "[ENTRY SELL DISPATCH] MARKET symbol=%s qty=%s reference_price=%s",
+                p["symbol"], p["qty"], p["price"],
             )
-            res = execute_sell_market(p["symbol"], p["qty"])
+            res = execute_sell_market(p["symbol"], p["qty"], reference_price=p["price"])
 
         elif p["order_type"] == "STOP":
             if p["price"] is None or p["qty"] is None:
