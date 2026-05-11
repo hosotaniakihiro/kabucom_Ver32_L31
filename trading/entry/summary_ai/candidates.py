@@ -1,23 +1,20 @@
 # ============================================================
 # File   : trading/entry/summary_ai/candidates.py
-# Version: PRODUCTION-STABLE-REV2.1-FORCE-TOP20-RANKING-SAFE
+# Version: PRODUCTION-STABLE-REV2.2-SCORE-CONFIG-FLAGS
 # ------------------------------------------------------------
 # Purpose:
 #   - SUMMARY / RANKING SUMMARY の DataFrame からAI gate候補を作る
 #   - build_summary_ai_entry_candidates() で BUY TOP20 と SELL TOP20 を同時に返す
 #   - 各行に ai_side / side = BUY or SELL を付与し、AI gate側で行ごとに判定する
-#
-# REV2.1:
-#   - hook 側から top_n=10 が渡っても、最低20件ずつ候補化する
-#   - RANKING由来では slope の厳格条件を使わず、ランキングスコア/方向性を優先する
-#   - PUSH由来では従来どおり slope 条件を維持する
+#   - score_config.ini の [buy_entry] / [buy_bonus] / [sell_entry] / [sell_bonus]
+#     をAI候補作成前に score_buy / score_sell へ反映する
 # ============================================================
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 
@@ -40,6 +37,10 @@ DEFAULT_MIN_PRICE = 200.0
 DEFAULT_MIN_BUY_SLOPE = 0.01
 DEFAULT_MAX_SELL_SLOPE = -0.01
 
+
+# ============================================================
+# env / basic helpers
+# ============================================================
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -74,10 +75,6 @@ def _is_ranking_source(source: str) -> bool:
 
 
 def _resolve_top_n(top_n: int | str | None) -> int:
-    """
-    AIに渡す候補は最低20件。
-    hook側が古く top_n=10 を渡しても、ここで20に補正する。
-    """
     try:
         n = int(top_n or DEFAULT_TOP_N)
     except Exception:
@@ -117,6 +114,208 @@ def _safe_symbols(df: pd.DataFrame, n: int = 30) -> list[str]:
         pass
     return []
 
+
+def _truthy(v: Any) -> bool:
+    try:
+        if v is None:
+            return False
+        if isinstance(v, bool):
+            return bool(v)
+        if isinstance(v, (int, float)):
+            return float(v) != 0.0
+        s = str(v).strip().lower()
+        return s in {"1", "true", "t", "yes", "y", "on", "ok"}
+    except Exception:
+        return False
+
+
+def _norm_key(key: str) -> str:
+    return str(key or "").strip().lower()
+
+
+def _flag_variants(key: str) -> list[str]:
+    k = _norm_key(key)
+    if not k:
+        return []
+    if k.startswith("flag_"):
+        out = [k, k[5:]]
+    else:
+        out = [k, f"flag_{k}"]
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for x in out:
+        if x and x not in seen:
+            uniq.append(x)
+            seen.add(x)
+    return uniq
+
+
+def _row_has_flag(row: pd.Series, flag_key: str) -> bool:
+    for key in _flag_variants(flag_key):
+        if key in row.index and _truthy(row.get(key)):
+            return True
+    return False
+
+
+# ============================================================
+# score_config.ini flag scoring bridge
+# ============================================================
+
+def _load_score_tables() -> dict[str, dict[str, int]]:
+    """
+    score_config.ini の明示セクションを読み込む。
+    import path が環境により trading.scoring / scoring のどちらでも動くようにする。
+    """
+    try:
+        from trading.scoring.config.score_table import build_score_tables
+        tables = build_score_tables()
+    except Exception:
+        try:
+            from scoring.config.score_table import build_score_tables  # type: ignore
+            tables = build_score_tables()
+        except Exception:
+            logger.debug("[SUMMARY AI CANDIDATES] score_config load failed", exc_info=True)
+            return {}
+
+    out: dict[str, dict[str, int]] = {}
+    for name in ("buy_entry", "buy_bonus", "sell_entry", "sell_bonus"):
+        t = tables.get(name, {}) if isinstance(tables, dict) else {}
+        if isinstance(t, dict):
+            out[name] = {str(k): int(v) for k, v in t.items() if isinstance(v, int) or str(v).lstrip("-").isdigit()}
+        else:
+            out[name] = {}
+    return out
+
+
+def _score_flags_for_row(row: pd.Series, table: dict[str, int]) -> tuple[float, list[str]]:
+    total = 0.0
+    hits: list[str] = []
+    used_base_keys: set[str] = set()
+
+    for key, score in table.items():
+        # score_table.py は flagあり/なし両方を登録するため、同じflagを二重加点しない。
+        base_key = _norm_key(key)
+        if base_key.startswith("flag_"):
+            base_key = base_key[5:]
+        if base_key in used_base_keys:
+            continue
+        if _row_has_flag(row, key):
+            used_base_keys.add(base_key)
+            total += float(score)
+            hits.append(f"{key}:{score}")
+
+    return total, hits
+
+
+def _apply_score_config_flags(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    DataFrame内の flag_* 列を score_config.ini の点数で合算し、
+    AI候補判定で見る ai_disp_buy_score / ai_disp_sell_score に上乗せする。
+
+    既存の score_buy / score_sell は壊さず、以下の列を追加・更新する:
+      - config_buy_entry_score
+      - config_buy_bonus_score
+      - config_buy_score
+      - config_sell_entry_score
+      - config_sell_bonus_score
+      - config_sell_score
+      - ai_disp_buy_score
+      - ai_disp_sell_score
+      - score_buy / buy_score
+      - score_sell / sell_score
+    """
+    out = safe_df(df)
+    if out.empty:
+        return out
+
+    if not _env_bool("SUMMARY_AI_APPLY_SCORE_CONFIG_FLAGS", True):
+        logger.warning("[SUMMARY AI CANDIDATES] score_config flag scoring disabled by env")
+        return out
+
+    tables = _load_score_tables()
+    if not tables:
+        logger.warning("[SUMMARY AI CANDIDATES] score_config tables unavailable; skip flag scoring")
+        return out
+
+    buy_entry_t = tables.get("buy_entry", {})
+    buy_bonus_t = tables.get("buy_bonus", {})
+    sell_entry_t = tables.get("sell_entry", {})
+    sell_bonus_t = tables.get("sell_bonus", {})
+
+    if not any((buy_entry_t, buy_bonus_t, sell_entry_t, sell_bonus_t)):
+        logger.warning("[SUMMARY AI CANDIDATES] score_config tables empty; skip flag scoring")
+        return out
+
+    buy_entry_scores: list[float] = []
+    buy_bonus_scores: list[float] = []
+    sell_entry_scores: list[float] = []
+    sell_bonus_scores: list[float] = []
+    buy_hits_col: list[str] = []
+    sell_hits_col: list[str] = []
+
+    for _, row in out.iterrows():
+        be, be_hits = _score_flags_for_row(row, buy_entry_t)
+        bb, bb_hits = _score_flags_for_row(row, buy_bonus_t)
+        se, se_hits = _score_flags_for_row(row, sell_entry_t)
+        sb, sb_hits = _score_flags_for_row(row, sell_bonus_t)
+
+        buy_entry_scores.append(be)
+        buy_bonus_scores.append(bb)
+        sell_entry_scores.append(abs(se))
+        sell_bonus_scores.append(abs(sb))
+        buy_hits_col.append("|".join((be_hits + bb_hits)[:30]))
+        sell_hits_col.append("|".join((se_hits + sb_hits)[:30]))
+
+    out["config_buy_entry_score"] = buy_entry_scores
+    out["config_buy_bonus_score"] = buy_bonus_scores
+    out["config_buy_score"] = pd.to_numeric(out["config_buy_entry_score"], errors="coerce").fillna(0.0) + pd.to_numeric(out["config_buy_bonus_score"], errors="coerce").fillna(0.0)
+
+    out["config_sell_entry_score"] = sell_entry_scores
+    out["config_sell_bonus_score"] = sell_bonus_scores
+    out["config_sell_score"] = pd.to_numeric(out["config_sell_entry_score"], errors="coerce").fillna(0.0) + pd.to_numeric(out["config_sell_bonus_score"], errors="coerce").fillna(0.0)
+
+    out["config_buy_hits"] = buy_hits_col
+    out["config_sell_hits"] = sell_hits_col
+
+    old_buy = pd.to_numeric(out.get("ai_disp_buy_score", 0.0), errors="coerce").fillna(0.0)
+    old_sell = pd.to_numeric(out.get("ai_disp_sell_score", 0.0), errors="coerce").fillna(0.0).abs()
+
+    # 既存スコアとiniフラグ加点の大きい方を採用する。
+    # 既存パイプラインで計算済みのスコアを壊さず、iniが効いていない場合だけ補強する。
+    out["ai_disp_buy_score"] = pd.concat([old_buy, pd.to_numeric(out["config_buy_score"], errors="coerce").fillna(0.0)], axis=1).max(axis=1)
+    out["ai_disp_sell_score"] = pd.concat([old_sell, pd.to_numeric(out["config_sell_score"], errors="coerce").fillna(0.0)], axis=1).max(axis=1)
+
+    out["score_buy"] = out["ai_disp_buy_score"]
+    out["buy_score"] = out["ai_disp_buy_score"]
+    out["score_sell"] = out["ai_disp_sell_score"]
+    out["sell_score"] = out["ai_disp_sell_score"]
+    out["score_total"] = out["ai_disp_buy_score"] - out["ai_disp_sell_score"]
+    out["total_score"] = out["score_total"]
+    out["final_score"] = out["score_total"]
+    out["display_score"] = out["score_total"]
+    out["ai_disp_total_score"] = out["score_total"]
+    out["ai_disp_final_score"] = out["score_total"]
+
+    try:
+        buy_positive = int((pd.to_numeric(out["config_buy_score"], errors="coerce").fillna(0.0) > 0).sum())
+        sell_positive = int((pd.to_numeric(out["config_sell_score"], errors="coerce").fillna(0.0) > 0).sum())
+        logger.warning(
+            "[SUMMARY AI CANDIDATES] score_config applied rows=%s buy_positive=%s sell_positive=%s buy_max=%.2f sell_max=%.2f",
+            len(out),
+            buy_positive,
+            sell_positive,
+            float(pd.to_numeric(out["config_buy_score"], errors="coerce").fillna(0.0).max()),
+            float(pd.to_numeric(out["config_sell_score"], errors="coerce").fillna(0.0).max()),
+        )
+    except Exception:
+        pass
+
+    return out.reset_index(drop=True)
+
+
+# ============================================================
+# dataframe preparation
+# ============================================================
 
 def attach_display_like_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = safe_df(df)
@@ -169,6 +368,7 @@ def attach_display_like_columns(df: pd.DataFrame) -> pd.DataFrame:
         except Exception:
             logger.debug("[SUMMARY AI CANDIDATES] datetime normalize failed", exc_info=True)
 
+    out = _apply_score_config_flags(out)
     return out.reset_index(drop=True)
 
 
@@ -255,6 +455,10 @@ def _prepare_base(summary_df: pd.DataFrame, *, require_buy_target: bool, exclude
     return dedupe_one_row_per_symbol(df)
 
 
+# ============================================================
+# candidate extraction
+# ============================================================
+
 def _buy_candidates_from_prepared(df: pd.DataFrame, *, interval: int | str, top_n: int, min_buy_score: float, max_sell_score: float, min_volume: float, min_price: float, source: str) -> pd.DataFrame:
     if df.empty:
         return df
@@ -274,13 +478,22 @@ def _buy_candidates_from_prepared(df: pd.DataFrame, *, interval: int | str, top_
 
     out = df[base_mask].copy()
     if out.empty:
+        try:
+            top_buy = df.sort_values("ai_disp_buy_score", ascending=False).head(10)[[c for c in ("symbol", "ai_disp_buy_score", "config_buy_score", "ai_disp_sell_score", "ai_disp_close", "ai_disp_volume", "ai_disp_slope") if c in df.columns]].to_dict(orient="records")
+        except Exception:
+            top_buy = []
         logger.warning(
-            "[SUMMARY AI CANDIDATES] BUY empty interval=%s source=%s before=%s ranking_source=%s slope_gate=%s",
+            "[SUMMARY AI CANDIDATES] BUY empty interval=%s source=%s before=%s min_buy=%.2f max_sell=%.2f min_price=%.1f min_volume=%.1f ranking_source=%s slope_gate=%s top_buy=%s",
             interval,
             source,
             before,
+            float(min_buy_score),
+            float(max_sell_score),
+            float(resolved_min_price),
+            float(min_volume),
             _is_ranking_source(source),
             not _is_ranking_source(source),
+            top_buy,
         )
         return out
     out["_ai_sort_score"] = (
@@ -355,13 +568,6 @@ def build_summary_ai_entry_candidates(
     exclude_etf_fund: bool = True,
     source: str = "SUMMARY",
 ) -> pd.DataFrame:
-    """
-    既存runner互換の候補作成入口。
-
-    重要:
-      既存runnerはこの関数しか呼ばないため、ここでBUY TOP20とSELL TOP20を結合して返す。
-      ai_gate_runner.py は行ごとの ai_side / side を読んで BUY/SELL としてAIに渡す。
-    """
     top_n = _resolve_top_n(top_n)
 
     base = _prepare_base(summary_df, require_buy_target=require_buy_target, exclude_etf_fund=exclude_etf_fund)
