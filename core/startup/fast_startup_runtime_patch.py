@@ -1,21 +1,21 @@
 # ============================================================
 # File   : core/startup/fast_startup_runtime_patch.py
-# Version: PRODUCTION-FAST-STARTUP-PATCH-V1
+# Version: PRODUCTION-FAST-STARTUP-PATCH-V2-SKIP-SUMMARY-SCHEMA
 # ------------------------------------------------------------
 # 目的:
-#   main.py 起動直後の重い初回ランキングサマリー実行を軽くする。
+#   main.py 起動直後の重い処理を軽くする。
 #
 # ログ上の問題:
-#   - ranking_summary_all の初回/定時実行が 232〜458秒かかっている
+#   - ranking_summary_all の初回/定時実行が 232〜458秒かかる
 #   - 64233 rows の DataFrame が job thread done の戻り値としてログに出る
-#   - 起動直後に summary / ranking の重い初回tickを同期実行すると、
-#     realtime開始・entry開始まで遅れる
+#   - summary schema bootstrap が added_columns=0 なのに約5分かかる
 #
 # 方針:
 #   1) scheduler_bootstrap のランキング lookback を環境変数で短縮可能にする
 #   2) ranking summary job の戻り値を None にして巨大DataFrameログを防ぐ
 #   3) main.py の initial ranking tick once を no-op 化可能にする
-#      デフォルトは SKIP=1。ランキングは定時ジョブに任せる。
+#   4) main.py 側の summary schema bootstrap をデフォルトskipする
+#      DB作成・schema補完は main_database.py 側で実施する想定。
 # ============================================================
 
 from __future__ import annotations
@@ -46,6 +46,52 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _patch_summary_schema_bootstrap() -> None:
+    """
+    database.session._bootstrap_summary_schema を main.py ではskipする。
+
+    理由:
+      database.session Ver43 は起動ごとに3テーブル全列を確認する。
+      NAS上SQLiteでは added_columns=0 でも数分かかる。
+
+    戻したい場合:
+      set FAST_STARTUP_SKIP_SUMMARY_SCHEMA_BOOTSTRAP=0
+    """
+    skip_schema = _env_bool("FAST_STARTUP_SKIP_SUMMARY_SCHEMA_BOOTSTRAP", True)
+    if not skip_schema:
+        logger.warning(
+            "[FAST STARTUP PATCH] summary schema bootstrap skip disabled env=FAST_STARTUP_SKIP_SUMMARY_SCHEMA_BOOTSTRAP"
+        )
+        return
+
+    try:
+        import database.session as ds
+    except Exception:
+        logger.exception("[FAST STARTUP PATCH] database.session import failed for schema skip")
+        return
+
+    old_bootstrap = getattr(ds, "_bootstrap_summary_schema", None)
+    if not callable(old_bootstrap):
+        logger.warning("[FAST STARTUP PATCH] _bootstrap_summary_schema not callable")
+        return
+
+    if getattr(old_bootstrap, "_fast_startup_schema_skip", False):
+        return
+
+    def _skip_summary_schema_bootstrap(engine):
+        logger.warning(
+            "[FAST STARTUP PATCH] summary schema bootstrap skipped in main.py "
+            "reason=main_database_handles_schema env=FAST_STARTUP_SKIP_SUMMARY_SCHEMA_BOOTSTRAP"
+        )
+        return None
+
+    _skip_summary_schema_bootstrap._fast_startup_schema_skip = True  # type: ignore[attr-defined]
+    _skip_summary_schema_bootstrap._original_bootstrap = old_bootstrap  # type: ignore[attr-defined]
+    ds._bootstrap_summary_schema = _skip_summary_schema_bootstrap
+
+    logger.warning("[FAST STARTUP PATCH] database.session._bootstrap_summary_schema patched to no-op")
+
+
 def install() -> bool:
     global _PATCHED
     if _PATCHED:
@@ -56,6 +102,12 @@ def install() -> bool:
     except Exception:
         logger.exception("[FAST STARTUP PATCH] scheduler_bootstrap import failed")
         return False
+
+    # 0) summary schema bootstrap をmain側ではskip。
+    try:
+        _patch_summary_schema_bootstrap()
+    except Exception:
+        logger.exception("[FAST STARTUP PATCH] summary schema skip patch failed")
 
     # 1) ranking lookback を短縮。デフォルト 240 -> 60。
     try:
@@ -102,7 +154,6 @@ def install() -> bool:
         logger.exception("[FAST STARTUP PATCH] ranking return suppression failed")
 
     # 3) main.py の initial ranking tick をデフォルト no-op 化。
-    #    起動中に重い ranking summary を同期実行しない。定時ジョブは残す。
     try:
         skip_initial = _env_bool("FAST_STARTUP_SKIP_INITIAL_RANKING_TICK", True)
         if skip_initial:
