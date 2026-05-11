@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/handlers/entry_handler.py
-# Version: Ver27.10.0-FINAL-MARKET-REFERENCE-PRICE-RECOVERY
+# Version: Ver27.11.0-FINAL-LIMIT-PRICE-DIRECT-SEND
 # ------------------------------------------------------------
 # ✔ kabu_api.buy_sell_entry に完全準拠
 # ✔ 注文実行専用（低レイヤ）
@@ -16,12 +16,19 @@
 # ✔ kabu low-layer 戻り値(order_id, price, qty)を診断ログ化
 # ✔ MARKET注文へ上位レイヤpriceをreference_priceとして渡す
 # ✔ order_price=None の場合は pending/global_data から reference_price を復元
+# ✔ LIMIT注文で上位レイヤpriceがある場合は、その価格で直接発注する
+#   - 旧: LIMITでも best ask/bid を取り直し、板なしならスキップ
+#   - 新: LIMIT price が渡されたらその価格で payload を作って送る
 # ============================================================
+
+from __future__ import annotations
 
 import logging
 from typing import Optional, Any
 
 from global_state import global_data
+
+import kabu_api.buy_sell_entry as bse
 
 from kabu_api.buy_sell_entry import (
     execute_buy_at_best_ask,
@@ -40,9 +47,6 @@ logger = logging.getLogger("entry_handler")
 # ============================================================
 
 def _ensure_entry_inflight_set():
-    """
-    entry_inflight が set であることを保証する
-    """
     if not isinstance(global_data.entry_inflight, set):
         logger.critical(
             "[ENTRY_INFLIGHT CORRUPTED] expected set, got %s → auto-fix",
@@ -158,7 +162,6 @@ def _recover_reference_price(symbol: str) -> Optional[float]:
     """
     sym = _norm_symbol(symbol)
 
-    # 1) pending_entries の同一銘柄 bucket から復元
     try:
         root = getattr(global_data, "pending_entries", {}) or {}
         bucket = root.get(sym) or root.get(str(symbol)) or []
@@ -178,7 +181,6 @@ def _recover_reference_price(symbol: str) -> Optional[float]:
     except Exception:
         pass
 
-    # 2) get_merged_summary から復元
     try:
         getter = getattr(global_data, "get_merged_summary", None)
         if callable(getter):
@@ -206,7 +208,6 @@ def _recover_reference_price(symbol: str) -> Optional[float]:
     except Exception:
         pass
 
-    # 3) よく使うglobal_data属性から復元
     attr_names = []
     for tf in (1, 3, 5):
         attr_names.extend([
@@ -261,6 +262,58 @@ def _normalize_args(
     }
 
 
+def _execute_direct_limit_order(symbol: str, side: str, price: float, qty: int):
+    """
+    entry_order_builder が price 付き LIMIT を作った場合は、板を取り直さずに
+    その指値で直接 payload を作る。
+
+    これにより、summary_fallback_limit の price があるにもかかわらず
+    execute_buy_at_best_ask / execute_short_at_best_bid が板なしでスキップする問題を防ぐ。
+    """
+    try:
+        side_u = str(side or "").upper()
+        side_code = 2 if side_u == "BUY" else 1
+        px = float(price)
+        q = int(qty)
+
+        if px <= 0 or q <= 0:
+            logger.error(
+                "[ENTRY DIRECT LIMIT INVALID] symbol=%s side=%s price=%s qty=%s",
+                symbol,
+                side_u,
+                price,
+                qty,
+            )
+            return None
+
+        logger.warning(
+            "[ENTRY DIRECT LIMIT DISPATCH] symbol=%s side=%s price=%s qty=%s reason=use_order_builder_limit_price",
+            symbol,
+            side_u,
+            px,
+            q,
+        )
+
+        payload = bse._make_payload(
+            symbol,
+            side=side_code,
+            qty=q,
+            price=px,
+            exchange=1,
+            front_order_type=20,
+        )
+
+        res = bse._send_order(payload, symbol)
+        if not res:
+            return None
+
+        return (res.get("OrderId"), res.get("Price", px), q)
+
+    except Exception:
+        logger.exception("[ENTRY DIRECT LIMIT EXCEPTION] symbol=%s side=%s", symbol, side)
+        return None
+
+
 # ============================================================
 # BUY
 # ============================================================
@@ -278,7 +331,6 @@ def place_entry_buy(
     BUY 新規エントリー（後方互換対応）
     """
 
-    # --- 後方互換（位置引数吸収） ---
     if args:
         if len(args) >= 1:
             order_type = args[0]
@@ -320,11 +372,18 @@ def place_entry_buy(
             if p["qty"] is None:
                 raise ValueError("LIMIT BUY requires qty")
 
-            logger.info(
-                "[ENTRY BUY DISPATCH] LIMIT symbol=%s qty=%s (best ask execution)",
-                p["symbol"], p["qty"],
-            )
-            res = execute_buy_at_best_ask(p["symbol"], p["qty"])
+            if p["price"] is not None:
+                logger.info(
+                    "[ENTRY BUY DISPATCH] LIMIT symbol=%s price=%s qty=%s direct_limit=True",
+                    p["symbol"], p["price"], p["qty"],
+                )
+                res = _execute_direct_limit_order(p["symbol"], "BUY", p["price"], p["qty"])
+            else:
+                logger.info(
+                    "[ENTRY BUY DISPATCH] LIMIT symbol=%s qty=%s best_ask_fallback=True",
+                    p["symbol"], p["qty"],
+                )
+                res = execute_buy_at_best_ask(p["symbol"], p["qty"])
 
         order_id = _normalize_result(res)
         if not order_id:
@@ -405,11 +464,18 @@ def place_entry_sell(
             if p["qty"] is None:
                 raise ValueError("LIMIT SELL requires qty")
 
-            logger.info(
-                "[ENTRY SELL DISPATCH] LIMIT symbol=%s qty=%s (best bid execution)",
-                p["symbol"], p["qty"],
-            )
-            res = execute_short_at_best_bid(p["symbol"], p["qty"])
+            if p["price"] is not None:
+                logger.info(
+                    "[ENTRY SELL DISPATCH] LIMIT symbol=%s price=%s qty=%s direct_limit=True",
+                    p["symbol"], p["price"], p["qty"],
+                )
+                res = _execute_direct_limit_order(p["symbol"], "SELL", p["price"], p["qty"])
+            else:
+                logger.info(
+                    "[ENTRY SELL DISPATCH] LIMIT symbol=%s qty=%s best_bid_fallback=True",
+                    p["symbol"], p["qty"],
+                )
+                res = execute_short_at_best_bid(p["symbol"], p["qty"])
 
         order_id = _normalize_result(res)
         if not order_id:
