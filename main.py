@@ -10,12 +10,14 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.2-CONSOLE-TEE-PROJECTROOT-FIRST
+# Version: Ver38.3-FAST-STARTUP-RUNTIME-PATCHES
 # ------------------------------------------------------------
 # ✔ PROJECT_ROOT を最初に sys.path へ追加
 # ✔ core.logging.console_tee を確実に import / setup
 # ✔ stdout / stderr / print / traceback / logging を console_*.log に保存
 # ✔ system_startup 後に logging StreamHandler を tee へ再接続
+# ✔ 100368 SELL拒否後の entry_controller ログ補正 runtime patch を起動時install
+# ✔ 起動高速化 runtime patch を起動時install
 # ✔ 既存の起動処理は維持
 # ============================================================
 
@@ -195,6 +197,42 @@ def _factory_position_state():
     except Exception:
         logger.exception("PositionState() create failed")
         return None
+
+
+# ============================================================
+# RUNTIME PATCHES
+# ============================================================
+
+def _install_main_runtime_patches():
+    """
+    起動時の runtime patch をまとめてinstallする。
+
+    - entry_controller_runtime_reject_patch:
+        kabu API 100368後に ORDER_ID_EMPTY_RETRYABLE として扱わず、
+        SELL_ORDER_REJECTED_BY_KABU_API としてログを分ける。
+
+    - fast_startup_runtime_patch:
+        起動直後の重い ranking 初回tickを抑止し、ranking summary jobの
+        巨大DataFrame戻り値ログを抑制する。
+    """
+    patches = [
+        ("core.startup.entry_controller_runtime_reject_patch", "install"),
+        ("core.startup.fast_startup_runtime_patch", "install"),
+    ]
+
+    for mod_name, fn_name in patches:
+        try:
+            mod = importlib.import_module(mod_name)
+            fn = getattr(mod, fn_name, None)
+            ok = fn() if callable(fn) else False
+            logger.warning(
+                "[MAIN RUNTIME PATCH] %s.%s installed=%s",
+                mod_name,
+                fn_name,
+                ok,
+            )
+        except Exception:
+            logger.exception("[MAIN RUNTIME PATCH] failed %s.%s", mod_name, fn_name)
 
 
 # ============================================================
@@ -580,6 +618,7 @@ def main():
     logger.info("force_run=%s", force_run)
 
     _install_summary_entry_runtime_context()
+    _install_main_runtime_patches()
 
     # --------------------------------------------------------
     # OPTIONAL
@@ -593,9 +632,8 @@ def main():
 
         if optional_data is not None:
             try:
-                print("optional_data rows:", len(optional_data))
-                print("optional_data columns:", optional_data.columns)
-                print(optional_data.head())
+                logger.info("optional_data rows=%s cols=%s", len(optional_data), list(optional_data.columns))
+                logger.info("optional_data head=\n%s", optional_data.head())
             except Exception:
                 logger.exception("optional_data print failed")
 
@@ -641,6 +679,7 @@ def main():
     logger.info("🚀 system_startup DONE")
 
     _install_summary_entry_runtime_context()
+    _install_main_runtime_patches()
 
     # --------------------------------------------------------
     # PUSH REFRESH CALLABLE INSTALL
