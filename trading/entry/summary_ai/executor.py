@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/summary_ai/executor.py
-# Version: PRODUCTION-STABLE-REV1.2-BUY-RESERVED-SELECTION
+# Version: PRODUCTION-STABLE-REV1.3-FILTER-RESTRICTED-BEFORE-SELECTION
 # ------------------------------------------------------------
 # 【概要】
 #   AI_OK 銘柄を approved_rows に変換し、
@@ -19,10 +19,12 @@
 #   - AI gate で決まった BUY / SELL side を絶対に破壊しない
 #   - SELL候補は sell_score 優先で評価する
 #   - BUY候補が存在する場合は最低1件BUYを優先採用する
+#   - trade_restricted / SELL reject cache 済み銘柄は選抜前に除外する
 # ============================================================
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import os
 from typing import Any, Callable, Dict, List, Optional, Sequence
@@ -53,6 +55,25 @@ def _norm_side(v: Any, default: str = "BUY") -> str:
         return s if s in {"BUY", "SELL"} else default
     except Exception:
         return default
+
+
+def _norm_symbol(v: Any) -> str:
+    try:
+        s = str(v or "").strip()
+        if s.endswith(".0"):
+            s = s[:-2]
+        return s
+    except Exception:
+        return ""
+
+
+def _pick_symbol(item: Dict[str, Any]) -> str:
+    try:
+        ai_row = dict(item.get("ai_row") or {})
+        src = dict(item.get("source_row") or {})
+        return _norm_symbol(item.get("symbol") or ai_row.get("symbol") or src.get("symbol"))
+    except Exception:
+        return _norm_symbol(item.get("symbol"))
 
 
 def _pick_side(ai_ok_item: Dict[str, Any], ai_row: Dict[str, Any], src: Dict[str, Any]) -> str:
@@ -102,6 +123,90 @@ def _sort_key_for_selection(item: Dict[str, Any]) -> tuple[float, float, float]:
     )
 
 
+def _is_trade_restricted_symbol(symbol: str) -> tuple[bool, Any]:
+    """
+    send_order.py / entry_controller が登録した取引制限を、executor 選抜前に見る。
+    期限切れなら可能な範囲で解除する。
+    """
+    if not symbol:
+        return False, None
+
+    try:
+        from global_state import global_data
+
+        root = getattr(global_data, "trade_restricted", {}) or {}
+        until = root.get(symbol)
+        if not until:
+            return False, None
+
+        if isinstance(until, dt.datetime):
+            if dt.datetime.now() < until:
+                return True, until
+            try:
+                root.pop(symbol, None)
+            except Exception:
+                pass
+            return False, None
+
+        return True, until
+    except Exception:
+        logger.exception("[SUMMARY AI EXECUTOR] trade_restricted check failed symbol=%s", symbol)
+        return False, None
+
+
+def _is_sell_reject_cached(symbol: str, side: str) -> tuple[bool, Any]:
+    if side != "SELL" or not symbol:
+        return False, None
+
+    try:
+        from AI.sell_order_reject_cache import is_sell_rejected, get_sell_reject_reason
+
+        if is_sell_rejected(symbol):
+            return True, get_sell_reject_reason(symbol)
+        return False, None
+    except Exception:
+        # cache が無い環境でも executor は止めない
+        return False, None
+
+
+def _filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    AI_OK だが、直前サイクルで kabu API から信用新規抑止/取引制限を受けた銘柄を除外する。
+    ここで除外してから max_entries を選ぶことで、3905/4203 のような拒否銘柄で3枠を消費しない。
+    """
+    if not ok_items:
+        return []
+
+    kept: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+
+    for item in ok_items:
+        symbol = _pick_symbol(item)
+        side = _row_side(item)
+
+        restricted, until = _is_trade_restricted_symbol(symbol)
+        if restricted:
+            skipped.append({"symbol": symbol, "side": side, "reason": "trade_restricted", "until": str(until)})
+            continue
+
+        sell_rejected, reason = _is_sell_reject_cached(symbol, side)
+        if sell_rejected:
+            skipped.append({"symbol": symbol, "side": side, "reason": "sell_reject_cache", "detail": str(reason)})
+            continue
+
+        kept.append(item)
+
+    if skipped:
+        logger.warning(
+            "[SUMMARY AI EXECUTOR] filtered blocked candidates before selection before=%s after=%s skipped=%s",
+            len(ok_items),
+            len(kept),
+            skipped[:20],
+        )
+
+    return kept
+
+
 def _select_ai_ok_items(ok_items: List[Dict[str, Any]], *, max_entries: int) -> List[Dict[str, Any]]:
     """
     AI_OK候補を最終approved候補に絞る。
@@ -110,11 +215,17 @@ def _select_ai_ok_items(ok_items: List[Dict[str, Any]], *, max_entries: int) -> 
     BUYがAI_OKでも approved から漏れていた。
 
     対策:
+      - trade_restricted / SELL reject cache 済み銘柄は選抜前に除外
       - BUY候補が存在する場合、最低 SUMMARY_AI_MIN_BUY_APPROVED 件はBUYから確保する
       - 残り枠はBUY/SELL混在でスコア順にする
       - max_entries=1 の場合でもBUYが存在すればBUYを優先する
     """
     if not ok_items:
+        return []
+
+    ok_items = _filter_blocked_ai_ok_items(ok_items)
+    if not ok_items:
+        logger.warning("[SUMMARY AI EXECUTOR] all AI_OK candidates filtered by trade restriction / reject cache")
         return []
 
     try:
@@ -154,7 +265,7 @@ def _select_ai_ok_items(ok_items: List[Dict[str, Any]], *, max_entries: int) -> 
         len([x for x in sorted_all if _row_side(x) == "SELL"]),
         [
             {
-                "symbol": x.get("symbol") or dict(x.get("ai_row") or {}).get("symbol"),
+                "symbol": _pick_symbol(x),
                 "side": _row_side(x),
                 "conf": round(safe_float(x.get("confidence")), 3),
                 "score": round(_row_score_for_side(x), 3),
