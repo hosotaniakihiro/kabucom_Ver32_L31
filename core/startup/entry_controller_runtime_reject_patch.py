@@ -1,19 +1,21 @@
 # ============================================================
 # File   : core/startup/entry_controller_runtime_reject_patch.py
-# Version: PRODUCTION-ENTRY-ORDER-REJECT-PATCH-V2-BUY-DIAG
+# Version: PRODUCTION-ENTRY-ORDER-REJECT-PATCH-V3-CREDIT-SUPPRESS
 # ------------------------------------------------------------
 # 目的:
 #   kabu API Code=100368/100033 等で注文IDが空になった時に、
-#   entry_controller 側で原因を見える化する。
+#   entry_controller 側で原因を見える化し、再試行扱いにしない。
 #
 # 背景:
-#   BUY候補が pending / entry_pipeline までは通っても、
-#   最終注文段階で APPROVED=0 になるケースがある。
-#   旧ログでは SELL 拒否以外の BUY 側 ORDER_ID_EMPTY の原因が追いにくい。
+#   send_order.py 側で CREDIT_NEW_ORDER_SUPPRESSED_BY_KABU_API を検出し
+#   global_data.trade_restricted[symbol] へ登録しても、直後の
+#   _execute_best_candidate では order_id=None だけを見て
+#   ORDER_ID_EMPTY_RETRYABLE としてログしていた。
 #
 # 方針:
-#   entry_controller._execute_best_candidate を runtime patch し、
-#   ORDER_ID_EMPTY 時に BUY / SELL 別の診断ログを追加する。
+#   place_entry_buy/sell から戻った直後に trade_restricted を再確認し、
+#   登録済みなら CREDIT_NEW_ORDER_SUPPRESSED_BY_KABU_API として終了する。
+#   BUY/SELL とも信用新規のまま。現物化はしない。
 # ============================================================
 
 from __future__ import annotations
@@ -39,6 +41,14 @@ def _short_dict(d: dict | None, keys: list[str]) -> dict:
     return out
 
 
+def _trade_restrict_detail(ec: Any, symbol: str) -> dict:
+    try:
+        until = ec.global_data.trade_restricted.get(symbol)
+        return {"until": until}
+    except Exception:
+        return {}
+
+
 def install() -> bool:
     global _PATCHED
 
@@ -57,7 +67,7 @@ def install() -> bool:
         logger.warning("[ENTRY REJECT PATCH] target _execute_best_candidate not found")
         return False
 
-    if getattr(old_fn, "_runtime_reject_patched_v2", False):
+    if getattr(old_fn, "_runtime_reject_patched_v3", False):
         _PATCHED = True
         return True
 
@@ -190,6 +200,34 @@ def install() -> bool:
         )
 
         if not order_id:
+            # send_order.py が Code=100368/100033 を検出した場合、
+            # global_data.trade_restricted[symbol] に登録済みになる。
+            # この場合は ORDER_ID_EMPTY_RETRYABLE ではなく、非再試行扱いにする。
+            try:
+                if ec._is_symbol_trade_restricted(symbol):
+                    detail = _trade_restrict_detail(ec, symbol)
+                    ec.logger.warning(
+                        "🚫 CREDIT_NEW_ORDER_SUPPRESSED_BY_KABU_API_CONFIRMED symbol=%s side=%s qty=%s order_type=%s price=%s detail=%s",
+                        symbol,
+                        side,
+                        order_qty,
+                        order_type,
+                        order_price,
+                        detail,
+                    )
+                    ec._log_skip(
+                        symbol,
+                        "CREDIT_NEW_ORDER_SUPPRESSED_BY_KABU_API",
+                        side=side,
+                        qty=order_qty,
+                        order_type=order_type,
+                        price=order_price,
+                        **detail,
+                    )
+                    return False
+            except Exception:
+                ec.logger.exception("trade_restricted post-order check failed symbol=%s", symbol)
+
             if side == "SELL" and is_sell_rejected(symbol):
                 reason = get_sell_reject_reason(symbol)
                 ec.logger.warning(
@@ -262,10 +300,11 @@ def install() -> bool:
 
     _execute_best_candidate_patched._runtime_reject_patched = True  # type: ignore[attr-defined]
     _execute_best_candidate_patched._runtime_reject_patched_v2 = True  # type: ignore[attr-defined]
+    _execute_best_candidate_patched._runtime_reject_patched_v3 = True  # type: ignore[attr-defined]
     ec._execute_best_candidate = _execute_best_candidate_patched
 
     _PATCHED = True
-    logger.warning("[ENTRY REJECT PATCH] installed v2 target=trading.handlers.entry_controller._execute_best_candidate buy_diag=True")
+    logger.warning("[ENTRY REJECT PATCH] installed v3 target=trading.handlers.entry_controller._execute_best_candidate credit_suppress_diag=True")
     return True
 
 
