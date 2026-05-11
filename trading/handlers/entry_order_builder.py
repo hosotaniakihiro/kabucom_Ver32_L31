@@ -1,12 +1,15 @@
 # ==========================================================
 # trading/handlers/entry_order_builder.py
-# Ver1.1.0-FINAL-QTY_OVERRIDE-COMPAT
+# Ver1.2.0-FINAL-SUMMARY-NOBOARD-LIMIT-FIX
 # ----------------------------------------------------------
 # ✔ 注文条件（price / order_type / qty）を決定するだけ
 # ✔ 副作用ゼロ（発注・global_state 操作なし）
 # ✔ SUMMARY / RANKING / TONOSAMA 共通
 # ✔ BUY のみ最小単元救済（QTY_ZERO 根絶）
 # ✔ qty_override 対応（ENTRY_CONTROLLER 最新版互換）
+# ✔ SUMMARY_AI で板が無い場合は MARKET ではなく close/vwap 指値にする
+#   - 旧: order_type=MARKET price=None
+#   - 新: order_type=LIMIT price=close/vwap 丸め
 # ==========================================================
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ from utils_common import (
 
 ALLOW_MARKET_IF_BAD_BOARD = True
 MAX_SPREAD_PCT_FOR_LIMIT = 0.30
-MIN_ENTRY_QTY = 100   # ★ BUY 最小単元
+MIN_ENTRY_QTY = 100
 
 
 # ==========================================================
@@ -92,13 +95,14 @@ def build_entry_order(
     side: str,
     source: str,
     entry_row: Dict[str, Any],
-    qty_override: Optional[int] = None,   # ★ 追加（互換対応）
+    qty_override: Optional[int] = None,
 ) -> Dict[str, Any]:
 
     price = None
     base_price = None
     spread_pct = None
     board = None
+    price_source = None
 
     side = side.upper()
     source = source.upper()
@@ -118,19 +122,33 @@ def build_entry_order(
 
             spread_pct = (ask - bid) / bid * 100
             base_price = bid if side == "SELL" else ask
+            price_source = "board_bid_ask"
 
             if ALLOW_MARKET_IF_BAD_BOARD and spread_pct > MAX_SPREAD_PCT_FOR_LIMIT:
                 order_type = "MARKET"
+                price = None
             else:
                 price = _round_price(base_price, side)
                 order_type = "LIMIT"
 
         else:
-            base_price = entry_row.get("close_price") or entry_row.get("vwap")
+            base_price = (
+                entry_row.get("close_price")
+                or entry_row.get("price")
+                or entry_row.get("current_price")
+                or entry_row.get("close")
+                or entry_row.get("vwap")
+            )
             if not base_price or base_price <= 0:
                 return _ng("NO_PRICE_SOURCE")
 
-            order_type = "MARKET"
+            # 重要:
+            # 板なしのまま MARKET / Price=None を作ると、後段で Price=0 成行になり
+            # kabu API 側で OrderId 空になりやすい。
+            # ここでは summary の close/vwap を使って指値化する。
+            price = _round_price(float(base_price), side)
+            order_type = "LIMIT"
+            price_source = "summary_fallback_limit"
 
     # ======================================================
     # RANKING / TONOSAMA
@@ -142,6 +160,7 @@ def build_entry_order(
 
         price = _round_price(base_price, side)
         order_type = "STOP"
+        price_source = "five_sec_breakout"
 
     # ======================================================
     # 流動性評価
@@ -201,6 +220,7 @@ def build_entry_order(
         "qty": qty,
         "spread_pct": spread_pct,
         "board": bool(board),
+        "price_source": price_source,
     }
 
     if qty_override is not None:
