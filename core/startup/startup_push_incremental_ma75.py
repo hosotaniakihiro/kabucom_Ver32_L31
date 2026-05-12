@@ -15,7 +15,7 @@
 # Design:
 #   1. summary DBを当日から最大3営業日相当分読む
 #      例: summary20260508.db, summary20260507.db, summary20260506.db
-#   2. stock_summary_1min/3min/5min の銘柄別tailを各120本以上確保
+#   2. stock_summary_1min/3min/5min の銘柄別tailを必要最小限の各75本を確保
 #   3. pushYYYYMMDD.db のstream_dataから直近PUSHを読む
 #   4. PUSHを1分足へ丸め、保存済みsummary最新以降のみ採用
 #   5. 1分足から3分足/5分足を生成
@@ -23,7 +23,7 @@
 #   7. global_data の merged summary cache へ反映する
 #
 # Env:
-#   PUSH_INCREMENTAL_MA75_TAIL_ROWS=120
+#   PUSH_INCREMENTAL_MA75_TAIL_ROWS=75
 #   PUSH_INCREMENTAL_MA75_SUMMARY_LOOKBACK_DAYS=3
 #   PUSH_INCREMENTAL_MA75_PUSH_MAX_ROWS=50000
 #   PUSH_INCREMENTAL_MA75_LOOKBACK_MINUTES=240
@@ -56,7 +56,8 @@ SUMMARY_TABLE_BY_INTERVAL = {
     5: "stock_summary_5min",
 }
 
-TAIL_ROWS_PER_SYMBOL = int(os.environ.get("PUSH_INCREMENTAL_MA75_TAIL_ROWS", "120"))
+MIN_MA75_BARS = 75
+TAIL_ROWS_PER_SYMBOL = max(int(os.environ.get("PUSH_INCREMENTAL_MA75_TAIL_ROWS", str(MIN_MA75_BARS))), MIN_MA75_BARS)
 SUMMARY_LOOKBACK_DAYS = int(os.environ.get("PUSH_INCREMENTAL_MA75_SUMMARY_LOOKBACK_DAYS", "3"))
 PUSH_MAX_ROWS = int(os.environ.get("PUSH_INCREMENTAL_MA75_PUSH_MAX_ROWS", "50000"))
 PUSH_LOOKBACK_MINUTES = int(os.environ.get("PUSH_INCREMENTAL_MA75_LOOKBACK_MINUTES", "240"))
@@ -605,6 +606,90 @@ def _combine_tail_and_new(existing: pd.DataFrame, new: pd.DataFrame, interval: i
     return out.reset_index(drop=True)
 
 
+def _fill_ma75_from_db_and_minimal_tail(calc_df: pd.DataFrame, source_df: pd.DataFrame, interval: int) -> pd.DataFrame:
+    """
+    起動時MA75用の最小履歴補正。
+
+    前日までの summary DB には ma75 が格納済みという前提で、
+    indicator_pipeline の再計算で 75本未満の既存行が NaN になった場合は
+    DB格納値を復元する。
+
+    新規PUSH足は、読み込んだ最小75本tailと結合した通常rollingで計算する。
+    直近値のcarry/ffillは行わず、DB格納済みの同一足ma75か厳密75本rollingのみを採用する。
+    """
+    if calc_df is None or calc_df.empty:
+        return pd.DataFrame()
+
+    out = calc_df.copy()
+    if "ma75" not in out.columns:
+        out["ma75"] = np.nan
+
+    try:
+        out["symbol"] = _normalize_symbol(out["symbol"])
+        out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    except Exception:
+        logger.debug("[PUSH INCR MA75] ma75 normalize calc failed interval=%s", interval, exc_info=True)
+
+    try:
+        if isinstance(source_df, pd.DataFrame) and not source_df.empty and "ma75" in source_df.columns:
+            src = source_df[["symbol", "datetime", "ma75"]].copy()
+            src["symbol"] = _normalize_symbol(src["symbol"])
+            src["datetime"] = pd.to_datetime(src["datetime"], errors="coerce")
+            src["__db_ma75"] = pd.to_numeric(src["ma75"], errors="coerce")
+            src = (
+                src.dropna(subset=["symbol", "datetime"])
+                   .sort_values(["symbol", "datetime"])
+                   .drop_duplicates(["symbol", "datetime"], keep="last")
+                   [["symbol", "datetime", "__db_ma75"]]
+            )
+
+            before = int(pd.to_numeric(out["ma75"], errors="coerce").notna().sum())
+            out = out.merge(src, on=["symbol", "datetime"], how="left")
+            cur = pd.to_numeric(out["ma75"], errors="coerce")
+            dbv = pd.to_numeric(out["__db_ma75"], errors="coerce")
+            out["ma75"] = cur.combine_first(dbv)
+            out = out.drop(columns=["__db_ma75"], errors="ignore")
+            after = int(pd.to_numeric(out["ma75"], errors="coerce").notna().sum())
+            if after > before:
+                logger.info(
+                    "[PUSH INCR MA75] restored stored ma75 interval=%s nonnull=%d->%d",
+                    interval,
+                    before,
+                    after,
+                )
+    except Exception:
+        logger.debug("[PUSH INCR MA75] stored ma75 restore failed interval=%s", interval, exc_info=True)
+
+    try:
+        out = out.sort_values(["symbol", "datetime"]).reset_index(drop=True)
+        close_col = "close" if "close" in out.columns else "close_price" if "close_price" in out.columns else None
+        if close_col is not None:
+            def _repair_one(g: pd.DataFrame) -> pd.DataFrame:
+                g = g.copy()
+                close = pd.to_numeric(g[close_col], errors="coerce")
+                strict = close.rolling(MIN_MA75_BARS, min_periods=MIN_MA75_BARS).mean()
+                ma = pd.to_numeric(g["ma75"], errors="coerce").combine_first(strict)
+                # ffill/carry は使わない。前日までの値は同一足のDB格納ma75として復元し、
+                # 新規足は最小75本tailから厳密rollingで成立した場合だけ採用する。
+                g["ma75"] = ma
+                return g
+
+            before = int(pd.to_numeric(out["ma75"], errors="coerce").notna().sum())
+            out = out.groupby("symbol", group_keys=False).apply(_repair_one).reset_index(drop=True)
+            after = int(pd.to_numeric(out["ma75"], errors="coerce").notna().sum())
+            if after > before:
+                logger.info(
+                    "[PUSH INCR MA75] minimal-tail ma75 repaired interval=%s nonnull=%d->%d",
+                    interval,
+                    before,
+                    after,
+                )
+    except Exception:
+        logger.debug("[PUSH INCR MA75] minimal-tail ma75 repair failed interval=%s", interval, exc_info=True)
+
+    return out
+
+
 def _apply_indicators(df: pd.DataFrame, interval: int) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
@@ -612,16 +697,16 @@ def _apply_indicators(df: pd.DataFrame, interval: int) -> pd.DataFrame:
         from trading.summary.pipeline.indicator_pipeline import run_indicator_pipeline
         out = run_indicator_pipeline(df, interval=int(interval), run_downstream_scoring=True)
         if isinstance(out, pd.DataFrame):
-            return out
+            return _fill_ma75_from_db_and_minimal_tail(out, df, int(interval))
     except Exception:
         logger.exception("[PUSH INCR MA75] indicator pipeline failed interval=%s", interval)
 
     out = df.copy()
     out = out.sort_values(["symbol", "datetime"])
     out["ma75"] = out.groupby("symbol")["close"].transform(
-        lambda x: pd.to_numeric(x, errors="coerce").rolling(75, min_periods=75).mean()
+        lambda x: pd.to_numeric(x, errors="coerce").rolling(MIN_MA75_BARS, min_periods=MIN_MA75_BARS).mean()
     )
-    return out
+    return _fill_ma75_from_db_and_minimal_tail(out, df, int(interval))
 
 
 def _set_global_cache(df: pd.DataFrame, interval: int) -> None:

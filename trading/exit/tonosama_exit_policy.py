@@ -33,6 +33,9 @@ from dataclasses import dataclass
 from typing import Optional, Any
 
 
+PCT_EPS = 1e-9
+
+
 # ============================================================
 # dataclasses
 # ============================================================
@@ -42,17 +45,17 @@ class TonosamaExitConfig:
     # --------------------------------------------------------
     # 基本EXIT
     # --------------------------------------------------------
-    stop_loss_pct: float = -1.2
+    stop_loss_pct: float = -0.8
     first_take_profit_pct: float = 2.0
     second_take_profit_pct: float = 4.0
 
     # --------------------------------------------------------
     # 高値からの失速
     # current_price が high_after_entry から何%落ちたか
-    # 例: -1.0 = 高値から1%下落
+    # 例: -0.5 = 高値から0.5%下落
     # --------------------------------------------------------
-    trailing_drop_pct: float = -1.0
-    hard_trailing_drop_pct: float = -2.0
+    trailing_drop_pct: float = -0.5
+    hard_trailing_drop_pct: float = -0.5
 
     # 分割利確後は残玉を守るため、少し厳しめにトレールする
     after_first_tp_trailing_drop_pct: float = -0.80
@@ -80,8 +83,8 @@ class TonosamaExitConfig:
     use_5sec_exit: bool = True
 
     # 直近5秒足の下落率がこれ以下なら即逃げ候補
-    # 例: -0.60 = 直近5秒足で -0.60%
-    bar5s_hard_drop_pct: float = -0.60
+    # 例: -0.40 = 直近5秒足で -0.40%
+    bar5s_hard_drop_pct: float = -0.40
 
     # 5秒足の連続陰線数
     bar5s_consecutive_down_exit: int = 2
@@ -296,7 +299,7 @@ def _judge_5sec_exit(
     if _is_valid_number(bar5s_drop_pct):
         drop_pct = _to_float(bar5s_drop_pct)
 
-        if drop_pct <= config.bar5s_hard_drop_pct:
+        if drop_pct <= config.bar5s_hard_drop_pct + PCT_EPS:
             return _exit_all(
                 reason=(
                     f"5sec_hard_drop "
@@ -329,7 +332,7 @@ def _judge_5sec_exit(
         config.bar5s_vwap_break_exit
         and vwap_break is True
         and consecutive_down >= config.bar5s_consecutive_down_exit
-        and pnl_pct <= config.bar5s_vwap_break_exit_max_pnl_pct
+        and pnl_pct <= config.bar5s_vwap_break_exit_max_pnl_pct + PCT_EPS
     ):
         return _exit_all(
             reason=(
@@ -348,9 +351,9 @@ def _judge_5sec_exit(
     if (
         config.bar5s_volume_dryup_exit
         and _is_valid_number(bar5s_volume_ratio)
-        and _to_float(bar5s_volume_ratio) <= config.bar5s_volume_dryup_ratio
+        and _to_float(bar5s_volume_ratio) <= config.bar5s_volume_dryup_ratio + PCT_EPS
         and consecutive_down >= config.bar5s_consecutive_down_exit
-        and pnl_pct <= config.bar5s_volume_dryup_exit_max_pnl_pct
+        and pnl_pct <= config.bar5s_volume_dryup_exit_max_pnl_pct + PCT_EPS
     ):
         volume_ratio = _to_float(bar5s_volume_ratio)
 
@@ -382,7 +385,7 @@ def _judge_5sec_exit(
         base_high = _to_float(high_after_entry)
 
     allow_drop_from_high = (
-        pnl_pct >= config.bar5s_drop_from_high_min_pnl_pct
+        pnl_pct + PCT_EPS >= config.bar5s_drop_from_high_min_pnl_pct
         or already_first_tp
         or already_second_tp
     )
@@ -390,7 +393,7 @@ def _judge_5sec_exit(
     if base_high and base_high > 0 and allow_drop_from_high:
         drop_from_high_pct = calc_pct(current_price, base_high)
 
-        if drop_from_high_pct <= config.bar5s_drop_from_high_exit_pct:
+        if drop_from_high_pct <= config.bar5s_drop_from_high_exit_pct + PCT_EPS:
             return _exit_all(
                 reason=(
                     f"5sec_drop_from_high "
@@ -448,8 +451,8 @@ def judge_tonosama_exit(
       3. 最低保有秒数ガード
       4. VWAP割れ
       5. ランキング脱落
-      6. 高値からの失速
-      7. 分割利確
+      6. 高値からの失速（-0.5%強制EXIT、利益時トレール）
+      7. 分割利確（+4%で50%、+2%で30%）
       8. HOLD
 
     5秒足について:
@@ -502,9 +505,9 @@ def judge_tonosama_exit(
 
     # --------------------------------------------------------
     # 1. 損切り
-    # 最優先。最低保有秒数を無視して即時EXIT。
+    # 最優先。pnl_pct <= -0.8% は最低保有秒数を無視して即時EXIT。
     # --------------------------------------------------------
-    if pnl_pct <= config.stop_loss_pct:
+    if pnl_pct <= config.stop_loss_pct + PCT_EPS:
         return _exit_all(
             reason=f"stop_loss pnl={pnl_pct:.2f}%",
             pnl_pct=pnl_pct,
@@ -581,7 +584,7 @@ def judge_tonosama_exit(
 
         if (
             lost_min >= config.ranking_lost_exit_minutes
-            and pnl_pct <= config.ranking_lost_exit_max_pnl_pct
+            and pnl_pct <= config.ranking_lost_exit_max_pnl_pct + PCT_EPS
         ):
             return _exit_all(
                 reason=(
@@ -600,7 +603,8 @@ def judge_tonosama_exit(
         high_f = _to_float(high_after_entry)
         drop_from_high_pct = calc_pct(current_price, high_f)
 
-        if drop_from_high_pct <= config.hard_trailing_drop_pct:
+        # 高値からの失速は -0.5% 下落で強制 EXIT_ALL。
+        if drop_from_high_pct <= config.hard_trailing_drop_pct + PCT_EPS:
             return _exit_all(
                 reason=(
                     f"hard_trailing_drop "
@@ -625,7 +629,7 @@ def judge_tonosama_exit(
                 config.after_first_tp_trailing_drop_pct,
             )
 
-        if pnl_pct > 1.0 and drop_from_high_pct <= trailing_threshold:
+        if pnl_pct > 1.0 and drop_from_high_pct <= trailing_threshold + PCT_EPS:
             return _exit_all(
                 reason=(
                     f"trailing_drop "
@@ -642,7 +646,7 @@ def judge_tonosama_exit(
     # --------------------------------------------------------
     # 7. 分割利確
     # --------------------------------------------------------
-    if not already_second_tp and pnl_pct >= config.second_take_profit_pct:
+    if not already_second_tp and pnl_pct + PCT_EPS >= config.second_take_profit_pct:
         return _take_profit(
             action="TAKE_PROFIT_50",
             sell_ratio=0.5,
@@ -650,7 +654,7 @@ def judge_tonosama_exit(
             pnl_pct=pnl_pct,
         )
 
-    if not already_first_tp and pnl_pct >= config.first_take_profit_pct:
+    if not already_first_tp and pnl_pct + PCT_EPS >= config.first_take_profit_pct:
         return _take_profit(
             action="TAKE_PROFIT_30",
             sell_ratio=0.3,

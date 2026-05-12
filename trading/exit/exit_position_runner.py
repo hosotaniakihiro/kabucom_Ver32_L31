@@ -24,15 +24,124 @@ import logging
 from typing import Any, Dict, Optional, Tuple
 
 from core.global_context.context import global_context as GC
+from global_state import global_data
 from trading.exit.ai_exit_runner import apply_ai_exit_if_needed
 from trading.exit.exit_features import build_exit_features_safe, inject_daily_features_safe
 from trading.exit.exit_finalize import finalize_exit
+from trading.exit.exit_context import ExitContext
 from trading.exit.exit_price_source import get_latest_exit_price
 from trading.exit.exit_state_machine import manage_exit
 from trading.exit.exit_utils import safe_float
 from trading.exit.tonosama_exit_runner import apply_tonosama_exit_if_needed
 
 logger = logging.getLogger(__name__)
+
+
+def _pos_get(pos: Dict[str, Any], *names: str, default: Any = None) -> Any:
+    for name in names:
+        try:
+            if isinstance(pos, dict) and name in pos:
+                return pos.get(name)
+            if hasattr(pos, name):
+                return getattr(pos, name)
+        except Exception:
+            continue
+    return default
+
+
+def _normalize_side(side: Any) -> str:
+    s = str(side or "").upper().strip()
+    if s in {"BUY", "BUY_CREDIT", "LONG"}:
+        return "BUY"
+    if s in {"SELL", "SELL_CREDIT", "SHORT"}:
+        return "SELL"
+    return s
+
+
+def _fallback_entry_time(pos: Dict[str, Any], now: dt.datetime) -> dt.datetime:
+    raw = _pos_get(pos, "entry_time", "created_at", "timestamp", default=None)
+    if isinstance(raw, dt.datetime):
+        try:
+            if raw.tzinfo is not None:
+                return raw.replace(tzinfo=None)
+        except Exception:
+            pass
+        return raw
+
+    try:
+        s = str(raw or "").strip()
+        if not s:
+            return now
+        # ISO 文字列 / pandas Timestamp 文字列の最低限互換。
+        s = s.replace("T", " ").split("+", 1)[0]
+        if s.endswith("Z"):
+            s = s[:-1]
+        return dt.datetime.fromisoformat(s)
+    except Exception:
+        return now
+
+
+def _resolve_exit_ctx(symbol: str, pos: Dict[str, Any], *, side: str, entry_price: float, now: dt.datetime) -> Any:
+    """
+    EXITが発火しない最大要因を避けるためのctx解決。
+
+    優先:
+      1. GC.ai の ExitContext
+      2. legacy global_state.global_data.exit_ctx
+      3. open position snapshot から最小 ExitContext を生成して GC.ai に保存
+    """
+    ctx = None
+
+    try:
+        if hasattr(GC, "ai") and GC.ai and hasattr(GC.ai, "get_exit_ctx"):
+            ctx = GC.ai.get_exit_ctx(symbol)
+            if ctx is not None:
+                return ctx
+    except Exception:
+        logger.debug("[EXIT] GC.ai ctx lookup failed symbol=%s", symbol, exc_info=True)
+
+    try:
+        legacy = getattr(global_data, "exit_ctx", None)
+        if isinstance(legacy, dict):
+            ctx = legacy.get(symbol)
+            if ctx is not None:
+                try:
+                    if hasattr(GC, "ai") and GC.ai and hasattr(GC.ai, "set_exit_ctx"):
+                        GC.ai.set_exit_ctx(symbol, ctx)
+                except Exception:
+                    pass
+                return ctx
+    except Exception:
+        logger.debug("[EXIT] legacy ctx lookup failed symbol=%s", symbol, exc_info=True)
+
+    atr = safe_float(_pos_get(pos, "atr_1min", "atr", default=0.0), 0.0)
+    entry_time = _fallback_entry_time(pos, now)
+
+    try:
+        ctx = ExitContext(
+            symbol=str(symbol),
+            side=side,
+            entry_price=float(entry_price),
+            atr_1min=max(float(atr), 0.0),
+            entry_time=entry_time,
+        )
+        try:
+            if hasattr(GC, "ai") and GC.ai and hasattr(GC.ai, "set_exit_ctx"):
+                GC.ai.set_exit_ctx(symbol, ctx)
+        except Exception:
+            pass
+        logger.warning(
+            "[EXIT] fallback ExitContext created symbol=%s side=%s entry=%.4f atr=%.4f entry_time=%s",
+            symbol,
+            side,
+            entry_price,
+            atr,
+            entry_time,
+        )
+        return ctx
+    except Exception:
+        logger.exception("[EXIT] fallback ExitContext create failed symbol=%s", symbol)
+        return None
 
 
 def evaluate_collapse(symbol: str, regime: int, features: Dict[str, Any], side: str) -> Tuple[float, int, Optional[str]]:
@@ -131,25 +240,35 @@ def run_exit_for_position(
     """
 
     try:
-        entry_price = safe_float(pos.get("avg_price"))
-        side = pos.get("side")
+        entry_price = safe_float(_pos_get(pos, "avg_price", "entry_price"))
+        side = _normalize_side(_pos_get(pos, "side"))
 
         if not entry_price:
+            logger.debug("[EXIT] skip no entry_price symbol=%s pos=%s", symbol, pos)
+            return False
+
+        if side not in ("BUY", "SELL"):
+            logger.debug("[EXIT] skip invalid side symbol=%s side=%s", symbol, side)
             return False
 
         price, bar5s = get_latest_exit_price(symbol)
         if not price:
+            logger.debug("[EXIT] skip no latest price symbol=%s", symbol)
             return False
 
-        pnl = price - entry_price if str(side).upper() == "BUY" else entry_price - price
+        pnl = price - entry_price if side == "BUY" else entry_price - price
         pnl = safe_float(pnl)
 
-        if not hasattr(GC, "ai") or not GC.ai:
+        ctx = _resolve_exit_ctx(symbol, pos, side=side, entry_price=entry_price, now=now)
+        if not ctx:
+            logger.warning("[EXIT] skip ctx unavailable symbol=%s side=%s entry=%.4f", symbol, side, entry_price)
             return False
 
-        ctx = GC.ai.get_exit_ctx(symbol)
-        if not ctx:
-            return False
+        try:
+            if hasattr(ctx, "update_price"):
+                ctx.update_price(float(price))
+        except Exception:
+            logger.debug("[EXIT] ctx.update_price failed symbol=%s price=%s", symbol, price, exc_info=True)
 
         features = build_exit_features_safe(ctx, price, pnl)
         features = inject_daily_features_safe(symbol, features)
