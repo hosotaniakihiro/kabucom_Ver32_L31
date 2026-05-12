@@ -1,25 +1,14 @@
 # ============================================================
 # File   : trading/push/push_stream/runner.py
-# Version: Ver1.5-PRODUCTION-PUSH-STREAM-RUNNER-MEMORY-ONLY-MODE
+# Version: Ver1.6-PRODUCTION-PUSH-STREAM-RUNNER-REFRESH-IN-MEMORY-ONLY
 # ------------------------------------------------------------
 # 【概要】
 #   kabu Station PUSH WebSocket runner
 #
-# 【主な機能】
-#   - WebSocketApp 起動 / reconnect loop
-#   - on_open / on_message / on_error / on_close callback 接続
-#   - PUSH queue flush worker 起動
-#   - monitor worker 起動
-#   - rotation_core worker 起動
-#   - stream writer / order book writer 初期化
-#   - runtime flags / status 管理
-#
-# REV1.5:
-#   ✔ main_database.py と main.py を併用するための memory_only mode 追加
-#   ✔ stream_writer=False または PUSH_STREAM_DB_WRITE=0 でDB保存workerを起動しない
-#   ✔ order_book_writer=False または PUSH_STREAM_ORDER_BOOK_WRITE=0 で板DB writerを起動しない
-#   ✔ enable_rotate=False でmain.py側の銘柄登録ローテーションを止める
-#   ✔ WebSocket受信・df更新・latest_price_cache更新は継続
+# 【REV1.6】
+#   ✔ enable_rotate=False の memory-only mode でも refresh_callable を設定する
+#   ✔ rotation worker OFF でも WebSocket on_open 後の登録refreshを可能にする
+#   ✔ 保有銘柄 protected が登録対象に入っても kabuステーションへ送信されない問題を修正
 # ============================================================
 
 from __future__ import annotations
@@ -56,7 +45,7 @@ from .constants import RECONNECT_WAIT_SEC
 
 logger = logging.getLogger(__name__)
 
-VERSION = "Ver1.5-PRODUCTION-PUSH-STREAM-RUNNER-MEMORY-ONLY-MODE"
+VERSION = "Ver1.6-PRODUCTION-PUSH-STREAM-RUNNER-REFRESH-IN-MEMORY-ONLY"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -73,10 +62,6 @@ def _env_bool(name: str, default: bool) -> bool:
     except Exception:
         return bool(default)
 
-
-# ============================================================
-# internal helpers
-# ============================================================
 
 def _get_existing_refresh_callable() -> Any:
     try:
@@ -143,8 +128,7 @@ def _auto_resolve_subscription_refresh_callable() -> Optional[Callable[..., Any]
         return fn
 
     logger.warning(
-        "[push_stream] auto resolve refresh_callable failed: "
-        "subscription_manager refresh/register function not found"
+        "[push_stream] auto resolve refresh_callable failed: subscription_manager refresh/register function not found"
     )
     return None
 
@@ -166,7 +150,6 @@ def _set_refresh_callable_preserve(refresh_callable: Optional[Any]) -> bool:
                 set_refresh_callable(auto_fn)
                 installed = _get_existing_refresh_callable()
                 ok = callable(installed)
-
                 logger.info(
                     "[push_stream] refresh_callable auto-installed ok=%s fn=%s",
                     ok,
@@ -199,7 +182,6 @@ def _set_refresh_callable_preserve(refresh_callable: Optional[Any]) -> bool:
         set_refresh_callable(refresh_callable)
         installed = _get_existing_refresh_callable()
         ok = callable(installed)
-
         logger.info(
             "[push_stream] refresh_callable installed by runner ok=%s fn=%s",
             ok,
@@ -250,10 +232,6 @@ def _sync_runtime_status_after_start() -> None:
     except Exception:
         logger.debug("[push_stream] sync runtime status failed", exc_info=True)
 
-
-# ============================================================
-# websocket loop
-# ============================================================
 
 def _run_forever_loop() -> None:
     _safe_set_runtime("push_stream_running", True)
@@ -306,10 +284,6 @@ def _run_forever_loop() -> None:
     logger.info("[push_stream] run loop stopped")
 
 
-# ============================================================
-# public runner api
-# ============================================================
-
 def start_push_stream(
     ws_url: Optional[str] = None,
     stream_writer: Any = None,
@@ -352,7 +326,10 @@ def start_push_stream(
             _safe_set_runtime("push_stream_order_book_write_enabled", False)
             logger.warning("[push_stream] order book DB write disabled")
 
-        refresh_alive = _set_refresh_callable_preserve(refresh_callable) if enable_rotate is not False else False
+        # 重要:
+        # refresh_callable は rotation worker とは別物。
+        # enable_rotate=False でも on_open 後の一括登録には refresh_callable が必要。
+        refresh_alive = _set_refresh_callable_preserve(refresh_callable)
         rotation_enabled = _set_rotation_preserve(enable_rotate)
 
         logger.info(
