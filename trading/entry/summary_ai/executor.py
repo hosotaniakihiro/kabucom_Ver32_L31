@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/summary_ai/executor.py
-# Version: PRODUCTION-STABLE-REV1.4-BUY-FIRST-SAFE-SELECTION
+# Version: PRODUCTION-STABLE-REV1.5-BUY-FIRST-EXECUTED-ACCURATE
 # ------------------------------------------------------------
 # 【概要】
 #   AI_OK 銘柄を approved_rows に変換し、
@@ -21,6 +21,7 @@
 #   - BUY候補が存在する場合は最大3件までBUYを優先採用する
 #   - trade_restricted / SELL reject cache 済み銘柄は選抜前に除外する
 #   - 制限中の候補で枠を消費せず、次の候補を採用する
+#   - entry_pipeline の戻り値が None の場合は executed=False にする
 # ============================================================
 
 from __future__ import annotations
@@ -287,6 +288,55 @@ def _select_ai_ok_items(ok_items: List[Dict[str, Any]], *, max_entries: int) -> 
     return selected
 
 
+def _is_positive_order_result(result: Any) -> bool:
+    """
+    entry_pipeline の戻り値から「実際に注文系処理が成功した」と判断する。
+
+    重要:
+      - result is None は成功扱いにしない
+      - boolだけ返る場合はその値を使う
+      - dictの場合は order_id / orders / executed などを見る
+      - list/tupleの場合は中身があれば成功候補とする
+    """
+    try:
+        if result is None:
+            return False
+
+        if isinstance(result, bool):
+            return result
+
+        if isinstance(result, dict):
+            for key in (
+                "executed",
+                "order_sent",
+                "order_submitted",
+                "success",
+                "approved",
+                "entry_executed",
+            ):
+                if bool(result.get(key)):
+                    return True
+
+            for key in ("order_id", "OrderId", "orders", "order_ids", "sent_orders"):
+                v = result.get(key)
+                if isinstance(v, (list, tuple, set, dict)):
+                    if len(v) > 0:
+                        return True
+                elif v:
+                    return True
+
+            return False
+
+        if isinstance(result, (list, tuple, set)):
+            return len(result) > 0
+
+        return bool(result)
+
+    except Exception:
+        logger.exception("[SUMMARY AI EXECUTOR] result judgement failed result=%s", result)
+        return False
+
+
 def build_approved_row(ai_ok_item: Dict[str, Any]) -> Dict[str, Any]:
     """
     entry_pipeline.py に渡す approved row を作る。
@@ -474,18 +524,28 @@ def execute_ai_ok_entries_bulk(
             interval,
         )
 
+        entry_executed = _is_positive_order_result(result)
+
         logger.info(
-            "[SUMMARY AI EXECUTOR] REAL bulk entry done approved=%s result=%s",
+            "[SUMMARY AI EXECUTOR] REAL bulk entry done approved=%s executed=%s result=%s",
             len(approved_rows),
+            entry_executed,
             result,
         )
 
+        if not entry_executed:
+            logger.warning(
+                "[SUMMARY AI EXECUTOR] REAL bulk entry finished but no order confirmed approved=%s result=%s",
+                len(approved_rows),
+                result,
+            )
+
         return {
-            "executed": True,
+            "executed": entry_executed,
             "dry_run": False,
             "approved_rows": approved_rows,
             "result": result,
-            "skip_reason": None,
+            "skip_reason": None if entry_executed else "entry_pipeline_no_order",
         }
 
     except Exception:
