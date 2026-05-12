@@ -1,15 +1,15 @@
 # ============================================================
 # File   : trading/exit/exit_utils.py
-# Version: V1.0-SPLIT-EXIT-UTILS
+# Version: V1.1-SPLIT-EXIT-UTILS-GC-GLOBALDATA-MERGE
 # ------------------------------------------------------------
 # 【概要】
 #   EXIT系共通ユーティリティ。
 #
-# 【役割】
-#   - 安全な float / int / bool / str 変換
-#   - dict / attr からの安全取得
-#   - open position snapshot
-#   - holding_seconds 取得
+# 【今回の重要修正】
+#   - EXITが発火しない原因になりやすい position 参照ズレを吸収
+#   - GC.positions だけでなく global_data.open_positions も見る
+#   - どちらか片方にしか保有が無い場合でも exit_loop が回る
+#   - symbol を str に正規化してマージする
 # ============================================================
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import math
 from typing import Any, Dict, Optional
 
 from core.global_context.context import global_context as GC
+from global_state import global_data
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,18 @@ def safe_str(v: Any, default: str = "") -> str:
         return default
 
 
+def normalize_symbol(v: Any) -> str:
+    try:
+        if v is None:
+            return ""
+        s = str(v).strip()
+        if s.endswith(".0"):
+            s = s[:-2]
+        return s
+    except Exception:
+        return ""
+
+
 def dict_get_any(d: Any, *names: str, default: Any = None) -> Any:
     if not isinstance(d, dict):
         return default
@@ -123,6 +136,16 @@ def dict_get_any(d: Any, *names: str, default: Any = None) -> Any:
                 return d.get(name)
         except Exception:
             pass
+
+    # 大文字小文字差異を吸収
+    try:
+        lower_map = {str(k).lower(): k for k in d.keys()}
+        for name in names:
+            real_key = lower_map.get(str(name).lower())
+            if real_key is not None:
+                return d.get(real_key)
+    except Exception:
+        pass
 
     return default
 
@@ -141,24 +164,119 @@ def attr_get_any(obj: Any, *names: str, default: Any = None) -> Any:
     return default
 
 
-def get_open_positions_safe() -> Dict[str, Dict[str, Any]]:
+def _position_to_dict(pos: Any) -> Dict[str, Any]:
+    if pos is None:
+        return {}
+    if isinstance(pos, dict):
+        return dict(pos)
+
+    out: Dict[str, Any] = {}
+    for name in [
+        "symbol", "side", "qty", "quantity", "avg_price", "entry_price",
+        "entry_time", "created_at", "status", "atr", "atr_1min",
+        "order_id", "entry_order_id", "ranking_lost_minutes",
+        "tonosama_first_tp_done", "tonosama_second_tp_done",
+    ]:
+        try:
+            if hasattr(pos, name):
+                out[name] = getattr(pos, name)
+        except Exception:
+            pass
+    return out
+
+
+def _merge_position_map(dst: Dict[str, Dict[str, Any]], src: Any, *, source: str) -> None:
+    if not isinstance(src, dict):
+        return
+
+    for key, value in list(src.items()):
+        try:
+            pos = _position_to_dict(value)
+            symbol = normalize_symbol(
+                pos.get("symbol")
+                or pos.get("Symbol")
+                or key
+            )
+            if not symbol:
+                continue
+
+            status = str(pos.get("status") or "OPEN").upper()
+            if status in {"CLOSED", "DONE", "CANCELLED", "CANCELED"}:
+                continue
+
+            pos.setdefault("symbol", symbol)
+            pos.setdefault("_position_source", source)
+
+            # 既存がある場合は値が多い方を優先しつつ、後勝ちで欠損を補完
+            if symbol in dst:
+                merged = dict(dst[symbol])
+                for k, v in pos.items():
+                    if v is not None and v != "":
+                        merged[k] = v
+                dst[symbol] = merged
+            else:
+                dst[symbol] = pos
+
+        except Exception:
+            logger.debug("[EXIT POS MERGE] skip key=%s source=%s", key, source, exc_info=True)
+
+
+def _snapshot_gc_positions() -> Dict[str, Any]:
     try:
-        if not hasattr(GC, "positions") or GC.positions is None:
+        positions_obj = getattr(GC, "positions", None)
+        if positions_obj is None:
             return {}
 
-        if hasattr(GC.positions, "snapshot_open"):
-            return GC.positions.snapshot_open() or {}
+        for method_name in ["snapshot_open", "snapshot_dict", "get_open_positions", "to_dict"]:
+            try:
+                fn = getattr(positions_obj, method_name, None)
+                if callable(fn):
+                    ret = fn() or {}
+                    if isinstance(ret, dict) and ret:
+                        return ret
+            except Exception:
+                logger.debug("[EXIT POS] GC.positions.%s failed", method_name, exc_info=True)
 
-        if hasattr(GC.positions, "snapshot_dict"):
-            return GC.positions.snapshot_dict() or {}
-
-        if hasattr(GC.positions, "open_positions"):
-            return dict(GC.positions.open_positions or {})
+        for attr in ["open_positions", "positions"]:
+            try:
+                ret = getattr(positions_obj, attr, None)
+                if isinstance(ret, dict) and ret:
+                    return dict(ret)
+            except Exception:
+                pass
 
     except Exception:
-        logger.exception("[POSITION_SNAPSHOT_ERROR]")
+        logger.exception("[POSITION_SNAPSHOT_ERROR] GC.positions")
 
     return {}
+
+
+def get_open_positions_safe() -> Dict[str, Dict[str, Any]]:
+    """
+    EXIT監視対象の open positions を安全に取得する。
+
+    重要:
+      exit_loop はこの戻り値が空だと何も判定しない。
+      エントリー側が GC.positions と global_data.open_positions の
+      片方にしか保存していないケースを救済するため、両方をマージする。
+    """
+    merged: Dict[str, Dict[str, Any]] = {}
+
+    try:
+        _merge_position_map(merged, _snapshot_gc_positions(), source="GC.positions")
+    except Exception:
+        logger.exception("[POSITION_SNAPSHOT_ERROR] merge GC.positions")
+
+    try:
+        gd_pos = getattr(global_data, "open_positions", None)
+        _merge_position_map(merged, gd_pos, source="global_data.open_positions")
+    except Exception:
+        logger.exception("[POSITION_SNAPSHOT_ERROR] merge global_data.open_positions")
+
+    if not merged:
+        logger.debug("[EXIT LOOP] no open positions from GC.positions/global_data.open_positions")
+
+    return merged
 
 
 def get_holding_seconds_safe(ctx: Any, now: dt.datetime) -> int:
@@ -309,6 +427,7 @@ __all__ = [
     "safe_bool",
     "safe_bool_or_none",
     "safe_str",
+    "normalize_symbol",
     "dict_get_any",
     "attr_get_any",
     "get_open_positions_safe",
