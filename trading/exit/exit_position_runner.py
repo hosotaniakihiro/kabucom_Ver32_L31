@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/exit/exit_position_runner.py
-# Version: V1.0-SPLIT-POSITION-RUNNER
+# Version: V1.1-SPLIT-POSITION-RUNNER-EARLY-PROFIT-GUARD
 # ------------------------------------------------------------
 # 【概要】
 #   1銘柄分のEXIT判定を担当。
@@ -8,13 +8,14 @@
 # 【判定順序】
 #   1. 価格取得
 #   2. ctx / features 構築
-#   3. collapse / inago
-#   4. 殿様イナゴEXIT
-#   5. collapse full exit
-#   6. AI EXIT
-#   7. boost guard
-#   8. RL
-#   9. manage_exit
+#   3. エントリー直後の建値撤退/早期利確/早期損切り
+#   4. collapse / inago
+#   5. 殿様イナゴEXIT
+#   6. collapse full exit
+#   7. AI EXIT
+#   8. boost guard
+#   9. RL
+#   10. manage_exit
 # ============================================================
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from typing import Any, Dict, Optional, Tuple
 from core.global_context.context import global_context as GC
 from global_state import global_data
 from trading.exit.ai_exit_runner import apply_ai_exit_if_needed
+from trading.exit.early_profit_guard import judge_early_profit_guard
 from trading.exit.exit_features import build_exit_features_safe, inject_daily_features_safe
 from trading.exit.exit_finalize import finalize_exit
 from trading.exit.exit_context import ExitContext
@@ -72,7 +74,6 @@ def _fallback_entry_time(pos: Dict[str, Any], now: dt.datetime) -> dt.datetime:
         s = str(raw or "").strip()
         if not s:
             return now
-        # ISO 文字列 / pandas Timestamp 文字列の最低限互換。
         s = s.replace("T", " ").split("+", 1)[0]
         if s.endswith("Z"):
             s = s[:-1]
@@ -277,6 +278,34 @@ def run_exit_for_position(
             cluster_id = GC.positions.get_cluster(symbol) or 0
         except Exception:
             cluster_id = 0
+
+        # ====================================================
+        # 0. EARLY PROFIT / BREAKEVEN GUARD
+        #    エントリー直後に一瞬プラスからマイナス化する問題を抑えるため、
+        #    TONOSAMA / AI / 通常EXITより前に判定する。
+        # ====================================================
+        early_exit, early_reason = judge_early_profit_guard(
+            symbol=symbol,
+            pos=pos,
+            side=side,
+            entry_price=entry_price,
+            current_price=price,
+            ctx=ctx,
+            now=now,
+        )
+        if early_exit:
+            finalize_exit(
+                symbol=symbol,
+                price=price,
+                reason=early_reason,
+                cluster_id=cluster_id,
+                regime=regime,
+                inago_state=0,
+                pnl=pnl,
+                collapse_prob=0.0,
+                ctx=ctx,
+            )
+            return True
 
         collapse_prob, inago_state, full_reason = evaluate_collapse(
             symbol,
