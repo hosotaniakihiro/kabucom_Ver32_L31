@@ -1,12 +1,12 @@
 # ============================================================
 # File   : trading/summary/pipeline/entry_pipeline.py
-# Version: Ver2.5-PRODUCTION-PRE-PENDING-SELL-CREDIT-GUARD
+# Version: Ver2.6-PRODUCTION-DB-POSITION-SYNC
 # ------------------------------------------------------------
 # ✔ AI approved rows → entry execution
 # ✔ DataFrame / list / dict / Series 両対応
 # ✔ 重複エントリー防止
 # ✔ positionチェック
-# ✔ positionチェック dict/list/DataFrame/Series 互換
+# ✔ DB positions(status=OPEN) も position_skip 対象にする
 # ✔ global_data.get_positions 不在でも落とさない fallback
 # ✔ blowoff top filter
 # ✔ run_summary_entry_executor 呼び出し
@@ -38,65 +38,44 @@ from AI.sell_credit_guard import can_sell_symbol
 
 logger = logging.getLogger(__name__)
 
-
 DEFAULT_SOURCE = "SUMMARY"
 
-
-# ============================================================
-# normalize rows
-# ============================================================
 
 def _normalize_rows(rows: Any) -> List[Any]:
     try:
         if rows is None:
             return []
-
         if isinstance(rows, pd.DataFrame):
             if rows.empty:
                 return []
             return [r for _, r in rows.iterrows()]
-
         if isinstance(rows, pd.Series):
             return [rows]
-
         if isinstance(rows, list):
             return rows
-
         if isinstance(rows, tuple):
             return list(rows)
-
         if isinstance(rows, dict):
             return [rows]
-
         return []
-
     except Exception:
         logger.exception("[entry_pipeline] normalize rows failed")
         return []
 
 
-# ============================================================
-# row helper
-# ============================================================
-
 def _row_to_dict(row: Any) -> dict:
     try:
         if row is None:
             return {}
-
         if isinstance(row, dict):
             return dict(row)
-
         if isinstance(row, pd.Series):
             return row.to_dict()
-
         if hasattr(row, "to_dict"):
             v = row.to_dict()
             if isinstance(v, dict):
                 return dict(v)
-
         return {}
-
     except Exception:
         logger.exception("[entry_pipeline] row_to_dict failed")
         return {}
@@ -169,15 +148,9 @@ def _norm_side(v: Any) -> str:
 
 
 def _resolve_side(row: dict, *, buy_score: float, sell_score: float, raw_score: float) -> str:
-    side = _norm_side(
-        row.get("side")
-        or row.get("entry_decision")
-        or row.get("ai_side")
-        or row.get("decision")
-    )
+    side = _norm_side(row.get("side") or row.get("entry_decision") or row.get("ai_side") or row.get("decision"))
     if side:
         return side
-
     if sell_score > buy_score and sell_score > 0:
         return "SELL"
     if buy_score > sell_score and buy_score > 0:
@@ -197,44 +170,18 @@ def _resolve_side_from_row(row: dict) -> str:
 
 
 def _resolve_summary_liquidity_min_score(row: dict, *, side: str) -> float:
-    """
-    SUMMARY AI の最終 executor 直前フィルタ用 min_score。
-
-    AI.entry_gate では SUMMARY SELL の既定 minScore を 1.0 にしている。
-    ここが従来どおり 3.0 固定だと、AI_OK 後に
-    [entry_pipeline] summary liquidity deny ... score=1.000 min_score=3.00
-    で全落ちするため、BUY / SELL で閾値を分ける。
-
-    優先順位:
-      1. SUMMARY_ENTRY_MIN_LIQUIDITY_SCORE_BUY / SELL
-      2. SUMMARY_ENTRY_MIN_SCORE_BUY / SELL
-      3. 従来の SUMMARY_ENTRY_MIN_LIQUIDITY_SCORE
-      4. 既定 BUY=3.0 / SELL=1.0
-    """
     if side == "SELL":
         return _env_float(
             "SUMMARY_ENTRY_MIN_LIQUIDITY_SCORE_SELL",
-            _env_float(
-                "SUMMARY_ENTRY_MIN_SCORE_SELL",
-                _env_float("MIN_ENTRY_SCORE_SELL_SUMMARY", 1.0),
-            ),
+            _env_float("SUMMARY_ENTRY_MIN_SCORE_SELL", _env_float("MIN_ENTRY_SCORE_SELL_SUMMARY", 1.0)),
         )
-
     if side == "BUY":
         return _env_float(
             "SUMMARY_ENTRY_MIN_LIQUIDITY_SCORE_BUY",
-            _env_float(
-                "SUMMARY_ENTRY_MIN_SCORE_BUY",
-                _env_float("SUMMARY_ENTRY_MIN_LIQUIDITY_SCORE", 3.0),
-            ),
+            _env_float("SUMMARY_ENTRY_MIN_SCORE_BUY", _env_float("SUMMARY_ENTRY_MIN_LIQUIDITY_SCORE", 3.0)),
         )
-
     return _env_float("SUMMARY_ENTRY_MIN_LIQUIDITY_SCORE", 3.0)
 
-
-# ============================================================
-# safe symbol
-# ============================================================
 
 def _normalize_symbol(value: Any) -> str:
     try:
@@ -258,18 +205,12 @@ def _get_symbol(row: Any) -> str:
         return ""
 
 
-# ============================================================
-# duplicate / position check
-# ============================================================
-
 def _extract_position_symbol(position: Any) -> str:
     try:
         if position is None:
             return ""
-
         if isinstance(position, pd.Series):
             position = position.to_dict()
-
         if isinstance(position, dict):
             for key in ("symbol", "Symbol", "銘柄コード", "code", "stock_code", "StockCode"):
                 if key in position:
@@ -277,9 +218,7 @@ def _extract_position_symbol(position: Any) -> str:
                     if sym:
                         return sym
             return ""
-
         return _normalize_symbol(position)
-
     except Exception:
         return ""
 
@@ -288,11 +227,9 @@ def _positions_contains_symbol(positions: Any, symbol: str) -> bool:
     target = _normalize_symbol(symbol)
     if not target:
         return False
-
     try:
         if positions is None:
             return False
-
         if isinstance(positions, pd.DataFrame):
             if positions.empty:
                 return False
@@ -301,30 +238,23 @@ def _positions_contains_symbol(positions: Any, symbol: str) -> bool:
                     s = positions[col].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
                     return bool((s == target).any())
             return False
-
         if isinstance(positions, pd.Series):
             return _extract_position_symbol(positions) == target
-
         if isinstance(positions, dict):
-            # {symbol: position} 形式
             if target in {_normalize_symbol(k) for k in positions.keys()}:
                 return True
-            # 1ポジションdict、または values に position dict が入る形式
             if _extract_position_symbol(positions) == target:
                 return True
             for v in positions.values():
                 if _extract_position_symbol(v) == target:
                     return True
             return False
-
         if isinstance(positions, (list, tuple, set)):
             for p in positions:
                 if _extract_position_symbol(p) == target:
                     return True
             return False
-
         return False
-
     except Exception:
         logger.exception("[entry_pipeline] positions contains check failed symbol=%s", symbol)
         return False
@@ -332,27 +262,28 @@ def _positions_contains_symbol(positions: Any, symbol: str) -> bool:
 
 def _already_in_position(symbol: str) -> bool:
     try:
-        positions_getter = getattr(global_data, "get_positions", None)
+        # 最優先: DB positions(status=OPEN) を同期して確認する。
+        # これにより、実建玉/DB建玉があるのにメモリが空で二重エントリーされる問題を防ぐ。
+        try:
+            from trading.position.open_position_sync import is_symbol_in_open_position
+            if is_symbol_in_open_position(symbol, sync=True):
+                logger.info("[entry_pipeline] position found by DB sync symbol=%s", symbol)
+                return True
+        except Exception:
+            logger.debug("[entry_pipeline] DB position sync check failed symbol=%s", symbol, exc_info=True)
 
+        positions_getter = getattr(global_data, "get_positions", None)
         if callable(positions_getter):
             positions = positions_getter()
         else:
-            logger.warning(
-                "[entry_pipeline] global_data.get_positions not found; fallback open_positions symbol=%s",
-                symbol,
-            )
+            logger.warning("[entry_pipeline] global_data.get_positions not found; fallback open_positions symbol=%s", symbol)
             positions = getattr(global_data, "open_positions", None)
 
         return _positions_contains_symbol(positions, symbol)
-
     except Exception:
         logger.exception("[entry_pipeline] position check failed symbol=%s", symbol)
         return False
 
-
-# ============================================================
-# liquidity / credit filters
-# ============================================================
 
 def _is_inago_source(row: dict) -> bool:
     source = str(row.get("source") or "").upper()
@@ -388,40 +319,18 @@ def _allow_summary_ai_liquidity(row: dict, *, symbol: str, interval: int) -> boo
     min_turnover = _env_float("SUMMARY_ENTRY_MIN_TURNOVER", _env_float("ENTRY_MIN_TURNOVER", 3_000_000.0))
     min_score = _resolve_summary_liquidity_min_score(row, side=side)
 
-    ok = (
-        close > min_price
-        and volume >= min_volume
-        and turnover >= min_turnover
-        and effective_score >= min_score
-    )
+    ok = close > min_price and volume >= min_volume and turnover >= min_turnover and effective_score >= min_score
 
     if ok:
         logger.info(
             "[entry_pipeline] summary liquidity allow symbol=%s interval=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f min_score=%.2f",
-            symbol,
-            interval,
-            side,
-            close,
-            volume,
-            turnover,
-            effective_score,
-            min_score,
+            symbol, interval, side, close, volume, turnover, effective_score, min_score,
         )
         return True
 
     logger.info(
         "[entry_pipeline] summary liquidity deny symbol=%s interval=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f min_price=%.1f min_volume=%.0f min_turnover=%.0f min_score=%.2f",
-        symbol,
-        interval,
-        side,
-        close,
-        volume,
-        turnover,
-        effective_score,
-        min_price,
-        min_volume,
-        min_turnover,
-        min_score,
+        symbol, interval, side, close, volume, turnover, effective_score, min_price, min_volume, min_turnover, min_score,
     )
     return False
 
@@ -432,123 +341,65 @@ def _allow_entry_liquidity(row: dict, *, symbol: str, interval: int) -> bool:
         if not ok:
             logger.info("[entry_pipeline] inago liquidity deny symbol=%s interval=%s", symbol, interval)
         return ok
-
     return _allow_summary_ai_liquidity(row, symbol=symbol, interval=interval)
 
 
 def _allow_sell_credit_before_pending(row: dict, *, symbol: str, interval: int) -> bool:
-    """
-    SELL候補を pending に入れる前の信用売りガード。
-
-    entry_controller 側にも最終ガードは残すが、ここで落とすことで
-    short_ok=0 / sell_target=0 の銘柄が pending に残り続けることを防ぐ。
-    """
     side = _resolve_side_from_row(row)
     if side != "SELL":
         return True
-
     try:
         ok = bool(can_sell_symbol(symbol))
     except Exception:
-        logger.exception(
-            "[entry_pipeline] sell credit precheck failed symbol=%s interval=%s -> skip safe",
-            symbol,
-            interval,
-        )
+        logger.exception("[entry_pipeline] sell credit precheck failed symbol=%s interval=%s -> skip safe", symbol, interval)
         return False
-
     if ok:
-        logger.info(
-            "[entry_pipeline] sell credit allow symbol=%s interval=%s side=%s",
-            symbol,
-            interval,
-            side,
-        )
+        logger.info("[entry_pipeline] sell credit allow symbol=%s interval=%s side=%s", symbol, interval, side)
         return True
-
-    logger.info(
-        "[entry_pipeline] skip sell credit guard symbol=%s interval=%s side=%s reason=not_short_sellable_pre_pending",
-        symbol,
-        interval,
-        side,
-    )
+    logger.info("[entry_pipeline] skip sell credit guard symbol=%s interval=%s side=%s reason=not_short_sellable_pre_pending", symbol, interval, side)
     return False
 
 
-# ============================================================
-# blowoff filter
-# ============================================================
-
 def _filter_blowoff(rows: List[Any], df_summary: pd.DataFrame | None) -> List[Any]:
     try:
-        if df_summary is None:
+        if df_summary is None or not isinstance(df_summary, pd.DataFrame) or df_summary.empty:
             return rows
-
-        if not isinstance(df_summary, pd.DataFrame):
-            return rows
-
-        if df_summary.empty:
-            return rows
-
         tops = detect_blowoff_top(df_summary)
-
-        if tops is None or tops.empty:
+        if tops is None or tops.empty or "symbol" not in tops.columns:
             return rows
-
-        if "symbol" not in tops.columns:
-            return rows
-
         top_symbols = set(tops["symbol"].astype(str))
-
         filtered = []
-
         for r in rows:
             symbol = _get_symbol(r)
-
             if symbol in top_symbols:
-                logger.info(
-                    "[entry_pipeline] skip blowoff top symbol=%s",
-                    symbol,
-                )
+                logger.info("[entry_pipeline] skip blowoff top symbol=%s", symbol)
                 continue
-
             filtered.append(r)
-
         return filtered
-
     except Exception:
         logger.exception("[entry_pipeline] blowoff filter failed")
         return rows
 
 
-# ============================================================
-# dataframe build
-# ============================================================
-
 def _build_exec_dataframe(rows: List[Any], interval: int) -> pd.DataFrame:
     records: List[dict] = []
-
     try:
         for row in rows:
             d = _clean_nan_dict(_row_to_dict(row))
             if not d:
                 continue
-
             if not d.get("source"):
                 d["source"] = DEFAULT_SOURCE
-
             if _safe_interval(d.get("interval")) is None:
                 d["interval"] = interval
             else:
                 d["interval"] = _safe_interval(d.get("interval"))
-
             records.append(d)
 
         if not records:
             return pd.DataFrame()
 
         df_exec = pd.DataFrame(records)
-
         if "source" not in df_exec.columns:
             df_exec["source"] = DEFAULT_SOURCE
         else:
@@ -557,29 +408,21 @@ def _build_exec_dataframe(rows: List[Any], interval: int) -> pd.DataFrame:
         if "interval" not in df_exec.columns:
             df_exec["interval"] = interval
         else:
-            df_exec["interval"] = df_exec["interval"].apply(
-                lambda x: interval if _safe_interval(x) is None else _safe_interval(x)
-            )
+            df_exec["interval"] = df_exec["interval"].apply(lambda x: interval if _safe_interval(x) is None else _safe_interval(x))
 
         if "symbol" in df_exec.columns:
             df_exec["symbol"] = df_exec["symbol"].astype(str).str.replace(r"\.0$", "", regex=True)
 
         return df_exec
-
     except Exception:
         logger.exception("[entry_pipeline] build exec dataframe failed interval=%s", interval)
         return pd.DataFrame()
 
 
-# ============================================================
-# entry pipeline
-# ============================================================
-
 def run_entry_pipeline(approved_rows: Any, df_summary: pd.DataFrame | None, interval: int):
     try:
         interval = _safe_interval(interval) or interval
         rows = _normalize_rows(approved_rows)
-
         if not rows:
             logger.info("[entry_pipeline] no approved rows interval=%s", interval)
             return
@@ -589,22 +432,18 @@ def run_entry_pipeline(approved_rows: Any, df_summary: pd.DataFrame | None, inte
         skipped_liquidity = 0
         skipped_sell_credit = 0
         skipped_position = 0
-
         filtered: List[Any] = []
 
         for r in rows:
             symbol = _get_symbol(r)
-
             if not symbol:
                 skipped_no_symbol += 1
                 continue
 
             try:
                 row_dict = _clean_nan_dict(_row_to_dict(r))
-
                 if not row_dict.get("source"):
                     row_dict["source"] = DEFAULT_SOURCE
-
                 if _safe_interval(row_dict.get("interval")) is None:
                     row_dict["interval"] = interval
                 else:
@@ -612,18 +451,12 @@ def run_entry_pipeline(approved_rows: Any, df_summary: pd.DataFrame | None, inte
 
                 if not _allow_entry_liquidity(row_dict, symbol=symbol, interval=int(interval)):
                     skipped_liquidity += 1
-                    logger.info(
-                        "[entry_pipeline] skip liquidity symbol=%s interval=%s source=%s",
-                        symbol,
-                        interval,
-                        row_dict.get("source"),
-                    )
+                    logger.info("[entry_pipeline] skip liquidity symbol=%s interval=%s source=%s", symbol, interval, row_dict.get("source"))
                     continue
 
                 if not _allow_sell_credit_before_pending(row_dict, symbol=symbol, interval=int(interval)):
                     skipped_sell_credit += 1
                     continue
-
             except Exception:
                 logger.exception("[entry_pipeline] pre-entry filters failed symbol=%s", symbol)
                 skipped_liquidity += 1
@@ -631,11 +464,7 @@ def run_entry_pipeline(approved_rows: Any, df_summary: pd.DataFrame | None, inte
 
             if _already_in_position(symbol):
                 skipped_position += 1
-                logger.info(
-                    "[entry_pipeline] skip position symbol=%s interval=%s",
-                    symbol,
-                    interval,
-                )
+                logger.info("[entry_pipeline] skip position symbol=%s interval=%s", symbol, interval)
                 continue
 
             filtered.append(row_dict)
@@ -646,16 +475,8 @@ def run_entry_pipeline(approved_rows: Any, df_summary: pd.DataFrame | None, inte
         skipped_blowoff = before_blowoff - after_blowoff
 
         logger.info(
-            "[entry_pipeline] summary interval=%s approved=%s no_symbol=%s liquidity_skip=%s "
-            "sell_credit_skip=%s position_skip=%s blowoff_skip=%s executable=%s",
-            interval,
-            total_in,
-            skipped_no_symbol,
-            skipped_liquidity,
-            skipped_sell_credit,
-            skipped_position,
-            skipped_blowoff,
-            len(filtered),
+            "[entry_pipeline] summary interval=%s approved=%s no_symbol=%s liquidity_skip=%s sell_credit_skip=%s position_skip=%s blowoff_skip=%s executable=%s",
+            interval, total_in, skipped_no_symbol, skipped_liquidity, skipped_sell_credit, skipped_position, skipped_blowoff, len(filtered),
         )
 
         if not filtered:
@@ -663,7 +484,6 @@ def run_entry_pipeline(approved_rows: Any, df_summary: pd.DataFrame | None, inte
             return
 
         df_exec = _build_exec_dataframe(filtered, interval)
-
         if df_exec.empty:
             logger.info("[entry_pipeline] df_exec empty interval=%s", interval)
             return
@@ -676,12 +496,7 @@ def run_entry_pipeline(approved_rows: Any, df_summary: pd.DataFrame | None, inte
         )
 
         run_summary_entry_executor(df_exec, df_summary, interval)
-
-        logger.info(
-            "[entry_pipeline] executed entries=%s interval=%s",
-            len(df_exec),
-            interval,
-        )
+        logger.info("[entry_pipeline] executed entries=%s interval=%s", len(df_exec), interval)
 
     except Exception:
         logger.exception("[entry_pipeline] failed interval=%s", interval)
