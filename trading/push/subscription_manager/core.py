@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/subscription_manager/core.py
-# Version: V3.2-PUSH-SUBSCRIPTION-CORE-THIN-STRICT-50-ROTATION-FORCE-NOSKIP
+# Version: V3.3-PUSH-SUBSCRIPTION-CORE-ONOPEN-FORCE-CLEAR
 # ------------------------------------------------------------
 # Function:
 #   - subscription manager 公開API
@@ -9,19 +9,14 @@
 #   - register_ops.run_refresh_sequence() を実行
 #
 # Important:
-#   - ranking_selector.py は最大100銘柄候補を作る
-#   - core.py に来る target_symbols は target_builder.py により50件以内
-#   - 念のため core.py でも最終防衛として50件に制限する
-#   - rotation時の unregister_all → 0.5秒待機 → register を
-#     register_ops.py へ渡す
+#   - kabu Station の同時登録上限は50銘柄
+#   - 既に50銘柄が登録済みの状態で /register を追加実行すると
+#     Code=4002006 レジスト数エラー になることがある
 #
-# Fix:
-#   - del kwargs を廃止
-#   - wait_after_clear_sec / unregister_wait_sec を run_refresh_sequence へ渡す
-#   - clear_first=True の時は毎回全解除してから登録する
-#   - rotation_A / rotation_B は skip 判定を無効化
-#   - rotation_A / rotation_B は force=True / clear_first=True / unregister_first=True
-#   - rotation時は必ず 0.5秒待機を register_ops.py へ渡す
+# Fix V3.3:
+#   - reason=on_open / startup / reconnect 系は必ず clear_first=True
+#   - unregister_all → 0.5秒待機 → register 50銘柄
+#   - rotation OFF の memory-only main.py でも安全に再登録する
 # ============================================================
 
 from __future__ import annotations
@@ -51,7 +46,6 @@ from .target_builder import REGISTER_MAX_SYMBOLS, build_target_symbols
 
 logger = logging.getLogger(__name__)
 
-
 DEFAULT_WAIT_AFTER_CLEAR_SEC = 0.5
 
 
@@ -65,15 +59,6 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
 
 
 def _is_rotation_reason(reason: Any) -> bool:
-    """
-    push_stream.rotation.py から来る reason かどうか判定する。
-
-    対象例:
-      - rotation_A
-      - rotation_B
-      - push_rotation_A
-      - push_rotation_B
-    """
     try:
         s = str(reason or "").strip().lower()
         return (
@@ -85,17 +70,27 @@ def _is_rotation_reason(reason: Any) -> bool:
         return False
 
 
-def _extract_wait_after_clear_sec(kwargs: dict[str, Any]) -> float:
+def _is_force_clear_reason(reason: Any) -> bool:
     """
-    push_stream.rotation から渡される待機秒を取り出す。
+    kabu Station に既存登録が残っている可能性が高い refresh 理由。
+    ここでは必ず unregister_all → register にする。
+    """
+    try:
+        s = str(reason or "").strip().lower()
+        if not s:
+            return False
+        return (
+            s in {"on_open", "startup", "startup_bridge", "startup_bridge_rotation_a", "startup_bridge_rotation_b"}
+            or s.startswith("on_open")
+            or s.startswith("startup")
+            or s.startswith("reconnect")
+            or s.startswith("ws_reconnect")
+        )
+    except Exception:
+        return False
 
-    優先:
-      1. wait_after_clear_sec
-      2. unregister_wait_sec
-      3. clear_wait_sec
-      4. wait_after_unregister_sec
-      5. DEFAULT_WAIT_AFTER_CLEAR_SEC
-    """
+
+def _extract_wait_after_clear_sec(kwargs: dict[str, Any]) -> float:
     for key in (
         "wait_after_clear_sec",
         "unregister_wait_sec",
@@ -103,11 +98,7 @@ def _extract_wait_after_clear_sec(kwargs: dict[str, Any]) -> float:
         "wait_after_unregister_sec",
     ):
         if key in kwargs and kwargs.get(key) is not None:
-            return max(
-                0.0,
-                _safe_float(kwargs.get(key), DEFAULT_WAIT_AFTER_CLEAR_SEC),
-            )
-
+            return max(0.0, _safe_float(kwargs.get(key), DEFAULT_WAIT_AFTER_CLEAR_SEC))
     return DEFAULT_WAIT_AFTER_CLEAR_SEC
 
 
@@ -115,16 +106,13 @@ def _normalize_bool_optional(v: Any, default: bool) -> bool:
     try:
         if v is None:
             return bool(default)
-
         if isinstance(v, bool):
             return bool(v)
-
         s = str(v).strip().lower()
         if s in ("1", "true", "yes", "y", "on"):
             return True
         if s in ("0", "false", "no", "n", "off"):
             return False
-
         return bool(default)
     except Exception:
         return bool(default)
@@ -145,31 +133,17 @@ def refresh_subscriptions(
 
     保証:
       - run_refresh_sequence() へ渡す target_symbols は最大50件
-
-    Rotation時:
-      push_stream.rotation から
-        reason=rotation_A / rotation_B
-        clear_first=True
-        unregister_first=True
-        wait_after_clear_sec=0.5
-      が渡される想定。
-
-      その場合:
-        skipせず、
-        unregister_all
-        → 0.5秒待機
-        → register 50銘柄
-      を毎回実行する。
+      - on_open / startup / rotation は既存登録を全解除してから登録する
     """
 
     is_rotation = _is_rotation_reason(reason)
+    is_force_clear = _is_force_clear_reason(reason)
     wait_after_clear_sec = _extract_wait_after_clear_sec(kwargs)
 
-    if is_rotation:
+    if is_rotation or is_force_clear:
         force = True
         clear_first = True
         unregister_first = True
-
         if wait_after_clear_sec <= 0:
             wait_after_clear_sec = DEFAULT_WAIT_AFTER_CLEAR_SEC
 
@@ -206,16 +180,18 @@ def refresh_subscriptions(
         auto_clear_on_target_change=auto_clear_on_target_change,
     )
 
-    # --------------------------------------------------------
-    # rotation_A / rotation_B は必ず全解除→登録したい。
-    # そのため通常の skip 判定を通さない。
-    # --------------------------------------------------------
     if is_rotation:
         skip = False
         skip_guard = "rotation_force_noskip"
         decided_clear_first = True
         unregister_first = True
         clear_policy = "rotation_force_clear"
+    elif is_force_clear:
+        skip = False
+        skip_guard = "on_open_force_clear"
+        decided_clear_first = True
+        unregister_first = True
+        clear_policy = "on_open_force_clear"
     else:
         skip, skip_guard = should_skip_on_open_refresh(
             reason=reason,
@@ -255,36 +231,23 @@ def refresh_subscriptions(
             diff_ratio,
         )
 
-    if is_rotation:
-        logger.info(
-            "[SUB MANAGER CORE] rotation force refresh reason=%s force=%s clear_first=%s unregister_first=%s "
-            "current=%d target=%d removed=%d added=%d diff_ratio=%.3f wait_after_clear=%.3fs",
-            reason,
-            force,
-            decided_clear_first,
-            unregister_first,
-            len(current_symbols),
-            len(target_symbols),
-            len(removed),
-            len(added),
-            diff_ratio,
-            wait_after_clear_sec,
-        )
-    else:
-        logger.info(
-            "[SUB MANAGER CORE] refresh start reason=%s force=%s clear_first=%s clear_policy=%s "
-            "current=%d target=%d removed=%d added=%d diff_ratio=%.3f wait_after_clear=%.3fs",
-            reason,
-            force,
-            decided_clear_first,
-            clear_policy,
-            len(current_symbols),
-            len(target_symbols),
-            len(removed),
-            len(added),
-            diff_ratio,
-            wait_after_clear_sec,
-        )
+    logger.info(
+        "[SUB MANAGER CORE] refresh start reason=%s force=%s clear_first=%s unregister_first=%s clear_policy=%s "
+        "current=%d target=%d removed=%d added=%d diff_ratio=%.3f wait_after_clear=%.3fs rotation=%s force_clear=%s",
+        reason,
+        force,
+        decided_clear_first,
+        unregister_first,
+        clear_policy,
+        len(current_symbols),
+        len(target_symbols),
+        len(removed),
+        len(added),
+        diff_ratio,
+        wait_after_clear_sec,
+        is_rotation,
+        is_force_clear,
+    )
 
     if len(target_symbols) > REGISTER_CHUNK_SIZE:
         logger.error(
@@ -320,17 +283,18 @@ def refresh_subscriptions(
         mark_reason(reason)
 
         logger.info(
-            "[SUB MANAGER CORE] refresh done reason=%s current=%d target=%d rotation=%s wait_after_clear=%.3fs",
+            "[SUB MANAGER CORE] refresh done reason=%s current=%d target=%d rotation=%s force_clear=%s wait_after_clear=%.3fs",
             reason,
             len(current_symbols),
             len(target_symbols),
             is_rotation,
+            is_force_clear,
             wait_after_clear_sec,
         )
         return True
 
     logger.warning(
-        "[SUB MANAGER CORE] refresh failed reason=%s current=%d target=%d removed=%d added=%d diff_ratio=%.3f rotation=%s",
+        "[SUB MANAGER CORE] refresh failed reason=%s current=%d target=%d removed=%d added=%d diff_ratio=%.3f rotation=%s force_clear=%s",
         reason,
         len(current_symbols),
         len(target_symbols),
@@ -338,6 +302,7 @@ def refresh_subscriptions(
         len(added),
         diff_ratio,
         is_rotation,
+        is_force_clear,
     )
     return False
 
