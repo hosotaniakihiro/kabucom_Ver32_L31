@@ -1,15 +1,13 @@
 # ============================================================
 # File   : trading/exit/exit_utils.py
-# Version: V1.1-SPLIT-EXIT-UTILS-GC-GLOBALDATA-MERGE
+# Version: V1.2-SPLIT-EXIT-UTILS-DB-POSITION-SYNC
 # ------------------------------------------------------------
-# 【概要】
-#   EXIT系共通ユーティリティ。
+# EXIT系共通ユーティリティ。
 #
-# 【今回の重要修正】
-#   - EXITが発火しない原因になりやすい position 参照ズレを吸収
-#   - GC.positions だけでなく global_data.open_positions も見る
-#   - どちらか片方にしか保有が無い場合でも exit_loop が回る
-#   - symbol を str に正規化してマージする
+# 重要修正:
+#   - GC.positions / global_data.open_positions に加え、DB positions(status=OPEN) も見る
+#   - exit_loop_5s が監視対象なしで即終了する問題を防ぐ
+#   - DBから読んだ建玉を global_data.open_positions / GC.positions へ同期する
 # ============================================================
 
 from __future__ import annotations
@@ -69,17 +67,12 @@ def safe_bool(v: Any, default: bool = False) -> bool:
             return bool(default)
         if isinstance(v, bool):
             return v
-
         s = str(v).strip().lower()
-
         if s in {"1", "true", "yes", "on", "y", "ok"}:
             return True
-
         if s in {"0", "false", "no", "off", "n", "ng", ""}:
             return False
-
         return bool(default)
-
     except Exception:
         return bool(default)
 
@@ -90,17 +83,12 @@ def safe_bool_or_none(v: Any) -> Optional[bool]:
             return None
         if isinstance(v, bool):
             return v
-
         s = str(v).strip().lower()
-
         if s in {"1", "true", "yes", "on", "y", "ok", "break", "broken", "below"}:
             return True
-
         if s in {"0", "false", "no", "off", "n", "ng", "", "none", "above"}:
             return False
-
         return None
-
     except Exception:
         return None
 
@@ -129,15 +117,12 @@ def normalize_symbol(v: Any) -> str:
 def dict_get_any(d: Any, *names: str, default: Any = None) -> Any:
     if not isinstance(d, dict):
         return default
-
     for name in names:
         try:
             if name in d:
                 return d.get(name)
         except Exception:
             pass
-
-    # 大文字小文字差異を吸収
     try:
         lower_map = {str(k).lower(): k for k in d.keys()}
         for name in names:
@@ -146,21 +131,18 @@ def dict_get_any(d: Any, *names: str, default: Any = None) -> Any:
                 return d.get(real_key)
     except Exception:
         pass
-
     return default
 
 
 def attr_get_any(obj: Any, *names: str, default: Any = None) -> Any:
     if obj is None:
         return default
-
     for name in names:
         try:
             if hasattr(obj, name):
                 return getattr(obj, name)
         except Exception:
             pass
-
     return default
 
 
@@ -172,10 +154,11 @@ def _position_to_dict(pos: Any) -> Dict[str, Any]:
 
     out: Dict[str, Any] = {}
     for name in [
-        "symbol", "side", "qty", "quantity", "avg_price", "entry_price",
-        "entry_time", "created_at", "status", "atr", "atr_1min",
+        "symbol", "symbolname", "side", "qty", "quantity", "avg_price", "entry_price",
+        "entry_time", "created_at", "updated_at", "status", "atr", "atr_1min",
         "order_id", "entry_order_id", "ranking_lost_minutes",
         "tonosama_first_tp_done", "tonosama_second_tp_done",
+        "exchange", "margin_trade_type", "account_type", "hold_id", "execution_id",
     ]:
         try:
             if hasattr(pos, name):
@@ -192,11 +175,7 @@ def _merge_position_map(dst: Dict[str, Dict[str, Any]], src: Any, *, source: str
     for key, value in list(src.items()):
         try:
             pos = _position_to_dict(value)
-            symbol = normalize_symbol(
-                pos.get("symbol")
-                or pos.get("Symbol")
-                or key
-            )
+            symbol = normalize_symbol(pos.get("symbol") or pos.get("Symbol") or key)
             if not symbol:
                 continue
 
@@ -207,7 +186,6 @@ def _merge_position_map(dst: Dict[str, Dict[str, Any]], src: Any, *, source: str
             pos.setdefault("symbol", symbol)
             pos.setdefault("_position_source", source)
 
-            # 既存がある場合は値が多い方を優先しつつ、後勝ちで欠損を補完
             if symbol in dst:
                 merged = dict(dst[symbol])
                 for k, v in pos.items():
@@ -244,23 +222,36 @@ def _snapshot_gc_positions() -> Dict[str, Any]:
                     return dict(ret)
             except Exception:
                 pass
-
     except Exception:
         logger.exception("[POSITION_SNAPSHOT_ERROR] GC.positions")
-
     return {}
+
+
+def _sync_db_open_positions_safe() -> Dict[str, Dict[str, Any]]:
+    """DB positions(status=OPEN) を読み、global_data / GC へ同期して返す。"""
+    try:
+        from trading.position.open_position_sync import sync_open_positions_from_db
+        return sync_open_positions_from_db(force_log=False) or {}
+    except Exception:
+        logger.exception("[EXIT POS] DB open position sync failed")
+        return {}
 
 
 def get_open_positions_safe() -> Dict[str, Dict[str, Any]]:
     """
     EXIT監視対象の open positions を安全に取得する。
 
-    重要:
-      exit_loop はこの戻り値が空だと何も判定しない。
-      エントリー側が GC.positions と global_data.open_positions の
-      片方にしか保存していないケースを救済するため、両方をマージする。
+    優先して全ソースをマージする:
+      1. DB positions(status=OPEN)
+      2. GC.positions
+      3. global_data.open_positions
     """
     merged: Dict[str, Dict[str, Any]] = {}
+
+    try:
+        _merge_position_map(merged, _sync_db_open_positions_safe(), source="DB.positions")
+    except Exception:
+        logger.exception("[POSITION_SNAPSHOT_ERROR] merge DB.positions")
 
     try:
         _merge_position_map(merged, _snapshot_gc_positions(), source="GC.positions")
@@ -273,8 +264,10 @@ def get_open_positions_safe() -> Dict[str, Dict[str, Any]]:
     except Exception:
         logger.exception("[POSITION_SNAPSHOT_ERROR] merge global_data.open_positions")
 
-    if not merged:
-        logger.debug("[EXIT LOOP] no open positions from GC.positions/global_data.open_positions")
+    if merged:
+        logger.info("[EXIT LOOP] open positions detected count=%s symbols=%s", len(merged), sorted(merged.keys()))
+    else:
+        logger.debug("[EXIT LOOP] no open positions from DB/GC/global_data")
 
     return merged
 
@@ -285,39 +278,26 @@ def get_holding_seconds_safe(ctx: Any, now: dt.datetime) -> int:
             return int(ctx.holding_seconds(now))
     except Exception:
         pass
-
     return 0
 
 
-def get_feature_value(
-    features: Dict[str, Any],
-    ctx: Any,
-    *names: str,
-    default: float = 0.0,
-) -> float:
+def get_feature_value(features: Dict[str, Any], ctx: Any, *names: str, default: float = 0.0) -> float:
     for name in names:
         try:
             if isinstance(features, dict) and name in features:
                 return safe_float(features.get(name), default)
         except Exception:
             pass
-
     for name in names:
         try:
             if ctx is not None and hasattr(ctx, name):
                 return safe_float(getattr(ctx, name), default)
         except Exception:
             pass
-
     return default
 
 
-def get_feature_value_or_none(
-    features: Dict[str, Any],
-    ctx: Any,
-    pos: Optional[Dict[str, Any]],
-    *names: str,
-) -> Optional[float]:
+def get_feature_value_or_none(features: Dict[str, Any], ctx: Any, pos: Optional[Dict[str, Any]], *names: str) -> Optional[float]:
     for name in names:
         try:
             if isinstance(features, dict) and name in features:
@@ -326,7 +306,6 @@ def get_feature_value_or_none(
                     return v
         except Exception:
             pass
-
     for name in names:
         try:
             if ctx is not None and hasattr(ctx, name):
@@ -335,7 +314,6 @@ def get_feature_value_or_none(
                     return v
         except Exception:
             pass
-
     for name in names:
         try:
             if isinstance(pos, dict) and name in pos:
@@ -344,16 +322,10 @@ def get_feature_value_or_none(
                     return v
         except Exception:
             pass
-
     return None
 
 
-def get_feature_int_or_none(
-    features: Dict[str, Any],
-    ctx: Any,
-    pos: Optional[Dict[str, Any]],
-    *names: str,
-) -> Optional[int]:
+def get_feature_int_or_none(features: Dict[str, Any], ctx: Any, pos: Optional[Dict[str, Any]], *names: str) -> Optional[int]:
     for name in names:
         try:
             if isinstance(features, dict) and name in features:
@@ -362,7 +334,6 @@ def get_feature_int_or_none(
                     return v
         except Exception:
             pass
-
     for name in names:
         try:
             if ctx is not None and hasattr(ctx, name):
@@ -371,7 +342,6 @@ def get_feature_int_or_none(
                     return v
         except Exception:
             pass
-
     for name in names:
         try:
             if isinstance(pos, dict) and name in pos:
@@ -380,16 +350,10 @@ def get_feature_int_or_none(
                     return v
         except Exception:
             pass
-
     return None
 
 
-def get_feature_bool_or_none(
-    features: Dict[str, Any],
-    ctx: Any,
-    pos: Optional[Dict[str, Any]],
-    *names: str,
-) -> Optional[bool]:
+def get_feature_bool_or_none(features: Dict[str, Any], ctx: Any, pos: Optional[Dict[str, Any]], *names: str) -> Optional[bool]:
     for name in names:
         try:
             if isinstance(features, dict) and name in features:
@@ -398,7 +362,6 @@ def get_feature_bool_or_none(
                     return v
         except Exception:
             pass
-
     for name in names:
         try:
             if ctx is not None and hasattr(ctx, name):
@@ -407,7 +370,6 @@ def get_feature_bool_or_none(
                     return v
         except Exception:
             pass
-
     for name in names:
         try:
             if isinstance(pos, dict) and name in pos:
@@ -416,7 +378,6 @@ def get_feature_bool_or_none(
                     return v
         except Exception:
             pass
-
     return None
 
 
