@@ -1,19 +1,13 @@
 # ============================================================
 # File   : trading/push/push_stream/ws_callbacks.py
-# Version: Ver1.3-PUSH-STREAM-WS-CALLBACKS-5SEC-BAR-LATEST-PRICE-CACHE
+# Version: Ver1.4-PUSH-STREAM-WS-CALLBACKS-REFRESH-AFTER-OPEN-FIX
 # ------------------------------------------------------------
-# 【概要】
-#   PUSH WebSocket callback。
+# PUSH WebSocket callback。
 #
-# 【REV1.2】
-#   ✔ PUSH row 正規化直後に5秒足生成を接続
-#   ✔ 5秒足はENTRY/SUMMARYには使わず EXIT 用にGC.monitorへ保存
-#   ✔ 失敗してもPUSH処理本体は止めない
-#
-# 【REV1.3】
-#   ✔ PUSH row 正規化直後に latest_price_cache を更新
-#   ✔ EXIT 5秒監視が global_data.latest_price_map から現在値を取得可能
-#   ✔ latest_price_cache 失敗でもPUSH処理本体は止めない
+# 重要修正:
+#   - WebSocket接続後に必ず subscription refresh thread を起動する
+#   - rotation_enabled=False の memory-only mode でも登録銘柄を送信する
+#   - 保有銘柄が protected に入っても、実際のPUSH登録が走らない問題を修正
 # ============================================================
 
 from __future__ import annotations
@@ -56,68 +50,27 @@ def _safe_row_head(row: Any) -> str:
         return "unknown"
 
 
-# ============================================================
-# 最新価格キャッシュ更新
-# ============================================================
-
 def _update_latest_price_cache_safe(row: dict) -> None:
-    """
-    PUSH row から最新価格キャッシュを更新する。
-
-    重要:
-      - global_data.latest_price_map / latest_tick_map へ保存
-      - EXIT 5秒監視がここを見る
-      - DB保存前に更新するため反応が早い
-      - 失敗してもPUSH処理本体は止めない
-    """
     try:
         if not isinstance(row, dict):
             return
-
         from trading.push.latest_price_cache import update_latest_price_from_push
-
         update_latest_price_from_push(row, source="push_stream")
-
     except Exception:
-        logger.exception(
-            "[PUSH PRICE CACHE] update from push_stream row failed row=%s",
-            _safe_row_head(row),
-        )
+        logger.exception("[PUSH PRICE CACHE] update from push_stream row failed row=%s", _safe_row_head(row))
 
-
-# ============================================================
-# 5秒足生成
-# ============================================================
 
 def _update_5sec_bar_safe(row: dict) -> None:
-    """
-    PUSH row から5秒足を作る。
-
-    重要:
-      - ここではGC.monitorへ保存するだけ
-      - ENTRY / SUMMARY / RANKING には使わない
-      - trading/exit 側が GC.monitor.get_five_sec_bar() で読む
-    """
     try:
         if not isinstance(row, dict):
             return
-
         symbol = row.get("symbol") or row.get("Symbol") or row.get("code")
         if not symbol:
             return
-
         from trading.monitor.five_sec_bar_builder import update_five_sec_bar_from_tick
-
-        update_five_sec_bar_from_tick(
-            symbol=str(symbol),
-            tick=row,
-        )
-
+        update_five_sec_bar_from_tick(symbol=str(symbol), tick=row)
     except Exception:
-        logger.exception(
-            "[5SEC BAR] update from push_stream row failed row=%s",
-            _safe_row_head(row),
-        )
+        logger.exception("[5SEC BAR] update from push_stream row failed row=%s", _safe_row_head(row))
 
 
 def on_message(ws: websocket.WebSocketApp, message: Any) -> None:
@@ -133,28 +86,13 @@ def on_message(ws: websocket.WebSocketApp, message: Any) -> None:
         state._total_received += 1
 
         payload = _parse_message(message)
-
         row = _normalize_push_row(payload)
         if not row:
             state._total_dropped += 1
-            logger.warning(
-                "[push_stream] normalize returned empty payload=%s",
-                _safe_payload_head(payload),
-            )
+            logger.warning("[push_stream] normalize returned empty payload=%s", _safe_payload_head(payload))
             return
 
-        # ----------------------------------------------------
-        # 最新価格キャッシュ更新
-        # PUSH受信直後に global_data.latest_price_map へ保存する。
-        # EXIT 5秒監視が最新価格をすぐ使えるようにする。
-        # ----------------------------------------------------
         _update_latest_price_cache_safe(row)
-
-        # ----------------------------------------------------
-        # 5秒足生成
-        # PUSH受信直後に作る。
-        # EXIT側のみが利用する。
-        # ----------------------------------------------------
         _update_5sec_bar_safe(row)
 
         try:
@@ -185,24 +123,19 @@ def on_message(ws: websocket.WebSocketApp, message: Any) -> None:
 def on_error(ws, error):
     state._last_error_at = _now()
     state._total_errors += 1
-
     msg = str(error)
-
     if "10054" in msg or isinstance(error, ConnectionResetError):
         logger.warning("[push_stream] ws reset by peer: %s", msg)
         return
-
     if "ping/pong timed out" in msg:
         logger.warning("[push_stream] ws ping timeout: %s", msg)
         return
-
     logger.error("--- ERROR ---")
     logger.error("%s", error, exc_info=True if isinstance(error, BaseException) else False)
 
 
 def on_close(ws: websocket.WebSocketApp, close_status_code=None, close_msg=None) -> None:
     state._last_disconnect_at = _now()
-
     logger.warning("--- DISCONNECTED --- code=%s msg=%s", close_status_code, close_msg)
     state._connected_event.clear()
     _clear_sender()
@@ -211,12 +144,25 @@ def on_close(ws: websocket.WebSocketApp, close_status_code=None, close_msg=None)
 
 def on_open(ws: websocket.WebSocketApp) -> None:
     state._last_connect_at = _now()
-
     logger.info("--- CONNECTED ---")
     state._connected_event.set()
     _install_sender(ws)
     _safe_set_runtime("ws_connected", True)
 
-    logger.info(
-        "[push_stream] skip after-open refresh; rotation worker handles registration"
-    )
+    # 重要:
+    # main.py memory-only mode では rotation_enabled=False のことがある。
+    # その場合、rotation worker は起動しないため、on_open で refresh を起動しないと
+    # protected銘柄を含む登録対象がkabuステーションへ送信されない。
+    try:
+        _start_refresh_after_open_thread()
+        logger.warning("[push_stream] refresh after open thread started")
+    except Exception:
+        logger.exception("[push_stream] failed to start refresh after open thread")
+
+
+__all__ = [
+    "on_message",
+    "on_error",
+    "on_close",
+    "on_open",
+]
