@@ -10,7 +10,7 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.3-FAST-STARTUP-RUNTIME-PATCHES
+# Version: Ver38.4-EXIT-SCHEDULER-REGISTERED
 # ------------------------------------------------------------
 # ✔ PROJECT_ROOT を最初に sys.path へ追加
 # ✔ core.logging.console_tee を確実に import / setup
@@ -18,6 +18,7 @@
 # ✔ system_startup 後に logging StreamHandler を tee へ再接続
 # ✔ 100368 SELL拒否後の entry_controller ログ補正 runtime patch を起動時install
 # ✔ 起動高速化 runtime patch を起動時install
+# ✔ EXIT scheduler を run_exit_pipeline で1秒ごとに登録
 # ✔ 既存の起動処理は維持
 # ============================================================
 
@@ -103,7 +104,7 @@ from trading.summary.realtime_engine import (
     process_realtime,
 )
 
-from trading.handlers.exit_handler import build_5s_bar_fast
+from trading.handlers.exit_handler import build_5s_bar_fast, run_exit_pipeline
 from force_cancel_loop import start_force_cancel_loop
 from test_script.test_force_exit import run_force_exit_test
 
@@ -309,6 +310,39 @@ def _install_summary_entry_runtime_context():
 
     except Exception:
         logger.exception("summary/entry runtime context install failed")
+
+
+# ============================================================
+# EXIT SCHEDULER
+# ============================================================
+
+def _register_exit_scheduler():
+    """
+    EXIT パイプラインを schedule に登録する。
+    これが未登録だと、ENTRY は成功しても EXIT 判定が一切回らない。
+    """
+    try:
+        if not callable(run_exit_pipeline):
+            logger.warning("[EXIT SCHEDULER] run_exit_pipeline unavailable")
+            return False
+
+        # 二重登録防止: schedule.Job には job_func が存在する
+        for job in list(schedule.jobs):
+            try:
+                fn = getattr(job, "job_func", None)
+                if getattr(fn, "func", fn) is run_exit_pipeline:
+                    logger.warning("[EXIT SCHEDULER] already registered")
+                    return True
+            except Exception:
+                pass
+
+        schedule.every(1).seconds.do(run_exit_pipeline)
+        logger.warning("[EXIT SCHEDULER] run_exit_pipeline registered every 1s")
+        return True
+
+    except Exception:
+        logger.exception("[EXIT SCHEDULER] register failed")
+        return False
 
 
 # ============================================================
@@ -699,6 +733,11 @@ def main():
         logger.info("✅ push storage started")
     except Exception:
         logger.exception("push storage start failed")
+
+    # --------------------------------------------------------
+    # EXIT scheduler register
+    # --------------------------------------------------------
+    _register_exit_scheduler()
 
     # --------------------------------------------------------
     # Scheduler loop start
