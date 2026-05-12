@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/summary_ai/executor.py
-# Version: PRODUCTION-STABLE-REV1.3-FILTER-RESTRICTED-BEFORE-SELECTION
+# Version: PRODUCTION-STABLE-REV1.4-BUY-FIRST-SAFE-SELECTION
 # ------------------------------------------------------------
 # 【概要】
 #   AI_OK 銘柄を approved_rows に変換し、
@@ -18,8 +18,9 @@
 #   - pending_entries / 注文API は直接触らない
 #   - AI gate で決まった BUY / SELL side を絶対に破壊しない
 #   - SELL候補は sell_score 優先で評価する
-#   - BUY候補が存在する場合は最低1件BUYを優先採用する
+#   - BUY候補が存在する場合は最大3件までBUYを優先採用する
 #   - trade_restricted / SELL reject cache 済み銘柄は選抜前に除外する
+#   - 制限中の候補で枠を消費せず、次の候補を採用する
 # ============================================================
 
 from __future__ import annotations
@@ -35,8 +36,8 @@ from .utils import get_bulk_entry_pipeline, is_market_open, safe_float
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MAX_ENTRIES = 1
-DEFAULT_MIN_BUY_APPROVED = 1
+DEFAULT_MAX_ENTRIES = 3
+DEFAULT_MIN_BUY_APPROVED = 3
 
 
 def _env_int(name: str, default: int) -> int:
@@ -171,8 +172,8 @@ def _is_sell_reject_cached(symbol: str, side: str) -> tuple[bool, Any]:
 
 def _filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    AI_OK だが、直前サイクルで kabu API から信用新規抑止/取引制限を受けた銘柄を除外する。
-    ここで除外してから max_entries を選ぶことで、3905/4203 のような拒否銘柄で3枠を消費しない。
+    AI_OK だが、直前サイクルで取引制限やSELL拒否キャッシュに該当する銘柄を除外する。
+    ここで除外してから max_entries を選ぶことで、通らない候補で枠を消費しない。
     """
     if not ok_items:
         return []
@@ -201,7 +202,7 @@ def _filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dict[str
             "[SUMMARY AI EXECUTOR] filtered blocked candidates before selection before=%s after=%s skipped=%s",
             len(ok_items),
             len(kept),
-            skipped[:20],
+            skipped[:30],
         )
 
     return kept
@@ -211,14 +212,11 @@ def _select_ai_ok_items(ok_items: List[Dict[str, Any]], *, max_entries: int) -> 
     """
     AI_OK候補を最終approved候補に絞る。
 
-    従来はBUY/SELL混在で単純スコア順だったため、SELLの絶対スコアが大きいと
-    BUYがAI_OKでも approved から漏れていた。
-
     対策:
       - trade_restricted / SELL reject cache 済み銘柄は選抜前に除外
-      - BUY候補が存在する場合、最低 SUMMARY_AI_MIN_BUY_APPROVED 件はBUYから確保する
-      - 残り枠はBUY/SELL混在でスコア順にする
-      - max_entries=1 の場合でもBUYが存在すればBUYを優先する
+      - BUY候補が存在する場合、最大 max_entries 件までBUYを優先する
+      - BUYが足りない場合のみSELLを補欠採用する
+      - SELL高スコア候補がBUY枠を潰さないようにする
     """
     if not ok_items:
         return []
@@ -239,15 +237,27 @@ def _select_ai_ok_items(ok_items: List[Dict[str, Any]], *, max_entries: int) -> 
 
     sorted_all = sorted(ok_items, key=_sort_key_for_selection, reverse=True)
     buy_items = [x for x in sorted_all if _row_side(x) == "BUY"]
+    sell_items = [x for x in sorted_all if _row_side(x) == "SELL"]
 
     selected: List[Dict[str, Any]] = []
     selected_ids: set[int] = set()
 
+    # BUYがある場合は、まずBUYで枠を埋める。
     if buy_items and min_buy > 0:
-        for item in buy_items[:min_buy]:
+        for item in buy_items[:max_n]:
             selected.append(item)
             selected_ids.add(id(item))
 
+    # BUYが不足した場合だけSELLを補欠で入れる。
+    for item in sell_items:
+        if len(selected) >= max_n:
+            break
+        if id(item) in selected_ids:
+            continue
+        selected.append(item)
+        selected_ids.add(id(item))
+
+    # 特殊ケース用: まだ枠が残るなら通常順で補充。
     for item in sorted_all:
         if len(selected) >= max_n:
             break
@@ -257,12 +267,12 @@ def _select_ai_ok_items(ok_items: List[Dict[str, Any]], *, max_entries: int) -> 
         selected_ids.add(id(item))
 
     logger.warning(
-        "[SUMMARY AI EXECUTOR] side-balanced selection max_entries=%s min_buy=%s ok_total=%s buy_ok=%s sell_ok=%s selected=%s",
+        "[SUMMARY AI EXECUTOR] buy-first selection max_entries=%s min_buy=%s ok_total=%s buy_ok=%s sell_ok=%s selected=%s",
         max_n,
         min_buy,
         len(ok_items),
         len(buy_items),
-        len([x for x in sorted_all if _row_side(x) == "SELL"]),
+        len(sell_items),
         [
             {
                 "symbol": _pick_symbol(x),
