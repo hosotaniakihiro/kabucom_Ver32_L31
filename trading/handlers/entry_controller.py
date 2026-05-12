@@ -605,13 +605,18 @@ def _execute_best_candidate(item: dict, boost_active: bool) -> bool:
     )
 
     if qty <= 0:
+        # lot_sizer が oneshot cap / price / confidence 等で 0 を返した場合、
+        # ここで MIN_ENTRY_QTY に戻すと、資金上限を超えた注文を無理に送って
+        # 「ENTRY_DISPATCH したが実注文が発火しない」状態を作る。
         logger.warning(
-            "⚠ ENTRY_QTY_FALLBACK symbol=%s qty_raw=%s -> MIN_ENTRY_QTY=%s",
+            "⚠ ENTRY_QTY_ZERO_SKIP symbol=%s qty_raw=%s side=%s price=%s -> no order dispatch",
             symbol,
             qty,
-            MIN_ENTRY_QTY,
+            side,
+            price,
         )
-        qty = MIN_ENTRY_QTY
+        _log_skip(symbol, "ENTRY_QTY_ZERO", side=side, price=price, qty_raw=qty)
+        return False
 
     if boost_active:
         qty = int(qty * BOOST_SIZE_MULTIPLIER)

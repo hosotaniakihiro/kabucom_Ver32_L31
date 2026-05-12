@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/summary_startup.py
-# Version: FINAL-PRODUCTION-REV23.2-SUMMARY-STARTUP-PUSH-INCREMENTAL-MA75-TAIL120
+# Version: FINAL-PRODUCTION-REV23.2-SUMMARY-STARTUP-PUSH-INCREMENTAL-MA75-TAIL75
 # ------------------------------------------------------------
 # 【概要】
 #   startup summary restore / push incremental MA75 / summary fast boot / MTF history を担当
@@ -8,7 +8,7 @@
 # 【機能】
 #   ✔ startup_summary_restore
 #   ✔ 保存済み1/3/5分足summary最新以降のPUSHを読み込みMA75を継続作成
-#   ✔ 各銘柄75MA計算用に最低75本以上、標準120本のsummary tailを読む
+#   ✔ 各銘柄75MA計算用に必要最小限の75本以上のsummary tailを読む
 #   ✔ orchestrator が run_startup_summary_restore_safe() だけ呼ぶ構成でもMA75処理を必ず実行
 #   ✔ summary fast boot async
 #   ✔ MTF history bootstrap
@@ -27,7 +27,7 @@ from core.startup.startup_config import resolve_attr
 
 logger = logging.getLogger(__name__)
 
-VERSION = "FINAL-PRODUCTION-REV23.2-SUMMARY-STARTUP-PUSH-INCREMENTAL-MA75-TAIL120"
+VERSION = "FINAL-PRODUCTION-REV23.2-SUMMARY-STARTUP-PUSH-INCREMENTAL-MA75-TAIL75"
 
 
 # ============================================================
@@ -168,8 +168,8 @@ def run_startup_summary_restore_safe() -> Any:
             intervals=(1, 3, 5),
             display=True,
             save_missing=True,
-            # 75MA用。75本ちょうどでは欠損/途中足/重複除去で足りなくなるため120本読む。
-            tail_rows=120,
+            # 75MA用。前日までのma75はDB格納済み前提のため、起動時は必要最小限の75本を読む。
+            tail_rows=75,
             one_min_lookback_minutes=15,
         )
 
@@ -205,7 +205,7 @@ def run_startup_summary_restore_safe() -> Any:
             getattr(result, "saved_3min_rows", None),
             getattr(result, "saved_5min_rows", None),
             getattr(result, "one_min_load_from", None),
-            120,
+            75,
         )
 
         if not ok:

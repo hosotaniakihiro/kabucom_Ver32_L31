@@ -18,6 +18,7 @@ import logging
 from typing import Optional
 
 from global_state import global_data
+from core.global_context.context import global_context as GC
 
 from database import Session_position
 from database.models import Position
@@ -87,6 +88,11 @@ def on_entry_filled(
 
         global_data.exit_ctx = getattr(global_data, "exit_ctx", {})
         global_data.exit_ctx[symbol] = ctx
+        try:
+            if hasattr(GC, "ai") and GC.ai and hasattr(GC.ai, "set_exit_ctx"):
+                GC.ai.set_exit_ctx(symbol, ctx)
+        except Exception:
+            logger.debug("ExitContext GC.ai registration failed symbol=%s", symbol, exc_info=True)
 
         # ----------------------------------------------------
         # 3. inflight / pending 解除

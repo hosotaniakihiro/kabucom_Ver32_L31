@@ -108,13 +108,18 @@ def install() -> bool:
         )
 
         if qty <= 0:
+            # lot_sizer が 0 を返した候補は、資金上限/価格条件で発注不可。
+            # MIN_ENTRY_QTY へ戻すと ORDER_ID_EMPTY や local suppress を誘発するため送信しない。
             ec.logger.warning(
-                "⚠ ENTRY_QTY_FALLBACK symbol=%s qty_raw=%s -> MIN_ENTRY_QTY=%s",
+                "⚠ ENTRY_QTY_ZERO_SKIP symbol=%s qty_raw=%s side=%s price=%s -> no order dispatch entry_diag=%s",
                 symbol,
                 qty,
-                ec.MIN_ENTRY_QTY,
+                side,
+                price,
+                _short_dict(entry_row, ["source", "entry_type", "interval", "close", "price", "score_buy", "score_sell"]),
             )
-            qty = ec.MIN_ENTRY_QTY
+            ec._log_skip(symbol, "ENTRY_QTY_ZERO", side=side, price=price, qty_raw=qty)
+            return False
 
         if boost_active:
             qty = int(qty * ec.BOOST_SIZE_MULTIPLIER)
