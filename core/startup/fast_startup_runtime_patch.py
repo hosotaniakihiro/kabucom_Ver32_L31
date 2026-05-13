@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/fast_startup_runtime_patch.py
-# Version: PRODUCTION-FAST-STARTUP-PATCH-V5-ENTRY-AFFORDABILITY
+# Version: PRODUCTION-FAST-STARTUP-PATCH-V6-SYMBOL-FLAGS-BOOTSTRAP
 # ------------------------------------------------------------
 # 目的:
 #   main.py 起動直後の重い処理を軽くする。
@@ -8,6 +8,7 @@
 #   さらに、EXIT_EXECUTOR が内部建玉を見つけられない場合でも、
 #   broker信用建玉から復元して返済注文できるpatchを起動時に入れる。
 #   さらに、AI確認前に予算上限で買えない高価格銘柄を除外するpatchを入れる。
+#   さらに、symbol_flags.db を起動時に global_data へキャッシュする。
 # ============================================================
 
 from __future__ import annotations
@@ -74,6 +75,20 @@ def _patch_summary_schema_bootstrap() -> None:
     logger.warning("[FAST STARTUP PATCH] database.session._bootstrap_summary_schema patched to no-op")
 
 
+def _install_symbol_flags_bootstrap() -> None:
+    """
+    信用銘柄マスターDBを起動直後にglobal_dataへキャッシュする。
+    SELL判定は global_data.symbol_flags_info_map / short_ok_symbols を優先参照する。
+    """
+    try:
+        from core.startup.symbol_flags_bootstrap import install_symbol_flags_cache
+
+        ok = install_symbol_flags_cache(force=True)
+        logger.warning("[FAST STARTUP PATCH] symbol_flags_bootstrap installed=%s", ok)
+    except Exception:
+        logger.exception("[FAST STARTUP PATCH] symbol_flags_bootstrap install failed")
+
+
 def _install_open_position_broker_merge_patch() -> None:
     try:
         from core.startup.open_position_broker_merge_patch import install as install_open_position_patch
@@ -120,6 +135,11 @@ def install() -> bool:
     except Exception:
         logger.exception("[FAST STARTUP PATCH] scheduler_bootstrap import failed")
         return False
+
+    try:
+        _install_symbol_flags_bootstrap()
+    except Exception:
+        logger.exception("[FAST STARTUP PATCH] symbol flags bootstrap failed")
 
     try:
         _patch_summary_schema_bootstrap()
@@ -203,7 +223,7 @@ def install() -> bool:
         logger.exception("[FAST STARTUP PATCH] initial ranking tick patch failed")
 
     _PATCHED = True
-    logger.warning("[FAST STARTUP PATCH] installed v5 entry_affordability=True")
+    logger.warning("[FAST STARTUP PATCH] installed v6 entry_affordability=True symbol_flags_bootstrap=True")
     return True
 
 
