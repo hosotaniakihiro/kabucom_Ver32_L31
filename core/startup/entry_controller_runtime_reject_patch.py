@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/entry_controller_runtime_reject_patch.py
-# Version: PRODUCTION-ENTRY-ORDER-REJECT-PATCH-V4-NO-100368-CACHE
+# Version: PRODUCTION-ENTRY-ORDER-REJECT-PATCH-V5-CLEAN-100368-CACHE
 # ------------------------------------------------------------
 # 目的:
 #   kabu APIで注文IDが空になった時に、entry_controller 側で原因を見える化する。
@@ -10,6 +10,7 @@
 #     「現在、株式信用新規の注文は抑止されております。」は、
 #     銘柄個別の trade_restricted / SELL拒否キャッシュ扱いにしない。
 #     その注文は失敗として扱うが、次候補・次サイクルは止めない。
+#   - 起動直後に古い100368 SELL拒否キャッシュが残っていても自動削除する。
 #   - Code=100033
 #     「この銘柄のお取引は制限されています。」は銘柄個別制限として扱う。
 #   - BUY/SELL とも信用新規のまま。現物化はしない。
@@ -106,8 +107,47 @@ def _same_order_error(err: dict, *, symbol: str, side: str) -> bool:
         return False
 
 
+def _cleanup_stale_100368_sell_cache() -> int:
+    """
+    古いバージョンや起動時パッチで 100368 が sell_order_reject_cache に入っていた場合、
+    起動直後に削除する。
+
+    100368 は銘柄個別SELL NGではなく、API側の信用新規抑止応答として扱うため、
+    キャッシュに残すと翌サイクル以降の候補が不当に消える。
+    """
+    removed = 0
+    try:
+        from global_state import global_data
+
+        cache = getattr(global_data, "sell_order_reject_cache", None)
+        if not isinstance(cache, dict):
+            return 0
+
+        for sym, rec in list(cache.items()):
+            if not isinstance(rec, dict):
+                continue
+            code = _norm_code(rec.get("code"))
+            msg = str(rec.get("message") or "")
+            if code == KABU_CODE_CREDIT_NEW_ORDER_SUPPRESSED or ("信用新規" in msg and "抑止" in msg):
+                cache.pop(sym, None)
+                removed += 1
+
+        if removed:
+            logger.warning(
+                "[ENTRY REJECT PATCH] stale 100368 sell reject cache cleaned removed=%s",
+                removed,
+            )
+        return removed
+    except Exception:
+        logger.exception("[ENTRY REJECT PATCH] stale 100368 cache cleanup failed")
+        return removed
+
+
 def install() -> bool:
     global _PATCHED
+
+    # 既にpatch済みでも、古い100368キャッシュだけは掃除する。
+    _cleanup_stale_100368_sell_cache()
 
     if _PATCHED:
         return True
@@ -124,7 +164,7 @@ def install() -> bool:
         logger.warning("[ENTRY REJECT PATCH] target _execute_best_candidate not found")
         return False
 
-    if getattr(old_fn, "_runtime_reject_patched_v4", False):
+    if getattr(old_fn, "_runtime_reject_patched_v5", False):
         _PATCHED = True
         return True
 
@@ -411,11 +451,12 @@ def install() -> bool:
     _execute_best_candidate_patched._runtime_reject_patched_v2 = True  # type: ignore[attr-defined]
     _execute_best_candidate_patched._runtime_reject_patched_v3 = True  # type: ignore[attr-defined]
     _execute_best_candidate_patched._runtime_reject_patched_v4 = True  # type: ignore[attr-defined]
+    _execute_best_candidate_patched._runtime_reject_patched_v5 = True  # type: ignore[attr-defined]
     ec._execute_best_candidate = _execute_best_candidate_patched
 
     _PATCHED = True
     logger.warning(
-        "[ENTRY REJECT PATCH] installed v4 target=trading.handlers.entry_controller._execute_best_candidate no_100368_cache=True"
+        "[ENTRY REJECT PATCH] installed v5 target=trading.handlers.entry_controller._execute_best_candidate no_100368_cache=True clean_stale_cache=True"
     )
     return True
 
