@@ -1,5 +1,5 @@
 # ============================================================
-# kabu_api/send_order.py（Ver23.5-FINAL-CREDIT-NEW-100368-COOLDOWN）
+# kabu_api/send_order.py（Ver23.6-FINAL-CREDIT-NEW-SKIP-LOG）
 # ------------------------------------------------------------
 # ・成功時は dict {"OrderId": "...", "Price": <float>} を返す
 # ・失敗時は None
@@ -11,6 +11,8 @@
 #   - 100368: 現在、株式信用新規の注文は抑止されております。
 #   - BUY/SELL どちらで出ても、kabu側が信用新規全体を拒否している状態として扱う
 # ・停止中は /sendorder へ再送せずローカルで即スキップする
+# ・停止中スキップ時は ENTRY_SKIP __GLOBAL__ reason=CREDIT_NEW_ORDER_SUPPRESSED を出す
+#   - 「エントリーが発火しない」の理由をログで明確化する
 # ・Code=100033 は銘柄個別 trade_restricted として扱う
 # ・Code=100368 は銘柄個別 trade_restricted には入れない
 # ・SELL 100368 は従来通り sell_order_reject_cache にも登録する
@@ -35,8 +37,8 @@ API_URL = "http://localhost:18080/kabusapi"
 TRADE_RESTRICT_SEC = 1800
 
 # 信用新規全体停止。Code=100368 用。
-# まずは短めに止めて、数分後に再確認する。
-CREDIT_NEW_SUPPRESS_SEC = 300
+# 300秒だと長く「発火しない」ように見えやすいため、まず60秒で再確認する。
+CREDIT_NEW_SUPPRESS_SEC = 60
 CREDIT_NEW_SUPPRESS_KEY = "__CREDIT_NEW_ORDER_SUPPRESSED__"
 
 conf = configparser.ConfigParser()
@@ -220,12 +222,26 @@ def _set_credit_new_suppressed(payload: dict, data: Any) -> None:
         root[CREDIT_NEW_SUPPRESS_KEY] = until
 
         logger.warning(
-            "🚫 CREDIT_NEW_ORDER_GLOBAL_SUPPRESSED symbol=%s side=%s code=%s until=%s message=%s",
+            "🚫 CREDIT_NEW_ORDER_GLOBAL_SUPPRESSED symbol=%s side=%s code=%s until=%s sec=%s message=%s",
             symbol,
             side,
             code or "UNKNOWN",
             until,
+            CREDIT_NEW_SUPPRESS_SEC,
             message,
+        )
+
+        logger.info(
+            "⛔ ENTRY_SKIP __GLOBAL__ reason=CREDIT_NEW_ORDER_SUPPRESSED detail=%s",
+            {
+                "symbol": symbol,
+                "side": side,
+                "code": code or "UNKNOWN",
+                "until": str(until),
+                "sec": CREDIT_NEW_SUPPRESS_SEC,
+                "message": message,
+                "source": "kabu_api_100368",
+            },
         )
 
     except Exception:
@@ -283,12 +299,29 @@ def _credit_new_suppressed_now(payload: dict) -> bool:
 
         now = dt.datetime.now()
         if now < until:
+            remain = max(0.0, (until - now).total_seconds())
+            symbol = _safe_symbol(payload)
+            side = _payload_side_name(payload)
+
             logger.warning(
                 "🚫 CREDIT_NEW_ORDER_SUPPRESSED_LOCAL_SKIP symbol=%s side=%s until=%s remain=%.1fs",
-                _safe_symbol(payload),
-                _payload_side_name(payload),
+                symbol,
+                side,
                 until,
-                max(0.0, (until - now).total_seconds()),
+                remain,
+            )
+
+            # entry_controller まで到達していないように見える問題を避けるため、
+            # send_order 側でも ENTRY_SKIP 形式で理由を出す。
+            logger.info(
+                "⛔ ENTRY_SKIP __GLOBAL__ reason=CREDIT_NEW_ORDER_SUPPRESSED detail=%s",
+                {
+                    "symbol": symbol,
+                    "side": side,
+                    "until": str(until),
+                    "remain_sec": round(remain, 1),
+                    "source": "kabu_api_local_cooldown",
+                },
             )
             return True
 
