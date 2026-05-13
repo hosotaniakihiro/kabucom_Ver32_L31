@@ -1,12 +1,13 @@
 # ============================================================
 # File   : core/startup/fast_startup_runtime_patch.py
-# Version: PRODUCTION-FAST-STARTUP-PATCH-V4-EXIT-EXECUTOR-BROKER-FALLBACK
+# Version: PRODUCTION-FAST-STARTUP-PATCH-V5-ENTRY-AFFORDABILITY
 # ------------------------------------------------------------
 # 目的:
 #   main.py 起動直後の重い処理を軽くする。
 #   さらに、OPEN建玉同期に broker 実建玉マージpatchを入れる。
 #   さらに、EXIT_EXECUTOR が内部建玉を見つけられない場合でも、
 #   broker信用建玉から復元して返済注文できるpatchを起動時に入れる。
+#   さらに、AI確認前に予算上限で買えない高価格銘柄を除外するpatchを入れる。
 # ============================================================
 
 from __future__ import annotations
@@ -93,6 +94,22 @@ def _install_exit_executor_broker_position_patch() -> None:
         logger.exception("[FAST STARTUP PATCH] exit_executor_broker_position_patch install failed")
 
 
+def _install_entry_affordability_patch() -> None:
+    """
+    AIに確認する前に、最低1単元でもMAX_ENTRY_ONESHOT_YENを超える高価格銘柄を除外する。
+    MAX_ENTRY_ONESHOT_YENを増額すれば、除外価格も自動で上がる。
+    """
+    try:
+        from core.startup.entry_affordability_runtime_patch import install as install_affordability_patch
+        from trading.entry.entry_budget import log_entry_budget_config
+
+        log_entry_budget_config(prefix="[FAST STARTUP PATCH][ENTRY BUDGET]")
+        ok = install_affordability_patch()
+        logger.warning("[FAST STARTUP PATCH] entry_affordability_runtime_patch installed=%s", ok)
+    except Exception:
+        logger.exception("[FAST STARTUP PATCH] entry_affordability_runtime_patch install failed")
+
+
 def install() -> bool:
     global _PATCHED
     if _PATCHED:
@@ -118,6 +135,11 @@ def install() -> bool:
         _install_exit_executor_broker_position_patch()
     except Exception:
         logger.exception("[FAST STARTUP PATCH] exit executor broker patch failed")
+
+    try:
+        _install_entry_affordability_patch()
+    except Exception:
+        logger.exception("[FAST STARTUP PATCH] entry affordability patch failed")
 
     try:
         old_lookback = getattr(sb, "_DEFAULT_RANKING_LOOKBACK_MINUTES", None)
@@ -181,7 +203,7 @@ def install() -> bool:
         logger.exception("[FAST STARTUP PATCH] initial ranking tick patch failed")
 
     _PATCHED = True
-    logger.warning("[FAST STARTUP PATCH] installed")
+    logger.warning("[FAST STARTUP PATCH] installed v5 entry_affordability=True")
     return True
 
 
