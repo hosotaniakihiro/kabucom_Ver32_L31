@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/summary_ai/executor.py
-# Version: PRODUCTION-STABLE-REV1.6-BUY-FIRST-MAX10
+# Version: PRODUCTION-STABLE-REV1.7-BUY-FIRST-MAX10-AFFORDABLE
 # ------------------------------------------------------------
 # 【概要】
 #   AI_OK 銘柄を approved_rows に変換し、
@@ -19,6 +19,7 @@
 #   - AI gate で決まった BUY / SELL side を絶対に破壊しない
 #   - SELL候補は sell_score 優先で評価する
 #   - BUY候補が存在する場合は最大10件までBUYを優先採用する
+#   - 50万円・100株単位で数量0になる高価格銘柄は選抜前に除外する
 #   - trade_restricted / SELL reject cache 済み銘柄は選抜前に除外する
 #   - 制限中の候補で枠を消費せず、次の候補を採用する
 #   - entry_pipeline の戻り値が None の場合は executed=False にする
@@ -40,6 +41,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_ENTRIES = 10
 DEFAULT_MIN_BUY_APPROVED = 3
 
+# 50万円・100株単位の場合、5000円超は最低100株でも50万円を超える。
+# 例: 5801 58,340円 -> 100株で5,834,000円のため qty=0 になり枠を消費する。
+DEFAULT_MAX_PRICE_FOR_100_SHARE_ENTRY = 5000.0
+
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -49,6 +54,16 @@ def _env_int(name: str, default: int) -> int:
         return int(float(v))
     except Exception:
         return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
 
 
 def _norm_side(v: Any, default: str = "BUY") -> str:
@@ -76,6 +91,51 @@ def _pick_symbol(item: Dict[str, Any]) -> str:
         return _norm_symbol(item.get("symbol") or ai_row.get("symbol") or src.get("symbol"))
     except Exception:
         return _norm_symbol(item.get("symbol"))
+
+
+def _pick_price(item: Dict[str, Any]) -> float:
+    """
+    AI_OK item から発注価格候補を拾う。
+    ここで価格を拾えない場合は除外せず、後段の lot_sizer / order_builder に任せる。
+    """
+    try:
+        ai_row = dict(item.get("ai_row") or {})
+        src = dict(item.get("source_row") or {})
+
+        for d in (item, ai_row, src):
+            if not isinstance(d, dict):
+                continue
+            for key in (
+                "close_price",
+                "price",
+                "current_price",
+                "close",
+                "last_price",
+                "CurrentPrice",
+            ):
+                v = d.get(key)
+                x = safe_float(v, 0.0)
+                if x > 0:
+                    return x
+        return 0.0
+    except Exception:
+        return 0.0
+
+
+def _max_price_for_100_share_entry() -> float:
+    """
+    AI候補選抜前の価格上限。
+
+    既定:
+      5000円 = 500,000円 / 100株
+
+    無効化したい場合:
+      SUMMARY_AI_ENTRY_MAX_PRICE_FOR_100_SHARE=0
+    """
+    return _env_float(
+        "SUMMARY_AI_ENTRY_MAX_PRICE_FOR_100_SHARE",
+        DEFAULT_MAX_PRICE_FOR_100_SHARE_ENTRY,
+    )
 
 
 def _pick_side(ai_ok_item: Dict[str, Any], ai_row: Dict[str, Any], src: Dict[str, Any]) -> str:
@@ -174,6 +234,8 @@ def _is_sell_reject_cached(symbol: str, side: str) -> tuple[bool, Any]:
 def _filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     AI_OK だが、直前サイクルで取引制限やSELL拒否キャッシュに該当する銘柄を除外する。
+    加えて、最低100株でも50万円枠を超える高価格銘柄を選抜前に除外する。
+
     ここで除外してから max_entries を選ぶことで、通らない候補で枠を消費しない。
     """
     if not ok_items:
@@ -181,10 +243,25 @@ def _filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dict[str
 
     kept: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
+    max_price = _max_price_for_100_share_entry()
 
     for item in ok_items:
         symbol = _pick_symbol(item)
         side = _row_side(item)
+        price = _pick_price(item)
+
+        if max_price > 0 and price > max_price:
+            skipped.append(
+                {
+                    "symbol": symbol,
+                    "side": side,
+                    "reason": "price_over_100share_cap",
+                    "price": price,
+                    "max_price": max_price,
+                    "min_notional_100": round(price * 100, 1),
+                }
+            )
+            continue
 
         restricted, until = _is_trade_restricted_symbol(symbol)
         if restricted:
@@ -200,10 +277,11 @@ def _filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dict[str
 
     if skipped:
         logger.warning(
-            "[SUMMARY AI EXECUTOR] filtered blocked candidates before selection before=%s after=%s skipped=%s",
+            "[SUMMARY AI EXECUTOR] filtered blocked/unaffordable candidates before selection before=%s after=%s max_price=%s skipped=%s",
             len(ok_items),
             len(kept),
-            skipped[:30],
+            max_price,
+            skipped[:50],
         )
 
     return kept
@@ -214,6 +292,7 @@ def _select_ai_ok_items(ok_items: List[Dict[str, Any]], *, max_entries: int) -> 
     AI_OK候補を最終approved候補に絞る。
 
     対策:
+      - 高価格でqty=0になる候補は選抜前に除外
       - trade_restricted / SELL reject cache 済み銘柄は選抜前に除外
       - BUY候補が存在する場合、最大 max_entries 件までBUYを優先する
       - BUYが足りない場合のみSELLを補欠採用する
@@ -224,7 +303,7 @@ def _select_ai_ok_items(ok_items: List[Dict[str, Any]], *, max_entries: int) -> 
 
     ok_items = _filter_blocked_ai_ok_items(ok_items)
     if not ok_items:
-        logger.warning("[SUMMARY AI EXECUTOR] all AI_OK candidates filtered by trade restriction / reject cache")
+        logger.warning("[SUMMARY AI EXECUTOR] all AI_OK candidates filtered by trade restriction / reject cache / price cap")
         return []
 
     try:
@@ -278,6 +357,7 @@ def _select_ai_ok_items(ok_items: List[Dict[str, Any]], *, max_entries: int) -> 
             {
                 "symbol": _pick_symbol(x),
                 "side": _row_side(x),
+                "price": _pick_price(x),
                 "conf": round(safe_float(x.get("confidence")), 3),
                 "score": round(_row_score_for_side(x), 3),
             }
@@ -419,6 +499,7 @@ def build_ai_ok_approved_rows(
             {
                 "symbol": r.get("symbol"),
                 "side": r.get("side"),
+                "price": safe_float(r.get("close_price") or r.get("price"), 0.0),
                 "buy": round(safe_float(r.get("buy_score")), 3),
                 "sell": round(safe_float(r.get("sell_score")), 3),
                 "total": round(safe_float(r.get("score_total")), 3),
