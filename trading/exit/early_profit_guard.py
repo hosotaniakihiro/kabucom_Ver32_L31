@@ -1,3 +1,23 @@
+# ============================================================
+# File   : trading/exit/early_profit_guard.py
+# Version: V1.5-BAR5S-TRAILING-NO-PROGRESS-5MIN
+# ------------------------------------------------------------
+# BUY:
+#   - 建値から -0.30% 下落でEXIT
+#   - エントリー後の最高値から -0.30% 下落でEXIT
+#   - 建玉後5分たっても有利方向にほとんど動かなければEXIT
+#
+# SELL:
+#   - 建値から +0.30% 上昇でEXIT
+#   - エントリー後の最安値から +0.30% 上昇でEXIT
+#   - 建玉後5分たっても有利方向にほとんど動かなければEXIT
+#
+# ENV:
+#   - TRAILING_DRAWDOWN_PCT default 0.0030
+#   - EARLY_NO_PROGRESS_SECONDS default 300.0
+#   - EARLY_NO_PROGRESS_NEED_PCT default 0.0005
+# ============================================================
+
 from __future__ import annotations
 
 import datetime as dt
@@ -140,7 +160,10 @@ def judge_early_profit_guard(*, symbol: str, pos: dict[str, Any], side: str, ent
 
     threshold = _env_float("TRAILING_DRAWDOWN_PCT", 0.0030)
     take_profit = _env_float("TAKE_PROFIT_PCT", _env_float("EARLY_TAKE_PROFIT_PCT", 0.0))
-    no_progress_sec = _env_float("EARLY_NO_PROGRESS_SECONDS", 15.0)
+
+    # 建玉後、ほとんど動かない銘柄を見切る時間。
+    # 既定は5分。環境変数 EARLY_NO_PROGRESS_SECONDS で上書き可能。
+    no_progress_sec = _env_float("EARLY_NO_PROGRESS_SECONDS", 300.0)
     no_progress_need = _env_float("EARLY_NO_PROGRESS_NEED_PCT", 0.0005)
 
     hold = _hold_seconds(pos, ctx, now)
@@ -158,8 +181,20 @@ def judge_early_profit_guard(*, symbol: str, pos: dict[str, Any], side: str, ent
         max_profit = (entry_price - low) / entry_price
 
     logger.warning(
-        "[EARLY PROFIT GUARD] check symbol=%s side=%s hold=%.1fs entry=%.4f price=%.4f high=%.4f low=%.4f profit=%.4f%% entry_adverse=%.4f%% extreme_adverse=%.4f%% threshold=%.4f%%",
-        symbol, side, hold, entry_price, current_price, high, low, profit * 100.0, adverse_from_entry * 100.0, adverse_from_extreme * 100.0, threshold * 100.0,
+        "[EARLY PROFIT GUARD] check symbol=%s side=%s hold=%.1fs entry=%.4f price=%.4f high=%.4f low=%.4f profit=%.4f%% entry_adverse=%.4f%% extreme_adverse=%.4f%% threshold=%.4f%% no_progress_sec=%.1f no_progress_need=%.4f%%",
+        symbol,
+        side,
+        hold,
+        entry_price,
+        current_price,
+        high,
+        low,
+        profit * 100.0,
+        adverse_from_entry * 100.0,
+        adverse_from_extreme * 100.0,
+        threshold * 100.0,
+        no_progress_sec,
+        no_progress_need * 100.0,
     )
 
     if threshold > 0 and adverse_from_entry >= threshold:
@@ -179,7 +214,7 @@ def judge_early_profit_guard(*, symbol: str, pos: dict[str, Any], side: str, ent
 
     if hold >= no_progress_sec and max_profit < no_progress_need:
         reason = f"EARLY_NO_PROGRESS_{side}"
-        logger.warning("[EARLY PROFIT GUARD] EXIT symbol=%s reason=%s", symbol, reason)
+        logger.warning("[EARLY PROFIT GUARD] EXIT symbol=%s reason=%s hold=%.1fs max_profit=%.4f%% need=%.4f%%", symbol, reason, hold, max_profit * 100.0, no_progress_need * 100.0)
         return True, reason
 
     return False, ""
