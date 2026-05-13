@@ -1,21 +1,18 @@
 # ============================================================
 # File   : core/startup/entry_controller_runtime_reject_patch.py
-# Version: PRODUCTION-ENTRY-ORDER-REJECT-PATCH-V3-CREDIT-SUPPRESS
+# Version: PRODUCTION-ENTRY-ORDER-REJECT-PATCH-V4-NO-100368-CACHE
 # ------------------------------------------------------------
 # 目的:
-#   kabu API Code=100368/100033 等で注文IDが空になった時に、
-#   entry_controller 側で原因を見える化し、再試行扱いにしない。
+#   kabu APIで注文IDが空になった時に、entry_controller 側で原因を見える化する。
 #
-# 背景:
-#   send_order.py 側で CREDIT_NEW_ORDER_SUPPRESSED_BY_KABU_API を検出し
-#   global_data.trade_restricted[symbol] へ登録しても、直後の
-#   _execute_best_candidate では order_id=None だけを見て
-#   ORDER_ID_EMPTY_RETRYABLE としてログしていた。
-#
-# 方針:
-#   place_entry_buy/sell から戻った直後に trade_restricted を再確認し、
-#   登録済みなら CREDIT_NEW_ORDER_SUPPRESSED_BY_KABU_API として終了する。
-#   BUY/SELL とも信用新規のまま。現物化はしない。
+# 重要修正:
+#   - Code=100368
+#     「現在、株式信用新規の注文は抑止されております。」は、
+#     銘柄個別の trade_restricted / SELL拒否キャッシュ扱いにしない。
+#     その注文は失敗として扱うが、次候補・次サイクルは止めない。
+#   - Code=100033
+#     「この銘柄のお取引は制限されています。」は銘柄個別制限として扱う。
+#   - BUY/SELL とも信用新規のまま。現物化はしない。
 # ============================================================
 
 from __future__ import annotations
@@ -26,6 +23,9 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _PATCHED = False
+
+KABU_CODE_CREDIT_NEW_ORDER_SUPPRESSED = "100368"
+KABU_CODE_SYMBOL_TRADE_RESTRICTED = "100033"
 
 
 def _short_dict(d: dict | None, keys: list[str]) -> dict:
@@ -49,6 +49,63 @@ def _trade_restrict_detail(ec: Any, symbol: str) -> dict:
         return {}
 
 
+def _last_send_error() -> dict:
+    try:
+        from kabu_api.send_order import get_last_send_order_error
+
+        err = get_last_send_order_error()
+        return dict(err) if isinstance(err, dict) else {}
+    except Exception:
+        return {}
+
+
+def _norm_code(v: Any) -> str:
+    try:
+        if v is None:
+            return ""
+        s = str(v).strip()
+        if s.endswith(".0"):
+            s = s[:-2]
+        return s
+    except Exception:
+        return ""
+
+
+def _is_100368_error(err: dict) -> bool:
+    code = _norm_code(err.get("code"))
+    msg = str(err.get("message") or "")
+    if code == KABU_CODE_CREDIT_NEW_ORDER_SUPPRESSED:
+        return True
+    if "信用新規" in msg and "抑止" in msg:
+        return True
+    return False
+
+
+def _is_100033_error(err: dict) -> bool:
+    code = _norm_code(err.get("code"))
+    msg = str(err.get("message") or "")
+    if code == KABU_CODE_SYMBOL_TRADE_RESTRICTED:
+        return True
+    if "この銘柄" in msg and "取引" in msg and "制限" in msg:
+        return True
+    return False
+
+
+def _same_order_error(err: dict, *, symbol: str, side: str) -> bool:
+    """
+    send_order.py の last_error が今回の注文に対応しているかを軽く確認する。
+    side は BUY/SELL、send_order.py 側も BUY/SELL で保存する。
+    """
+    try:
+        if not err:
+            return False
+        err_symbol = str(err.get("symbol") or "").strip()
+        err_side = str(err.get("side") or "").strip().upper()
+        return err_symbol == str(symbol) and err_side == str(side).upper()
+    except Exception:
+        return False
+
+
 def install() -> bool:
     global _PATCHED
 
@@ -67,7 +124,7 @@ def install() -> bool:
         logger.warning("[ENTRY REJECT PATCH] target _execute_best_candidate not found")
         return False
 
-    if getattr(old_fn, "_runtime_reject_patched_v3", False):
+    if getattr(old_fn, "_runtime_reject_patched_v4", False):
         _PATCHED = True
         return True
 
@@ -108,8 +165,6 @@ def install() -> bool:
         )
 
         if qty <= 0:
-            # lot_sizer が 0 を返した候補は、資金上限/価格条件で発注不可。
-            # MIN_ENTRY_QTY へ戻すと ORDER_ID_EMPTY や local suppress を誘発するため送信しない。
             ec.logger.warning(
                 "⚠ ENTRY_QTY_ZERO_SKIP symbol=%s qty_raw=%s side=%s price=%s -> no order dispatch entry_diag=%s",
                 symbol,
@@ -205,14 +260,61 @@ def install() -> bool:
         )
 
         if not order_id:
-            # send_order.py が Code=100368/100033 を検出した場合、
-            # global_data.trade_restricted[symbol] に登録済みになる。
-            # この場合は ORDER_ID_EMPTY_RETRYABLE ではなく、非再試行扱いにする。
+            last_err = _last_send_error()
+            same_err = _same_order_error(last_err, symbol=symbol, side=side)
+
+            # 100368は銘柄個別停止にしない。今回の注文は失敗だが、次候補・次サイクルは止めない。
+            if same_err and _is_100368_error(last_err):
+                ec.logger.warning(
+                    "🚫 CREDIT_NEW_ORDER_API_REJECT_NO_LOCAL_SUPPRESS_CONFIRMED symbol=%s side=%s qty=%s order_type=%s price=%s last_error=%s",
+                    symbol,
+                    side,
+                    order_qty,
+                    order_type,
+                    order_price,
+                    last_err,
+                )
+                ec._log_skip(
+                    symbol,
+                    "CREDIT_NEW_ORDER_API_REJECT_NO_LOCAL_SUPPRESS",
+                    side=side,
+                    qty=order_qty,
+                    order_type=order_type,
+                    price=order_price,
+                    code=last_err.get("code"),
+                    message=last_err.get("message"),
+                )
+                return False
+
+            # 100033等は銘柄個別制限。
+            if same_err and _is_100033_error(last_err):
+                detail = {"code": last_err.get("code"), "message": last_err.get("message")}
+                ec.logger.warning(
+                    "🚫 SYMBOL_TRADE_RESTRICTED_BY_KABU_API_CONFIRMED symbol=%s side=%s qty=%s order_type=%s price=%s detail=%s",
+                    symbol,
+                    side,
+                    order_qty,
+                    order_type,
+                    order_price,
+                    detail,
+                )
+                ec._log_skip(
+                    symbol,
+                    "SYMBOL_TRADE_RESTRICTED_BY_KABU_API",
+                    side=side,
+                    qty=order_qty,
+                    order_type=order_type,
+                    price=order_price,
+                    **detail,
+                )
+                return False
+
+            # 既存の trade_restricted は100033等だけが入る前提。
             try:
                 if ec._is_symbol_trade_restricted(symbol):
                     detail = _trade_restrict_detail(ec, symbol)
                     ec.logger.warning(
-                        "🚫 CREDIT_NEW_ORDER_SUPPRESSED_BY_KABU_API_CONFIRMED symbol=%s side=%s qty=%s order_type=%s price=%s detail=%s",
+                        "🚫 SYMBOL_TRADE_RESTRICTED_CONFIRMED symbol=%s side=%s qty=%s order_type=%s price=%s detail=%s",
                         symbol,
                         side,
                         order_qty,
@@ -222,7 +324,7 @@ def install() -> bool:
                     )
                     ec._log_skip(
                         symbol,
-                        "CREDIT_NEW_ORDER_SUPPRESSED_BY_KABU_API",
+                        "SYMBOL_TRADE_RESTRICTED",
                         side=side,
                         qty=order_qty,
                         order_type=order_type,
@@ -256,7 +358,7 @@ def install() -> bool:
 
             if side == "BUY":
                 ec.logger.warning(
-                    "🚫 BUY_ORDER_ID_EMPTY_DIAG symbol=%s qty=%s order_type=%s price=%s entry_diag=%s order_detail=%s ai_diag=%s possible=%s",
+                    "🚫 BUY_ORDER_ID_EMPTY_DIAG symbol=%s qty=%s order_type=%s price=%s entry_diag=%s order_detail=%s ai_diag=%s possible=%s last_error=%s",
                     symbol,
                     order_qty,
                     order_type,
@@ -269,15 +371,17 @@ def install() -> bool:
                     d,
                     _short_dict(ai, ["allow", "confidence", "lot_multiplier", "reason"]),
                     "kabu_api_returned_empty_order_id_or_place_entry_buy_suppressed",
+                    last_err,
                 )
 
             ec.logger.warning(
-                "⚠ ORDER_ID_EMPTY_NO_LONG_RESTRICT symbol=%s side=%s qty=%s order_type=%s price=%s -> retry allowed next cycle",
+                "⚠ ORDER_ID_EMPTY_NO_LONG_RESTRICT symbol=%s side=%s qty=%s order_type=%s price=%s last_error=%s -> retry allowed next cycle",
                 symbol,
                 side,
                 order_qty,
                 order_type,
                 order_price,
+                last_err,
             )
             ec._log_skip(
                 symbol,
@@ -306,10 +410,13 @@ def install() -> bool:
     _execute_best_candidate_patched._runtime_reject_patched = True  # type: ignore[attr-defined]
     _execute_best_candidate_patched._runtime_reject_patched_v2 = True  # type: ignore[attr-defined]
     _execute_best_candidate_patched._runtime_reject_patched_v3 = True  # type: ignore[attr-defined]
+    _execute_best_candidate_patched._runtime_reject_patched_v4 = True  # type: ignore[attr-defined]
     ec._execute_best_candidate = _execute_best_candidate_patched
 
     _PATCHED = True
-    logger.warning("[ENTRY REJECT PATCH] installed v3 target=trading.handlers.entry_controller._execute_best_candidate credit_suppress_diag=True")
+    logger.warning(
+        "[ENTRY REJECT PATCH] installed v4 target=trading.handlers.entry_controller._execute_best_candidate no_100368_cache=True"
+    )
     return True
 
 
