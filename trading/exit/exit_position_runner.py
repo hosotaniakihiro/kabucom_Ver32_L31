@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/exit/exit_position_runner.py
-# Version: V1.1-SPLIT-POSITION-RUNNER-EARLY-PROFIT-GUARD
+# Version: V1.2-SPLIT-POSITION-RUNNER-EARLY-GUARD-SIDE-FIX
 # ------------------------------------------------------------
 # 【概要】
 #   1銘柄分のEXIT判定を担当。
@@ -8,7 +8,7 @@
 # 【判定順序】
 #   1. 価格取得
 #   2. ctx / features 構築
-#   3. エントリー直後の建値撤退/早期利確/早期損切り
+#   3. エントリー直後の建値撤退/早期利確/早期損切り/トレーリング損切り
 #   4. collapse / inago
 #   5. 殿様イナゴEXIT
 #   6. collapse full exit
@@ -52,11 +52,40 @@ def _pos_get(pos: Dict[str, Any], *names: str, default: Any = None) -> Any:
 
 
 def _normalize_side(side: Any) -> str:
+    """
+    kabu Station / broker position / internal position の side 表記を BUY/SELL に統一する。
+
+    ここで正規化できないと、早期EXITガードに入る前に
+    [EXIT] skip invalid side で止まるため、数値・日本語表記も吸収する。
+    """
+    raw = side
     s = str(side or "").upper().strip()
-    if s in {"BUY", "BUY_CREDIT", "LONG"}:
+
+    buy_values = {
+        "BUY", "BUY_CREDIT", "LONG", "L",
+        "2", "02", "20", "B",
+        "信用買", "買", "買建", "買い", "新規買", "返済売",
+    }
+    sell_values = {
+        "SELL", "SELL_CREDIT", "SHORT", "S",
+        "1", "01", "10",
+        "信用売", "売", "売建", "売り", "新規売", "返済買",
+    }
+
+    if s in buy_values:
         return "BUY"
-    if s in {"SELL", "SELL_CREDIT", "SHORT"}:
+    if s in sell_values:
         return "SELL"
+
+    # dict形式のSideが混ざった場合の保険。
+    try:
+        if isinstance(raw, dict):
+            for key in ("side", "Side", "trade_side", "position_side", "order_side"):
+                if key in raw:
+                    return _normalize_side(raw.get(key))
+    except Exception:
+        pass
+
     return s
 
 
@@ -241,15 +270,15 @@ def run_exit_for_position(
     """
 
     try:
-        entry_price = safe_float(_pos_get(pos, "avg_price", "entry_price"))
-        side = _normalize_side(_pos_get(pos, "side"))
+        entry_price = safe_float(_pos_get(pos, "avg_price", "entry_price", "price", "Price", "CurrentPrice"))
+        side = _normalize_side(_pos_get(pos, "side", "Side", "trade_side", "position_side", "order_side"))
 
         if not entry_price:
             logger.debug("[EXIT] skip no entry_price symbol=%s pos=%s", symbol, pos)
             return False
 
         if side not in ("BUY", "SELL"):
-            logger.debug("[EXIT] skip invalid side symbol=%s side=%s", symbol, side)
+            logger.warning("[EXIT] skip invalid side symbol=%s side=%s pos_keys=%s", symbol, side, list(pos.keys()) if isinstance(pos, dict) else type(pos))
             return False
 
         price, bar5s = get_latest_exit_price(symbol)
@@ -280,7 +309,7 @@ def run_exit_for_position(
             cluster_id = 0
 
         # ====================================================
-        # 0. EARLY PROFIT / BREAKEVEN GUARD
+        # 0. EARLY PROFIT / BREAKEVEN / TRAILING STOP GUARD
         #    エントリー直後に一瞬プラスからマイナス化する問題を抑えるため、
         #    TONOSAMA / AI / 通常EXITより前に判定する。
         # ====================================================
