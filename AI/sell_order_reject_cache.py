@@ -1,18 +1,21 @@
 # ============================================================
 # File   : AI/sell_order_reject_cache.py
-# Version: PRODUCTION-RUNTIME-SELL-REJECT-CACHE-V2-100033
+# Version: PRODUCTION-RUNTIME-SELL-REJECT-CACHE-V3-NO-100368-CACHE
 # ------------------------------------------------------------
-# kabuステーションAPIで信用新規売りが拒否された銘柄を、
+# kabuステーションAPIで「銘柄個別に」信用新規売りが拒否された銘柄を、
 # 当日ランタイム中だけ SELL NG として記録する。
 #
-# 主目的:
+# 重要修正:
 #   - Code=100368
-#     「現在、株式信用新規の注文は抑止されております。」
+#     「現在、株式信用新規の注文は抑止されております。」は、
+#     銘柄個別SELL拒否キャッシュに入れない。
+#     理由: 100368 は銘柄個別NGではなく、API/セッション側の信用新規抑止を
+#           示す可能性が高く、ここで銘柄キャッシュすると次候補・次サイクルの
+#           SELL候補が大量に事前除外される。
 #   - Code=100033
-#     「この銘柄のお取引は制限されています。」
-#   - symbol_flags.db 上は貸借 / sell_target=1 でも、API側で
-#     実際に拒否される銘柄を学習して止める。
-#   - pending_entries に残っている同銘柄 SELL 候補も掃除する。
+#     「この銘柄のお取引は制限されています。」だけを、銘柄個別SELL NGとして扱う。
+#   - 古いランタイムパッチ等で 100368 が cache に入っていても、
+#     is_sell_rejected() 側で検出して自動解除する。
 # ============================================================
 
 from __future__ import annotations
@@ -23,21 +26,17 @@ from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
 
-# kabuステーションAPIの信用新規注文抑止 / 取引制限
+# kabuステーションAPIコード
 KABU_CODE_CREDIT_NEW_ORDER_REJECTED = "100368"
 KABU_CODE_SYMBOL_TRADE_RESTRICTED = "100033"
 
+# SELL拒否キャッシュへ入れるのは「銘柄個別制限」だけ。
 _REJECT_CODES = {
-    KABU_CODE_CREDIT_NEW_ORDER_REJECTED,
     KABU_CODE_SYMBOL_TRADE_RESTRICTED,
 }
 
-# 念のため、同系統の文言でも拾う
+# 銘柄個別制限だけを拾う文言。100368系の「信用新規抑止」は含めない。
 _REJECT_MESSAGE_HINTS = (
-    "株式信用新規の注文は抑止",
-    "信用新規の注文は抑止",
-    "信用新規",
-    "抑止",
     "この銘柄のお取引は制限",
     "お取引は制限",
     "取引制限",
@@ -73,9 +72,18 @@ def _normalize_code(v: Any) -> str:
 
 def is_credit_new_order_reject(code: Any = None, message: Any = None) -> bool:
     """
-    kabu API の信用新規注文抑止 / 銘柄取引制限かどうかを判定する。
+    SELL拒否キャッシュ対象かどうかを判定する。
+
+    注意:
+      関数名は互換のため残しているが、V3では 100368 を False にする。
+      100368 は send_order.py 側で「API拒否ログ」として扱い、
+      SELL reject cache / trade_restricted には入れない。
     """
     c = _normalize_code(code)
+
+    if c == KABU_CODE_CREDIT_NEW_ORDER_REJECTED:
+        return False
+
     if c in _REJECT_CODES:
         return True
 
@@ -83,8 +91,9 @@ def is_credit_new_order_reject(code: Any = None, message: Any = None) -> bool:
     if not msg:
         return False
 
-    if all(h in msg for h in ("信用新規", "抑止")):
-        return True
+    # 100368系の文言は銘柄個別キャッシュ対象外。
+    if "信用新規" in msg and "抑止" in msg:
+        return False
 
     return any(h in msg for h in _REJECT_MESSAGE_HINTS)
 
@@ -114,9 +123,23 @@ def mark_sell_rejected(
     """
     銘柄をランタイム SELL NG として登録する。
     登録時に pending_entries の同銘柄 SELL も掃除する。
+
+    V3:
+      100368 は登録しない。100033 等の銘柄個別制限だけ登録する。
     """
     sym = _normalize_symbol(symbol)
     if not sym:
+        return False
+
+    c = _normalize_code(code)
+    if c == KABU_CODE_CREDIT_NEW_ORDER_REJECTED:
+        logger.warning(
+            "[SELL ORDER REJECT CACHE] ignore 100368 symbol=%s code=%s message=%s source=%s",
+            sym,
+            c,
+            message,
+            source,
+        )
         return False
 
     if not is_credit_new_order_reject(code, message):
@@ -128,7 +151,7 @@ def mark_sell_rejected(
     cache = _get_runtime_cache()
     cache[sym] = {
         "symbol": sym,
-        "code": _normalize_code(code),
+        "code": c,
         "message": str(message or ""),
         "source": source,
         "blocked_at": now,
@@ -138,13 +161,13 @@ def mark_sell_rejected(
     logger.warning(
         "[SELL ORDER REJECT CACHE] blocked symbol=%s code=%s until=%s message=%s source=%s",
         sym,
-        _normalize_code(code),
+        c,
         until,
         message,
         source,
     )
 
-    _prune_pending_sell_entries(sym, reason=f"SELL_ORDER_REJECT_{_normalize_code(code) or 'UNKNOWN'}")
+    _prune_pending_sell_entries(sym, reason=f"SELL_ORDER_REJECT_{c or 'UNKNOWN'}")
     return True
 
 
@@ -176,6 +199,10 @@ def is_sell_rejected(symbol: Any) -> bool:
     """
     ランタイム中に信用新規売り拒否が記録されているか。
     期限切れなら自動削除する。
+
+    V3:
+      古いコードや起動時パッチにより 100368 が入っていた場合は、
+      検出時点で削除して False を返す。
     """
     sym = _normalize_symbol(symbol)
     if not sym:
@@ -184,6 +211,19 @@ def is_sell_rejected(symbol: Any) -> bool:
     cache = _get_runtime_cache()
     rec = cache.get(sym)
     if not isinstance(rec, dict):
+        return False
+
+    code = _normalize_code(rec.get("code"))
+    message = str(rec.get("message") or "")
+
+    if code == KABU_CODE_CREDIT_NEW_ORDER_REJECTED or ("信用新規" in message and "抑止" in message):
+        cache.pop(sym, None)
+        logger.warning(
+            "[SELL ORDER REJECT CACHE] removed stale 100368 cache symbol=%s code=%s message=%s",
+            sym,
+            code,
+            message,
+        )
         return False
 
     until = rec.get("blocked_until")
@@ -195,9 +235,9 @@ def is_sell_rejected(symbol: Any) -> bool:
     logger.info(
         "[SELL ORDER REJECT CACHE] active symbol=%s code=%s until=%s message=%s",
         sym,
-        rec.get("code"),
+        code,
         until,
-        rec.get("message"),
+        message,
     )
     return True
 
