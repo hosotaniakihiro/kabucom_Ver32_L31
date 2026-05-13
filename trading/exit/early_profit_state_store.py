@@ -1,9 +1,9 @@
 # ============================================================
 # File   : trading/exit/early_profit_state_store.py
-# Version: V1.0-PERSISTENT-EARLY-PROFIT-STATE
+# Version: V1.1-PERSISTENT-STAGNATION-PROGRESS-STATE
 # ------------------------------------------------------------
 # early_profit_guard の runtime state をSQLiteへ保存する。
-# 再起動後も entry後高値/安値/保持開始時刻を復元するための専用ストア。
+# 再起動後も entry後高値/安値/保持開始時刻/最後に有利方向へ進んだ時刻を復元する。
 # ============================================================
 
 from __future__ import annotations
@@ -51,8 +51,7 @@ def _iso(v: Any) -> str:
     if isinstance(v, dt.datetime):
         return v.replace(tzinfo=None).isoformat(sep=" ", timespec="seconds")
     try:
-        s = str(v or "").strip()
-        return s
+        return str(v or "").strip()
     except Exception:
         return ""
 
@@ -68,6 +67,20 @@ def _parse_time(v: Any) -> dt.datetime | None:
         return dt.datetime.fromisoformat(s)
     except Exception:
         return None
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        return {str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    except Exception:
+        return set()
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, name: str, ddl_type: str) -> None:
+    cols = _columns(conn, table)
+    if name in cols:
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl_type}")
 
 
 def ensure_schema() -> None:
@@ -87,6 +100,8 @@ def ensure_schema() -> None:
                 )
                 """
             )
+            _ensure_column(conn, "early_profit_state", "last_progress_at", "TEXT")
+            _ensure_column(conn, "early_profit_state", "last_progress_price", "REAL NOT NULL DEFAULT 0")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_early_profit_state_symbol ON early_profit_state(symbol, side)"
             )
@@ -100,7 +115,10 @@ def load_state(state_key: str) -> dict[str, Any] | None:
         with _connect() as conn:
             row = conn.execute(
                 """
-                SELECT state_key, symbol, side, entry_price, high_after_entry, low_after_entry, started_at, updated_at
+                SELECT state_key, symbol, side, entry_price,
+                       high_after_entry, low_after_entry,
+                       started_at, updated_at,
+                       last_progress_at, last_progress_price
                   FROM early_profit_state
                  WHERE state_key = ?
                 """,
@@ -117,6 +135,8 @@ def load_state(state_key: str) -> dict[str, Any] | None:
             "low": float(row[5] or 0),
             "started_at": _parse_time(row[6]),
             "updated_at": _parse_time(row[7]),
+            "last_progress_at": _parse_time(row[8]),
+            "last_progress_price": float(row[9] or 0),
         }
     except Exception:
         logger.exception("[EARLY PROFIT STATE] load failed key=%s", state_key)
@@ -133,6 +153,8 @@ def save_state(
     low_after_entry: float,
     started_at: dt.datetime | None,
     updated_at: dt.datetime | None,
+    last_progress_at: dt.datetime | None = None,
+    last_progress_price: float = 0.0,
 ) -> None:
     try:
         ensure_schema()
@@ -142,8 +164,9 @@ def save_state(
                 INSERT INTO early_profit_state (
                     state_key, symbol, side, entry_price,
                     high_after_entry, low_after_entry,
-                    started_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    started_at, updated_at,
+                    last_progress_at, last_progress_price
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(state_key) DO UPDATE SET
                     symbol = excluded.symbol,
                     side = excluded.side,
@@ -151,7 +174,9 @@ def save_state(
                     high_after_entry = excluded.high_after_entry,
                     low_after_entry = excluded.low_after_entry,
                     started_at = excluded.started_at,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    last_progress_at = excluded.last_progress_at,
+                    last_progress_price = excluded.last_progress_price
                 """,
                 (
                     state_key,
@@ -162,6 +187,8 @@ def save_state(
                     float(low_after_entry or 0),
                     _iso(started_at),
                     _iso(updated_at),
+                    _iso(last_progress_at),
+                    float(last_progress_price or 0),
                 ),
             )
     except Exception:
