@@ -1,6 +1,6 @@
 # ============================================================
 # File   : global_state.py
-# Version: V59.2-PRODUCTION-THIN-COMPAT-LAYER-POSITIONS-API-FIX
+# Version: V59.3-PRODUCTION-ENTRY-UNFILLED-CANCEL-WATCH
 # ------------------------------------------------------------
 # ✔ V59 全機能保持
 # ✔ GlobalContext完全委譲
@@ -17,13 +17,14 @@
 # ✔ entry_inflight_lock 正規化
 # ✔ fallback完全対応
 # ✔ ranking engine compatibility
-# ✔ NEW: set/get_merged_summary に source 引数対応
-# ✔ NEW: set/get_multi_summary に source 引数対応
-# ✔ NEW: get_positions() 旧API互換を追加
-# ✔ NEW: positions dataframe/dict/list fallback 対応
-# ✔ FIX: entry_inflight_lock / push_lock / orderflow_lock の None fallback 強化
-# ✔ FIX: positions 側 lock 未初期化時でも with 文で落ちない
-# ✔ FIX: entry_pipeline の global_data.get_positions AttributeError 対応
+# ✔ set/get_merged_summary に source 引数対応
+# ✔ set/get_multi_summary に source 引数対応
+# ✔ get_positions() 旧API互換
+# ✔ positions dataframe/dict/list fallback 対応
+# ✔ entry_inflight_lock / push_lock / orderflow_lock の None fallback 強化
+# ✔ positions 側 lock 未初期化時でも with 文で落ちない
+# ✔ entry_pipeline の global_data.get_positions AttributeError 対応
+# ✔ NEW: add_entry_inflight 時に未約定注文10秒取消監視を自動起動
 # ============================================================
 
 from __future__ import annotations
@@ -93,11 +94,9 @@ class GlobalDataCompat(_LegacyGlobalData):
                 return value
 
             if isinstance(value, dict):
-                # {symbol: position_dict} 形式を優先して list[dict] にする
                 vals = list(value.values())
                 if vals and all(isinstance(v, dict) for v in vals):
                     return vals
-                # 1ポジション分の dict の可能性
                 if any(k in value for k in ("symbol", "Symbol", "銘柄コード", "code", "stock_code")):
                     return [value]
                 return vals
@@ -109,6 +108,24 @@ class GlobalDataCompat(_LegacyGlobalData):
 
         except Exception:
             return []
+
+    @staticmethod
+    def _schedule_unfilled_cancel_watch(symbol: str, order_id: str, side: str) -> None:
+        """
+        エントリー注文が一定秒数未約定なら取消する監視を起動する。
+        import失敗や監視側例外で売買本体を止めない。
+        """
+        try:
+            from trading.entry.unfilled_order_cancel_watch import schedule_cancel_unfilled_entry_order
+
+            schedule_cancel_unfilled_entry_order(
+                symbol=symbol,
+                order_id=order_id,
+                side=side,
+            )
+        except Exception:
+            # global_state は薄い互換層なので、ここでは例外を握りつぶす。
+            pass
 
     # ============================================================
     # PUSH
@@ -532,9 +549,17 @@ class GlobalDataCompat(_LegacyGlobalData):
             return self._get_fallback_lock("_fallback_entry_inflight_lock")
 
     def add_entry_inflight(self, symbol: str, order_id: str, side: str):
+        """
+        エントリー注文のinflight登録。
 
+        NEW:
+          登録後に未約定取消ウォッチを起動する。
+          ENTRY_UNFILLED_CANCEL_SECONDS の既定値は10秒。
+        """
         try:
-            return GC.positions.add_entry_inflight(symbol, order_id, side)
+            ret = GC.positions.add_entry_inflight(symbol, order_id, side)
+            self._schedule_unfilled_cancel_watch(symbol, order_id, side)
+            return ret
         except Exception:
             try:
                 with self.entry_inflight_lock:
@@ -545,6 +570,7 @@ class GlobalDataCompat(_LegacyGlobalData):
                     inflight.add(symbol)
             except Exception:
                 pass
+            self._schedule_unfilled_cancel_watch(symbol, order_id, side)
 
     def remove_entry_inflight(self, symbol: str):
 
