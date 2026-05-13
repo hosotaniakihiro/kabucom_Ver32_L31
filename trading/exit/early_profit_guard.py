@@ -1,6 +1,9 @@
 # ============================================================
 # File   : trading/exit/early_profit_guard.py
-# Version: V1.6-STABLE-HOLD-TIMER-5MIN
+# Version: V1.7-PERSIST-HIGH-LOW-STATE
+# ------------------------------------------------------------
+# エントリー後の高値/安値/保持開始時刻をSQLiteに保存し、
+# main.py再起動後も復元する。
 # ============================================================
 
 from __future__ import annotations
@@ -107,6 +110,46 @@ def _extract_high_low(ctx: Any, bar5s: Any, entry_price: float, current_price: f
     return max(highs), min(lows)
 
 
+def _load_persisted_state(key: str) -> dict[str, Any] | None:
+    if not _env_bool("EARLY_PROFIT_STATE_PERSIST_ENABLED", True):
+        return None
+    try:
+        from trading.exit.early_profit_state_store import load_state
+        return load_state(key)
+    except Exception:
+        logger.exception("[EARLY PROFIT GUARD] persisted state load failed key=%s", key)
+        return None
+
+
+def _save_persisted_state(
+    *,
+    key: str,
+    symbol: str,
+    side: str,
+    entry_price: float,
+    high: float,
+    low: float,
+    started_at: dt.datetime | None,
+    updated_at: dt.datetime | None,
+) -> None:
+    if not _env_bool("EARLY_PROFIT_STATE_PERSIST_ENABLED", True):
+        return
+    try:
+        from trading.exit.early_profit_state_store import save_state
+        save_state(
+            state_key=key,
+            symbol=symbol,
+            side=side,
+            entry_price=entry_price,
+            high_after_entry=high,
+            low_after_entry=low,
+            started_at=started_at,
+            updated_at=updated_at,
+        )
+    except Exception:
+        logger.exception("[EARLY PROFIT GUARD] persisted state save failed key=%s", key)
+
+
 def _tracked(symbol: str, side: str, entry_price: float, current_price: float, pos: dict[str, Any], ctx: Any, now: dt.datetime, bar5s: Any) -> tuple[float, float, float]:
     high0, low0 = _extract_high_low(ctx, bar5s, entry_price, current_price)
     key = _key(symbol, side, entry_price)
@@ -115,12 +158,29 @@ def _tracked(symbol: str, side: str, entry_price: float, current_price: float, p
     ext_started = now - dt.timedelta(seconds=ext_hold) if ext_hold > 0 else now
 
     if not st:
-        st = {"high": high0, "low": low0, "started_at": ext_started, "updated_at": now}
-        _STATE[key] = st
-        logger.warning(
-            "[EARLY PROFIT GUARD] tracking start symbol=%s side=%s entry=%.4f price=%.4f high=%.4f low=%.4f started_at=%s hold=%.1fs",
-            symbol, side, entry_price, current_price, high0, low0, st["started_at"], ext_hold,
-        )
+        persisted = _load_persisted_state(key)
+        if persisted:
+            p_high = _sf(persisted.get("high"), high0)
+            p_low = _sf(persisted.get("low"), low0)
+            p_started = persisted.get("started_at") if isinstance(persisted.get("started_at"), dt.datetime) else ext_started
+            st = {
+                "high": max(p_high, high0),
+                "low": min(p_low if p_low > 0 else low0, low0),
+                "started_at": p_started,
+                "updated_at": now,
+            }
+            _STATE[key] = st
+            logger.warning(
+                "[EARLY PROFIT GUARD] restored state symbol=%s side=%s entry=%.4f high=%.4f low=%.4f started_at=%s",
+                symbol, side, entry_price, st["high"], st["low"], st["started_at"],
+            )
+        else:
+            st = {"high": high0, "low": low0, "started_at": ext_started, "updated_at": now}
+            _STATE[key] = st
+            logger.warning(
+                "[EARLY PROFIT GUARD] tracking start symbol=%s side=%s entry=%.4f price=%.4f high=%.4f low=%.4f started_at=%s hold=%.1fs",
+                symbol, side, entry_price, current_price, high0, low0, st["started_at"], ext_hold,
+            )
     else:
         st["high"] = max(_sf(st.get("high"), high0), high0)
         st["low"] = min(_sf(st.get("low"), low0), low0)
@@ -142,6 +202,17 @@ def _tracked(symbol: str, side: str, entry_price: float, current_price: float, p
         state_hold = max(0.0, (now - started_at).total_seconds()) if isinstance(started_at, dt.datetime) else 0.0
     except Exception:
         state_hold = 0.0
+
+    _save_persisted_state(
+        key=key,
+        symbol=symbol,
+        side=side,
+        entry_price=entry_price,
+        high=float(st["high"]),
+        low=float(st["low"]),
+        started_at=st.get("started_at"),
+        updated_at=now,
+    )
 
     return float(st["high"]), float(st["low"]), max(float(ext_hold), float(state_hold))
 
