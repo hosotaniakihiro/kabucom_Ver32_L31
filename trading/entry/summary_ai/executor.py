@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/summary_ai/executor.py
-# Version: PRODUCTION-STABLE-REV1.5-BUY-FIRST-EXECUTED-ACCURATE
+# Version: PRODUCTION-STABLE-REV1.6-BUY-FIRST-MAX10
 # ------------------------------------------------------------
 # 【概要】
 #   AI_OK 銘柄を approved_rows に変換し、
@@ -18,7 +18,7 @@
 #   - pending_entries / 注文API は直接触らない
 #   - AI gate で決まった BUY / SELL side を絶対に破壊しない
 #   - SELL候補は sell_score 優先で評価する
-#   - BUY候補が存在する場合は最大3件までBUYを優先採用する
+#   - BUY候補が存在する場合は最大10件までBUYを優先採用する
 #   - trade_restricted / SELL reject cache 済み銘柄は選抜前に除外する
 #   - 制限中の候補で枠を消費せず、次の候補を採用する
 #   - entry_pipeline の戻り値が None の場合は executed=False にする
@@ -37,7 +37,7 @@ from .utils import get_bulk_entry_pipeline, is_market_open, safe_float
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MAX_ENTRIES = 3
+DEFAULT_MAX_ENTRIES = 10
 DEFAULT_MIN_BUY_APPROVED = 3
 
 
