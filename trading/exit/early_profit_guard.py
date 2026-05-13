@@ -1,21 +1,6 @@
 # ============================================================
 # File   : trading/exit/early_profit_guard.py
-# Version: V1.5-BAR5S-TRAILING-NO-PROGRESS-5MIN
-# ------------------------------------------------------------
-# BUY:
-#   - 建値から -0.30% 下落でEXIT
-#   - エントリー後の最高値から -0.30% 下落でEXIT
-#   - 建玉後5分たっても有利方向にほとんど動かなければEXIT
-#
-# SELL:
-#   - 建値から +0.30% 上昇でEXIT
-#   - エントリー後の最安値から +0.30% 上昇でEXIT
-#   - 建玉後5分たっても有利方向にほとんど動かなければEXIT
-#
-# ENV:
-#   - TRAILING_DRAWDOWN_PCT default 0.0030
-#   - EARLY_NO_PROGRESS_SECONDS default 300.0
-#   - EARLY_NO_PROGRESS_NEED_PCT default 0.0005
+# Version: V1.6-STABLE-HOLD-TIMER-5MIN
 # ============================================================
 
 from __future__ import annotations
@@ -93,7 +78,7 @@ def _parse_time(v: Any) -> Optional[dt.datetime]:
         return None
 
 
-def _hold_seconds(pos: dict[str, Any], ctx: Any, now: dt.datetime) -> float:
+def _external_hold_seconds(pos: dict[str, Any], ctx: Any, now: dt.datetime) -> float:
     t = _parse_time(_get(ctx, "entry_time", default=None) or _get(pos, "entry_time", "created_at", "timestamp", default=None))
     if t is None:
         return 0.0
@@ -103,15 +88,13 @@ def _hold_seconds(pos: dict[str, Any], ctx: Any, now: dt.datetime) -> float:
         return 0.0
 
 
-def _key(symbol: str, side: str, entry_price: float, pos: dict[str, Any], ctx: Any) -> str:
-    t = _get(ctx, "entry_time", default=None) or _get(pos, "entry_time", "created_at", "timestamp", default="")
-    return f"{symbol}|{side}|{entry_price:.6f}|{t}"
+def _key(symbol: str, side: str, entry_price: float) -> str:
+    return f"{str(symbol)}|{side}|{entry_price:.6f}"
 
 
 def _extract_high_low(ctx: Any, bar5s: Any, entry_price: float, current_price: float) -> tuple[float, float]:
     highs = [entry_price, current_price]
     lows = [entry_price, current_price]
-
     for obj in (ctx, bar5s):
         for name in ("high_after_entry", "highest_price", "max_price", "high", "High", "h", "H"):
             x = _sf(_get(obj, name, default=None), 0.0)
@@ -121,21 +104,31 @@ def _extract_high_low(ctx: Any, bar5s: Any, entry_price: float, current_price: f
             x = _sf(_get(obj, name, default=None), 0.0)
             if x > 0:
                 lows.append(x)
-
     return max(highs), min(lows)
 
 
-def _tracked(symbol: str, side: str, entry_price: float, current_price: float, pos: dict[str, Any], ctx: Any, now: dt.datetime, bar5s: Any) -> tuple[float, float]:
+def _tracked(symbol: str, side: str, entry_price: float, current_price: float, pos: dict[str, Any], ctx: Any, now: dt.datetime, bar5s: Any) -> tuple[float, float, float]:
     high0, low0 = _extract_high_low(ctx, bar5s, entry_price, current_price)
-    key = _key(symbol, side, entry_price, pos, ctx)
+    key = _key(symbol, side, entry_price)
     st = _STATE.get(key)
+    ext_hold = _external_hold_seconds(pos, ctx, now)
+    ext_started = now - dt.timedelta(seconds=ext_hold) if ext_hold > 0 else now
+
     if not st:
-        st = {"high": high0, "low": low0, "updated_at": now}
+        st = {"high": high0, "low": low0, "started_at": ext_started, "updated_at": now}
         _STATE[key] = st
-        logger.warning("[EARLY PROFIT GUARD] tracking start symbol=%s side=%s entry=%.4f price=%.4f high=%.4f low=%.4f", symbol, side, entry_price, current_price, high0, low0)
+        logger.warning(
+            "[EARLY PROFIT GUARD] tracking start symbol=%s side=%s entry=%.4f price=%.4f high=%.4f low=%.4f started_at=%s hold=%.1fs",
+            symbol, side, entry_price, current_price, high0, low0, st["started_at"], ext_hold,
+        )
     else:
         st["high"] = max(_sf(st.get("high"), high0), high0)
         st["low"] = min(_sf(st.get("low"), low0), low0)
+        try:
+            if isinstance(st.get("started_at"), dt.datetime) and ext_started < st["started_at"]:
+                st["started_at"] = ext_started
+        except Exception:
+            pass
         st["updated_at"] = now
 
     try:
@@ -144,7 +137,13 @@ def _tracked(symbol: str, side: str, entry_price: float, current_price: float, p
     except Exception:
         pass
 
-    return float(st["high"]), float(st["low"])
+    started_at = st.get("started_at", now)
+    try:
+        state_hold = max(0.0, (now - started_at).total_seconds()) if isinstance(started_at, dt.datetime) else 0.0
+    except Exception:
+        state_hold = 0.0
+
+    return float(st["high"]), float(st["low"]), max(float(ext_hold), float(state_hold))
 
 
 def judge_early_profit_guard(*, symbol: str, pos: dict[str, Any], side: str, entry_price: float, current_price: float, ctx: Any, now: dt.datetime, bar5s: Any = None) -> Tuple[bool, str]:
@@ -160,14 +159,10 @@ def judge_early_profit_guard(*, symbol: str, pos: dict[str, Any], side: str, ent
 
     threshold = _env_float("TRAILING_DRAWDOWN_PCT", 0.0030)
     take_profit = _env_float("TAKE_PROFIT_PCT", _env_float("EARLY_TAKE_PROFIT_PCT", 0.0))
-
-    # 建玉後、ほとんど動かない銘柄を見切る時間。
-    # 既定は5分。環境変数 EARLY_NO_PROGRESS_SECONDS で上書き可能。
     no_progress_sec = _env_float("EARLY_NO_PROGRESS_SECONDS", 300.0)
     no_progress_need = _env_float("EARLY_NO_PROGRESS_NEED_PCT", 0.0005)
 
-    hold = _hold_seconds(pos, ctx, now)
-    high, low = _tracked(symbol, side, entry_price, current_price, pos, ctx, now, bar5s)
+    high, low, hold = _tracked(symbol, side, entry_price, current_price, pos, ctx, now, bar5s)
 
     if side == "BUY":
         profit = (current_price - entry_price) / entry_price
@@ -182,19 +177,7 @@ def judge_early_profit_guard(*, symbol: str, pos: dict[str, Any], side: str, ent
 
     logger.warning(
         "[EARLY PROFIT GUARD] check symbol=%s side=%s hold=%.1fs entry=%.4f price=%.4f high=%.4f low=%.4f profit=%.4f%% entry_adverse=%.4f%% extreme_adverse=%.4f%% threshold=%.4f%% no_progress_sec=%.1f no_progress_need=%.4f%%",
-        symbol,
-        side,
-        hold,
-        entry_price,
-        current_price,
-        high,
-        low,
-        profit * 100.0,
-        adverse_from_entry * 100.0,
-        adverse_from_extreme * 100.0,
-        threshold * 100.0,
-        no_progress_sec,
-        no_progress_need * 100.0,
+        symbol, side, hold, entry_price, current_price, high, low, profit * 100.0, adverse_from_entry * 100.0, adverse_from_extreme * 100.0, threshold * 100.0, no_progress_sec, no_progress_need * 100.0,
     )
 
     if threshold > 0 and adverse_from_entry >= threshold:
