@@ -1,6 +1,6 @@
 # ============================================================
 # File   : scheduler_jobs/summary/summary_ai_entry_hook_v20.py
-# Version: PRODUCTION-STABLE-SUMMARY-AI-ENTRY-HOOK-V23-TONOSAMA-OFF
+# Version: PRODUCTION-STABLE-SUMMARY-AI-ENTRY-HOOK-V24-MAX10
 # ------------------------------------------------------------
 # Purpose:
 #   - 定時サマリー計算後のAI判定hook
@@ -10,6 +10,7 @@
 #   - min_buy_score 既定を 5.0 -> 4.0 に緩和
 #   - AI_OK=0 の原因を reason/confidence/symbol 単位でログ出力する
 #   - 通常SUMMARY/PUSH/Yahoo由来では tonosama filter を既定OFF
+#   - SUMMARY_AI_ENTRY_MAX_ENTRIES 既定を 3 -> 10 に変更
 #
 # Notes:
 #   - 既存 summary_ai_entry_hook.py は長大なので壊さず残す
@@ -36,7 +37,7 @@ logger = logging.getLogger(__name__)
 _RUNNER_CACHE: Optional[Callable[..., Any]] = None
 
 DEFAULT_TOP_N = 20
-DEFAULT_MAX_ENTRIES = 3
+DEFAULT_MAX_ENTRIES = 10
 DEFAULT_MIN_CONFIDENCE = 0.65
 DEFAULT_MIN_BUY_SCORE = 4.0
 DEFAULT_MAX_SELL_SCORE = 2.0
@@ -472,12 +473,13 @@ def run_summary_ai_entry_safe(
         call_kwargs = _filter_kwargs(fn, kwargs)
 
         logger.warning(
-            "[summary.runners] summary AI entry v23 start interval=%s source=%s rows=%s runner=%s top_n=%s dry_run=%s require_market_open=%s min_conf=%.2f min_buy=%.2f max_sell=%.2f tonosama=%s pre_slope=%s min_slope=%.4f",
+            "[summary.runners] summary AI entry v23 start interval=%s source=%s rows=%s runner=%s top_n=%s max_entries=%s dry_run=%s require_market_open=%s min_conf=%.2f min_buy=%.2f max_sell=%.2f tonosama=%s pre_slope=%s min_slope=%.4f",
             interval,
             source_s,
             len(df),
             getattr(fn, "__name__", repr(fn)),
             top_n,
+            max_entries,
             dry_run,
             require_market_open,
             min_conf,
