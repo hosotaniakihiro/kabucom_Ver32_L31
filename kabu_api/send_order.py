@@ -1,21 +1,17 @@
 # ============================================================
-# kabu_api/send_order.py（Ver23.6-FINAL-CREDIT-NEW-SKIP-LOG）
+# kabu_api/send_order.py（Ver23.8-FINAL-100368-NO-LOCAL-SUPPRESS）
 # ------------------------------------------------------------
 # ・成功時は dict {"OrderId": "...", "Price": <float>} を返す
 # ・失敗時は None
 # ・buy_sell_entry と entry_handler が完全に動作する形に統一
-# ・レスポンスが文字列にならないように統一（最重要）
+# ・レスポンスが文字列にならないように統一
 #
 # 重要修正:
-# ・kabu API が Code=100368 を返したら、信用新規全体を短時間停止する
-#   - 100368: 現在、株式信用新規の注文は抑止されております。
-#   - BUY/SELL どちらで出ても、kabu側が信用新規全体を拒否している状態として扱う
-# ・停止中は /sendorder へ再送せずローカルで即スキップする
-# ・停止中スキップ時は ENTRY_SKIP __GLOBAL__ reason=CREDIT_NEW_ORDER_SUPPRESSED を出す
-#   - 「エントリーが発火しない」の理由をログで明確化する
-# ・Code=100033 は銘柄個別 trade_restricted として扱う
-# ・Code=100368 は銘柄個別 trade_restricted には入れない
-# ・SELL 100368 は従来通り sell_order_reject_cache にも登録する
+# ・制度信用固定運用を前提にする
+# ・Code=100368 が出ても、ローカルで信用新規全体を60秒停止しない
+# ・Code=100368 が出ても、SELL拒否キャッシュへ入れない
+# ・次候補・次サイクルも必ずAPIへ送って、銘柄ごとの実エラーを確認する
+# ・Code=100033 など銘柄個別制限だけ trade_restricted に入れる
 # ============================================================
 
 from __future__ import annotations
@@ -36,10 +32,11 @@ API_URL = "http://localhost:18080/kabusapi"
 # 銘柄別取引制限。Code=100033 用。
 TRADE_RESTRICT_SEC = 1800
 
-# 信用新規全体停止。Code=100368 用。
-# 300秒だと長く「発火しない」ように見えやすいため、まず60秒で再確認する。
-CREDIT_NEW_SUPPRESS_SEC = 60
+# 互換用に定義は残すが、Ver23.8では100368でローカル全体停止しない。
+CREDIT_NEW_SUPPRESS_SEC = 0
 CREDIT_NEW_SUPPRESS_KEY = "__CREDIT_NEW_ORDER_SUPPRESSED__"
+
+_LAST_SEND_ORDER_ERROR: dict[str, Any] = {}
 
 conf = configparser.ConfigParser()
 conf.read("settings.ini", encoding="utf-8")
@@ -86,10 +83,6 @@ def _payload_side_name(payload: dict) -> str:
 
 
 def _is_credit_new_order_payload(payload: dict) -> bool:
-    """
-    CashMargin=2 は信用新規。
-    BUY/SELL とも信用新規注文として扱う。
-    """
     try:
         return int(payload.get("CashMargin", 0)) == 2
     except Exception:
@@ -98,7 +91,6 @@ def _is_credit_new_order_payload(payload: dict) -> bool:
 
 def _is_sell_credit_new_payload(payload: dict) -> bool:
     try:
-        # kabu API: Side=1 が売り。CashMargin=2 が新規信用。
         return int(payload.get("Side", 0)) == 1 and int(payload.get("CashMargin", 0)) == 2
     except Exception:
         return False
@@ -106,17 +98,16 @@ def _is_sell_credit_new_payload(payload: dict) -> bool:
 
 def _is_credit_new_suppressed(data: Any) -> bool:
     """
-    Code=100368:
-      現在、株式信用新規の注文は抑止されております。
+    Code=100368 判定。
+
+    Ver23.8では、この判定をローカル全体停止には使わない。
+    ログ分類と last_error 記録用にだけ残す。
     """
     code, message = _extract_code_message(data)
-
     if code == "100368":
         return True
-
     if "信用新規" in message and "抑止" in message:
         return True
-
     return False
 
 
@@ -136,14 +127,43 @@ def _is_symbol_trade_restricted(data: Any) -> bool:
     return False
 
 
+def _set_last_send_order_error(payload: dict, data: Any, *, status_code: Any = None) -> None:
+    global _LAST_SEND_ORDER_ERROR
+    code, message = _extract_code_message(data)
+    _LAST_SEND_ORDER_ERROR = {
+        "symbol": _safe_symbol(payload),
+        "side": _payload_side_name(payload),
+        "code": code,
+        "message": message,
+        "status_code": status_code,
+        "cash_margin": payload.get("CashMargin"),
+        "margin_trade_type": payload.get("MarginTradeType"),
+        "account_type": payload.get("AccountType"),
+        "front_order_type": payload.get("FrontOrderType"),
+        "qty": payload.get("Qty"),
+        "price": payload.get("Price"),
+        "raw": data,
+        "created_at": dt.datetime.now(),
+    }
+
+
+def clear_last_send_order_error() -> None:
+    global _LAST_SEND_ORDER_ERROR
+    _LAST_SEND_ORDER_ERROR = {}
+
+
+def get_last_send_order_error() -> dict[str, Any]:
+    try:
+        return dict(_LAST_SEND_ORDER_ERROR)
+    except Exception:
+        return {}
+
+
 # ============================================================
 # global_state helpers
 # ============================================================
 
 def _get_trade_restricted_root() -> dict:
-    """
-    global_data.trade_restricted を必ず dict として取得する。
-    """
     from global_state import global_data
 
     root = getattr(global_data, "trade_restricted", None)
@@ -156,97 +176,58 @@ def _get_trade_restricted_root() -> dict:
 
 def get_credit_new_order_suppressed_until() -> dt.datetime | None:
     """
-    信用新規注文全体の停止期限を取得する。
+    互換用API。
 
-    entry_controller など上位レイヤからも参照できるよう public 名にしている。
+    Ver23.8では100368でローカル信用新規全体停止をしないため、常に None。
+    entry_controller 側の precheck がこれを見ても停止しない。
     """
-    try:
-        from global_state import global_data
-
-        until = getattr(global_data, "credit_new_order_suppressed_until", None)
-        if isinstance(until, dt.datetime):
-            return until
-
-        root = _get_trade_restricted_root()
-        until = root.get(CREDIT_NEW_SUPPRESS_KEY)
-        if isinstance(until, dt.datetime):
-            return until
-
-        return None
-
-    except Exception:
-        logger.exception("[SEND ORDER] credit-new suppress state check failed")
-        return None
+    return None
 
 
 def is_credit_new_order_globally_suppressed() -> bool:
     """
-    信用新規注文全体が現在停止中かどうか。
+    互換用API。
+
+    Ver23.8では100368を理由にローカル全体停止しない。
     """
-    try:
-        _clear_credit_new_suppressed_if_expired()
-
-        until = get_credit_new_order_suppressed_until()
-        if not isinstance(until, dt.datetime):
-            return False
-
-        return dt.datetime.now() < until
-
-    except Exception:
-        logger.exception("[SEND ORDER] credit-new suppress public check failed")
-        return False
+    return False
 
 
 def _set_credit_new_suppressed(payload: dict, data: Any) -> None:
     """
-    Code=100368 を検出したら、銘柄単位ではなく信用新規注文全体を一時停止する。
+    Ver23.8では100368でローカル全体停止しない。
+    ログだけ出して、次候補・次サイクルもAPIへ送れる状態を維持する。
     """
     try:
         if not _is_credit_new_order_payload(payload):
             return
-
         if not _is_credit_new_suppressed(data):
             return
 
-        symbol = _safe_symbol(payload)
-        side = _payload_side_name(payload)
         code, message = _extract_code_message(data)
-
-        until = dt.datetime.now() + dt.timedelta(seconds=CREDIT_NEW_SUPPRESS_SEC)
-
-        from global_state import global_data
-
-        setattr(global_data, "credit_new_order_suppressed_until", until)
-
-        root = _get_trade_restricted_root()
-        root[CREDIT_NEW_SUPPRESS_KEY] = until
-
         logger.warning(
-            "🚫 CREDIT_NEW_ORDER_GLOBAL_SUPPRESSED symbol=%s side=%s code=%s until=%s sec=%s message=%s",
-            symbol,
-            side,
+            "🚫 CREDIT_NEW_ORDER_API_REJECT_NO_LOCAL_SUPPRESS symbol=%s side=%s code=%s margin_type=%s message=%s",
+            _safe_symbol(payload),
+            _payload_side_name(payload),
             code or "UNKNOWN",
-            until,
-            CREDIT_NEW_SUPPRESS_SEC,
+            payload.get("MarginTradeType"),
             message,
         )
-
         logger.info(
-            "⛔ ENTRY_SKIP __GLOBAL__ reason=CREDIT_NEW_ORDER_SUPPRESSED detail=%s",
+            "⛔ ENTRY_SKIP %s reason=CREDIT_NEW_ORDER_API_REJECT detail=%s",
+            _safe_symbol(payload) or "__UNKNOWN__",
             {
-                "symbol": symbol,
-                "side": side,
+                "symbol": _safe_symbol(payload),
+                "side": _payload_side_name(payload),
                 "code": code or "UNKNOWN",
-                "until": str(until),
-                "sec": CREDIT_NEW_SUPPRESS_SEC,
+                "margin_trade_type": payload.get("MarginTradeType"),
                 "message": message,
-                "source": "kabu_api_100368",
+                "source": "kabu_api_100368_no_local_suppress",
             },
         )
-
     except Exception:
         logger.exception(
-            "[SEND ORDER] failed to set credit-new global suppress payload=%s data=%s",
+            "[SEND ORDER] failed to log credit-new api reject payload=%s data=%s",
             payload,
             data,
         )
@@ -254,93 +235,25 @@ def _set_credit_new_suppressed(payload: dict, data: Any) -> None:
 
 def _clear_credit_new_suppressed_if_expired() -> None:
     """
-    信用新規注文全体停止が期限切れなら解除する。
+    互換用。Ver23.8では何もしない。
     """
-    try:
-        from global_state import global_data
-
-        until = get_credit_new_order_suppressed_until()
-        if not isinstance(until, dt.datetime):
-            return
-
-        if dt.datetime.now() < until:
-            return
-
-        if getattr(global_data, "credit_new_order_suppressed_until", None) == until:
-            setattr(global_data, "credit_new_order_suppressed_until", None)
-
-        root = _get_trade_restricted_root()
-        if root.get(CREDIT_NEW_SUPPRESS_KEY) == until:
-            root.pop(CREDIT_NEW_SUPPRESS_KEY, None)
-
-        logger.warning(
-            "🟢 CREDIT_NEW_ORDER_SUPPRESSED_LOCAL_RELEASED until=%s",
-            until,
-        )
-
-    except Exception:
-        logger.exception("[SEND ORDER] failed to clear expired credit-new suppress")
+    return None
 
 
 def _credit_new_suppressed_now(payload: dict) -> bool:
     """
-    100368 発生後、一定時間は信用新規注文をAPIに送らない。
-    BUY/SELL 共通。
+    100368発生後もローカルでは止めない。
+
+    ここが False のため、次の候補・次サイクルも必ずAPIへ送る。
     """
-    try:
-        if not _is_credit_new_order_payload(payload):
-            return False
-
-        _clear_credit_new_suppressed_if_expired()
-
-        until = get_credit_new_order_suppressed_until()
-        if not isinstance(until, dt.datetime):
-            return False
-
-        now = dt.datetime.now()
-        if now < until:
-            remain = max(0.0, (until - now).total_seconds())
-            symbol = _safe_symbol(payload)
-            side = _payload_side_name(payload)
-
-            logger.warning(
-                "🚫 CREDIT_NEW_ORDER_SUPPRESSED_LOCAL_SKIP symbol=%s side=%s until=%s remain=%.1fs",
-                symbol,
-                side,
-                until,
-                remain,
-            )
-
-            # entry_controller まで到達していないように見える問題を避けるため、
-            # send_order 側でも ENTRY_SKIP 形式で理由を出す。
-            logger.info(
-                "⛔ ENTRY_SKIP __GLOBAL__ reason=CREDIT_NEW_ORDER_SUPPRESSED detail=%s",
-                {
-                    "symbol": symbol,
-                    "side": side,
-                    "until": str(until),
-                    "remain_sec": round(remain, 1),
-                    "source": "kabu_api_local_cooldown",
-                },
-            )
-            return True
-
-        return False
-
-    except Exception:
-        logger.exception(
-            "[SEND ORDER] credit-new local suppress precheck failed payload=%s",
-            payload,
-        )
-        return False
+    return False
 
 
 def _mark_symbol_trade_restricted_if_needed(payload: dict, data: Any) -> None:
     """
     Code=100033 等の銘柄個別の取引制限だけを symbol trade_restricted に入れる。
 
-    重要:
-      Code=100368 は信用新規全体の抑止なので、symbol個別停止にはしない。
+    Code=100368 は制度信用のAPI拒否ログとして扱い、銘柄個別停止にはしない。
     """
     try:
         if not _is_credit_new_order_payload(payload):
@@ -380,51 +293,17 @@ def _mark_symbol_trade_restricted_if_needed(payload: dict, data: Any) -> None:
 
 def _mark_sell_reject_if_needed(payload: dict, data: Any) -> None:
     """
-    SELL信用新規で100368が返った場合は、SELL拒否キャッシュにも入れる。
-    ただし100368自体は信用新規全体抑止としても扱う。
+    Ver23.8では100368をSELL拒否キャッシュへ入れない。
+
+    理由:
+      手動発注できる環境で100368を銘柄別SELL拒否扱いにすると、
+      次候補・次サイクルのSELL信用新規がAI選抜前に落ちる。
     """
-    try:
-        if not _is_sell_credit_new_payload(payload):
-            return
-
-        code, message = _extract_code_message(data)
-
-        if code != "100368" and not ("信用新規" in message and "抑止" in message):
-            return
-
-        symbol = _safe_symbol(payload)
-        if not symbol:
-            return
-
-        from AI.sell_order_reject_cache import mark_sell_rejected
-
-        mark_sell_rejected(
-            symbol,
-            code=code or "100368",
-            message=message,
-            source="kabu_api.send_order_common",
-        )
-
-    except Exception:
-        logger.exception(
-            "[SEND ORDER] failed to mark sell reject cache payload=%s data=%s",
-            payload,
-            data,
-        )
+    return None
 
 
-def _handle_reject_response(payload: dict, data: Any) -> None:
-    """
-    kabu API の拒否応答を分類して記録する。
-
-    100368:
-      信用新規注文全体の抑止。
-      → global credit-new suppress に入れる。
-
-    100033:
-      銘柄・取引制限。
-      → symbol trade_restricted に入れる。
-    """
+def _handle_reject_response(payload: dict, data: Any, *, status_code: Any = None) -> None:
+    _set_last_send_order_error(payload, data, status_code=status_code)
     _set_credit_new_suppressed(payload, data)
     _mark_sell_reject_if_needed(payload, data)
     _mark_symbol_trade_restricted_if_needed(payload, data)
@@ -433,10 +312,12 @@ def _handle_reject_response(payload: dict, data: Any) -> None:
 def _log_send_attempt(payload: dict) -> None:
     try:
         logger.info(
-            "[SEND ORDER ATTEMPT] symbol=%s side=%s cash_margin=%s qty=%s price=%s front_order_type=%s",
+            "[SEND ORDER ATTEMPT] symbol=%s side=%s cash_margin=%s margin_type=%s account_type=%s qty=%s price=%s front_order_type=%s",
             _safe_symbol(payload),
             _payload_side_name(payload),
             payload.get("CashMargin"),
+            payload.get("MarginTradeType"),
+            payload.get("AccountType"),
             payload.get("Qty"),
             payload.get("Price"),
             payload.get("FrontOrderType"),
@@ -468,12 +349,24 @@ def send_order_common(payload: dict):
         )
         return None
 
-    # 100368 発生中は信用新規注文をAPIに送らない。
+    clear_last_send_order_error()
+
+    # Ver23.8: 100368後もローカルでは止めない。
     if _credit_new_suppressed_now(payload):
+        _set_last_send_order_error(
+            payload,
+            {"Code": "LOCAL_SUPPRESS", "Message": "credit new local suppress"},
+            status_code="LOCAL",
+        )
         return None
 
     token = get_valid_token()
     if not token:
+        _set_last_send_order_error(
+            payload,
+            {"Code": "TOKEN", "Message": "API token unavailable"},
+            status_code="LOCAL",
+        )
         logger.error("❌ send_order_common: APIトークン取得失敗")
         return None
 
@@ -489,16 +382,13 @@ def send_order_common(payload: dict):
 
         res = requests.post(url, json=payload, headers=headers, timeout=5)
 
-        # -------------------------------------------------------
-        # HTTPエラー処理（JSONを取り出してログに表示）
-        # -------------------------------------------------------
         if res.status_code != 200:
             try:
                 data = res.json()
             except Exception:
                 data = res.text
 
-            _handle_reject_response(payload, data)
+            _handle_reject_response(payload, data, status_code=res.status_code)
 
             code, message = _extract_code_message(data)
             logger.error(
@@ -512,12 +402,14 @@ def send_order_common(payload: dict):
             )
             return None
 
-        # -------------------------------------------------------
-        # レスポンスJSON
-        # -------------------------------------------------------
         try:
             data = res.json()
         except Exception:
+            _set_last_send_order_error(
+                payload,
+                {"Code": "JSON", "Message": getattr(res, "text", "")},
+                status_code=getattr(res, "status_code", None),
+            )
             logger.error(
                 "❌ send_order_common: API JSON 解析失敗 text=%s",
                 getattr(res, "text", ""),
@@ -526,7 +418,7 @@ def send_order_common(payload: dict):
 
         order_id = data.get("OrderId") if isinstance(data, dict) else None
         if not order_id:
-            _handle_reject_response(payload, data)
+            _handle_reject_response(payload, data, status_code=getattr(res, "status_code", None))
 
             code, message = _extract_code_message(data)
             logger.error(
@@ -539,7 +431,6 @@ def send_order_common(payload: dict):
             )
             return None
 
-        # kabuS API は約定価格を返さないため payload.Price を返す
         try:
             executed_price = float(payload.get("Price", 0) or 0)
         except Exception:
@@ -552,13 +443,17 @@ def send_order_common(payload: dict):
             order_id,
         )
 
-        # ★★★ 最重要：dict で返す（文字列だけ返さない！）★★★
         return {
             "OrderId": order_id,
             "Price": executed_price,
         }
 
     except requests.exceptions.Timeout:
+        _set_last_send_order_error(
+            payload,
+            {"Code": "TIMEOUT", "Message": "sendorder timeout"},
+            status_code="LOCAL",
+        )
         logger.error(
             "❌ send_order_common timeout symbol=%s side=%s",
             _safe_symbol(payload),
@@ -568,6 +463,11 @@ def send_order_common(payload: dict):
         return None
 
     except requests.exceptions.RequestException as e:
+        _set_last_send_order_error(
+            payload,
+            {"Code": "REQUEST", "Message": str(e)},
+            status_code="LOCAL",
+        )
         logger.error(
             "❌ send_order_common request exception symbol=%s side=%s err=%s",
             _safe_symbol(payload),
@@ -578,6 +478,11 @@ def send_order_common(payload: dict):
         return None
 
     except Exception as e:
+        _set_last_send_order_error(
+            payload,
+            {"Code": "EXCEPTION", "Message": str(e)},
+            status_code="LOCAL",
+        )
         logger.error(
             "❌ send_order_common 例外 symbol=%s side=%s err=%s",
             _safe_symbol(payload),
