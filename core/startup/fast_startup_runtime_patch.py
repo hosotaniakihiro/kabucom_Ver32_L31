@@ -1,10 +1,12 @@
 # ============================================================
 # File   : core/startup/fast_startup_runtime_patch.py
-# Version: PRODUCTION-FAST-STARTUP-PATCH-V3-OPEN-POSITION-BROKER-MERGE
+# Version: PRODUCTION-FAST-STARTUP-PATCH-V4-EXIT-EXECUTOR-BROKER-FALLBACK
 # ------------------------------------------------------------
 # 目的:
 #   main.py 起動直後の重い処理を軽くする。
 #   さらに、OPEN建玉同期に broker 実建玉マージpatchを入れる。
+#   さらに、EXIT_EXECUTOR が内部建玉を見つけられない場合でも、
+#   broker信用建玉から復元して返済注文できるpatchを起動時に入れる。
 # ============================================================
 
 from __future__ import annotations
@@ -81,6 +83,16 @@ def _install_open_position_broker_merge_patch() -> None:
         logger.exception("[FAST STARTUP PATCH] open_position_broker_merge_patch install failed")
 
 
+def _install_exit_executor_broker_position_patch() -> None:
+    try:
+        from core.startup.exit_executor_broker_position_patch import install as install_exit_executor_patch
+
+        ok = install_exit_executor_patch()
+        logger.warning("[FAST STARTUP PATCH] exit_executor_broker_position_patch installed=%s", ok)
+    except Exception:
+        logger.exception("[FAST STARTUP PATCH] exit_executor_broker_position_patch install failed")
+
+
 def install() -> bool:
     global _PATCHED
     if _PATCHED:
@@ -101,6 +113,11 @@ def install() -> bool:
         _install_open_position_broker_merge_patch()
     except Exception:
         logger.exception("[FAST STARTUP PATCH] open position broker patch failed")
+
+    try:
+        _install_exit_executor_broker_position_patch()
+    except Exception:
+        logger.exception("[FAST STARTUP PATCH] exit executor broker patch failed")
 
     try:
         old_lookback = getattr(sb, "_DEFAULT_RANKING_LOOKBACK_MINUTES", None)
