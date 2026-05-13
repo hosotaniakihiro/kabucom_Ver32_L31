@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/ranking/active_symbols/manager.py
-# Version: Ver1.2-ACTIVE-SYMBOLS-TARGET100-SUPPLEMENT
+# Version: Ver1.3-ACTIVE-SYMBOLS-DAILY-WATCHLIST-FIRST-SUPPLEMENT
 # ------------------------------------------------------------
 # 目的:
 #   PUSH監視候補を原則100銘柄にする。
@@ -8,9 +8,10 @@
 # 重要修正:
 #   - 寄前SBIが96銘柄など100未満の場合でも、保有銘柄を加えた後、
 #     不足分を安全な補充候補から追加する。
+#   - 補充候補は daily_watchlist を最優先する。
 #   - これまでの不足時補充は allowed_universe に縛られていたため、
 #     寄前SBI universe 自体が100未満だと補充不能だった。
-#   - 寄前モードでは、価格列が無いことを前提に、symbol_flags適格銘柄から補充する。
+#   - 寄前モードでは、価格列が無いことを前提に、symbol_flags適格銘柄からも補充する。
 #   - 通常場中モードでは、従来どおり流動性条件を守る。
 #   - 保有中銘柄 protected は必ず残す。
 # ============================================================
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import sqlite3
 from typing import Iterable, List, Set, Tuple
 
 from global_state import global_data
@@ -138,6 +140,76 @@ def _flag_bool(v) -> bool:
         return False
 
 
+def _load_daily_watchlist_symbols(limit: int = 200) -> List[str]:
+    """
+    optional_data.db の daily_watchlist から補充候補を取得する。
+
+    補充品質を上げるため、単なる symbol_flags 全体より先に使う。
+    build_daily_watchlist.py が保存した直近 date の100銘柄を優先する。
+    """
+    try:
+        from config.paths import get_path
+
+        db_path = get_path("optional_db")
+    except Exception:
+        logger.debug("[ACTIVE SUPPLEMENT] optional_db path resolve failed", exc_info=True)
+        return []
+
+    try:
+        if not db_path or not db_path.exists():
+            logger.info("[ACTIVE SUPPLEMENT] daily_watchlist db not found path=%s", db_path)
+            return []
+    except Exception:
+        return []
+
+    try:
+        with sqlite3.connect(str(db_path), timeout=3.0) as con:
+            cur = con.cursor()
+            try:
+                row = cur.execute("SELECT MAX(date) FROM daily_watchlist").fetchone()
+            except sqlite3.Error:
+                logger.info("[ACTIVE SUPPLEMENT] daily_watchlist table not ready path=%s", db_path)
+                return []
+
+            latest_date = row[0] if row else None
+            if not latest_date:
+                logger.info("[ACTIVE SUPPLEMENT] daily_watchlist empty path=%s", db_path)
+                return []
+
+            rows = cur.execute(
+                """
+                SELECT symbol
+                FROM daily_watchlist
+                WHERE date = ?
+                ORDER BY
+                    COALESCE(buy_score, 0) + COALESCE(sell_score, 0) DESC,
+                    COALESCE(buy_score, 0) DESC,
+                    COALESCE(sell_score, 0) DESC,
+                    symbol ASC
+                LIMIT ?
+                """,
+                (latest_date, int(limit)),
+            ).fetchall()
+
+        symbols = dedupe_keep_order(
+            normalize_symbol(r[0]) for r in rows if r and r[0] is not None
+        )
+        logger.info(
+            "[ACTIVE SUPPLEMENT] daily_watchlist loaded date=%s count=%d head=%s db=%s",
+            latest_date,
+            len(symbols),
+            symbols[:20],
+            db_path,
+        )
+        return symbols
+    except sqlite3.OperationalError as e:
+        logger.warning("[ACTIVE SUPPLEMENT] daily_watchlist read skipped sqlite err=%s path=%s", e, db_path)
+        return []
+    except Exception:
+        logger.exception("[ACTIVE SUPPLEMENT] daily_watchlist read failed path=%s", db_path)
+        return []
+
+
 def _supplement_sort_key(
     sym: str,
     *,
@@ -202,10 +274,19 @@ def _iter_target_supplement_sources(
 ) -> Iterable[str]:
     """
     TARGET_ACTIVE_SYMBOLS 未満のときの補充元。
-    前半は品質が高い既知候補、最後に symbol_flags 適格銘柄で埋める。
+    優先順:
+      1. 既存候補 / 直近候補
+      2. optional_data.db の daily_watchlist
+      3. global_data 上の watchlist 候補
+      4. allowed_universe 内の漏れ
+      5. 最終手段として symbol_flags 適格銘柄
     """
     # まず既存の候補・直近候補。
     yield from _iter_fallback_sources(prev_active, hot_symbols, primary_candidates)
+
+    # daily_watchlist DBを最優先補充元にする。
+    for s in _load_daily_watchlist_symbols(limit=max(TARGET_ACTIVE_SYMBOLS * 2, 200)):
+        yield str(s)
 
     # 起動済みプロセスに載っている可能性がある候補群。
     for attr in (
@@ -481,7 +562,7 @@ def _update_active_symbols_impl(force: bool = False) -> List[str]:
             if len(active) >= TARGET_ACTIVE_SYMBOLS:
                 break
 
-    # それでも足りない場合、寄前は symbol_flags 適格銘柄から不足分を補充する。
+    # それでも足りない場合、daily_watchlist → symbol_flags 適格銘柄の順で補充する。
     supplement_diag = {}
     if len(active) < TARGET_ACTIVE_SYMBOLS:
         active, supplement_diag = _supplement_active_to_target(
