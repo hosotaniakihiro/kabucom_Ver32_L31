@@ -1,6 +1,6 @@
 # ==========================================================
 # trading/handlers/entry_order_builder.py
-# Ver1.3.0-FINAL-SUMMARY-AGGRESSIVE-LIMIT-1TICK
+# Ver1.4.0-FINAL-SUMMARY-LOW-MOVE-HARD-BLOCK
 # ----------------------------------------------------------
 # ✔ 注文条件（price / order_type / qty）を決定するだけ
 # ✔ 副作用ゼロ（発注・global_state 操作なし）
@@ -11,12 +11,17 @@
 # ✔ SUMMARY_AI の約定優先指値を導入
 #   - BUY  : ask + 1tick / fallback価格 + 1tick
 #   - SELL : bid - 1tick / fallback価格 - 1tick
+# ✔ 最終防衛: 動いていない銘柄は発注直前で止める
+#   - high/low/close が無い銘柄は止める
+#   - (high-low)/close が小さい銘柄は止める
+#   - atr/price が小さい銘柄は止める
 # ✔ 未約定は pending_order_monitor 側で2秒取消
 # ==========================================================
 
 from __future__ import annotations
 
 import math
+import os
 from typing import Dict, Any, Optional
 
 from global_state import global_data
@@ -39,6 +44,34 @@ MIN_ENTRY_QTY = 100
 # ただし未約定なら pending_order_monitor 側で2秒取消される。
 SUMMARY_AGGRESSIVE_LIMIT_TICKS = 1
 
+# ----------------------------------------------------------
+# 低ボラ最終防衛
+# ----------------------------------------------------------
+# 上流の volatility_filter が古い閾値で呼ばれたり、SUMMARY系バイパスが残っていても、
+# ここで最後に止める。
+ENTRY_ORDER_LOW_MOVE_GUARD_ENABLED = str(os.getenv("ENTRY_ORDER_LOW_MOVE_GUARD_ENABLED", "1")).lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+
+# 直近summary行の高安幅 / 終値。
+# まずは 1.2%。動いていない銘柄を確実に落とす。
+ENTRY_ORDER_MIN_RANGE_PCT = float(os.getenv("ENTRY_ORDER_MIN_RANGE_PCT", "0.012"))
+
+# ATR / 終値。
+ENTRY_ORDER_MIN_ATR_RATIO = float(os.getenv("ENTRY_ORDER_MIN_ATR_RATIO", "0.0035"))
+
+# atr が無い場合に高安幅だけで許可しない。
+# True なら atr 欠損は発注しない。
+ENTRY_ORDER_REQUIRE_ATR = str(os.getenv("ENTRY_ORDER_REQUIRE_ATR", "1")).lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+
 
 # ==========================================================
 # 共通結果フォーマット
@@ -58,6 +91,127 @@ def _ng(reason: str, **detail) -> Dict[str, Any]:
         "reason": reason,
         "detail": detail,
     }
+
+
+# ==========================================================
+# safe helpers
+# ==========================================================
+
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or v == "":
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def _first(row: Dict[str, Any], keys: tuple[str, ...], default: Any = None) -> Any:
+    try:
+        for k in keys:
+            v = row.get(k)
+            if v is not None and str(v).strip() != "":
+                return v
+    except Exception:
+        pass
+    return default
+
+
+# ==========================================================
+# 低ボラ最終防衛
+# ==========================================================
+
+def _low_move_hard_block(entry_row: Dict[str, Any], *, symbol: str, source: str) -> Optional[Dict[str, Any]]:
+    """
+    発注直前の最終防衛。
+
+    上流フィルターが古い閾値で通ったり、SUMMARY系バイパスで通っても、
+    entry_order_builder で止めれば実発注されない。
+    """
+    if not ENTRY_ORDER_LOW_MOVE_GUARD_ENABLED:
+        return None
+
+    source_u = str(source or "").upper()
+
+    # RANKING/TONOSAMA は5秒ブレイクで別判定しているため、まずは SUMMARY_AI を強制対象にする。
+    if source_u != "SUMMARY_AI":
+        return None
+
+    row = entry_row or {}
+
+    close = _safe_float(
+        _first(row, ("close_price", "close", "price", "current_price"), 0.0),
+        0.0,
+    )
+    high = _safe_float(_first(row, ("high_price", "high"), 0.0), 0.0)
+    low = _safe_float(_first(row, ("low_price", "low"), 0.0), 0.0)
+    atr = _safe_float(
+        _first(row, ("atr_1m", "atr", "ATR", "atr14", "atr_14"), 0.0),
+        0.0,
+    )
+
+    if close <= 0:
+        return _ng(
+            "LOW_MOVE_NO_CLOSE",
+            symbol=symbol,
+            close=close,
+            min_range_pct=ENTRY_ORDER_MIN_RANGE_PCT,
+            min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO,
+        )
+
+    if high <= 0 or low <= 0 or high < low:
+        return _ng(
+            "LOW_MOVE_NO_HIGH_LOW",
+            symbol=symbol,
+            close=close,
+            high=high,
+            low=low,
+            min_range_pct=ENTRY_ORDER_MIN_RANGE_PCT,
+            min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO,
+        )
+
+    range_value = high - low
+    range_pct = range_value / close if close > 0 else 0.0
+
+    if range_pct < ENTRY_ORDER_MIN_RANGE_PCT:
+        return _ng(
+            "LOW_MOVE_RANGE_TOO_SMALL",
+            symbol=symbol,
+            close=close,
+            high=high,
+            low=low,
+            range_value=range_value,
+            range_pct=range_pct,
+            min_range_pct=ENTRY_ORDER_MIN_RANGE_PCT,
+        )
+
+    if atr <= 0:
+        if ENTRY_ORDER_REQUIRE_ATR:
+            return _ng(
+                "LOW_MOVE_NO_ATR",
+                symbol=symbol,
+                close=close,
+                high=high,
+                low=low,
+                range_pct=range_pct,
+                atr=atr,
+                min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO,
+            )
+        return None
+
+    atr_ratio = atr / close if close > 0 else 0.0
+    if atr_ratio < ENTRY_ORDER_MIN_ATR_RATIO:
+        return _ng(
+            "LOW_MOVE_ATR_TOO_SMALL",
+            symbol=symbol,
+            close=close,
+            atr=atr,
+            atr_ratio=atr_ratio,
+            min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO,
+            range_pct=range_pct,
+        )
+
+    return None
 
 
 # ==========================================================
@@ -144,6 +298,13 @@ def build_entry_order(
 
     side = side.upper()
     source = source.upper()
+
+    # ======================================================
+    # 最終防衛: 動いていないSUMMARY銘柄は発注条件を作らない
+    # ======================================================
+    low_move_ng = _low_move_hard_block(entry_row, symbol=symbol, source=source)
+    if low_move_ng is not None:
+        return low_move_ng
 
     # ======================================================
     # SUMMARY 起点
@@ -262,6 +423,10 @@ def build_entry_order(
         "board": bool(board),
         "price_source": price_source,
         "aggressive_limit_ticks": SUMMARY_AGGRESSIVE_LIMIT_TICKS if source == "SUMMARY_AI" and order_type == "LIMIT" else 0,
+        "low_move_guard": bool(ENTRY_ORDER_LOW_MOVE_GUARD_ENABLED and source == "SUMMARY_AI"),
+        "min_range_pct": ENTRY_ORDER_MIN_RANGE_PCT,
+        "min_atr_ratio": ENTRY_ORDER_MIN_ATR_RATIO,
+        "require_atr": ENTRY_ORDER_REQUIRE_ATR,
     }
 
     if qty_override is not None:
