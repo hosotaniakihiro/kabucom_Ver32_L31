@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/ranking/active_symbols/config.py
-# Version: Ver1.0-ACTIVE-SYMBOLS-CONFIG
+# Version: Ver1.1-ACTIVE-SYMBOLS-CATEGORY-QUOTA-CONFIG
 # ============================================================
 from __future__ import annotations
 import os
@@ -33,10 +33,26 @@ def env_float(name: str, default: float) -> float:
     except Exception:
         return float(default)
 
+
 TARGET_ACTIVE_SYMBOLS = env_int("ACTIVE_TARGET_SYMBOLS", 100)
 MAX_ACTIVE_SYMBOLS = env_int("ACTIVE_MAX_SYMBOLS", 100)
 RANKING_EXPIRE_MINUTES = env_int("ACTIVE_RANKING_EXPIRE_MINUTES", 20)
 VOLUME_SPEED_TOP_N = env_int("ACTIVE_VOLUME_SPEED_TOP_N", 10)
+
+# ------------------------------------------------------------
+# 今日ランキングカテゴリ配分
+# ------------------------------------------------------------
+# 1. 値上がり率ランキング内で売買代金上位30
+# 2. 値下がり率ランキング内で売買代金上位10
+# 3. 売買代金ランキング内で上昇率上位30
+# 4. 売買代金ランキング内で下落率上位10
+# 5. 残りはTICK上位で100まで補充
+ACTIVE_USE_CATEGORY_QUOTA_SELECTION = env_bool("ACTIVE_USE_CATEGORY_QUOTA_SELECTION", True)
+ACTIVE_GAINERS_BY_VALUE_N = env_int("ACTIVE_GAINERS_BY_VALUE_N", 30)
+ACTIVE_LOSERS_BY_VALUE_N = env_int("ACTIVE_LOSERS_BY_VALUE_N", 10)
+ACTIVE_VALUE_BY_GAINERS_N = env_int("ACTIVE_VALUE_BY_GAINERS_N", 30)
+ACTIVE_VALUE_BY_LOSERS_N = env_int("ACTIVE_VALUE_BY_LOSERS_N", 10)
+ACTIVE_TICK_SUPPLEMENT_N = env_int("ACTIVE_TICK_SUPPLEMENT_N", 100)
 
 DEFAULT_SYMBOL_FLAGS_DB = r"\\192.168.0.22\AutoStockBuyAndSell\Basic\symbol_flags.db"
 SYMBOL_FLAGS_DB = os.environ.get("SYMBOL_FLAGS_DB_PATH", DEFAULT_SYMBOL_FLAGS_DB)
@@ -58,9 +74,13 @@ MIN_TRADING_VALUE = env_float("ACTIVE_MIN_TRADING_VALUE", 20_000_000)
 MIN_VOLUME = env_float("ACTIVE_MIN_VOLUME", 3_000)
 MIN_TICK_COUNT = env_float("ACTIVE_MIN_TICK_COUNT", 10)
 MIN_PRICE = env_float("ACTIVE_MIN_PRICE", 200)
+# 監視銘柄は5000円以下に限定。0以下にすると上限なし。
+MAX_PRICE = env_float("ACTIVE_MAX_PRICE", 5_000)
 KEEP_PROTECTED_EVEN_IF_ILLIQUID = env_bool("ACTIVE_KEEP_PROTECTED_EVEN_IF_ILLIQUID", True)
 
 PRICE_COLUMNS = ("current_price", "price", "close", "close_price", "現在値")
 VOLUME_COLUMNS = ("trading_volume", "volume", "出来高")
 VALUE_COLUMNS = ("trading_value", "turnover", "売買代金")
 TICK_COLUMNS = ("tick_count", "tick", "ticks", "TICK回数")
+CHANGE_COLUMNS = ("change_percentage", "change_ratio", "change_rate", "騰落率", "前日比率", "前日比%", "change_pct")
+RANK_TYPE_COLUMNS = ("ranking_type", "rank_type", "type", "category", "ランキング種別", "ranking_name")
