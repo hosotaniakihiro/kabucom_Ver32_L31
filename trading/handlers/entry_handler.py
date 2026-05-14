@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/handlers/entry_handler.py
-# Version: Ver27.11.0-FINAL-LIMIT-PRICE-DIRECT-SEND
+# Version: Ver27.12.0-FINAL-LIMIT-PRICE-DIRECT-SEND-CANCEL-WATCH
 # ------------------------------------------------------------
 # ✔ kabu_api.buy_sell_entry に完全準拠
 # ✔ 注文実行専用（低レイヤ）
@@ -17,8 +17,8 @@
 # ✔ MARKET注文へ上位レイヤpriceをreference_priceとして渡す
 # ✔ order_price=None の場合は pending/global_data から reference_price を復元
 # ✔ LIMIT注文で上位レイヤpriceがある場合は、その価格で直接発注する
-#   - 旧: LIMITでも best ask/bid を取り直し、板なしならスキップ
-#   - 新: LIMIT price が渡されたらその価格で payload を作って送る
+# ✔ DIRECT LIMITでも信用新規は bse.ENTRY_EXCHANGE（通常27）を使う
+# ✔ 発注成功OrderIdを10秒取消監視へ登録
 # ============================================================
 
 from __future__ import annotations
@@ -38,6 +38,11 @@ from kabu_api.buy_sell_entry import (
     execute_buy_stop,
     execute_short_stop,
 )
+
+try:
+    from trading.handlers.pending_order_monitor import register_pending_entry_order
+except Exception:  # 起動時の循環/部分導入でも落とさない
+    register_pending_entry_order = None
 
 logger = logging.getLogger("entry_handler")
 
@@ -262,6 +267,33 @@ def _normalize_args(
     }
 
 
+def _register_cancel_watch(order_id: str, symbol: str, side: str, qty: Optional[int], price: Optional[float], source: str):
+    try:
+        if callable(register_pending_entry_order):
+            register_pending_entry_order(
+                order_id=order_id,
+                symbol=symbol,
+                side=side,
+                qty=int(qty or 0),
+                price=price,
+                source=source,
+            )
+        else:
+            logger.warning(
+                "[ENTRY CANCEL WATCH] register function unavailable order_id=%s symbol=%s side=%s",
+                order_id,
+                symbol,
+                side,
+            )
+    except Exception:
+        logger.exception(
+            "[ENTRY CANCEL WATCH] register failed order_id=%s symbol=%s side=%s",
+            order_id,
+            symbol,
+            side,
+        )
+
+
 def _execute_direct_limit_order(symbol: str, side: str, price: float, qty: int):
     """
     entry_order_builder が price 付き LIMIT を作った場合は、板を取り直さずに
@@ -269,6 +301,9 @@ def _execute_direct_limit_order(symbol: str, side: str, price: float, qty: int):
 
     これにより、summary_fallback_limit の price があるにもかかわらず
     execute_buy_at_best_ask / execute_short_at_best_bid が板なしでスキップする問題を防ぐ。
+
+    信用新規エントリーの市場は kabu_api.buy_sell_entry.ENTRY_EXCHANGE を使う。
+    通常時の信用新規は Exchange=27（東証+）。
     """
     try:
         side_u = str(side or "").upper()
@@ -286,12 +321,15 @@ def _execute_direct_limit_order(symbol: str, side: str, price: float, qty: int):
             )
             return None
 
+        entry_exchange = int(getattr(bse, "ENTRY_EXCHANGE", 27))
+
         logger.warning(
-            "[ENTRY DIRECT LIMIT DISPATCH] symbol=%s side=%s price=%s qty=%s reason=use_order_builder_limit_price",
+            "[ENTRY DIRECT LIMIT DISPATCH] symbol=%s side=%s price=%s qty=%s exchange=%s reason=use_order_builder_limit_price",
             symbol,
             side_u,
             px,
             q,
+            entry_exchange,
         )
 
         payload = bse._make_payload(
@@ -299,7 +337,7 @@ def _execute_direct_limit_order(symbol: str, side: str, price: float, qty: int):
             side=side_code,
             qty=q,
             price=px,
-            exchange=1,
+            exchange=entry_exchange,
             front_order_type=20,
         )
 
@@ -394,6 +432,7 @@ def place_entry_buy(
             return None
 
         _ensure_entry_inflight_set()
+        _register_cancel_watch(order_id, p["symbol"], "BUY", p["qty"], p["price"], "ENTRY_BUY")
 
         logger.info(
             "[ENTRY BUY SENT] symbol=%s type=%s oid=%s qty=%s reason=%s",
@@ -486,6 +525,7 @@ def place_entry_sell(
             return None
 
         _ensure_entry_inflight_set()
+        _register_cancel_watch(order_id, p["symbol"], "SELL", p["qty"], p["price"], "ENTRY_SELL")
 
         logger.info(
             "[ENTRY SELL SENT] symbol=%s type=%s oid=%s qty=%s reason=%s",
@@ -503,4 +543,11 @@ def place_entry_sell(
 # ============================================================
 
 def _unlock_entry(symbol: str):
+    try:
+        sym = _norm_symbol(symbol)
+        inflight = getattr(global_data, "entry_inflight", None)
+        if hasattr(inflight, "discard"):
+            inflight.discard(sym)
+    except Exception:
+        pass
     return
