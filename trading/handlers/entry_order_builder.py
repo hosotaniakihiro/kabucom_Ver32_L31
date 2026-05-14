@@ -1,6 +1,6 @@
 # ==========================================================
 # trading/handlers/entry_order_builder.py
-# Ver1.4.0-FINAL-SUMMARY-LOW-MOVE-HARD-BLOCK
+# Ver1.4.1-FINAL-SUMMARY-LOW-MOVE-SAFE-GUARD
 # ----------------------------------------------------------
 # ✔ 注文条件（price / order_type / qty）を決定するだけ
 # ✔ 副作用ゼロ（発注・global_state 操作なし）
@@ -11,10 +11,10 @@
 # ✔ SUMMARY_AI の約定優先指値を導入
 #   - BUY  : ask + 1tick / fallback価格 + 1tick
 #   - SELL : bid - 1tick / fallback価格 - 1tick
-# ✔ 最終防衛: 動いていない銘柄は発注直前で止める
-#   - high/low/close が無い銘柄は止める
-#   - (high-low)/close が小さい銘柄は止める
-#   - atr/price が小さい銘柄は止める
+# ✔ 低ボラ最終防衛を安全化
+#   - high/low がある場合だけ値幅不足を止める
+#   - ATR は存在する場合だけ判定する
+#   - high/low/ATR 欠損だけで全停止しない
 # ✔ 未約定は pending_order_monitor 側で2秒取消
 # ==========================================================
 
@@ -39,16 +39,11 @@ ALLOW_MARKET_IF_BAD_BOARD = True
 MAX_SPREAD_PCT_FOR_LIMIT = 0.30
 MIN_ENTRY_QTY = 100
 
-# SUMMARY_AI の指値を約定優先にする。
-# BUY は ask より1tick上、SELL は bid より1tick下へ置く。
-# ただし未約定なら pending_order_monitor 側で2秒取消される。
 SUMMARY_AGGRESSIVE_LIMIT_TICKS = 1
 
 # ----------------------------------------------------------
 # 低ボラ最終防衛
 # ----------------------------------------------------------
-# 上流の volatility_filter が古い閾値で呼ばれたり、SUMMARY系バイパスが残っていても、
-# ここで最後に止める。
 ENTRY_ORDER_LOW_MOVE_GUARD_ENABLED = str(os.getenv("ENTRY_ORDER_LOW_MOVE_GUARD_ENABLED", "1")).lower() not in {
     "0",
     "false",
@@ -56,20 +51,32 @@ ENTRY_ORDER_LOW_MOVE_GUARD_ENABLED = str(os.getenv("ENTRY_ORDER_LOW_MOVE_GUARD_E
     "off",
 }
 
-# 直近summary行の高安幅 / 終値。
-# まずは 1.2%。動いていない銘柄を確実に落とす。
-ENTRY_ORDER_MIN_RANGE_PCT = float(os.getenv("ENTRY_ORDER_MIN_RANGE_PCT", "0.012"))
+# 1.2% は強すぎて候補を落としすぎるため、まず 0.6% にする。
+# さらに厳しくしたい場合は環境変数 ENTRY_ORDER_MIN_RANGE_PCT=0.012 で上げる。
+ENTRY_ORDER_MIN_RANGE_PCT = float(os.getenv("ENTRY_ORDER_MIN_RANGE_PCT", "0.006"))
 
-# ATR / 終値。
+# ATR は存在する場合だけ判定する。
 ENTRY_ORDER_MIN_ATR_RATIO = float(os.getenv("ENTRY_ORDER_MIN_ATR_RATIO", "0.0035"))
 
-# atr が無い場合に高安幅だけで許可しない。
-# True なら atr 欠損は発注しない。
-ENTRY_ORDER_REQUIRE_ATR = str(os.getenv("ENTRY_ORDER_REQUIRE_ATR", "1")).lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
+# 重要:
+# True にすると、entry_row に atr が無いだけで全候補が止まりやすい。
+# 現状 summary 候補は atr 欠損が多いため、既定は False。
+ENTRY_ORDER_REQUIRE_ATR = str(os.getenv("ENTRY_ORDER_REQUIRE_ATR", "0")).lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+}
+
+# high/low が無い場合に止めるか。
+# 現状 entry_diag に high/low が載らない経路があるため、既定は False。
+ENTRY_ORDER_REQUIRE_HIGH_LOW = str(os.getenv("ENTRY_ORDER_REQUIRE_HIGH_LOW", "0")).lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
 }
 
 
@@ -123,17 +130,17 @@ def _first(row: Dict[str, Any], keys: tuple[str, ...], default: Any = None) -> A
 
 def _low_move_hard_block(entry_row: Dict[str, Any], *, symbol: str, source: str) -> Optional[Dict[str, Any]]:
     """
-    発注直前の最終防衛。
+    発注直前の低ボラ最終防衛。
 
-    上流フィルターが古い閾値で通ったり、SUMMARY系バイパスで通っても、
-    entry_order_builder で止めれば実発注されない。
+    Ver1.4.1 方針:
+      - データがある場合だけ厳しく判定する。
+      - high/low/atr が無いだけでは全停止させない。
+      - 動いていないと数値で確認できる場合だけ止める。
     """
     if not ENTRY_ORDER_LOW_MOVE_GUARD_ENABLED:
         return None
 
     source_u = str(source or "").upper()
-
-    # RANKING/TONOSAMA は5秒ブレイクで別判定しているため、まずは SUMMARY_AI を強制対象にする。
     if source_u != "SUMMARY_AI":
         return None
 
@@ -159,57 +166,55 @@ def _low_move_hard_block(entry_row: Dict[str, Any], *, symbol: str, source: str)
             min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO,
         )
 
-    if high <= 0 or low <= 0 or high < low:
-        return _ng(
-            "LOW_MOVE_NO_HIGH_LOW",
-            symbol=symbol,
-            close=close,
-            high=high,
-            low=low,
-            min_range_pct=ENTRY_ORDER_MIN_RANGE_PCT,
-            min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO,
-        )
+    # high/low がある場合だけ range 判定する。
+    if high > 0 and low > 0 and high >= low:
+        range_value = high - low
+        range_pct = range_value / close if close > 0 else 0.0
 
-    range_value = high - low
-    range_pct = range_value / close if close > 0 else 0.0
+        if range_pct < ENTRY_ORDER_MIN_RANGE_PCT:
+            return _ng(
+                "LOW_MOVE_RANGE_TOO_SMALL",
+                symbol=symbol,
+                close=close,
+                high=high,
+                low=low,
+                range_value=range_value,
+                range_pct=range_pct,
+                min_range_pct=ENTRY_ORDER_MIN_RANGE_PCT,
+            )
+    else:
+        if ENTRY_ORDER_REQUIRE_HIGH_LOW:
+            return _ng(
+                "LOW_MOVE_NO_HIGH_LOW",
+                symbol=symbol,
+                close=close,
+                high=high,
+                low=low,
+                min_range_pct=ENTRY_ORDER_MIN_RANGE_PCT,
+                min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO,
+            )
 
-    if range_pct < ENTRY_ORDER_MIN_RANGE_PCT:
-        return _ng(
-            "LOW_MOVE_RANGE_TOO_SMALL",
-            symbol=symbol,
-            close=close,
-            high=high,
-            low=low,
-            range_value=range_value,
-            range_pct=range_pct,
-            min_range_pct=ENTRY_ORDER_MIN_RANGE_PCT,
-        )
-
-    if atr <= 0:
+    # ATR がある場合だけ ATR 判定する。
+    if atr > 0:
+        atr_ratio = atr / close if close > 0 else 0.0
+        if atr_ratio < ENTRY_ORDER_MIN_ATR_RATIO:
+            return _ng(
+                "LOW_MOVE_ATR_TOO_SMALL",
+                symbol=symbol,
+                close=close,
+                atr=atr,
+                atr_ratio=atr_ratio,
+                min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO,
+            )
+    else:
         if ENTRY_ORDER_REQUIRE_ATR:
             return _ng(
                 "LOW_MOVE_NO_ATR",
                 symbol=symbol,
                 close=close,
-                high=high,
-                low=low,
-                range_pct=range_pct,
                 atr=atr,
                 min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO,
             )
-        return None
-
-    atr_ratio = atr / close if close > 0 else 0.0
-    if atr_ratio < ENTRY_ORDER_MIN_ATR_RATIO:
-        return _ng(
-            "LOW_MOVE_ATR_TOO_SMALL",
-            symbol=symbol,
-            close=close,
-            atr=atr,
-            atr_ratio=atr_ratio,
-            min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO,
-            range_pct=range_pct,
-        )
 
     return None
 
@@ -226,19 +231,6 @@ def _round_price(price: float, side: str) -> float:
 
 
 def _aggressive_limit_price(base_price: float, side: str, ticks: int = SUMMARY_AGGRESSIVE_LIMIT_TICKS) -> float:
-    """
-    SUMMARY_AI用の約定優先指値。
-
-    BUY:
-      ask / close 等の基準価格をtickで丸めたあと、1tick上へ出す。
-      上に逃げられる前に約定させる目的。
-
-    SELL:
-      bid / close 等の基準価格をtickで丸めたあと、1tick下へ出す。
-      下に逃げられる前に約定させる目的。
-
-    ただし、刺さらない注文は pending_order_monitor が2秒で取消する。
-    """
     p = float(base_price)
     if p <= 0:
         return p
@@ -278,7 +270,7 @@ def five_sec_breakout(symbol: str, side: str) -> Optional[float]:
 
 
 # ==========================================================
-# 🔥 注文条件ビルド（唯一の公開API）
+# 注文条件ビルド（唯一の公開API）
 # ==========================================================
 
 def build_entry_order(
@@ -299,9 +291,6 @@ def build_entry_order(
     side = side.upper()
     source = source.upper()
 
-    # ======================================================
-    # 最終防衛: 動いていないSUMMARY銘柄は発注条件を作らない
-    # ======================================================
     low_move_ng = _low_move_hard_block(entry_row, symbol=symbol, source=source)
     if low_move_ng is not None:
         return low_move_ng
@@ -342,11 +331,6 @@ def build_entry_order(
             if not base_price or base_price <= 0:
                 return _ng("NO_PRICE_SOURCE")
 
-            # 重要:
-            # 板なしのまま MARKET / Price=None を作ると、後段で Price=0 成行になり
-            # kabu API 側で OrderId 空になりやすい。
-            # ここでは summary の close/vwap を使って指値化する。
-            # さらに短期順張り用に1tickだけ約定優先側へ寄せる。
             price = _aggressive_limit_price(float(base_price), side)
             order_type = "LIMIT"
             price_source = "summary_fallback_aggressive_1tick"
@@ -411,9 +395,6 @@ def build_entry_order(
             trading_value=trading_value,
         )
 
-    # ======================================================
-    # OK
-    # ======================================================
     detail = {
         "order_type": order_type,
         "price": price,
@@ -427,6 +408,7 @@ def build_entry_order(
         "min_range_pct": ENTRY_ORDER_MIN_RANGE_PCT,
         "min_atr_ratio": ENTRY_ORDER_MIN_ATR_RATIO,
         "require_atr": ENTRY_ORDER_REQUIRE_ATR,
+        "require_high_low": ENTRY_ORDER_REQUIRE_HIGH_LOW,
     }
 
     if qty_override is not None:
