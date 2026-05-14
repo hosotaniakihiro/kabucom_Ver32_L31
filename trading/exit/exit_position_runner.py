@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/exit/exit_position_runner.py
-# Version: V1.2-SPLIT-POSITION-RUNNER-EARLY-GUARD-SIDE-FIX
+# Version: V1.3-SPLIT-POSITION-RUNNER-THREE-MIN-PROFIT-ESCAPE
 # ------------------------------------------------------------
 # 【概要】
 #   1銘柄分のEXIT判定を担当。
@@ -8,20 +8,22 @@
 # 【判定順序】
 #   1. 価格取得
 #   2. ctx / features 構築
-#   3. エントリー直後の建値撤退/早期利確/早期損切り/トレーリング損切り
-#   4. collapse / inago
-#   5. 殿様イナゴEXIT
-#   6. collapse full exit
-#   7. AI EXIT
-#   8. boost guard
-#   9. RL
-#   10. manage_exit
+#   3. 3分経過しても最大含み益+0.2%未達、かつ現在プラスなら返済
+#   4. エントリー直後の建値撤退/早期利確/早期損切り/トレーリング損切り
+#   5. collapse / inago
+#   6. 殿様イナゴEXIT
+#   7. collapse full exit
+#   8. AI EXIT
+#   9. boost guard
+#   10. RL
+#   11. manage_exit
 # ============================================================
 
 from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 from typing import Any, Dict, Optional, Tuple
 
 from core.global_context.context import global_context as GC
@@ -37,6 +39,24 @@ from trading.exit.exit_utils import safe_float
 from trading.exit.tonosama_exit_runner import apply_tonosama_exit_if_needed
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# 3分伸びない銘柄のプラス逃げ設定
+# ============================================================
+
+# エントリーから何秒後に判定するか。3分=180秒。
+THREE_MIN_PROFIT_ESCAPE_SEC = int(float(os.getenv("THREE_MIN_PROFIT_ESCAPE_SEC", "180")))
+
+# 3分以内に最大含み益が +0.2% に到達していなければ対象。
+THREE_MIN_PROFIT_ESCAPE_TARGET_PCT = float(os.getenv("THREE_MIN_PROFIT_ESCAPE_TARGET_PCT", "0.20"))
+
+# 現在プラスの間だけ返済する。0.00より大きければ返済。
+# 手数料やスリッページを考慮するなら 0.03 などへ上げられる。
+THREE_MIN_PROFIT_ESCAPE_MIN_CURRENT_PCT = float(os.getenv("THREE_MIN_PROFIT_ESCAPE_MIN_CURRENT_PCT", "0.00"))
+
+# 同じポジションで何度もログ/返済を試さないためのフラグ名。
+_THREE_MIN_ESCAPE_MARK_ATTR = "three_min_profit_escape_fired"
 
 
 def _pos_get(pos: Dict[str, Any], *names: str, default: Any = None) -> Any:
@@ -77,7 +97,6 @@ def _normalize_side(side: Any) -> str:
     if s in sell_values:
         return "SELL"
 
-    # dict形式のSideが混ざった場合の保険。
     try:
         if isinstance(raw, dict):
             for key in ("side", "Side", "trade_side", "position_side", "order_side"):
@@ -172,6 +191,145 @@ def _resolve_exit_ctx(symbol: str, pos: Dict[str, Any], *, side: str, entry_pric
     except Exception:
         logger.exception("[EXIT] fallback ExitContext create failed symbol=%s", symbol)
         return None
+
+
+def _already_three_min_escape_fired(symbol: str, ctx: Any, pos: Dict[str, Any]) -> bool:
+    """
+    同一ポジションで3分プラス逃げを何度も発火させないための保険。
+    finalize_exit後に建玉が残っている数秒間の多重発注を避ける。
+    """
+    try:
+        if bool(getattr(ctx, _THREE_MIN_ESCAPE_MARK_ATTR, False)):
+            return True
+    except Exception:
+        pass
+
+    try:
+        if isinstance(pos, dict) and bool(pos.get(_THREE_MIN_ESCAPE_MARK_ATTR)):
+            return True
+    except Exception:
+        pass
+
+    try:
+        mark = getattr(global_data, "three_min_profit_escape_fired_symbols", None)
+        if isinstance(mark, set) and str(symbol) in mark:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _mark_three_min_escape_fired(symbol: str, ctx: Any, pos: Dict[str, Any]) -> None:
+    try:
+        setattr(ctx, _THREE_MIN_ESCAPE_MARK_ATTR, True)
+    except Exception:
+        pass
+
+    try:
+        if isinstance(pos, dict):
+            pos[_THREE_MIN_ESCAPE_MARK_ATTR] = True
+    except Exception:
+        pass
+
+    try:
+        mark = getattr(global_data, "three_min_profit_escape_fired_symbols", None)
+        if not isinstance(mark, set):
+            mark = set()
+            setattr(global_data, "three_min_profit_escape_fired_symbols", mark)
+        mark.add(str(symbol))
+    except Exception:
+        pass
+
+
+def _judge_three_min_profit_escape(
+    *,
+    symbol: str,
+    pos: Dict[str, Any],
+    side: str,
+    entry_price: float,
+    current_price: float,
+    ctx: Any,
+    now: dt.datetime,
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """
+    要望:
+      エントリーしても3分経ってもプラス0.2%に行かなければ、
+      プラスの間に返済する。
+
+    判定:
+      - 保有時間 >= 180秒
+      - 最大含み益 MFE% < +0.2%
+      - 現在損益% > 0.0%
+
+    BUY:
+      current_price > entry_price がプラス。
+    SELL:
+      current_price < entry_price がプラス。
+    """
+    try:
+        if _already_three_min_escape_fired(symbol, ctx, pos):
+            return False, "", {}
+
+        if not ctx or entry_price <= 0 or current_price <= 0:
+            return False, "", {}
+
+        try:
+            hold_sec = int(ctx.holding_seconds(now)) if hasattr(ctx, "holding_seconds") else 0
+        except Exception:
+            hold_sec = 0
+
+        if hold_sec < THREE_MIN_PROFIT_ESCAPE_SEC:
+            return False, "", {
+                "hold_sec": hold_sec,
+                "need_sec": THREE_MIN_PROFIT_ESCAPE_SEC,
+            }
+
+        if side == "BUY":
+            current_profit_pct = (current_price - entry_price) / entry_price * 100.0
+        else:
+            current_profit_pct = (entry_price - current_price) / entry_price * 100.0
+
+        try:
+            mfe_pct = float(getattr(ctx, "mfe_pct", 0.0) or 0.0)
+        except Exception:
+            mfe_pct = 0.0
+
+        # ctx.mfe_pct が0のままでも、現在プラスなら最低限は現在利益を反映する。
+        if current_profit_pct > mfe_pct:
+            mfe_pct = current_profit_pct
+
+        detail = {
+            "hold_sec": hold_sec,
+            "need_sec": THREE_MIN_PROFIT_ESCAPE_SEC,
+            "entry_price": entry_price,
+            "current_price": current_price,
+            "side": side,
+            "current_profit_pct": current_profit_pct,
+            "mfe_pct": mfe_pct,
+            "target_pct": THREE_MIN_PROFIT_ESCAPE_TARGET_PCT,
+            "min_current_pct": THREE_MIN_PROFIT_ESCAPE_MIN_CURRENT_PCT,
+        }
+
+        # 3分以内に一度でも+0.2%へ行っていれば、このルールでは返済しない。
+        if mfe_pct >= THREE_MIN_PROFIT_ESCAPE_TARGET_PCT:
+            return False, "", detail
+
+        # まだプラス圏でなければ「プラスの間に返済」条件ではない。
+        if current_profit_pct <= THREE_MIN_PROFIT_ESCAPE_MIN_CURRENT_PCT:
+            return False, "", detail
+
+        reason = (
+            f"THREE_MIN_PROFIT_ESCAPE "
+            f"hold={hold_sec}s "
+            f"mfe={mfe_pct:.3f}%<target={THREE_MIN_PROFIT_ESCAPE_TARGET_PCT:.3f}% "
+            f"current={current_profit_pct:.3f}%>min={THREE_MIN_PROFIT_ESCAPE_MIN_CURRENT_PCT:.3f}%"
+        )
+        return True, reason, detail
+
+    except Exception:
+        logger.exception("[THREE_MIN_PROFIT_ESCAPE] judge failed symbol=%s", symbol)
+        return False, "", {}
 
 
 def evaluate_collapse(symbol: str, regime: int, features: Dict[str, Any], side: str) -> Tuple[float, int, Optional[str]]:
@@ -309,7 +467,42 @@ def run_exit_for_position(
             cluster_id = 0
 
         # ====================================================
-        # 0. EARLY PROFIT / BREAKEVEN / TRAILING STOP GUARD
+        # 0. 3分伸びない銘柄のプラス逃げ
+        #    3分経って最大含み益が +0.2% 未達、かつ現在プラスなら返済。
+        #    AI / TONOSAMA / 通常EXITより前に判定する。
+        # ====================================================
+        three_min_exit, three_min_reason, three_min_detail = _judge_three_min_profit_escape(
+            symbol=symbol,
+            pos=pos,
+            side=side,
+            entry_price=entry_price,
+            current_price=price,
+            ctx=ctx,
+            now=now,
+        )
+        if three_min_exit:
+            logger.warning(
+                "[THREE_MIN_PROFIT_ESCAPE] EXIT symbol=%s detail=%s reason=%s",
+                symbol,
+                three_min_detail,
+                three_min_reason,
+            )
+            _mark_three_min_escape_fired(symbol, ctx, pos)
+            finalize_exit(
+                symbol=symbol,
+                price=price,
+                reason=three_min_reason,
+                cluster_id=cluster_id,
+                regime=regime,
+                inago_state=0,
+                pnl=pnl,
+                collapse_prob=0.0,
+                ctx=ctx,
+            )
+            return True
+
+        # ====================================================
+        # 1. EARLY PROFIT / BREAKEVEN / TRAILING STOP GUARD
         #    エントリー直後に一瞬プラスからマイナス化する問題を抑えるため、
         #    TONOSAMA / AI / 通常EXITより前に判定する。
         # ====================================================
@@ -346,7 +539,7 @@ def run_exit_for_position(
         features["collapse_prob"] = collapse_prob
 
         # ====================================================
-        # 1. TONOSAMA INAGO EXIT
+        # 2. TONOSAMA INAGO EXIT
         #    損切り・VWAP割れ・5秒足失速などをAIより前に判定
         # ====================================================
         if apply_tonosama_exit_if_needed(
@@ -368,7 +561,7 @@ def run_exit_for_position(
             return True
 
         # ====================================================
-        # 2. collapse full exit
+        # 3. collapse full exit
         # ====================================================
         if full_reason or collapse_prob > 0.85:
             finalize_exit(
@@ -385,7 +578,7 @@ def run_exit_for_position(
             return True
 
         # ====================================================
-        # 3. AI EXIT
+        # 4. AI EXIT
         # ====================================================
         if apply_ai_exit_if_needed(
             symbol=symbol,
@@ -404,7 +597,7 @@ def run_exit_for_position(
             return True
 
         # ====================================================
-        # 4. boost guard
+        # 5. boost guard
         #    boost中でATR利益が出ている場合は粘る
         # ====================================================
         if boost_active:
@@ -413,7 +606,7 @@ def run_exit_for_position(
                 return False
 
         # ====================================================
-        # 5. RL EXIT
+        # 6. RL EXIT
         # ====================================================
         rl_action, rl_state = evaluate_rl(
             symbol,
@@ -439,7 +632,7 @@ def run_exit_for_position(
             return True
 
         # ====================================================
-        # 6. 通常 state machine EXIT
+        # 7. 通常 state machine EXIT
         # ====================================================
         action, reason = manage_exit(
             ctx=ctx,
