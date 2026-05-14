@@ -1,6 +1,6 @@
 # ==========================================================
 # trading/handlers/entry_order_builder.py
-# Ver1.2.0-FINAL-SUMMARY-NOBOARD-LIMIT-FIX
+# Ver1.3.0-FINAL-SUMMARY-AGGRESSIVE-LIMIT-1TICK
 # ----------------------------------------------------------
 # ✔ 注文条件（price / order_type / qty）を決定するだけ
 # ✔ 副作用ゼロ（発注・global_state 操作なし）
@@ -8,8 +8,10 @@
 # ✔ BUY のみ最小単元救済（QTY_ZERO 根絶）
 # ✔ qty_override 対応（ENTRY_CONTROLLER 最新版互換）
 # ✔ SUMMARY_AI で板が無い場合は MARKET ではなく close/vwap 指値にする
-#   - 旧: order_type=MARKET price=None
-#   - 新: order_type=LIMIT price=close/vwap 丸め
+# ✔ SUMMARY_AI の約定優先指値を導入
+#   - BUY  : ask + 1tick / fallback価格 + 1tick
+#   - SELL : bid - 1tick / fallback価格 - 1tick
+# ✔ 未約定は pending_order_monitor 側で2秒取消
 # ==========================================================
 
 from __future__ import annotations
@@ -31,6 +33,11 @@ from utils_common import (
 ALLOW_MARKET_IF_BAD_BOARD = True
 MAX_SPREAD_PCT_FOR_LIMIT = 0.30
 MIN_ENTRY_QTY = 100
+
+# SUMMARY_AI の指値を約定優先にする。
+# BUY は ask より1tick上、SELL は bid より1tick下へ置く。
+# ただし未約定なら pending_order_monitor 側で2秒取消される。
+SUMMARY_AGGRESSIVE_LIMIT_TICKS = 1
 
 
 # ==========================================================
@@ -62,6 +69,37 @@ def _round_price(price: float, side: str) -> float:
     if side == "BUY":
         return math.ceil(price / tick) * tick
     return math.floor(price / tick) * tick
+
+
+def _aggressive_limit_price(base_price: float, side: str, ticks: int = SUMMARY_AGGRESSIVE_LIMIT_TICKS) -> float:
+    """
+    SUMMARY_AI用の約定優先指値。
+
+    BUY:
+      ask / close 等の基準価格をtickで丸めたあと、1tick上へ出す。
+      上に逃げられる前に約定させる目的。
+
+    SELL:
+      bid / close 等の基準価格をtickで丸めたあと、1tick下へ出す。
+      下に逃げられる前に約定させる目的。
+
+    ただし、刺さらない注文は pending_order_monitor が2秒で取消する。
+    """
+    p = float(base_price)
+    if p <= 0:
+        return p
+
+    rounded = _round_price(p, side)
+    tick = get_tick_size(rounded)
+    n = max(0, int(ticks or 0))
+
+    if n <= 0:
+        return rounded
+
+    if side.upper() == "BUY":
+        return rounded + tick * n
+
+    return max(tick, rounded - tick * n)
 
 
 # ==========================================================
@@ -122,13 +160,14 @@ def build_entry_order(
 
             spread_pct = (ask - bid) / bid * 100
             base_price = bid if side == "SELL" else ask
-            price_source = "board_bid_ask"
+            price_source = "board_bid_ask_aggressive_1tick"
 
             if ALLOW_MARKET_IF_BAD_BOARD and spread_pct > MAX_SPREAD_PCT_FOR_LIMIT:
                 order_type = "MARKET"
                 price = None
+                price_source = "board_bad_spread_market"
             else:
-                price = _round_price(base_price, side)
+                price = _aggressive_limit_price(float(base_price), side)
                 order_type = "LIMIT"
 
         else:
@@ -146,9 +185,10 @@ def build_entry_order(
             # 板なしのまま MARKET / Price=None を作ると、後段で Price=0 成行になり
             # kabu API 側で OrderId 空になりやすい。
             # ここでは summary の close/vwap を使って指値化する。
-            price = _round_price(float(base_price), side)
+            # さらに短期順張り用に1tickだけ約定優先側へ寄せる。
+            price = _aggressive_limit_price(float(base_price), side)
             order_type = "LIMIT"
-            price_source = "summary_fallback_limit"
+            price_source = "summary_fallback_aggressive_1tick"
 
     # ======================================================
     # RANKING / TONOSAMA
@@ -221,6 +261,7 @@ def build_entry_order(
         "spread_pct": spread_pct,
         "board": bool(board),
         "price_source": price_source,
+        "aggressive_limit_ticks": SUMMARY_AGGRESSIVE_LIMIT_TICKS if source == "SUMMARY_AI" and order_type == "LIMIT" else 0,
     }
 
     if qty_override is not None:
