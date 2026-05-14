@@ -1,6 +1,6 @@
 # ==========================================================
 # trading/handlers/entry_order_builder.py
-# Ver1.6.0-SCALPING-WINRATE-GUARDS
+# Ver1.7.0-SCALPING-GUARD-PRIORITY-1-6
 # ----------------------------------------------------------
 # ✔ 注文条件（price / order_type / qty）を決定するだけ
 # ✔ 副作用ゼロ（発注・global_state 操作なし）
@@ -9,18 +9,15 @@
 # ✔ qty_override 対応（ENTRY_CONTROLLER 最新版互換）
 # ✔ SUMMARY_AI で板が無い場合は MARKET ではなく close/vwap 指値にする
 # ✔ SUMMARY_AI の約定優先指値を導入
-#   - BUY  : ask + 1tick / fallback価格 + 1tick
-#   - SELL : bid - 1tick / fallback価格 - 1tick
 # ✔ 低ボラ最終防衛を安全化
 # ✔ SUMMARY_AI 発注直前に5秒足の向きを確認
-#   - BUY  : 直近5秒足が上方向でなければ止める
-#   - SELL : 直近5秒足が下方向でなければ止める
-#   - 勝率優先のため、既定で5秒足必須
 # ✔ SUMMARY_AI 発注直前にMTF/傾きの逆方向をブロック
-#   - BUY  : MTF/傾きが明確に下向きなら止める
-#   - SELL : MTF/傾きが明確に上向きなら止める
 # ✔ スプレッド上限を環境変数化し、既定0.15%へ厳格化
-# ✔ 未約定は pending_order_monitor 側で2秒取消
+# ✔ 優先順位1〜2,6:
+#   - 損切り後15分クールダウン
+#   - 同一銘柄2連敗で当日停止
+#   - 一部利確後3分/全利確後5分の再エントリー停止
+#   - 時間帯フィルタ 09:00-09:02 / 11:20-12:32 / 15:23以降
 # ==========================================================
 
 from __future__ import annotations
@@ -31,6 +28,7 @@ import os
 from typing import Dict, Any, Optional, Tuple
 
 from global_state import global_data
+from trading.exit.symbol_trade_guard import is_entry_blocked
 from utils_common import (
     get_latest_bid_ask,
     calculate_qty_by_budget,
@@ -45,8 +43,6 @@ ALLOW_MARKET_IF_BAD_BOARD = str(os.getenv("ALLOW_MARKET_IF_BAD_BOARD", "1")).low
     "0", "false", "no", "off",
 }
 
-# スキャルピングではスプレッド負けが大きいため、既定を0.15%に厳格化。
-# 以前の0.30%に戻す場合: set MAX_SPREAD_PCT_FOR_LIMIT=0.30
 MAX_SPREAD_PCT_FOR_LIMIT = float(
     os.getenv("MAX_SPREAD_PCT_FOR_LIMIT", os.getenv("ENTRY_ORDER_MAX_SPREAD_PCT", "0.15"))
 )
@@ -54,52 +50,31 @@ MAX_SPREAD_PCT_FOR_LIMIT = float(
 MIN_ENTRY_QTY = 100
 SUMMARY_AGGRESSIVE_LIMIT_TICKS = int(float(os.getenv("SUMMARY_AGGRESSIVE_LIMIT_TICKS", "1")))
 
-# ----------------------------------------------------------
-# SUMMARY_AI 5秒足 直前確認
-# ----------------------------------------------------------
 ENTRY_ORDER_5S_GUARD_ENABLED = str(os.getenv("ENTRY_ORDER_5S_GUARD_ENABLED", "1")).lower() not in {
     "0", "false", "no", "off",
 }
-
-# 勝率優先: 5秒足が無い銘柄は既定で発注しない。
-# 起動直後に止まりすぎる場合だけ set ENTRY_ORDER_REQUIRE_5S_DATA=0
 ENTRY_ORDER_REQUIRE_5S_DATA = str(os.getenv("ENTRY_ORDER_REQUIRE_5S_DATA", "1")).lower() in {
     "1", "true", "yes", "y", "on",
 }
-
 ENTRY_ORDER_5S_MIN_BARS = int(float(os.getenv("ENTRY_ORDER_5S_MIN_BARS", "2")))
 ENTRY_ORDER_5S_MAX_AGE_SEC = float(os.getenv("ENTRY_ORDER_5S_MAX_AGE_SEC", "20"))
 
-# ----------------------------------------------------------
-# SUMMARY_AI MTF/方向一致ガード
-# ----------------------------------------------------------
 ENTRY_ORDER_MTF_GUARD_ENABLED = str(os.getenv("ENTRY_ORDER_MTF_GUARD_ENABLED", "1")).lower() not in {
     "0", "false", "no", "off",
 }
-
-# True にすると MTF/傾き列が無いだけで止める。
-# 既定は False。存在する列が逆方向のときだけ止める。
 ENTRY_ORDER_REQUIRE_MTF_DATA = str(os.getenv("ENTRY_ORDER_REQUIRE_MTF_DATA", "0")).lower() in {
     "1", "true", "yes", "y", "on",
 }
-
-# 傾きは0付近でノイズが出るため、明確な逆方向だけ止める。
 ENTRY_ORDER_MTF_SLOPE_EPS = float(os.getenv("ENTRY_ORDER_MTF_SLOPE_EPS", "0.0"))
 
-# ----------------------------------------------------------
-# 低ボラ最終防衛
-# ----------------------------------------------------------
 ENTRY_ORDER_LOW_MOVE_GUARD_ENABLED = str(os.getenv("ENTRY_ORDER_LOW_MOVE_GUARD_ENABLED", "1")).lower() not in {
     "0", "false", "no", "off",
 }
-
 ENTRY_ORDER_MIN_RANGE_PCT = float(os.getenv("ENTRY_ORDER_MIN_RANGE_PCT", "0.006"))
 ENTRY_ORDER_MIN_ATR_RATIO = float(os.getenv("ENTRY_ORDER_MIN_ATR_RATIO", "0.0035"))
-
 ENTRY_ORDER_REQUIRE_ATR = str(os.getenv("ENTRY_ORDER_REQUIRE_ATR", "0")).lower() in {
     "1", "true", "yes", "y", "on",
 }
-
 ENTRY_ORDER_REQUIRE_HIGH_LOW = str(os.getenv("ENTRY_ORDER_REQUIRE_HIGH_LOW", "0")).lower() in {
     "1", "true", "yes", "y", "on",
 }
@@ -110,19 +85,11 @@ ENTRY_ORDER_REQUIRE_HIGH_LOW = str(os.getenv("ENTRY_ORDER_REQUIRE_HIGH_LOW", "0"
 # ==========================================================
 
 def _ok(**kwargs) -> Dict[str, Any]:
-    return {
-        "ok": True,
-        "reason": "OK",
-        "detail": kwargs,
-    }
+    return {"ok": True, "reason": "OK", "detail": kwargs}
 
 
 def _ng(reason: str, **detail) -> Dict[str, Any]:
-    return {
-        "ok": False,
-        "reason": reason,
-        "detail": detail,
-    }
+    return {"ok": False, "reason": reason, "detail": detail}
 
 
 # ==========================================================
@@ -165,7 +132,6 @@ def _first(row: Dict[str, Any], keys: tuple[str, ...], default: Any = None) -> A
 
 
 def _row_get(row: Any, *names: str, default: Any = None) -> Any:
-    """dict / pandas Series / object の列名ゆらぎを吸収する。"""
     for name in names:
         try:
             if isinstance(row, dict) and name in row:
@@ -207,90 +173,53 @@ def _parse_dt(v: Any) -> Optional[dt.datetime]:
 
 
 # ==========================================================
+# 銘柄別クールダウン / 時間帯ガード
+# ==========================================================
+
+def _trade_guard_block(symbol: str) -> Optional[Dict[str, Any]]:
+    try:
+        blocked, reason, detail = is_entry_blocked(symbol)
+        if blocked:
+            return _ng(reason, symbol=symbol, **(detail or {}))
+    except Exception as e:
+        # ガードDB不調で全停止は避ける。
+        return None
+    return None
+
+
+# ==========================================================
 # 低ボラ最終防衛
 # ==========================================================
 
 def _low_move_hard_block(entry_row: Dict[str, Any], *, symbol: str, source: str) -> Optional[Dict[str, Any]]:
-    """
-    発注直前の低ボラ最終防衛。
-    データがある場合だけ厳しく判定し、数値で動いていないと確認できる場合だけ止める。
-    """
     if not ENTRY_ORDER_LOW_MOVE_GUARD_ENABLED:
         return None
-
-    source_u = str(source or "").upper()
-    if source_u != "SUMMARY_AI":
+    if str(source or "").upper() != "SUMMARY_AI":
         return None
 
     row = entry_row or {}
-
-    close = _safe_float(
-        _first(row, ("close_price", "close", "price", "current_price"), 0.0),
-        0.0,
-    )
+    close = _safe_float(_first(row, ("close_price", "close", "price", "current_price"), 0.0), 0.0)
     high = _safe_float(_first(row, ("high_price", "high"), 0.0), 0.0)
     low = _safe_float(_first(row, ("low_price", "low"), 0.0), 0.0)
-    atr = _safe_float(
-        _first(row, ("atr_1m", "atr", "ATR", "atr14", "atr_14"), 0.0),
-        0.0,
-    )
+    atr = _safe_float(_first(row, ("atr_1m", "atr", "ATR", "atr14", "atr_14"), 0.0), 0.0)
 
     if close <= 0:
-        return _ng(
-            "LOW_MOVE_NO_CLOSE",
-            symbol=symbol,
-            close=close,
-            min_range_pct=ENTRY_ORDER_MIN_RANGE_PCT,
-            min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO,
-        )
+        return _ng("LOW_MOVE_NO_CLOSE", symbol=symbol, close=close, min_range_pct=ENTRY_ORDER_MIN_RANGE_PCT, min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO)
 
     if high > 0 and low > 0 and high >= low:
         range_value = high - low
         range_pct = range_value / close if close > 0 else 0.0
-
         if range_pct < ENTRY_ORDER_MIN_RANGE_PCT:
-            return _ng(
-                "LOW_MOVE_RANGE_TOO_SMALL",
-                symbol=symbol,
-                close=close,
-                high=high,
-                low=low,
-                range_value=range_value,
-                range_pct=range_pct,
-                min_range_pct=ENTRY_ORDER_MIN_RANGE_PCT,
-            )
-    else:
-        if ENTRY_ORDER_REQUIRE_HIGH_LOW:
-            return _ng(
-                "LOW_MOVE_NO_HIGH_LOW",
-                symbol=symbol,
-                close=close,
-                high=high,
-                low=low,
-                min_range_pct=ENTRY_ORDER_MIN_RANGE_PCT,
-                min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO,
-            )
+            return _ng("LOW_MOVE_RANGE_TOO_SMALL", symbol=symbol, close=close, high=high, low=low, range_value=range_value, range_pct=range_pct, min_range_pct=ENTRY_ORDER_MIN_RANGE_PCT)
+    elif ENTRY_ORDER_REQUIRE_HIGH_LOW:
+        return _ng("LOW_MOVE_NO_HIGH_LOW", symbol=symbol, close=close, high=high, low=low, min_range_pct=ENTRY_ORDER_MIN_RANGE_PCT, min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO)
 
     if atr > 0:
         atr_ratio = atr / close if close > 0 else 0.0
         if atr_ratio < ENTRY_ORDER_MIN_ATR_RATIO:
-            return _ng(
-                "LOW_MOVE_ATR_TOO_SMALL",
-                symbol=symbol,
-                close=close,
-                atr=atr,
-                atr_ratio=atr_ratio,
-                min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO,
-            )
-    else:
-        if ENTRY_ORDER_REQUIRE_ATR:
-            return _ng(
-                "LOW_MOVE_NO_ATR",
-                symbol=symbol,
-                close=close,
-                atr=atr,
-                min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO,
-            )
+            return _ng("LOW_MOVE_ATR_TOO_SMALL", symbol=symbol, close=close, atr=atr, atr_ratio=atr_ratio, min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO)
+    elif ENTRY_ORDER_REQUIRE_ATR:
+        return _ng("LOW_MOVE_NO_ATR", symbol=symbol, close=close, atr=atr, min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO)
 
     return None
 
@@ -300,15 +229,8 @@ def _low_move_hard_block(entry_row: Dict[str, Any], *, symbol: str, source: str)
 # ==========================================================
 
 def _summary_mtf_direction_guard(entry_row: Dict[str, Any], *, symbol: str, side: str, source: str) -> Optional[Dict[str, Any]]:
-    """
-    SUMMARY_AIの発注直前に、MTF/傾きがエントリー方向と逆なら止める。
-
-    データ欠損だけで全停止しないように、既定では「存在する列が明確に逆方向」だけ止める。
-    ENTRY_ORDER_REQUIRE_MTF_DATA=1 の場合はデータ欠損も止める。
-    """
     if not ENTRY_ORDER_MTF_GUARD_ENABLED:
         return None
-
     if str(source or "").upper() != "SUMMARY_AI":
         return None
 
@@ -318,61 +240,32 @@ def _summary_mtf_direction_guard(entry_row: Dict[str, Any], *, symbol: str, side
 
     row = entry_row or {}
     eps = abs(float(ENTRY_ORDER_MTF_SLOPE_EPS or 0.0))
-
     mtf = _safe_float_or_none(_entry_get(row, "mtf", "score_mtf", "mtf_score", "score_mtf_merged"))
     slope = _safe_float_or_none(_entry_get(row, "slope_atr_scaled", "slope", "score_slope"))
     slope_1m = _safe_float_or_none(_entry_get(row, "slope_atr_scaled_1m", "slope_1m", "slope1m"))
     slope_3m = _safe_float_or_none(_entry_get(row, "slope_atr_scaled_3m", "slope_3m", "slope3m"))
     slope_5m = _safe_float_or_none(_entry_get(row, "slope_atr_scaled_5m", "slope_5m", "slope5m"))
-
-    values = {
-        "mtf": mtf,
-        "slope": slope,
-        "slope_1m": slope_1m,
-        "slope_3m": slope_3m,
-        "slope_5m": slope_5m,
-    }
+    values = {"mtf": mtf, "slope": slope, "slope_1m": slope_1m, "slope_3m": slope_3m, "slope_5m": slope_5m}
     available = {k: v for k, v in values.items() if v is not None}
 
     if not available:
         if ENTRY_ORDER_REQUIRE_MTF_DATA:
-            return _ng(
-                "MTF_NO_DATA",
-                symbol=symbol,
-                side=side_u,
-                require_mtf=True,
-            )
+            return _ng("MTF_NO_DATA", symbol=symbol, side=side_u, require_mtf=True)
         return None
 
     if side_u == "BUY":
         bad = {k: v for k, v in available.items() if v < -eps}
         if bad:
-            return _ng(
-                "MTF_NOT_BUY_ALIGNED",
-                symbol=symbol,
-                side=side_u,
-                bad=bad,
-                values=values,
-                eps=eps,
-            )
-
-    if side_u == "SELL":
+            return _ng("MTF_NOT_BUY_ALIGNED", symbol=symbol, side=side_u, bad=bad, values=values, eps=eps)
+    else:
         bad = {k: v for k, v in available.items() if v > eps}
         if bad:
-            return _ng(
-                "MTF_NOT_SELL_ALIGNED",
-                symbol=symbol,
-                side=side_u,
-                bad=bad,
-                values=values,
-                eps=eps,
-            )
-
+            return _ng("MTF_NOT_SELL_ALIGNED", symbol=symbol, side=side_u, bad=bad, values=values, eps=eps)
     return None
 
 
 # ==========================================================
-# SUMMARY_AI 5秒足 直前確認
+# 5秒足
 # ==========================================================
 
 def _get_5s_df(symbol: str):
@@ -382,14 +275,7 @@ def _get_5s_df(symbol: str):
             return m.get(str(symbol)) or m.get(symbol) or m.get(str(symbol).zfill(4))
     except Exception:
         pass
-
-    for attr in (
-        "df_5s_by_symbol",
-        "realtime_5sec",
-        "realtime_5sec_bars",
-        "five_sec_bars",
-        "bars_5s",
-    ):
+    for attr in ("df_5s_by_symbol", "realtime_5sec", "realtime_5sec_bars", "five_sec_bars", "bars_5s"):
         try:
             m = getattr(global_data, attr, None)
             if isinstance(m, dict):
@@ -405,94 +291,56 @@ def _extract_5s_rows(df: Any) -> Optional[Tuple[Any, Any, int]]:
     try:
         if df is None:
             return None
-
         n = len(df)
         if n < max(2, ENTRY_ORDER_5S_MIN_BARS):
             return None
-
         if hasattr(df, "iloc"):
-            prev = df.iloc[-2]
-            last = df.iloc[-1]
-            return prev, last, n
-
+            return df.iloc[-2], df.iloc[-1], n
         if isinstance(df, (list, tuple)):
             return df[-2], df[-1], n
-
-        return None
     except Exception:
         return None
+    return None
 
 
 def _five_sec_pre_entry_guard(symbol: str, side: str, source: str) -> Optional[Dict[str, Any]]:
-    """
-    SUMMARY_AIの発注直前に5秒足の向きを確認する。
-    """
     if not ENTRY_ORDER_5S_GUARD_ENABLED:
         return None
-
-    source_u = str(source or "").upper()
-    if source_u != "SUMMARY_AI":
+    if str(source or "").upper() != "SUMMARY_AI":
         return None
-
     side_u = str(side or "").upper()
     if side_u not in {"BUY", "SELL"}:
         return None
 
-    df = _get_5s_df(symbol)
-    rows = _extract_5s_rows(df)
+    rows = _extract_5s_rows(_get_5s_df(symbol))
     if rows is None:
         if ENTRY_ORDER_REQUIRE_5S_DATA:
-            return _ng(
-                "FIVE_SEC_NO_DATA",
-                symbol=symbol,
-                side=side_u,
-                require_5s=True,
-                min_bars=ENTRY_ORDER_5S_MIN_BARS,
-            )
+            return _ng("FIVE_SEC_NO_DATA", symbol=symbol, side=side_u, require_5s=True, min_bars=ENTRY_ORDER_5S_MIN_BARS)
         return None
 
     prev, last, nrows = rows
-
     prev_close = _safe_float(_row_get(prev, "close_price", "close", "price", "current_price", "Close", default=0.0), 0.0)
     prev_high = _safe_float(_row_get(prev, "high_price", "high", "High", default=0.0), 0.0)
     prev_low = _safe_float(_row_get(prev, "low_price", "low", "Low", default=0.0), 0.0)
-
     last_open = _safe_float(_row_get(last, "open_price", "open", "Open", default=0.0), 0.0)
     last_close = _safe_float(_row_get(last, "close_price", "close", "price", "current_price", "Close", default=0.0), 0.0)
     last_high = _safe_float(_row_get(last, "high_price", "high", "High", default=0.0), 0.0)
     last_low = _safe_float(_row_get(last, "low_price", "low", "Low", default=0.0), 0.0)
 
-    ts = _row_get(last, "datetime", "timestamp", "time", "created_at", "updated_at", default=None)
-    last_dt = _parse_dt(ts)
+    last_dt = _parse_dt(_row_get(last, "datetime", "timestamp", "time", "created_at", "updated_at", default=None))
     age_sec = None
     if last_dt is not None:
         try:
             age_sec = abs((dt.datetime.now() - last_dt).total_seconds())
         except Exception:
             age_sec = None
-
     if age_sec is not None and age_sec > ENTRY_ORDER_5S_MAX_AGE_SEC:
         if ENTRY_ORDER_REQUIRE_5S_DATA:
-            return _ng(
-                "FIVE_SEC_STALE",
-                symbol=symbol,
-                side=side_u,
-                age_sec=age_sec,
-                max_age_sec=ENTRY_ORDER_5S_MAX_AGE_SEC,
-                nrows=nrows,
-            )
+            return _ng("FIVE_SEC_STALE", symbol=symbol, side=side_u, age_sec=age_sec, max_age_sec=ENTRY_ORDER_5S_MAX_AGE_SEC, nrows=nrows)
         return None
-
     if last_close <= 0 or prev_close <= 0:
         if ENTRY_ORDER_REQUIRE_5S_DATA:
-            return _ng(
-                "FIVE_SEC_INVALID_PRICE",
-                symbol=symbol,
-                side=side_u,
-                prev_close=prev_close,
-                last_close=last_close,
-                nrows=nrows,
-            )
+            return _ng("FIVE_SEC_INVALID_PRICE", symbol=symbol, side=side_u, prev_close=prev_close, last_close=last_close, nrows=nrows)
         return None
 
     if last_open <= 0:
@@ -508,34 +356,16 @@ def _five_sec_pre_entry_guard(symbol: str, side: str, source: str) -> Optional[D
 
     bullish = (last_close >= last_open) and ((last_close >= prev_close) or (last_high > prev_high))
     bearish = (last_close <= last_open) and ((last_close <= prev_close) or (last_low < prev_low))
-
-    detail = {
-        "symbol": symbol,
-        "side": side_u,
-        "nrows": nrows,
-        "prev_close": prev_close,
-        "last_open": last_open,
-        "last_close": last_close,
-        "prev_high": prev_high,
-        "last_high": last_high,
-        "prev_low": prev_low,
-        "last_low": last_low,
-        "age_sec": age_sec,
-        "bullish": bullish,
-        "bearish": bearish,
-    }
-
+    detail = {"symbol": symbol, "side": side_u, "nrows": nrows, "prev_close": prev_close, "last_open": last_open, "last_close": last_close, "prev_high": prev_high, "last_high": last_high, "prev_low": prev_low, "last_low": last_low, "age_sec": age_sec, "bullish": bullish, "bearish": bearish}
     if side_u == "BUY" and not bullish:
         return _ng("FIVE_SEC_NOT_BULLISH", **detail)
-
     if side_u == "SELL" and not bearish:
         return _ng("FIVE_SEC_NOT_BEARISH", **detail)
-
     return None
 
 
 # ==========================================================
-# 価格丸め
+# 価格丸め / 5秒ブレイク
 # ==========================================================
 
 def _round_price(price: float, side: str) -> float:
@@ -549,42 +379,29 @@ def _aggressive_limit_price(base_price: float, side: str, ticks: int = SUMMARY_A
     p = float(base_price)
     if p <= 0:
         return p
-
     rounded = _round_price(p, side)
     tick = get_tick_size(rounded)
     n = max(0, int(ticks or 0))
-
     if n <= 0:
         return rounded
-
     if side.upper() == "BUY":
         return rounded + tick * n
-
     return max(tick, rounded - tick * n)
 
 
-# ==========================================================
-# 5秒ブレイク判定
-# ==========================================================
-
 def five_sec_breakout(symbol: str, side: str) -> Optional[float]:
-    df = _get_5s_df(symbol)
-    rows = _extract_5s_rows(df)
+    rows = _extract_5s_rows(_get_5s_df(symbol))
     if rows is None:
         return None
-
     prev, last, _nrows = rows
     prev_high = _safe_float(_row_get(prev, "high_price", "high", "High", default=0.0), 0.0)
     prev_low = _safe_float(_row_get(prev, "low_price", "low", "Low", default=0.0), 0.0)
     last_high = _safe_float(_row_get(last, "high_price", "high", "High", default=0.0), 0.0)
     last_low = _safe_float(_row_get(last, "low_price", "low", "Low", default=0.0), 0.0)
-
     if side == "BUY" and last_high > 0 and prev_high > 0 and last_high > prev_high:
         return float(last_high)
-
     if side == "SELL" and last_low > 0 and prev_low > 0 and last_low < prev_low:
         return float(last_low)
-
     return None
 
 
@@ -592,15 +409,7 @@ def five_sec_breakout(symbol: str, side: str) -> Optional[float]:
 # 注文条件ビルド（唯一の公開API）
 # ==========================================================
 
-def build_entry_order(
-    *,
-    symbol: str,
-    side: str,
-    source: str,
-    entry_row: Dict[str, Any],
-    qty_override: Optional[int] = None,
-) -> Dict[str, Any]:
-
+def build_entry_order(*, symbol: str, side: str, source: str, entry_row: Dict[str, Any], qty_override: Optional[int] = None) -> Dict[str, Any]:
     price = None
     base_price = None
     spread_pct = None
@@ -609,6 +418,10 @@ def build_entry_order(
 
     side = side.upper()
     source = source.upper()
+
+    trade_guard_ng = _trade_guard_block(symbol)
+    if trade_guard_ng is not None:
+        return trade_guard_ng
 
     low_move_ng = _low_move_hard_block(entry_row, symbol=symbol, source=source)
     if low_move_ng is not None:
@@ -622,88 +435,45 @@ def build_entry_order(
     if five_sec_ng is not None:
         return five_sec_ng
 
-    # ======================================================
-    # SUMMARY 起点
-    # ======================================================
     if source == "SUMMARY_AI":
-
         board = get_latest_bid_ask(symbol)
         if board:
             bid = board.get("bid_price")
             ask = board.get("ask_price")
-
             if not bid or not ask or bid <= 0 or ask <= 0:
                 return _ng("INVALID_BOARD", board=board)
-
             spread_pct = (ask - bid) / bid * 100
             base_price = bid if side == "SELL" else ask
             price_source = "board_bid_ask_aggressive_1tick"
-
             if ALLOW_MARKET_IF_BAD_BOARD and spread_pct > MAX_SPREAD_PCT_FOR_LIMIT:
-                return _ng(
-                    "SPREAD_TOO_WIDE",
-                    symbol=symbol,
-                    side=side,
-                    spread_pct=spread_pct,
-                    max_spread_pct=MAX_SPREAD_PCT_FOR_LIMIT,
-                    bid=bid,
-                    ask=ask,
-                )
-
+                return _ng("SPREAD_TOO_WIDE", symbol=symbol, side=side, spread_pct=spread_pct, max_spread_pct=MAX_SPREAD_PCT_FOR_LIMIT, bid=bid, ask=ask)
             price = _aggressive_limit_price(float(base_price), side)
             order_type = "LIMIT"
-
         else:
-            base_price = (
-                entry_row.get("close_price")
-                or entry_row.get("price")
-                or entry_row.get("current_price")
-                or entry_row.get("close")
-                or entry_row.get("vwap")
-            )
+            base_price = entry_row.get("close_price") or entry_row.get("price") or entry_row.get("current_price") or entry_row.get("close") or entry_row.get("vwap")
             if not base_price or base_price <= 0:
                 return _ng("NO_PRICE_SOURCE")
-
             price = _aggressive_limit_price(float(base_price), side)
             order_type = "LIMIT"
             price_source = "summary_fallback_aggressive_1tick"
-
-    # ======================================================
-    # RANKING / TONOSAMA
-    # ======================================================
     else:
         base_price = five_sec_breakout(symbol, side)
         if not base_price:
             return _ng("NO_5S_BREAKOUT")
-
         price = _round_price(base_price, side)
         order_type = "STOP"
         price_source = "five_sec_breakout"
 
-    # ======================================================
-    # 流動性評価
-    # ======================================================
     try:
         volume = float(entry_row.get("volume") or 0.0)
     except Exception:
         volume = 0.0
-
     effective_price = price if price else base_price
     trading_value = effective_price * volume if effective_price else 0.0
-
     if trading_value < 3_000_000:
-        return _ng(
-            "LOW_LIQUIDITY",
-            trading_value=trading_value,
-            price=effective_price,
-            volume=volume,
-        )
+        return _ng("LOW_LIQUIDITY", trading_value=trading_value, price=effective_price, volume=volume)
 
-    # ======================================================
-    # 数量計算（qty_override 優先）
-    # ======================================================
     forced_min_qty = False
-
     if qty_override is not None:
         qty = int(qty_override)
         if qty <= 0:
@@ -717,16 +487,8 @@ def build_entry_order(
             if qty <= 0 and side == "BUY":
                 qty = MIN_ENTRY_QTY
                 forced_min_qty = True
-
     if qty <= 0:
-        return _ng(
-            "QTY_ZERO",
-            side=side,
-            price=price,
-            base_price=base_price,
-            spread_pct=spread_pct,
-            trading_value=trading_value,
-        )
+        return _ng("QTY_ZERO", side=side, price=price, base_price=base_price, spread_pct=spread_pct, trading_value=trading_value)
 
     detail = {
         "order_type": order_type,
@@ -738,22 +500,16 @@ def build_entry_order(
         "board": bool(board),
         "price_source": price_source,
         "aggressive_limit_ticks": SUMMARY_AGGRESSIVE_LIMIT_TICKS if source == "SUMMARY_AI" and order_type == "LIMIT" else 0,
+        "trade_guard": True,
         "low_move_guard": bool(ENTRY_ORDER_LOW_MOVE_GUARD_ENABLED and source == "SUMMARY_AI"),
-        "min_range_pct": ENTRY_ORDER_MIN_RANGE_PCT,
-        "min_atr_ratio": ENTRY_ORDER_MIN_ATR_RATIO,
-        "require_atr": ENTRY_ORDER_REQUIRE_ATR,
-        "require_high_low": ENTRY_ORDER_REQUIRE_HIGH_LOW,
         "five_sec_guard": bool(ENTRY_ORDER_5S_GUARD_ENABLED and source == "SUMMARY_AI"),
         "require_5s_data": ENTRY_ORDER_REQUIRE_5S_DATA,
         "mtf_guard": bool(ENTRY_ORDER_MTF_GUARD_ENABLED and source == "SUMMARY_AI"),
         "require_mtf_data": ENTRY_ORDER_REQUIRE_MTF_DATA,
     }
-
     if qty_override is not None:
         detail["qty_override"] = True
-
     if forced_min_qty:
         detail["forced_min_qty"] = True
         detail["liquidity_class"] = "LOW"
-
     return _ok(**detail)
