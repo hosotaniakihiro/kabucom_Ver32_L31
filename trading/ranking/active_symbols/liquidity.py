@@ -1,17 +1,11 @@
 # ============================================================
 # File   : trading/ranking/active_symbols/liquidity.py
-# Version: Ver1.1-ACTIVE-SYMBOLS-LIQUIDITY-NO-DROP-MISSING-INFO
+# Version: Ver1.2-ACTIVE-SYMBOLS-MAX-PRICE-GUARD
 # ------------------------------------------------------------
 # Purpose:
 #   - PUSH登録候補の流動性/価格フィルタ
 #   - 低位株や極端に流動性が低い銘柄を除外する
-#
-# REV1.1:
-#   - final_guard_min_price() で liquidity_map に情報が無い銘柄を全削除しない
-#   - 寄前気配CSV/ランキング候補など、価格情報が未取得の段階では候補を残す
-#   - current_price が 0/None/欠損の場合も「情報不足」として残す
-#   - 価格情報がある銘柄だけ MIN_PRICE / volume / value / tick を判定する
-#   - before=95 after=0 のようなPUSH対象全消滅を防ぐ
+#   - 監視銘柄を5000円以下に制限する
 # ============================================================
 
 from __future__ import annotations
@@ -22,6 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 from .config import (
     ENABLE_LIQUIDITY_FILTER,
     KEEP_PROTECTED_EVEN_IF_ILLIQUID,
+    MAX_PRICE,
     MIN_PRICE,
     MIN_TICK_COUNT,
     MIN_TRADING_VALUE,
@@ -46,15 +41,8 @@ def _has_positive_value(info: Optional[Dict[str, Any]], keys: Iterable[str]) -> 
 
 
 def _has_usable_liquidity_info(info: Optional[Dict[str, Any]]) -> bool:
-    """
-    フィルタ判定に使える価格/流動性情報があるか。
-
-    ranking DB の列名揺れを考慮する。
-    情報が無い場合は「落とす」のではなく「判定保留」にする。
-    """
     if not info:
         return False
-
     return _has_positive_value(
         info,
         (
@@ -99,6 +87,16 @@ def _get_tick(info: Dict[str, Any]) -> float:
     return to_float(info.get("tick_count"), 0.0)
 
 
+def _price_ok(price: float) -> bool:
+    if price <= 0:
+        return True
+    if MIN_PRICE > 0 and price < MIN_PRICE:
+        return False
+    if MAX_PRICE > 0 and price > MAX_PRICE:
+        return False
+    return True
+
+
 def is_liquid_symbol(
     symbol: Any,
     *,
@@ -130,7 +128,7 @@ def is_liquid_symbol(
     value = _get_value(info)
     tick = _get_tick(info)
 
-    if price > 0 and price < MIN_PRICE:
+    if not _price_ok(price):
         return False
     if value > 0 and value < MIN_TRADING_VALUE:
         return False
@@ -178,7 +176,7 @@ def filter_liquid_symbols(
 
     logger.info(
         "[ACTIVE LIQUIDITY FILTER] context=%s before=%d after=%d removed=%d missing_info=%d require_info=%s "
-        "min_value=%.0f min_volume=%.0f min_tick=%.0f min_price=%.0f removed_head=%s missing_head=%s",
+        "min_value=%.0f min_volume=%.0f min_tick=%.0f min_price=%.0f max_price=%.0f removed_head=%s missing_head=%s",
         context,
         len(cleaned),
         len(kept),
@@ -189,6 +187,7 @@ def filter_liquid_symbols(
         MIN_VOLUME,
         MIN_TICK_COUNT,
         MIN_PRICE,
+        MAX_PRICE,
         removed[:20],
         missing_info[:20],
     )
@@ -202,25 +201,11 @@ def final_guard_min_price(
     liquidity_map: Dict[str, Dict[str, float]],
     premarket_mode: bool,
 ) -> List[str]:
-    """
-    PUSH登録直前の最終ガード。
-
-    重要:
-      以前は require_info=True で is_liquid_symbol() を呼んでいたため、
-      liquidity_map に価格情報が無い銘柄が全て削除され、
-      before=95 after=0 のようにPUSH対象が消えることがあった。
-
-    方針:
-      - premarket_mode=True はそのまま返す
-      - 保有銘柄/protected は必ず残す
-      - 情報が無い銘柄は「判定保留」として残す
-      - 情報がある銘柄だけ価格/流動性で落とす
-    """
     items = dedupe_keep_order(symbols)
 
     if premarket_mode:
         logger.info(
-            "[ACTIVE FINAL MINPRICE GUARD] skipped premarket_mode before=%d after=%d",
+            "[ACTIVE FINAL PRICE GUARD] skipped premarket_mode before=%d after=%d",
             len(items),
             len(items),
         )
@@ -264,22 +249,24 @@ def final_guard_min_price(
 
     if removed or missing_info:
         logger.warning(
-            "[ACTIVE FINAL MINPRICE GUARD] before=%d after=%d removed=%d missing_info_kept=%d "
-            "min_price=%.1f removed_head=%s missing_info_head=%s",
+            "[ACTIVE FINAL PRICE GUARD] before=%d after=%d removed=%d missing_info_kept=%d "
+            "min_price=%.1f max_price=%.1f removed_head=%s missing_info_head=%s",
             len(items),
             len(kept),
             len(removed),
             len(missing_info),
             MIN_PRICE,
+            MAX_PRICE,
             removed[:30],
             missing_info[:30],
         )
     else:
         logger.info(
-            "[ACTIVE FINAL MINPRICE GUARD] before=%d after=%d removed=0 missing_info_kept=0 min_price=%.1f",
+            "[ACTIVE FINAL PRICE GUARD] before=%d after=%d removed=0 missing_info_kept=0 min_price=%.1f max_price=%.1f",
             len(items),
             len(kept),
             MIN_PRICE,
+            MAX_PRICE,
         )
 
     return dedupe_keep_order(kept)
