@@ -1,15 +1,17 @@
 # ============================================================
 # File   : trading/exit/exit_position_runner.py
-# Version: V1.5-ABSOLUTE-ENTRY-STOP-LOSS-030
+# Version: V1.6-ABSOLUTE-STOP-LOSS-RETRY-UNTIL-CLOSED
 # ------------------------------------------------------------
 # 【概要】
 #   1銘柄分のEXIT判定を担当。
 #
 # 【重要修正】
+#   - -0.3%絶対損切りは発火済みマークを使わない。
+#     返済注文失敗/DB close失敗後も、5秒ごとに成功するまで再試行する。
 #   - 建値取得から CurrentPrice を除外。
-#     CurrentPrice を建値として使うと、損失率が常に0%付近になり、
-#     -0.3%損切りが発火しない。
-#   - ctx / AI / features より前に、絶対損切りを最優先で判定。
+#   - 建値取得では avg_price / entry_price / 約定価格系を優先し、
+#     current_price / price は原則使わない。
+#   - ctx / AI / features より前に絶対損切りを最優先判定。
 #
 # 【最優先損切り】
 #   BUY : 現在値 <= 建値 * 0.997 で即返済
@@ -49,28 +51,16 @@ logger = logging.getLogger(__name__)
 # EXIT 設定
 # ============================================================
 
-# 最優先の建値基準損切り。0.30 = 0.30%。
 ABSOLUTE_ENTRY_STOP_LOSS_PCT = float(os.getenv("ABSOLUTE_ENTRY_STOP_LOSS_PCT", "0.30"))
-
-# エントリーから何秒後に判定するか。3分=180秒。
 THREE_MIN_PROFIT_ESCAPE_SEC = int(float(os.getenv("THREE_MIN_PROFIT_ESCAPE_SEC", "180")))
-
-# 3分以内に最大含み益が +0.35% に到達していなければ対象。
 THREE_MIN_PROFIT_ESCAPE_TARGET_PCT = float(os.getenv("THREE_MIN_PROFIT_ESCAPE_TARGET_PCT", "0.35"))
-
-# 現在プラスの間だけ返済する。0.00より大きければ返済。
 THREE_MIN_PROFIT_ESCAPE_MIN_CURRENT_PCT = float(os.getenv("THREE_MIN_PROFIT_ESCAPE_MIN_CURRENT_PCT", "0.00"))
-
-# 3分経過後、現在損益が ±0.1% 以内なら停滞EXIT。
 THREE_MIN_FLAT_EXIT_ABS_PCT = float(os.getenv("THREE_MIN_FLAT_EXIT_ABS_PCT", "0.10"))
-
-# BUY: 高値から0.25%下落でEXIT / SELL: 安値から0.25%上昇でEXIT。
 ENTRY_TRAIL_RETRACE_EXIT_PCT = float(os.getenv("ENTRY_TRAIL_RETRACE_EXIT_PCT", "0.25"))
 
 _THREE_MIN_ESCAPE_MARK_ATTR = "three_min_profit_escape_fired"
 _TRAIL_RETRACE_MARK_ATTR = "entry_trail_retrace_exit_fired"
 _FLAT_EXIT_MARK_ATTR = "three_min_flat_exit_fired"
-_ABSOLUTE_STOP_MARK_ATTR = "absolute_entry_stop_loss_fired"
 
 
 def _pos_get(pos: Dict[str, Any], *names: str, default: Any = None) -> Any:
@@ -89,11 +79,10 @@ def _resolve_entry_price(pos: Dict[str, Any]) -> float:
     """
     建値専用の価格を取得する。
 
-    重要:
-      CurrentPrice は現在値なので絶対に建値として使わない。
-      CurrentPrice を使うと -0.3% 損切りの基準が現在値になってしまう。
+    CurrentPrice / current_price は現在値なので使わない。
+    price も環境によって現在値として入るため、最後の最後まで使わない。
     """
-    for key in (
+    preferred_keys = (
         "avg_price",
         "entry_price",
         "AveragePrice",
@@ -104,12 +93,27 @@ def _resolve_entry_price(pos: Dict[str, Any]) -> float:
         "filled_price",
         "contract_price",
         "hold_price",
-        "Price",
-        "price",
-    ):
+        "entry_order_price",
+        "entry_fill_price",
+    )
+
+    for key in preferred_keys:
         v = safe_float(_pos_get(pos, key, default=0.0), 0.0)
         if v > 0:
             return v
+
+    # DB Position では price が補助的に入ることがあるが、
+    # Kabu positions / global では現在値のことがある。
+    # _position_source が DB の場合だけ price を建値候補にする。
+    try:
+        src = str(_pos_get(pos, "_position_source", default="") or "").upper()
+        if "DB" in src:
+            v = safe_float(_pos_get(pos, "Price", "price", default=0.0), 0.0)
+            if v > 0:
+                return v
+    except Exception:
+        pass
+
     return 0.0
 
 
@@ -288,7 +292,6 @@ def _mark_fired(symbol: str, ctx: Any, pos: Dict[str, Any], attr: str, set_name:
 def _judge_absolute_entry_stop_loss(
     *,
     symbol: str,
-    pos: Dict[str, Any],
     side: str,
     entry_price: float,
     current_price: float,
@@ -296,16 +299,10 @@ def _judge_absolute_entry_stop_loss(
     """
     最優先の建値基準損切り。
 
-    BUY:
-      current <= entry * (1 - 0.003)
-
-    SELL:
-      current >= entry * (1 + 0.003)
+    この判定は発火済みマークを見ない。
+    返済失敗時でも次回ループで必ず再試行する。
     """
     try:
-        if _already_marked(symbol, None, pos, _ABSOLUTE_STOP_MARK_ATTR, "absolute_entry_stop_loss_fired_symbols"):
-            return False, "", {}
-
         if entry_price <= 0 or current_price <= 0 or side not in {"BUY", "SELL"}:
             return False, "", {}
 
@@ -578,9 +575,10 @@ def run_exit_for_position(
 
         if not entry_price:
             logger.warning(
-                "[EXIT] skip no entry_price symbol=%s pos_keys=%s reason=current_price_not_used_as_entry",
+                "[EXIT] skip no entry_price symbol=%s pos_keys=%s pos=%s reason=current_price_not_used_as_entry",
                 symbol,
                 list(pos.keys()) if isinstance(pos, dict) else type(pos),
+                pos,
             )
             return False
 
@@ -599,22 +597,21 @@ def run_exit_for_position(
         # ====================================================
         # 0. 最優先: 建値基準 -0.3% 絶対損切り
         #    ctx / AI / features より前に判定する。
+        #    成功するまで毎回再試行するため、発火済みマークは使わない。
         # ====================================================
         abs_stop, abs_reason, abs_detail = _judge_absolute_entry_stop_loss(
             symbol=symbol,
-            pos=pos,
             side=side,
             entry_price=entry_price,
             current_price=price,
         )
         if abs_stop:
             logger.warning(
-                "[ABSOLUTE_ENTRY_STOP_LOSS] EXIT symbol=%s detail=%s reason=%s",
+                "[ABSOLUTE_ENTRY_STOP_LOSS] EXIT_RETRY symbol=%s detail=%s reason=%s",
                 symbol,
                 abs_detail,
                 abs_reason,
             )
-            _mark_fired(symbol, None, pos, _ABSOLUTE_STOP_MARK_ATTR, "absolute_entry_stop_loss_fired_symbols")
             finalize_exit(
                 symbol=symbol,
                 price=price,
@@ -629,7 +626,7 @@ def run_exit_for_position(
             return True
 
         logger.warning(
-            "[ABSOLUTE_ENTRY_STOP_LOSS] check symbol=%s side=%s entry=%.4f price=%.4f pnl=%.4f current_profit=%.4f%% threshold=%.4f%%",
+            "[ABSOLUTE_ENTRY_STOP_LOSS] check symbol=%s side=%s entry=%.4f price=%.4f pnl=%.4f current_profit=%.4f%% threshold=%.4f%% pos_source=%s",
             symbol,
             side,
             entry_price,
@@ -637,6 +634,7 @@ def run_exit_for_position(
             pnl,
             _calc_current_profit_pct(side=side, entry_price=entry_price, current_price=price),
             ABSOLUTE_ENTRY_STOP_LOSS_PCT,
+            _pos_get(pos, "_position_source", default=""),
         )
 
         ctx = _resolve_exit_ctx(symbol, pos, side=side, entry_price=entry_price, now=now)
@@ -658,9 +656,6 @@ def run_exit_for_position(
         except Exception:
             cluster_id = 0
 
-        # ====================================================
-        # 1. エントリー後高値/安値からの0.25%反転EXIT
-        # ====================================================
         trail_exit, trail_reason, trail_detail = _judge_entry_trail_retrace_exit(
             symbol=symbol,
             pos=pos,
@@ -680,9 +675,6 @@ def run_exit_for_position(
             finalize_exit(symbol=symbol, price=price, reason=trail_reason, cluster_id=cluster_id, regime=regime, inago_state=0, pnl=pnl, collapse_prob=0.0, ctx=ctx)
             return True
 
-        # ====================================================
-        # 2. 3分ルール
-        # ====================================================
         three_min_exit, three_min_reason, three_min_detail, mark_attr, mark_set_name = _judge_three_min_exit_rules(
             symbol=symbol,
             pos=pos,
@@ -704,9 +696,6 @@ def run_exit_for_position(
             finalize_exit(symbol=symbol, price=price, reason=three_min_reason, cluster_id=cluster_id, regime=regime, inago_state=0, pnl=pnl, collapse_prob=0.0, ctx=ctx)
             return True
 
-        # ====================================================
-        # 3. EARLY PROFIT / BREAKEVEN / TRAILING STOP GUARD
-        # ====================================================
         early_exit, early_reason = judge_early_profit_guard(
             symbol=symbol,
             pos=pos,
