@@ -1,6 +1,6 @@
 # ==========================================================
 # trading/handlers/entry_order_builder.py
-# Ver1.4.1-FINAL-SUMMARY-LOW-MOVE-SAFE-GUARD
+# Ver1.5.0-FINAL-SUMMARY-5SEC-PRE-ENTRY-GUARD
 # ----------------------------------------------------------
 # ✔ 注文条件（price / order_type / qty）を決定するだけ
 # ✔ 副作用ゼロ（発注・global_state 操作なし）
@@ -15,14 +15,19 @@
 #   - high/low がある場合だけ値幅不足を止める
 #   - ATR は存在する場合だけ判定する
 #   - high/low/ATR 欠損だけで全停止しない
+# ✔ SUMMARY_AI 発注直前に5秒足の向きを確認
+#   - BUY  : 直近5秒足が上方向でなければ止める
+#   - SELL : 直近5秒足が下方向でなければ止める
+#   - 5秒足が無い場合は既定では許可（環境変数で必須化可能）
 # ✔ 未約定は pending_order_monitor 側で2秒取消
 # ==========================================================
 
 from __future__ import annotations
 
+import datetime as dt
 import math
 import os
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 
 from global_state import global_data
 from utils_common import (
@@ -40,6 +45,29 @@ MAX_SPREAD_PCT_FOR_LIMIT = 0.30
 MIN_ENTRY_QTY = 100
 
 SUMMARY_AGGRESSIVE_LIMIT_TICKS = 1
+
+# ----------------------------------------------------------
+# SUMMARY_AI 5秒足 直前確認
+# ----------------------------------------------------------
+ENTRY_ORDER_5S_GUARD_ENABLED = str(os.getenv("ENTRY_ORDER_5S_GUARD_ENABLED", "1")).lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+
+# True にすると、5秒足が無い銘柄は発注しない。
+# 既定 True にすると起動直後やPUSH未登録銘柄で全停止しやすいため、既定は False。
+ENTRY_ORDER_REQUIRE_5S_DATA = str(os.getenv("ENTRY_ORDER_REQUIRE_5S_DATA", "0")).lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+}
+
+ENTRY_ORDER_5S_MIN_BARS = int(float(os.getenv("ENTRY_ORDER_5S_MIN_BARS", "2")))
+ENTRY_ORDER_5S_MAX_AGE_SEC = float(os.getenv("ENTRY_ORDER_5S_MAX_AGE_SEC", "20"))
 
 # ----------------------------------------------------------
 # 低ボラ最終防衛
@@ -108,7 +136,10 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
         if v is None or v == "":
             return default
-        return float(v)
+        x = float(v)
+        if math.isnan(x) or math.isinf(x):
+            return default
+        return x
     except Exception:
         return default
 
@@ -122,6 +153,44 @@ def _first(row: Dict[str, Any], keys: tuple[str, ...], default: Any = None) -> A
     except Exception:
         pass
     return default
+
+
+def _row_get(row: Any, *names: str, default: Any = None) -> Any:
+    """dict / pandas Series / object の列名ゆらぎを吸収する。"""
+    for name in names:
+        try:
+            if isinstance(row, dict) and name in row:
+                v = row.get(name)
+                if v not in (None, ""):
+                    return v
+            if hasattr(row, "get"):
+                v = row.get(name, None)
+                if v not in (None, ""):
+                    return v
+            if hasattr(row, name):
+                v = getattr(row, name)
+                if v not in (None, ""):
+                    return v
+        except Exception:
+            continue
+    return default
+
+
+def _parse_dt(v: Any) -> Optional[dt.datetime]:
+    try:
+        if v is None or v == "":
+            return None
+        if isinstance(v, dt.datetime):
+            return v.replace(tzinfo=None) if v.tzinfo else v
+        s = str(v).strip()
+        if not s:
+            return None
+        s = s.replace("T", " ").split("+", 1)[0]
+        if s.endswith("Z"):
+            s = s[:-1]
+        return dt.datetime.fromisoformat(s)
+    except Exception:
+        return None
 
 
 # ==========================================================
@@ -220,6 +289,185 @@ def _low_move_hard_block(entry_row: Dict[str, Any], *, symbol: str, source: str)
 
 
 # ==========================================================
+# SUMMARY_AI 5秒足 直前確認
+# ==========================================================
+
+def _get_5s_df(symbol: str):
+    try:
+        m = getattr(global_data, "realtime_5s", None)
+        if isinstance(m, dict):
+            return m.get(str(symbol)) or m.get(symbol) or m.get(str(symbol).zfill(4))
+    except Exception:
+        pass
+
+    # 互換: 他の名前で保持されている場合も拾う。
+    for attr in (
+        "df_5s_by_symbol",
+        "realtime_5sec",
+        "realtime_5sec_bars",
+        "five_sec_bars",
+        "bars_5s",
+    ):
+        try:
+            m = getattr(global_data, attr, None)
+            if isinstance(m, dict):
+                df = m.get(str(symbol)) or m.get(symbol) or m.get(str(symbol).zfill(4))
+                if df is not None:
+                    return df
+        except Exception:
+            continue
+    return None
+
+
+def _extract_5s_rows(df: Any) -> Optional[Tuple[Any, Any, int]]:
+    try:
+        if df is None:
+            return None
+
+        n = len(df)
+        if n < max(2, ENTRY_ORDER_5S_MIN_BARS):
+            return None
+
+        # pandas DataFrame想定。
+        if hasattr(df, "iloc"):
+            prev = df.iloc[-2]
+            last = df.iloc[-1]
+            return prev, last, n
+
+        # list[dict] / tuple[dict] 想定。
+        if isinstance(df, (list, tuple)):
+            return df[-2], df[-1], n
+
+        return None
+    except Exception:
+        return None
+
+
+def _five_sec_pre_entry_guard(symbol: str, side: str, source: str) -> Optional[Dict[str, Any]]:
+    """
+    SUMMARY_AIの発注直前に5秒足の向きを確認する。
+
+    BUY許可:
+      - 直近5秒足が陽線寄り
+      - かつ、前5秒足より下がっていない、または高値更新
+
+    SELL許可:
+      - 直近5秒足が陰線寄り
+      - かつ、前5秒足より上がっていない、または安値更新
+
+    5秒足が無い場合:
+      - ENTRY_ORDER_REQUIRE_5S_DATA=1 のときだけ止める
+      - 既定は止めない
+    """
+    if not ENTRY_ORDER_5S_GUARD_ENABLED:
+        return None
+
+    source_u = str(source or "").upper()
+    if source_u != "SUMMARY_AI":
+        return None
+
+    side_u = str(side or "").upper()
+    if side_u not in {"BUY", "SELL"}:
+        return None
+
+    df = _get_5s_df(symbol)
+    rows = _extract_5s_rows(df)
+    if rows is None:
+        if ENTRY_ORDER_REQUIRE_5S_DATA:
+            return _ng(
+                "FIVE_SEC_NO_DATA",
+                symbol=symbol,
+                side=side_u,
+                require_5s=True,
+                min_bars=ENTRY_ORDER_5S_MIN_BARS,
+            )
+        return None
+
+    prev, last, nrows = rows
+
+    prev_close = _safe_float(_row_get(prev, "close_price", "close", "price", "current_price", "Close", default=0.0), 0.0)
+    prev_high = _safe_float(_row_get(prev, "high_price", "high", "High", default=0.0), 0.0)
+    prev_low = _safe_float(_row_get(prev, "low_price", "low", "Low", default=0.0), 0.0)
+
+    last_open = _safe_float(_row_get(last, "open_price", "open", "Open", default=0.0), 0.0)
+    last_close = _safe_float(_row_get(last, "close_price", "close", "price", "current_price", "Close", default=0.0), 0.0)
+    last_high = _safe_float(_row_get(last, "high_price", "high", "High", default=0.0), 0.0)
+    last_low = _safe_float(_row_get(last, "low_price", "low", "Low", default=0.0), 0.0)
+
+    ts = _row_get(last, "datetime", "timestamp", "time", "created_at", "updated_at", default=None)
+    last_dt = _parse_dt(ts)
+    age_sec = None
+    if last_dt is not None:
+        try:
+            age_sec = abs((dt.datetime.now() - last_dt).total_seconds())
+        except Exception:
+            age_sec = None
+
+    if age_sec is not None and age_sec > ENTRY_ORDER_5S_MAX_AGE_SEC:
+        if ENTRY_ORDER_REQUIRE_5S_DATA:
+            return _ng(
+                "FIVE_SEC_STALE",
+                symbol=symbol,
+                side=side_u,
+                age_sec=age_sec,
+                max_age_sec=ENTRY_ORDER_5S_MAX_AGE_SEC,
+                nrows=nrows,
+            )
+        return None
+
+    # 最低限の価格が取れない場合。
+    if last_close <= 0 or prev_close <= 0:
+        if ENTRY_ORDER_REQUIRE_5S_DATA:
+            return _ng(
+                "FIVE_SEC_INVALID_PRICE",
+                symbol=symbol,
+                side=side_u,
+                prev_close=prev_close,
+                last_close=last_close,
+                nrows=nrows,
+            )
+        return None
+
+    if last_open <= 0:
+        last_open = prev_close
+    if last_high <= 0:
+        last_high = max(last_open, last_close)
+    if last_low <= 0:
+        last_low = min(last_open, last_close)
+    if prev_high <= 0:
+        prev_high = prev_close
+    if prev_low <= 0:
+        prev_low = prev_close
+
+    bullish = (last_close >= last_open) and ((last_close >= prev_close) or (last_high > prev_high))
+    bearish = (last_close <= last_open) and ((last_close <= prev_close) or (last_low < prev_low))
+
+    detail = {
+        "symbol": symbol,
+        "side": side_u,
+        "nrows": nrows,
+        "prev_close": prev_close,
+        "last_open": last_open,
+        "last_close": last_close,
+        "prev_high": prev_high,
+        "last_high": last_high,
+        "prev_low": prev_low,
+        "last_low": last_low,
+        "age_sec": age_sec,
+        "bullish": bullish,
+        "bearish": bearish,
+    }
+
+    if side_u == "BUY" and not bullish:
+        return _ng("FIVE_SEC_NOT_BULLISH", **detail)
+
+    if side_u == "SELL" and not bearish:
+        return _ng("FIVE_SEC_NOT_BEARISH", **detail)
+
+    return None
+
+
+# ==========================================================
 # 価格丸め
 # ==========================================================
 
@@ -253,18 +501,22 @@ def _aggressive_limit_price(base_price: float, side: str, ticks: int = SUMMARY_A
 # ==========================================================
 
 def five_sec_breakout(symbol: str, side: str) -> Optional[float]:
-    df = getattr(global_data, "realtime_5s", {}).get(symbol)
-    if df is None or len(df) < 3:
+    df = _get_5s_df(symbol)
+    rows = _extract_5s_rows(df)
+    if rows is None:
         return None
 
-    prev = df.iloc[-2]
-    last = df.iloc[-1]
+    prev, last, _nrows = rows
+    prev_high = _safe_float(_row_get(prev, "high_price", "high", "High", default=0.0), 0.0)
+    prev_low = _safe_float(_row_get(prev, "low_price", "low", "Low", default=0.0), 0.0)
+    last_high = _safe_float(_row_get(last, "high_price", "high", "High", default=0.0), 0.0)
+    last_low = _safe_float(_row_get(last, "low_price", "low", "Low", default=0.0), 0.0)
 
-    if side == "BUY" and last["high_price"] > prev["high_price"]:
-        return float(last["high_price"])
+    if side == "BUY" and last_high > 0 and prev_high > 0 and last_high > prev_high:
+        return float(last_high)
 
-    if side == "SELL" and last["low_price"] < prev["low_price"]:
-        return float(last["low_price"])
+    if side == "SELL" and last_low > 0 and prev_low > 0 and last_low < prev_low:
+        return float(last_low)
 
     return None
 
@@ -294,6 +546,10 @@ def build_entry_order(
     low_move_ng = _low_move_hard_block(entry_row, symbol=symbol, source=source)
     if low_move_ng is not None:
         return low_move_ng
+
+    five_sec_ng = _five_sec_pre_entry_guard(symbol=symbol, side=side, source=source)
+    if five_sec_ng is not None:
+        return five_sec_ng
 
     # ======================================================
     # SUMMARY 起点
@@ -409,6 +665,8 @@ def build_entry_order(
         "min_atr_ratio": ENTRY_ORDER_MIN_ATR_RATIO,
         "require_atr": ENTRY_ORDER_REQUIRE_ATR,
         "require_high_low": ENTRY_ORDER_REQUIRE_HIGH_LOW,
+        "five_sec_guard": bool(ENTRY_ORDER_5S_GUARD_ENABLED and source == "SUMMARY_AI"),
+        "require_5s_data": ENTRY_ORDER_REQUIRE_5S_DATA,
     }
 
     if qty_override is not None:
