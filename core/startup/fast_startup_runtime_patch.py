@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/fast_startup_runtime_patch.py
-# Version: PRODUCTION-FAST-STARTUP-PATCH-V7-PUSH-DIRECT-OHLC
+# Version: PRODUCTION-FAST-STARTUP-PATCH-V8-ENTRY-MAX10
 # ------------------------------------------------------------
 # 目的:
 #   main.py 起動直後の重い処理を軽くする。
@@ -10,6 +10,7 @@
 #   さらに、AI確認前に予算上限で買えない高価格銘柄を除外するpatchを入れる。
 #   さらに、symbol_flags.db を起動時に global_data へキャッシュする。
 #   さらに、PUSH rows があるのに summary が0件になる場合の direct OHLC patch を入れる。
+#   さらに、定時サマリーAI許可銘柄の最大発注数を10にする。
 # ============================================================
 
 from __future__ import annotations
@@ -140,6 +141,32 @@ def _install_push_direct_ohlc_patch() -> None:
         logger.exception("[FAST STARTUP PATCH] push_summary_direct_ohlc_runtime_patch install failed")
 
 
+def _install_entry_max_approved_patch() -> None:
+    """
+    定時サマリーAIで許可された候補を、優先順位順に最大10件まで発注可能にする。
+
+    entry_controller.py 本体の MAX_APPROVED_PER_RUN が古い値でも、起動時に10へ上書きする。
+    環境変数 ENTRY_MAX_APPROVED_PER_RUN を指定すれば変更可能。
+    """
+    try:
+        import trading.handlers.entry_controller as ec
+
+        old_value = getattr(ec, "MAX_APPROVED_PER_RUN", None)
+        new_value = _env_int("ENTRY_MAX_APPROVED_PER_RUN", 10)
+        if new_value <= 0:
+            new_value = 10
+
+        setattr(ec, "MAX_APPROVED_PER_RUN", int(new_value))
+
+        logger.warning(
+            "[FAST STARTUP PATCH] entry_controller.MAX_APPROVED_PER_RUN patched old=%s new=%s env=ENTRY_MAX_APPROVED_PER_RUN",
+            old_value,
+            getattr(ec, "MAX_APPROVED_PER_RUN", None),
+        )
+    except Exception:
+        logger.exception("[FAST STARTUP PATCH] entry MAX_APPROVED_PER_RUN patch failed")
+
+
 def install() -> bool:
     global _PATCHED
     if _PATCHED:
@@ -180,6 +207,11 @@ def install() -> bool:
         _install_push_direct_ohlc_patch()
     except Exception:
         logger.exception("[FAST STARTUP PATCH] push direct OHLC patch failed")
+
+    try:
+        _install_entry_max_approved_patch()
+    except Exception:
+        logger.exception("[FAST STARTUP PATCH] entry MAX_APPROVED_PER_RUN patch failed")
 
     try:
         old_lookback = getattr(sb, "_DEFAULT_RANKING_LOOKBACK_MINUTES", None)
@@ -243,7 +275,10 @@ def install() -> bool:
         logger.exception("[FAST STARTUP PATCH] initial ranking tick patch failed")
 
     _PATCHED = True
-    logger.warning("[FAST STARTUP PATCH] installed v7 entry_affordability=True symbol_flags_bootstrap=True push_direct_ohlc=True")
+    logger.warning(
+        "[FAST STARTUP PATCH] installed v8 entry_affordability=True symbol_flags_bootstrap=True push_direct_ohlc=True entry_max_approved=%s",
+        10,
+    )
     return True
 
 
