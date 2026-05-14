@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/fast_startup_runtime_patch.py
-# Version: PRODUCTION-FAST-STARTUP-PATCH-V6-SYMBOL-FLAGS-BOOTSTRAP
+# Version: PRODUCTION-FAST-STARTUP-PATCH-V7-PUSH-DIRECT-OHLC
 # ------------------------------------------------------------
 # 目的:
 #   main.py 起動直後の重い処理を軽くする。
@@ -9,6 +9,7 @@
 #   broker信用建玉から復元して返済注文できるpatchを起動時に入れる。
 #   さらに、AI確認前に予算上限で買えない高価格銘柄を除外するpatchを入れる。
 #   さらに、symbol_flags.db を起動時に global_data へキャッシュする。
+#   さらに、PUSH rows があるのに summary が0件になる場合の direct OHLC patch を入れる。
 # ============================================================
 
 from __future__ import annotations
@@ -125,6 +126,20 @@ def _install_entry_affordability_patch() -> None:
         logger.exception("[FAST STARTUP PATCH] entry_affordability_runtime_patch install failed")
 
 
+def _install_push_direct_ohlc_patch() -> None:
+    """
+    PUSH rows が存在するのに summary が0件になる場合の最終防衛。
+    push_summary_engine の列名正規化と direct OHLC fallback を強化する。
+    """
+    try:
+        from core.startup.push_summary_direct_ohlc_runtime_patch import install as install_push_direct_ohlc_patch
+
+        ok = install_push_direct_ohlc_patch()
+        logger.warning("[FAST STARTUP PATCH] push_summary_direct_ohlc_runtime_patch installed=%s", ok)
+    except Exception:
+        logger.exception("[FAST STARTUP PATCH] push_summary_direct_ohlc_runtime_patch install failed")
+
+
 def install() -> bool:
     global _PATCHED
     if _PATCHED:
@@ -160,6 +175,11 @@ def install() -> bool:
         _install_entry_affordability_patch()
     except Exception:
         logger.exception("[FAST STARTUP PATCH] entry affordability patch failed")
+
+    try:
+        _install_push_direct_ohlc_patch()
+    except Exception:
+        logger.exception("[FAST STARTUP PATCH] push direct OHLC patch failed")
 
     try:
         old_lookback = getattr(sb, "_DEFAULT_RANKING_LOOKBACK_MINUTES", None)
@@ -223,7 +243,7 @@ def install() -> bool:
         logger.exception("[FAST STARTUP PATCH] initial ranking tick patch failed")
 
     _PATCHED = True
-    logger.warning("[FAST STARTUP PATCH] installed v6 entry_affordability=True symbol_flags_bootstrap=True")
+    logger.warning("[FAST STARTUP PATCH] installed v7 entry_affordability=True symbol_flags_bootstrap=True push_direct_ohlc=True")
     return True
 
 
