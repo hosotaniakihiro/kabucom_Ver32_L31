@@ -1,8 +1,16 @@
 # ============================================================
 # File   : core/startup/entry_liquidity_runtime_patch.py
-# Version: V1.1-RECENT-1MIN-LIQUIDITY-GUARD
+# Version: V1.2-ENTRY-AND-SUMMARY-AI-LIQUIDITY-GUARD
 # ------------------------------------------------------------
-# 直近の1分足N本を優先して、出来高・売買代金・値動きを判定する。
+# 目的:
+#   出来高が少ない・売買代金が薄い・値動きが小さい銘柄への
+#   新規エントリーを止める。
+#
+# 重要:
+#   V1.1までは entry_controller の発注直前だけで止めていたため、
+#   SUMMARY_AI executor の approved_rows 作成前には効かない経路があった。
+#   V1.2では summary_ai_liquidity_runtime_patch も同時にinstallし、
+#   AI_OK -> approved_rows の前でも 3万株/1,000万円 を効かせる。
 #
 # default:
 #   ENTRY_LIQ_RECENT_BARS=5
@@ -10,6 +18,8 @@
 #   ENTRY_LIQ_MIN_TURNOVER_YEN=10000000
 #   ENTRY_LIQ_MIN_RANGE_PCT=0.0015
 #   ENTRY_LIQ_MIN_ATR_PCT=0.0010
+#   SUMMARY_AI_LIQ_MIN_VOLUME=30000
+#   SUMMARY_AI_LIQ_MIN_TURNOVER_YEN=10000000
 # ============================================================
 
 from __future__ import annotations
@@ -202,9 +212,19 @@ def _check_liquidity(row: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
     return True, "LIQUIDITY_OK", detail
 
 
+def _install_summary_ai_liquidity_guard() -> None:
+    try:
+        from core.startup.summary_ai_liquidity_runtime_patch import install as install_summary_ai_liq
+        ok = install_summary_ai_liq()
+        logger.warning("[ENTRY LIQ GUARD] summary_ai_liquidity_runtime_patch installed=%s", ok)
+    except Exception:
+        logger.exception("[ENTRY LIQ GUARD] summary_ai_liquidity_runtime_patch install failed")
+
+
 def install() -> bool:
     global _INSTALLED
     if _INSTALLED:
+        _install_summary_ai_liquidity_guard()
         return True
     try:
         import trading.handlers.entry_controller as ec
@@ -215,7 +235,7 @@ def install() -> bool:
     if not callable(old):
         logger.warning("[ENTRY LIQ GUARD] _execute_best_candidate not callable")
         return False
-    if not getattr(old, "_entry_liq_guard_wrapped_v11", False):
+    if not getattr(old, "_entry_liq_guard_wrapped_v12", False):
         def wrapped(item: dict, boost_active: bool) -> bool:
             try:
                 row = item.get("entry_row") if isinstance(item, dict) else None
@@ -228,16 +248,18 @@ def install() -> bool:
                         return False
             except Exception:
                 logger.exception("[ENTRY LIQ GUARD] precheck failed")
+                return False
             return old(item, boost_active=boost_active)
-        wrapped._entry_liq_guard_wrapped_v11 = True  # type: ignore[attr-defined]
+        wrapped._entry_liq_guard_wrapped_v12 = True  # type: ignore[attr-defined]
         wrapped._original = old  # type: ignore[attr-defined]
         ec._execute_best_candidate = wrapped
+    _install_summary_ai_liquidity_guard()
     _INSTALLED = True
     logger.warning(
-        "[ENTRY LIQ GUARD] installed v1.1 recent_bars=%s min_volume=%s min_turnover=%s min_range_pct=%s min_atr_pct=%s",
-        _env_int("ENTRY_LIQ_RECENT_BARS", 5),
+        "[ENTRY LIQ GUARD] installed v1.2 entry_controller+summary_ai min_volume=%s min_turnover=%s recent_bars=%s min_range_pct=%s min_atr_pct=%s",
         _env_float("ENTRY_LIQ_MIN_VOLUME", 30000.0),
         _env_float("ENTRY_LIQ_MIN_TURNOVER_YEN", 10000000.0),
+        _env_int("ENTRY_LIQ_RECENT_BARS", 5),
         _env_float("ENTRY_LIQ_MIN_RANGE_PCT", 0.0015),
         _env_float("ENTRY_LIQ_MIN_ATR_PCT", 0.0010),
     )
