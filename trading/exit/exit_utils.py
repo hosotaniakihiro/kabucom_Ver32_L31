@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/exit/exit_utils.py
-# Version: V1.2-SPLIT-EXIT-UTILS-DB-POSITION-SYNC
+# Version: V1.3-SPLIT-EXIT-UTILS-BROKER-POSITION-MERGE
 # ------------------------------------------------------------
 # EXIT系共通ユーティリティ。
 #
@@ -8,6 +8,7 @@
 #   - GC.positions / global_data.open_positions に加え、DB positions(status=OPEN) も見る
 #   - exit_loop_5s が監視対象なしで即終了する問題を防ぐ
 #   - DBから読んだ建玉を global_data.open_positions / GC.positions へ同期する
+#   - V1.3: kabu Station 実信用建玉も毎回マージする
 # ============================================================
 
 from __future__ import annotations
@@ -154,17 +155,60 @@ def _position_to_dict(pos: Any) -> Dict[str, Any]:
 
     out: Dict[str, Any] = {}
     for name in [
-        "symbol", "symbolname", "side", "qty", "quantity", "avg_price", "entry_price",
+        "symbol", "Symbol", "symbolname", "side", "Side", "qty", "quantity", "LeavesQty",
+        "avg_price", "entry_price", "AveragePrice", "AvgPrice", "ExecutionPrice", "Price",
         "entry_time", "created_at", "updated_at", "status", "atr", "atr_1min",
         "order_id", "entry_order_id", "ranking_lost_minutes",
         "tonosama_first_tp_done", "tonosama_second_tp_done",
         "exchange", "margin_trade_type", "account_type", "hold_id", "execution_id",
+        "current_price", "CurrentPrice",
     ]:
         try:
             if hasattr(pos, name):
                 out[name] = getattr(pos, name)
         except Exception:
             pass
+    return out
+
+
+def _normalize_broker_side(pos: Dict[str, Any]) -> str:
+    """kabu StationのSide/TradeType系をBUY/SELLへ寄せる。"""
+    raw = dict_get_any(pos, "side", "Side", "position_side", "trade_side", "SellBuy", default="")
+    s = str(raw or "").strip().upper()
+    if s in {"BUY", "LONG", "2", "02", "20", "B", "信用買", "買", "買建"}:
+        return "BUY"
+    if s in {"SELL", "SHORT", "1", "01", "10", "S", "信用売", "売", "売建"}:
+        return "SELL"
+    return s
+
+
+def _normalize_broker_position(symbol: str, pos: Dict[str, Any], *, source: str) -> Dict[str, Any]:
+    out = dict(pos)
+    out["symbol"] = normalize_symbol(out.get("symbol") or out.get("Symbol") or symbol)
+    out.setdefault("status", "OPEN")
+    out["_position_source"] = source
+
+    side = _normalize_broker_side(out)
+    if side in {"BUY", "SELL"}:
+        out["side"] = side
+
+    qty = dict_get_any(out, "qty", "quantity", "LeavesQty", "HoldQty", "Qty", default=None)
+    if qty not in (None, ""):
+        out["qty"] = qty
+
+    entry_price = dict_get_any(
+        out,
+        "entry_price", "avg_price", "AveragePrice", "AvgPrice", "ExecutionPrice", "Price", "price",
+        default=None,
+    )
+    if entry_price not in (None, ""):
+        out.setdefault("entry_price", entry_price)
+        out.setdefault("avg_price", entry_price)
+
+    current_price = dict_get_any(out, "current_price", "CurrentPrice", "PresentPrice", "last_price", default=None)
+    if current_price not in (None, ""):
+        out["current_price"] = current_price
+
     return out
 
 
@@ -183,8 +227,7 @@ def _merge_position_map(dst: Dict[str, Dict[str, Any]], src: Any, *, source: str
             if status in {"CLOSED", "DONE", "CANCELLED", "CANCELED"}:
                 continue
 
-            pos.setdefault("symbol", symbol)
-            pos.setdefault("_position_source", source)
+            pos = _normalize_broker_position(symbol, pos, source=source)
 
             if symbol in dst:
                 merged = dict(dst[symbol])
@@ -228,13 +271,65 @@ def _snapshot_gc_positions() -> Dict[str, Any]:
 
 
 def _sync_db_open_positions_safe() -> Dict[str, Dict[str, Any]]:
-    """DB positions(status=OPEN) を読み、global_data / GC へ同期して返す。"""
     try:
         from trading.position.open_position_sync import sync_open_positions_from_db
         return sync_open_positions_from_db(force_log=False) or {}
     except Exception:
         logger.exception("[EXIT POS] DB open position sync failed")
         return {}
+
+
+def _read_broker_open_positions_safe() -> Dict[str, Dict[str, Any]]:
+    """kabu Station の実信用建玉を直接読む。DB/メモリに無くてもEXIT監視対象へ入れる。"""
+    try:
+        from trading.position.kabu_position_reader import read_kabu_open_positions
+        rows = read_kabu_open_positions() or {}
+        if not isinstance(rows, dict):
+            return {}
+        out: Dict[str, Dict[str, Any]] = {}
+        for key, value in rows.items():
+            if not isinstance(value, dict):
+                continue
+            symbol = normalize_symbol(value.get("symbol") or value.get("Symbol") or key)
+            if not symbol:
+                continue
+            out[symbol] = _normalize_broker_position(symbol, value, source="KABU.positions.credit_only.exit_loop_direct")
+        return out
+    except Exception:
+        logger.exception("[EXIT POS] broker open position read failed")
+        return {}
+
+
+def _publish_open_positions_to_memory(positions: Dict[str, Dict[str, Any]]) -> None:
+    if not positions:
+        return
+    try:
+        gd = getattr(global_data, "open_positions", None)
+        if not isinstance(gd, dict):
+            gd = {}
+            setattr(global_data, "open_positions", gd)
+        for symbol, pos in positions.items():
+            gd[symbol] = pos
+    except Exception:
+        logger.debug("[EXIT POS] publish to global_data failed", exc_info=True)
+
+    try:
+        positions_obj = getattr(GC, "positions", None)
+        if positions_obj is not None:
+            for method_name in ["upsert", "set", "add", "set_position"]:
+                fn = getattr(positions_obj, method_name, None)
+                if callable(fn):
+                    for symbol, pos in positions.items():
+                        try:
+                            fn(symbol, pos)
+                        except TypeError:
+                            try:
+                                fn(pos)
+                            except Exception:
+                                pass
+                    break
+    except Exception:
+        logger.debug("[EXIT POS] publish to GC.positions failed", exc_info=True)
 
 
 def get_open_positions_safe() -> Dict[str, Dict[str, Any]]:
@@ -245,6 +340,7 @@ def get_open_positions_safe() -> Dict[str, Dict[str, Any]]:
       1. DB positions(status=OPEN)
       2. GC.positions
       3. global_data.open_positions
+      4. kabu Station 実信用建玉
     """
     merged: Dict[str, Dict[str, Any]] = {}
 
@@ -264,10 +360,21 @@ def get_open_positions_safe() -> Dict[str, Dict[str, Any]]:
     except Exception:
         logger.exception("[POSITION_SNAPSHOT_ERROR] merge global_data.open_positions")
 
+    try:
+        broker_pos = _read_broker_open_positions_safe()
+        _merge_position_map(merged, broker_pos, source="KABU.positions.credit_only.exit_loop_direct")
+    except Exception:
+        logger.exception("[POSITION_SNAPSHOT_ERROR] merge broker positions")
+
+    try:
+        _publish_open_positions_to_memory(merged)
+    except Exception:
+        logger.debug("[EXIT POS] publish merged positions failed", exc_info=True)
+
     if merged:
         logger.info("[EXIT LOOP] open positions detected count=%s symbols=%s", len(merged), sorted(merged.keys()))
     else:
-        logger.debug("[EXIT LOOP] no open positions from DB/GC/global_data")
+        logger.warning("[EXIT LOOP] no open positions from DB/GC/global_data/broker")
 
     return merged
 
