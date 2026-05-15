@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/fast_startup_runtime_patch.py
-# Version: PRODUCTION-FAST-STARTUP-PATCH-V10-ENTRY-PASSIVE-LIMIT
+# Version: PRODUCTION-FAST-STARTUP-PATCH-V11-ENTRY-CANCEL-2S-NEXT
 # ------------------------------------------------------------
 # 目的:
 #   main.py 起動直後の重い処理を軽くする。
@@ -13,6 +13,7 @@
 #   さらに、定時サマリーAI許可銘柄の最大発注数を10にする。
 #   さらに、エントリー価格0.3%損切り・高値/安値0.3%トレーリングEXITを入れる。
 #   さらに、SUMMARY_AIのエントリー指値を BUY=ask-1tick / SELL=bid+1tick にする。
+#   さらに、未約定新規指値を2秒で取消し、次候補のENTRYを起動する。
 # ============================================================
 
 from __future__ import annotations
@@ -129,6 +130,16 @@ def _install_entry_passive_limit_patch() -> None:
         logger.exception("[FAST STARTUP PATCH] entry_limit_passive_runtime_patch install failed")
 
 
+def _install_entry_cancel_2s_next_patch() -> None:
+    try:
+        from core.startup.entry_unfilled_cancel_2s_runtime_patch import install as install_entry_cancel_2s_patch
+
+        ok = install_entry_cancel_2s_patch()
+        logger.warning("[FAST STARTUP PATCH] entry_unfilled_cancel_2s_runtime_patch installed=%s", ok)
+    except Exception:
+        logger.exception("[FAST STARTUP PATCH] entry_unfilled_cancel_2s_runtime_patch install failed")
+
+
 def _install_entry_affordability_patch() -> None:
     try:
         from core.startup.entry_affordability_runtime_patch import install as install_affordability_patch
@@ -213,6 +224,11 @@ def install() -> bool:
         logger.exception("[FAST STARTUP PATCH] entry passive limit patch failed")
 
     try:
+        _install_entry_cancel_2s_next_patch()
+    except Exception:
+        logger.exception("[FAST STARTUP PATCH] entry cancel 2s next patch failed")
+
+    try:
         _install_entry_affordability_patch()
     except Exception:
         logger.exception("[FAST STARTUP PATCH] entry affordability patch failed")
@@ -290,7 +306,7 @@ def install() -> bool:
 
     _PATCHED = True
     logger.warning(
-        "[FAST STARTUP PATCH] installed v10 entry_affordability=True symbol_flags_bootstrap=True push_direct_ohlc=True entry_max_approved=%s exit_trail_0p3=True entry_passive_limit=True",
+        "[FAST STARTUP PATCH] installed v11 entry_affordability=True symbol_flags_bootstrap=True push_direct_ohlc=True entry_max_approved=%s exit_trail_0p3=True entry_passive_limit=True entry_cancel_2s_next=True",
         10,
     )
     return True
