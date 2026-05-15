@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/summary/pipeline/entry_pipeline.py
-# Version: Ver2.6-PRODUCTION-DB-POSITION-SYNC
+# Version: Ver2.7-PRODUCTION-RETURN-EXECUTION-RESULT
 # ------------------------------------------------------------
 # ✔ AI approved rows → entry execution
 # ✔ DataFrame / list / dict / Series 両対応
@@ -18,6 +18,8 @@
 # ✔ SUMMARY AI通常エントリーとイナゴ liquidity_shock 条件を分離
 # ✔ SUMMARY liquidity の min_score を BUY / SELL で分離
 # ✔ SELL信用売り不可銘柄を pending 登録前に除外
+# ✔ Ver2.7: run_summary_entry_executor の戻り値を上位へ返す
+# ✔ Ver2.7: result=None による entry_pipeline_no_order 誤判定を防止
 # ============================================================
 
 from __future__ import annotations
@@ -262,8 +264,6 @@ def _positions_contains_symbol(positions: Any, symbol: str) -> bool:
 
 def _already_in_position(symbol: str) -> bool:
     try:
-        # 最優先: DB positions(status=OPEN) を同期して確認する。
-        # これにより、実建玉/DB建玉があるのにメモリが空で二重エントリーされる問題を防ぐ。
         try:
             from trading.position.open_position_sync import is_symbol_in_open_position
             if is_symbol_in_open_position(symbol, sync=True):
@@ -419,13 +419,39 @@ def _build_exec_dataframe(rows: List[Any], interval: int) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _result_executed(result: Any) -> bool:
+    try:
+        if result is None:
+            return False
+        if isinstance(result, bool):
+            return result
+        if isinstance(result, dict):
+            if bool(result.get("executed")):
+                return True
+            for key in ("executed_count", "approved_count", "registered"):
+                try:
+                    if int(result.get(key) or 0) > 0:
+                        return True
+                except Exception:
+                    pass
+            entries = result.get("entries")
+            if isinstance(entries, list) and entries:
+                return True
+            return False
+        if isinstance(result, (list, tuple, set)):
+            return len(result) > 0
+        return bool(result)
+    except Exception:
+        return False
+
+
 def run_entry_pipeline(approved_rows: Any, df_summary: pd.DataFrame | None, interval: int):
     try:
         interval = _safe_interval(interval) or interval
         rows = _normalize_rows(approved_rows)
         if not rows:
             logger.info("[entry_pipeline] no approved rows interval=%s", interval)
-            return
+            return {"executed": False, "entries": 0, "interval": interval, "skip_reason": "no_approved_rows"}
 
         total_in = len(rows)
         skipped_no_symbol = 0
@@ -481,12 +507,25 @@ def run_entry_pipeline(approved_rows: Any, df_summary: pd.DataFrame | None, inte
 
         if not filtered:
             logger.info("[entry_pipeline] no tradable rows after filters interval=%s", interval)
-            return
+            return {
+                "executed": False,
+                "entries": 0,
+                "approved": total_in,
+                "interval": interval,
+                "skip_reason": "no_tradable_rows_after_filters",
+                "skipped": {
+                    "no_symbol": skipped_no_symbol,
+                    "liquidity": skipped_liquidity,
+                    "sell_credit": skipped_sell_credit,
+                    "position": skipped_position,
+                    "blowoff": skipped_blowoff,
+                },
+            }
 
         df_exec = _build_exec_dataframe(filtered, interval)
         if df_exec.empty:
             logger.info("[entry_pipeline] df_exec empty interval=%s", interval)
-            return
+            return {"executed": False, "entries": 0, "approved": total_in, "interval": interval, "skip_reason": "df_exec_empty"}
 
         logger.info(
             "[entry_pipeline] calling executor interval=%s symbols=%s source_counts=%s",
@@ -495,8 +534,34 @@ def run_entry_pipeline(approved_rows: Any, df_summary: pd.DataFrame | None, inte
             df_exec["source"].value_counts(dropna=False).to_dict() if "source" in df_exec.columns else {},
         )
 
-        run_summary_entry_executor(df_exec, df_summary, interval)
-        logger.info("[entry_pipeline] executed entries=%s interval=%s", len(df_exec), interval)
+        result = run_summary_entry_executor(df_exec, df_summary, interval)
+        executed = _result_executed(result)
+
+        logger.info(
+            "[entry_pipeline] executed entries=%s interval=%s executed=%s result_type=%s result=%s",
+            len(df_exec),
+            interval,
+            executed,
+            type(result).__name__,
+            result,
+        )
+
+        return {
+            "executed": executed,
+            "entries": len(df_exec),
+            "approved": total_in,
+            "interval": interval,
+            "result": result,
+            "skip_reason": None if executed else "summary_entry_executor_no_order",
+            "skipped": {
+                "no_symbol": skipped_no_symbol,
+                "liquidity": skipped_liquidity,
+                "sell_credit": skipped_sell_credit,
+                "position": skipped_position,
+                "blowoff": skipped_blowoff,
+            },
+        }
 
     except Exception:
         logger.exception("[entry_pipeline] failed interval=%s", interval)
+        return {"executed": False, "entries": 0, "interval": interval, "skip_reason": "entry_pipeline_exception"}
