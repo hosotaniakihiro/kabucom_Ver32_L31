@@ -1,6 +1,6 @@
 # ==========================================================
 # trading/handlers/entry_order_builder.py
-# Ver1.7.0-SCALPING-GUARD-PRIORITY-1-6
+# Ver1.8.0-SUMMARY-AI-SELL-MTF-5S-RELAX
 # ----------------------------------------------------------
 # ✔ 注文条件（price / order_type / qty）を決定するだけ
 # ✔ 副作用ゼロ（発注・global_state 操作なし）
@@ -18,6 +18,10 @@
 #   - 同一銘柄2連敗で当日停止
 #   - 一部利確後3分/全利確後5分の再エントリー停止
 #   - 時間帯フィルタ 09:00-09:02 / 11:20-12:32 / 15:23以降
+# ✔ Ver1.8:
+#   - 5秒足データなしは標準では即NGにしない
+#   - SELL時、日足MTF/score_mtf がプラスという理由だけでは止めない
+#   - SELLは slope 系がプラスの場合だけ逆方向として止める
 # ==========================================================
 
 from __future__ import annotations
@@ -35,10 +39,6 @@ from utils_common import (
     get_tick_size,
 )
 
-# ==========================================================
-# 定数
-# ==========================================================
-
 ALLOW_MARKET_IF_BAD_BOARD = str(os.getenv("ALLOW_MARKET_IF_BAD_BOARD", "1")).lower() not in {
     "0", "false", "no", "off",
 }
@@ -53,7 +53,12 @@ SUMMARY_AGGRESSIVE_LIMIT_TICKS = int(float(os.getenv("SUMMARY_AGGRESSIVE_LIMIT_T
 ENTRY_ORDER_5S_GUARD_ENABLED = str(os.getenv("ENTRY_ORDER_5S_GUARD_ENABLED", "1")).lower() not in {
     "0", "false", "no", "off",
 }
-ENTRY_ORDER_REQUIRE_5S_DATA = str(os.getenv("ENTRY_ORDER_REQUIRE_5S_DATA", "1")).lower() in {
+# 重要:
+#   以前は既定1だったため、PUSH登録直後/ローテーション外/5秒足未生成の銘柄が
+#   FIVE_SEC_NO_DATA で即NGになっていた。
+#   5秒足がある場合は方向確認するが、無いだけでは止めない。
+#   強制したい場合だけ set ENTRY_ORDER_REQUIRE_5S_DATA=1 にする。
+ENTRY_ORDER_REQUIRE_5S_DATA = str(os.getenv("ENTRY_ORDER_REQUIRE_5S_DATA", "0")).lower() in {
     "1", "true", "yes", "y", "on",
 }
 ENTRY_ORDER_5S_MIN_BARS = int(float(os.getenv("ENTRY_ORDER_5S_MIN_BARS", "2")))
@@ -66,6 +71,11 @@ ENTRY_ORDER_REQUIRE_MTF_DATA = str(os.getenv("ENTRY_ORDER_REQUIRE_MTF_DATA", "0"
     "1", "true", "yes", "y", "on",
 }
 ENTRY_ORDER_MTF_SLOPE_EPS = float(os.getenv("ENTRY_ORDER_MTF_SLOPE_EPS", "0.0"))
+# SELL時、日足MTF/score_mtf がプラスという理由だけで空売り候補を止めない。
+# 1分/3分/5分の slope 系が明確にプラスなら止める。
+ENTRY_ORDER_SELL_IGNORE_POSITIVE_MTF = str(os.getenv("ENTRY_ORDER_SELL_IGNORE_POSITIVE_MTF", "1")).lower() not in {
+    "0", "false", "no", "off",
+}
 
 ENTRY_ORDER_LOW_MOVE_GUARD_ENABLED = str(os.getenv("ENTRY_ORDER_LOW_MOVE_GUARD_ENABLED", "1")).lower() not in {
     "0", "false", "no", "off",
@@ -80,10 +90,6 @@ ENTRY_ORDER_REQUIRE_HIGH_LOW = str(os.getenv("ENTRY_ORDER_REQUIRE_HIGH_LOW", "0"
 }
 
 
-# ==========================================================
-# 共通結果フォーマット
-# ==========================================================
-
 def _ok(**kwargs) -> Dict[str, Any]:
     return {"ok": True, "reason": "OK", "detail": kwargs}
 
@@ -91,10 +97,6 @@ def _ok(**kwargs) -> Dict[str, Any]:
 def _ng(reason: str, **detail) -> Dict[str, Any]:
     return {"ok": False, "reason": reason, "detail": detail}
 
-
-# ==========================================================
-# safe helpers
-# ==========================================================
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
@@ -172,24 +174,15 @@ def _parse_dt(v: Any) -> Optional[dt.datetime]:
         return None
 
 
-# ==========================================================
-# 銘柄別クールダウン / 時間帯ガード
-# ==========================================================
-
 def _trade_guard_block(symbol: str) -> Optional[Dict[str, Any]]:
     try:
         blocked, reason, detail = is_entry_blocked(symbol)
         if blocked:
             return _ng(reason, symbol=symbol, **(detail or {}))
-    except Exception as e:
-        # ガードDB不調で全停止は避ける。
+    except Exception:
         return None
     return None
 
-
-# ==========================================================
-# 低ボラ最終防衛
-# ==========================================================
 
 def _low_move_hard_block(entry_row: Dict[str, Any], *, symbol: str, source: str) -> Optional[Dict[str, Any]]:
     if not ENTRY_ORDER_LOW_MOVE_GUARD_ENABLED:
@@ -224,10 +217,6 @@ def _low_move_hard_block(entry_row: Dict[str, Any], *, symbol: str, source: str)
     return None
 
 
-# ==========================================================
-# SUMMARY_AI MTF/傾き 直前確認
-# ==========================================================
-
 def _summary_mtf_direction_guard(entry_row: Dict[str, Any], *, symbol: str, side: str, source: str) -> Optional[Dict[str, Any]]:
     if not ENTRY_ORDER_MTF_GUARD_ENABLED:
         return None
@@ -258,15 +247,21 @@ def _summary_mtf_direction_guard(entry_row: Dict[str, Any], *, symbol: str, side
         if bad:
             return _ng("MTF_NOT_BUY_ALIGNED", symbol=symbol, side=side_u, bad=bad, values=values, eps=eps)
     else:
-        bad = {k: v for k, v in available.items() if v > eps}
+        if ENTRY_ORDER_SELL_IGNORE_POSITIVE_MTF:
+            # SELLでは、日足MTFが買い寄りでも、短期slopeが下向きならエントリー候補として残す。
+            # mtf単体で止めると、ログ上の 2980/3900/1963/6363/6544/2475 のように
+            # slopeが下向きでも全て ORDER_BUILD_NG になる。
+            bad = {
+                k: v
+                for k, v in available.items()
+                if k != "mtf" and v > eps
+            }
+        else:
+            bad = {k: v for k, v in available.items() if v > eps}
         if bad:
             return _ng("MTF_NOT_SELL_ALIGNED", symbol=symbol, side=side_u, bad=bad, values=values, eps=eps)
     return None
 
-
-# ==========================================================
-# 5秒足
-# ==========================================================
 
 def _get_5s_df(symbol: str):
     try:
@@ -364,10 +359,6 @@ def _five_sec_pre_entry_guard(symbol: str, side: str, source: str) -> Optional[D
     return None
 
 
-# ==========================================================
-# 価格丸め / 5秒ブレイク
-# ==========================================================
-
 def _round_price(price: float, side: str) -> float:
     tick = get_tick_size(price)
     if side == "BUY":
@@ -404,10 +395,6 @@ def five_sec_breakout(symbol: str, side: str) -> Optional[float]:
         return float(last_low)
     return None
 
-
-# ==========================================================
-# 注文条件ビルド（唯一の公開API）
-# ==========================================================
 
 def build_entry_order(*, symbol: str, side: str, source: str, entry_row: Dict[str, Any], qty_override: Optional[int] = None) -> Dict[str, Any]:
     price = None
@@ -506,6 +493,7 @@ def build_entry_order(*, symbol: str, side: str, source: str, entry_row: Dict[st
         "require_5s_data": ENTRY_ORDER_REQUIRE_5S_DATA,
         "mtf_guard": bool(ENTRY_ORDER_MTF_GUARD_ENABLED and source == "SUMMARY_AI"),
         "require_mtf_data": ENTRY_ORDER_REQUIRE_MTF_DATA,
+        "sell_ignore_positive_mtf": ENTRY_ORDER_SELL_IGNORE_POSITIVE_MTF,
     }
     if qty_override is not None:
         detail["qty_override"] = True
