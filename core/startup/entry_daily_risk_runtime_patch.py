@@ -1,9 +1,9 @@
 # ============================================================
 # File   : core/startup/entry_daily_risk_runtime_patch.py
-# Version: V1.1-COUNT-FILLED-ONLY
+# Version: V1.2-BUY-ENABLED-COUNT-FILLED-ONLY
 # ------------------------------------------------------------
 # 導入ルール:
-#   1. BUY新規停止
+#   1. BUY新規も許可する
 #   2. 同一銘柄2連敗で当日停止
 #      - 既存 trading.exit.symbol_trade_guard の loss_count を利用
 #   3. 同一銘柄の当日最大エントリー2回
@@ -12,7 +12,7 @@
 #   4. 1銘柄の当日損失 -2,000円で停止
 #
 # 環境変数:
-#   ENTRY_BUY_ENABLED=0
+#   ENTRY_BUY_ENABLED=1
 #   ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL=2
 #   ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN=-2000
 # ============================================================
@@ -154,7 +154,7 @@ def _record_actual_trade(symbol: str, pnl: float) -> None:
 def _risk_block_reason(symbol: str, side: str) -> Tuple[bool, str, Dict[str, Any]]:
     symbol = _norm_symbol(symbol)
     side_u = str(side or "").upper()
-    if side_u == "BUY" and not _env_bool("ENTRY_BUY_ENABLED", False):
+    if side_u == "BUY" and not _env_bool("ENTRY_BUY_ENABLED", True):
         return True, "BUY_DISABLED_BY_DAILY_RISK_PATCH", {"symbol": symbol, "side": side_u}
     row = _get_row(symbol)
     max_entries = _env_int("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", 2)
@@ -183,7 +183,7 @@ def install() -> bool:
         logger.warning("[ENTRY DAILY RISK] _execute_best_candidate not callable")
         return False
 
-    if not getattr(old_execute, "_entry_daily_risk_wrapped_v11", False):
+    if not getattr(old_execute, "_entry_daily_risk_wrapped_v12", False):
         def _execute_best_candidate_daily_risk(item: dict, boost_active: bool) -> bool:
             try:
                 symbol = _norm_symbol(item.get("symbol"))
@@ -197,14 +197,12 @@ def install() -> bool:
                     return False
             except Exception:
                 logger.exception("[ENTRY DAILY RISK] precheck failed")
-            # ここでは entry_count を増やさない。
-            # order_id が返っても、2秒未約定キャンセルされる可能性があるため。
             return old_execute(item, boost_active=boost_active)
-        _execute_best_candidate_daily_risk._entry_daily_risk_wrapped_v11 = True  # type: ignore[attr-defined]
+        _execute_best_candidate_daily_risk._entry_daily_risk_wrapped_v12 = True  # type: ignore[attr-defined]
         _execute_best_candidate_daily_risk._original = old_execute  # type: ignore[attr-defined]
         ec._execute_best_candidate = _execute_best_candidate_daily_risk
 
-    if callable(old_record_exit) and not getattr(old_record_exit, "_entry_daily_actual_trade_wrapped_v11", False):
+    if callable(old_record_exit) and not getattr(old_record_exit, "_entry_daily_actual_trade_wrapped_v12", False):
         def _record_exit_event_daily_actual_trade(symbol: Any, *, pnl: float, reason: str, now=None) -> None:
             try:
                 old_record_exit(symbol, pnl=pnl, reason=reason, now=now)
@@ -213,14 +211,14 @@ def install() -> bool:
                     _record_actual_trade(symbol, float(pnl or 0.0))
                 except Exception:
                     logger.exception("[ENTRY DAILY RISK] record actual trade failed symbol=%s", symbol)
-        _record_exit_event_daily_actual_trade._entry_daily_actual_trade_wrapped_v11 = True  # type: ignore[attr-defined]
+        _record_exit_event_daily_actual_trade._entry_daily_actual_trade_wrapped_v12 = True  # type: ignore[attr-defined]
         _record_exit_event_daily_actual_trade._original = old_record_exit  # type: ignore[attr-defined]
         stg.record_exit_event = _record_exit_event_daily_actual_trade
 
     _INSTALLED = True
     logger.warning(
-        "[ENTRY DAILY RISK] installed v1.1 buy_enabled=%s max_actual_trades_per_symbol=%s max_daily_loss=%s count_mode=actual_exit_only",
-        _env_bool("ENTRY_BUY_ENABLED", False),
+        "[ENTRY DAILY RISK] installed v1.2 buy_enabled=%s max_actual_trades_per_symbol=%s max_daily_loss=%s count_mode=actual_exit_only",
+        _env_bool("ENTRY_BUY_ENABLED", True),
         _env_int("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", 2),
         _env_float("ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN", -2000.0),
     )
