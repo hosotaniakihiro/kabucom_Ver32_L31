@@ -1,12 +1,14 @@
 # ============================================================
 # File   : core/startup/entry_daily_risk_runtime_patch.py
-# Version: V1.0-BUY-OFF-SYMBOL-DAILY-RISK
+# Version: V1.1-COUNT-FILLED-ONLY
 # ------------------------------------------------------------
 # 導入ルール:
 #   1. BUY新規停止
 #   2. 同一銘柄2連敗で当日停止
 #      - 既存 trading.exit.symbol_trade_guard の loss_count を利用
 #   3. 同一銘柄の当日最大エントリー2回
+#      - 注意: 未約定取消では回数を増やさない
+#      - 実際に約定し、返済イベントが出た時だけ回数を増やす
 #   4. 1銘柄の当日損失 -2,000円で停止
 #
 # 環境変数:
@@ -127,44 +129,26 @@ def _get_row(symbol: str) -> Dict[str, Any]:
     return {"entry_count": 0, "daily_pnl": 0.0, "last_entry_time": "", "last_exit_time": ""}
 
 
-def _inc_entry(symbol: str) -> None:
+def _record_actual_trade(symbol: str, pnl: float) -> None:
+    """実際に約定して返済された時だけ、当日エントリー回数と損益を更新する。"""
     symbol = _norm_symbol(symbol)
     if not symbol:
         return
     with _connect() as conn:
         conn.execute(
             """
-            INSERT INTO symbol_daily_entry_risk (trade_date, symbol, entry_count, daily_pnl, last_entry_time, updated_at)
-            VALUES (?, ?, 1, 0, ?, ?)
+            INSERT INTO symbol_daily_entry_risk (trade_date, symbol, entry_count, daily_pnl, last_entry_time, last_exit_time, updated_at)
+            VALUES (?, ?, 1, ?, ?, ?, ?)
             ON CONFLICT(trade_date, symbol) DO UPDATE SET
                 entry_count = entry_count + 1,
-                last_entry_time = excluded.last_entry_time,
-                updated_at = excluded.updated_at
-            """,
-            (_today(), symbol, _now_iso(), _now_iso()),
-        )
-        conn.commit()
-    logger.warning("[ENTRY DAILY RISK] entry_count incremented symbol=%s row=%s", symbol, _get_row(symbol))
-
-
-def _add_pnl(symbol: str, pnl: float) -> None:
-    symbol = _norm_symbol(symbol)
-    if not symbol:
-        return
-    with _connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO symbol_daily_entry_risk (trade_date, symbol, entry_count, daily_pnl, last_exit_time, updated_at)
-            VALUES (?, ?, 0, ?, ?, ?)
-            ON CONFLICT(trade_date, symbol) DO UPDATE SET
                 daily_pnl = daily_pnl + excluded.daily_pnl,
                 last_exit_time = excluded.last_exit_time,
                 updated_at = excluded.updated_at
             """,
-            (_today(), symbol, float(pnl or 0.0), _now_iso(), _now_iso()),
+            (_today(), symbol, float(pnl or 0.0), _now_iso(), _now_iso(), _now_iso()),
         )
         conn.commit()
-    logger.warning("[ENTRY DAILY RISK] pnl updated symbol=%s pnl=%s row=%s", symbol, pnl, _get_row(symbol))
+    logger.warning("[ENTRY DAILY RISK] actual_trade recorded symbol=%s pnl=%s row=%s", symbol, pnl, _get_row(symbol))
 
 
 def _risk_block_reason(symbol: str, side: str) -> Tuple[bool, str, Dict[str, Any]]:
@@ -199,7 +183,7 @@ def install() -> bool:
         logger.warning("[ENTRY DAILY RISK] _execute_best_candidate not callable")
         return False
 
-    if not getattr(old_execute, "_entry_daily_risk_wrapped", False):
+    if not getattr(old_execute, "_entry_daily_risk_wrapped_v11", False):
         def _execute_best_candidate_daily_risk(item: dict, boost_active: bool) -> bool:
             try:
                 symbol = _norm_symbol(item.get("symbol"))
@@ -213,33 +197,29 @@ def install() -> bool:
                     return False
             except Exception:
                 logger.exception("[ENTRY DAILY RISK] precheck failed")
-            ok = old_execute(item, boost_active=boost_active)
-            if ok:
-                try:
-                    _inc_entry(item.get("symbol"))
-                except Exception:
-                    logger.exception("[ENTRY DAILY RISK] increment entry count failed")
-            return ok
-        _execute_best_candidate_daily_risk._entry_daily_risk_wrapped = True  # type: ignore[attr-defined]
+            # ここでは entry_count を増やさない。
+            # order_id が返っても、2秒未約定キャンセルされる可能性があるため。
+            return old_execute(item, boost_active=boost_active)
+        _execute_best_candidate_daily_risk._entry_daily_risk_wrapped_v11 = True  # type: ignore[attr-defined]
         _execute_best_candidate_daily_risk._original = old_execute  # type: ignore[attr-defined]
         ec._execute_best_candidate = _execute_best_candidate_daily_risk
 
-    if callable(old_record_exit) and not getattr(old_record_exit, "_entry_daily_pnl_wrapped", False):
-        def _record_exit_event_daily_pnl(symbol: Any, *, pnl: float, reason: str, now=None) -> None:
+    if callable(old_record_exit) and not getattr(old_record_exit, "_entry_daily_actual_trade_wrapped_v11", False):
+        def _record_exit_event_daily_actual_trade(symbol: Any, *, pnl: float, reason: str, now=None) -> None:
             try:
                 old_record_exit(symbol, pnl=pnl, reason=reason, now=now)
             finally:
                 try:
-                    _add_pnl(symbol, float(pnl or 0.0))
+                    _record_actual_trade(symbol, float(pnl or 0.0))
                 except Exception:
-                    logger.exception("[ENTRY DAILY RISK] add pnl failed symbol=%s", symbol)
-        _record_exit_event_daily_pnl._entry_daily_pnl_wrapped = True  # type: ignore[attr-defined]
-        _record_exit_event_daily_pnl._original = old_record_exit  # type: ignore[attr-defined]
-        stg.record_exit_event = _record_exit_event_daily_pnl
+                    logger.exception("[ENTRY DAILY RISK] record actual trade failed symbol=%s", symbol)
+        _record_exit_event_daily_actual_trade._entry_daily_actual_trade_wrapped_v11 = True  # type: ignore[attr-defined]
+        _record_exit_event_daily_actual_trade._original = old_record_exit  # type: ignore[attr-defined]
+        stg.record_exit_event = _record_exit_event_daily_actual_trade
 
     _INSTALLED = True
     logger.warning(
-        "[ENTRY DAILY RISK] installed buy_enabled=%s max_entries_per_symbol=%s max_daily_loss=%s",
+        "[ENTRY DAILY RISK] installed v1.1 buy_enabled=%s max_actual_trades_per_symbol=%s max_daily_loss=%s count_mode=actual_exit_only",
         _env_bool("ENTRY_BUY_ENABLED", False),
         _env_int("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", 2),
         _env_float("ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN", -2000.0),
