@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/fast_startup_runtime_patch.py
-# Version: PRODUCTION-FAST-STARTUP-PATCH-V11-ENTRY-CANCEL-2S-NEXT
+# Version: PRODUCTION-FAST-STARTUP-PATCH-V12-DAILY-RISK-GUARD
 # ------------------------------------------------------------
 # 目的:
 #   main.py 起動直後の重い処理を軽くする。
@@ -12,8 +12,9 @@
 #   さらに、PUSH rows があるのに summary が0件になる場合の direct OHLC patch を入れる。
 #   さらに、定時サマリーAI許可銘柄の最大発注数を10にする。
 #   さらに、エントリー価格0.3%損切り・高値/安値0.3%トレーリングEXITを入れる。
-#   さらに、SUMMARY_AIのエントリー指値を BUY=ask-1tick / SELL=bid+1tick にする。
+#   さらに、SUMMARY_AIのエントリー指値を BUY=ask / SELL=bid にする。
 #   さらに、未約定新規指値を2秒で取消し、次候補のENTRYを起動する。
+#   さらに、BUY停止・同一銘柄当日2回まで・銘柄別-2000円停止を入れる。
 # ============================================================
 
 from __future__ import annotations
@@ -140,6 +141,16 @@ def _install_entry_cancel_2s_next_patch() -> None:
         logger.exception("[FAST STARTUP PATCH] entry_unfilled_cancel_2s_runtime_patch install failed")
 
 
+def _install_entry_daily_risk_patch() -> None:
+    try:
+        from core.startup.entry_daily_risk_runtime_patch import install as install_entry_daily_risk_patch
+
+        ok = install_entry_daily_risk_patch()
+        logger.warning("[FAST STARTUP PATCH] entry_daily_risk_runtime_patch installed=%s", ok)
+    except Exception:
+        logger.exception("[FAST STARTUP PATCH] entry_daily_risk_runtime_patch install failed")
+
+
 def _install_entry_affordability_patch() -> None:
     try:
         from core.startup.entry_affordability_runtime_patch import install as install_affordability_patch
@@ -229,6 +240,11 @@ def install() -> bool:
         logger.exception("[FAST STARTUP PATCH] entry cancel 2s next patch failed")
 
     try:
+        _install_entry_daily_risk_patch()
+    except Exception:
+        logger.exception("[FAST STARTUP PATCH] entry daily risk patch failed")
+
+    try:
         _install_entry_affordability_patch()
     except Exception:
         logger.exception("[FAST STARTUP PATCH] entry affordability patch failed")
@@ -306,7 +322,7 @@ def install() -> bool:
 
     _PATCHED = True
     logger.warning(
-        "[FAST STARTUP PATCH] installed v11 entry_affordability=True symbol_flags_bootstrap=True push_direct_ohlc=True entry_max_approved=%s exit_trail_0p3=True entry_passive_limit=True entry_cancel_2s_next=True",
+        "[FAST STARTUP PATCH] installed v12 entry_affordability=True symbol_flags_bootstrap=True push_direct_ohlc=True entry_max_approved=%s exit_trail_0p3=True entry_limit_board_touch=True entry_cancel_2s_next=True entry_daily_risk=True",
         10,
     )
     return True
