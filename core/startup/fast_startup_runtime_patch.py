@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/fast_startup_runtime_patch.py
-# Version: PRODUCTION-FAST-STARTUP-PATCH-V8-ENTRY-MAX10
+# Version: PRODUCTION-FAST-STARTUP-PATCH-V9-EXIT-TRAIL-0P3
 # ------------------------------------------------------------
 # 目的:
 #   main.py 起動直後の重い処理を軽くする。
@@ -11,6 +11,7 @@
 #   さらに、symbol_flags.db を起動時に global_data へキャッシュする。
 #   さらに、PUSH rows があるのに summary が0件になる場合の direct OHLC patch を入れる。
 #   さらに、定時サマリーAI許可銘柄の最大発注数を10にする。
+#   さらに、エントリー価格0.3%損切り・高値/安値0.3%トレーリングEXITを入れる。
 # ============================================================
 
 from __future__ import annotations
@@ -78,10 +79,6 @@ def _patch_summary_schema_bootstrap() -> None:
 
 
 def _install_symbol_flags_bootstrap() -> None:
-    """
-    信用銘柄マスターDBを起動直後にglobal_dataへキャッシュする。
-    SELL判定は global_data.symbol_flags_info_map / short_ok_symbols を優先参照する。
-    """
     try:
         from core.startup.symbol_flags_bootstrap import install_symbol_flags_cache
 
@@ -111,11 +108,17 @@ def _install_exit_executor_broker_position_patch() -> None:
         logger.exception("[FAST STARTUP PATCH] exit_executor_broker_position_patch install failed")
 
 
+def _install_exit_trail_03_patch() -> None:
+    try:
+        from core.startup.exit_trail_03_runtime_patch import install as install_exit_trail_03_patch
+
+        ok = install_exit_trail_03_patch()
+        logger.warning("[FAST STARTUP PATCH] exit_trail_03_runtime_patch installed=%s", ok)
+    except Exception:
+        logger.exception("[FAST STARTUP PATCH] exit_trail_03_runtime_patch install failed")
+
+
 def _install_entry_affordability_patch() -> None:
-    """
-    AIに確認する前に、最低1単元でもMAX_ENTRY_ONESHOT_YENを超える高価格銘柄を除外する。
-    MAX_ENTRY_ONESHOT_YENを増額すれば、除外価格も自動で上がる。
-    """
     try:
         from core.startup.entry_affordability_runtime_patch import install as install_affordability_patch
         from trading.entry.entry_budget import log_entry_budget_config
@@ -128,10 +131,6 @@ def _install_entry_affordability_patch() -> None:
 
 
 def _install_push_direct_ohlc_patch() -> None:
-    """
-    PUSH rows が存在するのに summary が0件になる場合の最終防衛。
-    push_summary_engine の列名正規化と direct OHLC fallback を強化する。
-    """
     try:
         from core.startup.push_summary_direct_ohlc_runtime_patch import install as install_push_direct_ohlc_patch
 
@@ -142,12 +141,6 @@ def _install_push_direct_ohlc_patch() -> None:
 
 
 def _install_entry_max_approved_patch() -> None:
-    """
-    定時サマリーAIで許可された候補を、優先順位順に最大10件まで発注可能にする。
-
-    entry_controller.py 本体の MAX_APPROVED_PER_RUN が古い値でも、起動時に10へ上書きする。
-    環境変数 ENTRY_MAX_APPROVED_PER_RUN を指定すれば変更可能。
-    """
     try:
         import trading.handlers.entry_controller as ec
 
@@ -197,6 +190,11 @@ def install() -> bool:
         _install_exit_executor_broker_position_patch()
     except Exception:
         logger.exception("[FAST STARTUP PATCH] exit executor broker patch failed")
+
+    try:
+        _install_exit_trail_03_patch()
+    except Exception:
+        logger.exception("[FAST STARTUP PATCH] exit trail 0.3 patch failed")
 
     try:
         _install_entry_affordability_patch()
@@ -276,7 +274,7 @@ def install() -> bool:
 
     _PATCHED = True
     logger.warning(
-        "[FAST STARTUP PATCH] installed v8 entry_affordability=True symbol_flags_bootstrap=True push_direct_ohlc=True entry_max_approved=%s",
+        "[FAST STARTUP PATCH] installed v9 entry_affordability=True symbol_flags_bootstrap=True push_direct_ohlc=True entry_max_approved=%s exit_trail_0p3=True",
         10,
     )
     return True
