@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/fast_startup_runtime_patch.py
-# Version: PRODUCTION-FAST-STARTUP-PATCH-V12-DAILY-RISK-GUARD
+# Version: PRODUCTION-FAST-STARTUP-PATCH-V13-ENTRY-LIQUIDITY-GUARD
 # ------------------------------------------------------------
 # 目的:
 #   main.py 起動直後の重い処理を軽くする。
@@ -14,7 +14,8 @@
 #   さらに、エントリー価格0.3%損切り・高値/安値0.3%トレーリングEXITを入れる。
 #   さらに、SUMMARY_AIのエントリー指値を BUY=ask / SELL=bid にする。
 #   さらに、未約定新規指値を2秒で取消し、次候補のENTRYを起動する。
-#   さらに、BUY停止・同一銘柄当日2回まで・銘柄別-2000円停止を入れる。
+#   さらに、同一銘柄当日2回まで・銘柄別-2000円停止を入れる。
+#   さらに、出来高/売買代金/値動きが弱い銘柄のエントリーを止める。
 # ============================================================
 
 from __future__ import annotations
@@ -151,6 +152,16 @@ def _install_entry_daily_risk_patch() -> None:
         logger.exception("[FAST STARTUP PATCH] entry_daily_risk_runtime_patch install failed")
 
 
+def _install_entry_liquidity_patch() -> None:
+    try:
+        from core.startup.entry_liquidity_runtime_patch import install as install_entry_liquidity_patch
+
+        ok = install_entry_liquidity_patch()
+        logger.warning("[FAST STARTUP PATCH] entry_liquidity_runtime_patch installed=%s", ok)
+    except Exception:
+        logger.exception("[FAST STARTUP PATCH] entry_liquidity_runtime_patch install failed")
+
+
 def _install_entry_affordability_patch() -> None:
     try:
         from core.startup.entry_affordability_runtime_patch import install as install_affordability_patch
@@ -245,6 +256,11 @@ def install() -> bool:
         logger.exception("[FAST STARTUP PATCH] entry daily risk patch failed")
 
     try:
+        _install_entry_liquidity_patch()
+    except Exception:
+        logger.exception("[FAST STARTUP PATCH] entry liquidity patch failed")
+
+    try:
         _install_entry_affordability_patch()
     except Exception:
         logger.exception("[FAST STARTUP PATCH] entry affordability patch failed")
@@ -322,7 +338,7 @@ def install() -> bool:
 
     _PATCHED = True
     logger.warning(
-        "[FAST STARTUP PATCH] installed v12 entry_affordability=True symbol_flags_bootstrap=True push_direct_ohlc=True entry_max_approved=%s exit_trail_0p3=True entry_limit_board_touch=True entry_cancel_2s_next=True entry_daily_risk=True",
+        "[FAST STARTUP PATCH] installed v13 entry_affordability=True symbol_flags_bootstrap=True push_direct_ohlc=True entry_max_approved=%s exit_trail_0p3=True entry_limit_board_touch=True entry_cancel_2s_next=True entry_daily_risk=True entry_liquidity=True",
         10,
     )
     return True
