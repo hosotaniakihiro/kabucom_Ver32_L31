@@ -1,13 +1,9 @@
 # ============================================================
 # File   : core/startup/entry_unfilled_cancel_2s_runtime_patch.py
-# Version: V1.1-CANCEL-AND-NEXT
+# Version: V1.2-CANCEL-NEXT-SUMMARY-RETRY-ROTATION
 # ------------------------------------------------------------
 # 未約定の新規指値注文を2秒で取消し、取消後に次候補のENTRYを起動する。
-#
-# - 監視間隔: 0.5秒
-# - 未約定取消: 2秒
-# - 取消銘柄は30秒だけ再エントリー抑止
-# - 取消後に entry_controller.run_entry_pipeline() を呼ぶ
+# SUMMARY_AI候補は最大3巡までpendingへ戻す。
 # ============================================================
 
 from __future__ import annotations
@@ -62,7 +58,6 @@ def _sym(v: Any) -> str:
 
 
 def _order_time_elapsed(order_id: str, order: Dict[str, Any], now_ts: float) -> float:
-    # kabu APIの時刻項目は環境により揺れるため、読めない場合は初回検知から計測する。
     for key in ("OrderTime", "RecvTime", "ReceivedTime", "RegisterTime", "UpdateTime"):
         raw = order.get(key)
         if not raw:
@@ -102,14 +97,14 @@ def _is_target_order(order: Dict[str, Any], cancelable_states: set[int]) -> bool
     qty, cum, leaves = _remaining(order)
     is_limit = front == 20 or (front != 10 and price > 0)
     is_open = leaves > 0 or (qty > 0 and cum < qty)
-    is_new_entry = cash_margin != 3  # 3=返済は対象外。不明/2=新規は対象。
+    is_new_entry = cash_margin != 3
     return bool(is_limit and is_open and is_new_entry and state in cancelable_states)
 
 
 def _mark_cancelled_symbol(symbol: str) -> None:
     try:
         from global_state import global_data
-        cooldown = _env_float("ENTRY_CANCEL_SYMBOL_COOLDOWN_SEC", 30.0)
+        cooldown = _env_float("ENTRY_CANCEL_SYMBOL_COOLDOWN_SEC", 2.5)
         if not hasattr(global_data, "trade_restricted") or not isinstance(global_data.trade_restricted, dict):
             global_data.trade_restricted = {}
         until = dt.datetime.now() + dt.timedelta(seconds=cooldown)
@@ -127,8 +122,21 @@ def _clear_inflight(symbol: str, order_id: str) -> None:
             if isinstance(m, dict):
                 m.pop(_sym(symbol), None)
                 m.pop(str(order_id), None)
+        try:
+            global_data.remove_entry_inflight(_sym(symbol))
+        except Exception:
+            pass
     except Exception:
         logger.debug("[ENTRY CANCEL 2S] clear inflight failed", exc_info=True)
+
+
+def _requeue_summary_ai(symbol: str, order_id: str) -> bool:
+    try:
+        from core.startup.entry_summary_retry_rotation_runtime_patch import on_unfilled_order_cancelled
+        return bool(on_unfilled_order_cancelled(symbol, order_id))
+    except Exception:
+        logger.exception("[ENTRY CANCEL 2S] summary retry requeue failed symbol=%s order_id=%s", symbol, order_id)
+        return False
 
 
 def _trigger_next_entry() -> None:
@@ -145,7 +153,7 @@ def _trigger_next_entry() -> None:
             time.sleep(_env_float("ENTRY_CANCEL_NEXT_DELAY_SEC", 0.2))
             from trading.handlers.entry_controller import run_entry_pipeline
             logger.warning("[ENTRY CANCEL 2S] trigger next entry pipeline")
-            run_entry_pipeline()
+            run_entry_pipeline(pipeline_source="SUMMARY")
         except Exception:
             logger.exception("[ENTRY CANCEL 2S] trigger next entry failed")
         finally:
@@ -173,7 +181,7 @@ def install() -> bool:
         interval = max(0.2, _env_float("ENTRY_CANCEL_CHECK_INTERVAL_SEC", 0.5))
         cancel_after = max(0.5, _env_float("ENTRY_UNFILLED_CANCEL_SEC", 2.0))
         cancelable_states = set(getattr(fcl, "CANCELABLE_STATES", {1, 2, 3, 4}))
-        logger.warning("[ENTRY CANCEL 2S] loop start interval=%.2fs cancel_after=%.2fs", interval, cancel_after)
+        logger.warning("[ENTRY CANCEL 2S] loop start interval=%.2fs cancel_after=%.2fs summary_retry=True", interval, cancel_after)
         while True:
             active: set[str] = set()
             try:
@@ -199,7 +207,9 @@ def install() -> bool:
                     cancel_order(order_id)
                     _CANCEL_SENT[order_id] = now_ts
                     _clear_inflight(symbol, order_id)
+                    requeued = _requeue_summary_ai(symbol, order_id)
                     _mark_cancelled_symbol(symbol)
+                    logger.warning("[ENTRY CANCEL 2S] cancelled order_id=%s symbol=%s summary_requeued=%s", order_id, symbol, requeued)
                     _trigger_next_entry()
                     time.sleep(0.1)
                 for oid in list(_FIRST_SEEN.keys()):
@@ -213,7 +223,7 @@ def install() -> bool:
     start_force_cancel_loop_2s._entry_cancel_2s_wrapped = True  # type: ignore[attr-defined]
     fcl.start_force_cancel_loop = start_force_cancel_loop_2s
     _INSTALLED = True
-    logger.warning("[ENTRY CANCEL 2S] installed cancel_after=2s trigger_next=True")
+    logger.warning("[ENTRY CANCEL 2S] installed v1.2 cancel_after=2s trigger_next=True summary_retry=True")
     return True
 
 try:
