@@ -1,17 +1,19 @@
 # ============================================================
 # File   : trading/push/push_stream/protected_symbols.py
-# Version: Ver01-PROTECTED-PUSH-SYMBOLS
+# Version: Ver02-PROTECTED-PUSH-SYMBOLS-PRIORITY
 # ------------------------------------------------------------
 # PUSH登録から絶対に外したくない銘柄を解決する。
 #
-# 対象:
-#   - 保有中銘柄
-#   - 未約定注文中銘柄
-#   - 直近ENTRY候補/直近AI OK候補
+# 優先順位:
+#   1. 保有中銘柄 / 実建玉復元銘柄
+#   2. EXIT中 / 未約定注文中銘柄
+#   3. ENTRY注文直後 / 直近ENTRY候補
+#   4. AI_OK / 候補銘柄
 #
 # 目的:
 #   - 50銘柄制限/A-Bローテーション中でも、売買中銘柄を優先登録する
 #   - 5秒EXIT / trail exit / 未約定cancel の監視漏れを減らす
+#   - 保護銘柄が多すぎる場合でも、リスクの高いものを優先する
 # ============================================================
 
 from __future__ import annotations
@@ -98,7 +100,6 @@ def _symbols_from_any(obj: Any) -> list[str]:
 
     if isinstance(obj, dict):
         items: list[Any] = []
-        # dict values にposition/order dictが入るケース
         for k, v in obj.items():
             if isinstance(v, dict):
                 items.append(v.get('symbol') or v.get('Symbol') or v.get('code') or v.get('Code') or k)
@@ -135,28 +136,10 @@ def _get_global_data() -> Any:
     return None
 
 
-def _from_global_data() -> list[str]:
+def _symbols_from_global_attrs(attrs: tuple[str, ...], *, label: str) -> list[str]:
     gd = _get_global_data()
     if gd is None:
         return []
-
-    attrs = (
-        # 保有中
-        'open_positions',
-        'positions',
-        'current_positions',
-        'position_state_map',
-        # 未約定/注文中
-        'pending_orders',
-        'pending_order_map',
-        'entry_pending_orders',
-        'active_orders',
-        # 直近候補
-        'recent_entry_symbols',
-        'recent_ai_ok_symbols',
-        'last_entry_candidates',
-        'ai_ok_symbols',
-    )
 
     out: list[str] = []
     for attr in attrs:
@@ -166,7 +149,7 @@ def _from_global_data() -> list[str]:
                 src = src()
             syms = _symbols_from_any(src)
             if syms:
-                logger.info('[PROTECTED PUSH] global_data.%s symbols=%s', attr, syms[:20])
+                logger.info('[PROTECTED PUSH] %s global_data.%s symbols=%s', label, attr, syms[:20])
                 out.extend(syms)
         except Exception:
             logger.debug('[PROTECTED PUSH] read global_data.%s failed', attr, exc_info=True)
@@ -188,15 +171,59 @@ def _from_global_context_positions() -> list[str]:
     return []
 
 
-def _from_runtime_state() -> list[str]:
-    out: list[str] = []
+def _from_runtime_open_positions() -> list[str]:
     try:
-        from trading.runtime_persistence.runtime_state_store import load_open_positions, load_pending_orders
-        out.extend(_symbols_from_any(load_open_positions()))
-        out.extend(_symbols_from_any(load_pending_orders()))
+        from trading.runtime_persistence.runtime_state_store import load_open_positions
+        return _symbols_from_any(load_open_positions())
     except Exception:
-        logger.debug('[PROTECTED PUSH] runtime_state load failed', exc_info=True)
-    return _dedupe(out)
+        logger.debug('[PROTECTED PUSH] runtime open positions load failed', exc_info=True)
+    return []
+
+
+def _from_runtime_pending_orders() -> list[str]:
+    try:
+        from trading.runtime_persistence.runtime_state_store import load_pending_orders
+        return _symbols_from_any(load_pending_orders())
+    except Exception:
+        logger.debug('[PROTECTED PUSH] runtime pending orders load failed', exc_info=True)
+    return []
+
+
+def _priority_buckets() -> list[tuple[str, list[str]]]:
+    """リスク順に保護銘柄を返す。前ほど優先。"""
+    position_attrs = (
+        'open_positions',
+        'positions',
+        'current_positions',
+        'position_state_map',
+    )
+    order_attrs = (
+        'pending_orders',
+        'pending_order_map',
+        'entry_pending_orders',
+        'active_orders',
+        'pending_order_symbols',
+        'recent_exit_symbols',
+    )
+    entry_attrs = (
+        'recent_entry_symbols',
+        'last_entry_candidates',
+    )
+    ai_attrs = (
+        'recent_ai_ok_symbols',
+        'ai_ok_symbols',
+    )
+
+    buckets = [
+        ('P1_POSITION_GC', _from_global_context_positions()),
+        ('P1_POSITION_RUNTIME', _from_runtime_open_positions()),
+        ('P1_POSITION_GLOBAL', _symbols_from_global_attrs(position_attrs, label='P1_POSITION')),
+        ('P2_PENDING_RUNTIME', _from_runtime_pending_orders()),
+        ('P2_PENDING_GLOBAL', _symbols_from_global_attrs(order_attrs, label='P2_PENDING')),
+        ('P3_RECENT_ENTRY', _symbols_from_global_attrs(entry_attrs, label='P3_RECENT_ENTRY')),
+        ('P4_AI_CANDIDATE', _symbols_from_global_attrs(ai_attrs, label='P4_AI')),
+    ]
+    return buckets
 
 
 def resolve_protected_push_symbols() -> list[str]:
@@ -204,18 +231,38 @@ def resolve_protected_push_symbols() -> list[str]:
         return []
 
     out: list[str] = []
-    out.extend(_from_global_context_positions())
-    out.extend(_from_global_data())
-    out.extend(_from_runtime_state())
+    bucket_counts: dict[str, int] = {}
 
-    out = _dedupe(out)
+    for label, syms in _priority_buckets():
+        syms = _dedupe(syms)
+        bucket_counts[label] = len(syms)
+        for s in syms:
+            if s not in out:
+                out.append(s)
+
+    before_limit = len(out)
     if PROTECTED_PUSH_MAX_SYMBOLS > 0:
         out = out[:PROTECTED_PUSH_MAX_SYMBOLS]
 
-    if out:
-        logger.warning('[PROTECTED PUSH] resolved count=%d symbols=%s', len(out), out)
+    if before_limit > len(out):
+        logger.warning(
+            '[PROTECTED PUSH] truncated protected symbols before=%d after=%d max=%d bucket_counts=%s kept=%s',
+            before_limit,
+            len(out),
+            PROTECTED_PUSH_MAX_SYMBOLS,
+            bucket_counts,
+            out,
+        )
+    elif out:
+        logger.warning(
+            '[PROTECTED PUSH] resolved count=%d bucket_counts=%s symbols=%s',
+            len(out),
+            bucket_counts,
+            out,
+        )
     else:
-        logger.info('[PROTECTED PUSH] resolved empty')
+        logger.info('[PROTECTED PUSH] resolved empty bucket_counts=%s', bucket_counts)
+
     return out
 
 
