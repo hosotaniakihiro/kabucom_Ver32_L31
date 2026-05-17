@@ -1,12 +1,17 @@
 # ============================================================
 # File   : trading/push/push_stream/rotation_core.py
-# Version: PRODUCTION-STABLE-REV1-PUSH-ROTATION-CORE-THIN-CONTROLLER
+# Version: PRODUCTION-STABLE-REV2-PUSH-ROTATION-PROTECTED-BOTH-SIDES
 # ------------------------------------------------------------
 # PUSH A/B 50銘柄ローテーションの制御本体。
 #
 # Default flow:
 #   A面50銘柄登録 -> 4.8秒維持 -> 全解除 -> 0.2秒待機 ->
 #   B面50銘柄登録 -> 4.8秒維持 -> 全解除 -> 0.2秒待機 -> 繰り返し
+#
+# Ver2:
+#   - 保有中 / 未約定 / 直近ENTRY候補の protected symbols を
+#     A面/B面の両方へ入れる。
+#   - これにより、売買中銘柄がB面中にPUSH未登録になる問題を減らす。
 #
 # Notes:
 #   - 銘柄解決は rotation_symbols.py に委譲
@@ -33,9 +38,14 @@ from .rotation_settings import (
 from .rotation_symbols import resolve_register_targets
 from .transport import get_ws_sender, _is_ws_alive
 
+try:
+    from .protected_symbols import resolve_protected_push_symbols
+except Exception:
+    resolve_protected_push_symbols = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
-VERSION = "PRODUCTION-STABLE-REV1-PUSH-ROTATION-CORE-THIN-CONTROLLER"
+VERSION = "PRODUCTION-STABLE-REV2-PUSH-ROTATION-PROTECTED-BOTH-SIDES"
 
 
 def enable_rotation(enabled: bool = True) -> None:
@@ -54,6 +64,72 @@ def _sleep_or_stop(seconds: float) -> bool:
         time.sleep(min(0.1, max(0.0, end - time.time())))
 
     return state._stop_event.is_set()
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in items:
+        s = str(x).strip().upper()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _resolve_protected_safe() -> list[str]:
+    try:
+        if callable(resolve_protected_push_symbols):
+            return _dedupe(list(resolve_protected_push_symbols()))
+    except Exception:
+        logger.exception('[push_stream] protected symbols resolve failed in rotation_core')
+    return []
+
+
+def _build_protected_rotation_batches(targets: list[str]) -> tuple[list[str], list[str], list[str]]:
+    """
+    A/B両面に protected symbols を入れる。
+
+    例:
+      protected=8銘柄, chunk=50 の場合
+        A = protected 8 + normal 42
+        B = protected 8 + normal 次42
+
+    これにより、保有中/未約定銘柄はA面でもB面でも登録される。
+    """
+    targets = _dedupe([str(x).strip().upper() for x in targets])
+    protected = _resolve_protected_safe()
+
+    if not protected:
+        first = targets[:DEFAULT_REGISTER_CHUNK_SIZE]
+        second = targets[DEFAULT_REGISTER_CHUNK_SIZE:DEFAULT_REGISTER_CHUNK_SIZE * 2]
+        return first, second, []
+
+    # protected は両面へ入れる。通常枠からは除外して重複を避ける。
+    protected = protected[:max(0, DEFAULT_REGISTER_CHUNK_SIZE)]
+    protected_set = set(protected)
+    normal = [x for x in targets if x not in protected_set]
+
+    normal_slots = max(0, DEFAULT_REGISTER_CHUNK_SIZE - len(protected))
+    first = _dedupe(protected + normal[:normal_slots])
+    second = _dedupe(protected + normal[normal_slots:normal_slots * 2])
+
+    # B側がprotectedだけになるケースでも、保護目的なので登録する。
+    first = first[:DEFAULT_REGISTER_CHUNK_SIZE]
+    second = second[:DEFAULT_REGISTER_CHUNK_SIZE]
+
+    logger.warning(
+        '[push_stream] protected rotation batches protected=%d normal=%d A=%d B=%d protected_symbols=%s headA=%s headB=%s',
+        len(protected),
+        len(normal),
+        len(first),
+        len(second),
+        protected,
+        first[:15],
+        second[:15],
+    )
+    return first, second, protected
 
 
 def _log_ws_not_ready_if_needed(
@@ -162,15 +238,12 @@ def _rotation_worker() -> None:
 
             empty_count = 0
 
-            first = targets[:DEFAULT_REGISTER_CHUNK_SIZE]
-            second = targets[
-                DEFAULT_REGISTER_CHUNK_SIZE:
-                DEFAULT_REGISTER_CHUNK_SIZE * 2
-            ]
+            first, second, protected = _build_protected_rotation_batches(list(targets))
 
             logger.info(
-                "[push_stream] rotation cycle targets=%d first=%d second=%d headA=%s headB=%s refresh_callable=%s ws_ready=%s",
+                "[push_stream] rotation cycle targets=%d protected=%d first=%d second=%d headA=%s headB=%s refresh_callable=%s ws_ready=%s",
                 len(targets),
+                len(protected),
                 len(first),
                 len(second),
                 first[:10],
