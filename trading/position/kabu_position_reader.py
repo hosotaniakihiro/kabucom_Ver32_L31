@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/position/kabu_position_reader.py
-# Version: V1.1-KABU-CREDIT-POSITION-READER-NO-CASH-EXIT
+# Version: V1.2-KABU-CREDIT-POSITION-READER-READ-STATUS
 # ------------------------------------------------------------
 # kabu Station の建玉一覧から「信用建玉だけ」を読み、
 # symbol -> position dict に正規化する。
@@ -9,6 +9,7 @@
 #   現物はEXIT監視しない。
 #   product=2 を優先して信用建玉だけ取得する。
 #   念のため MarginTradeType / AccountType でも現物らしき行を除外する。
+#   API正常応答0件とAPI失敗を区別するため LAST_READ_OK を公開する。
 # ============================================================
 
 from __future__ import annotations
@@ -21,6 +22,11 @@ import urllib.request
 from typing import Any, Dict, Iterable
 
 logger = logging.getLogger(__name__)
+
+LAST_READ_OK: bool = False
+LAST_RAW_COUNT: int = 0
+LAST_ERROR: str = ""
+LAST_READ_AT: dt.datetime | None = None
 
 
 def _normalize_symbol(v: Any) -> str:
@@ -105,8 +111,7 @@ def _iter_items(payload: Any) -> Iterable[dict]:
 def _fetch_positions_payload(*, product: int = 2) -> Any:
     base, token = _resolve_base_and_token()
     if not base or not token:
-        logger.warning("[KABU POSITION READER] skipped base/token unavailable")
-        return None
+        raise RuntimeError("base/token unavailable")
 
     # product=2: 信用。現物はEXIT監視しないため product=0 は使わない。
     url = base.rstrip("/") + "/positions?" + urllib.parse.urlencode({"product": int(product)})
@@ -117,7 +122,7 @@ def _fetch_positions_payload(*, product: int = 2) -> Any:
     with urllib.request.urlopen(req, timeout=3.0) as res:
         raw = res.read()
         if not raw:
-            return None
+            return []
         return json.loads(raw.decode("utf-8"))
 
 
@@ -148,9 +153,18 @@ def _is_credit_position(x: dict) -> bool:
 
 
 def read_kabu_open_positions() -> Dict[str, Dict[str, Any]]:
+    global LAST_READ_OK, LAST_RAW_COUNT, LAST_ERROR, LAST_READ_AT
+
+    LAST_READ_AT = dt.datetime.now()
+    LAST_READ_OK = False
+    LAST_RAW_COUNT = 0
+    LAST_ERROR = ""
+
     try:
         payload = _fetch_positions_payload(product=2)
+        LAST_READ_OK = True
     except Exception as e:
+        LAST_ERROR = str(e)
         logger.warning("[KABU POSITION READER] request failed err=%s", e)
         return {}
 
@@ -203,8 +217,11 @@ def read_kabu_open_positions() -> Dict[str, Dict[str, Any]]:
             "_position_source": "KABU.positions.credit_only",
         }
 
+    LAST_RAW_COUNT = raw_count
+
     logger.warning(
-        "[KABU POSITION READER] scan product=2 raw=%d credit_open=%d skipped_cash=%d skipped_qty=%d skipped_price=%d symbols=%s",
+        "[KABU POSITION READER] scan product=2 read_ok=%s raw=%d credit_open=%d skipped_cash=%d skipped_qty=%d skipped_price=%d symbols=%s",
+        LAST_READ_OK,
         raw_count,
         len(out),
         skipped_cash,
@@ -215,4 +232,13 @@ def read_kabu_open_positions() -> Dict[str, Dict[str, Any]]:
     return out
 
 
-__all__ = ["read_kabu_open_positions"]
+def get_last_read_status() -> dict:
+    return {
+        "ok": bool(LAST_READ_OK),
+        "raw_count": int(LAST_RAW_COUNT or 0),
+        "error": str(LAST_ERROR or ""),
+        "read_at": LAST_READ_AT,
+    }
+
+
+__all__ = ["read_kabu_open_positions", "get_last_read_status"]
