@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/db_bootstrap.py
-# Ver    : PRODUCTION-STABLE-REV5.5-STARTUP-EFFECTIVE-TRADE-DATE-SPLIT-MODE
+# Ver    : PRODUCTION-STABLE-REV5.6-MAIN-SKIP-PREV-SUMMARY-RESTORE
 # ------------------------------------------------------------
 # ✔ summary DB フォールバック完全対応
 # ✔ ranking DB フォールバック完全対応
@@ -24,12 +24,16 @@
 # ✔ 日曜/祝日に today_db を参照先として採用しない
 # ✔ os 未import問題を解消
 # ✔ split mode: main.pyでは migration と ranking rebind をskip可能
+# ✔ split mode: main.pyでは前営業日 summary DB の強制検証/直読みをskip可能
+#    - NAS上の旧summary DB読み込みで 0xC0000006 が出る事故を回避
+#    - main_database.pyが当日DBを作成するまで main.py は当日DBパスで空起動可能
 # ============================================================
 
 from __future__ import annotations
 
-import logging
 import datetime as dt
+import logging
+import os
 import sqlite3
 from pathlib import Path
 from typing import Optional
@@ -55,6 +59,14 @@ logger = logging.getLogger(__name__)
 
 MARKET_OPEN = dt.time(9, 0)
 MARKET_CLOSE = dt.time(15, 30)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """環境変数のON/OFF判定。"""
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
 def _is_market_hours_now(now: Optional[dt.datetime] = None) -> bool:
@@ -241,7 +253,20 @@ def _run_auto_migration(summary_dir: Path, ranking_dir: Optional[Path] = None) -
     logger.info("[DBBOOT][auto_migration] done")
 
 
-def resolve_latest_valid_summary_db(summary_dir: Path) -> Path:
+def resolve_latest_valid_summary_db(
+    summary_dir: Path,
+    *,
+    skip_prev_restore: bool = False,
+) -> Path:
+    """
+    summary DB 解決。
+
+    skip_prev_restore=True:
+      main.py split mode 用。
+      起動時に前営業日/anchor/fallback の summary DB を検証しない。
+      NAS上の旧DBを sqlite3.connect した瞬間に Windows 0xC0000006 で落ちる事故を避ける。
+      当日DBが未作成でも today_db を返し、main_database.py 側のDB作成を待てる状態にする。
+    """
     now = dt.datetime.now()
     today = now.date()
     effective_trade_date = _get_startup_trade_date(now)
@@ -250,10 +275,19 @@ def resolve_latest_valid_summary_db(summary_dir: Path) -> Path:
     logger.info("🔍 Resolving latest valid summary DB")
     logger.info("[DBBOOT][resolve_summary] today_db=%s", today_db)
     logger.info("[DBBOOT][resolve_summary] effective_trade_date=%s effective_db=%s", effective_trade_date, effective_db)
+    logger.info("[DBBOOT][resolve_summary] skip_prev_restore=%s", skip_prev_restore)
 
     if _is_market_hours_now(now):
         logger.info("📈 Market hours detected -> force today summary DB: %s", today_db)
         return today_db
+
+    if skip_prev_restore:
+        logger.warning(
+            "[DBBOOT][resolve_summary] skip previous summary restore enabled -> use today summary DB without old DB validation: %s",
+            today_db,
+        )
+        return today_db
+
     if _is_after_market_close_today(now):
         if today_db.exists() and _db_has_summary_data(today_db):
             logger.info("📂 Using today summary DB after close: %s", today_db)
@@ -378,6 +412,7 @@ def bootstrap_database(summary_dir: Path, ranking_dir: Optional[Path] = None, *,
     split mode:
       - skip_migration=True の場合、main.py側では migration を実行しない
       - ranking_dir=None の場合、ranking DB resolve / rebind を実行しない
+      - MAIN_SKIP_PREV_SUMMARY_RESTORE=1 または既定ONにより、main.py側では前営業日summary DBを直読みしない
     """
     logger.info("🗄️ Database bootstrap start")
     logger.info("📁 summary_dir = %s", summary_dir)
@@ -400,8 +435,18 @@ def bootstrap_database(summary_dir: Path, ranking_dir: Optional[Path] = None, *,
             raise
 
     try:
-        logger.info("[DBBOOT] step=3 before resolve summary")
-        summary_db_path = resolve_latest_valid_summary_db(summary_dir)
+        # main.py split mode では、前営業日DBをNASから直読みして存在/件数検証しない。
+        # 2026-05-18ログで summary20260515.db connect start 直後に 0xC0000006 でプロセス終了したため。
+        skip_prev_restore = bool(skip_migration) and _env_bool("MAIN_SKIP_PREV_SUMMARY_RESTORE", True)
+        logger.info(
+            "[DBBOOT] step=3 before resolve summary skip_prev_restore=%s env_MAIN_SKIP_PREV_SUMMARY_RESTORE=%s",
+            skip_prev_restore,
+            os.getenv("MAIN_SKIP_PREV_SUMMARY_RESTORE"),
+        )
+        summary_db_path = resolve_latest_valid_summary_db(
+            summary_dir,
+            skip_prev_restore=skip_prev_restore,
+        )
         logger.info("[DBBOOT] step=4 after resolve summary path=%s", summary_db_path)
         logger.info("✅ summary DB resolved: %s", summary_db_path)
     except Exception:
