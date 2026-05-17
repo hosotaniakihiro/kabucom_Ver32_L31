@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/push_bootstrap.py
-# Ver    : PRODUCTION-STABLE-REV6-FAST-RESTORE-DIAGNOSTIC
+# Ver    : PRODUCTION-STABLE-REV7-PREMARKET-RESTORE-0800
 # ------------------------------------------------------------
 # ✔ pushDB 復元（当日分）
 # ✔ 起動時は全日分を読まず、最大行だけ高速復元
@@ -9,7 +9,8 @@
 # ✔ datetime/received_at 等の日付付き列がある場合だけSQLite側で直近検索
 # ✔ pandas dateutil warning を抑制
 # ✔ datetime列を必ず補完
-# ✔ 市場時間外データ除外
+# ✔ 寄前PUSH/板気配データを復元対象に含める（既定 08:00〜15:30）
+# ✔ PUSH_BOOTSTRAP_SESSION_OPEN / PUSH_BOOTSTRAP_SESSION_CLOSE で復元時間を変更可能
 # ✔ 列名小文字正規化
 # ✔ 例外完全吸収
 # ✔ push_df 安全初期化
@@ -58,8 +59,39 @@ _TIME_COLUMN_CANDIDATES = (
     "CurrentPriceTimeNano",
 )
 
-MARKET_OPEN_TIME = dt.time(9, 0)
-MARKET_CLOSE_TIME = dt.time(15, 30)
+
+def _parse_hhmm_time(value: str, default: dt.time) -> dt.time:
+    try:
+        s = str(value or "").strip()
+        if not s:
+            return default
+        m = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$", s)
+        if not m:
+            return default
+        hh = int(m.group(1))
+        mm = int(m.group(2))
+        ss = int(m.group(3) or 0)
+        if 0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59:
+            return dt.time(hh, mm, ss)
+    except Exception:
+        pass
+    return default
+
+
+# 寄前の板気配/CalcPrice を残すため、既定を 08:00 にする。
+# 必要なら set PUSH_BOOTSTRAP_SESSION_OPEN=08:30 などで調整可能。
+SESSION_OPEN_TIME = _parse_hhmm_time(
+    os.environ.get("PUSH_BOOTSTRAP_SESSION_OPEN", "08:00"),
+    dt.time(8, 0),
+)
+SESSION_CLOSE_TIME = _parse_hhmm_time(
+    os.environ.get("PUSH_BOOTSTRAP_SESSION_CLOSE", "15:30"),
+    dt.time(15, 30),
+)
+
+# 旧名を参照している外部コードへの互換用。
+MARKET_OPEN_TIME = SESSION_OPEN_TIME
+MARKET_CLOSE_TIME = SESSION_CLOSE_TIME
 
 
 def _today_date() -> dt.date:
@@ -276,10 +308,12 @@ def _normalize_push_df_for_summary(df: pd.DataFrame) -> pd.DataFrame:
     out.columns = [str(c).strip().lower() for c in out.columns]
 
     logger.info(
-        "[PUSH BOOTSTRAP DIAG] normalize start raw_rows=%d raw_cols=%s normalized_cols=%s head=%s",
+        "[PUSH BOOTSTRAP DIAG] normalize start raw_rows=%d raw_cols=%s normalized_cols=%s session_open=%s session_close=%s head=%s",
         len(out),
         raw_cols,
         list(out.columns),
+        SESSION_OPEN_TIME,
+        SESSION_CLOSE_TIME,
         out.head(3).to_dict("records") if len(out) else [],
     )
 
@@ -335,25 +369,25 @@ def _normalize_push_df_for_summary(df: pd.DataFrame) -> pd.DataFrame:
     else:
         out["datetime"] = out["time"]
 
-    before_market = len(out)
+    before_session = len(out)
     try:
-        out = out[out["time"].dt.time.between(MARKET_OPEN_TIME, MARKET_CLOSE_TIME)]
+        out = out[out["time"].dt.time.between(SESSION_OPEN_TIME, SESSION_CLOSE_TIME)]
     except Exception:
-        logger.warning("⚠ market time filter failed (skipped)")
+        logger.warning("⚠ session time filter failed (skipped)")
 
     if out.empty:
         logger.warning(
-            "⚠ pushDB all rows removed by market time filter before=%d open=%s close=%s time_min=%s time_max=%s",
-            before_market,
-            MARKET_OPEN_TIME,
-            MARKET_CLOSE_TIME,
+            "⚠ pushDB all rows removed by session time filter before=%d open=%s close=%s time_min=%s time_max=%s",
+            before_session,
+            SESSION_OPEN_TIME,
+            SESSION_CLOSE_TIME,
             parsed_time.min() if ok_time else None,
             parsed_time.max() if ok_time else None,
         )
         return pd.DataFrame()
 
     if "price" not in out.columns:
-        for c in ("current_price", "close", "close_price", "last_price"):
+        for c in ("current_price", "calcprice", "calc_price", "close", "close_price", "last_price"):
             if c in out.columns:
                 out["price"] = out[c]
                 logger.info("[PUSH BOOTSTRAP DIAG] price mapped from col=%s", c)
@@ -390,10 +424,12 @@ def _normalize_push_df_for_summary(df: pd.DataFrame) -> pd.DataFrame:
 
     latest = out["datetime"].max() if "datetime" in out.columns else None
     logger.info(
-        "📡 pushDB normalize done rows=%d time_src=%s latest=%s elapsed=%.3fs",
+        "📡 pushDB normalize done rows=%d time_src=%s latest=%s session=%s-%s elapsed=%.3fs",
         len(out),
         time_src,
         latest,
+        SESSION_OPEN_TIME,
+        SESSION_CLOSE_TIME,
         (dt.datetime.now() - norm_started).total_seconds(),
     )
 
@@ -402,7 +438,7 @@ def _normalize_push_df_for_summary(df: pd.DataFrame) -> pd.DataFrame:
 
 def bootstrap_push(push_dir: str):
     boot_started = dt.datetime.now()
-    logger.info("📡 push bootstrap start")
+    logger.info("📡 push bootstrap start session_open=%s session_close=%s", SESSION_OPEN_TIME, SESSION_CLOSE_TIME)
 
     today_str = dt.datetime.now().strftime("%Y%m%d")
     db_path = os.path.join(push_dir, f"push{today_str}.db")
@@ -456,16 +492,20 @@ def bootstrap_push(push_dir: str):
         global_data.push_bootstrap_latest_datetime = latest
         global_data.push_bootstrap_lookback_minutes = int(RESTORE_LOOKBACK_MINUTES)
         global_data.push_bootstrap_max_restore_rows = int(MAX_RESTORE_ROWS)
+        global_data.push_bootstrap_session_open = str(SESSION_OPEN_TIME)
+        global_data.push_bootstrap_session_close = str(SESSION_CLOSE_TIME)
     except Exception:
         pass
 
     logger.info(
-        "📡 push bootstrap complete rows=%d raw_rows=%d latest=%s lookback_min=%d limited=%d elapsed=%.3fs path=%s",
+        "📡 push bootstrap complete rows=%d raw_rows=%d latest=%s lookback_min=%d limited=%d session=%s-%s elapsed=%.3fs path=%s",
         len(df),
         len(raw),
         latest,
         RESTORE_LOOKBACK_MINUTES,
         MAX_RESTORE_ROWS,
+        SESSION_OPEN_TIME,
+        SESSION_CLOSE_TIME,
         (dt.datetime.now() - boot_started).total_seconds(),
         db_path,
     )
