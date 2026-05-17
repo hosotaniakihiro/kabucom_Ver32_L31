@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/rotation_symbols.py
-# Version: PRODUCTION-STABLE-REV2-PUSH-ROTATION-SYMBOLS-INDEPENDENT
+# Version: PRODUCTION-STABLE-REV3-PUSH-ROTATION-SYMBOLS-PROTECTED
 # ------------------------------------------------------------
 # PUSH A/Bローテーション用の銘柄解決・正規化API。
 #
@@ -10,6 +10,7 @@
 #   - 銘柄コードを正規化
 #   - 100銘柄上限へ制限
 #   - 流動性ガードを適用
+#   - 保有中 / 未約定 / 直近ENTRY候補を優先保護
 #
 # Notes:
 #   - 旧 rotation.py へ依存しない独立実装。
@@ -30,7 +31,7 @@ from .rotation_settings import (
 
 logger = logging.getLogger(__name__)
 
-VERSION = "PRODUCTION-STABLE-REV2-PUSH-ROTATION-SYMBOLS-INDEPENDENT"
+VERSION = "PRODUCTION-STABLE-REV3-PUSH-ROTATION-SYMBOLS-PROTECTED"
 
 
 try:
@@ -41,6 +42,16 @@ except Exception:
     filter_register_targets_by_liquidity = None  # type: ignore[assignment]
     logger.warning(
         "[push_stream] liquidity_guard import failed. PUSH register liquidity guard disabled.",
+        exc_info=True,
+    )
+
+
+try:
+    from .protected_symbols import merge_protected_first
+except Exception:
+    merge_protected_first = None  # type: ignore[assignment]
+    logger.warning(
+        '[push_stream] protected_symbols import failed. protected push symbols disabled.',
         exc_info=True,
     )
 
@@ -509,6 +520,27 @@ def resolve_register_targets() -> List[str]:
         return []
 
     before_limit = len(targets)
+
+    # ========================================================
+    # 保有中 / 未約定 / 直近ENTRY候補を先頭優先へ
+    # ========================================================
+    try:
+        if callable(merge_protected_first):
+            merged = merge_protected_first(
+                targets,
+                max_symbols=DEFAULT_REGISTER_MAX_SYMBOLS,
+            )
+            if merged:
+                logger.warning(
+                    '[push_stream] protected merge applied before=%d after=%d protected_head=%s',
+                    len(targets),
+                    len(merged),
+                    merged[:20],
+                )
+                targets = merged
+    except Exception:
+        logger.exception('[push_stream] protected merge failed')
+
     targets = targets[:DEFAULT_REGISTER_MAX_SYMBOLS]
 
     logger.info(
