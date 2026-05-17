@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/trade_runtime_persistence_patch.py
-# Version: Ver01-TRADE-RUNTIME-PERSISTENCE-PATCH
+# Version: Ver02-TRADE-RUNTIME-PERSISTENCE-PROTECTED-PUSH
 # ------------------------------------------------------------
 # 売買に関する runtime 証跡を保存する runtime patch。
 # 既存の注文ロジックを直接壊さず、以下を monkey patch する。
@@ -8,8 +8,10 @@
 # 対象:
 #   - kabu_api.buy_sell_entry._send_order
 #       新規 entry 注文送信後に pending_orders_runtime へ保存
+#       注文送信直後に protected push symbols へ即反映
 #   - kabu_api.close.process_exit
 #       exit 注文送信後に pending_orders_runtime へ保存
+#       exit注文銘柄も protected push symbols へ即反映
 #       成功時に positions_runtime を CLOSED 扱いへ補正
 #
 # 保存先:
@@ -45,6 +47,82 @@ def _safe_int(v: Any, default: int = 0) -> int:
         return int(float(v))
     except Exception:
         return default
+
+
+def _normalize_symbol(symbol: Any) -> str:
+    s = str(symbol or '').strip().upper()
+    if s.endswith('.T'):
+        s = s[:-2]
+    if s.endswith('.0') and s[:-2].isdigit():
+        s = s[:-2]
+    return s
+
+
+def _add_symbol_to_global_list(attr: str, symbol: str, *, max_len: int = 50) -> None:
+    """global_data上の保護用リストへ即時追加する。失敗しても売買処理は止めない。"""
+    try:
+        symbol = _normalize_symbol(symbol)
+        if not symbol:
+            return
+
+        from global_state import global_data
+
+        cur = getattr(global_data, attr, None)
+        if cur is None:
+            cur_list: list[str] = []
+        elif isinstance(cur, list):
+            cur_list = [str(x).strip().upper() for x in cur if x]
+        elif isinstance(cur, set):
+            cur_list = [str(x).strip().upper() for x in cur if x]
+        elif isinstance(cur, dict):
+            cur_list = [str(k).strip().upper() for k in cur.keys() if k]
+        else:
+            try:
+                cur_list = [str(x).strip().upper() for x in list(cur) if x]
+            except Exception:
+                cur_list = []
+
+        merged = [symbol] + [x for x in cur_list if x != symbol]
+        merged = merged[:max_len]
+        setattr(global_data, attr, merged)
+        logger.warning('[TRADE RUNTIME] global_data.%s protected add symbol=%s size=%d', attr, symbol, len(merged))
+    except Exception:
+        logger.debug('[TRADE RUNTIME] global protected add failed attr=%s symbol=%s', attr, symbol, exc_info=True)
+
+
+def _protect_symbol_immediately(symbol: str, *, reason: str) -> None:
+    """
+    注文送信直後/約定直後にPUSH保護対象へ即反映する。
+    protected_symbols.py はこれらのglobal_data属性を読む。
+    """
+    symbol = _normalize_symbol(symbol)
+    if not symbol:
+        return
+
+    _add_symbol_to_global_list('recent_entry_symbols', symbol, max_len=50)
+    _add_symbol_to_global_list('pending_order_symbols', symbol, max_len=50)
+    _add_symbol_to_global_list('recent_ai_ok_symbols', symbol, max_len=50)
+
+    try:
+        from trading.runtime_persistence.heartbeat_watchdog import heartbeat
+        heartbeat('protected_push_immediate', status='OK', detail={'symbol': symbol, 'reason': reason})
+    except Exception:
+        pass
+
+    logger.warning('[TRADE RUNTIME] symbol immediately protected symbol=%s reason=%s', symbol, reason)
+
+
+def _unprotect_after_exit(symbol: str) -> None:
+    """
+    exit注文を出した銘柄は直後もしばらく監視が必要なので recent_exit_symbols に残す。
+    完全解除は position_reconcile で実建玉なし確認後に任せる。
+    """
+    symbol = _normalize_symbol(symbol)
+    if not symbol:
+        return
+    _add_symbol_to_global_list('recent_exit_symbols', symbol, max_len=50)
+    _add_symbol_to_global_list('pending_order_symbols', symbol, max_len=50)
+    logger.warning('[TRADE RUNTIME] exit symbol protected until reconcile symbol=%s', symbol)
 
 
 def _side_from_payload(payload: dict | None) -> str:
@@ -171,6 +249,7 @@ def _patch_buy_sell_entry() -> bool:
                         seconds_to_cancel=10,
                         payload=payload if isinstance(payload, dict) else None,
                     )
+                    _protect_symbol_immediately(str(symbol), reason='entry_order_sent')
             except Exception:
                 logger.exception('[TRADE RUNTIME PATCH] entry order persistence failed symbol=%s res=%s', symbol, res)
             return res
@@ -223,6 +302,7 @@ def _patch_process_exit() -> bool:
                         status='PENDING_EXIT',
                         seconds_to_cancel=10,
                     )
+                    _unprotect_after_exit(symbol)
                     _mark_position_closed_from_exit(pos)
             except Exception:
                 logger.exception('[TRADE RUNTIME PATCH] exit order persistence failed api=%s', api)
