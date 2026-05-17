@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/open_position_broker_merge_patch.py
-# Version: V1.2-BROKER-CREDIT-AUTHORITATIVE-NO-CASH-DB-STUB
+# Version: V1.3-BROKER-EMPTY-AUTHORITATIVE-NO-STALE-DB-FALLBACK
 # ------------------------------------------------------------
 # broker reader の信用実建玉を authoritative source として
 # global_data.open_positions / protected / EXIT監視へ渡す runtime patch。
@@ -8,15 +8,16 @@
 # 重要:
 #   - 現物はEXIT監視しない。
 #   - 実保有していない positions.db の残骸はEXIT監視しない。
-#   - broker側の信用建玉が読めた場合は broker側だけを採用する。
-#   - broker側が読めない場合のみ、DB由来の信用らしい建玉を fallback 採用する。
+#   - broker側の信用建玉が読めた場合は、0件でも broker側を正とする。
+#   - broker API失敗時のみ、DB由来の信用らしい建玉を fallback 採用する。
+#   - これにより、手動返済済み/証券会社側0件の 9716 などを保有扱いしない。
 # ============================================================
 
 from __future__ import annotations
 
 import datetime as dt
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -87,11 +88,25 @@ def _ensure_open_positions() -> Dict[str, Dict[str, Any]]:
         return {}
 
 
-def _read_broker_positions() -> Dict[str, Dict[str, Any]]:
-    try:
-        from trading.position.kabu_position_reader import read_kabu_open_positions
+def _read_broker_positions_with_status() -> Tuple[Dict[str, Dict[str, Any]], bool, dict]:
+    """
+    Returns:
+      positions, read_ok, status
 
-        rows = read_kabu_open_positions() or {}
+    read_ok=True なら、信用建玉0件でも broker側を正としてDB fallbackしない。
+    read_ok=False の場合だけ DB fallback を許可する。
+    """
+    try:
+        import trading.position.kabu_position_reader as reader
+
+        rows = reader.read_kabu_open_positions() or {}
+        status = {}
+        try:
+            status = reader.get_last_read_status() or {}
+        except Exception:
+            status = {}
+        read_ok = bool(status.get("ok", True))
+
         out: Dict[str, Dict[str, Any]] = {}
         skipped_non_credit = 0
         for k, v in rows.items():
@@ -104,10 +119,10 @@ def _read_broker_positions() -> Dict[str, Dict[str, Any]]:
             out[s] = v
         if skipped_non_credit:
             logger.warning("[OPEN POSITION BROKER PATCH] broker non-credit skipped=%d", skipped_non_credit)
-        return out
-    except Exception:
-        logger.warning("[OPEN POSITION BROKER PATCH] broker reader failed", exc_info=True)
-        return {}
+        return out, read_ok, status
+    except Exception as e:
+        logger.warning("[OPEN POSITION BROKER PATCH] broker reader failed err=%s", e, exc_info=True)
+        return {}, False, {"ok": False, "error": str(e)}
 
 
 def _filter_db_credit_positions(db_positions: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -126,17 +141,24 @@ def _filter_db_credit_positions(db_positions: Dict[str, Dict[str, Any]]) -> Dict
     return out
 
 
-def _merge_and_publish(db_positions: Dict[str, Dict[str, Any]], broker_positions: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+def _merge_and_publish(
+    db_positions: Dict[str, Dict[str, Any]],
+    broker_positions: Dict[str, Dict[str, Any]],
+    *,
+    broker_read_ok: bool,
+    broker_status: dict | None = None,
+) -> Dict[str, Dict[str, Any]]:
     db_credit = _filter_db_credit_positions(db_positions)
+    broker_status = broker_status or {}
 
-    # broker信用建玉が読めた場合は broker を正とする。
-    # これで 9716 のような positions.db の残骸をEXIT監視から外す。
-    if broker_positions:
+    # broker APIが正常に読めた場合は、0件でも broker を正とする。
+    # これで「証券会社側0件なのにpositions.dbの9716を保有扱いする」事故を防ぐ。
+    if broker_read_ok:
         merged = dict(broker_positions)
-        source_mode = "broker_credit_authoritative"
+        source_mode = "broker_credit_authoritative_empty_ok" if not broker_positions else "broker_credit_authoritative"
     else:
         merged = dict(db_credit)
-        source_mode = "db_credit_fallback"
+        source_mode = "db_credit_fallback_broker_read_failed"
 
     gd_positions = _ensure_open_positions()
     before_keys = {_normalize_symbol(k) for k in gd_positions.keys()}
@@ -160,15 +182,19 @@ def _merge_and_publish(db_positions: Dict[str, Dict[str, Any]], broker_positions
         global_data.open_positions_synced_at = dt.datetime.now()
         global_data.open_positions_synced_count = len(merged)
         global_data.open_positions_source_mode = source_mode
+        global_data.open_positions_broker_read_ok = bool(broker_read_ok)
+        global_data.open_positions_broker_status = broker_status
     except Exception:
         pass
 
     changed = before_keys != merged_keys
     logger.warning(
-        "[OPEN POSITION BROKER PATCH] merged credit open positions count=%d changed=%s mode=%s db_count=%d db_credit=%d broker_count=%d symbols=%s",
+        "[OPEN POSITION BROKER PATCH] merged credit open positions count=%d changed=%s mode=%s broker_read_ok=%s broker_status=%s db_count=%d db_credit=%d broker_count=%d symbols=%s",
         len(merged),
         changed,
         source_mode,
+        broker_read_ok,
+        broker_status,
         len(db_positions or {}),
         len(db_credit),
         len(broker_positions or {}),
@@ -203,18 +229,23 @@ def install() -> bool:
             logger.exception("[OPEN POSITION BROKER PATCH] original sync failed")
             db_positions = {}
 
-        broker_positions = _read_broker_positions()
-        return _merge_and_publish(db_positions, broker_positions)
+        broker_positions, broker_read_ok, broker_status = _read_broker_positions_with_status()
+        return _merge_and_publish(
+            db_positions,
+            broker_positions,
+            broker_read_ok=broker_read_ok,
+            broker_status=broker_status,
+        )
 
     target.sync_open_positions_from_db = patched_sync_open_positions_from_db
 
     try:
-        target.load_open_positions_from_broker = _read_broker_positions
+        target.load_open_positions_from_broker = lambda: _read_broker_positions_with_status()[0]
     except Exception:
         pass
 
     _INSTALLED = True
-    logger.warning("[OPEN POSITION BROKER PATCH] installed broker_credit_authoritative=True no_cash_exit=True")
+    logger.warning("[OPEN POSITION BROKER PATCH] installed broker_credit_authoritative=True broker_empty_ok=True no_cash_exit=True")
     return True
 
 
