@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/ranking/active_symbols/config.py
-# Version: Ver1.1-ACTIVE-SYMBOLS-CATEGORY-QUOTA-CONFIG
+# Version: Ver1.2-ACTIVE-SYMBOLS-MAX-PRICE-7000
 # ============================================================
 from __future__ import annotations
 import os
@@ -74,8 +74,8 @@ MIN_TRADING_VALUE = env_float("ACTIVE_MIN_TRADING_VALUE", 20_000_000)
 MIN_VOLUME = env_float("ACTIVE_MIN_VOLUME", 3_000)
 MIN_TICK_COUNT = env_float("ACTIVE_MIN_TICK_COUNT", 10)
 MIN_PRICE = env_float("ACTIVE_MIN_PRICE", 200)
-# 監視銘柄は5000円以下に限定。0以下にすると上限なし。
-MAX_PRICE = env_float("ACTIVE_MAX_PRICE", 5_000)
+# 監視銘柄は7000円以下に限定。0以下にすると上限なし。
+MAX_PRICE = env_float("ACTIVE_MAX_PRICE", 7_000)
 KEEP_PROTECTED_EVEN_IF_ILLIQUID = env_bool("ACTIVE_KEEP_PROTECTED_EVEN_IF_ILLIQUID", True)
 
 PRICE_COLUMNS = ("current_price", "price", "close", "close_price", "現在値")
