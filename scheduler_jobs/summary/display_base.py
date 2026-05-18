@@ -8,7 +8,7 @@
 #   - Discord用 1銘柄2行フォーマット生成
 #   - score_config.ini の買い/売りサインを日本語で表示
 # ------------------------------------------------------------
-# Version: Ver1.2-SCORING-SIGNAL-JAPANESE-DISPLAY
+# Version: Ver1.3-SCORING-SIGNAL-CATALOG-DEFAULT-ON
 # ============================================================
 
 from __future__ import annotations
@@ -376,13 +376,6 @@ def _discord_reason(row: pd.Series, side: str = "BUY") -> str:
 
 
 def build_discord_candidate_2lines(i: int, row: pd.Series, *, side: str = "BUY") -> str:
-    """
-    Discord送信用。
-    1銘柄を2〜3行に整形する。
-
-    3行目に score_config.ini/scoring.ini の日本語サインを出す。
-    """
-
     try:
         if not isinstance(row, pd.Series):
             row = pd.Series(row)
@@ -437,13 +430,6 @@ def build_discord_top10_message_2lines(
     max_rows: int = 10,
     code_block: bool = True,
 ) -> str:
-    """
-    Discord送信用 TOP10 メッセージを作る。
-
-    - 1銘柄2〜3行
-    - score_config.ini/scoring.ini のONサインを日本語で表示
-    """
-
     out_df = safe_df(df)
     out_df = coalesce_duplicate_columns(out_df)
 
@@ -456,8 +442,9 @@ def build_discord_top10_message_2lines(
     rows = out_df.head(max_rows).copy()
     lines: List[str] = [str(title)]
 
-    # 必要ならサイン定義カタログを先頭に全部出す。
-    show_catalog = str(os.getenv("SUMMARY_DISPLAY_SHOW_SIGNAL_CATALOG", "0")).lower() in {"1", "true", "yes", "y", "on"}
+    # score_config.ini / scoring.ini のサイン定義カタログを標準で全部表示する。
+    # 長すぎる場合だけ SUMMARY_DISPLAY_SHOW_SIGNAL_CATALOG=0 で非表示にできる。
+    show_catalog = str(os.getenv("SUMMARY_DISPLAY_SHOW_SIGNAL_CATALOG", "1")).lower() in {"1", "true", "yes", "y", "on"}
     if show_catalog:
         catalog = _score_config_catalog_text(side)
         if catalog:
