@@ -1,13 +1,14 @@
 # ============================================================
 # File   : trading/entry/lot_sizer.py
-# Ver1.2-FINAL-RISK-PARITY-LOT-SIZER-ONESHOT-CAP
+# Ver1.3-FINAL-RISK-PARITY-LOT-SIZER-UNIFIED-ENTRY-BUDGET
 # ------------------------------------------------------------
 # ✔ confidence / lot_multiplier / ATR から数量を算出
 # ✔ 1トレードの最大損失額を常に一定化
 # ✔ ドローダウン連動で MAX_RISK_YEN を自動縮小
 # ✔ ENTRY_GATE の外側で使用（副作用ゼロ）
 # ✔ 約定単位・最小ロット・最大ロット対応
-# ✔ 50万円ワンショット制限に合わせて数量を自動縮小
+# ✔ MAX_ENTRY_ONESHOT_YEN は trading.entry.entry_budget と統一
+# ✔ 既定は 70万円ワンショット制限に合わせて数量を自動縮小
 # ✔ None / NaN / 異常値 完全防御
 # ============================================================
 
@@ -49,6 +50,28 @@ def _safe_int(v, default: int = 0) -> int:
         return default
 
 
+def _get_unified_max_oneshot_yen() -> float:
+    try:
+        from trading.entry.entry_budget import get_max_entry_oneshot_yen
+        v = float(get_max_entry_oneshot_yen())
+        if v > 0:
+            return v
+    except Exception:
+        pass
+    return _safe_float(_cfg("MAX_ENTRY_ONESHOT_YEN", 700_000), 700_000)
+
+
+def _get_unified_order_lot_size() -> int:
+    try:
+        from trading.entry.entry_budget import get_order_lot_size
+        v = int(get_order_lot_size())
+        if v > 0:
+            return v
+    except Exception:
+        pass
+    return _safe_int(_cfg("ORDER_LOT_SIZE", 100), 100)
+
+
 # ============================================================
 # core
 # ============================================================
@@ -64,7 +87,7 @@ def calculate_entry_quantity(
     リスク一定化に基づく ENTRY 数量計算。
 
     重要:
-      下位の kabu_api.buy_sell_entry には 50万円ワンショット制限がある。
+      下位の kabu_api.buy_sell_entry にはワンショット制限がある。
       ここで price * qty <= MAX_ENTRY_ONESHOT_YEN に収めておくことで、
       ORDER_BUILD_OK 後に ONESHOT制限超過で None になるのを防ぐ。
 
@@ -94,8 +117,8 @@ def calculate_entry_quantity(
     STOP_ATR_MULT = _safe_float(_cfg("STOP_ATR_MULTIPLIER", 1.5), 1.5)
     MIN_STOP_YEN = _safe_float(_cfg("MIN_STOP_YEN", 20), 20)
     MAX_QTY = _safe_int(_cfg("MAX_ENTRY_QTY", 10_000), 10_000)
-    LOT_SIZE = _safe_int(_cfg("ORDER_LOT_SIZE", 100), 100)
-    MAX_ONESHOT_YEN = _safe_float(_cfg("MAX_ENTRY_ONESHOT_YEN", 500_000), 500_000)
+    LOT_SIZE = _get_unified_order_lot_size()
+    MAX_ONESHOT_YEN = _get_unified_max_oneshot_yen()
 
     if LOT_SIZE <= 0:
         LOT_SIZE = 100
@@ -104,7 +127,7 @@ def calculate_entry_quantity(
         MAX_QTY = 10_000
 
     if MAX_ONESHOT_YEN <= 0:
-        MAX_ONESHOT_YEN = 500_000
+        MAX_ONESHOT_YEN = 700_000
 
     # --------------------------------------------------------
     # ドローダウン連動リスク係数
@@ -153,7 +176,7 @@ def calculate_entry_quantity(
     qty = max(0, min(qty, MAX_QTY))
 
     # --------------------------------------------------------
-    # 50万円ワンショット制限
+    # ワンショット制限
     # --------------------------------------------------------
     max_qty_by_oneshot = int((MAX_ONESHOT_YEN // price) // LOT_SIZE * LOT_SIZE)
 
