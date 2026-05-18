@@ -1,28 +1,14 @@
 # ============================================================
 # File   : trading/entry/entry_budget.py
-# Version: PRODUCTION-ENTRY-BUDGET-CONFIG-V2-PRICE-RANGE-3000-7000
+# Version: PRODUCTION-ENTRY-BUDGET-CONFIG-V3-SETTING-INI
 # ------------------------------------------------------------
 # 目的:
 #   エントリー1回あたりの予算・最低株数・価格帯上限/下限を一元管理する。
 #
-# 背景:
-#   50万円 / 100株単位の場合、株価が5000円を超える銘柄は
-#   最低100株でも50万円を超えるため、最終的に qty=0 で落ちる。
-#   それをAI判定後に落とすとAI枠を無駄に消費する。
-#
-# 重要修正 V2:
-#   - エントリー対象価格帯を明示管理する
-#   - 既定は ENTRY_MIN_PRICE=3000 / ENTRY_MAX_PRICE=7000
-#   - MAX_ENTRY_ONESHOT_YEN 既定を 700000 に統一
-#   - can_afford_min_lot() で 3000円未満/7000円超をAI前に除外する
-#
-# 方針:
-#   - MAX_ENTRY_ONESHOT_YEN を増額すれば、AI前価格上限も自動で変わる
-#   - ENTRY_MAX_PRICE が設定されている場合は、予算上限と価格帯上限の小さい方を使う
-#   - ENTRY_MIN_PRICE で低価格株を除外する
-#   - ORDER_LOT_SIZE を変更しても、同じ計算式で追随する
-#   - ENVで一時上書きも可能
-#   - config.global_config が読める場合はそこを優先
+# 重要修正 V3:
+#   - setting.ini を読めるようにする
+#   - 優先順: config.global_config -> ENV -> setting.ini -> default
+#   - setting.ini はプロジェクト配下から自動探索する
 #
 # 主な設定:
 #   MAX_ENTRY_ONESHOT_YEN 既定 700000
@@ -71,8 +57,8 @@ def _safe_int(v: Any, default: int) -> int:
 
 def _cfg(key: str, default: Any) -> Any:
     """
-    config.global_config -> ENV -> default の順で読む。
-    global_config がdict風/オブジェクト風どちらでも落ちない。
+    config.global_config -> ENV -> setting.ini -> default の順で読む。
+    ENVを一時上書きに使えるよう、setting.ini より ENV を優先する。
     """
     try:
         from config import global_config
@@ -96,6 +82,15 @@ def _cfg(key: str, default: Any) -> Any:
 
     try:
         v = os.getenv(key)
+        if v is not None and str(v).strip() != "":
+            return v
+    except Exception:
+        pass
+
+    try:
+        from core.startup.settings_ini_loader import get_setting
+
+        v = get_setting(key, None)
         if v is not None and str(v).strip() != "":
             return v
     except Exception:
@@ -139,13 +134,6 @@ def get_max_affordable_price_for_min_lot(
     budget_yen: float | None = None,
     lot_size: int | None = None,
 ) -> float:
-    """
-    最低1単元を買える最大価格を返す。
-
-    例:
-      budget=700000, lot=100 -> 7000
-      budget=1000000, lot=100 -> 10000
-    """
     budget = get_max_entry_oneshot_yen() if budget_yen is None else _safe_float(budget_yen, DEFAULT_MAX_ENTRY_ONESHOT_YEN)
     lot = get_order_lot_size() if lot_size is None else _safe_int(lot_size, DEFAULT_ORDER_LOT_SIZE)
 
@@ -156,12 +144,6 @@ def get_max_affordable_price_for_min_lot(
 
 
 def get_effective_entry_max_price() -> float:
-    """
-    実際にAI前フィルタで使う価格上限。
-
-    ENTRY_MAX_PRICE と 最低1単元を買える価格上限 の小さい方を使う。
-    これにより、7000円以下を希望していても、予算が不足する場合は安全側に倒す。
-    """
     configured_max = get_entry_max_price()
     affordable_max = get_max_affordable_price_for_min_lot()
 
@@ -172,10 +154,6 @@ def get_effective_entry_max_price() -> float:
 
 
 def can_afford_min_lot(price: Any) -> tuple[bool, dict[str, Any]]:
-    """
-    指定価格でエントリー対象価格帯かつ最低1単元を買えるかを判定する。
-    BUY/SELLとも新規建ての最低発注単位チェックとして使う。
-    """
     p = _safe_float(price, 0.0)
     budget = get_max_entry_oneshot_yen()
     lot = get_order_lot_size()
@@ -195,6 +173,7 @@ def can_afford_min_lot(price: Any) -> tuple[bool, dict[str, Any]]:
         "affordable_max_price": affordable_max_price,
         "max_price": effective_max_price,
         "min_notional": min_notional,
+        "source": "entry_budget_cfg_global_env_setting_ini_default",
     }
 
     if not is_affordability_filter_enabled(default=True):
@@ -230,7 +209,7 @@ def log_entry_budget_config(prefix: str = "[ENTRY BUDGET]") -> None:
         configured_max = get_entry_max_price()
         effective_max = get_effective_entry_max_price()
         logger.warning(
-            "%s max_oneshot_yen=%.0f lot_size=%s min_price=%.2f configured_max_price=%.2f affordable_max_price=%.2f effective_max_price=%.2f affordability_filter=%s",
+            "%s max_oneshot_yen=%.0f lot_size=%s min_price=%.2f configured_max_price=%.2f affordable_max_price=%.2f effective_max_price=%.2f affordability_filter=%s source=global_config_env_setting_ini_default",
             prefix,
             budget,
             lot,
