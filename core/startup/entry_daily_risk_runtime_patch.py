@@ -1,28 +1,36 @@
 # ============================================================
 # File   : core/startup/entry_daily_risk_runtime_patch.py
-# Version: V1.3-HARD-DAILY-LOSS-BRAKE
+# Version: V1.4-HARD-DAILY-LOSS-BRAKE-ENTRY-SENT-COUNT
 # ------------------------------------------------------------
 # 導入ルール:
 #   1. BUY新規も許可する
 #   2. 同一銘柄は当日最大1回をデフォルトにする
-#   3. 同一銘柄で1回でも損失が出たら当日停止する
-#   4. 1銘柄の当日損失 -1000円で停止する
-#   5. システム全体の当日損失が -10000円に到達したら新規停止する
-#   6. 当日の返済済み取引回数が30回に到達したら新規停止する
-#   7. 連敗が5回に到達したら新規停止する
+#   3. 発注成功時点でも同一銘柄の当日エントリー済みとして記録する
+#   4. 同一銘柄で1回でも損失が出たら当日停止する
+#   5. 1銘柄の当日損失 -1500円で停止する
+#   6. システム全体の当日損失が -10000円に到達したら新規停止する
+#   7. 当日の返済済み取引回数が30回に到達したら新規停止する
+#   8. 連敗が5回に到達したら新規停止する
 #
 # 背景:
-#   小さな損を同一銘柄で何度も重ねる状態を止めるため、
-#   ENTRY前に銘柄別・全体の実現損益/回数を確認してブロックする。
+#   2026/05/18 の取引明細で、同一銘柄の複数回負けが多く、
+#   小さな勝ちより大きな負けを積み上げていた。
+#
+# 重要修正 V1.4:
+#   - V1.3 は count_mode=actual_exit_only だったため、返済記録前の再エントリーに弱い
+#   - 発注処理が True を返した時点で entry_sent_count を増やす
+#   - リスク判定では actual exit count と entry_sent_count の大きい方を見る
+#   - これにより、同一銘柄は「その日に1回発注したら」再エントリーしない
 #
 # 環境変数:
 #   ENTRY_BUY_ENABLED=1
 #   ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL=1
 #   ENTRY_STOP_SYMBOL_AFTER_FIRST_LOSS=1
-#   ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN=-1000
+#   ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN=-1500
 #   ENTRY_GLOBAL_MAX_DAILY_LOSS_YEN=-10000
 #   ENTRY_GLOBAL_MAX_DAILY_TRADES=30
 #   ENTRY_GLOBAL_MAX_CONSECUTIVE_LOSSES=5
+#   ENTRY_COUNT_SENT_ORDER_AS_DAILY_ENTRY=1
 # ============================================================
 
 from __future__ import annotations
@@ -108,6 +116,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             trade_date TEXT NOT NULL,
             symbol TEXT NOT NULL,
             entry_count INTEGER NOT NULL DEFAULT 0,
+            entry_sent_count INTEGER NOT NULL DEFAULT 0,
             daily_pnl REAL NOT NULL DEFAULT 0,
             win_count INTEGER NOT NULL DEFAULT 0,
             loss_count INTEGER NOT NULL DEFAULT 0,
@@ -123,6 +132,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS global_daily_entry_risk (
             trade_date TEXT PRIMARY KEY,
             trade_count INTEGER NOT NULL DEFAULT 0,
+            entry_sent_count INTEGER NOT NULL DEFAULT 0,
             daily_pnl REAL NOT NULL DEFAULT 0,
             win_count INTEGER NOT NULL DEFAULT 0,
             loss_count INTEGER NOT NULL DEFAULT 0,
@@ -131,10 +141,13 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
-    for col, ddl in [
-        ("win_count", "ALTER TABLE symbol_daily_entry_risk ADD COLUMN win_count INTEGER NOT NULL DEFAULT 0"),
-        ("loss_count", "ALTER TABLE symbol_daily_entry_risk ADD COLUMN loss_count INTEGER NOT NULL DEFAULT 0"),
-    ]:
+    alter_stmts = [
+        "ALTER TABLE symbol_daily_entry_risk ADD COLUMN win_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE symbol_daily_entry_risk ADD COLUMN loss_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE symbol_daily_entry_risk ADD COLUMN entry_sent_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE global_daily_entry_risk ADD COLUMN entry_sent_count INTEGER NOT NULL DEFAULT 0",
+    ]
+    for ddl in alter_stmts:
         try:
             conn.execute(ddl)
         except sqlite3.OperationalError:
@@ -147,7 +160,7 @@ def _get_symbol_row(symbol: str) -> Dict[str, Any]:
     with _connect() as conn:
         cur = conn.execute(
             """
-            SELECT entry_count, daily_pnl, win_count, loss_count, last_entry_time, last_exit_time
+            SELECT entry_count, entry_sent_count, daily_pnl, win_count, loss_count, last_entry_time, last_exit_time
             FROM symbol_daily_entry_risk
             WHERE trade_date=? AND symbol=?
             """,
@@ -157,20 +170,21 @@ def _get_symbol_row(symbol: str) -> Dict[str, Any]:
         if row:
             return {
                 "entry_count": int(row[0] or 0),
-                "daily_pnl": float(row[1] or 0.0),
-                "win_count": int(row[2] or 0),
-                "loss_count": int(row[3] or 0),
-                "last_entry_time": row[4] or "",
-                "last_exit_time": row[5] or "",
+                "entry_sent_count": int(row[1] or 0),
+                "daily_pnl": float(row[2] or 0.0),
+                "win_count": int(row[3] or 0),
+                "loss_count": int(row[4] or 0),
+                "last_entry_time": row[5] or "",
+                "last_exit_time": row[6] or "",
             }
-    return {"entry_count": 0, "daily_pnl": 0.0, "win_count": 0, "loss_count": 0, "last_entry_time": "", "last_exit_time": ""}
+    return {"entry_count": 0, "entry_sent_count": 0, "daily_pnl": 0.0, "win_count": 0, "loss_count": 0, "last_entry_time": "", "last_exit_time": ""}
 
 
 def _get_global_row() -> Dict[str, Any]:
     with _connect() as conn:
         cur = conn.execute(
             """
-            SELECT trade_count, daily_pnl, win_count, loss_count, consecutive_losses, updated_at
+            SELECT trade_count, entry_sent_count, daily_pnl, win_count, loss_count, consecutive_losses, updated_at
             FROM global_daily_entry_risk
             WHERE trade_date=?
             """,
@@ -180,17 +194,58 @@ def _get_global_row() -> Dict[str, Any]:
         if row:
             return {
                 "trade_count": int(row[0] or 0),
-                "daily_pnl": float(row[1] or 0.0),
-                "win_count": int(row[2] or 0),
-                "loss_count": int(row[3] or 0),
-                "consecutive_losses": int(row[4] or 0),
-                "updated_at": row[5] or "",
+                "entry_sent_count": int(row[1] or 0),
+                "daily_pnl": float(row[2] or 0.0),
+                "win_count": int(row[3] or 0),
+                "loss_count": int(row[4] or 0),
+                "consecutive_losses": int(row[5] or 0),
+                "updated_at": row[6] or "",
             }
-    return {"trade_count": 0, "daily_pnl": 0.0, "win_count": 0, "loss_count": 0, "consecutive_losses": 0, "updated_at": ""}
+    return {"trade_count": 0, "entry_sent_count": 0, "daily_pnl": 0.0, "win_count": 0, "loss_count": 0, "consecutive_losses": 0, "updated_at": ""}
+
+
+def _record_entry_sent(symbol: str) -> None:
+    """発注成功時点で、同一銘柄の当日再エントリー抑止用カウントを増やす。"""
+    symbol = _norm_symbol(symbol)
+    if not symbol:
+        return
+
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO symbol_daily_entry_risk
+                (trade_date, symbol, entry_count, entry_sent_count, daily_pnl, win_count, loss_count, last_entry_time, updated_at)
+            VALUES (?, ?, 0, 1, 0, 0, 0, ?, ?)
+            ON CONFLICT(trade_date, symbol) DO UPDATE SET
+                entry_sent_count = entry_sent_count + 1,
+                last_entry_time = excluded.last_entry_time,
+                updated_at = excluded.updated_at
+            """,
+            (_today(), symbol, _now_iso(), _now_iso()),
+        )
+        conn.execute(
+            """
+            INSERT INTO global_daily_entry_risk
+                (trade_date, trade_count, entry_sent_count, daily_pnl, win_count, loss_count, consecutive_losses, updated_at)
+            VALUES (?, 0, 1, 0, 0, 0, 0, ?)
+            ON CONFLICT(trade_date) DO UPDATE SET
+                entry_sent_count = entry_sent_count + 1,
+                updated_at = excluded.updated_at
+            """,
+            (_today(), _now_iso()),
+        )
+        conn.commit()
+
+    logger.warning(
+        "[ENTRY DAILY RISK] entry_sent recorded symbol=%s symbol_row=%s global_row=%s",
+        symbol,
+        _get_symbol_row(symbol),
+        _get_global_row(),
+    )
 
 
 def _record_actual_trade(symbol: str, pnl: float) -> None:
-    """実際に約定して返済された時だけ、当日エントリー回数と損益を更新する。"""
+    """実際に約定して返済された時、当日実現損益/勝敗を更新する。"""
     symbol = _norm_symbol(symbol)
     if not symbol:
         return
@@ -203,8 +258,8 @@ def _record_actual_trade(symbol: str, pnl: float) -> None:
         conn.execute(
             """
             INSERT INTO symbol_daily_entry_risk
-                (trade_date, symbol, entry_count, daily_pnl, win_count, loss_count, last_entry_time, last_exit_time, updated_at)
-            VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)
+                (trade_date, symbol, entry_count, entry_sent_count, daily_pnl, win_count, loss_count, last_entry_time, last_exit_time, updated_at)
+            VALUES (?, ?, 1, 0, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(trade_date, symbol) DO UPDATE SET
                 entry_count = entry_count + 1,
                 daily_pnl = daily_pnl + excluded.daily_pnl,
@@ -218,8 +273,8 @@ def _record_actual_trade(symbol: str, pnl: float) -> None:
         conn.execute(
             """
             INSERT INTO global_daily_entry_risk
-                (trade_date, trade_count, daily_pnl, win_count, loss_count, consecutive_losses, updated_at)
-            VALUES (?, 1, ?, ?, ?, ?, ?)
+                (trade_date, trade_count, entry_sent_count, daily_pnl, win_count, loss_count, consecutive_losses, updated_at)
+            VALUES (?, 1, 0, ?, ?, ?, ?, ?)
             ON CONFLICT(trade_date) DO UPDATE SET
                 trade_count = trade_count + 1,
                 daily_pnl = daily_pnl + excluded.daily_pnl,
@@ -251,11 +306,13 @@ def _risk_block_reason(symbol: str, side: str) -> Tuple[bool, str, Dict[str, Any
     grow = _get_global_row()
 
     max_entries = _env_int("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", 1)
-    symbol_max_loss = _env_float("ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN", -1000.0)
+    symbol_max_loss = _env_float("ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN", -1500.0)
     stop_after_first_loss = _env_bool("ENTRY_STOP_SYMBOL_AFTER_FIRST_LOSS", True)
     global_max_loss = _env_float("ENTRY_GLOBAL_MAX_DAILY_LOSS_YEN", -10000.0)
     global_max_trades = _env_int("ENTRY_GLOBAL_MAX_DAILY_TRADES", 30)
     global_max_consec_losses = _env_int("ENTRY_GLOBAL_MAX_CONSECUTIVE_LOSSES", 5)
+
+    symbol_seen_entries = max(int(srow.get("entry_count") or 0), int(srow.get("entry_sent_count") or 0))
 
     if global_max_trades > 0 and int(grow.get("trade_count") or 0) >= global_max_trades:
         return True, "GLOBAL_DAILY_TRADE_LIMIT", {"symbol": symbol, "side": side_u, "max_trades": global_max_trades, **grow}
@@ -266,8 +323,9 @@ def _risk_block_reason(symbol: str, side: str) -> Tuple[bool, str, Dict[str, Any
     if global_max_consec_losses > 0 and int(grow.get("consecutive_losses") or 0) >= global_max_consec_losses:
         return True, "GLOBAL_CONSECUTIVE_LOSS_LIMIT", {"symbol": symbol, "side": side_u, "max_consecutive_losses": global_max_consec_losses, **grow}
 
-    if max_entries > 0 and int(srow.get("entry_count") or 0) >= max_entries:
-        return True, "SYMBOL_DAILY_ENTRY_LIMIT", {"symbol": symbol, "side": side_u, "max_entries": max_entries, **srow}
+    if max_entries > 0 and symbol_seen_entries >= max_entries:
+        detail = {"symbol": symbol, "side": side_u, "max_entries": max_entries, "symbol_seen_entries": symbol_seen_entries, **srow}
+        return True, "SYMBOL_DAILY_ENTRY_LIMIT", detail
 
     if stop_after_first_loss and int(srow.get("loss_count") or 0) >= 1:
         return True, "SYMBOL_STOP_AFTER_FIRST_LOSS", {"symbol": symbol, "side": side_u, **srow}
@@ -295,8 +353,10 @@ def install() -> bool:
         logger.warning("[ENTRY DAILY RISK] _execute_best_candidate not callable")
         return False
 
-    if not getattr(old_execute, "_entry_daily_risk_wrapped_v13", False):
+    if not getattr(old_execute, "_entry_daily_risk_wrapped_v14", False):
         def _execute_best_candidate_daily_risk(item: dict, boost_active: bool) -> bool:
+            symbol = ""
+            side = ""
             try:
                 symbol = _norm_symbol(item.get("symbol"))
                 side = str(item.get("side") or "").upper()
@@ -309,12 +369,22 @@ def install() -> bool:
                     return False
             except Exception:
                 logger.exception("[ENTRY DAILY RISK] precheck failed")
-            return old_execute(item, boost_active=boost_active)
-        _execute_best_candidate_daily_risk._entry_daily_risk_wrapped_v13 = True  # type: ignore[attr-defined]
+
+            ok = old_execute(item, boost_active=boost_active)
+
+            try:
+                if bool(ok) and _env_bool("ENTRY_COUNT_SENT_ORDER_AS_DAILY_ENTRY", True):
+                    _record_entry_sent(symbol or item.get("symbol"))
+            except Exception:
+                logger.exception("[ENTRY DAILY RISK] record entry_sent failed symbol=%s", symbol)
+
+            return ok
+
+        _execute_best_candidate_daily_risk._entry_daily_risk_wrapped_v14 = True  # type: ignore[attr-defined]
         _execute_best_candidate_daily_risk._original = old_execute  # type: ignore[attr-defined]
         ec._execute_best_candidate = _execute_best_candidate_daily_risk
 
-    if callable(old_record_exit) and not getattr(old_record_exit, "_entry_daily_actual_trade_wrapped_v13", False):
+    if callable(old_record_exit) and not getattr(old_record_exit, "_entry_daily_actual_trade_wrapped_v14", False):
         def _record_exit_event_daily_actual_trade(symbol: Any, *, pnl: float, reason: str, now=None) -> None:
             try:
                 old_record_exit(symbol, pnl=pnl, reason=reason, now=now)
@@ -323,17 +393,17 @@ def install() -> bool:
                     _record_actual_trade(symbol, float(pnl or 0.0))
                 except Exception:
                     logger.exception("[ENTRY DAILY RISK] record actual trade failed symbol=%s", symbol)
-        _record_exit_event_daily_actual_trade._entry_daily_actual_trade_wrapped_v13 = True  # type: ignore[attr-defined]
+        _record_exit_event_daily_actual_trade._entry_daily_actual_trade_wrapped_v14 = True  # type: ignore[attr-defined]
         _record_exit_event_daily_actual_trade._original = old_record_exit  # type: ignore[attr-defined]
         stg.record_exit_event = _record_exit_event_daily_actual_trade
 
     _INSTALLED = True
     logger.warning(
-        "[ENTRY DAILY RISK] installed v1.3 buy_enabled=%s max_symbol_entries=%s stop_after_first_loss=%s symbol_max_loss=%s global_max_loss=%s global_max_trades=%s global_max_consecutive_losses=%s count_mode=actual_exit_only",
+        "[ENTRY DAILY RISK] installed v1.4 buy_enabled=%s max_symbol_entries=%s stop_after_first_loss=%s symbol_max_loss=%s global_max_loss=%s global_max_trades=%s global_max_consecutive_losses=%s count_mode=entry_sent_and_actual_exit",
         _env_bool("ENTRY_BUY_ENABLED", True),
         _env_int("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", 1),
         _env_bool("ENTRY_STOP_SYMBOL_AFTER_FIRST_LOSS", True),
-        _env_float("ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN", -1000.0),
+        _env_float("ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN", -1500.0),
         _env_float("ENTRY_GLOBAL_MAX_DAILY_LOSS_YEN", -10000.0),
         _env_int("ENTRY_GLOBAL_MAX_DAILY_TRADES", 30),
         _env_int("ENTRY_GLOBAL_MAX_CONSECUTIVE_LOSSES", 5),
