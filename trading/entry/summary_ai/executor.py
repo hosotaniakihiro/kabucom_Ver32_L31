@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/summary_ai/executor.py
-# Version: PRODUCTION-STABLE-REV1.7-BUY-FIRST-MAX10-AFFORDABLE
+# Version: PRODUCTION-STABLE-REV1.8-BUY-FIRST-MAX10-UNIFIED-ENTRY-BUDGET
 # ------------------------------------------------------------
 # 【概要】
 #   AI_OK 銘柄を approved_rows に変換し、
@@ -19,7 +19,8 @@
 #   - AI gate で決まった BUY / SELL side を絶対に破壊しない
 #   - SELL候補は sell_score 優先で評価する
 #   - BUY候補が存在する場合は最大10件までBUYを優先採用する
-#   - 50万円・100株単位で数量0になる高価格銘柄は選抜前に除外する
+#   - entry_budget.py の ENTRY_MIN_PRICE / ENTRY_MAX_PRICE / MAX_ENTRY_ONESHOT_YEN を使う
+#   - 3000円以上7000円以下の価格帯を executor 側でも統一する
 #   - trade_restricted / SELL reject cache 済み銘柄は選抜前に除外する
 #   - 制限中の候補で枠を消費せず、次の候補を採用する
 #   - entry_pipeline の戻り値が None の場合は executed=False にする
@@ -41,9 +42,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_ENTRIES = 10
 DEFAULT_MIN_BUY_APPROVED = 3
 
-# 50万円・100株単位の場合、5000円超は最低100株でも50万円を超える。
-# 例: 5801 58,340円 -> 100株で5,834,000円のため qty=0 になり枠を消費する。
-DEFAULT_MAX_PRICE_FOR_100_SHARE_ENTRY = 5000.0
+# 互換用フォールバック。
+# 通常は trading.entry.entry_budget.get_effective_entry_max_price() を使う。
+DEFAULT_MAX_PRICE_FOR_100_SHARE_ENTRY = 7000.0
+DEFAULT_MIN_PRICE_FOR_ENTRY = 3000.0
 
 
 def _env_int(name: str, default: int) -> int:
@@ -122,20 +124,58 @@ def _pick_price(item: Dict[str, Any]) -> float:
         return 0.0
 
 
-def _max_price_for_100_share_entry() -> float:
+def _entry_price_bounds() -> tuple[float, float, dict[str, Any]]:
     """
-    AI候補選抜前の価格上限。
+    AI候補選抜前の価格レンジ。
 
-    既定:
-      5000円 = 500,000円 / 100株
+    優先:
+      trading.entry.entry_budget の統一設定
 
-    無効化したい場合:
-      SUMMARY_AI_ENTRY_MAX_PRICE_FOR_100_SHARE=0
+    互換:
+      SUMMARY_AI_ENTRY_MIN_PRICE / SUMMARY_AI_ENTRY_MAX_PRICE_FOR_100_SHARE があれば上書き可能
     """
-    return _env_float(
-        "SUMMARY_AI_ENTRY_MAX_PRICE_FOR_100_SHARE",
-        DEFAULT_MAX_PRICE_FOR_100_SHARE_ENTRY,
-    )
+    diag: dict[str, Any] = {"source": "fallback"}
+
+    min_price = DEFAULT_MIN_PRICE_FOR_ENTRY
+    max_price = DEFAULT_MAX_PRICE_FOR_100_SHARE_ENTRY
+
+    try:
+        from trading.entry.entry_budget import (
+            get_entry_min_price,
+            get_entry_max_price,
+            get_effective_entry_max_price,
+            get_max_entry_oneshot_yen,
+            get_order_lot_size,
+        )
+
+        min_price = float(get_entry_min_price())
+        max_price = float(get_effective_entry_max_price() or get_entry_max_price() or DEFAULT_MAX_PRICE_FOR_100_SHARE_ENTRY)
+        diag.update(
+            {
+                "source": "entry_budget",
+                "entry_min_price": min_price,
+                "entry_max_price_effective": max_price,
+                "max_oneshot_yen": float(get_max_entry_oneshot_yen()),
+                "lot_size": int(get_order_lot_size()),
+            }
+        )
+    except Exception:
+        logger.debug("[SUMMARY AI EXECUTOR] entry_budget import failed; use fallback price bounds", exc_info=True)
+
+    # 古い環境変数も互換維持。ただし未設定なら entry_budget を優先する。
+    min_price = _env_float("SUMMARY_AI_ENTRY_MIN_PRICE", min_price)
+    max_price = _env_float("SUMMARY_AI_ENTRY_MAX_PRICE_FOR_100_SHARE", max_price)
+
+    # 新しい名前でも上書き可能。
+    min_price = _env_float("ENTRY_MIN_PRICE", min_price)
+    max_price = _env_float("ENTRY_MAX_PRICE", max_price)
+
+    min_price = max(0.0, float(min_price or 0.0))
+    max_price = max(0.0, float(max_price or 0.0))
+
+    diag["effective_min_price"] = min_price
+    diag["effective_max_price"] = max_price
+    return min_price, max_price, diag
 
 
 def _pick_side(ai_ok_item: Dict[str, Any], ai_row: Dict[str, Any], src: Dict[str, Any]) -> str:
@@ -234,7 +274,7 @@ def _is_sell_reject_cached(symbol: str, side: str) -> tuple[bool, Any]:
 def _filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     AI_OK だが、直前サイクルで取引制限やSELL拒否キャッシュに該当する銘柄を除外する。
-    加えて、最低100株でも50万円枠を超える高価格銘柄を選抜前に除外する。
+    加えて、entry_budget.py の価格帯/最低単元予算を選抜前に適用する。
 
     ここで除外してから max_entries を選ぶことで、通らない候補で枠を消費しない。
     """
@@ -243,20 +283,35 @@ def _filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dict[str
 
     kept: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
-    max_price = _max_price_for_100_share_entry()
+    min_price, max_price, price_diag = _entry_price_bounds()
 
     for item in ok_items:
         symbol = _pick_symbol(item)
         side = _row_side(item)
         price = _pick_price(item)
 
-        if max_price > 0 and price > max_price:
+        if price > 0 and min_price > 0 and price < min_price:
             skipped.append(
                 {
                     "symbol": symbol,
                     "side": side,
-                    "reason": "price_over_100share_cap",
+                    "reason": "price_below_entry_min_price",
                     "price": price,
+                    "min_price": min_price,
+                    "max_price": max_price,
+                    "min_notional_100": round(price * 100, 1),
+                }
+            )
+            continue
+
+        if price > 0 and max_price > 0 and price > max_price:
+            skipped.append(
+                {
+                    "symbol": symbol,
+                    "side": side,
+                    "reason": "price_over_entry_max_price",
+                    "price": price,
+                    "min_price": min_price,
                     "max_price": max_price,
                     "min_notional_100": round(price * 100, 1),
                 }
@@ -277,11 +332,22 @@ def _filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dict[str
 
     if skipped:
         logger.warning(
-            "[SUMMARY AI EXECUTOR] filtered blocked/unaffordable candidates before selection before=%s after=%s max_price=%s skipped=%s",
+            "[SUMMARY AI EXECUTOR] filtered blocked/unaffordable candidates before selection before=%s after=%s min_price=%s max_price=%s price_diag=%s skipped=%s",
             len(ok_items),
             len(kept),
+            min_price,
             max_price,
+            price_diag,
             skipped[:50],
+        )
+    else:
+        logger.info(
+            "[SUMMARY AI EXECUTOR] price range filter passed before=%s after=%s min_price=%s max_price=%s price_diag=%s",
+            len(ok_items),
+            len(kept),
+            min_price,
+            max_price,
+            price_diag,
         )
 
     return kept
@@ -292,7 +358,7 @@ def _select_ai_ok_items(ok_items: List[Dict[str, Any]], *, max_entries: int) -> 
     AI_OK候補を最終approved候補に絞る。
 
     対策:
-      - 高価格でqty=0になる候補は選抜前に除外
+      - 価格帯外/最低単元予算外の候補は選抜前に除外
       - trade_restricted / SELL reject cache 済み銘柄は選抜前に除外
       - BUY候補が存在する場合、最大 max_entries 件までBUYを優先する
       - BUYが足りない場合のみSELLを補欠採用する
@@ -303,7 +369,7 @@ def _select_ai_ok_items(ok_items: List[Dict[str, Any]], *, max_entries: int) -> 
 
     ok_items = _filter_blocked_ai_ok_items(ok_items)
     if not ok_items:
-        logger.warning("[SUMMARY AI EXECUTOR] all AI_OK candidates filtered by trade restriction / reject cache / price cap")
+        logger.warning("[SUMMARY AI EXECUTOR] all AI_OK candidates filtered by trade restriction / reject cache / price range")
         return []
 
     try:
