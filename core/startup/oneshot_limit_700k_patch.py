@@ -1,9 +1,10 @@
 # ============================================================
 # File   : core/startup/oneshot_limit_700k_patch.py
-# Version: Ver07-WIDE-AWARE-ALIGNED-SUMMARY-DISPLAY
+# Version: Ver08-ENTRY-QTY-MINLOT-AND-WIDE-DISPLAY
 # ------------------------------------------------------------
 # 起動時 runtime patches:
 # - 70万円ワンショット制限
+# - ENTRY数量0株の最低100株フォールバック
 # - SUMMARY AI daily risk / executed判定 / 売建不可候補除外
 # - PUSH flush writer 自己復旧
 # - SUMMARY表示ログの数値・列幅整形
@@ -16,6 +17,18 @@ import os
 
 logger = logging.getLogger(__name__)
 _INSTALLED = False
+
+
+def _install_entry_qty_minlot_patch() -> bool:
+    try:
+        os.environ.setdefault("ENTRY_MIN_LOT_FALLBACK_WHEN_AFFORDABLE", "1")
+        from core.startup import entry_qty_min_lot_runtime_patch as p
+        ok = p.install()
+        logger.warning("[ONESHOT LIMIT PATCH] entry_qty_min_lot_runtime_patch installed=%s", ok)
+        return bool(ok)
+    except Exception:
+        logger.exception("[ONESHOT LIMIT PATCH] entry_qty_min_lot_runtime_patch install failed")
+        return False
 
 
 def _install_aligned_summary_display_patch() -> bool:
@@ -223,6 +236,7 @@ def install() -> bool:
         return True
 
     ok_display = _install_aligned_summary_display_patch()
+    ok_qty_minlot = _install_entry_qty_minlot_patch()
     ok_push_flush = _install_push_flush_auto_recover_patch()
 
     ok_main = False
@@ -239,5 +253,5 @@ def install() -> bool:
     ok_executor_result = _install_summary_ai_executor_result_patch()
     ok_sell_credit_prefilter = _install_summary_ai_sell_credit_prefilter_patch()
 
-    _INSTALLED = bool(ok_display or ok_push_flush or ok_main or ok_symbol_risk or ok_executor_result or ok_sell_credit_prefilter)
+    _INSTALLED = bool(ok_display or ok_qty_minlot or ok_push_flush or ok_main or ok_symbol_risk or ok_executor_result or ok_sell_credit_prefilter)
     return _INSTALLED
