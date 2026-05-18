@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/summary_ai/executor.py
-# Version: PRODUCTION-STABLE-REV1.8-BUY-FIRST-MAX10-UNIFIED-ENTRY-BUDGET
+# Version: PRODUCTION-STABLE-REV1.9-BUY-FIRST-DAILY-RISK-PRE-APPROVAL
 # ------------------------------------------------------------
 # 【概要】
 #   AI_OK 銘柄を approved_rows に変換し、
@@ -21,6 +21,7 @@
 #   - BUY候補が存在する場合は最大10件までBUYを優先採用する
 #   - entry_budget.py の ENTRY_MIN_PRICE / ENTRY_MAX_PRICE / MAX_ENTRY_ONESHOT_YEN を使う
 #   - 3000円以上7000円以下の価格帯を executor 側でも統一する
+#   - daily risk により同一銘柄当日1回制限/損失停止済み銘柄は approved 化前に除外する
 #   - trade_restricted / SELL reject cache 済み銘柄は選抜前に除外する
 #   - 制限中の候補で枠を消費せず、次の候補を採用する
 #   - entry_pipeline の戻り値が None の場合は executed=False にする
@@ -46,6 +47,16 @@ DEFAULT_MIN_BUY_APPROVED = 3
 # 通常は trading.entry.entry_budget.get_effective_entry_max_price() を使う。
 DEFAULT_MAX_PRICE_FOR_100_SHARE_ENTRY = 7000.0
 DEFAULT_MIN_PRICE_FOR_ENTRY = 3000.0
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        return bool(default)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -271,10 +282,50 @@ def _is_sell_reject_cached(symbol: str, side: str) -> tuple[bool, Any]:
         return False, None
 
 
+def _daily_risk_block_reason(symbol: str, side: str) -> tuple[bool, str, Dict[str, Any]]:
+    """
+    entry_controller まで流す前に daily risk を事前確認する。
+
+    目的:
+      - 同一銘柄当日1回制限済みの銘柄を pending に入れない
+      - 6266 のような当日損失/発注済み銘柄を AI_OK approved 化前に除外する
+
+    注意:
+      core.startup.entry_daily_risk_runtime_patch の private 関数を利用するが、
+      失敗しても executor 自体は止めない。
+    """
+    if not _env_bool("SUMMARY_AI_PRE_FILTER_DAILY_RISK", True):
+        return False, "", {}
+
+    symbol_s = _norm_symbol(symbol)
+    side_s = _norm_side(side, "BUY")
+    if not symbol_s:
+        return False, "", {}
+
+    try:
+        from core.startup import entry_daily_risk_runtime_patch as daily_risk
+
+        fn = getattr(daily_risk, "_risk_block_reason", None)
+        if callable(fn):
+            blocked, reason, detail = fn(symbol_s, side_s)
+            if blocked:
+                if not isinstance(detail, dict):
+                    detail = {"detail": str(detail)}
+                return True, str(reason or "DAILY_RISK_BLOCK"), dict(detail)
+    except Exception:
+        logger.exception(
+            "[SUMMARY AI EXECUTOR] daily risk precheck failed; fail-open symbol=%s side=%s",
+            symbol_s,
+            side_s,
+        )
+
+    return False, "", {}
+
+
 def _filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     AI_OK だが、直前サイクルで取引制限やSELL拒否キャッシュに該当する銘柄を除外する。
-    加えて、entry_budget.py の価格帯/最低単元予算を選抜前に適用する。
+    加えて、entry_budget.py の価格帯/最低単元予算、daily risk を選抜前に適用する。
 
     ここで除外してから max_entries を選ぶことで、通らない候補で枠を消費しない。
     """
@@ -318,6 +369,26 @@ def _filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dict[str
             )
             continue
 
+        daily_blocked, daily_reason, daily_detail = _daily_risk_block_reason(symbol, side)
+        if daily_blocked:
+            skipped.append(
+                {
+                    "symbol": symbol,
+                    "side": side,
+                    "reason": daily_reason,
+                    "source": "daily_risk_pre_approval",
+                    "detail": daily_detail,
+                }
+            )
+            logger.warning(
+                "[SUMMARY AI EXECUTOR] AI_OK canceled by daily risk symbol=%s side=%s reason=%s detail=%s",
+                symbol,
+                side,
+                daily_reason,
+                daily_detail,
+            )
+            continue
+
         restricted, until = _is_trade_restricted_symbol(symbol)
         if restricted:
             skipped.append({"symbol": symbol, "side": side, "reason": "trade_restricted", "until": str(until)})
@@ -332,7 +403,7 @@ def _filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dict[str
 
     if skipped:
         logger.warning(
-            "[SUMMARY AI EXECUTOR] filtered blocked/unaffordable candidates before selection before=%s after=%s min_price=%s max_price=%s price_diag=%s skipped=%s",
+            "[SUMMARY AI EXECUTOR] filtered blocked/unaffordable/daily-risk candidates before selection before=%s after=%s min_price=%s max_price=%s price_diag=%s skipped=%s",
             len(ok_items),
             len(kept),
             min_price,
@@ -342,7 +413,7 @@ def _filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dict[str
         )
     else:
         logger.info(
-            "[SUMMARY AI EXECUTOR] price range filter passed before=%s after=%s min_price=%s max_price=%s price_diag=%s",
+            "[SUMMARY AI EXECUTOR] price/daily-risk filter passed before=%s after=%s min_price=%s max_price=%s price_diag=%s",
             len(ok_items),
             len(kept),
             min_price,
@@ -359,6 +430,7 @@ def _select_ai_ok_items(ok_items: List[Dict[str, Any]], *, max_entries: int) -> 
 
     対策:
       - 価格帯外/最低単元予算外の候補は選抜前に除外
+      - daily risk 対象銘柄は approved 化前に除外
       - trade_restricted / SELL reject cache 済み銘柄は選抜前に除外
       - BUY候補が存在する場合、最大 max_entries 件までBUYを優先する
       - BUYが足りない場合のみSELLを補欠採用する
@@ -369,7 +441,7 @@ def _select_ai_ok_items(ok_items: List[Dict[str, Any]], *, max_entries: int) -> 
 
     ok_items = _filter_blocked_ai_ok_items(ok_items)
     if not ok_items:
-        logger.warning("[SUMMARY AI EXECUTOR] all AI_OK candidates filtered by trade restriction / reject cache / price range")
+        logger.warning("[SUMMARY AI EXECUTOR] all AI_OK candidates filtered by daily risk / trade restriction / reject cache / price range")
         return []
 
     try:
