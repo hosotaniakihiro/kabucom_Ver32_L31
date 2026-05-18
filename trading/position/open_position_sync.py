@@ -1,9 +1,15 @@
 # ============================================================
 # File   : trading/position/open_position_sync.py
-# Version: V1.1-PRODUCTION-OPEN-POSITION-SYNC-NON-CLOSED
+# Version: V1.2-BROKER-AUTHORITATIVE-GUARD-NO-STALE-DB-RESYNC
 # ------------------------------------------------------------
 # 【目的】
 #   既にエントリー済み/約定待ち/保有中の銘柄を Python 側の共通キャッシュへ同期する。
+#
+# 【重要修正 V1.2】
+#   - broker API が正常に読めている場合、positions.db の古い残骸を再同期しない
+#   - open_position_broker_merge_patch が 4324/6752 等の実建玉を正として反映した直後に、
+#     旧 sync 参照から 9716 などのDB残骸が global_data.open_positions へ戻る事故を防止
+#   - broker authoritative 中は DB scan のログは出しても、global_data/GC への publish は行わない
 #
 # 【重要修正 V1.1】
 #   - status='OPEN' だけではなく、CLOSED/EXITED/CANCELED 以外も監視対象に含める
@@ -13,8 +19,7 @@
 # 【方針】
 #   - qty > 0 の未クローズ行を読み込む
 #   - avg_price が0でも、price があれば entry_price に使う
-#   - global_data.open_positions に必ず同期する
-#   - DBで見えている未クローズ銘柄は protected 対象にする
+#   - broker authoritative 中は DB由来建玉を同期しない
 # ============================================================
 
 from __future__ import annotations
@@ -127,6 +132,33 @@ def _ensure_global_open_positions() -> Dict[str, Dict[str, Any]]:
     except Exception:
         logger.debug("[OPEN POSITION SYNC] ensure global_data.open_positions failed", exc_info=True)
         return {}
+
+
+def _current_global_positions_copy() -> Dict[str, Dict[str, Any]]:
+    try:
+        positions = getattr(global_data, "open_positions", None)
+        if isinstance(positions, dict):
+            return dict(positions)
+    except Exception:
+        pass
+    return {}
+
+
+def _broker_authoritative_active() -> bool:
+    """
+    broker API が正常に読めている場合は、positions.db の古いOPEN残骸を再投入しない。
+
+    open_position_broker_merge_patch 側が global_data.open_positions_source_mode / broker_read_ok を設定する。
+    この関数は、古い関数参照から sync_open_positions_from_db が直接呼ばれても、DB残骸を publish しないための安全弁。
+    """
+    try:
+        read_ok = bool(getattr(global_data, "open_positions_broker_read_ok", False))
+        mode = str(getattr(global_data, "open_positions_source_mode", "") or "")
+        if read_ok and mode.startswith("broker_credit_authoritative"):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _position_model_to_dict(p: Any) -> Dict[str, Any]:
@@ -285,6 +317,25 @@ def _sync_to_gc_positions(positions: Dict[str, Dict[str, Any]]) -> None:
 def sync_open_positions_from_db(*, force_log: bool = False) -> Dict[str, Dict[str, Any]]:
     """DBの未クローズ建玉を global_data / GC に同期して返す。"""
     db_positions = load_open_positions_from_db()
+
+    if _broker_authoritative_active():
+        current = _current_global_positions_copy()
+        try:
+            global_data.open_positions_db_sync_skipped_broker_authoritative = True
+            global_data.open_positions_db_sync_skipped_at = dt.datetime.now()
+            global_data.open_positions_db_seen_count = len(db_positions)
+            global_data.open_positions_db_seen_symbols = sorted(db_positions.keys())
+        except Exception:
+            pass
+        if force_log or db_positions:
+            logger.warning(
+                "[OPEN POSITION SYNC] DB publish skipped because broker authoritative active db_count=%s db_symbols=%s current_symbols=%s",
+                len(db_positions),
+                sorted(db_positions.keys()),
+                sorted(current.keys()),
+            )
+        return current
+
     gd_positions = _ensure_global_open_positions()
 
     changed = 0
@@ -311,6 +362,7 @@ def sync_open_positions_from_db(*, force_log: bool = False) -> Dict[str, Dict[st
     try:
         global_data.open_positions_synced_at = dt.datetime.now()
         global_data.open_positions_synced_count = len(db_positions)
+        global_data.open_positions_db_sync_skipped_broker_authoritative = False
     except Exception:
         pass
 
