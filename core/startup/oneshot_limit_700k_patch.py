@@ -1,11 +1,12 @@
 # ============================================================
 # File   : core/startup/oneshot_limit_700k_patch.py
-# Version: Ver04-ONESHOT-LIMIT-700K-AND-SUMMARY-AI-PATCHES
+# Version: Ver05-PUSH-FLUSH-AUTO-RECOVER-AND-SUMMARY-AI-PATCHES
 # ------------------------------------------------------------
 # kabu_api.buy_sell_entry.MAX_ONESHOT を起動時に 700,000 円へ変更する。
 # SUMMARY AI の daily risk 事前除外を銘柄単位に限定する。
 # SUMMARY AI executor の executed 誤判定を補正する。
 # SUMMARY AI のSELL候補から売建不可銘柄を候補前除外する。
+# PUSH受信中にflush writerが止まった場合、monitor側で自己復旧する。
 # ============================================================
 
 from __future__ import annotations
@@ -16,6 +17,19 @@ import os
 logger = logging.getLogger(__name__)
 
 _INSTALLED = False
+
+
+def _install_push_flush_auto_recover_patch() -> bool:
+    try:
+        os.environ.setdefault("PUSH_STREAM_AUTO_RECOVER_FLUSH", "1")
+        from core.startup import push_flush_auto_recover_patch as p
+
+        ok = p.install()
+        logger.warning("[ONESHOT LIMIT PATCH] push_flush_auto_recover_patch installed=%s", ok)
+        return bool(ok)
+    except Exception:
+        logger.exception("[ONESHOT LIMIT PATCH] push_flush_auto_recover_patch install failed")
+        return False
 
 
 def _install_summary_ai_symbol_risk_patch() -> bool:
@@ -65,6 +79,8 @@ def install() -> bool:
     if _INSTALLED:
         return True
 
+    ok_push_flush = _install_push_flush_auto_recover_patch()
+
     ok_main = False
     try:
         from kabu_api import buy_sell_entry as bse
@@ -85,5 +101,5 @@ def install() -> bool:
     ok_executor_result = _install_summary_ai_executor_result_patch()
     ok_sell_credit_prefilter = _install_summary_ai_sell_credit_prefilter_patch()
 
-    _INSTALLED = bool(ok_main or ok_symbol_risk or ok_executor_result or ok_sell_credit_prefilter)
+    _INSTALLED = bool(ok_push_flush or ok_main or ok_symbol_risk or ok_executor_result or ok_sell_credit_prefilter)
     return _INSTALLED
