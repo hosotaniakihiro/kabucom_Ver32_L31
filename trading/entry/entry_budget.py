@@ -1,29 +1,35 @@
 # ============================================================
 # File   : trading/entry/entry_budget.py
-# Version: PRODUCTION-ENTRY-BUDGET-CONFIG-V1
+# Version: PRODUCTION-ENTRY-BUDGET-CONFIG-V2-PRICE-RANGE-3000-7000
 # ------------------------------------------------------------
 # 目的:
-#   エントリー1回あたりの予算・最低株数・価格上限を一元管理する。
+#   エントリー1回あたりの予算・最低株数・価格帯上限/下限を一元管理する。
 #
 # 背景:
 #   50万円 / 100株単位の場合、株価が5000円を超える銘柄は
 #   最低100株でも50万円を超えるため、最終的に qty=0 で落ちる。
 #   それをAI判定後に落とすとAI枠を無駄に消費する。
 #
+# 重要修正 V2:
+#   - エントリー対象価格帯を明示管理する
+#   - 既定は ENTRY_MIN_PRICE=3000 / ENTRY_MAX_PRICE=7000
+#   - MAX_ENTRY_ONESHOT_YEN 既定を 700000 に統一
+#   - can_afford_min_lot() で 3000円未満/7000円超をAI前に除外する
+#
 # 方針:
 #   - MAX_ENTRY_ONESHOT_YEN を増額すれば、AI前価格上限も自動で変わる
+#   - ENTRY_MAX_PRICE が設定されている場合は、予算上限と価格帯上限の小さい方を使う
+#   - ENTRY_MIN_PRICE で低価格株を除外する
 #   - ORDER_LOT_SIZE を変更しても、同じ計算式で追随する
 #   - ENVで一時上書きも可能
 #   - config.global_config が読める場合はそこを優先
 #
 # 主な設定:
-#   MAX_ENTRY_ONESHOT_YEN 既定 500000
+#   MAX_ENTRY_ONESHOT_YEN 既定 700000
 #   ORDER_LOT_SIZE        既定 100
+#   ENTRY_MIN_PRICE       既定 3000
+#   ENTRY_MAX_PRICE       既定 7000
 #   ENTRY_AFFORDABILITY_FILTER_ENABLED 既定 1
-#
-# 例:
-#   予算 500,000 / 100株 -> 最大価格 5,000円
-#   予算 1,000,000 / 100株 -> 最大価格 10,000円
 # ============================================================
 
 from __future__ import annotations
@@ -35,8 +41,10 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MAX_ENTRY_ONESHOT_YEN = 500_000.0
+DEFAULT_MAX_ENTRY_ONESHOT_YEN = 700_000.0
 DEFAULT_ORDER_LOT_SIZE = 100
+DEFAULT_ENTRY_MIN_PRICE = 3_000.0
+DEFAULT_ENTRY_MAX_PRICE = 7_000.0
 
 
 def _safe_float(v: Any, default: float) -> float:
@@ -106,6 +114,16 @@ def get_order_lot_size(default: int = DEFAULT_ORDER_LOT_SIZE) -> int:
     return v if v > 0 else int(default)
 
 
+def get_entry_min_price(default: float = DEFAULT_ENTRY_MIN_PRICE) -> float:
+    v = _safe_float(_cfg("ENTRY_MIN_PRICE", default), default)
+    return max(0.0, float(v))
+
+
+def get_entry_max_price(default: float = DEFAULT_ENTRY_MAX_PRICE) -> float:
+    v = _safe_float(_cfg("ENTRY_MAX_PRICE", default), default)
+    return max(0.0, float(v))
+
+
 def is_affordability_filter_enabled(default: bool = True) -> bool:
     v = _cfg("ENTRY_AFFORDABILITY_FILTER_ENABLED", "1" if default else "0")
     s = str(v).strip().lower()
@@ -125,7 +143,7 @@ def get_max_affordable_price_for_min_lot(
     最低1単元を買える最大価格を返す。
 
     例:
-      budget=500000, lot=100 -> 5000
+      budget=700000, lot=100 -> 7000
       budget=1000000, lot=100 -> 10000
     """
     budget = get_max_entry_oneshot_yen() if budget_yen is None else _safe_float(budget_yen, DEFAULT_MAX_ENTRY_ONESHOT_YEN)
@@ -137,49 +155,89 @@ def get_max_affordable_price_for_min_lot(
     return float(budget) / float(lot)
 
 
+def get_effective_entry_max_price() -> float:
+    """
+    実際にAI前フィルタで使う価格上限。
+
+    ENTRY_MAX_PRICE と 最低1単元を買える価格上限 の小さい方を使う。
+    これにより、7000円以下を希望していても、予算が不足する場合は安全側に倒す。
+    """
+    configured_max = get_entry_max_price()
+    affordable_max = get_max_affordable_price_for_min_lot()
+
+    vals = [x for x in (configured_max, affordable_max) if x and x > 0]
+    if not vals:
+        return 0.0
+    return float(min(vals))
+
+
 def can_afford_min_lot(price: Any) -> tuple[bool, dict[str, Any]]:
     """
-    指定価格で最低1単元を買えるかを判定する。
+    指定価格でエントリー対象価格帯かつ最低1単元を買えるかを判定する。
     BUY/SELLとも新規建ての最低発注単位チェックとして使う。
     """
     p = _safe_float(price, 0.0)
     budget = get_max_entry_oneshot_yen()
     lot = get_order_lot_size()
-    max_price = get_max_affordable_price_for_min_lot(budget_yen=budget, lot_size=lot)
+    min_price = get_entry_min_price()
+    configured_max_price = get_entry_max_price()
+    affordable_max_price = get_max_affordable_price_for_min_lot(budget_yen=budget, lot_size=lot)
+    effective_max_price = get_effective_entry_max_price()
     min_notional = p * lot if p > 0 else 0.0
 
-    if not is_affordability_filter_enabled(default=True):
-        return True, {
-            "enabled": False,
-            "price": p,
-            "budget_yen": budget,
-            "lot_size": lot,
-            "max_price": max_price,
-            "min_notional": min_notional,
-        }
-
-    ok = bool(p <= 0 or p <= max_price)
-    return ok, {
-        "enabled": True,
+    diag = {
+        "enabled": is_affordability_filter_enabled(default=True),
         "price": p,
         "budget_yen": budget,
         "lot_size": lot,
-        "max_price": max_price,
+        "min_price": min_price,
+        "configured_max_price": configured_max_price,
+        "affordable_max_price": affordable_max_price,
+        "max_price": effective_max_price,
         "min_notional": min_notional,
     }
+
+    if not is_affordability_filter_enabled(default=True):
+        diag["enabled"] = False
+        diag["reason"] = "filter_disabled"
+        return True, diag
+
+    if p <= 0:
+        diag["reason"] = "price_missing_allow"
+        return True, diag
+
+    if min_price > 0 and p < min_price:
+        diag["reason"] = "price_below_entry_min_price"
+        return False, diag
+
+    if effective_max_price > 0 and p > effective_max_price:
+        if configured_max_price > 0 and p > configured_max_price:
+            diag["reason"] = "price_over_entry_max_price"
+        else:
+            diag["reason"] = "price_over_budget_for_min_lot"
+        return False, diag
+
+    diag["reason"] = "ok"
+    return True, diag
 
 
 def log_entry_budget_config(prefix: str = "[ENTRY BUDGET]") -> None:
     try:
         budget = get_max_entry_oneshot_yen()
         lot = get_order_lot_size()
-        max_price = get_max_affordable_price_for_min_lot(budget_yen=budget, lot_size=lot)
+        affordable_max = get_max_affordable_price_for_min_lot(budget_yen=budget, lot_size=lot)
+        min_price = get_entry_min_price()
+        configured_max = get_entry_max_price()
+        effective_max = get_effective_entry_max_price()
         logger.warning(
-            "%s max_oneshot_yen=%.0f lot_size=%s max_affordable_price=%.2f affordability_filter=%s",
+            "%s max_oneshot_yen=%.0f lot_size=%s min_price=%.2f configured_max_price=%.2f affordable_max_price=%.2f effective_max_price=%.2f affordability_filter=%s",
             prefix,
             budget,
             lot,
-            max_price,
+            min_price,
+            configured_max,
+            affordable_max,
+            effective_max,
             is_affordability_filter_enabled(default=True),
         )
     except Exception:
