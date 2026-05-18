@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/writers.py
-# Version: Ver1.1-PRODUCTION-PUSH-STREAM-WRITERS-SINGLETON
+# Version: Ver1.2-PRODUCTION-PUSH-STREAM-WRITERS-NO-DROP-RETRY
 # ------------------------------------------------------------
 # 【概要】
 #   push_stream package 用 writer / queue / flush worker
@@ -11,16 +11,11 @@
 #   - startup 側で起動済みの trading.push.push_db_writer.stream_writer singleton を優先使用
 #   - StreamDBWriter のインスタンス分裂を防止
 #
-# 【主な機能】
-#   ✔ queue put
-#   ✔ batch flush
-#   ✔ StreamDBWriter.add_push_row 対応
-#   ✔ add_row 互換対応
-#   ✔ flush() 対応
-#   ✔ OrderBook writer 連携維持
-#   ✔ flush profile log
-#   ✔ runtime flag 更新
-#   ✔ production safe
+# 【重要修正 Ver1.2】
+#   - stream_writer が None のとき、flush失敗で batch を捨てない
+#   - writer を遅延再初期化してから再flushする
+#   - flush失敗時は取得済み batch を queue に戻す
+#   - total_flushed=0 / queue肥大化の原因をログで見える化
 # ============================================================
 
 from __future__ import annotations
@@ -55,11 +50,6 @@ def _init_stream_writer() -> Any:
     重要:
       startup 側で trading.push.push_db_writer.stream_writer singleton を
       起動しているため、ここでも同じ singleton を優先使用する。
-
-    これをしないと、
-      startup 側 writer
-      push_stream 側 writer
-    が分裂し、起動状態や flush 経路が不安定になる。
     """
     try:
         from trading.push import push_db_writer as mod
@@ -75,6 +65,13 @@ def _init_stream_writer() -> Any:
         cls = getattr(mod, "StreamDBWriter", None)
         if callable(cls):
             writer = cls()
+            try:
+                # 実装によっては start() が必要。
+                start = getattr(writer, "start", None)
+                if callable(start):
+                    start()
+            except Exception:
+                logger.debug("[push_stream] created StreamDBWriter start skipped/failed", exc_info=True)
             logger.warning(
                 "[push_stream] singleton stream_writer missing -> created new StreamDBWriter"
             )
@@ -86,12 +83,26 @@ def _init_stream_writer() -> Any:
     return None
 
 
+def _ensure_stream_writer() -> Any:
+    """flush時点で writer が無ければ再取得する。"""
+    try:
+        if state._stream_writer is not None:
+            return state._stream_writer
+        writer = _init_stream_writer()
+        state._stream_writer = writer
+        if writer is None:
+            logger.error("[push_stream] stream writer still unavailable after re-init")
+        else:
+            logger.warning("[push_stream] stream writer re-initialized writer=%s", type(writer).__name__)
+        return writer
+    except Exception:
+        logger.exception("[push_stream] ensure stream writer failed")
+        return None
+
+
 def _init_order_book_writer() -> Any:
     """
     OrderBook writer を取得する。
-
-    StreamDBWriter 側にも OrderBookDBWriter が統合されているが、
-    旧互換のため push_stream 側の order_book_writer も維持する。
     """
     try:
         if OrderBookDBWriter is not None:
@@ -135,6 +146,33 @@ def _queue_put(row: dict) -> None:
         )
 
 
+def _requeue_rows(rows: List[dict], *, reason: str) -> int:
+    """flush失敗時、取得済み batch を捨てずに queue へ戻す。"""
+    if not rows:
+        return 0
+
+    requeued = 0
+    dropped = 0
+    for row in rows:
+        try:
+            state._push_queue.put_nowait(row)
+            requeued += 1
+        except queue.Full:
+            dropped += 1
+            state._total_dropped += 1
+
+    logger.error(
+        "[push_stream] flush batch requeued reason=%s rows=%d requeued=%d dropped=%d queue=%d total_dropped=%d",
+        reason,
+        len(rows),
+        requeued,
+        dropped,
+        state._push_queue.qsize(),
+        state._total_dropped,
+    )
+    return requeued
+
+
 # ============================================================
 # flush
 # ============================================================
@@ -146,7 +184,8 @@ def _flush_rows(rows: List[dict]) -> bool:
     ok = True
 
     try:
-        if state._stream_writer is None:
+        writer = _ensure_stream_writer()
+        if writer is None:
             logger.error("[push_stream] stream writer missing rows=%d", len(rows))
             return False
 
@@ -154,17 +193,17 @@ def _flush_rows(rows: List[dict]) -> bool:
 
         for row in rows:
             try:
-                if hasattr(state._stream_writer, "add_push_row"):
-                    state._stream_writer.add_push_row(row)
+                if hasattr(writer, "add_push_row"):
+                    writer.add_push_row(row)
                     added += 1
-                elif hasattr(state._stream_writer, "add_row"):
-                    state._stream_writer.add_row(row)
+                elif hasattr(writer, "add_row"):
+                    writer.add_row(row)
                     added += 1
                 else:
                     ok = False
                     logger.error(
                         "[push_stream] stream writer has no add method writer=%s",
-                        type(state._stream_writer).__name__,
+                        type(writer).__name__,
                     )
                     break
             except Exception:
@@ -174,16 +213,17 @@ def _flush_rows(rows: List[dict]) -> bool:
                     row.get("symbol"),
                 )
 
-        if ok and hasattr(state._stream_writer, "flush"):
-            result = state._stream_writer.flush()
+        if ok and hasattr(writer, "flush"):
+            result = writer.flush()
             if result is False:
                 ok = False
 
         logger.debug(
-            "[push_stream] stream writer batch add rows=%d added=%d ok=%s",
+            "[push_stream] stream writer batch add rows=%d added=%d ok=%s writer=%s",
             len(rows),
             added,
             ok,
+            type(writer).__name__,
         )
 
     except Exception:
@@ -214,13 +254,16 @@ def _flush_rows(rows: List[dict]) -> bool:
         state._total_flushed += len(rows)
         state._last_flush_at = _now()
         _safe_set_runtime("last_push_db_flush_at", _safe_iso(state._last_flush_at))
+        _safe_set_runtime("push_writer_last_ok", True)
         logger.info(
-            "[push_stream] flushed %d rows -> stream_data total_flushed=%d",
+            "[push_stream] flushed %d rows -> stream_data total_flushed=%d queue=%d",
             len(rows),
             state._total_flushed,
+            state._push_queue.qsize(),
         )
     else:
-        logger.error("[push_stream] flush failed rows=%d", len(rows))
+        _safe_set_runtime("push_writer_last_ok", False)
+        logger.error("[push_stream] flush failed rows=%d queue=%d", len(rows), state._push_queue.qsize())
 
     return ok
 
@@ -231,6 +274,7 @@ def _flush_worker() -> None:
 
     batch: List[dict] = []
     last_flush_ts = time.time()
+    consecutive_failures = 0
 
     while not state._stop_event.is_set():
         try:
@@ -247,17 +291,31 @@ def _flush_worker() -> None:
             )
 
             if should_flush:
-                _flush_rows(batch)
-                batch = []
-                last_flush_ts = now_ts
+                ok = _flush_rows(batch)
+                if ok:
+                    batch = []
+                    consecutive_failures = 0
+                    last_flush_ts = now_ts
+                else:
+                    consecutive_failures += 1
+                    _requeue_rows(batch, reason=f"flush_failed_{consecutive_failures}")
+                    batch = []
+                    last_flush_ts = time.time()
+                    time.sleep(min(5.0, 0.5 * consecutive_failures))
 
         except Exception:
-            logger.exception("[push_stream] flush worker loop failed")
-            time.sleep(0.5)
+            consecutive_failures += 1
+            logger.exception("[push_stream] flush worker loop failed failures=%d", consecutive_failures)
+            if batch:
+                _requeue_rows(batch, reason="worker_exception")
+                batch = []
+            time.sleep(min(5.0, 0.5 * consecutive_failures))
 
     try:
         if batch:
-            _flush_rows(batch)
+            ok = _flush_rows(batch)
+            if not ok:
+                _requeue_rows(batch, reason="final_flush_failed")
     except Exception:
         logger.exception("[push_stream] final flush failed")
 
