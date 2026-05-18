@@ -1,15 +1,14 @@
 # ============================================================
 # File   : core/startup/low_movement_entry_guard_patch.py
-# Version: Ver02-LOW-MOVEMENT-AND-RANKING-DIRECTION-GUARD
+# Version: Ver03-RELAX-SLOPE-WHEN-RANGE-IS-LARGE
 # ------------------------------------------------------------
 # あまり動かない銘柄へのエントリーを発注直前で止める。
 # さらに、ランキング方向に逆らうエントリーも禁止する。
 #
-# 仕様:
-#   - 1,500〜2,999円: 高安幅/価格 >= 1.50% を要求
-#   - 3,000〜7,000円: 高安幅/価格 >= 0.80% を要求
-#   - 下落率ランキング/下落優勢銘柄への BUY を禁止
-#   - 上昇率ランキング/上昇優勢銘柄への SELL を禁止
+# 修正:
+#   - ATR/高安幅が十分大きい銘柄まで slope=0 扱いで落としていたため、
+#     range_pct が十分大きい場合は slope_too_small では落とさない。
+#   - これにより 3640 / 6480 / 6369 のような ATR OK 銘柄を過剰除外しない。
 # ============================================================
 
 from __future__ import annotations
@@ -112,6 +111,7 @@ def _low_movement_guard(entry_row: Any) -> bool:
     range_pct = (high - low) / close if close > 0 else 0.0
     split = _env_float("LOW_MOVE_TIER_SPLIT_PRICE", 3000.0)
     min_range_pct = _env_float("LOW_MOVE_MIN_RANGE_PCT_LOW_PRICE", 0.015) if close < split else _env_float("LOW_MOVE_MIN_RANGE_PCT_HIGH_PRICE", 0.008)
+    strong_range_pct = _env_float("LOW_MOVE_STRONG_RANGE_PCT", 0.020)
 
     if range_pct < min_range_pct:
         logger.warning("[LOW MOVE GUARD] NG symbol=%s reason=range_too_small close=%.1f high=%.1f low=%.1f range_pct=%.4f min=%.4f", symbol, close, high, low, range_pct, min_range_pct)
@@ -122,21 +122,25 @@ def _low_movement_guard(entry_row: Any) -> bool:
         if k in row:
             slope_values.append(_safe_float(row.get(k), 0.0))
 
-    if slope_values:
-        abs_slope = max(abs(x) for x in slope_values)
-        min_abs_slope = _env_float("LOW_MOVE_MIN_ABS_SLOPE_LOW_PRICE", 0.0008) if close < split else _env_float("LOW_MOVE_MIN_ABS_SLOPE_HIGH_PRICE", 0.0004)
-        if abs_slope < min_abs_slope:
-            logger.warning("[LOW MOVE GUARD] NG symbol=%s reason=slope_too_small close=%.1f abs_slope=%.6f min=%.6f range_pct=%.4f", symbol, close, abs_slope, min_abs_slope, range_pct)
-            return False
-
     macd = _safe_float(row.get("macd"), 0.0)
     signal = _safe_float(row.get("signal"), 0.0)
     max_abs_slope = max([abs(x) for x in slope_values], default=0.0)
-    if abs(macd) < 0.0001 and abs(signal) < 0.0001 and max_abs_slope < 0.0001:
-        logger.warning("[LOW MOVE GUARD] NG symbol=%s reason=no_momentum macd=%.6f signal=%.6f slope=%.6f range_pct=%.4f", symbol, macd, signal, max_abs_slope, range_pct)
+
+    if slope_values:
+        abs_slope = max_abs_slope
+        min_abs_slope = _env_float("LOW_MOVE_MIN_ABS_SLOPE_LOW_PRICE", 0.0003) if close < split else _env_float("LOW_MOVE_MIN_ABS_SLOPE_HIGH_PRICE", 0.0002)
+        if abs_slope < min_abs_slope and range_pct < strong_range_pct:
+            logger.warning("[LOW MOVE GUARD] NG symbol=%s reason=slope_too_small close=%.1f abs_slope=%.6f min=%.6f range_pct=%.4f strong_range=%.4f", symbol, close, abs_slope, min_abs_slope, range_pct, strong_range_pct)
+            return False
+        if abs_slope < min_abs_slope and range_pct >= strong_range_pct:
+            logger.warning("[LOW MOVE GUARD] slope small but allowed by strong range symbol=%s close=%.1f abs_slope=%.6f min=%.6f range_pct=%.4f strong_range=%.4f", symbol, close, abs_slope, min_abs_slope, range_pct, strong_range_pct)
+
+    # 完全無動意は除外。ただし高安幅が2%以上ある場合は、slope欠損/丸め0の可能性があるため通す。
+    if abs(macd) < 0.0001 and abs(signal) < 0.0001 and max_abs_slope < 0.0001 and range_pct < strong_range_pct:
+        logger.warning("[LOW MOVE GUARD] NG symbol=%s reason=no_momentum macd=%.6f signal=%.6f slope=%.6f range_pct=%.4f strong_range=%.4f", symbol, macd, signal, max_abs_slope, range_pct, strong_range_pct)
         return False
 
-    logger.info("[LOW MOVE GUARD] OK symbol=%s close=%.1f range_pct=%.4f min_range=%.4f macd=%.4f signal=%.4f max_abs_slope=%.6f", symbol, close, range_pct, min_range_pct, macd, signal, max_abs_slope)
+    logger.info("[LOW MOVE GUARD] OK symbol=%s close=%.1f range_pct=%.4f min_range=%.4f strong_range=%.4f macd=%.4f signal=%.4f max_abs_slope=%.6f", symbol, close, range_pct, min_range_pct, strong_range_pct, macd, signal, max_abs_slope)
     return True
 
 
@@ -193,7 +197,7 @@ def install() -> bool:
         ec.atr_1m_filter = _patched_atr_1m_filter
         ec.range_5m_filter = _patched_range_5m_filter
         _INSTALLED = True
-        logger.warning("[LOW MOVE GUARD] installed low_range=%.4f high_range=%.4f low_slope=%.6f high_slope=%.6f ranking_direction=%s", _env_float("LOW_MOVE_MIN_RANGE_PCT_LOW_PRICE", 0.015), _env_float("LOW_MOVE_MIN_RANGE_PCT_HIGH_PRICE", 0.008), _env_float("LOW_MOVE_MIN_ABS_SLOPE_LOW_PRICE", 0.0008), _env_float("LOW_MOVE_MIN_ABS_SLOPE_HIGH_PRICE", 0.0004), ok_direction)
+        logger.warning("[LOW MOVE GUARD] installed low_range=%.4f high_range=%.4f low_slope=%.6f high_slope=%.6f strong_range=%.4f ranking_direction=%s", _env_float("LOW_MOVE_MIN_RANGE_PCT_LOW_PRICE", 0.015), _env_float("LOW_MOVE_MIN_RANGE_PCT_HIGH_PRICE", 0.008), _env_float("LOW_MOVE_MIN_ABS_SLOPE_LOW_PRICE", 0.0003), _env_float("LOW_MOVE_MIN_ABS_SLOPE_HIGH_PRICE", 0.0002), _env_float("LOW_MOVE_STRONG_RANGE_PCT", 0.020), ok_direction)
         return True
     except Exception:
         logger.exception("[LOW MOVE GUARD] install failed")
