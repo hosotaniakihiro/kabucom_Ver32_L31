@@ -6,13 +6,15 @@
 #   - 列揺れ吸収
 #   - symbol / 数値 / テキスト整形
 #   - Discord用 1銘柄2行フォーマット生成
+#   - score_config.ini の買い/売りサインを日本語で表示
 # ------------------------------------------------------------
-# Version: Ver1.1-PRODUCTION-DISPLAY-SPLIT-BASE-DISCORD-2LINES
+# Version: Ver1.2-SCORING-SIGNAL-JAPANESE-DISPLAY
 # ============================================================
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Iterable, List, Optional
 
 import numpy as np
@@ -139,7 +141,7 @@ def first_existing(row: pd.Series, names: Iterable[str], default=None):
 
 def to_float(v: Any, default: float = 0.0) -> float:
     try:
-        if v is None or (isinstance(v, str) and v.strip() == ""):
+        if v is None or (isinstance(v, str) and str(v).strip() == ""):
             return default
         if pd.isna(v):
             return default
@@ -288,6 +290,30 @@ def print_line(s: str) -> None:
 
 
 # ============================================================
+# scoring.ini / score_config.ini サイン表示 helper
+# ============================================================
+
+def _active_scoring_signal_text(row: pd.Series, side: str) -> str:
+    try:
+        from scheduler_jobs.summary.scoring_signal_japanese import format_active_scoring_signals
+        max_items = int(float(os.getenv("SUMMARY_DISPLAY_SIGNAL_MAX_ITEMS", "999")))
+        return format_active_scoring_signals(row, side=side, max_items=max_items)
+    except Exception:
+        logger.debug("[SUMMARY DISPLAY] active scoring signal text failed", exc_info=True)
+        return ""
+
+
+def _score_config_catalog_text(side: str) -> str:
+    try:
+        from scheduler_jobs.summary.scoring_signal_japanese import format_score_config_catalog
+        max_items = int(float(os.getenv("SUMMARY_DISPLAY_SIGNAL_CATALOG_MAX_ITEMS", "999")))
+        return format_score_config_catalog(side=side, max_items=max_items)
+    except Exception:
+        logger.debug("[SUMMARY DISPLAY] score config catalog text failed", exc_info=True)
+        return ""
+
+
+# ============================================================
 # Discord用 helper
 # ============================================================
 
@@ -299,71 +325,62 @@ def _discord_reason(row: pd.Series, side: str = "BUY") -> str:
       BUY  : reason_buy / buy_reason / reason
       SELL : reason_sell / sell_reason / reason
 
-    reason列が無い場合は、
-    score_buy / score_sell / slope / macd / rsi から簡易生成する。
+    さらに score_config.ini / scoring.ini 由来のONフラグがあれば
+    日本語の「買いサイン=...」「売りサイン=...」を追加する。
     """
 
     side_u = str(side or "BUY").upper()
 
     if side_u == "SELL":
-        reason = first_existing(
-            row,
-            ["reason_sell", "sell_reason", "reason", "理由_SELL", "理由"],
-            "",
-        )
+        reason = first_existing(row, ["reason_sell", "sell_reason", "reason", "理由_SELL", "理由"], "")
     else:
-        reason = first_existing(
-            row,
-            ["reason_buy", "buy_reason", "reason", "理由_BUY", "理由"],
-            "",
-        )
+        reason = first_existing(row, ["reason_buy", "buy_reason", "reason", "理由_BUY", "理由"], "")
 
     if reason not in ("", "-", None):
-        return str(reason)
-
-    reasons: List[str] = []
-
-    buy = to_float(first_existing(row, ["score_buy", "disp_buy_score", "buy"], 0.0), 0.0)
-    sell = to_float(first_existing(row, ["score_sell", "disp_sell_score", "sell"], 0.0), 0.0)
-    slope = to_float(first_existing(row, ["slope", "disp_slope", "score_slope", "slope_atr_scaled"], 0.0), 0.0)
-    macd = to_float(first_existing(row, ["macd"], 0.0), 0.0)
-    rsi = to_float(first_existing(row, ["rsi"], 0.0), 0.0)
-
-    if side_u == "SELL":
-        if sell >= buy:
-            reasons.append("売りスコア優勢")
-        if slope <= 0:
-            reasons.append("下向き")
-        if macd <= 0:
-            reasons.append("MACD弱化")
-        if rsi <= 45:
-            reasons.append("RSI弱い")
+        base_reason = str(reason)
     else:
-        if buy >= sell:
-            reasons.append("買いスコア優勢")
-        if slope >= 0:
-            reasons.append("上向き")
-        if macd >= 0:
-            reasons.append("MACD強化")
-        if rsi >= 50:
-            reasons.append("RSI良好")
+        reasons: List[str] = []
+        buy = to_float(first_existing(row, ["score_buy", "disp_buy_score", "buy"], 0.0), 0.0)
+        sell = to_float(first_existing(row, ["score_sell", "disp_sell_score", "sell"], 0.0), 0.0)
+        slope = to_float(first_existing(row, ["slope", "disp_slope", "score_slope", "slope_atr_scaled"], 0.0), 0.0)
+        macd = to_float(first_existing(row, ["macd"], 0.0), 0.0)
+        rsi = to_float(first_existing(row, ["rsi"], 0.0), 0.0)
 
-    return " / ".join(reasons) if reasons else "-"
+        if side_u == "SELL":
+            if sell >= buy:
+                reasons.append("売りスコア優勢")
+            if slope <= 0:
+                reasons.append("下向き")
+            if macd <= 0:
+                reasons.append("MACD弱化")
+            if rsi <= 45:
+                reasons.append("RSI弱い")
+        else:
+            if buy >= sell:
+                reasons.append("買いスコア優勢")
+            if slope >= 0:
+                reasons.append("上向き")
+            if macd >= 0:
+                reasons.append("MACD強化")
+            if rsi >= 50:
+                reasons.append("RSI良好")
+
+        base_reason = " / ".join(reasons) if reasons else "-"
+
+    signal_text = _active_scoring_signal_text(row, side_u)
+    if signal_text:
+        if base_reason and base_reason != "-":
+            return base_reason + " / " + signal_text
+        return signal_text
+    return base_reason
 
 
-def build_discord_candidate_2lines(
-    i: int,
-    row: pd.Series,
-    *,
-    side: str = "BUY",
-) -> str:
+def build_discord_candidate_2lines(i: int, row: pd.Series, *, side: str = "BUY") -> str:
     """
     Discord送信用。
-    1銘柄を必ず2行に整形する。
+    1銘柄を2〜3行に整形する。
 
-    出力例:
-      1. 6489 前澤工業 score=-0.21 buy=0.00 sell=0.43 total=-0.43 final=-0.43 close=1875.0
-         slope=-0.00 mtf=0.00 rsi=55.67 macd=0.66 tick=3.00 理由=売りスコア優勢 / 下向き / MACD弱化
+    3行目に score_config.ini/scoring.ini の日本語サインを出す。
     """
 
     try:
@@ -373,50 +390,15 @@ def build_discord_candidate_2lines(
         row = pd.Series({})
 
     symbol = normalize_symbol_value(first_existing(row, ["symbol", "code", "銘柄コード"], "-"))
-    name = str(
-        first_existing(
-            row,
-            ["symbolname_view", "symbolname", "name", "銘柄名"],
-            "",
-        )
-    ).strip()
+    name = str(first_existing(row, ["symbolname_view", "symbolname", "name", "銘柄名"], "")).strip()
 
-    score = first_existing(
-        row,
-        ["disp_score", "score", "display_score", "final_score", "score_total"],
-        0.0,
-    )
-    buy = first_existing(
-        row,
-        ["disp_buy_score", "score_buy", "buy"],
-        0.0,
-    )
-    sell = first_existing(
-        row,
-        ["disp_sell_score", "score_sell", "sell"],
-        0.0,
-    )
-    total = first_existing(
-        row,
-        ["score_total", "total", "display_score", "final_score", "score"],
-        score,
-    )
-    final = first_existing(
-        row,
-        ["final_score", "display_score", "score_total", "score"],
-        score,
-    )
-
-    slope = first_existing(
-        row,
-        ["disp_slope", "slope", "score_slope", "slope_atr_scaled"],
-        0.0,
-    )
-    mtf = first_existing(
-        row,
-        ["disp_mtf", "mtf", "score_mtf", "mtf_score"],
-        0.0,
-    )
+    score = first_existing(row, ["disp_score", "score", "display_score", "final_score", "score_total"], 0.0)
+    buy = first_existing(row, ["disp_buy_score", "score_buy", "buy"], 0.0)
+    sell = first_existing(row, ["disp_sell_score", "score_sell", "sell"], 0.0)
+    total = first_existing(row, ["score_total", "total", "display_score", "final_score", "score"], score)
+    final = first_existing(row, ["final_score", "display_score", "score_total", "score"], score)
+    slope = first_existing(row, ["disp_slope", "slope", "score_slope", "slope_atr_scaled"], 0.0)
+    mtf = first_existing(row, ["disp_mtf", "mtf", "score_mtf", "mtf_score"], 0.0)
     rsi = first_existing(row, ["rsi"], 0.0)
     macd = first_existing(row, ["macd"], 0.0)
     close = first_existing(row, ["close", "close_price"], 0.0)
@@ -435,17 +417,16 @@ def build_discord_candidate_2lines(
     )
 
     tick_text = "-" if tick == "-" else fmt_metric(tick)
-
     line2 = (
         f"    slope={fmt_metric(slope)} "
         f"mtf={fmt_metric(mtf)} "
         f"rsi={fmt_metric(rsi)} "
         f"macd={fmt_metric(macd)} "
-        f"tick={tick_text} "
-        f"理由={reason}"
+        f"tick={tick_text}"
     )
+    line3 = f"    理由={reason}"
 
-    return line1 + "\n" + line2
+    return line1 + "\n" + line2 + "\n" + line3
 
 
 def build_discord_top10_message_2lines(
@@ -459,9 +440,8 @@ def build_discord_top10_message_2lines(
     """
     Discord送信用 TOP10 メッセージを作る。
 
-    - 1銘柄2行
-    - Discordの2000文字制限を考慮して短め
-    - code_block=True の場合、``` で囲んで等幅表示にする
+    - 1銘柄2〜3行
+    - score_config.ini/scoring.ini のONサインを日本語で表示
     """
 
     out_df = safe_df(df)
@@ -474,17 +454,21 @@ def build_discord_top10_message_2lines(
         return msg
 
     rows = out_df.head(max_rows).copy()
-
     lines: List[str] = [str(title)]
+
+    # 必要ならサイン定義カタログを先頭に全部出す。
+    show_catalog = str(os.getenv("SUMMARY_DISPLAY_SHOW_SIGNAL_CATALOG", "0")).lower() in {"1", "true", "yes", "y", "on"}
+    if show_catalog:
+        catalog = _score_config_catalog_text(side)
+        if catalog:
+            lines.append(catalog)
 
     for i, (_, row) in enumerate(rows.iterrows(), start=1):
         lines.append(build_discord_candidate_2lines(i, row, side=side))
 
     msg = "\n".join(lines)
-
     if code_block:
         return f"```\n{msg}\n```"
-
     return msg
 
 
@@ -496,18 +480,8 @@ def build_discord_buy_top10_message_2lines(
     max_rows: int = 10,
     code_block: bool = True,
 ) -> str:
-    """
-    Discord BUY TOP10 用ショートカット。
-    """
-
     title = f"[SUMMARY BUY TOP{max_rows}] interval={interval} source={source}"
-    return build_discord_top10_message_2lines(
-        df,
-        title=title,
-        side="BUY",
-        max_rows=max_rows,
-        code_block=code_block,
-    )
+    return build_discord_top10_message_2lines(df, title=title, side="BUY", max_rows=max_rows, code_block=code_block)
 
 
 def build_discord_sell_top10_message_2lines(
@@ -518,18 +492,8 @@ def build_discord_sell_top10_message_2lines(
     max_rows: int = 10,
     code_block: bool = True,
 ) -> str:
-    """
-    Discord SELL TOP10 用ショートカット。
-    """
-
     title = f"[SUMMARY SELL TOP{max_rows}] interval={interval} source={source}"
-    return build_discord_top10_message_2lines(
-        df,
-        title=title,
-        side="SELL",
-        max_rows=max_rows,
-        code_block=code_block,
-    )
+    return build_discord_top10_message_2lines(df, title=title, side="SELL", max_rows=max_rows, code_block=code_block)
 
 
 def build_discord_ai_ok_message_2lines(
@@ -540,19 +504,7 @@ def build_discord_ai_ok_message_2lines(
     max_rows: int = 10,
     code_block: bool = True,
 ) -> str:
-    """
-    AI通過銘柄のDiscord通知用。
-    DataFrameに confidence / lot / model 等がある場合も、
-    まずは通常の2行表示に統一する。
-    """
-
-    return build_discord_top10_message_2lines(
-        df,
-        title=title,
-        side=side,
-        max_rows=max_rows,
-        code_block=code_block,
-    )
+    return build_discord_top10_message_2lines(df, title=title, side=side, max_rows=max_rows, code_block=code_block)
 
 
 # ============================================================
