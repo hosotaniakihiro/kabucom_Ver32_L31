@@ -1,11 +1,12 @@
 # ============================================================
 # File   : trading/push/push_stream/transport.py
-# Version: Ver1.2-PUSH-STREAM-TRANSPORT-REFRESH-RESULT-STRICT
+# Version: Ver1.3-PUSH-STREAM-TRANSPORT-SKIP-AFTER-OPEN-REFRESH
 # ------------------------------------------------------------
 # ✔ WebSocket sender install / clear
 # ✔ ws alive 判定
 # ✔ refresh callable 管理
 # ✔ on_open 後 refresh
+# ✔ PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1 で on_open refresh を抑止可能
 # ✔ ConnectionResetError / BrokenPipeError / OSError を安全処理
 # ✔ ws.send 失敗時に connected_event clear + sender clear
 # ✔ register_symbols 側へ RuntimeError として安全伝搬
@@ -16,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from typing import Any, Callable, Optional
@@ -28,6 +30,21 @@ from . import state
 from .runtime import _now, _safe_set_runtime
 
 logger = logging.getLogger(__name__)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    try:
+        v = os.environ.get(name)
+        if v is None:
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on"}:
+            return True
+        if s in {"0", "false", "no", "n", "off"}:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
 
 
 # ============================================================
@@ -227,6 +244,10 @@ def _call_refresh(force: bool = True, reason: str = "on_open", **kwargs) -> Any:
 
 def _safe_refresh_subscriptions_after_open() -> None:
     try:
+        if _env_bool("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", False):
+            logger.warning("[push_stream] refresh after open skipped by env PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1")
+            return
+
         time.sleep(AFTER_OPEN_REFRESH_DELAY_SEC)
 
         if not _wait_for_ws_ready(timeout=WS_READY_WAIT_SEC):
@@ -285,6 +306,10 @@ def is_connected() -> bool:
 
 
 def _start_refresh_after_open_thread() -> None:
+    if _env_bool("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", False):
+        logger.warning("[push_stream] refresh after open thread not started by env PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1")
+        return
+
     threading.Thread(
         target=_safe_refresh_subscriptions_after_open,
         name="push-refresh-after-open",
