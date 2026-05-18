@@ -10,7 +10,7 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.6-MAIN-EXPLICIT-ENTRY-QTY-MINLOT-PATCH
+# Version: Ver38.7-MAIN-LOW-MOVEMENT-GUARD-PATCH
 # ------------------------------------------------------------
 # ✔ PROJECT_ROOT を最初に sys.path へ追加
 # ✔ core.logging.console_tee を確実に import / setup
@@ -19,6 +19,7 @@
 # ✔ 100368 SELL拒否後の entry_controller ログ補正 runtime patch を起動時install
 # ✔ 起動高速化 runtime patch を起動時install
 # ✔ ENTRY_QTY_ZERO対策 runtime patch を明示install
+# ✔ 動かない銘柄をエントリー直前で除外する low movement guard を明示install
 # ✔ EXIT scheduler を run_exit_pipeline で1秒ごとに登録
 # ✔ main.py 側の scheduler / realtime / position_sync / push_monitor 生存証跡を heartbeat DB に保存
 # ✔ 既存の起動処理は維持
@@ -121,18 +122,12 @@ from utils.business_day_utils import is_market_open
 from core.runtime.stream_orchestrator import StreamOrchestrator
 
 
-# ------------------------------------------------------------
-# summary scheduler helper
-# ------------------------------------------------------------
 try:
     from scheduler_jobs.summary.scheduler import run_summary_tick_once
 except Exception:
     run_summary_tick_once = None
 
 
-# ------------------------------------------------------------
-# signal runtime context
-# ------------------------------------------------------------
 try:
     from trading.signals.state.signal_state import SignalState
 except Exception:
@@ -149,9 +144,6 @@ except Exception:
     PositionState = None
 
 
-# ------------------------------------------------------------
-# runtime heartbeat watchdog
-# ------------------------------------------------------------
 try:
     from trading.runtime_persistence.heartbeat_watchdog import (
         heartbeat,
@@ -169,16 +161,7 @@ except Exception:
         return None
 
 
-# ============================================================
-# LAZY STATE MAPS
-# ============================================================
-
 class _LazyFactoryDict(dict):
-    """
-    未登録 key アクセス時に factory() で自動生成する辞書。
-    runner 側で map[symbol] 参照しても KeyError にしない。
-    """
-
     def __init__(self, factory):
         super().__init__()
         self._factory = factory
@@ -192,7 +175,6 @@ class _LazyFactoryDict(dict):
 def _factory_signal_state():
     if SignalState is None:
         return None
-
     try:
         return SignalState()
     except Exception:
@@ -203,7 +185,6 @@ def _factory_signal_state():
 def _factory_prev_state():
     if PrevSignalState is None:
         return None
-
     try:
         return PrevSignalState()
     except Exception:
@@ -214,7 +195,6 @@ def _factory_prev_state():
 def _factory_position_state():
     if PositionState is None:
         return None
-
     try:
         return PositionState()
     except Exception:
@@ -222,33 +202,12 @@ def _factory_position_state():
         return None
 
 
-# ============================================================
-# RUNTIME PATCHES
-# ============================================================
-
 def _install_main_runtime_patches():
-    """
-    起動時の runtime patch をまとめてinstallする。
-
-    - entry_controller_runtime_reject_patch:
-        kabu API 100368後に ORDER_ID_EMPTY_RETRYABLE として扱わず、
-        SELL_ORDER_REJECTED_BY_KABU_API としてログを分ける。
-
-    - fast_startup_runtime_patch:
-        起動直後の重い ranking 初回tickを抑止し、ranking summary jobの
-        巨大DataFrame戻り値ログを抑制する。
-
-    - entry_qty_min_lot_runtime_patch:
-        entry_controller の数量計算が0株を返しても、価格帯OK・70万円以内で
-        100株買えるなら最低100株へ戻す。
-
-    - oneshot_limit_700k_patch:
-        1回あたり建玉上限を70万円にruntime反映し、関連patchをまとめて入れる。
-    """
     patches = [
         ("core.startup.entry_controller_runtime_reject_patch", "install"),
         ("core.startup.fast_startup_runtime_patch", "install"),
         ("core.startup.entry_qty_min_lot_runtime_patch", "install"),
+        ("core.startup.low_movement_entry_guard_patch", "install"),
         ("core.startup.oneshot_limit_700k_patch", "install"),
     ]
 
@@ -257,12 +216,7 @@ def _install_main_runtime_patches():
             mod = importlib.import_module(mod_name)
             fn = getattr(mod, fn_name, None)
             ok = fn() if callable(fn) else False
-            logger.warning(
-                "[MAIN RUNTIME PATCH] %s.%s installed=%s",
-                mod_name,
-                fn_name,
-                ok,
-            )
+            logger.warning("[MAIN RUNTIME PATCH] %s.%s installed=%s", mod_name, fn_name, ok)
             heartbeat("main_runtime_patch", status="OK" if ok else "NG", detail={"module": mod_name, "fn": fn_name})
         except Exception:
             heartbeat("main_runtime_patch", status="ERROR", detail={"module": mod_name, "fn": fn_name})
@@ -274,47 +228,23 @@ def _install_main_runtime_patches():
 # ============================================================
 
 def _install_summary_entry_runtime_context():
-    """
-    scheduler 側 / summary job 側 / entry bridge 側から参照する
-    共通 runtime context を global_data へ積む。
-    """
     try:
-        if not hasattr(global_data, "signal_state_map") or not isinstance(
-            getattr(global_data, "signal_state_map", None),
-            dict,
-        ):
+        if not hasattr(global_data, "signal_state_map") or not isinstance(getattr(global_data, "signal_state_map", None), dict):
             global_data.signal_state_map = _LazyFactoryDict(_factory_signal_state)
-
-        if not hasattr(global_data, "prev_state_map") or not isinstance(
-            getattr(global_data, "prev_state_map", None),
-            dict,
-        ):
+        if not hasattr(global_data, "prev_state_map") or not isinstance(getattr(global_data, "prev_state_map", None), dict):
             global_data.prev_state_map = _LazyFactoryDict(_factory_prev_state)
-
-        if not hasattr(global_data, "position_state_map") or not isinstance(
-            getattr(global_data, "position_state_map", None),
-            dict,
-        ):
+        if not hasattr(global_data, "position_state_map") or not isinstance(getattr(global_data, "position_state_map", None), dict):
             global_data.position_state_map = _LazyFactoryDict(_factory_position_state)
-
-        if not hasattr(global_data, "recent_realized_pnl_map") or not isinstance(
-            getattr(global_data, "recent_realized_pnl_map", None),
-            dict,
-        ):
+        if not hasattr(global_data, "recent_realized_pnl_map") or not isinstance(getattr(global_data, "recent_realized_pnl_map", None), dict):
             global_data.recent_realized_pnl_map = defaultdict(float)
-
         if not hasattr(global_data, "summary_1m_df"):
             global_data.summary_1m_df = None
-
         if not hasattr(global_data, "summary_3m_df"):
             global_data.summary_3m_df = None
-
         if not hasattr(global_data, "summary_5m_df"):
             global_data.summary_5m_df = None
-
         if not hasattr(global_data, "discord_sender"):
             global_data.discord_sender = None
-
         if not hasattr(global_data, "discord_webhook_url"):
             global_data.discord_webhook_url = None
 
@@ -332,16 +262,8 @@ def _install_summary_entry_runtime_context():
             }
 
         global_data.get_summary_runtime_kwargs = _get_summary_runtime_kwargs
-
-        logger.info(
-            "✅ summary/entry runtime context installed "
-            "(signal_state_map=%s prev_state_map=%s position_state_map=%s)",
-            type(global_data.signal_state_map).__name__,
-            type(global_data.prev_state_map).__name__,
-            type(global_data.position_state_map).__name__,
-        )
+        logger.info("✅ summary/entry runtime context installed (signal_state_map=%s prev_state_map=%s position_state_map=%s)", type(global_data.signal_state_map).__name__, type(global_data.prev_state_map).__name__, type(global_data.position_state_map).__name__)
         heartbeat("main_runtime_context", status="OK", detail={"signal_state_map": type(global_data.signal_state_map).__name__})
-
     except Exception:
         heartbeat("main_runtime_context", status="ERROR")
         logger.exception("summary/entry runtime context install failed")
@@ -352,16 +274,11 @@ def _install_summary_entry_runtime_context():
 # ============================================================
 
 def _register_exit_scheduler():
-    """
-    EXIT パイプラインを schedule に登録する。
-    これが未登録だと、ENTRY は成功しても EXIT 判定が一切回らない。
-    """
     try:
         if not callable(run_exit_pipeline):
             logger.warning("[EXIT SCHEDULER] run_exit_pipeline unavailable")
             heartbeat("exit_scheduler", status="NG", detail={"reason": "run_exit_pipeline unavailable"})
             return False
-
         for job in list(schedule.jobs):
             try:
                 fn = getattr(job, "job_func", None)
@@ -371,21 +288,15 @@ def _register_exit_scheduler():
                     return True
             except Exception:
                 pass
-
         schedule.every(1).seconds.do(run_exit_pipeline)
         logger.warning("[EXIT SCHEDULER] run_exit_pipeline registered every 1s")
         heartbeat("exit_scheduler", status="OK", detail={"registered_every_sec": 1})
         return True
-
     except Exception:
         heartbeat("exit_scheduler", status="ERROR")
         logger.exception("[EXIT SCHEDULER] register failed")
         return False
 
-
-# ============================================================
-# PUSH REFRESH CALLABLE RESOLVER
-# ============================================================
 
 def _resolve_push_refresh_callable():
     candidates = [
@@ -395,19 +306,15 @@ def _resolve_push_refresh_callable():
         ("trading.push.symbol_subscription_manager", "refresh_subscription"),
         ("trading.push.symbol_subscription_manager", "start_symbol_subscription_manager"),
     ]
-
     for mod_name, fn_name in candidates:
         try:
             mod = importlib.import_module(mod_name)
             fn = getattr(mod, fn_name, None)
-
             if callable(fn):
                 logger.info("✅ push refresh callable resolved: %s.%s", mod_name, fn_name)
                 return fn
-
         except Exception:
             logger.debug("push refresh callable resolve failed: %s.%s", mod_name, fn_name, exc_info=True)
-
     logger.warning("⚠ push refresh callable unresolved")
     return None
 
@@ -415,7 +322,6 @@ def _resolve_push_refresh_callable():
 def _install_push_refresh_callable():
     try:
         refresh_fn = _resolve_push_refresh_callable()
-
         if callable(refresh_fn):
             global_data.push_refresh_callable = refresh_fn
             logger.info("✅ global_data.push_refresh_callable installed")
@@ -424,48 +330,30 @@ def _install_push_refresh_callable():
             global_data.push_refresh_callable = None
             logger.warning("⚠ global_data.push_refresh_callable not installed")
             heartbeat("push_refresh_callable", status="NG")
-
     except Exception:
         heartbeat("push_refresh_callable", status="ERROR")
         logger.exception("push_refresh_callable install failed")
 
 
-# ============================================================
-# PUSH STREAM STARTER
-# ============================================================
-
 def _start_push_stream_safely():
     try:
         start_fn = getattr(push_stream, "start_push_stream", None)
-
         if not callable(start_fn):
             logger.error("❌ push_stream.start_push_stream unavailable")
             heartbeat("main_push_stream", status="NG", detail={"reason": "start_push_stream unavailable"})
             return False
-
         refresh_fn = getattr(global_data, "push_refresh_callable", None)
-
-        logger.info(
-            "🟡 starting push_stream with refresh_callable=%s",
-            getattr(refresh_fn, "__name__", repr(refresh_fn)) if callable(refresh_fn) else None,
-        )
+        logger.info("🟡 starting push_stream with refresh_callable=%s", getattr(refresh_fn, "__name__", repr(refresh_fn)) if callable(refresh_fn) else None)
         heartbeat("main_push_stream", status="START", detail={"refresh_callable": getattr(refresh_fn, "__name__", repr(refresh_fn)) if callable(refresh_fn) else None})
-
         start_fn(refresh_callable=refresh_fn, enable_rotate=False)
-
         logger.info("✅ push_stream.start_push_stream started")
         heartbeat("main_push_stream", status="OK")
         return True
-
     except Exception:
         heartbeat("main_push_stream", status="ERROR")
         logger.exception("push_stream start failed")
         return False
 
-
-# ============================================================
-# INITIAL SUMMARY TICK
-# ============================================================
 
 def _run_initial_summary_tick_once():
     try:
@@ -478,20 +366,14 @@ def _run_initial_summary_tick_once():
         else:
             logger.warning("⚠ initial summary tick once skipped (run_summary_tick_once unavailable)")
             heartbeat("initial_summary_tick", status="SKIP")
-
     except Exception:
         heartbeat("initial_summary_tick", status="ERROR")
         logger.exception("initial summary tick once failed")
 
 
-# ============================================================
-# INITIAL RANKING TICK
-# ============================================================
-
 def _run_initial_ranking_tick_once():
     try:
         from trading.summary.ranking.runner import run_time_locked_jobs
-
         if callable(run_time_locked_jobs):
             logger.info("🟡 initial ranking tick once start via ranking.runner.run_time_locked_jobs")
             heartbeat("initial_ranking_tick", status="START", detail={"via": "run_time_locked_jobs"})
@@ -499,14 +381,12 @@ def _run_initial_ranking_tick_once():
             logger.info("✅ initial ranking tick once done via run_time_locked_jobs targets=%s", sorted(list(result.keys())) if isinstance(result, dict) else [])
             heartbeat("initial_ranking_tick", status="OK", detail={"via": "run_time_locked_jobs"})
             return
-
     except Exception:
         heartbeat("initial_ranking_tick", status="ERROR", detail={"via": "run_time_locked_jobs"})
         logger.exception("initial ranking tick via run_time_locked_jobs failed")
 
     try:
         from trading.summary.ranking.runner import run_ranking_summary_job
-
         if callable(run_ranking_summary_job):
             logger.info("🟡 initial ranking tick once start via ranking.runner.run_ranking_summary_job(interval=1)")
             heartbeat("initial_ranking_tick", status="START", detail={"via": "run_ranking_summary_job"})
@@ -514,14 +394,12 @@ def _run_initial_ranking_tick_once():
             logger.info("✅ initial ranking tick once done via run_ranking_summary_job rows=%s", len(df) if hasattr(df, "__len__") else None)
             heartbeat("initial_ranking_tick", status="OK", detail={"via": "run_ranking_summary_job", "rows": len(df) if hasattr(df, "__len__") else None})
             return
-
     except Exception:
         heartbeat("initial_ranking_tick", status="ERROR", detail={"via": "run_ranking_summary_job"})
         logger.exception("initial ranking tick via run_ranking_summary_job failed")
 
     try:
         from trading.ranking.scheduler import job_save_ranking
-
         if callable(job_save_ranking):
             logger.info("🟡 initial ranking tick fallback start via trading.ranking.scheduler.job_save_ranking")
             heartbeat("initial_ranking_tick", status="START", detail={"via": "job_save_ranking"})
@@ -531,21 +409,15 @@ def _run_initial_ranking_tick_once():
         else:
             logger.warning("⚠ initial ranking tick skipped (job_save_ranking unavailable)")
             heartbeat("initial_ranking_tick", status="SKIP")
-
     except Exception:
         heartbeat("initial_ranking_tick", status="ERROR", detail={"via": "job_save_ranking"})
         logger.exception("initial ranking tick fallback failed")
 
 
-# ============================================================
-# Scheduler Loop
-# ============================================================
-
 def scheduler_loop():
     logger.info("⏱ Scheduler loop START")
     mark_component_start("main_scheduler_loop")
     last_hb = 0.0
-
     while True:
         try:
             schedule.run_pending()
@@ -556,77 +428,52 @@ def scheduler_loop():
         except Exception:
             heartbeat("main_scheduler_loop", status="ERROR")
             logger.exception("[scheduler_loop]")
-
         time.sleep(0.5)
 
-
-# ============================================================
-# EXIT DEBUG
-# ============================================================
 
 def debug_exit_status():
     try:
         logger.info("========== EXIT DEBUG ==========")
-
         getter = getattr(global_data, "get_push_df", None)
         df = getter() if callable(getter) else None
         rows = 0 if df is None else len(df)
-
         logger.info("push_df rows=%d", rows)
         heartbeat("main_exit_debug", status="OK", detail={"push_rows": rows})
-
         if rows > 0:
             logger.info("\n%s", df.tail(3))
-
         open_positions = getattr(global_data, "open_positions", [])
         logger.info("open_positions=%s", open_positions)
-
         for sym in list(open_positions):
             try:
                 bar = build_5s_bar_fast(sym)
                 logger.info("5s bar [%s] = %s", sym, bar)
             except Exception:
                 logger.exception("5s bar error [%s]", sym)
-
         logger.info("======== END EXIT DEBUG ========")
-
     except Exception:
         heartbeat("main_exit_debug", status="ERROR")
         logger.exception("[debug_exit_status] fatal")
 
 
-# ============================================================
-# PUSH MONITOR
-# ============================================================
-
 def monitor_push_df():
     i = 0
     mark_component_start("main_push_monitor_df")
-
     while True:
         try:
             getter = getattr(global_data, "get_push_df", None)
             df = getter() if callable(getter) else None
             rows = 0 if df is None else len(df)
-
             logger.info("[PUSH MONITOR] %d rows=%d", i, rows)
             heartbeat("main_push_monitor_df", status="OK", detail={"i": i, "rows": rows})
-
             if rows > 0:
                 logger.info("\n%s", df.tail(2))
-
             i += 1
             time.sleep(3)
-
         except Exception:
             heartbeat("main_push_monitor_df", status="ERROR")
             logger.exception("[monitor_push_df] error")
             time.sleep(3)
 
-
-# ============================================================
-# POSITION SYNC LOOP
-# ============================================================
 
 def start_position_sync_loop(pos_sync: PositionSyncManager):
     mark_component_start("main_position_sync_loop")
@@ -637,18 +484,12 @@ def start_position_sync_loop(pos_sync: PositionSyncManager):
         except Exception:
             heartbeat("main_position_sync_loop", status="ERROR")
             logger.exception("[PositionSync] error")
-
         time.sleep(5)
 
-
-# ============================================================
-# SHOULD REGISTER MONITOR
-# ============================================================
 
 def should_register_monitor_loop(interval_sec: int = 30):
     logger.info("📋 SHOULD REGISTER monitor START (interval=%s sec)", interval_sec)
     mark_component_start("main_should_register_monitor", {"interval_sec": interval_sec})
-
     while True:
         try:
             logger.info("📋 SHOW SHOULD REGISTER SYMBOLS (PERIODIC)")
@@ -657,22 +498,14 @@ def should_register_monitor_loop(interval_sec: int = 30):
         except Exception:
             heartbeat("main_should_register_monitor", status="ERROR")
             logger.exception("[should_register_monitor_loop] error")
-
         time.sleep(interval_sec)
 
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
     conf = ConfigParser()
     conf.read("settings.ini", encoding="utf-8")
-
     force_run = conf.getboolean("test", "force_run", fallback=False)
-
     mark_component_start("main_py", {"project_root": PROJECT_ROOT, "console_log": str(CONSOLE_LOG_PATH), "force_run": force_run})
-
     logger.info("========== SYSTEM BOOT START ==========")
     logger.info("PROJECT_ROOT=%s", PROJECT_ROOT)
     logger.info("CONSOLE_LOG_PATH=%s", CONSOLE_LOG_PATH)
@@ -682,79 +515,51 @@ def main():
     _install_summary_entry_runtime_context()
     _install_main_runtime_patches()
 
-    # --------------------------------------------------------
-    # OPTIONAL
-    # --------------------------------------------------------
     try:
         logger.info("🔧 optional boot START")
         heartbeat("main_boot", status="START", detail={"stage": "optional"})
-
         optional_main()
-
         optional_data = getattr(global_data, "optional_data", None)
-
         if optional_data is not None:
             try:
                 logger.info("optional_data rows=%s cols=%s", len(optional_data), list(optional_data.columns))
                 logger.info("optional_data head=\n%s", optional_data.head())
             except Exception:
                 logger.exception("optional_data print failed")
-
         logger.info("✅ optional boot DONE")
         heartbeat("main_boot", status="OK", detail={"stage": "optional"})
-
     except Exception:
         heartbeat("main_boot", status="ERROR", detail={"stage": "optional"})
         logger.critical("❌ optional boot FAILED → system abort")
         traceback.print_exc()
         sys.exit(1)
 
-    # --------------------------------------------------------
-    # SYMBOL NAME MAP BUILD
-    # --------------------------------------------------------
     try:
         logger.info("🔧 building symbol_name_map")
         heartbeat("main_boot", status="START", detail={"stage": "symbol_name_map"})
-
         build_symbol_name_map()
-
         symbol_name_map = getattr(global_data, "symbol_name_map", {})
-
         logger.info("symbol_name_map size=%d", len(symbol_name_map) if symbol_name_map is not None else 0)
         logger.info("✅ symbol_name_map loaded (%d)", len(symbol_name_map) if symbol_name_map is not None else 0)
         heartbeat("main_boot", status="OK", detail={"stage": "symbol_name_map", "size": len(symbol_name_map) if symbol_name_map is not None else 0})
-
     except Exception:
         heartbeat("main_boot", status="ERROR", detail={"stage": "symbol_name_map"})
         logger.exception("symbol_name_map build failed")
 
-    # --------------------------------------------------------
-    # STARTUP
-    # --------------------------------------------------------
     heartbeat("main_boot", status="START", detail={"stage": "system_startup"})
     system_startup()
-
     try:
         rebind_logging_streams_to_console_tee()
     except Exception:
         logger.exception("console tee rebind failed after system_startup")
-
     logger.info("🚀 system_startup DONE")
     heartbeat("main_boot", status="OK", detail={"stage": "system_startup"})
 
     _install_summary_entry_runtime_context()
     _install_main_runtime_patches()
-
-    # --------------------------------------------------------
-    # PUSH REFRESH CALLABLE INSTALL
-    # --------------------------------------------------------
     _install_push_refresh_callable()
 
-    # --------------------------------------------------------
-    # PUSH SYSTEM START
-    # --------------------------------------------------------
     push_started = _start_push_stream_safely()
-
     if not push_started:
         logger.warning("⚠ push stream start returned False")
 
@@ -766,88 +571,53 @@ def main():
         heartbeat("main_push_storage", status="ERROR")
         logger.exception("push storage start failed")
 
-    # --------------------------------------------------------
-    # EXIT scheduler register
-    # --------------------------------------------------------
     _register_exit_scheduler()
-
-    # --------------------------------------------------------
-    # Scheduler loop start
-    # --------------------------------------------------------
     Thread(target=scheduler_loop, daemon=True, name="scheduler_loop").start()
     logger.info("✅ scheduler loop started")
     heartbeat("main_boot", status="OK", detail={"stage": "scheduler_loop_started"})
 
-    # --------------------------------------------------------
-    # initial summary / ranking tick once
-    # --------------------------------------------------------
     _run_initial_summary_tick_once()
     _run_initial_ranking_tick_once()
 
-    # --------------------------------------------------------
-    # HOLIDAY GUARD
-    # --------------------------------------------------------
     if not is_market_open() and not force_run:
         try:
             logger.info("📋 SHOW SHOULD REGISTER SYMBOLS (HOLIDAY MODE)")
             show_should_register_symbols()
         except Exception:
             logger.exception("show_should_register_symbols failed")
-
         Thread(target=should_register_monitor_loop, args=(30,), daemon=True, name="should_register_monitor_holiday").start()
-
         logger.info("🧊 HOLIDAY MODE ACTIVE")
         logger.info("🟡 Scheduler is running for summary display / monitoring")
         logger.info("🛑 Realtime / ATS / Entry main flow NOT started")
         heartbeat("main_py", status="HOLIDAY_MODE")
-
         while True:
             heartbeat("main_holiday_loop", status="OK")
             time.sleep(60)
 
-    # --------------------------------------------------------
-    # Realtime Engine
-    # --------------------------------------------------------
     heartbeat("main_boot", status="START", detail={"stage": "realtime_engine"})
     init_realtime_engine()
     logger.info("⚡ realtime_engine initialized")
     heartbeat("main_boot", status="OK", detail={"stage": "realtime_engine"})
 
-    # --------------------------------------------------------
-    # StreamOrchestrator
-    # --------------------------------------------------------
     stream = StreamOrchestrator()
     Thread(target=stream.start, daemon=True, name="stream_orchestrator").start()
     logger.info("🌊 StreamOrchestrator started")
     heartbeat("main_stream_orchestrator", status="STARTED")
 
-    # --------------------------------------------------------
-    # Position Sync
-    # --------------------------------------------------------
     pos_sync = PositionSyncManager()
     Thread(target=start_position_sync_loop, args=(pos_sync,), daemon=True, name="position_sync_loop").start()
     logger.info("✅ position sync loop started")
 
-    # --------------------------------------------------------
-    # ATS候補一覧を起動時に1回表示
-    # --------------------------------------------------------
     try:
         logger.info("📋 SHOW SHOULD REGISTER SYMBOLS (BEFORE ATS START)")
         show_should_register_symbols()
     except Exception:
         logger.exception("show_should_register_symbols failed")
 
-    # --------------------------------------------------------
-    # SHOULD REGISTER MONITOR
-    # --------------------------------------------------------
     Thread(target=should_register_monitor_loop, args=(30,), daemon=True, name="should_register_monitor").start()
     logger.info("✅ should-register monitor started")
 
-    # --------------------------------------------------------
-    # ATS
-    # --------------------------------------------------------
     token_value = getattr(global_data, "token_value", None)
-
     if token_value:
         Thread(target=ats_register_loop, args=(token_value,), daemon=True, name="ats_register_loop").start()
         logger.info("✅ ATS register loop started")
@@ -856,9 +626,6 @@ def main():
         logger.warning("⚠ ATS register loop skipped (global_data.token_value missing)")
         heartbeat("main_ats_register_loop", status="SKIP", detail={"reason": "token missing"})
 
-    # --------------------------------------------------------
-    # Debug & Monitor
-    # --------------------------------------------------------
     Timer(10, debug_exit_status).start()
     Thread(target=monitor_push_df, daemon=True, name="push_monitor_df").start()
     Thread(target=start_force_cancel_loop, daemon=True, name="force_cancel_loop").start()
@@ -866,9 +633,7 @@ def main():
 
     logger.info("🔥 REALTIME MAIN LOOP START")
     heartbeat("main_realtime_loop", status="START")
-
     last_realtime_hb = 0.0
-
     while True:
         try:
             process_realtime()
@@ -879,13 +644,8 @@ def main():
         except Exception:
             heartbeat("main_realtime_loop", status="ERROR")
             logger.exception("[REALTIME LOOP ERROR]")
-
         time.sleep(0.2)
 
-
-# ============================================================
-# Entry Point
-# ============================================================
 
 if __name__ == "__main__":
     main()
