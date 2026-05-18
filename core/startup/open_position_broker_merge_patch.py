@@ -1,16 +1,20 @@
 # ============================================================
 # File   : core/startup/open_position_broker_merge_patch.py
-# Version: V1.3-BROKER-EMPTY-AUTHORITATIVE-NO-STALE-DB-FALLBACK
+# Version: V1.4-BROKER-PARSE-SUSPICIOUS-DB-SAFETY-FALLBACK
 # ------------------------------------------------------------
 # broker reader の信用実建玉を authoritative source として
 # global_data.open_positions / protected / EXIT監視へ渡す runtime patch。
 #
 # 重要:
 #   - 現物はEXIT監視しない。
-#   - 実保有していない positions.db の残骸はEXIT監視しない。
-#   - broker側の信用建玉が読めた場合は、0件でも broker側を正とする。
-#   - broker API失敗時のみ、DB由来の信用らしい建玉を fallback 採用する。
-#   - これにより、手動返済済み/証券会社側0件の 9716 などを保有扱いしない。
+#   - 実保有していない positions.db の残骸は原則EXIT監視しない。
+#   - broker側の信用建玉が読めた場合は、通常は broker側を正とする。
+#   - ただし raw_count>0 なのに broker_count=0 かつ skipped_qty/skipped_price が多い場合は
+#     brokerパース失敗疑いとして、DB由来の信用らしい建玉を安全fallback採用する。
+#   - broker API失敗時も、DB由来の信用らしい建玉を fallback 採用する。
+#
+# V1.4 修正:
+#   - skipped_qty=23 のような状態で DB建玉を消して EXIT LOOP no open positions になる事故を防止
 # ============================================================
 
 from __future__ import annotations
@@ -42,6 +46,15 @@ def _text(v: Any) -> str:
         return str(v or "").strip()
     except Exception:
         return ""
+
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        if v is None or v == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
 
 
 def _is_credit_position(pos: Dict[str, Any], *, source: str = "") -> bool:
@@ -93,8 +106,7 @@ def _read_broker_positions_with_status() -> Tuple[Dict[str, Dict[str, Any]], boo
     Returns:
       positions, read_ok, status
 
-    read_ok=True なら、信用建玉0件でも broker側を正としてDB fallbackしない。
-    read_ok=False の場合だけ DB fallback を許可する。
+    read_ok=True でも、status が broker parse suspicious の場合は上位でDB fallbackする。
     """
     try:
         import trading.position.kabu_position_reader as reader
@@ -141,6 +153,46 @@ def _filter_db_credit_positions(db_positions: Dict[str, Dict[str, Any]]) -> Dict
     return out
 
 
+def _broker_parse_suspicious(
+    *,
+    db_credit: Dict[str, Dict[str, Any]],
+    broker_positions: Dict[str, Dict[str, Any]],
+    broker_read_ok: bool,
+    broker_status: dict,
+) -> bool:
+    """
+    broker APIは読めているが、レスポンスのパースに失敗している疑いを検出する。
+
+    今回の実ログ:
+      raw=23 credit_open=0 skipped_qty=23
+      DBには open_like=1 symbol=9716
+      EXIT LOOP no open positions
+
+    この状態は「本当に信用建玉ゼロ」ではなく、数量キー不一致の可能性が高いためDB fallbackする。
+    """
+    if not broker_read_ok:
+        return False
+    if broker_positions:
+        return False
+    if not db_credit:
+        return False
+
+    raw_count = _safe_int(broker_status.get("raw_count"), 0)
+    credit_candidates = _safe_int(broker_status.get("credit_candidate_count"), 0)
+    skipped_qty = _safe_int(broker_status.get("skipped_qty"), 0)
+    skipped_price = _safe_int(broker_status.get("skipped_price"), 0)
+
+    # product=2 raw があり、候補もあるのに qty/price で全滅している場合はパース失敗疑い。
+    if raw_count > 0 and credit_candidates > 0 and (skipped_qty + skipped_price) >= credit_candidates:
+        return True
+
+    # V1.2以前の reader は credit_candidate_count を出さないため、raw/skipped_qty だけでも拾う。
+    if raw_count > 0 and credit_candidates == 0 and skipped_qty >= raw_count:
+        return True
+
+    return False
+
+
 def _merge_and_publish(
     db_positions: Dict[str, Dict[str, Any]],
     broker_positions: Dict[str, Dict[str, Any]],
@@ -151,14 +203,24 @@ def _merge_and_publish(
     db_credit = _filter_db_credit_positions(db_positions)
     broker_status = broker_status or {}
 
-    # broker APIが正常に読めた場合は、0件でも broker を正とする。
-    # これで「証券会社側0件なのにpositions.dbの9716を保有扱いする」事故を防ぐ。
-    if broker_read_ok:
+    parse_suspicious = _broker_parse_suspicious(
+        db_credit=db_credit,
+        broker_positions=broker_positions,
+        broker_read_ok=broker_read_ok,
+        broker_status=broker_status,
+    )
+
+    if broker_read_ok and not parse_suspicious:
+        # 通常: broker APIが正常に読めた場合は、0件でも broker を正とする。
         merged = dict(broker_positions)
         source_mode = "broker_credit_authoritative_empty_ok" if not broker_positions else "broker_credit_authoritative"
     else:
+        # API失敗 or パース失敗疑い: DB由来信用建玉を安全fallbackする。
         merged = dict(db_credit)
-        source_mode = "db_credit_fallback_broker_read_failed"
+        if parse_suspicious:
+            source_mode = "db_credit_fallback_broker_parse_suspicious"
+        else:
+            source_mode = "db_credit_fallback_broker_read_failed"
 
     gd_positions = _ensure_open_positions()
     before_keys = {_normalize_symbol(k) for k in gd_positions.keys()}
@@ -183,17 +245,19 @@ def _merge_and_publish(
         global_data.open_positions_synced_count = len(merged)
         global_data.open_positions_source_mode = source_mode
         global_data.open_positions_broker_read_ok = bool(broker_read_ok)
+        global_data.open_positions_broker_parse_suspicious = bool(parse_suspicious)
         global_data.open_positions_broker_status = broker_status
     except Exception:
         pass
 
     changed = before_keys != merged_keys
     logger.warning(
-        "[OPEN POSITION BROKER PATCH] merged credit open positions count=%d changed=%s mode=%s broker_read_ok=%s broker_status=%s db_count=%d db_credit=%d broker_count=%d symbols=%s",
+        "[OPEN POSITION BROKER PATCH] merged credit open positions count=%d changed=%s mode=%s broker_read_ok=%s parse_suspicious=%s broker_status=%s db_count=%d db_credit=%d broker_count=%d symbols=%s",
         len(merged),
         changed,
         source_mode,
         broker_read_ok,
+        parse_suspicious,
         broker_status,
         len(db_positions or {}),
         len(db_credit),
@@ -245,7 +309,7 @@ def install() -> bool:
         pass
 
     _INSTALLED = True
-    logger.warning("[OPEN POSITION BROKER PATCH] installed broker_credit_authoritative=True broker_empty_ok=True no_cash_exit=True")
+    logger.warning("[OPEN POSITION BROKER PATCH] installed broker_credit_authoritative=True broker_parse_suspicious_db_fallback=True no_cash_exit=True")
     return True
 
 
