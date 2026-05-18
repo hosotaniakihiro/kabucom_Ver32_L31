@@ -1,6 +1,6 @@
 # ==========================================================
 # trading/handlers/entry_order_builder.py
-# Ver1.8.0-SUMMARY-AI-SELL-MTF-5S-RELAX
+# Ver1.9.0-SELL-CREDIT-LIMIT-NO-DOWN-TICK
 # ----------------------------------------------------------
 # ✔ 注文条件（price / order_type / qty）を決定するだけ
 # ✔ 副作用ゼロ（発注・global_state 操作なし）
@@ -13,15 +13,10 @@
 # ✔ SUMMARY_AI 発注直前に5秒足の向きを確認
 # ✔ SUMMARY_AI 発注直前にMTF/傾きの逆方向をブロック
 # ✔ スプレッド上限を環境変数化し、既定0.15%へ厳格化
-# ✔ 優先順位1〜2,6:
-#   - 損切り後15分クールダウン
-#   - 同一銘柄2連敗で当日停止
-#   - 一部利確後3分/全利確後5分の再エントリー停止
-#   - 時間帯フィルタ 09:00-09:02 / 11:20-12:32 / 15:23以降
-# ✔ Ver1.8:
-#   - 5秒足データなしは標準では即NGにしない
-#   - SELL時、日足MTF/score_mtf がプラスという理由だけでは止めない
-#   - SELLは slope 系がプラスの場合だけ逆方向として止める
+# ✔ Ver1.9:
+#   - SELL信用新規で base_price より下のLIMITを作らない
+#   - 3640 SELL 2453 -> 2450 のような下方向 aggressive 指値を禁止
+#   - kabu API 4002004 トリガチェックエラー対策
 # ==========================================================
 
 from __future__ import annotations
@@ -49,15 +44,14 @@ MAX_SPREAD_PCT_FOR_LIMIT = float(
 
 MIN_ENTRY_QTY = 100
 SUMMARY_AGGRESSIVE_LIMIT_TICKS = int(float(os.getenv("SUMMARY_AGGRESSIVE_LIMIT_TICKS", "1")))
+SELL_CREDIT_LIMIT_DOWN_TICK_ENABLED = str(os.getenv("SELL_CREDIT_LIMIT_DOWN_TICK_ENABLED", "0")).lower() in {
+    "1", "true", "yes", "y", "on",
+}
+SELL_CREDIT_LIMIT_UP_TICK_WHEN_BOARD_MISSING = int(float(os.getenv("SELL_CREDIT_LIMIT_UP_TICK_WHEN_BOARD_MISSING", "0")))
 
 ENTRY_ORDER_5S_GUARD_ENABLED = str(os.getenv("ENTRY_ORDER_5S_GUARD_ENABLED", "1")).lower() not in {
     "0", "false", "no", "off",
 }
-# 重要:
-#   以前は既定1だったため、PUSH登録直後/ローテーション外/5秒足未生成の銘柄が
-#   FIVE_SEC_NO_DATA で即NGになっていた。
-#   5秒足がある場合は方向確認するが、無いだけでは止めない。
-#   強制したい場合だけ set ENTRY_ORDER_REQUIRE_5S_DATA=1 にする。
 ENTRY_ORDER_REQUIRE_5S_DATA = str(os.getenv("ENTRY_ORDER_REQUIRE_5S_DATA", "0")).lower() in {
     "1", "true", "yes", "y", "on",
 }
@@ -71,8 +65,6 @@ ENTRY_ORDER_REQUIRE_MTF_DATA = str(os.getenv("ENTRY_ORDER_REQUIRE_MTF_DATA", "0"
     "1", "true", "yes", "y", "on",
 }
 ENTRY_ORDER_MTF_SLOPE_EPS = float(os.getenv("ENTRY_ORDER_MTF_SLOPE_EPS", "0.0"))
-# SELL時、日足MTF/score_mtf がプラスという理由だけで空売り候補を止めない。
-# 1分/3分/5分の slope 系が明確にプラスなら止める。
 ENTRY_ORDER_SELL_IGNORE_POSITIVE_MTF = str(os.getenv("ENTRY_ORDER_SELL_IGNORE_POSITIVE_MTF", "1")).lower() not in {
     "0", "false", "no", "off",
 }
@@ -189,16 +181,13 @@ def _low_move_hard_block(entry_row: Dict[str, Any], *, symbol: str, source: str)
         return None
     if str(source or "").upper() != "SUMMARY_AI":
         return None
-
     row = entry_row or {}
     close = _safe_float(_first(row, ("close_price", "close", "price", "current_price"), 0.0), 0.0)
     high = _safe_float(_first(row, ("high_price", "high"), 0.0), 0.0)
     low = _safe_float(_first(row, ("low_price", "low"), 0.0), 0.0)
     atr = _safe_float(_first(row, ("atr_1m", "atr", "ATR", "atr14", "atr_14"), 0.0), 0.0)
-
     if close <= 0:
         return _ng("LOW_MOVE_NO_CLOSE", symbol=symbol, close=close, min_range_pct=ENTRY_ORDER_MIN_RANGE_PCT, min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO)
-
     if high > 0 and low > 0 and high >= low:
         range_value = high - low
         range_pct = range_value / close if close > 0 else 0.0
@@ -206,14 +195,12 @@ def _low_move_hard_block(entry_row: Dict[str, Any], *, symbol: str, source: str)
             return _ng("LOW_MOVE_RANGE_TOO_SMALL", symbol=symbol, close=close, high=high, low=low, range_value=range_value, range_pct=range_pct, min_range_pct=ENTRY_ORDER_MIN_RANGE_PCT)
     elif ENTRY_ORDER_REQUIRE_HIGH_LOW:
         return _ng("LOW_MOVE_NO_HIGH_LOW", symbol=symbol, close=close, high=high, low=low, min_range_pct=ENTRY_ORDER_MIN_RANGE_PCT, min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO)
-
     if atr > 0:
         atr_ratio = atr / close if close > 0 else 0.0
         if atr_ratio < ENTRY_ORDER_MIN_ATR_RATIO:
             return _ng("LOW_MOVE_ATR_TOO_SMALL", symbol=symbol, close=close, atr=atr, atr_ratio=atr_ratio, min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO)
     elif ENTRY_ORDER_REQUIRE_ATR:
         return _ng("LOW_MOVE_NO_ATR", symbol=symbol, close=close, atr=atr, min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO)
-
     return None
 
 
@@ -222,11 +209,9 @@ def _summary_mtf_direction_guard(entry_row: Dict[str, Any], *, symbol: str, side
         return None
     if str(source or "").upper() != "SUMMARY_AI":
         return None
-
     side_u = str(side or "").upper()
     if side_u not in {"BUY", "SELL"}:
         return None
-
     row = entry_row or {}
     eps = abs(float(ENTRY_ORDER_MTF_SLOPE_EPS or 0.0))
     mtf = _safe_float_or_none(_entry_get(row, "mtf", "score_mtf", "mtf_score", "score_mtf_merged"))
@@ -236,26 +221,17 @@ def _summary_mtf_direction_guard(entry_row: Dict[str, Any], *, symbol: str, side
     slope_5m = _safe_float_or_none(_entry_get(row, "slope_atr_scaled_5m", "slope_5m", "slope5m"))
     values = {"mtf": mtf, "slope": slope, "slope_1m": slope_1m, "slope_3m": slope_3m, "slope_5m": slope_5m}
     available = {k: v for k, v in values.items() if v is not None}
-
     if not available:
         if ENTRY_ORDER_REQUIRE_MTF_DATA:
             return _ng("MTF_NO_DATA", symbol=symbol, side=side_u, require_mtf=True)
         return None
-
     if side_u == "BUY":
         bad = {k: v for k, v in available.items() if v < -eps}
         if bad:
             return _ng("MTF_NOT_BUY_ALIGNED", symbol=symbol, side=side_u, bad=bad, values=values, eps=eps)
     else:
         if ENTRY_ORDER_SELL_IGNORE_POSITIVE_MTF:
-            # SELLでは、日足MTFが買い寄りでも、短期slopeが下向きならエントリー候補として残す。
-            # mtf単体で止めると、ログ上の 2980/3900/1963/6363/6544/2475 のように
-            # slopeが下向きでも全て ORDER_BUILD_NG になる。
-            bad = {
-                k: v
-                for k, v in available.items()
-                if k != "mtf" and v > eps
-            }
+            bad = {k: v for k, v in available.items() if k != "mtf" and v > eps}
         else:
             bad = {k: v for k, v in available.items() if v > eps}
         if bad:
@@ -306,13 +282,11 @@ def _five_sec_pre_entry_guard(symbol: str, side: str, source: str) -> Optional[D
     side_u = str(side or "").upper()
     if side_u not in {"BUY", "SELL"}:
         return None
-
     rows = _extract_5s_rows(_get_5s_df(symbol))
     if rows is None:
         if ENTRY_ORDER_REQUIRE_5S_DATA:
             return _ng("FIVE_SEC_NO_DATA", symbol=symbol, side=side_u, require_5s=True, min_bars=ENTRY_ORDER_5S_MIN_BARS)
         return None
-
     prev, last, nrows = rows
     prev_close = _safe_float(_row_get(prev, "close_price", "close", "price", "current_price", "Close", default=0.0), 0.0)
     prev_high = _safe_float(_row_get(prev, "high_price", "high", "High", default=0.0), 0.0)
@@ -321,7 +295,6 @@ def _five_sec_pre_entry_guard(symbol: str, side: str, source: str) -> Optional[D
     last_close = _safe_float(_row_get(last, "close_price", "close", "price", "current_price", "Close", default=0.0), 0.0)
     last_high = _safe_float(_row_get(last, "high_price", "high", "High", default=0.0), 0.0)
     last_low = _safe_float(_row_get(last, "low_price", "low", "Low", default=0.0), 0.0)
-
     last_dt = _parse_dt(_row_get(last, "datetime", "timestamp", "time", "created_at", "updated_at", default=None))
     age_sec = None
     if last_dt is not None:
@@ -337,7 +310,6 @@ def _five_sec_pre_entry_guard(symbol: str, side: str, source: str) -> Optional[D
         if ENTRY_ORDER_REQUIRE_5S_DATA:
             return _ng("FIVE_SEC_INVALID_PRICE", symbol=symbol, side=side_u, prev_close=prev_close, last_close=last_close, nrows=nrows)
         return None
-
     if last_open <= 0:
         last_open = prev_close
     if last_high <= 0:
@@ -348,7 +320,6 @@ def _five_sec_pre_entry_guard(symbol: str, side: str, source: str) -> Optional[D
         prev_high = prev_close
     if prev_low <= 0:
         prev_low = prev_close
-
     bullish = (last_close >= last_open) and ((last_close >= prev_close) or (last_high > prev_high))
     bearish = (last_close <= last_open) and ((last_close <= prev_close) or (last_low < prev_low))
     detail = {"symbol": symbol, "side": side_u, "nrows": nrows, "prev_close": prev_close, "last_open": last_open, "last_close": last_close, "prev_high": prev_high, "last_high": last_high, "prev_low": prev_low, "last_low": last_low, "age_sec": age_sec, "bullish": bullish, "bearish": bearish}
@@ -370,12 +341,18 @@ def _aggressive_limit_price(base_price: float, side: str, ticks: int = SUMMARY_A
     p = float(base_price)
     if p <= 0:
         return p
-    rounded = _round_price(p, side)
+    side_u = str(side or "").upper()
+    rounded = _round_price(p, side_u)
     tick = get_tick_size(rounded)
     n = max(0, int(ticks or 0))
+    if side_u == "SELL" and not SELL_CREDIT_LIMIT_DOWN_TICK_ENABLED:
+        # 信用新規売りは base_price より下にぶつける指値を作らない。
+        # 2453 -> 2450 のような下方向指値は kabu API 4002004 の原因になる。
+        up_ticks = max(0, int(SELL_CREDIT_LIMIT_UP_TICK_WHEN_BOARD_MISSING or 0))
+        return rounded + tick * up_ticks
     if n <= 0:
         return rounded
-    if side.upper() == "BUY":
+    if side_u == "BUY":
         return rounded + tick * n
     return max(tick, rounded - tick * n)
 
@@ -402,26 +379,20 @@ def build_entry_order(*, symbol: str, side: str, source: str, entry_row: Dict[st
     spread_pct = None
     board = None
     price_source = None
-
     side = side.upper()
     source = source.upper()
-
     trade_guard_ng = _trade_guard_block(symbol)
     if trade_guard_ng is not None:
         return trade_guard_ng
-
     low_move_ng = _low_move_hard_block(entry_row, symbol=symbol, source=source)
     if low_move_ng is not None:
         return low_move_ng
-
     mtf_ng = _summary_mtf_direction_guard(entry_row, symbol=symbol, side=side, source=source)
     if mtf_ng is not None:
         return mtf_ng
-
     five_sec_ng = _five_sec_pre_entry_guard(symbol=symbol, side=side, source=source)
     if five_sec_ng is not None:
         return five_sec_ng
-
     if source == "SUMMARY_AI":
         board = get_latest_bid_ask(symbol)
         if board:
@@ -431,7 +402,7 @@ def build_entry_order(*, symbol: str, side: str, source: str, entry_row: Dict[st
                 return _ng("INVALID_BOARD", board=board)
             spread_pct = (ask - bid) / bid * 100
             base_price = bid if side == "SELL" else ask
-            price_source = "board_bid_ask_aggressive_1tick"
+            price_source = "board_bid_ask_safe_limit"
             if ALLOW_MARKET_IF_BAD_BOARD and spread_pct > MAX_SPREAD_PCT_FOR_LIMIT:
                 return _ng("SPREAD_TOO_WIDE", symbol=symbol, side=side, spread_pct=spread_pct, max_spread_pct=MAX_SPREAD_PCT_FOR_LIMIT, bid=bid, ask=ask)
             price = _aggressive_limit_price(float(base_price), side)
@@ -442,7 +413,7 @@ def build_entry_order(*, symbol: str, side: str, source: str, entry_row: Dict[st
                 return _ng("NO_PRICE_SOURCE")
             price = _aggressive_limit_price(float(base_price), side)
             order_type = "LIMIT"
-            price_source = "summary_fallback_aggressive_1tick"
+            price_source = "summary_fallback_safe_limit"
     else:
         base_price = five_sec_breakout(symbol, side)
         if not base_price:
@@ -450,7 +421,6 @@ def build_entry_order(*, symbol: str, side: str, source: str, entry_row: Dict[st
         price = _round_price(base_price, side)
         order_type = "STOP"
         price_source = "five_sec_breakout"
-
     try:
         volume = float(entry_row.get("volume") or 0.0)
     except Exception:
@@ -459,7 +429,6 @@ def build_entry_order(*, symbol: str, side: str, source: str, entry_row: Dict[st
     trading_value = effective_price * volume if effective_price else 0.0
     if trading_value < 3_000_000:
         return _ng("LOW_LIQUIDITY", trading_value=trading_value, price=effective_price, volume=volume)
-
     forced_min_qty = False
     if qty_override is not None:
         qty = int(qty_override)
@@ -476,7 +445,6 @@ def build_entry_order(*, symbol: str, side: str, source: str, entry_row: Dict[st
                 forced_min_qty = True
     if qty <= 0:
         return _ng("QTY_ZERO", side=side, price=price, base_price=base_price, spread_pct=spread_pct, trading_value=trading_value)
-
     detail = {
         "order_type": order_type,
         "price": price,
@@ -486,7 +454,8 @@ def build_entry_order(*, symbol: str, side: str, source: str, entry_row: Dict[st
         "max_spread_pct": MAX_SPREAD_PCT_FOR_LIMIT,
         "board": bool(board),
         "price_source": price_source,
-        "aggressive_limit_ticks": SUMMARY_AGGRESSIVE_LIMIT_TICKS if source == "SUMMARY_AI" and order_type == "LIMIT" else 0,
+        "aggressive_limit_ticks": SUMMARY_AGGRESSIVE_LIMIT_TICKS if source == "SUMMARY_AI" and order_type == "LIMIT" and side == "BUY" else 0,
+        "sell_credit_limit_down_tick_enabled": SELL_CREDIT_LIMIT_DOWN_TICK_ENABLED,
         "trade_guard": True,
         "low_move_guard": bool(ENTRY_ORDER_LOW_MOVE_GUARD_ENABLED and source == "SUMMARY_AI"),
         "five_sec_guard": bool(ENTRY_ORDER_5S_GUARD_ENABLED and source == "SUMMARY_AI"),
