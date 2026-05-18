@@ -1,17 +1,18 @@
 # ============================================================
 # File   : core/startup/entry_affordability_runtime_patch.py
-# Version: PRODUCTION-AI-PRE-AFFORDABILITY-PATCH-V1
+# Version: PRODUCTION-AI-PRE-AFFORDABILITY-PATCH-V2-PRICE-RANGE-REASON
 # ------------------------------------------------------------
 # 目的:
-#   AIに確認する前に、最低1単元でも予算上限を超える高価格銘柄を除外する。
+#   AIに確認する前に、対象価格帯外/最低1単元でも予算上限を超える銘柄を除外する。
 #
 # 背景:
-#   50万円 / 100株単位の場合、株価5000円超は最低100株でも50万円超。
-#   AI_OK後に lot_sizer で qty=0 になり、AI枠を無駄に消費していた。
+#   3000円以上7000円以下の銘柄にエントリーしたい。
+#   以前は 50万円 / 100株 = 5000円上限として動き、5000〜7000円がAI前で落ちる可能性があった。
 #
 # 方針:
 #   - trading.entry.entry_budget の共通設定を使う
-#   - MAX_ENTRY_ONESHOT_YEN を増額すれば上限価格も自動追随
+#   - ENTRY_MIN_PRICE / ENTRY_MAX_PRICE / MAX_ENTRY_ONESHOT_YEN をログへ出す
+#   - skipped理由を entry_budget 側の reason で出す
 #   - candidates.build_summary_ai_entry_candidates をラップする
 #   - runner.py が直接import済みの関数も差し替える
 # ============================================================
@@ -97,11 +98,14 @@ def _filter_affordable_candidates_df(df, *, label: str):
                     "symbol": _symbol_from_row(row),
                     "side": str(row.get("side") or row.get("ai_side") or ""),
                     "price": round(float(diag.get("price") or price or 0.0), 2),
+                    "min_price": round(float(diag.get("min_price") or 0.0), 2),
                     "max_price": round(float(diag.get("max_price") or 0.0), 2),
+                    "configured_max_price": round(float(diag.get("configured_max_price") or 0.0), 2),
+                    "affordable_max_price": round(float(diag.get("affordable_max_price") or 0.0), 2),
                     "budget_yen": round(float(diag.get("budget_yen") or 0.0), 0),
                     "lot_size": int(diag.get("lot_size") or 0),
                     "min_notional": round(float(diag.get("min_notional") or 0.0), 0),
-                    "reason": "price_over_budget_for_min_lot",
+                    "reason": str(diag.get("reason") or "price_range_or_budget_ng"),
                 }
             )
 
@@ -162,7 +166,7 @@ def install() -> bool:
         logger.debug("[ENTRY AFFORDABILITY PATCH] runner patch skipped", exc_info=True)
 
     _PATCHED = True
-    logger.warning("[ENTRY AFFORDABILITY PATCH] installed ai_pre_affordability_filter=True")
+    logger.warning("[ENTRY AFFORDABILITY PATCH] installed ai_pre_affordability_filter=True price_range_reason=True")
     return True
 
 
