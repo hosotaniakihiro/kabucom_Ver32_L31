@@ -10,7 +10,7 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.5-MAIN-HEARTBEAT-WATCHDOG
+# Version: Ver38.6-MAIN-EXPLICIT-ENTRY-QTY-MINLOT-PATCH
 # ------------------------------------------------------------
 # ✔ PROJECT_ROOT を最初に sys.path へ追加
 # ✔ core.logging.console_tee を確実に import / setup
@@ -18,6 +18,7 @@
 # ✔ system_startup 後に logging StreamHandler を tee へ再接続
 # ✔ 100368 SELL拒否後の entry_controller ログ補正 runtime patch を起動時install
 # ✔ 起動高速化 runtime patch を起動時install
+# ✔ ENTRY_QTY_ZERO対策 runtime patch を明示install
 # ✔ EXIT scheduler を run_exit_pipeline で1秒ごとに登録
 # ✔ main.py 側の scheduler / realtime / position_sync / push_monitor 生存証跡を heartbeat DB に保存
 # ✔ 既存の起動処理は維持
@@ -237,12 +238,17 @@ def _install_main_runtime_patches():
         起動直後の重い ranking 初回tickを抑止し、ranking summary jobの
         巨大DataFrame戻り値ログを抑制する。
 
+    - entry_qty_min_lot_runtime_patch:
+        entry_controller の数量計算が0株を返しても、価格帯OK・70万円以内で
+        100株買えるなら最低100株へ戻す。
+
     - oneshot_limit_700k_patch:
-        1回あたり建玉上限を70万円にruntime反映する。
+        1回あたり建玉上限を70万円にruntime反映し、関連patchをまとめて入れる。
     """
     patches = [
         ("core.startup.entry_controller_runtime_reject_patch", "install"),
         ("core.startup.fast_startup_runtime_patch", "install"),
+        ("core.startup.entry_qty_min_lot_runtime_patch", "install"),
         ("core.startup.oneshot_limit_700k_patch", "install"),
     ]
 
