@@ -1,10 +1,11 @@
 # ============================================================
 # File   : core/startup/oneshot_limit_700k_patch.py
-# Version: Ver03-ONESHOT-LIMIT-700K-AND-SUMMARY-AI-PATCHES
+# Version: Ver04-ONESHOT-LIMIT-700K-AND-SUMMARY-AI-PATCHES
 # ------------------------------------------------------------
 # kabu_api.buy_sell_entry.MAX_ONESHOT を起動時に 700,000 円へ変更する。
 # SUMMARY AI の daily risk 事前除外を銘柄単位に限定する。
 # SUMMARY AI executor の executed 誤判定を補正する。
+# SUMMARY AI のSELL候補から売建不可銘柄を候補前除外する。
 # ============================================================
 
 from __future__ import annotations
@@ -46,6 +47,18 @@ def _install_summary_ai_executor_result_patch() -> bool:
         return False
 
 
+def _install_summary_ai_sell_credit_prefilter_patch() -> bool:
+    try:
+        from core.startup import summary_ai_sell_credit_prefilter_patch as p
+
+        ok = p.install()
+        logger.warning("[ONESHOT LIMIT PATCH] summary_ai_sell_credit_prefilter_patch installed=%s", ok)
+        return bool(ok)
+    except Exception:
+        logger.exception("[ONESHOT LIMIT PATCH] summary_ai_sell_credit_prefilter_patch install failed")
+        return False
+
+
 def install() -> bool:
     global _INSTALLED
 
@@ -70,6 +83,7 @@ def install() -> bool:
 
     ok_symbol_risk = _install_summary_ai_symbol_risk_patch()
     ok_executor_result = _install_summary_ai_executor_result_patch()
+    ok_sell_credit_prefilter = _install_summary_ai_sell_credit_prefilter_patch()
 
-    _INSTALLED = bool(ok_main or ok_symbol_risk or ok_executor_result)
+    _INSTALLED = bool(ok_main or ok_symbol_risk or ok_executor_result or ok_sell_credit_prefilter)
     return _INSTALLED
