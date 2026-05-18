@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/oneshot_limit_700k_patch.py
-# Version: Ver09-BUY-THRESHOLD-AND-FIXED-SYMBOLNAME-WIDTH
+# Version: Ver10-SCORE-COLUMN-STRICT-ALIGN
 # ------------------------------------------------------------
 # 起動時 runtime patches:
 # - 70万円ワンショット制限
@@ -43,17 +43,14 @@ def _env_int(name: str, default: int) -> int:
 def _install_entry_threshold_patch() -> bool:
     try:
         import trading.handlers.entry_controller as ec
-
         old_buy_score = getattr(ec, "MIN_SUMMARY_SCORE_BUY", None)
         old_buy_comp = getattr(ec, "MIN_COMPOSITE_SCORE_BUY", None)
         old_sell_score = getattr(ec, "MIN_SUMMARY_SCORE_SELL", None)
         old_sell_comp = getattr(ec, "MIN_COMPOSITE_SCORE_SELL", None)
-
         ec.MIN_SUMMARY_SCORE_BUY = _env_float("MIN_SUMMARY_SCORE_BUY", 1.0)
         ec.MIN_COMPOSITE_SCORE_BUY = _env_float("MIN_COMPOSITE_SCORE_BUY", 0.8)
         ec.MIN_SUMMARY_SCORE_SELL = _env_float("MIN_SUMMARY_SCORE_SELL", 1.0)
         ec.MIN_COMPOSITE_SCORE_SELL = _env_float("MIN_COMPOSITE_SCORE_SELL", 1.0)
-
         logger.warning(
             "[ENTRY THRESHOLD PATCH] installed BUY score %s->%s comp %s->%s SELL score %s->%s comp %s->%s",
             old_buy_score, ec.MIN_SUMMARY_SCORE_BUY,
@@ -97,6 +94,31 @@ def _install_aligned_summary_display_patch() -> bool:
         left_cols = {"symbol", "symbolname", "datetime"}
         symbolname_width = max(10, min(_env_int("DISPLAY_SYMBOLNAME_WIDTH", 24), 40))
 
+        fixed_widths = {
+            "symbol": 6,
+            "symbolname": symbolname_width,
+            "score": 8,
+            "score_total": 11,
+            "final_score": 11,
+            "display_score": 13,
+            "score_buy": 9,
+            "score_sell": 10,
+            "slope": 9,
+            "slope_atr_scaled": 16,
+            "score_slope": 12,
+            "mtf": 7,
+            "score_mtf": 9,
+            "mtf_score": 9,
+            "open": 8,
+            "high": 8,
+            "low": 8,
+            "close": 8,
+            "rsi": 6,
+            "macd": 7,
+            "signal": 7,
+            "datetime": 19,
+        }
+
         def _num(v, default=np.nan):
             try:
                 if v is None or (isinstance(v, str) and v.strip() == ""):
@@ -114,13 +136,13 @@ def _install_aligned_summary_display_patch() -> bool:
         def _cell(col: str, v) -> str:
             try:
                 if col in score_cols:
-                    return _fmt_num(v, 7, 2)
+                    return _fmt_num(v, fixed_widths.get(col, 8), 2)
                 if col in slope_cols:
-                    return _fmt_num(v, 8, 4)
+                    return _fmt_num(v, fixed_widths.get(col, 9), 4)
                 if col in two_cols:
-                    return _fmt_num(v, 7, 2)
+                    return _fmt_num(v, fixed_widths.get(col, 7), 2)
                 if col in one_cols:
-                    return _fmt_num(v, 8, 1)
+                    return _fmt_num(v, fixed_widths.get(col, 8), 1)
                 if pd.isna(v):
                     return "-"
                 return str(v)
@@ -130,7 +152,9 @@ def _install_aligned_summary_display_patch() -> bool:
         def _w(s: str) -> int:
             total = 0
             for ch in str(s):
-                total += 2 if unicodedata.east_asian_width(ch) in {"F", "W", "A"} else 1
+                # Windows/PyCharmでは east_asian_width=A を1幅で表示することが多い。
+                # Aを2幅扱いすると score列が右へズレるため、F/Wだけ2幅にする。
+                total += 2 if unicodedata.east_asian_width(ch) in {"F", "W"} else 1
             return total
 
         def _pad(s: str, width: int, left: bool) -> str:
@@ -143,36 +167,25 @@ def _install_aligned_summary_display_patch() -> bool:
             if _w(s) <= width:
                 return s
             out = ""
+            ell = "..."
             for ch in s:
-                if _w(out + ch + "…") > width:
+                if _w(out + ch + ell) > width:
                     break
                 out += ch
-            return out + "…"
+            return out + ell
 
         def _table_to_string(df) -> str:
             try:
                 if df is None or not isinstance(df, pd.DataFrame) or df.empty:
                     return ""
-                rows = []
                 cols = [str(c) for c in df.columns]
-                for _, r in df.iterrows():
-                    rows.append([_cell(c, r.get(c, "")) for c in cols])
-                widths = []
-                for i, c in enumerate(cols):
-                    if c == "symbolname":
-                        widths.append(symbolname_width)
-                        continue
-                    maxw = _w(c)
-                    for row in rows:
-                        maxw = max(maxw, _w(row[i]))
-                    widths.append(maxw)
-
+                widths = [fixed_widths.get(c, max(_w(c), 8)) for c in cols]
                 header = " ".join(_pad(c, widths[i], True if c in left_cols else False) for i, c in enumerate(cols))
                 lines = [header]
-                for row in rows:
+                for _, r in df.iterrows():
                     vals = []
                     for i, c in enumerate(cols):
-                        s = row[i]
+                        s = _cell(c, r.get(c, ""))
                         if c == "symbolname":
                             s = _clip(s, widths[i])
                         vals.append(_pad(s, widths[i], True if c in left_cols else False))
@@ -187,7 +200,7 @@ def _install_aligned_summary_display_patch() -> bool:
         try:
             from core.global_context import context as ctx
             old = getattr(ctx, "_log_df_profile", None)
-            if callable(old) and not getattr(old, "_wide_aligned_display_patch_v3", False):
+            if callable(old) and not getattr(old, "_score_strict_aligned_display_patch_v4", False):
                 def _patched_log_df_profile(prefix, tf, source, df):
                     try:
                         prof = ctx._profile_df(df)
@@ -212,7 +225,7 @@ def _install_aligned_summary_display_patch() -> bool:
                             ctx.logger.info("%s tf=%s source=%s\n%s", prefix, tf, source, _table_to_string(df[show_cols].head(20)))
                     except Exception:
                         ctx.logger.exception("[GlobalContext] _log_df_profile patched failed prefix=%s tf=%s source=%s", prefix, tf, source)
-                _patched_log_df_profile._wide_aligned_display_patch_v3 = True
+                _patched_log_df_profile._score_strict_aligned_display_patch_v4 = True
                 ctx._log_df_profile = _patched_log_df_profile
         except Exception:
             logger.debug("[ALIGNED DISPLAY PATCH] context patch skipped", exc_info=True)
@@ -226,7 +239,7 @@ def _install_aligned_summary_display_patch() -> bool:
             logger.debug("[ALIGNED DISPLAY PATCH] display_base patch skipped", exc_info=True)
 
         logger.warning(
-            "[ALIGNED DISPLAY PATCH] installed symbolname_width=%s score=2dec slope=4dec price/rsi=1dec",
+            "[ALIGNED DISPLAY PATCH] installed strict score alignment symbolname_width=%s A_width=1",
             symbolname_width,
         )
         return True
