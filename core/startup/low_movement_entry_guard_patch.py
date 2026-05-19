@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/low_movement_entry_guard_patch.py
-# Version: Ver04-INSTALL-SCORING-FLAG-PATTERN-BRIDGE
+# Version: Ver05-INSTALL-ENTRY-DIRECTION-CONFIRM-GUARD
 # ------------------------------------------------------------
 # あまり動かない銘柄へのエントリーを発注直前で止める。
 # さらに、ランキング方向に逆らうエントリーも禁止する。
@@ -9,6 +9,10 @@
 #   - trading/scoring/flags 配下の生成フラグをスコアへ反映
 #   - trading/scoring/patterns 配下のパターンもスコアへ反映
 #   - scoring_flag_pattern_bridge_patch を main.py 起動時に同時 install
+#
+# Ver05:
+#   - 「売ったら上がる / 買ったら下がる」対策として、
+#     entry_direction_confirm_guard_patch も同時 install
 # ============================================================
 
 from __future__ import annotations
@@ -100,6 +104,17 @@ def _install_scoring_flag_pattern_bridge() -> bool:
         return False
 
 
+def _install_entry_direction_confirm_guard() -> bool:
+    try:
+        from core.startup import entry_direction_confirm_guard_patch as p
+        ok = p.install()
+        logger.warning("[LOW MOVE GUARD] entry_direction_confirm_guard_patch installed=%s", ok)
+        return bool(ok)
+    except Exception:
+        logger.exception("[LOW MOVE GUARD] entry_direction_confirm_guard_patch install failed")
+        return False
+
+
 def _low_movement_guard(entry_row: Any) -> bool:
     row = _row_to_dict(entry_row)
     symbol = _norm_symbol(_first(row, ("symbol", "code", "stock_code"), ""))
@@ -125,7 +140,10 @@ def _low_movement_guard(entry_row: Any) -> bool:
     strong_range_pct = _env_float("LOW_MOVE_STRONG_RANGE_PCT", 0.020)
 
     if range_pct < min_range_pct:
-        logger.warning("[LOW MOVE GUARD] NG symbol=%s reason=range_too_small close=%.1f high=%.1f low=%.1f range_pct=%.4f min=%.4f", symbol, close, high, low, range_pct, min_range_pct)
+        logger.warning(
+            "[LOW MOVE GUARD] NG symbol=%s reason=range_too_small close=%.1f high=%.1f low=%.1f range_pct=%.4f min=%.4f",
+            symbol, close, high, low, range_pct, min_range_pct,
+        )
         return False
 
     slope_values = []
@@ -141,16 +159,28 @@ def _low_movement_guard(entry_row: Any) -> bool:
         abs_slope = max_abs_slope
         min_abs_slope = _env_float("LOW_MOVE_MIN_ABS_SLOPE_LOW_PRICE", 0.0003) if close < split else _env_float("LOW_MOVE_MIN_ABS_SLOPE_HIGH_PRICE", 0.0002)
         if abs_slope < min_abs_slope and range_pct < strong_range_pct:
-            logger.warning("[LOW MOVE GUARD] NG symbol=%s reason=slope_too_small close=%.1f abs_slope=%.6f min=%.6f range_pct=%.4f strong_range=%.4f", symbol, close, abs_slope, min_abs_slope, range_pct, strong_range_pct)
+            logger.warning(
+                "[LOW MOVE GUARD] NG symbol=%s reason=slope_too_small close=%.1f abs_slope=%.6f min=%.6f range_pct=%.4f strong_range=%.4f",
+                symbol, close, abs_slope, min_abs_slope, range_pct, strong_range_pct,
+            )
             return False
         if abs_slope < min_abs_slope and range_pct >= strong_range_pct:
-            logger.warning("[LOW MOVE GUARD] slope small but allowed by strong range symbol=%s close=%.1f abs_slope=%.6f min=%.6f range_pct=%.4f strong_range=%.4f", symbol, close, abs_slope, min_abs_slope, range_pct, strong_range_pct)
+            logger.warning(
+                "[LOW MOVE GUARD] slope small but allowed by strong range symbol=%s close=%.1f abs_slope=%.6f min=%.6f range_pct=%.4f strong_range=%.4f",
+                symbol, close, abs_slope, min_abs_slope, range_pct, strong_range_pct,
+            )
 
     if abs(macd) < 0.0001 and abs(signal) < 0.0001 and max_abs_slope < 0.0001 and range_pct < strong_range_pct:
-        logger.warning("[LOW MOVE GUARD] NG symbol=%s reason=no_momentum macd=%.6f signal=%.6f slope=%.6f range_pct=%.4f strong_range=%.4f", symbol, macd, signal, max_abs_slope, range_pct, strong_range_pct)
+        logger.warning(
+            "[LOW MOVE GUARD] NG symbol=%s reason=no_momentum macd=%.6f signal=%.6f slope=%.6f range_pct=%.4f strong_range=%.4f",
+            symbol, macd, signal, max_abs_slope, range_pct, strong_range_pct,
+        )
         return False
 
-    logger.info("[LOW MOVE GUARD] OK symbol=%s close=%.1f range_pct=%.4f min_range=%.4f strong_range=%.4f macd=%.4f signal=%.4f max_abs_slope=%.6f", symbol, close, range_pct, min_range_pct, strong_range_pct, macd, signal, max_abs_slope)
+    logger.info(
+        "[LOW MOVE GUARD] OK symbol=%s close=%.1f range_pct=%.4f min_range=%.4f strong_range=%.4f macd=%.4f signal=%.4f max_abs_slope=%.6f",
+        symbol, close, range_pct, min_range_pct, strong_range_pct, macd, signal, max_abs_slope,
+    )
     return True
 
 
@@ -192,8 +222,9 @@ def install() -> bool:
     global _INSTALLED, _ORIG_ATR_FILTER, _ORIG_RANGE_FILTER
     ok_direction = _install_ranking_direction_guard()
     ok_scoring_bridge = _install_scoring_flag_pattern_bridge()
+    ok_entry_direction = _install_entry_direction_confirm_guard()
     if _INSTALLED:
-        return bool(ok_direction or ok_scoring_bridge or True)
+        return bool(ok_direction or ok_scoring_bridge or ok_entry_direction or True)
     try:
         import trading.handlers.entry_controller as ec
         old_atr = getattr(ec, "atr_1m_filter", None)
@@ -208,11 +239,21 @@ def install() -> bool:
         ec.atr_1m_filter = _patched_atr_1m_filter
         ec.range_5m_filter = _patched_range_5m_filter
         _INSTALLED = True
-        logger.warning("[LOW MOVE GUARD] installed low_range=%.4f high_range=%.4f low_slope=%.6f high_slope=%.6f strong_range=%.4f ranking_direction=%s scoring_flag_pattern_bridge=%s", _env_float("LOW_MOVE_MIN_RANGE_PCT_LOW_PRICE", 0.015), _env_float("LOW_MOVE_MIN_RANGE_PCT_HIGH_PRICE", 0.008), _env_float("LOW_MOVE_MIN_ABS_SLOPE_LOW_PRICE", 0.0003), _env_float("LOW_MOVE_MIN_ABS_SLOPE_HIGH_PRICE", 0.0002), _env_float("LOW_MOVE_STRONG_RANGE_PCT", 0.020), ok_direction, ok_scoring_bridge)
+        logger.warning(
+            "[LOW MOVE GUARD] installed low_range=%.4f high_range=%.4f low_slope=%.6f high_slope=%.6f strong_range=%.4f ranking_direction=%s scoring_flag_pattern_bridge=%s entry_direction_confirm=%s",
+            _env_float("LOW_MOVE_MIN_RANGE_PCT_LOW_PRICE", 0.015),
+            _env_float("LOW_MOVE_MIN_RANGE_PCT_HIGH_PRICE", 0.008),
+            _env_float("LOW_MOVE_MIN_ABS_SLOPE_LOW_PRICE", 0.0003),
+            _env_float("LOW_MOVE_MIN_ABS_SLOPE_HIGH_PRICE", 0.0002),
+            _env_float("LOW_MOVE_STRONG_RANGE_PCT", 0.020),
+            ok_direction,
+            ok_scoring_bridge,
+            ok_entry_direction,
+        )
         return True
     except Exception:
         logger.exception("[LOW MOVE GUARD] install failed")
-        return bool(ok_direction or ok_scoring_bridge)
+        return bool(ok_direction or ok_scoring_bridge or ok_entry_direction)
 
 
 try:
