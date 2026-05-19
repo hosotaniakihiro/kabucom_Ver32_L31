@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/low_movement_entry_guard_patch.py
-# Version: Ver08-INSTALL-ENTRY-PRICE-IMPROVEMENT
+# Version: Ver09-INSTALL-MA-CROSS-STATE
 # ------------------------------------------------------------
 # あまり動かない銘柄へのエントリーを発注直前で止める。
 # さらに、ランキング方向に逆らうエントリーも禁止する。
@@ -14,6 +14,10 @@
 # Ver08:
 #   - entry_price_improvement_patch も同時 install
 #   - Bid/Ask レベルで有利指値へ補正
+#
+# Ver09:
+#   - ma_cross_state_runtime_patch も同時 install
+#   - ゴールデンクロス/デッドクロス後のMA継続状態を方向強度へ反映
 # ============================================================
 
 from __future__ import annotations
@@ -138,6 +142,17 @@ def _install_entry_price_improvement_patch() -> bool:
         return False
 
 
+def _install_ma_cross_state_runtime_patch() -> bool:
+    try:
+        from core.startup import ma_cross_state_runtime_patch as p
+        ok = p.install()
+        logger.warning("[LOW MOVE GUARD] ma_cross_state_runtime_patch installed=%s", ok)
+        return bool(ok)
+    except Exception:
+        logger.exception("[LOW MOVE GUARD] ma_cross_state_runtime_patch install failed")
+        return False
+
+
 def _low_movement_guard(entry_row: Any) -> bool:
     row = _row_to_dict(entry_row)
     symbol = _norm_symbol(_first(row, ("symbol", "code", "stock_code"), ""))
@@ -248,12 +263,14 @@ def install() -> bool:
     ok_entry_direction = False
     ok_final_safety = _install_final_entry_safety_guard()
     ok_price_improve = _install_entry_price_improvement_patch()
+    ok_ma_cross = _install_ma_cross_state_runtime_patch()
 
     if _INSTALLED:
         ok_entry_direction = _install_entry_direction_confirm_guard()
         ok_final_safety = _install_final_entry_safety_guard()
         ok_price_improve = _install_entry_price_improvement_patch()
-        return bool(ok_direction or ok_scoring_bridge or ok_entry_direction or ok_final_safety or ok_price_improve or True)
+        ok_ma_cross = _install_ma_cross_state_runtime_patch()
+        return bool(ok_direction or ok_scoring_bridge or ok_entry_direction or ok_final_safety or ok_price_improve or ok_ma_cross or True)
 
     try:
         import trading.handlers.entry_controller as ec
@@ -264,6 +281,7 @@ def install() -> bool:
             ok_entry_direction = _install_entry_direction_confirm_guard()
             ok_final_safety = _install_final_entry_safety_guard()
             ok_price_improve = _install_entry_price_improvement_patch()
+            ok_ma_cross = _install_ma_cross_state_runtime_patch()
             return True
 
         _ORIG_ATR_FILTER = old_atr
@@ -277,9 +295,10 @@ def install() -> bool:
         ok_entry_direction = _install_entry_direction_confirm_guard()
         ok_final_safety = _install_final_entry_safety_guard()
         ok_price_improve = _install_entry_price_improvement_patch()
+        ok_ma_cross = _install_ma_cross_state_runtime_patch()
 
         logger.warning(
-            "[LOW MOVE GUARD] installed low_range=%.4f high_range=%.4f low_slope=%.6f high_slope=%.6f strong_range=%.4f ranking_direction=%s scoring_flag_pattern_bridge=%s entry_direction_confirm=%s final_entry_safety=%s price_improve=%s",
+            "[LOW MOVE GUARD] installed low_range=%.4f high_range=%.4f low_slope=%.6f high_slope=%.6f strong_range=%.4f ranking_direction=%s scoring_flag_pattern_bridge=%s entry_direction_confirm=%s final_entry_safety=%s price_improve=%s ma_cross_state=%s",
             _env_float("LOW_MOVE_MIN_RANGE_PCT_LOW_PRICE", 0.015),
             _env_float("LOW_MOVE_MIN_RANGE_PCT_HIGH_PRICE", 0.008),
             _env_float("LOW_MOVE_MIN_ABS_SLOPE_LOW_PRICE", 0.0003),
@@ -290,11 +309,12 @@ def install() -> bool:
             ok_entry_direction,
             ok_final_safety,
             ok_price_improve,
+            ok_ma_cross,
         )
         return True
     except Exception:
         logger.exception("[LOW MOVE GUARD] install failed")
-        return bool(ok_direction or ok_scoring_bridge or ok_entry_direction or ok_final_safety or ok_price_improve)
+        return bool(ok_direction or ok_scoring_bridge or ok_entry_direction or ok_final_safety or ok_price_improve or ok_ma_cross)
 
 
 try:
