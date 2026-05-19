@@ -1,47 +1,19 @@
 # ============================================================
 # File   : core/startup/entry_direction_confirm_guard_patch.py
-# Version: Ver03-MA-STRUCTURE-HARD-GUARD
+# Version: Ver04-DAILY-MA-SLOPE-AWARE-GUARD
 # ------------------------------------------------------------
 # 「売ったら上がる / 買ったら下がる」を減らすため、
 # エントリー直前で方向確認を行う runtime patch。
 #
-# Ver02:
-#   通常シグナルと実方向が強く逆なら、条件付きで反転する。
+# Ver04:
+#   - daily_ma5 / daily_ma25 / daily_ma75 を MA 判定対象に追加
+#   - daily_ma25_slope / daily_ma75_slope を MA傾き判定対象に追加
+#   - MA傾き列が無い場合でも、MAの並びだけで逆方向を禁止可能
 #
-# Ver03:
-#   分足MA構造の最終ガードを追加。
-#
-#   BUY禁止:
-#     - close < ma5 / ma25 / ma75
-#     - ma5 <= ma25 <= ma75
-#     - ma25下向き or ma75下向き
-#
-#   SELL禁止:
-#     - close > ma5 / ma25 / ma75
-#     - ma5 >= ma25 >= ma75
-#     - ma25上向き or ma75上向き
-#
-#   目的:
-#     名村造船所のように、分足移動平均が全部下向きで
-#     株価もその下にあるのにBUYしてしまう事故を止める。
-#
-# 環境変数:
-#   ENTRY_DIRECTION_CONFIRM_ENABLED=1
-#   ENTRY_DIRECTION_CONFIRM_MIN_STRENGTH=1.5
-#   ENTRY_DIRECTION_CONFIRM_STRICT=1
-#
-#   ENTRY_MA_STRUCTURE_GUARD_ENABLED=1
-#   ENTRY_MA_REQUIRE_PRICE_ABOVE_ALL_FOR_BUY=1
-#   ENTRY_MA_REQUIRE_PRICE_BELOW_ALL_FOR_SELL=1
-#
-#   ENTRY_CONTRARIAN_REVERSE_ENABLED=1
-#   ENTRY_CONTRARIAN_REVERSE_MIN_STRENGTH=2.5
-#   ENTRY_CONTRARIAN_REVERSE_HALF_SIZE=1
-#
-# ログ:
-#   [ENTRY MA STRUCTURE GUARD] NG ...
-#   [ENTRY DIRECTION CONFIRM] OK/NG ...
-#   [ENTRY CONTRARIAN REVERSE] BUY->SELL / SELL->BUY ...
+# 重要:
+#   日足MTFパッチは stock_analysis_latest の MA_25_Slope / MA_75_Slope を
+#   daily_ma25_slope / daily_ma75_slope として summary_df に付与する。
+#   そのため、このガードでは daily_* も必ず読む。
 # ============================================================
 
 from __future__ import annotations
@@ -117,6 +89,16 @@ def _first(row: dict, keys: tuple[str, ...], default=None):
     return default
 
 
+def _has_any(row: dict, keys: tuple[str, ...]) -> bool:
+    for k in keys:
+        try:
+            if k in row and row.get(k) is not None and str(row.get(k)).strip() != "":
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def _norm_side(v: Any) -> str:
     s = str(v or "").strip().upper()
     if s in {"1", "SELL", "SHORT", "売", "売り"}:
@@ -142,81 +124,107 @@ def _norm_symbol(v: Any) -> str:
     return s
 
 
-def _get_price_ma(row: dict) -> tuple[float, float, float, float]:
-    close = _safe_float(_first(row, ("close", "close_price", "price", "current_price"), 0.0), 0.0)
-    ma5 = _safe_float(_first(row, ("ma5", "MA5", "ma_5"), 0.0), 0.0)
-    ma25 = _safe_float(_first(row, ("ma25", "MA25", "ma_25"), 0.0), 0.0)
-    ma75 = _safe_float(_first(row, ("ma75", "MA75", "ma_75"), 0.0), 0.0)
-    return close, ma5, ma25, ma75
+def _get_price_ma(row: dict) -> tuple[float, float, float, float, str]:
+    """
+    MAは分足 ma5/ma25/ma75 を優先し、無ければ日足 daily_ma5/25/75 を使う。
+    """
+    close = _safe_float(_first(row, ("close", "close_price", "price", "current_price", "daily_close"), 0.0), 0.0)
+
+    ma5_raw = _first(row, ("ma5", "MA5", "ma_5", "daily_ma5", "MA_5"), None)
+    ma25_raw = _first(row, ("ma25", "MA25", "ma_25", "daily_ma25", "MA_25"), None)
+    ma75_raw = _first(row, ("ma75", "MA75", "ma_75", "daily_ma75", "MA_75"), None)
+
+    ma5 = _safe_float(ma5_raw, 0.0)
+    ma25 = _safe_float(ma25_raw, 0.0)
+    ma75 = _safe_float(ma75_raw, 0.0)
+
+    src = "minute"
+    if ma5_raw is None and ma25_raw is None and ma75_raw is None:
+        src = "none"
+    elif any(k in row for k in ("daily_ma5", "daily_ma25", "daily_ma75", "MA_5", "MA_25", "MA_75")):
+        if not any(k in row for k in ("ma5", "MA5", "ma_5", "ma25", "MA25", "ma_25", "ma75", "MA75", "ma_75")):
+            src = "daily"
+        else:
+            src = "minute_or_daily"
+
+    return close, ma5, ma25, ma75, src
 
 
-def _get_ma_slope(row: dict, ma_key: str, fallback_slope: float = 0.0) -> float:
-    keys = (
+def _ma_slope_keys(ma_key: str) -> tuple[str, ...]:
+    # ma25 -> ma25_slope / MA25_Slope / daily_ma25_slope / MA_25_Slope など全部拾う
+    n = ma_key.lower().replace("ma", "")
+    return (
         f"{ma_key}_slope",
         f"{ma_key}_Slope",
         f"{ma_key.upper()}_Slope",
         f"{ma_key.upper()}_slope",
+        f"ma_{n}_slope",
+        f"MA_{n}_Slope",
+        f"MA_{n}_slope",
+        f"daily_{ma_key}_slope",
+        f"daily_{ma_key}_Slope",
+        f"daily_ma{n}_slope",
+        f"daily_ma{n}_Slope",
+        f"daily_MA_{n}_Slope",
     )
-    return _safe_float(_first(row, keys, fallback_slope), fallback_slope)
+
+
+def _get_ma_slope(row: dict, ma_key: str) -> tuple[float, bool]:
+    keys = _ma_slope_keys(ma_key)
+    found = _has_any(row, keys)
+    if not found:
+        return 0.0, False
+    return _safe_float(_first(row, keys, 0.0), 0.0), True
 
 
 def _ma_structure_guard(row: dict, side: str, symbol: str) -> bool:
-    """
-    MA構造による最終ガード。
-
-    BUY:
-      株価が ma5/ma25/ma75 をすべて下回り、かつ ma5<=ma25<=ma75 の
-      下落パーフェクトオーダーなら禁止。
-
-    SELL:
-      株価が ma5/ma25/ma75 をすべて上回り、かつ ma5>=ma25>=ma75 の
-      上昇パーフェクトオーダーなら禁止。
-    """
     if not _env_bool("ENTRY_MA_STRUCTURE_GUARD_ENABLED", True):
         return True
 
-    close, ma5, ma25, ma75 = _get_price_ma(row)
+    close, ma5, ma25, ma75, ma_source = _get_price_ma(row)
     if close <= 0 or ma5 <= 0 or ma25 <= 0 or ma75 <= 0:
         logger.info(
-            "[ENTRY MA STRUCTURE GUARD] SKIP symbol=%s side=%s reason=ma_missing close=%.4f ma5=%.4f ma25=%.4f ma75=%.4f",
-            symbol, side, close, ma5, ma25, ma75,
+            "[ENTRY MA STRUCTURE GUARD] SKIP symbol=%s side=%s reason=ma_missing close=%.4f ma5=%.4f ma25=%.4f ma75=%.4f ma_source=%s",
+            symbol, side, close, ma5, ma25, ma75, ma_source,
         )
         return True
 
-    # 分足側にMA傾きが無いケースがあるため、ma5/25/75 の並びも傾き代理として使う。
-    fallback = _safe_float(_first(row, ("slope", "score_slope", "slope_atr_scaled"), 0.0), 0.0)
-    ma25_slope = _get_ma_slope(row, "ma25", fallback)
-    ma75_slope = _get_ma_slope(row, "ma75", fallback)
+    ma25_slope, has_ma25_slope = _get_ma_slope(row, "ma25")
+    ma75_slope, has_ma75_slope = _get_ma_slope(row, "ma75")
+    has_any_ma_slope = has_ma25_slope or has_ma75_slope
+    block_order_only = _env_bool("ENTRY_MA_ORDER_ONLY_BLOCK_WHEN_SLOPE_MISSING", True)
 
     bearish_price = close < ma5 and close < ma25 and close < ma75
     bearish_order = ma5 <= ma25 <= ma75
-    bearish_ma_slope = ma25_slope <= 0 or ma75_slope <= 0
+    bearish_ma_slope = (ma25_slope <= 0 if has_ma25_slope else False) or (ma75_slope <= 0 if has_ma75_slope else False)
+    bearish_block = bearish_price and bearish_order and (bearish_ma_slope or (block_order_only and not has_any_ma_slope))
 
     bullish_price = close > ma5 and close > ma25 and close > ma75
     bullish_order = ma5 >= ma25 >= ma75
-    bullish_ma_slope = ma25_slope >= 0 or ma75_slope >= 0
+    bullish_ma_slope = (ma25_slope >= 0 if has_ma25_slope else False) or (ma75_slope >= 0 if has_ma75_slope else False)
+    bullish_block = bullish_price and bullish_order and (bullish_ma_slope or (block_order_only and not has_any_ma_slope))
 
-    if side == "BUY":
-        if _env_bool("ENTRY_MA_REQUIRE_PRICE_ABOVE_ALL_FOR_BUY", True):
-            if bearish_price and bearish_order and bearish_ma_slope:
-                logger.warning(
-                    "[ENTRY MA STRUCTURE GUARD] NG symbol=%s side=BUY reason=bearish_ma_structure close=%.4f ma5=%.4f ma25=%.4f ma75=%.4f ma25_slope=%.6f ma75_slope=%.6f",
-                    symbol, close, ma5, ma25, ma75, ma25_slope, ma75_slope,
-                )
-                return False
+    if side == "BUY" and _env_bool("ENTRY_MA_REQUIRE_PRICE_ABOVE_ALL_FOR_BUY", True):
+        if bearish_block:
+            reason = "bearish_ma_structure_no_slope" if not has_any_ma_slope else "bearish_ma_structure"
+            logger.warning(
+                "[ENTRY MA STRUCTURE GUARD] NG symbol=%s side=BUY reason=%s close=%.4f ma5=%.4f ma25=%.4f ma75=%.4f ma_source=%s ma25_slope=%.6f ma75_slope=%.6f has_ma25_slope=%s has_ma75_slope=%s",
+                symbol, reason, close, ma5, ma25, ma75, ma_source, ma25_slope, ma75_slope, has_ma25_slope, has_ma75_slope,
+            )
+            return False
 
-    if side == "SELL":
-        if _env_bool("ENTRY_MA_REQUIRE_PRICE_BELOW_ALL_FOR_SELL", True):
-            if bullish_price and bullish_order and bullish_ma_slope:
-                logger.warning(
-                    "[ENTRY MA STRUCTURE GUARD] NG symbol=%s side=SELL reason=bullish_ma_structure close=%.4f ma5=%.4f ma25=%.4f ma75=%.4f ma25_slope=%.6f ma75_slope=%.6f",
-                    symbol, close, ma5, ma25, ma75, ma25_slope, ma75_slope,
-                )
-                return False
+    if side == "SELL" and _env_bool("ENTRY_MA_REQUIRE_PRICE_BELOW_ALL_FOR_SELL", True):
+        if bullish_block:
+            reason = "bullish_ma_structure_no_slope" if not has_any_ma_slope else "bullish_ma_structure"
+            logger.warning(
+                "[ENTRY MA STRUCTURE GUARD] NG symbol=%s side=SELL reason=%s close=%.4f ma5=%.4f ma25=%.4f ma75=%.4f ma_source=%s ma25_slope=%.6f ma75_slope=%.6f has_ma25_slope=%s has_ma75_slope=%s",
+                symbol, reason, close, ma5, ma25, ma75, ma_source, ma25_slope, ma75_slope, has_ma25_slope, has_ma75_slope,
+            )
+            return False
 
     logger.info(
-        "[ENTRY MA STRUCTURE GUARD] OK symbol=%s side=%s close=%.4f ma5=%.4f ma25=%.4f ma75=%.4f ma25_slope=%.6f ma75_slope=%.6f",
-        symbol, side, close, ma5, ma25, ma75, ma25_slope, ma75_slope,
+        "[ENTRY MA STRUCTURE GUARD] OK symbol=%s side=%s close=%.4f ma5=%.4f ma25=%.4f ma75=%.4f ma_source=%s ma25_slope=%.6f ma75_slope=%.6f has_ma25_slope=%s has_ma75_slope=%s order_only_block=%s",
+        symbol, side, close, ma5, ma25, ma75, ma_source, ma25_slope, ma75_slope, has_ma25_slope, has_ma75_slope, block_order_only,
     )
     return True
 
@@ -241,7 +249,7 @@ def _calc_direction_strength(row: dict) -> tuple[float, list[str]]:
     flag_delta = _safe_float(row.get("flag_score_total_delta"), 0.0)
     pattern_delta = _safe_float(row.get("pattern_score_delta"), 0.0)
 
-    close2, ma5, ma25, ma75 = _get_price_ma(row)
+    close2, ma5, ma25, ma75, _ma_source = _get_price_ma(row)
     if close2 > 0 and ma5 > 0 and ma25 > 0 and ma75 > 0:
         if close2 > ma5 > ma25 > ma75:
             strength += 1.2
@@ -407,7 +415,6 @@ def _direction_confirm(entry_row: Any) -> bool:
         return True
 
     if _try_reverse_entry_side(entry_row, row, side, strength, reasons):
-        # 反転後のMA構造も必ず確認する。
         reversed_side = _norm_side(_first(_row_to_dict(entry_row), ("side", "entry_decision", "ai_side"), side))
         if _ma_structure_guard(_row_to_dict(entry_row), reversed_side, symbol):
             return True
@@ -475,7 +482,6 @@ def install() -> bool:
     try:
         import trading.handlers.entry_controller as ec
 
-        # 他パッチが後から filter を上書きした場合に再ラップする。
         if _INSTALLED and _is_currently_wrapped():
             return True
 
@@ -490,11 +496,12 @@ def install() -> bool:
         ec.range_5m_filter = _patched_range_5m_filter
         _INSTALLED = True
         logger.warning(
-            "[ENTRY DIRECTION CONFIRM] installed enabled=%s min_strength=%.3f strict=%s ma_guard=%s reverse_enabled=%s reverse_min=%.3f reverse_half_size=%s",
+            "[ENTRY DIRECTION CONFIRM] installed enabled=%s min_strength=%.3f strict=%s ma_guard=%s order_only_block=%s reverse_enabled=%s reverse_min=%.3f reverse_half_size=%s",
             _env_bool("ENTRY_DIRECTION_CONFIRM_ENABLED", True),
             _env_float("ENTRY_DIRECTION_CONFIRM_MIN_STRENGTH", 1.5),
             _env_bool("ENTRY_DIRECTION_CONFIRM_STRICT", True),
             _env_bool("ENTRY_MA_STRUCTURE_GUARD_ENABLED", True),
+            _env_bool("ENTRY_MA_ORDER_ONLY_BLOCK_WHEN_SLOPE_MISSING", True),
             _env_bool("ENTRY_CONTRARIAN_REVERSE_ENABLED", True),
             _env_float("ENTRY_CONTRARIAN_REVERSE_MIN_STRENGTH", 2.5),
             _env_bool("ENTRY_CONTRARIAN_REVERSE_HALF_SIZE", True),
