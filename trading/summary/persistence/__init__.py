@@ -1,14 +1,15 @@
 # ============================================================
 # File   : trading/summary/persistence/__init__.py
-# Version: PRODUCTION-COMPAT-SUMMARY-PERSISTENCE-EXPORT-V3-DAILY-MTF-PATCH
+# Version: PRODUCTION-COMPAT-SUMMARY-PERSISTENCE-EXPORT-V4-MA-CROSS-STATE-PATCH
 # ------------------------------------------------------------
 # Purpose:
 #   - 既存互換APIを維持する
 #   - summary_saver_bulk 読み込み時に日足MA-MTFパッチを自動インストールする
+#   - summary_saver_bulk 読み込み時にMAクロス状態DB保存パッチを自動インストールする
 #
 # Notes:
 #   - 元ファイルには ranking summary persistence 互換exportが含まれていたため維持
-#   - 日足MA-MTFパッチは失敗しても import 自体を落とさない
+#   - 追加パッチは失敗しても import 自体を落とさない
 # ============================================================
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# daily MA-MTF patch bootstrap
+# summary save patches bootstrap
 # ============================================================
 
 def _install_daily_mtf_patch_on_import() -> None:
@@ -49,7 +50,33 @@ def _install_daily_mtf_patch_on_import() -> None:
         logger.exception("[SUMMARY PERSISTENCE] daily MA-MTF patch install failed")
 
 
+def _install_ma_cross_state_summary_patch_on_import() -> None:
+    """
+    summary_saver_bulk の bulk_upsert_summary / save_summary_bulk / save_summary_df を
+    MAクロス状態DB保存版へ安全にラップする。
+
+    保存前に ma_cross_state 等を DataFrame に追加し、
+    stock_summary_1min / 3min / 5min に不足列があれば ALTER TABLE で追加する。
+
+    ここで失敗しても、既存のsummary保存処理は止めない。
+    """
+    try:
+        from trading.summary.persistence.ma_cross_state_summary_patch import (
+            install_ma_cross_state_summary_patch,
+        )
+
+        ok = install_ma_cross_state_summary_patch()
+        if ok:
+            logger.warning("[SUMMARY PERSISTENCE] MA cross state summary patch installed")
+        else:
+            logger.warning("[SUMMARY PERSISTENCE] MA cross state summary patch not installed")
+
+    except Exception:
+        logger.exception("[SUMMARY PERSISTENCE] MA cross state summary patch install failed")
+
+
 _install_daily_mtf_patch_on_import()
+_install_ma_cross_state_summary_patch_on_import()
 
 
 # ============================================================
@@ -113,7 +140,7 @@ def _call_backend_safely(backend, df: pd.DataFrame, **kwargs: Any) -> Any:
         if accepts_var_kw:
             return backend(df, **kwargs)
 
-        call_kwargs = {k: v for k, v in kwargs.items() if k in params}
+        call_kwargs = {k: v for k, v in kwargs if k in params}
         return backend(df, **call_kwargs)
 
     except TypeError:
