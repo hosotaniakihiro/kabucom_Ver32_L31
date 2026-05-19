@@ -1,31 +1,45 @@
 # ============================================================
 # File   : core/startup/entry_direction_confirm_guard_patch.py
-# Version: Ver02-SAFE-CONTRARIAN-REVERSE-MODE
+# Version: Ver03-MA-STRUCTURE-HARD-GUARD
 # ------------------------------------------------------------
 # 「売ったら上がる / 買ったら下がる」を減らすため、
 # エントリー直前で方向確認を行う runtime patch。
 #
-# Ver01:
-#   BUY  : 直近方向が上向きでなければ止める
-#   SELL : 直近方向が下向きでなければ止める
-#
 # Ver02:
 #   通常シグナルと実方向が強く逆なら、条件付きで反転する。
 #
-#   例:
-#     BUY候補だが実方向が強く下向き  -> SELLへ反転
-#     SELL候補だが実方向が強く上向き -> BUYへ反転
+# Ver03:
+#   分足MA構造の最終ガードを追加。
+#
+#   BUY禁止:
+#     - close < ma5 / ma25 / ma75
+#     - ma5 <= ma25 <= ma75
+#     - ma25下向き or ma75下向き
+#
+#   SELL禁止:
+#     - close > ma5 / ma25 / ma75
+#     - ma5 >= ma25 >= ma75
+#     - ma25上向き or ma75上向き
+#
+#   目的:
+#     名村造船所のように、分足移動平均が全部下向きで
+#     株価もその下にあるのにBUYしてしまう事故を止める。
 #
 # 環境変数:
 #   ENTRY_DIRECTION_CONFIRM_ENABLED=1
 #   ENTRY_DIRECTION_CONFIRM_MIN_STRENGTH=1.5
 #   ENTRY_DIRECTION_CONFIRM_STRICT=1
 #
+#   ENTRY_MA_STRUCTURE_GUARD_ENABLED=1
+#   ENTRY_MA_REQUIRE_PRICE_ABOVE_ALL_FOR_BUY=1
+#   ENTRY_MA_REQUIRE_PRICE_BELOW_ALL_FOR_SELL=1
+#
 #   ENTRY_CONTRARIAN_REVERSE_ENABLED=1
 #   ENTRY_CONTRARIAN_REVERSE_MIN_STRENGTH=2.5
 #   ENTRY_CONTRARIAN_REVERSE_HALF_SIZE=1
 #
 # ログ:
+#   [ENTRY MA STRUCTURE GUARD] NG ...
 #   [ENTRY DIRECTION CONFIRM] OK/NG ...
 #   [ENTRY CONTRARIAN REVERSE] BUY->SELL / SELL->BUY ...
 # ============================================================
@@ -128,6 +142,85 @@ def _norm_symbol(v: Any) -> str:
     return s
 
 
+def _get_price_ma(row: dict) -> tuple[float, float, float, float]:
+    close = _safe_float(_first(row, ("close", "close_price", "price", "current_price"), 0.0), 0.0)
+    ma5 = _safe_float(_first(row, ("ma5", "MA5", "ma_5"), 0.0), 0.0)
+    ma25 = _safe_float(_first(row, ("ma25", "MA25", "ma_25"), 0.0), 0.0)
+    ma75 = _safe_float(_first(row, ("ma75", "MA75", "ma_75"), 0.0), 0.0)
+    return close, ma5, ma25, ma75
+
+
+def _get_ma_slope(row: dict, ma_key: str, fallback_slope: float = 0.0) -> float:
+    keys = (
+        f"{ma_key}_slope",
+        f"{ma_key}_Slope",
+        f"{ma_key.upper()}_Slope",
+        f"{ma_key.upper()}_slope",
+    )
+    return _safe_float(_first(row, keys, fallback_slope), fallback_slope)
+
+
+def _ma_structure_guard(row: dict, side: str, symbol: str) -> bool:
+    """
+    MA構造による最終ガード。
+
+    BUY:
+      株価が ma5/ma25/ma75 をすべて下回り、かつ ma5<=ma25<=ma75 の
+      下落パーフェクトオーダーなら禁止。
+
+    SELL:
+      株価が ma5/ma25/ma75 をすべて上回り、かつ ma5>=ma25>=ma75 の
+      上昇パーフェクトオーダーなら禁止。
+    """
+    if not _env_bool("ENTRY_MA_STRUCTURE_GUARD_ENABLED", True):
+        return True
+
+    close, ma5, ma25, ma75 = _get_price_ma(row)
+    if close <= 0 or ma5 <= 0 or ma25 <= 0 or ma75 <= 0:
+        logger.info(
+            "[ENTRY MA STRUCTURE GUARD] SKIP symbol=%s side=%s reason=ma_missing close=%.4f ma5=%.4f ma25=%.4f ma75=%.4f",
+            symbol, side, close, ma5, ma25, ma75,
+        )
+        return True
+
+    # 分足側にMA傾きが無いケースがあるため、ma5/25/75 の並びも傾き代理として使う。
+    fallback = _safe_float(_first(row, ("slope", "score_slope", "slope_atr_scaled"), 0.0), 0.0)
+    ma25_slope = _get_ma_slope(row, "ma25", fallback)
+    ma75_slope = _get_ma_slope(row, "ma75", fallback)
+
+    bearish_price = close < ma5 and close < ma25 and close < ma75
+    bearish_order = ma5 <= ma25 <= ma75
+    bearish_ma_slope = ma25_slope <= 0 or ma75_slope <= 0
+
+    bullish_price = close > ma5 and close > ma25 and close > ma75
+    bullish_order = ma5 >= ma25 >= ma75
+    bullish_ma_slope = ma25_slope >= 0 or ma75_slope >= 0
+
+    if side == "BUY":
+        if _env_bool("ENTRY_MA_REQUIRE_PRICE_ABOVE_ALL_FOR_BUY", True):
+            if bearish_price and bearish_order and bearish_ma_slope:
+                logger.warning(
+                    "[ENTRY MA STRUCTURE GUARD] NG symbol=%s side=BUY reason=bearish_ma_structure close=%.4f ma5=%.4f ma25=%.4f ma75=%.4f ma25_slope=%.6f ma75_slope=%.6f",
+                    symbol, close, ma5, ma25, ma75, ma25_slope, ma75_slope,
+                )
+                return False
+
+    if side == "SELL":
+        if _env_bool("ENTRY_MA_REQUIRE_PRICE_BELOW_ALL_FOR_SELL", True):
+            if bullish_price and bullish_order and bullish_ma_slope:
+                logger.warning(
+                    "[ENTRY MA STRUCTURE GUARD] NG symbol=%s side=SELL reason=bullish_ma_structure close=%.4f ma5=%.4f ma25=%.4f ma75=%.4f ma25_slope=%.6f ma75_slope=%.6f",
+                    symbol, close, ma5, ma25, ma75, ma25_slope, ma75_slope,
+                )
+                return False
+
+    logger.info(
+        "[ENTRY MA STRUCTURE GUARD] OK symbol=%s side=%s close=%.4f ma5=%.4f ma25=%.4f ma75=%.4f ma25_slope=%.6f ma75_slope=%.6f",
+        symbol, side, close, ma5, ma25, ma75, ma25_slope, ma75_slope,
+    )
+    return True
+
+
 def _calc_direction_strength(row: dict) -> tuple[float, list[str]]:
     reasons: list[str] = []
     strength = 0.0
@@ -147,6 +240,21 @@ def _calc_direction_strength(row: dict) -> tuple[float, list[str]]:
     score_sell = _safe_float(_first(row, ("score_sell", "sell_score", "disp_sell_score", "sell"), 0.0), 0.0)
     flag_delta = _safe_float(row.get("flag_score_total_delta"), 0.0)
     pattern_delta = _safe_float(row.get("pattern_score_delta"), 0.0)
+
+    close2, ma5, ma25, ma75 = _get_price_ma(row)
+    if close2 > 0 and ma5 > 0 and ma25 > 0 and ma75 > 0:
+        if close2 > ma5 > ma25 > ma75:
+            strength += 1.2
+            reasons.append("ma_bullish_order")
+        elif close2 < ma5 < ma25 < ma75:
+            strength -= 1.2
+            reasons.append("ma_bearish_order")
+        elif close2 > ma25 and close2 > ma75:
+            strength += 0.5
+            reasons.append("price_above_ma25_75")
+        elif close2 < ma25 and close2 < ma75:
+            strength -= 0.5
+            reasons.append("price_below_ma25_75")
 
     if slope > 0:
         strength += 1.0
@@ -224,14 +332,6 @@ def _set_row_value(entry_row: Any, key: str, value: Any) -> None:
 
 
 def _try_reverse_entry_side(entry_row: Any, row: dict, side: str, strength: float, reasons: list[str]) -> bool:
-    """
-    通常方向が失敗し、逆方向が強い場合だけ side を反転する。
-
-    注意:
-      - dict の場合はその場で side を書き換える
-      - pandas Series 等も __setitem__ 可能なら書き換える
-      - 反転後は pending_manager の BUY/SELL 混在禁止がさらに安全弁になる
-    """
     if not _env_bool("ENTRY_CONTRARIAN_REVERSE_ENABLED", True):
         return False
 
@@ -244,11 +344,8 @@ def _try_reverse_entry_side(entry_row: Any, row: dict, side: str, strength: floa
     if reverse_side not in {"BUY", "SELL"}:
         return False
 
-    # BUY候補をSELLに反転するには実方向が十分マイナス。
     if original_side == "BUY" and strength > -reverse_min:
         return False
-
-    # SELL候補をBUYに反転するには実方向が十分プラス。
     if original_side == "SELL" and strength < reverse_min:
         return False
 
@@ -262,7 +359,6 @@ def _try_reverse_entry_side(entry_row: Any, row: dict, side: str, strength: floa
     _set_row_value(entry_row, "reverse_reason", "direction_failed_strong_opposite")
     _set_row_value(entry_row, "reverse_strength", float(strength))
 
-    # 反転注文は数量を半分にする安全弁。
     if _env_bool("ENTRY_CONTRARIAN_REVERSE_HALF_SIZE", True):
         for key in ("lot_multiplier", "qty_multiplier"):
             old = _safe_float(row.get(key), 1.0)
@@ -296,6 +392,9 @@ def _direction_confirm(entry_row: Any) -> bool:
         logger.warning("[ENTRY DIRECTION CONFIRM] SKIP symbol=%s reason=unknown_side side=%s", symbol, side)
         return True
 
+    if not _ma_structure_guard(row, side, symbol):
+        return False
+
     strength, reasons = _calc_direction_strength(row)
 
     if side == "BUY":
@@ -307,9 +406,12 @@ def _direction_confirm(entry_row: Any) -> bool:
         logger.info("[ENTRY DIRECTION CONFIRM] OK symbol=%s side=%s strength=%.3f min=%.3f reasons=%s", symbol, side, strength, min_strength, reasons)
         return True
 
-    # 方向が完全に逆で、十分に強い場合だけ反転許可。
     if _try_reverse_entry_side(entry_row, row, side, strength, reasons):
-        return True
+        # 反転後のMA構造も必ず確認する。
+        reversed_side = _norm_side(_first(_row_to_dict(entry_row), ("side", "entry_decision", "ai_side"), side))
+        if _ma_structure_guard(_row_to_dict(entry_row), reversed_side, symbol):
+            return True
+        return False
 
     if not strict:
         weak = abs(strength) >= min_strength * 0.5
@@ -355,17 +457,31 @@ def _patched_atr_1m_filter(entry_row: Any = None, *args, **kwargs):
         return False
 
 
-def install() -> bool:
-    global _INSTALLED, _ORIG_ATR_FILTER, _ORIG_RANGE_FILTER
-    if _INSTALLED:
-        return True
+def _is_currently_wrapped() -> bool:
     try:
         import trading.handlers.entry_controller as ec
+        cur_atr = getattr(ec, "atr_1m_filter", None)
+        cur_range = getattr(ec, "range_5m_filter", None)
+        return bool(
+            getattr(cur_atr, "_entry_direction_confirm_guard", False)
+            and getattr(cur_range, "_entry_direction_confirm_guard", False)
+        )
+    except Exception:
+        return False
+
+
+def install() -> bool:
+    global _INSTALLED, _ORIG_ATR_FILTER, _ORIG_RANGE_FILTER
+    try:
+        import trading.handlers.entry_controller as ec
+
+        # 他パッチが後から filter を上書きした場合に再ラップする。
+        if _INSTALLED and _is_currently_wrapped():
+            return True
+
         old_atr = getattr(ec, "atr_1m_filter", None)
         old_range = getattr(ec, "range_5m_filter", None)
-        if callable(old_range) and getattr(old_range, "_entry_direction_confirm_guard", False):
-            _INSTALLED = True
-            return True
+
         _ORIG_ATR_FILTER = old_atr
         _ORIG_RANGE_FILTER = old_range
         _patched_atr_1m_filter._entry_direction_confirm_guard = True  # type: ignore[attr-defined]
@@ -374,10 +490,11 @@ def install() -> bool:
         ec.range_5m_filter = _patched_range_5m_filter
         _INSTALLED = True
         logger.warning(
-            "[ENTRY DIRECTION CONFIRM] installed enabled=%s min_strength=%.3f strict=%s reverse_enabled=%s reverse_min=%.3f reverse_half_size=%s",
+            "[ENTRY DIRECTION CONFIRM] installed enabled=%s min_strength=%.3f strict=%s ma_guard=%s reverse_enabled=%s reverse_min=%.3f reverse_half_size=%s",
             _env_bool("ENTRY_DIRECTION_CONFIRM_ENABLED", True),
             _env_float("ENTRY_DIRECTION_CONFIRM_MIN_STRENGTH", 1.5),
             _env_bool("ENTRY_DIRECTION_CONFIRM_STRICT", True),
+            _env_bool("ENTRY_MA_STRUCTURE_GUARD_ENABLED", True),
             _env_bool("ENTRY_CONTRARIAN_REVERSE_ENABLED", True),
             _env_float("ENTRY_CONTRARIAN_REVERSE_MIN_STRENGTH", 2.5),
             _env_bool("ENTRY_CONTRARIAN_REVERSE_HALF_SIZE", True),
