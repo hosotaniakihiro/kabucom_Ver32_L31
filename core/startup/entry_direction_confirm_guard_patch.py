@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/entry_direction_confirm_guard_patch.py
-# Version: Ver05-MA-DEVIATION-GUARD
+# Version: Ver06-CLIMAX-REVERSAL-EXCEPTION
 # ------------------------------------------------------------
 # エントリー直前の方向確認 runtime patch。
 #
@@ -16,23 +16,14 @@
 #      BUY : MA25/MA75より大きく下に乖離している場合はBUY禁止
 #      SELL: MA25/MA75より大きく上に乖離している場合はSELL禁止
 #
-# 環境変数:
-#   ENTRY_DIRECTION_CONFIRM_ENABLED=1
-#   ENTRY_DIRECTION_CONFIRM_MIN_STRENGTH=1.5
-#   ENTRY_DIRECTION_CONFIRM_STRICT=1
+#   4. 分足クライマックス反転例外
+#      selling_climax_absorption / selling_climax_wick ならBUY例外許可
+#      buying_climax_exhaustion / buying_climax_wick ならSELL例外許可
 #
-#   ENTRY_MA_STRUCTURE_GUARD_ENABLED=1
-#   ENTRY_MA_ORDER_ONLY_BLOCK_WHEN_SLOPE_MISSING=1
-#
-#   ENTRY_MA_DEVIATION_GUARD_ENABLED=1
-#   ENTRY_BUY_MAX_NEGATIVE_MA25_DEV_PCT=-1.0
-#   ENTRY_BUY_MAX_NEGATIVE_MA75_DEV_PCT=-1.5
-#   ENTRY_SELL_MAX_POSITIVE_MA25_DEV_PCT=1.0
-#   ENTRY_SELL_MAX_POSITIVE_MA75_DEV_PCT=1.5
-#
-#   ENTRY_CONTRARIAN_REVERSE_ENABLED=1
-#   ENTRY_CONTRARIAN_REVERSE_MIN_STRENGTH=2.5
-#   ENTRY_CONTRARIAN_REVERSE_HALF_SIZE=1
+# 注意:
+#   クライマックス反転は無条件許可ではない。
+#   出来高・売買代金・MA乖離・トレンド失速などが複合成立した場合のみ、
+#   MA構造/MA乖離/方向強度NGを例外的に通す。
 # ============================================================
 
 from __future__ import annotations
@@ -143,6 +134,17 @@ def _norm_symbol(v: Any) -> str:
     return s
 
 
+def _set_row_value(entry_row: Any, key: str, value: Any) -> None:
+    try:
+        if isinstance(entry_row, dict):
+            entry_row[key] = value
+            return
+        if hasattr(entry_row, "__setitem__"):
+            entry_row[key] = value
+    except Exception:
+        return
+
+
 def _get_price_ma(row: dict) -> tuple[float, float, float, float, str]:
     close = _safe_float(_first(row, ("close", "close_price", "price", "current_price", "daily_close"), 0.0), 0.0)
 
@@ -202,6 +204,48 @@ def _ma_dev_pct(close: float, ma: float) -> float:
         return ((close - ma) / ma) * 100.0
     except Exception:
         return 0.0
+
+
+def _climax_exception(entry_row: Any, row: dict, side: str, symbol: str, blocked_by: str) -> bool:
+    """
+    通常ガードでNGになった場合でも、分足クライマックス反転が成立していれば例外許可する。
+    """
+    if not _env_bool("ENTRY_CLIMAX_REVERSAL_EXCEPTION_ENABLED", True):
+        return False
+
+    try:
+        from trading.entry.climax_reversal_detector import detect_climax_reversal
+
+        res = detect_climax_reversal(row, side=side)
+        allow = bool(res.get("allow_exception"))
+        ctype = str(res.get("climax_type") or "")
+        score = _safe_float(res.get("climax_score"), 0.0)
+        reason = str(res.get("reason") or "")
+
+        if allow:
+            _set_row_value(entry_row, "climax_reversal_exception", True)
+            _set_row_value(entry_row, "climax_type", ctype)
+            _set_row_value(entry_row, "climax_score", score)
+            _set_row_value(entry_row, "climax_reason", reason)
+            _set_row_value(entry_row, "climax_blocked_by", blocked_by)
+            logger.warning(
+                "[ENTRY CLIMAX EXCEPTION] ALLOW symbol=%s side=%s blocked_by=%s type=%s score=%.2f reason=%s",
+                symbol, side, blocked_by, ctype, score, reason,
+            )
+            return True
+
+        logger.info(
+            "[ENTRY CLIMAX EXCEPTION] NO symbol=%s side=%s blocked_by=%s reason=%s score=%.2f type=%s",
+            symbol, side, blocked_by, reason, score, ctype,
+        )
+        return False
+
+    except Exception:
+        logger.exception(
+            "[ENTRY CLIMAX EXCEPTION] failed symbol=%s side=%s blocked_by=%s",
+            symbol, side, blocked_by,
+        )
+        return False
 
 
 def _ma_deviation_guard(row: dict, side: str, symbol: str) -> bool:
@@ -396,17 +440,6 @@ def _calc_direction_strength(row: dict) -> tuple[float, list[str]]:
     return float(strength), reasons
 
 
-def _set_row_value(entry_row: Any, key: str, value: Any) -> None:
-    try:
-        if isinstance(entry_row, dict):
-            entry_row[key] = value
-            return
-        if hasattr(entry_row, "__setitem__"):
-            entry_row[key] = value
-    except Exception:
-        return
-
-
 def _try_reverse_entry_side(entry_row: Any, row: dict, side: str, strength: float, reasons: list[str]) -> bool:
     if not _env_bool("ENTRY_CONTRARIAN_REVERSE_ENABLED", True):
         return False
@@ -469,10 +502,12 @@ def _direction_confirm(entry_row: Any) -> bool:
         return True
 
     if not _ma_structure_guard(row, side, symbol):
-        return False
+        if not _climax_exception(entry_row, row, side, symbol, "ma_structure"):
+            return False
 
     if not _ma_deviation_guard(row, side, symbol):
-        return False
+        if not _climax_exception(entry_row, row, side, symbol, "ma_deviation"):
+            return False
 
     strength, reasons = _calc_direction_strength(row)
 
@@ -485,9 +520,14 @@ def _direction_confirm(entry_row: Any) -> bool:
         reversed_row = _row_to_dict(entry_row)
         reversed_side = _norm_side(_first(reversed_row, ("side", "entry_decision", "ai_side"), side))
         if not _ma_structure_guard(reversed_row, reversed_side, symbol):
-            return False
+            if not _climax_exception(entry_row, reversed_row, reversed_side, symbol, "reverse_ma_structure"):
+                return False
         if not _ma_deviation_guard(reversed_row, reversed_side, symbol):
-            return False
+            if not _climax_exception(entry_row, reversed_row, reversed_side, symbol, "reverse_ma_deviation"):
+                return False
+        return True
+
+    if _climax_exception(entry_row, row, side, symbol, "direction_strength"):
         return True
 
     if not strict:
@@ -566,13 +606,14 @@ def install() -> bool:
         ec.range_5m_filter = _patched_range_5m_filter
         _INSTALLED = True
         logger.warning(
-            "[ENTRY DIRECTION CONFIRM] installed enabled=%s min_strength=%.3f strict=%s ma_guard=%s order_only_block=%s ma_dev_guard=%s buy_ma25_dev=%.3f buy_ma75_dev=%.3f sell_ma25_dev=%.3f sell_ma75_dev=%.3f reverse_enabled=%s reverse_min=%.3f reverse_half_size=%s",
+            "[ENTRY DIRECTION CONFIRM] installed enabled=%s min_strength=%.3f strict=%s ma_guard=%s order_only_block=%s ma_dev_guard=%s climax_exception=%s buy_ma25_dev=%.3f buy_ma75_dev=%.3f sell_ma25_dev=%.3f sell_ma75_dev=%.3f reverse_enabled=%s reverse_min=%.3f reverse_half_size=%s",
             _env_bool("ENTRY_DIRECTION_CONFIRM_ENABLED", True),
             _env_float("ENTRY_DIRECTION_CONFIRM_MIN_STRENGTH", 1.5),
             _env_bool("ENTRY_DIRECTION_CONFIRM_STRICT", True),
             _env_bool("ENTRY_MA_STRUCTURE_GUARD_ENABLED", True),
             _env_bool("ENTRY_MA_ORDER_ONLY_BLOCK_WHEN_SLOPE_MISSING", True),
             _env_bool("ENTRY_MA_DEVIATION_GUARD_ENABLED", True),
+            _env_bool("ENTRY_CLIMAX_REVERSAL_EXCEPTION_ENABLED", True),
             _env_float("ENTRY_BUY_MAX_NEGATIVE_MA25_DEV_PCT", -1.0),
             _env_float("ENTRY_BUY_MAX_NEGATIVE_MA75_DEV_PCT", -1.5),
             _env_float("ENTRY_SELL_MAX_POSITIVE_MA25_DEV_PCT", 1.0),
