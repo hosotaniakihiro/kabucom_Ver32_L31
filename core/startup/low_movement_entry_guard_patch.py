@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/low_movement_entry_guard_patch.py
-# Version: Ver05-INSTALL-ENTRY-DIRECTION-CONFIRM-GUARD
+# Version: Ver06-INSTALL-ENTRY-DIRECTION-AFTER-LOW-MOVE
 # ------------------------------------------------------------
 # あまり動かない銘柄へのエントリーを発注直前で止める。
 # さらに、ランキング方向に逆らうエントリーも禁止する。
@@ -13,6 +13,12 @@
 # Ver05:
 #   - 「売ったら上がる / 買ったら下がる」対策として、
 #     entry_direction_confirm_guard_patch も同時 install
+#
+# Ver06:
+#   - install順を修正
+#   - low_movement が filter を設定した後に、最後に
+#     entry_direction_confirm_guard_patch を install する
+#   - これにより MA構造ガード / 方向確認ガードが最終段で必ず効く
 # ============================================================
 
 from __future__ import annotations
@@ -222,16 +228,21 @@ def install() -> bool:
     global _INSTALLED, _ORIG_ATR_FILTER, _ORIG_RANGE_FILTER
     ok_direction = _install_ranking_direction_guard()
     ok_scoring_bridge = _install_scoring_flag_pattern_bridge()
-    ok_entry_direction = _install_entry_direction_confirm_guard()
+    ok_entry_direction = False
+
     if _INSTALLED:
+        ok_entry_direction = _install_entry_direction_confirm_guard()
         return bool(ok_direction or ok_scoring_bridge or ok_entry_direction or True)
+
     try:
         import trading.handlers.entry_controller as ec
         old_atr = getattr(ec, "atr_1m_filter", None)
         old_range = getattr(ec, "range_5m_filter", None)
         if callable(old_range) and getattr(old_range, "_low_move_guard_v1", False):
             _INSTALLED = True
+            ok_entry_direction = _install_entry_direction_confirm_guard()
             return True
+
         _ORIG_ATR_FILTER = old_atr
         _ORIG_RANGE_FILTER = old_range
         _patched_atr_1m_filter._low_move_guard_v1 = True  # type: ignore[attr-defined]
@@ -239,6 +250,11 @@ def install() -> bool:
         ec.atr_1m_filter = _patched_atr_1m_filter
         ec.range_5m_filter = _patched_range_5m_filter
         _INSTALLED = True
+
+        # 重要: low_movement が filter を設定した後、最後に方向確認を install する。
+        # これにより MA構造ガード / 方向確認ガードが最終段で必ず効く。
+        ok_entry_direction = _install_entry_direction_confirm_guard()
+
         logger.warning(
             "[LOW MOVE GUARD] installed low_range=%.4f high_range=%.4f low_slope=%.6f high_slope=%.6f strong_range=%.4f ranking_direction=%s scoring_flag_pattern_bridge=%s entry_direction_confirm=%s",
             _env_float("LOW_MOVE_MIN_RANGE_PCT_LOW_PRICE", 0.015),
