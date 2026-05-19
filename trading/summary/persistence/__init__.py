@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/summary/persistence/__init__.py
-# Version: PRODUCTION-COMPAT-SUMMARY-PERSISTENCE-EXPORT-V4-MA-CROSS-STATE-PATCH
+# Version: PRODUCTION-COMPAT-SUMMARY-PERSISTENCE-EXPORT-V4.1-MA-CROSS-STATE-PATCH-FIX
 # ------------------------------------------------------------
 # Purpose:
 #   - 既存互換APIを維持する
@@ -140,7 +140,7 @@ def _call_backend_safely(backend, df: pd.DataFrame, **kwargs: Any) -> Any:
         if accepts_var_kw:
             return backend(df, **kwargs)
 
-        call_kwargs = {k: v for k, v in kwargs if k in params}
+        call_kwargs = {k: v for k, v in kwargs.items() if k in params}
         return backend(df, **call_kwargs)
 
     except TypeError:
