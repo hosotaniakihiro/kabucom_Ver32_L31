@@ -1,6 +1,7 @@
 # ============================================================
 # File   : trading/entry/pending_manager.py
 # Purpose: pending_entries 完全一元管理（FINAL）
+# Version: Ver02-NO-MIXED-BUY-SELL-PER-SYMBOL
 # ------------------------------------------------------------
 # ✔ pending_entries = dict[str, list[dict]] を絶対保証
 # ✔ 直代入 / 型崩れを STACKTRACE 付きで検出
@@ -10,17 +11,46 @@
 # ✔ ROOT 可視化・件数監視・空状態の原因追跡を強化
 # ✔ reject理由を可視化
 # ✔ interval違い / SELL不可 / 古い候補を安全に掃除できる prune_entries を追加
+#
+# Ver02:
+# ✔ 同一銘柄 bucket 内の BUY / SELL 混在を禁止
+# ✔ 既存 BUY に対する SELL 追加、既存 SELL に対する BUY 追加を拒否
+# ✔ 既に混在している bucket は発注列挙時に全削除して安全停止
+# ✔ 「表示はBUYなのに実発注はSELL」事故を防止
 # ============================================================
 
 from __future__ import annotations
 
 import logging
+import os
 import traceback
-from typing import Dict, List, Any, Iterator, Tuple, Callable
+from typing import Dict, List, Any, Iterator, Tuple, Callable, Set
 
 from global_state import global_data
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# ENV
+# ============================================================
+def _env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None:
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", ""}:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
+
+
+PENDING_REJECT_MIXED_SIDE = _env_bool("PENDING_REJECT_MIXED_SIDE", True)
+PENDING_CLEAR_ALREADY_MIXED_BUCKET = _env_bool("PENDING_CLEAR_ALREADY_MIXED_BUCKET", True)
 
 
 # ============================================================
@@ -116,6 +146,35 @@ def _norm_interval(v: Any) -> str:
         return ""
 
 
+def _norm_side(v: Any) -> str:
+    s = _norm_str(v)
+    if s in {"BUY", "LONG", "2", "買", "買い"}:
+        return "BUY"
+    if s in {"SELL", "SHORT", "1", "売", "売り"}:
+        return "SELL"
+    return s
+
+
+def _entry_side(entry: Dict[str, Any]) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    return _norm_side(entry.get("side") or entry.get("entry_decision") or entry.get("ai_side"))
+
+
+def _bucket_sides(bucket: List[Dict]) -> Set[str]:
+    sides: Set[str] = set()
+    for e in bucket:
+        side = _entry_side(e)
+        if side in {"BUY", "SELL"}:
+            sides.add(side)
+    return sides
+
+
+def _bucket_has_mixed_side(bucket: List[Dict]) -> bool:
+    sides = _bucket_sides(bucket)
+    return "BUY" in sides and "SELL" in sides
+
+
 def _entry_identity(entry: Dict[str, Any]) -> Tuple[str, str, str, str]:
     """
     重複判定用 identity。
@@ -124,11 +183,28 @@ def _entry_identity(entry: Dict[str, Any]) -> Tuple[str, str, str, str]:
         return (
             _norm_str(entry.get("source")),
             _norm_str(entry.get("entry_type")),
-            _norm_str(entry.get("side") or entry.get("entry_decision")),
+            _entry_side(entry),
             _norm_interval(entry.get("interval")),
         )
     except Exception:
         return ("", "", "", "")
+
+
+def _entry_debug(entry: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        return {
+            "source": entry.get("source"),
+            "entry_type": entry.get("entry_type"),
+            "side": entry.get("side"),
+            "entry_decision": entry.get("entry_decision"),
+            "ai_side": entry.get("ai_side"),
+            "interval": entry.get("interval"),
+            "score": entry.get("score"),
+            "score_buy": entry.get("score_buy"),
+            "score_sell": entry.get("score_sell"),
+        }
+    except Exception:
+        return {}
 
 
 # ============================================================
@@ -217,6 +293,14 @@ def has_identity(symbol: str, entry: Dict[str, Any]) -> bool:
 
 
 # ============================================================
+# 公開API: symbol bucket が BUY/SELL 混在か
+# ============================================================
+def has_mixed_side(symbol: str) -> bool:
+    bucket = get_bucket(symbol)
+    return _bucket_has_mixed_side(bucket)
+
+
+# ============================================================
 # 公開API: pending 追加（唯一の入口）
 # ============================================================
 def add_pending(entry: Dict) -> bool:
@@ -239,8 +323,37 @@ def add_pending(entry: Dict) -> bool:
     sym = str(symbol)
     src = str(source)
     new_identity = _entry_identity(entry)
+    new_side = _entry_side(entry)
 
     bucket = get_bucket(sym)
+
+    # --------------------------------------------------------
+    # BUY / SELL 混在禁止
+    # --------------------------------------------------------
+    if PENDING_REJECT_MIXED_SIDE:
+        existing_sides = _bucket_sides(bucket)
+
+        if _bucket_has_mixed_side(bucket):
+            logger.warning(
+                "⛔ pending mixed-side bucket detected -> clear symbol=%s sides=%s bucket=%s",
+                sym,
+                sorted(existing_sides),
+                [_entry_debug(e) for e in bucket],
+            )
+            if PENDING_CLEAR_ALREADY_MIXED_BUCKET:
+                replace_bucket(sym, [])
+            return False
+
+        if new_side in {"BUY", "SELL"} and existing_sides and new_side not in existing_sides:
+            logger.warning(
+                "⛔ pending opposite-side rejected symbol=%s existing_sides=%s new_side=%s new=%s bucket=%s",
+                sym,
+                sorted(existing_sides),
+                new_side,
+                _entry_debug(entry),
+                [_entry_debug(e) for e in bucket],
+            )
+            return False
 
     for e in bucket:
         old_identity = _entry_identity(e)
@@ -289,6 +402,17 @@ def iter_entries() -> Iterator[Tuple[str, Dict]]:
     for sym, bucket in list(global_data.pending_entries.items()):
         normalized = _normalize_bucket(bucket, sym)
         if normalized:
+            if PENDING_REJECT_MIXED_SIDE and _bucket_has_mixed_side(normalized):
+                logger.warning(
+                    "⛔ pending mixed-side bucket skipped before dispatch symbol=%s sides=%s bucket=%s",
+                    sym,
+                    sorted(_bucket_sides(normalized)),
+                    [_entry_debug(e) for e in normalized],
+                )
+                if PENDING_CLEAR_ALREADY_MIXED_BUCKET:
+                    global_data.pending_entries.pop(sym, None)
+                    logger.warning("🧹 pending mixed-side bucket cleared symbol=%s", sym)
+                continue
             global_data.pending_entries[sym] = normalized
         else:
             global_data.pending_entries.pop(sym, None)
@@ -344,9 +468,6 @@ def prune_entries(
       - PIPELINE_FILTER_MISMATCH の古い interval 候補削除
       - SELL_CREDIT_GUARD_NG の空売り不可候補削除
       - POSITION_FILTER_NG 等の再評価不要候補削除
-
-    例:
-        prune_entries(lambda sym, e: e.get("source") == "SUMMARY" and e.get("interval") == 1)
     """
     _ensure_root()
     removed = 0
@@ -368,13 +489,7 @@ def prune_entries(
                         sym,
                         reason,
                         _entry_identity(entry),
-                        {
-                            "source": entry.get("source"),
-                            "entry_type": entry.get("entry_type"),
-                            "side": entry.get("side"),
-                            "interval": entry.get("interval"),
-                            "score": entry.get("score"),
-                        },
+                        _entry_debug(entry),
                     )
                     continue
 
@@ -408,3 +523,19 @@ def clear_symbol(symbol: str) -> None:
 def clear_all() -> None:
     global_data.pending_entries = {}
     logger.warning("🧹 ALL pending_entries cleared")
+
+
+__all__ = [
+    "snapshot_root",
+    "get_bucket",
+    "replace_bucket",
+    "has_source",
+    "has_identity",
+    "has_mixed_side",
+    "add_pending",
+    "iter_entries",
+    "pop_entry",
+    "prune_entries",
+    "clear_symbol",
+    "clear_all",
+]
