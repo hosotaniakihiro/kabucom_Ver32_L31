@@ -1,30 +1,33 @@
 # ============================================================
 # File   : core/startup/entry_direction_confirm_guard_patch.py
-# Version: Ver01-ENTRY-DIRECTION-CONFIRM-GUARD
+# Version: Ver02-SAFE-CONTRARIAN-REVERSE-MODE
 # ------------------------------------------------------------
 # 「売ったら上がる / 買ったら下がる」を減らすため、
 # エントリー直前で方向確認を行う runtime patch。
 #
-# 方針:
+# Ver01:
 #   BUY  : 直近方向が上向きでなければ止める
 #   SELL : 直近方向が下向きでなければ止める
 #
-# 判定材料:
-#   - side
-#   - slope / slope_atr_scaled / score_slope
-#   - macd - signal
-#   - close と open の方向
-#   - close のバー内位置 high/low
-#   - score_buy / score_sell の優劣
-#   - flag_score_total_delta / pattern_score_delta
+# Ver02:
+#   通常シグナルと実方向が強く逆なら、条件付きで反転する。
+#
+#   例:
+#     BUY候補だが実方向が強く下向き  -> SELLへ反転
+#     SELL候補だが実方向が強く上向き -> BUYへ反転
 #
 # 環境変数:
 #   ENTRY_DIRECTION_CONFIRM_ENABLED=1
 #   ENTRY_DIRECTION_CONFIRM_MIN_STRENGTH=1.5
 #   ENTRY_DIRECTION_CONFIRM_STRICT=1
 #
+#   ENTRY_CONTRARIAN_REVERSE_ENABLED=1
+#   ENTRY_CONTRARIAN_REVERSE_MIN_STRENGTH=2.5
+#   ENTRY_CONTRARIAN_REVERSE_HALF_SIZE=1
+#
 # ログ:
 #   [ENTRY DIRECTION CONFIRM] OK/NG ...
+#   [ENTRY CONTRARIAN REVERSE] BUY->SELL / SELL->BUY ...
 # ============================================================
 
 from __future__ import annotations
@@ -107,6 +110,15 @@ def _norm_side(v: Any) -> str:
     if s in {"2", "BUY", "LONG", "買", "買い"}:
         return "BUY"
     return s
+
+
+def _opposite_side(side: str) -> str:
+    side = _norm_side(side)
+    if side == "BUY":
+        return "SELL"
+    if side == "SELL":
+        return "BUY"
+    return side
 
 
 def _norm_symbol(v: Any) -> str:
@@ -200,12 +212,82 @@ def _calc_direction_strength(row: dict) -> tuple[float, list[str]]:
     return float(strength), reasons
 
 
+def _set_row_value(entry_row: Any, key: str, value: Any) -> None:
+    try:
+        if isinstance(entry_row, dict):
+            entry_row[key] = value
+            return
+        if hasattr(entry_row, "__setitem__"):
+            entry_row[key] = value
+    except Exception:
+        return
+
+
+def _try_reverse_entry_side(entry_row: Any, row: dict, side: str, strength: float, reasons: list[str]) -> bool:
+    """
+    通常方向が失敗し、逆方向が強い場合だけ side を反転する。
+
+    注意:
+      - dict の場合はその場で side を書き換える
+      - pandas Series 等も __setitem__ 可能なら書き換える
+      - 反転後は pending_manager の BUY/SELL 混在禁止がさらに安全弁になる
+    """
+    if not _env_bool("ENTRY_CONTRARIAN_REVERSE_ENABLED", True):
+        return False
+
+    reverse_min = _env_float("ENTRY_CONTRARIAN_REVERSE_MIN_STRENGTH", 2.5)
+    if abs(strength) < reverse_min:
+        return False
+
+    original_side = _norm_side(side)
+    reverse_side = _opposite_side(original_side)
+    if reverse_side not in {"BUY", "SELL"}:
+        return False
+
+    # BUY候補をSELLに反転するには実方向が十分マイナス。
+    if original_side == "BUY" and strength > -reverse_min:
+        return False
+
+    # SELL候補をBUYに反転するには実方向が十分プラス。
+    if original_side == "SELL" and strength < reverse_min:
+        return False
+
+    symbol = _norm_symbol(_first(row, ("symbol", "code", "stock_code"), ""))
+
+    _set_row_value(entry_row, "side", reverse_side)
+    _set_row_value(entry_row, "entry_decision", reverse_side)
+    _set_row_value(entry_row, "ai_side", reverse_side)
+    _set_row_value(entry_row, "contrarian_reversed", True)
+    _set_row_value(entry_row, "original_side", original_side)
+    _set_row_value(entry_row, "reverse_reason", "direction_failed_strong_opposite")
+    _set_row_value(entry_row, "reverse_strength", float(strength))
+
+    # 反転注文は数量を半分にする安全弁。
+    if _env_bool("ENTRY_CONTRARIAN_REVERSE_HALF_SIZE", True):
+        for key in ("lot_multiplier", "qty_multiplier"):
+            old = _safe_float(row.get(key), 1.0)
+            if old > 0:
+                _set_row_value(entry_row, key, max(0.5, old * 0.5))
+        _set_row_value(entry_row, "reverse_half_size", True)
+
+    logger.warning(
+        "[ENTRY CONTRARIAN REVERSE] symbol=%s %s->%s strength=%.3f min=%.3f reasons=%s",
+        symbol,
+        original_side,
+        reverse_side,
+        strength,
+        reverse_min,
+        reasons,
+    )
+    return True
+
+
 def _direction_confirm(entry_row: Any) -> bool:
     if not _env_bool("ENTRY_DIRECTION_CONFIRM_ENABLED", True):
         return True
 
     row = _row_to_dict(entry_row)
-    side = _norm_side(_first(row, ("side", "売買", "order_side"), ""))
+    side = _norm_side(_first(row, ("side", "売買", "order_side", "entry_decision", "ai_side"), ""))
     symbol = _norm_symbol(_first(row, ("symbol", "code", "stock_code"), ""))
     min_strength = _env_float("ENTRY_DIRECTION_CONFIRM_MIN_STRENGTH", 1.5)
     strict = _env_bool("ENTRY_DIRECTION_CONFIRM_STRICT", True)
@@ -221,15 +303,19 @@ def _direction_confirm(entry_row: Any) -> bool:
     else:
         ok = strength <= -min_strength
 
-    if not ok and not strict:
+    if ok:
+        logger.info("[ENTRY DIRECTION CONFIRM] OK symbol=%s side=%s strength=%.3f min=%.3f reasons=%s", symbol, side, strength, min_strength, reasons)
+        return True
+
+    # 方向が完全に逆で、十分に強い場合だけ反転許可。
+    if _try_reverse_entry_side(entry_row, row, side, strength, reasons):
+        return True
+
+    if not strict:
         weak = abs(strength) >= min_strength * 0.5
         if weak:
             logger.warning("[ENTRY DIRECTION CONFIRM] WEAK_ALLOW symbol=%s side=%s strength=%.3f min=%.3f reasons=%s", symbol, side, strength, min_strength, reasons)
             return True
-
-    if ok:
-        logger.info("[ENTRY DIRECTION CONFIRM] OK symbol=%s side=%s strength=%.3f min=%.3f reasons=%s", symbol, side, strength, min_strength, reasons)
-        return True
 
     logger.warning("[ENTRY DIRECTION CONFIRM] NG symbol=%s side=%s strength=%.3f min=%.3f reasons=%s", symbol, side, strength, min_strength, reasons)
     return False
@@ -288,10 +374,13 @@ def install() -> bool:
         ec.range_5m_filter = _patched_range_5m_filter
         _INSTALLED = True
         logger.warning(
-            "[ENTRY DIRECTION CONFIRM] installed enabled=%s min_strength=%.3f strict=%s",
+            "[ENTRY DIRECTION CONFIRM] installed enabled=%s min_strength=%.3f strict=%s reverse_enabled=%s reverse_min=%.3f reverse_half_size=%s",
             _env_bool("ENTRY_DIRECTION_CONFIRM_ENABLED", True),
             _env_float("ENTRY_DIRECTION_CONFIRM_MIN_STRENGTH", 1.5),
             _env_bool("ENTRY_DIRECTION_CONFIRM_STRICT", True),
+            _env_bool("ENTRY_CONTRARIAN_REVERSE_ENABLED", True),
+            _env_float("ENTRY_CONTRARIAN_REVERSE_MIN_STRENGTH", 2.5),
+            _env_bool("ENTRY_CONTRARIAN_REVERSE_HALF_SIZE", True),
         )
         return True
     except Exception:
