@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/low_movement_entry_guard_patch.py
-# Version: Ver06-INSTALL-ENTRY-DIRECTION-AFTER-LOW-MOVE
+# Version: Ver07-INSTALL-FINAL-ENTRY-SAFETY-GUARD
 # ------------------------------------------------------------
 # あまり動かない銘柄へのエントリーを発注直前で止める。
 # さらに、ランキング方向に逆らうエントリーも禁止する。
@@ -19,6 +19,12 @@
 #   - low_movement が filter を設定した後に、最後に
 #     entry_direction_confirm_guard_patch を install する
 #   - これにより MA構造ガード / 方向確認ガードが最終段で必ず効く
+#
+# Ver07:
+#   - final_entry_safety_guard_patch も同時 install
+#   - 発注直前の出来高・売買代金、時間帯、同一銘柄損切り後ロック、
+#     直近逆行、板/スプレッド、逆張り半数量化を有効化
+#   - 優先度3「当日損失上限」はユーザー要望により未実装
 # ============================================================
 
 from __future__ import annotations
@@ -118,6 +124,17 @@ def _install_entry_direction_confirm_guard() -> bool:
         return bool(ok)
     except Exception:
         logger.exception("[LOW MOVE GUARD] entry_direction_confirm_guard_patch install failed")
+        return False
+
+
+def _install_final_entry_safety_guard() -> bool:
+    try:
+        from core.startup import final_entry_safety_guard_patch as p
+        ok = p.install()
+        logger.warning("[LOW MOVE GUARD] final_entry_safety_guard_patch installed=%s", ok)
+        return bool(ok)
+    except Exception:
+        logger.exception("[LOW MOVE GUARD] final_entry_safety_guard_patch install failed")
         return False
 
 
@@ -229,10 +246,12 @@ def install() -> bool:
     ok_direction = _install_ranking_direction_guard()
     ok_scoring_bridge = _install_scoring_flag_pattern_bridge()
     ok_entry_direction = False
+    ok_final_safety = _install_final_entry_safety_guard()
 
     if _INSTALLED:
         ok_entry_direction = _install_entry_direction_confirm_guard()
-        return bool(ok_direction or ok_scoring_bridge or ok_entry_direction or True)
+        ok_final_safety = _install_final_entry_safety_guard()
+        return bool(ok_direction or ok_scoring_bridge or ok_entry_direction or ok_final_safety or True)
 
     try:
         import trading.handlers.entry_controller as ec
@@ -241,6 +260,7 @@ def install() -> bool:
         if callable(old_range) and getattr(old_range, "_low_move_guard_v1", False):
             _INSTALLED = True
             ok_entry_direction = _install_entry_direction_confirm_guard()
+            ok_final_safety = _install_final_entry_safety_guard()
             return True
 
         _ORIG_ATR_FILTER = old_atr
@@ -255,8 +275,12 @@ def install() -> bool:
         # これにより MA構造ガード / 方向確認ガードが最終段で必ず効く。
         ok_entry_direction = _install_entry_direction_confirm_guard()
 
+        # さらに _execute_best_candidate を包む最終安全ガードを install する。
+        # ここでは日次損失上限ガードは入れない。
+        ok_final_safety = _install_final_entry_safety_guard()
+
         logger.warning(
-            "[LOW MOVE GUARD] installed low_range=%.4f high_range=%.4f low_slope=%.6f high_slope=%.6f strong_range=%.4f ranking_direction=%s scoring_flag_pattern_bridge=%s entry_direction_confirm=%s",
+            "[LOW MOVE GUARD] installed low_range=%.4f high_range=%.4f low_slope=%.6f high_slope=%.6f strong_range=%.4f ranking_direction=%s scoring_flag_pattern_bridge=%s entry_direction_confirm=%s final_entry_safety=%s",
             _env_float("LOW_MOVE_MIN_RANGE_PCT_LOW_PRICE", 0.015),
             _env_float("LOW_MOVE_MIN_RANGE_PCT_HIGH_PRICE", 0.008),
             _env_float("LOW_MOVE_MIN_ABS_SLOPE_LOW_PRICE", 0.0003),
@@ -265,11 +289,12 @@ def install() -> bool:
             ok_direction,
             ok_scoring_bridge,
             ok_entry_direction,
+            ok_final_safety,
         )
         return True
     except Exception:
         logger.exception("[LOW MOVE GUARD] install failed")
-        return bool(ok_direction or ok_scoring_bridge or ok_entry_direction)
+        return bool(ok_direction or ok_scoring_bridge or ok_entry_direction or ok_final_safety)
 
 
 try:
