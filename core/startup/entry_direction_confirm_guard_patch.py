@@ -1,19 +1,38 @@
 # ============================================================
 # File   : core/startup/entry_direction_confirm_guard_patch.py
-# Version: Ver04-DAILY-MA-SLOPE-AWARE-GUARD
+# Version: Ver05-MA-DEVIATION-GUARD
 # ------------------------------------------------------------
-# 「売ったら上がる / 買ったら下がる」を減らすため、
-# エントリー直前で方向確認を行う runtime patch。
+# エントリー直前の方向確認 runtime patch。
 #
-# Ver04:
-#   - daily_ma5 / daily_ma25 / daily_ma75 を MA 判定対象に追加
-#   - daily_ma25_slope / daily_ma75_slope を MA傾き判定対象に追加
-#   - MA傾き列が無い場合でも、MAの並びだけで逆方向を禁止可能
+# 主なガード:
+#   1. MA構造ガード
+#      BUY : 株価がMA下、MA並びが下落形ならBUY禁止
+#      SELL: 株価がMA上、MA並びが上昇形ならSELL禁止
 #
-# 重要:
-#   日足MTFパッチは stock_analysis_latest の MA_25_Slope / MA_75_Slope を
-#   daily_ma25_slope / daily_ma75_slope として summary_df に付与する。
-#   そのため、このガードでは daily_* も必ず読む。
+#   2. MA傾きガード
+#      daily_ma25_slope / daily_ma75_slope などを読む
+#
+#   3. MA乖離率ガード
+#      BUY : MA25/MA75より大きく下に乖離している場合はBUY禁止
+#      SELL: MA25/MA75より大きく上に乖離している場合はSELL禁止
+#
+# 環境変数:
+#   ENTRY_DIRECTION_CONFIRM_ENABLED=1
+#   ENTRY_DIRECTION_CONFIRM_MIN_STRENGTH=1.5
+#   ENTRY_DIRECTION_CONFIRM_STRICT=1
+#
+#   ENTRY_MA_STRUCTURE_GUARD_ENABLED=1
+#   ENTRY_MA_ORDER_ONLY_BLOCK_WHEN_SLOPE_MISSING=1
+#
+#   ENTRY_MA_DEVIATION_GUARD_ENABLED=1
+#   ENTRY_BUY_MAX_NEGATIVE_MA25_DEV_PCT=-1.0
+#   ENTRY_BUY_MAX_NEGATIVE_MA75_DEV_PCT=-1.5
+#   ENTRY_SELL_MAX_POSITIVE_MA25_DEV_PCT=1.0
+#   ENTRY_SELL_MAX_POSITIVE_MA75_DEV_PCT=1.5
+#
+#   ENTRY_CONTRARIAN_REVERSE_ENABLED=1
+#   ENTRY_CONTRARIAN_REVERSE_MIN_STRENGTH=2.5
+#   ENTRY_CONTRARIAN_REVERSE_HALF_SIZE=1
 # ============================================================
 
 from __future__ import annotations
@@ -125,10 +144,10 @@ def _norm_symbol(v: Any) -> str:
 
 
 def _get_price_ma(row: dict) -> tuple[float, float, float, float, str]:
-    """
-    MAは分足 ma5/ma25/ma75 を優先し、無ければ日足 daily_ma5/25/75 を使う。
-    """
     close = _safe_float(_first(row, ("close", "close_price", "price", "current_price", "daily_close"), 0.0), 0.0)
+
+    minute_ma_exists = any(k in row for k in ("ma5", "MA5", "ma_5", "ma25", "MA25", "ma_25", "ma75", "MA75", "ma_75"))
+    daily_ma_exists = any(k in row for k in ("daily_ma5", "daily_ma25", "daily_ma75", "MA_5", "MA_25", "MA_75"))
 
     ma5_raw = _first(row, ("ma5", "MA5", "ma_5", "daily_ma5", "MA_5"), None)
     ma25_raw = _first(row, ("ma25", "MA25", "ma_25", "daily_ma25", "MA_25"), None)
@@ -138,20 +157,19 @@ def _get_price_ma(row: dict) -> tuple[float, float, float, float, str]:
     ma25 = _safe_float(ma25_raw, 0.0)
     ma75 = _safe_float(ma75_raw, 0.0)
 
-    src = "minute"
-    if ma5_raw is None and ma25_raw is None and ma75_raw is None:
+    if minute_ma_exists and daily_ma_exists:
+        src = "minute_or_daily"
+    elif minute_ma_exists:
+        src = "minute"
+    elif daily_ma_exists:
+        src = "daily"
+    else:
         src = "none"
-    elif any(k in row for k in ("daily_ma5", "daily_ma25", "daily_ma75", "MA_5", "MA_25", "MA_75")):
-        if not any(k in row for k in ("ma5", "MA5", "ma_5", "ma25", "MA25", "ma_25", "ma75", "MA75", "ma_75")):
-            src = "daily"
-        else:
-            src = "minute_or_daily"
 
     return close, ma5, ma25, ma75, src
 
 
 def _ma_slope_keys(ma_key: str) -> tuple[str, ...]:
-    # ma25 -> ma25_slope / MA25_Slope / daily_ma25_slope / MA_25_Slope など全部拾う
     n = ma_key.lower().replace("ma", "")
     return (
         f"{ma_key}_slope",
@@ -175,6 +193,56 @@ def _get_ma_slope(row: dict, ma_key: str) -> tuple[float, bool]:
     if not found:
         return 0.0, False
     return _safe_float(_first(row, keys, 0.0), 0.0), True
+
+
+def _ma_dev_pct(close: float, ma: float) -> float:
+    try:
+        if close <= 0 or ma <= 0:
+            return 0.0
+        return ((close - ma) / ma) * 100.0
+    except Exception:
+        return 0.0
+
+
+def _ma_deviation_guard(row: dict, side: str, symbol: str) -> bool:
+    if not _env_bool("ENTRY_MA_DEVIATION_GUARD_ENABLED", True):
+        return True
+
+    close, _ma5, ma25, ma75, ma_source = _get_price_ma(row)
+    if close <= 0 or ma25 <= 0 or ma75 <= 0:
+        logger.info(
+            "[ENTRY MA DEVIATION GUARD] SKIP symbol=%s side=%s reason=ma_missing close=%.4f ma25=%.4f ma75=%.4f ma_source=%s",
+            symbol, side, close, ma25, ma75, ma_source,
+        )
+        return True
+
+    dev25 = _ma_dev_pct(close, ma25)
+    dev75 = _ma_dev_pct(close, ma75)
+
+    buy_ma25_limit = _env_float("ENTRY_BUY_MAX_NEGATIVE_MA25_DEV_PCT", -1.0)
+    buy_ma75_limit = _env_float("ENTRY_BUY_MAX_NEGATIVE_MA75_DEV_PCT", -1.5)
+    sell_ma25_limit = _env_float("ENTRY_SELL_MAX_POSITIVE_MA25_DEV_PCT", 1.0)
+    sell_ma75_limit = _env_float("ENTRY_SELL_MAX_POSITIVE_MA75_DEV_PCT", 1.5)
+
+    if side == "BUY" and (dev25 <= buy_ma25_limit or dev75 <= buy_ma75_limit):
+        logger.warning(
+            "[ENTRY MA DEVIATION GUARD] NG symbol=%s side=BUY reason=negative_ma_deviation close=%.4f ma25=%.4f ma75=%.4f dev25=%.3f%% limit25=%.3f%% dev75=%.3f%% limit75=%.3f%% ma_source=%s",
+            symbol, close, ma25, ma75, dev25, buy_ma25_limit, dev75, buy_ma75_limit, ma_source,
+        )
+        return False
+
+    if side == "SELL" and (dev25 >= sell_ma25_limit or dev75 >= sell_ma75_limit):
+        logger.warning(
+            "[ENTRY MA DEVIATION GUARD] NG symbol=%s side=SELL reason=positive_ma_deviation close=%.4f ma25=%.4f ma75=%.4f dev25=%.3f%% limit25=%.3f%% dev75=%.3f%% limit75=%.3f%% ma_source=%s",
+            symbol, close, ma25, ma75, dev25, sell_ma25_limit, dev75, sell_ma75_limit, ma_source,
+        )
+        return False
+
+    logger.info(
+        "[ENTRY MA DEVIATION GUARD] OK symbol=%s side=%s close=%.4f ma25=%.4f ma75=%.4f dev25=%.3f%% dev75=%.3f%% ma_source=%s",
+        symbol, side, close, ma25, ma75, dev25, dev75, ma_source,
+    )
+    return True
 
 
 def _ma_structure_guard(row: dict, side: str, symbol: str) -> bool:
@@ -403,22 +471,24 @@ def _direction_confirm(entry_row: Any) -> bool:
     if not _ma_structure_guard(row, side, symbol):
         return False
 
+    if not _ma_deviation_guard(row, side, symbol):
+        return False
+
     strength, reasons = _calc_direction_strength(row)
 
-    if side == "BUY":
-        ok = strength >= min_strength
-    else:
-        ok = strength <= -min_strength
-
+    ok = strength >= min_strength if side == "BUY" else strength <= -min_strength
     if ok:
         logger.info("[ENTRY DIRECTION CONFIRM] OK symbol=%s side=%s strength=%.3f min=%.3f reasons=%s", symbol, side, strength, min_strength, reasons)
         return True
 
     if _try_reverse_entry_side(entry_row, row, side, strength, reasons):
-        reversed_side = _norm_side(_first(_row_to_dict(entry_row), ("side", "entry_decision", "ai_side"), side))
-        if _ma_structure_guard(_row_to_dict(entry_row), reversed_side, symbol):
-            return True
-        return False
+        reversed_row = _row_to_dict(entry_row)
+        reversed_side = _norm_side(_first(reversed_row, ("side", "entry_decision", "ai_side"), side))
+        if not _ma_structure_guard(reversed_row, reversed_side, symbol):
+            return False
+        if not _ma_deviation_guard(reversed_row, reversed_side, symbol):
+            return False
+        return True
 
     if not strict:
         weak = abs(strength) >= min_strength * 0.5
@@ -496,12 +566,17 @@ def install() -> bool:
         ec.range_5m_filter = _patched_range_5m_filter
         _INSTALLED = True
         logger.warning(
-            "[ENTRY DIRECTION CONFIRM] installed enabled=%s min_strength=%.3f strict=%s ma_guard=%s order_only_block=%s reverse_enabled=%s reverse_min=%.3f reverse_half_size=%s",
+            "[ENTRY DIRECTION CONFIRM] installed enabled=%s min_strength=%.3f strict=%s ma_guard=%s order_only_block=%s ma_dev_guard=%s buy_ma25_dev=%.3f buy_ma75_dev=%.3f sell_ma25_dev=%.3f sell_ma75_dev=%.3f reverse_enabled=%s reverse_min=%.3f reverse_half_size=%s",
             _env_bool("ENTRY_DIRECTION_CONFIRM_ENABLED", True),
             _env_float("ENTRY_DIRECTION_CONFIRM_MIN_STRENGTH", 1.5),
             _env_bool("ENTRY_DIRECTION_CONFIRM_STRICT", True),
             _env_bool("ENTRY_MA_STRUCTURE_GUARD_ENABLED", True),
             _env_bool("ENTRY_MA_ORDER_ONLY_BLOCK_WHEN_SLOPE_MISSING", True),
+            _env_bool("ENTRY_MA_DEVIATION_GUARD_ENABLED", True),
+            _env_float("ENTRY_BUY_MAX_NEGATIVE_MA25_DEV_PCT", -1.0),
+            _env_float("ENTRY_BUY_MAX_NEGATIVE_MA75_DEV_PCT", -1.5),
+            _env_float("ENTRY_SELL_MAX_POSITIVE_MA25_DEV_PCT", 1.0),
+            _env_float("ENTRY_SELL_MAX_POSITIVE_MA75_DEV_PCT", 1.5),
             _env_bool("ENTRY_CONTRARIAN_REVERSE_ENABLED", True),
             _env_float("ENTRY_CONTRARIAN_REVERSE_MIN_STRENGTH", 2.5),
             _env_bool("ENTRY_CONTRARIAN_REVERSE_HALF_SIZE", True),
