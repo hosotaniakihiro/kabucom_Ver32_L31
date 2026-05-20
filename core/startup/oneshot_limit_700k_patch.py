@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/oneshot_limit_700k_patch.py
-# Version: Ver10-SCORE-COLUMN-STRICT-ALIGN
+# Version: Ver11-EARLY-SUMMARY-AI-ASYNC-DIRECTION-FAILOPEN
 # ------------------------------------------------------------
 # 起動時 runtime patches:
 # - 70万円ワンショット制限
@@ -9,6 +9,8 @@
 # - SUMMARY AI daily risk / executed判定 / 売建不可候補除外
 # - PUSH flush writer 自己復旧
 # - SUMMARY表示ログの数値・列幅整形
+# - SUMMARY AI 実発注の非同期化
+# - SUMMARY AI 方向確認RecursionError時のfail-open
 # ============================================================
 
 from __future__ import annotations
@@ -152,8 +154,6 @@ def _install_aligned_summary_display_patch() -> bool:
         def _w(s: str) -> int:
             total = 0
             for ch in str(s):
-                # Windows/PyCharmでは east_asian_width=A を1幅で表示することが多い。
-                # Aを2幅扱いすると score列が右へズレるため、F/Wだけ2幅にする。
                 total += 2 if unicodedata.east_asian_width(ch) in {"F", "W"} else 1
             return total
 
@@ -297,10 +297,39 @@ def _install_summary_ai_sell_credit_prefilter_patch() -> bool:
         return False
 
 
+def _install_summary_ai_async_entry_patch() -> bool:
+    try:
+        os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY", "1")
+        os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_DROP_BUSY", "1")
+        from core.startup import summary_ai_async_entry_patch as p
+        ok = p.install()
+        logger.warning("[ONESHOT LIMIT PATCH] summary_ai_async_entry_patch installed=%s", ok)
+        return bool(ok)
+    except Exception:
+        logger.exception("[ONESHOT LIMIT PATCH] summary_ai_async_entry_patch install failed")
+        return False
+
+
+def _install_entry_direction_failopen_patch() -> bool:
+    try:
+        os.environ.setdefault("ENTRY_DIRECTION_FAILOPEN_FOR_SUMMARY_AI", "1")
+        from core.startup import entry_direction_failopen_runtime_patch as p
+        ok = p.install()
+        logger.warning("[ONESHOT LIMIT PATCH] entry_direction_failopen_patch installed=%s", ok)
+        return bool(ok)
+    except Exception:
+        logger.exception("[ONESHOT LIMIT PATCH] entry_direction_failopen_patch install failed")
+        return False
+
+
 def install() -> bool:
     global _INSTALLED
     if _INSTALLED:
         return True
+
+    # 早い段階で入れる。SUMMARY AI hook が動く前に参照差し替えを済ませる。
+    ok_async_entry = _install_summary_ai_async_entry_patch()
+    ok_direction_failopen = _install_entry_direction_failopen_patch()
 
     ok_display = _install_aligned_summary_display_patch()
     ok_threshold = _install_entry_threshold_patch()
@@ -321,5 +350,16 @@ def install() -> bool:
     ok_executor_result = _install_summary_ai_executor_result_patch()
     ok_sell_credit_prefilter = _install_summary_ai_sell_credit_prefilter_patch()
 
-    _INSTALLED = bool(ok_display or ok_threshold or ok_qty_minlot or ok_push_flush or ok_main or ok_symbol_risk or ok_executor_result or ok_sell_credit_prefilter)
+    _INSTALLED = bool(
+        ok_async_entry
+        or ok_direction_failopen
+        or ok_display
+        or ok_threshold
+        or ok_qty_minlot
+        or ok_push_flush
+        or ok_main
+        or ok_symbol_risk
+        or ok_executor_result
+        or ok_sell_credit_prefilter
+    )
     return _INSTALLED
