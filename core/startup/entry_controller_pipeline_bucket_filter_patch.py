@@ -1,10 +1,14 @@
 # ============================================================
 # File   : core/startup/entry_controller_pipeline_bucket_filter_patch.py
-# Version: Ver01-PIPELINE-BUCKET-PREFILTER
+# Version: Ver02-PIPELINE-BUCKET-PREFILTER-ATR-FAILOPEN-HOOK
 # ------------------------------------------------------------
 # entry_controller の pending bucket に interval違いの候補が混在し、
 # MAX_CANDIDATES_PER_SYMBOL の先頭枠を別intervalが消費して
 # PIPELINE_FILTER_MISMATCH ばかりになる問題を軽減する。
+#
+# 追加:
+#   - SUMMARY_AI で出来高・売買代金が十分な候補が ATR_1M_FILTER_NG だけで
+#     全落ちする問題を避けるため、summary_ai_atr_failopen_patch もここから入れる。
 #
 # 方針:
 #   - run_entry_pipeline 呼び出し中だけ、get_bucket(symbol) の戻り値を
@@ -69,6 +73,21 @@ def _entry_matches(entry: Any, pipeline_source: str | None, interval: int | None
     return True
 
 
+def _install_summary_ai_atr_failopen() -> bool:
+    try:
+        os.environ.setdefault("SUMMARY_AI_ATR_FAILOPEN_ENABLED", "1")
+        os.environ.setdefault("SUMMARY_AI_ATR_FAILOPEN_MIN_VOLUME", "30000")
+        os.environ.setdefault("SUMMARY_AI_ATR_FAILOPEN_MIN_TURNOVER", "10000000")
+        os.environ.setdefault("SUMMARY_AI_ATR_FAILOPEN_MIN_PRICE", "1500")
+        from core.startup import summary_ai_atr_failopen_patch as p
+        ok = p.install()
+        logger.warning("[ENTRY PIPELINE BUCKET FILTER] summary_ai_atr_failopen_patch installed=%s", ok)
+        return bool(ok)
+    except Exception:
+        logger.exception("[ENTRY PIPELINE BUCKET FILTER] summary_ai_atr_failopen_patch install failed")
+        return False
+
+
 def _patched_get_bucket(symbol):
     bucket = _ORIG_GET_BUCKET(symbol) if callable(_ORIG_GET_BUCKET) else []
     if not _env_bool("ENTRY_PIPELINE_BUCKET_PREFILTER", True):
@@ -124,6 +143,7 @@ def _patched_run_entry_pipeline(*args, **kwargs):
 
 def install() -> bool:
     global _INSTALLED, _ORIG_RUN, _ORIG_GET_BUCKET
+    _install_summary_ai_atr_failopen()
     if _INSTALLED:
         return True
     try:
