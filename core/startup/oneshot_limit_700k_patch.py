@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/oneshot_limit_700k_patch.py
-# Version: Ver19-EARLY-PUSH-BOOTSTRAP-FAST-RESTORE
+# Version: Ver20-EARLY-ENTRY-PIPELINE-BUCKET-FILTER
 # ------------------------------------------------------------
 # 起動時 runtime patches:
 # - PUSH bootstrap fast restore: 起動時PUSH DB復元を軽量化
@@ -9,9 +9,11 @@
 # - BUYエントリー閾値を後場スコアに合わせて緩和
 # - SUMMARY AI daily risk / executed判定 / 売建不可候補除外
 # - SUMMARY AI pre-order dedupe/cooldown無効化
+# - SUMMARY AI async queue: busy時に候補を捨てずキュー処理
 # - SUMMARY AI strict liquidity: 直近1本/平均出来高も必須
 # - WATCHLIST recent liquidity: 監視銘柄選定時点で直近1本/平均/売買代金を必須化
 # - SUMMARY parallel intervals: 1m/3m/5mを並列実行
+# - ENTRY pipeline bucket prefilter: interval/source違いpendingを事前除外
 # - SUMMARY_ENTRY duplicate pending を registered 扱いにする
 # - EXIT 利益保護 / 板対応
 # ============================================================
@@ -152,7 +154,8 @@ def _install_summary_ai_sell_credit_prefilter_patch() -> bool:
 def _install_summary_ai_async_entry_patch() -> bool:
     try:
         os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY", "1")
-        os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_DROP_BUSY", "1")
+        os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_DROP_BUSY", "0")
+        os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX", "20")
         from core.startup import summary_ai_async_entry_patch as p
         ok = p.install()
         logger.warning("[ONESHOT LIMIT PATCH] summary_ai_async_entry_patch installed=%s", ok)
@@ -220,6 +223,18 @@ def _install_summary_parallel_intervals_patch() -> bool:
         return False
 
 
+def _install_entry_pipeline_bucket_filter_patch() -> bool:
+    try:
+        os.environ.setdefault("ENTRY_PIPELINE_BUCKET_PREFILTER", "1")
+        from core.startup import entry_controller_pipeline_bucket_filter_patch as p
+        ok = p.install()
+        logger.warning("[ONESHOT LIMIT PATCH] entry_pipeline_bucket_filter_patch installed=%s", ok)
+        return bool(ok)
+    except Exception:
+        logger.exception("[ONESHOT LIMIT PATCH] entry_pipeline_bucket_filter_patch install failed")
+        return False
+
+
 def _install_summary_entry_pending_existing_fix_patch() -> bool:
     try:
         from core.startup import summary_entry_pending_existing_fix_patch as p
@@ -283,7 +298,6 @@ def install() -> bool:
     if _INSTALLED:
         return True
 
-    # push_bootstrap より前に効かせたいので最初に入れる
     ok_push_fast_restore = _install_push_bootstrap_fast_restore_patch()
 
     ok_async_entry = _install_summary_ai_async_entry_patch()
@@ -291,6 +305,7 @@ def install() -> bool:
     ok_strict_liq = _install_strict_liquidity_patch()
     ok_watchlist_liq = _install_watchlist_recent_liquidity_patch()
     ok_parallel = _install_summary_parallel_intervals_patch()
+    ok_bucket_filter = _install_entry_pipeline_bucket_filter_patch()
     ok_pending_existing = _install_summary_entry_pending_existing_fix_patch()
     ok_direction_failopen = _install_entry_direction_failopen_patch()
     ok_exit_profit = _install_exit_profit_protect_patch()
@@ -322,6 +337,7 @@ def install() -> bool:
         or ok_strict_liq
         or ok_watchlist_liq
         or ok_parallel
+        or ok_bucket_filter
         or ok_pending_existing
         or ok_direction_failopen
         or ok_exit_profit
