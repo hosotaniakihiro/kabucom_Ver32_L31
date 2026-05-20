@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/oneshot_limit_700k_patch.py
-# Version: Ver12-EARLY-EXIT-PROFIT-PROTECT
+# Version: Ver13-EARLY-EXIT-BOARD-PROFIT
 # ------------------------------------------------------------
 # 起動時 runtime patches:
 # - 70万円ワンショット制限
@@ -12,6 +12,7 @@
 # - SUMMARY AI 実発注の非同期化
 # - SUMMARY AI 方向確認RecursionError時のfail-open
 # - EXIT 利益保護: 含み益を損切り化させない
+# - EXIT 板対応: 厚い板の1tick手前に返済指値、逆行で取消→成行返済
 # ============================================================
 
 from __future__ import annotations
@@ -340,6 +341,24 @@ def _install_exit_profit_protect_patch() -> bool:
         return False
 
 
+def _install_exit_board_profit_patch() -> bool:
+    try:
+        os.environ.setdefault("EXIT_BOARD_PROFIT_ENABLED", "1")
+        os.environ.setdefault("EXIT_BOARD_MIN_PROFIT_PCT", "0.0010")
+        os.environ.setdefault("EXIT_BOARD_THICK_QTY_MULT", "3.0")
+        os.environ.setdefault("EXIT_BOARD_MIN_THICK_QTY", "1000")
+        os.environ.setdefault("EXIT_BOARD_MAX_WAIT_SEC", "2.0")
+        os.environ.setdefault("EXIT_BOARD_POLL_SEC", "0.25")
+        os.environ.setdefault("EXIT_BOARD_REVERSE_GAP_PCT", "0.0010")
+        from core.startup import exit_board_profit_runtime_patch as p
+        ok = p.install()
+        logger.warning("[ONESHOT LIMIT PATCH] exit_board_profit_patch installed=%s", ok)
+        return bool(ok)
+    except Exception:
+        logger.exception("[ONESHOT LIMIT PATCH] exit_board_profit_patch install failed")
+        return False
+
+
 def install() -> bool:
     global _INSTALLED
     if _INSTALLED:
@@ -349,6 +368,7 @@ def install() -> bool:
     ok_async_entry = _install_summary_ai_async_entry_patch()
     ok_direction_failopen = _install_entry_direction_failopen_patch()
     ok_exit_profit = _install_exit_profit_protect_patch()
+    ok_exit_board = _install_exit_board_profit_patch()
 
     ok_display = _install_aligned_summary_display_patch()
     ok_threshold = _install_entry_threshold_patch()
@@ -373,6 +393,7 @@ def install() -> bool:
         ok_async_entry
         or ok_direction_failopen
         or ok_exit_profit
+        or ok_exit_board
         or ok_display
         or ok_threshold
         or ok_qty_minlot
