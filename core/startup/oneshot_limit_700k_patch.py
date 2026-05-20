@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/oneshot_limit_700k_patch.py
-# Version: Ver13-EARLY-EXIT-BOARD-PROFIT
+# Version: Ver14-EARLY-SUMMARY-AI-DEDUPE-FIX
 # ------------------------------------------------------------
 # 起動時 runtime patches:
 # - 70万円ワンショット制限
@@ -11,6 +11,7 @@
 # - SUMMARY表示ログの数値・列幅整形
 # - SUMMARY AI 実発注の非同期化
 # - SUMMARY AI 方向確認RecursionError時のfail-open
+# - SUMMARY AI pre-order dedupe/cooldown無効化
 # - EXIT 利益保護: 含み益を損切り化させない
 # - EXIT 板対応: 厚い板の1tick手前に返済指値、逆行で取消→成行返済
 # ============================================================
@@ -312,6 +313,18 @@ def _install_summary_ai_async_entry_patch() -> bool:
         return False
 
 
+def _install_summary_ai_dedupe_fix_patch() -> bool:
+    try:
+        os.environ.setdefault("SUMMARY_AI_PREORDER_DEDUPE_ENABLED", "0")
+        from core.startup import summary_ai_dedupe_fix_runtime_patch as p
+        ok = p.install()
+        logger.warning("[ONESHOT LIMIT PATCH] summary_ai_dedupe_fix_patch installed=%s", ok)
+        return bool(ok)
+    except Exception:
+        logger.exception("[ONESHOT LIMIT PATCH] summary_ai_dedupe_fix_patch install failed")
+        return False
+
+
 def _install_entry_direction_failopen_patch() -> bool:
     try:
         os.environ.setdefault("ENTRY_DIRECTION_FAILOPEN_FOR_SUMMARY_AI", "1")
@@ -366,6 +379,7 @@ def install() -> bool:
 
     # 早い段階で入れる。SUMMARY AI hook / EXIT hook が動く前に参照差し替えを済ませる。
     ok_async_entry = _install_summary_ai_async_entry_patch()
+    ok_dedupe_fix = _install_summary_ai_dedupe_fix_patch()
     ok_direction_failopen = _install_entry_direction_failopen_patch()
     ok_exit_profit = _install_exit_profit_protect_patch()
     ok_exit_board = _install_exit_board_profit_patch()
@@ -391,6 +405,7 @@ def install() -> bool:
 
     _INSTALLED = bool(
         ok_async_entry
+        or ok_dedupe_fix
         or ok_direction_failopen
         or ok_exit_profit
         or ok_exit_board
