@@ -1,29 +1,19 @@
 # ============================================================
 # File   : core/startup/entry_direction_confirm_guard_patch.py
-# Version: Ver06-CLIMAX-REVERSAL-EXCEPTION
+# Version: Ver07-NO-WRAP-RECURSION-FIX
 # ------------------------------------------------------------
-# エントリー直前の方向確認 runtime patch。
+# エントリー直前の方向確認 runtime guard。
 #
-# 主なガード:
-#   1. MA構造ガード
-#      BUY : 株価がMA下、MA並びが下落形ならBUY禁止
-#      SELL: 株価がMA上、MA並びが上昇形ならSELL禁止
+# Ver07:
+#   - RecursionError 対策
+#   - このモジュールでは trading.handlers.entry_controller の
+#     atr_1m_filter / range_5m_filter を直接差し替えない
+#   - low_movement_entry_guard_patch 側の単一ラッパーから
+#     check_entry_direction_confirm() を呼び出す構成へ変更
 #
-#   2. MA傾きガード
-#      daily_ma25_slope / daily_ma75_slope などを読む
-#
-#   3. MA乖離率ガード
-#      BUY : MA25/MA75より大きく下に乖離している場合はBUY禁止
-#      SELL: MA25/MA75より大きく上に乖離している場合はSELL禁止
-#
-#   4. 分足クライマックス反転例外
-#      selling_climax_absorption / selling_climax_wick ならBUY例外許可
-#      buying_climax_exhaustion / buying_climax_wick ならSELL例外許可
-#
-# 注意:
-#   クライマックス反転は無条件許可ではない。
-#   出来高・売買代金・MA乖離・トレンド失速などが複合成立した場合のみ、
-#   MA構造/MA乖離/方向強度NGを例外的に通す。
+# 重要:
+#   このファイルは「判定関数」を提供するだけです。
+#   ATR/RANGE フィルタの monkey patch はここでは行いません。
 # ============================================================
 
 from __future__ import annotations
@@ -35,8 +25,6 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _INSTALLED = False
-_ORIG_ATR_FILTER = None
-_ORIG_RANGE_FILTER = None
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -207,9 +195,6 @@ def _ma_dev_pct(close: float, ma: float) -> float:
 
 
 def _climax_exception(entry_row: Any, row: dict, side: str, symbol: str, blocked_by: str) -> bool:
-    """
-    通常ガードでNGになった場合でも、分足クライマックス反転が成立していれば例外許可する。
-    """
     if not _env_bool("ENTRY_CLIMAX_REVERSAL_EXCEPTION_ENABLED", True):
         return False
 
@@ -240,10 +225,11 @@ def _climax_exception(entry_row: Any, row: dict, side: str, symbol: str, blocked
         )
         return False
 
-    except Exception:
-        logger.exception(
-            "[ENTRY CLIMAX EXCEPTION] failed symbol=%s side=%s blocked_by=%s",
-            symbol, side, blocked_by,
+    except Exception as e:
+        logger.warning(
+            "[ENTRY CLIMAX EXCEPTION] failed symbol=%s side=%s blocked_by=%s err=%s",
+            symbol, side, blocked_by, e,
+            exc_info=False,
         )
         return False
 
@@ -540,97 +526,58 @@ def _direction_confirm(entry_row: Any) -> bool:
     return False
 
 
-def _patched_range_5m_filter(entry_row: Any = None, *args, **kwargs):
+def check_entry_direction_confirm(entry_row: Any = None, *args, **kwargs) -> bool:
+    """
+    low_movement_entry_guard_patch など、単一ラッパー側から呼ぶための公開関数。
+    ここでは元ATR/RANGEフィルタを呼ばないため、二重パッチ再帰が発生しない。
+    """
+    if entry_row is None:
+        return True
     try:
-        allow = True
-        if callable(_ORIG_RANGE_FILTER):
-            allow = _ORIG_RANGE_FILTER(entry_row, *args, **kwargs)
-        if isinstance(allow, tuple):
-            return allow
-        if not bool(allow):
-            return False
-        if entry_row is not None:
-            return _direction_confirm(entry_row)
-        return allow
-    except Exception:
-        logger.exception("[ENTRY DIRECTION CONFIRM] patched range filter failed")
-        return False
-
-
-def _patched_atr_1m_filter(entry_row: Any = None, *args, **kwargs):
-    try:
-        allow = True
-        if callable(_ORIG_ATR_FILTER):
-            allow = _ORIG_ATR_FILTER(entry_row, *args, **kwargs)
-        if isinstance(allow, tuple):
-            return allow
-        if not bool(allow):
-            return False
-        if entry_row is not None:
-            return _direction_confirm(entry_row)
-        return allow
-    except Exception:
-        logger.exception("[ENTRY DIRECTION CONFIRM] patched atr filter failed")
-        return False
-
-
-def _is_currently_wrapped() -> bool:
-    try:
-        import trading.handlers.entry_controller as ec
-        cur_atr = getattr(ec, "atr_1m_filter", None)
-        cur_range = getattr(ec, "range_5m_filter", None)
-        return bool(
-            getattr(cur_atr, "_entry_direction_confirm_guard", False)
-            and getattr(cur_range, "_entry_direction_confirm_guard", False)
+        return bool(_direction_confirm(entry_row))
+    except RecursionError:
+        logger.error(
+            "[ENTRY DIRECTION CONFIRM] recursion detected in pure guard. fail-safe NG.",
+            exc_info=False,
         )
-    except Exception:
+        return False
+    except Exception as e:
+        logger.warning(
+            "[ENTRY DIRECTION CONFIRM] pure guard failed: %s",
+            e,
+            exc_info=False,
+        )
         return False
 
 
 def install() -> bool:
-    global _INSTALLED, _ORIG_ATR_FILTER, _ORIG_RANGE_FILTER
-    try:
-        import trading.handlers.entry_controller as ec
-
-        if _INSTALLED and _is_currently_wrapped():
-            return True
-
-        old_atr = getattr(ec, "atr_1m_filter", None)
-        old_range = getattr(ec, "range_5m_filter", None)
-
-        _ORIG_ATR_FILTER = old_atr
-        _ORIG_RANGE_FILTER = old_range
-        _patched_atr_1m_filter._entry_direction_confirm_guard = True  # type: ignore[attr-defined]
-        _patched_range_5m_filter._entry_direction_confirm_guard = True  # type: ignore[attr-defined]
-        ec.atr_1m_filter = _patched_atr_1m_filter
-        ec.range_5m_filter = _patched_range_5m_filter
-        _INSTALLED = True
-        logger.warning(
-            "[ENTRY DIRECTION CONFIRM] installed enabled=%s min_strength=%.3f strict=%s ma_guard=%s order_only_block=%s ma_dev_guard=%s climax_exception=%s buy_ma25_dev=%.3f buy_ma75_dev=%.3f sell_ma25_dev=%.3f sell_ma75_dev=%.3f reverse_enabled=%s reverse_min=%.3f reverse_half_size=%s",
-            _env_bool("ENTRY_DIRECTION_CONFIRM_ENABLED", True),
-            _env_float("ENTRY_DIRECTION_CONFIRM_MIN_STRENGTH", 1.5),
-            _env_bool("ENTRY_DIRECTION_CONFIRM_STRICT", True),
-            _env_bool("ENTRY_MA_STRUCTURE_GUARD_ENABLED", True),
-            _env_bool("ENTRY_MA_ORDER_ONLY_BLOCK_WHEN_SLOPE_MISSING", True),
-            _env_bool("ENTRY_MA_DEVIATION_GUARD_ENABLED", True),
-            _env_bool("ENTRY_CLIMAX_REVERSAL_EXCEPTION_ENABLED", True),
-            _env_float("ENTRY_BUY_MAX_NEGATIVE_MA25_DEV_PCT", -1.0),
-            _env_float("ENTRY_BUY_MAX_NEGATIVE_MA75_DEV_PCT", -1.5),
-            _env_float("ENTRY_SELL_MAX_POSITIVE_MA25_DEV_PCT", 1.0),
-            _env_float("ENTRY_SELL_MAX_POSITIVE_MA75_DEV_PCT", 1.5),
-            _env_bool("ENTRY_CONTRARIAN_REVERSE_ENABLED", True),
-            _env_float("ENTRY_CONTRARIAN_REVERSE_MIN_STRENGTH", 2.5),
-            _env_bool("ENTRY_CONTRARIAN_REVERSE_HALF_SIZE", True),
-        )
+    """
+    後方互換用。
+    旧版はここで entry_controller の atr_1m_filter / range_5m_filter を差し替えていたが、
+    low_movement_entry_guard_patch と相互再帰するため廃止。
+    """
+    global _INSTALLED
+    if _INSTALLED:
         return True
-    except Exception:
-        logger.exception("[ENTRY DIRECTION CONFIRM] install failed")
-        return False
+    _INSTALLED = True
+    logger.warning(
+        "[ENTRY DIRECTION CONFIRM] installed as pure guard only enabled=%s min_strength=%.3f strict=%s ma_guard=%s order_only_block=%s ma_dev_guard=%s climax_exception=%s reverse_enabled=%s reverse_min=%.3f",
+        _env_bool("ENTRY_DIRECTION_CONFIRM_ENABLED", True),
+        _env_float("ENTRY_DIRECTION_CONFIRM_MIN_STRENGTH", 1.5),
+        _env_bool("ENTRY_DIRECTION_CONFIRM_STRICT", True),
+        _env_bool("ENTRY_MA_STRUCTURE_GUARD_ENABLED", True),
+        _env_bool("ENTRY_MA_ORDER_ONLY_BLOCK_WHEN_SLOPE_MISSING", True),
+        _env_bool("ENTRY_MA_DEVIATION_GUARD_ENABLED", True),
+        _env_bool("ENTRY_CLIMAX_REVERSAL_EXCEPTION_ENABLED", True),
+        _env_bool("ENTRY_CONTRARIAN_REVERSE_ENABLED", True),
+        _env_float("ENTRY_CONTRARIAN_REVERSE_MIN_STRENGTH", 2.5),
+    )
+    return True
 
 
 try:
     install()
-except Exception:
-    logger.exception("[ENTRY DIRECTION CONFIRM] auto install failed")
+except Exception as e:
+    logger.warning("[ENTRY DIRECTION CONFIRM] auto install failed: %s", e, exc_info=False)
 
-__all__ = ["install"]
+__all__ = ["install", "check_entry_direction_confirm"]
