@@ -1,27 +1,16 @@
 # ============================================================
 # File   : core/startup/low_movement_entry_guard_patch.py
-# Version: Ver10-INSTALL-VWAP-STATE
+# Version: Ver11-ATR-WRAP-OWNER-RECURSION-FIX
 # ------------------------------------------------------------
 # あまり動かない銘柄へのエントリーを発注直前で止める。
 # さらに、ランキング方向に逆らうエントリーも禁止する。
 #
-# Ver07:
-#   - final_entry_safety_guard_patch も同時 install
-#   - 発注直前の出来高・売買代金、時間帯、同一銘柄損切り後ロック、
-#     直近逆行、板/スプレッド、逆張り半数量化を有効化
-#   - 優先度3「当日損失上限」はユーザー要望により未実装
-#
-# Ver08:
-#   - entry_price_improvement_patch も同時 install
-#   - Bid/Ask レベルで有利指値へ補正
-#
-# Ver09:
-#   - ma_cross_state_runtime_patch も同時 install
-#   - ゴールデンクロス/デッドクロス後のMA継続状態を方向強度へ反映
-#
-# Ver10:
-#   - vwap_state_runtime_patch も同時 install
-#   - VWAP上/下の継続状態を方向強度へ反映
+# Ver11:
+#   - RecursionError 対策
+#   - atr_1m_filter / range_5m_filter の実パッチ所有者をこのファイルに統一
+#   - entry_direction_confirm_guard_patch は直接パッチせず、
+#     check_entry_direction_confirm() の純粋判定だけを呼ぶ
+#   - logger.exception を主要パッチ経路から排除し、ログ整形中の再帰を抑止
 # ============================================================
 
 from __future__ import annotations
@@ -97,8 +86,8 @@ def _install_ranking_direction_guard() -> bool:
         ok = p.install()
         logger.warning("[LOW MOVE GUARD] ranking_direction_entry_guard_patch installed=%s", ok)
         return bool(ok)
-    except Exception:
-        logger.exception("[LOW MOVE GUARD] ranking_direction_entry_guard_patch install failed")
+    except Exception as e:
+        logger.warning("[LOW MOVE GUARD] ranking_direction_entry_guard_patch install failed: %s", e, exc_info=False)
         return False
 
 
@@ -108,8 +97,8 @@ def _install_scoring_flag_pattern_bridge() -> bool:
         ok = p.install()
         logger.warning("[LOW MOVE GUARD] scoring_flag_pattern_bridge_patch installed=%s", ok)
         return bool(ok)
-    except Exception:
-        logger.exception("[LOW MOVE GUARD] scoring_flag_pattern_bridge_patch install failed")
+    except Exception as e:
+        logger.warning("[LOW MOVE GUARD] scoring_flag_pattern_bridge_patch install failed: %s", e, exc_info=False)
         return False
 
 
@@ -117,10 +106,10 @@ def _install_entry_direction_confirm_guard() -> bool:
     try:
         from core.startup import entry_direction_confirm_guard_patch as p
         ok = p.install()
-        logger.warning("[LOW MOVE GUARD] entry_direction_confirm_guard_patch installed=%s", ok)
+        logger.warning("[LOW MOVE GUARD] entry_direction_confirm_guard_patch pure_guard_installed=%s", ok)
         return bool(ok)
-    except Exception:
-        logger.exception("[LOW MOVE GUARD] entry_direction_confirm_guard_patch install failed")
+    except Exception as e:
+        logger.warning("[LOW MOVE GUARD] entry_direction_confirm_guard_patch install failed: %s", e, exc_info=False)
         return False
 
 
@@ -130,8 +119,8 @@ def _install_final_entry_safety_guard() -> bool:
         ok = p.install()
         logger.warning("[LOW MOVE GUARD] final_entry_safety_guard_patch installed=%s", ok)
         return bool(ok)
-    except Exception:
-        logger.exception("[LOW MOVE GUARD] final_entry_safety_guard_patch install failed")
+    except Exception as e:
+        logger.warning("[LOW MOVE GUARD] final_entry_safety_guard_patch install failed: %s", e, exc_info=False)
         return False
 
 
@@ -141,8 +130,8 @@ def _install_entry_price_improvement_patch() -> bool:
         ok = p.install()
         logger.warning("[LOW MOVE GUARD] entry_price_improvement_patch installed=%s", ok)
         return bool(ok)
-    except Exception:
-        logger.exception("[LOW MOVE GUARD] entry_price_improvement_patch install failed")
+    except Exception as e:
+        logger.warning("[LOW MOVE GUARD] entry_price_improvement_patch install failed: %s", e, exc_info=False)
         return False
 
 
@@ -152,8 +141,8 @@ def _install_ma_cross_state_runtime_patch() -> bool:
         ok = p.install()
         logger.warning("[LOW MOVE GUARD] ma_cross_state_runtime_patch installed=%s", ok)
         return bool(ok)
-    except Exception:
-        logger.exception("[LOW MOVE GUARD] ma_cross_state_runtime_patch install failed")
+    except Exception as e:
+        logger.warning("[LOW MOVE GUARD] ma_cross_state_runtime_patch install failed: %s", e, exc_info=False)
         return False
 
 
@@ -163,9 +152,28 @@ def _install_vwap_state_runtime_patch() -> bool:
         ok = p.install()
         logger.warning("[LOW MOVE GUARD] vwap_state_runtime_patch installed=%s", ok)
         return bool(ok)
-    except Exception:
-        logger.exception("[LOW MOVE GUARD] vwap_state_runtime_patch install failed")
+    except Exception as e:
+        logger.warning("[LOW MOVE GUARD] vwap_state_runtime_patch install failed: %s", e, exc_info=False)
         return False
+
+
+def _call_entry_direction_confirm(entry_row: Any) -> bool:
+    try:
+        from core.startup.entry_direction_confirm_guard_patch import check_entry_direction_confirm
+        return bool(check_entry_direction_confirm(entry_row))
+    except RecursionError:
+        logger.error(
+            "[LOW MOVE GUARD] entry_direction_confirm recursion detected. fail-safe NG.",
+            exc_info=False,
+        )
+        return False
+    except Exception as e:
+        logger.warning(
+            "[LOW MOVE GUARD] entry_direction_confirm skipped due to error: %s",
+            e,
+            exc_info=False,
+        )
+        return True
 
 
 def _low_movement_guard(entry_row: Any) -> bool:
@@ -237,6 +245,16 @@ def _low_movement_guard(entry_row: Any) -> bool:
     return True
 
 
+def _apply_all_entry_guards(entry_row: Any) -> bool:
+    if entry_row is None:
+        return True
+    if not _low_movement_guard(entry_row):
+        return False
+    if not _call_entry_direction_confirm(entry_row):
+        return False
+    return True
+
+
 def _patched_range_5m_filter(entry_row: Any = None, *args, **kwargs):
     try:
         allow = True
@@ -246,11 +264,15 @@ def _patched_range_5m_filter(entry_row: Any = None, *args, **kwargs):
             return allow
         if not bool(allow):
             return False
-        if entry_row is not None:
-            return _low_movement_guard(entry_row)
-        return allow
-    except Exception:
-        logger.exception("[LOW MOVE GUARD] patched range filter failed")
+        return _apply_all_entry_guards(entry_row)
+    except RecursionError:
+        logger.error(
+            "[LOW MOVE GUARD] recursion detected in patched range filter. fail-safe NG. Check duplicate wrappers.",
+            exc_info=False,
+        )
+        return False
+    except Exception as e:
+        logger.warning("[LOW MOVE GUARD] patched range filter failed: %s", e, exc_info=False)
         return False
 
 
@@ -263,11 +285,22 @@ def _patched_atr_1m_filter(entry_row: Any = None, *args, **kwargs):
             return allow
         if not bool(allow):
             return False
-        if entry_row is not None:
-            return _low_movement_guard(entry_row)
-        return allow
+        return _apply_all_entry_guards(entry_row)
+    except RecursionError:
+        logger.error(
+            "[LOW MOVE GUARD] recursion detected in patched atr filter. fail-safe NG. Check duplicate wrappers.",
+            exc_info=False,
+        )
+        return False
+    except Exception as e:
+        logger.warning("[LOW MOVE GUARD] patched atr filter failed: %s", e, exc_info=False)
+        return False
+
+
+def _is_low_move_wrapped(func: Any) -> bool:
+    try:
+        return bool(getattr(func, "_low_move_guard_v2", False) or getattr(func, "_low_move_guard_v1", False))
     except Exception:
-        logger.exception("[LOW MOVE GUARD] patched atr filter failed")
         return False
 
 
@@ -275,49 +308,35 @@ def install() -> bool:
     global _INSTALLED, _ORIG_ATR_FILTER, _ORIG_RANGE_FILTER
     ok_direction = _install_ranking_direction_guard()
     ok_scoring_bridge = _install_scoring_flag_pattern_bridge()
-    ok_entry_direction = False
+    ok_entry_direction = _install_entry_direction_confirm_guard()
     ok_final_safety = _install_final_entry_safety_guard()
     ok_price_improve = _install_entry_price_improvement_patch()
     ok_ma_cross = _install_ma_cross_state_runtime_patch()
     ok_vwap_state = _install_vwap_state_runtime_patch()
 
     if _INSTALLED:
-        ok_entry_direction = _install_entry_direction_confirm_guard()
-        ok_final_safety = _install_final_entry_safety_guard()
-        ok_price_improve = _install_entry_price_improvement_patch()
-        ok_ma_cross = _install_ma_cross_state_runtime_patch()
-        ok_vwap_state = _install_vwap_state_runtime_patch()
-        return bool(ok_direction or ok_scoring_bridge or ok_entry_direction or ok_final_safety or ok_price_improve or ok_ma_cross or ok_vwap_state or True)
+        return True
 
     try:
         import trading.handlers.entry_controller as ec
         old_atr = getattr(ec, "atr_1m_filter", None)
         old_range = getattr(ec, "range_5m_filter", None)
-        if callable(old_range) and getattr(old_range, "_low_move_guard_v1", False):
+
+        if _is_low_move_wrapped(old_atr) and _is_low_move_wrapped(old_range):
             _INSTALLED = True
-            ok_entry_direction = _install_entry_direction_confirm_guard()
-            ok_final_safety = _install_final_entry_safety_guard()
-            ok_price_improve = _install_entry_price_improvement_patch()
-            ok_ma_cross = _install_ma_cross_state_runtime_patch()
-            ok_vwap_state = _install_vwap_state_runtime_patch()
+            logger.warning("[LOW MOVE GUARD] already installed; skip duplicate wrapping")
             return True
 
         _ORIG_ATR_FILTER = old_atr
         _ORIG_RANGE_FILTER = old_range
-        _patched_atr_1m_filter._low_move_guard_v1 = True  # type: ignore[attr-defined]
-        _patched_range_5m_filter._low_move_guard_v1 = True  # type: ignore[attr-defined]
+        _patched_atr_1m_filter._low_move_guard_v2 = True  # type: ignore[attr-defined]
+        _patched_range_5m_filter._low_move_guard_v2 = True  # type: ignore[attr-defined]
         ec.atr_1m_filter = _patched_atr_1m_filter
         ec.range_5m_filter = _patched_range_5m_filter
         _INSTALLED = True
 
-        ok_entry_direction = _install_entry_direction_confirm_guard()
-        ok_final_safety = _install_final_entry_safety_guard()
-        ok_price_improve = _install_entry_price_improvement_patch()
-        ok_ma_cross = _install_ma_cross_state_runtime_patch()
-        ok_vwap_state = _install_vwap_state_runtime_patch()
-
         logger.warning(
-            "[LOW MOVE GUARD] installed low_range=%.4f high_range=%.4f low_slope=%.6f high_slope=%.6f strong_range=%.4f ranking_direction=%s scoring_flag_pattern_bridge=%s entry_direction_confirm=%s final_entry_safety=%s price_improve=%s ma_cross_state=%s vwap_state=%s",
+            "[LOW MOVE GUARD] installed as single filter wrapper low_range=%.4f high_range=%.4f low_slope=%.6f high_slope=%.6f strong_range=%.4f ranking_direction=%s scoring_flag_pattern_bridge=%s entry_direction_confirm_pure=%s final_entry_safety=%s price_improve=%s ma_cross_state=%s vwap_state=%s",
             _env_float("LOW_MOVE_MIN_RANGE_PCT_LOW_PRICE", 0.015),
             _env_float("LOW_MOVE_MIN_RANGE_PCT_HIGH_PRICE", 0.008),
             _env_float("LOW_MOVE_MIN_ABS_SLOPE_LOW_PRICE", 0.0003),
@@ -332,14 +351,14 @@ def install() -> bool:
             ok_vwap_state,
         )
         return True
-    except Exception:
-        logger.exception("[LOW MOVE GUARD] install failed")
+    except Exception as e:
+        logger.warning("[LOW MOVE GUARD] install failed: %s", e, exc_info=False)
         return bool(ok_direction or ok_scoring_bridge or ok_entry_direction or ok_final_safety or ok_price_improve or ok_ma_cross or ok_vwap_state)
 
 
 try:
     install()
-except Exception:
-    logger.exception("[LOW MOVE GUARD] auto install failed")
+except Exception as e:
+    logger.warning("[LOW MOVE GUARD] auto install failed: %s", e, exc_info=False)
 
 __all__ = ["install"]
