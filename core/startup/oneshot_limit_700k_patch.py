@@ -1,8 +1,9 @@
 # ============================================================
 # File   : core/startup/oneshot_limit_700k_patch.py
-# Version: Ver18-EARLY-SUMMARY-PARALLEL-INTERVALS
+# Version: Ver19-EARLY-PUSH-BOOTSTRAP-FAST-RESTORE
 # ------------------------------------------------------------
 # 起動時 runtime patches:
+# - PUSH bootstrap fast restore: 起動時PUSH DB復元を軽量化
 # - 70万円ワンショット制限
 # - ENTRY数量0株の最低100株フォールバック
 # - BUYエントリー閾値を後場スコアに合わせて緩和
@@ -42,6 +43,20 @@ def _env_int(name: str, default: int) -> int:
         return int(float(v))
     except Exception:
         return int(default)
+
+
+def _install_push_bootstrap_fast_restore_patch() -> bool:
+    try:
+        os.environ.setdefault("PUSH_BOOTSTRAP_FAST_RESTORE", "1")
+        os.environ.setdefault("PUSH_BOOTSTRAP_FAST_MAX_ROWS", "3000")
+        os.environ.setdefault("PUSH_BOOTSTRAP_FAST_LOOKBACK_MINUTES", "45")
+        from core.startup import push_bootstrap_fast_restore_patch as p
+        ok = p.install()
+        logger.warning("[ONESHOT LIMIT PATCH] push_bootstrap_fast_restore_patch installed=%s", ok)
+        return bool(ok)
+    except Exception:
+        logger.exception("[ONESHOT LIMIT PATCH] push_bootstrap_fast_restore_patch install failed")
+        return False
 
 
 def _install_entry_threshold_patch() -> bool:
@@ -268,6 +283,9 @@ def install() -> bool:
     if _INSTALLED:
         return True
 
+    # push_bootstrap より前に効かせたいので最初に入れる
+    ok_push_fast_restore = _install_push_bootstrap_fast_restore_patch()
+
     ok_async_entry = _install_summary_ai_async_entry_patch()
     ok_dedupe_fix = _install_summary_ai_dedupe_fix_patch()
     ok_strict_liq = _install_strict_liquidity_patch()
@@ -298,7 +316,8 @@ def install() -> bool:
     ok_sell_credit_prefilter = _install_summary_ai_sell_credit_prefilter_patch()
 
     _INSTALLED = bool(
-        ok_async_entry
+        ok_push_fast_restore
+        or ok_async_entry
         or ok_dedupe_fix
         or ok_strict_liq
         or ok_watchlist_liq
