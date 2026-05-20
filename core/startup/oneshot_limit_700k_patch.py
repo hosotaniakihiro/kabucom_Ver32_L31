@@ -1,9 +1,10 @@
 # ============================================================
 # File   : core/startup/oneshot_limit_700k_patch.py
-# Version: Ver20-EARLY-ENTRY-PIPELINE-BUCKET-FILTER
+# Version: Ver21-EARLY-OPEN-POSITION-STALE-DB-CLEANUP
 # ------------------------------------------------------------
 # 起動時 runtime patches:
 # - PUSH bootstrap fast restore: 起動時PUSH DB復元を軽量化
+# - OPEN POSITION stale DB cleanup: broker側に無い古いDB建玉を自動CLOSED化
 # - 70万円ワンショット制限
 # - ENTRY数量0株の最低100株フォールバック
 # - BUYエントリー閾値を後場スコアに合わせて緩和
@@ -58,6 +59,19 @@ def _install_push_bootstrap_fast_restore_patch() -> bool:
         return bool(ok)
     except Exception:
         logger.exception("[ONESHOT LIMIT PATCH] push_bootstrap_fast_restore_patch install failed")
+        return False
+
+
+def _install_open_position_stale_db_cleanup_patch() -> bool:
+    try:
+        os.environ.setdefault("OPEN_POSITION_AUTO_CLOSE_STALE_DB", "1")
+        os.environ.setdefault("OPEN_POSITION_STALE_DB_CLEAN_INTERVAL_SEC", "30")
+        from core.startup import open_position_stale_db_cleanup_patch as p
+        ok = p.install()
+        logger.warning("[ONESHOT LIMIT PATCH] open_position_stale_db_cleanup_patch installed=%s", ok)
+        return bool(ok)
+    except Exception:
+        logger.exception("[ONESHOT LIMIT PATCH] open_position_stale_db_cleanup_patch install failed")
         return False
 
 
@@ -299,6 +313,7 @@ def install() -> bool:
         return True
 
     ok_push_fast_restore = _install_push_bootstrap_fast_restore_patch()
+    ok_stale_db_cleanup = _install_open_position_stale_db_cleanup_patch()
 
     ok_async_entry = _install_summary_ai_async_entry_patch()
     ok_dedupe_fix = _install_summary_ai_dedupe_fix_patch()
@@ -332,6 +347,7 @@ def install() -> bool:
 
     _INSTALLED = bool(
         ok_push_fast_restore
+        or ok_stale_db_cleanup
         or ok_async_entry
         or ok_dedupe_fix
         or ok_strict_liq
