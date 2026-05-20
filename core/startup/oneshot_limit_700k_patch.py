@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/oneshot_limit_700k_patch.py
-# Version: Ver16-EARLY-PENDING-EXISTING-FIX
+# Version: Ver17-EARLY-WATCHLIST-RECENT-LIQUIDITY
 # ------------------------------------------------------------
 # 起動時 runtime patches:
 # - 70万円ワンショット制限
@@ -9,6 +9,7 @@
 # - SUMMARY AI daily risk / executed判定 / 売建不可候補除外
 # - SUMMARY AI pre-order dedupe/cooldown無効化
 # - SUMMARY AI strict liquidity: 直近1本/平均出来高も必須
+# - WATCHLIST recent liquidity: 監視銘柄選定時点で直近1本/平均/売買代金を必須化
 # - SUMMARY_ENTRY duplicate pending を registered 扱いにする
 # - EXIT 利益保護 / 板対応
 # ============================================================
@@ -171,6 +172,23 @@ def _install_strict_liquidity_patch() -> bool:
         return False
 
 
+def _install_watchlist_recent_liquidity_patch() -> bool:
+    try:
+        os.environ.setdefault("WATCHLIST_RECENT_LIQ_ENABLED", "1")
+        os.environ.setdefault("WATCHLIST_RECENT_LIQ_MIN_LATEST_VOLUME", "3000")
+        os.environ.setdefault("WATCHLIST_RECENT_LIQ_MIN_AVG_VOLUME", "3000")
+        os.environ.setdefault("WATCHLIST_RECENT_LIQ_MIN_TURNOVER_YEN", "1000000")
+        os.environ.setdefault("WATCHLIST_RECENT_LIQ_BARS", "5")
+        os.environ.setdefault("WATCHLIST_RECENT_LIQ_PROTECT_BYPASS", "1")
+        from core.startup import watchlist_recent_liquidity_guard_patch as p
+        ok = p.install()
+        logger.warning("[ONESHOT LIMIT PATCH] watchlist_recent_liquidity_patch installed=%s", ok)
+        return bool(ok)
+    except Exception:
+        logger.exception("[ONESHOT LIMIT PATCH] watchlist_recent_liquidity_patch install failed")
+        return False
+
+
 def _install_summary_entry_pending_existing_fix_patch() -> bool:
     try:
         from core.startup import summary_entry_pending_existing_fix_patch as p
@@ -237,6 +255,7 @@ def install() -> bool:
     ok_async_entry = _install_summary_ai_async_entry_patch()
     ok_dedupe_fix = _install_summary_ai_dedupe_fix_patch()
     ok_strict_liq = _install_strict_liquidity_patch()
+    ok_watchlist_liq = _install_watchlist_recent_liquidity_patch()
     ok_pending_existing = _install_summary_entry_pending_existing_fix_patch()
     ok_direction_failopen = _install_entry_direction_failopen_patch()
     ok_exit_profit = _install_exit_profit_protect_patch()
@@ -265,6 +284,7 @@ def install() -> bool:
         ok_async_entry
         or ok_dedupe_fix
         or ok_strict_liq
+        or ok_watchlist_liq
         or ok_pending_existing
         or ok_direction_failopen
         or ok_exit_profit
