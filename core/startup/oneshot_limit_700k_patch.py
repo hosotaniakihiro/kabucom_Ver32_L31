@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/oneshot_limit_700k_patch.py
-# Version: Ver17-EARLY-WATCHLIST-RECENT-LIQUIDITY
+# Version: Ver18-EARLY-SUMMARY-PARALLEL-INTERVALS
 # ------------------------------------------------------------
 # 起動時 runtime patches:
 # - 70万円ワンショット制限
@@ -10,6 +10,7 @@
 # - SUMMARY AI pre-order dedupe/cooldown無効化
 # - SUMMARY AI strict liquidity: 直近1本/平均出来高も必須
 # - WATCHLIST recent liquidity: 監視銘柄選定時点で直近1本/平均/売買代金を必須化
+# - SUMMARY parallel intervals: 1m/3m/5mを並列実行
 # - SUMMARY_ENTRY duplicate pending を registered 扱いにする
 # - EXIT 利益保護 / 板対応
 # ============================================================
@@ -189,6 +190,21 @@ def _install_watchlist_recent_liquidity_patch() -> bool:
         return False
 
 
+def _install_summary_parallel_intervals_patch() -> bool:
+    try:
+        os.environ.setdefault("SUMMARY_PARALLEL_INTERVALS_ENABLED", "1")
+        os.environ.setdefault("SUMMARY_PARALLEL_INTERVAL_WORKERS", "3")
+        os.environ.setdefault("SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC", "55")
+        os.environ.setdefault("SUMMARY_PARALLEL_RANKING_ENABLED", "1")
+        from core.startup import summary_parallel_intervals_runtime_patch as p
+        ok = p.install()
+        logger.warning("[ONESHOT LIMIT PATCH] summary_parallel_intervals_patch installed=%s", ok)
+        return bool(ok)
+    except Exception:
+        logger.exception("[ONESHOT LIMIT PATCH] summary_parallel_intervals_patch install failed")
+        return False
+
+
 def _install_summary_entry_pending_existing_fix_patch() -> bool:
     try:
         from core.startup import summary_entry_pending_existing_fix_patch as p
@@ -256,6 +272,7 @@ def install() -> bool:
     ok_dedupe_fix = _install_summary_ai_dedupe_fix_patch()
     ok_strict_liq = _install_strict_liquidity_patch()
     ok_watchlist_liq = _install_watchlist_recent_liquidity_patch()
+    ok_parallel = _install_summary_parallel_intervals_patch()
     ok_pending_existing = _install_summary_entry_pending_existing_fix_patch()
     ok_direction_failopen = _install_entry_direction_failopen_patch()
     ok_exit_profit = _install_exit_profit_protect_patch()
@@ -285,6 +302,7 @@ def install() -> bool:
         or ok_dedupe_fix
         or ok_strict_liq
         or ok_watchlist_liq
+        or ok_parallel
         or ok_pending_existing
         or ok_direction_failopen
         or ok_exit_profit
