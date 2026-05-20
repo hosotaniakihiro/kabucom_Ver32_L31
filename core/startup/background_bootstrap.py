@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/background_bootstrap.py
-# Version: PRODUCTION-STABLE-REV4-PUSH-STREAM-RUNNER-BOOTSTRAP
+# Version: PRODUCTION-STABLE-REV5-SUMMARY-AI-ASYNC-ENTRY-PATCH
 # ------------------------------------------------------------
 # 【概要】
 #   background 系常駐処理の起動
@@ -14,21 +14,16 @@
 #   ✔ position sync 起動
 #   ✔ pending monitor 起動
 #   ✔ StreamOrchestrator 起動
+#   ✔ SUMMARY AI 実発注の非同期化 patch 起動
 #   ✔ 二重起動防止
 #   ✔ 永久安定ループ設計
 #   ✔ 例外完全吸収
 #   ✔ 機能削除ゼロ
 #
-# 【REV4 修正】
-#   ✔ trading.push.push_stream.runner.start_push_stream を明示起動
-#   ✔ WebSocket 未起動で on_message が発火しない問題を修正
-#   ✔ StreamDBWriter は singleton stream_writer を優先
-#   ✔ 既存の reconnect monitor / StreamOrchestrator / ATS loop は維持
-#
-# 【重要】
-#   - start_push_storage() は DB writer 起動
-#   - start_push_stream() は WebSocket / on_message / queue / flush worker 起動
-#   - 両方必要
+# 【REV5 修正】
+#   ✔ core.startup.summary_ai_async_entry_patch を background 起動時に install
+#   ✔ 1分サマリー job の90秒 timeout が発注処理を巻き込む問題を緩和
+#   ✔ AI_OK/approved 後の実発注は worker thread 側ログで追跡
 # ============================================================
 
 from __future__ import annotations
@@ -61,6 +56,7 @@ _BACKGROUND_STARTED = False
 _PENDING_MONITOR_STARTED = False
 _STREAMDB_STARTED = False
 _PUSH_STREAM_STARTED = False
+_SUMMARY_AI_ASYNC_PATCH_STARTED = False
 
 _STREAMDB_INSTANCE: Any | None = None
 
@@ -119,6 +115,26 @@ def _resolve_refresh_callable() -> Any | None:
         logger.debug("[background] push_refresh_callable resolve failed", exc_info=True)
 
     return None
+
+
+# ============================================================
+# SUMMARY AI async entry patch
+# ============================================================
+
+def _install_summary_ai_async_entry_patch() -> None:
+    global _SUMMARY_AI_ASYNC_PATCH_STARTED
+
+    if _SUMMARY_AI_ASYNC_PATCH_STARTED:
+        logger.info("[background] summary_ai_async_entry_patch already installed")
+        return
+
+    try:
+        from core.startup import summary_ai_async_entry_patch as p
+        ok = bool(p.install())
+        _SUMMARY_AI_ASYNC_PATCH_STARTED = ok
+        logger.warning("[background] summary_ai_async_entry_patch installed=%s", ok)
+    except Exception:
+        logger.exception("[background] summary_ai_async_entry_patch install failed")
 
 
 # ============================================================
@@ -282,14 +298,15 @@ def bootstrap_background():
     background 常駐系を起動する。
 
     起動順:
-      1. legacy flush loop
-      2. reconnect monitor
-      3. StreamDBWriter
-      4. push_stream runner
-      5. ATS loop
-      6. position sync
-      7. pending monitor
-      8. StreamOrchestrator
+      1. SUMMARY AI async entry patch
+      2. legacy flush loop
+      3. reconnect monitor
+      4. StreamDBWriter
+      5. push_stream runner
+      6. ATS loop
+      7. position sync
+      8. pending monitor
+      9. StreamOrchestrator
     """
 
     global _BACKGROUND_STARTED
@@ -300,6 +317,11 @@ def bootstrap_background():
         return
 
     logger.info("🚀 background bootstrap start")
+
+    # --------------------------------------------------------
+    # SUMMARY AI async entry patch
+    # --------------------------------------------------------
+    _install_summary_ai_async_entry_patch()
 
     # --------------------------------------------------------
     # legacy flush loop
