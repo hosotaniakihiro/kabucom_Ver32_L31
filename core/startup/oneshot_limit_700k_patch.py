@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/oneshot_limit_700k_patch.py
-# Version: Ver15-EARLY-STRICT-LIQUIDITY
+# Version: Ver16-EARLY-PENDING-EXISTING-FIX
 # ------------------------------------------------------------
 # 起動時 runtime patches:
 # - 70万円ワンショット制限
@@ -9,6 +9,7 @@
 # - SUMMARY AI daily risk / executed判定 / 売建不可候補除外
 # - SUMMARY AI pre-order dedupe/cooldown無効化
 # - SUMMARY AI strict liquidity: 直近1本/平均出来高も必須
+# - SUMMARY_ENTRY duplicate pending を registered 扱いにする
 # - EXIT 利益保護 / 板対応
 # ============================================================
 
@@ -52,13 +53,7 @@ def _install_entry_threshold_patch() -> bool:
         ec.MIN_COMPOSITE_SCORE_BUY = _env_float("MIN_COMPOSITE_SCORE_BUY", 0.8)
         ec.MIN_SUMMARY_SCORE_SELL = _env_float("MIN_SUMMARY_SCORE_SELL", 1.0)
         ec.MIN_COMPOSITE_SCORE_SELL = _env_float("MIN_COMPOSITE_SCORE_SELL", 1.0)
-        logger.warning(
-            "[ENTRY THRESHOLD PATCH] installed BUY score %s->%s comp %s->%s SELL score %s->%s comp %s->%s",
-            old_buy_score, ec.MIN_SUMMARY_SCORE_BUY,
-            old_buy_comp, ec.MIN_COMPOSITE_SCORE_BUY,
-            old_sell_score, ec.MIN_SUMMARY_SCORE_SELL,
-            old_sell_comp, ec.MIN_COMPOSITE_SCORE_SELL,
-        )
+        logger.warning("[ENTRY THRESHOLD PATCH] installed BUY score %s->%s comp %s->%s SELL score %s->%s comp %s->%s", old_buy_score, ec.MIN_SUMMARY_SCORE_BUY, old_buy_comp, ec.MIN_COMPOSITE_SCORE_BUY, old_sell_score, ec.MIN_SUMMARY_SCORE_SELL, old_sell_comp, ec.MIN_COMPOSITE_SCORE_SELL)
         return True
     except Exception:
         logger.exception("[ENTRY THRESHOLD PATCH] install failed")
@@ -79,8 +74,6 @@ def _install_entry_qty_minlot_patch() -> bool:
 
 def _install_aligned_summary_display_patch() -> bool:
     try:
-        # Ver15では表示整形パッチは既存実装を維持するため、読み込みのみ行う。
-        # 失敗しても売買ロジックには影響させない。
         from core.startup import aligned_summary_display_patch as p  # type: ignore
         ok = bool(p.install()) if hasattr(p, "install") else False
         logger.warning("[ONESHOT LIMIT PATCH] aligned_summary_display_patch installed=%s", ok)
@@ -178,6 +171,17 @@ def _install_strict_liquidity_patch() -> bool:
         return False
 
 
+def _install_summary_entry_pending_existing_fix_patch() -> bool:
+    try:
+        from core.startup import summary_entry_pending_existing_fix_patch as p
+        ok = p.install()
+        logger.warning("[ONESHOT LIMIT PATCH] summary_entry_pending_existing_fix_patch installed=%s", ok)
+        return bool(ok)
+    except Exception:
+        logger.exception("[ONESHOT LIMIT PATCH] summary_entry_pending_existing_fix_patch install failed")
+        return False
+
+
 def _install_entry_direction_failopen_patch() -> bool:
     try:
         os.environ.setdefault("ENTRY_DIRECTION_FAILOPEN_FOR_SUMMARY_AI", "1")
@@ -233,6 +237,7 @@ def install() -> bool:
     ok_async_entry = _install_summary_ai_async_entry_patch()
     ok_dedupe_fix = _install_summary_ai_dedupe_fix_patch()
     ok_strict_liq = _install_strict_liquidity_patch()
+    ok_pending_existing = _install_summary_entry_pending_existing_fix_patch()
     ok_direction_failopen = _install_entry_direction_failopen_patch()
     ok_exit_profit = _install_exit_profit_protect_patch()
     ok_exit_board = _install_exit_board_profit_patch()
@@ -260,6 +265,7 @@ def install() -> bool:
         ok_async_entry
         or ok_dedupe_fix
         or ok_strict_liq
+        or ok_pending_existing
         or ok_direction_failopen
         or ok_exit_profit
         or ok_exit_board
