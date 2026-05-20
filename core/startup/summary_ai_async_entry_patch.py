@@ -1,18 +1,18 @@
 # ============================================================
 # File   : core/startup/summary_ai_async_entry_patch.py
-# Version: Ver01-SUMMARY-AI-ASYNC-ENTRY
+# Version: Ver02-SUMMARY-AI-ASYNC-ENTRY-QUEUE
 # ------------------------------------------------------------
 # SUMMARY AI の実発注部分を、1分サマリー本体から切り離す runtime patch。
 #
-# 目的:
-#   - PUSH-1m summary job が90秒 timeout して entry まで戻らない問題を緩和
-#   - AI_OK / approved_rows 作成後、実発注 pipeline は background thread で実行
-#   - runner 側には submitted_async として即時返す
-#   - 実発注の成否・skip_reason・skipped 内訳を background 側ログに必ず出す
+# Ver02 重要修正:
+#   - 前回実発注中でも async_entry_busy で候補を捨てない
+#   - approved_rows をキューに積み、1本の worker が順番に処理する
+#   - 並列サマリー化後、1m/3m/5m の候補が同時に来ても取りこぼさない
 #
 # ENV:
-#   SUMMARY_AI_ASYNC_ENTRY=1           # default ON
-#   SUMMARY_AI_ASYNC_ENTRY_DROP_BUSY=1 # 前回実発注中なら次回投入を抑止
+#   SUMMARY_AI_ASYNC_ENTRY=1
+#   SUMMARY_AI_ASYNC_ENTRY_DROP_BUSY=0      # Ver02 default: 捨てない
+#   SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX=20
 # ============================================================
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import logging
 import os
 import threading
 import time
+from collections import deque
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -28,7 +29,8 @@ logger = logging.getLogger(__name__)
 _INSTALLED = False
 _ORIG_EXECUTE = None
 _ASYNC_LOCK = threading.Lock()
-_INFLIGHT = False
+_QUEUE: deque[dict[str, Any]] = deque()
+_WORKER_RUNNING = False
 _SEQ = 0
 
 
@@ -45,6 +47,16 @@ def _env_bool(name: str, default: bool = True) -> bool:
         return bool(default)
     except Exception:
         return bool(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return max(1, int(float(v)))
+    except Exception:
+        return int(default)
 
 
 def _safe_len(v: Any) -> int:
@@ -83,6 +95,64 @@ def _summarize_result(result: Any) -> dict[str, Any]:
         return {"summary_error": str(e), "result_type": type(result).__name__}
 
 
+def _run_worker_loop() -> None:
+    global _WORKER_RUNNING
+    while True:
+        with _ASYNC_LOCK:
+            if not _QUEUE:
+                _WORKER_RUNNING = False
+                logger.info("[SUMMARY AI ASYNC ENTRY] queue worker idle")
+                return
+            item = _QUEUE.popleft()
+            q_left = len(_QUEUE)
+
+        seq = item["seq"]
+        interval = item["interval"]
+        approved_rows = item["approved_rows"]
+        started = time.time()
+        try:
+            logger.warning(
+                "[SUMMARY AI ASYNC ENTRY] worker start seq=%s interval=%s approved=%s symbols=%s queue_left=%s",
+                seq,
+                interval,
+                len(approved_rows),
+                _symbols(approved_rows),
+                q_left,
+            )
+            result = _ORIG_EXECUTE(
+                item["ai_results"],
+                df_summary=item["df_summary"],
+                interval=interval,
+                max_entries=item["max_entries"],
+                dry_run=False,
+                require_market_open=item["require_market_open"],
+                entry_pipeline=item["entry_pipeline"],
+            )
+            logger.warning(
+                "[SUMMARY AI ASYNC ENTRY] worker done seq=%s interval=%s elapsed=%.3fs summary=%s",
+                seq,
+                interval,
+                time.time() - started,
+                _summarize_result(result),
+            )
+        except Exception as e:
+            logger.exception("[SUMMARY AI ASYNC ENTRY] worker failed seq=%s interval=%s err=%s", seq, interval, e)
+
+
+def _ensure_worker_started() -> None:
+    global _WORKER_RUNNING
+    with _ASYNC_LOCK:
+        if _WORKER_RUNNING:
+            return
+        _WORKER_RUNNING = True
+        t = threading.Thread(
+            target=_run_worker_loop,
+            daemon=True,
+            name="summary-ai-entry-async-queue-worker",
+        )
+        t.start()
+
+
 def _patched_execute_ai_ok_entries_bulk(
     ai_results,
     *,
@@ -93,13 +163,8 @@ def _patched_execute_ai_ok_entries_bulk(
     require_market_open=True,
     entry_pipeline=None,
 ):
-    """
-    trading.entry.summary_ai.executor.execute_ai_ok_entries_bulk の差し替え。
-
-    dry_run時やENV無効時は元関数をそのまま実行。
-    実発注時は approved_rows だけ同期的に作り、発注pipelineは別スレッドへ渡す。
-    """
-    global _INFLIGHT, _SEQ
+    """execute_ai_ok_entries_bulk の差し替え。approved_rows 作成後、実発注をキュー投入する。"""
+    global _SEQ
 
     if not callable(_ORIG_EXECUTE):
         logger.warning("[SUMMARY AI ASYNC ENTRY] original executor missing -> no-op")
@@ -159,86 +224,75 @@ def _patched_execute_ai_ok_entries_bulk(
                     "skip_reason": "market_closed",
                 }
 
-        drop_busy = _env_bool("SUMMARY_AI_ASYNC_ENTRY_DROP_BUSY", True)
-        with _ASYNC_LOCK:
-            if _INFLIGHT and drop_busy:
-                logger.warning(
-                    "[SUMMARY AI ASYNC ENTRY] previous async entry still running; skip new submit interval=%s approved=%s symbols=%s",
-                    interval,
-                    len(approved_rows),
-                    _symbols(approved_rows),
-                )
-                return {
-                    "executed": False,
-                    "submitted_async": False,
-                    "async_busy": True,
-                    "dry_run": False,
-                    "approved_rows": approved_rows,
-                    "result": None,
-                    "skip_reason": "async_entry_busy",
-                }
+        queue_max = _env_int("SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX", 20)
+        drop_busy = _env_bool("SUMMARY_AI_ASYNC_ENTRY_DROP_BUSY", False)
 
-            _INFLIGHT = True
+        with _ASYNC_LOCK:
+            if len(_QUEUE) >= queue_max:
+                if drop_busy:
+                    logger.warning(
+                        "[SUMMARY AI ASYNC ENTRY] queue full; drop submit interval=%s approved=%s symbols=%s queue=%s max=%s",
+                        interval,
+                        len(approved_rows),
+                        _symbols(approved_rows),
+                        len(_QUEUE),
+                        queue_max,
+                    )
+                    return {
+                        "executed": False,
+                        "submitted_async": False,
+                        "async_busy": True,
+                        "queue_full": True,
+                        "dry_run": False,
+                        "approved_rows": approved_rows,
+                        "result": None,
+                        "skip_reason": "async_entry_queue_full",
+                    }
+                # 捨てない設定では古いものを1つ落として最新を残す。完全停止防止。
+                dropped = _QUEUE.popleft()
+                logger.warning(
+                    "[SUMMARY AI ASYNC ENTRY] queue full; drop oldest seq=%s interval=%s to keep latest",
+                    dropped.get("seq"),
+                    dropped.get("interval"),
+                )
+
             _SEQ += 1
             seq = _SEQ
+            _QUEUE.append(
+                {
+                    "seq": seq,
+                    "ai_results": ai_results,
+                    "df_summary": df_summary,
+                    "interval": interval,
+                    "max_entries": max_entries,
+                    "require_market_open": require_market_open,
+                    "entry_pipeline": entry_pipeline,
+                    "approved_rows": approved_rows,
+                }
+            )
+            q_size = len(_QUEUE)
 
-        def _worker():
-            global _INFLIGHT
-            started = time.time()
-            try:
-                logger.warning(
-                    "[SUMMARY AI ASYNC ENTRY] worker start seq=%s interval=%s approved=%s symbols=%s",
-                    seq,
-                    interval,
-                    len(approved_rows),
-                    _symbols(approved_rows),
-                )
-                result = _ORIG_EXECUTE(
-                    ai_results,
-                    df_summary=df_summary,
-                    interval=interval,
-                    max_entries=max_entries,
-                    dry_run=False,
-                    require_market_open=require_market_open,
-                    entry_pipeline=entry_pipeline,
-                )
-                logger.warning(
-                    "[SUMMARY AI ASYNC ENTRY] worker done seq=%s elapsed=%.3fs summary=%s",
-                    seq,
-                    time.time() - started,
-                    _summarize_result(result),
-                )
-            except Exception as e:
-                logger.exception("[SUMMARY AI ASYNC ENTRY] worker failed seq=%s err=%s", seq, e)
-            finally:
-                with _ASYNC_LOCK:
-                    _INFLIGHT = False
-
-        t = threading.Thread(
-            target=_worker,
-            daemon=True,
-            name=f"summary-ai-entry-async-{seq}",
-        )
-        t.start()
+        _ensure_worker_started()
 
         logger.warning(
-            "[SUMMARY AI ASYNC ENTRY] submitted seq=%s interval=%s approved=%s symbols=%s",
+            "[SUMMARY AI ASYNC ENTRY] queued seq=%s interval=%s approved=%s symbols=%s queue_size=%s",
             seq,
             interval,
             len(approved_rows),
             _symbols(approved_rows),
+            q_size,
         )
 
         return {
-            # サマリー側から見ると「発注処理の投入」は完了。
-            # 実際の注文成否は worker done ログで確認する。
             "executed": True,
             "submitted_async": True,
+            "queued_async": True,
             "async_seq": seq,
+            "queue_size": q_size,
             "dry_run": False,
             "approved_rows": approved_rows,
-            "result": {"status": "submitted_async", "seq": seq},
-            "skip_reason": "submitted_async",
+            "result": {"status": "queued_async", "seq": seq, "queue_size": q_size},
+            "skip_reason": "queued_async",
         }
 
     except Exception as e:
@@ -264,24 +318,23 @@ def install() -> bool:
         from trading.entry.summary_ai import runner as runner_mod
 
         current = getattr(exec_mod, "execute_ai_ok_entries_bulk", None)
-        if getattr(current, "_summary_ai_async_entry_patch", False):
+        if getattr(current, "_summary_ai_async_entry_patch_v2", False):
             _INSTALLED = True
-            logger.warning("[SUMMARY AI ASYNC ENTRY] already installed")
+            logger.warning("[SUMMARY AI ASYNC ENTRY] already installed v2")
             return True
 
         _ORIG_EXECUTE = current
-        _patched_execute_ai_ok_entries_bulk._summary_ai_async_entry_patch = True  # type: ignore[attr-defined]
+        _patched_execute_ai_ok_entries_bulk._summary_ai_async_entry_patch_v2 = True  # type: ignore[attr-defined]
 
         exec_mod.execute_ai_ok_entries_bulk = _patched_execute_ai_ok_entries_bulk
-        # runner.py は from .executor import execute_ai_ok_entries_bulk で関数参照を保持しているため、
-        # runner 側の参照も差し替える。
         runner_mod.execute_ai_ok_entries_bulk = _patched_execute_ai_ok_entries_bulk
 
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY AI ASYNC ENTRY] installed enabled=%s drop_busy=%s",
+            "[SUMMARY AI ASYNC ENTRY] installed v2 enabled=%s drop_busy=%s queue_max=%s",
             _env_bool("SUMMARY_AI_ASYNC_ENTRY", True),
-            _env_bool("SUMMARY_AI_ASYNC_ENTRY_DROP_BUSY", True),
+            _env_bool("SUMMARY_AI_ASYNC_ENTRY_DROP_BUSY", False),
+            _env_int("SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX", 20),
         )
         return True
     except Exception as e:
