@@ -1,32 +1,48 @@
 # ============================================================
 # File   : core/startup/open_position_broker_merge_patch.py
-# Version: V1.4-BROKER-PARSE-SUSPICIOUS-DB-SAFETY-FALLBACK
+# Version: V1.5-BROKER-AUTHORITATIVE-NO-STALE-DB-FALLBACK
 # ------------------------------------------------------------
 # broker reader の信用実建玉を authoritative source として
 # global_data.open_positions / protected / EXIT監視へ渡す runtime patch。
 #
-# 重要:
-#   - 現物はEXIT監視しない。
-#   - 実保有していない positions.db の残骸は原則EXIT監視しない。
-#   - broker側の信用建玉が読めた場合は、通常は broker側を正とする。
-#   - ただし raw_count>0 なのに broker_count=0 かつ skipped_qty/skipped_price が多い場合は
-#     brokerパース失敗疑いとして、DB由来の信用らしい建玉を安全fallback採用する。
-#   - broker API失敗時も、DB由来の信用らしい建玉を fallback 採用する。
+# V1.5 重要修正:
+#   - broker API が read_ok=True の場合は、credit_open=0 でも broker側を正とする
+#   - DB positions の古い残骸を保有中扱いしない
+#   - parse_suspicious でもデフォルトでは DB fallback しない
+#   - どうしても旧挙動に戻す場合のみ:
+#       OPEN_POSITION_ALLOW_DB_FALLBACK_ON_PARSE_SUSPICIOUS=1
 #
-# V1.4 修正:
-#   - skipped_qty=23 のような状態で DB建玉を消して EXIT LOOP no open positions になる事故を防止
+# 理由:
+#   - 実保有していない 9716 などが DB fallback で open_positions/protected に残り、
+#     監視・EXIT・新規ENTRY制御を誤らせるため
 # ============================================================
 
 from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 from typing import Any, Dict, Tuple
 
 logger = logging.getLogger(__name__)
 
 _INSTALLED = False
 _ORIGINAL_SYNC = None
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "ng"}:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
 
 
 def _normalize_symbol(v: Any) -> str:
@@ -106,7 +122,7 @@ def _read_broker_positions_with_status() -> Tuple[Dict[str, Dict[str, Any]], boo
     Returns:
       positions, read_ok, status
 
-    read_ok=True でも、status が broker parse suspicious の場合は上位でDB fallbackする。
+    read_ok=True の場合は、positions が空でも broker側を正とする。
     """
     try:
         import trading.position.kabu_position_reader as reader
@@ -160,16 +176,7 @@ def _broker_parse_suspicious(
     broker_read_ok: bool,
     broker_status: dict,
 ) -> bool:
-    """
-    broker APIは読めているが、レスポンスのパースに失敗している疑いを検出する。
-
-    今回の実ログ:
-      raw=23 credit_open=0 skipped_qty=23
-      DBには open_like=1 symbol=9716
-      EXIT LOOP no open positions
-
-    この状態は「本当に信用建玉ゼロ」ではなく、数量キー不一致の可能性が高いためDB fallbackする。
-    """
+    """broker APIは読めているが、レスポンスのパースに失敗している疑いを検出する。"""
     if not broker_read_ok:
         return False
     if broker_positions:
@@ -182,15 +189,23 @@ def _broker_parse_suspicious(
     skipped_qty = _safe_int(broker_status.get("skipped_qty"), 0)
     skipped_price = _safe_int(broker_status.get("skipped_price"), 0)
 
-    # product=2 raw があり、候補もあるのに qty/price で全滅している場合はパース失敗疑い。
     if raw_count > 0 and credit_candidates > 0 and (skipped_qty + skipped_price) >= credit_candidates:
         return True
-
-    # V1.2以前の reader は credit_candidate_count を出さないため、raw/skipped_qty だけでも拾う。
     if raw_count > 0 and credit_candidates == 0 and skipped_qty >= raw_count:
         return True
-
     return False
+
+
+def _clear_open_positions_dict(gd_positions: Dict[str, Dict[str, Any]]) -> None:
+    """DB/broker由来の建玉を全削除する。broker側0件時に古い残骸を残さない。"""
+    for k in list(gd_positions.keys()):
+        try:
+            src = str((gd_positions.get(k) or {}).get("_position_source") or "")
+            # source未設定の古い残骸も、broker authoritative sync時は消す。
+            if (not src) or src.startswith("DB.positions") or src.startswith("KABU.positions") or src.startswith("BROKER"):
+                gd_positions.pop(k, None)
+        except Exception:
+            pass
 
 
 def _merge_and_publish(
@@ -210,32 +225,44 @@ def _merge_and_publish(
         broker_status=broker_status,
     )
 
-    if broker_read_ok and not parse_suspicious:
-        # 通常: broker APIが正常に読めた場合は、0件でも broker を正とする。
-        merged = dict(broker_positions)
-        source_mode = "broker_credit_authoritative_empty_ok" if not broker_positions else "broker_credit_authoritative"
-    else:
-        # API失敗 or パース失敗疑い: DB由来信用建玉を安全fallbackする。
-        merged = dict(db_credit)
-        if parse_suspicious:
-            source_mode = "db_credit_fallback_broker_parse_suspicious"
+    allow_parse_suspicious_db_fallback = _env_bool(
+        "OPEN_POSITION_ALLOW_DB_FALLBACK_ON_PARSE_SUSPICIOUS",
+        False,
+    )
+
+    if broker_read_ok:
+        if parse_suspicious and allow_parse_suspicious_db_fallback:
+            # 旧挙動: 明示的に許可された場合のみDB fallbackする。
+            merged = dict(db_credit)
+            source_mode = "db_credit_fallback_broker_parse_suspicious_enabled"
         else:
-            source_mode = "db_credit_fallback_broker_read_failed"
+            # V1.5: broker APIが読めたら、0件でも broker を正とする。
+            # これにより実保有していないDB残骸を protected/open_position に残さない。
+            merged = dict(broker_positions)
+            if broker_positions:
+                source_mode = "broker_credit_authoritative"
+            elif parse_suspicious:
+                source_mode = "broker_credit_authoritative_empty_parse_suspicious_no_db_fallback"
+            else:
+                source_mode = "broker_credit_authoritative_empty_ok"
+    else:
+        # API失敗時のみDB由来信用建玉を fallback 採用する。
+        merged = dict(db_credit)
+        source_mode = "db_credit_fallback_broker_read_failed"
 
     gd_positions = _ensure_open_positions()
     before_keys = {_normalize_symbol(k) for k in gd_positions.keys()}
     merged_keys = set(merged.keys())
 
     # 古いDB/broker由来建玉をいったん消して、今回の信用建玉だけを入れ直す。
-    for k in list(gd_positions.keys()):
-        try:
-            src = str((gd_positions.get(k) or {}).get("_position_source") or "")
-            if src.startswith("DB.positions") or src.startswith("KABU.positions"):
-                gd_positions.pop(k, None)
-        except Exception:
-            pass
+    _clear_open_positions_dict(gd_positions)
 
     for s, pos in merged.items():
+        try:
+            if isinstance(pos, dict):
+                pos.setdefault("_position_source", "KABU.positions" if broker_read_ok and not source_mode.startswith("db_") else "DB.positions")
+        except Exception:
+            pass
         gd_positions[s] = pos
 
     try:
@@ -247,17 +274,19 @@ def _merge_and_publish(
         global_data.open_positions_broker_read_ok = bool(broker_read_ok)
         global_data.open_positions_broker_parse_suspicious = bool(parse_suspicious)
         global_data.open_positions_broker_status = broker_status
+        global_data.open_positions_db_fallback_on_parse_suspicious = bool(allow_parse_suspicious_db_fallback)
     except Exception:
         pass
 
     changed = before_keys != merged_keys
     logger.warning(
-        "[OPEN POSITION BROKER PATCH] merged credit open positions count=%d changed=%s mode=%s broker_read_ok=%s parse_suspicious=%s broker_status=%s db_count=%d db_credit=%d broker_count=%d symbols=%s",
+        "[OPEN POSITION BROKER PATCH] merged credit open positions count=%d changed=%s mode=%s broker_read_ok=%s parse_suspicious=%s db_fallback_on_parse_suspicious=%s broker_status=%s db_count=%d db_credit=%d broker_count=%d symbols=%s",
         len(merged),
         changed,
         source_mode,
         broker_read_ok,
         parse_suspicious,
+        allow_parse_suspicious_db_fallback,
         broker_status,
         len(db_positions or {}),
         len(db_credit),
@@ -309,7 +338,9 @@ def install() -> bool:
         pass
 
     _INSTALLED = True
-    logger.warning("[OPEN POSITION BROKER PATCH] installed broker_credit_authoritative=True broker_parse_suspicious_db_fallback=True no_cash_exit=True")
+    logger.warning(
+        "[OPEN POSITION BROKER PATCH] installed broker_credit_authoritative=True parse_suspicious_db_fallback_default=False no_cash_exit=True"
+    )
     return True
 
 
