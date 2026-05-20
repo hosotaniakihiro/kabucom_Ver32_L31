@@ -3,6 +3,12 @@
 # Purpose:
 #   - print / stdout / stderr / logging console 出力を
 #     コンソール表示しながら同時にファイル保存する
+# Version: Ver02-FORCE-TIMESTAMP-FORMATTER
+# ------------------------------------------------------------
+# 修正:
+#   - optional系などが %(message)s だけの formatter を設定した場合でも、
+#     root StreamHandler を必ず時刻付き formatter に戻す。
+#   - print文は仕様上そのまま。logging経由の出力は時刻付きになる。
 # ============================================================
 
 from __future__ import annotations
@@ -13,6 +19,9 @@ import logging
 import datetime as dt
 from pathlib import Path
 from typing import Optional, TextIO
+
+
+DEFAULT_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 
 
 class TeeStream:
@@ -43,6 +52,20 @@ _console_file: Optional[TextIO] = None
 _console_path: Optional[Path] = None
 
 
+def _timestamp_formatter() -> logging.Formatter:
+    return logging.Formatter(DEFAULT_LOG_FORMAT)
+
+
+def _force_timestamp_formatter(handler: logging.Handler, *, level: int | None = None) -> None:
+    """既存formatterがmessage-onlyでも、必ず時刻付きへ上書きする。"""
+    try:
+        if level is not None:
+            handler.setLevel(level)
+        handler.setFormatter(_timestamp_formatter())
+    except Exception:
+        pass
+
+
 def setup_console_tee(
     log_dir: str | Path = r"\\192.168.0.22\AutoStockBuyAndSell\Logs\console",
     *,
@@ -56,7 +79,7 @@ def setup_console_tee(
     global _console_file, _console_path
 
     if _console_file is not None and _console_path is not None:
-        rebind_logging_streams_to_console_tee()
+        rebind_logging_streams_to_console_tee(force_formatter=True)
         return _console_path
 
     log_dir = Path(log_dir)
@@ -80,10 +103,6 @@ def setup_console_tee(
     root = logging.getLogger()
     root.setLevel(level)
 
-    formatter = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    )
-
     stream_handlers = [
         h for h in root.handlers
         if isinstance(h, logging.StreamHandler)
@@ -93,15 +112,12 @@ def setup_console_tee(
         for h in stream_handlers:
             try:
                 h.setStream(sys.stderr)
-                h.setLevel(level)
-                if h.formatter is None:
-                    h.setFormatter(formatter)
+                _force_timestamp_formatter(h, level=level)
             except Exception:
                 pass
     else:
         h = logging.StreamHandler(sys.stderr)
-        h.setLevel(level)
-        h.setFormatter(formatter)
+        _force_timestamp_formatter(h, level=level)
         root.addHandler(h)
 
     def _excepthook(exc_type, exc_value, exc_tb):
@@ -117,16 +133,15 @@ def setup_console_tee(
     return _console_path
 
 
-def rebind_logging_streams_to_console_tee() -> None:
+def rebind_logging_streams_to_console_tee(*, force_formatter: bool = True) -> None:
     """
     setup_logging() / system_startup() 等で後から handler が作り直された場合に、
     logging.StreamHandler を現在の sys.stderr へ再接続する。
+
+    force_formatter=True:
+      既存formatterが %(message)s のみでも必ず時刻付きformatterへ戻す。
     """
     root = logging.getLogger()
-
-    formatter = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    )
 
     stream_handlers = [
         h for h in root.handlers
@@ -136,15 +151,15 @@ def rebind_logging_streams_to_console_tee() -> None:
     if not stream_handlers:
         h = logging.StreamHandler(sys.stderr)
         h.setLevel(logging.INFO)
-        h.setFormatter(formatter)
+        h.setFormatter(_timestamp_formatter())
         root.addHandler(h)
         return
 
     for h in stream_handlers:
         try:
             h.setStream(sys.stderr)
-            if h.formatter is None:
-                h.setFormatter(formatter)
+            if force_formatter or h.formatter is None:
+                _force_timestamp_formatter(h)
         except Exception:
             pass
 
