@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/oneshot_limit_700k_patch.py
-# Version: Ver22-OPEN-POSITION-THROTTLE
+# Version: Ver23-WATCHLIST-BULK-LIQUIDITY
 # ------------------------------------------------------------
 # 起動時 runtime patches:
 # - PUSH bootstrap fast restore: 起動時PUSH DB復元を軽量化
@@ -14,6 +14,7 @@
 # - SUMMARY AI async queue: busy時に候補を捨てずキュー処理
 # - SUMMARY AI strict liquidity: 直近1本/平均出来高も必須
 # - WATCHLIST recent liquidity: 監視銘柄選定時点で直近1本/平均/売買代金を必須化
+# - WATCHLIST recent liquidity bulk: NAS summary DBを銘柄ごとではなく一括読取
 # - SUMMARY parallel intervals: 1m/3m/5mを並列実行
 # - ENTRY pipeline bucket prefilter: interval/source違いpendingを事前除外
 # - SUMMARY_ENTRY duplicate pending を registered 扱いにする
@@ -236,6 +237,19 @@ def _install_watchlist_recent_liquidity_patch() -> bool:
         return False
 
 
+def _install_watchlist_recent_liquidity_bulk_patch() -> bool:
+    try:
+        os.environ.setdefault("WATCHLIST_RECENT_LIQ_CACHE_TTL_SEC", "10")
+        os.environ.setdefault("WATCHLIST_RECENT_LIQ_BULK_LOG_SEC", "0.5")
+        from core.startup import watchlist_recent_liquidity_bulk_patch as p
+        ok = p.install()
+        logger.warning("[ONESHOT LIMIT PATCH] watchlist_recent_liquidity_bulk_patch installed=%s", ok)
+        return bool(ok)
+    except Exception:
+        logger.exception("[ONESHOT LIMIT PATCH] watchlist_recent_liquidity_bulk_patch install failed")
+        return False
+
+
 def _install_summary_parallel_intervals_patch() -> bool:
     try:
         os.environ.setdefault("SUMMARY_PARALLEL_INTERVALS_ENABLED", "1")
@@ -334,6 +348,7 @@ def install() -> bool:
     ok_dedupe_fix = _install_summary_ai_dedupe_fix_patch()
     ok_strict_liq = _install_strict_liquidity_patch()
     ok_watchlist_liq = _install_watchlist_recent_liquidity_patch()
+    ok_watchlist_bulk = _install_watchlist_recent_liquidity_bulk_patch()
     ok_parallel = _install_summary_parallel_intervals_patch()
     ok_bucket_filter = _install_entry_pipeline_bucket_filter_patch()
     ok_pending_existing = _install_summary_entry_pending_existing_fix_patch()
@@ -368,6 +383,7 @@ def install() -> bool:
         or ok_dedupe_fix
         or ok_strict_liq
         or ok_watchlist_liq
+        or ok_watchlist_bulk
         or ok_parallel
         or ok_bucket_filter
         or ok_pending_existing
