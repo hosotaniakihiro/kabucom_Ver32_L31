@@ -1,28 +1,12 @@
 # ============================================================
 # File   : core/startup/summary_multiframe_startup_catchup_patch.py
-# Version: V1.0-STARTUP-3M-5M-CATCHUP-FROM-1M
+# Version: V1.1-FIX-INCLUDE-PARTIAL-NAME
 # ------------------------------------------------------------
 # 起動時にDB内の1分足サマリーから、3分足・5分足サマリーを差分再集計する。
 #
-# 目的:
-#   - main.py再起動直後に3分足/5分足が古い、または75MA計算本数が不足する問題を軽減
-#   - stock_summary_3min / stock_summary_5min の最新時刻を確認
-#   - stock_summary_1min から未反映分 + 75MA用lookback分を読み込む
-#   - 3分足/5分足OHLCVを再集計してDBへ INSERT OR REPLACE / UPSERT
-#   - 起動時にDB格納済みサマリーを最新化して、後続の通常サマリー計算へ渡す
-#
-# デフォルト:
-#   SUMMARY_MTF_STARTUP_CATCHUP_ENABLED=1
-#   SUMMARY_MTF_CATCHUP_INTERVALS=3,5
-#   SUMMARY_MTF_CATCHUP_MA_BARS=75
-#   SUMMARY_MTF_CATCHUP_EXTRA_MINUTES=30
-#   SUMMARY_MTF_CATCHUP_INCLUDE_CURRENT_PARTIAL=1
-#   SUMMARY_MTF_CATCHUP_MAX_ROWS=80000
-#   SUMMARY_MTF_CATCHUP_RUN_ASYNC=1
-#
-# 注意:
-#   - ここではOHLCV/volume/turnover/vwapなどの基礎値を補完する。
-#   - RSI/MACD/score/MTFなど高度指標は通常のsummary計算側が後続で更新する。
+# 修正:
+#   - run_catchup 内で include_partial と定義しているのに
+#     include_current_partial を参照して NameError になる不具合を修正。
 # ============================================================
 
 from __future__ import annotations
@@ -390,7 +374,7 @@ def run_catchup(*, reason: str = "manual") -> dict[str, Any]:
                     since = min(latest - dt.timedelta(minutes=1), floor_since)
                     latest_s = latest.strftime("%Y-%m-%d %H:%M:%S")
                 rows1 = conn.execute(sql1, (since.strftime("%Y-%m-%d %H:%M:%S"), max_rows)).fetchall()
-                barsx = _aggregate(rows1, interval, include_current_partial)
+                barsx = _aggregate(rows1, interval, include_partial)
                 upserted = _upsert(conn, dst, cols_dst, barsx)
                 recent = _read_recent_from_db(conn, dst, cols_dst, interval, ma_bars)
                 total_upserted += upserted
