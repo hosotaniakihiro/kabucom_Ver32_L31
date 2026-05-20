@@ -1,12 +1,9 @@
 # ============================================================
 # File   : core/startup/summary_multiframe_startup_catchup_patch.py
-# Version: V1.1-FIX-INCLUDE-PARTIAL-NAME
+# Version: V1.2-RUN-INDICATOR-FILL-AFTER-CATCHUP
 # ------------------------------------------------------------
 # 起動時にDB内の1分足サマリーから、3分足・5分足サマリーを差分再集計する。
-#
-# 修正:
-#   - run_catchup 内で include_partial と定義しているのに
-#     include_current_partial を参照して NameError になる不具合を修正。
+# その後、3分足/5分足の rsi/macd/signal/ma75/score 等を補完する。
 # ============================================================
 
 from __future__ import annotations
@@ -329,6 +326,16 @@ def _read_recent_from_db(conn: sqlite3.Connection, table: str, cols: list[str], 
     return [{"symbol": _norm_symbol(r[0]), "datetime": str(r[1]), "close": _f(r[2], 0.0), "volume": _f(r[3], 0.0)} for r in rows]
 
 
+def _run_indicator_fill_after_catchup() -> None:
+    if not _env_bool("SUMMARY_MTF_INDICATOR_FILL_AFTER_CATCHUP", True):
+        return
+    try:
+        from core.startup.summary_mtf_indicator_fill_patch import run_fill
+        run_fill(reason="after_mtf_catchup")
+    except Exception as e:
+        logger.warning("[SUMMARY MTF CATCHUP] indicator fill failed err=%s", e, exc_info=True)
+
+
 def run_catchup(*, reason: str = "manual") -> dict[str, Any]:
     t0 = time.monotonic()
     path = _summary_db_path()
@@ -394,6 +401,7 @@ def run_catchup(*, reason: str = "manual") -> dict[str, Any]:
             conn.commit()
         result.update({"ok": True, "upserted": total_upserted, "elapsed": round(time.monotonic() - t0, 3)})
         logger.warning("[SUMMARY MTF CATCHUP] done reason=%s upserted=%s elapsed=%.3fs db=%s", reason, total_upserted, time.monotonic() - t0, path)
+        _run_indicator_fill_after_catchup()
         return result
     except Exception as e:
         result["error"] = str(e)
