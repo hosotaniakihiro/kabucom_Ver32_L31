@@ -1,11 +1,12 @@
 # ============================================================
 # File   : core/startup/oneshot_limit_700k_patch.py
-# Version: Ver23-WATCHLIST-BULK-LIQUIDITY
+# Version: Ver24-ENTRY-FRESH-QUOTE-GUARD
 # ------------------------------------------------------------
 # 起動時 runtime patches:
 # - PUSH bootstrap fast restore: 起動時PUSH DB復元を軽量化
 # - OPEN POSITION stale DB cleanup: broker側に無い古いDB建玉を自動CLOSED化
 # - OPEN POSITION sync throttle: 建玉なし時のbroker同期/API/長文ログを間引く
+# - ENTRY fresh quote guard: 発注直前の板鮮度を確認し古い価格注文を止める
 # - 70万円ワンショット制限
 # - ENTRY数量0株の最低100株フォールバック
 # - BUYエントリー閾値を後場スコアに合わせて緩和
@@ -87,6 +88,20 @@ def _install_open_position_sync_throttle_patch() -> bool:
         return bool(ok)
     except Exception:
         logger.exception("[ONESHOT LIMIT PATCH] open_position_sync_throttle_patch install failed")
+        return False
+
+
+def _install_entry_fresh_quote_guard_patch() -> bool:
+    try:
+        os.environ.setdefault("ENTRY_FRESH_QUOTE_GUARD_ENABLED", "1")
+        os.environ.setdefault("ENTRY_MAX_QUOTE_AGE_SEC", "8.0")
+        os.environ.setdefault("ENTRY_ALLOW_QUOTE_WITHOUT_TIMESTAMP", "0")
+        from core.startup import entry_fresh_quote_guard_patch as p
+        ok = p.install()
+        logger.warning("[ONESHOT LIMIT PATCH] entry_fresh_quote_guard_patch installed=%s", ok)
+        return bool(ok)
+    except Exception:
+        logger.exception("[ONESHOT LIMIT PATCH] entry_fresh_quote_guard_patch install failed")
         return False
 
 
@@ -343,6 +358,7 @@ def install() -> bool:
     ok_push_fast_restore = _install_push_bootstrap_fast_restore_patch()
     ok_stale_db_cleanup = _install_open_position_stale_db_cleanup_patch()
     ok_open_pos_throttle = _install_open_position_sync_throttle_patch()
+    ok_fresh_quote = _install_entry_fresh_quote_guard_patch()
 
     ok_async_entry = _install_summary_ai_async_entry_patch()
     ok_dedupe_fix = _install_summary_ai_dedupe_fix_patch()
@@ -379,6 +395,7 @@ def install() -> bool:
         ok_push_fast_restore
         or ok_stale_db_cleanup
         or ok_open_pos_throttle
+        or ok_fresh_quote
         or ok_async_entry
         or ok_dedupe_fix
         or ok_strict_liq
