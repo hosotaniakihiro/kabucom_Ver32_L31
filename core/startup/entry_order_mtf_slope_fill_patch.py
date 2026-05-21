@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/entry_order_mtf_slope_fill_patch.py
-# Version: Ver01-ENTRY-ORDER-MTF-SLOPE-FILL
+# Version: Ver02-ENTRY-ORDER-MTF-SLOPE-FILL-SYNTAX-FIX
 # ------------------------------------------------------------
 # Purpose:
 #   SUMMARY_AI 承認後の entry_row に slope_1m / slope_3m / slope_5m が
@@ -10,6 +10,12 @@
 #   表示DFでは daily MTF / ranking が入っていても、AI承認済み entries の
 #   entry_row が古い列セットのままになり、発注直前 guard で
 #   SHORT_MTF_SLOPE_MISSING になるケースがある。
+#
+# 修正:
+#   Ver02:
+#   - Python SyntaxError 対策
+#     f-string expression part cannot include a backslash
+#   - SQL列名生成を _qident() に集約し、f-string式内の \" を廃止
 # ============================================================
 
 from __future__ import annotations
@@ -51,6 +57,18 @@ def _norm_symbol(v: Any) -> str:
     return s
 
 
+def _qident(name: Any) -> str:
+    """
+    SQLite identifier quote.
+
+    注意:
+      f-string の { ... } 内に backslash を含む文字列を書くと
+      SyntaxError: f-string expression part cannot include a backslash
+      になるため、識別子クォートはこの関数に集約する。
+    """
+    return '"' + str(name).replace('"', '""') + '"'
+
+
 def _safe_float_or_none(v: Any) -> Optional[float]:
     try:
         if v is None:
@@ -82,7 +100,7 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
 
 def _cols(conn: sqlite3.Connection, table: str) -> set[str]:
     try:
-        return {str(r[1]) for r in conn.execute(f"PRAGMA table_info(\"{table}\")").fetchall()}
+        return {str(r[1]) for r in conn.execute(f"PRAGMA table_info({_qident(table)})").fetchall()}
     except Exception:
         return set()
 
@@ -110,10 +128,12 @@ def _read_latest_summary_values(symbol: str, interval: int) -> dict[str, Any]:
             select_cols = [c for c in want if c in cols]
             if not select_cols:
                 return {}
+
+            select_cols_sql = ", ".join(_qident(c) for c in select_cols)
             sql = (
-                f"SELECT {', '.join([f'\"{c}\"' for c in select_cols])} "
-                f"FROM \"{table}\" WHERE CAST(\"symbol\" AS TEXT)=? "
-                f"ORDER BY \"datetime\" DESC LIMIT 1"
+                f"SELECT {select_cols_sql} "
+                f"FROM {_qident(table)} WHERE CAST({_qident('symbol')} AS TEXT)=? "
+                f"ORDER BY {_qident('datetime')} DESC LIMIT 1"
             )
             row = conn.execute(sql, (symbol,)).fetchone()
             if not row:
@@ -144,7 +164,6 @@ def _try_enrich_one_row(row: dict[str, Any]) -> dict[str, Any]:
                 if k not in merged or merged.get(k) in (None, ""):
                     merged[k] = v
                 elif k in {"mtf", "score_mtf", "mtf_score", "ranking_score", "ranking_score_total"}:
-                    # 0 のままなら enrich 側の非0値で置換
                     old = _safe_float_or_none(merged.get(k))
                     new = _safe_float_or_none(v)
                     if (old is None or old == 0.0) and new not in (None, 0.0):
@@ -165,17 +184,12 @@ def _fill_entry_row(entry_row: Any, *, symbol: str, side: str, source: str) -> A
     symbol = _norm_symbol(symbol or row.get("symbol"))
     row["symbol"] = symbol
 
-    # daily MTF / ranking_score をまず通常enrichで補完
     row = _try_enrich_one_row(row)
 
-    # 1m/3m/5m の slope を summary DB から補完
     filled = {}
     for iv in (1, 3, 5):
         vals = _read_latest_summary_values(symbol, iv)
-        slope_val = (
-            _safe_float_or_none(vals.get("slope_atr_scaled"))
-            if vals else None
-        )
+        slope_val = _safe_float_or_none(vals.get("slope_atr_scaled")) if vals else None
         if slope_val is None and vals:
             slope_val = _safe_float_or_none(vals.get("slope"))
         if slope_val is None and iv == int(float(row.get("interval") or 1)):
@@ -189,7 +203,6 @@ def _fill_entry_row(entry_row: Any, *, symbol: str, side: str, source: str) -> A
                     row[key] = slope_val
                     filled[key] = slope_val
 
-        # MTF/ranking も DB 側に非0があれば補完
         if vals:
             for key in ("mtf", "score_mtf", "mtf_score"):
                 cand = None
@@ -212,8 +225,6 @@ def _fill_entry_row(entry_row: Any, *, symbol: str, side: str, source: str) -> A
                     row[key] = vals.get(key)
                     filled[key] = vals.get(key)
 
-    # それでも短期 slope が全欠損なら、現在intervalの slope を最低限横展開する。
-    # ENTRY_ORDER_REQUIRE_MTF_DATA=0 の運用だが、別patch guardが slope_1m/3m/5m の存在だけを見る場合の保険。
     current_slope = _safe_float_or_none(row.get("slope_atr_scaled"))
     if current_slope is None:
         current_slope = _safe_float_or_none(row.get("slope"))
@@ -279,7 +290,6 @@ def install() -> bool:
         wrapped_build_entry_order._original = original  # type: ignore[attr-defined]
 
         eob.build_entry_order = wrapped_build_entry_order
-        # entry_controller は from ... import build_entry_order 済みなので、こちらも差し替える。
         try:
             ec.build_entry_order = wrapped_build_entry_order
         except Exception:
