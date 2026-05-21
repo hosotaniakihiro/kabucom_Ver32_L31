@@ -10,7 +10,7 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.11-MAIN-SUMMARY-AI-MORE-CANDIDATES
+# Version: Ver38.12-MAIN-ENTRY-ORDER-MTF-SLOPE-FILL
 # ------------------------------------------------------------
 # ✔ PROJECT_ROOT を最初に sys.path へ追加
 # ✔ core.logging.console_tee を確実に import / setup
@@ -24,6 +24,7 @@
 # ✔ AI確認候補数拡張 patch を起動時install（既定20→40）
 # ✔ 板取得リトライ patch を起動時install（4.5秒 + 0.3秒追加確認）
 # ✔ 板が食われているのに株価が止まる場合の反転警戒EXITを起動時install
+# ✔ 発注直前に entry_row の 1m/3m/5m slope と MTF/ranking を補完
 # ✔ EXIT scheduler を run_exit_pipeline で1秒ごとに登録
 # ✔ main.py 側の scheduler / realtime / position_sync / push_monitor 生存証跡を heartbeat DB に保存
 # ✔ 既存の起動処理は維持
@@ -217,6 +218,7 @@ def _install_main_runtime_patches():
         ("core.startup.entry_limit_passive_runtime_patch", "install"),
         ("core.startup.final_entry_safety_guard_patch", "install"),
         ("core.startup.summary_ai_more_candidates_patch", "install"),
+        ("core.startup.entry_order_mtf_slope_fill_patch", "install"),
         ("core.startup.board_retry_patch", "install"),
         ("core.startup.board_wall_stall_exit_patch", "install"),
     ]
