@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/ranking/active_symbols/liquidity.py
-# Version: Ver1.3-ACTIVE-SYMBOLS-PREMARKET-PRICE-GUARD
+# Version: Ver1.4-ACTIVE-SYMBOLS-SUMMARY-PRICE-FALLBACK
 # ------------------------------------------------------------
 # Purpose:
 #   - PUSH登録候補の流動性/価格フィルタ
@@ -11,11 +11,19 @@
 #   - premarket_mode でも最終価格ガードを完全スキップしない。
 #   - 価格情報が取れる銘柄は MIN_PRICE / MAX_PRICE を必ず適用する。
 #   - 価格情報が本当に無い銘柄だけ fail-open で残す。
+# Ver1.4:
+#   - liquidity_map に価格が無い場合、summaryYYYYMMDD.db の
+#     stock_summary_1min/3min/5min から直近 close/current_price を取得して
+#     価格ガードへ利用する。
 # ============================================================
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
+import os
+import sqlite3
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 from .config import (
@@ -31,6 +39,110 @@ from .normalize import dedupe_keep_order, normalize_symbol, to_float
 from .ranking_source import build_liquidity_map
 
 logger = logging.getLogger(__name__)
+
+
+def _today() -> str:
+    return dt.datetime.now().strftime("%Y%m%d")
+
+
+def _summary_db_path() -> str:
+    base = os.getenv(
+        "SUMMARY_DB_DIR",
+        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary",
+    )
+    return os.getenv("SUMMARY_DB_PATH", str(Path(base) / f"summary{_today()}.db"))
+
+
+def _qident(name: Any) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    try:
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone() is not None
+    except Exception:
+        return False
+
+
+def _table_cols(conn: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        return {str(r[1]) for r in conn.execute(f"PRAGMA table_info({_qident(table)})").fetchall()}
+    except Exception:
+        return set()
+
+
+def _summary_price_fallback_map(symbols: Iterable[str]) -> Dict[str, Dict[str, float]]:
+    """
+    寄前SBIやランキング側に価格列が無い場合の最終価格補完。
+    監視候補100銘柄程度を想定し、summary DBの直近closeを1回ずつ参照する。
+    """
+    cleaned = [normalize_symbol(s) for s in dedupe_keep_order(symbols)]
+    cleaned = [s for s in cleaned if s]
+    if not cleaned:
+        return {}
+
+    path = _summary_db_path()
+    if not path or not Path(path).exists():
+        logger.warning("[ACTIVE SUMMARY PRICE FALLBACK] db not found path=%s symbols=%d", path, len(cleaned))
+        return {}
+
+    out: Dict[str, Dict[str, float]] = {}
+    try:
+        with sqlite3.connect(path, timeout=1.5) as conn:
+            conn.execute("PRAGMA busy_timeout=1500;")
+            for table in ("stock_summary_1min", "stock_summary_3min", "stock_summary_5min"):
+                if len(out) >= len(cleaned):
+                    break
+                if not _table_exists(conn, table):
+                    continue
+                cols = _table_cols(conn, table)
+                if "symbol" not in cols or "datetime" not in cols:
+                    continue
+                price_col = None
+                for c in ("current_price", "price", "close", "close_price"):
+                    if c in cols:
+                        price_col = c
+                        break
+                if not price_col:
+                    continue
+
+                sql = (
+                    f"SELECT {_qident(price_col)}, datetime "
+                    f"FROM {_qident(table)} "
+                    f"WHERE CAST({_qident('symbol')} AS TEXT)=? "
+                    f"ORDER BY {_qident('datetime')} DESC LIMIT 1"
+                )
+                for sym in cleaned:
+                    if sym in out:
+                        continue
+                    try:
+                        row = conn.execute(sql, (sym,)).fetchone()
+                    except Exception:
+                        row = None
+                    if not row:
+                        continue
+                    price = to_float(row[0], 0.0)
+                    if price > 0:
+                        out[sym] = {
+                            "current_price": price,
+                            "price": price,
+                            "close": price,
+                            "summary_price_table": table,
+                        }
+        logger.warning(
+            "[ACTIVE SUMMARY PRICE FALLBACK] loaded symbols=%d hit=%d missing=%d path=%s",
+            len(cleaned),
+            len(out),
+            max(0, len(cleaned) - len(out)),
+            path,
+        )
+        return out
+    except Exception:
+        logger.exception("[ACTIVE SUMMARY PRICE FALLBACK] failed path=%s symbols=%d", path, len(cleaned))
+        return {}
 
 
 def _has_positive_value(info: Optional[Dict[str, Any]], keys: Iterable[str]) -> bool:
@@ -215,6 +327,22 @@ def final_guard_min_price(
 
     protected = protected or set()
     liquidity_map = liquidity_map or {}
+
+    # 価格情報が無い候補は summary DB から直近価格を補完する。
+    missing_price_symbols = []
+    for s in items:
+        sym = normalize_symbol(s)
+        if not sym or sym in protected:
+            continue
+        info = liquidity_map.get(sym)
+        if not _has_positive_value(info, ("current_price", "price", "close", "last_price", "close_price", "現在値")):
+            missing_price_symbols.append(sym)
+    if missing_price_symbols:
+        fallback = _summary_price_fallback_map(missing_price_symbols)
+        for sym, info in fallback.items():
+            merged = dict(liquidity_map.get(sym, {}) or {})
+            merged.update(info)
+            liquidity_map[sym] = merged
 
     kept: List[str] = []
     removed: List[str] = []
