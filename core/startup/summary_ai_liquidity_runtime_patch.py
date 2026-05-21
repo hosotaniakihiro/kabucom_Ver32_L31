@@ -1,22 +1,15 @@
 # ============================================================
 # File   : core/startup/summary_ai_liquidity_runtime_patch.py
-# Version: V2.0-RECENT-SUMMARY-HARD-LIQUIDITY-GUARD
+# Version: V2.1-RECENT-SUMMARY-TURNOVER-FALLBACK-FIX
 # ------------------------------------------------------------
 # 目的:
 #   SUMMARY_AI の approved_rows 作成前に、出来高/売買代金の足切りを入れる。
 #
-# Ver2.0:
-#   - AI結果1行の volume/turnover だけに依存しない
-#   - summary DB stock_summary_1min から直近N本を読み、合計volume/turnoverで判定
-#   - DBが読めない/直近データが無い場合は row fallback するが、rowにも出来高が無ければ落とす
-#   - ENTRY側と同じ 3万株 / 1,000万円 を approved 前に強制
-#
-# default:
-#   SUMMARY_AI_LIQ_MIN_VOLUME=30000
-#   SUMMARY_AI_LIQ_MIN_TURNOVER_YEN=10000000
-#   SUMMARY_AI_LIQ_MIN_PRICE=200
-#   SUMMARY_AI_LIQ_RECENT_BARS=5
-#   SUMMARY_AI_LIQ_REQUIRE_DATA=1
+# Ver2.1:
+#   - summary DB の turnover が小さい単位/不完全値の場合、
+#     AI row 側の row_turnover や close*volume を fallback として採用する。
+#   - ログ上で row_turnover は十分なのに turnover が小さく、
+#     SUMMARY_AI_LIQ_TURNOVER_LOW で落ちる問題を修正。
 # ============================================================
 
 from __future__ import annotations
@@ -78,10 +71,7 @@ def _today() -> str:
 
 
 def _summary_db_path() -> str:
-    base = os.getenv(
-        "SUMMARY_DB_DIR",
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary",
-    )
+    base = os.getenv("SUMMARY_DB_DIR", r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary")
     return os.getenv("SUMMARY_DB_PATH", str(Path(base) / f"summary{_today()}.db"))
 
 
@@ -134,10 +124,11 @@ def _recent_summary_values(symbol: str) -> Dict[str, Any]:
             tv = _col(conn, table, ["turnover", "turnover_yen", "trading_value", "売買代金"])
             if not sym or not tm or not cl:
                 return {}
-
             select = f"{tm}, {cl}, {vo or '0'}, {tv or '0'}"
-            sql = f"SELECT {select} FROM {table} WHERE CAST({sym} AS TEXT)=? ORDER BY {tm} DESC LIMIT ?"
-            rows = conn.execute(sql, (_sym(symbol), bars)).fetchall()
+            rows = conn.execute(
+                f"SELECT {select} FROM {table} WHERE CAST({sym} AS TEXT)=? ORDER BY {tm} DESC LIMIT ?",
+                (_sym(symbol), bars),
+            ).fetchall()
 
         if not rows:
             return {}
@@ -185,10 +176,32 @@ def _liquidity_values(item: Dict[str, Any]) -> Dict[str, Any]:
     symbol = row_v.get("symbol") or ""
     recent = _recent_summary_values(symbol)
     if recent:
-        # symbolは常に残す
         recent["symbol"] = symbol
-        recent["row_volume"] = row_v.get("volume", 0.0)
-        recent["row_turnover"] = row_v.get("turnover", 0.0)
+        row_volume = _f(row_v.get("volume"), 0.0)
+        row_turnover = _f(row_v.get("turnover"), 0.0)
+        recent_turnover = _f(recent.get("turnover"), 0.0)
+        recent_volume = _f(recent.get("volume"), 0.0)
+        close = _f(recent.get("close"), _f(row_v.get("close"), 0.0))
+
+        # DB側turnoverが小さい単位/不完全値の場合は、row_turnoverを優先する。
+        # row_turnoverが無ければ close * max(volume) を使う。
+        calc_turnover = 0.0
+        if close > 0:
+            calc_turnover = close * max(recent_volume, row_volume)
+
+        fixed_turnover = max(recent_turnover, row_turnover, calc_turnover)
+        if fixed_turnover > recent_turnover:
+            recent["turnover_original"] = recent_turnover
+            recent["turnover_fixed_by"] = "max_recent_row_calc"
+            recent["turnover"] = fixed_turnover
+
+        if row_volume > recent_volume:
+            recent["volume_original"] = recent_volume
+            recent["volume_fixed_by"] = "row_volume"
+            recent["volume"] = row_volume
+
+        recent["row_volume"] = row_volume
+        recent["row_turnover"] = row_turnover
         return recent
     return row_v
 
@@ -243,7 +256,7 @@ def install() -> bool:
         logger.warning("[SUMMARY AI LIQ GUARD] _filter_blocked_ai_ok_items missing")
         return False
 
-    if not getattr(old, "_summary_ai_liq_wrapped_v2", False):
+    if not getattr(old, "_summary_ai_liq_wrapped_v21", False):
         def wrapped(ok_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             base = old(ok_items)
             kept: List[Dict[str, Any]] = []
@@ -269,13 +282,14 @@ def install() -> bool:
                     _env_float("SUMMARY_AI_LIQ_MIN_TURNOVER_YEN", 10000000.0),
                 )
             return kept
-        wrapped._summary_ai_liq_wrapped_v2 = True  # type: ignore[attr-defined]
+
+        wrapped._summary_ai_liq_wrapped_v21 = True  # type: ignore[attr-defined]
         wrapped._original = old  # type: ignore[attr-defined]
         ex._filter_blocked_ai_ok_items = wrapped
 
     _INSTALLED = True
     logger.warning(
-        "[SUMMARY AI LIQ GUARD] installed v2 min_volume=%s min_turnover=%s min_price=%s recent_bars=%s require_data=%s",
+        "[SUMMARY AI LIQ GUARD] installed v2.1 min_volume=%s min_turnover=%s min_price=%s recent_bars=%s require_data=%s turnover_fallback=row_or_calc",
         _env_float("SUMMARY_AI_LIQ_MIN_VOLUME", 30000.0),
         _env_float("SUMMARY_AI_LIQ_MIN_TURNOVER_YEN", 10000000.0),
         _env_float("SUMMARY_AI_LIQ_MIN_PRICE", 200.0),
