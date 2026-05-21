@@ -1,12 +1,12 @@
 # ============================================================
 # File   : trading/entry/lot_sizer.py
-# Ver1.5-TIERED-BUDGET-1500-7000
+# Ver1.6-UNIFIED-BUDGET-700K-1500-7000
 # ------------------------------------------------------------
 # ✔ confidence / lot_multiplier / ATR から数量を算出
 # ✔ 1トレードの最大損失額を常に一定化
 # ✔ ドローダウン連動で MAX_RISK_YEN を自動縮小
-# ✔ 1,500円〜2,999円: MAX 50万円
-# ✔ 3,000円〜7,000円: MAX 70万円
+# ✔ 1銘柄あたりの発注上限を 70万円 に統一
+# ✔ 資金が増えた場合は1銘柄ロット増ではなく銘柄数増で対応する前提
 # ✔ 価格帯OKかつ最低1単元を買える場合、リスク丸めで0株にしない
 # ============================================================
 
@@ -80,10 +80,7 @@ def _get_oneshot_yen_for_price(price: float) -> float:
             return v
     except Exception:
         pass
-    p = _safe_float(price, 0.0)
-    if p > 0 and p < 3000:
-        return _safe_float(_cfg("ENTRY_LOW_PRICE_ONESHOT_YEN", 500_000), 500_000)
-    return _safe_float(_cfg("ENTRY_HIGH_PRICE_ONESHOT_YEN", 700_000), 700_000)
+    return _safe_float(_cfg("MAX_ENTRY_ONESHOT_YEN", 700_000), 700_000)
 
 
 def _can_afford_min_lot(price: float) -> tuple[bool, dict]:
@@ -97,7 +94,7 @@ def _can_afford_min_lot(price: float) -> tuple[bool, dict]:
             "price": price,
             "budget_yen": budget,
             "lot_size": lot,
-            "reason": "fallback_tiered_affordability_check",
+            "reason": "fallback_unified_700k_affordability_check",
         }
 
 
@@ -153,7 +150,7 @@ def calculate_entry_quantity(
     max_qty_by_oneshot = int((MAX_ONESHOT_YEN // price) // LOT_SIZE * LOT_SIZE)
     if max_qty_by_oneshot <= 0:
         logger.warning(
-            "[LOT] qty=0 by tiered oneshot cap symbol=%s price=%.2f max_oneshot=%.0f lot_size=%s",
+            "[LOT] qty=0 by unified oneshot cap symbol=%s price=%.2f max_oneshot=%.0f lot_size=%s",
             symbol, price, MAX_ONESHOT_YEN, LOT_SIZE,
         )
         return 0
@@ -171,21 +168,21 @@ def calculate_entry_quantity(
     if qty <= 0 and MIN_LOT_FALLBACK:
         qty = min(LOT_SIZE, max_qty_by_oneshot, MAX_QTY)
         logger.warning(
-            "[LOT] min lot fallback symbol=%s price=%.2f raw_qty=%.2f qty=%s tiered_budget=%.0f lot=%s confidence=%.4f multiplier=%.4f atr=%s risk_budget=%.2f per_share_risk=%.2f diag=%s",
+            "[LOT] min lot fallback symbol=%s price=%.2f raw_qty=%.2f qty=%s oneshot_budget=%.0f lot=%s confidence=%.4f multiplier=%.4f atr=%s risk_budget=%.2f per_share_risk=%.2f diag=%s",
             symbol, price, raw_qty, qty, MAX_ONESHOT_YEN, LOT_SIZE, confidence, lot_multiplier, atr,
             risk_budget, per_share_risk, afford_diag,
         )
 
     if qty > max_qty_by_oneshot:
         logger.warning(
-            "[LOT] qty reduced by tiered oneshot cap symbol=%s price=%.2f qty=%s -> %s max_oneshot=%.0f",
+            "[LOT] qty reduced by unified oneshot cap symbol=%s price=%.2f qty=%s -> %s max_oneshot=%.0f",
             symbol, price, qty, max_qty_by_oneshot, MAX_ONESHOT_YEN,
         )
         qty = max_qty_by_oneshot
 
     if qty <= 0:
         logger.warning(
-            "[LOT] qty=0 final symbol=%s price=%.2f raw_qty=%.2f risk_scale=%.4f tiered_budget=%.0f lot=%s max_qty_by_oneshot=%s fallback=%s",
+            "[LOT] qty=0 final symbol=%s price=%.2f raw_qty=%.2f risk_scale=%.4f oneshot_budget=%.0f lot=%s max_qty_by_oneshot=%s fallback=%s",
             symbol, price, raw_qty, risk_scale, MAX_ONESHOT_YEN, LOT_SIZE, max_qty_by_oneshot, MIN_LOT_FALLBACK,
         )
         return 0
