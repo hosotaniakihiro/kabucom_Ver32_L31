@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/fast_startup_runtime_patch.py
-# Version: PRODUCTION-FAST-STARTUP-PATCH-V13-ENTRY-LIQUIDITY-GUARD
+# Version: PRODUCTION-FAST-STARTUP-PATCH-V14-SUMMARY-PARALLEL-INSTALL
 # ------------------------------------------------------------
 # 目的:
 #   main.py 起動直後の重い処理を軽くする。
@@ -16,6 +16,7 @@
 #   さらに、未約定新規指値を2秒で取消し、次候補のENTRYを起動する。
 #   さらに、同一銘柄当日2回まで・銘柄別-2000円停止を入れる。
 #   さらに、出来高/売買代金/値動きが弱い銘柄のエントリーを止める。
+#   さらに、1m/3m/5m summary parallel patch を明示installし、短期MTF用の3足を更新しやすくする。
 # ============================================================
 
 from __future__ import annotations
@@ -80,6 +81,16 @@ def _patch_summary_schema_bootstrap() -> None:
     ds._bootstrap_summary_schema = _skip_summary_schema_bootstrap
 
     logger.warning("[FAST STARTUP PATCH] database.session._bootstrap_summary_schema patched to no-op")
+
+
+def _install_summary_parallel_patch() -> None:
+    try:
+        from core.startup.summary_parallel_intervals_runtime_patch import install as install_summary_parallel_patch
+
+        ok = install_summary_parallel_patch()
+        logger.warning("[FAST STARTUP PATCH] summary_parallel_intervals_runtime_patch installed=%s", ok)
+    except Exception:
+        logger.exception("[FAST STARTUP PATCH] summary_parallel_intervals_runtime_patch install failed")
 
 
 def _install_symbol_flags_bootstrap() -> None:
@@ -216,6 +227,11 @@ def install() -> bool:
         return False
 
     try:
+        _install_summary_parallel_patch()
+    except Exception:
+        logger.exception("[FAST STARTUP PATCH] summary parallel patch failed")
+
+    try:
         _install_symbol_flags_bootstrap()
     except Exception:
         logger.exception("[FAST STARTUP PATCH] symbol flags bootstrap failed")
@@ -338,7 +354,7 @@ def install() -> bool:
 
     _PATCHED = True
     logger.warning(
-        "[FAST STARTUP PATCH] installed v13 entry_affordability=True symbol_flags_bootstrap=True push_direct_ohlc=True entry_max_approved=%s exit_trail_0p3=True entry_limit_board_touch=True entry_cancel_2s_next=True entry_daily_risk=True entry_liquidity=True",
+        "[FAST STARTUP PATCH] installed v14 summary_parallel=True entry_affordability=True symbol_flags_bootstrap=True push_direct_ohlc=True entry_max_approved=%s exit_trail_0p3=True entry_limit_board_touch=True entry_cancel_2s_next=True entry_daily_risk=True entry_liquidity=True",
         10,
     )
     return True
