@@ -1,12 +1,12 @@
 # ============================================================
 # File   : kabu_api/buy_sell_entry.py
-# Version: Ver26-PRODUCTION-MARKET-REFERENCE-PRICE-FIX
+# Version: Ver27-PRODUCTION-MARKET-REFERENCE-PRICE-700K
 # ------------------------------------------------------------
-# ✔ Ver25 完全互換ベース
+# ✔ Ver26 完全互換ベース
 # ✔ 機能削除ゼロ
 # ✔ 上位レイヤ計算 qty を優先使用
 # ✔ qty=None のときのみ固定100株互換
-# ✔ 50万円ワンショット最終防衛
+# ✔ 70万円ワンショット最終防衛
 # ✔ payload 数値型完全保証
 # ✔ price / stop_price 型安全化
 # ✔ API戻り値安全化
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 DEFAULT_FALLBACK_QTY = 100
-MAX_ONESHOT = 500_000
+MAX_ONESHOT = 700_000
 
 # ============================================================
 # settings.ini
@@ -125,7 +125,7 @@ def _normalize_qty_to_unit(symbol, qty: int) -> int:
 
 def _resolve_market_reference_price(symbol, quotes, reference_price, *, side: str) -> float:
     """
-    MARKET注文の数量防衛・50万円制限用の参考価格を解決する。
+    MARKET注文の数量防衛・70万円制限用の参考価格を解決する。
 
     成行payload自体は Price=0 のまま送るが、数量計算には価格が必要。
     板が取得できる場合は BUY=ask / SELL=bid を優先し、
@@ -174,7 +174,7 @@ def _resolve_market_reference_price(symbol, quotes, reference_price, *, side: st
 
 def _enforce_oneshot_rule(symbol, price, qty):
     """
-    指定 qty を使いつつ、50万円ワンショット制限を守る。
+    指定 qty を使いつつ、70万円ワンショット制限を守る。
     """
     try:
         if price is None:
@@ -196,11 +196,12 @@ def _enforce_oneshot_rule(symbol, price, qty):
 
         if total > MAX_ONESHOT:
             logger.warning(
-                "🚫 ONESHOT制限超過 symbol=%s price=%s qty=%s total=%s",
+                "🚫 ONESHOT制限超過 symbol=%s price=%s qty=%s total=%s max_oneshot=%s",
                 symbol,
                 price,
                 qty,
                 int(total),
+                int(MAX_ONESHOT),
             )
             return 0
 
@@ -320,13 +321,14 @@ def _resolve_actual_qty(symbol, price, requested_qty) -> int:
         actual_qty = _enforce_oneshot_rule(symbol, price, unit_qty)
 
         logger.info(
-            "[QTY RESOLVED] symbol=%s requested_qty=%s base_qty=%s unit_qty=%s actual_qty=%s price=%s",
+            "[QTY RESOLVED] symbol=%s requested_qty=%s base_qty=%s unit_qty=%s actual_qty=%s price=%s max_oneshot=%s",
             symbol,
             requested_qty,
             base_qty,
             unit_qty,
             actual_qty,
             price,
+            int(MAX_ONESHOT),
         )
 
         return actual_qty
@@ -340,7 +342,7 @@ def _resolve_actual_qty(symbol, price, requested_qty) -> int:
 # BUY（最良ASK指値）
 # ============================================================
 
-def execute_buy_at_best_ask(symbol, qty=None, lot_yen=500000, exchange=1):
+def execute_buy_at_best_ask(symbol, qty=None, lot_yen=700000, exchange=1):
     try:
         quotes = get_latest_bid_ask(symbol)
 
@@ -386,7 +388,7 @@ def execute_buy_at_best_ask(symbol, qty=None, lot_yen=500000, exchange=1):
 # SELL（最良BID指値）
 # ============================================================
 
-def execute_short_at_best_bid(symbol, qty=None, lot_yen=500000, exchange=1):
+def execute_short_at_best_bid(symbol, qty=None, lot_yen=700000, exchange=1):
     try:
         quotes = get_latest_bid_ask(symbol)
 
