@@ -1,14 +1,14 @@
 # ============================================================
 # File   : trading/entry/entry_budget.py
-# Version: PRODUCTION-ENTRY-BUDGET-CONFIG-V4-TIERED-1500-7000
+# Version: PRODUCTION-ENTRY-BUDGET-CONFIG-V5-UNIFIED-700K
 # ------------------------------------------------------------
 # 目的:
 #   エントリー1回あたりの予算・最低株数・価格帯上限/下限を一元管理する。
 #
-# V4仕様:
-#   - エントリー対象価格帯を 1,500円〜7,000円 に拡張
-#   - 1,500円〜2,999円: MAX 500,000円
-#   - 3,000円〜7,000円: MAX 700,000円
+# V5仕様:
+#   - 1銘柄あたりの基本予算を 700,000円 に統一
+#   - 資金が増えた場合は1銘柄ロットを増やすより、発注対象銘柄数を増やす前提
+#   - 価格帯は 1,500円〜7,000円 を維持
 #   - 7,001円以上: 対象外
 #
 # 優先順:
@@ -25,7 +25,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_ENTRY_ONESHOT_YEN = 700_000.0
-DEFAULT_ENTRY_LOW_PRICE_ONESHOT_YEN = 500_000.0
+DEFAULT_ENTRY_LOW_PRICE_ONESHOT_YEN = 700_000.0
 DEFAULT_ENTRY_HIGH_PRICE_ONESHOT_YEN = 700_000.0
 DEFAULT_ORDER_LOT_SIZE = 100
 DEFAULT_ENTRY_MIN_PRICE = 1_500.0
@@ -132,6 +132,11 @@ def get_max_entry_oneshot_yen(default: float = DEFAULT_MAX_ENTRY_ONESHOT_YEN) ->
 
 
 def get_entry_oneshot_yen_for_price(price: Any) -> float:
+    """
+    1銘柄あたりの発注上限を返す。
+    低価格帯・高価格帯の個別設定が残っている環境でも上書き可能だが、
+    デフォルトは全価格帯 700,000円 に統一する。
+    """
     p = _safe_float(price, 0.0)
     split = get_entry_tier_split_price()
     low_budget = get_entry_low_price_oneshot_yen()
@@ -188,7 +193,7 @@ def can_afford_min_lot(price: Any) -> tuple[bool, dict[str, Any]]:
         "affordable_max_price": affordable_max_price,
         "max_price": effective_max_price,
         "min_notional": min_notional,
-        "source": "entry_budget_tiered_cfg_global_env_setting_ini_default",
+        "source": "entry_budget_unified_700k_cfg_global_env_setting_ini_default",
     }
 
     if not is_affordability_filter_enabled(default=True):
@@ -225,7 +230,7 @@ def log_entry_budget_config(prefix: str = "[ENTRY BUDGET]") -> None:
         low_budget = get_entry_low_price_oneshot_yen()
         high_budget = get_entry_high_price_oneshot_yen()
         logger.warning(
-            "%s tiered min_price=%.0f split_price=%.0f max_price=%.0f low_budget=%.0f high_budget=%.0f lot_size=%s affordability_filter=%s source=global_config_env_setting_ini_default",
+            "%s unified_700k min_price=%.0f split_price=%.0f max_price=%.0f low_budget=%.0f high_budget=%.0f lot_size=%s affordability_filter=%s source=global_config_env_setting_ini_default",
             prefix, min_price, split_price, max_price, low_budget, high_budget, lot,
             is_affordability_filter_enabled(default=True),
         )
