@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/entry_limit_passive_runtime_patch.py
-# Version: V1.2-STRICT-BOARD-MTF-SLOPE-GUARD
+# Version: V1.3-BOARD-MISSING-ALLOW-FALLBACK
 # ------------------------------------------------------------
 # SUMMARY_AI エントリー指値を board touch に変更し、同時に
 # 「売ったら上がる / 買ったら下がる」対策として発注直前ガードを強化する。
@@ -10,18 +10,12 @@
 #   SELL : bid 指値
 #
 # 追加防衛:
-#   1. 板が取れない場合は summary_fallback_touch で発注しない
+#   1. 板が取れない場合、ENTRY_ALLOW_ENTRY_WITHOUT_BOARD=1 なら
+#      close/current/reference price の fallback 指値で継続する
 #   2. technical_ready=False の SUMMARY_AI は止める
 #   3. BUY は slope が正方向、SELL は slope が負方向のときだけ通す
 #   4. MTF / score_mtf が逆方向なら止める
 #   5. SELL で positive MTF を無視しない
-#
-# 環境変数:
-#   ENTRY_STRICT_BOARD_REQUIRED=1
-#   ENTRY_STRICT_SUMMARY_REQUIRE_TECHNICAL_READY=1
-#   ENTRY_STRICT_SUMMARY_SLOPE_EPS=0.001
-#   ENTRY_STRICT_SUMMARY_MTF_EPS=0.0
-#   ENTRY_STRICT_SUMMARY_REQUIRE_MTF_DATA=1
 # ============================================================
 
 from __future__ import annotations
@@ -117,10 +111,12 @@ def _ng(reason: str, **detail: Any) -> Dict[str, Any]:
 def _summary_ai_strict_guard(*, symbol: str, side: str, row: dict, detail: dict) -> Optional[Dict[str, Any]]:
     side_u = str(side or "").upper()
 
-    if _env_bool("ENTRY_STRICT_BOARD_REQUIRED", True):
-        board_ok = bool(detail.get("board"))
-        price_source = str(detail.get("price_source") or "")
-        if not board_ok or "fallback" in price_source.lower():
+    board_ok = bool(detail.get("board"))
+    price_source = str(detail.get("price_source") or "")
+    if not board_ok or "fallback" in price_source.lower():
+        allow_without_board = _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", True)
+        strict_board = _env_bool("ENTRY_STRICT_BOARD_REQUIRED", False)
+        if strict_board and not allow_without_board:
             return _ng(
                 "STRICT_BOARD_MISSING",
                 symbol=symbol,
@@ -129,6 +125,14 @@ def _summary_ai_strict_guard(*, symbol: str, side: str, row: dict, detail: dict)
                 price_source=price_source,
                 message="板が取れないためSUMMARY_AI新規エントリーを停止",
             )
+        logger.warning(
+            "[ENTRY LIMIT BOARD TOUCH] BOARD_MISSING_ALLOW symbol=%s side=%s price_source=%s strict_board=%s allow_without_board=%s",
+            symbol,
+            side_u,
+            price_source,
+            strict_board,
+            allow_without_board,
+        )
 
     if _env_bool("ENTRY_STRICT_SUMMARY_REQUIRE_TECHNICAL_READY", True):
         technical_ready = row.get("technical_ready")
@@ -192,10 +196,7 @@ def install() -> bool:
             logger.warning("[ENTRY LIMIT BOARD TOUCH] required functions not callable")
             return False
 
-        # 0 = board base price そのまま。BUYはask、SELLはbid。
         setattr(eob, "SUMMARY_AGGRESSIVE_LIMIT_TICKS", 0)
-
-        # fail-open しない方向へデフォルトを補正する。
         setattr(eob, "ENTRY_ORDER_REQUIRE_MTF_DATA", _env_bool("ENTRY_STRICT_SUMMARY_REQUIRE_MTF_DATA", True))
         setattr(eob, "ENTRY_ORDER_SELL_IGNORE_POSITIVE_MTF", False)
 
@@ -222,8 +223,8 @@ def install() -> bool:
                         detail = ret.get("detail")
                         if isinstance(detail, dict) and src == "SUMMARY_AI" and detail.get("order_type") == "LIMIT":
                             detail["aggressive_limit_ticks"] = 0
-                            detail["entry_limit_mode"] = "BOARD_TOUCH_STRICT"
-                            detail["price_rule"] = "BUY=ask / SELL=bid"
+                            detail["entry_limit_mode"] = "BOARD_TOUCH_OR_FALLBACK"
+                            detail["price_rule"] = "BUY=ask / SELL=bid / board_missing=fallback_limit"
                             if detail.get("board"):
                                 detail["price_source"] = "board_bid_ask_touch"
                             else:
@@ -241,7 +242,7 @@ def install() -> bool:
                                 return strict_ng
 
                             logger.warning(
-                                "[ENTRY LIMIT BOARD TOUCH] symbol=%s side=%s price=%s base=%s rule=%s strict=OK",
+                                "[ENTRY LIMIT BOARD TOUCH] symbol=%s side=%s price=%s base=%s rule=%s guard=OK",
                                 symbol,
                                 side,
                                 detail.get("price"),
@@ -255,7 +256,6 @@ def install() -> bool:
             build_entry_order_board_touch._entry_board_touch_wrapped = True  # type: ignore[attr-defined]
             build_entry_order_board_touch._original = old_build  # type: ignore[attr-defined]
             setattr(eob, "build_entry_order", build_entry_order_board_touch)
-            # entry_controller は from import で参照を保持しているため、同時に差し替える。
             try:
                 setattr(ec, "build_entry_order", build_entry_order_board_touch)
             except Exception:
@@ -263,8 +263,9 @@ def install() -> bool:
 
         _INSTALLED = True
         logger.warning(
-            "[ENTRY LIMIT BOARD TOUCH] installed rule=BUY:ask SELL:bid strict_board=%s require_tech=%s slope_eps=%.6f require_mtf=%s sell_ignore_positive_mtf=False",
-            _env_bool("ENTRY_STRICT_BOARD_REQUIRED", True),
+            "[ENTRY LIMIT BOARD TOUCH] installed rule=BUY:ask SELL:bid strict_board=%s allow_without_board=%s require_tech=%s slope_eps=%.6f require_mtf=%s sell_ignore_positive_mtf=False",
+            _env_bool("ENTRY_STRICT_BOARD_REQUIRED", False),
+            _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", True),
             _env_bool("ENTRY_STRICT_SUMMARY_REQUIRE_TECHNICAL_READY", True),
             _env_float("ENTRY_STRICT_SUMMARY_SLOPE_EPS", 0.001),
             _env_bool("ENTRY_STRICT_SUMMARY_REQUIRE_MTF_DATA", True),
