@@ -3,7 +3,8 @@
 #====================================================================================================
 # ============================================================
 # File   : trading/push/push_db_writer.py
-# Version: PRODUCTION-ABSOLUTE-FULL-STREAM-SAVER-REV23-RAW-ALWAYS-ON
+# Version: PRODUCTION-ABSOLUTE-FULL-STREAM-SAVER-REV24-DB-BUSY-RETRY
+#          -RAW-ALWAYS-ON
 #          -FUTURE-DATETIME-GUARD
 #          -FLUSH-RUNTIME-METRICS
 #          -PUSH-ONLY-LOG-RENAME
@@ -30,6 +31,7 @@
 # ✔ NEW: ranking snapshot を連想させる snapshot_* ログ名を廃止
 # ✔ NEW: push writer は PUSH専用であることをログに明示
 # ✔ REV23: stream_data_raw を既定ONにし、UNIQUE(symbol, datetime) 上書きでも全tickを残す
+# ✔ REV24: database is locked/busy 時に rollback + 短時間リトライ + busy_timeout 30秒化
 # ============================================================
 
 from __future__ import annotations
@@ -62,6 +64,11 @@ class StreamDBWriter:
     # stream_data_raw: 上記64 + received_at + ingest_id = 66
     RAW_EXPECTED_COLUMN_COUNT = 66
     RAW_TABLE_NAME = "stream_data_raw"
+
+    # NAS上SQLite向け。ロック競合時に即失敗しない。
+    BUSY_TIMEOUT_MS = 30000
+    FLUSH_BUSY_RETRY_COUNT = 3
+    FLUSH_BUSY_SLEEP_BASE_SEC = 0.35
 
     def __init__(
         self,
@@ -145,6 +152,17 @@ class StreamDBWriter:
 
     def _new_ingest_id(self) -> str:
         return uuid.uuid4().hex
+
+    def _is_sqlite_busy_error(self, exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return "database is locked" in msg or "database is busy" in msg or "locked" in msg
+
+    def _safe_rollback(self) -> None:
+        try:
+            if self.conn is not None:
+                self.conn.rollback()
+        except Exception:
+            logger.exception("[PUSH DB WRITER] rollback failed")
 
     def _set_runtime_metric(self, name: str, value: Any) -> None:
         try:
@@ -396,7 +414,7 @@ class StreamDBWriter:
 
         self.conn = sqlite3.connect(
             db_path,
-            timeout=10,
+            timeout=max(30.0, self.BUSY_TIMEOUT_MS / 1000.0),
             check_same_thread=False,
         )
         self.cursor = self.conn.cursor()
@@ -404,7 +422,7 @@ class StreamDBWriter:
         self.cursor.execute("PRAGMA journal_mode=WAL;")
         self.cursor.execute("PRAGMA synchronous=NORMAL;")
         self.cursor.execute("PRAGMA wal_autocheckpoint=1000;")
-        self.cursor.execute("PRAGMA busy_timeout=5000;")
+        self.cursor.execute(f"PRAGMA busy_timeout={int(self.BUSY_TIMEOUT_MS)};")
         self.cursor.execute("PRAGMA temp_store=MEMORY;")
         self.cursor.execute("PRAGMA cache_size=-50000;")
 
@@ -413,11 +431,12 @@ class StreamDBWriter:
             self._ensure_raw_table()
 
         logger.info(
-            "[PUSH DB WRITER] connected → %s raw_save=%s buffer_size=%d flush_interval=%.3f push_only=True",
+            "[PUSH DB WRITER] connected → %s raw_save=%s buffer_size=%d flush_interval=%.3f push_only=True busy_timeout_ms=%d",
             db_path,
             self.enable_raw_save,
             self.buffer_size,
             self.flush_interval_sec,
+            self.BUSY_TIMEOUT_MS,
         )
 
     # ========================================================
@@ -922,92 +941,138 @@ class StreamDBWriter:
                     self.buffer.clear()
                     return False
 
-                self.cursor.execute(f"SELECT COUNT(*) FROM {self.TABLE_NAME}")
-                before_push = self.cursor.fetchone()[0]
-
-                if self.enable_raw_save:
-                    self.cursor.execute(f"SELECT COUNT(*) FROM {self.RAW_TABLE_NAME}")
-                    before_raw = self.cursor.fetchone()[0]
-                else:
-                    before_raw = 0
-
-                t0 = time.time()
                 db_path = self._resolve_db_path()
+                last_busy_error: Optional[sqlite3.OperationalError] = None
 
-                logger.info(
-                    "[PUSH DB WRITER] executemany start push_rows=%d raw_rows=%d",
-                    len(push_rows),
-                    len(raw_rows),
-                )
+                for attempt in range(1, self.FLUSH_BUSY_RETRY_COUNT + 1):
+                    try:
+                        self.cursor.execute(f"PRAGMA busy_timeout={int(self.BUSY_TIMEOUT_MS)};")
 
-                self.cursor.executemany(push_sql, push_rows)
-                t1 = time.time()
-                logger.info(
-                    "[PUSH DB WRITER] executemany push done rows=%d elapsed=%.3fs",
-                    len(push_rows),
-                    t1 - t0,
-                )
+                        self.cursor.execute(f"SELECT COUNT(*) FROM {self.TABLE_NAME}")
+                        before_push = self.cursor.fetchone()[0]
 
-                if self.enable_raw_save and raw_sql and raw_rows:
-                    self.cursor.executemany(raw_sql, raw_rows)
-                    t2 = time.time()
-                    logger.info(
-                        "[PUSH DB WRITER] executemany raw done rows=%d elapsed=%.3fs",
-                        len(raw_rows),
-                        t2 - t1,
-                    )
-                else:
-                    t2 = t1
+                        if self.enable_raw_save:
+                            self.cursor.execute(f"SELECT COUNT(*) FROM {self.RAW_TABLE_NAME}")
+                            before_raw = self.cursor.fetchone()[0]
+                        else:
+                            before_raw = 0
 
-                self.conn.commit()
-                t3 = time.time()
-                total_elapsed = t3 - t0
+                        t0 = time.time()
 
-                logger.info(
-                    "[PUSH DB WRITER] commit done elapsed=%.3fs total_elapsed=%.3fs",
-                    t3 - t2,
-                    total_elapsed,
-                )
+                        logger.info(
+                            "[PUSH DB WRITER] executemany start push_rows=%d raw_rows=%d attempt=%d/%d busy_timeout_ms=%d",
+                            len(push_rows),
+                            len(raw_rows),
+                            attempt,
+                            self.FLUSH_BUSY_RETRY_COUNT,
+                            self.BUSY_TIMEOUT_MS,
+                        )
 
-                self.cursor.execute(f"SELECT COUNT(*) FROM {self.TABLE_NAME}")
-                after_push = self.cursor.fetchone()[0]
+                        self.cursor.executemany(push_sql, push_rows)
+                        t1 = time.time()
+                        logger.info(
+                            "[PUSH DB WRITER] executemany push done rows=%d elapsed=%.3fs attempt=%d",
+                            len(push_rows),
+                            t1 - t0,
+                            attempt,
+                        )
 
-                if self.enable_raw_save:
-                    self.cursor.execute(f"SELECT COUNT(*) FROM {self.RAW_TABLE_NAME}")
-                    after_raw = self.cursor.fetchone()[0]
-                else:
-                    after_raw = 0
+                        if self.enable_raw_save and raw_sql and raw_rows:
+                            self.cursor.executemany(raw_sql, raw_rows)
+                            t2 = time.time()
+                            logger.info(
+                                "[PUSH DB WRITER] executemany raw done rows=%d elapsed=%.3fs attempt=%d",
+                                len(raw_rows),
+                                t2 - t1,
+                                attempt,
+                            )
+                        else:
+                            t2 = t1
 
-                self._mark_flush_runtime(
-                    push_flushed=len(push_rows),
-                    push_before=before_push,
-                    push_after=after_push,
-                    raw_flushed=len(raw_rows) if self.enable_raw_save else 0,
-                    raw_before=before_raw,
-                    raw_after=after_raw,
-                    db_path=db_path,
-                    elapsed_sec=total_elapsed,
-                )
+                        self.conn.commit()
+                        t3 = time.time()
+                        total_elapsed = t3 - t0
 
-                logger.warning(
-                    "[PUSH DB WRITER] db=%s push_flushed=%d push_before=%d push_after=%d push_delta=%d raw_save=%s raw_flushed=%d raw_before=%d raw_after=%d raw_delta=%d buffer_before=%d",
-                    db_path,
-                    len(push_rows),
-                    before_push,
-                    after_push,
-                    after_push - before_push,
-                    self.enable_raw_save,
-                    len(raw_rows) if self.enable_raw_save else 0,
-                    before_raw,
-                    after_raw,
-                    (after_raw - before_raw) if self.enable_raw_save else 0,
+                        logger.info(
+                            "[PUSH DB WRITER] commit done elapsed=%.3fs total_elapsed=%.3fs attempt=%d",
+                            t3 - t2,
+                            total_elapsed,
+                            attempt,
+                        )
+
+                        self.cursor.execute(f"SELECT COUNT(*) FROM {self.TABLE_NAME}")
+                        after_push = self.cursor.fetchone()[0]
+
+                        if self.enable_raw_save:
+                            self.cursor.execute(f"SELECT COUNT(*) FROM {self.RAW_TABLE_NAME}")
+                            after_raw = self.cursor.fetchone()[0]
+                        else:
+                            after_raw = 0
+
+                        self._mark_flush_runtime(
+                            push_flushed=len(push_rows),
+                            push_before=before_push,
+                            push_after=after_push,
+                            raw_flushed=len(raw_rows) if self.enable_raw_save else 0,
+                            raw_before=before_raw,
+                            raw_after=after_raw,
+                            db_path=db_path,
+                            elapsed_sec=total_elapsed,
+                        )
+
+                        logger.warning(
+                            "[PUSH DB WRITER] db=%s push_flushed=%d push_before=%d push_after=%d push_delta=%d raw_save=%s raw_flushed=%d raw_before=%d raw_after=%d raw_delta=%d buffer_before=%d attempt=%d",
+                            db_path,
+                            len(push_rows),
+                            before_push,
+                            after_push,
+                            after_push - before_push,
+                            self.enable_raw_save,
+                            len(raw_rows) if self.enable_raw_save else 0,
+                            before_raw,
+                            after_raw,
+                            (after_raw - before_raw) if self.enable_raw_save else 0,
+                            buffer_len_before,
+                            attempt,
+                        )
+
+                        self.buffer.clear()
+                        return True
+
+                    except sqlite3.OperationalError as e:
+                        last_busy_error = e
+                        self._safe_rollback()
+
+                        if not self._is_sqlite_busy_error(e):
+                            raise
+
+                        if attempt >= self.FLUSH_BUSY_RETRY_COUNT:
+                            break
+
+                        sleep_sec = self.FLUSH_BUSY_SLEEP_BASE_SEC * attempt
+                        logger.warning(
+                            "[PUSH DB WRITER] database busy -> retry buffer=%d attempt=%d/%d sleep=%.3fs err=%s",
+                            buffer_len_before,
+                            attempt,
+                            self.FLUSH_BUSY_RETRY_COUNT,
+                            sleep_sec,
+                            e,
+                        )
+                        time.sleep(sleep_sec)
+
+                logger.error(
+                    "[PUSH DB WRITER] flush operational failed after retry buffer=%d table_push=%s raw_save=%s table_raw=%s err=%s",
                     buffer_len_before,
+                    self.TABLE_NAME,
+                    self.enable_raw_save,
+                    self.RAW_TABLE_NAME,
+                    last_busy_error,
                 )
-
                 self.buffer.clear()
-                return True
+                return False
 
             except sqlite3.IntegrityError:
+                self._safe_rollback()
                 logger.exception(
                     "[PUSH DB WRITER] flush integrity failed buffer=%d table_push=%s raw_save=%s table_raw=%s",
                     buffer_len_before,
@@ -1019,6 +1084,7 @@ class StreamDBWriter:
                 return False
 
             except sqlite3.OperationalError:
+                self._safe_rollback()
                 logger.exception(
                     "[PUSH DB WRITER] flush operational failed buffer=%d table_push=%s raw_save=%s table_raw=%s",
                     buffer_len_before,
@@ -1030,6 +1096,7 @@ class StreamDBWriter:
                 return False
 
             except Exception:
+                self._safe_rollback()
                 logger.exception(
                     "[PUSH DB WRITER] flush failed buffer=%d table_push=%s raw_save=%s table_raw=%s",
                     buffer_len_before,
