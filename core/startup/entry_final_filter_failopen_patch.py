@@ -1,21 +1,20 @@
 # ============================================================
 # File   : core/startup/entry_final_filter_failopen_patch.py
-# Version: V1.1-BOARD-DAILY-RISK-RELAX
+# Version: V1.2-DIRECTION-FAIL-CLOSED
 # ------------------------------------------------------------
 # 【目的】
 #   候補・AI・pending までは通るのに、最後で全落ちする問題の緩和。
 #
 # 【対象】
 #   - range_5m_filter が 5分足欠損/未完成で False を返すケース
-#   - entry_direction_confirm が RecursionError で fail-safe NG になるケース
 #   - final_entry_safety_guard の board_missing で全落ちするケース
 #   - SYMBOL_DAILY_ENTRY_LIMIT が 1回固定で強すぎるケース
 #
 # 【方針】
 #   - 5分足元フィルタNGは、発注停止ではなく既存の低変動ガード側に任せる
-#   - 再帰/例外は fail-open して、他の流動性・板・価格・信用ガードに任せる
 #   - 板が取れない場合は entry_order_builder / buy_sell_entry の reference_price に任せる
 #   - 同一銘柄の当日発注済みカウントはデフォルト2回まで許可する
+#   - 方向確認の再帰/例外は fail-open しない。安全側NGにする。
 # ============================================================
 
 from __future__ import annotations
@@ -35,6 +34,14 @@ def _setdefault_env(name: str, value: str) -> None:
         if cur is None or str(cur).strip() == "":
             os.environ[name] = str(value)
             logger.warning("[ENTRY FINAL FILTER FAILOPEN] env default set %s=%s", name, value)
+    except Exception:
+        pass
+
+
+def _force_env(name: str, value: str) -> None:
+    try:
+        os.environ[name] = str(value)
+        logger.warning("[ENTRY FINAL FILTER FAILOPEN] env force set %s=%s", name, value)
     except Exception:
         pass
 
@@ -60,7 +67,10 @@ def install() -> bool:
     _setdefault_env("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", "2")
     _setdefault_env("ENTRY_COUNT_SENT_ORDER_AS_DAILY_ENTRY", "1")
     _setdefault_env("RANGE_5M_FILTER_NG_FAIL_OPEN", "1")
-    _setdefault_env("ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN", "1")
+
+    # 方向確認は fail-open しない。明示的に安全側NGへ固定する。
+    _force_env("ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN", "0")
+    _force_env("ENTRY_DIRECTION_CONFIRM_ERROR_FAIL_OPEN", "0")
 
     try:
         import trading.handlers.entry_controller as ec
@@ -103,37 +113,21 @@ def install() -> bool:
         logger.exception("[ENTRY FINAL FILTER FAILOPEN] range_5m wrapper install failed")
 
     # --------------------------------------------------------
-    # 2) pure direction confirm fail-open wrapper
+    # 2) pure direction confirm は fail-closed
     # --------------------------------------------------------
     try:
-        import core.startup.entry_direction_confirm_guard_patch as dgp
-        orig_check = getattr(dgp, "check_entry_direction_confirm", None)
-        if callable(orig_check) and not getattr(orig_check, "_direction_failopen_wrapper", False):
-
-            def _direction_failopen(entry_row: Any = None, *args, **kwargs) -> bool:
-                try:
-                    return bool(orig_check(entry_row, *args, **kwargs))
-                except RecursionError:
-                    allow = _env_bool("ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN", True)
-                    logger.error("[ENTRY FINAL FILTER FAILOPEN] direction confirm recursion. fail_open=%s", allow, exc_info=False)
-                    return bool(allow)
-                except Exception as e:
-                    allow = _env_bool("ENTRY_DIRECTION_CONFIRM_ERROR_FAIL_OPEN", True)
-                    logger.warning("[ENTRY FINAL FILTER FAILOPEN] direction confirm error. fail_open=%s err=%s", allow, e, exc_info=False)
-                    return bool(allow)
-
-            _direction_failopen._direction_failopen_wrapper = True  # type: ignore[attr-defined]
-            _direction_failopen._original_check_entry_direction_confirm = orig_check  # type: ignore[attr-defined]
-            dgp.check_entry_direction_confirm = _direction_failopen
-            logger.warning("[ENTRY FINAL FILTER FAILOPEN] direction confirm wrapper installed")
+        from core.startup.entry_direction_failclosed_patch import install as install_direction_failclosed
+        ok = install_direction_failclosed()
+        logger.warning("[ENTRY FINAL FILTER FAILOPEN] direction fail-closed patch installed=%s", ok)
     except Exception:
-        logger.exception("[ENTRY FINAL FILTER FAILOPEN] direction wrapper install failed")
+        logger.exception("[ENTRY FINAL FILTER FAILOPEN] direction fail-closed patch install failed")
 
     _PATCHED = True
     logger.warning(
-        "[ENTRY FINAL FILTER FAILOPEN] installed range_fail_open=%s direction_recursion_fail_open=%s allow_without_board=%s max_symbol_entries=%s",
+        "[ENTRY FINAL FILTER FAILOPEN] installed range_fail_open=%s direction_recursion_fail_open=%s direction_error_fail_open=%s allow_without_board=%s max_symbol_entries=%s",
         _env_bool("RANGE_5M_FILTER_NG_FAIL_OPEN", True),
-        _env_bool("ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN", True),
+        _env_bool("ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN", False),
+        _env_bool("ENTRY_DIRECTION_CONFIRM_ERROR_FAIL_OPEN", False),
         os.getenv("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"),
         os.getenv("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL"),
     )
