@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/entry_order_mtf_slope_fill_patch.py
-# Version: Ver02-ENTRY-ORDER-MTF-SLOPE-FILL-SYNTAX-FIX
+# Version: Ver03-ENTRY-ORDER-MTF-SLOPE-FILL-CHAIN-SUMMARY-GUARD
 # ------------------------------------------------------------
 # Purpose:
 #   SUMMARY_AI 承認後の entry_row に slope_1m / slope_3m / slope_5m が
@@ -16,6 +16,8 @@
 #   - Python SyntaxError 対策
 #     f-string expression part cannot include a backslash
 #   - SQL列名生成を _qident() に集約し、f-string式内の \" を廃止
+#   Ver03:
+#   - 起動時に summary_no_overlap_runtime_patch も連鎖installする
 # ============================================================
 
 from __future__ import annotations
@@ -34,6 +36,16 @@ logger = logging.getLogger(__name__)
 
 _INSTALLED = False
 _ORIGINAL = None
+
+
+def _install_summary_no_overlap_guard() -> None:
+    try:
+        from core.startup import summary_no_overlap_runtime_patch as snop
+        fn = getattr(snop, "install", None)
+        ok = fn() if callable(fn) else False
+        logger.warning("[ENTRY ORDER MTF SLOPE FILL] chained summary_no_overlap install=%s", ok)
+    except Exception:
+        logger.exception("[ENTRY ORDER MTF SLOPE FILL] chained summary_no_overlap install failed")
 
 
 def _today() -> str:
@@ -253,6 +265,8 @@ def install() -> bool:
         return True
 
     try:
+        _install_summary_no_overlap_guard()
+
         import trading.handlers.entry_order_builder as eob
         import trading.handlers.entry_controller as ec
 
