@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/entry_limit_passive_runtime_patch.py
-# Version: V1.3-BOARD-MISSING-ALLOW-FALLBACK
+# Version: V1.4-MISSING-TECHNICAL-READY-PASS-TO-SLOPE-MTF
 # ------------------------------------------------------------
 # SUMMARY_AI エントリー指値を board touch に変更し、同時に
 # 「売ったら上がる / 買ったら下がる」対策として発注直前ガードを強化する。
@@ -12,7 +12,8 @@
 # 追加防衛:
 #   1. 板が取れない場合、ENTRY_ALLOW_ENTRY_WITHOUT_BOARD=1 なら
 #      close/current/reference price の fallback 指値で継続する
-#   2. technical_ready=False の SUMMARY_AI は止める
+#   2. technical_ready が明示 False の場合だけ止める
+#      None/欠損は entry_row 欠損として slope / MTF 判定へ進める
 #   3. BUY は slope が正方向、SELL は slope が負方向のときだけ通す
 #   4. MTF / score_mtf が逆方向なら止める
 #   5. SELL で positive MTF を無視しない
@@ -104,6 +105,25 @@ def _first(row: dict, keys: tuple[str, ...], default: Any = None) -> Any:
     return default
 
 
+def _is_explicit_false(v: Any) -> bool:
+    try:
+        if v is None:
+            return False
+        s = str(v).strip().lower()
+        return s in {"0", "false", "no", "n", "off"}
+    except Exception:
+        return False
+
+
+def _is_true(v: Any) -> bool:
+    try:
+        if v is None:
+            return False
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        return False
+
+
 def _ng(reason: str, **detail: Any) -> Dict[str, Any]:
     return {"ok": False, "reason": reason, "detail": detail}
 
@@ -136,13 +156,22 @@ def _summary_ai_strict_guard(*, symbol: str, side: str, row: dict, detail: dict)
 
     if _env_bool("ENTRY_STRICT_SUMMARY_REQUIRE_TECHNICAL_READY", True):
         technical_ready = row.get("technical_ready")
-        if str(technical_ready).strip().lower() not in {"1", "true", "yes", "y", "on"}:
+        usable_technical_ready = row.get("usable_technical_ready")
+        if _is_explicit_false(technical_ready) and not _is_true(usable_technical_ready):
             return _ng(
                 "STRICT_TECHNICAL_NOT_READY",
                 symbol=symbol,
                 side=side_u,
                 technical_ready=technical_ready,
+                usable_technical_ready=usable_technical_ready,
                 message="technical_ready=False のためSUMMARY_AI新規エントリーを停止",
+            )
+        if technical_ready is None:
+            logger.warning(
+                "[ENTRY LIMIT BOARD TOUCH] technical_ready missing -> continue to slope/MTF guard symbol=%s side=%s usable_technical_ready=%s",
+                symbol,
+                side_u,
+                usable_technical_ready,
             )
 
     slope = _safe_float_or_none(_first(row, ("slope_atr_scaled", "slope", "score_slope", "disp_slope"), None))
@@ -263,7 +292,7 @@ def install() -> bool:
 
         _INSTALLED = True
         logger.warning(
-            "[ENTRY LIMIT BOARD TOUCH] installed rule=BUY:ask SELL:bid strict_board=%s allow_without_board=%s require_tech=%s slope_eps=%.6f require_mtf=%s sell_ignore_positive_mtf=False",
+            "[ENTRY LIMIT BOARD TOUCH] installed rule=BUY:ask SELL:bid strict_board=%s allow_without_board=%s require_tech=%s slope_eps=%.6f require_mtf=%s sell_ignore_positive_mtf=False tech_missing_pass=True",
             _env_bool("ENTRY_STRICT_BOARD_REQUIRED", False),
             _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", True),
             _env_bool("ENTRY_STRICT_SUMMARY_REQUIRE_TECHNICAL_READY", True),
