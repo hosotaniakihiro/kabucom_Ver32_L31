@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry_exit/tasks.py
-# Version: Ver1.0-ENTRY-EXIT-SCHEDULER-TASKS-RANKING-TONOSAMA
+# Version: Ver1.1-ENTRY-JOB-TIMEOUT-GUARD
 # ------------------------------------------------------------
 # 【目的】
 #   core.entry_exit_tasks shim から解決される実体モジュール。
@@ -18,12 +18,14 @@
 # 【重要】
 #   - ランキングサマリー保存とランキング由来エントリーは別物。
 #   - これを登録しないと ranking_snapshot は保存されても発注候補に流れない。
+#   - Ver1.1: scheduler側の previous_still_running を防ぐため、各処理にタイムアウトを設ける。
 # ============================================================
 
 from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 import threading
 import time
 from typing import Any, Callable, Optional
@@ -39,6 +41,10 @@ _TAG_RANKING_ENTRY = "ranking_entry"
 _RANKING_ENTRY_RUNNING = False
 _RANKING_ENTRY_STARTED_AT: Optional[dt.datetime] = None
 _RANKING_ENTRY_LOCK = threading.RLock()
+
+TONOSAMA_ENTRY_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_TIMEOUT_SEC", "12"))
+RANKING_ENTRY_BUILD_TIMEOUT_SEC = float(os.getenv("RANKING_ENTRY_BUILD_TIMEOUT_SEC", "20"))
+RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC = float(os.getenv("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", "20"))
 
 
 def _clear_tag(tag: str) -> None:
@@ -75,6 +81,49 @@ def _resolve_callable(module_name: str, attr_name: str) -> Optional[Callable[...
         return None
 
 
+def _run_callable_with_timeout(
+    fn: Callable[..., Any],
+    *,
+    timeout_sec: float,
+    name: str,
+    args: tuple[Any, ...] = (),
+    kwargs: Optional[dict[str, Any]] = None,
+) -> tuple[bool, Any]:
+    """
+    schedule_loop の previous_still_running を防ぐためのタイムアウト実行。
+
+    Pythonでは安全にスレッドを強制終了できないため、timeout後はdaemon threadを残して
+    呼び出し元だけ返す。DB/API待ちで固まった場合でも次回ジョブを止め続けないための防衛。
+    """
+    result: dict[str, Any] = {"done": False, "ret": None, "err": None}
+    kwargs = kwargs or {}
+
+    def _target() -> None:
+        try:
+            result["ret"] = fn(*args, **kwargs)
+            result["done"] = True
+        except Exception as e:  # noqa: BLE001
+            result["err"] = e
+            result["done"] = True
+
+    th = threading.Thread(target=_target, daemon=True, name=f"entry-timeout-{name}")
+    th.start()
+    th.join(max(0.1, float(timeout_sec or 0.1)))
+
+    if th.is_alive():
+        logger.warning(
+            "[%s] timeout -> return to scheduler timeout_sec=%.3f thread_alive=True",
+            name,
+            timeout_sec,
+        )
+        return False, None
+
+    if result.get("err") is not None:
+        raise result["err"]
+
+    return True, result.get("ret")
+
+
 def _run_tonosama_entry_safe() -> int:
     started = time.perf_counter()
     fn = _resolve_callable("trading.entry.tonosama.runner", "tonosama_loop")
@@ -82,8 +131,18 @@ def _run_tonosama_entry_safe() -> int:
         logger.warning("[TONOSAMA ENTRY SCHEDULE] skipped reason=runner_unavailable")
         return 0
     try:
-        logger.info("[TONOSAMA ENTRY SCHEDULE] fire")
-        ret = fn()
+        logger.info("[TONOSAMA ENTRY SCHEDULE] fire timeout_sec=%.3f", TONOSAMA_ENTRY_TIMEOUT_SEC)
+        completed, ret = _run_callable_with_timeout(
+            fn,
+            timeout_sec=TONOSAMA_ENTRY_TIMEOUT_SEC,
+            name="TONOSAMA ENTRY SCHEDULE",
+        )
+        if not completed:
+            logger.warning(
+                "[TONOSAMA ENTRY SCHEDULE] timeout skipped_result elapsed=%.3fs",
+                time.perf_counter() - started,
+            )
+            return 0
         logger.info("[TONOSAMA ENTRY SCHEDULE] done result=%s elapsed=%.3fs", ret, time.perf_counter() - started)
         return int(ret or 0)
     except Exception:
@@ -120,14 +179,41 @@ def _run_ranking_entry_safe() -> int:
             logger.warning("[RANKING ENTRY SCHEDULE] skipped reason=ranking_entry_pipeline_unavailable")
             return 0
 
-        created = int(build_fn() or 0)
+        completed, created_ret = _run_callable_with_timeout(
+            build_fn,
+            timeout_sec=RANKING_ENTRY_BUILD_TIMEOUT_SEC,
+            name="RANKING ENTRY BUILD",
+        )
+        if not completed:
+            logger.warning(
+                "[RANKING ENTRY SCHEDULE] build timeout -> controller dispatch skipped timeout_sec=%.3f elapsed=%.3fs",
+                RANKING_ENTRY_BUILD_TIMEOUT_SEC,
+                time.perf_counter() - started,
+            )
+            return 0
+
+        created = int(created_ret or 0)
         logger.info("[RANKING ENTRY SCHEDULE] pending build done created=%s", created)
 
         if created > 0:
             controller_fn = _resolve_callable("trading.handlers.entry_controller", "run_entry_pipeline")
             if callable(controller_fn):
-                logger.info("[RANKING ENTRY SCHEDULE] dispatch entry_controller pipeline_source=RANKING interval=1")
-                controller_fn(pipeline_source="RANKING", interval=1)
+                logger.info(
+                    "[RANKING ENTRY SCHEDULE] dispatch entry_controller pipeline_source=RANKING interval=1 timeout_sec=%.3f",
+                    RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC,
+                )
+                completed_ctrl, _ret = _run_callable_with_timeout(
+                    controller_fn,
+                    timeout_sec=RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC,
+                    name="RANKING ENTRY CONTROLLER",
+                    kwargs={"pipeline_source": "RANKING", "interval": 1},
+                )
+                if not completed_ctrl:
+                    logger.warning(
+                        "[RANKING ENTRY SCHEDULE] controller timeout timeout_sec=%.3f elapsed=%.3fs",
+                        RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC,
+                        time.perf_counter() - started,
+                    )
             else:
                 logger.warning("[RANKING ENTRY SCHEDULE] entry_controller unavailable after pending created=%s", created)
         else:
@@ -175,10 +261,13 @@ def register_entry_exit_tasks(*args: Any, **kwargs: Any) -> bool:
         job_r.tag(_TAG_RANKING_ENTRY)
 
         logger.info(
-            "[entry_exit.tasks] registered tonosama every=%ss tag=%s ranking every minute at :12 tag=%s",
+            "[entry_exit.tasks] registered tonosama every=%ss tag=%s timeout=%.1fs ranking every minute at :12 tag=%s build_timeout=%.1fs controller_timeout=%.1fs",
             interval_sec,
             _TAG_TONOSAMA_ENTRY,
+            TONOSAMA_ENTRY_TIMEOUT_SEC,
             _TAG_RANKING_ENTRY,
+            RANKING_ENTRY_BUILD_TIMEOUT_SEC,
+            RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC,
         )
 
         ok = _has_tag(_TAG_TONOSAMA_ENTRY) and _has_tag(_TAG_RANKING_ENTRY)
