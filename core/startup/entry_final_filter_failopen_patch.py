@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/entry_final_filter_failopen_patch.py
-# Version: V1.3-DIRECTION-FAIL-CLOSED-PENDING-PROTECT-PUSH
+# Version: V1.4-DIRECTION-FAIL-CLOSED-PENDING-PROTECT-PUSH-BOARD-RETRY
 # ------------------------------------------------------------
 # 【目的】
 #   候補・AI・pending までは通るのに、最後で全落ちする問題の緩和。
@@ -13,7 +13,7 @@
 #
 # 【方針】
 #   - 5分足元フィルタNGは、発注停止ではなく既存の低変動ガード側に任せる
-#   - 板が取れない場合は entry_order_builder / buy_sell_entry の reference_price に任せる
+#   - 板が取れない場合は5秒待って1回再取得する
 #   - 同一銘柄の当日発注済みカウントはデフォルト2回まで許可する
 #   - 方向確認の再帰/例外は fail-open しない。安全側NGにする。
 #   - pending化した候補銘柄をPUSH protectedへ渡し、A/B両面登録されやすくする。
@@ -71,6 +71,10 @@ def install() -> bool:
     _setdefault_env("RANGE_5M_FILTER_NG_FAIL_OPEN", "1")
     _setdefault_env("PENDING_PROTECT_PUSH_SYMBOLS", "1")
     _setdefault_env("PENDING_PROTECT_PUSH_MAX_KEEP", "50")
+    _setdefault_env("ENTRY_BOARD_RETRY_ENABLED", "1")
+    _setdefault_env("ENTRY_BOARD_RETRY_WAIT_SEC", "5.0")
+    _setdefault_env("ENTRY_BOARD_RETRY_COUNT", "1")
+    _setdefault_env("ENTRY_BOARD_RETRY_SYMBOLS_ONLY_PENDING", "0")
 
     # 方向確認は fail-open しない。明示的に安全側NGへ固定する。
     _force_env("ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN", "0")
@@ -136,15 +140,27 @@ def install() -> bool:
     except Exception:
         logger.exception("[ENTRY FINAL FILTER FAILOPEN] pending protect push patch install failed")
 
+    # --------------------------------------------------------
+    # 4) 板が無い場合、A/Bローテーションを考慮して5秒後に再取得
+    # --------------------------------------------------------
+    try:
+        from core.startup.board_retry_patch import install as install_board_retry
+        ok = install_board_retry()
+        logger.warning("[ENTRY FINAL FILTER FAILOPEN] board retry patch installed=%s", ok)
+    except Exception:
+        logger.exception("[ENTRY FINAL FILTER FAILOPEN] board retry patch install failed")
+
     _PATCHED = True
     logger.warning(
-        "[ENTRY FINAL FILTER FAILOPEN] installed range_fail_open=%s direction_recursion_fail_open=%s direction_error_fail_open=%s allow_without_board=%s max_symbol_entries=%s pending_protect_push=%s",
+        "[ENTRY FINAL FILTER FAILOPEN] installed range_fail_open=%s direction_recursion_fail_open=%s direction_error_fail_open=%s allow_without_board=%s max_symbol_entries=%s pending_protect_push=%s board_retry=%s board_retry_wait=%s",
         _env_bool("RANGE_5M_FILTER_NG_FAIL_OPEN", True),
         _env_bool("ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN", False),
         _env_bool("ENTRY_DIRECTION_CONFIRM_ERROR_FAIL_OPEN", False),
         os.getenv("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"),
         os.getenv("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL"),
         os.getenv("PENDING_PROTECT_PUSH_SYMBOLS"),
+        os.getenv("ENTRY_BOARD_RETRY_ENABLED"),
+        os.getenv("ENTRY_BOARD_RETRY_WAIT_SEC"),
     )
     return True
 
