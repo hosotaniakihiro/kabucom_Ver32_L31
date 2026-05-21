@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/final_entry_safety_guard_patch.py
-# Version: Ver01-FINAL-ENTRY-SAFETY-GUARD
+# Version: Ver02-FINAL-ENTRY-SAFETY-GUARD-FAIL-CLOSED-BOARD
 # ------------------------------------------------------------
 # entry_controller._execute_best_candidate を runtime patch し、
 # 発注直前の最終安全ガードを追加する。
@@ -12,6 +12,11 @@
 #   5. エントリー時間帯ガード
 #   6. スプレッド・板薄ガード
 #   7. 逆張り例外の半数量化
+#
+# Ver02:
+#   - 板が取れない場合に通していた BOARD_SKIP を廃止
+#   - 既定で bid/ask missing は発注停止
+#   - ENTRY_ALLOW_ENTRY_WITHOUT_BOARD=1 の場合のみ旧動作に戻せる
 #
 # 優先度3「当日損失上限で新規停止」は、ユーザー要望により未実装。
 # ============================================================
@@ -188,7 +193,6 @@ def _liquidity_guard(row: dict, symbol: str, side: str) -> bool:
     min_volume = _env_float("ENTRY_MIN_VOLUME", 30000.0)
     min_turnover = _env_float("ENTRY_MIN_TURNOVER", 10000000.0)
 
-    # データが無い場合は止める。出来高が取れていない銘柄の発注を防ぐ。
     if volume <= 0:
         _log_ng("volume_missing", symbol, side, volume=volume, turnover=turnover, close=close)
         return False
@@ -222,7 +226,6 @@ def _same_symbol_loss_guard(symbol: str, side: str) -> bool:
     except Exception:
         return True
 
-    # 明示的なロック集合があれば優先
     for attr in (
         "same_symbol_loss_locked_set",
         "entry_loss_locked_symbols",
@@ -237,7 +240,6 @@ def _same_symbol_loss_guard(symbol: str, side: str) -> bool:
         except Exception:
             pass
 
-    # 銘柄別の当日実現損益が負なら止める。
     maps = (
         "recent_realized_pnl_map",
         "daily_symbol_realized_pnl_map",
@@ -253,7 +255,6 @@ def _same_symbol_loss_guard(symbol: str, side: str) -> bool:
             _log_ng("same_symbol_realized_loss", symbol, side, source=attr, pnl=pnl)
             return False
 
-    # 負け回数が指定以上なら止める。
     count_maps = (
         "symbol_loss_count_map",
         "daily_symbol_loss_count_map",
@@ -281,7 +282,6 @@ def _recent_reverse_guard(row: dict, symbol: str, side: str) -> bool:
     pc10 = _safe_float(_first(row, ("price_change_10", "change_10", "ret_10", "return_10", "price_change_10s", "change_10s"), 0.0), 0.0)
     slope = _safe_float(_first(row, ("slope_5s", "recent_slope", "slope_atr_scaled", "score_slope", "slope"), 0.0), 0.0)
 
-    # 0.01形式なら%へ、1.0形式ならそのまま%として扱う。
     def _as_pct(v: float) -> float:
         if abs(v) <= 1.0:
             return v * 100.0
@@ -299,7 +299,6 @@ def _recent_reverse_guard(row: dict, symbol: str, side: str) -> bool:
     sell_max_10 = _env_float("ENTRY_SELL_MAX_RECENT_10_CHANGE_PCT", 0.15)
     max_bad_slope = _env_float("ENTRY_RECENT_REVERSE_MAX_BAD_SLOPE", 0.12)
 
-    # データがまったく無い場合は止めない。
     if pc3 == 0 and pc5 == 0 and pc10 == 0 and slope == 0:
         logger.info("[FINAL ENTRY SAFETY GUARD] RECENT_REVERSE_SKIP symbol=%s side=%s reason=no_recent_data", symbol, side)
         return True
@@ -340,8 +339,8 @@ def _try_get_bid_ask_from_api(symbol: str) -> tuple[float, float, float, float]:
         res = get_latest_bid_ask(symbol)
         if isinstance(res, dict):
             return (
-                _safe_float(res.get("bid") or res.get("best_bid") or res.get("BidPrice"), 0.0),
-                _safe_float(res.get("ask") or res.get("best_ask") or res.get("AskPrice"), 0.0),
+                _safe_float(res.get("bid") or res.get("best_bid") or res.get("BidPrice") or res.get("bid_price"), 0.0),
+                _safe_float(res.get("ask") or res.get("best_ask") or res.get("AskPrice") or res.get("ask_price"), 0.0),
                 _safe_float(res.get("bid_qty") or res.get("BidQty") or res.get("bid_volume"), 0.0),
                 _safe_float(res.get("ask_qty") or res.get("AskQty") or res.get("ask_volume"), 0.0),
             )
@@ -356,7 +355,6 @@ def _board_guard(row: dict, symbol: str, side: str) -> bool:
     if not _env_bool("ENTRY_BOARD_GUARD_ENABLED", True):
         return True
 
-    close = _safe_float(_first(row, ("close", "close_price", "price", "current_price"), 0.0), 0.0)
     bid, ask, bid_qty, ask_qty = _extract_bid_ask_from_row(row)
 
     if bid <= 0 or ask <= 0:
@@ -366,10 +364,12 @@ def _board_guard(row: dict, symbol: str, side: str) -> bool:
         bid_qty = bid_qty or bidq2
         ask_qty = ask_qty or askq2
 
-    # 板が取れない場合は止めすぎ防止で通す。send_order側の reference_price 防衛に任せる。
     if bid <= 0 or ask <= 0:
-        logger.info("[FINAL ENTRY SAFETY GUARD] BOARD_SKIP symbol=%s side=%s reason=bid_ask_missing bid=%s ask=%s", symbol, side, bid, ask)
-        return True
+        if _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", False):
+            logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_MISSING_ALLOW symbol=%s side=%s bid=%s ask=%s", symbol, side, bid, ask)
+            return True
+        _log_ng("board_missing", symbol, side, bid=bid, ask=ask, message="板が取れないため新規エントリー停止")
+        return False
 
     mid = (bid + ask) / 2.0
     spread_pct = ((ask - bid) / mid) * 100.0 if mid > 0 else 999.0
@@ -503,7 +503,7 @@ def install() -> bool:
         _INSTALLED = True
 
         logger.warning(
-            "[FINAL ENTRY SAFETY GUARD] installed liquidity=%s min_volume=%.0f min_turnover=%.0f same_symbol_loss=%s recent_reverse=%s time_guard=%s board_guard=%s contrarian_half=%s qty_ratio=%.2f daily_loss_guard=NOT_INSTALLED_BY_REQUEST",
+            "[FINAL ENTRY SAFETY GUARD] installed liquidity=%s min_volume=%.0f min_turnover=%.0f same_symbol_loss=%s recent_reverse=%s time_guard=%s board_guard=%s allow_without_board=%s contrarian_half=%s qty_ratio=%.2f daily_loss_guard=NOT_INSTALLED_BY_REQUEST",
             _env_bool("ENTRY_FINAL_LIQUIDITY_GUARD_ENABLED", True),
             _env_float("ENTRY_MIN_VOLUME", 30000.0),
             _env_float("ENTRY_MIN_TURNOVER", 10000000.0),
@@ -511,6 +511,7 @@ def install() -> bool:
             _env_bool("ENTRY_RECENT_REVERSE_GUARD_ENABLED", True),
             _env_bool("ENTRY_TIME_GUARD_ENABLED", True),
             _env_bool("ENTRY_BOARD_GUARD_ENABLED", True),
+            _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", False),
             _env_bool("ENTRY_CONTRARIAN_HALF_SIZE_ENABLED", True),
             _env_float("ENTRY_CONTRARIAN_QTY_RATIO", 0.5),
         )
