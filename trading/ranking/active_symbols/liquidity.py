@@ -1,11 +1,16 @@
 # ============================================================
 # File   : trading/ranking/active_symbols/liquidity.py
-# Version: Ver1.2-ACTIVE-SYMBOLS-MAX-PRICE-GUARD
+# Version: Ver1.3-ACTIVE-SYMBOLS-PREMARKET-PRICE-GUARD
 # ------------------------------------------------------------
 # Purpose:
 #   - PUSH登録候補の流動性/価格フィルタ
 #   - 低位株や極端に流動性が低い銘柄を除外する
-#   - 監視銘柄を5000円以下に制限する
+#   - 監視銘柄を価格条件内に制限する
+#
+# Ver1.3:
+#   - premarket_mode でも最終価格ガードを完全スキップしない。
+#   - 価格情報が取れる銘柄は MIN_PRICE / MAX_PRICE を必ず適用する。
+#   - 価格情報が本当に無い銘柄だけ fail-open で残す。
 # ============================================================
 
 from __future__ import annotations
@@ -50,6 +55,8 @@ def _has_usable_liquidity_info(info: Optional[Dict[str, Any]]) -> bool:
             "price",
             "close",
             "last_price",
+            "close_price",
+            "現在値",
             "trading_value",
             "turnover",
             "trading_volume",
@@ -60,7 +67,7 @@ def _has_usable_liquidity_info(info: Optional[Dict[str, Any]]) -> bool:
 
 
 def _get_price(info: Dict[str, Any]) -> float:
-    for k in ("current_price", "price", "close", "last_price"):
+    for k in ("current_price", "price", "close", "last_price", "close_price", "現在値"):
         v = to_float(info.get(k), 0.0)
         if v > 0:
             return v
@@ -203,14 +210,6 @@ def final_guard_min_price(
 ) -> List[str]:
     items = dedupe_keep_order(symbols)
 
-    if premarket_mode:
-        logger.info(
-            "[ACTIVE FINAL PRICE GUARD] skipped premarket_mode before=%d after=%d",
-            len(items),
-            len(items),
-        )
-        return items
-
     if not ENABLE_LIQUIDITY_FILTER:
         return items
 
@@ -220,6 +219,7 @@ def final_guard_min_price(
     kept: List[str] = []
     removed: List[str] = []
     missing_info: List[str] = []
+    price_guarded: List[str] = []
 
     for s in items:
         sym = normalize_symbol(s)
@@ -237,6 +237,14 @@ def final_guard_min_price(
             missing_info.append(sym)
             continue
 
+        assert info is not None
+        price = _get_price(info)
+        if price > 0:
+            price_guarded.append(sym)
+            if not _price_ok(price):
+                removed.append(sym)
+                continue
+
         if is_liquid_symbol(
             sym,
             liquidity_map=liquidity_map,
@@ -247,14 +255,16 @@ def final_guard_min_price(
         else:
             removed.append(sym)
 
-    if removed or missing_info:
+    if removed or missing_info or premarket_mode:
         logger.warning(
             "[ACTIVE FINAL PRICE GUARD] before=%d after=%d removed=%d missing_info_kept=%d "
-            "min_price=%.1f max_price=%.1f removed_head=%s missing_info_head=%s",
+            "premarket=%s price_guarded=%d min_price=%.1f max_price=%.1f removed_head=%s missing_info_head=%s",
             len(items),
             len(kept),
             len(removed),
             len(missing_info),
+            premarket_mode,
+            len(price_guarded),
             MIN_PRICE,
             MAX_PRICE,
             removed[:30],
@@ -262,9 +272,11 @@ def final_guard_min_price(
         )
     else:
         logger.info(
-            "[ACTIVE FINAL PRICE GUARD] before=%d after=%d removed=0 missing_info_kept=0 min_price=%.1f max_price=%.1f",
+            "[ACTIVE FINAL PRICE GUARD] before=%d after=%d removed=0 missing_info_kept=0 premarket=%s price_guarded=%d min_price=%.1f max_price=%.1f",
             len(items),
             len(kept),
+            premarket_mode,
+            len(price_guarded),
             MIN_PRICE,
             MAX_PRICE,
         )
