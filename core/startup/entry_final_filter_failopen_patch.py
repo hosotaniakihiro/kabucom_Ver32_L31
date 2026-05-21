@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/entry_final_filter_failopen_patch.py
-# Version: V1.0-RANGE5M-DIRECTION-FAILOPEN
+# Version: V1.1-BOARD-DAILY-RISK-RELAX
 # ------------------------------------------------------------
 # 【目的】
 #   候補・AI・pending までは通るのに、最後で全落ちする問題の緩和。
@@ -8,10 +8,14 @@
 # 【対象】
 #   - range_5m_filter が 5分足欠損/未完成で False を返すケース
 #   - entry_direction_confirm が RecursionError で fail-safe NG になるケース
+#   - final_entry_safety_guard の board_missing で全落ちするケース
+#   - SYMBOL_DAILY_ENTRY_LIMIT が 1回固定で強すぎるケース
 #
 # 【方針】
 #   - 5分足元フィルタNGは、発注停止ではなく既存の低変動ガード側に任せる
 #   - 再帰/例外は fail-open して、他の流動性・板・価格・信用ガードに任せる
+#   - 板が取れない場合は entry_order_builder / buy_sell_entry の reference_price に任せる
+#   - 同一銘柄の当日発注済みカウントはデフォルト2回まで許可する
 # ============================================================
 
 from __future__ import annotations
@@ -22,6 +26,17 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 _PATCHED = False
+
+
+def _setdefault_env(name: str, value: str) -> None:
+    """bat や .env で明示指定されていなければ安全側の緩和値を入れる。"""
+    try:
+        cur = os.getenv(name)
+        if cur is None or str(cur).strip() == "":
+            os.environ[name] = str(value)
+            logger.warning("[ENTRY FINAL FILTER FAILOPEN] env default set %s=%s", name, value)
+    except Exception:
+        pass
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -38,6 +53,14 @@ def install() -> bool:
     global _PATCHED
     if _PATCHED:
         return True
+
+    # 既存 runtime patch は判定時に os.getenv を読むため、ここでデフォルトを補完する。
+    # ユーザーが bat 側で明示指定している値は上書きしない。
+    _setdefault_env("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", "1")
+    _setdefault_env("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", "2")
+    _setdefault_env("ENTRY_COUNT_SENT_ORDER_AS_DAILY_ENTRY", "1")
+    _setdefault_env("RANGE_5M_FILTER_NG_FAIL_OPEN", "1")
+    _setdefault_env("ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN", "1")
 
     try:
         import trading.handlers.entry_controller as ec
@@ -108,9 +131,11 @@ def install() -> bool:
 
     _PATCHED = True
     logger.warning(
-        "[ENTRY FINAL FILTER FAILOPEN] installed range_fail_open=%s direction_recursion_fail_open=%s",
+        "[ENTRY FINAL FILTER FAILOPEN] installed range_fail_open=%s direction_recursion_fail_open=%s allow_without_board=%s max_symbol_entries=%s",
         _env_bool("RANGE_5M_FILTER_NG_FAIL_OPEN", True),
         _env_bool("ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN", True),
+        os.getenv("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"),
+        os.getenv("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL"),
     )
     return True
 
