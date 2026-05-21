@@ -1,21 +1,20 @@
 # ============================================================
 # File   : trading/summary/controller_enrich.py
-# Version: Ver01-SUMMARY-LATEST-RANKING-DAILY-MTF-ENRICH
+# Version: Ver02-SUMMARY-LATEST-RANKING-RANK-FALLBACK-FIX
 # ------------------------------------------------------------
 # Purpose:
 #   - summary_controller の latest DF に、表示/保存前の補強列を付与する
 #   - ranking_score / ranking_type / rank / change_rate / turnover を補完
 #   - daily MTF を表示/保存前にも merge する
 #
-# Notes:
-#   - main.py / main_database.py を止めずに動くよう、失敗時は元DFを返す
-#   - ranking は global_data の最新DFを優先し、無ければ当日 ranking DB を軽く読む
-#   - DBスキーマ差異・列名揺れを吸収する
+# Ver02:
+#   - ranking_snapshot_1min に rank_position 列があるが中身が空のケースで、
+#     rank 列を rank_position へ補完してから build_ranking_aggregate() に渡す。
+#   - これにより [RANKING_AGG] no rows after normalize を防ぐ。
 # ============================================================
 
 from __future__ import annotations
 
-import datetime as dt
 import logging
 import sqlite3
 from pathlib import Path
@@ -43,6 +42,25 @@ def _find_col(df: pd.DataFrame, names: Iterable[str]) -> Optional[str]:
         if hit is not None:
             return hit
     return None
+
+
+def _find_best_numeric_col(df: pd.DataFrame, names: Iterable[str]) -> Optional[str]:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+    best = None
+    best_nonnull = -1
+    for n in names:
+        c = _find_col(df, (n,))
+        if c is None:
+            continue
+        try:
+            nonnull = int(pd.to_numeric(df[c], errors="coerce").notna().sum())
+        except Exception:
+            nonnull = 0
+        if nonnull > best_nonnull:
+            best = c
+            best_nonnull = nonnull
+    return best
 
 
 def _symbol_series(s: pd.Series) -> pd.Series:
@@ -105,21 +123,16 @@ def attach_daily_mtf_for_display(df: pd.DataFrame, *, interval: int, context: st
         out = merge_daily_mtf_for_ai(out, source=f"SUMMARY_CONTROLLER_{context}_{interval}m")
 
         if isinstance(out, pd.DataFrame) and not out.empty:
+            score_mtf = _num(out.get("score_mtf", pd.Series(index=out.index)), 0.0)
             if "mtf_alignment" not in out.columns:
-                out["mtf_alignment"] = _num(out.get("score_mtf", pd.Series(index=out.index)), 0.0)
+                out["mtf_alignment"] = score_mtf
             else:
-                out["mtf_alignment"] = _fill_missing_or_zero(
-                    out["mtf_alignment"],
-                    _num(out.get("score_mtf", pd.Series(index=out.index)), 0.0),
-                )
+                out["mtf_alignment"] = _fill_missing_or_zero(out["mtf_alignment"], score_mtf)
 
             if "mtf_score" not in out.columns:
-                out["mtf_score"] = _num(out.get("score_mtf", pd.Series(index=out.index)), 0.0)
+                out["mtf_score"] = score_mtf
             else:
-                out["mtf_score"] = _fill_missing_or_zero(
-                    out["mtf_score"],
-                    _num(out.get("score_mtf", pd.Series(index=out.index)), 0.0),
-                )
+                out["mtf_score"] = _fill_missing_or_zero(out["mtf_score"], score_mtf)
 
         after_nonzero = int((_num(out.get("score_mtf", pd.Series(index=out.index))) != 0).sum()) if "score_mtf" in out.columns else 0
         logger.info(
@@ -147,11 +160,7 @@ def _get_ranking_df_from_global() -> pd.DataFrame:
         if isinstance(snapshot, list) and snapshot:
             return pd.DataFrame(snapshot)
 
-        for name in (
-            "latest_ranking_raw",
-            "latest_ranking_df",
-            "ranking_raw_df",
-        ):
+        for name in ("latest_ranking_raw", "latest_ranking_df", "ranking_raw_df"):
             df = getattr(global_data, name, None)
             if isinstance(df, pd.DataFrame) and not df.empty:
                 return df.copy()
@@ -170,7 +179,7 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
     return [str(r[1]) for r in cur.fetchall()]
 
 
-def _read_ranking_df_from_db(limit: int = 5000) -> pd.DataFrame:
+def _read_ranking_df_from_db(limit: int = 20000) -> pd.DataFrame:
     try:
         from ats.ats_ranking.db_path import get_usable_ranking_db_path
 
@@ -233,7 +242,7 @@ def _build_ranking_enrich_df(ranking_df: pd.DataFrame) -> pd.DataFrame:
     try:
         symbol_col = _find_col(ranking_df, ("symbol", "code", "stock_code", "Symbol"))
         type_col = _find_col(ranking_df, ("rank_type", "ranking_type", "type", "category", "ranking_name"))
-        rank_col = _find_col(ranking_df, ("rank_position", "ranking_position", "rank", "position", "順位"))
+        rank_col = _find_best_numeric_col(ranking_df, ("rank_position", "ranking_position", "rank", "position", "順位", "No"))
         if symbol_col is None:
             return pd.DataFrame()
 
@@ -253,9 +262,18 @@ def _build_ranking_enrich_df(ranking_df: pd.DataFrame) -> pd.DataFrame:
         else:
             work["rank"] = pd.to_numeric(work[rank_col], errors="coerce")
 
-        change_col = _find_col(work, ("change_rate", "chg", "change_pct", "騰落率", "rate"))
-        turnover_col = _find_col(work, ("turnover", "trading_value", "売買代金", "value", "Value"))
-        volume_col = _find_col(work, ("trading_volume", "volume", "売買高", "出来高", "TradingVolume"))
+        # build_ranking_aggregate は rank_position を優先して見るため、
+        # 既存の rank_position が空なら必ず rank で上書き補完する。
+        if "rank_position" not in work.columns:
+            work["rank_position"] = work["rank"]
+        else:
+            rp = pd.to_numeric(work["rank_position"], errors="coerce")
+            rk = pd.to_numeric(work["rank"], errors="coerce")
+            work["rank_position"] = rp.where(rp.notna(), rk)
+
+        change_col = _find_best_numeric_col(work, ("change_rate", "chg", "change_percentage", "change_pct", "騰落率", "rate"))
+        turnover_col = _find_best_numeric_col(work, ("turnover", "trading_value", "売買代金", "value", "Value"))
+        volume_col = _find_best_numeric_col(work, ("trading_volume", "volume", "売買高", "出来高", "TradingVolume"))
         market_col = _find_col(work, ("market", "market_type", "exchange", "Exchange", "exchange_name"))
 
         work["change_rate"] = pd.to_numeric(work[change_col], errors="coerce") if change_col else pd.NA
@@ -270,14 +288,8 @@ def _build_ranking_enrich_df(ranking_df: pd.DataFrame) -> pd.DataFrame:
             logger.exception("[SUMMARY ENRICH][RANKING] aggregate failed")
             agg = pd.DataFrame()
 
-        sort_cols = ["symbol"]
-        ascending = [True]
-        if "rank" in work.columns:
-            sort_cols.append("rank")
-            ascending.append(True)
-
         latest = (
-            work.sort_values(sort_cols, ascending=ascending, kind="mergesort")
+            work.sort_values(["symbol", "rank"], ascending=[True, True], kind="mergesort")
             .drop_duplicates("symbol", keep="first")
             .copy()
         )
@@ -296,7 +308,16 @@ def _build_ranking_enrich_df(ranking_df: pd.DataFrame) -> pd.DataFrame:
         else:
             keep["ranking_score_total"] = 0.0
 
-        keep["ranking_score"] = pd.to_numeric(keep.get("ranking_score_total", 0.0), errors="coerce").fillna(0.0)
+        keep["ranking_score_total"] = pd.to_numeric(keep.get("ranking_score_total", 0.0), errors="coerce").fillna(0.0)
+        keep["ranking_score"] = keep["ranking_score_total"]
+
+        logger.info(
+            "[SUMMARY ENRICH][RANKING] enrich built rows=%s score_nonzero=%s rank_nonnull=%s type_nonempty=%s",
+            len(keep),
+            int((keep["ranking_score"] != 0).sum()) if "ranking_score" in keep.columns else 0,
+            int(pd.to_numeric(keep.get("rank", pd.Series(dtype="float64")), errors="coerce").notna().sum()) if "rank" in keep.columns else 0,
+            int(keep.get("ranking_type", pd.Series(dtype="object")).astype(str).str.strip().ne("").sum()) if "ranking_type" in keep.columns else 0,
+        )
         return keep.drop_duplicates("symbol", keep="first")
 
     except Exception:
@@ -344,7 +365,7 @@ def attach_ranking_for_display(df: pd.DataFrame, *, interval: int, context: str)
         drop_cols = [c for c in merged.columns if c.endswith("__rank_src")]
         merged = merged.drop(columns=drop_cols, errors="ignore")
 
-        hit = int(merged["ranking_score_total"].notna().sum()) if "ranking_score_total" in merged.columns else 0
+        hit = int(pd.to_numeric(merged.get("rank", pd.Series(index=merged.index)), errors="coerce").notna().sum()) if "rank" in merged.columns else 0
         after_score_nonzero = int((_num(merged.get("ranking_score", pd.Series(index=merged.index))) != 0).sum()) if "ranking_score" in merged.columns else 0
         logger.info(
             "[SUMMARY ENRICH][RANKING] interval=%s context=%s rows=%s hit=%s ranking_score_nonzero %s->%s",
