@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/entry_mtf_short_required_daily_optional_patch.py
-# Version: V1.1-SHORT-MTF-BACKFILL-FROM-GLOBAL-SUMMARY
+# Version: V1.2-SHORT-MTF-BACKFILL-GC-AND-SUMMARY-DB
 # ------------------------------------------------------------
 # 【目的】
 #   日足MA/日足MTF 1つの逆行だけでエントリー不可になる問題を防ぐ。
@@ -10,11 +10,14 @@
 #   - 1分・3分・5分の slope_atr_scaled_* を必須にする
 #   - 日足MTFはスコア加点・参考情報として残すが、単独では発注停止しない
 #
-# V1.1:
+# V1.2:
 #   - entry_row に slope_1m / slope_3m / slope_5m が無い場合、
-#     global_context の push merged summary / summary history から補完する
-#   - 現在の row.interval と一致する足は slope_atr_scaled / slope からも補完する
-#   - これにより SHORT_MTF_SLOPE_MISSING で不必要に全落ちする問題を緩和
+#     1) entry_row
+#     2) row.interval の汎用 slope
+#     3) global_context の merged summary / history
+#     4) summaryYYYYMMDD.db の stock_summary_1min/3min/5min
+#     の順で補完する。
+#   - GCで 3分/5分が empty の瞬間でも、DBに保存済みなら補完できる。
 # ============================================================
 
 from __future__ import annotations
@@ -22,12 +25,15 @@ from __future__ import annotations
 import logging
 import math
 import os
+import sqlite3
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 _PATCHED = False
+_DB_CACHE: dict[tuple[str, int, str], Optional[float]] = {}
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -127,14 +133,12 @@ def _slope_from_summary_row(row: dict) -> Optional[float]:
 
 
 def _get_gc_summary_row(symbol: str, tf: int) -> dict:
-    """global_context から該当銘柄の最新summary行を取得する。"""
     try:
         from core.global_context.context import global_context as GC
     except Exception:
         return {}
 
-    # 表示用最新summaryを優先。無ければ履歴キャッシュ。
-    for getter_name in ("get_push_merged_summary", "get_merged_summary", "get_summary_history"):
+    for getter_name in ("get_push_merged_summary", "get_merged_summary", "get_summary_history", "get_push_summary"):
         try:
             getter = getattr(GC, getter_name, None)
             if not callable(getter):
@@ -151,11 +155,69 @@ def _get_gc_summary_row(symbol: str, tf: int) -> dict:
     return {}
 
 
+def _summary_db_path() -> str:
+    ymd = os.getenv("KABU_TODAY") or os.getenv("TARGET_DATE") or datetime.now().strftime("%Y%m%d")
+    root = os.getenv("SUMMARY_DB_DIR") or r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary"
+    return os.path.join(root, f"summary{ymd}.db")
+
+
+def _table_for_tf(tf: int) -> str:
+    return f"stock_summary_{int(tf)}min"
+
+
+def _get_db_short_slope(symbol: str, tf: int) -> Optional[float]:
+    if not _env_bool("ENTRY_SHORT_MTF_DB_BACKFILL", True):
+        return None
+
+    sym = _norm_symbol(symbol)
+    today = datetime.now().strftime("%Y%m%d")
+    key = (sym, int(tf), today)
+    if key in _DB_CACHE:
+        return _DB_CACHE[key]
+
+    db = _summary_db_path()
+    table = _table_for_tf(tf)
+    val: Optional[float] = None
+
+    try:
+        if not os.path.exists(db):
+            _DB_CACHE[key] = None
+            return None
+
+        sql = f"""
+            SELECT slope_atr_scaled, slope, score_slope, datetime
+              FROM {table}
+             WHERE CAST(symbol AS TEXT)=?
+             ORDER BY datetime DESC
+             LIMIT 1
+        """
+        with sqlite3.connect(db, timeout=1.0) as conn:
+            conn.execute("PRAGMA query_only=ON")
+            row = conn.execute(sql, (sym,)).fetchone()
+
+        if row:
+            for x in (row[0], row[1], row[2]):
+                val = _safe_float_or_none(x)
+                if val is not None:
+                    break
+            logger.warning(
+                "[SHORT MTF GUARD] DB backfill symbol=%s tf=%s slope=%s dt=%s db=%s",
+                sym,
+                tf,
+                val,
+                row[3],
+                db,
+            )
+    except Exception as e:
+        logger.debug("[SHORT MTF GUARD] DB backfill failed symbol=%s tf=%s err=%s", sym, tf, e, exc_info=False)
+
+    _DB_CACHE[key] = val
+    return val
+
+
 def _resolve_short_slope(row: Dict[str, Any], *, symbol: str, tf: int) -> Optional[float]:
-    """entry_row → 現在足 → global_context の順で 1/3/5分 slope を補完する。"""
     tf_s = str(tf)
 
-    # 1) 明示列を優先
     explicit = _safe_float_or_none(
         _get(
             row,
@@ -168,18 +230,20 @@ def _resolve_short_slope(row: Dict[str, Any], *, symbol: str, tf: int) -> Option
     if explicit is not None:
         return explicit
 
-    # 2) row.interval が該当足なら、汎用 slope を使う
     row_interval = _safe_int(_get(row, "interval"), 0)
     if row_interval == tf:
         cur = _safe_float_or_none(_get(row, "slope_atr_scaled", "slope", "score_slope", "disp_slope"))
         if cur is not None:
             return cur
 
-    # 3) global_context の該当足summaryから補完
     gc_row = _get_gc_summary_row(symbol, tf)
     val = _slope_from_summary_row(gc_row)
     if val is not None:
         return val
+
+    db_val = _get_db_short_slope(symbol, tf)
+    if db_val is not None:
+        return db_val
 
     return None
 
@@ -215,7 +279,8 @@ def _short_mtf_direction_guard(entry_row: Dict[str, Any], *, symbol: str, side: 
             missing=missing,
             slopes=slopes,
             daily_mtf_optional=_env_bool("ENTRY_DAILY_MTF_OPTIONAL", True),
-            note="short slopes were not found in entry_row or global_context summaries",
+            db_backfill=_env_bool("ENTRY_SHORT_MTF_DB_BACKFILL", True),
+            note="short slopes were not found in entry_row, global_context, or summary DB",
         )
 
     available = {k: v for k, v in slopes.items() if v is not None}
@@ -254,11 +319,12 @@ def _short_mtf_direction_guard(entry_row: Dict[str, Any], *, symbol: str, side: 
             )
 
     logger.warning(
-        "[SHORT MTF GUARD] OK symbol=%s side=%s slopes=%s daily_mtf_optional=%s",
+        "[SHORT MTF GUARD] OK symbol=%s side=%s slopes=%s daily_mtf_optional=%s db_backfill=%s",
         sym,
         side_u,
         slopes,
         _env_bool("ENTRY_DAILY_MTF_OPTIONAL", True),
+        _env_bool("ENTRY_SHORT_MTF_DB_BACKFILL", True),
     )
     return None
 
@@ -276,44 +342,46 @@ def install() -> bool:
     os.environ.setdefault("ENTRY_SHORT_MTF_REQUIRE_ALL", "1")
     os.environ.setdefault("ENTRY_SHORT_MTF_SLOPE_EPS", "0.0")
     os.environ.setdefault("ENTRY_DAILY_MTF_OPTIONAL", "1")
+    os.environ.setdefault("ENTRY_SHORT_MTF_DB_BACKFILL", "1")
 
     ok_any = False
 
     try:
         import trading.handlers.entry_order_builder as eob
         old = getattr(eob, "_summary_mtf_direction_guard", None)
-        if callable(old) and not getattr(old, "_short_required_daily_optional_v11", False):
-            _short_mtf_direction_guard._short_required_daily_optional_v11 = True  # type: ignore[attr-defined]
+        if callable(old) and not getattr(old, "_short_required_daily_optional_v12", False):
+            _short_mtf_direction_guard._short_required_daily_optional_v12 = True  # type: ignore[attr-defined]
             _short_mtf_direction_guard._original = old  # type: ignore[attr-defined]
             eob._summary_mtf_direction_guard = _short_mtf_direction_guard
             ok_any = True
-            logger.warning("[SHORT MTF GUARD] patched entry_order_builder._summary_mtf_direction_guard v1.1")
+            logger.warning("[SHORT MTF GUARD] patched entry_order_builder._summary_mtf_direction_guard v1.2")
     except Exception:
         logger.exception("[SHORT MTF GUARD] patch entry_order_builder failed")
 
     try:
         import core.startup.entry_limit_passive_runtime_patch as elp
         old2 = getattr(elp, "_summary_ai_strict_guard", None)
-        if callable(old2) and not getattr(old2, "_short_required_daily_optional_v11", False):
+        if callable(old2) and not getattr(old2, "_short_required_daily_optional_v12", False):
             def _patched_summary_ai_strict_guard(*, symbol: str, side: str, row: dict, detail: dict):
                 return _strict_guard_short_mtf_only(symbol=symbol, side=side, row=row, detail=detail)
 
-            _patched_summary_ai_strict_guard._short_required_daily_optional_v11 = True  # type: ignore[attr-defined]
+            _patched_summary_ai_strict_guard._short_required_daily_optional_v12 = True  # type: ignore[attr-defined]
             _patched_summary_ai_strict_guard._original = old2  # type: ignore[attr-defined]
             elp._summary_ai_strict_guard = _patched_summary_ai_strict_guard
             ok_any = True
-            logger.warning("[SHORT MTF GUARD] patched entry_limit_passive_runtime_patch._summary_ai_strict_guard v1.1")
+            logger.warning("[SHORT MTF GUARD] patched entry_limit_passive_runtime_patch._summary_ai_strict_guard v1.2")
     except Exception:
         logger.exception("[SHORT MTF GUARD] patch entry_limit_passive_runtime_patch failed")
 
     _PATCHED = bool(ok_any)
     logger.warning(
-        "[SHORT MTF GUARD] installed=%s required=%s require_all=%s eps=%s daily_optional=%s backfill_from_gc=True",
+        "[SHORT MTF GUARD] installed=%s required=%s require_all=%s eps=%s daily_optional=%s backfill_from_gc=True db_backfill=%s",
         _PATCHED,
         os.getenv("ENTRY_SHORT_MTF_REQUIRED"),
         os.getenv("ENTRY_SHORT_MTF_REQUIRE_ALL"),
         os.getenv("ENTRY_SHORT_MTF_SLOPE_EPS"),
         os.getenv("ENTRY_DAILY_MTF_OPTIONAL"),
+        os.getenv("ENTRY_SHORT_MTF_DB_BACKFILL"),
     )
     return _PATCHED
 
