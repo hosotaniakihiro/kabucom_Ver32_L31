@@ -1,18 +1,23 @@
 # ============================================================
 # File   : trading/push/push_stream/monitor.py
-# Version: Ver1.1-PUSH-STREAM-MONITOR-FLUSH-STALL-DETECT
+# Version: Ver1.2-AUTO-RECOVER-FLUSH-WORKER
 # ------------------------------------------------------------
 # PUSH監視ログ。
 #
 # Ver1.1:
 #   - queue が溜まっているのに total_flushed=0 / last_flush=None の状態をERROR化
 #   - flush thread alive / stream_writer 有無をログへ追加
-#   - サマリー遅延の原因になりやすい writer停止を早期発見する
+#
+# Ver1.2:
+#   - flush_alive=False かつ queue>0 の場合、flush worker を自動再起動
+#   - writer_ready=False の場合でも writers._ensure_stream_writer() に任せて遅延復旧
 # ============================================================
 
 from __future__ import annotations
 
 import logging
+import os
+import threading
 import time
 
 from .constants import MONITOR_INTERVAL_SEC
@@ -23,10 +28,57 @@ from .transport import _is_ws_alive
 logger = logging.getLogger(__name__)
 
 
+def _env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok"}
+    except Exception:
+        return bool(default)
+
+
 def _thread_alive(th) -> bool:
     try:
         return bool(th and th.is_alive())
     except Exception:
+        return False
+
+
+def _recover_flush_worker_if_needed(*, queue_size: int, flush_alive: bool, writer_ready: bool, stall_count: int) -> bool:
+    """PUSH受信はあるがflush workerが死んでいる場合に再起動する。"""
+    if not _env_bool("PUSH_STREAM_AUTO_RECOVER_FLUSH", True):
+        return False
+    if queue_size <= 0:
+        return False
+    if flush_alive:
+        return False
+    try:
+        from .writers import _flush_worker, _ensure_stream_writer
+
+        writer = getattr(state, "_stream_writer", None)
+        if writer is None:
+            try:
+                writer = _ensure_stream_writer()
+            except Exception:
+                logger.exception("[PUSH MONITOR][AUTO RECOVER] ensure stream writer failed")
+                writer = None
+
+        th = threading.Thread(target=_flush_worker, name="push-flush-worker-auto-recover", daemon=True)
+        state._flush_thread = th
+        th.start()
+        _safe_set_runtime("push_writer_running", True)
+        _safe_set_runtime("push_flush_auto_recovered", True)
+        logger.warning(
+            "[PUSH MONITOR][AUTO RECOVER] flush worker restarted queue=%d writer_ready_before=%s writer_now=%s stall_count=%d",
+            queue_size,
+            writer_ready,
+            writer is not None,
+            stall_count,
+        )
+        return True
+    except Exception:
+        logger.exception("[PUSH MONITOR][AUTO RECOVER] failed queue=%d", queue_size)
         return False
 
 
@@ -61,7 +113,6 @@ def _monitor_worker() -> None:
                 _safe_iso(state._last_flush_at),
             )
 
-            # 受信しているのにDB flushが一度も成功していない状態を強く検知。
             if queue_size > 0 and state._total_received > 0 and state._total_flushed <= 0:
                 stall_count += 1
                 _safe_set_runtime("push_flush_stalled", True)
@@ -77,6 +128,12 @@ def _monitor_worker() -> None:
                     _safe_iso(state._last_message_at),
                     _safe_iso(state._last_flush_at),
                 )
+                _recover_flush_worker_if_needed(
+                    queue_size=queue_size,
+                    flush_alive=flush_alive,
+                    writer_ready=writer_ready,
+                    stall_count=stall_count,
+                )
             else:
                 stall_count = 0
                 _safe_set_runtime("push_flush_stalled", False)
@@ -87,3 +144,6 @@ def _monitor_worker() -> None:
         time.sleep(MONITOR_INTERVAL_SEC)
 
     logger.info("[push_stream] monitor worker stopped")
+
+
+__all__ = ["_monitor_worker"]
