@@ -1,9 +1,16 @@
 # ============================================================
 # File   : core/startup/summary_multiframe_startup_catchup_patch.py
-# Version: V1.2-RUN-INDICATOR-FILL-AFTER-CATCHUP
+# Version: V1.3-DB-LOCK-RETRY-SKIP-IF-BUSY
 # ------------------------------------------------------------
 # 起動時にDB内の1分足サマリーから、3分足・5分足サマリーを差分再集計する。
 # その後、3分足/5分足の rsi/macd/signal/ma75/score 等を補完する。
+#
+# V1.3:
+#   - NAS/SQLiteの database is locked 対策
+#   - busy_timeout 30秒既定
+#   - UPSERTをチャンク分割
+#   - locked/busy時 rollback + retry
+#   - startup中にDBが忙しい場合は全体停止ではなく interval単位でskip可能
 # ============================================================
 
 from __future__ import annotations
@@ -52,6 +59,32 @@ def _env_float(name: str, default: float) -> float:
         return float(v)
     except Exception:
         return float(default)
+
+
+def _is_sqlite_busy_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "database is locked" in msg or "database is busy" in msg or "locked" in msg
+
+
+def _safe_rollback(conn: sqlite3.Connection) -> None:
+    try:
+        conn.rollback()
+    except Exception:
+        logger.debug("[SUMMARY MTF CATCHUP] rollback failed", exc_info=True)
+
+
+def _apply_sqlite_pragmas(conn: sqlite3.Connection) -> None:
+    busy_ms = int(_env_float("SUMMARY_MTF_CATCHUP_BUSY_TIMEOUT_MS", 30000))
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        logger.debug("[SUMMARY MTF CATCHUP] PRAGMA journal_mode=WAL failed", exc_info=True)
+    try:
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute(f"PRAGMA busy_timeout={busy_ms}")
+    except Exception:
+        logger.debug("[SUMMARY MTF CATCHUP] PRAGMA setup failed", exc_info=True)
 
 
 def _summary_db_path() -> str:
@@ -277,6 +310,12 @@ def _aggregate(rows: list[tuple[Any, ...]], interval: int, include_current_parti
     return out
 
 
+def _chunked(vals: list[tuple[Any, ...]], chunk_size: int) -> Iterable[list[tuple[Any, ...]]]:
+    n = max(1, int(chunk_size or 1))
+    for i in range(0, len(vals), n):
+        yield vals[i:i + n]
+
+
 def _upsert(conn: sqlite3.Connection, table: str, cols: list[str], rows: list[dict[str, Any]]) -> int:
     if not rows:
         return 0
@@ -303,8 +342,43 @@ def _upsert(conn: sqlite3.Connection, table: str, cols: list[str], rows: list[di
         ON CONFLICT({conflict}) DO UPDATE SET {update_sql}
     """
     vals = [tuple(r.get(c) for c in writable) for r in rows]
-    conn.executemany(sql, vals)
-    return len(vals)
+
+    retry_count = max(1, _env_int("SUMMARY_MTF_CATCHUP_UPSERT_RETRY_COUNT", 3))
+    sleep_base = max(0.05, _env_float("SUMMARY_MTF_CATCHUP_UPSERT_RETRY_SLEEP_SEC", 0.5))
+    chunk_size = max(1, _env_int("SUMMARY_MTF_CATCHUP_UPSERT_CHUNK_SIZE", 500))
+    skip_if_busy = _env_bool("SUMMARY_MTF_CATCHUP_SKIP_IF_BUSY", True)
+    total = 0
+
+    for chunk_no, chunk in enumerate(_chunked(vals, chunk_size), start=1):
+        last_err: sqlite3.OperationalError | None = None
+        for attempt in range(1, retry_count + 1):
+            try:
+                conn.executemany(sql, chunk)
+                total += len(chunk)
+                break
+            except sqlite3.OperationalError as e:
+                last_err = e
+                _safe_rollback(conn)
+                if not _is_sqlite_busy_error(e):
+                    raise
+                if attempt >= retry_count:
+                    if skip_if_busy:
+                        logger.warning(
+                            "[SUMMARY MTF CATCHUP] upsert skip busy table=%s chunk=%s rows=%s attempts=%s err=%s",
+                            table, chunk_no, len(chunk), retry_count, e,
+                        )
+                        return total
+                    raise
+                sleep_sec = sleep_base * attempt
+                logger.warning(
+                    "[SUMMARY MTF CATCHUP] upsert busy retry table=%s chunk=%s rows=%s attempt=%s/%s sleep=%.2fs err=%s",
+                    table, chunk_no, len(chunk), attempt, retry_count, sleep_sec, e,
+                )
+                time.sleep(sleep_sec)
+        else:
+            if last_err is not None:
+                raise last_err
+    return total
 
 
 def _read_recent_from_db(conn: sqlite3.Connection, table: str, cols: list[str], interval: int, bars: int) -> list[dict[str, Any]]:
@@ -319,10 +393,17 @@ def _read_recent_from_db(conn: sqlite3.Connection, table: str, cols: list[str], 
     dtexpr = dtc if dtc else f"({datec} || ' ' || {timec})"
     lookback_min = max(interval * bars + 30, interval * bars)
     since = (dt.datetime.now() - dt.timedelta(minutes=lookback_min)).strftime("%Y-%m-%d %H:%M:%S")
-    rows = conn.execute(
-        f"SELECT CAST({sym} AS TEXT), {dtexpr}, {cl}, {vol if vol else '0'} FROM {table} WHERE {dtexpr} >= ? ORDER BY {dtexpr} DESC LIMIT ?",
-        (since, max(1000, bars * 200)),
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            f"SELECT CAST({sym} AS TEXT), {dtexpr}, {cl}, {vol if vol else '0'} FROM {table} WHERE {dtexpr} >= ? ORDER BY {dtexpr} DESC LIMIT ?",
+            (since, max(1000, bars * 200)),
+        ).fetchall()
+    except sqlite3.OperationalError as e:
+        if _is_sqlite_busy_error(e) and _env_bool("SUMMARY_MTF_CATCHUP_SKIP_IF_BUSY", True):
+            logger.warning("[SUMMARY MTF CATCHUP] read recent skipped busy table=%s err=%s", table, e)
+            _safe_rollback(conn)
+            return []
+        raise
     return [{"symbol": _norm_symbol(r[0]), "datetime": str(r[1]), "close": _f(r[2], 0.0), "volume": _f(r[3], 0.0)} for r in rows]
 
 
@@ -345,6 +426,8 @@ def run_catchup(*, reason: str = "manual") -> dict[str, Any]:
     extra_min = _env_int("SUMMARY_MTF_CATCHUP_EXTRA_MINUTES", 30)
     max_rows = _env_int("SUMMARY_MTF_CATCHUP_MAX_ROWS", 80000)
     include_partial = _env_bool("SUMMARY_MTF_CATCHUP_INCLUDE_CURRENT_PARTIAL", True)
+    timeout_sec = max(5.0, _env_float("SUMMARY_MTF_CATCHUP_SQLITE_TIMEOUT", 30.0))
+    busy_ms = int(_env_float("SUMMARY_MTF_CATCHUP_BUSY_TIMEOUT_MS", 30000))
     result: dict[str, Any] = {"ok": False, "path": path, "intervals": intervals, "reason": reason, "details": {}}
 
     if not Path(path).exists():
@@ -353,8 +436,16 @@ def run_catchup(*, reason: str = "manual") -> dict[str, Any]:
         return result
 
     try:
-        with sqlite3.connect(path, timeout=_env_float("SUMMARY_MTF_CATCHUP_SQLITE_TIMEOUT", 5.0)) as conn:
-            conn.execute("PRAGMA busy_timeout=%d" % int(_env_float("SUMMARY_MTF_CATCHUP_BUSY_TIMEOUT_MS", 5000)))
+        with sqlite3.connect(path, timeout=timeout_sec) as conn:
+            _apply_sqlite_pragmas(conn)
+            logger.warning(
+                "[SUMMARY MTF CATCHUP] db open path=%s timeout=%.1fs busy_timeout_ms=%s skip_if_busy=%s chunk_size=%s",
+                path,
+                timeout_sec,
+                busy_ms,
+                _env_bool("SUMMARY_MTF_CATCHUP_SKIP_IF_BUSY", True),
+                _env_int("SUMMARY_MTF_CATCHUP_UPSERT_CHUNK_SIZE", 500),
+            )
             if not _table_exists(conn, src):
                 result["error"] = "src_table_missing"
                 logger.warning("[SUMMARY MTF CATCHUP] skip src missing table=%s path=%s", src, path)
@@ -380,28 +471,46 @@ def run_catchup(*, reason: str = "manual") -> dict[str, Any]:
                 else:
                     since = min(latest - dt.timedelta(minutes=1), floor_since)
                     latest_s = latest.strftime("%Y-%m-%d %H:%M:%S")
-                rows1 = conn.execute(sql1, (since.strftime("%Y-%m-%d %H:%M:%S"), max_rows)).fetchall()
-                barsx = _aggregate(rows1, interval, include_partial)
-                upserted = _upsert(conn, dst, cols_dst, barsx)
-                recent = _read_recent_from_db(conn, dst, cols_dst, interval, ma_bars)
-                total_upserted += upserted
-                detail.update({
-                    "latest_before": latest_s,
-                    "since": since.strftime("%Y-%m-%d %H:%M:%S"),
-                    "rows_1min": len(rows1),
-                    "bars": len(barsx),
-                    "upserted": upserted,
-                    "recent_rows_for_ma": len(recent),
-                    "ma_bars": ma_bars,
-                })
-                logger.warning(
-                    "[SUMMARY MTF CATCHUP] interval=%s latest_before=%s since=%s rows_1min=%s bars=%s upserted=%s recent_for_ma=%s",
-                    interval, latest_s, detail["since"], len(rows1), len(barsx), upserted, len(recent),
-                )
+
+                try:
+                    rows1 = conn.execute(sql1, (since.strftime("%Y-%m-%d %H:%M:%S"), max_rows)).fetchall()
+                    barsx = _aggregate(rows1, interval, include_partial)
+                    upserted = _upsert(conn, dst, cols_dst, barsx)
+                    recent = _read_recent_from_db(conn, dst, cols_dst, interval, ma_bars)
+                    total_upserted += upserted
+                    detail.update({
+                        "latest_before": latest_s,
+                        "since": since.strftime("%Y-%m-%d %H:%M:%S"),
+                        "rows_1min": len(rows1),
+                        "bars": len(barsx),
+                        "upserted": upserted,
+                        "recent_rows_for_ma": len(recent),
+                        "ma_bars": ma_bars,
+                    })
+                    logger.warning(
+                        "[SUMMARY MTF CATCHUP] interval=%s latest_before=%s since=%s rows_1min=%s bars=%s upserted=%s recent_for_ma=%s",
+                        interval, latest_s, detail["since"], len(rows1), len(barsx), upserted, len(recent),
+                    )
+                except sqlite3.OperationalError as e:
+                    _safe_rollback(conn)
+                    if _is_sqlite_busy_error(e) and _env_bool("SUMMARY_MTF_CATCHUP_SKIP_IF_BUSY", True):
+                        detail.update({"error": "database_busy_skipped", "message": str(e)})
+                        logger.warning(
+                            "[SUMMARY MTF CATCHUP] interval skipped busy interval=%s dst=%s err=%s path=%s",
+                            interval,
+                            dst,
+                            e,
+                            path,
+                        )
+                        continue
+                    raise
             conn.commit()
         result.update({"ok": True, "upserted": total_upserted, "elapsed": round(time.monotonic() - t0, 3)})
         logger.warning("[SUMMARY MTF CATCHUP] done reason=%s upserted=%s elapsed=%.3fs db=%s", reason, total_upserted, time.monotonic() - t0, path)
-        _run_indicator_fill_after_catchup()
+        if total_upserted > 0 or _env_bool("SUMMARY_MTF_INDICATOR_FILL_AFTER_EMPTY_CATCHUP", False):
+            _run_indicator_fill_after_catchup()
+        else:
+            logger.warning("[SUMMARY MTF CATCHUP] indicator fill skipped because upserted=0")
         return result
     except Exception as e:
         result["error"] = str(e)
@@ -431,17 +540,27 @@ def install() -> bool:
         logger.warning("[SUMMARY MTF CATCHUP] disabled by env")
         return False
     _INSTALLED = True
+    delay_sec = max(0.0, _env_float("SUMMARY_MTF_CATCHUP_START_DELAY_SEC", 8.0))
     logger.warning(
-        "[SUMMARY MTF CATCHUP] installed intervals=%s ma_bars=%s async=%s",
+        "[SUMMARY MTF CATCHUP] installed intervals=%s ma_bars=%s async=%s delay=%.1fs busy_timeout_ms=%s skip_if_busy=%s",
         _parse_intervals(),
         _env_int("SUMMARY_MTF_CATCHUP_MA_BARS", 75),
         _env_bool("SUMMARY_MTF_CATCHUP_RUN_ASYNC", True),
+        delay_sec,
+        int(_env_float("SUMMARY_MTF_CATCHUP_BUSY_TIMEOUT_MS", 30000)),
+        _env_bool("SUMMARY_MTF_CATCHUP_SKIP_IF_BUSY", True),
     )
+
+    def _delayed_background() -> None:
+        if delay_sec > 0:
+            time.sleep(delay_sec)
+        _run_background("startup")
+
     if _env_bool("SUMMARY_MTF_CATCHUP_RUN_ASYNC", True):
-        th = threading.Thread(target=_run_background, args=("startup",), name="summary-mtf-startup-catchup", daemon=True)
+        th = threading.Thread(target=_delayed_background, name="summary-mtf-startup-catchup", daemon=True)
         th.start()
     else:
-        _run_background("startup")
+        _delayed_background()
     return True
 
 try:
