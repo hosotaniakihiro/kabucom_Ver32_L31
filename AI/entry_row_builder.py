@@ -1,6 +1,6 @@
 # ============================================================
 # AI/entry_row_builder.py
-# Version: Ver1.1-PRODUCTION-SUMMARY-AI-PENDING-SCORE-PRESERVE
+# Version: Ver1.2-SIDE-NONE-FALLBACK-FIX
 # ------------------------------------------------------------
 # ✔ AI/entry_gate に渡す row を正規化生成
 # ✔ summary / ranking / pending 共通
@@ -11,6 +11,11 @@
 # ✔ scoreをint丸めせず float のまま保持
 # ✔ pending の score から score_buy / score_sell を復元
 # ✔ entry_controller の BUY_SCORE_LOW:0 / SELL_SCORE_LOW:0 を防止
+#
+# Ver1.2:
+# ✔ entry_decision='NONE' / '' / nan を有効sideとして扱わない
+# ✔ entry_decision が NONE でも side='BUY'/'SELL' があれば正しく採用
+# ✔ RANKING pending が SIDE_INVALID side=NONE で落ちる問題を修正
 # ============================================================
 
 from __future__ import annotations
@@ -53,12 +58,28 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return default
 
 
+def _is_blank_like(v: Any) -> bool:
+    try:
+        if v is None:
+            return True
+        if isinstance(v, float) and math.isnan(v):
+            return True
+        s = str(v).strip()
+        if s == "":
+            return True
+        if s.upper() in {"NONE", "NULL", "NAN", "NA", "N/A", "-"}:
+            return True
+        return False
+    except Exception:
+        return True
+
+
 def _first(row: Dict[str, Any], keys: tuple[str, ...], default: Any = None) -> Any:
     for key in keys:
         try:
             if key in row:
                 v = row.get(key)
-                if v is not None and str(v).strip() != "":
+                if not _is_blank_like(v):
                     return v
         except Exception:
             pass
@@ -67,12 +88,27 @@ def _first(row: Dict[str, Any], keys: tuple[str, ...], default: Any = None) -> A
 
 def _norm_side(v: Any) -> str:
     try:
-        if v is None:
+        if _is_blank_like(v):
             return ""
         s = str(v).strip().upper()
         return s if s in ("BUY", "SELL") else ""
     except Exception:
         return ""
+
+
+def _resolve_side(row: Dict[str, Any]) -> str:
+    """
+    side解決専用。
+
+    entry_decision='NONE' が入っていると Python の or では真として扱われ、
+    後続の side='BUY'/'SELL' まで到達しない。
+    そのため、NONE系を明示的に無効扱いしてから順番に見る。
+    """
+    for key in ("entry_decision", "side", "ai_side", "decision", "Side"):
+        side = _norm_side(row.get(key))
+        if side in ("BUY", "SELL"):
+            return side
+    return ""
 
 
 # ============================================================
@@ -81,7 +117,7 @@ def build_entry_row(row: Dict[str, Any]) -> Dict[str, Any]:
     AI/entry_gate に渡す row を生成する唯一の関数。
 
     重要:
-      pending_manager から来る SUMMARY_AI は score だけを持ち、
+      pending_manager から来る SUMMARY_AI / RANKING は score だけを持ち、
       score_buy / score_sell を持たないことがある。
       ここで score と side から buy/sell score を復元しないと、
       entry_controller 側の最終 _passes_ai_gate で
@@ -107,21 +143,16 @@ def build_entry_row(row: Dict[str, Any]) -> Dict[str, Any]:
         return {}
 
     source = row.get("source", "UNKNOWN")
-
-    side = _norm_side(
-        row.get("entry_decision")
-        or row.get("side")
-        or row.get("ai_side")
-        or row.get("decision")
-    )
+    side = _resolve_side(row)
 
     entry_row: Dict[str, Any] = {
         "symbol": symbol,
         "symbolname": row.get("symbolname", ""),
         "source": source,
         "side": side,
-        "entry_decision": side or row.get("entry_decision", "NONE"),
+        "entry_decision": side if side in ("BUY", "SELL") else "",
         "entry_type": row.get("entry_type") or row.get("entryType"),
+        "ai_side": side if side in ("BUY", "SELL") else row.get("ai_side"),
     }
 
     # ========================================================
@@ -161,7 +192,6 @@ def build_entry_row(row: Dict[str, Any]) -> Dict[str, Any]:
         None,
     )
 
-    # 最終 fallback（値が無い場合のみ）
     if turnover is None:
         turnover = close_price * volume
 
@@ -189,7 +219,7 @@ def build_entry_row(row: Dict[str, Any]) -> Dict[str, Any]:
         0.0,
     )
 
-    # pending SUMMARY_AI は score だけを持つことがあるため、side から復元する
+    # pending SUMMARY_AI / RANKING は score だけを持つことがあるため、side から復元する
     if side == "BUY" and buy_score <= 0 and raw_score > 0:
         buy_score = raw_score
     elif side == "SELL" and sell_score <= 0:
@@ -215,7 +245,6 @@ def build_entry_row(row: Dict[str, Any]) -> Dict[str, Any]:
     entry_row["final_score"] = score_total
     entry_row["display_score"] = score_total
 
-    # 旧名・新名の両方を埋める
     entry_row["score_buy"] = buy_score
     entry_row["buy_score"] = buy_score
     entry_row["score_sell"] = sell_score
@@ -277,7 +306,19 @@ def build_entry_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "turnover_raw": row.get("turnover"),
         "side_raw": row.get("side"),
         "entry_decision_raw": row.get("entry_decision"),
+        "ai_side_raw": row.get("ai_side"),
+        "resolved_side": side,
     }
+
+    if not side and (row.get("side") or row.get("entry_decision") or row.get("ai_side")):
+        logger.warning(
+            "[ENTRY ROW BUILDER] side unresolved symbol=%s raw_side=%s raw_entry_decision=%s raw_ai_side=%s keys=%s",
+            symbol,
+            row.get("side"),
+            row.get("entry_decision"),
+            row.get("ai_side"),
+            sorted(list(row.keys()))[:40],
+        )
 
     return entry_row
 
