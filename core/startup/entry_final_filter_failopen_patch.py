@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/entry_final_filter_failopen_patch.py
-# Version: V1.5-BOARD-RETRY-4P5SEC-DEFAULT
+# Version: V1.6-SHORT-MTF-REQUIRED-DAILY-OPTIONAL
 # ------------------------------------------------------------
 # 【目的】
 #   候補・AI・pending までは通るのに、最後で全落ちする問題の緩和。
@@ -10,6 +10,7 @@
 #   - final_entry_safety_guard の board_missing で全落ちするケース
 #   - SYMBOL_DAILY_ENTRY_LIMIT が 1回固定で強すぎるケース
 #   - A/B PUSHローテーションで候補銘柄が反対面にいて板が取れないケース
+#   - 日足MTFだけで発注停止してしまうケース
 #
 # 【方針】
 #   - 5分足元フィルタNGは、発注停止ではなく既存の低変動ガード側に任せる
@@ -17,6 +18,7 @@
 #   - 同一銘柄の当日発注済みカウントはデフォルト2回まで許可する
 #   - 方向確認の再帰/例外は fail-open しない。安全側NGにする。
 #   - pending化した候補銘柄をPUSH protectedへ渡し、A/B両面登録されやすくする。
+#   - 発注直前MTFは 1分/3分/5分の傾きを必須、日足MTFはオプショナルにする。
 # ============================================================
 
 from __future__ import annotations
@@ -77,6 +79,10 @@ def install() -> bool:
     _setdefault_env("ENTRY_BOARD_RETRY_EXTRA_WAIT_SEC", "0.3")
     _setdefault_env("ENTRY_BOARD_RETRY_EXTRA_COUNT", "1")
     _setdefault_env("ENTRY_BOARD_RETRY_SYMBOLS_ONLY_PENDING", "0")
+    _setdefault_env("ENTRY_SHORT_MTF_REQUIRED", "1")
+    _setdefault_env("ENTRY_SHORT_MTF_REQUIRE_ALL", "1")
+    _setdefault_env("ENTRY_SHORT_MTF_SLOPE_EPS", "0.0")
+    _setdefault_env("ENTRY_DAILY_MTF_OPTIONAL", "1")
 
     # 方向確認は fail-open しない。明示的に安全側NGへ固定する。
     _force_env("ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN", "0")
@@ -152,9 +158,19 @@ def install() -> bool:
     except Exception:
         logger.exception("[ENTRY FINAL FILTER FAILOPEN] board retry patch install failed")
 
+    # --------------------------------------------------------
+    # 5) 発注直前MTFは短期1/3/5分を必須、日足MTFはオプショナル
+    # --------------------------------------------------------
+    try:
+        from core.startup.entry_mtf_short_required_daily_optional_patch import install as install_short_mtf
+        ok = install_short_mtf()
+        logger.warning("[ENTRY FINAL FILTER FAILOPEN] short MTF daily optional patch installed=%s", ok)
+    except Exception:
+        logger.exception("[ENTRY FINAL FILTER FAILOPEN] short MTF daily optional patch install failed")
+
     _PATCHED = True
     logger.warning(
-        "[ENTRY FINAL FILTER FAILOPEN] installed range_fail_open=%s direction_recursion_fail_open=%s direction_error_fail_open=%s allow_without_board=%s max_symbol_entries=%s pending_protect_push=%s board_retry=%s board_retry_wait=%s board_retry_extra_wait=%s board_retry_extra_count=%s",
+        "[ENTRY FINAL FILTER FAILOPEN] installed range_fail_open=%s direction_recursion_fail_open=%s direction_error_fail_open=%s allow_without_board=%s max_symbol_entries=%s pending_protect_push=%s board_retry=%s board_retry_wait=%s board_retry_extra_wait=%s board_retry_extra_count=%s short_mtf_required=%s short_mtf_require_all=%s daily_mtf_optional=%s",
         _env_bool("RANGE_5M_FILTER_NG_FAIL_OPEN", True),
         _env_bool("ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN", False),
         _env_bool("ENTRY_DIRECTION_CONFIRM_ERROR_FAIL_OPEN", False),
@@ -165,6 +181,9 @@ def install() -> bool:
         os.getenv("ENTRY_BOARD_RETRY_WAIT_SEC"),
         os.getenv("ENTRY_BOARD_RETRY_EXTRA_WAIT_SEC"),
         os.getenv("ENTRY_BOARD_RETRY_EXTRA_COUNT"),
+        os.getenv("ENTRY_SHORT_MTF_REQUIRED"),
+        os.getenv("ENTRY_SHORT_MTF_REQUIRE_ALL"),
+        os.getenv("ENTRY_DAILY_MTF_OPTIONAL"),
     )
     return True
 
