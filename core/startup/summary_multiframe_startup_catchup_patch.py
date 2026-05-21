@@ -1,9 +1,16 @@
 # ============================================================
 # File   : core/startup/summary_multiframe_startup_catchup_patch.py
-# Version: V1.3-DB-LOCK-RETRY-SKIP-IF-BUSY
+# Version: V1.4-TIME-RANGE-NOT-NULL-FIX
 # ------------------------------------------------------------
 # 起動時にDB内の1分足サマリーから、3分足・5分足サマリーを差分再集計する。
 # その後、3分足/5分足の rsi/macd/signal/ma75/score 等を補完する。
+#
+# V1.4:
+#   - stock_summary_3min/5min の time_range NOT NULL 対策
+#   - 3分足/5分足生成時に time_range を必ず作成
+#   - UPSERT保存対象に time_range を追加
+#   - 将来 NOT NULL カラムが増えても止まりにくいよう、INSERT必須列へ安全デフォルトを補完
+#   - sqlite3.IntegrityError も interval単位でログ化して処理継続しやすくする
 #
 # V1.3:
 #   - NAS/SQLiteの database is locked 対策
@@ -119,11 +126,26 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
         return False
 
 
-def _columns(conn: sqlite3.Connection, table: str) -> list[str]:
+def _table_info(conn: sqlite3.Connection, table: str) -> list[dict[str, Any]]:
     try:
-        return [str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return [
+            {
+                "cid": r[0],
+                "name": str(r[1]),
+                "type": str(r[2] or ""),
+                "notnull": int(r[3] or 0),
+                "dflt_value": r[4],
+                "pk": int(r[5] or 0),
+            }
+            for r in rows
+        ]
     except Exception:
         return []
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    return [x["name"] for x in _table_info(conn, table)]
 
 
 def _pick(cols: Iterable[str], candidates: Iterable[str]) -> str:
@@ -183,6 +205,15 @@ def _parse_dt(v: Any) -> dt.datetime | None:
 
 def _floor_interval(t: dt.datetime, interval: int) -> dt.datetime:
     return t.replace(minute=(t.minute // interval) * interval, second=0, microsecond=0)
+
+
+def _make_time_range(start_dt: dt.datetime, interval: int) -> str:
+    """DBの time_range NOT NULL 対策。例: 09:00:00-09:02:59。"""
+    try:
+        end_dt = start_dt + dt.timedelta(minutes=int(interval), seconds=-1)
+        return f"{start_dt.strftime('%H:%M:%S')}-{end_dt.strftime('%H:%M:%S')}"
+    except Exception:
+        return "00:00:00-00:00:00"
 
 
 def _latest_dst_dt(conn: sqlite3.Connection, table: str, cols: list[str]) -> dt.datetime | None:
@@ -283,6 +314,7 @@ def _aggregate(rows: list[tuple[Any, ...]], interval: int, include_current_parti
         if turnover <= 0 and close_price > 0 and volume > 0:
             turnover = close_price * volume
         vwap = turnover / volume if turnover > 0 and volume > 0 else 0.0
+        time_range = _make_time_range(bdt, interval)
         out.append({
             "symbol": sym,
             "symbolname": xs[-1].get("symbolname") or xs[0].get("symbolname") or "",
@@ -290,6 +322,7 @@ def _aggregate(rows: list[tuple[Any, ...]], interval: int, include_current_parti
             "datetime": bdt.strftime("%Y-%m-%d %H:%M:%S"),
             "date": bdt.strftime("%Y-%m-%d"),
             "time": bdt.strftime("%H:%M:%S"),
+            "time_range": time_range,
             "open_price": open_price,
             "high_price": max(highs) if highs else close_price,
             "low_price": min(lows) if lows else close_price,
@@ -316,16 +349,51 @@ def _chunked(vals: list[tuple[Any, ...]], chunk_size: int) -> Iterable[list[tupl
         yield vals[i:i + n]
 
 
+def _default_for_required_column(col: str, col_type: str, row: dict[str, Any]) -> Any:
+    c = str(col or "")
+    t = str(col_type or "").upper()
+    if c == "time_range":
+        dtx = _parse_dt(row.get("datetime") or f"{row.get('date', '')} {row.get('time', '')}")
+        return _make_time_range(dtx or dt.datetime.now(), 1)
+    if c == "source":
+        return "startup_mtf_catchup"
+    if c == "updated_at":
+        return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if c in {"date", "trade_date"}:
+        dtx = _parse_dt(row.get("datetime")) or dt.datetime.now()
+        return dtx.strftime("%Y-%m-%d")
+    if c in {"time", "minute", "bar_time"}:
+        dtx = _parse_dt(row.get("datetime")) or dt.datetime.now()
+        return dtx.strftime("%H:%M:%S")
+    if "INT" in t or "REAL" in t or "NUM" in t or "FLOA" in t or "DOUB" in t:
+        return 0
+    return ""
+
+
 def _upsert(conn: sqlite3.Connection, table: str, cols: list[str], rows: list[dict[str, Any]]) -> int:
     if not rows:
         return 0
+    table_info = _table_info(conn, table)
+    info_by_col = {x["name"]: x for x in table_info}
     preferred = [
-        "symbol", "symbolname", "symbol_name", "datetime", "date", "time",
+        "symbol", "symbolname", "symbol_name", "datetime", "date", "time", "time_range",
         "open_price", "high_price", "low_price", "close_price",
         "open", "high", "low", "close", "price", "current_price",
         "volume", "turnover", "trading_value", "vwap", "source", "updated_at",
     ]
     writable = [c for c in preferred if c in cols]
+
+    # NOT NULL かつ defaultなしの列はINSERT時に必ず含める。
+    # symbol/datetime/date/time 以外の未知列も安全デフォルトで埋める。
+    for info in table_info:
+        c = info["name"]
+        if info.get("pk"):
+            continue
+        if c in writable:
+            continue
+        if int(info.get("notnull") or 0) and info.get("dflt_value") is None and c in cols:
+            writable.append(c)
+
     if "symbol" not in writable:
         raise RuntimeError(f"{table} symbol column missing")
     if "datetime" in writable:
@@ -334,14 +402,28 @@ def _upsert(conn: sqlite3.Connection, table: str, cols: list[str], rows: list[di
         conflict = "symbol, date, time"
     else:
         raise RuntimeError(f"{table} datetime/date+time columns missing")
+
     non_keys = [c for c in writable if c not in {"symbol", "datetime", "date", "time"}]
     update_sql = ",".join([f"{c}=excluded.{c}" for c in non_keys])
+    if not update_sql:
+        update_sql = "symbol=excluded.symbol"
     sql = f"""
         INSERT INTO {table} ({','.join(writable)})
         VALUES ({','.join(['?'] * len(writable))})
         ON CONFLICT({conflict}) DO UPDATE SET {update_sql}
     """
-    vals = [tuple(r.get(c) for c in writable) for r in rows]
+
+    vals: list[tuple[Any, ...]] = []
+    for r in rows:
+        one = []
+        for c in writable:
+            v = r.get(c)
+            if v is None or (isinstance(v, str) and v == ""):
+                info = info_by_col.get(c, {})
+                if int(info.get("notnull") or 0):
+                    v = _default_for_required_column(c, str(info.get("type") or ""), r)
+            one.append(v)
+        vals.append(tuple(one))
 
     retry_count = max(1, _env_int("SUMMARY_MTF_CATCHUP_UPSERT_RETRY_COUNT", 3))
     sleep_base = max(0.05, _env_float("SUMMARY_MTF_CATCHUP_UPSERT_RETRY_SLEEP_SEC", 0.5))
@@ -497,13 +579,18 @@ def run_catchup(*, reason: str = "manual") -> dict[str, Any]:
                         detail.update({"error": "database_busy_skipped", "message": str(e)})
                         logger.warning(
                             "[SUMMARY MTF CATCHUP] interval skipped busy interval=%s dst=%s err=%s path=%s",
-                            interval,
-                            dst,
-                            e,
-                            path,
+                            interval, dst, e, path,
                         )
                         continue
                     raise
+                except sqlite3.IntegrityError as e:
+                    _safe_rollback(conn)
+                    detail.update({"error": "integrity_error_skipped", "message": str(e)})
+                    logger.warning(
+                        "[SUMMARY MTF CATCHUP] interval skipped integrity interval=%s dst=%s err=%s path=%s",
+                        interval, dst, e, path, exc_info=True,
+                    )
+                    continue
             conn.commit()
         result.update({"ok": True, "upserted": total_upserted, "elapsed": round(time.monotonic() - t0, 3)})
         logger.warning("[SUMMARY MTF CATCHUP] done reason=%s upserted=%s elapsed=%.3fs db=%s", reason, total_upserted, time.monotonic() - t0, path)
@@ -562,6 +649,7 @@ def install() -> bool:
     else:
         _delayed_background()
     return True
+
 
 try:
     install()
