@@ -10,7 +10,7 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.9-MAIN-BOARD-WALL-STALL-EXIT
+# Version: Ver38.10-MAIN-BOARD-RETRY-PATCH-INSTALL
 # ------------------------------------------------------------
 # ✔ PROJECT_ROOT を最初に sys.path へ追加
 # ✔ core.logging.console_tee を確実に import / setup
@@ -21,6 +21,7 @@
 # ✔ ENTRY_QTY_ZERO対策 runtime patch を明示install
 # ✔ 動かない銘柄をエントリー直前で除外する low movement guard を明示install
 # ✔ 5分足欠損/方向確認再帰による最終全落ちを fail-open する patch を明示install
+# ✔ 板取得リトライ patch を起動時install（4.5秒 + 0.3秒追加確認）
 # ✔ 板が食われているのに株価が止まる場合の反転警戒EXITを起動時install
 # ✔ EXIT scheduler を run_exit_pipeline で1秒ごとに登録
 # ✔ main.py 側の scheduler / realtime / position_sync / push_monitor 生存証跡を heartbeat DB に保存
@@ -214,6 +215,7 @@ def _install_main_runtime_patches():
         ("core.startup.oneshot_limit_700k_patch", "install"),
         ("core.startup.entry_limit_passive_runtime_patch", "install"),
         ("core.startup.final_entry_safety_guard_patch", "install"),
+        ("core.startup.board_retry_patch", "install"),
         ("core.startup.board_wall_stall_exit_patch", "install"),
     ]
 
