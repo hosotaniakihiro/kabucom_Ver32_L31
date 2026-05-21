@@ -1,13 +1,14 @@
 # ============================================================
 # File   : core/startup/__init__.py
-# Ver    : PRODUCTION-STABLE-REV20.8-EXIT-BOARD-TOUCH-PATCH
+# Ver    : PRODUCTION-STABLE-REV20.9-SUMMARY-EXISTING-NULL-REPAIR
 # ------------------------------------------------------------
 # 【概要】
 #   core.startup パッケージの公開入口。
 #   schedule loop stale guard patch / summary scheduler timeout patch /
 #   summary AI slope env patch / summary AI score env patch /
 #   summary write gate runtime patch / ranking summary persistence lock patch /
-#   allow orders runtime patch / exit board touch limit patch を自動適用する。
+#   allow orders runtime patch / exit board touch limit patch /
+#   summary existing null repair patch を自動適用する。
 # ============================================================
 
 from __future__ import annotations
@@ -71,6 +72,13 @@ try:
     install_exit_limit_board_touch_patch()
 except Exception:
     logger.exception("[core.startup] exit board touch limit patch install failed")
+
+try:
+    from .summary_existing_null_repair_patch import install as install_summary_existing_null_repair_patch
+
+    install_summary_existing_null_repair_patch()
+except Exception:
+    logger.exception("[core.startup] summary existing null repair patch install failed")
 
 from .startup import system_startup
 from .summary_bootstrap import (
