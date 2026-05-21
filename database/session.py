@@ -1,27 +1,16 @@
 # ============================================================
 # File: database/session.py
-# Ver43-NAS-ABSOLUTE-STABLE-SUMMARY-WIDE-SCHEMA-EVERY-BOOT
+# Ver44-NAS-STABLE-MODELS-CANONICAL-SUMMARY-SCHEMA
 # ------------------------------------------------------------
-# ✔ Ver42 全機能保持
-# ✔ 起動時に summary table の不足列を毎回 PRAGMA で確認
-# ✔ 既存列は skip、無い列だけ ALTER TABLE ADD COLUMN
-# ✔ schema_bootstrap_meta の「1回だけskip」を廃止
-# ✔ score_buy / score_sell / display_ready / mtf_score / mtf_alignment 追加
-# ✔ score_base / score_trend / score_momentum / score_velocity 追加
-# ✔ direction_penalty / base_score / momentum_score / volume_score 追加
-# ✔ SQLite ADD COLUMN IF NOT EXISTS 非依存
-# ✔ duplicate column name は正常競合として握りつぶす
-# ✔ production hardened
-#
-# 【重要】
-#   create_all() は既存テーブルに不足カラムを追加しない。
-#   そのため _bootstrap_summary_schema() で毎回不足列だけ補完する。
-#
-# 【今回の修正理由】
-#   Ver42 は schema_bootstrap_meta の flag が 1 の場合、
-#   あとから追加したカラムがあっても丸ごと skip していた。
-#   その結果、score系・ready系・mtf系が DB に存在せず、
-#   summary_saver_bulk 側で drop される原因になっていた。
+# ✔ DB engine / Session 管理
+# ✔ SQLite NAS向け busy_timeout / WAL / NullPool 設定
+# ✔ summary DB のテーブル作成は database/models.py の ORM 定義を正本にする
+# ✔ 既存 summary DB への不足カラム追加も models.py の Base_summary.metadata から自動生成
+# ✔ session.py 側の手書き SUMMARY_BOOTSTRAP_COLUMNS を廃止
+# ✔ time_range / date / time / start_time / end_time / trading_value / updated_at なども
+#   models.py にあれば自動で補完対象になる
+# ✔ create_all() は既存テーブルに不足カラムを追加しないため、毎起動 PRAGMA で差分補完
+# ✔ SQLite の ALTER TABLE ADD COLUMN では NOT NULL を付けず、安全に列追加する
 # ============================================================
 
 from __future__ import annotations
@@ -30,12 +19,13 @@ from datetime import date
 from pathlib import Path
 import logging
 import sqlite3
-from typing import Iterable
+from typing import Any
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 
+# 重要: models import により Base_* metadata に全ORMテーブルを登録する
 import database.models  # noqa: F401
 from config.paths import get_path
 from database.bases import (
@@ -222,7 +212,7 @@ def _log_engine_info(engine, name: str) -> None:
 
 
 def _ensure_tables(engine, base) -> None:
-    tables = list(base.metadata.tables.keys())
+    tables = list(base.metadata.tables.keys()) if base is not None else []
     if tables:
         base.metadata.create_all(engine)
 
@@ -243,10 +233,7 @@ def _table_exists(engine, table_name: str) -> bool:
             )
             return rs.first() is not None
     except Exception:
-        logger.exception(
-            "[SCHEMA BOOTSTRAP] table exists check failed table=%s",
-            table_name,
-        )
+        logger.exception("[SCHEMA BOOTSTRAP] table exists check failed table=%s", table_name)
         return False
 
 
@@ -254,7 +241,6 @@ def _get_table_columns(engine, table_name: str) -> set[str]:
     try:
         if not _table_exists(engine, table_name):
             return set()
-
         with engine.connect() as conn:
             rs = conn.execute(text(f"PRAGMA table_info({_quote_ident(table_name)})"))
             cols: set[str] = set()
@@ -268,10 +254,7 @@ def _get_table_columns(engine, table_name: str) -> set[str]:
                         pass
             return cols
     except Exception:
-        logger.exception(
-            "[SCHEMA BOOTSTRAP] PRAGMA table_info failed table=%s",
-            table_name,
-        )
+        logger.exception("[SCHEMA BOOTSTRAP] PRAGMA table_info failed table=%s", table_name)
         return set()
 
 
@@ -280,7 +263,7 @@ def _column_exists(engine, table_name: str, column_name: str) -> bool:
 
 
 # ============================================================
-# SUMMARY SCHEMA BOOTSTRAP
+# SUMMARY SCHEMA BOOTSTRAP FROM database/models.py
 # ============================================================
 
 SUMMARY_TARGET_TABLES = (
@@ -289,128 +272,54 @@ SUMMARY_TARGET_TABLES = (
     "stock_summary_5min",
 )
 
-SUMMARY_BOOTSTRAP_COLUMNS = [
-    # --------------------------------------------------------
-    # basic / metadata
-    # --------------------------------------------------------
-    ("source", "VARCHAR"),
-    ("interval", "INTEGER"),
-    ("last_update", "DATETIME"),
 
-    # --------------------------------------------------------
-    # OHLC aliases
-    # --------------------------------------------------------
-    ("open", "FLOAT"),
-    ("high", "FLOAT"),
-    ("low", "FLOAT"),
-    ("close", "FLOAT"),
-    ("open_price", "FLOAT"),
-    ("high_price", "FLOAT"),
-    ("low_price", "FLOAT"),
-    ("close_price", "FLOAT"),
+def _sqlite_type_from_model_column(column: Any) -> str:
+    """SQLAlchemy Column から SQLite ALTER TABLE 用の型文字列を作る。
 
-    # --------------------------------------------------------
-    # volume / MA / technical
-    # --------------------------------------------------------
-    ("volume", "FLOAT"),
-    ("vwap", "FLOAT"),
+    既存テーブルへの ALTER TABLE ADD COLUMN では NOT NULL を付けない。
+    SQLiteは既存行がある状態で NOT NULL + defaultなし列を追加できないため。
+    新規作成時の nullable/制約は models.py の create_all() が担当する。
+    """
+    try:
+        typ = column.type
+        name = typ.__class__.__name__.upper()
+        if "INTEGER" in name:
+            return "INTEGER"
+        if "FLOAT" in name or "REAL" in name or "NUMERIC" in name:
+            return "REAL"
+        if "DATETIME" in name or "DATE" in name or "TIME" in name:
+            return "DATETIME"
+        if "TEXT" in name:
+            return "TEXT"
+        if "STRING" in name or "VARCHAR" in name:
+            return "VARCHAR"
+        compiled = str(typ).upper().strip()
+        return compiled or "VARCHAR"
+    except Exception:
+        return "VARCHAR"
 
-    ("ma5", "FLOAT"),
-    ("ma25", "FLOAT"),
-    ("ma75", "FLOAT"),
 
-    ("ma5_conf", "FLOAT"),
-    ("ma25_conf", "FLOAT"),
-    ("ma75_conf", "FLOAT"),
-
-    ("ma75_slope", "FLOAT"),
-    ("volume_slope", "FLOAT"),
-    ("vwap_slope", "FLOAT"),
-
-    ("slope", "FLOAT"),
-    ("slope_atr_scaled", "FLOAT"),
-    ("slope_atr_scaled_1m", "FLOAT"),
-    ("slope_atr_scaled_3m", "FLOAT"),
-    ("slope_atr_scaled_5m", "FLOAT"),
-
-    ("ema12", "FLOAT"),
-    ("ema26", "FLOAT"),
-    ("macd", "FLOAT"),
-    ("signal", "FLOAT"),
-    ("hist", "FLOAT"),
-
-    ("rsi", "FLOAT"),
-    ("rci", "FLOAT"),
-
-    ("atr", "FLOAT"),
-    ("atr_1m", "FLOAT"),
-    ("atr_3m", "FLOAT"),
-    ("atr_5m", "FLOAT"),
-
-    ("bb_mid", "FLOAT"),
-    ("bb_upper", "FLOAT"),
-    ("bb_lower", "FLOAT"),
-    ("bb_width", "FLOAT"),
-
-    # --------------------------------------------------------
-    # score / display
-    # --------------------------------------------------------
-    ("score", "FLOAT"),
-    ("score_total", "FLOAT"),
-    ("display_score", "FLOAT"),
-    ("final_score", "FLOAT"),
-
-    ("score_buy", "FLOAT"),
-    ("score_sell", "FLOAT"),
-    ("buy_score", "FLOAT"),
-    ("sell_score", "FLOAT"),
-
-    ("score_slope", "FLOAT"),
-    ("score_mtf", "FLOAT"),
-
-    ("mtf", "FLOAT"),
-    ("mtf_alignment", "FLOAT"),
-    ("mtf_score", "FLOAT"),
-
-    ("price_diff", "FLOAT"),
-
-    ("base", "FLOAT"),
-    ("trend", "FLOAT"),
-    ("mom", "FLOAT"),
-    ("vel", "FLOAT"),
-    ("pen", "FLOAT"),
-
-    ("combined_score", "FLOAT"),
-
-    # --------------------------------------------------------
-    # score alias / diagnostics
-    # --------------------------------------------------------
-    ("score_base", "FLOAT"),
-    ("score_trend", "FLOAT"),
-    ("score_momentum", "FLOAT"),
-    ("score_velocity", "FLOAT"),
-    ("direction_penalty", "FLOAT"),
-
-    ("base_score", "FLOAT"),
-    ("momentum_score", "FLOAT"),
-    ("volume_score", "FLOAT"),
-    ("flag_score", "FLOAT"),
-
-    ("sell_pressure", "FLOAT"),
-    ("absolute_score", "FLOAT"),
-    ("liquidity_score", "FLOAT"),
-    ("distribution_score", "FLOAT"),
-    ("volatility_score", "FLOAT"),
-    ("score_rank", "FLOAT"),
-    ("ai_score", "FLOAT"),
-
-    # --------------------------------------------------------
-    # readiness / history
-    # --------------------------------------------------------
-    ("symbol_hist_len", "FLOAT"),
-    ("technical_ready", "INTEGER"),
-    ("display_ready", "INTEGER"),
-]
+def _summary_model_columns() -> dict[str, list[tuple[str, str]]]:
+    """database/models.py の Base_summary.metadata を正本としてカラム一覧を返す。"""
+    out: dict[str, list[tuple[str, str]]] = {}
+    try:
+        metadata = Base_summary.metadata
+        for table_name in SUMMARY_TARGET_TABLES:
+            tbl = metadata.tables.get(table_name)
+            if tbl is None:
+                out[table_name] = []
+                continue
+            cols: list[tuple[str, str]] = []
+            for col in tbl.columns:
+                col_name = str(col.name)
+                if col.primary_key:
+                    # id は create_all() 側で作られる。既存DBに後付けしない。
+                    continue
+                cols.append((col_name, _sqlite_type_from_model_column(col)))
+            out[table_name] = cols
+    except Exception:
+        logger.exception("[SCHEMA BOOTSTRAP] summary model column scan failed")
+    return out
 
 
 def _ensure_column(
@@ -427,11 +336,7 @@ def _ensure_column(
     """
     try:
         if not _table_exists(engine, table_name):
-            logger.info(
-                "[SCHEMA BOOTSTRAP] table not found skip table=%s column=%s",
-                table_name,
-                column_name,
-            )
+            logger.info("[SCHEMA BOOTSTRAP] table not found skip table=%s column=%s", table_name, column_name)
             return False
 
         if existing_columns is None:
@@ -449,54 +354,30 @@ def _ensure_column(
             )
 
         existing_columns.add(column_name)
-
-        logger.info(
-            "[SCHEMA BOOTSTRAP] added table=%s column=%s type=%s",
-            table_name,
-            column_name,
-            column_type,
-        )
+        logger.info("[SCHEMA BOOTSTRAP] added table=%s column=%s type=%s", table_name, column_name, column_type)
         return True
 
     except Exception as e:
         msg = str(e).lower()
-
-        # 複数スレッド/再起動競合で先に追加された場合は正常扱い
         if "duplicate column" in msg or "already exists" in msg:
             try:
                 if existing_columns is not None:
                     existing_columns.add(column_name)
             except Exception:
                 pass
-            logger.debug(
-                "[SCHEMA BOOTSTRAP] duplicate column ignored table=%s column=%s",
-                table_name,
-                column_name,
-            )
+            logger.debug("[SCHEMA BOOTSTRAP] duplicate column ignored table=%s column=%s", table_name, column_name)
             return False
 
-        logger.exception(
-            "[SCHEMA BOOTSTRAP] ensure column failed table=%s column=%s type=%s",
-            table_name,
-            column_name,
-            column_type,
-        )
+        logger.exception("[SCHEMA BOOTSTRAP] ensure column failed table=%s column=%s type=%s", table_name, column_name, column_type)
         return False
 
 
 def _bootstrap_summary_schema(engine) -> None:
-    """
-    起動時に summary DB の不足列を補完する。
+    """起動時に summary DB の不足列を database/models.py から補完する。"""
+    model_columns = _summary_model_columns()
+    targets = tuple(model_columns.keys()) or SUMMARY_TARGET_TABLES
 
-    Ver43:
-      - meta flag による丸ごと skip はしない
-      - 毎回 PRAGMA table_info を見て、無い列だけ追加する
-      - 既存列は無音 skip
-      - duplicate column は競合として無視
-    """
-    targets = SUMMARY_TARGET_TABLES
-
-    logger.info("🧱 summary schema bootstrap start targets=%s mode=every_boot_missing_only", targets)
+    logger.info("🧱 summary schema bootstrap start targets=%s source=database.models mode=models_canonical", targets)
 
     added_count = 0
     table_added: dict[str, list[str]] = {}
@@ -509,31 +390,17 @@ def _bootstrap_summary_schema(engine) -> None:
         existing_columns = _get_table_columns(engine, table_name)
         table_added[table_name] = []
 
-        for col_name, col_type in SUMMARY_BOOTSTRAP_COLUMNS:
-            if _ensure_column(
-                engine,
-                table_name,
-                col_name,
-                col_type,
-                existing_columns=existing_columns,
-            ):
+        for col_name, col_type in model_columns.get(table_name, []):
+            if _ensure_column(engine, table_name, col_name, col_type, existing_columns=existing_columns):
                 added_count += 1
                 table_added[table_name].append(col_name)
 
         if table_added[table_name]:
-            logger.warning(
-                "[SCHEMA BOOTSTRAP] table patched table=%s added=%s",
-                table_name,
-                table_added[table_name],
-            )
+            logger.warning("[SCHEMA BOOTSTRAP] table patched table=%s added=%s", table_name, table_added[table_name])
         else:
             logger.info("[SCHEMA BOOTSTRAP] table schema ok table=%s", table_name)
 
-    logger.info(
-        "✅ summary schema bootstrap done added_columns=%s details=%s",
-        added_count,
-        table_added,
-    )
+    logger.info("✅ summary schema bootstrap done source=database.models added_columns=%s details=%s", added_count, table_added)
 
 
 # ============================================================
@@ -575,7 +442,7 @@ def init_engines() -> None:
     if _initialized:
         return
 
-    logger.info("🚀 INIT ENGINES (NAS ABSOLUTE STABLE SUMMARY WIDE SCHEMA EVERY BOOT MODE)")
+    logger.info("🚀 INIT ENGINES (NAS STABLE MODELS CANONICAL SUMMARY SCHEMA)")
 
     today = _today_ymd()
 
@@ -613,7 +480,7 @@ def init_engines() -> None:
 
     _initialized = True
 
-    logger.info("✅ ALL ENGINES INITIALIZED (NAS ABSOLUTE STABLE FINAL)")
+    logger.info("✅ ALL ENGINES INITIALIZED (NAS STABLE FINAL)")
 
 
 def _auto_init() -> None:
