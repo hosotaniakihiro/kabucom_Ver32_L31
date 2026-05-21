@@ -1,6 +1,6 @@
 # ==========================================================
 # trading/handlers/entry_order_builder.py
-# Ver2.0.0-LOW-MOVE-GUARD-ALL-ENTRY-SOURCES
+# Ver2.1.0-BOARD-RETRY-FOR-ROTATION
 # ----------------------------------------------------------
 # ✔ 注文条件（price / order_type / qty）を決定するだけ
 # ✔ 副作用ゼロ（発注・global_state 操作なし）
@@ -19,6 +19,10 @@
 # ✔ 低変動ガードを SUMMARY_AI 限定から RANKING / TONOSAMA にも拡張
 # ✔ ENTRY_ORDER_LOW_MOVE_SOURCES で対象sourceを環境変数制御
 # ✔ 変動の少ないランキング銘柄を発注直前で止める
+#
+# 【Ver2.1 追加】
+# ✔ A/B PUSHローテーション対策: SUMMARY_AI 発注直前の板取得を短時間リトライ
+# ✔ 板が一時的に無いだけで即 fallback/skip しにくくする
 # ==========================================================
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ from __future__ import annotations
 import datetime as dt
 import math
 import os
+import time
 from typing import Dict, Any, Optional, Tuple
 
 from global_state import global_data
@@ -85,6 +90,15 @@ ENTRY_ORDER_REQUIRE_ATR = str(os.getenv("ENTRY_ORDER_REQUIRE_ATR", "0")).lower()
     "1", "true", "yes", "y", "on",
 }
 ENTRY_ORDER_REQUIRE_HIGH_LOW = str(os.getenv("ENTRY_ORDER_REQUIRE_HIGH_LOW", "0")).lower() in {
+    "1", "true", "yes", "y", "on",
+}
+
+ENTRY_ORDER_BOARD_RETRY_ENABLED = str(os.getenv("ENTRY_ORDER_BOARD_RETRY_ENABLED", "1")).lower() not in {
+    "0", "false", "no", "off",
+}
+ENTRY_ORDER_BOARD_RETRY_SEC = float(os.getenv("ENTRY_ORDER_BOARD_RETRY_SEC", "5.6"))
+ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC = float(os.getenv("ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", "0.4"))
+ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY = str(os.getenv("ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY", "0")).lower() in {
     "1", "true", "yes", "y", "on",
 }
 
@@ -188,6 +202,50 @@ def _source_uses_low_move_guard(source: str) -> bool:
     if "ALL" in ENTRY_ORDER_LOW_MOVE_SOURCES:
         return True
     return src in ENTRY_ORDER_LOW_MOVE_SOURCES
+
+
+def _get_board_with_retry(symbol: str, *, source: str, side: str) -> Optional[Dict[str, Any]]:
+    """
+    A/Bローテーションでは、対象銘柄が未登録側にいる瞬間だけ板が取れない。
+    SUMMARY_AIの発注直前だけ短時間待って再取得し、即スキップを減らす。
+    """
+    attempts = 0
+    deadline = time.monotonic() + max(0.0, ENTRY_ORDER_BOARD_RETRY_SEC)
+    interval = max(0.05, ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC)
+
+    while True:
+        attempts += 1
+        try:
+            board = get_latest_bid_ask(symbol)
+        except Exception:
+            board = None
+
+        if board:
+            if attempts > 1:
+                logger.info(
+                    "[ENTRY ORDER BOARD RETRY] board recovered symbol=%s side=%s source=%s attempts=%d",
+                    symbol,
+                    side,
+                    source,
+                    attempts,
+                )
+            return board
+
+        if not ENTRY_ORDER_BOARD_RETRY_ENABLED:
+            return None
+
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "[ENTRY ORDER BOARD RETRY] board missing after retry symbol=%s side=%s source=%s attempts=%d retry_sec=%.3f",
+                symbol,
+                side,
+                source,
+                attempts,
+                ENTRY_ORDER_BOARD_RETRY_SEC,
+            )
+            return None
+
+        time.sleep(interval)
 
 
 def _low_move_hard_block(entry_row: Dict[str, Any], *, symbol: str, source: str) -> Optional[Dict[str, Any]]:
@@ -460,26 +518,39 @@ def build_entry_order(*, symbol: str, side: str, source: str, entry_row: Dict[st
         return five_sec_ng
 
     if source == "SUMMARY_AI":
-        board = get_latest_bid_ask(symbol)
+        board = _get_board_with_retry(symbol, source=source, side=side)
         if board:
             bid = board.get("bid_price")
             ask = board.get("ask_price")
             if not bid or not ask or bid <= 0 or ask <= 0:
-                return _ng("INVALID_BOARD", board=board)
-            spread_pct = (ask - bid) / bid * 100
-            base_price = bid if side == "SELL" else ask
-            price_source = "board_bid_ask_safe_limit"
-            if ALLOW_MARKET_IF_BAD_BOARD and spread_pct > MAX_SPREAD_PCT_FOR_LIMIT:
-                return _ng("SPREAD_TOO_WIDE", symbol=symbol, side=side, spread_pct=spread_pct, max_spread_pct=MAX_SPREAD_PCT_FOR_LIMIT, bid=bid, ask=ask)
-            price = _aggressive_limit_price(float(base_price), side)
-            order_type = "LIMIT"
-        else:
+                if ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY:
+                    return _ng("INVALID_BOARD", board=board, require_board=True)
+                board = None
+            else:
+                spread_pct = (ask - bid) / bid * 100
+                base_price = bid if side == "SELL" else ask
+                price_source = "board_bid_ask_safe_limit"
+                if ALLOW_MARKET_IF_BAD_BOARD and spread_pct > MAX_SPREAD_PCT_FOR_LIMIT:
+                    return _ng("SPREAD_TOO_WIDE", symbol=symbol, side=side, spread_pct=spread_pct, max_spread_pct=MAX_SPREAD_PCT_FOR_LIMIT, bid=bid, ask=ask)
+                price = _aggressive_limit_price(float(base_price), side)
+                order_type = "LIMIT"
+        if not board:
+            if ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY:
+                return _ng(
+                    "STRICT_BOARD_MISSING",
+                    symbol=symbol,
+                    side=side,
+                    source=source,
+                    retry_enabled=ENTRY_ORDER_BOARD_RETRY_ENABLED,
+                    retry_sec=ENTRY_ORDER_BOARD_RETRY_SEC,
+                    message="板が取れないためSUMMARY_AI新規エントリーを停止",
+                )
             base_price = entry_row.get("close_price") or entry_row.get("price") or entry_row.get("current_price") or entry_row.get("close") or entry_row.get("vwap")
             if not base_price or base_price <= 0:
                 return _ng("NO_PRICE_SOURCE")
             price = _aggressive_limit_price(float(base_price), side)
             order_type = "LIMIT"
-            price_source = "summary_fallback_safe_limit"
+            price_source = "summary_fallback_safe_limit_after_board_retry"
     else:
         base_price = five_sec_breakout(symbol, side)
         if not base_price:
@@ -533,6 +604,9 @@ def build_entry_order(*, symbol: str, side: str, source: str, entry_row: Dict[st
         "mtf_guard": bool(ENTRY_ORDER_MTF_GUARD_ENABLED and source == "SUMMARY_AI"),
         "require_mtf_data": ENTRY_ORDER_REQUIRE_MTF_DATA,
         "sell_ignore_positive_mtf": ENTRY_ORDER_SELL_IGNORE_POSITIVE_MTF,
+        "board_retry_enabled": ENTRY_ORDER_BOARD_RETRY_ENABLED,
+        "board_retry_sec": ENTRY_ORDER_BOARD_RETRY_SEC,
+        "require_board_for_summary": ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY,
     }
     if qty_override is not None:
         detail["qty_override"] = True
