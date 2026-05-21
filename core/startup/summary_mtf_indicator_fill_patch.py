@@ -1,20 +1,26 @@
 # ============================================================
 # File   : core/startup/summary_mtf_indicator_fill_patch.py
-# Version: V1.1-FILL-3M-5M-INDICATORS-LOCK-TOLERANT
+# Version: V2.0-FILL-1M-3M-5M-WITH-HISTORY
 # ------------------------------------------------------------
 # summary_multiframe_startup_catchup_patch はOHLCVを作るが、
 # rsi/macd/signal/ma75/score_mtf/final_score などの指標列は
 # 通常サマリー計算まで0/50/NULLになりやすい。
 #
-# このパッチは起動時に stock_summary_3min / stock_summary_5min を読み、
+# このパッチは起動時に stock_summary_1min / 3min / 5min を読み、
 # 銘柄ごとに基本テクニカルを再計算してDBへUPDATEする。
 #
-# V1.1:
-#   - NAS SQLite の database is locked 対策
-#   - UPDATEを小分けchunk化し、chunkごとにcommitしてロック保持時間を短縮
-#   - locked時は指数バックオフでretry
-#   - startup等の補完処理が重複起動しても同時実行しないrun_fillガード追加
-#   - skip_if_busy=true の場合、ロックが解けないchunkは全体失敗にせず部分更新で終了
+# V2.0:
+#   - 1分足 stock_summary_1min も補完対象に追加
+#   - 当日DBだけでなく、過去 summaryYYYYMMDD.db を先頭に結合してから計算
+#   - 計算は「過去足 + 当日足」で行い、UPDATEは当日DBのrowidだけに限定
+#   - 途中からランキング/監視に入った銘柄でも rsi/macd/signal/ma75 の先頭NULLを減らす
+#   - NAS SQLite の database is locked 対策、chunk commit、skip_if_busy は維持
+#
+# 主な環境変数:
+#   SUMMARY_MTF_INDICATOR_INTERVALS=1,3,5
+#   SUMMARY_MTF_INDICATOR_HISTORY_DAYS=7
+#   SUMMARY_MTF_INDICATOR_LOOKBACK_BARS=180
+#   SUMMARY_MTF_INDICATOR_MAX_ROWS=250000
 # ============================================================
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ import datetime as dt
 import logging
 import os
 import random
+import re
 import sqlite3
 import threading
 import time
@@ -78,17 +85,59 @@ def _summary_db_path() -> str:
     return str(Path(base) / f"summary{today}.db")
 
 
+def _extract_yyyymmdd(path: str) -> str:
+    try:
+        m = re.search(r"summary(\d{8})\.db$", str(path))
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
+
+
+def _summary_db_paths_with_history(current_path: str) -> list[str]:
+    """current_path を最後に置き、前日以前のsummary DBを先に返す。
+
+    指標計算には過去足が必要だが、UPDATE対象は current_path のrowidだけにする。
+    土日/祝日を厳密判定せず、指定日数ぶん暦日で戻って存在するDBのみ採用する。
+    """
+    cur = Path(current_path)
+    out: list[str] = []
+    history_days = max(0, _env_int("SUMMARY_MTF_INDICATOR_HISTORY_DAYS", 7))
+    ymd = _extract_yyyymmdd(current_path)
+    if not ymd:
+        return [current_path]
+    try:
+        base_date = dt.datetime.strptime(ymd, "%Y%m%d").date()
+    except Exception:
+        return [current_path]
+
+    for i in range(history_days, 0, -1):
+        d = base_date - dt.timedelta(days=i)
+        p = cur.with_name(f"summary{d.strftime('%Y%m%d')}.db")
+        if p.exists():
+            out.append(str(p))
+    out.append(str(cur))
+    # 念のため重複排除
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for p in out:
+        key = os.path.abspath(p).lower()
+        if key not in seen:
+            uniq.append(p)
+            seen.add(key)
+    return uniq
+
+
 def _parse_intervals() -> list[int]:
-    raw = os.getenv("SUMMARY_MTF_INDICATOR_INTERVALS", "3,5")
+    raw = os.getenv("SUMMARY_MTF_INDICATOR_INTERVALS", "1,3,5")
     out: list[int] = []
     for x in str(raw).replace(";", ",").split(","):
         try:
             n = int(float(x.strip()))
-            if n in (3, 5) and n not in out:
+            if n in (1, 3, 5) and n not in out:
                 out.append(n)
         except Exception:
             pass
-    return out or [3, 5]
+    return out or [1, 3, 5]
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> list[str]:
@@ -175,7 +224,8 @@ def _compute_indicators(df):
     df["symbol"] = df["symbol"].map(_norm_symbol)
     df["dtv"] = pd.to_datetime(df["dtv"], errors="coerce")
     df = df.dropna(subset=["symbol", "dtv"])
-    df = df.sort_values(["symbol", "dtv"])
+    df = df[df["symbol"].astype(str).str.len() > 0]
+    df = df.sort_values(["symbol", "dtv", "_is_target", "_rowid"], na_position="first")
 
     for c in ["open_price", "high_price", "low_price", "close_price", "volume", "turnover"]:
         if c not in df.columns:
@@ -184,7 +234,7 @@ def _compute_indicators(df):
 
     out_parts = []
     for sym, g in df.groupby("symbol", sort=False):
-        g = g.sort_values("dtv").copy()
+        g = g.sort_values(["dtv", "_is_target", "_rowid"], na_position="first").copy()
         close = g["close_price"].astype(float)
         high = g["high_price"].replace(0, np.nan).fillna(close).astype(float)
         low = g["low_price"].replace(0, np.nan).fillna(close).astype(float)
@@ -249,9 +299,7 @@ def _compute_indicators(df):
     return pd.concat(out_parts, ignore_index=True)
 
 
-def _load_table_df(conn: sqlite3.Connection, table: str, cols: list[str], interval: int):
-    import pandas as pd
-
+def _build_select_sql(table: str, cols: list[str], *, current_db: bool, interval: int) -> tuple[str, tuple[Any, ...]]:
     sym = _pick(cols, ["symbol", "code", "stock_code"])
     dtc = _pick(cols, ["datetime", "dt", "timestamp"])
     datec = _pick(cols, ["date", "trade_date"])
@@ -263,15 +311,20 @@ def _load_table_df(conn: sqlite3.Connection, table: str, cols: list[str], interv
     vol = _pick(cols, ["volume", "vol"])
     turn = _pick(cols, ["turnover", "turnover_yen", "trading_value"])
     if not sym or not cl or not (dtc or (datec and timec)):
-        return pd.DataFrame()
+        return "", ()
 
     dtexpr = dtc if dtc else f"({datec} || ' ' || {timec})"
-    lookback_bars = _env_int("SUMMARY_MTF_INDICATOR_LOOKBACK_BARS", 120)
-    lookback_min = max(interval * lookback_bars + 30, interval * 75 + 30)
+    lookback_bars = _env_int("SUMMARY_MTF_INDICATOR_LOOKBACK_BARS", 180)
+    # 75MA / MACD signal / 5分足75本を考慮して、多めに読む
+    lookback_min = max(interval * lookback_bars + 30, interval * 90 + 30)
     since = (dt.datetime.now() - dt.timedelta(minutes=lookback_min)).strftime("%Y-%m-%d %H:%M:%S")
-    max_rows = _env_int("SUMMARY_MTF_INDICATOR_MAX_ROWS", 120000)
+    max_rows = _env_int("SUMMARY_MTF_INDICATOR_MAX_ROWS", 250000)
+
+    rowid_expr = "rowid" if current_db else "NULL"
+    target_expr = "1" if current_db else "0"
     sql = f"""
-        SELECT rowid AS _rowid,
+        SELECT {rowid_expr} AS _rowid,
+               {target_expr} AS _is_target,
                CAST({sym} AS TEXT) AS symbol,
                {dtexpr} AS dtv,
                {op if op else cl} AS open_price,
@@ -285,12 +338,76 @@ def _load_table_df(conn: sqlite3.Connection, table: str, cols: list[str], interv
         ORDER BY symbol, dtv
         LIMIT ?
     """
-    return pd.read_sql_query(sql, conn, params=(since, max_rows))
+    return sql, (since, max_rows)
+
+
+def _load_one_table_df(path: str, table: str, interval: int, *, current_db: bool):
+    import pandas as pd
+
+    if not Path(path).exists():
+        return pd.DataFrame()
+    try:
+        timeout = _env_float("SUMMARY_MTF_INDICATOR_SQLITE_TIMEOUT", 30.0)
+        with sqlite3.connect(path, timeout=timeout) as conn:
+            _configure_connection(conn)
+            if not _table_exists(conn, table):
+                return pd.DataFrame()
+            cols = _columns(conn, table)
+            sql, params = _build_select_sql(table, cols, current_db=current_db, interval=interval)
+            if not sql:
+                return pd.DataFrame()
+            df = pd.read_sql_query(sql, conn, params=params)
+            df["_src_db"] = Path(path).name
+            return df
+    except sqlite3.OperationalError as e:
+        if _is_locked_error(e) and not current_db:
+            logger.warning("[SUMMARY MTF INDICATOR FILL] history db locked skip path=%s table=%s err=%s", path, table, e, exc_info=False)
+            return pd.DataFrame()
+        raise
+    except Exception as e:
+        logger.warning("[SUMMARY MTF INDICATOR FILL] load table failed path=%s table=%s err=%s", path, table, e, exc_info=False)
+        return pd.DataFrame()
+
+
+def _load_table_df_with_history(current_path: str, table: str, interval: int):
+    import pandas as pd
+
+    frames = []
+    paths = _summary_db_paths_with_history(current_path)
+    for p in paths:
+        current_db = os.path.abspath(p).lower() == os.path.abspath(current_path).lower()
+        dfp = _load_one_table_df(p, table, interval, current_db=current_db)
+        if dfp is not None and not dfp.empty:
+            frames.append(dfp)
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True)
+
+    # 同一 symbol/dtv が過去DBと当日DBに重複した場合は当日DBを優先
+    try:
+        df["_sym_norm"] = df["symbol"].map(_norm_symbol)
+        df["dtv"] = pd.to_datetime(df["dtv"], errors="coerce")
+        df = df.sort_values(["_sym_norm", "dtv", "_is_target"], na_position="first")
+        df = df.drop_duplicates(subset=["_sym_norm", "dtv"], keep="last")
+        df = df.drop(columns=["_sym_norm"], errors="ignore")
+    except Exception:
+        pass
+    return df
 
 
 def _update_table(conn: sqlite3.Connection, table: str, cols: list[str], df) -> int:
     if df is None or df.empty:
         return 0
+
+    # UPDATE対象は当日DBのrowidを持つ行だけ
+    try:
+        df = df[(df.get("_is_target", 0).astype(int) == 1) & df["_rowid"].notna()].copy()
+    except Exception:
+        df = df[df["_rowid"].notna()].copy()
+
+    if df.empty:
+        return 0
+
     wanted = [
         "rsi", "macd", "signal", "atr", "slope", "slope_atr_scaled", "score_slope",
         "ma5", "ma25", "ma75",
@@ -360,6 +477,19 @@ def _update_table(conn: sqlite3.Connection, table: str, cols: list[str], df) -> 
     return total_done
 
 
+def _null_stats(df) -> dict[str, int]:
+    try:
+        target = df[(df.get("_is_target", 0).astype(int) == 1) & df["_rowid"].notna()]
+        return {
+            "target_rows": int(len(target)),
+            "null_rsi": int(target["rsi"].isna().sum()) if "rsi" in target.columns else -1,
+            "null_macd": int(target["macd"].isna().sum()) if "macd" in target.columns else -1,
+            "null_signal": int(target["signal"].isna().sum()) if "signal" in target.columns else -1,
+        }
+    except Exception:
+        return {}
+
+
 def _run_fill_impl(*, reason: str = "manual") -> dict[str, Any]:
     t0 = time.monotonic()
     path = _summary_db_path()
@@ -371,6 +501,11 @@ def _run_fill_impl(*, reason: str = "manual") -> dict[str, Any]:
     try:
         total = 0
         timeout = _env_float("SUMMARY_MTF_INDICATOR_SQLITE_TIMEOUT", 30.0)
+        history_paths = _summary_db_paths_with_history(path)
+        logger.warning(
+            "[SUMMARY MTF INDICATOR FILL] start reason=%s intervals=%s history_dbs=%s current=%s",
+            reason, _parse_intervals(), [Path(p).name for p in history_paths], path,
+        )
         with sqlite3.connect(path, timeout=timeout) as conn:
             _configure_connection(conn)
             for interval in _parse_intervals():
@@ -380,20 +515,25 @@ def _run_fill_impl(*, reason: str = "manual") -> dict[str, Any]:
                 if not _table_exists(conn, table):
                     detail["error"] = "table_missing"
                     continue
+
                 cols = _columns(conn, table)
-                df = _load_table_df(conn, table, cols, interval)
+                df = _load_table_df_with_history(path, table, interval)
                 detail["loaded"] = int(len(df)) if df is not None else 0
+                detail["history_dbs"] = len(history_paths)
                 if df is None or df.empty:
                     detail["updated"] = 0
                     continue
+
                 calc = _compute_indicators(df)
+                detail["after_calc_null_stats"] = _null_stats(calc)
                 updated = _update_table(conn, table, cols, calc)
                 total += updated
                 detail["updated"] = updated
                 logger.warning(
-                    "[SUMMARY MTF INDICATOR FILL] interval=%s loaded=%s updated=%s table=%s",
-                    interval, len(df), updated, table,
+                    "[SUMMARY MTF INDICATOR FILL] interval=%s loaded=%s updated=%s table=%s null_stats=%s",
+                    interval, len(df), updated, table, detail.get("after_calc_null_stats"),
                 )
+
         result.update({"ok": True, "updated": total, "elapsed": round(time.monotonic() - t0, 3)})
         logger.warning("[SUMMARY MTF INDICATOR FILL] done reason=%s updated=%s elapsed=%.3fs db=%s", reason, total, time.monotonic() - t0, path)
         return result
@@ -406,7 +546,7 @@ def _run_fill_impl(*, reason: str = "manual") -> dict[str, Any]:
 def run_fill(*, reason: str = "manual") -> dict[str, Any]:
     """MTF指標補完の公開入口。
 
-    旧版では background startup と after_mtf_catchup 等が同時に走る可能性があった。
+    background startup と after_mtf_catchup 等が同時に走る可能性がある。
     NAS上のSQLiteでは同時UPDATEが locked の主因になるため、入口で直列化する。
     """
     global _RUNNING
@@ -439,9 +579,10 @@ def install() -> bool:
         return False
     _INSTALLED = True
     logger.warning(
-        "[SUMMARY MTF INDICATOR FILL] installed intervals=%s delay=%.1fs chunk=%s retries=%s skip_if_busy=%s",
+        "[SUMMARY MTF INDICATOR FILL] installed intervals=%s delay=%.1fs history_days=%s chunk=%s retries=%s skip_if_busy=%s",
         _parse_intervals(),
         _env_float("SUMMARY_MTF_INDICATOR_START_DELAY_SEC", 4.0),
+        _env_int("SUMMARY_MTF_INDICATOR_HISTORY_DAYS", 7),
         _env_int("SUMMARY_MTF_INDICATOR_UPDATE_CHUNK_SIZE", 200),
         _env_int("SUMMARY_MTF_INDICATOR_LOCK_RETRIES", 8),
         _env_bool("SUMMARY_MTF_INDICATOR_SKIP_IF_BUSY", True),
@@ -449,6 +590,7 @@ def install() -> bool:
     th = threading.Thread(target=_run_background, args=("startup",), name="summary-mtf-indicator-fill", daemon=True)
     th.start()
     return True
+
 
 try:
     install()
