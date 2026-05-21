@@ -1,10 +1,11 @@
 # ============================================================
 # File   : trading/ranking/ranking_summary_adapter.py
-# Version: Ver1.1-ITER-TRADE-DATES-COMPAT
+# Version: Ver1.2-YAHOO-MERGE-COLUMN-COMPAT
 # ------------------------------------------------------------
 # ✔ iter_trade_dates(max_days=...) 非対応環境でも動くよう互換化
 # ✔ ランキング由来エントリーの TECH SCORE 生成で落ちないようにする
 # ✔ 取得対象営業日が不足する場合は平日フォールバックで補完
+# ✔ Yahoo補完DFの列名揺れ datetime/close を吸収
 # ============================================================
 from __future__ import annotations
 
@@ -57,11 +58,129 @@ def _calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return rsi
 
 
+def _first_existing_col(df: pd.DataFrame, names: tuple[str, ...]) -> str | None:
+    """
+    大文字小文字の揺れも含めて最初に存在する列名を返す。
+    """
+    if df is None or df.empty:
+        return None
+    cols = list(df.columns)
+    lower_map = {str(c).lower(): c for c in cols}
+    for name in names:
+        if name in df.columns:
+            return name
+        hit = lower_map.get(str(name).lower())
+        if hit is not None:
+            return hit
+    return None
+
+
+def _normalize_yahoo_df_for_merge(yahoo_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    load_yahoo_1min_range の戻り列名揺れを吸収して、
+    symbol / datetime / yahoo_close だけのDFに正規化する。
+
+    想定外の列名でも ERROR にせず WARNING でスキップ可能にする。
+    """
+    if yahoo_df is None or yahoo_df.empty:
+        return pd.DataFrame()
+
+    y = yahoo_df.copy()
+
+    symbol_col = _first_existing_col(
+        y,
+        (
+            "symbol",
+            "code",
+            "stock_code",
+            "Symbol",
+            "銘柄コード",
+        ),
+    )
+    dt_col = _first_existing_col(
+        y,
+        (
+            "datetime",
+            "Datetime",
+            "timestamp",
+            "Timestamp",
+            "date_time",
+            "DateTime",
+            "time",
+            "Time",
+            "date",
+            "Date",
+        ),
+    )
+    close_col = _first_existing_col(
+        y,
+        (
+            "yahoo_close",
+            "close",
+            "Close",
+            "close_price",
+            "current_price",
+            "price",
+            "終値",
+        ),
+    )
+
+    # date + time 別列の場合
+    if dt_col is None:
+        date_col = _first_existing_col(y, ("date", "Date", "日付"))
+        time_col = _first_existing_col(y, ("time", "Time", "時刻"))
+        if date_col is not None and time_col is not None:
+            y["__datetime__"] = y[date_col].astype(str) + " " + y[time_col].astype(str)
+            dt_col = "__datetime__"
+
+    missing = []
+    if symbol_col is None:
+        missing.append("symbol")
+    if dt_col is None:
+        missing.append("datetime")
+    if close_col is None:
+        missing.append("close")
+
+    if missing:
+        logger.warning(
+            "[RANKING_ADAPTER] Yahoo merge skipped missing=%s columns=%s",
+            missing,
+            list(y.columns),
+        )
+        return pd.DataFrame()
+
+    out = pd.DataFrame(
+        {
+            "symbol": y[symbol_col].astype(str).str.strip(),
+            "datetime": y[dt_col].apply(_normalize_datetime),
+            "yahoo_close": pd.to_numeric(y[close_col], errors="coerce"),
+        }
+    )
+    out = out.dropna(subset=["datetime", "yahoo_close"])
+    out = out[out["symbol"] != ""]
+
+    if out.empty:
+        logger.warning(
+            "[RANKING_ADAPTER] Yahoo merge skipped after normalize empty columns=%s",
+            list(yahoo_df.columns),
+        )
+        return pd.DataFrame()
+
+    # 同一symbol/datetimeが複数ある場合は最後を採用
+    out = out.sort_values(["symbol", "datetime"]).drop_duplicates(["symbol", "datetime"], keep="last")
+
+    logger.info(
+        "[RANKING_ADAPTER] Yahoo normalized rows=%s symbols=%s dt_min=%s dt_max=%s cols=%s",
+        len(out),
+        out["symbol"].nunique(),
+        out["datetime"].min(),
+        out["datetime"].max(),
+        list(yahoo_df.columns),
+    )
+    return out
+
+
 def _fallback_trade_dates(end_date: dt.date, max_trade_days: int) -> list[dt.date]:
-    """
-    iter_trade_dates が新旧どちらの引数にも合わない場合の安全フォールバック。
-    厳密な祝日判定ではないが、ランキングエントリー停止より安全。
-    """
     out: list[dt.date] = []
     d = end_date - dt.timedelta(days=1)
     guard = 0
@@ -74,17 +193,6 @@ def _fallback_trade_dates(end_date: dt.date, max_trade_days: int) -> list[dt.dat
 
 
 def _iter_trade_dates_compat(end_date: dt.date, max_trade_days: int) -> list[dt.date]:
-    """
-    trading.summary.calculator.iter_trade_dates のシグネチャ差異を吸収する。
-
-    既存ログのエラー:
-      TypeError: iter_trade_dates() got an unexpected keyword argument 'max_days'
-
-    対策:
-      1) max_days 対応版なら keyword で呼ぶ
-      2) 非対応なら positional を試す
-      3) それも駄目なら平日フォールバック
-    """
     try:
         sig = inspect.signature(iter_trade_dates)
         if "max_days" in sig.parameters:
@@ -135,9 +243,6 @@ def build_ranking_like_summary_1min(
 
     symbols = [str(s) for s in symbols]
 
-    # --------------------------------------------------------
-    # 当日 + 過去営業日を必ず含める
-    # --------------------------------------------------------
     trade_dates = [end_time.date()]
     for d in _iter_trade_dates_compat(end_time.date(), max_trade_days=max_trade_days):
         if d not in trade_dates:
@@ -200,9 +305,6 @@ def build_ranking_like_summary_1min(
         logger.warning("[RANKING_ADAPTER] snapshot data empty")
         return pd.DataFrame()
 
-    # --------------------------------------------------------
-    # 正規化（summary 互換）
-    # --------------------------------------------------------
     df_all = (
         pd.concat(dfs, ignore_index=True)
         .rename(
@@ -234,23 +336,32 @@ def build_ranking_like_summary_1min(
             end=end_time,
         )
 
-        if yahoo_df is not None and not yahoo_df.empty:
-            yahoo_df = yahoo_df.rename(columns={"close": "yahoo_close"})
+        ymerge = _normalize_yahoo_df_for_merge(yahoo_df)
+        if ymerge is not None and not ymerge.empty:
+            before_missing = int(df_all["close_price"].isna().sum())
 
             df_all = pd.merge(
                 df_all,
-                yahoo_df[["symbol", "datetime", "yahoo_close"]],
+                ymerge[["symbol", "datetime", "yahoo_close"]],
                 on=["symbol", "datetime"],
                 how="left",
             )
 
-            mask = df_all["close_price"].isna()
+            mask = df_all["close_price"].isna() & df_all["yahoo_close"].notna()
+            filled = int(mask.sum())
             df_all.loc[mask, "close_price"] = df_all.loc[mask, "yahoo_close"]
-
             df_all = df_all.drop(columns=["yahoo_close"])
 
+            logger.info(
+                "[RANKING_ADAPTER] Yahoo merge ok yahoo_rows=%s missing_before=%s filled=%s",
+                len(ymerge),
+                before_missing,
+                filled,
+            )
+
     except Exception:
-        logger.exception("[RANKING_ADAPTER] Yahoo merge failed (ignored)")
+        # ランキングエントリー本体を止めないため、ERRORではなくWARNINGに落とす
+        logger.warning("[RANKING_ADAPTER] Yahoo merge failed ignored", exc_info=True)
 
     # --------------------------------------------------------
     # calculate_summary 互換カラム補完
@@ -265,9 +376,6 @@ def build_ranking_like_summary_1min(
     df_all["low_price"] = df_all["close_price"]
     df_all["turnover"] = pd.to_numeric(df_all["close_price"], errors="coerce").fillna(0.0) * pd.to_numeric(df_all["volume"], errors="coerce").fillna(0.0)
 
-    # --------------------------------------------------------
-    # Ranking 強度 MA / RSI（価格とは独立思想）
-    # --------------------------------------------------------
     out_dfs: list[pd.DataFrame] = []
 
     for symbol, g in df_all.groupby("symbol"):
