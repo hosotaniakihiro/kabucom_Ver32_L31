@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/tonosama/config.py
-# Version: Ver1.0-TONOSAMA-ENTRY-CONFIG
+# Version: Ver1.1-TONOSAMA-ENTRY-CONFIG-FAST-5SEC
 # ============================================================
 from __future__ import annotations
 
@@ -20,3 +20,7 @@ MAX_PENDING_PER_LOOP = 20
 MAX_CANDIDATES = 80
 SCHEDULER_INTERVAL_SEC = 15
 DISCORD_NOTIFY_ON_PENDING = True
+
+# 5秒足確認は重いため、全銘柄ではなく1分足側の一次フィルタ通過後の上位だけに限定する。
+# 15秒ジョブが100秒以上詰まって previous_still_running になる事故を防ぐ。
+MAX_5SEC_FEATURE_SYMBOLS = 30
