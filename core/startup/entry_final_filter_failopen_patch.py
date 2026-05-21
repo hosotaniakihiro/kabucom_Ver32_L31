@@ -1,0 +1,123 @@
+# ============================================================
+# File   : core/startup/entry_final_filter_failopen_patch.py
+# Version: V1.0-RANGE5M-DIRECTION-FAILOPEN
+# ------------------------------------------------------------
+# 【目的】
+#   候補・AI・pending までは通るのに、最後で全落ちする問題の緩和。
+#
+# 【対象】
+#   - range_5m_filter が 5分足欠損/未完成で False を返すケース
+#   - entry_direction_confirm が RecursionError で fail-safe NG になるケース
+#
+# 【方針】
+#   - 5分足元フィルタNGは、発注停止ではなく既存の低変動ガード側に任せる
+#   - 再帰/例外は fail-open して、他の流動性・板・価格・信用ガードに任せる
+# ============================================================
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any
+
+logger = logging.getLogger(__name__)
+_PATCHED = False
+
+
+def _env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        return bool(default)
+
+
+def install() -> bool:
+    global _PATCHED
+    if _PATCHED:
+        return True
+
+    try:
+        import trading.handlers.entry_controller as ec
+    except Exception:
+        logger.exception("[ENTRY FINAL FILTER FAILOPEN] entry_controller import failed")
+        return False
+
+    # --------------------------------------------------------
+    # 1) range_5m_filter fail-open wrapper
+    # --------------------------------------------------------
+    try:
+        orig_range = getattr(ec, "range_5m_filter", None)
+        if callable(orig_range) and not getattr(orig_range, "_range5m_failopen_wrapper", False):
+
+            def _range5m_failopen(entry_row: Any = None, *args, **kwargs):
+                try:
+                    ret = orig_range(entry_row, *args, **kwargs)
+                    if isinstance(ret, tuple):
+                        return ret
+                    if ret is False and _env_bool("RANGE_5M_FILTER_NG_FAIL_OPEN", True):
+                        logger.warning(
+                            "[ENTRY FINAL FILTER FAILOPEN] range_5m_filter returned NG -> fail-open. Other guards still apply."
+                        )
+                        return True
+                    return ret
+                except RecursionError:
+                    allow = _env_bool("RANGE_5M_FILTER_RECURSION_FAIL_OPEN", True)
+                    logger.error("[ENTRY FINAL FILTER FAILOPEN] range_5m_filter recursion. fail_open=%s", allow, exc_info=False)
+                    return bool(allow)
+                except Exception as e:
+                    allow = _env_bool("RANGE_5M_FILTER_ERROR_FAIL_OPEN", True)
+                    logger.warning("[ENTRY FINAL FILTER FAILOPEN] range_5m_filter error. fail_open=%s err=%s", allow, e, exc_info=False)
+                    return bool(allow)
+
+            _range5m_failopen._range5m_failopen_wrapper = True  # type: ignore[attr-defined]
+            _range5m_failopen._original_range_5m_filter = orig_range  # type: ignore[attr-defined]
+            setattr(ec, "range_5m_filter", _range5m_failopen)
+            logger.warning("[ENTRY FINAL FILTER FAILOPEN] range_5m_filter wrapper installed")
+    except Exception:
+        logger.exception("[ENTRY FINAL FILTER FAILOPEN] range_5m wrapper install failed")
+
+    # --------------------------------------------------------
+    # 2) pure direction confirm fail-open wrapper
+    # --------------------------------------------------------
+    try:
+        import core.startup.entry_direction_confirm_guard_patch as dgp
+        orig_check = getattr(dgp, "check_entry_direction_confirm", None)
+        if callable(orig_check) and not getattr(orig_check, "_direction_failopen_wrapper", False):
+
+            def _direction_failopen(entry_row: Any = None, *args, **kwargs) -> bool:
+                try:
+                    return bool(orig_check(entry_row, *args, **kwargs))
+                except RecursionError:
+                    allow = _env_bool("ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN", True)
+                    logger.error("[ENTRY FINAL FILTER FAILOPEN] direction confirm recursion. fail_open=%s", allow, exc_info=False)
+                    return bool(allow)
+                except Exception as e:
+                    allow = _env_bool("ENTRY_DIRECTION_CONFIRM_ERROR_FAIL_OPEN", True)
+                    logger.warning("[ENTRY FINAL FILTER FAILOPEN] direction confirm error. fail_open=%s err=%s", allow, e, exc_info=False)
+                    return bool(allow)
+
+            _direction_failopen._direction_failopen_wrapper = True  # type: ignore[attr-defined]
+            _direction_failopen._original_check_entry_direction_confirm = orig_check  # type: ignore[attr-defined]
+            dgp.check_entry_direction_confirm = _direction_failopen
+            logger.warning("[ENTRY FINAL FILTER FAILOPEN] direction confirm wrapper installed")
+    except Exception:
+        logger.exception("[ENTRY FINAL FILTER FAILOPEN] direction wrapper install failed")
+
+    _PATCHED = True
+    logger.warning(
+        "[ENTRY FINAL FILTER FAILOPEN] installed range_fail_open=%s direction_recursion_fail_open=%s",
+        _env_bool("RANGE_5M_FILTER_NG_FAIL_OPEN", True),
+        _env_bool("ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN", True),
+    )
+    return True
+
+
+try:
+    install()
+except Exception:
+    logger.exception("[ENTRY FINAL FILTER FAILOPEN] auto install failed")
+
+__all__ = ["install"]
