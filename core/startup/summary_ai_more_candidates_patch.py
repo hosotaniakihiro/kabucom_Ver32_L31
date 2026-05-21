@@ -1,26 +1,14 @@
 # ============================================================
 # File   : core/startup/summary_ai_more_candidates_patch.py
-# Version: Ver1.0-SUMMARY-AI-MORE-CANDIDATES
+# Version: Ver1.1-SUMMARY-AI-MORE-CANDIDATES-WITH-CONTROLLER-ENRICH
 # ------------------------------------------------------------
 # 【目的】
 #   AIに「もっとエントリーできるか」を確認させるため、
 #   SUMMARY_AI runner へ渡す候補数を起動時に拡張する。
 #
-# 【背景】
-#   runner.py / candidates.py は既定 TOP20。
-#   実際には候補抽出・傾き・殿様フィルタなどでAI前に削られるため、
-#   AIが見る母数を増やす。
-#
-# 【既定値】
-#   SUMMARY_AI_MORE_CANDIDATES_ENABLED=1
-#   SUMMARY_AI_ENTRY_TOP_N=40
-#   SUMMARY_AI_TONOSAMA_MAX_CANDIDATES=40
-#   SUMMARY_AI_ENTRY_BYPASS_SLOPE_FILTER=0
-#
-# 【注意】
-#   - AI確認候補数を増やすだけで、無条件に発注数を増やすものではない。
-#   - 発注可否は従来どおり AI gate / executor / entry_controller / order_builder が判定する。
-#   - slope filter を完全に外したい場合だけ SUMMARY_AI_ENTRY_BYPASS_SLOPE_FILTER=1 を使う。
+# 【Ver1.1 追加】
+#   - summary_controller_enrich_runtime_patch を同時に install
+#   - 表示/保存/AI前の df_latest に ranking / daily MTF を付与する
 # ============================================================
 
 from __future__ import annotations
@@ -55,8 +43,22 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _install_controller_enrich_patch() -> bool:
+    try:
+        from core.startup.summary_controller_enrich_runtime_patch import install as install_enrich
+        ok = bool(install_enrich())
+        logger.warning("[SUMMARY AI MORE CANDIDATES PATCH] summary_controller_enrich_runtime_patch installed=%s", ok)
+        return ok
+    except Exception:
+        logger.exception("[SUMMARY AI MORE CANDIDATES PATCH] summary_controller_enrich_runtime_patch install failed")
+        return False
+
+
 def install() -> bool:
     global _INSTALLED
+
+    # summary_controller 側の補強は、このpatchが既に入っていても再install確認する。
+    _install_controller_enrich_patch()
 
     if _INSTALLED:
         logger.warning("[SUMMARY AI MORE CANDIDATES PATCH] already installed")
@@ -74,7 +76,6 @@ def install() -> bool:
         tonosama_max = max(20, _env_int("SUMMARY_AI_TONOSAMA_MAX_CANDIDATES", top_n))
         bypass_slope = _env_bool("SUMMARY_AI_ENTRY_BYPASS_SLOPE_FILTER", False)
 
-        # module定数も更新。ただし関数デフォルト引数は定義時に固定されるため、下でwrapperも入れる。
         try:
             runner.DEFAULT_AI_ENTRY_TOP_N = top_n
             runner.DEFAULT_TONOSAMA_AI_CANDIDATES = tonosama_max
@@ -97,7 +98,6 @@ def install() -> bool:
 
         @functools.wraps(original)
         def _wrapped_run_summary_ai_entry_from_df(*args: Any, **kwargs: Any):
-            # callerが明示指定していない場合だけ、AI確認候補数を増やす。
             explicit_top_n = any(k in kwargs for k in ("top_n", "max_candidates", "candidate_limit"))
             if not explicit_top_n:
                 kwargs["top_n"] = top_n
@@ -105,7 +105,6 @@ def install() -> bool:
             if "tonosama_max_candidates" not in kwargs:
                 kwargs["tonosama_max_candidates"] = tonosama_max
 
-            # 通常は傾きフィルタを維持。必要時だけAI前slope filterをバイパスする。
             if bypass_slope and "use_pre_slope_filter" not in kwargs:
                 kwargs["use_pre_slope_filter"] = False
 
