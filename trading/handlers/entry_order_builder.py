@@ -1,6 +1,6 @@
 # ==========================================================
 # trading/handlers/entry_order_builder.py
-# Ver1.9.0-SELL-CREDIT-LIMIT-NO-DOWN-TICK
+# Ver2.0.0-LOW-MOVE-GUARD-ALL-ENTRY-SOURCES
 # ----------------------------------------------------------
 # ✔ 注文条件（price / order_type / qty）を決定するだけ
 # ✔ 副作用ゼロ（発注・global_state 操作なし）
@@ -13,10 +13,12 @@
 # ✔ SUMMARY_AI 発注直前に5秒足の向きを確認
 # ✔ SUMMARY_AI 発注直前にMTF/傾きの逆方向をブロック
 # ✔ スプレッド上限を環境変数化し、既定0.15%へ厳格化
-# ✔ Ver1.9:
-#   - SELL信用新規で base_price より下のLIMITを作らない
-#   - 3640 SELL 2453 -> 2450 のような下方向 aggressive 指値を禁止
-#   - kabu API 4002004 トリガチェックエラー対策
+# ✔ SELL信用新規で base_price より下のLIMITを作らない
+#
+# 【Ver2.0 追加】
+# ✔ 低変動ガードを SUMMARY_AI 限定から RANKING / TONOSAMA にも拡張
+# ✔ ENTRY_ORDER_LOW_MOVE_SOURCES で対象sourceを環境変数制御
+# ✔ 変動の少ないランキング銘柄を発注直前で止める
 # ==========================================================
 
 from __future__ import annotations
@@ -71,6 +73,11 @@ ENTRY_ORDER_SELL_IGNORE_POSITIVE_MTF = str(os.getenv("ENTRY_ORDER_SELL_IGNORE_PO
 
 ENTRY_ORDER_LOW_MOVE_GUARD_ENABLED = str(os.getenv("ENTRY_ORDER_LOW_MOVE_GUARD_ENABLED", "1")).lower() not in {
     "0", "false", "no", "off",
+}
+ENTRY_ORDER_LOW_MOVE_SOURCES = {
+    s.strip().upper()
+    for s in os.getenv("ENTRY_ORDER_LOW_MOVE_SOURCES", "SUMMARY_AI,RANKING,TONOSAMA,EARLY_SCALP").split(",")
+    if s.strip()
 }
 ENTRY_ORDER_MIN_RANGE_PCT = float(os.getenv("ENTRY_ORDER_MIN_RANGE_PCT", "0.006"))
 ENTRY_ORDER_MIN_ATR_RATIO = float(os.getenv("ENTRY_ORDER_MIN_ATR_RATIO", "0.0035"))
@@ -176,31 +183,87 @@ def _trade_guard_block(symbol: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _source_uses_low_move_guard(source: str) -> bool:
+    src = str(source or "").upper()
+    if "ALL" in ENTRY_ORDER_LOW_MOVE_SOURCES:
+        return True
+    return src in ENTRY_ORDER_LOW_MOVE_SOURCES
+
+
 def _low_move_hard_block(entry_row: Dict[str, Any], *, symbol: str, source: str) -> Optional[Dict[str, Any]]:
     if not ENTRY_ORDER_LOW_MOVE_GUARD_ENABLED:
         return None
-    if str(source or "").upper() != "SUMMARY_AI":
+    if not _source_uses_low_move_guard(source):
         return None
+
     row = entry_row or {}
     close = _safe_float(_first(row, ("close_price", "close", "price", "current_price"), 0.0), 0.0)
     high = _safe_float(_first(row, ("high_price", "high"), 0.0), 0.0)
     low = _safe_float(_first(row, ("low_price", "low"), 0.0), 0.0)
     atr = _safe_float(_first(row, ("atr_1m", "atr", "ATR", "atr14", "atr_14"), 0.0), 0.0)
+
     if close <= 0:
-        return _ng("LOW_MOVE_NO_CLOSE", symbol=symbol, close=close, min_range_pct=ENTRY_ORDER_MIN_RANGE_PCT, min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO)
+        return _ng(
+            "LOW_MOVE_NO_CLOSE",
+            symbol=symbol,
+            source=source,
+            close=close,
+            min_range_pct=ENTRY_ORDER_MIN_RANGE_PCT,
+            min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO,
+        )
+
+    range_checked = False
     if high > 0 and low > 0 and high >= low:
+        range_checked = True
         range_value = high - low
         range_pct = range_value / close if close > 0 else 0.0
         if range_pct < ENTRY_ORDER_MIN_RANGE_PCT:
-            return _ng("LOW_MOVE_RANGE_TOO_SMALL", symbol=symbol, close=close, high=high, low=low, range_value=range_value, range_pct=range_pct, min_range_pct=ENTRY_ORDER_MIN_RANGE_PCT)
+            return _ng(
+                "LOW_MOVE_RANGE_TOO_SMALL",
+                symbol=symbol,
+                source=source,
+                close=close,
+                high=high,
+                low=low,
+                range_value=range_value,
+                range_pct=range_pct,
+                min_range_pct=ENTRY_ORDER_MIN_RANGE_PCT,
+            )
     elif ENTRY_ORDER_REQUIRE_HIGH_LOW:
-        return _ng("LOW_MOVE_NO_HIGH_LOW", symbol=symbol, close=close, high=high, low=low, min_range_pct=ENTRY_ORDER_MIN_RANGE_PCT, min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO)
+        return _ng(
+            "LOW_MOVE_NO_HIGH_LOW",
+            symbol=symbol,
+            source=source,
+            close=close,
+            high=high,
+            low=low,
+            min_range_pct=ENTRY_ORDER_MIN_RANGE_PCT,
+            min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO,
+        )
+
     if atr > 0:
         atr_ratio = atr / close if close > 0 else 0.0
         if atr_ratio < ENTRY_ORDER_MIN_ATR_RATIO:
-            return _ng("LOW_MOVE_ATR_TOO_SMALL", symbol=symbol, close=close, atr=atr, atr_ratio=atr_ratio, min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO)
+            return _ng(
+                "LOW_MOVE_ATR_TOO_SMALL",
+                symbol=symbol,
+                source=source,
+                close=close,
+                atr=atr,
+                atr_ratio=atr_ratio,
+                min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO,
+            )
     elif ENTRY_ORDER_REQUIRE_ATR:
-        return _ng("LOW_MOVE_NO_ATR", symbol=symbol, close=close, atr=atr, min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO)
+        return _ng(
+            "LOW_MOVE_NO_ATR",
+            symbol=symbol,
+            source=source,
+            close=close,
+            atr=atr,
+            range_checked=range_checked,
+            min_atr_ratio=ENTRY_ORDER_MIN_ATR_RATIO,
+        )
+
     return None
 
 
@@ -346,8 +409,6 @@ def _aggressive_limit_price(base_price: float, side: str, ticks: int = SUMMARY_A
     tick = get_tick_size(rounded)
     n = max(0, int(ticks or 0))
     if side_u == "SELL" and not SELL_CREDIT_LIMIT_DOWN_TICK_ENABLED:
-        # 信用新規売りは base_price より下にぶつける指値を作らない。
-        # 2453 -> 2450 のような下方向指値は kabu API 4002004 の原因になる。
         up_ticks = max(0, int(SELL_CREDIT_LIMIT_UP_TICK_WHEN_BOARD_MISSING or 0))
         return rounded + tick * up_ticks
     if n <= 0:
@@ -381,18 +442,23 @@ def build_entry_order(*, symbol: str, side: str, source: str, entry_row: Dict[st
     price_source = None
     side = side.upper()
     source = source.upper()
+
     trade_guard_ng = _trade_guard_block(symbol)
     if trade_guard_ng is not None:
         return trade_guard_ng
+
     low_move_ng = _low_move_hard_block(entry_row, symbol=symbol, source=source)
     if low_move_ng is not None:
         return low_move_ng
+
     mtf_ng = _summary_mtf_direction_guard(entry_row, symbol=symbol, side=side, source=source)
     if mtf_ng is not None:
         return mtf_ng
+
     five_sec_ng = _five_sec_pre_entry_guard(symbol=symbol, side=side, source=source)
     if five_sec_ng is not None:
         return five_sec_ng
+
     if source == "SUMMARY_AI":
         board = get_latest_bid_ask(symbol)
         if board:
@@ -421,6 +487,7 @@ def build_entry_order(*, symbol: str, side: str, source: str, entry_row: Dict[st
         price = _round_price(base_price, side)
         order_type = "STOP"
         price_source = "five_sec_breakout"
+
     try:
         volume = float(entry_row.get("volume") or 0.0)
     except Exception:
@@ -429,6 +496,7 @@ def build_entry_order(*, symbol: str, side: str, source: str, entry_row: Dict[st
     trading_value = effective_price * volume if effective_price else 0.0
     if trading_value < 3_000_000:
         return _ng("LOW_LIQUIDITY", trading_value=trading_value, price=effective_price, volume=volume)
+
     forced_min_qty = False
     if qty_override is not None:
         qty = int(qty_override)
@@ -445,6 +513,7 @@ def build_entry_order(*, symbol: str, side: str, source: str, entry_row: Dict[st
                 forced_min_qty = True
     if qty <= 0:
         return _ng("QTY_ZERO", side=side, price=price, base_price=base_price, spread_pct=spread_pct, trading_value=trading_value)
+
     detail = {
         "order_type": order_type,
         "price": price,
@@ -457,7 +526,8 @@ def build_entry_order(*, symbol: str, side: str, source: str, entry_row: Dict[st
         "aggressive_limit_ticks": SUMMARY_AGGRESSIVE_LIMIT_TICKS if source == "SUMMARY_AI" and order_type == "LIMIT" and side == "BUY" else 0,
         "sell_credit_limit_down_tick_enabled": SELL_CREDIT_LIMIT_DOWN_TICK_ENABLED,
         "trade_guard": True,
-        "low_move_guard": bool(ENTRY_ORDER_LOW_MOVE_GUARD_ENABLED and source == "SUMMARY_AI"),
+        "low_move_guard": bool(ENTRY_ORDER_LOW_MOVE_GUARD_ENABLED and _source_uses_low_move_guard(source)),
+        "low_move_sources": sorted(ENTRY_ORDER_LOW_MOVE_SOURCES),
         "five_sec_guard": bool(ENTRY_ORDER_5S_GUARD_ENABLED and source == "SUMMARY_AI"),
         "require_5s_data": ENTRY_ORDER_REQUIRE_5S_DATA,
         "mtf_guard": bool(ENTRY_ORDER_MTF_GUARD_ENABLED and source == "SUMMARY_AI"),
