@@ -1,36 +1,77 @@
 # ============================================================
 # trading/ranking/ranking_aggregate_builder.py
-# Ver1.2-FINAL-RANKING-AGGREGATE-BREADTH-STRENGTH-STABLE
+# Ver1.3-EMPTY-SAFE-RANK-COLUMN-COMPAT
 # ------------------------------------------------------------
 # ✔ 複数ランキング種別を symbol 単位で統合
 # ✔ 出現回数 / 最良順位 / 平均順位 を完全保持
 # ✔ breadth（話題性の広さ）を固定スケールで安定評価
 # ✔ strength（順位の強さ）を best + avg の複合で評価
-# ✔ ranking_summary_adapter への入力ユニバース生成専用
-# ✔ SUMMARY / ENTRY / AI ロジックとは完全分離
-# ✔ universe 依存・瞬間ブレを完全排除
+# ✔ 空結果でも symbol / ranking_score_total などの列を保証
+# ✔ rank_position / rank / ranking_position / position 列名揺れを吸収
+# ✔ rank filter で全落ちした場合は件数上限でfallback
 # ============================================================
 
 from __future__ import annotations
 
 import logging
+import os
+from typing import Iterable
+
 import pandas as pd
-from typing import Dict
 
 logger = logging.getLogger(__name__)
 
-# ============================================================
-# 設定（魔法数排除・思想固定）
-# ============================================================
+DEFAULT_MAX_RANK = 50
+WEIGHT_BREADTH = 0.4
+WEIGHT_STRENGTH = 0.6
 
-DEFAULT_MAX_RANK = 50          # ランキング上位何位までを見るか
+OUT_COLUMNS = [
+    "symbol",
+    "rank_types_count",
+    "best_rank",
+    "avg_rank",
+    "breadth_score",
+    "strength_score",
+    "ranking_score_total",
+]
 
-WEIGHT_BREADTH = 0.4           # 出現ランキング種別の広さ
-WEIGHT_STRENGTH = 0.6          # 順位の強さ（持続性重視）
 
-# ============================================================
-# メイン API
-# ============================================================
+def _empty() -> pd.DataFrame:
+    return pd.DataFrame(columns=OUT_COLUMNS)
+
+
+def _env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok"}
+    except Exception:
+        return bool(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
+def _first_existing_col(df: pd.DataFrame, names: Iterable[str]) -> str | None:
+    if df is None or df.empty:
+        return None
+    lower = {str(c).lower(): c for c in df.columns}
+    for n in names:
+        if n in df.columns:
+            return n
+        hit = lower.get(str(n).lower())
+        if hit is not None:
+            return hit
+    return None
+
 
 def build_ranking_aggregate(
     ranking_df: pd.DataFrame,
@@ -38,74 +79,87 @@ def build_ranking_aggregate(
     max_rank: int = DEFAULT_MAX_RANK,
 ) -> pd.DataFrame:
     """
-    複数ランキングを symbol 単位で統合する
+    複数ランキングを symbol 単位で統合する。
 
-    必須列:
+    必須相当列:
         symbol
-        rank_type
-        rank_position
-
-    Returns:
-        DataFrame:
-            symbol
-            rank_types_count
-            best_rank
-            avg_rank
-            breadth_score
-            strength_score
-            ranking_score_total
+        rank_type / ranking_type / type / category
+        rank_position / rank / ranking_position / position
     """
 
-    # --------------------------------------------------------
-    # ガード（入力）
-    # --------------------------------------------------------
     if ranking_df is None or ranking_df.empty:
         logger.warning("[RANKING_AGG] input empty")
-        return pd.DataFrame()
+        return _empty()
 
-    required_cols = {"symbol", "rank_type", "rank_position"}
-    missing = required_cols - set(ranking_df.columns)
+    symbol_col = _first_existing_col(ranking_df, ("symbol", "code", "stock_code"))
+    type_col = _first_existing_col(ranking_df, ("rank_type", "ranking_type", "type", "category", "ranking_name"))
+    pos_col = _first_existing_col(ranking_df, ("rank_position", "ranking_position", "rank", "position", "順位"))
+
+    missing = []
+    if symbol_col is None:
+        missing.append("symbol")
+    if type_col is None:
+        missing.append("rank_type")
+    if pos_col is None:
+        missing.append("rank_position")
+
     if missing:
         logger.error(
-            "[RANKING_AGG] missing required columns: %s",
-            ",".join(sorted(missing)),
+            "[RANKING_AGG] missing required columns=%s actual_columns=%s",
+            missing,
+            list(ranking_df.columns),
         )
-        return pd.DataFrame()
+        return _empty()
 
-    df = ranking_df.copy()
+    df = pd.DataFrame({
+        "symbol": ranking_df[symbol_col].astype(str).str.strip(),
+        "rank_type": ranking_df[type_col].astype(str).str.strip(),
+        "rank_position": pd.to_numeric(ranking_df[pos_col], errors="coerce"),
+    })
 
-    # --------------------------------------------------------
-    # 正規化
-    # --------------------------------------------------------
-    df["symbol"] = df["symbol"].astype(str)
-    df["rank_type"] = df["rank_type"].astype(str)
-
-    df["rank_position"] = pd.to_numeric(
-        df["rank_position"],
-        errors="coerce",
-    )
-
-    # NaN / inf 排除
     df = df.dropna(subset=["symbol", "rank_type", "rank_position"])
-
-    # 上位 rank のみ使用
-    df = df[df["rank_position"] <= max_rank]
+    df = df[(df["symbol"] != "") & (df["rank_type"] != "")]
 
     if df.empty:
-        logger.warning("[RANKING_AGG] no rows after rank filter")
-        return pd.DataFrame()
+        logger.warning("[RANKING_AGG] no rows after normalize actual_columns=%s", list(ranking_df.columns))
+        return _empty()
 
-    # --------------------------------------------------------
-    # ranking universe 情報
-    # --------------------------------------------------------
+    max_rank = _env_int("RANKING_AGG_MAX_RANK", int(max_rank or DEFAULT_MAX_RANK))
+    filtered = df[df["rank_position"] <= max_rank]
+
+    if filtered.empty:
+        if _env_bool("RANKING_AGG_FALLBACK_WHEN_FILTER_EMPTY", True):
+            fallback_top_n = _env_int("RANKING_AGG_FALLBACK_TOP_N_PER_TYPE", 80)
+            filtered = (
+                df.sort_values(["rank_type", "rank_position"], ascending=[True, True])
+                .groupby("rank_type", group_keys=False)
+                .head(fallback_top_n)
+                .reset_index(drop=True)
+            )
+            logger.warning(
+                "[RANKING_AGG] no rows after rank filter max_rank=%s -> fallback top_n_per_type=%s rows=%s rank_min=%s rank_max=%s",
+                max_rank,
+                fallback_top_n,
+                len(filtered),
+                df["rank_position"].min(),
+                df["rank_position"].max(),
+            )
+        else:
+            logger.warning(
+                "[RANKING_AGG] no rows after rank filter max_rank=%s rank_min=%s rank_max=%s",
+                max_rank,
+                df["rank_position"].min(),
+                df["rank_position"].max(),
+            )
+            return _empty()
+
+    df = filtered
+
     total_rank_types = df["rank_type"].nunique()
     if total_rank_types <= 0:
         logger.warning("[RANKING_AGG] no rank_type detected")
-        return pd.DataFrame()
+        return _empty()
 
-    # --------------------------------------------------------
-    # 集計（symbol 単位）
-    # --------------------------------------------------------
     agg = (
         df.groupby("symbol", as_index=False)
         .agg(
@@ -117,55 +171,31 @@ def build_ranking_aggregate(
 
     if agg.empty:
         logger.warning("[RANKING_AGG] aggregation result empty")
-        return pd.DataFrame()
+        return _empty()
 
-    # --------------------------------------------------------
-    # スコア化
-    # --------------------------------------------------------
+    agg["breadth_score"] = (agg["rank_types_count"] / float(total_rank_types)).clip(0.0, 1.0)
 
-    # ========================================================
-    # breadth: 何種類のランキングに出たか
-    # ・universe 最大値依存を完全排除
-    # ・日跨ぎ / 時間跨ぎで比較可能
-    # ========================================================
-    agg["breadth_score"] = (
-        agg["rank_types_count"] / float(total_rank_types)
-    ).clip(0.0, 1.0)
+    # fallbackでrankが50を超える場合でも score が全0にならないよう、実使用上限を広げる。
+    score_rank_base = max(float(max_rank), float(agg["best_rank"].max()), 1.0)
+    best_norm = 1.0 - (agg["best_rank"] / score_rank_base)
+    avg_norm = 1.0 - (agg["avg_rank"] / score_rank_base)
 
-    # ========================================================
-    # strength: 順位の強さ（持続性重視）
-    # ・best_rank = 瞬間最大強度
-    # ・avg_rank  = 継続的な強度
-    # ========================================================
-    best_norm = 1.0 - (agg["best_rank"] / float(max_rank))
-    avg_norm = 1.0 - (agg["avg_rank"] / float(max_rank))
-
-    agg["strength_score"] = (
-        0.6 * best_norm
-        + 0.4 * avg_norm
-    ).clip(0.0, 1.0)
-
-    # ========================================================
-    # total score（思想固定）
-    # ========================================================
+    agg["strength_score"] = (0.6 * best_norm + 0.4 * avg_norm).clip(0.0, 1.0)
     agg["ranking_score_total"] = (
         WEIGHT_BREADTH * agg["breadth_score"]
         + WEIGHT_STRENGTH * agg["strength_score"]
     )
 
-    # --------------------------------------------------------
-    # 並び替え
-    # --------------------------------------------------------
-    agg = (
-        agg
-        .sort_values("ranking_score_total", ascending=False)
-        .reset_index(drop=True)
-    )
+    agg = agg.sort_values("ranking_score_total", ascending=False).reset_index(drop=True)
+    agg = agg.reindex(columns=OUT_COLUMNS)
 
     logger.info(
-        "[RANKING_AGG] aggregated symbols=%d (rank_types=%d)",
+        "[RANKING_AGG] aggregated symbols=%d rank_types=%d max_rank=%s score_rank_base=%.1f rank_min=%s rank_max=%s",
         len(agg),
         total_rank_types,
+        max_rank,
+        score_rank_base,
+        df["rank_position"].min(),
+        df["rank_position"].max(),
     )
-
     return agg
