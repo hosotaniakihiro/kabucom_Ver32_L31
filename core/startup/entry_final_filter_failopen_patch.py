@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/entry_final_filter_failopen_patch.py
-# Version: V1.2-DIRECTION-FAIL-CLOSED
+# Version: V1.3-DIRECTION-FAIL-CLOSED-PENDING-PROTECT-PUSH
 # ------------------------------------------------------------
 # 【目的】
 #   候補・AI・pending までは通るのに、最後で全落ちする問題の緩和。
@@ -9,12 +9,14 @@
 #   - range_5m_filter が 5分足欠損/未完成で False を返すケース
 #   - final_entry_safety_guard の board_missing で全落ちするケース
 #   - SYMBOL_DAILY_ENTRY_LIMIT が 1回固定で強すぎるケース
+#   - A/B PUSHローテーションで候補銘柄が反対面にいて板が取れないケース
 #
 # 【方針】
 #   - 5分足元フィルタNGは、発注停止ではなく既存の低変動ガード側に任せる
 #   - 板が取れない場合は entry_order_builder / buy_sell_entry の reference_price に任せる
 #   - 同一銘柄の当日発注済みカウントはデフォルト2回まで許可する
 #   - 方向確認の再帰/例外は fail-open しない。安全側NGにする。
+#   - pending化した候補銘柄をPUSH protectedへ渡し、A/B両面登録されやすくする。
 # ============================================================
 
 from __future__ import annotations
@@ -67,6 +69,8 @@ def install() -> bool:
     _setdefault_env("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", "2")
     _setdefault_env("ENTRY_COUNT_SENT_ORDER_AS_DAILY_ENTRY", "1")
     _setdefault_env("RANGE_5M_FILTER_NG_FAIL_OPEN", "1")
+    _setdefault_env("PENDING_PROTECT_PUSH_SYMBOLS", "1")
+    _setdefault_env("PENDING_PROTECT_PUSH_MAX_KEEP", "50")
 
     # 方向確認は fail-open しない。明示的に安全側NGへ固定する。
     _force_env("ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN", "0")
@@ -122,14 +126,25 @@ def install() -> bool:
     except Exception:
         logger.exception("[ENTRY FINAL FILTER FAILOPEN] direction fail-closed patch install failed")
 
+    # --------------------------------------------------------
+    # 3) pending候補銘柄をPUSH protectedへ渡す
+    # --------------------------------------------------------
+    try:
+        from core.startup.pending_protect_push_patch import install as install_pending_protect_push
+        ok = install_pending_protect_push()
+        logger.warning("[ENTRY FINAL FILTER FAILOPEN] pending protect push patch installed=%s", ok)
+    except Exception:
+        logger.exception("[ENTRY FINAL FILTER FAILOPEN] pending protect push patch install failed")
+
     _PATCHED = True
     logger.warning(
-        "[ENTRY FINAL FILTER FAILOPEN] installed range_fail_open=%s direction_recursion_fail_open=%s direction_error_fail_open=%s allow_without_board=%s max_symbol_entries=%s",
+        "[ENTRY FINAL FILTER FAILOPEN] installed range_fail_open=%s direction_recursion_fail_open=%s direction_error_fail_open=%s allow_without_board=%s max_symbol_entries=%s pending_protect_push=%s",
         _env_bool("RANGE_5M_FILTER_NG_FAIL_OPEN", True),
         _env_bool("ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN", False),
         _env_bool("ENTRY_DIRECTION_CONFIRM_ERROR_FAIL_OPEN", False),
         os.getenv("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"),
         os.getenv("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL"),
+        os.getenv("PENDING_PROTECT_PUSH_SYMBOLS"),
     )
     return True
 
