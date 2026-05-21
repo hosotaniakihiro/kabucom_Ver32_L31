@@ -1,22 +1,14 @@
 # ============================================================
 # File   : scheduler_jobs/summary/safe_io.py
-# Version: PRODUCTION-STABLE-SUMMARY-SAFE-IO-V1.2-USE-COMMON-LIQUIDITY-FILTER
+# Version: PRODUCTION-STABLE-SUMMARY-SAFE-IO-V1.3-ENRICH-BEFORE-DISPLAY
 # ------------------------------------------------------------
 # 【概要】
 #   summary DB保存 / PUSH表示 / RANKING表示の安全ラッパー。
 #
-# 【主な機能】
-#   - 空DF保存禁止
-#   - 空DF表示禁止
-#   - 表示前後ログ
-#   - TOP10表示前に共通流動性フィルタを適用
-#   - trading/summary/filters/liquidity_filter.py を利用
-#   - 例外を握りつぶし scheduler を防衛
-#
-# 【重要】
-#   - DB保存前には流動性フィルタをかけない。
-#   - 表示前だけ低出来高・低売買代金銘柄を除外する。
-#   - 実エントリー側 runner.py にも同じ共通フィルタを入れるのが望ましい。
+# V1.3:
+#   - display_push_summary_safe / display_ranking_summary_safe の表示前に
+#     trading.summary.controller_enrich.enrich_summary_latest() を通す。
+#   - scheduler_jobs.summary 経路の表示でも daily MTF / ranking_score を反映する。
 # ============================================================
 
 from __future__ import annotations
@@ -39,25 +31,45 @@ from trading.summary.filters.liquidity_filter import (
 logger = logging.getLogger(__name__)
 
 
+def _enrich_for_display(df: pd.DataFrame, interval: int, source: str, context: str) -> pd.DataFrame:
+    """scheduler_jobs.summary 経路でも ranking / daily MTF を表示直前に付与する。"""
+    if not is_nonempty_df(df):
+        return df
+    try:
+        from trading.summary.controller_enrich import enrich_summary_latest
+
+        out = enrich_summary_latest(
+            df,
+            interval=int(interval),
+            context=f"scheduler-{source.lower()}-{context}",
+        )
+        try:
+            logger.info(
+                "[summary.runners] enrich_for_display source=%s interval=%s context=%s rows=%s cols=%s",
+                source,
+                interval,
+                context,
+                len(out) if isinstance(out, pd.DataFrame) else None,
+                len(out.columns) if isinstance(out, pd.DataFrame) else None,
+            )
+        except Exception:
+            pass
+        return out
+    except Exception:
+        logger.exception(
+            "[summary.runners] enrich_for_display failed source=%s interval=%s context=%s",
+            source,
+            interval,
+            context,
+        )
+        return df
+
+
 # ============================================================
 # 保存安全ラッパー
 # ============================================================
 
 def save_summary_safe(df: pd.DataFrame, interval: int, source: str) -> bool:
-    """
-    summary DB へ保存する安全ラッパー。
-
-    重要:
-      rows=0 の空DFは保存しない。
-      rows=0 保存は障害解析を難しくし、
-      「定時サマリーが動いたように見えるが中身がない」
-      状態を作るため skip する。
-
-    注意:
-      ここでは流動性フィルタをかけない。
-      DBには低出来高銘柄も含めて保存し、
-      表示・AIエントリー側で除外する方が原因解析しやすい。
-    """
     try:
         rows = df_rows(df)
 
@@ -101,18 +113,6 @@ def save_summary_safe(df: pd.DataFrame, interval: int, source: str) -> bool:
 # ============================================================
 
 def display_push_summary_safe(df: pd.DataFrame, interval: int, now: dt.datetime) -> bool:
-    """
-    PUSHサマリー表示の安全ラッパー。
-    空DFは表示層へ渡さない。
-
-    処理順:
-      1. 入力DFが空なら skip
-      2. 表示スロットを解決
-      3. 表示前DF状態ログ
-      4. 共通流動性フィルタを適用
-      5. フィルタ後DFが空なら skip
-      6. display_push_summary() へ渡す
-    """
     try:
         if not is_nonempty_df(df):
             logger.warning(
@@ -123,6 +123,8 @@ def display_push_summary_safe(df: pd.DataFrame, interval: int, now: dt.datetime)
             return False
 
         _, slot_dt = resolve_display_slot(interval=interval, now=now)
+
+        df = _enrich_for_display(df, interval, "PUSH", "before-liquidity")
 
         logger.info(
             "[summary.runners] display_push_summary start interval=%s rows=%d now=%s slot=%s",
@@ -157,6 +159,8 @@ def display_push_summary_safe(df: pd.DataFrame, interval: int, now: dt.datetime)
                 slot_dt,
             )
             return False
+
+        display_df = _enrich_for_display(display_df, interval, "PUSH", "after-liquidity")
 
         log_df_state("display_push_input_after_liquidity", interval, display_df)
 
@@ -193,18 +197,6 @@ def display_push_summary_safe(df: pd.DataFrame, interval: int, now: dt.datetime)
 # ============================================================
 
 def display_ranking_summary_safe(df: pd.DataFrame, interval: int, now: dt.datetime) -> bool:
-    """
-    RANKINGサマリー表示の安全ラッパー。
-    空DFは表示層へ渡さない。
-
-    処理順:
-      1. 入力DFが空なら skip
-      2. 表示スロットを解決
-      3. 表示前DF状態ログ
-      4. 共通流動性フィルタを適用
-      5. フィルタ後DFが空なら skip
-      6. display_ranking_summary() へ渡す
-    """
     try:
         if not is_nonempty_df(df):
             logger.warning(
@@ -215,6 +207,8 @@ def display_ranking_summary_safe(df: pd.DataFrame, interval: int, now: dt.dateti
             return False
 
         _, slot_dt = resolve_display_slot(interval=interval, now=now)
+
+        df = _enrich_for_display(df, interval, "RANKING", "before-liquidity")
 
         logger.info(
             "[summary.runners] display_ranking_summary start interval=%s rows=%d now=%s slot=%s",
@@ -249,6 +243,8 @@ def display_ranking_summary_safe(df: pd.DataFrame, interval: int, now: dt.dateti
                 slot_dt,
             )
             return False
+
+        display_df = _enrich_for_display(display_df, interval, "RANKING", "after-liquidity")
 
         log_df_state("display_ranking_input_after_liquidity", interval, display_df)
 
