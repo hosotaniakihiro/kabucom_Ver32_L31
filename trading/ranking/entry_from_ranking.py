@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/ranking/entry_from_ranking.py
-# Ver    : RANKING-ENTRY-SNAPSHOT+TECHNICAL+BREADTH+VOL+MARKET-v4.3.0-FINAL
+# Ver    : RANKING-ENTRY-SNAPSHOT+TECHNICAL+BREADTH+VOL+MARKET-v4.4.0-PENDING-FIX
 # ------------------------------------------------------------
 # ✔ ranking_snapshot / ranking_raw → pending 生成の唯一の入口
 # ✔ snapshot / technical / breadth / volatility / market の完全HYBRID
@@ -11,7 +11,14 @@
 # ✔ pending_manager 以外を直接操作しない
 # ✔ AI 最終判断は既存設計を完全維持
 # ✔ price 欠損 / indicator_ready 欠損 完全耐性
-# ✔ ★ RANKING AI フェイルセーフ（②）正式実装
+# ✔ RANKING AI フェイルセーフ正式実装
+#
+# 【Ver4.4 修正】
+# ✔ pending_manager.add_pending(entry_dict) の正しい呼び出し形式に修正
+#   旧: add_pending(symbol=symbol, data={...})  ← TypeError で落ちる
+#   新: add_pending({...})
+# ✔ [RANKING ENTRY LOOP] / [RANKING PENDING ADD] の判定ログを強化
+# ✔ ranking_df 件数・source取得元・created件数を明確化
 # ============================================================
 
 from __future__ import annotations
@@ -42,13 +49,12 @@ from trading.ranking.ranking_aggregate_builder import (
 
 logger = logging.getLogger(__name__)
 
+
 # ============================================================
 # 設定
 # ============================================================
 
 VOL_THRESHOLD = 0.01  # 1分変動率 1%
-
-# ★ フェイルセーフ用（②）
 RANKING_FALLBACK_MIN_STRENGTH = 0.80
 
 RANK_TYPE_WEIGHT = {
@@ -67,6 +73,7 @@ EXCHANGE_WEIGHT = {
     "TG": 1.10,
     "ALL": 1.00,
 }
+
 
 # ============================================================
 # util
@@ -89,6 +96,7 @@ def _reject(reason: str, row: Dict[str, Any]):
 def _get_ranking_source_df() -> Optional[pd.DataFrame]:
     snapshot = getattr(global_data, "latest_ranking_snapshot", None)
     if isinstance(snapshot, list) and snapshot:
+        logger.info("[RANKING ENTRY LOOP] source=latest_ranking_snapshot rows=%s", len(snapshot))
         return pd.DataFrame(snapshot)
 
     for name in (
@@ -98,9 +106,20 @@ def _get_ranking_source_df() -> Optional[pd.DataFrame]:
     ):
         df = getattr(global_data, name, None)
         if isinstance(df, pd.DataFrame) and not df.empty:
+            logger.info("[RANKING ENTRY LOOP] source=%s rows=%s", name, len(df))
             return df
 
+    logger.warning("[RANKING ENTRY LOOP] ranking source dataframe not found")
     return None
+
+
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None:
+            return default
+        return float(v)
+    except Exception:
+        return default
 
 
 # ============================================================
@@ -108,11 +127,12 @@ def _get_ranking_source_df() -> Optional[pd.DataFrame]:
 # ============================================================
 
 def entry_from_ranking():
-
-    logger.info("[RANKING ENTRY PIPELINE] START")
+    started = dt.datetime.now()
+    logger.info("[RANKING ENTRY LOOP] start at=%s", started.strftime("%Y-%m-%d %H:%M:%S"))
 
     ranking_df = _get_ranking_source_df()
     if ranking_df is None or ranking_df.empty:
+        logger.info("[RANKING ENTRY LOOP] skip reason=no_ranking_df")
         return 0
 
     cfg_score = RANKING_ENTRY_CONFIG["SCORE"]
@@ -124,18 +144,25 @@ def entry_from_ranking():
 
     now = _now()
     created = 0
+    ai_reject = 0
+    turnover_reject = 0
+    build_reject = 0
+    pending_reject = 0
 
     # =====================================================
-    # A️⃣ 複数ランキング統合（breadth / strength）
+    # 複数ランキング統合（breadth / strength）
     # =====================================================
-    agg_df = build_ranking_aggregate(ranking_df)
-
-    ranking_strength_map = dict(
-        zip(
-            agg_df["symbol"],
-            agg_df["ranking_score_total"],
+    try:
+        agg_df = build_ranking_aggregate(ranking_df)
+        ranking_strength_map = dict(
+            zip(
+                agg_df["symbol"].astype(str),
+                agg_df["ranking_score_total"],
+            )
         )
-    )
+    except Exception:
+        logger.exception("[RANKING ENTRY LOOP] build_ranking_aggregate failed")
+        ranking_strength_map = {}
 
     # =====================================================
     # TECHNICAL SCORE（SUMMARY 同等）
@@ -152,7 +179,6 @@ def entry_from_ranking():
                 bars=80,
             )
 
-            # price 補完
             if (
                 "price" not in df_rank_summary.columns
                 and "close_price" in df_rank_summary.columns
@@ -167,23 +193,22 @@ def entry_from_ranking():
                 end_time=now,
             )
 
-            if "indicator_ready" not in df_eval.columns:
-                logger.warning(
-                    "[RANKING TECH SCORE] indicator_ready missing → skip"
-                )
-                df_eval = pd.DataFrame()
+            ready_col = None
+            if "indicator_ready" in df_eval.columns:
+                ready_col = "indicator_ready"
+            elif "technical_ready" in df_eval.columns:
+                ready_col = "technical_ready"
+
+            if ready_col is None:
+                logger.warning("[RANKING TECH SCORE] ready column missing -> use all evaluated rows")
             else:
-                df_eval = df_eval[df_eval["indicator_ready"]]
+                df_eval = df_eval[df_eval[ready_col].fillna(False).astype(bool)]
 
             for _, r in df_eval.iterrows():
-                tech_score_map[str(r["symbol"])] = float(
-                    r.get("score_buy", 0.0)
-                )
+                sym = str(r.get("symbol"))
+                tech_score_map[sym] = _safe_float(r.get("score_buy", r.get("buy_score", 0.0)), 0.0)
 
-            logger.info(
-                "[RANKING TECH SCORE] prepared symbols=%d",
-                len(tech_score_map),
-            )
+            logger.info("[RANKING TECH SCORE] prepared symbols=%d", len(tech_score_map))
 
         except Exception:
             logger.exception("[RANKING TECH SCORE] failed")
@@ -195,100 +220,107 @@ def entry_from_ranking():
         row = raw_row.to_dict()
         row["source"] = "RANKING"
 
-        symbol = str(row.get("symbol"))
+        symbol = str(row.get("symbol") or "").strip()
+        if not symbol:
+            build_reject += 1
+            continue
 
-        snapshot_score = float(
-            row.get("score_total") or row.get("score") or 0.0
-        )
+        snapshot_score = _safe_float(row.get("score_total") or row.get("score") or 0.0, 0.0)
         technical_score = tech_score_map.get(symbol, 0.0)
-        breadth_score = ranking_strength_map.get(symbol, 0.0)
+        breadth_score = _safe_float(ranking_strength_map.get(symbol, 0.0), 0.0)
 
-        price_delta = abs(row.get("price_delta_1m") or 0.0)
+        price_delta = abs(_safe_float(row.get("price_delta_1m"), 0.0))
         volatility_score = min(price_delta / VOL_THRESHOLD, 1.0)
 
         rank_type = row.get("rank_type")
         rank_type_weight = RANK_TYPE_WEIGHT.get(rank_type, 1.0)
 
         base_score = (
-            0.30 * breadth_score +
-            0.30 * technical_score +
-            0.25 * volatility_score +
-            0.15 * snapshot_score
+            0.30 * breadth_score
+            + 0.30 * technical_score
+            + 0.25 * volatility_score
+            + 0.15 * snapshot_score
         ) * rank_type_weight
 
         market = row.get("market") or "ALL"
         market_weight = EXCHANGE_WEIGHT.get(market, 1.0)
 
-        final_score = max(
-            base_score * market_weight,
-            MIN_SCORE_TOTAL,
-        )
-
+        final_score = max(base_score * market_weight, MIN_SCORE_TOTAL)
         row["score_total"] = final_score
+        row["score"] = final_score
 
         entry_row = build_entry_row(row)
         if not entry_row:
+            build_reject += 1
             continue
 
-        side = entry_row.get("side") or infer_side_from_rank_type(
-            row.get("rank_type")
-        ) or "BUY"
+        side = entry_row.get("side") or infer_side_from_rank_type(row.get("rank_type")) or "BUY"
         entry_row["side"] = side
+        entry_row["source"] = "RANKING"
+        entry_row["symbol"] = symbol
+        entry_row.setdefault("entry_type", "RANKING")
+        entry_row.setdefault("interval", 1)
+        entry_row["score"] = final_score
+        entry_row["score_total"] = final_score
 
-        if entry_row.get("turnover", 0) < MIN_TURNOVER:
+        if _safe_float(entry_row.get("turnover", 0), 0.0) < MIN_TURNOVER:
+            turnover_reject += 1
             continue
 
-        # =================================================
-        # AI 最終判断 + フェイルセーフ（②）
-        # =================================================
         ai = ai_final_entry_check(entry_row)
-
         fallback_used = False
 
         if not ai.get("allow"):
-            # ★ フェイルセーフ条件
             if breadth_score >= RANKING_FALLBACK_MIN_STRENGTH:
                 fallback_used = True
                 logger.warning(
-                    "⚠️ RANKING FALLBACK ALLOW "
-                    f"symbol={symbol} breadth={breadth_score:.3f}"
+                    "⚠️ RANKING FALLBACK ALLOW symbol=%s breadth=%.3f",
+                    symbol,
+                    breadth_score,
                 )
             else:
+                ai_reject += 1
                 _reject("AI_REJECT", entry_row)
                 continue
 
-        add_pending(
-            symbol=symbol,
-            data={
-                **entry_row,
-                "source": "RANKING",
-                "created_at": now,
-                # --- 学習・検証用 ---
-                "ranking_fallback_used": fallback_used,
-                "ranking_strength": breadth_score,
-                "technical_score": technical_score,
-                "snapshot_score": snapshot_score,
-            },
-        )
+        pending_entry = {
+            **entry_row,
+            "source": "RANKING",
+            "created_at": now,
+            "ranking_fallback_used": fallback_used,
+            "ranking_strength": breadth_score,
+            "technical_score": technical_score,
+            "snapshot_score": snapshot_score,
+        }
 
-        created += 1
+        if add_pending(pending_entry):
+            created += 1
+            logger.info(
+                "[RANKING PENDING ADD] "
+                f"symbol={symbol} "
+                f"side={side} "
+                f"snap={snapshot_score:.2f} "
+                f"tech={technical_score:.2f} "
+                f"breadth={breadth_score:.2f} "
+                f"vol={volatility_score:.2f} "
+                f"rank_w={rank_type_weight:.2f} "
+                f"mkt_w={market_weight:.2f} "
+                f"final={final_score:.2f} "
+                f"fallback={fallback_used}"
+            )
+        else:
+            pending_reject += 1
 
-        logger.info(
-            "[RANKING PENDING ADD] "
-            f"symbol={symbol} "
-            f"snap={snapshot_score:.2f} "
-            f"tech={technical_score:.2f} "
-            f"breadth={breadth_score:.2f} "
-            f"vol={volatility_score:.2f} "
-            f"rank_w={rank_type_weight:.2f} "
-            f"mkt_w={market_weight:.2f} "
-            f"final={final_score:.2f} "
-            f"fallback={fallback_used}"
-        )
-
+    elapsed = (dt.datetime.now() - started).total_seconds()
     logger.info(
-        "[RANKING ENTRY PIPELINE] END "
-        f"created={created} total={len(ranking_df)}"
+        "[RANKING ENTRY LOOP] done created=%s total=%s build_reject=%s turnover_reject=%s ai_reject=%s pending_reject=%s elapsed=%.3fs",
+        created,
+        len(ranking_df),
+        build_reject,
+        turnover_reject,
+        ai_reject,
+        pending_reject,
+        elapsed,
     )
 
     return created
