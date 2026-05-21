@@ -1,18 +1,14 @@
 # ============================================================
 # File   : trading/exit/exit_loop.py
-# Version: V69-SPLIT-MAIN-LOOP
+# Version: V70-BLOWOFF-PROFIT-TAKE-FIRST
 # ------------------------------------------------------------
 # 【概要】
 #   5秒ごとのEXIT監視メインループ。
 #
-# 【分割後の役割】
-#   - open positions を取る
-#   - market_state / regime / boost を更新する
-#   - 各銘柄を run_exit_for_position() に渡す
-#
-# 【互換性】
-#   - exit_loop = exit_loop_5s を維持
-#   - scheduler 側の import を壊さない
+# 【追加】
+#   - 株価が吹いたときの利確を通常EXIT判定より前に実行
+#   - 100株など小ロットは +0.20% で全利確
+#   - 200株以上は +0.25% で一部利確、+0.45% で全利確
 # ============================================================
 
 from __future__ import annotations
@@ -26,6 +22,11 @@ from trading.exit.exit_utils import get_open_positions_safe
 from trading.exit.market_state_builder import build_market_state
 from trading.monitor.boost_monitor import BoostMonitor
 from trading.risk.boost_engine import BoostEngine
+
+try:
+    from trading.exit.blowoff_profit_take import apply_blowoff_profit_take
+except Exception:  # pragma: no cover
+    apply_blowoff_profit_take = None
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,16 @@ def _update_boost_safe(regime: int) -> bool:
         return False
 
 
+def _apply_blowoff_profit_take_safe(symbol: str, pos: dict, regime: int) -> bool:
+    if not callable(apply_blowoff_profit_take):
+        return False
+    try:
+        return bool(apply_blowoff_profit_take(symbol=symbol, pos=pos, regime=regime))
+    except Exception:
+        logger.exception("[EXIT LOOP] blowoff profit take failed symbol=%s", symbol)
+        return False
+
+
 def exit_loop_5s() -> None:
     try:
         positions = get_open_positions_safe()
@@ -87,6 +98,10 @@ def exit_loop_5s() -> None:
             pos = positions[symbol]
 
             try:
+                # 通常のAI/トレーリング/時間EXITより先に、吹き上げ利確を確認する。
+                if _apply_blowoff_profit_take_safe(symbol, pos, regime):
+                    continue
+
                 run_exit_for_position(
                     symbol=symbol,
                     pos=pos,
