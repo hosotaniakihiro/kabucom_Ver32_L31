@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/ranking/entry_from_ranking.py
-# Ver    : RANKING-ONLY-ENTRY-v5.0.0
+# Ver    : RANKING-ONLY-ENTRY-v5.0.1
 # ------------------------------------------------------------
 # ✔ ranking_snapshot / ranking_raw → pending 生成の唯一の入口
 # ✔ ランキング表示情報と、そこから算出できる数値だけで ENTRY 判定
@@ -10,6 +10,7 @@
 # ✔ SELL : ランキング価格が直近安値更新のときのみ許可
 # ✔ 急騰急落しすぎた銘柄は追いかけない
 # ✔ AI gate は使わず、ランキング専用スコアのみで pending 生成
+# ✔ Ver5.0.1: 同一銘柄・同一sideの複数ランキング出現時に最高score候補を残す
 # ============================================================
 
 from __future__ import annotations
@@ -608,7 +609,11 @@ def entry_from_ranking():
 
         key = (symbol, side)
         old = best_by_symbol_side.get(key)
-        if old is None or score > _safe_float(old.get("score_total"), 0.0):
+        old_score = 0.0
+        if isinstance(old, dict) and isinstance(old.get("row"), dict):
+            old_score = _safe_float(old["row"].get("score_total"), 0.0)
+
+        if old is None or score > old_score:
             best_by_symbol_side[key] = {
                 "row": row,
                 "parts": parts,
