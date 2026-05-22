@@ -1,10 +1,14 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver03-AUTO-AUDIT-AND-SUMMARY-MTF-CATCHUP
+# Version: Ver04-SKIP-HEAVY-SUMMARY-MTF-CATCHUP-IN-MAIN
 # ------------------------------------------------------------
 # Python 起動時に自動 import されるフック。
 # main.py を直接壊さず、監査ログ/バックテスト用DB保存を自動有効化する。
-# 追加で、3分足/5分足サマリーを1分足DBから起動時に差分補完する。
+#
+# Ver04:
+#   - main.py では SUMMARY MTF CATCHUP の自動起動を既定スキップ
+#   - main_database.py / data collectors 側でDB補完を担当
+#   - main.pyで強制実行したい場合のみ SUMMARY_MTF_CATCHUP_RUN_IN_MAIN=1
 #
 # 注意:
 #   - sitecustomize.py は Python の site 初期化時に自動で読み込まれる。
@@ -67,6 +71,35 @@ def _ensure_project_root() -> str:
         return ''
 
 
+def _env_on(name: str, default: bool = False) -> bool:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == '':
+            return bool(default)
+        return str(v).strip().lower() in {'1', 'true', 'yes', 'y', 'on', 'ok', 'enable', 'enabled'}
+    except Exception:
+        return bool(default)
+
+
+def _is_main_py_process() -> bool:
+    try:
+        argv = [str(x).replace('\\', '/').lower() for x in sys.argv]
+        return any(x.endswith('/main.py') or x == 'main.py' for x in argv)
+    except Exception:
+        return False
+
+
+def _is_database_process() -> bool:
+    return any(
+        _env_on(name, False)
+        for name in (
+            'AUTOSTOCK_DATA_COLLECTORS_PROCESS',
+            'AUTOSTOCK_SUMMARY_DB_WRITER',
+            'AUTOSTOCK_MAIN_DATABASE_PROCESS',
+        )
+    )
+
+
 def _install_boot_exception_hook() -> None:
     try:
         old_hook = sys.excepthook
@@ -117,6 +150,18 @@ def _install_summary_mtf_catchup_safely() -> None:
     try:
         if os.environ.get('DISABLE_SUMMARY_MTF_CATCHUP', '').strip() == '1':
             _write_boot_evidence('SUMMARY_MTF_CATCHUP_DISABLED_BY_ENV')
+            return
+
+        # main.py は売買・表示優先。重いDB補完は main_database.py 側に寄せる。
+        # 強制したい場合のみ SUMMARY_MTF_CATCHUP_RUN_IN_MAIN=1 を設定する。
+        if _is_main_py_process() and not _is_database_process() and not _env_on('SUMMARY_MTF_CATCHUP_RUN_IN_MAIN', False):
+            _write_boot_evidence('SUMMARY_MTF_CATCHUP_SKIPPED_IN_MAIN_PROCESS')
+            try:
+                logging.getLogger(__name__).warning(
+                    '[SITECUSTOMIZE] summary mtf catchup skipped in main.py; main_database.py handles DB catchup'
+                )
+            except Exception:
+                pass
             return
 
         _ensure_project_root()
