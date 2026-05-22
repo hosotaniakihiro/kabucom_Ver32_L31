@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry_exit/tasks.py
-# Version: Ver1.1-ENTRY-JOB-TIMEOUT-GUARD
+# Version: Ver1.2-TONOSAMA-TIMEOUT-30SEC
 # ------------------------------------------------------------
 # 【目的】
 #   core.entry_exit_tasks shim から解決される実体モジュール。
@@ -19,6 +19,8 @@
 #   - ランキングサマリー保存とランキング由来エントリーは別物。
 #   - これを登録しないと ranking_snapshot は保存されても発注候補に流れない。
 #   - Ver1.1: scheduler側の previous_still_running を防ぐため、各処理にタイムアウトを設ける。
+#   - Ver1.2: 殿様イナゴは12秒だと summary/ランキング処理と重なって頻繁にtimeoutするため、
+#              デフォルトを30秒へ引き上げる。
 # ============================================================
 
 from __future__ import annotations
@@ -42,7 +44,7 @@ _RANKING_ENTRY_RUNNING = False
 _RANKING_ENTRY_STARTED_AT: Optional[dt.datetime] = None
 _RANKING_ENTRY_LOCK = threading.RLock()
 
-TONOSAMA_ENTRY_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_TIMEOUT_SEC", "12"))
+TONOSAMA_ENTRY_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_TIMEOUT_SEC", "30"))
 RANKING_ENTRY_BUILD_TIMEOUT_SEC = float(os.getenv("RANKING_ENTRY_BUILD_TIMEOUT_SEC", "20"))
 RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC = float(os.getenv("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", "20"))
 
