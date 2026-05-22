@@ -1,10 +1,18 @@
 # ============================================================
 # File   : core/startup/entry_liquidity_runtime_patch.py
-# Version: V1.3-ENTRY-LIQUIDITY-LOG-SKIP-KWARG-FIX
+# Version: V1.4-ENTRY-LIQUIDITY-TURNOVER-YEN-NORMALIZE-FIX
 # ------------------------------------------------------------
 # 目的:
 #   出来高が少ない・売買代金が薄い・値動きが小さい銘柄への
 #   新規エントリーを止める。
+#
+# V1.4:
+#   - recent summary DB 側の turnover が「百万円単位/千円単位/不完全値」でも、
+#     close * volume から円単位 turnover_yen を再計算して比較する。
+#   - ログ例: close=1813 volume=1440900 turnover=2596.44 min_turnover=10000000
+#     のように、本来は約26億円ある銘柄が LIQUIDITY_RECENT_TURNOVER_LOW で
+#     誤って落ちる問題を修正。
+#   - detail に turnover_original / turnover_fixed_by / turnover_calc_yen を出す。
 #
 # V1.3:
 #   - ec._log_skip(symbol, reason, **detail) 呼び出し時、
@@ -94,21 +102,63 @@ def _col(conn: sqlite3.Connection, table: str, names: list[str]) -> str:
     return ""
 
 
+def _calc_turnover_yen(close: float, volume: float) -> float:
+    """株価×株数から円単位の売買代金を計算する。"""
+    close = _f(close, 0.0)
+    volume = _f(volume, 0.0)
+    if close <= 0 or volume <= 0:
+        return 0.0
+    return close * volume
+
+
+def _normalize_turnover_yen(turnover: float, close: float, volume: float) -> Tuple[float, Dict[str, Any]]:
+    """
+    turnover を必ず円単位として扱える値に補正する。
+
+    summary DB の turnover は環境によって、
+      - 円単位
+      - 千円単位
+      - 百万円単位
+      - 途中計算の小さい値
+    が混在しうる。
+
+    エントリー流動性ガードの閾値 ENTRY_LIQ_MIN_TURNOVER_YEN は円単位なので、
+    close * volume が取れる場合はそれを安全側の円単位候補として使う。
+    """
+    raw = max(0.0, _f(turnover, 0.0))
+    calc = _calc_turnover_yen(close, volume)
+    fixed = raw
+    info: Dict[str, Any] = {"turnover_calc_yen": calc}
+
+    if calc > 0:
+        # raw が 0、または close*volume より極端に小さい場合は単位違い/不完全値とみなす。
+        # 例: raw=2596.44, calc=2,612,351,700 のようなケース。
+        if raw <= 0 or raw < calc * 0.5:
+            fixed = calc
+            info["turnover_original"] = raw
+            info["turnover_fixed_by"] = "close_x_volume_yen"
+        else:
+            fixed = raw
+
+    return fixed, info
+
+
 def _entry_row_values(row: Dict[str, Any]) -> Dict[str, Any]:
     close = _first(row, ["close_price", "close", "price", "current_price"])
     volume = _first(row, ["volume", "Volume", "vol", "出来高"])
     high = _first(row, ["high_price", "high"])
     low = _first(row, ["low_price", "low"])
     atr = _first(row, ["atr", "atr_1m", "atr_3m", "atr_5m"])
-    turnover = _first(row, ["turnover", "turnover_yen", "trading_value", "売買代金"])
-    if turnover <= 0 and close > 0 and volume > 0:
-        turnover = close * volume
+    turnover_raw = _first(row, ["turnover_yen", "turnover", "trading_value", "売買代金"])
+    turnover, turnover_info = _normalize_turnover_yen(turnover_raw, close, volume)
+
     return {
         "liq_mode": "entry_row_fallback",
         "liq_bars": 1,
         "close": close,
         "volume": volume,
         "turnover": turnover,
+        **turnover_info,
         "range_pct": ((high - low) / close) if close > 0 and high >= low and high > 0 and low > 0 else 0.0,
         "atr_pct": (atr / close) if close > 0 and atr > 0 else 0.0,
     }
@@ -128,7 +178,7 @@ def _recent_values(symbol: str, bars: int) -> Dict[str, Any]:
             hi = _col(conn, table, ["high_price", "high"])
             lo = _col(conn, table, ["low_price", "low"])
             vo = _col(conn, table, ["volume", "Volume", "vol"])
-            tv = _col(conn, table, ["turnover", "turnover_yen", "trading_value"])
+            tv = _col(conn, table, ["turnover_yen", "turnover", "trading_value", "売買代金"])
             at = _col(conn, table, ["atr", "atr_1m", "atr_3m", "atr_5m"])
             if not sym or not tm or not cl:
                 return {}
@@ -137,13 +187,27 @@ def _recent_values(symbol: str, bars: int) -> Dict[str, Any]:
             rows = conn.execute(sql, (_norm_symbol(symbol), max(1, bars))).fetchall()
             if not rows:
                 return {}
+
         close = _f(rows[0][1], 0.0)
         highs = [_f(r[2], 0.0) for r in rows if _f(r[2], 0.0) > 0]
         lows = [_f(r[3], 0.0) for r in rows if _f(r[3], 0.0) > 0]
         volume = sum(max(0.0, _f(r[4], 0.0)) for r in rows)
-        turnover = sum(max(0.0, _f(r[5], 0.0)) for r in rows)
-        if turnover <= 0:
-            turnover = sum(max(0.0, _f(r[1], 0.0)) * max(0.0, _f(r[4], 0.0)) for r in rows)
+        turnover_raw = sum(max(0.0, _f(r[5], 0.0)) for r in rows)
+        turnover_calc_yen = sum(
+            _calc_turnover_yen(_f(r[1], 0.0), _f(r[4], 0.0))
+            for r in rows
+        )
+        turnover, turnover_info = _normalize_turnover_yen(turnover_raw, close, volume)
+
+        # 複数barでは「最新close×合計volume」より「各bar close×volume 合計」の方が正確。
+        if turnover_calc_yen > 0 and turnover < turnover_calc_yen * 0.5:
+            turnover_info["turnover_original"] = turnover
+            turnover_info["turnover_fixed_by"] = "sum_close_x_volume_yen"
+            turnover_info["turnover_calc_yen"] = turnover_calc_yen
+            turnover = turnover_calc_yen
+        elif turnover_calc_yen > 0:
+            turnover_info["turnover_calc_yen"] = turnover_calc_yen
+
         atrs = [_f(r[6], 0.0) for r in rows if _f(r[6], 0.0) > 0]
         return {
             "liq_mode": "recent_summary_1min",
@@ -152,6 +216,7 @@ def _recent_values(symbol: str, bars: int) -> Dict[str, Any]:
             "close": close,
             "volume": volume,
             "turnover": turnover,
+            **turnover_info,
             "range_pct": ((max(highs) - min(lows)) / close) if close > 0 and highs and lows else 0.0,
             "atr_pct": ((sum(atrs) / len(atrs)) / close) if close > 0 and atrs else 0.0,
         }
@@ -243,7 +308,7 @@ def install() -> bool:
     if not callable(old):
         logger.warning("[ENTRY LIQ GUARD] _execute_best_candidate not callable")
         return False
-    if not getattr(old, "_entry_liq_guard_wrapped_v13", False):
+    if not getattr(old, "_entry_liq_guard_wrapped_v14", False):
         def wrapped(item: dict, boost_active: bool) -> bool:
             try:
                 row = item.get("entry_row") if isinstance(item, dict) else None
@@ -258,13 +323,13 @@ def install() -> bool:
                 logger.exception("[ENTRY LIQ GUARD] precheck failed")
                 return False
             return old(item, boost_active=boost_active)
-        wrapped._entry_liq_guard_wrapped_v13 = True  # type: ignore[attr-defined]
+        wrapped._entry_liq_guard_wrapped_v14 = True  # type: ignore[attr-defined]
         wrapped._original = old  # type: ignore[attr-defined]
         ec._execute_best_candidate = wrapped
     _install_summary_ai_liquidity_guard()
     _INSTALLED = True
     logger.warning(
-        "[ENTRY LIQ GUARD] installed v1.3 entry_controller+summary_ai min_volume=%s min_turnover=%s recent_bars=%s min_range_pct=%s min_atr_pct=%s",
+        "[ENTRY LIQ GUARD] installed v1.4 entry_controller+summary_ai min_volume=%s min_turnover_yen=%s recent_bars=%s min_range_pct=%s min_atr_pct=%s turnover_normalize=close_x_volume_yen",
         _env_float("ENTRY_LIQ_MIN_VOLUME", 30000.0),
         _env_float("ENTRY_LIQ_MIN_TURNOVER_YEN", 10000000.0),
         _env_int("ENTRY_LIQ_RECENT_BARS", 5),
