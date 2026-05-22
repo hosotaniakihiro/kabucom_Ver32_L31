@@ -1,16 +1,11 @@
 # ============================================================
 # File   : trading/ranking/entry_from_ranking.py
-# Ver    : RANKING-ONLY-ENTRY-v5.0.1
+# Ver    : RANKING-ONLY-ENTRY-v5.1.0-RANKING-TECH
 # ------------------------------------------------------------
 # ✔ ranking_snapshot / ranking_raw → pending 生成の唯一の入口
 # ✔ ランキング表示情報と、そこから算出できる数値だけで ENTRY 判定
-# ✔ SUMMARY / PUSH / 板 / 5秒足 / 日足MA / technical score は使わない
-# ✔ 現在値推移・順位改善・連続出現・出来高・売買代金で判定
-# ✔ BUY  : ランキング価格が直近高値更新のときのみ許可
-# ✔ SELL : ランキング価格が直近安値更新のときのみ許可
-# ✔ 急騰急落しすぎた銘柄は追いかけない
-# ✔ AI gate は使わず、ランキング専用スコアのみで pending 生成
-# ✔ Ver5.0.1: 同一銘柄・同一sideの複数ランキング出現時に最高score候補を残す
+# ✔ Ver5.1.0: ランキング現在値を疑似終値として専用テクニカルを計算/DB保存
+# ✔ Ver5.1.0: ranking_technical_1min の ma/rsi/macd/slope をENTRY検討要素に追加
 # ============================================================
 
 from __future__ import annotations
@@ -27,12 +22,17 @@ from trading.ranking.side_infer import infer_side_from_rank_type
 from AI.entry_row_builder import build_entry_row
 from config.ranking_entry_config import RANKING_ENTRY_CONFIG, is_time_allowed
 
+try:
+    from trading.ranking.ranking_technical_store import (
+        save_ranking_pseudo_technicals,
+        attach_ranking_technicals,
+    )
+except Exception:  # pragma: no cover
+    save_ranking_pseudo_technicals = None
+    attach_ranking_technicals = None
+
 logger = logging.getLogger(__name__)
 
-
-# ============================================================
-# ランキング種別ごとの重み
-# ============================================================
 
 RANK_TYPE_WEIGHT = {
     "値上がり率": 1.15,
@@ -54,10 +54,6 @@ EXCHANGE_WEIGHT = {
 }
 
 
-# ============================================================
-# 共通ユーティリティ
-# ============================================================
-
 def _now() -> dt.datetime:
     return dt.datetime.now()
 
@@ -67,7 +63,7 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         if v is None:
             return default
         s = str(v).strip()
-        if s == "" or s.lower() == "nan" or s.lower() == "none":
+        if s == "" or s.lower() in ("nan", "none", "nat"):
             return default
         s = s.replace(",", "").replace("%", "")
         return float(s)
@@ -77,8 +73,7 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
 
 def _safe_int(v: Any, default: int = 999999) -> int:
     try:
-        f = _safe_float(v, float(default))
-        return int(f)
+        return int(_safe_float(v, float(default)))
     except Exception:
         return default
 
@@ -118,21 +113,13 @@ def _reject(reason: str, row: Dict[str, Any], detail: str = "") -> None:
     )
 
 
-# ============================================================
-# 入力データ取得・正規化
-# ============================================================
-
 def _get_ranking_source_df() -> Optional[pd.DataFrame]:
     snapshot = getattr(global_data, "latest_ranking_snapshot", None)
     if isinstance(snapshot, list) and snapshot:
         logger.info("[RANKING ENTRY LOOP] source=latest_ranking_snapshot rows=%s", len(snapshot))
         return pd.DataFrame(snapshot)
 
-    for name in (
-        "latest_ranking_raw",
-        "latest_ranking_df",
-        "ranking_raw_df",
-    ):
+    for name in ("latest_ranking_raw", "latest_ranking_df", "ranking_raw_df"):
         df = getattr(global_data, name, None)
         if isinstance(df, pd.DataFrame) and not df.empty:
             logger.info("[RANKING ENTRY LOOP] source=%s rows=%s", name, len(df))
@@ -146,7 +133,6 @@ def _normalize_rank_type(v: Any) -> str:
     s = str(v or "").strip()
     if not s:
         return ""
-    # 代表的な表記揺れを吸収
     s = s.replace("ランキング", "").strip()
     if "値上" in s or "上昇" in s:
         return "値上がり率"
@@ -162,111 +148,47 @@ def _normalize_rank_type(v: Any) -> str:
 
 
 def _extract_day_change_pct(row: Dict[str, Any]) -> float:
-    v = _first(
-        row,
-        (
-            "change_rate",
-            "change_pct",
-            "price_change_rate",
-            "rate",
-            "前日比率",
-            "騰落率",
-        ),
-        None,
-    )
+    v = _first(row, ("change_rate", "change_pct", "price_change_rate", "rate", "前日比率", "騰落率"), None)
     if v is not None:
         return _safe_float(v, 0.0)
-
     price = _safe_float(row.get("current_price") or row.get("price"), 0.0)
-    prev_close = _safe_float(
-        _first(row, ("prev_close", "previous_close", "base_price", "基準値", "前日終値"), 0.0),
-        0.0,
-    )
+    prev_close = _safe_float(_first(row, ("prev_close", "previous_close", "base_price", "基準値", "前日終値"), 0.0), 0.0)
     if price > 0 and prev_close > 0:
         return _pct_change(price, prev_close)
     return 0.0
 
 
 def _normalize_ranking_row_for_entry(row: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    ranking_snapshot / ranking_raw のカラム名揺れを entry_row_builder が読める形に正規化する。
-    """
     row = dict(row)
-
     symbol = str(_first(row, ("symbol", "Symbol", "code", "コード", "銘柄コード"), "")).strip()
     if symbol:
         row["symbol"] = symbol
 
     price = _safe_float(
-        _first(
-            row,
-            (
-                "close_price",
-                "current_price",
-                "CurrentPrice",
-                "price",
-                "close",
-                "現在値",
-            ),
-            0.0,
-        ),
+        _first(row, ("close_price", "current_price", "CurrentPrice", "price", "close", "現在値"), 0.0),
         0.0,
     )
-
     volume = _safe_float(
-        _first(
-            row,
-            (
-                "volume",
-                "trading_volume",
-                "TradingVolume",
-                "出来高",
-                "売買高",
-            ),
-            0.0,
-        ),
+        _first(row, ("volume", "trading_volume", "TradingVolume", "出来高", "売買高"), 0.0),
         0.0,
     )
-
     turnover = _safe_float(
-        _first(
-            row,
-            (
-                "turnover",
-                "trading_value",
-                "TradingValue",
-                "売買代金",
-                "売買代金上位",
-                "value",
-                "Value",
-            ),
-            0.0,
-        ),
+        _first(row, ("turnover", "trading_value", "TradingValue", "売買代金", "売買代金上位", "value", "Value"), 0.0),
         0.0,
     )
-
     if turnover <= 0 and price > 0 and volume > 0:
         turnover = price * volume
 
-    rank_position = _safe_int(
-        _first(row, ("rank_position", "rank", "ranking", "順位", "Rank"), 999999),
-        999999,
-    )
-
-    rank_type = _normalize_rank_type(
-        _first(row, ("rank_type", "ranking_type", "type", "ランキング種別", "種別"), "")
-    )
-
+    rank_position = _safe_int(_first(row, ("rank_position", "rank", "ranking", "順位", "Rank"), 999999), 999999)
+    rank_type = _normalize_rank_type(_first(row, ("rank_type", "ranking_type", "type", "ランキング種別", "種別"), ""))
     day_change_pct = _extract_day_change_pct({**row, "current_price": price, "price": price})
 
     if price > 0:
         for k in ("close_price", "current_price", "price", "close"):
             row[k] = price
-
     if volume > 0:
         row["volume"] = volume
         row["trading_volume"] = volume
-
     if turnover > 0:
         row["turnover"] = turnover
         row["trading_value"] = turnover
@@ -274,10 +196,8 @@ def _normalize_ranking_row_for_entry(row: Dict[str, Any]) -> Dict[str, Any]:
     row["rank_position"] = rank_position
     row["rank_type"] = rank_type
     row["day_change_pct"] = day_change_pct
-
     if not row.get("datetime"):
         row["datetime"] = row.get("snapshot_time") or row.get("time") or row.get("created_at")
-
     return row
 
 
@@ -291,10 +211,6 @@ def _prepare_rows(ranking_df: pd.DataFrame) -> List[Dict[str, Any]]:
         rows.append(row)
     return rows
 
-
-# ============================================================
-# ランキング履歴
-# ============================================================
 
 def _get_history_store() -> Dict[str, Any]:
     store = getattr(global_data, "ranking_entry_history", None)
@@ -318,14 +234,11 @@ def _update_history(symbol: str, side: str, price: float, rank_position: int, ra
     store = _get_history_store()
     key = _history_key(symbol, side)
     old = store.get(key, {}) if isinstance(store.get(key, {}), dict) else {}
-
     prices = list(old.get("prices", []))
     prices.append(price)
     prices = prices[-10:]
-
     old_side_seen = bool(old)
     consecutive = int(old.get("consecutive", 0)) + 1 if old_side_seen else 1
-
     new_h = {
         "symbol": symbol,
         "side": side,
@@ -343,10 +256,6 @@ def _update_history(symbol: str, side: str, price: float, rank_position: int, ra
 
 
 def _reset_missing_histories(current_keys: set[str]) -> None:
-    """
-    今回のランキングに出なかった銘柄は連続出現を切る。
-    履歴自体は少し残すが consecutive は 0 に戻す。
-    """
     store = _get_history_store()
     for key, h in list(store.items()):
         if key not in current_keys and isinstance(h, dict):
@@ -354,31 +263,74 @@ def _reset_missing_histories(current_keys: set[str]) -> None:
             store[key] = h
 
 
-# ============================================================
-# ランキング専用スコア・判定
-# ============================================================
-
 def _infer_side(row: Dict[str, Any]) -> str:
     rt = str(row.get("rank_type") or "")
     side = infer_side_from_rank_type(rt)
     if side in ("BUY", "SELL"):
         return side
-
     day_change = _safe_float(row.get("day_change_pct"), 0.0)
-    if day_change < 0:
-        return "SELL"
-    return "BUY"
+    return "SELL" if day_change < 0 else "BUY"
 
 
-def _calc_ranking_only_score(
-    row: Dict[str, Any],
-    side: str,
-    prev_price: float,
-    prev_rank: int,
-    consecutive: int,
-) -> Tuple[float, Dict[str, float]]:
+def _ranking_technical_filter(row: Dict[str, Any], side: str) -> Tuple[bool, str, float]:
+    cfg = RANKING_ENTRY_CONFIG.get("TECHNICAL", {}) or {}
+    if not bool(cfg.get("ENABLED", True)):
+        return True, "TECH_DISABLED", 0.0
+
+    ready = _safe_int(row.get("ranking_tech_ready"), 0)
+    if bool(cfg.get("REQUIRE_READY", False)) and ready <= 0:
+        return False, f"RANKING_TECH_NOT_READY reason={row.get('ranking_tech_reason')}", 0.0
+
+    if not bool(cfg.get("REQUIRE_DIRECTION", True)):
+        return True, "TECH_DIRECTION_DISABLED", 0.0
+
+    close = _safe_float(row.get("close") or row.get("current_price") or row.get("price"), 0.0)
+    ma5 = _safe_float(row.get("ma5"), 0.0)
+    ma25 = _safe_float(row.get("ma25"), 0.0)
+    rsi = _safe_float(row.get("rsi"), 50.0)
+    macd = _safe_float(row.get("macd"), 0.0)
+    signal = _safe_float(row.get("signal"), 0.0)
+    slope = _safe_float(row.get("slope"), 0.0)
+    tech_score = _safe_float(row.get("ranking_tech_score") or row.get("score_total"), 0.0)
+    min_slope = abs(_safe_float(cfg.get("MIN_SLOPE", 0.0001), 0.0001))
+
+    # 履歴が短い場合でも、REQUIRE_READY=Falseなら方向判定可能な項目だけ使う。
+    if bool(cfg.get("REQUIRE_CLOSE_VS_MA5", True)) and close > 0 and ma5 > 0:
+        if side == "BUY" and close < ma5:
+            return False, f"RANKING_TECH_BUY_CLOSE_BELOW_MA5 close={close:.2f} ma5={ma5:.2f}", tech_score
+        if side == "SELL" and close > ma5:
+            return False, f"RANKING_TECH_SELL_CLOSE_ABOVE_MA5 close={close:.2f} ma5={ma5:.2f}", tech_score
+
+    if bool(cfg.get("REQUIRE_MA5_MA25", True)) and ma5 > 0 and ma25 > 0:
+        if side == "BUY" and ma5 < ma25:
+            return False, f"RANKING_TECH_BUY_MA5_LT_MA25 ma5={ma5:.2f} ma25={ma25:.2f}", tech_score
+        if side == "SELL" and ma5 > ma25:
+            return False, f"RANKING_TECH_SELL_MA5_GT_MA25 ma5={ma5:.2f} ma25={ma25:.2f}", tech_score
+
+    if bool(cfg.get("REQUIRE_SLOPE", True)):
+        if side == "BUY" and slope < min_slope:
+            return False, f"RANKING_TECH_BUY_SLOPE_NG slope={slope:.6f} min={min_slope:.6f}", tech_score
+        if side == "SELL" and slope > -min_slope:
+            return False, f"RANKING_TECH_SELL_SLOPE_NG slope={slope:.6f} min=-{min_slope:.6f}", tech_score
+
+    if bool(cfg.get("REQUIRE_MACD_SIGNAL", False)):
+        if side == "BUY" and macd < signal:
+            return False, f"RANKING_TECH_BUY_MACD_NG macd={macd:.4f} signal={signal:.4f}", tech_score
+        if side == "SELL" and macd > signal:
+            return False, f"RANKING_TECH_SELL_MACD_NG macd={macd:.4f} signal={signal:.4f}", tech_score
+
+    if side == "BUY" and rsi > _safe_float(cfg.get("BUY_RSI_MAX", 82.0), 82.0):
+        return False, f"RANKING_TECH_BUY_RSI_TOO_HIGH rsi={rsi:.2f}", tech_score
+    if side == "SELL" and rsi < _safe_float(cfg.get("SELL_RSI_MIN", 18.0), 18.0):
+        return False, f"RANKING_TECH_SELL_RSI_TOO_LOW rsi={rsi:.2f}", tech_score
+
+    return True, "OK", tech_score
+
+
+def _calc_ranking_only_score(row: Dict[str, Any], side: str, prev_price: float, prev_rank: int, consecutive: int) -> Tuple[float, Dict[str, float]]:
     cfg_rank = RANKING_ENTRY_CONFIG["RANKING"]
     cfg_vol = RANKING_ENTRY_CONFIG["VOLUME"]
+    cfg_tech = RANKING_ENTRY_CONFIG.get("TECHNICAL", {}) or {}
 
     price = _safe_float(row.get("current_price") or row.get("price"), 0.0)
     volume = _safe_float(row.get("volume"), 0.0)
@@ -390,16 +342,11 @@ def _calc_ranking_only_score(
     min_volume = max(1.0, _safe_float(cfg_vol.get("MIN_VOLUME", 30000), 30000))
     min_turnover = max(1.0, _safe_float(cfg_vol.get("MIN_TURNOVER", 10000000), 10000000))
 
-    # 順位は 1位=満点、MAX_RANK_POSITION=最低点
     rank_score = _clip((max_rank - rank_position + 1) / max_rank, 0.0, 1.0) * 25.0
-
     turnover_score = _clip(turnover / (min_turnover * 5.0), 0.0, 1.0) * 20.0
     volume_score = _clip(volume / (min_volume * 5.0), 0.0, 1.0) * 15.0
 
-    rank_improve = 0.0
-    if prev_rank and prev_rank < 999999:
-        # 前回 20位 → 今回 10位なら +10
-        rank_improve = float(prev_rank - rank_position)
+    rank_improve = float(prev_rank - rank_position) if prev_rank and prev_rank < 999999 else 0.0
     rank_improve_score = _clip(rank_improve / 10.0, 0.0, 1.0) * 15.0
 
     step_pct = _pct_change(price, prev_price) if prev_price > 0 else 0.0
@@ -411,19 +358,18 @@ def _calc_ranking_only_score(
         day_direction_score = _clip((-day_change_pct) / 5.0, 0.0, 1.0) * 5.0
 
     consecutive_score = _clip((consecutive - 1) / 2.0, 0.0, 1.0) * 5.0
-
     rank_type_weight = RANK_TYPE_WEIGHT.get(str(row.get("rank_type") or ""), 1.0)
     market_weight = EXCHANGE_WEIGHT.get(str(row.get("market") or "ALL"), 1.0)
 
-    raw_score = (
-        rank_score
-        + turnover_score
-        + volume_score
-        + rank_improve_score
-        + price_momentum_score
-        + day_direction_score
-        + consecutive_score
-    )
+    tech_score_raw = _safe_float(row.get("ranking_tech_score"), 0.0)
+    tech_weight = _safe_float(cfg_tech.get("SCORE_WEIGHT", 2.0), 2.0) if bool(cfg_tech.get("ENABLED", True)) else 0.0
+    # ranking_tech_score は概ね -5〜+5。方向に合う分だけ加点する。
+    if side == "BUY":
+        tech_bonus = max(0.0, tech_score_raw) * tech_weight
+    else:
+        tech_bonus = max(0.0, -tech_score_raw) * tech_weight
+
+    raw_score = rank_score + turnover_score + volume_score + rank_improve_score + price_momentum_score + day_direction_score + consecutive_score + tech_bonus
     final_score = _clip(raw_score * rank_type_weight * market_weight, 0.0, 100.0)
 
     parts = {
@@ -434,6 +380,8 @@ def _calc_ranking_only_score(
         "price_momentum_score": price_momentum_score,
         "day_direction_score": day_direction_score,
         "consecutive_score": consecutive_score,
+        "ranking_tech_score": tech_score_raw,
+        "ranking_tech_bonus": tech_bonus,
         "rank_type_weight": rank_type_weight,
         "market_weight": market_weight,
         "rank_improve": rank_improve,
@@ -459,20 +407,15 @@ def _passes_ranking_only_filters(row: Dict[str, Any], side: str, prev_h: Dict[st
 
     if not symbol:
         return False, "NO_SYMBOL"
-
     allow_type = cfg_rank.get("TYPE")
     if allow_type and str(allow_type) not in rank_type:
         return False, f"RANK_TYPE_NG rank_type={rank_type} allow={allow_type}"
-
-    if price < _safe_float(cfg_price.get("MIN", 300), 300) or price > _safe_float(cfg_price.get("MAX", 5000), 5000):
+    if price < _safe_float(cfg_price.get("MIN", 300), 300) or price > _safe_float(cfg_price.get("MAX", 7000), 7000):
         return False, f"PRICE_RANGE_NG price={price}"
-
     if rank_position > int(cfg_rank.get("MAX_RANK_POSITION", 30)):
         return False, f"RANK_POSITION_NG rank={rank_position}"
-
     if volume < _safe_float(cfg_vol.get("MIN_VOLUME", 30000), 30000):
         return False, f"VOLUME_NG volume={volume}"
-
     if turnover < _safe_float(cfg_vol.get("MIN_TURNOVER", 10000000), 10000000):
         return False, f"TURNOVER_NG turnover={turnover}"
 
@@ -484,7 +427,6 @@ def _passes_ranking_only_filters(row: Dict[str, Any], side: str, prev_h: Dict[st
     consecutive = int(prev_h.get("consecutive", 0)) + 1 if prev_h else 1
     if consecutive < int(cfg_rank.get("MIN_CONSECUTIVE_APPEAR", 2)):
         return False, f"CONSECUTIVE_NG consecutive={consecutive}"
-
     if bool(cfg_rank.get("REQUIRE_RANK_NOT_WORSE", True)) and prev_rank < 999999 and rank_position > prev_rank:
         return False, f"RANK_WORSE prev={prev_rank} now={rank_position}"
 
@@ -510,24 +452,22 @@ def _passes_ranking_only_filters(row: Dict[str, Any], side: str, prev_h: Dict[st
 
     if bool(cfg_rank.get("REQUIRE_PRICE_BREAKOUT", True)):
         prices = list(prev_h.get("prices", []))
-        window = max(1, int(cfg_rank.get("PRICE_BREAKOUT_WINDOW", 3)))
-        recent = prices[-window:]
+        recent = prices[-max(1, int(cfg_rank.get("PRICE_BREAKOUT_WINDOW", 3))):]
         if recent:
             if side == "BUY" and price < max(recent):
                 return False, f"BUY_NOT_RECENT_HIGH price={price} recent_high={max(recent)}"
             if side == "SELL" and price > min(recent):
                 return False, f"SELL_NOT_RECENT_LOW price={price} recent_low={min(recent)}"
 
+    tech_ok, tech_reason, _tech_score = _ranking_technical_filter(row, side)
+    if not tech_ok:
+        return False, tech_reason
+
     min_score = _safe_float(cfg_score.get("MIN_ENTRY_SCORE", 70.0), 70.0)
     if score < min_score:
         return False, f"SCORE_NG score={score:.2f} min={min_score:.2f}"
-
     return True, "OK"
 
-
-# ============================================================
-# メイン処理
-# ============================================================
 
 def entry_from_ranking():
     started = dt.datetime.now()
@@ -548,17 +488,24 @@ def entry_from_ranking():
         logger.info("[RANKING ENTRY LOOP] skip reason=no_normalized_rows")
         return 0
 
+    tech_map: Dict[str, Dict[str, Any]] = {}
+    cfg_tech = RANKING_ENTRY_CONFIG.get("TECHNICAL", {}) or {}
+    if bool(cfg_tech.get("ENABLED", True)) and callable(save_ranking_pseudo_technicals):
+        tech_map = save_ranking_pseudo_technicals(rows)
+        logger.info("[RANKING ENTRY LOOP] ranking_technical attached symbols=%s", len(tech_map))
+
     created = 0
     build_reject = 0
     filter_reject = 0
     pending_reject = 0
     reject_samples: List[Dict[str, Any]] = []
     current_keys: set[str] = set()
-
-    # 同一銘柄・同一sideが複数ランキングに出る場合は、scoreが高いものだけ pending する
     best_by_symbol_side: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
     for row in rows:
+        if callable(attach_ranking_technicals):
+            row = attach_ranking_technicals(row, tech_map)
+
         symbol = str(row.get("symbol") or "").strip()
         side = _infer_side(row)
         row["side"] = side
@@ -573,18 +520,11 @@ def entry_from_ranking():
         row["score"] = score
         row["score_total"] = score
         row["ranking_only_score"] = score
+        row["ranking_score_parts"] = parts
 
         ok, reason = _passes_ranking_only_filters(row, side, prev_h, score, parts)
 
-        # 履歴はフィルターNGでも更新する。次回の価格推移・順位改善判定に使うため。
-        _update_history(
-            symbol=symbol,
-            side=side,
-            price=_safe_float(row.get("price") or row.get("current_price"), 0.0),
-            rank_position=_safe_int(row.get("rank_position"), 999999),
-            rank_type=str(row.get("rank_type") or ""),
-            now=now,
-        )
+        _update_history(symbol, side, _safe_float(row.get("price") or row.get("current_price"), 0.0), _safe_int(row.get("rank_position"), 999999), str(row.get("rank_type") or ""), now)
 
         if not ok:
             filter_reject += 1
@@ -600,6 +540,13 @@ def entry_from_ranking():
                         "volume": row.get("volume"),
                         "turnover": row.get("turnover"),
                         "day_change_pct": row.get("day_change_pct"),
+                        "ranking_tech_score": row.get("ranking_tech_score"),
+                        "ma5": row.get("ma5"),
+                        "ma25": row.get("ma25"),
+                        "rsi": row.get("rsi"),
+                        "macd": row.get("macd"),
+                        "signal": row.get("signal"),
+                        "slope": row.get("slope"),
                         "score": round(score, 2),
                         "reason": reason,
                     }
@@ -609,18 +556,9 @@ def entry_from_ranking():
 
         key = (symbol, side)
         old = best_by_symbol_side.get(key)
-        old_score = 0.0
-        if isinstance(old, dict) and isinstance(old.get("row"), dict):
-            old_score = _safe_float(old["row"].get("score_total"), 0.0)
-
+        old_score = _safe_float(old["row"].get("score_total"), 0.0) if isinstance(old, dict) and isinstance(old.get("row"), dict) else 0.0
         if old is None or score > old_score:
-            best_by_symbol_side[key] = {
-                "row": row,
-                "parts": parts,
-                "prev_price": prev_price,
-                "prev_rank": prev_rank,
-                "consecutive": consecutive,
-            }
+            best_by_symbol_side[key] = {"row": row, "parts": parts, "prev_price": prev_price, "prev_rank": prev_rank, "consecutive": consecutive}
 
     _reset_missing_histories(current_keys)
 
@@ -646,7 +584,7 @@ def entry_from_ranking():
         entry_row["score"] = final_score
         entry_row["score_total"] = final_score
         entry_row["ranking_only_score"] = final_score
-        entry_row["ranking_entry_mode"] = "RANKING_ONLY"
+        entry_row["ranking_entry_mode"] = "RANKING_ONLY_WITH_TECH"
         entry_row["ranking_prev_price"] = prev_price
         entry_row["ranking_prev_rank"] = prev_rank
         entry_row["ranking_consecutive"] = consecutive
@@ -654,20 +592,24 @@ def entry_from_ranking():
         entry_row["ranking_rank_improve"] = parts.get("rank_improve")
         entry_row["ranking_score_parts"] = parts
 
+        for k in ("ma5", "ma25", "ma75", "rsi", "macd", "signal", "macd_hist", "atr", "slope", "slope_atr_scaled", "vwap", "ranking_tech_score", "ranking_tech_ready", "ranking_tech_reason", "ranking_tech_datetime", "ranking_tech_db"):
+            if k in row:
+                entry_row[k] = row.get(k)
+
         pending_entry = {
             **entry_row,
             "source": "RANKING",
             "created_at": now,
             "ranking_fallback_used": False,
             "ranking_strength": final_score,
-            "technical_score": 0.0,
+            "technical_score": _safe_float(row.get("ranking_tech_score"), 0.0),
             "snapshot_score": final_score,
         }
 
         if add_pending(pending_entry):
             created += 1
             logger.info(
-                "[RANKING PENDING ADD] mode=RANKING_ONLY symbol=%s side=%s rank_type=%s rank=%s price=%.2f prev_price=%.2f step=%.3f%% day=%.3f%% volume=%.0f turnover=%.0f consecutive=%s rank_improve=%.1f score=%.2f",
+                "[RANKING PENDING ADD] mode=RANKING_ONLY_WITH_TECH symbol=%s side=%s rank_type=%s rank=%s price=%.2f prev_price=%.2f step=%.3f%% day=%.3f%% volume=%.0f turnover=%.0f consecutive=%s rank_improve=%.1f score=%.2f tech=%.2f ma5=%.2f ma25=%.2f rsi=%.2f slope=%.6f",
                 symbol,
                 side,
                 row.get("rank_type"),
@@ -681,6 +623,11 @@ def entry_from_ranking():
                 consecutive,
                 _safe_float(parts.get("rank_improve"), 0.0),
                 final_score,
+                _safe_float(row.get("ranking_tech_score"), 0.0),
+                _safe_float(row.get("ma5"), 0.0),
+                _safe_float(row.get("ma25"), 0.0),
+                _safe_float(row.get("rsi"), 0.0),
+                _safe_float(row.get("slope"), 0.0),
             )
         else:
             pending_reject += 1
@@ -688,9 +635,8 @@ def entry_from_ranking():
     elapsed = (dt.datetime.now() - started).total_seconds()
     if reject_samples:
         logger.warning("[RANKING ENTRY LOOP] ranking_only_reject_samples=%s", reject_samples)
-
     logger.info(
-        "[RANKING ENTRY LOOP] done mode=RANKING_ONLY created=%s total=%s candidates=%s filter_reject=%s build_reject=%s pending_reject=%s elapsed=%.3fs",
+        "[RANKING ENTRY LOOP] done mode=RANKING_ONLY_WITH_TECH created=%s total=%s candidates=%s filter_reject=%s build_reject=%s pending_reject=%s elapsed=%.3fs",
         created,
         len(rows),
         len(best_by_symbol_side),
@@ -699,7 +645,6 @@ def entry_from_ranking():
         pending_reject,
         elapsed,
     )
-
     return created
 
 
