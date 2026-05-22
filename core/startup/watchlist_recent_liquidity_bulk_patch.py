@@ -1,20 +1,20 @@
 # ============================================================
 # File   : core/startup/watchlist_recent_liquidity_bulk_patch.py
-# Version: V1.1-BULK-TIMEOUT-FAILOPEN
+# Version: V1.2-SKIP-DB-READ-IN-MAIN-PROCESS
 # ------------------------------------------------------------
 # watchlist_recent_liquidity_guard_patch の per-symbol SQLite 読取を
 # 1回のbulk読取に差し替え、さらにNAS DBが遅い場合はfail-openする。
 #
-# 背景:
-#   ACTIVE FINAL PRICE GUARD 後、100銘柄すべて missing_info の状態で
-#   WATCHLIST_RECENT_LIQ が summary DB を読むが、NAS上のSQLite SELECTが
-#   返らず起動/場中処理が止まって見える。
+# V1.2:
+#   - main.py では既定でsummary DB bulk read自体を起動しない
+#   - 理由: timeout後もdaemon workerがNAS SQLite SELECTを継続し、
+#           60〜132秒後に read done となってPUSH/ATSへ悪影響が出るため
+#   - main.pyで強制実行したい場合のみ WATCHLIST_RECENT_LIQ_BULK_RUN_IN_MAIN=1
 #
-# 変更:
+# V1.1:
 #   - 100銘柄分を1回の SELECT ... IN (...) で取得
 #   - DB読取は専用スレッドで実行し、最大 WATCHLIST_RECENT_LIQ_BULK_TIMEOUT_SEC だけ待つ
 #   - timeout/DB遅延時は監視銘柄を落とさず fail-open して後続処理を止めない
-#   - 次回以降はキャッシュがあれば通常どおり判定
 # ============================================================
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ import datetime as dt
 import logging
 import os
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
@@ -50,6 +51,47 @@ def _env_float(name: str, default: float) -> float:
         return float(v)
     except Exception:
         return float(default)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _is_main_py_process() -> bool:
+    try:
+        argv = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        return any(x.endswith("/main.py") or x == "main.py" for x in argv)
+    except Exception:
+        return False
+
+
+def _is_database_process() -> bool:
+    return any(
+        _env_bool(name, False)
+        for name in (
+            "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+            "AUTOSTOCK_SUMMARY_DB_WRITER",
+            "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+        )
+    )
+
+
+def _should_skip_db_read_in_main() -> bool:
+    if not _is_main_py_process():
+        return False
+    if _is_database_process():
+        return False
+    if _env_bool("WATCHLIST_RECENT_LIQ_BULK_RUN_IN_MAIN", False):
+        return False
+    if not _env_bool("WATCHLIST_RECENT_LIQ_BULK_SKIP_DB_IN_MAIN", True):
+        return False
+    return True
 
 
 def _read_bulk_stats_sync(mod: Any, missing: List[str], symbols_total: int) -> dict[str, dict[str, Any]]:
@@ -163,6 +205,14 @@ def _bulk_stats(mod: Any, symbols: List[str]) -> tuple[dict[str, dict[str, Any]]
     if not missing:
         return out, False
 
+    if _should_skip_db_read_in_main():
+        logger.warning(
+            "[WATCHLIST RECENT LIQ BULK] DB read skipped in main.py fail-open symbols=%d missing=%d set WATCHLIST_RECENT_LIQ_BULK_RUN_IN_MAIN=1 to force",
+            len(symbols),
+            len(missing),
+        )
+        return out, True
+
     timeout_sec = max(0.0, _env_float("WATCHLIST_RECENT_LIQ_BULK_TIMEOUT_SEC", 1.5))
     if timeout_sec <= 0:
         try:
@@ -223,11 +273,9 @@ def install() -> bool:
         check_items = [s for s in items if s not in protected]
         stats_map, timed_out = _bulk_stats(mod, check_items)
 
-        # NAS DBが遅い場合は、ここで監視銘柄を落とすと起動/場中更新が止まる。
-        # そのtickではfail-openして、エントリー直前の厳格出来高ガードに任せる。
         if timed_out and mod._env_bool("WATCHLIST_RECENT_LIQ_FAIL_OPEN_ON_TIMEOUT", True):
             logger.warning(
-                "[WATCHLIST RECENT LIQ BULK] fail-open context=%s count=%s reason=bulk_timeout",
+                "[WATCHLIST RECENT LIQ BULK] fail-open context=%s count=%s reason=bulk_timeout_or_main_skip",
                 context, len(items),
             )
             return items
@@ -276,9 +324,10 @@ def install() -> bool:
     mod._filter_symbols = _filter_symbols_bulk
     _INSTALLED = True
     logger.warning(
-        "[WATCHLIST RECENT LIQ BULK] installed bulk summary read timeout=%.2fs fail_open=%s",
+        "[WATCHLIST RECENT LIQ BULK] installed bulk summary read timeout=%.2fs fail_open=%s skip_db_in_main=%s",
         _env_float("WATCHLIST_RECENT_LIQ_BULK_TIMEOUT_SEC", 1.5),
         mod._env_bool("WATCHLIST_RECENT_LIQ_FAIL_OPEN_ON_TIMEOUT", True),
+        _should_skip_db_read_in_main(),
     )
     return True
 
