@@ -1,26 +1,20 @@
 # ============================================================
 # File   : core/startup/summary_mtf_indicator_fill_patch.py
-# Version: V2.0-FILL-1M-3M-5M-WITH-HISTORY
+# Version: V2.1-SKIP-HEAVY-IN-MAIN-PROCESS
 # ------------------------------------------------------------
-# summary_multiframe_startup_catchup_patch はOHLCVを作るが、
-# rsi/macd/signal/ma75/score_mtf/final_score などの指標列は
-# 通常サマリー計算まで0/50/NULLになりやすい。
+# 起動時に stock_summary_1min / 3min / 5min の基本テクニカルを再計算してDBへUPDATEする。
 #
-# このパッチは起動時に stock_summary_1min / 3min / 5min を読み、
-# 銘柄ごとに基本テクニカルを再計算してDBへUPDATEする。
-#
-# V2.0:
-#   - 1分足 stock_summary_1min も補完対象に追加
-#   - 当日DBだけでなく、過去 summaryYYYYMMDD.db を先頭に結合してから計算
-#   - 計算は「過去足 + 当日足」で行い、UPDATEは当日DBのrowidだけに限定
-#   - 途中からランキング/監視に入った銘柄でも rsi/macd/signal/ma75 の先頭NULLを減らす
-#   - NAS SQLite の database is locked 対策、chunk commit、skip_if_busy は維持
+# V2.1:
+#   - main.py 側では重い起動時自動補修を既定でスキップ
+#   - main_database.py / data collectors 側では従来通り実行可能
+#   - run_fill(reason="after_mtf_catchup") も main.py では既定スキップ
+#   - 定時サマリー保存前の軽量補完は scheduler_jobs.summary.safe_io 側で実施
 #
 # 主な環境変数:
-#   SUMMARY_MTF_INDICATOR_INTERVALS=1,3,5
-#   SUMMARY_MTF_INDICATOR_HISTORY_DAYS=7
-#   SUMMARY_MTF_INDICATOR_LOOKBACK_BARS=180
-#   SUMMARY_MTF_INDICATOR_MAX_ROWS=250000
+#   SUMMARY_MTF_INDICATOR_FILL_ENABLED=1/0
+#   SUMMARY_MTF_INDICATOR_RUN_IN_MAIN=0/1       # main.pyでも重い補修を実行したい場合のみ1
+#   AUTOSTOCK_MAIN_DATABASE_PROCESS=1           # main_database.py側
+#   AUTOSTOCK_DATA_COLLECTORS_PROCESS=1         # data collectors側
 # ============================================================
 
 from __future__ import annotations
@@ -48,7 +42,7 @@ def _env_bool(name: str, default: bool = True) -> bool:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
             return bool(default)
-        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok"}
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
     except Exception:
         return bool(default)
 
@@ -73,6 +67,25 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _is_database_process() -> bool:
+    return any(
+        _env_bool(name, False)
+        for name in (
+            "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+            "AUTOSTOCK_SUMMARY_DB_WRITER",
+            "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+        )
+    )
+
+
+def _is_main_process_split_mode() -> bool:
+    if _is_database_process():
+        return False
+    if _env_bool("SUMMARY_MTF_INDICATOR_RUN_IN_MAIN", False):
+        return False
+    return True
+
+
 def _summary_db_path() -> str:
     explicit = os.getenv("SUMMARY_DB_PATH") or os.getenv("AUTOSTOCK_SUMMARY_DB_PATH")
     if explicit:
@@ -94,11 +107,6 @@ def _extract_yyyymmdd(path: str) -> str:
 
 
 def _summary_db_paths_with_history(current_path: str) -> list[str]:
-    """current_path を最後に置き、前日以前のsummary DBを先に返す。
-
-    指標計算には過去足が必要だが、UPDATE対象は current_path のrowidだけにする。
-    土日/祝日を厳密判定せず、指定日数ぶん暦日で戻って存在するDBのみ採用する。
-    """
     cur = Path(current_path)
     out: list[str] = []
     history_days = max(0, _env_int("SUMMARY_MTF_INDICATOR_HISTORY_DAYS", 7))
@@ -116,7 +124,6 @@ def _summary_db_paths_with_history(current_path: str) -> list[str]:
         if p.exists():
             out.append(str(p))
     out.append(str(cur))
-    # 念のため重複排除
     uniq: list[str] = []
     seen: set[str] = set()
     for p in out:
@@ -197,7 +204,6 @@ def _rollback_quiet(conn: sqlite3.Connection) -> None:
 
 
 def _configure_connection(conn: sqlite3.Connection) -> None:
-    """NAS SQLite向けの軽い接続設定。失敗しても本処理は継続する。"""
     try:
         conn.execute("PRAGMA busy_timeout=%d" % int(_env_float("SUMMARY_MTF_INDICATOR_BUSY_TIMEOUT_MS", 30000)))
     except Exception:
@@ -207,7 +213,6 @@ def _configure_connection(conn: sqlite3.Connection) -> None:
     except Exception:
         pass
     try:
-        # WALはNAS環境で環境差があるため、既にWALなら維持する程度に留める。
         if _env_bool("SUMMARY_MTF_INDICATOR_FORCE_WAL", False):
             conn.execute("PRAGMA journal_mode=WAL")
     except Exception:
@@ -247,22 +252,15 @@ def _compute_indicators(df):
         gain = delta.clip(lower=0).rolling(14, min_periods=1).mean()
         loss = (-delta.clip(upper=0)).rolling(14, min_periods=1).mean()
         rs = gain / loss.replace(0, np.nan)
-        rsi = 100 - (100 / (1 + rs))
-        rsi = rsi.fillna(50.0).clip(0, 100)
-        g["rsi"] = rsi
+        g["rsi"] = (100 - (100 / (1 + rs))).fillna(50.0).clip(0, 100)
 
         ema12 = close.ewm(span=12, adjust=False, min_periods=1).mean()
         ema26 = close.ewm(span=26, adjust=False, min_periods=1).mean()
-        macd = ema12 - ema26
-        sig = macd.ewm(span=9, adjust=False, min_periods=1).mean()
-        g["macd"] = macd.fillna(0.0)
-        g["signal"] = sig.fillna(0.0)
+        g["macd"] = (ema12 - ema26).fillna(0.0)
+        g["signal"] = g["macd"].ewm(span=9, adjust=False, min_periods=1).mean().fillna(0.0)
 
         prev_close = close.shift(1)
-        tr1 = (high - low).abs()
-        tr2 = (high - prev_close).abs()
-        tr3 = (low - prev_close).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).fillna(0.0)
+        tr = pd.concat([(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1).fillna(0.0)
         atr = tr.rolling(14, min_periods=1).mean().fillna(0.0)
         g["atr"] = atr
 
@@ -280,7 +278,6 @@ def _compute_indicators(df):
         rsi_sell = ((g["rsi"] <= 50) & (g["rsi"] >= 25)).astype(float)
         slope_buy = (g["slope"] > 0).astype(float)
         slope_sell = (g["slope"] < 0).astype(float)
-
         score_buy = ma_buy + macd_buy + rsi_buy + slope_buy
         score_sell = ma_sell + macd_sell + rsi_sell + slope_sell
         g["score_buy"] = score_buy.fillna(0.0)
@@ -315,7 +312,6 @@ def _build_select_sql(table: str, cols: list[str], *, current_db: bool, interval
 
     dtexpr = dtc if dtc else f"({datec} || ' ' || {timec})"
     lookback_bars = _env_int("SUMMARY_MTF_INDICATOR_LOOKBACK_BARS", 180)
-    # 75MA / MACD signal / 5分足75本を考慮して、多めに読む
     lookback_min = max(interval * lookback_bars + 30, interval * 90 + 30)
     since = (dt.datetime.now() - dt.timedelta(minutes=lookback_min)).strftime("%Y-%m-%d %H:%M:%S")
     max_rows = _env_int("SUMMARY_MTF_INDICATOR_MAX_ROWS", 250000)
@@ -382,8 +378,6 @@ def _load_table_df_with_history(current_path: str, table: str, interval: int):
     if not frames:
         return pd.DataFrame()
     df = pd.concat(frames, ignore_index=True)
-
-    # 同一 symbol/dtv が過去DBと当日DBに重複した場合は当日DBを優先
     try:
         df["_sym_norm"] = df["symbol"].map(_norm_symbol)
         df["dtv"] = pd.to_datetime(df["dtv"], errors="coerce")
@@ -398,21 +392,17 @@ def _load_table_df_with_history(current_path: str, table: str, interval: int):
 def _update_table(conn: sqlite3.Connection, table: str, cols: list[str], df) -> int:
     if df is None or df.empty:
         return 0
-
-    # UPDATE対象は当日DBのrowidを持つ行だけ
     try:
         df = df[(df.get("_is_target", 0).astype(int) == 1) & df["_rowid"].notna()].copy()
     except Exception:
         df = df[df["_rowid"].notna()].copy()
-
     if df.empty:
         return 0
 
     wanted = [
         "rsi", "macd", "signal", "atr", "slope", "slope_atr_scaled", "score_slope",
-        "ma5", "ma25", "ma75",
-        "score", "score_buy", "score_sell", "score_total", "final_score", "display_score",
-        "score_mtf", "mtf_score", "mtf",
+        "ma5", "ma25", "ma75", "score", "score_buy", "score_sell", "score_total",
+        "final_score", "display_score", "score_mtf", "mtf_score", "mtf",
     ]
     update_cols = [c for c in wanted if c in cols and c in df.columns]
     if not update_cols:
@@ -448,10 +438,7 @@ def _update_table(conn: sqlite3.Connection, table: str, cols: list[str], df) -> 
                 conn.commit()
                 total_done += len(chunk)
                 if idx == 1 or idx == len(chunks) or idx % 10 == 0:
-                    logger.info(
-                        "[SUMMARY MTF INDICATOR FILL] chunk ok table=%s chunk=%s/%s rows=%s total_done=%s",
-                        table, idx, len(chunks), len(chunk), total_done,
-                    )
+                    logger.info("[SUMMARY MTF INDICATOR FILL] chunk ok table=%s chunk=%s/%s rows=%s total_done=%s", table, idx, len(chunks), len(chunk), total_done)
                 break
             except sqlite3.OperationalError as e:
                 _rollback_quiet(conn)
@@ -459,20 +446,12 @@ def _update_table(conn: sqlite3.Connection, table: str, cols: list[str], df) -> 
                     raise
                 attempt += 1
                 if attempt > max_retries:
-                    logger.warning(
-                        "[SUMMARY MTF INDICATOR FILL] chunk locked giveup table=%s chunk=%s/%s rows=%s done=%s retries=%s skip_if_busy=%s err=%s",
-                        table, idx, len(chunks), len(chunk), total_done, max_retries, skip_if_busy, e,
-                        exc_info=False,
-                    )
+                    logger.warning("[SUMMARY MTF INDICATOR FILL] chunk locked giveup table=%s chunk=%s/%s rows=%s done=%s retries=%s skip_if_busy=%s err=%s", table, idx, len(chunks), len(chunk), total_done, max_retries, skip_if_busy, e, exc_info=False)
                     if skip_if_busy:
                         return total_done
                     raise
                 sleep_sec = sleep_base * (1.5 ** (attempt - 1)) + random.uniform(0.0, sleep_base)
-                logger.warning(
-                    "[SUMMARY MTF INDICATOR FILL] chunk locked retry table=%s chunk=%s/%s attempt=%s/%s sleep=%.2fs err=%s",
-                    table, idx, len(chunks), attempt, max_retries, sleep_sec, e,
-                    exc_info=False,
-                )
+                logger.warning("[SUMMARY MTF INDICATOR FILL] chunk locked retry table=%s chunk=%s/%s attempt=%s/%s sleep=%.2fs err=%s", table, idx, len(chunks), attempt, max_retries, sleep_sec, e, exc_info=False)
                 time.sleep(sleep_sec)
     return total_done
 
@@ -502,10 +481,7 @@ def _run_fill_impl(*, reason: str = "manual") -> dict[str, Any]:
         total = 0
         timeout = _env_float("SUMMARY_MTF_INDICATOR_SQLITE_TIMEOUT", 30.0)
         history_paths = _summary_db_paths_with_history(path)
-        logger.warning(
-            "[SUMMARY MTF INDICATOR FILL] start reason=%s intervals=%s history_dbs=%s current=%s",
-            reason, _parse_intervals(), [Path(p).name for p in history_paths], path,
-        )
+        logger.warning("[SUMMARY MTF INDICATOR FILL] start reason=%s intervals=%s history_dbs=%s current=%s", reason, _parse_intervals(), [Path(p).name for p in history_paths], path)
         with sqlite3.connect(path, timeout=timeout) as conn:
             _configure_connection(conn)
             for interval in _parse_intervals():
@@ -515,7 +491,6 @@ def _run_fill_impl(*, reason: str = "manual") -> dict[str, Any]:
                 if not _table_exists(conn, table):
                     detail["error"] = "table_missing"
                     continue
-
                 cols = _columns(conn, table)
                 df = _load_table_df_with_history(path, table, interval)
                 detail["loaded"] = int(len(df)) if df is not None else 0
@@ -523,16 +498,12 @@ def _run_fill_impl(*, reason: str = "manual") -> dict[str, Any]:
                 if df is None or df.empty:
                     detail["updated"] = 0
                     continue
-
                 calc = _compute_indicators(df)
                 detail["after_calc_null_stats"] = _null_stats(calc)
                 updated = _update_table(conn, table, cols, calc)
                 total += updated
                 detail["updated"] = updated
-                logger.warning(
-                    "[SUMMARY MTF INDICATOR FILL] interval=%s loaded=%s updated=%s table=%s null_stats=%s",
-                    interval, len(df), updated, table, detail.get("after_calc_null_stats"),
-                )
+                logger.warning("[SUMMARY MTF INDICATOR FILL] interval=%s loaded=%s updated=%s table=%s null_stats=%s", interval, len(df), updated, table, detail.get("after_calc_null_stats"))
 
         result.update({"ok": True, "updated": total, "elapsed": round(time.monotonic() - t0, 3)})
         logger.warning("[SUMMARY MTF INDICATOR FILL] done reason=%s updated=%s elapsed=%.3fs db=%s", reason, total, time.monotonic() - t0, path)
@@ -544,11 +515,15 @@ def _run_fill_impl(*, reason: str = "manual") -> dict[str, Any]:
 
 
 def run_fill(*, reason: str = "manual") -> dict[str, Any]:
-    """MTF指標補完の公開入口。
+    if _is_main_process_split_mode() and str(reason or "") in {"startup", "after_mtf_catchup"}:
+        path = _summary_db_path()
+        logger.warning(
+            "[SUMMARY MTF INDICATOR FILL] skip heavy fill in main process reason=%s path=%s set SUMMARY_MTF_INDICATOR_RUN_IN_MAIN=1 to force",
+            reason,
+            path,
+        )
+        return {"ok": False, "skipped": True, "error": "skipped_in_main_process", "reason": reason, "path": path}
 
-    background startup と after_mtf_catchup 等が同時に走る可能性がある。
-    NAS上のSQLiteでは同時UPDATEが locked の主因になるため、入口で直列化する。
-    """
     global _RUNNING
     with _LOCK:
         if _RUNNING:
@@ -576,6 +551,10 @@ def install() -> bool:
         return True
     if not _env_bool("SUMMARY_MTF_INDICATOR_FILL_ENABLED", True):
         logger.warning("[SUMMARY MTF INDICATOR FILL] disabled by env")
+        return False
+    if _is_main_process_split_mode():
+        logger.warning("[SUMMARY MTF INDICATOR FILL] install skipped in main process; main_database.py handles heavy DB fill")
+        _INSTALLED = True
         return False
     _INSTALLED = True
     logger.warning(
