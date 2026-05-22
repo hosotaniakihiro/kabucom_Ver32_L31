@@ -1,6 +1,6 @@
 # ==========================================================
 # File   : trading/summary/summary_controller.py
-# Version: Ver37.7-PRODUCTION-HARDENED-SUMMARY-CONTROLLER
+# Version: Ver37.7.1-PRODUCTION-HARDENED-SUMMARY-CONTROLLER
 #          -LATEST-ONLY-POLLUTION-BLOCK
 #          -MERGED-HISTORY-SEPARATION
 #          -REASON-COLUMNS-PRESERVE
@@ -9,11 +9,13 @@
 #          -TECHNICAL-COLUMNS-PRESERVE
 #          -MA-MTF-BREAKDOWN-PRESERVE
 #          -MAIN-ENTRY-ONLY-SKIP-DB-SAVE
+#          -HISTORY-PAYLOAD-DEDUPE-FIX
 # ----------------------------------------------------------
-# ✔ Ver37.6 完全保持
+# ✔ Ver37.7 完全保持
 # ✔ main.py のサマリー計算結果はエントリー判定専用として利用可能
 # ✔ SUMMARY_SKIP_DB_SAVE_IN_MAIN=1 のとき summary DB 保存だけをスキップ
 # ✔ DB保存スキップ後も cache / ranking / AI / entry は継続
+# ✔ Ver37.7.1: dedupe_symbol_datetime(out, normalize_summary_df) に修正
 # ==========================================================
 
 from __future__ import annotations
@@ -231,8 +233,7 @@ def _overlay_preferred_score_columns(candidate_latest: pd.DataFrame, current_lat
             "base", "trend", "momentum", "mom", "velocity", "vel", "penalty", "pen",
             "buy_reason_ja", "sell_reason_ja", "exit_reason_ja",
             "buy_reason", "sell_reason", "exit_reason",
-            "ai_reason", "ai_exit_reason",
-            "ai_decision", "ai_exit_decision", "ai_side",
+            "ai_reason", "ai_exit_reason", "ai_decision", "ai_exit_decision", "ai_side",
             "ai_passed", "ai_buy_passed", "ai_sell_passed", "ai_exit_passed",
             "ai_confidence", "ai_exit_confidence",
         )
@@ -334,7 +335,7 @@ def _prepare_history_payload(interval: int, df_hist: pd.DataFrame) -> pd.DataFra
     if out.empty:
         return out
     try:
-        out = dedupe_symbol_datetime(out)
+        out = dedupe_symbol_datetime(out, normalize_summary_df)
         out = limit_history_rows_per_symbol(out, limit=240)
     except Exception:
         logger.exception("[summary_controller] prepare history payload failed interval=%s", interval)
