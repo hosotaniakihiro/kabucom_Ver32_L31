@@ -1,15 +1,15 @@
 # ============================================================
 # File: config/ranking_entry_config.py
-# Ver : RANKING-ONLY-ENTRY-CONFIG-v5.0.1
+# Ver : RANKING-ONLY-ENTRY-CONFIG-v5.1.0
 # ------------------------------------------------------------
 # Ranking ENTRY 専用設定ファイル
 #
 # ✔ ランキング由来 ENTRY の条件をすべて数値化
 # ✔ ランキング表示情報と、そこから算出できる数値だけで判定
-# ✔ SUMMARY / PUSH / 板 / 5秒足 / 日足MA は使わない
 # ✔ BUY / SELL 両対応
 # ✔ 現在値推移・順位改善・連続出現・売買代金・出来高で判定
 # ✔ Ver5.0.1: 最高価格を 7,000円以下へ統一
+# ✔ Ver5.1.0: ランキング現在値を疑似終値にした専用テクニカルをENTRY検討要素へ追加
 # ============================================================
 
 from datetime import time, datetime
@@ -93,14 +93,52 @@ RANKING_ENTRY_CONFIG = {
     },
 
     # ========================================================
+    # ランキング疑似終値テクニカル
+    # ========================================================
+    "TECHNICAL": {
+        # ランキング現在値を疑似終値として別DB保存し、ENTRY検討要素に使う
+        "ENABLED": True,
+
+        # True にすると、ランキングテクニカルが未計算の銘柄は落とす。
+        # 起動直後は履歴が少ないため、初期値は False。
+        "REQUIRE_READY": False,
+
+        # BUY/SELL方向確認。Trueなら逆方向テクニカルは落とす。
+        "REQUIRE_DIRECTION": True,
+
+        # BUY: close > ma5 を要求
+        # SELL: close < ma5 を要求
+        "REQUIRE_CLOSE_VS_MA5": True,
+
+        # BUY: ma5 >= ma25 を要求
+        # SELL: ma5 <= ma25 を要求
+        "REQUIRE_MA5_MA25": True,
+
+        # BUY: slope > MIN_SLOPE を要求
+        # SELL: slope < -MIN_SLOPE を要求
+        "REQUIRE_SLOPE": True,
+        "MIN_SLOPE": 0.0001,
+
+        # BUY: macd >= signal / SELL: macd <= signal を要求
+        "REQUIRE_MACD_SIGNAL": False,
+
+        # RSI過熱回避
+        "BUY_RSI_MAX": 82.0,
+        "SELL_RSI_MIN": 18.0,
+
+        # ランキング専用スコアに加点する重み
+        "SCORE_WEIGHT": 2.0,
+    },
+
+    # ========================================================
     # ENTRY スコア
     # ========================================================
     "SCORE": {
         # ランキング専用スコアの最低ライン
         "MIN_ENTRY_SCORE": 70.0,
 
-        # RANKING ONLY のためテクニカル評価は使わない
-        "USE_TECHNICAL_SCORE": False,
+        # RANKING ONLY のためAI gateは使わない
+        "USE_TECHNICAL_SCORE": True,
         "USE_AI_GATE": False,
 
         # 互換用
