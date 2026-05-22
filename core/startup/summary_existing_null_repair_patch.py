@@ -1,30 +1,21 @@
 # ============================================================
 # File   : core/startup/summary_existing_null_repair_patch.py
-# Version: V1.0-REPAIR-EXISTING-SUMMARY-NULLS
+# Version: V1.1-SKIP-HEAVY-IN-MAIN-PROCESS
 # ------------------------------------------------------------
 # 目的:
 #   既に summaryYYYYMMDD.db に入っている stock_summary_1min/3min/5min の
-#   NULL項目を起動時に再計算・補修する。
+#   NULL項目を再計算・補修する。
 #
-# 背景:
-#   summary_multiframe_startup_catchup_patch / summary_mtf_indicator_fill_patch は
-#   新規UPSERTや直近補完には効くが、既存DB内の古いNULL行が残ることがある。
-#   このパッチは既存行を読み直し、NULLが残っている行だけUPDATEする。
+# V1.1:
+#   - main.py 側では起動時の重い全DB NULL補修を既定でスキップ
+#   - main_database.py / data collectors 側では従来通り実行可能
+#   - main.py の定時サマリー保存前補完は scheduler_jobs.summary.safe_io 側で実施
 #
-# 補修対象:
-#   time_range
-#   rsi / macd / signal / atr
-#   slope / slope_atr_scaled / score_slope
-#   ma5 / ma25 / ma75
-#   score / score_buy / score_sell / score_total
-#   final_score / display_score
-#   score_mtf / mtf_score / mtf
-#
-# 安全性:
-#   - DBに存在するカラムだけ更新
-#   - NULLが残っている行だけ更新
-#   - chunk commit + busy retry
-#   - 失敗しても本体起動を止めない
+# 主な環境変数:
+#   SUMMARY_EXISTING_NULL_REPAIR_ENABLED=1/0
+#   SUMMARY_EXISTING_NULL_REPAIR_RUN_IN_MAIN=0/1   # main.pyでも起動時補修したい場合のみ1
+#   AUTOSTOCK_MAIN_DATABASE_PROCESS=1
+#   AUTOSTOCK_DATA_COLLECTORS_PROCESS=1
 # ============================================================
 
 from __future__ import annotations
@@ -51,7 +42,7 @@ def _env_bool(name: str, default: bool = True) -> bool:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
             return bool(default)
-        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok"}
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
     except Exception:
         return bool(default)
 
@@ -74,6 +65,25 @@ def _env_float(name: str, default: float) -> float:
         return float(v)
     except Exception:
         return float(default)
+
+
+def _is_database_process() -> bool:
+    return any(
+        _env_bool(name, False)
+        for name in (
+            "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+            "AUTOSTOCK_SUMMARY_DB_WRITER",
+            "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+        )
+    )
+
+
+def _is_main_process_split_mode() -> bool:
+    if _is_database_process():
+        return False
+    if _env_bool("SUMMARY_EXISTING_NULL_REPAIR_RUN_IN_MAIN", False):
+        return False
+    return True
 
 
 def _summary_db_path() -> str:
@@ -256,7 +266,6 @@ def _compute(df, interval: int):
         prev_close = close.shift(1)
         tr = pd.concat([(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1).fillna(0.0)
         g["atr"] = tr.rolling(14, min_periods=1).mean().fillna(0.0)
-
         g["slope"] = close.pct_change(3).replace([np.inf, -np.inf], np.nan).fillna(0.0)
         atr_pct = (g["atr"] / close.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
         g["slope_atr_scaled"] = (g["slope"] / atr_pct.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
@@ -270,7 +279,6 @@ def _compute(df, interval: int):
         rsi_sell = ((g["rsi"] <= 50) & (g["rsi"] >= 25)).astype(float)
         slope_buy = (g["slope"] > 0).astype(float)
         slope_sell = (g["slope"] < 0).astype(float)
-
         score_buy = ma_buy + macd_buy + rsi_buy + slope_buy
         score_sell = ma_sell + macd_sell + rsi_sell + slope_sell
         g["score_buy"] = score_buy.fillna(0.0)
@@ -293,8 +301,6 @@ def _needs_update_where(cols: list[str]) -> str:
         "ma5", "ma25", "ma75", "score_buy", "score_sell", "score_total", "final_score", "score_mtf", "mtf",
     ]
     terms = [f"{c} IS NULL" for c in candidates if c in cols]
-    if not terms:
-        return ""
     return " OR ".join(terms)
 
 
@@ -373,6 +379,15 @@ def _update_table(conn: sqlite3.Connection, table: str, cols: list[str], calc, t
 
 
 def run_repair(*, reason: str = "manual") -> dict[str, Any]:
+    if _is_main_process_split_mode() and str(reason or "") == "startup":
+        path = _summary_db_path()
+        logger.warning(
+            "[SUMMARY EXISTING NULL REPAIR] skip heavy repair in main process reason=%s path=%s set SUMMARY_EXISTING_NULL_REPAIR_RUN_IN_MAIN=1 to force",
+            reason,
+            path,
+        )
+        return {"ok": False, "skipped": True, "error": "skipped_in_main_process", "reason": reason, "path": path}
+
     global _RUNNING
     with _LOCK:
         if _RUNNING:
@@ -422,10 +437,7 @@ def _run_repair_impl(*, reason: str) -> dict[str, Any]:
                 updated = _update_table(conn, table, cols, calc, target_rowids)
                 detail["updated"] = updated
                 total += updated
-                logger.warning(
-                    "[SUMMARY EXISTING NULL REPAIR] interval=%s table=%s loaded=%s null_rows=%s updated=%s",
-                    interval, table, len(df), len(target_rowids), updated,
-                )
+                logger.warning("[SUMMARY EXISTING NULL REPAIR] interval=%s table=%s loaded=%s null_rows=%s updated=%s", interval, table, len(df), len(target_rowids), updated)
         result.update({"ok": True, "updated": total, "elapsed": round(time.monotonic() - t0, 3)})
         logger.warning("[SUMMARY EXISTING NULL REPAIR] done reason=%s updated=%s elapsed=%.3fs db=%s", reason, total, time.monotonic() - t0, path)
         return result
@@ -449,13 +461,12 @@ def install() -> bool:
     if not _env_bool("SUMMARY_EXISTING_NULL_REPAIR_ENABLED", True):
         logger.warning("[SUMMARY EXISTING NULL REPAIR] disabled by env")
         return False
+    if _is_main_process_split_mode():
+        logger.warning("[SUMMARY EXISTING NULL REPAIR] install skipped in main process; main_database.py handles heavy repair")
+        _INSTALLED = True
+        return False
     _INSTALLED = True
-    logger.warning(
-        "[SUMMARY EXISTING NULL REPAIR] installed intervals=%s delay=%.1fs max_rows=%s",
-        _parse_intervals(),
-        _env_float("SUMMARY_EXISTING_NULL_REPAIR_START_DELAY_SEC", 18.0),
-        _env_int("SUMMARY_EXISTING_NULL_REPAIR_MAX_ROWS", 300000),
-    )
+    logger.warning("[SUMMARY EXISTING NULL REPAIR] installed intervals=%s delay=%.1fs max_rows=%s", _parse_intervals(), _env_float("SUMMARY_EXISTING_NULL_REPAIR_START_DELAY_SEC", 18.0), _env_int("SUMMARY_EXISTING_NULL_REPAIR_MAX_ROWS", 300000))
     th = threading.Thread(target=_run_background, args=("startup",), name="summary-existing-null-repair", daemon=True)
     th.start()
     return True
