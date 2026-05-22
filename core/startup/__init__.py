@@ -1,14 +1,14 @@
 # ============================================================
 # File   : core/startup/__init__.py
-# Ver    : PRODUCTION-STABLE-REV20.9-SUMMARY-EXISTING-NULL-REPAIR
+# Ver    : PRODUCTION-STABLE-REV21.0-DAILY-CACHE-FAST-STARTUP
 # ------------------------------------------------------------
 # 【概要】
 #   core.startup パッケージの公開入口。
-#   schedule loop stale guard patch / summary scheduler timeout patch /
-#   summary AI slope env patch / summary AI score env patch /
-#   summary write gate runtime patch / ranking summary persistence lock patch /
-#   allow orders runtime patch / exit board touch limit patch /
-#   summary existing null repair patch を自動適用する。
+#   各種 runtime/startup patch を自動適用する。
+#
+# REV21.0:
+#   - daily_signal_cache_fast_startup_patch を追加
+#   - main.py 起動時の日足キャッシュ全件同期warmupをスキップ可能にする
 # ============================================================
 
 from __future__ import annotations
@@ -79,6 +79,13 @@ try:
     install_summary_existing_null_repair_patch()
 except Exception:
     logger.exception("[core.startup] summary existing null repair patch install failed")
+
+try:
+    from .daily_signal_cache_fast_startup_patch import install as install_daily_signal_cache_fast_startup_patch
+
+    install_daily_signal_cache_fast_startup_patch()
+except Exception:
+    logger.exception("[core.startup] daily signal cache fast startup patch install failed")
 
 from .startup import system_startup
 from .summary_bootstrap import (
