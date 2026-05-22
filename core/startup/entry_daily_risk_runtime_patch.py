@@ -1,10 +1,10 @@
 # ============================================================
 # File   : core/startup/entry_daily_risk_runtime_patch.py
-# Version: V1.5-HARD-SYMBOL-BRAKE-SOFT-GLOBAL-BRAKE
+# Version: V1.6-DEFAULT-MAX-SYMBOL-ENTRIES-2
 # ------------------------------------------------------------
 # 導入ルール:
 #   1. BUY新規も許可する
-#   2. 同一銘柄は当日最大1回をデフォルトにする
+#   2. 同一銘柄は当日最大2回をデフォルトにする
 #   3. 発注成功時点でも同一銘柄の当日エントリー済みとして記録する
 #   4. 同一銘柄で1回でも損失が出たら当日停止する
 #   5. 1銘柄の当日損失 -1500円で停止する
@@ -13,19 +13,18 @@
 #   8. 連敗が20回に到達したら新規停止する
 #
 # 背景:
-#   2026/05/18 の取引明細で、同一銘柄の複数回負けが多く、
-#   小さな勝ちより大きな負けを積み上げていた。
+#   entry_final_filter_failopen_patch が ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL=2 を
+#   後段でセットしても、このpatchのinstall時点では v1.5 のデフォルト1回が
+#   ログ表示・判定に使われることがある。
 #
-# 重要修正 V1.5:
-#   - V1.4 の ENTRY_GLOBAL_MAX_DAILY_LOSS_YEN=-10000 は強すぎ、
-#     当日損失が -10000 を超えた時点でエントリーが全くなくなる。
-#   - 同一銘柄の再エントリー停止は維持する。
-#   - 全体停止はデフォルト -50000 円へ緩和する。
-#   - 連敗停止も 5 回から 20 回へ緩和する。
+# 重要修正 V1.6:
+#   - ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL のデフォルトを 1 → 2 に変更する。
+#   - 起動ログも installed v1.6 / max_symbol_entries=2 になる。
+#   - ただし環境変数やbatで明示指定されている場合は、その指定を優先する。
 #
 # 環境変数:
 #   ENTRY_BUY_ENABLED=1
-#   ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL=1
+#   ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL=2
 #   ENTRY_STOP_SYMBOL_AFTER_FIRST_LOSS=1
 #   ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN=-1500
 #   ENTRY_GLOBAL_MAX_DAILY_LOSS_YEN=-50000
@@ -306,7 +305,7 @@ def _risk_block_reason(symbol: str, side: str) -> Tuple[bool, str, Dict[str, Any
     srow = _get_symbol_row(symbol)
     grow = _get_global_row()
 
-    max_entries = _env_int("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", 1)
+    max_entries = _env_int("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", 2)
     symbol_max_loss = _env_float("ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN", -1500.0)
     stop_after_first_loss = _env_bool("ENTRY_STOP_SYMBOL_AFTER_FIRST_LOSS", True)
     global_max_loss = _env_float("ENTRY_GLOBAL_MAX_DAILY_LOSS_YEN", -50000.0)
@@ -354,7 +353,7 @@ def install() -> bool:
         logger.warning("[ENTRY DAILY RISK] _execute_best_candidate not callable")
         return False
 
-    if not getattr(old_execute, "_entry_daily_risk_wrapped_v15", False):
+    if not getattr(old_execute, "_entry_daily_risk_wrapped_v16", False):
         def _execute_best_candidate_daily_risk(item: dict, boost_active: bool) -> bool:
             symbol = ""
             side = ""
@@ -381,11 +380,11 @@ def install() -> bool:
 
             return ok
 
-        _execute_best_candidate_daily_risk._entry_daily_risk_wrapped_v15 = True  # type: ignore[attr-defined]
+        _execute_best_candidate_daily_risk._entry_daily_risk_wrapped_v16 = True  # type: ignore[attr-defined]
         _execute_best_candidate_daily_risk._original = old_execute  # type: ignore[attr-defined]
         ec._execute_best_candidate = _execute_best_candidate_daily_risk
 
-    if callable(old_record_exit) and not getattr(old_record_exit, "_entry_daily_actual_trade_wrapped_v15", False):
+    if callable(old_record_exit) and not getattr(old_record_exit, "_entry_daily_actual_trade_wrapped_v16", False):
         def _record_exit_event_daily_actual_trade(symbol: Any, *, pnl: float, reason: str, now=None) -> None:
             try:
                 old_record_exit(symbol, pnl=pnl, reason=reason, now=now)
@@ -394,15 +393,15 @@ def install() -> bool:
                     _record_actual_trade(symbol, float(pnl or 0.0))
                 except Exception:
                     logger.exception("[ENTRY DAILY RISK] record actual trade failed symbol=%s", symbol)
-        _record_exit_event_daily_actual_trade._entry_daily_actual_trade_wrapped_v15 = True  # type: ignore[attr-defined]
+        _record_exit_event_daily_actual_trade._entry_daily_actual_trade_wrapped_v16 = True  # type: ignore[attr-defined]
         _record_exit_event_daily_actual_trade._original = old_record_exit  # type: ignore[attr-defined]
         stg.record_exit_event = _record_exit_event_daily_actual_trade
 
     _INSTALLED = True
     logger.warning(
-        "[ENTRY DAILY RISK] installed v1.5 buy_enabled=%s max_symbol_entries=%s stop_after_first_loss=%s symbol_max_loss=%s global_max_loss=%s global_max_trades=%s global_max_consecutive_losses=%s count_mode=entry_sent_and_actual_exit",
+        "[ENTRY DAILY RISK] installed v1.6 buy_enabled=%s max_symbol_entries=%s stop_after_first_loss=%s symbol_max_loss=%s global_max_loss=%s global_max_trades=%s global_max_consecutive_losses=%s count_mode=entry_sent_and_actual_exit",
         _env_bool("ENTRY_BUY_ENABLED", True),
-        _env_int("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", 1),
+        _env_int("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", 2),
         _env_bool("ENTRY_STOP_SYMBOL_AFTER_FIRST_LOSS", True),
         _env_float("ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN", -1500.0),
         _env_float("ENTRY_GLOBAL_MAX_DAILY_LOSS_YEN", -50000.0),
