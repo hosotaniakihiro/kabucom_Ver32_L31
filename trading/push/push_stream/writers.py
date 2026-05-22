@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/writers.py
-# Version: Ver1.2-PRODUCTION-PUSH-STREAM-WRITERS-NO-DROP-RETRY
+# Version: Ver1.3-PRODUCTION-PUSH-STREAM-WRITERS-MAIN-MEMORY-ONLY-GUARD
 # ------------------------------------------------------------
 # 【概要】
 #   push_stream package 用 writer / queue / flush worker
@@ -10,6 +10,11 @@
 #   - flush worker が queue から batch を取り出して stream_data DB へ保存
 #   - startup 側で起動済みの trading.push.push_db_writer.stream_writer singleton を優先使用
 #   - StreamDBWriter のインスタンス分裂を防止
+#
+# 【重要修正 Ver1.3】
+#   - main.py / main_database.py 分離運用時、main.py側ではqueue投入をskip
+#   - main.py側はPUSHをメモリ/price cache/5秒足更新だけに使用
+#   - flush workerが誤起動しても _flush_rows 側でDB保存をno-op
 #
 # 【重要修正 Ver1.2】
 #   - stream_writer が None のとき、flush失敗で batch を捨てない
@@ -40,6 +45,22 @@ except Exception:
 
 
 # ============================================================
+# split-mode guard
+# ============================================================
+
+def _should_skip_push_stream_db_work_here() -> bool:
+    """
+    main.py側ではpush_stream queue/flush/DB保存を行わない。
+    main_database.py 側だけがPUSH DB保存を担当する。
+    """
+    try:
+        from data_collectors.split_mode import should_skip_data_collector_work_in_main
+        return bool(should_skip_data_collector_work_in_main())
+    except Exception:
+        return False
+
+
+# ============================================================
 # writer init
 # ============================================================
 
@@ -51,6 +72,12 @@ def _init_stream_writer() -> Any:
       startup 側で trading.push.push_db_writer.stream_writer singleton を
       起動しているため、ここでも同じ singleton を優先使用する。
     """
+    if _should_skip_push_stream_db_work_here():
+        logger.warning(
+            "[push_stream] stream writer init skipped in main memory-only mode; main_database.py handles PUSH DB storage"
+        )
+        return None
+
     try:
         from trading.push import push_db_writer as mod
 
@@ -85,6 +112,10 @@ def _init_stream_writer() -> Any:
 
 def _ensure_stream_writer() -> Any:
     """flush時点で writer が無ければ再取得する。"""
+    if _should_skip_push_stream_db_work_here():
+        logger.debug("[push_stream] ensure stream writer skipped in main memory-only mode")
+        return None
+
     try:
         if state._stream_writer is not None:
             return state._stream_writer
@@ -104,6 +135,12 @@ def _init_order_book_writer() -> Any:
     """
     OrderBook writer を取得する。
     """
+    if _should_skip_push_stream_db_work_here():
+        logger.warning(
+            "[push_stream] order book writer init skipped in main memory-only mode; main_database.py handles PUSH DB storage"
+        )
+        return None
+
     try:
         if OrderBookDBWriter is not None:
             writer = OrderBookDBWriter()
@@ -127,6 +164,7 @@ def _init_order_book_writer() -> Any:
 def _queue_put(row: dict) -> None:
     """
     on_message から呼ばれる queue 投入口。
+    main.py memory-only mode ではDB保存用queueへ投入しない。
     """
     if not isinstance(row, dict):
         state._total_dropped += 1
@@ -134,6 +172,13 @@ def _queue_put(row: dict) -> None:
             "[push_stream] queue put skipped: row is not dict total_dropped=%d",
             state._total_dropped,
         )
+        return
+
+    if _should_skip_push_stream_db_work_here():
+        # PUSHは既に latest_price_cache / 5秒足 / DataFrame に反映済み。
+        # DB保存用queueだけ投入しない。
+        _safe_set_runtime("push_stream_memory_only", True)
+        _safe_set_runtime("push_stream_db_queue_skipped", True)
         return
 
     try:
@@ -149,6 +194,14 @@ def _queue_put(row: dict) -> None:
 def _requeue_rows(rows: List[dict], *, reason: str) -> int:
     """flush失敗時、取得済み batch を捨てずに queue へ戻す。"""
     if not rows:
+        return 0
+
+    if _should_skip_push_stream_db_work_here():
+        logger.warning(
+            "[push_stream] requeue skipped in main memory-only mode reason=%s rows=%d",
+            reason,
+            len(rows),
+        )
         return 0
 
     requeued = 0
@@ -179,6 +232,15 @@ def _requeue_rows(rows: List[dict], *, reason: str) -> int:
 
 def _flush_rows(rows: List[dict]) -> bool:
     if not rows:
+        return True
+
+    if _should_skip_push_stream_db_work_here():
+        _safe_set_runtime("push_stream_memory_only", True)
+        _safe_set_runtime("push_writer_last_ok", True)
+        logger.warning(
+            "[push_stream] flush skipped in main memory-only mode rows=%d; memory/latest cache already updated",
+            len(rows),
+        )
         return True
 
     ok = True
@@ -269,6 +331,11 @@ def _flush_rows(rows: List[dict]) -> bool:
 
 
 def _flush_worker() -> None:
+    if _should_skip_push_stream_db_work_here():
+        _safe_set_runtime("push_writer_running", False)
+        logger.warning("[push_stream] flush worker not started in main memory-only mode")
+        return
+
     _safe_set_runtime("push_writer_running", True)
     logger.info("[push_stream] flush worker started")
 
