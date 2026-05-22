@@ -1,9 +1,14 @@
 # ============================================================
 # File   : scheduler_jobs/summary/safe_io.py
-# Version: PRODUCTION-STABLE-SUMMARY-SAFE-IO-V1.3-ENRICH-BEFORE-DISPLAY
+# Version: PRODUCTION-STABLE-SUMMARY-SAFE-IO-V1.4-ENRICH-BEFORE-SAVE
 # ------------------------------------------------------------
 # 【概要】
 #   summary DB保存 / PUSH表示 / RANKING表示の安全ラッパー。
+#
+# V1.4:
+#   - DB保存前にも trading.summary.controller_enrich.enrich_summary_latest() を通す
+#   - 表示には入るがDBには入らない daily MTF / ranking_score を防ぐ
+#   - 保存前の重要カラムNULL/0件数をログ出力
 #
 # V1.3:
 #   - display_push_summary_safe / display_ranking_summary_safe の表示前に
@@ -31,8 +36,17 @@ from trading.summary.filters.liquidity_filter import (
 logger = logging.getLogger(__name__)
 
 
+IMPORTANT_SAVE_COLUMNS = [
+    "open_price", "high_price", "low_price", "close_price", "volume", "time_range",
+    "rsi", "macd", "signal", "atr", "slope", "slope_atr_scaled",
+    "ma5", "ma25", "ma75",
+    "score_buy", "score_sell", "score_total", "final_score", "score_mtf", "mtf",
+    "ranking_score", "ranking_score_total", "ranking_type", "rank",
+]
+
+
 def _enrich_for_display(df: pd.DataFrame, interval: int, source: str, context: str) -> pd.DataFrame:
-    """scheduler_jobs.summary 経路でも ranking / daily MTF を表示直前に付与する。"""
+    """scheduler_jobs.summary 経路でも ranking / daily MTF を表示・保存前に付与する。"""
     if not is_nonempty_df(df):
         return df
     try:
@@ -45,10 +59,10 @@ def _enrich_for_display(df: pd.DataFrame, interval: int, source: str, context: s
         )
         try:
             logger.info(
-                "[summary.runners] enrich_for_display source=%s interval=%s context=%s rows=%s cols=%s",
+                "[summary.runners] enrich_for_%s source=%s interval=%s rows=%s cols=%s",
+                context,
                 source,
                 interval,
-                context,
                 len(out) if isinstance(out, pd.DataFrame) else None,
                 len(out.columns) if isinstance(out, pd.DataFrame) else None,
             )
@@ -63,6 +77,49 @@ def _enrich_for_display(df: pd.DataFrame, interval: int, source: str, context: s
             context,
         )
         return df
+
+
+def _log_save_column_health(df: pd.DataFrame, interval: int, source: str, stage: str) -> None:
+    if not is_nonempty_df(df):
+        logger.warning(
+            "[SUMMARY SAVE HEALTH] source=%s interval=%s stage=%s rows=0 reason=empty",
+            source,
+            interval,
+            stage,
+        )
+        return
+    try:
+        payload = {}
+        for c in IMPORTANT_SAVE_COLUMNS:
+            if c not in df.columns:
+                payload[c] = "MISSING"
+                continue
+            s = df[c]
+            nulls = int(s.isna().sum())
+            zeros = None
+            try:
+                num = pd.to_numeric(s, errors="coerce")
+                zeros = int(num.fillna(0).eq(0).sum())
+            except Exception:
+                pass
+            payload[c] = {"null": nulls, "zero": zeros}
+
+        logger.warning(
+            "[SUMMARY SAVE HEALTH] source=%s interval=%s stage=%s rows=%s cols=%s health=%s",
+            source,
+            interval,
+            stage,
+            len(df),
+            len(df.columns),
+            payload,
+        )
+    except Exception:
+        logger.exception(
+            "[SUMMARY SAVE HEALTH] failed source=%s interval=%s stage=%s",
+            source,
+            interval,
+            stage,
+        )
 
 
 # ============================================================
@@ -89,13 +146,21 @@ def save_summary_safe(df: pd.DataFrame, interval: int, source: str) -> bool:
             rows,
         )
 
-        save_merged_summary(df, interval, source=source)
+        _log_save_column_health(df, interval, source, "before_enrich")
+
+        # 重要: 表示前だけでなく、DB保存前にも daily MTF / ranking_score 等を補完する。
+        df_to_save = _enrich_for_display(df, interval, source.upper(), "before-save")
+
+        _log_save_column_health(df_to_save, interval, source, "after_enrich_before_db")
+
+        save_merged_summary(df_to_save, interval, source=source)
 
         logger.info(
-            "[summary.runners] save_summary success source=%s interval=%s rows=%d",
+            "[summary.runners] save_summary success source=%s interval=%s rows=%d saved_cols=%s",
             source,
             interval,
-            rows,
+            len(df_to_save) if isinstance(df_to_save, pd.DataFrame) else rows,
+            len(df_to_save.columns) if isinstance(df_to_save, pd.DataFrame) else None,
         )
         return True
 
