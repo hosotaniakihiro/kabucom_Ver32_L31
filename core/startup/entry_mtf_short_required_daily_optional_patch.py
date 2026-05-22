@@ -1,23 +1,21 @@
 # ============================================================
 # File   : core/startup/entry_mtf_short_required_daily_optional_patch.py
-# Version: V1.2-SHORT-MTF-BACKFILL-GC-AND-SUMMARY-DB
+# Version: V1.3-ZERO-SLOPE-NEUTRAL-FOR-MA5-BREAKOUT
 # ------------------------------------------------------------
 # 【目的】
 #   日足MA/日足MTF 1つの逆行だけでエントリー不可になる問題を防ぐ。
 #
 # 【方針】
 #   - 発注直前の方向ガードでは、日足込みの mtf / score_mtf は必須判定に使わない
-#   - 1分・3分・5分の slope_atr_scaled_* を必須にする
+#   - 1分・3分・5分の slope_atr_scaled_* を確認する
 #   - 日足MTFはスコア加点・参考情報として残すが、単独では発注停止しない
 #
-# V1.2:
-#   - entry_row に slope_1m / slope_3m / slope_5m が無い場合、
-#     1) entry_row
-#     2) row.interval の汎用 slope
-#     3) global_context の merged summary / history
-#     4) summaryYYYYMMDD.db の stock_summary_1min/3min/5min
-#     の順で補完する。
-#   - GCで 3分/5分が empty の瞬間でも、DBに保存済みなら補完できる。
+# V1.3:
+#   - slope=0.0 を「逆方向」扱いしない。
+#   - BUY は slope < -eps の足だけNG、SELL は slope > eps の足だけNG。
+#   - 3足すべて0.0でも、後段の MA5上抜け/下抜け本数ガードで判定できるようにする。
+#   - これにより SHORT_MTF_NOT_SELL_ALIGNED bad={'slope_1m':0,'slope_3m':0,'slope_5m':0}
+#     で全落ちする問題を避ける。
 # ============================================================
 
 from __future__ import annotations
@@ -202,11 +200,7 @@ def _get_db_short_slope(symbol: str, tf: int) -> Optional[float]:
                     break
             logger.warning(
                 "[SHORT MTF GUARD] DB backfill symbol=%s tf=%s slope=%s dt=%s db=%s",
-                sym,
-                tf,
-                val,
-                row[3],
-                db,
+                sym, tf, val, row[3], db,
             )
     except Exception as e:
         logger.debug("[SHORT MTF GUARD] DB backfill failed symbol=%s tf=%s err=%s", sym, tf, e, exc_info=False)
@@ -217,41 +211,27 @@ def _get_db_short_slope(symbol: str, tf: int) -> Optional[float]:
 
 def _resolve_short_slope(row: Dict[str, Any], *, symbol: str, tf: int) -> Optional[float]:
     tf_s = str(tf)
-
-    explicit = _safe_float_or_none(
-        _get(
-            row,
-            f"slope_atr_scaled_{tf_s}m",
-            f"slope_{tf_s}m",
-            f"slope{tf_s}m",
-            f"score_slope_{tf_s}m",
-        )
-    )
+    explicit = _safe_float_or_none(_get(row, f"slope_atr_scaled_{tf_s}m", f"slope_{tf_s}m", f"slope{tf_s}m", f"score_slope_{tf_s}m"))
     if explicit is not None:
         return explicit
-
     row_interval = _safe_int(_get(row, "interval"), 0)
     if row_interval == tf:
         cur = _safe_float_or_none(_get(row, "slope_atr_scaled", "slope", "score_slope", "disp_slope"))
         if cur is not None:
             return cur
-
     gc_row = _get_gc_summary_row(symbol, tf)
     val = _slope_from_summary_row(gc_row)
     if val is not None:
         return val
-
     db_val = _get_db_short_slope(symbol, tf)
     if db_val is not None:
         return db_val
-
     return None
 
 
 def _short_mtf_direction_guard(entry_row: Dict[str, Any], *, symbol: str, side: str, source: str) -> Optional[Dict[str, Any]]:
     if not _env_bool("ENTRY_SHORT_MTF_REQUIRED", True):
         return None
-
     if str(source or "").upper() != "SUMMARY_AI":
         return None
 
@@ -263,6 +243,7 @@ def _short_mtf_direction_guard(entry_row: Dict[str, Any], *, symbol: str, side: 
     sym = _norm_symbol(symbol or row.get("symbol"))
     eps = abs(_env_float("ENTRY_SHORT_MTF_SLOPE_EPS", 0.0))
     require_all = _env_bool("ENTRY_SHORT_MTF_REQUIRE_ALL", True)
+    zero_neutral = _env_bool("ENTRY_SHORT_MTF_ZERO_NEUTRAL", True)
 
     slopes = {
         "slope_1m": _resolve_short_slope(row, symbol=sym, tf=1),
@@ -272,59 +253,28 @@ def _short_mtf_direction_guard(entry_row: Dict[str, Any], *, symbol: str, side: 
 
     missing = [k for k, v in slopes.items() if v is None]
     if missing and require_all:
-        return _ng(
-            "SHORT_MTF_SLOPE_MISSING",
-            symbol=sym,
-            side=side_u,
-            missing=missing,
-            slopes=slopes,
-            daily_mtf_optional=_env_bool("ENTRY_DAILY_MTF_OPTIONAL", True),
-            db_backfill=_env_bool("ENTRY_SHORT_MTF_DB_BACKFILL", True),
-            note="short slopes were not found in entry_row, global_context, or summary DB",
-        )
+        return _ng("SHORT_MTF_SLOPE_MISSING", symbol=sym, side=side_u, missing=missing, slopes=slopes, daily_mtf_optional=_env_bool("ENTRY_DAILY_MTF_OPTIONAL", True), db_backfill=_env_bool("ENTRY_SHORT_MTF_DB_BACKFILL", True), note="short slopes were not found in entry_row, global_context, or summary DB")
 
     available = {k: v for k, v in slopes.items() if v is not None}
     if not available:
-        return _ng(
-            "SHORT_MTF_NO_DATA",
-            symbol=sym,
-            side=side_u,
-            slopes=slopes,
-            daily_mtf_optional=_env_bool("ENTRY_DAILY_MTF_OPTIONAL", True),
-        )
+        return _ng("SHORT_MTF_NO_DATA", symbol=sym, side=side_u, slopes=slopes, daily_mtf_optional=_env_bool("ENTRY_DAILY_MTF_OPTIONAL", True))
 
+    # zero_neutral=True の場合:
+    #   BUY は明確なマイナスだけNG。0.0は中立として後段MA5ブレイク判定へ渡す。
+    #   SELLは明確なプラスだけNG。0.0は中立として後段MA5ブレイク判定へ渡す。
+    # zero_neutral=False の場合は従来通り、BUYは0以下NG、SELLは0以上NG。
     if side_u == "BUY":
-        bad = {k: v for k, v in available.items() if v <= eps}
+        bad = {k: v for k, v in available.items() if (v < -eps if zero_neutral else v <= eps)}
         if bad:
-            return _ng(
-                "SHORT_MTF_NOT_BUY_ALIGNED",
-                symbol=sym,
-                side=side_u,
-                bad=bad,
-                slopes=slopes,
-                eps=eps,
-                note="daily_mtf_is_optional_not_blocking",
-            )
+            return _ng("SHORT_MTF_NOT_BUY_ALIGNED", symbol=sym, side=side_u, bad=bad, slopes=slopes, eps=eps, zero_neutral=zero_neutral, note="daily_mtf_is_optional_not_blocking")
     else:
-        bad = {k: v for k, v in available.items() if v >= -eps}
+        bad = {k: v for k, v in available.items() if (v > eps if zero_neutral else v >= -eps)}
         if bad:
-            return _ng(
-                "SHORT_MTF_NOT_SELL_ALIGNED",
-                symbol=sym,
-                side=side_u,
-                bad=bad,
-                slopes=slopes,
-                eps=eps,
-                note="daily_mtf_is_optional_not_blocking",
-            )
+            return _ng("SHORT_MTF_NOT_SELL_ALIGNED", symbol=sym, side=side_u, bad=bad, slopes=slopes, eps=eps, zero_neutral=zero_neutral, note="daily_mtf_is_optional_not_blocking")
 
     logger.warning(
-        "[SHORT MTF GUARD] OK symbol=%s side=%s slopes=%s daily_mtf_optional=%s db_backfill=%s",
-        sym,
-        side_u,
-        slopes,
-        _env_bool("ENTRY_DAILY_MTF_OPTIONAL", True),
-        _env_bool("ENTRY_SHORT_MTF_DB_BACKFILL", True),
+        "[SHORT MTF GUARD] OK symbol=%s side=%s slopes=%s daily_mtf_optional=%s db_backfill=%s zero_neutral=%s",
+        sym, side_u, slopes, _env_bool("ENTRY_DAILY_MTF_OPTIONAL", True), _env_bool("ENTRY_SHORT_MTF_DB_BACKFILL", True), zero_neutral,
     )
     return None
 
@@ -343,45 +293,39 @@ def install() -> bool:
     os.environ.setdefault("ENTRY_SHORT_MTF_SLOPE_EPS", "0.0")
     os.environ.setdefault("ENTRY_DAILY_MTF_OPTIONAL", "1")
     os.environ.setdefault("ENTRY_SHORT_MTF_DB_BACKFILL", "1")
+    os.environ.setdefault("ENTRY_SHORT_MTF_ZERO_NEUTRAL", "1")
 
     ok_any = False
-
     try:
         import trading.handlers.entry_order_builder as eob
         old = getattr(eob, "_summary_mtf_direction_guard", None)
-        if callable(old) and not getattr(old, "_short_required_daily_optional_v12", False):
-            _short_mtf_direction_guard._short_required_daily_optional_v12 = True  # type: ignore[attr-defined]
+        if callable(old) and not getattr(old, "_short_required_daily_optional_v13", False):
+            _short_mtf_direction_guard._short_required_daily_optional_v13 = True  # type: ignore[attr-defined]
             _short_mtf_direction_guard._original = old  # type: ignore[attr-defined]
             eob._summary_mtf_direction_guard = _short_mtf_direction_guard
             ok_any = True
-            logger.warning("[SHORT MTF GUARD] patched entry_order_builder._summary_mtf_direction_guard v1.2")
+            logger.warning("[SHORT MTF GUARD] patched entry_order_builder._summary_mtf_direction_guard v1.3")
     except Exception:
         logger.exception("[SHORT MTF GUARD] patch entry_order_builder failed")
 
     try:
         import core.startup.entry_limit_passive_runtime_patch as elp
         old2 = getattr(elp, "_summary_ai_strict_guard", None)
-        if callable(old2) and not getattr(old2, "_short_required_daily_optional_v12", False):
+        if callable(old2) and not getattr(old2, "_short_required_daily_optional_v13", False):
             def _patched_summary_ai_strict_guard(*, symbol: str, side: str, row: dict, detail: dict):
                 return _strict_guard_short_mtf_only(symbol=symbol, side=side, row=row, detail=detail)
-
-            _patched_summary_ai_strict_guard._short_required_daily_optional_v12 = True  # type: ignore[attr-defined]
+            _patched_summary_ai_strict_guard._short_required_daily_optional_v13 = True  # type: ignore[attr-defined]
             _patched_summary_ai_strict_guard._original = old2  # type: ignore[attr-defined]
             elp._summary_ai_strict_guard = _patched_summary_ai_strict_guard
             ok_any = True
-            logger.warning("[SHORT MTF GUARD] patched entry_limit_passive_runtime_patch._summary_ai_strict_guard v1.2")
+            logger.warning("[SHORT MTF GUARD] patched entry_limit_passive_runtime_patch._summary_ai_strict_guard v1.3")
     except Exception:
         logger.exception("[SHORT MTF GUARD] patch entry_limit_passive_runtime_patch failed")
 
     _PATCHED = bool(ok_any)
     logger.warning(
-        "[SHORT MTF GUARD] installed=%s required=%s require_all=%s eps=%s daily_optional=%s backfill_from_gc=True db_backfill=%s",
-        _PATCHED,
-        os.getenv("ENTRY_SHORT_MTF_REQUIRED"),
-        os.getenv("ENTRY_SHORT_MTF_REQUIRE_ALL"),
-        os.getenv("ENTRY_SHORT_MTF_SLOPE_EPS"),
-        os.getenv("ENTRY_DAILY_MTF_OPTIONAL"),
-        os.getenv("ENTRY_SHORT_MTF_DB_BACKFILL"),
+        "[SHORT MTF GUARD] installed=%s required=%s require_all=%s eps=%s daily_optional=%s backfill_from_gc=True db_backfill=%s zero_neutral=%s",
+        _PATCHED, os.getenv("ENTRY_SHORT_MTF_REQUIRED"), os.getenv("ENTRY_SHORT_MTF_REQUIRE_ALL"), os.getenv("ENTRY_SHORT_MTF_SLOPE_EPS"), os.getenv("ENTRY_DAILY_MTF_OPTIONAL"), os.getenv("ENTRY_SHORT_MTF_DB_BACKFILL"), os.getenv("ENTRY_SHORT_MTF_ZERO_NEUTRAL"),
     )
     return _PATCHED
 
