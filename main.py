@@ -10,7 +10,7 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.12-MAIN-ENTRY-ORDER-MTF-SLOPE-FILL
+# Version: Ver38.13-MAIN-SUMMARY-ENTRY-ONLY
 # ------------------------------------------------------------
 # ✔ PROJECT_ROOT を最初に sys.path へ追加
 # ✔ core.logging.console_tee を確実に import / setup
@@ -27,6 +27,7 @@
 # ✔ 発注直前に entry_row の 1m/3m/5m slope と MTF/ranking を補完
 # ✔ EXIT scheduler を run_exit_pipeline で1秒ごとに登録
 # ✔ main.py 側の scheduler / realtime / position_sync / push_monitor 生存証跡を heartbeat DB に保存
+# ✔ main.py のサマリー計算結果はENTRY判定専用。正式なsummary DB保存は main_database.py 側へ寄せる
 # ✔ 既存の起動処理は維持
 # ============================================================
 
@@ -41,6 +42,12 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+
+# main.py で計算したサマリーは、エントリー判定・表示・メモリキャッシュ専用。
+# DBへ正式保存するサマリーは main_database.py 側に寄せる。
+os.environ.setdefault("SUMMARY_MAIN_ENTRY_ONLY", "1")
+os.environ.setdefault("SUMMARY_SKIP_DB_SAVE_IN_MAIN", "1")
+os.environ.setdefault("SUMMARY_DB_WRITER_ROLE", "entry_only")
 
 try:
     from core.logging.console_tee import (
@@ -522,6 +529,7 @@ def main():
     logger.info("PROJECT_ROOT=%s", PROJECT_ROOT)
     logger.info("CONSOLE_LOG_PATH=%s", CONSOLE_LOG_PATH)
     logger.info("force_run=%s", force_run)
+    logger.warning("[MAIN SUMMARY ROLE] entry_only=%s skip_db_save=%s writer_role=%s", os.environ.get("SUMMARY_MAIN_ENTRY_ONLY"), os.environ.get("SUMMARY_SKIP_DB_SAVE_IN_MAIN"), os.environ.get("SUMMARY_DB_WRITER_ROLE"))
 
     heartbeat("main_boot", status="START", detail={"stage": "runtime_context"})
     _install_summary_entry_runtime_context()
@@ -618,46 +626,53 @@ def main():
 
     pos_sync = PositionSyncManager()
     Thread(target=start_position_sync_loop, args=(pos_sync,), daemon=True, name="position_sync_loop").start()
-    logger.info("✅ position sync loop started")
+
+    Thread(target=debug_exit_status, daemon=True, name="debug_exit_status").start()
+    Thread(target=monitor_push_df, daemon=True, name="monitor_push_df").start()
+    Thread(target=should_register_monitor_loop, args=(30,), daemon=True, name="should_register_monitor").start()
 
     try:
-        logger.info("📋 SHOW SHOULD REGISTER SYMBOLS (BEFORE ATS START)")
-        show_should_register_symbols()
+        force_cancel_loop = start_force_cancel_loop(interval_sec=5)
+        logger.info("✅ force_cancel_loop started: %s", force_cancel_loop)
+        heartbeat("main_force_cancel_loop", status="STARTED")
     except Exception:
-        logger.exception("show_should_register_symbols failed")
+        heartbeat("main_force_cancel_loop", status="ERROR")
+        logger.exception("force_cancel_loop start failed")
 
-    Thread(target=should_register_monitor_loop, args=(30,), daemon=True, name="should_register_monitor").start()
-    logger.info("✅ should-register monitor started")
+    try:
+        result = run_force_exit_test()
+        logger.info("🧪 run_force_exit_test result=%s", result)
+        heartbeat("main_force_exit_test", status="OK", detail={"result": str(result)[:200]})
+    except Exception:
+        heartbeat("main_force_exit_test", status="ERROR")
+        logger.exception("run_force_exit_test failed")
 
-    token_value = getattr(global_data, "token_value", None)
-    if token_value:
-        Thread(target=ats_register_loop, args=(token_value,), daemon=True, name="ats_register_loop").start()
-        logger.info("✅ ATS register loop started")
-        heartbeat("main_ats_register_loop", status="STARTED")
-    else:
-        logger.warning("⚠ ATS register loop skipped (global_data.token_value missing)")
-        heartbeat("main_ats_register_loop", status="SKIP", detail={"reason": "token missing"})
+    logger.info("🚀 MARKET MODE ACTIVE")
+    logger.info("🚀 starting ATS register loop in background")
+    Thread(target=ats_register_loop, daemon=True, name="ats_register_loop").start()
+    heartbeat("main_ats_register_loop", status="STARTED")
 
-    Timer(10, debug_exit_status).start()
-    Thread(target=monitor_push_df, daemon=True, name="push_monitor_df").start()
-    Thread(target=start_force_cancel_loop, daemon=True, name="force_cancel_loop").start()
-    Timer(12, run_force_exit_test).start()
-
-    logger.info("🔥 REALTIME MAIN LOOP START")
-    heartbeat("main_realtime_loop", status="START")
-    last_realtime_hb = 0.0
+    logger.info("🚀 starting realtime main loop")
+    mark_component_start("main_realtime_loop")
+    loop_i = 0
     while True:
         try:
             process_realtime()
-            now = time.time()
-            if now - last_realtime_hb >= 10:
-                heartbeat("main_realtime_loop", status="OK")
-                last_realtime_hb = now
+            heartbeat("main_realtime_loop", status="OK", detail={"loop_i": loop_i})
+            loop_i += 1
         except Exception:
             heartbeat("main_realtime_loop", status="ERROR")
-            logger.exception("[REALTIME LOOP ERROR]")
-        time.sleep(0.2)
+            logger.exception("[realtime main loop]")
+        time.sleep(1)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.warning("Interrupted by user")
+        mark_component_stop("main_py", status="INTERRUPTED")
+    except Exception:
+        mark_component_stop("main_py", status="FATAL")
+        logger.critical("FATAL in main", exc_info=True)
+        sys.exit(1)
