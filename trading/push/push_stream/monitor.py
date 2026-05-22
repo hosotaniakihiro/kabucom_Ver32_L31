@@ -1,12 +1,13 @@
 # ============================================================
 # File   : trading/push/push_stream/monitor.py
-# Version: Ver1.2-AUTO-RECOVER-FLUSH-WORKER
+# Version: Ver1.3-AUTO-RECOVER-MEMORY-ONLY-GUARD
 # ------------------------------------------------------------
 # PUSH監視ログ。
 #
-# Ver1.1:
-#   - queue が溜まっているのに total_flushed=0 / last_flush=None の状態をERROR化
-#   - flush thread alive / stream_writer 有無をログへ追加
+# Ver1.3:
+#   - main.py memory-only mode では flush stall / auto recover を出さない
+#   - main.py側で誤ってflush workerを自動再起動しない
+#   - PUSH受信は memory df / latest cache / 5秒足 用として継続
 #
 # Ver1.2:
 #   - flush_alive=False かつ queue>0 の場合、flush worker を自動再起動
@@ -45,8 +46,30 @@ def _thread_alive(th) -> bool:
         return False
 
 
+def _is_main_memory_only_mode() -> bool:
+    """
+    main.py / main_database.py 分離運用時、main.py側はPUSH DB保存をしない。
+    この場合、flush workerが無いことは正常なので、stall扱いやauto recoverをしない。
+    """
+    try:
+        from data_collectors.split_mode import should_skip_data_collector_work_in_main
+        return bool(should_skip_data_collector_work_in_main())
+    except Exception:
+        return False
+
+
 def _recover_flush_worker_if_needed(*, queue_size: int, flush_alive: bool, writer_ready: bool, stall_count: int) -> bool:
     """PUSH受信はあるがflush workerが死んでいる場合に再起動する。"""
+    if _is_main_memory_only_mode():
+        _safe_set_runtime("push_stream_memory_only", True)
+        _safe_set_runtime("push_writer_running", False)
+        logger.warning(
+            "[PUSH MONITOR][MEMORY ONLY] auto recover skipped in main process queue=%d stall_count=%d; main_database.py handles PUSH DB storage",
+            queue_size,
+            stall_count,
+        )
+        return False
+
     if not _env_bool("PUSH_STREAM_AUTO_RECOVER_FLUSH", True):
         return False
     if queue_size <= 0:
@@ -94,11 +117,12 @@ def _monitor_worker() -> None:
             queue_size = state._push_queue.qsize()
             flush_alive = _thread_alive(getattr(state, "_flush_thread", None))
             writer_ready = getattr(state, "_stream_writer", None) is not None
+            memory_only = _is_main_memory_only_mode()
 
             _sync_push_df_to_global()
 
             logger.info(
-                "[PUSH MONITOR] %s connected=%s ws_alive=%s queue=%d df_rows=%d total_received=%d total_flushed=%d dropped=%d flush_alive=%s writer_ready=%s last_recv=%s last_flush=%s",
+                "[PUSH MONITOR] %s connected=%s ws_alive=%s queue=%d df_rows=%d total_received=%d total_flushed=%d dropped=%d flush_alive=%s writer_ready=%s memory_only=%s last_recv=%s last_flush=%s",
                 loop_count,
                 state._connected_event.is_set(),
                 _is_ws_alive(),
@@ -109,9 +133,30 @@ def _monitor_worker() -> None:
                 state._total_dropped,
                 flush_alive,
                 writer_ready,
+                memory_only,
                 _safe_iso(state._last_message_at),
                 _safe_iso(state._last_flush_at),
             )
+
+            if memory_only:
+                # main.py側ではflush workerが無いのが正常。
+                # 古いqueueが残っていてもDB保存へ復旧させない。
+                stall_count = 0
+                _safe_set_runtime("push_stream_memory_only", True)
+                _safe_set_runtime("push_writer_running", False)
+                _safe_set_runtime("push_flush_stalled", False)
+                if queue_size > 0:
+                    try:
+                        with state._push_queue.mutex:
+                            state._push_queue.queue.clear()
+                    except Exception:
+                        logger.debug("[PUSH MONITOR][MEMORY ONLY] queue clear skipped", exc_info=True)
+                    logger.warning(
+                        "[PUSH MONITOR][MEMORY ONLY] cleared DB queue in main process queue_before=%d",
+                        queue_size,
+                    )
+                time.sleep(MONITOR_INTERVAL_SEC)
+                continue
 
             if queue_size > 0 and state._total_received > 0 and state._total_flushed <= 0:
                 stall_count += 1
