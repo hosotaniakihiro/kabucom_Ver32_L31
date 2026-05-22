@@ -10,7 +10,7 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.13-MAIN-SUMMARY-ENTRY-ONLY
+# Version: Ver38.14-MAIN-FAST-OPTIONAL-LIGHT-MODE
 # ------------------------------------------------------------
 # ✔ PROJECT_ROOT を最初に sys.path へ追加
 # ✔ core.logging.console_tee を確実に import / setup
@@ -28,6 +28,7 @@
 # ✔ EXIT scheduler を run_exit_pipeline で1秒ごとに登録
 # ✔ main.py 側の scheduler / realtime / position_sync / push_monitor 生存証跡を heartbeat DB に保存
 # ✔ main.py のサマリー計算結果はENTRY判定専用。正式なsummary DB保存は main_database.py 側へ寄せる
+# ✔ main.py では optional ingest / kabutan取得 / daily_watchlist作成を既定スキップ
 # ✔ 既存の起動処理は維持
 # ============================================================
 
@@ -48,6 +49,13 @@ if PROJECT_ROOT not in sys.path:
 os.environ.setdefault("SUMMARY_MAIN_ENTRY_ONLY", "1")
 os.environ.setdefault("SUMMARY_SKIP_DB_SAVE_IN_MAIN", "1")
 os.environ.setdefault("SUMMARY_DB_WRITER_ROLE", "entry_only")
+
+# main.py は売買/PUSH起動優先。
+# Kabutan取得・optional DB更新・daily_watchlist作成は main_database.py 側へ寄せる。
+# optional_main.py 側の軽量モードに加えて、main.py側からも明示する。
+os.environ.setdefault("OPTIONAL_LIGHT_MODE", "1")
+os.environ.setdefault("OPTIONAL_SKIP_INGEST", "1")
+os.environ.setdefault("OPTIONAL_RUN_INGEST_IN_MAIN", "0")
 
 try:
     from core.logging.console_tee import (
@@ -530,6 +538,7 @@ def main():
     logger.info("CONSOLE_LOG_PATH=%s", CONSOLE_LOG_PATH)
     logger.info("force_run=%s", force_run)
     logger.warning("[MAIN SUMMARY ROLE] entry_only=%s skip_db_save=%s writer_role=%s", os.environ.get("SUMMARY_MAIN_ENTRY_ONLY"), os.environ.get("SUMMARY_SKIP_DB_SAVE_IN_MAIN"), os.environ.get("SUMMARY_DB_WRITER_ROLE"))
+    logger.warning("[MAIN OPTIONAL ROLE] light_mode=%s skip_ingest=%s run_ingest_in_main=%s", os.environ.get("OPTIONAL_LIGHT_MODE"), os.environ.get("OPTIONAL_SKIP_INGEST"), os.environ.get("OPTIONAL_RUN_INGEST_IN_MAIN"))
 
     heartbeat("main_boot", status="START", detail={"stage": "runtime_context"})
     _install_summary_entry_runtime_context()
