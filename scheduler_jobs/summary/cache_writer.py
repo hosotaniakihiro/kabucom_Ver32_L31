@@ -1,6 +1,6 @@
 # ============================================================
 # File   : scheduler_jobs/summary/cache_writer.py
-# Ver    : PRODUCTION-STABLE-SUMMARY-CACHE-WRITER-V1.4-SAFE-KWARGS-CALLER
+# Ver    : PRODUCTION-STABLE-SUMMARY-CACHE-WRITER-V1.5-MAIN-ENTRY-ONLY-SKIP-DB
 # ------------------------------------------------------------
 # ✔ merged cache 保存
 # ✔ uncomputed DF の cache 汚染防止
@@ -13,12 +13,14 @@
 # ✔ lock_timeout 旧名を使わず、summary_saver_bulk の正式名 lock_timeout_sec に統一
 # ✔ 関数内部の TypeError を signature 不明と誤判定しない
 # ✔ fallback 呼び出しでも interval を positional で渡して欠落を防ぐ
+# ✔ main.py entry_only 実行時は DB upsert だけスキップし、cache保存は継続
 # ============================================================
 
 from __future__ import annotations
 
 import inspect
 import logging
+import os
 from typing import Any
 
 import pandas as pd
@@ -43,6 +45,34 @@ except Exception:
 # ============================================================
 # helpers
 # ============================================================
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    try:
+        v = os.environ.get(name)
+        if v is None:
+            return bool(default)
+        return str(v).strip().lower() in ("1", "true", "yes", "on", "y")
+    except Exception:
+        return bool(default)
+
+
+def _skip_db_save_for_entry_only_main() -> bool:
+    """
+    main.py はサマリー計算結果をエントリー判定・表示・cache用に使うだけ。
+    正式な summary DB 保存は main_database.py 側へ寄せる。
+
+    main.py で以下が設定されている場合だけ DB upsert を止める:
+      SUMMARY_SKIP_DB_SAVE_IN_MAIN=1
+      SUMMARY_MAIN_ENTRY_ONLY=1
+      SUMMARY_DB_WRITER_ROLE=entry_only
+    """
+    if _env_bool("SUMMARY_SKIP_DB_SAVE_IN_MAIN", False):
+        return True
+    if _env_bool("SUMMARY_MAIN_ENTRY_ONLY", False):
+        return True
+    role = str(os.environ.get("SUMMARY_DB_WRITER_ROLE") or "").strip().lower()
+    return role in ("entry_only", "main_entry_only", "read_only", "no_save")
+
 
 def _safe_rows(df: Any) -> int:
     try:
@@ -92,15 +122,6 @@ def _normalize_source(source: str) -> str:
 
 
 def _call_with_supported_kwargs(func: Any, *args: Any, **kwargs: Any) -> Any:
-    """
-    関数が受け取れる keyword だけ渡す互換呼び出し。
-
-    重要:
-      - inspect.signature() が取れない場合だけ optional kwargs を落とす。
-      - func 実行中に発生した TypeError は握り潰さない。
-        ここで握り潰すと、本当の保存エラーが見えなくなり、
-        さらに func(*args) 再実行で interval が欠落することがある。
-    """
     try:
         sig = inspect.signature(func)
     except (TypeError, ValueError):
@@ -112,10 +133,7 @@ def _call_with_supported_kwargs(func: Any, *args: Any, **kwargs: Any) -> Any:
         return func(*args, **kwargs)
 
     params = sig.parameters
-    accepts_var_kw = any(
-        p.kind == inspect.Parameter.VAR_KEYWORD
-        for p in params.values()
-    )
+    accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
     if accepts_var_kw:
         return func(*args, **kwargs)
@@ -134,18 +152,6 @@ def _call_with_supported_kwargs(func: Any, *args: Any, **kwargs: Any) -> Any:
 
 
 def _db_upsert_options(interval: int, source: str) -> dict[str, Any]:
-    """
-    DB upsert 用オプション。
-
-    interval=1 は毎分来るため、60秒待ちは逆効果。
-    ロックが取れない場合は短時間で諦め、次の最新データを優先する。
-
-    interval=3/5 は頻度が低いため、少し長めに待って保存成功を優先する。
-
-    重要:
-      - summary_saver_bulk.bulk_upsert_summary の正式引数名は lock_timeout_sec。
-      - lock_timeout 旧名は使わない。
-    """
     interval = int(interval)
     source = _normalize_source(source)
 
@@ -182,15 +188,6 @@ def _db_upsert_options(interval: int, source: str) -> dict[str, Any]:
 
 
 def _prepare_df_for_db(df: pd.DataFrame, interval: int, source: str) -> pd.DataFrame:
-    """
-    DB保存前の最低限整形。
-
-    重要:
-      - symbol / datetime がないと upsert_executor 側で落ちる
-      - interval / source は保存列にある環境では残す
-      - date / time / time_range を補完して NOT NULL 制約に備える
-      - 存在しない列は upsert_executor 側で自動除外される
-    """
     out = df.copy()
 
     if "datetime" not in out.columns:
@@ -230,7 +227,6 @@ def _prepare_df_for_db(df: pd.DataFrame, interval: int, source: str) -> pd.DataF
 
     if "datetime" in out.columns:
         dt_ser = pd.to_datetime(out["datetime"], errors="coerce")
-
         out["datetime"] = dt_ser.dt.strftime("%Y-%m-%d %H:%M:%S")
 
         if "date" not in out.columns:
@@ -268,7 +264,6 @@ def _prepare_df_for_db(df: pd.DataFrame, interval: int, source: str) -> pd.DataF
         if mask.any():
             out.loc[mask, "interval"] = int(interval)
 
-    # OHLC alias 補完
     alias_pairs = {
         "open": "open_price",
         "high": "high_price",
@@ -284,10 +279,7 @@ def _prepare_df_for_db(df: pd.DataFrame, interval: int, source: str) -> pd.DataF
 
     if "symbol" in out.columns and "datetime" in out.columns:
         before_dedupe = len(out)
-        out = out.sort_values(["symbol", "datetime"]).drop_duplicates(
-            ["symbol", "datetime"],
-            keep="last",
-        )
+        out = out.sort_values(["symbol", "datetime"]).drop_duplicates(["symbol", "datetime"], keep="last")
         after_dedupe = len(out)
 
         if before_dedupe != after_dedupe:
@@ -304,14 +296,6 @@ def _prepare_df_for_db(df: pd.DataFrame, interval: int, source: str) -> pd.DataF
 
 
 def _try_db_upsert(df: pd.DataFrame, interval: int, source: str) -> int:
-    """
-    summary DB へ保存する。
-
-    優先:
-      1. trading.summary.persistence.summary_saver_bulk.bulk_upsert_summary
-      2. trading.summary.persistence.summary_saver_bulk.save_summary_bulk
-      3. trading.summary.persistence.core.upsert_executor.execute_upsert
-    """
     interval = int(interval)
     source = _normalize_source(source)
 
@@ -337,16 +321,10 @@ def _try_db_upsert(df: pd.DataFrame, interval: int, source: str) -> int:
         opts,
     )
 
-    # 1. 既存の本番 saver があれば最優先
     try:
         from trading.summary.persistence.summary_saver_bulk import bulk_upsert_summary  # type: ignore
 
-        ret = _call_with_supported_kwargs(
-            bulk_upsert_summary,
-            work,
-            interval,
-            **opts,
-        )
+        ret = _call_with_supported_kwargs(bulk_upsert_summary, work, interval, **opts)
         saved = int(ret) if isinstance(ret, (int, float)) else len(work)
 
         logger.info(
@@ -358,11 +336,7 @@ def _try_db_upsert(df: pd.DataFrame, interval: int, source: str) -> int:
         return saved
 
     except ImportError:
-        logger.info(
-            "[summary.cache_writer] bulk_upsert_summary unavailable -> fallback interval=%s source=%s",
-            interval,
-            source,
-        )
+        logger.info("[summary.cache_writer] bulk_upsert_summary unavailable -> fallback interval=%s source=%s", interval, source)
     except TimeoutError:
         logger.warning(
             "[summary.cache_writer] bulk_upsert_summary lock timeout interval=%s source=%s rows=%s opts=%s -> fallback",
@@ -373,22 +347,12 @@ def _try_db_upsert(df: pd.DataFrame, interval: int, source: str) -> int:
             exc_info=True,
         )
     except Exception:
-        logger.exception(
-            "[summary.cache_writer] bulk_upsert_summary failed interval=%s source=%s -> fallback",
-            interval,
-            source,
-        )
+        logger.exception("[summary.cache_writer] bulk_upsert_summary failed interval=%s source=%s -> fallback", interval, source)
 
-    # 2. 別名 saver 互換
     try:
         from trading.summary.persistence.summary_saver_bulk import save_summary_bulk  # type: ignore
 
-        ret = _call_with_supported_kwargs(
-            save_summary_bulk,
-            work,
-            interval,
-            **opts,
-        )
+        ret = _call_with_supported_kwargs(save_summary_bulk, work, interval, **opts)
         saved = int(ret) if isinstance(ret, (int, float)) else len(work)
 
         logger.info(
@@ -400,11 +364,7 @@ def _try_db_upsert(df: pd.DataFrame, interval: int, source: str) -> int:
         return saved
 
     except ImportError:
-        logger.info(
-            "[summary.cache_writer] save_summary_bulk unavailable -> fallback interval=%s source=%s",
-            interval,
-            source,
-        )
+        logger.info("[summary.cache_writer] save_summary_bulk unavailable -> fallback interval=%s source=%s", interval, source)
     except TimeoutError:
         logger.warning(
             "[summary.cache_writer] save_summary_bulk lock timeout interval=%s source=%s rows=%s opts=%s -> fallback",
@@ -415,30 +375,14 @@ def _try_db_upsert(df: pd.DataFrame, interval: int, source: str) -> int:
             exc_info=True,
         )
     except Exception:
-        logger.exception(
-            "[summary.cache_writer] save_summary_bulk failed interval=%s source=%s -> fallback",
-            interval,
-            source,
-        )
+        logger.exception("[summary.cache_writer] save_summary_bulk failed interval=%s source=%s -> fallback", interval, source)
 
-    # 3. 最終手段: upsert_executor を直接呼ぶ
     try:
         from trading.summary.persistence.core.upsert_executor import execute_upsert  # type: ignore
 
         rows = work.to_dict(orient="records")
-
-        executor_opts = {
-            "skip_if_busy": False,
-        }
-
-        saved = int(
-            _call_with_supported_kwargs(
-                execute_upsert,
-                rows,
-                interval,
-                **executor_opts,
-            )
-        )
+        executor_opts = {"skip_if_busy": False}
+        saved = int(_call_with_supported_kwargs(execute_upsert, rows, interval, **executor_opts))
 
         logger.info(
             "[summary.cache_writer] db upsert done via execute_upsert interval=%s source=%s saved=%s",
@@ -459,44 +403,24 @@ def _try_db_upsert(df: pd.DataFrame, interval: int, source: str) -> int:
         )
         return 0
     except Exception:
-        logger.exception(
-            "[summary.cache_writer] db upsert failed interval=%s source=%s rows=%s",
-            interval,
-            source,
-            len(work),
-        )
+        logger.exception("[summary.cache_writer] db upsert failed interval=%s source=%s rows=%s", interval, source, len(work))
         return 0
 
 
 def _save_cache(df: pd.DataFrame, interval: int, source: str) -> bool:
-    """
-    global_data へ cache 保存する。
-    """
     try:
         if source == "push" and hasattr(global_data, "set_push_merged_summary"):
             global_data.set_push_merged_summary(interval, df.copy())
-            logger.info(
-                "[summary.cache_writer] push merged cache saved interval=%s rows=%s",
-                interval,
-                len(df),
-            )
+            logger.info("[summary.cache_writer] push merged cache saved interval=%s rows=%s", interval, len(df))
             return True
 
         if source == "ranking" and hasattr(global_data, "set_ranking_merged_summary"):
             global_data.set_ranking_merged_summary(interval, df.copy())
-            logger.info(
-                "[summary.cache_writer] ranking merged cache saved interval=%s rows=%s",
-                interval,
-                len(df),
-            )
+            logger.info("[summary.cache_writer] ranking merged cache saved interval=%s rows=%s", interval, len(df))
             return True
 
     except Exception:
-        logger.exception(
-            "[summary.cache_writer] separated merged cache save failed source=%s interval=%s",
-            source,
-            interval,
-        )
+        logger.exception("[summary.cache_writer] separated merged cache save failed source=%s interval=%s", source, interval)
 
     try:
         if hasattr(global_data, "set_merged_summary"):
@@ -505,20 +429,11 @@ def _save_cache(df: pd.DataFrame, interval: int, source: str) -> bool:
             except TypeError:
                 global_data.set_merged_summary(interval, df.copy())
 
-            logger.info(
-                "[summary.cache_writer] merged cache saved interval=%s source=%s rows=%s",
-                interval,
-                source,
-                len(df),
-            )
+            logger.info("[summary.cache_writer] merged cache saved interval=%s source=%s rows=%s", interval, source, len(df))
             return True
 
     except Exception:
-        logger.exception(
-            "[summary.cache_writer] merged cache save failed source=%s interval=%s",
-            source,
-            interval,
-        )
+        logger.exception("[summary.cache_writer] merged cache save failed source=%s interval=%s", source, interval)
 
     logger.warning(
         "[summary.cache_writer] merged cache save skipped source=%s interval=%s reason=no_global_cache_writer",
@@ -533,26 +448,11 @@ def _save_cache(df: pd.DataFrame, interval: int, source: str) -> bool:
 # ============================================================
 
 def save_merged_summary(df: pd.DataFrame, interval: int, *, source: str) -> None:
-    """
-    summary 保存入口。
-
-    REV1.4:
-      - まず summary DB へ upsert
-      - その後 global_data cache へ保存
-      - cache保存だけでDB未保存になる状態を防ぐ
-      - interval=1 の PUSH 保存はロック待ちを短くして詰まりを防ぐ
-      - lock_timeout 旧名ではなく lock_timeout_sec を使う
-      - fallback直呼びでも interval を positional で渡す
-    """
     interval = int(interval)
     source = _normalize_source(source)
 
     if df is None or df.empty:
-        logger.warning(
-            "[summary.cache_writer] save skipped source=%s interval=%s reason=empty_df",
-            source,
-            interval,
-        )
+        logger.warning("[summary.cache_writer] save skipped source=%s interval=%s reason=empty_df", source, interval)
         return
 
     if source == "push" and looks_uncomputed_push_df(df):
@@ -582,25 +482,36 @@ def save_merged_summary(df: pd.DataFrame, interval: int, *, source: str) -> None
         _safe_latest_dt(df),
     )
 
-    saved_rows = _try_db_upsert(df, interval, source)
-
-    if saved_rows <= 0:
+    db_save_skipped = _skip_db_save_for_entry_only_main()
+    if db_save_skipped:
+        saved_rows = 0
         logger.warning(
-            "[summary.cache_writer] db upsert saved zero rows source=%s interval=%s input_rows=%s",
-            source,
+            "[summary.cache_writer] db upsert skipped interval=%s source=%s reason=main_entry_only rows=%s symbols=%s env_skip=%s role=%s",
             interval,
+            source,
             len(df),
+            _safe_symbols(df),
+            os.environ.get("SUMMARY_SKIP_DB_SAVE_IN_MAIN"),
+            os.environ.get("SUMMARY_DB_WRITER_ROLE"),
         )
+    else:
+        saved_rows = _try_db_upsert(df, interval, source)
+        if saved_rows <= 0:
+            logger.warning(
+                "[summary.cache_writer] db upsert saved zero rows source=%s interval=%s input_rows=%s",
+                source,
+                interval,
+                len(df),
+            )
 
     cache_ok = _save_cache(df, interval, source)
 
     logger.info(
-        "[summary.cache_writer] save done source=%s interval=%s input_rows=%s db_saved=%s cache_ok=%s",
+        "[summary.cache_writer] save done source=%s interval=%s input_rows=%s db_saved=%s db_skipped=%s cache_ok=%s",
         source,
         interval,
         len(df),
         saved_rows,
+        db_save_skipped,
         cache_ok,
     )
-
-
