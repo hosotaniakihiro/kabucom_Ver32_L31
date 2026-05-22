@@ -8,7 +8,11 @@
 #   - Discord用 1銘柄2行フォーマット生成
 #   - score_config.ini の買い/売りサインを日本語で表示
 # ------------------------------------------------------------
-# Version: Ver1.3-SCORING-SIGNAL-CATALOG-DEFAULT-ON
+# Version: Ver1.4-SAFE-DF-HARDENED
+# ------------------------------------------------------------
+# ✔ safe_df が DataFrame/Series/dict/list[dict]/tuple戻り値に対応
+# ✔ (df, meta) のような戻り値から DataFrame を救済
+# ✔ DataFrame constructor not properly called! で表示処理を止めない
 # ============================================================
 
 from __future__ import annotations
@@ -27,19 +31,76 @@ logger = logging.getLogger(__name__)
 # DataFrame安全化
 # ============================================================
 
+def _looks_like_scalar(v: Any) -> bool:
+    try:
+        return isinstance(v, (str, bytes, int, float, bool, type(None), np.generic, pd.Timestamp))
+    except Exception:
+        return False
+
+
+def _find_dataframe_like(obj: Any, depth: int = 0) -> pd.DataFrame:
+    """(df, meta) / {'df': df} / list[dict] などから DataFrame を救済する。"""
+    if depth > 3:
+        return pd.DataFrame()
+    try:
+        if obj is None:
+            return pd.DataFrame()
+        if isinstance(obj, pd.DataFrame):
+            return obj.copy()
+        if isinstance(obj, pd.Series):
+            return obj.to_frame().T.reset_index(drop=True)
+        if isinstance(obj, dict):
+            for key in ("df", "dataframe", "data", "rows", "result", "result_df", "summary_df", "df_latest", "latest_df", "payload"):
+                if key in obj:
+                    found = _find_dataframe_like(obj.get(key), depth + 1)
+                    if isinstance(found, pd.DataFrame) and not found.empty:
+                        return found
+            if obj and all(_looks_like_scalar(v) for v in obj.values()):
+                return pd.DataFrame([obj])
+            return pd.DataFrame()
+        if isinstance(obj, (list, tuple)):
+            if len(obj) == 0:
+                return pd.DataFrame()
+            if all(isinstance(x, dict) for x in obj):
+                rows = []
+                for row in obj:
+                    if row and all(_looks_like_scalar(v) for v in row.values()):
+                        rows.append(row)
+                return pd.DataFrame(rows) if rows else pd.DataFrame()
+            if all(isinstance(x, pd.Series) for x in obj):
+                return pd.DataFrame([x.to_dict() for x in obj])
+            for item in obj:
+                found = _find_dataframe_like(item, depth + 1)
+                if isinstance(found, pd.DataFrame) and not found.empty:
+                    return found
+            return pd.DataFrame()
+        return pd.DataFrame()
+    except Exception:
+        logger.debug("[SUMMARY DISPLAY] _find_dataframe_like failed type=%s", type(obj).__name__, exc_info=True)
+        return pd.DataFrame()
+
+
 def safe_df(df: Any) -> pd.DataFrame:
     try:
-        if df is None:
-            return pd.DataFrame()
+        out = _find_dataframe_like(df)
 
-        if isinstance(df, pd.DataFrame):
-            out = df.copy()
-        elif isinstance(df, pd.Series):
-            out = pd.DataFrame([df.to_dict()])
-        elif isinstance(df, dict):
-            out = pd.DataFrame([df])
-        else:
-            out = pd.DataFrame(df).copy()
+        if not isinstance(out, pd.DataFrame):
+            out = pd.DataFrame()
+
+        if out.empty:
+            # str/scalar は DataFrame constructor not properly called になりやすいので試さない。
+            if df is not None and not _looks_like_scalar(df):
+                try:
+                    out = pd.DataFrame(df).copy()
+                except Exception:
+                    logger.warning(
+                        "[SUMMARY DISPLAY] safe_df fallback empty type=%s repr=%s",
+                        type(df).__name__,
+                        repr(df)[:300],
+                    )
+                    return pd.DataFrame()
+            else:
+                return pd.DataFrame()
 
         if out.empty:
             return out
@@ -68,7 +129,7 @@ def safe_df(df: Any) -> pd.DataFrame:
         return out
 
     except Exception:
-        logger.exception("[SUMMARY DISPLAY] safe_df failed")
+        logger.exception("[SUMMARY DISPLAY] safe_df failed type=%s repr=%s", type(df).__name__, repr(df)[:300])
         return pd.DataFrame()
 
 
@@ -318,17 +379,6 @@ def _score_config_catalog_text(side: str) -> str:
 # ============================================================
 
 def _discord_reason(row: pd.Series, side: str = "BUY") -> str:
-    """
-    Discord表示用の理由を取得または簡易生成する。
-
-    優先順:
-      BUY  : reason_buy / buy_reason / reason
-      SELL : reason_sell / sell_reason / reason
-
-    さらに score_config.ini / scoring.ini 由来のONフラグがあれば
-    日本語の「買いサイン=...」「売りサイン=...」を追加する。
-    """
-
     side_u = str(side or "BUY").upper()
 
     if side_u == "SELL":
@@ -442,8 +492,6 @@ def build_discord_top10_message_2lines(
     rows = out_df.head(max_rows).copy()
     lines: List[str] = [str(title)]
 
-    # score_config.ini / scoring.ini のサイン定義カタログを標準で全部表示する。
-    # 長すぎる場合だけ SUMMARY_DISPLAY_SHOW_SIGNAL_CATALOG=0 で非表示にできる。
     show_catalog = str(os.getenv("SUMMARY_DISPLAY_SHOW_SIGNAL_CATALOG", "1")).lower() in {"1", "true", "yes", "y", "on"}
     if show_catalog:
         catalog = _score_config_catalog_text(side)
