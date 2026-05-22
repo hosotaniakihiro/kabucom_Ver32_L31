@@ -1,61 +1,268 @@
 # ============================================================
 # File   : trading/entry/tonosama/volume_surge.py
-# Version: Ver1.0-TONOSAMA-ENTRY-VOLUME-SURGE
+# Version: Ver1.1-TONOSAMA-VOLUME-SURGE-HISTORY-UNAVAILABLE-FAILOPEN
+# ------------------------------------------------------------
+# 目的:
+#   殿様エントリー用の出来高急増・価格変化特徴量を作る。
+#
+# Ver1.1:
+#   - main.py側の merged summary が最新1本/銘柄だけの場合、
+#     shift(1).rolling() で prev5_volume_avg が作れず、
+#     _max_volume_surge_ratio が全件 None になる。
+#   - その結果、一次フィルタ volume_surge_low で全件落ちる問題を修正。
+#   - 履歴不足で出来高急増率が計算不能な場合は、
+#     TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE 既定2.0で fail-open。
+#   - 価格変化率が計算不能な場合は、open→close の変化率で補完。
 # ============================================================
+
 from __future__ import annotations
+
+import logging
+import os
+
 import pandas as pd
+
 from .config import VOLUME_AVG_LOOKBACK_BARS
 from .summary_loader import load_merged_summary, normalize_summary_base
 from .utils import safe_float
+
+logger = logging.getLogger(__name__)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _num(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    if df is None or df.empty or col not in df.columns:
+        return pd.Series(default, index=df.index if df is not None else None, dtype="float64")
+    return pd.to_numeric(df[col], errors="coerce")
+
+
+def _first_existing(df: pd.DataFrame, names: list[str]) -> str | None:
+    for n in names:
+        if n in df.columns:
+            return n
+    return None
+
+
+def _intrabar_price_change_pct(df: pd.DataFrame, interval: int) -> pd.Series:
+    """prev_close が無いとき、open→close のバー内変化率で補完する。"""
+    try:
+        close_col = _first_existing(df, [f"close_{interval}m", "close", "close_price", "current_price", "price"])
+        open_col = _first_existing(df, [f"open_{interval}m", "open", "open_price"])
+        if close_col is None or open_col is None:
+            return pd.Series(pd.NA, index=df.index, dtype="float64")
+        close = pd.to_numeric(df[close_col], errors="coerce")
+        open_ = pd.to_numeric(df[open_col], errors="coerce")
+        return ((close - open_) / open_.replace(0, pd.NA) * 100.0).replace([float("inf"), -float("inf")], pd.NA)
+    except Exception:
+        logger.debug("[TONOSAMA SURGE] intrabar price change failed interval=%s", interval, exc_info=True)
+        return pd.Series(pd.NA, index=df.index if df is not None else None, dtype="float64")
+
 
 def add_volume_surge_features(df: pd.DataFrame, *, interval: int) -> pd.DataFrame:
     x = normalize_summary_base(df, interval=interval)
     if x.empty:
         return pd.DataFrame()
+
+    interval = int(interval)
     x = x.sort_values(["symbol", "datetime"])
     g = x.groupby("symbol", group_keys=False)
+
     avg_col = f"prev{VOLUME_AVG_LOOKBACK_BARS}_volume_avg_{interval}m"
     ratio_col = f"volume_surge_ratio_{interval}m"
-    x[avg_col] = g["volume"].transform(lambda s: s.shift(1).rolling(VOLUME_AVG_LOOKBACK_BARS, min_periods=2).mean())
+
+    x[avg_col] = g["volume"].transform(
+        lambda s: s.shift(1).rolling(VOLUME_AVG_LOOKBACK_BARS, min_periods=2).mean()
+    )
     x[ratio_col] = x["volume"] / x[avg_col].replace(0, pd.NA)
     x[ratio_col] = pd.to_numeric(x[ratio_col], errors="coerce").replace([float("inf"), -float("inf")], pd.NA)
+
     prev_close_col = f"prev_close_{interval}m"
     price_chg_col = f"price_change_pct_{interval}m"
     x[prev_close_col] = g["close"].shift(1)
     x[price_chg_col] = ((x["close"] - x[prev_close_col]) / x[prev_close_col].replace(0, pd.NA) * 100.0)
+    x[price_chg_col] = pd.to_numeric(x[price_chg_col], errors="coerce").replace([float("inf"), -float("inf")], pd.NA)
+
+    # 履歴不足の場合、open→close のバー内変化率で補完する。
+    if x[price_chg_col].isna().all():
+        fallback_chg = _intrabar_price_change_pct(x, interval)
+        if fallback_chg.notna().any():
+            x[price_chg_col] = fallback_chg
+            logger.warning(
+                "[TONOSAMA SURGE] price_change fallback open_to_close interval=%sm rows=%s nonnull=%s",
+                interval,
+                len(x),
+                int(fallback_chg.notna().sum()),
+            )
+
     latest = x.dropna(subset=["datetime"]).sort_values(["symbol", "datetime"]).groupby("symbol", group_keys=False).tail(1)
+
     keep_cols = ["symbol", "datetime", "close", "volume", avg_col, ratio_col, prev_close_col, price_chg_col]
     for c in keep_cols:
         if c not in latest.columns:
             latest[c] = pd.NA
-    latest = latest[keep_cols].copy().rename(columns={"datetime": f"datetime_{interval}m", "close": f"close_{interval}m", "volume": f"volume_{interval}m"})
+
+    latest = latest[keep_cols].copy().rename(
+        columns={"datetime": f"datetime_{interval}m", "close": f"close_{interval}m", "volume": f"volume_{interval}m"}
+    )
     return latest.reset_index(drop=True)
+
+
+def _ensure_open_close_aliases(out: pd.DataFrame) -> pd.DataFrame:
+    """1m側のopen/high/low/close aliasを整える。"""
+    if out is None or out.empty:
+        return pd.DataFrame()
+    x = out.copy()
+    for src, dst in [("open_price", "open"), ("high_price", "high"), ("low_price", "low"), ("close_price", "close")]:
+        if src in x.columns and dst not in x.columns:
+            x[dst] = pd.to_numeric(x[src], errors="coerce")
+    return x
+
+
+def _fallback_price_change_from_1m(out: pd.DataFrame) -> pd.Series:
+    try:
+        x = _ensure_open_close_aliases(out)
+        return _intrabar_price_change_pct(x, 1)
+    except Exception:
+        return pd.Series(pd.NA, index=out.index if out is not None else None, dtype="float64")
+
+
+def _apply_history_unavailable_failopen(out: pd.DataFrame) -> pd.DataFrame:
+    """
+    merged summaryが最新1本だけの場合、3m/5mのprev5平均が作れない。
+    その場合に volume_surge が全件Noneで全落ちしないようにする。
+    """
+    if out is None or out.empty:
+        return pd.DataFrame()
+
+    x = out.copy()
+    ratio_cols = [c for c in ["volume_surge_ratio_3m", "volume_surge_ratio_5m"] if c in x.columns]
+    price_cols = [c for c in ["price_change_pct_3m", "price_change_pct_5m"] if c in x.columns]
+
+    for c in ratio_cols + price_cols:
+        x[c] = pd.to_numeric(x[c], errors="coerce").replace([float("inf"), -float("inf")], pd.NA)
+
+    failopen_enabled = _env_bool("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING", True)
+    failopen_value = _env_float("TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE", 2.0)
+
+    if ratio_cols:
+        ratio_df = x[ratio_cols]
+        ratio_missing_all = ratio_df.isna().all(axis=1)
+        if failopen_enabled and bool(ratio_missing_all.any()):
+            for c in ratio_cols:
+                x.loc[ratio_missing_all, c] = failopen_value
+            x.loc[ratio_missing_all, "_volume_surge_failopen"] = True
+            logger.warning(
+                "[TONOSAMA SURGE] volume_surge fail-open because history unavailable rows=%s ratio_cols=%s value=%.3f",
+                int(ratio_missing_all.sum()),
+                ratio_cols,
+                failopen_value,
+            )
+
+    if price_cols:
+        price_df = x[price_cols]
+        price_missing_all = price_df.isna().all(axis=1)
+        if bool(price_missing_all.any()):
+            fallback_1m = _fallback_price_change_from_1m(x)
+            if fallback_1m.notna().any():
+                for c in price_cols:
+                    x.loc[price_missing_all, c] = fallback_1m.loc[price_missing_all]
+                x.loc[price_missing_all, "_price_change_fallback_1m"] = True
+                logger.warning(
+                    "[TONOSAMA SURGE] price_change fallback from 1m open_to_close rows=%s price_cols=%s nonnull=%s",
+                    int(price_missing_all.sum()),
+                    price_cols,
+                    int(fallback_1m.notna().sum()),
+                )
+
+    return x
+
 
 def build_scalping_feature_df() -> pd.DataFrame:
     df1 = normalize_summary_base(load_merged_summary(1), interval=1)
     df3 = add_volume_surge_features(load_merged_summary(3), interval=3)
     df5 = add_volume_surge_features(load_merged_summary(5), interval=5)
+
     if df1.empty:
         return pd.DataFrame()
+
     out = df1.dropna(subset=["datetime"]).sort_values(["symbol", "datetime"]).groupby("symbol", group_keys=False).tail(1).copy()
     if out.empty:
         return pd.DataFrame()
+
     if not df3.empty:
         out = out.merge(df3, on="symbol", how="left")
     if not df5.empty:
         out = out.merge(df5, on="symbol", how="left")
-    for c in ["volume_surge_ratio_3m", "volume_surge_ratio_5m", "price_change_pct_3m", "price_change_pct_5m", "prev5_volume_avg_3m", "prev5_volume_avg_5m", "volume_3m", "volume_5m"]:
+
+    for c in [
+        "volume_surge_ratio_3m",
+        "volume_surge_ratio_5m",
+        "price_change_pct_3m",
+        "price_change_pct_5m",
+        "prev5_volume_avg_3m",
+        "prev5_volume_avg_5m",
+        "volume_3m",
+        "volume_5m",
+    ]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    out = _apply_history_unavailable_failopen(out)
+    if out.empty:
+        return pd.DataFrame()
+
     vol_cols = [c for c in ["volume_surge_ratio_3m", "volume_surge_ratio_5m"] if c in out.columns]
     price_cols = [c for c in ["price_change_pct_3m", "price_change_pct_5m"] if c in out.columns]
-    out["_max_volume_surge_ratio"] = out[vol_cols].max(axis=1) if vol_cols else 0.0
-    out["_max_price_change_pct"] = out[price_cols].max(axis=1) if price_cols else 0.0
+
+    out["_max_volume_surge_ratio"] = out[vol_cols].max(axis=1, skipna=True) if vol_cols else 0.0
+    out["_max_price_change_pct"] = out[price_cols].max(axis=1, skipna=True) if price_cols else 0.0
+
+    out["_max_volume_surge_ratio"] = pd.to_numeric(out["_max_volume_surge_ratio"], errors="coerce").fillna(0.0)
+    out["_max_price_change_pct"] = pd.to_numeric(out["_max_price_change_pct"], errors="coerce").fillna(0.0)
+
     out["_surge_tf"] = ""
     if "volume_surge_ratio_3m" in out.columns and "volume_surge_ratio_5m" in out.columns:
-        out["_surge_tf"] = out.apply(lambda r: "3m" if safe_float(r.get("volume_surge_ratio_3m"), 0) >= safe_float(r.get("volume_surge_ratio_5m"), 0) else "5m", axis=1)
+        out["_surge_tf"] = out.apply(
+            lambda r: "3m" if safe_float(r.get("volume_surge_ratio_3m"), 0) >= safe_float(r.get("volume_surge_ratio_5m"), 0) else "5m",
+            axis=1,
+        )
     elif "volume_surge_ratio_3m" in out.columns:
         out["_surge_tf"] = "3m"
     elif "volume_surge_ratio_5m" in out.columns:
         out["_surge_tf"] = "5m"
+
+    try:
+        logger.warning(
+            "[TONOSAMA SURGE] feature summary rows=%s vol_cols=%s price_cols=%s volume_surge_nonzero=%s price_change_nonzero=%s failopen_rows=%s price_fallback_rows=%s head=%s",
+            len(out),
+            vol_cols,
+            price_cols,
+            int((out["_max_volume_surge_ratio"].fillna(0) != 0).sum()),
+            int((out["_max_price_change_pct"].fillna(0) != 0).sum()),
+            int(out.get("_volume_surge_failopen", pd.Series(False, index=out.index)).fillna(False).astype(bool).sum()),
+            int(out.get("_price_change_fallback_1m", pd.Series(False, index=out.index)).fillna(False).astype(bool).sum()),
+            out[[c for c in ["symbol", "symbolname", "close", "_max_volume_surge_ratio", "_max_price_change_pct", "_surge_tf", "_volume_surge_failopen", "_price_change_fallback_1m"] if c in out.columns]].head(12).to_dict("records"),
+        )
+    except Exception:
+        logger.debug("[TONOSAMA SURGE] feature summary log failed", exc_info=True)
+
     return out.reset_index(drop=True)
