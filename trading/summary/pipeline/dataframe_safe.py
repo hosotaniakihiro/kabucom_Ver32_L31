@@ -1,19 +1,37 @@
 # ============================================================
 # File   : trading/summary/pipeline/dataframe_safe.py
-# Version: Ver32_L05-SPLIT-DATAFRAME-SAFE
+# Version: Ver32_L06-DATETIME-FORMAT-SAFE
 # Purpose:
 #   summary_pipeline 用 DataFrame 安全化ユーティリティ
+#
+# Changes:
+#   - pd.to_datetime の format 推測 UserWarning を抑止
+#   - 主要なDB/ログ日時フォーマットを明示 format で高速変換
+#   - datetime / dt / timestamp / end_time / snapshot_time 等を共通変換
 # ============================================================
 
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+
+_DATETIME_FORMATS = (
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M:%S.%f",
+    "%Y/%m/%d %H:%M:%S",
+    "%Y/%m/%d %H:%M:%S.%f",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S.%f",
+    "%Y-%m-%d",
+    "%Y/%m/%d",
+)
 
 
 def is_scalar_like(v: Any) -> bool:
@@ -30,6 +48,112 @@ def is_scalar_like(v: Any) -> bool:
             np.generic,
         ),
     )
+
+
+def _drop_timezone(s: pd.Series) -> pd.Series:
+    """Series の timezone を可能な範囲で外して naive datetime に寄せる。"""
+    try:
+        return s.dt.tz_localize(None)
+    except Exception:
+        return s
+
+
+def safe_to_datetime(value: Any) -> pd.Series:
+    """
+    pandas の format 推測警告を出さずに datetime64[ns] へ寄せる。
+
+    summary DB / push / ranking では以下が多い:
+      - 2026-05-22 09:02:00
+      - 2026-05-22 09:02:12.224559
+      - 2026/05/22 09:02:00
+
+    まず明示 format で高速・安定変換し、それでも残った値だけを
+    警告抑止付きのフォールバックで救済する。
+    """
+    try:
+        if isinstance(value, pd.Series):
+            src = value.copy()
+        else:
+            src = pd.Series(value)
+
+        if src.empty:
+            return pd.to_datetime(src, errors="coerce")
+
+        # すでに datetime 型なら、そのまま正規化する。
+        try:
+            if pd.api.types.is_datetime64_any_dtype(src):
+                return _drop_timezone(pd.to_datetime(src, errors="coerce"))
+        except Exception:
+            pass
+
+        out = pd.Series(pd.NaT, index=src.index, dtype="datetime64[ns]")
+
+        # 数値 epoch 系が来た場合の救済。通常の銘柄コードなどは対象外。
+        try:
+            if pd.api.types.is_numeric_dtype(src):
+                num = pd.to_numeric(src, errors="coerce")
+                valid = num.notna()
+                if valid.any():
+                    # 10桁前後: 秒、13桁前後: ミリ秒、16桁前後: マイクロ秒を想定
+                    abs_num = num.abs()
+                    sec_mask = valid & (abs_num >= 1_000_000_000) & (abs_num < 10_000_000_000)
+                    ms_mask = valid & (abs_num >= 1_000_000_000_000) & (abs_num < 10_000_000_000_000)
+                    us_mask = valid & (abs_num >= 1_000_000_000_000_000) & (abs_num < 10_000_000_000_000_000)
+                    if sec_mask.any():
+                        out.loc[sec_mask] = pd.to_datetime(num.loc[sec_mask], unit="s", errors="coerce")
+                    if ms_mask.any():
+                        out.loc[ms_mask] = pd.to_datetime(num.loc[ms_mask], unit="ms", errors="coerce")
+                    if us_mask.any():
+                        out.loc[us_mask] = pd.to_datetime(num.loc[us_mask], unit="us", errors="coerce")
+                    return _drop_timezone(out)
+        except Exception:
+            pass
+
+        text = src.astype("string").str.strip()
+        text = text.replace({"": pd.NA, "None": pd.NA, "NaT": pd.NA, "nan": pd.NA, "NaN": pd.NA})
+        remaining = text.notna()
+
+        for fmt in _DATETIME_FORMATS:
+            if not remaining.any():
+                break
+            try:
+                parsed = pd.to_datetime(text.loc[remaining], format=fmt, errors="coerce")
+                ok = parsed.notna()
+                if ok.any():
+                    idx = parsed.index[ok]
+                    out.loc[idx] = parsed.loc[idx]
+                    remaining.loc[idx] = False
+            except Exception:
+                continue
+
+        # ISO timezone 付きなど、明示 format で拾えない少数だけ救済。
+        # ここは警告がログに出ないように抑止する。
+        if remaining.any():
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    fallback = pd.to_datetime(text.loc[remaining], errors="coerce")
+                ok = fallback.notna()
+                if ok.any():
+                    out.loc[fallback.index[ok]] = fallback.loc[fallback.index[ok]]
+            except Exception:
+                pass
+
+        return _drop_timezone(out)
+
+    except Exception as e:
+        logger.warning(
+            "[summary_pipeline] safe_to_datetime failed err=%s: %s",
+            type(e).__name__,
+            str(e)[:200],
+            exc_info=False,
+        )
+        try:
+            if isinstance(value, pd.Series):
+                return pd.Series(pd.NaT, index=value.index, dtype="datetime64[ns]")
+        except Exception:
+            pass
+        return pd.Series(dtype="datetime64[ns]")
 
 
 def safe_to_frame(value: Any, name: str = "df") -> pd.DataFrame:
@@ -129,11 +253,7 @@ def coerce_datetime_columns(df: pd.DataFrame) -> pd.DataFrame:
         "received_at",
     ):
         if col in out.columns:
-            out[col] = pd.to_datetime(out[col], errors="coerce")
-            try:
-                out[col] = out[col].dt.tz_localize(None)
-            except Exception:
-                pass
+            out[col] = safe_to_datetime(out[col])
 
     return out
 
@@ -142,20 +262,12 @@ def ensure_primary_datetime_col(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
     if "datetime" in out.columns:
-        out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
-        try:
-            out["datetime"] = out["datetime"].dt.tz_localize(None)
-        except Exception:
-            pass
+        out["datetime"] = safe_to_datetime(out["datetime"])
         return out
 
     for c in ("dt", "timestamp", "end_time", "snapshot_time"):
         if c in out.columns:
-            out["datetime"] = pd.to_datetime(out[c], errors="coerce")
-            try:
-                out["datetime"] = out["datetime"].dt.tz_localize(None)
-            except Exception:
-                pass
+            out["datetime"] = safe_to_datetime(out[c])
             return out
 
     return out
@@ -177,7 +289,7 @@ def latest_only(df: pd.DataFrame) -> pd.DataFrame:
 
     out = out.copy()
     out["symbol"] = out["symbol"].astype(str)
-    out[dt_col] = pd.to_datetime(out[dt_col], errors="coerce")
+    out[dt_col] = safe_to_datetime(out[dt_col])
 
     before = len(out)
     out = out.dropna(subset=["symbol", dt_col]).copy()
@@ -228,7 +340,7 @@ def safe_latest_dt(df: Any):
             "received_at",
         ):
             if c in df.columns:
-                s = pd.to_datetime(df[c], errors="coerce").dropna()
+                s = safe_to_datetime(df[c]).dropna()
                 if not s.empty:
                     ts = s.max()
                     try:
@@ -269,4 +381,5 @@ __all__ = [
     "safe_latest_dt",
     "safe_non_null",
     "safe_non_zero",
+    "safe_to_datetime",
 ]
