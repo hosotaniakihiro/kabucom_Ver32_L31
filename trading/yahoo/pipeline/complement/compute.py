@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/yahoo/pipeline/complement/compute.py
-# Version: PRODUCTION-STABLE-REV4.1-YAHOO-COMPLEMENT-COMPUTE
+# Version: REV4.2-YAHOO-COMPLEMENT-FULL-DB-SCHEMA-COLUMNS
 # ------------------------------------------------------------
 # 【概要】
 #   Yahoo補完サマリーの計算・整形
@@ -10,13 +10,23 @@
 #   - indicator計算
 #   - scoring_pipeline実行
 #   - score / final_score / display_score 保証
-#   - summary schema整形
+#   - Yahoo補完で計算可能な追加列を補完計算
+#   - summary DB実カラムを読み取り、保存前DataFrameへ不足列を追加
+#   - DB列/DF列/追加列/ゼロ補完列を診断ログに出力
 #   - source付与
+#
+# REV4.2:
+#   ✔ Yahoo補完保存前に summary DB 実カラムを読み取り、DF側の不足列を揃える
+#   ✔ vwap / ma*_conf / ma75_slope / volume_slope / vwap_slope / rci を補完計算
+#   ✔ atr_1m/3m/5m・slope_atr_scaled_1m/3m/5m を interval に応じて補完
+#   ✔ symbol_hist_len / technical_ready を補完
+#   ✔ DBカラムに存在するが計算不能な列は安全値で追加し、ログに zero_filled_cols として出す
 # ============================================================
 
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import pandas as pd
 
@@ -26,7 +36,9 @@ from trading.scoring.core.scoring_pipeline import run_scoring_pipeline
 from .constants import (
     PREFERRED_SUMMARY_COLUMNS,
     yahoo_source_for_interval,
+    summary_table_for_interval,
 )
+from .db import get_table_columns
 from .normalize import (
     safe_df,
     normalize_datetime_df,
@@ -70,6 +82,63 @@ def build_end_time(dt_series: pd.Series) -> pd.Series:
     except Exception:
         logger.exception("[YAHOO COMPUTE] build end_time failed")
         return pd.Series(pd.NA, index=dt_series.index if hasattr(dt_series, "index") else None)
+
+
+# ============================================================
+# generic helpers
+# ============================================================
+
+def _num(out: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    if col in out.columns:
+        return pd.to_numeric(out[col], errors="coerce")
+    return pd.Series(default, index=out.index, dtype="float64")
+
+
+def _group_diff_ratio(out: pd.DataFrame, value_col: str, denom_col: str = "close") -> pd.Series:
+    try:
+        if value_col not in out.columns:
+            return pd.Series(0.0, index=out.index, dtype="float64")
+        val = _num(out, value_col)
+        denom = _num(out, denom_col).replace(0, pd.NA)
+        diff = val.groupby(out["symbol"].astype(str), sort=False).diff()
+        return (diff / denom).replace([float("inf"), float("-inf")], pd.NA).fillna(0.0)
+    except Exception:
+        logger.debug("[YAHOO COMPUTE] group diff ratio failed col=%s", value_col, exc_info=True)
+        return pd.Series(0.0, index=out.index, dtype="float64")
+
+
+def _rolling_rci(close: pd.Series, window: int = 9) -> pd.Series:
+    """
+    RCIを簡易計算する。値は -100 ～ +100。
+    window未満は0。
+    """
+    try:
+        close = pd.to_numeric(close, errors="coerce")
+
+        def calc(x: pd.Series) -> float:
+            if len(x) < window or x.isna().any():
+                return 0.0
+            price_rank = x.rank(method="average")
+            time_rank = pd.Series(range(1, len(x) + 1), index=x.index, dtype="float64")
+            d = time_rank - price_rank
+            n = float(len(x))
+            return float((1.0 - (6.0 * (d * d).sum()) / (n * (n * n - 1.0))) * 100.0)
+
+        return close.rolling(window=window, min_periods=window).apply(calc, raw=False).fillna(0.0)
+    except Exception:
+        logger.debug("[YAHOO COMPUTE] rolling rci failed", exc_info=True)
+        return pd.Series(0.0, index=close.index, dtype="float64")
+
+
+def _default_value_for_missing_db_col(col: str) -> Any:
+    c = str(col).lower()
+    if c in {"symbol", "symbolname", "date", "time", "time_range", "start_time", "end_time", "source", "signal"}:
+        return ""
+    if c in {"datetime", "last_update", "created_at", "updated_at"}:
+        return pd.NA
+    if c in {"technical_ready", "display_ready", "is_ready", "ready"}:
+        return 0
+    return 0.0
 
 
 # ============================================================
@@ -264,6 +333,178 @@ def ensure_score_columns(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def ensure_yahoo_extra_calculated_columns(df: pd.DataFrame, interval: int) -> pd.DataFrame:
+    """
+    Yahoo OHLCVから計算可能な列を追加する。
+    DBに列があるのにYahoo補完では未作成、という状態を減らす。
+    """
+    try:
+        out = safe_df(df)
+        if out.empty:
+            return pd.DataFrame()
+
+        interval = int(interval)
+        if "symbol" not in out.columns:
+            return out
+
+        out = out.sort_values(["symbol", "datetime"], kind="stable").copy()
+
+        close = _num(out, "close")
+        high = _num(out, "high")
+        low = _num(out, "low")
+        open_ = _num(out, "open")
+        volume = _num(out, "volume")
+        close_denom = close.replace(0, pd.NA)
+
+        typical = (high + low + close) / 3.0
+        pv = (typical.fillna(close) * volume.fillna(0.0)).fillna(0.0)
+        vol = volume.fillna(0.0)
+        grp = out["symbol"].astype(str)
+        cum_pv = pv.groupby(grp, sort=False).cumsum()
+        cum_vol = vol.groupby(grp, sort=False).cumsum().replace(0, pd.NA)
+        out["vwap"] = coalesce_series(numeric_series(out, "vwap").replace(0, pd.NA), cum_pv / cum_vol).fillna(0.0)
+
+        if "price_diff" not in out.columns:
+            out["price_diff"] = (close - open_).fillna(0.0)
+
+        for ma_col, conf_col in [("ma5", "ma5_conf"), ("ma25", "ma25_conf"), ("ma75", "ma75_conf")]:
+            ma = numeric_series(out, ma_col)
+            conf = ((close - ma) / close_denom).replace([float("inf"), float("-inf")], pd.NA).fillna(0.0)
+            if conf_col not in out.columns or (numeric_series(out, conf_col).fillna(0) == 0).all():
+                out[conf_col] = conf
+
+        if "ma75_slope" not in out.columns or (numeric_series(out, "ma75_slope").fillna(0) == 0).all():
+            out["ma75_slope"] = _group_diff_ratio(out, "ma75")
+
+        if "volume_slope" not in out.columns or (numeric_series(out, "volume_slope").fillna(0) == 0).all():
+            vol_prev = volume.groupby(grp, sort=False).shift(1).replace(0, pd.NA)
+            out["volume_slope"] = ((volume - vol_prev) / vol_prev).replace([float("inf"), float("-inf")], pd.NA).fillna(0.0)
+
+        if "vwap_slope" not in out.columns or (numeric_series(out, "vwap_slope").fillna(0) == 0).all():
+            out["vwap_slope"] = _group_diff_ratio(out, "vwap")
+
+        if "rci" not in out.columns or (numeric_series(out, "rci").fillna(0) == 0).all():
+            out["rci"] = out.groupby(grp, group_keys=False, sort=False)["close"].apply(lambda s: _rolling_rci(s, window=9))
+
+        atr = numeric_series(out, "atr").fillna(0.0)
+        slope_atr = numeric_series(out, "slope_atr_scaled").fillna(numeric_series(out, "slope")).fillna(0.0)
+        for iv in (1, 3, 5):
+            atr_col = f"atr_{iv}m"
+            slope_col = f"slope_atr_scaled_{iv}m"
+            if atr_col not in out.columns:
+                out[atr_col] = atr if interval == iv else 0.0
+            elif interval == iv and (numeric_series(out, atr_col).fillna(0) == 0).all():
+                out[atr_col] = atr
+            if slope_col not in out.columns:
+                out[slope_col] = slope_atr if interval == iv else 0.0
+            elif interval == iv and (numeric_series(out, slope_col).fillna(0) == 0).all():
+                out[slope_col] = slope_atr
+
+        out["symbol_hist_len"] = out.groupby(grp, sort=False).cumcount() + 1
+
+        score = numeric_series(out, "score").fillna(0.0)
+        ma5 = numeric_series(out, "ma5")
+        rsi = numeric_series(out, "rsi")
+        technical_ready = (
+            close.notna()
+            & close.gt(0)
+            & out["symbol_hist_len"].ge(3)
+            & (ma5.notna() | rsi.notna() | score.ne(0))
+        )
+        out["technical_ready"] = technical_ready.astype(int)
+
+        # scoring_pipelineの内部列名が存在する場合はDB列へ寄せる。
+        alias_pairs = [
+            ("_score_base", "base"),
+            ("_score_trend", "trend"),
+            ("_score_mom", "mom"),
+            ("_score_velocity", "vel"),
+            ("_score_penalty", "pen"),
+            ("_combined_score", "combined_score"),
+        ]
+        for src, dst in alias_pairs:
+            if src in out.columns and (dst not in out.columns or (numeric_series(out, dst).fillna(0) == 0).all()):
+                out[dst] = numeric_series(out, src).fillna(0.0)
+
+        if "combined_score" not in out.columns or (numeric_series(out, "combined_score").fillna(0) == 0).all():
+            out["combined_score"] = numeric_series(out, "final_score").fillna(numeric_series(out, "score")).fillna(0.0)
+
+        for col in ["base", "trend", "mom", "vel", "pen"]:
+            if col not in out.columns:
+                out[col] = 0.0
+
+        return out
+
+    except Exception:
+        logger.exception("[YAHOO COMPUTE] ensure yahoo extra calculated columns failed interval=%s", interval)
+        return safe_df(df)
+
+
+def ensure_actual_db_schema_columns(df: pd.DataFrame, interval: int) -> pd.DataFrame:
+    """
+    summary DBの実カラムを読み取り、DataFrame側に不足列を追加する。
+    計算不能列は安全値で追加し、ログに出す。
+    """
+    try:
+        out = safe_df(df)
+        if out.empty:
+            return pd.DataFrame()
+
+        table = summary_table_for_interval(interval)
+        db_cols = get_table_columns(table)
+
+        if not db_cols:
+            logger.warning(
+                "[YAHOO SUMMARY SCHEMA CHECK] table=%s interval=%s db_cols=0 -> use preferred columns only df_cols=%s",
+                table,
+                interval,
+                len(out.columns),
+            )
+            return out
+
+        before_cols = set(map(str, out.columns))
+        added_cols: list[str] = []
+        zero_filled_cols: list[str] = []
+
+        for col in db_cols:
+            if col == "id":
+                continue
+            if col in out.columns:
+                continue
+            default_value = _default_value_for_missing_db_col(col)
+            out[col] = default_value
+            added_cols.append(col)
+            if default_value in (0, 0.0):
+                zero_filled_cols.append(col)
+
+        after_cols = set(map(str, out.columns))
+        still_missing = [c for c in db_cols if c != "id" and c not in after_cols]
+        computed_or_existing = [c for c in db_cols if c != "id" and c in before_cols]
+
+        logger.warning(
+            "[YAHOO SUMMARY SCHEMA CHECK] table=%s interval=%s db_cols=%s df_cols_before=%s df_cols_after=%s added_cols=%s zero_filled_cols=%s still_missing=%s computed_or_existing=%s",
+            table,
+            interval,
+            len(db_cols),
+            len(before_cols),
+            len(out.columns),
+            added_cols[:120],
+            zero_filled_cols[:120],
+            still_missing[:120],
+            computed_or_existing[:120],
+        )
+
+        preferred = [c for c in db_cols if c in out.columns and c != "id"]
+        others = [c for c in out.columns if c not in preferred]
+        out = out[preferred + others].copy()
+
+        return out
+
+    except Exception:
+        logger.exception("[YAHOO COMPUTE] ensure actual db schema columns failed interval=%s", interval)
+        return safe_df(df)
+
+
 def ensure_summary_schema_columns(df: pd.DataFrame, interval: int) -> pd.DataFrame:
     try:
         out = safe_df(df)
@@ -335,6 +576,14 @@ def ensure_summary_schema_columns(df: pd.DataFrame, interval: int) -> pd.DataFra
         ]:
             if col not in out.columns:
                 out[col] = 0.0
+
+        out = ensure_yahoo_extra_calculated_columns(out, interval=interval)
+        if out.empty:
+            return pd.DataFrame()
+
+        out = ensure_actual_db_schema_columns(out, interval=interval)
+        if out.empty:
+            return pd.DataFrame()
 
         return out
 
@@ -462,12 +711,13 @@ def compute_summary_frame(df: pd.DataFrame, *, interval: int) -> pd.DataFrame:
     warn_if_suspicious_zero_scores(out)
 
     logger.info(
-        "[YAHOO COMPUTE] computed interval=%s rows=%s symbols=%s latest=%s score_nonzero=%s",
+        "[YAHOO COMPUTE] computed interval=%s rows=%s symbols=%s latest=%s score_nonzero=%s cols=%s",
         interval,
         len(out),
         out["symbol"].nunique() if "symbol" in out.columns else 0,
         out["datetime"].max() if "datetime" in out.columns and not out.empty else None,
         int((numeric_series(out, "score").fillna(0) != 0).sum()) if not out.empty else 0,
+        len(out.columns),
     )
 
     return out
@@ -481,6 +731,8 @@ __all__ = [
     "apply_indicators",
     "apply_scoring",
     "ensure_score_columns",
+    "ensure_yahoo_extra_calculated_columns",
+    "ensure_actual_db_schema_columns",
     "ensure_summary_schema_columns",
     "finalize_before_save",
     "warn_if_suspicious_zero_scores",
