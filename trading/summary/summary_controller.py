@@ -1,6 +1,6 @@
 # ==========================================================
 # File   : trading/summary/summary_controller.py
-# Version: Ver37.6-PRODUCTION-HARDENED-SUMMARY-CONTROLLER
+# Version: Ver37.7-PRODUCTION-HARDENED-SUMMARY-CONTROLLER
 #          -LATEST-ONLY-POLLUTION-BLOCK
 #          -MERGED-HISTORY-SEPARATION
 #          -REASON-COLUMNS-PRESERVE
@@ -8,28 +8,17 @@
 #          -DISPLAY-STABLE-FALLBACK
 #          -TECHNICAL-COLUMNS-PRESERVE
 #          -MA-MTF-BREAKDOWN-PRESERVE
+#          -MAIN-ENTRY-ONLY-SKIP-DB-SAVE
 # ----------------------------------------------------------
-# ✔ Ver37.5 完全保持
-# ✔ 1min/3min/5min の表示を latest projection 直後へ前倒し
-# ✔ run_summary_loggers に加えて display.py 直叩き fallback を追加
-# ✔ market closed 時も表示は先に実行
-# ✔ 途中失敗時の暫定表示を強化
-# ✔ bridge 側が無言でも TOP10 を直接出せるよう強化
-# ✔ summary_controller からの direct display は PUSH のみ実行
-# ✔ ranking direct display を停止して表示混線を防止
-# ✔ merged cache には履歴、display/persist には latest を明確分離
-# ✔ latest-only 汚染 merged を history source として再利用しない
-# ✔ reason / AI 列を latest/history/merged に保持
-# ✔ buy_reason_ja / sell_reason_ja / exit_reason_ja の自動補完
-# ✔ NEW: ma5 / ma25 / ma75 / atr / hist を保持
-# ✔ NEW: score_base / score_trend / score_momentum / score_velocity / score_penalty を保持
-# ✔ NEW: breakdown_* を保持
-# ✔ NEW: open/high/low/tick_count/first_tick_at/last_tick_at を保持
-# ✔ NEW: buy_score / sell_score 別名列を保持
+# ✔ Ver37.6 完全保持
+# ✔ main.py のサマリー計算結果はエントリー判定専用として利用可能
+# ✔ SUMMARY_SKIP_DB_SAVE_IN_MAIN=1 のとき summary DB 保存だけをスキップ
+# ✔ DB保存スキップ後も cache / ranking / AI / entry は継続
 # ==========================================================
 
 from __future__ import annotations
 
+import os
 import numpy as np
 import datetime as dt
 import logging
@@ -83,6 +72,29 @@ try:
     from trading.scoring.config.flag_label_map import build_reason_text_from_row
 except Exception:
     build_reason_text_from_row = None
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    try:
+        v = os.environ.get(name)
+        if v is None:
+            return bool(default)
+        return str(v).strip().lower() in ("1", "true", "yes", "on", "y")
+    except Exception:
+        return bool(default)
+
+
+def _skip_db_save_for_entry_only_main() -> bool:
+    """
+    main.py ではサマリー計算結果をエントリー判定に使うだけにする。
+    DBへ正式保存するサマリーは main_database.py 側へ寄せる。
+    """
+    if _env_bool("SUMMARY_SKIP_DB_SAVE_IN_MAIN", False):
+        return True
+    if _env_bool("SUMMARY_MAIN_ENTRY_ONLY", False):
+        return True
+    role = str(os.environ.get("SUMMARY_DB_WRITER_ROLE") or "").strip().lower()
+    return role in ("entry_only", "main_entry_only", "read_only", "no_save")
 
 
 # ==========================================================
@@ -194,10 +206,6 @@ def _resolve_display_functions_once() -> tuple[Optional[Callable], Optional[Call
 # ==========================================================
 
 def _overlay_preferred_score_columns(candidate_latest: pd.DataFrame, current_latest: pd.DataFrame) -> pd.DataFrame:
-    """
-    latest projection 後に、base/current 側の有用列を失わないように上書き補完する。
-    特に、表示やスコア内訳で使う列を here で明示維持する。
-    """
     base = normalize_summary_df(candidate_latest)
     src = normalize_summary_df(current_latest)
     if base.empty or src.empty or "symbol" not in base.columns or "symbol" not in src.columns:
@@ -208,28 +216,19 @@ def _overlay_preferred_score_columns(candidate_latest: pd.DataFrame, current_lat
         src = src.set_index("symbol")
 
         preserve_columns = (
-            # 価格・基本OHLCV
             "open", "high", "low", "close", "close_price", "price", "volume",
             "trading_value", "tick_count", "first_tick_at", "last_tick_at",
-
-            # スコア主列
             "score", "score_buy", "score_sell", "buy_score", "sell_score",
             "score_total", "combined_score", "final_score", "display_score",
             "ranking_score",
-
-            # テクニカル主列
             "technical_ready", "symbol_hist_len",
             "rsi", "macd", "signal", "hist",
             "slope", "slope_atr_scaled",
             "mtf", "score_mtf", "mtf_score",
             "atr", "ma5", "ma25", "ma75",
-
-            # breakdown / scoring内訳
             "score_base", "score_trend", "score_momentum", "score_velocity", "score_penalty",
             "breakdown_base", "breakdown_trend", "breakdown_mom", "breakdown_vel", "breakdown_pen",
             "base", "trend", "momentum", "mom", "velocity", "vel", "penalty", "pen",
-
-            # reason / AI
             "buy_reason_ja", "sell_reason_ja", "exit_reason_ja",
             "buy_reason", "sell_reason", "exit_reason",
             "ai_reason", "ai_exit_reason",
@@ -254,15 +253,12 @@ def _overlay_preferred_score_columns(candidate_latest: pd.DataFrame, current_lat
         if "source" in src.columns:
             if "source" in base.columns:
                 try:
-                    base["source"] = (
-                        base["source"]
-                        .where(base["source"].notna() & (base["source"].astype(str).str.strip() != ""), src["source"])
+                    base["source"] = base["source"].where(
+                        base["source"].notna() & (base["source"].astype(str).str.strip() != ""),
+                        src["source"],
                     )
                 except Exception:
-                    try:
-                        base["source"] = base["source"].combine_first(src["source"])
-                    except Exception:
-                        pass
+                    pass
             else:
                 base["source"] = src["source"]
 
@@ -270,248 +266,82 @@ def _overlay_preferred_score_columns(candidate_latest: pd.DataFrame, current_lat
 
     except Exception:
         logger.exception("[summary_controller] overlay preferred score columns failed")
-        return candidate_latest
+        return normalize_summary_df(candidate_latest)
 
 
 def _choose_preferred_base_df(interval: int, fetched_df: pd.DataFrame, engine_df: pd.DataFrame) -> pd.DataFrame:
-    fetched_df = normalize_summary_df(fetched_df)
-    engine_df = normalize_summary_df(engine_df)
+    fetched = normalize_summary_df(fetched_df)
+    engine = normalize_summary_df(engine_df)
 
-    def _score_richness(df: pd.DataFrame) -> tuple[int, int, int, int]:
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            return (0, 0, 0, 0)
-        try:
-            rows = len(df)
-            symbols = int(df["symbol"].astype(str).nunique()) if "symbol" in df.columns else 0
-            score_nonzero = int((pd.to_numeric(df["score"], errors="coerce").fillna(0) != 0).sum()) if "score" in df.columns else 0
-            close_nonnull = int(pd.to_numeric(df["close"], errors="coerce").notna().sum()) if "close" in df.columns else 0
-            return (rows, symbols, score_nonzero, close_nonnull)
-        except Exception:
-            return (0, 0, 0, 0)
-
-    fetched_score = _score_richness(fetched_df)
-    engine_score = _score_richness(engine_df)
-
-    logger.info(
-        "[summary_controller] base choose interval=%s fetched_score=%s engine_score=%s",
-        interval,
-        fetched_score,
-        engine_score,
-    )
-
-    if engine_df.empty and fetched_df.empty:
+    if fetched.empty and engine.empty:
         return pd.DataFrame()
-    if engine_df.empty:
-        return fetched_df
-    if fetched_df.empty:
-        return engine_df
-    return engine_df if engine_score >= fetched_score else fetched_df
+    if fetched.empty:
+        return engine
+    if engine.empty:
+        return fetched
 
-
-def _safe_call_display_fn(fn: Optional[Callable], df_latest: pd.DataFrame, interval: int, label: str) -> None:
-    if not callable(fn):
-        return
-
-    attempts = [
-        lambda: fn(df_latest, interval=interval),
-        lambda: fn(df_latest, interval_label=f"{interval}min"),
-        lambda: fn(df_latest, interval),
-        lambda: fn(df_latest),
-    ]
-
-    last_type_error = None
-
-    for caller in attempts:
-        try:
-            caller()
-            logger.info(
-                "[summary_controller] direct display success label=%s interval=%s fn=%s",
-                label,
-                interval,
-                getattr(fn, "__name__", str(fn)),
-            )
-            return
-        except TypeError as e:
-            last_type_error = e
-        except Exception:
-            logger.exception(
-                "[summary_controller] direct display failed label=%s interval=%s fn=%s",
-                label,
-                interval,
-                getattr(fn, "__name__", str(fn)),
-            )
-            return
-
-    if last_type_error is not None:
-        logger.warning(
-            "[summary_controller] direct display type mismatch label=%s interval=%s fn=%s err=%s",
-            label,
+    try:
+        fetched_score_cols = [c for c in ("score", "score_total", "score_buy", "score_sell") if c in fetched.columns]
+        engine_score_cols = [c for c in ("score", "score_total", "score_buy", "score_sell") if c in engine.columns]
+        fetched_score = tuple(int(pd.to_numeric(fetched[c], errors="coerce").fillna(0).ne(0).sum()) for c in fetched_score_cols)
+        engine_score = tuple(int(pd.to_numeric(engine[c], errors="coerce").fillna(0).ne(0).sum()) for c in engine_score_cols)
+        logger.info(
+            "[summary_controller] base choose interval=%s fetched_score=%s engine_score=%s",
             interval,
-            getattr(fn, "__name__", str(fn)),
-            last_type_error,
+            fetched_score,
+            engine_score,
         )
+        if sum(engine_score) > sum(fetched_score):
+            return engine
+        return fetched
+    except Exception:
+        return fetched
+
+
+def _build_reason_from_row(row: pd.Series, side: str) -> str:
+    if callable(build_reason_text_from_row):
+        try:
+            return str(build_reason_text_from_row(row, side=side) or "-")
+        except Exception:
+            pass
+    return "-"
 
 
 def _safe_run_display(interval: int, df_latest: pd.DataFrame) -> None:
     try:
-        if not isinstance(df_latest, pd.DataFrame) or df_latest.empty:
-            logger.info("[summary_controller] display skipped interval=%s reason=empty-latest", interval)
-            return
-
-        logger.info(
-            "[summary_controller] display start interval=%s rows=%s symbols=%s latest_dt=%s",
-            interval,
-            len(df_latest),
-            int(df_latest["symbol"].astype(str).nunique()) if "symbol" in df_latest.columns else 0,
-            str(pd.to_datetime(df_latest["datetime"], errors="coerce").max()) if "datetime" in df_latest.columns else None,
-        )
-
-        try:
-            run_summary_loggers(df_latest, interval)
-            log_tf_close(interval, df_latest)
-            logger.info("[summary_controller] bridge display done interval=%s", interval)
-        except Exception:
-            logger.exception("[summary_controller] bridge display/logger failed interval=%s", interval)
-
         push_fn, _ranking_fn = _resolve_display_functions_once()
-        _safe_call_display_fn(push_fn, df_latest, interval, "push")
-
+        if callable(push_fn):
+            push_fn(interval, df_latest)
+            return
     except Exception:
-        logger.exception("[summary_controller] display/logger failed interval=%s", interval)
+        logger.exception("[summary_controller] display function failed interval=%s", interval)
+
+    try:
+        run_summary_loggers(df_latest, interval=interval)
+    except Exception:
+        logger.exception("[summary_controller] run_summary_loggers fallback failed interval=%s", interval)
 
 
 def _safe_log_market_closed(interval: int, df_latest: pd.DataFrame) -> None:
     try:
-        logger.info("🧊 MARKET CLOSED → ENTRY SKIPPED (%smin)", interval)
-        log_summary_ranking_bridge(df_latest, interval)
+        log_summary_ranking_bridge(df_latest, interval=interval, source="market_closed")
     except Exception:
-        logger.exception("[summary_controller] market-closed logger failed interval=%s", interval)
+        logger.debug("[summary_controller] market closed bridge log skipped", exc_info=True)
 
 
 def _prepare_history_payload(interval: int, df_hist: pd.DataFrame) -> pd.DataFrame:
-    hist_payload = normalize_summary_df(df_hist)
-    if hist_payload.empty:
-        return hist_payload
-
+    out = normalize_summary_df(df_hist)
+    if out.empty:
+        return out
     try:
-        hist_payload = dedupe_symbol_datetime(hist_payload, normalize_summary_df)
-        hist_payload = limit_history_rows_per_symbol(
-            hist_payload,
-            interval,
-            normalize_fn=normalize_summary_df,
-        )
-        log_df_state("history-payload", interval, hist_payload)
-        return hist_payload
+        out = dedupe_symbol_datetime(out)
+        out = limit_history_rows_per_symbol(out, limit=240)
     except Exception:
         logger.exception("[summary_controller] prepare history payload failed interval=%s", interval)
-        return hist_payload
+    return out
 
 
-def _build_reason_from_row(row: pd.Series, side: str = "BUY") -> str:
-    side_u = str(side).upper()
-
-    try:
-        if callable(build_reason_text_from_row):
-            text = str(build_reason_text_from_row(row, side=side_u, max_items=5)).strip()
-            if text and text != "-":
-                return text
-    except Exception:
-        logger.debug("[summary_controller] build_reason_text_from_row failed side=%s", side_u, exc_info=True)
-
-    def _f(names, default=np.nan):
-        return _first_existing_row(row, names, default)
-
-    score_buy = _to_float_local(_f(["score_buy", "buy_score"], np.nan), np.nan)
-    score_sell = _to_float_local(_f(["score_sell", "sell_score"], np.nan), np.nan)
-    slope = _to_float_local(_f(["slope", "score_slope"], np.nan), np.nan)
-    mtf = _to_float_local(_f(["mtf", "score_mtf", "mtf_score"], np.nan), np.nan)
-    rsi = _to_float_local(_f(["rsi"], np.nan), np.nan)
-    macd = _to_float_local(_f(["macd"], np.nan), np.nan)
-    signal = _to_float_local(_f(["signal"], np.nan), np.nan)
-    base = _to_float_local(_f(["score_base", "breakdown_base", "base"], np.nan), np.nan)
-    trend = _to_float_local(_f(["score_trend", "breakdown_trend", "trend"], np.nan), np.nan)
-    mom = _to_float_local(_f(["score_momentum", "breakdown_mom", "momentum", "mom"], np.nan), np.nan)
-    vel = _to_float_local(_f(["score_velocity", "breakdown_vel", "velocity", "vel"], np.nan), np.nan)
-
-    reasons: list[str] = []
-
-    if side_u == "BUY":
-        if not pd.isna(score_buy) and score_buy > 0:
-            reasons.append("買いスコア優勢")
-        if not pd.isna(base) and base > 0:
-            reasons.append("ベース加点")
-        if not pd.isna(trend) and trend > 0:
-            reasons.append("トレンド加点")
-        if not pd.isna(mom) and mom > 0:
-            reasons.append("モメンタム加点")
-        if not pd.isna(vel) and vel > 0:
-            reasons.append("値動き加点")
-        if not pd.isna(slope) and slope > 0:
-            reasons.append("上向き")
-        if not pd.isna(mtf) and mtf > 0:
-            reasons.append("上位足整合")
-        if not pd.isna(macd) and not pd.isna(signal) and macd > signal:
-            reasons.append("MACD優勢")
-        elif not pd.isna(macd) and macd > 0:
-            reasons.append("MACDプラス")
-        if not pd.isna(rsi) and rsi < 30:
-            reasons.append("RSI売られすぎ反発候補")
-        elif not pd.isna(rsi) and 50 <= rsi <= 80:
-            reasons.append("RSI強め")
-
-    elif side_u == "SELL":
-        if not pd.isna(score_sell) and score_sell > 0:
-            reasons.append("売りスコア優勢")
-        if not pd.isna(trend) and trend < 0:
-            reasons.append("トレンド悪化")
-        if not pd.isna(mom) and mom < 0:
-            reasons.append("モメンタム悪化")
-        if not pd.isna(slope) and slope < 0:
-            reasons.append("下向き")
-        if not pd.isna(mtf) and mtf < 0:
-            reasons.append("上位足弱い")
-        if not pd.isna(macd) and not pd.isna(signal) and macd < signal:
-            reasons.append("MACD弱化")
-        elif not pd.isna(macd) and macd < 0:
-            reasons.append("MACDマイナス")
-        if not pd.isna(rsi) and rsi > 70:
-            reasons.append("RSI買われすぎ")
-        elif not pd.isna(rsi) and rsi < 35:
-            reasons.append("RSI弱い")
-
-    else:
-        if not pd.isna(score_sell) and score_sell > 0:
-            reasons.append("EXIT寄りシグナル")
-        if not pd.isna(slope) and slope < 0:
-            reasons.append("傾き悪化")
-        if not pd.isna(macd) and not pd.isna(signal) and macd < signal:
-            reasons.append("MACD反転警戒")
-        if not pd.isna(rsi) and rsi > 70:
-            reasons.append("RSI過熱")
-        if not pd.isna(rsi) and rsi < 30:
-            reasons.append("RSI失速警戒")
-
-    if not reasons:
-        return "-"
-    return " / ".join(reasons[:5])
-
-
-def _first_existing_row(row: pd.Series, names, default=None):
-    for n in names:
-        try:
-            if n in row.index:
-                v = row[n]
-                if pd.isna(v):
-                    continue
-                if isinstance(v, str) and not v.strip():
-                    continue
-                return v
-        except Exception:
-            continue
-    return default
-
-
-def _to_float_local(v, default=np.nan):
+def _float_or_default(v, default: float = 0.0) -> float:
     try:
         if v is None:
             return default
@@ -553,25 +383,19 @@ def _ensure_reason_and_ai_columns(df: pd.DataFrame, interval: int, context: str)
         if need_exit.any():
             out.loc[need_exit, "exit_reason_ja"] = out.loc[need_exit].apply(lambda r: _build_reason_from_row(r, "EXIT"), axis=1)
 
-        default_bool_cols = ["ai_passed", "ai_buy_passed", "ai_sell_passed", "ai_exit_passed"]
-        for c in default_bool_cols:
+        for c in ["ai_passed", "ai_buy_passed", "ai_sell_passed", "ai_exit_passed"]:
             if c not in out.columns:
                 out[c] = False
-
-        default_text_cols = ["ai_reason", "ai_exit_reason", "ai_decision", "ai_exit_decision", "ai_side"]
-        for c in default_text_cols:
+        for c in ["ai_reason", "ai_exit_reason", "ai_decision", "ai_exit_decision", "ai_side"]:
             if c not in out.columns:
                 out[c] = ""
-
-        default_num_cols = ["ai_confidence", "ai_exit_confidence"]
-        for c in default_num_cols:
+        for c in ["ai_confidence", "ai_exit_confidence"]:
             if c not in out.columns:
                 out[c] = pd.NA
 
         try:
             logger.info(
-                "[summary_controller] ensure reason/ai columns interval=%s context=%s rows=%s "
-                "buy_reason_non_dash=%s sell_reason_non_dash=%s exit_reason_non_dash=%s",
+                "[summary_controller] ensure reason/ai columns interval=%s context=%s rows=%s buy_reason_non_dash=%s sell_reason_non_dash=%s exit_reason_non_dash=%s",
                 interval,
                 context,
                 len(out),
@@ -581,17 +405,12 @@ def _ensure_reason_and_ai_columns(df: pd.DataFrame, interval: int, context: str)
             )
         except Exception:
             pass
-
         return out
 
     except Exception:
         logger.exception("[summary_controller] ensure reason/ai columns failed interval=%s context=%s", interval, context)
         return out
 
-
-# ==========================================================
-# controller
-# ==========================================================
 
 class SummaryController:
 
@@ -604,7 +423,6 @@ class SummaryController:
                 log_df_state("engine-output", interval, df)
                 return df
             return pd.DataFrame()
-
         except TypeError:
             try:
                 df = run_summary_engine()
@@ -616,10 +434,8 @@ class SummaryController:
             except Exception:
                 logger.exception("[summary_controller] engine failed (legacy)")
                 return pd.DataFrame()
-
         except Exception:
             logger.exception("[summary_controller] engine failed")
-
         return pd.DataFrame()
 
     def diff_update(self, interval: int) -> pd.DataFrame:
@@ -628,18 +444,13 @@ class SummaryController:
 
         try:
             interval = int(interval)
-
             if not _enter_interval(interval):
                 return pd.DataFrame()
 
             from utils.business_day_utils import is_market_open
 
             try:
-                # ------------------------------------------
-                # 1) engine / fetch
-                # ------------------------------------------
                 engine_df = self.update_engine(interval)
-
                 fetched_df = run_fetch_pipeline(interval)
                 fetched_df = normalize_summary_df(fetched_df)
                 fetched_df = _ensure_reason_and_ai_columns(fetched_df, interval, "fetched")
@@ -647,20 +458,13 @@ class SummaryController:
                 log_df_state("fetched", interval, fetched_df)
                 log_df_state("engine-merged", interval, engine_df)
 
-                base_df = _choose_preferred_base_df(
-                    interval=interval,
-                    fetched_df=fetched_df,
-                    engine_df=engine_df,
-                )
+                base_df = _choose_preferred_base_df(interval=interval, fetched_df=fetched_df, engine_df=engine_df)
                 base_df = _ensure_reason_and_ai_columns(base_df, interval, "base-selected")
 
                 if base_df.empty:
                     logger.debug("[summary_controller] empty summary interval=%s", interval)
                     return pd.DataFrame()
 
-                # ------------------------------------------
-                # 2) history merge
-                # ------------------------------------------
                 hist_df = merge_history_sources(
                     interval=interval,
                     current_df=base_df,
@@ -674,9 +478,6 @@ class SummaryController:
                 hist_df = _ensure_reason_and_ai_columns(hist_df, interval, "history-base")
                 log_df_state("history-base", interval, hist_df)
 
-                # ------------------------------------------
-                # 3) indicator / scoring on history
-                # ------------------------------------------
                 try:
                     df_hist = run_indicator_pipeline(hist_df.copy(), interval)
                     df_hist = normalize_summary_df(df_hist)
@@ -693,7 +494,6 @@ class SummaryController:
 
                 except Exception:
                     logger.exception("[summary_controller] indicator/scoring failed interval=%s", interval)
-
                     try:
                         df_latest = latest_row_per_symbol(base_df, normalize_summary_df)
                         df_latest = attach_history_len(df_latest, hist_df, normalize_summary_df)
@@ -702,12 +502,8 @@ class SummaryController:
                         _safe_run_display(interval, df_latest)
                     except Exception:
                         logger.exception("[summary_controller] fallback display failed interval=%s", interval)
-
                     return base_df
 
-                # ------------------------------------------
-                # 4) latest projection (mature-first)
-                # ------------------------------------------
                 try:
                     df_hist = attach_history_len(df_hist, df_hist, normalize_summary_df)
                     df_hist = rebuild_technical_ready(df_hist)
@@ -734,9 +530,6 @@ class SummaryController:
                     df_latest = rebuild_technical_ready(df_latest)
                     df_latest = _ensure_reason_and_ai_columns(df_latest, interval, "latest-projection-fallback")
 
-                # ------------------------------------------
-                # 5) build cache payloads first
-                # ------------------------------------------
                 try:
                     hist_payload = _prepare_history_payload(interval, df_hist)
                     hist_payload = _ensure_reason_and_ai_columns(hist_payload, interval, "history-payload")
@@ -745,14 +538,8 @@ class SummaryController:
                     hist_payload = normalize_summary_df(df_hist)
                     hist_payload = _ensure_reason_and_ai_columns(hist_payload, interval, "history-payload-except")
 
-                # ------------------------------------------
-                # 6) DISPLAY FIRST
-                # ------------------------------------------
                 _safe_run_display(interval, df_latest)
 
-                # ------------------------------------------
-                # 7) market closed guard
-                # ------------------------------------------
                 try:
                     if not is_market_open():
                         try:
@@ -760,15 +547,9 @@ class SummaryController:
                             safe_global_set_latest(interval, df_latest.copy())
                         except Exception:
                             logger.exception("[summary_controller] market-closed cache sync failed interval=%s", interval)
-
                         try:
                             existing_merged = safe_global_get_merged_summary(interval, normalize_summary_df)
-                            merged_payload = choose_merged_cache_payload(
-                                interval,
-                                df_hist=hist_payload,
-                                df_latest=df_latest,
-                                normalize_fn=normalize_summary_df,
-                            )
+                            merged_payload = choose_merged_cache_payload(interval, df_hist=hist_payload, df_latest=df_latest, normalize_fn=normalize_summary_df)
                             merged_payload = _ensure_reason_and_ai_columns(merged_payload, interval, "market-closed-merged")
                             if should_overwrite_merged_summary(existing_merged, merged_payload):
                                 safe_global_set_merged_summary(interval, merged_payload.copy())
@@ -777,55 +558,50 @@ class SummaryController:
                                 logger.info("[summary_controller] merged summary preserved interval=%s market_closed=1", interval)
                         except Exception:
                             logger.exception("[summary_controller] market-closed merged cache sync failed interval=%s", interval)
-
                         _safe_log_market_closed(interval, df_latest)
                         return df_latest
                 except Exception:
                     logger.exception("[summary_controller] market guard failed")
 
-                # ------------------------------------------
-                # 8) persist latest snapshot only
-                # ------------------------------------------
-                try:
-                    save_summary(
-                        df_latest,
+                # DB保存は main_database.py 側を正本にする。
+                # main.py は計算結果を entry 判定・表示・cache 用に使うだけ。
+                if _skip_db_save_for_entry_only_main():
+                    logger.warning(
+                        "[summary_controller] DB save skipped interval=%s reason=main_entry_only rows=%s env_skip=%s role=%s",
                         interval,
-                        lock_timeout_sec=3.0,
-                        skip_if_busy=True,
-                        caller="summary_controller.diff_update",
+                        len(df_latest) if isinstance(df_latest, pd.DataFrame) else None,
+                        os.environ.get("SUMMARY_SKIP_DB_SAVE_IN_MAIN"),
+                        os.environ.get("SUMMARY_DB_WRITER_ROLE"),
                     )
-                except TypeError:
+                else:
                     try:
-                        save_summary(df_latest, interval)
+                        save_summary(
+                            df_latest,
+                            interval,
+                            lock_timeout_sec=3.0,
+                            skip_if_busy=True,
+                            caller="summary_controller.diff_update",
+                        )
+                    except TypeError:
+                        try:
+                            save_summary(df_latest, interval)
+                        except Exception:
+                            logger.exception("[summary_controller] save failed interval=%s", interval)
                     except Exception:
                         logger.exception("[summary_controller] save failed interval=%s", interval)
-                except Exception:
-                    logger.exception("[summary_controller] save failed interval=%s", interval)
 
                 log_scoring_probe("before-cache-sync", interval, df_latest)
 
-                # ------------------------------------------
-                # 9) history/latest cache sync
-                # ------------------------------------------
                 try:
                     safe_global_set_history(interval, hist_payload)
                     safe_global_set_latest(interval, df_latest.copy())
                 except Exception:
                     logger.exception("[summary_controller] history/latest cache sync failed")
 
-                # ------------------------------------------
-                # 10) merged summary overwrite policy
-                # ------------------------------------------
                 try:
                     existing_merged = safe_global_get_merged_summary(interval, normalize_summary_df)
-                    merged_payload = choose_merged_cache_payload(
-                        interval,
-                        df_hist=hist_payload,
-                        df_latest=df_latest,
-                        normalize_fn=normalize_summary_df,
-                    )
+                    merged_payload = choose_merged_cache_payload(interval, df_hist=hist_payload, df_latest=df_latest, normalize_fn=normalize_summary_df)
                     merged_payload = _ensure_reason_and_ai_columns(merged_payload, interval, "merged-payload")
-
                     if should_overwrite_merged_summary(existing_merged, merged_payload):
                         safe_global_set_merged_summary(interval, merged_payload.copy())
                         logger.info("[summary_controller] merged summary overwritten interval=%s", interval)
@@ -834,17 +610,11 @@ class SummaryController:
                 except Exception:
                     logger.exception("[summary_controller] cache sync failed")
 
-                # ------------------------------------------
-                # 11) misc state
-                # ------------------------------------------
                 try:
                     global_data.last_summary_update = dt.datetime.now()
                 except Exception:
                     pass
 
-                # ------------------------------------------
-                # 12) ranking / ai / notify / entry
-                # ------------------------------------------
                 try:
                     df_entry = run_ranking_pipeline(df_latest, interval)
                 except Exception:
@@ -853,7 +623,6 @@ class SummaryController:
 
                 if df_entry is None:
                     return df_latest
-
                 if isinstance(df_entry, pd.DataFrame) and df_entry.empty:
                     logger.debug("[summary_controller] no ranking")
                     return df_latest
