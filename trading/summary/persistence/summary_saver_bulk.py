@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/summary/persistence/summary_saver_bulk.py
-# Version: Ver34.3-PRODUCTION-SUMMARY-SAVER-BULK-DB-WRITE-LOCK
+# Version: Ver34.4-PRODUCTION-SUMMARY-SAVER-BULK-OWNER-GUARD
 # ------------------------------------------------------------
 # 【概要】
 #   summary DB への bulk UPSERT 保存入口
@@ -19,18 +19,20 @@
 #   ✔ periodic / push / yahoo 定時保存時の全履歴UPSERTを防止
 #   ✔ recovery / bootstrap / rebuild では latest_only=False で全履歴保存可能
 #   ✔ latest_only 適用前後の rows / symbols / datetime 範囲をログ出力
+#   ✔ SQLite database is locked 対策として summary DB 全体 write lock を使用
+#   ✔ main.py / main_database.py の二重DB保存を owner guard で防止
 #
-# 【Ver34.3 修正】
-#   ✔ SQLite database is locked 対策を強化
-#   ✔ interval別 lock に加えて summary DB 全体の write lock を追加
-#   ✔ 1min / 3min / 5min が別テーブルでも同一DBへの同時書き込みを防止
-#   ✔ bootstrap / recovery / periodic / yahoo 保存の競合を DB単位で直列化
-#   ✔ lock_wait のログを interval lock / db write lock の両方で出力
+# 【Ver34.4 修正】
+#   ✔ AUTOSTOCK_SUMMARY_SAVE_OWNER を尊重
+#   ✔ 既定 owner=database のため main.py 側のsummary DB保存はスキップ
+#   ✔ main.pyは計算/表示/AI/entry、main_database.pyはDB保存に分離
+#   ✔ bootstrap/recovery/rebuild/repair等の保守系保存は owner guard の対象外
 #
 # 【重要】
 #   SQLite は同じDBファイルへの同時 writer が基本1つのみ。
 #   interval別 lock だけでは stock_summary_1min / 3min / 5min の
 #   同時書き込みを防げないため、DB単位の write lock が必要。
+#   さらに main.py と main_database.py の二重保存も避ける。
 # ============================================================
 
 from __future__ import annotations
@@ -66,8 +68,6 @@ logger = logging.getLogger(__name__)
 # constants
 # ============================================================
 
-# upsert_executor 側で warning になっていた代表列。
-# DBに実在しない場合のみ落とす。
 _KNOWN_OPTIONAL_ALIAS_COLS = [
     "open",
     "high",
@@ -76,7 +76,6 @@ _KNOWN_OPTIONAL_ALIAS_COLS = [
     "interval",
 ]
 
-# alias を落とす前に、DB正式列へ値を退避するための対応表。
 _ALIAS_TO_DB_COLS = {
     "open": "open_price",
     "high": "high_price",
@@ -84,8 +83,6 @@ _ALIAS_TO_DB_COLS = {
     "close": "close_price",
 }
 
-# どうしてもDBカラム取得に失敗した場合の安全drop。
-# ログで実際に unknown になっていた列だけに限定する。
 _FALLBACK_DROP_COLS = [
     "open",
     "high",
@@ -96,17 +93,98 @@ _FALLBACK_DROP_COLS = [
 
 
 # ============================================================
+# owner guard helpers
+# ============================================================
+
+def _is_data_collector_process_safe() -> bool:
+    try:
+        from data_collectors.split_mode import is_data_collector_process
+        return bool(is_data_collector_process())
+    except Exception:
+        return False
+
+
+def _summary_save_owner_safe() -> str:
+    try:
+        from data_collectors.split_mode import summary_save_owner
+        return str(summary_save_owner())
+    except Exception:
+        try:
+            import os
+            return str(os.getenv("AUTOSTOCK_SUMMARY_SAVE_OWNER", "database")).strip().lower() or "database"
+        except Exception:
+            return "database"
+
+
+def _is_maintenance_save_reason(save_reason: str) -> bool:
+    try:
+        r = str(save_reason or "").strip().lower()
+    except Exception:
+        r = ""
+    if not r:
+        return False
+    maintenance_keywords = (
+        "bootstrap",
+        "rebuild",
+        "recovery",
+        "recover",
+        "backfill",
+        "full",
+        "repair",
+        "migrate",
+        "migration",
+        "historical",
+        "history",
+        "catchup",
+        "startup",
+    )
+    return any(k in r for k in maintenance_keywords)
+
+
+def _should_skip_summary_save_by_owner(save_reason: str) -> tuple[bool, str]:
+    """
+    main.py と main_database.py の二重保存を避ける。
+
+    既定:
+      AUTOSTOCK_SUMMARY_SAVE_OWNER=database
+      main_database.py/data collector process だけ保存する。
+
+    例外:
+      bootstrap/recovery/rebuild/repair などの保守系保存は明示処理として通す。
+    """
+    if _is_maintenance_save_reason(save_reason):
+        return False, "maintenance_save_reason"
+
+    owner = _summary_save_owner_safe()
+    is_db_proc = _is_data_collector_process_safe()
+
+    if owner == "none":
+        return True, "owner_none"
+
+    if owner == "both":
+        return False, "owner_both"
+
+    if owner == "database":
+        if not is_db_proc:
+            return True, "owner_database_non_collector_process"
+        return False, "owner_database_collector_process"
+
+    if owner == "main":
+        if is_db_proc:
+            return True, "owner_main_collector_process"
+        return False, "owner_main_non_collector_process"
+
+    # 不正値は database 扱い
+    if not is_db_proc:
+        return True, "owner_invalid_as_database_non_collector_process"
+    return False, "owner_invalid_as_database_collector_process"
+
+
+# ============================================================
 # datetime helpers
 # ============================================================
 
 def _strip_tz_keep_wallclock(v: Any):
-    """
-    timezone付き datetime を UTC変換せず、壁時計時刻を維持して tz だけ外す。
-
-    例:
-      2026-04-20 10:51:00+09:00
-          -> 2026-04-20 10:51:00
-    """
     try:
         if v is None:
             return pd.NaT
@@ -140,10 +218,6 @@ def _strip_tz_keep_wallclock(v: Any):
 
 
 def _safe_to_datetime_naive_series(s: Any) -> pd.Series:
-    """
-    UserWarning: Could not infer format... を出さずに datetime 化する。
-    UTC変換はせず、JSTの壁時計時刻を維持する。
-    """
     try:
         if s is None:
             return pd.Series(dtype="datetime64[ns]")
@@ -193,11 +267,6 @@ def _summary_table_name(interval: int) -> str:
 
 
 def _resolve_summary_engine():
-    """
-    summary DB の SQLAlchemy engine をできるだけ広く解決する。
-
-    失敗しても保存処理自体は止めない。
-    """
     candidates = []
 
     try:
@@ -237,9 +306,6 @@ def _resolve_summary_engine():
 
 
 def _get_table_columns_from_engine(engine, table_name: str) -> Optional[set[str]]:
-    """
-    SQLAlchemy engine から SQLite PRAGMA で実カラムを取得する。
-    """
     if engine is None:
         return None
 
@@ -262,9 +328,6 @@ def _get_table_columns_from_engine(engine, table_name: str) -> Optional[set[str]
 
 
 def _get_summary_table_columns(interval: int) -> Optional[set[str]]:
-    """
-    stock_summary_{interval}min の実カラムを取得する。
-    """
     table_name = _summary_table_name(interval)
     engine = _resolve_summary_engine()
     cols = _get_table_columns_from_engine(engine, table_name)
@@ -285,10 +348,6 @@ def _get_summary_table_columns(interval: int) -> Optional[set[str]]:
 # ============================================================
 
 def _coalesce_numeric_column(work: pd.DataFrame, dst: str, src: str) -> pd.DataFrame:
-    """
-    src を dst に退避する。
-    dst が既にあれば欠損のみ src で補完。
-    """
     if src not in work.columns:
         return work
 
@@ -315,10 +374,6 @@ def _coalesce_numeric_column(work: pd.DataFrame, dst: str, src: str) -> pd.DataF
 
 
 def _protect_ohlc_price_aliases(work: pd.DataFrame) -> pd.DataFrame:
-    """
-    open/high/low/close を落とす前に、
-    open_price/high_price/low_price/close_price へ退避する。
-    """
     out = work.copy()
 
     for src, dst in _ALIAS_TO_DB_COLS.items():
@@ -328,9 +383,6 @@ def _protect_ohlc_price_aliases(work: pd.DataFrame) -> pd.DataFrame:
 
 
 def _normalize_time_columns(work: pd.DataFrame) -> pd.DataFrame:
-    """
-    datetime / start_time / end_time / last_update の warning 抑止。
-    """
     if work is None or work.empty:
         return work
 
@@ -347,16 +399,6 @@ def _normalize_time_columns(work: pd.DataFrame) -> pd.DataFrame:
 
 
 def _align_columns_to_table(work: pd.DataFrame, interval: int) -> pd.DataFrame:
-    """
-    UPSERT前にDB実カラムへ列を整形する。
-
-    目的:
-      - upsert_executor の
-          [UPSERT] dropping unknown column ...
-        を発生前に抑止する
-      - open/high/low/close の値は *_price に退避してから落とす
-      - interval はDBに無ければ落とす
-    """
     if work is None or work.empty:
         return work
 
@@ -364,7 +406,6 @@ def _align_columns_to_table(work: pd.DataFrame, interval: int) -> pd.DataFrame:
     interval = int(interval)
     table_name = _summary_table_name(interval)
 
-    # aliasを落とす前に正式列へ退避
     out = _protect_ohlc_price_aliases(out)
 
     table_cols = _get_summary_table_columns(interval)
@@ -383,7 +424,6 @@ def _align_columns_to_table(work: pd.DataFrame, interval: int) -> pd.DataFrame:
 
         return out
 
-    # DBカラム取得に失敗した場合は、ログで実際にunknownだった列だけ落とす。
     fallback_drop = [c for c in _FALLBACK_DROP_COLS if c in out.columns]
 
     if fallback_drop:
@@ -447,20 +487,6 @@ def _latest_per_symbol_for_periodic_save(
     interval: int,
     reason: str = "",
 ) -> pd.DataFrame:
-    """
-    定時サマリー保存用:
-      - 履歴付きで計算した summary_df から
-      - DB保存対象だけを symbolごとの最新足へ絞る
-
-    目的:
-      - 毎回 5万〜10万行を UPSERT しない
-      - chunk=500/528 のような重い保存を防ぐ
-      - 計算用履歴は維持し、保存だけ軽量化する
-
-    注意:
-      - recovery / bootstrap / full rebuild では latest_only=False を使う
-      - periodic / push / yahoo 定時保存時だけ latest_only=True を使う
-    """
     if work is None or work.empty:
         return work
 
@@ -529,15 +555,6 @@ def _latest_per_symbol_for_periodic_save(
 
 
 def _should_auto_latest_only(save_reason: str) -> bool:
-    """
-    呼び出し元が latest_only を明示していない場合でも、
-    save_reason から定時系だと判断できるものは latest_only を有効化する。
-
-    互換性:
-      - デフォルトは False
-      - recovery / bootstrap / rebuild / backfill / repair は対象外
-      - 明示 latest_only=True が最優先
-    """
     try:
         r = str(save_reason or "").strip().lower()
     except Exception:
@@ -558,6 +575,8 @@ def _should_auto_latest_only(save_reason: str) -> bool:
         "migration",
         "historical",
         "history",
+        "catchup",
+        "startup",
     )
     if any(k in r for k in full_save_keywords):
         return False
@@ -586,14 +605,6 @@ def _run_upsert_with_summary_db_lock(
     interval: int,
     save_reason: str,
 ) -> tuple[int, float]:
-    """
-    execute_upsert を summary DB 単位の write lock 内で実行する。
-
-    Returns
-    -------
-    tuple[int, float]
-        saved_rows, db_lock_wait_sec
-    """
     from trading.summary.persistence.core.upsert_engine import execute_upsert
 
     table_name = _summary_table_name(interval)
@@ -632,43 +643,28 @@ def bulk_upsert_summary(
     latest_only: bool = False,
     save_reason: str = "",
 ) -> int:
-    """
-    summary DB へ bulk UPSERT する。
-
-    Parameters
-    ----------
-    df:
-        保存対象DataFrame。
-    interval:
-        1, 3, 5 など。
-    lock_timeout_sec:
-        interval単位の排他ロック待機秒数。
-    skip_if_busy:
-        True の場合、ロックが取れなければ保存をスキップ。
-    latest_only:
-        True の場合、symbolごとの最新 datetime 1行だけ保存する。
-        定時サマリー保存では True 推奨。
-        recovery / bootstrap / rebuild では False のまま使う。
-    save_reason:
-        ログ用の保存理由。
-        例:
-          - periodic_push_summary
-          - yahoo_complement_periodic
-          - bootstrap_rebuild
-          - recovery_full
-
-    Notes
-    -----
-    Ver34.3:
-      interval lock の内側で summary DB 全体の write lock も取得する。
-      これにより stock_summary_1min / 3min / 5min の同時UPSERTによる
-      database is locked を抑止する。
-    """
     total_started = time.monotonic()
     interval = int(interval)
     table_name = _summary_table_name(interval)
 
-    # import確認だけ先に行う。
+    skip_owner, owner_reason = _should_skip_summary_save_by_owner(save_reason)
+    if skip_owner:
+        try:
+            rows = 0 if df is None else len(df)
+        except Exception:
+            rows = -1
+        logger.warning(
+            "[SUMMARY OWNER GUARD] skip DB save interval=%s table=%s rows=%s owner=%s is_data_collector=%s reason=%s save_reason=%s",
+            interval,
+            table_name,
+            rows,
+            _summary_save_owner_safe(),
+            _is_data_collector_process_safe(),
+            owner_reason,
+            save_reason,
+        )
+        return 0
+
     try:
         from trading.summary.persistence.core.upsert_engine import execute_upsert  # noqa: F401
     except Exception:
@@ -703,7 +699,7 @@ def bulk_upsert_summary(
 
         logger.info(
             "[SUMMARY] upsert enter interval=%s table=%s rows=%s symbols=%s earliest=%s latest=%s "
-            "tid=%s thread=%s lock_timeout=%.3fs skip_if_busy=%s latest_only=%s save_reason=%s",
+            "tid=%s thread=%s lock_timeout=%.3fs skip_if_busy=%s latest_only=%s save_reason=%s owner_guard=%s",
             interval,
             table_name,
             len(work),
@@ -716,6 +712,7 @@ def bulk_upsert_summary(
             bool(skip_if_busy),
             bool(latest_only),
             save_reason,
+            owner_reason,
         )
     except Exception:
         logger.debug("[SUMMARY] enter log failed", exc_info=True)
@@ -727,15 +724,6 @@ def bulk_upsert_summary(
     work = _drop_invalid_ohlc_rows(work, interval=interval, stage="bulk-save-pre")
     work = _dedupe_before_save(work, interval=interval)
 
-    # --------------------------------------------------------
-    # latest-only save
-    # --------------------------------------------------------
-    # 明示 latest_only=True、または save_reason から定時系と判定できる場合のみ、
-    # symbolごとの最新足だけに絞る。
-    #
-    # recovery / bootstrap / rebuild では save_reason をそれらにしておけば
-    # auto latest-only は発動しない。
-    # --------------------------------------------------------
     auto_latest_only = _should_auto_latest_only(save_reason)
     effective_latest_only = bool(latest_only or auto_latest_only)
 
@@ -765,8 +753,6 @@ def bulk_upsert_summary(
         logger.warning("[SUMMARY] no valid rows before upsert interval=%s", interval)
         return 0
 
-    # UPSERT前にDBカラムに合わせる。
-    # ここで open/high/low/close/interval unknown warning を事前抑止する。
     rows_before_align = len(work)
     cols_before_align = list(work.columns)
     work = _align_columns_to_table(work, interval=interval)
@@ -799,17 +785,6 @@ def bulk_upsert_summary(
         logger.debug("[SUMMARY] preprocess profile failed", exc_info=True)
 
     try:
-        # ----------------------------------------------------
-        # 1) interval別 lock
-        # 2) summary DB全体 write lock
-        #
-        # interval別 lock:
-        #   同じ interval の重複保存を防ぐ。
-        #
-        # DB全体 write lock:
-        #   1min / 3min / 5min / recovery / yahoo など、
-        #   同一 summary DB への同時 writer を防ぐ。
-        # ----------------------------------------------------
         with _interval_lock(
             interval,
             timeout_sec=float(lock_timeout_sec),
@@ -897,11 +872,8 @@ def save_summary_bulk(
     latest_only: bool = False,
     save_reason: str = "",
 ) -> int:
-    """
-    旧API互換。
-    """
     return bulk_upsert_summary(
-        df=df,
+        df,
         interval=interval,
         lock_timeout_sec=lock_timeout_sec,
         skip_if_busy=skip_if_busy,
@@ -918,11 +890,8 @@ def save_summary_df(
     latest_only: bool = False,
     save_reason: str = "",
 ) -> int:
-    """
-    旧API互換。
-    """
     return bulk_upsert_summary(
-        df=df,
+        df,
         interval=interval,
         lock_timeout_sec=lock_timeout_sec,
         skip_if_busy=skip_if_busy,
