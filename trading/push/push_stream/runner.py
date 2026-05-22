@@ -1,9 +1,15 @@
 # ============================================================
 # File   : trading/push/push_stream/runner.py
-# Version: Ver1.6-PRODUCTION-PUSH-STREAM-RUNNER-REFRESH-IN-MEMORY-ONLY
+# Version: Ver1.7-PRODUCTION-PUSH-STREAM-MAIN-MEMORY-ONLY-DB-FLUSH-OFF
 # ------------------------------------------------------------
 # 【概要】
 #   kabu Station PUSH WebSocket runner
+#
+# 【REV1.7】
+#   ✔ main.py / main_database.py 分離運用時、main.py側では
+#     push_stream DB writer / order_book writer / flush worker を強制OFF
+#   ✔ main.py側は WebSocket受信・latest price cache・5秒足・push_df 更新だけを担当
+#   ✔ stream_data へのflushログ/DB保存は main_database.py 側だけに寄せる
 #
 # 【REV1.6】
 #   ✔ enable_rotate=False の memory-only mode でも refresh_callable を設定する
@@ -45,7 +51,7 @@ from .constants import RECONNECT_WAIT_SEC
 
 logger = logging.getLogger(__name__)
 
-VERSION = "Ver1.6-PRODUCTION-PUSH-STREAM-RUNNER-REFRESH-IN-MEMORY-ONLY"
+VERSION = "Ver1.7-PRODUCTION-PUSH-STREAM-MAIN-MEMORY-ONLY-DB-FLUSH-OFF"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -61,6 +67,20 @@ def _env_bool(name: str, default: bool) -> bool:
         return bool(default)
     except Exception:
         return bool(default)
+
+
+def _should_disable_push_db_write_in_this_process() -> bool:
+    """
+    main.py側ではpush_streamのDB flush workerを起動しない。
+
+    data_collectors.split_mode.should_skip_data_collector_work_in_main() が True の場合、
+    このプロセスは main.py 側なので、PUSH DB保存は main_database.py 側だけに任せる。
+    """
+    try:
+        from data_collectors.split_mode import should_skip_data_collector_work_in_main
+        return bool(should_skip_data_collector_work_in_main())
+    except Exception:
+        return False
 
 
 def _get_existing_refresh_callable() -> Any:
@@ -309,8 +329,23 @@ def start_push_stream(
         _ensure_runtime_flags()
         state._ring_buffer = _init_ring_buffer()
 
-        db_write_enabled = _env_bool("PUSH_STREAM_DB_WRITE", True) and stream_writer is not False
-        order_book_write_enabled = _env_bool("PUSH_STREAM_ORDER_BOOK_WRITE", True) and order_book_writer is not False
+        force_memory_only = _should_disable_push_db_write_in_this_process()
+
+        if force_memory_only:
+            db_write_enabled = False
+            order_book_write_enabled = False
+            stream_writer = False
+            order_book_writer = False
+            _safe_set_runtime("push_stream_memory_only", True)
+            _safe_set_runtime("push_stream_db_write_enabled", False)
+            _safe_set_runtime("push_stream_order_book_write_enabled", False)
+            logger.warning(
+                "[push_stream] MAIN MEMORY-ONLY mode: DB writer/order_book writer/flush worker disabled; main_database.py handles PUSH DB storage"
+            )
+        else:
+            db_write_enabled = _env_bool("PUSH_STREAM_DB_WRITE", True) and stream_writer is not False
+            order_book_write_enabled = _env_bool("PUSH_STREAM_ORDER_BOOK_WRITE", True) and order_book_writer is not False
+            _safe_set_runtime("push_stream_memory_only", False)
 
         if db_write_enabled:
             state._stream_writer = stream_writer if stream_writer is not None else _init_stream_writer()
@@ -333,12 +368,13 @@ def start_push_stream(
         rotation_enabled = _set_rotation_preserve(enable_rotate)
 
         logger.info(
-            "[push_stream] start config refresh_callable=%s rotation_enabled=%s enable_rotate_arg=%s db_write=%s order_book_write=%s version=%s",
+            "[push_stream] start config refresh_callable=%s rotation_enabled=%s enable_rotate_arg=%s db_write=%s order_book_write=%s memory_only=%s version=%s",
             refresh_alive,
             rotation_enabled,
             enable_rotate,
             db_write_enabled,
             order_book_write_enabled,
+            force_memory_only,
             VERSION,
         )
 
@@ -347,6 +383,7 @@ def start_push_stream(
         else:
             state._flush_thread = None
             _safe_set_runtime("push_writer_running", False)
+            logger.warning("[push_stream] flush worker not started because db_write_enabled=False")
 
         _start_thread_if_needed(attr_name="_monitor_thread", target=_monitor_worker, name="push-monitor-worker")
 
@@ -360,11 +397,12 @@ def start_push_stream(
         _sync_runtime_status_after_start()
 
         logger.info(
-            "[push_stream] started version=%s refresh_callable=%s rotation_enabled=%s db_write=%s",
+            "[push_stream] started version=%s refresh_callable=%s rotation_enabled=%s db_write=%s memory_only=%s",
             VERSION,
             _is_refresh_callable_alive(),
             bool(getattr(state, "_rotation_enabled", False)),
             db_write_enabled,
+            force_memory_only,
         )
 
 
