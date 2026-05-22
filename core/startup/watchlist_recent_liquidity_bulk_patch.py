@@ -1,9 +1,16 @@
 # ============================================================
 # File   : core/startup/watchlist_recent_liquidity_bulk_patch.py
-# Version: V1.2-SKIP-DB-READ-IN-MAIN-PROCESS
+# Version: V1.3-HARD-SKIP-DB-READ-IN-MAIN-PROCESS
 # ------------------------------------------------------------
 # watchlist_recent_liquidity_guard_patch の per-symbol SQLite 読取を
 # 1回のbulk読取に差し替え、さらにNAS DBが遅い場合はfail-openする。
+#
+# V1.3:
+#   - main.py 判定を sys.argv/env だけでなく data_collectors.split_mode に統一
+#   - main.py 側に AUTOSTOCK_SUMMARY_DB_WRITER 等が紛れ込んでもDB読取しない
+#   - main.py 側では thread を作らず即 fail-open する
+#   - SQLite progress_handler で長時間SELECTを中断しやすくする
+#   - timeout後にdaemon workerが132秒後に read done を出す問題を抑制
 #
 # V1.2:
 #   - main.py では既定でsummary DB bulk read自体を起動しない
@@ -71,32 +78,43 @@ def _is_main_py_process() -> bool:
         return False
 
 
-def _is_database_process() -> bool:
-    return any(
-        _env_bool(name, False)
-        for name in (
-            "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
-            "AUTOSTOCK_SUMMARY_DB_WRITER",
-            "AUTOSTOCK_MAIN_DATABASE_PROCESS",
-        )
-    )
+def _split_mode_says_main_should_skip_db_work() -> bool:
+    """
+    main.py / main_database.py 分離判定の正本。
+
+    旧判定では AUTOSTOCK_SUMMARY_DB_WRITER=1 等がmain.py側に残ると
+    database process と誤判定して、main.pyで重いsummary DB readを開始していた。
+    """
+    try:
+        from data_collectors.split_mode import should_skip_data_collector_work_in_main
+        return bool(should_skip_data_collector_work_in_main())
+    except Exception:
+        return False
 
 
 def _should_skip_db_read_in_main() -> bool:
-    if not _is_main_py_process():
-        return False
-    if _is_database_process():
-        return False
     if _env_bool("WATCHLIST_RECENT_LIQ_BULK_RUN_IN_MAIN", False):
         return False
     if not _env_bool("WATCHLIST_RECENT_LIQ_BULK_SKIP_DB_IN_MAIN", True):
         return False
-    return True
+    if _split_mode_says_main_should_skip_db_work():
+        return True
+    if _is_main_py_process() and not _env_bool("AUTOSTOCK_DATA_COLLECTORS_PROCESS", False):
+        return True
+    return False
 
 
 def _read_bulk_stats_sync(mod: Any, missing: List[str], symbols_total: int) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     if not missing:
+        return out
+
+    if _should_skip_db_read_in_main():
+        logger.warning(
+            "[WATCHLIST RECENT LIQ BULK] sync read blocked in main.py symbols=%d missing=%d reason=split_mode_main_memory_only",
+            symbols_total,
+            len(missing),
+        )
         return out
 
     now_ts = dt.datetime.now().timestamp()
@@ -110,8 +128,22 @@ def _read_bulk_stats_sync(mod: Any, missing: List[str], symbols_total: int) -> d
         return out
 
     t0 = time.monotonic()
-    with sqlite3.connect(path, timeout=0.5) as conn:
-        conn.execute("PRAGMA busy_timeout=500")
+    deadline = t0 + max(0.2, _env_float("WATCHLIST_RECENT_LIQ_BULK_SQL_HARD_TIMEOUT_SEC", 2.0))
+
+    with sqlite3.connect(path, timeout=0.25) as conn:
+        conn.execute("PRAGMA busy_timeout=250")
+
+        def _progress_handler() -> int:
+            # 0=continue, nonzero=abort
+            if time.monotonic() > deadline:
+                return 1
+            return 0
+
+        try:
+            conn.set_progress_handler(_progress_handler, 10_000)
+        except Exception:
+            pass
+
         sym_col = mod._col(conn, table, ["symbol", "code", "stock_code"])
         tm_col = mod._col(conn, table, ["datetime", "dt", "timestamp", "time"])
         close_col = mod._col(conn, table, ["close_price", "close", "price", "current_price"])
@@ -134,7 +166,24 @@ def _read_bulk_stats_sync(mod: Any, missing: List[str], symbols_total: int) -> d
             ORDER BY {sym_col}, {tm_col} DESC
             LIMIT ?
         """
-        rows = conn.execute(sql, tuple(missing) + (int(limit_rows),)).fetchall()
+        try:
+            rows = conn.execute(sql, tuple(missing) + (int(limit_rows),)).fetchall()
+        except sqlite3.OperationalError as e:
+            if "interrupted" in str(e).lower():
+                logger.warning(
+                    "[WATCHLIST RECENT LIQ BULK] SQL interrupted hard-timeout fail-open symbols=%d missing=%d timeout=%.2fs path=%s",
+                    symbols_total,
+                    len(missing),
+                    _env_float("WATCHLIST_RECENT_LIQ_BULK_SQL_HARD_TIMEOUT_SEC", 2.0),
+                    path,
+                )
+                return out
+            raise
+        finally:
+            try:
+                conn.set_progress_handler(None, 0)
+            except Exception:
+                pass
 
     grouped: dict[str, list[tuple[Any, Any, Any, Any]]] = {s: [] for s in missing}
     for r in rows or []:
@@ -185,7 +234,7 @@ def _read_bulk_stats_sync(mod: Any, missing: List[str], symbols_total: int) -> d
 
 
 def _bulk_stats(mod: Any, symbols: List[str]) -> tuple[dict[str, dict[str, Any]], bool]:
-    """returns (stats_map, timed_out)."""
+    """returns (stats_map, timed_out_or_skipped)."""
     symbols = mod._dedupe(symbols)
     if not symbols:
         return {}, False
@@ -207,9 +256,11 @@ def _bulk_stats(mod: Any, symbols: List[str]) -> tuple[dict[str, dict[str, Any]]
 
     if _should_skip_db_read_in_main():
         logger.warning(
-            "[WATCHLIST RECENT LIQ BULK] DB read skipped in main.py fail-open symbols=%d missing=%d set WATCHLIST_RECENT_LIQ_BULK_RUN_IN_MAIN=1 to force",
+            "[WATCHLIST RECENT LIQ BULK] DB read HARD-SKIPPED in main.py fail-open symbols=%d missing=%d split_mode_skip=%s argv_main=%s set WATCHLIST_RECENT_LIQ_BULK_RUN_IN_MAIN=1 to force",
             len(symbols),
             len(missing),
+            _split_mode_says_main_should_skip_db_work(),
+            _is_main_py_process(),
         )
         return out, True
 
@@ -237,8 +288,9 @@ def _bulk_stats(mod: Any, symbols: List[str]) -> tuple[dict[str, dict[str, Any]]
 
     if th.is_alive():
         logger.warning(
-            "[WATCHLIST RECENT LIQ BULK] timeout fail-open symbols=%d missing=%d timeout=%.2fs",
+            "[WATCHLIST RECENT LIQ BULK] timeout fail-open symbols=%d missing=%d timeout=%.2fs hard_timeout=%.2fs",
             len(symbols), len(missing), timeout_sec,
+            _env_float("WATCHLIST_RECENT_LIQ_BULK_SQL_HARD_TIMEOUT_SEC", 2.0),
         )
         return out, True
 
@@ -324,10 +376,13 @@ def install() -> bool:
     mod._filter_symbols = _filter_symbols_bulk
     _INSTALLED = True
     logger.warning(
-        "[WATCHLIST RECENT LIQ BULK] installed bulk summary read timeout=%.2fs fail_open=%s skip_db_in_main=%s",
+        "[WATCHLIST RECENT LIQ BULK] installed v1.3 bulk summary read timeout=%.2fs hard_timeout=%.2fs fail_open=%s skip_db_in_main=%s split_mode_skip=%s argv_main=%s",
         _env_float("WATCHLIST_RECENT_LIQ_BULK_TIMEOUT_SEC", 1.5),
+        _env_float("WATCHLIST_RECENT_LIQ_BULK_SQL_HARD_TIMEOUT_SEC", 2.0),
         mod._env_bool("WATCHLIST_RECENT_LIQ_FAIL_OPEN_ON_TIMEOUT", True),
         _should_skip_db_read_in_main(),
+        _split_mode_says_main_should_skip_db_work(),
+        _is_main_py_process(),
     )
     return True
 
