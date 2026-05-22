@@ -1,16 +1,20 @@
 # ============================================================
 # File   : trading/ranking/active_symbols/liquidity.py
-# Version: Ver1.4-ACTIVE-SYMBOLS-SUMMARY-PRICE-FALLBACK
+# Version: Ver1.5-FAST-STARTUP-SKIP-SUMMARY-PRICE-FALLBACK
 # ------------------------------------------------------------
 # Purpose:
 #   - PUSH登録候補の流動性/価格フィルタ
 #   - 低位株や極端に流動性が低い銘柄を除外する
 #   - 監視銘柄を価格条件内に制限する
 #
-# Ver1.3:
-#   - premarket_mode でも最終価格ガードを完全スキップしない。
-#   - 価格情報が取れる銘柄は MIN_PRICE / MAX_PRICE を必ず適用する。
-#   - 価格情報が本当に無い銘柄だけ fail-open で残す。
+# Ver1.5:
+#   - main.py 起動時に止まって見える原因だった summary DB 価格補完を
+#     既定でスキップ可能にする。
+#   - ACTIVE_SUMMARY_PRICE_FALLBACK_ENABLED=0 で完全無効。
+#   - ACTIVE_SUMMARY_PRICE_FALLBACK_RUN_IN_MAIN=1 のときだけ main.py でも実行。
+#   - 1銘柄ずつSELECTする方式をやめ、IN句の一括取得に変更。
+#   - timeout/busy_timeoutを短縮可能にする。
+#
 # Ver1.4:
 #   - liquidity_map に価格が無い場合、summaryYYYYMMDD.db の
 #     stock_summary_1min/3min/5min から直近 close/current_price を取得して
@@ -23,6 +27,8 @@ import datetime as dt
 import logging
 import os
 import sqlite3
+import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set
 
@@ -39,6 +45,34 @@ from .normalize import dedupe_keep_order, normalize_symbol, to_float
 from .ranking_source import build_liquidity_map
 
 logger = logging.getLogger(__name__)
+
+
+def _env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _is_main_py_process() -> bool:
+    try:
+        argv = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        return any(x.endswith("/main.py") or x == "main.py" for x in argv)
+    except Exception:
+        return False
 
 
 def _today() -> str:
@@ -74,14 +108,33 @@ def _table_cols(conn: sqlite3.Connection, table: str) -> set[str]:
         return set()
 
 
+def _summary_price_fallback_enabled() -> bool:
+    if not _env_bool("ACTIVE_SUMMARY_PRICE_FALLBACK_ENABLED", True):
+        return False
+    if _is_main_py_process() and not _env_bool("ACTIVE_SUMMARY_PRICE_FALLBACK_RUN_IN_MAIN", False):
+        return False
+    return True
+
+
 def _summary_price_fallback_map(symbols: Iterable[str]) -> Dict[str, Dict[str, float]]:
     """
     寄前SBIやランキング側に価格列が無い場合の最終価格補完。
-    監視候補100銘柄程度を想定し、summary DBの直近closeを1回ずつ参照する。
+
+    main.py起動時にNAS SQLiteへ100銘柄×複数テーブルのSELECTを行うと
+    起動停止に見えるため、既定ではmain.pyではスキップする。
+    main_database.py側や手動検証では env で有効化できる。
     """
     cleaned = [normalize_symbol(s) for s in dedupe_keep_order(symbols)]
     cleaned = [s for s in cleaned if s]
     if not cleaned:
+        return {}
+
+    if not _summary_price_fallback_enabled():
+        logger.warning(
+            "[ACTIVE SUMMARY PRICE FALLBACK] skipped symbols=%d reason=disabled_or_main_process run_in_main=%s",
+            len(cleaned),
+            os.getenv("ACTIVE_SUMMARY_PRICE_FALLBACK_RUN_IN_MAIN"),
+        )
         return {}
 
     path = _summary_db_path()
@@ -89,18 +142,30 @@ def _summary_price_fallback_map(symbols: Iterable[str]) -> Dict[str, Dict[str, f
         logger.warning("[ACTIVE SUMMARY PRICE FALLBACK] db not found path=%s symbols=%d", path, len(cleaned))
         return {}
 
+    timeout_sec = max(0.05, _env_float("ACTIVE_SUMMARY_PRICE_FALLBACK_TIMEOUT_SEC", 0.35))
+    busy_ms = int(max(50.0, _env_float("ACTIVE_SUMMARY_PRICE_FALLBACK_BUSY_TIMEOUT_MS", 300.0)))
+    t0 = time.monotonic()
     out: Dict[str, Dict[str, float]] = {}
     try:
-        with sqlite3.connect(path, timeout=1.5) as conn:
-            conn.execute("PRAGMA busy_timeout=1500;")
+        with sqlite3.connect(path, timeout=timeout_sec) as conn:
+            conn.execute(f"PRAGMA busy_timeout={busy_ms};")
             for table in ("stock_summary_1min", "stock_summary_3min", "stock_summary_5min"):
                 if len(out) >= len(cleaned):
                     break
                 if not _table_exists(conn, table):
                     continue
                 cols = _table_cols(conn, table)
-                if "symbol" not in cols or "datetime" not in cols:
+                if "symbol" not in cols:
                     continue
+
+                dt_expr = None
+                if "datetime" in cols:
+                    dt_expr = _qident("datetime")
+                elif "date" in cols and "time" in cols:
+                    dt_expr = f"({_qident('date')} || ' ' || {_qident('time')})"
+                else:
+                    continue
+
                 price_col = None
                 for c in ("current_price", "price", "close", "close_price"):
                     if c in cols:
@@ -109,23 +174,32 @@ def _summary_price_fallback_map(symbols: Iterable[str]) -> Dict[str, Dict[str, f
                 if not price_col:
                     continue
 
-                sql = (
-                    f"SELECT {_qident(price_col)}, datetime "
-                    f"FROM {_qident(table)} "
-                    f"WHERE CAST({_qident('symbol')} AS TEXT)=? "
-                    f"ORDER BY {_qident('datetime')} DESC LIMIT 1"
-                )
-                for sym in cleaned:
-                    if sym in out:
-                        continue
-                    try:
-                        row = conn.execute(sql, (sym,)).fetchone()
-                    except Exception:
-                        row = None
-                    if not row:
-                        continue
-                    price = to_float(row[0], 0.0)
-                    if price > 0:
+                remain = [s for s in cleaned if s not in out]
+                if not remain:
+                    break
+                placeholders = ",".join(["?"] * len(remain))
+                # symbolごとの最新行を1回のSQLで取得する。
+                sql = f"""
+                    SELECT CAST({_qident('symbol')} AS TEXT) AS symbol,
+                           {_qident(price_col)} AS price,
+                           {dt_expr} AS dtv
+                    FROM {_qident(table)}
+                    WHERE CAST({_qident('symbol')} AS TEXT) IN ({placeholders})
+                      AND {dt_expr} = (
+                          SELECT MAX({dt_expr})
+                          FROM {_qident(table)} t2
+                          WHERE CAST(t2.{_qident('symbol')} AS TEXT) = CAST({_qident(table)}.{_qident('symbol')} AS TEXT)
+                """
+                try:
+                    rows = conn.execute(sql, remain).fetchall()
+                except Exception as e:
+                    logger.warning("[ACTIVE SUMMARY PRICE FALLBACK] bulk select skipped table=%s err=%s", table, e, exc_info=False)
+                    continue
+
+                for row in rows or []:
+                    sym = normalize_symbol(row[0])
+                    price = to_float(row[1], 0.0)
+                    if sym and price > 0 and sym not in out:
                         out[sym] = {
                             "current_price": price,
                             "price": price,
@@ -133,13 +207,17 @@ def _summary_price_fallback_map(symbols: Iterable[str]) -> Dict[str, Dict[str, f
                             "summary_price_table": table,
                         }
         logger.warning(
-            "[ACTIVE SUMMARY PRICE FALLBACK] loaded symbols=%d hit=%d missing=%d path=%s",
+            "[ACTIVE SUMMARY PRICE FALLBACK] loaded symbols=%d hit=%d missing=%d elapsed=%.3fs path=%s",
             len(cleaned),
             len(out),
             max(0, len(cleaned) - len(out)),
+            time.monotonic() - t0,
             path,
         )
         return out
+    except sqlite3.OperationalError as e:
+        logger.warning("[ACTIVE SUMMARY PRICE FALLBACK] sqlite skipped path=%s symbols=%d err=%s", path, len(cleaned), e, exc_info=False)
+        return {}
     except Exception:
         logger.exception("[ACTIVE SUMMARY PRICE FALLBACK] failed path=%s symbols=%d", path, len(cleaned))
         return {}
@@ -328,7 +406,16 @@ def final_guard_min_price(
     protected = protected or set()
     liquidity_map = liquidity_map or {}
 
+    logger.warning(
+        "[ACTIVE FINAL PRICE GUARD] start symbols=%d premarket=%s fallback_enabled=%s run_in_main=%s",
+        len(items),
+        premarket_mode,
+        _summary_price_fallback_enabled(),
+        os.getenv("ACTIVE_SUMMARY_PRICE_FALLBACK_RUN_IN_MAIN"),
+    )
+
     # 価格情報が無い候補は summary DB から直近価格を補完する。
+    # main.pyでは既定スキップ。価格不明銘柄はfail-openで残す。
     missing_price_symbols = []
     for s in items:
         sym = normalize_symbol(s)
