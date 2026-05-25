@@ -26,6 +26,16 @@ def _env_bool(name: str, default: bool = True) -> bool:
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
 def _safe_df(value: Any) -> pd.DataFrame:
     if isinstance(value, pd.DataFrame):
         return value.copy()
@@ -124,17 +134,6 @@ def _useful(hist: pd.DataFrame) -> bool:
     return False
 
 
-def _patched_resolve(interval: int) -> pd.DataFrame:
-    interval = int(interval)
-    hist = _get_history(interval)
-    if _useful(hist):
-        logger.warning("[PUSH HISTORY PATCH] use history as pipeline seed interval=%s rows=%s", interval, len(hist))
-        return hist
-    if callable(_ORIGINAL_RESOLVE):
-        return _ORIGINAL_RESOLVE(interval)
-    return pd.DataFrame()
-
-
 def _latest_by_symbol(df: pd.DataFrame) -> pd.DataFrame:
     out = _normalize(df)
     if out.empty:
@@ -144,17 +143,179 @@ def _latest_by_symbol(df: pd.DataFrame) -> pd.DataFrame:
     return out.drop_duplicates(subset=["symbol"], keep="last").reset_index(drop=True)
 
 
+def _tf_signal(row: pd.Series) -> float:
+    score = 0.0
+
+    def _num(col: str):
+        try:
+            return float(row.get(col))
+        except Exception:
+            return None
+
+    slope = _num("slope")
+    if slope is None or slope == 0.0:
+        slope = _num("slope_atr_scaled")
+    if slope is not None:
+        if slope > 0:
+            score += 1.0
+        elif slope < 0:
+            score -= 1.0
+
+    macd = _num("macd")
+    signal = _num("signal")
+    if macd is not None and signal is not None:
+        diff = macd - signal
+        if diff > 0:
+            score += 1.0
+        elif diff < 0:
+            score -= 1.0
+    elif macd is not None:
+        if macd > 0:
+            score += 0.5
+        elif macd < 0:
+            score -= 0.5
+
+    close = _num("close")
+    if close is None:
+        close = _num("close_price")
+    ma5 = _num("ma5")
+    ma25 = _num("ma25")
+    if close is not None and ma5 is not None:
+        if close > ma5:
+            score += 0.5
+        elif close < ma5:
+            score -= 0.5
+    if ma5 is not None and ma25 is not None:
+        if ma5 > ma25:
+            score += 0.5
+        elif ma5 < ma25:
+            score -= 0.5
+
+    return float(max(-3.0, min(3.0, score)))
+
+
+def _build_mtf_map() -> dict[str, dict[str, float]]:
+    histories = {tf: _latest_by_symbol(_get_history(tf)) for tf in (1, 3, 5)}
+    latest_by_tf: dict[int, dict[str, pd.Series]] = {}
+    for tf, df in histories.items():
+        m: dict[str, pd.Series] = {}
+        if isinstance(df, pd.DataFrame) and not df.empty and "symbol" in df.columns:
+            for _, r in df.iterrows():
+                m[str(r.get("symbol", "")).strip()] = r
+        latest_by_tf[tf] = m
+
+    symbols = set()
+    for m in latest_by_tf.values():
+        symbols.update(m.keys())
+
+    weights = {1: 1.0, 3: 1.25, 5: 1.5}
+    result: dict[str, dict[str, float]] = {}
+    for sym in symbols:
+        total = 0.0
+        wsum = 0.0
+        tf_count = 0
+        raw_parts = {}
+        for tf in (1, 3, 5):
+            row = latest_by_tf.get(tf, {}).get(sym)
+            if row is None:
+                continue
+            val = _tf_signal(row)
+            raw_parts[f"tf{tf}"] = val
+            if val != 0:
+                tf_count += 1
+            w = weights[tf]
+            total += val * w
+            wsum += w
+        if wsum <= 0:
+            continue
+        mtf = float(total / wsum)
+        if abs(mtf) < 1e-12:
+            continue
+        result[sym] = {
+            "mtf": mtf,
+            "score_mtf": mtf,
+            "mtf_score": mtf,
+            "mtf_tf_count": float(tf_count),
+            **raw_parts,
+        }
+    return result
+
+
+def _need_fill_mtf_value(v: Any) -> bool:
+    try:
+        if pd.isna(v):
+            return True
+        return float(v) == 0.0
+    except Exception:
+        return str(v).strip() in {"", "0", "0.0", "False", "None"}
+
+
+def _apply_mtf_rebuild(df: pd.DataFrame, interval: int, *, context: str) -> pd.DataFrame:
+    out = _normalize(df)
+    if out.empty or "symbol" not in out.columns:
+        return out
+    if not _env_bool("PUSH_HISTORY_PATCH_REBUILD_MTF", True):
+        return out
+
+    mtf_map = _build_mtf_map()
+    if not mtf_map:
+        logger.warning("[PUSH HISTORY PATCH][MTF] no mtf map context=%s interval=%s", context, interval)
+        return out
+
+    fill_count = 0
+    hit_count = 0
+    score_scale = _env_float("PUSH_HISTORY_PATCH_SCORE_MTF_SCALE", 1.0)
+    for idx, row in out.iterrows():
+        sym = str(row.get("symbol", "")).strip()
+        vals = mtf_map.get(sym)
+        if not vals:
+            continue
+        hit_count += 1
+        mtf_val = float(vals.get("mtf", 0.0))
+        score_val = float(vals.get("score_mtf", mtf_val)) * score_scale
+        for col, val in (("mtf", mtf_val), ("score_mtf", score_val), ("mtf_score", score_val)):
+            if col not in out.columns:
+                out[col] = pd.NA
+            if _need_fill_mtf_value(out.at[idx, col]):
+                out.at[idx, col] = val
+                fill_count += 1
+        if "mtf_tf_count" not in out.columns:
+            out["mtf_tf_count"] = pd.NA
+        if _need_fill_mtf_value(out.at[idx, "mtf_tf_count"]):
+            out.at[idx, "mtf_tf_count"] = vals.get("mtf_tf_count", 0.0)
+
+    logger.warning(
+        "[PUSH HISTORY PATCH][MTF] context=%s interval=%s rows=%s hits=%s fill_count=%s mtf=%s score_mtf=%s mtf_score=%s",
+        context, interval, len(out), hit_count, fill_count,
+        _nonzero(out, "mtf"), _nonzero(out, "score_mtf"), _nonzero(out, "mtf_score"),
+    )
+    return out
+
+
+def _patched_resolve(interval: int) -> pd.DataFrame:
+    interval = int(interval)
+    hist = _get_history(interval)
+    if _useful(hist):
+        hist = _apply_mtf_rebuild(hist, interval, context="seed")
+        logger.warning("[PUSH HISTORY PATCH] use history as pipeline seed interval=%s rows=%s", interval, len(hist))
+        return hist
+    if callable(_ORIGINAL_RESOLVE):
+        return _ORIGINAL_RESOLVE(interval)
+    return pd.DataFrame()
+
+
 def _fill_from_history(df: pd.DataFrame, hist: pd.DataFrame, interval: int, *, context: str = "store") -> pd.DataFrame:
     out = _normalize(df)
     latest = _latest_by_symbol(hist)
-    if out.empty or latest.empty:
+    if out.empty:
         return out
-    latest = latest.set_index("symbol", drop=False)
+    if not latest.empty:
+        latest = latest.set_index("symbol", drop=False)
     fill_count = 0
     hit_count = 0
     for idx, row in out.iterrows():
         sym = str(row.get("symbol", "")).strip()
-        if not sym or sym not in latest.index:
+        if not sym or latest.empty or sym not in latest.index:
             continue
         hit_count += 1
         hrow = latest.loc[sym]
@@ -175,10 +336,11 @@ def _fill_from_history(df: pd.DataFrame, hist: pd.DataFrame, interval: int, *, c
             if need:
                 out.at[idx, col] = hrow.get(col)
                 fill_count += 1
+    out = _apply_mtf_rebuild(out, interval, context=context)
     logger.warning(
-        "[PUSH HISTORY PATCH] filled context=%s interval=%s rows=%s hits=%s fill_count=%s macd=%s signal=%s mtf=%s",
+        "[PUSH HISTORY PATCH] filled context=%s interval=%s rows=%s hits=%s fill_count=%s macd=%s signal=%s mtf=%s score_mtf=%s",
         context, interval, len(out), hit_count, fill_count,
-        _nonzero(out, "macd"), _nonzero(out, "signal"), _nonzero(out, "mtf"),
+        _nonzero(out, "macd"), _nonzero(out, "signal"), _nonzero(out, "mtf"), _nonzero(out, "score_mtf"),
     )
     return out
 
@@ -214,7 +376,7 @@ def _set_history(interval: int, df: pd.DataFrame) -> None:
 def _fix_df(interval: int, df: pd.DataFrame, *, context: str) -> pd.DataFrame:
     interval = int(interval)
     hist = _get_history(interval)
-    fixed = _fill_from_history(df, hist, interval, context=context) if _useful(hist) else _safe_df(df)
+    fixed = _fill_from_history(df, hist, interval, context=context) if _useful(hist) else _apply_mtf_rebuild(_safe_df(df), interval, context=context)
     merged = _merge_history(hist, fixed, interval)
     if not merged.empty:
         _set_history(interval, merged)
@@ -277,7 +439,7 @@ def install() -> bool:
                 logger.warning("[PUSH HISTORY PATCH] patched public %s", name)
 
         _PATCHED = True
-        logger.warning("[PUSH HISTORY PATCH] installed V2 return-filled")
+        logger.warning("[PUSH HISTORY PATCH] installed V3 return-filled mtf-rebuild")
         return True
     except Exception:
         logger.exception("[PUSH HISTORY PATCH] install failed")
