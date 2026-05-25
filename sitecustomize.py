@@ -1,9 +1,13 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver04-SKIP-HEAVY-SUMMARY-MTF-CATCHUP-IN-MAIN
+# Version: Ver05-AUTO-INSTALL-SUMMARY-CONTROLLER-DUPCOL-PATCH
 # ------------------------------------------------------------
 # Python 起動時に自動 import されるフック。
 # main.py を直接壊さず、監査ログ/バックテスト用DB保存を自動有効化する。
+#
+# Ver05:
+#   - summary_controller.concat_frames の重複カラム対策 patch を自動install
+#   - pandas InvalidIndexError: Reindexing only valid with uniquely valued Index objects を防止
 #
 # Ver04:
 #   - main.py では SUMMARY MTF CATCHUP の自動起動を既定スキップ
@@ -145,6 +149,31 @@ def _install_audit_logging_safely() -> None:
             pass
 
 
+def _install_summary_controller_dupcol_patch_safely() -> None:
+    """summary_controller の concat 前後で重複カラムを潰す runtime patch。"""
+    try:
+        if os.environ.get('DISABLE_SUMMARY_CONTROLLER_DUPCOL_PATCH', '').strip() == '1':
+            _write_boot_evidence('SUMMARY_CONTROLLER_DUPCOL_PATCH_DISABLED_BY_ENV')
+            return
+
+        _ensure_project_root()
+        _write_boot_evidence('SUMMARY_CONTROLLER_DUPCOL_PATCH_INSTALL_START')
+
+        from core.startup.summary_controller_concat_duplicate_columns_patch import install
+
+        ok = install()
+        _write_boot_evidence('SUMMARY_CONTROLLER_DUPCOL_PATCH_INSTALL_DONE', {'ok': ok})
+        logging.getLogger(__name__).warning('[SITECUSTOMIZE] summary controller dupcol patch auto install ok=%s', ok)
+
+    except Exception:
+        text = traceback.format_exc()
+        _write_boot_evidence('SUMMARY_CONTROLLER_DUPCOL_PATCH_EXCEPTION', text)
+        try:
+            logging.getLogger(__name__).exception('[SITECUSTOMIZE] summary controller dupcol patch auto install failed')
+        except Exception:
+            pass
+
+
 def _install_summary_mtf_catchup_safely() -> None:
     """3分足/5分足サマリーを1分足DBから起動時に差分補完する。"""
     try:
@@ -194,5 +223,6 @@ def _install_summary_mtf_catchup_safely() -> None:
 _write_boot_evidence('PYTHON_START')
 _install_boot_exception_hook()
 _install_audit_logging_safely()
+_install_summary_controller_dupcol_patch_safely()
 _install_summary_mtf_catchup_safely()
 _write_boot_evidence('SITECUSTOMIZE_DONE')
