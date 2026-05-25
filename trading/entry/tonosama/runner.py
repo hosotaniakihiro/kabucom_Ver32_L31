@@ -1,12 +1,17 @@
 # ============================================================
 # File   : trading/entry/tonosama/runner.py
-# Version: Ver1.2-TONOSAMA-ENTRY-FILTER-DIAGNOSTICS
+# Version: Ver1.3-TONOSAMA-ACTUAL-MOVEMENT-GUARD
 # ------------------------------------------------------------
 # ✔ 15秒ジョブが100秒以上詰まる原因を修正
 # ✔ 5秒足特徴量取得を全銘柄ではなく一次フィルタ通過後の上位だけに限定
 # ✔ previous_still_running 多発を防ぐため詳細ログと elapsed を追加
 # ✔ 一次フィルタ / 5秒足フィルタ / raw_score フィルタの落選理由を集計ログ化
 # ✔ 機能削除なし: 5秒足確認は維持しつつ取得対象を絞る
+# ✔ Ver1.3: 全然動いていない銘柄のアラートを抑止
+#    - 直近1分出来高
+#    - 1分足 open→close 実体変化率
+#    - 1分足 high-low 値幅率
+#   を一次/最終フィルタに追加
 # ============================================================
 from __future__ import annotations
 
@@ -27,6 +32,9 @@ from .config import (
     MIN_FINAL_SCORE,
     MIN_VOLUME_SURGE_RATIO,
     MIN_PRICE_CHANGE_PCT,
+    MIN_BODY_CHANGE_PCT,
+    MIN_INTRABAR_RANGE_PCT,
+    MIN_LATEST_VOLUME,
     MIN_5SEC_PRICE_CHANGE_PCT,
     MAX_5SEC_DROP_PCT,
     REQUIRE_5SEC_BAR,
@@ -60,6 +68,58 @@ def _bool_series(df: pd.DataFrame, col: str, default: bool = False) -> pd.Series
     if df is None or df.empty or col not in df.columns:
         return pd.Series(default, index=df.index if df is not None else None, dtype="bool")
     return df[col].fillna(default).astype(bool)
+
+
+def _first_existing(df: pd.DataFrame, names: list[str]) -> str | None:
+    try:
+        for n in names:
+            if n in df.columns:
+                return n
+    except Exception:
+        pass
+    return None
+
+
+def _ensure_actual_movement_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """殿様アラート用に、実際に動いているかを示す列を追加する。"""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    x = df.copy()
+
+    close_col = _first_existing(x, ["close", "close_price", "current_price", "price", "close_1m"])
+    open_col = _first_existing(x, ["open", "open_price", "open_1m"])
+    high_col = _first_existing(x, ["high", "high_price", "high_1m"])
+    low_col = _first_existing(x, ["low", "low_price", "low_1m"])
+    volume_col = _first_existing(x, ["volume", "volume_1m", "latest_volume", "latest_1m_volume"])
+
+    if close_col:
+        x["_tonosama_close_for_move"] = pd.to_numeric(x[close_col], errors="coerce")
+    else:
+        x["_tonosama_close_for_move"] = 0.0
+
+    if open_col:
+        open_s = pd.to_numeric(x[open_col], errors="coerce")
+        close_s = pd.to_numeric(x["_tonosama_close_for_move"], errors="coerce")
+        x["_body_change_pct"] = ((close_s - open_s).abs() / open_s.replace(0, pd.NA) * 100.0).replace([float("inf"), -float("inf")], pd.NA).fillna(0.0)
+    else:
+        # open が無い場合は 3m/5m price_change を代用。無ければ0にして動いていない扱い。
+        x["_body_change_pct"] = _num_series(x, "_max_price_change_pct", 0.0).abs()
+
+    if high_col and low_col:
+        high_s = pd.to_numeric(x[high_col], errors="coerce")
+        low_s = pd.to_numeric(x[low_col], errors="coerce")
+        close_s = pd.to_numeric(x["_tonosama_close_for_move"], errors="coerce")
+        denom = close_s.where(close_s > 0, pd.NA)
+        x["_intrabar_range_pct"] = ((high_s - low_s).abs() / denom * 100.0).replace([float("inf"), -float("inf")], pd.NA).fillna(0.0)
+    else:
+        x["_intrabar_range_pct"] = 0.0
+
+    if volume_col:
+        x["_latest_volume"] = pd.to_numeric(x[volume_col], errors="coerce").fillna(0.0)
+    else:
+        x["_latest_volume"] = 0.0
+
+    return x
 
 
 def _sample_rows(df: pd.DataFrame, cols: list[str], limit: int = 8) -> list[dict[str, Any]]:
@@ -141,6 +201,9 @@ def _diagnose_base_frame(x: pd.DataFrame) -> None:
             "min_price": MIN_PRICE,
             "min_volume_surge": MIN_VOLUME_SURGE_RATIO,
             "min_price_change_pct": MIN_PRICE_CHANGE_PCT,
+            "min_body_change_pct": MIN_BODY_CHANGE_PCT,
+            "min_intrabar_range_pct": MIN_INTRABAR_RANGE_PCT,
+            "min_latest_volume": MIN_LATEST_VOLUME,
             "min_raw_score": MIN_RAW_SCORE,
             "use_5sec_confirm": USE_5SEC_CONFIRM,
             "require_5sec_bar": REQUIRE_5SEC_BAR,
@@ -148,7 +211,7 @@ def _diagnose_base_frame(x: pd.DataFrame) -> None:
             "max_5sec_drop_pct": MAX_5SEC_DROP_PCT,
         }
         metrics = {}
-        for col in ["close", "_max_volume_surge_ratio", "_max_price_change_pct", "_slope", "_tonosama_score"]:
+        for col in ["close", "_max_volume_surge_ratio", "_max_price_change_pct", "_body_change_pct", "_intrabar_range_pct", "_latest_volume", "_slope", "_tonosama_score"]:
             if col in x.columns:
                 s = pd.to_numeric(x[col], errors="coerce")
                 metrics[col] = {
@@ -158,18 +221,12 @@ def _diagnose_base_frame(x: pd.DataFrame) -> None:
                     "mean": round(float(s.mean()), 6) if s.notna().any() else None,
                     "zero": int((s.fillna(0.0) == 0.0).sum()),
                 }
-        logger.warning("[TONOSAMA FILTER DIAG] base summary=%s metrics=%s head=%s", summary, metrics, _sample_rows(x, ["symbol", "symbolname", "close", "_max_volume_surge_ratio", "_max_price_change_pct", "_slope", "score", "final_score", "score_mtf"], limit=15))
+        logger.warning("[TONOSAMA FILTER DIAG] base summary=%s metrics=%s head=%s", summary, metrics, _sample_rows(x, ["symbol", "symbolname", "close", "_max_volume_surge_ratio", "_max_price_change_pct", "_body_change_pct", "_intrabar_range_pct", "_latest_volume", "_slope", "score", "final_score", "score_mtf"], limit=15))
     except Exception:
         logger.debug("[TONOSAMA FILTER DIAG] base diagnose failed", exc_info=True)
 
 
 def _apply_primary_filters(x: pd.DataFrame) -> pd.DataFrame:
-    """
-    5秒足を取りに行く前の軽量フィルタ。
-
-    ここで候補を絞らず全銘柄に build_5sec_features() を実行すると、
-    15秒ジョブが100秒以上詰まり、schedule_loop 側で previous_still_running になる。
-    """
     global _LAST_FILTER_DIAG
     _LAST_FILTER_DIAG = {}
 
@@ -177,11 +234,11 @@ def _apply_primary_filters(x: pd.DataFrame) -> pd.DataFrame:
         _LAST_FILTER_DIAG = {"stage": "primary", "base_rows": 0, "primary_rows": 0, "empty_reason": "base_empty"}
         return pd.DataFrame()
 
-    x = x.copy()
+    x = _ensure_actual_movement_cols(x)
     base_rows = len(x)
     _diagnose_base_frame(x)
 
-    sample_cols = ["symbol", "symbolname", "close", "_max_volume_surge_ratio", "_max_price_change_pct", "_slope", "score", "final_score", "score_mtf", "mtf"]
+    sample_cols = ["symbol", "symbolname", "close", "_latest_volume", "_body_change_pct", "_intrabar_range_pct", "_max_volume_surge_ratio", "_max_price_change_pct", "_slope", "score", "final_score", "score_mtf", "mtf"]
 
     if "close" in x.columns:
         before = x.copy()
@@ -189,6 +246,18 @@ def _apply_primary_filters(x: pd.DataFrame) -> pd.DataFrame:
         _log_filter_step(stage="primary", before=before, after=x, reason="close_below_min_price", threshold={"MIN_PRICE": MIN_PRICE}, sample_cols=sample_cols)
     else:
         logger.warning("[TONOSAMA FILTER WARN] stage=primary missing close column -> price filter skipped cols=%s", list(x.columns))
+
+    before = x.copy()
+    x = x[_num_series(x, "_latest_volume") >= MIN_LATEST_VOLUME]
+    _log_filter_step(stage="primary", before=before, after=x, reason="latest_volume_low_flat_alert_guard", threshold={"MIN_LATEST_VOLUME": MIN_LATEST_VOLUME}, sample_cols=sample_cols)
+
+    before = x.copy()
+    x = x[_num_series(x, "_body_change_pct") >= MIN_BODY_CHANGE_PCT]
+    _log_filter_step(stage="primary", before=before, after=x, reason="body_change_low_flat_alert_guard", threshold={"MIN_BODY_CHANGE_PCT": MIN_BODY_CHANGE_PCT}, sample_cols=sample_cols)
+
+    before = x.copy()
+    x = x[_num_series(x, "_intrabar_range_pct") >= MIN_INTRABAR_RANGE_PCT]
+    _log_filter_step(stage="primary", before=before, after=x, reason="intrabar_range_low_flat_alert_guard", threshold={"MIN_INTRABAR_RANGE_PCT": MIN_INTRABAR_RANGE_PCT}, sample_cols=sample_cols)
 
     if "_max_volume_surge_ratio" in x.columns:
         before = x.copy()
@@ -217,6 +286,9 @@ def _apply_primary_filters(x: pd.DataFrame) -> pd.DataFrame:
         "primary_rows": len(x),
         "thresholds": {
             "MIN_PRICE": MIN_PRICE,
+            "MIN_LATEST_VOLUME": MIN_LATEST_VOLUME,
+            "MIN_BODY_CHANGE_PCT": MIN_BODY_CHANGE_PCT,
+            "MIN_INTRABAR_RANGE_PCT": MIN_INTRABAR_RANGE_PCT,
             "MIN_VOLUME_SURGE_RATIO": MIN_VOLUME_SURGE_RATIO,
             "MIN_PRICE_CHANGE_PCT": MIN_PRICE_CHANGE_PCT,
             "MIN_SLOPE": -0.02,
@@ -245,7 +317,6 @@ def build_feature_df_with_5sec() -> pd.DataFrame:
 
     base_rows = len(x)
 
-    # 5秒足取得前に一次フィルタで絞る
     x = _apply_primary_filters(x)
     primary_rows = len(x)
 
@@ -259,7 +330,6 @@ def build_feature_df_with_5sec() -> pd.DataFrame:
         )
         return pd.DataFrame()
 
-    # スコア列がある場合は5秒足確認前に強い候補から処理する
     try:
         x = prepare_entry_scores(x)
         if "_tonosama_score" in x.columns:
@@ -271,9 +341,8 @@ def build_feature_df_with_5sec() -> pd.DataFrame:
     if max_5sec <= 0:
         max_5sec = int(MAX_CANDIDATES or 80)
 
-    before_head = _sample_rows(x, ["symbol", "symbolname", "close", "_max_volume_surge_ratio", "_max_price_change_pct", "_slope", "_tonosama_score"], limit=12)
+    before_head = _sample_rows(x, ["symbol", "symbolname", "close", "_latest_volume", "_body_change_pct", "_intrabar_range_pct", "_max_volume_surge_ratio", "_max_price_change_pct", "_slope", "_tonosama_score"], limit=12)
 
-    # 5秒足特徴量取得は上位だけに限定
     x = x.head(min(max_5sec, MAX_CANDIDATES)).reset_index(drop=True)
 
     features = []
@@ -311,7 +380,7 @@ def build_feature_df_with_5sec() -> pd.DataFrame:
         len(x),
         feature_missing,
         before_head,
-        _sample_rows(x, ["symbol", "symbolname", "close", "_max_volume_surge_ratio", "_max_price_change_pct", "_slope", "_tonosama_score", "has_5sec_bar", "price_change_5s_pct", "volume_surge_ratio_5s"], limit=12),
+        _sample_rows(x, ["symbol", "symbolname", "close", "_latest_volume", "_body_change_pct", "_intrabar_range_pct", "_max_volume_surge_ratio", "_max_price_change_pct", "_slope", "_tonosama_score", "has_5sec_bar", "price_change_5s_pct", "volume_surge_ratio_5s"], limit=12),
         time.perf_counter() - started,
     )
 
@@ -324,12 +393,24 @@ def iter_tonosama_candidate_rows() -> pd.DataFrame:
     if x.empty:
         return pd.DataFrame()
 
-    sample_cols = ["symbol", "symbolname", "close", "_max_volume_surge_ratio", "_max_price_change_pct", "_slope", "_tonosama_score", "has_5sec_bar", "price_change_5s_pct", "volume_surge_ratio_5s"]
+    x = _ensure_actual_movement_cols(x)
+    sample_cols = ["symbol", "symbolname", "close", "_latest_volume", "_body_change_pct", "_intrabar_range_pct", "_max_volume_surge_ratio", "_max_price_change_pct", "_slope", "_tonosama_score", "has_5sec_bar", "price_change_5s_pct", "volume_surge_ratio_5s"]
 
-    # build_feature_df_with_5sec 側で一次フィルタ済みだが、互換性のため最終確認も残す
     before = x.copy()
     x = x[_num_series(x, "close") > MIN_PRICE]
     _log_filter_step(stage="final", before=before, after=x, reason="close_below_min_price", threshold={"MIN_PRICE": MIN_PRICE}, sample_cols=sample_cols)
+
+    before = x.copy()
+    x = x[_num_series(x, "_latest_volume") >= MIN_LATEST_VOLUME]
+    _log_filter_step(stage="final", before=before, after=x, reason="latest_volume_low_flat_alert_guard", threshold={"MIN_LATEST_VOLUME": MIN_LATEST_VOLUME}, sample_cols=sample_cols)
+
+    before = x.copy()
+    x = x[_num_series(x, "_body_change_pct") >= MIN_BODY_CHANGE_PCT]
+    _log_filter_step(stage="final", before=before, after=x, reason="body_change_low_flat_alert_guard", threshold={"MIN_BODY_CHANGE_PCT": MIN_BODY_CHANGE_PCT}, sample_cols=sample_cols)
+
+    before = x.copy()
+    x = x[_num_series(x, "_intrabar_range_pct") >= MIN_INTRABAR_RANGE_PCT]
+    _log_filter_step(stage="final", before=before, after=x, reason="intrabar_range_low_flat_alert_guard", threshold={"MIN_INTRABAR_RANGE_PCT": MIN_INTRABAR_RANGE_PCT}, sample_cols=sample_cols)
 
     before = x.copy()
     x = x[_num_series(x, "_max_volume_surge_ratio") >= MIN_VOLUME_SURGE_RATIO]
@@ -370,7 +451,7 @@ def iter_tonosama_candidate_rows() -> pd.DataFrame:
 
     if x.empty:
         logger.info(
-            "[TONOSAMA ENTRY] no scalping candidates after surge/5sec filters diag=%s elapsed=%.3fs",
+            "[TONOSAMA ENTRY] no scalping candidates after surge/5sec/actual-move filters diag=%s elapsed=%.3fs",
             _LAST_FILTER_DIAG,
             time.perf_counter() - started,
         )
@@ -423,12 +504,15 @@ def build_tonosama_entries() -> int:
         if not ai_ok:
             ai_ng += 1
             logger.info(
-                "[TONOSAMA ENTRY AI NG] symbol=%s prob=%.3f reason=%s surge=%.2f price_chg=%.2f 5s=%.3f",
+                "[TONOSAMA ENTRY AI NG] symbol=%s prob=%.3f reason=%s surge=%.2f price_chg=%.2f body=%.3f range=%.3f vol=%.0f 5s=%.3f",
                 symbol,
                 ai_prob,
                 ai_reason,
                 safe_float(row.get("_max_volume_surge_ratio"), 0.0),
                 safe_float(row.get("_max_price_change_pct"), 0.0),
+                safe_float(row.get("_body_change_pct"), 0.0),
+                safe_float(row.get("_intrabar_range_pct"), 0.0),
+                safe_float(row.get("_latest_volume"), 0.0),
                 safe_float(row.get("price_change_5s_pct"), 0.0),
             )
             continue
@@ -443,10 +527,13 @@ def build_tonosama_entries() -> int:
         if add_tonosama_pending(entry):
             registered += 1
             logger.info(
-                "🔥 TONOSAMA PENDING %s score=%.2f price=%.1f surge=%.2fx price_chg=%.2f%% tf=%s 5s=%.3f%% ai_prob=%.3f",
+                "🔥 TONOSAMA PENDING %s score=%.2f price=%.1f vol=%.0f body=%.3f%% range=%.3f%% surge=%.2fx price_chg=%.2f%% tf=%s 5s=%.3f%% ai_prob=%.3f",
                 symbol,
                 final_score,
                 safe_float(row.get("close"), 0.0),
+                safe_float(row.get("_latest_volume"), 0.0),
+                safe_float(row.get("_body_change_pct"), 0.0),
+                safe_float(row.get("_intrabar_range_pct"), 0.0),
                 safe_float(row.get("_max_volume_surge_ratio"), 0.0),
                 safe_float(row.get("_max_price_change_pct"), 0.0),
                 str(row.get("_surge_tf", "")),
