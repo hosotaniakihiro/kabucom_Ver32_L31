@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/summary_ai_entry_controller_bridge_patch.py
-# Version: V1.1-WAIT-ENTRY-PIPELINE-LOCK
+# Version: V1.2-RETRY-AFTER-LOCK-SKIP
 # ------------------------------------------------------------
 # 目的:
 #   SUMMARY AI が AI_OK を出して pending 登録まで成功しているのに、
@@ -15,12 +15,16 @@
 #      summary_entry 側で判定できる dict 戻り値へ補正する。
 #   3. entry_controller の _pipeline_lock が他ルートで使用中の場合、
 #      SUMMARY_AI を即 skip せず、短時間待ってから実行する。
-#   4. 実際の安全ガードは維持する。
+#   4. V1.2: 待機開始時には lock が空いていても、old_run 内で競合して
+#      "ENTRY PIPELINE already running → skip" になった場合を検出し、
+#      pending が残っていれば lock解放後に1回だけ再実行する。
+#   5. 実際の安全ガードは維持する。
 #      - market/risk/index shock/position/sell credit/ATR/range/order builder/qty はそのまま通す。
 #
 # ENV:
 #   SUMMARY_AI_ENTRY_CONTROLLER_LOCK_WAIT_SEC=8.0
 #   SUMMARY_AI_ENTRY_CONTROLLER_LOCK_POLL_SEC=0.25
+#   SUMMARY_AI_ENTRY_CONTROLLER_RETRY_AFTER_SKIP=1
 # ============================================================
 
 from __future__ import annotations
@@ -55,6 +59,21 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
+
+
 def _norm_source(v: Any) -> str:
     try:
         return str(v or "").strip().upper()
@@ -79,7 +98,6 @@ def _is_summary_pipeline_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> 
     try:
         src = kwargs.get("pipeline_source")
         if src is None and len(args) >= 1:
-            # 旧互換。通常 run_entry_pipeline は keyword only だが保険。
             src = args[0]
         return _norm_source(src) == "SUMMARY"
     except Exception:
@@ -160,10 +178,6 @@ def _lock_is_held(ec: Any) -> bool:
 
 
 def _wait_entry_lock_if_needed(ec: Any, *, is_summary: bool, before_pending: int) -> tuple[bool, float]:
-    """
-    SUMMARY_AI が pending 登録済みなのに entry_controller が別ルート実行中なら待つ。
-    非SUMMARYや pending 無しは従来通り待たない。
-    """
     if not is_summary or before_pending <= 0:
         return True, 0.0
 
@@ -203,6 +217,75 @@ def _wait_entry_lock_if_needed(ec: Any, *, is_summary: bool, before_pending: int
     return True, elapsed
 
 
+def _normalize_run_result(
+    ec: Any,
+    result: Any,
+    *,
+    before_root: dict,
+    before_pending: int,
+    before_inflight: int,
+    waited_sec: float,
+    is_summary: bool,
+    retry_count: int,
+) -> dict:
+    if isinstance(result, dict):
+        result.setdefault("waited_sec", waited_sec)
+        result.setdefault("retry_count", retry_count)
+        return result
+    if isinstance(result, bool):
+        return {
+            "executed": bool(result),
+            "approved_count": 1 if result else 0,
+            "result": result,
+            "skip_reason": None if result else "entry_controller_no_order",
+            "waited_sec": waited_sec,
+            "retry_count": retry_count,
+        }
+
+    after_root, after_pending = _snapshot_pending_count(ec)
+    after_inflight = _inflight_count(ec)
+    pending_decreased = after_pending < before_pending
+    inflight_increased = after_inflight > before_inflight
+    executed = bool(pending_decreased or inflight_increased)
+    approved_count = max(0, before_pending - after_pending, after_inflight - before_inflight)
+
+    skip_reason = None if executed else "entry_controller_no_order"
+    if not executed and is_summary and waited_sec > 0:
+        skip_reason = "entry_controller_no_order_after_lock_wait"
+    if not executed and is_summary and retry_count > 0:
+        skip_reason = "entry_controller_no_order_after_retry"
+
+    return {
+        "executed": executed,
+        "approved_count": approved_count,
+        "result": result,
+        "skip_reason": skip_reason,
+        "pending_before": before_root,
+        "pending_after": after_root,
+        "pending_count_before": before_pending,
+        "pending_count_after": after_pending,
+        "inflight_before": before_inflight,
+        "inflight_after": after_inflight,
+        "waited_sec": waited_sec,
+        "retry_count": retry_count,
+    }
+
+
+def _should_retry_after_no_order(ec: Any, *, is_summary: bool, before_pending: int, before_inflight: int, result: Any) -> bool:
+    if not _env_bool("SUMMARY_AI_ENTRY_CONTROLLER_RETRY_AFTER_SKIP", True):
+        return False
+    if not is_summary or before_pending <= 0:
+        return False
+    if isinstance(result, dict) and bool(result.get("executed")):
+        return False
+    if isinstance(result, bool) and result:
+        return False
+    after_root, after_pending = _snapshot_pending_count(ec)
+    after_inflight = _inflight_count(ec)
+    # pendingが減っておらず、inflightも増えていないなら、old_runが lock skip 等で何もしていない可能性が高い。
+    return after_pending >= before_pending and after_inflight <= before_inflight and _count_pending(after_root) > 0
+
+
 def install() -> bool:
     global _PATCHED
     if _PATCHED:
@@ -214,10 +297,6 @@ def install() -> bool:
         logger.exception("[SUMMARY AI ENTRY BRIDGE] entry_controller import failed")
         return False
 
-    # --------------------------------------------------------
-    # 1) SUMMARY_AI は summary_ai 側でAI_OK済みなので、
-    #    entry_controller の再AI判定は preapproved として扱う。
-    # --------------------------------------------------------
     try:
         old_ai = getattr(ec, "ai_final_entry_check", None)
         if callable(old_ai) and not getattr(old_ai, "_summary_ai_preapproved_bridge", False):
@@ -248,13 +327,9 @@ def install() -> bool:
         logger.exception("[SUMMARY AI ENTRY BRIDGE] ai wrapper install failed")
         return False
 
-    # --------------------------------------------------------
-    # 2) entry_controller.run_entry_pipeline の戻り値を dict 化。
-    #    かつ SUMMARY_AI の場合は _pipeline_lock が空くまで短時間待つ。
-    # --------------------------------------------------------
     try:
         old_run = getattr(ec, "run_entry_pipeline", None)
-        if callable(old_run) and not getattr(old_run, "_summary_ai_return_bridge_v11", False):
+        if callable(old_run) and not getattr(old_run, "_summary_ai_return_bridge_v12", False):
             def _run_entry_pipeline_patched(*args, **kwargs):
                 before_root, before_pending = _snapshot_pending_count(ec)
                 before_inflight = _inflight_count(ec)
@@ -278,67 +353,66 @@ def install() -> bool:
                         "inflight_before": before_inflight,
                         "inflight_after": before_inflight,
                         "waited_sec": waited_sec,
+                        "retry_count": 0,
                     }
                     ec.logger.warning("[SUMMARY AI ENTRY BRIDGE] run_entry_pipeline blocked by lock timeout %s", out)
                     return out
 
                 result = old_run(*args, **kwargs)
+                retry_count = 0
 
-                if isinstance(result, dict):
-                    result.setdefault("waited_sec", waited_sec)
-                    return result
-                if isinstance(result, bool):
-                    return {
-                        "executed": bool(result),
-                        "approved_count": 1 if result else 0,
-                        "result": result,
-                        "skip_reason": None if result else "entry_controller_no_order",
-                        "waited_sec": waited_sec,
-                    }
+                if _should_retry_after_no_order(ec, is_summary=is_summary, before_pending=before_pending, before_inflight=before_inflight, result=result):
+                    retry_count = 1
+                    retry_wait_ok, retry_waited = _wait_entry_lock_if_needed(
+                        ec,
+                        is_summary=True,
+                        before_pending=before_pending,
+                    )
+                    waited_sec += retry_waited
+                    if retry_wait_ok:
+                        ec.logger.warning(
+                            "[SUMMARY AI ENTRY BRIDGE] retry run_entry_pipeline after no-order/lock-skip pending_before=%s waited_total=%.3fs",
+                            before_pending,
+                            waited_sec,
+                        )
+                        result = old_run(*args, **kwargs)
+                    else:
+                        ec.logger.warning(
+                            "[SUMMARY AI ENTRY BRIDGE] retry skipped because lock timeout pending_before=%s waited_total=%.3fs",
+                            before_pending,
+                            waited_sec,
+                        )
 
-                after_root, after_pending = _snapshot_pending_count(ec)
-                after_inflight = _inflight_count(ec)
-                pending_decreased = after_pending < before_pending
-                inflight_increased = after_inflight > before_inflight
-                executed = bool(pending_decreased or inflight_increased)
-                approved_count = max(0, before_pending - after_pending, after_inflight - before_inflight)
-
-                # ロック待ちをしたのに pending が残ったままなら、原因が見えるようにする。
-                skip_reason = None if executed else "entry_controller_no_order"
-                if not executed and is_summary and waited_sec > 0:
-                    skip_reason = "entry_controller_no_order_after_lock_wait"
-
-                out = {
-                    "executed": executed,
-                    "approved_count": approved_count,
-                    "result": result,
-                    "skip_reason": skip_reason,
-                    "pending_before": before_root,
-                    "pending_after": after_root,
-                    "pending_count_before": before_pending,
-                    "pending_count_after": after_pending,
-                    "inflight_before": before_inflight,
-                    "inflight_after": after_inflight,
-                    "waited_sec": waited_sec,
-                }
+                out = _normalize_run_result(
+                    ec,
+                    result,
+                    before_root=before_root,
+                    before_pending=before_pending,
+                    before_inflight=before_inflight,
+                    waited_sec=waited_sec,
+                    is_summary=is_summary,
+                    retry_count=retry_count,
+                )
                 ec.logger.info("[SUMMARY AI ENTRY BRIDGE] run_entry_pipeline return normalized %s", out)
                 return out
 
+            _run_entry_pipeline_patched._summary_ai_return_bridge_v12 = True  # type: ignore[attr-defined]
             _run_entry_pipeline_patched._summary_ai_return_bridge_v11 = True  # type: ignore[attr-defined]
             _run_entry_pipeline_patched._summary_ai_return_bridge = True  # type: ignore[attr-defined]
             _run_entry_pipeline_patched._original_run_entry_pipeline = old_run  # type: ignore[attr-defined]
             ec.run_entry_pipeline = _run_entry_pipeline_patched
             logger.warning(
-                "[SUMMARY AI ENTRY BRIDGE] run_entry_pipeline return/lock-wait wrapper installed wait_sec=%.3f poll=%.3f",
+                "[SUMMARY AI ENTRY BRIDGE] run_entry_pipeline return/lock-wait/retry wrapper installed wait_sec=%.3f poll=%.3f retry=%s",
                 _env_float("SUMMARY_AI_ENTRY_CONTROLLER_LOCK_WAIT_SEC", 8.0),
                 _env_float("SUMMARY_AI_ENTRY_CONTROLLER_LOCK_POLL_SEC", 0.25),
+                _env_bool("SUMMARY_AI_ENTRY_CONTROLLER_RETRY_AFTER_SKIP", True),
             )
     except Exception:
         logger.exception("[SUMMARY AI ENTRY BRIDGE] run wrapper install failed")
         return False
 
     _PATCHED = True
-    logger.warning("[SUMMARY AI ENTRY BRIDGE] installed v1.1")
+    logger.warning("[SUMMARY AI ENTRY BRIDGE] installed v1.2")
     return True
 
 
