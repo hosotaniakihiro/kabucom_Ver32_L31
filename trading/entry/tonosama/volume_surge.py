@@ -1,18 +1,15 @@
 # ============================================================
 # File   : trading/entry/tonosama/volume_surge.py
-# Version: Ver1.1-TONOSAMA-VOLUME-SURGE-HISTORY-UNAVAILABLE-FAILOPEN
+# Version: Ver1.2-TONOSAMA-VOLUME-SURGE-NO-BULK-FAILOPEN
 # ------------------------------------------------------------
 # 目的:
 #   殿様エントリー用の出来高急増・価格変化特徴量を作る。
 #
-# Ver1.1:
-#   - main.py側の merged summary が最新1本/銘柄だけの場合、
-#     shift(1).rolling() で prev5_volume_avg が作れず、
-#     _max_volume_surge_ratio が全件 None になる。
-#   - その結果、一次フィルタ volume_surge_low で全件落ちる問題を修正。
-#   - 履歴不足で出来高急増率が計算不能な場合は、
-#     TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE 既定2.0で fail-open。
-#   - 価格変化率が計算不能な場合は、open→close の変化率で補完。
+# Ver1.2:
+#   - 履歴不足時に volume_surge_ratio を全件 2.0 にする fail-open を廃止
+#   - 全銘柄が「出来高急増扱い」になり、動いていない銘柄まで候補化する問題を防ぐ
+#   - 価格変化がある行だけ open→close で補完し、出来高急増は 0/NaN のまま扱う
+#   - 必要な場合のみ TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING=1 で旧挙動へ戻せる
 # ============================================================
 
 from __future__ import annotations
@@ -44,7 +41,12 @@ def _env_bool(name: str, default: bool = True) -> bool:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
             return bool(default)
-        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
+            return False
+        return bool(default)
     except Exception:
         return bool(default)
 
@@ -101,7 +103,6 @@ def add_volume_surge_features(df: pd.DataFrame, *, interval: int) -> pd.DataFram
     x[price_chg_col] = ((x["close"] - x[prev_close_col]) / x[prev_close_col].replace(0, pd.NA) * 100.0)
     x[price_chg_col] = pd.to_numeric(x[price_chg_col], errors="coerce").replace([float("inf"), -float("inf")], pd.NA)
 
-    # 履歴不足の場合、open→close のバー内変化率で補完する。
     if x[price_chg_col].isna().all():
         fallback_chg = _intrabar_price_change_pct(x, interval)
         if fallback_chg.notna().any():
@@ -127,7 +128,6 @@ def add_volume_surge_features(df: pd.DataFrame, *, interval: int) -> pd.DataFram
 
 
 def _ensure_open_close_aliases(out: pd.DataFrame) -> pd.DataFrame:
-    """1m側のopen/high/low/close aliasを整える。"""
     if out is None or out.empty:
         return pd.DataFrame()
     x = out.copy()
@@ -145,10 +145,13 @@ def _fallback_price_change_from_1m(out: pd.DataFrame) -> pd.Series:
         return pd.Series(pd.NA, index=out.index if out is not None else None, dtype="float64")
 
 
-def _apply_history_unavailable_failopen(out: pd.DataFrame) -> pd.DataFrame:
+def _apply_history_unavailable_policy(out: pd.DataFrame) -> pd.DataFrame:
     """
-    merged summaryが最新1本だけの場合、3m/5mのprev5平均が作れない。
-    その場合に volume_surge が全件Noneで全落ちしないようにする。
+    3m/5m履歴不足時の扱い。
+
+    旧版は全件 fail-open で volume_surge_ratio=2.0 にしたが、
+    それにより「全銘柄が出来高急増」に見えてしまう。
+    既定では fail-open せず、ratio は 0 扱いにする。
     """
     if out is None or out.empty:
         return pd.DataFrame()
@@ -160,22 +163,33 @@ def _apply_history_unavailable_failopen(out: pd.DataFrame) -> pd.DataFrame:
     for c in ratio_cols + price_cols:
         x[c] = pd.to_numeric(x[c], errors="coerce").replace([float("inf"), -float("inf")], pd.NA)
 
-    failopen_enabled = _env_bool("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING", True)
+    failopen_enabled = _env_bool("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING", False)
     failopen_value = _env_float("TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE", 2.0)
 
     if ratio_cols:
         ratio_df = x[ratio_cols]
         ratio_missing_all = ratio_df.isna().all(axis=1)
-        if failopen_enabled and bool(ratio_missing_all.any()):
-            for c in ratio_cols:
-                x.loc[ratio_missing_all, c] = failopen_value
-            x.loc[ratio_missing_all, "_volume_surge_failopen"] = True
-            logger.warning(
-                "[TONOSAMA SURGE] volume_surge fail-open because history unavailable rows=%s ratio_cols=%s value=%.3f",
-                int(ratio_missing_all.sum()),
-                ratio_cols,
-                failopen_value,
-            )
+        if bool(ratio_missing_all.any()):
+            x.loc[ratio_missing_all, "_volume_surge_history_missing"] = True
+            if failopen_enabled:
+                for c in ratio_cols:
+                    x.loc[ratio_missing_all, c] = failopen_value
+                x.loc[ratio_missing_all, "_volume_surge_failopen"] = True
+                logger.warning(
+                    "[TONOSAMA SURGE] volume_surge fail-open enabled rows=%s ratio_cols=%s value=%.3f",
+                    int(ratio_missing_all.sum()),
+                    ratio_cols,
+                    failopen_value,
+                )
+            else:
+                for c in ratio_cols:
+                    x.loc[ratio_missing_all, c] = 0.0
+                x.loc[ratio_missing_all, "_volume_surge_failopen"] = False
+                logger.warning(
+                    "[TONOSAMA SURGE] volume_surge history missing -> no fail-open rows=%s ratio_cols=%s value=0.0",
+                    int(ratio_missing_all.sum()),
+                    ratio_cols,
+                )
 
     if price_cols:
         price_df = x[price_cols]
@@ -192,6 +206,9 @@ def _apply_history_unavailable_failopen(out: pd.DataFrame) -> pd.DataFrame:
                     price_cols,
                     int(fallback_1m.notna().sum()),
                 )
+            else:
+                for c in price_cols:
+                    x.loc[price_missing_all, c] = 0.0
 
     return x
 
@@ -226,7 +243,7 @@ def build_scalping_feature_df() -> pd.DataFrame:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
 
-    out = _apply_history_unavailable_failopen(out)
+    out = _apply_history_unavailable_policy(out)
     if out.empty:
         return pd.DataFrame()
 
@@ -251,16 +268,19 @@ def build_scalping_feature_df() -> pd.DataFrame:
         out["_surge_tf"] = "5m"
 
     try:
+        failopen_col = out.get("_volume_surge_failopen", pd.Series(False, index=out.index)).fillna(False).astype(bool)
+        history_missing_col = out.get("_volume_surge_history_missing", pd.Series(False, index=out.index)).fillna(False).astype(bool)
         logger.warning(
-            "[TONOSAMA SURGE] feature summary rows=%s vol_cols=%s price_cols=%s volume_surge_nonzero=%s price_change_nonzero=%s failopen_rows=%s price_fallback_rows=%s head=%s",
+            "[TONOSAMA SURGE] feature summary rows=%s vol_cols=%s price_cols=%s volume_surge_nonzero=%s price_change_nonzero=%s history_missing_rows=%s failopen_rows=%s price_fallback_rows=%s head=%s",
             len(out),
             vol_cols,
             price_cols,
             int((out["_max_volume_surge_ratio"].fillna(0) != 0).sum()),
             int((out["_max_price_change_pct"].fillna(0) != 0).sum()),
-            int(out.get("_volume_surge_failopen", pd.Series(False, index=out.index)).fillna(False).astype(bool).sum()),
+            int(history_missing_col.sum()),
+            int(failopen_col.sum()),
             int(out.get("_price_change_fallback_1m", pd.Series(False, index=out.index)).fillna(False).astype(bool).sum()),
-            out[[c for c in ["symbol", "symbolname", "close", "_max_volume_surge_ratio", "_max_price_change_pct", "_surge_tf", "_volume_surge_failopen", "_price_change_fallback_1m"] if c in out.columns]].head(12).to_dict("records"),
+            out[[c for c in ["symbol", "symbolname", "close", "_max_volume_surge_ratio", "_max_price_change_pct", "_surge_tf", "_volume_surge_history_missing", "_volume_surge_failopen", "_price_change_fallback_1m"] if c in out.columns]].head(12).to_dict("records"),
         )
     except Exception:
         logger.debug("[TONOSAMA SURGE] feature summary log failed", exc_info=True)
