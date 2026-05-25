@@ -10,7 +10,7 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.14-MAIN-FAST-OPTIONAL-LIGHT-MODE
+# Version: Ver38.15-SUMMARY-AI-ENTRY-BRIDGE
 # ------------------------------------------------------------
 # ✔ PROJECT_ROOT を最初に sys.path へ追加
 # ✔ core.logging.console_tee を確実に import / setup
@@ -25,6 +25,7 @@
 # ✔ 板取得リトライ patch を起動時install（4.5秒 + 0.3秒追加確認）
 # ✔ 板が食われているのに株価が止まる場合の反転警戒EXITを起動時install
 # ✔ 発注直前に entry_row の 1m/3m/5m slope と MTF/ranking を補完
+# ✔ SUMMARY AI が AI_OK 済みの候補を entry_controller で再AI落ち/None戻り値誤判定させない bridge patch を起動時install
 # ✔ EXIT scheduler を run_exit_pipeline で1秒ごとに登録
 # ✔ main.py 側の scheduler / realtime / position_sync / push_monitor 生存証跡を heartbeat DB に保存
 # ✔ main.py のサマリー計算結果はENTRY判定専用。正式なsummary DB保存は main_database.py 側へ寄せる
@@ -234,6 +235,7 @@ def _install_main_runtime_patches():
         ("core.startup.final_entry_safety_guard_patch", "install"),
         ("core.startup.summary_ai_more_candidates_patch", "install"),
         ("core.startup.entry_order_mtf_slope_fill_patch", "install"),
+        ("core.startup.summary_ai_entry_controller_bridge_patch", "install"),
         ("core.startup.board_retry_patch", "install"),
         ("core.startup.board_wall_stall_exit_patch", "install"),
     ]
