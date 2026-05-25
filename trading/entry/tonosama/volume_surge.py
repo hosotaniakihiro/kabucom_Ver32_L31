@@ -1,15 +1,16 @@
 # ============================================================
 # File   : trading/entry/tonosama/volume_surge.py
-# Version: Ver1.2-TONOSAMA-VOLUME-SURGE-NO-BULK-FAILOPEN
+# Version: Ver1.3-TONOSAMA-VOLUME-SURGE-HISTORY-REQUIRED
 # ------------------------------------------------------------
 # 目的:
 #   殿様エントリー用の出来高急増・価格変化特徴量を作る。
 #
-# Ver1.2:
-#   - 履歴不足時に volume_surge_ratio を全件 2.0 にする fail-open を廃止
-#   - 全銘柄が「出来高急増扱い」になり、動いていない銘柄まで候補化する問題を防ぐ
-#   - 価格変化がある行だけ open→close で補完し、出来高急増は 0/NaN のまま扱う
-#   - 必要な場合のみ TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING=1 で旧挙動へ戻せる
+# Ver1.3:
+#   - 3m/5mの出来高履歴が全件不足している場合、既定では殿様候補を空にして早期終了
+#   - volume_surge_ratio=0 の全件を後段runnerへ渡して、volume_surge_lowで全件落とす無駄を削減
+#   - 動いていない銘柄の誤アラート防止を維持
+#   - 必要な場合は TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY=1 で後段へ流せる
+#   - 旧fail-openは TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING=1 の場合のみ
 # ============================================================
 
 from __future__ import annotations
@@ -51,12 +52,6 @@ def _env_bool(name: str, default: bool = True) -> bool:
         return bool(default)
 
 
-def _num(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
-    if df is None or df.empty or col not in df.columns:
-        return pd.Series(default, index=df.index if df is not None else None, dtype="float64")
-    return pd.to_numeric(df[col], errors="coerce")
-
-
 def _first_existing(df: pd.DataFrame, names: list[str]) -> str | None:
     for n in names:
         if n in df.columns:
@@ -65,7 +60,6 @@ def _first_existing(df: pd.DataFrame, names: list[str]) -> str | None:
 
 
 def _intrabar_price_change_pct(df: pd.DataFrame, interval: int) -> pd.Series:
-    """prev_close が無いとき、open→close のバー内変化率で補完する。"""
     try:
         close_col = _first_existing(df, [f"close_{interval}m", "close", "close_price", "current_price", "price"])
         open_col = _first_existing(df, [f"open_{interval}m", "open", "open_price"])
@@ -146,13 +140,6 @@ def _fallback_price_change_from_1m(out: pd.DataFrame) -> pd.Series:
 
 
 def _apply_history_unavailable_policy(out: pd.DataFrame) -> pd.DataFrame:
-    """
-    3m/5m履歴不足時の扱い。
-
-    旧版は全件 fail-open で volume_surge_ratio=2.0 にしたが、
-    それにより「全銘柄が出来高急増」に見えてしまう。
-    既定では fail-open せず、ratio は 0 扱いにする。
-    """
     if out is None or out.empty:
         return pd.DataFrame()
 
@@ -255,6 +242,17 @@ def build_scalping_feature_df() -> pd.DataFrame:
 
     out["_max_volume_surge_ratio"] = pd.to_numeric(out["_max_volume_surge_ratio"], errors="coerce").fillna(0.0)
     out["_max_price_change_pct"] = pd.to_numeric(out["_max_price_change_pct"], errors="coerce").fillna(0.0)
+
+    history_missing = out.get("_volume_surge_history_missing", pd.Series(False, index=out.index)).fillna(False).astype(bool)
+    failopen_col = out.get("_volume_surge_failopen", pd.Series(False, index=out.index)).fillna(False).astype(bool)
+    allow_without_history = _env_bool("TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY", False)
+    if bool(history_missing.all()) and not bool(failopen_col.any()) and not allow_without_history:
+        logger.warning(
+            "[TONOSAMA SURGE] all rows missing volume surge history -> return empty rows=%s reason=require_surge_history allow_without_history=%s",
+            len(out),
+            allow_without_history,
+        )
+        return pd.DataFrame()
 
     out["_surge_tf"] = ""
     if "volume_surge_ratio_3m" in out.columns and "volume_surge_ratio_5m" in out.columns:
