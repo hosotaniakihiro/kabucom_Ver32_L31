@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/tonosama/config.py
-# Version: Ver1.2-TONOSAMA-ENTRY-CONFIG-REALISTIC-PRICE-CHANGE
+# Version: Ver1.3-TONOSAMA-FLAT-MOVEMENT-GUARD
 # ------------------------------------------------------------
 # Ver1.2:
 #   - 固定値を環境変数対応
@@ -12,6 +12,11 @@
 #       price_change_low threshold=0.6 により全件落ち。
 #       実データでは 4506=0.033%, 6779=0.119% 程度だったため、
 #       0.6%は殿様15秒監視には厳しすぎる。
+#
+# Ver1.3:
+#   - 「全然動いていない銘柄」に殿様アラートが出る問題を防ぐため、
+#     1分足の実体値動き・高安値幅・直近出来高の下限を追加。
+#   - 出来高急増率が履歴不足で fail-open しても、実際の値動きが小さい銘柄は落とす。
 # ============================================================
 
 from __future__ import annotations
@@ -63,8 +68,17 @@ MIN_RAW_SCORE = _env_float("TONOSAMA_MIN_RAW_SCORE", 0.01)
 MIN_VOLUME_SURGE_RATIO = _env_float("TONOSAMA_MIN_VOLUME_SURGE_RATIO", 2.0)
 
 # 以前の 0.6% は15秒/1〜5分スキャルピングでは厳しすぎる。
-# 例: 6779=0.119856%, 4506=0.033113% が全落ちしていたため、既定0.03%。
+# Ver1.3では、これ単独ではなく実体値動き/高安値幅も追加で見る。
 MIN_PRICE_CHANGE_PCT = _env_float("TONOSAMA_MIN_PRICE_CHANGE_PCT", 0.03)
+
+# Ver1.3: 止まっている銘柄のアラート抑止。
+# - 1分足の open→close 実体変化率が最低 0.05% 以上
+# - 1分足の high-low 値幅率が最低 0.10% 以上
+# - 直近1分出来高が最低 3,000 株以上
+# これらは「出来高急増率 fail-open」より後段で必ず効かせる。
+MIN_BODY_CHANGE_PCT = _env_float("TONOSAMA_MIN_BODY_CHANGE_PCT", 0.05)
+MIN_INTRABAR_RANGE_PCT = _env_float("TONOSAMA_MIN_INTRABAR_RANGE_PCT", 0.10)
+MIN_LATEST_VOLUME = _env_float("TONOSAMA_MIN_LATEST_VOLUME", 3000.0)
 
 VOLUME_AVG_LOOKBACK_BARS = _env_int("TONOSAMA_VOLUME_AVG_LOOKBACK_BARS", 5)
 
