@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/summary_display_label_guard_patch.py
-# Version: V1.1-DISCORD-SUMMARY-SOURCE-AND-TIME
+# Version: V1.2-POSITIONAL-DF-SWAP-FIX
 # ------------------------------------------------------------
 # 【目的】
 #   SUMMARY表示で interval_label に DataFrame が誤って渡り、
@@ -12,13 +12,20 @@
 #   PUSH由来サマリーかランキング由来サマリーかを明示する。
 #   さらに、そのTOP10がどの時刻のサマリー結果かを明示する。
 #
+# 【重要修正 V1.2】
+#   一部呼び出し元が display_summary(interval_label, df) の順で呼んでいる。
+#   旧版は第2引数の DataFrame を単に "-" に置換していたため、
+#   本来の summary_df を失い、BUY/SELL が常に no candidates になり得た。
+#   V1.2 では DataFrame を捨てず、(df, label) の正しい順に入れ替える。
+#
 # 【方針】
 #   - scheduler_jobs.summary.display の公開表示関数を薄くwrapする。
 #   - interval_label が DataFrame / Series / dict / list / tuple の場合は表示名として使わない。
+#   - positional が (label, DataFrame) の場合は (DataFrame, label) に補正する。
+#   - positional が (DataFrame, DataFrame) の場合のみ第2引数を安全なラベルへ補正する。
 #   - kwargs の interval があれば "3min" のように復元する。
 #   - それも無ければ "-" にする。
 #   - 表示だけの修正で、エントリー判定・AI判定・DB保存には触らない。
-#   - Discord専用TOP10生成関数もwrapし、BUY/SELL見出しに由来と結果時刻を出す。
 # ============================================================
 
 from __future__ import annotations
@@ -49,6 +56,36 @@ def _looks_bad_label(v: Any) -> bool:
         return False
     except Exception:
         return True
+
+
+def _is_df_like(v: Any) -> bool:
+    try:
+        return isinstance(v, pd.DataFrame)
+    except Exception:
+        return False
+
+
+def _is_label_like(v: Any) -> bool:
+    try:
+        if v is None:
+            return False
+        if _looks_bad_label(v):
+            return False
+        s = str(v).strip()
+        if not s:
+            return False
+        return len(s) <= 80
+    except Exception:
+        return False
+
+
+def _label_from_any(v: Any, default: str = "-") -> str:
+    try:
+        if _is_label_like(v):
+            return str(v).strip()
+    except Exception:
+        pass
+    return default
 
 
 def _label_from_kwargs(kwargs: dict[str, Any], default: str = "-") -> str:
@@ -82,8 +119,25 @@ def _normalize_args_kwargs(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tup
             kw.get("interval_label"),
         )
 
-    # 第2 positional が interval_label の関数用。ここにDataFrameが入る事故を補正。
-    if len(args_l) >= 2 and _looks_bad_label(args_l[1]):
+    # よくある事故: display_summary(interval_label, df)
+    # 第2 positional が DataFrame で、第1 positional がラベルらしい場合は、DataFrameを捨てずに順序を直す。
+    if len(args_l) >= 2 and _is_df_like(args_l[1]) and not _is_df_like(args_l[0]):
+        old0_type = type(args_l[0]).__name__
+        old1_type = type(args_l[1]).__name__
+        label = _label_from_any(args_l[0], _label_from_kwargs(kw, default="-"))
+        args_l[0], args_l[1] = args_l[1], label
+        logger.warning(
+            "[SUMMARY DISPLAY LABEL GUARD] swapped positional summary_df/interval_label old0_type=%s old1_type=%s new_label=%s rows=%s",
+            old0_type,
+            old1_type,
+            label,
+            len(args_l[0]) if hasattr(args_l[0], "__len__") else "-",
+        )
+        return tuple(args_l), kw
+
+    # 第1 positional が DataFrame で、第2 positional も DataFrame などの壊れたラベルの場合のみ、
+    # 本体dfは保持し、第2引数だけ安全な表示ラベルに補正する。
+    if len(args_l) >= 2 and _is_df_like(args_l[0]) and _looks_bad_label(args_l[1]):
         old_type = type(args_l[1]).__name__
         args_l[1] = _label_from_kwargs(kw, default="-")
         logger.warning(
@@ -98,13 +152,14 @@ def _normalize_args_kwargs(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tup
 def _wrap(fn: Any, name: str):
     if not callable(fn):
         return fn
-    if getattr(fn, "_summary_display_label_guard_v1", False):
+    if getattr(fn, "_summary_display_label_guard_v12", False):
         return fn
 
     def _wrapped(*args: Any, **kwargs: Any):
         a, kw = _normalize_args_kwargs(args, kwargs)
         return fn(*a, **kw)
 
+    _wrapped._summary_display_label_guard_v12 = True  # type: ignore[attr-defined]
     _wrapped._summary_display_label_guard_v1 = True  # type: ignore[attr-defined]
     _wrapped._original = fn  # type: ignore[attr-defined]
     _wrapped.__name__ = getattr(fn, "__name__", name)
@@ -204,9 +259,10 @@ def _patched_collect_discord_top10_sections(
 def _patch_discord_top10_sections(disp: Any) -> bool:
     try:
         old = getattr(disp, "_collect_discord_top10_sections", None)
-        if getattr(old, "_summary_display_source_time_v1", False):
+        if getattr(old, "_summary_display_source_time_v12", False):
             return True
 
+        _patched_collect_discord_top10_sections._summary_display_source_time_v12 = True  # type: ignore[attr-defined]
         _patched_collect_discord_top10_sections._summary_display_source_time_v1 = True  # type: ignore[attr-defined]
         _patched_collect_discord_top10_sections._original = old  # type: ignore[attr-defined]
         setattr(disp, "_collect_discord_top10_sections", _patched_collect_discord_top10_sections)
@@ -253,7 +309,7 @@ def install() -> bool:
 
     _PATCHED = bool(patched) or bool(discord_patched)
     logger.warning(
-        "[SUMMARY DISPLAY LABEL GUARD] installed=%s patched=%s discord_source_time=%s",
+        "[SUMMARY DISPLAY LABEL GUARD] installed=%s version=V1.2 patched=%s discord_source_time=%s",
         _PATCHED,
         patched,
         discord_patched,
