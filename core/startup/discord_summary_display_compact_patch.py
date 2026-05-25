@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/discord_summary_display_compact_patch.py
-# Version: V1.1-COMPACT-DISCORD-SUMMARY-DISPLAY-SEND-1MIN-DEFAULT
+# Version: V1.2-COMPACT-DISCORD-SUMMARY-DISPLAY-FORCE-PUSH-1MIN
 # ------------------------------------------------------------
 # 目的:
 #   Discordへ送信されるサマリー表示が横長・桁揃え・日本語銘柄名で崩れる問題を補正する。
@@ -8,15 +8,15 @@
 # 方針:
 #   - Discord専用表示は「縦リスト・短い2行」に統一する。
 #   - 日本語銘柄名の桁揃えをやめる。
-#   - PUSH由来サマリーは 1分 / 3分 / 5分 をDiscord送信する。
-#   - ランキング由来サマリーの1分抑止は環境変数で制御する。
+#   - PUSH由来サマリーは 1分 / 3分 / 5分 を必ずDiscord送信する。
+#   - ランキング由来サマリーの1分抑止は従来通り環境変数で制御する。
 #   - ENTRY / EXIT 通知や重要アラートは対象外。
 #   - コンソール表示は既存のまま変更しない。
 #
-# V1.1:
-#   - SUMMARY_DISCORD_SEND_1MIN のデフォルトを True に変更
-#   - これにより PUSH由来 SUMMARY TOP10 1min もDiscordへ送る
-#   - 抑止したい場合だけ SUMMARY_DISCORD_SEND_1MIN=0 を設定する
+# V1.2:
+#   - PUSH由来 SUMMARY 1min は環境変数に関係なく送信する
+#   - 旧wrapperが残っていても _original をたどって必ず差し替える
+#   - 起動ログに force_summary_1min=True を出す
 # ============================================================
 
 from __future__ import annotations
@@ -51,8 +51,8 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _send_summary_1min_enabled() -> bool:
-    # PUSH由来は1分/3分/5分を見たいので、1分も既定で送る。
-    return _env_bool("SUMMARY_DISCORD_SEND_1MIN", True)
+    # PUSH由来は 1分/3分/5分を必ず見たいので、1分も常に送る。
+    return True
 
 
 def _send_ranking_summary_1min_enabled() -> bool:
@@ -192,6 +192,19 @@ def _send_to_discord_compact(disp: Any, lines: list[str], title: str | None = No
         logger.exception("[DISCORD SUMMARY COMPACT] send failed")
 
 
+def _unwrap(fn: Any) -> Any:
+    """旧patch wrapperが残っている場合、元関数まで戻してから新wrapperをかける。"""
+    try:
+        seen = set()
+        cur = fn
+        while callable(getattr(cur, "_original", None)) and id(cur) not in seen:
+            seen.add(id(cur))
+            cur = getattr(cur, "_original")
+        return cur
+    except Exception:
+        return fn
+
+
 def install() -> bool:
     global _PATCHED
     if _PATCHED:
@@ -204,13 +217,17 @@ def install() -> bool:
         return False
 
     try:
+        # 念のため環境変数にも明示して、他patchが参照しても1分PUSHを落とさない。
+        os.environ["SUMMARY_DISCORD_SEND_1MIN"] = "1"
+
         old_send = getattr(disp, "_send_to_discord", None)
-        if callable(old_send) and not getattr(old_send, "_discord_compact_patch", False):
+        base_send = _unwrap(old_send)
+        if callable(base_send):
             def _send_to_discord_patched(lines: list[str], title: str | None = None) -> None:
                 return _send_to_discord_compact(disp, lines, title)
 
             _send_to_discord_patched._discord_compact_patch = True  # type: ignore[attr-defined]
-            _send_to_discord_patched._original = old_send  # type: ignore[attr-defined]
+            _send_to_discord_patched._original = base_send  # type: ignore[attr-defined]
             disp._send_to_discord = _send_to_discord_patched
 
         def _candidate(i: int, row: Any, *, side: str) -> str:
@@ -223,35 +240,35 @@ def install() -> bool:
         disp._build_discord_ai_candidate_2lines = _ai_candidate
 
         old_print_summary = getattr(disp, "print_summary_top10", None)
-        if callable(old_print_summary) and not getattr(old_print_summary, "_discord_1min_suppress_patch", False):
+        base_print_summary = _unwrap(old_print_summary)
+        if callable(base_print_summary):
             def _print_summary_top10_patched(summary_df, interval_label="1min", *, notify_discord=True, **kwargs):
-                if notify_discord and _is_1min_label(interval_label) and not _send_summary_1min_enabled():
-                    logger.info("[DISCORD SUMMARY COMPACT] suppress 1min SUMMARY discord interval=%s", interval_label)
-                    notify_discord = False
-                return old_print_summary(summary_df, interval_label=interval_label, notify_discord=notify_discord, **kwargs)
+                # PUSH由来SUMMARYは1分も必ず送る。ここでは抑止しない。
+                if notify_discord and _is_1min_label(interval_label):
+                    logger.info("[DISCORD SUMMARY COMPACT] allow 1min SUMMARY discord interval=%s", interval_label)
+                return base_print_summary(summary_df, interval_label=interval_label, notify_discord=notify_discord, **kwargs)
 
-            _print_summary_top10_patched._discord_1min_suppress_patch = True  # type: ignore[attr-defined]
-            _print_summary_top10_patched._original = old_print_summary  # type: ignore[attr-defined]
+            _print_summary_top10_patched._discord_1min_force_patch = True  # type: ignore[attr-defined]
+            _print_summary_top10_patched._original = base_print_summary  # type: ignore[attr-defined]
             disp.print_summary_top10 = _print_summary_top10_patched
 
         old_print_ranking = getattr(disp, "print_ranking_summary_top10", None)
-        if callable(old_print_ranking) and not getattr(old_print_ranking, "_discord_1min_suppress_patch", False):
+        base_print_ranking = _unwrap(old_print_ranking)
+        if callable(base_print_ranking):
             def _print_ranking_summary_top10_patched(summary_df, interval_label="1min", *, notify_discord=True, **kwargs):
                 if notify_discord and _is_1min_label(interval_label) and not _send_ranking_summary_1min_enabled():
                     logger.info("[DISCORD SUMMARY COMPACT] suppress 1min RANKING SUMMARY discord interval=%s", interval_label)
                     notify_discord = False
-                return old_print_ranking(summary_df, interval_label=interval_label, notify_discord=notify_discord, **kwargs)
+                return base_print_ranking(summary_df, interval_label=interval_label, notify_discord=notify_discord, **kwargs)
 
             _print_ranking_summary_top10_patched._discord_1min_suppress_patch = True  # type: ignore[attr-defined]
-            _print_ranking_summary_top10_patched._original = old_print_ranking  # type: ignore[attr-defined]
+            _print_ranking_summary_top10_patched._original = base_print_ranking  # type: ignore[attr-defined]
             disp.print_ranking_summary_top10 = _print_ranking_summary_top10_patched
 
         _PATCHED = True
         logger.warning(
-            "[DISCORD SUMMARY COMPACT] installed compact_display=True suppress_summary_1min=%s suppress_ranking_1min=%s send_summary_1min=%s send_ranking_1min=%s",
-            not _send_summary_1min_enabled(),
+            "[DISCORD SUMMARY COMPACT] installed compact_display=True force_summary_1min=True suppress_summary_1min=False suppress_ranking_1min=%s send_summary_1min=True send_ranking_1min=%s",
             not _send_ranking_summary_1min_enabled(),
-            _send_summary_1min_enabled(),
             _send_ranking_summary_1min_enabled(),
         )
         return True
