@@ -1,20 +1,24 @@
 # ============================================================
 # File   : core/startup/entry_direction_failopen_runtime_patch.py
-# Version: Ver03-BIDIRECTIONAL-TREND-SAFETY
+# Version: Ver04-REVERSE-AGAINST-CLEAR-TREND
 # ------------------------------------------------------------
 # SUMMARY_AI の方向確認ガードで RecursionError / pure guard False が出た場合の runtime patch。
 #
-# Ver03 重要修正:
-#   - 上昇トレンドでSELLを禁止
-#   - 下降トレンドでBUYを禁止
-#   - 元の方向確認がOKでも、明確に逆トレンドなら止める
-#   - fail-open は「トレンドに逆らわない場合のみ」許可
+# Ver04:
+#   - pure guard 側で recursion detected -> NG になった場合でも、
+#     SUMMARY_AI 候補を即ブロックせず、明確な逆トレンドなら side を反転して通す。
+#   - SELL候補なのに上昇トレンドが明確: SELL -> BUY に反転
+#   - BUY候補なのに下降トレンドが明確: BUY -> SELL に反転
+#   - 反転した場合は direction_safety_reversed / original_side / reverse_reason を行に付与
+#   - 反転できない場合だけ従来どおりブロックまたは fail-open 判定
 #
 # ENV:
 #   ENTRY_DIRECTION_FAILOPEN_FOR_SUMMARY_AI_BUY=1
 #   ENTRY_DIRECTION_FAILOPEN_FOR_SUMMARY_AI_SELL=1
 #   ENTRY_BLOCK_SELL_IN_BULLISH_TREND=1
 #   ENTRY_BLOCK_BUY_IN_BEARISH_TREND=1
+#   ENTRY_DIRECTION_REVERSE_AGAINST_CLEAR_TREND=1
+#   ENTRY_DIRECTION_REVERSE_HALF_SIZE=1
 #   ENTRY_TREND_BLOCK_MIN_POINTS=2
 # ============================================================
 
@@ -78,6 +82,19 @@ def _row_to_dict(row: Any) -> dict:
         return {}
 
 
+def _set_row_value(row: Any, key: str, value: Any) -> None:
+    try:
+        if row is None:
+            return
+        if isinstance(row, dict):
+            row[key] = value
+            return
+        if hasattr(row, "__setitem__"):
+            row[key] = value
+    except Exception:
+        return
+
+
 def _first(d: dict, keys: tuple[str, ...], default: Any = None) -> Any:
     for k in keys:
         try:
@@ -106,7 +123,21 @@ def _symbol(row: Any) -> str:
 
 def _side(row: Any) -> str:
     d = _row_to_dict(row)
-    return str(d.get("side") or d.get("entry_decision") or d.get("ai_side") or "").upper()
+    s = str(d.get("side") or d.get("entry_decision") or d.get("ai_side") or "").strip().upper()
+    if s in {"1", "SELL", "SHORT", "売", "売り"}:
+        return "SELL"
+    if s in {"2", "BUY", "LONG", "買", "買い"}:
+        return "BUY"
+    return s
+
+
+def _opposite_side(side: str) -> str:
+    side = str(side or "").upper()
+    if side == "SELL":
+        return "BUY"
+    if side == "BUY":
+        return "SELL"
+    return side
 
 
 def _trend_diag(row: Any) -> dict[str, Any]:
@@ -217,6 +248,52 @@ def _allow_failopen_for_side(row: Any) -> bool:
     return False
 
 
+def _reverse_against_trend(row: Any, reason: str, against_reason: str, diag: dict[str, Any]) -> bool:
+    if not _env_bool("ENTRY_DIRECTION_REVERSE_AGAINST_CLEAR_TREND", True):
+        return False
+
+    if not _is_summary_ai(row):
+        return False
+
+    old_side = _side(row)
+    new_side = _opposite_side(old_side)
+    if new_side not in {"BUY", "SELL"} or new_side == old_side:
+        return False
+
+    symbol = _symbol(row)
+    _set_row_value(row, "original_side", old_side)
+    _set_row_value(row, "side", new_side)
+    _set_row_value(row, "entry_decision", new_side)
+    _set_row_value(row, "ai_side", new_side)
+    _set_row_value(row, "direction_safety_reversed", True)
+    _set_row_value(row, "reverse_reason", against_reason)
+    _set_row_value(row, "reverse_source_reason", reason)
+    _set_row_value(row, "direction_safety_diag", str(diag))
+
+    if _env_bool("ENTRY_DIRECTION_REVERSE_HALF_SIZE", True):
+        # 逆方向に切り替える場合は安全側で半ロット指定を付ける。
+        # 実数量計算側が未対応でも、既存キーを壊さない。
+        for key in ("lot_multiplier", "qty_multiplier"):
+            try:
+                cur = _safe_float(_row_to_dict(row).get(key), 1.0)
+                if cur > 0:
+                    _set_row_value(row, key, max(0.5, cur * 0.5))
+            except Exception:
+                pass
+        _set_row_value(row, "reverse_half_size", True)
+
+    logger.warning(
+        "[ENTRY DIRECTION SAFETY] REVERSE symbol=%s %s->%s against=%s reason=%s diag=%s",
+        symbol,
+        old_side,
+        new_side,
+        against_reason,
+        reason,
+        diag,
+    )
+    return True
+
+
 def _maybe_failopen(row: Any, reason: str) -> bool:
     side = _side(row)
     symbol = _symbol(row)
@@ -226,6 +303,8 @@ def _maybe_failopen(row: Any, reason: str) -> bool:
 
     against, against_reason, diag = _against_clear_trend(row)
     if against:
+        if _reverse_against_trend(row, reason, against_reason, diag):
+            return True
         logger.warning(
             "[ENTRY DIRECTION SAFETY] BLOCK %s symbol=%s side=%s reason=%s diag=%s",
             against_reason,
@@ -265,6 +344,8 @@ def _patched_check_entry_direction_confirm(entry_row: Any = None, *args, **kwarg
         if ok:
             against, against_reason, diag = _against_clear_trend(entry_row)
             if _is_summary_ai(entry_row) and against:
+                if _reverse_against_trend(entry_row, "original_guard_ok_but_against_trend", against_reason, diag):
+                    return True
                 logger.warning(
                     "[ENTRY DIRECTION SAFETY] BLOCK despite original OK %s symbol=%s side=%s diag=%s",
                     against_reason,
@@ -294,21 +375,23 @@ def install() -> bool:
         from core.startup import entry_direction_confirm_guard_patch as ed
 
         cur = getattr(ed, "check_entry_direction_confirm", None)
-        if getattr(cur, "_entry_direction_failopen_patch_v3", False):
+        if getattr(cur, "_entry_direction_failopen_patch_v4", False):
             _INSTALLED = True
             return True
 
         _ORIG_CHECK = cur
-        _patched_check_entry_direction_confirm._entry_direction_failopen_patch_v3 = True  # type: ignore[attr-defined]
+        _patched_check_entry_direction_confirm._entry_direction_failopen_patch_v4 = True  # type: ignore[attr-defined]
         ed.check_entry_direction_confirm = _patched_check_entry_direction_confirm
 
         _INSTALLED = True
         logger.warning(
-            "[ENTRY DIRECTION SAFETY] installed v3 buy_failopen=%s sell_failopen=%s block_sell_bullish=%s block_buy_bearish=%s min_points=%s",
+            "[ENTRY DIRECTION SAFETY] installed v4 buy_failopen=%s sell_failopen=%s block_sell_bullish=%s block_buy_bearish=%s reverse_against_trend=%s reverse_half_size=%s min_points=%s",
             _env_bool("ENTRY_DIRECTION_FAILOPEN_FOR_SUMMARY_AI_BUY", True),
             _env_bool("ENTRY_DIRECTION_FAILOPEN_FOR_SUMMARY_AI_SELL", True),
             _env_bool("ENTRY_BLOCK_SELL_IN_BULLISH_TREND", True),
             _env_bool("ENTRY_BLOCK_BUY_IN_BEARISH_TREND", True),
+            _env_bool("ENTRY_DIRECTION_REVERSE_AGAINST_CLEAR_TREND", True),
+            _env_bool("ENTRY_DIRECTION_REVERSE_HALF_SIZE", True),
             _env_int("ENTRY_TREND_BLOCK_MIN_POINTS", 2),
         )
         return True
