@@ -3,7 +3,7 @@
 #====================================================================================================
 # ============================================================
 # File   : scheduler_jobs/summary/runner_core.py
-# Version: PRODUCTION-STABLE-SUMMARY-RUNNER-CORE-V1.4-SAVE-OWNER-SPLIT
+# Version: PRODUCTION-STABLE-SUMMARY-RUNNER-CORE-V1.5-ENTRY-BEFORE-DISPLAY
 # ------------------------------------------------------------
 # 【概要】
 #   PUSH / RANKING サマリーの実行本体。
@@ -31,6 +31,11 @@
 #   - DB保存は環境変数 AUTOSTOCK_SUMMARY_SAVE_OWNER で owner を制御
 #   - owner=database の場合、data collector/main_database 側だけ保存
 #   - main.py 側は計算・表示・AI/entryを継続し、DB保存だけskip可能
+#
+# REV1.5:
+#   - 表示/Discord送信が重く、SUMMARY PARALLEL timeout でAI entryまで到達しない問題を修正
+#   - AI entry hook を display より前に実行する
+#   - これにより SUMMARY TOP10 表示やDiscordが遅れても、AI_OK→発注処理を先に進める
 # ============================================================
 
 from __future__ import annotations
@@ -167,6 +172,45 @@ def _save_summary_if_owner(df: pd.DataFrame, interval: int, *, source: str) -> N
         os.getenv("AUTOSTOCK_SUMMARY_SAVE_MODE", ""),
         _is_database_process(),
     )
+
+
+def _run_push_ai_entry_before_display(df: pd.DataFrame, interval: int, now: dt.datetime, run_entry: bool) -> None:
+    """
+    表示/Discord送信より先にAI entryを走らせる。
+    表示処理が重い場合でも、エントリー機会を先に処理するため。
+    """
+    if run_entry and interval in (1, 3, 5):
+        logger.info(
+            "[summary.runners] push AI entry requested before display interval=%s now=%s source=SUMMARY hook=v20",
+            interval,
+            now,
+        )
+        run_summary_ai_entry_safe(interval=interval, now=now, df=df, source="SUMMARY")
+    else:
+        logger.info(
+            "[summary.runners] summary AI entry skipped interval=%s run_entry=%s reason=%s",
+            interval,
+            run_entry,
+            "interval_not_enabled" if interval not in (1, 3, 5) else "run_entry_false",
+        )
+
+
+def _run_ranking_ai_entry_before_display(df: pd.DataFrame, interval: int, now: dt.datetime, run_entry: bool) -> None:
+    if run_entry and interval in (1, 3, 5) and is_market_session(now):
+        logger.info(
+            "[summary.runners] ranking AI entry requested before display interval=%s now=%s source=RANKING hook=v20",
+            interval,
+            now,
+        )
+        run_summary_ai_entry_safe(interval=interval, now=now, df=df, source="RANKING")
+    else:
+        logger.info(
+            "[summary.runners] ranking AI entry skipped interval=%s run_entry=%s in_session=%s reason=%s",
+            interval,
+            run_entry,
+            is_market_session(now),
+            "interval_not_enabled" if interval not in (1, 3, 5) else "run_entry_false_or_closed_market",
+        )
 
 
 # ============================================================
@@ -345,25 +389,13 @@ def job_summary(
     _save_summary_if_owner(df, interval, source="push")
     log_job_result("job_summary(PUSH)", interval, df, meta)
 
+    # REV1.5: エントリー機会を優先するため、表示/Discordより先にAI entryを実行する。
+    _run_push_ai_entry_before_display(df, interval, now, run_entry)
+
     if display:
         display_push_summary_safe(df, interval, now=now)
     else:
         logger.info("[summary.runners] display skipped interval=%s source=push reason=display_false", interval)
-
-    if run_entry and interval in (1, 3, 5):
-        logger.info(
-            "[summary.runners] push AI entry requested interval=%s now=%s source=SUMMARY hook=v20",
-            interval,
-            now,
-        )
-        run_summary_ai_entry_safe(interval=interval, now=now, df=df, source="SUMMARY")
-    else:
-        logger.info(
-            "[summary.runners] summary AI entry skipped interval=%s run_entry=%s reason=%s",
-            interval,
-            run_entry,
-            "interval_not_enabled" if interval not in (1, 3, 5) else "run_entry_false",
-        )
 
     return df
 
@@ -465,26 +497,13 @@ def job_ranking_summary(
     _save_summary_if_owner(df, interval, source="ranking")
     log_job_result("job_ranking_summary(RANKING)", interval, df, meta)
 
+    # REV1.5: RANKING由来もAI entryを表示より先に実行する。
+    _run_ranking_ai_entry_before_display(df, interval, now, run_entry)
+
     if display:
         display_ranking_summary_safe(df, interval, now=now)
     else:
         logger.info("[summary.runners] display skipped interval=%s source=ranking reason=display_false", interval)
-
-    if run_entry and interval in (1, 3, 5) and is_market_session(now):
-        logger.info(
-            "[summary.runners] ranking AI entry requested interval=%s now=%s source=RANKING hook=v20",
-            interval,
-            now,
-        )
-        run_summary_ai_entry_safe(interval=interval, now=now, df=df, source="RANKING")
-    else:
-        logger.info(
-            "[summary.runners] ranking AI entry skipped interval=%s run_entry=%s in_session=%s reason=%s",
-            interval,
-            run_entry,
-            is_market_session(now),
-            "interval_not_enabled" if interval not in (1, 3, 5) else "run_entry_false_or_closed_market",
-        )
 
     return df
 
