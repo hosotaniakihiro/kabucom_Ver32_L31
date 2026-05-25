@@ -10,7 +10,7 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.17-MAIN-LIGHT-SUMMARY-5SEC-FILTER-TUNE
+# Version: Ver38.18-MAIN-DISCORD-KWARG-SAFETY
 # ------------------------------------------------------------
 # ✔ PROJECT_ROOT を最初に sys.path へ追加
 # ✔ core.logging.console_tee を確実に import / setup
@@ -26,7 +26,7 @@
 # ✔ 板が食われているのに株価が止まる場合の反転警戒EXITを起動時install
 # ✔ 発注直前に entry_row の 1m/3m/5m slope と MTF/ranking を補完
 # ✔ SUMMARY AI が AI_OK 済みの候補を entry_controller で再AI落ち/None戻り値誤判定させない bridge patch を起動時install
-# ✔ Discordの横長サマリー表示を縦リスト短文に補正し、1分SUMMARY/RANKING SUMMARY通知を既定停止
+# ✔ Discordの横長サマリー表示を縦リスト短文に補正し、interval kwarg TypeError を防止
 # ✔ EXIT scheduler を run_exit_pipeline で1秒ごとに登録
 # ✔ main.py 側の scheduler / realtime / position_sync / push_monitor 生存証跡を heartbeat DB に保存
 # ✔ main.py のサマリー計算結果はENTRY判定専用。正式なsummary DB保存は main_database.py 側へ寄せる
@@ -257,6 +257,7 @@ def _install_main_runtime_patches():
         ("core.startup.entry_order_mtf_slope_fill_patch", "install"),
         ("core.startup.summary_ai_entry_controller_bridge_patch", "install"),
         ("core.startup.discord_summary_display_compact_patch", "install"),
+        ("core.startup.discord_summary_kwarg_safety_patch", "install"),
         ("core.startup.board_retry_patch", "install"),
         ("core.startup.board_wall_stall_exit_patch", "install"),
     ]
@@ -676,13 +677,13 @@ def main():
     try:
         result = run_force_exit_test()
         logger.info("🧪 run_force_exit_test result=%s", result)
-        heartbeat("main_force_exit_test", status="OK", detail={"result": str(result)[:200]})
+        heartbeat("main_force_exit_test", status="OK", detail={"result": str(result)})
     except Exception:
         heartbeat("main_force_exit_test", status="ERROR")
         logger.exception("run_force_exit_test failed")
 
     logger.info("🚀 MARKET MODE ACTIVE")
-    logger.info("🚀 starting ATS register loop in background")
+    logger.info("🚀 starting ATS register loop")
     Thread(target=ats_register_loop, daemon=True, name="ats_register_loop").start()
     heartbeat("main_ats_register_loop", status="STARTED")
 
