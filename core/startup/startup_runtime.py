@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/startup_runtime.py
-# Version: REV1.5-STARTUP-RUNTIME-SUMMARY-CONTROLLER-READY-MTF
+# Version: REV1.6-STARTUP-RUNTIME-RANKING-ENTRY-FIX
 # ------------------------------------------------------------
 # 【概要】
 #   startup の runtime / engine / migration phase を分離
@@ -14,6 +14,7 @@
 #   - PUSHサマリーが最新1本だけでMACD/MTFを薄くしないよう履歴patchをinstall
 #   - GlobalContext.set_merged_summary 直前にも macd/signal/mtf を履歴復元
 #   - summary_controller before-cache-sync 時点で MTF / technical_ready を補正
+#   - ranking entry の technical fallback / volume表示単位補正をinstall
 # ============================================================
 
 from __future__ import annotations
@@ -146,6 +147,15 @@ def _install_summary_controller_ready_mtf_patch() -> None:
         logger.exception("[STARTUP.RUNTIME] summary controller ready mtf patch install failed")
 
 
+def _install_ranking_entry_runtime_fix_patch() -> None:
+    try:
+        from core.startup.ranking_entry_runtime_fix_patch import install as install_ranking_fix
+        ok = install_ranking_fix()
+        logger.warning("[STARTUP.RUNTIME] ranking entry runtime fix patch installed=%s", ok)
+    except Exception:
+        logger.exception("[STARTUP.RUNTIME] ranking entry runtime fix patch install failed")
+
+
 def _restore_summary_db_seed_after_bootstrap(summary_db_path) -> None:
     try:
         from core.startup.summary_db_seed_restore_patch import restore_summary_db_seed
@@ -157,6 +167,7 @@ def _restore_summary_db_seed_after_bootstrap(summary_db_path) -> None:
     _install_push_summary_history_patch()
     _install_global_context_summary_repair_patch()
     _install_summary_controller_ready_mtf_patch()
+    _install_ranking_entry_runtime_fix_patch()
 
 
 def safe_migration_phase(summary_dir, ranking_dir) -> None:
