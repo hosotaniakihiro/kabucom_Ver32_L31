@@ -1,18 +1,21 @@
 # ============================================================
 # File   : core/startup/summary_ai_async_entry_patch.py
-# Version: Ver02-SUMMARY-AI-ASYNC-ENTRY-QUEUE
+# Version: Ver03-SKIP-STALE-QUEUE-AND-MARKET-CLOSED
 # ------------------------------------------------------------
 # SUMMARY AI の実発注部分を、1分サマリー本体から切り離す runtime patch。
 #
-# Ver02 重要修正:
-#   - 前回実発注中でも async_entry_busy で候補を捨てない
-#   - approved_rows をキューに積み、1本の worker が順番に処理する
-#   - 並列サマリー化後、1m/3m/5m の候補が同時に来ても取りこぼさない
+# Ver03:
+#   - キュー投入時刻を保存し、古い approved_rows は worker 側で捨てる。
+#   - worker 実行時点で market closed / 昼休みなら、重い entry_pipeline を呼ばず即skip。
+#   - 昼休み前に溜まった古いキューが 12:30 後も順番に処理され続け、
+#     最新のAI_OK候補の発注を遅らせる問題を防ぐ。
+#   - worker の処理結果ログに stale / market_closed_worker を明示する。
 #
 # ENV:
 #   SUMMARY_AI_ASYNC_ENTRY=1
-#   SUMMARY_AI_ASYNC_ENTRY_DROP_BUSY=0      # Ver02 default: 捨てない
+#   SUMMARY_AI_ASYNC_ENTRY_DROP_BUSY=0
 #   SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX=20
+#   SUMMARY_AI_ASYNC_ENTRY_STALE_SEC=20
 # ============================================================
 
 from __future__ import annotations
@@ -59,6 +62,16 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
 def _safe_len(v: Any) -> int:
     try:
         return len(v) if v is not None else 0
@@ -95,6 +108,17 @@ def _summarize_result(result: Any) -> dict[str, Any]:
         return {"summary_error": str(e), "result_type": type(result).__name__}
 
 
+def _market_open_now() -> bool:
+    try:
+        from trading.entry.summary_ai import executor as exec_mod
+        is_open = getattr(exec_mod, "is_market_open", None)
+        if callable(is_open):
+            return bool(is_open())
+    except Exception:
+        logger.debug("[SUMMARY AI ASYNC ENTRY] market open check failed", exc_info=True)
+    return True
+
+
 def _run_worker_loop() -> None:
     global _WORKER_RUNNING
     while True:
@@ -110,11 +134,41 @@ def _run_worker_loop() -> None:
         interval = item["interval"]
         approved_rows = item["approved_rows"]
         started = time.time()
+        queued_at = float(item.get("queued_at") or started)
+        age_sec = max(0.0, started - queued_at)
+        stale_sec = _env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 20.0)
+
         try:
+            if stale_sec > 0 and age_sec > stale_sec:
+                logger.warning(
+                    "[SUMMARY AI ASYNC ENTRY] worker skip stale seq=%s interval=%s age=%.3fs stale_sec=%.3fs approved=%s symbols=%s queue_left=%s",
+                    seq,
+                    interval,
+                    age_sec,
+                    stale_sec,
+                    len(approved_rows),
+                    _symbols(approved_rows),
+                    q_left,
+                )
+                continue
+
+            if bool(item.get("require_market_open")) and not _market_open_now():
+                logger.warning(
+                    "[SUMMARY AI ASYNC ENTRY] worker skip market_closed seq=%s interval=%s age=%.3fs approved=%s symbols=%s queue_left=%s",
+                    seq,
+                    interval,
+                    age_sec,
+                    len(approved_rows),
+                    _symbols(approved_rows),
+                    q_left,
+                )
+                continue
+
             logger.warning(
-                "[SUMMARY AI ASYNC ENTRY] worker start seq=%s interval=%s approved=%s symbols=%s queue_left=%s",
+                "[SUMMARY AI ASYNC ENTRY] worker start seq=%s interval=%s age=%.3fs approved=%s symbols=%s queue_left=%s",
                 seq,
                 interval,
+                age_sec,
                 len(approved_rows),
                 _symbols(approved_rows),
                 q_left,
@@ -248,7 +302,6 @@ def _patched_execute_ai_ok_entries_bulk(
                         "result": None,
                         "skip_reason": "async_entry_queue_full",
                     }
-                # 捨てない設定では古いものを1つ落として最新を残す。完全停止防止。
                 dropped = _QUEUE.popleft()
                 logger.warning(
                     "[SUMMARY AI ASYNC ENTRY] queue full; drop oldest seq=%s interval=%s to keep latest",
@@ -261,6 +314,7 @@ def _patched_execute_ai_ok_entries_bulk(
             _QUEUE.append(
                 {
                     "seq": seq,
+                    "queued_at": time.time(),
                     "ai_results": ai_results,
                     "df_summary": df_summary,
                     "interval": interval,
@@ -275,12 +329,13 @@ def _patched_execute_ai_ok_entries_bulk(
         _ensure_worker_started()
 
         logger.warning(
-            "[SUMMARY AI ASYNC ENTRY] queued seq=%s interval=%s approved=%s symbols=%s queue_size=%s",
+            "[SUMMARY AI ASYNC ENTRY] queued seq=%s interval=%s approved=%s symbols=%s queue_size=%s stale_sec=%.3f",
             seq,
             interval,
             len(approved_rows),
             _symbols(approved_rows),
             q_size,
+            _env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 20.0),
         )
 
         return {
@@ -318,12 +373,13 @@ def install() -> bool:
         from trading.entry.summary_ai import runner as runner_mod
 
         current = getattr(exec_mod, "execute_ai_ok_entries_bulk", None)
-        if getattr(current, "_summary_ai_async_entry_patch_v2", False):
+        if getattr(current, "_summary_ai_async_entry_patch_v3", False):
             _INSTALLED = True
-            logger.warning("[SUMMARY AI ASYNC ENTRY] already installed v2")
+            logger.warning("[SUMMARY AI ASYNC ENTRY] already installed v3")
             return True
 
         _ORIG_EXECUTE = current
+        _patched_execute_ai_ok_entries_bulk._summary_ai_async_entry_patch_v3 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_async_entry_patch_v2 = True  # type: ignore[attr-defined]
 
         exec_mod.execute_ai_ok_entries_bulk = _patched_execute_ai_ok_entries_bulk
@@ -331,10 +387,11 @@ def install() -> bool:
 
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY AI ASYNC ENTRY] installed v2 enabled=%s drop_busy=%s queue_max=%s",
+            "[SUMMARY AI ASYNC ENTRY] installed v3 enabled=%s drop_busy=%s queue_max=%s stale_sec=%.3f",
             _env_bool("SUMMARY_AI_ASYNC_ENTRY", True),
             _env_bool("SUMMARY_AI_ASYNC_ENTRY_DROP_BUSY", False),
             _env_int("SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX", 20),
+            _env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 20.0),
         )
         return True
     except Exception as e:
