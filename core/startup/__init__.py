@@ -1,15 +1,15 @@
 # ============================================================
 # File   : core/startup/__init__.py
-# Ver    : PRODUCTION-STABLE-REV21.2-SUMMARY-READY-FILL
+# Ver    : PRODUCTION-STABLE-REV21.3-SOFT-TECHNICAL-READY
 # ------------------------------------------------------------
 # 【概要】
 #   core.startup パッケージの公開入口。
 #   各種 runtime/startup patch を自動適用する。
 #
-# REV21.2:
-#   - summary_runner_ready_fill_before_save_patch を追加
-#   - PUSHサマリーがAI/表示へ渡る前に technical_ready を補完
-#   - summary_scheduler_unified_stale_guard_patch も継続適用
+# REV21.3:
+#   - summary_controller_soft_technical_ready_patch を追加
+#   - 短履歴PUSHサマリーで指標があるのに technical_ready=False 固定になる問題を補正
+#   - summary_runner_ready_fill_before_save_patch も継続適用
 # ============================================================
 
 from __future__ import annotations
@@ -38,6 +38,13 @@ try:
     install_summary_scheduler_unified_stale_guard_patch()
 except Exception:
     logger.exception("[core.startup] summary scheduler unified stale guard patch install failed")
+
+try:
+    from .summary_controller_soft_technical_ready_patch import install as install_summary_controller_soft_technical_ready_patch
+
+    install_summary_controller_soft_technical_ready_patch()
+except Exception:
+    logger.exception("[core.startup] summary controller soft technical ready patch install failed")
 
 try:
     from .summary_runner_ready_fill_before_save_patch import install as install_summary_runner_ready_fill_before_save_patch
