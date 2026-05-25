@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/discord_summary_display_compact_patch.py
-# Version: V1.4-COMPACT-DISCORD-SUMMARY-KWARGS-GUARD
+# Version: V1.5-COMPACT-DISCORD-SUMMARY-STRICT-KWARGS-DROP
 # ------------------------------------------------------------
 # 目的:
 #   Discordへ送信されるサマリー表示が横長・桁揃え・日本語銘柄名で崩れる問題を補正する。
@@ -13,21 +13,11 @@
 #   - ENTRY / EXIT 通知や重要アラートは対象外。
 #   - コンソール表示は既存のまま変更しない。
 #
-# V1.2:
-#   - PUSH由来 SUMMARY 1min は環境変数に関係なく送信する
-#   - 旧wrapperが残っていても _original をたどって必ず差し替える
-#   - 起動ログに force_summary_1min=True を出す
-#
-# V1.3:
-#   - compact patch の wrapper 自体で interval_label を安全化する。
-#   - 呼び出し元が display_xxx(df, df) / print_xxx(df, df) をしても、
-#     DataFrame本体をタイトルへ表示しない。
-#   - 呼び出し元が display_xxx(label, df) の順で渡しても、DataFrameを捨てずに入れ替える。
-#
-# V1.4:
-#   - display_runner 側から渡る interval / source / slot 等の内部 kwargs を、
-#     元の print_summary_top10 / print_ranking_summary_top10 へ渡さない。
-#   - 「unexpected keyword argument 'interval'」でPUSH表示が落ちる問題を修正。
+# V1.5:
+#   - 元の scheduler_jobs.summary.display.print_summary_top10 は
+#     summary_df / interval_label / notify_discord しか受け取れない。
+#   - interval だけでなく未知kwargsもすべて base関数へ渡さない。
+#   - display_runner の TypeError: unexpected keyword argument 'interval' を確実に防ぐ。
 # ============================================================
 
 from __future__ import annotations
@@ -45,14 +35,13 @@ _PATCHED = False
 _TRUE = {"1", "true", "yes", "y", "on", "enable", "enabled"}
 _FALSE = {"0", "false", "no", "n", "off", "disable", "disabled"}
 
-# display_runner / safe_io / scheduler 側の内部制御用引数。
-# 元の表示関数が受け取れない可能性が高いため、base関数へ渡す直前で必ず除去する。
 _BASE_UNSUPPORTED_KWARGS = {
     "interval",
     "interval_min",
     "minutes",
     "source",
     "source_label",
+    "summary_source",
     "market",
     "now",
     "slot",
@@ -62,6 +51,9 @@ _BASE_UNSUPPORTED_KWARGS = {
     "origin",
     "runner",
     "job_name",
+    "ranking",
+    "display",
+    "run_entry",
 }
 
 
@@ -81,12 +73,10 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _send_summary_1min_enabled() -> bool:
-    # PUSH由来は 1分/3分/5分を必ず見たいので、1分も常に送る。
     return True
 
 
 def _send_ranking_summary_1min_enabled() -> bool:
-    # ランキング由来は従来互換として既定では1分抑止。
     return _env_bool("RANKING_SUMMARY_DISCORD_SEND_1MIN", False)
 
 
@@ -112,7 +102,6 @@ def _is_series_like(v: Any) -> bool:
 
 
 def _looks_bad_label(v: Any) -> bool:
-    """タイトルに出してはいけない値を検出する。"""
     try:
         if v is None:
             return False
@@ -160,40 +149,22 @@ def _safe_interval_label(label: Any, *, kwargs: dict[str, Any] | None = None, de
 
 def _base_safe_kwargs(kwargs: dict[str, Any] | None) -> dict[str, Any]:
     """
-    元の print_summary_top10 系へ渡してよい kwargs だけに近づける。
-
-    display_runner 側は interval=1 などの内部情報を渡すことがあるが、
-    元関数はそれを受け取れないため TypeError になる。
-    interval_label の復元には _normalize_summary_call 側で kwargs を参照済みなので、
-    base関数へ渡す直前では削除してよい。
+    元の print_summary_top10 / print_ranking_summary_top10 へは、
+    互換kwargsを一切渡さない。
     """
-    safe = dict(kwargs or {})
-    removed: dict[str, Any] = {}
-    for k in list(safe.keys()):
-        if k in _BASE_UNSUPPORTED_KWARGS:
-            removed[k] = safe.pop(k, None)
-    if removed:
+    if kwargs:
         try:
-            logger.debug("[DISCORD SUMMARY COMPACT] stripped unsupported kwargs for base: %s", sorted(removed.keys()))
+            logger.info(
+                "[DISCORD SUMMARY COMPACT] dropped all base kwargs keys=%s",
+                sorted(list(dict(kwargs).keys())),
+            )
         except Exception:
             pass
-    return safe
+    return {}
 
 
 def _normalize_summary_call(summary_df: Any, interval_label: Any, kwargs: dict[str, Any]) -> tuple[Any, str]:
-    """
-    compact patch wrapper入口の最終防衛。
-
-    想定事故:
-      1) print_summary_top10(df, df)
-         -> interval_label を 1min に戻す
-      2) print_summary_top10("1min", df)
-         -> (df, "1min") に入れ替える
-      3) print_summary_top10(summary_df=df, interval_label=df)
-         -> interval_label を 1min に戻す
-    """
     try:
-        # display_xxx(label, df) 型の順序ミスは、DataFrameを本体として救済する。
         if _is_df_like(interval_label) and not _is_df_like(summary_df):
             fixed_label = _safe_interval_label(summary_df, kwargs=kwargs, default="1min")
             logger.warning(
@@ -346,7 +317,6 @@ def _send_to_discord_compact(disp: Any, lines: list[str], title: str | None = No
 
 
 def _unwrap(fn: Any) -> Any:
-    """旧patch wrapperが残っている場合、元関数まで戻してから新wrapperをかける。"""
     try:
         seen = set()
         cur = fn
@@ -370,7 +340,6 @@ def install() -> bool:
         return False
 
     try:
-        # 念のため環境変数にも明示して、他patchが参照しても1分PUSHを落とさない。
         os.environ["SUMMARY_DISCORD_SEND_1MIN"] = "1"
 
         old_send = getattr(disp, "_send_to_discord", None)
@@ -397,18 +366,17 @@ def install() -> bool:
         if callable(base_print_summary):
             def _print_summary_top10_patched(summary_df, interval_label="1min", *, notify_discord=True, **kwargs):
                 summary_df, interval_label = _normalize_summary_call(summary_df, interval_label, kwargs)
-                safe_kwargs = _base_safe_kwargs(kwargs)
-                # PUSH由来SUMMARYは1分も必ず送る。ここでは抑止しない。
+                _base_safe_kwargs(kwargs)
                 if notify_discord and _is_1min_label(interval_label):
                     logger.info("[DISCORD SUMMARY COMPACT] allow 1min SUMMARY discord interval=%s", interval_label)
                 return base_print_summary(
                     summary_df,
                     interval_label=interval_label,
                     notify_discord=notify_discord,
-                    **safe_kwargs,
                 )
 
             _print_summary_top10_patched._discord_1min_force_patch = True  # type: ignore[attr-defined]
+            _print_summary_top10_patched._summary_display_label_guard_v15 = True  # type: ignore[attr-defined]
             _print_summary_top10_patched._summary_display_label_guard_v14 = True  # type: ignore[attr-defined]
             _print_summary_top10_patched._original = base_print_summary  # type: ignore[attr-defined]
             disp.print_summary_top10 = _print_summary_top10_patched
@@ -418,7 +386,7 @@ def install() -> bool:
         if callable(base_print_ranking):
             def _print_ranking_summary_top10_patched(summary_df, interval_label="1min", *, notify_discord=True, **kwargs):
                 summary_df, interval_label = _normalize_summary_call(summary_df, interval_label, kwargs)
-                safe_kwargs = _base_safe_kwargs(kwargs)
+                _base_safe_kwargs(kwargs)
                 if notify_discord and _is_1min_label(interval_label) and not _send_ranking_summary_1min_enabled():
                     logger.info("[DISCORD SUMMARY COMPACT] suppress 1min RANKING SUMMARY discord interval=%s", interval_label)
                     notify_discord = False
@@ -426,16 +394,14 @@ def install() -> bool:
                     summary_df,
                     interval_label=interval_label,
                     notify_discord=notify_discord,
-                    **safe_kwargs,
                 )
 
             _print_ranking_summary_top10_patched._discord_1min_suppress_patch = True  # type: ignore[attr-defined]
+            _print_ranking_summary_top10_patched._summary_display_label_guard_v15 = True  # type: ignore[attr-defined]
             _print_ranking_summary_top10_patched._summary_display_label_guard_v14 = True  # type: ignore[attr-defined]
             _print_ranking_summary_top10_patched._original = base_print_ranking  # type: ignore[attr-defined]
             disp.print_ranking_summary_top10 = _print_ranking_summary_top10_patched
 
-        # display_summary / display_push_summary / display_ranking_summary が
-        # 旧関数参照を保持していても、入口で同じ正規化をかける。
         for attr, target_name in (
             ("display_summary", "print_summary_top10"),
             ("display_push_summary", "print_summary_top10"),
@@ -453,13 +419,13 @@ def install() -> bool:
                 def _make_ai_wrapper(fn):
                     def _wrapped(summary_df=None, interval_label="1min", *, notify_discord=True, **kwargs):
                         summary_df, interval_label = _normalize_summary_call(summary_df, interval_label, kwargs)
-                        safe_kwargs = _base_safe_kwargs(kwargs)
+                        _base_safe_kwargs(kwargs)
                         return fn(
                             summary_df=summary_df,
                             interval_label=interval_label,
                             notify_discord=notify_discord,
-                            **safe_kwargs,
                         )
+                    _wrapped._summary_display_label_guard_v15 = True  # type: ignore[attr-defined]
                     _wrapped._summary_display_label_guard_v14 = True  # type: ignore[attr-defined]
                     _wrapped._original = fn  # type: ignore[attr-defined]
                     return _wrapped
@@ -468,14 +434,14 @@ def install() -> bool:
                 def _make_display_wrapper(target_attr: str):
                     def _wrapped(summary_df=None, interval_label="1min", *, notify_discord=True, **kwargs):
                         summary_df, interval_label = _normalize_summary_call(summary_df, interval_label, kwargs)
-                        safe_kwargs = _base_safe_kwargs(kwargs)
+                        _base_safe_kwargs(kwargs)
                         fn = getattr(disp, target_attr)
                         return fn(
                             summary_df,
                             interval_label=interval_label,
                             notify_discord=notify_discord,
-                            **safe_kwargs,
                         )
+                    _wrapped._summary_display_label_guard_v15 = True  # type: ignore[attr-defined]
                     _wrapped._summary_display_label_guard_v14 = True  # type: ignore[attr-defined]
                     _wrapped._original = base_old  # type: ignore[attr-defined]
                     return _wrapped
@@ -483,7 +449,7 @@ def install() -> bool:
 
         _PATCHED = True
         logger.warning(
-            "[DISCORD SUMMARY COMPACT] installed compact_display=True label_guard=V1.4 kwargs_guard=True force_summary_1min=True suppress_summary_1min=False suppress_ranking_1min=%s send_summary_1min=True send_ranking_1min=%s",
+            "[DISCORD SUMMARY COMPACT] installed compact_display=True label_guard=V1.5 strict_kwargs_drop=True force_summary_1min=True suppress_summary_1min=False suppress_ranking_1min=%s send_summary_1min=True send_ranking_1min=%s",
             not _send_ranking_summary_1min_enabled(),
             _send_ranking_summary_1min_enabled(),
         )
