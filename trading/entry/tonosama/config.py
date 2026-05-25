@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/tonosama/config.py
-# Version: Ver1.5-TONOSAMA-5SEC-FLAT-ALLOW
+# Version: Ver1.6-TONOSAMA-FINAL-SCORE-1_5
 # ------------------------------------------------------------
 # Ver1.2:
 #   - 固定値を環境変数対応
@@ -23,6 +23,14 @@
 #   - 動きの確認は _max_price_change_pct / _intrabar_range_pct / volume で行う。
 #   - main.py が TONOSAMA_MIN_5SEC_PRICE_CHANGE_PCT=0.01 を setdefault していても、
 #     0.01 以下は 0.0 に丸めて全落ちを防ぐ。
+#
+# Ver1.6:
+#   - 最新ログで candidates=1, raw/final=1.7198, min_final_score=2.0 のため
+#     final_score_low で登録されない。
+#   - TONOSAMA は既に 出来高/値幅/5秒足/AI fallback を通過した短期候補なので、
+#     最終閾値の既定を 2.0 -> 1.5 に緩和する。
+#   - これにより 6762 のような raw=1.7 台候補を pending に登録し、
+#     entry_controller の板/リスク/発注前ガードへ進める。
 # ============================================================
 
 from __future__ import annotations
@@ -77,8 +85,10 @@ TONOSAMA_EXPIRE_SEC = _env_int("TONOSAMA_EXPIRE_SEC", 180)
 
 MIN_PRICE = _env_float("TONOSAMA_MIN_PRICE", 200.0)
 
-# pending作成直前の最終スコア。厳しすぎると候補は出ても登録されない。
-MIN_FINAL_SCORE = _env_float("TONOSAMA_MIN_FINAL_SCORE", 2.0)
+# pending作成直前の最終スコア。
+# TONOSAMAは短期急騰検知ルートなので、候補抽出後は entry_controller 側の
+# 板/リスク/数量/発注前ガードへ渡すことを優先する。
+MIN_FINAL_SCORE = _env_float("TONOSAMA_MIN_FINAL_SCORE", 1.5)
 
 # raw score は 0 より大きければ候補として残す。
 MIN_RAW_SCORE = _env_float("TONOSAMA_MIN_RAW_SCORE", 0.01)
