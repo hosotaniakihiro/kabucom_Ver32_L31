@@ -1,14 +1,15 @@
 # ============================================================
 # File   : core/startup/__init__.py
-# Ver    : PRODUCTION-STABLE-REV21.0-DAILY-CACHE-FAST-STARTUP
+# Ver    : PRODUCTION-STABLE-REV21.1-SUMMARY-SCHEDULER-STALE-GUARD
 # ------------------------------------------------------------
 # 【概要】
 #   core.startup パッケージの公開入口。
 #   各種 runtime/startup patch を自動適用する。
 #
-# REV21.0:
-#   - daily_signal_cache_fast_startup_patch を追加
-#   - main.py 起動時の日足キャッシュ全件同期warmupをスキップ可能にする
+# REV21.1:
+#   - summary_scheduler_unified_stale_guard_patch を追加
+#   - main.py(entry_only) + PUSH全足BG化時に旧PUSH fallback重複を抑止
+#   - staleな unified_bg_running 状態を自動解除
 # ============================================================
 
 from __future__ import annotations
@@ -30,6 +31,13 @@ try:
     install_summary_scheduler_timeout_patch()
 except Exception:
     logger.exception("[core.startup] summary scheduler timeout patch install failed")
+
+try:
+    from .summary_scheduler_unified_stale_guard_patch import install as install_summary_scheduler_unified_stale_guard_patch
+
+    install_summary_scheduler_unified_stale_guard_patch()
+except Exception:
+    logger.exception("[core.startup] summary scheduler unified stale guard patch install failed")
 
 try:
     from .summary_ai_slope_env_patch import install_summary_ai_slope_env_patch
