@@ -1,22 +1,27 @@
 # ============================================================
 # File   : core/startup/summary_parallel_intervals_runtime_patch.py
-# Version: Ver03-ENFORCE-1M-3M-5M-TIMEOUT-MIN90
+# Version: Ver04-MAIN-LIGHT-TARGETS-NO-FORCE-1_3_5
 # ------------------------------------------------------------
 # 1分・3分・5分サマリーを直列ではなく並列に実行する runtime patch。
 #
-# 目的:
-#   - :00 / :03 / :05 などで 1m→3m→5m と順番待ちになり、
-#     SUMMARY AI / エントリー投入が遅れる問題を緩和する
-#   - 計算・表示・AI投入を interval 単位で並列化する
-#   - エントリー直前で 1分/3分/5分 slope を必須にしたため、
-#     市場中は1分境界だけでも 1m/3m/5m を常に更新対象へ広げる
-#   - bat 側に timeout=55 が残っていても、最低90秒へ引き上げる
+# Ver04 Fix:
+#   ✔ main.py(entry_only) で毎分 1m/3m/5m を強制作成しない
+#     - 12:53 のような 1分足だけのタイミングで 3本同時に走り、
+#       90秒 timeout → scheduler 全体が詰まる問題を回避
+#   ✔ main.py は resolve_target_intervals() の本来の対象だけ実行
+#     - 1分境界: 1m
+#     - 3分境界: 1m/3m
+#     - 5分境界: 1m/5m
+#     - 15分境界等: 1m/3m/5m
+#   ✔ main_database.py 側は従来どおり env で強制可能
+#   ✔ timeout 時は未完了 job を cancel() し、次tickへの重なりを減らす
 #
 # ENV:
 #   SUMMARY_PARALLEL_INTERVALS_ENABLED=1
-#   SUMMARY_PARALLEL_FORCE_1_3_5=1
+#   SUMMARY_PARALLEL_FORCE_1_3_5=0  # main.py 既定
+#   SUMMARY_PARALLEL_FORCE_1_3_5=1  # 必要時だけ明示
 #   SUMMARY_PARALLEL_INTERVAL_WORKERS=3
-#   SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC=90  # 最低90へ補正
+#   SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC=90
 #   SUMMARY_PARALLEL_TIMEOUT_MIN_SEC=90
 #   SUMMARY_PARALLEL_RANKING_ENABLED=1
 # ============================================================
@@ -87,6 +92,18 @@ def _setdefault_env(name: str, value: str) -> None:
         pass
 
 
+def _is_main_entry_only_process() -> bool:
+    try:
+        if _env_bool("AUTOSTOCK_MAIN_DATABASE_PROCESS", False):
+            return False
+        if _env_bool("AUTOSTOCK_DATA_COLLECTORS_PROCESS", False):
+            return False
+        role = str(os.getenv("SUMMARY_DB_WRITER_ROLE") or "").strip().lower()
+        return _env_bool("SUMMARY_MAIN_ENTRY_ONLY", False) or role in {"entry_only", "main_entry_only", "read_only", "no_save"}
+    except Exception:
+        return False
+
+
 def _force_bool_env(name: str, value: str) -> None:
     try:
         os.environ[name] = str(value)
@@ -103,7 +120,7 @@ def _ensure_timeout_min() -> None:
         if cur < min_sec:
             os.environ["SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC"] = str(int(min_sec) if float(min_sec).is_integer() else min_sec)
             logger.warning(
-                "[SUMMARY PARALLEL] timeout raised old=%s new=%s reason=min_timeout_for_1_3_5",
+                "[SUMMARY PARALLEL] timeout raised old=%s new=%s reason=min_timeout_for_summary",
                 cur_raw,
                 os.environ.get("SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC"),
             )
@@ -158,10 +175,20 @@ def _resolve_target_intervals(now: dt.datetime, in_session: bool) -> list[int]:
                 pass
 
     clean = sorted({int(x) for x in targets if int(x) in {1, 3, 5}})
-    if in_session and _env_bool("SUMMARY_PARALLEL_FORCE_1_3_5", True):
+
+    # main.py はDB seed済み履歴を使う。毎分 1/3/5 全部を強制作成すると
+    # push DB/summary DBの巨大履歴をなめて timeout しやすいため既定OFF。
+    force_default = False if _is_main_entry_only_process() else True
+    force_all = _env_bool("SUMMARY_PARALLEL_FORCE_1_3_5", force_default)
+
+    if in_session and force_all:
         if clean != [1, 3, 5]:
-            logger.warning("[SUMMARY PARALLEL] force targets to 1/3/5 for entry MTF now=%s original=%s", now, clean)
+            logger.warning("[SUMMARY PARALLEL] force targets to 1/3/5 now=%s original=%s main_entry_only=%s", now, clean, _is_main_entry_only_process())
         clean = [1, 3, 5]
+
+    if not clean:
+        clean = [1]
+
     return clean
 
 
@@ -217,7 +244,7 @@ def _patched_run_time_locked_summary_jobs(*, now: Optional[dt.datetime] = None, 
     futures = []
     timeout = _env_float("SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC", 90.0)
     try:
-        logger.warning("[SUMMARY PARALLEL] tick start now=%s targets=%s run_push=%s run_ranking=%s display=%s run_entry=%s in_session=%s workers=%s timeout=%.1f force_1_3_5=%s", n, targets, run_push, run_ranking, display, run_entry, in_session, _env_int("SUMMARY_PARALLEL_INTERVAL_WORKERS", 3), timeout, _env_bool("SUMMARY_PARALLEL_FORCE_1_3_5", True))
+        logger.warning("[SUMMARY PARALLEL] tick start now=%s targets=%s run_push=%s run_ranking=%s display=%s run_entry=%s in_session=%s workers=%s timeout=%.1f force_1_3_5=%s main_entry_only=%s", n, targets, run_push, run_ranking, display, run_entry, in_session, _env_int("SUMMARY_PARALLEL_INTERVAL_WORKERS", 3), timeout, _env_bool("SUMMARY_PARALLEL_FORCE_1_3_5", False if _is_main_entry_only_process() else True), _is_main_entry_only_process())
         ex = _executor()
         for interval in targets:
             if run_push:
@@ -238,7 +265,12 @@ def _patched_run_time_locked_summary_jobs(*, now: Optional[dt.datetime] = None, 
                 out.setdefault(source, {})[int(interval)] = df
                 done_count += 1
         except FuturesTimeoutError:
-            logger.error("[SUMMARY PARALLEL] tick timeout now=%s timeout=%.1fs done=%s total=%s", n, timeout, done_count, len(futures))
+            logger.error("[SUMMARY PARALLEL] tick timeout now=%s timeout=%.1fs done=%s total=%s targets=%s", n, timeout, done_count, len(futures), targets)
+            for fut in futures:
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
 
         logger.warning("[SUMMARY PARALLEL] tick done now=%s targets=%s push_done=%s ranking_done=%s elapsed=%.3fs", n, targets, sorted(out.get("push", {}).keys()), sorted(out.get("ranking", {}).keys()), time.perf_counter() - t0)
         return out
@@ -249,12 +281,17 @@ def _patched_run_time_locked_summary_jobs(*, now: Optional[dt.datetime] = None, 
 
 def install() -> bool:
     global _INSTALLED, _ORIG_TIME_LOCKED
+
+    # main.py(entry_only) は毎分1/3/5強制を既定OFF。既に環境変数で明示されている場合だけ尊重。
+    if _is_main_entry_only_process():
+        _setdefault_env("SUMMARY_PARALLEL_FORCE_1_3_5", "0")
+    else:
+        _setdefault_env("SUMMARY_PARALLEL_FORCE_1_3_5", "1")
+
     if _INSTALLED:
         _ensure_timeout_min()
-        _force_bool_env("SUMMARY_PARALLEL_FORCE_1_3_5", "1")
         return True
 
-    _force_bool_env("SUMMARY_PARALLEL_FORCE_1_3_5", "1")
     _setdefault_env("SUMMARY_PARALLEL_TIMEOUT_MIN_SEC", "90")
     _ensure_timeout_min()
     _setdefault_env("SUMMARY_PARALLEL_INTERVAL_WORKERS", "3")
@@ -264,16 +301,16 @@ def install() -> bool:
         import scheduler_jobs.summary.runners as runners
         import scheduler_jobs.summary.scheduler as scheduler
         cur = getattr(tlr, "run_time_locked_summary_jobs", None)
-        if getattr(cur, "_summary_parallel_intervals_v3", False):
+        if getattr(cur, "_summary_parallel_intervals_v4", False):
             _INSTALLED = True
             return True
         _ORIG_TIME_LOCKED = cur
-        _patched_run_time_locked_summary_jobs._summary_parallel_intervals_v3 = True  # type: ignore[attr-defined]
+        _patched_run_time_locked_summary_jobs._summary_parallel_intervals_v4 = True  # type: ignore[attr-defined]
         tlr.run_time_locked_summary_jobs = _patched_run_time_locked_summary_jobs
         runners.run_time_locked_summary_jobs = _patched_run_time_locked_summary_jobs
         scheduler.run_time_locked_summary_jobs = _patched_run_time_locked_summary_jobs
         _INSTALLED = True
-        logger.warning("[SUMMARY PARALLEL] installed enabled=%s workers=%s timeout=%.1f ranking_parallel=%s force_1_3_5=%s min_timeout=%s", _env_bool("SUMMARY_PARALLEL_INTERVALS_ENABLED", True), _env_int("SUMMARY_PARALLEL_INTERVAL_WORKERS", 3), _env_float("SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC", 90.0), _env_bool("SUMMARY_PARALLEL_RANKING_ENABLED", True), _env_bool("SUMMARY_PARALLEL_FORCE_1_3_5", True), os.getenv("SUMMARY_PARALLEL_TIMEOUT_MIN_SEC"))
+        logger.warning("[SUMMARY PARALLEL] installed enabled=%s workers=%s timeout=%.1f ranking_parallel=%s force_1_3_5=%s main_entry_only=%s min_timeout=%s", _env_bool("SUMMARY_PARALLEL_INTERVALS_ENABLED", True), _env_int("SUMMARY_PARALLEL_INTERVAL_WORKERS", 3), _env_float("SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC", 90.0), _env_bool("SUMMARY_PARALLEL_RANKING_ENABLED", True), _env_bool("SUMMARY_PARALLEL_FORCE_1_3_5", False if _is_main_entry_only_process() else True), _is_main_entry_only_process(), os.getenv("SUMMARY_PARALLEL_TIMEOUT_MIN_SEC"))
         return True
     except Exception as e:
         logger.exception("[SUMMARY PARALLEL] install failed err=%s", e)
