@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/tonosama/config.py
-# Version: Ver1.7-TONOSAMA-STRICT-FILTERS
+# Version: Ver1.8-TONOSAMA-STRICT-BUT-5SEC-NOT-REQUIRED
 # ------------------------------------------------------------
 # Ver1.2:
 #   - 固定値を環境変数対応
@@ -44,6 +44,11 @@
 #       MIN_5SEC_PRICE_CHANGE_PCT 実質OFF -> 0.05
 #   - main.py 側が TONOSAMA_MIN_5SEC_PRICE_CHANGE_PCT=0.01 を setdefault していても、
 #     0.05 未満は 0.05 に引き上げる。
+#
+# Ver1.8:
+#   - 5秒足は必須にしない。
+#   - 5秒足が取れている場合だけ 5秒変化率 0.05%以上を要求する。
+#   - 5秒足が無い場合は 3m/5m値幅・出来高急増・直近出来高・最終スコアで絞る。
 # ============================================================
 
 from __future__ import annotations
@@ -83,12 +88,12 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def _tonosama_5sec_threshold() -> float:
     """
-    Ver1.7:
-    殿様イナゴは「今まさに動いている」銘柄だけを拾う。
+    Ver1.8:
+    5秒足は必須にしないが、取れている場合は 0.000% を通さない。
     main.py が 0.01 を setdefault していても、0.05% 未満は緩すぎるため
     既定では 0.05% に引き上げる。
 
-    完全に無効化したい場合だけ TONOSAMA_USE_5SEC_CONFIRM=0 を使う。
+    5秒確認自体を無効化したい場合だけ TONOSAMA_USE_5SEC_CONFIRM=0 を使う。
     """
     v = _env_float("TONOSAMA_MIN_5SEC_PRICE_CHANGE_PCT", 0.05)
     if v < 0.05:
@@ -102,7 +107,7 @@ TONOSAMA_EXPIRE_SEC = _env_int("TONOSAMA_EXPIRE_SEC", 180)
 MIN_PRICE = _env_float("TONOSAMA_MIN_PRICE", 300.0)
 
 # pending作成直前の最終スコア。
-# Ver1.7: AI未接続・5秒停止の候補を減らすため、既定を厳格化。
+# Ver1.7以降: AI未接続・5秒停止の候補を減らすため、既定を厳格化。
 MIN_FINAL_SCORE = _env_float("TONOSAMA_MIN_FINAL_SCORE", 2.5)
 
 # raw score は 0 より大きければ候補として残す。
@@ -115,7 +120,7 @@ MIN_VOLUME_SURGE_RATIO = _env_float("TONOSAMA_MIN_VOLUME_SURGE_RATIO", 3.0)
 MIN_PRICE_CHANGE_PCT = _env_float("TONOSAMA_MIN_PRICE_CHANGE_PCT", 1.5)
 
 # body は open==close の足で 0 になりやすいため、既定では強制しない。
-# 動いているかどうかは intrabar range と latest volume と 5秒変化で判定する。
+# 動いているかどうかは intrabar range と latest volume と、取れている場合の5秒変化で判定する。
 MIN_BODY_CHANGE_PCT = _env_float("TONOSAMA_MIN_BODY_CHANGE_PCT", 0.0)
 MIN_INTRABAR_RANGE_PCT = _env_float("TONOSAMA_MIN_INTRABAR_RANGE_PCT", 0.10)
 
@@ -129,8 +134,8 @@ MIN_5SEC_PRICE_CHANGE_PCT = _tonosama_5sec_threshold()
 MIN_5SEC_VOLUME_SURGE_RATIO = _env_float("TONOSAMA_MIN_5SEC_VOLUME_SURGE_RATIO", 1.5)
 MAX_5SEC_DROP_PCT = _env_float("TONOSAMA_MAX_5SEC_DROP_PCT", -0.20)
 
-# 5秒足が無い場合の誤通過を減らすため、既定で必須にする。
-REQUIRE_5SEC_BAR = _env_bool("TONOSAMA_REQUIRE_5SEC_BAR", True)
+# 5秒足は必須にしない。取れている場合だけ runner.py 側で 0.05%以上を要求する。
+REQUIRE_5SEC_BAR = _env_bool("TONOSAMA_REQUIRE_5SEC_BAR", False)
 
 MAX_PENDING_PER_LOOP = _env_int("TONOSAMA_MAX_PENDING_PER_LOOP", 10)
 MAX_CANDIDATES = _env_int("TONOSAMA_MAX_CANDIDATES", 40)
