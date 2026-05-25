@@ -1,18 +1,21 @@
 # ============================================================
 # File   : core/startup/summary_ai_async_entry_patch.py
-# Version: Ver03-SKIP-STALE-QUEUE-AND-MARKET-CLOSED
+# Version: Ver04-DIRECT-SYNC-DEFAULT
 # ------------------------------------------------------------
-# SUMMARY AI の実発注部分を、1分サマリー本体から切り離す runtime patch。
+# SUMMARY AI の実発注部分を runtime patch する。
 #
-# Ver03:
-#   - キュー投入時刻を保存し、古い approved_rows は worker 側で捨てる。
-#   - worker 実行時点で market closed / 昼休みなら、重い entry_pipeline を呼ばず即skip。
-#   - 昼休み前に溜まった古いキューが 12:30 後も順番に処理され続け、
-#     最新のAI_OK候補の発注を遅らせる問題を防ぐ。
-#   - worker の処理結果ログに stale / market_closed_worker を明示する。
+# Ver04:
+#   - SUMMARY AI の approved_rows が出ているのに queued_async で終わり、
+#     実発注が遅延・ stale skip・market_closed skip になる問題を避けるため、
+#     市場時間中は direct sync 実行を既定ONに変更。
+#   - つまり AI_OK -> approved_rows -> entry_pipeline を同じ呼び出し内で実行する。
+#   - これにより runner の executed / skip_reason が実発注結果と一致する。
+#   - 非同期キューを使いたい場合のみ SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC=0 を指定する。
+#   - キュー利用時は Ver03 と同じ stale / market_closed worker guard を維持。
 #
 # ENV:
 #   SUMMARY_AI_ASYNC_ENTRY=1
+#   SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC=1       # Ver04 default: 発注優先
 #   SUMMARY_AI_ASYNC_ENTRY_DROP_BUSY=0
 #   SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX=20
 #   SUMMARY_AI_ASYNC_ENTRY_STALE_SEC=20
@@ -217,7 +220,7 @@ def _patched_execute_ai_ok_entries_bulk(
     require_market_open=True,
     entry_pipeline=None,
 ):
-    """execute_ai_ok_entries_bulk の差し替え。approved_rows 作成後、実発注をキュー投入する。"""
+    """execute_ai_ok_entries_bulk の差し替え。既定では direct sync 実行する。"""
     global _SEQ
 
     if not callable(_ORIG_EXECUTE):
@@ -241,6 +244,55 @@ def _patched_execute_ai_ok_entries_bulk(
             require_market_open=require_market_open,
             entry_pipeline=entry_pipeline,
         )
+
+    # Ver04: エントリー発火を優先し、既定では非同期キューへ逃がさず即実行する。
+    # これにより queued_async だけ出て実注文に進まない/遅れる状態を避ける。
+    if _env_bool("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC", True):
+        started = time.time()
+        try:
+            # 古いキューが残っている場合、最新のdirect発注を邪魔しないよう掃除する。
+            with _ASYNC_LOCK:
+                dropped = len(_QUEUE)
+                _QUEUE.clear()
+            if dropped:
+                logger.warning(
+                    "[SUMMARY AI ASYNC ENTRY] direct sync clearing old async queue dropped=%s interval=%s",
+                    dropped,
+                    interval,
+                )
+
+            logger.warning(
+                "[SUMMARY AI ASYNC ENTRY] direct sync start interval=%s max_entries=%s require_market_open=%s",
+                interval,
+                max_entries,
+                require_market_open,
+            )
+            result = _ORIG_EXECUTE(
+                ai_results,
+                df_summary=df_summary,
+                interval=interval,
+                max_entries=max_entries,
+                dry_run=False,
+                require_market_open=require_market_open,
+                entry_pipeline=entry_pipeline,
+            )
+            logger.warning(
+                "[SUMMARY AI ASYNC ENTRY] direct sync done interval=%s elapsed=%.3fs summary=%s",
+                interval,
+                time.time() - started,
+                _summarize_result(result),
+            )
+            return result
+        except Exception as e:
+            logger.exception("[SUMMARY AI ASYNC ENTRY] direct sync failed err=%s", e)
+            return {
+                "executed": False,
+                "submitted_async": False,
+                "dry_run": False,
+                "approved_rows": [],
+                "result": None,
+                "skip_reason": "direct_sync_exception",
+            }
 
     try:
         from trading.entry.summary_ai import executor as exec_mod
@@ -373,12 +425,13 @@ def install() -> bool:
         from trading.entry.summary_ai import runner as runner_mod
 
         current = getattr(exec_mod, "execute_ai_ok_entries_bulk", None)
-        if getattr(current, "_summary_ai_async_entry_patch_v3", False):
+        if getattr(current, "_summary_ai_async_entry_patch_v4", False):
             _INSTALLED = True
-            logger.warning("[SUMMARY AI ASYNC ENTRY] already installed v3")
+            logger.warning("[SUMMARY AI ASYNC ENTRY] already installed v4")
             return True
 
         _ORIG_EXECUTE = current
+        _patched_execute_ai_ok_entries_bulk._summary_ai_async_entry_patch_v4 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_async_entry_patch_v3 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_async_entry_patch_v2 = True  # type: ignore[attr-defined]
 
@@ -387,8 +440,9 @@ def install() -> bool:
 
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY AI ASYNC ENTRY] installed v3 enabled=%s drop_busy=%s queue_max=%s stale_sec=%.3f",
+            "[SUMMARY AI ASYNC ENTRY] installed v4 enabled=%s direct_sync=%s drop_busy=%s queue_max=%s stale_sec=%.3f",
             _env_bool("SUMMARY_AI_ASYNC_ENTRY", True),
+            _env_bool("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC", True),
             _env_bool("SUMMARY_AI_ASYNC_ENTRY_DROP_BUSY", False),
             _env_int("SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX", 20),
             _env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 20.0),
