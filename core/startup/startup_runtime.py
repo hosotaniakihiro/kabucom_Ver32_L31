@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/startup_runtime.py
-# Version: REV1.3-STARTUP-RUNTIME-SPLIT-MODE-SUMMARY-DB-SEED-PUSH-HISTORY
+# Version: REV1.4-STARTUP-RUNTIME-SUMMARY-REPAIR
 # ------------------------------------------------------------
 # 【概要】
 #   startup の runtime / engine / migration phase を分離
@@ -12,6 +12,7 @@
 #   - safe migration phase
 #   - split mode main.py でも summary DB の履歴をメモリへ復元
 #   - PUSHサマリーが最新1本だけでMACD/MTFを薄くしないよう履歴patchをinstall
+#   - GlobalContext.set_merged_summary 直前にも macd/signal/mtf を履歴復元
 # ============================================================
 
 from __future__ import annotations
@@ -126,6 +127,15 @@ def _install_push_summary_history_patch() -> None:
         logger.exception("[STARTUP.RUNTIME] push summary history patch install failed")
 
 
+def _install_global_context_summary_repair_patch() -> None:
+    try:
+        from core.startup.global_context_summary_repair_patch import install as install_gc_repair
+        ok = install_gc_repair()
+        logger.warning("[STARTUP.RUNTIME] global context summary repair patch installed=%s", ok)
+    except Exception:
+        logger.exception("[STARTUP.RUNTIME] global context summary repair patch install failed")
+
+
 def _restore_summary_db_seed_after_bootstrap(summary_db_path) -> None:
     try:
         from core.startup.summary_db_seed_restore_patch import restore_summary_db_seed
@@ -135,6 +145,7 @@ def _restore_summary_db_seed_after_bootstrap(summary_db_path) -> None:
         logger.exception("[STARTUP.RUNTIME] summary DB seed restore failed")
 
     _install_push_summary_history_patch()
+    _install_global_context_summary_repair_patch()
 
 
 def safe_migration_phase(summary_dir, ranking_dir) -> None:
