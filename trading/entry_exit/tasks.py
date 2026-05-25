@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry_exit/tasks.py
-# Version: Ver1.3-TONOSAMA-DISPATCH-ENTRY-CONTROLLER
+# Version: Ver1.4-TONOSAMA-FAST-LOOP-SKIP-ACTIVE-REFRESH
 # ------------------------------------------------------------
 # 【目的】
 #   core.entry_exit_tasks shim から解決される実体モジュール。
@@ -17,11 +17,14 @@
 #       毎分 :12 / tags: entry, ranking_entry
 #       その直後に entry_controller.run_entry_pipeline(pipeline_source="RANKING", interval=1)
 #
-# 【重要】
-#   - Ver1.2 までは TONOSAMA は pending 登録で終わり、entry_controller
-#     が起動されないタイミングがあり「🔥 TONOSAMA PENDING」後に
-#     実発注ログが出ないことがあった。
-#   - Ver1.3 で registered > 0 のとき即 controller dispatch する。
+# Ver1.4 Fix:
+#   - 最新ログで TONOSAMA の build 自体は1.9〜3.8秒なのに、loop全体が
+#     17〜24秒かかり previous_still_running が多発。
+#   - 原因は tonosama_loop 冒頭の update_active_symbols() が重く、
+#     ranking_save / ranking_entry と競合するため。
+#   - TONOSAMA_ENTRY_FAST_SKIP_ACTIVE_UPDATE=1 既定で runner.update_active_symbols
+#     を None に差し替え、15秒監視を軽量化する。
+#   - 必要なら環境変数 TONOSAMA_UPDATE_ACTIVE_SYMBOLS_IN_LOOP=1 で旧動作に戻せる。
 # ============================================================
 
 from __future__ import annotations
@@ -45,10 +48,20 @@ _RANKING_ENTRY_RUNNING = False
 _RANKING_ENTRY_STARTED_AT: Optional[dt.datetime] = None
 _RANKING_ENTRY_LOCK = threading.RLock()
 
-TONOSAMA_ENTRY_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_TIMEOUT_SEC", "30"))
-TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC", "20"))
+TONOSAMA_ENTRY_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_TIMEOUT_SEC", "12"))
+TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC", "15"))
 RANKING_ENTRY_BUILD_TIMEOUT_SEC = float(os.getenv("RANKING_ENTRY_BUILD_TIMEOUT_SEC", "20"))
 RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC = float(os.getenv("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", "20"))
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
 
 
 def _clear_tag(tag: str) -> None:
@@ -83,6 +96,33 @@ def _resolve_callable(module_name: str, attr_name: str) -> Optional[Callable[...
     except Exception:
         logger.warning("[entry_exit.tasks] resolve failed %s.%s", module_name, attr_name, exc_info=True)
         return None
+
+
+def _patch_tonosama_runner_fast_loop() -> None:
+    """
+    TONOSAMA 15秒ジョブの中で active_symbols 更新を毎回走らせない。
+
+    active_symbols は ranking_save / ranking_summary 側で更新されるため、
+    TONOSAMA内で毎回 update_active_symbols() すると ranking DB 読み込みと競合し、
+    15秒ジョブが20秒以上かかる。発注候補生成は既存の summary/ranking cache を使う。
+    """
+    try:
+        # 旧動作へ戻したい場合だけ明示的にON。
+        if _env_bool("TONOSAMA_UPDATE_ACTIVE_SYMBOLS_IN_LOOP", False):
+            logger.info("[TONOSAMA FAST LOOP PATCH] keep update_active_symbols because TONOSAMA_UPDATE_ACTIVE_SYMBOLS_IN_LOOP=1")
+            return
+        if not _env_bool("TONOSAMA_ENTRY_FAST_SKIP_ACTIVE_UPDATE", True):
+            logger.info("[TONOSAMA FAST LOOP PATCH] disabled by TONOSAMA_ENTRY_FAST_SKIP_ACTIVE_UPDATE=0")
+            return
+
+        import importlib
+        mod = importlib.import_module("trading.entry.tonosama.runner")
+        cur = getattr(mod, "update_active_symbols", None)
+        if cur is not None:
+            setattr(mod, "update_active_symbols", None)
+            logger.warning("[TONOSAMA FAST LOOP PATCH] runner.update_active_symbols disabled for fast 15s loop")
+    except Exception:
+        logger.warning("[TONOSAMA FAST LOOP PATCH] failed", exc_info=True)
 
 
 def _run_callable_with_timeout(
@@ -171,6 +211,7 @@ def _run_tonosama_entry_safe() -> int:
         logger.warning("[TONOSAMA ENTRY SCHEDULE] skipped reason=runner_unavailable")
         return 0
     try:
+        _patch_tonosama_runner_fast_loop()
         logger.info("[TONOSAMA ENTRY SCHEDULE] fire timeout_sec=%.3f", TONOSAMA_ENTRY_TIMEOUT_SEC)
         completed, ret = _run_callable_with_timeout(
             fn,
