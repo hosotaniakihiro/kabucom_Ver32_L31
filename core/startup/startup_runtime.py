@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/startup_runtime.py
-# Version: REV1.1-STARTUP-RUNTIME-SPLIT-MODE
+# Version: REV1.2-STARTUP-RUNTIME-SPLIT-MODE-SUMMARY-DB-SEED
 # ------------------------------------------------------------
 # 【概要】
 #   startup の runtime / engine / migration phase を分離
@@ -10,11 +10,14 @@
 #   - engine dispose
 #   - global_data.clear_all
 #   - safe migration phase
+#   - split mode main.py でも summary DB の履歴をメモリへ復元
 #
 # Split mode:
 #   - main_database.py が DB作成 / ranking取得 / PUSH受信を担当
 #   - main.py 側では push/ranking engine の factory を呼ばない
 #   - main.py 側では DB migration を走らせず、summary engine の解決だけ行う
+#   - ただし main.py のエントリー判定には過去足が必要なため、
+#     bootstrap_database() 後に summary DB seed を GlobalContext へ復元する
 #
 # 【重要】
 #   from database.session import summary_engine の固定参照は使わない。
@@ -175,6 +178,24 @@ def clear_runtime_memory() -> None:
         pass
 
 
+def _restore_summary_db_seed_after_bootstrap(summary_db_path) -> None:
+    """
+    bootstrap_database() で summary_engine が当日DBへ rebind された直後、
+    main_database.py が保存した summary DB の履歴を main.py のメモリへ復元する。
+
+    main.py は entry_only / skip_db_save のままでよいが、
+    MACD / signal / MTF / ma75 / technical_ready 等の履歴依存項目には
+    stock_summary_1min/3min/5min の過去足が必要。
+    """
+    try:
+        from core.startup.summary_db_seed_restore_patch import restore_summary_db_seed
+
+        result = restore_summary_db_seed(summary_db_path)
+        logger.warning("[STARTUP.RUNTIME] summary DB seed restore result=%s", result)
+    except Exception:
+        logger.exception("[STARTUP.RUNTIME] summary DB seed restore failed")
+
+
 def safe_migration_phase(summary_dir, ranking_dir) -> None:
     logger.info("🛑 ENTER SAFE MIGRATION MODE")
     logger.info("📁 SAFE MIGRATION summary_dir=%s", summary_dir)
@@ -190,11 +211,14 @@ def safe_migration_phase(summary_dir, ranking_dir) -> None:
     dispose_all_engines()
     clear_runtime_memory()
 
-    bootstrap_database(
+    summary_db_path = bootstrap_database(
         summary_dir,
         None if split else ranking_dir,
         skip_migration=split,
     )
+
+    _restore_summary_db_seed_after_bootstrap(summary_db_path)
+
     logger.info("✅ SAFE MIGRATION COMPLETE")
 
 
