@@ -1,6 +1,6 @@
 # ============================================================
 # File: AI/entry_gate_tonosama.py
-# Version: PRODUCTION-STABLE-V2-COMPAT-SYMBOL-OR-FEATURE-ROW
+# Version: PRODUCTION-STABLE-V3-MODEL-MISSING-HEURISTIC-FALLBACK
 # ------------------------------------------------------------
 # 殿様イナゴ（BUY）専用 ENTRY ゲート
 #
@@ -8,7 +8,8 @@
 # ✔ feature_row dict / symbol str の両方を受け付ける
 # ✔ entry_controller が allow_tonosama_entry(symbol) と呼ぶ既存実装に対応
 # ✔ pending_entries の TONOSAMA entry から最低限の特徴量を復元
-# ✔ モデル/特徴量不足時は fail-closed
+# ✔ モデルが存在しない場合は、短期スキャルピング用の保守的 heuristic fallback で判定
+# ✔ fallback は環境変数 TONOSAMA_MODEL_MISSING_FAIL_OPEN で制御可能
 # ============================================================
 
 from __future__ import annotations
@@ -41,11 +42,24 @@ FEATURES = [
     "minute_from_open",
 ]
 
-MIN_PROB = 0.55
-MIN_SCORE = 1.20
-MAX_SPREAD_RATIO = 0.003
+MIN_PROB = float(os.getenv("TONOSAMA_MIN_PROB", "0.55"))
+MIN_SCORE = float(os.getenv("TONOSAMA_MIN_SCORE", "1.20"))
+MAX_SPREAD_RATIO = float(os.getenv("TONOSAMA_MAX_SPREAD_RATIO", "0.003"))
+
+# モデルファイルがない場合の運用。
+# 0: 従来どおり fail-closed
+# 1: heuristic fallback で最低限判定して通す
+MODEL_MISSING_FAIL_OPEN = str(os.getenv("TONOSAMA_MODEL_MISSING_FAIL_OPEN", "1")).strip().lower() not in {"0", "false", "no", "off", "ng"}
+
+# fallback 用の保守的な基準。
+# TONOSAMA pending 側で既に volume surge / price change / 5秒足を確認している前提。
+FALLBACK_MIN_PRICE_VELOCITY = float(os.getenv("TONOSAMA_FALLBACK_MIN_PRICE_VELOCITY", "-0.003"))
+FALLBACK_MIN_VOLUME_SPEED = float(os.getenv("TONOSAMA_FALLBACK_MIN_VOLUME_SPEED", "1.0"))
+FALLBACK_MIN_DOMINANT_RATIO = float(os.getenv("TONOSAMA_FALLBACK_MIN_DOMINANT_RATIO", "0.80"))
+FALLBACK_MIN_RANK_STRENGTH = float(os.getenv("TONOSAMA_FALLBACK_MIN_RANK_STRENGTH", "0.0"))
 
 _model: lgb.Booster | None = None
+_model_missing_logged = False
 
 
 # ============================================================
@@ -125,28 +139,58 @@ def _get_pending_entry_for_symbol(symbol: str) -> Dict[str, Any]:
     return {}
 
 
+def _entry_conditions(row: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        ec = row.get("entry_conditions")
+        if isinstance(ec, dict):
+            return ec
+    except Exception:
+        pass
+    return {}
+
+
 def _feature_from_entry_row(row: Dict[str, Any]) -> Dict[str, float]:
     if not isinstance(row, dict) or not row:
         return {}
 
+    ec = _entry_conditions(row)
+
     # すでに学習特徴量が全部ある場合はそのまま使う
     if all(f in row for f in FEATURES):
-        return {f: _safe_float(row.get(f), 0.0) for f in FEATURES}
+        out = {f: _safe_float(row.get(f), 0.0) for f in FEATURES}
+        out["symbol"] = _normalize_symbol(row.get("symbol"))  # type: ignore[assignment]
+        return out
 
     close = _safe_float(_first(row, ("close", "close_price", "current_price", "price"), 0.0), 0.0)
     rank_now = _safe_float(_first(row, ("rank_now", "rank", "rank_position", "ranking_rank"), 0.0), 0.0)
     rank_prev = _safe_float(_first(row, ("rank_prev", "prev_rank", "rank_previous"), 0.0), 0.0)
 
-    # 価格速度は slope 系を優先。無ければ price_velocity を見る。
-    price_velocity = _safe_float(
-        _first(row, ("price_velocity", "slope", "slope_atr_scaled", "score_slope"), 0.0),
-        0.0,
-    )
+    # 価格速度は 5秒足変化率 → slope 系 → price_velocity の順に使う。
+    price_change_5s_pct = _safe_float(_first(ec, ("price_change_5s_pct",), None), None)  # type: ignore[arg-type]
+    if price_change_5s_pct is None:
+        price_change_5s_pct = _safe_float(_first(row, ("price_change_5s_pct",), 0.0), 0.0)
+
+    price_velocity = price_change_5s_pct / 100.0 if price_change_5s_pct is not None else 0.0
+    if abs(price_velocity) <= 1.0e-12:
+        price_velocity = _safe_float(
+            _first(row, ("price_velocity", "slope", "slope_atr_scaled", "score_slope"), _first(ec, ("slope",), 0.0)),
+            0.0,
+        )
     if abs(price_velocity) > 1.0:
         # score_slope 等が 5.0 のようなスコア値なら比率へ縮小
         price_velocity = price_velocity / 100.0
 
-    volume_speed = _safe_float(_first(row, ("volume_speed", "volume_ratio", "出来高速度"), 1.0), 1.0)
+    # volume_speed は 5秒足比率 → entry_conditions の急増比率 → row のvolume系の順。
+    volume_speed = _safe_float(
+        _first(
+            row,
+            ("volume_speed", "volume_ratio", "volume_surge_ratio_5s", "出来高速度"),
+            _first(ec, ("volume_surge_ratio_5s", "max_volume_surge_ratio", "volume_surge_ratio_3m", "volume_surge_ratio_5m"), 1.0),
+        ),
+        1.0,
+    )
+    if volume_speed <= 0:
+        volume_speed = _safe_float(_first(ec, ("max_volume_surge_ratio",), 1.0), 1.0)
     if volume_speed <= 0:
         volume_speed = 1.0
 
@@ -169,7 +213,7 @@ def _feature_from_entry_row(row: Dict[str, Any]) -> Dict[str, float]:
     if spread_ratio <= 0 and spread > 0 and close > 0:
         spread_ratio = spread / close
 
-    return {
+    out = {
         "price_velocity": float(price_velocity),
         "volume_speed": float(volume_speed),
         "rank_jump": float(rank_jump),
@@ -178,6 +222,8 @@ def _feature_from_entry_row(row: Dict[str, Any]) -> Dict[str, float]:
         "spread_ratio": float(spread_ratio),
         "minute_from_open": float(_safe_float(row.get("minute_from_open"), _minute_from_open())),
     }
+    out["symbol"] = _normalize_symbol(row.get("symbol"))  # type: ignore[assignment]
+    return out
 
 
 def _resolve_feature_row(feature_or_symbol: Any) -> Dict[str, float]:
@@ -197,7 +243,7 @@ def _resolve_feature_row(feature_or_symbol: Any) -> Dict[str, float]:
 
 
 # ============================================================
-# model
+# model / fallback
 # ============================================================
 
 def _load_model() -> lgb.Booster:
@@ -207,6 +253,48 @@ def _load_model() -> lgb.Booster:
             raise FileNotFoundError(f"model not found: {MODEL_PATH}")
         _model = lgb.Booster(model_file=MODEL_PATH)
     return _model
+
+
+def _heuristic_fallback(row: Dict[str, float], *, reason: str) -> bool:
+    """
+    モデルがない時の最低限判定。
+    TONOSAMA runner 側ですでに候補化済みなので、ここでは
+    強すぎる逆方向・スプレッド過大だけを止める。
+    """
+    price_velocity = _safe_float(row.get("price_velocity"), 0.0)
+    volume_speed = _safe_float(row.get("volume_speed"), 1.0)
+    dominant_ratio = _safe_float(row.get("dominant_ratio"), 1.0)
+    spread_ratio = _safe_float(row.get("spread_ratio"), 0.0)
+    rank_strength = _safe_float(row.get("rank_strength"), 0.0)
+
+    ok = bool(
+        MODEL_MISSING_FAIL_OPEN
+        and price_velocity >= FALLBACK_MIN_PRICE_VELOCITY
+        and volume_speed >= FALLBACK_MIN_VOLUME_SPEED
+        and dominant_ratio >= FALLBACK_MIN_DOMINANT_RATIO
+        and spread_ratio <= MAX_SPREAD_RATIO
+        and rank_strength >= FALLBACK_MIN_RANK_STRENGTH
+    )
+
+    logger.warning(
+        "[TONOSAMA BUY FALLBACK] ok=%s reason=%s model_path=%s fail_open=%s price_velocity=%.6f volume_speed=%.4f dominant_ratio=%.4f spread_ratio=%.6f rank_strength=%.6f thresholds={pv>=%.6f,vol>=%.4f,dom>=%.4f,spread<=%.6f,rank>=%.6f} symbol=%s",
+        ok,
+        reason,
+        MODEL_PATH,
+        MODEL_MISSING_FAIL_OPEN,
+        price_velocity,
+        volume_speed,
+        dominant_ratio,
+        spread_ratio,
+        rank_strength,
+        FALLBACK_MIN_PRICE_VELOCITY,
+        FALLBACK_MIN_VOLUME_SPEED,
+        FALLBACK_MIN_DOMINANT_RATIO,
+        MAX_SPREAD_RATIO,
+        FALLBACK_MIN_RANK_STRENGTH,
+        row.get("symbol", ""),
+    )
+    return ok
 
 
 # ============================================================
@@ -225,6 +313,8 @@ def allow_tonosama_entry(feature_row: Dict[str, float] | str) -> bool:
     entry_row に含まれる slope / volume_speed / rank / dominant_ratio などから
     推論特徴量を復元する。
     """
+    global _model_missing_logged
+
     row = _resolve_feature_row(feature_row)
     if not row:
         return False
@@ -257,9 +347,16 @@ def allow_tonosama_entry(feature_row: Dict[str, float] | str) -> bool:
         )
         return ok
 
-    except Exception:
+    except FileNotFoundError as e:
+        if not _model_missing_logged:
+            logger.warning("[TONOSAMA BUY] model missing -> heuristic fallback enabled=%s err=%s", MODEL_MISSING_FAIL_OPEN, e)
+            _model_missing_logged = True
+        return _heuristic_fallback(row, reason="MODEL_MISSING")
+
+    except Exception as e:
         logger.exception("[TONOSAMA BUY] gate failed row=%s", row)
-        return False
+        # 想定外エラーは基本fail-closed。ただし明示的にfail_openが有効なら保守的fallback。
+        return _heuristic_fallback(row, reason=f"MODEL_ERROR:{type(e).__name__}")
 
 
 __all__ = ["allow_tonosama_entry"]
