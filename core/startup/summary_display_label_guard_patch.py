@@ -1,11 +1,16 @@
 # ============================================================
 # File   : core/startup/summary_display_label_guard_patch.py
-# Version: V1.0-DISPLAY-INTERVAL-LABEL-DATAFRAME-GUARD
+# Version: V1.1-DISCORD-SUMMARY-SOURCE-AND-TIME
 # ------------------------------------------------------------
 # 【目的】
 #   SUMMARY表示で interval_label に DataFrame が誤って渡り、
 #   "AI PASSED BUY CANDIDATES (   symbol ... [47 rows x 127 columns])"
 #   のように画面へDataFrame本体が表示される問題を防ぐ。
+#
+# 【追加目的 V1.1】
+#   Discordへ BUY TOP10 / SELL TOP10 を送るとき、
+#   PUSH由来サマリーかランキング由来サマリーかを明示する。
+#   さらに、そのTOP10がどの時刻のサマリー結果かを明示する。
 #
 # 【方針】
 #   - scheduler_jobs.summary.display の公開表示関数を薄くwrapする。
@@ -13,6 +18,7 @@
 #   - kwargs の interval があれば "3min" のように復元する。
 #   - それも無ければ "-" にする。
 #   - 表示だけの修正で、エントリー判定・AI判定・DB保存には触らない。
+#   - Discord専用TOP10生成関数もwrapし、BUY/SELL見出しに由来と結果時刻を出す。
 # ============================================================
 
 from __future__ import annotations
@@ -107,6 +113,110 @@ def _wrap(fn: Any, name: str):
     return _wrapped
 
 
+def _summary_source_label_for_discord(ranking: bool) -> str:
+    return "ランキング由来サマリー" if bool(ranking) else "PUSH由来サマリー"
+
+
+def _latest_summary_time_for_discord(df: pd.DataFrame) -> str:
+    """
+    Discord表示用に、DataFrame内の最新サマリー時刻を抽出する。
+    DBや経路によって列名が揺れるため、候補列を順に見る。
+    """
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return "-"
+
+        candidates = [
+            "summary_datetime",
+            "summary_dt",
+            "bar_datetime",
+            "datetime",
+            "dt",
+            "timestamp",
+            "time",
+            "saved_at",
+            "updated_at",
+            "created_at",
+        ]
+
+        for col in candidates:
+            if col not in df.columns:
+                continue
+            try:
+                s = pd.to_datetime(df[col], errors="coerce")
+                if s.notna().any():
+                    mx = s.max()
+                    if pd.notna(mx):
+                        return mx.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                continue
+
+    except Exception:
+        logger.debug("[SUMMARY DISPLAY LABEL GUARD] latest summary time detect failed", exc_info=True)
+
+    return "-"
+
+
+def _patched_collect_discord_top10_sections(
+    df: pd.DataFrame,
+    interval_label: str,
+    *,
+    ranking: bool = False,
+) -> list[str]:
+    """
+    scheduler_jobs.summary.display._collect_discord_top10_sections の置換版。
+    BUY TOP10 / SELL TOP10 見出しに、由来とサマリー結果時刻を表示する。
+    """
+    lines: list[str] = []
+
+    try:
+        import scheduler_jobs.summary.display as disp
+
+        source_label = _summary_source_label_for_discord(ranking)
+        summary_time = _latest_summary_time_for_discord(df)
+        title_prefix = "RANKING SUMMARY" if ranking else "PUSH SUMMARY"
+        meta = f"{source_label} / 結果時刻={summary_time}"
+
+        lines.append(f"========== 📊 {title_prefix} TOP10 ({interval_label}) / {meta} ==========")
+
+        lines.append(f"🔵 BUY TOP10【{meta}】")
+        buy_df = disp.prepare_buy_df(df)
+        if buy_df.empty:
+            lines.append(" (no buy candidates)")
+        else:
+            for i, (_, row) in enumerate(buy_df.head(10).iterrows(), start=1):
+                lines.append(disp._build_discord_candidate_2lines(i, row, side="BUY"))
+
+        lines.append(f"🔴 SELL TOP10【{meta}】")
+        sell_df = disp.prepare_sell_df(df)
+        if sell_df.empty:
+            lines.append(" (no sell candidates)")
+        else:
+            for i, (_, row) in enumerate(sell_df.head(10).iterrows(), start=1):
+                lines.append(disp._build_discord_candidate_2lines(i, row, side="SELL"))
+
+    except Exception:
+        logger.exception("[SUMMARY DISPLAY LABEL GUARD] patched discord top10 sections failed")
+
+    return lines
+
+
+def _patch_discord_top10_sections(disp: Any) -> bool:
+    try:
+        old = getattr(disp, "_collect_discord_top10_sections", None)
+        if getattr(old, "_summary_display_source_time_v1", False):
+            return True
+
+        _patched_collect_discord_top10_sections._summary_display_source_time_v1 = True  # type: ignore[attr-defined]
+        _patched_collect_discord_top10_sections._original = old  # type: ignore[attr-defined]
+        setattr(disp, "_collect_discord_top10_sections", _patched_collect_discord_top10_sections)
+        logger.warning("[SUMMARY DISPLAY LABEL GUARD] discord top10 source/time patch installed")
+        return True
+    except Exception:
+        logger.exception("[SUMMARY DISPLAY LABEL GUARD] discord top10 source/time patch failed")
+        return False
+
+
 def install() -> bool:
     global _PATCHED
     if _PATCHED:
@@ -139,8 +249,15 @@ def install() -> bool:
         except Exception:
             logger.debug("[SUMMARY DISPLAY LABEL GUARD] patch failed name=%s", name, exc_info=True)
 
-    _PATCHED = bool(patched)
-    logger.warning("[SUMMARY DISPLAY LABEL GUARD] installed=%s patched=%s", _PATCHED, patched)
+    discord_patched = _patch_discord_top10_sections(disp)
+
+    _PATCHED = bool(patched) or bool(discord_patched)
+    logger.warning(
+        "[SUMMARY DISPLAY LABEL GUARD] installed=%s patched=%s discord_source_time=%s",
+        _PATCHED,
+        patched,
+        discord_patched,
+    )
     return _PATCHED
 
 
