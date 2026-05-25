@@ -3,7 +3,7 @@
 #====================================================================================================
 # ============================================================
 # File   : scheduler_jobs/summary/runner_core.py
-# Version: PRODUCTION-STABLE-SUMMARY-RUNNER-CORE-V1.5-ENTRY-BEFORE-DISPLAY
+# Version: PRODUCTION-STABLE-SUMMARY-RUNNER-CORE-V1.6-ASYNC-DISPLAY
 # ------------------------------------------------------------
 # 【概要】
 #   PUSH / RANKING サマリーの実行本体。
@@ -21,21 +21,19 @@
 #   - PUSH は source="SUMMARY"
 #   - RANKING は source="RANKING"
 #
-# REV1.3:
-#   - summary_ai_entry_hook_v20 を使用
-#   - PUSH/RANKINGとも BUY TOP20 + SELL TOP20 をAIへ渡す
-#   - RANKINGではAI前段のtonosama/slopeフィルタをhook側でOFFにする
-#
-# REV1.4:
-#   - サマリー計算は main.py / main_database.py 両方で実行可能
-#   - DB保存は環境変数 AUTOSTOCK_SUMMARY_SAVE_OWNER で owner を制御
-#   - owner=database の場合、data collector/main_database 側だけ保存
-#   - main.py 側は計算・表示・AI/entryを継続し、DB保存だけskip可能
-#
 # REV1.5:
-#   - 表示/Discord送信が重く、SUMMARY PARALLEL timeout でAI entryまで到達しない問題を修正
 #   - AI entry hook を display より前に実行する
-#   - これにより SUMMARY TOP10 表示やDiscordが遅れても、AI_OK→発注処理を先に進める
+#
+# REV1.6:
+#   - 表示/Discord送信を非同期化する
+#   - PUSH 1m/3m/5m を毎分表示対象にした場合、Discord表示が重く
+#     SUMMARY PARALLEL timeout で親tickが90秒固まる問題を回避する
+#   - AI entry は従来どおり表示より先に同期実行
+#   - display=False の場合は従来どおり何もしない
+#
+# ENV:
+#   SUMMARY_DISPLAY_ASYNC=1       # 既定ON
+#   SUMMARY_DISPLAY_ASYNC_WORKERS=2
 # ============================================================
 
 from __future__ import annotations
@@ -43,6 +41,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import pandas as pd
@@ -75,9 +74,11 @@ from .time_utils import (
 
 logger = logging.getLogger(__name__)
 
+_DISPLAY_EXECUTOR: ThreadPoolExecutor | None = None
+
 
 # ============================================================
-# save owner gate
+# env helpers
 # ============================================================
 
 def _env_flag_value(name: str) -> str:
@@ -97,10 +98,43 @@ def _env_false(name: str) -> bool:
     return raw in ("0", "false", "no", "off", "disable", "disabled")
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    if _env_true(name):
+        return True
+    if _env_false(name):
+        return False
+    return bool(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return int(default)
+        return max(1, int(float(raw)))
+    except Exception:
+        return int(default)
+
+
+def _display_async_enabled() -> bool:
+    return _env_bool("SUMMARY_DISPLAY_ASYNC", True)
+
+
+def _display_executor() -> ThreadPoolExecutor:
+    global _DISPLAY_EXECUTOR
+    if _DISPLAY_EXECUTOR is None:
+        _DISPLAY_EXECUTOR = ThreadPoolExecutor(
+            max_workers=_env_int("SUMMARY_DISPLAY_ASYNC_WORKERS", 2),
+            thread_name_prefix="summary-display-async",
+        )
+    return _DISPLAY_EXECUTOR
+
+
+# ============================================================
+# save owner gate
+# ============================================================
+
 def _is_database_process() -> bool:
-    """
-    main_database.py / data_collectors_runner 配下のプロセス判定。
-    """
     return any(
         _env_true(name)
         for name in (
@@ -112,25 +146,6 @@ def _is_database_process() -> bool:
 
 
 def _summary_save_enabled() -> bool:
-    """
-    サマリーDB保存の owner をプロセスごとに切り替える。
-
-    環境変数:
-      AUTOSTOCK_SUMMARY_SAVE_MODE=disabled / calculate_only / no_save
-        -> 常に保存しない
-
-      AUTOSTOCK_SUMMARY_SAVE_MODE=enabled / save
-        -> 常に保存する
-
-      AUTOSTOCK_SUMMARY_SAVE_OWNER=database
-        -> main_database.py / data collectors 側だけ保存する
-
-      AUTOSTOCK_SUMMARY_SAVE_OWNER=main
-        -> main.py 側だけ保存する
-
-      未指定:
-        -> 従来互換として保存する
-    """
     mode = _env_flag_value("AUTOSTOCK_SUMMARY_SAVE_MODE")
     if mode in ("disabled", "disable", "calculate_only", "calc_only", "no_save", "skip", "off"):
         return False
@@ -146,8 +161,6 @@ def _summary_save_enabled() -> bool:
         return True
     if owner in ("none", "off", "disabled", "no_save"):
         return False
-
-    # owner未指定時は従来互換: 保存する
     return True
 
 
@@ -164,8 +177,7 @@ def _save_summary_if_owner(df: pd.DataFrame, interval: int, *, source: str) -> N
         return
 
     logger.info(
-        "[summary.runners] DB save skipped interval=%s source=%s owner=%s mode=%s db_process=%s "
-        "reason=summary_save_owner_gate",
+        "[summary.runners] DB save skipped interval=%s source=%s owner=%s mode=%s db_process=%s reason=summary_save_owner_gate",
         interval,
         source,
         os.getenv("AUTOSTOCK_SUMMARY_SAVE_OWNER", ""),
@@ -174,17 +186,13 @@ def _save_summary_if_owner(df: pd.DataFrame, interval: int, *, source: str) -> N
     )
 
 
+# ============================================================
+# AI before display
+# ============================================================
+
 def _run_push_ai_entry_before_display(df: pd.DataFrame, interval: int, now: dt.datetime, run_entry: bool) -> None:
-    """
-    表示/Discord送信より先にAI entryを走らせる。
-    表示処理が重い場合でも、エントリー機会を先に処理するため。
-    """
     if run_entry and interval in (1, 3, 5):
-        logger.info(
-            "[summary.runners] push AI entry requested before display interval=%s now=%s source=SUMMARY hook=v20",
-            interval,
-            now,
-        )
+        logger.info("[summary.runners] push AI entry requested before display interval=%s now=%s source=SUMMARY hook=v20", interval, now)
         run_summary_ai_entry_safe(interval=interval, now=now, df=df, source="SUMMARY")
     else:
         logger.info(
@@ -197,11 +205,7 @@ def _run_push_ai_entry_before_display(df: pd.DataFrame, interval: int, now: dt.d
 
 def _run_ranking_ai_entry_before_display(df: pd.DataFrame, interval: int, now: dt.datetime, run_entry: bool) -> None:
     if run_entry and interval in (1, 3, 5) and is_market_session(now):
-        logger.info(
-            "[summary.runners] ranking AI entry requested before display interval=%s now=%s source=RANKING hook=v20",
-            interval,
-            now,
-        )
+        logger.info("[summary.runners] ranking AI entry requested before display interval=%s now=%s source=RANKING hook=v20", interval, now)
         run_summary_ai_entry_safe(interval=interval, now=now, df=df, source="RANKING")
     else:
         logger.info(
@@ -214,59 +218,81 @@ def _run_ranking_ai_entry_before_display(df: pd.DataFrame, interval: int, now: d
 
 
 # ============================================================
+# async display helpers
+# ============================================================
+
+def _display_push_sync_or_async(df: pd.DataFrame, interval: int, now: dt.datetime, display: bool) -> None:
+    if not display:
+        logger.info("[summary.runners] display skipped interval=%s source=push reason=display_false", interval)
+        return
+
+    if not _display_async_enabled():
+        display_push_summary_safe(df, interval, now=now)
+        return
+
+    def _task() -> None:
+        try:
+            logger.info("[summary.runners] async display start source=push interval=%s now=%s rows=%s", interval, now, len(df) if isinstance(df, pd.DataFrame) else 0)
+            ok = display_push_summary_safe(df.copy() if isinstance(df, pd.DataFrame) else df, interval, now=now)
+            logger.info("[summary.runners] async display done source=push interval=%s ok=%s", interval, ok)
+        except Exception:
+            logger.exception("[summary.runners] async display failed source=push interval=%s now=%s", interval, now)
+
+    _display_executor().submit(_task)
+    logger.info("[summary.runners] async display submitted source=push interval=%s now=%s", interval, now)
+
+
+def _display_ranking_sync_or_async(df: pd.DataFrame, interval: int, now: dt.datetime, display: bool) -> None:
+    if not display:
+        logger.info("[summary.runners] display skipped interval=%s source=ranking reason=display_false", interval)
+        return
+
+    if not _display_async_enabled():
+        display_ranking_summary_safe(df, interval, now=now)
+        return
+
+    def _task() -> None:
+        try:
+            logger.info("[summary.runners] async display start source=ranking interval=%s now=%s rows=%s", interval, now, len(df) if isinstance(df, pd.DataFrame) else 0)
+            ok = display_ranking_summary_safe(df.copy() if isinstance(df, pd.DataFrame) else df, interval, now=now)
+            logger.info("[summary.runners] async display done source=ranking interval=%s ok=%s", interval, ok)
+        except Exception:
+            logger.exception("[summary.runners] async display failed source=ranking interval=%s now=%s", interval, now)
+
+    _display_executor().submit(_task)
+    logger.info("[summary.runners] async display submitted source=ranking interval=%s now=%s", interval, now)
+
+
+# ============================================================
 # public shortcut jobs
 # ============================================================
 
-def job_1m(
-    display: bool = True,
-    now: Optional[dt.datetime] = None,
-    run_entry: bool = True,
-) -> pd.DataFrame:
+def job_1m(display: bool = True, now: Optional[dt.datetime] = None, run_entry: bool = True) -> pd.DataFrame:
     logger.info("[summary.runners] job_1m start display=%s now=%s run_entry=%s", display, now, run_entry)
     return job_summary(1, display=display, now=now, run_entry=run_entry)
 
 
-def job_3m(
-    display: bool = True,
-    now: Optional[dt.datetime] = None,
-    run_entry: bool = True,
-) -> pd.DataFrame:
+def job_3m(display: bool = True, now: Optional[dt.datetime] = None, run_entry: bool = True) -> pd.DataFrame:
     logger.info("[summary.runners] job_3m start display=%s now=%s run_entry=%s", display, now, run_entry)
     return job_summary(3, display=display, now=now, run_entry=run_entry)
 
 
-def job_5m(
-    display: bool = True,
-    now: Optional[dt.datetime] = None,
-    run_entry: bool = True,
-) -> pd.DataFrame:
+def job_5m(display: bool = True, now: Optional[dt.datetime] = None, run_entry: bool = True) -> pd.DataFrame:
     logger.info("[summary.runners] job_5m start display=%s now=%s run_entry=%s", display, now, run_entry)
     return job_summary(5, display=display, now=now, run_entry=run_entry)
 
 
-def job_ranking_1m(
-    display: bool = True,
-    now: Optional[dt.datetime] = None,
-    run_entry: bool = True,
-) -> pd.DataFrame:
+def job_ranking_1m(display: bool = True, now: Optional[dt.datetime] = None, run_entry: bool = True) -> pd.DataFrame:
     logger.info("[summary.runners] job_ranking_1m start display=%s now=%s run_entry=%s", display, now, run_entry)
     return job_ranking_summary(1, display=display, now=now, run_entry=run_entry)
 
 
-def job_ranking_3m(
-    display: bool = True,
-    now: Optional[dt.datetime] = None,
-    run_entry: bool = True,
-) -> pd.DataFrame:
+def job_ranking_3m(display: bool = True, now: Optional[dt.datetime] = None, run_entry: bool = True) -> pd.DataFrame:
     logger.info("[summary.runners] job_ranking_3m start display=%s now=%s run_entry=%s", display, now, run_entry)
     return job_ranking_summary(3, display=display, now=now, run_entry=run_entry)
 
 
-def job_ranking_5m(
-    display: bool = True,
-    now: Optional[dt.datetime] = None,
-    run_entry: bool = True,
-) -> pd.DataFrame:
+def job_ranking_5m(display: bool = True, now: Optional[dt.datetime] = None, run_entry: bool = True) -> pd.DataFrame:
     logger.info("[summary.runners] job_ranking_5m start display=%s now=%s run_entry=%s", display, now, run_entry)
     return job_ranking_summary(5, display=display, now=now, run_entry=run_entry)
 
@@ -275,19 +301,12 @@ def job_ranking_5m(
 # PUSH summary job
 # ============================================================
 
-def job_summary(
-    interval: int,
-    display: bool = True,
-    now: Optional[dt.datetime] = None,
-    run_entry: bool = True,
-    **kwargs,
-) -> pd.DataFrame:
+def job_summary(interval: int, display: bool = True, now: Optional[dt.datetime] = None, run_entry: bool = True, **kwargs) -> pd.DataFrame:
     interval = int(interval)
     now = (now or now_naive()).replace(microsecond=0)
 
     logger.info(
-        "[summary.runners] job_summary(PUSH) start interval=%s display=%s run_entry=%s "
-        "now=%s slot=%s in_session=%s extra_keys=%s save_enabled=%s db_process=%s",
+        "[summary.runners] job_summary(PUSH) start interval=%s display=%s run_entry=%s now=%s slot=%s in_session=%s extra_keys=%s save_enabled=%s db_process=%s display_async=%s",
         interval,
         display,
         run_entry,
@@ -297,12 +316,12 @@ def job_summary(
         sorted(list(kwargs.keys())),
         _summary_save_enabled(),
         _is_database_process(),
+        _display_async_enabled(),
     )
 
     if not is_market_session(now):
         logger.info(
-            "[summary.runners] market closed/lunch interval=%s now=%s slot=%s "
-            "-> display latest persisted summary / fallback / rebuild if empty",
+            "[summary.runners] market closed/lunch interval=%s now=%s slot=%s -> display latest persisted summary / fallback / rebuild if empty",
             interval,
             now,
             floor_to_interval(now, interval),
@@ -315,18 +334,8 @@ def job_summary(
     if not callable(runner):
         raise RuntimeError("push summary runner is not available")
 
-    logger.info(
-        "[summary.runners] push runner resolved interval=%s runner=%s",
-        interval,
-        getattr(runner, "__name__", repr(runner)),
-    )
-
-    result = call_runner_with_optional_now(
-        runner,
-        interval=interval,
-        now=now,
-        **kwargs,
-    )
+    logger.info("[summary.runners] push runner resolved interval=%s runner=%s", interval, getattr(runner, "__name__", repr(runner)))
+    result = call_runner_with_optional_now(runner, interval=interval, now=now, **kwargs)
 
     df, meta = normalize_runner_output(result)
     log_df_state("push_after_normalize_runner_output", interval, df)
@@ -336,28 +345,15 @@ def job_summary(
 
     before_filter_rows = len(df)
     df = filter_push_like_rows(df)
-
-    logger.info(
-        "[summary.runners] filter_push_like_rows interval=%s before=%d after=%d",
-        interval,
-        before_filter_rows,
-        len(df),
-    )
+    logger.info("[summary.runners] filter_push_like_rows interval=%s before=%d after=%d", interval, before_filter_rows, len(df))
     log_df_state("push_after_filter_push_like_rows", interval, df)
 
     if not df.empty and looks_uncomputed_push_df(df):
-        logger.warning(
-            "[summary.runners] runner returned uncomputed PUSH df interval=%s latest_dt=%s -> trying fallback",
-            interval,
-            latest_dt_str(df),
-        )
+        logger.warning("[summary.runners] runner returned uncomputed PUSH df interval=%s latest_dt=%s -> trying fallback", interval, latest_dt_str(df))
         df = pd.DataFrame()
 
     if df.empty:
-        logger.warning(
-            "[summary.runners] runner returned empty PUSH interval=%s -> trying push-only fallback from db/cache",
-            interval,
-        )
+        logger.warning("[summary.runners] runner returned empty PUSH interval=%s -> trying push-only fallback from db/cache", interval)
         df = fallback_push_summary_df(interval, now=now)
         log_df_state("push_after_fallback_push_summary_df", interval, df)
 
@@ -366,37 +362,18 @@ def job_summary(
 
     before_clamp_rows = len(df)
     df = clamp_future_rows(df, interval=interval, now=now)
-
-    logger.info(
-        "[summary.runners] clamp_future_rows interval=%s source=push before=%d after=%d now=%s",
-        interval,
-        before_clamp_rows,
-        len(df),
-        now,
-    )
+    logger.info("[summary.runners] clamp_future_rows interval=%s source=push before=%d after=%d now=%s", interval, before_clamp_rows, len(df), now)
     log_df_state("push_after_clamp_future_rows", interval, df)
 
     if df.empty:
-        logger.warning(
-            "[summary.runners] job_summary(PUSH) empty after runner/fallback/clamp interval=%s now=%s "
-            "-> skip save/display/entry",
-            interval,
-            now,
-        )
+        logger.warning("[summary.runners] job_summary(PUSH) empty after runner/fallback/clamp interval=%s now=%s -> skip save/display/entry", interval, now)
         log_job_result("job_summary(PUSH-EMPTY)", interval, df, meta)
         return df
 
     _save_summary_if_owner(df, interval, source="push")
     log_job_result("job_summary(PUSH)", interval, df, meta)
-
-    # REV1.5: エントリー機会を優先するため、表示/Discordより先にAI entryを実行する。
     _run_push_ai_entry_before_display(df, interval, now, run_entry)
-
-    if display:
-        display_push_summary_safe(df, interval, now=now)
-    else:
-        logger.info("[summary.runners] display skipped interval=%s source=push reason=display_false", interval)
-
+    _display_push_sync_or_async(df, interval, now, display)
     return df
 
 
@@ -404,19 +381,12 @@ def job_summary(
 # RANKING summary job
 # ============================================================
 
-def job_ranking_summary(
-    interval: int,
-    display: bool = True,
-    now: Optional[dt.datetime] = None,
-    run_entry: bool = True,
-    **kwargs,
-) -> pd.DataFrame:
+def job_ranking_summary(interval: int, display: bool = True, now: Optional[dt.datetime] = None, run_entry: bool = True, **kwargs) -> pd.DataFrame:
     interval = int(interval)
     now = (now or now_naive()).replace(microsecond=0)
 
     logger.info(
-        "[summary.runners] job_ranking_summary(RANKING) start interval=%s display=%s run_entry=%s "
-        "now=%s slot=%s in_session=%s extra_keys=%s save_enabled=%s db_process=%s",
+        "[summary.runners] job_ranking_summary(RANKING) start interval=%s display=%s run_entry=%s now=%s slot=%s in_session=%s extra_keys=%s save_enabled=%s db_process=%s display_async=%s",
         interval,
         display,
         run_entry,
@@ -426,24 +396,15 @@ def job_ranking_summary(
         sorted(list(kwargs.keys())),
         _summary_save_enabled(),
         _is_database_process(),
+        _display_async_enabled(),
     )
 
     runner = resolve_ranking_summary_runner()
     if not callable(runner):
         raise RuntimeError("ranking summary runner is not available")
 
-    logger.info(
-        "[summary.runners] ranking runner resolved interval=%s runner=%s",
-        interval,
-        getattr(runner, "__name__", repr(runner)),
-    )
-
-    result = call_runner_with_optional_now(
-        runner,
-        interval=interval,
-        now=now,
-        **kwargs,
-    )
+    logger.info("[summary.runners] ranking runner resolved interval=%s runner=%s", interval, getattr(runner, "__name__", repr(runner)))
+    result = call_runner_with_optional_now(runner, interval=interval, now=now, **kwargs)
 
     df, meta = normalize_runner_output(result)
     log_df_state("ranking_after_normalize_runner_output", interval, df)
@@ -452,20 +413,11 @@ def job_ranking_summary(
     log_df_state("ranking_after_normalize_df", interval, df)
 
     if not df.empty and looks_uncomputed_ranking_df(df):
-        logger.warning(
-            "[summary.runners] ranking runner returned uncomputed RANKING df interval=%s latest_dt=%s "
-            "-> trying fallback",
-            interval,
-            latest_dt_str(df),
-        )
+        logger.warning("[summary.runners] ranking runner returned uncomputed RANKING df interval=%s latest_dt=%s -> trying fallback", interval, latest_dt_str(df))
         df = pd.DataFrame()
 
     if df.empty:
-        logger.warning(
-            "[summary.runners] ranking runner returned empty interval=%s "
-            "-> trying ranking-only fallback from cache/global_data",
-            interval,
-        )
+        logger.warning("[summary.runners] ranking runner returned empty interval=%s -> trying ranking-only fallback from cache/global_data", interval)
         df = fallback_ranking_summary_df(interval, now=now)
         log_df_state("ranking_after_fallback_ranking_summary_df", interval, df)
 
@@ -474,37 +426,18 @@ def job_ranking_summary(
 
     before_clamp_rows = len(df)
     df = clamp_future_rows(df, interval=interval, now=now)
-
-    logger.info(
-        "[summary.runners] clamp_future_rows interval=%s source=ranking before=%d after=%d now=%s",
-        interval,
-        before_clamp_rows,
-        len(df),
-        now,
-    )
+    logger.info("[summary.runners] clamp_future_rows interval=%s source=ranking before=%d after=%d now=%s", interval, before_clamp_rows, len(df), now)
     log_df_state("ranking_after_clamp_future_rows", interval, df)
 
     if df.empty:
-        logger.warning(
-            "[summary.runners] job_ranking_summary(RANKING) empty after runner/fallback/clamp interval=%s now=%s "
-            "-> skip save/display/entry",
-            interval,
-            now,
-        )
+        logger.warning("[summary.runners] job_ranking_summary(RANKING) empty after runner/fallback/clamp interval=%s now=%s -> skip save/display/entry", interval, now)
         log_job_result("job_ranking_summary(RANKING-EMPTY)", interval, df, meta)
         return df
 
     _save_summary_if_owner(df, interval, source="ranking")
     log_job_result("job_ranking_summary(RANKING)", interval, df, meta)
-
-    # REV1.5: RANKING由来もAI entryを表示より先に実行する。
     _run_ranking_ai_entry_before_display(df, interval, now, run_entry)
-
-    if display:
-        display_ranking_summary_safe(df, interval, now=now)
-    else:
-        logger.info("[summary.runners] display skipped interval=%s source=ranking reason=display_false", interval)
-
+    _display_ranking_sync_or_async(df, interval, now, display)
     return df
 
 
@@ -512,23 +445,11 @@ def job_ranking_summary(
 # compatibility aliases
 # ============================================================
 
-def run_push_summary_job(
-    interval: int | str = 1,
-    display: bool = True,
-    now: Optional[dt.datetime] = None,
-    run_entry: bool = True,
-    **kwargs,
-) -> pd.DataFrame:
+def run_push_summary_job(interval: int | str = 1, display: bool = True, now: Optional[dt.datetime] = None, run_entry: bool = True, **kwargs) -> pd.DataFrame:
     return job_summary(int(interval), display=display, now=now, run_entry=run_entry, **kwargs)
 
 
-def run_ranking_summary_job(
-    interval: int | str = 1,
-    display: bool = True,
-    now: Optional[dt.datetime] = None,
-    run_entry: bool = True,
-    **kwargs,
-) -> pd.DataFrame:
+def run_ranking_summary_job(interval: int | str = 1, display: bool = True, now: Optional[dt.datetime] = None, run_entry: bool = True, **kwargs) -> pd.DataFrame:
     return job_ranking_summary(int(interval), display=display, now=now, run_entry=run_entry, **kwargs)
 
 
