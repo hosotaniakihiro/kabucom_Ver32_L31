@@ -12,11 +12,18 @@ _ORIGINAL_RESOLVE = None
 _ORIGINAL_STORE = None
 _ORIGINAL_PUBLIC: dict[str, Callable] = {}
 
+# 履歴から復元したい列。PUSH再接続直後やfallback summaryでは、最新行だけが残り
+# macd/signal/slope が 0 に戻ることがあるため、同一銘柄の過去の非ゼロ値で補完する。
 _TECH_FILL_COLS = (
     "ma5", "ma25", "ma75", "rsi", "macd", "signal", "hist", "atr",
     "slope", "slope_atr_scaled", "score_slope", "mtf", "score_mtf", "mtf_score",
     "technical_ready", "symbol_hist_len",
 )
+
+_NONZERO_PREFERRED_COLS = {
+    "macd", "signal", "hist", "rsi", "slope", "slope_atr_scaled", "score_slope",
+    "mtf", "score_mtf", "mtf_score", "technical_ready", "symbol_hist_len",
+}
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -85,6 +92,30 @@ def _nonzero(df: pd.DataFrame, col: str) -> int:
         return -1
 
 
+def _is_blank(v: Any) -> bool:
+    try:
+        return bool(pd.isna(v))
+    except Exception:
+        return str(v).strip() in {"", "None", "nan", "NaN"}
+
+
+def _is_zero_like(v: Any) -> bool:
+    if _is_blank(v):
+        return True
+    try:
+        return float(v) == 0.0
+    except Exception:
+        return str(v).strip() in {"", "0", "0.0", "False", "false", "None"}
+
+
+def _is_useful_value(v: Any, *, prefer_nonzero: bool) -> bool:
+    if _is_blank(v):
+        return False
+    if prefer_nonzero:
+        return not _is_zero_like(v)
+    return True
+
+
 def _gc():
     try:
         from core.global_context.context import global_context as GC
@@ -141,6 +172,52 @@ def _latest_by_symbol(df: pd.DataFrame) -> pd.DataFrame:
     if "datetime" in out.columns:
         out = out.sort_values(["symbol", "datetime"], kind="stable")
     return out.drop_duplicates(subset=["symbol"], keep="last").reset_index(drop=True)
+
+
+def _build_best_history_by_symbol(hist: pd.DataFrame) -> dict[str, dict[str, Any]]:
+    """
+    最新行が 0 の場合でも、同一銘柄の過去履歴から非ゼロのテクニカル値を拾う。
+    WebSocket reconnect 後の fallback DF で macd/signal が 0 へ退行する対策。
+    """
+    df = _normalize(hist)
+    if df.empty or "symbol" not in df.columns:
+        return {}
+    if "datetime" in df.columns:
+        df = df.sort_values(["symbol", "datetime"], kind="stable")
+
+    result: dict[str, dict[str, Any]] = {}
+    for sym, g in df.groupby("symbol", sort=False):
+        sym_s = str(sym).strip()
+        if not sym_s:
+            continue
+        best: dict[str, Any] = {}
+        latest_row = g.iloc[-1]
+
+        # 非テクニカルの基礎値は最新行を採用
+        for col in ("symbol", "symbolname", "datetime", "close", "close_price", "price", "volume"):
+            if col in g.columns:
+                best[col] = latest_row.get(col)
+
+        for col in _TECH_FILL_COLS:
+            if col not in g.columns:
+                continue
+            prefer_nonzero = col in _NONZERO_PREFERRED_COLS
+            val = None
+            # 最新から過去へ見て、非ゼロ優先列は非ゼロ値、その他は非NULL値を採用
+            for v in reversed(list(g[col].values)):
+                if _is_useful_value(v, prefer_nonzero=prefer_nonzero):
+                    val = v
+                    break
+            # 非ゼロ値が無い場合でも、最新がNULLでなければ最後の値を保持
+            if val is None:
+                lv = latest_row.get(col)
+                if not _is_blank(lv):
+                    val = lv
+            if val is not None:
+                best[col] = val
+
+        result[sym_s] = best
+    return result
 
 
 def _tf_signal(row: pd.Series) -> float:
@@ -242,12 +319,7 @@ def _build_mtf_map() -> dict[str, dict[str, float]]:
 
 
 def _need_fill_mtf_value(v: Any) -> bool:
-    try:
-        if pd.isna(v):
-            return True
-        return float(v) == 0.0
-    except Exception:
-        return str(v).strip() in {"", "0", "0.0", "False", "None"}
+    return _is_zero_like(v)
 
 
 def _apply_mtf_rebuild(df: pd.DataFrame, interval: int, *, context: str) -> pd.DataFrame:
@@ -306,41 +378,60 @@ def _patched_resolve(interval: int) -> pd.DataFrame:
 
 def _fill_from_history(df: pd.DataFrame, hist: pd.DataFrame, interval: int, *, context: str = "store") -> pd.DataFrame:
     out = _normalize(df)
-    latest = _latest_by_symbol(hist)
     if out.empty:
         return out
-    if not latest.empty:
-        latest = latest.set_index("symbol", drop=False)
+
+    best_map = _build_best_history_by_symbol(hist)
     fill_count = 0
     hit_count = 0
+    macd_fill = 0
+    signal_fill = 0
+    slope_fill = 0
+
     for idx, row in out.iterrows():
         sym = str(row.get("symbol", "")).strip()
-        if not sym or latest.empty or sym not in latest.index:
+        if not sym or sym not in best_map:
             continue
         hit_count += 1
-        hrow = latest.loc[sym]
-        if isinstance(hrow, pd.DataFrame):
-            hrow = hrow.iloc[-1]
+        best = best_map[sym]
         for col in _TECH_FILL_COLS:
-            if col not in hrow.index or pd.isna(hrow.get(col)):
+            if col not in best or _is_blank(best.get(col)):
                 continue
             if col not in out.columns:
                 out[col] = pd.NA
             cur = out.at[idx, col]
-            need = pd.isna(cur)
-            if not need:
-                try:
-                    need = float(cur) == 0.0 and float(hrow.get(col)) != 0.0
-                except Exception:
-                    need = str(cur).strip() in {"", "0", "0.0", "False"}
+            prefer_nonzero = col in _NONZERO_PREFERRED_COLS
+            need = _is_blank(cur) or (prefer_nonzero and _is_zero_like(cur) and not _is_zero_like(best.get(col)))
             if need:
-                out.at[idx, col] = hrow.get(col)
+                out.at[idx, col] = best.get(col)
                 fill_count += 1
+                if col == "macd":
+                    macd_fill += 1
+                elif col == "signal":
+                    signal_fill += 1
+                elif col in {"slope", "slope_atr_scaled", "score_slope"}:
+                    slope_fill += 1
+
+    # macd/signal/slope が戻った行は technical_ready も立て直す。
+    try:
+        if "technical_ready" not in out.columns:
+            out["technical_ready"] = False
+        macd_nz = pd.to_numeric(out.get("macd"), errors="coerce").fillna(0) != 0 if "macd" in out.columns else False
+        sig_nz = pd.to_numeric(out.get("signal"), errors="coerce").fillna(0) != 0 if "signal" in out.columns else False
+        rsi_ok = pd.to_numeric(out.get("rsi"), errors="coerce").fillna(0) != 0 if "rsi" in out.columns else False
+        ready = macd_nz | sig_nz | rsi_ok
+        out.loc[ready, "technical_ready"] = True
+        if "symbol_hist_len" not in out.columns:
+            out["symbol_hist_len"] = pd.NA
+        out.loc[ready & out["symbol_hist_len"].isna(), "symbol_hist_len"] = 3
+    except Exception:
+        logger.exception("[PUSH HISTORY PATCH] technical_ready rebuild failed interval=%s context=%s", interval, context)
+
     out = _apply_mtf_rebuild(out, interval, context=context)
     logger.warning(
-        "[PUSH HISTORY PATCH] filled context=%s interval=%s rows=%s hits=%s fill_count=%s macd=%s signal=%s mtf=%s score_mtf=%s",
-        context, interval, len(out), hit_count, fill_count,
-        _nonzero(out, "macd"), _nonzero(out, "signal"), _nonzero(out, "mtf"), _nonzero(out, "score_mtf"),
+        "[PUSH HISTORY PATCH] filled context=%s interval=%s rows=%s hits=%s fill_count=%s macd_fill=%s signal_fill=%s slope_fill=%s macd=%s signal=%s mtf=%s score_mtf=%s ready=%s",
+        context, interval, len(out), hit_count, fill_count, macd_fill, signal_fill, slope_fill,
+        _nonzero(out, "macd"), _nonzero(out, "signal"), _nonzero(out, "mtf"), _nonzero(out, "score_mtf"), _nonzero(out, "technical_ready"),
     )
     return out
 
@@ -352,6 +443,9 @@ def _merge_history(hist: pd.DataFrame, latest: pd.DataFrame, interval: int) -> p
         return latest
     if latest.empty:
         return hist
+
+    # latest は既に _fill_from_history 済みだが、同一 symbol/datetime の重複で
+    # 非ゼロテクニカルが 0 に戻らないように latest を後勝ちにしつつ補完済み値を保持する。
     merged = pd.concat([hist, latest], ignore_index=True, sort=False)
     if "source" not in merged.columns:
         merged["source"] = "push"
@@ -439,7 +533,7 @@ def install() -> bool:
                 logger.warning("[PUSH HISTORY PATCH] patched public %s", name)
 
         _PATCHED = True
-        logger.warning("[PUSH HISTORY PATCH] installed V3 return-filled mtf-rebuild")
+        logger.warning("[PUSH HISTORY PATCH] installed V4 return-filled mtf-rebuild macd-signal-preserve")
         return True
     except Exception:
         logger.exception("[PUSH HISTORY PATCH] install failed")
