@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/tonosama/pending_writer.py
-# Version: Ver1.2-TONOSAMA-PENDING-EXPIRE-PRUNE-ROBUST
+# Version: Ver1.3-TONOSAMA-PENDING-JA-REASONS
 # ------------------------------------------------------------
 # Fix:
 #   - TONOSAMA候補が毎回 duplicate 扱いになり、registered=0 のまま
@@ -9,6 +9,9 @@
 #   - has_tonosama_pending() の前に対象銘柄の期限切れTONOSAMAを prune する。
 #   - ループ側から全体掃除できる prune_expired_tonosama_pending() も維持。
 #   - pandas.Timestamp / datetime文字列 / timezone付き文字列を安全に解釈。
+# Ver1.3:
+#   - Discord表示用の理由を日本語化。
+#   - pending は「難病保持」ではなく「発注待ち候補」であることが分かるようにする。
 # ============================================================
 from __future__ import annotations
 
@@ -152,10 +155,34 @@ def has_tonosama_pending(symbol: str) -> bool:
     return any(_is_tonosama_entry(e) for e in bucket if isinstance(e, dict))
 
 
+def _build_reason_ja(row: pd.Series, *, ai_reason: str) -> str:
+    max_surge = safe_float(row.get("_max_volume_surge_ratio"), 0.0)
+    max_chg = safe_float(row.get("_max_price_change_pct"), 0.0)
+    chg_5s = safe_float(row.get("price_change_5s_pct"), 0.0)
+    has_5s = bool(row.get("has_5sec_bar", False))
+    slope = safe_float(row.get("_slope"), 0.0)
+    tf = str(row.get("_surge_tf", ""))
+
+    parts = [
+        f"{tf or '3m/5m'}で出来高急増 {max_surge:.2f}倍",
+        f"価格変化 {max_chg:.2f}%",
+        f"傾き {slope:.4f}",
+    ]
+    if has_5s:
+        parts.append(f"5秒変化 {chg_5s:.3f}%")
+    else:
+        parts.append("5秒足なしのため3m/5m条件で判定")
+
+    if ai_reason:
+        parts.append(f"AI判定: {ai_reason}")
+    return " / ".join(parts)
+
+
 def build_pending_entry(row: pd.Series, *, final_score: float, ai_prob: float, ai_reason: str) -> dict[str, Any]:
     now = dt.datetime.now()
     expire_at = now + dt.timedelta(seconds=TONOSAMA_EXPIRE_SEC)
     symbol = normalize_symbol(row.get("symbol"))
+    reason_ja = _build_reason_ja(row, ai_reason=ai_reason)
     return {
         "symbol": symbol,
         "symbolname": str(row.get("symbolname", "")),
@@ -173,7 +200,8 @@ def build_pending_entry(row: pd.Series, *, final_score: float, ai_prob: float, a
         "expire_at": expire_at,
         "entry_conditions": {
             "expire_at": expire_at,
-            "reason": "3m_5m_volume_surge_price_change_5sec_ai",
+            "reason": reason_ja,
+            "reason_code": "tonosama_volume_surge_price_change_5sec_ai",
             "ai_reason": ai_reason,
             "volume_surge_ratio_3m": safe_float(row.get("volume_surge_ratio_3m"), 0.0),
             "volume_surge_ratio_5m": safe_float(row.get("volume_surge_ratio_5m"), 0.0),
