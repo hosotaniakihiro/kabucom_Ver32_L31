@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/tonosama/runner.py
-# Version: Ver1.3-TONOSAMA-ACTUAL-MOVEMENT-GUARD
+# Version: Ver1.4-TONOSAMA-PRUNE-PENDING-AND-STRICT-5SEC
 # ------------------------------------------------------------
 # ✔ 15秒ジョブが100秒以上詰まる原因を修正
 # ✔ 5秒足特徴量取得を全銘柄ではなく一次フィルタ通過後の上位だけに限定
@@ -12,6 +12,10 @@
 #    - 1分足 open→close 実体変化率
 #    - 1分足 high-low 値幅率
 #   を一次/最終フィルタに追加
+# ✔ Ver1.4:
+#    - ループ開始時に期限切れTONOSAMA pendingを掃除
+#    - has_5sec_bar=True かつ price_change_5s_pct <= 0 は候補除外
+#      （0.0%で止まっている銘柄の誤アラート防止）
 # ============================================================
 from __future__ import annotations
 
@@ -49,7 +53,12 @@ from .volume_surge import build_scalping_feature_df
 from .five_sec_features import build_5sec_features
 from .scoring import prepare_entry_scores, calc_final_score_safe
 from .ai_gate import ai_check_tonosama_entry
-from .pending_writer import has_tonosama_pending, build_pending_entry, add_tonosama_pending
+from .pending_writer import (
+    has_tonosama_pending,
+    build_pending_entry,
+    add_tonosama_pending,
+    prune_expired_tonosama_pending,
+)
 from .notifier import notify_discord_tonosama_pending
 from .utils import normalize_symbol, safe_float
 
@@ -102,7 +111,6 @@ def _ensure_actual_movement_cols(df: pd.DataFrame) -> pd.DataFrame:
         close_s = pd.to_numeric(x["_tonosama_close_for_move"], errors="coerce")
         x["_body_change_pct"] = ((close_s - open_s).abs() / open_s.replace(0, pd.NA) * 100.0).replace([float("inf"), -float("inf")], pd.NA).fillna(0.0)
     else:
-        # open が無い場合は 3m/5m price_change を代用。無ければ0にして動いていない扱い。
         x["_body_change_pct"] = _num_series(x, "_max_price_change_pct", 0.0).abs()
 
     if high_col and low_col:
@@ -433,13 +441,14 @@ def iter_tonosama_candidate_rows() -> pd.DataFrame:
         before = x.copy()
         has_bar = _bool_series(x, "has_5sec_bar")
         chg_5s = _num_series(x, "price_change_5s_pct")
-        x = x[(~has_bar) | ((chg_5s >= MIN_5SEC_PRICE_CHANGE_PCT) & (chg_5s > MAX_5SEC_DROP_PCT))]
+        # Ver1.4: 5秒足があるのに 0.0% 以下なら「動いていない」ので必ず除外。
+        x = x[(~has_bar) | ((chg_5s > 0.0) & (chg_5s >= MIN_5SEC_PRICE_CHANGE_PCT) & (chg_5s > MAX_5SEC_DROP_PCT))]
         _log_filter_step(
             stage="5sec",
             before=before,
             after=x,
-            reason="five_sec_price_change_ng",
-            threshold={"MIN_5SEC_PRICE_CHANGE_PCT": MIN_5SEC_PRICE_CHANGE_PCT, "MAX_5SEC_DROP_PCT": MAX_5SEC_DROP_PCT, "REQUIRE_5SEC_BAR": REQUIRE_5SEC_BAR},
+            reason="five_sec_price_change_ng_or_zero",
+            threshold={"MIN_5SEC_PRICE_CHANGE_PCT": MIN_5SEC_PRICE_CHANGE_PCT, "REQUIRE_POSITIVE_5SEC_CHANGE": True, "MAX_5SEC_DROP_PCT": MAX_5SEC_DROP_PCT, "REQUIRE_5SEC_BAR": REQUIRE_5SEC_BAR},
             sample_cols=sample_cols,
         )
     elif USE_5SEC_CONFIRM:
@@ -567,6 +576,10 @@ def tonosama_loop() -> int:
         if not is_market_time():
             logger.info("[TONOSAMA ENTRY] market closed skip")
             return 0
+
+        pruned = prune_expired_tonosama_pending(reason="TONOSAMA_LOOP_START_EXPIRED")
+        if pruned:
+            logger.warning("[TONOSAMA LOOP] expired pending pruned at start removed=%s", pruned)
 
         if callable(update_active_symbols):
             try:
