@@ -1,6 +1,6 @@
 # ============================================================
 # File   : scheduler_jobs/summary/time_locked_runner.py
-# Version: PRODUCTION-STABLE-TIME-LOCKED-SUMMARY-RUNNER-V1.0
+# Version: PRODUCTION-STABLE-TIME-LOCKED-SUMMARY-RUNNER-V1.1-PUSH-ALL-INTERVAL-DISPLAY
 # ------------------------------------------------------------
 # 【概要】
 #   毎時0分起点の 1min / 3min / 5min 定時実行を管理する。
@@ -8,14 +8,25 @@
 # 【主な機能】
 #   - market session 内: PUSH / RANKING 実行
 #   - market session 外: PUSH の保存済み最新サマリー表示
-#   - 1min 毎分、3min :00/:03、5min :00/:05
+#   - RANKING は従来通り 1min 毎分、3min :00/:03、5min :00/:05
+#   - PUSH由来サマリーは、Discord/画面確認用に 1min / 3min / 5min を毎回表示する
 #   - 時間外は ranking / entry を止める
+#
+# 【重要 V1.1】
+#   ユーザー要望:
+#     「PUSH由来のランキングは1分足、3分足、5分足を表示させて」
+#
+#   対応:
+#     - 親tickが1分ごとに動くたび、PUSH側は [1, 3, 5] を対象にする
+#     - RANKING側は従来通り interval boundary のみ実行する
+#     - 無効化したい場合は環境変数 SUMMARY_PUSH_DISPLAY_ALL_INTERVALS=0
 # ============================================================
 
 from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 from typing import Optional
 
 import pandas as pd
@@ -31,22 +42,47 @@ from .time_utils import (
 logger = logging.getLogger(__name__)
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    try:
+        raw = str(os.getenv(name, "")).strip().lower()
+        if raw in ("1", "true", "yes", "on", "enable", "enabled"):
+            return True
+        if raw in ("0", "false", "no", "off", "disable", "disabled"):
+            return False
+    except Exception:
+        pass
+    return bool(default)
+
+
+def _push_display_all_intervals_enabled() -> bool:
+    """
+    PUSH由来サマリーは毎分 1m/3m/5m を表示する。
+
+    3m/5mの計算自体が重い場合だけ、
+    SUMMARY_PUSH_DISPLAY_ALL_INTERVALS=0 にすると従来の時間境界実行へ戻せる。
+    """
+    return _env_flag("SUMMARY_PUSH_DISPLAY_ALL_INTERVALS", default=True)
+
+
+def _all_summary_intervals() -> list[int]:
+    return [1, 3, 5]
+
+
 def closed_market_display_targets(now: dt.datetime) -> list[int]:
     """
     時間外 / 昼休み / 休場日でも表示する対象 interval を作る。
 
-    要件:
-      - 1分足: 毎分
-      - 3分足: 毎時0分起点で 00,03,06,...,57
-      - 5分足: 毎時0分起点で 00,05,10,...,55
-
-    resolve_target_intervals(now) が market session 外で [] を返しても、
-    保存済み最新サマリー表示へ到達させるための救済。
+    V1.1:
+      PUSH表示は常に 1m/3m/5m を見たいので、既定では [1,3,5] を返す。
+      従来周期へ戻す場合のみ SUMMARY_PUSH_DISPLAY_ALL_INTERVALS=0。
     """
     try:
         n = (now or now_naive()).replace(second=0, microsecond=0)
     except Exception:
         n = now_naive().replace(second=0, microsecond=0)
+
+    if _push_display_all_intervals_enabled():
+        return _all_summary_intervals()
 
     targets = [1]
 
@@ -65,6 +101,16 @@ def closed_market_display_targets(now: dt.datetime) -> list[int]:
     return sorted(list(dict.fromkeys(targets)))
 
 
+def _push_targets_from_time_locked_targets(targets: list[int]) -> list[int]:
+    """
+    PUSH側だけは毎分 1m/3m/5m を表示対象にする。
+    RANKING側は resolve_target_intervals の結果をそのまま使う。
+    """
+    if _push_display_all_intervals_enabled():
+        return _all_summary_intervals()
+    return sorted(list(dict.fromkeys(int(x) for x in (targets or []))))
+
+
 def run_time_locked_summary_jobs(
     *,
     now: Optional[dt.datetime] = None,
@@ -77,38 +123,41 @@ def run_time_locked_summary_jobs(
     毎時0分起点の定時サマリー実行。
 
     market session 内:
-      - resolve_target_intervals(now) に従い PUSH計算 / RANKING計算 / 表示
+      - PUSH: 既定で 1m / 3m / 5m を毎回計算・表示
+      - RANKING: resolve_target_intervals(now) に従い、従来通り時間境界のみ計算・表示
 
     market session 外 / 昼休み / 休場日:
-      - resolve_target_intervals(now) が [] でも早期returnしない
-      - 1m/3m/5m の周期に従い job_summary() を呼ぶ
-      - job_summary() 内の display_closed_market_push_summary() に到達させる
+      - PUSH: 保存済み最新サマリー表示へ到達させる
       - RANKING は時間外では原則 skip
       - entry pipeline も時間外では skip
     """
     now = (now or now_naive()).replace(microsecond=0)
     in_session = is_market_session(now)
 
-    targets = resolve_target_intervals(now)
-    original_targets = list(targets or [])
+    ranking_targets = resolve_target_intervals(now)
+    original_targets = list(ranking_targets or [])
 
-    if not targets and not in_session:
-        targets = closed_market_display_targets(now)
+    if not ranking_targets and not in_session:
+        ranking_targets = closed_market_display_targets(now)
         logger.warning(
             "[summary.runners] time-locked targets rescued for closed-market display "
             "now=%s original_targets=%s rescued_targets=%s in_session=%s",
             now,
             original_targets,
-            targets,
+            ranking_targets,
             in_session,
         )
 
+    push_targets = _push_targets_from_time_locked_targets(ranking_targets)
+
     logger.info(
-        "[summary.runners] time-locked tick now=%s targets=%s original_targets=%s "
-        "run_push=%s run_ranking=%s display=%s run_entry=%s in_session=%s",
+        "[summary.runners] time-locked tick now=%s push_targets=%s ranking_targets=%s original_targets=%s "
+        "push_all_intervals=%s run_push=%s run_ranking=%s display=%s run_entry=%s in_session=%s",
         now,
-        targets,
+        push_targets,
+        ranking_targets,
         original_targets,
+        _push_display_all_intervals_enabled(),
         run_push,
         run_ranking,
         display,
@@ -121,7 +170,7 @@ def run_time_locked_summary_jobs(
         "ranking": {},
     }
 
-    if not targets:
+    if not push_targets and not ranking_targets:
         logger.info(
             "[summary.runners] time-locked tick skipped now=%s reason=no_target_intervals in_session=%s",
             now,
@@ -129,17 +178,17 @@ def run_time_locked_summary_jobs(
         )
         return out
 
-    for interval in targets:
-        interval = int(interval)
-
-        if run_push:
+    if run_push:
+        for interval in push_targets:
+            interval = int(interval)
             try:
                 logger.info(
-                    "[summary.runners] time-locked push begin interval=%s now=%s in_session=%s display=%s",
+                    "[summary.runners] time-locked push begin interval=%s now=%s in_session=%s display=%s push_all_intervals=%s",
                     interval,
                     now,
                     in_session,
                     display,
+                    _push_display_all_intervals_enabled(),
                 )
 
                 out["push"][interval] = job_summary(
@@ -165,15 +214,15 @@ def run_time_locked_summary_jobs(
                     in_session,
                 )
                 out["push"][interval] = pd.DataFrame()
+    else:
+        logger.info(
+            "[summary.runners] time-locked push skipped now=%s reason=run_push_false push_targets=%s",
+            now,
+            push_targets,
+        )
 
-        else:
-            logger.info(
-                "[summary.runners] time-locked push skipped interval=%s now=%s reason=run_push_false",
-                interval,
-                now,
-            )
-
-        if run_ranking and in_session:
+    if run_ranking and in_session:
+        for interval in sorted(list(dict.fromkeys(int(x) for x in (ranking_targets or [])))):
             try:
                 logger.info(
                     "[summary.runners] time-locked ranking begin interval=%s now=%s",
@@ -203,18 +252,18 @@ def run_time_locked_summary_jobs(
                 )
                 out["ranking"][interval] = pd.DataFrame()
 
-        elif run_ranking and not in_session:
-            logger.info(
-                "[summary.runners] time-locked ranking skipped interval=%s now=%s reason=closed_market_or_lunch",
-                interval,
-                now,
-            )
+    elif run_ranking and not in_session:
+        logger.info(
+            "[summary.runners] time-locked ranking skipped now=%s targets=%s reason=closed_market_or_lunch",
+            now,
+            ranking_targets,
+        )
 
-        else:
-            logger.info(
-                "[summary.runners] time-locked ranking skipped interval=%s now=%s reason=run_ranking_false",
-                interval,
-                now,
-            )
+    else:
+        logger.info(
+            "[summary.runners] time-locked ranking skipped now=%s targets=%s reason=run_ranking_false",
+            now,
+            ranking_targets,
+        )
 
     return out
