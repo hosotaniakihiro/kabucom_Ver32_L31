@@ -10,7 +10,7 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.16-DISCORD-SUMMARY-COMPACT
+# Version: Ver38.17-MAIN-LIGHT-SUMMARY-5SEC-FILTER-TUNE
 # ------------------------------------------------------------
 # ✔ PROJECT_ROOT を最初に sys.path へ追加
 # ✔ core.logging.console_tee を確実に import / setup
@@ -31,6 +31,8 @@
 # ✔ main.py 側の scheduler / realtime / position_sync / push_monitor 生存証跡を heartbeat DB に保存
 # ✔ main.py のサマリー計算結果はENTRY判定専用。正式なsummary DB保存は main_database.py 側へ寄せる
 # ✔ main.py では optional ingest / kabutan取得 / daily_watchlist作成を既定スキップ
+# ✔ main.py では毎分 1m/3m/5m summary 強制作成を止め、timeoutを防ぐ
+# ✔ TONOSAMA 5秒足値動きフィルタを 0.03% → 0.01% に緩和
 # ✔ 既存の起動処理は維持
 # ============================================================
 
@@ -51,6 +53,23 @@ if PROJECT_ROOT not in sys.path:
 os.environ.setdefault("SUMMARY_MAIN_ENTRY_ONLY", "1")
 os.environ.setdefault("SUMMARY_SKIP_DB_SAVE_IN_MAIN", "1")
 os.environ.setdefault("SUMMARY_DB_WRITER_ROLE", "entry_only")
+
+# main.py では DB seed 済みの履歴を使う。
+# 毎分 1m/3m/5m を全部強制作成すると scheduler が90秒timeoutしやすいため、
+# 本来の対象足だけ実行する。
+os.environ.setdefault("SUMMARY_PARALLEL_FORCE_1_3_5", "0")
+os.environ.setdefault("SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC", "90")
+os.environ.setdefault("SUMMARY_PARALLEL_TIMEOUT_MIN_SEC", "90")
+os.environ.setdefault("SUMMARY_PARALLEL_INTERVAL_WORKERS", "3")
+
+# TONOSAMA / 5秒足フィルタ調整。
+# 直近ログで price_change_5s_pct=0.0 / MIN_5SEC_PRICE_CHANGE_PCT=0.03 により
+# 候補が全落ちしていたため、動き始めを拾えるよう既定を 0.01% に緩和する。
+# 既にbat/settings側で明示されている場合はそちらを優先する。
+os.environ.setdefault("MIN_5SEC_PRICE_CHANGE_PCT", "0.01")
+os.environ.setdefault("TONOSAMA_MIN_5SEC_PRICE_CHANGE_PCT", "0.01")
+os.environ.setdefault("ENTRY_MIN_5SEC_PRICE_CHANGE_PCT", "0.01")
+os.environ.setdefault("SUMMARY_AI_MIN_5SEC_PRICE_CHANGE_PCT", "0.01")
 
 # main.py は売買/PUSH起動優先。
 # Kabutan取得・optional DB更新・daily_watchlist作成は main_database.py 側へ寄せる。
@@ -542,6 +561,8 @@ def main():
     logger.info("CONSOLE_LOG_PATH=%s", CONSOLE_LOG_PATH)
     logger.info("force_run=%s", force_run)
     logger.warning("[MAIN SUMMARY ROLE] entry_only=%s skip_db_save=%s writer_role=%s", os.environ.get("SUMMARY_MAIN_ENTRY_ONLY"), os.environ.get("SUMMARY_SKIP_DB_SAVE_IN_MAIN"), os.environ.get("SUMMARY_DB_WRITER_ROLE"))
+    logger.warning("[MAIN SUMMARY PARALLEL] force_1_3_5=%s timeout=%s workers=%s", os.environ.get("SUMMARY_PARALLEL_FORCE_1_3_5"), os.environ.get("SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC"), os.environ.get("SUMMARY_PARALLEL_INTERVAL_WORKERS"))
+    logger.warning("[MAIN ENTRY 5SEC FILTER] min_5sec=%s tonosama=%s entry=%s summary_ai=%s", os.environ.get("MIN_5SEC_PRICE_CHANGE_PCT"), os.environ.get("TONOSAMA_MIN_5SEC_PRICE_CHANGE_PCT"), os.environ.get("ENTRY_MIN_5SEC_PRICE_CHANGE_PCT"), os.environ.get("SUMMARY_AI_MIN_5SEC_PRICE_CHANGE_PCT"))
     logger.warning("[MAIN OPTIONAL ROLE] light_mode=%s skip_ingest=%s run_ingest_in_main=%s", os.environ.get("OPTIONAL_LIGHT_MODE"), os.environ.get("OPTIONAL_SKIP_INGEST"), os.environ.get("OPTIONAL_RUN_INGEST_IN_MAIN"))
 
     heartbeat("main_boot", status="START", detail={"stage": "runtime_context"})
