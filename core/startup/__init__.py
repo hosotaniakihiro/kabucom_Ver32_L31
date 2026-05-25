@@ -1,15 +1,15 @@
 # ============================================================
 # File   : core/startup/__init__.py
-# Ver    : PRODUCTION-STABLE-REV21.3-SOFT-TECHNICAL-READY
+# Ver    : PRODUCTION-STABLE-REV21.4-RANKING-ENTRY-UNIT-FIX
 # ------------------------------------------------------------
 # 【概要】
 #   core.startup パッケージの公開入口。
 #   各種 runtime/startup patch を自動適用する。
 #
-# REV21.3:
-#   - summary_controller_soft_technical_ready_patch を追加
-#   - 短履歴PUSHサマリーで指標があるのに technical_ready=False 固定になる問題を補正
-#   - summary_runner_ready_fill_before_save_patch も継続適用
+# REV21.4:
+#   - ranking_entry_volume_unit_patch を追加
+#   - ランキングエントリーの売買高/売買代金単位を補正し VOLUME_NG を減らす
+#   - soft technical ready / runner ready fill も継続適用
 # ============================================================
 
 from __future__ import annotations
@@ -52,6 +52,13 @@ try:
     install_summary_runner_ready_fill_before_save_patch()
 except Exception:
     logger.exception("[core.startup] summary runner ready fill before save patch install failed")
+
+try:
+    from .ranking_entry_volume_unit_patch import install as install_ranking_entry_volume_unit_patch
+
+    install_ranking_entry_volume_unit_patch()
+except Exception:
+    logger.exception("[core.startup] ranking entry volume unit patch install failed")
 
 try:
     from .summary_ai_slope_env_patch import install_summary_ai_slope_env_patch
