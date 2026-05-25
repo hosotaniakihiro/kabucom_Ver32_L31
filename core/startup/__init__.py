@@ -1,15 +1,15 @@
 # ============================================================
 # File   : core/startup/__init__.py
-# Ver    : PRODUCTION-STABLE-REV21.1-SUMMARY-SCHEDULER-STALE-GUARD
+# Ver    : PRODUCTION-STABLE-REV21.2-SUMMARY-READY-FILL
 # ------------------------------------------------------------
 # 【概要】
 #   core.startup パッケージの公開入口。
 #   各種 runtime/startup patch を自動適用する。
 #
-# REV21.1:
-#   - summary_scheduler_unified_stale_guard_patch を追加
-#   - main.py(entry_only) + PUSH全足BG化時に旧PUSH fallback重複を抑止
-#   - staleな unified_bg_running 状態を自動解除
+# REV21.2:
+#   - summary_runner_ready_fill_before_save_patch を追加
+#   - PUSHサマリーがAI/表示へ渡る前に technical_ready を補完
+#   - summary_scheduler_unified_stale_guard_patch も継続適用
 # ============================================================
 
 from __future__ import annotations
@@ -38,6 +38,13 @@ try:
     install_summary_scheduler_unified_stale_guard_patch()
 except Exception:
     logger.exception("[core.startup] summary scheduler unified stale guard patch install failed")
+
+try:
+    from .summary_runner_ready_fill_before_save_patch import install as install_summary_runner_ready_fill_before_save_patch
+
+    install_summary_runner_ready_fill_before_save_patch()
+except Exception:
+    logger.exception("[core.startup] summary runner ready fill before save patch install failed")
 
 try:
     from .summary_ai_slope_env_patch import install_summary_ai_slope_env_patch
