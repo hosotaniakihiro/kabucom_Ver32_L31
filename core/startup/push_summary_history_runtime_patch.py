@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 _PATCHED = False
 _ORIGINAL_RESOLVE = None
 _ORIGINAL_STORE = None
+_ORIGINAL_PUBLIC: dict[str, Callable] = {}
 
 _TECH_FILL_COLS = (
     "ma5", "ma25", "ma75", "rsi", "macd", "signal", "hist", "atr",
@@ -28,13 +29,17 @@ def _env_bool(name: str, default: bool = True) -> bool:
 def _safe_df(value: Any) -> pd.DataFrame:
     if isinstance(value, pd.DataFrame):
         return value.copy()
-    return pd.DataFrame()
+    try:
+        return pd.DataFrame(value).copy()
+    except Exception:
+        return pd.DataFrame()
 
 
 def _normalize(df: pd.DataFrame) -> pd.DataFrame:
     out = _safe_df(df)
     if out.empty or "symbol" not in out.columns:
         return pd.DataFrame()
+    out = out.loc[:, ~out.columns.duplicated()].copy()
     out["symbol"] = out["symbol"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
     out = out[out["symbol"] != ""].copy()
     if "datetime" not in out.columns:
@@ -139,17 +144,19 @@ def _latest_by_symbol(df: pd.DataFrame) -> pd.DataFrame:
     return out.drop_duplicates(subset=["symbol"], keep="last").reset_index(drop=True)
 
 
-def _fill_from_history(df: pd.DataFrame, hist: pd.DataFrame, interval: int) -> pd.DataFrame:
+def _fill_from_history(df: pd.DataFrame, hist: pd.DataFrame, interval: int, *, context: str = "store") -> pd.DataFrame:
     out = _normalize(df)
     latest = _latest_by_symbol(hist)
     if out.empty or latest.empty:
         return out
     latest = latest.set_index("symbol", drop=False)
     fill_count = 0
+    hit_count = 0
     for idx, row in out.iterrows():
         sym = str(row.get("symbol", "")).strip()
         if not sym or sym not in latest.index:
             continue
+        hit_count += 1
         hrow = latest.loc[sym]
         if isinstance(hrow, pd.DataFrame):
             hrow = hrow.iloc[-1]
@@ -169,8 +176,9 @@ def _fill_from_history(df: pd.DataFrame, hist: pd.DataFrame, interval: int) -> p
                 out.at[idx, col] = hrow.get(col)
                 fill_count += 1
     logger.warning(
-        "[PUSH HISTORY PATCH] filled interval=%s rows=%s fill_count=%s macd=%s signal=%s mtf=%s",
-        interval, len(out), fill_count, _nonzero(out, "macd"), _nonzero(out, "signal"), _nonzero(out, "mtf"),
+        "[PUSH HISTORY PATCH] filled context=%s interval=%s rows=%s hits=%s fill_count=%s macd=%s signal=%s mtf=%s",
+        context, interval, len(out), hit_count, fill_count,
+        _nonzero(out, "macd"), _nonzero(out, "signal"), _nonzero(out, "mtf"),
     )
     return out
 
@@ -203,16 +211,39 @@ def _set_history(interval: int, df: pd.DataFrame) -> None:
         logger.exception("[PUSH HISTORY PATCH] set history failed interval=%s", interval)
 
 
-def _patched_store(interval: int, df: pd.DataFrame) -> None:
+def _fix_df(interval: int, df: pd.DataFrame, *, context: str) -> pd.DataFrame:
     interval = int(interval)
     hist = _get_history(interval)
-    fixed = _fill_from_history(df, hist, interval) if _useful(hist) else _safe_df(df)
+    fixed = _fill_from_history(df, hist, interval, context=context) if _useful(hist) else _safe_df(df)
     merged = _merge_history(hist, fixed, interval)
     if not merged.empty:
         _set_history(interval, merged)
+    return fixed
+
+
+def _patched_store(interval: int, df: pd.DataFrame) -> None:
+    fixed = _fix_df(int(interval), df, context="store")
     if callable(_ORIGINAL_STORE):
-        return _ORIGINAL_STORE(interval, fixed)
+        return _ORIGINAL_STORE(int(interval), fixed)
     return None
+
+
+def _wrap_public(fn_name: str, fn: Callable) -> Callable:
+    def _wrapped(*args, **kwargs):
+        interval = kwargs.get("interval", None)
+        if interval is None and args:
+            try:
+                interval = int(args[0])
+            except Exception:
+                interval = 1
+        if interval is None:
+            interval = 1
+        ret = fn(*args, **kwargs)
+        if isinstance(ret, pd.DataFrame):
+            return _fix_df(int(interval), ret, context=f"return:{fn_name}")
+        return ret
+    _wrapped._push_history_patch = True  # type: ignore[attr-defined]
+    return _wrapped
 
 
 def install() -> bool:
@@ -223,20 +254,30 @@ def install() -> bool:
         return False
     try:
         import trading.summary.engine.push_summary_engine as pse
+
         old_resolve = getattr(pse, "_resolve_summary_source_df", None)
         if callable(old_resolve) and not getattr(old_resolve, "_push_history_patch", False):
             _ORIGINAL_RESOLVE = old_resolve
             _patched_resolve._push_history_patch = True  # type: ignore[attr-defined]
             pse._resolve_summary_source_df = _patched_resolve
             logger.warning("[PUSH HISTORY PATCH] patched resolve")
+
         old_store = getattr(pse, "_store_push_merged_summary", None)
         if callable(old_store) and not getattr(old_store, "_push_history_patch", False):
             _ORIGINAL_STORE = old_store
             _patched_store._push_history_patch = True  # type: ignore[attr-defined]
             pse._store_push_merged_summary = _patched_store
             logger.warning("[PUSH HISTORY PATCH] patched store")
+
+        for name in ("build_summary", "build_push_summary", "push_summary_engine", "run_push_summary_engine", "run_summary_engine", "run"):
+            fn = getattr(pse, name, None)
+            if callable(fn) and not getattr(fn, "_push_history_patch", False):
+                _ORIGINAL_PUBLIC[name] = fn
+                setattr(pse, name, _wrap_public(name, fn))
+                logger.warning("[PUSH HISTORY PATCH] patched public %s", name)
+
         _PATCHED = True
-        logger.warning("[PUSH HISTORY PATCH] installed V1")
+        logger.warning("[PUSH HISTORY PATCH] installed V2 return-filled")
         return True
     except Exception:
         logger.exception("[PUSH HISTORY PATCH] install failed")
