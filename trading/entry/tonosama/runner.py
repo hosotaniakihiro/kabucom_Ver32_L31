@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/tonosama/runner.py
-# Version: Ver1.4-TONOSAMA-PRUNE-PENDING-AND-STRICT-5SEC
+# Version: Ver1.5-TONOSAMA-STRICT-SLOPE-FILTER
 # ------------------------------------------------------------
 # ✔ 15秒ジョブが100秒以上詰まる原因を修正
 # ✔ 5秒足特徴量取得を全銘柄ではなく一次フィルタ通過後の上位だけに限定
@@ -16,6 +16,10 @@
 #    - ループ開始時に期限切れTONOSAMA pendingを掃除
 #    - has_5sec_bar=True かつ price_change_5s_pct <= 0 は候補除外
 #      （0.0%で止まっている銘柄の誤アラート防止）
+# ✔ Ver1.5:
+#    - 5秒足は必須にしないが、取れている場合は5秒変化率を厳格判定
+#    - slope の下限を config.MIN_SLOPE で判定
+#    - 6981 のような slope=0.0001 のほぼ横ばい候補を除外
 # ============================================================
 from __future__ import annotations
 
@@ -36,6 +40,7 @@ from .config import (
     MIN_FINAL_SCORE,
     MIN_VOLUME_SURGE_RATIO,
     MIN_PRICE_CHANGE_PCT,
+    MIN_SLOPE,
     MIN_BODY_CHANGE_PCT,
     MIN_INTRABAR_RANGE_PCT,
     MIN_LATEST_VOLUME,
@@ -209,6 +214,7 @@ def _diagnose_base_frame(x: pd.DataFrame) -> None:
             "min_price": MIN_PRICE,
             "min_volume_surge": MIN_VOLUME_SURGE_RATIO,
             "min_price_change_pct": MIN_PRICE_CHANGE_PCT,
+            "min_slope": MIN_SLOPE,
             "min_body_change_pct": MIN_BODY_CHANGE_PCT,
             "min_intrabar_range_pct": MIN_INTRABAR_RANGE_PCT,
             "min_latest_volume": MIN_LATEST_VOLUME,
@@ -283,8 +289,8 @@ def _apply_primary_filters(x: pd.DataFrame) -> pd.DataFrame:
 
     if "_slope" in x.columns:
         before = x.copy()
-        x = x[_num_series(x, "_slope") >= -0.02]
-        _log_filter_step(stage="primary", before=before, after=x, reason="slope_too_negative", threshold={"MIN_SLOPE": -0.02}, sample_cols=sample_cols)
+        x = x[_num_series(x, "_slope") >= MIN_SLOPE]
+        _log_filter_step(stage="primary", before=before, after=x, reason="slope_too_small", threshold={"MIN_SLOPE": MIN_SLOPE}, sample_cols=sample_cols)
     else:
         logger.warning("[TONOSAMA FILTER WARN] stage=primary missing _slope -> slope filter skipped cols=%s", list(x.columns))
 
@@ -299,7 +305,7 @@ def _apply_primary_filters(x: pd.DataFrame) -> pd.DataFrame:
             "MIN_INTRABAR_RANGE_PCT": MIN_INTRABAR_RANGE_PCT,
             "MIN_VOLUME_SURGE_RATIO": MIN_VOLUME_SURGE_RATIO,
             "MIN_PRICE_CHANGE_PCT": MIN_PRICE_CHANGE_PCT,
-            "MIN_SLOPE": -0.02,
+            "MIN_SLOPE": MIN_SLOPE,
         },
         "survivors": _sample_rows(x, sample_cols, limit=12),
     }
@@ -429,8 +435,8 @@ def iter_tonosama_candidate_rows() -> pd.DataFrame:
     _log_filter_step(stage="final", before=before, after=x, reason="price_change_low", threshold={"MIN_PRICE_CHANGE_PCT": MIN_PRICE_CHANGE_PCT}, sample_cols=sample_cols)
 
     before = x.copy()
-    x = x[_num_series(x, "_slope") >= -0.02]
-    _log_filter_step(stage="final", before=before, after=x, reason="slope_too_negative", threshold={"MIN_SLOPE": -0.02}, sample_cols=sample_cols)
+    x = x[_num_series(x, "_slope") >= MIN_SLOPE]
+    _log_filter_step(stage="final", before=before, after=x, reason="slope_too_small", threshold={"MIN_SLOPE": MIN_SLOPE}, sample_cols=sample_cols)
 
     if USE_5SEC_CONFIRM and "has_5sec_bar" in x.columns:
         if REQUIRE_5SEC_BAR:
@@ -441,7 +447,7 @@ def iter_tonosama_candidate_rows() -> pd.DataFrame:
         before = x.copy()
         has_bar = _bool_series(x, "has_5sec_bar")
         chg_5s = _num_series(x, "price_change_5s_pct")
-        # Ver1.4: 5秒足があるのに 0.0% 以下なら「動いていない」ので必ず除外。
+        # 5秒足は必須ではない。取れている場合だけ 0.05%以上を要求する。
         x = x[(~has_bar) | ((chg_5s > 0.0) & (chg_5s >= MIN_5SEC_PRICE_CHANGE_PCT) & (chg_5s > MAX_5SEC_DROP_PCT))]
         _log_filter_step(
             stage="5sec",
@@ -513,7 +519,7 @@ def build_tonosama_entries() -> int:
         if not ai_ok:
             ai_ng += 1
             logger.info(
-                "[TONOSAMA ENTRY AI NG] symbol=%s prob=%.3f reason=%s surge=%.2f price_chg=%.2f body=%.3f range=%.3f vol=%.0f 5s=%.3f",
+                "[TONOSAMA ENTRY AI NG] symbol=%s prob=%.3f reason=%s surge=%.2f price_chg=%.2f body=%.3f range=%.3f vol=%.0f 5s=%.3f slope=%.6f",
                 symbol,
                 ai_prob,
                 ai_reason,
@@ -523,6 +529,7 @@ def build_tonosama_entries() -> int:
                 safe_float(row.get("_intrabar_range_pct"), 0.0),
                 safe_float(row.get("_latest_volume"), 0.0),
                 safe_float(row.get("price_change_5s_pct"), 0.0),
+                safe_float(row.get("_slope"), 0.0),
             )
             continue
 
@@ -536,7 +543,7 @@ def build_tonosama_entries() -> int:
         if add_tonosama_pending(entry):
             registered += 1
             logger.info(
-                "🔥 TONOSAMA PENDING %s score=%.2f price=%.1f vol=%.0f body=%.3f%% range=%.3f%% surge=%.2fx price_chg=%.2f%% tf=%s 5s=%.3f%% ai_prob=%.3f",
+                "🔥 TONOSAMA PENDING %s score=%.2f price=%.1f vol=%.0f body=%.3f%% range=%.3f%% surge=%.2fx price_chg=%.2f%% tf=%s 5s=%.3f%% slope=%.6f ai_prob=%.3f",
                 symbol,
                 final_score,
                 safe_float(row.get("close"), 0.0),
@@ -547,6 +554,7 @@ def build_tonosama_entries() -> int:
                 safe_float(row.get("_max_price_change_pct"), 0.0),
                 str(row.get("_surge_tf", "")),
                 safe_float(row.get("price_change_5s_pct"), 0.0),
+                safe_float(row.get("_slope"), 0.0),
                 ai_prob,
             )
             notify_discord_tonosama_pending(entry)
