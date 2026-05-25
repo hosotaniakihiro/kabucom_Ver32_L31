@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry_exit/tasks.py
-# Version: Ver1.2-TONOSAMA-TIMEOUT-30SEC
+# Version: Ver1.3-TONOSAMA-DISPATCH-ENTRY-CONTROLLER
 # ------------------------------------------------------------
 # 【目的】
 #   core.entry_exit_tasks shim から解決される実体モジュール。
@@ -9,6 +9,8 @@
 #   - 殿様イナゴ候補生成:
 #       trading.entry.tonosama.runner.tonosama_loop
 #       15秒ごと / tags: entry, tonosama_entry
+#       候補 pending 登録後、即 entry_controller.run_entry_pipeline(TONOSAMA)
+#       へ流して実発注まで到達させる。
 #
 #   - ランキング由来エントリー:
 #       trading.ranking.entry_from_ranking.run_ranking_entry_pipeline
@@ -16,11 +18,10 @@
 #       その直後に entry_controller.run_entry_pipeline(pipeline_source="RANKING", interval=1)
 #
 # 【重要】
-#   - ランキングサマリー保存とランキング由来エントリーは別物。
-#   - これを登録しないと ranking_snapshot は保存されても発注候補に流れない。
-#   - Ver1.1: scheduler側の previous_still_running を防ぐため、各処理にタイムアウトを設ける。
-#   - Ver1.2: 殿様イナゴは12秒だと summary/ランキング処理と重なって頻繁にtimeoutするため、
-#              デフォルトを30秒へ引き上げる。
+#   - Ver1.2 までは TONOSAMA は pending 登録で終わり、entry_controller
+#     が起動されないタイミングがあり「🔥 TONOSAMA PENDING」後に
+#     実発注ログが出ないことがあった。
+#   - Ver1.3 で registered > 0 のとき即 controller dispatch する。
 # ============================================================
 
 from __future__ import annotations
@@ -45,6 +46,7 @@ _RANKING_ENTRY_STARTED_AT: Optional[dt.datetime] = None
 _RANKING_ENTRY_LOCK = threading.RLock()
 
 TONOSAMA_ENTRY_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_TIMEOUT_SEC", "30"))
+TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC", "20"))
 RANKING_ENTRY_BUILD_TIMEOUT_SEC = float(os.getenv("RANKING_ENTRY_BUILD_TIMEOUT_SEC", "20"))
 RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC = float(os.getenv("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", "20"))
 
@@ -126,6 +128,42 @@ def _run_callable_with_timeout(
     return True, result.get("ret")
 
 
+def _dispatch_entry_controller(*, pipeline_source: str, interval: int | None, timeout_sec: float, reason: str) -> bool:
+    controller_fn = _resolve_callable("trading.handlers.entry_controller", "run_entry_pipeline")
+    if not callable(controller_fn):
+        logger.warning("[%s] entry_controller unavailable pipeline_source=%s", reason, pipeline_source)
+        return False
+
+    kwargs: dict[str, Any] = {"pipeline_source": pipeline_source}
+    if interval is not None:
+        kwargs["interval"] = interval
+
+    logger.info(
+        "[%s] dispatch entry_controller pipeline_source=%s interval=%s timeout_sec=%.3f",
+        reason,
+        pipeline_source,
+        interval,
+        timeout_sec,
+    )
+    completed, _ret = _run_callable_with_timeout(
+        controller_fn,
+        timeout_sec=timeout_sec,
+        name=f"{reason} CONTROLLER",
+        kwargs=kwargs,
+    )
+    if not completed:
+        logger.warning(
+            "[%s] controller timeout pipeline_source=%s interval=%s timeout_sec=%.3f",
+            reason,
+            pipeline_source,
+            interval,
+            timeout_sec,
+        )
+        return False
+    logger.info("[%s] controller done pipeline_source=%s interval=%s", reason, pipeline_source, interval)
+    return True
+
+
 def _run_tonosama_entry_safe() -> int:
     started = time.perf_counter()
     fn = _resolve_callable("trading.entry.tonosama.runner", "tonosama_loop")
@@ -145,8 +183,22 @@ def _run_tonosama_entry_safe() -> int:
                 time.perf_counter() - started,
             )
             return 0
-        logger.info("[TONOSAMA ENTRY SCHEDULE] done result=%s elapsed=%.3fs", ret, time.perf_counter() - started)
-        return int(ret or 0)
+
+        registered = int(ret or 0)
+        logger.info("[TONOSAMA ENTRY SCHEDULE] pending build done registered=%s elapsed=%.3fs", registered, time.perf_counter() - started)
+
+        if registered > 0:
+            _dispatch_entry_controller(
+                pipeline_source="TONOSAMA",
+                interval=None,
+                timeout_sec=TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC,
+                reason="TONOSAMA ENTRY SCHEDULE",
+            )
+        else:
+            logger.info("[TONOSAMA ENTRY SCHEDULE] no pending created -> controller dispatch skipped")
+
+        logger.info("[TONOSAMA ENTRY SCHEDULE] done result=%s elapsed=%.3fs", registered, time.perf_counter() - started)
+        return registered
     except Exception:
         logger.exception("[TONOSAMA ENTRY SCHEDULE] failed")
         return 0
@@ -198,26 +250,12 @@ def _run_ranking_entry_safe() -> int:
         logger.info("[RANKING ENTRY SCHEDULE] pending build done created=%s", created)
 
         if created > 0:
-            controller_fn = _resolve_callable("trading.handlers.entry_controller", "run_entry_pipeline")
-            if callable(controller_fn):
-                logger.info(
-                    "[RANKING ENTRY SCHEDULE] dispatch entry_controller pipeline_source=RANKING interval=1 timeout_sec=%.3f",
-                    RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC,
-                )
-                completed_ctrl, _ret = _run_callable_with_timeout(
-                    controller_fn,
-                    timeout_sec=RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC,
-                    name="RANKING ENTRY CONTROLLER",
-                    kwargs={"pipeline_source": "RANKING", "interval": 1},
-                )
-                if not completed_ctrl:
-                    logger.warning(
-                        "[RANKING ENTRY SCHEDULE] controller timeout timeout_sec=%.3f elapsed=%.3fs",
-                        RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC,
-                        time.perf_counter() - started,
-                    )
-            else:
-                logger.warning("[RANKING ENTRY SCHEDULE] entry_controller unavailable after pending created=%s", created)
+            _dispatch_entry_controller(
+                pipeline_source="RANKING",
+                interval=1,
+                timeout_sec=RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC,
+                reason="RANKING ENTRY SCHEDULE",
+            )
         else:
             logger.info("[RANKING ENTRY SCHEDULE] no pending created -> controller dispatch skipped")
 
@@ -263,10 +301,11 @@ def register_entry_exit_tasks(*args: Any, **kwargs: Any) -> bool:
         job_r.tag(_TAG_RANKING_ENTRY)
 
         logger.info(
-            "[entry_exit.tasks] registered tonosama every=%ss tag=%s timeout=%.1fs ranking every minute at :12 tag=%s build_timeout=%.1fs controller_timeout=%.1fs",
+            "[entry_exit.tasks] registered tonosama every=%ss tag=%s build_timeout=%.1fs controller_timeout=%.1fs ranking every minute at :12 tag=%s build_timeout=%.1fs controller_timeout=%.1fs",
             interval_sec,
             _TAG_TONOSAMA_ENTRY,
             TONOSAMA_ENTRY_TIMEOUT_SEC,
+            TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC,
             _TAG_RANKING_ENTRY,
             RANKING_ENTRY_BUILD_TIMEOUT_SEC,
             RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC,
