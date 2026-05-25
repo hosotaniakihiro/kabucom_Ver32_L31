@@ -1,19 +1,27 @@
 # ============================================================
 # File   : core/startup/summary_parallel_intervals_runtime_patch.py
-# Version: Ver05-MAIN-PUSH-ALL-INTERVALS-RANKING-TIME-LOCKED
+# Version: Ver06-MAIN-PUSH-3M5M-BACKGROUND-NO-PARENT-BLOCK
 # ------------------------------------------------------------
 # 1分・3分・5分サマリーを直列ではなく並列に実行する runtime patch。
 #
-# Ver05 Fix:
-#   ✔ main.py(entry_only) でも PUSH由来サマリーは 1m/3m/5m を毎分表示対象にする
-#   ✔ RANKING由来サマリーは従来通り時間境界のみ実行
-#   ✔ force_1_3_5=False のままでも push_targets=[1,3,5] になる
-#   ✔ ログに push_targets / ranking_targets を分離表示
+# Ver06 Fix:
+#   ✔ main.py(entry_only) では PUSH 1m を親tick内で待つ
+#   ✔ PUSH 3m/5m はバックグラウンド投入して親tickでは待たない
+#   ✔ Discord/表示用の 3m/5m は維持しつつ、90秒 timeout を防ぐ
+#   ✔ RANKING由来は従来通り時間境界のみ実行
+#   ✔ ログに wait_push_targets / bg_push_targets を分離表示
+#
+# 背景:
+#   PUSH 1m/3m/5m を毎分すべて親tick内で待つと、3本のうち1本でも
+#   summary_controller.diff_update が重い場合、親tickが90秒timeoutして
+#   次のtickまで詰まる。main.pyはentry優先なので、1mだけ待ち、3m/5mは
+#   表示・Discord・AI hook込みでバックグラウンド継続する。
 #
 # ENV:
 #   SUMMARY_PARALLEL_INTERVALS_ENABLED=1
-#   SUMMARY_PARALLEL_FORCE_1_3_5=0  # main.py 既定。RANKING側の強制対象にはしない
-#   SUMMARY_PUSH_DISPLAY_ALL_INTERVALS=1  # PUSH側 1m/3m/5m 毎回表示。既定ON
+#   SUMMARY_PARALLEL_FORCE_1_3_5=0
+#   SUMMARY_PUSH_DISPLAY_ALL_INTERVALS=1
+#   SUMMARY_PUSH_BG_LONG_INTERVALS=1   # main.pyでは既定ON
 #   SUMMARY_PARALLEL_INTERVAL_WORKERS=3
 #   SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC=90
 #   SUMMARY_PARALLEL_TIMEOUT_MIN_SEC=90
@@ -38,7 +46,9 @@ _INSTALLED = False
 _ORIG_TIME_LOCKED = None
 _RUNNING_LOCK = threading.RLock()
 _RUNNING_KEYS: set[str] = set()
+_BG_RUNNING_KEYS: set[str] = set()
 _EXECUTOR: ThreadPoolExecutor | None = None
+_BG_EXECUTOR: ThreadPoolExecutor | None = None
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -119,6 +129,14 @@ def _executor() -> ThreadPoolExecutor:
     return _EXECUTOR
 
 
+def _bg_executor() -> ThreadPoolExecutor:
+    global _BG_EXECUTOR
+    workers = _env_int("SUMMARY_PUSH_BG_INTERVAL_WORKERS", 2)
+    if _BG_EXECUTOR is None:
+        _BG_EXECUTOR = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="summary-push-bg-interval")
+    return _BG_EXECUTOR
+
+
 def _now_naive() -> dt.datetime:
     try:
         from scheduler_jobs.summary.time_utils import now_naive
@@ -174,8 +192,13 @@ def _force_all_targets_enabled() -> bool:
 
 
 def _push_all_intervals_enabled() -> bool:
-    # ユーザー要望: PUSH由来は1分足・3分足・5分足を表示。
     return _env_bool("SUMMARY_PUSH_DISPLAY_ALL_INTERVALS", True)
+
+
+def _push_bg_long_intervals_enabled() -> bool:
+    # main.pyでは既定ON。main_database.pyでは既定OFF。
+    default = True if _is_main_entry_only_process() else False
+    return _env_bool("SUMMARY_PUSH_BG_LONG_INTERVALS", default)
 
 
 def _resolve_targets(now: dt.datetime, in_session: bool) -> tuple[list[int], list[int]]:
@@ -186,14 +209,18 @@ def _resolve_targets(now: dt.datetime, in_session: bool) -> tuple[list[int], lis
     if in_session and force_all:
         ranking_targets = [1, 3, 5]
 
-    if _push_all_intervals_enabled():
-        push_targets = [1, 3, 5]
-    else:
-        push_targets = list(base)
-
+    push_targets = [1, 3, 5] if _push_all_intervals_enabled() else list(base)
     push_targets = sorted({int(x) for x in push_targets if int(x) in {1, 3, 5}}) or [1]
     ranking_targets = sorted({int(x) for x in ranking_targets if int(x) in {1, 3, 5}}) or [1]
     return push_targets, ranking_targets
+
+
+def _split_push_wait_and_bg(push_targets: list[int]) -> tuple[list[int], list[int]]:
+    if _is_main_entry_only_process() and _push_bg_long_intervals_enabled():
+        wait = [x for x in push_targets if int(x) == 1]
+        bg = [x for x in push_targets if int(x) in (3, 5)]
+        return (wait or [1]), bg
+    return push_targets, []
 
 
 def _job_one_source(*, source: str, interval: int, now: dt.datetime, display: bool, run_entry: bool) -> tuple[str, int, pd.DataFrame]:
@@ -214,6 +241,27 @@ def _job_one_source(*, source: str, interval: int, now: dt.datetime, display: bo
         return source, interval, pd.DataFrame()
 
 
+def _submit_bg_push_interval(*, interval: int, now: dt.datetime, display: bool, run_entry: bool) -> None:
+    bg_key = f"{now.strftime('%Y%m%d%H%M')}:push:{int(interval)}"
+    with _RUNNING_LOCK:
+        if bg_key in _BG_RUNNING_KEYS:
+            logger.warning("[SUMMARY PARALLEL] bg push skipped reason=already_running key=%s", bg_key)
+            return
+        _BG_RUNNING_KEYS.add(bg_key)
+
+    def _task() -> None:
+        try:
+            logger.warning("[SUMMARY PARALLEL] bg push start key=%s interval=%s now=%s display=%s run_entry=%s", bg_key, interval, now, display, run_entry)
+            _job_one_source(source="push", interval=int(interval), now=now, display=display, run_entry=run_entry)
+        finally:
+            with _RUNNING_LOCK:
+                _BG_RUNNING_KEYS.discard(bg_key)
+            logger.warning("[SUMMARY PARALLEL] bg push done key=%s interval=%s now=%s", bg_key, interval, now)
+
+    _bg_executor().submit(_task)
+    logger.warning("[SUMMARY PARALLEL] bg push submitted key=%s interval=%s now=%s", bg_key, interval, now)
+
+
 def _patched_run_time_locked_summary_jobs(*, now: Optional[dt.datetime] = None, run_push: bool = True, run_ranking: bool = True, display: bool = True, run_entry: bool = True) -> dict[str, dict[int, pd.DataFrame]]:
     if not _env_bool("SUMMARY_PARALLEL_INTERVALS_ENABLED", True):
         if callable(_ORIG_TIME_LOCKED):
@@ -224,12 +272,13 @@ def _patched_run_time_locked_summary_jobs(*, now: Optional[dt.datetime] = None, 
     n = (now or _now_naive()).replace(microsecond=0)
     in_session = _is_market_session(n)
     push_targets, ranking_targets = _resolve_targets(n, in_session)
+    wait_push_targets, bg_push_targets = _split_push_wait_and_bg(push_targets)
     out: dict[str, dict[int, pd.DataFrame]] = {"push": {}, "ranking": {}}
 
     key = n.strftime("%Y%m%d%H%M")
     with _RUNNING_LOCK:
         if key in _RUNNING_KEYS:
-            logger.warning("[SUMMARY PARALLEL] skipped reason=previous_same_tick_running key=%s push_targets=%s ranking_targets=%s", key, push_targets, ranking_targets)
+            logger.warning("[SUMMARY PARALLEL] skipped reason=previous_same_tick_running key=%s push_targets=%s wait_push_targets=%s bg_push_targets=%s ranking_targets=%s", key, push_targets, wait_push_targets, bg_push_targets, ranking_targets)
             return out
         _RUNNING_KEYS.add(key)
 
@@ -238,26 +287,18 @@ def _patched_run_time_locked_summary_jobs(*, now: Optional[dt.datetime] = None, 
     timeout = _env_float("SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC", 90.0)
     try:
         logger.warning(
-            "[SUMMARY PARALLEL] tick start now=%s push_targets=%s ranking_targets=%s run_push=%s run_ranking=%s display=%s run_entry=%s in_session=%s workers=%s timeout=%.1f force_1_3_5=%s push_all_intervals=%s main_entry_only=%s",
-            n,
-            push_targets,
-            ranking_targets,
-            run_push,
-            run_ranking,
-            display,
-            run_entry,
-            in_session,
-            _env_int("SUMMARY_PARALLEL_INTERVAL_WORKERS", 3),
-            timeout,
-            _force_all_targets_enabled(),
-            _push_all_intervals_enabled(),
-            _is_main_entry_only_process(),
+            "[SUMMARY PARALLEL] tick start now=%s push_targets=%s wait_push_targets=%s bg_push_targets=%s ranking_targets=%s run_push=%s run_ranking=%s display=%s run_entry=%s in_session=%s workers=%s timeout=%.1f force_1_3_5=%s push_all_intervals=%s push_bg_long=%s main_entry_only=%s",
+            n, push_targets, wait_push_targets, bg_push_targets, ranking_targets, run_push, run_ranking, display, run_entry,
+            in_session, _env_int("SUMMARY_PARALLEL_INTERVAL_WORKERS", 3), timeout, _force_all_targets_enabled(),
+            _push_all_intervals_enabled(), _push_bg_long_intervals_enabled(), _is_main_entry_only_process(),
         )
         ex = _executor()
 
         if run_push:
-            for interval in push_targets:
+            for interval in wait_push_targets:
                 futures.append(ex.submit(_job_one_source, source="push", interval=int(interval), now=n, display=display, run_entry=bool(run_entry) and bool(in_session)))
+            for interval in bg_push_targets:
+                _submit_bg_push_interval(interval=int(interval), now=n, display=display, run_entry=bool(run_entry) and bool(in_session))
 
         if run_ranking and in_session and _env_bool("SUMMARY_PARALLEL_RANKING_ENABLED", True):
             for interval in ranking_targets:
@@ -268,6 +309,7 @@ def _patched_run_time_locked_summary_jobs(*, now: Optional[dt.datetime] = None, 
             logger.info("[SUMMARY PARALLEL] ranking skipped reason=parallel_ranking_disabled targets=%s", ranking_targets)
 
         if not futures:
+            logger.warning("[SUMMARY PARALLEL] tick no wait futures now=%s bg_push_targets=%s", n, bg_push_targets)
             return out
 
         done_count = 0
@@ -277,14 +319,14 @@ def _patched_run_time_locked_summary_jobs(*, now: Optional[dt.datetime] = None, 
                 out.setdefault(source, {})[int(interval)] = df
                 done_count += 1
         except FuturesTimeoutError:
-            logger.error("[SUMMARY PARALLEL] tick timeout now=%s timeout=%.1fs done=%s total=%s push_targets=%s ranking_targets=%s", n, timeout, done_count, len(futures), push_targets, ranking_targets)
+            logger.error("[SUMMARY PARALLEL] tick timeout now=%s timeout=%.1fs done=%s total=%s wait_push_targets=%s bg_push_targets=%s ranking_targets=%s", n, timeout, done_count, len(futures), wait_push_targets, bg_push_targets, ranking_targets)
             for fut in futures:
                 try:
                     fut.cancel()
                 except Exception:
                     pass
 
-        logger.warning("[SUMMARY PARALLEL] tick done now=%s push_targets=%s ranking_targets=%s push_done=%s ranking_done=%s elapsed=%.3fs", n, push_targets, ranking_targets, sorted(out.get("push", {}).keys()), sorted(out.get("ranking", {}).keys()), time.perf_counter() - t0)
+        logger.warning("[SUMMARY PARALLEL] tick done now=%s push_targets=%s wait_push_targets=%s bg_push_targets=%s ranking_targets=%s push_done=%s ranking_done=%s elapsed=%.3fs", n, push_targets, wait_push_targets, bg_push_targets, ranking_targets, sorted(out.get("push", {}).keys()), sorted(out.get("ranking", {}).keys()), time.perf_counter() - t0)
         return out
     finally:
         with _RUNNING_LOCK:
@@ -294,12 +336,12 @@ def _patched_run_time_locked_summary_jobs(*, now: Optional[dt.datetime] = None, 
 def install() -> bool:
     global _INSTALLED, _ORIG_TIME_LOCKED
 
-    # main.py(entry_only) では RANKING側の強制1/3/5は既定OFF。
-    # ただし PUSH側の 1/3/5 表示は SUMMARY_PUSH_DISPLAY_ALL_INTERVALS で別管理する。
     if _is_main_entry_only_process():
         _setdefault_env("SUMMARY_PARALLEL_FORCE_1_3_5", "0")
+        _setdefault_env("SUMMARY_PUSH_BG_LONG_INTERVALS", "1")
     else:
         _setdefault_env("SUMMARY_PARALLEL_FORCE_1_3_5", "1")
+        _setdefault_env("SUMMARY_PUSH_BG_LONG_INTERVALS", "0")
     _setdefault_env("SUMMARY_PUSH_DISPLAY_ALL_INTERVALS", "1")
 
     if _INSTALLED:
@@ -309,29 +351,32 @@ def install() -> bool:
     _setdefault_env("SUMMARY_PARALLEL_TIMEOUT_MIN_SEC", "90")
     _ensure_timeout_min()
     _setdefault_env("SUMMARY_PARALLEL_INTERVAL_WORKERS", "3")
+    _setdefault_env("SUMMARY_PUSH_BG_INTERVAL_WORKERS", "2")
 
     try:
         import scheduler_jobs.summary.time_locked_runner as tlr
         import scheduler_jobs.summary.runners as runners
         import scheduler_jobs.summary.scheduler as scheduler
         cur = getattr(tlr, "run_time_locked_summary_jobs", None)
-        if getattr(cur, "_summary_parallel_intervals_v5", False):
+        if getattr(cur, "_summary_parallel_intervals_v6", False):
             _INSTALLED = True
             return True
         _ORIG_TIME_LOCKED = cur
-        _patched_run_time_locked_summary_jobs._summary_parallel_intervals_v5 = True  # type: ignore[attr-defined]
+        _patched_run_time_locked_summary_jobs._summary_parallel_intervals_v6 = True  # type: ignore[attr-defined]
         tlr.run_time_locked_summary_jobs = _patched_run_time_locked_summary_jobs
         runners.run_time_locked_summary_jobs = _patched_run_time_locked_summary_jobs
         scheduler.run_time_locked_summary_jobs = _patched_run_time_locked_summary_jobs
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY PARALLEL] installed enabled=%s workers=%s timeout=%.1f ranking_parallel=%s force_1_3_5=%s push_all_intervals=%s main_entry_only=%s min_timeout=%s",
+            "[SUMMARY PARALLEL] installed v6 enabled=%s workers=%s bg_workers=%s timeout=%.1f ranking_parallel=%s force_1_3_5=%s push_all_intervals=%s push_bg_long=%s main_entry_only=%s min_timeout=%s",
             _env_bool("SUMMARY_PARALLEL_INTERVALS_ENABLED", True),
             _env_int("SUMMARY_PARALLEL_INTERVAL_WORKERS", 3),
+            _env_int("SUMMARY_PUSH_BG_INTERVAL_WORKERS", 2),
             _env_float("SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC", 90.0),
             _env_bool("SUMMARY_PARALLEL_RANKING_ENABLED", True),
             _force_all_targets_enabled(),
             _push_all_intervals_enabled(),
+            _push_bg_long_intervals_enabled(),
             _is_main_entry_only_process(),
             os.getenv("SUMMARY_PARALLEL_TIMEOUT_MIN_SEC"),
         )
