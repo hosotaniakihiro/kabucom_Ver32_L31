@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/tonosama/config.py
-# Version: Ver1.4-TONOSAMA-BODY-GUARD-RELAX
+# Version: Ver1.5-TONOSAMA-5SEC-FLAT-ALLOW
 # ------------------------------------------------------------
 # Ver1.2:
 #   - 固定値を環境変数対応
@@ -12,12 +12,17 @@
 #     1分足の実体値動き・高安値幅・直近出来高の下限を追加。
 #
 # Ver1.4:
-#   - 最新ログで _body_change_pct が全銘柄 0.0 のため、
-#     body_change_low_flat_alert_guard で primary_rows=0 になった。
-#   - 一方で _intrabar_range_pct は 6%〜16% 程度あり、実際には高安値幅がある。
-#   - body_change は open==close の足では 0 になりやすいため、既定値を 0.0 に緩和。
-#   - 「全然動いていない銘柄」抑止は high-low の MIN_INTRABAR_RANGE_PCT と
-#     MIN_LATEST_VOLUME に任せる。
+#   - _body_change_pct が全銘柄 0.0 のケースで全落ちしないよう、
+#     body_change 既定値を 0.0 に緩和。
+#
+# Ver1.5:
+#   - 最新ログで primary は 1件通過したが、price_change_5s_pct=0.0 のため
+#     five_sec_price_change_ng で全落ち。
+#   - 5秒足は取得タイミングにより 0.0 になりやすいので、TONOSAMA では
+#     5秒変化率を必須にしない。
+#   - 動きの確認は _max_price_change_pct / _intrabar_range_pct / volume で行う。
+#   - main.py が TONOSAMA_MIN_5SEC_PRICE_CHANGE_PCT=0.01 を setdefault していても、
+#     0.01 以下は 0.0 に丸めて全落ちを防ぐ。
 # ============================================================
 
 from __future__ import annotations
@@ -55,6 +60,19 @@ def _env_bool(name: str, default: bool) -> bool:
         return bool(default)
 
 
+def _tonosama_5sec_threshold() -> float:
+    """
+    main.py 側で TONOSAMA_MIN_5SEC_PRICE_CHANGE_PCT=0.01 が setdefault されるため、
+    config default を 0.0 にしても環境変数経由で 0.01 になり得る。
+    最新ログでは 5秒足が has_5sec_bar=True でも price_change_5s_pct=0.0 のため
+    全落ちしていたので、0.01 以下は実質OFFとして扱う。
+    """
+    v = _env_float("TONOSAMA_MIN_5SEC_PRICE_CHANGE_PCT", 0.0)
+    if v <= 0.01:
+        return 0.0
+    return float(v)
+
+
 TONOSAMA_EXPIRE_SEC = _env_int("TONOSAMA_EXPIRE_SEC", 180)
 
 MIN_PRICE = _env_float("TONOSAMA_MIN_PRICE", 200.0)
@@ -71,7 +89,6 @@ MIN_VOLUME_SURGE_RATIO = _env_float("TONOSAMA_MIN_VOLUME_SURGE_RATIO", 2.0)
 # 以前の 0.6% は15秒/1〜5分スキャルピングでは厳しすぎる。
 MIN_PRICE_CHANGE_PCT = _env_float("TONOSAMA_MIN_PRICE_CHANGE_PCT", 0.03)
 
-# Ver1.4:
 # body は open==close の足で 0 になりやすいため、既定では強制しない。
 # 動いているかどうかは intrabar range と latest volume で判定する。
 MIN_BODY_CHANGE_PCT = _env_float("TONOSAMA_MIN_BODY_CHANGE_PCT", 0.0)
@@ -81,7 +98,7 @@ MIN_LATEST_VOLUME = _env_float("TONOSAMA_MIN_LATEST_VOLUME", 3000.0)
 VOLUME_AVG_LOOKBACK_BARS = _env_int("TONOSAMA_VOLUME_AVG_LOOKBACK_BARS", 5)
 
 USE_5SEC_CONFIRM = _env_bool("TONOSAMA_USE_5SEC_CONFIRM", True)
-MIN_5SEC_PRICE_CHANGE_PCT = _env_float("TONOSAMA_MIN_5SEC_PRICE_CHANGE_PCT", 0.01)
+MIN_5SEC_PRICE_CHANGE_PCT = _tonosama_5sec_threshold()
 MIN_5SEC_VOLUME_SURGE_RATIO = _env_float("TONOSAMA_MIN_5SEC_VOLUME_SURGE_RATIO", 1.5)
 MAX_5SEC_DROP_PCT = _env_float("TONOSAMA_MAX_5SEC_DROP_PCT", -0.20)
 REQUIRE_5SEC_BAR = _env_bool("TONOSAMA_REQUIRE_5SEC_BAR", False)
