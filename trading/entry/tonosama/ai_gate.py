@@ -1,9 +1,9 @@
 # ============================================================
 # File   : trading/entry/tonosama/ai_gate.py
-# Version: Ver1.1-TONOSAMA-AI-DISCONNECTED-STRICT-FALLBACK
+# Version: Ver1.2-TONOSAMA-FALLBACK-CONFIG-ALIGNED
 # ------------------------------------------------------------
-# AIが未接続の場合、無条件 pass しない。
-# 強い出来高急増・価格変化・傾きがある場合だけルール代替で通す。
+# AI判定モジュールが利用できない場合の代替判定。
+# runner/config.py 側の殿様条件と同じ閾値を使う。
 # ============================================================
 from __future__ import annotations
 
@@ -23,6 +23,14 @@ def _env_float(name: str, default: float) -> float:
         if v is None or str(v).strip() == "":
             return float(default)
         return float(v)
+    except Exception:
+        return float(default)
+
+
+def _cfg(name: str, default: float) -> float:
+    try:
+        from . import config
+        return float(getattr(config, name, default))
     except Exception:
         return float(default)
 
@@ -57,37 +65,27 @@ def build_ai_features(row: pd.Series) -> dict:
 
 
 def _fallback_when_ai_disconnected(features: dict) -> tuple[bool, float, str]:
-    """
-    AI未接続時のフェイルクローズ寄り代替判定。
-
-    以前は ai_not_connected_rule_pass で無条件OKにしていたため、
-    出来高2倍・価格変化0.06%・5秒0.012%・slope0.0001 のような弱い候補が
-    pending になっていた。
-    """
     max_surge = safe_float(features.get("max_volume_surge_ratio"), 0.0)
     max_chg = safe_float(features.get("max_price_change_pct"), 0.0)
     chg_5s = safe_float(features.get("price_change_5s_pct"), 0.0)
     has_5s = bool(features.get("has_5sec_bar", False))
     slope = safe_float(features.get("slope"), 0.0)
 
-    min_surge = _env_float("TONOSAMA_AI_FALLBACK_MIN_VOLUME_SURGE", 3.0)
-    min_chg = _env_float("TONOSAMA_AI_FALLBACK_MIN_PRICE_CHANGE_PCT", 1.5)
-    min_slope = _env_float("TONOSAMA_AI_FALLBACK_MIN_SLOPE", 0.01)
-    min_5s = _env_float("TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT", 0.05)
+    min_surge = _env_float("TONOSAMA_AI_FALLBACK_MIN_VOLUME_SURGE", _cfg("MIN_VOLUME_SURGE_RATIO", 3.0))
+    min_chg = _env_float("TONOSAMA_AI_FALLBACK_MIN_PRICE_CHANGE_PCT", _cfg("MIN_PRICE_CHANGE_PCT", 0.05))
+    min_slope = _env_float("TONOSAMA_AI_FALLBACK_MIN_SLOPE", _cfg("MIN_SLOPE", 0.0003))
+    min_5s = _env_float("TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT", _cfg("MIN_5SEC_PRICE_CHANGE_PCT", 0.01))
 
     if max_surge < min_surge:
-        return False, 0.0, f"AI未接続: 出来高急増不足 max={max_surge:.2f}x < {min_surge:.2f}x"
-
+        return False, 0.0, f"fallback volume surge low max={max_surge:.2f}x < {min_surge:.2f}x"
     if max_chg < min_chg:
-        return False, 0.0, f"AI未接続: 価格変化不足 max={max_chg:.2f}% < {min_chg:.2f}%"
-
+        return False, 0.0, f"fallback price change low max={max_chg:.2f}% < {min_chg:.2f}%"
     if slope < min_slope:
-        return False, 0.0, f"AI未接続: 傾き不足 slope={slope:.4f} < {min_slope:.4f}"
-
+        return False, 0.0, f"fallback slope low slope={slope:.4f} < {min_slope:.4f}"
     if has_5s and chg_5s < min_5s:
-        return False, 0.0, f"AI未接続: 5秒変化不足 5s={chg_5s:.3f}% < {min_5s:.3f}%"
+        return False, 0.0, f"fallback 5sec change low 5s={chg_5s:.3f}% < {min_5s:.3f}%"
 
-    return True, 0.0, "AI未接続: 強い出来高急増・価格変化・傾きでルール代替通過"
+    return True, 0.0, f"fallback rule pass surge={max_surge:.2f}x chg={max_chg:.2f}% slope={slope:.4f}"
 
 
 def ai_check_tonosama_entry(row: pd.Series) -> tuple[bool, float, str]:
