@@ -1,12 +1,18 @@
 # ============================================================
 # File   : trading/entry/summary_ai/ai_gate_runner.py
-# Version: PRODUCTION-STABLE-REV3.2-AI-GATE-TOP20-CONSOLE
+# Version: PRODUCTION-STABLE-REV3.3-DIRECT-BUY-SAFETY-GUARD
 # ------------------------------------------------------------
 # Purpose:
 #   - summary候補 DataFrame を AI gate に通す
 #   - BUY / SELL の side を明示して AI に渡す
 #   - row側に side / ai_side がある場合は行ごとに BUY/SELL を切り替える
 #   - AI判定後、BUY/SELL別にTOP20 + AI可否結果をコンソールログへ表示する
+#
+# REV3.3:
+#   - side未指定の行を全部BUY扱いしない。buy_score/sell_scoreから推定する
+#   - direct place_entry_buy ルートでも require_market_open を必ず確認する
+#   - direct place_entry_buy ルートでも entry_budget の価格帯を必ず確認する
+#   - 昼休み 11:30〜12:30 に SUMMARY AI が直接発注する事故を防ぐ
 # ============================================================
 
 from __future__ import annotations
@@ -17,7 +23,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from .row_adapter import convert_summary_row_to_ai_gate_row
-from .utils import get_ai_final_entry_check, safe_df, safe_float, safe_str
+from .utils import get_ai_final_entry_check, is_market_open, safe_df, safe_float, safe_str
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +64,23 @@ def _side_value(side: Any) -> str:
     return s
 
 
+def _first_existing(row: pd.Series, names: list[str], default: Any = None) -> Any:
+    for c in names:
+        try:
+            if c in row.index:
+                v = row.get(c)
+                if v is None:
+                    continue
+                if isinstance(v, str) and v.strip() == "":
+                    continue
+                return v
+        except Exception:
+            pass
+    return default
+
+
 def _row_side(row: pd.Series, default_side: str) -> str:
+    # 明示 side がある場合は最優先。
     for c in ("ai_side", "side", "entry_decision", "signal"):
         try:
             if c in row.index:
@@ -67,6 +89,21 @@ def _row_side(row: pd.Series, default_side: str) -> str:
                     return v
         except Exception:
             pass
+
+    # side未指定の場合はスコアから推定する。
+    # 以前は default_side=BUY に倒していたため、SELLスコアだけの行がBUY発注された。
+    buy_score = safe_float(_first_existing(row, ["ai_disp_buy_score", "disp_buy_score", "score_buy", "buy_score"], 0.0), 0.0)
+    sell_score = safe_float(_first_existing(row, ["ai_disp_sell_score", "disp_sell_score", "score_sell", "sell_score"], 0.0), 0.0)
+    score = safe_float(_first_existing(row, ["score_total", "total_score", "final_score", "display_score", "score"], 0.0), 0.0)
+
+    if sell_score > buy_score and sell_score > 0:
+        return "SELL"
+    if buy_score > sell_score and buy_score > 0:
+        return "BUY"
+    if score < 0:
+        return "SELL"
+    if score > 0:
+        return "BUY"
     return _side_value(default_side)
 
 
@@ -77,6 +114,41 @@ def _get_place_entry_buy():
     except Exception:
         logger.exception("[SUMMARY AI ENTRY] failed to import place_entry_buy")
         return None
+
+
+def _entry_price_bounds() -> tuple[float, float, dict[str, Any]]:
+    min_price = 0.0
+    max_price = 0.0
+    diag: dict[str, Any] = {"source": "none"}
+    try:
+        from trading.entry.entry_budget import (
+            get_entry_min_price,
+            get_entry_max_price,
+            get_effective_entry_max_price,
+            get_max_entry_oneshot_yen,
+            get_order_lot_size,
+        )
+        min_price = float(get_entry_min_price())
+        max_price = float(get_effective_entry_max_price() or get_entry_max_price() or 0.0)
+        diag = {
+            "source": "entry_budget",
+            "entry_min_price": min_price,
+            "entry_max_price_effective": max_price,
+            "max_oneshot_yen": float(get_max_entry_oneshot_yen()),
+            "lot_size": int(get_order_lot_size()),
+        }
+    except Exception:
+        logger.debug("[SUMMARY AI ENTRY] entry budget bounds unavailable", exc_info=True)
+    return max(0.0, min_price), max(0.0, max_price), diag
+
+
+def _price_allowed_for_direct_entry(symbol: str, price: float) -> tuple[bool, str, dict[str, Any]]:
+    min_price, max_price, diag = _entry_price_bounds()
+    if price > 0 and min_price > 0 and price < min_price:
+        return False, f"price_below_entry_min_price:{price:.1f}<{min_price:.1f}", diag
+    if price > 0 and max_price > 0 and price > max_price:
+        return False, f"price_over_entry_max_price:{price:.1f}>{max_price:.1f}", diag
+    return True, "ok", diag
 
 
 def _inject_daily_fields_to_ai_row(ai_row: Dict[str, Any], row: pd.Series) -> Dict[str, Any]:
@@ -139,38 +211,18 @@ def _print_summary_ai_top20_console(
     source: str,
     top_n: int = DEFAULT_CONSOLE_TOP_N,
 ) -> None:
-    """
-    サマリーTOP20とAI可否を同じブロックでコンソールへ出す。
-    console_teeが有効ならこのままコンソールログにも保存される。
-    """
     try:
         if not results:
-            logger.warning(
-                "[SUMMARY AI TOP20 RESULT] empty interval=%s source=%s",
-                interval,
-                source,
-            )
+            logger.warning("[SUMMARY AI TOP20 RESULT] empty interval=%s source=%s", interval, source)
             return
 
         for side in ("BUY", "SELL"):
             rows = _sort_for_console(results, side)[: int(top_n)]
             if not rows:
-                logger.warning(
-                    "\n========== SUMMARY AI %s TOP20 RESULT interval=%s source=%s rows=0 ==========" ,
-                    side,
-                    interval,
-                    source,
-                )
+                logger.warning("\n========== SUMMARY AI %s TOP20 RESULT interval=%s source=%s rows=0 ==========", side, interval, source)
                 continue
 
-            logger.warning(
-                "\n========== SUMMARY AI %s TOP20 RESULT interval=%s source=%s rows=%s ==========" ,
-                side,
-                interval,
-                source,
-                len(rows),
-            )
-
+            logger.warning("\n========== SUMMARY AI %s TOP20 RESULT interval=%s source=%s rows=%s ==========", side, interval, source, len(rows))
             for i, r in enumerate(rows, start=1):
                 status = "AI_OK" if bool(r.get("allow")) else "AI_NG"
                 symbol = safe_str(r.get("symbol"), "")
@@ -183,36 +235,13 @@ def _print_summary_ai_top20_console(
                 close = safe_float(r.get("close_price"), 0.0)
                 reason = safe_str(r.get("reason"), "")
                 model = safe_str(r.get("model_used"), "")
-
                 logger.warning(
                     "%2d. %-5s %-18s %s conf=%.3f C=%.1f buy=%.2f sell=%.2f total=%.2f final=%.2f model=%s reason=%s",
-                    i,
-                    symbol,
-                    name[:18],
-                    status,
-                    conf,
-                    close,
-                    buy,
-                    sell,
-                    total,
-                    final,
-                    model,
-                    reason,
+                    i, symbol, name[:18], status, conf, close, buy, sell, total, final, model, reason,
                 )
-
-            logger.warning(
-                "========== END SUMMARY AI %s TOP20 RESULT interval=%s source=%s ==========\n",
-                side,
-                interval,
-                source,
-            )
-
+            logger.warning("========== END SUMMARY AI %s TOP20 RESULT interval=%s source=%s ==========\n", side, interval, source)
     except Exception:
-        logger.exception(
-            "[SUMMARY AI TOP20 RESULT] console print failed interval=%s source=%s",
-            interval,
-            source,
-        )
+        logger.exception("[SUMMARY AI TOP20 RESULT] console print failed interval=%s source=%s", interval, source)
 
 
 def run_ai_gate_for_candidates(
@@ -230,12 +259,7 @@ def run_ai_gate_for_candidates(
 ) -> List[Dict[str, Any]]:
     df = safe_df(candidates_df)
     if df.empty:
-        logger.warning(
-            "[SUMMARY AI GATE] skipped empty candidates interval=%s source=%s side=%s",
-            interval,
-            source,
-            side,
-        )
+        logger.warning("[SUMMARY AI GATE] skipped empty candidates interval=%s source=%s side=%s", interval, source, side)
         return []
 
     default_side = _side_value(side)
@@ -261,17 +285,9 @@ def run_ai_gate_for_candidates(
     )
 
     results: List[Dict[str, Any]] = []
-
     for _, row in df.iterrows():
         row_side = _row_side(row, default_side)
-
-        ai_row = convert_summary_row_to_ai_gate_row(
-            row,
-            interval=interval,
-            source=source,
-            default_dominant_ratio=default_dominant_ratio,
-            side=row_side,
-        )
+        ai_row = convert_summary_row_to_ai_gate_row(row, interval=interval, source=source, default_dominant_ratio=default_dominant_ratio, side=row_side)
         ai_row["side"] = row_side
         ai_row["ai_side"] = row_side
         ai_row = _inject_daily_fields_to_ai_row(ai_row, row)
@@ -282,20 +298,10 @@ def run_ai_gate_for_candidates(
         try:
             gate_result = ai_check(ai_row)
             if not isinstance(gate_result, dict):
-                gate_result = {
-                    "allow": False,
-                    "confidence": 0.0,
-                    "reason": "invalid_ai_result",
-                    "model_used": "UNKNOWN",
-                }
+                gate_result = {"allow": False, "confidence": 0.0, "reason": "invalid_ai_result", "model_used": "UNKNOWN"}
         except Exception:
             logger.exception("[SUMMARY AI GATE] AI gate failed side=%s symbol=%s", row_side, symbol)
-            gate_result = {
-                "allow": False,
-                "confidence": 0.0,
-                "reason": "ai_gate_exception",
-                "model_used": "ERROR",
-            }
+            gate_result = {"allow": False, "confidence": 0.0, "reason": "ai_gate_exception", "model_used": "ERROR"}
 
         allow = bool(gate_result.get("allow", False))
         conf = safe_float(gate_result.get("confidence"), 0.0)
@@ -306,10 +312,9 @@ def run_ai_gate_for_candidates(
             allow = False
             reason = _append_reason(reason, f"confidence_low:{conf:.3f}<{float(min_ai_confidence):.3f}")
 
-        if allow and row_side == "BUY" and daily_hard_block_exit_warn:
-            if _safe_bool(ai_row.get("daily_exit_warn"), False):
-                allow = False
-                reason = _append_reason(reason, "daily_exit_warn")
+        if allow and row_side == "BUY" and daily_hard_block_exit_warn and _safe_bool(ai_row.get("daily_exit_warn"), False):
+            allow = False
+            reason = _append_reason(reason, "daily_exit_warn")
 
         if allow and daily_min_score is not None:
             try:
@@ -348,45 +353,22 @@ def run_ai_gate_for_candidates(
             "daily_date": safe_str(ai_row.get("daily_date"), ""),
         }
         results.append(item)
-
         logger.info(
             "[SUMMARY AI GATE] AI_%s side=%s symbol=%s name=%s conf=%.3f buy=%.2f sell=%.2f total=%.2f close=%.1f reason=%s model=%s",
-            "OK" if allow else "NG",
-            row_side,
-            symbol,
-            symbolname,
-            conf,
-            safe_float(ai_row.get("buy_score")),
-            safe_float(ai_row.get("sell_score")),
-            safe_float(ai_row.get("score_total")),
-            safe_float(ai_row.get("close_price")),
-            reason,
-            model_used,
+            "OK" if allow else "NG", row_side, symbol, symbolname, conf,
+            safe_float(ai_row.get("buy_score")), safe_float(ai_row.get("sell_score")),
+            safe_float(ai_row.get("score_total")), safe_float(ai_row.get("close_price")), reason, model_used,
         )
 
     buy_sent = len([x for x in results if str(x.get("side")).upper() == "BUY"])
     sell_sent = len([x for x in results if str(x.get("side")).upper() == "SELL"])
     buy_ok = len([x for x in results if str(x.get("side")).upper() == "BUY" and bool(x.get("allow"))])
     sell_ok = len([x for x in results if str(x.get("side")).upper() == "SELL" and bool(x.get("allow"))])
-
     logger.warning(
         "[SUMMARY AI GATE] SEND_TO_AI done sent=%s buy_sent=%s sell_sent=%s buy_ok=%s sell_ok=%s interval=%s source=%s",
-        len(results),
-        buy_sent,
-        sell_sent,
-        buy_ok,
-        sell_ok,
-        interval,
-        source,
+        len(results), buy_sent, sell_sent, buy_ok, sell_ok, interval, source,
     )
-
-    _print_summary_ai_top20_console(
-        results,
-        interval=interval,
-        source=source,
-        top_n=DEFAULT_CONSOLE_TOP_N,
-    )
-
+    _print_summary_ai_top20_console(results, interval=interval, source=source, top_n=DEFAULT_CONSOLE_TOP_N)
     return results
 
 
@@ -397,12 +379,7 @@ def _extract_entry_values(r: Dict[str, Any]) -> Dict[str, Any]:
     symbolname = ai_row.get("symbolname") or r.get("symbolname") or source_row.get("symbolname") or ""
     price = ai_row.get("close_price") or ai_row.get("close") or r.get("close_price") or source_row.get("close")
     reason = r.get("reason") or "AI_OK"
-    return {
-        "symbol": str(symbol).strip(),
-        "symbolname": str(symbolname),
-        "price": safe_float(price, 0.0),
-        "reason": str(reason),
-    }
+    return {"symbol": str(symbol).strip(), "symbolname": str(symbolname), "price": safe_float(price, 0.0), "reason": str(reason)}
 
 
 def run_push_summary_ai_entry(
@@ -441,16 +418,9 @@ def run_push_summary_ai_entry(
         top_n = 20
 
     side_s = _side_value(side)
-
     logger.info(
-        "[SUMMARY AI ENTRY] received rows=%s interval=%s source=%s side=%s top_n=%s max_entries=%s dry_run=%s",
-        len(base_df),
-        interval,
-        source,
-        side_s,
-        top_n,
-        max_entries,
-        dry_run,
+        "[SUMMARY AI ENTRY] received rows=%s interval=%s source=%s side=%s top_n=%s max_entries=%s dry_run=%s require_market_open=%s",
+        len(base_df), interval, source, side_s, top_n, max_entries, dry_run, require_market_open,
     )
 
     if base_df.empty:
@@ -468,12 +438,20 @@ def run_push_summary_ai_entry(
     ai_ok = [r for r in ai_results if bool(r.get("allow"))]
 
     if side_s != "BUY":
-        logger.warning(
-            "[SUMMARY AI ENTRY] side=%s evaluated only; real BUY entry skipped ai_ok=%s",
-            side_s,
-            len(ai_ok),
-        )
+        logger.warning("[SUMMARY AI ENTRY] side=%s evaluated only; real BUY entry skipped ai_ok=%s", side_s, len(ai_ok))
         return {"candidates": candidates_df, "ai_results": ai_results, "ai_ok": ai_ok, "approved_rows": [], "execution": {"executed": False, "orders": [], "skip_reason": "non_buy_side_evaluated_only"}}
+
+    # direct BUY route の最終安全弁。
+    # executor bulk route には market/price guard があるが、この関数は place_entry_buy を直接呼ぶため必須。
+    if require_market_open and not is_market_open():
+        logger.warning(
+            "[SUMMARY AI ENTRY] market closed; direct BUY entry skipped interval=%s source=%s ai_ok=%s symbols=%s",
+            interval,
+            source,
+            len(ai_ok),
+            [str(x.get("symbol")) for x in ai_ok[:30]],
+        )
+        return {"candidates": candidates_df, "ai_results": ai_results, "ai_ok": ai_ok, "approved_rows": [], "execution": {"executed": False, "orders": [], "skip_reason": "market_closed"}}
 
     place_entry_buy = _get_place_entry_buy()
     if place_entry_buy is None:
@@ -485,12 +463,33 @@ def run_push_summary_ai_entry(
     except Exception:
         max_entries_i = 1
 
-    for r in ai_ok[:max_entries_i]:
+    approved_rows: List[Dict[str, Any]] = []
+    for r in ai_ok:
         if str(r.get("side", "BUY")).upper() != "BUY":
             continue
         v = _extract_entry_values(r)
         if not v["symbol"]:
             continue
+        price_ok, price_reason, price_diag = _price_allowed_for_direct_entry(v["symbol"], v["price"])
+        if not price_ok:
+            logger.warning(
+                "[SUMMARY AI ENTRY] direct BUY skipped by price guard symbol=%s price=%.1f reason=%s diag=%s",
+                v["symbol"],
+                v["price"],
+                price_reason,
+                price_diag,
+            )
+            continue
+        approved_rows.append(r)
+        if len(approved_rows) >= max_entries_i:
+            break
+
+    if not approved_rows:
+        logger.warning("[SUMMARY AI ENTRY] no direct BUY rows after side/price guard ai_ok=%s", len(ai_ok))
+        return {"candidates": candidates_df, "ai_results": ai_results, "ai_ok": ai_ok, "approved_rows": [], "execution": {"executed": False, "orders": [], "skip_reason": "no_buy_after_direct_guard"}}
+
+    for r in approved_rows:
+        v = _extract_entry_values(r)
         if dry_run:
             logger.warning("[SUMMARY AI ENTRY DRY_RUN] would entry BUY symbol=%s price=%.1f reason=%s", v["symbol"], v["price"], v["reason"])
             orders.append({"symbol": v["symbol"], "ok": True, "dry_run": True, "order_id": None})
@@ -503,7 +502,7 @@ def run_push_summary_ai_entry(
             orders.append({"symbol": v["symbol"], "ok": False, "dry_run": False, "order_id": None})
 
     executed = any(bool(x.get("ok")) for x in orders)
-    return {"candidates": candidates_df, "ai_results": ai_results, "ai_ok": ai_ok, "approved_rows": ai_ok, "execution": {"executed": executed, "orders": orders, "skip_reason": None if executed else "no_entry_sent"}}
+    return {"candidates": candidates_df, "ai_results": ai_results, "ai_ok": ai_ok, "approved_rows": approved_rows, "execution": {"executed": executed, "orders": orders, "skip_reason": None if executed else "no_entry_sent"}}
 
 
 def run_summary_ai_entry_from_df(*args, **kwargs):
