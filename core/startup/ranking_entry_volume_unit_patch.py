@@ -1,24 +1,22 @@
 # ============================================================
 # File   : core/startup/ranking_entry_volume_unit_patch.py
-# Version: V4.2-RANKING-ENTRY-UNIT-FINALIZE-ZERO-VOLUME-TURNOVER-ZERO
+# Version: V4.3-RANKING-ENTRY-UNIT-CACHE-AND-QUIET-LOG
 # ------------------------------------------------------------
 # 目的:
-#   ランキング由来エントリーで VOLUME_NG / TURNOVER_NG が大量発生する問題を補正する。
-#   ただし、補正の二重掛け・過剰掛けで流動性判定をすり抜ける事故を防ぐ。
+#   ランキング由来エントリーの volume / turnover 単位を補正する。
+#   ただし、同一銘柄が type × market で多数出るため、ログ大量出力と
+#   同一値の繰り返し正規化で entry loop が重くならないようにする。
+#
+# V4.3:
+#   - 同一 (symbol, price, raw_volume, raw_turnover) の補正結果をキャッシュ
+#   - 通常の finalized ログは既定で抑制
+#   - zero-volume turnover ignored も同一キーは一度だけ表示
+#   - 詳細ログが必要な場合だけ RANKING_ENTRY_UNIT_FIX_LOG_EACH=1
 #
 # V4.2:
 #   - volume=0 の行では turnover を 0 に落とす
 #   - 出来高ゼロなのに売買代金だけで流動性条件を通過する事故を防止
 #   - ranking_zero_volume_turnover_ignored を明示保存
-#   - install() ログで未定義変数 yen_floor / implied_max_ratio を参照する不具合を修正
-#
-# V4.1:
-#   - volume=0 の行では turnover の百万円補正を絶対に行わない
-#   - implied_turnover=0 の時に upper=candidate で補正が通る不具合を修正
-#   - volume=0 の行は raw_turnover を保持し、流動性判定では VOLUME_NG に落とす
-#   - ranking_entry_units_finalized=1 を付与し、後続patchの二重補正を防ぐ
-#   - turnover は price*volume と矛盾しない範囲に丸める
-#   - 旧wrapperを _original で辿って外してから再patchする
 # ============================================================
 
 from __future__ import annotations
@@ -32,6 +30,11 @@ _PATCHED = False
 
 _TRUE = {"1", "true", "yes", "y", "on", "enable", "enabled"}
 _FALSE = {"0", "false", "no", "n", "off", "disable", "disabled"}
+_CACHE: dict[tuple[str, float, float, float], dict[str, Any]] = {}
+_LOGGED_KEYS: set[tuple[str, float, float, float, str]] = set()
+_CACHE_MAX = 20000
+_LOG_FIRST_N = 30
+_LOG_COUNT = 0
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -90,6 +93,38 @@ def _unwrap(fn: Any) -> Any:
         return fn
 
 
+def _key(symbol: Any, price: float, raw_volume: float, raw_turnover: float) -> tuple[str, float, float, float]:
+    return (
+        str(symbol or "").strip(),
+        round(float(price), 4),
+        round(float(raw_volume), 4),
+        round(float(raw_turnover), 4),
+    )
+
+
+def _should_log_once(base_key: tuple[str, float, float, float], kind: str) -> bool:
+    global _LOG_COUNT
+    if _env_bool("RANKING_ENTRY_UNIT_FIX_LOG_EACH", False):
+        return True
+    k = (base_key[0], base_key[1], base_key[2], base_key[3], kind)
+    if k in _LOGGED_KEYS:
+        return False
+    _LOGGED_KEYS.add(k)
+    _LOG_COUNT += 1
+    if _LOG_COUNT <= int(_env_float("RANKING_ENTRY_UNIT_FIX_LOG_FIRST_N", _LOG_FIRST_N)):
+        return True
+    return False
+
+
+def _apply_cached(row: dict[str, Any], cached: dict[str, Any]) -> dict[str, Any]:
+    try:
+        for k, v in cached.items():
+            row[k] = v
+    except Exception:
+        pass
+    return row
+
+
 def _normalize_units(row: dict[str, Any], *, min_volume: float, min_turnover: float) -> dict[str, Any]:
     if not _env_bool("RANKING_ENTRY_NORMALIZE_VOLUME_UNITS", True):
         return row
@@ -98,9 +133,15 @@ def _normalize_units(row: dict[str, Any], *, min_volume: float, min_turnover: fl
         if _flag_on(row.get("ranking_entry_units_finalized")):
             return row
 
+        symbol = row.get("symbol")
         price = _safe_float(row.get("price") or row.get("current_price") or row.get("close_price") or row.get("close"), 0.0)
         raw_volume = _safe_float(row.get("volume") if row.get("volume") is not None else row.get("trading_volume"), 0.0)
         raw_turnover = _safe_float(row.get("turnover") if row.get("turnover") is not None else row.get("trading_value"), 0.0)
+        base_key = _key(symbol, price, raw_volume, raw_turnover)
+
+        cached = _CACHE.get(base_key)
+        if cached is not None:
+            return _apply_cached(row, cached)
 
         volume_multiplier = _env_float("RANKING_ENTRY_VOLUME_UNIT_MULTIPLIER", 1000.0)
         turnover_multiplier = _env_float("RANKING_ENTRY_TURNOVER_UNIT_MULTIPLIER", 1000000.0)
@@ -115,7 +156,6 @@ def _normalize_units(row: dict[str, Any], *, min_volume: float, min_turnover: fl
         turnover_unit_multiplier = 1.0
         zero_volume_turnover_ignored = False
 
-        # 売買高は千株単位で来るケースだけ補正する。
         if 0.0 < raw_volume < min_volume and volume_multiplier > 1:
             candidate_volume = raw_volume * volume_multiplier
             if candidate_volume >= min_volume:
@@ -127,8 +167,6 @@ def _normalize_units(row: dict[str, Any], *, min_volume: float, min_turnover: fl
         can_fix_turnover = volume > 0 and implied_turnover > 0
 
         if can_fix_turnover:
-            # 売買代金は百万円単位らしい小さい値だけ補正する。
-            # 100,000円以上の値は既に円単位とみなし、*1,000,000 しない。
             if 0.0 < raw_turnover < min_turnover and raw_turnover < yen_floor and turnover_multiplier > 1:
                 candidate_turnover = raw_turnover * turnover_multiplier
                 upper = max(min_turnover, implied_turnover * implied_max_ratio)
@@ -144,37 +182,45 @@ def _normalize_units(row: dict[str, Any], *, min_volume: float, min_turnover: fl
             elif turnover > implied_turnover * implied_max_ratio:
                 logger.warning(
                     "[RANKING ENTRY UNIT FIX] turnover clamped symbol=%s price=%s volume=%s turnover=%s implied=%s",
-                    row.get("symbol"), price, volume, turnover, implied_turnover,
+                    symbol, price, volume, turnover, implied_turnover,
                 )
                 turnover = implied_turnover
         else:
-            # 出来高ゼロ/欠損の行は、売買代金だけでは信用しない。
-            # ランキング種別によって turnover が入っても、entryの流動性判定では使わない。
             if raw_turnover > 0:
                 zero_volume_turnover_ignored = True
-                logger.info(
-                    "[RANKING ENTRY UNIT FIX] zero-volume turnover ignored symbol=%s price=%s raw_volume=%.3f raw_turnover=%.3f",
-                    row.get("symbol"), price, raw_volume, raw_turnover,
-                )
+                if _should_log_once(base_key, "zero_volume"):
+                    logger.info(
+                        "[RANKING ENTRY UNIT FIX] zero-volume turnover ignored symbol=%s price=%s raw_volume=%.3f raw_turnover=%.3f",
+                        symbol, price, raw_volume, raw_turnover,
+                    )
             turnover = 0.0
 
-        row["ranking_raw_volume"] = raw_volume
-        row["ranking_raw_turnover"] = raw_turnover
-        row["ranking_volume_unit_fixed"] = int(volume_unit_fixed)
-        row["ranking_turnover_unit_fixed"] = int(turnover_unit_fixed)
-        row["ranking_volume_unit_multiplier"] = volume_unit_multiplier
-        row["ranking_turnover_unit_multiplier"] = turnover_unit_multiplier
-        row["ranking_entry_units_finalized"] = 1
-        row["ranking_zero_volume_turnover_ignored"] = int(zero_volume_turnover_ignored)
-        row["volume"] = volume
-        row["trading_volume"] = volume
-        row["turnover"] = turnover
-        row["trading_value"] = turnover
+        updates = {
+            "ranking_raw_volume": raw_volume,
+            "ranking_raw_turnover": raw_turnover,
+            "ranking_volume_unit_fixed": int(volume_unit_fixed),
+            "ranking_turnover_unit_fixed": int(turnover_unit_fixed),
+            "ranking_volume_unit_multiplier": volume_unit_multiplier,
+            "ranking_turnover_unit_multiplier": turnover_unit_multiplier,
+            "ranking_entry_units_finalized": 1,
+            "ranking_zero_volume_turnover_ignored": int(zero_volume_turnover_ignored),
+            "volume": volume,
+            "trading_volume": volume,
+            "turnover": turnover,
+            "trading_value": turnover,
+        }
+        row.update(updates)
 
-        if volume_unit_fixed or turnover_unit_fixed or raw_turnover != turnover or raw_volume != volume:
+        if len(_CACHE) >= int(_env_float("RANKING_ENTRY_UNIT_FIX_CACHE_MAX", _CACHE_MAX)):
+            _CACHE.clear()
+            _LOGGED_KEYS.clear()
+        _CACHE[base_key] = dict(updates)
+
+        changed = volume_unit_fixed or turnover_unit_fixed or raw_turnover != turnover or raw_volume != volume
+        if changed and _should_log_once(base_key, "finalized"):
             logger.info(
-                "[RANKING ENTRY UNIT FIX] finalized V4.2 symbol=%s price=%s volume %.3f->%.3f turnover %.3f->%.3f vol_mul=%.0f turn_mul=%.0f implied=%.3f can_fix_turnover=%s zero_volume_ignored=%s",
-                row.get("symbol"), price, raw_volume, volume, raw_turnover, turnover,
+                "[RANKING ENTRY UNIT FIX] finalized V4.3 symbol=%s price=%s volume %.3f->%.3f turnover %.3f->%.3f vol_mul=%.0f turn_mul=%.0f implied=%.3f can_fix_turnover=%s zero_volume_ignored=%s",
+                symbol, price, raw_volume, volume, raw_turnover, turnover,
                 volume_unit_multiplier, turnover_unit_multiplier, implied_turnover,
                 can_fix_turnover, zero_volume_turnover_ignored,
             )
@@ -208,16 +254,13 @@ def install() -> bool:
         vol_cfg["MIN_VOLUME"] = min_volume
         vol_cfg["MIN_TURNOVER"] = min_turnover
 
-        yen_floor_log = _env_float("RANKING_ENTRY_TURNOVER_YEN_FLOOR", 100000.0)
-        implied_max_ratio_log = max(1.0, _env_float("RANKING_ENTRY_TURNOVER_IMPLIED_MAX_RATIO", 20.0))
-
         old_norm = getattr(target, "_normalize_ranking_row_for_entry", None)
         if not callable(old_norm):
             logger.warning("[RANKING ENTRY UNIT FIX] target normalizer not callable")
             return False
 
         base_norm = _unwrap(old_norm)
-        if getattr(old_norm, "_ranking_entry_unit_fix_patch_v42", False):
+        if getattr(old_norm, "_ranking_entry_unit_fix_patch_v43", False):
             _PATCHED = True
             return True
 
@@ -227,14 +270,15 @@ def install() -> bool:
                 return _normalize_units(out, min_volume=min_volume, min_turnover=min_turnover)
             return out
 
-        _normalize_ranking_row_for_entry_patched._ranking_entry_unit_fix_patch_v42 = True  # type: ignore[attr-defined]
+        _normalize_ranking_row_for_entry_patched._ranking_entry_unit_fix_patch_v43 = True  # type: ignore[attr-defined]
         _normalize_ranking_row_for_entry_patched._original = base_norm  # type: ignore[attr-defined]
         target._normalize_ranking_row_for_entry = _normalize_ranking_row_for_entry_patched
 
         _PATCHED = True
         logger.warning(
-            "[RANKING ENTRY UNIT FIX] installed V4.2 price_min %.1f->%.1f min_volume=%.1f min_turnover=%.1f zero_volume_turnover=zero finalized_marker=True yen_floor=%.1f implied_max_ratio=%.1f",
-            old_min, new_min, min_volume, min_turnover, yen_floor_log, implied_max_ratio_log,
+            "[RANKING ENTRY UNIT FIX] installed V4.3 price_min %.1f->%.1f min_volume=%.1f min_turnover=%.1f cache=True quiet_log=True log_each=%s",
+            old_min, new_min, min_volume, min_turnover,
+            _env_bool("RANKING_ENTRY_UNIT_FIX_LOG_EACH", False),
         )
         return True
     except Exception:
