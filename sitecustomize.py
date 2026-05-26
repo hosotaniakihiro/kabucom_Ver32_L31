@@ -1,9 +1,12 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver06-TONOSAMA-SURGE-FAILOPEN-DEFAULTS
+# Version: Ver07-SUMMARY-AI-LIQ-RESCUE-AUTO-INSTALL
 # ------------------------------------------------------------
 # Python 起動時に自動 import されるフック。
 # main.py を直接壊さず、監査ログ/バックテスト用DB保存を自動有効化する。
+#
+# Ver07:
+#   - SUMMARY AI の直前流動性チェックで全AI_OK候補が落ちる場合の救済patchを自動install
 #
 # Ver06:
 #   - TONOSAMA 出来高急増履歴不足時の fail-open 既定値を Python 起動直後に明示
@@ -153,6 +156,30 @@ def _install_tonosama_surge_defaults() -> None:
         _write_boot_evidence('TONOSAMA_SURGE_DEFAULTS_EXCEPTION', traceback.format_exc())
 
 
+def _install_summary_ai_liq_rescue_safely() -> None:
+    """SUMMARY AI のAI_OK候補が直前流動性判定だけで全落ちする場合の救済patch。"""
+    try:
+        if os.environ.get('DISABLE_SUMMARY_AI_LIQ_RESCUE_PATCH', '').strip() == '1':
+            _write_boot_evidence('SUMMARY_AI_LIQ_RESCUE_DISABLED_BY_ENV')
+            return
+
+        _ensure_project_root()
+        _write_boot_evidence('SUMMARY_AI_LIQ_RESCUE_INSTALL_START')
+
+        from core.startup.summary_ai_liquidity_rescue_patch import install
+
+        ok = install()
+        _write_boot_evidence('SUMMARY_AI_LIQ_RESCUE_INSTALL_DONE', {'ok': ok})
+        logging.getLogger(__name__).warning('[SITECUSTOMIZE] summary ai liq rescue auto install ok=%s', ok)
+    except Exception:
+        text = traceback.format_exc()
+        _write_boot_evidence('SUMMARY_AI_LIQ_RESCUE_EXCEPTION', text)
+        try:
+            logging.getLogger(__name__).exception('[SITECUSTOMIZE] summary ai liq rescue auto install failed')
+        except Exception:
+            pass
+
+
 def _install_audit_logging_safely() -> None:
     try:
         if os.environ.get('DISABLE_AUDIT_LOGGING', '').strip() == '1':
@@ -209,8 +236,6 @@ def _install_summary_mtf_catchup_safely() -> None:
             _write_boot_evidence('SUMMARY_MTF_CATCHUP_DISABLED_BY_ENV')
             return
 
-        # main.py は売買・表示優先。重いDB補完は main_database.py 側に寄せる。
-        # 強制したい場合のみ SUMMARY_MTF_CATCHUP_RUN_IN_MAIN=1 を設定する。
         if _is_main_py_process() and not _is_database_process() and not _env_on('SUMMARY_MTF_CATCHUP_RUN_IN_MAIN', False):
             _write_boot_evidence('SUMMARY_MTF_CATCHUP_SKIPPED_IN_MAIN_PROCESS')
             try:
@@ -251,6 +276,7 @@ def _install_summary_mtf_catchup_safely() -> None:
 _write_boot_evidence('PYTHON_START')
 _install_boot_exception_hook()
 _install_tonosama_surge_defaults()
+_install_summary_ai_liq_rescue_safely()
 _install_audit_logging_safely()
 _install_summary_controller_dupcol_patch_safely()
 _install_summary_mtf_catchup_safely()
