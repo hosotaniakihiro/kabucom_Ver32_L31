@@ -1,15 +1,16 @@
 # ============================================================
 # File   : core/startup/__init__.py
-# Ver    : PRODUCTION-STABLE-REV21.4-RANKING-ENTRY-UNIT-FIX
+# Ver    : PRODUCTION-STABLE-REV21.5-RANKING-SUMMARY-BG
 # ------------------------------------------------------------
 # 【概要】
 #   core.startup パッケージの公開入口。
 #   各種 runtime/startup patch を自動適用する。
 #
-# REV21.4:
-#   - ranking_entry_volume_unit_patch を追加
-#   - ランキングエントリーの売買高/売買代金単位を補正し VOLUME_NG を減らす
-#   - soft technical ready / runner ready fill も継続適用
+# REV21.5:
+#   - ranking_summary_schedule_bg_patch を追加
+#   - ranking_summary_all が長時間 running で残り、次回ジョブが previous still running に
+#     なる問題を防ぐ
+#   - ranking_entry_volume_unit_patch / soft technical ready 等も継続適用
 # ============================================================
 
 from __future__ import annotations
@@ -38,6 +39,13 @@ try:
     install_summary_scheduler_unified_stale_guard_patch()
 except Exception:
     logger.exception("[core.startup] summary scheduler unified stale guard patch install failed")
+
+try:
+    from .ranking_summary_schedule_bg_patch import install as install_ranking_summary_schedule_bg_patch
+
+    install_ranking_summary_schedule_bg_patch()
+except Exception:
+    logger.exception("[core.startup] ranking summary schedule bg patch install failed")
 
 try:
     from .summary_controller_soft_technical_ready_patch import install as install_summary_controller_soft_technical_ready_patch
