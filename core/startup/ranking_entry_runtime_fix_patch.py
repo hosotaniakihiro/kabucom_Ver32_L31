@@ -1,23 +1,17 @@
 # ============================================================
 # File   : core/startup/ranking_entry_runtime_fix_patch.py
-# Version: V1.1-RANKING-ENTRY-TECH-FALLBACK-SAFE-VOLUME-UNITS
+# Version: V1.2-RANKING-ENTRY-TECH-FALLBACK-NO-UNIT-REFIX
 # ------------------------------------------------------------
 # 目的:
 #   ranking_entry で以下の状態になる問題を抑止する。
 #     - ranking_technical attached symbols=0
-#     - 出来高ランキング値が 786.7 / 20633.9 のような表示単位のまま扱われ、
-#       MIN_VOLUME=30000 に届かず VOLUME_NG になる
+#     - 出来高ランキング値が表示単位のまま扱われ、MIN_VOLUMEに届かず VOLUME_NG になる
 #
-# V1.1 修正:
-#   - ranking_entry_volume_unit_patch と二重補正しない
-#   - すでに円単位らしい turnover=8,165,500 などを *1,000,000 しない
-#   - volume=0 の行で turnover だけを兆円化しない
-#   - turnover は price*volume と矛盾しない範囲でだけ補正する
-#
-# ENV:
-#   RANKING_ENTRY_RUNTIME_FIX_ENABLED=1
-#   RANKING_ENTRY_VOLUME_UNIT_MULTIPLIER=1000
-#   RANKING_ENTRY_TURNOVER_UNIT_MULTIPLIER=1000000
+# V1.2:
+#   - ranking_entry_volume_unit_patch V4 が ranking_entry_units_finalized=1 を付けた行は
+#     volume / turnover を一切再調整しない
+#   - 確定済み行の「turnover を price*volume へ寄せるだけ」のログを止める
+#   - 技術指標 fallback は従来通り維持
 # ============================================================
 
 from __future__ import annotations
@@ -96,13 +90,6 @@ def _current_thresholds() -> tuple[float, float]:
 
 
 def _looks_already_yen_turnover(turnover: float, *, min_turnover: float) -> bool:
-    """
-    turnover がすでに円単位らしいかを判定する。
-
-    ランキング表示単位の百万円なら 8.165 のような小さい値になる。
-    8,165,500 のような値は閾値未満でも「円」と見なして、
-    *1,000,000 して 8兆円にしない。
-    """
     if turnover <= 0:
         return False
     yen_floor = _env_float("RANKING_ENTRY_TURNOVER_YEN_FLOOR", 100000.0)
@@ -119,6 +106,10 @@ def _patched_normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
         if not _env_bool("RANKING_ENTRY_NORMALIZE_VOLUME_UNITS", True):
             return out
 
+        # volume_unit_patch V4 で確定済みなら、ここでは一切再調整しない。
+        if _flag_on(out.get("ranking_entry_units_finalized")):
+            return out
+
         min_volume, min_turnover = _current_thresholds()
         volume_mul = _env_float("RANKING_ENTRY_VOLUME_UNIT_MULTIPLIER", 1000.0)
         turnover_mul = _env_float("RANKING_ENTRY_TURNOVER_UNIT_MULTIPLIER", 1000000.0)
@@ -132,7 +123,6 @@ def _patched_normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
         already_volume_fixed = _flag_on(out.get("ranking_volume_unit_fixed")) or _safe_float(out.get("ranking_volume_unit_multiplier"), 0.0) > 1
         already_turnover_fixed = _flag_on(out.get("ranking_turnover_unit_fixed")) or _safe_float(out.get("ranking_turnover_unit_multiplier"), 0.0) > 1
 
-        # volume は未補正かつ閾値未満の時だけ千株補正を試す。
         if (not already_volume_fixed) and volume > 0 and volume < min_volume and volume_mul > 1:
             candidate_volume = volume * volume_mul
             if candidate_volume >= min_volume:
@@ -145,13 +135,10 @@ def _patched_normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
 
         implied_turnover = price * volume if price > 0 and volume > 0 else 0.0
 
-        # turnover は二重補正禁止。
-        # また、volume=0 のときに turnover だけを百万円補正して通過させない。
         if not already_turnover_fixed:
             if turnover > 0 and turnover < min_turnover and turnover_mul > 1:
                 if (not _looks_already_yen_turnover(turnover, min_turnover=min_turnover)) and implied_turnover > 0:
                     candidate_turnover = turnover * turnover_mul
-                    # price*volume と大きく乖離する候補は採用しない。
                     upper = implied_turnover * _env_float("RANKING_ENTRY_TURNOVER_IMPLIED_MAX_RATIO", 20.0)
                     if candidate_turnover >= min_turnover and candidate_turnover <= max(upper, min_turnover):
                         turnover = max(candidate_turnover, implied_turnover)
@@ -161,10 +148,6 @@ def _patched_normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
                 elif implied_turnover > turnover:
                     turnover = implied_turnover
             elif implied_turnover > turnover:
-                turnover = implied_turnover
-        else:
-            # 既に別patchで補正済みの場合でも price*volume より小さければ補完だけ行う。
-            if implied_turnover > turnover:
                 turnover = implied_turnover
 
         if turnover > 0:
@@ -274,21 +257,21 @@ def install() -> bool:
         import trading.ranking.entry_from_ranking as efr
 
         norm = getattr(efr, "_normalize_ranking_row_for_entry", None)
-        if callable(norm) and not getattr(norm, "_ranking_entry_fix_patch", False):
+        if callable(norm) and not getattr(norm, "_ranking_entry_fix_patch_v12", False):
             _ORIGINAL_NORMALIZE = norm
-            _patched_normalize_row._ranking_entry_fix_patch = True  # type: ignore[attr-defined]
+            _patched_normalize_row._ranking_entry_fix_patch_v12 = True  # type: ignore[attr-defined]
             efr._normalize_ranking_row_for_entry = _patched_normalize_row
-            logger.warning("[RANKING ENTRY FIX] patched _normalize_ranking_row_for_entry")
+            logger.warning("[RANKING ENTRY FIX] patched _normalize_ranking_row_for_entry V1.2 no-unit-refix")
 
         save = getattr(efr, "save_ranking_pseudo_technicals", None)
-        if callable(save) and not getattr(save, "_ranking_entry_fix_patch", False):
+        if callable(save) and not getattr(save, "_ranking_entry_fix_patch_v12", False):
             _ORIGINAL_SAVE_TECH = save
-            _patched_save_ranking_pseudo_technicals._ranking_entry_fix_patch = True  # type: ignore[attr-defined]
+            _patched_save_ranking_pseudo_technicals._ranking_entry_fix_patch_v12 = True  # type: ignore[attr-defined]
             efr.save_ranking_pseudo_technicals = _patched_save_ranking_pseudo_technicals
-            logger.warning("[RANKING ENTRY FIX] patched save_ranking_pseudo_technicals")
+            logger.warning("[RANKING ENTRY FIX] patched save_ranking_pseudo_technicals V1.2")
 
         _PATCHED = True
-        logger.warning("[RANKING ENTRY FIX] installed V1.1 tech-fallback safe-volume-unit-normalizer")
+        logger.warning("[RANKING ENTRY FIX] installed V1.2 tech-fallback no-unit-refix")
         return True
     except Exception:
         logger.exception("[RANKING ENTRY FIX] install failed")
