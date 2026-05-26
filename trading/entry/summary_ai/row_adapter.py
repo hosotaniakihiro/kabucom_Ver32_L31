@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/summary_ai/row_adapter.py
-# Version: PRODUCTION-STABLE-REV1.0-SUMMARY-AI-ROW-ADAPTER
+# Version: PRODUCTION-STABLE-REV1.1-SUMMARY-AI-TECH-READY-PASS
 # ------------------------------------------------------------
 # 【概要】
 #   SUMMARY row を AI/entry_gate.py の ai_final_entry_check(row)
@@ -15,6 +15,11 @@
 #     dominant_ratio / entry_decision / side
 #
 #   を吸収する。
+#
+# REV1.1:
+#   - technical_ready / display_ready / symbol_hist_len を AI row に渡す
+#   - slope_atr_scaled / mtf_score も渡す
+#   - サマリー側では ready なのに AI側で technical_not_ready 扱いになる問題を修正
 # ============================================================
 
 from __future__ import annotations
@@ -24,6 +29,22 @@ from typing import Any, Dict
 import pandas as pd
 
 from .utils import first_value, normalize_symbol, safe_float, safe_int, safe_str
+
+
+def _safe_bool(v: Any, default: bool = False) -> bool:
+    try:
+        if isinstance(v, bool):
+            return v
+        if v is None:
+            return default
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "ng", "", "nan", "none", "<na>"}:
+            return False
+        return default
+    except Exception:
+        return default
 
 
 def convert_summary_row_to_ai_gate_row(
@@ -92,6 +113,15 @@ def convert_summary_row_to_ai_gate_row(
 
     side = str(side or "BUY").upper()
 
+    score_mtf = safe_float(first_value(row, ["ai_disp_mtf", "disp_mtf", "score_mtf", "mtf_score", "mtf"], 0.0))
+    mtf_score = safe_float(first_value(row, ["mtf_score", "score_mtf", "mtf", "ai_disp_mtf", "disp_mtf"], score_mtf))
+    slope = safe_float(first_value(row, ["ai_disp_slope", "disp_slope", "slope", "score_slope"], 0.0))
+    slope_atr_scaled = safe_float(first_value(row, ["slope_atr_scaled", "disp_slope_atr_scaled", "ai_disp_slope_atr_scaled", "score_slope"], slope))
+
+    technical_ready = _safe_bool(first_value(row, ["technical_ready", "tech_ready", "ready"], True), True)
+    display_ready = _safe_bool(first_value(row, ["display_ready", "disp_ready"], technical_ready), technical_ready)
+    symbol_hist_len = safe_float(first_value(row, ["symbol_hist_len", "hist_len", "history_len"], 0.0), 0.0)
+
     return {
         "symbol": symbol,
         "symbolname": symbolname,
@@ -113,14 +143,21 @@ def convert_summary_row_to_ai_gate_row(
         "volume": volume,
         "datetime": dt_value,
 
+        # readiness / history
+        "technical_ready": technical_ready,
+        "display_ready": display_ready,
+        "symbol_hist_len": symbol_hist_len,
+
         # 元のサマリー系
         "score": safe_float(first_value(row, ["ai_disp_score", "disp_score", "score"], 0.0)),
         "score_buy": buy_score,
         "score_sell": sell_score,
         "score_slope": safe_float(first_value(row, ["ai_disp_slope", "disp_slope", "score_slope", "slope"], 0.0)),
-        "score_mtf": safe_float(first_value(row, ["ai_disp_mtf", "disp_mtf", "score_mtf", "mtf"], 0.0)),
-        "slope": safe_float(first_value(row, ["ai_disp_slope", "disp_slope", "slope", "score_slope"], 0.0)),
+        "score_mtf": score_mtf,
+        "slope": slope,
+        "slope_atr_scaled": slope_atr_scaled,
         "mtf": safe_float(first_value(row, ["ai_disp_mtf", "disp_mtf", "mtf", "score_mtf"], 0.0)),
+        "mtf_score": mtf_score,
         "rsi": safe_float(first_value(row, ["ai_disp_rsi", "disp_rsi", "rsi"], 50.0), 50.0),
         "macd": safe_float(first_value(row, ["ai_disp_macd", "disp_macd", "macd"], 0.0)),
         "signal": safe_float(first_value(row, ["ai_disp_signal", "disp_signal", "signal", "macd_signal"], 0.0)),
