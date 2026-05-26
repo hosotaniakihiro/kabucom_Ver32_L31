@@ -1,28 +1,23 @@
 # ============================================================
 # File   : core/startup/summary_db_seed_restore_patch.py
-# Version: V1.2-PREV-SUMMARY-75BARS-INSUFFICIENT-CURRENT-FALLBACK
+# Version: V1.3-PREV-SEED-HISTORY-ONLY-NO-MERGED-PUSH
 # ------------------------------------------------------------
 # 目的:
 #   main.py は split mode / entry_only のため summary DB へ正式保存しない。
 #   ただし、エントリー判定・AI判定・Discord表示では
 #   main_database.py が保存した stock_summary_1min/3min/5min の履歴が必要。
 #
-# 修正内容:
+# V1.3:
+#   - 前日DB seed は history cache には入れるが、source=push の merged latest へは載せない
+#   - 5/26起動時に 5/25 の4231銘柄が PUSH最新扱いになり、5MA早期クロス判定が
+#     前日データを見てしまう問題を防止
+#   - 当日DB seed は従来通り merged へ載せてもよい
+#
+# 既存内容:
 #   - system_startup の summary_engine rebind 後に summaryYYYYMMDD.db を読む
 #   - stock_summary_1min/3min/5min を各銘柄ごとに最新75本だけ復元
-#   - 当日DBが空の場合は直近の前日 summary DB を読む
-#   - V1.2: 当日DBが非空でも、各銘柄履歴が薄い場合は前日DBを読む
-#       例: current DB rows>0 だが max_rows_per_symbol=5/11、macd_nonzero=0 のケース
+#   - 当日DBが空/薄い場合は直近の前日 summary DB を読む
 #   - GlobalContext の history cache へ復元
-#   - 表示用 merged summary へ source=push / source=ranking 別に最新行を復元
-#   - global_data.summary_1m_df / 3m / 5m へも履歴DFを注入
-#
-# 効果:
-#   - main.py 側の previous PUSH merged summary rows=0 を防ぐ
-#   - 起動直後でも各銘柄ごとに 1m/3m/5m 最新75本の履歴を持てる
-#   - 当日DBが少量だけあるせいで前日履歴復元がスキップされる問題を防ぐ
-#   - MACD / signal / slope / MTF / ma75 / technical_ready など
-#     履歴依存項目が 0/NULL になりにくくなる
 # ============================================================
 
 from __future__ import annotations
@@ -63,6 +58,14 @@ def _env_int(name: str, default: int) -> int:
         return int(float(v))
     except Exception:
         return int(default)
+
+
+def _today() -> dt.date:
+    try:
+        from scheduler_jobs.summary.time_utils import now_naive
+        return now_naive().date()
+    except Exception:
+        return dt.datetime.now().date()
 
 
 def _engine_database_path() -> Optional[str]:
@@ -127,7 +130,6 @@ def _quote_ident(name: str) -> str:
 
 
 def _count_summary_rows(path: Path) -> int:
-    """前日fallback判定用。存在するsummary tableの合計行数を軽く見る。"""
     if path is None or not path.exists():
         return 0
     total = 0
@@ -164,10 +166,6 @@ def _parse_summary_date(path: Path) -> Optional[dt.date]:
 
 
 def _resolve_previous_seed_db_path(current_path: Path) -> Optional[Path]:
-    """
-    直近の前日summary DBを軽量探索する。
-    db_bootstrap側の summary_engine は当日DBのまま維持する。
-    """
     if not _env_bool("SUMMARY_DB_SEED_RESTORE_PREV_FALLBACK", True):
         return None
     if current_path is None:
@@ -211,7 +209,6 @@ def _read_table(conn: sqlite3.Connection, table: str, *, per_symbol_rows: int, m
     per_symbol_rows = max(1, int(per_symbol_rows))
     max_rows = max(1000, int(max_rows))
 
-    # 重要: 全体LIMITではなく、各銘柄ごとに最新N本を読む。
     if symbol_col and order_col:
         q_symbol = _quote_ident(symbol_col)
         q_order = _quote_ident(order_col)
@@ -326,6 +323,26 @@ def _normalize_summary_df(df: pd.DataFrame, interval: int) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _seed_is_stale_for_merged(df: pd.DataFrame) -> tuple[bool, str]:
+    """前日/古いseedを最新PUSH mergedに載せないための判定。history cacheには使う。"""
+    try:
+        if not _env_bool("SUMMARY_DB_SEED_RESTORE_HISTORY_ONLY_FOR_STALE", True):
+            return False, "disabled"
+        if df is None or df.empty or "datetime" not in df.columns:
+            return False, "no_datetime"
+        dt_ser = pd.to_datetime(df["datetime"], errors="coerce")
+        latest = dt_ser.max()
+        if pd.isna(latest):
+            return False, "latest_na"
+        today = _today()
+        if latest.date() < today:
+            return True, f"latest_date={latest.date()}<today={today}"
+        return False, f"latest_date={latest.date()}"
+    except Exception:
+        logger.debug("[SUMMARY DB SEED RESTORE] stale merged check failed", exc_info=True)
+        return False, "check_failed"
+
+
 def _publish_interval(interval: int, df: pd.DataFrame) -> dict[str, Any]:
     stats: dict[str, Any] = {"interval": interval, "rows": 0, "push_rows": 0, "ranking_rows": 0}
     if df is None or df.empty:
@@ -345,29 +362,41 @@ def _publish_interval(interval: int, df: pd.DataFrame) -> dict[str, Any]:
         except Exception:
             pass
 
-        src = df["source"].fillna("push").astype(str).str.lower() if "source" in df.columns else pd.Series("push", index=df.index)
-        ranking_mask = src.str.contains("ranking|rank", regex=True, na=False)
-        push_mask = ~ranking_mask
+        stale_for_merged, stale_reason = _seed_is_stale_for_merged(df)
+        if stale_for_merged:
+            logger.warning(
+                "[SUMMARY DB SEED RESTORE] history-only seed interval=%s reason=%s rows=%s; skip set_push/ranking_merged_summary",
+                interval,
+                stale_reason,
+                len(df),
+            )
+            push_df = pd.DataFrame()
+            ranking_df = pd.DataFrame()
+        else:
+            src = df["source"].fillna("push").astype(str).str.lower() if "source" in df.columns else pd.Series("push", index=df.index)
+            ranking_mask = src.str.contains("ranking|rank", regex=True, na=False)
+            push_mask = ~ranking_mask
+            push_df = df.loc[push_mask].copy()
+            ranking_df = df.loc[ranking_mask].copy()
 
-        push_df = df.loc[push_mask].copy()
-        ranking_df = df.loc[ranking_mask].copy()
+            if not push_df.empty:
+                try:
+                    global_data.set_push_merged_summary(interval, push_df)
+                except Exception:
+                    logger.exception("[SUMMARY DB SEED RESTORE] set_push_merged_summary failed interval=%s", interval)
 
-        if not push_df.empty:
-            try:
-                global_data.set_push_merged_summary(interval, push_df)
-            except Exception:
-                logger.exception("[SUMMARY DB SEED RESTORE] set_push_merged_summary failed interval=%s", interval)
-
-        if not ranking_df.empty:
-            try:
-                global_data.set_ranking_merged_summary(interval, ranking_df)
-            except Exception:
-                logger.exception("[SUMMARY DB SEED RESTORE] set_ranking_merged_summary failed interval=%s", interval)
+            if not ranking_df.empty:
+                try:
+                    global_data.set_ranking_merged_summary(interval, ranking_df)
+                except Exception:
+                    logger.exception("[SUMMARY DB SEED RESTORE] set_ranking_merged_summary failed interval=%s", interval)
 
         stats.update(
             rows=int(len(df)),
             push_rows=int(len(push_df)),
             ranking_rows=int(len(ranking_df)),
+            merged_skipped_stale=int(bool(stale_for_merged)),
+            merged_skip_reason=stale_reason,
             symbols=int(df["symbol"].nunique()) if "symbol" in df.columns else 0,
             latest_dt=str(pd.to_datetime(df["datetime"], errors="coerce").max()) if "datetime" in df.columns else None,
             min_dt=str(pd.to_datetime(df["datetime"], errors="coerce").min()) if "datetime" in df.columns else None,
@@ -411,7 +440,7 @@ def _build_result_from_frames(path: Path, frames: dict[int, pd.DataFrame], *, pe
         stats["raw_rows"] = int(len(df)) if isinstance(df, pd.DataFrame) else 0
         result["intervals"][str(interval)] = stats
         logger.warning(
-            "[SUMMARY DB SEED RESTORE] interval=%sm table=%s raw_rows=%s rows=%s symbols=%s max_rows_per_symbol=%s push_rows=%s ranking_rows=%s min_dt=%s latest_dt=%s macd_nonzero=%s signal_nonzero=%s mtf_nonzero=%s",
+            "[SUMMARY DB SEED RESTORE] interval=%sm table=%s raw_rows=%s rows=%s symbols=%s max_rows_per_symbol=%s push_rows=%s ranking_rows=%s merged_skipped_stale=%s min_dt=%s latest_dt=%s macd_nonzero=%s signal_nonzero=%s mtf_nonzero=%s",
             interval,
             table,
             stats.get("raw_rows"),
@@ -420,6 +449,7 @@ def _build_result_from_frames(path: Path, frames: dict[int, pd.DataFrame], *, pe
             stats.get("max_rows_per_symbol"),
             stats.get("push_rows"),
             stats.get("ranking_rows"),
+            stats.get("merged_skipped_stale"),
             stats.get("min_dt"),
             stats.get("latest_dt"),
             stats.get("macd_nonzero"),
@@ -449,7 +479,6 @@ def _total_restored_rows(result: dict[str, Any]) -> int:
 
 
 def _result_needs_previous_seed(result: dict[str, Any], *, per_symbol_rows: int) -> tuple[bool, str]:
-    """当日DBが非空でも、履歴が薄ければ前日DBを使う。"""
     if not _env_bool("SUMMARY_DB_SEED_RESTORE_USE_PREV_IF_INSUFFICIENT", True):
         return False, "disabled"
     if _total_restored_rows(result) <= 0:
@@ -482,10 +511,6 @@ def _result_needs_previous_seed(result: dict[str, Any], *, per_symbol_rows: int)
 
 
 def restore_summary_db_seed(db_path: Any = None, *, force: bool = False) -> dict[str, Any]:
-    """
-    main_database.py が保存した summary DB を main.py メモリへ復元する。
-    既定では各銘柄・各足ごとに最新75本のみ読む。
-    """
     global _RESTORED
 
     if not force and _RESTORED:
