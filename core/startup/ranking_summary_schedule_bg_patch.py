@@ -1,26 +1,22 @@
 # ============================================================
 # File   : core/startup/ranking_summary_schedule_bg_patch.py
-# Version: V1-RANKING-SUMMARY-SCHEDULE-BACKGROUND
+# Version: V2-RANKING-SUMMARY-BG-AND-INTERNAL-STALE-CLEAR
 # ------------------------------------------------------------
 # 目的:
 #   ranking_summary_all の schedule job が数分間 running のまま残り、
-#   毎分 previous still running でスキップされ続ける問題を防ぐ。
+#   毎分 previous still running / internal_previous_still_running で
+#   スキップされ続ける問題を防ぐ。
 #
-# 背景:
-#   fast_startup_runtime_patch は scheduler_bootstrap._run_ranking_summary_all_job_safe を
-#   _ranking_job_safe_no_return に差し替えているが、その中で old_job を同期実行している。
-#   そのためランキングDB/Discord/announceが重いと、schedule_loop上では
-#   tags:ranking_summary_all,startup_scheduler_bootstrap が長時間 running になる。
-#
-# 対応:
-#   - fast_startup_runtime_patch._ranking_job_safe_no_return を背景実行版へ差し替える。
-#   - schedule job 自体は即 return None するため schedule_loop を詰まらせない。
-#   - 内部では同時多重実行を禁止し、前回BGが実行中なら投入だけスキップする。
-#   - 古いBG状態は RANKING_SUMMARY_BG_STALE_SEC で解除する。
+# V2:
+#   - schedule側だけでなく scheduler_bootstrap._RANKING_JOB_RUNNING も stale解除
+#   - 12:09ログの started_at=12:01 elapsed=480s internal_previous_still_running を解除
+#   - fast_startup_runtime_patch._ranking_job_safe_no_return を背景実行版へ差し替え
+#   - schedule job 自体は即 return None して schedule_loop を詰まらせない
 #
 # ENV:
 #   RANKING_SUMMARY_SCHEDULE_BG=1
 #   RANKING_SUMMARY_BG_STALE_SEC=120
+#   RANKING_SUMMARY_INTERNAL_STALE_SEC=120
 # ============================================================
 
 from __future__ import annotations
@@ -83,7 +79,7 @@ def _elapsed_sec() -> float:
         return 0.0
 
 
-def _clear_if_stale() -> bool:
+def _clear_bg_if_stale() -> bool:
     global _RUNNING, _STARTED_AT
     try:
         if not _RUNNING:
@@ -94,10 +90,49 @@ def _clear_if_stale() -> bool:
             return False
         _RUNNING = False
         _STARTED_AT = None
-        logger.warning("[RANKING SUMMARY BG PATCH] stale running cleared elapsed=%.3fs stale=%.3fs", elapsed, stale)
+        logger.warning("[RANKING SUMMARY BG PATCH] bg stale running cleared elapsed=%.3fs stale=%.3fs", elapsed, stale)
         return True
     except Exception:
-        logger.debug("[RANKING SUMMARY BG PATCH] stale clear failed", exc_info=True)
+        logger.debug("[RANKING SUMMARY BG PATCH] bg stale clear failed", exc_info=True)
+        return False
+
+
+def _clear_scheduler_bootstrap_internal_if_stale() -> bool:
+    """scheduler_bootstrap 内部の _RANKING_JOB_RUNNING が古く残るケースを解除する。"""
+    try:
+        import core.startup.scheduler_bootstrap as sb
+        running = bool(getattr(sb, "_RANKING_JOB_RUNNING", False))
+        if not running:
+            return False
+        started_at = getattr(sb, "_RANKING_JOB_STARTED_AT", None)
+        elapsed = 999999.0
+        if isinstance(started_at, dt.datetime):
+            elapsed = max(0.0, (dt.datetime.now() - started_at).total_seconds())
+        stale = _env_float("RANKING_SUMMARY_INTERNAL_STALE_SEC", 120.0)
+        if elapsed < stale:
+            return False
+        lock = getattr(sb, "_RANKING_JOB_LOCK", None)
+        if lock is not None:
+            with lock:
+                sb._RANKING_JOB_RUNNING = False
+                sb._RANKING_JOB_STARTED_AT = None
+        else:
+            sb._RANKING_JOB_RUNNING = False
+            sb._RANKING_JOB_STARTED_AT = None
+        try:
+            sb._set_global_attr("ranking_summary_job_running", False)
+            sb._set_global_attr("ranking_summary_job_stale_cleared_at", dt.datetime.now())
+        except Exception:
+            pass
+        logger.warning(
+            "[RANKING SUMMARY BG PATCH] scheduler_bootstrap internal running stale cleared started_at=%s elapsed=%.3fs stale=%.3fs",
+            started_at,
+            elapsed,
+            stale,
+        )
+        return True
+    except Exception:
+        logger.debug("[RANKING SUMMARY BG PATCH] scheduler_bootstrap internal stale clear failed", exc_info=True)
         return False
 
 
@@ -105,6 +140,7 @@ def _task(original, args: tuple[Any, ...], kwargs: dict[str, Any], started_at: d
     global _RUNNING, _STARTED_AT
     t0 = time.perf_counter()
     try:
+        _clear_scheduler_bootstrap_internal_if_stale()
         logger.warning("[RANKING SUMMARY BG PATCH] bg start started_at=%s", started_at)
         ret = original(*args, **kwargs)
         logger.warning("[RANKING SUMMARY BG PATCH] bg done elapsed=%.3fs ret_type=%s", time.perf_counter() - t0, type(ret).__name__)
@@ -119,6 +155,7 @@ def _task(original, args: tuple[Any, ...], kwargs: dict[str, Any], started_at: d
 def _ranking_job_safe_no_return_bg(*args: Any, **kwargs: Any):
     global _RUNNING, _STARTED_AT
     if not _env_bool("RANKING_SUMMARY_SCHEDULE_BG", True):
+        _clear_scheduler_bootstrap_internal_if_stale()
         if callable(_ORIGINAL):
             return _ORIGINAL(*args, **kwargs)
         return None
@@ -129,7 +166,8 @@ def _ranking_job_safe_no_return_bg(*args: Any, **kwargs: Any):
         return None
 
     with _LOCK:
-        _clear_if_stale()
+        _clear_bg_if_stale()
+        _clear_scheduler_bootstrap_internal_if_stale()
         if _RUNNING:
             logger.warning(
                 "[RANKING SUMMARY BG PATCH] submit skipped reason=bg_still_running elapsed=%.3fs",
@@ -148,6 +186,7 @@ def _ranking_job_safe_no_return_bg(*args: Any, **kwargs: Any):
 def install() -> bool:
     global _PATCHED, _ORIGINAL
     if _PATCHED:
+        _clear_scheduler_bootstrap_internal_if_stale()
         return True
     try:
         import core.startup.fast_startup_runtime_patch as fast_patch
@@ -160,16 +199,16 @@ def install() -> bool:
         if not callable(cur):
             logger.warning("[RANKING SUMMARY BG PATCH] target _ranking_job_safe_no_return not callable")
             return False
-        if getattr(cur, "_ranking_summary_bg_patch", False):
+        if getattr(cur, "_ranking_summary_bg_patch_v2", False):
             _PATCHED = True
+            _clear_scheduler_bootstrap_internal_if_stale()
             return True
 
         _ORIGINAL = cur
-        _ranking_job_safe_no_return_bg._ranking_summary_bg_patch = True  # type: ignore[attr-defined]
+        _ranking_job_safe_no_return_bg._ranking_summary_bg_patch_v2 = True  # type: ignore[attr-defined]
         _ranking_job_safe_no_return_bg._original = cur  # type: ignore[attr-defined]
         fast_patch._ranking_job_safe_no_return = _ranking_job_safe_no_return_bg
 
-        # 既に scheduler_bootstrap 側へ同じ関数参照が入っている場合も差し替える。
         try:
             import core.startup.scheduler_bootstrap as sb
             if getattr(sb, "_run_ranking_summary_all_job_safe", None) is cur:
@@ -177,11 +216,13 @@ def install() -> bool:
         except Exception:
             logger.debug("[RANKING SUMMARY BG PATCH] scheduler_bootstrap ref patch skipped", exc_info=True)
 
+        _clear_scheduler_bootstrap_internal_if_stale()
         _PATCHED = True
         logger.warning(
-            "[RANKING SUMMARY BG PATCH] installed enabled=%s stale_sec=%.1f",
+            "[RANKING SUMMARY BG PATCH] installed V2 enabled=%s bg_stale_sec=%.1f internal_stale_sec=%.1f",
             _env_bool("RANKING_SUMMARY_SCHEDULE_BG", True),
             _env_float("RANKING_SUMMARY_BG_STALE_SEC", 120.0),
+            _env_float("RANKING_SUMMARY_INTERNAL_STALE_SEC", 120.0),
         )
         return True
     except Exception:
