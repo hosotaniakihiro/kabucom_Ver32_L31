@@ -1,16 +1,17 @@
 # ============================================================
 # File   : trading/entry/summary_ai/utils.py
-# Version: PRODUCTION-STABLE-REV1.0-SUMMARY-AI-UTILS
+# Version: PRODUCTION-STABLE-REV1.1-DEDUPE-COLUMNS-BEFORE-AI
 # ------------------------------------------------------------
 # 【概要】
 #   summary_ai パッケージ共通の安全化ユーティリティ。
 #
-# 【主な機能】
-#   - DataFrame 安全化
-#   - 数値 / 文字列 / symbol 正規化
-#   - optional callable resolver
-#   - market open 判定
-#   - DataFrame → records 変換
+# REV1.1:
+#   - DataFrame.columns 重複を safe_df/to_records 前に統合
+#   - df.to_dict(orient='records') の
+#       UserWarning: DataFrame columns are not unique
+#     を抑止
+#   - technical_ready / usable_technical_ready などの True 値が
+#     重複カラムで欠落し、AI.entry_gate が technical_not_ready 扱いする問題を防ぐ
 # ============================================================
 
 from __future__ import annotations
@@ -28,6 +29,72 @@ logger = logging.getLogger(__name__)
 
 
 VALID_MARKET_TYPES = {"プライム", "スタンダード", "グロース"}
+
+_TRUE_STR = {"1", "true", "yes", "y", "on", "ok", "対象"}
+
+
+def _series_has_value(s: pd.Series) -> bool:
+    try:
+        if s is None:
+            return False
+        return bool(s.notna().any())
+    except Exception:
+        return False
+
+
+def _merge_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df
+    try:
+        cols = list(df.columns)
+        if len(cols) == len(set(cols)):
+            return df
+
+        out = pd.DataFrame(index=df.index)
+        for col in dict.fromkeys(cols):
+            same = df.loc[:, [c for c in cols if c == col]]
+            if isinstance(same, pd.Series):
+                out[col] = same
+                continue
+            if same.shape[1] == 1:
+                out[col] = same.iloc[:, 0]
+                continue
+
+            # technical_ready系は OR で統合する。
+            if str(col).lower() in {"technical_ready", "usable_technical_ready", "display_ready", "ranking_tech_ready"}:
+                merged_bool = pd.Series(False, index=df.index)
+                for i in range(same.shape[1]):
+                    s = same.iloc[:, i]
+                    try:
+                        b = s.fillna(False)
+                        if b.dtype != bool:
+                            b = b.astype(str).str.strip().str.lower().isin(_TRUE_STR)
+                        merged_bool = merged_bool | b.astype(bool)
+                    except Exception:
+                        pass
+                out[col] = merged_bool
+                continue
+
+            # 通常列は左から順に non-null を採用。
+            merged = same.iloc[:, 0].copy()
+            for i in range(1, same.shape[1]):
+                s = same.iloc[:, i]
+                try:
+                    merged = merged.where(merged.notna(), s)
+                except Exception:
+                    if _series_has_value(s):
+                        merged = s
+            out[col] = merged
+
+        dup_count = len(cols) - len(out.columns)
+        logger.warning("[SUMMARY AI UTILS] duplicate columns merged before AI dup_count=%s cols=%s", dup_count, [c for c in dict.fromkeys(cols) if cols.count(c) > 1][:20])
+        return out
+    except Exception:
+        logger.exception("[SUMMARY AI UTILS] duplicate column merge failed")
+        try:
+            return df.loc[:, ~pd.Index(df.columns).duplicated(keep="first")].copy()
+        except Exception:
+            return df
 
 
 def safe_df(df: Any) -> pd.DataFrame:
@@ -57,6 +124,7 @@ def safe_df(df: Any) -> pd.DataFrame:
             logger.debug("[SUMMARY AI UTILS] MultiIndex flatten failed", exc_info=True)
 
         out.columns = [str(c) for c in out.columns]
+        out = _merge_duplicate_columns(out)
         out = out.replace([np.inf, -np.inf], np.nan)
         return out.reset_index(drop=True)
 
@@ -143,11 +211,13 @@ def first_value(row: pd.Series | Dict[str, Any], names: Sequence[str], default: 
 
 def to_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
     try:
-        return df.to_dict(orient="records")
+        x = safe_df(df)
+        return x.to_dict(orient="records")
     except Exception:
         rows: List[Dict[str, Any]] = []
         try:
-            for _, row in df.iterrows():
+            x = safe_df(df)
+            for _, row in x.iterrows():
                 rows.append(dict(row))
         except Exception:
             pass
@@ -217,15 +287,6 @@ def get_ai_final_entry_check() -> Optional[Callable[[Dict[str, Any]], Dict[str, 
 
 
 def get_bulk_entry_pipeline() -> Optional[Callable[..., Any]]:
-    """
-    既存の entry pipeline を探索する。
-
-    優先:
-      trading.summary.pipeline.entry_pipeline.run_entry_pipeline
-
-    想定:
-      run_entry_pipeline(approved_rows, df_summary, interval)
-    """
     return resolve_callable(
         [
             ("trading.summary.pipeline.entry_pipeline", "run_entry_pipeline"),
@@ -238,25 +299,19 @@ def get_bulk_entry_pipeline() -> Optional[Callable[..., Any]]:
 
 def pick_num_series(df: pd.DataFrame, candidates: Sequence[str], default: float = 0.0) -> pd.Series:
     for c in candidates:
-        if c in df.columns:
-            try:
-                return (
-                    pd.to_numeric(df[c], errors="coerce")
-                    .replace([np.inf, -np.inf], np.nan)
-                    .fillna(default)
-                )
-            except Exception:
-                pass
-
-    return pd.Series(default, index=df.index, dtype="float64")
+        try:
+            if c in df.columns:
+                return pd.to_numeric(df[c], errors="coerce").fillna(default)
+        except Exception:
+            continue
+    return pd.Series(default, index=df.index)
 
 
-def pick_text_series(df: pd.DataFrame, candidates: Sequence[str], default: str = "") -> pd.Series:
+def pick_str_series(df: pd.DataFrame, candidates: Sequence[str], default: str = "") -> pd.Series:
     for c in candidates:
-        if c in df.columns:
-            try:
+        try:
+            if c in df.columns:
                 return df[c].fillna(default).astype(str)
-            except Exception:
-                pass
-
-    return pd.Series(default, index=df.index, dtype="object")
+        except Exception:
+            continue
+    return pd.Series(default, index=df.index)
