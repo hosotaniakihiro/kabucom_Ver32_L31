@@ -1,9 +1,14 @@
 # ============================================================
 # File   : trading/entry/summary_ai/utils.py
-# Version: PRODUCTION-STABLE-REV1.1-DEDUPE-COLUMNS-BEFORE-AI
+# Version: PRODUCTION-STABLE-REV1.2-DEDUPE-COLUMNS-PICK-TEXT-COMPAT
 # ------------------------------------------------------------
 # 【概要】
 #   summary_ai パッケージ共通の安全化ユーティリティ。
+#
+# REV1.2:
+#   - candidates.py が import している pick_text_series を復旧
+#   - pick_text_series は pick_str_series の互換aliasとして動作
+#   - REV1.1 の重複カラム統合処理は維持
 #
 # REV1.1:
 #   - DataFrame.columns 重複を safe_df/to_records 前に統合
@@ -60,7 +65,6 @@ def _merge_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
                 out[col] = same.iloc[:, 0]
                 continue
 
-            # technical_ready系は OR で統合する。
             if str(col).lower() in {"technical_ready", "usable_technical_ready", "display_ready", "ranking_tech_ready"}:
                 merged_bool = pd.Series(False, index=df.index)
                 for i in range(same.shape[1]):
@@ -75,7 +79,6 @@ def _merge_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
                 out[col] = merged_bool
                 continue
 
-            # 通常列は左から順に non-null を採用。
             merged = same.iloc[:, 0].copy()
             for i in range(1, same.shape[1]):
                 s = same.iloc[:, i]
@@ -264,11 +267,7 @@ def resolve_callable(candidates: Sequence[Tuple[str, str]]) -> Optional[Callable
             mod = importlib.import_module(module_name)
             fn = getattr(mod, func_name, None)
             if callable(fn):
-                logger.info(
-                    "[SUMMARY AI UTILS] resolved callable %s.%s",
-                    module_name,
-                    func_name,
-                )
+                logger.info("[SUMMARY AI UTILS] resolved callable %s.%s", module_name, func_name)
                 return fn
         except Exception:
             continue
@@ -315,3 +314,29 @@ def pick_str_series(df: pd.DataFrame, candidates: Sequence[str], default: str = 
         except Exception:
             continue
     return pd.Series(default, index=df.index)
+
+
+def pick_text_series(df: pd.DataFrame, candidates: Sequence[str], default: str = "") -> pd.Series:
+    """Backward compatible alias used by candidates.py."""
+    return pick_str_series(df, candidates, default=default)
+
+
+__all__ = [
+    "VALID_MARKET_TYPES",
+    "safe_df",
+    "safe_float",
+    "safe_int",
+    "safe_str",
+    "normalize_symbol",
+    "first_value",
+    "to_records",
+    "now_jst_naive",
+    "is_market_open",
+    "is_truthy",
+    "resolve_callable",
+    "get_ai_final_entry_check",
+    "get_bulk_entry_pipeline",
+    "pick_num_series",
+    "pick_str_series",
+    "pick_text_series",
+]
