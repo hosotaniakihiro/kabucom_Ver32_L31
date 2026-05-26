@@ -1,30 +1,18 @@
 # ============================================================
 # File   : core/startup/ranking_entry_volume_unit_patch.py
-# Version: V2-RANKING-ENTRY-SAFE-VOLUME-TURNOVER-UNIT-NORMALIZE
+# Version: V3-RANKING-ENTRY-UNIT-FINALIZE-NO-DOUBLE-FIX
 # ------------------------------------------------------------
 # 目的:
 #   ランキング由来エントリーで VOLUME_NG / TURNOVER_NG が大量発生する問題を補正する。
 #   ただし、補正の二重掛け・過剰掛けで流動性判定をすり抜ける事故を防ぐ。
 #
-# 背景:
-#   kabu StationランキングAPI由来の売買高・売買代金は、画面/API上の単位が
-#   「千株」「百万円」等の縮約値で来ることがある。
-#   entry_from_ranking.py はその値を株数/円としてそのまま判定していたため、
-#   例: volume=13316.0 が 13,316株扱いになり、MIN_VOLUME=30,000で落ちる。
-#
-# V2 修正:
-#   - volume=0 の行で turnover だけを百万円補正しない
-#   - turnover=8,165,500 のように既に円単位らしい値を *1,000,000 しない
-#   - turnover 補正候補が price * volume から大きく乖離する場合は採用しない
-#   - 既に ranking_*_unit_fixed が立っている行を二重補正しない
-#   - 低位株の過剰排除を避けるため、ランキング由来の最低価格を 200円へ緩和する
-#
-# ENV:
-#   RANKING_ENTRY_NORMALIZE_VOLUME_UNITS=1
-#   RANKING_ENTRY_VOLUME_UNIT_MULTIPLIER=1000
-#   RANKING_ENTRY_TURNOVER_UNIT_MULTIPLIER=1000000
-#   RANKING_ENTRY_TURNOVER_YEN_FLOOR=100000
-#   RANKING_ENTRY_TURNOVER_IMPLIED_MAX_RATIO=20
+# V3:
+#   - このpatchで単位補正を一度だけ確定する
+#   - ranking_entry_units_finalized=1 を付与し、後続patchの二重補正を防ぐ
+#   - ranking_volume_unit_multiplier / ranking_turnover_unit_multiplier を常に明示保存
+#   - volume=0 の行で turnover だけを過大補正しない
+#   - turnover は price*volume と矛盾しない範囲に丸める
+#   - 旧wrapperを _original で辿って外してから再patchする
 # ============================================================
 
 from __future__ import annotations
@@ -84,16 +72,16 @@ def _flag_on(v: Any) -> bool:
         return False
 
 
-def _looks_already_yen_turnover(turnover: float, *, min_turnover: float) -> bool:
-    """turnover が既に円単位に見える場合 True。"""
-    if turnover <= 0:
-        return False
-    yen_floor = _env_float("RANKING_ENTRY_TURNOVER_YEN_FLOOR", 100000.0)
-    if turnover >= yen_floor:
-        return True
-    if turnover >= min_turnover:
-        return True
-    return False
+def _unwrap(fn: Any) -> Any:
+    try:
+        seen = set()
+        cur = fn
+        while callable(getattr(cur, "_original", None)) and id(cur) not in seen:
+            seen.add(id(cur))
+            cur = getattr(cur, "_original")
+        return cur
+    except Exception:
+        return fn
 
 
 def _normalize_units(row: dict[str, Any], *, min_volume: float, min_turnover: float) -> dict[str, Any]:
@@ -101,6 +89,9 @@ def _normalize_units(row: dict[str, Any], *, min_volume: float, min_turnover: fl
         return row
 
     try:
+        if _flag_on(row.get("ranking_entry_units_finalized")):
+            return row
+
         price = _safe_float(row.get("price") or row.get("current_price") or row.get("close_price") or row.get("close"), 0.0)
         raw_volume = _safe_float(row.get("volume") if row.get("volume") is not None else row.get("trading_volume"), 0.0)
         raw_turnover = _safe_float(row.get("turnover") if row.get("turnover") is not None else row.get("trading_value"), 0.0)
@@ -108,57 +99,55 @@ def _normalize_units(row: dict[str, Any], *, min_volume: float, min_turnover: fl
         volume_multiplier = _env_float("RANKING_ENTRY_VOLUME_UNIT_MULTIPLIER", 1000.0)
         turnover_multiplier = _env_float("RANKING_ENTRY_TURNOVER_UNIT_MULTIPLIER", 1000000.0)
         implied_max_ratio = max(1.0, _env_float("RANKING_ENTRY_TURNOVER_IMPLIED_MAX_RATIO", 20.0))
+        yen_floor = _env_float("RANKING_ENTRY_TURNOVER_YEN_FLOOR", 100000.0)
 
         volume = raw_volume
         turnover = raw_turnover
         volume_unit_fixed = False
         turnover_unit_fixed = False
+        volume_unit_multiplier = 1.0
+        turnover_unit_multiplier = 1.0
 
-        already_volume_fixed = _flag_on(row.get("ranking_volume_unit_fixed")) or _safe_float(row.get("ranking_volume_unit_multiplier"), 0.0) > 1
-        already_turnover_fixed = _flag_on(row.get("ranking_turnover_unit_fixed")) or _safe_float(row.get("ranking_turnover_unit_multiplier"), 0.0) > 1
-
-        # ランキングの売買高は千株単位で来るケースがある。
-        # ただし、既に補正済みの行には二重に掛けない。
-        if (not already_volume_fixed) and 0.0 < raw_volume < min_volume and volume_multiplier > 1:
+        # 売買高は千株単位で来るケースだけ補正する。
+        if 0.0 < raw_volume < min_volume and volume_multiplier > 1:
             candidate = raw_volume * volume_multiplier
-            if candidate >= min_volume or raw_volume >= 1.0:
+            if candidate >= min_volume:
                 volume = candidate
                 volume_unit_fixed = True
+                volume_unit_multiplier = volume_multiplier
 
         implied_turnover = price * volume if price > 0 and volume > 0 else 0.0
 
-        # ランキングの売買代金は百万円単位で来るケースがある。
-        # ただし、以下は絶対に補正しない。
-        #   - volume=0: 出来高ゼロなのに売買代金だけ巨大化させない
-        #   - raw_turnover が既に円単位らしい
-        #   - price*volume と大きく乖離する
-        if not already_turnover_fixed:
-            if 0.0 < raw_turnover < min_turnover and turnover_multiplier > 1:
-                if volume > 0 and implied_turnover > 0 and not _looks_already_yen_turnover(raw_turnover, min_turnover=min_turnover):
-                    candidate = raw_turnover * turnover_multiplier
-                    upper = max(min_turnover, implied_turnover * implied_max_ratio)
-                    if candidate >= min_turnover and candidate <= upper:
-                        turnover = max(candidate, implied_turnover)
-                        turnover_unit_fixed = True
-                    else:
-                        # 候補が不自然な場合は price*volume を採用する。
-                        turnover = max(raw_turnover, implied_turnover)
-                elif implied_turnover > raw_turnover:
-                    turnover = implied_turnover
-            elif implied_turnover > raw_turnover:
+        # 売買代金は百万円単位らしい小さい値だけ補正する。
+        # 100,000円以上の値は既に円単位とみなし、*1,000,000 しない。
+        if 0.0 < raw_turnover < min_turnover and raw_turnover < yen_floor and turnover_multiplier > 1:
+            candidate_turnover = raw_turnover * turnover_multiplier
+            upper = implied_turnover * implied_max_ratio if implied_turnover > 0 else candidate_turnover
+            if candidate_turnover >= min_turnover and candidate_turnover <= max(upper, min_turnover):
+                turnover = candidate_turnover
+                turnover_unit_fixed = True
+                turnover_unit_multiplier = turnover_multiplier
+
+        # price*volume が妥当なら補完。ただし volume=0 では turnover だけを巨大化させない。
+        if implied_turnover > 0:
+            if turnover <= 0:
                 turnover = implied_turnover
-        else:
-            if implied_turnover > turnover:
+            elif turnover < min_turnover <= implied_turnover:
+                turnover = implied_turnover
+            elif turnover > implied_turnover * implied_max_ratio:
+                logger.warning(
+                    "[RANKING ENTRY UNIT FIX] turnover clamped symbol=%s price=%s volume=%s turnover=%s implied=%s",
+                    row.get("symbol"), price, volume, turnover, implied_turnover,
+                )
                 turnover = implied_turnover
 
         row["ranking_raw_volume"] = raw_volume
         row["ranking_raw_turnover"] = raw_turnover
-        row["ranking_volume_unit_fixed"] = int(volume_unit_fixed or already_volume_fixed)
-        row["ranking_turnover_unit_fixed"] = int(turnover_unit_fixed or already_turnover_fixed)
-        if volume_unit_fixed:
-            row["ranking_volume_unit_multiplier"] = volume_multiplier
-        if turnover_unit_fixed:
-            row["ranking_turnover_unit_multiplier"] = turnover_multiplier
+        row["ranking_volume_unit_fixed"] = int(volume_unit_fixed)
+        row["ranking_turnover_unit_fixed"] = int(turnover_unit_fixed)
+        row["ranking_volume_unit_multiplier"] = volume_unit_multiplier
+        row["ranking_turnover_unit_multiplier"] = turnover_unit_multiplier
+        row["ranking_entry_units_finalized"] = 1
         row["volume"] = volume
         row["trading_volume"] = volume
         row["turnover"] = turnover
@@ -166,9 +155,9 @@ def _normalize_units(row: dict[str, Any], *, min_volume: float, min_turnover: fl
 
         if volume_unit_fixed or turnover_unit_fixed or raw_turnover != turnover:
             logger.info(
-                "[RANKING ENTRY UNIT FIX] symbol=%s price=%s volume %.3f->%.3f turnover %.3f->%.3f vol_fixed=%s turn_fixed=%s implied=%.3f already_vol=%s already_turn=%s",
+                "[RANKING ENTRY UNIT FIX] finalized symbol=%s price=%s volume %.3f->%.3f turnover %.3f->%.3f vol_mul=%.0f turn_mul=%.0f implied=%.3f",
                 row.get("symbol"), price, raw_volume, volume, raw_turnover, turnover,
-                volume_unit_fixed, turnover_unit_fixed, implied_turnover, already_volume_fixed, already_turnover_fixed,
+                volume_unit_multiplier, turnover_unit_multiplier, implied_turnover,
             )
     except Exception:
         logger.exception("[RANKING ENTRY UNIT FIX] normalize failed symbol=%s", row.get("symbol"))
@@ -204,28 +193,26 @@ def install() -> bool:
         if not callable(old_norm):
             logger.warning("[RANKING ENTRY UNIT FIX] target normalizer not callable")
             return False
-        if getattr(old_norm, "_ranking_entry_unit_fix_patch", False):
+
+        base_norm = _unwrap(old_norm)
+        if getattr(old_norm, "_ranking_entry_unit_fix_patch_v3", False):
             _PATCHED = True
             return True
 
         def _normalize_ranking_row_for_entry_patched(row: dict[str, Any]) -> dict[str, Any]:
-            out = old_norm(row)
+            out = base_norm(row)
             if isinstance(out, dict):
                 return _normalize_units(out, min_volume=min_volume, min_turnover=min_turnover)
             return out
 
-        _normalize_ranking_row_for_entry_patched._ranking_entry_unit_fix_patch = True  # type: ignore[attr-defined]
-        _normalize_ranking_row_for_entry_patched._original = old_norm  # type: ignore[attr-defined]
+        _normalize_ranking_row_for_entry_patched._ranking_entry_unit_fix_patch_v3 = True  # type: ignore[attr-defined]
+        _normalize_ranking_row_for_entry_patched._original = base_norm  # type: ignore[attr-defined]
         target._normalize_ranking_row_for_entry = _normalize_ranking_row_for_entry_patched
 
         _PATCHED = True
         logger.warning(
-            "[RANKING ENTRY UNIT FIX] installed V2 price_min %.1f->%.1f min_volume=%.1f min_turnover=%.1f normalize_units=%s yen_floor=%.1f implied_max_ratio=%.1f",
-            old_min,
-            new_min,
-            min_volume,
-            min_turnover,
-            _env_bool("RANKING_ENTRY_NORMALIZE_VOLUME_UNITS", True),
+            "[RANKING ENTRY UNIT FIX] installed V3 price_min %.1f->%.1f min_volume=%.1f min_turnover=%.1f finalized_marker=True yen_floor=%.1f implied_max_ratio=%.1f",
+            old_min, new_min, min_volume, min_turnover,
             _env_float("RANKING_ENTRY_TURNOVER_YEN_FLOOR", 100000.0),
             _env_float("RANKING_ENTRY_TURNOVER_IMPLIED_MAX_RATIO", 20.0),
         )
