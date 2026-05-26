@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/summary_db_seed_restore_patch.py
-# Version: V1.1-PREV-SUMMARY-75BARS-PER-SYMBOL
+# Version: V1.2-PREV-SUMMARY-75BARS-INSUFFICIENT-CURRENT-FALLBACK
 # ------------------------------------------------------------
 # 目的:
 #   main.py は split mode / entry_only のため summary DB へ正式保存しない。
@@ -9,8 +9,10 @@
 #
 # 修正内容:
 #   - system_startup の summary_engine rebind 後に summaryYYYYMMDD.db を読む
-#   - 当日DBが空の場合、直近の前日 summaryYYYYMMDD.db を軽量探索して読む
 #   - stock_summary_1min/3min/5min を各銘柄ごとに最新75本だけ復元
+#   - 当日DBが空の場合は直近の前日 summary DB を読む
+#   - V1.2: 当日DBが非空でも、各銘柄履歴が薄い場合は前日DBを読む
+#       例: current DB rows>0 だが max_rows_per_symbol=5/11、macd_nonzero=0 のケース
 #   - GlobalContext の history cache へ復元
 #   - 表示用 merged summary へ source=push / source=ranking 別に最新行を復元
 #   - global_data.summary_1m_df / 3m / 5m へも履歴DFを注入
@@ -18,6 +20,7 @@
 # 効果:
 #   - main.py 側の previous PUSH merged summary rows=0 を防ぐ
 #   - 起動直後でも各銘柄ごとに 1m/3m/5m 最新75本の履歴を持てる
+#   - 当日DBが少量だけあるせいで前日履歴復元がスキップされる問題を防ぐ
 #   - MACD / signal / slope / MTF / ma75 / technical_ready など
 #     履歴依存項目が 0/NULL になりにくくなる
 # ============================================================
@@ -162,7 +165,7 @@ def _parse_summary_date(path: Path) -> Optional[dt.date]:
 
 def _resolve_previous_seed_db_path(current_path: Path) -> Optional[Path]:
     """
-    当日DBが空のときだけ、直近の前日summary DBを軽量探索する。
+    直近の前日summary DBを軽量探索する。
     db_bootstrap側の summary_engine は当日DBのまま維持する。
     """
     if not _env_bool("SUMMARY_DB_SEED_RESTORE_PREV_FALLBACK", True):
@@ -209,7 +212,6 @@ def _read_table(conn: sqlite3.Connection, table: str, *, per_symbol_rows: int, m
     max_rows = max(1000, int(max_rows))
 
     # 重要: 全体LIMITではなく、各銘柄ごとに最新N本を読む。
-    # SQLiteのROW_NUMBER()が使える環境ではこちらを優先する。
     if symbol_col and order_col:
         q_symbol = _quote_ident(symbol_col)
         q_order = _quote_ident(order_col)
@@ -241,7 +243,6 @@ def _read_table(conn: sqlite3.Connection, table: str, *, per_symbol_rows: int, m
                 per_symbol_rows,
             )
 
-    # 古いSQLite等のfallback。これは全体最新max_rowsなので、通常は使わない。
     if order_col:
         q_order = _quote_ident(order_col)
         sql = f"SELECT * FROM (SELECT * FROM {q_table} WHERE {q_order} IS NOT NULL ORDER BY {q_order} DESC LIMIT ?) ORDER BY {q_order} ASC"
@@ -372,6 +373,7 @@ def _publish_interval(interval: int, df: pd.DataFrame) -> dict[str, Any]:
             min_dt=str(pd.to_datetime(df["datetime"], errors="coerce").min()) if "datetime" in df.columns else None,
             max_rows_per_symbol=int(df.groupby("symbol").size().max()) if "symbol" in df.columns and len(df) else 0,
             macd_nonzero=int((pd.to_numeric(df.get("macd"), errors="coerce").fillna(0) != 0).sum()) if "macd" in df.columns else -1,
+            signal_nonzero=int((pd.to_numeric(df.get("signal"), errors="coerce").fillna(0) != 0).sum()) if "signal" in df.columns else -1,
             mtf_nonzero=int((pd.to_numeric(df.get("mtf"), errors="coerce").fillna(0) != 0).sum()) if "mtf" in df.columns else -1,
         )
         return stats
@@ -380,7 +382,21 @@ def _publish_interval(interval: int, df: pd.DataFrame) -> dict[str, Any]:
         return stats
 
 
-def _restore_from_path(path: Path, *, per_symbol_rows: int, max_rows: int) -> dict[str, Any]:
+def _read_all_intervals_from_path(path: Path, *, per_symbol_rows: int, max_rows: int) -> dict[int, pd.DataFrame]:
+    out: dict[int, pd.DataFrame] = {}
+    with sqlite3.connect(str(path), timeout=30) as conn:
+        try:
+            conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute("PRAGMA query_only=ON")
+        except Exception:
+            pass
+        for interval, table in _TABLES.items():
+            raw = _read_table(conn, table, per_symbol_rows=per_symbol_rows, max_rows=max_rows)
+            out[interval] = _normalize_summary_df(raw, interval=interval)
+    return out
+
+
+def _build_result_from_frames(path: Path, frames: dict[int, pd.DataFrame], *, per_symbol_rows: int, max_rows: int) -> dict[str, Any]:
     result: dict[str, Any] = {
         "ok": True,
         "path": str(path),
@@ -388,43 +404,40 @@ def _restore_from_path(path: Path, *, per_symbol_rows: int, max_rows: int) -> di
         "max_rows": int(max_rows),
         "intervals": {},
     }
+    for interval, table in _TABLES.items():
+        df = frames.get(interval, pd.DataFrame())
+        stats = _publish_interval(interval, df)
+        stats["table"] = table
+        stats["raw_rows"] = int(len(df)) if isinstance(df, pd.DataFrame) else 0
+        result["intervals"][str(interval)] = stats
+        logger.warning(
+            "[SUMMARY DB SEED RESTORE] interval=%sm table=%s raw_rows=%s rows=%s symbols=%s max_rows_per_symbol=%s push_rows=%s ranking_rows=%s min_dt=%s latest_dt=%s macd_nonzero=%s signal_nonzero=%s mtf_nonzero=%s",
+            interval,
+            table,
+            stats.get("raw_rows"),
+            stats.get("rows"),
+            stats.get("symbols"),
+            stats.get("max_rows_per_symbol"),
+            stats.get("push_rows"),
+            stats.get("ranking_rows"),
+            stats.get("min_dt"),
+            stats.get("latest_dt"),
+            stats.get("macd_nonzero"),
+            stats.get("signal_nonzero"),
+            stats.get("mtf_nonzero"),
+        )
+    return result
 
+
+def _restore_from_path(path: Path, *, per_symbol_rows: int, max_rows: int) -> dict[str, Any]:
     logger.warning(
         "[SUMMARY DB SEED RESTORE] start path=%s per_symbol_rows=%s max_rows=%s",
         path,
         per_symbol_rows,
         max_rows,
     )
-    with sqlite3.connect(str(path), timeout=30) as conn:
-        try:
-            conn.execute("PRAGMA busy_timeout=30000")
-            conn.execute("PRAGMA query_only=ON")
-        except Exception:
-            pass
-
-        for interval, table in _TABLES.items():
-            raw = _read_table(conn, table, per_symbol_rows=per_symbol_rows, max_rows=max_rows)
-            df = _normalize_summary_df(raw, interval=interval)
-            stats = _publish_interval(interval, df)
-            stats["table"] = table
-            stats["raw_rows"] = int(len(raw)) if isinstance(raw, pd.DataFrame) else 0
-            result["intervals"][str(interval)] = stats
-            logger.warning(
-                "[SUMMARY DB SEED RESTORE] interval=%sm table=%s raw_rows=%s rows=%s symbols=%s max_rows_per_symbol=%s push_rows=%s ranking_rows=%s min_dt=%s latest_dt=%s macd_nonzero=%s mtf_nonzero=%s",
-                interval,
-                table,
-                stats.get("raw_rows"),
-                stats.get("rows"),
-                stats.get("symbols"),
-                stats.get("max_rows_per_symbol"),
-                stats.get("push_rows"),
-                stats.get("ranking_rows"),
-                stats.get("min_dt"),
-                stats.get("latest_dt"),
-                stats.get("macd_nonzero"),
-                stats.get("mtf_nonzero"),
-            )
-    return result
+    frames = _read_all_intervals_from_path(path, per_symbol_rows=per_symbol_rows, max_rows=max_rows)
+    return _build_result_from_frames(path, frames, per_symbol_rows=per_symbol_rows, max_rows=max_rows)
 
 
 def _total_restored_rows(result: dict[str, Any]) -> int:
@@ -433,6 +446,39 @@ def _total_restored_rows(result: dict[str, Any]) -> int:
         return int(sum(int(v.get("rows") or 0) for v in intervals.values() if isinstance(v, dict)))
     except Exception:
         return 0
+
+
+def _result_needs_previous_seed(result: dict[str, Any], *, per_symbol_rows: int) -> tuple[bool, str]:
+    """当日DBが非空でも、履歴が薄ければ前日DBを使う。"""
+    if not _env_bool("SUMMARY_DB_SEED_RESTORE_USE_PREV_IF_INSUFFICIENT", True):
+        return False, "disabled"
+    if _total_restored_rows(result) <= 0:
+        return True, "current_empty"
+
+    intervals = result.get("intervals") or {}
+    if not intervals:
+        return True, "no_intervals"
+
+    min_bars = max(1, _env_int("SUMMARY_DB_SEED_RESTORE_MIN_CURRENT_BARS_PER_SYMBOL", min(30, int(per_symbol_rows))))
+    weak = []
+    macd_total = 0
+    signal_total = 0
+    for key in ("1", "3", "5"):
+        st = intervals.get(key) or {}
+        max_rows_per_symbol = int(st.get("max_rows_per_symbol") or 0)
+        rows = int(st.get("rows") or 0)
+        macd_total += max(0, int(st.get("macd_nonzero") or 0))
+        signal_total += max(0, int(st.get("signal_nonzero") or 0))
+        if rows <= 0 or max_rows_per_symbol < min_bars:
+            weak.append(f"{key}m:max_rows_per_symbol={max_rows_per_symbol}<min={min_bars}")
+
+    if weak:
+        return True, ";".join(weak)
+
+    if _env_bool("SUMMARY_DB_SEED_RESTORE_REQUIRE_MACD_SIGNAL", False) and (macd_total <= 0 or signal_total <= 0):
+        return True, f"macd_signal_zero macd={macd_total} signal={signal_total}"
+
+    return False, "current_sufficient"
 
 
 def restore_summary_db_seed(db_path: Any = None, *, force: bool = False) -> dict[str, Any]:
@@ -469,27 +515,38 @@ def restore_summary_db_seed(db_path: Any = None, *, force: bool = False) -> dict
 
     try:
         result = _restore_from_path(path, per_symbol_rows=per_symbol_rows, max_rows=max_rows)
+        result["seed_source"] = "current_summary_db"
 
-        if _total_restored_rows(result) <= 0:
+        needs_prev, reason = _result_needs_previous_seed(result, per_symbol_rows=per_symbol_rows)
+        if needs_prev:
             prev_path = _resolve_previous_seed_db_path(path)
             if prev_path is not None and str(prev_path) != str(path):
                 logger.warning(
-                    "[SUMMARY DB SEED RESTORE] current summary DB empty -> restore previous seed current=%s previous=%s per_symbol_rows=%s",
+                    "[SUMMARY DB SEED RESTORE] current summary DB insufficient -> restore previous seed current=%s previous=%s reason=%s per_symbol_rows=%s",
                     path,
                     prev_path,
+                    reason,
                     per_symbol_rows,
                 )
                 prev_result = _restore_from_path(prev_path, per_symbol_rows=per_symbol_rows, max_rows=max_rows)
-                prev_result["seed_source"] = "previous_summary_db"
-                prev_result["current_empty_path"] = str(path)
+                prev_result["seed_source"] = "previous_summary_db_insufficient_current"
+                prev_result["current_insufficient_path"] = str(path)
+                prev_result["current_insufficient_reason"] = reason
                 result = prev_result
             else:
-                result["seed_source"] = "current_summary_db_empty"
+                result["seed_source"] = "current_summary_db_insufficient_no_previous"
+                result["current_insufficient_reason"] = reason
         else:
-            result["seed_source"] = "current_summary_db"
+            result["current_sufficient_reason"] = reason
 
         _RESTORED = True
-        logger.warning("[SUMMARY DB SEED RESTORE] done path=%s seed_source=%s total_rows=%s", result.get("path"), result.get("seed_source"), _total_restored_rows(result))
+        logger.warning(
+            "[SUMMARY DB SEED RESTORE] done path=%s seed_source=%s total_rows=%s reason=%s",
+            result.get("path"),
+            result.get("seed_source"),
+            _total_restored_rows(result),
+            result.get("current_insufficient_reason") or result.get("current_sufficient_reason"),
+        )
         return result
     except Exception as e:
         logger.exception("[SUMMARY DB SEED RESTORE] failed path=%s", path)
