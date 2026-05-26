@@ -1,21 +1,17 @@
 # ============================================================
 # File   : scheduler_jobs/summary/summary_ai_entry_hook_v20.py
-# Version: PRODUCTION-STABLE-SUMMARY-AI-ENTRY-HOOK-V24-MAX10
+# Version: PRODUCTION-STABLE-SUMMARY-AI-ENTRY-HOOK-V25-NO-DF-BOOLEAN
 # ------------------------------------------------------------
 # Purpose:
 #   - 定時サマリー計算後のAI判定hook
 #   - PUSH由来 / RANKING由来を同じ出口AIパイプラインへ通す
 #   - BUY TOP20 / SELL TOP20 を確実にAIへ渡す
-#   - AI前段で候補が全消えしないよう、pre slope filter は既定OFF
-#   - min_buy_score 既定を 5.0 -> 4.0 に緩和
 #   - AI_OK=0 の原因を reason/confidence/symbol 単位でログ出力する
-#   - 通常SUMMARY/PUSH/Yahoo由来では tonosama filter を既定OFF
-#   - SUMMARY_AI_ENTRY_MAX_ENTRIES 既定を 3 -> 10 に変更
 #
-# Notes:
-#   - 既存 summary_ai_entry_hook.py は長大なので壊さず残す
-#   - runner_core.py / ranking_summary_jobs.py からこの軽量hookを呼ぶ
-#   - 殿様イナゴは別ルートで動かし、通常SUMMARY AI entryには混ぜない
+# V25 修正:
+#   - result_dict.get("candidates") or ... のような DataFrame 真偽値評価を廃止
+#   - pandas DataFrame が返っても ValueError: truth value is ambiguous を出さない
+#   - 昼休み/市場外は runner へ require_market_open=True を渡し、直発注側の安全弁を使う
 # ============================================================
 
 from __future__ import annotations
@@ -79,17 +75,6 @@ def _safe_min_slope() -> float:
 
 
 def _effective_use_tonosama_filter(source: str) -> bool:
-    """
-    通常SUMMARY/PUSH/Yahoo由来のAI entryでは tonosama filter を既定OFFにする。
-
-    理由:
-      - PUSHサマリーAI entryの候補抽出前に殿様フィルタを通すと、
-        候補が絞られすぎる・DB参照で重くなる・AI DIAGまで進みにくい。
-      - 殿様イナゴは別ルートで検知/AI判定へ回す方が安定する。
-
-    明示的に戻したい場合だけ:
-      SUMMARY_AI_ENTRY_USE_TONOSAMA_FILTER=1
-    """
     if _is_ranking_source(source):
         return False
     if _is_tonosama_source(source):
@@ -98,15 +83,7 @@ def _effective_use_tonosama_filter(source: str) -> bool:
 
 
 def _effective_use_pre_slope_filter(source: str) -> bool:
-    """
-    エントリーが発火しない原因の多くがAI前段のslope全落ちだったため、既定OFF。
-
-    必要なら PyCharm 環境変数で明示的にONに戻せる:
-      SUMMARY_AI_ENTRY_USE_PRE_SLOPE_FILTER=1
-    """
-    if _is_ranking_source(source):
-        return False
-    if _is_tonosama_source(source):
+    if _is_ranking_source(source) or _is_tonosama_source(source):
         return False
     return env_bool("SUMMARY_AI_ENTRY_USE_PRE_SLOPE_FILTER", False)
 
@@ -125,7 +102,6 @@ def _resolve_runner() -> Optional[Callable[..., Any]]:
         ("trading.entry.summary_ai.ai_gate_runner", "run_push_summary_ai_entry"),
         ("trading.entry.summary_ai.ai_gate_runner", "run_summary_ai_entry_from_df"),
     ]
-
     for module_name, func_name in candidates:
         try:
             mod = importlib.import_module(module_name)
@@ -133,21 +109,15 @@ def _resolve_runner() -> Optional[Callable[..., Any]]:
             if callable(fn):
                 _RUNNER_CACHE = fn
                 logger.warning(
-                    "[summary.runners] AI hook v23 runner resolved %s.%s file=%s",
+                    "[summary.runners] AI hook v25 runner resolved %s.%s file=%s",
                     module_name,
                     func_name,
                     getattr(mod, "__file__", None),
                 )
                 return fn
         except Exception:
-            logger.debug(
-                "[summary.runners] AI hook v23 runner resolve failed %s.%s",
-                module_name,
-                func_name,
-                exc_info=True,
-            )
-
-    logger.error("[summary.runners] AI hook v23 runner resolve failed all candidates")
+            logger.debug("[summary.runners] AI hook v25 runner resolve failed %s.%s", module_name, func_name, exc_info=True)
+    logger.error("[summary.runners] AI hook v25 runner resolve failed all candidates")
     return None
 
 
@@ -168,7 +138,7 @@ def _result_to_dict(result: Any) -> dict[str, Any]:
     if isinstance(result, pd.DataFrame):
         return {
             "candidates": result,
-            "ai_results": result,
+            "ai_results": [],
             "ai_ok": [],
             "approved_rows": [],
             "execution": {"executed": False, "skip_reason": "runner_returned_dataframe"},
@@ -177,7 +147,7 @@ def _result_to_dict(result: Any) -> dict[str, Any]:
         return {
             "candidates": result,
             "ai_results": result,
-            "ai_ok": [x for x in result if isinstance(x, dict) and x.get("allow")],
+            "ai_ok": [x for x in result if isinstance(x, dict) and bool(x.get("allow"))],
             "approved_rows": [],
             "execution": {"executed": False, "skip_reason": "runner_returned_list"},
         }
@@ -188,6 +158,18 @@ def _result_to_dict(result: Any) -> dict[str, Any]:
         "approved_rows": [],
         "execution": {"executed": False, "skip_reason": f"runner_returned_{type(result).__name__}"},
     }
+
+
+def _payload(result_dict: dict[str, Any], *keys: str, default: Any = None) -> Any:
+    """DataFrame/list/dict を bool 評価せずに最初に存在するpayloadを返す。"""
+    for key in keys:
+        if key not in result_dict:
+            continue
+        v = result_dict.get(key)
+        if v is None:
+            continue
+        return v
+    return [] if default is None else default
 
 
 def _len_any(v: Any) -> int:
@@ -215,22 +197,11 @@ def _records_any(v: Any, *, limit: int = 200) -> list[dict[str, Any]]:
 
 
 def _compact_reason(row: dict[str, Any]) -> str:
-    for key in (
-        "reason",
-        "ng_reason",
-        "skip_reason",
-        "reject_reason",
-        "error",
-        "message",
-        "ai_reason",
-        "decision_reason",
-    ):
+    for key in ("reason", "ng_reason", "skip_reason", "reject_reason", "error", "message", "ai_reason", "decision_reason"):
         v = row.get(key)
         if v is not None and str(v).strip() != "":
-            s = str(v).strip()
-            return s[:160]
-    allow = row.get("allow")
-    if allow is False:
+            return str(v).strip()[:160]
+    if row.get("allow") is False:
         return "allow_false_no_reason"
     return "unknown"
 
@@ -248,183 +219,87 @@ def _symbol_of(row: dict[str, Any]) -> str:
     return str(row.get("symbol") or row.get("code") or row.get("stock_code") or "").strip()
 
 
-def _diagnose_ai_entry_result(
-    *,
-    interval: int,
-    source: str,
-    candidates: Any,
-    ai_results: Any,
-    ai_ok: Any,
-    sell_ai_ok: Any,
-    execution: Any,
-    min_conf: float,
-) -> None:
-    """
-    AI_OK=0 / executed=False の理由をログで分解する。
-    runner本体に手を入れず、返却payloadから原因を読む安全診断。
-    """
+def _diagnose_ai_entry_result(*, interval: int, source: str, candidates: Any, ai_results: Any, ai_ok: Any, sell_ai_ok: Any, execution: Any, min_conf: float) -> None:
     try:
         cand_rows = _records_any(candidates, limit=60)
         result_rows = _records_any(ai_results, limit=120)
         exec_dict = execution if isinstance(execution, dict) else {}
-
         reason_counter: Counter[str] = Counter()
-        conf_low = 0
-        allow_true = 0
-        allow_false = 0
-        unknown_allow = 0
-
+        conf_low = allow_true = allow_false = unknown_allow = 0
         ng_head: list[dict[str, Any]] = []
         ok_head: list[dict[str, Any]] = []
 
         for row in result_rows:
-            allow = bool(row.get("allow"))
-            conf = _safe_num(
-                row.get("confidence")
-                or row.get("conf")
-                or row.get("ai_confidence")
-                or row.get("score_confidence"),
-                default=0.0,
-            )
-
+            allow_raw = row.get("allow")
+            allow = bool(allow_raw)
+            conf = _safe_num(row.get("confidence") or row.get("conf") or row.get("ai_confidence") or row.get("score_confidence"), 0.0)
             if allow:
                 allow_true += 1
                 if len(ok_head) < 20:
-                    ok_head.append(
-                        {
-                            "symbol": _symbol_of(row),
-                            "conf": conf,
-                            "reason": _compact_reason(row),
-                        }
-                    )
+                    ok_head.append({"symbol": _symbol_of(row), "conf": conf, "reason": _compact_reason(row)})
                 continue
-
-            if row.get("allow") is False:
+            if allow_raw is False:
                 allow_false += 1
             else:
                 unknown_allow += 1
-
             reason = _compact_reason(row)
             reason_counter[reason] += 1
             if conf < float(min_conf):
                 conf_low += 1
-
             if len(ng_head) < 30:
-                ng_head.append(
-                    {
-                        "symbol": _symbol_of(row),
-                        "conf": conf,
-                        "reason": reason,
-                        "side": row.get("side") or row.get("signal") or row.get("entry_side"),
-                        "buy_score": row.get("buy_score") or row.get("score_buy") or row.get("score"),
-                        "sell_score": row.get("sell_score") or row.get("score_sell"),
-                    }
-                )
-
-        cand_head: list[dict[str, Any]] = []
-        for row in cand_rows[:30]:
-            cand_head.append(
-                {
+                ng_head.append({
                     "symbol": _symbol_of(row),
+                    "conf": conf,
+                    "reason": reason,
                     "side": row.get("side") or row.get("signal") or row.get("entry_side"),
-                    "score": row.get("score") or row.get("final_score") or row.get("display_score"),
-                    "buy_score": row.get("buy_score") or row.get("score_buy"),
+                    "buy_score": row.get("buy_score") or row.get("score_buy") or row.get("score"),
                     "sell_score": row.get("sell_score") or row.get("score_sell"),
-                    "close": row.get("close") or row.get("close_price") or row.get("price"),
-                    "slope": row.get("slope_atr_scaled") or row.get("slope") or row.get("score_slope"),
-                    "rsi": row.get("rsi"),
-                    "macd": row.get("macd"),
-                    "mtf": row.get("mtf") or row.get("score_mtf"),
-                }
-            )
+                })
+
+        cand_head = []
+        for row in cand_rows[:30]:
+            cand_head.append({
+                "symbol": _symbol_of(row),
+                "side": row.get("side") or row.get("signal") or row.get("entry_side"),
+                "score": row.get("score") or row.get("final_score") or row.get("display_score"),
+                "buy_score": row.get("buy_score") or row.get("score_buy"),
+                "sell_score": row.get("sell_score") or row.get("score_sell"),
+                "close": row.get("close") or row.get("close_price") or row.get("price"),
+                "slope": row.get("slope_atr_scaled") or row.get("slope") or row.get("score_slope"),
+                "rsi": row.get("rsi"),
+                "macd": row.get("macd"),
+                "mtf": row.get("mtf") or row.get("score_mtf"),
+            })
 
         logger.warning(
             "[SUMMARY AI DIAG] interval=%s source=%s candidates=%s ai_results=%s allow_true=%s allow_false=%s allow_unknown=%s ai_ok=%s sell_ai_ok=%s executed=%s skip=%s min_conf=%.2f conf_low=%s",
-            interval,
-            source,
-            _len_any(candidates),
-            _len_any(ai_results),
-            allow_true,
-            allow_false,
-            unknown_allow,
-            _len_any(ai_ok),
-            _len_any(sell_ai_ok),
-            bool(exec_dict.get("executed")) if isinstance(exec_dict, dict) else False,
-            exec_dict.get("skip_reason") if isinstance(exec_dict, dict) else None,
-            float(min_conf),
-            conf_low,
+            interval, source, _len_any(candidates), _len_any(ai_results), allow_true, allow_false, unknown_allow,
+            _len_any(ai_ok), _len_any(sell_ai_ok), bool(exec_dict.get("executed")), exec_dict.get("skip_reason"), float(min_conf), conf_low,
         )
-        logger.warning(
-            "[SUMMARY AI DIAG] interval=%s source=%s ng_reason_counts=%s",
-            interval,
-            source,
-            dict(reason_counter.most_common(20)),
-        )
-        logger.warning(
-            "[SUMMARY AI DIAG] interval=%s source=%s ng_head=%s",
-            interval,
-            source,
-            ng_head,
-        )
+        logger.warning("[SUMMARY AI DIAG] interval=%s source=%s ng_reason_counts=%s", interval, source, dict(reason_counter.most_common(20)))
+        logger.warning("[SUMMARY AI DIAG] interval=%s source=%s ng_head=%s", interval, source, ng_head)
         if ok_head:
-            logger.warning(
-                "[SUMMARY AI DIAG] interval=%s source=%s ok_head=%s",
-                interval,
-                source,
-                ok_head,
-            )
+            logger.warning("[SUMMARY AI DIAG] interval=%s source=%s ok_head=%s", interval, source, ok_head)
         if cand_head:
-            logger.warning(
-                "[SUMMARY AI DIAG] interval=%s source=%s candidate_head=%s",
-                interval,
-                source,
-                cand_head,
-            )
+            logger.warning("[SUMMARY AI DIAG] interval=%s source=%s candidate_head=%s", interval, source, cand_head)
     except Exception:
-        logger.debug(
-            "[SUMMARY AI DIAG] failed interval=%s source=%s",
-            interval,
-            source,
-            exc_info=True,
-        )
+        logger.debug("[SUMMARY AI DIAG] failed interval=%s source=%s", interval, source, exc_info=True)
 
 
-def run_summary_ai_entry_safe(
-    interval: int,
-    now: dt.datetime,
-    df: Optional[pd.DataFrame] = None,
-    *,
-    source: str = "SUMMARY",
-) -> bool:
+def run_summary_ai_entry_safe(interval: int, now: dt.datetime, df: Optional[pd.DataFrame] = None, *, source: str = "SUMMARY") -> bool:
     interval = int(interval)
     now = (now or dt.datetime.now()).replace(microsecond=0)
     source_s = _normalize_source(source)
-
     try:
         if not env_bool("SUMMARY_AI_ENTRY_ENABLED", True):
-            logger.info(
-                "[summary.runners] summary AI entry v23 skipped interval=%s source=%s reason=disabled_env",
-                interval,
-                source_s,
-            )
+            logger.info("[summary.runners] summary AI entry v25 skipped interval=%s source=%s reason=disabled_env", interval, source_s)
             return False
-
         if df is None or not isinstance(df, pd.DataFrame) or not is_nonempty_df(df):
-            logger.warning(
-                "[summary.runners] summary AI entry v23 skipped interval=%s source=%s reason=empty_or_invalid_df type=%s",
-                interval,
-                source_s,
-                type(df).__name__,
-            )
+            logger.warning("[summary.runners] summary AI entry v25 skipped interval=%s source=%s reason=empty_or_invalid_df type=%s", interval, source_s, type(df).__name__)
             return False
-
         fn = _resolve_runner()
         if not callable(fn):
-            logger.warning(
-                "[summary.runners] summary AI entry v23 skipped interval=%s source=%s reason=runner_unavailable",
-                interval,
-                source_s,
-            )
+            logger.warning("[summary.runners] summary AI entry v25 skipped interval=%s source=%s reason=runner_unavailable", interval, source_s)
             return False
 
         top_n = _safe_top_n()
@@ -469,35 +344,22 @@ def run_summary_ai_entry_safe(
             "use_entry_dedupe_guard": True,
             "enable_sell_ai": True,
         }
-
         call_kwargs = _filter_kwargs(fn, kwargs)
-
         logger.warning(
-            "[summary.runners] summary AI entry v23 start interval=%s source=%s rows=%s runner=%s top_n=%s max_entries=%s dry_run=%s require_market_open=%s min_conf=%.2f min_buy=%.2f max_sell=%.2f tonosama=%s pre_slope=%s min_slope=%.4f",
-            interval,
-            source_s,
-            len(df),
-            getattr(fn, "__name__", repr(fn)),
-            top_n,
-            max_entries,
-            dry_run,
-            require_market_open,
-            min_conf,
-            min_buy_score,
-            max_sell_score,
-            use_tonosama,
-            use_pre_slope,
-            _safe_min_slope(),
+            "[summary.runners] summary AI entry v25 start interval=%s source=%s rows=%s runner=%s top_n=%s max_entries=%s dry_run=%s require_market_open=%s min_conf=%.2f min_buy=%.2f max_sell=%.2f tonosama=%s pre_slope=%s min_slope=%.4f",
+            interval, source_s, len(df), getattr(fn, "__name__", repr(fn)), top_n, max_entries, dry_run,
+            require_market_open, min_conf, min_buy_score, max_sell_score, use_tonosama, use_pre_slope, _safe_min_slope(),
         )
 
         result = fn(**call_kwargs)
         result_dict = _result_to_dict(result)
-
-        candidates = result_dict.get("candidates") or result_dict.get("buy_candidates") or []
-        ai_results = result_dict.get("ai_results") or []
-        ai_ok = result_dict.get("ai_ok") or result_dict.get("buy_ai_ok") or []
-        sell_ai_ok = result_dict.get("sell_ai_ok") or []
-        execution = result_dict.get("execution") or {}
+        candidates = _payload(result_dict, "candidates", "buy_candidates")
+        ai_results = _payload(result_dict, "ai_results")
+        ai_ok = _payload(result_dict, "ai_ok", "buy_ai_ok")
+        sell_ai_ok = _payload(result_dict, "sell_ai_ok")
+        execution = _payload(result_dict, "execution", default={})
+        if not isinstance(execution, dict):
+            execution = {}
 
         _diagnose_ai_entry_result(
             interval=interval,
@@ -509,26 +371,14 @@ def run_summary_ai_entry_safe(
             execution=execution,
             min_conf=min_conf,
         )
-
         logger.warning(
-            "[summary.runners] summary AI entry v23 done interval=%s source=%s candidates=%s ai_results=%s ai_ok=%s sell_ai_ok=%s executed=%s skip=%s",
-            interval,
-            source_s,
-            _len_any(candidates),
-            _len_any(ai_results),
-            _len_any(ai_ok),
-            _len_any(sell_ai_ok),
-            bool(execution.get("executed")) if isinstance(execution, dict) else False,
-            execution.get("skip_reason") if isinstance(execution, dict) else None,
+            "[summary.runners] summary AI entry v25 done interval=%s source=%s candidates=%s ai_results=%s ai_ok=%s sell_ai_ok=%s executed=%s skip=%s",
+            interval, source_s, _len_any(candidates), _len_any(ai_results), _len_any(ai_ok), _len_any(sell_ai_ok),
+            bool(execution.get("executed")), execution.get("skip_reason"),
         )
         return True
-
     except Exception:
-        logger.exception(
-            "[summary.runners] summary AI entry v23 failed interval=%s source=%s",
-            interval,
-            source_s,
-        )
+        logger.exception("[summary.runners] summary AI entry v25 failed interval=%s source=%s", interval, source_s)
         return False
 
 
