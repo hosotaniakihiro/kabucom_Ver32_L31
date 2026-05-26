@@ -1,9 +1,13 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver05-AUTO-INSTALL-SUMMARY-CONTROLLER-DUPCOL-PATCH
+# Version: Ver06-TONOSAMA-SURGE-FAILOPEN-DEFAULTS
 # ------------------------------------------------------------
 # Python 起動時に自動 import されるフック。
 # main.py を直接壊さず、監査ログ/バックテスト用DB保存を自動有効化する。
+#
+# Ver06:
+#   - TONOSAMA 出来高急増履歴不足時の fail-open 既定値を Python 起動直後に明示
+#   - allow_without_history=False に倒れて base feature empty で全落ちする問題を防止
 #
 # Ver05:
 #   - summary_controller.concat_frames の重複カラム対策 patch を自動install
@@ -125,6 +129,30 @@ def _install_boot_exception_hook() -> None:
         pass
 
 
+def _install_tonosama_surge_defaults() -> None:
+    """TONOSAMA ENTRY が履歴不足だけで base feature empty にならないよう既定値を明示する。"""
+    try:
+        os.environ.setdefault('TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING', '1')
+        os.environ.setdefault('TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY', '1')
+        os.environ.setdefault('TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE', '3.0')
+        _write_boot_evidence('TONOSAMA_SURGE_DEFAULTS_SET', {
+            'failopen': os.environ.get('TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING'),
+            'allow_without_history': os.environ.get('TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY'),
+            'failopen_value': os.environ.get('TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE'),
+        })
+        try:
+            logging.getLogger(__name__).warning(
+                '[SITECUSTOMIZE] tonosama surge defaults failopen=%s allow_without_history=%s value=%s',
+                os.environ.get('TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING'),
+                os.environ.get('TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY'),
+                os.environ.get('TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE'),
+            )
+        except Exception:
+            pass
+    except Exception:
+        _write_boot_evidence('TONOSAMA_SURGE_DEFAULTS_EXCEPTION', traceback.format_exc())
+
+
 def _install_audit_logging_safely() -> None:
     try:
         if os.environ.get('DISABLE_AUDIT_LOGGING', '').strip() == '1':
@@ -222,6 +250,7 @@ def _install_summary_mtf_catchup_safely() -> None:
 
 _write_boot_evidence('PYTHON_START')
 _install_boot_exception_hook()
+_install_tonosama_surge_defaults()
 _install_audit_logging_safely()
 _install_summary_controller_dupcol_patch_safely()
 _install_summary_mtf_catchup_safely()
