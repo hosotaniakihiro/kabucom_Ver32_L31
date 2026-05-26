@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry_exit/tasks.py
-# Version: Ver1.4-TONOSAMA-FAST-LOOP-SKIP-ACTIVE-REFRESH
+# Version: Ver1.5-TONOSAMA-LONGER-TIMEOUT-DISPATCH-PENDING
 # ------------------------------------------------------------
 # 【目的】
 #   core.entry_exit_tasks shim から解決される実体モジュール。
@@ -17,14 +17,16 @@
 #       毎分 :12 / tags: entry, ranking_entry
 #       その直後に entry_controller.run_entry_pipeline(pipeline_source="RANKING", interval=1)
 #
+# Ver1.5 Fix:
+#   - 最新ログで TONOSAMA の候補生成が 38秒前後かかり、旧timeout=12秒で
+#     [TONOSAMA ENTRY SCHEDULE] timeout skipped_result になっていた。
+#   - その結果、runner側で pending added しても、schedule側は result=0 扱いになり
+#     entry_controller dispatch へ進まないケースがあった。
+#   - 既定 timeout を 45秒へ延長。
+#   - ret が 0/None でも pending が存在する場合は controller dispatch する。
+#
 # Ver1.4 Fix:
-#   - 最新ログで TONOSAMA の build 自体は1.9〜3.8秒なのに、loop全体が
-#     17〜24秒かかり previous_still_running が多発。
-#   - 原因は tonosama_loop 冒頭の update_active_symbols() が重く、
-#     ranking_save / ranking_entry と競合するため。
-#   - TONOSAMA_ENTRY_FAST_SKIP_ACTIVE_UPDATE=1 既定で runner.update_active_symbols
-#     を None に差し替え、15秒監視を軽量化する。
-#   - 必要なら環境変数 TONOSAMA_UPDATE_ACTIVE_SYMBOLS_IN_LOOP=1 で旧動作に戻せる。
+#   - TONOSAMA内の update_active_symbols() を既定スキップし、15秒監視を軽量化。
 # ============================================================
 
 from __future__ import annotations
@@ -48,8 +50,8 @@ _RANKING_ENTRY_RUNNING = False
 _RANKING_ENTRY_STARTED_AT: Optional[dt.datetime] = None
 _RANKING_ENTRY_LOCK = threading.RLock()
 
-TONOSAMA_ENTRY_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_TIMEOUT_SEC", "12"))
-TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC", "15"))
+TONOSAMA_ENTRY_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_TIMEOUT_SEC", "45"))
+TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC", "20"))
 RANKING_ENTRY_BUILD_TIMEOUT_SEC = float(os.getenv("RANKING_ENTRY_BUILD_TIMEOUT_SEC", "20"))
 RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC = float(os.getenv("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", "20"))
 
@@ -62,6 +64,64 @@ def _env_bool(name: str, default: bool) -> bool:
         return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
     except Exception:
         return bool(default)
+
+
+def _safe_len(obj: Any) -> int:
+    try:
+        return len(obj) if obj is not None else 0
+    except Exception:
+        return 0
+
+
+def _pending_count_for_source(source: str) -> int:
+    """pending_manager に残っている指定sourceの件数をできるだけ安全に数える。"""
+    try:
+        import trading.entry.pending_manager as pm
+        source_u = str(source or "").upper()
+        names = [
+            "pending_entries",
+            "PENDING_ENTRIES",
+            "pending_by_symbol",
+            "PENDING_BY_SYMBOL",
+            "_pending_entries",
+            "_PENDING_ENTRIES",
+            "_pending_by_symbol",
+            "_PENDING_BY_SYMBOL",
+        ]
+        total = 0
+        for name in names:
+            obj = getattr(pm, name, None)
+            if obj is None:
+                continue
+            if isinstance(obj, dict):
+                vals = []
+                for v in obj.values():
+                    if isinstance(v, (list, tuple, set)):
+                        vals.extend(list(v))
+                    else:
+                        vals.append(v)
+                for item in vals:
+                    try:
+                        s = str(getattr(item, "source", None) or getattr(item, "pipeline_source", None) or "").upper()
+                        if not s and isinstance(item, dict):
+                            s = str(item.get("source") or item.get("pipeline_source") or "").upper()
+                        if source_u in s:
+                            total += 1
+                    except Exception:
+                        pass
+            elif isinstance(obj, (list, tuple, set)):
+                for item in obj:
+                    try:
+                        s = str(getattr(item, "source", None) or getattr(item, "pipeline_source", None) or "").upper()
+                        if not s and isinstance(item, dict):
+                            s = str(item.get("source") or item.get("pipeline_source") or "").upper()
+                        if source_u in s:
+                            total += 1
+                    except Exception:
+                        pass
+        return int(total)
+    except Exception:
+        return 0
 
 
 def _clear_tag(tag: str) -> None:
@@ -101,13 +161,8 @@ def _resolve_callable(module_name: str, attr_name: str) -> Optional[Callable[...
 def _patch_tonosama_runner_fast_loop() -> None:
     """
     TONOSAMA 15秒ジョブの中で active_symbols 更新を毎回走らせない。
-
-    active_symbols は ranking_save / ranking_summary 側で更新されるため、
-    TONOSAMA内で毎回 update_active_symbols() すると ranking DB 読み込みと競合し、
-    15秒ジョブが20秒以上かかる。発注候補生成は既存の summary/ranking cache を使う。
     """
     try:
-        # 旧動作へ戻したい場合だけ明示的にON。
         if _env_bool("TONOSAMA_UPDATE_ACTIVE_SYMBOLS_IN_LOOP", False):
             logger.info("[TONOSAMA FAST LOOP PATCH] keep update_active_symbols because TONOSAMA_UPDATE_ACTIVE_SYMBOLS_IN_LOOP=1")
             return
@@ -120,7 +175,7 @@ def _patch_tonosama_runner_fast_loop() -> None:
         cur = getattr(mod, "update_active_symbols", None)
         if cur is not None:
             setattr(mod, "update_active_symbols", None)
-            logger.warning("[TONOSAMA FAST LOOP PATCH] runner.update_active_symbols disabled for fast 15s loop")
+            logger.warning("[TONOSAMA FAST LOOP PATCH] runner.update_active_symbols disabled for fast loop")
     except Exception:
         logger.warning("[TONOSAMA FAST LOOP PATCH] failed", exc_info=True)
 
@@ -133,12 +188,6 @@ def _run_callable_with_timeout(
     args: tuple[Any, ...] = (),
     kwargs: Optional[dict[str, Any]] = None,
 ) -> tuple[bool, Any]:
-    """
-    schedule_loop の previous_still_running を防ぐためのタイムアウト実行。
-
-    Pythonでは安全にスレッドを強制終了できないため、timeout後はdaemon threadを残して
-    呼び出し元だけ返す。DB/API待ちで固まった場合でも次回ジョブを止め続けないための防衛。
-    """
     result: dict[str, Any] = {"done": False, "ret": None, "err": None}
     kwargs = kwargs or {}
 
@@ -219,16 +268,31 @@ def _run_tonosama_entry_safe() -> int:
             name="TONOSAMA ENTRY SCHEDULE",
         )
         if not completed:
+            pending_count = _pending_count_for_source("TONOSAMA")
             logger.warning(
-                "[TONOSAMA ENTRY SCHEDULE] timeout skipped_result elapsed=%.3fs",
+                "[TONOSAMA ENTRY SCHEDULE] timeout skipped_result elapsed=%.3fs pending_count=%s",
                 time.perf_counter() - started,
+                pending_count,
             )
+            if pending_count > 0 and _env_bool("TONOSAMA_DISPATCH_CONTROLLER_ON_TIMEOUT_PENDING", True):
+                _dispatch_entry_controller(
+                    pipeline_source="TONOSAMA",
+                    interval=None,
+                    timeout_sec=TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC,
+                    reason="TONOSAMA ENTRY SCHEDULE TIMEOUT-PENDING",
+                )
             return 0
 
         registered = int(ret or 0)
-        logger.info("[TONOSAMA ENTRY SCHEDULE] pending build done registered=%s elapsed=%.3fs", registered, time.perf_counter() - started)
+        pending_count = _pending_count_for_source("TONOSAMA")
+        logger.info(
+            "[TONOSAMA ENTRY SCHEDULE] pending build done registered=%s pending_count=%s elapsed=%.3fs",
+            registered,
+            pending_count,
+            time.perf_counter() - started,
+        )
 
-        if registered > 0:
+        if registered > 0 or pending_count > 0:
             _dispatch_entry_controller(
                 pipeline_source="TONOSAMA",
                 interval=None,
@@ -238,7 +302,7 @@ def _run_tonosama_entry_safe() -> int:
         else:
             logger.info("[TONOSAMA ENTRY SCHEDULE] no pending created -> controller dispatch skipped")
 
-        logger.info("[TONOSAMA ENTRY SCHEDULE] done result=%s elapsed=%.3fs", registered, time.perf_counter() - started)
+        logger.info("[TONOSAMA ENTRY SCHEDULE] done result=%s pending_count=%s elapsed=%.3fs", registered, pending_count, time.perf_counter() - started)
         return registered
     except Exception:
         logger.exception("[TONOSAMA ENTRY SCHEDULE] failed")
@@ -324,7 +388,6 @@ def register_entry_exit_tasks(*args: Any, **kwargs: Any) -> bool:
         _clear_tag(_TAG_TONOSAMA_ENTRY)
         _clear_tag(_TAG_RANKING_ENTRY)
 
-        # 殿様イナゴ: config の秒数に追従。失敗時は15秒。
         interval_sec = 15
         try:
             from trading.entry.tonosama.config import SCHEDULER_INTERVAL_SEC
@@ -336,7 +399,6 @@ def register_entry_exit_tasks(*args: Any, **kwargs: Any) -> bool:
         job_t.tag(_TAG_ENTRY)
         job_t.tag(_TAG_TONOSAMA_ENTRY)
 
-        # ランキング由来エントリー: ranking save(:02), ranking summary(:10) の後ろで :12 に実行
         job_r = schedule.every().minute.at(":12").do(_run_ranking_entry_safe)
         job_r.tag(_TAG_ENTRY)
         job_r.tag(_TAG_RANKING_ENTRY)
