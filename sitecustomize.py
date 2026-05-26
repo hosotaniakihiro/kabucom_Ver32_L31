@@ -1,9 +1,12 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver07-SUMMARY-AI-LIQ-RESCUE-AUTO-INSTALL
+# Version: Ver08-SUMMARY-AI-DF-TRUTH-GUARD-AUTO-INSTALL
 # ------------------------------------------------------------
 # Python 起動時に自動 import されるフック。
 # main.py を直接壊さず、監査ログ/バックテスト用DB保存を自動有効化する。
+#
+# Ver08:
+#   - summary_ai_entry_hook_v20 の DataFrame truth value error 対策patchを自動install
 #
 # Ver07:
 #   - SUMMARY AI の直前流動性チェックで全AI_OK候補が落ちる場合の救済patchを自動install
@@ -180,6 +183,30 @@ def _install_summary_ai_liq_rescue_safely() -> None:
             pass
 
 
+def _install_summary_ai_df_truth_guard_safely() -> None:
+    """summary_ai_entry_hook_v20 の DataFrame bool 評価エラー対策patch。"""
+    try:
+        if os.environ.get('DISABLE_SUMMARY_AI_DF_TRUTH_PATCH', '').strip() == '1':
+            _write_boot_evidence('SUMMARY_AI_DF_TRUTH_PATCH_DISABLED_BY_ENV')
+            return
+
+        _ensure_project_root()
+        _write_boot_evidence('SUMMARY_AI_DF_TRUTH_PATCH_INSTALL_START')
+
+        from core.startup.summary_ai_entry_hook_dataframe_truth_patch import install
+
+        ok = install()
+        _write_boot_evidence('SUMMARY_AI_DF_TRUTH_PATCH_INSTALL_DONE', {'ok': ok})
+        logging.getLogger(__name__).warning('[SITECUSTOMIZE] summary ai df truth guard auto install ok=%s', ok)
+    except Exception:
+        text = traceback.format_exc()
+        _write_boot_evidence('SUMMARY_AI_DF_TRUTH_PATCH_EXCEPTION', text)
+        try:
+            logging.getLogger(__name__).exception('[SITECUSTOMIZE] summary ai df truth guard auto install failed')
+        except Exception:
+            pass
+
+
 def _install_audit_logging_safely() -> None:
     try:
         if os.environ.get('DISABLE_AUDIT_LOGGING', '').strip() == '1':
@@ -277,6 +304,7 @@ _write_boot_evidence('PYTHON_START')
 _install_boot_exception_hook()
 _install_tonosama_surge_defaults()
 _install_summary_ai_liq_rescue_safely()
+_install_summary_ai_df_truth_guard_safely()
 _install_audit_logging_safely()
 _install_summary_controller_dupcol_patch_safely()
 _install_summary_mtf_catchup_safely()
