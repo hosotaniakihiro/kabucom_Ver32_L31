@@ -1,22 +1,24 @@
 # ============================================================
 # File   : core/startup/ranking_entry_volume_unit_patch.py
-# Version: V4.3-RANKING-ENTRY-UNIT-CACHE-AND-QUIET-LOG
+# Version: V4.4-RANKING-ENTRY-UNIT-SILENT-BY-DEFAULT
 # ------------------------------------------------------------
 # 目的:
 #   ランキング由来エントリーの volume / turnover 単位を補正する。
 #   ただし、同一銘柄が type × market で多数出るため、ログ大量出力と
 #   同一値の繰り返し正規化で entry loop が重くならないようにする。
 #
+# V4.4:
+#   - 通常ログは完全に既定OFF
+#   - RANKING_ENTRY_UNIT_FIX_LOG_FIRST_N 既定 30 -> 0
+#   - zero-volume / finalized / turnover clamped の銘柄別ログも既定抑制
+#   - 詳細確認時のみ RANKING_ENTRY_UNIT_FIX_LOG_EACH=1 または
+#     RANKING_ENTRY_UNIT_FIX_LOG_FIRST_N=N で出す
+#
 # V4.3:
 #   - 同一 (symbol, price, raw_volume, raw_turnover) の補正結果をキャッシュ
 #   - 通常の finalized ログは既定で抑制
 #   - zero-volume turnover ignored も同一キーは一度だけ表示
 #   - 詳細ログが必要な場合だけ RANKING_ENTRY_UNIT_FIX_LOG_EACH=1
-#
-# V4.2:
-#   - volume=0 の行では turnover を 0 に落とす
-#   - 出来高ゼロなのに売買代金だけで流動性条件を通過する事故を防止
-#   - ranking_zero_volume_turnover_ignored を明示保存
 # ============================================================
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ _FALSE = {"0", "false", "no", "n", "off", "disable", "disabled"}
 _CACHE: dict[tuple[str, float, float, float], dict[str, Any]] = {}
 _LOGGED_KEYS: set[tuple[str, float, float, float, str]] = set()
 _CACHE_MAX = 20000
-_LOG_FIRST_N = 30
+_LOG_FIRST_N = 0
 _LOG_COUNT = 0
 
 
@@ -106,14 +108,15 @@ def _should_log_once(base_key: tuple[str, float, float, float], kind: str) -> bo
     global _LOG_COUNT
     if _env_bool("RANKING_ENTRY_UNIT_FIX_LOG_EACH", False):
         return True
+    limit = int(_env_float("RANKING_ENTRY_UNIT_FIX_LOG_FIRST_N", _LOG_FIRST_N))
+    if limit <= 0:
+        return False
     k = (base_key[0], base_key[1], base_key[2], base_key[3], kind)
     if k in _LOGGED_KEYS:
         return False
     _LOGGED_KEYS.add(k)
     _LOG_COUNT += 1
-    if _LOG_COUNT <= int(_env_float("RANKING_ENTRY_UNIT_FIX_LOG_FIRST_N", _LOG_FIRST_N)):
-        return True
-    return False
+    return _LOG_COUNT <= limit
 
 
 def _apply_cached(row: dict[str, Any], cached: dict[str, Any]) -> dict[str, Any]:
@@ -180,10 +183,11 @@ def _normalize_units(row: dict[str, Any], *, min_volume: float, min_turnover: fl
             elif turnover < min_turnover <= implied_turnover:
                 turnover = implied_turnover
             elif turnover > implied_turnover * implied_max_ratio:
-                logger.warning(
-                    "[RANKING ENTRY UNIT FIX] turnover clamped symbol=%s price=%s volume=%s turnover=%s implied=%s",
-                    symbol, price, volume, turnover, implied_turnover,
-                )
+                if _should_log_once(base_key, "turnover_clamped"):
+                    logger.warning(
+                        "[RANKING ENTRY UNIT FIX] turnover clamped symbol=%s price=%s volume=%s turnover=%s implied=%s",
+                        symbol, price, volume, turnover, implied_turnover,
+                    )
                 turnover = implied_turnover
         else:
             if raw_turnover > 0:
@@ -219,7 +223,7 @@ def _normalize_units(row: dict[str, Any], *, min_volume: float, min_turnover: fl
         changed = volume_unit_fixed or turnover_unit_fixed or raw_turnover != turnover or raw_volume != volume
         if changed and _should_log_once(base_key, "finalized"):
             logger.info(
-                "[RANKING ENTRY UNIT FIX] finalized V4.3 symbol=%s price=%s volume %.3f->%.3f turnover %.3f->%.3f vol_mul=%.0f turn_mul=%.0f implied=%.3f can_fix_turnover=%s zero_volume_ignored=%s",
+                "[RANKING ENTRY UNIT FIX] finalized V4.4 symbol=%s price=%s volume %.3f->%.3f turnover %.3f->%.3f vol_mul=%.0f turn_mul=%.0f implied=%.3f can_fix_turnover=%s zero_volume_ignored=%s",
                 symbol, price, raw_volume, volume, raw_turnover, turnover,
                 volume_unit_multiplier, turnover_unit_multiplier, implied_turnover,
                 can_fix_turnover, zero_volume_turnover_ignored,
@@ -260,7 +264,7 @@ def install() -> bool:
             return False
 
         base_norm = _unwrap(old_norm)
-        if getattr(old_norm, "_ranking_entry_unit_fix_patch_v43", False):
+        if getattr(old_norm, "_ranking_entry_unit_fix_patch_v44", False):
             _PATCHED = True
             return True
 
@@ -270,15 +274,16 @@ def install() -> bool:
                 return _normalize_units(out, min_volume=min_volume, min_turnover=min_turnover)
             return out
 
-        _normalize_ranking_row_for_entry_patched._ranking_entry_unit_fix_patch_v43 = True  # type: ignore[attr-defined]
+        _normalize_ranking_row_for_entry_patched._ranking_entry_unit_fix_patch_v44 = True  # type: ignore[attr-defined]
         _normalize_ranking_row_for_entry_patched._original = base_norm  # type: ignore[attr-defined]
         target._normalize_ranking_row_for_entry = _normalize_ranking_row_for_entry_patched
 
         _PATCHED = True
         logger.warning(
-            "[RANKING ENTRY UNIT FIX] installed V4.3 price_min %.1f->%.1f min_volume=%.1f min_turnover=%.1f cache=True quiet_log=True log_each=%s",
+            "[RANKING ENTRY UNIT FIX] installed V4.4 price_min %.1f->%.1f min_volume=%.1f min_turnover=%.1f cache=True silent_default=True log_each=%s log_first_n=%s",
             old_min, new_min, min_volume, min_turnover,
             _env_bool("RANKING_ENTRY_UNIT_FIX_LOG_EACH", False),
+            int(_env_float("RANKING_ENTRY_UNIT_FIX_LOG_FIRST_N", _LOG_FIRST_N)),
         )
         return True
     except Exception:
