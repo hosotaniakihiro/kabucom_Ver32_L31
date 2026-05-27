@@ -1,16 +1,20 @@
 # ============================================================
 # File   : core/startup/low_movement_entry_guard_patch.py
-# Version: Ver11-ATR-WRAP-OWNER-RECURSION-FIX
+# Version: Ver12-TONOSAMA-INTRABAR-RANGE-FALLBACK
 # ------------------------------------------------------------
 # あまり動かない銘柄へのエントリーを発注直前で止める。
 # さらに、ランキング方向に逆らうエントリーも禁止する。
 #
+# Ver12:
+#   - TONOSAMA pending は high/low が entry_row に渡らないことがある
+#   - その場合でも _intrabar_range_pct / intrabar_range_pct / range_pct があれば
+#     no_high_low で即NGにせず、代替range_pctとして評価する
+#   - 11:22ログの [LOW MOVE GUARD] NG reason=no_high_low を防止
+#   - high/low がある通常ケースは従来通り
+#
 # Ver11:
 #   - RecursionError 対策
 #   - atr_1m_filter / range_5m_filter の実パッチ所有者をこのファイルに統一
-#   - entry_direction_confirm_guard_patch は直接パッチせず、
-#     check_entry_direction_confirm() の純粋判定だけを呼ぶ
-#   - logger.exception を主要パッチ経路から排除し、ログ整形中の再帰を抑止
 # ============================================================
 
 from __future__ import annotations
@@ -29,7 +33,10 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
         if v is None or v == "":
             return default
-        return float(v)
+        s = str(v).strip()
+        if not s or s.lower() in {"nan", "none", "nat", "<na>"}:
+            return default
+        return float(s.replace(",", ""))
     except Exception:
         return default
 
@@ -78,6 +85,31 @@ def _norm_symbol(v: Any) -> str:
         return s
     except Exception:
         return ""
+
+
+def _range_pct_from_row(row: dict) -> float:
+    """行にある値幅系カラムから range_pct を 0.123 の比率形式で返す。"""
+    raw = _first(
+        row,
+        (
+            "_intrabar_range_pct",
+            "intrabar_range_pct",
+            "range_pct",
+            "price_range_pct",
+            "range_1m_pct",
+            "range_3m_pct",
+            "range_5m_pct",
+            "disp_range_pct",
+        ),
+        None,
+    )
+    v = _safe_float(raw, 0.0)
+    if v <= 0:
+        return 0.0
+    # TONOSAMAの _intrabar_range_pct は 20.4 のような percent 表記。
+    if v > 1.0:
+        return v / 100.0
+    return v
 
 
 def _install_ranking_direction_guard() -> bool:
@@ -162,17 +194,10 @@ def _call_entry_direction_confirm(entry_row: Any) -> bool:
         from core.startup.entry_direction_confirm_guard_patch import check_entry_direction_confirm
         return bool(check_entry_direction_confirm(entry_row))
     except RecursionError:
-        logger.error(
-            "[LOW MOVE GUARD] entry_direction_confirm recursion detected. fail-safe NG.",
-            exc_info=False,
-        )
+        logger.error("[LOW MOVE GUARD] entry_direction_confirm recursion detected. fail-safe NG.", exc_info=False)
         return False
     except Exception as e:
-        logger.warning(
-            "[LOW MOVE GUARD] entry_direction_confirm skipped due to error: %s",
-            e,
-            exc_info=False,
-        )
+        logger.warning("[LOW MOVE GUARD] entry_direction_confirm skipped due to error: %s", e, exc_info=False)
         return True
 
 
@@ -191,24 +216,40 @@ def _low_movement_guard(entry_row: Any) -> bool:
         logger.warning("[LOW MOVE GUARD] NG symbol=%s reason=price_out_of_range close=%.1f", symbol, close)
         return False
 
-    if high <= 0 or low <= 0 or high < low:
-        logger.warning("[LOW MOVE GUARD] NG symbol=%s reason=no_high_low close=%.1f high=%.1f low=%.1f", symbol, close, high, low)
-        return False
+    range_pct = 0.0
+    range_source = "high_low"
+    if high > 0 and low > 0 and high >= low:
+        range_pct = (high - low) / close if close > 0 else 0.0
+    else:
+        range_pct = _range_pct_from_row(row)
+        range_source = "row_range_pct"
+        if range_pct <= 0:
+            logger.warning(
+                "[LOW MOVE GUARD] NG symbol=%s reason=no_high_low close=%.1f high=%.1f low=%.1f row_range_pct=%.4f keys=%s",
+                symbol, close, high, low, range_pct, sorted(list(row.keys()))[:60],
+            )
+            return False
+        # ログ/後段用の疑似high/low。判定はrange_pctのみを使う。
+        high = close * (1.0 + range_pct / 2.0)
+        low = close * max(0.0001, (1.0 - range_pct / 2.0))
+        logger.warning(
+            "[LOW MOVE GUARD] high/low missing but use row range fallback symbol=%s close=%.1f range_pct=%.4f source=%s pseudo_high=%.1f pseudo_low=%.1f",
+            symbol, close, range_pct, range_source, high, low,
+        )
 
-    range_pct = (high - low) / close if close > 0 else 0.0
     split = _env_float("LOW_MOVE_TIER_SPLIT_PRICE", 3000.0)
     min_range_pct = _env_float("LOW_MOVE_MIN_RANGE_PCT_LOW_PRICE", 0.015) if close < split else _env_float("LOW_MOVE_MIN_RANGE_PCT_HIGH_PRICE", 0.008)
     strong_range_pct = _env_float("LOW_MOVE_STRONG_RANGE_PCT", 0.020)
 
     if range_pct < min_range_pct:
         logger.warning(
-            "[LOW MOVE GUARD] NG symbol=%s reason=range_too_small close=%.1f high=%.1f low=%.1f range_pct=%.4f min=%.4f",
-            symbol, close, high, low, range_pct, min_range_pct,
+            "[LOW MOVE GUARD] NG symbol=%s reason=range_too_small close=%.1f high=%.1f low=%.1f range_pct=%.4f min=%.4f source=%s",
+            symbol, close, high, low, range_pct, min_range_pct, range_source,
         )
         return False
 
     slope_values = []
-    for k in ("slope_atr_scaled", "slope", "score_slope", "disp_slope"):
+    for k in ("slope_atr_scaled", "slope", "score_slope", "disp_slope", "_slope"):
         if k in row:
             slope_values.append(_safe_float(row.get(k), 0.0))
 
@@ -221,26 +262,26 @@ def _low_movement_guard(entry_row: Any) -> bool:
         min_abs_slope = _env_float("LOW_MOVE_MIN_ABS_SLOPE_LOW_PRICE", 0.0003) if close < split else _env_float("LOW_MOVE_MIN_ABS_SLOPE_HIGH_PRICE", 0.0002)
         if abs_slope < min_abs_slope and range_pct < strong_range_pct:
             logger.warning(
-                "[LOW MOVE GUARD] NG symbol=%s reason=slope_too_small close=%.1f abs_slope=%.6f min=%.6f range_pct=%.4f strong_range=%.4f",
-                symbol, close, abs_slope, min_abs_slope, range_pct, strong_range_pct,
+                "[LOW MOVE GUARD] NG symbol=%s reason=slope_too_small close=%.1f abs_slope=%.6f min=%.6f range_pct=%.4f strong_range=%.4f source=%s",
+                symbol, close, abs_slope, min_abs_slope, range_pct, strong_range_pct, range_source,
             )
             return False
         if abs_slope < min_abs_slope and range_pct >= strong_range_pct:
             logger.warning(
-                "[LOW MOVE GUARD] slope small but allowed by strong range symbol=%s close=%.1f abs_slope=%.6f min=%.6f range_pct=%.4f strong_range=%.4f",
-                symbol, close, abs_slope, min_abs_slope, range_pct, strong_range_pct,
+                "[LOW MOVE GUARD] slope small but allowed by strong range symbol=%s close=%.1f abs_slope=%.6f min=%.6f range_pct=%.4f strong_range=%.4f source=%s",
+                symbol, close, abs_slope, min_abs_slope, range_pct, strong_range_pct, range_source,
             )
 
     if abs(macd) < 0.0001 and abs(signal) < 0.0001 and max_abs_slope < 0.0001 and range_pct < strong_range_pct:
         logger.warning(
-            "[LOW MOVE GUARD] NG symbol=%s reason=no_momentum macd=%.6f signal=%.6f slope=%.6f range_pct=%.4f strong_range=%.4f",
-            symbol, macd, signal, max_abs_slope, range_pct, strong_range_pct,
+            "[LOW MOVE GUARD] NG symbol=%s reason=no_momentum macd=%.6f signal=%.6f slope=%.6f range_pct=%.4f strong_range=%.4f source=%s",
+            symbol, macd, signal, max_abs_slope, range_pct, strong_range_pct, range_source,
         )
         return False
 
     logger.info(
-        "[LOW MOVE GUARD] OK symbol=%s close=%.1f range_pct=%.4f min_range=%.4f strong_range=%.4f macd=%.4f signal=%.4f max_abs_slope=%.6f",
-        symbol, close, range_pct, min_range_pct, strong_range_pct, macd, signal, max_abs_slope,
+        "[LOW MOVE GUARD] OK symbol=%s close=%.1f range_pct=%.4f min_range=%.4f strong_range=%.4f macd=%.4f signal=%.4f max_abs_slope=%.6f source=%s",
+        symbol, close, range_pct, min_range_pct, strong_range_pct, macd, signal, max_abs_slope, range_source,
     )
     return True
 
@@ -266,10 +307,7 @@ def _patched_range_5m_filter(entry_row: Any = None, *args, **kwargs):
             return False
         return _apply_all_entry_guards(entry_row)
     except RecursionError:
-        logger.error(
-            "[LOW MOVE GUARD] recursion detected in patched range filter. fail-safe NG. Check duplicate wrappers.",
-            exc_info=False,
-        )
+        logger.error("[LOW MOVE GUARD] recursion detected in patched range filter. fail-safe NG. Check duplicate wrappers.", exc_info=False)
         return False
     except Exception as e:
         logger.warning("[LOW MOVE GUARD] patched range filter failed: %s", e, exc_info=False)
@@ -287,10 +325,7 @@ def _patched_atr_1m_filter(entry_row: Any = None, *args, **kwargs):
             return False
         return _apply_all_entry_guards(entry_row)
     except RecursionError:
-        logger.error(
-            "[LOW MOVE GUARD] recursion detected in patched atr filter. fail-safe NG. Check duplicate wrappers.",
-            exc_info=False,
-        )
+        logger.error("[LOW MOVE GUARD] recursion detected in patched atr filter. fail-safe NG. Check duplicate wrappers.", exc_info=False)
         return False
     except Exception as e:
         logger.warning("[LOW MOVE GUARD] patched atr filter failed: %s", e, exc_info=False)
@@ -299,7 +334,7 @@ def _patched_atr_1m_filter(entry_row: Any = None, *args, **kwargs):
 
 def _is_low_move_wrapped(func: Any) -> bool:
     try:
-        return bool(getattr(func, "_low_move_guard_v2", False) or getattr(func, "_low_move_guard_v1", False))
+        return bool(getattr(func, "_low_move_guard_v2", False) or getattr(func, "_low_move_guard_v1", False) or getattr(func, "_low_move_guard_v12", False))
     except Exception:
         return False
 
@@ -322,38 +357,33 @@ def install() -> bool:
         old_atr = getattr(ec, "atr_1m_filter", None)
         old_range = getattr(ec, "range_5m_filter", None)
 
-        if _is_low_move_wrapped(old_atr) and _is_low_move_wrapped(old_range):
-            _INSTALLED = True
-            logger.warning("[LOW MOVE GUARD] already installed; skip duplicate wrapping")
-            return True
+        if callable(old_atr) and not _is_low_move_wrapped(old_atr):
+            _ORIG_ATR_FILTER = old_atr
+            _patched_atr_1m_filter._low_move_guard_v12 = True  # type: ignore[attr-defined]
+            _patched_atr_1m_filter._original = old_atr  # type: ignore[attr-defined]
+            ec.atr_1m_filter = _patched_atr_1m_filter
+            logger.warning("[LOW MOVE GUARD] patched entry_controller.atr_1m_filter")
+        else:
+            logger.warning("[LOW MOVE GUARD] atr_1m_filter already wrapped or missing")
 
-        _ORIG_ATR_FILTER = old_atr
-        _ORIG_RANGE_FILTER = old_range
-        _patched_atr_1m_filter._low_move_guard_v2 = True  # type: ignore[attr-defined]
-        _patched_range_5m_filter._low_move_guard_v2 = True  # type: ignore[attr-defined]
-        ec.atr_1m_filter = _patched_atr_1m_filter
-        ec.range_5m_filter = _patched_range_5m_filter
+        if callable(old_range) and not _is_low_move_wrapped(old_range):
+            _ORIG_RANGE_FILTER = old_range
+            _patched_range_5m_filter._low_move_guard_v12 = True  # type: ignore[attr-defined]
+            _patched_range_5m_filter._original = old_range  # type: ignore[attr-defined]
+            ec.range_5m_filter = _patched_range_5m_filter
+            logger.warning("[LOW MOVE GUARD] patched entry_controller.range_5m_filter")
+        else:
+            logger.warning("[LOW MOVE GUARD] range_5m_filter already wrapped or missing")
+
         _INSTALLED = True
-
         logger.warning(
-            "[LOW MOVE GUARD] installed as single filter wrapper low_range=%.4f high_range=%.4f low_slope=%.6f high_slope=%.6f strong_range=%.4f ranking_direction=%s scoring_flag_pattern_bridge=%s entry_direction_confirm_pure=%s final_entry_safety=%s price_improve=%s ma_cross_state=%s vwap_state=%s",
-            _env_float("LOW_MOVE_MIN_RANGE_PCT_LOW_PRICE", 0.015),
-            _env_float("LOW_MOVE_MIN_RANGE_PCT_HIGH_PRICE", 0.008),
-            _env_float("LOW_MOVE_MIN_ABS_SLOPE_LOW_PRICE", 0.0003),
-            _env_float("LOW_MOVE_MIN_ABS_SLOPE_HIGH_PRICE", 0.0002),
-            _env_float("LOW_MOVE_STRONG_RANGE_PCT", 0.020),
-            ok_direction,
-            ok_scoring_bridge,
-            ok_entry_direction,
-            ok_final_safety,
-            ok_price_improve,
-            ok_ma_cross,
-            ok_vwap_state,
+            "[LOW MOVE GUARD] installed v12 direction=%s scoring_bridge=%s entry_direction=%s final_safety=%s price_improve=%s ma_cross=%s vwap=%s",
+            ok_direction, ok_scoring_bridge, ok_entry_direction, ok_final_safety, ok_price_improve, ok_ma_cross, ok_vwap_state,
         )
         return True
     except Exception as e:
         logger.warning("[LOW MOVE GUARD] install failed: %s", e, exc_info=False)
-        return bool(ok_direction or ok_scoring_bridge or ok_entry_direction or ok_final_safety or ok_price_improve or ok_ma_cross or ok_vwap_state)
+        return False
 
 
 try:
