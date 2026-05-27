@@ -2,12 +2,21 @@
 # File   : scheduler_jobs/summary/display.py
 # Function:
 #   - public printer / compatibility 入口
-#   - line builder
+#   - console / Discord SUMMARY TOP10 表示
+#   - 1銘柄3行固定表示
 #   - AI sections
 #   - Discord 通知
-#   - Discord用 1銘柄2行メッセージ生成
 # ------------------------------------------------------------
-# Version: Ver10.3-PRODUCTION-DISPLAY-SPLIT-DISCORD-2LINES
+# Version: Ver10.4-PRODUCTION-DISPLAY-3LINES-READABLE-LABELS
+# ------------------------------------------------------------
+# 目的:
+#   Discord / console の SUMMARY TOP10 が横長1行にならないよう、
+#   BUY/SELL候補を 1銘柄3行固定にする。
+#
+# 表示形式:
+#   🟦 1. 9632 スバル興業 Price=3695.0 Score=10.55 Buy=10.55 Sell=0.00
+#      Slope=0.0300 MTF=0.00 RSI=50.00 MACD=0.00
+#      理由=買いスコア優勢 buy=10.55 / 上向き傾き slope=0.0300 / スコア条件で抽出
 # ============================================================
 
 from __future__ import annotations
@@ -24,7 +33,6 @@ from .display_reasons import (
     build_sell_reason_line,
     build_exit_reason_line,
 )
-from .display_ranking import build_ranking_line
 from .display_ai import (
     build_ai_buy_line,
     build_ai_sell_line,
@@ -53,10 +61,6 @@ def _discord_available() -> bool:
 
 
 def _send_to_discord(lines: list[str], title: str | None = None) -> None:
-    """
-    表示本文を Discord へ送る。
-    1メッセージが長すぎる場合は分割する。
-    """
     try:
         if not _discord_available():
             logger.info("[SUMMARY DISPLAY] discord sender not available")
@@ -75,16 +79,13 @@ def _send_to_discord(lines: list[str], title: str | None = None) -> None:
 
         limit = 1900
         chunks: list[str] = []
-
         while text:
             if len(text) <= limit:
                 chunks.append(text)
                 break
-
             cut = text.rfind("\n", 0, limit)
             if cut <= 0:
                 cut = limit
-
             chunks.append(text[:cut].rstrip())
             text = text[cut:].lstrip()
 
@@ -98,251 +99,138 @@ def _send_to_discord(lines: list[str], title: str | None = None) -> None:
                     len(chunk),
                 )
             except Exception:
-                logger.exception(
-                    "[SUMMARY DISPLAY] discord send failed chunk=%s/%s",
-                    idx,
-                    len(chunks),
-                )
+                logger.exception("[SUMMARY DISPLAY] discord send failed chunk=%s/%s", idx, len(chunks))
 
     except Exception:
         logger.exception("[SUMMARY DISPLAY] _send_to_discord failed")
 
 
 # ============================================================
-# line builders for console / logger
+# helpers
 # ============================================================
 
-def _build_breakdown_line(row: pd.Series) -> str:
-    base = first_existing(row, ["disp_base", "score_base", "breakdown_base", "base_score", "base"], np.nan)
-    trend = first_existing(row, ["disp_trend", "score_trend", "breakdown_trend", "trend_score", "trend"], np.nan)
-    mom = first_existing(
-        row,
-        ["disp_mom", "score_momentum", "breakdown_mom", "score_mom", "momentum_score", "mom", "momentum"],
-        np.nan,
-    )
-    vel = first_existing(
-        row,
-        ["disp_vel", "score_velocity", "breakdown_vel", "score_vel", "velocity_score", "vel", "velocity"],
-        np.nan,
-    )
-    pen = first_existing(
-        row,
-        ["disp_pen", "score_penalty", "breakdown_pen", "score_pen", "penalty_score", "penalty", "pen"],
-        np.nan,
-    )
+def _clean(v, max_len: int = 24) -> str:
+    try:
+        s = str(v if v is not None else "").replace("\r", " ").replace("\n", " ").strip()
+        if len(s) > max_len:
+            return s[: max_len - 1] + "…"
+        return s
+    except Exception:
+        return ""
+
+
+def _num(v, default: float = 0.0) -> float:
+    try:
+        if v is None or str(v).strip() in {"", "-", "nan", "None"}:
+            return default
+        x = float(v)
+        return x if np.isfinite(x) else default
+    except Exception:
+        return default
+
+
+def _strip_reason_prefix(raw: str) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    if "=" in s:
+        s = s.split("=", 1)[1].strip()
+    return s
+
+
+def _score_reason_ja(row: pd.Series, side: str) -> str:
+    """SUMMARY表示用の日本語理由。長すぎないよう主要項目に絞る。"""
+    try:
+        side_u = str(side or "").upper()
+        buy = _num(first_existing(row, ["disp_buy_score", "score_buy", "buy_score"], 0.0))
+        sell = _num(first_existing(row, ["disp_sell_score", "score_sell", "sell_score"], 0.0))
+        slope = _num(first_existing(row, ["disp_slope", "slope", "score_slope", "slope_atr_scaled"], 0.0))
+        mtf = _num(first_existing(row, ["disp_mtf", "mtf", "score_mtf", "mtf_score"], 0.0))
+        rsi = _num(first_existing(row, ["disp_rsi", "rsi"], 50.0), 50.0)
+        macd = _num(first_existing(row, ["disp_macd", "macd"], 0.0))
+
+        parts: list[str] = []
+        if side_u == "SELL":
+            if sell > 0:
+                parts.append(f"売りスコア優勢 sell={sell:.2f}")
+            if slope < 0:
+                parts.append(f"下向き傾き slope={slope:.4f}")
+            else:
+                parts.append(f"下落傾きは弱い slope={slope:.4f}")
+        else:
+            if buy > 0:
+                parts.append(f"買いスコア優勢 buy={buy:.2f}")
+            if slope > 0:
+                parts.append(f"上向き傾き slope={slope:.4f}")
+            else:
+                parts.append(f"傾きは弱い slope={slope:.4f}")
+
+        if mtf:
+            parts.append(f"複数時間足={mtf:.2f}")
+        if rsi != 50.0:
+            parts.append(f"RSI={rsi:.1f}")
+        if macd:
+            parts.append(f"MACD={macd:.3f}")
+
+        raw = build_sell_reason_line(row) if side_u == "SELL" else build_buy_reason_line(row)
+        raw_reason = _strip_reason_prefix(raw)
+        if raw_reason and raw_reason not in {"-", "flag_score"}:
+            # 既に日本語化済みの理由は重複を避けつつ後ろに足す。
+            if raw_reason not in " / ".join(parts):
+                parts.append(raw_reason)
+        elif raw_reason == "flag_score":
+            parts.append("スコア条件で抽出")
+
+        return " / ".join(parts) if parts else "理由データ不足: スコア・傾き・補助指標から判定"
+    except Exception:
+        logger.debug("[SUMMARY DISPLAY] _score_reason_ja failed", exc_info=True)
+        return "理由生成失敗"
+
+
+# ============================================================
+# line builders for console / logger / Discord
+# ============================================================
+
+def _build_summary_candidate_3lines(i: int, row: pd.Series, *, side: str) -> str:
+    symbol = first_existing(row, ["symbol"], "")
+    symbolname = first_existing(row, ["symbolname_view", "symbolname", "name"], "")
+
+    score = first_existing(row, ["disp_score", "score", "display_score", "final_score"], np.nan)
+    score_buy = first_existing(row, ["disp_buy_score", "score_buy", "buy_score"], np.nan)
+    score_sell = first_existing(row, ["disp_sell_score", "score_sell", "sell_score"], np.nan)
+    close = first_existing(row, ["disp_close", "close", "close_price", "current_price", "price"], np.nan)
+    slope = first_existing(row, ["disp_slope", "slope", "score_slope", "slope_atr_scaled"], np.nan)
+    mtf = first_existing(row, ["disp_mtf", "mtf", "score_mtf", "mtf_score"], np.nan)
+    rsi = first_existing(row, ["disp_rsi", "rsi"], np.nan)
+    macd = first_existing(row, ["disp_macd", "macd"], np.nan)
+
+    mark = "🟦" if str(side).upper() == "BUY" else "🟥"
+    reason = _score_reason_ja(row, side)
 
     return (
-        f"    base={fmt_metric(base):>6} "
-        f"trend={fmt_metric(trend):>6} "
-        f"mom={fmt_metric(mom):>6} "
-        f"vel={fmt_metric(vel):>6} "
-        f"pen={fmt_metric(pen):>6}"
+        f"{mark} {i}. {_clean(symbol, 8)} {_clean(symbolname, 28)} "
+        f"Price={fmt_price(close)} Score={fmt_metric(score)} Buy={fmt_metric(score_buy)} Sell={fmt_metric(score_sell)}\n"
+        f"   Slope={fmt_metric(slope)} MTF={fmt_metric(mtf)} RSI={fmt_metric(rsi)} MACD={fmt_metric(macd)}\n"
+        f"   理由={reason}"
     )
 
 
 def _build_buy_line(i: int, row: pd.Series) -> str:
-    symbol = first_existing(row, ["symbol"], "")
-    symbolname = first_existing(row, ["symbolname_view", "symbolname", "name"], "")
-
-    score = first_existing(row, ["disp_score", "score", "display_score", "final_score"], np.nan)
-    score_buy = first_existing(row, ["disp_buy_score", "score_buy"], np.nan)
-    score_sell = first_existing(row, ["disp_sell_score", "score_sell"], np.nan)
-    slope = first_existing(row, ["disp_slope", "slope", "score_slope"], np.nan)
-    mtf = first_existing(row, ["disp_mtf", "mtf", "score_mtf", "mtf_score"], np.nan)
-    total = first_existing(row, ["disp_total_score", "score_total", "total_score"], np.nan)
-    final_score = first_existing(row, ["disp_final_score", "final_score", "display_score", "score"], np.nan)
-    rsi = first_existing(row, ["disp_rsi", "rsi"], np.nan)
-    macd = first_existing(row, ["disp_macd", "macd"], np.nan)
-    close = first_existing(row, ["disp_close", "close", "close_price", "current_price"], np.nan)
-
-    line1 = (
-        f"{i:2d}. {str(symbol):<6} {str(symbolname):<28} "
-        f"score={fmt_metric(score):>6} "
-        f"buy={fmt_metric(score_buy):>6} "
-        f"sell={fmt_metric(score_sell):>6} "
-        f"slope={fmt_metric(slope):>6} "
-        f"mtf={fmt_metric(mtf):>6} "
-        f"total={fmt_metric(total):>6} "
-        f"final={fmt_metric(final_score):>6} "
-        f"rsi={fmt_metric(rsi):>6} "
-        f"macd={fmt_metric(macd):>6} "
-        f"close={fmt_price(close):>7}"
-    )
-
-    line2 = _build_breakdown_line(row)
-    line3 = build_buy_reason_line(row)
-    line_rank = build_ranking_line(row)
-
-    parts = [line1, line2]
-    if line_rank:
-        parts.append(line_rank)
-    parts.append(line3)
-
-    return "\n".join(parts)
+    return _build_summary_candidate_3lines(i, row, side="BUY")
 
 
 def _build_sell_line(i: int, row: pd.Series) -> str:
-    symbol = first_existing(row, ["symbol"], "")
-    symbolname = first_existing(row, ["symbolname_view", "symbolname", "name"], "")
+    return _build_summary_candidate_3lines(i, row, side="SELL")
 
-    score = first_existing(row, ["disp_score", "score", "display_score", "final_score"], np.nan)
-    score_buy = first_existing(row, ["disp_buy_score", "score_buy"], np.nan)
-    score_sell = first_existing(row, ["disp_sell_score", "score_sell"], np.nan)
-    slope = first_existing(row, ["disp_slope", "slope", "score_slope"], np.nan)
-    mtf = first_existing(row, ["disp_mtf", "mtf", "score_mtf", "mtf_score"], np.nan)
-    total = first_existing(row, ["disp_total_score", "score_total", "total_score"], np.nan)
-    final_score = first_existing(row, ["disp_final_score", "final_score", "display_score", "score"], np.nan)
-    rsi = first_existing(row, ["disp_rsi", "rsi"], np.nan)
-    macd = first_existing(row, ["disp_macd", "macd"], np.nan)
-    close = first_existing(row, ["disp_close", "close", "close_price", "current_price"], np.nan)
-
-    line1 = (
-        f"{i:2d}. {str(symbol):<6} {str(symbolname):<28} "
-        f"score={fmt_metric(score):>6} "
-        f"buy={fmt_metric(score_buy):>6} "
-        f"sell={fmt_metric(score_sell):>6} "
-        f"slope={fmt_metric(slope):>6} "
-        f"mtf={fmt_metric(mtf):>6} "
-        f"total={fmt_metric(total):>6} "
-        f"final={fmt_metric(final_score):>6} "
-        f"rsi={fmt_metric(rsi):>6} "
-        f"macd={fmt_metric(macd):>6} "
-        f"close={fmt_price(close):>7}"
-    )
-
-    line2 = _build_breakdown_line(row)
-    line3 = build_sell_reason_line(row)
-    line_rank = build_ranking_line(row)
-
-    parts = [line1, line2]
-    if line_rank:
-        parts.append(line_rank)
-    parts.append(line3)
-
-    return "\n".join(parts)
-
-
-# ============================================================
-# Discord 2-line builders
-# ============================================================
 
 def _reason_text_for_discord(row: pd.Series, side: str) -> str:
-    """
-    build_buy_reason_line / build_sell_reason_line の先頭ラベルを削って、
-    Discord用に短くする。
-
-    例:
-      '    理由(SELL)=売りスコア優勢 / 下向き'
-      -> '売りスコア優勢 / 下向き'
-    """
-    try:
-        if side.upper() == "SELL":
-            raw = build_sell_reason_line(row)
-        else:
-            raw = build_buy_reason_line(row)
-
-        raw = str(raw or "").strip()
-        if not raw:
-            return "-"
-
-        if "=" in raw:
-            return raw.split("=", 1)[1].strip()
-
-        return raw
-    except Exception:
-        logger.debug("[SUMMARY DISPLAY] _reason_text_for_discord failed", exc_info=True)
-        return "-"
+    return _score_reason_ja(row, side)
 
 
 def _build_discord_candidate_2lines(i: int, row: pd.Series, *, side: str) -> str:
-    """
-    Discord用。
-    1銘柄を必ず2行にする。
+    # 関数名は互換維持。実際は3行固定。
+    return _build_summary_candidate_3lines(i, row, side=side)
 
-    情報量を増やした版:
-      1行目:
-        symbol / name / score / buy / sell / total / final / close / rsi / macd
-      2行目:
-        slope / mtf / base / trend / mom / vel / pen / rank / chg / turn / tick / 理由
-
-    コンソール表示用の _build_buy_line / _build_sell_line は変更しない。
-    """
-
-    symbol = first_existing(row, ["symbol"], "")
-    symbolname = first_existing(row, ["symbolname_view", "symbolname", "name"], "")
-
-    score = first_existing(row, ["disp_score", "score", "display_score", "final_score"], np.nan)
-    score_buy = first_existing(row, ["disp_buy_score", "score_buy"], np.nan)
-    score_sell = first_existing(row, ["disp_sell_score", "score_sell"], np.nan)
-    total = first_existing(row, ["disp_total_score", "score_total", "total_score"], np.nan)
-    final_score = first_existing(row, ["disp_final_score", "final_score", "display_score", "score"], np.nan)
-
-    close = first_existing(row, ["disp_close", "close", "close_price", "current_price"], np.nan)
-    rsi = first_existing(row, ["disp_rsi", "rsi"], np.nan)
-    macd = first_existing(row, ["disp_macd", "macd"], np.nan)
-
-    slope = first_existing(row, ["disp_slope", "slope", "score_slope", "slope_atr_scaled"], np.nan)
-    mtf = first_existing(row, ["disp_mtf", "mtf", "score_mtf", "mtf_score"], np.nan)
-
-    base = first_existing(row, ["disp_base", "score_base", "breakdown_base", "base_score", "base"], np.nan)
-    trend = first_existing(row, ["disp_trend", "score_trend", "breakdown_trend", "trend_score", "trend"], np.nan)
-    mom = first_existing(
-        row,
-        ["disp_mom", "score_momentum", "breakdown_mom", "score_mom", "momentum_score", "mom", "momentum"],
-        np.nan,
-    )
-    vel = first_existing(
-        row,
-        ["disp_vel", "score_velocity", "breakdown_vel", "score_vel", "velocity_score", "vel", "velocity"],
-        np.nan,
-    )
-    pen = first_existing(
-        row,
-        ["disp_pen", "score_penalty", "breakdown_pen", "score_pen", "penalty_score", "penalty", "pen"],
-        np.nan,
-    )
-
-    rank = first_existing(row, ["rank", "ranking_rank", "disp_rank"], "-")
-    chg = first_existing(row, ["change_rate", "chg", "ranking_change_rate", "disp_chg"], "-")
-    turn = first_existing(row, ["turnover", "turn", "ranking_turnover", "disp_turn"], "-")
-    tick = first_existing(row, ["tick", "tick_count", "ticks", "disp_tick"], "-")
-
-    reason = _reason_text_for_discord(row, side)
-
-    # Discordは等幅フォントで見やすくするため、銘柄名は少し長めに確保
-    line1 = (
-        f"{i:2d}. {str(symbol):<6} {str(symbolname):<22} "
-        f"score={fmt_metric(score)} "
-        f"buy={fmt_metric(score_buy)} "
-        f"sell={fmt_metric(score_sell)} "
-        f"total={fmt_metric(total)} "
-        f"final={fmt_metric(final_score)} "
-        f"close={fmt_price(close)} "
-        f"rsi={fmt_metric(rsi)} "
-        f"macd={fmt_metric(macd)}"
-    )
-
-    rank_text = str(rank)
-    chg_text = fmt_metric(chg) if chg != "-" else "-"
-    turn_text = fmt_metric(turn) if turn != "-" else "-"
-    tick_text = fmt_metric(tick) if tick != "-" else "-"
-
-    line2 = (
-        f"    slope={fmt_metric(slope)} "
-        f"mtf={fmt_metric(mtf)} "
-        f"base={fmt_metric(base)} "
-        f"trend={fmt_metric(trend)} "
-        f"mom={fmt_metric(mom)} "
-        f"vel={fmt_metric(vel)} "
-        f"pen={fmt_metric(pen)} "
-        f"rank={rank_text} "
-        f"chg={chg_text} "
-        f"turn={turn_text} "
-        f"tick={tick_text} "
-        f"理由={reason}"
-    )
-
-    return line1 + "\n" + line2
 
 def _collect_discord_top10_sections(
     df: pd.DataFrame,
@@ -350,16 +238,9 @@ def _collect_discord_top10_sections(
     *,
     ranking: bool = False,
 ) -> list[str]:
-    """
-    Discord通知専用。
-    ログ表示用 lines とは別に、1銘柄2行だけで作る。
-    """
-
     lines: list[str] = []
-
     try:
         title_prefix = "RANKING SUMMARY" if ranking else "SUMMARY"
-
         lines.append(f"========== 📊 {title_prefix} TOP10 ({interval_label}) ==========")
 
         lines.append("🔵 BUY TOP10")
@@ -377,62 +258,37 @@ def _collect_discord_top10_sections(
         else:
             for i, (_, row) in enumerate(sell_df.head(10).iterrows(), start=1):
                 lines.append(_build_discord_candidate_2lines(i, row, side="SELL"))
-
     except Exception:
         logger.exception("[SUMMARY DISPLAY] _collect_discord_top10_sections failed")
-
     return lines
 
 
 def _build_discord_ai_candidate_2lines(i: int, row: pd.Series, *, side: str) -> str:
-    """
-    AI通過銘柄用のDiscord 2行表示。
-    既存のAI表示関数はコンソール用として残す。
-    """
-
     symbol = first_existing(row, ["symbol"], "")
     symbolname = first_existing(row, ["symbolname_view", "symbolname", "name"], "")
-
     confidence = first_existing(row, ["confidence", "conf", "ai_confidence"], np.nan)
     lot = first_existing(row, ["lot", "order_lot", "qty"], np.nan)
-    model = first_existing(row, ["model", "ai_model"], "-")
-
     score = first_existing(row, ["disp_score", "score", "display_score", "final_score"], np.nan)
-    score_buy = first_existing(row, ["disp_buy_score", "score_buy"], np.nan)
-    score_sell = first_existing(row, ["disp_sell_score", "score_sell"], np.nan)
-    total = first_existing(row, ["disp_total_score", "score_total", "total_score"], np.nan)
-    close = first_existing(row, ["disp_close", "close", "close_price", "current_price"], np.nan)
+    score_buy = first_existing(row, ["disp_buy_score", "score_buy", "buy_score"], np.nan)
+    score_sell = first_existing(row, ["disp_sell_score", "score_sell", "sell_score"], np.nan)
+    close = first_existing(row, ["disp_close", "close", "close_price", "current_price", "price"], np.nan)
+    slope = first_existing(row, ["disp_slope", "slope", "score_slope", "slope_atr_scaled"], np.nan)
 
     reason = first_existing(row, ["ai_reason", "reason", "gate_reason"], "")
     if not reason:
         reason = _reason_text_for_discord(row, side)
 
-    line1 = (
-        f"{i:2d}. {str(symbol):<6} {str(symbolname):<18} "
-        f"conf={fmt_confidence(confidence)} "
-        f"lot={fmt_metric(lot)} "
-        f"model={model} "
-        f"close={fmt_price(close)}"
+    mark = "🤖🟦" if str(side).upper() == "BUY" else "🤖🟥"
+    return (
+        f"{mark} {i}. {_clean(symbol, 8)} {_clean(symbolname, 24)} "
+        f"Price={fmt_price(close)} Score={fmt_metric(score)} Buy={fmt_metric(score_buy)} Sell={fmt_metric(score_sell)}\n"
+        f"   Conf={fmt_confidence(confidence)} Lot={fmt_metric(lot)} Slope={fmt_metric(slope)}\n"
+        f"   理由={reason}"
     )
-
-    line2 = (
-        f"    score={fmt_metric(score)} "
-        f"buy={fmt_metric(score_buy)} "
-        f"sell={fmt_metric(score_sell)} "
-        f"total={fmt_metric(total)} "
-        f"理由={reason}"
-    )
-
-    return line1 + "\n" + line2
 
 
 def _collect_discord_ai_sections(df: pd.DataFrame, interval_label: str) -> list[str]:
-    """
-    Discord通知専用 AI セクション。
-    """
-
     lines: list[str] = []
-
     try:
         lines.append("")
         lines.append(f"========== 🤖 AI PASSED BUY CANDIDATES ({interval_label}) ==========")
@@ -458,10 +314,8 @@ def _collect_discord_ai_sections(df: pd.DataFrame, interval_label: str) -> list[
         else:
             for i, (_, row) in enumerate(exit_df.head(10).iterrows(), start=1):
                 lines.append(build_ai_exit_line(i, row))
-
     except Exception:
         logger.exception("[SUMMARY DISPLAY] _collect_discord_ai_sections failed")
-
     return lines
 
 
@@ -471,7 +325,6 @@ def _collect_discord_ai_sections(df: pd.DataFrame, interval_label: str) -> list[
 
 def _collect_ai_sections(df: pd.DataFrame, interval_label: str) -> list[str]:
     lines: list[str] = []
-
     try:
         lines.append("")
         lines.append(f"========== 🤖 AI PASSED BUY CANDIDATES ({interval_label}) ==========")
@@ -497,10 +350,8 @@ def _collect_ai_sections(df: pd.DataFrame, interval_label: str) -> list[str]:
         else:
             for i, (_, row) in enumerate(exit_df.head(10).iterrows(), start=1):
                 lines.append(build_ai_exit_line(i, row))
-
     except Exception:
         logger.exception("[SUMMARY DISPLAY] _collect_ai_sections failed")
-
     return lines
 
 
@@ -522,7 +373,6 @@ def print_summary_top10(
     try:
         df = repair_mtf_consistency(safe_df(summary_df))
         df = ensure_display_columns(df)
-
         lines: list[str] = []
 
         header = build_header_context(df, interval_label)
@@ -542,7 +392,6 @@ def print_summary_top10(
                 lines.append(_build_buy_line(i, row))
 
         lines.append("🔴 SELL TOP10（score_sell 優先）")
-
         sell_df = prepare_sell_df(df)
         if sell_df.empty:
             lines.append(" (no sell candidates)")
@@ -551,20 +400,12 @@ def print_summary_top10(
                 lines.append(_build_sell_line(i, row))
 
         lines.extend(_collect_ai_sections(df, interval_label))
-
-        # コンソール / logger は従来通り詳細表示
         _emit_lines(lines)
 
-        # Discord は1銘柄2行の専用表示
         if notify_discord:
-            discord_lines = _collect_discord_top10_sections(
-                df,
-                interval_label,
-                ranking=False,
-            )
+            discord_lines = _collect_discord_top10_sections(df, interval_label, ranking=False)
             discord_lines.extend(_collect_discord_ai_sections(df, interval_label))
             _send_to_discord(discord_lines, title=f"📊 SUMMARY TOP10 {interval_label}")
-
     except Exception:
         logger.exception("[SUMMARY DISPLAY] print_summary_top10 failed")
 
@@ -578,7 +419,6 @@ def print_ranking_summary_top10(
     try:
         df = repair_mtf_consistency(safe_df(summary_df))
         df = ensure_display_columns(df)
-
         lines: list[str] = []
 
         header = latest_header_text(df, f"{interval_label} ランキングサマリー")
@@ -598,7 +438,6 @@ def print_ranking_summary_top10(
                 lines.append(_build_buy_line(i, row))
 
         lines.append("🔴 SELL TOP10（score_sell 優先）")
-
         sell_df = prepare_sell_df(df)
         if sell_df.empty:
             lines.append(" (no sell candidates)")
@@ -607,20 +446,12 @@ def print_ranking_summary_top10(
                 lines.append(_build_sell_line(i, row))
 
         lines.extend(_collect_ai_sections(df, interval_label))
-
-        # コンソール / logger は従来通り詳細表示
         _emit_lines(lines)
 
-        # Discord は1銘柄2行の専用表示
         if notify_discord:
-            discord_lines = _collect_discord_top10_sections(
-                df,
-                interval_label,
-                ranking=True,
-            )
+            discord_lines = _collect_discord_top10_sections(df, interval_label, ranking=True)
             discord_lines.extend(_collect_discord_ai_sections(df, interval_label))
             _send_to_discord(discord_lines, title=f"📊 RANKING SUMMARY TOP10 {interval_label}")
-
     except Exception:
         logger.exception("[SUMMARY DISPLAY] print_ranking_summary_top10 failed")
 
@@ -634,11 +465,7 @@ def print_push_summary(
 ) -> None:
     if summary_df is None:
         return
-    print_summary_top10(
-        summary_df=summary_df,
-        interval_label=interval_label,
-        notify_discord=notify_discord,
-    )
+    print_summary_top10(summary_df=summary_df, interval_label=interval_label, notify_discord=notify_discord)
 
 
 def print_ranking_summary(
@@ -650,11 +477,7 @@ def print_ranking_summary(
 ) -> None:
     if summary_df is None:
         return
-    print_ranking_summary_top10(
-        summary_df=summary_df,
-        interval_label=interval_label,
-        notify_discord=notify_discord,
-    )
+    print_ranking_summary_top10(summary_df=summary_df, interval_label=interval_label, notify_discord=notify_discord)
 
 
 def display_ai_passed_summary(
@@ -666,20 +489,14 @@ def display_ai_passed_summary(
 ) -> None:
     if summary_df is None:
         return
-
     try:
         df = repair_mtf_consistency(safe_df(summary_df))
         df = ensure_display_columns(df)
-
-        # コンソール / logger は従来通り
         lines = _collect_ai_sections(df, interval_label)
         _emit_lines(lines)
-
-        # Discord は2行版
         if notify_discord:
             discord_lines = _collect_discord_ai_sections(df, interval_label)
             _send_to_discord(discord_lines, title=f"🤖 AI PASSED {interval_label}")
-
     except Exception:
         logger.exception("[SUMMARY DISPLAY] display_ai_passed_summary failed")
 
@@ -697,11 +514,7 @@ def display_summary(
 ) -> None:
     if summary_df is None:
         return
-    print_summary_top10(
-        summary_df=summary_df,
-        interval_label=interval_label,
-        notify_discord=notify_discord,
-    )
+    print_summary_top10(summary_df=summary_df, interval_label=interval_label, notify_discord=notify_discord)
 
 
 def display_push_summary(
@@ -713,11 +526,7 @@ def display_push_summary(
 ) -> None:
     if summary_df is None:
         return
-    print_summary_top10(
-        summary_df=summary_df,
-        interval_label=interval_label,
-        notify_discord=notify_discord,
-    )
+    print_summary_top10(summary_df=summary_df, interval_label=interval_label, notify_discord=notify_discord)
 
 
 def display_ranking_summary(
@@ -729,8 +538,4 @@ def display_ranking_summary(
 ) -> None:
     if summary_df is None:
         return
-    print_ranking_summary_top10(
-        summary_df=summary_df,
-        interval_label=interval_label,
-        notify_discord=notify_discord,
-    )
+    print_ranking_summary_top10(summary_df=summary_df, interval_label=interval_label, notify_discord=notify_discord)
