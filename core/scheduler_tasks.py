@@ -1,37 +1,25 @@
 # ============================================================
 # File   : core/scheduler_tasks.py
+# Version: Ver32.2-RANKING-SAVE-TIMEOUT-COOLDOWN
+# ------------------------------------------------------------
 # Function:
 #   - アプリ全体の scheduler タスク登録を担当する
 #   - summary系 scheduler の登録を統合親tick優先で実行する
-#   - ranking_snapshot_1min 毎分保存タスクを登録する
-#   - 既存の push / yahoo / entry_exit 系タスクと共存させる
-#   - summary scheduler が壊れていても fallback で生かす
+#   - ranking_snapshot_1min 保存タスクを登録する
 #   - import 半壊時も利用可能な関数だけ登録し、全体停止を避ける
-# ------------------------------------------------------------
-# Version: Ver32.1-CORE-SCHEDULER-TASKS-RANKING-SAVE-ALWAYS-REGISTERED
-#          -SUMMARY-SOURCE-SEPARATED
-#          -RANKING-SAVE-TICK-02SEC
-#          -ROBUST-IMPORT-RESOLUTION
-#          -FALLBACK-KEEPALIVE
-#          -UNIFIED-SUMMARY-PARENT-PRIORITY
-#          -COMPAT-REGISTER-SUMMARY-TASKS-INCLUDES-RANKING-SAVE
-# ------------------------------------------------------------
-# 機能:
-#   - アプリ全体の scheduler タスク登録
-#   - PUSH由来サマリーの登録
-#   - ランキング由来サマリーの登録
-#   - ranking_snapshot_1min 毎分保存タスクの登録
-#   - 既存の push / yahoo / entry_exit 系タスクと共存
 #
-# 改善点:
-#   - summary scheduler の import を個別解決
-#   - ranking保存タスク job_save_ranking を明示追加
-#   - 1つ欠けても他の関数は生かす
-#   - scheduler module が半壊でも fallback で動作
-#   - summary系と ranking保存系の責務を分離
-#   - 統合親tick方式を優先し、二重登録を避ける
-#   - register_summary_tasks() 経由でも ranking保存を登録
-#   - ranking保存tickを :02 にずらし、summary :00 との衝突を軽減
+# Ver32.2:
+#   - main.py側の ranking_save_tick が120秒以上詰まる問題を抑制
+#   - ranking save を既定3分間隔に変更
+#   - ranking save 実行にタイムアウトを追加
+#   - timeout後はクールダウンし、その間は即skip
+#   - job本体が戻らなくても scheduler thread は戻る
+#
+# ENV:
+#   RANKING_SAVE_IN_MAIN_ENABLED=1/0      default 1
+#   RANKING_SAVE_INTERVAL_MIN=3           default 3
+#   RANKING_SAVE_TIMEOUT_SEC=20           default 20
+#   RANKING_SAVE_TIMEOUT_COOLDOWN_SEC=180 default 180
 # ============================================================
 
 from __future__ import annotations
@@ -40,70 +28,69 @@ import datetime as dt
 import importlib
 import inspect
 import logging
+import os
+import threading
+import time
 from typing import Any, Callable, Optional
 
 import schedule
 
 logger = logging.getLogger(__name__)
 
-
-# ============================================================
-# tags
-# ============================================================
-
 _TAG_SUMMARY_FALLBACK_TICK = "summary_fallback_tick"
 _TAG_RANKING_SAVE_TICK = "ranking_save_tick"
-
-# ranking保存は summary :00 と衝突しないよう :02 にする
 _RANKING_SAVE_SECOND = 2
 
+_RANKING_SAVE_LOCK = threading.RLock()
+_RANKING_SAVE_COOLDOWN_UNTIL: dt.datetime | None = None
+_RANKING_SAVE_TIMEOUT_STREAK = 0
 
-# ============================================================
-# helper
-# ============================================================
+
+def _env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
+
 
 def _resolve_attr(module_name: str, attr_name: str) -> Optional[Callable[..., Any]]:
-    """
-    module.attr を安全に解決する。
-
-    import 半壊時でも全体を止めない。
-    """
     try:
         mod = importlib.import_module(module_name)
         fn = getattr(mod, attr_name, None)
-
         if callable(fn):
-            logger.info(
-                "[core.scheduler_tasks] resolved %s.%s",
-                module_name,
-                attr_name,
-            )
+            logger.info("[core.scheduler_tasks] resolved %s.%s", module_name, attr_name)
             return fn
-
-        logger.info(
-            "[core.scheduler_tasks] unresolved %s.%s (not callable)",
-            module_name,
-            attr_name,
-        )
+        logger.info("[core.scheduler_tasks] unresolved %s.%s (not callable)", module_name, attr_name)
         return None
-
     except Exception:
-        logger.info(
-            "[core.scheduler_tasks] unresolved %s.%s",
-            module_name,
-            attr_name,
-            exc_info=False,
-        )
+        logger.info("[core.scheduler_tasks] unresolved %s.%s", module_name, attr_name, exc_info=False)
         return None
 
 
-
-def _call_with_supported_kwargs(fn: Callable[..., Any], **kwargs) -> Any:
-    """
-    関数が受け取れる kwargs だけ渡して呼ぶ。
-    新版 job_save_ranking(mode="fast") なら軽量モードで呼び、
-    旧版 job_save_ranking() なら引数なしで壊さず呼ぶ。
-    """
+def _call_with_supported_kwargs(fn: Callable[..., Any], **kwargs: Any) -> Any:
     try:
         sig = inspect.signature(fn)
         params = sig.parameters
@@ -115,17 +102,36 @@ def _call_with_supported_kwargs(fn: Callable[..., Any], **kwargs) -> Any:
     except ValueError:
         return fn(**kwargs)
 
+
+def _call_with_timeout(fn: Callable[[], Any], *, timeout_sec: float, name: str) -> tuple[bool, Any]:
+    result: dict[str, Any] = {"done": False, "ret": None, "err": None}
+
+    def _target() -> None:
+        try:
+            result["ret"] = fn()
+            result["done"] = True
+        except Exception as e:
+            result["err"] = e
+            result["done"] = True
+
+    th = threading.Thread(target=_target, daemon=True, name=f"scheduler-timeout-{name}")
+    th.start()
+    th.join(max(0.1, float(timeout_sec or 0.1)))
+    if th.is_alive():
+        logger.warning("[%s] timeout -> return to scheduler timeout_sec=%.3f thread_alive=True", name, timeout_sec)
+        return False, None
+    if result.get("err") is not None:
+        raise result["err"]
+    return True, result.get("ret")
+
+
 def _safe_call(fn: Optional[Callable[..., Any]], name: str) -> None:
-    """
-    任意の登録関数を安全に呼ぶ。
-    """
     try:
         if callable(fn):
             fn()
             logger.info("[core.scheduler_tasks] %s ok", name)
         else:
             logger.info("[core.scheduler_tasks] %s skipped (not available)", name)
-
     except Exception:
         logger.exception("[core.scheduler_tasks] %s failed", name)
 
@@ -138,9 +144,6 @@ def _safe_job_name(fn: Any) -> str:
 
 
 def _has_schedule_tag(tag: str) -> bool:
-    """
-    schedule に指定 tag の job が存在するか確認する。
-    """
     try:
         for job in list(getattr(schedule, "jobs", []) or []):
             tags = getattr(job, "tags", set()) or set()
@@ -148,389 +151,213 @@ def _has_schedule_tag(tag: str) -> bool:
                 return True
     except Exception:
         pass
-
     return False
 
 
 def _clear_schedule_tag(tag: str) -> None:
-    """
-    指定 tag の schedule job を削除する。
-    """
     try:
         schedule.clear(tag)
         logger.info("[core.scheduler_tasks] cleared existing scheduled jobs tag=%s", tag)
     except Exception:
-        logger.warning(
-            "[core.scheduler_tasks] schedule.clear failed tag=%s",
-            tag,
-            exc_info=True,
-        )
+        logger.warning("[core.scheduler_tasks] schedule.clear failed tag=%s", tag, exc_info=True)
 
 
 def _log_registered_jobs(context: str) -> None:
-    """
-    現在の schedule.jobs を軽くログ出力する。
-    """
     try:
         rows = []
         for job in list(getattr(schedule, "jobs", []) or []):
             try:
-                rows.append(
-                    {
-                        "job": str(job),
-                        "tags": sorted(list(getattr(job, "tags", set()) or set())),
-                        "next_run": str(getattr(job, "next_run", None)),
-                        "last_run": str(getattr(job, "last_run", None)),
-                    }
-                )
+                rows.append({
+                    "job": str(job),
+                    "tags": sorted(list(getattr(job, "tags", set()) or set())),
+                    "next_run": str(getattr(job, "next_run", None)),
+                    "last_run": str(getattr(job, "last_run", None)),
+                })
             except Exception:
                 rows.append({"job": str(job)})
-
-        logger.info(
-            "[core.scheduler_tasks] schedule snapshot context=%s count=%s jobs=%s",
-            context,
-            len(rows),
-            rows,
-        )
-
+        logger.info("[core.scheduler_tasks] schedule snapshot context=%s count=%s jobs=%s", context, len(rows), rows)
     except Exception:
-        logger.debug(
-            "[core.scheduler_tasks] schedule snapshot failed context=%s",
-            context,
-            exc_info=True,
-        )
+        logger.debug("[core.scheduler_tasks] schedule snapshot failed context=%s", context, exc_info=True)
 
 
-# ============================================================
-# summary scheduler resolvers
-# ============================================================
+_register_push_summary_tasks = _resolve_attr("scheduler_jobs.summary.scheduler", "register_push_summary_tasks")
+_register_ranking_summary_tasks = _resolve_attr("scheduler_jobs.summary.scheduler", "register_ranking_summary_tasks")
+_register_summary_tasks_impl = _resolve_attr("scheduler_jobs.summary.scheduler", "register_summary_tasks")
+_register_time_locked_summary_tasks = _resolve_attr("scheduler_jobs.summary.scheduler", "register_time_locked_summary_tasks")
+_job_push_summary = _resolve_attr("scheduler_jobs.summary.runners", "job_summary")
+_job_ranking_summary = _resolve_attr("scheduler_jobs.summary.runners", "job_ranking_summary")
+_job_save_ranking = _resolve_attr("trading.ranking.scheduler", "job_save_ranking")
+_save_ranking_data_loop = _resolve_attr("trading.ranking.scheduler", "save_ranking_data_loop")
+register_yahoo_tasks = _resolve_attr("core.yahoo_tasks", "register_yahoo_tasks")
+register_push_tasks = _resolve_attr("core.push_tasks", "register_push_tasks")
+register_entry_exit_tasks = _resolve_attr("core.entry_exit_tasks", "register_entry_exit_tasks")
 
-_register_push_summary_tasks = _resolve_attr(
-    "scheduler_jobs.summary.scheduler",
-    "register_push_summary_tasks",
-)
-
-_register_ranking_summary_tasks = _resolve_attr(
-    "scheduler_jobs.summary.scheduler",
-    "register_ranking_summary_tasks",
-)
-
-_register_summary_tasks_impl = _resolve_attr(
-    "scheduler_jobs.summary.scheduler",
-    "register_summary_tasks",
-)
-
-_register_time_locked_summary_tasks = _resolve_attr(
-    "scheduler_jobs.summary.scheduler",
-    "register_time_locked_summary_tasks",
-)
-
-
-# ============================================================
-# summary runners fallback
-# ============================================================
-
-_job_push_summary = _resolve_attr(
-    "scheduler_jobs.summary.runners",
-    "job_summary",
-)
-
-_job_ranking_summary = _resolve_attr(
-    "scheduler_jobs.summary.runners",
-    "job_ranking_summary",
-)
-
-
-# ============================================================
-# ranking SAVE task resolver
-# 実体候補:
-#   - trading.ranking.scheduler.job_save_ranking
-#   - trading.ranking.scheduler.save_ranking_data_loop
-# ============================================================
-
-_job_save_ranking = _resolve_attr(
-    "trading.ranking.scheduler",
-    "job_save_ranking",
-)
-
-_save_ranking_data_loop = _resolve_attr(
-    "trading.ranking.scheduler",
-    "save_ranking_data_loop",
-)
-
-
-# ============================================================
-# existing other task resolvers
-# ============================================================
-
-register_yahoo_tasks = _resolve_attr(
-    "core.yahoo_tasks",
-    "register_yahoo_tasks",
-)
-
-register_push_tasks = _resolve_attr(
-    "core.push_tasks",
-    "register_push_tasks",
-)
-
-register_entry_exit_tasks = _resolve_attr(
-    "core.entry_exit_tasks",
-    "register_entry_exit_tasks",
-)
-
-
-# ============================================================
-# fallback runners: summary
-# ============================================================
 
 def _run_push_interval(interval: int) -> None:
     try:
         if callable(_job_push_summary):
             _job_push_summary(int(interval))
-            logger.info(
-                "[core.scheduler_tasks] push summary fired interval=%s",
-                interval,
-            )
+            logger.info("[core.scheduler_tasks] push summary fired interval=%s", interval)
         else:
-            logger.warning(
-                "[core.scheduler_tasks] push summary runner unavailable interval=%s",
-                interval,
-            )
-
+            logger.warning("[core.scheduler_tasks] push summary runner unavailable interval=%s", interval)
     except Exception:
-        logger.exception(
-            "[core.scheduler_tasks] push summary failed interval=%s",
-            interval,
-        )
+        logger.exception("[core.scheduler_tasks] push summary failed interval=%s", interval)
 
 
 def _run_ranking_interval(interval: int) -> None:
     try:
         if callable(_job_ranking_summary):
             _job_ranking_summary(int(interval))
-            logger.info(
-                "[core.scheduler_tasks] ranking summary fired interval=%s",
-                interval,
-            )
+            logger.info("[core.scheduler_tasks] ranking summary fired interval=%s", interval)
         else:
-            logger.warning(
-                "[core.scheduler_tasks] ranking summary runner unavailable interval=%s",
-                interval,
-            )
-
+            logger.warning("[core.scheduler_tasks] ranking summary runner unavailable interval=%s", interval)
     except Exception:
-        logger.exception(
-            "[core.scheduler_tasks] ranking summary failed interval=%s",
-            interval,
-        )
+        logger.exception("[core.scheduler_tasks] ranking summary failed interval=%s", interval)
 
 
 def _summary_tick() -> None:
-    """
-    毎分 :00 に呼ばれる summary 統合 tick。
-
-    0分起点で 1分 / 3分 / 5分 を判定する。
-    PUSH と ranking summary を同じ基準で実行する。
-    fallback用途。
-    """
     try:
         now = dt.datetime.now().replace(second=0, microsecond=0)
         minute = int(now.minute)
-
-        logger.info(
-            "[core.scheduler_tasks] summary tick start hhmm=%s interval_base_minute=%s",
-            now.strftime("%H:%M"),
-            minute,
-        )
-
-        # PUSH summary
+        logger.info("[core.scheduler_tasks] summary tick start hhmm=%s interval_base_minute=%s", now.strftime("%H:%M"), minute)
         _run_push_interval(1)
         if minute % 3 == 0:
             _run_push_interval(3)
         if minute % 5 == 0:
             _run_push_interval(5)
-
-        # ranking summary
         _run_ranking_interval(1)
         if minute % 3 == 0:
             _run_ranking_interval(3)
         if minute % 5 == 0:
             _run_ranking_interval(5)
-
         logger.info("[core.scheduler_tasks] summary tick finished")
-
     except Exception:
         logger.exception("[core.scheduler_tasks] summary tick failed")
 
 
 def _register_summary_fallback_tasks() -> None:
-    """
-    scheduler_jobs.summary.scheduler が import できない場合の
-    自前 fallback 登録。
-    """
     try:
         _clear_schedule_tag(_TAG_SUMMARY_FALLBACK_TICK)
-
         schedule.every().minute.at(":00").do(_summary_tick).tag(_TAG_SUMMARY_FALLBACK_TICK)
-
-        logger.info(
-            "[core.scheduler_tasks] fallback summary schedule registered "
-            "(every minute :00, base=0min, push/ranking summary 1m/3m/5m)"
-        )
-
+        logger.info("[core.scheduler_tasks] fallback summary schedule registered every minute :00")
     except Exception:
-        logger.exception(
-            "[core.scheduler_tasks] fallback summary schedule registration failed"
-        )
+        logger.exception("[core.scheduler_tasks] fallback summary schedule registration failed")
 
 
-# ============================================================
-# ranking SAVE
-# ============================================================
+def _ranking_save_cooldown_seconds() -> float:
+    base = max(1.0, _env_float("RANKING_SAVE_TIMEOUT_COOLDOWN_SEC", 180.0))
+    max_sec = max(base, _env_float("RANKING_SAVE_TIMEOUT_COOLDOWN_MAX_SEC", 600.0))
+    streak = max(1, int(_RANKING_SAVE_TIMEOUT_STREAK or 1))
+    return min(max_sec, base * streak)
+
 
 def _run_ranking_save_tick() -> None:
-    """
-    ranking_snapshot_1min 保存用の毎分 tick。
+    """ranking_snapshot_1min 保存用tick。timeout/cooldown付き。"""
+    global _RANKING_SAVE_COOLDOWN_UNTIL, _RANKING_SAVE_TIMEOUT_STREAK
+    started_dt = dt.datetime.now()
+    started = time.perf_counter()
 
-    summary とは別責務。
-    """
-    try:
-        now = dt.datetime.now().replace(second=0, microsecond=0)
+    if not _env_bool("RANKING_SAVE_IN_MAIN_ENABLED", True):
+        logger.info("[core.scheduler_tasks] ranking save skipped disabled by RANKING_SAVE_IN_MAIN_ENABLED=0")
+        return
 
-        logger.info(
-            "[core.scheduler_tasks] ranking save tick start hhmm=%s",
-            now.strftime("%H:%M"),
-        )
-
-        if callable(_job_save_ranking):
-            result = _call_with_supported_kwargs(
-                _job_save_ranking,
-                mode="fast",
-                run_full_postprocess=False,
-                save_legacy=False,
-            )
-            logger.info(
-                "[core.scheduler_tasks] ranking save fired FAST fn=%s result_type=%s",
-                _safe_job_name(_job_save_ranking),
-                type(result).__name__,
-            )
-
-        elif callable(_save_ranking_data_loop):
-            result = _call_with_supported_kwargs(
-                _save_ranking_data_loop,
-                mode="fast",
-                run_full_postprocess=False,
-                save_legacy=False,
-            )
-            logger.info(
-                "[core.scheduler_tasks] ranking save fired FAST fn=%s result_type=%s",
-                _safe_job_name(_save_ranking_data_loop),
-                type(result).__name__,
-            )
-
-        else:
+    with _RANKING_SAVE_LOCK:
+        if _RANKING_SAVE_COOLDOWN_UNTIL is not None and started_dt < _RANKING_SAVE_COOLDOWN_UNTIL:
+            remain = (_RANKING_SAVE_COOLDOWN_UNTIL - started_dt).total_seconds()
             logger.warning(
-                "[core.scheduler_tasks] ranking save runner unavailable "
-                "fn=job_save_ranking/save_ranking_data_loop"
+                "[core.scheduler_tasks] ranking save skipped reason=timeout_cooldown remain=%.1fs until=%s streak=%s",
+                remain, _RANKING_SAVE_COOLDOWN_UNTIL, _RANKING_SAVE_TIMEOUT_STREAK,
             )
+            return
 
+    now = started_dt.replace(second=0, microsecond=0)
+    timeout_sec = max(1.0, _env_float("RANKING_SAVE_TIMEOUT_SEC", 20.0))
+    logger.info("[core.scheduler_tasks] ranking save tick start hhmm=%s timeout_sec=%.1f", now.strftime("%H:%M"), timeout_sec)
+
+    def _body() -> Any:
+        if callable(_job_save_ranking):
+            return _call_with_supported_kwargs(_job_save_ranking, mode="fast", run_full_postprocess=False, save_legacy=False)
+        if callable(_save_ranking_data_loop):
+            return _call_with_supported_kwargs(_save_ranking_data_loop, mode="fast", run_full_postprocess=False, save_legacy=False)
+        logger.warning("[core.scheduler_tasks] ranking save runner unavailable fn=job_save_ranking/save_ranking_data_loop")
+        return None
+
+    try:
+        completed, result = _call_with_timeout(_body, timeout_sec=timeout_sec, name="RANKING SAVE TICK")
+        if not completed:
+            with _RANKING_SAVE_LOCK:
+                _RANKING_SAVE_TIMEOUT_STREAK += 1
+                cool_sec = _ranking_save_cooldown_seconds()
+                _RANKING_SAVE_COOLDOWN_UNTIL = dt.datetime.now() + dt.timedelta(seconds=cool_sec)
+            logger.warning(
+                "[core.scheduler_tasks] ranking save timeout -> cooldown elapsed=%.3fs streak=%s cooldown_sec=%.1f until=%s",
+                time.perf_counter() - started, _RANKING_SAVE_TIMEOUT_STREAK, cool_sec, _RANKING_SAVE_COOLDOWN_UNTIL,
+            )
+            return
+
+        with _RANKING_SAVE_LOCK:
+            _RANKING_SAVE_TIMEOUT_STREAK = 0
+            _RANKING_SAVE_COOLDOWN_UNTIL = None
         logger.info(
-            "[core.scheduler_tasks] ranking save tick finished hhmm=%s",
-            now.strftime("%H:%M"),
+            "[core.scheduler_tasks] ranking save fired FAST result_type=%s elapsed=%.3fs",
+            type(result).__name__, time.perf_counter() - started,
         )
-
+        logger.info("[core.scheduler_tasks] ranking save tick finished hhmm=%s", now.strftime("%H:%M"))
     except Exception:
         logger.exception("[core.scheduler_tasks] ranking save tick failed")
 
 
+def _resolve_ranking_save_interval_min() -> int:
+    return max(1, _env_int("RANKING_SAVE_INTERVAL_MIN", 3))
+
+
 def register_ranking_save_tasks() -> None:
-    """
-    ranking_snapshot_1min 保存タスク登録。
-
-    毎分 :02 に ranking save job を実行する。
-
-    理由:
-      - summary系が :00 で動く構成と衝突しやすいため
-      - ranking保存を先に走らせる場合でも、DBロック集中を少し避けるため
-    """
+    """ranking_snapshot_1min 保存タスク登録。既定3分ごと :02。"""
     try:
         _clear_schedule_tag(_TAG_RANKING_SAVE_TICK)
+        if not _env_bool("RANKING_SAVE_IN_MAIN_ENABLED", True):
+            logger.warning("[core.scheduler_tasks] ranking save task not registered disabled by RANKING_SAVE_IN_MAIN_ENABLED=0")
+            return
 
         at_text = f":{int(_RANKING_SAVE_SECOND):02d}"
-
-        schedule.every().minute.at(at_text).do(_run_ranking_save_tick).tag(_TAG_RANKING_SAVE_TICK)
+        interval_min = _resolve_ranking_save_interval_min()
+        if interval_min <= 1:
+            job = schedule.every().minute.at(at_text).do(_run_ranking_save_tick)
+        else:
+            job = schedule.every(interval_min).minutes.at(at_text).do(_run_ranking_save_tick)
+        job.tag(_TAG_RANKING_SAVE_TICK)
 
         logger.info(
-            "[core.scheduler_tasks] registered ranking save every minute at %s "
-            "fn=trading.ranking.scheduler.job_save_ranking/save_ranking_data_loop "
-            "tag=%s job_save_available=%s loop_available=%s",
+            "[core.scheduler_tasks] registered ranking save every %s minute(s) at %s tag=%s timeout=%.1fs cooldown=%.1fs job_save_available=%s loop_available=%s",
+            interval_min,
             at_text,
             _TAG_RANKING_SAVE_TICK,
+            _env_float("RANKING_SAVE_TIMEOUT_SEC", 20.0),
+            _env_float("RANKING_SAVE_TIMEOUT_COOLDOWN_SEC", 180.0),
             callable(_job_save_ranking),
             callable(_save_ranking_data_loop),
         )
-
         if not callable(_job_save_ranking) and not callable(_save_ranking_data_loop):
-            logger.warning(
-                "[core.scheduler_tasks] ranking save task registered but runner unavailable. "
-                "Check trading.ranking.scheduler.job_save_ranking or save_ranking_data_loop"
-            )
-
+            logger.warning("[core.scheduler_tasks] ranking save task registered but runner unavailable")
     except Exception:
         logger.exception("[core.scheduler_tasks] register_ranking_save_tasks failed")
 
 
 def ensure_ranking_save_tasks_registered() -> None:
-    """
-    ranking保存タスクが未登録なら登録する。
-
-    複数入口から呼ばれても安全にするための保険。
-    """
     try:
         if _has_schedule_tag(_TAG_RANKING_SAVE_TICK):
-            logger.info(
-                "[core.scheduler_tasks] ranking save task already registered tag=%s",
-                _TAG_RANKING_SAVE_TICK,
-            )
+            logger.info("[core.scheduler_tasks] ranking save task already registered tag=%s", _TAG_RANKING_SAVE_TICK)
             return
-
-        logger.warning(
-            "[core.scheduler_tasks] ranking save task not found. registering now tag=%s",
-            _TAG_RANKING_SAVE_TICK,
-        )
+        logger.warning("[core.scheduler_tasks] ranking save task not found. registering now tag=%s", _TAG_RANKING_SAVE_TICK)
         register_ranking_save_tasks()
-
     except Exception:
         logger.exception("[core.scheduler_tasks] ensure_ranking_save_tasks_registered failed")
 
 
-# ============================================================
-# public api
-# ============================================================
-
 def register_summary_only_tasks() -> None:
-    """
-    summary系のみ登録。
-
-    優先順位:
-      1) scheduler_jobs.summary.scheduler.register_summary_tasks
-      2) scheduler_jobs.summary.scheduler.register_time_locked_summary_tasks
-      3) push/ranking 個別登録
-      4) fallback
-
-    注意:
-      - この関数は名前通り summary のみ。
-      - ranking保存は register_ranking_save_tasks() で別登録する。
-      - ただし旧互換 register_summary_tasks() では ranking保存も呼ぶ。
-    """
     try:
         logger.info("[core.scheduler_tasks] register_summary_only_tasks start")
-
         registered = False
-
-        # ----------------------------------------------------
-        # 最優先: 統合親tick登録
-        # ----------------------------------------------------
         if callable(_register_summary_tasks_impl):
             try:
                 _register_summary_tasks_impl()
@@ -538,10 +365,6 @@ def register_summary_only_tasks() -> None:
                 registered = True
             except Exception:
                 logger.exception("[core.scheduler_tasks] register_summary_tasks impl failed")
-
-        # ----------------------------------------------------
-        # 次点: time-locked summary tasks
-        # ----------------------------------------------------
         if (not registered) and callable(_register_time_locked_summary_tasks):
             try:
                 _register_time_locked_summary_tasks()
@@ -549,13 +372,8 @@ def register_summary_only_tasks() -> None:
                 registered = True
             except Exception:
                 logger.exception("[core.scheduler_tasks] register_time_locked_summary_tasks failed")
-
-        # ----------------------------------------------------
-        # 互換: 個別登録
-        # ----------------------------------------------------
         if not registered:
             dedicated_registered = False
-
             if callable(_register_push_summary_tasks):
                 try:
                     _register_push_summary_tasks()
@@ -563,7 +381,6 @@ def register_summary_only_tasks() -> None:
                     dedicated_registered = True
                 except Exception:
                     logger.exception("[core.scheduler_tasks] register_push_summary_tasks failed")
-
             if callable(_register_ranking_summary_tasks):
                 try:
                     _register_ranking_summary_tasks()
@@ -571,101 +388,53 @@ def register_summary_only_tasks() -> None:
                     dedicated_registered = True
                 except Exception:
                     logger.exception("[core.scheduler_tasks] register_ranking_summary_tasks failed")
-
             registered = dedicated_registered
-
-        # ----------------------------------------------------
-        # 最終fallback
-        # ----------------------------------------------------
         if not registered:
             _register_summary_fallback_tasks()
-
         logger.info("[core.scheduler_tasks] register_summary_only_tasks finished")
         _log_registered_jobs("after_register_summary_only_tasks")
-
     except Exception:
         logger.exception("[core.scheduler_tasks] register_summary_only_tasks failed")
 
 
 def register_summary_tasks_compat() -> None:
-    """
-    旧互換名。
-
-    以前は summary のみだったが、main.py / startup 側がこの関数だけを
-    呼ぶケースで ranking保存が登録されない事故を防ぐため、
-    ranking保存も登録する。
-    """
     try:
         logger.info("[core.scheduler_tasks] register_summary_tasks_compat start")
-
         register_summary_only_tasks()
         register_ranking_save_tasks()
-
         logger.info("[core.scheduler_tasks] register_summary_tasks_compat finished")
         _log_registered_jobs("after_register_summary_tasks_compat")
-
     except Exception:
         logger.exception("[core.scheduler_tasks] register_summary_tasks_compat failed")
 
 
 def register_summary_entry_exit_tasks() -> None:
-    """
-    既存互換用の総合登録関数。
-
-    main.py などがこの名前を呼んでいる前提に対応。
-    """
     try:
         logger.info("[core.scheduler_tasks] register_summary_entry_exit_tasks start")
-
-        # summary系
         register_summary_only_tasks()
-
-        # ranking保存系
         register_ranking_save_tasks()
-
-        # 既存他タスク
         _safe_call(register_push_tasks, "register_push_tasks")
         _safe_call(register_yahoo_tasks, "register_yahoo_tasks")
         _safe_call(register_entry_exit_tasks, "register_entry_exit_tasks")
-
-        # 保険
         ensure_ranking_save_tasks_registered()
-
         logger.info("[core.scheduler_tasks] register_summary_entry_exit_tasks finished")
         _log_registered_jobs("after_register_summary_entry_exit_tasks")
-
     except Exception:
         logger.exception("[core.scheduler_tasks] register_summary_entry_exit_tasks failed")
 
 
 def register_summary_tasks() -> None:
-    """
-    旧互換エクスポート。
-
-    重要:
-      startup_bootstrap / main.py がこの関数だけを採用した場合でも、
-      ranking_snapshot_1min 毎分保存を落とさないため、
-      summaryだけでなく ranking保存も登録する。
-    """
     try:
         logger.info("[core.scheduler_tasks] register_summary_tasks compat start")
-
         register_summary_only_tasks()
         register_ranking_save_tasks()
-
         logger.info("[core.scheduler_tasks] register_summary_tasks compat finished")
         _log_registered_jobs("after_register_summary_tasks")
-
     except Exception:
         logger.exception("[core.scheduler_tasks] register_summary_tasks compat failed")
 
 
 def register_all_tasks() -> None:
-    """
-    明示的な総合登録名。
-
-    新しい呼び出し元では、この関数を使うのが最も分かりやすい。
-    """
     register_summary_entry_exit_tasks()
 
 
