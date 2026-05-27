@@ -1,26 +1,23 @@
 # ============================================================
 # File   : trading/entry/tonosama/ai_gate.py
-# Version: Ver1.5-TONOSAMA-AI-FALLBACK-5SEC-OPTIONAL-001
+# Version: Ver1.6-TONOSAMA-AI-FALLBACK-BUY-SELL-SIGNED-FIX
 # ------------------------------------------------------------
 # AI判定モジュールが利用できない場合の代替判定。
 # runner/config.py 側の殿様条件と同じ閾値を使う。
 #
+# Ver1.6:
+#   - SELL候補で price_change / slope がマイナスの場合、Ver1.5 は
+#       max=-0.32% < 0.30%
+#       slope=-0.0032 < 0.0030
+#     と判定してAI未接続fallbackで落としていた。
+#   - BUY/SELL両対応として、強さ判定は abs(price_change) / abs(slope) で行う。
+#   - 方向は price_change と slope の符号から推定し、BUY/SELLがどちらにも
+#     見えない横ばいはNGにする。
+#   - 5秒足は Ver1.5 と同じく任意。強い逆行だけNG。
+#
 # Ver1.5:
-#   - main.py は TONOSAMA_MIN_5SEC_PRICE_CHANGE_PCT=0.01 を設定しているが、
-#     Ver1.4 は ai_gate 側で floor=0.05 に固定していた。
-#   - そのため runner 側は5秒足任意で候補を通しても、AI未接続fallbackで
-#       5s=0.000% < 0.050%
-#     としてNGになっていた。
-#   - REQUIRE_5SEC_BAR=False の場合は、5秒足0.000%横ばいをNGにしない。
-#   - 強い逆行だけNGにする。
-#   - REQUIRE_5SEC_BAR=True の場合だけ min_5s を要求する。
-#
-# Ver1.4:
-#   - 5秒足は必須にしないが、取れているのに 0.000% はNG。
-#
-# Ver1.3:
-#   - REQUIRE_5SEC_BAR=False のときは 5秒足0.0%横ばいで落とさない。
-#   - 5秒足は補助情報扱いにし、強い逆行だけNGにする。
+#   - TONOSAMA_MIN_5SEC_PRICE_CHANGE_PCT=0.01 を尊重
+#   - REQUIRE_5SEC_BAR=False の場合は、5秒足0.000%横ばいをNGにしない
 # ============================================================
 from __future__ import annotations
 
@@ -98,6 +95,16 @@ def build_ai_features(row: pd.Series) -> dict:
     }
 
 
+def _infer_side(max_chg: float, slope: float) -> str:
+    if max_chg > 0 or slope > 0:
+        if not (max_chg < 0 and slope < 0):
+            return "BUY"
+    if max_chg < 0 or slope < 0:
+        if not (max_chg > 0 and slope > 0):
+            return "SELL"
+    return "UNKNOWN"
+
+
 def _fallback_when_ai_disconnected(features: dict) -> tuple[bool, float, str]:
     max_surge = safe_float(features.get("max_volume_surge_ratio"), 0.0)
     max_chg = safe_float(features.get("max_price_change_pct"), 0.0)
@@ -105,33 +112,38 @@ def _fallback_when_ai_disconnected(features: dict) -> tuple[bool, float, str]:
     has_5s = bool(features.get("has_5sec_bar", False))
     slope = safe_float(features.get("slope"), 0.0)
 
+    side = _infer_side(max_chg, slope)
+    abs_chg = abs(max_chg)
+    abs_slope = abs(slope)
+
     min_surge = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_VOLUME_SURGE", float(_cfg("MIN_VOLUME_SURGE_RATIO", 3.0)), 3.0)
     min_chg = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_PRICE_CHANGE_PCT", float(_cfg("MIN_PRICE_CHANGE_PCT", 0.30)), 0.30)
     min_slope = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_SLOPE", float(_cfg("MIN_SLOPE", 0.0030)), 0.0030)
-
-    # 重要: main.py/config.py側の0.01を尊重する。0.05へ固定しない。
     min_5s = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT", float(_cfg("MIN_5SEC_PRICE_CHANGE_PCT", 0.01)), 0.01)
     max_5s_drop = _env_float("TONOSAMA_AI_FALLBACK_MAX_5SEC_DROP_PCT", float(_cfg("MAX_5SEC_DROP_PCT", -0.20)))
     require_5s = _env_bool("TONOSAMA_AI_FALLBACK_REQUIRE_5SEC_BAR", bool(_cfg("REQUIRE_5SEC_BAR", False)))
 
+    if side == "UNKNOWN":
+        return False, 0.0, f"AI未接続: 方向不明 price_change={max_chg:.2f}% slope={slope:.4f}"
     if max_surge < min_surge:
-        return False, 0.0, f"AI未接続: 出来高急増不足 max={max_surge:.2f}x < {min_surge:.2f}x"
-    if max_chg < min_chg:
-        return False, 0.0, f"AI未接続: 価格変化不足 max={max_chg:.2f}% < {min_chg:.2f}%"
-    if slope < min_slope:
-        return False, 0.0, f"AI未接続: 傾き不足 slope={slope:.4f} < {min_slope:.4f}"
+        return False, 0.0, f"AI未接続: 出来高急増不足 side={side} max={max_surge:.2f}x < {min_surge:.2f}x"
+    if abs_chg < min_chg:
+        return False, 0.0, f"AI未接続: 価格変化不足 side={side} abs={abs_chg:.2f}% raw={max_chg:.2f}% < {min_chg:.2f}%"
+    if abs_slope < min_slope:
+        return False, 0.0, f"AI未接続: 傾き不足 side={side} abs={abs_slope:.4f} raw={slope:.4f} < {min_slope:.4f}"
 
     if has_5s:
         # 5秒足任意なら、0.000%横ばいでは落とさない。強い逆行のみNG。
-        if chg_5s <= max_5s_drop:
-            return False, 0.0, f"AI未接続: 5秒逆行 5s={chg_5s:.3f}% <= {max_5s_drop:.3f}%"
-        # 5秒足必須モードの時だけ、min_5sを要求する。
-        if require_5s and chg_5s < min_5s:
-            return False, 0.0, f"AI未接続: 5秒変化不足 5s={chg_5s:.3f}% < {min_5s:.3f}%"
+        if side == "BUY" and chg_5s <= max_5s_drop:
+            return False, 0.0, f"AI未接続: BUY 5秒逆行 5s={chg_5s:.3f}% <= {max_5s_drop:.3f}%"
+        if side == "SELL" and chg_5s >= abs(max_5s_drop):
+            return False, 0.0, f"AI未接続: SELL 5秒逆行 5s={chg_5s:.3f}% >= {abs(max_5s_drop):.3f}%"
+        if require_5s and abs(chg_5s) < min_5s:
+            return False, 0.0, f"AI未接続: 5秒変化不足 side={side} abs5s={abs(chg_5s):.3f}% < {min_5s:.3f}%"
     elif require_5s:
         return False, 0.0, "AI未接続: 5秒足なし"
 
-    return True, 0.0, f"AI未接続: 代替通過 出来高={max_surge:.2f}x 価格変化={max_chg:.2f}% 傾き={slope:.4f} 5s={chg_5s:.3f}% require_5s={require_5s}"
+    return True, 0.0, f"AI未接続: 代替通過 side={side} 出来高={max_surge:.2f}x 価格変化={max_chg:.2f}% abs={abs_chg:.2f}% 傾き={slope:.4f} abs_slope={abs_slope:.4f} 5s={chg_5s:.3f}% require_5s={require_5s}"
 
 
 def ai_check_tonosama_entry(row: pd.Series) -> tuple[bool, float, str]:
