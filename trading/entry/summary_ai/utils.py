@@ -1,9 +1,15 @@
 # ============================================================
 # File   : trading/entry/summary_ai/utils.py
-# Version: PRODUCTION-STABLE-REV1.2-DEDUPE-COLUMNS-PICK-TEXT-COMPAT
+# Version: PRODUCTION-STABLE-REV1.3-DEDUPE-COLUMNS-CONCAT-FAST
 # ------------------------------------------------------------
 # 【概要】
 #   summary_ai パッケージ共通の安全化ユーティリティ。
+#
+# REV1.3:
+#   - _merge_duplicate_columns を高速化
+#   - out[col] = ... の連続代入を廃止し、pd.concat(axis=1) で一括生成
+#   - DataFrame is highly fragmented PerformanceWarning を抑止
+#   - 重複カラム抽出時に df.loc[:, ["同名", "同名"]] で列が増幅する問題を回避
 #
 # REV1.2:
 #   - candidates.py が import している pick_text_series を復旧
@@ -37,6 +43,13 @@ VALID_MARKET_TYPES = {"プライム", "スタンダード", "グロース"}
 
 _TRUE_STR = {"1", "true", "yes", "y", "on", "ok", "対象"}
 
+_READY_BOOL_COLS = {
+    "technical_ready",
+    "usable_technical_ready",
+    "display_ready",
+    "ranking_tech_ready",
+}
+
 
 def _series_has_value(s: pd.Series) -> bool:
     try:
@@ -47,51 +60,96 @@ def _series_has_value(s: pd.Series) -> bool:
         return False
 
 
+def _merge_bool_columns(same: pd.DataFrame, index: pd.Index) -> pd.Series:
+    """
+    technical_ready などの重複bool系カラムは OR で統合する。
+    どれか1本でも True/対象/ok なら True とする。
+    """
+    merged_bool = pd.Series(False, index=index)
+
+    for i in range(same.shape[1]):
+        s = same.iloc[:, i]
+        try:
+            b = s.fillna(False)
+            if b.dtype != bool:
+                b = b.astype(str).str.strip().str.lower().isin(_TRUE_STR)
+            merged_bool = merged_bool | b.astype(bool)
+        except Exception:
+            pass
+
+    return merged_bool
+
+
+def _merge_value_columns(same: pd.DataFrame) -> pd.Series:
+    """
+    同名カラムを左優先で統合する。
+    旧実装の merged.where(merged.notna(), s) と同じ意味で、
+    左から見て最初に notna の値を採用する。
+    """
+    if same.shape[1] <= 1:
+        return same.iloc[:, 0].copy()
+
+    try:
+        return same.bfill(axis=1).iloc[:, 0].copy()
+    except Exception:
+        merged = same.iloc[:, 0].copy()
+        for i in range(1, same.shape[1]):
+            s = same.iloc[:, i]
+            try:
+                merged = merged.where(merged.notna(), s)
+            except Exception:
+                if _series_has_value(s):
+                    merged = s
+        return merged
+
+
 def _merge_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame() if df is None else df
+
     try:
         cols = list(df.columns)
+
+        # 重複がない場合も copy() で返し、直前処理で断片化していても軽くデフラグする。
         if len(cols) == len(set(cols)):
-            return df
+            return df.copy()
 
-        out = pd.DataFrame(index=df.index)
-        for col in dict.fromkeys(cols):
-            same = df.loc[:, [c for c in cols if c == col]]
-            if isinstance(same, pd.Series):
-                out[col] = same
-                continue
-            if same.shape[1] == 1:
-                out[col] = same.iloc[:, 0]
-                continue
+        positions_by_col: Dict[str, List[int]] = {}
+        for pos, col in enumerate(cols):
+            positions_by_col.setdefault(str(col), []).append(pos)
 
-            if str(col).lower() in {"technical_ready", "usable_technical_ready", "display_ready", "ranking_tech_ready"}:
-                merged_bool = pd.Series(False, index=df.index)
-                for i in range(same.shape[1]):
-                    s = same.iloc[:, i]
-                    try:
-                        b = s.fillna(False)
-                        if b.dtype != bool:
-                            b = b.astype(str).str.strip().str.lower().isin(_TRUE_STR)
-                        merged_bool = merged_bool | b.astype(bool)
-                    except Exception:
-                        pass
-                out[col] = merged_bool
-                continue
+        series_list: List[pd.Series] = []
+        merged_cols: List[str] = []
 
-            merged = same.iloc[:, 0].copy()
-            for i in range(1, same.shape[1]):
-                s = same.iloc[:, i]
-                try:
-                    merged = merged.where(merged.notna(), s)
-                except Exception:
-                    if _series_has_value(s):
-                        merged = s
-            out[col] = merged
+        for col, positions in positions_by_col.items():
+            # df.loc[:, [同名, 同名]] は重複ラベルで列が増幅することがあるため、
+            # 必ず iloc の位置指定で抽出する。
+            same = df.iloc[:, positions]
+
+            if len(positions) > 1:
+                merged_cols.append(col)
+
+            if col.lower() in _READY_BOOL_COLS:
+                s = _merge_bool_columns(same, df.index)
+            else:
+                s = _merge_value_columns(same)
+
+            s = s.copy()
+            s.name = col
+            series_list.append(s)
+
+        out = pd.concat(series_list, axis=1).copy()
 
         dup_count = len(cols) - len(out.columns)
-        logger.warning("[SUMMARY AI UTILS] duplicate columns merged before AI dup_count=%s cols=%s", dup_count, [c for c in dict.fromkeys(cols) if cols.count(c) > 1][:20])
+        if dup_count > 0:
+            logger.warning(
+                "[SUMMARY AI UTILS] duplicate columns merged before AI dup_count=%s cols=%s",
+                dup_count,
+                merged_cols[:50],
+            )
+
         return out
+
     except Exception:
         logger.exception("[SUMMARY AI UTILS] duplicate column merge failed")
         try:
