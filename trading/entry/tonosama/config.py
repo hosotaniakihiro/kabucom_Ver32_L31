@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/tonosama/config.py
-# Version: Ver2.3-TONOSAMA-STARTUP-SURGE-FAILOPEN
+# Version: Ver2.4-TONOSAMA-CLIMAX-GUARD-BUY-SELL
 # ------------------------------------------------------------
 # 方針:
 #   - 起動直後やPUSH再接続直後は、3m/5mの行は存在しても、
@@ -10,6 +10,11 @@
 #   - 09:21ログでは base_rows=44 / df3=44 / df5=44 があるのに
 #     force_failopen=False で全落ちしていたため、既定で fail-open を戻す。
 #   - 完全に止まっている銘柄は runner.py 側の latest_volume / price_change / slope / 5s で落とす。
+#
+# Ver2.4:
+#   - 出来高急増だけで高値掴み/安値売りをしない。
+#   - BUY: 上がり過ぎ・高値圏・上ヒゲ反落・バイイングクライマックス疑いを除外。
+#   - SELL: 下がり過ぎ・安値圏・下ヒゲ反発・セリングクライマックス疑いを除外。
 #
 # Balanced settings:
 #   MIN_PRICE               >= 300円
@@ -81,6 +86,24 @@ MIN_SLOPE = _env_float_floor("TONOSAMA_MIN_SLOPE", 0.0003, 0.0003)
 MIN_BODY_CHANGE_PCT = _env_float("TONOSAMA_MIN_BODY_CHANGE_PCT", 0.0)
 MIN_INTRABAR_RANGE_PCT = _env_float_floor("TONOSAMA_MIN_INTRABAR_RANGE_PCT", 0.10, 0.10)
 MIN_LATEST_VOLUME = _env_float_floor("TONOSAMA_MIN_LATEST_VOLUME", 50000.0, 50000.0)
+
+# ------------------------------------------------------------
+# BUY buying climax / high-chase guard
+# ------------------------------------------------------------
+MAX_BUY_PRICE_CHANGE_PCT = _env_float("TONOSAMA_MAX_BUY_PRICE_CHANGE_PCT", 0.80)
+MAX_BUY_CLOSE_POSITION_PCT = _env_float("TONOSAMA_MAX_BUY_CLOSE_POSITION_PCT", 90.0)
+MAX_BUY_UPPER_WICK_PCT = _env_float("TONOSAMA_MAX_BUY_UPPER_WICK_PCT", 45.0)
+BUYING_CLIMAX_MIN_SURGE_RATIO = _env_float("TONOSAMA_BUYING_CLIMAX_MIN_SURGE_RATIO", 3.0)
+BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT = _env_float("TONOSAMA_BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT", 0.50)
+
+# ------------------------------------------------------------
+# SELL selling climax / low-chase guard
+# ------------------------------------------------------------
+MAX_SELL_PRICE_DROP_PCT = _env_float("TONOSAMA_MAX_SELL_PRICE_DROP_PCT", 0.80)
+MIN_SELL_CLOSE_POSITION_PCT = _env_float("TONOSAMA_MIN_SELL_CLOSE_POSITION_PCT", 10.0)
+MAX_SELL_LOWER_WICK_PCT = _env_float("TONOSAMA_MAX_SELL_LOWER_WICK_PCT", 45.0)
+SELLING_CLIMAX_MIN_SURGE_RATIO = _env_float("TONOSAMA_SELLING_CLIMAX_MIN_SURGE_RATIO", 3.0)
+SELLING_CLIMAX_MIN_PRICE_DROP_PCT = _env_float("TONOSAMA_SELLING_CLIMAX_MIN_PRICE_DROP_PCT", 0.50)
 
 VOLUME_AVG_LOOKBACK_BARS = _env_int("TONOSAMA_VOLUME_AVG_LOOKBACK_BARS", 5)
 
