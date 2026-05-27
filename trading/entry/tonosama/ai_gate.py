@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/tonosama/ai_gate.py
-# Version: Ver1.3-TONOSAMA-AI-FALLBACK-5SEC-OPTIONAL
+# Version: Ver1.4-TONOSAMA-AI-FALLBACK-REJECT-ZERO-5SEC
 # ------------------------------------------------------------
 # AI判定モジュールが利用できない場合の代替判定。
 # runner/config.py 側の殿様条件と同じ閾値を使う。
@@ -8,6 +8,11 @@
 # Ver1.3:
 #   - REQUIRE_5SEC_BAR=False のときは 5秒足0.0%横ばいで落とさない。
 #   - 5秒足は補助情報扱いにし、強い逆行だけNGにする。
+#
+# Ver1.4:
+#   - 5秒足は必須にしないが、取れているのに 0.000% はNG。
+#   - 6996 のような surge=3.00x だけで chg=0.14% / slope=0.0014 /
+#     5s=0.000% の候補を AI未接続 fallback で通さない。
 # ============================================================
 from __future__ import annotations
 
@@ -29,6 +34,13 @@ def _env_float(name: str, default: float) -> float:
         return float(v)
     except Exception:
         return float(default)
+
+
+def _env_float_floor(name: str, default: float, floor: float) -> float:
+    try:
+        return max(float(floor), _env_float(name, default))
+    except Exception:
+        return float(max(default, floor))
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -85,27 +97,30 @@ def _fallback_when_ai_disconnected(features: dict) -> tuple[bool, float, str]:
     has_5s = bool(features.get("has_5sec_bar", False))
     slope = safe_float(features.get("slope"), 0.0)
 
-    min_surge = _env_float("TONOSAMA_AI_FALLBACK_MIN_VOLUME_SURGE", float(_cfg("MIN_VOLUME_SURGE_RATIO", 3.0)))
-    min_chg = _env_float("TONOSAMA_AI_FALLBACK_MIN_PRICE_CHANGE_PCT", float(_cfg("MIN_PRICE_CHANGE_PCT", 0.05)))
-    min_slope = _env_float("TONOSAMA_AI_FALLBACK_MIN_SLOPE", float(_cfg("MIN_SLOPE", 0.0003)))
-    min_5s = _env_float("TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT", float(_cfg("MIN_5SEC_PRICE_CHANGE_PCT", 0.01)))
+    min_surge = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_VOLUME_SURGE", float(_cfg("MIN_VOLUME_SURGE_RATIO", 3.0)), 3.0)
+    min_chg = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_PRICE_CHANGE_PCT", float(_cfg("MIN_PRICE_CHANGE_PCT", 0.30)), 0.30)
+    min_slope = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_SLOPE", float(_cfg("MIN_SLOPE", 0.0030)), 0.0030)
+    min_5s = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT", float(_cfg("MIN_5SEC_PRICE_CHANGE_PCT", 0.05)), 0.05)
     max_5s_drop = _env_float("TONOSAMA_AI_FALLBACK_MAX_5SEC_DROP_PCT", float(_cfg("MAX_5SEC_DROP_PCT", -0.20)))
     require_5s = _env_bool("TONOSAMA_AI_FALLBACK_REQUIRE_5SEC_BAR", bool(_cfg("REQUIRE_5SEC_BAR", False)))
 
     if max_surge < min_surge:
-        return False, 0.0, f"fallback volume surge low max={max_surge:.2f}x < {min_surge:.2f}x"
+        return False, 0.0, f"AI未接続: 出来高急増不足 max={max_surge:.2f}x < {min_surge:.2f}x"
     if max_chg < min_chg:
-        return False, 0.0, f"fallback price change low max={max_chg:.2f}% < {min_chg:.2f}%"
+        return False, 0.0, f"AI未接続: 価格変化不足 max={max_chg:.2f}% < {min_chg:.2f}%"
     if slope < min_slope:
-        return False, 0.0, f"fallback slope low slope={slope:.4f} < {min_slope:.4f}"
+        return False, 0.0, f"AI未接続: 傾き不足 slope={slope:.4f} < {min_slope:.4f}"
 
     if has_5s:
-        if require_5s and chg_5s < min_5s:
-            return False, 0.0, f"fallback 5sec strict low 5s={chg_5s:.3f}% < {min_5s:.3f}%"
-        if (not require_5s) and chg_5s <= max_5s_drop:
-            return False, 0.0, f"fallback 5sec strong reverse 5s={chg_5s:.3f}% <= {max_5s_drop:.3f}%"
+        # 5秒足は必須ではないが、取れているのに0.000%なら「今動いていない」ので落とす。
+        if chg_5s < min_5s:
+            return False, 0.0, f"AI未接続: 5秒変化不足 5s={chg_5s:.3f}% < {min_5s:.3f}%"
+        if chg_5s <= max_5s_drop:
+            return False, 0.0, f"AI未接続: 5秒逆行 5s={chg_5s:.3f}% <= {max_5s_drop:.3f}%"
+    elif require_5s:
+        return False, 0.0, "AI未接続: 5秒足なし"
 
-    return True, 0.0, f"fallback rule pass surge={max_surge:.2f}x chg={max_chg:.2f}% slope={slope:.4f} 5s={chg_5s:.3f}% optional={not require_5s}"
+    return True, 0.0, f"AI未接続: 代替通過 出来高={max_surge:.2f}x 価格変化={max_chg:.2f}% 傾き={slope:.4f} 5s={chg_5s:.3f}%"
 
 
 def ai_check_tonosama_entry(row: pd.Series) -> tuple[bool, float, str]:
