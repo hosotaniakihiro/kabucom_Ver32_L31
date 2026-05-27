@@ -1,18 +1,23 @@
 # ============================================================
 # File   : trading/entry/tonosama/volume_surge.py
-# Version: Ver1.9-TONOSAMA-RECENT-FAILCLOSED-NO-SAFE-FAILOPEN
+# Version: Ver2.0-TONOSAMA-EARLY-SESSION-SURGE-FAILOPEN
 # ------------------------------------------------------------
 # 目的:
 #   殿様エントリー用の出来高急増・価格変化特徴量を作る。
 #
-# Ver1.9:
-#   - Ver1.8 の safe fail-open を停止
-#   - 3m/5m 出来高履歴が不足している場合、既定では殿様候補を空にして早期終了
-#   - legacy env が failopen=1 / allow_without_history=1 を入れていても無視する
-#   - 本当に履歴不足でも通す場合だけ、危険許可として
-#       TONOSAMA_FORCE_SURGE_FAILOPEN=1
-#     を明示する
-#   - 15:00ログのように全銘柄 _max_volume_surge_ratio=3.0 扱いになる問題を防止
+# Ver2.0:
+#   - Ver1.9 の fail-closed 方針は維持しつつ、寄り付き直後だけ救済する。
+#   - 09:00〜09:30 は 3m/5m の rolling 履歴が不足しやすく、
+#     df3/df5 は存在しても ratio が全NaNになり base feature empty になる。
+#   - TONOSAMA_ALLOW_EARLY_SURGE_FAILOPEN=1 の場合、寄り付き後
+#     TONOSAMA_EARLY_SURGE_FAILOPEN_MINUTES 分だけ履歴不足を fail-open する。
+#   - それ以外の時間帯は Ver1.9 と同じく fail-closed。
+#   - 常時強制したい場合のみ TONOSAMA_FORCE_SURGE_FAILOPEN=1。
+#
+# ENV:
+#   TONOSAMA_ALLOW_EARLY_SURGE_FAILOPEN=1
+#   TONOSAMA_EARLY_SURGE_FAILOPEN_MINUTES=30
+#   TONOSAMA_FORCE_SURGE_FAILOPEN=0
 # ============================================================
 
 from __future__ import annotations
@@ -61,6 +66,23 @@ def _now_naive() -> dt.datetime:
         return now_naive().replace(tzinfo=None)
     except Exception:
         return dt.datetime.now()
+
+
+def _minutes_since_morning_open(now: dt.datetime | None = None) -> float:
+    try:
+        n = (now or _now_naive()).replace(tzinfo=None)
+        open_dt = n.replace(hour=9, minute=0, second=0, microsecond=0)
+        return (n - open_dt).total_seconds() / 60.0
+    except Exception:
+        return 9999.0
+
+
+def _is_early_session() -> bool:
+    if not _env_bool("TONOSAMA_ALLOW_EARLY_SURGE_FAILOPEN", True):
+        return False
+    mins = _minutes_since_morning_open()
+    limit = max(1.0, _env_float("TONOSAMA_EARLY_SURGE_FAILOPEN_MINUTES", 30.0))
+    return 0.0 <= mins <= limit
 
 
 def _normalize_datetime_col(df: pd.DataFrame) -> pd.DataFrame:
@@ -201,8 +223,16 @@ def _default_failopen_value() -> float:
 
 
 def _force_failopen_enabled() -> bool:
-    """履歴不足でも通す危険操作。旧ENVは無視し、このENVだけを見る。"""
-    return _env_bool("TONOSAMA_FORCE_SURGE_FAILOPEN", False)
+    """履歴不足でも通す危険操作。常時は専用ENV、寄り付き直後は安全救済ENVを見る。"""
+    return _env_bool("TONOSAMA_FORCE_SURGE_FAILOPEN", False) or _is_early_session()
+
+
+def _failopen_reason() -> str:
+    if _env_bool("TONOSAMA_FORCE_SURGE_FAILOPEN", False):
+        return "forced_env"
+    if _is_early_session():
+        return f"early_session:{_minutes_since_morning_open():.1f}min"
+    return "disabled"
 
 
 def _apply_history_unavailable_policy(out: pd.DataFrame) -> pd.DataFrame:
@@ -232,8 +262,8 @@ def _apply_history_unavailable_policy(out: pd.DataFrame) -> pd.DataFrame:
                     x.loc[ratio_missing_all, c] = failopen_value
                 x.loc[ratio_missing_all, "_volume_surge_failopen"] = True
                 logger.warning(
-                    "[TONOSAMA SURGE] volume_surge history missing -> FORCED fail-open rows=%s ratio_cols=%s value=%.3f legacy_failopen=%s allow_without_history=%s dangerous_old=%s",
-                    int(ratio_missing_all.sum()), ratio_cols, failopen_value, legacy_failopen, legacy_allow, dangerous_old,
+                    "[TONOSAMA SURGE] volume_surge history missing -> EARLY/FORCED fail-open rows=%s ratio_cols=%s value=%.3f reason=%s legacy_failopen=%s allow_without_history=%s dangerous_old=%s",
+                    int(ratio_missing_all.sum()), ratio_cols, failopen_value, _failopen_reason(), legacy_failopen, legacy_allow, dangerous_old,
                 )
             else:
                 for c in ratio_cols:
@@ -285,13 +315,23 @@ def build_scalping_feature_df() -> pd.DataFrame:
     missing_history = _all_surge_history_missing(df3, df5)
     if missing_history and not _force_failopen_enabled():
         logger.warning(
-            "[TONOSAMA SURGE] no usable 3m/5m volume surge history after recent filter -> return empty base_rows=%s df3=%s df5=%s force_failopen=%s",
+            "[TONOSAMA SURGE] no usable 3m/5m volume surge history after recent filter -> return empty base_rows=%s df3=%s df5=%s force_failopen=%s reason=%s",
             len(df1),
             len(df3) if isinstance(df3, pd.DataFrame) else 0,
             len(df5) if isinstance(df5, pd.DataFrame) else 0,
             _force_failopen_enabled(),
+            _failopen_reason(),
         )
         return pd.DataFrame()
+
+    if missing_history and _force_failopen_enabled():
+        logger.warning(
+            "[TONOSAMA SURGE] no usable 3m/5m volume surge history but continue by fail-open base_rows=%s df3=%s df5=%s reason=%s",
+            len(df1),
+            len(df3) if isinstance(df3, pd.DataFrame) else 0,
+            len(df5) if isinstance(df5, pd.DataFrame) else 0,
+            _failopen_reason(),
+        )
 
     out = df1.dropna(subset=["datetime"]).sort_values(["symbol", "datetime"]).groupby("symbol", group_keys=False).tail(1).copy()
     if out.empty:
@@ -327,8 +367,8 @@ def build_scalping_feature_df() -> pd.DataFrame:
     failopen_col = out.get("_volume_surge_failopen", pd.Series(False, index=out.index)).fillna(False).astype(bool)
     if bool(history_missing.all()) and not bool(failopen_col.any()):
         logger.warning(
-            "[TONOSAMA SURGE] all rows missing volume surge history -> return empty rows=%s reason=require_surge_history force_failopen=%s",
-            len(out), _force_failopen_enabled(),
+            "[TONOSAMA SURGE] all rows missing volume surge history -> return empty rows=%s reason=require_surge_history force_failopen=%s failopen_reason=%s",
+            len(out), _force_failopen_enabled(), _failopen_reason(),
         )
         return pd.DataFrame()
 
@@ -347,13 +387,14 @@ def build_scalping_feature_df() -> pd.DataFrame:
         failopen_col = out.get("_volume_surge_failopen", pd.Series(False, index=out.index)).fillna(False).astype(bool)
         history_missing_col = out.get("_volume_surge_history_missing", pd.Series(False, index=out.index)).fillna(False).astype(bool)
         logger.warning(
-            "[TONOSAMA SURGE] feature summary rows=%s vol_cols=%s price_cols=%s volume_surge_nonzero=%s price_change_nonzero=%s history_missing_rows=%s failopen_rows=%s price_fallback_rows=%s head=%s",
+            "[TONOSAMA SURGE] feature summary rows=%s vol_cols=%s price_cols=%s volume_surge_nonzero=%s price_change_nonzero=%s history_missing_rows=%s failopen_rows=%s price_fallback_rows=%s failopen_reason=%s head=%s",
             len(out), vol_cols, price_cols,
             int((out["_max_volume_surge_ratio"].fillna(0) != 0).sum()),
             int((out["_max_price_change_pct"].fillna(0) != 0).sum()),
             int(history_missing_col.sum()),
             int(failopen_col.sum()),
             int(out.get("_price_change_fallback_1m", pd.Series(False, index=out.index)).fillna(False).astype(bool).sum()),
+            _failopen_reason(),
             out[[c for c in ["symbol", "symbolname", "close", "_max_volume_surge_ratio", "_max_price_change_pct", "_surge_tf", "_volume_surge_history_missing", "_volume_surge_failopen", "_price_change_fallback_1m"] if c in out.columns]].head(12).to_dict("records"),
         )
     except Exception:
