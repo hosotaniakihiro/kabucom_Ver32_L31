@@ -1,17 +1,21 @@
 # ============================================================
 # File   : core/startup/global_context_summary_repair_patch.py
-# Version: V1.1-MERGED-SUMMARY-TECH-REPAIR-RECENT-PUSH-ONLY
+# Version: V1.2-MERGED-SUMMARY-TECH-REPAIR-RECENT-PUSH-GET-SET
 # ------------------------------------------------------------
 # 目的:
 #   scheduler_jobs.summary.safe_io から GlobalContext.set_push_merged_summary()
 #   へ入る直前のDFで、macd/signal/mtf が 0 に戻るケースを防ぐ。
 #
+# V1.2:
+#   - set_merged_summary だけでなく get_merged_summary もラップ
+#   - source=push または source未指定fallbackで返る古い completed summary を除外
+#   - 13:22ログのように MERGED GET FALLBACK tf=3/5 source=push rows=4084/4093 で
+#     2026-05-26 / 2026-05-25 / 2026-05-19 の古い行が返る問題を防ぐ
+#   - 古い行だけなら空DFを返し、殿様/5MA/SUMMARY AIが前日・先週足を参照しない
+#
 # V1.1:
 #   - source=push の merged 保存前に、古い日付の行を除外
-#   - 12:38ログのように 5分PUSH merged に 2026-05-14 / 2026-05-26 の
-#     古いseed行が混ざる問題を防ぐ
 #   - 当日かつ直近N分のみを merged latest として扱う
-#   - 補完用history自体は使うが、merged latestには古い行を残さない
 #
 # ENV:
 #   GC_SUMMARY_REPAIR_FILTER_STALE_PUSH=1
@@ -32,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 _PATCHED = False
 _ORIGINAL_SET_MERGED = None
+_ORIGINAL_GET_MERGED = None
 
 _FILL_COLS = (
     "macd", "signal", "hist", "rsi",
@@ -136,6 +141,26 @@ def _filter_recent_push_rows(df: pd.DataFrame, *, tf: Any, source: str) -> pd.Da
     except Exception:
         logger.exception("[GC SUMMARY REPAIR] stale push filter failed tf=%s source=%s", tf, source)
         return df
+
+
+def _filter_get_result(df: pd.DataFrame, *, tf: Any, source: str | None) -> pd.DataFrame:
+    """get_merged_summaryの戻り値側ガード。push/fallbackの古い行を返さない。"""
+    out = _safe_df(df)
+    if out.empty:
+        return out
+    src = (source or "").strip().lower()
+    # source未指定時は fallback order が push優先なので、古いPUSH混入防止として同じガードを掛ける。
+    if src in {"", "push", "push-cache", "push-legacy-attr", "completed"}:
+        filtered = _filter_recent_push_rows(_normalize(out), tf=tf, source="push")
+        if filtered.empty and not out.empty:
+            logger.warning(
+                "[GC SUMMARY REPAIR] get stale push fallback suppressed tf=%s source=%s before=%s after=0",
+                tf,
+                source,
+                len(out),
+            )
+        return filtered
+    return out
 
 
 def _zero_like(v: Any) -> bool:
@@ -248,7 +273,7 @@ def _repair_df_from_history(gc, tf: Any, df: Any, source: str) -> pd.DataFrame:
 
 
 def install() -> bool:
-    global _PATCHED, _ORIGINAL_SET_MERGED
+    global _PATCHED, _ORIGINAL_SET_MERGED, _ORIGINAL_GET_MERGED
     if _PATCHED:
         return True
     if not _env_bool("GLOBAL_CONTEXT_SUMMARY_REPAIR_ENABLED", True):
@@ -257,15 +282,20 @@ def install() -> bool:
     try:
         from core.global_context.context import global_context as GC
 
-        orig = getattr(GC, "set_merged_summary", None)
-        if not callable(orig):
+        orig_set = getattr(GC, "set_merged_summary", None)
+        orig_get = getattr(GC, "get_merged_summary", None)
+        if not callable(orig_set):
             logger.warning("[GC SUMMARY REPAIR] set_merged_summary not callable")
             return False
-        if getattr(orig, "_gc_summary_repair_patch", False):
+        if not callable(orig_get):
+            logger.warning("[GC SUMMARY REPAIR] get_merged_summary not callable")
+            return False
+        if getattr(orig_set, "_gc_summary_repair_patch_v12", False):
             _PATCHED = True
             return True
 
-        _ORIGINAL_SET_MERGED = orig
+        _ORIGINAL_SET_MERGED = orig_set
+        _ORIGINAL_GET_MERGED = orig_get
 
         def _patched_set_merged_summary(self, tf: Any, df: Any, source: str = "push") -> None:
             src = (source or "push").strip().lower()
@@ -276,10 +306,20 @@ def install() -> bool:
                 fixed = df
             return _ORIGINAL_SET_MERGED(tf=tf, df=fixed, source=source)
 
-        _patched_set_merged_summary._gc_summary_repair_patch = True  # type: ignore[attr-defined]
+        def _patched_get_merged_summary(self, tf: Any, source: str | None = None) -> pd.DataFrame:
+            df = _ORIGINAL_GET_MERGED(tf=tf, source=source)
+            try:
+                return _filter_get_result(df, tf=tf, source=source)
+            except Exception:
+                logger.exception("[GC SUMMARY REPAIR] get filter failed tf=%s source=%s", tf, source)
+                return df
+
+        _patched_set_merged_summary._gc_summary_repair_patch_v12 = True  # type: ignore[attr-defined]
+        _patched_get_merged_summary._gc_summary_repair_get_patch_v12 = True  # type: ignore[attr-defined]
         GC.set_merged_summary = MethodType(_patched_set_merged_summary, GC)
+        GC.get_merged_summary = MethodType(_patched_get_merged_summary, GC)
         _PATCHED = True
-        logger.warning("[GC SUMMARY REPAIR] installed V1.1 set_merged_summary pre-store repair recent-push-only")
+        logger.warning("[GC SUMMARY REPAIR] installed V1.2 set/get merged_summary recent-push-only")
         return True
     except Exception:
         logger.exception("[GC SUMMARY REPAIR] install failed")
