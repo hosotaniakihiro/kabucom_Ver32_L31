@@ -1,16 +1,17 @@
 # ============================================================
 # File   : trading/entry/tonosama/volume_surge.py
-# Version: Ver2.2-TONOSAMA-SURGE-HISTORY-ALWAYS-FAILCLOSED
+# Version: Ver2.3-TONOSAMA-CONTROLLED-SURGE-FAILOPEN
 # ------------------------------------------------------------
 # 目的:
 #   殿様エントリー用の出来高急増・価格変化特徴量を作る。
 #
-# Ver2.2:
+# Ver2.3:
+#   - Ver2.2 の「履歴不足なら必ず候補0」を緩和。
 #   - TONOSAMA_FORCE_SURGE_FAILOPEN / TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY /
-#     TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING 等が環境変数に残っていても無視
-#   - 3m/5m の実測 volume_surge_ratio が作れない場合は必ず候補0にする
-#   - 12:52ログの「EARLY/FORCED fail-open rows=44 value=3.000」を発生させない
-#   - runner側の HISTORY GUARD に到達する前に、volume_surge.py側で fail-closed
+#     TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING のいずれかが有効なら、
+#     3m/5mの出来高履歴不足時も controlled fail-open で候補を作る。
+#   - fail-open値は TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE 既定3.0。
+#   - その後 runner.py 側の latest_volume / price_change / slope / 5秒足 / AI fallback で絞る。
 # ============================================================
 
 from __future__ import annotations
@@ -83,12 +84,7 @@ def _source_counts(df: pd.DataFrame, limit: int = 8) -> dict:
 def _latest_info(df: pd.DataFrame, *, now: dt.datetime | None = None) -> dict:
     try:
         if df is None or df.empty or "datetime" not in df.columns:
-            return {
-                "rows": len(df) if isinstance(df, pd.DataFrame) else 0,
-                "latest_dt": None,
-                "age_min": None,
-                "source_counts": _source_counts(df) if isinstance(df, pd.DataFrame) else {},
-            }
+            return {"rows": len(df) if isinstance(df, pd.DataFrame) else 0, "latest_dt": None, "age_min": None, "source_counts": _source_counts(df) if isinstance(df, pd.DataFrame) else {}}
         x = _normalize_datetime_col(df)
         if x.empty:
             return {"rows": len(df), "latest_dt": None, "age_min": None, "source_counts": _source_counts(df)}
@@ -96,13 +92,7 @@ def _latest_info(df: pd.DataFrame, *, now: dt.datetime | None = None) -> dict:
         latest = pd.to_datetime(x["datetime"], errors="coerce").max()
         oldest = pd.to_datetime(x["datetime"], errors="coerce").min()
         age_min = (pd.Timestamp(n) - latest).total_seconds() / 60.0 if pd.notna(latest) else None
-        return {
-            "rows": len(df),
-            "oldest_dt": str(oldest) if pd.notna(oldest) else None,
-            "latest_dt": str(latest) if pd.notna(latest) else None,
-            "age_min": round(float(age_min), 3) if age_min is not None else None,
-            "source_counts": _source_counts(x),
-        }
+        return {"rows": len(df), "oldest_dt": str(oldest) if pd.notna(oldest) else None, "latest_dt": str(latest) if pd.notna(latest) else None, "age_min": round(float(age_min), 3) if age_min is not None else None, "source_counts": _source_counts(x)}
     except Exception:
         return {"rows": len(df) if isinstance(df, pd.DataFrame) else 0, "latest_dt": None, "age_min": None, "source_counts": {}}
 
@@ -114,33 +104,20 @@ def _filter_recent_rows(df: pd.DataFrame, *, interval: int, label: str) -> pd.Da
         return df.copy()
     if "datetime" not in df.columns:
         return df.copy()
-
     x0 = _normalize_datetime_col(df)
     if x0.empty:
         return x0
-
     now = _now_naive()
     max_age_min = max(1.0, _env_float("TONOSAMA_RECENT_MAX_AGE_MIN", 30.0))
     cutoff = pd.Timestamp(now - dt.timedelta(minutes=max_age_min))
     today = pd.Timestamp(now.date())
-
     before = len(x0)
     info_before = _latest_info(x0, now=now)
     x = x0[(x0["datetime"] >= cutoff) & (x0["datetime"] >= today)].copy()
     info_after = _latest_info(x, now=now)
-
     logger.warning(
         "[TONOSAMA SURGE] recent filter label=%s interval=%s before=%s after=%s cutoff=%s today=%s latest_before=%s age_min=%s source_counts=%s latest_after=%s",
-        label,
-        interval,
-        before,
-        len(x),
-        cutoff,
-        today.date(),
-        info_before.get("latest_dt"),
-        info_before.get("age_min"),
-        info_before.get("source_counts"),
-        info_after.get("latest_dt"),
+        label, interval, before, len(x), cutoff, today.date(), info_before.get("latest_dt"), info_before.get("age_min"), info_before.get("source_counts"), info_after.get("latest_dt"),
     )
     return x
 
@@ -171,47 +148,30 @@ def add_volume_surge_features(df: pd.DataFrame, *, interval: int) -> pd.DataFram
     x = _filter_recent_rows(x, interval=interval, label="feature_source")
     if x.empty:
         return pd.DataFrame()
-
     interval = int(interval)
     x = x.sort_values(["symbol", "datetime"])
     g = x.groupby("symbol", group_keys=False)
-
     avg_col = f"prev{VOLUME_AVG_LOOKBACK_BARS}_volume_avg_{interval}m"
     ratio_col = f"volume_surge_ratio_{interval}m"
-
-    x[avg_col] = g["volume"].transform(
-        lambda s: s.shift(1).rolling(VOLUME_AVG_LOOKBACK_BARS, min_periods=2).mean()
-    )
+    x[avg_col] = g["volume"].transform(lambda s: s.shift(1).rolling(VOLUME_AVG_LOOKBACK_BARS, min_periods=2).mean())
     x[ratio_col] = x["volume"] / x[avg_col].replace(0, pd.NA)
     x[ratio_col] = pd.to_numeric(x[ratio_col], errors="coerce").replace([float("inf"), -float("inf")], pd.NA)
-
     prev_close_col = f"prev_close_{interval}m"
     price_chg_col = f"price_change_pct_{interval}m"
     x[prev_close_col] = g["close"].shift(1)
     x[price_chg_col] = ((x["close"] - x[prev_close_col]) / x[prev_close_col].replace(0, pd.NA) * 100.0)
     x[price_chg_col] = pd.to_numeric(x[price_chg_col], errors="coerce").replace([float("inf"), -float("inf")], pd.NA)
-
     if x[price_chg_col].isna().all():
         fallback_chg = _intrabar_price_change_pct(x, interval)
         if fallback_chg.notna().any():
             x[price_chg_col] = fallback_chg
-            logger.warning(
-                "[TONOSAMA SURGE] price_change fallback open_to_close interval=%sm rows=%s nonnull=%s",
-                interval,
-                len(x),
-                int(fallback_chg.notna().sum()),
-            )
-
+            logger.warning("[TONOSAMA SURGE] price_change fallback open_to_close interval=%sm rows=%s nonnull=%s", interval, len(x), int(fallback_chg.notna().sum()))
     latest = x.dropna(subset=["datetime"]).sort_values(["symbol", "datetime"]).groupby("symbol", group_keys=False).tail(1)
-
     keep_cols = ["symbol", "datetime", "close", "volume", avg_col, ratio_col, prev_close_col, price_chg_col]
     for c in keep_cols:
         if c not in latest.columns:
             latest[c] = pd.NA
-
-    latest = latest[keep_cols].copy().rename(
-        columns={"datetime": f"datetime_{interval}m", "close": f"close_{interval}m", "volume": f"volume_{interval}m"}
-    )
+    latest = latest[keep_cols].copy().rename(columns={"datetime": f"datetime_{interval}m", "close": f"close_{interval}m", "volume": f"volume_{interval}m"})
     return latest.reset_index(drop=True)
 
 
@@ -234,67 +194,55 @@ def _fallback_price_change_from_1m(out: pd.DataFrame) -> pd.Series:
 
 
 def _force_failopen_enabled() -> bool:
-    """Ver2.2: 殿様は履歴不足fail-openを完全禁止。旧/強制ENVも無視する。"""
-    return False
+    return _env_bool("TONOSAMA_FORCE_SURGE_FAILOPEN", False) or _env_bool("TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY", False) or _env_bool("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING", False) or _env_bool("TONOSAMA_ALLOW_EARLY_SURGE_FAILOPEN", False)
 
 
 def _failopen_reason() -> str:
-    legacy_allow = _env_bool("TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY", False)
-    legacy_failopen = _env_bool("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING", False)
     force_old = _env_bool("TONOSAMA_FORCE_SURGE_FAILOPEN", False)
     early_old = _env_bool("TONOSAMA_ALLOW_EARLY_SURGE_FAILOPEN", False)
-    if legacy_allow or legacy_failopen or force_old or early_old:
-        return f"disabled_ignored_env force={force_old} early={early_old} legacy_failopen={legacy_failopen} allow_without_history={legacy_allow}"
-    return "disabled"
+    legacy_failopen = _env_bool("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING", False)
+    legacy_allow = _env_bool("TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY", False)
+    if _force_failopen_enabled():
+        return f"controlled_failopen force={force_old} early={early_old} legacy_failopen={legacy_failopen} allow_without_history={legacy_allow}"
+    return f"disabled force={force_old} early={early_old} legacy_failopen={legacy_failopen} allow_without_history={legacy_allow}"
 
 
 def _apply_history_unavailable_policy(out: pd.DataFrame) -> pd.DataFrame:
     if out is None or out.empty:
         return pd.DataFrame()
-
     x = out.copy()
     ratio_cols = [c for c in ["volume_surge_ratio_3m", "volume_surge_ratio_5m"] if c in x.columns]
     price_cols = [c for c in ["price_change_pct_3m", "price_change_pct_5m"] if c in x.columns]
-
     for c in ratio_cols + price_cols:
         x[c] = pd.to_numeric(x[c], errors="coerce").replace([float("inf"), -float("inf")], pd.NA)
-
-    legacy_allow = _env_bool("TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY", False)
-    legacy_failopen = _env_bool("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING", False)
-    dangerous_old = _env_bool("TONOSAMA_ALLOW_DANGEROUS_SURGE_FAILOPEN", False)
-    force_old = _env_bool("TONOSAMA_FORCE_SURGE_FAILOPEN", False)
-    early_old = _env_bool("TONOSAMA_ALLOW_EARLY_SURGE_FAILOPEN", False)
-
     if ratio_cols:
-        ratio_df = x[ratio_cols]
-        ratio_missing_all = ratio_df.isna().all(axis=1)
+        ratio_missing_all = x[ratio_cols].isna().all(axis=1)
         if bool(ratio_missing_all.any()):
-            x.loc[ratio_missing_all, "_volume_surge_history_missing"] = True
-            x.loc[ratio_missing_all, "_volume_surge_failopen"] = False
-            for c in ratio_cols:
-                x.loc[ratio_missing_all, c] = 0.0
-            logger.warning(
-                "[TONOSAMA SURGE] volume_surge history missing -> fail-closed rows=%s ratio_cols=%s value=0.0 ignored_force=%s ignored_early=%s ignored_legacy_failopen=%s ignored_allow_without_history=%s ignored_dangerous_old=%s",
-                int(ratio_missing_all.sum()), ratio_cols, force_old, early_old, legacy_failopen, legacy_allow, dangerous_old,
-            )
-
+            if _force_failopen_enabled():
+                val = _env_float("TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE", 3.0)
+                x.loc[ratio_missing_all, "_volume_surge_history_missing"] = True
+                x.loc[ratio_missing_all, "_volume_surge_failopen"] = True
+                for c in ratio_cols:
+                    x.loc[ratio_missing_all, c] = val
+                logger.warning("[TONOSAMA SURGE] volume_surge history missing -> controlled fail-open rows=%s ratio_cols=%s value=%.3f reason=%s", int(ratio_missing_all.sum()), ratio_cols, val, _failopen_reason())
+            else:
+                x.loc[ratio_missing_all, "_volume_surge_history_missing"] = True
+                x.loc[ratio_missing_all, "_volume_surge_failopen"] = False
+                for c in ratio_cols:
+                    x.loc[ratio_missing_all, c] = 0.0
+                logger.warning("[TONOSAMA SURGE] volume_surge history missing -> fail-closed rows=%s ratio_cols=%s value=0.0 reason=%s", int(ratio_missing_all.sum()), ratio_cols, _failopen_reason())
     if price_cols:
-        price_df = x[price_cols]
-        price_missing_all = price_df.isna().all(axis=1)
+        price_missing_all = x[price_cols].isna().all(axis=1)
         if bool(price_missing_all.any()):
             fallback_1m = _fallback_price_change_from_1m(x)
             if fallback_1m.notna().any():
                 for c in price_cols:
                     x.loc[price_missing_all, c] = fallback_1m.loc[price_missing_all]
                 x.loc[price_missing_all, "_price_change_fallback_1m"] = True
-                logger.warning(
-                    "[TONOSAMA SURGE] price_change fallback from 1m open_to_close rows=%s price_cols=%s nonnull=%s",
-                    int(price_missing_all.sum()), price_cols, int(fallback_1m.notna().sum()),
-                )
+                logger.warning("[TONOSAMA SURGE] price_change fallback from 1m open_to_close rows=%s price_cols=%s nonnull=%s", int(price_missing_all.sum()), price_cols, int(fallback_1m.notna().sum()))
             else:
                 for c in price_cols:
                     x.loc[price_missing_all, c] = 0.0
-
     return x
 
 
@@ -311,95 +259,49 @@ def build_scalping_feature_df() -> pd.DataFrame:
     raw1_info = _latest_info(raw1)
     df1 = _filter_recent_rows(raw1, interval=1, label="base_1m")
     if df1.empty:
-        logger.warning(
-            "[TONOSAMA SURGE] base 1m recent empty -> skip TONOSAMA for safety raw_rows=%s latest_dt=%s age_min=%s max_age_min=%.1f source_counts=%s hint=%s",
-            len(raw1) if isinstance(raw1, pd.DataFrame) else 0,
-            raw1_info.get("latest_dt"),
-            raw1_info.get("age_min"),
-            _env_float("TONOSAMA_RECENT_MAX_AGE_MIN", 30.0),
-            raw1_info.get("source_counts"),
-            "summary_1m_is_stale_or_not_updating; check push summary / lunch-yahoo / main_database freshness",
-        )
+        logger.warning("[TONOSAMA SURGE] base 1m recent empty -> skip TONOSAMA for safety raw_rows=%s latest_dt=%s age_min=%s max_age_min=%.1f source_counts=%s hint=%s", len(raw1) if isinstance(raw1, pd.DataFrame) else 0, raw1_info.get("latest_dt"), raw1_info.get("age_min"), _env_float("TONOSAMA_RECENT_MAX_AGE_MIN", 30.0), raw1_info.get("source_counts"), "summary_1m_is_stale_or_not_updating; check push summary / lunch-yahoo / main_database freshness")
         return pd.DataFrame()
-
     df3 = add_volume_surge_features(load_merged_summary(3), interval=3)
     df5 = add_volume_surge_features(load_merged_summary(5), interval=5)
-
     missing_history = _all_surge_history_missing(df3, df5)
-    if missing_history:
-        logger.warning(
-            "[TONOSAMA SURGE] no usable 3m/5m volume surge history after recent filter -> return empty base_rows=%s df3=%s df5=%s failopen_reason=%s raw1_latest=%s raw1_age_min=%s",
-            len(df1),
-            len(df3) if isinstance(df3, pd.DataFrame) else 0,
-            len(df5) if isinstance(df5, pd.DataFrame) else 0,
-            _failopen_reason(),
-            raw1_info.get("latest_dt"),
-            raw1_info.get("age_min"),
-        )
+    if missing_history and not _force_failopen_enabled():
+        logger.warning("[TONOSAMA SURGE] no usable 3m/5m volume surge history after recent filter -> return empty base_rows=%s df3=%s df5=%s failopen_reason=%s raw1_latest=%s raw1_age_min=%s", len(df1), len(df3) if isinstance(df3, pd.DataFrame) else 0, len(df5) if isinstance(df5, pd.DataFrame) else 0, _failopen_reason(), raw1_info.get("latest_dt"), raw1_info.get("age_min"))
         return pd.DataFrame()
-
+    if missing_history and _force_failopen_enabled():
+        logger.warning("[TONOSAMA SURGE] no usable 3m/5m volume surge history -> continue controlled fail-open base_rows=%s df3=%s df5=%s reason=%s raw1_latest=%s raw1_age_min=%s", len(df1), len(df3) if isinstance(df3, pd.DataFrame) else 0, len(df5) if isinstance(df5, pd.DataFrame) else 0, _failopen_reason(), raw1_info.get("latest_dt"), raw1_info.get("age_min"))
     out = df1.dropna(subset=["datetime"]).sort_values(["symbol", "datetime"]).groupby("symbol", group_keys=False).tail(1).copy()
     if out.empty:
         return pd.DataFrame()
-
     if not df3.empty:
         out = out.merge(df3, on="symbol", how="left")
     if not df5.empty:
         out = out.merge(df5, on="symbol", how="left")
-
-    for c in [
-        "volume_surge_ratio_3m", "volume_surge_ratio_5m",
-        "price_change_pct_3m", "price_change_pct_5m",
-        "prev5_volume_avg_3m", "prev5_volume_avg_5m",
-        "volume_3m", "volume_5m",
-    ]:
+    for c in ["volume_surge_ratio_3m", "volume_surge_ratio_5m", "price_change_pct_3m", "price_change_pct_5m", "prev5_volume_avg_3m", "prev5_volume_avg_5m", "volume_3m", "volume_5m"]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
-
     out = _apply_history_unavailable_policy(out)
     if out.empty:
         return pd.DataFrame()
-
     vol_cols = [c for c in ["volume_surge_ratio_3m", "volume_surge_ratio_5m"] if c in out.columns]
     price_cols = [c for c in ["price_change_pct_3m", "price_change_pct_5m"] if c in out.columns]
-
     out["_max_volume_surge_ratio"] = out[vol_cols].max(axis=1, skipna=True) if vol_cols else 0.0
     out["_max_price_change_pct"] = out[price_cols].max(axis=1, skipna=True) if price_cols else 0.0
     out["_max_volume_surge_ratio"] = pd.to_numeric(out["_max_volume_surge_ratio"], errors="coerce").fillna(0.0)
     out["_max_price_change_pct"] = pd.to_numeric(out["_max_price_change_pct"], errors="coerce").fillna(0.0)
-
-    history_missing = out.get("_volume_surge_history_missing", pd.Series(False, index=out.index)).fillna(False).astype(bool)
-    failopen_col = out.get("_volume_surge_failopen", pd.Series(False, index=out.index)).fillna(False).astype(bool)
-    if bool(history_missing.any()) or bool(failopen_col.any()):
-        logger.warning(
-            "[TONOSAMA SURGE] history_missing/failopen rows present after policy -> return empty rows=%s missing_rows=%s failopen_rows=%s failopen_reason=%s raw1_latest=%s raw1_age_min=%s",
-            len(out), int(history_missing.sum()), int(failopen_col.sum()), _failopen_reason(), raw1_info.get("latest_dt"), raw1_info.get("age_min"),
-        )
-        return pd.DataFrame()
-
     out["_surge_tf"] = ""
     if "volume_surge_ratio_3m" in out.columns and "volume_surge_ratio_5m" in out.columns:
-        out["_surge_tf"] = out.apply(
-            lambda r: "3m" if safe_float(r.get("volume_surge_ratio_3m"), 0) >= safe_float(r.get("volume_surge_ratio_5m"), 0) else "5m",
-            axis=1,
-        )
+        out["_surge_tf"] = out.apply(lambda r: "3m" if safe_float(r.get("volume_surge_ratio_3m"), 0) >= safe_float(r.get("volume_surge_ratio_5m"), 0) else "5m", axis=1)
     elif "volume_surge_ratio_3m" in out.columns:
         out["_surge_tf"] = "3m"
     elif "volume_surge_ratio_5m" in out.columns:
         out["_surge_tf"] = "5m"
-
     try:
-        logger.warning(
-            "[TONOSAMA SURGE] feature summary rows=%s vol_cols=%s price_cols=%s volume_surge_nonzero=%s price_change_nonzero=%s history_missing_rows=0 failopen_rows=0 price_fallback_rows=%s failopen_reason=%s raw1_latest=%s head=%s",
-            len(out), vol_cols, price_cols,
-            int((out["_max_volume_surge_ratio"].fillna(0) != 0).sum()),
-            int((out["_max_price_change_pct"].fillna(0) != 0).sum()),
-            int(out.get("_price_change_fallback_1m", pd.Series(False, index=out.index)).fillna(False).astype(bool).sum()),
-            _failopen_reason(),
-            raw1_info.get("latest_dt"),
-            out[[c for c in ["symbol", "symbolname", "close", "_max_volume_surge_ratio", "_max_price_change_pct", "_surge_tf", "_volume_surge_history_missing", "_volume_surge_failopen", "_price_change_fallback_1m"] if c in out.columns]].head(12).to_dict("records"),
-        )
+        history_missing = out.get("_volume_surge_history_missing", pd.Series(False, index=out.index)).fillna(False).astype(bool)
+        failopen_col = out.get("_volume_surge_failopen", pd.Series(False, index=out.index)).fillna(False).astype(bool)
+        logger.warning("[TONOSAMA SURGE] feature summary rows=%s vol_cols=%s price_cols=%s volume_surge_nonzero=%s price_change_nonzero=%s history_missing_rows=%s failopen_rows=%s price_fallback_rows=%s failopen_reason=%s raw1_latest=%s head=%s", len(out), vol_cols, price_cols, int((out["_max_volume_surge_ratio"].fillna(0) != 0).sum()), int((out["_max_price_change_pct"].fillna(0) != 0).sum()), int(history_missing.sum()), int(failopen_col.sum()), int(out.get("_price_change_fallback_1m", pd.Series(False, index=out.index)).fillna(False).astype(bool).sum()), _failopen_reason(), raw1_info.get("latest_dt"), out[[c for c in ["symbol", "symbolname", "close", "_max_volume_surge_ratio", "_max_price_change_pct", "_surge_tf", "_volume_surge_history_missing", "_volume_surge_failopen", "_price_change_fallback_1m"] if c in out.columns]].head(12).to_dict("records"))
     except Exception:
         logger.debug("[TONOSAMA SURGE] feature summary log failed", exc_info=True)
-
     return out.reset_index(drop=True)
+
+
+__all__ = ["build_scalping_feature_df", "add_volume_surge_features"]
