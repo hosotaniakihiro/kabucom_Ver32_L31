@@ -1,14 +1,14 @@
 # ============================================================
 # File   : core/startup/discord_summary_kwarg_safety_patch.py
-# Version: V2.4-DISPLAY-KWARG-SAFETY-COMPACT-ORIGINAL-FIELDS-JA-REASONS
+# Version: V2.5-DISPLAY-KWARG-SAFETY-3LINES-ALPHA-LABELS-JA-REASON
 # ------------------------------------------------------------
 # 目的:
 #   1) display系関数へ interval=1 等の未知kwargsが渡っても壊れないようにする。
-#   2) Discord SUMMARY TOP10 の表示項目を元のコンパクト表示へ戻す。
-#      - 株価 / score / buy / sell / slope / mtf / rsi / macd / 理由 のみ。
-#      - 出来高、売買代金、rank、tick、短期価格変化、出来高急増、VWAP等は表示しない。
-#   3) 理由の内容だけ日本語で詳細化する。
-#   4) 古い「結果時刻」のSUMMARYをDiscordへ送らない。
+#   2) Discord SUMMARY TOP10 を 1銘柄3行固定にする。
+#      - 1行目: 銘柄 + P/S/B/SL
+#      - 2行目: SLP/MTF/RSI/MACD
+#      - 3行目: REASON=日本語理由
+#   3) 古い「結果時刻」のSUMMARYをDiscordへ送らない。
 # ============================================================
 
 from __future__ import annotations
@@ -26,10 +26,6 @@ logger = logging.getLogger(__name__)
 _PATCHED = False
 _ORIGINALS: dict[str, Callable] = {}
 
-
-# ============================================================
-# kwargs safety
-# ============================================================
 
 def _is_df_like(v: Any) -> bool:
     try:
@@ -108,10 +104,6 @@ def _wrap(fn: Callable) -> Callable:
     return _wrapped
 
 
-# ============================================================
-# formatting helpers
-# ============================================================
-
 def _clean(v: Any, *, max_len: int = 24) -> str:
     try:
         s = str(v if v is not None else "").replace("\r", " ").replace("\n", " ").strip()
@@ -172,10 +164,6 @@ def _fmt_price(v: Any) -> str:
         return f"{x:.1f}"
     return f"{x:.2f}"
 
-
-# ============================================================
-# stale guard
-# ============================================================
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -251,7 +239,7 @@ def _should_skip_stale_discord(lines: list[str], title: str | None) -> tuple[boo
 def _install_stale_send_guard(disp: Any) -> int:
     try:
         old = getattr(disp, "_send_to_discord", None)
-        if not callable(old) or getattr(old, "_summary_discord_stale_guard_v24", False):
+        if not callable(old) or getattr(old, "_summary_discord_stale_guard_v25", False):
             return 0
 
         def _send_guarded(lines: list[str], title: str | None = None) -> None:
@@ -262,7 +250,7 @@ def _install_stale_send_guard(disp: Any) -> int:
             logger.info("[DISCORD SUMMARY STALE GUARD] allow summary discord %s", reason)
             return old(lines, title=title)
 
-        _send_guarded._summary_discord_stale_guard_v24 = True  # type: ignore[attr-defined]
+        _send_guarded._summary_discord_stale_guard_v25 = True  # type: ignore[attr-defined]
         _send_guarded._original = old  # type: ignore[attr-defined]
         disp._send_to_discord = _send_guarded
         return 1
@@ -270,10 +258,6 @@ def _install_stale_send_guard(disp: Any) -> int:
         logger.exception("[DISCORD SUMMARY STALE GUARD] install failed")
         return 0
 
-
-# ============================================================
-# Japanese reason / compact original fields
-# ============================================================
 
 def _reason_ja(row: Any, side: str) -> str:
     side_u = str(side or "").upper()
@@ -333,9 +317,9 @@ def _compact_candidate_line(i: int, row: Any, *, side: str) -> str:
 
     mark = "🟦" if str(side).upper() == "BUY" else "🟥"
     return (
-        f"{mark} {i}. {symbol} {name} 株価={_fmt_price(close)} score={_fmt_metric(score)} buy={_fmt_metric(buy)} sell={_fmt_metric(sell)} "
-        f"slope={_fmt_metric(slope, 4)} mtf={_fmt_metric(mtf)} rsi={_fmt_metric(rsi)} macd={_fmt_metric(macd)}\n"
-        f"   理由={reason}"
+        f"{mark} {i}. {symbol} {name} P={_fmt_price(close)} S={_fmt_metric(score)} B={_fmt_metric(buy)} SL={_fmt_metric(sell)}\n"
+        f"   SLP={_fmt_metric(slope, 4)} MTF={_fmt_metric(mtf)} RSI={_fmt_metric(rsi)} MACD={_fmt_metric(macd)}\n"
+        f"   REASON={reason}"
     )
 
 
@@ -346,7 +330,7 @@ def _install_compact_discord_builder(disp: Any) -> int:
         if callable(old):
             def _candidate(i: int, row: Any, *, side: str) -> str:
                 return _compact_candidate_line(i, row, side=side)
-            _candidate._discord_compact_original_fields_ja_reasons_v24 = True  # type: ignore[attr-defined]
+            _candidate._discord_3lines_alpha_labels_ja_reason_v25 = True  # type: ignore[attr-defined]
             _candidate._original = old  # type: ignore[attr-defined]
             disp._build_discord_candidate_2lines = _candidate
             patched += 1
@@ -354,7 +338,7 @@ def _install_compact_discord_builder(disp: Any) -> int:
         old_reason = getattr(disp, "_reason_text_for_discord", None)
         def _reason(row: Any, side: str) -> str:
             return _reason_ja(row, side)
-        _reason._discord_compact_original_fields_ja_reasons_v24 = True  # type: ignore[attr-defined]
+        _reason._discord_3lines_alpha_labels_ja_reason_v25 = True  # type: ignore[attr-defined]
         _reason._original = old_reason  # type: ignore[attr-defined]
         disp._reason_text_for_discord = _reason
         patched += 1
@@ -362,10 +346,6 @@ def _install_compact_discord_builder(disp: Any) -> int:
         logger.exception("[DISCORD KWARG SAFETY] compact discord builder install failed")
     return patched
 
-
-# ============================================================
-# install
-# ============================================================
 
 def install() -> bool:
     global _PATCHED
@@ -394,7 +374,7 @@ def install() -> bool:
         stale_patched = _install_stale_send_guard(disp)
         _PATCHED = True
         logger.warning(
-            "[DISCORD KWARG SAFETY] installed V2.4 patched=%s compact_original_fields=%s stale_guard=%s",
+            "[DISCORD KWARG SAFETY] installed V2.5 patched=%s three_lines_alpha_labels=%s stale_guard=%s",
             patched,
             compact_patched,
             stale_patched,
