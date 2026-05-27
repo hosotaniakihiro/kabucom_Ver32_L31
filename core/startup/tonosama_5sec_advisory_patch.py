@@ -1,183 +1,146 @@
 # ============================================================
 # File   : core/startup/tonosama_5sec_advisory_patch.py
-# Version: V1.0-TONOSAMA-5SEC-ADVISORY-NOT-MANDATORY
+# Version: V2.0-TONOSAMA-ADVISORY-NO-OVERRIDE-CLIMAX-SAFE
 # ------------------------------------------------------------
 # 【目的】
-#   TONOSAMA ENTRY で一次/最終フィルタを通過した候補が、5秒足の
-#   price_change_5s_pct=0.0 だけで全落ちする問題を緩和する。
+#   旧V1.0は trading.entry.tonosama.runner.iter_tonosama_candidate_rows を
+#   runtime patch で上書きしていた。
 #
-# 【背景】
-#   ユーザー方針: 「5秒足必須にはしたくない」
-#   現行 runner.py Ver1.5 は has_5sec_bar=True の場合、
-#     chg_5s > 0.0 and chg_5s >= MIN_5SEC_PRICE_CHANGE_PCT
-#   を要求するため、0.0% 横ばいでも候補を捨てる。
+# 【問題】
+#   runner.py 側に BUY/SELL クライマックスガードを追加しても、
+#   このpatchが古い候補生成ロジックで上書きするため、
+#   upper_wick=90%超 / close_pos=3〜10% のBUY候補が残っていた。
 #
-# 【方針】
-#   - trading.entry.tonosama.runner.iter_tonosama_candidate_rows をruntime patch
-#   - 一次/最終フィルタは従来どおり維持
-#   - 5秒足は「急落NG」だけを見る補助フィルタへ変更
-#   - price_change_5s_pct=0.0 は、上位足の価格変化/出来高/値幅/slopeが通っていれば残す
-#   - MAX_5SEC_DROP_PCT 以下の急落は従来どおり除外
+# 【V2.0方針】
+#   - iter_tonosama_candidate_rows は上書きしない
+#   - runner.py 本体の最新ロジックを尊重する
+#   - 念のため _apply_climax_guards だけ安全版に差し替える
+#   - 5秒足任意化は runner.py 本体の _apply_5sec_filter に任せる
 #
-# 【ENV】
-#   TONOSAMA_5SEC_ADVISORY_ENABLED=1
-#   TONOSAMA_5SEC_ALLOW_ZERO_IF_PRIMARY_PASS=1
+# 【期待ログ】
+#   [TONOSAMA 5SEC ADVISORY PATCH] installed v2 no_override=True climax_safe=True
+#   [TONOSAMA FILTER DROP] ... reason=buying_climax_or_upper_wick_reversal_guard
 # ============================================================
 
 from __future__ import annotations
 
 import logging
-import os
-import time
 from typing import Any
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 _PATCHED = False
-_ORIGINAL_ITER = None
 
 
-def _env_bool(name: str, default: bool = True) -> bool:
-    try:
-        v = os.getenv(name)
-        if v is None or str(v).strip() == "":
-            return bool(default)
-        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
-    except Exception:
-        return bool(default)
+def _safe_climax_guards(r: Any, x: pd.DataFrame, *, stage: str, sample_cols: list[str]) -> pd.DataFrame:
+    """
+    runner.py の BUY/SELL クライマックスガード安全版。
 
+    BUY:
+      - 上ヒゲが大きく、終値が安値圏なら、上昇率が小さくても除外
+      - 高値圏張り付き + 出来高急増も除外
 
-def _patched_iter_tonosama_candidate_rows() -> pd.DataFrame:
-    import trading.entry.tonosama.runner as r
-
-    if not _env_bool("TONOSAMA_5SEC_ADVISORY_ENABLED", True):
-        return _ORIGINAL_ITER() if callable(_ORIGINAL_ITER) else pd.DataFrame()
-
-    started = time.perf_counter()
-    x = r.build_feature_df_with_5sec()
+    SELL:
+      - 下ヒゲが大きく、終値が高値圏なら、下落率が小さくても除外
+      - 安値圏張り付き + 出来高急増も除外
+    """
     if x is None or x.empty:
         return pd.DataFrame()
 
-    x = r._ensure_actual_movement_cols(x)
-    sample_cols = [
-        "symbol", "symbolname", "close", "_latest_volume", "_body_change_pct",
-        "_intrabar_range_pct", "_max_volume_surge_ratio", "_max_price_change_pct",
-        "_slope", "_tonosama_score", "has_5sec_bar", "price_change_5s_pct",
-        "volume_surge_ratio_5s",
-    ]
+    buy_rejected_close_pos = float(getattr(r, "BUY_REJECTED_CLOSE_POSITION_PCT", 35.0))
+    sell_rejected_close_pos = float(getattr(r, "SELL_REJECTED_CLOSE_POSITION_PCT", 65.0))
+
+    surge = r._num_series(x, "_max_volume_surge_ratio")
+    price_chg = r._num_series(x, "_max_price_change_pct")
+    signed_body = r._num_series(x, "_signed_body_change_pct")
+    close_pos = r._num_series(x, "_close_position_pct", 50.0)
+    upper_wick = r._num_series(x, "_upper_wick_pct")
+    slope = r._num_series(x, "_slope")
+
+    buy_like = (price_chg > 0) | (signed_body > 0) | (slope > 0)
+    buy_too_late = buy_like & (price_chg >= r.MAX_BUY_PRICE_CHANGE_PCT)
+    buy_high_zone = buy_like & (close_pos >= r.MAX_BUY_CLOSE_POSITION_PCT) & (price_chg >= r.BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT)
+    buy_upper_wick_reversal = buy_like & (upper_wick >= r.MAX_BUY_UPPER_WICK_PCT) & (close_pos <= buy_rejected_close_pos)
+    buying_climax = buy_like & (surge >= r.BUYING_CLIMAX_MIN_SURGE_RATIO) & (
+        ((price_chg >= r.BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT) & (close_pos >= r.MAX_BUY_CLOSE_POSITION_PCT))
+        | ((upper_wick >= r.MAX_BUY_UPPER_WICK_PCT) & (close_pos <= buy_rejected_close_pos))
+    )
 
     before = x.copy()
-    x = x[r._num_series(x, "close") > r.MIN_PRICE]
-    r._log_filter_step(stage="final", before=before, after=x, reason="close_below_min_price", threshold={"MIN_PRICE": r.MIN_PRICE}, sample_cols=sample_cols)
-
-    before = x.copy()
-    x = x[r._num_series(x, "_latest_volume") >= r.MIN_LATEST_VOLUME]
-    r._log_filter_step(stage="final", before=before, after=x, reason="latest_volume_low_flat_alert_guard", threshold={"MIN_LATEST_VOLUME": r.MIN_LATEST_VOLUME}, sample_cols=sample_cols)
-
-    before = x.copy()
-    x = x[r._num_series(x, "_body_change_pct") >= r.MIN_BODY_CHANGE_PCT]
-    r._log_filter_step(stage="final", before=before, after=x, reason="body_change_low_flat_alert_guard", threshold={"MIN_BODY_CHANGE_PCT": r.MIN_BODY_CHANGE_PCT}, sample_cols=sample_cols)
-
-    before = x.copy()
-    x = x[r._num_series(x, "_intrabar_range_pct") >= r.MIN_INTRABAR_RANGE_PCT]
-    r._log_filter_step(stage="final", before=before, after=x, reason="intrabar_range_low_flat_alert_guard", threshold={"MIN_INTRABAR_RANGE_PCT": r.MIN_INTRABAR_RANGE_PCT}, sample_cols=sample_cols)
-
-    before = x.copy()
-    x = x[r._num_series(x, "_max_volume_surge_ratio") >= r.MIN_VOLUME_SURGE_RATIO]
-    r._log_filter_step(stage="final", before=before, after=x, reason="volume_surge_low", threshold={"MIN_VOLUME_SURGE_RATIO": r.MIN_VOLUME_SURGE_RATIO}, sample_cols=sample_cols)
-
-    before = x.copy()
-    x = x[r._num_series(x, "_max_price_change_pct") >= r.MIN_PRICE_CHANGE_PCT]
-    r._log_filter_step(stage="final", before=before, after=x, reason="price_change_low", threshold={"MIN_PRICE_CHANGE_PCT": r.MIN_PRICE_CHANGE_PCT}, sample_cols=sample_cols)
-
-    before = x.copy()
-    x = x[r._num_series(x, "_slope") >= r.MIN_SLOPE]
-    r._log_filter_step(stage="final", before=before, after=x, reason="slope_too_small", threshold={"MIN_SLOPE": r.MIN_SLOPE}, sample_cols=sample_cols)
-
-    if r.USE_5SEC_CONFIRM and "has_5sec_bar" in x.columns:
-        if r.REQUIRE_5SEC_BAR:
-            before = x.copy()
-            x = x[r._bool_series(x, "has_5sec_bar")]
-            r._log_filter_step(stage="5sec", before=before, after=x, reason="missing_5sec_bar", threshold={"REQUIRE_5SEC_BAR": r.REQUIRE_5SEC_BAR}, sample_cols=sample_cols)
-
-        before = x.copy()
-        has_bar = r._bool_series(x, "has_5sec_bar")
-        chg_5s = r._num_series(x, "price_change_5s_pct")
-
-        # Advisory mode:
-        # - 5秒足が無い場合は通す
-        # - 5秒足が0.0%の場合も、一次/最終フィルタ通過済みなら通す
-        # - ただし MAX_5SEC_DROP_PCT 以下の急落は止める
-        if _env_bool("TONOSAMA_5SEC_ALLOW_ZERO_IF_PRIMARY_PASS", True):
-            mask = (~has_bar) | (chg_5s >= r.MAX_5SEC_DROP_PCT)
-            reason = "five_sec_advisory_drop_only"
-            threshold = {
-                "MIN_5SEC_PRICE_CHANGE_PCT": r.MIN_5SEC_PRICE_CHANGE_PCT,
-                "REQUIRE_POSITIVE_5SEC_CHANGE": False,
-                "ALLOW_ZERO_IF_PRIMARY_PASS": True,
-                "MAX_5SEC_DROP_PCT": r.MAX_5SEC_DROP_PCT,
-                "REQUIRE_5SEC_BAR": r.REQUIRE_5SEC_BAR,
-            }
-        else:
-            mask = (~has_bar) | ((chg_5s >= r.MIN_5SEC_PRICE_CHANGE_PCT) & (chg_5s > r.MAX_5SEC_DROP_PCT))
-            reason = "five_sec_advisory_min_change"
-            threshold = {
-                "MIN_5SEC_PRICE_CHANGE_PCT": r.MIN_5SEC_PRICE_CHANGE_PCT,
-                "REQUIRE_POSITIVE_5SEC_CHANGE": False,
-                "ALLOW_ZERO_IF_PRIMARY_PASS": False,
-                "MAX_5SEC_DROP_PCT": r.MAX_5SEC_DROP_PCT,
-                "REQUIRE_5SEC_BAR": r.REQUIRE_5SEC_BAR,
-            }
-
-        x = x[mask]
-        r._log_filter_step(stage="5sec", before=before, after=x, reason=reason, threshold=threshold, sample_cols=sample_cols)
-    elif r.USE_5SEC_CONFIRM:
-        logger.warning("[TONOSAMA 5SEC ADVISORY PATCH] has_5sec_bar column missing cols=%s", list(x.columns))
-
-    before = x.copy()
-    x = x[r._num_series(x, "_tonosama_score") >= r.MIN_RAW_SCORE]
-    r._log_filter_step(stage="score", before=before, after=x, reason="raw_score_low", threshold={"MIN_RAW_SCORE": r.MIN_RAW_SCORE}, sample_cols=sample_cols)
+    x = x[~(buy_too_late | buy_high_zone | buy_upper_wick_reversal | buying_climax)]
+    r._log_filter_step(
+        stage=stage,
+        before=before,
+        after=x,
+        reason="buying_climax_or_upper_wick_reversal_guard",
+        threshold={
+            "MAX_BUY_PRICE_CHANGE_PCT": r.MAX_BUY_PRICE_CHANGE_PCT,
+            "MAX_BUY_CLOSE_POSITION_PCT": r.MAX_BUY_CLOSE_POSITION_PCT,
+            "MAX_BUY_UPPER_WICK_PCT": r.MAX_BUY_UPPER_WICK_PCT,
+            "BUY_REJECTED_CLOSE_POSITION_PCT": buy_rejected_close_pos,
+            "BUYING_CLIMAX_MIN_SURGE_RATIO": r.BUYING_CLIMAX_MIN_SURGE_RATIO,
+            "BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT": r.BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT,
+        },
+        sample_cols=sample_cols,
+    )
 
     if x.empty:
-        logger.info(
-            "[TONOSAMA ENTRY] no scalping candidates after advisory 5sec filters diag=%s elapsed=%.3fs",
-            getattr(r, "_LAST_FILTER_DIAG", {}),
-            time.perf_counter() - started,
-        )
-        return pd.DataFrame()
+        return x
 
-    out = x.sort_values("_tonosama_score", ascending=False).head(r.MAX_CANDIDATES).reset_index(drop=True)
-    logger.warning(
-        "[TONOSAMA 5SEC ADVISORY PATCH] candidates ready rows=%s head=%s elapsed=%.3fs",
-        len(out),
-        r._sample_rows(out, sample_cols, limit=12),
-        time.perf_counter() - started,
+    surge = r._num_series(x, "_max_volume_surge_ratio")
+    price_chg = r._num_series(x, "_max_price_change_pct")
+    signed_body = r._num_series(x, "_signed_body_change_pct")
+    close_pos = r._num_series(x, "_close_position_pct", 50.0)
+    lower_wick = r._num_series(x, "_lower_wick_pct")
+    slope = r._num_series(x, "_slope")
+
+    drop_abs = price_chg.abs()
+    sell_like = (price_chg < 0) | (signed_body < 0) | (slope < 0)
+    sell_too_late = sell_like & (drop_abs >= r.MAX_SELL_PRICE_DROP_PCT)
+    sell_low_zone = sell_like & (close_pos <= r.MIN_SELL_CLOSE_POSITION_PCT) & (drop_abs >= r.SELLING_CLIMAX_MIN_PRICE_DROP_PCT)
+    sell_lower_wick_reversal = sell_like & (lower_wick >= r.MAX_SELL_LOWER_WICK_PCT) & (close_pos >= sell_rejected_close_pos)
+    selling_climax = sell_like & (surge >= r.SELLING_CLIMAX_MIN_SURGE_RATIO) & (
+        ((drop_abs >= r.SELLING_CLIMAX_MIN_PRICE_DROP_PCT) & (close_pos <= r.MIN_SELL_CLOSE_POSITION_PCT))
+        | ((lower_wick >= r.MAX_SELL_LOWER_WICK_PCT) & (close_pos >= sell_rejected_close_pos))
     )
-    return out
+
+    before = x.copy()
+    x = x[~(sell_too_late | sell_low_zone | sell_lower_wick_reversal | selling_climax)]
+    r._log_filter_step(
+        stage=stage,
+        before=before,
+        after=x,
+        reason="selling_climax_or_lower_wick_reversal_guard",
+        threshold={
+            "MAX_SELL_PRICE_DROP_PCT": r.MAX_SELL_PRICE_DROP_PCT,
+            "MIN_SELL_CLOSE_POSITION_PCT": r.MIN_SELL_CLOSE_POSITION_PCT,
+            "MAX_SELL_LOWER_WICK_PCT": r.MAX_SELL_LOWER_WICK_PCT,
+            "SELL_REJECTED_CLOSE_POSITION_PCT": sell_rejected_close_pos,
+            "SELLING_CLIMAX_MIN_SURGE_RATIO": r.SELLING_CLIMAX_MIN_SURGE_RATIO,
+            "SELLING_CLIMAX_MIN_PRICE_DROP_PCT": r.SELLING_CLIMAX_MIN_PRICE_DROP_PCT,
+        },
+        sample_cols=sample_cols,
+    )
+    return x
 
 
 def install() -> bool:
-    global _PATCHED, _ORIGINAL_ITER
+    global _PATCHED
     if _PATCHED:
         return True
     try:
         import trading.entry.tonosama.runner as r
 
-        cur = getattr(r, "iter_tonosama_candidate_rows", None)
-        if not callable(cur):
-            logger.warning("[TONOSAMA 5SEC ADVISORY PATCH] target iter not callable")
-            return False
-        if getattr(cur, "_tonosama_5sec_advisory_patch", False):
-            _PATCHED = True
-            return True
+        def _patched_apply_climax_guards(x: pd.DataFrame, *, stage: str, sample_cols: list[str]) -> pd.DataFrame:
+            return _safe_climax_guards(r, x, stage=stage, sample_cols=sample_cols)
 
-        _ORIGINAL_ITER = cur
-        _patched_iter_tonosama_candidate_rows._tonosama_5sec_advisory_patch = True  # type: ignore[attr-defined]
-        _patched_iter_tonosama_candidate_rows._original = cur  # type: ignore[attr-defined]
-        r.iter_tonosama_candidate_rows = _patched_iter_tonosama_candidate_rows
+        _patched_apply_climax_guards._tonosama_climax_safe_v2 = True  # type: ignore[attr-defined]
+        r._apply_climax_guards = _patched_apply_climax_guards
+
+        # 重要: iter_tonosama_candidate_rows は上書きしない。
         _PATCHED = True
-        logger.warning("[TONOSAMA 5SEC ADVISORY PATCH] installed allow_zero=%s", _env_bool("TONOSAMA_5SEC_ALLOW_ZERO_IF_PRIMARY_PASS", True))
+        logger.warning("[TONOSAMA 5SEC ADVISORY PATCH] installed v2 no_override=True climax_safe=True")
         return True
     except Exception:
         logger.exception("[TONOSAMA 5SEC ADVISORY PATCH] install failed")
