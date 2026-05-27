@@ -1,24 +1,20 @@
 # ============================================================
 # File   : trading/entry_exit/tasks.py
-# Version: Ver1.8-RANKING-ENTRY-PREFILTER-TIMEOUT-45SEC
+# Version: Ver1.9-RANKING-ENTRY-TIMEOUT-60SEC
 # ------------------------------------------------------------
 # 【目的】
 #   core.entry_exit_tasks shim から解決される実体モジュール。
 #
-# Ver1.8 Fix:
+# Ver1.9 Fix:
+#   - 実測で ranking_entry が53秒で完了したのに、scheduler timeout=45秒で
+#     先にtimeout扱いになっていた問題を修正
+#   - RANKING_ENTRY_BUILD_TIMEOUT_SEC 既定を45秒→60秒へ延長
+#   - config側で REQUIRE_PREVIOUS_SNAPSHOT=False にしたため、
+#     NO_PREVIOUS_RANKING_SNAPSHOT 大量DROPも緩和
+#
+# Ver1.8:
 #   - entry_from_ranking.py 側で軽量prefilterを追加したため、
 #     ranking build timeoutの既定を20秒→45秒へ延長
-#   - 20秒timeoutで候補抽出途中に切られ、entry_controllerへ渡らない問題を緩和
-#
-# Ver1.7 Fix:
-#   - RANKING ENTRY BUILD が20秒timeoutした後も、実体スレッドはdaemonで残る。
-#   - timeout後は一定時間クールダウンし、その間はranking_entryを即skipする。
-#   - 既定では ranking_entry を2分間隔に変更し、重いDB読みを抑える。
-#
-# Ver1.6 Fix:
-#   - pending_manager は global_data.pending_entries を使っているため、
-#     tasks.py 側の _pending_count_for_source が常に0になりやすかった問題を修正
-#   - TONOSAMA実行が16秒前後かかるため、既定周期を15秒→30秒へ変更
 # ============================================================
 
 from __future__ import annotations
@@ -46,7 +42,7 @@ _RANKING_ENTRY_LOCK = threading.RLock()
 
 TONOSAMA_ENTRY_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_TIMEOUT_SEC", "45"))
 TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC", "20"))
-RANKING_ENTRY_BUILD_TIMEOUT_SEC = float(os.getenv("RANKING_ENTRY_BUILD_TIMEOUT_SEC", "45"))
+RANKING_ENTRY_BUILD_TIMEOUT_SEC = float(os.getenv("RANKING_ENTRY_BUILD_TIMEOUT_SEC", "60"))
 RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC = float(os.getenv("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", "20"))
 RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC = float(os.getenv("RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC", "90"))
 RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC = float(os.getenv("RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC", "300"))
