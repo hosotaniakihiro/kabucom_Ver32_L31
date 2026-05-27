@@ -1,35 +1,24 @@
 # ============================================================
 # File   : trading/entry/tonosama/config.py
-# Version: Ver2.5-TONOSAMA-NO-ZERO-MOVEMENT-FLOORS
+# Version: Ver2.6-TONOSAMA-BALANCED-CANDIDATE-RECOVERY
 # ------------------------------------------------------------
 # 方針:
-#   - 起動直後やPUSH再接続直後は、3m/5mの行は存在しても、
-#     prev5_volume_avg がまだ作れず volume_surge_ratio が全NaNになりやすい。
-#   - Ver1.9 の volume_surge.py は TONOSAMA_FORCE_SURGE_FAILOPEN=1 が無いと
-#     この状態で base feature empty にする。
-#   - 09:21ログでは base_rows=44 / df3=44 / df5=44 があるのに
-#     force_failopen=False で全落ちしていたため、既定で fail-open を戻す。
-#   - 完全に止まっている銘柄は runner.py 側の latest_volume / price_change / slope / 5s で落とす。
+#   - volume_surge.py / history guard で履歴不足fail-openを許可した後、
+#     runner.py 側の本体条件が強すぎて candidates=0 に戻る問題を緩和。
+#   - 2026-05-27ログでは43件作成後、price_change_low_abs等で最終0件。
+#   - 6996のような微小変化だけの候補は避けつつ、4592/6072のように
+#     実値動きがある候補を残す水準へ調整。
 #
-# Ver2.4:
-#   - 出来高急増だけで高値掴み/安値売りをしない。
-#   - BUY: 上がり過ぎ・高値圏・上ヒゲ反落・バイイングクライマックス疑いを除外。
-#   - SELL: 下がり過ぎ・安値圏・下ヒゲ反発・セリングクライマックス疑いを除外。
-#
-# Ver2.5:
-#   - 6996 のような max_surge=3.00x だけで、価格変化0.14% / 5s=0.000% /
-#     slope=0.0014 の候補が pending になる問題を抑止。
-#   - 5秒足は必須にしないが、取れている場合のゼロ変化は runner/AI fallback 側で落とす。
-#   - 価格変化と傾きの最低下限を引き上げる。
-#
-# Balanced strict settings:
+# Balanced settings:
 #   MIN_PRICE               >= 300円
 #   MIN_FINAL_SCORE         >= 2.5
 #   MIN_VOLUME_SURGE_RATIO  >= 3.0
-#   MIN_PRICE_CHANGE_PCT    >= 0.30%
-#   MIN_SLOPE               >= 0.0030
-#   MIN_5SEC_PRICE_CHANGE   >= 0.05% when 5秒足あり
+#   MIN_PRICE_CHANGE_PCT    >= 0.20%
+#   MIN_SLOPE               >= 0.0010
+#   MIN_5SEC_PRICE_CHANGE   >= 0.01% when 5秒足あり
 #   MIN_LATEST_VOLUME       >= 50,000株
+#   MAX_BUY_PRICE_CHANGE    <= 1.20%
+#   MAX_SELL_PRICE_DROP     <= 1.20%
 #   REQUIRE_5SEC_BAR        default False
 # ============================================================
 
@@ -37,10 +26,19 @@ from __future__ import annotations
 
 import os
 
-# volume_surge.py Ver1.9 はこのENVだけを見る。
+# volume_surge.py が参照するfail-open系ENV。
 # settings/batで明示的に 0 を入れている場合はそちらを尊重する。
 os.environ.setdefault("TONOSAMA_FORCE_SURGE_FAILOPEN", "1")
 os.environ.setdefault("TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE", "3.0")
+os.environ.setdefault("TONOSAMA_ALLOW_HISTORY_MISSING_ENTRY", "1")
+os.environ.setdefault("TONOSAMA_DROP_HISTORY_MISSING_ENTRY", "0")
+
+# 本体フィルタの既定値。外部ENVがあれば外部値を尊重する。
+os.environ.setdefault("TONOSAMA_MIN_PRICE_CHANGE_PCT", "0.20")
+os.environ.setdefault("TONOSAMA_MIN_SLOPE", "0.0010")
+os.environ.setdefault("TONOSAMA_MIN_5SEC_PRICE_CHANGE_PCT", "0.01")
+os.environ.setdefault("TONOSAMA_MAX_BUY_PRICE_CHANGE_PCT", "1.20")
+os.environ.setdefault("TONOSAMA_MAX_SELL_PRICE_DROP_PCT", "1.20")
 
 
 def _env_float(name: str, default: float) -> float:
@@ -88,11 +86,11 @@ MIN_RAW_SCORE = _env_float("TONOSAMA_MIN_RAW_SCORE", 0.01)
 
 MIN_VOLUME_SURGE_RATIO = _env_float_floor("TONOSAMA_MIN_VOLUME_SURGE_RATIO", 3.0, 3.0)
 
-# Ver2.5: 0.14% のような微小変化は通さない。
-MIN_PRICE_CHANGE_PCT = _env_float_floor("TONOSAMA_MIN_PRICE_CHANGE_PCT", 0.30, 0.30)
+# Ver2.6: 0.30%では候補0が続いたため、0.20%へ緩和。
+MIN_PRICE_CHANGE_PCT = _env_float_floor("TONOSAMA_MIN_PRICE_CHANGE_PCT", 0.20, 0.20)
 
-# Ver2.5: slope=0.0014 程度の横ばいは通さない。
-MIN_SLOPE = _env_float_floor("TONOSAMA_MIN_SLOPE", 0.0030, 0.0030)
+# Ver2.6: slope=0.0030では短期履歴不足時に厳しいため、0.0010へ緩和。
+MIN_SLOPE = _env_float_floor("TONOSAMA_MIN_SLOPE", 0.0010, 0.0010)
 
 MIN_BODY_CHANGE_PCT = _env_float("TONOSAMA_MIN_BODY_CHANGE_PCT", 0.0)
 MIN_INTRABAR_RANGE_PCT = _env_float_floor("TONOSAMA_MIN_INTRABAR_RANGE_PCT", 0.10, 0.10)
@@ -101,7 +99,7 @@ MIN_LATEST_VOLUME = _env_float_floor("TONOSAMA_MIN_LATEST_VOLUME", 50000.0, 5000
 # ------------------------------------------------------------
 # BUY buying climax / high-chase guard
 # ------------------------------------------------------------
-MAX_BUY_PRICE_CHANGE_PCT = _env_float("TONOSAMA_MAX_BUY_PRICE_CHANGE_PCT", 0.80)
+MAX_BUY_PRICE_CHANGE_PCT = _env_float("TONOSAMA_MAX_BUY_PRICE_CHANGE_PCT", 1.20)
 MAX_BUY_CLOSE_POSITION_PCT = _env_float("TONOSAMA_MAX_BUY_CLOSE_POSITION_PCT", 90.0)
 MAX_BUY_UPPER_WICK_PCT = _env_float("TONOSAMA_MAX_BUY_UPPER_WICK_PCT", 45.0)
 BUYING_CLIMAX_MIN_SURGE_RATIO = _env_float("TONOSAMA_BUYING_CLIMAX_MIN_SURGE_RATIO", 3.0)
@@ -110,7 +108,7 @@ BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT = _env_float("TONOSAMA_BUYING_CLIMAX_MIN_PRIC
 # ------------------------------------------------------------
 # SELL selling climax / low-chase guard
 # ------------------------------------------------------------
-MAX_SELL_PRICE_DROP_PCT = _env_float("TONOSAMA_MAX_SELL_PRICE_DROP_PCT", 0.80)
+MAX_SELL_PRICE_DROP_PCT = _env_float("TONOSAMA_MAX_SELL_PRICE_DROP_PCT", 1.20)
 MIN_SELL_CLOSE_POSITION_PCT = _env_float("TONOSAMA_MIN_SELL_CLOSE_POSITION_PCT", 10.0)
 MAX_SELL_LOWER_WICK_PCT = _env_float("TONOSAMA_MAX_SELL_LOWER_WICK_PCT", 45.0)
 SELLING_CLIMAX_MIN_SURGE_RATIO = _env_float("TONOSAMA_SELLING_CLIMAX_MIN_SURGE_RATIO", 3.0)
@@ -119,7 +117,7 @@ SELLING_CLIMAX_MIN_PRICE_DROP_PCT = _env_float("TONOSAMA_SELLING_CLIMAX_MIN_PRIC
 VOLUME_AVG_LOOKBACK_BARS = _env_int("TONOSAMA_VOLUME_AVG_LOOKBACK_BARS", 5)
 
 USE_5SEC_CONFIRM = _env_bool("TONOSAMA_USE_5SEC_CONFIRM", True)
-MIN_5SEC_PRICE_CHANGE_PCT = _env_float_floor("TONOSAMA_MIN_5SEC_PRICE_CHANGE_PCT", 0.05, 0.05)
+MIN_5SEC_PRICE_CHANGE_PCT = _env_float_floor("TONOSAMA_MIN_5SEC_PRICE_CHANGE_PCT", 0.01, 0.01)
 MIN_5SEC_VOLUME_SURGE_RATIO = _env_float("TONOSAMA_MIN_5SEC_VOLUME_SURGE_RATIO", 1.5)
 MAX_5SEC_DROP_PCT = _env_float("TONOSAMA_MAX_5SEC_DROP_PCT", -0.20)
 REQUIRE_5SEC_BAR = _env_bool("TONOSAMA_REQUIRE_5SEC_BAR", False)
