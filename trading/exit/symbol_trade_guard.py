@@ -1,33 +1,18 @@
 # ============================================================
 # File   : trading/exit/symbol_trade_guard.py
-# Version: V1.1-SYMBOL-TRADE-GUARD-SQLITE-NAS-SAFE
+# Version: V1.2-SYMBOL-TRADE-GUARD-SQLITE-NAS-SAFE-SYNTAX-FIX
 # ------------------------------------------------------------
 # 【概要】
 #   スキャルピング用の銘柄別エントリー抑制。
 #
-# 【組み込み機能】
-#   1. 損切り後15分クールダウン
-#   2. 同一銘柄2連敗で当日停止
-#   3. 一部利確後3分の再エントリー停止
-#   4. 全利確後5分の再エントリー停止
-#   5. 銘柄ごとの当日成績を保存
-#   6. 時間帯フィルタ
-#      - 09:00〜09:02 新規停止
-#      - 11:20〜12:30 新規停止
-#      - 12:30〜12:32 新規停止
-#      - 15:23以降 新規停止
+# V1.2:
+#   - V1.1 の _today() 定義インデントを修正
 #
 # V1.1:
 #   - NAS/SMB上SQLiteで PRAGMA journal_mode=WAL が disk I/O error になる問題を回避
 #   - WAL失敗時は DELETE journal にフォールバック
 #   - 接続自体が失敗する場合はローカル退避DBへフォールバック
 #   - trade guard DB障害でエントリー判定全体を壊さない
-#
-# 【保存先】
-#   既定:
-#     \\192.168.0.22\AutoStockBuyAndSell\raw_data\trade_guard\trade_guardYYYYMMDD.db
-#   ローカル退避:
-#     F:\script\python\kabu\runtime_cache\trade_guard\trade_guardYYYYMMDD.db
 # ============================================================
 
 from __future__ import annotations
@@ -55,12 +40,10 @@ LOSS_COOLDOWN_MINUTES = int(float(os.getenv("LOSS_COOLDOWN_MINUTES", "15")))
 PROFIT_COOLDOWN_MINUTES = int(float(os.getenv("PROFIT_COOLDOWN_MINUTES", "5")))
 PARTIAL_PROFIT_COOLDOWN_MINUTES = int(float(os.getenv("PARTIAL_PROFIT_COOLDOWN_MINUTES", "3")))
 MAX_DAILY_LOSSES_PER_SYMBOL = int(float(os.getenv("MAX_DAILY_LOSSES_PER_SYMBOL", "2")))
-
-# 新規エントリー停止時刻。東証の15:30引けを前提に15:23。
 ENTRY_STOP_AFTER = os.getenv("ENTRY_STOP_AFTER", "15:23")
 
 
- def _today() -> str:
+def _today() -> str:
     return dt.datetime.now().strftime("%Y%m%d")
 
 
@@ -134,7 +117,6 @@ def _open_sqlite(path: str) -> sqlite3.Connection:
 
 
 def _apply_journal_mode(conn: sqlite3.Connection, path: str) -> None:
-    """NASではWALがdisk I/O errorになりやすいため、安全にフォールバックする。"""
     desired = str(os.getenv("TRADE_GUARD_SQLITE_JOURNAL_MODE", "")).strip().upper()
     if not desired:
         desired = "DELETE" if _is_nas_like_path(path) else "WAL"
@@ -291,7 +273,6 @@ def _time_block_reason(now: Optional[dt.datetime] = None) -> Tuple[bool, str, Di
 
 
 def is_entry_blocked(symbol: Any, now: Optional[dt.datetime] = None) -> Tuple[bool, str, Dict[str, Any]]:
-    """新規エントリーしてよいかを判定する。"""
     symbol = _norm_symbol(symbol)
     if not TRADE_GUARD_ENABLED:
         return False, "", {}
@@ -323,7 +304,6 @@ def is_entry_blocked(symbol: Any, now: Optional[dt.datetime] = None) -> Tuple[bo
 
 
 def record_exit_event(symbol: Any, *, pnl: float, reason: str, now: Optional[dt.datetime] = None) -> None:
-    """全返済イベントを記録し、次回エントリー抑制をセットする。"""
     symbol = _norm_symbol(symbol)
     if not TRADE_GUARD_ENABLED or not symbol:
         return
@@ -355,7 +335,6 @@ def record_exit_event(symbol: Any, *, pnl: float, reason: str, now: Optional[dt.
 
 
 def record_partial_profit_event(symbol: Any, *, reason: str, now: Optional[dt.datetime] = None) -> None:
-    """一部利確後の短時間クールダウンを記録する。"""
     symbol = _norm_symbol(symbol)
     if not TRADE_GUARD_ENABLED or not symbol:
         return
