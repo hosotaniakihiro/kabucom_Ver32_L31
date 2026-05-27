@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/tonosama/config.py
-# Version: Ver2.4-TONOSAMA-CLIMAX-GUARD-BUY-SELL
+# Version: Ver2.5-TONOSAMA-NO-ZERO-MOVEMENT-FLOORS
 # ------------------------------------------------------------
 # 方針:
 #   - 起動直後やPUSH再接続直後は、3m/5mの行は存在しても、
@@ -16,12 +16,19 @@
 #   - BUY: 上がり過ぎ・高値圏・上ヒゲ反落・バイイングクライマックス疑いを除外。
 #   - SELL: 下がり過ぎ・安値圏・下ヒゲ反発・セリングクライマックス疑いを除外。
 #
-# Balanced settings:
+# Ver2.5:
+#   - 6996 のような max_surge=3.00x だけで、価格変化0.14% / 5s=0.000% /
+#     slope=0.0014 の候補が pending になる問題を抑止。
+#   - 5秒足は必須にしないが、取れている場合のゼロ変化は runner/AI fallback 側で落とす。
+#   - 価格変化と傾きの最低下限を引き上げる。
+#
+# Balanced strict settings:
 #   MIN_PRICE               >= 300円
 #   MIN_FINAL_SCORE         >= 2.5
 #   MIN_VOLUME_SURGE_RATIO  >= 3.0
-#   MIN_PRICE_CHANGE_PCT    >= 0.05%
-#   MIN_SLOPE               >= 0.0003
+#   MIN_PRICE_CHANGE_PCT    >= 0.30%
+#   MIN_SLOPE               >= 0.0030
+#   MIN_5SEC_PRICE_CHANGE   >= 0.05% when 5秒足あり
 #   MIN_LATEST_VOLUME       >= 50,000株
 #   REQUIRE_5SEC_BAR        default False
 # ============================================================
@@ -80,8 +87,12 @@ MIN_FINAL_SCORE = _env_float_floor("TONOSAMA_MIN_FINAL_SCORE", 2.5, 2.5)
 MIN_RAW_SCORE = _env_float("TONOSAMA_MIN_RAW_SCORE", 0.01)
 
 MIN_VOLUME_SURGE_RATIO = _env_float_floor("TONOSAMA_MIN_VOLUME_SURGE_RATIO", 3.0, 3.0)
-MIN_PRICE_CHANGE_PCT = _env_float_floor("TONOSAMA_MIN_PRICE_CHANGE_PCT", 0.05, 0.05)
-MIN_SLOPE = _env_float_floor("TONOSAMA_MIN_SLOPE", 0.0003, 0.0003)
+
+# Ver2.5: 0.14% のような微小変化は通さない。
+MIN_PRICE_CHANGE_PCT = _env_float_floor("TONOSAMA_MIN_PRICE_CHANGE_PCT", 0.30, 0.30)
+
+# Ver2.5: slope=0.0014 程度の横ばいは通さない。
+MIN_SLOPE = _env_float_floor("TONOSAMA_MIN_SLOPE", 0.0030, 0.0030)
 
 MIN_BODY_CHANGE_PCT = _env_float("TONOSAMA_MIN_BODY_CHANGE_PCT", 0.0)
 MIN_INTRABAR_RANGE_PCT = _env_float_floor("TONOSAMA_MIN_INTRABAR_RANGE_PCT", 0.10, 0.10)
@@ -108,7 +119,7 @@ SELLING_CLIMAX_MIN_PRICE_DROP_PCT = _env_float("TONOSAMA_SELLING_CLIMAX_MIN_PRIC
 VOLUME_AVG_LOOKBACK_BARS = _env_int("TONOSAMA_VOLUME_AVG_LOOKBACK_BARS", 5)
 
 USE_5SEC_CONFIRM = _env_bool("TONOSAMA_USE_5SEC_CONFIRM", True)
-MIN_5SEC_PRICE_CHANGE_PCT = _env_float_floor("TONOSAMA_MIN_5SEC_PRICE_CHANGE_PCT", 0.01, 0.01)
+MIN_5SEC_PRICE_CHANGE_PCT = _env_float_floor("TONOSAMA_MIN_5SEC_PRICE_CHANGE_PCT", 0.05, 0.05)
 MIN_5SEC_VOLUME_SURGE_RATIO = _env_float("TONOSAMA_MIN_5SEC_VOLUME_SURGE_RATIO", 1.5)
 MAX_5SEC_DROP_PCT = _env_float("TONOSAMA_MAX_5SEC_DROP_PCT", -0.20)
 REQUIRE_5SEC_BAR = _env_bool("TONOSAMA_REQUIRE_5SEC_BAR", False)
