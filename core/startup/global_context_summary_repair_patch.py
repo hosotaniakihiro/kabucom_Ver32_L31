@@ -1,26 +1,26 @@
 # ============================================================
 # File   : core/startup/global_context_summary_repair_patch.py
-# Version: V1.0-MERGED-SUMMARY-TECH-REPAIR
+# Version: V1.1-MERGED-SUMMARY-TECH-REPAIR-RECENT-PUSH-ONLY
 # ------------------------------------------------------------
 # 目的:
 #   scheduler_jobs.summary.safe_io から GlobalContext.set_push_merged_summary()
 #   へ入る直前のDFで、macd/signal/mtf が 0 に戻るケースを防ぐ。
 #
-# 背景:
-#   push_summary_history_runtime_patch は push_summary_engine の戻り値を補正するが、
-#   runner_core/safe_io 経由で再normalize/after_calcされたDFが
-#   そのまま set_push_merged_summary されると、MERGED SET INPUT で
-#   macd=0 signal=0 mtf=0 に退行することがある。
+# V1.1:
+#   - source=push の merged 保存前に、古い日付の行を除外
+#   - 12:38ログのように 5分PUSH merged に 2026-05-14 / 2026-05-26 の
+#     古いseed行が混ざる問題を防ぐ
+#   - 当日かつ直近N分のみを merged latest として扱う
+#   - 補完用history自体は使うが、merged latestには古い行を残さない
 #
-# 修正内容:
-#   - global_context.set_merged_summary を monkey patch
-#   - source=push の場合、set直前に summary_history_cache から同一銘柄の
-#     最新非ゼロ macd/signal/slope/mtf を復元
-#   - technical_ready も復元
+# ENV:
+#   GC_SUMMARY_REPAIR_FILTER_STALE_PUSH=1
+#   GC_SUMMARY_REPAIR_PUSH_MAX_AGE_MIN=240
 # ============================================================
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import os
 from types import MethodType
@@ -47,6 +47,24 @@ def _env_bool(name: str, default: bool = True) -> bool:
     if v is None or str(v).strip() == "":
         return bool(default)
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return max(1.0, float(v))
+    except Exception:
+        return float(default)
+
+
+def _now_naive() -> dt.datetime:
+    try:
+        from scheduler_jobs.summary.time_utils import now_naive
+        return now_naive().replace(tzinfo=None)
+    except Exception:
+        return dt.datetime.now()
 
 
 def _safe_df(x: Any) -> pd.DataFrame:
@@ -77,6 +95,47 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
         except Exception:
             pass
     return out.reset_index(drop=True)
+
+
+def _filter_recent_push_rows(df: pd.DataFrame, *, tf: Any, source: str) -> pd.DataFrame:
+    if df is None or df.empty or source != "push":
+        return df
+    if not _env_bool("GC_SUMMARY_REPAIR_FILTER_STALE_PUSH", True):
+        return df
+    if "datetime" not in df.columns:
+        return df
+    try:
+        out = df.copy()
+        out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+        before = len(out)
+        now = _now_naive()
+        today = pd.Timestamp(now.date())
+        max_age_min = _env_float("GC_SUMMARY_REPAIR_PUSH_MAX_AGE_MIN", 240.0)
+        cutoff = pd.Timestamp(now - dt.timedelta(minutes=max_age_min))
+        out = out[(out["datetime"].notna()) & (out["datetime"] >= today) & (out["datetime"] >= cutoff)].copy()
+        dropped = before - len(out)
+        if dropped > 0:
+            try:
+                min_dt = pd.to_datetime(df["datetime"], errors="coerce").min()
+                max_dt = pd.to_datetime(df["datetime"], errors="coerce").max()
+            except Exception:
+                min_dt = max_dt = None
+            logger.warning(
+                "[GC SUMMARY REPAIR] stale push rows filtered tf=%s source=%s before=%s after=%s dropped=%s cutoff=%s today=%s original_min_dt=%s original_max_dt=%s",
+                tf,
+                source,
+                before,
+                len(out),
+                dropped,
+                cutoff,
+                today.date(),
+                min_dt,
+                max_dt,
+            )
+        return out.reset_index(drop=True)
+    except Exception:
+        logger.exception("[GC SUMMARY REPAIR] stale push filter failed tf=%s source=%s", tf, source)
+        return df
 
 
 def _zero_like(v: Any) -> bool:
@@ -141,7 +200,7 @@ def _repair_df_from_history(gc, tf: Any, df: Any, source: str) -> pd.DataFrame:
         hist = pd.DataFrame()
     best = _best_map_from_history(hist)
     if not best:
-        return out
+        return _filter_recent_push_rows(out, tf=tf, source=source)
 
     hits = fills = macd_fill = signal_fill = mtf_fill = 0
     for idx, row in out.iterrows():
@@ -177,6 +236,8 @@ def _repair_df_from_history(gc, tf: Any, df: Any, source: str) -> pd.DataFrame:
         out.loc[ready & out["symbol_hist_len"].isna(), "symbol_hist_len"] = 3
     except Exception:
         logger.exception("[GC SUMMARY REPAIR] technical_ready repair failed tf=%s", tf)
+
+    out = _filter_recent_push_rows(out, tf=tf, source=source)
 
     logger.warning(
         "[GC SUMMARY REPAIR] tf=%s source=%s rows=%s hits=%s fills=%s macd_fill=%s signal_fill=%s mtf_fill=%s macd=%s signal=%s mtf=%s ready=%s",
@@ -218,7 +279,7 @@ def install() -> bool:
         _patched_set_merged_summary._gc_summary_repair_patch = True  # type: ignore[attr-defined]
         GC.set_merged_summary = MethodType(_patched_set_merged_summary, GC)
         _PATCHED = True
-        logger.warning("[GC SUMMARY REPAIR] installed V1 set_merged_summary pre-store repair")
+        logger.warning("[GC SUMMARY REPAIR] installed V1.1 set_merged_summary pre-store repair recent-push-only")
         return True
     except Exception:
         logger.exception("[GC SUMMARY REPAIR] install failed")
