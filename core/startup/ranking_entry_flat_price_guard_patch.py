@@ -1,11 +1,16 @@
 # ============================================================
 # File   : core/startup/ranking_entry_flat_price_guard_patch.py
-# Version: V1.1-RANKING-FLAT-PRICE-DB-FALLBACK-NO-HARDCODED-PATH
+# Version: V1.2-RANKING-DB-FALLBACK-USE-USABLE-PATH-API
 # ------------------------------------------------------------
 # 目的:
 #   1) ランキング由来ENTRYで、価格横ばいだけで大量DROPされる問題を緩和する。
-#   2) ranking_entry が global_data のランキングDFだけを見て
-#      no_ranking_df で止まる問題を、既存DBパス解決関数からのfallbackで補正する。
+#   2) ranking_entry が global_data のランキングDFだけを見て no_ranking_df で止まる問題を、
+#      ats.ats_ranking.db_path.get_usable_ranking_db_path() からのfallbackで補正する。
+#
+# V1.2:
+#   - 存在しない resolve_ranking_db_path import を廃止
+#   - 実在API get_usable_ranking_db_path(force_refresh=True, allow_fallback=False,
+#     prefer_today_even_if_empty=True) を使用
 # ============================================================
 
 from __future__ import annotations
@@ -164,11 +169,15 @@ def _patched_filter(row: Dict[str, Any], side: str, prev_h: Dict[str, Any], scor
 
 def _resolve_ranking_db_path() -> str:
     try:
-        from ats.ats_ranking.db_path import resolve_ranking_db_path
-        p = resolve_ranking_db_path()
+        from ats.ats_ranking.db_path import get_usable_ranking_db_path
+        p = get_usable_ranking_db_path(
+            force_refresh=True,
+            allow_fallback=False,
+            prefer_today_even_if_empty=True,
+        )
         return str(p or "")
     except Exception:
-        logger.warning("[RANKING DB FALLBACK PATCH] resolve_ranking_db_path failed", exc_info=True)
+        logger.warning("[RANKING DB FALLBACK PATCH] get_usable_ranking_db_path failed", exc_info=True)
         return ""
 
 
@@ -258,23 +267,22 @@ def install() -> bool:
         return True
     try:
         import trading.ranking.entry_from_ranking as efr
-
-        cur_filter = getattr(efr, "_passes_ranking_only_filters", None)
-        if callable(cur_filter) and not getattr(cur_filter, "_ranking_flat_price_patch", False):
-            _ORIGINAL_FILTER = cur_filter
+        cur = getattr(efr, "_passes_ranking_only_filters", None)
+        if callable(cur) and not getattr(cur, "_ranking_flat_price_patch", False):
+            _ORIGINAL_FILTER = cur
             _patched_filter._ranking_flat_price_patch = True  # type: ignore[attr-defined]
+            _patched_filter._original = cur  # type: ignore[attr-defined]
             efr._passes_ranking_only_filters = _patched_filter
-            logger.warning("[RANKING FLAT PRICE PATCH] filter wrapper installed")
 
         cur_getter = getattr(efr, "_get_ranking_source_df", None)
         if callable(cur_getter) and not getattr(cur_getter, "_ranking_db_fallback_patch", False):
             _ORIGINAL_GET_RANKING_SOURCE_DF = cur_getter
             _patched_get_ranking_source_df._ranking_db_fallback_patch = True  # type: ignore[attr-defined]
+            _patched_get_ranking_source_df._original = cur_getter  # type: ignore[attr-defined]
             efr._get_ranking_source_df = _patched_get_ranking_source_df
-            logger.warning("[RANKING DB FALLBACK PATCH] getter wrapper installed enabled=%s", _env_bool("RANKING_ENTRY_DB_FALLBACK_ENABLED", True))
 
         _PATCHED = True
-        logger.warning("[RANKING FLAT PRICE PATCH] installed V1.1 allow_flat=%s db_fallback=%s", _env_bool("RANKING_ENTRY_ALLOW_FLAT_PRICE_IF_RANK_STRONG", True), _env_bool("RANKING_ENTRY_DB_FALLBACK_ENABLED", True))
+        logger.warning("[RANKING FLAT PRICE PATCH] installed v1.2 db_fallback=True")
         return True
     except Exception:
         logger.exception("[RANKING FLAT PRICE PATCH] install failed")
@@ -285,5 +293,6 @@ try:
     install()
 except Exception:
     logger.exception("[RANKING FLAT PRICE PATCH] auto install failed")
+
 
 __all__ = ["install"]
