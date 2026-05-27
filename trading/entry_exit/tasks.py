@@ -1,24 +1,24 @@
 # ============================================================
 # File   : trading/entry_exit/tasks.py
-# Version: Ver1.7-RANKING-ENTRY-TIMEOUT-COOLDOWN
+# Version: Ver1.8-RANKING-ENTRY-PREFILTER-TIMEOUT-45SEC
 # ------------------------------------------------------------
 # 【目的】
 #   core.entry_exit_tasks shim から解決される実体モジュール。
 #
+# Ver1.8 Fix:
+#   - entry_from_ranking.py 側で軽量prefilterを追加したため、
+#     ranking build timeoutの既定を20秒→45秒へ延長
+#   - 20秒timeoutで候補抽出途中に切られ、entry_controllerへ渡らない問題を緩和
+#
 # Ver1.7 Fix:
 #   - RANKING ENTRY BUILD が20秒timeoutした後も、実体スレッドはdaemonで残る。
-#   - そのまま毎分起動すると、previous_still_running / DB読み直し / NAS負荷が増える。
 #   - timeout後は一定時間クールダウンし、その間はranking_entryを即skipする。
-#   - timeoutが連続する場合はクールダウンを段階的に延長する。
 #   - 既定では ranking_entry を2分間隔に変更し、重いDB読みを抑える。
 #
 # Ver1.6 Fix:
 #   - pending_manager は global_data.pending_entries を使っているため、
 #     tasks.py 側の _pending_count_for_source が常に0になりやすかった問題を修正
-#   - pending_manager.iter_entries() / global_data.pending_entries を直接数える
-#   - TONOSAMA PENDING があるのに controller dispatch skipped になる問題を防止
 #   - TONOSAMA実行が16秒前後かかるため、既定周期を15秒→30秒へ変更
-#   - 既存ENV TONOSAMA_ENTRY_INTERVAL_SEC / SCHEDULER_INTERVAL_SEC があれば尊重
 # ============================================================
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ _RANKING_ENTRY_LOCK = threading.RLock()
 
 TONOSAMA_ENTRY_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_TIMEOUT_SEC", "45"))
 TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC", "20"))
-RANKING_ENTRY_BUILD_TIMEOUT_SEC = float(os.getenv("RANKING_ENTRY_BUILD_TIMEOUT_SEC", "20"))
+RANKING_ENTRY_BUILD_TIMEOUT_SEC = float(os.getenv("RANKING_ENTRY_BUILD_TIMEOUT_SEC", "45"))
 RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC = float(os.getenv("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", "20"))
 RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC = float(os.getenv("RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC", "90"))
 RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC = float(os.getenv("RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC", "300"))
@@ -72,13 +72,6 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
-def _safe_len(obj: Any) -> int:
-    try:
-        return len(obj) if obj is not None else 0
-    except Exception:
-        return 0
-
-
 def _entry_source(entry: Any) -> str:
     try:
         if isinstance(entry, dict):
@@ -89,23 +82,19 @@ def _entry_source(entry: Any) -> str:
 
 
 def _pending_count_for_source(source: str) -> int:
-    """pending_manager/global_data に残っている指定sourceの件数を数える。"""
     source_u = str(source or "").upper()
     total = 0
-
     try:
         import trading.entry.pending_manager as pm
         iter_entries = getattr(pm, "iter_entries", None)
         if callable(iter_entries):
             for _sym, entry in list(iter_entries()):
-                s = _entry_source(entry)
-                if source_u in s:
+                if source_u in _entry_source(entry):
                     total += 1
             if total > 0:
                 return int(total)
     except Exception:
         logger.debug("[entry_exit.tasks] pending count via iter_entries failed", exc_info=True)
-
     try:
         from global_state import global_data
         root = getattr(global_data, "pending_entries", None)
@@ -113,19 +102,14 @@ def _pending_count_for_source(source: str) -> int:
             for bucket in list(root.values()):
                 entries = bucket if isinstance(bucket, (list, tuple, set)) else [bucket]
                 for entry in entries:
-                    s = _entry_source(entry)
-                    if source_u in s:
+                    if source_u in _entry_source(entry):
                         total += 1
             return int(total)
     except Exception:
         logger.debug("[entry_exit.tasks] pending count via global_data failed", exc_info=True)
-
     try:
         import trading.entry.pending_manager as pm
-        names = [
-            "pending_entries", "PENDING_ENTRIES", "pending_by_symbol", "PENDING_BY_SYMBOL",
-            "_pending_entries", "_PENDING_ENTRIES", "_pending_by_symbol", "_PENDING_BY_SYMBOL",
-        ]
+        names = ["pending_entries", "PENDING_ENTRIES", "pending_by_symbol", "PENDING_BY_SYMBOL", "_pending_entries", "_PENDING_ENTRIES", "_pending_by_symbol", "_PENDING_BY_SYMBOL"]
         for name in names:
             obj = getattr(pm, name, None)
             if obj is None:
@@ -133,10 +117,7 @@ def _pending_count_for_source(source: str) -> int:
             if isinstance(obj, dict):
                 vals = []
                 for v in obj.values():
-                    if isinstance(v, (list, tuple, set)):
-                        vals.extend(list(v))
-                    else:
-                        vals.append(v)
+                    vals.extend(list(v) if isinstance(v, (list, tuple, set)) else [v])
                 for item in vals:
                     if source_u in _entry_source(item):
                         total += 1
@@ -160,8 +141,7 @@ def _clear_tag(tag: str) -> None:
 def _has_tag(tag: str) -> bool:
     try:
         for job in list(getattr(schedule, "jobs", []) or []):
-            tags = getattr(job, "tags", set()) or set()
-            if tag in tags:
+            if tag in (getattr(job, "tags", set()) or set()):
                 return True
     except Exception:
         pass
@@ -201,10 +181,7 @@ def _patch_tonosama_runner_fast_loop() -> None:
         logger.warning("[TONOSAMA FAST LOOP PATCH] failed", exc_info=True)
 
 
-def _run_callable_with_timeout(
-    fn: Callable[..., Any], *, timeout_sec: float, name: str,
-    args: tuple[Any, ...] = (), kwargs: Optional[dict[str, Any]] = None,
-) -> tuple[bool, Any]:
+def _run_callable_with_timeout(fn: Callable[..., Any], *, timeout_sec: float, name: str, args: tuple[Any, ...] = (), kwargs: Optional[dict[str, Any]] = None) -> tuple[bool, Any]:
     result: dict[str, Any] = {"done": False, "ret": None, "err": None}
     kwargs = kwargs or {}
 
@@ -261,18 +238,12 @@ def _run_tonosama_entry_safe() -> int:
             if after_pending > 0 and _env_bool("TONOSAMA_DISPATCH_CONTROLLER_ON_TIMEOUT_PENDING", True):
                 _dispatch_entry_controller(pipeline_source="TONOSAMA", interval=None, timeout_sec=TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC, reason="TONOSAMA ENTRY SCHEDULE TIMEOUT-PENDING")
             return 0
-
         registered = int(ret or 0)
-        logger.info(
-            "[TONOSAMA ENTRY SCHEDULE] pending build done registered=%s before_pending=%s after_pending=%s elapsed=%.3fs",
-            registered, before_pending, after_pending, time.perf_counter() - started,
-        )
-
+        logger.info("[TONOSAMA ENTRY SCHEDULE] pending build done registered=%s before_pending=%s after_pending=%s elapsed=%.3fs", registered, before_pending, after_pending, time.perf_counter() - started)
         if registered > 0 or after_pending > 0:
             _dispatch_entry_controller(pipeline_source="TONOSAMA", interval=None, timeout_sec=TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC, reason="TONOSAMA ENTRY SCHEDULE")
         else:
             logger.info("[TONOSAMA ENTRY SCHEDULE] no pending created -> controller dispatch skipped")
-
         logger.info("[TONOSAMA ENTRY SCHEDULE] done result=%s pending_count=%s elapsed=%.3fs", registered, after_pending, time.perf_counter() - started)
         return registered
     except Exception:
@@ -297,10 +268,7 @@ def _run_ranking_entry_safe() -> int:
     with _RANKING_ENTRY_LOCK:
         if _RANKING_ENTRY_COOLDOWN_UNTIL is not None and started_dt < _RANKING_ENTRY_COOLDOWN_UNTIL:
             remain = (_RANKING_ENTRY_COOLDOWN_UNTIL - started_dt).total_seconds()
-            logger.warning(
-                "[RANKING ENTRY SCHEDULE] skipped reason=timeout_cooldown remain=%.1fs until=%s timeout_streak=%s",
-                remain, _RANKING_ENTRY_COOLDOWN_UNTIL, _RANKING_ENTRY_TIMEOUT_STREAK,
-            )
+            logger.warning("[RANKING ENTRY SCHEDULE] skipped reason=timeout_cooldown remain=%.1fs until=%s timeout_streak=%s", remain, _RANKING_ENTRY_COOLDOWN_UNTIL, _RANKING_ENTRY_TIMEOUT_STREAK)
             return 0
         if _RANKING_ENTRY_RUNNING:
             elapsed = (dt.datetime.now() - _RANKING_ENTRY_STARTED_AT).total_seconds() if _RANKING_ENTRY_STARTED_AT else None
@@ -320,11 +288,7 @@ def _run_ranking_entry_safe() -> int:
                 _RANKING_ENTRY_TIMEOUT_STREAK += 1
                 cool_sec = _ranking_entry_cooldown_seconds()
                 _RANKING_ENTRY_COOLDOWN_UNTIL = dt.datetime.now() + dt.timedelta(seconds=cool_sec)
-            logger.warning(
-                "[RANKING ENTRY SCHEDULE] build timeout -> cooldown timeout_sec=%.3f elapsed=%.3fs timeout_streak=%s cooldown_sec=%.1f until=%s",
-                RANKING_ENTRY_BUILD_TIMEOUT_SEC, time.perf_counter() - started,
-                _RANKING_ENTRY_TIMEOUT_STREAK, cool_sec, _RANKING_ENTRY_COOLDOWN_UNTIL,
-            )
+            logger.warning("[RANKING ENTRY SCHEDULE] build timeout -> cooldown timeout_sec=%.3f elapsed=%.3fs timeout_streak=%s cooldown_sec=%.1f until=%s", RANKING_ENTRY_BUILD_TIMEOUT_SEC, time.perf_counter() - started, _RANKING_ENTRY_TIMEOUT_STREAK, cool_sec, _RANKING_ENTRY_COOLDOWN_UNTIL)
             return 0
         _RANKING_ENTRY_TIMEOUT_STREAK = 0
         _RANKING_ENTRY_COOLDOWN_UNTIL = None
@@ -374,12 +338,10 @@ def register_entry_exit_tasks(*args: Any, **kwargs: Any) -> bool:
         logger.info("[entry_exit.tasks] register_entry_exit_tasks start")
         _clear_tag(_TAG_TONOSAMA_ENTRY)
         _clear_tag(_TAG_RANKING_ENTRY)
-
         interval_sec = _resolve_tonosama_interval_sec()
         job_t = schedule.every(interval_sec).seconds.do(_run_tonosama_entry_safe)
         job_t.tag(_TAG_ENTRY)
         job_t.tag(_TAG_TONOSAMA_ENTRY)
-
         ranking_interval_min = _resolve_ranking_entry_interval_min()
         if ranking_interval_min <= 1:
             job_r = schedule.every().minute.at(":12").do(_run_ranking_entry_safe)
@@ -387,7 +349,6 @@ def register_entry_exit_tasks(*args: Any, **kwargs: Any) -> bool:
             job_r = schedule.every(ranking_interval_min).minutes.at(":12").do(_run_ranking_entry_safe)
         job_r.tag(_TAG_ENTRY)
         job_r.tag(_TAG_RANKING_ENTRY)
-
         logger.info(
             "[entry_exit.tasks] registered tonosama every=%ss tag=%s build_timeout=%.1fs controller_timeout=%.1fs ranking every=%smin at :12 tag=%s build_timeout=%.1fs controller_timeout=%.1fs cooldown=%.1f-%0.1fs pending_count_global=True",
             interval_sec, _TAG_TONOSAMA_ENTRY, TONOSAMA_ENTRY_TIMEOUT_SEC, TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC,
