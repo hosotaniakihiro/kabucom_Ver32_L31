@@ -1,9 +1,19 @@
 # ============================================================
 # File   : trading/exit/symbol_trade_guard.py
-# Version: V1.4-SYMBOL-TRADE-GUARD-ENTRY-BLOCKED-COMPAT
+# Version: V1.5-SYMBOL-TRADE-GUARD-EXIT-EVENT-COMPAT
 # ------------------------------------------------------------
 # 【概要】
 #   スキャルピング用の銘柄別エントリー抑制。
+#
+# V1.5:
+#   - exit_finalize.py が import している旧互換名
+#       record_exit_event
+#     を復旧
+#   - record_exit(symbol, pnl, reason) の互換ラッパーとして動作
+#   - dict/event形式、keyword形式、旧位置引数形式を許容
+#   - これにより main.py 起動時の
+#       ImportError: cannot import name 'record_exit_event'
+#     を解消
 #
 # V1.4:
 #   - entry_order_builder.py が import している旧互換名
@@ -13,9 +23,6 @@
 #   - 戻り値は bool。詳細が必要な既存コード向けに
 #       get_entry_block_reason
 #     も追加
-#   - これにより main.py 起動時の
-#       ImportError: cannot import name 'is_entry_blocked'
-#     を解消
 #
 # V1.3:
 #   - NAS/SMB上SQLiteで接続のたびに PRAGMA journal_mode を実行しない
@@ -154,24 +161,17 @@ def _journal_warn_throttled(path: str, message: str, *args, exc_info: bool = Fal
 def _apply_journal_mode(conn: sqlite3.Connection, path: str) -> None:
     if not _env_bool("TRADE_GUARD_APPLY_JOURNAL_MODE", True):
         return
-
     path_key = str(path)
     if path_key in _JOURNAL_MODE_OK_PATHS:
         return
-
     now = time.time()
     skip_until = float(_JOURNAL_MODE_SKIP_UNTIL.get(path_key, 0.0) or 0.0)
     if now < skip_until:
-        logger.debug(
-            "[TRADE GUARD] journal_mode skipped by throttle path=%s remain=%.3fs",
-            path,
-            skip_until - now,
-        )
+        logger.debug("[TRADE GUARD] journal_mode skipped by throttle path=%s remain=%.3fs", path, skip_until - now)
         return
     desired = str(os.getenv("TRADE_GUARD_SQLITE_JOURNAL_MODE", "")).strip().upper()
     if not desired:
         desired = "DELETE" if _is_nas_like_path(path) else "WAL"
-
     try:
         conn.execute(f"PRAGMA journal_mode={desired}")
         _JOURNAL_MODE_OK_PATHS.add(path_key)
@@ -358,16 +358,7 @@ def check_entry_allowed(symbol: Any, now: Optional[dt.datetime] = None) -> Tuple
 
 
 def is_entry_blocked(symbol: Any, now: Optional[dt.datetime] = None, *args: Any, **kwargs: Any) -> bool:
-    """
-    旧互換API。
-
-    entry_order_builder.py などが `from trading.exit.symbol_trade_guard import is_entry_blocked`
-    として参照するため、check_entry_allowed の否定として提供する。
-
-    戻り値:
-      True  = エントリー禁止
-      False = エントリー許可
-    """
+    """旧互換API。True=エントリー禁止、False=エントリー許可。"""
     try:
         allowed, reason, meta = check_entry_allowed(symbol, now=now)
         if not allowed:
@@ -379,10 +370,7 @@ def is_entry_blocked(symbol: Any, now: Optional[dt.datetime] = None, *args: Any,
 
 
 def get_entry_block_reason(symbol: Any, now: Optional[dt.datetime] = None) -> Tuple[bool, str, Dict[str, Any]]:
-    """
-    旧互換/診断用API。
-    戻り値は (blocked, reason, meta)。
-    """
+    """旧互換/診断用API。戻り値は (blocked, reason, meta)。"""
     allowed, reason, meta = check_entry_allowed(symbol, now=now)
     return (not bool(allowed), reason, meta)
 
@@ -417,6 +405,39 @@ def record_exit(symbol: Any, pnl: float = 0.0, reason: str = "") -> None:
         logger.exception("[TRADE GUARD] record_exit failed symbol=%s", sym)
 
 
+def record_exit_event(symbol: Any = None, pnl: float = 0.0, reason: str = "", *args: Any, **kwargs: Any) -> None:
+    """
+    旧互換API。
+
+    exit_finalize.py が import する `record_exit_event` を復旧する。
+    dict/event形式、keyword形式、旧位置引数形式を許容し、最終的に record_exit へ渡す。
+    """
+    try:
+        event = symbol if isinstance(symbol, dict) else None
+        if event is not None:
+            symbol = event.get("symbol") or event.get("Symbol") or event.get("code") or event.get("stock_code")
+            pnl = event.get("pnl", event.get("realized_pnl", event.get("profit", event.get("profit_loss", pnl))))
+            reason = event.get("reason", event.get("exit_reason", event.get("last_exit_reason", reason)))
+
+        symbol = kwargs.get("symbol", kwargs.get("Symbol", symbol))
+        pnl = kwargs.get("pnl", kwargs.get("realized_pnl", kwargs.get("profit", kwargs.get("profit_loss", pnl))))
+        reason = kwargs.get("reason", kwargs.get("exit_reason", kwargs.get("last_exit_reason", reason)))
+
+        # 旧位置引数: record_exit_event(symbol, reason, pnl) のような揺れを軽く吸収
+        if args:
+            if len(args) >= 1 and not reason:
+                reason = str(args[0] or "")
+            if len(args) >= 2:
+                try:
+                    pnl = float(args[1] or pnl)
+                except Exception:
+                    pass
+
+        record_exit(symbol, pnl=float(pnl or 0.0), reason=str(reason or ""))
+    except Exception:
+        logger.exception("[TRADE GUARD] record_exit_event failed symbol=%s", symbol)
+
+
 def record_entry(symbol: Any) -> None:
     if not TRADE_GUARD_ENABLED:
         return
@@ -437,5 +458,6 @@ __all__ = [
     "is_entry_blocked",
     "get_entry_block_reason",
     "record_exit",
+    "record_exit_event",
     "record_entry",
 ]
