@@ -1,24 +1,28 @@
 # ============================================================
 # File   : core/startup/discord_summary_kwarg_safety_patch.py
-# Version: V2.0-DISPLAY-KWARG-SAFETY-RICH-JA-REASONS
+# Version: V2.1-DISPLAY-KWARG-SAFETY-RICH-JA-STALE-GUARD
 # ------------------------------------------------------------
 # 目的:
-#   1) discord_summary_display_compact_patch 経由で interval=1 などが
-#      scheduler_jobs.summary.display.print_summary_top10() へ渡され、
-#      TypeError で表示が失敗する問題を防ぐ。
-#   2) Discord SUMMARY TOP10 の理由が flag_score など英語コードだけになる問題を補正する。
-#   3) PUSH由来で rank/chg/turn/tick が無い場合も、代替列・欠損理由を表示する。
+#   1) display系関数へ interval=1 等の未知kwargsが渡っても壊れないようにする。
+#   2) Discord SUMMARY TOP10 の理由を日本語で詳細化する。
+#   3) PUSH由来で rank/chg/turn/tick が無い場合も、欠損理由を明示する。
+#   4) 古い「結果時刻」のSUMMARYをDiscordへ送らない。
 #
-# V2.0:
-#   - _build_discord_candidate_2lines を最終上書きする。
-#   - 理由を日本語で詳細化する。
-#   - 出来高・売買代金・価格変化・出来高急増・VWAP・rank/tick の表示を追加する。
+# V2.1:
+#   - Discord送信直前に 結果時刻=YYYY-MM-DD HH:MM:SS を抽出。
+#   - 市場時間中に古いSUMMARYを送信しない。
+#   - 既定 stale 許容:
+#       1分=4分 / 3分=8分 / 5分=12分
+#     環境変数 SUMMARY_DISCORD_STALE_LIMIT_MIN で一括変更可。
 # ============================================================
 
 from __future__ import annotations
 
+import datetime as dt
 import inspect
 import logging
+import os
+import re
 from typing import Any, Callable
 
 import numpy as np
@@ -27,6 +31,10 @@ logger = logging.getLogger(__name__)
 _PATCHED = False
 _ORIGINALS: dict[str, Callable] = {}
 
+
+# ============================================================
+# kwargs safety
+# ============================================================
 
 def _is_df_like(v: Any) -> bool:
     try:
@@ -104,6 +112,10 @@ def _wrap(fn: Callable) -> Callable:
     _wrapped._original = fn  # type: ignore[attr-defined]
     return _wrapped
 
+
+# ============================================================
+# formatting helpers
+# ============================================================
 
 def _clean(v: Any, *, max_len: int = 24) -> str:
     try:
@@ -183,6 +195,108 @@ def _fmt_pct(v: Any, digits: int = 2) -> str:
     return f"{float(v):.{digits}f}%"
 
 
+# ============================================================
+# stale guard
+# ============================================================
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _extract_interval_min(text: str) -> int:
+    try:
+        m = re.search(r"(?:TOP10|SUMMARY TOP10)\s*\(?\s*(\d+)\s*(?:min|m|分)?", text, flags=re.I)
+        if m:
+            return max(1, int(m.group(1)))
+        m = re.search(r"\((\d+)\s*(?:min|m|分)?\)", text, flags=re.I)
+        if m:
+            return max(1, int(m.group(1)))
+    except Exception:
+        pass
+    return 1
+
+
+def _extract_result_dt(text: str) -> dt.datetime | None:
+    try:
+        m = re.search(r"結果時刻\s*=\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", text)
+        if not m:
+            return None
+        return dt.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def _stale_limit_min(interval_min: int) -> float:
+    override = os.getenv("SUMMARY_DISCORD_STALE_LIMIT_MIN")
+    if override is not None and str(override).strip() != "":
+        return _env_float("SUMMARY_DISCORD_STALE_LIMIT_MIN", 8.0)
+    if interval_min <= 1:
+        return _env_float("SUMMARY_DISCORD_STALE_LIMIT_1MIN", 4.0)
+    if interval_min <= 3:
+        return _env_float("SUMMARY_DISCORD_STALE_LIMIT_3MIN", 8.0)
+    if interval_min <= 5:
+        return _env_float("SUMMARY_DISCORD_STALE_LIMIT_5MIN", 12.0)
+    return _env_float("SUMMARY_DISCORD_STALE_LIMIT_OTHER", 15.0)
+
+
+def _should_skip_stale_discord(lines: list[str], title: str | None) -> tuple[bool, str]:
+    try:
+        if str(os.getenv("SUMMARY_DISCORD_STALE_GUARD", "1")).strip().lower() in {"0", "false", "no", "off"}:
+            return False, "disabled"
+
+        text = (str(title or "") + "\n" + "\n".join(str(x) for x in (lines or [])))[:6000]
+        if "SUMMARY TOP10" not in text and "PUSH SUMMARY TOP10" not in text and "RANKING SUMMARY TOP10" not in text:
+            return False, "not_summary"
+
+        result_dt = _extract_result_dt(text)
+        if result_dt is None:
+            return False, "no_result_time"
+
+        interval_min = _extract_interval_min(text)
+        now = dt.datetime.now().replace(tzinfo=None, microsecond=0)
+        age_min = (now - result_dt).total_seconds() / 60.0
+        limit = _stale_limit_min(interval_min)
+
+        if age_min > limit:
+            return True, f"result_dt={result_dt} now={now} age_min={age_min:.1f} limit_min={limit:.1f} interval={interval_min}"
+        return False, f"fresh age_min={age_min:.1f} limit_min={limit:.1f} interval={interval_min}"
+    except Exception as e:
+        return False, f"guard_error={e}"
+
+
+def _install_stale_send_guard(disp: Any) -> int:
+    try:
+        old = getattr(disp, "_send_to_discord", None)
+        if not callable(old) or getattr(old, "_summary_discord_stale_guard_v21", False):
+            return 0
+
+        def _send_guarded(lines: list[str], title: str | None = None) -> None:
+            skip, reason = _should_skip_stale_discord(lines or [], title)
+            if skip:
+                logger.warning("[DISCORD SUMMARY STALE GUARD] skip old summary discord %s", reason)
+                return None
+            logger.info("[DISCORD SUMMARY STALE GUARD] allow summary discord %s", reason)
+            return old(lines, title=title)
+
+        _send_guarded._summary_discord_stale_guard_v21 = True  # type: ignore[attr-defined]
+        _send_guarded._original = old  # type: ignore[attr-defined]
+        disp._send_to_discord = _send_guarded
+        return 1
+    except Exception:
+        logger.exception("[DISCORD SUMMARY STALE GUARD] install failed")
+        return 0
+
+
+# ============================================================
+# Japanese rich reason / candidate line
+# ============================================================
+
 def _reason_ja(row: Any, side: str) -> str:
     side_u = str(side or "").upper()
     parts: list[str] = []
@@ -203,17 +317,11 @@ def _reason_ja(row: Any, side: str) -> str:
     if side_u == "BUY":
         if buy > 0:
             parts.append(f"買いスコア優勢 buy={buy:.2f}")
-        if slope > 0:
-            parts.append(f"上向き傾き slope={slope:.4f}")
-        elif slope <= 0:
-            parts.append(f"傾きは弱い slope={slope:.4f}")
+        parts.append(f"上向き傾き slope={slope:.4f}" if slope > 0 else f"傾きは弱い slope={slope:.4f}")
     else:
         if sell > 0:
             parts.append(f"売りスコア優勢 sell={sell:.2f}")
-        if slope < 0:
-            parts.append(f"下向き傾き slope={slope:.4f}")
-        elif slope >= 0:
-            parts.append(f"下落傾きは弱い slope={slope:.4f}")
+        parts.append(f"下向き傾き slope={slope:.4f}" if slope < 0 else f"下落傾きは弱い slope={slope:.4f}")
 
     if base:
         parts.append(f"基礎点={base:.2f}")
@@ -258,7 +366,6 @@ def _rich_candidate_line(i: int, row: Any, *, side: str) -> str:
     rsi = _first(row, ("disp_rsi", "rsi"), np.nan)
     macd = _first(row, ("disp_macd", "macd"), np.nan)
     signal = _first(row, ("disp_signal", "signal", "macd_signal"), np.nan)
-
     base = _first(row, ("disp_base", "score_base", "breakdown_base", "base_score", "base"), np.nan)
     trend = _first(row, ("disp_trend", "score_trend", "breakdown_trend", "trend_score", "trend"), np.nan)
     mom = _first(row, ("disp_mom", "score_momentum", "breakdown_mom", "score_mom", "momentum_score", "mom", "momentum"), np.nan)
@@ -278,11 +385,9 @@ def _rich_candidate_line(i: int, row: Any, *, side: str) -> str:
     pc1 = _first(row, ("price_change_pct_1m", "change_pct_1m", "change_rate_1m", "ret_1m"), np.nan)
     pc3 = _first(row, ("price_change_pct_3m", "change_pct_3m", "change_rate_3m", "ret_3m"), np.nan)
     pc5 = _first(row, ("price_change_pct_5m", "change_pct_5m", "change_rate_5m", "ret_5m"), np.nan)
-
     vs3 = _first(row, ("volume_surge_ratio_3m", "vol_surge_3m"), np.nan)
     vs5 = _first(row, ("volume_surge_ratio_5m", "vol_surge_5m"), np.nan)
     vsmax = _first(row, ("max_volume_surge_ratio", "_max_volume_surge_ratio"), np.nan)
-
     vwap = _first(row, ("vwap", "disp_vwap"), np.nan)
     above = _first(row, ("vwap_stable_above",), np.nan)
     below = _first(row, ("vwap_stable_below",), np.nan)
@@ -320,7 +425,7 @@ def _install_rich_discord_builder(disp: Any) -> int:
         if callable(old):
             def _candidate(i: int, row: Any, *, side: str) -> str:
                 return _rich_candidate_line(i, row, side=side)
-            _candidate._discord_rich_ja_reasons_v2 = True  # type: ignore[attr-defined]
+            _candidate._discord_rich_ja_reasons_v21 = True  # type: ignore[attr-defined]
             _candidate._original = old  # type: ignore[attr-defined]
             disp._build_discord_candidate_2lines = _candidate
             patched += 1
@@ -328,7 +433,7 @@ def _install_rich_discord_builder(disp: Any) -> int:
         old_reason = getattr(disp, "_reason_text_for_discord", None)
         def _reason(row: Any, side: str) -> str:
             return _reason_ja(row, side)
-        _reason._discord_rich_ja_reasons_v2 = True  # type: ignore[attr-defined]
+        _reason._discord_rich_ja_reasons_v21 = True  # type: ignore[attr-defined]
         _reason._original = old_reason  # type: ignore[attr-defined]
         disp._reason_text_for_discord = _reason
         patched += 1
@@ -336,6 +441,10 @@ def _install_rich_discord_builder(disp: Any) -> int:
         logger.exception("[DISCORD KWARG SAFETY] rich discord builder install failed")
     return patched
 
+
+# ============================================================
+# install
+# ============================================================
 
 def install() -> bool:
     global _PATCHED
@@ -361,8 +470,14 @@ def install() -> bool:
                 patched += 1
 
         rich_patched = _install_rich_discord_builder(disp)
+        stale_patched = _install_stale_send_guard(disp)
         _PATCHED = True
-        logger.warning("[DISCORD KWARG SAFETY] installed V2 patched=%s rich_builder=%s", patched, rich_patched)
+        logger.warning(
+            "[DISCORD KWARG SAFETY] installed V2.1 patched=%s rich_builder=%s stale_guard=%s",
+            patched,
+            rich_patched,
+            stale_patched,
+        )
         return True
     except Exception:
         logger.exception("[DISCORD KWARG SAFETY] install failed")
