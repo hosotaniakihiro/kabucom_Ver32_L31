@@ -1,11 +1,16 @@
 # ============================================================
 # File   : core/startup/ranking_summary_schedule_bg_patch.py
-# Version: V4-RANKING-SUMMARY-BG-NO-RECURSION
+# Version: V5-RANKING-SUMMARY-BG-TIMEOUT-COOLDOWN
 # ------------------------------------------------------------
 # 目的:
-#   ranking_summary_all の schedule job が数分間 running のまま残り、
-#   previous still running / internal_previous_still_running で
-#   スキップされ続ける問題を防ぐ。
+#   ranking_summary_all の schedule job が長時間 running のまま残り、
+#   毎分 bg_still_running でスキップされ続ける問題を抑える。
+#
+# V5:
+#   - BG実行が一定秒数を超えたら timeout 扱いにして cooldown へ入れる
+#   - timeout/cooldown中は新しいBGを投入しない
+#   - 古いBGスレッド自体はPython上killできないため、scheduler側だけ即復帰させる
+#   - 既定では main.py 側のランキングサマリーBGを重くしない
 #
 # V4:
 #   - V3の再帰を解消
@@ -16,6 +21,8 @@
 #
 # ENV:
 #   RANKING_SUMMARY_SCHEDULE_BG=1
+#   RANKING_SUMMARY_BG_TIMEOUT_SEC=55
+#   RANKING_SUMMARY_BG_COOLDOWN_SEC=180
 #   RANKING_SUMMARY_BG_STALE_SEC=120
 #   RANKING_SUMMARY_INTERNAL_STALE_SEC=120
 # ============================================================
@@ -37,6 +44,8 @@ _EXECUTOR: ThreadPoolExecutor | None = None
 _LOCK = threading.RLock()
 _RUNNING = False
 _STARTED_AT: dt.datetime | None = None
+_COOLDOWN_UNTIL: dt.datetime | None = None
+_TIMEOUT_STREAK = 0
 _ORIGINAL_SB = None
 
 
@@ -79,6 +88,69 @@ def _elapsed_sec() -> float:
         return max(0.0, (dt.datetime.now() - _STARTED_AT).total_seconds())
     except Exception:
         return 0.0
+
+
+def _cooldown_seconds() -> float:
+    try:
+        base = _env_float("RANKING_SUMMARY_BG_COOLDOWN_SEC", 180.0)
+        max_sec = _env_float("RANKING_SUMMARY_BG_COOLDOWN_MAX_SEC", 600.0)
+        streak = max(1, int(_TIMEOUT_STREAK or 1))
+        return min(max_sec, base * streak)
+    except Exception:
+        return 180.0
+
+
+def _enter_cooldown(reason: str, *, elapsed: float) -> None:
+    global _RUNNING, _STARTED_AT, _COOLDOWN_UNTIL, _TIMEOUT_STREAK
+    try:
+        _TIMEOUT_STREAK += 1
+        cool_sec = _cooldown_seconds()
+        _COOLDOWN_UNTIL = dt.datetime.now() + dt.timedelta(seconds=cool_sec)
+        _RUNNING = False
+        _STARTED_AT = None
+        _set_scheduler_bootstrap_running(False)
+        logger.warning(
+            "[RANKING SUMMARY BG PATCH] timeout cooldown reason=%s elapsed=%.3fs timeout_streak=%s cooldown_sec=%.1f until=%s",
+            reason,
+            elapsed,
+            _TIMEOUT_STREAK,
+            cool_sec,
+            _COOLDOWN_UNTIL,
+        )
+    except Exception:
+        logger.debug("[RANKING SUMMARY BG PATCH] enter cooldown failed", exc_info=True)
+
+
+def _check_timeout_or_cooldown_locked() -> bool:
+    """Trueなら今回submitしない。_LOCK内から呼ぶ。"""
+    global _COOLDOWN_UNTIL
+    try:
+        now = dt.datetime.now()
+        if _COOLDOWN_UNTIL is not None and now < _COOLDOWN_UNTIL:
+            remain = (_COOLDOWN_UNTIL - now).total_seconds()
+            logger.warning(
+                "[RANKING SUMMARY BG PATCH] submit skipped reason=timeout_cooldown remain=%.1fs until=%s timeout_streak=%s",
+                remain,
+                _COOLDOWN_UNTIL,
+                _TIMEOUT_STREAK,
+            )
+            return True
+        if _COOLDOWN_UNTIL is not None and now >= _COOLDOWN_UNTIL:
+            logger.warning("[RANKING SUMMARY BG PATCH] cooldown expired until=%s", _COOLDOWN_UNTIL)
+            _COOLDOWN_UNTIL = None
+
+        if _RUNNING:
+            elapsed = _elapsed_sec()
+            timeout_sec = _env_float("RANKING_SUMMARY_BG_TIMEOUT_SEC", 55.0)
+            if elapsed >= timeout_sec:
+                _enter_cooldown("bg_timeout", elapsed=elapsed)
+                return True
+            logger.warning("[RANKING SUMMARY BG PATCH] submit skipped reason=bg_still_running elapsed=%.3fs timeout=%.1fs", elapsed, timeout_sec)
+            return True
+        return False
+    except Exception:
+        logger.debug("[RANKING SUMMARY BG PATCH] timeout/cooldown check failed", exc_info=True)
+        return False
 
 
 def _clear_bg_if_stale() -> bool:
@@ -160,7 +232,6 @@ def _set_scheduler_bootstrap_running(value: bool, *, started_at: dt.datetime | N
 
 
 def _run_core_ranking_summary_job() -> Any:
-    """scheduler_bootstrapの便利関数を使いながら、再帰せずランキング本体を直接実行する。"""
     import core.startup.scheduler_bootstrap as sb
 
     started = dt.datetime.now()
@@ -184,11 +255,7 @@ def _run_core_ranking_summary_job() -> Any:
             sb._set_global_attr("last_ranking_summary_job_result", sb._summarize_result(result))
         except Exception:
             pass
-        logger.warning(
-            "[RANKING SUMMARY BG PATCH] core ranking job done elapsed=%.3fs result=%s",
-            elapsed,
-            sb._summarize_result(result),
-        )
+        logger.warning("[RANKING SUMMARY BG PATCH] core ranking job done elapsed=%.3fs result=%s", elapsed, sb._summarize_result(result))
         try:
             announce_results = sb._announce_ranking_summary_intervals_safe(top_n=10, use_discord=True, intervals=(1, 3, 5))
             sb._set_global_attr("last_ranking_summary_announce_results", announce_results)
@@ -204,13 +271,15 @@ def _run_core_ranking_summary_job() -> Any:
 
 
 def _bg_task(started_at: dt.datetime) -> None:
-    global _RUNNING, _STARTED_AT
+    global _RUNNING, _STARTED_AT, _TIMEOUT_STREAK
     t0 = time.perf_counter()
     try:
         _clear_scheduler_bootstrap_internal_if_stale(reason="bg_task_before_core")
         logger.warning("[RANKING SUMMARY BG PATCH] bg start started_at=%s", started_at)
         _run_core_ranking_summary_job()
-        logger.warning("[RANKING SUMMARY BG PATCH] bg done elapsed=%.3fs", time.perf_counter() - t0)
+        elapsed = time.perf_counter() - t0
+        _TIMEOUT_STREAK = 0
+        logger.warning("[RANKING SUMMARY BG PATCH] bg done elapsed=%.3fs", elapsed)
     except Exception:
         logger.exception("[RANKING SUMMARY BG PATCH] bg failed elapsed=%.3fs", time.perf_counter() - t0)
     finally:
@@ -220,7 +289,6 @@ def _bg_task(started_at: dt.datetime) -> None:
 
 
 def _scheduler_bootstrap_job_wrapper(*args: Any, **kwargs: Any):
-    """scheduleから呼ばれる軽量入口。再帰防止のため旧jobは呼ばず、BGへ直接投入する。"""
     global _RUNNING, _STARTED_AT
     _clear_scheduler_bootstrap_internal_if_stale(reason="direct_wrapper_entry")
     if not _env_bool("RANKING_SUMMARY_SCHEDULE_BG", True):
@@ -228,8 +296,7 @@ def _scheduler_bootstrap_job_wrapper(*args: Any, **kwargs: Any):
 
     with _LOCK:
         _clear_bg_if_stale()
-        if _RUNNING:
-            logger.warning("[RANKING SUMMARY BG PATCH] submit skipped reason=bg_still_running elapsed=%.3fs", _elapsed_sec())
+        if _check_timeout_or_cooldown_locked():
             return None
         _RUNNING = True
         _STARTED_AT = dt.datetime.now()
@@ -273,9 +340,9 @@ def _patch_scheduler_bootstrap_direct() -> bool:
         if not callable(cur):
             logger.warning("[RANKING SUMMARY BG PATCH] scheduler_bootstrap direct target not callable")
             return False
-        if not getattr(cur, "_ranking_summary_direct_bg_v4", False):
+        if not getattr(cur, "_ranking_summary_direct_bg_v5", False):
             _ORIGINAL_SB = cur
-            _scheduler_bootstrap_job_wrapper._ranking_summary_direct_bg_v4 = True  # type: ignore[attr-defined]
+            _scheduler_bootstrap_job_wrapper._ranking_summary_direct_bg_v5 = True  # type: ignore[attr-defined]
             _scheduler_bootstrap_job_wrapper._original = cur  # type: ignore[attr-defined]
             sb._run_ranking_summary_all_job_safe = _scheduler_bootstrap_job_wrapper
         changed = _replace_schedule_job_refs(cur, _scheduler_bootstrap_job_wrapper)
@@ -293,8 +360,10 @@ def install() -> bool:
     _clear_scheduler_bootstrap_internal_if_stale(reason="install_final")
     _PATCHED = bool(direct_ok)
     logger.warning(
-        "[RANKING SUMMARY BG PATCH] installed V4 enabled=%s bg_stale_sec=%.1f internal_stale_sec=%.1f direct_ok=%s",
+        "[RANKING SUMMARY BG PATCH] installed V5 enabled=%s bg_timeout=%.1f cooldown=%.1f bg_stale_sec=%.1f internal_stale_sec=%.1f direct_ok=%s",
         _env_bool("RANKING_SUMMARY_SCHEDULE_BG", True),
+        _env_float("RANKING_SUMMARY_BG_TIMEOUT_SEC", 55.0),
+        _env_float("RANKING_SUMMARY_BG_COOLDOWN_SEC", 180.0),
         _env_float("RANKING_SUMMARY_BG_STALE_SEC", 120.0),
         _env_float("RANKING_SUMMARY_INTERNAL_STALE_SEC", 120.0),
         direct_ok,
