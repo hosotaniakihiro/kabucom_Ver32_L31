@@ -1,11 +1,19 @@
 # ============================================================
 # File   : core/startup/ranking_entry_flat_price_guard_patch.py
-# Version: V1.2-RANKING-DB-FALLBACK-USE-USABLE-PATH-API
+# Version: V1.3-SILENT-LAST-CHANCE-VOLUME-NORMALIZE
 # ------------------------------------------------------------
 # 目的:
 #   1) ランキング由来ENTRYで、価格横ばいだけで大量DROPされる問題を緩和する。
 #   2) ranking_entry が global_data のランキングDFだけを見て no_ranking_df で止まる問題を、
 #      ats.ats_ranking.db_path.get_usable_ranking_db_path() からのfallbackで補正する。
+#   3) last-chance volume normalize の銘柄別ログを既定OFFにして、ログ大量出力と処理遅延を抑える。
+#
+# V1.3:
+#   - [RANKING FLAT PRICE PATCH] last-chance volume normalize を既定では出さない
+#   - 同一(symbol, price, volume, turnover)の補正結果をキャッシュ
+#   - 詳細確認時のみ以下でログ出力
+#       RANKING_FLAT_PRICE_PATCH_LOG_NORMALIZE=1
+#       RANKING_FLAT_PRICE_PATCH_LOG_FIRST_N=30
 #
 # V1.2:
 #   - 存在しない resolve_ranking_db_path import を廃止
@@ -27,6 +35,10 @@ logger = logging.getLogger(__name__)
 _PATCHED = False
 _ORIGINAL_FILTER = None
 _ORIGINAL_GET_RANKING_SOURCE_DF = None
+
+_NORMALIZE_CACHE: dict[tuple[str, float, float, float], dict[str, Any]] = {}
+_LOGGED_NORMALIZE_KEYS: set[tuple[str, float, float, float]] = set()
+_LOG_NORMALIZE_COUNT = 0
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -84,6 +96,29 @@ def _get_cfg() -> dict:
         return {}
 
 
+def _normalize_key(row: Dict[str, Any], price: float, volume: float, turnover: float) -> tuple[str, float, float, float]:
+    return (
+        str(row.get("symbol") or "").strip(),
+        round(float(price), 4),
+        round(float(volume), 4),
+        round(float(turnover), 4),
+    )
+
+
+def _should_log_normalize(key: tuple[str, float, float, float]) -> bool:
+    global _LOG_NORMALIZE_COUNT
+    if _env_bool("RANKING_FLAT_PRICE_PATCH_LOG_NORMALIZE", False):
+        return True
+    limit = _env_int("RANKING_FLAT_PRICE_PATCH_LOG_FIRST_N", 0)
+    if limit <= 0:
+        return False
+    if key in _LOGGED_NORMALIZE_KEYS:
+        return False
+    _LOGGED_NORMALIZE_KEYS.add(key)
+    _LOG_NORMALIZE_COUNT += 1
+    return _LOG_NORMALIZE_COUNT <= limit
+
+
 def _repair_volume_units(row: Dict[str, Any]) -> Dict[str, Any]:
     cfg = _get_cfg()
     vol_cfg = cfg.get("VOLUME", {}) if isinstance(cfg, dict) else {}
@@ -96,6 +131,12 @@ def _repair_volume_units(row: Dict[str, Any]) -> Dict[str, Any]:
     turnover = _f(row.get("turnover") or row.get("trading_value"), 0.0)
     raw_v = volume
     raw_t = turnover
+    key = _normalize_key(row, price, raw_v, raw_t)
+
+    cached = _NORMALIZE_CACHE.get(key)
+    if cached is not None:
+        row.update(cached)
+        return row
 
     if 0 < volume < min_volume and mul > 1:
         volume = volume * mul
@@ -113,7 +154,22 @@ def _repair_volume_units(row: Dict[str, Any]) -> Dict[str, Any]:
         row["turnover"] = turnover
         row["trading_value"] = turnover
 
-    if raw_v != volume or raw_t != turnover:
+    updates = {
+        "volume": row.get("volume", volume),
+        "trading_volume": row.get("trading_volume", volume),
+        "turnover": row.get("turnover", turnover),
+        "trading_value": row.get("trading_value", turnover),
+    }
+    if row.get("ranking_last_chance_volume_fixed"):
+        updates["ranking_last_chance_volume_fixed"] = True
+        updates["ranking_last_chance_volume_raw"] = raw_v
+
+    if len(_NORMALIZE_CACHE) >= _env_int("RANKING_FLAT_PRICE_PATCH_CACHE_MAX", 20000):
+        _NORMALIZE_CACHE.clear()
+        _LOGGED_NORMALIZE_KEYS.clear()
+    _NORMALIZE_CACHE[key] = dict(updates)
+
+    if (raw_v != volume or raw_t != turnover) and _should_log_normalize(key):
         logger.info(
             "[RANKING FLAT PRICE PATCH] last-chance volume normalize symbol=%s price=%s volume %s->%s turnover %s->%s min_volume=%s",
             row.get("symbol"), price, raw_v, volume, raw_t, turnover, min_volume,
@@ -157,10 +213,11 @@ def _patched_filter(row: Dict[str, Any], side: str, prev_h: Dict[str, Any], scor
                     patched_prev["last_price"] = price * 1.000001
             ok2, reason2 = _ORIGINAL_FILTER(row, side, patched_prev, score, parts)
             if ok2:
-                logger.info(
-                    "[RANKING FLAT PRICE PATCH] pass flat price symbol=%s side=%s rank=%s prev_rank=%s reason=%s",
-                    row.get("symbol"), side, row.get("rank_position"), prev_h.get("last_rank_position"), reason,
-                )
+                if _env_bool("RANKING_FLAT_PRICE_PATCH_LOG_PASS", False):
+                    logger.info(
+                        "[RANKING FLAT PRICE PATCH] pass flat price symbol=%s side=%s rank=%s prev_rank=%s reason=%s",
+                        row.get("symbol"), side, row.get("rank_position"), prev_h.get("last_rank_position"), reason,
+                    )
                 return True, "OK_FLAT_PRICE_RANK_STRONG"
             return False, reason2
         return ok, reason
@@ -282,7 +339,11 @@ def install() -> bool:
             efr._get_ranking_source_df = _patched_get_ranking_source_df
 
         _PATCHED = True
-        logger.warning("[RANKING FLAT PRICE PATCH] installed v1.2 db_fallback=True")
+        logger.warning(
+            "[RANKING FLAT PRICE PATCH] installed v1.3 db_fallback=True silent_normalize=%s log_first_n=%s",
+            not _env_bool("RANKING_FLAT_PRICE_PATCH_LOG_NORMALIZE", False),
+            _env_int("RANKING_FLAT_PRICE_PATCH_LOG_FIRST_N", 0),
+        )
         return True
     except Exception:
         logger.exception("[RANKING FLAT PRICE PATCH] install failed")
