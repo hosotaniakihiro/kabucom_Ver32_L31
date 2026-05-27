@@ -1,29 +1,28 @@
 # ============================================================
 # File   : core/startup/tonosama_history_missing_guard_patch.py
-# Version: V2-TONOSAMA-HISTORY-MISSING-STRONG-MOVE-ALLOW
+# Version: V2.1-TONOSAMA-HISTORY-MISSING-BALANCED-ALLOW
 # ------------------------------------------------------------
 # 目的:
 #   _volume_surge_history_missing=True / _volume_surge_failopen=True の行を
-#   原則除外する。ただし、後場寄り直後などで3m/5mの出来高履歴が
-#   足りない場合でも、価格変化・値幅・slope が十分強いものだけは残す。
+#   原則は注意扱いにしつつ、実際の値動きがあるものはTONOSAMA本体へ渡す。
 #
 # 背景:
-#   12:52ログでは 1m/3m/5m summary は最新化されていたが、
-#   volume_surge の rolling 履歴不足により全行 _volume_surge_failopen=True。
-#   V1 は全落ちさせるため TONOSAMA が完全停止していた。
+#   12:52ログでは volume_surge.py が forced fail-open で44行を作ったが、
+#   V2 の強い動き条件 price_change>=0.20% / range>=1.50% が厳しく、
+#   TONOSAMA HISTORY GUARD が44行すべてDROPして base feature empty に戻した。
 #
-# 安全方針:
-#   - 偽の出来高急増 3.0x だけでは通さない
-#   - _max_price_change_pct / _intrabar_range_pct / _slope の実値が強い場合だけ通す
-#   - マイナス方向はBUY候補としては落ちるため、ここでは絶対値ではなく正方向を見る
+# 方針:
+#   - 出来高急増率3.0xはfailopen由来なので信用しすぎない。
+#   - ただし、TONOSAMA本体の一次条件に近い実値条件を満たせば通す。
+#   - 通した後も runner 側の latest_volume / price_change / slope / 5秒足 / AI fallback / 発注直前ガードで絞る。
 #
 # ENV:
 #   TONOSAMA_HISTORY_MISSING_GUARD_ENABLED=1
 #   TONOSAMA_ALLOW_HISTORY_MISSING_ENTRY=0
 #   TONOSAMA_ALLOW_HISTORY_MISSING_STRONG_MOVE=1
-#   TONOSAMA_HISTORY_MISSING_MIN_PRICE_CHANGE_PCT=0.20
-#   TONOSAMA_HISTORY_MISSING_MIN_INTRABAR_RANGE_PCT=1.50
-#   TONOSAMA_HISTORY_MISSING_MIN_SLOPE=0.0005
+#   TONOSAMA_HISTORY_MISSING_MIN_PRICE_CHANGE_PCT=0.05
+#   TONOSAMA_HISTORY_MISSING_MIN_INTRABAR_RANGE_PCT=0.10
+#   TONOSAMA_HISTORY_MISSING_MIN_SLOPE=0.0003
 # ============================================================
 
 from __future__ import annotations
@@ -65,6 +64,16 @@ def _env_float(name: str, default: float) -> float:
         return float(raw)
     except Exception:
         return float(default)
+
+
+def _setdefault_env(name: str, value: str) -> None:
+    try:
+        cur = os.getenv(name)
+        if cur is None or str(cur).strip() == "":
+            os.environ[name] = str(value)
+            logger.warning("[TONOSAMA HISTORY GUARD] env default set %s=%s", name, value)
+    except Exception:
+        pass
 
 
 def _num_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
@@ -124,16 +133,12 @@ def _strong_move_mask(df: pd.DataFrame) -> pd.Series:
     body = _num_series(df, "_body_change_pct", 0.0)
     slope = _num_series(df, "_slope", 0.0)
 
-    min_price_chg = _env_float("TONOSAMA_HISTORY_MISSING_MIN_PRICE_CHANGE_PCT", 0.20)
-    min_range = _env_float("TONOSAMA_HISTORY_MISSING_MIN_INTRABAR_RANGE_PCT", 1.50)
-    min_slope = _env_float("TONOSAMA_HISTORY_MISSING_MIN_SLOPE", 0.0005)
+    min_price_chg = _env_float("TONOSAMA_HISTORY_MISSING_MIN_PRICE_CHANGE_PCT", 0.05)
+    min_range = _env_float("TONOSAMA_HISTORY_MISSING_MIN_INTRABAR_RANGE_PCT", 0.10)
+    min_slope = _env_float("TONOSAMA_HISTORY_MISSING_MIN_SLOPE", 0.0003)
+    min_body = _env_float("TONOSAMA_HISTORY_MISSING_MIN_BODY_CHANGE_PCT", 0.0)
 
-    # 出来高急増率はfailopen由来で信用しない。実際の価格変化・値幅・slopeだけを見る。
-    # bodyが入っている場合は、ヒゲだけの荒れではなく実体変化も少し要求する。
-    body_ok = body >= _env_float("TONOSAMA_HISTORY_MISSING_MIN_BODY_CHANGE_PCT", 0.02)
-    body_missing = "_body_change_pct" not in df.columns
-    body_cond = body_ok if not body_missing else pd.Series(True, index=df.index, dtype="bool")
-
+    body_cond = (body >= min_body) if "_body_change_pct" in df.columns else pd.Series(True, index=df.index, dtype="bool")
     return (price_chg >= min_price_chg) & (intrabar >= min_range) & (slope >= min_slope) & body_cond
 
 
@@ -141,7 +146,9 @@ def _drop_history_missing_failopen(df: pd.DataFrame, *, stage: str) -> pd.DataFr
     if df is None or df.empty:
         return pd.DataFrame()
     if _env_bool("TONOSAMA_ALLOW_HISTORY_MISSING_ENTRY", False):
+        logger.warning("[TONOSAMA HISTORY GUARD] allow all history-missing entries by env stage=%s rows=%s", stage, len(df))
         return df
+
     has_missing = "_volume_surge_history_missing" in df.columns
     has_failopen = "_volume_surge_failopen" in df.columns
     if not has_missing and not has_failopen:
@@ -164,18 +171,18 @@ def _drop_history_missing_failopen(df: pd.DataFrame, *, stage: str) -> pd.DataFr
 
     if not kept_hist.empty:
         logger.warning(
-            "[TONOSAMA HISTORY GUARD] allow strong move despite missing history stage=%s kept=%s threshold_price_chg=%.3f threshold_range=%.3f threshold_slope=%.5f sample=%s",
+            "[TONOSAMA HISTORY GUARD] allow balanced move despite missing history stage=%s kept=%s threshold_price_chg=%.3f threshold_range=%.3f threshold_slope=%.5f sample=%s",
             stage,
             len(kept_hist),
-            _env_float("TONOSAMA_HISTORY_MISSING_MIN_PRICE_CHANGE_PCT", 0.20),
-            _env_float("TONOSAMA_HISTORY_MISSING_MIN_INTRABAR_RANGE_PCT", 1.50),
-            _env_float("TONOSAMA_HISTORY_MISSING_MIN_SLOPE", 0.0005),
+            _env_float("TONOSAMA_HISTORY_MISSING_MIN_PRICE_CHANGE_PCT", 0.05),
+            _env_float("TONOSAMA_HISTORY_MISSING_MIN_INTRABAR_RANGE_PCT", 0.10),
+            _env_float("TONOSAMA_HISTORY_MISSING_MIN_SLOPE", 0.0003),
             _sample(kept_hist),
         )
 
     if not dropped.empty:
         logger.warning(
-            "[TONOSAMA HISTORY GUARD] dropped stage=%s before=%s after=%s dropped=%s reason=volume_surge_history_missing_or_failopen_not_strong_enough sample=%s",
+            "[TONOSAMA HISTORY GUARD] dropped stage=%s before=%s after=%s dropped=%s reason=history_missing_not_enough_real_move sample=%s",
             stage,
             before,
             len(out),
@@ -196,6 +203,13 @@ def install() -> bool:
     global _PATCHED, _ORIGINAL_BUILD
     if _PATCHED:
         return True
+
+    _setdefault_env("TONOSAMA_ALLOW_HISTORY_MISSING_STRONG_MOVE", "1")
+    _setdefault_env("TONOSAMA_HISTORY_MISSING_MIN_PRICE_CHANGE_PCT", "0.05")
+    _setdefault_env("TONOSAMA_HISTORY_MISSING_MIN_INTRABAR_RANGE_PCT", "0.10")
+    _setdefault_env("TONOSAMA_HISTORY_MISSING_MIN_SLOPE", "0.0003")
+    _setdefault_env("TONOSAMA_HISTORY_MISSING_MIN_BODY_CHANGE_PCT", "0.0")
+
     if not _env_bool("TONOSAMA_HISTORY_MISSING_GUARD_ENABLED", True):
         logger.warning("[TONOSAMA HISTORY GUARD] disabled by env")
         return False
@@ -218,9 +232,12 @@ def install() -> bool:
         runner.build_scalping_feature_df = _patched_build_scalping_feature_df
         _PATCHED = True
         logger.warning(
-            "[TONOSAMA HISTORY GUARD] installed v2 allow_history_missing=%s allow_strong_move=%s",
+            "[TONOSAMA HISTORY GUARD] installed v2.1 allow_history_missing=%s allow_strong_move=%s min_price_chg=%s min_range=%s min_slope=%s",
             _env_bool("TONOSAMA_ALLOW_HISTORY_MISSING_ENTRY", False),
             _env_bool("TONOSAMA_ALLOW_HISTORY_MISSING_STRONG_MOVE", True),
+            _env_float("TONOSAMA_HISTORY_MISSING_MIN_PRICE_CHANGE_PCT", 0.05),
+            _env_float("TONOSAMA_HISTORY_MISSING_MIN_INTRABAR_RANGE_PCT", 0.10),
+            _env_float("TONOSAMA_HISTORY_MISSING_MIN_SLOPE", 0.0003),
         )
         return True
     except Exception:
