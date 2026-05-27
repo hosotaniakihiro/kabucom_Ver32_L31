@@ -1,19 +1,26 @@
 # ============================================================
 # File   : core/startup/scheduler_exit_bootstrap.py
-# Version: FINAL-PRODUCTION-REV1.1-EXIT-EMPTY-FAST-SKIP
+# Version: FINAL-PRODUCTION-REV1.2-EXIT-BROKER-EMPTY-IMMEDIATE-SKIP
 # ------------------------------------------------------------
 # 【概要】
 #   EXIT order sender 接続と EXIT loop scheduler 登録。
 #
+# REV1.2:
+#   - open_position_sync_throttle_patch が設定する実際の属性名
+#       open_positions_source_mode
+#       open_positions_broker_read_ok
+#       open_positions_synced_count
+#     を見て、broker authoritative empty なら exit_loop_5s を初回から即skip
+#   - これにより建玉なしでも18秒走って previous still running になる問題を抑止
+#   - 建玉ありそうなglobal状態があれば従来通りexit_loopを実行
+#
 # REV1.1:
-#   - exit_loop_5s が建玉なしでも18秒前後かかり、5秒周期に追いつかず
-#     previous still running になる問題を抑止
-#   - 建玉なしが確認できた直後は短いTTLだけexit_loopをスキップ
-#   - open_position系のglobal状態で建玉ありそうな場合はスキップしない
+#   - 建玉なし確認後、短いTTLだけexit_loopをスキップ
 #
 # ENV:
 #   EXIT_EMPTY_FAST_SKIP_ENABLED=1
 #   EXIT_EMPTY_FAST_SKIP_TTL_SEC=10
+#   EXIT_BROKER_EMPTY_IMMEDIATE_SKIP=1
 # ============================================================
 
 from __future__ import annotations
@@ -42,9 +49,9 @@ def _env_bool(name: str, default: bool = True) -> bool:
         if raw is None or str(raw).strip() == "":
             return bool(default)
         s = str(raw).strip().lower()
-        if s in {"1", "true", "yes", "y", "on", "enable", "enabled"}:
+        if s in {"1", "true", "yes", "y", "on", "enable", "enabled", "ok"}:
             return True
-        if s in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+        if s in {"0", "false", "no", "n", "off", "disable", "disabled", "ng"}:
             return False
     except Exception:
         pass
@@ -86,17 +93,42 @@ def _global_has_open_positions_hint() -> bool:
             "position_cache",
             "open_position_cache",
             "current_positions",
+            "positions",
         ):
             if _as_len(getattr(global_data, name, None)) > 0:
+                logger.debug("[EXIT SCHEDULER] open position hint attr=%s len>0", name)
                 return True
-        broker_empty = bool(getattr(global_data, "open_position_broker_authoritative_empty", False))
-        broker_empty_until = getattr(global_data, "open_position_broker_authoritative_empty_until", None)
-        if broker_empty:
+    except Exception:
+        pass
+    return False
+
+
+def _broker_authoritative_empty_hint() -> bool:
+    """open_position_sync_throttle_patch の broker empty キャッシュを利用する。"""
+    if not _env_bool("EXIT_BROKER_EMPTY_IMMEDIATE_SKIP", True):
+        return False
+    if _global_has_open_positions_hint():
+        return False
+    try:
+        mode = str(getattr(global_data, "open_positions_source_mode", "") or "")
+        read_ok = bool(getattr(global_data, "open_positions_broker_read_ok", False))
+        cnt = int(getattr(global_data, "open_positions_synced_count", 0) or 0)
+        if read_ok and cnt == 0 and mode.startswith("broker_credit_authoritative_empty"):
+            return True
+    except Exception:
+        pass
+
+    # 互換: 旧名が設定されている環境も見る。
+    try:
+        old_empty = bool(getattr(global_data, "open_position_broker_authoritative_empty", False))
+        old_until = getattr(global_data, "open_position_broker_authoritative_empty_until", None)
+        if old_empty:
+            if old_until is None:
+                return True
             try:
-                if broker_empty_until is None or float(broker_empty_until) > time.time():
-                    return False
+                return float(old_until) > time.time()
             except Exception:
-                return False
+                return True
     except Exception:
         pass
     return False
@@ -107,6 +139,8 @@ def _empty_fast_skip_active() -> bool:
         return False
     if _global_has_open_positions_hint():
         return False
+    if _broker_authoritative_empty_hint():
+        return True
     if _EMPTY_CONFIRMED_AT_TS is None:
         return False
     ttl = _env_float("EXIT_EMPTY_FAST_SKIP_TTL_SEC", 10.0)
@@ -160,6 +194,18 @@ def install_exit_order_sender_safe() -> bool:
         return False
 
 
+def _skip_reason() -> str:
+    try:
+        if _broker_authoritative_empty_hint():
+            return "broker_authoritative_empty"
+        if _EMPTY_CONFIRMED_AT_TS is not None:
+            remain = (_EMPTY_CONFIRMED_AT_TS + _env_float("EXIT_EMPTY_FAST_SKIP_TTL_SEC", 10.0)) - time.time()
+            return f"recent_empty_confirmed remain={max(0.0, remain):.3f}s"
+    except Exception:
+        pass
+    return "empty_fast_skip"
+
+
 def run_exit_loop_market_guarded() -> None:
     global _LAST_STARTED_TS
     try:
@@ -168,8 +214,8 @@ def run_exit_loop_market_guarded() -> None:
             return
 
         if _empty_fast_skip_active():
-            remain = (_EMPTY_CONFIRMED_AT_TS + _env_float("EXIT_EMPTY_FAST_SKIP_TTL_SEC", 10.0)) - time.time() if _EMPTY_CONFIRMED_AT_TS else 0.0
-            logger.info("[EXIT SCHEDULER] empty fast skip remain=%.3fs", max(0.0, remain))
+            logger.info("[EXIT SCHEDULER] empty fast skip reason=%s", _skip_reason())
+            _mark_empty_confirmed()
             return
 
         try:
@@ -177,7 +223,6 @@ def run_exit_loop_market_guarded() -> None:
         except Exception:
             logger.exception("[EXIT SCHEDULER] import failed: trading.exit.exit_loop.exit_loop_5s")
             return
-
         _LAST_STARTED_TS = time.time()
         logger.info("[EXIT SCHEDULER] exit_loop_5s start")
         ret = exit_loop_5s()
@@ -186,7 +231,6 @@ def run_exit_loop_market_guarded() -> None:
         if _global_has_open_positions_hint():
             _clear_empty_confirmed()
         else:
-            # exit_loop側で no open positions と判定している場合、ret=Noneでもここで短時間だけ空判定を保持。
             _mark_empty_confirmed()
     except Exception:
         logger.exception("[EXIT SCHEDULER] exit loop failed")
