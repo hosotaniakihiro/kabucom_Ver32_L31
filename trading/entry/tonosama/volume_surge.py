@@ -1,9 +1,15 @@
 # ============================================================
 # File   : trading/entry/tonosama/volume_surge.py
-# Version: Ver2.0-TONOSAMA-EARLY-SESSION-SURGE-FAILOPEN
+# Version: Ver2.1-TONOSAMA-STALE-BASE-SUMMARY-DIAG
 # ------------------------------------------------------------
 # 目的:
 #   殿様エントリー用の出来高急増・価格変化特徴量を作る。
+#
+# Ver2.1:
+#   - 12:38ログのように base_1m が recent filter で after=0 になった場合、
+#     最新datetime / 経過分 / cutoff / source内訳を明示する。
+#   - 古い1分足でTONOSAMAをfail-openしない。これは安全のため継続。
+#   - 「なぜ base feature empty か」をログから即判断できるようにする。
 #
 # Ver2.0:
 #   - Ver1.9 の fail-closed 方針は維持しつつ、寄り付き直後だけ救済する。
@@ -13,11 +19,6 @@
 #     TONOSAMA_EARLY_SURGE_FAILOPEN_MINUTES 分だけ履歴不足を fail-open する。
 #   - それ以外の時間帯は Ver1.9 と同じく fail-closed。
 #   - 常時強制したい場合のみ TONOSAMA_FORCE_SURGE_FAILOPEN=1。
-#
-# ENV:
-#   TONOSAMA_ALLOW_EARLY_SURGE_FAILOPEN=1
-#   TONOSAMA_EARLY_SURGE_FAILOPEN_MINUTES=30
-#   TONOSAMA_FORCE_SURGE_FAILOPEN=0
 # ============================================================
 
 from __future__ import annotations
@@ -95,6 +96,37 @@ def _normalize_datetime_col(df: pd.DataFrame) -> pd.DataFrame:
     return x.dropna(subset=["datetime"])
 
 
+def _source_counts(df: pd.DataFrame, limit: int = 8) -> dict:
+    try:
+        if df is None or df.empty or "source" not in df.columns:
+            return {}
+        return df["source"].astype(str).value_counts(dropna=False).head(limit).to_dict()
+    except Exception:
+        return {}
+
+
+def _latest_info(df: pd.DataFrame, *, now: dt.datetime | None = None) -> dict:
+    try:
+        if df is None or df.empty or "datetime" not in df.columns:
+            return {"rows": len(df) if isinstance(df, pd.DataFrame) else 0, "latest_dt": None, "age_min": None, "source_counts": _source_counts(df) if isinstance(df, pd.DataFrame) else {}}
+        x = _normalize_datetime_col(df)
+        if x.empty:
+            return {"rows": len(df), "latest_dt": None, "age_min": None, "source_counts": _source_counts(df)}
+        n = now or _now_naive()
+        latest = pd.to_datetime(x["datetime"], errors="coerce").max()
+        oldest = pd.to_datetime(x["datetime"], errors="coerce").min()
+        age_min = (pd.Timestamp(n) - latest).total_seconds() / 60.0 if pd.notna(latest) else None
+        return {
+            "rows": len(df),
+            "oldest_dt": str(oldest) if pd.notna(oldest) else None,
+            "latest_dt": str(latest) if pd.notna(latest) else None,
+            "age_min": round(float(age_min), 3) if age_min is not None else None,
+            "source_counts": _source_counts(x),
+        }
+    except Exception:
+        return {"rows": len(df) if isinstance(df, pd.DataFrame) else 0, "latest_dt": None, "age_min": None, "source_counts": {}}
+
+
 def _filter_recent_rows(df: pd.DataFrame, *, interval: int, label: str) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
@@ -103,25 +135,32 @@ def _filter_recent_rows(df: pd.DataFrame, *, interval: int, label: str) -> pd.Da
     if "datetime" not in df.columns:
         return df.copy()
 
-    x = _normalize_datetime_col(df)
-    if x.empty:
-        return x
+    x0 = _normalize_datetime_col(df)
+    if x0.empty:
+        return x0
 
     now = _now_naive()
     max_age_min = max(1.0, _env_float("TONOSAMA_RECENT_MAX_AGE_MIN", 30.0))
     cutoff = pd.Timestamp(now - dt.timedelta(minutes=max_age_min))
     today = pd.Timestamp(now.date())
 
-    before = len(x)
-    x = x[(x["datetime"] >= cutoff) & (x["datetime"] >= today)].copy()
+    before = len(x0)
+    info_before = _latest_info(x0, now=now)
+    x = x0[(x0["datetime"] >= cutoff) & (x0["datetime"] >= today)].copy()
+    info_after = _latest_info(x, now=now)
+
     logger.warning(
-        "[TONOSAMA SURGE] recent filter label=%s interval=%s before=%s after=%s cutoff=%s today=%s",
+        "[TONOSAMA SURGE] recent filter label=%s interval=%s before=%s after=%s cutoff=%s today=%s latest_before=%s age_min=%s source_counts=%s latest_after=%s",
         label,
         interval,
         before,
         len(x),
         cutoff,
         today.date(),
+        info_before.get("latest_dt"),
+        info_before.get("age_min"),
+        info_before.get("source_counts"),
+        info_after.get("latest_dt"),
     )
     return x
 
@@ -304,9 +343,18 @@ def _all_surge_history_missing(df3: pd.DataFrame, df5: pd.DataFrame) -> bool:
 
 def build_scalping_feature_df() -> pd.DataFrame:
     raw1 = normalize_summary_base(load_merged_summary(1), interval=1)
+    raw1_info = _latest_info(raw1)
     df1 = _filter_recent_rows(raw1, interval=1, label="base_1m")
     if df1.empty:
-        logger.warning("[TONOSAMA SURGE] base 1m recent empty raw_rows=%s", len(raw1) if isinstance(raw1, pd.DataFrame) else 0)
+        logger.warning(
+            "[TONOSAMA SURGE] base 1m recent empty -> skip TONOSAMA for safety raw_rows=%s latest_dt=%s age_min=%s max_age_min=%.1f source_counts=%s hint=%s",
+            len(raw1) if isinstance(raw1, pd.DataFrame) else 0,
+            raw1_info.get("latest_dt"),
+            raw1_info.get("age_min"),
+            _env_float("TONOSAMA_RECENT_MAX_AGE_MIN", 30.0),
+            raw1_info.get("source_counts"),
+            "summary_1m_is_stale_or_not_updating; check push summary / lunch-yahoo / main_database freshness",
+        )
         return pd.DataFrame()
 
     df3 = add_volume_surge_features(load_merged_summary(3), interval=3)
@@ -315,12 +363,14 @@ def build_scalping_feature_df() -> pd.DataFrame:
     missing_history = _all_surge_history_missing(df3, df5)
     if missing_history and not _force_failopen_enabled():
         logger.warning(
-            "[TONOSAMA SURGE] no usable 3m/5m volume surge history after recent filter -> return empty base_rows=%s df3=%s df5=%s force_failopen=%s reason=%s",
+            "[TONOSAMA SURGE] no usable 3m/5m volume surge history after recent filter -> return empty base_rows=%s df3=%s df5=%s force_failopen=%s reason=%s raw1_latest=%s raw1_age_min=%s",
             len(df1),
             len(df3) if isinstance(df3, pd.DataFrame) else 0,
             len(df5) if isinstance(df5, pd.DataFrame) else 0,
             _force_failopen_enabled(),
             _failopen_reason(),
+            raw1_info.get("latest_dt"),
+            raw1_info.get("age_min"),
         )
         return pd.DataFrame()
 
@@ -367,8 +417,8 @@ def build_scalping_feature_df() -> pd.DataFrame:
     failopen_col = out.get("_volume_surge_failopen", pd.Series(False, index=out.index)).fillna(False).astype(bool)
     if bool(history_missing.all()) and not bool(failopen_col.any()):
         logger.warning(
-            "[TONOSAMA SURGE] all rows missing volume surge history -> return empty rows=%s reason=require_surge_history force_failopen=%s failopen_reason=%s",
-            len(out), _force_failopen_enabled(), _failopen_reason(),
+            "[TONOSAMA SURGE] all rows missing volume surge history -> return empty rows=%s reason=require_surge_history force_failopen=%s failopen_reason=%s raw1_latest=%s raw1_age_min=%s",
+            len(out), _force_failopen_enabled(), _failopen_reason(), raw1_info.get("latest_dt"), raw1_info.get("age_min"),
         )
         return pd.DataFrame()
 
@@ -387,7 +437,7 @@ def build_scalping_feature_df() -> pd.DataFrame:
         failopen_col = out.get("_volume_surge_failopen", pd.Series(False, index=out.index)).fillna(False).astype(bool)
         history_missing_col = out.get("_volume_surge_history_missing", pd.Series(False, index=out.index)).fillna(False).astype(bool)
         logger.warning(
-            "[TONOSAMA SURGE] feature summary rows=%s vol_cols=%s price_cols=%s volume_surge_nonzero=%s price_change_nonzero=%s history_missing_rows=%s failopen_rows=%s price_fallback_rows=%s failopen_reason=%s head=%s",
+            "[TONOSAMA SURGE] feature summary rows=%s vol_cols=%s price_cols=%s volume_surge_nonzero=%s price_change_nonzero=%s history_missing_rows=%s failopen_rows=%s price_fallback_rows=%s failopen_reason=%s raw1_latest=%s head=%s",
             len(out), vol_cols, price_cols,
             int((out["_max_volume_surge_ratio"].fillna(0) != 0).sum()),
             int((out["_max_price_change_pct"].fillna(0) != 0).sum()),
@@ -395,6 +445,7 @@ def build_scalping_feature_df() -> pd.DataFrame:
             int(failopen_col.sum()),
             int(out.get("_price_change_fallback_1m", pd.Series(False, index=out.index)).fillna(False).astype(bool).sum()),
             _failopen_reason(),
+            raw1_info.get("latest_dt"),
             out[[c for c in ["symbol", "symbolname", "close", "_max_volume_surge_ratio", "_max_price_change_pct", "_surge_tf", "_volume_surge_history_missing", "_volume_surge_failopen", "_price_change_fallback_1m"] if c in out.columns]].head(12).to_dict("records"),
         )
     except Exception:
