@@ -1,18 +1,27 @@
 # ============================================================
 # File   : trading/exit/symbol_trade_guard.py
-# Version: V1.3-SYMBOL-TRADE-GUARD-JOURNAL-MODE-THROTTLE
+# Version: V1.4-SYMBOL-TRADE-GUARD-ENTRY-BLOCKED-COMPAT
 # ------------------------------------------------------------
 # 【概要】
 #   スキャルピング用の銘柄別エントリー抑制。
+#
+# V1.4:
+#   - entry_order_builder.py が import している旧互換名
+#       is_entry_blocked
+#     を復旧
+#   - check_entry_allowed(symbol) の否定として動作
+#   - 戻り値は bool。詳細が必要な既存コード向けに
+#       get_entry_block_reason
+#     も追加
+#   - これにより main.py 起動時の
+#       ImportError: cannot import name 'is_entry_blocked'
+#     を解消
 #
 # V1.3:
 #   - NAS/SMB上SQLiteで接続のたびに PRAGMA journal_mode を実行しない
 #   - database is locked 時は一定時間 journal_mode 再試行を抑制
 #   - journal_mode失敗は trade guard 判定を壊さず継続
 #   - ログ連打とロック悪化を抑止
-#
-# V1.2:
-#   - V1.1 の _today() 定義インデントを修正
 # ============================================================
 
 from __future__ import annotations
@@ -159,10 +168,8 @@ def _apply_journal_mode(conn: sqlite3.Connection, path: str) -> None:
             skip_until - now,
         )
         return
-
     desired = str(os.getenv("TRADE_GUARD_SQLITE_JOURNAL_MODE", "")).strip().upper()
     if not desired:
-        # NAS/SMBはDELETE既定。ただし毎回PRAGMA実行するとロック原因になるため成功後は記憶する。
         desired = "DELETE" if _is_nas_like_path(path) else "WAL"
 
     try:
@@ -350,6 +357,36 @@ def check_entry_allowed(symbol: Any, now: Optional[dt.datetime] = None) -> Tuple
         return True, "trade_guard_error_fail_open", {"error": str(e)}
 
 
+def is_entry_blocked(symbol: Any, now: Optional[dt.datetime] = None, *args: Any, **kwargs: Any) -> bool:
+    """
+    旧互換API。
+
+    entry_order_builder.py などが `from trading.exit.symbol_trade_guard import is_entry_blocked`
+    として参照するため、check_entry_allowed の否定として提供する。
+
+    戻り値:
+      True  = エントリー禁止
+      False = エントリー許可
+    """
+    try:
+        allowed, reason, meta = check_entry_allowed(symbol, now=now)
+        if not allowed:
+            logger.warning("[TRADE GUARD] entry blocked symbol=%s reason=%s meta=%s", _norm_symbol(symbol), reason, meta)
+        return not bool(allowed)
+    except Exception as e:
+        logger.warning("[TRADE GUARD] is_entry_blocked failed symbol=%s err=%s -> allow fail-open", _norm_symbol(symbol), e, exc_info=True)
+        return False
+
+
+def get_entry_block_reason(symbol: Any, now: Optional[dt.datetime] = None) -> Tuple[bool, str, Dict[str, Any]]:
+    """
+    旧互換/診断用API。
+    戻り値は (blocked, reason, meta)。
+    """
+    allowed, reason, meta = check_entry_allowed(symbol, now=now)
+    return (not bool(allowed), reason, meta)
+
+
 def record_exit(symbol: Any, pnl: float = 0.0, reason: str = "") -> None:
     if not TRADE_GUARD_ENABLED:
         return
@@ -395,4 +432,10 @@ def record_entry(symbol: Any) -> None:
         logger.exception("[TRADE GUARD] record_entry failed symbol=%s", sym)
 
 
-__all__ = ["check_entry_allowed", "record_exit", "record_entry"]
+__all__ = [
+    "check_entry_allowed",
+    "is_entry_blocked",
+    "get_entry_block_reason",
+    "record_exit",
+    "record_entry",
+]
