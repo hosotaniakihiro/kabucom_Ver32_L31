@@ -1,13 +1,13 @@
 # ============================================================
 # File   : core/startup/discord_summary_kwarg_safety_patch.py
-# Version: V2.5-DISPLAY-KWARG-SAFETY-3LINES-ALPHA-LABELS-JA-REASON
+# Version: V2.6-DISPLAY-KWARG-SAFETY-3LINES-READABLE-LABELS-JA-REASON
 # ------------------------------------------------------------
 # 目的:
 #   1) display系関数へ interval=1 等の未知kwargsが渡っても壊れないようにする。
 #   2) Discord SUMMARY TOP10 を 1銘柄3行固定にする。
-#      - 1行目: 銘柄 + P/S/B/SL
-#      - 2行目: SLP/MTF/RSI/MACD
-#      - 3行目: REASON=日本語理由
+#      - 1行目: 銘柄 + Price/Score/Buy/Sell
+#      - 2行目: Slope/MTF/RSI/MACD
+#      - 3行目: 理由=日本語理由
 #   3) 古い「結果時刻」のSUMMARYをDiscordへ送らない。
 # ============================================================
 
@@ -239,7 +239,7 @@ def _should_skip_stale_discord(lines: list[str], title: str | None) -> tuple[boo
 def _install_stale_send_guard(disp: Any) -> int:
     try:
         old = getattr(disp, "_send_to_discord", None)
-        if not callable(old) or getattr(old, "_summary_discord_stale_guard_v25", False):
+        if not callable(old) or getattr(old, "_summary_discord_stale_guard_v26", False):
             return 0
 
         def _send_guarded(lines: list[str], title: str | None = None) -> None:
@@ -250,7 +250,7 @@ def _install_stale_send_guard(disp: Any) -> int:
             logger.info("[DISCORD SUMMARY STALE GUARD] allow summary discord %s", reason)
             return old(lines, title=title)
 
-        _send_guarded._summary_discord_stale_guard_v25 = True  # type: ignore[attr-defined]
+        _send_guarded._summary_discord_stale_guard_v26 = True  # type: ignore[attr-defined]
         _send_guarded._original = old  # type: ignore[attr-defined]
         disp._send_to_discord = _send_guarded
         return 1
@@ -317,9 +317,9 @@ def _compact_candidate_line(i: int, row: Any, *, side: str) -> str:
 
     mark = "🟦" if str(side).upper() == "BUY" else "🟥"
     return (
-        f"{mark} {i}. {symbol} {name} P={_fmt_price(close)} S={_fmt_metric(score)} B={_fmt_metric(buy)} SL={_fmt_metric(sell)}\n"
-        f"   SLP={_fmt_metric(slope, 4)} MTF={_fmt_metric(mtf)} RSI={_fmt_metric(rsi)} MACD={_fmt_metric(macd)}\n"
-        f"   REASON={reason}"
+        f"{mark} {i}. {symbol} {name} Price={_fmt_price(close)} Score={_fmt_metric(score)} Buy={_fmt_metric(buy)} Sell={_fmt_metric(sell)}\n"
+        f"   Slope={_fmt_metric(slope, 4)} MTF={_fmt_metric(mtf)} RSI={_fmt_metric(rsi)} MACD={_fmt_metric(macd)}\n"
+        f"   理由={reason}"
     )
 
 
@@ -330,7 +330,7 @@ def _install_compact_discord_builder(disp: Any) -> int:
         if callable(old):
             def _candidate(i: int, row: Any, *, side: str) -> str:
                 return _compact_candidate_line(i, row, side=side)
-            _candidate._discord_3lines_alpha_labels_ja_reason_v25 = True  # type: ignore[attr-defined]
+            _candidate._discord_3lines_readable_labels_ja_reason_v26 = True  # type: ignore[attr-defined]
             _candidate._original = old  # type: ignore[attr-defined]
             disp._build_discord_candidate_2lines = _candidate
             patched += 1
@@ -338,7 +338,7 @@ def _install_compact_discord_builder(disp: Any) -> int:
         old_reason = getattr(disp, "_reason_text_for_discord", None)
         def _reason(row: Any, side: str) -> str:
             return _reason_ja(row, side)
-        _reason._discord_3lines_alpha_labels_ja_reason_v25 = True  # type: ignore[attr-defined]
+        _reason._discord_3lines_readable_labels_ja_reason_v26 = True  # type: ignore[attr-defined]
         _reason._original = old_reason  # type: ignore[attr-defined]
         disp._reason_text_for_discord = _reason
         patched += 1
@@ -374,7 +374,7 @@ def install() -> bool:
         stale_patched = _install_stale_send_guard(disp)
         _PATCHED = True
         logger.warning(
-            "[DISCORD KWARG SAFETY] installed V2.5 patched=%s three_lines_alpha_labels=%s stale_guard=%s",
+            "[DISCORD KWARG SAFETY] installed V2.6 patched=%s three_lines_readable_labels=%s stale_guard=%s",
             patched,
             compact_patched,
             stale_patched,
