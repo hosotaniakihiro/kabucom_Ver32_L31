@@ -1,24 +1,20 @@
 # ============================================================
 # File   : core/startup/ranking_entry_volume_unit_patch.py
-# Version: V4.4-RANKING-ENTRY-UNIT-SILENT-BY-DEFAULT
+# Version: V4.5-RANKING-ENTRY-UNIT-AUTO-PREFILTER
 # ------------------------------------------------------------
 # 目的:
 #   ランキング由来エントリーの volume / turnover 単位を補正する。
 #   ただし、同一銘柄が type × market で多数出るため、ログ大量出力と
 #   同一値の繰り返し正規化で entry loop が重くならないようにする。
 #
+# V4.5:
+#   - ranking_entry_source_prefilter_patch_v2 を同時installする。
+#   - main.py へ追加しなくても、core.startup.__init__ 経由でprefilterが有効になる。
+#
 # V4.4:
 #   - 通常ログは完全に既定OFF
 #   - RANKING_ENTRY_UNIT_FIX_LOG_FIRST_N 既定 30 -> 0
 #   - zero-volume / finalized / turnover clamped の銘柄別ログも既定抑制
-#   - 詳細確認時のみ RANKING_ENTRY_UNIT_FIX_LOG_EACH=1 または
-#     RANKING_ENTRY_UNIT_FIX_LOG_FIRST_N=N で出す
-#
-# V4.3:
-#   - 同一 (symbol, price, raw_volume, raw_turnover) の補正結果をキャッシュ
-#   - 通常の finalized ログは既定で抑制
-#   - zero-volume turnover ignored も同一キーは一度だけ表示
-#   - 詳細ログが必要な場合だけ RANKING_ENTRY_UNIT_FIX_LOG_EACH=1
 # ============================================================
 
 from __future__ import annotations
@@ -223,7 +219,7 @@ def _normalize_units(row: dict[str, Any], *, min_volume: float, min_turnover: fl
         changed = volume_unit_fixed or turnover_unit_fixed or raw_turnover != turnover or raw_volume != volume
         if changed and _should_log_once(base_key, "finalized"):
             logger.info(
-                "[RANKING ENTRY UNIT FIX] finalized V4.4 symbol=%s price=%s volume %.3f->%.3f turnover %.3f->%.3f vol_mul=%.0f turn_mul=%.0f implied=%.3f can_fix_turnover=%s zero_volume_ignored=%s",
+                "[RANKING ENTRY UNIT FIX] finalized V4.5 symbol=%s price=%s volume %.3f->%.3f turnover %.3f->%.3f vol_mul=%.0f turn_mul=%.0f implied=%.3f can_fix_turnover=%s zero_volume_ignored=%s",
                 symbol, price, raw_volume, volume, raw_turnover, turnover,
                 volume_unit_multiplier, turnover_unit_multiplier, implied_turnover,
                 can_fix_turnover, zero_volume_turnover_ignored,
@@ -234,9 +230,22 @@ def _normalize_units(row: dict[str, Any], *, min_volume: float, min_turnover: fl
     return row
 
 
+def _install_source_prefilter() -> bool:
+    try:
+        from core.startup import ranking_entry_source_prefilter_patch_v2 as prefilter
+        fn = getattr(prefilter, "install", None)
+        ok = fn() if callable(fn) else False
+        logger.warning("[RANKING ENTRY UNIT FIX] source prefilter installed=%s", ok)
+        return bool(ok)
+    except Exception:
+        logger.exception("[RANKING ENTRY UNIT FIX] source prefilter install failed")
+        return False
+
+
 def install() -> bool:
     global _PATCHED
     if _PATCHED:
+        _install_source_prefilter()
         return True
 
     try:
@@ -261,11 +270,13 @@ def install() -> bool:
         old_norm = getattr(target, "_normalize_ranking_row_for_entry", None)
         if not callable(old_norm):
             logger.warning("[RANKING ENTRY UNIT FIX] target normalizer not callable")
+            _install_source_prefilter()
             return False
 
         base_norm = _unwrap(old_norm)
-        if getattr(old_norm, "_ranking_entry_unit_fix_patch_v44", False):
+        if getattr(old_norm, "_ranking_entry_unit_fix_patch_v45", False):
             _PATCHED = True
+            _install_source_prefilter()
             return True
 
         def _normalize_ranking_row_for_entry_patched(row: dict[str, Any]) -> dict[str, Any]:
@@ -274,14 +285,15 @@ def install() -> bool:
                 return _normalize_units(out, min_volume=min_volume, min_turnover=min_turnover)
             return out
 
-        _normalize_ranking_row_for_entry_patched._ranking_entry_unit_fix_patch_v44 = True  # type: ignore[attr-defined]
+        _normalize_ranking_row_for_entry_patched._ranking_entry_unit_fix_patch_v45 = True  # type: ignore[attr-defined]
         _normalize_ranking_row_for_entry_patched._original = base_norm  # type: ignore[attr-defined]
         target._normalize_ranking_row_for_entry = _normalize_ranking_row_for_entry_patched
 
+        prefilter_ok = _install_source_prefilter()
         _PATCHED = True
         logger.warning(
-            "[RANKING ENTRY UNIT FIX] installed V4.4 price_min %.1f->%.1f min_volume=%.1f min_turnover=%.1f cache=True silent_default=True log_each=%s log_first_n=%s",
-            old_min, new_min, min_volume, min_turnover,
+            "[RANKING ENTRY UNIT FIX] installed V4.5 price_min %.1f->%.1f min_volume=%.1f min_turnover=%.1f cache=True silent_default=True prefilter=%s log_each=%s log_first_n=%s",
+            old_min, new_min, min_volume, min_turnover, prefilter_ok,
             _env_bool("RANKING_ENTRY_UNIT_FIX_LOG_EACH", False),
             int(_env_float("RANKING_ENTRY_UNIT_FIX_LOG_FIRST_N", _LOG_FIRST_N)),
         )
