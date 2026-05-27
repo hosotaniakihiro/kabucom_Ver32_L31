@@ -1,28 +1,27 @@
 # ============================================================
 # File   : core/startup/ranking_entry_flat_price_guard_patch.py
-# Version: V1.0-RANKING-FLAT-PRICE-RANK-STRENGTH-GUARD
+# Version: V1.1-RANKING-FLAT-PRICE-DB-FALLBACK-NO-HARDCODED-PATH
 # ------------------------------------------------------------
 # 目的:
-#   ランキング由来エントリーで、価格が前回ランキング取得時と同値のため
-#   BUY_PRICE_NOT_UP / SELL_PRICE_NOT_DOWN で大量DROPされる問題を緩和する。
-#
-# 方針:
-#   - 価格横ばいでも、順位が上位または改善/維持なら一度だけ再判定する。
-#   - 再判定では original filter を再利用し、出来高/売買代金/日中過熱/テクニカル/スコアは維持。
-#   - volume=9.8 / 28.1 のようなランキング表示単位が最終フィルタ直前に残る場合、
-#     x1000 補正を再適用する。
+#   1) ランキング由来ENTRYで、価格横ばいだけで大量DROPされる問題を緩和する。
+#   2) ranking_entry が global_data のランキングDFだけを見て
+#      no_ranking_df で止まる問題を、既存DBパス解決関数からのfallbackで補正する。
 # ============================================================
 
 from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 from typing import Any, Dict, Tuple
+
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
 _PATCHED = False
 _ORIGINAL_FILTER = None
+_ORIGINAL_GET_RANKING_SOURCE_DF = None
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -43,6 +42,16 @@ def _env_float(name: str, default: float) -> float:
         return float(v)
     except Exception:
         return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
 
 
 def _f(v: Any, default: float = 0.0) -> float:
@@ -153,32 +162,128 @@ def _patched_filter(row: Dict[str, Any], side: str, prev_h: Dict[str, Any], scor
     return False, "ORIGINAL_FILTER_NOT_AVAILABLE"
 
 
+def _resolve_ranking_db_path() -> str:
+    try:
+        from ats.ats_ranking.db_path import resolve_ranking_db_path
+        p = resolve_ranking_db_path()
+        return str(p or "")
+    except Exception:
+        logger.warning("[RANKING DB FALLBACK PATCH] resolve_ranking_db_path failed", exc_info=True)
+        return ""
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    try:
+        return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
+    except Exception:
+        return False
+
+
+def _cols(conn: sqlite3.Connection, table: str) -> list[str]:
+    try:
+        return [str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    except Exception:
+        return []
+
+
+def _read_latest_ranking_snapshot_from_db() -> pd.DataFrame:
+    if not _env_bool("RANKING_ENTRY_DB_FALLBACK_ENABLED", True):
+        return pd.DataFrame()
+
+    db_path = _resolve_ranking_db_path()
+    if not db_path or not os.path.exists(db_path):
+        logger.warning("[RANKING DB FALLBACK PATCH] db not found path=%s", db_path)
+        return pd.DataFrame()
+
+    table = "ranking_snapshot_1min"
+    max_rows = max(100, _env_int("RANKING_ENTRY_DB_FALLBACK_MAX_ROWS", 3000))
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path, timeout=_env_float("RANKING_ENTRY_DB_FALLBACK_TIMEOUT_SEC", 2.0))
+        conn.execute("PRAGMA query_only=ON")
+        if not _table_exists(conn, table):
+            logger.warning("[RANKING DB FALLBACK PATCH] table missing table=%s path=%s", table, db_path)
+            return pd.DataFrame()
+        cols = _cols(conn, table)
+        dt_col = next((c for c in ("datetime", "snapshot_time", "time", "created_at") if c in cols), None)
+        if dt_col:
+            latest = conn.execute(f"SELECT MAX({dt_col}) FROM {table}").fetchone()
+            latest_dt = latest[0] if latest else None
+            if latest_dt is not None and str(latest_dt).strip() != "":
+                df = pd.read_sql_query(f"SELECT * FROM {table} WHERE {dt_col}=? LIMIT ?", conn, params=(latest_dt, max_rows))
+                logger.warning("[RANKING DB FALLBACK PATCH] loaded latest snapshot rows=%s dt_col=%s latest=%s", len(df), dt_col, latest_dt)
+                return df
+        df = pd.read_sql_query(f"SELECT * FROM {table} ORDER BY rowid DESC LIMIT ?", conn, params=(max_rows,))
+        logger.warning("[RANKING DB FALLBACK PATCH] loaded by rowid rows=%s", len(df))
+        return df
+    except Exception as e:
+        logger.warning("[RANKING DB FALLBACK PATCH] read failed err=%s", e, exc_info=False)
+        return pd.DataFrame()
+    finally:
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
+
+
+def _patched_get_ranking_source_df():
+    if callable(_ORIGINAL_GET_RANKING_SOURCE_DF):
+        try:
+            df = _ORIGINAL_GET_RANKING_SOURCE_DF()
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        except Exception:
+            logger.warning("[RANKING DB FALLBACK PATCH] original getter failed", exc_info=True)
+
+    df = _read_latest_ranking_snapshot_from_db()
+    if df is None or df.empty:
+        logger.warning("[RANKING DB FALLBACK PATCH] fallback empty")
+        return None
+
+    try:
+        from global_state import global_data
+        setattr(global_data, "latest_ranking_df", df.copy())
+        setattr(global_data, "latest_ranking_snapshot", df.to_dict("records"))
+    except Exception:
+        logger.debug("[RANKING DB FALLBACK PATCH] global_data publish failed", exc_info=True)
+
+    logger.warning("[RANKING DB FALLBACK PATCH] source=db rows=%s cols=%s", len(df), len(df.columns))
+    return df
+
+
 def install() -> bool:
-    global _PATCHED, _ORIGINAL_FILTER
+    global _PATCHED, _ORIGINAL_FILTER, _ORIGINAL_GET_RANKING_SOURCE_DF
     if _PATCHED:
         return True
     try:
         import trading.ranking.entry_from_ranking as efr
-        cur = getattr(efr, "_passes_ranking_only_filters", None)
-        if not callable(cur):
-            logger.warning("[RANKING FLAT PRICE PATCH] original filter not callable")
-            return False
-        if getattr(cur, "_ranking_flat_price_patch", False):
-            _PATCHED = True
-            return True
-        _ORIGINAL_FILTER = cur
-        _patched_filter._ranking_flat_price_patch = True  # type: ignore[attr-defined]
-        efr._passes_ranking_only_filters = _patched_filter
+
+        cur_filter = getattr(efr, "_passes_ranking_only_filters", None)
+        if callable(cur_filter) and not getattr(cur_filter, "_ranking_flat_price_patch", False):
+            _ORIGINAL_FILTER = cur_filter
+            _patched_filter._ranking_flat_price_patch = True  # type: ignore[attr-defined]
+            efr._passes_ranking_only_filters = _patched_filter
+            logger.warning("[RANKING FLAT PRICE PATCH] filter wrapper installed")
+
+        cur_getter = getattr(efr, "_get_ranking_source_df", None)
+        if callable(cur_getter) and not getattr(cur_getter, "_ranking_db_fallback_patch", False):
+            _ORIGINAL_GET_RANKING_SOURCE_DF = cur_getter
+            _patched_get_ranking_source_df._ranking_db_fallback_patch = True  # type: ignore[attr-defined]
+            efr._get_ranking_source_df = _patched_get_ranking_source_df
+            logger.warning("[RANKING DB FALLBACK PATCH] getter wrapper installed enabled=%s", _env_bool("RANKING_ENTRY_DB_FALLBACK_ENABLED", True))
+
         _PATCHED = True
-        logger.warning(
-            "[RANKING FLAT PRICE PATCH] installed V1 allow_flat=%s max_rank=%s",
-            _env_bool("RANKING_ENTRY_ALLOW_FLAT_PRICE_IF_RANK_STRONG", True),
-            _env_float("RANKING_ENTRY_FLAT_PRICE_ALLOW_MAX_RANK", 12),
-        )
+        logger.warning("[RANKING FLAT PRICE PATCH] installed V1.1 allow_flat=%s db_fallback=%s", _env_bool("RANKING_ENTRY_ALLOW_FLAT_PRICE_IF_RANK_STRONG", True), _env_bool("RANKING_ENTRY_DB_FALLBACK_ENABLED", True))
         return True
     except Exception:
         logger.exception("[RANKING FLAT PRICE PATCH] install failed")
         return False
 
+
+try:
+    install()
+except Exception:
+    logger.exception("[RANKING FLAT PRICE PATCH] auto install failed")
 
 __all__ = ["install"]
