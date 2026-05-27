@@ -1,24 +1,17 @@
 # ============================================================
 # File   : core/startup/summary_parallel_intervals_runtime_patch.py
-# Version: Ver08-NO-WAIT-OUT-OF-SESSION-MAIN-ENTRY-ONLY
+# Version: Ver09-MAIN-ENTRY-ONLY-FORCE-PUSH-BG-IN-SESSION
 # ------------------------------------------------------------
 # 1分・3分・5分サマリーを直列ではなく並列に実行する runtime patch。
+#
+# Ver09 Fix:
+#   ✔ main.py(entry_only) では市場時間中でも PUSH 1m/3m/5m を親tickで待たない
+#   ✔ SUMMARY_PUSH_BG_ALL_INTERVALS=0 / SUMMARY_PUSH_BG_LONG_INTERVALS=0 が残っていても無視
+#   ✔ 2026-05-27 09:09 の wait_push_targets=[1,3,5] timeout=90s を防止
 #
 # Ver08 Fix:
 #   ✔ 昼休み/非セッション中(in_session=False)の main.py(entry_only) では
 #     PUSH 1m/3m/5m を親tickで待たず、バックグラウンドまたは軽量スキップへ倒す
-#   ✔ 12:07/12:17/12:19/12:21 のような昼休み 90秒 timeout を防止
-#   ✔ closed/lunch 時は run_entry=False のため、親tickで待つ意味が薄い
-#   ✔ 古い環境変数 SUMMARY_PUSH_BG_ALL_INTERVALS=0 が残っていても、
-#     main_entry_only かつ in_session=False では強制 no-wait
-#
-# Ver07 Fix:
-#   ✔ main.py(entry_only) では PUSH 1m/3m/5m をすべてバックグラウンド投入
-#   ✔ 親tickではPUSHサマリー完了を待たない
-#   ✔ 13:29ログの PUSH-1m 90秒 timeout を回避
-#   ✔ Discord/表示/AI hook はバックグラウンド内で継続
-#   ✔ RANKING由来は従来通り時間境界のみ実行
-#   ✔ ログに wait_push_targets=[] / bg_push_targets=[1,3,5] を表示
 # ============================================================
 
 from __future__ import annotations
@@ -85,6 +78,16 @@ def _setdefault_env(name: str, value: str) -> None:
         if cur is None or str(cur).strip() == "":
             os.environ[name] = str(value)
             logger.warning("[SUMMARY PARALLEL] env default set %s=%s", name, value)
+    except Exception:
+        pass
+
+
+def _force_env(name: str, value: str, *, reason: str) -> None:
+    try:
+        old = os.getenv(name)
+        if str(old or "").strip() != str(value):
+            os.environ[name] = str(value)
+            logger.warning("[SUMMARY PARALLEL] env forced %s=%s old=%s reason=%s", name, value, old, reason)
     except Exception:
         pass
 
@@ -189,13 +192,17 @@ def _push_all_intervals_enabled() -> bool:
 
 
 def _push_bg_all_intervals_enabled() -> bool:
-    default = True if _is_main_entry_only_process() else False
-    return _env_bool("SUMMARY_PUSH_BG_ALL_INTERVALS", default)
+    # Ver09: main.py(entry_only)は市場時間中でも親tickを詰まらせないため強制ON。
+    if _is_main_entry_only_process():
+        return True
+    return _env_bool("SUMMARY_PUSH_BG_ALL_INTERVALS", False)
 
 
 def _push_bg_long_intervals_enabled() -> bool:
-    default = True if _is_main_entry_only_process() else False
-    return _env_bool("SUMMARY_PUSH_BG_LONG_INTERVALS", default)
+    # Ver09: main.py(entry_only)は少なくとも長足BG化を強制ON。
+    if _is_main_entry_only_process():
+        return True
+    return _env_bool("SUMMARY_PUSH_BG_LONG_INTERVALS", False)
 
 
 def _resolve_targets(now: dt.datetime, in_session: bool) -> tuple[list[int], list[int]]:
@@ -215,17 +222,16 @@ def _resolve_targets(now: dt.datetime, in_session: bool) -> tuple[list[int], lis
 def _split_push_wait_and_bg(push_targets: list[int], *, in_session: bool) -> tuple[list[int], list[int]]:
     targets = sorted({int(x) for x in push_targets if int(x) in {1, 3, 5}})
 
-    # Ver08: main.py(entry_only) の昼休み/非セッション中は親tickを絶対にブロックしない。
-    # run_entry=False で実発注もしないため、ここで90秒待つ意味が薄い。
-    if _is_main_entry_only_process() and not bool(in_session):
-        if _env_bool("SUMMARY_PUSH_SKIP_BG_WHEN_OUT_OF_SESSION", False):
+    # Ver09: main.py(entry_only) は市場中/昼休み問わず親tickでPUSHを待たない。
+    if _is_main_entry_only_process():
+        if (not bool(in_session)) and _env_bool("SUMMARY_PUSH_SKIP_BG_WHEN_OUT_OF_SESSION", False):
             return [], []
         return [], targets
 
-    if _is_main_entry_only_process() and _push_bg_all_intervals_enabled():
+    if _push_bg_all_intervals_enabled():
         return [], targets
 
-    if _is_main_entry_only_process() and _push_bg_long_intervals_enabled():
+    if _push_bg_long_intervals_enabled():
         wait = [x for x in targets if int(x) == 1]
         bg = [x for x in targets if int(x) in (3, 5)]
         return (wait or [1]), bg
@@ -301,7 +307,8 @@ def _patched_run_time_locked_summary_jobs(*, now: Optional[dt.datetime] = None, 
             n, push_targets, wait_push_targets, bg_push_targets, ranking_targets, run_push, run_ranking, display, run_entry,
             in_session, _env_int("SUMMARY_PARALLEL_INTERVAL_WORKERS", 3), _env_int("SUMMARY_PUSH_BG_INTERVAL_WORKERS", 3), timeout,
             _force_all_targets_enabled(), _push_all_intervals_enabled(), _push_bg_all_intervals_enabled(),
-            _push_bg_long_intervals_enabled(), _is_main_entry_only_process(), _is_main_entry_only_process() and not bool(in_session),
+            _push_bg_long_intervals_enabled(), _is_main_entry_only_process(),
+            _is_main_entry_only_process() and not bool(in_session),
         )
         ex = _executor()
 
@@ -349,8 +356,8 @@ def install() -> bool:
 
     if _is_main_entry_only_process():
         _setdefault_env("SUMMARY_PARALLEL_FORCE_1_3_5", "0")
-        _setdefault_env("SUMMARY_PUSH_BG_ALL_INTERVALS", "1")
-        _setdefault_env("SUMMARY_PUSH_BG_LONG_INTERVALS", "1")
+        _force_env("SUMMARY_PUSH_BG_ALL_INTERVALS", "1", reason="main_entry_only_force_no_parent_block_v9")
+        _force_env("SUMMARY_PUSH_BG_LONG_INTERVALS", "1", reason="main_entry_only_force_no_parent_block_v9")
     else:
         _setdefault_env("SUMMARY_PARALLEL_FORCE_1_3_5", "1")
         _setdefault_env("SUMMARY_PUSH_BG_ALL_INTERVALS", "0")
@@ -371,17 +378,17 @@ def install() -> bool:
         import scheduler_jobs.summary.runners as runners
         import scheduler_jobs.summary.scheduler as scheduler
         cur = getattr(tlr, "run_time_locked_summary_jobs", None)
-        if getattr(cur, "_summary_parallel_intervals_v8", False):
+        if getattr(cur, "_summary_parallel_intervals_v9", False):
             _INSTALLED = True
             return True
         _ORIG_TIME_LOCKED = cur
-        _patched_run_time_locked_summary_jobs._summary_parallel_intervals_v8 = True  # type: ignore[attr-defined]
+        _patched_run_time_locked_summary_jobs._summary_parallel_intervals_v9 = True  # type: ignore[attr-defined]
         tlr.run_time_locked_summary_jobs = _patched_run_time_locked_summary_jobs
         runners.run_time_locked_summary_jobs = _patched_run_time_locked_summary_jobs
         scheduler.run_time_locked_summary_jobs = _patched_run_time_locked_summary_jobs
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY PARALLEL] installed v8 enabled=%s workers=%s bg_workers=%s timeout=%.1f ranking_parallel=%s force_1_3_5=%s push_all_intervals=%s push_bg_all=%s push_bg_long=%s main_entry_only=%s min_timeout=%s out_session_no_wait=True",
+            "[SUMMARY PARALLEL] installed v9 enabled=%s workers=%s bg_workers=%s timeout=%.1f ranking_parallel=%s force_1_3_5=%s push_all_intervals=%s push_bg_all=%s push_bg_long=%s main_entry_only=%s min_timeout=%s",
             _env_bool("SUMMARY_PARALLEL_INTERVALS_ENABLED", True),
             _env_int("SUMMARY_PARALLEL_INTERVAL_WORKERS", 3),
             _env_int("SUMMARY_PUSH_BG_INTERVAL_WORKERS", 3),
