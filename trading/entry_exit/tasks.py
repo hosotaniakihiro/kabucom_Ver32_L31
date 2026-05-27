@@ -1,9 +1,16 @@
 # ============================================================
 # File   : trading/entry_exit/tasks.py
-# Version: Ver1.6-TONOSAMA-PENDING-COUNT-GLOBAL-DISPATCH-30SEC
+# Version: Ver1.7-RANKING-ENTRY-TIMEOUT-COOLDOWN
 # ------------------------------------------------------------
 # 【目的】
 #   core.entry_exit_tasks shim から解決される実体モジュール。
+#
+# Ver1.7 Fix:
+#   - RANKING ENTRY BUILD が20秒timeoutした後も、実体スレッドはdaemonで残る。
+#   - そのまま毎分起動すると、previous_still_running / DB読み直し / NAS負荷が増える。
+#   - timeout後は一定時間クールダウンし、その間はranking_entryを即skipする。
+#   - timeoutが連続する場合はクールダウンを段階的に延長する。
+#   - 既定では ranking_entry を2分間隔に変更し、重いDB読みを抑える。
 #
 # Ver1.6 Fix:
 #   - pending_manager は global_data.pending_entries を使っているため、
@@ -12,10 +19,6 @@
 #   - TONOSAMA PENDING があるのに controller dispatch skipped になる問題を防止
 #   - TONOSAMA実行が16秒前後かかるため、既定周期を15秒→30秒へ変更
 #   - 既存ENV TONOSAMA_ENTRY_INTERVAL_SEC / SCHEDULER_INTERVAL_SEC があれば尊重
-#
-# Ver1.5:
-#   - TONOSAMA timeout 45秒化
-#   - pending存在時は controller dispatch
 # ============================================================
 
 from __future__ import annotations
@@ -37,12 +40,16 @@ _TAG_RANKING_ENTRY = "ranking_entry"
 
 _RANKING_ENTRY_RUNNING = False
 _RANKING_ENTRY_STARTED_AT: Optional[dt.datetime] = None
+_RANKING_ENTRY_COOLDOWN_UNTIL: Optional[dt.datetime] = None
+_RANKING_ENTRY_TIMEOUT_STREAK = 0
 _RANKING_ENTRY_LOCK = threading.RLock()
 
 TONOSAMA_ENTRY_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_TIMEOUT_SEC", "45"))
 TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC", "20"))
 RANKING_ENTRY_BUILD_TIMEOUT_SEC = float(os.getenv("RANKING_ENTRY_BUILD_TIMEOUT_SEC", "20"))
 RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC = float(os.getenv("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", "20"))
+RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC = float(os.getenv("RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC", "90"))
+RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC = float(os.getenv("RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC", "300"))
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -113,7 +120,6 @@ def _pending_count_for_source(source: str) -> int:
     except Exception:
         logger.debug("[entry_exit.tasks] pending count via global_data failed", exc_info=True)
 
-    # 旧互換: pending_manager モジュール直下にある場合。
     try:
         import trading.entry.pending_manager as pm
         names = [
@@ -262,7 +268,6 @@ def _run_tonosama_entry_safe() -> int:
             registered, before_pending, after_pending, time.perf_counter() - started,
         )
 
-        # 新規registeredだけでなく、既存pending/重複pendingが残っている場合もcontrollerへ流す。
         if registered > 0 or after_pending > 0:
             _dispatch_entry_controller(pipeline_source="TONOSAMA", interval=None, timeout_sec=TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC, reason="TONOSAMA ENTRY SCHEDULE")
         else:
@@ -275,11 +280,28 @@ def _run_tonosama_entry_safe() -> int:
         return 0
 
 
+def _ranking_entry_cooldown_seconds() -> float:
+    try:
+        streak = max(1, int(_RANKING_ENTRY_TIMEOUT_STREAK or 1))
+        base = max(1.0, float(RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC))
+        max_sec = max(base, float(RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC))
+        return min(max_sec, base * streak)
+    except Exception:
+        return 90.0
+
+
 def _run_ranking_entry_safe() -> int:
-    global _RANKING_ENTRY_RUNNING, _RANKING_ENTRY_STARTED_AT
+    global _RANKING_ENTRY_RUNNING, _RANKING_ENTRY_STARTED_AT, _RANKING_ENTRY_COOLDOWN_UNTIL, _RANKING_ENTRY_TIMEOUT_STREAK
     started_dt = dt.datetime.now()
     started = time.perf_counter()
     with _RANKING_ENTRY_LOCK:
+        if _RANKING_ENTRY_COOLDOWN_UNTIL is not None and started_dt < _RANKING_ENTRY_COOLDOWN_UNTIL:
+            remain = (_RANKING_ENTRY_COOLDOWN_UNTIL - started_dt).total_seconds()
+            logger.warning(
+                "[RANKING ENTRY SCHEDULE] skipped reason=timeout_cooldown remain=%.1fs until=%s timeout_streak=%s",
+                remain, _RANKING_ENTRY_COOLDOWN_UNTIL, _RANKING_ENTRY_TIMEOUT_STREAK,
+            )
+            return 0
         if _RANKING_ENTRY_RUNNING:
             elapsed = (dt.datetime.now() - _RANKING_ENTRY_STARTED_AT).total_seconds() if _RANKING_ENTRY_STARTED_AT else None
             logger.warning("[RANKING ENTRY SCHEDULE] skipped reason=previous_still_running started_at=%s elapsed=%s", _RANKING_ENTRY_STARTED_AT, elapsed)
@@ -294,8 +316,18 @@ def _run_ranking_entry_safe() -> int:
             return 0
         completed, created_ret = _run_callable_with_timeout(build_fn, timeout_sec=RANKING_ENTRY_BUILD_TIMEOUT_SEC, name="RANKING ENTRY BUILD")
         if not completed:
-            logger.warning("[RANKING ENTRY SCHEDULE] build timeout -> controller dispatch skipped timeout_sec=%.3f elapsed=%.3fs", RANKING_ENTRY_BUILD_TIMEOUT_SEC, time.perf_counter() - started)
+            with _RANKING_ENTRY_LOCK:
+                _RANKING_ENTRY_TIMEOUT_STREAK += 1
+                cool_sec = _ranking_entry_cooldown_seconds()
+                _RANKING_ENTRY_COOLDOWN_UNTIL = dt.datetime.now() + dt.timedelta(seconds=cool_sec)
+            logger.warning(
+                "[RANKING ENTRY SCHEDULE] build timeout -> cooldown timeout_sec=%.3f elapsed=%.3fs timeout_streak=%s cooldown_sec=%.1f until=%s",
+                RANKING_ENTRY_BUILD_TIMEOUT_SEC, time.perf_counter() - started,
+                _RANKING_ENTRY_TIMEOUT_STREAK, cool_sec, _RANKING_ENTRY_COOLDOWN_UNTIL,
+            )
             return 0
+        _RANKING_ENTRY_TIMEOUT_STREAK = 0
+        _RANKING_ENTRY_COOLDOWN_UNTIL = None
         created = int(created_ret or 0)
         logger.info("[RANKING ENTRY SCHEDULE] pending build done created=%s", created)
         if created > 0:
@@ -322,10 +354,19 @@ def _resolve_tonosama_interval_sec() -> int:
         pass
     try:
         from trading.entry.tonosama.config import SCHEDULER_INTERVAL_SEC
-        # 既存configが15秒でも、処理実測16秒超のため最低30秒へ引き上げる。
         return max(30, int(SCHEDULER_INTERVAL_SEC or 30))
     except Exception:
         return 30
+
+
+def _resolve_ranking_entry_interval_min() -> int:
+    try:
+        env_v = os.getenv("RANKING_ENTRY_INTERVAL_MIN")
+        if env_v is not None and str(env_v).strip() != "":
+            return max(1, int(float(env_v)))
+    except Exception:
+        pass
+    return 2
 
 
 def register_entry_exit_tasks(*args: Any, **kwargs: Any) -> bool:
@@ -339,14 +380,19 @@ def register_entry_exit_tasks(*args: Any, **kwargs: Any) -> bool:
         job_t.tag(_TAG_ENTRY)
         job_t.tag(_TAG_TONOSAMA_ENTRY)
 
-        job_r = schedule.every().minute.at(":12").do(_run_ranking_entry_safe)
+        ranking_interval_min = _resolve_ranking_entry_interval_min()
+        if ranking_interval_min <= 1:
+            job_r = schedule.every().minute.at(":12").do(_run_ranking_entry_safe)
+        else:
+            job_r = schedule.every(ranking_interval_min).minutes.at(":12").do(_run_ranking_entry_safe)
         job_r.tag(_TAG_ENTRY)
         job_r.tag(_TAG_RANKING_ENTRY)
 
         logger.info(
-            "[entry_exit.tasks] registered tonosama every=%ss tag=%s build_timeout=%.1fs controller_timeout=%.1fs ranking every minute at :12 tag=%s build_timeout=%.1fs controller_timeout=%.1fs pending_count_global=True",
+            "[entry_exit.tasks] registered tonosama every=%ss tag=%s build_timeout=%.1fs controller_timeout=%.1fs ranking every=%smin at :12 tag=%s build_timeout=%.1fs controller_timeout=%.1fs cooldown=%.1f-%0.1fs pending_count_global=True",
             interval_sec, _TAG_TONOSAMA_ENTRY, TONOSAMA_ENTRY_TIMEOUT_SEC, TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC,
-            _TAG_RANKING_ENTRY, RANKING_ENTRY_BUILD_TIMEOUT_SEC, RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC,
+            ranking_interval_min, _TAG_RANKING_ENTRY, RANKING_ENTRY_BUILD_TIMEOUT_SEC, RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC,
+            RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC, RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC,
         )
         ok = _has_tag(_TAG_TONOSAMA_ENTRY) and _has_tag(_TAG_RANKING_ENTRY)
         logger.info("[entry_exit.tasks] register_entry_exit_tasks done ok=%s", ok)
