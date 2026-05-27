@@ -1,18 +1,18 @@
 # ============================================================
 # File   : trading/exit/symbol_trade_guard.py
-# Version: V1.2-SYMBOL-TRADE-GUARD-SQLITE-NAS-SAFE-SYNTAX-FIX
+# Version: V1.3-SYMBOL-TRADE-GUARD-JOURNAL-MODE-THROTTLE
 # ------------------------------------------------------------
 # 【概要】
 #   スキャルピング用の銘柄別エントリー抑制。
 #
+# V1.3:
+#   - NAS/SMB上SQLiteで接続のたびに PRAGMA journal_mode を実行しない
+#   - database is locked 時は一定時間 journal_mode 再試行を抑制
+#   - journal_mode失敗は trade guard 判定を壊さず継続
+#   - ログ連打とロック悪化を抑止
+#
 # V1.2:
 #   - V1.1 の _today() 定義インデントを修正
-#
-# V1.1:
-#   - NAS/SMB上SQLiteで PRAGMA journal_mode=WAL が disk I/O error になる問題を回避
-#   - WAL失敗時は DELETE journal にフォールバック
-#   - 接続自体が失敗する場合はローカル退避DBへフォールバック
-#   - trade guard DB障害でエントリー判定全体を壊さない
 # ============================================================
 
 from __future__ import annotations
@@ -21,10 +21,15 @@ import datetime as dt
 import logging
 import os
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+_JOURNAL_MODE_OK_PATHS: set[str] = set()
+_JOURNAL_MODE_SKIP_UNTIL: dict[str, float] = {}
+_JOURNAL_MODE_LAST_WARN_AT: dict[str, float] = {}
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -32,6 +37,16 @@ def _env_bool(name: str, default: bool) -> bool:
     if v is None:
         return bool(default)
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
 
 
 TRADE_GUARD_ENABLED = _env_bool("TRADE_GUARD_ENABLED", True)
@@ -111,32 +126,76 @@ def _open_sqlite(path: str) -> sqlite3.Connection:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
     except Exception:
         logger.debug("[TRADE GUARD] mkdir failed path=%s", path, exc_info=True)
-    conn = sqlite3.connect(path, timeout=3.0)
-    conn.execute("PRAGMA busy_timeout=3000")
+    conn = sqlite3.connect(path, timeout=_env_float("TRADE_GUARD_SQLITE_TIMEOUT_SEC", 3.0))
+    conn.execute(f"PRAGMA busy_timeout={int(_env_float('TRADE_GUARD_SQLITE_BUSY_TIMEOUT_MS', 3000.0))}")
     return conn
 
 
+def _journal_warn_throttled(path: str, message: str, *args, exc_info: bool = False) -> None:
+    now = time.time()
+    interval = max(1.0, _env_float("TRADE_GUARD_JOURNAL_WARN_INTERVAL_SEC", 60.0))
+    last = _JOURNAL_MODE_LAST_WARN_AT.get(path, 0.0)
+    if now - last >= interval:
+        _JOURNAL_MODE_LAST_WARN_AT[path] = now
+        logger.warning(message, *args, exc_info=exc_info)
+    else:
+        logger.debug(message, *args, exc_info=exc_info)
+
+
 def _apply_journal_mode(conn: sqlite3.Connection, path: str) -> None:
+    if not _env_bool("TRADE_GUARD_APPLY_JOURNAL_MODE", True):
+        return
+
+    path_key = str(path)
+    if path_key in _JOURNAL_MODE_OK_PATHS:
+        return
+
+    now = time.time()
+    skip_until = float(_JOURNAL_MODE_SKIP_UNTIL.get(path_key, 0.0) or 0.0)
+    if now < skip_until:
+        logger.debug(
+            "[TRADE GUARD] journal_mode skipped by throttle path=%s remain=%.3fs",
+            path,
+            skip_until - now,
+        )
+        return
+
     desired = str(os.getenv("TRADE_GUARD_SQLITE_JOURNAL_MODE", "")).strip().upper()
     if not desired:
+        # NAS/SMBはDELETE既定。ただし毎回PRAGMA実行するとロック原因になるため成功後は記憶する。
         desired = "DELETE" if _is_nas_like_path(path) else "WAL"
 
     try:
         conn.execute(f"PRAGMA journal_mode={desired}")
+        _JOURNAL_MODE_OK_PATHS.add(path_key)
+        logger.info("[TRADE GUARD] journal_mode applied path=%s mode=%s", path, desired)
         return
-    except Exception as e:
-        logger.warning(
-            "[TRADE GUARD] journal_mode failed path=%s mode=%s err=%s -> fallback DELETE",
+    except sqlite3.OperationalError as e:
+        cooldown = max(5.0, _env_float("TRADE_GUARD_JOURNAL_RETRY_COOLDOWN_SEC", 300.0))
+        _JOURNAL_MODE_SKIP_UNTIL[path_key] = time.time() + cooldown
+        _journal_warn_throttled(
+            path_key,
+            "[TRADE GUARD] journal_mode skipped after lock path=%s mode=%s err=%s retry_after=%.1fs",
             path,
             desired,
             e,
+            cooldown,
+            exc_info=False,
+        )
+        return
+    except Exception as e:
+        cooldown = max(5.0, _env_float("TRADE_GUARD_JOURNAL_RETRY_COOLDOWN_SEC", 300.0))
+        _JOURNAL_MODE_SKIP_UNTIL[path_key] = time.time() + cooldown
+        _journal_warn_throttled(
+            path_key,
+            "[TRADE GUARD] journal_mode failed path=%s mode=%s err=%s retry_after=%.1fs",
+            path,
+            desired,
+            e,
+            cooldown,
             exc_info=True,
         )
-
-    try:
-        conn.execute("PRAGMA journal_mode=DELETE")
-    except Exception as e:
-        logger.warning("[TRADE GUARD] journal_mode DELETE failed path=%s err=%s", path, e, exc_info=True)
+        return
 
 
 def _connect_path(path: str) -> sqlite3.Connection:
@@ -258,102 +317,82 @@ def _time_block_reason(now: Optional[dt.datetime] = None) -> Tuple[bool, str, Di
         return False, "", {}
     n = _now(now)
     t = n.time()
-    stop_after = _parse_time_hhmm(ENTRY_STOP_AFTER)
-
-    windows = [
-        (dt.time(9, 0), dt.time(9, 2), "ENTRY_TIME_BLOCK_OPENING_0900_0902"),
-        (dt.time(11, 20), dt.time(12, 30), "ENTRY_TIME_BLOCK_LUNCH_1120_1230"),
-        (dt.time(12, 30), dt.time(12, 32), "ENTRY_TIME_BLOCK_AFTER_LUNCH_1230_1232"),
-        (stop_after, dt.time(23, 59, 59), "ENTRY_TIME_BLOCK_AFTER_1523"),
-    ]
-    for start, end, reason in windows:
-        if start <= t <= end:
-            return True, reason, {"now": n.strftime("%H:%M:%S"), "start": str(start), "end": str(end)}
-    return False, "", {"now": n.strftime("%H:%M:%S")}
-
-
-def is_entry_blocked(symbol: Any, now: Optional[dt.datetime] = None) -> Tuple[bool, str, Dict[str, Any]]:
-    symbol = _norm_symbol(symbol)
-    if not TRADE_GUARD_ENABLED:
-        return False, "", {}
-
-    tb, tr, td = _time_block_reason(now)
-    if tb:
-        return True, tr, td
-
-    if not symbol:
-        return False, "", {}
-
-    try:
-        n = _now(now)
-        with _connect() as conn:
-            row = _get_row(conn, symbol)
-            if int(row.get("day_blocked") or 0):
-                return True, "SYMBOL_DAY_BLOCKED_AFTER_LOSSES", row
-            until = _from_iso(row.get("cooldown_until"))
-            if until and n < until:
-                detail = dict(row)
-                detail["now"] = _iso(n)
-                detail["cooldown_until"] = _iso(until)
-                return True, "SYMBOL_COOLDOWN_ACTIVE", detail
-    except Exception:
-        logger.exception("[TRADE GUARD] is_entry_blocked failed symbol=%s", symbol)
-        return False, "", {"error": "trade_guard_failed"}
-
+    stop_t = _parse_time_hhmm(ENTRY_STOP_AFTER)
+    if t >= stop_t:
+        return True, "after_entry_stop_time", {"now": t.strftime("%H:%M"), "entry_stop_after": ENTRY_STOP_AFTER}
     return False, "", {}
 
 
-def record_exit_event(symbol: Any, *, pnl: float, reason: str, now: Optional[dt.datetime] = None) -> None:
-    symbol = _norm_symbol(symbol)
-    if not TRADE_GUARD_ENABLED or not symbol:
-        return
-    n = _now(now)
-    reason_s = str(reason or "")
-    pnl_f = float(pnl or 0.0)
-    loss_like = pnl_f < 0 or any(x in reason_s.upper() for x in ["STOP_LOSS", "LOSS", "ADVERSE"])
-
+def check_entry_allowed(symbol: Any, now: Optional[dt.datetime] = None) -> Tuple[bool, str, Dict[str, Any]]:
+    if not TRADE_GUARD_ENABLED:
+        return True, "trade_guard_disabled", {}
+    sym = _norm_symbol(symbol)
+    if not sym:
+        return False, "symbol_empty", {}
+    blocked, reason, meta = _time_block_reason(now)
+    if blocked:
+        return False, reason, meta
     try:
         with _connect() as conn:
-            row = _get_row(conn, symbol)
-            if loss_like:
+            row = _get_row(conn, sym)
+        n = _now(now)
+        cooldown_until = _from_iso(row.get("cooldown_until"))
+        if int(row.get("day_blocked") or 0):
+            return False, "symbol_day_blocked", row
+        if cooldown_until is not None and n < cooldown_until:
+            row["cooldown_remaining_sec"] = int((cooldown_until - n).total_seconds())
+            return False, "symbol_cooldown", row
+        if int(row.get("loss_count") or 0) >= MAX_DAILY_LOSSES_PER_SYMBOL:
+            return False, "symbol_loss_limit", row
+        return True, "ok", row
+    except Exception as e:
+        logger.warning("[TRADE GUARD] check failed symbol=%s err=%s -> allow fail-open", sym, e, exc_info=True)
+        return True, "trade_guard_error_fail_open", {"error": str(e)}
+
+
+def record_exit(symbol: Any, pnl: float = 0.0, reason: str = "") -> None:
+    if not TRADE_GUARD_ENABLED:
+        return
+    sym = _norm_symbol(symbol)
+    if not sym:
+        return
+    try:
+        with _connect() as conn:
+            row = _get_row(conn, sym)
+            pnl_f = float(pnl or 0.0)
+            if pnl_f < 0:
                 row["loss_count"] = int(row.get("loss_count") or 0) + 1
-                cooldown_until = n + dt.timedelta(minutes=LOSS_COOLDOWN_MINUTES)
-                row["cooldown_until"] = _iso(cooldown_until)
+                row["cooldown_until"] = _iso(dt.datetime.now() + dt.timedelta(minutes=LOSS_COOLDOWN_MINUTES))
                 if int(row["loss_count"]) >= MAX_DAILY_LOSSES_PER_SYMBOL:
                     row["day_blocked"] = 1
-                    row["cooldown_until"] = _iso(n.replace(hour=23, minute=59, second=59, microsecond=0))
-            else:
+            elif pnl_f > 0:
                 row["win_count"] = int(row.get("win_count") or 0) + 1
-                row["cooldown_until"] = _iso(n + dt.timedelta(minutes=PROFIT_COOLDOWN_MINUTES))
-            row["last_exit_reason"] = reason_s
+                row["cooldown_until"] = _iso(dt.datetime.now() + dt.timedelta(minutes=PROFIT_COOLDOWN_MINUTES))
+            else:
+                row["partial_profit_count"] = int(row.get("partial_profit_count") or 0) + 1
+                row["cooldown_until"] = _iso(dt.datetime.now() + dt.timedelta(minutes=PARTIAL_PROFIT_COOLDOWN_MINUTES))
+            row["last_exit_reason"] = str(reason or "")
             row["last_exit_pnl"] = pnl_f
-            row["last_event_time"] = _iso(n)
+            row["last_event_time"] = _iso(dt.datetime.now())
             _upsert(conn, row)
-        logger.warning("[TRADE GUARD] record_exit symbol=%s pnl=%.4f reason=%s", symbol, pnl_f, reason_s)
+            logger.info("[TRADE GUARD] record_exit symbol=%s pnl=%.2f reason=%s row=%s", sym, pnl_f, reason, row)
     except Exception:
-        logger.exception("[TRADE GUARD] record_exit failed symbol=%s", symbol)
+        logger.exception("[TRADE GUARD] record_exit failed symbol=%s", sym)
 
 
-def record_partial_profit_event(symbol: Any, *, reason: str, now: Optional[dt.datetime] = None) -> None:
-    symbol = _norm_symbol(symbol)
-    if not TRADE_GUARD_ENABLED or not symbol:
+def record_entry(symbol: Any) -> None:
+    if not TRADE_GUARD_ENABLED:
         return
-    n = _now(now)
+    sym = _norm_symbol(symbol)
+    if not sym:
+        return
     try:
         with _connect() as conn:
-            row = _get_row(conn, symbol)
-            row["partial_profit_count"] = int(row.get("partial_profit_count") or 0) + 1
-            row["cooldown_until"] = _iso(n + dt.timedelta(minutes=PARTIAL_PROFIT_COOLDOWN_MINUTES))
-            row["last_exit_reason"] = str(reason or "PARTIAL_PROFIT")
-            row["last_event_time"] = _iso(n)
+            row = _get_row(conn, sym)
+            row["last_event_time"] = _iso(dt.datetime.now())
             _upsert(conn, row)
-        logger.warning("[TRADE GUARD] record_partial_profit symbol=%s reason=%s", symbol, reason)
     except Exception:
-        logger.exception("[TRADE GUARD] record_partial_profit failed symbol=%s", symbol)
+        logger.exception("[TRADE GUARD] record_entry failed symbol=%s", sym)
 
 
-__all__ = [
-    "is_entry_blocked",
-    "record_exit_event",
-    "record_partial_profit_event",
-]
+__all__ = ["check_entry_allowed", "record_exit", "record_entry"]
