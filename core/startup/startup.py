@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/startup.py
-# Version: FINAL-PRODUCTION-REV23.1-TONOSAMA-HISTORY-GUARD
+# Version: FINAL-PRODUCTION-REV23.2-SEED-RECENT-MERGED-GUARD
 # ------------------------------------------------------------
 # 【概要】
 #   system_startup の公開入口
@@ -10,8 +10,9 @@
 #   - 実際の起動順序は startup_orchestrator.py に委譲
 #   - 詳細処理は push_startup / scheduler_startup / summary_startup 等へ分離
 #
-# REV23.1:
+# REV23.2:
 #   - tonosama_history_missing_guard_patch を起動時に明示適用
+#   - summary_seed_recent_merged_guard_patch を起動時に明示適用
 # ============================================================
 
 from __future__ import annotations
@@ -31,9 +32,16 @@ def _install_entrypoint_runtime_patches() -> None:
     except Exception:
         logger.exception("[startup.entrypoint] tonosama history missing guard install failed")
 
+    try:
+        from core.startup.summary_seed_recent_merged_guard_patch import install as install_summary_seed_recent_guard
+
+        install_summary_seed_recent_guard()
+    except Exception:
+        logger.exception("[startup.entrypoint] summary seed recent merged guard install failed")
+
 
 def system_startup():
-    logger.info("🚀 system_startup entry REV23.1-TONOSAMA-HISTORY-GUARD")
+    logger.info("🚀 system_startup entry REV23.2-SEED-RECENT-MERGED-GUARD")
     _install_entrypoint_runtime_patches()
     return run_system_startup()
 
