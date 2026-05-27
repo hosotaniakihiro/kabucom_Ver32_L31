@@ -1,18 +1,18 @@
 # ============================================================
 # File   : core/startup/ranking_summary_schedule_bg_patch.py
-# Version: V3-RANKING-SUMMARY-DIRECT-SCHEDULERBOOTSTRAP-WRAP
+# Version: V4-RANKING-SUMMARY-BG-NO-RECURSION
 # ------------------------------------------------------------
 # 目的:
 #   ranking_summary_all の schedule job が数分間 running のまま残り、
 #   previous still running / internal_previous_still_running で
 #   スキップされ続ける問題を防ぐ。
 #
-# V3:
-#   - fast_startup_runtime_patch 側だけでなく、
-#     scheduler_bootstrap._run_ranking_summary_all_job_safe 自体を直接ラップ
-#   - schedule に登録済みの関数参照も、可能なら job_func.func を差し替える
-#   - _RANKING_JOB_RUNNING が stale 秒数以上残っていたら、入口で解除してから実行
-#   - 09:18 started_at が 09:23 以降も残る internal_previous_still_running を防止
+# V4:
+#   - V3の再帰を解消
+#   - schedule登録関数は fast_startup_runtime_patch を経由しない
+#   - _scheduler_bootstrap_job_wrapper はランキング本体を直接BG投入して即return
+#   - scheduler_bootstrap._RANKING_JOB_RUNNING がstaleなら入口で解除
+#   - BG内で job_ranking_summary_all と announce を直接呼ぶ
 #
 # ENV:
 #   RANKING_SUMMARY_SCHEDULE_BG=1
@@ -37,7 +37,6 @@ _EXECUTOR: ThreadPoolExecutor | None = None
 _LOCK = threading.RLock()
 _RUNNING = False
 _STARTED_AT: dt.datetime | None = None
-_ORIGINAL_FAST = None
 _ORIGINAL_SB = None
 
 
@@ -101,23 +100,18 @@ def _clear_bg_if_stale() -> bool:
 
 
 def _clear_scheduler_bootstrap_internal_if_stale(*, force: bool = False, reason: str = "stale_check") -> bool:
-    """scheduler_bootstrap 内部の _RANKING_JOB_RUNNING が古く残るケースを解除する。"""
     try:
         import core.startup.scheduler_bootstrap as sb
-
         running = bool(getattr(sb, "_RANKING_JOB_RUNNING", False))
         if not running:
             return False
-
         started_at = getattr(sb, "_RANKING_JOB_STARTED_AT", None)
         elapsed = 999999.0
         if isinstance(started_at, dt.datetime):
             elapsed = max(0.0, (dt.datetime.now() - started_at).total_seconds())
-
         stale = _env_float("RANKING_SUMMARY_INTERNAL_STALE_SEC", 120.0)
         if (not force) and elapsed < stale:
             return False
-
         lock = getattr(sb, "_RANKING_JOB_LOCK", None)
         if lock is not None:
             with lock:
@@ -126,21 +120,15 @@ def _clear_scheduler_bootstrap_internal_if_stale(*, force: bool = False, reason:
         else:
             sb._RANKING_JOB_RUNNING = False
             sb._RANKING_JOB_STARTED_AT = None
-
         try:
             sb._set_global_attr("ranking_summary_job_running", False)
             sb._set_global_attr("ranking_summary_job_stale_cleared_at", dt.datetime.now())
             sb._set_global_attr("ranking_summary_job_stale_clear_reason", reason)
         except Exception:
             pass
-
         logger.warning(
             "[RANKING SUMMARY BG PATCH] scheduler_bootstrap internal running stale cleared reason=%s started_at=%s elapsed=%.3fs stale=%.3fs force=%s",
-            reason,
-            started_at,
-            elapsed,
-            stale,
-            force,
+            reason, started_at, elapsed, stale, force,
         )
         return True
     except Exception:
@@ -148,14 +136,81 @@ def _clear_scheduler_bootstrap_internal_if_stale(*, force: bool = False, reason:
         return False
 
 
-def _task(original: Callable, args: tuple[Any, ...], kwargs: dict[str, Any], started_at: dt.datetime) -> None:
+def _set_scheduler_bootstrap_running(value: bool, *, started_at: dt.datetime | None = None) -> None:
+    try:
+        import core.startup.scheduler_bootstrap as sb
+        lock = getattr(sb, "_RANKING_JOB_LOCK", None)
+        if lock is not None:
+            with lock:
+                sb._RANKING_JOB_RUNNING = bool(value)
+                sb._RANKING_JOB_STARTED_AT = started_at if value else None
+        else:
+            sb._RANKING_JOB_RUNNING = bool(value)
+            sb._RANKING_JOB_STARTED_AT = started_at if value else None
+        try:
+            sb._set_global_attr("ranking_summary_job_running", bool(value))
+            if value:
+                sb._set_global_attr("ranking_summary_job_started_at", started_at)
+            else:
+                sb._set_global_attr("ranking_summary_job_finished_at", dt.datetime.now())
+        except Exception:
+            pass
+    except Exception:
+        logger.debug("[RANKING SUMMARY BG PATCH] set scheduler_bootstrap running failed", exc_info=True)
+
+
+def _run_core_ranking_summary_job() -> Any:
+    """scheduler_bootstrapの便利関数を使いながら、再帰せずランキング本体を直接実行する。"""
+    import core.startup.scheduler_bootstrap as sb
+
+    started = dt.datetime.now()
+    perf_started = time.perf_counter()
+    _set_scheduler_bootstrap_running(True, started_at=started)
+    try:
+        logger.warning("[RANKING SUMMARY BG PATCH] core ranking job start at=%s", started.strftime("%Y-%m-%d %H:%M:%S"))
+        fn = sb._resolve_attr(
+            "scheduler_jobs.summary.ranking_summary_jobs",
+            "job_ranking_summary_all",
+            quiet=False,
+        )
+        if not callable(fn):
+            logger.warning("[RANKING SUMMARY BG PATCH] core ranking job skipped function unavailable")
+            return None
+        kwargs = sb._build_ranking_job_kwargs(force=False)
+        result = sb._call_with_supported_kwargs(fn, **kwargs)
+        elapsed = time.perf_counter() - perf_started
+        try:
+            sb._set_global_attr("last_ranking_summary_job_at", dt.datetime.now())
+            sb._set_global_attr("last_ranking_summary_job_result", sb._summarize_result(result))
+        except Exception:
+            pass
+        logger.warning(
+            "[RANKING SUMMARY BG PATCH] core ranking job done elapsed=%.3fs result=%s",
+            elapsed,
+            sb._summarize_result(result),
+        )
+        try:
+            announce_results = sb._announce_ranking_summary_intervals_safe(top_n=10, use_discord=True, intervals=(1, 3, 5))
+            sb._set_global_attr("last_ranking_summary_announce_results", announce_results)
+            logger.warning("[RANKING SUMMARY BG PATCH] announce done results=%s", announce_results)
+        except Exception:
+            logger.exception("[RANKING SUMMARY BG PATCH] announce failed")
+        return result
+    except Exception:
+        logger.exception("[RANKING SUMMARY BG PATCH] core ranking job failed")
+        return None
+    finally:
+        _set_scheduler_bootstrap_running(False)
+
+
+def _bg_task(started_at: dt.datetime) -> None:
     global _RUNNING, _STARTED_AT
     t0 = time.perf_counter()
     try:
-        _clear_scheduler_bootstrap_internal_if_stale(reason="bg_task_before_original")
+        _clear_scheduler_bootstrap_internal_if_stale(reason="bg_task_before_core")
         logger.warning("[RANKING SUMMARY BG PATCH] bg start started_at=%s", started_at)
-        ret = original(*args, **kwargs)
-        logger.warning("[RANKING SUMMARY BG PATCH] bg done elapsed=%.3fs ret_type=%s", time.perf_counter() - t0, type(ret).__name__)
+        _run_core_ranking_summary_job()
+        logger.warning("[RANKING SUMMARY BG PATCH] bg done elapsed=%.3fs", time.perf_counter() - t0)
     except Exception:
         logger.exception("[RANKING SUMMARY BG PATCH] bg failed elapsed=%.3fs", time.perf_counter() - t0)
     finally:
@@ -164,48 +219,28 @@ def _task(original: Callable, args: tuple[Any, ...], kwargs: dict[str, Any], sta
             _STARTED_AT = None
 
 
-def _ranking_job_safe_no_return_bg(*args: Any, **kwargs: Any):
-    """fast_startup_runtime_patch 用のBGラッパ。"""
+def _scheduler_bootstrap_job_wrapper(*args: Any, **kwargs: Any):
+    """scheduleから呼ばれる軽量入口。再帰防止のため旧jobは呼ばず、BGへ直接投入する。"""
     global _RUNNING, _STARTED_AT
+    _clear_scheduler_bootstrap_internal_if_stale(reason="direct_wrapper_entry")
     if not _env_bool("RANKING_SUMMARY_SCHEDULE_BG", True):
-        _clear_scheduler_bootstrap_internal_if_stale(reason="fast_wrapper_sync_mode")
-        if callable(_ORIGINAL_FAST):
-            return _ORIGINAL_FAST(*args, **kwargs)
-        return None
-
-    original = _ORIGINAL_FAST
-    if not callable(original):
-        logger.warning("[RANKING SUMMARY BG PATCH] original fast ranking job not callable")
-        return None
+        return _run_core_ranking_summary_job()
 
     with _LOCK:
         _clear_bg_if_stale()
-        _clear_scheduler_bootstrap_internal_if_stale(reason="fast_wrapper_submit")
         if _RUNNING:
-            logger.warning(
-                "[RANKING SUMMARY BG PATCH] submit skipped reason=bg_still_running elapsed=%.3fs",
-                _elapsed_sec(),
-            )
+            logger.warning("[RANKING SUMMARY BG PATCH] submit skipped reason=bg_still_running elapsed=%.3fs", _elapsed_sec())
             return None
         _RUNNING = True
         _STARTED_AT = dt.datetime.now()
         started = _STARTED_AT
 
-    _executor().submit(_task, original, tuple(args), dict(kwargs), started)
+    _executor().submit(_bg_task, started)
     logger.warning("[RANKING SUMMARY BG PATCH] submitted schedule job returns immediately started_at=%s", started)
     return None
 
 
-def _scheduler_bootstrap_job_wrapper(*args: Any, **kwargs: Any):
-    """scheduler_bootstrap._run_ranking_summary_all_job_safe の入口で stale を直接解除する。"""
-    _clear_scheduler_bootstrap_internal_if_stale(reason="direct_scheduler_bootstrap_wrapper_entry")
-    if callable(_ORIGINAL_SB):
-        return _ORIGINAL_SB(*args, **kwargs)
-    return None
-
-
 def _replace_schedule_job_refs(old: Callable, new: Callable) -> int:
-    """既にscheduleへ登録済みのjob_func.funcがoldならnewへ差し替える。"""
     changed = 0
     try:
         import schedule
@@ -216,10 +251,11 @@ def _replace_schedule_job_refs(old: Callable, new: Callable) -> int:
                     continue
                 jf = getattr(job, "job_func", None)
                 if isinstance(jf, functools.partial):
-                    if getattr(jf, "func", None) is old:
+                    current = getattr(jf, "func", None)
+                    if current is old or getattr(current, "__name__", "") in {"_scheduler_bootstrap_job_wrapper", "_ranking_job_safe_no_return", "_run_ranking_summary_all_job_safe"}:
                         job.job_func = functools.partial(new, *jf.args, **(jf.keywords or {}))
                         changed += 1
-                elif jf is old:
+                elif jf is old or getattr(jf, "__name__", "") in {"_scheduler_bootstrap_job_wrapper", "_ranking_job_safe_no_return", "_run_ranking_summary_all_job_safe"}:
                     job.job_func = new
                     changed += 1
             except Exception:
@@ -237,16 +273,13 @@ def _patch_scheduler_bootstrap_direct() -> bool:
         if not callable(cur):
             logger.warning("[RANKING SUMMARY BG PATCH] scheduler_bootstrap direct target not callable")
             return False
-        if getattr(cur, "_ranking_summary_direct_stale_wrapper_v3", False):
-            _clear_scheduler_bootstrap_internal_if_stale(reason="direct_already_patched")
-            return True
-
-        _ORIGINAL_SB = cur
-        _scheduler_bootstrap_job_wrapper._ranking_summary_direct_stale_wrapper_v3 = True  # type: ignore[attr-defined]
-        _scheduler_bootstrap_job_wrapper._original = cur  # type: ignore[attr-defined]
-        sb._run_ranking_summary_all_job_safe = _scheduler_bootstrap_job_wrapper
+        if not getattr(cur, "_ranking_summary_direct_bg_v4", False):
+            _ORIGINAL_SB = cur
+            _scheduler_bootstrap_job_wrapper._ranking_summary_direct_bg_v4 = True  # type: ignore[attr-defined]
+            _scheduler_bootstrap_job_wrapper._original = cur  # type: ignore[attr-defined]
+            sb._run_ranking_summary_all_job_safe = _scheduler_bootstrap_job_wrapper
         changed = _replace_schedule_job_refs(cur, _scheduler_bootstrap_job_wrapper)
-        logger.warning("[RANKING SUMMARY BG PATCH] scheduler_bootstrap direct wrapper installed schedule_refs_changed=%s", changed)
+        logger.warning("[RANKING SUMMARY BG PATCH] scheduler_bootstrap direct BG wrapper installed schedule_refs_changed=%s", changed)
         _clear_scheduler_bootstrap_internal_if_stale(reason="direct_patch_install")
         return True
     except Exception:
@@ -255,47 +288,18 @@ def _patch_scheduler_bootstrap_direct() -> bool:
 
 
 def install() -> bool:
-    global _PATCHED, _ORIGINAL_FAST
+    global _PATCHED
     direct_ok = _patch_scheduler_bootstrap_direct()
-
-    if _PATCHED:
-        _clear_scheduler_bootstrap_internal_if_stale(reason="install_already_patched")
-        return bool(direct_ok)
-
-    try:
-        import core.startup.fast_startup_runtime_patch as fast_patch
-    except Exception:
-        logger.exception("[RANKING SUMMARY BG PATCH] fast_startup_runtime_patch import failed")
-        _PATCHED = bool(direct_ok)
-        return bool(direct_ok)
-
-    try:
-        cur = getattr(fast_patch, "_ranking_job_safe_no_return", None)
-        if not callable(cur):
-            logger.warning("[RANKING SUMMARY BG PATCH] target _ranking_job_safe_no_return not callable")
-            _PATCHED = bool(direct_ok)
-            return bool(direct_ok)
-
-        if not getattr(cur, "_ranking_summary_bg_patch_v3", False):
-            _ORIGINAL_FAST = cur
-            _ranking_job_safe_no_return_bg._ranking_summary_bg_patch_v3 = True  # type: ignore[attr-defined]
-            _ranking_job_safe_no_return_bg._original = cur  # type: ignore[attr-defined]
-            fast_patch._ranking_job_safe_no_return = _ranking_job_safe_no_return_bg
-
-        _clear_scheduler_bootstrap_internal_if_stale(reason="install_final")
-        _PATCHED = True
-        logger.warning(
-            "[RANKING SUMMARY BG PATCH] installed V3 enabled=%s bg_stale_sec=%.1f internal_stale_sec=%.1f direct_ok=%s",
-            _env_bool("RANKING_SUMMARY_SCHEDULE_BG", True),
-            _env_float("RANKING_SUMMARY_BG_STALE_SEC", 120.0),
-            _env_float("RANKING_SUMMARY_INTERNAL_STALE_SEC", 120.0),
-            direct_ok,
-        )
-        return True
-    except Exception:
-        logger.exception("[RANKING SUMMARY BG PATCH] install failed")
-        _PATCHED = bool(direct_ok)
-        return bool(direct_ok)
+    _clear_scheduler_bootstrap_internal_if_stale(reason="install_final")
+    _PATCHED = bool(direct_ok)
+    logger.warning(
+        "[RANKING SUMMARY BG PATCH] installed V4 enabled=%s bg_stale_sec=%.1f internal_stale_sec=%.1f direct_ok=%s",
+        _env_bool("RANKING_SUMMARY_SCHEDULE_BG", True),
+        _env_float("RANKING_SUMMARY_BG_STALE_SEC", 120.0),
+        _env_float("RANKING_SUMMARY_INTERNAL_STALE_SEC", 120.0),
+        direct_ok,
+    )
+    return bool(direct_ok)
 
 
 try:
