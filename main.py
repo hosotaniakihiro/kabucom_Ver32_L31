@@ -10,7 +10,7 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.19-MAIN-RANKING-FLAT-PRICE-PATCH
+# Version: Ver38.20-MAIN-INDICATOR-FRAGMENTATION-PATCH
 # ------------------------------------------------------------
 # ✔ PROJECT_ROOT を最初に sys.path へ追加
 # ✔ core.logging.console_tee を確実に import / setup
@@ -28,6 +28,7 @@
 # ✔ SUMMARY AI が AI_OK 済みの候補を entry_controller で再AI落ち/None戻り値誤判定させない bridge patch を起動時install
 # ✔ Discordの横長サマリー表示を縦リスト短文に補正し、interval kwarg TypeError を防止
 # ✔ ランキング由来ENTRYで価格横ばいでも順位上位/改善なら許可する patch を起動時install
+# ✔ indicator_calculator の DataFrame fragmentation 警告抑制/戻りDFデフラグ patch を起動時install
 # ✔ EXIT scheduler を run_exit_pipeline で1秒ごとに登録
 # ✔ main.py 側の scheduler / realtime / position_sync / push_monitor 生存証跡を heartbeat DB に保存
 # ✔ main.py のサマリー計算結果はENTRY判定専用。正式なsummary DB保存は main_database.py 側へ寄せる
@@ -153,6 +154,7 @@ def _factory_position_state():
 
 def _install_main_runtime_patches():
     patches = [
+        ("core.startup.indicator_fragmentation_runtime_patch", "install"),
         ("core.startup.entry_controller_runtime_reject_patch", "install"),
         ("core.startup.fast_startup_runtime_patch", "install"),
         ("core.startup.entry_qty_min_lot_runtime_patch", "install"),
