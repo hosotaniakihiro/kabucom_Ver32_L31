@@ -1,14 +1,16 @@
 # ============================================================
 # File   : trading/entry/tonosama/runner.py
-# Version: Ver1.7-TONOSAMA-CLIMAX-GUARD-BUY-SELL
+# Version: Ver1.8-TONOSAMA-WICK-REVERSAL-STRICT-GUARD
 # ------------------------------------------------------------
 # ✔ 5秒足は必須にしない。
 # ✔ REQUIRE_5SEC_BAR=False の場合、5秒足が取れていても 0.0% 横ばいだけでは落とさない。
 # ✔ 5秒足で MAX_5SEC_DROP_PCT 以下の強い逆行だけ落とす。
 # ✔ REQUIRE_5SEC_BAR=True の場合のみ、従来通り 5秒足の正方向変化を要求する。
-# ✔ Ver1.7: 出来高急増だけで高値掴み/安値売りしない。
-#   - BUY: バイイングクライマックス疑いを除外
-#   - SELL: セリングクライマックス疑いを除外
+# ✔ 出来高急増だけで高値掴み/安値売りしない。
+# ✔ Ver1.8:
+#   - BUY: 上ヒゲ大 + 終値が安値圏なら、上昇率が小さくても除外
+#   - SELL: 下ヒゲ大 + 終値が高値圏なら、下落率が小さくても除外
+#   - 11:09ログの upper_wick=90%超 / close_pos=3〜10% のBUY通過を防止
 # ============================================================
 from __future__ import annotations
 
@@ -69,6 +71,9 @@ from .utils import normalize_symbol, safe_float
 logger = logging.getLogger(__name__)
 _last_loop_at: dt.datetime | None = None
 _LAST_FILTER_DIAG: dict[str, Any] = {}
+
+BUY_REJECTED_CLOSE_POSITION_PCT = 35.0
+SELL_REJECTED_CLOSE_POSITION_PCT = 65.0
 
 
 def _num_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
@@ -189,6 +194,8 @@ def _diagnose_base_frame(x: pd.DataFrame) -> None:
             "min_raw_score": MIN_RAW_SCORE,
             "max_buy_price_change_pct": MAX_BUY_PRICE_CHANGE_PCT,
             "max_sell_price_drop_pct": MAX_SELL_PRICE_DROP_PCT,
+            "buy_rejected_close_position_pct": BUY_REJECTED_CLOSE_POSITION_PCT,
+            "sell_rejected_close_position_pct": SELL_REJECTED_CLOSE_POSITION_PCT,
             "use_5sec_confirm": USE_5SEC_CONFIRM,
             "require_5sec_bar": REQUIRE_5SEC_BAR,
             "min_5sec_price_change_pct": MIN_5SEC_PRICE_CHANGE_PCT,
@@ -213,26 +220,36 @@ def _apply_climax_guards(x: pd.DataFrame, *, stage: str, sample_cols: list[str])
     signed_body = _num_series(x, "_signed_body_change_pct")
     close_pos = _num_series(x, "_close_position_pct", 50.0)
     upper_wick = _num_series(x, "_upper_wick_pct")
-    lower_wick = _num_series(x, "_lower_wick_pct")
     slope = _num_series(x, "_slope")
 
     # BUY側: 出来高急増 + 上昇後の高値掴み/上ヒゲ反落を除外。
+    # 重要: 11:09ログでは price_chg=0.07〜0.23% と小さくても、
+    # upper_wick=90%超 / close_pos=3〜10% で明確に高値から叩き落とされていた。
+    # よって上ヒゲ反落は price_chg >= 0.50% を必須にしない。
     buy_like = (price_chg > 0) | (signed_body > 0) | (slope > 0)
     buy_too_late = buy_like & (price_chg >= MAX_BUY_PRICE_CHANGE_PCT)
     buy_high_zone = buy_like & (close_pos >= MAX_BUY_CLOSE_POSITION_PCT) & (price_chg >= BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT)
-    buy_upper_wick_reversal = buy_like & (upper_wick >= MAX_BUY_UPPER_WICK_PCT) & (price_chg >= BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT)
-    buying_climax = buy_like & (surge >= BUYING_CLIMAX_MIN_SURGE_RATIO) & (price_chg >= BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT) & ((close_pos >= MAX_BUY_CLOSE_POSITION_PCT) | (upper_wick >= MAX_BUY_UPPER_WICK_PCT))
+    buy_upper_wick_reversal = buy_like & (upper_wick >= MAX_BUY_UPPER_WICK_PCT) & (close_pos <= BUY_REJECTED_CLOSE_POSITION_PCT)
+    buying_climax = buy_like & (surge >= BUYING_CLIMAX_MIN_SURGE_RATIO) & (
+        (price_chg >= BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT and False)
+    )
+    # 上の式はSeries演算にしないためFalse固定。実際の過熱判定は下でSeriesとして作る。
+    buying_climax = buy_like & (surge >= BUYING_CLIMAX_MIN_SURGE_RATIO) & (
+        ((price_chg >= BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT) & (close_pos >= MAX_BUY_CLOSE_POSITION_PCT))
+        | ((upper_wick >= MAX_BUY_UPPER_WICK_PCT) & (close_pos <= BUY_REJECTED_CLOSE_POSITION_PCT))
+    )
     before = x.copy()
     x = x[~(buy_too_late | buy_high_zone | buy_upper_wick_reversal | buying_climax)]
     _log_filter_step(
         stage=stage,
         before=before,
         after=x,
-        reason="buying_climax_or_high_chase_guard",
+        reason="buying_climax_or_upper_wick_reversal_guard",
         threshold={
             "MAX_BUY_PRICE_CHANGE_PCT": MAX_BUY_PRICE_CHANGE_PCT,
             "MAX_BUY_CLOSE_POSITION_PCT": MAX_BUY_CLOSE_POSITION_PCT,
             "MAX_BUY_UPPER_WICK_PCT": MAX_BUY_UPPER_WICK_PCT,
+            "BUY_REJECTED_CLOSE_POSITION_PCT": BUY_REJECTED_CLOSE_POSITION_PCT,
             "BUYING_CLIMAX_MIN_SURGE_RATIO": BUYING_CLIMAX_MIN_SURGE_RATIO,
             "BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT": BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT,
         },
@@ -254,19 +271,23 @@ def _apply_climax_guards(x: pd.DataFrame, *, stage: str, sample_cols: list[str])
     sell_like = (price_chg < 0) | (signed_body < 0) | (slope < 0)
     sell_too_late = sell_like & (drop_abs >= MAX_SELL_PRICE_DROP_PCT)
     sell_low_zone = sell_like & (close_pos <= MIN_SELL_CLOSE_POSITION_PCT) & (drop_abs >= SELLING_CLIMAX_MIN_PRICE_DROP_PCT)
-    sell_lower_wick_reversal = sell_like & (lower_wick >= MAX_SELL_LOWER_WICK_PCT) & (drop_abs >= SELLING_CLIMAX_MIN_PRICE_DROP_PCT)
-    selling_climax = sell_like & (surge >= SELLING_CLIMAX_MIN_SURGE_RATIO) & (drop_abs >= SELLING_CLIMAX_MIN_PRICE_DROP_PCT) & ((close_pos <= MIN_SELL_CLOSE_POSITION_PCT) | (lower_wick >= MAX_SELL_LOWER_WICK_PCT))
+    sell_lower_wick_reversal = sell_like & (lower_wick >= MAX_SELL_LOWER_WICK_PCT) & (close_pos >= SELL_REJECTED_CLOSE_POSITION_PCT)
+    selling_climax = sell_like & (surge >= SELLING_CLIMAX_MIN_SURGE_RATIO) & (
+        ((drop_abs >= SELLING_CLIMAX_MIN_PRICE_DROP_PCT) & (close_pos <= MIN_SELL_CLOSE_POSITION_PCT))
+        | ((lower_wick >= MAX_SELL_LOWER_WICK_PCT) & (close_pos >= SELL_REJECTED_CLOSE_POSITION_PCT))
+    )
     before = x.copy()
     x = x[~(sell_too_late | sell_low_zone | sell_lower_wick_reversal | selling_climax)]
     _log_filter_step(
         stage=stage,
         before=before,
         after=x,
-        reason="selling_climax_or_low_chase_guard",
+        reason="selling_climax_or_lower_wick_reversal_guard",
         threshold={
             "MAX_SELL_PRICE_DROP_PCT": MAX_SELL_PRICE_DROP_PCT,
             "MIN_SELL_CLOSE_POSITION_PCT": MIN_SELL_CLOSE_POSITION_PCT,
             "MAX_SELL_LOWER_WICK_PCT": MAX_SELL_LOWER_WICK_PCT,
+            "SELL_REJECTED_CLOSE_POSITION_PCT": SELL_REJECTED_CLOSE_POSITION_PCT,
             "SELLING_CLIMAX_MIN_SURGE_RATIO": SELLING_CLIMAX_MIN_SURGE_RATIO,
             "SELLING_CLIMAX_MIN_PRICE_DROP_PCT": SELLING_CLIMAX_MIN_PRICE_DROP_PCT,
         },
@@ -308,7 +329,7 @@ def _apply_primary_filters(x: pd.DataFrame) -> pd.DataFrame:
 
     x = _apply_climax_guards(x, stage="primary", sample_cols=sample_cols)
 
-    _LAST_FILTER_DIAG = {"stage": "primary", "base_rows": base_rows, "primary_rows": len(x), "thresholds": {"MIN_PRICE": MIN_PRICE, "MIN_LATEST_VOLUME": MIN_LATEST_VOLUME, "MIN_BODY_CHANGE_PCT": MIN_BODY_CHANGE_PCT, "MIN_INTRABAR_RANGE_PCT": MIN_INTRABAR_RANGE_PCT, "MIN_VOLUME_SURGE_RATIO": MIN_VOLUME_SURGE_RATIO, "MIN_PRICE_CHANGE_PCT": MIN_PRICE_CHANGE_PCT, "MIN_SLOPE": MIN_SLOPE, "MAX_BUY_PRICE_CHANGE_PCT": MAX_BUY_PRICE_CHANGE_PCT, "MAX_SELL_PRICE_DROP_PCT": MAX_SELL_PRICE_DROP_PCT}, "survivors": _sample_rows(x, sample_cols, limit=12)}
+    _LAST_FILTER_DIAG = {"stage": "primary", "base_rows": base_rows, "primary_rows": len(x), "thresholds": {"MIN_PRICE": MIN_PRICE, "MIN_LATEST_VOLUME": MIN_LATEST_VOLUME, "MIN_BODY_CHANGE_PCT": MIN_BODY_CHANGE_PCT, "MIN_INTRABAR_RANGE_PCT": MIN_INTRABAR_RANGE_PCT, "MIN_VOLUME_SURGE_RATIO": MIN_VOLUME_SURGE_RATIO, "MIN_PRICE_CHANGE_PCT": MIN_PRICE_CHANGE_PCT, "MIN_SLOPE": MIN_SLOPE, "MAX_BUY_PRICE_CHANGE_PCT": MAX_BUY_PRICE_CHANGE_PCT, "MAX_SELL_PRICE_DROP_PCT": MAX_SELL_PRICE_DROP_PCT, "BUY_REJECTED_CLOSE_POSITION_PCT": BUY_REJECTED_CLOSE_POSITION_PCT, "SELL_REJECTED_CLOSE_POSITION_PCT": SELL_REJECTED_CLOSE_POSITION_PCT}, "survivors": _sample_rows(x, sample_cols, limit=12)}
     logger.warning("[TONOSAMA FILTER SUMMARY] stage=primary base_rows=%s primary_rows=%s survivors=%s thresholds=%s", base_rows, len(x), _LAST_FILTER_DIAG.get("survivors"), _LAST_FILTER_DIAG.get("thresholds"))
     return x
 
@@ -344,9 +365,12 @@ def build_feature_df_with_5sec() -> pd.DataFrame:
             continue
         try:
             f = build_5sec_features(sym)
-            if not isinstance(f, dict): f = {}
-            if not f: feature_missing += 1
-            f["symbol"] = sym; features.append(f)
+            if not isinstance(f, dict):
+                f = {}
+            if not f:
+                feature_missing += 1
+            f["symbol"] = sym
+            features.append(f)
         except Exception:
             feature_missing += 1
             logger.warning("[TONOSAMA ENTRY] build_5sec_features failed symbol=%s", sym, exc_info=True)
@@ -354,7 +378,8 @@ def build_feature_df_with_5sec() -> pd.DataFrame:
     if features:
         x = x.merge(pd.DataFrame(features), on="symbol", how="left")
     for c in ["price_change_5s_pct", "volume_surge_ratio_5s", "latest_5sec_close", "latest_5sec_volume"]:
-        if c in x.columns: x[c] = pd.to_numeric(x[c], errors="coerce")
+        if c in x.columns:
+            x[c] = pd.to_numeric(x[c], errors="coerce")
     x = prepare_entry_scores(x)
     logger.info("[TONOSAMA ENTRY] feature build done base_rows=%s primary_rows=%s five_sec_rows=%s feature_missing=%s pre_5sec_head=%s post_5sec_head=%s elapsed=%.3fs", base_rows, primary_rows, len(x), feature_missing, before_head, _sample_rows(x, ["symbol", "symbolname", "close", "_latest_volume", "_body_change_pct", "_signed_body_change_pct", "_intrabar_range_pct", "_close_position_pct", "_upper_wick_pct", "_lower_wick_pct", "_max_volume_surge_ratio", "_max_price_change_pct", "_slope", "_tonosama_score", "has_5sec_bar", "price_change_5s_pct", "volume_surge_ratio_5s"], limit=12), time.perf_counter() - started)
     return x
@@ -422,15 +447,27 @@ def build_tonosama_entries() -> int:
     if candidates.empty:
         logger.info("[TONOSAMA ENTRY] build done candidates=0 registered=0 elapsed=%.3fs", time.perf_counter() - started)
         return 0
-    registered = 0; ai_ng = 0; duplicate = 0; low_score = 0; no_symbol = 0; final_low_samples: list[dict[str, Any]] = []
+    registered = 0
+    ai_ng = 0
+    duplicate = 0
+    low_score = 0
+    no_symbol = 0
+    final_low_samples: list[dict[str, Any]] = []
     for _, row in candidates.iterrows():
-        if registered >= MAX_PENDING_PER_LOOP: break
+        if registered >= MAX_PENDING_PER_LOOP:
+            break
         symbol = normalize_symbol(row.get("symbol"))
-        if not symbol: no_symbol += 1; continue
-        if has_tonosama_pending(symbol): duplicate += 1; continue
+        if not symbol:
+            no_symbol += 1
+            continue
+        if has_tonosama_pending(symbol):
+            duplicate += 1
+            continue
         raw_score = safe_float(row.get("_tonosama_score"), 0.0)
         if raw_score <= 0:
-            low_score += 1; final_low_samples.append({"symbol": symbol, "reason": "raw_score_le_zero", "raw_score": raw_score}); continue
+            low_score += 1
+            final_low_samples.append({"symbol": symbol, "reason": "raw_score_le_zero", "raw_score": raw_score})
+            continue
         ai_ok, ai_prob, ai_reason = ai_check_tonosama_entry(row)
         if not ai_ok:
             ai_ng += 1
@@ -438,7 +475,9 @@ def build_tonosama_entries() -> int:
             continue
         final_score = calc_final_score_safe(row, raw_score=raw_score, ai_prob=ai_prob)
         if final_score < MIN_FINAL_SCORE:
-            low_score += 1; final_low_samples.append({"symbol": symbol, "reason": "final_score_low", "final_score": round(final_score, 4), "min_final_score": MIN_FINAL_SCORE, "raw_score": round(raw_score, 4), "ai_prob": round(ai_prob, 4)}); continue
+            low_score += 1
+            final_low_samples.append({"symbol": symbol, "reason": "final_score_low", "final_score": round(final_score, 4), "min_final_score": MIN_FINAL_SCORE, "raw_score": round(raw_score, 4), "ai_prob": round(ai_prob, 4)})
+            continue
         entry = build_pending_entry(row, final_score=final_score, ai_prob=ai_prob, ai_reason=ai_reason)
         if add_tonosama_pending(entry):
             registered += 1
@@ -454,12 +493,16 @@ def tonosama_loop() -> int:
     try:
         logger.info("[TONOSAMA LOOP] start at=%s", _last_loop_at.strftime("%Y-%m-%d %H:%M:%S"))
         if not is_market_time():
-            logger.info("[TONOSAMA ENTRY] market closed skip"); return 0
+            logger.info("[TONOSAMA ENTRY] market closed skip")
+            return 0
         pruned = prune_expired_tonosama_pending(reason="TONOSAMA_LOOP_START_EXPIRED")
-        if pruned: logger.warning("[TONOSAMA LOOP] expired pending pruned at start removed=%s", pruned)
+        if pruned:
+            logger.warning("[TONOSAMA LOOP] expired pending pruned at start removed=%s", pruned)
         if callable(update_active_symbols):
-            try: update_active_symbols()
-            except Exception: logger.warning("[TONOSAMA ENTRY] update_active_symbols skipped/failed", exc_info=True)
+            try:
+                update_active_symbols()
+            except Exception:
+                logger.warning("[TONOSAMA ENTRY] update_active_symbols skipped/failed", exc_info=True)
         registered = build_tonosama_entries()
         logger.info("[TONOSAMA LOOP] done registered=%s elapsed=%.3fs", registered, time.perf_counter() - started)
         return registered
