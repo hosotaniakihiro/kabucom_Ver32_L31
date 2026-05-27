@@ -1,14 +1,17 @@
 # ============================================================
 # File: config/ranking_entry_config.py
-# Ver : RANKING-ONLY-ENTRY-CONFIG-v5.1.1-LATE-SESSION
+# Ver : RANKING-ONLY-ENTRY-CONFIG-v5.2.0-RESTART-SAFE
 # ------------------------------------------------------------
 # Ranking ENTRY 専用設定ファイル
 #
+# Ver5.2.0:
+#   - 再起動直後に in-memory ranking_entry_history が空だと、
+#     NO_PREVIOUS_RANKING_SNAPSHOT で134件以上が一括DROPされる問題を修正。
+#   - ランキングDB fallback/prefilter が動いているため、前回メモリ履歴を必須にしない。
+#   - ランク悪化チェック・価格ブレイクアウトチェックは、履歴がある場合のみ効く。
+#
 # Ver5.1.1:
 #   - NO_ENTRY_AFTER を 14:30 → 15:20 に変更。
-#   - 14:47ログで RANKING ENTRY が TIME_GUARD により即skipされ、
-#     ranking flat price patch の効果確認もできなかったため。
-#   - 大引け直前の新規発注は避けるため 15:20 で停止する。
 # ============================================================
 
 from datetime import time, datetime
@@ -24,9 +27,9 @@ RANKING_ENTRY_CONFIG = {
     "RANKING": {
         "TYPE": None,
         "MAX_RANK_POSITION": 30,
-        "MIN_CONSECUTIVE_APPEAR": 2,
+        "MIN_CONSECUTIVE_APPEAR": 1,
         "PRICE_BREAKOUT_WINDOW": 3,
-        "REQUIRE_PREVIOUS_SNAPSHOT": True,
+        "REQUIRE_PREVIOUS_SNAPSHOT": False,
         "REQUIRE_RANK_NOT_WORSE": True,
         "REQUIRE_PRICE_BREAKOUT": True,
         # 価格横ばい時の救済: ranking_entry_flat_price_guard_patch が参照。
