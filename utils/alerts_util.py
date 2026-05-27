@@ -1,6 +1,6 @@
 # ============================================================
 # File   : utils/alerts_util.py
-# Version: Ver3.0-PRODUCTION-RATE-LIMIT-SAFE-BRIDGE-COMPAT
+# Version: Ver3.1-PRODUCTION-DISCORD-FINAL-SUMMARY-3LINE-GUARD
 # ------------------------------------------------------------
 # ✔ 既存機能完全保持（削除ゼロ）
 # ✔ Discord 429 RateLimit完全対策
@@ -8,17 +8,17 @@
 # ✔ 送信間隔制御（0.7秒）
 # ✔ ENTRY / EXIT Embed互換
 # ✔ ranking互換 send_discord_notify 保持
-# ✔ announce_bridge / jobs / runners から
-#   discord_sender として直接使える
+# ✔ announce_bridge / jobs / runners から discord_sender として直接使える
 # ✔ 長文自動分割対応
 # ✔ 例外耐性強化
-# ✔ 本番永久安定版
+# ✔ 最終防衛: SUMMARY/AI PASSED 系の横長1行通知を送信直前に3行化
 # ============================================================
 
 from __future__ import annotations
 
 import configparser
 import logging
+import re
 import time
 from datetime import datetime
 from threading import Lock
@@ -79,6 +79,132 @@ def _resolve_webhook_url(webhook_url: Optional[str] = None) -> str:
     return DISCORD_WEBHOOK
 
 
+# ------------------------------------------------------------
+# Discord summary final formatter
+# ------------------------------------------------------------
+
+_SUMMARY_ONE_LINE_RE = re.compile(
+    r"^(?P<prefix>\s*(?:[🟦🟥🔴🔵🟩🟨⬛⬜🟧🟪]\s*)?\d+\.\s+)"
+    r"(?P<head>.*?)\s+"
+    r"(?:株価|価|Price|price|close)=(?P<price>[-+0-9.,]+)\s+"
+    r"(?:score|Score)=(?P<score>[-+0-9.,]+)\s+"
+    r"(?:buy|Buy)=(?P<buy>[-+0-9.,]+)\s+"
+    r"(?:sell|Sell)=(?P<sell>[-+0-9.,]+)\s+"
+    r"(?:total=[-+0-9.,]+\s+)?"
+    r"(?:final=[-+0-9.,]+\s+)?"
+    r"(?:close=[-+0-9.,]+\s+)?"
+    r"(?:slope|Slope)=(?P<slope>[-+0-9.,]+)\s+"
+    r"(?:mtf|MTF)=(?P<mtf>[-+0-9.,]+)\s+"
+    r"(?:rsi|RSI)=(?P<rsi>[-+0-9.,]+)\s+"
+    r"(?:macd|MACD)=(?P<macd>[-+0-9.,]+)\s+"
+    r"(?:理由|REASON|Reason)=(?P<reason>.*)$",
+    re.IGNORECASE,
+)
+
+
+def _summary_reason_to_ja(reason: str, *, buy: str, sell: str, slope: str, mtf: str, rsi: str, macd: str) -> str:
+    """英語コードや既存理由を、短めの日本語理由へ寄せる。"""
+    try:
+        raw = _safe_str(reason).strip()
+        parts: list[str] = []
+        buy_f = _safe_float(buy, 0.0)
+        sell_f = _safe_float(sell, 0.0)
+        slope_f = _safe_float(slope, 0.0)
+        mtf_f = _safe_float(mtf, 0.0)
+        rsi_f = _safe_float(rsi, 50.0)
+        macd_f = _safe_float(macd, 0.0)
+
+        if sell_f > buy_f and sell_f > 0:
+            parts.append(f"売りスコア優勢 sell={sell_f:.2f}")
+            if slope_f < 0:
+                parts.append(f"下向き傾き slope={slope_f:.4f}")
+            else:
+                parts.append(f"下落傾きは弱い slope={slope_f:.4f}")
+        elif buy_f > 0:
+            parts.append(f"買いスコア優勢 buy={buy_f:.2f}")
+            if slope_f > 0:
+                parts.append(f"上向き傾き slope={slope_f:.4f}")
+            else:
+                parts.append(f"傾きは弱い slope={slope_f:.4f}")
+
+        if abs(mtf_f) > 0:
+            parts.append(f"複数時間足={mtf_f:.2f}")
+        if rsi_f != 50.0:
+            parts.append(f"RSI={rsi_f:.1f}")
+        if abs(macd_f) > 0:
+            parts.append(f"MACD={macd_f:.3f}")
+
+        # 既に日本語理由が入っている場合は、重複が少なければ追加。
+        if raw and raw not in {"-", "flag_score"}:
+            if "売りスコア優勢" not in raw and "買いスコア優勢" not in raw:
+                parts.append(raw)
+        elif raw == "flag_score":
+            parts.append("スコア条件で抽出")
+
+        return " / ".join(parts) if parts else (raw or "理由データ不足")
+    except Exception:
+        return _safe_str(reason, "理由生成失敗")
+
+
+def _normalize_summary_one_line(line: str) -> str:
+    """
+    どの通知ルートから来ても、横長SUMMARY候補行を3行に直す最終防衛。
+
+    入力例:
+      1. 6072 XXX 株価=1446.0 score=-7.09 buy=0.00 sell=7.09 slope=-0.0142 mtf=0.00 rsi=0.00 macd=-10.19 理由=...
+
+    出力例:
+      1. 6072 XXX Price=1446.0 Score=-7.09 Buy=0.00 Sell=7.09
+         Slope=-0.0142 MTF=0.00 RSI=0.00 MACD=-10.19
+         理由=...
+    """
+    try:
+        s = _safe_str(line).rstrip()
+        if not s or "score=" not in s.lower() or "理由=" not in s:
+            return line
+        if "\n" in s:
+            return line
+
+        m = _SUMMARY_ONE_LINE_RE.match(s)
+        if not m:
+            return line
+
+        gd = m.groupdict()
+        reason = _summary_reason_to_ja(
+            gd.get("reason", ""),
+            buy=gd.get("buy", "0"),
+            sell=gd.get("sell", "0"),
+            slope=gd.get("slope", "0"),
+            mtf=gd.get("mtf", "0"),
+            rsi=gd.get("rsi", "50"),
+            macd=gd.get("macd", "0"),
+        )
+        return (
+            f"{gd['prefix']}{gd['head']} Price={gd['price']} Score={gd['score']} Buy={gd['buy']} Sell={gd['sell']}\n"
+            f"   Slope={gd['slope']} MTF={gd['mtf']} RSI={gd['rsi']} MACD={gd['macd']}\n"
+            f"   理由={reason}"
+        )
+    except Exception:
+        logger.debug("[DISCORD FINAL FORMATTER] normalize one line failed", exc_info=True)
+        return line
+
+
+def _normalize_discord_summary_text(text: str) -> str:
+    try:
+        if not text:
+            return text
+        s = _safe_str(text)
+        # SUMMARY/AI候補以外は触らない。ただし、横長候補行単体は対象にする。
+        if "score=" not in s.lower() or "理由=" not in s:
+            return s
+        lines = s.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        out = [_normalize_summary_one_line(line) for line in lines]
+        return "\n".join(out)
+    except Exception:
+        logger.debug("[DISCORD FINAL FORMATTER] normalize text failed", exc_info=True)
+        return text
+
+
 def _split_message_chunks(text: str, max_len: int = DEFAULT_MAX_LEN) -> List[str]:
     text = _safe_str(text).replace("\r\n", "\n")
     if not text.strip():
@@ -125,17 +251,12 @@ def _split_message_chunks(text: str, max_len: int = DEFAULT_MAX_LEN) -> List[str
 # ------------------------------------------------------------
 
 def _wait_rate_limit():
-    """
-    Discordレート制限回避
-    """
+    """Discordレート制限回避"""
     global _last_send_time
-
     now = time.time()
     diff = now - _last_send_time
-
     if diff < SEND_INTERVAL:
         time.sleep(SEND_INTERVAL - diff)
-
     _last_send_time = time.time()
 
 
@@ -156,52 +277,25 @@ def _post_discord(payload, *, webhook_url: Optional[str] = None, timeout: int = 
 
     with _send_lock:
         _wait_rate_limit()
-
         try:
-            r = requests.post(
-                resolved_webhook,
-                json=payload,
-                timeout=timeout,
-            )
-
+            r = requests.post(resolved_webhook, json=payload, timeout=timeout)
             if r.status_code in (200, 204):
                 logger.info("✅ Discord送信成功 status=%s", r.status_code)
                 return True
 
             if r.status_code == 429:
                 retry_after = _safe_float(r.headers.get("Retry-After", 1), 1.0)
-
-                logger.warning(
-                    "Discord rate limit hit. sleeping %ss",
-                    retry_after,
-                )
-
+                logger.warning("Discord rate limit hit. sleeping %ss", retry_after)
                 time.sleep(retry_after)
-
-                r = requests.post(
-                    resolved_webhook,
-                    json=payload,
-                    timeout=timeout,
-                )
-
+                r = requests.post(resolved_webhook, json=payload, timeout=timeout)
                 if r.status_code in (200, 204):
                     logger.info("✅ Discord再送信成功 status=%s", r.status_code)
                     return True
-
-                logger.warning(
-                    "⚠️ Discord retry response status=%s body=%s",
-                    r.status_code,
-                    getattr(r, "text", "")[:300],
-                )
+                logger.warning("⚠️ Discord retry response status=%s body=%s", r.status_code, getattr(r, "text", "")[:300])
                 return False
 
-            logger.warning(
-                "⚠️ Discord response status=%s body=%s",
-                r.status_code,
-                getattr(r, "text", "")[:300],
-            )
+            logger.warning("⚠️ Discord response status=%s body=%s", r.status_code, getattr(r, "text", "")[:300])
             return False
-
         except Exception as e:
             logger.error("❌ Discord送信エラー: %s", e, exc_info=True)
             return False
@@ -227,7 +321,7 @@ def send_discord_message(
     payload = {}
 
     if content:
-        payload["content"] = content
+        payload["content"] = _normalize_discord_summary_text(content)
 
     if embeds:
         payload["embeds"] = embeds
@@ -250,11 +344,7 @@ def send_discord_text(
     timeout: int = DEFAULT_TIMEOUT,
     max_len: int = DEFAULT_MAX_LEN,
 ) -> bool:
-    """
-    announce_bridge / jobs / runners からそのまま
-    discord_sender として使えるテキスト送信関数。
-    長文は自動分割する。
-    """
+    """announce_bridge / jobs / runners からそのまま discord_sender として使えるテキスト送信関数。"""
     if not msg:
         return False
 
@@ -263,17 +353,14 @@ def send_discord_text(
         logger.warning("⚠️ Discord Webhook URL 未設定")
         return False
 
+    msg = _normalize_discord_summary_text(msg)
     chunks = _split_message_chunks(msg, max_len=max_len)
     if not chunks:
         return False
 
     sent = 0
     for chunk in chunks:
-        ok = send_discord_message(
-            content=chunk,
-            webhook_url=resolved_webhook,
-            timeout=timeout,
-        )
+        ok = send_discord_message(content=chunk, webhook_url=resolved_webhook, timeout=timeout)
         if not ok:
             logger.warning("⚠️ Discordチャンク送信失敗 sent=%d/%d", sent, len(chunks))
             return False
@@ -290,12 +377,7 @@ def send_discord_lines(
     max_len: int = DEFAULT_MAX_LEN,
 ) -> bool:
     text = "\n".join([_safe_str(x) for x in lines if _safe_str(x)])
-    return send_discord_text(
-        text,
-        webhook_url=webhook_url,
-        timeout=timeout,
-        max_len=max_len,
-    )
+    return send_discord_text(text, webhook_url=webhook_url, timeout=timeout, max_len=max_len)
 
 
 def build_discord_sender(
@@ -304,26 +386,11 @@ def build_discord_sender(
     timeout: int = DEFAULT_TIMEOUT,
     max_len: int = DEFAULT_MAX_LEN,
 ) -> Callable[[str], bool]:
-    """
-    runner / job に渡せる discord_sender を返す。
-
-    例:
-        sender = build_discord_sender()
-        job_push_summary_1m(
-            return_details=True,
-            announce_bridge=True,
-            discord_sender=sender,
-        )
-    """
+    """runner / job に渡せる discord_sender を返す。"""
     resolved_webhook = _resolve_webhook_url(webhook_url)
 
     def _sender(text: str) -> bool:
-        return send_discord_text(
-            text,
-            webhook_url=resolved_webhook,
-            timeout=timeout,
-            max_len=max_len,
-        )
+        return send_discord_text(text, webhook_url=resolved_webhook, timeout=timeout, max_len=max_len)
 
     return _sender
 
@@ -333,7 +400,6 @@ def build_discord_sender(
 # ------------------------------------------------------------
 
 def send_discord_notify_embed_entry(symbol, symbolname, side, price, qty, reasons):
-
     embed = {
         "title": f"🚀 ENTRY: {symbolname} ({symbol})",
         "description": "\n".join(reasons) if isinstance(reasons, (list, tuple)) else _safe_str(reasons),
@@ -343,11 +409,8 @@ def send_discord_notify_embed_entry(symbol, symbolname, side, price, qty, reason
             {"name": "価格", "value": _safe_str(price), "inline": True},
             {"name": "数量", "value": _safe_str(qty), "inline": True},
         ],
-        "footer": {
-            "text": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
+        "footer": {"text": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
     }
-
     return send_discord_message(embeds=[embed])
 
 
@@ -355,16 +418,7 @@ def send_discord_notify_embed_entry(symbol, symbolname, side, price, qty, reason
 # EXIT 通知（軽量版）
 # ------------------------------------------------------------
 
-def send_discord_notify_embed_exit(
-        symbol,
-        symbolname,
-        side,
-        exit_price,
-        qty,
-        pnl,
-        reason
-):
-
+def send_discord_notify_embed_exit(symbol, symbolname, side, exit_price, qty, pnl, reason):
     try:
         pnl_text = f"{float(pnl):.2f}"
     except Exception:
@@ -380,11 +434,8 @@ def send_discord_notify_embed_exit(
             {"name": "損益", "value": pnl_text, "inline": True},
             {"name": "理由", "value": _safe_str(reason), "inline": False},
         ],
-        "footer": {
-            "text": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
+        "footer": {"text": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
     }
-
     return send_discord_message(embeds=[embed])
 
 
@@ -393,8 +444,5 @@ def send_discord_notify_embed_exit(
 # ------------------------------------------------------------
 
 def send_discord_notify(msg: str):
-    """
-    ランキングENTRY / 出来高急増などが呼び出す互換テキスト通知関数。
-    send_discord_text のラッパー。
-    """
+    """ランキングENTRY / 出来高急増などが呼び出す互換テキスト通知関数。"""
     return send_discord_text(msg)
