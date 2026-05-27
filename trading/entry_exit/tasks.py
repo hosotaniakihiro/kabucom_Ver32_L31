@@ -1,20 +1,18 @@
 # ============================================================
 # File   : trading/entry_exit/tasks.py
-# Version: Ver1.9-RANKING-ENTRY-TIMEOUT-60SEC
+# Version: Ver2.0-RANKING-ENTRY-TIMEOUT-90SEC
 # ------------------------------------------------------------
 # 【目的】
 #   core.entry_exit_tasks shim から解決される実体モジュール。
 #
-# Ver1.9 Fix:
-#   - 実測で ranking_entry が53秒で完了したのに、scheduler timeout=45秒で
-#     先にtimeout扱いになっていた問題を修正
-#   - RANKING_ENTRY_BUILD_TIMEOUT_SEC 既定を45秒→60秒へ延長
-#   - config側で REQUIRE_PREVIOUS_SNAPSHOT=False にしたため、
-#     NO_PREVIOUS_RANKING_SNAPSHOT 大量DROPも緩和
+# Ver2.0 Fix:
+#   - 14:16ログで ranking_entry が4件pending作成まで到達したが、
+#     実処理68秒に対してscheduler timeout=60秒が先に発生し、
+#     entry_controller dispatch されなかった問題を修正
+#   - RANKING_ENTRY_BUILD_TIMEOUT_SEC 既定を60秒→90秒へ延長
 #
-# Ver1.8:
-#   - entry_from_ranking.py 側で軽量prefilterを追加したため、
-#     ranking build timeoutの既定を20秒→45秒へ延長
+# Ver1.9:
+#   - RANKING_ENTRY_BUILD_TIMEOUT_SEC 既定を45秒→60秒へ延長
 # ============================================================
 
 from __future__ import annotations
@@ -42,7 +40,7 @@ _RANKING_ENTRY_LOCK = threading.RLock()
 
 TONOSAMA_ENTRY_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_TIMEOUT_SEC", "45"))
 TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC", "20"))
-RANKING_ENTRY_BUILD_TIMEOUT_SEC = float(os.getenv("RANKING_ENTRY_BUILD_TIMEOUT_SEC", "60"))
+RANKING_ENTRY_BUILD_TIMEOUT_SEC = float(os.getenv("RANKING_ENTRY_BUILD_TIMEOUT_SEC", "90"))
 RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC = float(os.getenv("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", "20"))
 RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC = float(os.getenv("RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC", "90"))
 RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC = float(os.getenv("RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC", "300"))
@@ -211,7 +209,7 @@ def _dispatch_entry_controller(*, pipeline_source: str, interval: int | None, ti
     logger.info("[%s] dispatch entry_controller pipeline_source=%s interval=%s timeout_sec=%.3f", reason, pipeline_source, interval, timeout_sec)
     completed, _ret = _run_callable_with_timeout(controller_fn, timeout_sec=timeout_sec, name=f"{reason} CONTROLLER", kwargs=kwargs)
     if not completed:
-        logger.warning("[%s] controller timeout pipeline_source=%s interval=%s timeout_sec=%.3f", reason, pipeline_source, interval, timeout_sec)
+        logger.warning("[%s] controller timeout pipeline_source=%s interval=%s timeout_sec=%.3f", reason, pipeline_source, interval)
         return False
     logger.info("[%s] controller done pipeline_source=%s interval=%s", reason, pipeline_source, interval)
     return True
