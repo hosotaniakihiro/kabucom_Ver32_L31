@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/exit/symbol_trade_guard.py
-# Version: V1.0-SYMBOL-COOLDOWN-AND-ENTRY-TIME-GUARD
+# Version: V1.1-SYMBOL-TRADE-GUARD-SQLITE-NAS-SAFE
 # ------------------------------------------------------------
 # 【概要】
 #   スキャルピング用の銘柄別エントリー抑制。
@@ -17,9 +17,17 @@
 #      - 12:30〜12:32 新規停止
 #      - 15:23以降 新規停止
 #
+# V1.1:
+#   - NAS/SMB上SQLiteで PRAGMA journal_mode=WAL が disk I/O error になる問題を回避
+#   - WAL失敗時は DELETE journal にフォールバック
+#   - 接続自体が失敗する場合はローカル退避DBへフォールバック
+#   - trade guard DB障害でエントリー判定全体を壊さない
+#
 # 【保存先】
 #   既定:
 #     \\192.168.0.22\AutoStockBuyAndSell\raw_data\trade_guard\trade_guardYYYYMMDD.db
+#   ローカル退避:
+#     F:\script\python\kabu\runtime_cache\trade_guard\trade_guardYYYYMMDD.db
 # ============================================================
 
 from __future__ import annotations
@@ -52,7 +60,7 @@ MAX_DAILY_LOSSES_PER_SYMBOL = int(float(os.getenv("MAX_DAILY_LOSSES_PER_SYMBOL",
 ENTRY_STOP_AFTER = os.getenv("ENTRY_STOP_AFTER", "15:23")
 
 
-def _today() -> str:
+ def _today() -> str:
     return dt.datetime.now().strftime("%Y%m%d")
 
 
@@ -60,6 +68,14 @@ def _default_db_path() -> str:
     base = os.getenv(
         "TRADE_GUARD_DB_DIR",
         r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\trade_guard",
+    )
+    return str(Path(base) / f"trade_guard{_today()}.db")
+
+
+def _fallback_db_path() -> str:
+    base = os.getenv(
+        "TRADE_GUARD_FALLBACK_DB_DIR",
+        r"F:\script\python\kabu\runtime_cache\trade_guard",
     )
     return str(Path(base) / f"trade_guard{_today()}.db")
 
@@ -99,17 +115,78 @@ def _from_iso(s: Any) -> Optional[dt.datetime]:
         return None
 
 
-def _connect() -> sqlite3.Connection:
-    path = _db_path()
+def _is_nas_like_path(path: str) -> bool:
+    try:
+        p = str(path or "")
+        return p.startswith("\\\\") or p.startswith("//")
+    except Exception:
+        return False
+
+
+def _open_sqlite(path: str) -> sqlite3.Connection:
     try:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
     except Exception:
         logger.debug("[TRADE GUARD] mkdir failed path=%s", path, exc_info=True)
     conn = sqlite3.connect(path, timeout=3.0)
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=3000")
-    _ensure_schema(conn)
     return conn
+
+
+def _apply_journal_mode(conn: sqlite3.Connection, path: str) -> None:
+    """NASではWALがdisk I/O errorになりやすいため、安全にフォールバックする。"""
+    desired = str(os.getenv("TRADE_GUARD_SQLITE_JOURNAL_MODE", "")).strip().upper()
+    if not desired:
+        desired = "DELETE" if _is_nas_like_path(path) else "WAL"
+
+    try:
+        conn.execute(f"PRAGMA journal_mode={desired}")
+        return
+    except Exception as e:
+        logger.warning(
+            "[TRADE GUARD] journal_mode failed path=%s mode=%s err=%s -> fallback DELETE",
+            path,
+            desired,
+            e,
+            exc_info=True,
+        )
+
+    try:
+        conn.execute("PRAGMA journal_mode=DELETE")
+    except Exception as e:
+        logger.warning("[TRADE GUARD] journal_mode DELETE failed path=%s err=%s", path, e, exc_info=True)
+
+
+def _connect_path(path: str) -> sqlite3.Connection:
+    conn = _open_sqlite(path)
+    try:
+        _apply_journal_mode(conn, path)
+        _ensure_schema(conn)
+        return conn
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
+
+
+def _connect() -> sqlite3.Connection:
+    path = _db_path()
+    try:
+        return _connect_path(path)
+    except Exception as e:
+        if not _env_bool("TRADE_GUARD_USE_LOCAL_FALLBACK_ON_IO_ERROR", True):
+            raise
+        fb = _fallback_db_path()
+        logger.warning(
+            "[TRADE GUARD] primary db connect failed path=%s err=%s -> fallback local db=%s",
+            path,
+            e,
+            fb,
+            exc_info=True,
+        )
+        return _connect_path(fb)
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
