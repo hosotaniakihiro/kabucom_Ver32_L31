@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/tonosama_intraday_liquidity_patch.py
-# Version: V1.0-TONOSAMA-INTRADAY-LIQUIDITY-FOLLOWER-GUARD
+# Version: V1.1-TONOSAMA-INTRADAY-LIQUIDITY-DEFERRED-INSTALL
 # ------------------------------------------------------------
 # 目的:
 #   殿様イナゴの候補から、日中出来高・売買代金が少ない銘柄を除外する。
@@ -13,21 +13,29 @@
 #       3) 出来高が発生した分足数
 #       4) 直近 3m/5m または 1m の出来高
 #   - trading.entry.tonosama.volume_surge.build_scalping_feature_df() をwrapする。
-#   - main.py の起動patchに追加しなくても、tonosama.config から install() される想定。
+#
+# Ver1.1:
+#   - tonosama.config 初期化中に volume_surge を即importして循環する問題を修正
+#   - install() は循環検出時に遅延installとして成功扱いにする
+#   - 実際のpatchは runner.build_scalping_feature_df 呼び出し直前/初回実行時に行う
 # ============================================================
 
 from __future__ import annotations
 
 import datetime as dt
+import importlib
 import logging
 import os
+import sys
 from typing import Any
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 _PATCHED = False
+_DEFERRED = False
 _ORIGINAL = None
+_RUNNER_ORIGINAL = None
 
 
 def _env_float(name: str, default: float) -> float:
@@ -139,7 +147,7 @@ def _apply_intraday_liquidity_filter(df: pd.DataFrame) -> pd.DataFrame:
 
     x = df.copy()
     stats = _load_1m_today_stats()
-    if not stats.empty:
+    if not stats.empty and "symbol" in x.columns:
         x["symbol"] = x["symbol"].astype(str)
         stats["symbol"] = stats["symbol"].astype(str)
         x = x.merge(stats, on="symbol", how="left")
@@ -153,7 +161,7 @@ def _apply_intraday_liquidity_filter(df: pd.DataFrame) -> pd.DataFrame:
             x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0.0)
 
     min_day_volume = _env_float("TONOSAMA_MIN_DAY_VOLUME", 100000.0)
-    min_day_turnover = _env_float("TONOSAMA_MIN_DAY_TURNOVER", 100000000.0)  # 1億円
+    min_day_turnover = _env_float("TONOSAMA_MIN_DAY_TURNOVER", 100000000.0)
     min_active_minutes = _env_float("TONOSAMA_MIN_ACTIVE_VOLUME_MINUTES", 8.0)
     min_recent_3m_volume = _env_float("TONOSAMA_MIN_RECENT_3M_VOLUME", 50000.0)
     min_recent_5m_volume = _env_float("TONOSAMA_MIN_RECENT_5M_VOLUME", 80000.0)
@@ -202,13 +210,9 @@ def _apply_intraday_liquidity_filter(df: pd.DataFrame) -> pd.DataFrame:
     return kept.reset_index(drop=True)
 
 
-def install() -> bool:
+def _wrap_volume_surge_module(volume_surge: Any) -> bool:
     global _PATCHED, _ORIGINAL
-    if _PATCHED:
-        return True
     try:
-        import trading.entry.tonosama.volume_surge as volume_surge
-
         fn = getattr(volume_surge, "build_scalping_feature_df", None)
         if not callable(fn):
             logger.warning("[TONOSAMA INTRADAY LIQ] build_scalping_feature_df unavailable")
@@ -216,7 +220,6 @@ def install() -> bool:
         if getattr(fn, "_tonosama_intraday_liquidity_guard", False):
             _PATCHED = True
             return True
-
         _ORIGINAL = fn
 
         def _wrapped_build_scalping_feature_df(*args: Any, **kwargs: Any) -> pd.DataFrame:
@@ -227,11 +230,85 @@ def install() -> bool:
         _wrapped_build_scalping_feature_df._original = _ORIGINAL  # type: ignore[attr-defined]
         volume_surge.build_scalping_feature_df = _wrapped_build_scalping_feature_df
         _PATCHED = True
-        logger.warning("[TONOSAMA INTRADAY LIQ] installed V1.0")
+        logger.warning("[TONOSAMA INTRADAY LIQ] installed V1.1 target=volume_surge")
         return True
     except Exception:
-        logger.exception("[TONOSAMA INTRADAY LIQ] install failed")
+        logger.exception("[TONOSAMA INTRADAY LIQ] wrap volume_surge failed")
         return False
+
+
+def _try_patch_volume_surge() -> bool:
+    try:
+        mod_name = "trading.entry.tonosama.volume_surge"
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            # config.py初期化中の循環を避けるため、configが完全に抜けてからだけimportする。
+            cfg = sys.modules.get("trading.entry.tonosama.config")
+            if cfg is not None and not hasattr(cfg, "VOLUME_AVG_LOOKBACK_BARS"):
+                return False
+            mod = importlib.import_module(mod_name)
+        return _wrap_volume_surge_module(mod)
+    except ImportError as e:
+        msg = str(e)
+        if "partially initialized module" in msg or "circular import" in msg:
+            logger.warning("[TONOSAMA INTRADAY LIQ] deferred due to circular import err=%s", e)
+            return False
+        logger.exception("[TONOSAMA INTRADAY LIQ] import failed")
+        return False
+    except Exception:
+        logger.exception("[TONOSAMA INTRADAY LIQ] patch attempt failed")
+        return False
+
+
+def _install_runner_lazy_hook() -> bool:
+    """volume_surgeがまだimportできない場合、runner側関数を一度だけhookして遅延patchする。"""
+    global _DEFERRED, _RUNNER_ORIGINAL
+    if _DEFERRED:
+        return True
+    try:
+        mod_name = "trading.entry.tonosama.runner"
+        runner = sys.modules.get(mod_name)
+        if runner is None:
+            # runner未ロードなら無理にimportしない。次回install呼び出しで再試行する。
+            _DEFERRED = True
+            logger.warning("[TONOSAMA INTRADAY LIQ] deferred pending runner import")
+            return True
+        fn = getattr(runner, "build_scalping_feature_df", None)
+        if not callable(fn):
+            _DEFERRED = True
+            logger.warning("[TONOSAMA INTRADAY LIQ] deferred runner build_scalping_feature_df unavailable")
+            return True
+        if getattr(fn, "_tonosama_intraday_liq_lazy_hook", False):
+            _DEFERRED = True
+            return True
+        _RUNNER_ORIGINAL = fn
+
+        def _runner_lazy_wrapper(*args: Any, **kwargs: Any) -> pd.DataFrame:
+            if not _PATCHED:
+                _try_patch_volume_surge()
+            base = _RUNNER_ORIGINAL(*args, **kwargs)
+            # volume_surge側patchがまだ効いていない場合の保険。
+            if not _PATCHED:
+                return _apply_intraday_liquidity_filter(base)
+            return base
+
+        _runner_lazy_wrapper._tonosama_intraday_liq_lazy_hook = True  # type: ignore[attr-defined]
+        runner.build_scalping_feature_df = _runner_lazy_wrapper
+        _DEFERRED = True
+        logger.warning("[TONOSAMA INTRADAY LIQ] deferred lazy hook installed target=runner")
+        return True
+    except Exception:
+        logger.exception("[TONOSAMA INTRADAY LIQ] lazy hook install failed")
+        _DEFERRED = True
+        return True
+
+
+def install() -> bool:
+    if _PATCHED:
+        return True
+    if _try_patch_volume_surge():
+        return True
+    return _install_runner_lazy_hook()
 
 
 __all__ = ["install"]
