@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/tonosama/volume_surge.py
-# Version: Ver2.4-TONOSAMA-1M-STREAK-FEATURES
+# Version: Ver2.5-TONOSAMA-3M5M-STREAK-FEATURES
 # ------------------------------------------------------------
 # 目的:
 #   殿様エントリー用の出来高急増・価格変化特徴量を作る。
@@ -8,11 +8,11 @@
 # Ver2.3:
 #   - 3m/5mの出来高履歴不足時も controlled fail-open で候補を作る。
 #
-# Ver2.4:
-#   - 1分足の連続上昇/連続下落本数を特徴量として追加。
-#   - BUY: 直前まで1分足が3本以上連続上昇した後の高値追いを避けるため。
-#   - SELL: 直前まで1分足が3本以上連続下落した後の安値追いを避けるため。
-#   - runner.py / pending_writer.py 側で _prev_1m_up_streak / _prev_1m_down_streak を利用する。
+# Ver2.5:
+#   - 1分足streakではなく、3分足/5分足それぞれの連続上昇・連続下落本数を作る。
+#   - BUY: 3mまたは5mが3本以上連続上昇した後は高値追いとして拒否するため。
+#   - SELL: 3mまたは5mが3本以上連続下落した後は安値追いとして拒否するため。
+#   - pending_writer.py 側で prev_3m_up_streak / prev_5m_up_streak などを利用する。
 # ============================================================
 
 from __future__ import annotations
@@ -156,52 +156,6 @@ def _consecutive_true_counts(values: pd.Series) -> pd.Series:
     return pd.Series(out, index=values.index, dtype="int64")
 
 
-def _add_1m_streak_features(out: pd.DataFrame, df1: pd.DataFrame) -> pd.DataFrame:
-    if out is None or out.empty:
-        return pd.DataFrame()
-    if df1 is None or df1.empty or "symbol" not in df1.columns or "datetime" not in df1.columns or "close" not in df1.columns:
-        x = out.copy()
-        x["_prev_1m_up_streak"] = 0
-        x["_prev_1m_down_streak"] = 0
-        x["_prev_1m_last_delta_pct"] = 0.0
-        return x
-    try:
-        h = df1.copy()
-        h["datetime"] = pd.to_datetime(h["datetime"], errors="coerce")
-        h["close"] = pd.to_numeric(h["close"], errors="coerce")
-        h = h.dropna(subset=["symbol", "datetime", "close"]).sort_values(["symbol", "datetime"])
-        if h.empty:
-            x = out.copy()
-            x["_prev_1m_up_streak"] = 0
-            x["_prev_1m_down_streak"] = 0
-            x["_prev_1m_last_delta_pct"] = 0.0
-            return x
-        h["_prev_close_for_streak"] = h.groupby("symbol")["close"].shift(1)
-        h["_prev_1m_last_delta_pct"] = ((h["close"] - h["_prev_close_for_streak"]) / h["_prev_close_for_streak"].replace(0, pd.NA) * 100.0).replace([float("inf"), -float("inf")], pd.NA).fillna(0.0)
-        h["_is_1m_up"] = h["close"] > h["_prev_close_for_streak"]
-        h["_is_1m_down"] = h["close"] < h["_prev_close_for_streak"]
-        h["_prev_1m_up_streak"] = h.groupby("symbol", group_keys=False)["_is_1m_up"].apply(_consecutive_true_counts)
-        h["_prev_1m_down_streak"] = h.groupby("symbol", group_keys=False)["_is_1m_down"].apply(_consecutive_true_counts)
-        latest = h.sort_values(["symbol", "datetime"]).groupby("symbol", group_keys=False).tail(1)[["symbol", "_prev_1m_up_streak", "_prev_1m_down_streak", "_prev_1m_last_delta_pct"]]
-        x = out.merge(latest, on="symbol", how="left")
-        for c in ["_prev_1m_up_streak", "_prev_1m_down_streak"]:
-            x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0).astype(int)
-        x["_prev_1m_last_delta_pct"] = pd.to_numeric(x["_prev_1m_last_delta_pct"], errors="coerce").fillna(0.0)
-        logger.warning(
-            "[TONOSAMA SURGE] 1m streak features attached rows=%s up_ge3=%s down_ge3=%s head=%s",
-            len(x), int((x["_prev_1m_up_streak"] >= 3).sum()), int((x["_prev_1m_down_streak"] >= 3).sum()),
-            x[[c for c in ["symbol", "symbolname", "close", "_prev_1m_up_streak", "_prev_1m_down_streak", "_prev_1m_last_delta_pct"] if c in x.columns]].head(12).to_dict("records"),
-        )
-        return x
-    except Exception:
-        logger.exception("[TONOSAMA SURGE] add 1m streak features failed")
-        x = out.copy()
-        x["_prev_1m_up_streak"] = 0
-        x["_prev_1m_down_streak"] = 0
-        x["_prev_1m_last_delta_pct"] = 0.0
-        return x
-
-
 def add_volume_surge_features(df: pd.DataFrame, *, interval: int) -> pd.DataFrame:
     x = normalize_summary_base(df, interval=interval)
     x = _filter_recent_rows(x, interval=interval, label="feature_source")
@@ -217,20 +171,36 @@ def add_volume_surge_features(df: pd.DataFrame, *, interval: int) -> pd.DataFram
     x[ratio_col] = pd.to_numeric(x[ratio_col], errors="coerce").replace([float("inf"), -float("inf")], pd.NA)
     prev_close_col = f"prev_close_{interval}m"
     price_chg_col = f"price_change_pct_{interval}m"
+    up_streak_col = f"prev_{interval}m_up_streak"
+    down_streak_col = f"prev_{interval}m_down_streak"
+    last_delta_col = f"prev_{interval}m_last_delta_pct"
     x[prev_close_col] = g["close"].shift(1)
     x[price_chg_col] = ((x["close"] - x[prev_close_col]) / x[prev_close_col].replace(0, pd.NA) * 100.0)
     x[price_chg_col] = pd.to_numeric(x[price_chg_col], errors="coerce").replace([float("inf"), -float("inf")], pd.NA)
+    x[last_delta_col] = x[price_chg_col].fillna(0.0)
+    x[f"_is_{interval}m_up"] = pd.to_numeric(x["close"], errors="coerce") > pd.to_numeric(x[prev_close_col], errors="coerce")
+    x[f"_is_{interval}m_down"] = pd.to_numeric(x["close"], errors="coerce") < pd.to_numeric(x[prev_close_col], errors="coerce")
+    x[up_streak_col] = g[f"_is_{interval}m_up"].apply(_consecutive_true_counts)
+    x[down_streak_col] = g[f"_is_{interval}m_down"].apply(_consecutive_true_counts)
     if x[price_chg_col].isna().all():
         fallback_chg = _intrabar_price_change_pct(x, interval)
         if fallback_chg.notna().any():
             x[price_chg_col] = fallback_chg
             logger.warning("[TONOSAMA SURGE] price_change fallback open_to_close interval=%sm rows=%s nonnull=%s", interval, len(x), int(fallback_chg.notna().sum()))
     latest = x.dropna(subset=["datetime"]).sort_values(["symbol", "datetime"]).groupby("symbol", group_keys=False).tail(1)
-    keep_cols = ["symbol", "datetime", "close", "volume", avg_col, ratio_col, prev_close_col, price_chg_col]
+    keep_cols = ["symbol", "datetime", "close", "volume", avg_col, ratio_col, prev_close_col, price_chg_col, up_streak_col, down_streak_col, last_delta_col]
     for c in keep_cols:
         if c not in latest.columns:
             latest[c] = pd.NA
     latest = latest[keep_cols].copy().rename(columns={"datetime": f"datetime_{interval}m", "close": f"close_{interval}m", "volume": f"volume_{interval}m"})
+    for c in [up_streak_col, down_streak_col]:
+        latest[c] = pd.to_numeric(latest[c], errors="coerce").fillna(0).astype(int)
+    latest[last_delta_col] = pd.to_numeric(latest[last_delta_col], errors="coerce").fillna(0.0)
+    logger.warning(
+        "[TONOSAMA SURGE] %sm streak features latest rows=%s up_ge3=%s down_ge3=%s head=%s",
+        interval, len(latest), int((latest[up_streak_col] >= 3).sum()), int((latest[down_streak_col] >= 3).sum()),
+        latest[[c for c in ["symbol", f"close_{interval}m", up_streak_col, down_streak_col, last_delta_col, ratio_col, price_chg_col] if c in latest.columns]].head(12).to_dict("records"),
+    )
     return latest.reset_index(drop=True)
 
 
@@ -331,12 +301,11 @@ def build_scalping_feature_df() -> pd.DataFrame:
     out = df1.dropna(subset=["datetime"]).sort_values(["symbol", "datetime"]).groupby("symbol", group_keys=False).tail(1).copy()
     if out.empty:
         return pd.DataFrame()
-    out = _add_1m_streak_features(out, df1)
     if not df3.empty:
         out = out.merge(df3, on="symbol", how="left")
     if not df5.empty:
         out = out.merge(df5, on="symbol", how="left")
-    for c in ["volume_surge_ratio_3m", "volume_surge_ratio_5m", "price_change_pct_3m", "price_change_pct_5m", "prev5_volume_avg_3m", "prev5_volume_avg_5m", "volume_3m", "volume_5m"]:
+    for c in ["volume_surge_ratio_3m", "volume_surge_ratio_5m", "price_change_pct_3m", "price_change_pct_5m", "prev5_volume_avg_3m", "prev5_volume_avg_5m", "volume_3m", "volume_5m", "prev_3m_up_streak", "prev_3m_down_streak", "prev_5m_up_streak", "prev_5m_down_streak", "prev_3m_last_delta_pct", "prev_5m_last_delta_pct"]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
     out = _apply_history_unavailable_policy(out)
@@ -348,6 +317,14 @@ def build_scalping_feature_df() -> pd.DataFrame:
     out["_max_price_change_pct"] = out[price_cols].max(axis=1, skipna=True) if price_cols else 0.0
     out["_max_volume_surge_ratio"] = pd.to_numeric(out["_max_volume_surge_ratio"], errors="coerce").fillna(0.0)
     out["_max_price_change_pct"] = pd.to_numeric(out["_max_price_change_pct"], errors="coerce").fillna(0.0)
+    for c in ["prev_3m_up_streak", "prev_3m_down_streak", "prev_5m_up_streak", "prev_5m_down_streak"]:
+        if c not in out.columns:
+            out[c] = 0
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).astype(int)
+    for c in ["prev_3m_last_delta_pct", "prev_5m_last_delta_pct"]:
+        if c not in out.columns:
+            out[c] = 0.0
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
     out["_surge_tf"] = ""
     if "volume_surge_ratio_3m" in out.columns and "volume_surge_ratio_5m" in out.columns:
         out["_surge_tf"] = out.apply(lambda r: "3m" if safe_float(r.get("volume_surge_ratio_3m"), 0) >= safe_float(r.get("volume_surge_ratio_5m"), 0) else "5m", axis=1)
@@ -358,7 +335,11 @@ def build_scalping_feature_df() -> pd.DataFrame:
     try:
         history_missing = out.get("_volume_surge_history_missing", pd.Series(False, index=out.index)).fillna(False).astype(bool)
         failopen_col = out.get("_volume_surge_failopen", pd.Series(False, index=out.index)).fillna(False).astype(bool)
-        logger.warning("[TONOSAMA SURGE] feature summary rows=%s vol_cols=%s price_cols=%s volume_surge_nonzero=%s price_change_nonzero=%s up_streak_ge3=%s down_streak_ge3=%s history_missing_rows=%s failopen_rows=%s price_fallback_rows=%s failopen_reason=%s raw1_latest=%s head=%s", len(out), vol_cols, price_cols, int((out["_max_volume_surge_ratio"].fillna(0) != 0).sum()), int((out["_max_price_change_pct"].fillna(0) != 0).sum()), int((out.get("_prev_1m_up_streak", pd.Series(0, index=out.index)).fillna(0) >= 3).sum()), int((out.get("_prev_1m_down_streak", pd.Series(0, index=out.index)).fillna(0) >= 3).sum()), int(history_missing.sum()), int(failopen_col.sum()), int(out.get("_price_change_fallback_1m", pd.Series(False, index=out.index)).fillna(False).astype(bool).sum()), _failopen_reason(), raw1_info.get("latest_dt"), out[[c for c in ["symbol", "symbolname", "close", "_max_volume_surge_ratio", "_max_price_change_pct", "_prev_1m_up_streak", "_prev_1m_down_streak", "_prev_1m_last_delta_pct", "_surge_tf", "_volume_surge_history_missing", "_volume_surge_failopen", "_price_change_fallback_1m"] if c in out.columns]].head(12).to_dict("records"))
+        up3 = out.get("prev_3m_up_streak", pd.Series(0, index=out.index)).fillna(0)
+        up5 = out.get("prev_5m_up_streak", pd.Series(0, index=out.index)).fillna(0)
+        dn3 = out.get("prev_3m_down_streak", pd.Series(0, index=out.index)).fillna(0)
+        dn5 = out.get("prev_5m_down_streak", pd.Series(0, index=out.index)).fillna(0)
+        logger.warning("[TONOSAMA SURGE] feature summary rows=%s vol_cols=%s price_cols=%s volume_surge_nonzero=%s price_change_nonzero=%s up_3m_or_5m_ge3=%s down_3m_or_5m_ge3=%s history_missing_rows=%s failopen_rows=%s price_fallback_rows=%s failopen_reason=%s raw1_latest=%s head=%s", len(out), vol_cols, price_cols, int((out["_max_volume_surge_ratio"].fillna(0) != 0).sum()), int((out["_max_price_change_pct"].fillna(0) != 0).sum()), int(((up3 >= 3) | (up5 >= 3)).sum()), int(((dn3 >= 3) | (dn5 >= 3)).sum()), int(history_missing.sum()), int(failopen_col.sum()), int(out.get("_price_change_fallback_1m", pd.Series(False, index=out.index)).fillna(False).astype(bool).sum()), _failopen_reason(), raw1_info.get("latest_dt"), out[[c for c in ["symbol", "symbolname", "close", "_max_volume_surge_ratio", "_max_price_change_pct", "prev_3m_up_streak", "prev_5m_up_streak", "prev_3m_down_streak", "prev_5m_down_streak", "prev_3m_last_delta_pct", "prev_5m_last_delta_pct", "_surge_tf", "_volume_surge_history_missing", "_volume_surge_failopen", "_price_change_fallback_1m"] if c in out.columns]].head(12).to_dict("records"))
     except Exception:
         logger.debug("[TONOSAMA SURGE] feature summary log failed", exc_info=True)
     return out.reset_index(drop=True)
