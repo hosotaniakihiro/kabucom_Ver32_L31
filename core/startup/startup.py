@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/startup.py
-# Version: FINAL-PRODUCTION-REV23.6-ENTRY-PENDING-ROOT-PREFILTER
+# Version: FINAL-PRODUCTION-REV23.7-ENTRY-VOLUME-DIRECTION-GUARD
 # ------------------------------------------------------------
 # 【概要】
 #   system_startup の公開入口
@@ -23,6 +23,10 @@
 # REV23.6:
 #   - entry_pipeline_pending_root_prefilter_patch を起動時に明示適用
 #   - TONOSAMA実行時にRANKING/SUMMARY pendingを全銘柄scanしない
+#
+# REV23.7:
+#   - entry_volume_direction_guard_patch を起動時に明示適用
+#   - SUMMARY/RANKING/TONOSAMA共通で「出来高急増×価格方向」を判定
 # ============================================================
 
 from __future__ import annotations
@@ -77,9 +81,16 @@ def _install_entrypoint_runtime_patches() -> None:
     except Exception:
         logger.exception("[startup.entrypoint] entry pending root prefilter install failed")
 
+    try:
+        from core.startup.entry_volume_direction_guard_patch import install as install_entry_volume_direction_guard
+
+        install_entry_volume_direction_guard()
+    except Exception:
+        logger.exception("[startup.entrypoint] entry volume direction guard install failed")
+
 
 def system_startup():
-    logger.info("🚀 system_startup entry REV23.6-ENTRY-PENDING-ROOT-PREFILTER")
+    logger.info("🚀 system_startup entry REV23.7-ENTRY-VOLUME-DIRECTION-GUARD")
     _install_entrypoint_runtime_patches()
     return run_system_startup()
 
