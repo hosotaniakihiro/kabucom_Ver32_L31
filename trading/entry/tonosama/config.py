@@ -1,25 +1,20 @@
 # ============================================================
 # File   : trading/entry/tonosama/config.py
-# Version: Ver2.6-TONOSAMA-BALANCED-CANDIDATE-RECOVERY
+# Version: Ver2.7-TONOSAMA-INTRADAY-LIQUIDITY-GUARD-INSTALL
 # ------------------------------------------------------------
 # 方針:
 #   - volume_surge.py / history guard で履歴不足fail-openを許可した後、
 #     runner.py 側の本体条件が強すぎて candidates=0 に戻る問題を緩和。
-#   - 2026-05-27ログでは43件作成後、price_change_low_abs等で最終0件。
 #   - 6996のような微小変化だけの候補は避けつつ、4592/6072のように
 #     実値動きがある候補を残す水準へ調整。
-#
-# Balanced settings:
-#   MIN_PRICE               >= 300円
-#   MIN_FINAL_SCORE         >= 2.5
-#   MIN_VOLUME_SURGE_RATIO  >= 3.0
-#   MIN_PRICE_CHANGE_PCT    >= 0.20%
-#   MIN_SLOPE               >= 0.0010
-#   MIN_5SEC_PRICE_CHANGE   >= 0.01% when 5秒足あり
-#   MIN_LATEST_VOLUME       >= 50,000株
-#   MAX_BUY_PRICE_CHANGE    <= 1.20%
-#   MAX_SELL_PRICE_DROP     <= 1.20%
-#   REQUIRE_5SEC_BAR        default False
+#   - Ver2.7:
+#     日中出来高・日中売買代金が少ない銘柄を殿様イナゴから除外する。
+#     「後からイナゴが付いてくる銘柄」に寄せるため、
+#       当日累計出来高 >= 100,000株
+#       当日累計売買代金 >= 1億円
+#       出来高発生分足 >= 8本
+#       直近3m出来高 >= 50,000株 または 5m出来高 >= 80,000株
+#     を既定にする。
 # ============================================================
 
 from __future__ import annotations
@@ -39,6 +34,28 @@ os.environ.setdefault("TONOSAMA_MIN_SLOPE", "0.0010")
 os.environ.setdefault("TONOSAMA_MIN_5SEC_PRICE_CHANGE_PCT", "0.01")
 os.environ.setdefault("TONOSAMA_MAX_BUY_PRICE_CHANGE_PCT", "1.20")
 os.environ.setdefault("TONOSAMA_MAX_SELL_PRICE_DROP_PCT", "1.20")
+
+# 日中流動性ガード。後からイナゴが付いてきやすい銘柄へ寄せる。
+os.environ.setdefault("TONOSAMA_INTRADAY_LIQUIDITY_GUARD", "1")
+os.environ.setdefault("TONOSAMA_MIN_DAY_VOLUME", "100000")
+os.environ.setdefault("TONOSAMA_MIN_DAY_TURNOVER", "100000000")
+os.environ.setdefault("TONOSAMA_MIN_ACTIVE_VOLUME_MINUTES", "8")
+os.environ.setdefault("TONOSAMA_MIN_RECENT_3M_VOLUME", "50000")
+os.environ.setdefault("TONOSAMA_MIN_RECENT_5M_VOLUME", "80000")
+
+
+def _install_intraday_liquidity_guard() -> None:
+    try:
+        if str(os.getenv("TONOSAMA_INTRADAY_LIQUIDITY_GUARD", "1")).strip().lower() in {"0", "false", "no", "off"}:
+            return
+        from core.startup.tonosama_intraday_liquidity_patch import install
+        install()
+    except Exception:
+        # config import時に落ちると殿様全体が止まるため、ここでは握りつぶす。
+        pass
+
+
+_install_intraday_liquidity_guard()
 
 
 def _env_float(name: str, default: float) -> float:
