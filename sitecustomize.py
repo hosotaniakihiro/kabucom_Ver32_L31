@@ -1,6 +1,6 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver12-ENTRY-CONTROLLER-LOCK-WAIT-AUTO-INSTALL
+# Version: Ver13-ENTRY-CONTROLLER-SOURCE-PREFILTER-AUTO-INSTALL
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # 失敗しても本体起動は止めない。
@@ -120,6 +120,7 @@ def _install_tonosama_surge_defaults() -> None:
         os.environ.setdefault("TONOSAMA_ALLOW_HISTORY_MISSING_STRONG_MOVE", "1")
         os.environ.setdefault("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_ENABLED", "1")
         os.environ.setdefault("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_SEC", "35")
+        os.environ.setdefault("ENTRY_CONTROLLER_SOURCE_PREFILTER_ENABLED", "1")
         _write_boot_evidence("TONOSAMA_SURGE_DEFAULTS_SET", {
             "failopen": os.environ.get("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING"),
             "allow_without_history": os.environ.get("TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY"),
@@ -128,9 +129,10 @@ def _install_tonosama_surge_defaults() -> None:
             "five_sec_allow_zero": os.environ.get("TONOSAMA_5SEC_ALLOW_ZERO_IF_PRIMARY_PASS"),
             "history_missing_strong_move": os.environ.get("TONOSAMA_ALLOW_HISTORY_MISSING_STRONG_MOVE"),
             "ranking_lock_wait": os.environ.get("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_ENABLED"),
+            "source_prefilter": os.environ.get("ENTRY_CONTROLLER_SOURCE_PREFILTER_ENABLED"),
         })
         logger.warning(
-            "[SITECUSTOMIZE] tonosama defaults failopen=%s allow_without_history=%s value=%s five_sec_advisory=%s allow_zero=%s history_missing_strong_move=%s ranking_lock_wait=%s",
+            "[SITECUSTOMIZE] tonosama defaults failopen=%s allow_without_history=%s value=%s five_sec_advisory=%s allow_zero=%s history_missing_strong_move=%s ranking_lock_wait=%s source_prefilter=%s",
             os.environ.get("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING"),
             os.environ.get("TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY"),
             os.environ.get("TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE"),
@@ -138,6 +140,7 @@ def _install_tonosama_surge_defaults() -> None:
             os.environ.get("TONOSAMA_5SEC_ALLOW_ZERO_IF_PRIMARY_PASS"),
             os.environ.get("TONOSAMA_ALLOW_HISTORY_MISSING_STRONG_MOVE"),
             os.environ.get("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_ENABLED"),
+            os.environ.get("ENTRY_CONTROLLER_SOURCE_PREFILTER_ENABLED"),
         )
     except Exception:
         _write_boot_evidence("TONOSAMA_SURGE_DEFAULTS_EXCEPTION", traceback.format_exc())
@@ -171,6 +174,7 @@ _install_module("core.startup.tonosama_5sec_advisory_patch", "TONOSAMA_5SEC_ADVI
 _install_module("core.startup.tonosama_history_missing_guard_patch", "TONOSAMA_HISTORY_MISSING_GUARD", disabled_env="DISABLE_TONOSAMA_HISTORY_MISSING_GUARD_PATCH")
 _install_module("core.startup.ranking_entry_flat_price_guard_patch", "RANKING_FLAT_PRICE_DB_FALLBACK", disabled_env="DISABLE_RANKING_FLAT_PRICE_PATCH")
 _install_module("core.startup.entry_controller_pipeline_lock_wait_patch", "ENTRY_CONTROLLER_LOCK_WAIT", disabled_env="DISABLE_ENTRY_CONTROLLER_LOCK_WAIT_PATCH")
+_install_module("core.startup.entry_controller_source_prefilter_patch", "ENTRY_CONTROLLER_SOURCE_PREFILTER", disabled_env="DISABLE_ENTRY_CONTROLLER_SOURCE_PREFILTER_PATCH")
 _install_module("core.startup.summary_ai_liquidity_rescue_patch", "SUMMARY_AI_LIQ_RESCUE", disabled_env="DISABLE_SUMMARY_AI_LIQ_RESCUE_PATCH")
 _install_module("core.startup.summary_ai_entry_hook_dataframe_truth_patch", "SUMMARY_AI_DF_TRUTH_PATCH", disabled_env="DISABLE_SUMMARY_AI_DF_TRUTH_PATCH")
 _install_module("core.startup.summary_mtf_early_ready_patch", "SUMMARY_MTF_EARLY_READY", disabled_env="DISABLE_SUMMARY_MTF_EARLY_READY_PATCH")
