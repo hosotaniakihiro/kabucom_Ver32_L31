@@ -1,6 +1,6 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver15-SUMMARY-SAVE-QUALITY-GUARD-AUTO-INSTALL
+# Version: Ver16-LOW-MOVE-TONOSAMA-FALLBACK-AUTO-INSTALL
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # 失敗しても本体起動は止めない。
@@ -123,6 +123,9 @@ def _install_tonosama_surge_defaults() -> None:
         os.environ.setdefault("ENTRY_CONTROLLER_SOURCE_PREFILTER_ENABLED", "1")
         os.environ.setdefault("ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE", "1")
         os.environ.setdefault("ENTRY_CONTROLLER_TONOSAMA_MIN_SCORE", "0.01")
+        os.environ.setdefault("LOW_MOVE_TONOSAMA_MIN_ENTRY_PRICE", "300")
+        os.environ.setdefault("LOW_MOVE_TONOSAMA_ALLOW_NO_HIGHLOW_FALLBACK", "1")
+        os.environ.setdefault("LOW_MOVE_TONOSAMA_NO_HIGHLOW_FALLBACK_RANGE_PCT", "0.012")
         _write_boot_evidence("TONOSAMA_SURGE_DEFAULTS_SET", {
             "failopen": os.environ.get("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING"),
             "allow_without_history": os.environ.get("TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY"),
@@ -133,9 +136,11 @@ def _install_tonosama_surge_defaults() -> None:
             "ranking_lock_wait": os.environ.get("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_ENABLED"),
             "source_prefilter": os.environ.get("ENTRY_CONTROLLER_SOURCE_PREFILTER_ENABLED"),
             "tonosama_ai_bridge": os.environ.get("ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE"),
+            "low_move_tonosama_min_price": os.environ.get("LOW_MOVE_TONOSAMA_MIN_ENTRY_PRICE"),
+            "low_move_tonosama_no_highlow": os.environ.get("LOW_MOVE_TONOSAMA_ALLOW_NO_HIGHLOW_FALLBACK"),
         })
         logger.warning(
-            "[SITECUSTOMIZE] tonosama defaults failopen=%s allow_without_history=%s value=%s five_sec_advisory=%s allow_zero=%s history_missing_strong_move=%s ranking_lock_wait=%s source_prefilter=%s tonosama_ai_bridge=%s",
+            "[SITECUSTOMIZE] tonosama defaults failopen=%s allow_without_history=%s value=%s five_sec_advisory=%s allow_zero=%s history_missing_strong_move=%s ranking_lock_wait=%s source_prefilter=%s tonosama_ai_bridge=%s low_move_tonosama_min_price=%s no_highlow_fallback=%s",
             os.environ.get("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING"),
             os.environ.get("TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY"),
             os.environ.get("TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE"),
@@ -145,6 +150,8 @@ def _install_tonosama_surge_defaults() -> None:
             os.environ.get("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_ENABLED"),
             os.environ.get("ENTRY_CONTROLLER_SOURCE_PREFILTER_ENABLED"),
             os.environ.get("ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE"),
+            os.environ.get("LOW_MOVE_TONOSAMA_MIN_ENTRY_PRICE"),
+            os.environ.get("LOW_MOVE_TONOSAMA_ALLOW_NO_HIGHLOW_FALLBACK"),
         )
     except Exception:
         _write_boot_evidence("TONOSAMA_SURGE_DEFAULTS_EXCEPTION", traceback.format_exc())
@@ -181,6 +188,7 @@ _install_module("core.startup.ranking_entry_flat_price_guard_patch", "RANKING_FL
 _install_module("core.startup.entry_controller_pipeline_lock_wait_patch", "ENTRY_CONTROLLER_LOCK_WAIT", disabled_env="DISABLE_ENTRY_CONTROLLER_LOCK_WAIT_PATCH")
 _install_module("core.startup.entry_controller_source_prefilter_patch", "ENTRY_CONTROLLER_SOURCE_PREFILTER", disabled_env="DISABLE_ENTRY_CONTROLLER_SOURCE_PREFILTER_PATCH")
 _install_module("core.startup.entry_controller_tonosama_ai_bridge_patch", "TONOSAMA_AI_BRIDGE", disabled_env="DISABLE_TONOSAMA_AI_BRIDGE_PATCH")
+_install_module("core.startup.low_movement_tonosama_no_highlow_patch", "LOW_MOVE_TONOSAMA_FALLBACK", disabled_env="DISABLE_LOW_MOVE_TONOSAMA_FALLBACK_PATCH")
 _install_module("core.startup.summary_ai_liquidity_rescue_patch", "SUMMARY_AI_LIQ_RESCUE", disabled_env="DISABLE_SUMMARY_AI_LIQ_RESCUE_PATCH")
 _install_module("core.startup.summary_ai_entry_hook_dataframe_truth_patch", "SUMMARY_AI_DF_TRUTH_PATCH", disabled_env="DISABLE_SUMMARY_AI_DF_TRUTH_PATCH")
 _install_module("core.startup.summary_mtf_early_ready_patch", "SUMMARY_MTF_EARLY_READY", disabled_env="DISABLE_SUMMARY_MTF_EARLY_READY_PATCH")
