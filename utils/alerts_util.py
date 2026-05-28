@@ -1,6 +1,6 @@
 # ============================================================
 # File   : utils/alerts_util.py
-# Version: Ver3.1-PRODUCTION-DISCORD-FINAL-SUMMARY-3LINE-GUARD
+# Version: Ver3.2-PRODUCTION-DISCORD-FINAL-DF-TITLE-GUARD
 # ------------------------------------------------------------
 # ✔ 既存機能完全保持（削除ゼロ）
 # ✔ Discord 429 RateLimit完全対策
@@ -12,6 +12,7 @@
 # ✔ 長文自動分割対応
 # ✔ 例外耐性強化
 # ✔ 最終防衛: SUMMARY/AI PASSED 系の横長1行通知を送信直前に3行化
+# ✔ 最終防衛: interval_label に DataFrame が入ったAI見出しを送信直前に修復
 # ============================================================
 
 from __future__ import annotations
@@ -101,6 +102,16 @@ _SUMMARY_ONE_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# AI/SUMMARY見出しの interval_label に DataFrame repr が入る事故を送信直前に直す。
+_DF_TITLE_RE = re.compile(
+    r"(?P<head>=+\s*(?:📊\s*)?(?:🤖\s*)?(?:SUMMARY TOP10|PUSH SUMMARY TOP10|RANKING SUMMARY TOP10|AI PASSED BUY CANDIDATES|AI PASSED SELL CANDIDATES|AI PASSED EXIT CANDIDATES)\s*)"
+    r"\(.*?\[\s*\d+\s+rows\s+x\s+\d+\s+columns\s*\]\s*\)\s*(?P<tail>=+)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_DF_REPR_LINE_RE = re.compile(r"^\s*(?:\.\.\.|\d+)\s+\S+\s+.*\.\.\.\s+.*$")
+_ROWS_COLS_LINE_RE = re.compile(r"^\s*\[\s*\d+\s+rows\s+x\s+\d+\s+columns\s*\]\)?\s*=*\s*$", re.IGNORECASE)
+
 
 def _summary_reason_to_ja(reason: str, *, buy: str, sell: str, slope: str, mtf: str, rsi: str, macd: str) -> str:
     """英語コードや既存理由を、短めの日本語理由へ寄せる。"""
@@ -149,14 +160,6 @@ def _summary_reason_to_ja(reason: str, *, buy: str, sell: str, slope: str, mtf: 
 def _normalize_summary_one_line(line: str) -> str:
     """
     どの通知ルートから来ても、横長SUMMARY候補行を3行に直す最終防衛。
-
-    入力例:
-      1. 6072 XXX 株価=1446.0 score=-7.09 buy=0.00 sell=7.09 slope=-0.0142 mtf=0.00 rsi=0.00 macd=-10.19 理由=...
-
-    出力例:
-      1. 6072 XXX Price=1446.0 Score=-7.09 Buy=0.00 Sell=7.09
-         Slope=-0.0142 MTF=0.00 RSI=0.00 MACD=-10.19
-         理由=...
     """
     try:
         s = _safe_str(line).rstrip()
@@ -189,11 +192,38 @@ def _normalize_summary_one_line(line: str) -> str:
         return line
 
 
+def _normalize_bad_dataframe_titles(text: str) -> str:
+    """見出しの括弧内に DataFrame repr が入った場合、(1min) に修復する。"""
+    try:
+        s = _safe_str(text)
+        if "rows x" not in s or "columns" not in s:
+            return s
+
+        s = _DF_TITLE_RE.sub(lambda m: f"{m.group('head')}(1min) {m.group('tail')}", s)
+
+        # 念のため、チャンク境界などで残ったDataFrame表の行だけを削除する。
+        out: list[str] = []
+        for line in s.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            if _DF_REPR_LINE_RE.match(line):
+                continue
+            if _ROWS_COLS_LINE_RE.match(line):
+                continue
+            if "..." in line and "NaN" in line and len(line) > 40:
+                continue
+            out.append(line)
+        return "\n".join(out)
+    except Exception:
+        logger.debug("[DISCORD FINAL FORMATTER] dataframe title normalize failed", exc_info=True)
+        return text
+
+
 def _normalize_discord_summary_text(text: str) -> str:
     try:
         if not text:
             return text
         s = _safe_str(text)
+        s = _normalize_bad_dataframe_titles(s)
+
         # SUMMARY/AI候補以外は触らない。ただし、横長候補行単体は対象にする。
         if "score=" not in s.lower() or "理由=" not in s:
             return s
