@@ -1,20 +1,19 @@
 # ============================================================
 # File   : trading/entry/tonosama/pending_writer.py
-# Version: Ver1.8-TONOSAMA-PENDING-FINAL-LIQUIDITY-GUARD
+# Version: Ver1.9-TONOSAMA-PENDING-RANKING-SNAPSHOT-MA-GUARD
 # ------------------------------------------------------------
 # 目的:
 #   殿様イナゴの pending 登録と Discord 通知直前の最終安全ガード。
 #
-# Ver1.7:
-#   - 1分足streak判定を廃止。
-#   - BUY: 3分足または5分足が3本以上連続上昇していた後はエントリーしない。
-#   - SELL: 3分足または5分足が3本以上連続下落していた後はエントリーしない。
-#
 # Ver1.8:
 #   - 出来高が少ない銘柄が pending / Discord通知まで進むのを防ぐ。
-#   - runner.py の一次フィルターに加えて、add_pending直前でも latest_volume を再確認。
-#   - 既定は TONOSAMA_MIN_FINAL_LATEST_VOLUME=50000 株。
-#   - 3m/5m出来高も entry_conditions とログへ残す。
+#   - add_pending直前でも latest_volume を再確認。
+#
+# Ver1.9:
+#   - 3MA/5MA方向判定はPUSH 1分履歴ではなく ranking_snapshot_1min から算出する。
+#   - BUY: ranking snapshot 由来の MA3/MA5 が下向きなら通知/pending拒否。
+#   - SELL: ranking snapshot 由来の MA3/MA5 が上向きなら通知/pending拒否。
+#   - 既存の3m/5m連続足ガード、出来高ガード、クライマックスガードは継続。
 # ============================================================
 from __future__ import annotations
 
@@ -62,8 +61,6 @@ SELLING_CLIMAX_MIN_PRICE_DROP_PCT = _env_float("TONOSAMA_SELLING_CLIMAX_MIN_PRIC
 
 MAX_BUY_PREV_3M5M_UP_STREAK = _env_int("TONOSAMA_MAX_BUY_PREV_3M5M_UP_STREAK", 2)
 MAX_SELL_PREV_3M5M_DOWN_STREAK = _env_int("TONOSAMA_MAX_SELL_PREV_3M5M_DOWN_STREAK", 2)
-
-# 最終流動性ガード。一次フィルターが抜けても、pending/Discord直前で必ず止める。
 MIN_FINAL_LATEST_VOLUME = _env_float("TONOSAMA_MIN_FINAL_LATEST_VOLUME", _env_float("TONOSAMA_MIN_LATEST_VOLUME", 50000.0))
 
 
@@ -225,6 +222,7 @@ def _build_reason_ja(row: pd.Series, *, ai_reason: str, side: str) -> str:
         f"傾き {slope:.4f}",
         f"出来高 1m={latest_volume:.0f} / 3m={volume_3m:.0f} / 5m={volume_5m:.0f}",
         f"3分連続上昇 {up3}本 / 5分連続上昇 {up5}本 / 3分連続下落 {dn3}本 / 5分連続下落 {dn5}本",
+        "ランキングスナップショットMA方向は通知直前に判定",
     ]
     parts.append(f"5秒変化 {chg_5s:.3f}%" if has_5s else "5秒足なしのため3m/5m条件で判定")
     if ai_reason:
@@ -277,10 +275,25 @@ def _entry_conditions_from_row(row: pd.Series, *, ai_reason: str, side: str, exp
     }
 
 
-def _climax_reject_reason(entry: dict[str, Any]) -> str | None:
+def _ranking_ma_reject_reason(symbol: str, side: str) -> tuple[str | None, dict[str, Any]]:
+    try:
+        from .ranking_snapshot_ma_guard import reject_reason_for_side
+        return reject_reason_for_side(symbol, side)
+    except Exception:
+        logger.warning("[TONOSAMA PENDING GUARD] ranking snapshot MA guard failed symbol=%s side=%s", symbol, side, exc_info=True)
+        return None, {"reason": "ranking_ma_guard_exception"}
+
+
+def _climax_reject_reason(entry: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
+    ma_info: dict[str, Any] = {}
     try:
         cond = entry.get("entry_conditions") or {}
         side = str(entry.get("side") or cond.get("side") or "BUY").upper()
+        symbol = normalize_symbol(entry.get("symbol"))
+        ma_reject, ma_info = _ranking_ma_reject_reason(symbol, side)
+        if ma_reject:
+            return ma_reject, ma_info
+
         surge = safe_float(cond.get("max_volume_surge_ratio"), 0.0)
         price_chg = safe_float(cond.get("max_price_change_pct"), 0.0)
         signed_body = safe_float(cond.get("signed_body_change_pct"), price_chg)
@@ -295,47 +308,47 @@ def _climax_reject_reason(entry: dict[str, Any]) -> str | None:
         dn5 = int(safe_float(cond.get("prev_5m_down_streak"), 0.0))
 
         if latest_volume < MIN_FINAL_LATEST_VOLUME:
-            return "latest_volume_low_final_guard"
+            return "latest_volume_low_final_guard", ma_info
 
         if side == "BUY":
             buy_like = (price_chg > 0) or (signed_body > 0) or (slope > 0)
             if max(up3, up5) > MAX_BUY_PREV_3M5M_UP_STREAK:
-                return "buy_after_3m5m_up_streak_guard"
+                return "buy_after_3m5m_up_streak_guard", ma_info
             if buy_like and price_chg >= MAX_BUY_PRICE_CHANGE_PCT:
-                return "buy_price_chase_too_late"
+                return "buy_price_chase_too_late", ma_info
             if buy_like and close_pos >= MAX_BUY_CLOSE_POSITION_PCT and price_chg >= BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT:
-                return "buying_climax_high_zone"
+                return "buying_climax_high_zone", ma_info
             if buy_like and upper_wick >= MAX_BUY_UPPER_WICK_PCT and close_pos <= BUY_REJECTED_CLOSE_POSITION_PCT:
-                return "buying_climax_upper_wick_reversal"
+                return "buying_climax_upper_wick_reversal", ma_info
             if buy_like and surge >= BUYING_CLIMAX_MIN_SURGE_RATIO and upper_wick >= MAX_BUY_UPPER_WICK_PCT and close_pos <= 60.0:
-                return "buying_climax_upper_wick_warning"
+                return "buying_climax_upper_wick_warning", ma_info
             if buy_like and surge >= BUYING_CLIMAX_MIN_SURGE_RATIO and (
                 (price_chg >= BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT and close_pos >= MAX_BUY_CLOSE_POSITION_PCT)
                 or (upper_wick >= MAX_BUY_UPPER_WICK_PCT and close_pos <= BUY_REJECTED_CLOSE_POSITION_PCT)
             ):
-                return "buying_climax_or_high_chase_guard"
+                return "buying_climax_or_high_chase_guard", ma_info
 
         if side == "SELL":
             drop_abs = abs(price_chg)
             sell_like = (price_chg < 0) or (signed_body < 0) or (slope < 0)
             if max(dn3, dn5) > MAX_SELL_PREV_3M5M_DOWN_STREAK:
-                return "sell_after_3m5m_down_streak_guard"
+                return "sell_after_3m5m_down_streak_guard", ma_info
             if sell_like and drop_abs >= MAX_SELL_PRICE_DROP_PCT:
-                return "sell_price_chase_too_late"
+                return "sell_price_chase_too_late", ma_info
             if sell_like and close_pos <= MIN_SELL_CLOSE_POSITION_PCT and drop_abs >= SELLING_CLIMAX_MIN_PRICE_DROP_PCT:
-                return "selling_climax_low_zone"
+                return "selling_climax_low_zone", ma_info
             if sell_like and lower_wick >= MAX_SELL_LOWER_WICK_PCT and close_pos >= SELL_REJECTED_CLOSE_POSITION_PCT:
-                return "selling_climax_lower_wick_reversal"
+                return "selling_climax_lower_wick_reversal", ma_info
             if sell_like and surge >= SELLING_CLIMAX_MIN_SURGE_RATIO and lower_wick >= MAX_SELL_LOWER_WICK_PCT and close_pos >= 40.0:
-                return "selling_climax_lower_wick_warning"
+                return "selling_climax_lower_wick_warning", ma_info
             if sell_like and surge >= SELLING_CLIMAX_MIN_SURGE_RATIO and (
                 (drop_abs >= SELLING_CLIMAX_MIN_PRICE_DROP_PCT and close_pos <= MIN_SELL_CLOSE_POSITION_PCT)
                 or (lower_wick >= MAX_SELL_LOWER_WICK_PCT and close_pos >= SELL_REJECTED_CLOSE_POSITION_PCT)
             ):
-                return "selling_climax_or_low_chase_guard"
+                return "selling_climax_or_low_chase_guard", ma_info
     except Exception:
-        logger.debug("[TONOSAMA PENDING GUARD] climax/liquidity check failed", exc_info=True)
-    return None
+        logger.debug("[TONOSAMA PENDING GUARD] climax/liquidity/ma check failed", exc_info=True)
+    return None, ma_info
 
 
 def build_pending_entry(row: pd.Series, *, final_score: float, ai_prob: float, ai_reason: str) -> dict[str, Any]:
@@ -368,11 +381,11 @@ def build_pending_entry(row: pd.Series, *, final_score: float, ai_prob: float, a
 def add_tonosama_pending(entry: dict[str, Any]) -> bool:
     try:
         prune_expired_tonosama_pending(entry.get("symbol"), reason="TONOSAMA_BEFORE_ADD_EXPIRED")
-        reject = _climax_reject_reason(entry)
+        reject, ma_info = _climax_reject_reason(entry)
         if reject:
             cond = entry.get("entry_conditions") or {}
             logger.warning(
-                "[TONOSAMA PENDING GUARD] reject symbol=%s side=%s reason=%s price_chg=%.3f surge=%.2f latest_volume=%.0f min_volume=%.0f volume_3m=%.0f volume_5m=%.0f close_pos=%.1f upper_wick=%.1f lower_wick=%.1f up3=%s up5=%s dn3=%s dn5=%s slope=%.6f",
+                "[TONOSAMA PENDING GUARD] reject symbol=%s side=%s reason=%s price_chg=%.3f surge=%.2f latest_volume=%.0f min_volume=%.0f volume_3m=%.0f volume_5m=%.0f close_pos=%.1f upper_wick=%.1f lower_wick=%.1f up3=%s up5=%s dn3=%s dn5=%s slope=%.6f ranking_ma=%s",
                 entry.get("symbol"), entry.get("side"), reject,
                 safe_float(cond.get("max_price_change_pct"), 0.0),
                 safe_float(cond.get("max_volume_surge_ratio"), 0.0),
@@ -388,6 +401,7 @@ def add_tonosama_pending(entry: dict[str, Any]) -> bool:
                 int(safe_float(cond.get("prev_3m_down_streak"), 0.0)),
                 int(safe_float(cond.get("prev_5m_down_streak"), 0.0)),
                 safe_float(cond.get("slope"), 0.0),
+                ma_info,
             )
             return False
         return bool(add_pending(entry))
