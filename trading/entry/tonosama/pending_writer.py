@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/tonosama/pending_writer.py
-# Version: Ver1.3-TONOSAMA-PENDING-JA-REASONS
+# Version: Ver1.4-TONOSAMA-PENDING-SIDE-INFER-CLIMAX-GUARD
 # ------------------------------------------------------------
 # Fix:
 #   - TONOSAMA候補が毎回 duplicate 扱いになり、registered=0 のまま
@@ -12,11 +12,18 @@
 # Ver1.3:
 #   - Discord表示用の理由を日本語化。
 #   - pending は「難病保持」ではなく「発注待ち候補」であることが分かるようにする。
+# Ver1.4:
+#   - side='BUY' 固定を廃止。
+#   - price_change / signed_body / slope / score_buy / score_sell から BUY/SELL を推定する。
+#   - BUYのバイイングクライマックス疑い、SELLのセリングクライマックス疑いを
+#     add_pending直前でも強制拒否する。
+#   - Discordアラートや発注待ちに危険形が混入しないよう二重ガードにする。
 # ============================================================
 from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 from typing import Any
 
 import pandas as pd
@@ -26,6 +33,28 @@ from .config import TONOSAMA_EXPIRE_SEC
 from .utils import normalize_symbol, safe_float
 
 logger = logging.getLogger(__name__)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return float(default)
+
+
+MAX_BUY_PRICE_CHANGE_PCT = _env_float("TONOSAMA_MAX_BUY_PRICE_CHANGE_PCT", 0.80)
+MAX_BUY_CLOSE_POSITION_PCT = _env_float("TONOSAMA_MAX_BUY_CLOSE_POSITION_PCT", 90.0)
+MAX_BUY_UPPER_WICK_PCT = _env_float("TONOSAMA_MAX_BUY_UPPER_WICK_PCT", 45.0)
+BUY_REJECTED_CLOSE_POSITION_PCT = _env_float("TONOSAMA_BUY_REJECTED_CLOSE_POSITION_PCT", 35.0)
+BUYING_CLIMAX_MIN_SURGE_RATIO = _env_float("TONOSAMA_BUYING_CLIMAX_MIN_SURGE_RATIO", 3.0)
+BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT = _env_float("TONOSAMA_BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT", 0.50)
+
+MAX_SELL_PRICE_DROP_PCT = _env_float("TONOSAMA_MAX_SELL_PRICE_DROP_PCT", 0.80)
+MIN_SELL_CLOSE_POSITION_PCT = _env_float("TONOSAMA_MIN_SELL_CLOSE_POSITION_PCT", 10.0)
+MAX_SELL_LOWER_WICK_PCT = _env_float("TONOSAMA_MAX_SELL_LOWER_WICK_PCT", 45.0)
+SELL_REJECTED_CLOSE_POSITION_PCT = _env_float("TONOSAMA_SELL_REJECTED_CLOSE_POSITION_PCT", 65.0)
+SELLING_CLIMAX_MIN_SURGE_RATIO = _env_float("TONOSAMA_SELLING_CLIMAX_MIN_SURGE_RATIO", 3.0)
+SELLING_CLIMAX_MIN_PRICE_DROP_PCT = _env_float("TONOSAMA_SELLING_CLIMAX_MIN_PRICE_DROP_PCT", 0.50)
 
 
 def _norm_source(v: Any) -> str:
@@ -90,7 +119,6 @@ def _is_expired_tonosama_entry(entry: dict[str, Any], *, now: dt.datetime | None
             return False
         exp = _expire_at(entry)
         if exp is None:
-            # 期限が読めない古いTONOSAMAは、安全側で一旦残す。
             return False
         return (now or dt.datetime.now()) >= exp
     except Exception:
@@ -129,7 +157,6 @@ def _prune_symbol_expired_tonosama(symbol: str, *, reason: str, now: dt.datetime
 
 
 def prune_expired_tonosama_pending(symbol: str | None = None, *, reason: str = "TONOSAMA_EXPIRED") -> int:
-    """期限切れのTONOSAMA pendingを削除する。symbol指定時は対象銘柄のみ。"""
     now = dt.datetime.now()
     try:
         if symbol:
@@ -155,7 +182,31 @@ def has_tonosama_pending(symbol: str) -> bool:
     return any(_is_tonosama_entry(e) for e in bucket if isinstance(e, dict))
 
 
-def _build_reason_ja(row: pd.Series, *, ai_reason: str) -> str:
+def _infer_side_from_row(row: pd.Series) -> str:
+    max_chg = safe_float(row.get("_max_price_change_pct"), 0.0)
+    signed_body = safe_float(row.get("_signed_body_change_pct"), max_chg)
+    slope = safe_float(row.get("_slope"), 0.0)
+    score_sell = safe_float(row.get("score_sell"), 0.0)
+    score_buy = safe_float(row.get("score_buy"), 0.0)
+
+    if max_chg < 0:
+        return "SELL"
+    if max_chg > 0:
+        return "BUY"
+    if signed_body < 0:
+        return "SELL"
+    if signed_body > 0:
+        return "BUY"
+    if slope < 0:
+        return "SELL"
+    if slope > 0:
+        return "BUY"
+    if score_sell > score_buy:
+        return "SELL"
+    return "BUY"
+
+
+def _build_reason_ja(row: pd.Series, *, ai_reason: str, side: str) -> str:
     max_surge = safe_float(row.get("_max_volume_surge_ratio"), 0.0)
     max_chg = safe_float(row.get("_max_price_change_pct"), 0.0)
     chg_5s = safe_float(row.get("price_change_5s_pct"), 0.0)
@@ -164,6 +215,7 @@ def _build_reason_ja(row: pd.Series, *, ai_reason: str) -> str:
     tf = str(row.get("_surge_tf", ""))
 
     parts = [
+        f"方向 {side}",
         f"{tf or '3m/5m'}で出来高急増 {max_surge:.2f}倍",
         f"価格変化 {max_chg:.2f}%",
         f"傾き {slope:.4f}",
@@ -178,54 +230,110 @@ def _build_reason_ja(row: pd.Series, *, ai_reason: str) -> str:
     return " / ".join(parts)
 
 
+def _entry_conditions_from_row(row: pd.Series, *, ai_reason: str, side: str, expire_at: dt.datetime) -> dict[str, Any]:
+    return {
+        "expire_at": expire_at,
+        "reason": _build_reason_ja(row, ai_reason=ai_reason, side=side),
+        "reason_code": "tonosama_volume_surge_price_change_5sec_ai",
+        "ai_reason": ai_reason,
+        "side": side,
+        "volume_surge_ratio_3m": safe_float(row.get("volume_surge_ratio_3m"), 0.0),
+        "volume_surge_ratio_5m": safe_float(row.get("volume_surge_ratio_5m"), 0.0),
+        "max_volume_surge_ratio": safe_float(row.get("_max_volume_surge_ratio"), 0.0),
+        "price_change_pct_3m": safe_float(row.get("price_change_pct_3m"), 0.0),
+        "price_change_pct_5m": safe_float(row.get("price_change_pct_5m"), 0.0),
+        "max_price_change_pct": safe_float(row.get("_max_price_change_pct"), 0.0),
+        "signed_body_change_pct": safe_float(row.get("_signed_body_change_pct"), safe_float(row.get("_max_price_change_pct"), 0.0)),
+        "body_change_pct": safe_float(row.get("_body_change_pct"), 0.0),
+        "intrabar_range_pct": safe_float(row.get("_intrabar_range_pct"), 0.0),
+        "close_position_pct": safe_float(row.get("_close_position_pct"), 50.0),
+        "upper_wick_pct": safe_float(row.get("_upper_wick_pct"), 0.0),
+        "lower_wick_pct": safe_float(row.get("_lower_wick_pct"), 0.0),
+        "latest_volume": safe_float(row.get("_latest_volume"), 0.0),
+        "has_5sec_bar": bool(row.get("has_5sec_bar", False)),
+        "latest_5sec_close": safe_float(row.get("latest_5sec_close"), 0.0),
+        "latest_5sec_volume": safe_float(row.get("latest_5sec_volume"), 0.0),
+        "price_change_5s_pct": safe_float(row.get("price_change_5s_pct"), 0.0),
+        "volume_surge_ratio_5s": safe_float(row.get("volume_surge_ratio_5s"), 0.0),
+        "is_5sec_confirm_ok": bool(row.get("is_5sec_confirm_ok", False)),
+        "surge_tf": str(row.get("_surge_tf", "")),
+        "slope": safe_float(row.get("_slope"), 0.0),
+        "rsi": safe_float(row.get("rsi"), 0.0),
+        "macd": safe_float(row.get("macd"), 0.0),
+        "signal": safe_float(row.get("signal"), 0.0),
+        "mtf": safe_float(row.get("mtf"), 0.0),
+        "score_mtf": safe_float(row.get("score_mtf"), 0.0),
+    }
+
+
+def _climax_reject_reason(entry: dict[str, Any]) -> str | None:
+    try:
+        cond = entry.get("entry_conditions") or {}
+        side = str(entry.get("side") or cond.get("side") or "BUY").upper()
+        surge = safe_float(cond.get("max_volume_surge_ratio"), 0.0)
+        price_chg = safe_float(cond.get("max_price_change_pct"), 0.0)
+        signed_body = safe_float(cond.get("signed_body_change_pct"), price_chg)
+        slope = safe_float(cond.get("slope"), 0.0)
+        close_pos = safe_float(cond.get("close_position_pct"), 50.0)
+        upper_wick = safe_float(cond.get("upper_wick_pct"), 0.0)
+        lower_wick = safe_float(cond.get("lower_wick_pct"), 0.0)
+
+        if side == "BUY":
+            buy_like = (price_chg > 0) or (signed_body > 0) or (slope > 0)
+            if buy_like and price_chg >= MAX_BUY_PRICE_CHANGE_PCT:
+                return "buy_price_chase_too_late"
+            if buy_like and close_pos >= MAX_BUY_CLOSE_POSITION_PCT and price_chg >= BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT:
+                return "buying_climax_high_zone"
+            if buy_like and upper_wick >= MAX_BUY_UPPER_WICK_PCT and close_pos <= BUY_REJECTED_CLOSE_POSITION_PCT:
+                return "buying_climax_upper_wick_reversal"
+            if buy_like and surge >= BUYING_CLIMAX_MIN_SURGE_RATIO and (
+                (price_chg >= BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT and close_pos >= MAX_BUY_CLOSE_POSITION_PCT)
+                or (upper_wick >= MAX_BUY_UPPER_WICK_PCT and close_pos <= BUY_REJECTED_CLOSE_POSITION_PCT)
+            ):
+                return "buying_climax_or_high_chase_guard"
+
+        if side == "SELL":
+            drop_abs = abs(price_chg)
+            sell_like = (price_chg < 0) or (signed_body < 0) or (slope < 0)
+            if sell_like and drop_abs >= MAX_SELL_PRICE_DROP_PCT:
+                return "sell_price_chase_too_late"
+            if sell_like and close_pos <= MIN_SELL_CLOSE_POSITION_PCT and drop_abs >= SELLING_CLIMAX_MIN_PRICE_DROP_PCT:
+                return "selling_climax_low_zone"
+            if sell_like and lower_wick >= MAX_SELL_LOWER_WICK_PCT and close_pos >= SELL_REJECTED_CLOSE_POSITION_PCT:
+                return "selling_climax_lower_wick_reversal"
+            if sell_like and surge >= SELLING_CLIMAX_MIN_SURGE_RATIO and (
+                (drop_abs >= SELLING_CLIMAX_MIN_PRICE_DROP_PCT and close_pos <= MIN_SELL_CLOSE_POSITION_PCT)
+                or (lower_wick >= MAX_SELL_LOWER_WICK_PCT and close_pos >= SELL_REJECTED_CLOSE_POSITION_PCT)
+            ):
+                return "selling_climax_or_low_chase_guard"
+    except Exception:
+        logger.debug("[TONOSAMA PENDING GUARD] climax check failed", exc_info=True)
+    return None
+
+
 def build_pending_entry(row: pd.Series, *, final_score: float, ai_prob: float, ai_reason: str) -> dict[str, Any]:
     now = dt.datetime.now()
     expire_at = now + dt.timedelta(seconds=TONOSAMA_EXPIRE_SEC)
     symbol = normalize_symbol(row.get("symbol"))
-    reason_ja = _build_reason_ja(row, ai_reason=ai_reason)
+    side = _infer_side_from_row(row)
+    conditions = _entry_conditions_from_row(row, ai_reason=ai_reason, side=side, expire_at=expire_at)
+    final = safe_float(final_score, 0.0)
     return {
         "symbol": symbol,
         "symbolname": str(row.get("symbolname", "")),
-        "side": "BUY",
+        "side": side,
         "source": "TONOSAMA",
         "entry_type": "TONOSAMA",
         "price": safe_float(row.get("close"), 0.0),
         "raw_score": safe_float(row.get("_tonosama_score"), 0.0),
-        "final_score": safe_float(final_score, 0.0),
-        "display_score": safe_float(final_score, 0.0),
-        "score": safe_float(final_score, 0.0),
-        "score_buy": safe_float(final_score, 0.0),
-        "score_sell": 0.0,
+        "final_score": final,
+        "display_score": final,
+        "score": final if side == "BUY" else -abs(final),
+        "score_buy": final if side == "BUY" else 0.0,
+        "score_sell": final if side == "SELL" else 0.0,
         "ai_prob": safe_float(ai_prob, 0.0),
         "expire_at": expire_at,
-        "entry_conditions": {
-            "expire_at": expire_at,
-            "reason": reason_ja,
-            "reason_code": "tonosama_volume_surge_price_change_5sec_ai",
-            "ai_reason": ai_reason,
-            "volume_surge_ratio_3m": safe_float(row.get("volume_surge_ratio_3m"), 0.0),
-            "volume_surge_ratio_5m": safe_float(row.get("volume_surge_ratio_5m"), 0.0),
-            "max_volume_surge_ratio": safe_float(row.get("_max_volume_surge_ratio"), 0.0),
-            "price_change_pct_3m": safe_float(row.get("price_change_pct_3m"), 0.0),
-            "price_change_pct_5m": safe_float(row.get("price_change_pct_5m"), 0.0),
-            "max_price_change_pct": safe_float(row.get("_max_price_change_pct"), 0.0),
-            "body_change_pct": safe_float(row.get("_body_change_pct"), 0.0),
-            "intrabar_range_pct": safe_float(row.get("_intrabar_range_pct"), 0.0),
-            "latest_volume": safe_float(row.get("_latest_volume"), 0.0),
-            "has_5sec_bar": bool(row.get("has_5sec_bar", False)),
-            "latest_5sec_close": safe_float(row.get("latest_5sec_close"), 0.0),
-            "latest_5sec_volume": safe_float(row.get("latest_5sec_volume"), 0.0),
-            "price_change_5s_pct": safe_float(row.get("price_change_5s_pct"), 0.0),
-            "volume_surge_ratio_5s": safe_float(row.get("volume_surge_ratio_5s"), 0.0),
-            "is_5sec_confirm_ok": bool(row.get("is_5sec_confirm_ok", False)),
-            "surge_tf": str(row.get("_surge_tf", "")),
-            "slope": safe_float(row.get("_slope"), 0.0),
-            "rsi": safe_float(row.get("rsi"), 0.0),
-            "macd": safe_float(row.get("macd"), 0.0),
-            "signal": safe_float(row.get("signal"), 0.0),
-            "mtf": safe_float(row.get("mtf"), 0.0),
-            "score_mtf": safe_float(row.get("score_mtf"), 0.0),
-        },
+        "entry_conditions": conditions,
         "created_at": now,
     }
 
@@ -233,6 +341,22 @@ def build_pending_entry(row: pd.Series, *, final_score: float, ai_prob: float, a
 def add_tonosama_pending(entry: dict[str, Any]) -> bool:
     try:
         prune_expired_tonosama_pending(entry.get("symbol"), reason="TONOSAMA_BEFORE_ADD_EXPIRED")
+        reject = _climax_reject_reason(entry)
+        if reject:
+            cond = entry.get("entry_conditions") or {}
+            logger.warning(
+                "[TONOSAMA PENDING GUARD] reject symbol=%s side=%s reason=%s price_chg=%.3f surge=%.2f close_pos=%.1f upper_wick=%.1f lower_wick=%.1f slope=%.6f",
+                entry.get("symbol"),
+                entry.get("side"),
+                reject,
+                safe_float(cond.get("max_price_change_pct"), 0.0),
+                safe_float(cond.get("max_volume_surge_ratio"), 0.0),
+                safe_float(cond.get("close_position_pct"), 50.0),
+                safe_float(cond.get("upper_wick_pct"), 0.0),
+                safe_float(cond.get("lower_wick_pct"), 0.0),
+                safe_float(cond.get("slope"), 0.0),
+            )
+            return False
         return bool(add_pending(entry))
     except Exception:
         logger.exception("[TONOSAMA ENTRY] add_pending failed symbol=%s", entry.get("symbol"))
