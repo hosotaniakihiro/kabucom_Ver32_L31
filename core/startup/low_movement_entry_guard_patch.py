@@ -1,9 +1,16 @@
 # ============================================================
 # File   : core/startup/low_movement_entry_guard_patch.py
-# Version: Ver13-TONOSAMA-HIGH-PRICE-RANGE-RELAX
+# Version: Ver14-TONOSAMA-RAW-RANGE-MERGE
 # ------------------------------------------------------------
 # あまり動かない銘柄へのエントリーを発注直前で止める。
 # さらに、ランキング方向に逆らうエントリーも禁止する。
+#
+# Ver14:
+#   - pending entry の top-level には high/low/_intrabar_range_pct が無く、
+#     _raw 内にだけ TONOSAMA 特徴量が残るケースに対応
+#   - _row_to_dict() で _raw dict を展開し、top-level 欠損項目だけ補完
+#   - [LOW MOVE GUARD] reason=no_high_low row_range_pct=0.0000 を防ぐ
+#   - source/side/score など top-level の確定値は上書きしない
 #
 # Ver13:
 #   - TONOSAMA pending が最終段で LOW_MOVE_MAX_ENTRY_PRICE=7000 により
@@ -69,17 +76,42 @@ def _env_bool(name: str, default: bool = True) -> bool:
         return bool(default)
 
 
+def _is_blank_value(v: Any) -> bool:
+    try:
+        if v is None:
+            return True
+        s = str(v).strip()
+        return s == "" or s.lower() in {"nan", "none", "nat", "<na>"}
+    except Exception:
+        return True
+
+
 def _row_to_dict(row: Any) -> dict:
     try:
         if row is None:
             return {}
         if isinstance(row, dict):
-            return dict(row)
-        if hasattr(row, "to_dict"):
+            d = dict(row)
+        elif hasattr(row, "to_dict"):
             v = row.to_dict()
-            if isinstance(v, dict):
-                return dict(v)
-        return {}
+            d = dict(v) if isinstance(v, dict) else {}
+        else:
+            d = {}
+
+        # TONOSAMA pending は軽量化のため top-level に high/low/range 系が無く、
+        # _raw 内に元候補行が残ることがある。top-level を優先し、不足分だけ補完する。
+        raw = d.get("_raw")
+        if hasattr(raw, "to_dict"):
+            try:
+                raw = raw.to_dict()
+            except Exception:
+                raw = None
+        if isinstance(raw, dict) and raw:
+            for k, v in raw.items():
+                if k not in d or _is_blank_value(d.get(k)):
+                    d[k] = v
+            d["_raw_merged_for_low_move_guard"] = True
+        return d
     except Exception:
         return {}
 
@@ -268,16 +300,16 @@ def _low_movement_guard(entry_row: Any) -> bool:
         range_source = "row_range_pct"
         if range_pct <= 0:
             logger.warning(
-                "[LOW MOVE GUARD] NG symbol=%s reason=no_high_low close=%.1f high=%.1f low=%.1f row_range_pct=%.4f keys=%s",
-                symbol, close, high, low, range_pct, sorted(list(row.keys()))[:60],
+                "[LOW MOVE GUARD] NG symbol=%s reason=no_high_low close=%.1f high=%.1f low=%.1f row_range_pct=%.4f raw_merged=%s keys=%s",
+                symbol, close, high, low, range_pct, row.get("_raw_merged_for_low_move_guard"), sorted(list(row.keys()))[:80],
             )
             return False
         # ログ/後段用の疑似high/low。判定はrange_pctのみを使う。
         high = close * (1.0 + range_pct / 2.0)
         low = close * max(0.0001, (1.0 - range_pct / 2.0))
         logger.warning(
-            "[LOW MOVE GUARD] high/low missing but use row range fallback symbol=%s close=%.1f range_pct=%.4f source=%s pseudo_high=%.1f pseudo_low=%.1f",
-            symbol, close, range_pct, range_source, high, low,
+            "[LOW MOVE GUARD] high/low missing but use row range fallback symbol=%s close=%.1f range_pct=%.4f source=%s raw_merged=%s pseudo_high=%.1f pseudo_low=%.1f",
+            symbol, close, range_pct, range_source, row.get("_raw_merged_for_low_move_guard"), high, low,
         )
 
     split = _env_float("LOW_MOVE_TIER_SPLIT_PRICE", 3000.0)
@@ -330,8 +362,8 @@ def _low_movement_guard(entry_row: Any) -> bool:
         return False
 
     logger.info(
-        "[LOW MOVE GUARD] OK symbol=%s close=%.1f range_pct=%.4f min_range=%.4f strong_range=%.4f macd=%.4f signal=%.4f max_abs_slope=%.6f source=%s tonosama=%s",
-        symbol, close, range_pct, min_range_pct, strong_range_pct, macd, signal, max_abs_slope, range_source, source_tonosama,
+        "[LOW MOVE GUARD] OK symbol=%s close=%.1f range_pct=%.4f min_range=%.4f strong_range=%.4f macd=%.4f signal=%.4f max_abs_slope=%.6f source=%s tonosama=%s raw_merged=%s",
+        symbol, close, range_pct, min_range_pct, strong_range_pct, macd, signal, max_abs_slope, range_source, source_tonosama, row.get("_raw_merged_for_low_move_guard"),
     )
     return True
 
@@ -390,7 +422,7 @@ def _patched_atr_1m_filter(entry_row: Any = None, *args, **kwargs):
 
 def _is_low_move_wrapped(func: Any) -> bool:
     try:
-        return bool(getattr(func, "_low_move_guard_v2", False) or getattr(func, "_low_move_guard_v1", False) or getattr(func, "_low_move_guard_v12", False) or getattr(func, "_low_move_guard_v13", False))
+        return bool(getattr(func, "_low_move_guard_v2", False) or getattr(func, "_low_move_guard_v1", False) or getattr(func, "_low_move_guard_v12", False) or getattr(func, "_low_move_guard_v13", False) or getattr(func, "_low_move_guard_v14", False))
     except Exception:
         return False
 
@@ -415,7 +447,7 @@ def install() -> bool:
 
         if callable(old_atr) and not _is_low_move_wrapped(old_atr):
             _ORIG_ATR_FILTER = old_atr
-            _patched_atr_1m_filter._low_move_guard_v13 = True  # type: ignore[attr-defined]
+            _patched_atr_1m_filter._low_move_guard_v14 = True  # type: ignore[attr-defined]
             _patched_atr_1m_filter._original = old_atr  # type: ignore[attr-defined]
             ec.atr_1m_filter = _patched_atr_1m_filter
             logger.warning("[LOW MOVE GUARD] patched entry_controller.atr_1m_filter")
@@ -424,7 +456,7 @@ def install() -> bool:
 
         if callable(old_range) and not _is_low_move_wrapped(old_range):
             _ORIG_RANGE_FILTER = old_range
-            _patched_range_5m_filter._low_move_guard_v13 = True  # type: ignore[attr-defined]
+            _patched_range_5m_filter._low_move_guard_v14 = True  # type: ignore[attr-defined]
             _patched_range_5m_filter._original = old_range  # type: ignore[attr-defined]
             ec.range_5m_filter = _patched_range_5m_filter
             logger.warning("[LOW MOVE GUARD] patched entry_controller.range_5m_filter")
@@ -433,7 +465,7 @@ def install() -> bool:
 
         _INSTALLED = True
         logger.warning(
-            "[LOW MOVE GUARD] installed v13 tonosama_max_price=%s tonosama_min_range=%s tonosama_ignore_orig_range_ng=%s direction=%s scoring_bridge=%s entry_direction=%s final_safety=%s price_improve=%s ma_cross=%s vwap=%s",
+            "[LOW MOVE GUARD] installed v14 raw_merge=True tonosama_max_price=%s tonosama_min_range=%s tonosama_ignore_orig_range_ng=%s direction=%s scoring_bridge=%s entry_direction=%s final_safety=%s price_improve=%s ma_cross=%s vwap=%s",
             os.getenv("LOW_MOVE_TONOSAMA_MAX_ENTRY_PRICE", "12000"),
             os.getenv("LOW_MOVE_TONOSAMA_MIN_RANGE_PCT", "0.006"),
             _env_bool("LOW_MOVE_TONOSAMA_IGNORE_ORIG_RANGE_NG", True),
