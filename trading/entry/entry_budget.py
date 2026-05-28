@@ -1,18 +1,18 @@
 # ============================================================
 # File   : trading/entry/entry_budget.py
-# Version: PRODUCTION-ENTRY-BUDGET-CONFIG-V5-UNIFIED-700K
+# Version: PRODUCTION-ENTRY-BUDGET-CONFIG-V6-SETTINGS-INI-TRADE
 # ------------------------------------------------------------
 # 目的:
 #   エントリー1回あたりの予算・最低株数・価格帯上限/下限を一元管理する。
 #
-# V5仕様:
-#   - 1銘柄あたりの基本予算を 700,000円 に統一
-#   - 資金が増えた場合は1銘柄ロットを増やすより、発注対象銘柄数を増やす前提
-#   - 価格帯は 1,500円〜7,000円 を維持
-#   - 7,001円以上: 対象外
+# V6仕様:
+#   - project root settings.ini / setting.ini を実売買設定の正とする
+#   - [trade] entry_budget / budget / unit_size も読める
+#   - [ENTRY] の既存キーも互換維持
+#   - score_config.ini の [trade] へは戻さない
 #
 # 優先順:
-#   config.global_config -> ENV -> setting.ini -> default
+#   config.global_config -> ENV -> settings.ini([trade]/[ENTRY]) -> default
 # ============================================================
 
 from __future__ import annotations
@@ -125,7 +125,7 @@ def get_entry_high_price_oneshot_yen(default: float = DEFAULT_ENTRY_HIGH_PRICE_O
 def get_max_entry_oneshot_yen(default: float = DEFAULT_MAX_ENTRY_ONESHOT_YEN) -> float:
     """
     価格が未指定の既定予算。
-    互換性のため残す。数量計算では get_entry_oneshot_yen_for_price(price) を優先する。
+    settings.ini [trade] entry_budget / budget を alias として読める。
     """
     v = _safe_float(_cfg("MAX_ENTRY_ONESHOT_YEN", default), default)
     return v if v > 0 else float(default)
@@ -134,8 +134,8 @@ def get_max_entry_oneshot_yen(default: float = DEFAULT_MAX_ENTRY_ONESHOT_YEN) ->
 def get_entry_oneshot_yen_for_price(price: Any) -> float:
     """
     1銘柄あたりの発注上限を返す。
-    低価格帯・高価格帯の個別設定が残っている環境でも上書き可能だが、
     デフォルトは全価格帯 700,000円 に統一する。
+    settings.ini [trade] entry_budget / budget があれば低価格・高価格の両方へ効く。
     """
     p = _safe_float(price, 0.0)
     split = get_entry_tier_split_price()
@@ -193,7 +193,7 @@ def can_afford_min_lot(price: Any) -> tuple[bool, dict[str, Any]]:
         "affordable_max_price": affordable_max_price,
         "max_price": effective_max_price,
         "min_notional": min_notional,
-        "source": "entry_budget_unified_700k_cfg_global_env_setting_ini_default",
+        "source": "entry_budget_settings_ini_trade_entry_env_global_default",
     }
 
     if not is_affordability_filter_enabled(default=True):
@@ -230,7 +230,7 @@ def log_entry_budget_config(prefix: str = "[ENTRY BUDGET]") -> None:
         low_budget = get_entry_low_price_oneshot_yen()
         high_budget = get_entry_high_price_oneshot_yen()
         logger.warning(
-            "%s unified_700k min_price=%.0f split_price=%.0f max_price=%.0f low_budget=%.0f high_budget=%.0f lot_size=%s affordability_filter=%s source=global_config_env_setting_ini_default",
+            "%s settings_ini_trade min_price=%.0f split_price=%.0f max_price=%.0f low_budget=%.0f high_budget=%.0f lot_size=%s affordability_filter=%s source=settings.ini([trade]/[ENTRY])->env->global_config->default",
             prefix, min_price, split_price, max_price, low_budget, high_budget, lot,
             is_affordability_filter_enabled(default=True),
         )
