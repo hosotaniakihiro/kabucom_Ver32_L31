@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/tonosama/ranking_snapshot_ma_guard.py
-# Version: Ver1.0-TONOSAMA-RANKING-SNAPSHOT-MA-GUARD
+# Version: Ver1.1-TONOSAMA-RANKING-SNAPSHOT-MA-GUARD-SHARED-RANKING-MODULES
 # ------------------------------------------------------------
 # 目的:
 #   殿様イナゴの通知/pending直前で使う、ランキングスナップショット由来の
@@ -9,9 +9,10 @@
 # 方針:
 #   - PUSH 1分履歴は使わない。
 #   - ranking_snapshot_1min の価格履歴から、symbol別に直近MA3/MA5と傾きを算出する。
-#   - まず global_data 上の ranking snapshot を探す。
-#   - 無ければ ranking DB の ranking_snapshot_1min を読む。
-#   - 読めない場合は fail-open ではなく「unknown」として返し、呼び出し側で設定に従う。
+#   - trading/ranking/snapshot_writer.py が委譲している既存共通モジュールを使う。
+#       database.paths.ranking_paths.resolve_ranking_db_path
+#       database.schema.ranking_snapshot_schema.SNAPSHOT_TABLE
+#   - ranking DBの場所やテーブル名を殿様側で独自に持たない。
 #
 # BUY拒否:
 #   - ma3_slope < 0 または ma5_slope < 0
@@ -24,10 +25,19 @@ import datetime as dt
 import logging
 import os
 import sqlite3
-from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+try:
+    from database.paths.ranking_paths import resolve_ranking_db_path
+except Exception:  # pragma: no cover
+    resolve_ranking_db_path = None  # type: ignore
+
+try:
+    from database.schema.ranking_snapshot_schema import SNAPSHOT_TABLE
+except Exception:  # pragma: no cover
+    SNAPSHOT_TABLE = "ranking_snapshot_1min"
 
 logger = logging.getLogger(__name__)
 
@@ -61,10 +71,9 @@ RANKING_MA_LOOKBACK_ROWS = _env_int("TONOSAMA_RANKING_MA_LOOKBACK_ROWS", 30)
 RANKING_MA_MAX_AGE_MIN = _env_float("TONOSAMA_RANKING_MA_MAX_AGE_MIN", 30.0)
 RANKING_MA_FAIL_OPEN_IF_UNKNOWN = _env_bool("TONOSAMA_RANKING_MA_FAIL_OPEN_IF_UNKNOWN", True)
 
-
 _PRICE_COL_CANDIDATES = [
-    "price",
     "current_price",
+    "price",
     "CurrentPrice",
     "close",
     "close_price",
@@ -103,6 +112,10 @@ def _first_existing(df: pd.DataFrame, names: list[str]) -> str | None:
     return None
 
 
+def _quote_ident(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
 def _normalize_snapshot_df(df: pd.DataFrame, *, symbol: str | None = None) -> pd.DataFrame:
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame()
@@ -111,6 +124,13 @@ def _normalize_snapshot_df(df: pd.DataFrame, *, symbol: str | None = None) -> pd
     time_col = _first_existing(x, _TIME_COL_CANDIDATES)
     price_col = _first_existing(x, _PRICE_COL_CANDIDATES)
     if sym_col is None or time_col is None or price_col is None:
+        logger.warning(
+            "[TONOSAMA RANKING MA] normalize failed missing columns sym_col=%s time_col=%s price_col=%s columns=%s",
+            sym_col,
+            time_col,
+            price_col,
+            list(x.columns),
+        )
         return pd.DataFrame()
     x["symbol"] = x[sym_col].map(_normalize_symbol)
     x["datetime"] = pd.to_datetime(x[time_col], errors="coerce")
@@ -123,7 +143,6 @@ def _normalize_snapshot_df(df: pd.DataFrame, *, symbol: str | None = None) -> pd
     if x.empty:
         return pd.DataFrame()
     x = x.sort_values(["symbol", "datetime"])
-    # 同一分・同一銘柄が複数ある場合は最後を採用する。
     x["datetime"] = pd.to_datetime(x["datetime"], errors="coerce").dt.floor("min")
     x = x.drop_duplicates(subset=["symbol", "datetime"], keep="last")
     return x[["symbol", "datetime", "price"]].sort_values(["symbol", "datetime"])
@@ -169,48 +188,74 @@ def _candidate_global_snapshot_frames() -> list[pd.DataFrame]:
     return frames
 
 
-def _today_ranking_db_candidates() -> list[Path]:
-    today = dt.datetime.now().strftime("%Y%m%d")
-    paths: list[str] = []
+def _resolve_today_ranking_db_path() -> str | None:
+    # 環境変数が明示されている場合はそれを優先。
     env_path = os.getenv("RANKING_DB_PATH") or os.getenv("KABU_RANKING_DB_PATH") or os.getenv("KABUCOM_RANKING_DB_PATH")
-    if env_path:
-        paths.append(env_path)
-    paths.extend([
-        rf"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\ranking\ranking{today}.db",
-        rf"\\192.168.0.22\kabu\raw_data\kabu_station\ranking\ranking{today}.db",
-    ])
-    out: list[Path] = []
-    for p in paths:
-        try:
-            pp = Path(p)
-            if pp.exists():
-                out.append(pp)
-        except Exception:
-            continue
-    return out
+    if env_path and str(env_path).strip():
+        return str(env_path).strip()
+
+    # 既存のranking共通パス解決へ委譲。
+    try:
+        if callable(resolve_ranking_db_path):
+            return str(resolve_ranking_db_path())
+    except Exception:
+        logger.debug("[TONOSAMA RANKING MA] resolve_ranking_db_path failed", exc_info=True)
+    return None
+
+
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    try:
+        cur = conn.execute(f"PRAGMA table_info({_quote_ident(table_name)})")
+        return {str(row[1]) for row in cur.fetchall()}
+    except Exception:
+        return set()
 
 
 def _load_snapshot_from_db(symbol: str) -> pd.DataFrame:
     sym = _normalize_symbol(symbol)
     if not sym:
         return pd.DataFrame()
-    cols = "*"
-    for db_path in _today_ranking_db_candidates():
-        try:
-            with sqlite3.connect(str(db_path), timeout=1.0) as conn:
-                q = (
-                    "SELECT " + cols + " FROM ranking_snapshot_1min "
-                    "WHERE CAST(symbol AS TEXT)=? "
-                    "ORDER BY COALESCE(datetime, snapshot_time, received_at, created_at, inserted_at, updated_at) DESC "
-                    "LIMIT ?"
+
+    db_path = _resolve_today_ranking_db_path()
+    if not db_path:
+        logger.warning("[TONOSAMA RANKING MA] ranking db path unresolved symbol=%s", sym)
+        return pd.DataFrame()
+
+    try:
+        with sqlite3.connect(str(db_path), timeout=1.0) as conn:
+            cols = _table_columns(conn, SNAPSHOT_TABLE)
+            if not cols:
+                logger.warning("[TONOSAMA RANKING MA] table columns empty db=%s table=%s", db_path, SNAPSHOT_TABLE)
+                return pd.DataFrame()
+
+            sym_col = next((c for c in _SYMBOL_COL_CANDIDATES if c in cols), None)
+            time_col = next((c for c in _TIME_COL_CANDIDATES if c in cols), None)
+            price_col = next((c for c in _PRICE_COL_CANDIDATES if c in cols), None)
+            if sym_col is None or time_col is None or price_col is None:
+                logger.warning(
+                    "[TONOSAMA RANKING MA] required columns missing db=%s table=%s sym=%s time=%s price=%s columns=%s",
+                    db_path,
+                    SNAPSHOT_TABLE,
+                    sym_col,
+                    time_col,
+                    price_col,
+                    sorted(cols),
                 )
-                df = pd.read_sql_query(q, conn, params=(sym, int(max(RANKING_MA_LOOKBACK_ROWS, 10))))
-            norm = _normalize_snapshot_df(df, symbol=sym)
-            if not norm.empty:
-                logger.info("[TONOSAMA RANKING MA] loaded from db path=%s symbol=%s rows=%s", db_path, sym, len(norm))
-                return norm
-        except Exception:
-            logger.debug("[TONOSAMA RANKING MA] db load failed path=%s symbol=%s", db_path, sym, exc_info=True)
+                return pd.DataFrame()
+
+            q = (
+                f"SELECT * FROM {_quote_ident(SNAPSHOT_TABLE)} "
+                f"WHERE CAST({_quote_ident(sym_col)} AS TEXT)=? "
+                f"ORDER BY {_quote_ident(time_col)} DESC "
+                f"LIMIT ?"
+            )
+            df = pd.read_sql_query(q, conn, params=(sym, int(max(RANKING_MA_LOOKBACK_ROWS, 10))))
+        norm = _normalize_snapshot_df(df, symbol=sym)
+        if not norm.empty:
+            logger.info("[TONOSAMA RANKING MA] loaded from shared ranking db path=%s table=%s symbol=%s rows=%s", db_path, SNAPSHOT_TABLE, sym, len(norm))
+            return norm
+    except Exception:
+        logger.debug("[TONOSAMA RANKING MA] db load failed path=%s table=%s symbol=%s", db_path, SNAPSHOT_TABLE, sym, exc_info=True)
     return pd.DataFrame()
 
 
@@ -230,6 +275,7 @@ def calc_ranking_snapshot_ma(symbol: str) -> dict[str, Any]:
         "ok": False,
         "symbol": sym,
         "source": "ranking_snapshot_1min",
+        "table": SNAPSHOT_TABLE,
         "rows": 0,
         "latest_dt": None,
         "age_min": None,
@@ -289,8 +335,18 @@ def calc_ranking_snapshot_ma(symbol: str) -> dict[str, Any]:
             result["ok"] = False
             result["reason"] = "ranking_snapshot_stale"
         logger.info(
-            "[TONOSAMA RANKING MA] symbol=%s ok=%s rows=%s latest=%s age_min=%s ma3=%.4f ma5=%.4f ma3_slope=%.6f ma5_slope=%.6f reason=%s",
-            sym, result["ok"], result["rows"], result["latest_dt"], result["age_min"], result["ma3"], result["ma5"], result["ma3_slope"], result["ma5_slope"], result["reason"],
+            "[TONOSAMA RANKING MA] symbol=%s ok=%s table=%s rows=%s latest=%s age_min=%s ma3=%.4f ma5=%.4f ma3_slope=%.6f ma5_slope=%.6f reason=%s",
+            sym,
+            result["ok"],
+            SNAPSHOT_TABLE,
+            result["rows"],
+            result["latest_dt"],
+            result["age_min"],
+            result["ma3"],
+            result["ma5"],
+            result["ma3_slope"],
+            result["ma5_slope"],
+            result["reason"],
         )
         return result
     except Exception:
