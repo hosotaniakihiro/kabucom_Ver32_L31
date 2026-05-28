@@ -1,18 +1,19 @@
 # ============================================================
 # File   : trading/entry_exit/tasks.py
-# Version: Ver2.0-RANKING-ENTRY-TIMEOUT-90SEC
+# Version: Ver2.1-FIX-CONTROLLER-TIMEOUT-LOG
 # ------------------------------------------------------------
 # 【目的】
 #   core.entry_exit_tasks shim から解決される実体モジュール。
+#
+# Ver2.1 Fix:
+#   - _dispatch_entry_controller() の timeout ログで timeout_sec 引数が不足し、
+#     logging error Message/Arguments が出ていた問題を修正。
 #
 # Ver2.0 Fix:
 #   - 14:16ログで ranking_entry が4件pending作成まで到達したが、
 #     実処理68秒に対してscheduler timeout=60秒が先に発生し、
 #     entry_controller dispatch されなかった問題を修正
 #   - RANKING_ENTRY_BUILD_TIMEOUT_SEC 既定を60秒→90秒へ延長
-#
-# Ver1.9:
-#   - RANKING_ENTRY_BUILD_TIMEOUT_SEC 既定を45秒→60秒へ延長
 # ============================================================
 
 from __future__ import annotations
@@ -54,16 +55,6 @@ def _env_bool(name: str, default: bool) -> bool:
         return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
     except Exception:
         return bool(default)
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        v = os.getenv(name)
-        if v is None or str(v).strip() == "":
-            return int(default)
-        return int(float(v))
-    except Exception:
-        return int(default)
 
 
 def _entry_source(entry: Any) -> str:
@@ -209,7 +200,7 @@ def _dispatch_entry_controller(*, pipeline_source: str, interval: int | None, ti
     logger.info("[%s] dispatch entry_controller pipeline_source=%s interval=%s timeout_sec=%.3f", reason, pipeline_source, interval, timeout_sec)
     completed, _ret = _run_callable_with_timeout(controller_fn, timeout_sec=timeout_sec, name=f"{reason} CONTROLLER", kwargs=kwargs)
     if not completed:
-        logger.warning("[%s] controller timeout pipeline_source=%s interval=%s timeout_sec=%.3f", reason, pipeline_source, interval)
+        logger.warning("[%s] controller timeout pipeline_source=%s interval=%s timeout_sec=%.3f", reason, pipeline_source, interval, timeout_sec)
         return False
     logger.info("[%s] controller done pipeline_source=%s interval=%s", reason, pipeline_source, interval)
     return True
