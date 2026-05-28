@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/ranking/summary/bootstrap_ohlcv.py
-# Version: Ver1.0-PRODUCTION-RANKING-SUMMARY-BOOTSTRAP-OHLCV
+# Version: Ver1.1-PRODUCTION-RANKING-SUMMARY-BOOTSTRAP-OHLCV-DATETIME-FORMAT
 # ------------------------------------------------------------
 # 【概要】
 #   ranking snapshot から 1min 擬似OHLCVを作成
@@ -8,11 +8,16 @@
 # 【重要方針】
 #   ranking snapshot は約定足ではないため、
 #   open = high = low = close = snapshot price
+#
+# Ver1.1:
+#   - pd.to_datetime の自動format推定Warningを抑制
+#   - よく使う日時形式を明示的に順番parse
 # ============================================================
 
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import Iterable
 
 import numpy as np
@@ -29,6 +34,19 @@ from trading.ranking.summary.bootstrap_config import (
 )
 
 logger = logging.getLogger(__name__)
+
+_DATETIME_FORMATS: tuple[str, ...] = (
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y/%m/%d %H:%M:%S",
+    "%Y/%m/%d %H:%M",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S.%f",
+    "%Y%m%d%H%M%S",
+    "%Y%m%d%H%M",
+    "%H:%M:%S",
+    "%H:%M",
+)
 
 
 def safe_numeric_series(
@@ -99,6 +117,90 @@ def safe_numeric_series(
         return pd.Series(float(default), index=df.index, dtype="float64")
 
 
+def _normalize_datetime_text(s: pd.Series) -> pd.Series:
+    try:
+        return (
+            s.astype(str)
+            .str.strip()
+            .str.replace("/", "-", regex=False)
+            .str.replace("T", " ", regex=False)
+            .str.replace("Z", "", regex=False)
+            .replace(
+                {
+                    "": np.nan,
+                    "None": np.nan,
+                    "none": np.nan,
+                    "NULL": np.nan,
+                    "null": np.nan,
+                    "nan": np.nan,
+                    "NaN": np.nan,
+                    "<NA>": np.nan,
+                    "pd.NA": np.nan,
+                    "NaT": np.nan,
+                }
+            )
+        )
+    except Exception:
+        return s
+
+
+def _parse_datetime_series(s: pd.Series, *, index: pd.Index) -> pd.Series:
+    """Warningを出さずに日時Seriesをparseする。
+
+    pandasの自動推定Warningを避けるため、既知formatを順番に試す。
+    残りだけ最後に warnings 抑制付きでfallback parseする。
+    """
+    if s is None:
+        return pd.Series(pd.NaT, index=index)
+
+    try:
+        if pd.api.types.is_datetime64_any_dtype(s):
+            return pd.to_datetime(s, errors="coerce")
+    except Exception:
+        pass
+
+    raw = _normalize_datetime_text(pd.Series(s, index=index))
+    out = pd.Series(pd.NaT, index=index, dtype="datetime64[ns]")
+
+    # Excel/Unix serialのような数値は通常入らない想定だが、念のため秒/ミリ秒epochだけ拾う。
+    try:
+        numeric = pd.to_numeric(raw, errors="coerce")
+        num_mask = numeric.notna() & raw.astype(str).str.match(r"^\d+(\.0+)?$", na=False)
+        if bool(num_mask.any()):
+            # 13桁以上はms、それ以外は秒扱い。ただしYYYYMMDDHHMM系はformat側に任せる。
+            lens = raw.astype(str).str.replace(r"\.0+$", "", regex=True).str.len()
+            epoch_mask = num_mask & lens.isin([10, 13])
+            if bool(epoch_mask.any()):
+                unit = "ms" if int(lens[epoch_mask].max()) >= 13 else "s"
+                out.loc[epoch_mask] = pd.to_datetime(numeric.loc[epoch_mask], unit=unit, errors="coerce")
+    except Exception:
+        pass
+
+    remaining = out.isna() & raw.notna()
+    for fmt in _DATETIME_FORMATS:
+        if not bool(remaining.any()):
+            break
+        try:
+            parsed = pd.to_datetime(raw.loc[remaining], format=fmt, errors="coerce")
+            hit = parsed.notna()
+            if bool(hit.any()):
+                out.loc[parsed.index[hit]] = parsed.loc[hit]
+                remaining = out.isna() & raw.notna()
+        except Exception:
+            continue
+
+    if bool(remaining.any()):
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="Could not infer format.*", category=UserWarning)
+                parsed = pd.to_datetime(raw.loc[remaining], errors="coerce")
+            out.loc[parsed.index] = parsed
+        except Exception:
+            pass
+
+    return out
+
+
 def safe_datetime_series(df: pd.DataFrame, col: str) -> pd.Series:
     if df is None or not isinstance(df, pd.DataFrame):
         return pd.Series(dtype="datetime64[ns]")
@@ -112,7 +214,7 @@ def safe_datetime_series(df: pd.DataFrame, col: str) -> pd.Series:
             if s.shape[1] == 0:
                 return pd.Series(pd.NaT, index=df.index)
             s = s.iloc[:, 0]
-        return pd.to_datetime(s, errors="coerce")
+        return _parse_datetime_series(pd.Series(s, index=df.index), index=df.index)
     except Exception:
         logger.exception("[RANKING SUMMARY BOOTSTRAP OHLCV] datetime conversion failed col=%s", col)
         return pd.Series(pd.NaT, index=df.index)
@@ -225,7 +327,7 @@ def normalize_datetime(df: pd.DataFrame) -> pd.DataFrame:
         x["datetime"] = x["datetime"].fillna(end_time)
 
     x = x.dropna(subset=["datetime"]).copy()
-    x["datetime"] = pd.to_datetime(x["datetime"], errors="coerce").dt.floor("min")
+    x["datetime"] = safe_datetime_series(x, "datetime").dt.floor("min")
     x = x.dropna(subset=["datetime"]).copy()
 
     return x
