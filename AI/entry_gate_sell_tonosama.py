@@ -1,14 +1,20 @@
 # ============================================================
 # File: AI/entry_gate_sell_tonosama.py
-# Version: PRODUCTION-STABLE-V2-COMPAT-SYMBOL-OR-FEATURE-ROW
+# Version: PRODUCTION-STABLE-V3-MODEL-MISSING-RULE-FALLBACK
 # ------------------------------------------------------------
 # 殿様イナゴ（SELL）専用 ENTRY ゲート
 #
-# ✔ LightGBM 60秒分類モデル（下げ）を使用
-# ✔ feature_row dict / symbol str の両方を受け付ける
-# ✔ entry_controller が allow_sell_tonosama_entry(symbol) と呼ぶ既存実装に対応
-# ✔ pending_entries の TONOSAMA entry から最低限の特徴量を復元
-# ✔ モデル/特徴量不足時は fail-closed
+# V3:
+#   - sell_tonosama_lgbm.txt が未配置の場合、FileNotFoundErrorで例外ログを
+#     出して全SELL TONOSAMAが止まっていた。
+#   - モデルが無い場合だけ、安全側のルールfallbackへ切替える。
+#   - fallback条件:
+#       minute_from_open >= 10
+#       spread_ratio <= 0.004
+#       sell_pressure >= 1.0
+#       volume_drop >= 1.0
+#       price_velocity <= 0.0 または rank_fall >= 0.0
+#   - モデルが存在する場合は従来通りLightGBMを使用。
 # ============================================================
 
 from __future__ import annotations
@@ -30,6 +36,7 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 MODEL_PATH = os.environ.get("SELL_TONOSAMA_MODEL_PATH", "sell_tonosama_lgbm.txt")
+ALLOW_RULE_FALLBACK = os.environ.get("SELL_TONOSAMA_ALLOW_RULE_FALLBACK", "1").strip().lower() in {"1", "true", "yes", "on", "ok"}
 
 FEATURES = [
     "price_velocity",
@@ -45,7 +52,12 @@ MIN_SCORE = 1.30
 MAX_SPREAD_RATIO = 0.004
 NO_SELL_BEFORE_MIN = 10
 
+FALLBACK_MIN_SELL_PRESSURE = float(os.environ.get("SELL_TONOSAMA_FALLBACK_MIN_SELL_PRESSURE", "1.0"))
+FALLBACK_MIN_VOLUME_DROP = float(os.environ.get("SELL_TONOSAMA_FALLBACK_MIN_VOLUME_DROP", "1.0"))
+FALLBACK_MAX_SPREAD_RATIO = float(os.environ.get("SELL_TONOSAMA_FALLBACK_MAX_SPREAD_RATIO", str(MAX_SPREAD_RATIO)))
+
 _model: lgb.Booster | None = None
+_model_missing_logged = False
 
 
 # ============================================================
@@ -187,16 +199,62 @@ def _resolve_feature_row(feature_or_symbol: Any) -> Dict[str, float]:
 
 
 # ============================================================
-# model
+# model / fallback
 # ============================================================
 
-def _load_model() -> lgb.Booster:
-    global _model
-    if _model is None:
-        if not os.path.exists(MODEL_PATH):
-            raise FileNotFoundError(f"model not found: {MODEL_PATH}")
-        _model = lgb.Booster(model_file=MODEL_PATH)
+def _load_model() -> lgb.Booster | None:
+    global _model, _model_missing_logged
+    if _model is not None:
+        return _model
+    if not os.path.exists(MODEL_PATH):
+        if not _model_missing_logged:
+            logger.warning(
+                "[TONOSAMA SELL] model missing path=%s -> rule fallback enabled=%s",
+                MODEL_PATH,
+                ALLOW_RULE_FALLBACK,
+            )
+            _model_missing_logged = True
+        return None
+    _model = lgb.Booster(model_file=MODEL_PATH)
     return _model
+
+
+def _rule_fallback(row: Dict[str, float]) -> bool:
+    minute_from_open = _safe_float(row.get("minute_from_open"), 0.0)
+    price_velocity = _safe_float(row.get("price_velocity"), 0.0)
+    volume_drop = _safe_float(row.get("volume_drop"), 1.0)
+    rank_fall = _safe_float(row.get("rank_fall"), 0.0)
+    sell_pressure = _safe_float(row.get("sell_pressure"), 1.0)
+    spread_ratio = _safe_float(row.get("spread_ratio"), 0.0)
+
+    if minute_from_open < NO_SELL_BEFORE_MIN:
+        ok = False
+        reason = "before_open_guard"
+    elif spread_ratio > FALLBACK_MAX_SPREAD_RATIO:
+        ok = False
+        reason = "spread_too_wide"
+    elif sell_pressure < FALLBACK_MIN_SELL_PRESSURE:
+        ok = False
+        reason = "sell_pressure_low"
+    elif volume_drop < FALLBACK_MIN_VOLUME_DROP:
+        ok = False
+        reason = "volume_drop_low"
+    else:
+        ok = bool(price_velocity <= 0.0 or rank_fall >= 0.0)
+        reason = "rule_ok" if ok else "no_downward_or_rank_fall_signal"
+
+    logger.info(
+        "[TONOSAMA SELL] rule fallback ok=%s reason=%s price_velocity=%.6f volume_drop=%.4f rank_fall=%.4f sell_pressure=%.4f spread_ratio=%.6f minute=%.1f",
+        ok,
+        reason,
+        price_velocity,
+        volume_drop,
+        rank_fall,
+        sell_pressure,
+        spread_ratio,
+        minute_from_open,
+    )
+    return ok
 
 
 # ============================================================
@@ -226,8 +284,14 @@ def allow_sell_tonosama_entry(feature_row: Dict[str, float] | str) -> bool:
             logger.info("[TONOSAMA SELL] blocked before open+%smin minute=%.1f", NO_SELL_BEFORE_MIN, minute_from_open)
             return False
 
-        x = np.array([[float(row[f]) for f in FEATURES]], dtype=float)
         model = _load_model()
+        if model is None:
+            if not ALLOW_RULE_FALLBACK:
+                logger.info("[TONOSAMA SELL] model missing and fallback disabled -> deny row=%s", row)
+                return False
+            return _rule_fallback(row)
+
+        x = np.array([[float(row[f]) for f in FEATURES]], dtype=float)
         prob = float(model.predict(x)[0])
 
         sell_pressure = _safe_float(row.get("sell_pressure"), 0.0)
@@ -250,6 +314,8 @@ def allow_sell_tonosama_entry(feature_row: Dict[str, float] | str) -> bool:
 
     except Exception:
         logger.exception("[TONOSAMA SELL] gate failed row=%s", row)
+        if ALLOW_RULE_FALLBACK:
+            return _rule_fallback(row)
         return False
 
 
