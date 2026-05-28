@@ -1,17 +1,21 @@
 # ============================================================
 # File: config/ranking_entry_config.py
-# Ver : RANKING-ONLY-ENTRY-CONFIG-v5.2.0-RESTART-SAFE
+# Ver : RANKING-ONLY-ENTRY-CONFIG-v5.3.0-EARLY-SESSION-RELAX
 # ------------------------------------------------------------
 # Ranking ENTRY 専用設定ファイル
+#
+# Ver5.3.0:
+#   - 2026-05-28 09:07〜09:10ログで ranking prefilter 後101件が全落ち。
+#   - 主因は寄り付き直後の履歴不足/短期ノイズに対して、
+#       RANK_WORSE / RECENT_HIGH_LOW / slope=0 NG / MA5-MA25 厳格判定
+#     が強すぎること。
+#   - 価格/出来高/売買代金/ランキング上位/日中方向は維持しつつ、
+#     まず候補を entry_controller へ流せるようランキング専用条件を緩和する。
 #
 # Ver5.2.0:
 #   - 再起動直後に in-memory ranking_entry_history が空だと、
 #     NO_PREVIOUS_RANKING_SNAPSHOT で134件以上が一括DROPされる問題を修正。
 #   - ランキングDB fallback/prefilter が動いているため、前回メモリ履歴を必須にしない。
-#   - ランク悪化チェック・価格ブレイクアウトチェックは、履歴がある場合のみ効く。
-#
-# Ver5.1.1:
-#   - NO_ENTRY_AFTER を 14:30 → 15:20 に変更。
 # ============================================================
 
 from datetime import time, datetime
@@ -30,9 +34,12 @@ RANKING_ENTRY_CONFIG = {
         "MIN_CONSECUTIVE_APPEAR": 1,
         "PRICE_BREAKOUT_WINDOW": 3,
         "REQUIRE_PREVIOUS_SNAPSHOT": False,
-        "REQUIRE_RANK_NOT_WORSE": True,
-        "REQUIRE_PRICE_BREAKOUT": True,
-        # 価格横ばい時の救済: ranking_entry_flat_price_guard_patch が参照。
+        # 09:05〜09:30は履歴が短く RANK_WORSE が過剰に効くため、
+        # entry_from_ranking 側で履歴が十分な場合のみ参考にする。
+        "REQUIRE_RANK_NOT_WORSE": False,
+        # ランキング由来はランキング情報と現在値が主情報。直近高値/安値突破を必須にすると
+        # 寄り付き直後に BUY_NOT_RECENT_HIGH / SELL_NOT_RECENT_LOW で全落ちするため緩和。
+        "REQUIRE_PRICE_BREAKOUT": False,
         "FLAT_PRICE_ALLOW_MAX_RANK": 12,
     },
 
@@ -48,7 +55,8 @@ RANKING_ENTRY_CONFIG = {
     },
 
     "PRICE_MOVE": {
-        "MAX_STEP_MOVE_PCT": 1.0,
+        # 09:07〜09:10では step_pct が1%を少し超えるだけで上位候補が落ちていたため緩和。
+        "MAX_STEP_MOVE_PCT": 2.0,
         "MAX_DAY_CHANGE_PCT": 10.0,
         "BUY_MIN_DAY_CHANGE_PCT": 0.0,
         "SELL_MAX_DAY_CHANGE_PCT": 0.0,
@@ -59,9 +67,11 @@ RANKING_ENTRY_CONFIG = {
         "REQUIRE_READY": False,
         "REQUIRE_DIRECTION": True,
         "REQUIRE_CLOSE_VS_MA5": True,
-        "REQUIRE_MA5_MA25": True,
+        # 09:05〜09:30は ma5/ma25 が同値または本数不足になりやすいので必須を外す。
+        "REQUIRE_MA5_MA25": False,
         "REQUIRE_SLOPE": True,
-        "MIN_SLOPE": 0.0001,
+        # slope=0.000000 で SELL/BUY が一括NGになっていたため、0を中立として許容。
+        "MIN_SLOPE": 0.0,
         "REQUIRE_MACD_SIGNAL": False,
         "BUY_RSI_MAX": 82.0,
         "SELL_RSI_MIN": 18.0,
