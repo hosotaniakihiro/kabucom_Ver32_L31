@@ -1,17 +1,18 @@
 # ============================================================
 # File   : trading/entry/tonosama/volume_surge.py
-# Version: Ver2.3-TONOSAMA-CONTROLLED-SURGE-FAILOPEN
+# Version: Ver2.4-TONOSAMA-1M-STREAK-FEATURES
 # ------------------------------------------------------------
 # 目的:
 #   殿様エントリー用の出来高急増・価格変化特徴量を作る。
 #
 # Ver2.3:
-#   - Ver2.2 の「履歴不足なら必ず候補0」を緩和。
-#   - TONOSAMA_FORCE_SURGE_FAILOPEN / TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY /
-#     TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING のいずれかが有効なら、
-#     3m/5mの出来高履歴不足時も controlled fail-open で候補を作る。
-#   - fail-open値は TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE 既定3.0。
-#   - その後 runner.py 側の latest_volume / price_change / slope / 5秒足 / AI fallback で絞る。
+#   - 3m/5mの出来高履歴不足時も controlled fail-open で候補を作る。
+#
+# Ver2.4:
+#   - 1分足の連続上昇/連続下落本数を特徴量として追加。
+#   - BUY: 直前まで1分足が3本以上連続上昇した後の高値追いを避けるため。
+#   - SELL: 直前まで1分足が3本以上連続下落した後の安値追いを避けるため。
+#   - runner.py / pending_writer.py 側で _prev_1m_up_streak / _prev_1m_down_streak を利用する。
 # ============================================================
 
 from __future__ import annotations
@@ -143,6 +144,64 @@ def _intrabar_price_change_pct(df: pd.DataFrame, interval: int) -> pd.Series:
         return pd.Series(pd.NA, index=df.index if df is not None else None, dtype="float64")
 
 
+def _consecutive_true_counts(values: pd.Series) -> pd.Series:
+    cnt = 0
+    out: list[int] = []
+    for v in values.fillna(False).astype(bool).tolist():
+        if v:
+            cnt += 1
+        else:
+            cnt = 0
+        out.append(cnt)
+    return pd.Series(out, index=values.index, dtype="int64")
+
+
+def _add_1m_streak_features(out: pd.DataFrame, df1: pd.DataFrame) -> pd.DataFrame:
+    if out is None or out.empty:
+        return pd.DataFrame()
+    if df1 is None or df1.empty or "symbol" not in df1.columns or "datetime" not in df1.columns or "close" not in df1.columns:
+        x = out.copy()
+        x["_prev_1m_up_streak"] = 0
+        x["_prev_1m_down_streak"] = 0
+        x["_prev_1m_last_delta_pct"] = 0.0
+        return x
+    try:
+        h = df1.copy()
+        h["datetime"] = pd.to_datetime(h["datetime"], errors="coerce")
+        h["close"] = pd.to_numeric(h["close"], errors="coerce")
+        h = h.dropna(subset=["symbol", "datetime", "close"]).sort_values(["symbol", "datetime"])
+        if h.empty:
+            x = out.copy()
+            x["_prev_1m_up_streak"] = 0
+            x["_prev_1m_down_streak"] = 0
+            x["_prev_1m_last_delta_pct"] = 0.0
+            return x
+        h["_prev_close_for_streak"] = h.groupby("symbol")["close"].shift(1)
+        h["_prev_1m_last_delta_pct"] = ((h["close"] - h["_prev_close_for_streak"]) / h["_prev_close_for_streak"].replace(0, pd.NA) * 100.0).replace([float("inf"), -float("inf")], pd.NA).fillna(0.0)
+        h["_is_1m_up"] = h["close"] > h["_prev_close_for_streak"]
+        h["_is_1m_down"] = h["close"] < h["_prev_close_for_streak"]
+        h["_prev_1m_up_streak"] = h.groupby("symbol", group_keys=False)["_is_1m_up"].apply(_consecutive_true_counts)
+        h["_prev_1m_down_streak"] = h.groupby("symbol", group_keys=False)["_is_1m_down"].apply(_consecutive_true_counts)
+        latest = h.sort_values(["symbol", "datetime"]).groupby("symbol", group_keys=False).tail(1)[["symbol", "_prev_1m_up_streak", "_prev_1m_down_streak", "_prev_1m_last_delta_pct"]]
+        x = out.merge(latest, on="symbol", how="left")
+        for c in ["_prev_1m_up_streak", "_prev_1m_down_streak"]:
+            x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0).astype(int)
+        x["_prev_1m_last_delta_pct"] = pd.to_numeric(x["_prev_1m_last_delta_pct"], errors="coerce").fillna(0.0)
+        logger.warning(
+            "[TONOSAMA SURGE] 1m streak features attached rows=%s up_ge3=%s down_ge3=%s head=%s",
+            len(x), int((x["_prev_1m_up_streak"] >= 3).sum()), int((x["_prev_1m_down_streak"] >= 3).sum()),
+            x[[c for c in ["symbol", "symbolname", "close", "_prev_1m_up_streak", "_prev_1m_down_streak", "_prev_1m_last_delta_pct"] if c in x.columns]].head(12).to_dict("records"),
+        )
+        return x
+    except Exception:
+        logger.exception("[TONOSAMA SURGE] add 1m streak features failed")
+        x = out.copy()
+        x["_prev_1m_up_streak"] = 0
+        x["_prev_1m_down_streak"] = 0
+        x["_prev_1m_last_delta_pct"] = 0.0
+        return x
+
+
 def add_volume_surge_features(df: pd.DataFrame, *, interval: int) -> pd.DataFrame:
     x = normalize_summary_base(df, interval=interval)
     x = _filter_recent_rows(x, interval=interval, label="feature_source")
@@ -272,6 +331,7 @@ def build_scalping_feature_df() -> pd.DataFrame:
     out = df1.dropna(subset=["datetime"]).sort_values(["symbol", "datetime"]).groupby("symbol", group_keys=False).tail(1).copy()
     if out.empty:
         return pd.DataFrame()
+    out = _add_1m_streak_features(out, df1)
     if not df3.empty:
         out = out.merge(df3, on="symbol", how="left")
     if not df5.empty:
@@ -298,7 +358,7 @@ def build_scalping_feature_df() -> pd.DataFrame:
     try:
         history_missing = out.get("_volume_surge_history_missing", pd.Series(False, index=out.index)).fillna(False).astype(bool)
         failopen_col = out.get("_volume_surge_failopen", pd.Series(False, index=out.index)).fillna(False).astype(bool)
-        logger.warning("[TONOSAMA SURGE] feature summary rows=%s vol_cols=%s price_cols=%s volume_surge_nonzero=%s price_change_nonzero=%s history_missing_rows=%s failopen_rows=%s price_fallback_rows=%s failopen_reason=%s raw1_latest=%s head=%s", len(out), vol_cols, price_cols, int((out["_max_volume_surge_ratio"].fillna(0) != 0).sum()), int((out["_max_price_change_pct"].fillna(0) != 0).sum()), int(history_missing.sum()), int(failopen_col.sum()), int(out.get("_price_change_fallback_1m", pd.Series(False, index=out.index)).fillna(False).astype(bool).sum()), _failopen_reason(), raw1_info.get("latest_dt"), out[[c for c in ["symbol", "symbolname", "close", "_max_volume_surge_ratio", "_max_price_change_pct", "_surge_tf", "_volume_surge_history_missing", "_volume_surge_failopen", "_price_change_fallback_1m"] if c in out.columns]].head(12).to_dict("records"))
+        logger.warning("[TONOSAMA SURGE] feature summary rows=%s vol_cols=%s price_cols=%s volume_surge_nonzero=%s price_change_nonzero=%s up_streak_ge3=%s down_streak_ge3=%s history_missing_rows=%s failopen_rows=%s price_fallback_rows=%s failopen_reason=%s raw1_latest=%s head=%s", len(out), vol_cols, price_cols, int((out["_max_volume_surge_ratio"].fillna(0) != 0).sum()), int((out["_max_price_change_pct"].fillna(0) != 0).sum()), int((out.get("_prev_1m_up_streak", pd.Series(0, index=out.index)).fillna(0) >= 3).sum()), int((out.get("_prev_1m_down_streak", pd.Series(0, index=out.index)).fillna(0) >= 3).sum()), int(history_missing.sum()), int(failopen_col.sum()), int(out.get("_price_change_fallback_1m", pd.Series(False, index=out.index)).fillna(False).astype(bool).sum()), _failopen_reason(), raw1_info.get("latest_dt"), out[[c for c in ["symbol", "symbolname", "close", "_max_volume_surge_ratio", "_max_price_change_pct", "_prev_1m_up_streak", "_prev_1m_down_streak", "_prev_1m_last_delta_pct", "_surge_tf", "_volume_surge_history_missing", "_volume_surge_failopen", "_price_change_fallback_1m"] if c in out.columns]].head(12).to_dict("records"))
     except Exception:
         logger.debug("[TONOSAMA SURGE] feature summary log failed", exc_info=True)
     return out.reset_index(drop=True)
