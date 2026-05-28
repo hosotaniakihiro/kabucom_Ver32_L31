@@ -1,6 +1,6 @@
 # ============================================================
 # File   : utils/alerts_util.py
-# Version: Ver3.2-PRODUCTION-DISCORD-FINAL-DF-TITLE-GUARD
+# Version: Ver3.3-PRODUCTION-DISCORD-FINAL-DF-BLOCK-GUARD
 # ------------------------------------------------------------
 # ✔ 既存機能完全保持（削除ゼロ）
 # ✔ Discord 429 RateLimit完全対策
@@ -12,7 +12,8 @@
 # ✔ 長文自動分割対応
 # ✔ 例外耐性強化
 # ✔ 最終防衛: SUMMARY/AI PASSED 系の横長1行通知を送信直前に3行化
-# ✔ 最終防衛: interval_label に DataFrame が入ったAI見出しを送信直前に修復
+# ✔ 最終防衛: interval_label に DataFrame が入った見出しを送信直前に修復
+# ✔ 最終防衛: 見出し直後に DataFrame repr 本体が混入したブロックを丸ごと削除
 # ============================================================
 
 from __future__ import annotations
@@ -84,6 +85,15 @@ def _resolve_webhook_url(webhook_url: Optional[str] = None) -> str:
 # Discord summary final formatter
 # ------------------------------------------------------------
 
+_TITLE_WORDS = (
+    "SUMMARY TOP10",
+    "PUSH SUMMARY TOP10",
+    "RANKING SUMMARY TOP10",
+    "AI PASSED BUY CANDIDATES",
+    "AI PASSED SELL CANDIDATES",
+    "AI PASSED EXIT CANDIDATES",
+)
+
 _SUMMARY_ONE_LINE_RE = re.compile(
     r"^(?P<prefix>\s*(?:[🟦🟥🔴🔵🟩🟨⬛⬜🟧🟪]\s*)?\d+\.\s+)"
     r"(?P<head>.*?)\s+"
@@ -111,6 +121,93 @@ _DF_TITLE_RE = re.compile(
 
 _DF_REPR_LINE_RE = re.compile(r"^\s*(?:\.\.\.|\d+)\s+\S+\s+.*\.\.\.\s+.*$")
 _ROWS_COLS_LINE_RE = re.compile(r"^\s*\[\s*\d+\s+rows\s+x\s+\d+\s+columns\s*\]\)?\s*=*\s*$", re.IGNORECASE)
+_HEADER_WITH_DF_START_RE = re.compile(r"^(?P<head>.*?(?:SUMMARY TOP10|AI PASSED BUY CANDIDATES|AI PASSED SELL CANDIDATES|AI PASSED EXIT CANDIDATES).*?)(?:\(|\s+)\s*symbol\s+", re.IGNORECASE)
+
+
+def _contains_summary_title(line: str) -> bool:
+    u = _safe_str(line).upper()
+    return any(w in u for w in _TITLE_WORDS)
+
+
+def _looks_like_df_header_start(line: str) -> bool:
+    s = _safe_str(line)
+    return _contains_summary_title(s) and "symbol" in s.lower() and ("..." in s or " id" in s.lower() or "ai_confidence" in s.lower())
+
+
+def _clean_title_from_df_start(line: str) -> str:
+    """DataFrame repr が付いた見出し行を安全な見出しへ戻す。"""
+    s = _safe_str(line).rstrip()
+    upper = s.upper()
+    title = None
+    for w in _TITLE_WORDS:
+        if w in upper:
+            title = w
+            break
+    if not title:
+        return "📊 SUMMARY TOP10 1min"
+
+    emoji = "🤖 " if "AI PASSED" in title else "📊 "
+    if s.lstrip().startswith("="):
+        return f"========== {emoji}{title} (1min) =========="
+    return f"{emoji}{title} 1min"
+
+
+def _strip_dataframe_repr_blocks(text: str) -> str:
+    """
+    DataFrame repr が見出しに混入したブロックを丸ごと削除/修復する。
+
+    対象例:
+      📊 SUMMARY TOP10      symbol id ...
+      0 1301 ...
+      ...
+      [4109 rows x 173 columns]
+
+      ========== 🤖 AI PASSED SELL CANDIDATES (     symbol id ...
+      ...
+      [4109 rows x 173 columns]) ==========
+    """
+    try:
+        s = _safe_str(text)
+        if "rows x" not in s and "columns" not in s and "symbol" not in s.lower():
+            return s
+
+        lines = s.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        out: list[str] = []
+        skipping_df = False
+        skip_replaced = False
+
+        for line in lines:
+            raw = line.rstrip()
+
+            if skipping_df:
+                if _ROWS_COLS_LINE_RE.match(raw) or "rows x" in raw:
+                    skipping_df = False
+                    skip_replaced = False
+                continue
+
+            if _looks_like_df_header_start(raw):
+                clean = _clean_title_from_df_start(raw)
+                if not out or out[-1] != clean:
+                    out.append(clean)
+                skipping_df = True
+                skip_replaced = True
+                continue
+
+            if _DF_REPR_LINE_RE.match(raw):
+                continue
+            if _ROWS_COLS_LINE_RE.match(raw):
+                continue
+            if "..." in raw and "NaN" in raw and len(raw) > 40:
+                continue
+            if raw.strip().startswith("...") and "..." in raw:
+                continue
+
+            out.append(raw)
+
+        return "\n".join(out)
+    except Exception:
+        logger.debug("[DISCORD FINAL FORMATTER] strip dataframe blocks failed", exc_info=True)
+        return text
 
 
 def _summary_reason_to_ja(reason: str, *, buy: str, sell: str, slope: str, mtf: str, rsi: str, macd: str) -> str:
@@ -193,25 +290,15 @@ def _normalize_summary_one_line(line: str) -> str:
 
 
 def _normalize_bad_dataframe_titles(text: str) -> str:
-    """見出しの括弧内に DataFrame repr が入った場合、(1min) に修復する。"""
+    """見出しの括弧内・直後に DataFrame repr が入った場合、(1min) に修復する。"""
     try:
         s = _safe_str(text)
-        if "rows x" not in s or "columns" not in s:
+        if "rows x" not in s and "columns" not in s and "symbol" not in s.lower():
             return s
 
         s = _DF_TITLE_RE.sub(lambda m: f"{m.group('head')}(1min) {m.group('tail')}", s)
-
-        # 念のため、チャンク境界などで残ったDataFrame表の行だけを削除する。
-        out: list[str] = []
-        for line in s.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-            if _DF_REPR_LINE_RE.match(line):
-                continue
-            if _ROWS_COLS_LINE_RE.match(line):
-                continue
-            if "..." in line and "NaN" in line and len(line) > 40:
-                continue
-            out.append(line)
-        return "\n".join(out)
+        s = _strip_dataframe_repr_blocks(s)
+        return s
     except Exception:
         logger.debug("[DISCORD FINAL FORMATTER] dataframe title normalize failed", exc_info=True)
         return text
@@ -224,9 +311,6 @@ def _normalize_discord_summary_text(text: str) -> str:
         s = _safe_str(text)
         s = _normalize_bad_dataframe_titles(s)
 
-        # SUMMARY/AI候補以外は触らない。ただし、横長候補行単体は対象にする。
-        if "score=" not in s.lower() or "理由=" not in s:
-            return s
         lines = s.replace("\r\n", "\n").replace("\r", "\n").split("\n")
         out = [_normalize_summary_one_line(line) for line in lines]
         return "\n".join(out)
