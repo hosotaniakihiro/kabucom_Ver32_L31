@@ -1,9 +1,17 @@
 # ============================================================
 # File   : core/startup/low_movement_entry_guard_patch.py
-# Version: Ver12-TONOSAMA-INTRABAR-RANGE-FALLBACK
+# Version: Ver13-TONOSAMA-HIGH-PRICE-RANGE-RELAX
 # ------------------------------------------------------------
 # あまり動かない銘柄へのエントリーを発注直前で止める。
 # さらに、ランキング方向に逆らうエントリーも禁止する。
+#
+# Ver13:
+#   - TONOSAMA pending が最終段で LOW_MOVE_MAX_ENTRY_PRICE=7000 により
+#     price_out_of_range で落ちる問題を修正
+#   - TONOSAMA のみ価格上限を LOW_MOVE_TONOSAMA_MAX_ENTRY_PRICE=12000 へ拡張
+#   - TONOSAMA のみ range_5m_filter が RANGE不足で False を返しても、
+#     直後の low movement guard 側で再判定する
+#   - 通常 SUMMARY/RANKING の低変動ガードは従来どおり
 #
 # Ver12:
 #   - TONOSAMA pending は high/low が entry_row に渡らないことがある
@@ -51,6 +59,16 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
 def _row_to_dict(row: Any) -> dict:
     try:
         if row is None:
@@ -85,6 +103,20 @@ def _norm_symbol(v: Any) -> str:
         return s
     except Exception:
         return ""
+
+
+def _norm_text(v: Any) -> str:
+    try:
+        return str(v or "").strip().upper()
+    except Exception:
+        return ""
+
+
+def _is_tonosama_entry(row_or_entry: Any) -> bool:
+    row = _row_to_dict(row_or_entry)
+    src = _norm_text(_first(row, ("source", "entry_source", "pipeline_source"), ""))
+    et = _norm_text(_first(row, ("entry_type", "type", "entry_kind"), ""))
+    return src == "TONOSAMA" or et == "TONOSAMA"
 
 
 def _range_pct_from_row(row: dict) -> float:
@@ -204,6 +236,7 @@ def _call_entry_direction_confirm(entry_row: Any) -> bool:
 def _low_movement_guard(entry_row: Any) -> bool:
     row = _row_to_dict(entry_row)
     symbol = _norm_symbol(_first(row, ("symbol", "code", "stock_code"), ""))
+    source_tonosama = _is_tonosama_entry(row)
     close = _safe_float(_first(row, ("close_price", "close", "price", "current_price"), 0.0), 0.0)
     high = _safe_float(_first(row, ("high_price", "high"), 0.0), 0.0)
     low = _safe_float(_first(row, ("low_price", "low"), 0.0), 0.0)
@@ -212,8 +245,18 @@ def _low_movement_guard(entry_row: Any) -> bool:
         logger.warning("[LOW MOVE GUARD] NG symbol=%s reason=no_close close=%s", symbol, close)
         return False
 
-    if close < _env_float("LOW_MOVE_MIN_ENTRY_PRICE", 1500.0) or close > _env_float("LOW_MOVE_MAX_ENTRY_PRICE", 7000.0):
-        logger.warning("[LOW MOVE GUARD] NG symbol=%s reason=price_out_of_range close=%.1f", symbol, close)
+    if source_tonosama:
+        min_price = _env_float("LOW_MOVE_TONOSAMA_MIN_ENTRY_PRICE", _env_float("LOW_MOVE_MIN_ENTRY_PRICE", 1500.0))
+        max_price = _env_float("LOW_MOVE_TONOSAMA_MAX_ENTRY_PRICE", 12000.0)
+    else:
+        min_price = _env_float("LOW_MOVE_MIN_ENTRY_PRICE", 1500.0)
+        max_price = _env_float("LOW_MOVE_MAX_ENTRY_PRICE", 7000.0)
+
+    if close < min_price or close > max_price:
+        logger.warning(
+            "[LOW MOVE GUARD] NG symbol=%s reason=price_out_of_range close=%.1f min_price=%.1f max_price=%.1f tonosama=%s",
+            symbol, close, min_price, max_price, source_tonosama,
+        )
         return False
 
     range_pct = 0.0
@@ -238,13 +281,17 @@ def _low_movement_guard(entry_row: Any) -> bool:
         )
 
     split = _env_float("LOW_MOVE_TIER_SPLIT_PRICE", 3000.0)
-    min_range_pct = _env_float("LOW_MOVE_MIN_RANGE_PCT_LOW_PRICE", 0.015) if close < split else _env_float("LOW_MOVE_MIN_RANGE_PCT_HIGH_PRICE", 0.008)
-    strong_range_pct = _env_float("LOW_MOVE_STRONG_RANGE_PCT", 0.020)
+    if source_tonosama:
+        min_range_pct = _env_float("LOW_MOVE_TONOSAMA_MIN_RANGE_PCT", 0.006)
+        strong_range_pct = _env_float("LOW_MOVE_TONOSAMA_STRONG_RANGE_PCT", 0.012)
+    else:
+        min_range_pct = _env_float("LOW_MOVE_MIN_RANGE_PCT_LOW_PRICE", 0.015) if close < split else _env_float("LOW_MOVE_MIN_RANGE_PCT_HIGH_PRICE", 0.008)
+        strong_range_pct = _env_float("LOW_MOVE_STRONG_RANGE_PCT", 0.020)
 
     if range_pct < min_range_pct:
         logger.warning(
-            "[LOW MOVE GUARD] NG symbol=%s reason=range_too_small close=%.1f high=%.1f low=%.1f range_pct=%.4f min=%.4f source=%s",
-            symbol, close, high, low, range_pct, min_range_pct, range_source,
+            "[LOW MOVE GUARD] NG symbol=%s reason=range_too_small close=%.1f high=%.1f low=%.1f range_pct=%.4f min=%.4f source=%s tonosama=%s",
+            symbol, close, high, low, range_pct, min_range_pct, range_source, source_tonosama,
         )
         return False
 
@@ -259,29 +306,32 @@ def _low_movement_guard(entry_row: Any) -> bool:
 
     if slope_values:
         abs_slope = max_abs_slope
-        min_abs_slope = _env_float("LOW_MOVE_MIN_ABS_SLOPE_LOW_PRICE", 0.0003) if close < split else _env_float("LOW_MOVE_MIN_ABS_SLOPE_HIGH_PRICE", 0.0002)
+        if source_tonosama:
+            min_abs_slope = _env_float("LOW_MOVE_TONOSAMA_MIN_ABS_SLOPE", 0.0001)
+        else:
+            min_abs_slope = _env_float("LOW_MOVE_MIN_ABS_SLOPE_LOW_PRICE", 0.0003) if close < split else _env_float("LOW_MOVE_MIN_ABS_SLOPE_HIGH_PRICE", 0.0002)
         if abs_slope < min_abs_slope and range_pct < strong_range_pct:
             logger.warning(
-                "[LOW MOVE GUARD] NG symbol=%s reason=slope_too_small close=%.1f abs_slope=%.6f min=%.6f range_pct=%.4f strong_range=%.4f source=%s",
-                symbol, close, abs_slope, min_abs_slope, range_pct, strong_range_pct, range_source,
+                "[LOW MOVE GUARD] NG symbol=%s reason=slope_too_small close=%.1f abs_slope=%.6f min=%.6f range_pct=%.4f strong_range=%.4f source=%s tonosama=%s",
+                symbol, close, abs_slope, min_abs_slope, range_pct, strong_range_pct, range_source, source_tonosama,
             )
             return False
         if abs_slope < min_abs_slope and range_pct >= strong_range_pct:
             logger.warning(
-                "[LOW MOVE GUARD] slope small but allowed by strong range symbol=%s close=%.1f abs_slope=%.6f min=%.6f range_pct=%.4f strong_range=%.4f source=%s",
-                symbol, close, abs_slope, min_abs_slope, range_pct, strong_range_pct, range_source,
+                "[LOW MOVE GUARD] slope small but allowed by strong range symbol=%s close=%.1f abs_slope=%.6f min=%.6f range_pct=%.4f strong_range=%.4f source=%s tonosama=%s",
+                symbol, close, abs_slope, min_abs_slope, range_pct, strong_range_pct, range_source, source_tonosama,
             )
 
     if abs(macd) < 0.0001 and abs(signal) < 0.0001 and max_abs_slope < 0.0001 and range_pct < strong_range_pct:
         logger.warning(
-            "[LOW MOVE GUARD] NG symbol=%s reason=no_momentum macd=%.6f signal=%.6f slope=%.6f range_pct=%.4f strong_range=%.4f source=%s",
-            symbol, macd, signal, max_abs_slope, range_pct, strong_range_pct, range_source,
+            "[LOW MOVE GUARD] NG symbol=%s reason=no_momentum macd=%.6f signal=%.6f slope=%.6f range_pct=%.4f strong_range=%.4f source=%s tonosama=%s",
+            symbol, macd, signal, max_abs_slope, range_pct, strong_range_pct, range_source, source_tonosama,
         )
         return False
 
     logger.info(
-        "[LOW MOVE GUARD] OK symbol=%s close=%.1f range_pct=%.4f min_range=%.4f strong_range=%.4f macd=%.4f signal=%.4f max_abs_slope=%.6f source=%s",
-        symbol, close, range_pct, min_range_pct, strong_range_pct, macd, signal, max_abs_slope, range_source,
+        "[LOW MOVE GUARD] OK symbol=%s close=%.1f range_pct=%.4f min_range=%.4f strong_range=%.4f macd=%.4f signal=%.4f max_abs_slope=%.6f source=%s tonosama=%s",
+        symbol, close, range_pct, min_range_pct, strong_range_pct, macd, signal, max_abs_slope, range_source, source_tonosama,
     )
     return True
 
@@ -304,7 +354,13 @@ def _patched_range_5m_filter(entry_row: Any = None, *args, **kwargs):
         if isinstance(allow, tuple):
             return allow
         if not bool(allow):
-            return False
+            if _is_tonosama_entry(entry_row) and _env_bool("LOW_MOVE_TONOSAMA_IGNORE_ORIG_RANGE_NG", True):
+                logger.warning(
+                    "[LOW MOVE GUARD] original range_5m_filter NG ignored for TONOSAMA; recheck low movement guard. symbol=%s",
+                    _norm_symbol(_first(_row_to_dict(entry_row), ("symbol", "code", "stock_code"), "")),
+                )
+            else:
+                return False
         return _apply_all_entry_guards(entry_row)
     except RecursionError:
         logger.error("[LOW MOVE GUARD] recursion detected in patched range filter. fail-safe NG. Check duplicate wrappers.", exc_info=False)
@@ -334,7 +390,7 @@ def _patched_atr_1m_filter(entry_row: Any = None, *args, **kwargs):
 
 def _is_low_move_wrapped(func: Any) -> bool:
     try:
-        return bool(getattr(func, "_low_move_guard_v2", False) or getattr(func, "_low_move_guard_v1", False) or getattr(func, "_low_move_guard_v12", False))
+        return bool(getattr(func, "_low_move_guard_v2", False) or getattr(func, "_low_move_guard_v1", False) or getattr(func, "_low_move_guard_v12", False) or getattr(func, "_low_move_guard_v13", False))
     except Exception:
         return False
 
@@ -359,7 +415,7 @@ def install() -> bool:
 
         if callable(old_atr) and not _is_low_move_wrapped(old_atr):
             _ORIG_ATR_FILTER = old_atr
-            _patched_atr_1m_filter._low_move_guard_v12 = True  # type: ignore[attr-defined]
+            _patched_atr_1m_filter._low_move_guard_v13 = True  # type: ignore[attr-defined]
             _patched_atr_1m_filter._original = old_atr  # type: ignore[attr-defined]
             ec.atr_1m_filter = _patched_atr_1m_filter
             logger.warning("[LOW MOVE GUARD] patched entry_controller.atr_1m_filter")
@@ -368,7 +424,7 @@ def install() -> bool:
 
         if callable(old_range) and not _is_low_move_wrapped(old_range):
             _ORIG_RANGE_FILTER = old_range
-            _patched_range_5m_filter._low_move_guard_v12 = True  # type: ignore[attr-defined]
+            _patched_range_5m_filter._low_move_guard_v13 = True  # type: ignore[attr-defined]
             _patched_range_5m_filter._original = old_range  # type: ignore[attr-defined]
             ec.range_5m_filter = _patched_range_5m_filter
             logger.warning("[LOW MOVE GUARD] patched entry_controller.range_5m_filter")
@@ -377,7 +433,10 @@ def install() -> bool:
 
         _INSTALLED = True
         logger.warning(
-            "[LOW MOVE GUARD] installed v12 direction=%s scoring_bridge=%s entry_direction=%s final_safety=%s price_improve=%s ma_cross=%s vwap=%s",
+            "[LOW MOVE GUARD] installed v13 tonosama_max_price=%s tonosama_min_range=%s tonosama_ignore_orig_range_ng=%s direction=%s scoring_bridge=%s entry_direction=%s final_safety=%s price_improve=%s ma_cross=%s vwap=%s",
+            os.getenv("LOW_MOVE_TONOSAMA_MAX_ENTRY_PRICE", "12000"),
+            os.getenv("LOW_MOVE_TONOSAMA_MIN_RANGE_PCT", "0.006"),
+            _env_bool("LOW_MOVE_TONOSAMA_IGNORE_ORIG_RANGE_NG", True),
             ok_direction, ok_scoring_bridge, ok_entry_direction, ok_final_safety, ok_price_improve, ok_ma_cross, ok_vwap_state,
         )
         return True
