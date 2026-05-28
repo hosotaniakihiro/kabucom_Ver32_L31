@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/startup.py
-# Version: FINAL-PRODUCTION-REV23.5-PUSH-BG-DUE-GUARD
+# Version: FINAL-PRODUCTION-REV23.6-ENTRY-PENDING-ROOT-PREFILTER
 # ------------------------------------------------------------
 # 【概要】
 #   system_startup の公開入口
@@ -19,6 +19,10 @@
 # REV23.5:
 #   - summary_push_bg_due_interval_guard_patch を起動時に明示適用
 #   - main.py(entry_only) のPUSH BGで3分/5分足を毎分投入しない
+#
+# REV23.6:
+#   - entry_pipeline_pending_root_prefilter_patch を起動時に明示適用
+#   - TONOSAMA実行時にRANKING/SUMMARY pendingを全銘柄scanしない
 # ============================================================
 
 from __future__ import annotations
@@ -66,9 +70,16 @@ def _install_entrypoint_runtime_patches() -> None:
     except Exception:
         logger.exception("[startup.entrypoint] push bg due interval guard install failed")
 
+    try:
+        from core.startup.entry_pipeline_pending_root_prefilter_patch import install as install_entry_pending_root_prefilter
+
+        install_entry_pending_root_prefilter()
+    except Exception:
+        logger.exception("[startup.entrypoint] entry pending root prefilter install failed")
+
 
 def system_startup():
-    logger.info("🚀 system_startup entry REV23.5-PUSH-BG-DUE-GUARD")
+    logger.info("🚀 system_startup entry REV23.6-ENTRY-PENDING-ROOT-PREFILTER")
     _install_entrypoint_runtime_patches()
     return run_system_startup()
 
