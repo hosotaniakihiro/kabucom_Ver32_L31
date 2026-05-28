@@ -1,6 +1,6 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver14-TONOSAMA-AI-BRIDGE-AUTO-INSTALL
+# Version: Ver15-SUMMARY-SAVE-QUALITY-GUARD-AUTO-INSTALL
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # 失敗しても本体起動は止めない。
@@ -174,6 +174,7 @@ def _install_summary_mtf_catchup_safely() -> None:
 _write_boot_evidence("PYTHON_START")
 _install_boot_exception_hook()
 _install_tonosama_surge_defaults()
+_install_module("core.startup.summary_save_quality_guard_patch", "SUMMARY_SAVE_QUALITY_GUARD", disabled_env="DISABLE_SUMMARY_SAVE_QUALITY_GUARD")
 _install_module("core.startup.tonosama_5sec_advisory_patch", "TONOSAMA_5SEC_ADVISORY", disabled_env="DISABLE_TONOSAMA_5SEC_ADVISORY_PATCH")
 _install_module("core.startup.tonosama_history_missing_guard_patch", "TONOSAMA_HISTORY_MISSING_GUARD", disabled_env="DISABLE_TONOSAMA_HISTORY_MISSING_GUARD_PATCH")
 _install_module("core.startup.ranking_entry_flat_price_guard_patch", "RANKING_FLAT_PRICE_DB_FALLBACK", disabled_env="DISABLE_RANKING_FLAT_PRICE_PATCH")
