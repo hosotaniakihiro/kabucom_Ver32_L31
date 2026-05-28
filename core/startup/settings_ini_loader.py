@@ -9,26 +9,52 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# ============================================================
+# settings.ini central loader
+# ------------------------------------------------------------
+# Ver2.0-TRADE-SETTINGS-CENTRALIZE
+#   - project root setting.ini / settings.ini を正式な運用設定源にする
+#   - [trade] / [ENTRY] の両方を許容
+#   - 旧 key: budget / unit_size も新 key: ENTRY_* / ORDER_* へalias解決
+#   - score_config.ini の [trade] へ戻らないよう、実売買系はここへ集約
+# ============================================================
+
 SECTION_ALIASES = {
+    "TRADE": ("trade", "Trade", "TRADE"),
     "ENTRY": ("ENTRY", "entry", "Entry"),
     "SUMMARY_AI": ("SUMMARY_AI", "summary_ai", "SummaryAI", "SUMMARY"),
 }
 
 KEY_TO_SECTIONS = {
-    "MAX_ENTRY_ONESHOT_YEN": ("ENTRY",),
-    "ORDER_LOT_SIZE": ("ENTRY",),
-    "ENTRY_MIN_PRICE": ("ENTRY",),
-    "ENTRY_MAX_PRICE": ("ENTRY",),
-    "ENTRY_AFFORDABILITY_FILTER_ENABLED": ("ENTRY",),
-    "ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL": ("ENTRY",),
-    "ENTRY_STOP_SYMBOL_AFTER_FIRST_LOSS": ("ENTRY",),
-    "ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN": ("ENTRY",),
-    "ENTRY_COUNT_SENT_ORDER_AS_DAILY_ENTRY": ("ENTRY",),
-    "ENTRY_GLOBAL_MAX_DAILY_LOSS_YEN": ("ENTRY",),
-    "ENTRY_GLOBAL_MAX_CONSECUTIVE_LOSSES": ("ENTRY",),
+    "MAX_ENTRY_ONESHOT_YEN": ("TRADE", "ENTRY"),
+    "ENTRY_LOW_PRICE_ONESHOT_YEN": ("TRADE", "ENTRY"),
+    "ENTRY_HIGH_PRICE_ONESHOT_YEN": ("TRADE", "ENTRY"),
+    "ORDER_LOT_SIZE": ("TRADE", "ENTRY"),
+    "ENTRY_MIN_PRICE": ("TRADE", "ENTRY"),
+    "ENTRY_TIER_SPLIT_PRICE": ("TRADE", "ENTRY"),
+    "ENTRY_MAX_PRICE": ("TRADE", "ENTRY"),
+    "ENTRY_AFFORDABILITY_FILTER_ENABLED": ("TRADE", "ENTRY"),
+    "ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL": ("ENTRY", "TRADE"),
+    "ENTRY_STOP_SYMBOL_AFTER_FIRST_LOSS": ("ENTRY", "TRADE"),
+    "ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN": ("ENTRY", "TRADE"),
+    "ENTRY_COUNT_SENT_ORDER_AS_DAILY_ENTRY": ("ENTRY", "TRADE"),
+    "ENTRY_GLOBAL_MAX_DAILY_LOSS_YEN": ("ENTRY", "TRADE"),
+    "ENTRY_GLOBAL_MAX_CONSECUTIVE_LOSSES": ("ENTRY", "TRADE"),
     "SUMMARY_AI_PRE_FILTER_DAILY_RISK": ("SUMMARY_AI", "ENTRY"),
     "SUMMARY_AI_PRE_FILTER_DAILY_RISK_SCOPE": ("SUMMARY_AI", "ENTRY"),
     "SUMMARY_AI_SELL_CREDIT_PREFILTER": ("SUMMARY_AI", "ENTRY"),
+}
+
+# settings.ini の人間向け短縮keyを、コード側の正式keyへ寄せる。
+KEY_ALIASES = {
+    "MAX_ENTRY_ONESHOT_YEN": ("MAX_ENTRY_ONESHOT_YEN", "entry_budget", "budget", "oneshot_budget", "max_entry_oneshot_yen"),
+    "ENTRY_LOW_PRICE_ONESHOT_YEN": ("ENTRY_LOW_PRICE_ONESHOT_YEN", "entry_low_price_oneshot_yen", "low_budget", "low_price_budget", "entry_budget", "budget"),
+    "ENTRY_HIGH_PRICE_ONESHOT_YEN": ("ENTRY_HIGH_PRICE_ONESHOT_YEN", "entry_high_price_oneshot_yen", "high_budget", "high_price_budget", "entry_budget", "budget"),
+    "ORDER_LOT_SIZE": ("ORDER_LOT_SIZE", "order_lot_size", "unit_size", "lot_size"),
+    "ENTRY_MIN_PRICE": ("ENTRY_MIN_PRICE", "entry_min_price", "min_price"),
+    "ENTRY_TIER_SPLIT_PRICE": ("ENTRY_TIER_SPLIT_PRICE", "entry_tier_split_price", "split_price", "tier_split_price"),
+    "ENTRY_MAX_PRICE": ("ENTRY_MAX_PRICE", "entry_max_price", "max_price"),
+    "ENTRY_AFFORDABILITY_FILTER_ENABLED": ("ENTRY_AFFORDABILITY_FILTER_ENABLED", "entry_affordability_filter_enabled", "affordability_filter"),
 }
 
 
@@ -94,6 +120,13 @@ def load_setting_ini() -> tuple[configparser.ConfigParser, str]:
     return cp, ""
 
 
+def _option_names_for_key(key_s: str) -> tuple[str, ...]:
+    aliases = KEY_ALIASES.get(key_s)
+    if aliases:
+        return tuple(str(x) for x in aliases if str(x).strip())
+    return (key_s, key_s.lower())
+
+
 def get_setting(key: str, default: Any = None) -> Any:
     key_s = str(key).strip()
     if not key_s:
@@ -103,14 +136,18 @@ def get_setting(key: str, default: Any = None) -> Any:
     if not cp.sections():
         return default
 
-    section_keys = KEY_TO_SECTIONS.get(key_s, ("ENTRY", "SUMMARY_AI"))
+    section_keys = KEY_TO_SECTIONS.get(key_s, ("TRADE", "ENTRY", "SUMMARY_AI"))
+    option_names = _option_names_for_key(key_s)
     for section_key in section_keys:
         for section in SECTION_ALIASES.get(section_key, (section_key,)):
             try:
-                if cp.has_section(section) and cp.has_option(section, key_s):
-                    v = cp.get(section, key_s)
-                    if v is not None and str(v).strip() != "":
-                        return v
+                if not cp.has_section(section):
+                    continue
+                for opt in option_names:
+                    if cp.has_option(section, opt):
+                        v = cp.get(section, opt)
+                        if v is not None and str(v).strip() != "":
+                            return v
             except Exception:
                 pass
 
