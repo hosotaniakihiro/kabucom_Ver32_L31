@@ -1,14 +1,14 @@
 # ============================================================
 # File   : trading/entry/tonosama/pending_writer.py
-# Version: Ver1.6-TONOSAMA-PENDING-STREAK-AND-CLIMAX-GUARD
+# Version: Ver1.7-TONOSAMA-PENDING-3M5M-STREAK-GUARD
 # ------------------------------------------------------------
 # 目的:
 #   殿様イナゴの pending 登録と Discord 通知直前の最終安全ガード。
 #
-# Ver1.6:
-#   - side='BUY' 固定を廃止した状態を維持。
-#   - BUY: 直前1分足が3本以上連続上昇していた後はエントリーしない。
-#   - SELL: 直前1分足が3本以上連続下落していた後はエントリーしない。
+# Ver1.7:
+#   - 1分足streak判定を廃止。
+#   - BUY: 3分足または5分足が3本以上連続上昇していた後はエントリーしない。
+#   - SELL: 3分足または5分足が3本以上連続下落していた後はエントリーしない。
 #   - BUYのバイイングクライマックス/上ヒゲ警戒、SELLのセリングクライマックス/下ヒゲ警戒も継続。
 #   - runner側を通過しても、pending登録/Discord通知の直前で止める二重ガード。
 # ============================================================
@@ -46,7 +46,6 @@ MAX_BUY_PRICE_CHANGE_PCT = _env_float("TONOSAMA_MAX_BUY_PRICE_CHANGE_PCT", 0.80)
 MAX_BUY_CLOSE_POSITION_PCT = _env_float("TONOSAMA_MAX_BUY_CLOSE_POSITION_PCT", 90.0)
 MAX_BUY_UPPER_WICK_PCT = _env_float("TONOSAMA_MAX_BUY_UPPER_WICK_PCT", 45.0)
 BUY_REJECTED_CLOSE_POSITION_PCT = _env_float("TONOSAMA_BUY_REJECTED_CLOSE_POSITION_PCT", 35.0)
-BUY_WICK_WARNING_CLOSE_POSITION_PCT = _env_float("TONOSAMA_BUY_WICK_WARNING_CLOSE_POSITION_PCT", 60.0)
 BUYING_CLIMAX_MIN_SURGE_RATIO = _env_float("TONOSAMA_BUYING_CLIMAX_MIN_SURGE_RATIO", 3.0)
 BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT = _env_float("TONOSAMA_BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT", 0.50)
 
@@ -54,12 +53,11 @@ MAX_SELL_PRICE_DROP_PCT = _env_float("TONOSAMA_MAX_SELL_PRICE_DROP_PCT", 0.80)
 MIN_SELL_CLOSE_POSITION_PCT = _env_float("TONOSAMA_MIN_SELL_CLOSE_POSITION_PCT", 10.0)
 MAX_SELL_LOWER_WICK_PCT = _env_float("TONOSAMA_MAX_SELL_LOWER_WICK_PCT", 45.0)
 SELL_REJECTED_CLOSE_POSITION_PCT = _env_float("TONOSAMA_SELL_REJECTED_CLOSE_POSITION_PCT", 65.0)
-SELL_WICK_WARNING_CLOSE_POSITION_PCT = _env_float("TONOSAMA_SELL_WICK_WARNING_CLOSE_POSITION_PCT", 40.0)
 SELLING_CLIMAX_MIN_SURGE_RATIO = _env_float("TONOSAMA_SELLING_CLIMAX_MIN_SURGE_RATIO", 3.0)
 SELLING_CLIMAX_MIN_PRICE_DROP_PCT = _env_float("TONOSAMA_SELLING_CLIMAX_MIN_PRICE_DROP_PCT", 0.50)
 
-MAX_BUY_PREV_1M_UP_STREAK = _env_int("TONOSAMA_MAX_BUY_PREV_1M_UP_STREAK", 2)
-MAX_SELL_PREV_1M_DOWN_STREAK = _env_int("TONOSAMA_MAX_SELL_PREV_1M_DOWN_STREAK", 2)
+MAX_BUY_PREV_3M5M_UP_STREAK = _env_int("TONOSAMA_MAX_BUY_PREV_3M5M_UP_STREAK", 2)
+MAX_SELL_PREV_3M5M_DOWN_STREAK = _env_int("TONOSAMA_MAX_SELL_PREV_3M5M_DOWN_STREAK", 2)
 
 
 def _norm_source(v: Any) -> str:
@@ -206,14 +204,16 @@ def _build_reason_ja(row: pd.Series, *, ai_reason: str, side: str) -> str:
     has_5s = bool(row.get("has_5sec_bar", False))
     slope = safe_float(row.get("_slope"), 0.0)
     tf = str(row.get("_surge_tf", ""))
-    up_streak = int(safe_float(row.get("_prev_1m_up_streak"), 0.0))
-    down_streak = int(safe_float(row.get("_prev_1m_down_streak"), 0.0))
+    up3 = int(safe_float(row.get("prev_3m_up_streak"), 0.0))
+    up5 = int(safe_float(row.get("prev_5m_up_streak"), 0.0))
+    dn3 = int(safe_float(row.get("prev_3m_down_streak"), 0.0))
+    dn5 = int(safe_float(row.get("prev_5m_down_streak"), 0.0))
     parts = [
         f"方向 {side}",
         f"{tf or '3m/5m'}で出来高急増 {max_surge:.2f}倍",
         f"価格変化 {max_chg:.2f}%",
         f"傾き {slope:.4f}",
-        f"1分連続上昇 {up_streak}本 / 連続下落 {down_streak}本",
+        f"3分連続上昇 {up3}本 / 5分連続上昇 {up5}本 / 3分連続下落 {dn3}本 / 5分連続下落 {dn5}本",
     ]
     parts.append(f"5秒変化 {chg_5s:.3f}%" if has_5s else "5秒足なしのため3m/5m条件で判定")
     if ai_reason:
@@ -240,9 +240,12 @@ def _entry_conditions_from_row(row: pd.Series, *, ai_reason: str, side: str, exp
         "close_position_pct": safe_float(row.get("_close_position_pct"), 50.0),
         "upper_wick_pct": safe_float(row.get("_upper_wick_pct"), 0.0),
         "lower_wick_pct": safe_float(row.get("_lower_wick_pct"), 0.0),
-        "prev_1m_up_streak": int(safe_float(row.get("_prev_1m_up_streak"), 0.0)),
-        "prev_1m_down_streak": int(safe_float(row.get("_prev_1m_down_streak"), 0.0)),
-        "prev_1m_last_delta_pct": safe_float(row.get("_prev_1m_last_delta_pct"), 0.0),
+        "prev_3m_up_streak": int(safe_float(row.get("prev_3m_up_streak"), 0.0)),
+        "prev_5m_up_streak": int(safe_float(row.get("prev_5m_up_streak"), 0.0)),
+        "prev_3m_down_streak": int(safe_float(row.get("prev_3m_down_streak"), 0.0)),
+        "prev_5m_down_streak": int(safe_float(row.get("prev_5m_down_streak"), 0.0)),
+        "prev_3m_last_delta_pct": safe_float(row.get("prev_3m_last_delta_pct"), 0.0),
+        "prev_5m_last_delta_pct": safe_float(row.get("prev_5m_last_delta_pct"), 0.0),
         "latest_volume": safe_float(row.get("_latest_volume"), 0.0),
         "has_5sec_bar": bool(row.get("has_5sec_bar", False)),
         "latest_5sec_close": safe_float(row.get("latest_5sec_close"), 0.0),
@@ -271,13 +274,15 @@ def _climax_reject_reason(entry: dict[str, Any]) -> str | None:
         close_pos = safe_float(cond.get("close_position_pct"), 50.0)
         upper_wick = safe_float(cond.get("upper_wick_pct"), 0.0)
         lower_wick = safe_float(cond.get("lower_wick_pct"), 0.0)
-        up_streak = int(safe_float(cond.get("prev_1m_up_streak"), 0.0))
-        down_streak = int(safe_float(cond.get("prev_1m_down_streak"), 0.0))
+        up3 = int(safe_float(cond.get("prev_3m_up_streak"), 0.0))
+        up5 = int(safe_float(cond.get("prev_5m_up_streak"), 0.0))
+        dn3 = int(safe_float(cond.get("prev_3m_down_streak"), 0.0))
+        dn5 = int(safe_float(cond.get("prev_5m_down_streak"), 0.0))
 
         if side == "BUY":
             buy_like = (price_chg > 0) or (signed_body > 0) or (slope > 0)
-            if up_streak > MAX_BUY_PREV_1M_UP_STREAK:
-                return "buy_after_1m_up_streak_guard"
+            if max(up3, up5) > MAX_BUY_PREV_3M5M_UP_STREAK:
+                return "buy_after_3m5m_up_streak_guard"
             if buy_like and price_chg >= MAX_BUY_PRICE_CHANGE_PCT:
                 return "buy_price_chase_too_late"
             if buy_like and close_pos >= MAX_BUY_CLOSE_POSITION_PCT and price_chg >= BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT:
@@ -295,8 +300,8 @@ def _climax_reject_reason(entry: dict[str, Any]) -> str | None:
         if side == "SELL":
             drop_abs = abs(price_chg)
             sell_like = (price_chg < 0) or (signed_body < 0) or (slope < 0)
-            if down_streak > MAX_SELL_PREV_1M_DOWN_STREAK:
-                return "sell_after_1m_down_streak_guard"
+            if max(dn3, dn5) > MAX_SELL_PREV_3M5M_DOWN_STREAK:
+                return "sell_after_3m5m_down_streak_guard"
             if sell_like and drop_abs >= MAX_SELL_PRICE_DROP_PCT:
                 return "sell_price_chase_too_late"
             if sell_like and close_pos <= MIN_SELL_CLOSE_POSITION_PCT and drop_abs >= SELLING_CLIMAX_MIN_PRICE_DROP_PCT:
@@ -349,15 +354,17 @@ def add_tonosama_pending(entry: dict[str, Any]) -> bool:
         if reject:
             cond = entry.get("entry_conditions") or {}
             logger.warning(
-                "[TONOSAMA PENDING GUARD] reject symbol=%s side=%s reason=%s price_chg=%.3f surge=%.2f close_pos=%.1f upper_wick=%.1f lower_wick=%.1f up_streak=%s down_streak=%s slope=%.6f",
+                "[TONOSAMA PENDING GUARD] reject symbol=%s side=%s reason=%s price_chg=%.3f surge=%.2f close_pos=%.1f upper_wick=%.1f lower_wick=%.1f up3=%s up5=%s dn3=%s dn5=%s slope=%.6f",
                 entry.get("symbol"), entry.get("side"), reject,
                 safe_float(cond.get("max_price_change_pct"), 0.0),
                 safe_float(cond.get("max_volume_surge_ratio"), 0.0),
                 safe_float(cond.get("close_position_pct"), 50.0),
                 safe_float(cond.get("upper_wick_pct"), 0.0),
                 safe_float(cond.get("lower_wick_pct"), 0.0),
-                int(safe_float(cond.get("prev_1m_up_streak"), 0.0)),
-                int(safe_float(cond.get("prev_1m_down_streak"), 0.0)),
+                int(safe_float(cond.get("prev_3m_up_streak"), 0.0)),
+                int(safe_float(cond.get("prev_5m_up_streak"), 0.0)),
+                int(safe_float(cond.get("prev_3m_down_streak"), 0.0)),
+                int(safe_float(cond.get("prev_5m_down_streak"), 0.0)),
                 safe_float(cond.get("slope"), 0.0),
             )
             return False
