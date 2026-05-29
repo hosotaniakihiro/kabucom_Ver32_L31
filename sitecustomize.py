@@ -1,13 +1,15 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver27-SHORT-MTF-2OF3-AUTO-INSTALL
+# Version: Ver28-SHORT-MTF-AND-TONOSAMA-SURGE-ZERO-RESCUE
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # 失敗しても本体起動は止めない。
 #
-# Ver27:
-#   - SHORT_MTF guard v1.4 を自動install。
-#   - 1m/3m/5m 全一致必須ではなく、2本以上が方向一致なら許可。
+# Ver28:
+#   - SHORT_MTF 2/3許可は維持。
+#   - TONOSAMAで _max_volume_surge_ratio が全銘柄0.0になり
+#     volume_surge_low で全落ちするケースへ対応。
+#   - TONOSAMA_VOLUME_SURGE_ZERO_RESCUE を自動install。
 # ============================================================
 
 from __future__ import annotations
@@ -141,6 +143,13 @@ def _install_tonosama_surge_defaults() -> None:
         os.environ.setdefault("TONOSAMA_PRICE_CHANGE_OR_RANGE_MIN_RANGE_PCT", "3.0")
         os.environ.setdefault("TONOSAMA_PRICE_CHANGE_OR_RANGE_MIN_VOLUME", "50000")
         os.environ.setdefault("TONOSAMA_PRICE_CHANGE_OR_RANGE_MIN_SURGE", "3.0")
+        os.environ.setdefault("TONOSAMA_AI_FALLBACK_PRICE_RANGE_RESCUE", "1")
+        os.environ.setdefault("TONOSAMA_AI_FALLBACK_MIN_PRICE_CHANGE_PCT", "0.0")
+        os.environ.setdefault("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_ENABLED", "1")
+        os.environ.setdefault("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_MIN_VOLUME", "500000")
+        os.environ.setdefault("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_MIN_RANGE_PCT", "4.0")
+        os.environ.setdefault("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_MIN_ABS_SCORE", "0.8")
+        os.environ.setdefault("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_MIN_MTF", "1.0")
 
         os.environ.setdefault("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_ENABLED", "1")
         os.environ.setdefault("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_SEC", "35")
@@ -185,9 +194,10 @@ def _install_tonosama_surge_defaults() -> None:
             "entry_direction_recursion_failopen": os.environ.get("ENTRY_DIRECTION_RECURSION_FAILOPEN_ENABLED"),
             "summary_date_guard": os.environ.get("SUMMARY_DB_DATE_GUARD_ENABLED"),
             "tonosama_price_range_rescue": os.environ.get("TONOSAMA_PRICE_CHANGE_OR_RANGE_ENABLED"),
+            "tonosama_volume_surge_zero_rescue": os.environ.get("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_ENABLED"),
         })
         logger.warning(
-            "[SITECUSTOMIZE] defaults short_mtf_require_all=%s short_mtf_min_aligned=%s ranking_source_db_fallback=%s ranking_hl_patch=%s entry_direction_recursion_failopen=%s summary_date_guard=%s warning_only_climax=%s tonosama_price_range_rescue=%s",
+            "[SITECUSTOMIZE] defaults short_mtf_require_all=%s short_mtf_min_aligned=%s ranking_source_db_fallback=%s ranking_hl_patch=%s entry_direction_recursion_failopen=%s summary_date_guard=%s warning_only_climax=%s tonosama_price_range_rescue=%s tonosama_volume_surge_zero_rescue=%s",
             os.environ.get("ENTRY_SHORT_MTF_REQUIRE_ALL"),
             os.environ.get("ENTRY_SHORT_MTF_MIN_ALIGNED"),
             os.environ.get("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED"),
@@ -196,6 +206,7 @@ def _install_tonosama_surge_defaults() -> None:
             os.environ.get("SUMMARY_DB_DATE_GUARD_ENABLED"),
             os.environ.get("TONOSAMA_ALLOW_WARNING_ONLY_CLIMAX"),
             os.environ.get("TONOSAMA_PRICE_CHANGE_OR_RANGE_ENABLED"),
+            os.environ.get("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_ENABLED"),
         )
     except Exception:
         _write_boot_evidence("TONOSAMA_SURGE_DEFAULTS_EXCEPTION", traceback.format_exc())
@@ -241,6 +252,7 @@ _install_module("core.startup.low_movement_tonosama_no_highlow_patch", "LOW_MOVE
 _install_module("core.startup.final_entry_tonosama_liquidity_patch", "FINAL_TONOSAMA_LIQUIDITY", disabled_env="DISABLE_FINAL_TONOSAMA_LIQUIDITY_PATCH")
 _install_module("core.startup.tonosama_pending_warning_relax_patch", "TONOSAMA_PENDING_WARNING_RELAX", disabled_env="DISABLE_TONOSAMA_PENDING_WARNING_RELAX_PATCH")
 _install_module("core.startup.tonosama_price_change_or_range_patch", "TONOSAMA_PRICE_RANGE_RESCUE", disabled_env="DISABLE_TONOSAMA_PRICE_RANGE_RESCUE_PATCH")
+_install_module("core.startup.tonosama_volume_surge_zero_rescue_patch", "TONOSAMA_VOLUME_SURGE_ZERO_RESCUE", disabled_env="DISABLE_TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_PATCH")
 _install_liq_empty_fallback_only_if_enabled()
 _install_module("core.startup.summary_ai_liquidity_rescue_patch", "SUMMARY_AI_LIQ_RESCUE", disabled_env="DISABLE_SUMMARY_AI_LIQ_RESCUE_PATCH")
 _install_module("core.startup.summary_ai_entry_hook_dataframe_truth_patch", "SUMMARY_AI_DF_TRUTH_PATCH", disabled_env="DISABLE_SUMMARY_AI_DF_TRUTH_PATCH")
