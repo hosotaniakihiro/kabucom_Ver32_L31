@@ -1,13 +1,17 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver19-DISABLE-LIQUIDITY-EMPTY-FALLBACK-BY-DEFAULT
+# Version: Ver20-TONOSAMA-ZERO-5S-FALLBACK-RELAX
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # 失敗しても本体起動は止めない。
 #
+# Ver20:
+#   - TONOSAMA runner は5秒足を必須にしない方針。
+#   - AI fallback側だけ 5s=0.000% で全候補を落としていたため、
+#     TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC=0 を既定化。
+#
 # Ver19:
 #   - LIQ_EMPTY_FALLBACK は低流動性銘柄を戻してしまうため、自動installを既定OFFへ変更。
-#   - 必要な場合だけ ENABLE_LIQ_EMPTY_FALLBACK_PATCH=1 で明示的に有効化。
 # ============================================================
 
 from __future__ import annotations
@@ -131,6 +135,8 @@ def _install_tonosama_surge_defaults() -> None:
         os.environ.setdefault("TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE", "3.0")
         os.environ.setdefault("TONOSAMA_5SEC_ADVISORY_ENABLED", "1")
         os.environ.setdefault("TONOSAMA_5SEC_ALLOW_ZERO_IF_PRIMARY_PASS", "1")
+        os.environ.setdefault("TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC", "0")
+        os.environ.setdefault("TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT", "0.0")
         os.environ.setdefault("TONOSAMA_ALLOW_HISTORY_MISSING_STRONG_MOVE", "1")
         os.environ.setdefault("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_ENABLED", "1")
         os.environ.setdefault("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_SEC", "35")
@@ -150,6 +156,8 @@ def _install_tonosama_surge_defaults() -> None:
             "failopen_value": os.environ.get("TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE"),
             "five_sec_advisory": os.environ.get("TONOSAMA_5SEC_ADVISORY_ENABLED"),
             "five_sec_allow_zero": os.environ.get("TONOSAMA_5SEC_ALLOW_ZERO_IF_PRIMARY_PASS"),
+            "ai_reject_zero_5s": os.environ.get("TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC"),
+            "ai_min_5s": os.environ.get("TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT"),
             "history_missing_strong_move": os.environ.get("TONOSAMA_ALLOW_HISTORY_MISSING_STRONG_MOVE"),
             "ranking_lock_wait": os.environ.get("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_ENABLED"),
             "source_prefilter": os.environ.get("ENTRY_CONTROLLER_SOURCE_PREFILTER_ENABLED"),
@@ -159,12 +167,14 @@ def _install_tonosama_surge_defaults() -> None:
             "final_tonosama_liq": os.environ.get("FINAL_ENTRY_TONOSAMA_LIQUIDITY_FALLBACK"),
         })
         logger.warning(
-            "[SITECUSTOMIZE] tonosama defaults failopen=%s allow_without_history=%s value=%s five_sec_advisory=%s allow_zero=%s history_missing_strong_move=%s ranking_lock_wait=%s source_prefilter=%s tonosama_ai_bridge=%s low_move_tonosama_min_price=%s no_highlow_fallback=%s final_tonosama_liq=%s",
+            "[SITECUSTOMIZE] tonosama defaults failopen=%s allow_without_history=%s value=%s five_sec_advisory=%s allow_zero=%s ai_reject_zero_5s=%s ai_min_5s=%s history_missing_strong_move=%s ranking_lock_wait=%s source_prefilter=%s tonosama_ai_bridge=%s low_move_tonosama_min_price=%s no_highlow_fallback=%s final_tonosama_liq=%s",
             os.environ.get("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING"),
             os.environ.get("TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY"),
             os.environ.get("TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE"),
             os.environ.get("TONOSAMA_5SEC_ADVISORY_ENABLED"),
             os.environ.get("TONOSAMA_5SEC_ALLOW_ZERO_IF_PRIMARY_PASS"),
+            os.environ.get("TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC"),
+            os.environ.get("TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT"),
             os.environ.get("TONOSAMA_ALLOW_HISTORY_MISSING_STRONG_MOVE"),
             os.environ.get("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_ENABLED"),
             os.environ.get("ENTRY_CONTROLLER_SOURCE_PREFILTER_ENABLED"),
