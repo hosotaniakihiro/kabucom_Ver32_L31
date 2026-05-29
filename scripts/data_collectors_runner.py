@@ -1,15 +1,23 @@
 # ============================================================
 # File   : scripts/data_collectors_runner.py
-# Version: DATA-COLLECTORS-PARENT-RUNNER-V4-HEARTBEAT-WATCHDOG
+# Version: DATA-COLLECTORS-PARENT-RUNNER-V5-CLEAR-MAIN-DB-SKIP-ENV
 # ------------------------------------------------------------
 # Purpose:
 #   - DB作成 / ランキング取得 / PUSH受信 / Yahoo補完 / サマリーDB保存を一括起動する親runner
 #   - main.py とは別プロセスで動かす
 #
-# V4:
-#   ✔ Heartbeat Watchdogへ親/子プロセスの生存証跡を保存
-#   ✔ child start / exit / restart / stop を heartbeat DBへ保存
-#   ✔ main_database.py 側で「どのcollectorが止まったか」を後追い可能にする
+# V5:
+#   ✔ child process env で main.py専用DB保存skip設定を明示解除
+#   ✔ SUMMARY_SKIP_DB_SAVE_IN_MAIN=0
+#   ✔ SUMMARY_MAIN_ENTRY_ONLY=0
+#   ✔ SUMMARY_DB_WRITER_ROLE=database
+#   ✔ AUTOSTOCK_SUMMARY_DB_WRITER=1
+#   ✔ AUTOSTOCK_SUMMARY_SAVE_MODE=save
+#
+# 背景:
+#   親環境に SUMMARY_SKIP_DB_SAVE_IN_MAIN=1 / SUMMARY_DB_WRITER_ROLE=entry_only が残ると、
+#   summary_database_runner 側でも cache_writer が main_entry_only と判定し、
+#   PUSH summary DB保存をskipする。
 # ============================================================
 
 from __future__ import annotations
@@ -72,9 +80,21 @@ def _build_env() -> dict[str, str]:
 
     env["AUTOSTOCK_DATA_COLLECTORS_PROCESS"] = "1"
     env["AUTOSTOCK_MAIN_DATABASE_PROCESS"] = "1"
-    env.setdefault("AUTOSTOCK_EXTERNAL_DATA_COLLECTORS", "1")
-    env.setdefault("AUTOSTOCK_YAHOO_COMPLEMENT_OWNER", "database")
-    env.setdefault("AUTOSTOCK_SUMMARY_SAVE_OWNER", "database")
+    env["AUTOSTOCK_EXTERNAL_DATA_COLLECTORS"] = "1"
+
+    env["AUTOSTOCK_YAHOO_COMPLEMENT_OWNER"] = "database"
+    env["AUTOSTOCK_SUMMARY_SAVE_OWNER"] = "database"
+    env["AUTOSTOCK_SUMMARY_SAVE_MODE"] = "save"
+    env["AUTOSTOCK_SUMMARY_DB_WRITER"] = "1"
+
+    # main.py専用設定を子プロセスへ持ち込まない。
+    # summary_database_runner / cache_writer はこの3つを見るため、ここで強制解除する。
+    env["SUMMARY_SKIP_DB_SAVE_IN_MAIN"] = "0"
+    env["SUMMARY_MAIN_ENTRY_ONLY"] = "0"
+    env["SUMMARY_DB_WRITER_ROLE"] = "database"
+
+    # data collector側ではエントリー実行しない。
+    env.setdefault("ENABLE_SUMMARY_ENTRY_TICK", "0")
 
     return env
 
@@ -88,13 +108,22 @@ def _run_db_prepare(logger: logging.Logger) -> None:
     _check_file(DB_PREPARE_RUNNER)
 
     cmd = [_python_exe(), str(DB_PREPARE_RUNNER)]
+    env = _build_env()
     logger.info("[DATA COLLECTORS] db_prepare start cmd=%s", cmd)
+    logger.info(
+        "[DATA COLLECTORS] child env summary owner=%s mode=%s writer=%s skip_main=%s role=%s",
+        env.get("AUTOSTOCK_SUMMARY_SAVE_OWNER"),
+        env.get("AUTOSTOCK_SUMMARY_SAVE_MODE"),
+        env.get("AUTOSTOCK_SUMMARY_DB_WRITER"),
+        env.get("SUMMARY_SKIP_DB_SAVE_IN_MAIN"),
+        env.get("SUMMARY_DB_WRITER_ROLE"),
+    )
     mark_component_start("db_prepare_runner", {"cmd": cmd})
 
     ret = subprocess.run(
         cmd,
         cwd=str(PROJECT_ROOT),
-        env=_build_env(),
+        env=env,
         text=True,
     )
 
@@ -110,13 +139,25 @@ def _start_child(logger: logging.Logger, name: str, path: Path) -> subprocess.Po
     _check_file(path)
 
     cmd = [_python_exe(), str(path)]
+    env = _build_env()
     logger.info("[DATA COLLECTORS] start child name=%s cmd=%s", name, cmd)
+    logger.info(
+        "[DATA COLLECTORS] child env name=%s summary owner=%s mode=%s writer=%s skip_main=%s main_entry_only=%s role=%s yahoo_owner=%s",
+        name,
+        env.get("AUTOSTOCK_SUMMARY_SAVE_OWNER"),
+        env.get("AUTOSTOCK_SUMMARY_SAVE_MODE"),
+        env.get("AUTOSTOCK_SUMMARY_DB_WRITER"),
+        env.get("SUMMARY_SKIP_DB_SAVE_IN_MAIN"),
+        env.get("SUMMARY_MAIN_ENTRY_ONLY"),
+        env.get("SUMMARY_DB_WRITER_ROLE"),
+        env.get("AUTOSTOCK_YAHOO_COMPLEMENT_OWNER"),
+    )
     mark_component_start(f"collector_{name}", {"cmd": cmd, "path": str(path)})
 
     proc = subprocess.Popen(
         cmd,
         cwd=str(PROJECT_ROOT),
-        env=_build_env(),
+        env=env,
         text=True,
     )
 
@@ -138,18 +179,15 @@ def _terminate_child(logger: logging.Logger, name: str, proc: subprocess.Popen) 
         proc.wait(timeout=10)
         mark_component_stop(f"collector_{name}", {"pid": proc.pid, "returncode": proc.poll()})
     except subprocess.TimeoutExpired:
-        logger.warning("[DATA COLLECTORS] kill child name=%s pid=%s", name, proc.pid)
+        logger.error("[DATA COLLECTORS] kill child name=%s pid=%s", name, proc.pid)
         proc.kill()
-        mark_component_stop(f"collector_{name}", {"pid": proc.pid, "killed": True})
-    except Exception:
-        heartbeat(f"collector_{name}", status="STOP_ERROR", detail={"pid": proc.pid})
-        logger.exception("[DATA COLLECTORS] terminate failed name=%s", name)
+        proc.wait(timeout=5)
+        mark_component_stop(f"collector_{name}", {"pid": proc.pid, "returncode": proc.poll(), "killed": True})
 
 
 def _handle_signal(signum, frame) -> None:
     global _STOP
     _STOP = True
-    heartbeat("data_collectors_runner", status="SIGNAL", detail={"signum": signum})
 
 
 def main() -> int:
@@ -158,87 +196,64 @@ def main() -> int:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
-    mark_component_start("data_collectors_runner", {"project_root": str(PROJECT_ROOT), "python": _python_exe()})
-
     logger.info("=" * 80)
-    logger.info("[DATA COLLECTORS] START")
-    logger.info("[DATA COLLECTORS] PROJECT_ROOT=%s", PROJECT_ROOT)
-    logger.info("[DATA COLLECTORS] PYTHON=%s", _python_exe())
-    logger.info("[DATA COLLECTORS] process_specs=%s", {k: str(v) for k, v in PROCESS_SPECS.items()})
-    logger.info("[DATA COLLECTORS] AUTOSTOCK_SUMMARY_SAVE_OWNER=%s", _build_env().get("AUTOSTOCK_SUMMARY_SAVE_OWNER"))
+    logger.info("[DATA COLLECTORS] START project_root=%s python=%s", PROJECT_ROOT, _python_exe())
+    logger.info("[DATA COLLECTORS] specs=%s", {k: str(v) for k, v in PROCESS_SPECS.items()})
     logger.info("=" * 80)
 
-    try:
-        _run_db_prepare(logger)
-    except Exception:
-        heartbeat("data_collectors_runner", status="ERROR", detail={"stage": "db_prepare"})
-        logger.exception("[DATA COLLECTORS] db_prepare failed. abort.")
-        return 1
+    _run_db_prepare(logger)
 
-    children: Dict[str, subprocess.Popen] = {}
-
-    for name, path in PROCESS_SPECS.items():
-        try:
-            children[name] = _start_child(logger, name, path)
-        except Exception:
-            heartbeat(f"collector_{name}", status="START_ERROR", detail={"path": str(path)})
-            logger.exception("[DATA COLLECTORS] child start failed name=%s", name)
-
-    last_heartbeat = 0.0
+    procs: Dict[str, subprocess.Popen] = {}
 
     try:
+        for name, path in PROCESS_SPECS.items():
+            procs[name] = _start_child(logger, name, path)
+            time.sleep(0.5)
+
+        last_hb = 0.0
+
         while not _STOP:
             now = time.time()
 
-            for name, path in PROCESS_SPECS.items():
-                proc: Optional[subprocess.Popen] = children.get(name)
-
-                if proc is None:
-                    logger.warning("[DATA COLLECTORS] child missing name=%s. restart.", name)
-                    heartbeat(f"collector_{name}", status="MISSING_RESTART", detail={"path": str(path)})
-                    time.sleep(RESTART_DELAY_SEC)
-                    children[name] = _start_child(logger, name, path)
+            for name, proc in list(procs.items()):
+                rc = proc.poll()
+                if rc is None:
                     continue
 
-                ret = proc.poll()
-                if ret is not None:
-                    logger.error(
-                        "[DATA COLLECTORS] child exited name=%s pid=%s returncode=%s. restart after %.1fs",
-                        name,
-                        proc.pid,
-                        ret,
-                        RESTART_DELAY_SEC,
-                    )
-                    heartbeat(f"collector_{name}", status="EXITED", detail={"pid": proc.pid, "returncode": ret})
-                    time.sleep(RESTART_DELAY_SEC)
-                    children[name] = _start_child(logger, name, path)
+                logger.error("[DATA COLLECTORS] child exited name=%s pid=%s returncode=%s -> restart", name, proc.pid, rc)
+                heartbeat(f"collector_{name}", status="EXITED", detail={"pid": proc.pid, "returncode": rc})
+                mark_component_stop(f"collector_{name}", {"pid": proc.pid, "returncode": rc})
 
-            if now - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
-                parts = []
-                child_detail = {}
-                for name, proc in children.items():
-                    alive = proc.poll() is None
-                    parts.append(f"{name}:pid={proc.pid}:alive={alive}")
-                    child_detail[name] = {"pid": proc.pid, "alive": alive, "returncode": proc.poll()}
-                    heartbeat(f"collector_{name}", status="OK" if alive else "NG", detail=child_detail[name])
+                if _STOP:
+                    continue
 
-                heartbeat("data_collectors_runner", status="OK", detail={"children": child_detail})
+                time.sleep(RESTART_DELAY_SEC)
+                procs[name] = _start_child(logger, name, PROCESS_SPECS[name])
 
-                logger.info(
-                    "[DATA COLLECTORS] heartbeat time=%s %s",
-                    dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    " | ".join(parts),
+            if now - last_hb >= HEARTBEAT_INTERVAL_SEC:
+                last_hb = now
+                heartbeat(
+                    "data_collectors_runner",
+                    status="RUNNING",
+                    detail={
+                        "children": {
+                            name: {"pid": proc.pid, "returncode": proc.poll()}
+                            for name, proc in procs.items()
+                        }
+                    },
                 )
-                last_heartbeat = now
 
             time.sleep(1.0)
 
     finally:
-        heartbeat("data_collectors_runner", status="STOPPING", detail={"children": list(children.keys())})
-        logger.warning("[DATA COLLECTORS] stopping children...")
-        for name, proc in children.items():
-            _terminate_child(logger, name, proc)
-        mark_component_stop("data_collectors_runner", {"stopped_children": list(children.keys())})
+        logger.warning("[DATA COLLECTORS] stopping children")
+        for name, proc in list(procs.items()):
+            try:
+                _terminate_child(logger, name, proc)
+            except Exception:
+                logger.exception("[DATA COLLECTORS] child terminate failed name=%s", name)
+
+        heartbeat("data_collectors_runner", status="STOPPED", detail={})
         logger.warning("[DATA COLLECTORS] STOPPED")
 
     return 0
