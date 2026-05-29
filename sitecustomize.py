@@ -1,9 +1,13 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver20-TONOSAMA-ZERO-5S-FALLBACK-RELAX
+# Version: Ver21-SUMMARY-DB-DATE-GUARD
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # 失敗しても本体起動は止めない。
+#
+# Ver21:
+#   - summaryYYYYMMDD.db に別日 datetime が混入しないよう、
+#     SUMMARY_DB_DATE_GUARD を自動install。
 #
 # Ver20:
 #   - TONOSAMA runner は5秒足を必須にしない方針。
@@ -150,6 +154,8 @@ def _install_tonosama_surge_defaults() -> None:
         os.environ.setdefault("FINAL_ENTRY_TONOSAMA_MIN_VOLUME", "10000")
         os.environ.setdefault("FINAL_ENTRY_TONOSAMA_MIN_TURNOVER", "3000000")
         os.environ.setdefault("FINAL_ENTRY_TONOSAMA_MIN_VOLUME_SPEED", "1.0")
+        os.environ.setdefault("SUMMARY_DB_DATE_GUARD_ENABLED", "1")
+        os.environ.setdefault("SUMMARY_DB_DATE_GUARD_CLEANUP_ENABLED", "1")
         _write_boot_evidence("TONOSAMA_SURGE_DEFAULTS_SET", {
             "failopen": os.environ.get("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING"),
             "allow_without_history": os.environ.get("TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY"),
@@ -165,9 +171,10 @@ def _install_tonosama_surge_defaults() -> None:
             "low_move_tonosama_min_price": os.environ.get("LOW_MOVE_TONOSAMA_MIN_ENTRY_PRICE"),
             "low_move_tonosama_no_highlow": os.environ.get("LOW_MOVE_TONOSAMA_ALLOW_NO_HIGHLOW_FALLBACK"),
             "final_tonosama_liq": os.environ.get("FINAL_ENTRY_TONOSAMA_LIQUIDITY_FALLBACK"),
+            "summary_date_guard": os.environ.get("SUMMARY_DB_DATE_GUARD_ENABLED"),
         })
         logger.warning(
-            "[SITECUSTOMIZE] tonosama defaults failopen=%s allow_without_history=%s value=%s five_sec_advisory=%s allow_zero=%s ai_reject_zero_5s=%s ai_min_5s=%s history_missing_strong_move=%s ranking_lock_wait=%s source_prefilter=%s tonosama_ai_bridge=%s low_move_tonosama_min_price=%s no_highlow_fallback=%s final_tonosama_liq=%s",
+            "[SITECUSTOMIZE] tonosama defaults failopen=%s allow_without_history=%s value=%s five_sec_advisory=%s allow_zero=%s ai_reject_zero_5s=%s ai_min_5s=%s history_missing_strong_move=%s ranking_lock_wait=%s source_prefilter=%s tonosama_ai_bridge=%s low_move_tonosama_min_price=%s no_highlow_fallback=%s final_tonosama_liq=%s summary_date_guard=%s",
             os.environ.get("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING"),
             os.environ.get("TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY"),
             os.environ.get("TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE"),
@@ -182,6 +189,7 @@ def _install_tonosama_surge_defaults() -> None:
             os.environ.get("LOW_MOVE_TONOSAMA_MIN_ENTRY_PRICE"),
             os.environ.get("LOW_MOVE_TONOSAMA_ALLOW_NO_HIGHLOW_FALLBACK"),
             os.environ.get("FINAL_ENTRY_TONOSAMA_LIQUIDITY_FALLBACK"),
+            os.environ.get("SUMMARY_DB_DATE_GUARD_ENABLED"),
         )
     except Exception:
         _write_boot_evidence("TONOSAMA_SURGE_DEFAULTS_EXCEPTION", traceback.format_exc())
@@ -211,6 +219,7 @@ def _install_summary_mtf_catchup_safely() -> None:
 _write_boot_evidence("PYTHON_START")
 _install_boot_exception_hook()
 _install_tonosama_surge_defaults()
+_install_module("core.startup.summary_db_date_guard_patch", "SUMMARY_DB_DATE_GUARD", disabled_env="DISABLE_SUMMARY_DB_DATE_GUARD_PATCH")
 _install_module("core.startup.summary_save_quality_guard_patch", "SUMMARY_SAVE_QUALITY_GUARD", disabled_env="DISABLE_SUMMARY_SAVE_QUALITY_GUARD")
 _install_module("core.startup.tonosama_5sec_advisory_patch", "TONOSAMA_5SEC_ADVISORY", disabled_env="DISABLE_TONOSAMA_5SEC_ADVISORY_PATCH")
 _install_module("core.startup.tonosama_history_missing_guard_patch", "TONOSAMA_HISTORY_MISSING_GUARD", disabled_env="DISABLE_TONOSAMA_HISTORY_MISSING_GUARD_PATCH")
