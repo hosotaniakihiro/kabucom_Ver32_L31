@@ -1,20 +1,16 @@
 # ============================================================
 # File   : trading/entry/tonosama/config.py
-# Version: Ver2.7-TONOSAMA-INTRADAY-LIQUIDITY-GUARD-INSTALL
+# Version: Ver2.8-TONOSAMA-FINAL-SCORE-2P3
 # ------------------------------------------------------------
 # 方針:
 #   - volume_surge.py / history guard で履歴不足fail-openを許可した後、
 #     runner.py 側の本体条件が強すぎて candidates=0 に戻る問題を緩和。
 #   - 6996のような微小変化だけの候補は避けつつ、4592/6072のように
 #     実値動きがある候補を残す水準へ調整。
-#   - Ver2.7:
-#     日中出来高・日中売買代金が少ない銘柄を殿様イナゴから除外する。
-#     「後からイナゴが付いてくる銘柄」に寄せるため、
-#       当日累計出来高 >= 100,000株
-#       当日累計売買代金 >= 1億円
-#       出来高発生分足 >= 8本
-#       直近3m出来高 >= 50,000株 または 5m出来高 >= 80,000株
-#     を既定にする。
+#   - Ver2.8:
+#     slope/range rescue 後、raw_score=2.3 の候補が final_score_low で
+#     連続して落ちるため、TONOSAMA_MIN_FINAL_SCORE の floor を 2.5 -> 2.3 に緩和。
+#     ただし後段のAI/流動性/板/方向ガードはそのまま残す。
 # ============================================================
 
 from __future__ import annotations
@@ -29,6 +25,7 @@ os.environ.setdefault("TONOSAMA_ALLOW_HISTORY_MISSING_ENTRY", "1")
 os.environ.setdefault("TONOSAMA_DROP_HISTORY_MISSING_ENTRY", "0")
 
 # 本体フィルタの既定値。外部ENVがあれば外部値を尊重する。
+os.environ.setdefault("TONOSAMA_MIN_FINAL_SCORE", "2.3")
 os.environ.setdefault("TONOSAMA_MIN_PRICE_CHANGE_PCT", "0.20")
 os.environ.setdefault("TONOSAMA_MIN_SLOPE", "0.0010")
 os.environ.setdefault("TONOSAMA_MIN_5SEC_PRICE_CHANGE_PCT", "0.01")
@@ -98,7 +95,7 @@ def _env_bool(name: str, default: bool) -> bool:
 TONOSAMA_EXPIRE_SEC = _env_int("TONOSAMA_EXPIRE_SEC", 180)
 
 MIN_PRICE = _env_float_floor("TONOSAMA_MIN_PRICE", 300.0, 300.0)
-MIN_FINAL_SCORE = _env_float_floor("TONOSAMA_MIN_FINAL_SCORE", 2.5, 2.5)
+MIN_FINAL_SCORE = _env_float_floor("TONOSAMA_MIN_FINAL_SCORE", 2.3, 2.3)
 MIN_RAW_SCORE = _env_float("TONOSAMA_MIN_RAW_SCORE", 0.01)
 
 MIN_VOLUME_SURGE_RATIO = _env_float_floor("TONOSAMA_MIN_VOLUME_SURGE_RATIO", 3.0, 3.0)
