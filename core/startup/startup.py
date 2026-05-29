@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/startup.py
-# Version: FINAL-PRODUCTION-REV23.8-RANKING-ENTRY-FAST-PATCH
+# Version: FINAL-PRODUCTION-REV23.9-TONOSAMA-FAST-SCORE-PREFILTER
 # ------------------------------------------------------------
 # 【概要】
 #   system_startup の公開入口
@@ -31,6 +31,10 @@
 # REV23.8:
 #   - ranking_entry_fast_runtime_patch を起動時に明示適用
 #   - RANKING entry作成の80秒超過を軽減
+#
+# REV23.9:
+#   - tonosama_fast_score_prefilter_patch を起動時に明示適用
+#   - TONOSAMAのfinal_score_low候補をAI/5秒特徴取得前に早期除外
 # ============================================================
 
 from __future__ import annotations
@@ -99,9 +103,16 @@ def _install_entrypoint_runtime_patches() -> None:
     except Exception:
         logger.exception("[startup.entrypoint] ranking entry fast patch install failed")
 
+    try:
+        from core.startup.tonosama_fast_score_prefilter_patch import install as install_tonosama_fast_score_prefilter
+
+        install_tonosama_fast_score_prefilter()
+    except Exception:
+        logger.exception("[startup.entrypoint] tonosama fast score prefilter install failed")
+
 
 def system_startup():
-    logger.info("🚀 system_startup entry REV23.8-RANKING-ENTRY-FAST-PATCH")
+    logger.info("🚀 system_startup entry REV23.9-TONOSAMA-FAST-SCORE-PREFILTER")
     _install_entrypoint_runtime_patches()
     return run_system_startup()
 
