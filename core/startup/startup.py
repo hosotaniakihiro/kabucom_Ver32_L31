@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/startup.py
-# Version: FINAL-PRODUCTION-REV23.7-ENTRY-VOLUME-DIRECTION-GUARD
+# Version: FINAL-PRODUCTION-REV23.8-RANKING-ENTRY-FAST-PATCH
 # ------------------------------------------------------------
 # 【概要】
 #   system_startup の公開入口
@@ -27,6 +27,10 @@
 # REV23.7:
 #   - entry_volume_direction_guard_patch を起動時に明示適用
 #   - SUMMARY/RANKING/TONOSAMA共通で「出来高急増×価格方向」を判定
+#
+# REV23.8:
+#   - ranking_entry_fast_runtime_patch を起動時に明示適用
+#   - RANKING entry作成の80秒超過を軽減
 # ============================================================
 
 from __future__ import annotations
@@ -88,9 +92,16 @@ def _install_entrypoint_runtime_patches() -> None:
     except Exception:
         logger.exception("[startup.entrypoint] entry volume direction guard install failed")
 
+    try:
+        from core.startup.ranking_entry_fast_runtime_patch import install as install_ranking_entry_fast_patch
+
+        install_ranking_entry_fast_patch()
+    except Exception:
+        logger.exception("[startup.entrypoint] ranking entry fast patch install failed")
+
 
 def system_startup():
-    logger.info("🚀 system_startup entry REV23.7-ENTRY-VOLUME-DIRECTION-GUARD")
+    logger.info("🚀 system_startup entry REV23.8-RANKING-ENTRY-FAST-PATCH")
     _install_entrypoint_runtime_patches()
     return run_system_startup()
 
