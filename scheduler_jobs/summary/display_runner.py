@@ -1,13 +1,12 @@
 # ============================================================
 # File   : scheduler_jobs/summary/display_runner.py
-# Version: V4.3-DISPLAY-UNIVERSE-GUARD
+# Version: V4.4-SHOW-1MIN-SUMMARY-AND-GUARD-FALLBACK
 # ------------------------------------------------------------
-# ✔ 1分足はDiscord通知しない
-# ✔ 3分/5分は通常通り送信
-# ✔ 表示直前に close <= 200 を除外
-# ✔ BUY対象は slope > 0.03 のみ
-# ✔ SELL対象は slope < -0.03 のみ
+# ✔ 1分足もDiscord通知できるように変更
+# ✔ SUMMARY_NOTIFY_1MIN_DISCORD=1 を既定ON
+# ✔ 表示ガードで0件になった場合、元DFからフォールバック表示する
 # ✔ PUSH / RANKING 両方に適用
+# ✔ close <= 200 除外、BUY/SELL slope条件は維持しつつ、全件落ち時だけ救済
 # ============================================================
 
 from __future__ import annotations
@@ -15,36 +14,16 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
-from typing import Optional, Any
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
 
 from .dependencies import resolve_display_functions
-from .display_prepare import (
-    prepare_display_df,
-    latest_dt_str,
-    symbols_count,
-    extract_latest_timestamp,
-)
-from .quality_guards import (
-    looks_uncomputed_push_df,
-    looks_uncomputed_ranking_df,
-)
-from .time_utils import (
-    is_fresh_timestamp,
-    age_minutes,
-    is_lunch_break,
-    resolve_display_slot,
-    is_market_session,
-)
+from .display_prepare import prepare_display_df
 
 logger = logging.getLogger(__name__)
 
-
-# ============================================================
-# display universe settings
-# ============================================================
 
 DEFAULT_DISPLAY_MIN_PRICE = 200.0
 DEFAULT_DISPLAY_MIN_BUY_SLOPE = 0.03
@@ -61,12 +40,19 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
-def _resolve_display_min_price() -> float:
-    """
-    表示対象の最低株価。
+def _env_bool(name: str, default: bool) -> bool:
+    try:
+        raw = str(os.getenv(name, "")).strip().lower()
+        if raw in {"1", "true", "yes", "on", "enable", "enabled"}:
+            return True
+        if raw in {"0", "false", "no", "off", "disable", "disabled"}:
+            return False
+    except Exception:
+        pass
+    return bool(default)
 
-    200円以下を対象外にするため、判定は price > 200。
-    """
+
+def _resolve_display_min_price() -> float:
     v1 = os.getenv("SUMMARY_DISPLAY_MIN_PRICE")
     if v1 is not None and str(v1).strip() != "":
         return _env_float("SUMMARY_DISPLAY_MIN_PRICE", DEFAULT_DISPLAY_MIN_PRICE)
@@ -79,11 +65,6 @@ def _resolve_display_min_price() -> float:
 
 
 def _resolve_display_min_buy_slope() -> float:
-    """
-    BUY表示対象の最低slope。
-
-    slope 0.03以下を対象外にするため、判定は slope > 0.03。
-    """
     v1 = os.getenv("SUMMARY_DISPLAY_MIN_BUY_SLOPE")
     if v1 is not None and str(v1).strip() != "":
         return _env_float("SUMMARY_DISPLAY_MIN_BUY_SLOPE", DEFAULT_DISPLAY_MIN_BUY_SLOPE)
@@ -96,11 +77,6 @@ def _resolve_display_min_buy_slope() -> float:
 
 
 def _resolve_display_max_sell_slope() -> float:
-    """
-    SELL表示対象の最大slope。
-
-    -0.03以上を対象外にするため、判定は slope < -0.03。
-    """
     v1 = os.getenv("SUMMARY_DISPLAY_MAX_SELL_SLOPE")
     if v1 is not None and str(v1).strip() != "":
         return _env_float("SUMMARY_DISPLAY_MAX_SELL_SLOPE", DEFAULT_DISPLAY_MAX_SELL_SLOPE)
@@ -112,71 +88,54 @@ def _resolve_display_max_sell_slope() -> float:
     return float(DEFAULT_DISPLAY_MAX_SELL_SLOPE)
 
 
-def _select_price_col(df: pd.DataFrame) -> Optional[str]:
+def _select_first_col(df: pd.DataFrame, candidates: tuple[str, ...]) -> Optional[str]:
     if df is None or df.empty:
         return None
-
-    for c in (
-        "disp_close",
-        "close",
-        "close_price",
-        "current_price",
-        "price",
-        "last_price",
-    ):
+    for c in candidates:
         if c in df.columns:
             return c
-
     return None
+
+
+def _select_price_col(df: pd.DataFrame) -> Optional[str]:
+    return _select_first_col(
+        df,
+        (
+            "disp_close",
+            "close",
+            "close_price",
+            "current_price",
+            "price",
+            "last_price",
+        ),
+    )
 
 
 def _select_slope_col(df: pd.DataFrame) -> Optional[str]:
-    if df is None or df.empty:
-        return None
-
-    for c in (
-        "disp_slope",
-        "slope",
-        "score_slope",
-        "slope_atr_scaled",
-        "ma75_slope",
-    ):
-        if c in df.columns:
-            return c
-
-    return None
+    return _select_first_col(
+        df,
+        (
+            "disp_slope",
+            "slope",
+            "score_slope",
+            "slope_atr_scaled",
+            "ma75_slope",
+        ),
+    )
 
 
 def _select_buy_score_col(df: pd.DataFrame) -> Optional[str]:
-    if df is None or df.empty:
-        return None
-
-    for c in (
-        "disp_buy_score",
-        "score_buy",
-        "buy_score",
-        "buy",
-    ):
-        if c in df.columns:
-            return c
-
-    return None
+    return _select_first_col(df, ("disp_buy_score", "score_buy", "buy_score", "buy", "score"))
 
 
 def _select_sell_score_col(df: pd.DataFrame) -> Optional[str]:
-    if df is None or df.empty:
-        return None
+    return _select_first_col(df, ("disp_sell_score", "score_sell", "sell_score", "sell"))
 
-    for c in (
-        "disp_sell_score",
-        "score_sell",
-        "sell_score",
-        "sell",
-    ):
-        if c in df.columns:
-            return c
 
-    return None
+def _to_num_series(df: pd.DataFrame, col: Optional[str], default: float = 0.0) -> pd.Series:
+    if col is None or col not in df.columns:
+        return pd.Series(default, index=df.index, dtype="float64")
+    return pd.to_numeric(df[col], errors="coerce").fillna(default)
 
 
 def _apply_display_universe_guard(
@@ -185,24 +144,6 @@ def _apply_display_universe_guard(
     interval: int,
     source: str,
 ) -> pd.DataFrame:
-    """
-    表示直前の最終防御フィルタ。
-
-    ここで表示用DataFrameそのものから対象外を除去する。
-
-    共通:
-      close > 200
-
-    BUY候補として残す条件:
-      slope > 0.03
-
-    SELL候補として残す条件:
-      slope < -0.03
-
-    注意:
-      この関数は表示用の元dfを完全に削る。
-      BUYにもSELLにも該当しない中途半端な行は表示対象から外す。
-    """
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -227,9 +168,6 @@ def _apply_display_universe_guard(
             before,
             list(out.columns),
         )
-        price_s = pd.Series(np.nan, index=out.index)
-    else:
-        price_s = pd.to_numeric(out[price_col], errors="coerce").fillna(0.0)
 
     if slope_col is None:
         logger.warning(
@@ -239,61 +177,34 @@ def _apply_display_universe_guard(
             before,
             list(out.columns),
         )
-        slope_s = pd.Series(0.0, index=out.index)
-    else:
-        slope_s = pd.to_numeric(out[slope_col], errors="coerce").fillna(0.0)
 
-    if buy_col is None:
-        buy_s = pd.Series(0.0, index=out.index)
-    else:
-        buy_s = pd.to_numeric(out[buy_col], errors="coerce").fillna(0.0)
-
-    if sell_col is None:
-        sell_s = pd.Series(0.0, index=out.index)
-    else:
-        sell_s = pd.to_numeric(out[sell_col], errors="coerce").fillna(0.0).abs()
+    price_s = _to_num_series(out, price_col, 0.0)
+    slope_s = _to_num_series(out, slope_col, 0.0)
+    buy_s = _to_num_series(out, buy_col, 0.0)
+    sell_s = _to_num_series(out, sell_col, 0.0).abs()
 
     price_ok = price_s > float(min_price)
-
-    buy_ok = (
-        price_ok
-        & (buy_s > 0.0)
-        & (slope_s > float(min_buy_slope))
-    )
-
-    sell_ok = (
-        price_ok
-        & (sell_s > 0.0)
-        & (slope_s < float(max_sell_slope))
-    )
-
-    # BUYにもSELLにも該当しない行は表示対象外
+    buy_ok = price_ok & (buy_s > 0.0) & (slope_s > float(min_buy_slope))
+    sell_ok = price_ok & (sell_s > 0.0) & (slope_s < float(max_sell_slope))
     keep_mask = buy_ok | sell_ok
 
-    out = out.loc[keep_mask].copy()
-
-    after = len(out)
+    filtered = out.loc[keep_mask].copy()
+    after = len(filtered)
 
     try:
         skipped_head = []
-        if "symbol" in df.columns:
-            skipped = df.loc[~keep_mask].copy()
+        if "symbol" in out.columns:
+            skipped = out.loc[~keep_mask].copy()
             cols = ["symbol"]
-            if price_col:
-                cols.append(price_col)
-            if slope_col:
-                cols.append(slope_col)
-            if buy_col:
-                cols.append(buy_col)
-            if sell_col:
-                cols.append(sell_col)
+            for c in (price_col, slope_col, buy_col, sell_col):
+                if c and c not in cols:
+                    cols.append(c)
             skipped_head = skipped[cols].head(20).to_dict(orient="records")
     except Exception:
         skipped_head = []
 
     logger.info(
-        "[DISPLAY UNIVERSE GUARD] source=%s interval=%s "
-        "price_col=%s slope_col=%s buy_col=%s sell_col=%s "
+        "[DISPLAY UNIVERSE GUARD] source=%s interval=%s price_col=%s slope_col=%s buy_col=%s sell_col=%s "
         "condition='price > %.1f and ((buy > 0 and slope > %.4f) or (sell > 0 and slope < %.4f))' "
         "before=%s after=%s skipped=%s skipped_head=%s",
         source,
@@ -311,53 +222,116 @@ def _apply_display_universe_guard(
         skipped_head,
     )
 
+    return filtered.reset_index(drop=True)
+
+
+def _fallback_when_guard_empty(df: pd.DataFrame, *, interval: int, source: str) -> pd.DataFrame:
+    """
+    表示ガードで全件落ちした場合の救済。
+    1分足は動きが小さいため slope条件で全件消えやすい。
+    結果が見えないと状態確認できないので、price>min_price の範囲からスコア順で表示する。
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    if not _env_bool("SUMMARY_DISPLAY_FALLBACK_WHEN_GUARD_EMPTY", True):
+        return pd.DataFrame()
+
+    out = df.copy()
+    price_col = _select_price_col(out)
+    score_col = _select_first_col(
+        out,
+        (
+            "disp_score",
+            "display_score",
+            "final_score",
+            "score",
+            "score_total",
+            "score_buy",
+            "score_sell",
+        ),
+    )
+    buy_col = _select_buy_score_col(out)
+    sell_col = _select_sell_score_col(out)
+    slope_col = _select_slope_col(out)
+
+    if price_col is not None:
+        price_s = _to_num_series(out, price_col, 0.0)
+        out = out.loc[price_s > _resolve_display_min_price()].copy()
+
+    if out.empty:
+        logger.warning(
+            "[DISPLAY FALLBACK] skipped source=%s interval=%s reason=no_rows_after_price_filter",
+            source,
+            interval,
+        )
+        return pd.DataFrame()
+
+    # 表示関数がBUY/SELLを分けられるように、score_buy/sellが無い場合はscoreから補完する。
+    if score_col is not None:
+        score_s = _to_num_series(out, score_col, 0.0)
+    else:
+        score_s = pd.Series(0.0, index=out.index)
+
+    if buy_col is None or buy_col not in out.columns:
+        out["score_buy"] = np.maximum(score_s, 0.0)
+    if sell_col is None or sell_col not in out.columns:
+        out["score_sell"] = np.maximum(-score_s, 0.0)
+
+    # scoreがすべて0でも、候補なしではなく状態確認用に先頭を表示する。
+    sort_col = score_col if score_col is not None and score_col in out.columns else None
+    if sort_col:
+        out["_display_abs_score"] = _to_num_series(out, sort_col, 0.0).abs()
+        if slope_col and slope_col in out.columns:
+            out["_display_abs_slope"] = _to_num_series(out, slope_col, 0.0).abs()
+        else:
+            out["_display_abs_slope"] = 0.0
+        out = out.sort_values(["_display_abs_score", "_display_abs_slope"], ascending=[False, False]).drop(
+            columns=["_display_abs_score", "_display_abs_slope"],
+            errors="ignore",
+        )
+
+    limit = int(_env_float("SUMMARY_DISPLAY_FALLBACK_ROWS", 20.0))
+    out = out.head(max(limit, 1)).copy()
+    out["display_fallback_reason"] = "guard_empty_fallback"
+
+    logger.warning(
+        "[DISPLAY FALLBACK] source=%s interval=%s guard_empty -> fallback rows=%s price_col=%s score_col=%s slope_col=%s",
+        source,
+        interval,
+        len(out),
+        price_col,
+        score_col,
+        slope_col,
+    )
     return out.reset_index(drop=True)
 
 
-# ============================================================
-# ★ 1分足Discord制御
-# ============================================================
-
 def _should_notify_discord(interval: int) -> bool:
+    """
+    旧仕様: 1分足はDiscord通知しない。
+    新仕様: 1分足も確認したい要望があるため既定ON。
+
+    OFFに戻す場合:
+      SUMMARY_NOTIFY_1MIN_DISCORD=0
+    """
     try:
-        return int(interval) != 1
+        iv = int(interval)
     except Exception:
         return True
+    if iv == 1:
+        return _env_bool("SUMMARY_NOTIFY_1MIN_DISCORD", True)
+    return True
 
 
-# ============================================================
-# helpers
-# ============================================================
-
-def _safe_len(df: Any) -> int:
-    try:
-        return len(df)
-    except Exception:
-        return 0
-
-
-def _safe_cols(df: Any) -> list[str]:
-    try:
-        if isinstance(df, pd.DataFrame):
-            return list(df.columns)
-    except Exception:
-        pass
-    return []
-
-
-def _safe_df(df: Any) -> pd.DataFrame:
+def _safe_display_df(df: Any) -> pd.DataFrame:
     try:
         if isinstance(df, pd.DataFrame):
             return df.copy()
-        return pd.DataFrame()
     except Exception:
-        logger.debug("[summary.display_runner] safe_df failed", exc_info=True)
-        return pd.DataFrame()
+        pass
+    return pd.DataFrame()
 
-
-# ============================================================
-# PUSH表示
-# ============================================================
 
 def display_push_summary(
     df: pd.DataFrame,
@@ -369,37 +343,36 @@ def display_push_summary(
         display_push, _ = resolve_display_functions()
 
         if not callable(display_push):
+            logger.warning("[summary.display_runner] display_push callable missing interval=%s", interval)
             return
 
         if not isinstance(df, pd.DataFrame) or df.empty:
+            logger.info("[summary.display_runner] PUSH display skipped interval=%s reason=empty_input", interval)
             return
 
         df_prepared = prepare_display_df(df, interval=interval, now=now)
-        df_disp = df_prepared if not df_prepared.empty else df
+        df_disp = df_prepared if isinstance(df_prepared, pd.DataFrame) and not df_prepared.empty else df
 
         if df_disp.empty:
+            logger.info("[summary.display_runner] PUSH display skipped interval=%s reason=empty_prepared", interval)
             return
 
-        # ----------------------------------------------------
-        # 表示直前の最終フィルタ
-        # ----------------------------------------------------
-        df_disp = _apply_display_universe_guard(
-            df_disp,
-            interval=interval,
-            source="PUSH",
-        )
-
-        if df_disp.empty:
-            logger.info(
-                "[summary.display_runner] PUSH display skipped after universe guard interval=%s",
-                interval,
-            )
-            return
+        guarded = _apply_display_universe_guard(df_disp, interval=interval, source="PUSH")
+        if guarded.empty:
+            fallback = _fallback_when_guard_empty(df_disp, interval=interval, source="PUSH")
+            if fallback.empty:
+                logger.info(
+                    "[summary.display_runner] PUSH display skipped after universe guard interval=%s fallback_empty=True",
+                    interval,
+                )
+                return
+            df_disp = fallback
+        else:
+            df_disp = guarded
 
         notify_discord = _should_notify_discord(interval)
-
         if not notify_discord:
-            logger.info("[DISCORD] skip 1min PUSH summary")
+            logger.info("[DISCORD] skip %smin PUSH summary by SUMMARY_NOTIFY_1MIN_DISCORD", interval)
 
         try:
             display_push(
@@ -417,13 +390,16 @@ def display_push_summary(
                 now=now,
             )
 
+        logger.info(
+            "[summary.display_runner] PUSH display called interval=%s rows=%s notify_discord=%s",
+            interval,
+            len(df_disp),
+            notify_discord,
+        )
+
     except Exception:
         logger.exception("[display_runner] push display failed")
 
-
-# ============================================================
-# RANKING表示
-# ============================================================
 
 def display_ranking_summary(
     df: pd.DataFrame,
@@ -435,37 +411,36 @@ def display_ranking_summary(
         _, display_ranking = resolve_display_functions()
 
         if not callable(display_ranking):
+            logger.warning("[summary.display_runner] display_ranking callable missing interval=%s", interval)
             return
 
         if not isinstance(df, pd.DataFrame) or df.empty:
+            logger.info("[summary.display_runner] RANKING display skipped interval=%s reason=empty_input", interval)
             return
 
         df_prepared = prepare_display_df(df, interval=interval, now=now)
-        df_disp = df_prepared if not df_prepared.empty else df
+        df_disp = df_prepared if isinstance(df_prepared, pd.DataFrame) and not df_prepared.empty else df
 
         if df_disp.empty:
+            logger.info("[summary.display_runner] RANKING display skipped interval=%s reason=empty_prepared", interval)
             return
 
-        # ----------------------------------------------------
-        # 表示直前の最終フィルタ
-        # ----------------------------------------------------
-        df_disp = _apply_display_universe_guard(
-            df_disp,
-            interval=interval,
-            source="RANKING",
-        )
-
-        if df_disp.empty:
-            logger.info(
-                "[summary.display_runner] RANKING display skipped after universe guard interval=%s",
-                interval,
-            )
-            return
+        guarded = _apply_display_universe_guard(df_disp, interval=interval, source="RANKING")
+        if guarded.empty:
+            fallback = _fallback_when_guard_empty(df_disp, interval=interval, source="RANKING")
+            if fallback.empty:
+                logger.info(
+                    "[summary.display_runner] RANKING display skipped after universe guard interval=%s fallback_empty=True",
+                    interval,
+                )
+                return
+            df_disp = fallback
+        else:
+            df_disp = guarded
 
         notify_discord = _should_notify_discord(interval)
-
         if not notify_discord:
-            logger.info("[DISCORD] skip 1min RANKING summary")
+            logger.info("[DISCORD] skip %smin RANKING summary by SUMMARY_NOTIFY_1MIN_DISCORD", interval)
 
         try:
             display_ranking(
@@ -483,13 +458,16 @@ def display_ranking_summary(
                 now=now,
             )
 
+        logger.info(
+            "[summary.display_runner] RANKING display called interval=%s rows=%s notify_discord=%s",
+            interval,
+            len(df_disp),
+            notify_discord,
+        )
+
     except Exception:
         logger.exception("[display_runner] ranking display failed")
 
-
-# ============================================================
-# CLOSED DAY
-# ============================================================
 
 def display_closed_day_summary(
     df: pd.DataFrame,
@@ -499,10 +477,6 @@ def display_closed_day_summary(
 ) -> None:
     display_push_summary(df=df, interval=interval, now=now)
 
-
-# ============================================================
-# aliases
-# ============================================================
 
 def run_display_push_summary(
     df: pd.DataFrame,
