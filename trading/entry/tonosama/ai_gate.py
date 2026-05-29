@@ -1,3 +1,17 @@
+# ============================================================
+# File   : trading/entry/tonosama/ai_gate.py
+# Version: Ver1.5-TONOSAMA-FALLBACK-NO-ZERO-5S-DIRECTION-GUARD
+# ------------------------------------------------------------
+# 目的:
+#   AI未接続時の fallback が緩く、5秒変化0.000%や直近3m逆行でも
+#   TONOSAMA ENTRY PENDING になる問題を防ぐ。
+#
+# Ver1.5:
+#   - 5秒足が取れている場合、require_5s=Falseでも 5s=0.000% はNG。
+#   - BUY fallback は 3m価格変化がマイナスならNG。
+#   - SELL fallback は 3m価格変化がプラスならNG。
+#   - BUY は 5mプラス + slopeプラスだけでは通さず、3mも最低0%以上を要求。
+# ============================================================
 from __future__ import annotations
 
 import importlib
@@ -75,18 +89,22 @@ def build_ai_features(row: pd.Series) -> dict:
 
 
 def _infer_side(max_chg: float, slope: float) -> str:
+    if max_chg > 0 and slope > 0:
+        return "BUY"
+    if max_chg < 0 and slope < 0:
+        return "SELL"
     if max_chg > 0 or slope > 0:
-        if not (max_chg < 0 and slope < 0):
-            return "BUY"
+        return "BUY"
     if max_chg < 0 or slope < 0:
-        if not (max_chg > 0 and slope > 0):
-            return "SELL"
+        return "SELL"
     return "UNKNOWN"
 
 
 def _fallback_when_ai_disconnected(features: dict) -> tuple[bool, float, str]:
     max_surge = safe_float(features.get("max_volume_surge_ratio"), 0.0)
     max_chg = safe_float(features.get("max_price_change_pct"), 0.0)
+    chg_3m = safe_float(features.get("price_change_pct_3m"), 0.0)
+    chg_5m = safe_float(features.get("price_change_pct_5m"), 0.0)
     chg_5s = safe_float(features.get("price_change_5s_pct"), 0.0)
     has_5s = bool(features.get("has_5sec_bar", False))
     slope = safe_float(features.get("slope"), 0.0)
@@ -102,6 +120,11 @@ def _fallback_when_ai_disconnected(features: dict) -> tuple[bool, float, str]:
     max_5s_drop = _env_float("TONOSAMA_AI_FALLBACK_MAX_5SEC_DROP_PCT", float(_cfg("MAX_5SEC_DROP_PCT", -0.20)))
     require_5s = _env_bool("TONOSAMA_AI_FALLBACK_REQUIRE_5SEC_BAR", bool(_cfg("REQUIRE_5SEC_BAR", False)))
 
+    # Ver1.5: 5秒足があるのに0.000%なら、今は動いていないのでfallbackでは通さない。
+    reject_zero_5s = _env_bool("TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC", True)
+    min_buy_3m = _env_float("TONOSAMA_AI_FALLBACK_MIN_BUY_3M_CHANGE", 0.0)
+    max_sell_3m = _env_float("TONOSAMA_AI_FALLBACK_MAX_SELL_3M_CHANGE", 0.0)
+
     if side == "UNKNOWN":
         return False, 0.0, f"AI fallback NG: unknown direction price_change={max_chg:.2f}% slope={slope:.4f}"
     if max_surge < min_surge:
@@ -111,17 +134,28 @@ def _fallback_when_ai_disconnected(features: dict) -> tuple[bool, float, str]:
     if abs_slope < min_slope:
         return False, 0.0, f"AI fallback NG: slope low side={side} abs={abs_slope:.4f} raw={slope:.4f} < {min_slope:.4f}"
 
+    if side == "BUY":
+        if chg_3m < min_buy_3m:
+            return False, 0.0, f"AI fallback NG: BUY 3m weak/reverse 3m={chg_3m:.2f}% < {min_buy_3m:.2f}% 5m={chg_5m:.2f}%"
+        if max_chg <= 0 or slope <= 0:
+            return False, 0.0, f"AI fallback NG: BUY direction mismatch max_chg={max_chg:.2f}% slope={slope:.4f}"
+    elif side == "SELL":
+        if chg_3m > max_sell_3m:
+            return False, 0.0, f"AI fallback NG: SELL 3m weak/reverse 3m={chg_3m:.2f}% > {max_sell_3m:.2f}% 5m={chg_5m:.2f}%"
+        if max_chg >= 0 or slope >= 0:
+            return False, 0.0, f"AI fallback NG: SELL direction mismatch max_chg={max_chg:.2f}% slope={slope:.4f}"
+
     if has_5s:
+        if reject_zero_5s and abs(chg_5s) < min_5s:
+            return False, 0.0, f"AI fallback NG: 5s stopped side={side} abs5s={abs(chg_5s):.3f}% < {min_5s:.3f}%"
         if side == "BUY" and chg_5s <= max_5s_drop:
             return False, 0.0, f"AI fallback NG: BUY 5s reverse 5s={chg_5s:.3f}% <= {max_5s_drop:.3f}%"
         if side == "SELL" and chg_5s >= abs(max_5s_drop):
             return False, 0.0, f"AI fallback NG: SELL 5s reverse 5s={chg_5s:.3f}% >= {abs(max_5s_drop):.3f}%"
-        if require_5s and abs(chg_5s) < min_5s:
-            return False, 0.0, f"AI fallback NG: strict 5s low side={side} abs5s={abs(chg_5s):.3f}% < {min_5s:.3f}%"
     elif require_5s:
         return False, 0.0, "AI fallback NG: missing required 5s bar"
 
-    return True, 0.0, f"AI fallback pass side={side} surge={max_surge:.2f}x change={max_chg:.2f}% abs={abs_chg:.2f}% slope={slope:.4f} abs_slope={abs_slope:.4f} 5s={chg_5s:.3f}% require_5s={require_5s}"
+    return True, 0.0, f"AI fallback pass side={side} surge={max_surge:.2f}x change={max_chg:.2f}% 3m={chg_3m:.2f}% 5m={chg_5m:.2f}% abs={abs_chg:.2f}% slope={slope:.4f} abs_slope={abs_slope:.4f} 5s={chg_5s:.3f}% require_5s={require_5s}"
 
 
 def ai_check_tonosama_entry(row: pd.Series) -> tuple[bool, float, str]:
