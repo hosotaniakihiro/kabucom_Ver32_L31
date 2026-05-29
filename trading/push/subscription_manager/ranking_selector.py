@@ -1,23 +1,16 @@
 # ============================================================
 # File   : trading/push/subscription_manager/ranking_selector.py
-# Version: V2.0-PUSH-RANKING-SELECTOR-LIQUIDITY-100-ROTATION
-# Date   : 2026-05-01
+# Version: V2.1-PUSH-RANKING-SELECTOR-FRESHNESS-LIQUIDITY-SAFE
 # ------------------------------------------------------------
 # Purpose:
-#   kabu Station PUSH登録用のランキング由来銘柄を、
-#   条件別に抽出して最大100銘柄へ整理する。
+#   kabu Station PUSH登録用のランキング由来銘柄を最大100銘柄へ整理する。
 #
-# Selection policy:
-#   ① 全市場 上昇率上位50位の中から売買代金上位35銘柄
-#   ② 全市場 下落率上位50位の中から売買代金上位25銘柄
-#   ③ 全市場 売買代金上位50位の中から上昇率上位30銘柄
-#   ④ 全市場 売買代金上位50位の中から下落率上位20銘柄
-#   ⑤ 100銘柄に満たない場合:
-#      グロース市場 上昇率上位50位の中から売買代金上位15銘柄
-#   ⑥ まだ100銘柄に満たない場合:
-#      スタンダード市場 上昇率上位50位の中から売買代金上位15銘柄
-#   ⑦ まだ100銘柄に満たない場合:
-#      TICK回数上位50位から未使用銘柄を100銘柄まで補充
+# V2.1 Fix:
+#   - freshness を DB内最新時刻基準ではなく、現在時刻基準でも判定する。
+#     09:39時点で最新snapshot=09:09でも fresh 扱いになる問題を防ぐ。
+#   - liquidity filter が0件になったとき、完全 unfiltered へ戻さない。
+#     段階的に条件を緩めるが、最低限の価格/出来高/売買代金ガードは残す。
+#   - それでも0件なら、PUSH登録候補は空にして低流動性銘柄を監視対象へ戻さない。
 # ============================================================
 
 from __future__ import annotations
@@ -34,42 +27,37 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 DEFAULT_NAS_ROOT = r"\\192.168.0.22\AutoStockBuyAndSell"
-
-TABLE_CANDIDATES = (
-    "ranking_snapshot_1min",
-    "ranking_raw_1min",
-    "ranking",
-)
+TABLE_CANDIDATES = ("ranking_snapshot_1min", "ranking_raw_1min", "ranking")
 
 GAINER_TOP_N = 50
 GAINER_BY_VALUE_N = 35
-
 LOSER_TOP_N = 50
 LOSER_BY_VALUE_N = 25
-
 VALUE_TOP_N = 50
 VALUE_UP_RATE_N = 30
 VALUE_DOWN_RATE_N = 20
-
 GROWTH_TOP_N = 50
 GROWTH_BY_VALUE_N = 15
-
 STANDARD_TOP_N = 50
 STANDARD_BY_VALUE_N = 15
-
 TICK_TOP_N = 50
-
 DEFAULT_MAX_SYMBOLS = 100
 DEFAULT_REGISTER_LIMIT = 50
 
 DEFAULT_FRESH_MINUTES = float(os.environ.get("PUSH_RANKING_SELECTOR_FRESH_MINUTES", "5"))
-
+MAX_DB_STALE_MINUTES = float(os.environ.get("PUSH_RANKING_SELECTOR_MAX_DB_STALE_MINUTES", "12"))
 MIN_PRICE = float(os.environ.get("PUSH_RANKING_SELECTOR_MIN_PRICE", "300"))
 MIN_TRADING_VALUE = float(os.environ.get("PUSH_RANKING_SELECTOR_MIN_TRADING_VALUE", "30000000"))
 MIN_VOLUME = float(os.environ.get("PUSH_RANKING_SELECTOR_MIN_VOLUME", "10000"))
 MIN_TICK_COUNT = float(os.environ.get("PUSH_RANKING_SELECTOR_MIN_TICK_COUNT", "0"))
-
 SQLITE_TIMEOUT_SEC = float(os.environ.get("PUSH_RANKING_SELECTOR_SQLITE_TIMEOUT_SEC", "5"))
+
+# liquidity が厳しすぎる時の段階緩和。完全unfilteredには戻さない。
+RELAXED_LIQUIDITY_STEPS: tuple[tuple[float, float, float, float, str], ...] = (
+    (MIN_PRICE, MIN_TRADING_VALUE, MIN_VOLUME, MIN_TICK_COUNT, "strict_config"),
+    (MIN_PRICE, max(MIN_TRADING_VALUE * 0.50, 10_000_000.0), max(MIN_VOLUME * 0.70, 7_000.0), MIN_TICK_COUNT, "relaxed_50pct_value"),
+    (MIN_PRICE, max(MIN_TRADING_VALUE * 0.25, 5_000_000.0), max(MIN_VOLUME * 0.50, 5_000.0), 0.0, "relaxed_25pct_value"),
+)
 
 
 def _today_yyyymmdd() -> str:
@@ -83,13 +71,8 @@ def _normalize_yyyymmdd(value: Any = None) -> str:
         return value.strftime("%Y%m%d")
     if isinstance(value, dt.date):
         return value.strftime("%Y%m%d")
-    s = str(value).strip()
-    if not s:
-        return _today_yyyymmdd()
-    s = s.replace("-", "").replace("/", "")
-    if len(s) >= 8 and s[:8].isdigit():
-        return s[:8]
-    return _today_yyyymmdd()
+    s = str(value).strip().replace("-", "").replace("/", "")
+    return s[:8] if len(s) >= 8 and s[:8].isdigit() else _today_yyyymmdd()
 
 
 def _get_nas_root() -> str:
@@ -102,35 +85,23 @@ def _get_nas_root() -> str:
 
 def _default_ranking_db_path(yyyymmdd: Any = None) -> str:
     d = _normalize_yyyymmdd(yyyymmdd)
-    return str(
-        Path(_get_nas_root())
-        / "raw_data"
-        / "kabu_station"
-        / "ranking"
-        / f"ranking{d}.db"
-    )
+    return str(Path(_get_nas_root()) / "raw_data" / "kabu_station" / "ranking" / f"ranking{d}.db")
 
 
-def _resolve_ranking_db_path(
-    db_path: Optional[str | os.PathLike] = None,
-    yyyymmdd: Any = None,
-) -> Optional[str]:
+def _resolve_ranking_db_path(db_path: Optional[str | os.PathLike] = None, yyyymmdd: Any = None) -> Optional[str]:
     if db_path:
         p = str(db_path)
         if os.path.exists(p):
             return p
         logger.warning("[PUSH RANKING SELECTOR] explicit db_path not found path=%s", p)
         return p
-
     try:
         from ats.ats_ranking import get_usable_ranking_db_path  # type: ignore
-
         p = get_usable_ranking_db_path(force_refresh=False)
         if p and os.path.exists(str(p)):
             return str(p)
     except Exception:
         pass
-
     return _default_ranking_db_path(yyyymmdd)
 
 
@@ -167,10 +138,8 @@ def _normalize_symbol(value: Any) -> str:
         return ""
     if "." in s and s.upper().endswith(".T"):
         s = s.rsplit(".", 1)[0]
-    if s.endswith(".0"):
-        s2 = s[:-2]
-        if s2.isdigit():
-            s = s2
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
     return s.strip()
 
 
@@ -179,9 +148,7 @@ def _dedupe_keep_order(items: Iterable[Any]) -> list[str]:
     seen: set[str] = set()
     for item in items:
         s = _normalize_symbol(item)
-        if not s:
-            continue
-        if s in seen:
+        if not s or s in seen:
             continue
         seen.add(s)
         out.append(s)
@@ -217,96 +184,32 @@ def _parse_dt_series(s: pd.Series) -> pd.Series:
 def _normalize_df(df: pd.DataFrame, *, table_name: str = "") -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
-
     out = df.copy()
-
     symbol_col = _first_col(out, ("symbol", "Symbol", "code", "Code", "銘柄コード", "銘柄"))
     if not symbol_col:
-        logger.warning(
-            "[PUSH RANKING SELECTOR] symbol column not found table=%s columns=%s",
-            table_name,
-            list(out.columns),
-        )
+        logger.warning("[PUSH RANKING SELECTOR] symbol column not found table=%s columns=%s", table_name, list(out.columns))
         return pd.DataFrame()
-
     out["symbol"] = out[symbol_col].map(_normalize_symbol)
     out = out[out["symbol"].astype(str).str.len() > 0].copy()
 
     name_col = _first_col(out, ("symbolname", "symbol_name", "name", "Name", "銘柄名", "銘柄名称"))
     out["symbolname"] = _safe_str_series(out[name_col]) if name_col else ""
-
-    category_col = _first_col(
-        out,
-        (
-            "category",
-            "ranking_category",
-            "ranking_type",
-            "rank_type",
-            "type",
-            "Type",
-            "ranking_name",
-            "name_category",
-            "ランキング種別",
-            "ランキング名",
-            "種別",
-            "table_name",
-        ),
-    )
+    category_col = _first_col(out, ("category", "ranking_category", "ranking_type", "rank_type", "type", "Type", "ranking_name", "ランキング種別", "ランキング名", "種別", "table_name"))
     out["category"] = _safe_str_series(out[category_col]) if category_col else ""
-
-    market_col = _first_col(
-        out,
-        (
-            "market",
-            "Market",
-            "exchange",
-            "Exchange",
-            "exchange_division",
-            "division",
-            "market_name",
-            "市場",
-            "市場区分",
-            "市場名",
-        ),
-    )
+    market_col = _first_col(out, ("market", "Market", "exchange", "Exchange", "exchange_division", "division", "market_name", "市場", "市場区分", "市場名"))
     out["market"] = _safe_str_series(out[market_col]) if market_col else ""
-
     rank_col = _first_col(out, ("rank", "rank_no", "ranking", "順位"))
     out["rank_no"] = _to_num(out[rank_col]) if rank_col else pd.NA
-
     price_col = _first_col(out, ("current_price", "price", "Price", "close", "close_price", "現在値", "株価"))
     out["current_price"] = _to_num(out[price_col]) if price_col else pd.NA
-
-    rate_col = _first_col(
-        out,
-        (
-            "change_rate",
-            "change_percentage",
-            "change_ratio",
-            "rate",
-            "change_percent",
-            "change_pct",
-            "price_change_rate",
-            "rise_rate",
-            "fall_rate",
-            "騰落率",
-            "上昇率",
-            "下落率",
-            "値上がり率",
-            "値下がり率",
-        ),
-    )
+    rate_col = _first_col(out, ("change_rate", "change_percentage", "change_ratio", "rate", "change_percent", "change_pct", "price_change_rate", "rise_rate", "fall_rate", "騰落率", "上昇率", "下落率", "値上がり率", "値下がり率"))
     out["change_rate"] = _to_num(out[rate_col]) if rate_col else pd.NA
-
     value_col = _first_col(out, ("trading_value", "turnover", "amount", "売買代金", "売買金額", "代金"))
     out["trading_value"] = _to_num(out[value_col]) if value_col else pd.NA
-
     volume_col = _first_col(out, ("volume", "trading_volume", "出来高", "売買高"))
     out["volume"] = _to_num(out[volume_col]) if volume_col else pd.NA
-
     tick_col = _first_col(out, ("tick_count", "ticks", "tick", "TickCount", "TICK回数", "ティック回数", "約定回数"))
     out["tick_count"] = _to_num(out[tick_col]) if tick_col else pd.NA
-
     time_col = _first_col(out, ("snapshot_time", "datetime", "created_at", "updated_at", "inserted_at", "time", "取得時刻", "時刻"))
     out["snapshot_time"] = _parse_dt_series(out[time_col]) if time_col else pd.NaT
 
@@ -317,31 +220,22 @@ def _normalize_df(df: pd.DataFrame, *, table_name: str = "") -> pd.DataFrame:
         out.loc[mask, "change_rate"] = -out.loc[mask, "change_rate"].abs()
     except Exception:
         pass
-
     return out
 
 
-def _load_ranking_df(
-    *,
-    db_path: Optional[str | os.PathLike] = None,
-    yyyymmdd: Any = None,
-) -> pd.DataFrame:
+def _load_ranking_df(*, db_path: Optional[str | os.PathLike] = None, yyyymmdd: Any = None) -> pd.DataFrame:
     path = _resolve_ranking_db_path(db_path=db_path, yyyymmdd=yyyymmdd)
-
     if not path:
         logger.warning("[PUSH RANKING SELECTOR] ranking db path unresolved")
         return pd.DataFrame()
-
     if not os.path.exists(str(path)):
         logger.warning("[PUSH RANKING SELECTOR] ranking db not found path=%s", path)
         return pd.DataFrame()
-
     conn: Optional[sqlite3.Connection] = None
     try:
         conn = _connect(str(path))
         tables = _list_tables(conn)
         frames: list[pd.DataFrame] = []
-
         for table in TABLE_CANDIDATES:
             if table not in tables:
                 continue
@@ -354,22 +248,13 @@ def _load_ranking_df(
             ndf["_source_table"] = table
             frames.append(ndf)
             logger.info("[PUSH RANKING SELECTOR] loaded table=%s rows=%d path=%s", table, len(ndf), path)
-
         if not frames:
             logger.warning("[PUSH RANKING SELECTOR] no usable ranking tables path=%s tables=%s", path, tables)
             return pd.DataFrame()
-
         all_df = pd.concat(frames, ignore_index=True, sort=False)
         all_df = all_df[all_df["symbol"].astype(str).str.len() > 0].copy()
-
-        logger.info(
-            "[PUSH RANKING SELECTOR] loaded total rows=%d symbols=%d path=%s",
-            len(all_df),
-            all_df["symbol"].nunique(),
-            path,
-        )
+        logger.info("[PUSH RANKING SELECTOR] loaded total rows=%d symbols=%d path=%s", len(all_df), all_df["symbol"].nunique(), path)
         return all_df
-
     except sqlite3.OperationalError:
         logger.exception("[PUSH RANKING SELECTOR] ranking db operational error path=%s", path)
         return pd.DataFrame()
@@ -387,70 +272,58 @@ def _load_ranking_df(
 def _apply_freshness(df: pd.DataFrame, fresh_minutes: float = DEFAULT_FRESH_MINUTES) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
-    if "snapshot_time" not in df.columns:
-        return df
-    if df["snapshot_time"].notna().sum() <= 0:
+    if "snapshot_time" not in df.columns or df["snapshot_time"].notna().sum() <= 0:
         return df
     latest = df["snapshot_time"].max()
     if pd.isna(latest):
         return df
-    cutoff = latest - pd.Timedelta(minutes=max(0.0, float(fresh_minutes)))
+    now = pd.Timestamp(dt.datetime.now())
+    latest_age_min = (now - latest).total_seconds() / 60.0
+    if latest_age_min > MAX_DB_STALE_MINUTES:
+        logger.warning(
+            "[PUSH RANKING SELECTOR] ranking db stale -> return empty latest=%s now=%s age_min=%.1f max_age=%.1f before=%d",
+            latest, now, latest_age_min, MAX_DB_STALE_MINUTES, len(df),
+        )
+        return df.iloc[0:0].copy()
+    cutoff = max(latest - pd.Timedelta(minutes=max(0.0, float(fresh_minutes))), now - pd.Timedelta(minutes=max(0.0, float(fresh_minutes))))
     out = df[(df["snapshot_time"].isna()) | (df["snapshot_time"] >= cutoff)].copy()
-    logger.info(
-        "[PUSH RANKING SELECTOR] freshness filter latest=%s cutoff=%s before=%d after=%d",
-        latest,
-        cutoff,
-        len(df),
-        len(out),
-    )
+    logger.info("[PUSH RANKING SELECTOR] freshness filter latest=%s now=%s cutoff=%s before=%d after=%d age_min=%.1f", latest, now, cutoff, len(df), len(out), latest_age_min)
     return out
 
 
-def _apply_min_liquidity(
-    df: pd.DataFrame,
-    *,
-    min_price: float = MIN_PRICE,
-    min_trading_value: float = MIN_TRADING_VALUE,
-    min_volume: float = MIN_VOLUME,
-    min_tick_count: float = MIN_TICK_COUNT,
-    strict: bool = False,
-) -> pd.DataFrame:
+def _apply_min_liquidity(df: pd.DataFrame, *, min_price: float = MIN_PRICE, min_trading_value: float = MIN_TRADING_VALUE, min_volume: float = MIN_VOLUME, min_tick_count: float = MIN_TICK_COUNT, strict: bool = False) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
-
     out = df.copy()
     before = len(out)
-
     def apply_cond(col: str, min_value: float) -> None:
         nonlocal out
         if min_value <= 0:
             return
-        if col not in out.columns:
-            if strict:
-                out = out.iloc[0:0].copy()
-            return
-        if out[col].notna().sum() <= 0:
+        if col not in out.columns or out[col].notna().sum() <= 0:
             if strict:
                 out = out.iloc[0:0].copy()
             return
         out = out[(out[col].isna()) | (out[col] >= float(min_value))].copy()
-
     apply_cond("current_price", min_price)
     apply_cond("trading_value", min_trading_value)
     apply_cond("volume", min_volume)
     apply_cond("tick_count", min_tick_count)
-
-    logger.info(
-        "[PUSH RANKING SELECTOR] liquidity filter before=%d after=%d min_price=%.1f min_value=%.1f min_volume=%.1f min_tick=%.1f strict=%s",
-        before,
-        len(out),
-        min_price,
-        min_trading_value,
-        min_volume,
-        min_tick_count,
-        strict,
-    )
+    logger.info("[PUSH RANKING SELECTOR] liquidity filter before=%d after=%d min_price=%.1f min_value=%.1f min_volume=%.1f min_tick=%.1f strict=%s", before, len(out), min_price, min_trading_value, min_volume, min_tick_count, strict)
     return out
+
+
+def _apply_liquidity_safe(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    for min_price, min_value, min_volume, min_tick, label in RELAXED_LIQUIDITY_STEPS:
+        out = _apply_min_liquidity(df, min_price=min_price, min_trading_value=min_value, min_volume=min_volume, min_tick_count=min_tick, strict=False)
+        if not out.empty:
+            logger.info("[PUSH RANKING SELECTOR] liquidity accepted step=%s rows=%d", label, len(out))
+            return out
+        logger.warning("[PUSH RANKING SELECTOR] liquidity step empty step=%s", label)
+    logger.warning("[PUSH RANKING SELECTOR] liquidity filter empty -> no unfiltered fallback; return empty")
+    return df.iloc[0:0].copy()
 
 
 def _latest_per_symbol(df: pd.DataFrame) -> pd.DataFrame:
@@ -466,18 +339,14 @@ def _latest_per_symbol(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _category_contains(df: pd.DataFrame, patterns: str) -> pd.Series:
-    if df is None or df.empty:
-        return pd.Series([], dtype=bool)
-    if "category" not in df.columns:
-        return pd.Series([False] * len(df), index=df.index)
+    if df is None or df.empty or "category" not in df.columns:
+        return pd.Series([False] * (0 if df is None else len(df)), index=None if df is None else df.index)
     return df["category"].astype(str).str.contains(patterns, case=False, regex=True, na=False)
 
 
 def _market_contains(df: pd.DataFrame, patterns: str) -> pd.Series:
-    if df is None or df.empty:
-        return pd.Series([], dtype=bool)
-    if "market" not in df.columns:
-        return pd.Series([False] * len(df), index=df.index)
+    if df is None or df.empty or "market" not in df.columns:
+        return pd.Series([False] * (0 if df is None else len(df)), index=None if df is None else df.index)
     return df["market"].astype(str).str.contains(patterns, case=False, regex=True, na=False)
 
 
@@ -579,10 +448,9 @@ def _select_all_market_gainers_by_value(df: pd.DataFrame) -> list[str]:
     if sub.empty and "change_rate" in df.columns:
         sub = df[df["change_rate"] > 0].copy()
     sub = _latest_per_symbol(sub)
-    sub = _sort_by_change_rate_up(sub)
-    top50 = sub.head(GAINER_TOP_N)
-    top_by_value = _sort_by_trading_value(top50).head(GAINER_BY_VALUE_N)
-    return _symbols_from_df(top_by_value, "all_gainers_top50_by_value35", GAINER_BY_VALUE_N)
+    top50 = _sort_by_change_rate_up(sub).head(GAINER_TOP_N)
+    selected = _sort_by_trading_value(top50).head(GAINER_BY_VALUE_N)
+    return _symbols_from_df(selected, "all_gainers_top50_by_value35", GAINER_BY_VALUE_N)
 
 
 def _select_all_market_losers_by_value(df: pd.DataFrame) -> list[str]:
@@ -592,10 +460,9 @@ def _select_all_market_losers_by_value(df: pd.DataFrame) -> list[str]:
     if sub.empty and "change_rate" in df.columns:
         sub = df[df["change_rate"] < 0].copy()
     sub = _latest_per_symbol(sub)
-    sub = _sort_by_change_rate_down(sub)
-    top50 = sub.head(LOSER_TOP_N)
-    top_by_value = _sort_by_trading_value(top50).head(LOSER_BY_VALUE_N)
-    return _symbols_from_df(top_by_value, "all_losers_top50_by_value25", LOSER_BY_VALUE_N)
+    top50 = _sort_by_change_rate_down(sub).head(LOSER_TOP_N)
+    selected = _sort_by_trading_value(top50).head(LOSER_BY_VALUE_N)
+    return _symbols_from_df(selected, "all_losers_top50_by_value25", LOSER_BY_VALUE_N)
 
 
 def _select_value_top_up_rate(df: pd.DataFrame) -> list[str]:
@@ -635,10 +502,9 @@ def _select_growth_market_gainers_by_value(df: pd.DataFrame) -> list[str]:
     if sub.empty and "change_rate" in df.columns:
         sub = df[market_mask & (df["change_rate"] > 0)].copy()
     sub = _latest_per_symbol(sub)
-    sub = _sort_by_change_rate_up(sub)
-    top50 = sub.head(GROWTH_TOP_N)
-    top_by_value = _sort_by_trading_value(top50).head(GROWTH_BY_VALUE_N)
-    return _symbols_from_df(top_by_value, "growth_gainers_top50_by_value15", GROWTH_BY_VALUE_N)
+    top50 = _sort_by_change_rate_up(sub).head(GROWTH_TOP_N)
+    selected = _sort_by_trading_value(top50).head(GROWTH_BY_VALUE_N)
+    return _symbols_from_df(selected, "growth_gainers_top50_by_value15", GROWTH_BY_VALUE_N)
 
 
 def _select_standard_market_gainers_by_value(df: pd.DataFrame) -> list[str]:
@@ -650,10 +516,9 @@ def _select_standard_market_gainers_by_value(df: pd.DataFrame) -> list[str]:
     if sub.empty and "change_rate" in df.columns:
         sub = df[market_mask & (df["change_rate"] > 0)].copy()
     sub = _latest_per_symbol(sub)
-    sub = _sort_by_change_rate_up(sub)
-    top50 = sub.head(STANDARD_TOP_N)
-    top_by_value = _sort_by_trading_value(top50).head(STANDARD_BY_VALUE_N)
-    return _symbols_from_df(top_by_value, "standard_gainers_top50_by_value15", STANDARD_BY_VALUE_N)
+    top50 = _sort_by_change_rate_up(sub).head(STANDARD_TOP_N)
+    selected = _sort_by_trading_value(top50).head(STANDARD_BY_VALUE_N)
+    return _symbols_from_df(selected, "standard_gainers_top50_by_value15", STANDARD_BY_VALUE_N)
 
 
 def _select_tick_top_fill(df: pd.DataFrame) -> list[str]:
@@ -667,11 +532,7 @@ def _select_tick_top_fill(df: pd.DataFrame) -> list[str]:
     return _symbols_from_df(selected, "tick_top50_fill", TICK_TOP_N)
 
 
-def split_push_ranking_symbols_for_rotation(
-    symbols: Sequence[Any],
-    *,
-    register_limit: int = DEFAULT_REGISTER_LIMIT,
-) -> Tuple[list[str], list[str]]:
+def split_push_ranking_symbols_for_rotation(symbols: Sequence[Any], *, register_limit: int = DEFAULT_REGISTER_LIMIT) -> Tuple[list[str], list[str]]:
     uniq = _dedupe_keep_order(symbols)
     limit = int(register_limit or DEFAULT_REGISTER_LIMIT)
     if limit <= 0:
@@ -682,12 +543,7 @@ def split_push_ranking_symbols_for_rotation(
     return rotation_a, rotation_b
 
 
-def pick_push_ranking_symbols_for_rotation(
-    symbols: Sequence[Any],
-    *,
-    rotation: str = "A",
-    register_limit: int = DEFAULT_REGISTER_LIMIT,
-) -> list[str]:
+def pick_push_ranking_symbols_for_rotation(symbols: Sequence[Any], *, rotation: str = "A", register_limit: int = DEFAULT_REGISTER_LIMIT) -> list[str]:
     a, b = split_push_ranking_symbols_for_rotation(symbols, register_limit=register_limit)
     r = str(rotation or "A").upper().strip()
     selected = b if r in ("B", "ROTATION_B", "1", "SECOND", "NEXT") else a
@@ -695,35 +551,25 @@ def pick_push_ranking_symbols_for_rotation(
     return selected
 
 
-def build_push_ranking_symbols(
-    *,
-    max_symbols: int = DEFAULT_MAX_SYMBOLS,
-    db_path: Optional[str | os.PathLike] = None,
-    yyyymmdd: Any = None,
-    fresh_minutes: float = DEFAULT_FRESH_MINUTES,
-    apply_liquidity: bool = True,
-) -> list[str]:
+def build_push_ranking_symbols(*, max_symbols: int = DEFAULT_MAX_SYMBOLS, db_path: Optional[str | os.PathLike] = None, yyyymmdd: Any = None, fresh_minutes: float = DEFAULT_FRESH_MINUTES, apply_liquidity: bool = True) -> list[str]:
     try:
         limit = int(max_symbols or DEFAULT_MAX_SYMBOLS)
         if limit <= 0:
             limit = DEFAULT_MAX_SYMBOLS
-
         df = _load_ranking_df(db_path=db_path, yyyymmdd=yyyymmdd)
         if df.empty:
             logger.warning("[PUSH RANKING SELECTOR] no ranking df")
             return []
-
         df = _apply_freshness(df, fresh_minutes=fresh_minutes)
-
+        if df.empty:
+            logger.warning("[PUSH RANKING SELECTOR] no ranking df after freshness filter")
+            return []
         if apply_liquidity:
-            df_liq = _apply_min_liquidity(df, strict=False)
-            if not df_liq.empty:
-                df = df_liq
-            else:
-                logger.warning("[PUSH RANKING SELECTOR] liquidity filter empty -> fallback unfiltered")
-
+            df = _apply_liquidity_safe(df)
+            if df.empty:
+                logger.warning("[PUSH RANKING SELECTOR] no ranking df after liquidity filter")
+                return []
         merged: list[str] = []
-
         buckets = [
             ("all_gainers_top50_by_value35", _select_all_market_gainers_by_value),
             ("all_losers_top50_by_value25", _select_all_market_losers_by_value),
@@ -733,103 +579,25 @@ def build_push_ranking_symbols(
             ("standard_gainers_top50_by_value15", _select_standard_market_gainers_by_value),
             ("tick_top50_fill", _select_tick_top_fill),
         ]
-
         for label, fn in buckets:
             if len(merged) >= limit:
                 break
             symbols = fn(df)
             before = len(merged)
             merged = _append_unique_until(merged, symbols, max_symbols=limit)
-            logger.info(
-                "[PUSH RANKING SELECTOR] merge bucket=%s added_raw=%d before=%d after=%d",
-                label,
-                len(symbols),
-                before,
-                len(merged),
-            )
-
-        merged = _dedupe_keep_order(merged)
-        if limit and limit > 0:
-            merged = merged[:limit]
-
+            logger.info("[PUSH RANKING SELECTOR] merge bucket=%s added_raw=%d before=%d after=%d", label, len(symbols), before, len(merged))
+        merged = _dedupe_keep_order(merged)[:limit]
         logger.info("[PUSH RANKING SELECTOR] final symbols=%d max=%d head=%s", len(merged), limit, merged[:30])
-
         if len(merged) < min(limit, DEFAULT_MAX_SYMBOLS):
-            logger.warning(
-                "[PUSH RANKING SELECTOR] final symbols less than target count=%d target=%d",
-                len(merged),
-                min(limit, DEFAULT_MAX_SYMBOLS),
-            )
-
+            logger.warning("[PUSH RANKING SELECTOR] final symbols less than target count=%d target=%d", len(merged), min(limit, DEFAULT_MAX_SYMBOLS))
         return merged
-
     except Exception:
         logger.exception("[PUSH RANKING SELECTOR] build failed")
         return []
 
 
-def build_push_ranking_symbols_for_rotation(
-    *,
-    rotation: str = "A",
-    register_limit: int = DEFAULT_REGISTER_LIMIT,
-    max_symbols: int = DEFAULT_MAX_SYMBOLS,
-    db_path: Optional[str | os.PathLike] = None,
-    yyyymmdd: Any = None,
-    fresh_minutes: float = DEFAULT_FRESH_MINUTES,
-    apply_liquidity: bool = True,
-) -> list[str]:
-    symbols100 = build_push_ranking_symbols(
-        max_symbols=max_symbols,
-        db_path=db_path,
-        yyyymmdd=yyyymmdd,
-        fresh_minutes=fresh_minutes,
-        apply_liquidity=apply_liquidity,
-    )
-    return pick_push_ranking_symbols_for_rotation(
-        symbols100,
-        rotation=rotation,
-        register_limit=register_limit,
-    )
-
-
-def get_push_ranking_symbols_for_rotation(
-    symbols: Optional[Sequence[Any]] = None,
-    *,
-    rotation: str = "A",
-    register_limit: int = DEFAULT_REGISTER_LIMIT,
-    max_symbols: int = DEFAULT_MAX_SYMBOLS,
-    db_path: Optional[str | os.PathLike] = None,
-    yyyymmdd: Any = None,
-    fresh_minutes: float = DEFAULT_FRESH_MINUTES,
-    apply_liquidity: bool = True,
-) -> list[str]:
-    if symbols is not None:
-        return pick_push_ranking_symbols_for_rotation(
-            symbols,
-            rotation=rotation,
-            register_limit=register_limit,
-        )
-
-    return build_push_ranking_symbols_for_rotation(
-        rotation=rotation,
-        register_limit=register_limit,
-        max_symbols=max_symbols,
-        db_path=db_path,
-        yyyymmdd=yyyymmdd,
-        fresh_minutes=fresh_minutes,
-        apply_liquidity=apply_liquidity,
-    )
-
-
-def load_selected_ranking_symbols(*args, **kwargs) -> list[str]:
-    return build_push_ranking_symbols(*args, **kwargs)
-
-
 __all__ = [
     "build_push_ranking_symbols",
-    "build_push_ranking_symbols_for_rotation",
-    "get_push_ranking_symbols_for_rotation",
     "split_push_ranking_symbols_for_rotation",
     "pick_push_ranking_symbols_for_rotation",
-    "load_selected_ranking_symbols",
 ]
