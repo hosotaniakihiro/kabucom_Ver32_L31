@@ -1,22 +1,15 @@
 # ============================================================
 # File   : core/startup/entry_limit_passive_runtime_patch.py
-# Version: V1.4-MISSING-TECHNICAL-READY-PASS-TO-SLOPE-MTF
+# Version: V1.5-BOARD-TOUCH-NO-RECURSION
 # ------------------------------------------------------------
 # SUMMARY_AI エントリー指値を board touch に変更し、同時に
-# 「売ったら上がる / 買ったら下がる」対策として発注直前ガードを強化する。
+# 発注直前ガードを強化する。
 #
-# 重要:
-#   BUY  : ask 指値
-#   SELL : bid 指値
-#
-# 追加防衛:
-#   1. 板が取れない場合、ENTRY_ALLOW_ENTRY_WITHOUT_BOARD=1 なら
-#      close/current/reference price の fallback 指値で継続する
-#   2. technical_ready が明示 False の場合だけ止める
-#      None/欠損は entry_row 欠損として slope / MTF 判定へ進める
-#   3. BUY は slope が正方向、SELL は slope が負方向のときだけ通す
-#   4. MTF / score_mtf が逆方向なら止める
-#   5. SELL で positive MTF を無視しない
+# 重要修正:
+#   - entry_price_improvement_patch と相互に巻き直して
+#     RecursionError になる問題を防止する。
+#   - wrapper には _entry_board_touch_original を保持し、
+#     既存チェーン内に自分がいる場合は再ラップしない。
 # ============================================================
 
 from __future__ import annotations
@@ -128,6 +121,29 @@ def _ng(reason: str, **detail: Any) -> Dict[str, Any]:
     return {"ok": False, "reason": reason, "detail": detail}
 
 
+def _chain_contains(fn: Any, marker: str, *, limit: int = 20) -> bool:
+    seen: set[int] = set()
+    cur = fn
+    for _ in range(limit):
+        if not callable(cur):
+            return False
+        ident = id(cur)
+        if ident in seen:
+            return False
+        seen.add(ident)
+        if getattr(cur, marker, False):
+            return True
+        nxt = (
+            getattr(cur, "_entry_board_touch_original", None)
+            or getattr(cur, "_entry_price_improvement_original", None)
+            or getattr(cur, "_original", None)
+        )
+        if nxt is None:
+            return False
+        cur = nxt
+    return False
+
+
 def _summary_ai_strict_guard(*, symbol: str, side: str, row: dict, detail: dict) -> Optional[Dict[str, Any]]:
     side_u = str(side or "").upper()
 
@@ -208,9 +224,6 @@ def _summary_ai_strict_guard(*, symbol: str, side: str, row: dict, detail: dict)
 
 def install() -> bool:
     global _INSTALLED
-    if _INSTALLED:
-        return True
-
     try:
         import trading.handlers.entry_controller as ec
         import trading.handlers.entry_order_builder as eob
@@ -224,6 +237,13 @@ def install() -> bool:
         if not callable(old_build) or not callable(round_price):
             logger.warning("[ENTRY LIMIT BOARD TOUCH] required functions not callable")
             return False
+
+        # 既にチェーン内に board touch wrapper がある場合は再ラップしない。
+        # price_improvement wrapper が外側/内側にいても、この判定で循環を防止する。
+        if _chain_contains(old_build, "_entry_board_touch_wrapped"):
+            _INSTALLED = True
+            logger.warning("[ENTRY LIMIT BOARD TOUCH] already present in wrapper chain -> skip rewrap")
+            return True
 
         setattr(eob, "SUMMARY_AGGRESSIVE_LIMIT_TICKS", 0)
         setattr(eob, "ENTRY_ORDER_REQUIRE_MTF_DATA", _env_bool("ENTRY_STRICT_SUMMARY_REQUIRE_MTF_DATA", True))
@@ -239,60 +259,60 @@ def install() -> bool:
         _board_touch_limit_price._entry_board_touch = True  # type: ignore[attr-defined]
         setattr(eob, "_aggressive_limit_price", _board_touch_limit_price)
 
-        if not getattr(old_build, "_entry_board_touch_wrapped", False):
-            def build_entry_order_board_touch(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-                ret = old_build(*args, **kwargs)
-                try:
-                    src = str(kwargs.get("source") or "").upper()
-                    side = str(kwargs.get("side") or "").upper()
-                    symbol = str(kwargs.get("symbol") or "").strip()
-                    row = _row_to_dict(kwargs.get("entry_row"))
+        def build_entry_order_board_touch(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+            ret = old_build(*args, **kwargs)
+            try:
+                src = str(kwargs.get("source") or "").upper()
+                side = str(kwargs.get("side") or "").upper()
+                symbol = str(kwargs.get("symbol") or "").strip()
+                row = _row_to_dict(kwargs.get("entry_row"))
 
-                    if isinstance(ret, dict) and ret.get("ok"):
-                        detail = ret.get("detail")
-                        if isinstance(detail, dict) and src == "SUMMARY_AI" and detail.get("order_type") == "LIMIT":
-                            detail["aggressive_limit_ticks"] = 0
-                            detail["entry_limit_mode"] = "BOARD_TOUCH_OR_FALLBACK"
-                            detail["price_rule"] = "BUY=ask / SELL=bid / board_missing=fallback_limit"
-                            if detail.get("board"):
-                                detail["price_source"] = "board_bid_ask_touch"
-                            else:
-                                detail["price_source"] = "summary_fallback_touch"
+                if isinstance(ret, dict) and ret.get("ok"):
+                    detail = ret.get("detail")
+                    if isinstance(detail, dict) and src == "SUMMARY_AI" and detail.get("order_type") == "LIMIT":
+                        detail["aggressive_limit_ticks"] = 0
+                        detail["entry_limit_mode"] = "BOARD_TOUCH_OR_FALLBACK"
+                        detail["price_rule"] = "BUY=ask / SELL=bid / board_missing=fallback_limit"
+                        if detail.get("board"):
+                            detail["price_source"] = "board_bid_ask_touch"
+                        else:
+                            detail["price_source"] = "summary_fallback_touch"
 
-                            strict_ng = _summary_ai_strict_guard(symbol=symbol, side=side, row=row, detail=detail)
-                            if strict_ng is not None:
-                                logger.warning(
-                                    "[ENTRY LIMIT BOARD TOUCH] NG symbol=%s side=%s reason=%s detail=%s",
-                                    symbol,
-                                    side,
-                                    strict_ng.get("reason"),
-                                    strict_ng.get("detail"),
-                                )
-                                return strict_ng
-
+                        strict_ng = _summary_ai_strict_guard(symbol=symbol, side=side, row=row, detail=detail)
+                        if strict_ng is not None:
                             logger.warning(
-                                "[ENTRY LIMIT BOARD TOUCH] symbol=%s side=%s price=%s base=%s rule=%s guard=OK",
+                                "[ENTRY LIMIT BOARD TOUCH] NG symbol=%s side=%s reason=%s detail=%s",
                                 symbol,
                                 side,
-                                detail.get("price"),
-                                detail.get("base_price"),
-                                detail.get("price_rule"),
+                                strict_ng.get("reason"),
+                                strict_ng.get("detail"),
                             )
-                except Exception:
-                    logger.debug("[ENTRY LIMIT BOARD TOUCH] detail patch failed", exc_info=True)
-                return ret
+                            return strict_ng
 
-            build_entry_order_board_touch._entry_board_touch_wrapped = True  # type: ignore[attr-defined]
-            build_entry_order_board_touch._original = old_build  # type: ignore[attr-defined]
-            setattr(eob, "build_entry_order", build_entry_order_board_touch)
-            try:
-                setattr(ec, "build_entry_order", build_entry_order_board_touch)
+                        logger.warning(
+                            "[ENTRY LIMIT BOARD TOUCH] symbol=%s side=%s price=%s base=%s rule=%s guard=OK",
+                            symbol,
+                            side,
+                            detail.get("price"),
+                            detail.get("base_price"),
+                            detail.get("price_rule"),
+                        )
             except Exception:
-                logger.debug("[ENTRY LIMIT BOARD TOUCH] entry_controller patch skipped", exc_info=True)
+                logger.debug("[ENTRY LIMIT BOARD TOUCH] detail patch failed", exc_info=True)
+            return ret
+
+        build_entry_order_board_touch._entry_board_touch_wrapped = True  # type: ignore[attr-defined]
+        build_entry_order_board_touch._entry_board_touch_original = old_build  # type: ignore[attr-defined]
+        build_entry_order_board_touch._original = old_build  # type: ignore[attr-defined]
+        setattr(eob, "build_entry_order", build_entry_order_board_touch)
+        try:
+            setattr(ec, "build_entry_order", build_entry_order_board_touch)
+        except Exception:
+            logger.debug("[ENTRY LIMIT BOARD TOUCH] entry_controller patch skipped", exc_info=True)
 
         _INSTALLED = True
         logger.warning(
-            "[ENTRY LIMIT BOARD TOUCH] installed rule=BUY:ask SELL:bid strict_board=%s allow_without_board=%s require_tech=%s slope_eps=%.6f require_mtf=%s sell_ignore_positive_mtf=False tech_missing_pass=True",
+            "[ENTRY LIMIT BOARD TOUCH] installed rule=BUY:ask SELL:bid strict_board=%s allow_without_board=%s require_tech=%s slope_eps=%.6f require_mtf=%s sell_ignore_positive_mtf=False tech_missing_pass=True no_recursion=True",
             _env_bool("ENTRY_STRICT_BOARD_REQUIRED", False),
             _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", True),
             _env_bool("ENTRY_STRICT_SUMMARY_REQUIRE_TECHNICAL_READY", True),
