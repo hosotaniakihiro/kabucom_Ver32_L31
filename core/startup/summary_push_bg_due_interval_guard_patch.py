@@ -1,21 +1,16 @@
 # ============================================================
 # File   : core/startup/summary_push_bg_due_interval_guard_patch.py
-# Version: V3-ONE-MINUTE-DEDICATED-THREAD
+# Version: V4-ONE-MINUTE-DEDICATED-THREAD-DISPLAY-FIRST
 # ------------------------------------------------------------
 # 目的:
 #   main.py(entry_only) で PUSH 1m/3m/5m をBG実行する際、
 #   3分足・5分足を毎分投入しないようにしつつ、1分足は確実に表示する。
 #
-# V3 修正:
-#   ✔ V2で1分足staleは60秒になったが、共有BG executorが詰まると
-#     「bg push submitted」だけ出て「bg push start」が出ない
-#   ✔ 1分足だけ専用 daemon Thread で起動する
-#   ✔ 3分/5分は従来通り shared executor を使う
-#   ✔ 1分足Thread起動ログを bg push dedicated thread started として出す
-#
-# ログ上の問題例:
-#   [SUMMARY PUSH BG DUE GUARD] bg push submitted key=202605291227:push:1 ...
-#   その後に bg push start / job start が出ない
+# V4 修正:
+#   ✔ 1分足専用 daemon Thread は維持
+#   ✔ main.py側の1分足PUSHは、計算後に保存処理で止まらないよう
+#     summary_main_skip_save_for_display_patch を同時installする
+#   ✔ DB保存は main_database.py 側が担当し、main.py は表示/AIを優先
 # ============================================================
 
 from __future__ import annotations
@@ -74,6 +69,17 @@ def _is_due(interval: int, now: dt.datetime) -> bool:
         return True
 
 
+def _install_display_first_patch() -> bool:
+    try:
+        from core.startup.summary_main_skip_save_for_display_patch import install as install_display_first
+        ok = bool(install_display_first())
+        logger.warning("[SUMMARY PUSH BG DUE GUARD] display-first save skip patch installed=%s", ok)
+        return ok
+    except Exception:
+        logger.exception("[SUMMARY PUSH BG DUE GUARD] display-first save skip patch install failed")
+        return False
+
+
 def _run_task_direct_thread(task, *, bg_key: str, interval: int) -> bool:
     try:
         th = threading.Thread(
@@ -95,7 +101,6 @@ def _run_task_direct_thread(task, *, bg_key: str, interval: int) -> bool:
 
 
 def _patched_submit_bg_push_interval(*, interval: int, now: dt.datetime, display: bool, run_entry: bool) -> None:
-    """summary_parallel_intervals_runtime_patch._submit_bg_push_interval replacement."""
     try:
         import core.startup.summary_parallel_intervals_runtime_patch as sp
     except Exception:
@@ -195,25 +200,29 @@ def _patched_submit_bg_push_interval(*, interval: int, now: dt.datetime, display
 def install() -> bool:
     global _PATCHED, _ORIGINAL_SUBMIT
     if _PATCHED:
+        _install_display_first_patch()
         return True
     try:
         import core.startup.summary_parallel_intervals_runtime_patch as sp
         cur = getattr(sp, "_submit_bg_push_interval", None)
-        if getattr(cur, "_summary_push_bg_due_guard_v3", False):
+        if getattr(cur, "_summary_push_bg_due_guard_v4", False):
             _PATCHED = True
+            _install_display_first_patch()
             return True
         _ORIGINAL_SUBMIT = cur
         _patched_submit_bg_push_interval._summary_push_bg_due_guard = True  # type: ignore[attr-defined]
-        _patched_submit_bg_push_interval._summary_push_bg_due_guard_v3 = True  # type: ignore[attr-defined]
+        _patched_submit_bg_push_interval._summary_push_bg_due_guard_v4 = True  # type: ignore[attr-defined]
         sp._submit_bg_push_interval = _patched_submit_bg_push_interval
         _PATCHED = True
+        display_first_ok = _install_display_first_patch()
         logger.warning(
-            "[SUMMARY PUSH BG DUE GUARD] installed v3 due_only=%s stale_1m=%.1f stale_3m=%.1f stale_5m=%.1f dedicated_1m=%s original=%s",
+            "[SUMMARY PUSH BG DUE GUARD] installed v4 due_only=%s stale_1m=%.1f stale_3m=%.1f stale_5m=%.1f dedicated_1m=%s display_first=%s original=%s",
             _env_bool("SUMMARY_PUSH_BG_LONG_INTERVAL_DUE_ONLY", True),
             _stale_sec_for_interval(1),
             _stale_sec_for_interval(3),
             _stale_sec_for_interval(5),
             _env_bool("SUMMARY_PUSH_1M_DEDICATED_THREAD", True),
+            display_first_ok,
             getattr(cur, "__name__", str(cur)),
         )
         return True
