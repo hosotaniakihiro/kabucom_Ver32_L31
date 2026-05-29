@@ -1,29 +1,13 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver26-TONOSAMA-PRICE-RANGE-RESCUE
+# Version: Ver27-SHORT-MTF-2OF3-AUTO-INSTALL
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # 失敗しても本体起動は止めない。
 #
-# Ver26:
-#   - TONOSAMA が price_change_low_abs で全落ちするケースへ対応。
-#   - 日中レンジ・出来高・surge が十分なら、_max_price_change_pct が小さくても
-#     TONOSAMA_PRICE_RANGE_RESCUE で候補を後段guardへ渡す。
-#
-# Ver25:
-#   - ENTRY_DIRECTION_CONFIRM の RecursionError だけで発注候補が落ちる問題へ対応。
-#   - ENTRY_DIRECTION_RECURSION_FAILOPEN を自動install。
-#   - RecursionError時は方向確認ガードだけskipし、LOW MOVE / credit / liquidity等の他ガードは残す。
-#
-# Ver24:
-#   - ranking entry loop が global_data.latest_ranking_* を見つけられない場合でも、
-#     rankingYYYYMMDD.db / ranking_snapshot_1min から直接復元する
-#     RANKING_ENTRY_SOURCE_DB_FALLBACK を自動install。
-#
-# Ver23:
-#   - ランキング由来entry rowの high/low が0で LOW MOVE GUARD no_high_low になる問題へ対応。
-#   - ranking_snapshot_1min の直近価格履歴から high/low/range_pct を補完する
-#     RANKING_ENTRY_HIGH_LOW_SNAPSHOT を自動install。
+# Ver27:
+#   - SHORT_MTF guard v1.4 を自動install。
+#   - 1m/3m/5m 全一致必須ではなく、2本以上が方向一致なら許可。
 # ============================================================
 
 from __future__ import annotations
@@ -142,6 +126,7 @@ def _install_liq_empty_fallback_only_if_enabled() -> None:
 
 def _install_tonosama_surge_defaults() -> None:
     try:
+        # TONOSAMA / ranking / summary guards
         os.environ.setdefault("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING", "1")
         os.environ.setdefault("TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY", "1")
         os.environ.setdefault("TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE", "3.0")
@@ -156,11 +141,25 @@ def _install_tonosama_surge_defaults() -> None:
         os.environ.setdefault("TONOSAMA_PRICE_CHANGE_OR_RANGE_MIN_RANGE_PCT", "3.0")
         os.environ.setdefault("TONOSAMA_PRICE_CHANGE_OR_RANGE_MIN_VOLUME", "50000")
         os.environ.setdefault("TONOSAMA_PRICE_CHANGE_OR_RANGE_MIN_SURGE", "3.0")
+
         os.environ.setdefault("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_ENABLED", "1")
         os.environ.setdefault("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_SEC", "35")
         os.environ.setdefault("ENTRY_CONTROLLER_SOURCE_PREFILTER_ENABLED", "1")
         os.environ.setdefault("ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE", "1")
         os.environ.setdefault("ENTRY_CONTROLLER_TONOSAMA_MIN_SCORE", "0.01")
+        os.environ.setdefault("ENTRY_DIRECTION_RECURSION_FAILOPEN_ENABLED", "1")
+
+        # 短期MTF: 3本全一致ではなく 2/3 で許可
+        os.environ.setdefault("ENTRY_SHORT_MTF_REQUIRED", "1")
+        os.environ["ENTRY_SHORT_MTF_REQUIRE_ALL"] = "0"
+        os.environ.setdefault("ENTRY_SHORT_MTF_FORCE_2OF3", "1")
+        os.environ.setdefault("ENTRY_SHORT_MTF_MIN_ALIGNED", "2")
+        os.environ.setdefault("ENTRY_SHORT_MTF_MIN_AVAILABLE", "2")
+        os.environ.setdefault("ENTRY_SHORT_MTF_SLOPE_EPS", "0.0")
+        os.environ.setdefault("ENTRY_DAILY_MTF_OPTIONAL", "1")
+        os.environ.setdefault("ENTRY_SHORT_MTF_DB_BACKFILL", "1")
+        os.environ.setdefault("ENTRY_SHORT_MTF_ZERO_NEUTRAL", "1")
+
         os.environ.setdefault("LOW_MOVE_TONOSAMA_MIN_ENTRY_PRICE", "300")
         os.environ.setdefault("LOW_MOVE_TONOSAMA_ALLOW_NO_HIGHLOW_FALLBACK", "1")
         os.environ.setdefault("LOW_MOVE_TONOSAMA_NO_HIGHLOW_FALLBACK_RANGE_PCT", "0.012")
@@ -168,6 +167,7 @@ def _install_tonosama_surge_defaults() -> None:
         os.environ.setdefault("FINAL_ENTRY_TONOSAMA_MIN_VOLUME", "10000")
         os.environ.setdefault("FINAL_ENTRY_TONOSAMA_MIN_TURNOVER", "3000000")
         os.environ.setdefault("FINAL_ENTRY_TONOSAMA_MIN_VOLUME_SPEED", "1.0")
+
         os.environ.setdefault("SUMMARY_DB_DATE_GUARD_ENABLED", "1")
         os.environ.setdefault("SUMMARY_DB_DATE_GUARD_CLEANUP_ENABLED", "0")
         os.environ.setdefault("RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH_ENABLED", "1")
@@ -176,8 +176,10 @@ def _install_tonosama_surge_defaults() -> None:
         os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED", "1")
         os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_LOOKBACK_MIN", "8")
         os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_MAX_ROWS", "2000")
-        os.environ.setdefault("ENTRY_DIRECTION_RECURSION_FAILOPEN_ENABLED", "1")
+
         _write_boot_evidence("TONOSAMA_SURGE_DEFAULTS_SET", {
+            "short_mtf_require_all": os.environ.get("ENTRY_SHORT_MTF_REQUIRE_ALL"),
+            "short_mtf_min_aligned": os.environ.get("ENTRY_SHORT_MTF_MIN_ALIGNED"),
             "ranking_source_db_fallback": os.environ.get("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED"),
             "ranking_hl_patch": os.environ.get("RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH_ENABLED"),
             "entry_direction_recursion_failopen": os.environ.get("ENTRY_DIRECTION_RECURSION_FAILOPEN_ENABLED"),
@@ -185,7 +187,9 @@ def _install_tonosama_surge_defaults() -> None:
             "tonosama_price_range_rescue": os.environ.get("TONOSAMA_PRICE_CHANGE_OR_RANGE_ENABLED"),
         })
         logger.warning(
-            "[SITECUSTOMIZE] defaults ranking_source_db_fallback=%s ranking_hl_patch=%s entry_direction_recursion_failopen=%s summary_date_guard=%s warning_only_climax=%s tonosama_price_range_rescue=%s",
+            "[SITECUSTOMIZE] defaults short_mtf_require_all=%s short_mtf_min_aligned=%s ranking_source_db_fallback=%s ranking_hl_patch=%s entry_direction_recursion_failopen=%s summary_date_guard=%s warning_only_climax=%s tonosama_price_range_rescue=%s",
+            os.environ.get("ENTRY_SHORT_MTF_REQUIRE_ALL"),
+            os.environ.get("ENTRY_SHORT_MTF_MIN_ALIGNED"),
             os.environ.get("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED"),
             os.environ.get("RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH_ENABLED"),
             os.environ.get("ENTRY_DIRECTION_RECURSION_FAILOPEN_ENABLED"),
@@ -229,6 +233,7 @@ _install_module("core.startup.ranking_entry_flat_price_guard_patch", "RANKING_FL
 _install_module("core.startup.ranking_entry_source_db_fallback_patch", "RANKING_ENTRY_SOURCE_DB_FALLBACK", disabled_env="DISABLE_RANKING_ENTRY_SOURCE_DB_FALLBACK_PATCH")
 _install_module("core.startup.ranking_entry_high_low_from_snapshot_patch", "RANKING_ENTRY_HIGH_LOW_SNAPSHOT", disabled_env="DISABLE_RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH")
 _install_module("core.startup.entry_direction_recursion_failopen_patch", "ENTRY_DIRECTION_RECURSION_FAILOPEN", disabled_env="DISABLE_ENTRY_DIRECTION_RECURSION_FAILOPEN_PATCH")
+_install_module("core.startup.entry_mtf_short_required_daily_optional_patch", "SHORT_MTF_2OF3_GUARD", disabled_env="DISABLE_SHORT_MTF_2OF3_GUARD_PATCH")
 _install_module("core.startup.entry_controller_pipeline_lock_wait_patch", "ENTRY_CONTROLLER_LOCK_WAIT", disabled_env="DISABLE_ENTRY_CONTROLLER_LOCK_WAIT_PATCH")
 _install_module("core.startup.entry_controller_source_prefilter_patch", "ENTRY_CONTROLLER_SOURCE_PREFILTER", disabled_env="DISABLE_ENTRY_CONTROLLER_SOURCE_PREFILTER_PATCH")
 _install_module("core.startup.entry_controller_tonosama_ai_bridge_patch", "TONOSAMA_AI_BRIDGE", disabled_env="DISABLE_TONOSAMA_AI_BRIDGE_PATCH")
