@@ -1,17 +1,11 @@
 # ============================================================
 # File   : scripts/summary_database_runner.py
-# Version: SUMMARY-DATABASE-RUNNER-V5-DB-SAVE-DISCORD-EMPTY-FALLBACK
+# Version: SUMMARY-DATABASE-RUNNER-V6-FLUSH-SUMMARY-SAVE-SPOOL
 # ------------------------------------------------------------
 # Purpose:
 #   - main_database.py 側で定時サマリー計算・DB保存を担当する子プロセス
 #   - DB保存 owner は database 側へ寄せる
-#   - Discord表示も database 側で担当できるようにする
-#   - 1分ごとに run_time_locked_summary_jobs() を実行する
-#
-# V5 Fix:
-#   ✔ summary_discord_always_notify_patch を time_locked_runner import 前に導入
-#   ✔ フィルタ後0件でも 3分/5分は「候補なし」通知をDiscordへ出す
-#   ✔ 通常候補がある場合は従来のSUMMARY TOP10通知
+#   - main.py側でDBロック時にスプールしたsummary行を毎分flushする
 # ============================================================
 
 from __future__ import annotations
@@ -45,6 +39,7 @@ def _install_database_summary_env() -> None:
 
     os.environ.setdefault("SUMMARY_DATABASE_RUNNER_DISPLAY", "1")
     os.environ.setdefault("SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY", "1")
+    os.environ.setdefault("SUMMARY_SAVE_SPOOL_FLUSH", "1")
 
     os.environ["SUMMARY_SKIP_DB_SAVE_IN_MAIN"] = "0"
     os.environ["SUMMARY_MAIN_ENTRY_ONLY"] = "0"
@@ -57,16 +52,10 @@ def _install_database_summary_env() -> None:
 
 _install_database_summary_env()
 
-# ------------------------------------------------------------
-# Discord表示の最終防衛パッチ
-# ------------------------------------------------------------
-# time_locked_runner / runner_core は safe_io の関数を import して束縛するため、
-# 必ずその前に patch を import/install する。
 try:
     from core.startup.summary_discord_always_notify_patch import install as _install_summary_discord_patch
     _install_summary_discord_patch()
 except Exception:
-    # logger 初期化前なので print に留める。後続処理は止めない。
     print("[SUMMARY DB RUNNER] summary_discord_always_notify_patch install failed", file=sys.stderr)
 
 from data_collectors.logging_setup import setup_logging
@@ -139,6 +128,20 @@ def _warmup_multiday_ma75_cache(logger: logging.Logger) -> Any:
         return None
 
 
+def _flush_summary_save_spool(logger: logging.Logger, *, reason: str) -> dict:
+    if not _env_true("SUMMARY_SAVE_SPOOL_FLUSH", default=True):
+        return {"disabled": True}
+    try:
+        from trading.summary.persistence.summary_save_spool import flush_summary_spool
+        result = flush_summary_spool(max_files=50)
+        if result.get("files", 0):
+            logger.warning("[SUMMARY DB RUNNER] spool flush reason=%s result=%s", reason, result)
+        return result
+    except Exception:
+        logger.exception("[SUMMARY DB RUNNER] spool flush failed reason=%s", reason)
+        return {"error": True}
+
+
 def main() -> int:
     _install_database_summary_env()
 
@@ -163,6 +166,7 @@ def main() -> int:
     logger.info("[SUMMARY DB RUNNER] AUTOSTOCK_SUMMARY_SAVE_OWNER=%s", os.getenv("AUTOSTOCK_SUMMARY_SAVE_OWNER"))
     logger.info("[SUMMARY DB RUNNER] AUTOSTOCK_SUMMARY_SAVE_MODE=%s", os.getenv("AUTOSTOCK_SUMMARY_SAVE_MODE"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_DATABASE_RUNNER_DISPLAY=%s", os.getenv("SUMMARY_DATABASE_RUNNER_DISPLAY"))
+    logger.info("[SUMMARY DB RUNNER] SUMMARY_SAVE_SPOOL_FLUSH=%s", os.getenv("SUMMARY_SAVE_SPOOL_FLUSH"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY=%s patch_ok=%s", os.getenv("SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY"), patch_ok)
     logger.info("[SUMMARY DB RUNNER] SUMMARY_SKIP_DB_SAVE_IN_MAIN=%s", os.getenv("SUMMARY_SKIP_DB_SAVE_IN_MAIN"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_MAIN_ENTRY_ONLY=%s", os.getenv("SUMMARY_MAIN_ENTRY_ONLY"))
@@ -173,6 +177,7 @@ def main() -> int:
     logger.info("=" * 80)
 
     _warmup_multiday_ma75_cache(logger)
+    _flush_summary_save_spool(logger, reason="startup")
 
     last_run_minute: dt.datetime | None = None
 
@@ -191,7 +196,7 @@ def main() -> int:
             display_enabled = _env_true("SUMMARY_DATABASE_RUNNER_DISPLAY", default=True)
 
             logger.info(
-                "[SUMMARY DB RUNNER] tick start now=%s run_push=True run_ranking=%s display=%s run_entry=False save_owner=%s save_mode=%s skip_main=%s role=%s empty_notify=%s",
+                "[SUMMARY DB RUNNER] tick start now=%s run_push=True run_ranking=%s display=%s run_entry=False save_owner=%s save_mode=%s skip_main=%s role=%s empty_notify=%s spool_flush=%s",
                 now,
                 ranking_enabled,
                 display_enabled,
@@ -200,7 +205,10 @@ def main() -> int:
                 os.getenv("SUMMARY_SKIP_DB_SAVE_IN_MAIN"),
                 os.getenv("SUMMARY_DB_WRITER_ROLE"),
                 os.getenv("SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY"),
+                os.getenv("SUMMARY_SAVE_SPOOL_FLUSH"),
             )
+
+            _flush_summary_save_spool(logger, reason="before_tick")
 
             t0 = time.perf_counter()
 
@@ -211,6 +219,8 @@ def main() -> int:
                 display=display_enabled,
                 run_entry=False,
             )
+
+            _flush_summary_save_spool(logger, reason="after_tick")
 
             push_rows = {
                 int(k): len(v) if hasattr(v, "__len__") else 0
