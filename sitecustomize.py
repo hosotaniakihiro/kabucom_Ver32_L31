@@ -1,31 +1,19 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver23-RANKING-ENTRY-HIGH-LOW-SNAPSHOT-PATCH
+# Version: Ver24-RANKING-ENTRY-SOURCE-DB-FALLBACK
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # 失敗しても本体起動は止めない。
+#
+# Ver24:
+#   - ranking entry loop が global_data.latest_ranking_* を見つけられない場合でも、
+#     rankingYYYYMMDD.db / ranking_snapshot_1min から直接復元する
+#     RANKING_ENTRY_SOURCE_DB_FALLBACK を自動install。
 #
 # Ver23:
 #   - ランキング由来entry rowの high/low が0で LOW MOVE GUARD no_high_low になる問題へ対応。
 #   - ranking_snapshot_1min の直近価格履歴から high/low/range_pct を補完する
 #     RANKING_ENTRY_HIGH_LOW_SNAPSHOT を自動install。
-#
-# Ver22:
-#   - TONOSAMA pending_writer の warning-only climax guard を自動install。
-#   - buying_climax_upper_wick_warning / selling_climax_lower_wick_warning は、
-#     価格変化が小さく出来高とランキングMA方向がOKなら pending登録を許可。
-#
-# Ver21:
-#   - summaryYYYYMMDD.db に別日 datetime が混入しないよう、
-#     SUMMARY_DB_DATE_GUARD を自動install。
-#
-# Ver20:
-#   - TONOSAMA runner は5秒足を必須にしない方針。
-#   - AI fallback側だけ 5s=0.000% で全候補を落としていたため、
-#     TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC=0 を既定化。
-#
-# Ver19:
-#   - LIQ_EMPTY_FALLBACK は低流動性銘柄を戻してしまうため、自動installを既定OFFへ変更。
 # ============================================================
 
 from __future__ import annotations
@@ -171,46 +159,20 @@ def _install_tonosama_surge_defaults() -> None:
         os.environ.setdefault("RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH_ENABLED", "1")
         os.environ.setdefault("RANKING_ENTRY_HIGH_LOW_SNAPSHOT_LOOKBACK_ROWS", "12")
         os.environ.setdefault("RANKING_ENTRY_HIGH_LOW_SNAPSHOT_MAX_AGE_MIN", "30")
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED", "1")
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_LOOKBACK_MIN", "8")
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_MAX_ROWS", "2000")
         _write_boot_evidence("TONOSAMA_SURGE_DEFAULTS_SET", {
-            "failopen": os.environ.get("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING"),
-            "allow_without_history": os.environ.get("TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY"),
-            "failopen_value": os.environ.get("TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE"),
-            "five_sec_advisory": os.environ.get("TONOSAMA_5SEC_ADVISORY_ENABLED"),
-            "five_sec_allow_zero": os.environ.get("TONOSAMA_5SEC_ALLOW_ZERO_IF_PRIMARY_PASS"),
-            "ai_reject_zero_5s": os.environ.get("TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC"),
-            "ai_min_5s": os.environ.get("TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT"),
-            "warning_only_climax": os.environ.get("TONOSAMA_ALLOW_WARNING_ONLY_CLIMAX"),
-            "warning_only_max_price_change": os.environ.get("TONOSAMA_WARNING_ONLY_MAX_PRICE_CHANGE_PCT"),
-            "history_missing_strong_move": os.environ.get("TONOSAMA_ALLOW_HISTORY_MISSING_STRONG_MOVE"),
-            "ranking_lock_wait": os.environ.get("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_ENABLED"),
-            "source_prefilter": os.environ.get("ENTRY_CONTROLLER_SOURCE_PREFILTER_ENABLED"),
-            "tonosama_ai_bridge": os.environ.get("ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE"),
-            "low_move_tonosama_min_price": os.environ.get("LOW_MOVE_TONOSAMA_MIN_ENTRY_PRICE"),
-            "low_move_tonosama_no_highlow": os.environ.get("LOW_MOVE_TONOSAMA_ALLOW_NO_HIGHLOW_FALLBACK"),
-            "final_tonosama_liq": os.environ.get("FINAL_ENTRY_TONOSAMA_LIQUIDITY_FALLBACK"),
-            "summary_date_guard": os.environ.get("SUMMARY_DB_DATE_GUARD_ENABLED"),
+            "ranking_source_db_fallback": os.environ.get("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED"),
             "ranking_hl_patch": os.environ.get("RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH_ENABLED"),
+            "summary_date_guard": os.environ.get("SUMMARY_DB_DATE_GUARD_ENABLED"),
         })
         logger.warning(
-            "[SITECUSTOMIZE] tonosama defaults failopen=%s allow_without_history=%s value=%s five_sec_advisory=%s allow_zero=%s ai_reject_zero_5s=%s ai_min_5s=%s warning_only_climax=%s warning_only_max_price_change=%s history_missing_strong_move=%s ranking_lock_wait=%s source_prefilter=%s tonosama_ai_bridge=%s low_move_tonosama_min_price=%s no_highlow_fallback=%s final_tonosama_liq=%s summary_date_guard=%s ranking_hl_patch=%s",
-            os.environ.get("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING"),
-            os.environ.get("TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY"),
-            os.environ.get("TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE"),
-            os.environ.get("TONOSAMA_5SEC_ADVISORY_ENABLED"),
-            os.environ.get("TONOSAMA_5SEC_ALLOW_ZERO_IF_PRIMARY_PASS"),
-            os.environ.get("TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC"),
-            os.environ.get("TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT"),
-            os.environ.get("TONOSAMA_ALLOW_WARNING_ONLY_CLIMAX"),
-            os.environ.get("TONOSAMA_WARNING_ONLY_MAX_PRICE_CHANGE_PCT"),
-            os.environ.get("TONOSAMA_ALLOW_HISTORY_MISSING_STRONG_MOVE"),
-            os.environ.get("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_ENABLED"),
-            os.environ.get("ENTRY_CONTROLLER_SOURCE_PREFILTER_ENABLED"),
-            os.environ.get("ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE"),
-            os.environ.get("LOW_MOVE_TONOSAMA_MIN_ENTRY_PRICE"),
-            os.environ.get("LOW_MOVE_TONOSAMA_ALLOW_NO_HIGHLOW_FALLBACK"),
-            os.environ.get("FINAL_ENTRY_TONOSAMA_LIQUIDITY_FALLBACK"),
-            os.environ.get("SUMMARY_DB_DATE_GUARD_ENABLED"),
+            "[SITECUSTOMIZE] defaults ranking_source_db_fallback=%s ranking_hl_patch=%s summary_date_guard=%s warning_only_climax=%s",
+            os.environ.get("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED"),
             os.environ.get("RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH_ENABLED"),
+            os.environ.get("SUMMARY_DB_DATE_GUARD_ENABLED"),
+            os.environ.get("TONOSAMA_ALLOW_WARNING_ONLY_CLIMAX"),
         )
     except Exception:
         _write_boot_evidence("TONOSAMA_SURGE_DEFAULTS_EXCEPTION", traceback.format_exc())
@@ -245,6 +207,7 @@ _install_module("core.startup.summary_save_quality_guard_patch", "SUMMARY_SAVE_Q
 _install_module("core.startup.tonosama_5sec_advisory_patch", "TONOSAMA_5SEC_ADVISORY", disabled_env="DISABLE_TONOSAMA_5SEC_ADVISORY_PATCH")
 _install_module("core.startup.tonosama_history_missing_guard_patch", "TONOSAMA_HISTORY_MISSING_GUARD", disabled_env="DISABLE_TONOSAMA_HISTORY_MISSING_GUARD_PATCH")
 _install_module("core.startup.ranking_entry_flat_price_guard_patch", "RANKING_FLAT_PRICE_DB_FALLBACK", disabled_env="DISABLE_RANKING_FLAT_PRICE_PATCH")
+_install_module("core.startup.ranking_entry_source_db_fallback_patch", "RANKING_ENTRY_SOURCE_DB_FALLBACK", disabled_env="DISABLE_RANKING_ENTRY_SOURCE_DB_FALLBACK_PATCH")
 _install_module("core.startup.ranking_entry_high_low_from_snapshot_patch", "RANKING_ENTRY_HIGH_LOW_SNAPSHOT", disabled_env="DISABLE_RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH")
 _install_module("core.startup.entry_controller_pipeline_lock_wait_patch", "ENTRY_CONTROLLER_LOCK_WAIT", disabled_env="DISABLE_ENTRY_CONTROLLER_LOCK_WAIT_PATCH")
 _install_module("core.startup.entry_controller_source_prefilter_patch", "ENTRY_CONTROLLER_SOURCE_PREFILTER", disabled_env="DISABLE_ENTRY_CONTROLLER_SOURCE_PREFILTER_PATCH")
