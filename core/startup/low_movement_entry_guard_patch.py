@@ -1,35 +1,21 @@
 # ============================================================
 # File   : core/startup/low_movement_entry_guard_patch.py
-# Version: Ver14-TONOSAMA-RAW-RANGE-MERGE
+# Version: Ver15-RANKING-NO-HIGHLOW-MOMENTUM-FALLBACK
 # ------------------------------------------------------------
 # あまり動かない銘柄へのエントリーを発注直前で止める。
 # さらに、ランキング方向に逆らうエントリーも禁止する。
+#
+# Ver15:
+#   - RANKING pending はランキング情報だけで作るため high/low が
+#     0 または未設定のケースがある。
+#   - high/low が無いだけで ATR_1M_FILTER_NG にせず、RANKING では
+#     ATR / slope / macd-signal / score が十分なら通す。
+#   - 価格帯制限も RANKING 用に LOW_MOVE_RANKING_MIN/MAX_ENTRY_PRICE を追加。
 #
 # Ver14:
 #   - pending entry の top-level には high/low/_intrabar_range_pct が無く、
 #     _raw 内にだけ TONOSAMA 特徴量が残るケースに対応
 #   - _row_to_dict() で _raw dict を展開し、top-level 欠損項目だけ補完
-#   - [LOW MOVE GUARD] reason=no_high_low row_range_pct=0.0000 を防ぐ
-#   - source/side/score など top-level の確定値は上書きしない
-#
-# Ver13:
-#   - TONOSAMA pending が最終段で LOW_MOVE_MAX_ENTRY_PRICE=7000 により
-#     price_out_of_range で落ちる問題を修正
-#   - TONOSAMA のみ価格上限を LOW_MOVE_TONOSAMA_MAX_ENTRY_PRICE=12000 へ拡張
-#   - TONOSAMA のみ range_5m_filter が RANGE不足で False を返しても、
-#     直後の low movement guard 側で再判定する
-#   - 通常 SUMMARY/RANKING の低変動ガードは従来どおり
-#
-# Ver12:
-#   - TONOSAMA pending は high/low が entry_row に渡らないことがある
-#   - その場合でも _intrabar_range_pct / intrabar_range_pct / range_pct があれば
-#     no_high_low で即NGにせず、代替range_pctとして評価する
-#   - 11:22ログの [LOW MOVE GUARD] NG reason=no_high_low を防止
-#   - high/low がある通常ケースは従来通り
-#
-# Ver11:
-#   - RecursionError 対策
-#   - atr_1m_filter / range_5m_filter の実パッチ所有者をこのファイルに統一
 # ============================================================
 
 from __future__ import annotations
@@ -98,8 +84,6 @@ def _row_to_dict(row: Any) -> dict:
         else:
             d = {}
 
-        # TONOSAMA pending は軽量化のため top-level に high/low/range 系が無く、
-        # _raw 内に元候補行が残ることがある。top-level を優先し、不足分だけ補完する。
         raw = d.get("_raw")
         if hasattr(raw, "to_dict"):
             try:
@@ -144,15 +128,26 @@ def _norm_text(v: Any) -> str:
         return ""
 
 
+def _source_text(row: dict) -> str:
+    return _norm_text(_first(row, ("source", "entry_source", "pipeline_source"), ""))
+
+
 def _is_tonosama_entry(row_or_entry: Any) -> bool:
     row = _row_to_dict(row_or_entry)
-    src = _norm_text(_first(row, ("source", "entry_source", "pipeline_source"), ""))
+    src = _source_text(row)
     et = _norm_text(_first(row, ("entry_type", "type", "entry_kind"), ""))
     return src == "TONOSAMA" or et == "TONOSAMA"
 
 
+def _is_ranking_entry(row_or_entry: Any) -> bool:
+    row = _row_to_dict(row_or_entry)
+    src = _source_text(row)
+    et = _norm_text(_first(row, ("entry_type", "type", "entry_kind"), ""))
+    rank_type = _first(row, ("rank_type", "ranking_type", "rank_kind"), None)
+    return src == "RANKING" or et == "RANKING" or rank_type is not None
+
+
 def _range_pct_from_row(row: dict) -> float:
-    """行にある値幅系カラムから range_pct を 0.123 の比率形式で返す。"""
     raw = _first(
         row,
         (
@@ -170,10 +165,75 @@ def _range_pct_from_row(row: dict) -> float:
     v = _safe_float(raw, 0.0)
     if v <= 0:
         return 0.0
-    # TONOSAMAの _intrabar_range_pct は 20.4 のような percent 表記。
     if v > 1.0:
         return v / 100.0
     return v
+
+
+def _ranking_momentum_ok(row: dict, *, close: float, symbol: str, high: float, low: float) -> bool:
+    if not _env_bool("LOW_MOVE_RANKING_ALLOW_NO_HIGHLOW_MOMENTUM", True):
+        return False
+
+    atr = _safe_float(_first(row, ("atr", "atr_1m", "atr_5m"), 0.0), 0.0)
+    atr_ratio = atr / close if close > 0 else 0.0
+    min_atr_ratio = _env_float("LOW_MOVE_RANKING_MIN_ATR_RATIO", 0.0035)
+
+    slope_values = []
+    for k in ("slope_atr_scaled", "slope", "score_slope", "disp_slope", "_slope"):
+        if k in row:
+            slope_values.append(_safe_float(row.get(k), 0.0))
+    max_abs_slope = max([abs(x) for x in slope_values], default=0.0)
+    min_abs_slope = _env_float("LOW_MOVE_RANKING_MIN_ABS_SLOPE", 0.001)
+
+    macd = _safe_float(row.get("macd"), 0.0)
+    signal = _safe_float(row.get("signal"), 0.0)
+    macd_gap = abs(macd - signal)
+    min_macd_gap = _env_float("LOW_MOVE_RANKING_MIN_MACD_GAP", 0.0)
+
+    score = _safe_float(_first(row, ("pending_score", "score", "final_score", "display_score", "score_total"), 0.0), 0.0)
+    min_score = _env_float("LOW_MOVE_RANKING_MIN_SCORE_FOR_NO_HIGHLOW", 70.0)
+
+    ok = (
+        atr_ratio >= min_atr_ratio
+        and max_abs_slope >= min_abs_slope
+        and score >= min_score
+        and macd_gap >= min_macd_gap
+    )
+    if ok:
+        logger.warning(
+            "[LOW MOVE GUARD] RANKING high/low missing but allowed by momentum symbol=%s close=%.1f high=%.1f low=%.1f atr=%.4f atr_ratio=%.5f min_atr=%.5f max_abs_slope=%.6f min_slope=%.6f macd=%.4f signal=%.4f score=%.2f min_score=%.2f",
+            symbol,
+            close,
+            high,
+            low,
+            atr,
+            atr_ratio,
+            min_atr_ratio,
+            max_abs_slope,
+            min_abs_slope,
+            macd,
+            signal,
+            score,
+            min_score,
+        )
+        return True
+
+    logger.warning(
+        "[LOW MOVE GUARD] RANKING no_high_low momentum NG symbol=%s close=%.1f high=%.1f low=%.1f atr_ratio=%.5f min_atr=%.5f max_abs_slope=%.6f min_slope=%.6f macd_gap=%.4f min_macd_gap=%.4f score=%.2f min_score=%.2f",
+        symbol,
+        close,
+        high,
+        low,
+        atr_ratio,
+        min_atr_ratio,
+        max_abs_slope,
+        min_abs_slope,
+        macd_gap,
+        min_macd_gap,
+        score,
+        min_score,
+    )
+    return False
 
 
 def _install_ranking_direction_guard() -> bool:
@@ -269,6 +329,7 @@ def _low_movement_guard(entry_row: Any) -> bool:
     row = _row_to_dict(entry_row)
     symbol = _norm_symbol(_first(row, ("symbol", "code", "stock_code"), ""))
     source_tonosama = _is_tonosama_entry(row)
+    source_ranking = _is_ranking_entry(row)
     close = _safe_float(_first(row, ("close_price", "close", "price", "current_price"), 0.0), 0.0)
     high = _safe_float(_first(row, ("high_price", "high"), 0.0), 0.0)
     low = _safe_float(_first(row, ("low_price", "low"), 0.0), 0.0)
@@ -280,14 +341,17 @@ def _low_movement_guard(entry_row: Any) -> bool:
     if source_tonosama:
         min_price = _env_float("LOW_MOVE_TONOSAMA_MIN_ENTRY_PRICE", _env_float("LOW_MOVE_MIN_ENTRY_PRICE", 1500.0))
         max_price = _env_float("LOW_MOVE_TONOSAMA_MAX_ENTRY_PRICE", 12000.0)
+    elif source_ranking:
+        min_price = _env_float("LOW_MOVE_RANKING_MIN_ENTRY_PRICE", _env_float("LOW_MOVE_MIN_ENTRY_PRICE", 1500.0))
+        max_price = _env_float("LOW_MOVE_RANKING_MAX_ENTRY_PRICE", _env_float("LOW_MOVE_MAX_ENTRY_PRICE", 7000.0))
     else:
         min_price = _env_float("LOW_MOVE_MIN_ENTRY_PRICE", 1500.0)
         max_price = _env_float("LOW_MOVE_MAX_ENTRY_PRICE", 7000.0)
 
     if close < min_price or close > max_price:
         logger.warning(
-            "[LOW MOVE GUARD] NG symbol=%s reason=price_out_of_range close=%.1f min_price=%.1f max_price=%.1f tonosama=%s",
-            symbol, close, min_price, max_price, source_tonosama,
+            "[LOW MOVE GUARD] NG symbol=%s reason=price_out_of_range close=%.1f min_price=%.1f max_price=%.1f tonosama=%s ranking=%s",
+            symbol, close, min_price, max_price, source_tonosama, source_ranking,
         )
         return False
 
@@ -299,12 +363,13 @@ def _low_movement_guard(entry_row: Any) -> bool:
         range_pct = _range_pct_from_row(row)
         range_source = "row_range_pct"
         if range_pct <= 0:
+            if source_ranking and _ranking_momentum_ok(row, close=close, symbol=symbol, high=high, low=low):
+                return True
             logger.warning(
                 "[LOW MOVE GUARD] NG symbol=%s reason=no_high_low close=%.1f high=%.1f low=%.1f row_range_pct=%.4f raw_merged=%s keys=%s",
                 symbol, close, high, low, range_pct, row.get("_raw_merged_for_low_move_guard"), sorted(list(row.keys()))[:80],
             )
             return False
-        # ログ/後段用の疑似high/low。判定はrange_pctのみを使う。
         high = close * (1.0 + range_pct / 2.0)
         low = close * max(0.0001, (1.0 - range_pct / 2.0))
         logger.warning(
@@ -316,14 +381,17 @@ def _low_movement_guard(entry_row: Any) -> bool:
     if source_tonosama:
         min_range_pct = _env_float("LOW_MOVE_TONOSAMA_MIN_RANGE_PCT", 0.006)
         strong_range_pct = _env_float("LOW_MOVE_TONOSAMA_STRONG_RANGE_PCT", 0.012)
+    elif source_ranking:
+        min_range_pct = _env_float("LOW_MOVE_RANKING_MIN_RANGE_PCT_LOW_PRICE", 0.012) if close < split else _env_float("LOW_MOVE_RANKING_MIN_RANGE_PCT_HIGH_PRICE", 0.006)
+        strong_range_pct = _env_float("LOW_MOVE_RANKING_STRONG_RANGE_PCT", 0.018)
     else:
         min_range_pct = _env_float("LOW_MOVE_MIN_RANGE_PCT_LOW_PRICE", 0.015) if close < split else _env_float("LOW_MOVE_MIN_RANGE_PCT_HIGH_PRICE", 0.008)
         strong_range_pct = _env_float("LOW_MOVE_STRONG_RANGE_PCT", 0.020)
 
     if range_pct < min_range_pct:
         logger.warning(
-            "[LOW MOVE GUARD] NG symbol=%s reason=range_too_small close=%.1f high=%.1f low=%.1f range_pct=%.4f min=%.4f source=%s tonosama=%s",
-            symbol, close, high, low, range_pct, min_range_pct, range_source, source_tonosama,
+            "[LOW MOVE GUARD] NG symbol=%s reason=range_too_small close=%.1f high=%.1f low=%.1f range_pct=%.4f min=%.4f source=%s tonosama=%s ranking=%s",
+            symbol, close, high, low, range_pct, min_range_pct, range_source, source_tonosama, source_ranking,
         )
         return False
 
@@ -340,30 +408,32 @@ def _low_movement_guard(entry_row: Any) -> bool:
         abs_slope = max_abs_slope
         if source_tonosama:
             min_abs_slope = _env_float("LOW_MOVE_TONOSAMA_MIN_ABS_SLOPE", 0.0001)
+        elif source_ranking:
+            min_abs_slope = _env_float("LOW_MOVE_RANKING_MIN_ABS_SLOPE", 0.001)
         else:
             min_abs_slope = _env_float("LOW_MOVE_MIN_ABS_SLOPE_LOW_PRICE", 0.0003) if close < split else _env_float("LOW_MOVE_MIN_ABS_SLOPE_HIGH_PRICE", 0.0002)
         if abs_slope < min_abs_slope and range_pct < strong_range_pct:
             logger.warning(
-                "[LOW MOVE GUARD] NG symbol=%s reason=slope_too_small close=%.1f abs_slope=%.6f min=%.6f range_pct=%.4f strong_range=%.4f source=%s tonosama=%s",
-                symbol, close, abs_slope, min_abs_slope, range_pct, strong_range_pct, range_source, source_tonosama,
+                "[LOW MOVE GUARD] NG symbol=%s reason=slope_too_small close=%.1f abs_slope=%.6f min=%.6f range_pct=%.4f strong_range=%.4f source=%s tonosama=%s ranking=%s",
+                symbol, close, abs_slope, min_abs_slope, range_pct, strong_range_pct, range_source, source_tonosama, source_ranking,
             )
             return False
         if abs_slope < min_abs_slope and range_pct >= strong_range_pct:
             logger.warning(
-                "[LOW MOVE GUARD] slope small but allowed by strong range symbol=%s close=%.1f abs_slope=%.6f min=%.6f range_pct=%.4f strong_range=%.4f source=%s tonosama=%s",
-                symbol, close, abs_slope, min_abs_slope, range_pct, strong_range_pct, range_source, source_tonosama,
+                "[LOW MOVE GUARD] slope small but allowed by strong range symbol=%s close=%.1f abs_slope=%.6f min=%.6f range_pct=%.4f strong_range=%.4f source=%s tonosama=%s ranking=%s",
+                symbol, close, abs_slope, min_abs_slope, range_pct, strong_range_pct, range_source, source_tonosama, source_ranking,
             )
 
     if abs(macd) < 0.0001 and abs(signal) < 0.0001 and max_abs_slope < 0.0001 and range_pct < strong_range_pct:
         logger.warning(
-            "[LOW MOVE GUARD] NG symbol=%s reason=no_momentum macd=%.6f signal=%.6f slope=%.6f range_pct=%.4f strong_range=%.4f source=%s tonosama=%s",
-            symbol, macd, signal, max_abs_slope, range_pct, strong_range_pct, range_source, source_tonosama,
+            "[LOW MOVE GUARD] NG symbol=%s reason=no_momentum macd=%.6f signal=%.6f slope=%.6f range_pct=%.4f strong_range=%.4f source=%s tonosama=%s ranking=%s",
+            symbol, macd, signal, max_abs_slope, range_pct, strong_range_pct, range_source, source_tonosama, source_ranking,
         )
         return False
 
     logger.info(
-        "[LOW MOVE GUARD] OK symbol=%s close=%.1f range_pct=%.4f min_range=%.4f strong_range=%.4f macd=%.4f signal=%.4f max_abs_slope=%.6f source=%s tonosama=%s raw_merged=%s",
-        symbol, close, range_pct, min_range_pct, strong_range_pct, macd, signal, max_abs_slope, range_source, source_tonosama, row.get("_raw_merged_for_low_move_guard"),
+        "[LOW MOVE GUARD] OK symbol=%s close=%.1f range_pct=%.4f min_range=%.4f strong_range=%.4f macd=%.4f signal=%.4f max_abs_slope=%.6f source=%s tonosama=%s ranking=%s raw_merged=%s",
+        symbol, close, range_pct, min_range_pct, strong_range_pct, macd, signal, max_abs_slope, range_source, source_tonosama, source_ranking, row.get("_raw_merged_for_low_move_guard"),
     )
     return True
 
@@ -422,7 +492,14 @@ def _patched_atr_1m_filter(entry_row: Any = None, *args, **kwargs):
 
 def _is_low_move_wrapped(func: Any) -> bool:
     try:
-        return bool(getattr(func, "_low_move_guard_v2", False) or getattr(func, "_low_move_guard_v1", False) or getattr(func, "_low_move_guard_v12", False) or getattr(func, "_low_move_guard_v13", False) or getattr(func, "_low_move_guard_v14", False))
+        return bool(
+            getattr(func, "_low_move_guard_v2", False)
+            or getattr(func, "_low_move_guard_v1", False)
+            or getattr(func, "_low_move_guard_v12", False)
+            or getattr(func, "_low_move_guard_v13", False)
+            or getattr(func, "_low_move_guard_v14", False)
+            or getattr(func, "_low_move_guard_v15", False)
+        )
     except Exception:
         return False
 
@@ -447,7 +524,7 @@ def install() -> bool:
 
         if callable(old_atr) and not _is_low_move_wrapped(old_atr):
             _ORIG_ATR_FILTER = old_atr
-            _patched_atr_1m_filter._low_move_guard_v14 = True  # type: ignore[attr-defined]
+            _patched_atr_1m_filter._low_move_guard_v15 = True  # type: ignore[attr-defined]
             _patched_atr_1m_filter._original = old_atr  # type: ignore[attr-defined]
             ec.atr_1m_filter = _patched_atr_1m_filter
             logger.warning("[LOW MOVE GUARD] patched entry_controller.atr_1m_filter")
@@ -456,7 +533,7 @@ def install() -> bool:
 
         if callable(old_range) and not _is_low_move_wrapped(old_range):
             _ORIG_RANGE_FILTER = old_range
-            _patched_range_5m_filter._low_move_guard_v14 = True  # type: ignore[attr-defined]
+            _patched_range_5m_filter._low_move_guard_v15 = True  # type: ignore[attr-defined]
             _patched_range_5m_filter._original = old_range  # type: ignore[attr-defined]
             ec.range_5m_filter = _patched_range_5m_filter
             logger.warning("[LOW MOVE GUARD] patched entry_controller.range_5m_filter")
@@ -465,7 +542,11 @@ def install() -> bool:
 
         _INSTALLED = True
         logger.warning(
-            "[LOW MOVE GUARD] installed v14 raw_merge=True tonosama_max_price=%s tonosama_min_range=%s tonosama_ignore_orig_range_ng=%s direction=%s scoring_bridge=%s entry_direction=%s final_safety=%s price_improve=%s ma_cross=%s vwap=%s",
+            "[LOW MOVE GUARD] installed v15 raw_merge=True ranking_no_highlow_momentum=%s ranking_min_price=%s ranking_max_price=%s ranking_min_score=%s tonosama_max_price=%s tonosama_min_range=%s tonosama_ignore_orig_range_ng=%s direction=%s scoring_bridge=%s entry_direction=%s final_safety=%s price_improve=%s ma_cross=%s vwap=%s",
+            _env_bool("LOW_MOVE_RANKING_ALLOW_NO_HIGHLOW_MOMENTUM", True),
+            os.getenv("LOW_MOVE_RANKING_MIN_ENTRY_PRICE", os.getenv("LOW_MOVE_MIN_ENTRY_PRICE", "1500")),
+            os.getenv("LOW_MOVE_RANKING_MAX_ENTRY_PRICE", os.getenv("LOW_MOVE_MAX_ENTRY_PRICE", "7000")),
+            os.getenv("LOW_MOVE_RANKING_MIN_SCORE_FOR_NO_HIGHLOW", "70.0"),
             os.getenv("LOW_MOVE_TONOSAMA_MAX_ENTRY_PRICE", "12000"),
             os.getenv("LOW_MOVE_TONOSAMA_MIN_RANGE_PCT", "0.006"),
             _env_bool("LOW_MOVE_TONOSAMA_IGNORE_ORIG_RANGE_NG", True),
