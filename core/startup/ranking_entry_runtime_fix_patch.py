@@ -1,17 +1,18 @@
 # ============================================================
 # File   : core/startup/ranking_entry_runtime_fix_patch.py
-# Version: V1.2-RANKING-ENTRY-TECH-FALLBACK-NO-UNIT-REFIX
+# Version: V1.3-REINSTALL-RANKING-DB-FALLBACK
 # ------------------------------------------------------------
 # 目的:
 #   ranking_entry で以下の状態になる問題を抑止する。
 #     - ranking_technical attached symbols=0
 #     - 出来高ランキング値が表示単位のまま扱われ、MIN_VOLUMEに届かず VOLUME_NG になる
+#     - main.py split mode で in-memory latest_ranking_df が無い時、DB fallback が外れて
+#       ranking source dataframe not found になる
 #
-# V1.2:
-#   - ranking_entry_volume_unit_patch V4 が ranking_entry_units_finalized=1 を付けた行は
-#     volume / turnover を一切再調整しない
-#   - 確定済み行の「turnover を price*volume へ寄せるだけ」のログを止める
-#   - 技術指標 fallback は従来通り維持
+# V1.3:
+#   - このpatchは main runtime patch として sitecustomize 後に再度installされる。
+#   - sitecustomizeで入れた ranking_entry_flat_price_guard_patch の getter wrapper が
+#     後段patch順で外れるケースがあるため、最後に強制再installする。
 # ============================================================
 
 from __future__ import annotations
@@ -106,7 +107,6 @@ def _patched_normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
         if not _env_bool("RANKING_ENTRY_NORMALIZE_VOLUME_UNITS", True):
             return out
 
-        # volume_unit_patch V4 で確定済みなら、ここでは一切再調整しない。
         if _flag_on(out.get("ranking_entry_units_finalized")):
             return out
 
@@ -246,9 +246,26 @@ def _patched_save_ranking_pseudo_technicals(rows: List[Dict[str, Any]], *args, *
         return base
 
 
+def _reinstall_db_fallback_patch() -> bool:
+    try:
+        import core.startup.ranking_entry_flat_price_guard_patch as flat
+        # 後段patch順で getter wrapper が外れた場合に再wrapさせる。
+        try:
+            setattr(flat, "_PATCHED", False)
+        except Exception:
+            pass
+        ok = bool(flat.install())
+        logger.warning("[RANKING ENTRY FIX] reinstalled ranking DB fallback patch=%s", ok)
+        return ok
+    except Exception:
+        logger.exception("[RANKING ENTRY FIX] reinstall ranking DB fallback failed")
+        return False
+
+
 def install() -> bool:
     global _PATCHED, _ORIGINAL_NORMALIZE, _ORIGINAL_SAVE_TECH
     if _PATCHED:
+        _reinstall_db_fallback_patch()
         return True
     if not _env_bool("RANKING_ENTRY_RUNTIME_FIX_ENABLED", True):
         logger.warning("[RANKING ENTRY FIX] disabled by env")
@@ -257,21 +274,22 @@ def install() -> bool:
         import trading.ranking.entry_from_ranking as efr
 
         norm = getattr(efr, "_normalize_ranking_row_for_entry", None)
-        if callable(norm) and not getattr(norm, "_ranking_entry_fix_patch_v12", False):
+        if callable(norm) and not getattr(norm, "_ranking_entry_fix_patch_v13", False):
             _ORIGINAL_NORMALIZE = norm
-            _patched_normalize_row._ranking_entry_fix_patch_v12 = True  # type: ignore[attr-defined]
+            _patched_normalize_row._ranking_entry_fix_patch_v13 = True  # type: ignore[attr-defined]
             efr._normalize_ranking_row_for_entry = _patched_normalize_row
-            logger.warning("[RANKING ENTRY FIX] patched _normalize_ranking_row_for_entry V1.2 no-unit-refix")
+            logger.warning("[RANKING ENTRY FIX] patched _normalize_ranking_row_for_entry V1.3 no-unit-refix")
 
         save = getattr(efr, "save_ranking_pseudo_technicals", None)
-        if callable(save) and not getattr(save, "_ranking_entry_fix_patch_v12", False):
+        if callable(save) and not getattr(save, "_ranking_entry_fix_patch_v13", False):
             _ORIGINAL_SAVE_TECH = save
-            _patched_save_ranking_pseudo_technicals._ranking_entry_fix_patch_v12 = True  # type: ignore[attr-defined]
+            _patched_save_ranking_pseudo_technicals._ranking_entry_fix_patch_v13 = True  # type: ignore[attr-defined]
             efr.save_ranking_pseudo_technicals = _patched_save_ranking_pseudo_technicals
-            logger.warning("[RANKING ENTRY FIX] patched save_ranking_pseudo_technicals V1.2")
+            logger.warning("[RANKING ENTRY FIX] patched save_ranking_pseudo_technicals V1.3")
 
+        _reinstall_db_fallback_patch()
         _PATCHED = True
-        logger.warning("[RANKING ENTRY FIX] installed V1.2 tech-fallback no-unit-refix")
+        logger.warning("[RANKING ENTRY FIX] installed V1.3 tech-fallback no-unit-refix db-fallback-reinstall")
         return True
     except Exception:
         logger.exception("[RANKING ENTRY FIX] install failed")
