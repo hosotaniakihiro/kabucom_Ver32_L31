@@ -1,9 +1,13 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver18-LIQUIDITY-EMPTY-FALLBACK-AUTO-INSTALL
+# Version: Ver19-DISABLE-LIQUIDITY-EMPTY-FALLBACK-BY-DEFAULT
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # 失敗しても本体起動は止めない。
+#
+# Ver19:
+#   - LIQ_EMPTY_FALLBACK は低流動性銘柄を戻してしまうため、自動installを既定OFFへ変更。
+#   - 必要な場合だけ ENABLE_LIQ_EMPTY_FALLBACK_PATCH=1 で明示的に有効化。
 # ============================================================
 
 from __future__ import annotations
@@ -110,6 +114,16 @@ def _install_module(module_name: str, label: str, *, disabled_env: str | None = 
             pass
 
 
+def _install_liq_empty_fallback_only_if_enabled() -> None:
+    if not _env_on("ENABLE_LIQ_EMPTY_FALLBACK_PATCH", False):
+        os.environ.setdefault("DISABLE_LIQ_EMPTY_FALLBACK_PATCH", "1")
+        _write_boot_evidence("LIQ_EMPTY_FALLBACK_DISABLED_BY_DEFAULT")
+        logger.warning("[SITECUSTOMIZE] LIQ_EMPTY_FALLBACK auto install skipped by default; set ENABLE_LIQ_EMPTY_FALLBACK_PATCH=1 to enable")
+        return
+    os.environ.pop("DISABLE_LIQ_EMPTY_FALLBACK_PATCH", None)
+    _install_module("core.startup.liquidity_empty_fallback_patch", "LIQ_EMPTY_FALLBACK")
+
+
 def _install_tonosama_surge_defaults() -> None:
     try:
         os.environ.setdefault("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING", "1")
@@ -196,7 +210,7 @@ _install_module("core.startup.entry_controller_source_prefilter_patch", "ENTRY_C
 _install_module("core.startup.entry_controller_tonosama_ai_bridge_patch", "TONOSAMA_AI_BRIDGE", disabled_env="DISABLE_TONOSAMA_AI_BRIDGE_PATCH")
 _install_module("core.startup.low_movement_tonosama_no_highlow_patch", "LOW_MOVE_TONOSAMA_FALLBACK", disabled_env="DISABLE_LOW_MOVE_TONOSAMA_FALLBACK_PATCH")
 _install_module("core.startup.final_entry_tonosama_liquidity_patch", "FINAL_TONOSAMA_LIQUIDITY", disabled_env="DISABLE_FINAL_TONOSAMA_LIQUIDITY_PATCH")
-_install_module("core.startup.liquidity_empty_fallback_patch", "LIQ_EMPTY_FALLBACK", disabled_env="DISABLE_LIQ_EMPTY_FALLBACK_PATCH")
+_install_liq_empty_fallback_only_if_enabled()
 _install_module("core.startup.summary_ai_liquidity_rescue_patch", "SUMMARY_AI_LIQ_RESCUE", disabled_env="DISABLE_SUMMARY_AI_LIQ_RESCUE_PATCH")
 _install_module("core.startup.summary_ai_entry_hook_dataframe_truth_patch", "SUMMARY_AI_DF_TRUTH_PATCH", disabled_env="DISABLE_SUMMARY_AI_DF_TRUTH_PATCH")
 _install_module("core.startup.summary_mtf_early_ready_patch", "SUMMARY_MTF_EARLY_READY", disabled_env="DISABLE_SUMMARY_MTF_EARLY_READY_PATCH")
