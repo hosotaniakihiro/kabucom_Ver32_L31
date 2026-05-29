@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/ranking_entry_source_db_fallback_patch.py
-# Version: V1-RANKING-ENTRY-SOURCE-DB-FALLBACK
+# Version: V2-RANKING-ENTRY-SOURCE-DB-FALLBACK-NO-RECURSION
 # ------------------------------------------------------------
 # 目的:
 #   trading.ranking.entry_from_ranking が global_data.latest_ranking_* を
@@ -8,14 +8,12 @@
 #   ranking_snapshot_1min から直接ランキングDFを復元して、
 #   ranking entry loop を止めない。
 #
-# 背景ログ:
-#   [RANKING ENTRY LOOP] ranking source dataframe not found
-#   [ATS RANKING] use preferred usable today db=...ranking20260529.db
-#
-# 方針:
-#   - まず元の _get_ranking_source_df() を呼ぶ。
-#   - None/empty の場合のみ DB fallback。
-#   - 最新 timestamp から lookback 分以内、最大行数だけ読む。
+# V2 重要修正:
+#   - ranking_entry_flat_price_guard_patch と相互に _get_ranking_source_df を
+#     wrapper し、互いを original として呼んで RecursionError になる問題を防止。
+#   - 既存 wrapper は呼ばず、global_data を直接読む → DB fallback の順で処理する。
+#   - RecursionError中の logger.warning(..., exc_info=True) が logging 自体を
+#     再帰させるため、例外ログは exc_info=False に抑制。
 # ============================================================
 
 from __future__ import annotations
@@ -31,7 +29,6 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 _INSTALLED = False
-_ORIG_GET_SOURCE = None
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -64,8 +61,8 @@ def _resolve_ranking_db_path() -> Optional[str]:
         p = resolve_ranking_db_path()
         if p:
             return str(p)
-    except Exception:
-        logger.debug("[RANKING ENTRY SOURCE DB FALLBACK] ats resolve failed", exc_info=True)
+    except Exception as e:
+        logger.debug("[RANKING ENTRY SOURCE DB FALLBACK] ats resolve failed: %s", e, exc_info=False)
 
     for key in ("RANKING_DB_PATH", "ATS_RANKING_DB_PATH", "KABU_RANKING_DB_PATH"):
         try:
@@ -107,6 +104,40 @@ def _find_col(cols: list[str], candidates: tuple[str, ...]) -> Optional[str]:
         if cand.lower() in lower:
             return lower[cand.lower()]
     return None
+
+
+def _read_global_data_source() -> pd.DataFrame:
+    """既存 wrapper を呼ばず、global_data の実体だけを直接読む。"""
+    try:
+        from global_state import global_data
+    except Exception:
+        return pd.DataFrame()
+
+    try:
+        snapshot = getattr(global_data, "latest_ranking_snapshot", None)
+        if isinstance(snapshot, list) and snapshot:
+            df = pd.DataFrame(snapshot)
+            if not df.empty:
+                logger.info("[RANKING ENTRY SOURCE DB FALLBACK] direct source=latest_ranking_snapshot rows=%s", len(df))
+                return df
+    except Exception as e:
+        logger.debug("[RANKING ENTRY SOURCE DB FALLBACK] direct snapshot read failed: %s", e, exc_info=False)
+
+    for name in (
+        "latest_ranking_raw",
+        "latest_ranking_df",
+        "ranking_raw_df",
+        "ranking_snapshot_df",
+        "ranking_df",
+    ):
+        try:
+            df = getattr(global_data, name, None)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                logger.info("[RANKING ENTRY SOURCE DB FALLBACK] direct source=%s rows=%s", name, len(df))
+                return df.copy()
+        except Exception as e:
+            logger.debug("[RANKING ENTRY SOURCE DB FALLBACK] direct attr read failed name=%s err=%s", name, e, exc_info=False)
+    return pd.DataFrame()
 
 
 def _load_from_ranking_db() -> pd.DataFrame:
@@ -170,54 +201,51 @@ def _load_from_ranking_db() -> pd.DataFrame:
                 list(df.columns)[:20],
             )
             return df
-    except Exception:
-        logger.exception("[RANKING ENTRY SOURCE DB FALLBACK] db load failed db=%s table=%s", db_path, table)
+    except Exception as e:
+        logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] db load failed db=%s table=%s err=%s", db_path, table, e, exc_info=False)
         return pd.DataFrame()
 
 
+def _patched_get_ranking_source_df():
+    df = _read_global_data_source()
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        return df
+
+    fb = _load_from_ranking_db()
+    if isinstance(fb, pd.DataFrame) and not fb.empty:
+        try:
+            from global_state import global_data
+            setattr(global_data, "latest_ranking_df", fb.copy())
+        except Exception:
+            pass
+        return fb
+
+    logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] ranking source dataframe not found after direct+db fallback")
+    return None
+
+
 def install() -> bool:
-    global _INSTALLED, _ORIG_GET_SOURCE
+    global _INSTALLED
     if _INSTALLED:
         return True
     try:
         import trading.ranking.entry_from_ranking as mod
-    except Exception:
-        logger.exception("[RANKING ENTRY SOURCE DB FALLBACK] import failed")
+    except Exception as e:
+        logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] import failed: %s", e, exc_info=False)
         return False
 
     old = getattr(mod, "_get_ranking_source_df", None)
-    if getattr(old, "_ranking_entry_source_db_fallback", False):
+    if getattr(old, "_ranking_entry_source_db_fallback_v2", False):
         _INSTALLED = True
         return True
-    if not callable(old):
-        logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] target unavailable")
-        return False
-
-    _ORIG_GET_SOURCE = old
-
-    def _patched_get_ranking_source_df():
-        try:
-            df = _ORIG_GET_SOURCE()
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                return df
-        except Exception:
-            logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] original source failed -> fallback", exc_info=True)
-        fb = _load_from_ranking_db()
-        if isinstance(fb, pd.DataFrame) and not fb.empty:
-            try:
-                from global_state import global_data
-                setattr(global_data, "latest_ranking_df", fb.copy())
-            except Exception:
-                pass
-            return fb
-        return None
 
     _patched_get_ranking_source_df._ranking_entry_source_db_fallback = True  # type: ignore[attr-defined]
-    _patched_get_ranking_source_df._original = old  # type: ignore[attr-defined]
+    _patched_get_ranking_source_df._ranking_entry_source_db_fallback_v2 = True  # type: ignore[attr-defined]
+    _patched_get_ranking_source_df._original = None  # type: ignore[attr-defined]
     mod._get_ranking_source_df = _patched_get_ranking_source_df
     _INSTALLED = True
     logger.warning(
-        "[RANKING ENTRY SOURCE DB FALLBACK] installed enabled=%s lookback_min=%s max_rows=%s",
+        "[RANKING ENTRY SOURCE DB FALLBACK] installed v2 no_recursion=True enabled=%s lookback_min=%s max_rows=%s",
         _env_bool("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED", True),
         _env_int("RANKING_ENTRY_SOURCE_DB_LOOKBACK_MIN", 8),
         _env_int("RANKING_ENTRY_SOURCE_DB_MAX_ROWS", 2000),
@@ -227,8 +255,8 @@ def install() -> bool:
 
 try:
     install()
-except Exception:
-    logger.exception("[RANKING ENTRY SOURCE DB FALLBACK] auto install failed")
+except Exception as e:
+    logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] auto install failed: %s", e, exc_info=False)
 
 
 __all__ = ["install"]
