@@ -1,9 +1,14 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver22-TONOSAMA-PENDING-WARNING-RELAX
+# Version: Ver23-RANKING-ENTRY-HIGH-LOW-SNAPSHOT-PATCH
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # 失敗しても本体起動は止めない。
+#
+# Ver23:
+#   - ランキング由来entry rowの high/low が0で LOW MOVE GUARD no_high_low になる問題へ対応。
+#   - ranking_snapshot_1min の直近価格履歴から high/low/range_pct を補完する
+#     RANKING_ENTRY_HIGH_LOW_SNAPSHOT を自動install。
 #
 # Ver22:
 #   - TONOSAMA pending_writer の warning-only climax guard を自動install。
@@ -163,6 +168,9 @@ def _install_tonosama_surge_defaults() -> None:
         os.environ.setdefault("FINAL_ENTRY_TONOSAMA_MIN_VOLUME_SPEED", "1.0")
         os.environ.setdefault("SUMMARY_DB_DATE_GUARD_ENABLED", "1")
         os.environ.setdefault("SUMMARY_DB_DATE_GUARD_CLEANUP_ENABLED", "1")
+        os.environ.setdefault("RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH_ENABLED", "1")
+        os.environ.setdefault("RANKING_ENTRY_HIGH_LOW_SNAPSHOT_LOOKBACK_ROWS", "12")
+        os.environ.setdefault("RANKING_ENTRY_HIGH_LOW_SNAPSHOT_MAX_AGE_MIN", "30")
         _write_boot_evidence("TONOSAMA_SURGE_DEFAULTS_SET", {
             "failopen": os.environ.get("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING"),
             "allow_without_history": os.environ.get("TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY"),
@@ -181,9 +189,10 @@ def _install_tonosama_surge_defaults() -> None:
             "low_move_tonosama_no_highlow": os.environ.get("LOW_MOVE_TONOSAMA_ALLOW_NO_HIGHLOW_FALLBACK"),
             "final_tonosama_liq": os.environ.get("FINAL_ENTRY_TONOSAMA_LIQUIDITY_FALLBACK"),
             "summary_date_guard": os.environ.get("SUMMARY_DB_DATE_GUARD_ENABLED"),
+            "ranking_hl_patch": os.environ.get("RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH_ENABLED"),
         })
         logger.warning(
-            "[SITECUSTOMIZE] tonosama defaults failopen=%s allow_without_history=%s value=%s five_sec_advisory=%s allow_zero=%s ai_reject_zero_5s=%s ai_min_5s=%s warning_only_climax=%s warning_only_max_price_change=%s history_missing_strong_move=%s ranking_lock_wait=%s source_prefilter=%s tonosama_ai_bridge=%s low_move_tonosama_min_price=%s no_highlow_fallback=%s final_tonosama_liq=%s summary_date_guard=%s",
+            "[SITECUSTOMIZE] tonosama defaults failopen=%s allow_without_history=%s value=%s five_sec_advisory=%s allow_zero=%s ai_reject_zero_5s=%s ai_min_5s=%s warning_only_climax=%s warning_only_max_price_change=%s history_missing_strong_move=%s ranking_lock_wait=%s source_prefilter=%s tonosama_ai_bridge=%s low_move_tonosama_min_price=%s no_highlow_fallback=%s final_tonosama_liq=%s summary_date_guard=%s ranking_hl_patch=%s",
             os.environ.get("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING"),
             os.environ.get("TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY"),
             os.environ.get("TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE"),
@@ -201,6 +210,7 @@ def _install_tonosama_surge_defaults() -> None:
             os.environ.get("LOW_MOVE_TONOSAMA_ALLOW_NO_HIGHLOW_FALLBACK"),
             os.environ.get("FINAL_ENTRY_TONOSAMA_LIQUIDITY_FALLBACK"),
             os.environ.get("SUMMARY_DB_DATE_GUARD_ENABLED"),
+            os.environ.get("RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH_ENABLED"),
         )
     except Exception:
         _write_boot_evidence("TONOSAMA_SURGE_DEFAULTS_EXCEPTION", traceback.format_exc())
@@ -235,6 +245,7 @@ _install_module("core.startup.summary_save_quality_guard_patch", "SUMMARY_SAVE_Q
 _install_module("core.startup.tonosama_5sec_advisory_patch", "TONOSAMA_5SEC_ADVISORY", disabled_env="DISABLE_TONOSAMA_5SEC_ADVISORY_PATCH")
 _install_module("core.startup.tonosama_history_missing_guard_patch", "TONOSAMA_HISTORY_MISSING_GUARD", disabled_env="DISABLE_TONOSAMA_HISTORY_MISSING_GUARD_PATCH")
 _install_module("core.startup.ranking_entry_flat_price_guard_patch", "RANKING_FLAT_PRICE_DB_FALLBACK", disabled_env="DISABLE_RANKING_FLAT_PRICE_PATCH")
+_install_module("core.startup.ranking_entry_high_low_from_snapshot_patch", "RANKING_ENTRY_HIGH_LOW_SNAPSHOT", disabled_env="DISABLE_RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH")
 _install_module("core.startup.entry_controller_pipeline_lock_wait_patch", "ENTRY_CONTROLLER_LOCK_WAIT", disabled_env="DISABLE_ENTRY_CONTROLLER_LOCK_WAIT_PATCH")
 _install_module("core.startup.entry_controller_source_prefilter_patch", "ENTRY_CONTROLLER_SOURCE_PREFILTER", disabled_env="DISABLE_ENTRY_CONTROLLER_SOURCE_PREFILTER_PATCH")
 _install_module("core.startup.entry_controller_tonosama_ai_bridge_patch", "TONOSAMA_AI_BRIDGE", disabled_env="DISABLE_TONOSAMA_AI_BRIDGE_PATCH")
