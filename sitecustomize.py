@@ -1,9 +1,14 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver21-SUMMARY-DB-DATE-GUARD
+# Version: Ver22-TONOSAMA-PENDING-WARNING-RELAX
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # 失敗しても本体起動は止めない。
+#
+# Ver22:
+#   - TONOSAMA pending_writer の warning-only climax guard を自動install。
+#   - buying_climax_upper_wick_warning / selling_climax_lower_wick_warning は、
+#     価格変化が小さく出来高とランキングMA方向がOKなら pending登録を許可。
 #
 # Ver21:
 #   - summaryYYYYMMDD.db に別日 datetime が混入しないよう、
@@ -142,6 +147,8 @@ def _install_tonosama_surge_defaults() -> None:
         os.environ.setdefault("TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC", "0")
         os.environ.setdefault("TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT", "0.0")
         os.environ.setdefault("TONOSAMA_ALLOW_HISTORY_MISSING_STRONG_MOVE", "1")
+        os.environ.setdefault("TONOSAMA_ALLOW_WARNING_ONLY_CLIMAX", "1")
+        os.environ.setdefault("TONOSAMA_WARNING_ONLY_MAX_PRICE_CHANGE_PCT", "0.50")
         os.environ.setdefault("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_ENABLED", "1")
         os.environ.setdefault("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_SEC", "35")
         os.environ.setdefault("ENTRY_CONTROLLER_SOURCE_PREFILTER_ENABLED", "1")
@@ -164,6 +171,8 @@ def _install_tonosama_surge_defaults() -> None:
             "five_sec_allow_zero": os.environ.get("TONOSAMA_5SEC_ALLOW_ZERO_IF_PRIMARY_PASS"),
             "ai_reject_zero_5s": os.environ.get("TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC"),
             "ai_min_5s": os.environ.get("TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT"),
+            "warning_only_climax": os.environ.get("TONOSAMA_ALLOW_WARNING_ONLY_CLIMAX"),
+            "warning_only_max_price_change": os.environ.get("TONOSAMA_WARNING_ONLY_MAX_PRICE_CHANGE_PCT"),
             "history_missing_strong_move": os.environ.get("TONOSAMA_ALLOW_HISTORY_MISSING_STRONG_MOVE"),
             "ranking_lock_wait": os.environ.get("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_ENABLED"),
             "source_prefilter": os.environ.get("ENTRY_CONTROLLER_SOURCE_PREFILTER_ENABLED"),
@@ -174,7 +183,7 @@ def _install_tonosama_surge_defaults() -> None:
             "summary_date_guard": os.environ.get("SUMMARY_DB_DATE_GUARD_ENABLED"),
         })
         logger.warning(
-            "[SITECUSTOMIZE] tonosama defaults failopen=%s allow_without_history=%s value=%s five_sec_advisory=%s allow_zero=%s ai_reject_zero_5s=%s ai_min_5s=%s history_missing_strong_move=%s ranking_lock_wait=%s source_prefilter=%s tonosama_ai_bridge=%s low_move_tonosama_min_price=%s no_highlow_fallback=%s final_tonosama_liq=%s summary_date_guard=%s",
+            "[SITECUSTOMIZE] tonosama defaults failopen=%s allow_without_history=%s value=%s five_sec_advisory=%s allow_zero=%s ai_reject_zero_5s=%s ai_min_5s=%s warning_only_climax=%s warning_only_max_price_change=%s history_missing_strong_move=%s ranking_lock_wait=%s source_prefilter=%s tonosama_ai_bridge=%s low_move_tonosama_min_price=%s no_highlow_fallback=%s final_tonosama_liq=%s summary_date_guard=%s",
             os.environ.get("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING"),
             os.environ.get("TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY"),
             os.environ.get("TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE"),
@@ -182,6 +191,8 @@ def _install_tonosama_surge_defaults() -> None:
             os.environ.get("TONOSAMA_5SEC_ALLOW_ZERO_IF_PRIMARY_PASS"),
             os.environ.get("TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC"),
             os.environ.get("TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT"),
+            os.environ.get("TONOSAMA_ALLOW_WARNING_ONLY_CLIMAX"),
+            os.environ.get("TONOSAMA_WARNING_ONLY_MAX_PRICE_CHANGE_PCT"),
             os.environ.get("TONOSAMA_ALLOW_HISTORY_MISSING_STRONG_MOVE"),
             os.environ.get("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_ENABLED"),
             os.environ.get("ENTRY_CONTROLLER_SOURCE_PREFILTER_ENABLED"),
@@ -229,6 +240,7 @@ _install_module("core.startup.entry_controller_source_prefilter_patch", "ENTRY_C
 _install_module("core.startup.entry_controller_tonosama_ai_bridge_patch", "TONOSAMA_AI_BRIDGE", disabled_env="DISABLE_TONOSAMA_AI_BRIDGE_PATCH")
 _install_module("core.startup.low_movement_tonosama_no_highlow_patch", "LOW_MOVE_TONOSAMA_FALLBACK", disabled_env="DISABLE_LOW_MOVE_TONOSAMA_FALLBACK_PATCH")
 _install_module("core.startup.final_entry_tonosama_liquidity_patch", "FINAL_TONOSAMA_LIQUIDITY", disabled_env="DISABLE_FINAL_TONOSAMA_LIQUIDITY_PATCH")
+_install_module("core.startup.tonosama_pending_warning_relax_patch", "TONOSAMA_PENDING_WARNING_RELAX", disabled_env="DISABLE_TONOSAMA_PENDING_WARNING_RELAX_PATCH")
 _install_liq_empty_fallback_only_if_enabled()
 _install_module("core.startup.summary_ai_liquidity_rescue_patch", "SUMMARY_AI_LIQ_RESCUE", disabled_env="DISABLE_SUMMARY_AI_LIQ_RESCUE_PATCH")
 _install_module("core.startup.summary_ai_entry_hook_dataframe_truth_patch", "SUMMARY_AI_DF_TRUTH_PATCH", disabled_env="DISABLE_SUMMARY_AI_DF_TRUTH_PATCH")
