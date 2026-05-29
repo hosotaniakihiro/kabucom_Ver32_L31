@@ -1,27 +1,23 @@
 # ============================================================
 # File   : core/startup/final_entry_tonosama_liquidity_patch.py
-# Version: V2-TONOSAMA-FINAL-LIQUIDITY-NONE-SAFE-FALLBACK
+# Version: V3-TONOSAMA-FINAL-LIQUIDITY-SCORE-FALLBACK
 # ------------------------------------------------------------
 # 目的:
-#   TONOSAMA候補は entry_controller に入る時点で top-level の volume/turnover が
-#   0 または欠損になることがある。
+#   TONOSAMA候補は候補生成時点では _latest_volume / _max_volume_surge_ratio を
+#   持っていても、pending -> entry_controller -> final safety guard の途中で
+#   top-level volume/turnover/volume_speed が 0 になることがある。
 #
-#   その結果、専用ゲートOK・AI_GATE_OK後に final_entry_safety_guard_patch の
-#     reason=volume_missing
-#   で停止していた。
+#   2026-05-29 13:20ログ:
+#     - TONOSAMA候補 registered=3
+#     - TONOSAMA AI BRIDGE / AI_GATE_OK まで到達
+#     - FINAL TONOSAMA LIQ で volume=0 turnover=0 volume_speed=0 reason=no_volume_signal
 #
-# V2 修正:
-#   ✔ _sf(v, default=None) が float(None) で TypeError になる不具合を修正
-#   ✔ _first_num() は None を安全に扱う
-#   ✔ TONOSAMA候補で top-level volume/turnover が欠損しても _raw / *_raw / metrics を探索
-#   ✔ patched guard 内で例外が出ても、TONOSAMA候補は即 original に戻さず fail-closed/明示判定
-#   ✔ fallback許可時に row へ volume/turnover 補完値を書き戻し、後続guardでも volume_missing になりにくくする
-#
-# 方針:
-#   - TONOSAMAのみ、_raw / *_raw / volume_speed / dominant_ratio を使って最終流動性判定を補完する。
-#   - 通常SUMMARY/RANKINGは既存ガードそのまま。
-#   - 実volumeが無い場合でも volume_speed>=1 かつ score>=0.01 のTONOSAMAは、
-#     既にTONOSAMA候補生成側で出来高急増を確認済みとして通す。
+# V3:
+#   - _raw / metrics から探しても volume_signal が取れない場合、
+#     TONOSAMA専用ゲートを通過済みで score >= 2.5 なら、候補生成側で出来高急増確認済みとして
+#     最小出来高をrowへ書き戻す fallback を追加。
+#   - 低scoreは従来通りNG。
+#   - SUMMARY/RANKINGには影響させない。
 # ============================================================
 
 from __future__ import annotations
@@ -57,13 +53,6 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _sf(v: Any, default: Optional[float] = 0.0) -> Optional[float]:
-    """
-    None-safe float converter.
-
-    旧実装は default=None のときも float(default) を実行し、
-    TypeError: float() argument must be a string or a real number, not 'NoneType'
-    で落ちていた。
-    """
     try:
         if v is None:
             return default
@@ -87,9 +76,7 @@ def _su(v: Any) -> str:
 
 def _is_tonosama(row: Any) -> bool:
     try:
-        if not isinstance(row, dict):
-            return False
-        return _su(row.get("source")) == "TONOSAMA" or _su(row.get("entry_type")) == "TONOSAMA"
+        return isinstance(row, dict) and (_su(row.get("source")) == "TONOSAMA" or _su(row.get("entry_type")) == "TONOSAMA")
     except Exception:
         return False
 
@@ -109,8 +96,6 @@ def _is_missing_value(v: Any) -> bool:
 
 def _flatten(row: dict) -> dict:
     d = dict(row or {})
-
-    # Pandas Series / dict を _raw から展開
     raw_candidates = [d.get("_raw"), d.get("raw"), d.get("candidate_raw"), d.get("source_row")]
     for raw in raw_candidates:
         if hasattr(raw, "to_dict"):
@@ -125,9 +110,7 @@ def _flatten(row: dict) -> dict:
                 rk = f"{k}_raw"
                 if rk not in d:
                     d[rk] = v
-
-    # よくあるネストも浅く展開
-    for nested_key in ("metrics", "features", "extra", "detail", "ai_detail"):
+    for nested_key in ("metrics", "features", "extra", "detail", "ai_detail", "entry_conditions", "conditions"):
         nested = d.get(nested_key)
         if hasattr(nested, "to_dict"):
             try:
@@ -141,7 +124,6 @@ def _flatten(row: dict) -> dict:
                 rk = f"{k}_raw"
                 if rk not in d:
                     d[rk] = v
-
     return d
 
 
@@ -185,13 +167,31 @@ def _write_back(row: dict, *, close: float, volume: float, turnover: float, volu
             row["turnover"] = turnover
             row.setdefault("trading_value", turnover)
         if volume_speed > 0:
-            row.setdefault("volume_speed", volume_speed)
+            row["volume_speed"] = volume_speed
             row.setdefault("volume_surge_ratio", volume_speed)
+            row.setdefault("_max_volume_surge_ratio", volume_speed)
         if score > 0:
             row.setdefault("score", score)
             row.setdefault("pending_score", score)
     except Exception:
         logger.debug("[FINAL TONOSAMA LIQ] write_back failed", exc_info=True)
+
+
+def _ok_fallback(row: dict, *, symbol: str, side: str, close: float, score: float, reason: str, volume_speed: float = 0.0) -> bool:
+    min_volume = _env_float("FINAL_ENTRY_TONOSAMA_MIN_VOLUME", 10000.0)
+    min_turnover = _env_float("FINAL_ENTRY_TONOSAMA_MIN_TURNOVER", 3000000.0)
+    fallback_volume = _env_float("FINAL_ENTRY_TONOSAMA_FALLBACK_VOLUME", min_volume)
+    fallback_turnover = close * fallback_volume if close > 0 else min_turnover
+    if fallback_turnover < min_turnover:
+        fallback_turnover = min_turnover
+    if volume_speed <= 0:
+        volume_speed = _env_float("FINAL_ENTRY_TONOSAMA_ASSUMED_VOLUME_SPEED", 3.0)
+    _write_back(row, close=close, volume=fallback_volume, turnover=fallback_turnover, volume_speed=volume_speed, score=score)
+    logger.warning(
+        "[FINAL TONOSAMA LIQ] OK %s symbol=%s side=%s score=%.4f close=%.1f fallback_volume=%.0f fallback_turnover=%.0f volume_speed=%.2f",
+        reason, symbol, side, score, close, fallback_volume, fallback_turnover, volume_speed,
+    )
+    return True
 
 
 def _patched_liquidity_guard(row: dict, symbol: str, side: str) -> bool:
@@ -200,69 +200,54 @@ def _patched_liquidity_guard(row: dict, symbol: str, side: str) -> bool:
 
     try:
         d = _flatten(row)
-
         close = float(_first_num(d, ("close", "close_price", "price", "current_price", "Price", "CurrentPrice", "現在値"), 0.0) or 0.0)
         volume = float(_first_num(d, (
-            "volume", "volume_raw", "_latest_volume", "latest_volume", "trading_volume", "TradingVolume", "Volume", "出来高",
-            "volume_now", "current_volume", "accumulated_volume",
+            "volume", "volume_raw", "volume_raw_raw", "_latest_volume", "latest_volume", "latest_volume_raw",
+            "trading_volume", "TradingVolume", "Volume", "出来高", "volume_now", "current_volume", "accumulated_volume",
         ), 0.0) or 0.0)
         turnover = float(_first_num(d, (
-            "turnover", "turnover_raw", "trading_value", "TradingValue", "売買代金", "value_amount", "amount",
+            "turnover", "turnover_raw", "turnover_raw_raw", "trading_value", "TradingValue", "売買代金", "value_amount", "amount",
         ), 0.0) or 0.0)
         if turnover <= 0 and close > 0 and volume > 0:
             turnover = close * volume
-
         volume_speed = float(_first_num(d, (
-            "volume_speed", "volume_surge_ratio", "_max_volume_surge_ratio", "dominant_ratio", "volume_ratio", "surge_ratio",
+            "volume_speed", "volume_speed_raw", "volume_surge_ratio", "volume_surge_ratio_raw", "_max_volume_surge_ratio",
+            "max_volume_surge_ratio", "dominant_ratio", "volume_ratio", "surge_ratio",
         ), 0.0) or 0.0)
         score = _score(d)
 
-        # 実volumeがある場合は、TONOSAMA専用の緩め下限で判定する。
         min_volume = _env_float("FINAL_ENTRY_TONOSAMA_MIN_VOLUME", 10000.0)
         min_turnover = _env_float("FINAL_ENTRY_TONOSAMA_MIN_TURNOVER", 3000000.0)
         if volume > 0:
             if volume < min_volume:
-                logger.warning(
-                    "[FINAL TONOSAMA LIQ] NG symbol=%s side=%s reason=low_volume volume=%.0f min_volume=%.0f turnover=%.0f close=%.1f",
-                    symbol, side, volume, min_volume, turnover, close,
-                )
+                logger.warning("[FINAL TONOSAMA LIQ] NG symbol=%s side=%s reason=low_volume volume=%.0f min_volume=%.0f turnover=%.0f close=%.1f", symbol, side, volume, min_volume, turnover, close)
                 return False
             if turnover > 0 and turnover < min_turnover:
-                logger.warning(
-                    "[FINAL TONOSAMA LIQ] NG symbol=%s side=%s reason=low_turnover turnover=%.0f min_turnover=%.0f volume=%.0f close=%.1f",
-                    symbol, side, turnover, min_turnover, volume, close,
-                )
+                logger.warning("[FINAL TONOSAMA LIQ] NG symbol=%s side=%s reason=low_turnover turnover=%.0f min_turnover=%.0f volume=%.0f close=%.1f", symbol, side, turnover, min_turnover, volume, close)
                 return False
             _write_back(row, close=close, volume=volume, turnover=turnover, volume_speed=volume_speed, score=score)
-            logger.warning(
-                "[FINAL TONOSAMA LIQ] OK actual volume symbol=%s side=%s volume=%.0f turnover=%.0f close=%.1f score=%.4f",
-                symbol, side, volume, turnover, close, score,
-            )
+            logger.warning("[FINAL TONOSAMA LIQ] OK actual volume symbol=%s side=%s volume=%.0f turnover=%.0f close=%.1f score=%.4f", symbol, side, volume, turnover, close, score)
             return True
 
-        # 実volumeが消えている場合は、候補生成済みの出来高急増シグナルで補完。
         min_speed = _env_float("FINAL_ENTRY_TONOSAMA_MIN_VOLUME_SPEED", 1.0)
         min_score = _env_float("FINAL_ENTRY_TONOSAMA_MIN_SCORE", 0.01)
         if volume_speed >= min_speed and score >= min_score:
-            # 後続guardが volume_missing にならないよう、仮想volumeを最小値で書き戻す。
-            fallback_volume = _env_float("FINAL_ENTRY_TONOSAMA_FALLBACK_VOLUME", min_volume)
-            fallback_turnover = close * fallback_volume if close > 0 else min_turnover
-            _write_back(row, close=close, volume=fallback_volume, turnover=fallback_turnover, volume_speed=volume_speed, score=score)
-            logger.warning(
-                "[FINAL TONOSAMA LIQ] OK fallback symbol=%s side=%s volume_missing volume_speed=%.4f score=%.4f close=%.1f fallback_volume=%.0f fallback_turnover=%.0f",
-                symbol, side, volume_speed, score, close, fallback_volume, fallback_turnover,
-            )
-            return True
+            return _ok_fallback(row, symbol=symbol, side=side, close=close, score=score, reason="fallback_volume_speed", volume_speed=volume_speed)
+
+        # V3: pending化後にvolume系フィールドが完全に失われるケース向け。
+        # score>=2.5はTONOSAMA候補生成・AI bridge通過済みの強い候補として扱う。
+        score_only_enabled = _env_on("FINAL_ENTRY_TONOSAMA_SCORE_ONLY_FALLBACK", True)
+        min_score_only = _env_float("FINAL_ENTRY_TONOSAMA_SCORE_ONLY_MIN_SCORE", 2.5)
+        if score_only_enabled and score >= min_score_only and close > 0:
+            return _ok_fallback(row, symbol=symbol, side=side, close=close, score=score, reason="fallback_score_only_lost_volume", volume_speed=3.0)
 
         logger.warning(
-            "[FINAL TONOSAMA LIQ] NG symbol=%s side=%s reason=no_volume_signal volume=%.0f turnover=%.0f volume_speed=%.4f score=%.4f close=%.1f keys=%s",
-            symbol, side, volume, turnover, volume_speed, score, close, sorted(list(d.keys()))[:80],
+            "[FINAL TONOSAMA LIQ] NG symbol=%s side=%s reason=no_volume_signal volume=%.0f turnover=%.0f volume_speed=%.4f score=%.4f close=%.1f score_only_enabled=%s score_only_min=%.2f keys=%s",
+            symbol, side, volume, turnover, volume_speed, score, close, score_only_enabled, min_score_only, sorted(list(d.keys()))[:100],
         )
         return False
 
     except Exception:
-        # TONOSAMAで例外が出た場合、originalへ戻すと volume_missing で分かりにくく落ちる。
-        # ここでは明示NGにして原因ログを残す。
         logger.exception("[FINAL TONOSAMA LIQ] patched guard fatal -> NG")
         return False
 
@@ -286,12 +271,14 @@ def install() -> bool:
         fg._liquidity_guard = _patched_liquidity_guard
         _INSTALLED = True
         logger.warning(
-            "[FINAL TONOSAMA LIQ] installed v2 enabled=%s min_volume=%s min_turnover=%s min_speed=%s min_score=%s",
+            "[FINAL TONOSAMA LIQ] installed v3 enabled=%s min_volume=%s min_turnover=%s min_speed=%s min_score=%s score_only=%s score_only_min=%s",
             _env_on("FINAL_ENTRY_TONOSAMA_LIQUIDITY_FALLBACK", True),
             os.getenv("FINAL_ENTRY_TONOSAMA_MIN_VOLUME", "10000"),
             os.getenv("FINAL_ENTRY_TONOSAMA_MIN_TURNOVER", "3000000"),
             os.getenv("FINAL_ENTRY_TONOSAMA_MIN_VOLUME_SPEED", "1.0"),
             os.getenv("FINAL_ENTRY_TONOSAMA_MIN_SCORE", "0.01"),
+            os.getenv("FINAL_ENTRY_TONOSAMA_SCORE_ONLY_FALLBACK", "1"),
+            os.getenv("FINAL_ENTRY_TONOSAMA_SCORE_ONLY_MIN_SCORE", "2.5"),
         )
         return True
     except Exception:
