@@ -1,20 +1,22 @@
 # ============================================================
 # File   : core/startup/summary_db_date_guard_patch.py
-# Version: V1-SUMMARY-DB-DATE-GUARD
+# Version: V2-SUMMARY-DB-DATE-GUARD-LOCK-SAFE
 # ------------------------------------------------------------
 # 目的:
 #   summaryYYYYMMDD.db に別日 datetime の行が混入するのを防ぐ。
+#
+# V2:
+#   - main.py 起動時に既存DB cleanup DELETE を無理に実行しない。
+#   - 保存前の df 日付フィルターは継続し、別日行の新規混入は防ぐ。
+#   - cleanup は任意。ロック中なら stacktrace を出さず skip する。
+#   - database is locked で起動ログを汚さない。
 #
 # 対策:
 #   1. bulk_upsert_summary() 保存直前に、接続先 summary DB の
 #      ファイル名 summaryYYYYMMDD.db から対象日を取得する。
 #   2. df['datetime'] の日付が対象日と違う行は保存しない。
-#   3. 起動時/必要時に stock_summary_1min/3min/5min から
-#      既存の別日データを削除する。
-#
-# 重要:
-#   - recovery / backfill / startup 系であっても、日次DBへ別日行は保存しない。
-#   - 前日データを使う場合は計算用に読むだけ。保存先は当日DBの日付に限定。
+#   3. 既存の別日データ削除は SUMMARY_DB_DATE_GUARD_CLEANUP_ENABLED=1 かつ
+#      SUMMARY_DB_DATE_GUARD_STARTUP_CLEANUP=1 のときだけ実行。
 # ============================================================
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 import threading
 from pathlib import Path
 from typing import Any, Optional
@@ -46,13 +49,28 @@ def _env_bool(name: str, default: bool = True) -> bool:
         if v is None or str(v).strip() == "":
             return bool(default)
         s = str(v).strip().lower()
-        if s in {"1", "true", "yes", "y", "on"}:
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
             return True
-        if s in {"0", "false", "no", "n", "off"}:
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
             return False
         return bool(default)
     except Exception:
         return bool(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except Exception:
+        return float(default)
+
+
+def _is_main_py_process() -> bool:
+    try:
+        argv = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        return any(x.endswith("/main.py") or x == "main.py" for x in argv)
+    except Exception:
+        return False
 
 
 def _safe_datetime_series(s: Any) -> pd.Series:
@@ -122,7 +140,6 @@ def _resolve_summary_engine() -> Any:
 
 
 def _resolve_summary_db_path() -> Optional[str]:
-    # まず現在の summary engine から取得
     try:
         engine = _resolve_summary_engine()
         p = _engine_url_to_path(engine)
@@ -130,8 +147,6 @@ def _resolve_summary_db_path() -> Optional[str]:
             return p
     except Exception:
         pass
-
-    # フォールバック: よく使う環境変数
     for key in ("SUMMARY_DB_PATH", "AUTOSTOCK_SUMMARY_DB_PATH", "KABU_SUMMARY_DB_PATH"):
         try:
             v = os.environ.get(key, "").strip()
@@ -162,10 +177,19 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
         return False
 
 
-def _cleanup_wrong_date_rows(db_path: str, target_date: dt.date) -> None:
-    if not _env_bool("SUMMARY_DB_DATE_GUARD_CLEANUP_ENABLED", True):
+def _is_sqlite_locked(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "database is locked" in msg or "database table is locked" in msg or "locked" in msg
+
+
+def _cleanup_wrong_date_rows(db_path: str, target_date: dt.date, *, reason: str = "manual") -> None:
+    if not _env_bool("SUMMARY_DB_DATE_GUARD_CLEANUP_ENABLED", False):
         return
-    key = f"{db_path}|{target_date.isoformat()}"
+    if _is_main_py_process() and not _env_bool("SUMMARY_DB_DATE_GUARD_CLEANUP_IN_MAIN", False):
+        logger.info("[SUMMARY DB DATE GUARD] cleanup skipped in main.py reason=%s db=%s", reason, db_path)
+        return
+
+    key = f"{db_path}|{target_date.isoformat()}|{reason}"
     with _CLEANUP_LOCK:
         if key in _CLEANUP_DONE:
             return
@@ -175,10 +199,12 @@ def _cleanup_wrong_date_rows(db_path: str, target_date: dt.date) -> None:
         return
 
     target = target_date.isoformat()
+    timeout_sec = max(0.1, _env_float("SUMMARY_DB_DATE_GUARD_CLEANUP_TIMEOUT_SEC", 1.0))
+    conn: sqlite3.Connection | None = None
     try:
-        conn = sqlite3.connect(db_path, timeout=30)
+        conn = sqlite3.connect(db_path, timeout=timeout_sec)
         try:
-            conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute(f"PRAGMA busy_timeout={int(timeout_sec * 1000)}")
         except Exception:
             pass
         total_deleted = 0
@@ -200,23 +226,22 @@ def _cleanup_wrong_date_rows(db_path: str, target_date: dt.date) -> None:
                     deleted = int(before) - int(after)
                     total_deleted += deleted
                     logger.warning(
-                        "[SUMMARY DB DATE GUARD] cleanup deleted table=%s db=%s target_date=%s before=%s wrong=%s after=%s deleted=%s",
-                        table,
-                        db_path,
-                        target,
-                        before,
-                        wrong,
-                        after,
-                        deleted,
+                        "[SUMMARY DB DATE GUARD] cleanup deleted table=%s db=%s target_date=%s before=%s wrong=%s after=%s deleted=%s reason=%s",
+                        table, db_path, target, before, wrong, after, deleted, reason,
                     )
                 else:
                     logger.info(
-                        "[SUMMARY DB DATE GUARD] cleanup ok table=%s db=%s target_date=%s rows=%s wrong=0",
-                        table,
-                        db_path,
-                        target,
-                        before,
+                        "[SUMMARY DB DATE GUARD] cleanup ok table=%s db=%s target_date=%s rows=%s wrong=0 reason=%s",
+                        table, db_path, target, before, reason,
                     )
+            except sqlite3.OperationalError as exc:
+                if _is_sqlite_locked(exc):
+                    logger.warning(
+                        "[SUMMARY DB DATE GUARD] cleanup skipped locked table=%s db=%s reason=%s timeout=%.1fs",
+                        table, db_path, reason, timeout_sec,
+                    )
+                    continue
+                logger.exception("[SUMMARY DB DATE GUARD] cleanup failed table=%s db=%s", table, db_path)
             except Exception:
                 logger.exception("[SUMMARY DB DATE GUARD] cleanup failed table=%s db=%s", table, db_path)
         conn.commit()
@@ -225,11 +250,20 @@ def _cleanup_wrong_date_rows(db_path: str, target_date: dt.date) -> None:
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             except Exception:
                 pass
+    except sqlite3.OperationalError as exc:
+        if _is_sqlite_locked(exc):
+            logger.warning(
+                "[SUMMARY DB DATE GUARD] cleanup skipped locked db=%s target_date=%s reason=%s timeout=%.1fs",
+                db_path, target, reason, timeout_sec,
+            )
+        else:
+            logger.exception("[SUMMARY DB DATE GUARD] cleanup db failed db=%s target_date=%s", db_path, target)
     except Exception:
         logger.exception("[SUMMARY DB DATE GUARD] cleanup db failed db=%s target_date=%s", db_path, target)
     finally:
         try:
-            conn.close()  # type: ignore[name-defined]
+            if conn is not None:
+                conn.close()
         except Exception:
             pass
 
@@ -240,9 +274,7 @@ def _filter_df_to_summary_db_date(df: pd.DataFrame, *, interval: int, save_reaso
     if "datetime" not in df.columns:
         logger.warning(
             "[SUMMARY DB DATE GUARD] datetime column missing -> cannot date-filter interval=%s rows=%s save_reason=%s",
-            interval,
-            len(df),
-            save_reason,
+            interval, len(df), save_reason,
         )
         return df
 
@@ -251,17 +283,16 @@ def _filter_df_to_summary_db_date(df: pd.DataFrame, *, interval: int, save_reaso
     if target_date is None:
         logger.warning(
             "[SUMMARY DB DATE GUARD] target date unresolved -> skip date filter interval=%s db_path=%s rows=%s save_reason=%s",
-            interval,
-            db_path,
-            len(df),
-            save_reason,
+            interval, db_path, len(df), save_reason,
         )
         return df
 
-    try:
-        _cleanup_wrong_date_rows(str(db_path), target_date)
-    except Exception:
-        logger.debug("[SUMMARY DB DATE GUARD] cleanup call failed", exc_info=True)
+    # 保存前cleanupは既定OFF。別日行の新規保存防止だけは必ず行う。
+    if _env_bool("SUMMARY_DB_DATE_GUARD_CLEANUP_BEFORE_SAVE", False):
+        try:
+            _cleanup_wrong_date_rows(str(db_path), target_date, reason=f"before_save:{save_reason or 'unknown'}")
+        except Exception:
+            logger.debug("[SUMMARY DB DATE GUARD] cleanup call failed", exc_info=True)
 
     out = df.copy()
     dt_s = _safe_datetime_series(out["datetime"])
@@ -283,25 +314,14 @@ def _filter_df_to_summary_db_date(df: pd.DataFrame, *, interval: int, save_reaso
             pass
         logger.warning(
             "[SUMMARY DB DATE GUARD] drop wrong-date rows interval=%s db=%s target_date=%s rows_before=%s wrong_date=%s invalid_dt=%s sample=%s save_reason=%s",
-            interval,
-            db_path,
-            target_date.isoformat(),
-            before,
-            wrong,
-            invalid,
-            sample,
-            save_reason,
+            interval, db_path, target_date.isoformat(), before, wrong, invalid, sample, save_reason,
         )
     out = out.loc[mask_target].copy()
     after = len(out)
     if after != before:
         logger.warning(
             "[SUMMARY DB DATE GUARD] filtered interval=%s rows_before=%s rows_after=%s target_date=%s save_reason=%s",
-            interval,
-            before,
-            after,
-            target_date.isoformat(),
-            save_reason,
+            interval, before, after, target_date.isoformat(), save_reason,
         )
     return out
 
@@ -339,9 +359,7 @@ def install() -> bool:
                 rows = -1
             logger.warning(
                 "[SUMMARY DB DATE GUARD] all rows removed -> skip upsert interval=%s original_rows=%s save_reason=%s",
-                interval,
-                rows,
-                save_reason,
+                interval, rows, save_reason,
             )
             return 0
         return _ORIG_BULK_UPSERT(filtered, interval, *args, **kwargs)
@@ -363,17 +381,25 @@ def install() -> bool:
     except Exception:
         pass
 
-    # 起動時にも一度だけ既存DBを掃除する
-    try:
-        db_path = _resolve_summary_db_path()
-        target_date = _target_date_from_path(db_path)
-        if db_path and target_date:
-            _cleanup_wrong_date_rows(str(db_path), target_date)
-    except Exception:
-        logger.debug("[SUMMARY DB DATE GUARD] startup cleanup failed", exc_info=True)
+    if _env_bool("SUMMARY_DB_DATE_GUARD_STARTUP_CLEANUP", False):
+        try:
+            db_path = _resolve_summary_db_path()
+            target_date = _target_date_from_path(db_path)
+            if db_path and target_date:
+                _cleanup_wrong_date_rows(str(db_path), target_date, reason="startup")
+        except Exception:
+            logger.debug("[SUMMARY DB DATE GUARD] startup cleanup failed", exc_info=True)
+    else:
+        logger.info("[SUMMARY DB DATE GUARD] startup cleanup skipped by default")
 
     _INSTALLED = True
-    logger.warning("[SUMMARY DB DATE GUARD] installed enabled=True cleanup=True")
+    logger.warning(
+        "[SUMMARY DB DATE GUARD] installed enabled=True cleanup_enabled=%s startup_cleanup=%s before_save_cleanup=%s cleanup_in_main=%s",
+        _env_bool("SUMMARY_DB_DATE_GUARD_CLEANUP_ENABLED", False),
+        _env_bool("SUMMARY_DB_DATE_GUARD_STARTUP_CLEANUP", False),
+        _env_bool("SUMMARY_DB_DATE_GUARD_CLEANUP_BEFORE_SAVE", False),
+        _env_bool("SUMMARY_DB_DATE_GUARD_CLEANUP_IN_MAIN", False),
+    )
     return True
 
 
