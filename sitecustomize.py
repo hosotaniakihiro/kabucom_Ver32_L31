@@ -1,9 +1,14 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver24-RANKING-ENTRY-SOURCE-DB-FALLBACK
+# Version: Ver25-ENTRY-DIRECTION-RECURSION-FAILOPEN
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # 失敗しても本体起動は止めない。
+#
+# Ver25:
+#   - ENTRY_DIRECTION_CONFIRM の RecursionError だけで発注候補が落ちる問題へ対応。
+#   - ENTRY_DIRECTION_RECURSION_FAILOPEN を自動install。
+#   - RecursionError時は方向確認ガードだけskipし、LOW MOVE / credit / liquidity等の他ガードは残す。
 #
 # Ver24:
 #   - ranking entry loop が global_data.latest_ranking_* を見つけられない場合でも、
@@ -155,22 +160,25 @@ def _install_tonosama_surge_defaults() -> None:
         os.environ.setdefault("FINAL_ENTRY_TONOSAMA_MIN_TURNOVER", "3000000")
         os.environ.setdefault("FINAL_ENTRY_TONOSAMA_MIN_VOLUME_SPEED", "1.0")
         os.environ.setdefault("SUMMARY_DB_DATE_GUARD_ENABLED", "1")
-        os.environ.setdefault("SUMMARY_DB_DATE_GUARD_CLEANUP_ENABLED", "1")
+        os.environ.setdefault("SUMMARY_DB_DATE_GUARD_CLEANUP_ENABLED", "0")
         os.environ.setdefault("RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH_ENABLED", "1")
         os.environ.setdefault("RANKING_ENTRY_HIGH_LOW_SNAPSHOT_LOOKBACK_ROWS", "12")
         os.environ.setdefault("RANKING_ENTRY_HIGH_LOW_SNAPSHOT_MAX_AGE_MIN", "30")
         os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED", "1")
         os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_LOOKBACK_MIN", "8")
         os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_MAX_ROWS", "2000")
+        os.environ.setdefault("ENTRY_DIRECTION_RECURSION_FAILOPEN_ENABLED", "1")
         _write_boot_evidence("TONOSAMA_SURGE_DEFAULTS_SET", {
             "ranking_source_db_fallback": os.environ.get("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED"),
             "ranking_hl_patch": os.environ.get("RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH_ENABLED"),
+            "entry_direction_recursion_failopen": os.environ.get("ENTRY_DIRECTION_RECURSION_FAILOPEN_ENABLED"),
             "summary_date_guard": os.environ.get("SUMMARY_DB_DATE_GUARD_ENABLED"),
         })
         logger.warning(
-            "[SITECUSTOMIZE] defaults ranking_source_db_fallback=%s ranking_hl_patch=%s summary_date_guard=%s warning_only_climax=%s",
+            "[SITECUSTOMIZE] defaults ranking_source_db_fallback=%s ranking_hl_patch=%s entry_direction_recursion_failopen=%s summary_date_guard=%s warning_only_climax=%s",
             os.environ.get("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED"),
             os.environ.get("RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH_ENABLED"),
+            os.environ.get("ENTRY_DIRECTION_RECURSION_FAILOPEN_ENABLED"),
             os.environ.get("SUMMARY_DB_DATE_GUARD_ENABLED"),
             os.environ.get("TONOSAMA_ALLOW_WARNING_ONLY_CLIMAX"),
         )
@@ -209,6 +217,7 @@ _install_module("core.startup.tonosama_history_missing_guard_patch", "TONOSAMA_H
 _install_module("core.startup.ranking_entry_flat_price_guard_patch", "RANKING_FLAT_PRICE_DB_FALLBACK", disabled_env="DISABLE_RANKING_FLAT_PRICE_PATCH")
 _install_module("core.startup.ranking_entry_source_db_fallback_patch", "RANKING_ENTRY_SOURCE_DB_FALLBACK", disabled_env="DISABLE_RANKING_ENTRY_SOURCE_DB_FALLBACK_PATCH")
 _install_module("core.startup.ranking_entry_high_low_from_snapshot_patch", "RANKING_ENTRY_HIGH_LOW_SNAPSHOT", disabled_env="DISABLE_RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH")
+_install_module("core.startup.entry_direction_recursion_failopen_patch", "ENTRY_DIRECTION_RECURSION_FAILOPEN", disabled_env="DISABLE_ENTRY_DIRECTION_RECURSION_FAILOPEN_PATCH")
 _install_module("core.startup.entry_controller_pipeline_lock_wait_patch", "ENTRY_CONTROLLER_LOCK_WAIT", disabled_env="DISABLE_ENTRY_CONTROLLER_LOCK_WAIT_PATCH")
 _install_module("core.startup.entry_controller_source_prefilter_patch", "ENTRY_CONTROLLER_SOURCE_PREFILTER", disabled_env="DISABLE_ENTRY_CONTROLLER_SOURCE_PREFILTER_PATCH")
 _install_module("core.startup.entry_controller_tonosama_ai_bridge_patch", "TONOSAMA_AI_BRIDGE", disabled_env="DISABLE_TONOSAMA_AI_BRIDGE_PATCH")
