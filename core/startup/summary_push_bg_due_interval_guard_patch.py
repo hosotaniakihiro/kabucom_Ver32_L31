@@ -1,20 +1,21 @@
 # ============================================================
 # File   : core/startup/summary_push_bg_due_interval_guard_patch.py
-# Version: V2-ONE-MINUTE-STALE-LOCK-SHORTER
+# Version: V3-ONE-MINUTE-DEDICATED-THREAD
 # ------------------------------------------------------------
 # 目的:
 #   main.py(entry_only) で PUSH 1m/3m/5m をBG実行する際、
-#   3分足・5分足を毎分投入しないようにしつつ、1分足は詰まらせない。
+#   3分足・5分足を毎分投入しないようにしつつ、1分足は確実に表示する。
 #
-# V2 修正:
-#   ✔ 旧版は 1m/3m/5m すべて SUMMARY_PUSH_BG_INTERVAL_STALE_SEC=240秒を使用
-#   ✔ 1分足が 115秒以上 stale running でも skipped され、表示されない原因になった
-#   ✔ 1分足専用 stale を SUMMARY_PUSH_BG_INTERVAL_STALE_SEC_1M=60秒 に分離
-#   ✔ 3分/5分は従来通り 240秒既定
-#   ✔ stale clear 後は次の1分足BGを投入する
+# V3 修正:
+#   ✔ V2で1分足staleは60秒になったが、共有BG executorが詰まると
+#     「bg push submitted」だけ出て「bg push start」が出ない
+#   ✔ 1分足だけ専用 daemon Thread で起動する
+#   ✔ 3分/5分は従来通り shared executor を使う
+#   ✔ 1分足Thread起動ログを bg push dedicated thread started として出す
 #
 # ログ上の問題例:
-#   [SUMMARY PUSH BG DUE GUARD] skipped reason=interval_still_running interval=1 elapsed=115.7s stale_sec=240.0s
+#   [SUMMARY PUSH BG DUE GUARD] bg push submitted key=202605291227:push:1 ...
+#   その後に bg push start / job start が出ない
 # ============================================================
 
 from __future__ import annotations
@@ -55,7 +56,6 @@ def _env_float(name: str, default: float) -> float:
 def _stale_sec_for_interval(interval: int) -> float:
     iv = int(interval)
     if iv == 1:
-        # 1分足は毎分表示対象。前回が60秒以上残っていたらstaleとして解除する。
         return _env_float("SUMMARY_PUSH_BG_INTERVAL_STALE_SEC_1M", 60.0)
     if iv == 3:
         return _env_float("SUMMARY_PUSH_BG_INTERVAL_STALE_SEC_3M", _env_float("SUMMARY_PUSH_BG_INTERVAL_STALE_SEC", 240.0))
@@ -72,6 +72,26 @@ def _is_due(interval: int, now: dt.datetime) -> bool:
         return int(now.minute) % iv == 0
     except Exception:
         return True
+
+
+def _run_task_direct_thread(task, *, bg_key: str, interval: int) -> bool:
+    try:
+        th = threading.Thread(
+            target=task,
+            name=f"summary-push-{int(interval)}m-{bg_key}",
+            daemon=True,
+        )
+        th.start()
+        logger.warning(
+            "[SUMMARY PUSH BG DUE GUARD] bg push dedicated thread started key=%s interval=%s thread=%s",
+            bg_key,
+            interval,
+            th.name,
+        )
+        return True
+    except Exception:
+        logger.exception("[SUMMARY PUSH BG DUE GUARD] dedicated thread start failed key=%s interval=%s", bg_key, interval)
+        return False
 
 
 def _patched_submit_bg_push_interval(*, interval: int, now: dt.datetime, display: bool, run_entry: bool) -> None:
@@ -127,13 +147,14 @@ def _patched_submit_bg_push_interval(*, interval: int, now: dt.datetime, display
     def _task() -> None:
         try:
             logger.warning(
-                "[SUMMARY PUSH BG DUE GUARD] bg push start key=%s interval=%s now=%s display=%s run_entry=%s stale_sec=%.1f",
+                "[SUMMARY PUSH BG DUE GUARD] bg push start key=%s interval=%s now=%s display=%s run_entry=%s stale_sec=%.1f dedicated=%s",
                 bg_key,
                 iv,
                 now,
                 display,
                 run_entry,
                 stale_sec,
+                iv == 1,
             )
             sp._job_one_source(source="push", interval=iv, now=now, display=display, run_entry=run_entry)
         except Exception:
@@ -146,8 +167,23 @@ def _patched_submit_bg_push_interval(*, interval: int, now: dt.datetime, display
             logger.warning("[SUMMARY PUSH BG DUE GUARD] bg push done key=%s interval=%s now=%s", bg_key, iv, now)
 
     try:
+        if iv == 1 and _env_bool("SUMMARY_PUSH_1M_DEDICATED_THREAD", True):
+            ok = _run_task_direct_thread(_task, bg_key=bg_key, interval=iv)
+            if not ok:
+                with _LOCK:
+                    cur = _RUNNING_BY_INTERVAL.get(iv)
+                    if cur and cur[1] == bg_key:
+                        _RUNNING_BY_INTERVAL.pop(iv, None)
+            return None
+
         sp._bg_executor().submit(_task)
-        logger.warning("[SUMMARY PUSH BG DUE GUARD] bg push submitted key=%s interval=%s now=%s stale_sec=%.1f", bg_key, iv, now, stale_sec)
+        logger.warning(
+            "[SUMMARY PUSH BG DUE GUARD] bg push submitted key=%s interval=%s now=%s stale_sec=%.1f",
+            bg_key,
+            iv,
+            now,
+            stale_sec,
+        )
     except Exception:
         with _LOCK:
             cur = _RUNNING_BY_INTERVAL.get(iv)
@@ -163,19 +199,21 @@ def install() -> bool:
     try:
         import core.startup.summary_parallel_intervals_runtime_patch as sp
         cur = getattr(sp, "_submit_bg_push_interval", None)
-        if getattr(cur, "_summary_push_bg_due_guard", False):
+        if getattr(cur, "_summary_push_bg_due_guard_v3", False):
             _PATCHED = True
             return True
         _ORIGINAL_SUBMIT = cur
         _patched_submit_bg_push_interval._summary_push_bg_due_guard = True  # type: ignore[attr-defined]
+        _patched_submit_bg_push_interval._summary_push_bg_due_guard_v3 = True  # type: ignore[attr-defined]
         sp._submit_bg_push_interval = _patched_submit_bg_push_interval
         _PATCHED = True
         logger.warning(
-            "[SUMMARY PUSH BG DUE GUARD] installed v2 due_only=%s stale_1m=%.1f stale_3m=%.1f stale_5m=%.1f original=%s",
+            "[SUMMARY PUSH BG DUE GUARD] installed v3 due_only=%s stale_1m=%.1f stale_3m=%.1f stale_5m=%.1f dedicated_1m=%s original=%s",
             _env_bool("SUMMARY_PUSH_BG_LONG_INTERVAL_DUE_ONLY", True),
             _stale_sec_for_interval(1),
             _stale_sec_for_interval(3),
             _stale_sec_for_interval(5),
+            _env_bool("SUMMARY_PUSH_1M_DEDICATED_THREAD", True),
             getattr(cur, "__name__", str(cur)),
         )
         return True
