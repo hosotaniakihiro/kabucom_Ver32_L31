@@ -1,16 +1,19 @@
 # ============================================================
 # File   : trading/entry/tonosama/ai_gate.py
-# Version: Ver1.6-TONOSAMA-FALLBACK-PRICE-RANGE-RESCUE
+# Version: Ver1.7-TONOSAMA-FALLBACK-ZERO-SURGE-RANGE-RESCUE
 # ------------------------------------------------------------
 # 目的:
 #   TONOSAMA ENTRY のAI未接続fallback判定。
 #
+# Ver1.7:
+#   - runner側で TONOSAMA_VOLUME_SURGE_ZERO_RESCUE が発動しても、
+#     AI fallback側の features["max_volume_surge_ratio"] は 0.0 のまま残り、
+#       AI fallback NG: volume surge low max=0.00x < 3.00x
+#     でpending登録前に落ちていた。
+#   - max_surge < min_surge の即NGより先に、日中レンジ・出来高・score/mtfで
+#     surge=0を救済できるか判定する。
+#
 # Ver1.6:
-#   - sitecustomize で TONOSAMA_AI_FALLBACK_MIN_PRICE_CHANGE_PCT=0.0 を設定しても、
-#     _env_float_floor(..., floor=0.20) により最低0.20%へ戻され、
-#     runner側の TONOSAMA_PRICE/RANGE_RESCUE 後も
-#       AI fallback NG: price change low
-#     で全落ちしていた。
 #   - 価格変化が小さくても、日中レンジ・出来高・surge・方向が十分な場合は
 #     AI fallback を通す。
 #   - 5秒足0.000%は任意確認のため、それだけでは落とさない。
@@ -67,8 +70,10 @@ def build_ai_features(row: pd.Series) -> dict:
         "symbol": normalize_symbol(row.get("symbol")),
         "symbolname": str(row.get("symbolname", "")),
         "price": safe_float(row.get("close"), 0.0),
-        "raw_score": safe_float(row.get("_raw_score"), 0.0),
-        "tonosama_score": safe_float(row.get("_tonosama_score"), 0.0),
+        "raw_score": safe_float(row.get("_raw_score"), safe_float(row.get("score"), 0.0)),
+        "tonosama_score": safe_float(row.get("_tonosama_score"), safe_float(row.get("final_score"), 0.0)),
+        "score": safe_float(row.get("score"), 0.0),
+        "final_score": safe_float(row.get("final_score"), 0.0),
         "volume_surge_ratio_3m": safe_float(row.get("volume_surge_ratio_3m"), 0.0),
         "volume_surge_ratio_5m": safe_float(row.get("volume_surge_ratio_5m"), 0.0),
         "price_change_pct_3m": safe_float(row.get("price_change_pct_3m"), 0.0),
@@ -110,10 +115,46 @@ def _infer_side(max_chg: float, slope: float) -> str:
     return "UNKNOWN"
 
 
-def _range_rescue_ok(features: dict, *, side: str, min_surge: float) -> tuple[bool, str]:
+def _score_strength(features: dict) -> float:
+    vals = [
+        safe_float(features.get("tonosama_score"), 0.0),
+        safe_float(features.get("raw_score"), 0.0),
+        safe_float(features.get("final_score"), 0.0),
+        safe_float(features.get("score"), 0.0),
+    ]
+    return max(abs(x) for x in vals)
+
+
+def _zero_surge_rescue_ok(features: dict, *, min_surge: float) -> tuple[bool, str, float]:
+    if not _env_bool("TONOSAMA_AI_FALLBACK_ZERO_SURGE_RESCUE", True):
+        return False, "disabled", safe_float(features.get("max_volume_surge_ratio"), 0.0)
+
+    max_surge = safe_float(features.get("max_volume_surge_ratio"), 0.0)
+    if max_surge >= min_surge:
+        return True, "normal_surge", max_surge
+    if max_surge > 0:
+        return False, f"surge_low_nonzero={max_surge:.2f}", max_surge
+
+    rng = safe_float(features.get("intrabar_range_pct"), 0.0)
+    vol = safe_float(features.get("latest_volume"), 0.0)
+    score = _score_strength(features)
+    mtf_abs = max(abs(safe_float(features.get("mtf"), 0.0)), abs(safe_float(features.get("score_mtf"), 0.0)))
+
+    min_volume = _env_float("TONOSAMA_AI_FALLBACK_ZERO_SURGE_MIN_VOLUME", _env_float("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_MIN_VOLUME", 500000.0))
+    min_range = _env_float("TONOSAMA_AI_FALLBACK_ZERO_SURGE_MIN_RANGE_PCT", _env_float("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_MIN_RANGE_PCT", 4.0))
+    min_score = _env_float("TONOSAMA_AI_FALLBACK_ZERO_SURGE_MIN_ABS_SCORE", _env_float("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_MIN_ABS_SCORE", 0.8))
+    min_mtf = _env_float("TONOSAMA_AI_FALLBACK_ZERO_SURGE_MIN_MTF", _env_float("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_MIN_MTF", 1.0))
+
+    ok = vol >= min_volume and rng >= min_range and score >= min_score and mtf_abs >= min_mtf
+    if ok:
+        return True, f"zero_surge_rescue vol={vol:.0f} range={rng:.3f} score={score:.3f} mtf={mtf_abs:.3f}", min_surge
+    return False, f"zero_surge_rescue_ng vol={vol:.0f}/{min_volume:.0f} range={rng:.3f}/{min_range:.3f} score={score:.3f}/{min_score:.3f} mtf={mtf_abs:.3f}/{min_mtf:.3f}", max_surge
+
+
+def _range_rescue_ok(features: dict, *, side: str, min_surge: float, effective_surge: float | None = None) -> tuple[bool, str]:
     if not _env_bool("TONOSAMA_AI_FALLBACK_PRICE_RANGE_RESCUE", True):
         return False, "disabled"
-    max_surge = safe_float(features.get("max_volume_surge_ratio"), 0.0)
+    max_surge = safe_float(features.get("max_volume_surge_ratio"), 0.0) if effective_surge is None else float(effective_surge)
     rng = safe_float(features.get("intrabar_range_pct"), 0.0)
     vol = safe_float(features.get("latest_volume"), 0.0)
     close_pos = safe_float(features.get("close_position_pct"), 50.0)
@@ -128,10 +169,10 @@ def _range_rescue_ok(features: dict, *, side: str, min_surge: float) -> tuple[bo
         return False, f"range_rescue_base_ng surge={max_surge:.2f} range={rng:.3f} vol={vol:.0f}"
     if side == "BUY":
         ok = slope >= 0 and close_pos <= max_buy_close_pos
-        return ok, f"BUY range_rescue slope={slope:.6f} close_pos={close_pos:.1f} range={rng:.3f} vol={vol:.0f}"
+        return ok, f"BUY range_rescue slope={slope:.6f} close_pos={close_pos:.1f} range={rng:.3f} vol={vol:.0f} surge={max_surge:.2f}"
     if side == "SELL":
         ok = slope <= 0 and close_pos >= min_sell_close_pos
-        return ok, f"SELL range_rescue slope={slope:.6f} close_pos={close_pos:.1f} range={rng:.3f} vol={vol:.0f}"
+        return ok, f"SELL range_rescue slope={slope:.6f} close_pos={close_pos:.1f} range={rng:.3f} vol={vol:.0f} surge={max_surge:.2f}"
     return False, "side_unknown"
 
 
@@ -149,7 +190,6 @@ def _fallback_when_ai_disconnected(features: dict) -> tuple[bool, float, str]:
     abs_slope = abs(slope)
 
     min_surge = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_VOLUME_SURGE", float(_cfg("MIN_VOLUME_SURGE_RATIO", 3.0)), 3.0)
-    # Ver1.6: 価格変化下限は環境変数で0へ下げられるよう floor=0 にする。
     min_chg = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_PRICE_CHANGE_PCT", float(_cfg("MIN_PRICE_CHANGE_PCT", 0.20)), 0.0)
     min_slope = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_SLOPE", float(_cfg("MIN_SLOPE", 0.0010)), 0.0010)
     min_5s = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT", float(_cfg("MIN_5SEC_PRICE_CHANGE_PCT", 0.01)), 0.0)
@@ -161,10 +201,13 @@ def _fallback_when_ai_disconnected(features: dict) -> tuple[bool, float, str]:
 
     if side == "UNKNOWN":
         return False, 0.0, f"AI fallback NG: unknown direction price_change={max_chg:.2f}% slope={slope:.4f}"
-    if max_surge < min_surge:
-        return False, 0.0, f"AI fallback NG: volume surge low side={side} max={max_surge:.2f}x < {min_surge:.2f}x"
 
-    range_rescue, range_reason = _range_rescue_ok(features, side=side, min_surge=min_surge)
+    surge_ok, surge_reason, effective_surge = _zero_surge_rescue_ok(features, min_surge=min_surge)
+    range_rescue, range_reason = _range_rescue_ok(features, side=side, min_surge=min_surge, effective_surge=effective_surge)
+
+    if not surge_ok and not range_rescue:
+        return False, 0.0, f"AI fallback NG: volume surge low side={side} max={max_surge:.2f}x < {min_surge:.2f}x {surge_reason}"
+
     if abs_chg < min_chg and not range_rescue:
         return False, 0.0, f"AI fallback NG: price change low side={side} abs={abs_chg:.2f}% raw={max_chg:.2f}% < {min_chg:.2f}% range_rescue={range_reason}"
     if abs_slope < min_slope:
@@ -192,7 +235,7 @@ def _fallback_when_ai_disconnected(features: dict) -> tuple[bool, float, str]:
         return False, 0.0, "AI fallback NG: missing required 5s bar"
 
     reason = "range_rescue" if range_rescue else "normal"
-    return True, 0.0, f"AI fallback pass/{reason} side={side} surge={max_surge:.2f}x change={max_chg:.2f}% 3m={chg_3m:.2f}% 5m={chg_5m:.2f}% abs={abs_chg:.2f}% slope={slope:.4f} abs_slope={abs_slope:.4f} 5s={chg_5s:.3f}% require_5s={require_5s} range={safe_float(features.get('intrabar_range_pct'), 0.0):.3f}% volume={safe_float(features.get('latest_volume'), 0.0):.0f} range_reason={range_reason}"
+    return True, 0.0, f"AI fallback pass/{reason} side={side} surge={effective_surge:.2f}x raw_surge={max_surge:.2f}x surge_reason={surge_reason} change={max_chg:.2f}% 3m={chg_3m:.2f}% 5m={chg_5m:.2f}% abs={abs_chg:.2f}% slope={slope:.4f} abs_slope={abs_slope:.4f} 5s={chg_5s:.3f}% require_5s={require_5s} range={safe_float(features.get('intrabar_range_pct'), 0.0):.3f}% volume={safe_float(features.get('latest_volume'), 0.0):.0f} range_reason={range_reason}"
 
 
 def ai_check_tonosama_entry(row: pd.Series) -> tuple[bool, float, str]:
