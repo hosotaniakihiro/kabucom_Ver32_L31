@@ -1,22 +1,20 @@
 # ============================================================
 # File   : core/startup/summary_push_bg_due_interval_guard_patch.py
-# Version: V1-DUE-ONLY-PUSH-BG-INTERVAL-GUARD
+# Version: V2-ONE-MINUTE-STALE-LOCK-SHORTER
 # ------------------------------------------------------------
 # 目的:
 #   main.py(entry_only) で PUSH 1m/3m/5m をBG実行する際、
-#   3分足・5分足を毎分投入しないようにする。
+#   3分足・5分足を毎分投入しないようにしつつ、1分足は詰まらせない。
 #
-# 背景:
-#   2026-05-28 09:48ログで、5分PUSH BGが elapsed=606s まで
-#   長時間残っていた。親tickは軽いが、5分足を毎分BG投入すると
-#   同じ長足ジョブが積み上がり、CPU/DB/GC/表示処理を圧迫する。
+# V2 修正:
+#   ✔ 旧版は 1m/3m/5m すべて SUMMARY_PUSH_BG_INTERVAL_STALE_SEC=240秒を使用
+#   ✔ 1分足が 115秒以上 stale running でも skipped され、表示されない原因になった
+#   ✔ 1分足専用 stale を SUMMARY_PUSH_BG_INTERVAL_STALE_SEC_1M=60秒 に分離
+#   ✔ 3分/5分は従来通り 240秒既定
+#   ✔ stale clear 後は次の1分足BGを投入する
 #
-# 方針:
-#   - 1分足は毎分BG可
-#   - 3分足は minute % 3 == 0 の時だけBG投入
-#   - 5分足は minute % 5 == 0 の時だけBG投入
-#   - 同じ interval のBGがまだ実行中なら、次の同intervalは投入しない
-#   - stale秒を超えた実行中フラグは解除して再投入を許可
+# ログ上の問題例:
+#   [SUMMARY PUSH BG DUE GUARD] skipped reason=interval_still_running interval=1 elapsed=115.7s stale_sec=240.0s
 # ============================================================
 
 from __future__ import annotations
@@ -26,7 +24,6 @@ import logging
 import os
 import threading
 import time
-from typing import Any
 
 logger = logging.getLogger(__name__)
 _PATCHED = False
@@ -53,6 +50,18 @@ def _env_float(name: str, default: float) -> float:
         return max(1.0, float(raw))
     except Exception:
         return float(default)
+
+
+def _stale_sec_for_interval(interval: int) -> float:
+    iv = int(interval)
+    if iv == 1:
+        # 1分足は毎分表示対象。前回が60秒以上残っていたらstaleとして解除する。
+        return _env_float("SUMMARY_PUSH_BG_INTERVAL_STALE_SEC_1M", 60.0)
+    if iv == 3:
+        return _env_float("SUMMARY_PUSH_BG_INTERVAL_STALE_SEC_3M", _env_float("SUMMARY_PUSH_BG_INTERVAL_STALE_SEC", 240.0))
+    if iv == 5:
+        return _env_float("SUMMARY_PUSH_BG_INTERVAL_STALE_SEC_5M", _env_float("SUMMARY_PUSH_BG_INTERVAL_STALE_SEC", 240.0))
+    return _env_float("SUMMARY_PUSH_BG_INTERVAL_STALE_SEC", 240.0)
 
 
 def _is_due(interval: int, now: dt.datetime) -> bool:
@@ -86,7 +95,7 @@ def _patched_submit_bg_push_interval(*, interval: int, now: dt.datetime, display
         )
         return None
 
-    stale_sec = _env_float("SUMMARY_PUSH_BG_INTERVAL_STALE_SEC", 240.0)
+    stale_sec = _stale_sec_for_interval(iv)
     now_ts = time.time()
     with _LOCK:
         old = _RUNNING_BY_INTERVAL.get(iv)
@@ -102,6 +111,7 @@ def _patched_submit_bg_push_interval(*, interval: int, now: dt.datetime, display
                     key_old,
                 )
                 return None
+
             logger.warning(
                 "[SUMMARY PUSH BG DUE GUARD] stale interval running cleared interval=%s elapsed=%.1fs stale_sec=%.1fs key=%s",
                 iv,
@@ -117,12 +127,13 @@ def _patched_submit_bg_push_interval(*, interval: int, now: dt.datetime, display
     def _task() -> None:
         try:
             logger.warning(
-                "[SUMMARY PUSH BG DUE GUARD] bg push start key=%s interval=%s now=%s display=%s run_entry=%s",
+                "[SUMMARY PUSH BG DUE GUARD] bg push start key=%s interval=%s now=%s display=%s run_entry=%s stale_sec=%.1f",
                 bg_key,
                 iv,
                 now,
                 display,
                 run_entry,
+                stale_sec,
             )
             sp._job_one_source(source="push", interval=iv, now=now, display=display, run_entry=run_entry)
         except Exception:
@@ -136,7 +147,7 @@ def _patched_submit_bg_push_interval(*, interval: int, now: dt.datetime, display
 
     try:
         sp._bg_executor().submit(_task)
-        logger.warning("[SUMMARY PUSH BG DUE GUARD] bg push submitted key=%s interval=%s now=%s", bg_key, iv, now)
+        logger.warning("[SUMMARY PUSH BG DUE GUARD] bg push submitted key=%s interval=%s now=%s stale_sec=%.1f", bg_key, iv, now, stale_sec)
     except Exception:
         with _LOCK:
             cur = _RUNNING_BY_INTERVAL.get(iv)
@@ -160,9 +171,11 @@ def install() -> bool:
         sp._submit_bg_push_interval = _patched_submit_bg_push_interval
         _PATCHED = True
         logger.warning(
-            "[SUMMARY PUSH BG DUE GUARD] installed due_only=%s stale_sec=%.1f original=%s",
+            "[SUMMARY PUSH BG DUE GUARD] installed v2 due_only=%s stale_1m=%.1f stale_3m=%.1f stale_5m=%.1f original=%s",
             _env_bool("SUMMARY_PUSH_BG_LONG_INTERVAL_DUE_ONLY", True),
-            _env_float("SUMMARY_PUSH_BG_INTERVAL_STALE_SEC", 240.0),
+            _stale_sec_for_interval(1),
+            _stale_sec_for_interval(3),
+            _stale_sec_for_interval(5),
             getattr(cur, "__name__", str(cur)),
         )
         return True
