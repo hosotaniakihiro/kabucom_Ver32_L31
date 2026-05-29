@@ -1,24 +1,15 @@
 # ============================================================
 # File   : core/startup/entry_price_improvement_patch.py
-# Version: Ver01-BID-ASK-PRICE-IMPROVEMENT
+# Version: Ver02-BID-ASK-PRICE-IMPROVEMENT-NO-RECURSION
 # ------------------------------------------------------------
-# build_entry_order() の戻り値を runtime patch し、
-# 発注直前の LIMIT 注文価格を Bid/Ask レベルで有利に補正する。
+# build_entry_order() の戻り値を runtime patch し、LIMIT価格を
+# Bid/Ask レベルで補正する。
 #
-# 方針:
-#   逆張りBUY       : Bid 指値
-#   通常BUY         : Bid + 1tick 指値
-#   強い順張りBUY   : Ask 指値を許可
-#
-#   逆張りSELL      : Ask 指値
-#   通常SELL        : Ask - 1tick 指値
-#   強い順張りSELL  : Bid 指値を許可
-#
-# 注意:
-#   - build_entry_order のシグネチャは変更しない。
-#   - STOP注文/非LIMIT注文は触らない。
-#   - 板が取れない場合は元の価格を維持。
-#   - 逆張りは必ず passive 側に寄せる。
+# 重要修正:
+#   - entry_limit_passive_runtime_patch と相互に巻き直して
+#     RecursionError になる問題を防止する。
+#   - wrapper には *_original を保持し、既存チェーン内に自分が
+#     いる場合は再ラップしない。
 # ============================================================
 
 from __future__ import annotations
@@ -194,7 +185,6 @@ def _is_strong_trend(row: dict, side: str) -> tuple[bool, str]:
     pc3 = _safe_float(_first(row, ("price_change_3", "change_3", "ret_3", "return_3"), 0.0), 0.0)
     pc5 = _safe_float(_first(row, ("price_change_5", "change_5", "ret_5", "return_5"), 0.0), 0.0)
 
-    # 0.01形式なら%換算、1.0形式なら%として扱う。
     if abs(pc3) <= 1.0:
         pc3 *= 100.0
     if abs(pc5) <= 1.0:
@@ -234,8 +224,7 @@ def _improved_price(*, symbol: str, side: str, row: dict, detail: dict) -> tuple
 
     if side == "BUY":
         if contrarian:
-            price = bid + tick * max(0, passive_tick_offset)
-            price = min(price, ask)
+            price = min(bid + tick * max(0, passive_tick_offset), ask)
             mode = "PASSIVE_BID"
             reason = f"contrarian:{contra_reason}"
         elif strong and _env_bool("ENTRY_PRICE_IMPROVE_ALLOW_AGGRESSIVE_STRONG_TREND", True):
@@ -243,15 +232,13 @@ def _improved_price(*, symbol: str, side: str, row: dict, detail: dict) -> tuple
             mode = "AGGRESSIVE_ASK"
             reason = f"strong_trend:{strong_reason}"
         else:
-            price = bid + tick * max(0, normal_tick_offset)
-            price = min(price, ask)
+            price = min(bid + tick * max(0, normal_tick_offset), ask)
             mode = "BID_PLUS_TICK"
             reason = "normal_price_improve"
         return _round_to_tick(price, side="BUY"), mode, reason, {**board, "spread_pct": spread_pct, "tick": tick}
 
     if contrarian:
-        price = ask - tick * max(0, passive_tick_offset)
-        price = max(price, bid)
+        price = max(ask - tick * max(0, passive_tick_offset), bid)
         mode = "PASSIVE_ASK"
         reason = f"contrarian:{contra_reason}"
     elif strong and _env_bool("ENTRY_PRICE_IMPROVE_ALLOW_AGGRESSIVE_STRONG_TREND", True):
@@ -259,8 +246,7 @@ def _improved_price(*, symbol: str, side: str, row: dict, detail: dict) -> tuple
         mode = "AGGRESSIVE_BID"
         reason = f"strong_trend:{strong_reason}"
     else:
-        price = ask - tick * max(0, normal_tick_offset)
-        price = max(price, bid)
+        price = max(ask - tick * max(0, normal_tick_offset), bid)
         mode = "ASK_MINUS_TICK"
         reason = "normal_price_improve"
     return _round_to_tick(price, side="SELL"), mode, reason, {**board, "spread_pct": spread_pct, "tick": tick}
@@ -328,6 +314,29 @@ def _patch_order_result(result: dict, *, symbol: str, side: str, source: str, en
     return result
 
 
+def _chain_contains(fn: Any, marker: str, *, limit: int = 20) -> bool:
+    seen: set[int] = set()
+    cur = fn
+    for _ in range(limit):
+        if not callable(cur):
+            return False
+        ident = id(cur)
+        if ident in seen:
+            return False
+        seen.add(ident)
+        if getattr(cur, marker, False):
+            return True
+        nxt = (
+            getattr(cur, "_entry_price_improvement_original", None)
+            or getattr(cur, "_entry_board_touch_original", None)
+            or getattr(cur, "_original", None)
+        )
+        if nxt is None:
+            return False
+        cur = nxt
+    return False
+
+
 def _patched_build_entry_order(*args, **kwargs):
     if not callable(_ORIG_BUILD_ENTRY_ORDER):
         return {"ok": False, "reason": "PRICE_IMPROVE_ORIGINAL_MISSING", "detail": {}}
@@ -349,8 +358,8 @@ def _is_currently_wrapped() -> bool:
         import trading.handlers.entry_controller as ec
         import trading.handlers.entry_order_builder as eob
         return bool(
-            getattr(getattr(ec, "build_entry_order", None), "_entry_price_improvement_patch", False)
-            and getattr(getattr(eob, "build_entry_order", None), "_entry_price_improvement_patch", False)
+            _chain_contains(getattr(ec, "build_entry_order", None), "_entry_price_improvement_patch")
+            and _chain_contains(getattr(eob, "build_entry_order", None), "_entry_price_improvement_patch")
         )
     except Exception:
         return False
@@ -362,25 +371,29 @@ def install() -> bool:
         import trading.handlers.entry_controller as ec
         import trading.handlers.entry_order_builder as eob
 
-        if _INSTALLED and _is_currently_wrapped():
+        old = getattr(eob, "build_entry_order", None)
+
+        # 既にチェーン内に price improvement がある場合は再ラップしない。
+        # 特に board_touch wrapper の内側に既存 price wrapper がある状態で
+        # ここで再度 old=board_touch を掴むと board_touch <-> price の循環になる。
+        if _chain_contains(old, "_entry_price_improvement_patch"):
+            _INSTALLED = True
+            logger.warning("[ENTRY PRICE IMPROVE] already present in wrapper chain -> skip rewrap")
             return True
 
-        old = getattr(eob, "build_entry_order", None)
-        if getattr(old, "_entry_price_improvement_patch", False):
-            _INSTALLED = True
-            return True
         if not callable(old):
             logger.error("[ENTRY PRICE IMPROVE] target build_entry_order unavailable")
             return False
 
         _ORIG_BUILD_ENTRY_ORDER = old
         _patched_build_entry_order._entry_price_improvement_patch = True  # type: ignore[attr-defined]
+        _patched_build_entry_order._entry_price_improvement_original = old  # type: ignore[attr-defined]
         eob.build_entry_order = _patched_build_entry_order
         ec.build_entry_order = _patched_build_entry_order
         _INSTALLED = True
 
         logger.warning(
-            "[ENTRY PRICE IMPROVE] installed enabled=%s normal_ticks=%.0f passive_ticks=%.0f strong_score=%.2f strong_slope=%.4f max_spread=%.4f allow_aggressive_strong=%s",
+            "[ENTRY PRICE IMPROVE] installed enabled=%s normal_ticks=%.0f passive_ticks=%.0f strong_score=%.2f strong_slope=%.4f max_spread=%.4f allow_aggressive_strong=%s no_recursion=True",
             _env_bool("ENTRY_PRICE_IMPROVEMENT_ENABLED", True),
             _env_float("ENTRY_PRICE_IMPROVE_NORMAL_TICKS", 1.0),
             _env_float("ENTRY_PRICE_IMPROVE_PASSIVE_TICKS", 0.0),
