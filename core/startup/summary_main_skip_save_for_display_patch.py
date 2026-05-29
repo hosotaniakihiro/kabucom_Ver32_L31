@@ -1,24 +1,15 @@
 # ============================================================
 # File   : core/startup/summary_main_skip_save_for_display_patch.py
-# Version: V3-MAIN-1M-DISPLAY-FIRST-ASYNC-DB-SAVE-NO-HANG
+# Version: V4-MAIN-1M-DISPLAY-FIRST-ASYNC-SAVE-WITH-SPOOL
 # ------------------------------------------------------------
 # 目的:
 #   main.py(entry_only) 側で1分足PUSHサマリーを表示優先にしつつ、
-#   DBにも短時間で保存する。
+#   DBロック時も計算済み行を失わない。
 #
-# V3 修正:
-#   ✔ V2では async save start 後に direct sqlite save done/error が出ないことがあった
-#   ✔ 原因は NAS上SQLiteの connect / PRAGMA journal_mode=WAL / busy_timeout=10s が
-#     ロック時に長く詰まるため
-#   ✔ main.py側の補助保存では WAL変更をしない
-#   ✔ timeout/busy_timeout を短くする
-#   ✔ 各ステップにログを入れ、止まった箇所を判別可能にする
-#   ✔ 保存失敗時は明示ログを出し、次tickで再試行する
-#
-# 方針:
-#   - main_database.py がDB保存owner
-#   - main.py は1分足の補助保存のみ
-#   - main.py の補助保存は「詰まらない」ことを最優先
+# V4 修正:
+#   ✔ direct SQLite 保存が database is locked の場合、jsonl.gz にスプールする
+#   ✔ main_database.py / summary_database_runner 側で後追いflushする前提
+#   ✔ main.py側は表示・AIを止めない
 # ============================================================
 
 from __future__ import annotations
@@ -207,6 +198,17 @@ def _key_cols(work: pd.DataFrame, table_cols: list[str], interval: int) -> list[
     return []
 
 
+def _spool_on_failure(df: pd.DataFrame, *, interval: int, source: str, reason: str) -> str:
+    if not _env_bool("SUMMARY_MAIN_ASYNC_SPOOL_ON_LOCK", True):
+        return ""
+    try:
+        from trading.summary.persistence.summary_save_spool import spool_summary_df
+        return spool_summary_df(df, interval=int(interval), source=str(source), reason=reason)
+    except Exception:
+        logger.exception("[SUMMARY MAIN ASYNC SAVE] spool failed interval=%s source=%s reason=%s", interval, source, reason)
+        return ""
+
+
 def _direct_sqlite_save(df: pd.DataFrame, interval: int, source: str) -> int:
     t0 = time.perf_counter()
     work = _norm_df(df)
@@ -235,11 +237,11 @@ def _direct_sqlite_save(df: pd.DataFrame, interval: int, source: str) -> int:
 
         if not os.path.exists(db_path):
             logger.error("[SUMMARY MAIN ASYNC SAVE] db not found interval=%s table=%s path=%s", interval, table, db_path)
+            _spool_on_failure(work, interval=interval, source=source, reason="db_not_found")
             return 0
 
         con = sqlite3.connect(db_path, timeout=connect_timeout, isolation_level=None)
         con.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
-        # main.py補助保存では journal_mode を変更しない。NAS上でWAL変更が詰まるため。
         try:
             con.execute("PRAGMA synchronous = NORMAL")
         except Exception:
@@ -250,12 +252,14 @@ def _direct_sqlite_save(df: pd.DataFrame, interval: int, source: str) -> int:
         exists = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
         if exists is None:
             logger.error("[SUMMARY MAIN ASYNC SAVE] table not found interval=%s table=%s path=%s", interval, table, db_path)
+            _spool_on_failure(work, interval=interval, source=source, reason="table_not_found")
             return 0
 
         table_cols = [str(r[1]) for r in con.execute(f"PRAGMA table_info({table})").fetchall()]
         keys = _key_cols(work, table_cols, interval)
         if not keys:
             logger.error("[SUMMARY MAIN ASYNC SAVE] no key columns interval=%s table=%s df_cols=%s table_cols=%s", interval, table, list(work.columns), table_cols)
+            _spool_on_failure(work, interval=interval, source=source, reason="no_key_columns")
             return 0
 
         if "source" in table_cols:
@@ -292,9 +296,8 @@ def _direct_sqlite_save(df: pd.DataFrame, interval: int, source: str) -> int:
         return int(len(records))
 
     except sqlite3.OperationalError as e:
-        msg = str(e).lower()
         logger.warning(
-            "[SUMMARY MAIN ASYNC SAVE] sqlite operational error interval=%s source=%s err=%s elapsed=%.3fs action=retry_next_tick",
+            "[SUMMARY MAIN ASYNC SAVE] sqlite operational error interval=%s source=%s err=%s elapsed=%.3fs action=spool_and_retry_later",
             interval,
             source,
             e,
@@ -305,6 +308,7 @@ def _direct_sqlite_save(df: pd.DataFrame, interval: int, source: str) -> int:
                 con.rollback()
         except Exception:
             pass
+        _spool_on_failure(work, interval=interval, source=source, reason="sqlite_operational_error")
         return 0
     except Exception:
         logger.exception("[SUMMARY MAIN ASYNC SAVE] direct sqlite save failed interval=%s source=%s elapsed=%.3fs", interval, source, time.perf_counter() - t0)
@@ -313,6 +317,7 @@ def _direct_sqlite_save(df: pd.DataFrame, interval: int, source: str) -> int:
                 con.rollback()
         except Exception:
             pass
+        _spool_on_failure(work, interval=interval, source=source, reason="exception")
         return 0
     finally:
         if con is not None:
@@ -373,7 +378,7 @@ def install() -> bool:
         if not callable(cur):
             logger.warning("[SUMMARY MAIN DISPLAY-FIRST SAVE PATCH] target missing")
             return False
-        if getattr(cur, "_summary_main_display_first_async_save_patch_v3", False):
+        if getattr(cur, "_summary_main_display_first_async_save_patch_v4", False):
             _PATCHED = True
             return True
 
@@ -391,13 +396,14 @@ def install() -> bool:
                 except Exception:
                     rows = 0
                 logger.warning(
-                    "[SUMMARY MAIN DISPLAY-FIRST SAVE PATCH] async save then display interval=%s source=%s rows=%s role=%s main_entry_only=%s env_skip=%s",
+                    "[SUMMARY MAIN DISPLAY-FIRST SAVE PATCH] async save then display interval=%s source=%s rows=%s role=%s main_entry_only=%s env_skip=%s spool_on_lock=%s",
                     iv,
                     source,
                     rows,
                     os.getenv("SUMMARY_DB_WRITER_ROLE", ""),
                     os.getenv("SUMMARY_MAIN_ENTRY_ONLY", ""),
                     os.getenv("SUMMARY_SKIP_DB_SAVE_IN_MAIN", ""),
+                    _env_bool("SUMMARY_MAIN_ASYNC_SPOOL_ON_LOCK", True),
                 )
                 _submit_async_save(df, int(iv), str(source))
                 return None
@@ -405,16 +411,17 @@ def install() -> bool:
             return _ORIGINAL_SAVE(df, int(iv), source=source)
 
         _patched_save_summary_if_owner._summary_main_display_first_async_save_patch = True  # type: ignore[attr-defined]
-        _patched_save_summary_if_owner._summary_main_display_first_async_save_patch_v3 = True  # type: ignore[attr-defined]
+        _patched_save_summary_if_owner._summary_main_display_first_async_save_patch_v4 = True  # type: ignore[attr-defined]
         _patched_save_summary_if_owner._summary_main_skip_save_display_patch = True  # type: ignore[attr-defined]
         _patched_save_summary_if_owner._original = cur  # type: ignore[attr-defined]
         rc._save_summary_if_owner = _patched_save_summary_if_owner
         _PATCHED = True
         logger.warning(
-            "[SUMMARY MAIN DISPLAY-FIRST SAVE PATCH] installed v3 enabled=%s intervals=%s async_direct=%s sqlite_timeout=%.2f busy_ms=%.0f",
+            "[SUMMARY MAIN DISPLAY-FIRST SAVE PATCH] installed v4 enabled=%s intervals=%s async_direct=%s spool_on_lock=%s sqlite_timeout=%.2f busy_ms=%.0f",
             _env_bool("SUMMARY_MAIN_SKIP_1M_SAVE_BEFORE_DISPLAY", True),
             sorted(_skip_intervals()),
             _env_bool("SUMMARY_MAIN_ASYNC_DIRECT_DB_SAVE", True),
+            _env_bool("SUMMARY_MAIN_ASYNC_SPOOL_ON_LOCK", True),
             _env_float("SUMMARY_MAIN_ASYNC_SQLITE_TIMEOUT_SEC", 1.5, min_value=0.2, max_value=5.0),
             _env_float("SUMMARY_MAIN_ASYNC_SQLITE_BUSY_MS", 1200.0, min_value=100.0, max_value=5000.0),
         )
