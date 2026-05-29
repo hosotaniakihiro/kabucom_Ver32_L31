@@ -1,6 +1,6 @@
 # ============================================================
 # File   : scripts/summary_database_runner.py
-# Version: SUMMARY-DATABASE-RUNNER-V4-DB-SAVE-AND-DISCORD-DISPLAY
+# Version: SUMMARY-DATABASE-RUNNER-V5-DB-SAVE-DISCORD-EMPTY-FALLBACK
 # ------------------------------------------------------------
 # Purpose:
 #   - main_database.py 側で定時サマリー計算・DB保存を担当する子プロセス
@@ -8,30 +8,10 @@
 #   - Discord表示も database 側で担当できるようにする
 #   - 1分ごとに run_time_locked_summary_jobs() を実行する
 #
-# Policy:
-#   - run_entry=False
-#   - DB save enabled only in database/data collector process
-#   - PUSH summary は毎分 1分/3分/5分を計算・保存
-#   - Discord通知は display_runner 側の notify制御に従う
-#       既定: 1分足は送信しない / 3分足・5分足は送信する
-#   - RANKING summary は ENABLE_RANKING_SUMMARY_TICK=1 の場合だけ実行
-#
-# V4 Fix:
-#   ✔ 旧版は display=False 固定だったため、database runner側で計算・DB保存しても
-#     Discord送信経路に入らなかった
-#   ✔ SUMMARY_DATABASE_RUNNER_DISPLAY=1 を既定ONにする
-#   ✔ 送信を止めたい場合だけ SUMMARY_DATABASE_RUNNER_DISPLAY=0
-#   ✔ main.py専用DB保存skip環境変数は引き続き解除
-#
-# Environment:
-#   AUTOSTOCK_DATA_COLLECTORS_PROCESS=1
-#   AUTOSTOCK_SUMMARY_DB_WRITER=1
-#   AUTOSTOCK_SUMMARY_SAVE_OWNER=database
-#   AUTOSTOCK_SUMMARY_SAVE_MODE=save
-#   SUMMARY_DATABASE_RUNNER_DISPLAY=1
-#   SUMMARY_SKIP_DB_SAVE_IN_MAIN=0
-#   SUMMARY_MAIN_ENTRY_ONLY=0
-#   SUMMARY_DB_WRITER_ROLE=database
+# V5 Fix:
+#   ✔ summary_discord_always_notify_patch を time_locked_runner import 前に導入
+#   ✔ フィルタ後0件でも 3分/5分は「候補なし」通知をDiscordへ出す
+#   ✔ 通常候補がある場合は従来のSUMMARY TOP10通知
 # ============================================================
 
 from __future__ import annotations
@@ -63,25 +43,31 @@ def _install_database_summary_env() -> None:
     os.environ["AUTOSTOCK_SUMMARY_SAVE_OWNER"] = "database"
     os.environ["AUTOSTOCK_SUMMARY_SAVE_MODE"] = "save"
 
-    # Discord表示をdatabase runner側で有効化する。
-    # display_runner.py側で1分足は既定skip、3分/5分だけ送信する。
     os.environ.setdefault("SUMMARY_DATABASE_RUNNER_DISPLAY", "1")
+    os.environ.setdefault("SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY", "1")
 
-    # main.py専用の「DB保存しない」設定が親環境から残っていると、
-    # database runner でもDB保存が止まるため明示解除する。
     os.environ["SUMMARY_SKIP_DB_SAVE_IN_MAIN"] = "0"
     os.environ["SUMMARY_MAIN_ENTRY_ONLY"] = "0"
     os.environ["SUMMARY_DB_WRITER_ROLE"] = "database"
 
-    # main_database 側ではAI/entryは実行しない。計算・DB保存・Discord表示のみ。
     os.environ.setdefault("ENABLE_SUMMARY_ENTRY_TICK", "0")
-
-    # 5分足75MAは当日DBだけでは不足するため、前日/前々日を含めて読む。
     os.environ.setdefault("PUSH_INCREMENTAL_MA75_SUMMARY_LOOKBACK_DAYS", "3")
     os.environ.setdefault("PUSH_INCREMENTAL_MA75_TAIL_ROWS", "120")
 
 
 _install_database_summary_env()
+
+# ------------------------------------------------------------
+# Discord表示の最終防衛パッチ
+# ------------------------------------------------------------
+# time_locked_runner / runner_core は safe_io の関数を import して束縛するため、
+# 必ずその前に patch を import/install する。
+try:
+    from core.startup.summary_discord_always_notify_patch import install as _install_summary_discord_patch
+    _install_summary_discord_patch()
+except Exception:
+    # logger 初期化前なので print に留める。後続処理は止めない。
+    print("[SUMMARY DB RUNNER] summary_discord_always_notify_patch install failed", file=sys.stderr)
 
 from data_collectors.logging_setup import setup_logging
 from scheduler_jobs.summary.time_locked_runner import run_time_locked_summary_jobs
@@ -156,6 +142,12 @@ def _warmup_multiday_ma75_cache(logger: logging.Logger) -> Any:
 def main() -> int:
     _install_database_summary_env()
 
+    try:
+        from core.startup.summary_discord_always_notify_patch import install as _install_summary_discord_patch
+        patch_ok = _install_summary_discord_patch()
+    except Exception:
+        patch_ok = False
+
     logger = setup_logging("summary_database_runner")
 
     signal.signal(signal.SIGINT, _handle_signal)
@@ -171,6 +163,7 @@ def main() -> int:
     logger.info("[SUMMARY DB RUNNER] AUTOSTOCK_SUMMARY_SAVE_OWNER=%s", os.getenv("AUTOSTOCK_SUMMARY_SAVE_OWNER"))
     logger.info("[SUMMARY DB RUNNER] AUTOSTOCK_SUMMARY_SAVE_MODE=%s", os.getenv("AUTOSTOCK_SUMMARY_SAVE_MODE"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_DATABASE_RUNNER_DISPLAY=%s", os.getenv("SUMMARY_DATABASE_RUNNER_DISPLAY"))
+    logger.info("[SUMMARY DB RUNNER] SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY=%s patch_ok=%s", os.getenv("SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY"), patch_ok)
     logger.info("[SUMMARY DB RUNNER] SUMMARY_SKIP_DB_SAVE_IN_MAIN=%s", os.getenv("SUMMARY_SKIP_DB_SAVE_IN_MAIN"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_MAIN_ENTRY_ONLY=%s", os.getenv("SUMMARY_MAIN_ENTRY_ONLY"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_DB_WRITER_ROLE=%s", os.getenv("SUMMARY_DB_WRITER_ROLE"))
@@ -198,7 +191,7 @@ def main() -> int:
             display_enabled = _env_true("SUMMARY_DATABASE_RUNNER_DISPLAY", default=True)
 
             logger.info(
-                "[SUMMARY DB RUNNER] tick start now=%s run_push=True run_ranking=%s display=%s run_entry=False save_owner=%s save_mode=%s skip_main=%s role=%s",
+                "[SUMMARY DB RUNNER] tick start now=%s run_push=True run_ranking=%s display=%s run_entry=False save_owner=%s save_mode=%s skip_main=%s role=%s empty_notify=%s",
                 now,
                 ranking_enabled,
                 display_enabled,
@@ -206,6 +199,7 @@ def main() -> int:
                 os.getenv("AUTOSTOCK_SUMMARY_SAVE_MODE"),
                 os.getenv("SUMMARY_SKIP_DB_SAVE_IN_MAIN"),
                 os.getenv("SUMMARY_DB_WRITER_ROLE"),
+                os.getenv("SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY"),
             )
 
             t0 = time.perf_counter()
