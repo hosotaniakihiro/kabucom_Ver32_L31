@@ -1,19 +1,17 @@
 # ============================================================
 # File   : trading/entry/tonosama/pending_writer.py
-# Version: Ver1.9-TONOSAMA-PENDING-RANKING-SNAPSHOT-MA-GUARD
+# Version: Ver2.0-TONOSAMA-PENDING-TIME-AND-DIRECTION-FINAL-GUARD
 # ------------------------------------------------------------
 # 目的:
 #   殿様イナゴの pending 登録と Discord 通知直前の最終安全ガード。
 #
-# Ver1.8:
-#   - 出来高が少ない銘柄が pending / Discord通知まで進むのを防ぐ。
-#   - add_pending直前でも latest_volume を再確認。
-#
-# Ver1.9:
-#   - 3MA/5MA方向判定はPUSH 1分履歴ではなく ranking_snapshot_1min から算出する。
-#   - BUY: ranking snapshot 由来の MA3/MA5 が下向きなら通知/pending拒否。
-#   - SELL: ranking snapshot 由来の MA3/MA5 が上向きなら通知/pending拒否。
-#   - 既存の3m/5m連続足ガード、出来高ガード、クライマックスガードは継続。
+# Ver2.0:
+#   - 通知理由に「判定時刻」「特徴量時刻」「5秒足時刻」を追加。
+#   - 実データと通知内容のズレを追えるよう、entry_conditionsにも時刻を保存。
+#   - BUYは 5m価格変化がマイナスなら最終拒否。
+#   - SELLは 5m価格変化がプラスなら最終拒否。
+#   - 5秒足が存在するのに 5s=0.000% 近辺なら最終拒否。
+#   - AI fallbackが古い/緩い状態で通しても add_pending 直前で止める。
 # ============================================================
 from __future__ import annotations
 
@@ -45,6 +43,21 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
+
+
 MAX_BUY_PRICE_CHANGE_PCT = _env_float("TONOSAMA_MAX_BUY_PRICE_CHANGE_PCT", 0.80)
 MAX_BUY_CLOSE_POSITION_PCT = _env_float("TONOSAMA_MAX_BUY_CLOSE_POSITION_PCT", 90.0)
 MAX_BUY_UPPER_WICK_PCT = _env_float("TONOSAMA_MAX_BUY_UPPER_WICK_PCT", 45.0)
@@ -62,6 +75,12 @@ SELLING_CLIMAX_MIN_PRICE_DROP_PCT = _env_float("TONOSAMA_SELLING_CLIMAX_MIN_PRIC
 MAX_BUY_PREV_3M5M_UP_STREAK = _env_int("TONOSAMA_MAX_BUY_PREV_3M5M_UP_STREAK", 2)
 MAX_SELL_PREV_3M5M_DOWN_STREAK = _env_int("TONOSAMA_MAX_SELL_PREV_3M5M_DOWN_STREAK", 2)
 MIN_FINAL_LATEST_VOLUME = _env_float("TONOSAMA_MIN_FINAL_LATEST_VOLUME", _env_float("TONOSAMA_MIN_LATEST_VOLUME", 50000.0))
+
+# Ver2.0 final direction / 5sec guard
+MIN_FINAL_5SEC_CHANGE_PCT = _env_float("TONOSAMA_FINAL_MIN_5SEC_CHANGE_PCT", _env_float("TONOSAMA_MIN_5SEC_PRICE_CHANGE_PCT", 0.01))
+REJECT_ZERO_5SEC_FINAL = _env_bool("TONOSAMA_FINAL_REJECT_ZERO_5SEC", True)
+MIN_BUY_5M_CHANGE_FINAL = _env_float("TONOSAMA_FINAL_MIN_BUY_5M_CHANGE", 0.0)
+MAX_SELL_5M_CHANGE_FINAL = _env_float("TONOSAMA_FINAL_MAX_SELL_5M_CHANGE", 0.0)
 
 
 def _norm_source(v: Any) -> str:
@@ -98,6 +117,28 @@ def _parse_dt(v: Any) -> dt.datetime | None:
         return py.replace(tzinfo=None) if py.tzinfo else py
     except Exception:
         return None
+
+
+def _fmt_dt(v: Any) -> str:
+    d = _parse_dt(v)
+    if d is None:
+        return "不明"
+    try:
+        return d.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(d)
+
+
+def _first_dt_from_row(row: pd.Series, names: list[str]) -> Any:
+    try:
+        for n in names:
+            if n in row.index:
+                v = row.get(n)
+                if v is not None and str(v).strip() != "":
+                    return v
+    except Exception:
+        pass
+    return None
 
 
 def _expire_at(entry: dict[str, Any]) -> dt.datetime | None:
@@ -204,6 +245,8 @@ def _infer_side_from_row(row: pd.Series) -> str:
 def _build_reason_ja(row: pd.Series, *, ai_reason: str, side: str) -> str:
     max_surge = safe_float(row.get("_max_volume_surge_ratio"), 0.0)
     max_chg = safe_float(row.get("_max_price_change_pct"), 0.0)
+    chg_3m = safe_float(row.get("price_change_pct_3m"), 0.0)
+    chg_5m = safe_float(row.get("price_change_pct_5m"), 0.0)
     chg_5s = safe_float(row.get("price_change_5s_pct"), 0.0)
     has_5s = bool(row.get("has_5sec_bar", False))
     slope = safe_float(row.get("_slope"), 0.0)
@@ -215,10 +258,18 @@ def _build_reason_ja(row: pd.Series, *, ai_reason: str, side: str) -> str:
     up5 = int(safe_float(row.get("prev_5m_up_streak"), 0.0))
     dn3 = int(safe_float(row.get("prev_3m_down_streak"), 0.0))
     dn5 = int(safe_float(row.get("prev_5m_down_streak"), 0.0))
+
+    decision_at = dt.datetime.now()
+    feature_dt = _first_dt_from_row(row, ["datetime", "dt", "summary_dt", "bar_dt", "latest_dt", "_latest_dt"])
+    five_sec_dt = _first_dt_from_row(row, ["latest_5sec_dt", "five_sec_dt", "bar_5s_dt", "dt_5s", "timestamp_5s"])
+
     parts = [
+        f"判定時刻 {decision_at.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"特徴量時刻 {_fmt_dt(feature_dt)}",
+        f"5秒足時刻 {_fmt_dt(five_sec_dt) if has_5s else 'なし'}",
         f"方向 {side}",
         f"{tf or '3m/5m'}で出来高急増 {max_surge:.2f}倍",
-        f"価格変化 {max_chg:.2f}%",
+        f"価格変化 max={max_chg:.2f}% / 3m={chg_3m:.2f}% / 5m={chg_5m:.2f}%",
         f"傾き {slope:.4f}",
         f"出来高 1m={latest_volume:.0f} / 3m={volume_3m:.0f} / 5m={volume_5m:.0f}",
         f"3分連続上昇 {up3}本 / 5分連続上昇 {up5}本 / 3分連続下落 {dn3}本 / 5分連続下落 {dn5}本",
@@ -231,8 +282,13 @@ def _build_reason_ja(row: pd.Series, *, ai_reason: str, side: str) -> str:
 
 
 def _entry_conditions_from_row(row: pd.Series, *, ai_reason: str, side: str, expire_at: dt.datetime) -> dict[str, Any]:
+    feature_dt = _first_dt_from_row(row, ["datetime", "dt", "summary_dt", "bar_dt", "latest_dt", "_latest_dt"])
+    five_sec_dt = _first_dt_from_row(row, ["latest_5sec_dt", "five_sec_dt", "bar_5s_dt", "dt_5s", "timestamp_5s"])
     return {
         "expire_at": expire_at,
+        "decision_at": dt.datetime.now(),
+        "feature_dt": _fmt_dt(feature_dt),
+        "five_sec_dt": _fmt_dt(five_sec_dt) if bool(row.get("has_5sec_bar", False)) else "なし",
         "reason": _build_reason_ja(row, ai_reason=ai_reason, side=side),
         "reason_code": "tonosama_volume_surge_price_change_5sec_ai",
         "ai_reason": ai_reason,
@@ -296,6 +352,10 @@ def _climax_reject_reason(entry: dict[str, Any]) -> tuple[str | None, dict[str, 
 
         surge = safe_float(cond.get("max_volume_surge_ratio"), 0.0)
         price_chg = safe_float(cond.get("max_price_change_pct"), 0.0)
+        chg_3m = safe_float(cond.get("price_change_pct_3m"), 0.0)
+        chg_5m = safe_float(cond.get("price_change_pct_5m"), 0.0)
+        chg_5s = safe_float(cond.get("price_change_5s_pct"), 0.0)
+        has_5s = bool(cond.get("has_5sec_bar", False))
         signed_body = safe_float(cond.get("signed_body_change_pct"), price_chg)
         slope = safe_float(cond.get("slope"), 0.0)
         close_pos = safe_float(cond.get("close_position_pct"), 50.0)
@@ -310,8 +370,15 @@ def _climax_reject_reason(entry: dict[str, Any]) -> tuple[str | None, dict[str, 
         if latest_volume < MIN_FINAL_LATEST_VOLUME:
             return "latest_volume_low_final_guard", ma_info
 
+        if has_5s and REJECT_ZERO_5SEC_FINAL and abs(chg_5s) < MIN_FINAL_5SEC_CHANGE_PCT:
+            return "five_sec_stopped_final_guard", ma_info
+
         if side == "BUY":
             buy_like = (price_chg > 0) or (signed_body > 0) or (slope > 0)
+            if chg_5m < MIN_BUY_5M_CHANGE_FINAL:
+                return "buy_5m_reverse_final_guard", ma_info
+            if chg_3m < 0:
+                return "buy_3m_reverse_final_guard", ma_info
             if max(up3, up5) > MAX_BUY_PREV_3M5M_UP_STREAK:
                 return "buy_after_3m5m_up_streak_guard", ma_info
             if buy_like and price_chg >= MAX_BUY_PRICE_CHANGE_PCT:
@@ -331,6 +398,10 @@ def _climax_reject_reason(entry: dict[str, Any]) -> tuple[str | None, dict[str, 
         if side == "SELL":
             drop_abs = abs(price_chg)
             sell_like = (price_chg < 0) or (signed_body < 0) or (slope < 0)
+            if chg_5m > MAX_SELL_5M_CHANGE_FINAL:
+                return "sell_5m_reverse_final_guard", ma_info
+            if chg_3m > 0:
+                return "sell_3m_reverse_final_guard", ma_info
             if max(dn3, dn5) > MAX_SELL_PREV_3M5M_DOWN_STREAK:
                 return "sell_after_3m5m_down_streak_guard", ma_info
             if sell_like and drop_abs >= MAX_SELL_PRICE_DROP_PCT:
@@ -385,9 +456,13 @@ def add_tonosama_pending(entry: dict[str, Any]) -> bool:
         if reject:
             cond = entry.get("entry_conditions") or {}
             logger.warning(
-                "[TONOSAMA PENDING GUARD] reject symbol=%s side=%s reason=%s price_chg=%.3f surge=%.2f latest_volume=%.0f min_volume=%.0f volume_3m=%.0f volume_5m=%.0f close_pos=%.1f upper_wick=%.1f lower_wick=%.1f up3=%s up5=%s dn3=%s dn5=%s slope=%.6f ranking_ma=%s",
+                "[TONOSAMA PENDING GUARD] reject symbol=%s side=%s reason=%s feature_dt=%s five_sec_dt=%s price_chg=%.3f chg3m=%.3f chg5m=%.3f chg5s=%.3f surge=%.2f latest_volume=%.0f min_volume=%.0f volume_3m=%.0f volume_5m=%.0f close_pos=%.1f upper_wick=%.1f lower_wick=%.1f up3=%s up5=%s dn3=%s dn5=%s slope=%.6f ranking_ma=%s",
                 entry.get("symbol"), entry.get("side"), reject,
+                cond.get("feature_dt"), cond.get("five_sec_dt"),
                 safe_float(cond.get("max_price_change_pct"), 0.0),
+                safe_float(cond.get("price_change_pct_3m"), 0.0),
+                safe_float(cond.get("price_change_pct_5m"), 0.0),
+                safe_float(cond.get("price_change_5s_pct"), 0.0),
                 safe_float(cond.get("max_volume_surge_ratio"), 0.0),
                 safe_float(cond.get("latest_volume"), 0.0),
                 MIN_FINAL_LATEST_VOLUME,
