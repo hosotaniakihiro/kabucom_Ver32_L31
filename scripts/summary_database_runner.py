@@ -1,6 +1,6 @@
 # ============================================================
 # File   : scripts/summary_database_runner.py
-# Version: SUMMARY-DATABASE-RUNNER-V2-MULTIDAY-MA75-WARMUP
+# Version: SUMMARY-DATABASE-RUNNER-V3-FORCE-DB-SAVE-ENV
 # ------------------------------------------------------------
 # Purpose:
 #   - main_database.py 側で定時サマリー計算・DB保存を担当する子プロセス
@@ -14,16 +14,22 @@
 #   - PUSH summary は毎分/3分/5分周期で計算・保存
 #   - RANKING summary は ENABLE_RANKING_SUMMARY_TICK=1 の場合だけ実行
 #
-# V2 Fix:
-#   ✔ main_database.py 側でも起動直後に複数日summary tailを読み込む
-#   ✔ 5分足75MA用に前日/前々日DBを含めたtailをglobal cacheへ投入
-#   ✔ summary_database_runner の初回tickからMA75欠損を減らす
-#   ✔ warmup失敗でもrunnerは継続
+# V3 Fix:
+#   ✔ main.py 用の DB保存skip環境変数が継承されても、database runnerでは必ず解除する
+#   ✔ SUMMARY_SKIP_DB_SAVE_IN_MAIN=0
+#   ✔ SUMMARY_MAIN_ENTRY_ONLY=0
+#   ✔ SUMMARY_DB_WRITER_ROLE=database
+#   ✔ AUTOSTOCK_SUMMARY_SAVE_MODE=save
+#   ✔ cache_writer が main_entry_only と誤判定して PUSH summary DB保存をskipする問題を防止
 #
 # Environment:
 #   AUTOSTOCK_DATA_COLLECTORS_PROCESS=1
 #   AUTOSTOCK_SUMMARY_DB_WRITER=1
 #   AUTOSTOCK_SUMMARY_SAVE_OWNER=database
+#   AUTOSTOCK_SUMMARY_SAVE_MODE=save
+#   SUMMARY_SKIP_DB_SAVE_IN_MAIN=0
+#   SUMMARY_MAIN_ENTRY_ONLY=0
+#   SUMMARY_DB_WRITER_ROLE=database
 #   PUSH_INCREMENTAL_MA75_SUMMARY_LOOKBACK_DAYS=3
 #   PUSH_INCREMENTAL_MA75_TAIL_ROWS=120
 # ============================================================
@@ -48,6 +54,38 @@ try:
     os.chdir(str(PROJECT_ROOT))
 except Exception:
     pass
+
+# ------------------------------------------------------------
+# IMPORTANT:
+#   run_time_locked_summary_jobs を import する前に、DB保存owner環境を確定する。
+#   cache_writer は実行時にも os.environ を読むが、import時patch類にも影響するため
+#   ここで先にセットする。
+# ------------------------------------------------------------
+
+def _install_database_summary_env() -> None:
+    os.environ["AUTOSTOCK_DATA_COLLECTORS_PROCESS"] = "1"
+    os.environ["AUTOSTOCK_MAIN_DATABASE_PROCESS"] = "1"
+    os.environ["AUTOSTOCK_SUMMARY_DB_WRITER"] = "1"
+    os.environ["AUTOSTOCK_SUMMARY_SAVE_OWNER"] = "database"
+    os.environ["AUTOSTOCK_SUMMARY_SAVE_MODE"] = "save"
+
+    # main.py専用の「DB保存しない」設定が親環境から残っていると、
+    # scheduler_jobs.summary.cache_writer._skip_db_save_for_entry_only_main()
+    # が database runner でも True になり、PUSH/RANKING summaryがDB保存されない。
+    # database runnerでは明示的に解除する。
+    os.environ["SUMMARY_SKIP_DB_SAVE_IN_MAIN"] = "0"
+    os.environ["SUMMARY_MAIN_ENTRY_ONLY"] = "0"
+    os.environ["SUMMARY_DB_WRITER_ROLE"] = "database"
+
+    # main_database 側ではAI/entryは実行しない。計算とDB保存のみ。
+    os.environ.setdefault("ENABLE_SUMMARY_ENTRY_TICK", "0")
+
+    # 5分足75MAは当日DBだけでは不足するため、前日/前々日を含めて読む。
+    os.environ.setdefault("PUSH_INCREMENTAL_MA75_SUMMARY_LOOKBACK_DAYS", "3")
+    os.environ.setdefault("PUSH_INCREMENTAL_MA75_TAIL_ROWS", "120")
+
+
+_install_database_summary_env()
 
 from data_collectors.logging_setup import setup_logging
 from scheduler_jobs.summary.time_locked_runner import run_time_locked_summary_jobs
@@ -87,21 +125,6 @@ def _sleep_until_next_minute(logger: logging.Logger) -> None:
 
     logger.debug("[SUMMARY DB RUNNER] sleep %.3fs", sleep_sec)
     time.sleep(sleep_sec)
-
-
-def _install_database_summary_env() -> None:
-    os.environ["AUTOSTOCK_DATA_COLLECTORS_PROCESS"] = "1"
-    os.environ["AUTOSTOCK_MAIN_DATABASE_PROCESS"] = "1"
-    os.environ["AUTOSTOCK_SUMMARY_DB_WRITER"] = "1"
-    os.environ["AUTOSTOCK_SUMMARY_SAVE_OWNER"] = "database"
-    os.environ.setdefault("AUTOSTOCK_SUMMARY_SAVE_MODE", "save")
-
-    # main_database 側ではAI/entryは実行しない。計算とDB保存のみ。
-    os.environ.setdefault("ENABLE_SUMMARY_ENTRY_TICK", "0")
-
-    # 5分足75MAは当日DBだけでは不足するため、前日/前々日を含めて読む。
-    os.environ.setdefault("PUSH_INCREMENTAL_MA75_SUMMARY_LOOKBACK_DAYS", "3")
-    os.environ.setdefault("PUSH_INCREMENTAL_MA75_TAIL_ROWS", "120")
 
 
 def _warmup_multiday_ma75_cache(logger: logging.Logger) -> Any:
@@ -144,6 +167,7 @@ def _warmup_multiday_ma75_cache(logger: logging.Logger) -> Any:
 
 
 def main() -> int:
+    # 念のため main() でも再セットする。
     _install_database_summary_env()
 
     logger = setup_logging("summary_database_runner")
@@ -155,8 +179,14 @@ def main() -> int:
     logger.info("[SUMMARY DB RUNNER] START")
     logger.info("[SUMMARY DB RUNNER] PROJECT_ROOT=%s", PROJECT_ROOT)
     logger.info("[SUMMARY DB RUNNER] cwd=%s", os.getcwd())
+    logger.info("[SUMMARY DB RUNNER] AUTOSTOCK_DATA_COLLECTORS_PROCESS=%s", os.getenv("AUTOSTOCK_DATA_COLLECTORS_PROCESS"))
+    logger.info("[SUMMARY DB RUNNER] AUTOSTOCK_MAIN_DATABASE_PROCESS=%s", os.getenv("AUTOSTOCK_MAIN_DATABASE_PROCESS"))
+    logger.info("[SUMMARY DB RUNNER] AUTOSTOCK_SUMMARY_DB_WRITER=%s", os.getenv("AUTOSTOCK_SUMMARY_DB_WRITER"))
     logger.info("[SUMMARY DB RUNNER] AUTOSTOCK_SUMMARY_SAVE_OWNER=%s", os.getenv("AUTOSTOCK_SUMMARY_SAVE_OWNER"))
     logger.info("[SUMMARY DB RUNNER] AUTOSTOCK_SUMMARY_SAVE_MODE=%s", os.getenv("AUTOSTOCK_SUMMARY_SAVE_MODE"))
+    logger.info("[SUMMARY DB RUNNER] SUMMARY_SKIP_DB_SAVE_IN_MAIN=%s", os.getenv("SUMMARY_SKIP_DB_SAVE_IN_MAIN"))
+    logger.info("[SUMMARY DB RUNNER] SUMMARY_MAIN_ENTRY_ONLY=%s", os.getenv("SUMMARY_MAIN_ENTRY_ONLY"))
+    logger.info("[SUMMARY DB RUNNER] SUMMARY_DB_WRITER_ROLE=%s", os.getenv("SUMMARY_DB_WRITER_ROLE"))
     logger.info("[SUMMARY DB RUNNER] ENABLE_RANKING_SUMMARY_TICK=%s", os.getenv("ENABLE_RANKING_SUMMARY_TICK"))
     logger.info("[SUMMARY DB RUNNER] PUSH_INCREMENTAL_MA75_SUMMARY_LOOKBACK_DAYS=%s", os.getenv("PUSH_INCREMENTAL_MA75_SUMMARY_LOOKBACK_DAYS"))
     logger.info("[SUMMARY DB RUNNER] PUSH_INCREMENTAL_MA75_TAIL_ROWS=%s", os.getenv("PUSH_INCREMENTAL_MA75_TAIL_ROWS"))
@@ -177,12 +207,18 @@ def main() -> int:
         last_run_minute = now
 
         try:
+            # ループ中も環境変数を再固定する。
+            _install_database_summary_env()
             ranking_enabled = _env_true("ENABLE_RANKING_SUMMARY_TICK", default=False)
 
             logger.info(
-                "[SUMMARY DB RUNNER] tick start now=%s run_push=True run_ranking=%s display=False run_entry=False",
+                "[SUMMARY DB RUNNER] tick start now=%s run_push=True run_ranking=%s display=False run_entry=False save_owner=%s save_mode=%s skip_main=%s role=%s",
                 now,
                 ranking_enabled,
+                os.getenv("AUTOSTOCK_SUMMARY_SAVE_OWNER"),
+                os.getenv("AUTOSTOCK_SUMMARY_SAVE_MODE"),
+                os.getenv("SUMMARY_SKIP_DB_SAVE_IN_MAIN"),
+                os.getenv("SUMMARY_DB_WRITER_ROLE"),
             )
 
             t0 = time.perf_counter()
