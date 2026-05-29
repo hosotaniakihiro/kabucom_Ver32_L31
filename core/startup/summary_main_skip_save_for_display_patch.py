@@ -1,33 +1,24 @@
 # ============================================================
 # File   : core/startup/summary_main_skip_save_for_display_patch.py
-# Version: V2-MAIN-1M-DISPLAY-FIRST-ASYNC-DB-SAVE
+# Version: V3-MAIN-1M-DISPLAY-FIRST-ASYNC-DB-SAVE-NO-HANG
 # ------------------------------------------------------------
 # 目的:
 #   main.py(entry_only) 側で1分足PUSHサマリーを表示優先にしつつ、
-#   DBにも保存する。
+#   DBにも短時間で保存する。
 #
-# 背景:
-#   runner_core.job_summary() の順番は以下。
-#     1. 計算
-#     2. _save_summary_if_owner()
-#     3. AI entry
-#     4. display/Discord
+# V3 修正:
+#   ✔ V2では async save start 後に direct sqlite save done/error が出ないことがあった
+#   ✔ 原因は NAS上SQLiteの connect / PRAGMA journal_mode=WAL / busy_timeout=10s が
+#     ロック時に長く詰まるため
+#   ✔ main.py側の補助保存では WAL変更をしない
+#   ✔ timeout/busy_timeout を短くする
+#   ✔ 各ステップにログを入れ、止まった箇所を判別可能にする
+#   ✔ 保存失敗時は明示ログを出し、次tickで再試行する
 #
-#   main.py は entry_only なので cache_writer 側で
-#     reason=main_entry_only
-#   により DB保存がskipされる。
-#   ただし、保存処理を完全に飛ばすと summary DB が更新されない。
-#
-# V2 方針:
-#   - main.py / entry_only / 非database process の PUSH 1分足だけ、同期saveを実行しない
-#   - 代わりに daemon Thread で direct SQLite 保存を実行する
-#   - job_summary本体はすぐ次の AI/display へ進む
-#   - main_database.py 側は従来通り通常保存
-#
-# ENV:
-#   SUMMARY_MAIN_SKIP_1M_SAVE_BEFORE_DISPLAY=1  既定ON
-#   SUMMARY_MAIN_SKIP_SAVE_BEFORE_DISPLAY_INTERVALS=1
-#   SUMMARY_MAIN_ASYNC_DIRECT_DB_SAVE=1          既定ON
+# 方針:
+#   - main_database.py がDB保存owner
+#   - main.py は1分足の補助保存のみ
+#   - main.py の補助保存は「詰まらない」ことを最優先
 # ============================================================
 
 from __future__ import annotations
@@ -38,7 +29,7 @@ import os
 import sqlite3
 import threading
 import time
-from typing import Any, Optional
+from typing import Any
 
 import pandas as pd
 
@@ -64,6 +55,18 @@ def _env_bool(name: str, default: bool = True) -> bool:
     if raw in {"0", "false", "no", "n", "off", "disable", "disabled"}:
         return False
     return bool(default)
+
+
+def _env_float(name: str, default: float, *, min_value: float | None = None, max_value: float | None = None) -> float:
+    try:
+        v = float(str(os.getenv(name, str(default))).strip())
+        if min_value is not None:
+            v = max(v, min_value)
+        if max_value is not None:
+            v = min(v, max_value)
+        return v
+    except Exception:
+        return float(default)
 
 
 def _is_database_process() -> bool:
@@ -205,26 +208,44 @@ def _key_cols(work: pd.DataFrame, table_cols: list[str], interval: int) -> list[
 
 
 def _direct_sqlite_save(df: pd.DataFrame, interval: int, source: str) -> int:
+    t0 = time.perf_counter()
     work = _norm_df(df)
     if work.empty:
+        logger.warning("[SUMMARY MAIN ASYNC SAVE] empty after normalize interval=%s source=%s", interval, source)
         return 0
 
     db_path = _summary_db_path(work)
     table = _summary_table(interval)
+    connect_timeout = _env_float("SUMMARY_MAIN_ASYNC_SQLITE_TIMEOUT_SEC", 1.5, min_value=0.2, max_value=5.0)
+    busy_timeout_ms = int(_env_float("SUMMARY_MAIN_ASYNC_SQLITE_BUSY_MS", 1200.0, min_value=100.0, max_value=5000.0))
 
     con = None
     try:
+        logger.warning(
+            "[SUMMARY MAIN ASYNC SAVE] open start interval=%s source=%s rows=%s table=%s path=%s timeout=%.2fs busy_ms=%s latest=%s",
+            interval,
+            source,
+            len(work),
+            table,
+            db_path,
+            connect_timeout,
+            busy_timeout_ms,
+            work["datetime"].max() if "datetime" in work.columns else None,
+        )
+
         if not os.path.exists(db_path):
             logger.error("[SUMMARY MAIN ASYNC SAVE] db not found interval=%s table=%s path=%s", interval, table, db_path)
             return 0
 
-        con = sqlite3.connect(db_path, timeout=10.0)
-        con.execute("PRAGMA busy_timeout = 10000")
+        con = sqlite3.connect(db_path, timeout=connect_timeout, isolation_level=None)
+        con.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
+        # main.py補助保存では journal_mode を変更しない。NAS上でWAL変更が詰まるため。
         try:
-            con.execute("PRAGMA journal_mode = WAL")
             con.execute("PRAGMA synchronous = NORMAL")
         except Exception:
             pass
+
+        logger.warning("[SUMMARY MAIN ASYNC SAVE] open ok interval=%s elapsed=%.3fs", interval, time.perf_counter() - t0)
 
         exists = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
         if exists is None:
@@ -245,8 +266,10 @@ def _direct_sqlite_save(df: pd.DataFrame, interval: int, source: str) -> int:
         cols = [c for c in table_cols if c in work.columns and c != "id"]
         work = work.dropna(subset=keys).drop_duplicates(subset=keys, keep="last").reset_index(drop=True)
         if work.empty or not cols:
+            logger.warning("[SUMMARY MAIN ASYNC SAVE] no records after cleanup interval=%s source=%s keys=%s cols=%s", interval, source, keys, len(cols))
             return 0
 
+        con.execute("BEGIN IMMEDIATE")
         delete_sql = f"DELETE FROM {table} WHERE " + " AND ".join([f"{c}=?" for c in keys])
         delete_params = [tuple(_sqlite_value(row[c]) for c in keys) for _, row in work[keys].iterrows()]
         con.executemany(delete_sql, delete_params)
@@ -257,18 +280,26 @@ def _direct_sqlite_save(df: pd.DataFrame, interval: int, source: str) -> int:
         con.commit()
 
         logger.warning(
-            "[SUMMARY MAIN ASYNC SAVE] direct sqlite save done interval=%s source=%s rows=%s table=%s path=%s latest=%s",
+            "[SUMMARY MAIN ASYNC SAVE] direct sqlite save done interval=%s source=%s rows=%s table=%s path=%s latest=%s elapsed=%.3fs",
             interval,
             source,
             len(records),
             table,
             db_path,
             work["datetime"].max() if "datetime" in work.columns else None,
+            time.perf_counter() - t0,
         )
         return int(len(records))
 
     except sqlite3.OperationalError as e:
-        logger.warning("[SUMMARY MAIN ASYNC SAVE] sqlite operational error interval=%s source=%s err=%s", interval, source, e)
+        msg = str(e).lower()
+        logger.warning(
+            "[SUMMARY MAIN ASYNC SAVE] sqlite operational error interval=%s source=%s err=%s elapsed=%.3fs action=retry_next_tick",
+            interval,
+            source,
+            e,
+            time.perf_counter() - t0,
+        )
         try:
             if con is not None:
                 con.rollback()
@@ -276,7 +307,7 @@ def _direct_sqlite_save(df: pd.DataFrame, interval: int, source: str) -> int:
             pass
         return 0
     except Exception:
-        logger.exception("[SUMMARY MAIN ASYNC SAVE] direct sqlite save failed interval=%s source=%s", interval, source)
+        logger.exception("[SUMMARY MAIN ASYNC SAVE] direct sqlite save failed interval=%s source=%s elapsed=%.3fs", interval, source, time.perf_counter() - t0)
         try:
             if con is not None:
                 con.rollback()
@@ -293,10 +324,13 @@ def _direct_sqlite_save(df: pd.DataFrame, interval: int, source: str) -> int:
 
 def _submit_async_save(df: pd.DataFrame, interval: int, source: str) -> None:
     if not _env_bool("SUMMARY_MAIN_ASYNC_DIRECT_DB_SAVE", True):
+        logger.warning("[SUMMARY MAIN ASYNC SAVE] disabled by env")
         return
     work = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
     if work.empty:
+        logger.warning("[SUMMARY MAIN ASYNC SAVE] skipped empty df interval=%s source=%s", interval, source)
         return
+
     latest = ""
     try:
         if "datetime" in work.columns:
@@ -305,6 +339,7 @@ def _submit_async_save(df: pd.DataFrame, interval: int, source: str) -> None:
                 latest = pd.Timestamp(s.max()).strftime("%Y%m%d%H%M%S")
     except Exception:
         latest = ""
+
     key = f"{source}:{int(interval)}:{latest}:{len(work)}"
     with _ASYNC_LOCK:
         if key in _RUNNING_KEYS:
@@ -315,7 +350,8 @@ def _submit_async_save(df: pd.DataFrame, interval: int, source: str) -> None:
     def _task() -> None:
         try:
             logger.warning("[SUMMARY MAIN ASYNC SAVE] start key=%s rows=%s", key, len(work))
-            _direct_sqlite_save(work, int(interval), str(source))
+            saved = _direct_sqlite_save(work, int(interval), str(source))
+            logger.warning("[SUMMARY MAIN ASYNC SAVE] finished key=%s saved=%s", key, saved)
         finally:
             with _ASYNC_LOCK:
                 _RUNNING_KEYS.discard(key)
@@ -337,7 +373,7 @@ def install() -> bool:
         if not callable(cur):
             logger.warning("[SUMMARY MAIN DISPLAY-FIRST SAVE PATCH] target missing")
             return False
-        if getattr(cur, "_summary_main_display_first_async_save_patch", False):
+        if getattr(cur, "_summary_main_display_first_async_save_patch_v3", False):
             _PATCHED = True
             return True
 
@@ -369,15 +405,18 @@ def install() -> bool:
             return _ORIGINAL_SAVE(df, int(iv), source=source)
 
         _patched_save_summary_if_owner._summary_main_display_first_async_save_patch = True  # type: ignore[attr-defined]
+        _patched_save_summary_if_owner._summary_main_display_first_async_save_patch_v3 = True  # type: ignore[attr-defined]
         _patched_save_summary_if_owner._summary_main_skip_save_display_patch = True  # type: ignore[attr-defined]
         _patched_save_summary_if_owner._original = cur  # type: ignore[attr-defined]
         rc._save_summary_if_owner = _patched_save_summary_if_owner
         _PATCHED = True
         logger.warning(
-            "[SUMMARY MAIN DISPLAY-FIRST SAVE PATCH] installed enabled=%s intervals=%s async_direct=%s",
+            "[SUMMARY MAIN DISPLAY-FIRST SAVE PATCH] installed v3 enabled=%s intervals=%s async_direct=%s sqlite_timeout=%.2f busy_ms=%.0f",
             _env_bool("SUMMARY_MAIN_SKIP_1M_SAVE_BEFORE_DISPLAY", True),
             sorted(_skip_intervals()),
             _env_bool("SUMMARY_MAIN_ASYNC_DIRECT_DB_SAVE", True),
+            _env_float("SUMMARY_MAIN_ASYNC_SQLITE_TIMEOUT_SEC", 1.5, min_value=0.2, max_value=5.0),
+            _env_float("SUMMARY_MAIN_ASYNC_SQLITE_BUSY_MS", 1200.0, min_value=100.0, max_value=5000.0),
         )
         return True
 
