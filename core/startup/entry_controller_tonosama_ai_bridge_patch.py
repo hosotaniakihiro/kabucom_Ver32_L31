@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/entry_controller_tonosama_ai_bridge_patch.py
-# Version: V1-TONOSAMA-DEDICATED-GATE-AI-BRIDGE
+# Version: V2-TONOSAMA-BRIDGE-RESPECT-HARD-REJECT
 # ------------------------------------------------------------
 # 目的:
 #   entry_controller では TONOSAMA の場合、先に
@@ -14,6 +14,12 @@
 #   - source / entry_type が TONOSAMA の場合だけ、専用判定済みとして
 #     entry_controller 内のAI結果をTONOSAMA用OKに置き換える。
 #   - SUMMARY/RANKING には影響させない。
+#
+# V2:
+#   - ENTRY VOLUME DIRECTION GUARD / 3m5m candle guard 等の hard_reject を尊重する。
+#   - ai結果に hard_reject / volume_direction_reject / allow=False 等がある場合、
+#     TONOSAMA_DEDICATED_GATE_OK で上書きしない。
+#   - 拒否理由に TONOSAMA_*_REJECT / *_REJECT_* が含まれる場合もNGを維持する。
 # ============================================================
 
 from __future__ import annotations
@@ -27,6 +33,21 @@ logger = logging.getLogger(__name__)
 _INSTALLED = False
 _ORIG_AI_CHECK = None
 _ORIG_PASS_CHECK = None
+
+_REJECT_TOKENS = (
+    "HARD_REJECT",
+    "VOLUME_DIRECTION_REJECT",
+    "TONOSAMA_BUY_REJECT",
+    "TONOSAMA_SELL_REJECT",
+    "TONOSAMA_REJECT",
+    "REJECT_3M5M",
+    "3M5M_CANDLE_REJECT",
+    "NO_STRONG_3M5M",
+    "MA5_DOWN_AND_PRICE_BELOW",
+    "MA5_UP_AND_PRICE_ABOVE",
+    "VOLUME_SURGE_AFTER_UP_MOVE",
+    "VOLUME_SURGE_AFTER_DOWN_MOVE",
+)
 
 
 def _env_on(name: str, default: bool = True) -> bool:
@@ -72,25 +93,100 @@ def _score(row: dict, side: str) -> float:
     return max(base, raw, buy)
 
 
+def _txt_contains_reject(*vals: Any) -> bool:
+    try:
+        text = " ".join(str(v or "") for v in vals).upper()
+        return any(tok in text for tok in _REJECT_TOKENS)
+    except Exception:
+        return False
+
+
+def _ai_is_hard_reject(ai: Any) -> tuple[bool, str]:
+    if not isinstance(ai, dict):
+        return False, ""
+    try:
+        for k in ("hard_reject", "volume_direction_reject", "reject", "is_reject"):
+            if bool(ai.get(k)):
+                return True, str(ai.get("reason") or ai.get("gate_reason") or ai.get("ai_reason") or k)
+        # 明示的なFalse系を尊重する。
+        for k in ("allow", "allowed", "is_allowed", "ai_allow", "passed", "ok"):
+            if k in ai and ai.get(k) is False:
+                reason = str(ai.get("reason") or ai.get("gate_reason") or ai.get("ai_reason") or k)
+                if _txt_contains_reject(reason, ai.get("detail"), ai.get("volume_direction")):
+                    return True, reason
+        if _txt_contains_reject(ai.get("reason"), ai.get("gate_reason"), ai.get("ai_reason"), ai.get("detail"), ai.get("volume_direction")):
+            return True, str(ai.get("reason") or ai.get("gate_reason") or ai.get("ai_reason") or "TONOSAMA_HARD_REJECT_REASON")
+    except Exception:
+        pass
+    return False, ""
+
+
+def _force_ng(reason: str, ai: Any | None = None) -> dict:
+    out = dict(ai) if isinstance(ai, dict) else {}
+    for k in ("allow", "allowed", "is_allowed", "ai_allow", "passed", "ok"):
+        out[k] = False
+    for k in ("confidence", "ai_confidence", "conf"):
+        out[k] = 0.0
+    out["reason"] = reason or out.get("reason") or "TONOSAMA_HARD_REJECT"
+    out["gate_reason"] = reason or out.get("gate_reason") or "TONOSAMA_HARD_REJECT"
+    out["ai_reason"] = reason or out.get("ai_reason") or "TONOSAMA_HARD_REJECT"
+    out["hard_reject"] = True
+    out["tonosama_bridge_respected_reject"] = True
+    return out
+
+
 def _ai_check(row: dict):
     try:
+        orig_ai = _ORIG_AI_CHECK(row)
+        hard, reason = _ai_is_hard_reject(orig_ai)
+        if hard:
+            logger.warning(
+                "[TONOSAMA AI BRIDGE] keep NG reason=%s source=%s entry_type=%s symbol=%s side=%s",
+                reason,
+                row.get("source") if isinstance(row, dict) else None,
+                row.get("entry_type") if isinstance(row, dict) else None,
+                row.get("symbol") if isinstance(row, dict) else None,
+                row.get("side") if isinstance(row, dict) else None,
+            )
+            return _force_ng(reason, orig_ai)
+
         if _env_on("ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE", True) and _is_tonosama(row):
             side = _su(row.get("entry_decision") or row.get("side"))
             s = _score(row, side)
             return {
                 "allow": True,
+                "allowed": True,
+                "is_allowed": True,
+                "ai_allow": True,
+                "passed": True,
+                "ok": True,
                 "confidence": 1.0,
+                "ai_confidence": 1.0,
+                "conf": 1.0,
                 "reason": "TONOSAMA_DEDICATED_GATE_OK",
                 "lot_multiplier": 1.0,
                 "score": s,
             }
+        return orig_ai
     except Exception:
         logger.debug("[TONOSAMA AI BRIDGE] ai check bridge failed", exc_info=True)
-    return _ORIG_AI_CHECK(row)
+        return _ORIG_AI_CHECK(row)
 
 
 def _pass_check(row: dict, ai: dict, side: str):
     try:
+        hard, reason = _ai_is_hard_reject(ai)
+        if hard:
+            logger.warning(
+                "[TONOSAMA AI BRIDGE] reject preserved source=%s entry_type=%s symbol=%s side=%s reason=%s",
+                row.get("source") if isinstance(row, dict) else None,
+                row.get("entry_type") if isinstance(row, dict) else None,
+                row.get("symbol") if isinstance(row, dict) else None,
+                side,
+                reason,
+            )
+            return False, reason or "TONOSAMA_HARD_REJECT"
+
         if _env_on("ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE", True) and _is_tonosama(row):
             s = _score(row, side)
             min_s = _sf(os.getenv("ENTRY_CONTROLLER_TONOSAMA_MIN_SCORE"), 0.01)
@@ -121,17 +217,17 @@ def install() -> bool:
         if not callable(cur_ai) or not callable(cur_pass):
             logger.warning("[TONOSAMA AI BRIDGE] target missing ai=%s pass=%s", callable(cur_ai), callable(cur_pass))
             return False
-        if getattr(cur_pass, "_tonosama_ai_bridge_patch", False):
+        if getattr(cur_pass, "_tonosama_ai_bridge_patch_v2", False):
             _INSTALLED = True
             return True
         _ORIG_AI_CHECK = cur_ai
         _ORIG_PASS_CHECK = cur_pass
-        _ai_check._tonosama_ai_bridge_patch = True  # type: ignore[attr-defined]
-        _pass_check._tonosama_ai_bridge_patch = True  # type: ignore[attr-defined]
+        _ai_check._tonosama_ai_bridge_patch_v2 = True  # type: ignore[attr-defined]
+        _pass_check._tonosama_ai_bridge_patch_v2 = True  # type: ignore[attr-defined]
         ec.ai_final_entry_check = _ai_check
         ec._passes_ai_gate = _pass_check
         _INSTALLED = True
-        logger.warning("[TONOSAMA AI BRIDGE] installed v1 enabled=%s", _env_on("ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE", True))
+        logger.warning("[TONOSAMA AI BRIDGE] installed v2 respect_hard_reject enabled=%s", _env_on("ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE", True))
         return True
     except Exception:
         logger.exception("[TONOSAMA AI BRIDGE] install failed")
