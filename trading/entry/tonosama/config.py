@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/tonosama/config.py
-# Version: Ver2.10-FIX-ALERT-LIQUIDITY-CIRCULAR-IMPORT
+# Version: Ver2.11-INSTALL-RUNTIME-BUDGET-PATCH
 # ------------------------------------------------------------
 # 方針:
 #   - volume_surge.py / history guard で履歴不足fail-openを許可した後、
@@ -11,6 +11,9 @@
 #   - Ver2.10:
 #     config.py 初期化途中に pending_writer をimportして循環importになる問題を修正。
 #     アラート流動性ガードは全定数定義後にinstallする。
+#   - Ver2.11:
+#     TONOSAMAの古いdaemon threadが100秒超走り続ける問題を防ぐため、
+#     runtime budget patch を遅延installする。
 # ============================================================
 
 from __future__ import annotations
@@ -31,6 +34,11 @@ os.environ.setdefault("TONOSAMA_MIN_SLOPE", "0.0010")
 os.environ.setdefault("TONOSAMA_MIN_5SEC_PRICE_CHANGE_PCT", "0.01")
 os.environ.setdefault("TONOSAMA_MAX_BUY_PRICE_CHANGE_PCT", "1.20")
 os.environ.setdefault("TONOSAMA_MAX_SELL_PRICE_DROP_PCT", "1.20")
+
+# Runtime budget guard。timeout wrapperではPythonスレッドを強制停止できないため、
+# runner本体がこの時間予算を見て自分で早期終了する。
+os.environ.setdefault("TONOSAMA_LOOP_TIME_BUDGET_SEC", "10")
+os.environ.setdefault("TONOSAMA_RUNTIME_MAX_EVAL_CANDIDATES", "5")
 
 # 日中流動性ガード。後からイナゴが付いてきやすい銘柄へ寄せる。
 os.environ.setdefault("TONOSAMA_INTRADAY_LIQUIDITY_GUARD", "1")
@@ -68,6 +76,17 @@ def _install_alert_liquidity_guard() -> None:
         install()
     except Exception:
         # config import時に落ちると殿様全体が止まるため、ここでは握りつぶす。
+        pass
+
+
+def _install_runtime_budget_guard() -> None:
+    try:
+        if str(os.getenv("TONOSAMA_RUNTIME_BUDGET_GUARD", "1")).strip().lower() in {"0", "false", "no", "off"}:
+            return
+        from core.startup.tonosama_runtime_budget_patch import install
+        install(retry=True)
+    except Exception:
+        # runner import中でも安全にするため、ここでは握りつぶす。
         pass
 
 
@@ -165,3 +184,6 @@ MAX_5SEC_FEATURE_SYMBOLS = _env_int("TONOSAMA_MAX_5SEC_FEATURE_SYMBOLS", 20)
 # 重要: pending_writer.py は config.py から TONOSAMA_EXPIRE_SEC 等をimportする。
 # そのため、pending_writerを触るアラート流動性ガードは定数定義完了後にinstallする。
 _install_alert_liquidity_guard()
+
+# runner.py import中は build_tonosama_entries が未定義のため、retry threadで遅延installする。
+_install_runtime_budget_guard()
