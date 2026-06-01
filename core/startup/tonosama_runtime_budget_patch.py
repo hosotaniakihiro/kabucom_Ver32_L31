@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/tonosama_runtime_budget_patch.py
-# Version: Ver1.0-TONOSAMA-RUNTIME-BUDGET
+# Version: Ver1.1-TONOSAMA-RUNTIME-BUDGET-MIN-REGISTER
 # ------------------------------------------------------------
 # Purpose:
 #   TONOSAMA runner can continue in a daemon thread even after the
@@ -8,13 +8,11 @@
 #   to keep running for 100s+ and made every next 30s schedule skip as
 #   previous_timeout_thread_still_alive.
 #
-# Fix:
-#   Patch trading.entry.tonosama.runner.build_tonosama_entries() with a
-#   cooperative time-budgeted implementation.
-#
-# Defaults:
-#   TONOSAMA_LOOP_TIME_BUDGET_SEC=10
-#   TONOSAMA_RUNTIME_MAX_EVAL_CANDIDATES=5
+# Ver1.1:
+#   - 候補生成に時間がかかった場合でも、登録処理を0件で打ち切らない。
+#   - TONOSAMA_RUNTIME_MIN_EVAL_BEFORE_BUDGET=1 により最低1候補は評価する。
+#   - registered=0 の間は TONOSAMA_RUNTIME_GRACE_SEC を追加猶予として使う。
+#   - 既定 budget を 10s -> 18s に延長し、max_eval を 5 -> 8 に緩和。
 # ============================================================
 
 from __future__ import annotations
@@ -63,7 +61,7 @@ def _apply_patch() -> bool:
         return False
 
     try:
-        if getattr(runner, "_TONOSAMA_RUNTIME_BUDGET_PATCHED", False):
+        if getattr(runner, "_TONOSAMA_RUNTIME_BUDGET_PATCHED_V11", False):
             _INSTALLED = True
             return True
 
@@ -74,9 +72,13 @@ def _apply_patch() -> bool:
 
         def _budgeted_build_tonosama_entries() -> int:
             started = time.perf_counter()
-            budget_sec = max(1.0, _env_float("TONOSAMA_LOOP_TIME_BUDGET_SEC", 10.0))
-            max_eval = max(1, _env_int("TONOSAMA_RUNTIME_MAX_EVAL_CANDIDATES", 5))
+            budget_sec = max(3.0, _env_float("TONOSAMA_LOOP_TIME_BUDGET_SEC", 18.0))
+            grace_sec = max(0.0, _env_float("TONOSAMA_RUNTIME_GRACE_SEC", 6.0))
+            max_eval = max(1, _env_int("TONOSAMA_RUNTIME_MAX_EVAL_CANDIDATES", 8))
+            min_eval_before_budget = max(0, _env_int("TONOSAMA_RUNTIME_MIN_EVAL_BEFORE_BUDGET", 1))
+            min_register_before_budget = max(0, _env_int("TONOSAMA_RUNTIME_MIN_REGISTER_BEFORE_BUDGET", 1))
             deadline = started + budget_sec
+            grace_deadline = deadline + grace_sec
 
             try:
                 candidates = runner.iter_tonosama_candidate_rows()
@@ -98,6 +100,7 @@ def _apply_patch() -> bool:
                 pass
 
             registered = 0
+            evaluated = 0
             ai_ng = 0
             duplicate = 0
             low_score = 0
@@ -105,15 +108,28 @@ def _apply_patch() -> bool:
             time_budget_stop = False
             final_low_samples: list[dict[str, Any]] = []
 
+            def _can_stop_for_budget() -> bool:
+                now = time.perf_counter()
+                if now < deadline:
+                    return False
+                # 0件評価・0件登録のままなら追加猶予を使う。
+                if evaluated < min_eval_before_budget:
+                    return now >= grace_deadline
+                if registered < min_register_before_budget:
+                    return now >= grace_deadline
+                return True
+
             for _, row in candidates.iterrows():
                 now = time.perf_counter()
-                if now >= deadline:
+                if _can_stop_for_budget():
                     time_budget_stop = True
                     logger.warning(
-                        "[TONOSAMA RUNTIME BUDGET] stop before candidate budget_sec=%.1f elapsed=%.3fs registered=%s evaluated_limit=%s",
+                        "[TONOSAMA RUNTIME BUDGET] stop before candidate budget_sec=%.1f grace_sec=%.1f elapsed=%.3fs registered=%s evaluated=%s evaluated_limit=%s",
                         budget_sec,
+                        grace_sec,
                         now - started,
                         registered,
+                        evaluated,
                         max_eval,
                     )
                     break
@@ -121,6 +137,7 @@ def _apply_patch() -> bool:
                 if registered >= runner.MAX_PENDING_PER_LOOP:
                     break
 
+                evaluated += 1
                 symbol = runner.normalize_symbol(row.get("symbol"))
                 if not symbol:
                     no_symbol += 1
@@ -139,7 +156,7 @@ def _apply_patch() -> bool:
                     final_low_samples.append({"symbol": symbol, "reason": "raw_score_le_zero", "raw_score": raw_score})
                     continue
 
-                if time.perf_counter() >= deadline:
+                if _can_stop_for_budget():
                     time_budget_stop = True
                     break
 
@@ -170,7 +187,7 @@ def _apply_patch() -> bool:
                     )
                     continue
 
-                if time.perf_counter() >= deadline:
+                if _can_stop_for_budget():
                     time_budget_stop = True
                     break
 
@@ -193,7 +210,8 @@ def _apply_patch() -> bool:
                     })
                     continue
 
-                if time.perf_counter() >= deadline:
+                # ここは登録直前なので、0件登録のままなら猶予内で続行する。
+                if _can_stop_for_budget():
                     time_budget_stop = True
                     break
 
@@ -219,15 +237,19 @@ def _apply_patch() -> bool:
                             runner.safe_float(row.get("_slope"), 0.0),
                             ai_prob,
                         )
-                        if time.perf_counter() < deadline:
+                        # 通知で予算超過して次候補が止まるのを避けるため、通知は可能なら実施。
+                        try:
                             runner.notify_discord_tonosama_pending(entry)
+                        except Exception:
+                            logger.warning("[TONOSAMA RUNTIME BUDGET] notify failed symbol=%s", symbol, exc_info=True)
                 except Exception:
-                    logger.warning("[TONOSAMA RUNTIME BUDGET] add/notify failed symbol=%s", symbol, exc_info=True)
+                    logger.warning("[TONOSAMA RUNTIME BUDGET] add failed symbol=%s", symbol, exc_info=True)
                     continue
 
             logger.info(
-                "[TONOSAMA RUNTIME BUDGET] build done candidates=%s evaluated_max=%s registered=%s duplicate=%s ai_ng=%s low_score=%s no_symbol=%s stopped=%s budget_sec=%.1f elapsed=%.3fs low_score_samples=%s",
+                "[TONOSAMA RUNTIME BUDGET] build done candidates=%s evaluated=%s evaluated_max=%s registered=%s duplicate=%s ai_ng=%s low_score=%s no_symbol=%s stopped=%s budget_sec=%.1f grace_sec=%.1f elapsed=%.3fs low_score_samples=%s",
                 len(candidates),
+                evaluated,
                 max_eval,
                 registered,
                 duplicate,
@@ -236,6 +258,7 @@ def _apply_patch() -> bool:
                 no_symbol,
                 time_budget_stop,
                 budget_sec,
+                grace_sec,
                 time.perf_counter() - started,
                 final_low_samples[:10],
             )
@@ -244,11 +267,15 @@ def _apply_patch() -> bool:
         setattr(runner, "_TONOSAMA_ORIGINAL_BUILD_TONOSAMA_ENTRIES", original)
         setattr(runner, "build_tonosama_entries", _budgeted_build_tonosama_entries)
         setattr(runner, "_TONOSAMA_RUNTIME_BUDGET_PATCHED", True)
+        setattr(runner, "_TONOSAMA_RUNTIME_BUDGET_PATCHED_V11", True)
         _INSTALLED = True
         logger.warning(
-            "[TONOSAMA RUNTIME BUDGET PATCH] installed budget_sec=%s max_eval=%s",
-            os.getenv("TONOSAMA_LOOP_TIME_BUDGET_SEC", "10"),
-            os.getenv("TONOSAMA_RUNTIME_MAX_EVAL_CANDIDATES", "5"),
+            "[TONOSAMA RUNTIME BUDGET PATCH] installed v1.1 budget_sec=%s grace_sec=%s max_eval=%s min_eval=%s min_register=%s",
+            os.getenv("TONOSAMA_LOOP_TIME_BUDGET_SEC", "18"),
+            os.getenv("TONOSAMA_RUNTIME_GRACE_SEC", "6"),
+            os.getenv("TONOSAMA_RUNTIME_MAX_EVAL_CANDIDATES", "8"),
+            os.getenv("TONOSAMA_RUNTIME_MIN_EVAL_BEFORE_BUDGET", "1"),
+            os.getenv("TONOSAMA_RUNTIME_MIN_REGISTER_BEFORE_BUDGET", "1"),
         )
         return True
     except Exception:
