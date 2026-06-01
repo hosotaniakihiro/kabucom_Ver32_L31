@@ -1,17 +1,15 @@
 # ============================================================
 # File   : trading/entry/tonosama/pending_writer.py
-# Version: Ver2.0-TONOSAMA-PENDING-TIME-AND-DIRECTION-FINAL-GUARD
+# Version: Ver2.1-TONOSAMA-OPTIONAL-5SEC-FINAL-GUARD
 # ------------------------------------------------------------
 # 目的:
 #   殿様イナゴの pending 登録と Discord 通知直前の最終安全ガード。
 #
-# Ver2.0:
-#   - 通知理由に「判定時刻」「特徴量時刻」「5秒足時刻」を追加。
-#   - 実データと通知内容のズレを追えるよう、entry_conditionsにも時刻を保存。
-#   - BUYは 5m価格変化がマイナスなら最終拒否。
-#   - SELLは 5m価格変化がプラスなら最終拒否。
-#   - 5秒足が存在するのに 5s=0.000% 近辺なら最終拒否。
-#   - AI fallbackが古い/緩い状態で通しても add_pending 直前で止める。
+# Ver2.1:
+#   - 5秒足は必須にしない方針に合わせる。
+#   - has_5sec_bar=True でも five_sec_dt が不明、または latest_5sec_volume=0 の場合は
+#     five_sec_stopped_final_guard を発動しない。
+#   - 実5秒足が存在する時だけ、5s変化0近辺を停止判定に使う。
 # ============================================================
 from __future__ import annotations
 
@@ -76,9 +74,10 @@ MAX_BUY_PREV_3M5M_UP_STREAK = _env_int("TONOSAMA_MAX_BUY_PREV_3M5M_UP_STREAK", 2
 MAX_SELL_PREV_3M5M_DOWN_STREAK = _env_int("TONOSAMA_MAX_SELL_PREV_3M5M_DOWN_STREAK", 2)
 MIN_FINAL_LATEST_VOLUME = _env_float("TONOSAMA_MIN_FINAL_LATEST_VOLUME", _env_float("TONOSAMA_MIN_LATEST_VOLUME", 50000.0))
 
-# Ver2.0 final direction / 5sec guard
+# final direction / optional 5sec guard
 MIN_FINAL_5SEC_CHANGE_PCT = _env_float("TONOSAMA_FINAL_MIN_5SEC_CHANGE_PCT", _env_float("TONOSAMA_MIN_5SEC_PRICE_CHANGE_PCT", 0.01))
 REJECT_ZERO_5SEC_FINAL = _env_bool("TONOSAMA_FINAL_REJECT_ZERO_5SEC", True)
+REJECT_ZERO_5SEC_ONLY_WHEN_VALID = _env_bool("TONOSAMA_FINAL_REJECT_ZERO_5SEC_ONLY_WHEN_VALID", True)
 MIN_BUY_5M_CHANGE_FINAL = _env_float("TONOSAMA_FINAL_MIN_BUY_5M_CHANGE", 0.0)
 MAX_SELL_5M_CHANGE_FINAL = _env_float("TONOSAMA_FINAL_MAX_SELL_5M_CHANGE", 0.0)
 
@@ -108,7 +107,7 @@ def _parse_dt(v: Any) -> dt.datetime | None:
         if isinstance(v, dt.date):
             return dt.datetime.combine(v, dt.time.min)
         s = str(v).strip()
-        if not s:
+        if not s or s in {"不明", "なし", "None", "nan", "NaT"}:
             return None
         parsed = pd.to_datetime(s, errors="coerce")
         if pd.isna(parsed):
@@ -283,12 +282,14 @@ def _build_reason_ja(row: pd.Series, *, ai_reason: str, side: str) -> str:
 
 def _entry_conditions_from_row(row: pd.Series, *, ai_reason: str, side: str, expire_at: dt.datetime) -> dict[str, Any]:
     feature_dt = _first_dt_from_row(row, ["datetime", "dt", "summary_dt", "bar_dt", "latest_dt", "_latest_dt"])
-    five_sec_dt = _first_dt_from_row(row, ["latest_5sec_dt", "five_sec_dt", "bar_5s_dt", "dt_5s", "timestamp_5s"])
+    five_sec_dt_raw = _first_dt_from_row(row, ["latest_5sec_dt", "five_sec_dt", "bar_5s_dt", "dt_5s", "timestamp_5s"])
+    five_sec_dt = _fmt_dt(five_sec_dt_raw) if bool(row.get("has_5sec_bar", False)) else "なし"
     return {
         "expire_at": expire_at,
         "decision_at": dt.datetime.now(),
         "feature_dt": _fmt_dt(feature_dt),
-        "five_sec_dt": _fmt_dt(five_sec_dt) if bool(row.get("has_5sec_bar", False)) else "なし",
+        "five_sec_dt": five_sec_dt,
+        "five_sec_dt_valid": _parse_dt(five_sec_dt_raw) is not None,
         "reason": _build_reason_ja(row, ai_reason=ai_reason, side=side),
         "reason_code": "tonosama_volume_surge_price_change_5sec_ai",
         "ai_reason": ai_reason,
@@ -340,6 +341,17 @@ def _ranking_ma_reject_reason(symbol: str, side: str) -> tuple[str | None, dict[
         return None, {"reason": "ranking_ma_guard_exception"}
 
 
+def _has_valid_5sec_for_zero_guard(cond: dict[str, Any]) -> bool:
+    if not bool(cond.get("has_5sec_bar", False)):
+        return False
+    if REJECT_ZERO_5SEC_ONLY_WHEN_VALID:
+        if not bool(cond.get("five_sec_dt_valid", False)):
+            return False
+        if safe_float(cond.get("latest_5sec_volume"), 0.0) <= 0:
+            return False
+    return True
+
+
 def _climax_reject_reason(entry: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
     ma_info: dict[str, Any] = {}
     try:
@@ -355,7 +367,6 @@ def _climax_reject_reason(entry: dict[str, Any]) -> tuple[str | None, dict[str, 
         chg_3m = safe_float(cond.get("price_change_pct_3m"), 0.0)
         chg_5m = safe_float(cond.get("price_change_pct_5m"), 0.0)
         chg_5s = safe_float(cond.get("price_change_5s_pct"), 0.0)
-        has_5s = bool(cond.get("has_5sec_bar", False))
         signed_body = safe_float(cond.get("signed_body_change_pct"), price_chg)
         slope = safe_float(cond.get("slope"), 0.0)
         close_pos = safe_float(cond.get("close_position_pct"), 50.0)
@@ -370,7 +381,7 @@ def _climax_reject_reason(entry: dict[str, Any]) -> tuple[str | None, dict[str, 
         if latest_volume < MIN_FINAL_LATEST_VOLUME:
             return "latest_volume_low_final_guard", ma_info
 
-        if has_5s and REJECT_ZERO_5SEC_FINAL and abs(chg_5s) < MIN_FINAL_5SEC_CHANGE_PCT:
+        if REJECT_ZERO_5SEC_FINAL and _has_valid_5sec_for_zero_guard(cond) and abs(chg_5s) < MIN_FINAL_5SEC_CHANGE_PCT:
             return "five_sec_stopped_final_guard", ma_info
 
         if side == "BUY":
@@ -456,9 +467,9 @@ def add_tonosama_pending(entry: dict[str, Any]) -> bool:
         if reject:
             cond = entry.get("entry_conditions") or {}
             logger.warning(
-                "[TONOSAMA PENDING GUARD] reject symbol=%s side=%s reason=%s feature_dt=%s five_sec_dt=%s price_chg=%.3f chg3m=%.3f chg5m=%.3f chg5s=%.3f surge=%.2f latest_volume=%.0f min_volume=%.0f volume_3m=%.0f volume_5m=%.0f close_pos=%.1f upper_wick=%.1f lower_wick=%.1f up3=%s up5=%s dn3=%s dn5=%s slope=%.6f ranking_ma=%s",
+                "[TONOSAMA PENDING GUARD] reject symbol=%s side=%s reason=%s feature_dt=%s five_sec_dt=%s five_sec_dt_valid=%s price_chg=%.3f chg3m=%.3f chg5m=%.3f chg5s=%.3f surge=%.2f latest_volume=%.0f min_volume=%.0f volume_3m=%.0f volume_5m=%.0f close_pos=%.1f upper_wick=%.1f lower_wick=%.1f up3=%s up5=%s dn3=%s dn5=%s slope=%.6f ranking_ma=%s",
                 entry.get("symbol"), entry.get("side"), reject,
-                cond.get("feature_dt"), cond.get("five_sec_dt"),
+                cond.get("feature_dt"), cond.get("five_sec_dt"), cond.get("five_sec_dt_valid"),
                 safe_float(cond.get("max_price_change_pct"), 0.0),
                 safe_float(cond.get("price_change_pct_3m"), 0.0),
                 safe_float(cond.get("price_change_pct_5m"), 0.0),
