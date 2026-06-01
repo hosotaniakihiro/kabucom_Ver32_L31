@@ -1,19 +1,16 @@
 # ============================================================
 # File   : trading/entry/tonosama/config.py
-# Version: Ver2.9-TONOSAMA-ALERT-LIQUIDITY-GUARD
+# Version: Ver2.10-FIX-ALERT-LIQUIDITY-CIRCULAR-IMPORT
 # ------------------------------------------------------------
 # 方針:
 #   - volume_surge.py / history guard で履歴不足fail-openを許可した後、
 #     runner.py 側の本体条件が強すぎて candidates=0 に戻る問題を緩和。
-#   - 6996のような微小変化だけの候補は避けつつ、4592/6072のように
-#     実値動きがある候補を残す水準へ調整。
-#   - Ver2.8:
-#     slope/range rescue 後、raw_score=2.3 の候補が final_score_low で
-#     連続して落ちるため、TONOSAMA_MIN_FINAL_SCORE の floor を 2.5 -> 2.3 に緩和。
-#     ただし後段のAI/流動性/板/方向ガードはそのまま残す。
 #   - Ver2.9:
 #     PENDING/Discordアラート直前にも出来高・売買代金ガードを入れ、
 #     低出来高銘柄の通知を止める。
+#   - Ver2.10:
+#     config.py 初期化途中に pending_writer をimportして循環importになる問題を修正。
+#     アラート流動性ガードは全定数定義後にinstallする。
 # ============================================================
 
 from __future__ import annotations
@@ -74,8 +71,8 @@ def _install_alert_liquidity_guard() -> None:
         pass
 
 
+# intraday guard は runner import の遅延patchで、config初期化中でも安全。
 _install_intraday_liquidity_guard()
-_install_alert_liquidity_guard()
 
 
 def _env_float(name: str, default: float) -> float:
@@ -164,3 +161,7 @@ MAX_CANDIDATES = _env_int("TONOSAMA_MAX_CANDIDATES", 40)
 SCHEDULER_INTERVAL_SEC = _env_int("TONOSAMA_SCHEDULER_INTERVAL_SEC", 15)
 DISCORD_NOTIFY_ON_PENDING = _env_bool("TONOSAMA_DISCORD_NOTIFY_ON_PENDING", True)
 MAX_5SEC_FEATURE_SYMBOLS = _env_int("TONOSAMA_MAX_5SEC_FEATURE_SYMBOLS", 20)
+
+# 重要: pending_writer.py は config.py から TONOSAMA_EXPIRE_SEC 等をimportする。
+# そのため、pending_writerを触るアラート流動性ガードは定数定義完了後にinstallする。
+_install_alert_liquidity_guard()
