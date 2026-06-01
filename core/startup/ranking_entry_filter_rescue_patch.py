@@ -1,18 +1,16 @@
 # ============================================================
 # File   : core/startup/ranking_entry_filter_rescue_patch.py
-# Version: V1.1-RECURSION-SAFE-RANKING-TECH-RESCUE
+# Version: V1.2-RESCUE-FLAT-PRICE-RECURSION
 # ------------------------------------------------------------
 # 目的:
 #   ranking_entry_fast_runtime_patch v5 で prefilter は高速化されたが、
 #   _passes_ranking_only_filters() が全候補を filter_reject し、
 #   candidates=0 / pending=0 になるケースを救済する。
 #
-# V1.1:
-#   - ranking_entry_flat_price_guard_patch と相互ラップして
-#     RecursionError になる問題を防ぐ。
-#   - original filter が再帰した場合は、強ランキング条件だけで救済可否を判定する。
-#   - SCORE_NG/流動性NGは通常は救済しないが、再帰時は reason=FILTER_RECURSION として
-#     強条件を満たすものだけ救済する。
+# V1.2:
+#   - FLAT_PRICE_FILTER_RECURSION を救済対象に追加。
+#   - 再帰理由の場合は、day/price/volume の列欠損を通常より緩く扱う。
+#   - final_entry_safety_guard / board / credit / position guard は後段で維持。
 # ============================================================
 
 from __future__ import annotations
@@ -73,30 +71,15 @@ def _safe_int(v: Any, default: int = 999999) -> int:
         return int(default)
 
 
-def _unwrap_no_cycle(fn: Any) -> Any:
-    """Best-effort unwrap.  循環していたら最後の安全な関数で止める。"""
-    seen: set[int] = set()
-    cur = fn
-    last = fn
-    try:
-        while callable(cur) and hasattr(cur, "_original"):
-            if id(cur) in seen:
-                return last
-            seen.add(id(cur))
-            last = cur
-            nxt = getattr(cur, "_original", None)
-            if not callable(nxt):
-                return cur
-            cur = nxt
-        return cur
-    except Exception:
-        return fn
-
-
 def _reason_rescuable(reason_s: str) -> bool:
     if reason_s.startswith("RANKING_TECH_"):
         return True
-    if reason_s in {"FILTER_RECURSION", "ORIGINAL_FILTER_RECURSION", "ORIGINAL_FILTER_UNAVAILABLE"}:
+    if reason_s in {
+        "FILTER_RECURSION",
+        "ORIGINAL_FILTER_RECURSION",
+        "ORIGINAL_FILTER_UNAVAILABLE",
+        "FLAT_PRICE_FILTER_RECURSION",
+    }:
         return True
     if _env_bool("RANKING_ENTRY_RESCUE_FLAT_PRICE_REASON", True):
         if reason_s.startswith("BUY_PRICE_NOT_UP") or reason_s.startswith("SELL_PRICE_NOT_DOWN"):
@@ -104,25 +87,47 @@ def _reason_rescuable(reason_s: str) -> bool:
     return False
 
 
+def _is_recursion_reason(reason_s: str) -> bool:
+    return reason_s in {"FILTER_RECURSION", "ORIGINAL_FILTER_RECURSION", "FLAT_PRICE_FILTER_RECURSION"}
+
+
+def _first(row: dict[str, Any], keys: tuple[str, ...], default: Any = None) -> Any:
+    for k in keys:
+        try:
+            v = row.get(k)
+            if v is not None and str(v).strip() != "":
+                return v
+        except Exception:
+            pass
+    return default
+
+
 def _rescue_allowed(row: dict[str, Any], side: str, score: float, reason: Any) -> tuple[bool, dict[str, Any]]:
     reason_s = str(reason or "")
-    rank = _safe_int(row.get("rank_position") or row.get("rank"), 999999)
-    price = _safe_float(row.get("price") or row.get("current_price") or row.get("close"), 0.0)
-    volume = _safe_float(row.get("volume") or row.get("trading_volume"), 0.0)
-    turnover = _safe_float(row.get("turnover") or row.get("trading_value"), 0.0)
-    day = _safe_float(row.get("day_change_pct") or row.get("change_percentage") or row.get("change_rate"), 0.0)
-    rt = str(row.get("rank_type") or row.get("ranking_type") or "")
+    recursion_reason = _is_recursion_reason(reason_s)
 
-    min_score = _env_float("RANKING_ENTRY_RESCUE_MIN_SCORE", 60.0)
-    max_rank = _env_int("RANKING_ENTRY_RESCUE_MAX_RANK", 10)
-    min_turnover = _env_float("RANKING_ENTRY_RESCUE_MIN_TURNOVER", 100000000.0)
-    min_volume = _env_float("RANKING_ENTRY_RESCUE_MIN_VOLUME", 30000.0)
-    min_abs_day = _env_float("RANKING_ENTRY_RESCUE_MIN_ABS_DAY_PCT", 3.0)
+    rank = _safe_int(_first(row, ("rank_position", "rank", "No", "no"), 999999), 999999)
+    price = _safe_float(_first(row, ("price", "current_price", "CurrentPrice", "close"), 0.0), 0.0)
+    volume = _safe_float(_first(row, ("volume", "trading_volume", "TradingVolume"), 0.0), 0.0)
+    turnover = _safe_float(_first(row, ("turnover", "trading_value", "Turnover"), 0.0), 0.0)
+    day = _safe_float(_first(row, ("day_change_pct", "change_percentage", "change_rate", "ChangePercentage", "ChangeRatio"), 0.0), 0.0)
+    rt = str(_first(row, ("rank_type", "ranking_type", "CategoryName"), ""))
+
+    if turnover <= 0 and price > 0 and volume > 0:
+        turnover = price * volume
+
+    # 再帰理由は本来フィルタ結果ではなくパッチ衝突なので、少し緩い専用閾値を使う。
+    min_score = _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_SCORE" if recursion_reason else "RANKING_ENTRY_RESCUE_MIN_SCORE", 60.0)
+    max_rank = _env_int("RANKING_ENTRY_RESCUE_RECURSION_MAX_RANK" if recursion_reason else "RANKING_ENTRY_RESCUE_MAX_RANK", 5 if recursion_reason else 10)
+    min_turnover = _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_TURNOVER" if recursion_reason else "RANKING_ENTRY_RESCUE_MIN_TURNOVER", 300000000.0 if recursion_reason else 100000000.0)
+    min_volume = _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_VOLUME" if recursion_reason else "RANKING_ENTRY_RESCUE_MIN_VOLUME", 30000.0)
+    min_abs_day = _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_ABS_DAY_PCT" if recursion_reason else "RANKING_ENTRY_RESCUE_MIN_ABS_DAY_PCT", 0.0 if recursion_reason else 3.0)
     min_price = _env_float("RANKING_ENTRY_RESCUE_MIN_PRICE", 300.0)
     max_price = _env_float("RANKING_ENTRY_RESCUE_MAX_PRICE", 7000.0)
 
     diag = {
         "reason": reason_s,
+        "recursion_reason": recursion_reason,
         "rank": rank,
         "rank_type": rt,
         "side": side,
@@ -132,6 +137,7 @@ def _rescue_allowed(row: dict[str, Any], side: str, score: float, reason: Any) -
         "turnover": turnover,
         "day": day,
         "min_score": min_score,
+        "max_rank": max_rank,
     }
 
     if not _reason_rescuable(reason_s):
@@ -140,18 +146,26 @@ def _rescue_allowed(row: dict[str, Any], side: str, score: float, reason: Any) -
         return False, {**diag, "ng": "score_low"}
     if rank > max_rank:
         return False, {**diag, "ng": "rank_low"}
-    if price < min_price or price > max_price:
+    if price > 0 and (price < min_price or price > max_price):
         return False, {**diag, "ng": "price_range"}
-    if volume < min_volume:
+    if volume > 0 and volume < min_volume:
         return False, {**diag, "ng": "volume_low"}
-    if turnover < min_turnover:
+    if turnover > 0 and turnover < min_turnover:
         return False, {**diag, "ng": "turnover_low"}
-    if abs(day) < min_abs_day:
+    if min_abs_day > 0 and abs(day) < min_abs_day:
         return False, {**diag, "ng": "day_move_low"}
-    if side == "BUY" and day <= 0:
-        return False, {**diag, "ng": "buy_day_not_positive"}
-    if side == "SELL" and day >= 0:
-        return False, {**diag, "ng": "sell_day_not_negative"}
+    if not recursion_reason:
+        if side == "BUY" and day <= 0:
+            return False, {**diag, "ng": "buy_day_not_positive"}
+        if side == "SELL" and day >= 0:
+            return False, {**diag, "ng": "sell_day_not_negative"}
+    else:
+        # 再帰時でも day が取れていて明確に逆方向なら救済しない。
+        if day != 0:
+            if side == "BUY" and day < 0:
+                return False, {**diag, "ng": "buy_day_negative"}
+            if side == "SELL" and day > 0:
+                return False, {**diag, "ng": "sell_day_positive"}
     return True, {**diag, "rescue": True}
 
 
@@ -166,9 +180,9 @@ def _try_rescue(row: Any, side: str, score: float, reason: Any) -> tuple[bool, s
             row["ranking_filter_rescue"] = True
             row["ranking_filter_rescue_reason"] = str(reason or "")
             row["ranking_filter_rescue_diag"] = str(diag)
-            logger.warning("[RANKING FILTER RESCUE] allow symbol=%s side=%s diag=%s", row.get("symbol"), side, diag)
+            logger.warning("[RANKING FILTER RESCUE] allow symbol=%s side=%s diag=%s", row.get("symbol") or row.get("Symbol"), side, diag)
             return True, "RANKING_FILTER_RESCUE"
-        logger.debug("[RANKING FILTER RESCUE] no rescue symbol=%s side=%s diag=%s", row.get("symbol"), side, diag)
+        logger.info("[RANKING FILTER RESCUE] reject symbol=%s side=%s diag=%s", row.get("symbol") or row.get("Symbol"), side, diag)
         return False, str(reason or "RESCUE_NG")
     except Exception:
         logger.exception("[RANKING FILTER RESCUE] rescue check failed symbol=%s", row.get("symbol") if isinstance(row, dict) else None)
@@ -178,7 +192,6 @@ def _try_rescue(row: Any, side: str, score: float, reason: Any) -> tuple[bool, s
 def _patched_passes_ranking_only_filters(row, side, prev_h, score, parts):
     global _IN_FILTER
     if _IN_FILTER:
-        # 循環呼び出しを検知。originalへ入らず、強条件だけ判定する。
         ok, reason = _try_rescue(row, side, score, "FILTER_RECURSION")
         return ok, reason
 
@@ -212,28 +225,20 @@ def install() -> bool:
         if not callable(cur):
             logger.warning("[RANKING FILTER RESCUE] target unavailable")
             return False
-
-        # 既に古い rescue が入っていても、さらに外側から再帰安全版で包む。
-        if getattr(cur, "_ranking_filter_rescue_v11", False):
+        if getattr(cur, "_ranking_filter_rescue_v12", False):
             _INSTALLED = True
             return True
-
         _ORIG = cur
-        _patched_passes_ranking_only_filters._ranking_filter_rescue_v11 = True  # type: ignore[attr-defined]
+        _patched_passes_ranking_only_filters._ranking_filter_rescue_v12 = True  # type: ignore[attr-defined]
         _patched_passes_ranking_only_filters._original = cur  # type: ignore[attr-defined]
         efr._passes_ranking_only_filters = _patched_passes_ranking_only_filters
-
-        # flat_price_guard 側が古い rescue を original として掴んでいる場合に備え、
-        # 再帰安全版を最終フィルタとして必ず上書きする。
         _INSTALLED = True
         logger.warning(
-            "[RANKING FILTER RESCUE] installed v1.1 recursion_safe=True enabled=%s min_score=%.1f max_rank=%s min_turnover=%.0f min_abs_day=%.2f original=%s",
+            "[RANKING FILTER RESCUE] installed v1.2 recursion_safe=True flat_recursion_rescue=True enabled=%s min_score=%.1f max_rank=%s recursion_max_rank=%s",
             _env_bool("RANKING_ENTRY_STRONG_TECH_RESCUE_ENABLED", True),
             _env_float("RANKING_ENTRY_RESCUE_MIN_SCORE", 60.0),
             _env_int("RANKING_ENTRY_RESCUE_MAX_RANK", 10),
-            _env_float("RANKING_ENTRY_RESCUE_MIN_TURNOVER", 100000000.0),
-            _env_float("RANKING_ENTRY_RESCUE_MIN_ABS_DAY_PCT", 3.0),
-            getattr(cur, "__name__", repr(cur)),
+            _env_int("RANKING_ENTRY_RESCUE_RECURSION_MAX_RANK", 5),
         )
         return True
     except Exception:
