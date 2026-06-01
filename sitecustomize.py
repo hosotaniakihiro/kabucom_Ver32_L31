@@ -1,14 +1,9 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver29-TONOSAMA-SLOPE-RANGE-RESCUE
+# Version: Ver30-ENTRY-LOG-SKIP-REASON-GUARD
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # 失敗しても本体起動は止めない。
-#
-# Ver29:
-#   - TONOSAMAで slope_abs_too_small により、レンジ・出来高が十分な候補まで
-#     落ちるケースへ対応。
-#   - TONOSAMA_SLOPE_RANGE_RESCUE を自動install。
 # ============================================================
 
 from __future__ import annotations
@@ -240,6 +235,7 @@ def _install_summary_mtf_catchup_safely() -> None:
 _write_boot_evidence("PYTHON_START")
 _install_boot_exception_hook()
 _install_tonosama_surge_defaults()
+_install_module("core.startup.entry_log_skip_reason_collision_patch", "ENTRY_LOG_SKIP_GUARD", disabled_env="DISABLE_ENTRY_LOG_SKIP_GUARD")
 _install_module("core.startup.summary_db_date_guard_patch", "SUMMARY_DB_DATE_GUARD", disabled_env="DISABLE_SUMMARY_DB_DATE_GUARD_PATCH")
 _install_module("core.startup.summary_save_quality_guard_patch", "SUMMARY_SAVE_QUALITY_GUARD", disabled_env="DISABLE_SUMMARY_SAVE_QUALITY_GUARD")
 _install_module("core.startup.tonosama_5sec_advisory_patch", "TONOSAMA_5SEC_ADVISORY", disabled_env="DISABLE_TONOSAMA_5SEC_ADVISORY_PATCH")
