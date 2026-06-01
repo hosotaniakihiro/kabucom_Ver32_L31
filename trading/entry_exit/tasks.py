@@ -1,9 +1,17 @@
 # ============================================================
 # File   : trading/entry_exit/tasks.py
-# Version: Ver2.1-FIX-CONTROLLER-TIMEOUT-LOG
+# Version: Ver2.2-FIX-TONOSAMA-OVERLAP-TIMEOUT
 # ------------------------------------------------------------
 # 【目的】
 #   core.entry_exit_tasks shim から解決される実体モジュール。
+#
+# Ver2.2 Fix:
+#   - TONOSAMAが30秒周期なのに timeout 45s + controller 20s で
+#     60秒超になり previous_still_running が出る問題を修正。
+#   - TONOSAMA既定 build timeout を45秒→12秒へ短縮。
+#   - timeout時の controller dispatch は既定OFF。
+#   - timeoutで残ったdaemon threadが生きている間は次回TONOSAMA起動をskip。
+#   - timeout後は短いcooldownを入れ、同時多重実行を防止。
 #
 # Ver2.1 Fix:
 #   - _dispatch_entry_controller() の timeout ログで timeout_sec 引数が不足し、
@@ -33,14 +41,23 @@ _TAG_ENTRY = "entry"
 _TAG_TONOSAMA_ENTRY = "tonosama_entry"
 _TAG_RANKING_ENTRY = "ranking_entry"
 
+_TONOSAMA_ENTRY_RUNNING = False
+_TONOSAMA_ENTRY_STARTED_AT: Optional[dt.datetime] = None
+_TONOSAMA_ENTRY_COOLDOWN_UNTIL: Optional[dt.datetime] = None
+_TONOSAMA_ENTRY_TIMEOUT_STREAK = 0
+_TONOSAMA_ENTRY_ORPHAN_THREAD: Optional[threading.Thread] = None
+_TONOSAMA_ENTRY_LOCK = threading.RLock()
+
 _RANKING_ENTRY_RUNNING = False
 _RANKING_ENTRY_STARTED_AT: Optional[dt.datetime] = None
 _RANKING_ENTRY_COOLDOWN_UNTIL: Optional[dt.datetime] = None
 _RANKING_ENTRY_TIMEOUT_STREAK = 0
 _RANKING_ENTRY_LOCK = threading.RLock()
 
-TONOSAMA_ENTRY_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_TIMEOUT_SEC", "45"))
-TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC", "20"))
+TONOSAMA_ENTRY_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_TIMEOUT_SEC", "12"))
+TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC = float(os.getenv("TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC", "8"))
+TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_SEC = float(os.getenv("TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_SEC", "45"))
+TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC = float(os.getenv("TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC", "180"))
 RANKING_ENTRY_BUILD_TIMEOUT_SEC = float(os.getenv("RANKING_ENTRY_BUILD_TIMEOUT_SEC", "90"))
 RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC = float(os.getenv("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", "20"))
 RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC = float(os.getenv("RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC", "90"))
@@ -166,7 +183,14 @@ def _patch_tonosama_runner_fast_loop() -> None:
         logger.warning("[TONOSAMA FAST LOOP PATCH] failed", exc_info=True)
 
 
-def _run_callable_with_timeout(fn: Callable[..., Any], *, timeout_sec: float, name: str, args: tuple[Any, ...] = (), kwargs: Optional[dict[str, Any]] = None) -> tuple[bool, Any]:
+def _run_callable_with_timeout_thread(
+    fn: Callable[..., Any],
+    *,
+    timeout_sec: float,
+    name: str,
+    args: tuple[Any, ...] = (),
+    kwargs: Optional[dict[str, Any]] = None,
+) -> tuple[bool, Any, Optional[threading.Thread]]:
     result: dict[str, Any] = {"done": False, "ret": None, "err": None}
     kwargs = kwargs or {}
 
@@ -183,10 +207,15 @@ def _run_callable_with_timeout(fn: Callable[..., Any], *, timeout_sec: float, na
     th.join(max(0.1, float(timeout_sec or 0.1)))
     if th.is_alive():
         logger.warning("[%s] timeout -> return to scheduler timeout_sec=%.3f thread_alive=True", name, timeout_sec)
-        return False, None
+        return False, None, th
     if result.get("err") is not None:
         raise result["err"]
-    return True, result.get("ret")
+    return True, result.get("ret"), None
+
+
+def _run_callable_with_timeout(fn: Callable[..., Any], *, timeout_sec: float, name: str, args: tuple[Any, ...] = (), kwargs: Optional[dict[str, Any]] = None) -> tuple[bool, Any]:
+    completed, ret, _th = _run_callable_with_timeout_thread(fn, timeout_sec=timeout_sec, name=name, args=args, kwargs=kwargs)
+    return completed, ret
 
 
 def _dispatch_entry_controller(*, pipeline_source: str, interval: int | None, timeout_sec: float, reason: str) -> bool:
@@ -206,34 +235,88 @@ def _dispatch_entry_controller(*, pipeline_source: str, interval: int | None, ti
     return True
 
 
+def _tonosama_entry_cooldown_seconds() -> float:
+    try:
+        streak = max(1, int(_TONOSAMA_ENTRY_TIMEOUT_STREAK or 1))
+        base = max(1.0, float(TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_SEC))
+        max_sec = max(base, float(TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC))
+        return min(max_sec, base * streak)
+    except Exception:
+        return 45.0
+
+
 def _run_tonosama_entry_safe() -> int:
+    global _TONOSAMA_ENTRY_RUNNING, _TONOSAMA_ENTRY_STARTED_AT, _TONOSAMA_ENTRY_COOLDOWN_UNTIL, _TONOSAMA_ENTRY_TIMEOUT_STREAK, _TONOSAMA_ENTRY_ORPHAN_THREAD
+    started_dt = dt.datetime.now()
     started = time.perf_counter()
+    with _TONOSAMA_ENTRY_LOCK:
+        if _TONOSAMA_ENTRY_COOLDOWN_UNTIL is not None and started_dt < _TONOSAMA_ENTRY_COOLDOWN_UNTIL:
+            remain = (_TONOSAMA_ENTRY_COOLDOWN_UNTIL - started_dt).total_seconds()
+            logger.warning("[TONOSAMA ENTRY SCHEDULE] skipped reason=timeout_cooldown remain=%.1fs until=%s timeout_streak=%s", remain, _TONOSAMA_ENTRY_COOLDOWN_UNTIL, _TONOSAMA_ENTRY_TIMEOUT_STREAK)
+            return 0
+        if _TONOSAMA_ENTRY_ORPHAN_THREAD is not None and _TONOSAMA_ENTRY_ORPHAN_THREAD.is_alive():
+            logger.warning("[TONOSAMA ENTRY SCHEDULE] skipped reason=previous_timeout_thread_still_alive thread=%s", _TONOSAMA_ENTRY_ORPHAN_THREAD.name)
+            return 0
+        _TONOSAMA_ENTRY_ORPHAN_THREAD = None
+        if _TONOSAMA_ENTRY_RUNNING:
+            elapsed = (dt.datetime.now() - _TONOSAMA_ENTRY_STARTED_AT).total_seconds() if _TONOSAMA_ENTRY_STARTED_AT else None
+            logger.warning("[TONOSAMA ENTRY SCHEDULE] skipped reason=previous_still_running started_at=%s elapsed=%s", _TONOSAMA_ENTRY_STARTED_AT, elapsed)
+            return 0
+        _TONOSAMA_ENTRY_RUNNING = True
+        _TONOSAMA_ENTRY_STARTED_AT = started_dt
+
     fn = _resolve_callable("trading.entry.tonosama.runner", "tonosama_loop")
     if not callable(fn):
         logger.warning("[TONOSAMA ENTRY SCHEDULE] skipped reason=runner_unavailable")
+        with _TONOSAMA_ENTRY_LOCK:
+            _TONOSAMA_ENTRY_RUNNING = False
+            _TONOSAMA_ENTRY_STARTED_AT = None
         return 0
+
     try:
         _patch_tonosama_runner_fast_loop()
         before_pending = _pending_count_for_source("TONOSAMA")
         logger.info("[TONOSAMA ENTRY SCHEDULE] fire timeout_sec=%.3f before_pending=%s", TONOSAMA_ENTRY_TIMEOUT_SEC, before_pending)
-        completed, ret = _run_callable_with_timeout(fn, timeout_sec=TONOSAMA_ENTRY_TIMEOUT_SEC, name="TONOSAMA ENTRY SCHEDULE")
+        completed, ret, timeout_thread = _run_callable_with_timeout_thread(fn, timeout_sec=TONOSAMA_ENTRY_TIMEOUT_SEC, name="TONOSAMA ENTRY SCHEDULE")
         after_pending = _pending_count_for_source("TONOSAMA")
         if not completed:
-            logger.warning("[TONOSAMA ENTRY SCHEDULE] timeout skipped_result elapsed=%.3fs pending_count=%s", time.perf_counter() - started, after_pending)
-            if after_pending > 0 and _env_bool("TONOSAMA_DISPATCH_CONTROLLER_ON_TIMEOUT_PENDING", True):
+            with _TONOSAMA_ENTRY_LOCK:
+                _TONOSAMA_ENTRY_TIMEOUT_STREAK += 1
+                _TONOSAMA_ENTRY_ORPHAN_THREAD = timeout_thread
+                cool_sec = _tonosama_entry_cooldown_seconds()
+                _TONOSAMA_ENTRY_COOLDOWN_UNTIL = dt.datetime.now() + dt.timedelta(seconds=cool_sec)
+            logger.warning(
+                "[TONOSAMA ENTRY SCHEDULE] build timeout -> cooldown timeout_sec=%.3f elapsed=%.3fs pending_count=%s timeout_streak=%s cooldown_sec=%.1f until=%s dispatch_on_timeout_pending=%s",
+                TONOSAMA_ENTRY_TIMEOUT_SEC,
+                time.perf_counter() - started,
+                after_pending,
+                _TONOSAMA_ENTRY_TIMEOUT_STREAK,
+                cool_sec,
+                _TONOSAMA_ENTRY_COOLDOWN_UNTIL,
+                _env_bool("TONOSAMA_DISPATCH_CONTROLLER_ON_TIMEOUT_PENDING", False),
+            )
+            if after_pending > before_pending and _env_bool("TONOSAMA_DISPATCH_CONTROLLER_ON_TIMEOUT_PENDING", False):
                 _dispatch_entry_controller(pipeline_source="TONOSAMA", interval=None, timeout_sec=TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC, reason="TONOSAMA ENTRY SCHEDULE TIMEOUT-PENDING")
             return 0
+
+        _TONOSAMA_ENTRY_TIMEOUT_STREAK = 0
+        _TONOSAMA_ENTRY_COOLDOWN_UNTIL = None
+        _TONOSAMA_ENTRY_ORPHAN_THREAD = None
         registered = int(ret or 0)
         logger.info("[TONOSAMA ENTRY SCHEDULE] pending build done registered=%s before_pending=%s after_pending=%s elapsed=%.3fs", registered, before_pending, after_pending, time.perf_counter() - started)
-        if registered > 0 or after_pending > 0:
+        if registered > 0 or after_pending > before_pending:
             _dispatch_entry_controller(pipeline_source="TONOSAMA", interval=None, timeout_sec=TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC, reason="TONOSAMA ENTRY SCHEDULE")
         else:
-            logger.info("[TONOSAMA ENTRY SCHEDULE] no pending created -> controller dispatch skipped")
+            logger.info("[TONOSAMA ENTRY SCHEDULE] no new pending created -> controller dispatch skipped before_pending=%s after_pending=%s", before_pending, after_pending)
         logger.info("[TONOSAMA ENTRY SCHEDULE] done result=%s pending_count=%s elapsed=%.3fs", registered, after_pending, time.perf_counter() - started)
         return registered
     except Exception:
         logger.exception("[TONOSAMA ENTRY SCHEDULE] failed")
         return 0
+    finally:
+        with _TONOSAMA_ENTRY_LOCK:
+            _TONOSAMA_ENTRY_RUNNING = False
+            _TONOSAMA_ENTRY_STARTED_AT = None
 
 
 def _ranking_entry_cooldown_seconds() -> float:
@@ -335,8 +418,10 @@ def register_entry_exit_tasks(*args: Any, **kwargs: Any) -> bool:
         job_r.tag(_TAG_ENTRY)
         job_r.tag(_TAG_RANKING_ENTRY)
         logger.info(
-            "[entry_exit.tasks] registered tonosama every=%ss tag=%s build_timeout=%.1fs controller_timeout=%.1fs ranking every=%smin at :12 tag=%s build_timeout=%.1fs controller_timeout=%.1fs cooldown=%.1f-%0.1fs pending_count_global=True",
+            "[entry_exit.tasks] registered tonosama every=%ss tag=%s build_timeout=%.1fs controller_timeout=%.1fs timeout_cooldown=%.1f-%0.1fs dispatch_timeout_pending=%s ranking every=%smin at :12 tag=%s build_timeout=%.1fs controller_timeout=%.1fs cooldown=%.1f-%0.1fs pending_count_global=True",
             interval_sec, _TAG_TONOSAMA_ENTRY, TONOSAMA_ENTRY_TIMEOUT_SEC, TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC,
+            TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_SEC, TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC,
+            _env_bool("TONOSAMA_DISPATCH_CONTROLLER_ON_TIMEOUT_PENDING", False),
             ranking_interval_min, _TAG_RANKING_ENTRY, RANKING_ENTRY_BUILD_TIMEOUT_SEC, RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC,
             RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC, RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC,
         )
