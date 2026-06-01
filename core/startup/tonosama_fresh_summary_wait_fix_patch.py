@@ -1,23 +1,27 @@
 # ============================================================
 # File   : core/startup/tonosama_fresh_summary_wait_fix_patch.py
-# Version: v1-FIX-FRESH-SUMMARY-WAIT-LOOKUP
+# Version: v2-FIX-FRESH-SUMMARY-WAIT-FAILOPEN
 # ------------------------------------------------------------
 # Purpose:
-#   trading.entry_exit.tasks Ver2.3 added a fresh PUSH summary wait
-#   before TONOSAMA, but it imports a non-existing module-level
-#   get_push_merged_summary from core.global_context.context.
+#   trading.entry_exit.tasks の Tonosama 起動前 fresh summary wait が
+#   latest=None rows=0 のまま skip this cycle になり、Tonosama本体が
+#   一度も起動しない問題を防ぐ。
 #
-#   As a result the wait check returns latest=None rows=0 and TONOSAMA
-#   skips every cycle even though GlobalContext has fresh merged summary.
+# Symptoms:
+#   [TONOSAMA ENTRY SCHEDULE] fresh push summary wait expired
+#   latest=None age=None rows=0 ... -> skip this cycle
 #
-#   This patch replaces tasks._latest_push_summary_age_sec with a robust
-#   implementation that uses global_data/global_context methods and falls
-#   back to get_push_summary / get_merged_summary.
+# Fix:
+#   - _latest_push_summary_age_sec を robust lookup に差し替え。
+#   - _wait_fresh_push_summary_before_tonosama も差し替え。
+#   - latest が取れない場合は Tonosama本体の stale guard に任せるため
+#     fail-open して起動する。
 # ============================================================
 from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 import time
 from typing import Any
 
@@ -26,82 +30,173 @@ _INSTALLED = False
 _INSTALLING = False
 
 
-def _get_gc() -> Any:
+def _env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _candidate_dfs() -> list[tuple[str, Any]]:
+    out: list[tuple[str, Any]] = []
     try:
         import core.global_context.context as ctx
-        return getattr(ctx, "global_data", None) or getattr(ctx, "global_context", None) or getattr(ctx, "GC", None)
-    except Exception:
-        return None
+        for name, fn in (
+            ("module.get_push_merged_summary", lambda: ctx.get_push_merged_summary(1)),
+            ("module.get_merged_summary_push", lambda: ctx.get_merged_summary(1, source="push")),
+            ("module.get_summary_history_push", lambda: ctx.get_summary_history(1, source="push")),
+        ):
+            try:
+                out.append((name, fn()))
+            except Exception:
+                logger.debug("[TONOSAMA FRESH SUMMARY WAIT FIX] module provider failed %s", name, exc_info=True)
 
-
-def _best_push_summary_df(tf: int = 1):
-    try:
-        import pandas as pd
-        gc = _get_gc()
+        gc = getattr(ctx, "global_data", None) or getattr(ctx, "global_context", None) or getattr(ctx, "GC", None)
         if gc is not None:
-            for name, args in (
-                ("get_push_merged_summary", (tf,)),
-                ("get_merged_summary", (tf, "push")),
-                ("get_push_summary", (tf,)),
+            for name, fn in (
+                ("gc.get_push_merged_summary", lambda: gc.get_push_merged_summary(1)),
+                ("gc.get_merged_summary_push", lambda: gc.get_merged_summary(1, source="push")),
+                ("gc.get_summary_history_push", lambda: gc.get_summary_history(1, source="push")),
+                ("gc.get_push_summary", lambda: gc.get_push_summary(1)),
             ):
-                fn = getattr(gc, name, None)
-                if callable(fn):
+                try:
+                    out.append((name, fn()))
+                except TypeError:
                     try:
-                        df = fn(*args)
-                    except TypeError:
-                        if name == "get_merged_summary":
-                            df = fn(tf=tf, source="push")
-                        else:
-                            df = fn(tf)
-                    if isinstance(df, pd.DataFrame) and not df.empty:
-                        return df
+                        if "get_merged_summary" in name:
+                            out.append((name, gc.get_merged_summary(tf=1, source="push")))
+                    except Exception:
+                        pass
+                except Exception:
+                    logger.debug("[TONOSAMA FRESH SUMMARY WAIT FIX] gc provider failed %s", name, exc_info=True)
 
-        # Last-resort legacy attributes used by old GlobalContext code.
-        for attr in ("push_summary_1m", "push_summary_1min", "summary_1m", "merged_summary_1m"):
-            if gc is not None and hasattr(gc, attr):
-                df = getattr(gc, attr)
-                if isinstance(df, pd.DataFrame) and not df.empty:
-                    return df
+            try:
+                for attr in ("merged_summary_1", "push_summary_1", "push_summary_1m", "push_summary_1min", "summary_1m", "merged_summary_1m"):
+                    if hasattr(gc, attr):
+                        out.append((f"gc.attr.{attr}", getattr(gc, attr)))
+            except Exception:
+                pass
     except Exception:
-        logger.debug("[TONOSAMA FRESH SUMMARY WAIT FIX] best df lookup failed", exc_info=True)
+        logger.debug("[TONOSAMA FRESH SUMMARY WAIT FIX] context lookup failed", exc_info=True)
+
+    try:
+        from trading.entry.tonosama.summary_loader import load_merged_summary
+        out.append(("tonosama.summary_loader.load_merged_summary", load_merged_summary(1)))
+    except Exception:
+        logger.debug("[TONOSAMA FRESH SUMMARY WAIT FIX] summary_loader fallback failed", exc_info=True)
+
+    return out
+
+
+def _latest_from_df(df: Any, *, source_name: str) -> tuple[float | None, dt.datetime | None, int, str]:
     try:
         import pandas as pd
-        return pd.DataFrame()
-    except Exception:
-        return None
-
-
-def _patched_latest_push_summary_age_sec() -> tuple[float | None, dt.datetime | None, int]:
-    try:
-        import pandas as pd
-        df = _best_push_summary_df(1)
-        rows = int(len(df)) if df is not None else 0
-        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-            logger.warning("[TONOSAMA FRESH SUMMARY WAIT FIX] no push summary df rows=%s", rows)
-            return None, None, rows
-
-        time_cols = [c for c in ("datetime", "dt", "end_time", "time") if c in df.columns]
-        if not time_cols:
-            logger.warning("[TONOSAMA FRESH SUMMARY WAIT FIX] no time col rows=%s cols=%s", rows, list(df.columns)[:20])
-            return None, None, rows
-
-        s = pd.Series(dtype="datetime64[ns]")
-        for col in time_cols:
-            ss = pd.to_datetime(df[col], errors="coerce").dropna()
-            if not ss.empty:
-                s = ss
+        if df is None or not isinstance(df, pd.DataFrame):
+            return None, None, 0, source_name
+        rows = int(len(df))
+        if df.empty:
+            return None, None, rows, source_name
+        col = None
+        for c in ("datetime", "dt", "end_time", "start_time", "time", "snapshot_time"):
+            if c in df.columns:
+                col = c
                 break
+        if not col:
+            return None, None, rows, source_name
+        s = pd.to_datetime(df[col], errors="coerce").dropna()
         if s.empty:
-            logger.warning("[TONOSAMA FRESH SUMMARY WAIT FIX] time parse empty rows=%s time_cols=%s", rows, time_cols)
-            return None, None, rows
-
+            return None, None, rows, source_name
         latest = s.max().to_pydatetime().replace(tzinfo=None)
         age = (dt.datetime.now() - latest).total_seconds()
-        logger.info("[TONOSAMA FRESH SUMMARY WAIT FIX] latest push summary latest=%s age=%.1fs rows=%s cols=%s", latest, age, rows, len(df.columns))
-        return float(age), latest, rows
+        return float(age), latest, rows, f"{source_name}:{col}"
     except Exception:
-        logger.exception("[TONOSAMA FRESH SUMMARY WAIT FIX] patched latest age failed")
-        return None, None, 0
+        logger.debug("[TONOSAMA FRESH SUMMARY WAIT FIX] latest_from_df failed source=%s", source_name, exc_info=True)
+        return None, None, 0, source_name
+
+
+def _patched_latest_push_summary_age_sec():
+    best_age = None
+    best_dt = None
+    best_rows = 0
+    best_src = "none"
+    for name, df in _candidate_dfs():
+        age, latest, rows, src = _latest_from_df(df, source_name=name)
+        if latest is None:
+            if rows > best_rows:
+                best_age, best_dt, best_rows, best_src = age, latest, rows, src
+            continue
+        if best_dt is None or latest > best_dt:
+            best_age, best_dt, best_rows, best_src = age, latest, rows, src
+    logger.info(
+        "[TONOSAMA FRESH SUMMARY WAIT FIX] latest lookup latest=%s age=%s rows=%s source=%s",
+        best_dt,
+        None if best_age is None else round(float(best_age), 1),
+        best_rows,
+        best_src,
+    )
+    return best_age, best_dt, best_rows
+
+
+def _patched_wait_fresh_push_summary_before_tonosama() -> bool:
+    if not _env_bool("TONOSAMA_WAIT_FRESH_PUSH_SUMMARY", True):
+        return True
+    max_age = max(30.0, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_MAX_AGE_SEC", 180.0))
+    wait_sec = max(0.0, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_WAIT_SEC", 15.0))
+    poll = max(0.25, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_POLL_SEC", 1.0))
+    fail_open_empty = _env_bool("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY", True)
+    deadline = time.perf_counter() + wait_sec
+    last_age = None
+    last_dt = None
+    last_rows = 0
+
+    while True:
+        age, latest, rows = _patched_latest_push_summary_age_sec()
+        last_age, last_dt, last_rows = age, latest, rows
+        if age is not None and age <= max_age:
+            logger.info(
+                "[TONOSAMA ENTRY SCHEDULE] fresh push summary ok latest=%s age=%.1fs rows=%s max_age=%.1fs patched=1",
+                latest,
+                age,
+                rows,
+                max_age,
+            )
+            return True
+        if latest is None and fail_open_empty:
+            logger.warning(
+                "[TONOSAMA ENTRY SCHEDULE] fresh push summary unavailable latest=None rows=%s -> fail-open to Tonosama body patched=1",
+                rows,
+            )
+            return True
+        if time.perf_counter() >= deadline:
+            if last_dt is None and fail_open_empty:
+                logger.warning(
+                    "[TONOSAMA ENTRY SCHEDULE] fresh push summary wait expired latest=None rows=%s -> fail-open to Tonosama body patched=1",
+                    last_rows,
+                )
+                return True
+            logger.warning(
+                "[TONOSAMA ENTRY SCHEDULE] fresh push summary wait expired latest=%s age=%s rows=%s max_age=%.1fs wait_sec=%.1fs -> skip this cycle patched=1",
+                last_dt,
+                None if last_age is None else round(last_age, 1),
+                last_rows,
+                max_age,
+                wait_sec,
+            )
+            return False
+        time.sleep(poll)
 
 
 def _apply() -> bool:
@@ -115,15 +210,17 @@ def _apply() -> bool:
         return False
 
     try:
-        cur = getattr(tasks, "_latest_push_summary_age_sec", None)
-        if getattr(cur, "_tonosama_fresh_summary_wait_fix_v1", False):
+        cur = getattr(tasks, "_wait_fresh_push_summary_before_tonosama", None)
+        if getattr(cur, "_tonosama_fresh_summary_wait_fix_v2", False):
             _INSTALLED = True
             return True
-        _patched_latest_push_summary_age_sec._tonosama_fresh_summary_wait_fix_v1 = True  # type: ignore[attr-defined]
-        _patched_latest_push_summary_age_sec._original = cur  # type: ignore[attr-defined]
+        _patched_latest_push_summary_age_sec._tonosama_fresh_summary_wait_fix_v2 = True  # type: ignore[attr-defined]
+        _patched_wait_fresh_push_summary_before_tonosama._tonosama_fresh_summary_wait_fix_v2 = True  # type: ignore[attr-defined]
         setattr(tasks, "_latest_push_summary_age_sec", _patched_latest_push_summary_age_sec)
+        setattr(tasks, "_wait_fresh_push_summary_before_tonosama", _patched_wait_fresh_push_summary_before_tonosama)
+        os.environ.setdefault("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY", "1")
         _INSTALLED = True
-        logger.warning("[TONOSAMA FRESH SUMMARY WAIT FIX] installed v1 patched=trading.entry_exit.tasks._latest_push_summary_age_sec")
+        logger.warning("[TONOSAMA FRESH SUMMARY WAIT FIX] installed v2 patched latest+wait fail_open_empty=%s", os.environ.get("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY"))
         return True
     except Exception:
         logger.exception("[TONOSAMA FRESH SUMMARY WAIT FIX] apply failed")
@@ -140,7 +237,7 @@ def install(retry: bool = True) -> bool:
         def _retry_loop() -> None:
             global _INSTALLING
             try:
-                for _ in range(60):
+                for _ in range(80):
                     if _apply():
                         return
                     time.sleep(0.2)
