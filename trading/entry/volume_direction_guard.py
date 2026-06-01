@@ -1,19 +1,27 @@
 # ============================================================
 # File   : trading/entry/volume_direction_guard.py
-# Version: V4-TONOSAMA-3M-5M-CANDLE-GUARD
+# Version: V5-TONOSAMA-3M5M-CANDLE-GUARD-SOFT-MISSING
 # ------------------------------------------------------------
 # 目的:
 #   SUMMARY / RANKING / TONOSAMA の3種類すべてのエントリーで、
 #   出来高急増を単独評価せず、価格方向と直前トレンドを合わせて判定する。
 #
-# 方針:
-#   - BUYで「上がってきて出来高急増」は、買い遅れ・利確売り・天井掴みを警戒して拒否。
-#   - SELLで「下がってきて出来高急増」は、売り遅れ・買戻し・底売りを警戒して拒否。
-#   - BUYで「1分足5MAが下向き、かつ株価が5MAより下」は逆張りになるため拒否。
-#   - SELLで「1分足5MAが上向き、かつ株価が5MAより上」は逆張りになるため拒否。
-#   - RANKING / TONOSAMA はランキングスナップショット由来の5MAを優先する。
-#   - TONOSAMA BUY は3分足または5分足が陽線になり始めた銘柄を優先する。
-#   - TONOSAMA SELL は3分足または5分足が陰線になり始めた銘柄を優先する。
+# V5 Fix:
+#   - TONOSAMA pending から entry_controller に渡る行では、3m/5m専用OHLC
+#     が欠けることがある。その場合に _ohlc_from_row() が unsuffixed の
+#     open/close を3m/5mとして流用し、
+#       TONOSAMA_BUY_REJECT_NO_STRONG_3M5M_BULLISH_CANDLE
+#     で hard reject していた。
+#   - ログ上も vol=0.000 move=0.000 trend=0.500 で、実際には方向判定用
+#     データ不足なのに「強い3m/5m陽線なし」として落としていた。
+#   - TONOSAMAの3m/5m candle guardでは、まず interval専用OHLCだけを見る。
+#     無ければ summary_loader から補完する。
+#   - それでも directional evidence が弱い/欠損の場合は、既定で WARN 扱い
+#     にして Tonosama dedicated gate / pending側の判定を優先する。
+#
+# Safety:
+#   - 1m MA5方向ガード、出来高方向ガードは維持。
+#   - 明確な同方向クライマックス/逆方向データがある場合の拒否は維持可能。
 # ============================================================
 
 from __future__ import annotations
@@ -150,7 +158,6 @@ def _ranking_snapshot_ma_from_db(symbol: str) -> dict[str, float]:
     cached = _RANKING_MA_CACHE.get(symbol)
     if cached and now - cached[0] <= ttl:
         return dict(cached[1])
-
     try:
         db = _ranking_db_path()
         if not db or not os.path.exists(db):
@@ -261,62 +268,93 @@ def _evaluate_ma5_direction(row: dict, side: str) -> dict:
     return {"ok": not reject, "reason": reason, "action": "REJECT" if reject else "PASS", "side": side, "close": close, "ma5": ma5, "ma5_slope": slope, "price_ma5_gap_pct": gap_pct, "ma5_source": ma_source}
 
 
-def _ohlc_from_row(row: dict, interval: int) -> tuple[float, float, float, float]:
+def _interval_specific_names(interval: int, base: str) -> list[str]:
     suffixes = [f"_{interval}m", f"{interval}m", f"_{interval}min", f"{interval}min"]
-    open_names = [f"open{s}" for s in suffixes] + [f"open_price{s}" for s in suffixes] + [f"o{interval}"]
-    high_names = [f"high{s}" for s in suffixes] + [f"high_price{s}" for s in suffixes] + [f"h{interval}"]
-    low_names = [f"low{s}" for s in suffixes] + [f"low_price{s}" for s in suffixes] + [f"l{interval}"]
-    close_names = [f"close{s}" for s in suffixes] + [f"close_price{s}" for s in suffixes] + [f"c{interval}"]
-    if interval == 5:
-        open_names += ["five_min_open"]
-        high_names += ["five_min_high"]
-        low_names += ["five_min_low"]
-        close_names += ["five_min_close"]
-    if interval == 3:
-        open_names += ["three_min_open"]
-        high_names += ["three_min_high"]
-        low_names += ["three_min_low"]
-        close_names += ["three_min_close"]
-    open_names += ["open", "open_price"]
-    high_names += ["high", "high_price"]
-    low_names += ["low", "low_price"]
-    close_names += ["close", "close_price", "current_price", "price"]
-    return (_first_num(row, open_names, 0.0), _first_num(row, high_names, 0.0), _first_num(row, low_names, 0.0), _first_num(row, close_names, 0.0))
+    out = [f"{base}{s}" for s in suffixes]
+    if base == "open":
+        out += [f"open_price{s}" for s in suffixes]
+        out += [f"o{interval}"]
+        if interval == 5:
+            out += ["five_min_open"]
+        if interval == 3:
+            out += ["three_min_open"]
+    elif base == "high":
+        out += [f"high_price{s}" for s in suffixes]
+        out += [f"h{interval}"]
+        if interval == 5:
+            out += ["five_min_high"]
+        if interval == 3:
+            out += ["three_min_high"]
+    elif base == "low":
+        out += [f"low_price{s}" for s in suffixes]
+        out += [f"l{interval}"]
+        if interval == 5:
+            out += ["five_min_low"]
+        if interval == 3:
+            out += ["three_min_low"]
+    elif base == "close":
+        out += [f"close_price{s}" for s in suffixes]
+        out += [f"c{interval}"]
+        if interval == 5:
+            out += ["five_min_close"]
+        if interval == 3:
+            out += ["three_min_close"]
+    return out
 
 
-def _load_candle_from_summary(symbol: str, interval: int) -> tuple[float, float, float, float]:
+def _ohlc_from_row(row: dict, interval: int, *, allow_unsuffixed: bool = True) -> tuple[float, float, float, float, str]:
+    open_names = _interval_specific_names(interval, "open")
+    high_names = _interval_specific_names(interval, "high")
+    low_names = _interval_specific_names(interval, "low")
+    close_names = _interval_specific_names(interval, "close")
+    open_p = _first_num(row, open_names, 0.0)
+    high_p = _first_num(row, high_names, 0.0)
+    low_p = _first_num(row, low_names, 0.0)
+    close_p = _first_num(row, close_names, 0.0)
+    if open_p > 0 and close_p > 0:
+        return open_p, high_p, low_p, close_p, "entry_row_interval_specific"
+    if allow_unsuffixed:
+        open_p = _first_num(row, ["open", "open_price"], 0.0)
+        high_p = _first_num(row, ["high", "high_price"], 0.0)
+        low_p = _first_num(row, ["low", "low_price"], 0.0)
+        close_p = _first_num(row, ["close", "close_price", "current_price", "price"], 0.0)
+        return open_p, high_p, low_p, close_p, "entry_row_unsuffixed"
+    return 0.0, 0.0, 0.0, 0.0, "entry_row_interval_missing"
+
+
+def _load_candle_from_summary(symbol: str, interval: int) -> tuple[float, float, float, float, str]:
     if not symbol:
-        return 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, "summary_no_symbol"
     try:
         from trading.entry.tonosama.summary_loader import load_merged_summary, normalize_summary_base
         raw = load_merged_summary(interval)
         x = normalize_summary_base(raw, interval=interval)
         if x is None or x.empty or "symbol" not in x.columns:
-            return 0.0, 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0, f"summary_{interval}m_empty"
         x = x.copy()
         x["symbol"] = x["symbol"].astype(str)
         x = x[x["symbol"] == str(symbol)]
         if x.empty:
-            return 0.0, 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0, f"summary_{interval}m_symbol_missing"
         if "datetime" in x.columns:
             x["datetime"] = pd.to_datetime(x["datetime"], errors="coerce")
             x = x.sort_values("datetime")
         r = x.tail(1).iloc[0].to_dict()
-        return _ohlc_from_row(r, interval)
+        o, h, l, c, _src = _ohlc_from_row(r, interval, allow_unsuffixed=True)
+        return o, h, l, c, f"summary_{interval}m"
     except Exception:
         logger.exception("[ENTRY VOLUME DIRECTION GUARD] %sm candle load failed symbol=%s", interval, symbol)
-        return 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, f"summary_{interval}m_error"
 
 
 def _eval_candle(row: dict, side: str, interval: int) -> dict:
-    open_p, high_p, low_p, close_p = _ohlc_from_row(row, interval)
-    source = "entry_row"
+    # TONOSAMAでは unsuffixed の1m OHLCを3m/5mとして誤用しない。
+    allow_unsuffixed = not _is_tonosama(row)
+    open_p, high_p, low_p, close_p, source = _ohlc_from_row(row, interval, allow_unsuffixed=allow_unsuffixed)
     if open_p <= 0 or close_p <= 0:
-        open_p, high_p, low_p, close_p = _load_candle_from_summary(_symbol(row), interval)
-        source = f"summary_{interval}m"
+        open_p, high_p, low_p, close_p, source = _load_candle_from_summary(_symbol(row), interval)
     if open_p <= 0 or close_p <= 0:
         return {"ok": False, "usable": False, "reason": f"TONOSAMA_{interval}M_CANDLE_MISSING", "interval": interval, "source": source}
-
     body_pct = (close_p - open_p) / open_p * 100.0
     abs_body_pct = abs(body_pct)
     min_body_pct = _env_float(f"TONOSAMA_{interval}M_CANDLE_MIN_BODY_PCT", _env_float("TONOSAMA_3M5M_CANDLE_MIN_BODY_PCT", 0.03))
@@ -326,7 +364,6 @@ def _eval_candle(row: dict, side: str, interval: int) -> dict:
     wick_base = max(upper, lower, 0.000001)
     body_to_wick = body / wick_base
     min_body_to_wick = _env_float("TONOSAMA_3M5M_CANDLE_MIN_BODY_TO_WICK", 0.35)
-
     ok = True
     reason = f"TONOSAMA_{interval}M_CANDLE_OK"
     if side == "BUY":
@@ -349,8 +386,28 @@ def _eval_candle(row: dict, side: str, interval: int) -> dict:
         elif body_to_wick < min_body_to_wick:
             ok = False
             reason = f"TONOSAMA_SELL_REJECT_{interval}M_BODY_WEAK_VS_WICK"
-
     return {"ok": ok, "usable": True, "reason": reason, "interval": interval, "side": side, "open": open_p, "high": high_p, "low": low_p, "close": close_p, "body_pct": body_pct, "body_to_wick": body_to_wick, "source": source}
+
+
+def _tonosama_soft_allow_candle(row: dict, side: str, eval3: dict, eval5: dict) -> tuple[bool, str]:
+    if not _env_bool("TONOSAMA_3M5M_CANDLE_SOFT_ALLOW_IF_INCONCLUSIVE", True):
+        return False, "disabled"
+    # 3m/5m専用データが取れず、entry_rowの1m値だけで拒否していたケースを救済。
+    usable = [e for e in (eval3, eval5) if e.get("usable")]
+    interval_specific = [e for e in usable if str(e.get("source") or "").startswith("entry_row_interval_specific")]
+    summary_src = [e for e in usable if str(e.get("source") or "").startswith("summary_")]
+    if not usable:
+        return True, "no_usable_candle_failopen"
+    # summaryから取れていても、pending側のTonosama score/AIが強い場合はwarnに留める。
+    score = abs(_first_num(row, ["score", "final_score", "display_score", "score_buy", "score_sell"], 0.0))
+    vol = _volume_surge_ratio(row)
+    move = abs(_price_change_pct(row))
+    trend = abs(_trend_score(row))
+    min_score = _env_float("TONOSAMA_3M5M_CANDLE_SOFT_MIN_SCORE", 2.0)
+    # ログで vol=0/move=0 のような「entry_controller側で特徴量が落ちている」場合は、scoreだけで判定する。
+    if score >= min_score and (not interval_specific or summary_src or (vol <= 0 and move <= 0 and trend <= 0.75)):
+        return True, f"soft_score_pass score={score:.3f} vol={vol:.3f} move={move:.3f} trend={trend:.3f}"
+    return False, f"soft_ng score={score:.3f} vol={vol:.3f} move={move:.3f} trend={trend:.3f}"
 
 
 def _evaluate_tonosama_3m5m_candle(row: dict, side: str) -> dict:
@@ -358,29 +415,27 @@ def _evaluate_tonosama_3m5m_candle(row: dict, side: str) -> dict:
         return {"ok": True, "reason": "TONOSAMA_3M5M_CANDLE_DISABLED", "action": "PASS"}
     if not _is_tonosama(row):
         return {"ok": True, "reason": "NOT_TONOSAMA", "action": "PASS"}
-
     eval3 = _eval_candle(row, side, 3)
     eval5 = _eval_candle(row, side, 5)
     usable = [e for e in [eval3, eval5] if e.get("usable")]
     passed = [e for e in usable if e.get("ok")]
-
     mode = _safe_str(os.getenv("TONOSAMA_3M5M_CANDLE_MODE") or "ANY").upper()
     if mode == "BOTH":
         ok = len(usable) >= 2 and len(passed) >= 2
     else:
         ok = len(passed) >= 1
-
     if not usable:
         if _env_bool("TONOSAMA_3M5M_CANDLE_FAIL_OPEN", True):
             return {"ok": True, "reason": "TONOSAMA_3M5M_CANDLE_MISSING_PASS", "action": "PASS", "candle_3m": eval3, "candle_5m": eval5}
         return {"ok": False, "reason": "TONOSAMA_REJECT_3M5M_CANDLE_MISSING", "action": "REJECT", "candle_3m": eval3, "candle_5m": eval5}
-
     if not ok:
         reason = "TONOSAMA_BUY_REJECT_NO_STRONG_3M5M_BULLISH_CANDLE" if side == "BUY" else "TONOSAMA_SELL_REJECT_NO_STRONG_3M5M_BEARISH_CANDLE"
+        soft_ok, soft_reason = _tonosama_soft_allow_candle(row, side, eval3, eval5)
+        if soft_ok:
+            return {"ok": True, "reason": reason + "_WARN_ONLY_" + soft_reason, "action": "WARN", "mode": mode, "candle_3m": eval3, "candle_5m": eval5}
         if not _env_bool("TONOSAMA_3M5M_CANDLE_REJECT", True):
             return {"ok": True, "reason": reason + "_WARN_ONLY", "action": "WARN", "mode": mode, "candle_3m": eval3, "candle_5m": eval5}
-        return {"ok": False, "reason": reason, "action": "REJECT", "mode": mode, "candle_3m": eval3, "candle_5m": eval5}
-
+        return {"ok": False, "reason": reason, "action": "REJECT", "mode": mode, "candle_3m": eval3, "candle_5m": eval5, "soft_reason": soft_reason}
     return {"ok": True, "reason": "TONOSAMA_3M5M_CANDLE_OK", "action": "PASS", "mode": mode, "candle_3m": eval3, "candle_5m": eval5}
 
 
@@ -443,22 +498,17 @@ def evaluate_volume_direction(row: dict) -> dict:
         return {"ok": True, "reason": "DISABLED", "action": "PASS"}
     if not isinstance(row, dict):
         return {"ok": True, "reason": "ROW_INVALID_PASS", "action": "PASS"}
-
     side = _infer_side(row)
-
     candle_eval = _evaluate_tonosama_3m5m_candle(row, side)
     if not candle_eval.get("ok", True):
         return {"ok": False, "reason": candle_eval.get("reason"), "action": "REJECT", "side": side, "candle_eval": candle_eval, "volume_surge_ratio": _volume_surge_ratio(row), "price_change_pct": _price_change_pct(row), "trend_score": _trend_score(row), "trend_direction": "TONOSAMA_3M5M_CANDLE_REJECT"}
-
     ma5_eval = _evaluate_ma5_direction(row, side)
     if not ma5_eval.get("ok", True):
         return {"ok": False, "reason": ma5_eval.get("reason"), "action": "REJECT", "side": side, "ma5_eval": ma5_eval, "candle_eval": candle_eval, "volume_surge_ratio": _volume_surge_ratio(row), "price_change_pct": _price_change_pct(row), "trend_score": _trend_score(row), "trend_direction": "MA5_REJECT"}
-
     vol = _volume_surge_ratio(row)
     min_vol = _env_float("ENTRY_VOLUME_DIRECTION_MIN_SURGE_RATIO", 2.0)
     if vol < min_vol:
         return {"ok": True, "reason": "VOLUME_SURGE_LOW", "action": "PASS", "side": side, "volume_surge_ratio": vol, "ma5_eval": ma5_eval, "candle_eval": candle_eval}
-
     move = _price_change_pct(row)
     move_eps = _env_float("ENTRY_VOLUME_DIRECTION_PRICE_EPS_PCT", 0.15)
     trend = _trend_score(row)
@@ -473,7 +523,6 @@ def evaluate_volume_direction(row: dict) -> dict:
         direction = "DOWN_FROM_FLAT"
     else:
         direction = "FLAT_UNKNOWN"
-
     reject = False
     if side == "BUY" and direction in {"UP", "UP_FROM_FLAT"}:
         reject = True
