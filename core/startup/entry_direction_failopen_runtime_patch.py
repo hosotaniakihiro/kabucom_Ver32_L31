@@ -1,25 +1,18 @@
 # ============================================================
 # File   : core/startup/entry_direction_failopen_runtime_patch.py
-# Version: Ver04-REVERSE-AGAINST-CLEAR-TREND
+# Version: Ver05-NO-REVERSE-WHEN-SCORE-DOMINANT
 # ------------------------------------------------------------
 # SUMMARY_AI の方向確認ガードで RecursionError / pure guard False が出た場合の runtime patch。
+#
+# Ver05:
+#   - buy_score/sell_score が明確に現在sideを支持している場合は、
+#     MA同値・MTF加点だけを理由に SELL->BUY / BUY->SELL へ反転しない。
+#   - close == ma5 == ma25 == ma75 の同値状態では ma_bull/ma_bear を同時成立させない。
+#   - 反転は「現在sideスコアが弱く、反対方向が明確」な場合だけに限定。
 #
 # Ver04:
 #   - pure guard 側で recursion detected -> NG になった場合でも、
 #     SUMMARY_AI 候補を即ブロックせず、明確な逆トレンドなら side を反転して通す。
-#   - SELL候補なのに上昇トレンドが明確: SELL -> BUY に反転
-#   - BUY候補なのに下降トレンドが明確: BUY -> SELL に反転
-#   - 反転した場合は direction_safety_reversed / original_side / reverse_reason を行に付与
-#   - 反転できない場合だけ従来どおりブロックまたは fail-open 判定
-#
-# ENV:
-#   ENTRY_DIRECTION_FAILOPEN_FOR_SUMMARY_AI_BUY=1
-#   ENTRY_DIRECTION_FAILOPEN_FOR_SUMMARY_AI_SELL=1
-#   ENTRY_BLOCK_SELL_IN_BULLISH_TREND=1
-#   ENTRY_BLOCK_BUY_IN_BEARISH_TREND=1
-#   ENTRY_DIRECTION_REVERSE_AGAINST_CLEAR_TREND=1
-#   ENTRY_DIRECTION_REVERSE_HALF_SIZE=1
-#   ENTRY_TREND_BLOCK_MIN_POINTS=2
 # ============================================================
 
 from __future__ import annotations
@@ -39,9 +32,9 @@ def _env_bool(name: str, default: bool = True) -> bool:
         if v is None or str(v).strip() == "":
             return bool(default)
         s = str(v).strip().lower()
-        if s in {"1", "true", "yes", "y", "on", "ok"}:
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
             return True
-        if s in {"0", "false", "no", "n", "off", "ng"}:
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
             return False
         return bool(default)
     except Exception:
@@ -56,6 +49,16 @@ def _env_int(name: str, default: int) -> int:
         return int(float(v))
     except Exception:
         return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -159,8 +162,9 @@ def _trend_diag(row: Any) -> dict[str, Any]:
 
     macd_diff = hist if hist != 0 else macd - signal
 
-    ma_bull = bool(close > 0 and ma5 > 0 and ma25 > 0 and ma75 > 0 and close >= ma5 >= ma25 >= ma75)
-    ma_bear = bool(close > 0 and ma5 > 0 and ma25 > 0 and ma75 > 0 and close <= ma5 <= ma25 <= ma75)
+    # 同値 close==ma5==ma25==ma75 を bullish/bearish 両方にしない。
+    ma_bull = bool(close > 0 and ma5 > 0 and ma25 > 0 and ma75 > 0 and close > ma5 and ma5 >= ma25 >= ma75)
+    ma_bear = bool(close > 0 and ma5 > 0 and ma25 > 0 and ma75 > 0 and close < ma5 and ma5 <= ma25 <= ma75)
     price_above_ma = bool(close > 0 and ((ma25 > 0 and close > ma25) or (ma75 > 0 and close > ma75)))
     price_below_ma = bool(close > 0 and ((ma25 > 0 and close < ma25) or (ma75 > 0 and close < ma75)))
     bar_green = bool(close > 0 and open_ > 0 and close > open_)
@@ -213,28 +217,54 @@ def _trend_diag(row: Any) -> dict[str, Any]:
     }
 
 
-def _is_bullish_trend_for_sell(row: Any) -> bool:
+def _score_supports_current_side(side: str, diag: dict[str, Any]) -> bool:
+    """AI/score が明確に現在sideを支持しているなら、方向ガードで反転しない。"""
+    if not _env_bool("ENTRY_DIRECTION_KEEP_SCORE_DOMINANT_SIDE", True):
+        return False
+    side_u = str(side or "").upper()
+    buy_score = _safe_float(diag.get("buy_score"), 0.0)
+    sell_score = _safe_float(diag.get("sell_score"), 0.0)
+    min_score = _env_float("ENTRY_DIRECTION_KEEP_MIN_SCORE", 0.000001)
+    margin = _env_float("ENTRY_DIRECTION_KEEP_SCORE_MARGIN", 0.0)
+    if side_u == "SELL":
+        return sell_score >= min_score and sell_score >= buy_score + margin
+    if side_u == "BUY":
+        return buy_score >= min_score and buy_score >= sell_score + margin
+    return False
+
+
+def _is_bullish_trend_for_sell(row: Any, diag: dict[str, Any] | None = None) -> bool:
     if not _env_bool("ENTRY_BLOCK_SELL_IN_BULLISH_TREND", True):
         return False
-    diag = _trend_diag(row)
+    diag = diag or _trend_diag(row)
+    if _score_supports_current_side("SELL", diag):
+        return False
     min_points = max(1, _env_int("ENTRY_TREND_BLOCK_MIN_POINTS", 2))
-    return int(diag.get("bullish_points") or 0) >= min_points
+    gap = _env_int("ENTRY_TREND_BLOCK_POINT_GAP", 1)
+    bull = int(diag.get("bullish_points") or 0)
+    bear = int(diag.get("bearish_points") or 0)
+    return bull >= min_points and bull >= bear + gap
 
 
-def _is_bearish_trend_for_buy(row: Any) -> bool:
+def _is_bearish_trend_for_buy(row: Any, diag: dict[str, Any] | None = None) -> bool:
     if not _env_bool("ENTRY_BLOCK_BUY_IN_BEARISH_TREND", True):
         return False
-    diag = _trend_diag(row)
+    diag = diag or _trend_diag(row)
+    if _score_supports_current_side("BUY", diag):
+        return False
     min_points = max(1, _env_int("ENTRY_TREND_BLOCK_MIN_POINTS", 2))
-    return int(diag.get("bearish_points") or 0) >= min_points
+    gap = _env_int("ENTRY_TREND_BLOCK_POINT_GAP", 1)
+    bull = int(diag.get("bullish_points") or 0)
+    bear = int(diag.get("bearish_points") or 0)
+    return bear >= min_points and bear >= bull + gap
 
 
 def _against_clear_trend(row: Any) -> tuple[bool, str, dict[str, Any]]:
     side = _side(row)
     diag = _trend_diag(row)
-    if side == "SELL" and _is_bullish_trend_for_sell(row):
+    if side == "SELL" and _is_bullish_trend_for_sell(row, diag):
         return True, "sell_in_bullish_trend", diag
-    if side == "BUY" and _is_bearish_trend_for_buy(row):
+    if side == "BUY" and _is_bearish_trend_for_buy(row, diag):
         return True, "buy_in_bearish_trend", diag
     return False, "", diag
 
@@ -256,6 +286,13 @@ def _reverse_against_trend(row: Any, reason: str, against_reason: str, diag: dic
         return False
 
     old_side = _side(row)
+    if _score_supports_current_side(old_side, diag):
+        logger.warning(
+            "[ENTRY DIRECTION SAFETY] KEEP score-dominant side symbol=%s side=%s against=%s reason=%s diag=%s",
+            _symbol(row), old_side, against_reason, reason, diag,
+        )
+        return False
+
     new_side = _opposite_side(old_side)
     if new_side not in {"BUY", "SELL"} or new_side == old_side:
         return False
@@ -271,8 +308,6 @@ def _reverse_against_trend(row: Any, reason: str, against_reason: str, diag: dic
     _set_row_value(row, "direction_safety_diag", str(diag))
 
     if _env_bool("ENTRY_DIRECTION_REVERSE_HALF_SIZE", True):
-        # 逆方向に切り替える場合は安全側で半ロット指定を付ける。
-        # 実数量計算側が未対応でも、既存キーを壊さない。
         for key in ("lot_multiplier", "qty_multiplier"):
             try:
                 cur = _safe_float(_row_to_dict(row).get(key), 1.0)
@@ -303,6 +338,12 @@ def _maybe_failopen(row: Any, reason: str) -> bool:
 
     against, against_reason, diag = _against_clear_trend(row)
     if against:
+        if _score_supports_current_side(side, diag):
+            logger.warning(
+                "[ENTRY DIRECTION SAFETY] KEEP SUMMARY_AI score-dominant side symbol=%s side=%s against=%s reason=%s diag=%s",
+                symbol, side, against_reason, reason, diag,
+            )
+            return True
         if _reverse_against_trend(row, reason, against_reason, diag):
             return True
         logger.warning(
@@ -344,6 +385,13 @@ def _patched_check_entry_direction_confirm(entry_row: Any = None, *args, **kwarg
         if ok:
             against, against_reason, diag = _against_clear_trend(entry_row)
             if _is_summary_ai(entry_row) and against:
+                side = _side(entry_row)
+                if _score_supports_current_side(side, diag):
+                    logger.warning(
+                        "[ENTRY DIRECTION SAFETY] KEEP despite trend diag because score supports current side symbol=%s side=%s against=%s diag=%s",
+                        _symbol(entry_row), side, against_reason, diag,
+                    )
+                    return True
                 if _reverse_against_trend(entry_row, "original_guard_ok_but_against_trend", against_reason, diag):
                     return True
                 logger.warning(
@@ -375,17 +423,16 @@ def install() -> bool:
         from core.startup import entry_direction_confirm_guard_patch as ed
 
         cur = getattr(ed, "check_entry_direction_confirm", None)
-        if getattr(cur, "_entry_direction_failopen_patch_v4", False):
+        if getattr(cur, "_entry_direction_failopen_patch_v5", False):
             _INSTALLED = True
             return True
-
         _ORIG_CHECK = cur
-        _patched_check_entry_direction_confirm._entry_direction_failopen_patch_v4 = True  # type: ignore[attr-defined]
+        _patched_check_entry_direction_confirm._entry_direction_failopen_patch_v5 = True  # type: ignore[attr-defined]
         ed.check_entry_direction_confirm = _patched_check_entry_direction_confirm
 
         _INSTALLED = True
         logger.warning(
-            "[ENTRY DIRECTION SAFETY] installed v4 buy_failopen=%s sell_failopen=%s block_sell_bullish=%s block_buy_bearish=%s reverse_against_trend=%s reverse_half_size=%s min_points=%s",
+            "[ENTRY DIRECTION SAFETY] installed v5 buy_failopen=%s sell_failopen=%s block_sell_bullish=%s block_buy_bearish=%s reverse_against_trend=%s reverse_half_size=%s min_points=%s point_gap=%s keep_score_dominant=%s keep_min_score=%s",
             _env_bool("ENTRY_DIRECTION_FAILOPEN_FOR_SUMMARY_AI_BUY", True),
             _env_bool("ENTRY_DIRECTION_FAILOPEN_FOR_SUMMARY_AI_SELL", True),
             _env_bool("ENTRY_BLOCK_SELL_IN_BULLISH_TREND", True),
@@ -393,6 +440,9 @@ def install() -> bool:
             _env_bool("ENTRY_DIRECTION_REVERSE_AGAINST_CLEAR_TREND", True),
             _env_bool("ENTRY_DIRECTION_REVERSE_HALF_SIZE", True),
             _env_int("ENTRY_TREND_BLOCK_MIN_POINTS", 2),
+            _env_int("ENTRY_TREND_BLOCK_POINT_GAP", 1),
+            _env_bool("ENTRY_DIRECTION_KEEP_SCORE_DOMINANT_SIDE", True),
+            _env_float("ENTRY_DIRECTION_KEEP_MIN_SCORE", 0.000001),
         )
         return True
     except Exception as e:
