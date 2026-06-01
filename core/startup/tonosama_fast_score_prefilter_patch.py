@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/tonosama_fast_score_prefilter_patch.py
-# Version: V2-TONOSAMA-AI-SOFT-RESCUE
+# Version: V3-TONOSAMA-AI-SOFT-RESCUE-ZERO-SURGE-SCORE
 # ------------------------------------------------------------
 # 目的:
 #   殿様イナゴの処理時間が candidates=11 registered=0 でも19秒程度かかる問題を軽減する。
@@ -8,20 +8,15 @@
 # Ver2:
 #   - 価格変化/傾きがわずかに閾値未満でも、出来高・レンジ・方向が十分な候補は
 #     AI fallback OK としてPENDING登録へ進める。
-#   - buying/selling climax や direction_ng は救済しない。
-#   - SUMMARY/RANKINGには影響させない。
 #
-# ENV:
-#   TONOSAMA_FAST_SCORE_PREFILTER=1
-#   TONOSAMA_FAST_SCORE_PREFILTER_RATIO=1.00
-#   TONOSAMA_FAST_SCORE_PREFILTER_MIN=0
-#   TONOSAMA_FAST_SCORE_AI_SHORT_CIRCUIT=1
-#   TONOSAMA_AI_SOFT_RESCUE=1
-#   TONOSAMA_AI_RESCUE_MIN_VOLUME=500000
-#   TONOSAMA_AI_RESCUE_MIN_RANGE_PCT=4.0
-#   TONOSAMA_AI_RESCUE_MIN_SURGE=3.0
-#   TONOSAMA_AI_RESCUE_MIN_PRICE_CHANGE_PCT=0.08
-#   TONOSAMA_AI_RESCUE_MIN_SLOPE_ABS=0.0003
+# Ver3:
+#   - 3m/5m PUSH merged が古い Yahoo 復旧データのままになると、volume_surge.py は
+#     controlled fail-open しても _max_volume_surge_ratio=0 のfeature dfを返す。
+#   - その結果、prepare_entry_scores 後の _tonosama_score が -0.0x〜1.0 程度になり、
+#     fast score prefilter threshold=2.3 で候補0件になる。
+#   - 1m側の出来高・レンジ・MTFが十分な場合だけ、Tonosama限定で
+#     _max_volume_surge_ratio を fail-open 値に補完し、pre_5sec scoreを救済する。
+#   - クライマックス/方向NGは後段のpending/AI/final guardで維持する。
 # ============================================================
 
 from __future__ import annotations
@@ -54,7 +49,7 @@ def _env_float(name: str, default: float) -> float:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
             return float(default)
-        return float(v)
+        return float(str(v).replace(",", ""))
     except Exception:
         return float(default)
 
@@ -71,6 +66,15 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return float(s)
     except Exception:
         return float(default)
+
+
+def _num(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    try:
+        if df is None or df.empty or col not in df.columns:
+            return pd.Series(default, index=df.index if df is not None else None, dtype="float64")
+        return pd.to_numeric(df[col], errors="coerce").fillna(default).astype(float)
+    except Exception:
+        return pd.Series(default, index=df.index if df is not None else None, dtype="float64")
 
 
 def _threshold(runner: Any) -> float:
@@ -95,6 +99,57 @@ def _sample_rows(runner: Any, df: pd.DataFrame, cols: list[str], limit: int = 8)
         return df[use_cols].head(limit).to_dict("records")
 
 
+def _zero_surge_score_rescue(df: pd.DataFrame, *, threshold: float) -> pd.DataFrame:
+    """Rescue Tonosama feature rows when 3m/5m history is missing but 1m evidence is strong."""
+    try:
+        if df is None or df.empty or not _env_bool("TONOSAMA_ZERO_SURGE_PREFILTER_SCORE_RESCUE", True):
+            return df
+        x = df.copy()
+        surge = _num(x, "_max_volume_surge_ratio", 0.0)
+        volume = _num(x, "_latest_volume", 0.0).combine(_num(x, "volume", 0.0), max)
+        rng = _num(x, "_intrabar_range_pct", 0.0)
+        body = _num(x, "_body_change_pct", 0.0)
+        mtf = _num(x, "mtf", 0.0).abs().combine(_num(x, "score_mtf", 0.0).abs(), max)
+        score_abs = _num(x, "score", 0.0).abs().combine(_num(x, "final_score", 0.0).abs(), max)
+
+        min_volume = _env_float("TONOSAMA_ZERO_SURGE_PREFILTER_MIN_VOLUME", _env_float("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_MIN_VOLUME", 500000.0))
+        min_range = _env_float("TONOSAMA_ZERO_SURGE_PREFILTER_MIN_RANGE_PCT", _env_float("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_MIN_RANGE_PCT", 4.0))
+        min_body = _env_float("TONOSAMA_ZERO_SURGE_PREFILTER_MIN_BODY_PCT", 0.0)
+        min_score = _env_float("TONOSAMA_ZERO_SURGE_PREFILTER_MIN_ABS_SCORE", _env_float("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_MIN_ABS_SCORE", 0.8))
+        min_mtf = _env_float("TONOSAMA_ZERO_SURGE_PREFILTER_MIN_MTF", _env_float("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_MIN_MTF", 1.0))
+        failopen_surge = _env_float("TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE", 3.0)
+
+        rescue = (surge <= 0) & (volume >= min_volume) & (rng >= min_range) & (body >= min_body) & (score_abs >= min_score) & (mtf >= min_mtf)
+        if not rescue.any():
+            return x
+
+        x.loc[rescue, "_max_volume_surge_ratio"] = failopen_surge
+        x.loc[rescue, "_volume_surge_failopen"] = True
+        x.loc[rescue, "_volume_surge_history_missing"] = True
+        if "_surge_tf" not in x.columns:
+            x["_surge_tf"] = ""
+        x.loc[rescue, "_surge_tf"] = x.loc[rescue, "_surge_tf"].replace("", "1m_failopen")
+
+        # prepare_entry_scores がそれでも低く出る場合に備え、pre_5sec prefilterだけ通す最低点を付与。
+        if "_tonosama_score" in x.columns:
+            cur = pd.to_numeric(x.loc[rescue, "_tonosama_score"], errors="coerce").fillna(0.0)
+            x.loc[rescue, "_tonosama_score"] = cur.clip(lower=threshold + 0.05)
+        if "pending_score" in x.columns:
+            cur = pd.to_numeric(x.loc[rescue, "pending_score"], errors="coerce").fillna(0.0)
+            x.loc[rescue, "pending_score"] = cur.clip(lower=threshold + 0.05)
+
+        sample_cols = ["symbol", "symbolname", "close", "_latest_volume", "_intrabar_range_pct", "_max_volume_surge_ratio", "_tonosama_score", "score", "final_score", "mtf", "score_mtf"]
+        logger.warning(
+            "[TONOSAMA ZERO SURGE PREFILTER RESCUE] rescued=%s threshold=%.3f failopen_surge=%.2f min_volume=%.0f min_range=%.3f min_score=%.3f min_mtf=%.3f sample=%s",
+            int(rescue.sum()), threshold, failopen_surge, min_volume, min_range, min_score, min_mtf,
+            x.loc[rescue, [c for c in sample_cols if c in x.columns]].head(10).to_dict("records"),
+        )
+        return x
+    except Exception:
+        logger.exception("[TONOSAMA ZERO SURGE PREFILTER RESCUE] failed")
+        return df
+
+
 def _patched_build_feature_df_with_5sec() -> pd.DataFrame:
     if not _env_bool("TONOSAMA_FAST_SCORE_PREFILTER", True):
         return _ORIG_BUILD_FEATURE_DF_WITH_5SEC()
@@ -113,15 +168,17 @@ def _patched_build_feature_df_with_5sec() -> pd.DataFrame:
     if x.empty:
         logger.info(
             "[TONOSAMA ENTRY] no candidates after primary filters base_rows=%s primary_rows=%s diag=%s elapsed=%.3fs",
-            base_rows,
-            primary_rows,
-            getattr(runner, "_LAST_FILTER_DIAG", {}),
-            time.perf_counter() - started,
+            base_rows, primary_rows, getattr(runner, "_LAST_FILTER_DIAG", {}), time.perf_counter() - started,
         )
         return pd.DataFrame()
 
+    th = _threshold(runner)
+    x = _zero_surge_score_rescue(x, threshold=th)
+
     try:
         x = runner.prepare_entry_scores(x)
+        # score計算後にも再度救済。prepare_entry_scores がfailopen scoreを上書きするケース対策。
+        x = _zero_surge_score_rescue(x, threshold=th)
         if "_tonosama_score" in x.columns:
             x = x.sort_values("_tonosama_score", ascending=False)
     except Exception:
@@ -132,12 +189,11 @@ def _patched_build_feature_df_with_5sec() -> pd.DataFrame:
         "_body_change_pct", "_signed_body_change_pct", "_intrabar_range_pct",
         "_close_position_pct", "_upper_wick_pct", "_lower_wick_pct",
         "_max_volume_surge_ratio", "_max_price_change_pct", "_slope",
-        "_tonosama_score", "score", "final_score", "score_mtf", "mtf",
+        "_tonosama_score", "score", "final_score", "score_mtf", "mtf", "_volume_surge_failopen",
     ]
 
     if "_tonosama_score" in x.columns:
         before = x.copy()
-        th = _threshold(runner)
         x = x[pd.to_numeric(x["_tonosama_score"], errors="coerce").fillna(0.0) >= th]
         try:
             runner._log_filter_step(
@@ -193,6 +249,7 @@ def _patched_build_feature_df_with_5sec() -> pd.DataFrame:
             x[c] = pd.to_numeric(x[c], errors="coerce")
 
     x = runner.prepare_entry_scores(x)
+    x = _zero_surge_score_rescue(x, threshold=th)
     logger.info(
         "[TONOSAMA ENTRY] feature build done base_rows=%s primary_rows=%s five_sec_rows=%s feature_missing=%s pre_5sec_head=%s post_5sec_head=%s elapsed=%.3fs fast_score_prefilter=True",
         base_rows, primary_rows, len(x), feature_missing, before_head,
@@ -200,7 +257,7 @@ def _patched_build_feature_df_with_5sec() -> pd.DataFrame:
             "symbol", "symbolname", "close", "_latest_volume", "_body_change_pct", "_signed_body_change_pct",
             "_intrabar_range_pct", "_close_position_pct", "_upper_wick_pct", "_lower_wick_pct",
             "_max_volume_surge_ratio", "_max_price_change_pct", "_slope", "_tonosama_score",
-            "has_5sec_bar", "price_change_5s_pct", "volume_surge_ratio_5s"
+            "has_5sec_bar", "price_change_5s_pct", "volume_surge_ratio_5s", "_volume_surge_failopen",
         ], limit=12),
         time.perf_counter() - started,
     )
@@ -220,15 +277,9 @@ def _soft_rescue_ai_ng(row: Any, reason: str) -> tuple[bool, str]:
     if not _env_bool("TONOSAMA_AI_SOFT_RESCUE", True):
         return False, "disabled"
     r = str(reason or "")
-    # クライマックス/方向NGは救済しない。ここは高値掴み・底売りを防ぐ最後の壁。
     hard_words = (
-        "climax",
-        "selling_climax",
-        "buying_climax",
-        "direction_ng",
-        "reverse",
-        "upper_wick_reversal",
-        "lower_wick_reversal",
+        "climax", "selling_climax", "buying_climax", "direction_ng", "reverse",
+        "upper_wick_reversal", "lower_wick_reversal",
     )
     if any(w in r for w in hard_words):
         return False, "hard_reason"
@@ -257,7 +308,6 @@ def _soft_rescue_ai_ng(row: Any, reason: str) -> tuple[bool, str]:
         return False, "surge_low"
     if abs(price_chg) < min_chg and abs(body) < min_chg and abs(slope) < min_slope_abs:
         return False, "move_low"
-    # 方向が完全に反対のものは救済しない。
     if side == "BUY" and price_chg < -min_chg:
         return False, "buy_price_reverse"
     if side == "SELL" and price_chg > min_chg:
@@ -318,17 +368,17 @@ def install() -> bool:
 
         patched = []
         cur_build = getattr(runner, "build_feature_df_with_5sec", None)
-        if callable(cur_build) and not getattr(cur_build, "_tonosama_fast_score_prefilter_v2", False):
+        if callable(cur_build) and not getattr(cur_build, "_tonosama_fast_score_prefilter_v3", False):
             _ORIG_BUILD_FEATURE_DF_WITH_5SEC = getattr(cur_build, "_original", cur_build)
-            _patched_build_feature_df_with_5sec._tonosama_fast_score_prefilter_v2 = True  # type: ignore[attr-defined]
+            _patched_build_feature_df_with_5sec._tonosama_fast_score_prefilter_v3 = True  # type: ignore[attr-defined]
             _patched_build_feature_df_with_5sec._original = _ORIG_BUILD_FEATURE_DF_WITH_5SEC  # type: ignore[attr-defined]
             runner.build_feature_df_with_5sec = _patched_build_feature_df_with_5sec
             patched.append("runner.build_feature_df_with_5sec")
 
         cur_ai = getattr(runner, "ai_check_tonosama_entry", None)
-        if callable(cur_ai) and not getattr(cur_ai, "_tonosama_fast_score_prefilter_v2", False):
+        if callable(cur_ai) and not getattr(cur_ai, "_tonosama_fast_score_prefilter_v3", False):
             _ORIG_AI_CHECK = getattr(cur_ai, "_original", cur_ai)
-            _patched_ai_check_tonosama_entry._tonosama_fast_score_prefilter_v2 = True  # type: ignore[attr-defined]
+            _patched_ai_check_tonosama_entry._tonosama_fast_score_prefilter_v3 = True  # type: ignore[attr-defined]
             _patched_ai_check_tonosama_entry._original = _ORIG_AI_CHECK  # type: ignore[attr-defined]
             runner.ai_check_tonosama_entry = _patched_ai_check_tonosama_entry
             ai_gate.ai_check_tonosama_entry = _patched_ai_check_tonosama_entry
@@ -336,12 +386,13 @@ def install() -> bool:
 
         _PATCHED = True
         logger.warning(
-            "[TONOSAMA FAST SCORE PREFILTER] installed v2 patched=%s enabled=%s ratio=%.2f ai_short=%s soft_rescue=%s rescue_min_vol=%.0f rescue_min_range=%.2f rescue_min_chg=%.3f",
+            "[TONOSAMA FAST SCORE PREFILTER] installed v3 patched=%s enabled=%s ratio=%.2f ai_short=%s soft_rescue=%s zero_surge_score_rescue=%s rescue_min_vol=%.0f rescue_min_range=%.2f rescue_min_chg=%.3f",
             patched,
             _env_bool("TONOSAMA_FAST_SCORE_PREFILTER", True),
             _env_float("TONOSAMA_FAST_SCORE_PREFILTER_RATIO", 1.0),
             _env_bool("TONOSAMA_FAST_SCORE_AI_SHORT_CIRCUIT", True),
             _env_bool("TONOSAMA_AI_SOFT_RESCUE", True),
+            _env_bool("TONOSAMA_ZERO_SURGE_PREFILTER_SCORE_RESCUE", True),
             _env_float("TONOSAMA_AI_RESCUE_MIN_VOLUME", 500000.0),
             _env_float("TONOSAMA_AI_RESCUE_MIN_RANGE_PCT", 4.0),
             _env_float("TONOSAMA_AI_RESCUE_MIN_PRICE_CHANGE_PCT", 0.08),
@@ -356,6 +407,3 @@ try:
     install()
 except Exception:
     logger.exception("[TONOSAMA FAST SCORE PREFILTER] auto install failed")
-
-
-__all__ = ["install"]
