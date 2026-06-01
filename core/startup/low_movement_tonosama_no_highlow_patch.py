@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/low_movement_tonosama_no_highlow_patch.py
-# Version: V1-TONOSAMA-NO-HIGHLOW-FALLBACK
+# Version: V2-TONOSAMA-NO-HIGHLOW-FALLBACK-RAW-VOLUME-SIGNAL
 # ------------------------------------------------------------
 # 目的:
 #   TONOSAMA pending が entry_controller に渡る時、top-level / _raw の両方に
@@ -10,11 +10,11 @@
 #     reason=no_high_low
 #   で止めてしまい、TONOSAMA AI BRIDGE OK 後も発注前で止まる。
 #
-# 方針:
-#   - 既存 low_movement_entry_guard_patch の判定本体は維持する。
-#   - _range_pct_from_row() だけを補助し、TONOSAMA かつ score/volume 条件を満たす時だけ
-#     疑似range_pctを返す。
-#   - min price はユーザー方針に合わせ、TONOSAMAだけ既定300円へ下げる。
+# Ver2:
+#   - entry row の top-level だけでなく、_raw / raw / entry_conditions から
+#     volume_speed / volume_surge_ratio / dominant_ratio / turnover を拾う。
+#   - AI側ログでは volume_speed=3.0 なのに、低値動きguard側で
+#     volume_signal=0.0 になり、6981などが no_high_low で落ちる問題を修正。
 # ============================================================
 
 from __future__ import annotations
@@ -53,7 +53,13 @@ def _sf(v: Any, default: float = 0.0) -> float:
     try:
         if v is None or str(v).strip() == "":
             return default
-        return float(str(v).replace(",", ""))
+        s = str(v).replace(",", "").strip()
+        if s.lower() in {"nan", "none", "nat", "<na>"}:
+            return default
+        x = float(s)
+        if x != x:
+            return default
+        return x
     except Exception:
         return default
 
@@ -72,6 +78,44 @@ def _is_tonosama(row: Any, mod: Any) -> bool:
     return False
 
 
+def _as_dict(v: Any) -> dict[str, Any]:
+    try:
+        if isinstance(v, dict):
+            return dict(v)
+        if hasattr(v, "to_dict"):
+            d = v.to_dict()
+            return dict(d) if isinstance(d, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _nested_dicts(row: Any) -> list[dict[str, Any]]:
+    base = _as_dict(row)
+    out: list[dict[str, Any]] = []
+    if base:
+        out.append(base)
+    for k in ("_raw", "raw", "candidate_raw", "source_row", "entry_conditions", "conditions", "metrics", "features", "detail", "ai_detail"):
+        d = _as_dict(base.get(k)) if base else {}
+        if d:
+            out.append(d)
+            # 1段だけさらに見る。深追いしすぎて重くしない。
+            for kk in ("_raw", "raw", "entry_conditions", "metrics", "features", "detail", "ai_detail"):
+                dd = _as_dict(d.get(kk))
+                if dd:
+                    out.append(dd)
+    return out
+
+
+def _max_from_keys(row: Any, keys: tuple[str, ...]) -> float:
+    m = 0.0
+    for d in _nested_dicts(row):
+        for k in keys:
+            if k in d:
+                m = max(m, _sf(d.get(k), 0.0))
+    return float(m)
+
+
 def _score(row: dict) -> float:
     vals = [
         row.get("_tonosama_score"),
@@ -81,17 +125,39 @@ def _score(row: dict) -> float:
         row.get("score_buy"),
         row.get("score_sell"),
     ]
+    # nestedにもscoreが残るケースがある。
+    nested_score = _max_from_keys(row, ("_tonosama_score", "pending_score", "score", "final_score", "display_score", "score_buy", "score_sell"))
+    vals.append(nested_score)
     return max(abs(_sf(v, 0.0)) for v in vals)
 
 
 def _volume_signal(row: dict) -> float:
-    vals = [
-        row.get("_max_volume_surge_ratio"),
-        row.get("volume_surge_ratio"),
-        row.get("volume_speed"),
-        row.get("dominant_ratio"),
-    ]
-    return max(_sf(v, 0.0) for v in vals)
+    # AI.entry_gate_tonosama 側で使われる volume_speed を最優先で拾う。
+    signal = _max_from_keys(
+        row,
+        (
+            "_max_volume_surge_ratio",
+            "max_volume_surge_ratio",
+            "volume_surge_ratio",
+            "volume_surge_ratio_1m",
+            "volume_surge_ratio_3m",
+            "volume_surge_ratio_5m",
+            "volume_speed",
+            "dominant_ratio",
+            "volume_surge_ratio_5s",
+        ),
+    )
+    if signal > 0:
+        return signal
+
+    # ratioが無くても、実出来高または売買代金が十分なら「出来高シグナルあり」とみなす。
+    volume = _max_from_keys(row, ("volume", "latest_volume", "_latest_volume", "volume_1m", "volume_3m", "volume_5m", "latest_5sec_volume"))
+    turnover = _max_from_keys(row, ("turnover", "turnover_raw", "trading_value", "売買代金"))
+    min_vol = _env_float("LOW_MOVE_TONOSAMA_NO_HIGHLOW_MIN_ABS_VOLUME", _env_float("TONOSAMA_ALERT_MIN_LATEST_VOLUME", 30000.0))
+    min_turnover = _env_float("LOW_MOVE_TONOSAMA_NO_HIGHLOW_MIN_TURNOVER", _env_float("TONOSAMA_ALERT_MIN_TURNOVER", 10000000.0))
+    if volume >= min_vol or turnover >= min_turnover:
+        return _env_float("LOW_MOVE_TONOSAMA_NO_HIGHLOW_INFERRED_VOLUME_SIGNAL", 1.0)
+    return 0.0
 
 
 def _patched_range_pct_from_row(row: dict) -> float:
@@ -107,17 +173,20 @@ def _patched_range_pct_from_row(row: dict) -> float:
         if not _is_tonosama(row, lm):
             return 0.0
 
+        use_raw_volume = _env_on("LOW_MOVE_TONOSAMA_NO_HIGHLOW_USE_RAW_VOLUME_SIGNAL", True)
         score = _score(row if isinstance(row, dict) else {})
-        volume_sig = _volume_signal(row if isinstance(row, dict) else {})
+        volume_sig = _volume_signal(row if isinstance(row, dict) else {}) if use_raw_volume else 0.0
         min_score = _env_float("LOW_MOVE_TONOSAMA_NO_HIGHLOW_MIN_SCORE", 0.01)
         min_vol = _env_float("LOW_MOVE_TONOSAMA_NO_HIGHLOW_MIN_VOLUME_SIGNAL", 1.0)
         if score < min_score or volume_sig < min_vol:
             logger.warning(
-                "[LOW MOVE TONOSAMA FALLBACK] no high/low denied score=%.4f min_score=%.4f volume_signal=%.4f min_volume_signal=%.4f",
+                "[LOW MOVE TONOSAMA FALLBACK] no high/low denied score=%.4f min_score=%.4f volume_signal=%.4f min_volume_signal=%.4f use_raw_volume=%s nested_keys=%s",
                 score,
                 min_score,
                 volume_sig,
                 min_vol,
+                use_raw_volume,
+                [sorted(list(d.keys()))[:12] for d in _nested_dicts(row if isinstance(row, dict) else {})[:3]],
             )
             return 0.0
 
@@ -145,24 +214,26 @@ def install() -> bool:
         os.environ.setdefault("LOW_MOVE_TONOSAMA_MIN_ENTRY_PRICE", "300")
         os.environ.setdefault("LOW_MOVE_TONOSAMA_ALLOW_NO_HIGHLOW_FALLBACK", "1")
         os.environ.setdefault("LOW_MOVE_TONOSAMA_NO_HIGHLOW_FALLBACK_RANGE_PCT", "0.012")
+        os.environ.setdefault("LOW_MOVE_TONOSAMA_NO_HIGHLOW_USE_RAW_VOLUME_SIGNAL", "1")
 
         import core.startup.low_movement_entry_guard_patch as lm
         cur = getattr(lm, "_range_pct_from_row", None)
         if not callable(cur):
             logger.warning("[LOW MOVE TONOSAMA FALLBACK] target missing")
             return False
-        if getattr(cur, "_tonosama_no_highlow_fallback_patch", False):
+        if getattr(cur, "_tonosama_no_highlow_fallback_patch_v2", False):
             _INSTALLED = True
             return True
         _ORIG_RANGE_FN = cur
-        _patched_range_pct_from_row._tonosama_no_highlow_fallback_patch = True  # type: ignore[attr-defined]
+        _patched_range_pct_from_row._tonosama_no_highlow_fallback_patch_v2 = True  # type: ignore[attr-defined]
         _patched_range_pct_from_row._original = cur  # type: ignore[attr-defined]
         lm._range_pct_from_row = _patched_range_pct_from_row
         _INSTALLED = True
         logger.warning(
-            "[LOW MOVE TONOSAMA FALLBACK] installed v1 min_price=%s fallback_range=%s",
+            "[LOW MOVE TONOSAMA FALLBACK] installed v2 min_price=%s fallback_range=%s use_raw_volume=%s",
             os.environ.get("LOW_MOVE_TONOSAMA_MIN_ENTRY_PRICE"),
             os.environ.get("LOW_MOVE_TONOSAMA_NO_HIGHLOW_FALLBACK_RANGE_PCT"),
+            os.environ.get("LOW_MOVE_TONOSAMA_NO_HIGHLOW_USE_RAW_VOLUME_SIGNAL"),
         )
         return True
     except Exception:
