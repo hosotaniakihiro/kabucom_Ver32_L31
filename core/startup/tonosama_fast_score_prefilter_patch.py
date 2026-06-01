@@ -1,22 +1,21 @@
 # ============================================================
 # File   : core/startup/tonosama_fast_score_prefilter_patch.py
-# Version: V3-TONOSAMA-AI-SOFT-RESCUE-ZERO-SURGE-SCORE
+# Version: V4-TONOSAMA-AI-SOFT-RESCUE-ZERO-PRICE-SLOPE
 # ------------------------------------------------------------
-# 目的:
-#   殿様イナゴの処理時間が candidates=11 registered=0 でも19秒程度かかる問題を軽減する。
+# Purpose:
+#   Speed up Tonosama feature building and avoid losing strong candidates
+#   when 3m/5m surge history is missing or price_change is 0.00 while
+#   range/volume/slope evidence is strong.
 #
-# Ver2:
-#   - 価格変化/傾きがわずかに閾値未満でも、出来高・レンジ・方向が十分な候補は
-#     AI fallback OK としてPENDING登録へ進める。
-#
-# Ver3:
-#   - 3m/5m PUSH merged が古い Yahoo 復旧データのままになると、volume_surge.py は
-#     controlled fail-open しても _max_volume_surge_ratio=0 のfeature dfを返す。
-#   - その結果、prepare_entry_scores 後の _tonosama_score が -0.0x〜1.0 程度になり、
-#     fast score prefilter threshold=2.3 で候補0件になる。
-#   - 1m側の出来高・レンジ・MTFが十分な場合だけ、Tonosama限定で
-#     _max_volume_surge_ratio を fail-open 値に補完し、pre_5sec scoreを救済する。
-#   - クライマックス/方向NGは後段のpending/AI/final guardで維持する。
+# Fix V4:
+#   - V3 successfully rescues zero volume surge before the fast score filter.
+#   - Latest logs show candidates reach AI, but all are rejected by:
+#       price change low ... range_rescue_direction_ng change=0.00 3m=0.00 5m=0.00 slope=...
+#     and the wrapper treats direction_ng as hard_reason.
+#   - For this specific case only, allow soft rescue when:
+#       volume >= threshold, range >= threshold, surge >= threshold,
+#       abs(slope) >= threshold, and no climax/reverse reason is present.
+#   - Climax/reverse/actual opposite movement remain blocked.
 # ============================================================
 
 from __future__ import annotations
@@ -85,8 +84,7 @@ def _threshold(runner: Any) -> float:
     explicit = _env_float("TONOSAMA_FAST_SCORE_PREFILTER_MIN", 0.0)
     if explicit > 0:
         return explicit
-    ratio = _env_float("TONOSAMA_FAST_SCORE_PREFILTER_RATIO", 1.0)
-    return max(0.0, base * ratio)
+    return max(0.0, base * _env_float("TONOSAMA_FAST_SCORE_PREFILTER_RATIO", 1.0))
 
 
 def _sample_rows(runner: Any, df: pd.DataFrame, cols: list[str], limit: int = 8):
@@ -100,7 +98,6 @@ def _sample_rows(runner: Any, df: pd.DataFrame, cols: list[str], limit: int = 8)
 
 
 def _zero_surge_score_rescue(df: pd.DataFrame, *, threshold: float) -> pd.DataFrame:
-    """Rescue Tonosama feature rows when 3m/5m history is missing but 1m evidence is strong."""
     try:
         if df is None or df.empty or not _env_bool("TONOSAMA_ZERO_SURGE_PREFILTER_SCORE_RESCUE", True):
             return df
@@ -130,7 +127,6 @@ def _zero_surge_score_rescue(df: pd.DataFrame, *, threshold: float) -> pd.DataFr
             x["_surge_tf"] = ""
         x.loc[rescue, "_surge_tf"] = x.loc[rescue, "_surge_tf"].replace("", "1m_failopen")
 
-        # prepare_entry_scores がそれでも低く出る場合に備え、pre_5sec prefilterだけ通す最低点を付与。
         if "_tonosama_score" in x.columns:
             cur = pd.to_numeric(x.loc[rescue, "_tonosama_score"], errors="coerce").fillna(0.0)
             x.loc[rescue, "_tonosama_score"] = cur.clip(lower=threshold + 0.05)
@@ -177,7 +173,6 @@ def _patched_build_feature_df_with_5sec() -> pd.DataFrame:
 
     try:
         x = runner.prepare_entry_scores(x)
-        # score計算後にも再度救済。prepare_entry_scores がfailopen scoreを上書きするケース対策。
         x = _zero_surge_score_rescue(x, threshold=th)
         if "_tonosama_score" in x.columns:
             x = x.sort_values("_tonosama_score", ascending=False)
@@ -277,13 +272,15 @@ def _soft_rescue_ai_ng(row: Any, reason: str) -> tuple[bool, str]:
     if not _env_bool("TONOSAMA_AI_SOFT_RESCUE", True):
         return False, "disabled"
     r = str(reason or "")
-    hard_words = (
-        "climax", "selling_climax", "buying_climax", "direction_ng", "reverse",
+
+    # True hard rejects: do not rescue obvious climax/reversal cases.
+    true_hard_words = (
+        "climax", "selling_climax", "buying_climax", "reverse",
         "upper_wick_reversal", "lower_wick_reversal",
     )
-    if any(w in r for w in hard_words):
+    if any(w in r for w in true_hard_words):
         return False, "hard_reason"
-    if not ("price change low" in r or "slope low" in r):
+    if not ("price change low" in r or "slope low" in r or "range_rescue_direction_ng" in r):
         return False, "not_soft_reason"
 
     volume = _safe_float(row.get("_latest_volume"), 0.0) if hasattr(row, "get") else 0.0
@@ -299,6 +296,7 @@ def _soft_rescue_ai_ng(row: Any, reason: str) -> tuple[bool, str]:
     min_surge = _env_float("TONOSAMA_AI_RESCUE_MIN_SURGE", 3.0)
     min_chg = _env_float("TONOSAMA_AI_RESCUE_MIN_PRICE_CHANGE_PCT", 0.08)
     min_slope_abs = _env_float("TONOSAMA_AI_RESCUE_MIN_SLOPE_ABS", 0.0003)
+    zero_price_slope_min = _env_float("TONOSAMA_AI_RESCUE_ZERO_PRICE_MIN_SLOPE_ABS", min_slope_abs)
 
     if volume < min_vol:
         return False, "volume_low"
@@ -306,16 +304,26 @@ def _soft_rescue_ai_ng(row: Any, reason: str) -> tuple[bool, str]:
         return False, "range_low"
     if surge < min_surge:
         return False, "surge_low"
-    if abs(price_chg) < min_chg and abs(body) < min_chg and abs(slope) < min_slope_abs:
-        return False, "move_low"
-    if side == "BUY" and price_chg < -min_chg:
-        return False, "buy_price_reverse"
-    if side == "SELL" and price_chg > min_chg:
-        return False, "sell_price_reverse"
+
+    # price_change=0.00 but range/volume/slope are strong. Direction is taken from slope/body.
+    zero_price_direction_rescue = (
+        "range_rescue_direction_ng" in r
+        and abs(price_chg) < min_chg
+        and abs(body) < min_chg
+        and abs(slope) >= zero_price_slope_min
+    )
+    if not zero_price_direction_rescue:
+        if abs(price_chg) < min_chg and abs(body) < min_chg and abs(slope) < min_slope_abs:
+            return False, "move_low"
+        if side == "BUY" and price_chg < -min_chg:
+            return False, "buy_price_reverse"
+        if side == "SELL" and price_chg > min_chg:
+            return False, "sell_price_reverse"
 
     detail = (
         f"soft_rescue side={side} volume={volume:.0f} range={rng:.3f} "
-        f"surge={surge:.2f} price_chg={price_chg:.3f} body={body:.3f} slope={slope:.6f}"
+        f"surge={surge:.2f} price_chg={price_chg:.3f} body={body:.3f} "
+        f"slope={slope:.6f} zero_price_direction_rescue={zero_price_direction_rescue}"
     )
     return True, detail
 
@@ -368,17 +376,17 @@ def install() -> bool:
 
         patched = []
         cur_build = getattr(runner, "build_feature_df_with_5sec", None)
-        if callable(cur_build) and not getattr(cur_build, "_tonosama_fast_score_prefilter_v3", False):
+        if callable(cur_build) and not getattr(cur_build, "_tonosama_fast_score_prefilter_v4", False):
             _ORIG_BUILD_FEATURE_DF_WITH_5SEC = getattr(cur_build, "_original", cur_build)
-            _patched_build_feature_df_with_5sec._tonosama_fast_score_prefilter_v3 = True  # type: ignore[attr-defined]
+            _patched_build_feature_df_with_5sec._tonosama_fast_score_prefilter_v4 = True  # type: ignore[attr-defined]
             _patched_build_feature_df_with_5sec._original = _ORIG_BUILD_FEATURE_DF_WITH_5SEC  # type: ignore[attr-defined]
             runner.build_feature_df_with_5sec = _patched_build_feature_df_with_5sec
             patched.append("runner.build_feature_df_with_5sec")
 
         cur_ai = getattr(runner, "ai_check_tonosama_entry", None)
-        if callable(cur_ai) and not getattr(cur_ai, "_tonosama_fast_score_prefilter_v3", False):
+        if callable(cur_ai) and not getattr(cur_ai, "_tonosama_fast_score_prefilter_v4", False):
             _ORIG_AI_CHECK = getattr(cur_ai, "_original", cur_ai)
-            _patched_ai_check_tonosama_entry._tonosama_fast_score_prefilter_v3 = True  # type: ignore[attr-defined]
+            _patched_ai_check_tonosama_entry._tonosama_fast_score_prefilter_v4 = True  # type: ignore[attr-defined]
             _patched_ai_check_tonosama_entry._original = _ORIG_AI_CHECK  # type: ignore[attr-defined]
             runner.ai_check_tonosama_entry = _patched_ai_check_tonosama_entry
             ai_gate.ai_check_tonosama_entry = _patched_ai_check_tonosama_entry
@@ -386,13 +394,14 @@ def install() -> bool:
 
         _PATCHED = True
         logger.warning(
-            "[TONOSAMA FAST SCORE PREFILTER] installed v3 patched=%s enabled=%s ratio=%.2f ai_short=%s soft_rescue=%s zero_surge_score_rescue=%s rescue_min_vol=%.0f rescue_min_range=%.2f rescue_min_chg=%.3f",
+            "[TONOSAMA FAST SCORE PREFILTER] installed v4 patched=%s enabled=%s ratio=%.2f ai_short=%s soft_rescue=%s zero_surge_score_rescue=%s zero_price_slope_min=%.6f rescue_min_vol=%.0f rescue_min_range=%.2f rescue_min_chg=%.3f",
             patched,
             _env_bool("TONOSAMA_FAST_SCORE_PREFILTER", True),
             _env_float("TONOSAMA_FAST_SCORE_PREFILTER_RATIO", 1.0),
             _env_bool("TONOSAMA_FAST_SCORE_AI_SHORT_CIRCUIT", True),
             _env_bool("TONOSAMA_AI_SOFT_RESCUE", True),
             _env_bool("TONOSAMA_ZERO_SURGE_PREFILTER_SCORE_RESCUE", True),
+            _env_float("TONOSAMA_AI_RESCUE_ZERO_PRICE_MIN_SLOPE_ABS", _env_float("TONOSAMA_AI_RESCUE_MIN_SLOPE_ABS", 0.0003)),
             _env_float("TONOSAMA_AI_RESCUE_MIN_VOLUME", 500000.0),
             _env_float("TONOSAMA_AI_RESCUE_MIN_RANGE_PCT", 4.0),
             _env_float("TONOSAMA_AI_RESCUE_MIN_PRICE_CHANGE_PCT", 0.08),
@@ -407,3 +416,6 @@ try:
     install()
 except Exception:
     logger.exception("[TONOSAMA FAST SCORE PREFILTER] auto install failed")
+
+
+__all__ = ["install"]
