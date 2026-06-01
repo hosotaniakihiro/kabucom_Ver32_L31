@@ -1,17 +1,6 @@
-# ============================================================
-# File   : usercustomize.py
-# Version: V3-AUTOINSTALL-SMALL-RUNTIME-PATCHES
-# ------------------------------------------------------------
-# Python site module imports usercustomize after sitecustomize when the
-# project root is on sys.path. Keep this tiny and non-fatal.
-# ============================================================
-
 from __future__ import annotations
-
 import logging
-
 logger = logging.getLogger(__name__)
-
 
 def _install(label: str, module_name: str) -> None:
     try:
@@ -22,7 +11,7 @@ def _install(label: str, module_name: str) -> None:
     except Exception:
         logger.exception("[USERCUSTOMIZE] %s auto install failed", label)
 
-
 _install("TONOSAMA_LUNCH_REOPEN_RECENT", "core.startup.tonosama_lunch_reopen_recent_patch")
 _install("YAHOO_COMPUTE_SCHEMA_NA_GUARD", "core.startup.yahoo_compute_schema_na_guard_patch")
 _install("RANKING_ENTRY_FAST_BUDGET_OVERRIDE", "core.startup.ranking_entry_fast_budget_override_patch")
+_install("TONOSAMA_RECENT_3M5M_FAILOPEN", "core.startup.tonosama_recent3m5m_failopen_patch")
