@@ -1,6 +1,6 @@
 # ============================================================
 # File   : data_collectors/split_mode.py
-# Version: DATA-COLLECTORS-SPLIT-MODE-V3-SUMMARY-SAVE-OWNER
+# Version: DATA-COLLECTORS-SPLIT-MODE-V4-STANDALONE-DEFAULT
 # ------------------------------------------------------------
 # Purpose:
 #   - main.py と main_database.py の役割分離フラグを共通管理する
@@ -12,15 +12,20 @@
 #         定時サマリーDB保存を実行してよい
 #
 #   - main.py 側:
-#       AUTOSTOCK_EXTERNAL_DATA_COLLECTORS=1 なら
+#       AUTOSTOCK_EXTERNAL_DATA_COLLECTORS=1 を明示した場合だけ
 #       → DB作成 / ranking取得本体 / PUSH登録 / PUSH受信 / PUSH DB writer を起動しない
 #       → Yahoo補完の取得・保存ジョブも起動しない
 #       → 定時サマリーDB保存も main_database.py 側へ寄せる
 #       → Yahoo補完済みsummary DBは読み込んで利用してよい
 #
 # Notes:
-#   - 既定では分離モードON。
-#   - 元のmain.py単独運用に戻したい場合は、起動前に
+#   - V4では既定を単独起動向けに変更。
+#   - main.pyだけ起動した場合はPUSH DB writer/flush workerを起動する。
+#   - main_database.py と分離運用する場合だけ、起動前に
+#       set AUTOSTOCK_EXTERNAL_DATA_COLLECTORS=1
+#       set AUTOSTOCK_SUMMARY_SAVE_OWNER=database
+#     を指定する。
+#   - 元のmain.py単独運用を明示したい場合は、起動前に
 #       set AUTOSTOCK_EXTERNAL_DATA_COLLECTORS=0
 #       set AUTOSTOCK_SUMMARY_SAVE_OWNER=main
 #     を指定する。
@@ -56,7 +61,18 @@ def is_data_collector_process() -> bool:
 
 
 def external_data_collectors_enabled() -> bool:
-    return _env_bool("AUTOSTOCK_EXTERNAL_DATA_COLLECTORS", True)
+    """
+    外部データ収集プロセス分離モード。
+
+    重要:
+      以前は既定 True だったため、main.py 単独起動でも
+      PUSH DB writer / flush worker が無効化され、
+      memory_only=True / total_flushed=0 のままになることがあった。
+
+    V4では既定 False に変更し、main.py単独起動ではDB保存を有効にする。
+    main_database.py と分離運用する場合だけ環境変数で明示する。
+    """
+    return _env_bool("AUTOSTOCK_EXTERNAL_DATA_COLLECTORS", False)
 
 
 def yahoo_complement_owner() -> str:
@@ -69,9 +85,10 @@ def yahoo_complement_owner() -> str:
       - both     : 両方許可 非推奨
       - none     : Yahoo補完ジョブ登録なし
     """
-    owner = _env_text("AUTOSTOCK_YAHOO_COMPLEMENT_OWNER", "database").lower()
+    default_owner = "database" if external_data_collectors_enabled() else "main"
+    owner = _env_text("AUTOSTOCK_YAHOO_COMPLEMENT_OWNER", default_owner).lower()
     if owner not in {"database", "main", "both", "none"}:
-        return "database"
+        return default_owner
     return owner
 
 
@@ -85,12 +102,14 @@ def summary_save_owner() -> str:
       - both     : 両方許可 非推奨。DBロック競合が増える
       - none     : summary DB保存なし
 
-    既定は database。
-    main.py は計算・表示・AI/entry用、main_database.py はDB保存用に分離する。
+    V4:
+      - 外部データ収集分離ON なら既定 database
+      - 単独起動なら既定 main
     """
-    owner = _env_text("AUTOSTOCK_SUMMARY_SAVE_OWNER", "database").lower()
+    default_owner = "database" if external_data_collectors_enabled() else "main"
+    owner = _env_text("AUTOSTOCK_SUMMARY_SAVE_OWNER", default_owner).lower()
     if owner not in {"database", "main", "both", "none"}:
-        return "database"
+        return default_owner
     return owner
 
 
@@ -101,6 +120,10 @@ def should_skip_data_collector_work_in_main() -> bool:
       - PUSH DB writer
       - PUSH銘柄登録ローテーション
       - ranking DB writer / ranking取得本体
+
+    V4:
+      AUTOSTOCK_EXTERNAL_DATA_COLLECTORS=1 が明示されていない限り False。
+      これにより main.py 単独起動では memory_only にならずDBへflushする。
     """
     return external_data_collectors_enabled() and not is_data_collector_process()
 
@@ -113,7 +136,8 @@ def should_run_yahoo_complement_in_this_process() -> bool:
       AUTOSTOCK_DATA_COLLECTORS_PROCESS=1 なので database owner なら True
 
     main.py 側:
-      既定では external collectors ON かつ owner=database なので False
+      単独起動の既定では owner=main なので True
+      分離運用の既定では external collectors ON かつ owner=database なので False
     """
     owner = yahoo_complement_owner()
 
@@ -139,8 +163,8 @@ def should_run_summary_save_in_this_process() -> bool:
     重要:
       - main.py と main_database.py が同じ summary DB に同時保存すると、
         interval lock timeout / database is locked / 長時間tick の原因になる。
-      - 既定では database owner のため、main.py はDB保存をスキップする。
-      - main.py 側は計算・表示・AI判定・エントリーに専念する。
+      - 分離運用時は database owner のため、main.py はDB保存をスキップする。
+      - 単独起動時は main owner のため、main.py がDB保存する。
     """
     owner = summary_save_owner()
 
