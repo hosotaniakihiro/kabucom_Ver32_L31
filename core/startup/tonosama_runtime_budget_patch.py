@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/tonosama_runtime_budget_patch.py
-# Version: Ver1.2-TONOSAMA-RUNTIME-BUDGET-PRACTICAL
+# Version: Ver2.0-TONOSAMA-RUNTIME-BUDGET-AFTER-CANDIDATES
 # ------------------------------------------------------------
 # Purpose:
 #   TONOSAMA runner can continue in a daemon thread even after the
@@ -8,18 +8,16 @@
 #   to keep running for 100s+ and made every next 30s schedule skip as
 #   previous_timeout_thread_still_alive.
 #
-# Ver1.2:
-#   - 10秒/5候補や18秒/8候補では、候補 ready rows=11 の時に
-#     AI確認・板/MA確認だけで時間切れし、registered=0 のまま終了することがある。
-#   - 既定を 25秒 / 12候補へ拡張。
-#   - 候補を score/volume/range/surge で優先ソートして、登録可能性の高い銘柄を先に処理。
-#   - registered=0 の間は時間切れ直後でも最低1件を最後まで評価する。
-#   - 通知で時間超過しても pending 登録を優先する。
+# Ver2.0:
+#   - 候補生成に時間がかかっても、評価開始前に時間切れにしない。
+#   - 評価用budgetは candidates ready 後に開始する。
+#   - 7,000円超や予算超過銘柄を後ろへ回し、登録可能性の高い候補を先に評価する。
+#   - registered=0 の間は最低1件を add_pending まで試す。
 #
 # Defaults:
-#   TONOSAMA_LOOP_TIME_BUDGET_SEC=25
+#   TONOSAMA_LOOP_TIME_BUDGET_SEC=20
 #   TONOSAMA_RUNTIME_MAX_EVAL_CANDIDATES=12
-#   TONOSAMA_RUNTIME_MIN_REMAIN_SEC=1.5
+#   TONOSAMA_RUNTIME_PRIORITIZE_PRICE_ELIGIBLE=1
 # ============================================================
 
 from __future__ import annotations
@@ -55,6 +53,16 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _env_on(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
 def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
         if v is None:
@@ -69,19 +77,38 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
 
 def _prioritize_candidates(candidates):
     try:
+        import pandas as pd
         if candidates is None or candidates.empty:
             return candidates
         df = candidates.copy()
+
+        price = pd.to_numeric(df.get("close"), errors="coerce").fillna(0.0)
+        min_price = _env_float("ENTRY_MIN_PRICE", _env_float("TONOSAMA_ENTRY_MIN_PRICE", 1500.0))
+        max_price = _env_float("ENTRY_MAX_PRICE", _env_float("TONOSAMA_ENTRY_MAX_PRICE", 7000.0))
+        budget = _env_float("ENTRY_BUDGET_YEN", _env_float("TRADE_BUDGET_YEN", 700000.0))
+        lot_size = max(1.0, _env_float("ENTRY_LOT_SIZE", 100.0))
+        affordable_max = min(max_price, budget / lot_size) if budget > 0 else max_price
+
+        if _env_on("TONOSAMA_RUNTIME_PRIORITIZE_PRICE_ELIGIBLE", True):
+            df["__prio_price_ok"] = (price >= min_price) & (price <= affordable_max)
+        else:
+            df["__prio_price_ok"] = True
+
         df["__prio_score"] = df.get("_tonosama_score", 0).map(lambda x: abs(_safe_float(x, 0.0)))
         df["__prio_volume"] = df.get("_latest_volume", 0).map(lambda x: _safe_float(x, 0.0))
         df["__prio_range"] = df.get("_intrabar_range_pct", 0).map(lambda x: _safe_float(x, 0.0))
         df["__prio_surge"] = df.get("_max_volume_surge_ratio", 0).map(lambda x: _safe_float(x, 0.0))
+        eligible = int(df["__prio_price_ok"].sum())
         df = df.sort_values(
-            ["__prio_score", "__prio_volume", "__prio_range", "__prio_surge"],
-            ascending=[False, False, False, False],
+            ["__prio_price_ok", "__prio_score", "__prio_volume", "__prio_range", "__prio_surge"],
+            ascending=[False, False, False, False, False],
             kind="mergesort",
         )
-        return df.drop(columns=[c for c in ("__prio_score", "__prio_volume", "__prio_range", "__prio_surge") if c in df.columns])
+        logger.warning(
+            "[TONOSAMA RUNTIME BUDGET] priority rows=%s price_eligible=%s min_price=%.1f max_price=%.1f affordable_max=%.1f",
+            len(df), eligible, min_price, max_price, affordable_max,
+        )
+        return df.drop(columns=[c for c in ("__prio_price_ok", "__prio_score", "__prio_volume", "__prio_range", "__prio_surge") if c in df.columns])
     except Exception:
         logger.debug("[TONOSAMA RUNTIME BUDGET] prioritize failed", exc_info=True)
         return candidates
@@ -100,7 +127,7 @@ def _apply_patch() -> bool:
         return False
 
     try:
-        if getattr(runner, "_TONOSAMA_RUNTIME_BUDGET_PATCHED_V12", False):
+        if getattr(runner, "_TONOSAMA_RUNTIME_BUDGET_PATCHED_V20", False):
             _INSTALLED = True
             return True
 
@@ -110,14 +137,10 @@ def _apply_patch() -> bool:
             return False
 
         def _budgeted_build_tonosama_entries() -> int:
-            started = time.perf_counter()
-            budget_sec = max(5.0, _env_float("TONOSAMA_LOOP_TIME_BUDGET_SEC", 25.0))
+            build_started = time.perf_counter()
+            budget_sec = max(5.0, _env_float("TONOSAMA_LOOP_TIME_BUDGET_SEC", 20.0))
             max_eval = max(1, _env_int("TONOSAMA_RUNTIME_MAX_EVAL_CANDIDATES", 12))
-            min_remain = max(0.0, _env_float("TONOSAMA_RUNTIME_MIN_REMAIN_SEC", 1.5))
-            deadline = started + budget_sec
-
-            def _remaining() -> float:
-                return deadline - time.perf_counter()
+            min_remain = max(0.0, _env_float("TONOSAMA_RUNTIME_MIN_REMAIN_SEC", 1.0))
 
             try:
                 candidates = runner.iter_tonosama_candidate_rows()
@@ -125,12 +148,13 @@ def _apply_patch() -> bool:
                 logger.exception("[TONOSAMA RUNTIME BUDGET] iter_tonosama_candidate_rows failed")
                 return 0
 
+            candidate_elapsed = time.perf_counter() - build_started
             try:
                 empty = bool(candidates is None or candidates.empty)
             except Exception:
                 empty = True
             if empty:
-                logger.info("[TONOSAMA RUNTIME BUDGET] build done candidates=0 registered=0 elapsed=%.3fs", time.perf_counter() - started)
+                logger.info("[TONOSAMA RUNTIME BUDGET] build done candidates=0 registered=0 candidate_elapsed=%.3fs", candidate_elapsed)
                 return 0
 
             total_candidates = 0
@@ -138,8 +162,13 @@ def _apply_patch() -> bool:
                 total_candidates = int(len(candidates))
                 candidates = _prioritize_candidates(candidates).head(max_eval).reset_index(drop=True)
             except Exception:
-                pass
+                try:
+                    candidates = candidates.head(max_eval).reset_index(drop=True)
+                except Exception:
+                    pass
 
+            eval_started = time.perf_counter()
+            deadline = eval_started + budget_sec
             registered = 0
             ai_ng = 0
             duplicate = 0
@@ -149,14 +178,16 @@ def _apply_patch() -> bool:
             time_budget_stop = False
             final_low_samples: list[dict[str, Any]] = []
 
+            def _remaining() -> float:
+                return deadline - time.perf_counter()
+
             for idx, row in candidates.iterrows():
                 now = time.perf_counter()
-                # registered=0 の場合は、最初の候補だけは最後まで評価する。
                 if now >= deadline and registered > 0:
                     time_budget_stop = True
                     logger.warning(
-                        "[TONOSAMA RUNTIME BUDGET] stop before candidate budget_sec=%.1f elapsed=%.3fs registered=%s idx=%s evaluated_limit=%s total_candidates=%s",
-                        budget_sec, now - started, registered, idx, max_eval, total_candidates,
+                        "[TONOSAMA RUNTIME BUDGET] stop before candidate budget_sec=%.1f eval_elapsed=%.3fs registered=%s idx=%s evaluated_limit=%s total_candidates=%s",
+                        budget_sec, now - eval_started, registered, idx, max_eval, total_candidates,
                     )
                     break
 
@@ -264,21 +295,23 @@ def _apply_patch() -> bool:
                     continue
 
             logger.info(
-                "[TONOSAMA RUNTIME BUDGET] build done total_candidates=%s candidates=%s evaluated=%s evaluated_max=%s registered=%s duplicate=%s ai_ng=%s low_score=%s no_symbol=%s stopped=%s budget_sec=%.1f elapsed=%.3fs low_score_samples=%s",
-                total_candidates, len(candidates), evaluated, max_eval, registered, duplicate, ai_ng, low_score, no_symbol, time_budget_stop, budget_sec, time.perf_counter() - started, final_low_samples[:10],
+                "[TONOSAMA RUNTIME BUDGET] build done total_candidates=%s candidates=%s evaluated=%s evaluated_max=%s registered=%s duplicate=%s ai_ng=%s low_score=%s no_symbol=%s stopped=%s budget_sec=%.1f candidate_elapsed=%.3fs eval_elapsed=%.3fs total_elapsed=%.3fs low_score_samples=%s",
+                total_candidates, len(candidates), evaluated, max_eval, registered, duplicate, ai_ng, low_score, no_symbol, time_budget_stop,
+                budget_sec, candidate_elapsed, time.perf_counter() - eval_started, time.perf_counter() - build_started,
+                final_low_samples[:10],
             )
             return registered
 
         setattr(runner, "_TONOSAMA_ORIGINAL_BUILD_TONOSAMA_ENTRIES", original)
         setattr(runner, "build_tonosama_entries", _budgeted_build_tonosama_entries)
         setattr(runner, "_TONOSAMA_RUNTIME_BUDGET_PATCHED", True)
-        setattr(runner, "_TONOSAMA_RUNTIME_BUDGET_PATCHED_V12", True)
+        setattr(runner, "_TONOSAMA_RUNTIME_BUDGET_PATCHED_V20", True)
         _INSTALLED = True
         logger.warning(
-            "[TONOSAMA RUNTIME BUDGET PATCH] installed v1.2 budget_sec=%s max_eval=%s min_remain=%s",
-            os.getenv("TONOSAMA_LOOP_TIME_BUDGET_SEC", "25"),
+            "[TONOSAMA RUNTIME BUDGET PATCH] installed V2 budget_sec=%s max_eval=%s price_priority=%s",
+            os.getenv("TONOSAMA_LOOP_TIME_BUDGET_SEC", "20"),
             os.getenv("TONOSAMA_RUNTIME_MAX_EVAL_CANDIDATES", "12"),
-            os.getenv("TONOSAMA_RUNTIME_MIN_REMAIN_SEC", "1.5"),
+            os.getenv("TONOSAMA_RUNTIME_PRIORITIZE_PRICE_ELIGIBLE", "1"),
         )
         return True
     except Exception:
