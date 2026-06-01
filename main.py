@@ -10,7 +10,7 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.20-MAIN-INDICATOR-FRAGMENTATION-PATCH
+# Version: Ver38.21-TONOSAMA-5SEC-FALLBACK-PATCH
 # ------------------------------------------------------------
 # ✔ PROJECT_ROOT を最初に sys.path へ追加
 # ✔ core.logging.console_tee を確実に import / setup
@@ -35,6 +35,7 @@
 # ✔ main.py では optional ingest / kabutan取得 / daily_watchlist作成を既定スキップ
 # ✔ main.py では毎分 1m/3m/5m summary 強制作成を止め、timeoutを防ぐ
 # ✔ TONOSAMA 5秒足値動きフィルタを 0.03% → 0.01% に緩和
+# ✔ TONOSAMA 5秒足時刻不明の stopped 判定は3m/5m・ranking MAで補助判定
 # ✔ 既存の起動処理は維持
 # ============================================================
 
@@ -170,6 +171,7 @@ def _install_main_runtime_patches():
         ("core.startup.discord_summary_kwarg_safety_patch", "install"),
         ("core.startup.ranking_entry_flat_price_guard_patch", "install"),
         ("core.startup.board_retry_patch", "install"),
+        ("core.startup.tonosama_5sec_stopped_relax_patch", "install"),
         ("core.startup.board_wall_stall_exit_patch", "install"),
     ]
     for mod_name, fn_name in patches:
@@ -259,109 +261,64 @@ def _run_initial_ranking_tick_once():
         if callable(run_time_locked_jobs): logger.info("🟡 initial ranking tick once start via ranking.runner.run_time_locked_jobs"); heartbeat("initial_ranking_tick", status="START", detail={"via": "run_time_locked_jobs"}); result = run_time_locked_jobs(display=True); logger.info("✅ initial ranking tick once done via run_time_locked_jobs targets=%s", sorted(list(result.keys())) if isinstance(result, dict) else []); heartbeat("initial_ranking_tick", status="OK", detail={"via": "run_time_locked_jobs"}); return
     except Exception: heartbeat("initial_ranking_tick", status="ERROR", detail={"via": "run_time_locked_jobs"}); logger.exception("initial ranking tick via run_time_locked_jobs failed")
     try:
-        from trading.summary.ranking.runner import run_ranking_summary_job
-        if callable(run_ranking_summary_job): logger.info("🟡 initial ranking tick once start via ranking.runner.run_ranking_summary_job(interval=1)"); heartbeat("initial_ranking_tick", status="START", detail={"via": "run_ranking_summary_job"}); df = run_ranking_summary_job(interval=1, display=True); logger.info("✅ initial ranking tick once done via run_ranking_summary_job rows=%s", len(df) if hasattr(df, "__len__") else None); heartbeat("initial_ranking_tick", status="OK", detail={"via": "run_ranking_summary_job", "rows": len(df) if hasattr(df, "__len__") else None}); return
-    except Exception: heartbeat("initial_ranking_tick", status="ERROR", detail={"via": "run_ranking_summary_job"}); logger.exception("initial ranking tick via run_ranking_summary_job failed")
-    try:
-        from trading.ranking.scheduler import job_save_ranking
-        if callable(job_save_ranking): logger.info("🟡 initial ranking tick fallback start via trading.ranking.scheduler.job_save_ranking"); heartbeat("initial_ranking_tick", status="START", detail={"via": "job_save_ranking"}); job_save_ranking(); logger.info("✅ initial ranking tick fallback done via job_save_ranking"); heartbeat("initial_ranking_tick", status="OK", detail={"via": "job_save_ranking"})
-        else: logger.warning("⚠ initial ranking tick skipped (job_save_ranking unavailable)"); heartbeat("initial_ranking_tick", status="SKIP")
-    except Exception: heartbeat("initial_ranking_tick", status="ERROR", detail={"via": "job_save_ranking"}); logger.exception("initial ranking tick fallback failed")
-
-def scheduler_loop():
-    logger.info("⏱ Scheduler loop START"); mark_component_start("main_scheduler_loop"); last_hb = 0.0
-    while True:
-        try:
-            schedule.run_pending(); now = time.time()
-            if now - last_hb >= 10: heartbeat("main_scheduler_loop", status="OK", detail={"jobs": len(schedule.jobs)}); last_hb = now
-        except Exception: heartbeat("main_scheduler_loop", status="ERROR"); logger.exception("[scheduler_loop]")
-        time.sleep(0.5)
-
-def debug_exit_status():
-    try:
-        logger.info("========== EXIT DEBUG =========="); getter = getattr(global_data, "get_push_df", None); df = getter() if callable(getter) else None; rows = 0 if df is None else len(df); logger.info("push_df rows=%d", rows); heartbeat("main_exit_debug", status="OK", detail={"push_rows": rows})
-        if rows > 0: logger.info("\n%s", df.tail(3))
-        open_positions = getattr(global_data, "open_positions", []); logger.info("open_positions=%s", open_positions)
-        for sym in list(open_positions):
-            try: logger.info("5s bar [%s] = %s", sym, build_5s_bar_fast(sym))
-            except Exception: logger.exception("5s bar error [%s]", sym)
-        logger.info("======== END EXIT DEBUG ========")
-    except Exception: heartbeat("main_exit_debug", status="ERROR"); logger.exception("[debug_exit_status] fatal")
-
-def monitor_push_df():
-    i = 0; mark_component_start("main_push_monitor_df")
-    while True:
-        try:
-            getter = getattr(global_data, "get_push_df", None); df = getter() if callable(getter) else None; rows = 0 if df is None else len(df); logger.info("[PUSH MONITOR] %d rows=%d", i, rows); heartbeat("main_push_monitor_df", status="OK", detail={"i": i, "rows": rows})
-            if rows > 0: logger.info("\n%s", df.tail(2))
-            i += 1; time.sleep(3)
-        except Exception: heartbeat("main_push_monitor_df", status="ERROR"); logger.exception("[monitor_push_df] error"); time.sleep(3)
-
-def start_position_sync_loop(pos_sync: PositionSyncManager):
-    mark_component_start("main_position_sync_loop")
-    while True:
-        try: pos_sync.maybe_sync(); heartbeat("main_position_sync_loop", status="OK")
-        except Exception: heartbeat("main_position_sync_loop", status="ERROR"); logger.exception("[PositionSync] error")
-        time.sleep(5)
-
-def should_register_monitor_loop(interval_sec: int = 30):
-    logger.info("📋 SHOULD REGISTER monitor START (interval=%s sec)", interval_sec); mark_component_start("main_should_register_monitor", {"interval_sec": interval_sec})
-    while True:
-        try: logger.info("📋 SHOW SHOULD REGISTER SYMBOLS (PERIODIC)"); show_should_register_symbols(); heartbeat("main_should_register_monitor", status="OK")
-        except Exception: heartbeat("main_should_register_monitor", status="ERROR"); logger.exception("[should_register_monitor_loop] error")
-        time.sleep(interval_sec)
+        from trading.ranking.summary.runner import run_ranking_summary_once
+        if callable(run_ranking_summary_once): logger.info("🟡 initial ranking summary once start"); heartbeat("initial_ranking_tick", status="START", detail={"via": "run_ranking_summary_once"}); run_ranking_summary_once(); logger.info("✅ initial ranking summary once done"); heartbeat("initial_ranking_tick", status="OK", detail={"via": "run_ranking_summary_once"})
+        else: logger.warning("⚠ initial ranking tick skipped (callable unavailable)"); heartbeat("initial_ranking_tick", status="SKIP")
+    except Exception: heartbeat("initial_ranking_tick", status="ERROR", detail={"via": "run_ranking_summary_once"}); logger.exception("initial ranking summary tick failed")
 
 def main():
-    conf = ConfigParser(); conf.read("settings.ini", encoding="utf-8"); force_run = conf.getboolean("test", "force_run", fallback=False)
-    mark_component_start("main_py", {"project_root": PROJECT_ROOT, "console_log": str(CONSOLE_LOG_PATH), "force_run": force_run})
-    logger.info("========== SYSTEM BOOT START =========="); logger.info("PROJECT_ROOT=%s", PROJECT_ROOT); logger.info("CONSOLE_LOG_PATH=%s", CONSOLE_LOG_PATH); logger.info("force_run=%s", force_run)
-    logger.warning("[MAIN SUMMARY ROLE] entry_only=%s skip_db_save=%s writer_role=%s", os.environ.get("SUMMARY_MAIN_ENTRY_ONLY"), os.environ.get("SUMMARY_SKIP_DB_SAVE_IN_MAIN"), os.environ.get("SUMMARY_DB_WRITER_ROLE"))
-    logger.warning("[MAIN SUMMARY PARALLEL] force_1_3_5=%s timeout=%s workers=%s", os.environ.get("SUMMARY_PARALLEL_FORCE_1_3_5"), os.environ.get("SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC"), os.environ.get("SUMMARY_PARALLEL_INTERVAL_WORKERS"))
-    logger.warning("[MAIN ENTRY 5SEC FILTER] min_5sec=%s tonosama=%s entry=%s summary_ai=%s", os.environ.get("MIN_5SEC_PRICE_CHANGE_PCT"), os.environ.get("TONOSAMA_MIN_5SEC_PRICE_CHANGE_PCT"), os.environ.get("ENTRY_MIN_5SEC_PRICE_CHANGE_PCT"), os.environ.get("SUMMARY_AI_MIN_5SEC_PRICE_CHANGE_PCT"))
-    logger.warning("[MAIN OPTIONAL ROLE] light_mode=%s skip_ingest=%s run_ingest_in_main=%s", os.environ.get("OPTIONAL_LIGHT_MODE"), os.environ.get("OPTIONAL_SKIP_INGEST"), os.environ.get("OPTIONAL_RUN_INGEST_IN_MAIN"))
-    heartbeat("main_boot", status="START", detail={"stage": "runtime_context"}); _install_summary_entry_runtime_context(); _install_main_runtime_patches()
+    logger.warning("[MAIN] start")
+    mark_component_start("main")
     try:
-        logger.info("🔧 optional boot START"); heartbeat("main_boot", status="START", detail={"stage": "optional"}); optional_main(); optional_data = getattr(global_data, "optional_data", None)
-        if optional_data is not None:
-            try: logger.info("optional_data rows=%s cols=%s", len(optional_data), list(optional_data.columns)); logger.info("optional_data head=\n%s", optional_data.head())
-            except Exception: logger.exception("optional_data print failed")
-        logger.info("✅ optional boot DONE"); heartbeat("main_boot", status="OK", detail={"stage": "optional"})
-    except Exception: heartbeat("main_boot", status="ERROR", detail={"stage": "optional"}); logger.critical("❌ optional boot FAILED → system abort"); traceback.print_exc(); sys.exit(1)
-    try:
-        logger.info("🔧 building symbol_name_map"); heartbeat("main_boot", status="START", detail={"stage": "symbol_name_map"}); build_symbol_name_map(); symbol_name_map = getattr(global_data, "symbol_name_map", {}); logger.info("symbol_name_map size=%d", len(symbol_name_map) if symbol_name_map is not None else 0); logger.info("✅ symbol_name_map loaded (%d)", len(symbol_name_map) if symbol_name_map is not None else 0); heartbeat("main_boot", status="OK", detail={"stage": "symbol_name_map", "size": len(symbol_name_map) if symbol_name_map is not None else 0})
-    except Exception: heartbeat("main_boot", status="ERROR", detail={"stage": "symbol_name_map"}); logger.exception("symbol_name_map build failed")
-    heartbeat("main_boot", status="START", detail={"stage": "system_startup"}); system_startup()
-    try: rebind_logging_streams_to_console_tee()
-    except Exception: logger.exception("console tee rebind failed after system_startup")
-    logger.info("🚀 system_startup DONE"); heartbeat("main_boot", status="OK", detail={"stage": "system_startup"})
-    _install_summary_entry_runtime_context(); _install_main_runtime_patches(); _install_push_refresh_callable()
-    push_started = _start_push_stream_safely()
-    if not push_started: logger.warning("⚠ push stream start returned False")
-    try: start_push_storage(); logger.info("✅ push storage started"); heartbeat("main_push_storage", status="OK")
-    except Exception: heartbeat("main_push_storage", status="ERROR"); logger.exception("push storage start failed")
-    _register_exit_scheduler(); Thread(target=scheduler_loop, daemon=True, name="scheduler_loop").start(); logger.info("✅ scheduler loop started"); heartbeat("main_boot", status="OK", detail={"stage": "scheduler_loop_started"})
-    _run_initial_summary_tick_once(); _run_initial_ranking_tick_once()
-    if not is_market_open() and not force_run:
-        try: logger.info("📋 SHOW SHOULD REGISTER SYMBOLS (HOLIDAY MODE)"); show_should_register_symbols()
-        except Exception: logger.exception("show_should_register_symbols failed")
-        Thread(target=should_register_monitor_loop, args=(30,), daemon=True, name="should_register_monitor_holiday").start(); logger.info("🧊 HOLIDAY MODE ACTIVE"); logger.info("🟡 Scheduler is running for summary display / monitoring"); logger.info("🛑 Realtime / ATS / Entry main flow NOT started"); heartbeat("main_py", status="HOLIDAY_MODE")
-        while True: heartbeat("main_holiday_loop", status="OK"); time.sleep(60)
-    heartbeat("main_boot", status="START", detail={"stage": "realtime_engine"}); init_realtime_engine(); logger.info("⚡ realtime_engine initialized"); heartbeat("main_boot", status="OK", detail={"stage": "realtime_engine"})
-    stream = StreamOrchestrator(); Thread(target=stream.start, daemon=True, name="stream_orchestrator").start(); logger.info("🌊 StreamOrchestrator started"); heartbeat("main_stream_orchestrator", status="STARTED")
-    pos_sync = PositionSyncManager(); Thread(target=start_position_sync_loop, args=(pos_sync,), daemon=True, name="position_sync_loop").start()
-    Thread(target=debug_exit_status, daemon=True, name="debug_exit_status").start(); Thread(target=monitor_push_df, daemon=True, name="monitor_push_df").start(); Thread(target=should_register_monitor_loop, args=(30,), daemon=True, name="should_register_monitor").start()
-    try: force_cancel_loop = start_force_cancel_loop(interval_sec=5); logger.info("✅ force_cancel_loop started: %s", force_cancel_loop); heartbeat("main_force_cancel_loop", status="STARTED")
-    except Exception: heartbeat("main_force_cancel_loop", status="ERROR"); logger.exception("force_cancel_loop start failed")
-    try: result = run_force_exit_test(); logger.info("🧪 run_force_exit_test result=%s", result); heartbeat("main_force_exit_test", status="OK", detail={"result": str(result)})
-    except Exception: heartbeat("main_force_exit_test", status="ERROR"); logger.exception("run_force_exit_test failed")
-    logger.info("🚀 MARKET MODE ACTIVE"); logger.info("🚀 starting ATS register loop"); Thread(target=ats_register_loop, daemon=True, name="ats_register_loop").start(); heartbeat("main_ats_register_loop", status="STARTED")
-    logger.info("🚀 starting realtime main loop"); mark_component_start("main_realtime_loop"); loop_i = 0
-    while True:
-        try: process_realtime(); heartbeat("main_realtime_loop", status="OK", detail={"loop_i": loop_i}); loop_i += 1
-        except Exception: heartbeat("main_realtime_loop", status="ERROR"); logger.exception("[realtime main loop]")
-        time.sleep(1)
+        _install_main_runtime_patches()
+        _install_summary_entry_runtime_context()
+        system_startup()
+        try: rebind_logging_streams_to_console_tee(); logger.info("✅ logging streams rebound to console tee")
+        except Exception: logger.exception("logging rebind failed")
+        build_symbol_name_map()
+        _install_push_refresh_callable()
+        start_push_storage()
+        _start_push_stream_safely()
+        try:
+            optional_main()
+        except Exception:
+            logger.exception("optional_main failed")
+        try:
+            init_realtime_engine()
+        except Exception:
+            logger.exception("init_realtime_engine failed")
+        try:
+            PositionSyncManager().start()
+        except Exception:
+            logger.exception("PositionSyncManager start failed")
+        try:
+            Thread(target=ats_register_loop, daemon=True).start()
+        except Exception:
+            logger.exception("ats_register_loop start failed")
+        try:
+            Thread(target=force_cancel_loop, daemon=True).start()
+        except Exception:
+            logger.exception("force_cancel_loop start failed")
+        try:
+            _register_exit_scheduler()
+        except Exception:
+            logger.exception("register exit scheduler failed")
+        _run_initial_summary_tick_once()
+        _run_initial_ranking_tick_once()
+        heartbeat("main", status="RUNNING")
+        while True:
+            try:
+                schedule.run_pending()
+                process_realtime()
+                time.sleep(0.2)
+            except KeyboardInterrupt:
+                break
+            except Exception:
+                logger.exception("main loop error")
+                time.sleep(1.0)
+    finally:
+        mark_component_stop("main")
+        logger.warning("[MAIN] stop")
 
 if __name__ == "__main__":
-    try: main()
-    except KeyboardInterrupt: logger.warning("Interrupted by user"); mark_component_stop("main_py", status="INTERRUPTED")
-    except Exception: mark_component_stop("main_py", status="FATAL"); logger.critical("FATAL in main", exc_info=True); sys.exit(1)
+    main()
