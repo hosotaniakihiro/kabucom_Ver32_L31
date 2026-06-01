@@ -1,33 +1,27 @@
 # ============================================================
 # File   : core/startup/tonosama_fast_score_prefilter_patch.py
-# Version: V1-TONOSAMA-FAST-SCORE-PREFILTER
+# Version: V2-TONOSAMA-AI-SOFT-RESCUE
 # ------------------------------------------------------------
 # 目的:
 #   殿様イナゴの処理時間が candidates=11 registered=0 でも19秒程度かかる問題を軽減する。
 #
-# 背景:
-#   runner.py では以下の順序になっている。
-#     1) base feature生成
-#     2) primary filter
-#     3) prepare_entry_scores
-#     4) 5秒特徴取得
-#     5) final filter
-#     6) AI/fallback判定
-#     7) final_score < MIN_FINAL_SCORE で低スコア除外
-#
-#   ログでは low_score_samples reason=final_score_low が多く、
-#   AI/fallbackや後段処理後に落ちている。
-#
-# 方針:
-#   - 5秒特徴取得前に _tonosama_score が低すぎる候補を早期除外する。
-#   - AI/fallback呼び出し前にも raw_score < MIN_FINAL_SCORE を即NGにする。
-#   - TONOSAMAだけに作用し、SUMMARY/RANKINGには影響しない。
+# Ver2:
+#   - 価格変化/傾きがわずかに閾値未満でも、出来高・レンジ・方向が十分な候補は
+#     AI fallback OK としてPENDING登録へ進める。
+#   - buying/selling climax や direction_ng は救済しない。
+#   - SUMMARY/RANKINGには影響させない。
 #
 # ENV:
-#   TONOSAMA_FAST_SCORE_PREFILTER=1             # default enabled
-#   TONOSAMA_FAST_SCORE_PREFILTER_RATIO=1.00    # MIN_FINAL_SCORE * ratio
-#   TONOSAMA_FAST_SCORE_PREFILTER_MIN=0         # 0ならMIN_FINAL_SCORE使用
+#   TONOSAMA_FAST_SCORE_PREFILTER=1
+#   TONOSAMA_FAST_SCORE_PREFILTER_RATIO=1.00
+#   TONOSAMA_FAST_SCORE_PREFILTER_MIN=0
 #   TONOSAMA_FAST_SCORE_AI_SHORT_CIRCUIT=1
+#   TONOSAMA_AI_SOFT_RESCUE=1
+#   TONOSAMA_AI_RESCUE_MIN_VOLUME=500000
+#   TONOSAMA_AI_RESCUE_MIN_RANGE_PCT=4.0
+#   TONOSAMA_AI_RESCUE_MIN_SURGE=3.0
+#   TONOSAMA_AI_RESCUE_MIN_PRICE_CHANGE_PCT=0.08
+#   TONOSAMA_AI_RESCUE_MIN_SLOPE_ABS=0.0003
 # ============================================================
 
 from __future__ import annotations
@@ -102,10 +96,6 @@ def _sample_rows(runner: Any, df: pd.DataFrame, cols: list[str], limit: int = 8)
 
 
 def _patched_build_feature_df_with_5sec() -> pd.DataFrame:
-    """runner.build_feature_df_with_5sec の軽量置換。
-
-    ほぼ元処理と同じだが、5秒特徴取得前に _tonosama_score の早期フィルタを追加する。
-    """
     if not _env_bool("TONOSAMA_FAST_SCORE_PREFILTER", True):
         return _ORIG_BUILD_FEATURE_DF_WITH_5SEC()
 
@@ -138,27 +128,13 @@ def _patched_build_feature_df_with_5sec() -> pd.DataFrame:
         logger.warning("[TONOSAMA ENTRY] pre 5sec prepare_entry_scores failed", exc_info=True)
 
     sample_cols = [
-        "symbol",
-        "symbolname",
-        "close",
-        "_latest_volume",
-        "_body_change_pct",
-        "_signed_body_change_pct",
-        "_intrabar_range_pct",
-        "_close_position_pct",
-        "_upper_wick_pct",
-        "_lower_wick_pct",
-        "_max_volume_surge_ratio",
-        "_max_price_change_pct",
-        "_slope",
-        "_tonosama_score",
-        "score",
-        "final_score",
-        "score_mtf",
-        "mtf",
+        "symbol", "symbolname", "close", "_latest_volume",
+        "_body_change_pct", "_signed_body_change_pct", "_intrabar_range_pct",
+        "_close_position_pct", "_upper_wick_pct", "_lower_wick_pct",
+        "_max_volume_surge_ratio", "_max_price_change_pct", "_slope",
+        "_tonosama_score", "score", "final_score", "score_mtf", "mtf",
     ]
 
-    # ここが追加点: 5秒特徴取得前に、どう見てもMIN_FINAL_SCOREへ届かない候補を落とす。
     if "_tonosama_score" in x.columns:
         before = x.copy()
         th = _threshold(runner)
@@ -175,18 +151,12 @@ def _patched_build_feature_df_with_5sec() -> pd.DataFrame:
         except Exception:
             logger.warning(
                 "[TONOSAMA FAST SCORE PREFILTER] pre_5sec before=%s after=%s threshold=%.3f sample=%s",
-                len(before),
-                len(x),
-                th,
-                _sample_rows(runner, before, sample_cols, limit=8),
+                len(before), len(x), th, _sample_rows(runner, before, sample_cols, limit=8),
             )
         if x.empty:
             logger.info(
                 "[TONOSAMA ENTRY] no candidates after fast score prefilter base_rows=%s primary_rows=%s threshold=%.3f elapsed=%.3fs",
-                base_rows,
-                primary_rows,
-                th,
-                time.perf_counter() - started,
+                base_rows, primary_rows, th, time.perf_counter() - started,
             )
             return pd.DataFrame()
 
@@ -225,11 +195,7 @@ def _patched_build_feature_df_with_5sec() -> pd.DataFrame:
     x = runner.prepare_entry_scores(x)
     logger.info(
         "[TONOSAMA ENTRY] feature build done base_rows=%s primary_rows=%s five_sec_rows=%s feature_missing=%s pre_5sec_head=%s post_5sec_head=%s elapsed=%.3fs fast_score_prefilter=True",
-        base_rows,
-        primary_rows,
-        len(x),
-        feature_missing,
-        before_head,
+        base_rows, primary_rows, len(x), feature_missing, before_head,
         _sample_rows(runner, x, [
             "symbol", "symbolname", "close", "_latest_volume", "_body_change_pct", "_signed_body_change_pct",
             "_intrabar_range_pct", "_close_position_pct", "_upper_wick_pct", "_lower_wick_pct",
@@ -239,6 +205,69 @@ def _patched_build_feature_df_with_5sec() -> pd.DataFrame:
         time.perf_counter() - started,
     )
     return x
+
+
+def _infer_side(row: Any) -> str:
+    max_chg = _safe_float(row.get("_max_price_change_pct"), 0.0) if hasattr(row, "get") else 0.0
+    signed_body = _safe_float(row.get("_signed_body_change_pct"), max_chg) if hasattr(row, "get") else max_chg
+    slope = _safe_float(row.get("_slope"), 0.0) if hasattr(row, "get") else 0.0
+    if max_chg < 0 or signed_body < 0 or slope < 0:
+        return "SELL"
+    return "BUY"
+
+
+def _soft_rescue_ai_ng(row: Any, reason: str) -> tuple[bool, str]:
+    if not _env_bool("TONOSAMA_AI_SOFT_RESCUE", True):
+        return False, "disabled"
+    r = str(reason or "")
+    # クライマックス/方向NGは救済しない。ここは高値掴み・底売りを防ぐ最後の壁。
+    hard_words = (
+        "climax",
+        "selling_climax",
+        "buying_climax",
+        "direction_ng",
+        "reverse",
+        "upper_wick_reversal",
+        "lower_wick_reversal",
+    )
+    if any(w in r for w in hard_words):
+        return False, "hard_reason"
+    if not ("price change low" in r or "slope low" in r):
+        return False, "not_soft_reason"
+
+    volume = _safe_float(row.get("_latest_volume"), 0.0) if hasattr(row, "get") else 0.0
+    rng = _safe_float(row.get("_intrabar_range_pct"), 0.0) if hasattr(row, "get") else 0.0
+    surge = _safe_float(row.get("_max_volume_surge_ratio"), 0.0) if hasattr(row, "get") else 0.0
+    price_chg = _safe_float(row.get("_max_price_change_pct"), 0.0) if hasattr(row, "get") else 0.0
+    body = _safe_float(row.get("_signed_body_change_pct"), 0.0) if hasattr(row, "get") else 0.0
+    slope = _safe_float(row.get("_slope"), 0.0) if hasattr(row, "get") else 0.0
+    side = _infer_side(row)
+
+    min_vol = _env_float("TONOSAMA_AI_RESCUE_MIN_VOLUME", 500000.0)
+    min_range = _env_float("TONOSAMA_AI_RESCUE_MIN_RANGE_PCT", 4.0)
+    min_surge = _env_float("TONOSAMA_AI_RESCUE_MIN_SURGE", 3.0)
+    min_chg = _env_float("TONOSAMA_AI_RESCUE_MIN_PRICE_CHANGE_PCT", 0.08)
+    min_slope_abs = _env_float("TONOSAMA_AI_RESCUE_MIN_SLOPE_ABS", 0.0003)
+
+    if volume < min_vol:
+        return False, "volume_low"
+    if rng < min_range:
+        return False, "range_low"
+    if surge < min_surge:
+        return False, "surge_low"
+    if abs(price_chg) < min_chg and abs(body) < min_chg and abs(slope) < min_slope_abs:
+        return False, "move_low"
+    # 方向が完全に反対のものは救済しない。
+    if side == "BUY" and price_chg < -min_chg:
+        return False, "buy_price_reverse"
+    if side == "SELL" and price_chg > min_chg:
+        return False, "sell_price_reverse"
+
+    detail = (
+        f"soft_rescue side={side} volume={volume:.0f} range={rng:.3f} "
+        f"surge={surge:.2f} price_chg={price_chg:.3f} body={body:.3f} slope={slope:.6f}"
+    )
+    return True, detail
 
 
 def _patched_ai_check_tonosama_entry(row: Any):
@@ -251,14 +280,32 @@ def _patched_ai_check_tonosama_entry(row: Any):
                 symbol = row.get("symbol", "") if hasattr(row, "get") else ""
                 logger.info(
                     "[TONOSAMA FAST SCORE PREFILTER] AI short-circuit symbol=%s raw_score=%.4f threshold=%.4f reason=final_score_low_pre_ai",
-                    symbol,
-                    raw_score,
-                    th,
+                    symbol, raw_score, th,
                 )
                 return False, 0.0, f"final_score_low_pre_ai raw_score={raw_score:.4f} < {th:.4f}"
         except Exception:
             logger.debug("[TONOSAMA FAST SCORE PREFILTER] AI short-circuit check failed", exc_info=True)
-    return _ORIG_AI_CHECK(row)
+
+    ok, prob, reason = _ORIG_AI_CHECK(row)
+    if ok:
+        return ok, prob, reason
+
+    try:
+        symbol = row.get("symbol", "") if hasattr(row, "get") else ""
+        rescue, detail = _soft_rescue_ai_ng(row, str(reason or ""))
+        if rescue:
+            logger.warning(
+                "[TONOSAMA AI SOFT RESCUE] OK symbol=%s original_reason=%s detail=%s",
+                symbol, reason, detail,
+            )
+            return True, max(_safe_float(prob, 0.0), 0.0), f"AI soft rescue: {detail}; original={reason}"
+        logger.info(
+            "[TONOSAMA AI SOFT RESCUE] keep NG symbol=%s original_reason=%s no_rescue=%s",
+            symbol, reason, detail,
+        )
+    except Exception:
+        logger.debug("[TONOSAMA AI SOFT RESCUE] failed", exc_info=True)
+    return ok, prob, reason
 
 
 def install() -> bool:
@@ -271,27 +318,33 @@ def install() -> bool:
 
         patched = []
         cur_build = getattr(runner, "build_feature_df_with_5sec", None)
-        if callable(cur_build) and not getattr(cur_build, "_tonosama_fast_score_prefilter_v1", False):
-            _ORIG_BUILD_FEATURE_DF_WITH_5SEC = cur_build
-            _patched_build_feature_df_with_5sec._tonosama_fast_score_prefilter_v1 = True  # type: ignore[attr-defined]
+        if callable(cur_build) and not getattr(cur_build, "_tonosama_fast_score_prefilter_v2", False):
+            _ORIG_BUILD_FEATURE_DF_WITH_5SEC = getattr(cur_build, "_original", cur_build)
+            _patched_build_feature_df_with_5sec._tonosama_fast_score_prefilter_v2 = True  # type: ignore[attr-defined]
+            _patched_build_feature_df_with_5sec._original = _ORIG_BUILD_FEATURE_DF_WITH_5SEC  # type: ignore[attr-defined]
             runner.build_feature_df_with_5sec = _patched_build_feature_df_with_5sec
             patched.append("runner.build_feature_df_with_5sec")
 
         cur_ai = getattr(runner, "ai_check_tonosama_entry", None)
-        if callable(cur_ai) and not getattr(cur_ai, "_tonosama_fast_score_prefilter_v1", False):
-            _ORIG_AI_CHECK = cur_ai
-            _patched_ai_check_tonosama_entry._tonosama_fast_score_prefilter_v1 = True  # type: ignore[attr-defined]
+        if callable(cur_ai) and not getattr(cur_ai, "_tonosama_fast_score_prefilter_v2", False):
+            _ORIG_AI_CHECK = getattr(cur_ai, "_original", cur_ai)
+            _patched_ai_check_tonosama_entry._tonosama_fast_score_prefilter_v2 = True  # type: ignore[attr-defined]
+            _patched_ai_check_tonosama_entry._original = _ORIG_AI_CHECK  # type: ignore[attr-defined]
             runner.ai_check_tonosama_entry = _patched_ai_check_tonosama_entry
             ai_gate.ai_check_tonosama_entry = _patched_ai_check_tonosama_entry
             patched.append("ai_check_tonosama_entry")
 
         _PATCHED = True
         logger.warning(
-            "[TONOSAMA FAST SCORE PREFILTER] installed patched=%s enabled=%s ratio=%.2f ai_short=%s",
+            "[TONOSAMA FAST SCORE PREFILTER] installed v2 patched=%s enabled=%s ratio=%.2f ai_short=%s soft_rescue=%s rescue_min_vol=%.0f rescue_min_range=%.2f rescue_min_chg=%.3f",
             patched,
             _env_bool("TONOSAMA_FAST_SCORE_PREFILTER", True),
             _env_float("TONOSAMA_FAST_SCORE_PREFILTER_RATIO", 1.0),
             _env_bool("TONOSAMA_FAST_SCORE_AI_SHORT_CIRCUIT", True),
+            _env_bool("TONOSAMA_AI_SOFT_RESCUE", True),
+            _env_float("TONOSAMA_AI_RESCUE_MIN_VOLUME", 500000.0),
+            _env_float("TONOSAMA_AI_RESCUE_MIN_RANGE_PCT", 4.0),
+            _env_float("TONOSAMA_AI_RESCUE_MIN_PRICE_CHANGE_PCT", 0.08),
         )
         return True
     except Exception:
