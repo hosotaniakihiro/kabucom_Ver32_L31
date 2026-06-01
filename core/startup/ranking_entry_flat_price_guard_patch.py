@@ -1,24 +1,13 @@
 # ============================================================
 # File   : core/startup/ranking_entry_flat_price_guard_patch.py
-# Version: V1.3-SILENT-LAST-CHANCE-VOLUME-NORMALIZE
+# Version: V1.4-RECURSION-SAFE-WITH-FILTER-RESCUE
 # ------------------------------------------------------------
 # 目的:
 #   1) ランキング由来ENTRYで、価格横ばいだけで大量DROPされる問題を緩和する。
 #   2) ranking_entry が global_data のランキングDFだけを見て no_ranking_df で止まる問題を、
 #      ats.ats_ranking.db_path.get_usable_ranking_db_path() からのfallbackで補正する。
 #   3) last-chance volume normalize の銘柄別ログを既定OFFにして、ログ大量出力と処理遅延を抑える。
-#
-# V1.3:
-#   - [RANKING FLAT PRICE PATCH] last-chance volume normalize を既定では出さない
-#   - 同一(symbol, price, volume, turnover)の補正結果をキャッシュ
-#   - 詳細確認時のみ以下でログ出力
-#       RANKING_FLAT_PRICE_PATCH_LOG_NORMALIZE=1
-#       RANKING_FLAT_PRICE_PATCH_LOG_FIRST_N=30
-#
-# V1.2:
-#   - 存在しない resolve_ranking_db_path import を廃止
-#   - 実在API get_usable_ranking_db_path(force_refresh=True, allow_fallback=False,
-#     prefer_today_even_if_empty=True) を使用
+#   4) ranking_entry_filter_rescue_patch と相互ラップしても RecursionError にしない。
 # ============================================================
 
 from __future__ import annotations
@@ -35,6 +24,7 @@ logger = logging.getLogger(__name__)
 _PATCHED = False
 _ORIGINAL_FILTER = None
 _ORIGINAL_GET_RANKING_SOURCE_DF = None
+_IN_FILTER = False
 
 _NORMALIZE_CACHE: dict[tuple[str, float, float, float], dict[str, Any]] = {}
 _LOGGED_NORMALIZE_KEYS: set[tuple[str, float, float, float]] = set()
@@ -75,7 +65,7 @@ def _f(v: Any, default: float = 0.0) -> float:
     try:
         if v is None or str(v).strip() == "":
             return float(default)
-        x = float(str(v).replace(",", ""))
+        x = float(str(v).replace(",", "").replace("%", ""))
         return float(default) if x != x else x
     except Exception:
         return float(default)
@@ -97,12 +87,7 @@ def _get_cfg() -> dict:
 
 
 def _normalize_key(row: Dict[str, Any], price: float, volume: float, turnover: float) -> tuple[str, float, float, float]:
-    return (
-        str(row.get("symbol") or "").strip(),
-        round(float(price), 4),
-        round(float(volume), 4),
-        round(float(turnover), 4),
-    )
+    return (str(row.get("symbol") or "").strip(), round(float(price), 4), round(float(volume), 4), round(float(turnover), 4))
 
 
 def _should_log_normalize(key: tuple[str, float, float, float]) -> bool:
@@ -110,9 +95,7 @@ def _should_log_normalize(key: tuple[str, float, float, float]) -> bool:
     if _env_bool("RANKING_FLAT_PRICE_PATCH_LOG_NORMALIZE", False):
         return True
     limit = _env_int("RANKING_FLAT_PRICE_PATCH_LOG_FIRST_N", 0)
-    if limit <= 0:
-        return False
-    if key in _LOGGED_NORMALIZE_KEYS:
+    if limit <= 0 or key in _LOGGED_NORMALIZE_KEYS:
         return False
     _LOGGED_NORMALIZE_KEYS.add(key)
     _LOG_NORMALIZE_COUNT += 1
@@ -182,28 +165,45 @@ def _flat_price_allowed(row: Dict[str, Any], prev_h: Dict[str, Any], reason: str
         return False
     if not (str(reason).startswith("BUY_PRICE_NOT_UP") or str(reason).startswith("SELL_PRICE_NOT_DOWN")):
         return False
-
     cfg = _get_cfg()
     rank_cfg = cfg.get("RANKING", {}) if isinstance(cfg, dict) else {}
     max_rank = _i(rank_cfg.get("FLAT_PRICE_ALLOW_MAX_RANK", 12), 12)
     rank = _i(row.get("rank_position"), 999999)
-    prev_rank = _i(prev_h.get("last_rank_position"), 999999)
-    consecutive = _i(prev_h.get("consecutive"), 0) + 1 if prev_h else 1
+    prev_rank = _i((prev_h or {}).get("last_rank_position"), 999999)
+    consecutive = _i((prev_h or {}).get("consecutive"), 0) + 1 if prev_h else 1
     min_consecutive = _i(rank_cfg.get("MIN_CONSECUTIVE_APPEAR", 2), 2)
-
     rank_not_worse = prev_rank < 999999 and rank <= prev_rank
     rank_top = rank <= max_rank
     return consecutive >= min_consecutive and (rank_not_worse or rank_top)
 
 
+def _call_original_filter(row: Dict[str, Any], side: str, prev_h: Dict[str, Any], score: float, parts: Dict[str, float]) -> Tuple[bool, str]:
+    if not callable(_ORIGINAL_FILTER):
+        return False, "ORIGINAL_FILTER_NOT_AVAILABLE"
+    try:
+        return _ORIGINAL_FILTER(row, side, prev_h, score, parts)
+    except RecursionError:
+        logger.warning(
+            "[RANKING FLAT PRICE PATCH] original filter recursion detected symbol=%s side=%s original=%s",
+            row.get("symbol"), side, getattr(_ORIGINAL_FILTER, "__name__", repr(_ORIGINAL_FILTER)),
+        )
+        return False, "FLAT_PRICE_FILTER_RECURSION"
+
+
 def _patched_filter(row: Dict[str, Any], side: str, prev_h: Dict[str, Any], score: float, parts: Dict[str, float]) -> Tuple[bool, str]:
-    if callable(_ORIGINAL_FILTER):
+    global _IN_FILTER
+    if _IN_FILTER:
+        # filter_rescue_patch と循環した場合は、ここで止めて上位のrescueへ返す。
+        return False, "FLAT_PRICE_FILTER_RECURSION"
+
+    _IN_FILTER = True
+    try:
         row = _repair_volume_units(row)
-        ok, reason = _ORIGINAL_FILTER(row, side, prev_h, score, parts)
+        ok, reason = _call_original_filter(row, side, prev_h, score, parts)
         if ok:
             return ok, reason
 
-        if _flat_price_allowed(row, prev_h, reason):
+        if _flat_price_allowed(row, prev_h or {}, reason):
             price = _f(row.get("price") or row.get("current_price"), 0.0)
             patched_prev = dict(prev_h or {})
             if price > 0:
@@ -211,27 +211,24 @@ def _patched_filter(row: Dict[str, Any], side: str, prev_h: Dict[str, Any], scor
                     patched_prev["last_price"] = price * 0.999999
                 else:
                     patched_prev["last_price"] = price * 1.000001
-            ok2, reason2 = _ORIGINAL_FILTER(row, side, patched_prev, score, parts)
+            ok2, reason2 = _call_original_filter(row, side, patched_prev, score, parts)
             if ok2:
                 if _env_bool("RANKING_FLAT_PRICE_PATCH_LOG_PASS", False):
                     logger.info(
                         "[RANKING FLAT PRICE PATCH] pass flat price symbol=%s side=%s rank=%s prev_rank=%s reason=%s",
-                        row.get("symbol"), side, row.get("rank_position"), prev_h.get("last_rank_position"), reason,
+                        row.get("symbol"), side, row.get("rank_position"), (prev_h or {}).get("last_rank_position"), reason,
                     )
                 return True, "OK_FLAT_PRICE_RANK_STRONG"
             return False, reason2
         return ok, reason
-    return False, "ORIGINAL_FILTER_NOT_AVAILABLE"
+    finally:
+        _IN_FILTER = False
 
 
 def _resolve_ranking_db_path() -> str:
     try:
         from ats.ats_ranking.db_path import get_usable_ranking_db_path
-        p = get_usable_ranking_db_path(
-            force_refresh=True,
-            allow_fallback=False,
-            prefer_today_even_if_empty=True,
-        )
+        p = get_usable_ranking_db_path(force_refresh=True, allow_fallback=False, prefer_today_even_if_empty=True)
         return str(p or "")
     except Exception:
         logger.warning("[RANKING DB FALLBACK PATCH] get_usable_ranking_db_path failed", exc_info=True)
@@ -255,7 +252,6 @@ def _cols(conn: sqlite3.Connection, table: str) -> list[str]:
 def _read_latest_ranking_snapshot_from_db() -> pd.DataFrame:
     if not _env_bool("RANKING_ENTRY_DB_FALLBACK_ENABLED", True):
         return pd.DataFrame()
-
     db_path = _resolve_ranking_db_path()
     if not db_path or not os.path.exists(db_path):
         logger.warning("[RANKING DB FALLBACK PATCH] db not found path=%s", db_path)
@@ -325,9 +321,9 @@ def install() -> bool:
     try:
         import trading.ranking.entry_from_ranking as efr
         cur = getattr(efr, "_passes_ranking_only_filters", None)
-        if callable(cur) and not getattr(cur, "_ranking_flat_price_patch", False):
+        if callable(cur) and not getattr(cur, "_ranking_flat_price_patch_v14", False):
             _ORIGINAL_FILTER = cur
-            _patched_filter._ranking_flat_price_patch = True  # type: ignore[attr-defined]
+            _patched_filter._ranking_flat_price_patch_v14 = True  # type: ignore[attr-defined]
             _patched_filter._original = cur  # type: ignore[attr-defined]
             efr._passes_ranking_only_filters = _patched_filter
 
@@ -340,7 +336,7 @@ def install() -> bool:
 
         _PATCHED = True
         logger.warning(
-            "[RANKING FLAT PRICE PATCH] installed v1.3 db_fallback=True silent_normalize=%s log_first_n=%s",
+            "[RANKING FLAT PRICE PATCH] installed v1.4 db_fallback=True recursion_safe=True silent_normalize=%s log_first_n=%s",
             not _env_bool("RANKING_FLAT_PRICE_PATCH_LOG_NORMALIZE", False),
             _env_int("RANKING_FLAT_PRICE_PATCH_LOG_FIRST_N", 0),
         )
@@ -354,6 +350,5 @@ try:
     install()
 except Exception:
     logger.exception("[RANKING FLAT PRICE PATCH] auto install failed")
-
 
 __all__ = ["install"]
