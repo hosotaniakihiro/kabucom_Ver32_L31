@@ -10,10 +10,11 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.23-RANKING-ENTRY-TIMEOUT-PATCH
+# Version: Ver38.24-RANKING-FILTER-RESCUE-PATCH
 # ------------------------------------------------------------
 # ✔ _log_skip reason衝突ガードを全runtime patch後の最後に再適用
-# ✔ RANKING ENTRY controller timeoutを60秒へ拡張
+# ✔ RANKING ENTRY controller timeoutを拡張
+# ✔ RANKING_ENTRY 強スコアの技術フィルタ全落ちを救済
 # ✔ 既存の起動処理は維持
 # ============================================================
 
@@ -39,8 +40,8 @@ os.environ.setdefault("SUMMARY_AI_MIN_5SEC_PRICE_CHANGE_PCT", "0.01")
 os.environ.setdefault("OPTIONAL_LIGHT_MODE", "1")
 os.environ.setdefault("OPTIONAL_SKIP_INGEST", "1")
 os.environ.setdefault("OPTIONAL_RUN_INGEST_IN_MAIN", "0")
-os.environ.setdefault("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", "60")
-os.environ.setdefault("RANKING_ENTRY_BUILD_TIMEOUT_SEC", "90")
+os.environ.setdefault("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", "120")
+os.environ.setdefault("RANKING_ENTRY_BUILD_TIMEOUT_SEC", "180")
 
 try:
     from core.logging.console_tee import setup_console_tee, rebind_logging_streams_to_console_tee
@@ -150,6 +151,7 @@ def _install_main_runtime_patches():
         ("core.startup.tonosama_5sec_stopped_relax_patch", "install"),
         ("core.startup.board_wall_stall_exit_patch", "install"),
         ("core.startup.ranking_entry_controller_timeout_patch", "install"),
+        ("core.startup.ranking_entry_filter_rescue_patch", "install"),
         ("core.startup.entry_log_skip_reason_collision_patch", "install"),
     ]
     for mod_name, fn_name in patches:
