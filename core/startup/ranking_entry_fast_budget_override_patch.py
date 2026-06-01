@@ -2,31 +2,61 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+import time
 
 logger = logging.getLogger(__name__)
 _INSTALLED = False
+_STOP = False
+
+
+def _apply_once() -> bool:
+    os.environ["RANKING_ENTRY_RUNTIME_BUDGET_SEC"] = os.getenv("RANKING_ENTRY_FAST_RUNTIME_BUDGET_SEC", "25")
+    os.environ["RANKING_ENTRY_BUILD_TIMEOUT_SEC"] = os.getenv("RANKING_ENTRY_FAST_BUILD_TIMEOUT_SEC", "30")
+    os.environ["RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC"] = os.getenv("RANKING_ENTRY_FAST_CONTROLLER_TIMEOUT_SEC", "30")
+    os.environ["RANKING_ENTRY_MAX_PENDING_PER_RUN"] = os.getenv("RANKING_ENTRY_FAST_MAX_PENDING_PER_RUN", "1")
+    os.environ.setdefault("RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC", "45")
+    os.environ.setdefault("RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC", "120")
+    try:
+        import trading.entry_exit.tasks as tasks
+        tasks.RANKING_ENTRY_BUILD_TIMEOUT_SEC = float(os.environ["RANKING_ENTRY_BUILD_TIMEOUT_SEC"])
+        tasks.RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC = float(os.environ["RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC"])
+    except Exception:
+        return False
+    return True
+
+
+def _watch_loop() -> None:
+    # 他patchが後から150/180/120へ戻しても、起動後しばらく最後に上書きする。
+    for i in range(120):
+        try:
+            ok = _apply_once()
+            if i in (0, 1, 5, 15, 30, 60, 119):
+                logger.warning(
+                    "[RANKING ENTRY FAST BUDGET OVERRIDE] enforce ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s",
+                    ok,
+                    os.environ.get("RANKING_ENTRY_RUNTIME_BUDGET_SEC"),
+                    os.environ.get("RANKING_ENTRY_BUILD_TIMEOUT_SEC"),
+                    os.environ.get("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC"),
+                    os.environ.get("RANKING_ENTRY_MAX_PENDING_PER_RUN"),
+                )
+        except Exception:
+            logger.exception("[RANKING ENTRY FAST BUDGET OVERRIDE] enforce failed")
+        time.sleep(0.5)
 
 
 def install() -> bool:
     global _INSTALLED
     if _INSTALLED:
+        _apply_once()
         return True
     try:
-        os.environ["RANKING_ENTRY_RUNTIME_BUDGET_SEC"] = os.getenv("RANKING_ENTRY_FAST_RUNTIME_BUDGET_SEC", "25")
-        os.environ["RANKING_ENTRY_BUILD_TIMEOUT_SEC"] = os.getenv("RANKING_ENTRY_FAST_BUILD_TIMEOUT_SEC", "30")
-        os.environ["RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC"] = os.getenv("RANKING_ENTRY_FAST_CONTROLLER_TIMEOUT_SEC", "30")
-        os.environ["RANKING_ENTRY_MAX_PENDING_PER_RUN"] = os.getenv("RANKING_ENTRY_FAST_MAX_PENDING_PER_RUN", "1")
-        os.environ.setdefault("RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC", "45")
-        os.environ.setdefault("RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC", "120")
-        try:
-            import trading.entry_exit.tasks as tasks
-            tasks.RANKING_ENTRY_BUILD_TIMEOUT_SEC = float(os.environ["RANKING_ENTRY_BUILD_TIMEOUT_SEC"])
-            tasks.RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC = float(os.environ["RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC"])
-        except Exception:
-            logger.debug("[RANKING ENTRY FAST BUDGET OVERRIDE] tasks constants not ready", exc_info=True)
+        ok = _apply_once()
+        threading.Thread(target=_watch_loop, name="ranking-entry-fast-budget-override", daemon=True).start()
         _INSTALLED = True
         logger.warning(
-            "[RANKING ENTRY FAST BUDGET OVERRIDE] installed runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s",
+            "[RANKING ENTRY FAST BUDGET OVERRIDE] installed ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s watcher=True",
+            ok,
             os.environ.get("RANKING_ENTRY_RUNTIME_BUDGET_SEC"),
             os.environ.get("RANKING_ENTRY_BUILD_TIMEOUT_SEC"),
             os.environ.get("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC"),
