@@ -1,14 +1,15 @@
 # ============================================================
 # File   : core/startup/ranking_entry_controller_timeout_patch.py
-# Version: V1.1-RANKING-BUILD-TIMEOUT-DISPATCH-PENDING
+# Version: V1.2-RANKING-RUNTIME-BUDGET-EXTEND
 # ------------------------------------------------------------
 # RANKING ENTRY は pending 作成後の entry_controller が timeout しやすい。
-# さらに build 側も90秒 timeoutするが、その直前に RANKING PENDING ADD が
-# 出ている場合、pending は存在するのに controller が呼ばれない。
+# さらに fast patch の内部 runtime budget が60秒だと、
+# _prepare_rows -> prefilter だけで使い切って technical 前に return 0 になる。
 #
 # 対策:
-#   - RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC を既定60秒へ引き上げる
-#   - RANKING_ENTRY_BUILD_TIMEOUT_SEC を既定150秒へ引き上げる
+#   - RANKING_ENTRY_RUNTIME_BUDGET_SEC を150秒へ強制
+#   - RANKING_ENTRY_BUILD_TIMEOUT_SEC を180秒へ拡張
+#   - RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC は60秒へ拡張
 #   - build timeout時でも pending が増えていれば controller をdispatchする
 # ============================================================
 
@@ -91,7 +92,7 @@ def _patched_run_ranking_entry_safe() -> int:
         tasks._RANKING_ENTRY_STARTED_AT = started_dt
 
     try:
-        logger.info("[RANKING ENTRY SCHEDULE] fire at=%s patched=v1.1", started_dt.strftime("%Y-%m-%d %H:%M:%S"))
+        logger.info("[RANKING ENTRY SCHEDULE] fire at=%s patched=v1.2", started_dt.strftime("%Y-%m-%d %H:%M:%S"))
         before_pending = _pending_count_for_source("RANKING")
         build_fn = tasks._resolve_callable("trading.ranking.entry_from_ranking", "run_ranking_entry_pipeline")
         if not callable(build_fn):
@@ -172,8 +173,11 @@ def install() -> bool:
     if _INSTALLED:
         return True
     try:
+        # setdefault では既存 env=60 が残るため、ここは明示的に上書きする。
+        old_runtime_budget = os.environ.get("RANKING_ENTRY_RUNTIME_BUDGET_SEC")
+        os.environ["RANKING_ENTRY_RUNTIME_BUDGET_SEC"] = str(max(_env_float("RANKING_ENTRY_RUNTIME_BUDGET_SEC", 150.0), 150.0))
         os.environ.setdefault("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", "60")
-        os.environ.setdefault("RANKING_ENTRY_BUILD_TIMEOUT_SEC", "150")
+        os.environ.setdefault("RANKING_ENTRY_BUILD_TIMEOUT_SEC", "180")
         os.environ.setdefault("RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC", "90")
         os.environ.setdefault("RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC", "300")
 
@@ -182,25 +186,27 @@ def install() -> bool:
         old_controller = float(getattr(tasks, "RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", 20.0) or 20.0)
         old_build = float(getattr(tasks, "RANKING_ENTRY_BUILD_TIMEOUT_SEC", 90.0) or 90.0)
         new_controller = max(old_controller, _env_float("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", 60.0), 60.0)
-        new_build = max(old_build, _env_float("RANKING_ENTRY_BUILD_TIMEOUT_SEC", 150.0), 150.0)
+        new_build = max(old_build, _env_float("RANKING_ENTRY_BUILD_TIMEOUT_SEC", 180.0), 180.0)
 
         tasks.RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC = new_controller
         tasks.RANKING_ENTRY_BUILD_TIMEOUT_SEC = new_build
 
         cur = getattr(tasks, "_run_ranking_entry_safe", None)
-        if callable(cur) and not getattr(cur, "_ranking_timeout_dispatch_patch_v11", False):
+        if callable(cur) and not getattr(cur, "_ranking_timeout_dispatch_patch_v12", False):
             _ORIG_RANKING_SAFE = cur
-            _patched_run_ranking_entry_safe._ranking_timeout_dispatch_patch_v11 = True  # type: ignore[attr-defined]
+            _patched_run_ranking_entry_safe._ranking_timeout_dispatch_patch_v12 = True  # type: ignore[attr-defined]
             _patched_run_ranking_entry_safe._original = cur  # type: ignore[attr-defined]
             tasks._run_ranking_entry_safe = _patched_run_ranking_entry_safe
 
         _INSTALLED = True
         logger.warning(
-            "[RANKING ENTRY TIMEOUT PATCH] installed v1.1 controller_timeout %.1f->%.1f build_timeout %.1f->%.1f timeout_dispatch_pending=True",
+            "[RANKING ENTRY TIMEOUT PATCH] installed v1.2 controller_timeout %.1f->%.1f build_timeout %.1f->%.1f runtime_budget old=%s new=%s timeout_dispatch_pending=True",
             old_controller,
             new_controller,
             old_build,
             new_build,
+            old_runtime_budget,
+            os.environ.get("RANKING_ENTRY_RUNTIME_BUDGET_SEC"),
         )
         return True
     except Exception:
