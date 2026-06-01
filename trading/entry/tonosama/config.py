@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/tonosama/config.py
-# Version: Ver2.8-TONOSAMA-FINAL-SCORE-2P3
+# Version: Ver2.9-TONOSAMA-ALERT-LIQUIDITY-GUARD
 # ------------------------------------------------------------
 # 方針:
 #   - volume_surge.py / history guard で履歴不足fail-openを許可した後、
@@ -11,6 +11,9 @@
 #     slope/range rescue 後、raw_score=2.3 の候補が final_score_low で
 #     連続して落ちるため、TONOSAMA_MIN_FINAL_SCORE の floor を 2.5 -> 2.3 に緩和。
 #     ただし後段のAI/流動性/板/方向ガードはそのまま残す。
+#   - Ver2.9:
+#     PENDING/Discordアラート直前にも出来高・売買代金ガードを入れ、
+#     低出来高銘柄の通知を止める。
 # ============================================================
 
 from __future__ import annotations
@@ -40,6 +43,14 @@ os.environ.setdefault("TONOSAMA_MIN_ACTIVE_VOLUME_MINUTES", "8")
 os.environ.setdefault("TONOSAMA_MIN_RECENT_3M_VOLUME", "50000")
 os.environ.setdefault("TONOSAMA_MIN_RECENT_5M_VOLUME", "80000")
 
+# PENDING / Discordアラート直前の最終流動性ガード。
+# 発注最終ガードとは別に、通知だけ先に出てしまう問題を防ぐ。
+os.environ.setdefault("TONOSAMA_ALERT_LIQ_GUARD", "1")
+os.environ.setdefault("TONOSAMA_ALERT_REJECT_VOLUME_MISSING", "1")
+os.environ.setdefault("TONOSAMA_ALERT_MIN_LATEST_VOLUME", "30000")
+os.environ.setdefault("TONOSAMA_ALERT_MIN_RECENT_BAR_VOLUME", "30000")
+os.environ.setdefault("TONOSAMA_ALERT_MIN_TURNOVER", "10000000")
+
 
 def _install_intraday_liquidity_guard() -> None:
     try:
@@ -52,7 +63,19 @@ def _install_intraday_liquidity_guard() -> None:
         pass
 
 
+def _install_alert_liquidity_guard() -> None:
+    try:
+        if str(os.getenv("TONOSAMA_ALERT_LIQ_GUARD", "1")).strip().lower() in {"0", "false", "no", "off"}:
+            return
+        from core.startup.tonosama_alert_liquidity_guard_patch import install
+        install()
+    except Exception:
+        # config import時に落ちると殿様全体が止まるため、ここでは握りつぶす。
+        pass
+
+
 _install_intraday_liquidity_guard()
+_install_alert_liquidity_guard()
 
 
 def _env_float(name: str, default: float) -> float:
