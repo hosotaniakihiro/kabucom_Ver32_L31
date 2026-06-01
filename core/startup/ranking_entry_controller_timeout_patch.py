@@ -1,15 +1,16 @@
 # ============================================================
 # File   : core/startup/ranking_entry_controller_timeout_patch.py
-# Version: V1.2-RANKING-RUNTIME-BUDGET-EXTEND
+# Version: V1.3-RANKING-CONTROLLER-TIMEOUT-EXTEND
 # ------------------------------------------------------------
 # RANKING ENTRY は pending 作成後の entry_controller が timeout しやすい。
-# さらに fast patch の内部 runtime budget が60秒だと、
-# _prepare_rows -> prefilter だけで使い切って technical 前に return 0 になる。
+# fast patch の内部 runtime budget と controller timeout の両方を
+# 実運用ログに合わせて拡張する。
 #
 # 対策:
 #   - RANKING_ENTRY_RUNTIME_BUDGET_SEC を150秒へ強制
 #   - RANKING_ENTRY_BUILD_TIMEOUT_SEC を180秒へ拡張
-#   - RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC は60秒へ拡張
+#   - RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC を120秒へ拡張
+#   - RANKING_ENTRY_MAX_PENDING_PER_RUN は1件へ寄せ、pending作成後すぐcontrollerへ渡す
 #   - build timeout時でも pending が増えていれば controller をdispatchする
 # ============================================================
 
@@ -73,6 +74,15 @@ def _pending_count_for_source(source: str) -> int:
     return int(total)
 
 
+def _dispatch_ranking_controller(tasks, timeout_sec: float) -> None:
+    tasks._dispatch_entry_controller(
+        pipeline_source="RANKING",
+        interval=1,
+        timeout_sec=timeout_sec,
+        reason="RANKING ENTRY SCHEDULE",
+    )
+
+
 def _patched_run_ranking_entry_safe() -> int:
     import trading.entry_exit.tasks as tasks
 
@@ -92,7 +102,7 @@ def _patched_run_ranking_entry_safe() -> int:
         tasks._RANKING_ENTRY_STARTED_AT = started_dt
 
     try:
-        logger.info("[RANKING ENTRY SCHEDULE] fire at=%s patched=v1.2", started_dt.strftime("%Y-%m-%d %H:%M:%S"))
+        logger.info("[RANKING ENTRY SCHEDULE] fire at=%s patched=v1.3", started_dt.strftime("%Y-%m-%d %H:%M:%S"))
         before_pending = _pending_count_for_source("RANKING")
         build_fn = tasks._resolve_callable("trading.ranking.entry_from_ranking", "run_ranking_entry_pipeline")
         if not callable(build_fn):
@@ -118,12 +128,7 @@ def _patched_run_ranking_entry_safe() -> int:
             )
             if created_by_pending > 0 or after_pending > 0:
                 logger.warning("[RANKING ENTRY SCHEDULE] dispatch controller despite build timeout because pending exists count=%s", after_pending)
-                tasks._dispatch_entry_controller(
-                    pipeline_source="RANKING",
-                    interval=1,
-                    timeout_sec=tasks.RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC,
-                    reason="RANKING ENTRY SCHEDULE",
-                )
+                _dispatch_ranking_controller(tasks, tasks.RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC)
                 with tasks._RANKING_ENTRY_LOCK:
                     tasks._RANKING_ENTRY_TIMEOUT_STREAK = 0
                     tasks._RANKING_ENTRY_COOLDOWN_UNTIL = None
@@ -149,12 +154,7 @@ def _patched_run_ranking_entry_safe() -> int:
         created = int(created_ret or 0)
         logger.info("[RANKING ENTRY SCHEDULE] pending build done created=%s before_pending=%s after_pending=%s", created, before_pending, after_pending)
         if created > 0 or after_pending > before_pending:
-            tasks._dispatch_entry_controller(
-                pipeline_source="RANKING",
-                interval=1,
-                timeout_sec=tasks.RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC,
-                reason="RANKING ENTRY SCHEDULE",
-            )
+            _dispatch_ranking_controller(tasks, tasks.RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC)
         else:
             logger.info("[RANKING ENTRY SCHEDULE] no pending created -> controller dispatch skipped")
         logger.info("[RANKING ENTRY SCHEDULE] done created=%s pending_count=%s elapsed=%.3fs", created, after_pending, time.perf_counter() - started)
@@ -173,10 +173,11 @@ def install() -> bool:
     if _INSTALLED:
         return True
     try:
-        # setdefault では既存 env=60 が残るため、ここは明示的に上書きする。
         old_runtime_budget = os.environ.get("RANKING_ENTRY_RUNTIME_BUDGET_SEC")
+        old_max_pending = os.environ.get("RANKING_ENTRY_MAX_PENDING_PER_RUN")
         os.environ["RANKING_ENTRY_RUNTIME_BUDGET_SEC"] = str(max(_env_float("RANKING_ENTRY_RUNTIME_BUDGET_SEC", 150.0), 150.0))
-        os.environ.setdefault("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", "60")
+        os.environ["RANKING_ENTRY_MAX_PENDING_PER_RUN"] = "1"
+        os.environ.setdefault("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", "120")
         os.environ.setdefault("RANKING_ENTRY_BUILD_TIMEOUT_SEC", "180")
         os.environ.setdefault("RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC", "90")
         os.environ.setdefault("RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC", "300")
@@ -185,28 +186,30 @@ def install() -> bool:
 
         old_controller = float(getattr(tasks, "RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", 20.0) or 20.0)
         old_build = float(getattr(tasks, "RANKING_ENTRY_BUILD_TIMEOUT_SEC", 90.0) or 90.0)
-        new_controller = max(old_controller, _env_float("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", 60.0), 60.0)
+        new_controller = max(old_controller, _env_float("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", 120.0), 120.0)
         new_build = max(old_build, _env_float("RANKING_ENTRY_BUILD_TIMEOUT_SEC", 180.0), 180.0)
 
         tasks.RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC = new_controller
         tasks.RANKING_ENTRY_BUILD_TIMEOUT_SEC = new_build
 
         cur = getattr(tasks, "_run_ranking_entry_safe", None)
-        if callable(cur) and not getattr(cur, "_ranking_timeout_dispatch_patch_v12", False):
+        if callable(cur) and not getattr(cur, "_ranking_timeout_dispatch_patch_v13", False):
             _ORIG_RANKING_SAFE = cur
-            _patched_run_ranking_entry_safe._ranking_timeout_dispatch_patch_v12 = True  # type: ignore[attr-defined]
+            _patched_run_ranking_entry_safe._ranking_timeout_dispatch_patch_v13 = True  # type: ignore[attr-defined]
             _patched_run_ranking_entry_safe._original = cur  # type: ignore[attr-defined]
             tasks._run_ranking_entry_safe = _patched_run_ranking_entry_safe
 
         _INSTALLED = True
         logger.warning(
-            "[RANKING ENTRY TIMEOUT PATCH] installed v1.2 controller_timeout %.1f->%.1f build_timeout %.1f->%.1f runtime_budget old=%s new=%s timeout_dispatch_pending=True",
+            "[RANKING ENTRY TIMEOUT PATCH] installed v1.3 controller_timeout %.1f->%.1f build_timeout %.1f->%.1f runtime_budget old=%s new=%s max_pending old=%s new=%s timeout_dispatch_pending=True",
             old_controller,
             new_controller,
             old_build,
             new_build,
             old_runtime_budget,
             os.environ.get("RANKING_ENTRY_RUNTIME_BUDGET_SEC"),
+            old_max_pending,
+            os.environ.get("RANKING_ENTRY_MAX_PENDING_PER_RUN"),
         )
         return True
     except Exception:
