@@ -1,20 +1,16 @@
 # ============================================================
 # File   : trading/entry/tonosama/ai_gate.py
-# Version: Ver1.8-TONOSAMA-FALLBACK-SLOPE-RANGE-RESCUE
+# Version: Ver1.9-TONOSAMA-FALLBACK-NO-CLIMAX-RANGE-RESCUE
 # ------------------------------------------------------------
 # 目的:
 #   TONOSAMA ENTRY のAI未接続fallback判定。
 #
-# Ver1.8:
-#   - TONOSAMA_SLOPE_RANGE_RESCUE は runner 側では効いているが、AI fallback 側で
-#       AI fallback NG: slope low ... < 0.0010
-#     により pending 登録前に落ちていた。
-#   - 日中レンジ・出来高・surge/zero-surge rescue が成立している場合は、
-#     slope が小さくても range_rescue として通す。
-#
-# Ver1.7:
-#   - max_surge < min_surge の即NGより先に、日中レンジ・出来高・score/mtfで
-#     surge=0を救済できるか判定する。
+# Ver1.9:
+#   - range_rescue が「出来高急増 + 大きな値幅」を買い/売りサインとして救済しすぎる問題を止める。
+#   - BUYはバイイングクライマックス気味の出来高増をBUYサインにしない。
+#   - SELLはセリングクライマックス気味の出来高増をSELLサインにしない。
+#   - range_rescueでも価格変化0.00%・5秒0.000%は通さない。
+#   - 3m/5mの方向一致をfallbackで必須化する。
 # ============================================================
 from __future__ import annotations
 
@@ -106,9 +102,13 @@ def _infer_side(max_chg: float, slope: float) -> str:
         return "BUY"
     if max_chg < 0 and slope < 0:
         return "SELL"
-    if max_chg > 0 or slope > 0:
+    if max_chg > 0:
         return "BUY"
-    if max_chg < 0 or slope < 0:
+    if max_chg < 0:
+        return "SELL"
+    if slope > 0:
+        return "BUY"
+    if slope < 0:
         return "SELL"
     return "UNKNOWN"
 
@@ -152,26 +152,49 @@ def _zero_surge_rescue_ok(features: dict, *, min_surge: float) -> tuple[bool, st
 def _range_rescue_ok(features: dict, *, side: str, min_surge: float, effective_surge: float | None = None) -> tuple[bool, str]:
     if not _env_bool("TONOSAMA_AI_FALLBACK_PRICE_RANGE_RESCUE", True):
         return False, "disabled"
+
     max_surge = safe_float(features.get("max_volume_surge_ratio"), 0.0) if effective_surge is None else float(effective_surge)
     rng = safe_float(features.get("intrabar_range_pct"), 0.0)
     vol = safe_float(features.get("latest_volume"), 0.0)
     close_pos = safe_float(features.get("close_position_pct"), 50.0)
     slope = safe_float(features.get("slope"), 0.0)
+    max_chg = safe_float(features.get("max_price_change_pct"), 0.0)
+    chg_3m = safe_float(features.get("price_change_pct_3m"), 0.0)
+    chg_5m = safe_float(features.get("price_change_pct_5m"), 0.0)
+    chg_5s = safe_float(features.get("price_change_5s_pct"), 0.0)
+    signed_body = safe_float(features.get("signed_body_change_pct"), max_chg)
+    upper_wick = safe_float(features.get("upper_wick_pct"), 0.0)
+    lower_wick = safe_float(features.get("lower_wick_pct"), 0.0)
+
     min_range = _env_float("TONOSAMA_AI_FALLBACK_MIN_RANGE_PCT", 3.0)
     min_volume = _env_float("TONOSAMA_AI_FALLBACK_MIN_LATEST_VOLUME", 50000.0)
-    max_buy_close_pos = _env_float("TONOSAMA_AI_FALLBACK_BUY_MAX_CLOSE_POS", 98.0)
-    min_sell_close_pos = _env_float("TONOSAMA_AI_FALLBACK_SELL_MIN_CLOSE_POS", 2.0)
-    allow_slope_near_zero = _env_bool("TONOSAMA_AI_FALLBACK_ALLOW_RANGE_RESCUE_SLOPE_LOW", True)
+    # Ver1.9: range_rescueでも実際の方向変化が必要。0.00%救済は禁止。
+    min_dir_change = _env_float_floor("TONOSAMA_AI_FALLBACK_RANGE_RESCUE_MIN_DIR_CHANGE", 0.10, 0.10)
+    min_5s = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT", float(_cfg("MIN_5SEC_PRICE_CHANGE_PCT", 0.01)), 0.01)
+    reject_zero_5s = _env_bool("TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC", True)
+    reject_same_climax = _env_bool("TONOSAMA_AI_FALLBACK_REJECT_SAME_SIDE_CLIMAX", True)
 
     base_ok = max_surge >= min_surge and rng >= min_range and vol >= min_volume
     if not base_ok:
         return False, f"range_rescue_base_ng surge={max_surge:.2f} range={rng:.3f} vol={vol:.0f}"
+
+    if reject_zero_5s and abs(chg_5s) < min_5s:
+        return False, f"range_rescue_5s_stopped 5s={chg_5s:.3f} min={min_5s:.3f}"
+
     if side == "BUY":
-        ok = (slope >= 0 or allow_slope_near_zero) and close_pos <= max_buy_close_pos
-        return ok, f"BUY range_rescue slope={slope:.6f} close_pos={close_pos:.1f} range={rng:.3f} vol={vol:.0f} surge={max_surge:.2f} slope_low_allowed={allow_slope_near_zero}"
+        if max_chg < min_dir_change or chg_3m < 0 or chg_5m < 0 or slope <= 0:
+            return False, f"BUY range_rescue_direction_ng change={max_chg:.2f} 3m={chg_3m:.2f} 5m={chg_5m:.2f} slope={slope:.6f} min_change={min_dir_change:.2f}"
+        if reject_same_climax and signed_body > 0 and max_surge >= min_surge and (close_pos >= 65.0 or upper_wick >= 35.0 or rng >= 6.0):
+            return False, f"BUY buying_climax_volume_guard body={signed_body:.2f} close_pos={close_pos:.1f} upper_wick={upper_wick:.1f} range={rng:.3f} surge={max_surge:.2f}"
+        return True, f"BUY range_rescue change={max_chg:.2f} 3m={chg_3m:.2f} 5m={chg_5m:.2f} slope={slope:.6f} close_pos={close_pos:.1f} range={rng:.3f} vol={vol:.0f} surge={max_surge:.2f}"
+
     if side == "SELL":
-        ok = (slope <= 0 or allow_slope_near_zero) and close_pos >= min_sell_close_pos
-        return ok, f"SELL range_rescue slope={slope:.6f} close_pos={close_pos:.1f} range={rng:.3f} vol={vol:.0f} surge={max_surge:.2f} slope_low_allowed={allow_slope_near_zero}"
+        if max_chg > -min_dir_change or chg_3m > 0 or chg_5m > 0 or slope >= 0:
+            return False, f"SELL range_rescue_direction_ng change={max_chg:.2f} 3m={chg_3m:.2f} 5m={chg_5m:.2f} slope={slope:.6f} min_change={min_dir_change:.2f}"
+        if reject_same_climax and signed_body < 0 and max_surge >= min_surge and (close_pos <= 35.0 or lower_wick >= 35.0 or rng >= 6.0):
+            return False, f"SELL selling_climax_volume_guard body={signed_body:.2f} close_pos={close_pos:.1f} lower_wick={lower_wick:.1f} range={rng:.3f} surge={max_surge:.2f}"
+        return True, f"SELL range_rescue change={max_chg:.2f} 3m={chg_3m:.2f} 5m={chg_5m:.2f} slope={slope:.6f} close_pos={close_pos:.1f} range={rng:.3f} vol={vol:.0f} surge={max_surge:.2f}"
+
     return False, "side_unknown"
 
 
@@ -189,14 +212,16 @@ def _fallback_when_ai_disconnected(features: dict) -> tuple[bool, float, str]:
     abs_slope = abs(slope)
 
     min_surge = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_VOLUME_SURGE", float(_cfg("MIN_VOLUME_SURGE_RATIO", 3.0)), 3.0)
-    min_chg = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_PRICE_CHANGE_PCT", float(_cfg("MIN_PRICE_CHANGE_PCT", 0.20)), 0.0)
+    min_chg = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_PRICE_CHANGE_PCT", float(_cfg("MIN_PRICE_CHANGE_PCT", 0.20)), 0.20)
     min_slope = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_SLOPE", float(_cfg("MIN_SLOPE", 0.0010)), 0.0010)
-    min_5s = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT", float(_cfg("MIN_5SEC_PRICE_CHANGE_PCT", 0.01)), 0.0)
+    min_5s = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT", float(_cfg("MIN_5SEC_PRICE_CHANGE_PCT", 0.01)), 0.01)
     max_5s_drop = _env_float("TONOSAMA_AI_FALLBACK_MAX_5SEC_DROP_PCT", float(_cfg("MAX_5SEC_DROP_PCT", -0.20)))
     require_5s = _env_bool("TONOSAMA_AI_FALLBACK_REQUIRE_5SEC_BAR", bool(_cfg("REQUIRE_5SEC_BAR", False)))
-    reject_zero_5s = _env_bool("TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC", False)
+    reject_zero_5s = _env_bool("TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC", True)
     min_buy_3m = _env_float("TONOSAMA_AI_FALLBACK_MIN_BUY_3M_CHANGE", 0.0)
+    min_buy_5m = _env_float("TONOSAMA_AI_FALLBACK_MIN_BUY_5M_CHANGE", 0.0)
     max_sell_3m = _env_float("TONOSAMA_AI_FALLBACK_MAX_SELL_3M_CHANGE", 0.0)
+    max_sell_5m = _env_float("TONOSAMA_AI_FALLBACK_MAX_SELL_5M_CHANGE", 0.0)
 
     if side == "UNKNOWN":
         return False, 0.0, f"AI fallback NG: unknown direction price_change={max_chg:.2f}% slope={slope:.4f}"
@@ -205,7 +230,7 @@ def _fallback_when_ai_disconnected(features: dict) -> tuple[bool, float, str]:
     range_rescue, range_reason = _range_rescue_ok(features, side=side, min_surge=min_surge, effective_surge=effective_surge)
 
     if not surge_ok and not range_rescue:
-        return False, 0.0, f"AI fallback NG: volume surge low side={side} max={max_surge:.2f}x < {min_surge:.2f}x {surge_reason}"
+        return False, 0.0, f"AI fallback NG: volume surge low side={side} max={max_surge:.2f}x < {min_surge:.2f}x {surge_reason} {range_reason}"
 
     if abs_chg < min_chg and not range_rescue:
         return False, 0.0, f"AI fallback NG: price change low side={side} abs={abs_chg:.2f}% raw={max_chg:.2f}% < {min_chg:.2f}% range_rescue={range_reason}"
@@ -213,14 +238,18 @@ def _fallback_when_ai_disconnected(features: dict) -> tuple[bool, float, str]:
         return False, 0.0, f"AI fallback NG: slope low side={side} abs={abs_slope:.4f} raw={slope:.4f} < {min_slope:.4f}"
 
     if side == "BUY":
-        if chg_3m < min_buy_3m and not range_rescue:
+        if chg_3m < min_buy_3m:
             return False, 0.0, f"AI fallback NG: BUY 3m weak/reverse 3m={chg_3m:.2f}% < {min_buy_3m:.2f}% 5m={chg_5m:.2f}%"
-        if (max_chg <= 0 or slope <= 0) and not range_rescue:
+        if chg_5m < min_buy_5m:
+            return False, 0.0, f"AI fallback NG: BUY 5m weak/reverse 5m={chg_5m:.2f}% < {min_buy_5m:.2f}% 3m={chg_3m:.2f}%"
+        if max_chg <= 0 or slope <= 0:
             return False, 0.0, f"AI fallback NG: BUY direction mismatch max_chg={max_chg:.2f}% slope={slope:.4f}"
     elif side == "SELL":
-        if chg_3m > max_sell_3m and not range_rescue:
+        if chg_3m > max_sell_3m:
             return False, 0.0, f"AI fallback NG: SELL 3m weak/reverse 3m={chg_3m:.2f}% > {max_sell_3m:.2f}% 5m={chg_5m:.2f}%"
-        if (max_chg >= 0 or slope >= 0) and not range_rescue:
+        if chg_5m > max_sell_5m:
+            return False, 0.0, f"AI fallback NG: SELL 5m weak/reverse 5m={chg_5m:.2f}% > {max_sell_5m:.2f}% 3m={chg_3m:.2f}%"
+        if max_chg >= 0 or slope >= 0:
             return False, 0.0, f"AI fallback NG: SELL direction mismatch max_chg={max_chg:.2f}% slope={slope:.4f}"
 
     if has_5s:
