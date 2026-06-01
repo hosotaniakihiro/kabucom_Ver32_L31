@@ -1,34 +1,26 @@
 # ============================================================
 # File   : core/startup/ranking_entry_fast_runtime_patch.py
-# Version: V3-RANKING-ENTRY-FAST-MEMORY-CACHED-TECHNICALS
+# Version: V4-RANKING-ENTRY-RUNTIME-BUDGET
 # ------------------------------------------------------------
 # 目的:
-#   ランキング由来エントリー作成が80秒以上かかる問題を軽減する。
+#   ランキング由来エントリー作成が90秒timeoutして古いworker threadが
+#   残る問題を軽減する。
 #
-# 背景:
-#   V1:
-#     technical前候補を圧縮し、symbolごとの履歴SQLをIN句へ変更。
-#   V2:
-#     main.py(entry_only) 側では ranking_technical_1min への保存・再計算をスキップし、
-#     既存DBから最新technicalを読むだけに変更。
-#   V2後ログ:
-#     readonly tech loaded symbols=60 hit=59 elapsed=12.803s
-#     technical save skipped rows 61->61 readonly_hit=59 elapsed=12.855s
-#
-# V3方針:
-#   - readonly technical を短時間メモリキャッシュする。
-#   - 同じDB・同じ銘柄群はDBを再読込しない。
-#   - SQLも「全履歴取得→Pythonで最新化」ではなく、SQL側でMAX(datetime)の最新行だけ取得する。
-#   - DBが更新された場合はmtimeでキャッシュを自動無効化する。
+# V4:
+#   - entry_from_ranking.entry_from_ranking() 自体をbudget付き軽量版へ差し替え。
+#   - 外側timeout任せにせず、本体が自分で早期終了する。
+#   - prefilter後の重いtechnical対象を既定40件に制限。
+#   - pending追加は既定5件で即終了。
+#   - technical readonly DB読込も短いtimeout・memory cacheで行う。
 #
 # ENV:
-#   RANKING_ENTRY_SKIP_TECH_SAVE=1              # default 1: entry側では保存しない
-#   RANKING_ENTRY_TECH_READONLY=1               # default 1: 既存DBから読む
-#   RANKING_ENTRY_TECH_MEMORY_CACHE=1           # default 1: メモリキャッシュ使用
-#   RANKING_ENTRY_TECH_CACHE_TTL_SEC=60         # default 60秒
-#   RANKING_ENTRY_TECH_READ_BATCH_SIZE=80
-#   RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS=80
-#   RANKING_ENTRY_FAST_MAX_SYMBOLS=60
+#   RANKING_ENTRY_RUNTIME_BUDGET_SEC=25
+#   RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS=40
+#   RANKING_ENTRY_FAST_MAX_SYMBOLS=40
+#   RANKING_ENTRY_MAX_PENDING_PER_RUN=5
+#   RANKING_ENTRY_SKIP_TECH_SAVE=1
+#   RANKING_ENTRY_TECH_READONLY=1
+#   RANKING_ENTRY_TECH_MEMORY_CACHE=1
 # ============================================================
 
 from __future__ import annotations
@@ -40,7 +32,7 @@ import sqlite3
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 
@@ -49,28 +41,29 @@ _PATCHED = False
 _ORIG_LIGHT_PREFILTER = None
 _ORIG_SAVE_TECH = None
 _ORIG_LOAD_HISTORY = None
+_ORIG_ENTRY_FROM_RANKING = None
+_ORIG_RUN_PIPELINE = None
 
 # db_path -> {"ts": float, "mtime": float, "items": dict[symbol, technical]}
 _TECH_MEMORY_CACHE: dict[str, dict[str, Any]] = {}
 
+# 起動時に他patchより先に効かせるため、既定値をここで強める。
+os.environ.setdefault("RANKING_ENTRY_RUNTIME_BUDGET_SEC", "25")
+os.environ.setdefault("RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS", "40")
+os.environ.setdefault("RANKING_ENTRY_FAST_MAX_SYMBOLS", "40")
+os.environ.setdefault("RANKING_ENTRY_FAST_MAX_PER_SIDE", "25")
+os.environ.setdefault("RANKING_ENTRY_FAST_MAX_PER_TYPE", "12")
+os.environ.setdefault("RANKING_ENTRY_MAX_PENDING_PER_RUN", "5")
+os.environ.setdefault("RANKING_ENTRY_SKIP_TECH_SAVE", "1")
+os.environ.setdefault("RANKING_ENTRY_TECH_READONLY", "1")
+os.environ.setdefault("RANKING_ENTRY_TECH_MEMORY_CACHE", "1")
+os.environ.setdefault("RANKING_ENTRY_TECH_CACHE_TTL_SEC", "90")
+os.environ.setdefault("RANKING_ENTRY_TECH_READ_BATCH_SIZE", "40")
+
 TECH_COLUMNS = [
-    "ma5",
-    "ma25",
-    "ma75",
-    "rsi",
-    "macd",
-    "signal",
-    "macd_hist",
-    "atr",
-    "slope",
-    "slope_atr_scaled",
-    "vwap",
-    "score_buy",
-    "score_sell",
-    "score_total",
-    "ranking_tech_score",
-    "ranking_tech_ready",
-    "ranking_tech_reason",
+    "ma5", "ma25", "ma75", "rsi", "macd", "signal", "macd_hist", "atr",
+    "slope", "slope_atr_scaled", "vwap", "score_buy", "score_sell", "score_total",
+    "ranking_tech_score", "ranking_tech_ready", "ranking_tech_reason",
 ]
 
 
@@ -151,17 +144,18 @@ def _row_priority(row: Dict[str, Any]) -> tuple:
     turnover = _safe_float(row.get("turnover") or row.get("trading_value"), 0.0)
     volume = _safe_float(row.get("volume") or row.get("trading_volume"), 0.0)
     day = abs(_safe_float(row.get("day_change_pct"), 0.0))
+    score = abs(_safe_float(row.get("score") or row.get("score_total") or row.get("ranking_only_score"), 0.0))
     rt_w = _rank_type_weight(str(row.get("rank_type") or ""))
-    return (rank, -rt_w, -turnover, -volume, -day)
+    return (rank, -score, -rt_w, -turnover, -volume, -day)
 
 
 def _cap_rows(rows: List[Dict[str, Any]], *, context: str) -> List[Dict[str, Any]]:
     if not _env_bool("RANKING_ENTRY_FAST_CAP_ENABLED", True):
         return rows
-    max_rows = _env_int("RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS", 80)
-    max_symbols = _env_int("RANKING_ENTRY_FAST_MAX_SYMBOLS", 60)
-    max_per_side = _env_int("RANKING_ENTRY_FAST_MAX_PER_SIDE", 45)
-    max_per_type = _env_int("RANKING_ENTRY_FAST_MAX_PER_TYPE", 18)
+    max_rows = max(5, _env_int("RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS", 40))
+    max_symbols = max(5, _env_int("RANKING_ENTRY_FAST_MAX_SYMBOLS", 40))
+    max_per_side = max(3, _env_int("RANKING_ENTRY_FAST_MAX_PER_SIDE", 25))
+    max_per_type = max(3, _env_int("RANKING_ENTRY_FAST_MAX_PER_TYPE", 12))
     if len(rows) <= max_rows:
         return rows
 
@@ -202,14 +196,7 @@ def _cap_rows(rows: List[Dict[str, Any]], *, context: str) -> List[Dict[str, Any
 
     logger.warning(
         "[RANKING ENTRY FAST PATCH] cap context=%s before=%s after=%s max_rows=%s max_symbols=%s per_side=%s per_type=%s rejects=%s",
-        context,
-        len(rows),
-        len(kept),
-        max_rows,
-        max_symbols,
-        dict(per_side),
-        dict(per_type),
-        dict(rejects),
+        context, len(rows), len(kept), max_rows, max_symbols, dict(per_side), dict(per_type), dict(rejects),
     )
     return kept
 
@@ -220,6 +207,13 @@ def _patched_light_prefilter_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, 
 
 
 def _resolve_ranking_db_path() -> str:
+    try:
+        from ats.ats_ranking.db_path import get_usable_ranking_db_path
+        p = get_usable_ranking_db_path(force_refresh=False, allow_fallback=False, prefer_today_even_if_empty=True)
+        if p:
+            return str(p)
+    except Exception:
+        pass
     try:
         from ats.ats_ranking.db_path import resolve_ranking_db_path
         p = resolve_ranking_db_path()
@@ -254,7 +248,7 @@ def _cache_get(db: str, symbols: list[str]) -> tuple[Dict[str, Dict[str, Any]], 
     if not _env_bool("RANKING_ENTRY_TECH_MEMORY_CACHE", True):
         return {}, symbols, "disabled"
     now = time.time()
-    ttl = _env_float("RANKING_ENTRY_TECH_CACHE_TTL_SEC", 60.0)
+    ttl = _env_float("RANKING_ENTRY_TECH_CACHE_TTL_SEC", 90.0)
     mtime = _db_mtime(db)
     cache = _TECH_MEMORY_CACHE.get(db)
     if not cache:
@@ -286,11 +280,6 @@ def _cache_put(db: str, items: Dict[str, Dict[str, Any]]) -> None:
         cur["ts"] = now
         cur["mtime"] = mtime
         _TECH_MEMORY_CACHE[db] = cur
-        max_dbs = max(1, _env_int("RANKING_ENTRY_TECH_CACHE_MAX_DBS", 2))
-        if len(_TECH_MEMORY_CACHE) > max_dbs:
-            old_keys = sorted(_TECH_MEMORY_CACHE.keys(), key=lambda k: float(_TECH_MEMORY_CACHE[k].get("ts") or 0.0))
-            for k in old_keys[:-max_dbs]:
-                _TECH_MEMORY_CACHE.pop(k, None)
     except Exception:
         logger.debug("[RANKING ENTRY FAST PATCH] cache put failed", exc_info=True)
 
@@ -320,18 +309,17 @@ def _read_latest_tech_from_db(db: str, symbols: list[str]) -> Dict[str, Dict[str
     if not symbols:
         return {}
     table = "ranking_technical_1min"
-    batch_size = max(20, _env_int("RANKING_ENTRY_TECH_READ_BATCH_SIZE", 80))
+    batch_size = max(10, _env_int("RANKING_ENTRY_TECH_READ_BATCH_SIZE", 40))
     chunks = []
-    with sqlite3.connect(db, timeout=2.0) as conn:
+    with sqlite3.connect(db, timeout=1.5) as conn:
         conn.execute("PRAGMA query_only=ON")
-        conn.execute("PRAGMA busy_timeout=2000")
+        conn.execute("PRAGMA busy_timeout=1200")
         if not _table_exists(conn, table):
             logger.warning("[RANKING ENTRY FAST PATCH] readonly tech skipped reason=table_missing db=%s table=%s", db, table)
             return {}
         for i in range(0, len(symbols), batch_size):
             batch = symbols[i:i + batch_size]
             placeholders = ",".join(["?"] * len(batch))
-            # 最新1行だけをSQL側で抽出する。全履歴を読まない。
             q = f"""
                 SELECT t.*
                 FROM {table} t
@@ -355,9 +343,9 @@ def _read_latest_tech_from_db(db: str, symbols: list[str]) -> Dict[str, Dict[str
 
 
 def _latest_existing_technicals(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """ranking_technical_1min から対象symbolの最新technicalだけ読む。DB更新はしない。"""
     try:
-        symbols = [str(r.get("symbol") or "").strip() for r in rows]
+        capped = _cap_rows(rows, context="before_readonly_tech")
+        symbols = [str(r.get("symbol") or "").strip() for r in capped]
         symbols = [s for s in dict.fromkeys(symbols) if s]
         if not symbols:
             return {}
@@ -369,40 +357,14 @@ def _latest_existing_technicals(rows: List[Dict[str, Any]]) -> Dict[str, Dict[st
         t0 = time.time()
         cached, missing, cache_state = _cache_get(db, symbols)
         if cached and not missing:
-            logger.warning(
-                "[RANKING ENTRY FAST PATCH] readonly tech cache hit symbols=%s hit=%s db=%s elapsed=%.3fs",
-                len(symbols),
-                len(cached),
-                db,
-                time.time() - t0,
-            )
+            logger.warning("[RANKING ENTRY FAST PATCH] readonly tech cache hit symbols=%s hit=%s db=%s elapsed=%.3fs", len(symbols), len(cached), db, time.time() - t0)
             return cached
-
         db_items = _read_latest_tech_from_db(db, missing if cached else symbols)
         if db_items:
             _cache_put(db, db_items)
         result = dict(cached)
         result.update(db_items)
-
-        if not result:
-            logger.warning(
-                "[RANKING ENTRY FAST PATCH] readonly tech empty symbols=%s cache=%s db=%s elapsed=%.3fs",
-                len(symbols),
-                cache_state,
-                db,
-                time.time() - t0,
-            )
-            return {}
-
-        logger.warning(
-            "[RANKING ENTRY FAST PATCH] readonly tech loaded symbols=%s hit=%s cache=%s db_read=%s db=%s elapsed=%.3fs",
-            len(symbols),
-            len(result),
-            cache_state,
-            len(db_items),
-            db,
-            time.time() - t0,
-        )
+        logger.warning("[RANKING ENTRY FAST PATCH] readonly tech loaded symbols=%s hit=%s cache=%s db_read=%s db=%s elapsed=%.3fs", len(symbols), len(result), cache_state, len(db_items), db, time.time() - t0)
         return result
     except Exception:
         logger.exception("[RANKING ENTRY FAST PATCH] readonly tech load failed")
@@ -412,57 +374,35 @@ def _latest_existing_technicals(rows: List[Dict[str, Any]]) -> Dict[str, Dict[st
 def _patched_save_ranking_pseudo_technicals(rows: List[Dict[str, Any]], *args: Any, **kwargs: Any) -> Dict[str, Dict[str, Any]]:
     if not _env_bool("RANKING_ENTRY_FAST_TECH_CAP_ENABLED", True):
         return _ORIG_SAVE_TECH(rows, *args, **kwargs)
-
     capped = _cap_rows(rows, context="before_save_technical")
-
-    # main.py(entry_only) ではDB保存・再計算をデフォルトで行わない。
     if _env_bool("RANKING_ENTRY_SKIP_TECH_SAVE", True):
         t0 = time.time()
         ret = _latest_existing_technicals(capped) if _env_bool("RANKING_ENTRY_TECH_READONLY", True) else {}
-        logger.warning(
-            "[RANKING ENTRY FAST PATCH] technical save skipped rows %s->%s readonly_hit=%s elapsed=%.3fs",
-            len(rows),
-            len(capped),
-            len(ret or {}),
-            time.time() - t0,
-        )
+        logger.warning("[RANKING ENTRY FAST PATCH] technical save skipped rows %s->%s readonly_hit=%s elapsed=%.3fs", len(rows), len(capped), len(ret or {}), time.time() - t0)
         return ret
-
-    lookback = _env_int("RANKING_ENTRY_FAST_TECH_LOOKBACK_ROWS", 60)
+    lookback = _env_int("RANKING_ENTRY_FAST_TECH_LOOKBACK_ROWS", 30)
     kwargs.setdefault("lookback_rows", lookback)
     t0 = time.time()
     ret = _ORIG_SAVE_TECH(capped, *args, **kwargs)
-    logger.warning(
-        "[RANKING ENTRY FAST PATCH] technical done rows %s->%s latest=%s elapsed=%.3fs lookback=%s",
-        len(rows),
-        len(capped),
-        len(ret or {}),
-        time.time() - t0,
-        kwargs.get("lookback_rows"),
-    )
+    logger.warning("[RANKING ENTRY FAST PATCH] technical done rows %s->%s latest=%s elapsed=%.3fs lookback=%s", len(rows), len(capped), len(ret or {}), time.time() - t0, kwargs.get("lookback_rows"))
     return ret
 
 
 def _patched_load_history(conn: Any, symbols: List[str], lookback_rows: int = 120) -> pd.DataFrame:
-    """symbolごとのSQL発行をやめ、IN句でまとめて取得する。"""
     try:
         import trading.ranking.ranking_technical_store as store
-
         if not symbols:
             return pd.DataFrame()
         symbols = [str(s) for s in dict.fromkeys(symbols) if str(s).strip()]
         if not symbols:
             return pd.DataFrame()
-        batch_size = max(20, _env_int("RANKING_ENTRY_FAST_HISTORY_BATCH_SIZE", 80))
+        batch_size = max(10, _env_int("RANKING_ENTRY_FAST_HISTORY_BATCH_SIZE", 40))
+        lookback_rows = min(int(lookback_rows or 30), _env_int("RANKING_ENTRY_FAST_TECH_LOOKBACK_ROWS", 30))
         chunks = []
         for i in range(0, len(symbols), batch_size):
             batch = symbols[i:i + batch_size]
             placeholders = ",".join(["?"] * len(batch))
-            q = f"""
-                SELECT * FROM {store.TABLE_NAME}
-                WHERE symbol IN ({placeholders})
-                ORDER BY symbol ASC, datetime DESC
-            """
+            q = f"SELECT * FROM {store.TABLE_NAME} WHERE symbol IN ({placeholders}) ORDER BY symbol ASC, datetime DESC"
             part = pd.read_sql_query(q, conn, params=tuple(batch))
             if not part.empty:
                 part = part.groupby("symbol", group_keys=False).head(int(lookback_rows))
@@ -477,8 +417,188 @@ def _patched_load_history(conn: Any, symbols: List[str], lookback_rows: int = 12
         return _ORIG_LOAD_HISTORY(conn, symbols, lookback_rows=lookback_rows)
 
 
+def _patched_entry_from_ranking() -> int:
+    """Budgeted replacement for trading.ranking.entry_from_ranking.entry_from_ranking."""
+    import trading.ranking.entry_from_ranking as efr
+
+    started_dt = dt.datetime.now()
+    started = time.perf_counter()
+    budget_sec = max(5.0, _env_float("RANKING_ENTRY_RUNTIME_BUDGET_SEC", 25.0))
+    deadline = started + budget_sec
+    max_pending = max(1, _env_int("RANKING_ENTRY_MAX_PENDING_PER_RUN", 5))
+
+    logger.info("[RANKING ENTRY BUDGET] start at=%s budget_sec=%.1f max_pending=%s", started_dt.strftime("%Y-%m-%d %H:%M:%S"), budget_sec, max_pending)
+
+    try:
+        if not efr.is_time_allowed(started_dt):
+            logger.info("[RANKING ENTRY BUDGET] skip reason=TIME_GUARD now=%s", started_dt.strftime("%H:%M:%S"))
+            return 0
+
+        ranking_df = efr._get_ranking_source_df()
+        if ranking_df is None or ranking_df.empty:
+            logger.info("[RANKING ENTRY BUDGET] skip reason=no_ranking_df")
+            return 0
+
+        rows_all = efr._prepare_rows(ranking_df)
+        if not rows_all:
+            logger.info("[RANKING ENTRY BUDGET] skip reason=no_normalized_rows")
+            return 0
+
+        rows = efr._light_prefilter_rows(rows_all)
+        rows = _cap_rows(rows, context="runtime_budget_rows")
+        if not rows:
+            logger.info("[RANKING ENTRY BUDGET] skip reason=no_prefilter_rows raw_rows=%s", len(rows_all))
+            return 0
+
+        if time.perf_counter() >= deadline:
+            logger.warning("[RANKING ENTRY BUDGET] stop before technical elapsed=%.3fs", time.perf_counter() - started)
+            return 0
+
+        tech_map: Dict[str, Dict[str, Any]] = {}
+        cfg_tech = efr.RANKING_ENTRY_CONFIG.get("TECHNICAL", {}) or {}
+        if bool(cfg_tech.get("ENABLED", True)) and callable(getattr(efr, "save_ranking_pseudo_technicals", None)):
+            tech_map = efr.save_ranking_pseudo_technicals(rows)
+            logger.info("[RANKING ENTRY BUDGET] technical attached symbols=%s prefiltered_rows=%s raw_rows=%s", len(tech_map), len(rows), len(rows_all))
+
+        created = 0
+        build_reject = 0
+        filter_reject = 0
+        pending_reject = 0
+        reject_samples: List[Dict[str, Any]] = []
+        reject_counts = Counter()
+        current_keys: set[str] = set()
+        best_by_symbol_side: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        now = efr._now()
+
+        for row in rows:
+            if time.perf_counter() >= deadline:
+                logger.warning("[RANKING ENTRY BUDGET] stop while scoring elapsed=%.3fs candidates=%s", time.perf_counter() - started, len(best_by_symbol_side))
+                break
+            if callable(getattr(efr, "attach_ranking_technicals", None)):
+                row = efr.attach_ranking_technicals(row, tech_map)
+            symbol = str(row.get("symbol") or "").strip()
+            side = efr._infer_side(row)
+            row["side"] = side
+            current_keys.add(efr._history_key(symbol, side))
+            prev_h = efr._get_prev_history(symbol, side)
+            prev_price = efr._safe_float(prev_h.get("last_price"), 0.0)
+            prev_rank = efr._safe_int(prev_h.get("last_rank_position"), 999999)
+            consecutive = int(prev_h.get("consecutive", 0)) + 1 if prev_h else 1
+            score, parts = efr._calc_ranking_only_score(row, side, prev_price, prev_rank, consecutive)
+            row["score"] = score
+            row["score_total"] = score
+            row["ranking_only_score"] = score
+            row["ranking_score_parts"] = parts
+            ok, reason = efr._passes_ranking_only_filters(row, side, prev_h, score, parts)
+            efr._update_history(symbol, side, efr._safe_float(row.get("price") or row.get("current_price"), 0.0), efr._safe_int(row.get("rank_position"), 999999), str(row.get("rank_type") or ""), now)
+            if not ok:
+                filter_reject += 1
+                reason_key = str(reason).split()[0].split("=")[0]
+                reject_counts[reason_key] += 1
+                if len(reject_samples) < 12:
+                    reject_samples.append({
+                        "symbol": symbol,
+                        "side": side,
+                        "rank_type": row.get("rank_type"),
+                        "rank": row.get("rank_position"),
+                        "price": row.get("price"),
+                        "prev_price": prev_price,
+                        "volume": row.get("volume"),
+                        "turnover": row.get("turnover"),
+                        "day_change_pct": row.get("day_change_pct"),
+                        "score": round(score, 2),
+                        "reason": reason,
+                    })
+                continue
+            key = (symbol, side)
+            old = best_by_symbol_side.get(key)
+            old_score = efr._safe_float(old["row"].get("score_total"), 0.0) if isinstance(old, dict) and isinstance(old.get("row"), dict) else 0.0
+            if old is None or score > old_score:
+                best_by_symbol_side[key] = {"row": row, "parts": parts, "prev_price": prev_price, "prev_rank": prev_rank, "consecutive": consecutive}
+
+        try:
+            efr._reset_missing_histories(current_keys)
+        except Exception:
+            logger.debug("[RANKING ENTRY BUDGET] reset histories failed", exc_info=True)
+
+        packs = list(best_by_symbol_side.items())
+        packs.sort(key=lambda kv: efr._safe_float(kv[1]["row"].get("score_total"), 0.0), reverse=True)
+
+        for (symbol, side), pack in packs:
+            if created >= max_pending:
+                break
+            if time.perf_counter() >= deadline:
+                logger.warning("[RANKING ENTRY BUDGET] stop while pending_add elapsed=%.3fs created=%s", time.perf_counter() - started, created)
+                break
+            row = pack["row"]
+            parts = pack["parts"]
+            prev_price = pack["prev_price"]
+            prev_rank = pack["prev_rank"]
+            consecutive = pack["consecutive"]
+            final_score = efr._safe_float(row.get("score_total"), 0.0)
+            entry_row = efr.build_entry_row(row)
+            if not entry_row:
+                build_reject += 1
+                continue
+            entry_row["side"] = side
+            entry_row["source"] = "RANKING"
+            entry_row["symbol"] = symbol
+            entry_row.setdefault("entry_type", "RANKING")
+            entry_row.setdefault("interval", 1)
+            entry_row["score"] = final_score
+            entry_row["score_total"] = final_score
+            entry_row["ranking_only_score"] = final_score
+            entry_row["ranking_entry_mode"] = "RANKING_ONLY_WITH_TECH_BUDGET"
+            entry_row["ranking_prev_price"] = prev_price
+            entry_row["ranking_prev_rank"] = prev_rank
+            entry_row["ranking_consecutive"] = consecutive
+            entry_row["ranking_step_pct"] = parts.get("step_pct")
+            entry_row["ranking_rank_improve"] = parts.get("rank_improve")
+            entry_row["ranking_score_parts"] = parts
+            for k in ("ma5", "ma25", "ma75", "rsi", "macd", "signal", "macd_hist", "atr", "slope", "slope_atr_scaled", "vwap", "ranking_tech_score", "ranking_tech_ready", "ranking_tech_reason", "ranking_tech_datetime", "ranking_tech_db"):
+                if k in row:
+                    entry_row[k] = row.get(k)
+            pending_entry = {
+                **entry_row,
+                "source": "RANKING",
+                "created_at": now,
+                "ranking_fallback_used": False,
+                "ranking_strength": final_score,
+                "technical_score": efr._safe_float(row.get("ranking_tech_score"), 0.0),
+                "snapshot_score": final_score,
+            }
+            if efr.add_pending(pending_entry):
+                created += 1
+                logger.info(
+                    "[RANKING PENDING ADD] mode=RANKING_ONLY_WITH_TECH_BUDGET symbol=%s side=%s rank_type=%s rank=%s price=%.2f prev_price=%.2f step=%.3f%% day=%.3f%% volume=%.0f turnover=%.0f consecutive=%s rank_improve=%.1f score=%.2f tech=%.2f",
+                    symbol, side, row.get("rank_type"), row.get("rank_position"),
+                    efr._safe_float(row.get("price") or row.get("current_price"), 0.0), prev_price,
+                    efr._safe_float(parts.get("step_pct"), 0.0), efr._safe_float(row.get("day_change_pct"), 0.0),
+                    efr._safe_float(row.get("volume"), 0.0), efr._safe_float(row.get("turnover"), 0.0), consecutive,
+                    efr._safe_float(parts.get("rank_improve"), 0.0), final_score, efr._safe_float(row.get("ranking_tech_score"), 0.0),
+                )
+            else:
+                pending_reject += 1
+
+        elapsed = time.perf_counter() - started
+        if reject_samples:
+            logger.warning("[RANKING ENTRY BUDGET] reject_counts=%s samples=%s", dict(reject_counts), reject_samples)
+        logger.info(
+            "[RANKING ENTRY BUDGET] done created=%s raw_total=%s prefiltered=%s candidates=%s filter_reject=%s build_reject=%s pending_reject=%s budget_sec=%.1f elapsed=%.3fs",
+            created, len(rows_all), len(rows), len(best_by_symbol_side), filter_reject, build_reject, pending_reject, budget_sec, elapsed,
+        )
+        return created
+    except Exception:
+        logger.exception("[RANKING ENTRY BUDGET] failed")
+        return 0
+
+
+def _patched_run_ranking_entry_pipeline() -> int:
+    return _patched_entry_from_ranking()
+
+
 def install() -> bool:
-    global _PATCHED, _ORIG_LIGHT_PREFILTER, _ORIG_SAVE_TECH, _ORIG_LOAD_HISTORY
+    global _PATCHED, _ORIG_LIGHT_PREFILTER, _ORIG_SAVE_TECH, _ORIG_LOAD_HISTORY, _ORIG_ENTRY_FROM_RANKING, _ORIG_RUN_PIPELINE
     if _PATCHED:
         return True
     try:
@@ -487,37 +607,53 @@ def install() -> bool:
 
         patched = []
         cur_pf = getattr(efr, "_light_prefilter_rows", None)
-        if callable(cur_pf) and not getattr(cur_pf, "_ranking_entry_fast_patch_v3", False):
+        if callable(cur_pf) and not getattr(cur_pf, "_ranking_entry_fast_patch_v4", False):
             _ORIG_LIGHT_PREFILTER = cur_pf
-            _patched_light_prefilter_rows._ranking_entry_fast_patch_v3 = True  # type: ignore[attr-defined]
+            _patched_light_prefilter_rows._ranking_entry_fast_patch_v4 = True  # type: ignore[attr-defined]
             efr._light_prefilter_rows = _patched_light_prefilter_rows
             patched.append("entry_from_ranking._light_prefilter_rows")
 
         cur_save = getattr(efr, "save_ranking_pseudo_technicals", None)
-        if callable(cur_save) and not getattr(cur_save, "_ranking_entry_fast_patch_v3", False):
+        if callable(cur_save) and not getattr(cur_save, "_ranking_entry_fast_patch_v4", False):
             _ORIG_SAVE_TECH = cur_save
-            _patched_save_ranking_pseudo_technicals._ranking_entry_fast_patch_v3 = True  # type: ignore[attr-defined]
+            _patched_save_ranking_pseudo_technicals._ranking_entry_fast_patch_v4 = True  # type: ignore[attr-defined]
             efr.save_ranking_pseudo_technicals = _patched_save_ranking_pseudo_technicals
             store.save_ranking_pseudo_technicals = _patched_save_ranking_pseudo_technicals
-            patched.append("save_ranking_pseudo_technicals_cached_readonly")
+            patched.append("save_ranking_pseudo_technicals_budgeted_readonly")
 
         cur_load = getattr(store, "_load_history", None)
-        if callable(cur_load) and not getattr(cur_load, "_ranking_entry_fast_patch_v3", False):
+        if callable(cur_load) and not getattr(cur_load, "_ranking_entry_fast_patch_v4", False):
             _ORIG_LOAD_HISTORY = cur_load
-            _patched_load_history._ranking_entry_fast_patch_v3 = True  # type: ignore[attr-defined]
+            _patched_load_history._ranking_entry_fast_patch_v4 = True  # type: ignore[attr-defined]
             store._load_history = _patched_load_history
             patched.append("ranking_technical_store._load_history")
 
+        cur_entry = getattr(efr, "entry_from_ranking", None)
+        if callable(cur_entry) and not getattr(cur_entry, "_ranking_entry_fast_patch_v4", False):
+            _ORIG_ENTRY_FROM_RANKING = cur_entry
+            _patched_entry_from_ranking._ranking_entry_fast_patch_v4 = True  # type: ignore[attr-defined]
+            efr.entry_from_ranking = _patched_entry_from_ranking
+            patched.append("entry_from_ranking.entry_from_ranking_budgeted")
+
+        cur_run = getattr(efr, "run_ranking_entry_pipeline", None)
+        if callable(cur_run) and not getattr(cur_run, "_ranking_entry_fast_patch_v4", False):
+            _ORIG_RUN_PIPELINE = cur_run
+            _patched_run_ranking_entry_pipeline._ranking_entry_fast_patch_v4 = True  # type: ignore[attr-defined]
+            efr.run_ranking_entry_pipeline = _patched_run_ranking_entry_pipeline
+            patched.append("entry_from_ranking.run_ranking_entry_pipeline_budgeted")
+
         _PATCHED = True
         logger.warning(
-            "[RANKING ENTRY FAST PATCH] installed V3 patched=%s max_rows=%s max_symbols=%s skip_save=%s readonly=%s cache=%s ttl=%.1f",
+            "[RANKING ENTRY FAST PATCH] installed V4 patched=%s budget=%.1fs max_rows=%s max_symbols=%s max_pending=%s skip_save=%s readonly=%s cache=%s ttl=%.1f",
             patched,
-            _env_int("RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS", 80),
-            _env_int("RANKING_ENTRY_FAST_MAX_SYMBOLS", 60),
+            _env_float("RANKING_ENTRY_RUNTIME_BUDGET_SEC", 25.0),
+            _env_int("RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS", 40),
+            _env_int("RANKING_ENTRY_FAST_MAX_SYMBOLS", 40),
+            _env_int("RANKING_ENTRY_MAX_PENDING_PER_RUN", 5),
             _env_bool("RANKING_ENTRY_SKIP_TECH_SAVE", True),
             _env_bool("RANKING_ENTRY_TECH_READONLY", True),
             _env_bool("RANKING_ENTRY_TECH_MEMORY_CACHE", True),
-            _env_float("RANKING_ENTRY_TECH_CACHE_TTL_SEC", 60.0),
+            _env_float("RANKING_ENTRY_TECH_CACHE_TTL_SEC", 90.0),
         )
         return True
     except Exception:
