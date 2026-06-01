@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/tonosama/volume_surge.py
-# Version: Ver2.5-TONOSAMA-3M5M-STREAK-FEATURES
+# Version: Ver2.6-TONOSAMA-MARKET-AWARE-RECENT-FILTER
 # ------------------------------------------------------------
 # 目的:
 #   殿様エントリー用の出来高急増・価格変化特徴量を作る。
@@ -13,6 +13,12 @@
 #   - BUY: 3mまたは5mが3本以上連続上昇した後は高値追いとして拒否するため。
 #   - SELL: 3mまたは5mが3本以上連続下落した後は安値追いとして拒否するため。
 #   - pending_writer.py 側で prev_3m_up_streak / prev_5m_up_streak などを利用する。
+#
+# Ver2.6:
+#   - TONOSAMA_RECENT_ONLY の鮮度判定を市場稼働時間ベースに変更。
+#   - 11:30〜12:30の昼休みを stale age から控除する。
+#   - 12:31時点で latest=11:30 を実時間61分古いと誤判定し、
+#     base_1m recent empty -> skip TONOSAMA になる問題を防ぐ。
 # ============================================================
 
 from __future__ import annotations
@@ -28,6 +34,12 @@ from .summary_loader import load_merged_summary, normalize_summary_base
 from .utils import safe_float
 
 logger = logging.getLogger(__name__)
+
+
+_AM_START = dt.time(9, 0)
+_AM_END = dt.time(11, 30)
+_PM_START = dt.time(12, 30)
+_PM_END = dt.time(15, 30)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -82,20 +94,84 @@ def _source_counts(df: pd.DataFrame, limit: int = 8) -> dict:
         return {}
 
 
+def _session_minutes_until(t: dt.datetime) -> float:
+    """Return market-session minutes elapsed from 09:00 to t, excluding lunch."""
+    try:
+        base = t.date()
+        am_start = dt.datetime.combine(base, _AM_START)
+        am_end = dt.datetime.combine(base, _AM_END)
+        pm_start = dt.datetime.combine(base, _PM_START)
+        pm_end = dt.datetime.combine(base, _PM_END)
+        if t <= am_start:
+            return 0.0
+        if t <= am_end:
+            return (t - am_start).total_seconds() / 60.0
+        am_minutes = (am_end - am_start).total_seconds() / 60.0
+        if t <= pm_start:
+            return am_minutes
+        if t <= pm_end:
+            return am_minutes + (t - pm_start).total_seconds() / 60.0
+        return am_minutes + (pm_end - pm_start).total_seconds() / 60.0
+    except Exception:
+        return 0.0
+
+
+def _market_age_minutes(latest: pd.Timestamp | dt.datetime | None, now: dt.datetime) -> float | None:
+    try:
+        if latest is None or pd.isna(latest):
+            return None
+        lt = pd.Timestamp(latest).to_pydatetime().replace(tzinfo=None)
+        nt = now.replace(tzinfo=None)
+        if lt.date() != nt.date():
+            return max(0.0, (nt - lt).total_seconds() / 60.0)
+        # market-aware: 11:30〜12:30 は age に入れない。
+        return max(0.0, _session_minutes_until(nt) - _session_minutes_until(lt))
+    except Exception:
+        try:
+            return max(0.0, (now - pd.Timestamp(latest).to_pydatetime().replace(tzinfo=None)).total_seconds() / 60.0)
+        except Exception:
+            return None
+
+
+def _market_cutoff(now: dt.datetime, max_age_min: float) -> dt.datetime:
+    """Return the oldest acceptable timestamp by market-session minutes."""
+    try:
+        n = now.replace(tzinfo=None)
+        target_session_min = max(0.0, _session_minutes_until(n) - float(max_age_min))
+        base = n.date()
+        am_start = dt.datetime.combine(base, _AM_START)
+        am_end = dt.datetime.combine(base, _AM_END)
+        pm_start = dt.datetime.combine(base, _PM_START)
+        am_len = (am_end - am_start).total_seconds() / 60.0
+        if target_session_min <= am_len:
+            return am_start + dt.timedelta(minutes=target_session_min)
+        return pm_start + dt.timedelta(minutes=target_session_min - am_len)
+    except Exception:
+        return now - dt.timedelta(minutes=max_age_min)
+
+
 def _latest_info(df: pd.DataFrame, *, now: dt.datetime | None = None) -> dict:
     try:
         if df is None or df.empty or "datetime" not in df.columns:
-            return {"rows": len(df) if isinstance(df, pd.DataFrame) else 0, "latest_dt": None, "age_min": None, "source_counts": _source_counts(df) if isinstance(df, pd.DataFrame) else {}}
+            return {"rows": len(df) if isinstance(df, pd.DataFrame) else 0, "latest_dt": None, "age_min": None, "market_age_min": None, "source_counts": _source_counts(df) if isinstance(df, pd.DataFrame) else {}}
         x = _normalize_datetime_col(df)
         if x.empty:
-            return {"rows": len(df), "latest_dt": None, "age_min": None, "source_counts": _source_counts(df)}
+            return {"rows": len(df), "latest_dt": None, "age_min": None, "market_age_min": None, "source_counts": _source_counts(df)}
         n = now or _now_naive()
         latest = pd.to_datetime(x["datetime"], errors="coerce").max()
         oldest = pd.to_datetime(x["datetime"], errors="coerce").min()
         age_min = (pd.Timestamp(n) - latest).total_seconds() / 60.0 if pd.notna(latest) else None
-        return {"rows": len(df), "oldest_dt": str(oldest) if pd.notna(oldest) else None, "latest_dt": str(latest) if pd.notna(latest) else None, "age_min": round(float(age_min), 3) if age_min is not None else None, "source_counts": _source_counts(x)}
+        market_age = _market_age_minutes(latest, n) if pd.notna(latest) else None
+        return {
+            "rows": len(df),
+            "oldest_dt": str(oldest) if pd.notna(oldest) else None,
+            "latest_dt": str(latest) if pd.notna(latest) else None,
+            "age_min": round(float(age_min), 3) if age_min is not None else None,
+            "market_age_min": round(float(market_age), 3) if market_age is not None else None,
+            "source_counts": _source_counts(x),
+        }
     except Exception:
-        return {"rows": len(df) if isinstance(df, pd.DataFrame) else 0, "latest_dt": None, "age_min": None, "source_counts": {}}
+        return {"rows": len(df) if isinstance(df, pd.DataFrame) else 0, "latest_dt": None, "age_min": None, "market_age_min": None, "source_counts": {}}
 
 
 def _filter_recent_rows(df: pd.DataFrame, *, interval: int, label: str) -> pd.DataFrame:
@@ -110,15 +186,29 @@ def _filter_recent_rows(df: pd.DataFrame, *, interval: int, label: str) -> pd.Da
         return x0
     now = _now_naive()
     max_age_min = max(1.0, _env_float("TONOSAMA_RECENT_MAX_AGE_MIN", 30.0))
-    cutoff = pd.Timestamp(now - dt.timedelta(minutes=max_age_min))
+    real_cutoff = pd.Timestamp(now - dt.timedelta(minutes=max_age_min))
+    market_cutoff = pd.Timestamp(_market_cutoff(now, max_age_min)) if _env_bool("TONOSAMA_RECENT_MARKET_TIME_AWARE", True) else real_cutoff
+    cutoff = market_cutoff
     today = pd.Timestamp(now.date())
     before = len(x0)
     info_before = _latest_info(x0, now=now)
     x = x0[(x0["datetime"] >= cutoff) & (x0["datetime"] >= today)].copy()
     info_after = _latest_info(x, now=now)
     logger.warning(
-        "[TONOSAMA SURGE] recent filter label=%s interval=%s before=%s after=%s cutoff=%s today=%s latest_before=%s age_min=%s source_counts=%s latest_after=%s",
-        label, interval, before, len(x), cutoff, today.date(), info_before.get("latest_dt"), info_before.get("age_min"), info_before.get("source_counts"), info_after.get("latest_dt"),
+        "[TONOSAMA SURGE] recent filter label=%s interval=%s before=%s after=%s cutoff=%s real_cutoff=%s today=%s latest_before=%s age_min=%s market_age_min=%s source_counts=%s latest_after=%s market_time_aware=%s",
+        label,
+        interval,
+        before,
+        len(x),
+        cutoff,
+        real_cutoff,
+        today.date(),
+        info_before.get("latest_dt"),
+        info_before.get("age_min"),
+        info_before.get("market_age_min"),
+        info_before.get("source_counts"),
+        info_after.get("latest_dt"),
+        _env_bool("TONOSAMA_RECENT_MARKET_TIME_AWARE", True),
     )
     return x
 
@@ -288,16 +378,25 @@ def build_scalping_feature_df() -> pd.DataFrame:
     raw1_info = _latest_info(raw1)
     df1 = _filter_recent_rows(raw1, interval=1, label="base_1m")
     if df1.empty:
-        logger.warning("[TONOSAMA SURGE] base 1m recent empty -> skip TONOSAMA for safety raw_rows=%s latest_dt=%s age_min=%s max_age_min=%.1f source_counts=%s hint=%s", len(raw1) if isinstance(raw1, pd.DataFrame) else 0, raw1_info.get("latest_dt"), raw1_info.get("age_min"), _env_float("TONOSAMA_RECENT_MAX_AGE_MIN", 30.0), raw1_info.get("source_counts"), "summary_1m_is_stale_or_not_updating; check push summary / lunch-yahoo / main_database freshness")
+        logger.warning(
+            "[TONOSAMA SURGE] base 1m recent empty -> skip TONOSAMA for safety raw_rows=%s latest_dt=%s age_min=%s market_age_min=%s max_age_min=%.1f source_counts=%s hint=%s",
+            len(raw1) if isinstance(raw1, pd.DataFrame) else 0,
+            raw1_info.get("latest_dt"),
+            raw1_info.get("age_min"),
+            raw1_info.get("market_age_min"),
+            _env_float("TONOSAMA_RECENT_MAX_AGE_MIN", 30.0),
+            raw1_info.get("source_counts"),
+            "summary_1m_is_stale_or_not_updating; check push summary / lunch-yahoo / main_database freshness",
+        )
         return pd.DataFrame()
     df3 = add_volume_surge_features(load_merged_summary(3), interval=3)
     df5 = add_volume_surge_features(load_merged_summary(5), interval=5)
     missing_history = _all_surge_history_missing(df3, df5)
     if missing_history and not _force_failopen_enabled():
-        logger.warning("[TONOSAMA SURGE] no usable 3m/5m volume surge history after recent filter -> return empty base_rows=%s df3=%s df5=%s failopen_reason=%s raw1_latest=%s raw1_age_min=%s", len(df1), len(df3) if isinstance(df3, pd.DataFrame) else 0, len(df5) if isinstance(df5, pd.DataFrame) else 0, _failopen_reason(), raw1_info.get("latest_dt"), raw1_info.get("age_min"))
+        logger.warning("[TONOSAMA SURGE] no usable 3m/5m volume surge history after recent filter -> return empty base_rows=%s df3=%s df5=%s failopen_reason=%s raw1_latest=%s raw1_age_min=%s raw1_market_age_min=%s", len(df1), len(df3) if isinstance(df3, pd.DataFrame) else 0, len(df5) if isinstance(df5, pd.DataFrame) else 0, _failopen_reason(), raw1_info.get("latest_dt"), raw1_info.get("age_min"), raw1_info.get("market_age_min"))
         return pd.DataFrame()
     if missing_history and _force_failopen_enabled():
-        logger.warning("[TONOSAMA SURGE] no usable 3m/5m volume surge history -> continue controlled fail-open base_rows=%s df3=%s df5=%s reason=%s raw1_latest=%s raw1_age_min=%s", len(df1), len(df3) if isinstance(df3, pd.DataFrame) else 0, len(df5) if isinstance(df5, pd.DataFrame) else 0, _failopen_reason(), raw1_info.get("latest_dt"), raw1_info.get("age_min"))
+        logger.warning("[TONOSAMA SURGE] no usable 3m/5m volume surge history -> continue controlled fail-open base_rows=%s df3=%s df5=%s reason=%s raw1_latest=%s raw1_age_min=%s raw1_market_age_min=%s", len(df1), len(df3) if isinstance(df3, pd.DataFrame) else 0, len(df5) if isinstance(df5, pd.DataFrame) else 0, _failopen_reason(), raw1_info.get("latest_dt"), raw1_info.get("age_min"), raw1_info.get("market_age_min"))
     out = df1.dropna(subset=["datetime"]).sort_values(["symbol", "datetime"]).groupby("symbol", group_keys=False).tail(1).copy()
     if out.empty:
         return pd.DataFrame()
@@ -339,7 +438,7 @@ def build_scalping_feature_df() -> pd.DataFrame:
         up5 = out.get("prev_5m_up_streak", pd.Series(0, index=out.index)).fillna(0)
         dn3 = out.get("prev_3m_down_streak", pd.Series(0, index=out.index)).fillna(0)
         dn5 = out.get("prev_5m_down_streak", pd.Series(0, index=out.index)).fillna(0)
-        logger.warning("[TONOSAMA SURGE] feature summary rows=%s vol_cols=%s price_cols=%s volume_surge_nonzero=%s price_change_nonzero=%s up_3m_or_5m_ge3=%s down_3m_or_5m_ge3=%s history_missing_rows=%s failopen_rows=%s price_fallback_rows=%s failopen_reason=%s raw1_latest=%s head=%s", len(out), vol_cols, price_cols, int((out["_max_volume_surge_ratio"].fillna(0) != 0).sum()), int((out["_max_price_change_pct"].fillna(0) != 0).sum()), int(((up3 >= 3) | (up5 >= 3)).sum()), int(((dn3 >= 3) | (dn5 >= 3)).sum()), int(history_missing.sum()), int(failopen_col.sum()), int(out.get("_price_change_fallback_1m", pd.Series(False, index=out.index)).fillna(False).astype(bool).sum()), _failopen_reason(), raw1_info.get("latest_dt"), out[[c for c in ["symbol", "symbolname", "close", "_max_volume_surge_ratio", "_max_price_change_pct", "prev_3m_up_streak", "prev_5m_up_streak", "prev_3m_down_streak", "prev_5m_down_streak", "prev_3m_last_delta_pct", "prev_5m_last_delta_pct", "_surge_tf", "_volume_surge_history_missing", "_volume_surge_failopen", "_price_change_fallback_1m"] if c in out.columns]].head(12).to_dict("records"))
+        logger.warning("[TONOSAMA SURGE] feature summary rows=%s vol_cols=%s price_cols=%s volume_surge_nonzero=%s price_change_nonzero=%s up_3m_or_5m_ge3=%s down_3m_or_5m_ge3=%s history_missing_rows=%s failopen_rows=%s price_fallback_rows=%s failopen_reason=%s raw1_latest=%s raw1_market_age_min=%s head=%s", len(out), vol_cols, price_cols, int((out["_max_volume_surge_ratio"].fillna(0) != 0).sum()), int((out["_max_price_change_pct"].fillna(0) != 0).sum()), int(((up3 >= 3) | (up5 >= 3)).sum()), int(((dn3 >= 3) | (dn5 >= 3)).sum()), int(history_missing.sum()), int(failopen_col.sum()), int(out.get("_price_change_fallback_1m", pd.Series(False, index=out.index)).fillna(False).astype(bool).sum()), _failopen_reason(), raw1_info.get("latest_dt"), raw1_info.get("market_age_min"), out[[c for c in ["symbol", "symbolname", "close", "_max_volume_surge_ratio", "_max_price_change_pct", "prev_3m_up_streak", "prev_5m_up_streak", "prev_3m_down_streak", "prev_5m_down_streak", "prev_3m_last_delta_pct", "prev_5m_last_delta_pct", "_surge_tf", "_volume_surge_history_missing", "_volume_surge_failopen", "_price_change_fallback_1m"] if c in out.columns]].head(12).to_dict("records"))
     except Exception:
         logger.debug("[TONOSAMA SURGE] feature summary log failed", exc_info=True)
     return out.reset_index(drop=True)
