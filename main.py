@@ -10,7 +10,7 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.21-TONOSAMA-5SEC-FALLBACK-PATCH
+# Version: Ver38.22-ENTRY-LOG-SKIP-GUARD-LAST
 # ------------------------------------------------------------
 # ✔ PROJECT_ROOT を最初に sys.path へ追加
 # ✔ core.logging.console_tee を確実に import / setup
@@ -36,6 +36,7 @@
 # ✔ main.py では毎分 1m/3m/5m summary 強制作成を止め、timeoutを防ぐ
 # ✔ TONOSAMA 5秒足値動きフィルタを 0.03% → 0.01% に緩和
 # ✔ TONOSAMA 5秒足時刻不明の stopped 判定は3m/5m・ranking MAで補助判定
+# ✔ _log_skip reason衝突ガードを全runtime patch後の最後に再適用
 # ✔ 既存の起動処理は維持
 # ============================================================
 
@@ -173,6 +174,7 @@ def _install_main_runtime_patches():
         ("core.startup.board_retry_patch", "install"),
         ("core.startup.tonosama_5sec_stopped_relax_patch", "install"),
         ("core.startup.board_wall_stall_exit_patch", "install"),
+        ("core.startup.entry_log_skip_reason_collision_patch", "install"),
     ]
     for mod_name, fn_name in patches:
         try:
