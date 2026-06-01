@@ -1,6 +1,6 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver30-ENTRY-LOG-SKIP-REASON-GUARD
+# Version: Ver31-TONOSAMA-FRESH-WAIT-AND-AI-SOFT-RESCUE
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # 失敗しても本体起動は止めない。
@@ -149,6 +149,14 @@ def _install_tonosama_surge_defaults() -> None:
         os.environ.setdefault("TONOSAMA_SLOPE_RANGE_RESCUE_MIN_SURGE", "0.0")
         os.environ.setdefault("TONOSAMA_SLOPE_RANGE_RESCUE_MIN_ABS_SCORE", "0.0")
 
+        # TONOSAMA AI/fallback soft rescue.  Hard climax/direction NG remains blocked.
+        os.environ.setdefault("TONOSAMA_AI_SOFT_RESCUE", "1")
+        os.environ.setdefault("TONOSAMA_AI_RESCUE_MIN_VOLUME", "500000")
+        os.environ.setdefault("TONOSAMA_AI_RESCUE_MIN_RANGE_PCT", "4.0")
+        os.environ.setdefault("TONOSAMA_AI_RESCUE_MIN_SURGE", "3.0")
+        os.environ.setdefault("TONOSAMA_AI_RESCUE_MIN_PRICE_CHANGE_PCT", "0.08")
+        os.environ.setdefault("TONOSAMA_AI_RESCUE_MIN_SLOPE_ABS", "0.0003")
+
         os.environ.setdefault("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_ENABLED", "1")
         os.environ.setdefault("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_SEC", "35")
         os.environ.setdefault("ENTRY_CONTROLLER_SOURCE_PREFILTER_ENABLED", "1")
@@ -193,9 +201,10 @@ def _install_tonosama_surge_defaults() -> None:
             "tonosama_price_range_rescue": os.environ.get("TONOSAMA_PRICE_CHANGE_OR_RANGE_ENABLED"),
             "tonosama_volume_surge_zero_rescue": os.environ.get("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_ENABLED"),
             "tonosama_slope_range_rescue": os.environ.get("TONOSAMA_SLOPE_RANGE_RESCUE_ENABLED"),
+            "tonosama_ai_soft_rescue": os.environ.get("TONOSAMA_AI_SOFT_RESCUE"),
         })
         logger.warning(
-            "[SITECUSTOMIZE] defaults short_mtf_require_all=%s short_mtf_min_aligned=%s ranking_source_db_fallback=%s ranking_hl_patch=%s entry_direction_recursion_failopen=%s summary_date_guard=%s warning_only_climax=%s tonosama_price_range_rescue=%s tonosama_volume_surge_zero_rescue=%s tonosama_slope_range_rescue=%s",
+            "[SITECUSTOMIZE] defaults short_mtf_require_all=%s short_mtf_min_aligned=%s ranking_source_db_fallback=%s ranking_hl_patch=%s entry_direction_recursion_failopen=%s summary_date_guard=%s warning_only_climax=%s tonosama_price_range_rescue=%s tonosama_volume_surge_zero_rescue=%s tonosama_slope_range_rescue=%s ai_soft_rescue=%s",
             os.environ.get("ENTRY_SHORT_MTF_REQUIRE_ALL"),
             os.environ.get("ENTRY_SHORT_MTF_MIN_ALIGNED"),
             os.environ.get("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED"),
@@ -206,6 +215,7 @@ def _install_tonosama_surge_defaults() -> None:
             os.environ.get("TONOSAMA_PRICE_CHANGE_OR_RANGE_ENABLED"),
             os.environ.get("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_ENABLED"),
             os.environ.get("TONOSAMA_SLOPE_RANGE_RESCUE_ENABLED"),
+            os.environ.get("TONOSAMA_AI_SOFT_RESCUE"),
         )
     except Exception:
         _write_boot_evidence("TONOSAMA_SURGE_DEFAULTS_EXCEPTION", traceback.format_exc())
@@ -254,6 +264,8 @@ _install_module("core.startup.tonosama_pending_warning_relax_patch", "TONOSAMA_P
 _install_module("core.startup.tonosama_price_change_or_range_patch", "TONOSAMA_PRICE_RANGE_RESCUE", disabled_env="DISABLE_TONOSAMA_PRICE_RANGE_RESCUE_PATCH")
 _install_module("core.startup.tonosama_volume_surge_zero_rescue_patch", "TONOSAMA_VOLUME_SURGE_ZERO_RESCUE", disabled_env="DISABLE_TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_PATCH")
 _install_module("core.startup.tonosama_slope_range_rescue_patch", "TONOSAMA_SLOPE_RANGE_RESCUE", disabled_env="DISABLE_TONOSAMA_SLOPE_RANGE_RESCUE_PATCH")
+_install_module("core.startup.tonosama_fast_score_prefilter_patch", "TONOSAMA_FAST_SCORE_PREFILTER", disabled_env="DISABLE_TONOSAMA_FAST_SCORE_PREFILTER_PATCH")
+_install_module("core.startup.tonosama_fresh_summary_wait_fix_patch", "TONOSAMA_FRESH_SUMMARY_WAIT_FIX", disabled_env="DISABLE_TONOSAMA_FRESH_SUMMARY_WAIT_FIX_PATCH")
 _install_liq_empty_fallback_only_if_enabled()
 _install_module("core.startup.summary_ai_liquidity_rescue_patch", "SUMMARY_AI_LIQ_RESCUE", disabled_env="DISABLE_SUMMARY_AI_LIQ_RESCUE_PATCH")
 _install_module("core.startup.summary_ai_entry_hook_dataframe_truth_patch", "SUMMARY_AI_DF_TRUTH_PATCH", disabled_env="DISABLE_SUMMARY_AI_DF_TRUTH_PATCH")
