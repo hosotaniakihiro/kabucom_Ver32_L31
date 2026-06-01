@@ -1,9 +1,9 @@
 # ============================================================
 # File   : usercustomize.py
-# Version: V1-AUTOINSTALL-TONOSAMA-LUNCH-REOPEN
+# Version: V2-AUTOINSTALL-SMALL-RUNTIME-PATCHES
 # ------------------------------------------------------------
 # Python site module imports usercustomize after sitecustomize when the
-# project root is on sys.path.  Keep this tiny and non-fatal.
+# project root is on sys.path. Keep this tiny and non-fatal.
 # ============================================================
 
 from __future__ import annotations
@@ -12,9 +12,16 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-try:
-    from core.startup.tonosama_lunch_reopen_recent_patch import install
-    ok = bool(install())
-    logger.warning("[USERCUSTOMIZE] TONOSAMA_LUNCH_REOPEN_RECENT auto install ok=%s", ok)
-except Exception:
-    logger.exception("[USERCUSTOMIZE] TONOSAMA_LUNCH_REOPEN_RECENT auto install failed")
+
+def _install(label: str, module_name: str) -> None:
+    try:
+        mod = __import__(module_name, fromlist=["install"])
+        fn = getattr(mod, "install", None)
+        ok = bool(fn()) if callable(fn) else False
+        logger.warning("[USERCUSTOMIZE] %s auto install ok=%s", label, ok)
+    except Exception:
+        logger.exception("[USERCUSTOMIZE] %s auto install failed", label)
+
+
+_install("TONOSAMA_LUNCH_REOPEN_RECENT", "core.startup.tonosama_lunch_reopen_recent_patch")
+_install("YAHOO_COMPUTE_SCHEMA_NA_GUARD", "core.startup.yahoo_compute_schema_na_guard_patch")
