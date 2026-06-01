@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/tonosama/ai_gate.py
-# Version: Ver1.9-TONOSAMA-FALLBACK-NO-CLIMAX-RANGE-RESCUE
+# Version: Ver2.0-TONOSAMA-FALLBACK-MOMENTUM-TUNED
 # ------------------------------------------------------------
 # 目的:
 #   TONOSAMA ENTRY のAI未接続fallback判定。
@@ -11,6 +11,14 @@
 #   - SELLはセリングクライマックス気味の出来高増をSELLサインにしない。
 #   - range_rescueでも価格変化0.00%・5秒0.000%は通さない。
 #   - 3m/5mの方向一致をfallbackで必須化する。
+#
+# Ver2.0:
+#   - 後場ログで候補16件・price_eligible=11まで進むが、AI fallbackが
+#     price change low 0.20% / slope low 0.0010 でほぼ全NGになっていた。
+#   - 価格変化の既定を 0.20% -> 0.10% に調整。
+#   - slope既定を 0.0010 -> 0.0008 に調整。
+#   - 5秒足は任意扱いに合わせ、fallback側も reject_zero_5s 既定をFalseへ。
+#   - ただし同方向クライマックス拒否は維持する。
 # ============================================================
 from __future__ import annotations
 
@@ -168,10 +176,9 @@ def _range_rescue_ok(features: dict, *, side: str, min_surge: float, effective_s
 
     min_range = _env_float("TONOSAMA_AI_FALLBACK_MIN_RANGE_PCT", 3.0)
     min_volume = _env_float("TONOSAMA_AI_FALLBACK_MIN_LATEST_VOLUME", 50000.0)
-    # Ver1.9: range_rescueでも実際の方向変化が必要。0.00%救済は禁止。
-    min_dir_change = _env_float_floor("TONOSAMA_AI_FALLBACK_RANGE_RESCUE_MIN_DIR_CHANGE", 0.10, 0.10)
-    min_5s = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT", float(_cfg("MIN_5SEC_PRICE_CHANGE_PCT", 0.01)), 0.01)
-    reject_zero_5s = _env_bool("TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC", True)
+    min_dir_change = _env_float_floor("TONOSAMA_AI_FALLBACK_RANGE_RESCUE_MIN_DIR_CHANGE", 0.10, 0.05)
+    min_5s = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT", float(_cfg("MIN_5SEC_PRICE_CHANGE_PCT", 0.01)), 0.0)
+    reject_zero_5s = _env_bool("TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC", False)
     reject_same_climax = _env_bool("TONOSAMA_AI_FALLBACK_REJECT_SAME_SIDE_CLIMAX", True)
 
     base_ok = max_surge >= min_surge and rng >= min_range and vol >= min_volume
@@ -212,12 +219,12 @@ def _fallback_when_ai_disconnected(features: dict) -> tuple[bool, float, str]:
     abs_slope = abs(slope)
 
     min_surge = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_VOLUME_SURGE", float(_cfg("MIN_VOLUME_SURGE_RATIO", 3.0)), 3.0)
-    min_chg = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_PRICE_CHANGE_PCT", float(_cfg("MIN_PRICE_CHANGE_PCT", 0.20)), 0.20)
-    min_slope = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_SLOPE", float(_cfg("MIN_SLOPE", 0.0010)), 0.0010)
-    min_5s = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT", float(_cfg("MIN_5SEC_PRICE_CHANGE_PCT", 0.01)), 0.01)
+    min_chg = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_PRICE_CHANGE_PCT", float(_cfg("MIN_PRICE_CHANGE_PCT", 0.10)), 0.10)
+    min_slope = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_SLOPE", float(_cfg("MIN_SLOPE", 0.0008)), 0.0008)
+    min_5s = _env_float_floor("TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT", float(_cfg("MIN_5SEC_PRICE_CHANGE_PCT", 0.0)), 0.0)
     max_5s_drop = _env_float("TONOSAMA_AI_FALLBACK_MAX_5SEC_DROP_PCT", float(_cfg("MAX_5SEC_DROP_PCT", -0.20)))
     require_5s = _env_bool("TONOSAMA_AI_FALLBACK_REQUIRE_5SEC_BAR", bool(_cfg("REQUIRE_5SEC_BAR", False)))
-    reject_zero_5s = _env_bool("TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC", True)
+    reject_zero_5s = _env_bool("TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC", False)
     min_buy_3m = _env_float("TONOSAMA_AI_FALLBACK_MIN_BUY_3M_CHANGE", 0.0)
     min_buy_5m = _env_float("TONOSAMA_AI_FALLBACK_MIN_BUY_5M_CHANGE", 0.0)
     max_sell_3m = _env_float("TONOSAMA_AI_FALLBACK_MAX_SELL_3M_CHANGE", 0.0)
