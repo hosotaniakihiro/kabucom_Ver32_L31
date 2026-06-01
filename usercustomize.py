@@ -1,6 +1,6 @@
 # ============================================================
 # File   : usercustomize.py
-# Version: V2-AUTOINSTALL-SMALL-RUNTIME-PATCHES
+# Version: V3-AUTOINSTALL-SMALL-RUNTIME-PATCHES
 # ------------------------------------------------------------
 # Python site module imports usercustomize after sitecustomize when the
 # project root is on sys.path. Keep this tiny and non-fatal.
@@ -25,3 +25,4 @@ def _install(label: str, module_name: str) -> None:
 
 _install("TONOSAMA_LUNCH_REOPEN_RECENT", "core.startup.tonosama_lunch_reopen_recent_patch")
 _install("YAHOO_COMPUTE_SCHEMA_NA_GUARD", "core.startup.yahoo_compute_schema_na_guard_patch")
+_install("RANKING_ENTRY_FAST_BUDGET_OVERRIDE", "core.startup.ranking_entry_fast_budget_override_patch")
