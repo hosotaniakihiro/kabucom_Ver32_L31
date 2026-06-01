@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/transport.py
-# Version: Ver1.3-PUSH-STREAM-TRANSPORT-SKIP-AFTER-OPEN-REFRESH
+# Version: Ver1.4-PUSH-STREAM-TRANSPORT-ROBUST-REFRESH
 # ------------------------------------------------------------
 # ✔ WebSocket sender install / clear
 # ✔ ws alive 判定
@@ -12,6 +12,8 @@
 # ✔ register_symbols 側へ RuntimeError として安全伝搬
 # ✔ refresh の戻り値 / result_type / kwargs を詳細ログ
 # ✔ refresh 空振りの可視化強化
+# ✔ on_open / watchdog refresh は clear_first + unregister_first を優先し、
+#   callable の引数差異があっても安全に段階的フォールバック
 # ============================================================
 
 from __future__ import annotations
@@ -183,6 +185,48 @@ def set_refresh_callable(fn: Optional[Callable[..., Any]]) -> None:
     )
 
 
+def _invoke_refresh_callable(fn: Callable[..., Any], *, force: bool, reason: str, kwargs: dict[str, Any]) -> Any:
+    """
+    subscription_manager は版によって受け取る引数が違う。
+    on_open / watchdog 復旧では clear_first + unregister_first を優先するが、
+    TypeError の場合は段階的に引数を減らして必ず再登録を試す。
+    """
+    attempts: list[tuple[str, dict[str, Any]]] = [
+        ("full", {"force": force, "reason": reason, **kwargs}),
+        ("force_reason", {"force": force, "reason": reason}),
+        ("force_only", {"force": force}),
+        ("kwargs_only", dict(kwargs)),
+        ("none", {}),
+    ]
+    last_type_error: TypeError | None = None
+
+    for label, call_kwargs in attempts:
+        if not state._connected_event.is_set() or not _is_ws_alive():
+            logger.warning("[push_stream] refresh attempt skipped reason=%s mode=%s ws_not_ready", reason, label)
+            return None
+        try:
+            logger.info(
+                "[push_stream] refresh attempt start reason=%s mode=%s kwargs_keys=%s",
+                reason,
+                label,
+                sorted(list(call_kwargs.keys())),
+            )
+            return fn(**call_kwargs)
+        except TypeError as e:
+            last_type_error = e
+            logger.warning(
+                "[push_stream] refresh attempt TypeError reason=%s mode=%s err=%s -> retry with fewer args",
+                reason,
+                label,
+                e,
+            )
+            continue
+
+    if last_type_error is not None:
+        logger.warning("[push_stream] refresh all signatures failed reason=%s last_type_error=%s", reason, last_type_error)
+    return None
+
+
 def _call_refresh(force: bool = True, reason: str = "on_open", **kwargs) -> Any:
     fn = state._refresh_callable
 
@@ -201,7 +245,7 @@ def _call_refresh(force: bool = True, reason: str = "on_open", **kwargs) -> Any:
             reason,
             sorted(list(kwargs.keys())),
         )
-        result = fn(force=force, reason=reason, **kwargs)
+        result = _invoke_refresh_callable(fn, force=force, reason=reason, kwargs=dict(kwargs))
         logger.info(
             "[push_stream] refresh done reason=%s result_type=%s result=%r",
             reason,
@@ -209,30 +253,6 @@ def _call_refresh(force: bool = True, reason: str = "on_open", **kwargs) -> Any:
             result,
         )
         return result
-
-    except TypeError:
-        try:
-            if not state._connected_event.is_set() or not _is_ws_alive():
-                logger.warning("[push_stream] refresh legacy skipped reason=%s ws_not_ready", reason)
-                return None
-
-            logger.info(
-                "[push_stream] refresh legacy start reason=%s kwargs_keys=%s",
-                reason,
-                sorted(list(kwargs.keys())),
-            )
-            result = fn(**kwargs)
-            logger.info(
-                "[push_stream] refresh done reason=%s legacy result_type=%s result=%r",
-                reason,
-                type(result).__name__ if result is not None else "NoneType",
-                result,
-            )
-            return result
-
-        except Exception:
-            logger.exception("[push_stream] refresh legacy call failed reason=%s", reason)
-            return None
 
     except Exception:
         logger.exception("[push_stream] refresh failed reason=%s", reason)
@@ -254,7 +274,13 @@ def _safe_refresh_subscriptions_after_open() -> None:
             logger.warning("[push_stream] refresh after open skipped: ws not ready")
             return
 
-        _call_refresh(force=True, reason="on_open")
+        _call_refresh(
+            force=True,
+            reason="on_open",
+            clear_first=True,
+            unregister_first=True,
+            wait_after_clear=0.5,
+        )
 
     except Exception:
         logger.exception("[push_stream] refresh after open failed")
@@ -284,6 +310,20 @@ def refresh_subscriptions(*args, **kwargs) -> Any:
             result,
         )
         return result
+
+    except TypeError as e:
+        logger.warning("[push_stream] refresh_subscriptions TypeError err=%s -> retry safe no-arg", e)
+        try:
+            result = fn()
+            logger.info(
+                "[push_stream] refresh_subscriptions no-arg done result_type=%s result=%r",
+                type(result).__name__ if result is not None else "NoneType",
+                result,
+            )
+            return result
+        except Exception:
+            logger.exception("[push_stream] refresh_subscriptions no-arg retry failed")
+            return None
 
     except Exception:
         logger.exception("[push_stream] refresh_subscriptions failed")
