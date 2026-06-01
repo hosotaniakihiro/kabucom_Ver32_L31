@@ -10,45 +10,18 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.22-ENTRY-LOG-SKIP-GUARD-LAST
+# Version: Ver38.23-RANKING-ENTRY-TIMEOUT-PATCH
 # ------------------------------------------------------------
-# ✔ PROJECT_ROOT を最初に sys.path へ追加
-# ✔ core.logging.console_tee を確実に import / setup
-# ✔ stdout / stderr / print / traceback / logging を console_*.log に保存
-# ✔ system_startup 後に logging StreamHandler を tee へ再接続
-# ✔ 100368 SELL拒否後の entry_controller ログ補正 runtime patch を起動時install
-# ✔ 起動高速化 runtime patch を起動時install
-# ✔ ENTRY_QTY_ZERO対策 runtime patch を明示install
-# ✔ 動かない銘柄をエントリー直前で除外する low movement guard を明示install
-# ✔ 5分足欠損/方向確認再帰による最終全落ちを fail-open する patch を明示install
-# ✔ AI確認候補数拡張 patch を起動時install（既定20→40）
-# ✔ 板取得リトライ patch を起動時install（4.5秒 + 0.3秒追加確認）
-# ✔ 板が食われているのに株価が止まる場合の反転警戒EXITを起動時install
-# ✔ 発注直前に entry_row の 1m/3m/5m slope と MTF/ranking を補完
-# ✔ SUMMARY AI が AI_OK 済みの候補を entry_controller で再AI落ち/None戻り値誤判定させない bridge patch を起動時install
-# ✔ Discordの横長サマリー表示を縦リスト短文に補正し、interval kwarg TypeError を防止
-# ✔ ランキング由来ENTRYで価格横ばいでも順位上位/改善なら許可する patch を起動時install
-# ✔ indicator_calculator の DataFrame fragmentation 警告抑制/戻りDFデフラグ patch を起動時install
-# ✔ EXIT scheduler を run_exit_pipeline で1秒ごとに登録
-# ✔ main.py 側の scheduler / realtime / position_sync / push_monitor 生存証跡を heartbeat DB に保存
-# ✔ main.py のサマリー計算結果はENTRY判定専用。正式なsummary DB保存は main_database.py 側へ寄せる
-# ✔ main.py では optional ingest / kabutan取得 / daily_watchlist作成を既定スキップ
-# ✔ main.py では毎分 1m/3m/5m summary 強制作成を止め、timeoutを防ぐ
-# ✔ TONOSAMA 5秒足値動きフィルタを 0.03% → 0.01% に緩和
-# ✔ TONOSAMA 5秒足時刻不明の stopped 判定は3m/5m・ranking MAで補助判定
 # ✔ _log_skip reason衝突ガードを全runtime patch後の最後に再適用
+# ✔ RANKING ENTRY controller timeoutを60秒へ拡張
 # ✔ 既存の起動処理は維持
 # ============================================================
 
-# ------------------------------------------------------------
-# PROJECT_ROOT / logging / console tee（★絶対に最初）
-# ------------------------------------------------------------
 import os
 import sys
 import logging
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
@@ -66,6 +39,8 @@ os.environ.setdefault("SUMMARY_AI_MIN_5SEC_PRICE_CHANGE_PCT", "0.01")
 os.environ.setdefault("OPTIONAL_LIGHT_MODE", "1")
 os.environ.setdefault("OPTIONAL_SKIP_INGEST", "1")
 os.environ.setdefault("OPTIONAL_RUN_INGEST_IN_MAIN", "0")
+os.environ.setdefault("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", "60")
+os.environ.setdefault("RANKING_ENTRY_BUILD_TIMEOUT_SEC", "90")
 
 try:
     from core.logging.console_tee import setup_console_tee, rebind_logging_streams_to_console_tee
@@ -174,6 +149,7 @@ def _install_main_runtime_patches():
         ("core.startup.board_retry_patch", "install"),
         ("core.startup.tonosama_5sec_stopped_relax_patch", "install"),
         ("core.startup.board_wall_stall_exit_patch", "install"),
+        ("core.startup.ranking_entry_controller_timeout_patch", "install"),
         ("core.startup.entry_log_skip_reason_collision_patch", "install"),
     ]
     for mod_name, fn_name in patches:
