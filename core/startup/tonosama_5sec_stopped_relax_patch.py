@@ -1,16 +1,17 @@
 # ============================================================
 # File   : core/startup/tonosama_5sec_stopped_relax_patch.py
-# Version: V1.0-TONOSAMA-5SEC-NO-DT-FALLBACK
+# Version: V1.1-TONOSAMA-5SEC-RELAX-STRICT-MOVE-AND-SOFT-RESCUE-GUARD
 # ------------------------------------------------------------
 # 目的:
 #   TONOSAMA pending 登録直前で five_sec_stopped_final_guard が出るが、
-#   five_sec_dt=不明 の場合は「5秒足で止まった」のではなく
-#   5秒足時刻が取れていないだけのケースがある。
+#   five_sec_dt=不明 の場合にだけ限定緩和する。
 #
-# 方針:
-#   - five_sec_stopped_final_guard かつ five_sec_dt が 不明/なし/空 の場合だけ緩和
-#   - 3m/5m の向き、slope、ranking MA がエントリー方向と矛盾しない場合のみ通す
-#   - 既存の climax / 逆方向 / 出来高不足 / MA逆行ガードは維持
+# V1.1:
+#   - 緩和条件を厳格化。
+#   - 3m/5m/slope が 0近辺の「止まった大出来高」は通さない。
+#   - AI soft rescue / range_rescue で、価格変化が小さいのに大レンジ・大出来高だけで
+#     pendingになるケースを最終拒否する。
+#   - 既定の min_move を 0.10% に上げる。
 # ============================================================
 
 from __future__ import annotations
@@ -58,6 +59,60 @@ def _unknown_dt(v: Any) -> bool:
     return s in {"", "none", "nan", "nat", "不明", "なし"}
 
 
+def _soft_rescue_final_reject(cond: dict[str, Any], side: str) -> tuple[bool, dict[str, Any]]:
+    ai_reason = str(cond.get("ai_reason") or "")
+    side_u = str(side or "").upper()
+    if "soft_rescue" not in ai_reason and "range_rescue" not in ai_reason:
+        return False, {"reason": "not_soft_rescue"}
+
+    chg3 = _safe_float(cond.get("price_change_pct_3m"), 0.0)
+    chg5 = _safe_float(cond.get("price_change_pct_5m"), 0.0)
+    price_chg = _safe_float(cond.get("max_price_change_pct"), 0.0)
+    signed_body = _safe_float(cond.get("signed_body_change_pct"), price_chg)
+    slope = _safe_float(cond.get("slope"), 0.0)
+    rng = _safe_float(cond.get("intrabar_range_pct"), 0.0)
+    close_pos = _safe_float(cond.get("close_position_pct"), 50.0)
+    upper_wick = _safe_float(cond.get("upper_wick_pct"), 0.0)
+    lower_wick = _safe_float(cond.get("lower_wick_pct"), 0.0)
+    surge = _safe_float(cond.get("max_volume_surge_ratio"), 0.0)
+    latest_volume = _safe_float(cond.get("latest_volume"), 0.0)
+
+    min_move = abs(_env_float("TONOSAMA_SOFT_RESCUE_MIN_DIRECTION_MOVE", 0.10))
+    min_range = _env_float("TONOSAMA_SOFT_RESCUE_CLIMAX_RANGE_PCT", 6.0)
+    min_surge = _env_float("TONOSAMA_SOFT_RESCUE_CLIMAX_SURGE", 3.0)
+
+    diag = {
+        "side": side_u,
+        "chg3": chg3,
+        "chg5": chg5,
+        "price_chg": price_chg,
+        "signed_body": signed_body,
+        "slope": slope,
+        "range": rng,
+        "close_pos": close_pos,
+        "upper_wick": upper_wick,
+        "lower_wick": lower_wick,
+        "surge": surge,
+        "latest_volume": latest_volume,
+        "min_move": min_move,
+        "ai_reason": ai_reason[:180],
+    }
+
+    if side_u == "BUY":
+        if price_chg < min_move or chg3 < min_move or chg5 < min_move or slope <= 0:
+            return True, {**diag, "ng": "soft_rescue_buy_direction_too_weak"}
+        if surge >= min_surge and rng >= min_range and (close_pos >= 65.0 or upper_wick >= 35.0):
+            return True, {**diag, "ng": "soft_rescue_buying_climax_like_volume"}
+
+    if side_u == "SELL":
+        if price_chg > -min_move or chg3 > -min_move or chg5 > -min_move or slope >= 0:
+            return True, {**diag, "ng": "soft_rescue_sell_direction_too_weak"}
+        if surge >= min_surge and rng >= min_range and (close_pos <= 35.0 or lower_wick >= 35.0):
+            return True, {**diag, "ng": "soft_rescue_selling_climax_like_volume"}
+
+    return False, diag
+
+
 def _side_ok_by_3m5m(cond: dict[str, Any], side: str, ma_info: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
     side_u = str(side or "").upper()
     chg3 = _safe_float(cond.get("price_change_pct_3m"), 0.0)
@@ -72,7 +127,8 @@ def _side_ok_by_3m5m(cond: dict[str, Any], side: str, ma_info: dict[str, Any]) -
     rows = _safe_float(ma_info.get("rows"), 0.0)
 
     eps = abs(_env_float("TONOSAMA_5SEC_FALLBACK_EPS", 0.000001))
-    min_move = abs(_env_float("TONOSAMA_5SEC_FALLBACK_MIN_3M5M_CHANGE", 0.0))
+    # V1.1: 0.00%付近の出来高急増を通さないため既定0.10%へ。
+    min_move = abs(_env_float("TONOSAMA_5SEC_FALLBACK_MIN_3M5M_CHANGE", 0.10))
 
     diag = {
         "side": side_u,
@@ -93,19 +149,19 @@ def _side_ok_by_3m5m(cond: dict[str, Any], side: str, ma_info: dict[str, Any]) -
     if latest_volume < min_volume:
         return False, {**diag, "ng": "latest_volume_low"}
 
-    # ranking MA が明示的にNGを返している場合は通さない。
     if ma_reason and ma_reason not in {"ok", ""}:
         return False, {**diag, "ng": "ranking_ma_not_ok"}
 
     if side_u == "BUY":
-        # 3m/5m/slope/ランキングMAのいずれかが買い方向、かつ明確な逆行がない。
-        against = (chg3 < -min_move) or (chg5 < -min_move) or (slope < -eps) or (ma3_slope < -eps and ma5_slope < -eps)
-        aligned = (chg3 > min_move) or (chg5 > min_move) or (slope > eps) or (ma3_slope > eps) or (ma5_slope > eps) or (price_chg > min_move)
+        # BUYは3m/5mの両方が最低限プラス、かつslopeもプラス。片足だけでは緩和しない。
+        aligned = (chg3 >= min_move) and (chg5 >= min_move) and (slope > eps)
+        against = (price_chg < min_move) or (ma3_slope < -eps and ma5_slope < -eps)
         return bool(aligned and not against), {**diag, "aligned": aligned, "against": against}
 
     if side_u == "SELL":
-        against = (chg3 > min_move) or (chg5 > min_move) or (slope > eps) or (ma3_slope > eps and ma5_slope > eps)
-        aligned = (chg3 < -min_move) or (chg5 < -min_move) or (slope < -eps) or (ma3_slope < -eps) or (ma5_slope < -eps) or (price_chg < -min_move)
+        # SELLは3m/5mの両方が最低限マイナス、かつslopeもマイナス。0.00%では緩和しない。
+        aligned = (chg3 <= -min_move) and (chg5 <= -min_move) and (slope < -eps)
+        against = (price_chg > -min_move) or (ma3_slope > eps and ma5_slope > eps)
         return bool(aligned and not against), {**diag, "aligned": aligned, "against": against}
 
     return False, {**diag, "ng": "unknown_side"}
@@ -114,25 +170,32 @@ def _side_ok_by_3m5m(cond: dict[str, Any], side: str, ma_info: dict[str, Any]) -
 def _patched_climax_reject_reason(entry: dict[str, Any]):
     reject, ma_info = _ORIG(entry)  # type: ignore[misc]
     try:
+        cond = entry.get("entry_conditions") or {}
+        if not isinstance(cond, dict):
+            return reject, ma_info
+        side = str(entry.get("side") or cond.get("side") or "").upper()
+
+        soft_reject, soft_diag = _soft_rescue_final_reject(cond, side)
+        if soft_reject:
+            logger.warning(
+                "[TONOSAMA 5SEC RELAX] reject soft/range rescue symbol=%s side=%s diag=%s",
+                entry.get("symbol"), side, soft_diag,
+            )
+            return soft_diag.get("ng", "soft_rescue_final_guard"), ma_info
+
         if reject != "five_sec_stopped_final_guard":
             return reject, ma_info
         if not _env_bool("TONOSAMA_5SEC_STOPPED_NO_DT_FALLBACK", True):
             return reject, ma_info
 
-        cond = entry.get("entry_conditions") or {}
-        if not isinstance(cond, dict):
-            return reject, ma_info
-
         five_sec_dt = cond.get("five_sec_dt")
-        # 5秒足時刻が取れているなら、既存の five_sec stopped 判定を尊重する。
         if not _unknown_dt(five_sec_dt):
             return reject, ma_info
 
-        side = str(entry.get("side") or cond.get("side") or "").upper()
         ok, diag = _side_ok_by_3m5m(cond, side, ma_info if isinstance(ma_info, dict) else {})
         if ok:
             logger.warning(
-                "[TONOSAMA 5SEC RELAX] allow five_sec_stopped because five_sec_dt missing and 3m/5m/ranking_ma aligned symbol=%s side=%s diag=%s",
+                "[TONOSAMA 5SEC RELAX] allow five_sec_stopped because five_sec_dt missing and strict 3m/5m/ranking_ma aligned symbol=%s side=%s diag=%s",
                 entry.get("symbol"), side, diag,
             )
             return None, ma_info
@@ -157,19 +220,20 @@ def install() -> bool:
         if not callable(cur):
             logger.warning("[TONOSAMA 5SEC RELAX] target unavailable")
             return False
-        if getattr(cur, "_tonosama_5sec_relax_v1", False):
+        if getattr(cur, "_tonosama_5sec_relax_v11", False):
             _INSTALLED = True
             return True
         _ORIG = cur
-        _patched_climax_reject_reason._tonosama_5sec_relax_v1 = True  # type: ignore[attr-defined]
+        _patched_climax_reject_reason._tonosama_5sec_relax_v11 = True  # type: ignore[attr-defined]
         _patched_climax_reject_reason._original = cur  # type: ignore[attr-defined]
         pw._climax_reject_reason = _patched_climax_reject_reason
         _INSTALLED = True
         logger.warning(
-            "[TONOSAMA 5SEC RELAX] installed enabled=%s eps=%s min_move=%s",
+            "[TONOSAMA 5SEC RELAX] installed V1.1 enabled=%s eps=%s min_move=%s soft_rescue_guard=%s",
             _env_bool("TONOSAMA_5SEC_STOPPED_NO_DT_FALLBACK", True),
             _env_float("TONOSAMA_5SEC_FALLBACK_EPS", 0.000001),
-            _env_float("TONOSAMA_5SEC_FALLBACK_MIN_3M5M_CHANGE", 0.0),
+            _env_float("TONOSAMA_5SEC_FALLBACK_MIN_3M5M_CHANGE", 0.10),
+            True,
         )
         return True
     except Exception:
