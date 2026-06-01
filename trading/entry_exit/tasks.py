@@ -1,17 +1,19 @@
 # ============================================================
 # File   : trading/entry_exit/tasks.py
-# Version: Ver2.3-TONOSAMA-FRESH-SUMMARY-WAIT
+# Version: Ver2.4-TONOSAMA-FRESH-SUMMARY-FALLBACK
 # ------------------------------------------------------------
 # 【目的】
-#   core.entry_exit_tasks shim から解決される実体モジュール。
+#   entry/exit scheduler tasks.
 #
-# Ver2.3 Fix:
-#   - TONOSAMA runtime budget patch が 25秒/12候補へ拡張された一方、
-#     schedule側 build timeout が12秒のままだと先にtimeoutしてしまう。
-#     TONOSAMA_ENTRY_TIMEOUT_SEC の下限を30秒へ引き上げ。
-#   - 昼休み明け直後など、TONOSAMAがsummary更新完了前に走り、
-#     base_1m latest=11:30 のまま stale 判定で candidates=0 になる。
-#     実行前にPUSH 1分サマリーの鮮度を最大15秒待つ。
+# Ver2.4 Fix:
+#   - TONOSAMA実行前の fresh push summary wait が get_push_merged_summary(1)
+#     だけを見ていたため、merged cache が一瞬空の時に
+#       latest=None rows=0 -> skip this cycle
+#     となり、DB/summary_historyには最新データがあるのにTonosamaが起動しない。
+#   - fresh判定の取得元を push merged -> merged -> summary_history ->
+#     tonosama summary_loader の順でフォールバック。
+#   - それでも latest を取れない場合は、Tonosama本体の安全ガードに任せるため
+#     既定で fail-open して起動する。
 # ============================================================
 
 from __future__ import annotations
@@ -55,16 +57,6 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
-TONOSAMA_ENTRY_TIMEOUT_SEC = max(30.0, _env_float("TONOSAMA_ENTRY_TIMEOUT_SEC", 30.0))
-TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC = max(8.0, _env_float("TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC", 8.0))
-TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_SEC = _env_float("TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_SEC", 45.0)
-TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC = _env_float("TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC", 180.0)
-RANKING_ENTRY_BUILD_TIMEOUT_SEC = _env_float("RANKING_ENTRY_BUILD_TIMEOUT_SEC", 90.0)
-RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC = _env_float("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", 20.0)
-RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC = _env_float("RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC", 90.0)
-RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC = _env_float("RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC", 300.0)
-
-
 def _env_bool(name: str, default: bool) -> bool:
     try:
         v = os.getenv(name)
@@ -75,28 +67,14 @@ def _env_bool(name: str, default: bool) -> bool:
         return bool(default)
 
 
-def _parse_dt(v: Any) -> dt.datetime | None:
-    try:
-        if v is None:
-            return None
-        if isinstance(v, dt.datetime):
-            return v.replace(tzinfo=None) if v.tzinfo else v
-        if isinstance(v, dt.date):
-            return dt.datetime.combine(v, dt.time.min)
-        s = str(v).strip()
-        if not s or s.lower() in {"none", "nan", "nat", "<na>", "不明"}:
-            return None
-        try:
-            import pandas as pd
-            x = pd.to_datetime(s, errors="coerce")
-            if pd.isna(x):
-                return None
-            py = x.to_pydatetime()
-            return py.replace(tzinfo=None) if py.tzinfo else py
-        except Exception:
-            return dt.datetime.fromisoformat(s.replace("/", "-"))
-    except Exception:
-        return None
+TONOSAMA_ENTRY_TIMEOUT_SEC = max(30.0, _env_float("TONOSAMA_ENTRY_TIMEOUT_SEC", 30.0))
+TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC = max(8.0, _env_float("TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC", 8.0))
+TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_SEC = _env_float("TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_SEC", 45.0)
+TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC = _env_float("TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC", 180.0)
+RANKING_ENTRY_BUILD_TIMEOUT_SEC = _env_float("RANKING_ENTRY_BUILD_TIMEOUT_SEC", 90.0)
+RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC = _env_float("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", 20.0)
+RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC = _env_float("RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC", 90.0)
+RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC = _env_float("RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC", 300.0)
 
 
 def _entry_source(entry: Any) -> str:
@@ -122,6 +100,7 @@ def _pending_count_for_source(source: str) -> int:
                 return int(total)
     except Exception:
         logger.debug("[entry_exit.tasks] pending count via iter_entries failed", exc_info=True)
+
     try:
         from global_state import global_data
         root = getattr(global_data, "pending_entries", None)
@@ -134,6 +113,7 @@ def _pending_count_for_source(source: str) -> int:
             return int(total)
     except Exception:
         logger.debug("[entry_exit.tasks] pending count via global_data failed", exc_info=True)
+
     try:
         import trading.entry.pending_manager as pm
         names = ["pending_entries", "PENDING_ENTRIES", "pending_by_symbol", "PENDING_BY_SYMBOL", "_pending_entries", "_PENDING_ENTRIES", "_pending_by_symbol", "_PENDING_BY_SYMBOL"]
@@ -208,14 +188,7 @@ def _patch_tonosama_runner_fast_loop() -> None:
         logger.warning("[TONOSAMA FAST LOOP PATCH] failed", exc_info=True)
 
 
-def _run_callable_with_timeout_thread(
-    fn: Callable[..., Any],
-    *,
-    timeout_sec: float,
-    name: str,
-    args: tuple[Any, ...] = (),
-    kwargs: Optional[dict[str, Any]] = None
-) -> tuple[bool, Any, Optional[threading.Thread]]:
+def _run_callable_with_timeout_thread(fn: Callable[..., Any], *, timeout_sec: float, name: str, args: tuple[Any, ...] = (), kwargs: Optional[dict[str, Any]] = None) -> tuple[bool, Any, Optional[threading.Thread]]:
     result: dict[str, Any] = {"done": False, "ret": None, "err": None}
     kwargs = kwargs or {}
 
@@ -260,26 +233,70 @@ def _dispatch_entry_controller(*, pipeline_source: str, interval: int | None, ti
     return True
 
 
-def _latest_push_summary_age_sec() -> tuple[float | None, dt.datetime | None, int]:
+def _latest_from_df(df: Any, *, source_name: str) -> tuple[float | None, dt.datetime | None, int, str]:
     try:
         import pandas as pd
-        from core.global_context.context import get_push_merged_summary
-        df = get_push_merged_summary(1)
-        rows = int(len(df)) if df is not None else 0
-        if df is None or df.empty:
-            return None, None, rows
-        col = "datetime" if "datetime" in df.columns else ("dt" if "dt" in df.columns else None)
+        if df is None or not isinstance(df, pd.DataFrame):
+            return None, None, 0, source_name
+        rows = int(len(df))
+        if df.empty:
+            return None, None, rows, source_name
+        col = None
+        for c in ("datetime", "end_time", "start_time", "time", "snapshot_time"):
+            if c in df.columns:
+                col = c
+                break
         if not col:
-            return None, None, rows
+            return None, None, rows, source_name
         s = pd.to_datetime(df[col], errors="coerce").dropna()
         if s.empty:
-            return None, None, rows
+            return None, None, rows, source_name
         latest = s.max().to_pydatetime().replace(tzinfo=None)
         age = (dt.datetime.now() - latest).total_seconds()
-        return float(age), latest, rows
+        return float(age), latest, rows, f"{source_name}:{col}"
     except Exception:
-        logger.debug("[TONOSAMA ENTRY SCHEDULE] fresh summary check failed", exc_info=True)
-        return None, None, 0
+        logger.debug("[TONOSAMA ENTRY SCHEDULE] latest_from_df failed source=%s", source_name, exc_info=True)
+        return None, None, 0, source_name
+
+
+def _latest_push_summary_age_sec() -> tuple[float | None, dt.datetime | None, int, str]:
+    """Return freshest 1m PUSH summary age from multiple caches.
+
+    Important: get_push_merged_summary(1) can be empty during a brief publish gap.
+    Do not skip Tonosama solely because that single cache is empty.
+    """
+    candidates: list[tuple[str, Any]] = []
+    try:
+        import core.global_context.context as ctx
+        for name, call in [
+            ("get_push_merged_summary", lambda: ctx.get_push_merged_summary(1)),
+            ("get_merged_summary_push", lambda: ctx.get_merged_summary(1, source="push")),
+            ("get_summary_history_push", lambda: ctx.get_summary_history(1, source="push")),
+        ]:
+            try:
+                fn_df = call()
+                candidates.append((name, fn_df))
+            except Exception:
+                logger.debug("[TONOSAMA ENTRY SCHEDULE] provider failed %s", name, exc_info=True)
+    except Exception:
+        logger.debug("[TONOSAMA ENTRY SCHEDULE] core.global_context.context import failed", exc_info=True)
+
+    try:
+        from trading.entry.tonosama.summary_loader import load_merged_summary
+        candidates.append(("tonosama.summary_loader.load_merged_summary", load_merged_summary(1)))
+    except Exception:
+        logger.debug("[TONOSAMA ENTRY SCHEDULE] tonosama summary_loader fallback failed", exc_info=True)
+
+    best = (None, None, 0, "none")
+    for name, df in candidates:
+        age, latest, rows, src = _latest_from_df(df, source_name=name)
+        if latest is None:
+            if rows > best[2]:
+                best = (age, latest, rows, src)
+            continue
+        if best[1] is None or latest > best[1]:
+            best = (age, latest, rows, src)
+    return best
 
 
 def _wait_fresh_push_summary_before_tonosama() -> bool:
@@ -288,21 +305,38 @@ def _wait_fresh_push_summary_before_tonosama() -> bool:
     max_age = max(30.0, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_MAX_AGE_SEC", 180.0))
     wait_sec = max(0.0, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_WAIT_SEC", 15.0))
     poll = max(0.25, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_POLL_SEC", 1.0))
+    fail_open_empty = _env_bool("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY", True)
     deadline = time.perf_counter() + wait_sec
     last_age = None
     last_dt = None
     last_rows = 0
+    last_src = "none"
+
     while True:
-        age, latest, rows = _latest_push_summary_age_sec()
-        last_age, last_dt, last_rows = age, latest, rows
+        age, latest, rows, src = _latest_push_summary_age_sec()
+        last_age, last_dt, last_rows, last_src = age, latest, rows, src
         if age is not None and age <= max_age:
             if wait_sec > 0:
-                logger.info("[TONOSAMA ENTRY SCHEDULE] fresh push summary ok latest=%s age=%.1fs rows=%s max_age=%.1fs", latest, age, rows, max_age)
+                logger.info("[TONOSAMA ENTRY SCHEDULE] fresh push summary ok latest=%s age=%.1fs rows=%s max_age=%.1fs source=%s", latest, age, rows, max_age, src)
+            return True
+        if latest is None and fail_open_empty:
+            logger.warning(
+                "[TONOSAMA ENTRY SCHEDULE] fresh push summary unavailable latest=None rows=%s source=%s -> fail-open to Tonosama body; body has its own stale guard",
+                rows,
+                src,
+            )
             return True
         if time.perf_counter() >= deadline:
+            if last_dt is None and fail_open_empty:
+                logger.warning(
+                    "[TONOSAMA ENTRY SCHEDULE] fresh push summary wait expired latest=None rows=%s source=%s -> fail-open to Tonosama body",
+                    last_rows,
+                    last_src,
+                )
+                return True
             logger.warning(
-                "[TONOSAMA ENTRY SCHEDULE] fresh push summary wait expired latest=%s age=%s rows=%s max_age=%.1fs wait_sec=%.1fs -> skip this cycle",
-                last_dt, None if last_age is None else round(last_age, 1), last_rows, max_age, wait_sec,
+                "[TONOSAMA ENTRY SCHEDULE] fresh push summary wait expired latest=%s age=%s rows=%s max_age=%.1fs wait_sec=%.1fs source=%s -> skip this cycle",
+                last_dt, None if last_age is None else round(last_age, 1), last_rows, max_age, wait_sec, last_src,
             )
             return False
         time.sleep(poll)
@@ -362,13 +396,7 @@ def _run_tonosama_entry_safe() -> int:
                 _TONOSAMA_ENTRY_COOLDOWN_UNTIL = dt.datetime.now() + dt.timedelta(seconds=cool_sec)
             logger.warning(
                 "[TONOSAMA ENTRY SCHEDULE] build timeout -> cooldown timeout_sec=%.3f elapsed=%.3fs pending_count=%s timeout_streak=%s cooldown_sec=%.1f until=%s dispatch_on_timeout_pending=%s",
-                TONOSAMA_ENTRY_TIMEOUT_SEC,
-                time.perf_counter() - started,
-                after_pending,
-                _TONOSAMA_ENTRY_TIMEOUT_STREAK,
-                cool_sec,
-                _TONOSAMA_ENTRY_COOLDOWN_UNTIL,
-                _env_bool("TONOSAMA_DISPATCH_CONTROLLER_ON_TIMEOUT_PENDING", False),
+                TONOSAMA_ENTRY_TIMEOUT_SEC, time.perf_counter() - started, after_pending, _TONOSAMA_ENTRY_TIMEOUT_STREAK, cool_sec, _TONOSAMA_ENTRY_COOLDOWN_UNTIL, _env_bool("TONOSAMA_DISPATCH_CONTROLLER_ON_TIMEOUT_PENDING", False),
             )
             if after_pending > before_pending and _env_bool("TONOSAMA_DISPATCH_CONTROLLER_ON_TIMEOUT_PENDING", False):
                 _dispatch_entry_controller(pipeline_source="TONOSAMA", interval=None, timeout_sec=TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC, reason="TONOSAMA ENTRY SCHEDULE TIMEOUT-PENDING")
@@ -493,10 +521,11 @@ def register_entry_exit_tasks(*args: Any, **kwargs: Any) -> bool:
         job_r.tag(_TAG_ENTRY)
         job_r.tag(_TAG_RANKING_ENTRY)
         logger.info(
-            "[entry_exit.tasks] registered tonosama every=%ss tag=%s build_timeout=%.1fs controller_timeout=%.1fs timeout_cooldown=%.1f-%0.1fs wait_fresh_summary=%s dispatch_timeout_pending=%s ranking every=%smin at :12 tag=%s build_timeout=%.1fs controller_timeout=%.1fs cooldown=%.1f-%0.1fs pending_count_global=True",
+            "[entry_exit.tasks] registered tonosama every=%ss tag=%s build_timeout=%.1fs controller_timeout=%.1fs timeout_cooldown=%.1f-%0.1fs wait_fresh_summary=%s fail_open_empty=%s dispatch_timeout_pending=%s ranking every=%smin at :12 tag=%s build_timeout=%.1fs controller_timeout=%.1fs cooldown=%.1f-%0.1fs pending_count_global=True",
             interval_sec, _TAG_TONOSAMA_ENTRY, TONOSAMA_ENTRY_TIMEOUT_SEC, TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC,
             TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_SEC, TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC,
             _env_bool("TONOSAMA_WAIT_FRESH_PUSH_SUMMARY", True),
+            _env_bool("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY", True),
             _env_bool("TONOSAMA_DISPATCH_CONTROLLER_ON_TIMEOUT_PENDING", False),
             ranking_interval_min, _TAG_RANKING_ENTRY, RANKING_ENTRY_BUILD_TIMEOUT_SEC, RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC,
             RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC, RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC,
