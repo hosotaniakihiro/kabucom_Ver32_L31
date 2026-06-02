@@ -24,3 +24,5 @@ _install("TONOSAMA_CONTROLLER_TIMEOUT", "core.startup.tonosama_controller_timeou
 _install("TONOSAMA_CONTROLLER_TIMEOUT_EXTEND", "core.startup.tonosama_controller_timeout_extend_patch")
 _install("RANKING_ENTRY_INTRADAY_CAP", "core.startup.ranking_entry_intraday_cap_patch")
 _install("SUMMARY_AI_NO_DIRECT_SYNC", "core.startup.summary_ai_no_direct_sync_patch")
+_install("RANKING_ENTRY_MARKET_HOURS_SKIP", "core.startup.ranking_entry_market_hours_skip_patch")
+_install("YAHOO_STALE_RESET_OUTSIDE_SESSION", "core.startup.yahoo_stale_reset_outside_session_patch")
