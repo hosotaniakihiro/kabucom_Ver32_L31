@@ -1,15 +1,17 @@
 # ============================================================
 # File   : core/startup/ranking_entry_filter_rescue_patch.py
-# Version: V1.2-RESCUE-FLAT-PRICE-RECURSION
+# Version: V1.3-RELAX-RECURSION-RESCUE-SCORE
 # ------------------------------------------------------------
 # 目的:
 #   ranking_entry_fast_runtime_patch v5 で prefilter は高速化されたが、
-#   _passes_ranking_only_filters() が全候補を filter_reject し、
-#   candidates=0 / pending=0 になるケースを救済する。
+#   _passes_ranking_only_filters() が FLAT_PRICE_FILTER_RECURSION を返し、
+#   高流動性・上位rankの候補まで score_low で落ちるケースを救済する。
 #
-# V1.2:
-#   - FLAT_PRICE_FILTER_RECURSION を救済対象に追加。
-#   - 再帰理由の場合は、day/price/volume の列欠損を通常より緩く扱う。
+# V1.3:
+#   - 再帰系救済の既定 min_score を 60.0 -> 55.0 に緩和。
+#   - 再帰系救済の既定 min_turnover を 3億 -> 1億 に緩和。
+#   - ただし価格・出来高・方向（日中騰落方向）は維持。
+#   - BUYなのにday<0 / SELLなのにday>0 は引き続き拒否。
 #   - final_entry_safety_guard / board / credit / position guard は後段で維持。
 # ============================================================
 
@@ -112,14 +114,15 @@ def _rescue_allowed(row: dict[str, Any], side: str, score: float, reason: Any) -
     turnover = _safe_float(_first(row, ("turnover", "trading_value", "Turnover"), 0.0), 0.0)
     day = _safe_float(_first(row, ("day_change_pct", "change_percentage", "change_rate", "ChangePercentage", "ChangeRatio"), 0.0), 0.0)
     rt = str(_first(row, ("rank_type", "ranking_type", "CategoryName"), ""))
+    side_u = str(side or "").upper().strip()
 
     if turnover <= 0 and price > 0 and volume > 0:
         turnover = price * volume
 
     # 再帰理由は本来フィルタ結果ではなくパッチ衝突なので、少し緩い専用閾値を使う。
-    min_score = _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_SCORE" if recursion_reason else "RANKING_ENTRY_RESCUE_MIN_SCORE", 60.0)
+    min_score = _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_SCORE" if recursion_reason else "RANKING_ENTRY_RESCUE_MIN_SCORE", 55.0 if recursion_reason else 60.0)
     max_rank = _env_int("RANKING_ENTRY_RESCUE_RECURSION_MAX_RANK" if recursion_reason else "RANKING_ENTRY_RESCUE_MAX_RANK", 5 if recursion_reason else 10)
-    min_turnover = _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_TURNOVER" if recursion_reason else "RANKING_ENTRY_RESCUE_MIN_TURNOVER", 300000000.0 if recursion_reason else 100000000.0)
+    min_turnover = _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_TURNOVER" if recursion_reason else "RANKING_ENTRY_RESCUE_MIN_TURNOVER", 100000000.0 if recursion_reason else 100000000.0)
     min_volume = _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_VOLUME" if recursion_reason else "RANKING_ENTRY_RESCUE_MIN_VOLUME", 30000.0)
     min_abs_day = _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_ABS_DAY_PCT" if recursion_reason else "RANKING_ENTRY_RESCUE_MIN_ABS_DAY_PCT", 0.0 if recursion_reason else 3.0)
     min_price = _env_float("RANKING_ENTRY_RESCUE_MIN_PRICE", 300.0)
@@ -130,7 +133,7 @@ def _rescue_allowed(row: dict[str, Any], side: str, score: float, reason: Any) -
         "recursion_reason": recursion_reason,
         "rank": rank,
         "rank_type": rt,
-        "side": side,
+        "side": side_u,
         "score": score,
         "price": price,
         "volume": volume,
@@ -138,6 +141,8 @@ def _rescue_allowed(row: dict[str, Any], side: str, score: float, reason: Any) -
         "day": day,
         "min_score": min_score,
         "max_rank": max_rank,
+        "min_turnover": min_turnover,
+        "min_volume": min_volume,
     }
 
     if not _reason_rescuable(reason_s):
@@ -154,18 +159,21 @@ def _rescue_allowed(row: dict[str, Any], side: str, score: float, reason: Any) -
         return False, {**diag, "ng": "turnover_low"}
     if min_abs_day > 0 and abs(day) < min_abs_day:
         return False, {**diag, "ng": "day_move_low"}
+
+    # 通常救済では方向を厳密に見る。
     if not recursion_reason:
-        if side == "BUY" and day <= 0:
+        if side_u == "BUY" and day <= 0:
             return False, {**diag, "ng": "buy_day_not_positive"}
-        if side == "SELL" and day >= 0:
+        if side_u == "SELL" and day >= 0:
             return False, {**diag, "ng": "sell_day_not_negative"}
     else:
         # 再帰時でも day が取れていて明確に逆方向なら救済しない。
         if day != 0:
-            if side == "BUY" and day < 0:
+            if side_u == "BUY" and day < 0:
                 return False, {**diag, "ng": "buy_day_negative"}
-            if side == "SELL" and day > 0:
+            if side_u == "SELL" and day > 0:
                 return False, {**diag, "ng": "sell_day_positive"}
+
     return True, {**diag, "rescue": True}
 
 
@@ -225,20 +233,22 @@ def install() -> bool:
         if not callable(cur):
             logger.warning("[RANKING FILTER RESCUE] target unavailable")
             return False
-        if getattr(cur, "_ranking_filter_rescue_v12", False):
+        if getattr(cur, "_ranking_filter_rescue_v13", False):
             _INSTALLED = True
             return True
         _ORIG = cur
-        _patched_passes_ranking_only_filters._ranking_filter_rescue_v12 = True  # type: ignore[attr-defined]
+        _patched_passes_ranking_only_filters._ranking_filter_rescue_v13 = True  # type: ignore[attr-defined]
         _patched_passes_ranking_only_filters._original = cur  # type: ignore[attr-defined]
         efr._passes_ranking_only_filters = _patched_passes_ranking_only_filters
         _INSTALLED = True
         logger.warning(
-            "[RANKING FILTER RESCUE] installed v1.2 recursion_safe=True flat_recursion_rescue=True enabled=%s min_score=%.1f max_rank=%s recursion_max_rank=%s",
+            "[RANKING FILTER RESCUE] installed v1.3 recursion_safe=True flat_recursion_rescue=True enabled=%s min_score=%.1f recursion_min_score=%.1f max_rank=%s recursion_max_rank=%s recursion_min_turnover=%.0f",
             _env_bool("RANKING_ENTRY_STRONG_TECH_RESCUE_ENABLED", True),
             _env_float("RANKING_ENTRY_RESCUE_MIN_SCORE", 60.0),
+            _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_SCORE", 55.0),
             _env_int("RANKING_ENTRY_RESCUE_MAX_RANK", 10),
             _env_int("RANKING_ENTRY_RESCUE_RECURSION_MAX_RANK", 5),
+            _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_TURNOVER", 100000000.0),
         )
         return True
     except Exception:
@@ -250,5 +260,6 @@ try:
     install()
 except Exception:
     logger.exception("[RANKING FILTER RESCUE] auto install failed")
+
 
 __all__ = ["install"]
