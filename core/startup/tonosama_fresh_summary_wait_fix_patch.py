@@ -1,21 +1,15 @@
 # ============================================================
 # File   : core/startup/tonosama_fresh_summary_wait_fix_patch.py
-# Version: v3-FIX-FRESH-SUMMARY-WAIT-STALE-FAILOPEN
+# Version: v4-SKIP-WAIT-OUTSIDE-MARKET-SESSION
 # ------------------------------------------------------------
 # Purpose:
-#   trading.entry_exit.tasks の Tonosama 起動前 fresh summary wait が
-#   latest=None rows=0 または latest はあるが stale のまま skip this cycle
-#   になり、Tonosama本体が起動しない問題を防ぐ。
-#
-# Symptoms:
-#   [TONOSAMA ENTRY SCHEDULE] fresh push summary wait expired
-#   latest=2026-06-02 09:24:00 age=364.2 rows=20 ... -> skip this cycle patched=1
+#   Tonosama 起動前の fresh summary wait が昼休み/市場外でも15秒待ち、
+#   その後 Tonosama 本体で market closed skip になる無駄を防ぐ。
 #
 # Fix:
-#   - _latest_push_summary_age_sec を robust lookup に差し替え。
-#   - _wait_fresh_push_summary_before_tonosama も差し替え。
-#   - latest が取れない場合だけでなく、latest が stale の場合も、
-#     Tonosama本体の volume_surge stale guard に任せるため fail-open して起動する。
+#   - _wait_fresh_push_summary_before_tonosama() の先頭で市場時間を確認。
+#   - 09:00-11:30 / 12:30-15:30 以外は即 False を返す。
+#   - 市場内では従来どおり stale/empty fail-open を維持。
 # ============================================================
 from __future__ import annotations
 
@@ -48,6 +42,13 @@ def _env_float(name: str, default: float) -> float:
         return float(v)
     except Exception:
         return float(default)
+
+
+def _is_market_session_now(now: dt.datetime | None = None) -> bool:
+    now = now or dt.datetime.now()
+    t = now.time()
+    # 東京市場: 09:00-11:30 / 12:30-15:30
+    return (dt.time(9, 0) <= t <= dt.time(11, 30)) or (dt.time(12, 30) <= t <= dt.time(15, 30))
 
 
 def _candidate_dfs() -> list[tuple[str, Any]]:
@@ -153,6 +154,14 @@ def _patched_latest_push_summary_age_sec():
 def _patched_wait_fresh_push_summary_before_tonosama() -> bool:
     if not _env_bool("TONOSAMA_WAIT_FRESH_PUSH_SUMMARY", True):
         return True
+
+    if _env_bool("TONOSAMA_SKIP_WAIT_OUTSIDE_MARKET_SESSION", True) and not _is_market_session_now():
+        logger.info(
+            "[TONOSAMA ENTRY SCHEDULE] fresh push summary wait skipped outside market session now=%s patched=1",
+            dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        return False
+
     max_age = max(30.0, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_MAX_AGE_SEC", 180.0))
     wait_sec = max(0.0, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_WAIT_SEC", 15.0))
     poll = max(0.25, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_POLL_SEC", 1.0))
@@ -222,20 +231,24 @@ def _apply() -> bool:
 
     try:
         cur = getattr(tasks, "_wait_fresh_push_summary_before_tonosama", None)
-        if getattr(cur, "_tonosama_fresh_summary_wait_fix_v3", False):
+        if getattr(cur, "_tonosama_fresh_summary_wait_fix_v4", False):
             _INSTALLED = True
             return True
+        _patched_latest_push_summary_age_sec._tonosama_fresh_summary_wait_fix_v4 = True  # type: ignore[attr-defined]
         _patched_latest_push_summary_age_sec._tonosama_fresh_summary_wait_fix_v3 = True  # type: ignore[attr-defined]
+        _patched_wait_fresh_push_summary_before_tonosama._tonosama_fresh_summary_wait_fix_v4 = True  # type: ignore[attr-defined]
         _patched_wait_fresh_push_summary_before_tonosama._tonosama_fresh_summary_wait_fix_v3 = True  # type: ignore[attr-defined]
         setattr(tasks, "_latest_push_summary_age_sec", _patched_latest_push_summary_age_sec)
         setattr(tasks, "_wait_fresh_push_summary_before_tonosama", _patched_wait_fresh_push_summary_before_tonosama)
         os.environ.setdefault("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY", "1")
         os.environ.setdefault("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_STALE", "1")
+        os.environ.setdefault("TONOSAMA_SKIP_WAIT_OUTSIDE_MARKET_SESSION", "1")
         _INSTALLED = True
         logger.warning(
-            "[TONOSAMA FRESH SUMMARY WAIT FIX] installed v3 patched latest+wait fail_open_empty=%s fail_open_stale=%s",
+            "[TONOSAMA FRESH SUMMARY WAIT FIX] installed v4 patched latest+wait fail_open_empty=%s fail_open_stale=%s skip_wait_outside_session=%s",
             os.environ.get("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY"),
             os.environ.get("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_STALE"),
+            os.environ.get("TONOSAMA_SKIP_WAIT_OUTSIDE_MARKET_SESSION"),
         )
         return True
     except Exception:
