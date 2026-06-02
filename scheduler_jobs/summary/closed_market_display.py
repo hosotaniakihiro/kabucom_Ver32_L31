@@ -3,17 +3,14 @@
 #====================================================================================================
 # ============================================================
 # File   : scheduler_jobs/summary/closed_market_display.py
-# Version: PRODUCTION-STABLE-CLOSED-MARKET-DISPLAY-V1.1-EMPTY-REBUILD
+# Version: PRODUCTION-STABLE-CLOSED-MARKET-DISPLAY-V1.2-SESSION-GUARD
 # ------------------------------------------------------------
 # 【概要】
 #   時間外 / 昼休み / 休場日の PUSHサマリー表示を担当する。
 #
-# 【主な機能】
-#   - 市場時間内の最新確定サマリーをDBから読み込む
-#   - Yahoo補完後のDB更新を次回表示に反映
-#   - DBが空の場合はPUSH fallbackを試す
-#   - DB/fallback が空の場合、表示対象slotで PUSH runner 再計算を試す
-#   - 保存 / 表示は safe_io に委譲
+# V1.2:
+#   - 後場開始後(12:30-15:30)に誤って closed-market rebuild が呼ばれても即skipする。
+#   - 12:31 に latest_dt=11:30 を再保存して fresh summary を上書きする問題を防止する。
 # ============================================================
 
 from __future__ import annotations
@@ -43,6 +40,15 @@ _INTERVAL_TABLE_MAP = {
     3: "stock_summary_3min",
     5: "stock_summary_5min",
 }
+
+
+def _is_regular_session(now: Optional[dt.datetime]) -> bool:
+    """東証の通常取引時間。closed-market表示処理の誤起動を防ぐ最終ガード。"""
+    try:
+        t = (now or now_naive()).time()
+        return (dt.time(9, 0) <= t <= dt.time(11, 30)) or (dt.time(12, 30) <= t <= dt.time(15, 30))
+    except Exception:
+        return False
 
 
 def load_latest_market_hours_summary(interval: int) -> pd.DataFrame:
@@ -142,6 +148,15 @@ def rebuild_closed_market_push_summary(
     """
     interval = int(interval)
     now = (now or now_naive()).replace(microsecond=0)
+
+    if _is_regular_session(now):
+        logger.warning(
+            "[summary.runners] closed-market rebuild skipped interval=%s reason=regular_session_guard now=%s",
+            interval,
+            now,
+        )
+        return pd.DataFrame()
+
     rebuild_now = _resolve_closed_market_rebuild_now(now)
 
     runner = resolve_push_summary_runner()
@@ -224,6 +239,14 @@ def display_closed_market_push_summary(
     """
     now = (now or now_naive()).replace(microsecond=0)
 
+    if _is_regular_session(now):
+        logger.warning(
+            "[summary.runners] closed-market display skipped interval=%s reason=regular_session_guard now=%s",
+            interval,
+            now,
+        )
+        return pd.DataFrame()
+
     df = load_latest_market_hours_summary(interval)
     log_df_state("closed-market persisted", interval, df)
 
@@ -257,6 +280,11 @@ def display_closed_market_push_summary(
 
     save_summary_safe(df, interval, source="push")
     display_push_summary_safe(df, interval, now=now)
-
     return df
 
+
+__all__ = [
+    "display_closed_market_push_summary",
+    "load_latest_market_hours_summary",
+    "rebuild_closed_market_push_summary",
+]
