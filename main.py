@@ -10,8 +10,9 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.27-TONOSAMA-VOL-RESCUE-MAIN-INSTALL
+# Version: Ver38.28-TONOSAMA-LOST-VOLUME-THRESHOLD
 # ------------------------------------------------------------
+# ✔ TONOSAMA final liquidity lost-volume fallback threshold を 2.3 に調整
 # ✔ TONOSAMA volatility entry-row rescue を main runtime に追加
 # ✔ NAS sqlite I/O guard を main runtime に追加
 # ✔ _log_skip reason衝突ガードを全runtime patch後の最後に再適用
@@ -48,6 +49,8 @@ os.environ.setdefault("NAS_SQLITE_IO_GUARD_COOLDOWN_SEC", "20")
 os.environ.setdefault("TONOSAMA_VOL_ENTRYROW_RESCUE_ENABLED", "1")
 os.environ.setdefault("TONOSAMA_VOL_ENTRYROW_RESCUE_MIN_RANGE_RATIO", "0.006")
 os.environ.setdefault("TONOSAMA_VOL_ENTRYROW_RESCUE_MIN_INTRABAR_PCT", "0.6")
+os.environ.setdefault("FINAL_ENTRY_TONOSAMA_SCORE_ONLY_MIN_SCORE", "2.3")
+os.environ.setdefault("FINAL_ENTRY_TONOSAMA_DEDICATED_OK_MIN_SCORE", "2.3")
 
 try:
     from core.logging.console_tee import setup_console_tee, rebind_logging_streams_to_console_tee
