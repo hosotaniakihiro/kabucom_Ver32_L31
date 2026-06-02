@@ -1,24 +1,17 @@
 # ============================================================
 # File   : core/startup/summary_ai_async_entry_patch.py
-# Version: Ver04-DIRECT-SYNC-DEFAULT
+# Version: Ver05-ASYNC-DEFAULT-NO-LONG-DIRECT-BLOCK
 # ------------------------------------------------------------
-# SUMMARY AI の実発注部分を runtime patch する。
+# Purpose:
+#   SUMMARY AI の実発注で direct sync が 200秒超ブロックし、
+#   summary parent / display / entry_controller lock を詰まらせる問題を防ぐ。
 #
-# Ver04:
-#   - SUMMARY AI の approved_rows が出ているのに queued_async で終わり、
-#     実発注が遅延・ stale skip・market_closed skip になる問題を避けるため、
-#     市場時間中は direct sync 実行を既定ONに変更。
-#   - つまり AI_OK -> approved_rows -> entry_pipeline を同じ呼び出し内で実行する。
-#   - これにより runner の executed / skip_reason が実発注結果と一致する。
-#   - 非同期キューを使いたい場合のみ SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC=0 を指定する。
-#   - キュー利用時は Ver03 と同じ stale / market_closed worker guard を維持。
-#
-# ENV:
-#   SUMMARY_AI_ASYNC_ENTRY=1
-#   SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC=1       # Ver04 default: 発注優先
-#   SUMMARY_AI_ASYNC_ENTRY_DROP_BUSY=0
-#   SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX=20
-#   SUMMARY_AI_ASYNC_ENTRY_STALE_SEC=20
+# Ver05:
+#   - direct sync の既定を OFF に戻す。
+#   - 非同期キューは最新1件を優先し、古いものは破棄する。
+#   - stale 判定は既定60秒へ延長し、queued_async直後の市場中発注を残す。
+#   - worker実行中は次のSUMMARY AI発注を積み増さず、最新だけ保持。
+#   - 呼び出し元には submitted_async=True を返し、summary loopを長時間止めない。
 # ============================================================
 
 from __future__ import annotations
@@ -39,6 +32,13 @@ _QUEUE: deque[dict[str, Any]] = deque()
 _WORKER_RUNNING = False
 _SEQ = 0
 
+# 長時間ブロック防止の既定値。外部で明示されていても危険値はinstall時に丸める。
+os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY", "1")
+os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC", "0")
+os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_DROP_BUSY", "0")
+os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX", "1")
+os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", "60")
+
 
 def _env_bool(name: str, default: bool = True) -> bool:
     try:
@@ -46,9 +46,9 @@ def _env_bool(name: str, default: bool = True) -> bool:
         if v is None or str(v).strip() == "":
             return bool(default)
         s = str(v).strip().lower()
-        if s in {"1", "true", "yes", "y", "on", "ok"}:
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
             return True
-        if s in {"0", "false", "no", "n", "off", "ng"}:
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
             return False
         return bool(default)
     except Exception:
@@ -82,7 +82,7 @@ def _safe_len(v: Any) -> int:
         return 0
 
 
-def _symbols(rows: Any, limit: int = 30) -> list[str]:
+def _symbols(rows: Any, limit: int = 20) -> list[str]:
     out: list[str] = []
     try:
         for r in list(rows or [])[:limit]:
@@ -122,6 +122,17 @@ def _market_open_now() -> bool:
     return True
 
 
+def _build_approved_rows(ai_results: Any, max_entries: int) -> list[Any]:
+    try:
+        from trading.entry.summary_ai import executor as exec_mod
+        fn = getattr(exec_mod, "build_ai_ok_approved_rows", None)
+        if callable(fn):
+            return list(fn(ai_results, max_entries=max_entries) or [])
+    except Exception:
+        logger.exception("[SUMMARY AI ASYNC ENTRY] build approved rows failed")
+    return []
+
+
 def _run_worker_loop() -> None:
     global _WORKER_RUNNING
     while True:
@@ -135,46 +146,34 @@ def _run_worker_loop() -> None:
 
         seq = item["seq"]
         interval = item["interval"]
-        approved_rows = item["approved_rows"]
+        approved_rows = item.get("approved_rows") or []
         started = time.time()
         queued_at = float(item.get("queued_at") or started)
         age_sec = max(0.0, started - queued_at)
-        stale_sec = _env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 20.0)
+        stale_sec = _env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 60.0)
 
         try:
             if stale_sec > 0 and age_sec > stale_sec:
                 logger.warning(
                     "[SUMMARY AI ASYNC ENTRY] worker skip stale seq=%s interval=%s age=%.3fs stale_sec=%.3fs approved=%s symbols=%s queue_left=%s",
-                    seq,
-                    interval,
-                    age_sec,
-                    stale_sec,
-                    len(approved_rows),
-                    _symbols(approved_rows),
-                    q_left,
+                    seq, interval, age_sec, stale_sec, len(approved_rows), _symbols(approved_rows), q_left,
                 )
                 continue
 
             if bool(item.get("require_market_open")) and not _market_open_now():
                 logger.warning(
                     "[SUMMARY AI ASYNC ENTRY] worker skip market_closed seq=%s interval=%s age=%.3fs approved=%s symbols=%s queue_left=%s",
-                    seq,
-                    interval,
-                    age_sec,
-                    len(approved_rows),
-                    _symbols(approved_rows),
-                    q_left,
+                    seq, interval, age_sec, len(approved_rows), _symbols(approved_rows), q_left,
                 )
+                continue
+
+            if not callable(_ORIG_EXECUTE):
+                logger.warning("[SUMMARY AI ASYNC ENTRY] worker original executor missing seq=%s", seq)
                 continue
 
             logger.warning(
                 "[SUMMARY AI ASYNC ENTRY] worker start seq=%s interval=%s age=%.3fs approved=%s symbols=%s queue_left=%s",
-                seq,
-                interval,
-                age_sec,
-                len(approved_rows),
-                _symbols(approved_rows),
-                q_left,
+                seq, interval, age_sec, len(approved_rows), _symbols(approved_rows), q_left,
             )
             result = _ORIG_EXECUTE(
                 item["ai_results"],
@@ -187,10 +186,7 @@ def _run_worker_loop() -> None:
             )
             logger.warning(
                 "[SUMMARY AI ASYNC ENTRY] worker done seq=%s interval=%s elapsed=%.3fs summary=%s",
-                seq,
-                interval,
-                time.time() - started,
-                _summarize_result(result),
+                seq, interval, time.time() - started, _summarize_result(result),
             )
         except Exception as e:
             logger.exception("[SUMMARY AI ASYNC ENTRY] worker failed seq=%s interval=%s err=%s", seq, interval, e)
@@ -202,12 +198,7 @@ def _ensure_worker_started() -> None:
         if _WORKER_RUNNING:
             return
         _WORKER_RUNNING = True
-        t = threading.Thread(
-            target=_run_worker_loop,
-            daemon=True,
-            name="summary-ai-entry-async-queue-worker",
-        )
-        t.start()
+        threading.Thread(target=_run_worker_loop, daemon=True, name="summary-ai-entry-async-queue-worker").start()
 
 
 def _patched_execute_ai_ok_entries_bulk(
@@ -220,53 +211,35 @@ def _patched_execute_ai_ok_entries_bulk(
     require_market_open=True,
     entry_pipeline=None,
 ):
-    """execute_ai_ok_entries_bulk の差し替え。既定では direct sync 実行する。"""
     global _SEQ
 
-    if not callable(_ORIG_EXECUTE):
-        logger.warning("[SUMMARY AI ASYNC ENTRY] original executor missing -> no-op")
-        return {
-            "executed": False,
-            "submitted_async": False,
-            "dry_run": dry_run,
-            "approved_rows": [],
-            "result": None,
-            "skip_reason": "original_executor_missing",
-        }
-
     if dry_run or not _env_bool("SUMMARY_AI_ASYNC_ENTRY", True):
-        return _ORIG_EXECUTE(
-            ai_results,
-            df_summary=df_summary,
-            interval=interval,
-            max_entries=max_entries,
-            dry_run=dry_run,
-            require_market_open=require_market_open,
-            entry_pipeline=entry_pipeline,
-        )
-
-    # Ver04: エントリー発火を優先し、既定では非同期キューへ逃がさず即実行する。
-    # これにより queued_async だけ出て実注文に進まない/遅れる状態を避ける。
-    if _env_bool("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC", True):
-        started = time.time()
-        try:
-            # 古いキューが残っている場合、最新のdirect発注を邪魔しないよう掃除する。
-            with _ASYNC_LOCK:
-                dropped = len(_QUEUE)
-                _QUEUE.clear()
-            if dropped:
-                logger.warning(
-                    "[SUMMARY AI ASYNC ENTRY] direct sync clearing old async queue dropped=%s interval=%s",
-                    dropped,
-                    interval,
-                )
-
-            logger.warning(
-                "[SUMMARY AI ASYNC ENTRY] direct sync start interval=%s max_entries=%s require_market_open=%s",
-                interval,
-                max_entries,
-                require_market_open,
+        if callable(_ORIG_EXECUTE):
+            return _ORIG_EXECUTE(
+                ai_results,
+                df_summary=df_summary,
+                interval=interval,
+                max_entries=max_entries,
+                dry_run=dry_run,
+                require_market_open=require_market_open,
+                entry_pipeline=entry_pipeline,
             )
+        return {"executed": False, "submitted_async": False, "skip_reason": "original_executor_missing", "approved_rows": [], "result": None}
+
+    approved_rows = _build_approved_rows(ai_results, max_entries=max_entries)
+    if not approved_rows:
+        logger.info("[SUMMARY AI ASYNC ENTRY] no approved rows; skip interval=%s", interval)
+        return {"executed": False, "submitted_async": False, "dry_run": False, "approved_rows": [], "result": None, "skip_reason": "no_ai_ok"}
+
+    if require_market_open and not _market_open_now():
+        logger.warning("[SUMMARY AI ASYNC ENTRY] market closed; skipped approved=%s symbols=%s", len(approved_rows), _symbols(approved_rows))
+        return {"executed": False, "submitted_async": False, "dry_run": False, "approved_rows": approved_rows, "result": None, "skip_reason": "market_closed"}
+
+    # 明示的にdirect syncを指定した場合のみ同期実行。ただしデフォルトはOFF。
+    if _env_bool("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC", False):
+        started = time.time()
+        logger.warning("[SUMMARY AI ASYNC ENTRY] direct sync start interval=%s max_entries=%s approved=%s symbols=%s", interval, max_entries, len(approved_rows), _symbols(approved_rows))
+        try:
             result = _ORIG_EXECUTE(
                 ai_results,
                 df_summary=df_summary,
@@ -276,143 +249,52 @@ def _patched_execute_ai_ok_entries_bulk(
                 require_market_open=require_market_open,
                 entry_pipeline=entry_pipeline,
             )
-            logger.warning(
-                "[SUMMARY AI ASYNC ENTRY] direct sync done interval=%s elapsed=%.3fs summary=%s",
-                interval,
-                time.time() - started,
-                _summarize_result(result),
-            )
+            logger.warning("[SUMMARY AI ASYNC ENTRY] direct sync done interval=%s elapsed=%.3fs summary=%s", interval, time.time() - started, _summarize_result(result))
             return result
         except Exception as e:
             logger.exception("[SUMMARY AI ASYNC ENTRY] direct sync failed err=%s", e)
-            return {
-                "executed": False,
-                "submitted_async": False,
-                "dry_run": False,
-                "approved_rows": [],
-                "result": None,
-                "skip_reason": "direct_sync_exception",
-            }
+            return {"executed": False, "submitted_async": False, "dry_run": False, "approved_rows": [], "result": None, "skip_reason": "direct_sync_exception"}
 
-    try:
-        from trading.entry.summary_ai import executor as exec_mod
-
-        approved_rows = exec_mod.build_ai_ok_approved_rows(
-            ai_results,
-            max_entries=max_entries,
-        )
-
-        if not approved_rows:
-            logger.info("[SUMMARY AI ASYNC ENTRY] no approved rows; skip async interval=%s", interval)
-            return {
-                "executed": False,
-                "submitted_async": False,
-                "dry_run": False,
-                "approved_rows": [],
-                "result": None,
-                "skip_reason": "no_ai_ok",
-            }
-
-        if require_market_open:
-            is_open = getattr(exec_mod, "is_market_open", None)
-            if callable(is_open) and not bool(is_open()):
-                logger.warning(
-                    "[SUMMARY AI ASYNC ENTRY] market closed; async entry skipped approved=%s symbols=%s",
-                    len(approved_rows),
-                    _symbols(approved_rows),
-                )
-                return {
-                    "executed": False,
-                    "submitted_async": False,
-                    "dry_run": False,
-                    "approved_rows": approved_rows,
-                    "result": None,
-                    "skip_reason": "market_closed",
-                }
-
-        queue_max = _env_int("SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX", 20)
-        drop_busy = _env_bool("SUMMARY_AI_ASYNC_ENTRY_DROP_BUSY", False)
-
-        with _ASYNC_LOCK:
-            if len(_QUEUE) >= queue_max:
-                if drop_busy:
-                    logger.warning(
-                        "[SUMMARY AI ASYNC ENTRY] queue full; drop submit interval=%s approved=%s symbols=%s queue=%s max=%s",
-                        interval,
-                        len(approved_rows),
-                        _symbols(approved_rows),
-                        len(_QUEUE),
-                        queue_max,
-                    )
-                    return {
-                        "executed": False,
-                        "submitted_async": False,
-                        "async_busy": True,
-                        "queue_full": True,
-                        "dry_run": False,
-                        "approved_rows": approved_rows,
-                        "result": None,
-                        "skip_reason": "async_entry_queue_full",
-                    }
-                dropped = _QUEUE.popleft()
-                logger.warning(
-                    "[SUMMARY AI ASYNC ENTRY] queue full; drop oldest seq=%s interval=%s to keep latest",
-                    dropped.get("seq"),
-                    dropped.get("interval"),
-                )
-
-            _SEQ += 1
-            seq = _SEQ
-            _QUEUE.append(
-                {
-                    "seq": seq,
-                    "queued_at": time.time(),
-                    "ai_results": ai_results,
-                    "df_summary": df_summary,
-                    "interval": interval,
-                    "max_entries": max_entries,
-                    "require_market_open": require_market_open,
-                    "entry_pipeline": entry_pipeline,
-                    "approved_rows": approved_rows,
-                }
-            )
-            q_size = len(_QUEUE)
-
-        _ensure_worker_started()
-
-        logger.warning(
-            "[SUMMARY AI ASYNC ENTRY] queued seq=%s interval=%s approved=%s symbols=%s queue_size=%s stale_sec=%.3f",
-            seq,
-            interval,
-            len(approved_rows),
-            _symbols(approved_rows),
-            q_size,
-            _env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 20.0),
-        )
-
-        return {
-            "executed": True,
-            "submitted_async": True,
-            "queued_async": True,
-            "async_seq": seq,
-            "queue_size": q_size,
-            "dry_run": False,
+    queue_max = max(1, min(_env_int("SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX", 1), 3))
+    with _ASYNC_LOCK:
+        # 最新優先。古いSUMMARY AI発注は市場状態が変わりやすいので積み残さない。
+        dropped = 0
+        while len(_QUEUE) >= queue_max:
+            _QUEUE.popleft()
+            dropped += 1
+        _SEQ += 1
+        seq = _SEQ
+        _QUEUE.append({
+            "seq": seq,
+            "queued_at": time.time(),
+            "ai_results": ai_results,
+            "df_summary": df_summary,
+            "interval": interval,
+            "max_entries": max_entries,
+            "require_market_open": require_market_open,
+            "entry_pipeline": entry_pipeline,
             "approved_rows": approved_rows,
-            "result": {"status": "queued_async", "seq": seq, "queue_size": q_size},
-            "skip_reason": "queued_async",
-        }
+        })
+        q_size = len(_QUEUE)
 
-    except Exception as e:
-        logger.exception("[SUMMARY AI ASYNC ENTRY] submit failed err=%s -> fallback sync", e)
-        return _ORIG_EXECUTE(
-            ai_results,
-            df_summary=df_summary,
-            interval=interval,
-            max_entries=max_entries,
-            dry_run=False,
-            require_market_open=require_market_open,
-            entry_pipeline=entry_pipeline,
-        )
+    _ensure_worker_started()
+    if dropped:
+        logger.warning("[SUMMARY AI ASYNC ENTRY] queued latest and dropped old count=%s seq=%s interval=%s", dropped, seq, interval)
+    logger.warning(
+        "[SUMMARY AI ASYNC ENTRY] queued seq=%s interval=%s approved=%s symbols=%s queue_size=%s stale_sec=%.3f direct_sync=False",
+        seq, interval, len(approved_rows), _symbols(approved_rows), q_size, _env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 60.0),
+    )
+    return {
+        "executed": True,
+        "submitted_async": True,
+        "queued_async": True,
+        "async_seq": seq,
+        "queue_size": q_size,
+        "dry_run": False,
+        "approved_rows": approved_rows,
+        "result": {"status": "queued_async", "seq": seq, "queue_size": q_size},
+        "skip_reason": "queued_async",
+    }
 
 
 def install() -> bool:
@@ -421,31 +303,35 @@ def install() -> bool:
         return True
 
     try:
+        # 危険な長時間同期を起動時に明示的にOFFへ寄せる。
+        if os.getenv("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC") is None or str(os.getenv("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC")).strip() == "1":
+            os.environ["SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC"] = "0"
+        os.environ["SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX"] = str(max(1, min(_env_int("SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX", 1), 3)))
+        if _env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 60.0) < 30:
+            os.environ["SUMMARY_AI_ASYNC_ENTRY_STALE_SEC"] = "60"
+
         from trading.entry.summary_ai import executor as exec_mod
         from trading.entry.summary_ai import runner as runner_mod
 
         current = getattr(exec_mod, "execute_ai_ok_entries_bulk", None)
-        if getattr(current, "_summary_ai_async_entry_patch_v4", False):
+        if getattr(current, "_summary_ai_async_entry_patch_v5", False):
             _INSTALLED = True
-            logger.warning("[SUMMARY AI ASYNC ENTRY] already installed v4")
+            logger.warning("[SUMMARY AI ASYNC ENTRY] already installed v5")
             return True
 
         _ORIG_EXECUTE = current
+        _patched_execute_ai_ok_entries_bulk._summary_ai_async_entry_patch_v5 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_async_entry_patch_v4 = True  # type: ignore[attr-defined]
-        _patched_execute_ai_ok_entries_bulk._summary_ai_async_entry_patch_v3 = True  # type: ignore[attr-defined]
-        _patched_execute_ai_ok_entries_bulk._summary_ai_async_entry_patch_v2 = True  # type: ignore[attr-defined]
-
         exec_mod.execute_ai_ok_entries_bulk = _patched_execute_ai_ok_entries_bulk
         runner_mod.execute_ai_ok_entries_bulk = _patched_execute_ai_ok_entries_bulk
 
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY AI ASYNC ENTRY] installed v4 enabled=%s direct_sync=%s drop_busy=%s queue_max=%s stale_sec=%.3f",
+            "[SUMMARY AI ASYNC ENTRY] installed v5 enabled=%s direct_sync=%s queue_max=%s stale_sec=%.3f latest_only=True no_long_direct_block=True",
             _env_bool("SUMMARY_AI_ASYNC_ENTRY", True),
-            _env_bool("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC", True),
-            _env_bool("SUMMARY_AI_ASYNC_ENTRY_DROP_BUSY", False),
-            _env_int("SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX", 20),
-            _env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 20.0),
+            _env_bool("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC", False),
+            _env_int("SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX", 1),
+            _env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 60.0),
         )
         return True
     except Exception as e:
