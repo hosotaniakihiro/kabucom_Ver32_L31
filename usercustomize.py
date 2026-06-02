@@ -26,3 +26,4 @@ _install("RANKING_ENTRY_INTRADAY_CAP", "core.startup.ranking_entry_intraday_cap_
 _install("SUMMARY_AI_NO_DIRECT_SYNC", "core.startup.summary_ai_no_direct_sync_patch")
 _install("RANKING_ENTRY_MARKET_HOURS_SKIP", "core.startup.ranking_entry_market_hours_skip_patch")
 _install("YAHOO_STALE_RESET_OUTSIDE_SESSION", "core.startup.yahoo_stale_reset_outside_session_patch")
+_install("RANKING_SUMMARY_MARKET_HOURS_SKIP", "core.startup.ranking_summary_market_hours_skip_patch")
