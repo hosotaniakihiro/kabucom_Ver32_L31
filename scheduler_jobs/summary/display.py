@@ -7,11 +7,12 @@
 #   - AI sections
 #   - Discord 通知
 # ------------------------------------------------------------
-# Version: Ver10.4-PRODUCTION-DISPLAY-3LINES-READABLE-LABELS
+# Version: Ver10.5-PRODUCTION-DISPLAY-3LINES-SYMBOLNAME-FALLBACK
 # ------------------------------------------------------------
 # 目的:
 #   Discord / console の SUMMARY TOP10 が横長1行にならないよう、
 #   BUY/SELL候補を 1銘柄3行固定にする。
+#   symbolname が空、または銘柄コードと同じ場合は global_data.symbol_name_map から補完する。
 #
 # 表示形式:
 #   🟦 1. 9632 スバル興業 Price=3695.0 Score=10.55 Buy=10.55 Sell=0.00
@@ -119,6 +120,54 @@ def _clean(v, max_len: int = 24) -> str:
         return ""
 
 
+def _symbol_key(v) -> str:
+    try:
+        s = str(v if v is not None else "").strip()
+        if s.endswith(".0"):
+            s = s[:-2]
+        return s
+    except Exception:
+        return ""
+
+
+def _invalid_symbol_name(symbol, name) -> bool:
+    try:
+        sym = _symbol_key(symbol)
+        nm = str(name if name is not None else "").strip()
+        if not nm or nm.lower() in {"nan", "none", "null", "-"}:
+            return True
+        return _symbol_key(nm) == sym
+    except Exception:
+        return True
+
+
+def _lookup_symbol_name(symbol) -> str:
+    sym = _symbol_key(symbol)
+    if not sym:
+        return ""
+    try:
+        from global_state import global_data
+        mp = getattr(global_data, "symbol_name_map", None)
+        if isinstance(mp, dict) and mp:
+            for key in (sym, str(sym), f"{sym}.0"):
+                v = mp.get(key)
+                if v is not None and str(v).strip() and str(v).strip().lower() not in {"nan", "none"}:
+                    return str(v).strip()
+    except Exception:
+        logger.debug("[SUMMARY DISPLAY] symbol_name_map lookup failed symbol=%s", sym, exc_info=True)
+    return ""
+
+
+def _resolve_symbol_name(row: pd.Series, symbol) -> str:
+    raw = first_existing(row, ["symbolname_view", "symbolname", "name", "company_name", "銘柄名", "銘柄名称"], "")
+    if not _invalid_symbol_name(symbol, raw):
+        return str(raw).strip()
+    mapped = _lookup_symbol_name(symbol)
+    if mapped:
+        return mapped
+    return ""
+
+
 def _num(v, default: float = 0.0) -> float:
     try:
         if v is None or str(v).strip() in {"", "-", "nan", "None"}:
@@ -175,7 +224,6 @@ def _score_reason_ja(row: pd.Series, side: str) -> str:
         raw = build_sell_reason_line(row) if side_u == "SELL" else build_buy_reason_line(row)
         raw_reason = _strip_reason_prefix(raw)
         if raw_reason and raw_reason not in {"-", "flag_score"}:
-            # 既に日本語化済みの理由は重複を避けつつ後ろに足す。
             if raw_reason not in " / ".join(parts):
                 parts.append(raw_reason)
         elif raw_reason == "flag_score":
@@ -193,7 +241,7 @@ def _score_reason_ja(row: pd.Series, side: str) -> str:
 
 def _build_summary_candidate_3lines(i: int, row: pd.Series, *, side: str) -> str:
     symbol = first_existing(row, ["symbol"], "")
-    symbolname = first_existing(row, ["symbolname_view", "symbolname", "name"], "")
+    symbolname = _resolve_symbol_name(row, symbol)
 
     score = first_existing(row, ["disp_score", "score", "display_score", "final_score"], np.nan)
     score_buy = first_existing(row, ["disp_buy_score", "score_buy", "buy_score"], np.nan)
@@ -228,7 +276,6 @@ def _reason_text_for_discord(row: pd.Series, side: str) -> str:
 
 
 def _build_discord_candidate_2lines(i: int, row: pd.Series, *, side: str) -> str:
-    # 関数名は互換維持。実際は3行固定。
     return _build_summary_candidate_3lines(i, row, side=side)
 
 
@@ -265,7 +312,7 @@ def _collect_discord_top10_sections(
 
 def _build_discord_ai_candidate_2lines(i: int, row: pd.Series, *, side: str) -> str:
     symbol = first_existing(row, ["symbol"], "")
-    symbolname = first_existing(row, ["symbolname_view", "symbolname", "name"], "")
+    symbolname = _resolve_symbol_name(row, symbol)
     confidence = first_existing(row, ["confidence", "conf", "ai_confidence"], np.nan)
     lot = first_existing(row, ["lot", "order_lot", "qty"], np.nan)
     score = first_existing(row, ["disp_score", "score", "display_score", "final_score"], np.nan)
