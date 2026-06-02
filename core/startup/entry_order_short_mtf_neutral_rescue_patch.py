@@ -1,16 +1,18 @@
 # ============================================================
 # File   : core/startup/entry_order_short_mtf_neutral_rescue_patch.py
-# Version: V2-BYPASS-SHORT-MTF-FUNCTION
+# Version: V3-BYPASS-SHORT-MTF-FUNCTION-AND-PASSIVE
 # ------------------------------------------------------------
 # 目的:
 #   SUMMARY_AI が AI_OK / FINAL ENTRY SAFETY GUARD / ENTRY_QTY_FINAL まで通過後、
 #   注文作成直前で SHORT_MTF_NOT_BUY_ALIGNED / SHORT_MTF_NOT_SELL_ALIGNED により
 #   1mだけ方向一致・3m/5mが0または欠損のケースまで落ちる問題を救済する。
 #
-# V2:
-#   - ENTRY_ORDER_MTF_GUARD_ENABLED=False だけでは別patch側の短期MTFガードが残るため、
-#     _summary_mtf_direction_guard 自体を一時的に no-op にして再実行する。
-#   - 低ボラ、5秒足、板、流動性、数量など他ガードは維持。
+# V3:
+#   - 最新ログでは entry_order_builder._summary_mtf_direction_guard を no-op にしても
+#     entry_limit_passive_runtime_patch._summary_ai_strict_guard 側が残り、
+#     retry_still_ng_v2 になっていた。
+#   - 再実行中だけ、両方の短期MTFガードと関連envを一時的に緩和する。
+#   - 低ボラ、板、数量、信用、発注APIなど他ガードは維持する。
 # ============================================================
 
 from __future__ import annotations
@@ -144,22 +146,71 @@ def _can_rescue(row: dict[str, Any], *, symbol: str, side: str, source: str, res
     }
 
 
-def _retry_with_short_mtf_noop(eob: Any, original: Any, args: tuple[Any, ...], kwargs: dict[str, Any]):
-    old_enabled = getattr(eob, "ENTRY_ORDER_MTF_GUARD_ENABLED", True)
-    old_guard = getattr(eob, "_summary_mtf_direction_guard", None)
+class _TempShortMtfBypass:
+    def __init__(self, eob: Any):
+        self.eob = eob
+        self.attrs: dict[tuple[Any, str], Any] = {}
+        self.env: dict[str, str | None] = {}
+        self.elp = None
 
-    def _noop_summary_mtf_direction_guard(*_args: Any, **_kwargs: Any):
+    @staticmethod
+    def _noop(*_args: Any, **_kwargs: Any):
         return None
 
-    try:
-        eob.ENTRY_ORDER_MTF_GUARD_ENABLED = False
-        if callable(old_guard):
-            eob._summary_mtf_direction_guard = _noop_summary_mtf_direction_guard
-        return original(*args, **kwargs)
-    finally:
-        eob.ENTRY_ORDER_MTF_GUARD_ENABLED = old_enabled
-        if callable(old_guard):
-            eob._summary_mtf_direction_guard = old_guard
+    def __enter__(self):
+        for obj, name, value in [
+            (self.eob, "ENTRY_ORDER_MTF_GUARD_ENABLED", False),
+            (self.eob, "ENTRY_ORDER_REQUIRE_MTF_DATA", False),
+        ]:
+            try:
+                self.attrs[(obj, name)] = getattr(obj, name)
+                setattr(obj, name, value)
+            except Exception:
+                pass
+        try:
+            old_guard = getattr(self.eob, "_summary_mtf_direction_guard", None)
+            if callable(old_guard):
+                self.attrs[(self.eob, "_summary_mtf_direction_guard")] = old_guard
+                setattr(self.eob, "_summary_mtf_direction_guard", self._noop)
+        except Exception:
+            pass
+        try:
+            import core.startup.entry_limit_passive_runtime_patch as elp
+            self.elp = elp
+            old_strict = getattr(elp, "_summary_ai_strict_guard", None)
+            if callable(old_strict):
+                self.attrs[(elp, "_summary_ai_strict_guard")] = old_strict
+                setattr(elp, "_summary_ai_strict_guard", self._noop)
+        except Exception:
+            pass
+        for name, value in {
+            "ENTRY_ORDER_MTF_GUARD_ENABLED": "0",
+            "ENTRY_ORDER_REQUIRE_MTF_DATA": "0",
+            "ENTRY_SHORT_MTF_REQUIRED": "0",
+            "ENTRY_SHORT_MTF_FORCE_2OF3": "0",
+            "ENTRY_SHORT_MTF_REQUIRE_ALL": "0",
+            "ENTRY_SHORT_MTF_MIN_ALIGNED": "1",
+            "ENTRY_SHORT_MTF_MIN_AVAILABLE": "1",
+        }.items():
+            self.env[name] = os.environ.get(name)
+            os.environ[name] = value
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        for (obj, name), value in self.attrs.items():
+            try:
+                setattr(obj, name, value)
+            except Exception:
+                pass
+        for name, value in self.env.items():
+            try:
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+            except Exception:
+                pass
+        return False
 
 
 def install() -> bool:
@@ -176,15 +227,15 @@ def install() -> bool:
         if not callable(original):
             logger.error("[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] build_entry_order not callable")
             return False
-        if getattr(original, "_short_mtf_neutral_rescue_v2", False):
+        if getattr(original, "_short_mtf_neutral_rescue_v3", False):
             _INSTALLED = True
             return True
 
-        _ORIGINAL = original
+        _ORIGINAL = getattr(original, "_original", original)
 
-        @wraps(original)
+        @wraps(_ORIGINAL)
         def wrapped_build_entry_order(*args: Any, **kwargs: Any):
-            result = original(*args, **kwargs)
+            result = _ORIGINAL(*args, **kwargs)
             try:
                 if not isinstance(result, dict) or bool(result.get("ok")):
                     return result
@@ -203,7 +254,8 @@ def install() -> bool:
                     logger.info("[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] no_rescue detail=%s result=%s", detail, result)
                     return result
 
-                retry = _retry_with_short_mtf_noop(eob, original, args, kwargs)
+                with _TempShortMtfBypass(eob):
+                    retry = _ORIGINAL(*args, **kwargs)
 
                 if isinstance(retry, dict) and bool(retry.get("ok")):
                     retry = dict(retry)
@@ -211,18 +263,19 @@ def install() -> bool:
                     d["short_mtf_neutral_rescue"] = True
                     d["short_mtf_neutral_rescue_detail"] = detail
                     retry["detail"] = d
-                    logger.warning("[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] rescued detail=%s retry=%s", detail, retry)
+                    logger.warning("[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] rescued v3 detail=%s retry=%s", detail, retry)
                     return retry
 
-                logger.warning("[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] retry_still_ng_v2 detail=%s retry=%s", detail, retry)
+                logger.warning("[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] retry_still_ng_v3 detail=%s retry=%s", detail, retry)
                 return retry
             except Exception:
                 logger.exception("[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] wrapper failed; return original result")
                 return result
 
-        wrapped_build_entry_order._short_mtf_neutral_rescue_v2 = True  # type: ignore[attr-defined]
         wrapped_build_entry_order._short_mtf_neutral_rescue_v1 = True  # type: ignore[attr-defined]
-        wrapped_build_entry_order._original = original  # type: ignore[attr-defined]
+        wrapped_build_entry_order._short_mtf_neutral_rescue_v2 = True  # type: ignore[attr-defined]
+        wrapped_build_entry_order._short_mtf_neutral_rescue_v3 = True  # type: ignore[attr-defined]
+        wrapped_build_entry_order._original = _ORIGINAL  # type: ignore[attr-defined]
         eob.build_entry_order = wrapped_build_entry_order
         try:
             ec.build_entry_order = wrapped_build_entry_order
@@ -231,7 +284,7 @@ def install() -> bool:
 
         _INSTALLED = True
         logger.warning(
-            "[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] installed v2 enabled=%s min_score=%.3f eps=%.6f",
+            "[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] installed v3 enabled=%s min_score=%.3f eps=%.6f",
             _env_bool("ENTRY_ORDER_SHORT_MTF_NEUTRAL_RESCUE", True),
             _env_float("ENTRY_ORDER_SHORT_MTF_NEUTRAL_MIN_SCORE", 1.0),
             _env_float("ENTRY_ORDER_SHORT_MTF_NEUTRAL_EPS", 0.0),
