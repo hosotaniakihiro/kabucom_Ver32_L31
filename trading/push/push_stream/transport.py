@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/transport.py
-# Version: Ver1.4-PUSH-STREAM-TRANSPORT-ROBUST-REFRESH
+# Version: Ver1.5-PUSH-STREAM-TRANSPORT-ONOPEN-REFRESH-THROTTLE
 # ------------------------------------------------------------
 # ✔ WebSocket sender install / clear
 # ✔ ws alive 判定
@@ -14,6 +14,9 @@
 # ✔ refresh 空振りの可視化強化
 # ✔ on_open / watchdog refresh は clear_first + unregister_first を優先し、
 #   callable の引数差異があっても安全に段階的フォールバック
+# ✔ on_open refresh storm guard:
+#   WinError 10054 連発時に unregister_all/register も連発しないよう、
+#   直近成功/実行中 refresh を一定秒スキップ
 # ============================================================
 
 from __future__ import annotations
@@ -33,6 +36,10 @@ from .runtime import _now, _safe_set_runtime
 
 logger = logging.getLogger(__name__)
 
+_last_refresh_started_ts = 0.0
+_last_refresh_done_ts = 0.0
+_refresh_guard_lock = threading.Lock()
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     try:
@@ -47,6 +54,16 @@ def _env_bool(name: str, default: bool = False) -> bool:
         return bool(default)
     except Exception:
         return bool(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
 
 
 # ============================================================
@@ -185,6 +202,37 @@ def set_refresh_callable(fn: Optional[Callable[..., Any]]) -> None:
     )
 
 
+def _refresh_recent_or_running(reason: str) -> tuple[bool, str]:
+    """on_open refresh 連発を抑止する。"""
+    if reason != "on_open":
+        return False, "not_on_open"
+    if not _env_bool("PUSH_STREAM_ONOPEN_REFRESH_THROTTLE", True):
+        return False, "disabled"
+    now = time.monotonic()
+    min_interval = max(1.0, _env_float("PUSH_STREAM_ONOPEN_REFRESH_MIN_INTERVAL_SEC", 15.0))
+    running_ttl = max(2.0, _env_float("PUSH_STREAM_ONOPEN_REFRESH_RUNNING_TTL_SEC", 8.0))
+    with _refresh_guard_lock:
+        since_start = now - float(_last_refresh_started_ts or 0.0)
+        since_done = now - float(_last_refresh_done_ts or 0.0)
+        if _last_refresh_started_ts and since_start < running_ttl and (_last_refresh_done_ts < _last_refresh_started_ts):
+            return True, f"refresh_running since_start={since_start:.1f}s ttl={running_ttl:.1f}s"
+        if _last_refresh_done_ts and since_done < min_interval:
+            return True, f"recent_refresh since_done={since_done:.1f}s min_interval={min_interval:.1f}s"
+    return False, "ok"
+
+
+def _mark_refresh_started() -> None:
+    global _last_refresh_started_ts
+    with _refresh_guard_lock:
+        _last_refresh_started_ts = time.monotonic()
+
+
+def _mark_refresh_done() -> None:
+    global _last_refresh_done_ts
+    with _refresh_guard_lock:
+        _last_refresh_done_ts = time.monotonic()
+
+
 def _invoke_refresh_callable(fn: Callable[..., Any], *, force: bool, reason: str, kwargs: dict[str, Any]) -> Any:
     """
     subscription_manager は版によって受け取る引数が違う。
@@ -238,7 +286,14 @@ def _call_refresh(force: bool = True, reason: str = "on_open", **kwargs) -> Any:
         logger.warning("[push_stream] refresh skipped reason=%s ws_not_ready", reason)
         return None
 
+    skip, skip_reason = _refresh_recent_or_running(reason)
+    if skip:
+        logger.warning("[push_stream] refresh skipped reason=%s guard=%s", reason, skip_reason)
+        _safe_set_runtime("subscription_refresh_skip_reason", skip_reason)
+        return True
+
     try:
+        _mark_refresh_started()
         _safe_set_runtime("subscription_refresh_running", True)
         logger.info(
             "[push_stream] refresh start reason=%s kwargs_keys=%s",
@@ -259,6 +314,7 @@ def _call_refresh(force: bool = True, reason: str = "on_open", **kwargs) -> Any:
         return None
 
     finally:
+        _mark_refresh_done()
         _safe_set_runtime("subscription_refresh_running", False)
 
 
@@ -268,7 +324,9 @@ def _safe_refresh_subscriptions_after_open() -> None:
             logger.warning("[push_stream] refresh after open skipped by env PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1")
             return
 
-        time.sleep(AFTER_OPEN_REFRESH_DELAY_SEC)
+        # 10054連発時に接続直後すぐ unregister/register せず、少し安定待ちする。
+        delay = max(float(AFTER_OPEN_REFRESH_DELAY_SEC), _env_float("PUSH_STREAM_AFTER_OPEN_REFRESH_DELAY_SEC", 2.0))
+        time.sleep(delay)
 
         if not _wait_for_ws_ready(timeout=WS_READY_WAIT_SEC):
             logger.warning("[push_stream] refresh after open skipped: ws not ready")
