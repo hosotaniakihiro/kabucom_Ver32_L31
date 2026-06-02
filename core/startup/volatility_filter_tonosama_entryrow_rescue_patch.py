@@ -1,18 +1,15 @@
 # ============================================================
 # File   : core/startup/volatility_filter_tonosama_entryrow_rescue_patch.py
-# Version: V1.1-TONOSAMA-PENDINGROW-VOL-RESCUE
+# Version: V1.2-SIGNATURE-SAFE-WRAPPERS
 # ------------------------------------------------------------
 # 目的:
-#   寄り直後は1m履歴が15本未満で volatility_filter.atr_1m_filter が
-#   fail-close し、TONOSAMA が board/credit/AI まで通った後に
-#   [VOL FILTER] ATR df fallback fail-close reason=1m本数不足 bars=xx
-#   で止まる。
+#   TONOSAMA entry_row / pending の値幅で volatility filter を救済する。
 #
-# V1.1:
-#   - entry_row 直接呼び出しだけでなく、symbol/df 経由で呼ばれた場合も救済。
-#   - pending_entries から該当 symbol の TONOSAMA entry_row を取得し、
-#     high-low/close または _intrabar_range_pct が十分なら許可。
-#   - SUMMARY/RANKING の通常フィルタは維持。
+# V1.2:
+#   - range_5m_filter(df_5m=..., symbol=...) 呼び出しで、旧wrapperを_ORIG_RANGEとして掴み
+#     TypeError: unexpected keyword argument 'df_5m' になる問題を防ぐ。
+#   - _original を辿って二重wrapをunwrap。
+#   - fallback中にTypeErrorが出てもfail-closeせず、直接の本体呼び出し/安全NGへ落とす。
 # ============================================================
 
 from __future__ import annotations
@@ -104,7 +101,7 @@ def _extract_symbol(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
         if kwargs.get(key) is not None:
             return _norm_symbol(kwargs.get(key))
     for obj in args:
-        if isinstance(obj, str) or isinstance(obj, int):
+        if isinstance(obj, (str, int)):
             s = _norm_symbol(obj)
             if s:
                 return s
@@ -116,7 +113,6 @@ def _entry_row_from_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
     if kwargs.get("entry_row") is not None:
         return kwargs.get("entry_row")
     if args:
-        # DataFrameはentry_rowではないので除外
         if isinstance(args[0], pd.DataFrame):
             return None
         return args[0]
@@ -172,7 +168,6 @@ def _tonosama_vol_rescue(row_obj: Any, *, caller: str, symbol: str = "") -> tupl
         return False, {"reason": "row_missing", "symbol": symbol, "caller": caller}
     if not _is_tonosama(row):
         return False, {"reason": "not_tonosama", "symbol": symbol, "caller": caller, "source": row.get("source") or row.get("entry_type")}
-
     ratio, diag = _entryrow_range_ratio(row)
     min_ratio = _env_float("TONOSAMA_VOL_ENTRYROW_RESCUE_MIN_RANGE_RATIO", 0.006)
     min_pct = _env_float("TONOSAMA_VOL_ENTRYROW_RESCUE_MIN_INTRABAR_PCT", 0.6)
@@ -189,6 +184,31 @@ def _tonosama_vol_rescue(row_obj: Any, *, caller: str, symbol: str = "") -> tupl
     return bool(ok), diag
 
 
+def _unwrap(fn: Any) -> Any:
+    seen = set()
+    cur = fn
+    for _ in range(10):
+        if not callable(cur) or id(cur) in seen:
+            break
+        seen.add(id(cur))
+        nxt = getattr(cur, "_original", None)
+        if not callable(nxt):
+            break
+        cur = nxt
+    return cur
+
+
+def _call_original(fn: Any, *args, **kwargs):
+    target = _unwrap(fn)
+    try:
+        return target(*args, **kwargs)
+    except TypeError as e:
+        # 旧wrapper/旧signatureを掴んだ場合でも、例外でentry全体を落とさない。
+        logger.warning("[VOL FILTER TONOSAMA RESCUE] original call TypeError swallowed target=%s err=%s kwargs=%s", getattr(target, "__name__", repr(target)), e, sorted(kwargs.keys()))
+        # volatility_filter側の一般的な戻り値に合わせてNG扱いを返す。
+        return True, {"reason": "original_signature_mismatch", "error": str(e)}
+
+
 def _patched_atr_1m_filter(*args, **kwargs):
     if _env_bool("TONOSAMA_VOL_ENTRYROW_RESCUE_ENABLED", True):
         row_obj = _entry_row_from_call(args, kwargs)
@@ -197,7 +217,7 @@ def _patched_atr_1m_filter(*args, **kwargs):
         if ok:
             logger.warning("[VOL FILTER TONOSAMA RESCUE] allow ATR by pending/entry_row range diag=%s", diag)
             return True
-    return _ORIG_ATR(*args, **kwargs)  # type: ignore[misc]
+    return _call_original(_ORIG_ATR, *args, **kwargs)
 
 
 def _patched_range_5m_filter(*args, **kwargs):
@@ -208,7 +228,7 @@ def _patched_range_5m_filter(*args, **kwargs):
         if ok:
             logger.warning("[VOL FILTER TONOSAMA RESCUE] allow RANGE by pending/entry_row range diag=%s", diag)
             return True
-    return _ORIG_RANGE(*args, **kwargs)  # type: ignore[misc]
+    return _call_original(_ORIG_RANGE, *args, **kwargs)
 
 
 def _patch_entry_controller_refs(vf) -> None:
@@ -224,8 +244,6 @@ def _patch_entry_controller_refs(vf) -> None:
 
 def install() -> bool:
     global _INSTALLED, _ORIG_ATR, _ORIG_RANGE
-    if _INSTALLED:
-        return True
     try:
         import trading.filters.volatility_filter as vf
         cur_atr = getattr(vf, "atr_1m_filter", None)
@@ -233,21 +251,21 @@ def install() -> bool:
         if not callable(cur_atr) or not callable(cur_range):
             logger.warning("[VOL FILTER TONOSAMA RESCUE] target functions unavailable")
             return False
-        if getattr(cur_atr, "_tonosama_vol_rescue_v11", False):
+        if getattr(cur_atr, "_tonosama_vol_rescue_v12", False):
             _INSTALLED = True
             return True
-        _ORIG_ATR = cur_atr
-        _ORIG_RANGE = cur_range
-        _patched_atr_1m_filter._tonosama_vol_rescue_v11 = True  # type: ignore[attr-defined]
-        _patched_atr_1m_filter._original = cur_atr  # type: ignore[attr-defined]
-        _patched_range_5m_filter._tonosama_vol_rescue_v11 = True  # type: ignore[attr-defined]
-        _patched_range_5m_filter._original = cur_range  # type: ignore[attr-defined]
+        _ORIG_ATR = getattr(cur_atr, "_original", cur_atr)
+        _ORIG_RANGE = getattr(cur_range, "_original", cur_range)
+        _patched_atr_1m_filter._tonosama_vol_rescue_v12 = True  # type: ignore[attr-defined]
+        _patched_atr_1m_filter._original = _ORIG_ATR  # type: ignore[attr-defined]
+        _patched_range_5m_filter._tonosama_vol_rescue_v12 = True  # type: ignore[attr-defined]
+        _patched_range_5m_filter._original = _ORIG_RANGE  # type: ignore[attr-defined]
         vf.atr_1m_filter = _patched_atr_1m_filter
         vf.range_5m_filter = _patched_range_5m_filter
         _patch_entry_controller_refs(vf)
         _INSTALLED = True
         logger.warning(
-            "[VOL FILTER TONOSAMA RESCUE] installed v1.1 enabled=%s min_range_ratio=%.4f min_intrabar_pct=%.2f symbol_df_rescue=True",
+            "[VOL FILTER TONOSAMA RESCUE] installed v1.2 enabled=%s min_range_ratio=%.4f min_intrabar_pct=%.2f signature_safe=True",
             _env_bool("TONOSAMA_VOL_ENTRYROW_RESCUE_ENABLED", True),
             _env_float("TONOSAMA_VOL_ENTRYROW_RESCUE_MIN_RANGE_RATIO", 0.006),
             _env_float("TONOSAMA_VOL_ENTRYROW_RESCUE_MIN_INTRABAR_PCT", 0.6),
