@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/entry_order_mtf_slope_fill_patch.py
-# Version: Ver03-ENTRY-ORDER-MTF-SLOPE-FILL-CHAIN-SUMMARY-GUARD
+# Version: Ver04-CHAIN-SHORT-MTF-NEUTRAL-RESCUE
 # ------------------------------------------------------------
 # Purpose:
 #   SUMMARY_AI 承認後の entry_row に slope_1m / slope_3m / slope_5m が
@@ -11,13 +11,9 @@
 #   entry_row が古い列セットのままになり、発注直前 guard で
 #   SHORT_MTF_SLOPE_MISSING になるケースがある。
 #
-# 修正:
-#   Ver02:
-#   - Python SyntaxError 対策
-#     f-string expression part cannot include a backslash
-#   - SQL列名生成を _qident() に集約し、f-string式内の \" を廃止
-#   Ver03:
-#   - 起動時に summary_no_overlap_runtime_patch も連鎖installする
+# Ver04:
+#   - entry_order_short_mtf_neutral_rescue_patch を連鎖installする。
+#     1mだけ方向一致・3m/5mが0/欠損の SUMMARY_AI を、強score時のみ救済する。
 # ============================================================
 
 from __future__ import annotations
@@ -48,6 +44,16 @@ def _install_summary_no_overlap_guard() -> None:
         logger.exception("[ENTRY ORDER MTF SLOPE FILL] chained summary_no_overlap install failed")
 
 
+def _install_short_mtf_neutral_rescue() -> None:
+    try:
+        from core.startup import entry_order_short_mtf_neutral_rescue_patch as rescue
+        fn = getattr(rescue, "install", None)
+        ok = fn() if callable(fn) else False
+        logger.warning("[ENTRY ORDER MTF SLOPE FILL] chained short_mtf_neutral_rescue install=%s", ok)
+    except Exception:
+        logger.exception("[ENTRY ORDER MTF SLOPE FILL] chained short_mtf_neutral_rescue install failed")
+
+
 def _today() -> str:
     return dt.datetime.now().strftime("%Y%m%d")
 
@@ -70,14 +76,6 @@ def _norm_symbol(v: Any) -> str:
 
 
 def _qident(name: Any) -> str:
-    """
-    SQLite identifier quote.
-
-    注意:
-      f-string の { ... } 内に backslash を含む文字列を書くと
-      SyntaxError: f-string expression part cannot include a backslash
-      になるため、識別子クォートはこの関数に集約する。
-    """
     return '"' + str(name).replace('"', '""') + '"'
 
 
@@ -262,6 +260,7 @@ def install() -> bool:
     global _INSTALLED, _ORIGINAL
     if _INSTALLED:
         logger.warning("[ENTRY ORDER MTF SLOPE FILL] already installed")
+        _install_short_mtf_neutral_rescue()
         return True
 
     try:
@@ -277,6 +276,7 @@ def install() -> bool:
 
         if getattr(original, "_entry_order_mtf_slope_fill_v1", False):
             _INSTALLED = True
+            _install_short_mtf_neutral_rescue()
             return True
 
         _ORIGINAL = original
@@ -310,7 +310,8 @@ def install() -> bool:
             pass
 
         _INSTALLED = True
-        logger.warning("[ENTRY ORDER MTF SLOPE FILL] installed")
+        logger.warning("[ENTRY ORDER MTF SLOPE FILL] installed v04")
+        _install_short_mtf_neutral_rescue()
         return True
 
     except Exception:
