@@ -1,12 +1,19 @@
 # ============================================================
 # File   : core/startup/tonosama_runtime_budget_patch.py
-# Version: Ver2.1-TONOSAMA-RUNTIME-BUDGET-FIRST-PENDING
+# Version: Ver2.2-TONOSAMA-RUNTIME-BUDGET-RETURN-AFTER-FIRST-PENDING
 # ------------------------------------------------------------
 # Purpose:
 #   TONOSAMA runner can continue in a daemon thread even after the
-#   scheduler timeout wrapper returns.  This patch keeps the loop bounded,
+#   scheduler timeout wrapper returns. This patch keeps the loop bounded,
 #   but it must not finish with registered=0 only because candidate build
 #   consumed the time budget.
+#
+# Ver2.2:
+#   - If at least one candidate is added to pending, return immediately by
+#     default so entry_controller can run before the 30s schedule overlaps.
+#   - This avoids previous_still_running caused by evaluating many later
+#     candidates after a valid pending entry already exists.
+#   - Disable with TONOSAMA_RUNTIME_RETURN_AFTER_FIRST_PENDING=0 if needed.
 #
 # Ver2.1:
 #   - Evaluation budget starts after candidates are ready.
@@ -126,7 +133,7 @@ def _apply_patch() -> bool:
 
     try:
         cur = getattr(runner, "build_tonosama_entries", None)
-        if getattr(cur, "_TONOSAMA_RUNTIME_BUDGET_PATCHED_V21", False):
+        if getattr(cur, "_TONOSAMA_RUNTIME_BUDGET_PATCHED_V22", False):
             _INSTALLED = True
             return True
 
@@ -144,6 +151,7 @@ def _apply_patch() -> bool:
             budget_sec = max(25.0, raw_budget)
             max_eval = max(12, raw_max_eval)
             min_remain = max(1.5, _env_float("TONOSAMA_RUNTIME_MIN_REMAIN_SEC", 1.5))
+            return_after_first = _env_on("TONOSAMA_RUNTIME_RETURN_AFTER_FIRST_PENDING", True)
 
             try:
                 candidates = runner.iter_tonosama_candidate_rows()
@@ -184,6 +192,14 @@ def _apply_patch() -> bool:
 
             def _remaining() -> float:
                 return deadline - time.perf_counter()
+
+            def _log_done() -> None:
+                logger.info(
+                    "[TONOSAMA RUNTIME BUDGET] build done total_candidates=%s candidates=%s evaluated=%s evaluated_max=%s registered=%s duplicate=%s ai_ng=%s low_score=%s no_symbol=%s stopped=%s budget_sec=%.1f raw_budget=%.1f max_eval=%s raw_max_eval=%s candidate_elapsed=%.3fs eval_elapsed=%.3fs total_elapsed=%.3fs return_after_first=%s low_score_samples=%s add_fail_samples=%s",
+                    total_candidates, len(candidates), evaluated, max_eval, registered, duplicate, ai_ng, low_score, no_symbol, time_budget_stop,
+                    budget_sec, raw_budget, max_eval, raw_max_eval, candidate_elapsed, time.perf_counter() - eval_started, time.perf_counter() - build_started,
+                    return_after_first, final_low_samples[:10], add_fail_samples[:10],
+                )
 
             for idx, row in candidates.iterrows():
                 now = time.perf_counter()
@@ -296,6 +312,13 @@ def _apply_patch() -> bool:
                             runner.notify_discord_tonosama_pending(entry)
                         except Exception:
                             logger.warning("[TONOSAMA RUNTIME BUDGET] notify failed symbol=%s", symbol, exc_info=True)
+                        if return_after_first:
+                            time_budget_stop = True
+                            logger.warning(
+                                "[TONOSAMA RUNTIME BUDGET] return after first pending symbol=%s registered=%s evaluated=%s elapsed=%.3fs",
+                                symbol, registered, evaluated, time.perf_counter() - build_started,
+                            )
+                            break
                     else:
                         add_fail_samples.append({"symbol": symbol, "side": entry.get("side"), "score": round(final_score, 4)})
                 except Exception:
@@ -303,12 +326,7 @@ def _apply_patch() -> bool:
                     logger.warning("[TONOSAMA RUNTIME BUDGET] add failed symbol=%s", symbol, exc_info=True)
                     continue
 
-            logger.info(
-                "[TONOSAMA RUNTIME BUDGET] build done total_candidates=%s candidates=%s evaluated=%s evaluated_max=%s registered=%s duplicate=%s ai_ng=%s low_score=%s no_symbol=%s stopped=%s budget_sec=%.1f raw_budget=%.1f max_eval=%s raw_max_eval=%s candidate_elapsed=%.3fs eval_elapsed=%.3fs total_elapsed=%.3fs low_score_samples=%s add_fail_samples=%s",
-                total_candidates, len(candidates), evaluated, max_eval, registered, duplicate, ai_ng, low_score, no_symbol, time_budget_stop,
-                budget_sec, raw_budget, max_eval, raw_max_eval, candidate_elapsed, time.perf_counter() - eval_started, time.perf_counter() - build_started,
-                final_low_samples[:10], add_fail_samples[:10],
-            )
+            _log_done()
             return registered
 
         setattr(runner, "_TONOSAMA_ORIGINAL_BUILD_TONOSAMA_ENTRIES", original)
@@ -316,13 +334,15 @@ def _apply_patch() -> bool:
         setattr(runner, "_TONOSAMA_RUNTIME_BUDGET_PATCHED", True)
         setattr(runner, "_TONOSAMA_RUNTIME_BUDGET_PATCHED_V20", True)
         setattr(runner, "_TONOSAMA_RUNTIME_BUDGET_PATCHED_V21", True)
-        _budgeted_build_tonosama_entries._TONOSAMA_RUNTIME_BUDGET_PATCHED_V21 = True  # type: ignore[attr-defined]
+        setattr(runner, "_TONOSAMA_RUNTIME_BUDGET_PATCHED_V22", True)
+        _budgeted_build_tonosama_entries._TONOSAMA_RUNTIME_BUDGET_PATCHED_V22 = True  # type: ignore[attr-defined]
         _INSTALLED = True
         logger.warning(
-            "[TONOSAMA RUNTIME BUDGET PATCH] installed V2.1 budget_sec_floor=25 raw_budget=%s max_eval_floor=12 raw_max_eval=%s price_priority=%s",
+            "[TONOSAMA RUNTIME BUDGET PATCH] installed V2.2 budget_sec_floor=25 raw_budget=%s max_eval_floor=12 raw_max_eval=%s price_priority=%s return_after_first=%s",
             os.getenv("TONOSAMA_LOOP_TIME_BUDGET_SEC", "25"),
             os.getenv("TONOSAMA_RUNTIME_MAX_EVAL_CANDIDATES", "12"),
             os.getenv("TONOSAMA_RUNTIME_PRIORITIZE_PRICE_ELIGIBLE", "1"),
+            os.getenv("TONOSAMA_RUNTIME_RETURN_AFTER_FIRST_PENDING", "1"),
         )
         return True
     except Exception:
