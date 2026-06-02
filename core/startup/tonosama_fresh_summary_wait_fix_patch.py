@@ -1,21 +1,21 @@
 # ============================================================
 # File   : core/startup/tonosama_fresh_summary_wait_fix_patch.py
-# Version: v2-FIX-FRESH-SUMMARY-WAIT-FAILOPEN
+# Version: v3-FIX-FRESH-SUMMARY-WAIT-STALE-FAILOPEN
 # ------------------------------------------------------------
 # Purpose:
 #   trading.entry_exit.tasks の Tonosama 起動前 fresh summary wait が
-#   latest=None rows=0 のまま skip this cycle になり、Tonosama本体が
-#   一度も起動しない問題を防ぐ。
+#   latest=None rows=0 または latest はあるが stale のまま skip this cycle
+#   になり、Tonosama本体が起動しない問題を防ぐ。
 #
 # Symptoms:
 #   [TONOSAMA ENTRY SCHEDULE] fresh push summary wait expired
-#   latest=None age=None rows=0 ... -> skip this cycle
+#   latest=2026-06-02 09:24:00 age=364.2 rows=20 ... -> skip this cycle patched=1
 #
 # Fix:
 #   - _latest_push_summary_age_sec を robust lookup に差し替え。
 #   - _wait_fresh_push_summary_before_tonosama も差し替え。
-#   - latest が取れない場合は Tonosama本体の stale guard に任せるため
-#     fail-open して起動する。
+#   - latest が取れない場合だけでなく、latest が stale の場合も、
+#     Tonosama本体の volume_surge stale guard に任せるため fail-open して起動する。
 # ============================================================
 from __future__ import annotations
 
@@ -157,6 +157,7 @@ def _patched_wait_fresh_push_summary_before_tonosama() -> bool:
     wait_sec = max(0.0, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_WAIT_SEC", 15.0))
     poll = max(0.25, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_POLL_SEC", 1.0))
     fail_open_empty = _env_bool("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY", True)
+    fail_open_stale = _env_bool("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_STALE", True)
     deadline = time.perf_counter() + wait_sec
     last_age = None
     last_dt = None
@@ -178,6 +179,16 @@ def _patched_wait_fresh_push_summary_before_tonosama() -> bool:
             logger.warning(
                 "[TONOSAMA ENTRY SCHEDULE] fresh push summary unavailable latest=None rows=%s -> fail-open to Tonosama body patched=1",
                 rows,
+            )
+            return True
+        if latest is not None and age is not None and age > max_age and fail_open_stale and time.perf_counter() >= deadline:
+            logger.warning(
+                "[TONOSAMA ENTRY SCHEDULE] fresh push summary wait expired stale latest=%s age=%.1fs rows=%s max_age=%.1fs wait_sec=%.1fs -> fail-open to Tonosama body patched=1",
+                latest,
+                age,
+                rows,
+                max_age,
+                wait_sec,
             )
             return True
         if time.perf_counter() >= deadline:
@@ -211,16 +222,21 @@ def _apply() -> bool:
 
     try:
         cur = getattr(tasks, "_wait_fresh_push_summary_before_tonosama", None)
-        if getattr(cur, "_tonosama_fresh_summary_wait_fix_v2", False):
+        if getattr(cur, "_tonosama_fresh_summary_wait_fix_v3", False):
             _INSTALLED = True
             return True
-        _patched_latest_push_summary_age_sec._tonosama_fresh_summary_wait_fix_v2 = True  # type: ignore[attr-defined]
-        _patched_wait_fresh_push_summary_before_tonosama._tonosama_fresh_summary_wait_fix_v2 = True  # type: ignore[attr-defined]
+        _patched_latest_push_summary_age_sec._tonosama_fresh_summary_wait_fix_v3 = True  # type: ignore[attr-defined]
+        _patched_wait_fresh_push_summary_before_tonosama._tonosama_fresh_summary_wait_fix_v3 = True  # type: ignore[attr-defined]
         setattr(tasks, "_latest_push_summary_age_sec", _patched_latest_push_summary_age_sec)
         setattr(tasks, "_wait_fresh_push_summary_before_tonosama", _patched_wait_fresh_push_summary_before_tonosama)
         os.environ.setdefault("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY", "1")
+        os.environ.setdefault("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_STALE", "1")
         _INSTALLED = True
-        logger.warning("[TONOSAMA FRESH SUMMARY WAIT FIX] installed v2 patched latest+wait fail_open_empty=%s", os.environ.get("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY"))
+        logger.warning(
+            "[TONOSAMA FRESH SUMMARY WAIT FIX] installed v3 patched latest+wait fail_open_empty=%s fail_open_stale=%s",
+            os.environ.get("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY"),
+            os.environ.get("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_STALE"),
+        )
         return True
     except Exception:
         logger.exception("[TONOSAMA FRESH SUMMARY WAIT FIX] apply failed")
