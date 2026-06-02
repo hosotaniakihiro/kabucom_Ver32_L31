@@ -11,12 +11,21 @@ _STOP = False
 
 
 def _apply_once() -> bool:
-    os.environ["RANKING_ENTRY_RUNTIME_BUDGET_SEC"] = os.getenv("RANKING_ENTRY_FAST_RUNTIME_BUDGET_SEC", "25")
-    os.environ["RANKING_ENTRY_BUILD_TIMEOUT_SEC"] = os.getenv("RANKING_ENTRY_FAST_BUILD_TIMEOUT_SEC", "30")
-    os.environ["RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC"] = os.getenv("RANKING_ENTRY_FAST_CONTROLLER_TIMEOUT_SEC", "30")
+    """
+    USERCUSTOMIZE 側で後勝ち適用されるため、ここで短すぎる既定値を使うと
+    ranking_entry_controller_timeout_patch の 150/180/120 秒設定を潰してしまう。
+
+    旧既定:
+      runtime=25 / build=30 / controller=30
+    新既定:
+      runtime=150 / build=180 / controller=120
+    """
+    os.environ["RANKING_ENTRY_RUNTIME_BUDGET_SEC"] = os.getenv("RANKING_ENTRY_FAST_RUNTIME_BUDGET_SEC", "150")
+    os.environ["RANKING_ENTRY_BUILD_TIMEOUT_SEC"] = os.getenv("RANKING_ENTRY_FAST_BUILD_TIMEOUT_SEC", "180")
+    os.environ["RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC"] = os.getenv("RANKING_ENTRY_FAST_CONTROLLER_TIMEOUT_SEC", "120")
     os.environ["RANKING_ENTRY_MAX_PENDING_PER_RUN"] = os.getenv("RANKING_ENTRY_FAST_MAX_PENDING_PER_RUN", "1")
-    os.environ.setdefault("RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC", "45")
-    os.environ.setdefault("RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC", "120")
+    os.environ.setdefault("RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC", "90")
+    os.environ.setdefault("RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC", "300")
     try:
         import trading.entry_exit.tasks as tasks
         tasks.RANKING_ENTRY_BUILD_TIMEOUT_SEC = float(os.environ["RANKING_ENTRY_BUILD_TIMEOUT_SEC"])
@@ -27,7 +36,7 @@ def _apply_once() -> bool:
 
 
 def _watch_loop() -> None:
-    # 他patchが後から150/180/120へ戻しても、起動後しばらく最後に上書きする。
+    # 他patchが後から変更しても、起動後しばらく最後に現在の安全値を維持する。
     for i in range(120):
         try:
             ok = _apply_once()
@@ -55,7 +64,7 @@ def install() -> bool:
         threading.Thread(target=_watch_loop, name="ranking-entry-fast-budget-override", daemon=True).start()
         _INSTALLED = True
         logger.warning(
-            "[RANKING ENTRY FAST BUDGET OVERRIDE] installed ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s watcher=True",
+            "[RANKING ENTRY FAST BUDGET OVERRIDE] installed v2 ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s watcher=True",
             ok,
             os.environ.get("RANKING_ENTRY_RUNTIME_BUDGET_SEC"),
             os.environ.get("RANKING_ENTRY_BUILD_TIMEOUT_SEC"),
@@ -66,6 +75,7 @@ def install() -> bool:
     except Exception:
         logger.exception("[RANKING ENTRY FAST BUDGET OVERRIDE] install failed")
         return False
+
 
 try:
     install()
