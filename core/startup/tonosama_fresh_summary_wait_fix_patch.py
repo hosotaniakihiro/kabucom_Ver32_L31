@@ -1,16 +1,16 @@
 # ============================================================
 # File   : core/startup/tonosama_fresh_summary_wait_fix_patch.py
-# Version: v6-NO-STALE-FAILOPEN-DURING-SESSION
+# Version: v7-IMMEDIATE-STALE-SKIP-DURING-SESSION
 # ------------------------------------------------------------
 # Purpose:
-#   Tonosama 起動前の fresh summary wait が、場中でも古いPUSH summaryを
-#   stale fail-open して TONOSAMA 本体へ進めてしまう問題を防ぐ。
+#   場中に古いPUSH summaryを使ってTONOSAMAを動かさない。
+#   v6では fail-open は止めたが、stale skip まで wait_sec=15秒待つため、
+#   TONOSAMA job が約20秒残って previous_still_running を作っていた。
 #
 # Fix:
 #   - 09:00-11:30 / 12:30-15:30 以外は即 False。
-#   - 12:30:00〜12:33:00 は、latest が12:30未満なら即 False。
-#   - 場中でも latest が max_age を超えたら fail-open しない。
-#   - latest None の空状態だけは従来どおり環境変数で fail-open 可能。
+#   - latest が max_age を超えたら待たず即 False。
+#   - latest None だけは環境変数で fail-open 可能。
 # ============================================================
 from __future__ import annotations
 
@@ -214,6 +214,16 @@ def _patched_wait_fresh_push_summary_before_tonosama() -> bool:
             )
             return True
 
+        if latest is not None and age is not None and age > max_age:
+            logger.warning(
+                "[TONOSAMA ENTRY SCHEDULE] fresh push summary stale immediate skip latest=%s age=%.1fs rows=%s max_age=%.1fs patched=1 fail_open_stale=0",
+                latest,
+                age,
+                rows,
+                max_age,
+            )
+            return False
+
         if latest is None and fail_open_empty:
             logger.warning(
                 "[TONOSAMA ENTRY SCHEDULE] fresh push summary unavailable latest=None rows=%s -> fail-open to Tonosama body patched=1",
@@ -221,18 +231,7 @@ def _patched_wait_fresh_push_summary_before_tonosama() -> bool:
             )
             return True
 
-        if latest is not None and age is not None and age > max_age:
-            if time.perf_counter() >= deadline:
-                logger.warning(
-                    "[TONOSAMA ENTRY SCHEDULE] fresh push summary stale skip latest=%s age=%.1fs rows=%s max_age=%.1fs wait_sec=%.1fs patched=1 fail_open_stale=0",
-                    latest,
-                    age,
-                    rows,
-                    max_age,
-                    wait_sec,
-                )
-                return False
-        elif time.perf_counter() >= deadline:
+        if time.perf_counter() >= deadline:
             if last_dt is None and fail_open_empty:
                 logger.warning(
                     "[TONOSAMA ENTRY SCHEDULE] fresh push summary wait expired latest=None rows=%s -> fail-open to Tonosama body patched=1",
@@ -263,13 +262,15 @@ def _apply() -> bool:
 
     try:
         cur = getattr(tasks, "_wait_fresh_push_summary_before_tonosama", None)
-        if getattr(cur, "_tonosama_fresh_summary_wait_fix_v6", False):
+        if getattr(cur, "_tonosama_fresh_summary_wait_fix_v7", False):
             _INSTALLED = True
             return True
+        _patched_latest_push_summary_age_sec._tonosama_fresh_summary_wait_fix_v7 = True  # type: ignore[attr-defined]
         _patched_latest_push_summary_age_sec._tonosama_fresh_summary_wait_fix_v6 = True  # type: ignore[attr-defined]
         _patched_latest_push_summary_age_sec._tonosama_fresh_summary_wait_fix_v5 = True  # type: ignore[attr-defined]
         _patched_latest_push_summary_age_sec._tonosama_fresh_summary_wait_fix_v4 = True  # type: ignore[attr-defined]
         _patched_latest_push_summary_age_sec._tonosama_fresh_summary_wait_fix_v3 = True  # type: ignore[attr-defined]
+        _patched_wait_fresh_push_summary_before_tonosama._tonosama_fresh_summary_wait_fix_v7 = True  # type: ignore[attr-defined]
         _patched_wait_fresh_push_summary_before_tonosama._tonosama_fresh_summary_wait_fix_v6 = True  # type: ignore[attr-defined]
         _patched_wait_fresh_push_summary_before_tonosama._tonosama_fresh_summary_wait_fix_v5 = True  # type: ignore[attr-defined]
         _patched_wait_fresh_push_summary_before_tonosama._tonosama_fresh_summary_wait_fix_v4 = True  # type: ignore[attr-defined]
@@ -283,7 +284,7 @@ def _apply() -> bool:
         os.environ.setdefault("TONOSAMA_LUNCH_REOPEN_STALE_SKIP_MIN", "3")
         _INSTALLED = True
         logger.warning(
-            "[TONOSAMA FRESH SUMMARY WAIT FIX] installed v6 patched latest+wait fail_open_empty=%s fail_open_stale=%s skip_wait_outside_session=%s skip_lunch_reopen_stale=%s grace_min=%s",
+            "[TONOSAMA FRESH SUMMARY WAIT FIX] installed v7 patched latest+wait fail_open_empty=%s fail_open_stale=%s skip_wait_outside_session=%s skip_lunch_reopen_stale=%s grace_min=%s immediate_stale_skip=1",
             os.environ.get("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY"),
             os.environ.get("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_STALE"),
             os.environ.get("TONOSAMA_SKIP_WAIT_OUTSIDE_MARKET_SESSION"),
