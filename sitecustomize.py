@@ -1,9 +1,16 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver31-TONOSAMA-FRESH-WAIT-AND-AI-SOFT-RESCUE
+# Version: Ver32-TONOSAMA-TIMEOUT-PENDING-DISPATCH
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # 失敗しても本体起動は止めない。
+#
+# Ver32 Fix:
+#   - Tonosama build が pending 登録後に 30秒timeout すると、
+#     dispatch_timeout_pending=False のため entry_controller が呼ばれず、
+#     作成済み pending が SUMMARY pipeline では source filter で処理されない問題を防ぐ。
+#   - Tonosama build timeout を 45秒に延長し、timeout 時でも pending 増加があれば
+#     Tonosama controller dispatch を実行する。
 # ============================================================
 
 from __future__ import annotations
@@ -149,6 +156,18 @@ def _install_tonosama_surge_defaults() -> None:
         os.environ.setdefault("TONOSAMA_SLOPE_RANGE_RESCUE_MIN_SURGE", "0.0")
         os.environ.setdefault("TONOSAMA_SLOPE_RANGE_RESCUE_MIN_ABS_SCORE", "0.0")
 
+        # Tonosama scheduler/dispatch guard.
+        # Build が pending 登録後に timeout しても、Tonosama source の controller dispatch を実行する。
+        os.environ.setdefault("TONOSAMA_ENTRY_TIMEOUT_SEC", "45")
+        os.environ.setdefault("TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC", "12")
+        os.environ.setdefault("TONOSAMA_DISPATCH_CONTROLLER_ON_TIMEOUT_PENDING", "1")
+        os.environ.setdefault("TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_SEC", "10")
+        os.environ.setdefault("TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC", "60")
+
+        # 5秒足欠損/停止時の soft rescue は、強い1分方向なら 0.10% 直下も通す。
+        os.environ.setdefault("TONOSAMA_5SEC_RELAX_MIN_1M_BODY_PCT", "0.08")
+        os.environ.setdefault("TONOSAMA_5SEC_RELAX_MIN_1M_SLOPE", "0.0008")
+
         # TONOSAMA AI/fallback soft rescue.  Hard climax/direction NG remains blocked.
         os.environ.setdefault("TONOSAMA_AI_SOFT_RESCUE", "1")
         os.environ.setdefault("TONOSAMA_AI_RESCUE_MIN_VOLUME", "500000")
@@ -202,9 +221,11 @@ def _install_tonosama_surge_defaults() -> None:
             "tonosama_volume_surge_zero_rescue": os.environ.get("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_ENABLED"),
             "tonosama_slope_range_rescue": os.environ.get("TONOSAMA_SLOPE_RANGE_RESCUE_ENABLED"),
             "tonosama_ai_soft_rescue": os.environ.get("TONOSAMA_AI_SOFT_RESCUE"),
+            "tonosama_entry_timeout_sec": os.environ.get("TONOSAMA_ENTRY_TIMEOUT_SEC"),
+            "tonosama_dispatch_timeout_pending": os.environ.get("TONOSAMA_DISPATCH_CONTROLLER_ON_TIMEOUT_PENDING"),
         })
         logger.warning(
-            "[SITECUSTOMIZE] defaults short_mtf_require_all=%s short_mtf_min_aligned=%s ranking_source_db_fallback=%s ranking_hl_patch=%s entry_direction_recursion_failopen=%s summary_date_guard=%s warning_only_climax=%s tonosama_price_range_rescue=%s tonosama_volume_surge_zero_rescue=%s tonosama_slope_range_rescue=%s ai_soft_rescue=%s",
+            "[SITECUSTOMIZE] defaults short_mtf_require_all=%s short_mtf_min_aligned=%s ranking_source_db_fallback=%s ranking_hl_patch=%s entry_direction_recursion_failopen=%s summary_date_guard=%s warning_only_climax=%s tonosama_price_range_rescue=%s tonosama_volume_surge_zero_rescue=%s tonosama_slope_range_rescue=%s ai_soft_rescue=%s tonosama_timeout=%s dispatch_timeout_pending=%s",
             os.environ.get("ENTRY_SHORT_MTF_REQUIRE_ALL"),
             os.environ.get("ENTRY_SHORT_MTF_MIN_ALIGNED"),
             os.environ.get("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED"),
@@ -216,6 +237,8 @@ def _install_tonosama_surge_defaults() -> None:
             os.environ.get("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_ENABLED"),
             os.environ.get("TONOSAMA_SLOPE_RANGE_RESCUE_ENABLED"),
             os.environ.get("TONOSAMA_AI_SOFT_RESCUE"),
+            os.environ.get("TONOSAMA_ENTRY_TIMEOUT_SEC"),
+            os.environ.get("TONOSAMA_DISPATCH_CONTROLLER_ON_TIMEOUT_PENDING"),
         )
     except Exception:
         _write_boot_evidence("TONOSAMA_SURGE_DEFAULTS_EXCEPTION", traceback.format_exc())
