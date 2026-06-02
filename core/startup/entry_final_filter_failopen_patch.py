@@ -1,15 +1,16 @@
 # ============================================================
 # File   : core/startup/entry_final_filter_failopen_patch.py
-# Version: V1.9-DIRECTION-RECURSION-FAILOPEN-COMPAT
+# Version: V2.0-TONOSAMA-ATR-TUPLE-HISTORY-FAILOPEN
 # ------------------------------------------------------------
 # 【目的】
 #   候補・AI・pending までは通るのに、最後で全落ちする問題の緩和。
 #
-# V1.9:
-#   - ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN を 0 に強制しない。
-#   - RecursionError は wrapper衝突由来なので既定fail-openへ変更。
-#   - 通常Exceptionは引き続き fail-closed。
-#   - entry_direction_failclosed_patch v1.1 と整合。
+# V2.0:
+#   - atr_1m_filter が False 単体ではなく
+#       (False, {'reason': '1m本数不足', 'bars': 10, ...})
+#     の tuple を返すケースがあり、V1.9では tuple をそのまま返していた。
+#   - そのため TONOSAMA でも ENTRY_SKIP reason=ATR_1M_FILTER_NG になっていた。
+#   - TONOSAMA限定で、tuple型NGでも reason/bars が履歴不足なら True へ fail-open。
 #
 # 【方針】
 #   - TONOSAMA は候補生成時に出来高/値幅/傾き/5秒足を見ているため、
@@ -105,6 +106,33 @@ def _has_explicit_atr(entry_row: Any) -> bool:
     return price > 0 and atr > 0
 
 
+def _ret_ok(ret: Any) -> bool:
+    try:
+        if isinstance(ret, tuple) and len(ret) > 0:
+            return bool(ret[0])
+        return bool(ret)
+    except Exception:
+        return False
+
+
+def _ret_detail(ret: Any) -> Any:
+    try:
+        if isinstance(ret, tuple) and len(ret) > 1:
+            return ret[1]
+    except Exception:
+        pass
+    return None
+
+
+def _detail_bars(detail: Any) -> float:
+    try:
+        if isinstance(detail, dict):
+            return _safe_float(detail.get("bars"), -1.0)
+    except Exception:
+        pass
+    return -1.0
+
+
 def _looks_atr_history_gap(entry_row: Any = None, detail: Any = None) -> bool:
     try:
         if _has_explicit_atr(entry_row):
@@ -112,7 +140,12 @@ def _looks_atr_history_gap(entry_row: Any = None, detail: Any = None) -> bool:
         text = _safe_str(detail)
         if not text:
             return True
-        return any(w in text for w in _ATR_INSUFFICIENT_WORDS)
+        if any(w in text for w in _ATR_INSUFFICIENT_WORDS):
+            return True
+        bars = _detail_bars(detail)
+        if 0 <= bars < _safe_float(os.getenv("ATR_1M_FILTER_TONOSAMA_MIN_BARS"), 14.0):
+            return True
+        return False
     except Exception:
         return False
 
@@ -126,6 +159,7 @@ def install() -> bool:
     _setdefault_env("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", "2")
     _setdefault_env("ENTRY_COUNT_SENT_ORDER_AS_DAILY_ENTRY", "1")
     _setdefault_env("ATR_1M_FILTER_TONOSAMA_HISTORY_FAIL_OPEN", "1")
+    _setdefault_env("ATR_1M_FILTER_TONOSAMA_MIN_BARS", "14")
     _setdefault_env("RANGE_5M_FILTER_NG_FAIL_OPEN", "1")
     _setdefault_env("PENDING_PROTECT_PUSH_SYMBOLS", "1")
     _setdefault_env("PENDING_PROTECT_PUSH_MAX_KEEP", "50")
@@ -160,17 +194,18 @@ def install() -> bool:
 
     try:
         orig_atr = getattr(ec, "atr_1m_filter", None)
-        if callable(orig_atr) and not getattr(orig_atr, "_tonosama_atr_failopen_wrapper", False):
+        if callable(orig_atr) and not getattr(orig_atr, "_tonosama_atr_failopen_wrapper_v2", False):
             def _atr_tonosama_failopen(entry_row: Any = None, *args, **kwargs):
                 try:
                     ret = orig_atr(entry_row, *args, **kwargs)
-                    if isinstance(ret, tuple):
-                        return ret
-                    if ret is False and _is_tonosama_entry(entry_row) and _env_bool("ATR_1M_FILTER_TONOSAMA_HISTORY_FAIL_OPEN", True):
-                        if _looks_atr_history_gap(entry_row=entry_row, detail=None):
+                    if (not _ret_ok(ret)) and _is_tonosama_entry(entry_row) and _env_bool("ATR_1M_FILTER_TONOSAMA_HISTORY_FAIL_OPEN", True):
+                        detail = _ret_detail(ret)
+                        if _looks_atr_history_gap(entry_row=entry_row, detail=detail):
                             logger.warning(
-                                "[ENTRY FINAL FILTER FAILOPEN] atr_1m_filter TONOSAMA history gap -> fail-open. Other guards still apply. symbol=%s",
+                                "[ENTRY FINAL FILTER FAILOPEN] atr_1m_filter TONOSAMA history gap -> fail-open. symbol=%s ret=%s detail=%s",
                                 _row_dict(entry_row).get("symbol"),
+                                ret,
+                                detail,
                             )
                             return True
                     return ret
@@ -180,9 +215,10 @@ def install() -> bool:
                     return bool(allow)
 
             _atr_tonosama_failopen._tonosama_atr_failopen_wrapper = True  # type: ignore[attr-defined]
+            _atr_tonosama_failopen._tonosama_atr_failopen_wrapper_v2 = True  # type: ignore[attr-defined]
             _atr_tonosama_failopen._original_atr_1m_filter = orig_atr  # type: ignore[attr-defined]
             setattr(ec, "atr_1m_filter", _atr_tonosama_failopen)
-            logger.warning("[ENTRY FINAL FILTER FAILOPEN] atr_1m_filter TONOSAMA history-gap wrapper installed")
+            logger.warning("[ENTRY FINAL FILTER FAILOPEN] atr_1m_filter TONOSAMA history-gap tuple wrapper installed v2")
     except Exception:
         logger.exception("[ENTRY FINAL FILTER FAILOPEN] atr_1m wrapper install failed")
 
@@ -231,8 +267,9 @@ def install() -> bool:
 
     _PATCHED = True
     logger.warning(
-        "[ENTRY FINAL FILTER FAILOPEN] installed v1.9 atr_tonosama_history_fail_open=%s range_fail_open=%s allow_without_board=%s max_symbol_entries=%s pending_protect_push=%s board_retry=%s short_mtf_required=%s daily_mtf_optional=%s ma5_breakout=%s direction_recursion_fail_open=%s direction_error_fail_open=%s",
+        "[ENTRY FINAL FILTER FAILOPEN] installed v2.0 atr_tonosama_history_fail_open=%s atr_min_bars=%s range_fail_open=%s allow_without_board=%s max_symbol_entries=%s pending_protect_push=%s board_retry=%s short_mtf_required=%s daily_mtf_optional=%s ma5_breakout=%s direction_recursion_fail_open=%s direction_error_fail_open=%s",
         _env_bool("ATR_1M_FILTER_TONOSAMA_HISTORY_FAIL_OPEN", True),
+        os.getenv("ATR_1M_FILTER_TONOSAMA_MIN_BARS"),
         _env_bool("RANGE_5M_FILTER_NG_FAIL_OPEN", True),
         os.getenv("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"),
         os.getenv("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL"),
