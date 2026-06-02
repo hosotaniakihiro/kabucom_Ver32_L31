@@ -1,6 +1,6 @@
 # =========================================
 # optional_main.py
-# Version: PRODUCTION-STABLE-REV3-LIGHT-MODE-IN-MAIN
+# Version: PRODUCTION-STABLE-REV4-REBUILD-SYMBOL-MAP-AFTER-OPTIONAL-LOAD
 # =========================================
 # ・optional 系 日次バッチのエントリポイント
 # ・paths.py 前提
@@ -9,10 +9,10 @@
 # ・optional_data を global_data にロード
 # ・日足DB由来のMA/MTFを global_data.daily_mtf_df にロードし、AI判定前merge patchを導入
 #
-# REV3:
-#   - main.py では optional ingest/kabutan取得/daily_watchlist作成を既定スキップ可能にする
-#   - OPTIONAL_LIGHT_MODE=1 または OPTIONAL_SKIP_INGEST=1 で migrate/ingestを飛ばし、既存DB読込だけ実施
-#   - main_database.py / 手動実行では従来通り migrate + ingest を実行
+# REV4:
+#   - main.py では build_symbol_name_map() が optional_main() より前に呼ばれていたため、
+#     optional_data 未ロード状態で symbol_name_map が空になることがあった。
+#   - optional_data ロード直後に symbol_name_map を再構築し、SUMMARY TOP10 の銘柄名表示を復旧する。
 # =========================================
 
 from __future__ import annotations
@@ -104,6 +104,25 @@ from optional.db.reader import load_optional_dataframe
 
 
 # ---------------------------------
+# symbol map runtime boot
+# ---------------------------------
+def rebuild_symbol_name_map_safe() -> None:
+    """optional_data ロード後に銘柄名mapを再構築する。"""
+    try:
+        from core.bootstrap.load_symbol_map import build_symbol_name_map
+
+        build_symbol_name_map()
+        mp = getattr(global_data, "symbol_name_map", {})
+        logger.warning(
+            "[OPTIONAL BOOT] symbol_name_map rebuilt after optional load rows=%s optional_rows=%s",
+            len(mp) if isinstance(mp, dict) else 0,
+            len(getattr(global_data, "optional_data", [])) if getattr(global_data, "optional_data", None) is not None else 0,
+        )
+    except Exception:
+        logger.exception("[OPTIONAL BOOT] rebuild symbol_name_map failed (continue)")
+
+
+# ---------------------------------
 # daily MTF runtime boot
 # ---------------------------------
 def install_daily_mtf_runtime_safe() -> None:
@@ -191,6 +210,11 @@ def optional_main():
     except Exception:
         logger.exception("❌ optional dataframe load failed")
         global_data.optional_data = pd.DataFrame()
+
+    # -------------------------------------------------
+    # ③-2 optional_data → symbol_name_map rebuild
+    # -------------------------------------------------
+    rebuild_symbol_name_map_safe()
 
     # -------------------------------------------------
     # ④ 日足DB → daily_mtf_df load + AI前merge patch
