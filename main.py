@@ -10,8 +10,9 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.28-TONOSAMA-LOST-VOLUME-THRESHOLD
+# Version: Ver38.29-SUMMARY-AI-ASYNC-INSTALL
 # ------------------------------------------------------------
+# ✔ SUMMARY AI async entry patch を main runtime patch 一覧へ明示追加
 # ✔ TONOSAMA final liquidity lost-volume fallback threshold を 2.3 に調整
 # ✔ TONOSAMA volatility entry-row rescue を main runtime に追加
 # ✔ NAS sqlite I/O guard を main runtime に追加
@@ -152,6 +153,7 @@ def _install_main_runtime_patches():
         ("core.startup.entry_limit_passive_runtime_patch", "install"),
         ("core.startup.final_entry_safety_guard_patch", "install"),
         ("core.startup.summary_ai_more_candidates_patch", "install"),
+        ("core.startup.summary_ai_async_entry_patch", "install"),
         ("core.startup.entry_order_mtf_slope_fill_patch", "install"),
         ("core.startup.summary_ai_entry_controller_bridge_patch", "install"),
         ("core.startup.discord_summary_display_compact_patch", "install"),
