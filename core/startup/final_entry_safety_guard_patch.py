@@ -1,22 +1,15 @@
 # ============================================================
 # File   : core/startup/final_entry_safety_guard_patch.py
-# Version: Ver02-FINAL-ENTRY-SAFETY-GUARD-FAIL-CLOSED-BOARD
+# Version: Ver03-FINAL-GUARD-DISPATCH-DIAG
 # ------------------------------------------------------------
 # entry_controller._execute_best_candidate を runtime patch し、
 # 発注直前の最終安全ガードを追加する。
 #
-# 組み込む項目:
-#   1. 出来高・売買代金ガード
-#   2. 同一銘柄の損切り後、当日再エントリー禁止
-#   4. 直近5秒〜10秒の逆行検知
-#   5. エントリー時間帯ガード
-#   6. スプレッド・板薄ガード
-#   7. 逆張り例外の半数量化
-#
-# Ver02:
-#   - 板が取れない場合に通していた BOARD_SKIP を廃止
-#   - 既定で bid/ask missing は発注停止
-#   - ENTRY_ALLOW_ENTRY_WITHOUT_BOARD=1 の場合のみ旧動作に戻せる
+# Ver03:
+#   - ALL_OK の直後に CALL_ORIG_START を必ず出す
+#   - 元の _execute_best_candidate から戻ったら CALL_ORIG_DONE を出す
+#   - CALL_ORIG_START が出て ENTRY_QTY_CALC が出ない場合は、元関数内、主に lot_sizer 側停止と判別できる
+#   - CALL_ORIG_DONE ok=False の場合は、元関数内で発注前に止まったことを明示する
 #
 # 優先度3「当日損失上限で新規停止」は、ユーザー要望により未実装。
 # ============================================================
@@ -26,6 +19,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -150,23 +144,18 @@ def _log_ng(reason: str, symbol: str, side: str, **detail) -> None:
 def _entry_time_guard(symbol: str, side: str) -> bool:
     if not _env_bool("ENTRY_TIME_GUARD_ENABLED", True):
         return True
-
     now = dt.datetime.now()
     now_t = now.time()
-
     bh, bm = _parse_hhmm(_env_str("ENTRY_NO_NEW_BEFORE", "09:05"), 9, 5)
     ah, am = _parse_hhmm(_env_str("ENTRY_NO_NEW_AFTER", "14:55"), 14, 55)
     before_t = dt.time(bh, bm)
     after_t = dt.time(ah, am)
-
     if now_t < before_t:
         _log_ng("time_before_allowed", symbol, side, now=now.strftime("%H:%M:%S"), no_new_before=before_t.strftime("%H:%M"))
         return False
-
     if now_t >= after_t:
         _log_ng("time_after_allowed", symbol, side, now=now.strftime("%H:%M:%S"), no_new_after=after_t.strftime("%H:%M"))
         return False
-
     if _env_bool("ENTRY_LUNCH_GUARD_ENABLED", True):
         sh, sm = _parse_hhmm(_env_str("ENTRY_LUNCH_BLOCK_START", "11:25"), 11, 25)
         eh, em = _parse_hhmm(_env_str("ENTRY_LUNCH_BLOCK_END", "12:30"), 12, 30)
@@ -175,36 +164,28 @@ def _entry_time_guard(symbol: str, side: str) -> bool:
         if st <= now_t < et:
             _log_ng("time_lunch_block", symbol, side, now=now.strftime("%H:%M:%S"), lunch_start=st.strftime("%H:%M"), lunch_end=et.strftime("%H:%M"))
             return False
-
     return True
 
 
 def _liquidity_guard(row: dict, symbol: str, side: str) -> bool:
     if not _env_bool("ENTRY_FINAL_LIQUIDITY_GUARD_ENABLED", True):
         return True
-
     close = _safe_float(_first(row, ("close", "close_price", "price", "current_price"), 0.0), 0.0)
     volume = _safe_float(_first(row, ("volume", "Volume", "出来高"), 0.0), 0.0)
     turnover = _safe_float(_first(row, ("turnover", "trading_value", "売買代金"), 0.0), 0.0)
-
     if turnover <= 0 and close > 0 and volume > 0:
         turnover = close * volume
-
     min_volume = _env_float("ENTRY_MIN_VOLUME", 30000.0)
     min_turnover = _env_float("ENTRY_MIN_TURNOVER", 10000000.0)
-
     if volume <= 0:
         _log_ng("volume_missing", symbol, side, volume=volume, turnover=turnover, close=close)
         return False
-
     if volume < min_volume:
         _log_ng("low_volume", symbol, side, volume=volume, min_volume=min_volume, turnover=turnover)
         return False
-
     if turnover < min_turnover:
         _log_ng("low_turnover", symbol, side, turnover=turnover, min_turnover=min_turnover, volume=volume, close=close)
         return False
-
     logger.info(
         "[FINAL ENTRY SAFETY GUARD] LIQUIDITY_OK symbol=%s side=%s volume=%.0f turnover=%.0f min_volume=%.0f min_turnover=%.0f",
         symbol,
@@ -220,18 +201,11 @@ def _liquidity_guard(row: dict, symbol: str, side: str) -> bool:
 def _same_symbol_loss_guard(symbol: str, side: str) -> bool:
     if not _env_bool("ENTRY_SAME_SYMBOL_LOSS_LOCK_ENABLED", True):
         return True
-
     try:
         from global_state import global_data
     except Exception:
         return True
-
-    for attr in (
-        "same_symbol_loss_locked_set",
-        "entry_loss_locked_symbols",
-        "daily_loss_locked_symbols",
-        "symbol_loss_locked_set",
-    ):
+    for attr in ("same_symbol_loss_locked_set", "entry_loss_locked_symbols", "daily_loss_locked_symbols", "symbol_loss_locked_set"):
         locked = getattr(global_data, attr, None)
         try:
             if isinstance(locked, (set, list, tuple)) and symbol in {str(x) for x in locked}:
@@ -239,14 +213,7 @@ def _same_symbol_loss_guard(symbol: str, side: str) -> bool:
                 return False
         except Exception:
             pass
-
-    maps = (
-        "recent_realized_pnl_map",
-        "daily_symbol_realized_pnl_map",
-        "symbol_realized_pnl_map",
-        "realized_pnl_by_symbol",
-    )
-    for attr in maps:
+    for attr in ("recent_realized_pnl_map", "daily_symbol_realized_pnl_map", "symbol_realized_pnl_map", "realized_pnl_by_symbol"):
         mp = getattr(global_data, attr, None)
         if not isinstance(mp, dict):
             continue
@@ -254,14 +221,8 @@ def _same_symbol_loss_guard(symbol: str, side: str) -> bool:
         if pnl < _env_float("ENTRY_SAME_SYMBOL_LOSS_LOCK_PNL_BELOW", 0.0):
             _log_ng("same_symbol_realized_loss", symbol, side, source=attr, pnl=pnl)
             return False
-
-    count_maps = (
-        "symbol_loss_count_map",
-        "daily_symbol_loss_count_map",
-        "recent_symbol_loss_count_map",
-    )
     min_count = _safe_int(_env_float("ENTRY_SAME_SYMBOL_LOSS_LOCK_MIN_COUNT", 1.0), 1)
-    for attr in count_maps:
+    for attr in ("symbol_loss_count_map", "daily_symbol_loss_count_map", "recent_symbol_loss_count_map"):
         mp = getattr(global_data, attr, None)
         if not isinstance(mp, dict):
             continue
@@ -269,28 +230,21 @@ def _same_symbol_loss_guard(symbol: str, side: str) -> bool:
         if cnt >= min_count:
             _log_ng("same_symbol_loss_count_locked", symbol, side, source=attr, loss_count=cnt, min_count=min_count)
             return False
-
     return True
 
 
 def _recent_reverse_guard(row: dict, symbol: str, side: str) -> bool:
     if not _env_bool("ENTRY_RECENT_REVERSE_GUARD_ENABLED", True):
         return True
-
     pc3 = _safe_float(_first(row, ("price_change_3", "change_3", "ret_3", "return_3", "price_change_3s", "change_3s"), 0.0), 0.0)
     pc5 = _safe_float(_first(row, ("price_change_5", "change_5", "ret_5", "return_5", "price_change_5s", "change_5s"), 0.0), 0.0)
     pc10 = _safe_float(_first(row, ("price_change_10", "change_10", "ret_10", "return_10", "price_change_10s", "change_10s"), 0.0), 0.0)
     slope = _safe_float(_first(row, ("slope_5s", "recent_slope", "slope_atr_scaled", "score_slope", "slope"), 0.0), 0.0)
 
     def _as_pct(v: float) -> float:
-        if abs(v) <= 1.0:
-            return v * 100.0
-        return v
+        return v * 100.0 if abs(v) <= 1.0 else v
 
-    pc3p = _as_pct(pc3)
-    pc5p = _as_pct(pc5)
-    pc10p = _as_pct(pc10)
-
+    pc3p, pc5p, pc10p = _as_pct(pc3), _as_pct(pc5), _as_pct(pc10)
     buy_min_3 = _env_float("ENTRY_BUY_MIN_RECENT_3_CHANGE_PCT", -0.05)
     buy_min_5 = _env_float("ENTRY_BUY_MIN_RECENT_5_CHANGE_PCT", -0.10)
     buy_min_10 = _env_float("ENTRY_BUY_MIN_RECENT_10_CHANGE_PCT", -0.15)
@@ -298,30 +252,16 @@ def _recent_reverse_guard(row: dict, symbol: str, side: str) -> bool:
     sell_max_5 = _env_float("ENTRY_SELL_MAX_RECENT_5_CHANGE_PCT", 0.10)
     sell_max_10 = _env_float("ENTRY_SELL_MAX_RECENT_10_CHANGE_PCT", 0.15)
     max_bad_slope = _env_float("ENTRY_RECENT_REVERSE_MAX_BAD_SLOPE", 0.12)
-
     if pc3 == 0 and pc5 == 0 and pc10 == 0 and slope == 0:
         logger.info("[FINAL ENTRY SAFETY GUARD] RECENT_REVERSE_SKIP symbol=%s side=%s reason=no_recent_data", symbol, side)
         return True
-
-    if side == "BUY":
-        if pc3p < buy_min_3 or pc5p < buy_min_5 or pc10p < buy_min_10 or slope <= -max_bad_slope:
-            _log_ng("recent_down_against_buy", symbol, side, pc3=pc3p, pc5=pc5p, pc10=pc10p, slope=slope, limits=(buy_min_3, buy_min_5, buy_min_10, -max_bad_slope))
-            return False
-
-    if side == "SELL":
-        if pc3p > sell_max_3 or pc5p > sell_max_5 or pc10p > sell_max_10 or slope >= max_bad_slope:
-            _log_ng("recent_up_against_sell", symbol, side, pc3=pc3p, pc5=pc5p, pc10=pc10p, slope=slope, limits=(sell_max_3, sell_max_5, sell_max_10, max_bad_slope))
-            return False
-
-    logger.info(
-        "[FINAL ENTRY SAFETY GUARD] RECENT_REVERSE_OK symbol=%s side=%s pc3=%.3f pc5=%.3f pc10=%.3f slope=%.6f",
-        symbol,
-        side,
-        pc3p,
-        pc5p,
-        pc10p,
-        slope,
-    )
+    if side == "BUY" and (pc3p < buy_min_3 or pc5p < buy_min_5 or pc10p < buy_min_10 or slope <= -max_bad_slope):
+        _log_ng("recent_down_against_buy", symbol, side, pc3=pc3p, pc5=pc5p, pc10=pc10p, slope=slope, limits=(buy_min_3, buy_min_5, buy_min_10, -max_bad_slope))
+        return False
+    if side == "SELL" and (pc3p > sell_max_3 or pc5p > sell_max_5 or pc10p > sell_max_10 or slope >= max_bad_slope):
+        _log_ng("recent_up_against_sell", symbol, side, pc3=pc3p, pc5=pc5p, pc10=pc10p, slope=slope, limits=(sell_max_3, sell_max_5, sell_max_10, max_bad_slope))
+        return False
+    logger.info("[FINAL ENTRY SAFETY GUARD] RECENT_REVERSE_OK symbol=%s side=%s pc3=%.3f pc5=%.3f pc10=%.3f slope=%.6f", symbol, side, pc3p, pc5p, pc10p, slope)
     return True
 
 
@@ -354,120 +294,91 @@ def _try_get_bid_ask_from_api(symbol: str) -> tuple[float, float, float, float]:
 def _board_guard(row: dict, symbol: str, side: str) -> bool:
     if not _env_bool("ENTRY_BOARD_GUARD_ENABLED", True):
         return True
-
     bid, ask, bid_qty, ask_qty = _extract_bid_ask_from_row(row)
-
     if bid <= 0 or ask <= 0:
         bid2, ask2, bidq2, askq2 = _try_get_bid_ask_from_api(symbol)
         bid = bid or bid2
         ask = ask or ask2
         bid_qty = bid_qty or bidq2
         ask_qty = ask_qty or askq2
-
     if bid <= 0 or ask <= 0:
         if _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", False):
             logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_MISSING_ALLOW symbol=%s side=%s bid=%s ask=%s", symbol, side, bid, ask)
             return True
         _log_ng("board_missing", symbol, side, bid=bid, ask=ask, message="板が取れないため新規エントリー停止")
         return False
-
     mid = (bid + ask) / 2.0
     spread_pct = ((ask - bid) / mid) * 100.0 if mid > 0 else 999.0
     max_spread = _env_float("ENTRY_MAX_SPREAD_PCT", 0.15)
     min_best_qty = _env_float("ENTRY_MIN_BEST_BOARD_QTY", 100.0)
-
     if spread_pct > max_spread:
         _log_ng("spread_too_wide", symbol, side, bid=bid, ask=ask, spread_pct=spread_pct, max_spread=max_spread)
         return False
-
     if side == "BUY" and ask_qty > 0 and ask_qty < min_best_qty:
         _log_ng("ask_board_too_thin", symbol, side, ask_qty=ask_qty, min_best_qty=min_best_qty, bid=bid, ask=ask)
         return False
-
     if side == "SELL" and bid_qty > 0 and bid_qty < min_best_qty:
         _log_ng("bid_board_too_thin", symbol, side, bid_qty=bid_qty, min_best_qty=min_best_qty, bid=bid, ask=ask)
         return False
-
-    logger.info(
-        "[FINAL ENTRY SAFETY GUARD] BOARD_OK symbol=%s side=%s bid=%.4f ask=%.4f spread_pct=%.4f bid_qty=%.0f ask_qty=%.0f",
-        symbol,
-        side,
-        bid,
-        ask,
-        spread_pct,
-        bid_qty,
-        ask_qty,
-    )
+    logger.info("[FINAL ENTRY SAFETY GUARD] BOARD_OK symbol=%s side=%s bid=%.4f ask=%.4f spread_pct=%.4f bid_qty=%.0f ask_qty=%.0f", symbol, side, bid, ask, spread_pct, bid_qty, ask_qty)
     return True
 
 
 def _apply_contrarian_half_size(item: dict, row: dict, symbol: str, side: str) -> None:
     if not _env_bool("ENTRY_CONTRARIAN_HALF_SIZE_ENABLED", True):
         return
-
     climax = bool(row.get("climax_reversal_exception") or row.get("contrarian_reversed"))
     ctype = str(row.get("climax_type") or row.get("reverse_reason") or "")
     if not climax and "contrarian" not in ctype and "climax" not in ctype:
         return
-
     ai = item.get("ai")
     if not isinstance(ai, dict):
         return
-
     ratio = _env_float("ENTRY_CONTRARIAN_QTY_RATIO", 0.5)
     old_lot = _safe_float(ai.get("lot_multiplier"), 1.0)
     new_lot = max(0.1, old_lot * ratio)
     ai["lot_multiplier"] = new_lot
     ai["contrarian_half_size"] = True
     ai["contrarian_qty_ratio"] = ratio
-
-    logger.warning(
-        "[FINAL ENTRY SAFETY GUARD] CONTRARIAN_HALF_SIZE symbol=%s side=%s type=%s lot_multiplier %.3f -> %.3f ratio=%.3f",
-        symbol,
-        side,
-        ctype,
-        old_lot,
-        new_lot,
-        ratio,
-    )
+    logger.warning("[FINAL ENTRY SAFETY GUARD] CONTRARIAN_HALF_SIZE symbol=%s side=%s type=%s lot_multiplier %.3f -> %.3f ratio=%.3f", symbol, side, ctype, old_lot, new_lot, ratio)
 
 
 def _patched_execute_best_candidate(item: dict, boost_active: bool) -> bool:
     if not callable(_ORIG_EXECUTE_BEST_CANDIDATE):
         logger.error("[FINAL ENTRY SAFETY GUARD] original _execute_best_candidate unavailable")
         return False
-
+    started = time.time()
+    symbol = ""
+    side = ""
     try:
         symbol = _norm_symbol(item.get("symbol"))
         row = _row_to_dict(item.get("entry_row"))
         side = _norm_side(item.get("side") or _first(row, ("side", "entry_decision", "ai_side"), ""))
-
         if side not in {"BUY", "SELL"}:
             _log_ng("unknown_side", symbol, side, item_keys=list(item.keys()))
             return False
-
         if not _entry_time_guard(symbol, side):
             return False
-
         if not _liquidity_guard(row, symbol, side):
             return False
-
         if not _same_symbol_loss_guard(symbol, side):
             return False
-
         if not _recent_reverse_guard(row, symbol, side):
             return False
-
         if not _board_guard(row, symbol, side):
             return False
-
         _apply_contrarian_half_size(item, row, symbol, side)
 
         logger.info("[FINAL ENTRY SAFETY GUARD] ALL_OK symbol=%s side=%s", symbol, side)
-        return _ORIG_EXECUTE_BEST_CANDIDATE(item, boost_active)
-
+        logger.warning("[FINAL ENTRY SAFETY GUARD] CALL_ORIG_START symbol=%s side=%s orig=%s boost_active=%s", symbol, side, getattr(_ORIG_EXECUTE_BEST_CANDIDATE, "__name__", repr(_ORIG_EXECUTE_BEST_CANDIDATE)), boost_active)
+        ok = bool(_ORIG_EXECUTE_BEST_CANDIDATE(item, boost_active))
+        elapsed = time.time() - started
+        logger.warning("[FINAL ENTRY SAFETY GUARD] CALL_ORIG_DONE symbol=%s side=%s ok=%s elapsed=%.3fs", symbol, side, ok, elapsed)
+        if not ok:
+            logger.warning("[FINAL ENTRY SAFETY GUARD] ORIG_RETURN_FALSE symbol=%s side=%s elapsed=%.3fs", symbol, side, elapsed)
+        return ok
     except Exception:
-        logger.exception("[FINAL ENTRY SAFETY GUARD] patched execute failed")
+        logger.exception("[FINAL ENTRY SAFETY GUARD] patched execute failed symbol=%s side=%s", symbol, side)
         return False
 
 
@@ -475,7 +386,7 @@ def _is_currently_wrapped() -> bool:
     try:
         import trading.handlers.entry_controller as ec
         cur = getattr(ec, "_execute_best_candidate", None)
-        return bool(getattr(cur, "_final_entry_safety_guard", False))
+        return bool(getattr(cur, "_final_entry_safety_guard_v03", False))
     except Exception:
         return False
 
@@ -484,26 +395,26 @@ def install() -> bool:
     global _INSTALLED, _ORIG_EXECUTE_BEST_CANDIDATE
     try:
         import trading.handlers.entry_controller as ec
-
         if _INSTALLED and _is_currently_wrapped():
             return True
-
         old = getattr(ec, "_execute_best_candidate", None)
         if not callable(old):
             logger.error("[FINAL ENTRY SAFETY GUARD] target _execute_best_candidate unavailable")
             return False
-
-        if getattr(old, "_final_entry_safety_guard", False):
+        if getattr(old, "_final_entry_safety_guard_v03", False):
             _INSTALLED = True
             return True
-
+        # 旧Verの自分自身を二重に包まない。旧wrapperならその original を使う。
+        if getattr(old, "_final_entry_safety_guard", False) and _ORIG_EXECUTE_BEST_CANDIDATE is not None:
+            old = _ORIG_EXECUTE_BEST_CANDIDATE
         _ORIG_EXECUTE_BEST_CANDIDATE = old
         _patched_execute_best_candidate._final_entry_safety_guard = True  # type: ignore[attr-defined]
+        _patched_execute_best_candidate._final_entry_safety_guard_v03 = True  # type: ignore[attr-defined]
+        _patched_execute_best_candidate._original_execute_best_candidate = old  # type: ignore[attr-defined]
         ec._execute_best_candidate = _patched_execute_best_candidate
         _INSTALLED = True
-
         logger.warning(
-            "[FINAL ENTRY SAFETY GUARD] installed liquidity=%s min_volume=%.0f min_turnover=%.0f same_symbol_loss=%s recent_reverse=%s time_guard=%s board_guard=%s allow_without_board=%s contrarian_half=%s qty_ratio=%.2f daily_loss_guard=NOT_INSTALLED_BY_REQUEST",
+            "[FINAL ENTRY SAFETY GUARD] installed v03 liquidity=%s min_volume=%.0f min_turnover=%.0f same_symbol_loss=%s recent_reverse=%s time_guard=%s board_guard=%s allow_without_board=%s contrarian_half=%s qty_ratio=%.2f daily_loss_guard=NOT_INSTALLED_BY_REQUEST",
             _env_bool("ENTRY_FINAL_LIQUIDITY_GUARD_ENABLED", True),
             _env_float("ENTRY_MIN_VOLUME", 30000.0),
             _env_float("ENTRY_MIN_TURNOVER", 10000000.0),
@@ -516,7 +427,6 @@ def install() -> bool:
             _env_float("ENTRY_CONTRARIAN_QTY_RATIO", 0.5),
         )
         return True
-
     except Exception:
         logger.exception("[FINAL ENTRY SAFETY GUARD] install failed")
         return False
