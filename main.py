@@ -10,8 +10,10 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.24-RANKING-FILTER-RESCUE-PATCH
+# Version: Ver38.27-TONOSAMA-VOL-RESCUE-MAIN-INSTALL
 # ------------------------------------------------------------
+# ✔ TONOSAMA volatility entry-row rescue を main runtime に追加
+# ✔ NAS sqlite I/O guard を main runtime に追加
 # ✔ _log_skip reason衝突ガードを全runtime patch後の最後に再適用
 # ✔ RANKING ENTRY controller timeoutを拡張
 # ✔ RANKING_ENTRY 強スコアの技術フィルタ全落ちを救済
@@ -42,6 +44,10 @@ os.environ.setdefault("OPTIONAL_SKIP_INGEST", "1")
 os.environ.setdefault("OPTIONAL_RUN_INGEST_IN_MAIN", "0")
 os.environ.setdefault("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", "120")
 os.environ.setdefault("RANKING_ENTRY_BUILD_TIMEOUT_SEC", "180")
+os.environ.setdefault("NAS_SQLITE_IO_GUARD_COOLDOWN_SEC", "20")
+os.environ.setdefault("TONOSAMA_VOL_ENTRYROW_RESCUE_ENABLED", "1")
+os.environ.setdefault("TONOSAMA_VOL_ENTRYROW_RESCUE_MIN_RANGE_RATIO", "0.006")
+os.environ.setdefault("TONOSAMA_VOL_ENTRYROW_RESCUE_MIN_INTRABAR_PCT", "0.6")
 
 try:
     from core.logging.console_tee import setup_console_tee, rebind_logging_streams_to_console_tee
@@ -132,6 +138,7 @@ def _factory_position_state():
 
 def _install_main_runtime_patches():
     patches = [
+        ("core.startup.nas_sqlite_io_guard_patch", "install"),
         ("core.startup.indicator_fragmentation_runtime_patch", "install"),
         ("core.startup.entry_controller_runtime_reject_patch", "install"),
         ("core.startup.fast_startup_runtime_patch", "install"),
@@ -149,6 +156,7 @@ def _install_main_runtime_patches():
         ("core.startup.ranking_entry_flat_price_guard_patch", "install"),
         ("core.startup.board_retry_patch", "install"),
         ("core.startup.tonosama_5sec_stopped_relax_patch", "install"),
+        ("core.startup.volatility_filter_tonosama_entryrow_rescue_patch", "install"),
         ("core.startup.board_wall_stall_exit_patch", "install"),
         ("core.startup.ranking_entry_controller_timeout_patch", "install"),
         ("core.startup.ranking_entry_filter_rescue_patch", "install"),
