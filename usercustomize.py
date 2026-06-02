@@ -32,3 +32,4 @@ _install("YAHOO_STALE_RESET_OUTSIDE_SESSION", "core.startup.yahoo_stale_reset_ou
 _install("RANKING_SUMMARY_MARKET_HOURS_SKIP", "core.startup.ranking_summary_market_hours_skip_patch")
 _install("TONOSAMA_MARKET_HOURS_SKIP", "core.startup.tonosama_market_hours_skip_patch")
 _install("RANKING_ENTRY_FINAL_BUDGET_CAP", "core.startup.ranking_entry_final_budget_cap_patch")
+_install("ENTRY_ORDER_SHORT_MTF_NEUTRAL_DIRECT", "core.startup.entry_order_short_mtf_neutral_direct_patch")
