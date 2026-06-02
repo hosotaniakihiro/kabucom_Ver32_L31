@@ -9,15 +9,40 @@ logger = logging.getLogger(__name__)
 _INSTALLED = False
 
 
+def _float_env(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    try:
+        x = float(v)
+    except Exception:
+        x = float(lo)
+    return max(float(lo), min(float(hi), x))
+
+
 def _apply_once() -> bool:
-    os.environ["RANKING_ENTRY_RUNTIME_BUDGET_SEC"] = os.getenv("RANKING_ENTRY_FAST_RUNTIME_BUDGET_SEC", "150")
-    os.environ["RANKING_ENTRY_BUILD_TIMEOUT_SEC"] = os.getenv("RANKING_ENTRY_FAST_BUILD_TIMEOUT_SEC", "180")
-    os.environ["RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC"] = os.getenv("RANKING_ENTRY_FAST_CONTROLLER_TIMEOUT_SEC", "120")
+    # 他patchや環境変数が 150/180/120 を指定しても、ここで必ず高速上限へ丸める。
+    runtime = _clamp(_float_env("RANKING_ENTRY_FAST_RUNTIME_BUDGET_SEC", 25.0), 10.0, 25.0)
+    build = _clamp(_float_env("RANKING_ENTRY_FAST_BUILD_TIMEOUT_SEC", 30.0), 15.0, 30.0)
+    controller = _clamp(_float_env("RANKING_ENTRY_FAST_CONTROLLER_TIMEOUT_SEC", 30.0), 15.0, 30.0)
+    lock_wait = _clamp(_float_env("SUMMARY_AI_ENTRY_CONTROLLER_LOCK_WAIT_SEC", 15.0), 3.0, 15.0)
+
+    os.environ["RANKING_ENTRY_RUNTIME_BUDGET_SEC"] = str(runtime)
+    os.environ["RANKING_ENTRY_BUILD_TIMEOUT_SEC"] = str(build)
+    os.environ["RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC"] = str(controller)
     os.environ["RANKING_ENTRY_MAX_PENDING_PER_RUN"] = os.getenv("RANKING_ENTRY_FAST_MAX_PENDING_PER_RUN", "1")
-    os.environ.setdefault("RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC", "90")
-    os.environ.setdefault("RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC", "300")
-    os.environ.setdefault("SUMMARY_AI_ENTRY_CONTROLLER_LOCK_WAIT_SEC", "90")
+    os.environ["SUMMARY_AI_ENTRY_CONTROLLER_LOCK_WAIT_SEC"] = str(lock_wait)
     os.environ.setdefault("SUMMARY_AI_ENTRY_CONTROLLER_LOCK_POLL_SEC", "0.25")
+    os.environ.setdefault("RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC", "60")
+    os.environ.setdefault("RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC", "180")
+
     try:
         import trading.entry_exit.tasks as tasks
         tasks.RANKING_ENTRY_BUILD_TIMEOUT_SEC = float(os.environ["RANKING_ENTRY_BUILD_TIMEOUT_SEC"])
@@ -33,7 +58,7 @@ def _watch_loop() -> None:
             ok = _apply_once()
             if i in (0, 1, 5, 15, 30, 60, 120, 180, 239):
                 logger.warning(
-                    "[RANKING ENTRY FAST BUDGET OVERRIDE] enforce ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s summary_lock_wait=%s",
+                    "[RANKING ENTRY FAST BUDGET OVERRIDE] enforce ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s summary_lock_wait=%s cap=25/30/30",
                     ok,
                     os.environ.get("RANKING_ENTRY_RUNTIME_BUDGET_SEC"),
                     os.environ.get("RANKING_ENTRY_BUILD_TIMEOUT_SEC"),
@@ -56,7 +81,7 @@ def install() -> bool:
         threading.Thread(target=_watch_loop, name="ranking-entry-fast-budget-override", daemon=True).start()
         _INSTALLED = True
         logger.warning(
-            "[RANKING ENTRY FAST BUDGET OVERRIDE] installed v6 ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s summary_lock_wait=%s watcher=True",
+            "[RANKING ENTRY FAST BUDGET OVERRIDE] installed v7 ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s summary_lock_wait=%s watcher=True cap=25/30/30",
             ok,
             os.environ.get("RANKING_ENTRY_RUNTIME_BUDGET_SEC"),
             os.environ.get("RANKING_ENTRY_BUILD_TIMEOUT_SEC"),
