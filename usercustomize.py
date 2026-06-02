@@ -70,3 +70,4 @@ else:
     _install("RANKING_ENTRY_FINAL_BUDGET_CAP", "core.startup.ranking_entry_final_budget_cap_patch")
     _install("ENTRY_ORDER_SHORT_MTF_NEUTRAL_DIRECT", "core.startup.entry_order_short_mtf_neutral_direct_patch")
     _install("TONOSAMA_PRUNE_HARD_NG_PENDING", "core.startup.tonosama_prune_hard_ng_pending_patch")
+    _install("TONOSAMA_ORPHAN_CLEANUP", "core.startup.tonosama_orphan_thread_cleanup_patch")
