@@ -1,18 +1,18 @@
 # ============================================================
 # File   : core/startup/volatility_filter_tonosama_entryrow_rescue_patch.py
-# Version: V1.0-TONOSAMA-ENTRYROW-VOL-RESCUE
+# Version: V1.1-TONOSAMA-PENDINGROW-VOL-RESCUE
 # ------------------------------------------------------------
 # 目的:
-#   寄り直後は1m履歴が15本未満で volatility_filter.atr_1m_filter(entry_row)
-#   が fail-close し、TONOSAMA が board/credit/AI まで通った後に
-#   [VOL FILTER] ATR df fallback fail-close reason=1m本数不足 bars=0
+#   寄り直後は1m履歴が15本未満で volatility_filter.atr_1m_filter が
+#   fail-close し、TONOSAMA が board/credit/AI まで通った後に
+#   [VOL FILTER] ATR df fallback fail-close reason=1m本数不足 bars=xx
 #   で止まる。
 #
-# 方針:
-#   - TONOSAMA entry_row 呼び出しだけ救済
-#   - entry_row 自体の high-low / close または _intrabar_range_pct が十分なら許可
-#   - SUMMARY/RANKING の通常フィルタは維持
-#   - 既存の position/credit/board/final safety guard は維持
+# V1.1:
+#   - entry_row 直接呼び出しだけでなく、symbol/df 経由で呼ばれた場合も救済。
+#   - pending_entries から該当 symbol の TONOSAMA entry_row を取得し、
+#     high-low/close または _intrabar_range_pct が十分なら許可。
+#   - SUMMARY/RANKING の通常フィルタは維持。
 # ============================================================
 
 from __future__ import annotations
@@ -86,20 +86,12 @@ def _first(row: dict[str, Any], keys: tuple[str, ...], default: Any = None) -> A
     return default
 
 
-def _is_entry_row_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
-    if kwargs.get("df_1m") is not None or kwargs.get("df_5m") is not None or kwargs.get("symbol") is not None:
-        return False
-    if args and args[0] is not None:
-        return True
-    if kwargs.get("entry_row") is not None:
-        return True
-    return False
-
-
-def _entry_row_from_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
-    if args:
-        return args[0]
-    return kwargs.get("entry_row")
+def _norm_symbol(v: Any) -> str:
+    try:
+        s = str(v or "").strip()
+        return s[:-2] if s.endswith(".0") else s
+    except Exception:
+        return ""
 
 
 def _is_tonosama(row: dict[str, Any]) -> bool:
@@ -107,29 +99,87 @@ def _is_tonosama(row: dict[str, Any]) -> bool:
     return "TONOSAMA" in s
 
 
+def _extract_symbol(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
+    for key in ("symbol", "code", "stock_code"):
+        if kwargs.get(key) is not None:
+            return _norm_symbol(kwargs.get(key))
+    for obj in args:
+        if isinstance(obj, str) or isinstance(obj, int):
+            s = _norm_symbol(obj)
+            if s:
+                return s
+    row = _row_to_dict(args[0]) if args else _row_to_dict(kwargs.get("entry_row"))
+    return _norm_symbol(row.get("symbol") or row.get("Symbol"))
+
+
+def _entry_row_from_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    if kwargs.get("entry_row") is not None:
+        return kwargs.get("entry_row")
+    if args:
+        # DataFrameはentry_rowではないので除外
+        if isinstance(args[0], pd.DataFrame):
+            return None
+        return args[0]
+    return None
+
+
+def _pending_entry_for_symbol(symbol: str) -> dict[str, Any]:
+    sym = _norm_symbol(symbol)
+    if not sym:
+        return {}
+    try:
+        from global_state import global_data
+        root = getattr(global_data, "pending_entries", None)
+        if isinstance(root, dict):
+            bucket = root.get(sym) or root.get(str(sym))
+            entries = bucket if isinstance(bucket, (list, tuple, set)) else ([bucket] if bucket is not None else [])
+            for e in entries:
+                d = _row_to_dict(e)
+                if d and _is_tonosama(d):
+                    return d
+    except Exception:
+        pass
+    try:
+        import trading.entry.pending_manager as pm
+        iter_entries = getattr(pm, "iter_entries", None)
+        if callable(iter_entries):
+            for s, e in list(iter_entries()):
+                if _norm_symbol(s) == sym:
+                    d = _row_to_dict(e)
+                    if d and _is_tonosama(d):
+                        return d
+    except Exception:
+        pass
+    return {}
+
+
 def _entryrow_range_ratio(row: dict[str, Any]) -> tuple[float, dict[str, Any]]:
     close = _f(_first(row, ("close_price", "close", "price", "current_price"), 0.0), 0.0)
     high = _f(_first(row, ("high_price", "high", "High"), 0.0), 0.0)
     low = _f(_first(row, ("low_price", "low", "Low"), 0.0), 0.0)
-    intrabar_pct = _f(_first(row, ("_intrabar_range_pct", "intrabar_range_pct", "range_pct"), 0.0), 0.0)
+    intrabar_pct = _f(_first(row, ("_intrabar_range_pct", "intrabar_range_pct", "range_pct", "row_range_pct"), 0.0), 0.0)
     ratio_from_ohlc = ((high - low) / close) if high > 0 and low > 0 and close > 0 and high >= low else 0.0
     ratio_from_pct = intrabar_pct / 100.0 if intrabar_pct > 0 else 0.0
     ratio = max(ratio_from_ohlc, ratio_from_pct)
     return ratio, {"close": close, "high": high, "low": low, "intrabar_pct": intrabar_pct, "ratio": ratio}
 
 
-def _tonosama_vol_rescue(row_obj: Any, *, caller: str) -> tuple[bool, dict[str, Any]]:
+def _tonosama_vol_rescue(row_obj: Any, *, caller: str, symbol: str = "") -> tuple[bool, dict[str, Any]]:
     row = _row_to_dict(row_obj)
-    if not row or not _is_tonosama(row):
-        return False, {"reason": "not_tonosama"}
+    if not row and symbol:
+        row = _pending_entry_for_symbol(symbol)
+    if not row:
+        return False, {"reason": "row_missing", "symbol": symbol, "caller": caller}
+    if not _is_tonosama(row):
+        return False, {"reason": "not_tonosama", "symbol": symbol, "caller": caller, "source": row.get("source") or row.get("entry_type")}
+
     ratio, diag = _entryrow_range_ratio(row)
     min_ratio = _env_float("TONOSAMA_VOL_ENTRYROW_RESCUE_MIN_RANGE_RATIO", 0.006)
     min_pct = _env_float("TONOSAMA_VOL_ENTRYROW_RESCUE_MIN_INTRABAR_PCT", 0.6)
-    # ratioはhigh-low/close、intrabar_pctは%表記。どちらかを満たせば救済。
     ok = ratio >= min_ratio or _f(diag.get("intrabar_pct"), 0.0) >= min_pct
     diag.update({
         "caller": caller,
-        "symbol": row.get("symbol") or row.get("Symbol"),
+        "symbol": _norm_symbol(row.get("symbol") or row.get("Symbol") or symbol),
         "side": row.get("side"),
         "source": row.get("source") or row.get("entry_type"),
         "min_ratio": min_ratio,
@@ -140,21 +190,23 @@ def _tonosama_vol_rescue(row_obj: Any, *, caller: str) -> tuple[bool, dict[str, 
 
 
 def _patched_atr_1m_filter(*args, **kwargs):
-    if _is_entry_row_call(args, kwargs) and _env_bool("TONOSAMA_VOL_ENTRYROW_RESCUE_ENABLED", True):
+    if _env_bool("TONOSAMA_VOL_ENTRYROW_RESCUE_ENABLED", True):
         row_obj = _entry_row_from_call(args, kwargs)
-        ok, diag = _tonosama_vol_rescue(row_obj, caller="atr_1m_filter")
+        symbol = _extract_symbol(args, kwargs)
+        ok, diag = _tonosama_vol_rescue(row_obj, caller="atr_1m_filter", symbol=symbol)
         if ok:
-            logger.warning("[VOL FILTER TONOSAMA RESCUE] allow ATR by entry_row range diag=%s", diag)
+            logger.warning("[VOL FILTER TONOSAMA RESCUE] allow ATR by pending/entry_row range diag=%s", diag)
             return True
     return _ORIG_ATR(*args, **kwargs)  # type: ignore[misc]
 
 
 def _patched_range_5m_filter(*args, **kwargs):
-    if _is_entry_row_call(args, kwargs) and _env_bool("TONOSAMA_VOL_ENTRYROW_RESCUE_ENABLED", True):
+    if _env_bool("TONOSAMA_VOL_ENTRYROW_RESCUE_ENABLED", True):
         row_obj = _entry_row_from_call(args, kwargs)
-        ok, diag = _tonosama_vol_rescue(row_obj, caller="range_5m_filter")
+        symbol = _extract_symbol(args, kwargs)
+        ok, diag = _tonosama_vol_rescue(row_obj, caller="range_5m_filter", symbol=symbol)
         if ok:
-            logger.warning("[VOL FILTER TONOSAMA RESCUE] allow RANGE by entry_row range diag=%s", diag)
+            logger.warning("[VOL FILTER TONOSAMA RESCUE] allow RANGE by pending/entry_row range diag=%s", diag)
             return True
     return _ORIG_RANGE(*args, **kwargs)  # type: ignore[misc]
 
@@ -162,7 +214,6 @@ def _patched_range_5m_filter(*args, **kwargs):
 def _patch_entry_controller_refs(vf) -> None:
     try:
         import trading.handlers.entry_controller as ec
-        # entry_controller が from ... import atr_1m_filter している場合に備える。
         if hasattr(ec, "atr_1m_filter"):
             ec.atr_1m_filter = vf.atr_1m_filter
         if hasattr(ec, "range_5m_filter"):
@@ -182,21 +233,21 @@ def install() -> bool:
         if not callable(cur_atr) or not callable(cur_range):
             logger.warning("[VOL FILTER TONOSAMA RESCUE] target functions unavailable")
             return False
-        if getattr(cur_atr, "_tonosama_vol_rescue_v1", False):
+        if getattr(cur_atr, "_tonosama_vol_rescue_v11", False):
             _INSTALLED = True
             return True
         _ORIG_ATR = cur_atr
         _ORIG_RANGE = cur_range
-        _patched_atr_1m_filter._tonosama_vol_rescue_v1 = True  # type: ignore[attr-defined]
+        _patched_atr_1m_filter._tonosama_vol_rescue_v11 = True  # type: ignore[attr-defined]
         _patched_atr_1m_filter._original = cur_atr  # type: ignore[attr-defined]
-        _patched_range_5m_filter._tonosama_vol_rescue_v1 = True  # type: ignore[attr-defined]
+        _patched_range_5m_filter._tonosama_vol_rescue_v11 = True  # type: ignore[attr-defined]
         _patched_range_5m_filter._original = cur_range  # type: ignore[attr-defined]
         vf.atr_1m_filter = _patched_atr_1m_filter
         vf.range_5m_filter = _patched_range_5m_filter
         _patch_entry_controller_refs(vf)
         _INSTALLED = True
         logger.warning(
-            "[VOL FILTER TONOSAMA RESCUE] installed enabled=%s min_range_ratio=%.4f min_intrabar_pct=%.2f",
+            "[VOL FILTER TONOSAMA RESCUE] installed v1.1 enabled=%s min_range_ratio=%.4f min_intrabar_pct=%.2f symbol_df_rescue=True",
             _env_bool("TONOSAMA_VOL_ENTRYROW_RESCUE_ENABLED", True),
             _env_float("TONOSAMA_VOL_ENTRYROW_RESCUE_MIN_RANGE_RATIO", 0.006),
             _env_float("TONOSAMA_VOL_ENTRYROW_RESCUE_MIN_INTRABAR_PCT", 0.6),
