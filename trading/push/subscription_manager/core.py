@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/subscription_manager/core.py
-# Version: V3.3-PUSH-SUBSCRIPTION-CORE-ONOPEN-FORCE-CLEAR
+# Version: V3.4-SKIP-EMPTY-ROTATION-TARGET
 # ------------------------------------------------------------
 # Function:
 #   - subscription manager 公開API
@@ -13,10 +13,10 @@
 #   - 既に50銘柄が登録済みの状態で /register を追加実行すると
 #     Code=4002006 レジスト数エラー になることがある
 #
-# Fix V3.3:
-#   - reason=on_open / startup / reconnect 系は必ず clear_first=True
-#   - unregister_all → 0.5秒待機 → register 50銘柄
-#   - rotation OFF の memory-only main.py でも安全に再登録する
+# Fix V3.4:
+#   - rotation_A/B で target=0 の場合は unregister_all しない。
+#   - on_open で50銘柄を登録した直後に rotation_B empty が走り、
+#     50銘柄を全解除してしまう事故を防ぐ。
 # ============================================================
 
 from __future__ import annotations
@@ -133,7 +133,8 @@ def refresh_subscriptions(
 
     保証:
       - run_refresh_sequence() へ渡す target_symbols は最大50件
-      - on_open / startup / rotation は既存登録を全解除してから登録する
+      - on_open / startup は既存登録を全解除してから登録する
+      - rotation は target が空でなければ clear/register する
     """
 
     is_rotation = _is_rotation_reason(reason)
@@ -161,6 +162,18 @@ def refresh_subscriptions(
 
     with state.manager_lock:
         current_symbols = list(state.last_registered_symbols)
+
+    # 重要:
+    # rotation_B などで target=0 の時に unregister_all すると、
+    # 直前の on_open で登録した50銘柄を全解除してしまう。
+    # rotationの空ターゲットは「今回は交代先なし」として現状維持する。
+    if is_rotation and len(target_symbols) == 0 and len(current_symbols) > 0:
+        logger.warning(
+            "[SUB MANAGER CORE] skip empty rotation refresh keep current reason=%s current=%d target=0",
+            reason,
+            len(current_symbols),
+        )
+        return True
 
     vendor_safe_disable_unsubscribe = get_vendor_safe_disable_unsubscribe()
     auto_clear_on_target_change = get_auto_clear_on_target_change()
