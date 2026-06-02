@@ -1,15 +1,15 @@
 # ============================================================
 # File   : core/startup/tonosama_fresh_summary_wait_fix_patch.py
-# Version: v4-SKIP-WAIT-OUTSIDE-MARKET-SESSION
+# Version: v5-SKIP-LUNCH-REOPEN-STALE-SUMMARY
 # ------------------------------------------------------------
 # Purpose:
-#   Tonosama 起動前の fresh summary wait が昼休み/市場外でも15秒待ち、
-#   その後 Tonosama 本体で market closed skip になる無駄を防ぐ。
+#   Tonosama 起動前の fresh summary wait が昼休み/市場外でも15秒待つ問題と、
+#   12:30直後に11:30の古いsummaryを stale fail-open してしまう問題を防ぐ。
 #
 # Fix:
-#   - _wait_fresh_push_summary_before_tonosama() の先頭で市場時間を確認。
-#   - 09:00-11:30 / 12:30-15:30 以外は即 False を返す。
-#   - 市場内では従来どおり stale/empty fail-open を維持。
+#   - 09:00-11:30 / 12:30-15:30 以外は即 False。
+#   - 12:30:00〜12:33:00 の後場再開直後は、latest が12:30未満なら即 False。
+#   - 市場内かつ再開猶予外では従来どおり stale/empty fail-open を維持。
 # ============================================================
 from __future__ import annotations
 
@@ -47,8 +47,17 @@ def _env_float(name: str, default: float) -> float:
 def _is_market_session_now(now: dt.datetime | None = None) -> bool:
     now = now or dt.datetime.now()
     t = now.time()
-    # 東京市場: 09:00-11:30 / 12:30-15:30
     return (dt.time(9, 0) <= t <= dt.time(11, 30)) or (dt.time(12, 30) <= t <= dt.time(15, 30))
+
+
+def _is_lunch_reopen_grace(now: dt.datetime | None = None) -> bool:
+    now = now or dt.datetime.now()
+    grace_min = max(0.0, _env_float("TONOSAMA_LUNCH_REOPEN_STALE_SKIP_MIN", 3.0))
+    if grace_min <= 0:
+        return False
+    start = now.replace(hour=12, minute=30, second=0, microsecond=0)
+    end = start + dt.timedelta(minutes=grace_min)
+    return start <= now < end
 
 
 def _candidate_dfs() -> list[tuple[str, Any]]:
@@ -151,14 +160,23 @@ def _patched_latest_push_summary_age_sec():
     return best_age, best_dt, best_rows
 
 
+def _latest_is_before_lunch_reopen(latest: dt.datetime | None, now: dt.datetime | None = None) -> bool:
+    if latest is None:
+        return True
+    now = now or dt.datetime.now()
+    lunch_open = now.replace(hour=12, minute=30, second=0, microsecond=0)
+    return latest < lunch_open
+
+
 def _patched_wait_fresh_push_summary_before_tonosama() -> bool:
     if not _env_bool("TONOSAMA_WAIT_FRESH_PUSH_SUMMARY", True):
         return True
 
-    if _env_bool("TONOSAMA_SKIP_WAIT_OUTSIDE_MARKET_SESSION", True) and not _is_market_session_now():
+    now = dt.datetime.now()
+    if _env_bool("TONOSAMA_SKIP_WAIT_OUTSIDE_MARKET_SESSION", True) and not _is_market_session_now(now):
         logger.info(
             "[TONOSAMA ENTRY SCHEDULE] fresh push summary wait skipped outside market session now=%s patched=1",
-            dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            now.strftime("%Y-%m-%d %H:%M:%S"),
         )
         return False
 
@@ -175,6 +193,17 @@ def _patched_wait_fresh_push_summary_before_tonosama() -> bool:
     while True:
         age, latest, rows = _patched_latest_push_summary_age_sec()
         last_age, last_dt, last_rows = age, latest, rows
+
+        if _env_bool("TONOSAMA_SKIP_STALE_DURING_LUNCH_REOPEN", True) and _is_lunch_reopen_grace(now) and _latest_is_before_lunch_reopen(latest, now):
+            logger.warning(
+                "[TONOSAMA ENTRY SCHEDULE] fresh push summary skip lunch reopen stale latest=%s age=%s rows=%s grace_min=%.1f patched=1",
+                latest,
+                None if age is None else round(float(age), 1),
+                rows,
+                _env_float("TONOSAMA_LUNCH_REOPEN_STALE_SKIP_MIN", 3.0),
+            )
+            return False
+
         if age is not None and age <= max_age:
             logger.info(
                 "[TONOSAMA ENTRY SCHEDULE] fresh push summary ok latest=%s age=%.1fs rows=%s max_age=%.1fs patched=1",
@@ -231,11 +260,13 @@ def _apply() -> bool:
 
     try:
         cur = getattr(tasks, "_wait_fresh_push_summary_before_tonosama", None)
-        if getattr(cur, "_tonosama_fresh_summary_wait_fix_v4", False):
+        if getattr(cur, "_tonosama_fresh_summary_wait_fix_v5", False):
             _INSTALLED = True
             return True
+        _patched_latest_push_summary_age_sec._tonosama_fresh_summary_wait_fix_v5 = True  # type: ignore[attr-defined]
         _patched_latest_push_summary_age_sec._tonosama_fresh_summary_wait_fix_v4 = True  # type: ignore[attr-defined]
         _patched_latest_push_summary_age_sec._tonosama_fresh_summary_wait_fix_v3 = True  # type: ignore[attr-defined]
+        _patched_wait_fresh_push_summary_before_tonosama._tonosama_fresh_summary_wait_fix_v5 = True  # type: ignore[attr-defined]
         _patched_wait_fresh_push_summary_before_tonosama._tonosama_fresh_summary_wait_fix_v4 = True  # type: ignore[attr-defined]
         _patched_wait_fresh_push_summary_before_tonosama._tonosama_fresh_summary_wait_fix_v3 = True  # type: ignore[attr-defined]
         setattr(tasks, "_latest_push_summary_age_sec", _patched_latest_push_summary_age_sec)
@@ -243,12 +274,16 @@ def _apply() -> bool:
         os.environ.setdefault("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY", "1")
         os.environ.setdefault("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_STALE", "1")
         os.environ.setdefault("TONOSAMA_SKIP_WAIT_OUTSIDE_MARKET_SESSION", "1")
+        os.environ.setdefault("TONOSAMA_SKIP_STALE_DURING_LUNCH_REOPEN", "1")
+        os.environ.setdefault("TONOSAMA_LUNCH_REOPEN_STALE_SKIP_MIN", "3")
         _INSTALLED = True
         logger.warning(
-            "[TONOSAMA FRESH SUMMARY WAIT FIX] installed v4 patched latest+wait fail_open_empty=%s fail_open_stale=%s skip_wait_outside_session=%s",
+            "[TONOSAMA FRESH SUMMARY WAIT FIX] installed v5 patched latest+wait fail_open_empty=%s fail_open_stale=%s skip_wait_outside_session=%s skip_lunch_reopen_stale=%s grace_min=%s",
             os.environ.get("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY"),
             os.environ.get("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_STALE"),
             os.environ.get("TONOSAMA_SKIP_WAIT_OUTSIDE_MARKET_SESSION"),
+            os.environ.get("TONOSAMA_SKIP_STALE_DURING_LUNCH_REOPEN"),
+            os.environ.get("TONOSAMA_LUNCH_REOPEN_STALE_SKIP_MIN"),
         )
         return True
     except Exception:
