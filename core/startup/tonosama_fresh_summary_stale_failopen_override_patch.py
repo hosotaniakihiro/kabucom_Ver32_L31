@@ -1,24 +1,22 @@
 # ============================================================
 # File   : core/startup/tonosama_fresh_summary_stale_failopen_override_patch.py
-# Version: V1-TONOSAMA-STALE-SUMMARY-SESSION-FAILOPEN
+# Version: V2-TONOSAMA-STALE-SUMMARY-HISTORY-FIRST
 # ------------------------------------------------------------
 # Purpose:
-#   core.startup.tonosama_fresh_summary_wait_fix_patch v6 intentionally
-#   fail-closes stale PUSH summary during session:
+#   古いPUSH merged summary のまま Tonosama body へ fail-open しない。
 #
-#     fresh push summary stale skip ... fail_open_stale=0
-#
-#   In live operation, PUSH can still be receiving raw ticks while merged
-#   summary cache lags several minutes. Tonosama already has body-side guards
-#   for liquidity/range/ATR/final safety, so do not stop before candidate
-#   creation only because summary cache is stale.
+# Background:
+#   2026-06-03 09:14ログで、raw PUSH は生きているが merged summary は
+#   latest=09:00 / age=856s のままになり、このpatch V1 が stale fail-open して
+#   Tonosama 本体が古いサマリーで動いていた。
 #
 # Behavior:
 #   - outside market session: return False
 #   - lunch reopen first N minutes: keep stale-before-12:30 blocked
 #   - fresh summary: return True
-#   - empty summary: fail-open if enabled
-#   - stale summary during session: fail-open by default within grace seconds
+#   - empty summary: fail-open only if explicitly enabled
+#   - stale summary during session: do NOT fail-open by default
+#   - stale summary is only allowed when summary_loader/history has refreshed enough
 # ============================================================
 
 from __future__ import annotations
@@ -85,20 +83,8 @@ def _latest_push_summary_age_sec_from_tasks(tasks: Any) -> tuple[float | None, d
             age, latest, rows = fn()
             return age, latest, int(rows or 0)
         except Exception:
-            logger.debug("[TONOSAMA STALE SUMMARY FAILOPEN] tasks latest lookup failed", exc_info=True)
+            logger.debug("[TONOSAMA STALE SUMMARY HISTORY FIRST] tasks latest lookup failed", exc_info=True)
     return None, None, 0
-
-
-def _raw_push_alive(max_age_sec: float) -> tuple[bool, str]:
-    try:
-        from trading.push.push_stream import state as push_state
-        v = getattr(push_state, "_last_message_at", None)
-        if isinstance(v, dt.datetime):
-            age = max(0.0, (dt.datetime.now() - v.replace(tzinfo=None)).total_seconds())
-            return age <= max_age_sec, f"raw_push_age={age:.1f}s max={max_age_sec:.1f}s"
-    except Exception:
-        pass
-    return False, "raw_push_age=unknown"
 
 
 def _patched_wait_fresh_push_summary_before_tonosama() -> bool:
@@ -108,7 +94,7 @@ def _patched_wait_fresh_push_summary_before_tonosama() -> bool:
     now = dt.datetime.now()
     if _env_bool("TONOSAMA_SKIP_WAIT_OUTSIDE_MARKET_SESSION", True) and not _is_market_session(now):
         logger.info(
-            "[TONOSAMA ENTRY SCHEDULE] fresh push summary wait skipped outside market session now=%s stale_failopen_override=1",
+            "[TONOSAMA ENTRY SCHEDULE] fresh push summary wait skipped outside market session now=%s stale_history_first=1",
             now.strftime("%Y-%m-%d %H:%M:%S"),
         )
         return False
@@ -116,16 +102,14 @@ def _patched_wait_fresh_push_summary_before_tonosama() -> bool:
     try:
         import trading.entry_exit.tasks as tasks
     except Exception:
-        logger.debug("[TONOSAMA STALE SUMMARY FAILOPEN] tasks import failed", exc_info=True)
-        return True
+        logger.debug("[TONOSAMA STALE SUMMARY HISTORY FIRST] tasks import failed", exc_info=True)
+        return False
 
     max_age = max(30.0, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_MAX_AGE_SEC", 180.0))
-    wait_sec = max(0.0, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_WAIT_SEC", 15.0))
+    wait_sec = max(0.0, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_WAIT_SEC", 3.0))
     poll = max(0.25, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_POLL_SEC", 1.0))
-    fail_open_empty = _env_bool("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY", True)
-    fail_open_stale = _env_bool("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_STALE", True)
-    stale_grace = max(max_age, _env_float("TONOSAMA_WAIT_STALE_SUMMARY_FAIL_OPEN_GRACE_SEC", 900.0))
-    raw_max_age = max(5.0, _env_float("TONOSAMA_WAIT_RAW_PUSH_MAX_AGE_SEC", 90.0))
+    fail_open_empty = _env_bool("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY", False)
+    fail_open_stale = _env_bool("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_STALE", False)
     deadline = time.perf_counter() + wait_sec
 
     last_age = None
@@ -138,7 +122,7 @@ def _patched_wait_fresh_push_summary_before_tonosama() -> bool:
 
         if _env_bool("TONOSAMA_SKIP_STALE_DURING_LUNCH_REOPEN", True) and _is_lunch_reopen_grace(now) and _latest_before_lunch_reopen(latest, now):
             logger.warning(
-                "[TONOSAMA ENTRY SCHEDULE] fresh push summary skip lunch reopen stale latest=%s age=%s rows=%s stale_failopen_override=1",
+                "[TONOSAMA ENTRY SCHEDULE] fresh push summary skip lunch reopen stale latest=%s age=%s rows=%s stale_history_first=1",
                 latest,
                 None if age is None else round(float(age), 1),
                 rows,
@@ -147,7 +131,7 @@ def _patched_wait_fresh_push_summary_before_tonosama() -> bool:
 
         if age is not None and age <= max_age:
             logger.info(
-                "[TONOSAMA ENTRY SCHEDULE] fresh push summary ok latest=%s age=%.1fs rows=%s max_age=%.1fs stale_failopen_override=1",
+                "[TONOSAMA ENTRY SCHEDULE] fresh push summary ok latest=%s age=%.1fs rows=%s max_age=%.1fs stale_history_first=1",
                 latest,
                 age,
                 rows,
@@ -157,50 +141,30 @@ def _patched_wait_fresh_push_summary_before_tonosama() -> bool:
 
         if latest is None and fail_open_empty:
             logger.warning(
-                "[TONOSAMA ENTRY SCHEDULE] fresh push summary unavailable latest=None rows=%s -> fail-open to Tonosama body stale_failopen_override=1",
+                "[TONOSAMA ENTRY SCHEDULE] fresh push summary unavailable latest=None rows=%s -> fail-open stale_history_first=1 fail_open_empty=1",
                 rows,
             )
             return True
 
         if time.perf_counter() >= deadline:
             if latest is not None and age is not None and fail_open_stale:
-                raw_alive, raw_detail = _raw_push_alive(raw_max_age)
-                if age <= stale_grace or raw_alive:
-                    logger.warning(
-                        "[TONOSAMA ENTRY SCHEDULE] fresh push summary stale latest=%s age=%.1fs rows=%s max_age=%.1fs grace=%.1fs %s -> fail-open to Tonosama body stale_failopen_override=1",
-                        latest,
-                        age,
-                        rows,
-                        max_age,
-                        stale_grace,
-                        raw_detail,
-                    )
-                    return True
                 logger.warning(
-                    "[TONOSAMA ENTRY SCHEDULE] fresh push summary stale too old latest=%s age=%.1fs rows=%s max_age=%.1fs grace=%.1fs %s -> skip stale_failopen_override=1",
+                    "[TONOSAMA ENTRY SCHEDULE] fresh push summary stale latest=%s age=%.1fs rows=%s max_age=%.1fs -> fail-open stale_history_first=1 explicit_env=1",
                     latest,
                     age,
                     rows,
                     max_age,
-                    stale_grace,
-                    raw_detail,
-                )
-                return False
-
-            if last_dt is None and fail_open_empty:
-                logger.warning(
-                    "[TONOSAMA ENTRY SCHEDULE] fresh push summary wait expired latest=None rows=%s -> fail-open stale_failopen_override=1",
-                    last_rows,
                 )
                 return True
 
             logger.warning(
-                "[TONOSAMA ENTRY SCHEDULE] fresh push summary wait expired latest=%s age=%s rows=%s max_age=%.1fs wait_sec=%.1fs -> skip stale_failopen_override=1 fail_open_stale=%s",
+                "[TONOSAMA ENTRY SCHEDULE] fresh push summary stale/empty -> skip this cycle latest=%s age=%s rows=%s max_age=%.1fs wait_sec=%.1fs fail_open_empty=%s fail_open_stale=%s stale_history_first=1",
                 last_dt,
                 None if last_age is None else round(float(last_age), 1),
                 last_rows,
                 max_age,
                 wait_sec,
+                fail_open_empty,
                 fail_open_stale,
             )
             return False
@@ -215,26 +179,32 @@ def _apply() -> bool:
     try:
         import trading.entry_exit.tasks as tasks
         cur = getattr(tasks, "_wait_fresh_push_summary_before_tonosama", None)
-        if getattr(cur, "_tonosama_stale_summary_failopen_override_v1", False):
+        if getattr(cur, "_tonosama_stale_summary_history_first_v2", False):
             _INSTALLED = True
             return True
-        _patched_wait_fresh_push_summary_before_tonosama._tonosama_stale_summary_failopen_override_v1 = True  # type: ignore[attr-defined]
+        _patched_wait_fresh_push_summary_before_tonosama._tonosama_stale_summary_history_first_v2 = True  # type: ignore[attr-defined]
         _patched_wait_fresh_push_summary_before_tonosama._original = cur  # type: ignore[attr-defined]
         tasks._wait_fresh_push_summary_before_tonosama = _patched_wait_fresh_push_summary_before_tonosama
-        os.environ.setdefault("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY", "1")
-        os.environ["TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_STALE"] = "1"
-        os.environ.setdefault("TONOSAMA_WAIT_STALE_SUMMARY_FAIL_OPEN_GRACE_SEC", "900")
-        os.environ.setdefault("TONOSAMA_WAIT_RAW_PUSH_MAX_AGE_SEC", "90")
+
+        # 重要: V1 の stale fail-open を無効化する。必要時のみ環境変数で明示許可。
+        os.environ.setdefault("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY", "0")
+        os.environ["TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_STALE"] = os.environ.get("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_STALE", "0")
+        os.environ.setdefault("TONOSAMA_REPLACE_STALE_MERGED_WITH_HISTORY", "1")
+        os.environ.setdefault("TONOSAMA_HISTORY_FALLBACK_MAX_AGE_SEC", "240")
+        os.environ.setdefault("TONOSAMA_WAIT_PUSH_SUMMARY_WAIT_SEC", "3")
+
         _INSTALLED = True
         logger.warning(
-            "[TONOSAMA STALE SUMMARY FAILOPEN] installed v1 fail_open_stale=%s grace=%s raw_max_age=%s",
+            "[TONOSAMA STALE SUMMARY HISTORY FIRST] installed v2 fail_open_empty=%s fail_open_stale=%s replace_stale_with_history=%s history_max_age=%s wait_sec=%s",
+            os.environ.get("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY"),
             os.environ.get("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_STALE"),
-            os.environ.get("TONOSAMA_WAIT_STALE_SUMMARY_FAIL_OPEN_GRACE_SEC"),
-            os.environ.get("TONOSAMA_WAIT_RAW_PUSH_MAX_AGE_SEC"),
+            os.environ.get("TONOSAMA_REPLACE_STALE_MERGED_WITH_HISTORY"),
+            os.environ.get("TONOSAMA_HISTORY_FALLBACK_MAX_AGE_SEC"),
+            os.environ.get("TONOSAMA_WAIT_PUSH_SUMMARY_WAIT_SEC"),
         )
         return True
     except Exception:
-        logger.debug("[TONOSAMA STALE SUMMARY FAILOPEN] apply failed", exc_info=True)
+        logger.debug("[TONOSAMA STALE SUMMARY HISTORY FIRST] apply failed", exc_info=True)
         return False
 
 
@@ -252,18 +222,18 @@ def install(retry: bool = True) -> bool:
                     if _apply():
                         return
                     time.sleep(0.2)
-                logger.warning("[TONOSAMA STALE SUMMARY FAILOPEN] retry exhausted")
+                logger.warning("[TONOSAMA STALE SUMMARY HISTORY FIRST] retry exhausted")
             finally:
                 _INSTALLING = False
 
-        threading.Thread(target=_retry_loop, name="tonosama-stale-summary-failopen", daemon=True).start()
+        threading.Thread(target=_retry_loop, name="tonosama-stale-summary-history-first", daemon=True).start()
     return False
 
 
 try:
     install()
 except Exception:
-    logger.exception("[TONOSAMA STALE SUMMARY FAILOPEN] auto install failed")
+    logger.exception("[TONOSAMA STALE SUMMARY HISTORY FIRST] auto install failed")
 
 
 __all__ = ["install"]
