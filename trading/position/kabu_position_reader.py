@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/position/kabu_position_reader.py
-# Version: V1.3-KABU-CREDIT-POSITION-READER-QTY-PARSE-SAFE
+# Version: V1.4-KABU-CREDIT-POSITION-READER-ROBUST-QTY
 # ------------------------------------------------------------
 # kabu Station の建玉一覧から「信用建玉だけ」を読み、
 # symbol -> position dict に正規化する。
@@ -10,10 +10,10 @@
 #   product=2 を優先して信用建玉だけ取得する。
 #   API正常応答0件とAPI失敗を区別するため LAST_READ_OK を公開する。
 #
-# V1.3 修正:
-#   - LeavesQty が 0 でも HoldQty / Qty / RepayableQty 等に数量があるケースを拾う
-#   - 数量/価格は「最初の非空値」ではなく「最初の正の値」を優先する
-#   - skipped_qty / skipped_price / sample_keys を status に出し、brokerパース失敗を上位で判定可能にする
+# V1.4:
+#   - 数量/価格パースを強化。カンマ、全角数字、空白、文字混在を吸収。
+#   - HoldQty/LeavesQty が文字列 "1,000" 等の場合に 0 扱いされる問題を防ぐ。
+#   - 全信用候補が skipped_qty の場合に qty_samples を status/log へ出す。
 # ============================================================
 
 from __future__ import annotations
@@ -21,8 +21,10 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import re
 import urllib.parse
 import urllib.request
+import unicodedata
 from typing import Any, Dict, Iterable, Sequence
 
 logger = logging.getLogger(__name__)
@@ -35,55 +37,24 @@ LAST_SKIPPED_CASH: int = 0
 LAST_SKIPPED_QTY: int = 0
 LAST_SKIPPED_PRICE: int = 0
 LAST_SAMPLE_KEYS: list[str] = []
+LAST_QTY_SAMPLES: list[dict] = []
 LAST_ERROR: str = ""
 LAST_READ_AT: dt.datetime | None = None
 
 
 QTY_KEYS: tuple[str, ...] = (
-    "LeavesQty",
-    "HoldQty",
-    "Qty",
-    "Quantity",
-    "CurrentQty",
-    "PositionQty",
-    "OpenQty",
-    "RepayableQty",
-    "SettlementQty",
-    "BalanceQty",
-    "possess_qty",
-    "hold_qty",
-    "leaves_qty",
-    "qty",
-    "quantity",
-    "current_qty",
-    "position_qty",
-    "open_qty",
-    "repayable_qty",
-    "balance_qty",
+    "LeavesQty", "HoldQty", "Qty", "Quantity", "CurrentQty", "PositionQty", "OpenQty",
+    "RepayableQty", "SettlementQty", "BalanceQty", "possess_qty", "hold_qty", "leaves_qty",
+    "qty", "quantity", "current_qty", "position_qty", "open_qty", "repayable_qty", "balance_qty",
 )
 
 AVG_PRICE_KEYS: tuple[str, ...] = (
-    "Price",
-    "AvgPrice",
-    "AveragePrice",
-    "ExecutionPrice",
-    "EntryPrice",
-    "HoldPrice",
-    "avg_price",
-    "average_price",
-    "execution_price",
-    "entry_price",
-    "hold_price",
+    "Price", "AvgPrice", "AveragePrice", "ExecutionPrice", "EntryPrice", "HoldPrice",
+    "avg_price", "average_price", "execution_price", "entry_price", "hold_price",
 )
 
 CURRENT_PRICE_KEYS: tuple[str, ...] = (
-    "CurrentPrice",
-    "ValuationPrice",
-    "MarketPrice",
-    "price",
-    "current_price",
-    "valuation_price",
-    "market_price",
+    "CurrentPrice", "ValuationPrice", "MarketPrice", "price", "current_price", "valuation_price", "market_price",
 )
 
 
@@ -99,29 +70,45 @@ def _normalize_symbol(v: Any) -> str:
         return ""
 
 
+def _number_text(v: Any) -> str:
+    try:
+        if v is None:
+            return ""
+        s = unicodedata.normalize("NFKC", str(v)).strip()
+        s = s.replace(",", "").replace("株", "").replace("円", "")
+        s = s.replace("＋", "+").replace("−", "-").replace("－", "-")
+        # "100株(内...)" のような文字混在を救う。
+        m = re.search(r"[-+]?\d+(?:\.\d+)?", s)
+        return m.group(0) if m else ""
+    except Exception:
+        return ""
+
+
 def _safe_int(v: Any, default: int = 0) -> int:
     try:
-        if v is None or v == "":
+        s = _number_text(v)
+        if not s:
             return int(default)
-        return int(float(v))
+        return int(float(s))
     except Exception:
         return int(default)
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
-        if v is None or v == "":
+        s = _number_text(v)
+        if not s:
             return float(default)
-        return float(v)
+        return float(s)
     except Exception:
         return float(default)
 
 
 def _side(v: Any) -> str:
     s = str(v or "").strip().upper()
-    if s in {"2", "BUY", "LONG", "信用買", "現物買", "BUY_CREDIT"}:
+    if s in {"2", "02", "20", "BUY", "LONG", "B", "信用買", "買", "買建", "現物買", "BUY_CREDIT"}:
         return "BUY"
-    if s in {"1", "SELL", "SHORT", "信用売", "現物売", "SELL_CREDIT"}:
+    if s in {"1", "01", "10", "SELL", "SHORT", "S", "信用売", "売", "売建", "現物売", "SELL_CREDIT"}:
         return "SELL"
     return s
 
@@ -137,7 +124,6 @@ def _pick(d: dict, *keys: str, default: Any = None) -> Any:
 
 
 def _iter_key_values(d: Any) -> Iterable[tuple[str, Any]]:
-    """dict/list を浅すぎず辿り、kabu応答の大小文字違い・入れ子を吸収する。"""
     if isinstance(d, dict):
         for k, v in d.items():
             yield str(k), v
@@ -149,18 +135,26 @@ def _iter_key_values(d: Any) -> Iterable[tuple[str, Any]]:
                 yield from _iter_key_values(x)
 
 
+def _qty_debug_sample(d: dict) -> dict:
+    out = {}
+    wanted = {str(k).lower() for k in QTY_KEYS}
+    for k, v in _iter_key_values(d):
+        if str(k).lower() in wanted:
+            out[str(k)] = v
+    return out
+
+
 def _pick_positive_int(d: dict, keys: Sequence[str], default: int = 0) -> int:
     wanted = {str(k).lower() for k in keys}
-    candidates: list[tuple[str, int]] = []
+    best = 0
     for k, v in _iter_key_values(d):
         if str(k).lower() not in wanted:
             continue
         n = _safe_int(v, 0)
-        candidates.append((k, n))
         if n > 0:
             return n
-    # 正の値がなければ0。LeavesQty=0だけでHoldQtyを見落とさないことが重要。
-    return int(default)
+        best = max(best, n)
+    return int(default if best <= 0 else best)
 
 
 def _pick_positive_float(d: dict, keys: Sequence[str], default: float = 0.0) -> float:
@@ -177,7 +171,6 @@ def _pick_positive_float(d: dict, keys: Sequence[str], default: float = 0.0) -> 
 def _resolve_base_and_token() -> tuple[str, str]:
     try:
         from trading.push.subscription_manager.register_ops import _resolve_api_key, _resolve_base_url
-
         base = str(_resolve_base_url() or "").strip().rstrip("/")
         token = str(_resolve_api_key() or "").strip()
         return base, token
@@ -208,13 +201,10 @@ def _fetch_positions_payload(*, product: int = 2) -> Any:
     base, token = _resolve_base_and_token()
     if not base or not token:
         raise RuntimeError("base/token unavailable")
-
-    # product=2: 信用。現物はEXIT監視しないため product=0 は使わない。
     url = base.rstrip("/") + "/positions?" + urllib.parse.urlencode({"product": int(product)})
     req = urllib.request.Request(url, method="GET")
     req.add_header("Content-Type", "application/json")
     req.add_header("X-API-KEY", token)
-
     with urllib.request.urlopen(req, timeout=3.0) as res:
         raw = res.read()
         if not raw:
@@ -223,39 +213,27 @@ def _fetch_positions_payload(*, product: int = 2) -> Any:
 
 
 def _is_credit_position(x: dict) -> bool:
-    """現物をEXIT監視から除外し、信用建玉だけ通す。"""
     margin_trade_type = _pick(x, "MarginTradeType", "margin_trade_type")
     account_type = _pick(x, "AccountType", "account_type")
     product = _pick(x, "Product", "product")
-
     mt = str(margin_trade_type or "").strip()
     at = str(account_type or "").strip()
     pr = str(product or "").strip()
-
-    # product=2 は信用。APIレスポンスにProductが入っている場合はこれを最優先。
     if pr and pr not in {"2", "信用", "MARGIN", "margin"}:
         return False
-
-    # 現物を示す値は除外。
     joined = f"{mt} {at} {pr}".upper()
     if any(x in joined for x in ["CASH", "現物", "GENBUTSU", "PRODUCT=1"]):
         return False
-
-    # product=2 で取得しており、Productにも2が入っているなら信用として扱う。
-    # 一部レスポンスでは MarginTradeType が空のことがあるため、ここで落としすぎない。
     if pr == "2":
         return True
-
-    # MarginTradeType が入っているなら信用。
     if mt:
         return True
-
     return False
 
 
 def read_kabu_open_positions() -> Dict[str, Dict[str, Any]]:
     global LAST_READ_OK, LAST_RAW_COUNT, LAST_CREDIT_CANDIDATE_COUNT, LAST_CREDIT_OPEN_COUNT
-    global LAST_SKIPPED_CASH, LAST_SKIPPED_QTY, LAST_SKIPPED_PRICE, LAST_SAMPLE_KEYS
+    global LAST_SKIPPED_CASH, LAST_SKIPPED_QTY, LAST_SKIPPED_PRICE, LAST_SAMPLE_KEYS, LAST_QTY_SAMPLES
     global LAST_ERROR, LAST_READ_AT
 
     LAST_READ_AT = dt.datetime.now()
@@ -267,6 +245,7 @@ def read_kabu_open_positions() -> Dict[str, Dict[str, Any]]:
     LAST_SKIPPED_QTY = 0
     LAST_SKIPPED_PRICE = 0
     LAST_SAMPLE_KEYS = []
+    LAST_QTY_SAMPLES = []
     LAST_ERROR = ""
 
     try:
@@ -278,11 +257,7 @@ def read_kabu_open_positions() -> Dict[str, Dict[str, Any]]:
         return {}
 
     out: Dict[str, Dict[str, Any]] = {}
-    raw_count = 0
-    skipped_cash = 0
-    skipped_qty = 0
-    skipped_price = 0
-    credit_candidate_count = 0
+    raw_count = skipped_cash = skipped_qty = skipped_price = credit_candidate_count = 0
 
     for x in _iter_items(payload):
         raw_count += 1
@@ -297,7 +272,6 @@ def read_kabu_open_positions() -> Dict[str, Dict[str, Any]]:
             continue
 
         credit_candidate_count += 1
-
         symbol = _normalize_symbol(_pick(x, "Symbol", "symbol", "Code", "code"))
         if not symbol:
             continue
@@ -305,6 +279,8 @@ def read_kabu_open_positions() -> Dict[str, Dict[str, Any]]:
         qty = _pick_positive_int(x, QTY_KEYS, 0)
         if qty <= 0:
             skipped_qty += 1
+            if len(LAST_QTY_SAMPLES) < 5:
+                LAST_QTY_SAMPLES.append({"symbol": symbol, "side": _pick(x, "Side", "side"), "qty_values": _qty_debug_sample(x)})
             continue
 
         avg_price = _pick_positive_float(x, AVG_PRICE_KEYS, 0.0)
@@ -342,16 +318,9 @@ def read_kabu_open_positions() -> Dict[str, Dict[str, Any]]:
     LAST_SKIPPED_PRICE = skipped_price
 
     logger.warning(
-        "[KABU POSITION READER] scan product=2 read_ok=%s raw=%d credit_candidates=%d credit_open=%d skipped_cash=%d skipped_qty=%d skipped_price=%d sample_keys=%s symbols=%s",
-        LAST_READ_OK,
-        raw_count,
-        credit_candidate_count,
-        len(out),
-        skipped_cash,
-        skipped_qty,
-        skipped_price,
-        LAST_SAMPLE_KEYS,
-        sorted(out.keys()),
+        "[KABU POSITION READER] scan product=2 read_ok=%s raw=%d credit_candidates=%d credit_open=%d skipped_cash=%d skipped_qty=%d skipped_price=%d sample_keys=%s qty_samples=%s symbols=%s",
+        LAST_READ_OK, raw_count, credit_candidate_count, len(out), skipped_cash, skipped_qty, skipped_price,
+        LAST_SAMPLE_KEYS, LAST_QTY_SAMPLES, sorted(out.keys()),
     )
     return out
 
@@ -366,6 +335,7 @@ def get_last_read_status() -> dict:
         "skipped_qty": int(LAST_SKIPPED_QTY or 0),
         "skipped_price": int(LAST_SKIPPED_PRICE or 0),
         "sample_keys": list(LAST_SAMPLE_KEYS or []),
+        "qty_samples": list(LAST_QTY_SAMPLES or []),
         "error": str(LAST_ERROR or ""),
         "read_at": LAST_READ_AT,
     }
