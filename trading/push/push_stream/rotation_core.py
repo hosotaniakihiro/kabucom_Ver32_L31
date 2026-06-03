@@ -1,23 +1,13 @@
 # ============================================================
 # File   : trading/push/push_stream/rotation_core.py
-# Version: PRODUCTION-STABLE-REV2-PUSH-ROTATION-PROTECTED-BOTH-SIDES
+# Version: PRODUCTION-STABLE-REV3-PUSH-ROTATION-WAIT-WS-READY
 # ------------------------------------------------------------
-# PUSH A/B 50銘柄ローテーションの制御本体。
+# PUSH A/B ローテーションの制御本体。
 #
-# Default flow:
-#   A面50銘柄登録 -> 4.8秒維持 -> 全解除 -> 0.2秒待機 ->
-#   B面50銘柄登録 -> 4.8秒維持 -> 全解除 -> 0.2秒待機 -> 繰り返し
-#
-# Ver2:
-#   - 保有中 / 未約定 / 直近ENTRY候補の protected symbols を
-#     A面/B面の両方へ入れる。
-#   - これにより、売買中銘柄がB面中にPUSH未登録になる問題を減らす。
-#
-# Notes:
-#   - 銘柄解決は rotation_symbols.py に委譲
-#   - 登録処理は rotation_register.py に委譲
-#   - ログ処理は rotation_logging.py に委譲
-#   - 旧 rotation.py は互換APIとして残す
+# Fix REV3:
+#   - WS未接続のままHTTP refresh/registerを投げない。
+#   - register失敗時に30秒holdせず、短い待機で次回リトライする。
+#   - WinError 10054後の再接続中に「未登録状態でhold」する時間を減らす。
 # ============================================================
 
 from __future__ import annotations
@@ -32,7 +22,6 @@ from .rotation_settings import (
     DEFAULT_REGISTER_CHUNK_SIZE,
     REGISTER_TIMEOUT_SEC,
     ROTATE_HOLD_SEC,
-    UNREGISTER_TO_REGISTER_WAIT_SEC,
     WS_WAIT_LOG_INTERVAL_SEC,
 )
 from .rotation_symbols import resolve_register_targets
@@ -45,7 +34,7 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
-VERSION = "PRODUCTION-STABLE-REV2-PUSH-ROTATION-PROTECTED-BOTH-SIDES"
+VERSION = "PRODUCTION-STABLE-REV3-PUSH-ROTATION-WAIT-WS-READY"
 
 
 def enable_rotation(enabled: bool = True) -> None:
@@ -90,13 +79,6 @@ def _resolve_protected_safe() -> list[str]:
 def _build_protected_rotation_batches(targets: list[str]) -> tuple[list[str], list[str], list[str]]:
     """
     A/B両面に protected symbols を入れる。
-
-    例:
-      protected=8銘柄, chunk=50 の場合
-        A = protected 8 + normal 42
-        B = protected 8 + normal 次42
-
-    これにより、保有中/未約定銘柄はA面でもB面でも登録される。
     """
     targets = _dedupe([str(x).strip().upper() for x in targets])
     protected = _resolve_protected_safe()
@@ -106,7 +88,6 @@ def _build_protected_rotation_batches(targets: list[str]) -> tuple[list[str], li
         second = targets[DEFAULT_REGISTER_CHUNK_SIZE:DEFAULT_REGISTER_CHUNK_SIZE * 2]
         return first, second, []
 
-    # protected は両面へ入れる。通常枠からは除外して重複を避ける。
     protected = protected[:max(0, DEFAULT_REGISTER_CHUNK_SIZE)]
     protected_set = set(protected)
     normal = [x for x in targets if x not in protected_set]
@@ -115,7 +96,6 @@ def _build_protected_rotation_batches(targets: list[str]) -> tuple[list[str], li
     first = _dedupe(protected + normal[:normal_slots])
     second = _dedupe(protected + normal[normal_slots:normal_slots * 2])
 
-    # B側がprotectedだけになるケースでも、保護目的なので登録する。
     first = first[:DEFAULT_REGISTER_CHUNK_SIZE]
     second = second[:DEFAULT_REGISTER_CHUNK_SIZE]
 
@@ -143,8 +123,7 @@ def _log_ws_not_ready_if_needed(
 
     if ws_wait_count == 1 or now_ts - last_ws_wait_log_ts >= WS_WAIT_LOG_INTERVAL_SEC:
         logger.warning(
-            "[push_stream] rotation ws_not_ready but continue HTTP refresh "
-            "connected_event=%s ws_alive=%s refresh_callable=%s sender_callable=%s wait_count=%d",
+            "[push_stream] rotation waiting ws_not_ready connected_event=%s ws_alive=%s refresh_callable=%s sender_callable=%s wait_count=%d",
             connected,
             ws_alive,
             callable(state._refresh_callable),
@@ -156,14 +135,14 @@ def _log_ws_not_ready_if_needed(
     return last_ws_wait_log_ts
 
 
-def _run_rotation_side(*, label: str, symbols: list[str]) -> None:
-    """A面/B面の片側を登録し、指定秒数だけ維持する。"""
+def _run_rotation_side(*, label: str, symbols: list[str]) -> bool:
+    """A面/B面の片側を登録し、登録成功時だけ指定秒数維持する。"""
     if state._stop_event.is_set():
-        return
+        return False
 
     if not symbols:
         logger.warning("[push_stream] rotation %s skipped: empty symbols", label)
-        return
+        return False
 
     reason = f"rotation_{label}"
     log_register_targets_with_names(symbols, label=label, reason=reason)
@@ -174,6 +153,15 @@ def _run_rotation_side(*, label: str, symbols: list[str]) -> None:
         timeout_sec=REGISTER_TIMEOUT_SEC,
     )
 
+    if not ok:
+        logger.warning(
+            "[push_stream] rotation %s register failed -> short retry wait instead of hold size=%d",
+            label,
+            len(symbols),
+        )
+        _sleep_or_stop(2.0)
+        return False
+
     logger.info(
         "[push_stream] rotation %s hold start ok=%s hold=%.3fs size=%d",
         label,
@@ -183,21 +171,17 @@ def _run_rotation_side(*, label: str, symbols: list[str]) -> None:
     )
 
     _sleep_or_stop(ROTATE_HOLD_SEC)
+    return True
 
 
 def _rotation_worker() -> None:
     """
-    A/B 50銘柄を 4.8秒登録維持 + 0.2秒解除待機 でローテーションする。
-
-    実際の全解除 + 0.2秒待機 + 登録は run_one_batch_with_timeout()
-    -> rotation_register.py -> 旧 rotation.register_symbols()
-    -> subscription_manager.refresh_subscriptions(clear_first=True) で行う。
+    A/Bをローテーションする。REV3ではWS未接続中は登録を投げず待つ。
     """
     logger.info(
-        "[push_stream] rotation worker started version=%s hold=%.3fs unregister_wait=%.3fs register_timeout=%.3fs",
+        "[push_stream] rotation worker started version=%s hold=%.3fs register_timeout=%.3fs",
         VERSION,
         ROTATE_HOLD_SEC,
-        UNREGISTER_TO_REGISTER_WAIT_SEC,
         REGISTER_TIMEOUT_SEC,
     )
 
@@ -220,17 +204,17 @@ def _rotation_worker() -> None:
                     ws_wait_count=ws_wait_count,
                     last_ws_wait_log_ts=last_ws_wait_log_ts,
                 )
-            else:
-                ws_wait_count = 0
+                _sleep_or_stop(2.0)
+                continue
 
+            ws_wait_count = 0
             targets = resolve_register_targets()
 
             if not targets:
                 empty_count += 1
                 if empty_count == 1 or empty_count % 15 == 0:
                     logger.warning(
-                        "[push_stream] rotation waiting: no real targets empty_count=%d "
-                        "hint=check runtime/global_data/active_symbol_manager/liquidity_guard and upstream candidates",
+                        "[push_stream] rotation waiting: no real targets empty_count=%d hint=check runtime/global_data/active_symbol_manager/liquidity_guard and upstream candidates",
                         empty_count,
                     )
                 time.sleep(2.0)
@@ -249,7 +233,7 @@ def _rotation_worker() -> None:
                 first[:10],
                 second[:10],
                 callable(state._refresh_callable),
-                bool(connected and ws_alive),
+                True,
             )
 
             _run_rotation_side(label="A", symbols=list(first))
@@ -257,6 +241,11 @@ def _rotation_worker() -> None:
                 break
 
             if second:
+                # B面開始前にもWS状態を再確認する。
+                if not state._connected_event.is_set() or not _is_ws_alive():
+                    logger.warning("[push_stream] rotation B skipped because ws became not ready")
+                    _sleep_or_stop(2.0)
+                    continue
                 _run_rotation_side(label="B", symbols=list(second))
             else:
                 logger.warning(
