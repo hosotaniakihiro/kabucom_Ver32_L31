@@ -1,10 +1,33 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Iterable, List
 
 logger = logging.getLogger(__name__)
 _INSTALLED = False
+_LAST_GOOD_REGISTER_SYMBOLS: list[str] = []
+_LAST_GOOD_TS: float = 0.0
+
+
+def _is_push_register_context(context: str) -> bool:
+    text = str(context or "").lower()
+    return "push" in text or "rotation" in text or "register" in text
+
+
+def _remember_good(symbols: list[str], *, context: str) -> None:
+    global _LAST_GOOD_REGISTER_SYMBOLS, _LAST_GOOD_TS
+    if symbols and _is_push_register_context(context):
+        _LAST_GOOD_REGISTER_SYMBOLS = list(symbols)
+        _LAST_GOOD_TS = time.time()
+
+
+def _last_good(max_age_sec: float = 900.0) -> list[str]:
+    if not _LAST_GOOD_REGISTER_SYMBOLS:
+        return []
+    if (time.time() - _LAST_GOOD_TS) > max_age_sec:
+        return []
+    return list(_LAST_GOOD_REGISTER_SYMBOLS)
 
 
 def install() -> bool:
@@ -17,7 +40,24 @@ def install() -> bool:
 
         def _filter_symbols_failopen_empty(symbols: Iterable[Any], *, context: str) -> List[str]:
             items = mod._dedupe(symbols)
+            max_last_good_age = mod._env_float("WATCHLIST_LIQ_EMPTY_LAST_GOOD_SEC", 900.0)
+
             if not mod._env_bool("WATCHLIST_RECENT_LIQ_ENABLED", True):
+                _remember_good(items, context=context)
+                return items
+
+            if not items and _is_push_register_context(context):
+                fallback = _last_good(max_last_good_age)
+                if fallback:
+                    logger.warning(
+                        "[WATCHLIST LIQ EMPTY FAILOPEN] fail-open context=%s count=0 reason=empty_input_last_good fallback=%s age_sec=%.1f",
+                        context, len(fallback), time.time() - _LAST_GOOD_TS,
+                    )
+                    return fallback
+                logger.warning(
+                    "[WATCHLIST LIQ EMPTY FAILOPEN] empty input context=%s no last_good available -> keep empty",
+                    context,
+                )
                 return items
 
             protected = mod._protected_symbols()
@@ -27,12 +67,14 @@ def install() -> bool:
 
             if timed_out and mod._env_bool("WATCHLIST_RECENT_LIQ_FAIL_OPEN_ON_TIMEOUT", True):
                 logger.warning("[WATCHLIST LIQ EMPTY FAILOPEN] fail-open context=%s count=%s reason=timeout_or_main_skip", context, len(items))
+                _remember_good(items, context=context)
                 return items
 
             if check_items and not stats_map:
                 # PUSH登録でここを空にするとWebSocket登録が0件になり受信が止まる。
                 # 起動直後・サマリー未作成・DB更新遅延は監視銘柄を落とさず通す。
                 logger.warning("[WATCHLIST LIQ EMPTY FAILOPEN] fail-open context=%s count=%s reason=no_recent_summary_hit protected=%s", context, len(items), len(protected_items))
+                _remember_good(items, context=context)
                 return items
 
             kept: List[str] = []
@@ -61,17 +103,20 @@ def install() -> bool:
 
             if not kept and items:
                 logger.warning("[WATCHLIST LIQ EMPTY FAILOPEN] fail-open context=%s count=%s reason=all_filtered", context, len(items))
+                _remember_good(items, context=context)
                 return items
 
             if skipped:
                 logger.warning("[WATCHLIST LIQ EMPTY FAILOPEN] filtered context=%s before=%s after=%s protected=%s skipped=%s", context, len(items), len(kept), len(protected_items), skipped[:80])
             else:
                 logger.info("[WATCHLIST LIQ EMPTY FAILOPEN] passed context=%s count=%s protected=%s", context, len(kept), len(protected_items))
+
+            _remember_good(kept, context=context)
             return kept
 
         mod._filter_symbols = _filter_symbols_failopen_empty
         _INSTALLED = True
-        logger.warning("[WATCHLIST LIQ EMPTY FAILOPEN] installed V1")
+        logger.warning("[WATCHLIST LIQ EMPTY FAILOPEN] installed V2 last_good_empty_input=1")
         return True
     except Exception:
         logger.exception("[WATCHLIST LIQ EMPTY FAILOPEN] install failed")
