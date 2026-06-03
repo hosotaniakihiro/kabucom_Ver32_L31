@@ -1,17 +1,19 @@
 # ============================================================
 # File   : core/startup/entry_controller_pipeline_lock_wait_patch.py
-# Version: V3-LOCK-WAIT-LOG-SKIP-FINAL-GUARD
+# Version: V4-SUMMARY-AI-LOCK-WAIT-RETRYABLE
 # ------------------------------------------------------------
 # 目的:
 #   entry_controller.run_entry_pipeline() は内部で _pipeline_lock を
 #   blocking=False で取得するため、別 pipeline 実行中に dispatch されると
 #   "ENTRY PIPELINE already running → skip" で即終了する。
 #
-# V3:
-#   - _ORIGINAL_RUN 実行直前に entry_controller._log_skip を安全版へ差し替える。
-#   - 後段 runtime patch が _log_skip(symbol, reason, **detail) 形式で上書きし、
-#     detail に reason キーがあると TypeError になる問題をここで最終防御する。
-#   - patched run 失敗時に同じ original を再実行して同じ例外を二重発生させない。
+# V4:
+#   - lock wait 対象に SUMMARY を追加。
+#   - Summary AI が approved / pending 登録済みなのに controller lock timeout で
+#     注文まで進まないケースを retryable として返す。
+#   - 待機時間の既定を 75秒へ延長。Tonosama / Ranking が重い場面でも
+#     Summary AI の pending をすぐ捨てない。
+#   - _log_skip(symbol, reason, **detail) の reason キー衝突防御は維持。
 # ============================================================
 
 from __future__ import annotations
@@ -127,13 +129,18 @@ def _wait_enabled_for_source(source: str) -> bool:
         return False
     if not _env_bool("ENTRY_CONTROLLER_LOCK_WAIT_ENABLED", True):
         return False
-    return source_u in _env_list("ENTRY_CONTROLLER_LOCK_WAIT_SOURCES", "RANKING,TONOSAMA")
+    return source_u in _env_list("ENTRY_CONTROLLER_LOCK_WAIT_SOURCES", "RANKING,TONOSAMA,SUMMARY")
 
 
-def _timeout_sec() -> float:
+def _timeout_sec(source: str = "") -> float:
+    source_u = _normalize_source(source)
+    if source_u == "SUMMARY":
+        if os.getenv("ENTRY_CONTROLLER_SUMMARY_LOCK_WAIT_SEC") is not None:
+            return max(0.0, _env_float("ENTRY_CONTROLLER_SUMMARY_LOCK_WAIT_SEC", 75.0))
+        return max(0.0, _env_float("ENTRY_CONTROLLER_LOCK_WAIT_SEC", 75.0))
     if os.getenv("ENTRY_CONTROLLER_LOCK_WAIT_SEC") is not None:
-        return max(0.0, _env_float("ENTRY_CONTROLLER_LOCK_WAIT_SEC", 45.0))
-    return max(0.0, _env_float("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_SEC", 45.0))
+        return max(0.0, _env_float("ENTRY_CONTROLLER_LOCK_WAIT_SEC", 75.0))
+    return max(0.0, _env_float("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_SEC", 75.0))
 
 
 def _poll_sec() -> float:
@@ -147,7 +154,6 @@ def _safe_log_skip(symbol: Any, skip_reason: Any = None, *args, **kwargs):
     try:
         if "reason" in kwargs:
             kwargs.setdefault("detail_reason", kwargs.pop("reason"))
-        # args が残っている場合でも落とさないよう detail に退避。
         if args:
             kwargs.setdefault("extra_args", args)
         try:
@@ -166,10 +172,11 @@ def _install_log_skip_final_guard() -> bool:
     try:
         import trading.handlers.entry_controller as ec
         cur = getattr(ec, "_log_skip", None)
-        if getattr(cur, "_entry_log_skip_final_guard_v3", False):
+        if getattr(cur, "_entry_log_skip_final_guard_v4", False):
             return True
         if callable(cur) and _ORIGINAL_LOG_SKIP is None:
             _ORIGINAL_LOG_SKIP = cur
+        _safe_log_skip._entry_log_skip_final_guard_v4 = True  # type: ignore[attr-defined]
         _safe_log_skip._entry_log_skip_final_guard_v3 = True  # type: ignore[attr-defined]
         _safe_log_skip._original = cur  # type: ignore[attr-defined]
         ec._log_skip = _safe_log_skip
@@ -187,7 +194,7 @@ def _wait_until_entry_lock_free(ec: Any, *, source: str) -> tuple[bool, float, s
     if lock is None:
         return False, 0.0, "lock_missing"
 
-    timeout = _timeout_sec()
+    timeout = _timeout_sec(source_u)
     poll = _poll_sec()
     started = time.perf_counter()
     waited = 0.0
@@ -214,7 +221,7 @@ def _wait_until_entry_lock_free(ec: Any, *, source: str) -> tuple[bool, float, s
         waited = time.perf_counter() - started
         if waited >= timeout:
             logger.warning(
-                "[ENTRY CONTROLLER LOCK WAIT] timeout source=%s waited=%.3fs pending=%s snapshot=%s -> defer next cycle",
+                "[ENTRY CONTROLLER LOCK WAIT] timeout source=%s waited=%.3fs pending=%s snapshot=%s -> retryable defer",
                 source_u,
                 waited,
                 _pending_count_for_source(source_u),
@@ -230,13 +237,15 @@ def _timeout_result(source: str, waited: float, reason: str) -> dict[str, Any]:
         "executed": False,
         "approved_count": 0,
         "result": None,
-        "skip_reason": "entry_controller_lock_wait_timeout",
+        "skip_reason": "entry_controller_lock_timeout_retryable",
         "lock_wait_source": source_u,
         "lock_wait_reason": reason,
         "waited_sec": round(float(waited), 3),
         "pending_count": _pending_count_for_source(source_u),
         "pending_snapshot": _pending_snapshot_for_source(source_u),
+        "retryable": True,
         "retry_next_cycle": True,
+        "pending_kept": True,
     }
 
 
@@ -264,7 +273,12 @@ def _patched_run_entry_pipeline(*args, **kwargs):
         return _ORIGINAL_RUN(*args, **kwargs)
     except TypeError as e:
         if "multiple values for argument 'reason'" in str(e):
-            logger.warning("[ENTRY CONTROLLER LOCK WAIT] swallowed _log_skip reason collision source=%s pending=%s snapshot=%s", source_u, _pending_count_for_source(source_u), _pending_snapshot_for_source(source_u))
+            logger.warning(
+                "[ENTRY CONTROLLER LOCK WAIT] swallowed _log_skip reason collision source=%s pending=%s snapshot=%s",
+                source_u,
+                _pending_count_for_source(source_u),
+                _pending_snapshot_for_source(source_u),
+            )
             _install_log_skip_final_guard()
             return {
                 "executed": False,
@@ -274,7 +288,9 @@ def _patched_run_entry_pipeline(*args, **kwargs):
                 "lock_wait_source": source_u,
                 "pending_count": _pending_count_for_source(source_u),
                 "pending_snapshot": _pending_snapshot_for_source(source_u),
+                "retryable": True,
                 "retry_next_cycle": True,
+                "pending_kept": True,
             }
         logger.exception("[ENTRY CONTROLLER LOCK WAIT] patched run_entry_pipeline failed")
         return None
@@ -292,7 +308,7 @@ def install() -> bool:
         if not callable(cur):
             logger.warning("[ENTRY CONTROLLER LOCK WAIT] target missing")
             return False
-        if getattr(cur, "_entry_controller_lock_wait_patch_v3", False):
+        if getattr(cur, "_entry_controller_lock_wait_patch_v4", False):
             _INSTALLED = True
             return True
         original = getattr(cur, "_original", None) if getattr(cur, "_entry_controller_lock_wait_patch", False) else cur
@@ -302,13 +318,15 @@ def install() -> bool:
         _patched_run_entry_pipeline._entry_controller_lock_wait_patch = True  # type: ignore[attr-defined]
         _patched_run_entry_pipeline._entry_controller_lock_wait_patch_v2 = True  # type: ignore[attr-defined]
         _patched_run_entry_pipeline._entry_controller_lock_wait_patch_v3 = True  # type: ignore[attr-defined]
+        _patched_run_entry_pipeline._entry_controller_lock_wait_patch_v4 = True  # type: ignore[attr-defined]
         _patched_run_entry_pipeline._original = original  # type: ignore[attr-defined]
         ec.run_entry_pipeline = _patched_run_entry_pipeline
         _INSTALLED = True
         logger.warning(
-            "[ENTRY CONTROLLER LOCK WAIT] installed v3 sources=%s wait_sec=%.1f timeout_skip_original=%s log_skip_final_guard=True",
-            sorted(_env_list("ENTRY_CONTROLLER_LOCK_WAIT_SOURCES", "RANKING,TONOSAMA")),
-            _timeout_sec(),
+            "[ENTRY CONTROLLER LOCK WAIT] installed v4 sources=%s wait_sec=%.1f summary_wait_sec=%.1f timeout_skip_original=%s log_skip_final_guard=True",
+            sorted(_env_list("ENTRY_CONTROLLER_LOCK_WAIT_SOURCES", "RANKING,TONOSAMA,SUMMARY")),
+            _timeout_sec("RANKING"),
+            _timeout_sec("SUMMARY"),
             _env_bool("ENTRY_CONTROLLER_LOCK_WAIT_TIMEOUT_SKIP_ORIGINAL", True),
         )
         return True
