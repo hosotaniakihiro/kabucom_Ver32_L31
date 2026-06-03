@@ -1,9 +1,16 @@
 # ============================================================
 # File   : core/startup/entry_final_filter_failopen_patch.py
-# Version: V2.2-TONOSAMA-ATR-NESTED-SOURCE-FAILOPEN
+# Version: V2.3-SCALPING-REENTRY-RANGE-RELAX
 # ------------------------------------------------------------
 # 【目的】
 #   候補・AI・pending までは通るのに、最後で全落ちする問題の緩和。
+#
+# V2.3:
+#   - 勝ち銘柄の当日再エントリー設定を起動時に明示する。
+#   - RANGE/LOW_MOVE/ENTRY_ORDER の既定値をスキャルピング寄りに緩和する。
+#   - entry_order_builder は import 時に環境変数を定数化するため、既にimport済みでも
+#     runtime属性を書き換えて即反映する。
+#   - 方向確認は完全OFFにせず、min_strengthを1.0へ緩和し weak allow を使いやすくする。
 #
 # V2.2:
 #   - 最新ログでは PENDING_BUCKET は source=TONOSAMA なのに、ATR判定では
@@ -188,17 +195,74 @@ def _looks_atr_history_gap(entry_row: Any = None, detail: Any = None) -> bool:
         return False
 
 
+def _apply_scalping_defaults() -> None:
+    """AI_OK後に落ちすぎていた最終ガードを、スキャルピング運用向けに緩和する。"""
+    defaults = {
+        # 勝ち銘柄の再エントリー。発注送信だけで2回上限に当たる問題を避ける。
+        "ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL": "2",
+        "ENTRY_COUNT_SENT_ORDER_AS_DAILY_ENTRY": "1",
+        "ENTRY_WINNING_SYMBOL_REENTRY_ENABLED": "1",
+        "ENTRY_WINNING_SYMBOL_MAX_DAILY_ENTRIES": "4",
+        "ENTRY_WINNING_SYMBOL_MIN_DAILY_PNL": "1",
+        "ENTRY_WINNING_SYMBOL_REQUIRE_WIN_GT_LOSS": "1",
+        "ENTRY_WINNING_SYMBOL_IGNORE_SENT_ONLY": "1",
+        "ENTRY_STOP_AFTER_FIRST_LOSS_ONLY_IF_NET_NEGATIVE": "1",
+        # RANGE_5M / LOW_MOVE を少し緩和。流動性・板・信用・MA逆行ガードは維持。
+        "RANGE_5M_FILTER_NG_FAIL_OPEN": "1",
+        "LOW_MOVE_TONOSAMA_MIN_RANGE_PCT": "0.005",
+        "LOW_MOVE_TONOSAMA_STRONG_RANGE_PCT": "0.010",
+        "LOW_MOVE_MIN_RANGE_PCT_HIGH_PRICE": "0.005",
+        "LOW_MOVE_MIN_RANGE_PCT_LOW_PRICE": "0.010",
+        "LOW_MOVE_RANKING_MIN_RANGE_PCT_HIGH_PRICE": "0.005",
+        "LOW_MOVE_RANKING_MIN_RANGE_PCT_LOW_PRICE": "0.008",
+        "LOW_MOVE_RANKING_MIN_SCORE_FOR_NO_HIGHLOW": "55.0",
+        "LOW_MOVE_RANKING_MIN_ABS_SLOPE": "0.0005",
+        "LOW_MOVE_TONOSAMA_MIN_ABS_SLOPE": "0.00005",
+        "LOW_MOVE_MIN_ABS_SLOPE_HIGH_PRICE": "0.0001",
+        "LOW_MOVE_MIN_ABS_SLOPE_LOW_PRICE": "0.00015",
+        # build_entry_order 側の低変動最終防衛。
+        "ENTRY_ORDER_MIN_RANGE_PCT": "0.005",
+        "ENTRY_ORDER_MIN_ATR_RATIO": "0.0025",
+        "ENTRY_ORDER_REQUIRE_ATR": "0",
+        "ENTRY_ORDER_REQUIRE_HIGH_LOW": "0",
+        # 方向確認は完全OFFにしない。弱いが反対ではない候補を許可しやすくする。
+        "ENTRY_DIRECTION_CONFIRM_MIN_STRENGTH": "1.0",
+        "ENTRY_DIRECTION_CONFIRM_STRICT": "0",
+        "ENTRY_ORDER_SHORT_MTF_NEUTRAL_MIN_SCORE": "1.0",
+        "ENTRY_ORDER_SHORT_MTF_NEUTRAL_EPS": "0.0",
+    }
+    for k, v in defaults.items():
+        _setdefault_env(k, v)
+
+
+def _patch_import_time_constants() -> None:
+    """既にimport済みのモジュール定数にも env の緩和値を反映する。"""
+    try:
+        import trading.handlers.entry_order_builder as eob
+        eob.ENTRY_ORDER_MIN_RANGE_PCT = _safe_float(os.getenv("ENTRY_ORDER_MIN_RANGE_PCT"), 0.005)
+        eob.ENTRY_ORDER_MIN_ATR_RATIO = _safe_float(os.getenv("ENTRY_ORDER_MIN_ATR_RATIO"), 0.0025)
+        eob.ENTRY_ORDER_REQUIRE_ATR = _env_bool("ENTRY_ORDER_REQUIRE_ATR", False)
+        eob.ENTRY_ORDER_REQUIRE_HIGH_LOW = _env_bool("ENTRY_ORDER_REQUIRE_HIGH_LOW", False)
+        logger.warning(
+            "[ENTRY FINAL FILTER FAILOPEN] entry_order_builder constants patched min_range=%.4f min_atr=%.4f require_atr=%s require_high_low=%s",
+            eob.ENTRY_ORDER_MIN_RANGE_PCT,
+            eob.ENTRY_ORDER_MIN_ATR_RATIO,
+            eob.ENTRY_ORDER_REQUIRE_ATR,
+            eob.ENTRY_ORDER_REQUIRE_HIGH_LOW,
+        )
+    except Exception:
+        logger.exception("[ENTRY FINAL FILTER FAILOPEN] entry_order_builder constant patch failed")
+
+
+
 def install() -> bool:
     global _PATCHED
     if _PATCHED:
         return True
 
     _setdefault_env("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", "1")
-    _setdefault_env("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", "2")
-    _setdefault_env("ENTRY_COUNT_SENT_ORDER_AS_DAILY_ENTRY", "1")
     _setdefault_env("ATR_1M_FILTER_TONOSAMA_HISTORY_FAIL_OPEN", "1")
     _setdefault_env("ATR_1M_FILTER_TONOSAMA_MIN_BARS", "14")
-    _setdefault_env("RANGE_5M_FILTER_NG_FAIL_OPEN", "1")
     _setdefault_env("PENDING_PROTECT_PUSH_SYMBOLS", "1")
     _setdefault_env("PENDING_PROTECT_PUSH_MAX_KEEP", "50")
     _setdefault_env("ENTRY_BOARD_RETRY_ENABLED", "1")
@@ -220,6 +284,8 @@ def install() -> bool:
     _setdefault_env("ENTRY_MA5_BREAKOUT_DB_BACKFILL", "1")
     _setdefault_env("ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN", "1")
     _setdefault_env("ENTRY_DIRECTION_CONFIRM_ERROR_FAIL_OPEN", "0")
+    _apply_scalping_defaults()
+    _patch_import_time_constants()
 
     try:
         import trading.handlers.entry_controller as ec
@@ -229,7 +295,7 @@ def install() -> bool:
 
     try:
         orig_atr = getattr(ec, "atr_1m_filter", None)
-        if callable(orig_atr) and not getattr(orig_atr, "_tonosama_atr_failopen_wrapper_v22", False):
+        if callable(orig_atr) and not getattr(orig_atr, "_tonosama_atr_failopen_wrapper_v23", False):
             def _atr_tonosama_failopen(entry_row: Any = None, *args, **kwargs):
                 try:
                     ret = orig_atr(entry_row, *args, **kwargs)
@@ -250,15 +316,16 @@ def install() -> bool:
             _atr_tonosama_failopen._tonosama_atr_failopen_wrapper = True  # type: ignore[attr-defined]
             _atr_tonosama_failopen._tonosama_atr_failopen_wrapper_v2 = True  # type: ignore[attr-defined]
             _atr_tonosama_failopen._tonosama_atr_failopen_wrapper_v22 = True  # type: ignore[attr-defined]
+            _atr_tonosama_failopen._tonosama_atr_failopen_wrapper_v23 = True  # type: ignore[attr-defined]
             _atr_tonosama_failopen._original_atr_1m_filter = orig_atr  # type: ignore[attr-defined]
             setattr(ec, "atr_1m_filter", _atr_tonosama_failopen)
-            logger.warning("[ENTRY FINAL FILTER FAILOPEN] atr_1m_filter TONOSAMA nested-source history-gap wrapper installed v2.2")
+            logger.warning("[ENTRY FINAL FILTER FAILOPEN] atr_1m_filter TONOSAMA nested-source history-gap wrapper installed v2.3")
     except Exception:
         logger.exception("[ENTRY FINAL FILTER FAILOPEN] atr_1m wrapper install failed")
 
     try:
         orig_range = getattr(ec, "range_5m_filter", None)
-        if callable(orig_range) and not getattr(orig_range, "_range5m_failopen_wrapper", False):
+        if callable(orig_range) and not getattr(orig_range, "_range5m_failopen_wrapper_v23", False):
             def _range5m_failopen(entry_row: Any = None, *args, **kwargs):
                 try:
                     ret = orig_range(entry_row, *args, **kwargs)
@@ -278,9 +345,10 @@ def install() -> bool:
                     return bool(allow)
 
             _range5m_failopen._range5m_failopen_wrapper = True  # type: ignore[attr-defined]
+            _range5m_failopen._range5m_failopen_wrapper_v23 = True  # type: ignore[attr-defined]
             _range5m_failopen._original_range_5m_filter = orig_range  # type: ignore[attr-defined]
             setattr(ec, "range_5m_filter", _range5m_failopen)
-            logger.warning("[ENTRY FINAL FILTER FAILOPEN] range_5m_filter wrapper installed")
+            logger.warning("[ENTRY FINAL FILTER FAILOPEN] range_5m_filter wrapper installed v2.3")
     except Exception:
         logger.exception("[ENTRY FINAL FILTER FAILOPEN] range_5m wrapper install failed")
 
@@ -301,12 +369,19 @@ def install() -> bool:
 
     _PATCHED = True
     logger.warning(
-        "[ENTRY FINAL FILTER FAILOPEN] installed v2.2 atr_tonosama_history_fail_open=%s atr_min_bars=%s range_fail_open=%s allow_without_board=%s max_symbol_entries=%s pending_protect_push=%s board_retry=%s short_mtf_required=%s daily_mtf_optional=%s ma5_breakout=%s direction_recursion_fail_open=%s direction_error_fail_open=%s",
+        "[ENTRY FINAL FILTER FAILOPEN] installed v2.3 atr_tonosama_history_fail_open=%s atr_min_bars=%s range_fail_open=%s allow_without_board=%s max_symbol_entries=%s winning_reentry=%s winning_max=%s low_move_tonosama_min_range=%s entry_order_min_range=%s entry_order_min_atr=%s direction_min_strength=%s direction_strict=%s pending_protect_push=%s board_retry=%s short_mtf_required=%s daily_mtf_optional=%s ma5_breakout=%s direction_recursion_fail_open=%s direction_error_fail_open=%s",
         _env_bool("ATR_1M_FILTER_TONOSAMA_HISTORY_FAIL_OPEN", True),
         os.getenv("ATR_1M_FILTER_TONOSAMA_MIN_BARS"),
         _env_bool("RANGE_5M_FILTER_NG_FAIL_OPEN", True),
         os.getenv("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"),
         os.getenv("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL"),
+        os.getenv("ENTRY_WINNING_SYMBOL_REENTRY_ENABLED"),
+        os.getenv("ENTRY_WINNING_SYMBOL_MAX_DAILY_ENTRIES"),
+        os.getenv("LOW_MOVE_TONOSAMA_MIN_RANGE_PCT"),
+        os.getenv("ENTRY_ORDER_MIN_RANGE_PCT"),
+        os.getenv("ENTRY_ORDER_MIN_ATR_RATIO"),
+        os.getenv("ENTRY_DIRECTION_CONFIRM_MIN_STRENGTH"),
+        os.getenv("ENTRY_DIRECTION_CONFIRM_STRICT"),
         os.getenv("PENDING_PROTECT_PUSH_SYMBOLS"),
         os.getenv("ENTRY_BOARD_RETRY_ENABLED"),
         os.getenv("ENTRY_SHORT_MTF_REQUIRED"),
