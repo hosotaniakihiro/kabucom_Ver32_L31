@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/constants.py
-# Version: Ver1.1-PUSH-STREAM-CONSTANTS-ROTATION-4P8
+# Version: Ver1.2-PUSH-STREAM-CONSTANTS-LOW-PRESSURE
 # ============================================================
 
 DEFAULT_WS_URL = "ws://localhost:18080/kabusapi/websocket"
@@ -16,9 +16,11 @@ WS_READY_POLL_SEC = 0.1
 MAX_DF_ROWS = 50000
 MAX_RAW_LOG_CHARS = 1200
 
-DEFAULT_REGISTER_CHUNK_SIZE = 50
-DEFAULT_REGISTER_MAX_SYMBOLS = 100
+# kabu Station WebSocketが50銘柄登録直後にWinError 10054で切断される環境があるため、
+# 既定の同時登録数を30へ落とす。必要時はrotation_settings側の環境変数で上書きする。
+DEFAULT_REGISTER_CHUNK_SIZE = 30
+DEFAULT_REGISTER_MAX_SYMBOLS = 60
 
 # PUSHローテーションのデフォルト登録維持時間。
-# 50銘柄登録 -> 4.8秒維持 -> 全解除 -> 0.2秒待機 -> 次の50銘柄登録、を想定する。
-DEFAULT_ROTATE_WAIT_SEC = 4.8
+# 30銘柄登録 -> 30秒維持 -> 次の30銘柄登録、を想定する。
+DEFAULT_ROTATE_WAIT_SEC = 30.0
