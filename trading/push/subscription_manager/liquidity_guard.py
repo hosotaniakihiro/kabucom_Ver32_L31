@@ -1,26 +1,14 @@
 # ============================================================
 # File   : trading/push/subscription_manager/liquidity_guard.py
-# Version: PRODUCTION-STABLE-PUSH-LIQUIDITY-GUARD-V1.0
+# Version: PRODUCTION-STABLE-PUSH-LIQUIDITY-GUARD-V1.1-MIN-SURVIVORS
 # ------------------------------------------------------------
 # 【概要】
 #   PUSH登録対象から、日中出来高・売買代金が少なすぎる銘柄を除外する。
 #
-# 【目的】
-#   - 日中100株程度しか出来ていない薄商い銘柄をPUSH登録対象に入れない
-#   - rotation.py の A/B 50銘柄登録前に使う
-#   - rankingYYYYMMDD.db の ranking_snapshot_1min / ranking_raw_1min 等から
-#     当日累積出来高・価格を拾って判定する
-#
-# 【環境変数】
-#   PUSH_REGISTER_LIQUIDITY_GUARD_ENABLED=1
-#   PUSH_REGISTER_MIN_DAY_VOLUME=10000
-#   PUSH_REGISTER_MIN_DAY_TURNOVER=10000000
-#   PUSH_REGISTER_LIQUIDITY_CACHE_TTL_SEC=20
-#   PUSH_REGISTER_LIQUIDITY_MIN_COVERAGE_RATIO=0.20
-#
-# 【重要】
-#   - DBが見つからない、または取得率が低すぎる場合は登録対象を壊さないため pass-through
-#   - 取得できた銘柄については volume / turnover で除外
+# V1.1 Fix:
+#   - liquidity map の取得率は十分でも、条件が厳しすぎて登録対象が 100 -> 1 のように
+#     崩壊すると WebSocket rotation が不安定になる。
+#   - kept が少なすぎる場合は、流動性の高い除外候補/欠損候補を順に戻し、最低登録数を確保する。
 # ============================================================
 
 from __future__ import annotations
@@ -36,18 +24,54 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 logger = logging.getLogger(__name__)
 
 
-ENABLED = str(os.environ.get("PUSH_REGISTER_LIQUIDITY_GUARD_ENABLED", "1")).lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
+def _env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
 
-MIN_DAY_VOLUME = float(os.environ.get("PUSH_REGISTER_MIN_DAY_VOLUME", "10000"))
-MIN_DAY_TURNOVER = float(os.environ.get("PUSH_REGISTER_MIN_DAY_TURNOVER", "10000000"))
 
-CACHE_TTL_SEC = float(os.environ.get("PUSH_REGISTER_LIQUIDITY_CACHE_TTL_SEC", "20"))
-MIN_COVERAGE_RATIO = float(os.environ.get("PUSH_REGISTER_LIQUIDITY_MIN_COVERAGE_RATIO", "0.20"))
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
+ENABLED = _env_bool("PUSH_REGISTER_LIQUIDITY_GUARD_ENABLED", True)
+
+MIN_DAY_VOLUME = _env_float("PUSH_REGISTER_MIN_DAY_VOLUME", 10000.0)
+MIN_DAY_TURNOVER = _env_float("PUSH_REGISTER_MIN_DAY_TURNOVER", 10000000.0)
+
+CACHE_TTL_SEC = _env_float("PUSH_REGISTER_LIQUIDITY_CACHE_TTL_SEC", 20.0)
+MIN_COVERAGE_RATIO = _env_float("PUSH_REGISTER_LIQUIDITY_MIN_COVERAGE_RATIO", 0.20)
+
+# 100銘柄rotationが 1〜数銘柄まで削られると、PUSH購読が不安定化する。
+# 条件が厳しすぎた場合だけ、上位流動性候補を戻して最低数を確保する。
+MIN_SURVIVOR_COUNT = _env_int("PUSH_REGISTER_LIQUIDITY_MIN_SURVIVOR_COUNT", 30)
+MIN_SURVIVOR_RATIO = _env_float("PUSH_REGISTER_LIQUIDITY_MIN_SURVIVOR_RATIO", 0.25)
+RESCUE_MISSING_SYMBOLS = _env_bool("PUSH_REGISTER_LIQUIDITY_RESCUE_MISSING_SYMBOLS", True)
 
 DEFAULT_ROOT = r"\\192.168.0.22\AutoStockBuyAndSell"
 
@@ -373,6 +397,76 @@ def get_liquidity_map() -> Dict[str, Dict[str, float]]:
     return m
 
 
+def _rescue_min_survivors(
+    cleaned: List[str],
+    kept: List[str],
+    removed: List[Tuple[str, float, float]],
+    missing: List[str],
+    *,
+    source: str,
+    min_keep: int,
+    min_ratio: float,
+) -> List[str]:
+    """
+    liquidity guard の削りすぎを防ぐ。
+
+    kept が少なすぎる場合だけ、
+      1. turnover/volume が大きい removed
+      2. DBに無い missing
+    の順で元のrotation順を壊しすぎないように戻す。
+    """
+    before = len(cleaned)
+    if before <= 0:
+        return kept
+
+    required = min(before, max(int(min_keep), int(before * float(min_ratio))))
+    if required <= 0 or len(kept) >= required:
+        return kept
+
+    keep_set = set(kept)
+    rescued: List[str] = list(kept)
+
+    # 流動性が高い順に戻す。volumeだけ不足していてturnoverは大きい銘柄を救う。
+    removed_ranked = sorted(
+        removed,
+        key=lambda x: (float(x[2] or 0.0), float(x[1] or 0.0)),
+        reverse=True,
+    )
+    for sym, volume, turnover in removed_ranked:
+        if len(rescued) >= required:
+            break
+        if sym in keep_set:
+            continue
+        rescued.append(sym)
+        keep_set.add(sym)
+
+    if RESCUE_MISSING_SYMBOLS:
+        for sym in cleaned:
+            if len(rescued) >= required:
+                break
+            if sym in keep_set:
+                continue
+            if sym in missing:
+                rescued.append(sym)
+                keep_set.add(sym)
+
+    # 最後に元のrotation順へ戻す。
+    order = {s: i for i, s in enumerate(cleaned)}
+    rescued_sorted = sorted(rescued, key=lambda s: order.get(s, 10**9))
+    logger.warning(
+        "[PUSH LIQUIDITY GUARD] rescue min survivors source=%s before=%d kept_before=%d after=%d required=%d min_keep=%d min_ratio=%.3f rescued_head=%s",
+        source,
+        before,
+        len(kept),
+        len(rescued_sorted),
+        required,
+        int(min_keep),
+        float(min_ratio),
+        rescued_sorted[:20],
+    )
+    return rescued_sorted
+
+
 def filter_register_targets_by_liquidity(
     symbols: Iterable[Any],
     *,
@@ -460,24 +554,38 @@ def filter_register_targets_by_liquidity(
         else:
             removed.append((s, volume, turnover))
 
+    min_keep = max(0, int(MIN_SURVIVOR_COUNT))
+    min_ratio = max(0.0, min(1.0, float(MIN_SURVIVOR_RATIO)))
+    kept_final = _rescue_min_survivors(
+        cleaned,
+        kept,
+        removed,
+        missing,
+        source=source,
+        min_keep=min_keep,
+        min_ratio=min_ratio,
+    )
+
     logger.info(
         "[PUSH LIQUIDITY GUARD] source=%s before=%d after=%d removed=%d missing=%d "
         "matched=%d coverage=%.3f min_day_volume=%.0f min_day_turnover=%.0f "
-        "removed_head=%s kept_head=%s",
+        "min_survivor_count=%d min_survivor_ratio=%.3f removed_head=%s kept_head=%s",
         source,
         len(cleaned),
-        len(kept),
+        len(kept_final),
         len(removed),
         len(missing),
         len(matched),
         coverage,
         float(min_day_volume),
         float(min_day_turnover),
+        min_keep,
+        min_ratio,
         removed[:10],
-        kept[:10],
+        kept_final[:10],
     )
 
-    return kept
+    return kept_final
 
 
 __all__ = [
