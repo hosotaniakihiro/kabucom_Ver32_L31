@@ -1,15 +1,15 @@
 # ============================================================
 # File   : core/startup/entry_immediate_movement_guard_patch.py
-# Version: V1.1-ENTRY-IMMEDIATE-MOVEMENT-CLOSE-POSITION
+# Version: V1.2-SUMMARY-RANGE-RESCUE
 # ------------------------------------------------------------
 # 目的:
 #   エントリー後に株価が動かない銘柄を減らす。
 #
-# V1.1:
-#   - サマリー足では open==close になりやすく、実体(body_dir)が0扱いで
-#     値幅が十分ある候補まで全落ちしていた。
-#   - high/low内の close位置(close_pos) を方向判定に追加。
-#     BUYはレンジ上側、SELLはレンジ下側なら「動き出しあり」と判定する。
+# V1.2:
+#   - SUMMARY AI は open==close / slope≈0 になりやすく、出来高・値幅が十分でも
+#     immediate_movement_weak で全落ちしていた。
+#   - SUMMARY/SUMMARY_AI の score>=4 かつ range_pct が大きい候補を救済する。
+#   - close_pos_dir をログに必ず出し、なぜ落ちたかを見える化する。
 # ============================================================
 from __future__ import annotations
 
@@ -108,7 +108,8 @@ def _calc_diag(item: dict[str, Any]) -> dict[str, Any]:
     row = _row_from_item(item)
     side = _safe_str(item.get("side") or row.get("side") or row.get("entry_decision")).upper()
     symbol = _safe_str(item.get("symbol") or row.get("symbol"))
-    source = _safe_str(row.get("source") or item.get("entry_type") or item.get("source")).upper()
+    source = _safe_str(row.get("source") or item.get("source") or item.get("entry_type")).upper()
+    entry_type = _safe_str(item.get("entry_type") or row.get("entry_type")).upper()
 
     open_p = _safe_float(_first(row, "open", "open_price"), 0.0)
     high_p = _safe_float(_first(row, "high", "high_price"), 0.0)
@@ -138,19 +139,20 @@ def _calc_diag(item: dict[str, Any]) -> dict[str, Any]:
         slope_atr_dir = -slope_atr
         score_slope_dir = -score_slope
         macd_dir = signal - macd
-        rsi_dir_ok = rsi <= _env_float("ENTRY_MOVE_SELL_MAX_RSI", 58.0)
+        rsi_dir_ok = rsi <= _env_float("ENTRY_MOVE_SELL_MAX_RSI", 62.0)
     else:
         body_dir = body_pct
         slope_dir = slope
         slope_atr_dir = slope_atr
         score_slope_dir = score_slope
         macd_dir = macd - signal
-        rsi_dir_ok = rsi >= _env_float("ENTRY_MOVE_BUY_MIN_RSI", 42.0)
+        rsi_dir_ok = rsi >= _env_float("ENTRY_MOVE_BUY_MIN_RSI", 38.0)
 
     return {
         "symbol": symbol,
         "side": side,
         "source": source,
+        "entry_type": entry_type,
         "open": open_p,
         "high": high_p,
         "low": low_p,
@@ -179,24 +181,30 @@ def _calc_diag(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _is_summary_source(source: str, entry_type: str) -> bool:
+    return source in {"SUMMARY", "SUMMARY_AI", "PUSH"} or entry_type == "SUMMARY_AI"
+
+
 def _movement_ok(item: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
     d = _calc_diag(item)
     side = d.get("side")
     source = _safe_str(d.get("source")).upper()
+    entry_type = _safe_str(d.get("entry_type")).upper()
 
     if side not in {"BUY", "SELL"}:
         return False, {**d, "ng": "side_invalid"}
 
     is_fast_source = source in {"RANKING", "RANKING_5S", "TONOSAMA", "EARLY_SCALP"}
+    is_summary = _is_summary_source(source, entry_type)
 
     min_range = _env_float("ENTRY_MOVE_MIN_RANGE_PCT_FAST", 0.20) if is_fast_source else _env_float("ENTRY_MOVE_MIN_RANGE_PCT_SUMMARY", 0.28)
     min_body = _env_float("ENTRY_MOVE_MIN_BODY_DIR_PCT_FAST", 0.03) if is_fast_source else _env_float("ENTRY_MOVE_MIN_BODY_DIR_PCT_SUMMARY", 0.05)
     min_slope_atr = _env_float("ENTRY_MOVE_MIN_SLOPE_ATR_FAST", 0.0004) if is_fast_source else _env_float("ENTRY_MOVE_MIN_SLOPE_ATR_SUMMARY", 0.0006)
     min_score_slope = _env_float("ENTRY_MOVE_MIN_SCORE_SLOPE", 0.04)
     min_macd_dir = _env_float("ENTRY_MOVE_MIN_MACD_DIR", -0.05)
-    min_close_pos_dir = _env_float("ENTRY_MOVE_MIN_CLOSE_POS_DIR_FAST", 60.0) if is_fast_source else _env_float("ENTRY_MOVE_MIN_CLOSE_POS_DIR_SUMMARY", 62.0)
+    min_close_pos_dir = _env_float("ENTRY_MOVE_MIN_CLOSE_POS_DIR_FAST", 60.0) if is_fast_source else _env_float("ENTRY_MOVE_MIN_CLOSE_POS_DIR_SUMMARY", 58.0)
     strong_mtf = _env_float("ENTRY_MOVE_STRONG_MTF_RELAX", 6.0)
-    strong_score = _env_float("ENTRY_MOVE_STRONG_SCORE_RELAX", 5.5)
+    strong_score = _env_float("ENTRY_MOVE_STRONG_SCORE_RELAX", 4.0 if is_summary else 5.5)
 
     range_ok = float(d["range_pct"]) >= min_range
     body_ok = float(d["body_dir"]) >= min_body
@@ -210,6 +218,31 @@ def _movement_ok(item: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
     # 通常: 値幅があり、方向が body / close_pos / slope のどれかで確認できる。
     if range_ok and rsi_ok and macd_ok and (body_ok or close_pos_ok or slope_ok):
         return True, {**d, "ok": "range_body_closepos_or_slope"}
+
+    # SUMMARY AI: open==close/slope≈0 でも、スコア4以上かつ値幅・出来高が十分なら救済する。
+    if is_summary and _env_bool("ENTRY_MOVE_SUMMARY_RANGE_RESCUE_ENABLED", True):
+        summary_score_min = _env_float("ENTRY_MOVE_SUMMARY_RANGE_RESCUE_MIN_SCORE", 4.0)
+        summary_range_min = _env_float("ENTRY_MOVE_SUMMARY_RANGE_RESCUE_MIN_RANGE_PCT", 1.5)
+        summary_volume_min = _env_float("ENTRY_MOVE_SUMMARY_RANGE_RESCUE_MIN_VOLUME", 300000.0)
+        summary_close_pos_min = _env_float("ENTRY_MOVE_SUMMARY_RANGE_RESCUE_MIN_CLOSE_POS_DIR", 35.0)
+        summary_macd_min = _env_float("ENTRY_MOVE_SUMMARY_RANGE_RESCUE_MIN_MACD_DIR", -0.20)
+        if (
+            float(d["score"]) >= summary_score_min
+            and float(d["range_pct"]) >= summary_range_min
+            and float(d["volume"]) >= summary_volume_min
+            and float(d["close_pos_dir"]) >= summary_close_pos_min
+            and float(d["macd_dir"]) >= summary_macd_min
+            and rsi_ok
+        ):
+            return True, {
+                **d,
+                "ok": "summary_range_rescue",
+                "summary_score_min": summary_score_min,
+                "summary_range_min": summary_range_min,
+                "summary_volume_min": summary_volume_min,
+                "summary_close_pos_min": summary_close_pos_min,
+                "summary_macd_min": summary_macd_min,
+            }
 
     # 強い文脈: close_posまたはslopeがあれば通す。
     if strong_context and range_ok and macd_ok and (close_pos_ok or slope_ok):
@@ -251,37 +284,27 @@ def _patched_build_scored_candidates(*args, **kwargs):
                 kept.append(item)
                 continue
             ok, diag = _movement_ok(item)
+            view = {
+                "symbol": diag.get("symbol"),
+                "side": diag.get("side"),
+                "source": diag.get("source"),
+                "entry_type": diag.get("entry_type"),
+                "range_pct": round(float(diag.get("range_pct") or 0.0), 4),
+                "body_dir": round(float(diag.get("body_dir") or 0.0), 4),
+                "close_pos_dir": round(float(diag.get("close_pos_dir") or 0.0), 2),
+                "slope_atr_dir": round(float(diag.get("slope_atr_dir") or 0.0), 6),
+                "score_slope_dir": round(float(diag.get("score_slope_dir") or 0.0), 4),
+                "macd_dir": round(float(diag.get("macd_dir") or 0.0), 4),
+                "rsi": round(float(diag.get("rsi") or 0.0), 2),
+                "volume": round(float(diag.get("volume") or 0.0), 0),
+                "mtf": round(float(diag.get("mtf") or 0.0), 3),
+                "score": round(float(diag.get("score") or 0.0), 3),
+            }
             if ok:
                 kept.append(item)
-                passed_diag.append({
-                    "symbol": diag.get("symbol"),
-                    "side": diag.get("side"),
-                    "source": diag.get("source"),
-                    "ok": diag.get("ok"),
-                    "range_pct": round(float(diag.get("range_pct") or 0.0), 4),
-                    "body_dir": round(float(diag.get("body_dir") or 0.0), 4),
-                    "close_pos_dir": round(float(diag.get("close_pos_dir") or 0.0), 2),
-                    "slope_atr_dir": round(float(diag.get("slope_atr_dir") or 0.0), 6),
-                    "macd_dir": round(float(diag.get("macd_dir") or 0.0), 4),
-                    "rsi": round(float(diag.get("rsi") or 0.0), 2),
-                    "score": round(float(diag.get("score") or 0.0), 3),
-                })
+                passed_diag.append({**view, "ok": diag.get("ok")})
             else:
-                skipped.append({
-                    "symbol": diag.get("symbol"),
-                    "side": diag.get("side"),
-                    "source": diag.get("source"),
-                    "ng": diag.get("ng"),
-                    "range_pct": round(float(diag.get("range_pct") or 0.0), 4),
-                    "body_dir": round(float(diag.get("body_dir") or 0.0), 4),
-                    "close_pos_dir": round(float(diag.get("close_pos_dir") or 0.0), 2),
-                    "slope_atr_dir": round(float(diag.get("slope_atr_dir") or 0.0), 6),
-                    "score_slope_dir": round(float(diag.get("score_slope_dir") or 0.0), 4),
-                    "macd_dir": round(float(diag.get("macd_dir") or 0.0), 4),
-                    "rsi": round(float(diag.get("rsi") or 0.0), 2),
-                    "mtf": round(float(diag.get("mtf") or 0.0), 3),
-                    "score": round(float(diag.get("score") or 0.0), 3),
-                })
+                skipped.append({**view, "ng": diag.get("ng")})
         if skipped or passed_diag:
             logger.warning(
                 "[ENTRY IMMEDIATE MOVE GUARD] filtered before=%s after=%s passed=%s skipped=%s",
@@ -301,8 +324,7 @@ def install() -> bool:
     try:
         import trading.handlers.entry_controller as ec
         cur = getattr(ec, "_build_scored_candidates", None)
-        # v1 が既に入っていても、元関数へ戻って v1.1 を上書きする。
-        if getattr(cur, "_entry_immediate_movement_guard_v11", False):
+        if getattr(cur, "_entry_immediate_movement_guard_v12", False):
             _INSTALLED = True
             return True
         original = getattr(cur, "_original", None) if callable(cur) else None
@@ -315,17 +337,21 @@ def install() -> bool:
             return False
         _patched_build_scored_candidates._entry_immediate_movement_guard_v1 = True  # type: ignore[attr-defined]
         _patched_build_scored_candidates._entry_immediate_movement_guard_v11 = True  # type: ignore[attr-defined]
+        _patched_build_scored_candidates._entry_immediate_movement_guard_v12 = True  # type: ignore[attr-defined]
         _patched_build_scored_candidates._original = _ORIG_BUILD  # type: ignore[attr-defined]
         ec._build_scored_candidates = _patched_build_scored_candidates
         _INSTALLED = True
         logger.warning(
-            "[ENTRY IMMEDIATE MOVE GUARD] installed v1.1 enabled=%s sources=%s summary_min_range=%.3f summary_min_body=%.3f summary_min_close_pos_dir=%.1f summary_min_slope_atr=%.6f",
+            "[ENTRY IMMEDIATE MOVE GUARD] installed v1.2 enabled=%s sources=%s summary_min_range=%.3f summary_min_body=%.3f summary_min_close_pos_dir=%.1f summary_rescue=%s rescue_score=%.3f rescue_range=%.3f rescue_volume=%.0f",
             _env_bool("ENTRY_IMMEDIATE_MOVEMENT_GUARD_ENABLED", True),
             os.getenv("ENTRY_MOVE_GUARD_SOURCES", "SUMMARY,RANKING,TONOSAMA,EARLY_SCALP"),
             _env_float("ENTRY_MOVE_MIN_RANGE_PCT_SUMMARY", 0.28),
             _env_float("ENTRY_MOVE_MIN_BODY_DIR_PCT_SUMMARY", 0.05),
-            _env_float("ENTRY_MOVE_MIN_CLOSE_POS_DIR_SUMMARY", 62.0),
-            _env_float("ENTRY_MOVE_MIN_SLOPE_ATR_SUMMARY", 0.0006),
+            _env_float("ENTRY_MOVE_MIN_CLOSE_POS_DIR_SUMMARY", 58.0),
+            _env_bool("ENTRY_MOVE_SUMMARY_RANGE_RESCUE_ENABLED", True),
+            _env_float("ENTRY_MOVE_SUMMARY_RANGE_RESCUE_MIN_SCORE", 4.0),
+            _env_float("ENTRY_MOVE_SUMMARY_RANGE_RESCUE_MIN_RANGE_PCT", 1.5),
+            _env_float("ENTRY_MOVE_SUMMARY_RANGE_RESCUE_MIN_VOLUME", 300000.0),
         )
         return True
     except Exception:
