@@ -1,31 +1,36 @@
 # ============================================================
 # File   : core/startup/entry_daily_risk_runtime_patch.py
-# Version: V1.6-DEFAULT-MAX-SYMBOL-ENTRIES-2
+# Version: V1.7-WINNING-SYMBOL-REENTRY
 # ------------------------------------------------------------
 # 導入ルール:
 #   1. BUY新規も許可する
 #   2. 同一銘柄は当日最大2回をデフォルトにする
 #   3. 発注成功時点でも同一銘柄の当日エントリー済みとして記録する
-#   4. 同一銘柄で1回でも損失が出たら当日停止する
-#   5. 1銘柄の当日損失 -1500円で停止する
-#   6. システム全体の当日損失が -50000円に到達したら新規停止する
-#   7. 当日の返済済み取引回数が30回に到達したら新規停止する
-#   8. 連敗が20回に到達したら新規停止する
+#   4. 同一銘柄で負けた場合は停止できる
+#   5. ただし勝敗が良い銘柄は当日再エントリーを許可する
+#   6. 1銘柄の当日損失 -1500円で停止する
+#   7. システム全体の当日損失が -50000円に到達したら新規停止する
+#   8. 当日の返済済み取引回数が30回に到達したら新規停止する
+#   9. 連敗が20回に到達したら新規停止する
 #
-# 背景:
-#   entry_final_filter_failopen_patch が ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL=2 を
-#   後段でセットしても、このpatchのinstall時点では v1.5 のデフォルト1回が
-#   ログ表示・判定に使われることがある。
-#
-# 重要修正 V1.6:
-#   - ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL のデフォルトを 1 → 2 に変更する。
-#   - 起動ログも installed v1.6 / max_symbol_entries=2 になる。
-#   - ただし環境変数やbatで明示指定されている場合は、その指定を優先する。
+# V1.7:
+#   - 勝ち銘柄は再エントリー許可。
+#   - 条件: win_count > loss_count かつ daily_pnl > 0。
+#   - 勝ち銘柄は ENTRY_WINNING_SYMBOL_MAX_DAILY_ENTRIES まで許可する。
+#   - 勝ち銘柄では、未決済/未約定を含む entry_sent_count だけで上限停止しない。
+#     実際の返済済み entry_count を優先する。
+#   - stop_after_first_loss は、ネット損益がプラスで勝ち越しなら停止しない。
 #
 # 環境変数:
 #   ENTRY_BUY_ENABLED=1
 #   ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL=2
+#   ENTRY_WINNING_SYMBOL_REENTRY_ENABLED=1
+#   ENTRY_WINNING_SYMBOL_MAX_DAILY_ENTRIES=4
+#   ENTRY_WINNING_SYMBOL_MIN_DAILY_PNL=1
+#   ENTRY_WINNING_SYMBOL_REQUIRE_WIN_GT_LOSS=1
+#   ENTRY_WINNING_SYMBOL_IGNORE_SENT_ONLY=1
 #   ENTRY_STOP_SYMBOL_AFTER_FIRST_LOSS=1
+#   ENTRY_STOP_AFTER_FIRST_LOSS_ONLY_IF_NET_NEGATIVE=1
 #   ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN=-1500
 #   ENTRY_GLOBAL_MAX_DAILY_LOSS_YEN=-50000
 #   ENTRY_GLOBAL_MAX_DAILY_TRADES=30
@@ -296,6 +301,20 @@ def _record_actual_trade(symbol: str, pnl: float) -> None:
     )
 
 
+def _is_winning_symbol(srow: Dict[str, Any]) -> bool:
+    if not _env_bool("ENTRY_WINNING_SYMBOL_REENTRY_ENABLED", True):
+        return False
+    win_count = int(srow.get("win_count") or 0)
+    loss_count = int(srow.get("loss_count") or 0)
+    daily_pnl = float(srow.get("daily_pnl") or 0.0)
+    min_pnl = _env_float("ENTRY_WINNING_SYMBOL_MIN_DAILY_PNL", 1.0)
+    if daily_pnl < min_pnl:
+        return False
+    if _env_bool("ENTRY_WINNING_SYMBOL_REQUIRE_WIN_GT_LOSS", True):
+        return win_count > loss_count
+    return win_count >= 1
+
+
 def _risk_block_reason(symbol: str, side: str) -> Tuple[bool, str, Dict[str, Any]]:
     symbol = _norm_symbol(symbol)
     side_u = str(side or "").upper()
@@ -306,13 +325,30 @@ def _risk_block_reason(symbol: str, side: str) -> Tuple[bool, str, Dict[str, Any
     grow = _get_global_row()
 
     max_entries = _env_int("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", 2)
+    winning_max_entries = _env_int("ENTRY_WINNING_SYMBOL_MAX_DAILY_ENTRIES", 4)
     symbol_max_loss = _env_float("ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN", -1500.0)
     stop_after_first_loss = _env_bool("ENTRY_STOP_SYMBOL_AFTER_FIRST_LOSS", True)
+    stop_after_first_loss_only_net_negative = _env_bool("ENTRY_STOP_AFTER_FIRST_LOSS_ONLY_IF_NET_NEGATIVE", True)
     global_max_loss = _env_float("ENTRY_GLOBAL_MAX_DAILY_LOSS_YEN", -50000.0)
     global_max_trades = _env_int("ENTRY_GLOBAL_MAX_DAILY_TRADES", 30)
     global_max_consec_losses = _env_int("ENTRY_GLOBAL_MAX_CONSECUTIVE_LOSSES", 20)
 
-    symbol_seen_entries = max(int(srow.get("entry_count") or 0), int(srow.get("entry_sent_count") or 0))
+    entry_count = int(srow.get("entry_count") or 0)
+    entry_sent_count = int(srow.get("entry_sent_count") or 0)
+    loss_count = int(srow.get("loss_count") or 0)
+    daily_pnl = float(srow.get("daily_pnl") or 0.0)
+    winning_symbol = _is_winning_symbol(srow)
+
+    if winning_symbol and _env_bool("ENTRY_WINNING_SYMBOL_IGNORE_SENT_ONLY", True):
+        symbol_seen_entries = entry_count
+        count_mode = "actual_entry_count_only_for_winning_symbol"
+    else:
+        symbol_seen_entries = max(entry_count, entry_sent_count)
+        count_mode = "max_entry_count_or_sent_count"
+
+    effective_max_entries = max_entries
+    if winning_symbol:
+        effective_max_entries = max(max_entries, winning_max_entries)
 
     if global_max_trades > 0 and int(grow.get("trade_count") or 0) >= global_max_trades:
         return True, "GLOBAL_DAILY_TRADE_LIMIT", {"symbol": symbol, "side": side_u, "max_trades": global_max_trades, **grow}
@@ -323,17 +359,41 @@ def _risk_block_reason(symbol: str, side: str) -> Tuple[bool, str, Dict[str, Any
     if global_max_consec_losses > 0 and int(grow.get("consecutive_losses") or 0) >= global_max_consec_losses:
         return True, "GLOBAL_CONSECUTIVE_LOSS_LIMIT", {"symbol": symbol, "side": side_u, "max_consecutive_losses": global_max_consec_losses, **grow}
 
-    if max_entries > 0 and symbol_seen_entries >= max_entries:
-        detail = {"symbol": symbol, "side": side_u, "max_entries": max_entries, "symbol_seen_entries": symbol_seen_entries, **srow}
-        return True, "SYMBOL_DAILY_ENTRY_LIMIT", detail
-
-    if stop_after_first_loss and int(srow.get("loss_count") or 0) >= 1:
-        return True, "SYMBOL_STOP_AFTER_FIRST_LOSS", {"symbol": symbol, "side": side_u, **srow}
+    if stop_after_first_loss and loss_count >= 1:
+        if not (stop_after_first_loss_only_net_negative and winning_symbol and daily_pnl > 0):
+            return True, "SYMBOL_STOP_AFTER_FIRST_LOSS", {
+                "symbol": symbol,
+                "side": side_u,
+                "winning_symbol": winning_symbol,
+                "stop_after_first_loss_only_net_negative": stop_after_first_loss_only_net_negative,
+                **srow,
+            }
 
     if float(srow.get("daily_pnl") or 0.0) <= symbol_max_loss:
         return True, "SYMBOL_DAILY_LOSS_LIMIT", {"symbol": symbol, "side": side_u, "max_loss": symbol_max_loss, **srow}
 
-    return False, "", {"symbol": srow, "global": grow}
+    if effective_max_entries > 0 and symbol_seen_entries >= effective_max_entries:
+        detail = {
+            "symbol": symbol,
+            "side": side_u,
+            "max_entries": effective_max_entries,
+            "base_max_entries": max_entries,
+            "winning_max_entries": winning_max_entries,
+            "winning_symbol": winning_symbol,
+            "symbol_seen_entries": symbol_seen_entries,
+            "count_mode": count_mode,
+            **srow,
+        }
+        return True, "SYMBOL_DAILY_ENTRY_LIMIT", detail
+
+    return False, "", {
+        "symbol": srow,
+        "global": grow,
+        "winning_symbol": winning_symbol,
+        "effective_max_entries": effective_max_entries,
+        "symbol_seen_entries": symbol_seen_entries,
+        "count_mode": count_mode,
+    }
 
 
 def install() -> bool:
@@ -353,7 +413,11 @@ def install() -> bool:
         logger.warning("[ENTRY DAILY RISK] _execute_best_candidate not callable")
         return False
 
-    if not getattr(old_execute, "_entry_daily_risk_wrapped_v16", False):
+    if not getattr(old_execute, "_entry_daily_risk_wrapped_v17", False):
+        original = getattr(old_execute, "_original", None) if getattr(old_execute, "_entry_daily_risk_wrapped_v16", False) else old_execute
+        if not callable(original):
+            original = old_execute
+
         def _execute_best_candidate_daily_risk(item: dict, boost_active: bool) -> bool:
             symbol = ""
             side = ""
@@ -370,7 +434,7 @@ def install() -> bool:
             except Exception:
                 logger.exception("[ENTRY DAILY RISK] precheck failed")
 
-            ok = old_execute(item, boost_active=boost_active)
+            ok = original(item, boost_active=boost_active)
 
             try:
                 if bool(ok) and _env_bool("ENTRY_COUNT_SENT_ORDER_AS_DAILY_ENTRY", True):
@@ -381,28 +445,39 @@ def install() -> bool:
             return ok
 
         _execute_best_candidate_daily_risk._entry_daily_risk_wrapped_v16 = True  # type: ignore[attr-defined]
-        _execute_best_candidate_daily_risk._original = old_execute  # type: ignore[attr-defined]
+        _execute_best_candidate_daily_risk._entry_daily_risk_wrapped_v17 = True  # type: ignore[attr-defined]
+        _execute_best_candidate_daily_risk._original = original  # type: ignore[attr-defined]
         ec._execute_best_candidate = _execute_best_candidate_daily_risk
 
-    if callable(old_record_exit) and not getattr(old_record_exit, "_entry_daily_actual_trade_wrapped_v16", False):
+    if callable(old_record_exit) and not getattr(old_record_exit, "_entry_daily_actual_trade_wrapped_v17", False):
+        original_exit = getattr(old_record_exit, "_original", None) if getattr(old_record_exit, "_entry_daily_actual_trade_wrapped_v16", False) else old_record_exit
+        if not callable(original_exit):
+            original_exit = old_record_exit
+
         def _record_exit_event_daily_actual_trade(symbol: Any, *, pnl: float, reason: str, now=None) -> None:
             try:
-                old_record_exit(symbol, pnl=pnl, reason=reason, now=now)
+                original_exit(symbol, pnl=pnl, reason=reason, now=now)
             finally:
                 try:
                     _record_actual_trade(symbol, float(pnl or 0.0))
                 except Exception:
                     logger.exception("[ENTRY DAILY RISK] record actual trade failed symbol=%s", symbol)
+
         _record_exit_event_daily_actual_trade._entry_daily_actual_trade_wrapped_v16 = True  # type: ignore[attr-defined]
-        _record_exit_event_daily_actual_trade._original = old_record_exit  # type: ignore[attr-defined]
+        _record_exit_event_daily_actual_trade._entry_daily_actual_trade_wrapped_v17 = True  # type: ignore[attr-defined]
+        _record_exit_event_daily_actual_trade._original = original_exit  # type: ignore[attr-defined]
         stg.record_exit_event = _record_exit_event_daily_actual_trade
 
     _INSTALLED = True
     logger.warning(
-        "[ENTRY DAILY RISK] installed v1.6 buy_enabled=%s max_symbol_entries=%s stop_after_first_loss=%s symbol_max_loss=%s global_max_loss=%s global_max_trades=%s global_max_consecutive_losses=%s count_mode=entry_sent_and_actual_exit",
+        "[ENTRY DAILY RISK] installed v1.7 buy_enabled=%s max_symbol_entries=%s winning_reentry=%s winning_max_entries=%s winning_ignore_sent_only=%s stop_after_first_loss=%s stop_first_loss_only_net_negative=%s symbol_max_loss=%s global_max_loss=%s global_max_trades=%s global_max_consecutive_losses=%s count_mode=entry_sent_and_actual_exit_with_winning_reentry",
         _env_bool("ENTRY_BUY_ENABLED", True),
         _env_int("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", 2),
+        _env_bool("ENTRY_WINNING_SYMBOL_REENTRY_ENABLED", True),
+        _env_int("ENTRY_WINNING_SYMBOL_MAX_DAILY_ENTRIES", 4),
+        _env_bool("ENTRY_WINNING_SYMBOL_IGNORE_SENT_ONLY", True),
         _env_bool("ENTRY_STOP_SYMBOL_AFTER_FIRST_LOSS", True),
+        _env_bool("ENTRY_STOP_AFTER_FIRST_LOSS_ONLY_IF_NET_NEGATIVE", True),
         _env_float("ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN", -1500.0),
         _env_float("ENTRY_GLOBAL_MAX_DAILY_LOSS_YEN", -50000.0),
         _env_int("ENTRY_GLOBAL_MAX_DAILY_TRADES", 30),
