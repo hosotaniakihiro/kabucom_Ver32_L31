@@ -40,6 +40,7 @@ def _is_database_collector_context() -> bool:
 
 # PUSH WebSocketは main.py/main_database.py の両方で起動し得るため、先に安定化設定を入れる。
 _install("PUSH_RECONNECT_STABILITY", "core.startup.push_stream_reconnect_stability_patch")
+_install("PUSH_ONOPEN_SAFE_REFRESH", "core.startup.push_onopen_refresh_safe_patch")
 
 # ranking WALはDB専用/通常プロセスどちらでも早めにしきい値を下げてからguardを有効化する。
 _install("RANKING_WAL_AGGRESSIVE_TRUNCATE", "core.startup.ranking_wal_aggressive_truncate_patch")
