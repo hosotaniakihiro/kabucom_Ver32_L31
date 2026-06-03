@@ -71,3 +71,5 @@ else:
     _install("ENTRY_ORDER_SHORT_MTF_NEUTRAL_DIRECT", "core.startup.entry_order_short_mtf_neutral_direct_patch")
     _install("TONOSAMA_PRUNE_HARD_NG_PENDING", "core.startup.tonosama_prune_hard_ng_pending_patch")
     _install("TONOSAMA_ORPHAN_CLEANUP", "core.startup.tonosama_orphan_thread_cleanup_patch")
+    _install("TONOSAMA_RANKING_MA_FALLBACK", "core.startup.tonosama_ranking_ma_fallback_patch")
+    _install("SUMMARY_AI_WEAK_NEUTRAL_GUARD", "core.startup.summary_ai_weak_neutral_guard_patch")
