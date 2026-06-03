@@ -1,15 +1,14 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver33-SUMMARY-ENTRY-LOCK-WAIT
+# Version: Ver34-RANKING-STUCK-PENDING-PRUNE
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # 失敗しても本体起動は止めない。
 #
-# Ver33 Fix:
-#   - Summary AI が pending 登録後、entry_controller lock timeout で
-#     実注文まで進まない問題に対応。
-#   - ENTRY_CONTROLLER_LOCK_WAIT_SOURCES に SUMMARY を追加。
-#   - Summary/Raking/Tonosama の lock wait を 75秒既定に延長。
+# Ver34 Fix:
+#   - Ranking pending が RANGE_5M_FILTER_NG / ATR_1M_FILTER_NG 等で
+#     落ち続け、pending_rootに残る問題に対応するため
+#     ranking_stuck_pending_prune_patch を自動installする。
 # ============================================================
 
 from __future__ import annotations
@@ -155,7 +154,6 @@ def _install_tonosama_surge_defaults() -> None:
         os.environ.setdefault("TONOSAMA_SLOPE_RANGE_RESCUE_MIN_SURGE", "0.0")
         os.environ.setdefault("TONOSAMA_SLOPE_RANGE_RESCUE_MIN_ABS_SCORE", "0.0")
 
-        # Tonosama scheduler/dispatch guard.
         os.environ.setdefault("TONOSAMA_ENTRY_TIMEOUT_SEC", "45")
         os.environ.setdefault("TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC", "12")
         os.environ.setdefault("TONOSAMA_DISPATCH_CONTROLLER_ON_TIMEOUT_PENDING", "1")
@@ -172,7 +170,6 @@ def _install_tonosama_surge_defaults() -> None:
         os.environ.setdefault("TONOSAMA_AI_RESCUE_MIN_PRICE_CHANGE_PCT", "0.08")
         os.environ.setdefault("TONOSAMA_AI_RESCUE_MIN_SLOPE_ABS", "0.0003")
 
-        # Entry controller lock wait: SUMMARY を必ず含める。
         os.environ.setdefault("ENTRY_CONTROLLER_LOCK_WAIT_ENABLED", "1")
         os.environ.setdefault("ENTRY_CONTROLLER_LOCK_WAIT_SOURCES", "RANKING,TONOSAMA,SUMMARY")
         os.environ.setdefault("ENTRY_CONTROLLER_LOCK_WAIT_SEC", "75")
@@ -211,12 +208,15 @@ def _install_tonosama_surge_defaults() -> None:
         os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED", "1")
         os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_LOOKBACK_MIN", "8")
         os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_MAX_ROWS", "2000")
+        os.environ.setdefault("RANKING_STUCK_PENDING_MAX_CONTROLLER_RETRY", "2")
+        os.environ.setdefault("RANKING_STUCK_PENDING_MAX_AGE_SEC", "120")
 
         _write_boot_evidence("TONOSAMA_SURGE_DEFAULTS_SET", {
             "short_mtf_require_all": os.environ.get("ENTRY_SHORT_MTF_REQUIRE_ALL"),
             "short_mtf_min_aligned": os.environ.get("ENTRY_SHORT_MTF_MIN_ALIGNED"),
             "ranking_source_db_fallback": os.environ.get("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED"),
             "ranking_hl_patch": os.environ.get("RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH_ENABLED"),
+            "ranking_stuck_pending_retry": os.environ.get("RANKING_STUCK_PENDING_MAX_CONTROLLER_RETRY"),
             "entry_direction_recursion_failopen": os.environ.get("ENTRY_DIRECTION_RECURSION_FAILOPEN_ENABLED"),
             "summary_date_guard": os.environ.get("SUMMARY_DB_DATE_GUARD_ENABLED"),
             "tonosama_price_range_rescue": os.environ.get("TONOSAMA_PRICE_CHANGE_OR_RANGE_ENABLED"),
@@ -230,11 +230,12 @@ def _install_tonosama_surge_defaults() -> None:
             "entry_summary_lock_wait_sec": os.environ.get("ENTRY_CONTROLLER_SUMMARY_LOCK_WAIT_SEC"),
         })
         logger.warning(
-            "[SITECUSTOMIZE] defaults short_mtf_require_all=%s short_mtf_min_aligned=%s ranking_source_db_fallback=%s ranking_hl_patch=%s entry_direction_recursion_failopen=%s summary_date_guard=%s warning_only_climax=%s tonosama_price_range_rescue=%s tonosama_volume_surge_zero_rescue=%s tonosama_slope_range_rescue=%s ai_soft_rescue=%s tonosama_timeout=%s dispatch_timeout_pending=%s entry_lock_wait_sources=%s entry_lock_wait_sec=%s summary_lock_wait_sec=%s",
+            "[SITECUSTOMIZE] defaults short_mtf_require_all=%s short_mtf_min_aligned=%s ranking_source_db_fallback=%s ranking_hl_patch=%s ranking_stuck_retry=%s entry_direction_recursion_failopen=%s summary_date_guard=%s warning_only_climax=%s tonosama_price_range_rescue=%s tonosama_volume_surge_zero_rescue=%s tonosama_slope_range_rescue=%s ai_soft_rescue=%s tonosama_timeout=%s dispatch_timeout_pending=%s entry_lock_wait_sources=%s entry_lock_wait_sec=%s summary_lock_wait_sec=%s",
             os.environ.get("ENTRY_SHORT_MTF_REQUIRE_ALL"),
             os.environ.get("ENTRY_SHORT_MTF_MIN_ALIGNED"),
             os.environ.get("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED"),
-            os.environ.get("RANKING_ENTRY_HIGH_LOW_SNAPSHOT_ENABLED"),
+            os.environ.get("RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH_ENABLED"),
+            os.environ.get("RANKING_STUCK_PENDING_MAX_CONTROLLER_RETRY"),
             os.environ.get("ENTRY_DIRECTION_RECURSION_FAILOPEN_ENABLED"),
             os.environ.get("SUMMARY_DB_DATE_GUARD_ENABLED"),
             os.environ.get("TONOSAMA_ALLOW_WARNING_ONLY_CLIMAX"),
@@ -284,6 +285,7 @@ _install_module("core.startup.tonosama_history_missing_guard_patch", "TONOSAMA_H
 _install_module("core.startup.ranking_entry_flat_price_guard_patch", "RANKING_FLAT_PRICE_DB_FALLBACK", disabled_env="DISABLE_RANKING_FLAT_PRICE_PATCH")
 _install_module("core.startup.ranking_entry_source_db_fallback_patch", "RANKING_ENTRY_SOURCE_DB_FALLBACK", disabled_env="DISABLE_RANKING_ENTRY_SOURCE_DB_FALLBACK_PATCH")
 _install_module("core.startup.ranking_entry_high_low_from_snapshot_patch", "RANKING_ENTRY_HIGH_LOW_SNAPSHOT", disabled_env="DISABLE_RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH")
+_install_module("core.startup.ranking_stuck_pending_prune_patch", "RANKING_STUCK_PENDING_PRUNE", disabled_env="DISABLE_RANKING_STUCK_PENDING_PRUNE_PATCH")
 _install_module("core.startup.entry_direction_recursion_failopen_patch", "ENTRY_DIRECTION_RECURSION_FAILOPEN", disabled_env="DISABLE_ENTRY_DIRECTION_RECURSION_FAILOPEN_PATCH")
 _install_module("core.startup.entry_mtf_short_required_daily_optional_patch", "SHORT_MTF_2OF3_GUARD", disabled_env="DISABLE_SHORT_MTF_2OF3_GUARD_PATCH")
 _install_module("core.startup.entry_controller_pipeline_lock_wait_patch", "ENTRY_CONTROLLER_LOCK_WAIT", disabled_env="DISABLE_ENTRY_CONTROLLER_LOCK_WAIT_PATCH")
