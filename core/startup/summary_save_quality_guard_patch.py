@@ -1,22 +1,12 @@
 # ============================================================
 # File   : core/startup/summary_save_quality_guard_patch.py
-# Version: Ver1-SUMMARY-SAVE-ZERO-TECH-GUARD
+# Version: Ver2-SUMMARY-SAVE-ZERO-TECH-GUARD-YAHOO-CONFLICT
 # ------------------------------------------------------------
 # 目的:
 #   本日summary DBへ OHLCだけ入って score/rsi/macd/signal/mtf 等が
 #   0/欠損のまま保存される事故を防ぐ。
-#
-# 背景:
-#   起動直後やPUSH初期seedでは、価格OHLCはあるが指標未計算のDFが
-#   一時的に流れることがある。
-#   それをDBへUPSERTすると、その時刻の本日summary行が
-#   「項目未格納/0埋め」の状態になる。
-#
-# 方針:
-#   - bootstrap/rebuild/recovery/backfill/repair など保守系保存は通す
-#   - 通常の push/ranking/periodic/cache_writer 保存だけ検査する
-#   - 価格はあるが score系・technical系が全て0/欠損ならDB保存しない
-#   - cache保存や表示は既存処理に任せる
+#   併せて Yahoo direct fallback の UNIQUE conflict upsert patch を
+#   起動時に必ずinstallする。
 # ============================================================
 
 from __future__ import annotations
@@ -61,6 +51,17 @@ def _env_bool(name: str, default: bool = True) -> bool:
         return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
     except Exception:
         return bool(default)
+
+
+def _install_yahoo_conflict_patch() -> bool:
+    try:
+        from core.startup import yahoo_direct_summary_upsert_conflict_patch as p
+        ok = bool(p.install())
+        logger.warning("[SUMMARY SAVE QUALITY GUARD] yahoo direct conflict patch installed=%s", ok)
+        return ok
+    except Exception:
+        logger.exception("[SUMMARY SAVE QUALITY GUARD] yahoo direct conflict patch install failed")
+        return False
 
 
 def _is_maintenance_reason(reason: str) -> bool:
@@ -118,7 +119,6 @@ def _looks_uncomputed_for_db(df: Any, *, save_reason: str = "", interval: int | 
     score_cols = [c for c in _SCORE_COLS if c in df.columns]
     tech_cols = [c for c in _TECH_COLS if c in df.columns]
 
-    # priceだけあるがscore/technicalが完全に0または欠損なら未計算とみなす。
     bad = bool(has_price and score_abs == 0.0 and tech_abs == 0.0)
 
     diag = {
@@ -162,8 +162,11 @@ def _guarded_call(orig, df: pd.DataFrame, interval: int, *args: Any, **kwargs: A
 def install() -> bool:
     global _INSTALLED, _ORIG_BULK, _ORIG_SAVE_BULK, _ORIG_SAVE_DF
     if _INSTALLED:
+        _install_yahoo_conflict_patch()
         return True
     try:
+        _install_yahoo_conflict_patch()
+
         import trading.summary.persistence.summary_saver_bulk as mod
 
         _ORIG_BULK = getattr(mod, "bulk_upsert_summary", None)
@@ -173,23 +176,23 @@ def install() -> bool:
         if callable(_ORIG_BULK):
             def bulk_upsert_summary(df, interval, *args, **kwargs):
                 return _guarded_call(_ORIG_BULK, df, interval, *args, **kwargs)
-            bulk_upsert_summary._summary_save_quality_guard_v1 = True  # type: ignore[attr-defined]
+            bulk_upsert_summary._summary_save_quality_guard_v2 = True  # type: ignore[attr-defined]
             mod.bulk_upsert_summary = bulk_upsert_summary
 
         if callable(_ORIG_SAVE_BULK):
             def save_summary_bulk(df, interval, *args, **kwargs):
                 return _guarded_call(_ORIG_SAVE_BULK, df, interval, *args, **kwargs)
-            save_summary_bulk._summary_save_quality_guard_v1 = True  # type: ignore[attr-defined]
+            save_summary_bulk._summary_save_quality_guard_v2 = True  # type: ignore[attr-defined]
             mod.save_summary_bulk = save_summary_bulk
 
         if callable(_ORIG_SAVE_DF):
             def save_summary_df(df, interval, *args, **kwargs):
                 return _guarded_call(_ORIG_SAVE_DF, df, interval, *args, **kwargs)
-            save_summary_df._summary_save_quality_guard_v1 = True  # type: ignore[attr-defined]
+            save_summary_df._summary_save_quality_guard_v2 = True  # type: ignore[attr-defined]
             mod.save_summary_df = save_summary_df
 
         _INSTALLED = True
-        logger.warning("[SUMMARY SAVE QUALITY GUARD] installed v1 enabled=%s", _env_bool("SUMMARY_SAVE_ZERO_TECH_GUARD", True))
+        logger.warning("[SUMMARY SAVE QUALITY GUARD] installed v2 enabled=%s yahoo_conflict_patch=1", _env_bool("SUMMARY_SAVE_ZERO_TECH_GUARD", True))
         return True
     except Exception:
         logger.exception("[SUMMARY SAVE QUALITY GUARD] install failed")
