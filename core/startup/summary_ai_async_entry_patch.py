@@ -1,16 +1,16 @@
 # ============================================================
 # File   : core/startup/summary_ai_async_entry_patch.py
-# Version: Ver06-QUEUED-IS-NOT-EXECUTED
+# Version: Ver07-RETRY-LOCK-TIMEOUT
 # ------------------------------------------------------------
 # Purpose:
 #   SUMMARY AI の実発注で direct sync が 200秒超ブロックし、
 #   summary parent / display / entry_controller lock を詰まらせる問題を防ぐ。
 #
-# Ver06:
-#   - 非同期キュー投入は submitted_async=True だが executed=False と返す。
-#   - queued_async を「注文実行済み」と誤表示しない。
-#   - worker done 側だけが実際の結果をログする。
-#   - direct sync の既定OFF、最新1件優先、stale 60秒は維持。
+# Ver07:
+#   - worker実行結果が entry_controller_lock_timeout / retryable の場合、
+#     同じ approved をその場で短時間リトライする。
+#   - 「AI_OK候補はあるがlock timeoutで次サイクルまで注文に行かない」時間を短縮する。
+#   - stale判定は維持し、古い候補は追いかけすぎない。
 # ============================================================
 
 from __future__ import annotations
@@ -36,6 +36,9 @@ os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC", "0")
 os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_DROP_BUSY", "0")
 os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX", "1")
 os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", "60")
+os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY", "1")
+os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX", "4")
+os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_SLEEP_SEC", "2.0")
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -93,6 +96,49 @@ def _symbols(rows: Any, limit: int = 20) -> list[str]:
     return [x for x in out if x]
 
 
+def _unwrap_result(result: Any) -> Any:
+    """入れ子になった result を浅く辿る。"""
+    cur = result
+    try:
+        for _ in range(5):
+            if isinstance(cur, dict) and isinstance(cur.get("result"), dict):
+                cur = cur.get("result")
+                continue
+            break
+    except Exception:
+        return result
+    return cur
+
+
+def _skip_reason(result: Any) -> str:
+    try:
+        reasons: list[str] = []
+        cur = result
+        for _ in range(6):
+            if not isinstance(cur, dict):
+                break
+            r = cur.get("skip_reason") or cur.get("lock_wait_reason")
+            if r:
+                reasons.append(str(r))
+            nxt = cur.get("result")
+            if not isinstance(nxt, dict):
+                break
+            cur = nxt
+        return "|".join(reasons)
+    except Exception:
+        return ""
+
+
+def _is_retryable_lock_timeout(result: Any) -> bool:
+    try:
+        text = _skip_reason(result).lower()
+        unwrapped = _unwrap_result(result)
+        retryable = bool(unwrapped.get("retryable")) if isinstance(unwrapped, dict) else False
+        return retryable or "lock_timeout" in text or "entry_controller_lock_timeout" in text
+    except Exception:
+        return False
+
+
 def _summarize_result(result: Any) -> dict[str, Any]:
     try:
         if isinstance(result, dict):
@@ -101,6 +147,8 @@ def _summarize_result(result: Any) -> dict[str, Any]:
                 "submitted_async": bool(result.get("submitted_async")),
                 "skip_reason": result.get("skip_reason"),
                 "approved": _safe_len(result.get("approved_rows")),
+                "retryable_lock_timeout": _is_retryable_lock_timeout(result),
+                "reason_chain": _skip_reason(result),
                 "result_type": type(result.get("result")).__name__,
                 "result": result.get("result"),
             }
@@ -131,6 +179,18 @@ def _build_approved_rows(ai_results: Any, max_entries: int) -> list[Any]:
     return []
 
 
+def _execute_original(item: dict[str, Any]) -> Any:
+    return _ORIG_EXECUTE(
+        item["ai_results"],
+        df_summary=item["df_summary"],
+        interval=item["interval"],
+        max_entries=item["max_entries"],
+        dry_run=False,
+        require_market_open=item["require_market_open"],
+        entry_pipeline=item["entry_pipeline"],
+    )
+
+
 def _run_worker_loop() -> None:
     global _WORKER_RUNNING
     while True:
@@ -157,33 +217,54 @@ def _run_worker_loop() -> None:
                     seq, interval, age_sec, stale_sec, len(approved_rows), _symbols(approved_rows), q_left,
                 )
                 continue
-
             if bool(item.get("require_market_open")) and not _market_open_now():
                 logger.warning(
                     "[SUMMARY AI ASYNC ENTRY] worker skip market_closed seq=%s interval=%s age=%.3fs approved=%s symbols=%s queue_left=%s",
                     seq, interval, age_sec, len(approved_rows), _symbols(approved_rows), q_left,
                 )
                 continue
-
             if not callable(_ORIG_EXECUTE):
                 logger.warning("[SUMMARY AI ASYNC ENTRY] worker original executor missing seq=%s", seq)
                 continue
 
+            retry_enabled = _env_bool("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY", True)
+            retry_max = max(1, _env_int("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX", 4))
+            retry_sleep = max(0.2, _env_float("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_SLEEP_SEC", 2.0))
+            result: Any = None
+
+            for attempt in range(1, retry_max + 1):
+                attempt_started = time.time()
+                logger.warning(
+                    "[SUMMARY AI ASYNC ENTRY] worker start seq=%s interval=%s attempt=%s/%s age=%.3fs approved=%s symbols=%s queue_left=%s",
+                    seq, interval, attempt, retry_max, max(0.0, attempt_started - queued_at), len(approved_rows), _symbols(approved_rows), q_left,
+                )
+                result = _execute_original(item)
+                summary = _summarize_result(result)
+                logger.warning(
+                    "[SUMMARY AI ASYNC ENTRY] worker attempt done seq=%s interval=%s attempt=%s/%s elapsed=%.3fs summary=%s",
+                    seq, interval, attempt, retry_max, time.time() - attempt_started, summary,
+                )
+
+                if not retry_enabled or not _is_retryable_lock_timeout(result):
+                    break
+
+                age_now = max(0.0, time.time() - queued_at)
+                if stale_sec > 0 and age_now + retry_sleep > stale_sec:
+                    logger.warning(
+                        "[SUMMARY AI ASYNC ENTRY] retry stop stale risk seq=%s attempt=%s age=%.3fs stale_sec=%.3f",
+                        seq, attempt, age_now, stale_sec,
+                    )
+                    break
+
+                if attempt < retry_max:
+                    logger.warning(
+                        "[SUMMARY AI ASYNC ENTRY] retry because entry_controller lock timeout seq=%s next_attempt=%s sleep=%.2fs symbols=%s",
+                        seq, attempt + 1, retry_sleep, _symbols(approved_rows),
+                    )
+                    time.sleep(retry_sleep)
+
             logger.warning(
-                "[SUMMARY AI ASYNC ENTRY] worker start seq=%s interval=%s age=%.3fs approved=%s symbols=%s queue_left=%s",
-                seq, interval, age_sec, len(approved_rows), _symbols(approved_rows), q_left,
-            )
-            result = _ORIG_EXECUTE(
-                item["ai_results"],
-                df_summary=item["df_summary"],
-                interval=interval,
-                max_entries=item["max_entries"],
-                dry_run=False,
-                require_market_open=item["require_market_open"],
-                entry_pipeline=item["entry_pipeline"],
-            )
-            logger.warning(
-                "[SUMMARY AI ASYNC ENTRY] worker done seq=%s interval=%s elapsed=%.3fs summary=%s",
+                "[SUMMARY AI ASYNC ENTRY] worker done seq=%s interval=%s elapsed=%.3fs final_summary=%s",
                 seq, interval, time.time() - started, _summarize_result(result),
             )
         except Exception as e:
@@ -277,8 +358,16 @@ def _patched_execute_ai_ok_entries_bulk(
     if dropped:
         logger.warning("[SUMMARY AI ASYNC ENTRY] queued latest and dropped old count=%s seq=%s interval=%s", dropped, seq, interval)
     logger.warning(
-        "[SUMMARY AI ASYNC ENTRY] queued seq=%s interval=%s approved=%s symbols=%s queue_size=%s stale_sec=%.3f direct_sync=False executed=False submitted_async=True",
-        seq, interval, len(approved_rows), _symbols(approved_rows), q_size, _env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 60.0),
+        "[SUMMARY AI ASYNC ENTRY] queued seq=%s interval=%s approved=%s symbols=%s queue_size=%s stale_sec=%.3f direct_sync=False executed=False submitted_async=True lock_retry=%s retry_max=%s retry_sleep=%.2f",
+        seq,
+        interval,
+        len(approved_rows),
+        _symbols(approved_rows),
+        q_size,
+        _env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 60.0),
+        _env_bool("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY", True),
+        _env_int("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX", 4),
+        _env_float("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_SLEEP_SEC", 2.0),
     )
     return {
         "executed": False,
@@ -309,25 +398,32 @@ def install() -> bool:
         from trading.entry.summary_ai import runner as runner_mod
 
         current = getattr(exec_mod, "execute_ai_ok_entries_bulk", None)
-        if getattr(current, "_summary_ai_async_entry_patch_v6", False):
+        if getattr(current, "_summary_ai_async_entry_patch_v7", False):
             _INSTALLED = True
-            logger.warning("[SUMMARY AI ASYNC ENTRY] already installed v6")
+            logger.warning("[SUMMARY AI ASYNC ENTRY] already installed v7")
             return True
+        _ORIG_EXECUTE = getattr(current, "_original", None) if getattr(current, "_summary_ai_async_entry_patch_v6", False) else current
+        if not callable(_ORIG_EXECUTE):
+            _ORIG_EXECUTE = current
 
-        _ORIG_EXECUTE = current
+        _patched_execute_ai_ok_entries_bulk._summary_ai_async_entry_patch_v7 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_async_entry_patch_v6 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_async_entry_patch_v5 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_async_entry_patch_v4 = True  # type: ignore[attr-defined]
+        _patched_execute_ai_ok_entries_bulk._original = _ORIG_EXECUTE  # type: ignore[attr-defined]
         exec_mod.execute_ai_ok_entries_bulk = _patched_execute_ai_ok_entries_bulk
         runner_mod.execute_ai_ok_entries_bulk = _patched_execute_ai_ok_entries_bulk
 
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY AI ASYNC ENTRY] installed v6 enabled=%s direct_sync=%s queue_max=%s stale_sec=%.3f latest_only=True queued_is_not_executed=True",
+            "[SUMMARY AI ASYNC ENTRY] installed v7 enabled=%s direct_sync=%s queue_max=%s stale_sec=%.3f latest_only=True queued_is_not_executed=True lock_retry=%s retry_max=%s retry_sleep=%.2f",
             _env_bool("SUMMARY_AI_ASYNC_ENTRY", True),
             _env_bool("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC", False),
             _env_int("SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX", 1),
             _env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 60.0),
+            _env_bool("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY", True),
+            _env_int("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX", 4),
+            _env_float("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_SLEEP_SEC", 2.0),
         )
         return True
     except Exception as e:
