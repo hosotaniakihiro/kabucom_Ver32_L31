@@ -84,3 +84,4 @@ else:
     _install("TONOSAMA_ORPHAN_CLEANUP", "core.startup.tonosama_orphan_thread_cleanup_patch")
     _install("TONOSAMA_RANKING_MA_FALLBACK", "core.startup.tonosama_ranking_ma_fallback_patch")
     _install("SUMMARY_AI_WEAK_NEUTRAL_GUARD", "core.startup.summary_ai_weak_neutral_guard_patch")
+    _install("ENTRY_IMMEDIATE_MOVEMENT_GUARD", "core.startup.entry_immediate_movement_guard_patch")
