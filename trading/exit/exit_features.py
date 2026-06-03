@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/exit/exit_features.py
-# Version: V1.0-SPLIT-EXIT-FEATURES
+# Version: V1.1-SELL-MIRROR-5SEC-FEATURES
 # ------------------------------------------------------------
 # 【概要】
 #   EXIT判定に使う特徴量構築。
@@ -9,6 +9,10 @@
 #   - ctx.build_features(price)
 #   - daily cache の注入
 #   - 5秒足特徴量の抽出
+#
+# V1.1:
+#   - Tonosama SELL EXIT 用に、連続陽線 / VWAP上抜け / 安値 after entry を取得。
+#   - BUY側の既存キーはそのまま維持。
 # ============================================================
 
 from __future__ import annotations
@@ -211,6 +215,25 @@ def build_5sec_exit_features_safe(
             "down_bars",
         )
 
+    bar5s_consecutive_up = from_bar_int(
+        "bar5s_consecutive_up",
+        "five_sec_consecutive_up",
+        "consecutive_up",
+        "up_count",
+        "up_bars",
+    )
+    if bar5s_consecutive_up is None:
+        bar5s_consecutive_up = get_feature_int_or_none(
+            features,
+            ctx,
+            pos,
+            "bar5s_consecutive_up",
+            "five_sec_consecutive_up",
+            "consecutive_up",
+            "up_count",
+            "up_bars",
+        )
+
     bar5s_volume_ratio = from_bar_float(
         "bar5s_volume_ratio",
         "five_sec_volume_ratio",
@@ -251,6 +274,27 @@ def build_5sec_exit_features_safe(
             "below_vwap",
         )
 
+    bar5s_vwap_above = from_bar_bool(
+        "bar5s_vwap_above",
+        "five_sec_vwap_above",
+        "vwap_above",
+        "is_vwap_above",
+        "above_vwap",
+        "vwap_cross_up",
+    )
+    if bar5s_vwap_above is None:
+        bar5s_vwap_above = get_feature_bool_or_none(
+            features,
+            ctx,
+            pos,
+            "bar5s_vwap_above",
+            "five_sec_vwap_above",
+            "vwap_above",
+            "is_vwap_above",
+            "above_vwap",
+            "vwap_cross_up",
+        )
+
     bar5s_high_after_entry = from_bar_float(
         "bar5s_high_after_entry",
         "five_sec_high_after_entry",
@@ -271,23 +315,49 @@ def build_5sec_exit_features_safe(
             "highest",
         )
 
+    bar5s_low_after_entry = from_bar_float(
+        "bar5s_low_after_entry",
+        "five_sec_low_after_entry",
+        "low_after_entry",
+        "lowest_after_entry",
+        "lowest",
+        "low",
+    )
+    if bar5s_low_after_entry is None:
+        bar5s_low_after_entry = get_feature_value_or_none(
+            features,
+            ctx,
+            pos,
+            "bar5s_low_after_entry",
+            "five_sec_low_after_entry",
+            "low_after_entry",
+            "lowest_after_entry",
+            "lowest",
+        )
+
     out = {
         "bar5s_drop_pct": bar5s_drop_pct,
         "bar5s_consecutive_down": bar5s_consecutive_down,
+        "bar5s_consecutive_up": bar5s_consecutive_up,
         "bar5s_volume_ratio": bar5s_volume_ratio,
         "bar5s_vwap_break": bar5s_vwap_break,
+        "bar5s_vwap_above": bar5s_vwap_above,
         "bar5s_high_after_entry": bar5s_high_after_entry,
+        "bar5s_low_after_entry": bar5s_low_after_entry,
     }
 
     logger.debug(
-        "[TONOSAMA 5SEC FEATURES] symbol=%s drop=%s down=%s vol_ratio=%s "
-        "vwap_break=%s high_after=%s",
+        "[TONOSAMA 5SEC FEATURES] symbol=%s drop=%s down=%s up=%s vol_ratio=%s "
+        "vwap_break=%s vwap_above=%s high_after=%s low_after=%s",
         symbol,
         out["bar5s_drop_pct"],
         out["bar5s_consecutive_down"],
+        out["bar5s_consecutive_up"],
         out["bar5s_volume_ratio"],
         out["bar5s_vwap_break"],
+        out["bar5s_vwap_above"],
         out["bar5s_high_after_entry"],
+        out["bar5s_low_after_entry"],
     )
 
     return out
