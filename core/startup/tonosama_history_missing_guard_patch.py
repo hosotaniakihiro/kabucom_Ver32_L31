@@ -1,24 +1,23 @@
 # ============================================================
 # File   : core/startup/tonosama_history_missing_guard_patch.py
-# Version: V2.2-TONOSAMA-HISTORY-MISSING-PASS-THROUGH
+# Version: V2.3-TONOSAMA-HISTORY-MISSING-FAIL-CLOSE
 # ------------------------------------------------------------
 # 目的:
-#   volume_surge.py が controlled fail-open で作った候補を、ここで全件DROPして
-#   base feature empty に戻す問題を止める。
+#   3m/5mの出来高急増履歴が無い状態で controlled fail-open された
+#   TONOSAMA候補を、既定で全件DROPする。
 #
 # 背景:
-#   2026-05-27 14:18ログで、volume_surge.py は43件を作ったが、
-#   TONOSAMA HISTORY GUARD が history_missing_not_enough_real_move で43件全DROPした。
+#   09:04直後など、3m/5mの履歴が揃う前に
+#   _max_volume_surge_ratio=3.0 の仮値で候補化され、
+#   実際の出来高急増ではない銘柄が entry 直前まで進む問題を防ぐ。
 #
 # 方針:
-#   - 履歴不足 / fail-open 行は、このpatchでは既定で落とさない。
-#   - 実際の絞り込みは runner.py 側の latest_volume / price_change / slope /
-#     5秒足 / AI fallback / entry_controller 発注直前ガードに任せる。
-#   - 厳格運用に戻したい場合だけ ENV で明示DROPする。
+#   - 履歴不足 / fail-open 行は既定で落とす。
+#   - 明示的に許可したい場合だけ ENV で許可する。
 #
 # ENV:
-#   TONOSAMA_ALLOW_HISTORY_MISSING_ENTRY=1   # default allow
-#   TONOSAMA_DROP_HISTORY_MISSING_ENTRY=0    # set 1 to force drop
+#   TONOSAMA_ALLOW_HISTORY_MISSING_ENTRY=0   # default reject
+#   TONOSAMA_DROP_HISTORY_MISSING_ENTRY=1    # default drop
 # ============================================================
 
 from __future__ import annotations
@@ -115,11 +114,11 @@ def _drop_history_missing_failopen(df: pd.DataFrame, *, stage: str) -> pd.DataFr
     if affected <= 0:
         return df
 
-    allow = _env_bool("TONOSAMA_ALLOW_HISTORY_MISSING_ENTRY", True)
-    drop = _env_bool("TONOSAMA_DROP_HISTORY_MISSING_ENTRY", False)
+    allow = _env_bool("TONOSAMA_ALLOW_HISTORY_MISSING_ENTRY", False)
+    drop = _env_bool("TONOSAMA_DROP_HISTORY_MISSING_ENTRY", True)
     if allow and not drop:
         logger.warning(
-            "[TONOSAMA HISTORY GUARD] pass-through history-missing/failopen rows stage=%s rows=%s affected=%s sample=%s",
+            "[TONOSAMA HISTORY GUARD] explicitly pass-through history-missing/failopen rows stage=%s rows=%s affected=%s sample=%s",
             stage,
             len(df),
             affected,
@@ -129,11 +128,13 @@ def _drop_history_missing_failopen(df: pd.DataFrame, *, stage: str) -> pd.DataFr
 
     out = df.loc[~hist_mask].copy()
     logger.warning(
-        "[TONOSAMA HISTORY GUARD] dropped by env stage=%s before=%s after=%s dropped=%s sample=%s",
+        "[TONOSAMA HISTORY GUARD] fail-close dropped history-missing/failopen rows stage=%s before=%s after=%s dropped=%s allow=%s drop=%s sample=%s",
         stage,
         len(df),
         len(out),
         affected,
+        allow,
+        drop,
         _sample(df.loc[hist_mask].copy()),
     )
     return out
@@ -151,8 +152,8 @@ def install() -> bool:
     if _PATCHED:
         return True
 
-    _setdefault_env("TONOSAMA_ALLOW_HISTORY_MISSING_ENTRY", "1")
-    _setdefault_env("TONOSAMA_DROP_HISTORY_MISSING_ENTRY", "0")
+    _setdefault_env("TONOSAMA_ALLOW_HISTORY_MISSING_ENTRY", "0")
+    _setdefault_env("TONOSAMA_DROP_HISTORY_MISSING_ENTRY", "1")
 
     if not _env_bool("TONOSAMA_HISTORY_MISSING_GUARD_ENABLED", True):
         logger.warning("[TONOSAMA HISTORY GUARD] disabled by env")
@@ -176,9 +177,9 @@ def install() -> bool:
         runner.build_scalping_feature_df = _patched_build_scalping_feature_df
         _PATCHED = True
         logger.warning(
-            "[TONOSAMA HISTORY GUARD] installed v2.2 pass_through=%s drop=%s",
-            _env_bool("TONOSAMA_ALLOW_HISTORY_MISSING_ENTRY", True),
-            _env_bool("TONOSAMA_DROP_HISTORY_MISSING_ENTRY", False),
+            "[TONOSAMA HISTORY GUARD] installed v2.3 fail_close allow=%s drop=%s",
+            _env_bool("TONOSAMA_ALLOW_HISTORY_MISSING_ENTRY", False),
+            _env_bool("TONOSAMA_DROP_HISTORY_MISSING_ENTRY", True),
         )
         return True
     except Exception:
