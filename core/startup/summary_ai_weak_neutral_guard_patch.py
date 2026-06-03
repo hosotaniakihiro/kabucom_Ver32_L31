@@ -1,10 +1,16 @@
 # ============================================================
 # File   : core/startup/summary_ai_weak_neutral_guard_patch.py
-# Version: V1.0-SUMMARY-AI-WEAK-NEUTRAL-GUARD
+# Version: V2-SUMMARY-AI-WEAK-NEUTRAL-GUARD-BROADER
 # ------------------------------------------------------------
 # SUMMARY AI approved化直前の安全ガード。
-# slope=0 / macd=0 / rsi=50 近辺で、side scoreだけが1.0の候補を
+# slope / macd / rsi が中立で、side scoreだけが低い候補を
 # BUY/SELL根拠不足として除外する。
+#
+# V2:
+#   - score=1.0だけでなく、1.25程度の弱い候補も除外対象にする。
+#   - 6072 のように score=1.20 だが rsi=50/macd=0/slope微小の候補も
+#     approved候補から外し、daily-risk 1銘柄だけが残って approved=0 になる
+#     ノイズを減らす。
 # ============================================================
 from __future__ import annotations
 
@@ -59,7 +65,7 @@ def _norm_side(v: Any) -> str:
 
 def _dicts(item: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
     yield item
-    for k in ("ai_row", "source_row", "row", "src"):
+    for k in ("ai_row", "source_row", "row", "src", "entry", "entry_row"):
         v = item.get(k)
         if isinstance(v, dict):
             yield v
@@ -102,30 +108,33 @@ def _is_weak_neutral(item: Dict[str, Any]) -> tuple[bool, Dict[str, Any]]:
     side = _side(item)
     source = _source(item)
 
-    # SUMMARY/PUSH/YAHOO系だけ。RANKING専用の疑似価格系は別ポリシーで扱う。
-    source_ok = source in {"SUMMARY", "PUSH", "PUSH_SUMMARY", "SUMMARY_AI", "YAHOO", "YAHOO_SUMMARY"}
+    source_ok = source in {"SUMMARY", "PUSH", "PUSH_SUMMARY", "SUMMARY_AI", "YAHOO", "YAHOO_SUMMARY", ""}
     if not source_ok:
         return False, {"reason": "source_skip", "source": source, "side": side}
 
     slope = _safe_float(_first(item, "slope", "disp_slope", default=0.0))
     macd = _safe_float(_first(item, "macd", default=0.0))
+    signal = _safe_float(_first(item, "signal", default=0.0))
     rsi = _safe_float(_first(item, "rsi", default=50.0), 50.0)
     score = _side_score(item, side)
     mtf = _safe_float(_first(item, "mtf", "score_mtf", "mtf_score", default=0.0))
 
-    max_score = _env_float("SUMMARY_AI_WEAK_NEUTRAL_MAX_SIDE_SCORE", 1.0001)
-    slope_eps = abs(_env_float("SUMMARY_AI_WEAK_NEUTRAL_SLOPE_EPS", 0.0001))
+    max_score = _env_float("SUMMARY_AI_WEAK_NEUTRAL_MAX_SIDE_SCORE", 1.25)
+    slope_eps = abs(_env_float("SUMMARY_AI_WEAK_NEUTRAL_SLOPE_EPS", 0.0002))
     macd_eps = abs(_env_float("SUMMARY_AI_WEAK_NEUTRAL_MACD_EPS", 0.0001))
     rsi_low = _env_float("SUMMARY_AI_WEAK_NEUTRAL_RSI_LOW", 45.0)
     rsi_high = _env_float("SUMMARY_AI_WEAK_NEUTRAL_RSI_HIGH", 55.0)
 
-    weak = bool(score <= max_score and abs(slope) <= slope_eps and abs(macd) <= macd_eps and rsi_low <= rsi <= rsi_high)
+    # macd/signal両方が0、またはmacd-signalが極小なら中立扱い。
+    macd_neutral = abs(macd) <= macd_eps and abs(signal) <= macd_eps
+    weak = bool(score <= max_score and abs(slope) <= slope_eps and macd_neutral and rsi_low <= rsi <= rsi_high)
     return weak, {
         "side": side,
         "source": source,
         "score": score,
         "slope": slope,
         "macd": macd,
+        "signal": signal,
         "rsi": rsi,
         "mtf": mtf,
         "max_score": max_score,
@@ -162,6 +171,7 @@ def _patched_build_ai_ok_approved_rows(ai_results, *args, **kwargs):
                     "score": round(float(diag.get("score") or 0.0), 4),
                     "slope": round(float(diag.get("slope") or 0.0), 6),
                     "macd": round(float(diag.get("macd") or 0.0), 6),
+                    "signal": round(float(diag.get("signal") or 0.0), 6),
                     "rsi": round(float(diag.get("rsi") or 0.0), 2),
                     "mtf": round(float(diag.get("mtf") or 0.0), 3),
                     "reason": "weak_neutral_no_technical_basis",
@@ -178,27 +188,48 @@ def _patched_build_ai_ok_approved_rows(ai_results, *args, **kwargs):
             "[SUMMARY AI WEAK NEUTRAL GUARD] removed before approved before=%s after_allow=%s skipped=%s",
             len(list(ai_results or [])),
             sum(1 for x in kept if isinstance(x, dict) and bool(x.get("allow"))),
-            skipped[:30],
+            skipped[:50],
         )
     return _ORIG_BUILD(kept, *args, **kwargs)  # type: ignore[misc]
 
 
 def install() -> bool:
     global _INSTALLED, _ORIG_BUILD
-    if _INSTALLED:
-        return True
     try:
         import trading.entry.summary_ai.executor as executor
 
         fn = getattr(executor, "build_ai_ok_approved_rows", None)
-        if not callable(fn):
+        if getattr(fn, "_summary_ai_weak_neutral_guard_v2", False):
+            _INSTALLED = True
+            return True
+        original = getattr(fn, "_original", None) if callable(fn) else None
+        if callable(original):
+            _ORIG_BUILD = original
+        elif callable(fn):
+            _ORIG_BUILD = fn
+        else:
             logger.warning("[SUMMARY AI WEAK NEUTRAL GUARD] target not found")
             return False
-        _ORIG_BUILD = fn
+        _patched_build_ai_ok_approved_rows._summary_ai_weak_neutral_guard_v2 = True  # type: ignore[attr-defined]
+        _patched_build_ai_ok_approved_rows._original = _ORIG_BUILD  # type: ignore[attr-defined]
         executor.build_ai_ok_approved_rows = _patched_build_ai_ok_approved_rows
         _INSTALLED = True
-        logger.warning("[SUMMARY AI WEAK NEUTRAL GUARD] installed v1")
+        logger.warning(
+            "[SUMMARY AI WEAK NEUTRAL GUARD] installed v2 max_score=%.3f slope_eps=%.6f rsi=[%.1f, %.1f]",
+            _env_float("SUMMARY_AI_WEAK_NEUTRAL_MAX_SIDE_SCORE", 1.25),
+            abs(_env_float("SUMMARY_AI_WEAK_NEUTRAL_SLOPE_EPS", 0.0002)),
+            _env_float("SUMMARY_AI_WEAK_NEUTRAL_RSI_LOW", 45.0),
+            _env_float("SUMMARY_AI_WEAK_NEUTRAL_RSI_HIGH", 55.0),
+        )
         return True
     except Exception:
         logger.exception("[SUMMARY AI WEAK NEUTRAL GUARD] install failed")
         return False
+
+
+try:
+    install()
+except Exception:
+    logger.exception("[SUMMARY AI WEAK NEUTRAL GUARD] auto install failed")
+
+__all__ = ["install"]
