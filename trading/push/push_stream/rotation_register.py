@@ -1,23 +1,27 @@
 # ============================================================
 # File   : trading/push/push_stream/rotation_register.py
-# Version: PRODUCTION-STABLE-REV2-PUSH-ROTATION-REGISTER-INDEPENDENT
+# Version: PRODUCTION-STABLE-REV3-PUSH-ROTATION-REGISTER-NON-DESTRUCTIVE
 # ------------------------------------------------------------
 # PUSH A/Bローテーション用の登録委譲API。
 #
 # Responsibilities:
 #   - 50銘柄登録を subscription_manager refresh_callable へ委譲
-#   - 登録前に clear_first / unregister_first を指定
-#   - 全解除後 0.2秒待機してから登録
+#   - 既定では clear_first / unregister_first を使わない
+#   - kabu Station WinError 10054 対策として、rotationごとの全解除を禁止
 #   - timeout付き登録で rotation worker を止めない
 #
-# Notes:
-#   - 旧 rotation.py へ依存しない独立実装。
+# Env override:
+#   PUSH_ROTATION_REGISTER_FORCE=0/1
+#   PUSH_ROTATION_CLEAR_FIRST=0/1
+#   PUSH_ROTATION_UNREGISTER_FIRST=0/1
+#   PUSH_ROTATION_WAIT_AFTER_CLEAR_SEC=0.0
 # ============================================================
 
 from __future__ import annotations
 
 import concurrent.futures
 import logging
+import os
 from typing import Any, Iterable, Sequence
 
 from . import state
@@ -31,7 +35,27 @@ from .transport import _call_refresh
 
 logger = logging.getLogger(__name__)
 
-VERSION = "PRODUCTION-STABLE-REV2-PUSH-ROTATION-REGISTER-INDEPENDENT"
+VERSION = "PRODUCTION-STABLE-REV3-PUSH-ROTATION-REGISTER-NON-DESTRUCTIVE"
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
 
 
 def refresh_result_to_ok(result: Any) -> bool:
@@ -77,10 +101,11 @@ def register_symbols(symbols: Iterable[str], force: bool = False, **kwargs: Any)
     kabu Station への実登録は subscription_manager の refresh_callable に委譲する。
 
     重要:
-      - ここでは WebSocket ws.send による register はしない
-      - clear_first=True / unregister_first=True で、毎回 全解除 -> 0.2秒待機 -> 登録
+      - ここでは WebSocket ws.send による直接 register はしない
+      - REV3: 既定では全解除しない。rotationごとに unregister/register を連発すると
+        kabu Station が WinError 10054 で切断するため。
+      - 全解除が必要な緊急時だけ環境変数で明示的に有効化する。
     """
-    del force
 
     cleaned, raw_count, filler_count, invalid_count = clean_symbol_list(symbols)
     items = cleaned[:DEFAULT_REGISTER_CHUNK_SIZE]
@@ -105,22 +130,32 @@ def register_symbols(symbols: Iterable[str], force: bool = False, **kwargs: Any)
     reason = str(kwargs.get("reason") or "rotation")
     label = str(kwargs.get("label") or reason.replace("rotation_", "").upper())
 
+    # force引数より環境変数を優先。ただし既定はFalse。
+    effective_force = _env_bool("PUSH_ROTATION_REGISTER_FORCE", bool(force and False))
+    clear_first = _env_bool("PUSH_ROTATION_CLEAR_FIRST", False)
+    unregister_first = _env_bool("PUSH_ROTATION_UNREGISTER_FIRST", False)
+    wait_after_clear = _env_float("PUSH_ROTATION_WAIT_AFTER_CLEAR_SEC", 0.0)
+    unregister_wait = _env_float("PUSH_ROTATION_UNREGISTER_WAIT_SEC", wait_after_clear)
+
     try:
-        logger.info(
-            "[push_stream] refresh call reason=%s size=%d head=%s clear_first=True wait_after_clear=%.3fs",
+        logger.warning(
+            "[push_stream] refresh call reason=%s size=%d head=%s force=%s clear_first=%s unregister_first=%s wait_after_clear=%.3fs",
             reason,
             len(items),
             items[:10],
-            UNREGISTER_TO_REGISTER_WAIT_SEC,
+            effective_force,
+            clear_first,
+            unregister_first,
+            wait_after_clear,
         )
 
         result = _call_refresh(
-            force=True,
+            force=effective_force,
             reason=reason,
-            clear_first=True,
-            unregister_first=True,
-            wait_after_clear_sec=UNREGISTER_TO_REGISTER_WAIT_SEC,
-            unregister_wait_sec=UNREGISTER_TO_REGISTER_WAIT_SEC,
+            clear_first=clear_first,
+            unregister_first=unregister_first,
+            wait_after_clear_sec=wait_after_clear,
+            unregister_wait_sec=unregister_wait,
             symbols=items,
             codes=items,
             items=items,
@@ -160,9 +195,8 @@ def run_one_batch(*, label: str, symbols: Sequence[str]) -> bool:
             invalid_count,
         )
         return False
-
     reason = f"rotation_{label}"
-    return register_symbols(cleaned, force=True, reason=reason, label=label)
+    return register_symbols(cleaned, force=False, reason=reason, label=label)
 
 
 def run_one_batch_with_timeout(
@@ -183,7 +217,6 @@ def run_one_batch_with_timeout(
             invalid_count,
         )
         return False
-
     logger.info(
         "[push_stream] rotation %s register dispatch timeout=%.3fs size=%d head=%s",
         label,
