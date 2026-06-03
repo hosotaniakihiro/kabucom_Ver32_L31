@@ -38,6 +38,12 @@ def _is_database_collector_context() -> bool:
         pass
     return False
 
+# PUSH WebSocketは main.py/main_database.py の両方で起動し得るため、先に安定化設定を入れる。
+_install("PUSH_RECONNECT_STABILITY", "core.startup.push_stream_reconnect_stability_patch")
+
+# ranking WALはDB専用/通常プロセスどちらでも早めにしきい値を下げてからguardを有効化する。
+_install("RANKING_WAL_AGGRESSIVE_TRUNCATE", "core.startup.ranking_wal_aggressive_truncate_patch")
+
 # DB専用プロセスでは、ENTRY/TONOSAMA/AI系の重いruntime patchを読み込まない。
 # main_database.pyのメモリ消費を抑え、ranking WAL guardなどDB系だけを有効にする。
 if _is_database_collector_context():
@@ -46,6 +52,7 @@ if _is_database_collector_context():
     logger.warning("[USERCUSTOMIZE] database collector context detected -> heavy entry/tonosama patches skipped argv=%s", sys.argv)
 else:
     _install("RANKING_WAL_MEMORY_GUARD", "core.startup.ranking_wal_checkpoint_memory_guard_patch")
+    _install("TONOSAMA_RUNTIME_25SEC_BUDGET", "core.startup.tonosama_runtime_25sec_budget_patch")
     _install("TONOSAMA_LUNCH_REOPEN_RECENT", "core.startup.tonosama_lunch_reopen_recent_patch")
     _install("YAHOO_COMPUTE_SCHEMA_NA_GUARD", "core.startup.yahoo_compute_schema_na_guard_patch")
     _install("RANKING_ENTRY_FAST_BUDGET_OVERRIDE", "core.startup.ranking_entry_fast_budget_override_patch")
