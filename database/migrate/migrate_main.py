@@ -1,6 +1,6 @@
 # ============================================================
 # File: database/migrate/migrate_main.py
-# Ver34.0-PRODUCTION-MIGRATION-ORCHESTRATOR-STARTUP-LIGHT-FULL-SAFE-FINAL
+# Ver34.1-RANKING-MIGRATION-IMPORT-COMPAT
 # ------------------------------------------------------------
 # ✔ SAFE MIGRATION MODE 対応
 # ✔ Lazy session 完全互換
@@ -19,6 +19,7 @@
 # ✔ 起動時軽量 migration 追加
 # ✔ 手動完全 migration 追加
 # ✔ 既存 run_migration() 互換維持
+# ✔ Ver34.1: migrate_ranking が無い版でも run_migration を別名importして起動停止を防止
 # ============================================================
 
 from __future__ import annotations
@@ -33,7 +34,10 @@ from .migrate_push import migrate_push
 from .migrate_summary_duck import migrate_summary_duck
 from .migrate_summary_sqlite import migrate_summary_sqlite
 from .migrate_position import migrate_position
-from .migrate_ranking import migrate_ranking
+try:
+    from .migrate_ranking import migrate_ranking
+except ImportError:
+    from .migrate_ranking import run_migration as migrate_ranking
 from .migrate_tosama import migrate_tosama
 from .migrate_yahoo import migrate_yahoo
 from .migrate_daily_sqlite import migrate_daily_sqlite
@@ -59,7 +63,7 @@ def _is_duck_engine(engine) -> bool:
 
         if hasattr(engine, "_engine") and getattr(engine, "_engine", None) is not None:
             inner = engine._engine
-            if hasattr(inner, "dialect") and getattr(inner, "dialect", None) is not None:
+            if hasattr(inner, "dialect") and getattr(inner.dialect, "name", None) is not None:
                 return str(getattr(inner.dialect, "name", "")).lower() == "duckdb"
 
     except Exception:
