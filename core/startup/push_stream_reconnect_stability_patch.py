@@ -1,20 +1,17 @@
 # ============================================================
 # File   : core/startup/push_stream_reconnect_stability_patch.py
-# Version: V4-PUSH-EMPTY-OWNER-LOCK-FAILOPEN
+# Version: V5-PUSH-ONOPEN-NONDESTRUCTIVE-REFRESH
 # ------------------------------------------------------------
 # Purpose:
-#   kabu Station WebSocket can reset connections with WinError 10054
-#   when reconnect loops immediately run full unregister/register refresh,
-#   or when multiple local processes hold WebSocket clients at once.
+#   Stabilize kabu Station PUSH WebSocket startup/reconnect.
 #
 # Fix:
-#   - on_open refresh is skipped by default.
+#   - non-destructive on_open refresh is enabled by default.
+#   - on_open refresh uses short delay and does not clear/unregister first.
 #   - reconnect wait uses exponential backoff with extra cooldown for short-lived connections.
 #   - cross-process single-owner file lock prevents competing WebSocket clients.
 #   - if the lock is held, do not return permanently. Keep retrying.
-#   - V4: an empty lock with no pid cannot be verified and caused permanent
-#     total_received=0. In push_receiver/main contexts, treat owner_pid=None +
-#     empty text as stale and fail-open instead of waiting forever.
+#   - empty owner lock with no pid can fail-open in push_receiver/main contexts.
 # ============================================================
 from __future__ import annotations
 
@@ -68,11 +65,13 @@ def _is_push_owner_candidate_context() -> bool:
 
 
 def _set_default_env() -> None:
-    os.environ.setdefault("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", "1")
+    # V5: 接続直後の登録を止めない。全解除しない非破壊refreshなので10054を抑えつつ、
+    # rotation worker到達前に切れる問題を避ける。
+    os.environ.setdefault("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", "0")
     os.environ.setdefault("PUSH_STREAM_ONOPEN_REFRESH_THROTTLE", "1")
-    os.environ.setdefault("PUSH_STREAM_ONOPEN_REFRESH_MIN_INTERVAL_SEC", "60")
-    os.environ.setdefault("PUSH_STREAM_ONOPEN_REFRESH_RUNNING_TTL_SEC", "20")
-    os.environ.setdefault("PUSH_STREAM_AFTER_OPEN_REFRESH_DELAY_SEC", "8.0")
+    os.environ.setdefault("PUSH_STREAM_ONOPEN_REFRESH_MIN_INTERVAL_SEC", "15")
+    os.environ.setdefault("PUSH_STREAM_ONOPEN_REFRESH_RUNNING_TTL_SEC", "5")
+    os.environ.setdefault("PUSH_STREAM_AFTER_OPEN_REFRESH_DELAY_SEC", "0.15")
 
     os.environ.setdefault("PUSH_STREAM_RECONNECT_BACKOFF_BASE_SEC", "2.0")
     os.environ.setdefault("PUSH_STREAM_RECONNECT_BACKOFF_MAX_SEC", "60.0")
@@ -90,7 +89,6 @@ def _set_default_env() -> None:
     os.environ.setdefault("PUSH_STREAM_SINGLE_OWNER_RETRY_SEC", "5.0")
     os.environ.setdefault("PUSH_STREAM_SINGLE_OWNER_LOG_EVERY_SEC", "30.0")
 
-    # Empty lock has no pid and cannot be verified. It previously caused permanent wait.
     os.environ.setdefault("PUSH_STREAM_EMPTY_OWNER_LOCK_FAIL_OPEN", "1")
     os.environ.setdefault("PUSH_STREAM_EMPTY_OWNER_LOCK_REQUIRE_OWNER_CONTEXT", "1")
 
@@ -225,21 +223,13 @@ def _try_acquire_single_owner_lock() -> tuple[bool, Any, dict[str, Any]]:
             try:
                 msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
             except OSError:
-                return _lock_conflict_response(
-                    path,
-                    fh,
-                    log_prefix="[PUSH RECONNECT STABILITY] another process owns PUSH WebSocket lock",
-                )
+                return _lock_conflict_response(path, fh, log_prefix="[PUSH RECONNECT STABILITY] another process owns PUSH WebSocket lock")
         else:
             import fcntl
             try:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
-                return _lock_conflict_response(
-                    path,
-                    fh,
-                    log_prefix="[PUSH RECONNECT STABILITY] another process owns PUSH WebSocket lock",
-                )
+                return _lock_conflict_response(path, fh, log_prefix="[PUSH RECONNECT STABILITY] another process owns PUSH WebSocket lock")
 
         fh.seek(0)
         fh.truncate()
@@ -289,17 +279,18 @@ def _patch_transport() -> bool:
         return False
     try:
         cur = getattr(transport, "_safe_refresh_subscriptions_after_open", None)
-        if getattr(cur, "_push_reconnect_stability_v4", False):
+        if getattr(cur, "_push_reconnect_stability_v5", False):
             return True
 
         def _safe_refresh_subscriptions_after_open_patched() -> None:
             try:
-                if transport._env_bool("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", True):
-                    logger.warning("[push_stream] refresh after open skipped by env/default PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1")
+                if transport._env_bool("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", False):
+                    logger.warning("[push_stream] refresh after open skipped by env PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1")
                     return
-                delay = max(float(getattr(transport, "AFTER_OPEN_REFRESH_DELAY_SEC", 0.0)), _env_float("PUSH_STREAM_AFTER_OPEN_REFRESH_DELAY_SEC", 8.0))
-                time.sleep(delay)
-                if not transport._wait_for_ws_ready(timeout=getattr(transport, "WS_READY_WAIT_SEC", 15.0)):
+                delay = max(0.0, _env_float("PUSH_STREAM_AFTER_OPEN_REFRESH_DELAY_SEC", 0.15))
+                if delay > 0:
+                    time.sleep(delay)
+                if not transport._wait_for_ws_ready(timeout=max(0.2, _env_float("PUSH_STREAM_ONOPEN_WS_READY_TIMEOUT_SEC", 1.0))):
                     logger.warning("[push_stream] refresh after open skipped: ws not ready")
                     return
                 force = _env_bool("PUSH_STREAM_ONOPEN_REFRESH_FORCE", False)
@@ -307,13 +298,20 @@ def _patch_transport() -> bool:
                 unregister_first = _env_bool("PUSH_STREAM_ONOPEN_REFRESH_UNREGISTER_FIRST", False)
                 wait_after_clear = _env_float("PUSH_STREAM_ONOPEN_REFRESH_WAIT_AFTER_CLEAR", 0.0)
                 logger.warning(
-                    "[PUSH RECONNECT STABILITY] on_open refresh safe mode force=%s clear_first=%s unregister_first=%s wait_after_clear=%.3f",
+                    "[PUSH RECONNECT STABILITY] on_open non-destructive refresh force=%s clear_first=%s unregister_first=%s wait_after_clear=%.3f delay=%.3f",
                     force,
                     clear_first,
                     unregister_first,
                     wait_after_clear,
+                    delay,
                 )
-                transport._call_refresh(force=force, reason="on_open", clear_first=clear_first, unregister_first=unregister_first, wait_after_clear=wait_after_clear)
+                transport._call_refresh(
+                    force=force,
+                    reason="on_open",
+                    clear_first=clear_first,
+                    unregister_first=unregister_first,
+                    wait_after_clear=wait_after_clear,
+                )
             except Exception:
                 logger.exception("[push_stream] refresh after open failed")
 
@@ -321,9 +319,10 @@ def _patch_transport() -> bool:
         _safe_refresh_subscriptions_after_open_patched._push_reconnect_stability_v2 = True  # type: ignore[attr-defined]
         _safe_refresh_subscriptions_after_open_patched._push_reconnect_stability_v3 = True  # type: ignore[attr-defined]
         _safe_refresh_subscriptions_after_open_patched._push_reconnect_stability_v4 = True  # type: ignore[attr-defined]
+        _safe_refresh_subscriptions_after_open_patched._push_reconnect_stability_v5 = True  # type: ignore[attr-defined]
         _safe_refresh_subscriptions_after_open_patched._original = cur  # type: ignore[attr-defined]
         transport._safe_refresh_subscriptions_after_open = _safe_refresh_subscriptions_after_open_patched
-        logger.warning("[PUSH RECONNECT STABILITY] patched transport on_open refresh skipped_by_default=True")
+        logger.warning("[PUSH RECONNECT STABILITY] patched transport on_open non-destructive refresh enabled")
         return True
     except Exception:
         logger.exception("[PUSH RECONNECT STABILITY] transport patch failed")
@@ -363,7 +362,7 @@ def _patch_runner() -> bool:
         return False
     try:
         cur = getattr(runner, "_run_forever_loop", None)
-        if getattr(cur, "_push_reconnect_stability_v4", False):
+        if getattr(cur, "_push_reconnect_stability_v5", False):
             return True
         original = cur
 
@@ -465,9 +464,10 @@ def _patch_runner() -> bool:
         _run_forever_loop_patched._push_reconnect_stability_v2 = True  # type: ignore[attr-defined]
         _run_forever_loop_patched._push_reconnect_stability_v3 = True  # type: ignore[attr-defined]
         _run_forever_loop_patched._push_reconnect_stability_v4 = True  # type: ignore[attr-defined]
+        _run_forever_loop_patched._push_reconnect_stability_v5 = True  # type: ignore[attr-defined]
         _run_forever_loop_patched._original = original  # type: ignore[attr-defined]
         runner._run_forever_loop = _run_forever_loop_patched
-        logger.warning("[PUSH RECONNECT STABILITY] patched runner reconnect cooldown=True single_owner=True wait_retry=True empty_owner_failopen=True")
+        logger.warning("[PUSH RECONNECT STABILITY] patched runner reconnect cooldown=True single_owner=True wait_retry=True empty_owner_failopen=True onopen_refresh=True")
         return True
     except Exception:
         logger.exception("[PUSH RECONNECT STABILITY] runner patch failed")
@@ -487,7 +487,7 @@ def install(retry: bool = True) -> bool:
         return True
     if _apply():
         _INSTALLED = True
-        logger.warning("[PUSH RECONNECT STABILITY] installed v4")
+        logger.warning("[PUSH RECONNECT STABILITY] installed v5")
         return True
     if retry and not _INSTALLING:
         _INSTALLING = True
@@ -498,7 +498,7 @@ def install(retry: bool = True) -> bool:
                 for _ in range(120):
                     if _apply():
                         _INSTALLED = True
-                        logger.warning("[PUSH RECONNECT STABILITY] installed v4 by retry")
+                        logger.warning("[PUSH RECONNECT STABILITY] installed v5 by retry")
                         return
                     time.sleep(0.25)
                 logger.warning("[PUSH RECONNECT STABILITY] retry exhausted")
