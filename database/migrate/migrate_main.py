@@ -1,6 +1,6 @@
 # ============================================================
 # File: database/migrate/migrate_main.py
-# Ver34.1-RANKING-MIGRATION-IMPORT-COMPAT
+# Ver35-STARTUP-LIGHT-SKIP-RANKING-MIGRATION
 # ------------------------------------------------------------
 # ✔ SAFE MIGRATION MODE 対応
 # ✔ Lazy session 完全互換
@@ -19,7 +19,7 @@
 # ✔ 起動時軽量 migration 追加
 # ✔ 手動完全 migration 追加
 # ✔ 既存 run_migration() 互換維持
-# ✔ Ver34.1: migrate_ranking が無い版でも run_migration を別名importして起動停止を防止
+# ✔ Ver35: 通常起動では ranking migration を既定スキップして起動遅延を防止
 # ============================================================
 
 from __future__ import annotations
@@ -196,6 +196,7 @@ def _run_summary_migration(summary_engine, include_heavy_sqlite_rebuild: bool = 
 def run_startup_migration(
     include_summary_sqlite: bool = False,
     include_daily_sqlite: bool = False,
+    include_ranking_migration: bool | None = None,
 ):
     """
     通常起動用の軽量 migration
@@ -204,15 +205,31 @@ def run_startup_migration(
       - 起動時に毎回必要な create_all / ADD ONLY 系を中心に実行
       - NAS + SQLite + 複数スレッド環境で重くなりやすい
         summary SQLite rebuild / daily SQLite補修は既定でスキップ
-      - 必要時のみフラグで含められる
+      - ranking migration は DBロック待ちで main.py 起動を大きく遅らせるため既定スキップ
+      - 必要時のみフラグで含める
 
     既定:
-      - include_summary_sqlite = False
-      - include_daily_sqlite   = False
+      - include_summary_sqlite   = False
+      - include_daily_sqlite     = False
+      - include_ranking_migration = False
+
+    ranking migration を起動時に含めたい場合:
+      STARTUP_INCLUDE_RANKING_MIGRATION=1
     """
 
+    if include_ranking_migration is None:
+        include_ranking_migration = _safe_bool_from_env(
+            "STARTUP_INCLUDE_RANKING_MIGRATION",
+            default=False,
+        )
+
     print("⏳ DB起動時軽量マイグレーション開始")
-    logger.info("📦 run_startup_migration start")
+    logger.info(
+        "📦 run_startup_migration start include_summary_sqlite=%s include_daily_sqlite=%s include_ranking_migration=%s",
+        include_summary_sqlite,
+        include_daily_sqlite,
+        include_ranking_migration,
+    )
 
     engines = _get_engines()
 
@@ -248,8 +265,17 @@ def run_startup_migration(
 
         # ====================================================
         # RANKING
+        #   main.py通常起動ではスキップ。
+        #   ranking DB writer / ranking summary job とロック競合しやすく、
+        #   12:57起動→13:02でも抜けない原因になっていた。
         # ====================================================
-        _run_step("migrate_ranking", migrate_ranking, ranking_engine)
+        if include_ranking_migration:
+            _run_step("migrate_ranking", migrate_ranking, ranking_engine)
+        else:
+            logger.info(
+                "⏭ migrate_ranking skipped in startup-light mode "
+                "(set STARTUP_INCLUDE_RANKING_MIGRATION=1 to enable; main_database.py/full migration handles schema)"
+            )
 
         # ====================================================
         # TOSAMA
@@ -267,9 +293,7 @@ def run_startup_migration(
         if include_daily_sqlite:
             _run_step("migrate_daily_sqlite", migrate_daily_sqlite)
         else:
-            logger.info(
-                "⏭ migrate_daily_sqlite skipped in startup-light mode"
-            )
+            logger.info("⏭ migrate_daily_sqlite skipped in startup-light mode")
 
         logger.info("✅ run_startup_migration complete")
         print("🎉 DB起動時軽量マイグレーション完了")
@@ -293,6 +317,7 @@ def run_full_migration(
     方針:
       - 従来 run_migration() 相当
       - summary SQLite 正本 migration を実行
+      - ranking migration も実行
       - daily SQLite補修も必要に応じて実行
     """
 
@@ -390,6 +415,8 @@ if __name__ == "__main__":
           軽量 migrationでも SQLite summary migration を含める
       - STARTUP_INCLUDE_DAILY_SQLITE=1
           軽量 migrationでも daily SQLite補修を含める
+      - STARTUP_INCLUDE_RANKING_MIGRATION=1
+          軽量 migrationでも ranking migration を含める
       - FULL_INCLUDE_DAILY_SQLITE=0
           完全 migrationで daily SQLite補修をスキップする
     """
@@ -403,6 +430,10 @@ if __name__ == "__main__":
             ),
             include_daily_sqlite=_safe_bool_from_env(
                 "STARTUP_INCLUDE_DAILY_SQLITE",
+                default=False,
+            ),
+            include_ranking_migration=_safe_bool_from_env(
+                "STARTUP_INCLUDE_RANKING_MIGRATION",
                 default=False,
             ),
         )
