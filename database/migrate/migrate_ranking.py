@@ -1,6 +1,6 @@
 # ============================================================
 # File   : database/migrate/migrate_ranking.py
-# Version: Ver34-STARTUP-CREATE-ALL-RANKING-DB-TABLES
+# Version: Ver35-STARTUP-RANKING-RAW-MIGRATION-LOCK-RETRY
 # ------------------------------------------------------------
 # ✔ ADD ONLY 原則厳守
 # ✔ Base_ranking create_all保持
@@ -12,12 +12,15 @@
 # ✔ SAFE MIGRATION MODE 対応
 # ✔ 既存データ破壊なし
 # ✔ writer側からスキーマ責務を移管
+# ✔ raw schema BEGIN IMMEDIATE database is locked を短時間リトライして起動停止を防止
 # ============================================================
 
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +73,66 @@ LEGACY_CATEGORY_COLUMNS: dict[str, str] = {
 }
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
+def _is_sqlite_locked(exc: BaseException) -> bool:
+    s = str(exc).lower()
+    return "database is locked" in s or "database table is locked" in s or "database busy" in s
+
+
+def _begin_immediate_with_retry(
+    con: sqlite3.Connection,
+    *,
+    label: str,
+    attempts: int | None = None,
+    sleep_sec: float | None = None,
+) -> bool:
+    max_attempts = max(1, attempts if attempts is not None else _env_int("RANKING_MIGRATION_BEGIN_RETRY", 8))
+    wait = max(0.1, sleep_sec if sleep_sec is not None else _env_float("RANKING_MIGRATION_BEGIN_RETRY_SLEEP", 0.75))
+    for i in range(1, max_attempts + 1):
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            if i > 1:
+                logger.warning(
+                    "[RANKING MIGRATION] BEGIN IMMEDIATE retry success label=%s attempt=%s/%s",
+                    label,
+                    i,
+                    max_attempts,
+                )
+            return True
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_locked(exc) or i >= max_attempts:
+                raise
+            logger.warning(
+                "[RANKING MIGRATION] BEGIN IMMEDIATE locked label=%s attempt=%s/%s sleep=%.2fs error=%s",
+                label,
+                i,
+                max_attempts,
+                wait,
+                exc,
+            )
+            time.sleep(wait)
+    return False
+
+
 # ============================================================
 # helpers
 # ============================================================
@@ -104,15 +167,16 @@ def _open_sqlite_from_engine(engine: Any) -> sqlite3.Connection | None:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    timeout = _env_float("RANKING_MIGRATION_SQLITE_TIMEOUT", 60.0)
     con = sqlite3.connect(
         str(path),
-        timeout=60,
+        timeout=timeout,
         check_same_thread=False,
         isolation_level=None,
     )
 
     try:
-        con.execute("PRAGMA busy_timeout=60000")
+        con.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
         con.execute("PRAGMA journal_mode=WAL")
         con.execute("PRAGMA synchronous=NORMAL")
         con.execute("PRAGMA wal_autocheckpoint=1000")
@@ -147,8 +211,6 @@ def _safe_add_column_sqlite(
     add_type = str(col_type or "TEXT")
     upper = add_type.upper()
 
-    # SQLite の ALTER TABLE ADD COLUMN では DEFAULT CURRENT_TIMESTAMP や
-    # NOT NULL without DEFAULT が古いDBで失敗しやすいため除去する。
     if "DEFAULT CURRENT_TIMESTAMP" in upper:
         add_type = add_type.replace("DEFAULT CURRENT_TIMESTAMP", "")
         add_type = add_type.replace("default current_timestamp", "")
@@ -179,9 +241,6 @@ def _safe_add_column_sqlite(
 
 
 def _ensure_table_and_column(engine, table: str, column: str, col_type: str) -> bool:
-    """
-    SQLAlchemy engine 経由で ADD ONLY の列保証を行う。
-    """
     with engine.begin() as conn:
         conn.execute(text("PRAGMA busy_timeout=30000"))
 
@@ -236,53 +295,32 @@ def _ensure_table_and_column(engine, table: str, column: str, col_type: str) -> 
 # ============================================================
 
 def _ensure_ranking_snapshot_schema(engine) -> dict[str, Any]:
-    """
-    snapshot schema は database.schema.ranking_snapshot_schema を正本にする。
-    """
     con = _open_sqlite_from_engine(engine)
     if con is None:
         return {"ok": False, "reason": "no_sqlite_connection"}
 
     try:
-        con.execute("BEGIN IMMEDIATE")
+        _begin_immediate_with_retry(con, label="snapshot_schema")
         ensure_ranking_snapshot_table(con)
         patch_ranking_snapshot_schema(con)
-
         unique_ok = False
         try:
-            ensure_ranking_snapshot_unique_index(con)
-            unique_ok = True
+            unique_ok = ensure_ranking_snapshot_unique_index(con)
         except Exception:
-            # 既存重複データや旧スキーマで unique index が張れない場合でも、
-            # writer は DELETE -> INSERT 方式なので起動は止めない。
-            logger.warning(
-                "[RANKING MIGRATION] snapshot unique index ensure skipped/failed",
-                exc_info=True,
-            )
+            logger.warning("[RANKING MIGRATION] snapshot unique index ensure failed", exc_info=True)
 
         con.execute("COMMIT")
 
-        logger.info(
-            "[RANKING MIGRATION] snapshot schema ensured unique_ok=%s",
-            unique_ok,
-        )
-
-        return {
-            "ok": True,
-            "unique_ok": unique_ok,
-        }
+        logger.info("[RANKING MIGRATION] snapshot schema ensured unique_ok=%s", unique_ok)
+        return {"ok": True, "unique_ok": unique_ok}
 
     except Exception as e:
         try:
             con.execute("ROLLBACK")
         except Exception:
             pass
-
         logger.exception("[RANKING MIGRATION] snapshot schema ensure failed")
-        return {
-            "ok": False,
-            "error": str(e),
-        }
+        return {"ok": False, "error": str(e)}
 
     finally:
         try:
@@ -294,35 +332,43 @@ def _ensure_ranking_snapshot_schema(engine) -> dict[str, Any]:
 def _ensure_ranking_raw_schema(engine) -> dict[str, Any]:
     """
     raw schema は database.schema.ranking_raw_schema を正本にする。
+    ロック時は短時間リトライし、失敗しても起動継続できる形で返す。
     """
     con = _open_sqlite_from_engine(engine)
     if con is None:
         return {"ok": False, "reason": "no_sqlite_connection"}
 
     try:
-        con.execute("BEGIN IMMEDIATE")
+        _begin_immediate_with_retry(con, label="raw_schema")
         ensure_ranking_raw_table(con)
         status = get_ranking_raw_schema_status(con)
         con.execute("COMMIT")
 
         logger.info("[RANKING MIGRATION] raw schema ensured status=%s", status)
+        return {"ok": True, "status": status}
 
-        return {
-            "ok": True,
-            "status": status,
-        }
+    except sqlite3.OperationalError as e:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        if _is_sqlite_locked(e):
+            logger.warning(
+                "[RANKING MIGRATION] raw schema ensure skipped reason=database_locked_after_retry error=%s",
+                e,
+                exc_info=True,
+            )
+            return {"ok": False, "skip": True, "reason": "database_locked_after_retry", "error": str(e)}
+        logger.exception("[RANKING MIGRATION] raw schema ensure failed")
+        return {"ok": False, "error": str(e)}
 
     except Exception as e:
         try:
             con.execute("ROLLBACK")
         except Exception:
             pass
-
         logger.exception("[RANKING MIGRATION] raw schema ensure failed")
-        return {
-            "ok": False,
-            "error": str(e),
-        }
+        return {"ok": False, "error": str(e)}
 
     finally:
         try:
@@ -332,33 +378,27 @@ def _ensure_ranking_raw_schema(engine) -> dict[str, Any]:
 
 
 def _ensure_ranking_summary_schemas(engine) -> dict[str, Any]:
-    """
-    ranking_summary_1min / 3min / 5min を起動時に作成・補完する。
-    """
     con = _open_sqlite_from_engine(engine)
     if con is None:
         return {"ok": False, "reason": "no_sqlite_connection"}
 
-    ensured: list[str] = []
-
     try:
-        con.execute("BEGIN IMMEDIATE")
+        _begin_immediate_with_retry(con, label="summary_schema")
+        results: dict[str, Any] = {}
         for interval in (1, 3, 5):
-            ensure_ranking_summary_table(con, interval=interval)
-            ensured.append(f"ranking_summary_{interval}min")
+            table = f"ranking_summary_{interval}min"
+            ensure_ranking_summary_table(con, table_name=table)
+            results[table] = True
         con.execute("COMMIT")
-
-        logger.info("[RANKING MIGRATION] ranking summary schemas ensured tables=%s", ensured)
-        return {"ok": True, "tables": ensured}
-
+        logger.info("[RANKING MIGRATION] summary schemas ensured results=%s", results)
+        return {"ok": True, "results": results}
     except Exception as e:
         try:
             con.execute("ROLLBACK")
         except Exception:
             pass
-        logger.exception("[RANKING MIGRATION] ranking summary schemas ensure failed")
-        return {"ok": False, "error": str(e), "tables": ensured}
-
+        logger.exception("[RANKING MIGRATION] summary schemas ensure failed")
+        return {"ok": False, "error": str(e)}
     finally:
         try:
             con.close()
@@ -366,194 +406,72 @@ def _ensure_ranking_summary_schemas(engine) -> dict[str, Any]:
             pass
 
 
-def _ensure_legacy_category_table(con: sqlite3.Connection, table: str) -> int:
-    q = _quote_ident(table)
-    con.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {q} (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT,
-            symbolname TEXT,
-            current_price REAL,
-            change_percentage REAL,
-            change_ratio REAL,
-            trading_volume REAL,
-            trading_value REAL,
-            turnover REAL,
-            tick_count INTEGER,
-            inserted_at TEXT,
-            rank INTEGER
-        )
-        """
-    )
-
-    added = 0
-    for col, typ in LEGACY_CATEGORY_COLUMNS.items():
-        if _safe_add_column_sqlite(con, table=table, column=col, col_type=typ):
-            added += 1
-
-    con.execute(
-        f"CREATE INDEX IF NOT EXISTS {_quote_ident('idx_' + table + '_inserted_at')} "
-        f"ON {q}(inserted_at)"
-    )
-    con.execute(
-        f"CREATE INDEX IF NOT EXISTS {_quote_ident('idx_' + table + '_symbol_inserted_at')} "
-        f"ON {q}(symbol, inserted_at)"
-    )
-
-    return added
+def _ensure_legacy_category_tables(engine) -> dict[str, Any]:
+    changed = 0
+    errors: list[str] = []
+    for ranking_type in LEGACY_RANKING_TYPES:
+        for market in LEGACY_MARKETS:
+            table = _legacy_table_name(ranking_type, market)
+            for column, col_type in LEGACY_CATEGORY_COLUMNS.items():
+                try:
+                    if _ensure_table_and_column(engine, table, column, col_type):
+                        changed += 1
+                except Exception as exc:
+                    msg = f"{table}.{column}: {exc}"
+                    errors.append(msg)
+                    logger.warning("[RANKING MIGRATION] legacy category ensure failed %s", msg, exc_info=True)
+    return {"ok": not errors, "changed": changed, "errors": errors[:20], "error_count": len(errors)}
 
 
-def _ensure_legacy_category_schemas(engine) -> dict[str, Any]:
+def run_migration(engine) -> dict[str, Any]:
     """
-    値上がり率_ALL など旧カテゴリ別ランキングテーブルを起動時に作成・補完する。
+    ranking DB の起動時マイグレーション入口。
     """
-    con = _open_sqlite_from_engine(engine)
-    if con is None:
-        return {"ok": False, "reason": "no_sqlite_connection"}
-
-    tables: list[str] = []
-    added_columns: dict[str, int] = {}
-
-    try:
-        con.execute("BEGIN IMMEDIATE")
-
-        for ranking_type in LEGACY_RANKING_TYPES:
-            for market in LEGACY_MARKETS:
-                table = _legacy_table_name(ranking_type, market)
-                added = _ensure_legacy_category_table(con, table)
-                tables.append(table)
-                if added:
-                    added_columns[table] = added
-
-        con.execute("COMMIT")
-
-        logger.info(
-            "[RANKING MIGRATION] legacy category schemas ensured tables=%d added_columns=%s",
-            len(tables),
-            added_columns,
-        )
-
-        return {
-            "ok": True,
-            "tables": tables,
-            "added_columns": added_columns,
-        }
-
-    except Exception as e:
-        try:
-            con.execute("ROLLBACK")
-        except Exception:
-            pass
-
-        logger.exception("[RANKING MIGRATION] legacy category schemas ensure failed")
-        return {
-            "ok": False,
-            "error": str(e),
-            "tables": tables,
-            "added_columns": added_columns,
-        }
-
-    finally:
-        try:
-            con.close()
-        except Exception:
-            pass
-
-
-def _ensure_ranking_ma_schema(engine) -> dict[str, Any]:
-    """
-    ranking_ma_1min は従来通り migration 側で列保証する。
-    """
-    ranking_ma_columns = {
-        "id": "INTEGER",
-        "symbol": "TEXT",
-        "rank_type": "TEXT",
-        "market": "TEXT",
-        "ma_rank_position": "REAL",
-        "ma_volume_speed": "REAL",
-        "trend_score": "REAL",
-        "snapshot_time": "TEXT",
-        "created_at": "TEXT",
-    }
-
-    added: list[str] = []
-
-    try:
-        for col, typ in ranking_ma_columns.items():
-            if _ensure_table_and_column(engine, "ranking_ma_1min", col, typ):
-                added.append(col)
-
-        logger.info("[RANKING MIGRATION] ranking_ma_1min ensured added=%s", added)
-
-        return {
-            "ok": True,
-            "added": added,
-        }
-
-    except Exception as e:
-        logger.exception("[RANKING MIGRATION] ranking_ma_1min ensure failed")
-        return {
-            "ok": False,
-            "error": str(e),
-            "added": added,
-        }
-
-
-# ============================================================
-# public
-# ============================================================
-
-def migrate_ranking(engine) -> dict[str, Any]:
-    """
-    Ranking DB migration.
-
-    SAFE MIGRATION MODE:
-      - 既存データ削除なし
-      - ADD COLUMN のみ
-      - snapshot/raw schema は database.schema 側の正本を利用
-      - summary / legacy category tables も起動時に作成済みにする
-    """
-    logger.info("[RANKING MIGRATION] start version=Ver34-STARTUP-CREATE-ALL")
-
     result: dict[str, Any] = {
-        "ok": False,
-        "base_create_all": False,
-        "raw": {},
-        "snapshot": {},
-        "ma": {},
-        "summary": {},
-        "legacy": {},
+        "ok": True,
+        "base_create_all": None,
+        "snapshot_schema": None,
+        "raw_schema": None,
+        "summary_schemas": None,
+        "legacy_category_tables": None,
     }
 
     try:
         Base_ranking.metadata.create_all(engine)
-        result["base_create_all"] = True
-        logger.info("[RANKING MIGRATION] Base_ranking create_all done")
-    except Exception as e:
+        result["base_create_all"] = {"ok": True}
+        logger.info("[RANKING MIGRATION] Base_ranking create_all ok")
+    except Exception as exc:
         logger.exception("[RANKING MIGRATION] Base_ranking create_all failed")
-        result["base_create_all_error"] = str(e)
+        result["base_create_all"] = {"ok": False, "error": str(exc)}
+        result["ok"] = False
 
-    result["raw"] = _ensure_ranking_raw_schema(engine)
-    result["snapshot"] = _ensure_ranking_snapshot_schema(engine)
-    result["ma"] = _ensure_ranking_ma_schema(engine)
-    result["summary"] = _ensure_ranking_summary_schemas(engine)
-    result["legacy"] = _ensure_legacy_category_schemas(engine)
+    for key, fn in (
+        ("snapshot_schema", _ensure_ranking_snapshot_schema),
+        ("raw_schema", _ensure_ranking_raw_schema),
+        ("summary_schemas", _ensure_ranking_summary_schemas),
+    ):
+        try:
+            r = fn(engine)
+            result[key] = r
+            if isinstance(r, dict) and not r.get("ok", False) and not r.get("skip", False):
+                result["ok"] = False
+        except Exception as exc:
+            logger.exception("[RANKING MIGRATION] step failed key=%s", key)
+            result[key] = {"ok": False, "error": str(exc)}
+            result["ok"] = False
 
-    result["ok"] = bool(
-        result.get("base_create_all")
-        and result.get("raw", {}).get("ok")
-        and result.get("snapshot", {}).get("ok")
-        and result.get("ma", {}).get("ok")
-        and result.get("summary", {}).get("ok")
-        and result.get("legacy", {}).get("ok")
-    )
+    try:
+        r = _ensure_legacy_category_tables(engine)
+        result["legacy_category_tables"] = r
+        if isinstance(r, dict) and not r.get("ok", False):
+            # 旧カテゴリ表は互換用。ここで起動を止めない。
+            logger.warning("[RANKING MIGRATION] legacy category tables had errors but startup continues result=%s", r)
+    except Exception as exc:
+        logger.exception("[RANKING MIGRATION] legacy category ensure step failed")
+        result["legacy_category_tables"] = {"ok": False, "error": str(exc)}
 
-    logger.info("[RANKING MIGRATION] complete result=%s", result)
-
+    logger.info("[RANKING MIGRATION] run_migration done result=%s", result)
     return result
 
 
-__all__ = [
-    "migrate_ranking",
-]
+__all__ = ["run_migration"]
