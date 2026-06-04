@@ -1,5 +1,6 @@
 # ============================================================
 # File   : trading/push/subscription_manager/symbols.py
+# Version: V1.1-ALLOW-3DIGIT-ALPHA-SYMBOLS
 # Function:
 #   - symbol 正規化
 #   - 重複除去
@@ -7,8 +8,8 @@
 #   - 明示入力から symbol 一覧へ変換
 # ------------------------------------------------------------
 # Notes:
-#   - 純粋関数中心
-#   - 最初に安全に分離しやすいモジュール
+#   - kabu Station / 東証の英字入り銘柄コードに対応する。
+#   - 例: 280A, 286A, 147A, 201A, 280A.T
 # ============================================================
 
 from __future__ import annotations
@@ -41,6 +42,8 @@ def normalize_symbol(x: Any) -> Optional[str]:
     if not s:
         return None
 
+    # Yahoo形式や表示名付き形式を登録用コードへ寄せる。
+    # 例: 7203.T -> 7203 / 280A.T -> 280A / "7203 トヨタ" -> 7203
     if "." in s:
         s = s.split(".", 1)[0].strip()
 
@@ -49,15 +52,24 @@ def normalize_symbol(x: Any) -> Optional[str]:
         if parts:
             s = parts[0]
 
-    alnum = "".join(ch for ch in s if ch.isalnum())
+    alnum = "".join(ch for ch in s if ch.isalnum()).upper()
 
-    if len(alnum) >= 4:
-        if len(alnum) == 5 and alnum[:4].isdigit():
-            return alnum.upper()
-        if len(alnum) == 4 and alnum.isdigit():
-            return alnum
-        if len(alnum) > 4 and alnum[:4].isdigit() and alnum[4:].isalpha():
-            return (alnum[:4] + alnum[4:5]).upper()
+    # 通常の4桁数字コード。
+    if len(alnum) == 4 and alnum.isdigit():
+        return alnum
+
+    # 東証の英字入りコード。
+    # 例: 280A, 286A など「数字3桁 + 英字1文字」を落とさない。
+    if len(alnum) == 4 and alnum[:3].isdigit() and alnum[3].isalpha():
+        return alnum
+
+    # 既存互換: 4桁数字 + 英字1文字。
+    if len(alnum) == 5 and alnum[:4].isdigit() and alnum[4].isalpha():
+        return alnum
+
+    # 既存互換: 余分な英字が付いた場合は先頭1文字だけ残す。
+    if len(alnum) > 4 and alnum[:4].isdigit() and alnum[4:].isalpha():
+        return (alnum[:4] + alnum[4:5]).upper()
 
     digits = "".join(ch for ch in s if ch.isdigit())
 
@@ -135,4 +147,3 @@ def collect_symbols_from_explicit(symbols: Any) -> List[str]:
     raw = flatten_symbols(symbols)
     normalized = [normalize_symbol(x) for x in raw]
     return [s for s in normalized if s]
-
