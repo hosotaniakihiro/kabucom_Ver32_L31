@@ -41,6 +41,7 @@ def _is_database_collector_context() -> bool:
 # PUSH WebSocketは main.py がオーナー。DB/collector系は lock を握らない。
 _install("PUSH_RECONNECT_STABILITY", "core.startup.push_stream_reconnect_stability_patch")
 _install("PUSH_MAIN_OWNER_POLICY", "core.startup.push_main_owner_lock_policy_patch")
+_install("PUSH_EMPTY_OWNER_FAILOPEN", "core.startup.push_empty_owner_lock_failopen_patch")
 _install("PUSH_ONOPEN_SAFE_REFRESH", "core.startup.push_onopen_refresh_safe_patch")
 
 # ranking WALはDB専用/通常プロセスどちらでも早めにしきい値を下げてからguardを有効化する。
