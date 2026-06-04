@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/subscription_manager/register_ops.py
-# Version: PRODUCTION-STABLE-REV1.7-KABUSAPI-REGISTER-COUNT-RETRY
+# Version: PRODUCTION-STABLE-REV1.8-KABUSAPI-PARTIAL-REGISTER-OK
 # Function:
 #   - register / unregister / clear の実行を担当する
 #   - kabu Station 公式ひな形に合わせて HTTP PUT /kabusapi/register を使う
@@ -28,12 +28,8 @@ REGISTER_CHUNK_SIZE = 50
 REGISTER_LIMIT = 50
 DEFAULT_EXCHANGE = 1
 
-DEFAULT_UNREGISTER_TO_REGISTER_WAIT_SEC = float(
-    os.environ.get("KABU_REGISTER_UNREGISTER_WAIT_SEC", "0.5")
-)
-REGISTER_COUNT_ERROR_RETRY_WAIT_SEC = float(
-    os.environ.get("KABU_REGISTER_COUNT_ERROR_RETRY_WAIT_SEC", "1.0")
-)
+DEFAULT_UNREGISTER_TO_REGISTER_WAIT_SEC = float(os.environ.get("KABU_REGISTER_UNREGISTER_WAIT_SEC", "0.5"))
+REGISTER_COUNT_ERROR_RETRY_WAIT_SEC = float(os.environ.get("KABU_REGISTER_COUNT_ERROR_RETRY_WAIT_SEC", "1.0"))
 
 DEFAULT_BASE_URL = "http://localhost:18080/kabusapi"
 DEFAULT_REGISTER_URL = f"{DEFAULT_BASE_URL}/register"
@@ -384,9 +380,21 @@ def _is_register_count_error(content: Any) -> bool:
         if isinstance(content, dict):
             code = str(content.get("Code") or "")
             msg = str(content.get("Message") or "")
-            return code == "4002006" or "レジスト数" in msg or "register" in msg.lower() and "count" in msg.lower()
+            return code == "4002006" or "レジスト数" in msg or ("register" in msg.lower() and "count" in msg.lower())
         s = str(content)
         return "4002006" in s or "レジスト数" in s
+    except Exception:
+        return False
+
+
+def _is_partial_register_error(content: Any) -> bool:
+    try:
+        if isinstance(content, dict):
+            code = str(content.get("Code") or "")
+            msg = str(content.get("Message") or "")
+            return code == "4001019" or "一部の銘柄が登録できませんでした" in msg
+        s = str(content)
+        return "4001019" in s or "一部の銘柄が登録できませんでした" in s
     except Exception:
         return False
 
@@ -429,18 +437,13 @@ def run_register_chunks(symbols: Sequence[str], *, exchange: int = DEFAULT_EXCHA
     if not normalized:
         logger.info("[SUB MANAGER] register skipped empty target")
         return True
-    api_key = _resolve_api_key()
-    if not api_key:
-        logger.error("[SUB MANAGER] register failed: API key unavailable")
-        return False
-    url = _resolve_register_url()
-    if not url:
-        logger.error("[SUB MANAGER] register failed: register URL unavailable")
-        return False
-    payload = {"Symbols": make_symbol_objects(normalized, exchange=exchange)}
-    ok, content = _http_json_request(url=url, method="PUT", payload=payload, api_key=api_key)
-    logger.info("[SUB MANAGER] register done size=%d ok=%s content=%r", len(normalized), ok, content)
-    return ok
+    ok, content = _register_once_with_content(normalized, exchange=exchange)
+    if ok:
+        return True
+    if _is_partial_register_error(content):
+        logger.warning("[SUB MANAGER] register partial accepted as usable size=%d content=%r", len(normalized), content)
+        return True
+    return False
 
 
 def _register_once_with_content(symbols: Sequence[str], *, exchange: int = DEFAULT_EXCHANGE) -> tuple[bool, Any]:
@@ -505,6 +508,14 @@ def run_refresh_sequence(
     if ok:
         return True
 
+    if _is_partial_register_error(content):
+        logger.warning(
+            "[SUB MANAGER] register partial accepted as usable -> hold rotation size=%d content=%r",
+            len(normalized_target),
+            content,
+        )
+        return True
+
     if _is_register_count_error(content):
         logger.warning(
             "[SUB MANAGER] register count error -> unregister_all and retry once wait=%.3fs content=%r",
@@ -516,7 +527,16 @@ def run_refresh_sequence(
             time.sleep(REGISTER_COUNT_ERROR_RETRY_WAIT_SEC)
         ok2, content2 = _register_once_with_content(normalized_target, exchange=exchange)
         logger.info("[SUB MANAGER] register retry after clear ok=%s content=%r", ok2, content2)
-        return bool(ok2)
+        if ok2:
+            return True
+        if _is_partial_register_error(content2):
+            logger.warning(
+                "[SUB MANAGER] register retry partial accepted as usable -> hold rotation size=%d content=%r",
+                len(normalized_target),
+                content2,
+            )
+            return True
+        return False
 
     return False
 
