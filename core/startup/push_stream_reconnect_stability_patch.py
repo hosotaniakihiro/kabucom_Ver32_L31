@@ -1,12 +1,13 @@
 # ============================================================
 # File   : core/startup/push_stream_reconnect_stability_patch.py
-# Version: V5-PUSH-ONOPEN-NONDESTRUCTIVE-REFRESH
+# Version: V6-PUSH-FORCE-ONOPEN-NONDESTRUCTIVE-REFRESH
 # ------------------------------------------------------------
 # Purpose:
 #   Stabilize kabu Station PUSH WebSocket startup/reconnect.
 #
 # Fix:
-#   - non-destructive on_open refresh is enabled by default.
+#   - forcibly enables non-destructive on_open refresh, even if an older
+#     startup/usercustomize patch already set PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1.
 #   - on_open refresh uses short delay and does not clear/unregister first.
 #   - reconnect wait uses exponential backoff with extra cooldown for short-lived connections.
 #   - cross-process single-owner file lock prevents competing WebSocket clients.
@@ -64,33 +65,51 @@ def _is_push_owner_candidate_context() -> bool:
     return "push_receiver_runner.py" in txt or "main.py" in txt
 
 
+def _force_env(name: str, value: str) -> None:
+    try:
+        old = os.environ.get(name)
+        os.environ[name] = str(value)
+        if old != str(value):
+            logger.warning("[PUSH RECONNECT STABILITY] env force %s %s->%s", name, old, value)
+    except Exception:
+        pass
+
+
+def _setdefault_env(name: str, value: str) -> None:
+    try:
+        if os.environ.get(name) is None or str(os.environ.get(name)).strip() == "":
+            os.environ[name] = str(value)
+    except Exception:
+        pass
+
+
 def _set_default_env() -> None:
-    # V5: 接続直後の登録を止めない。全解除しない非破壊refreshなので10054を抑えつつ、
-    # rotation worker到達前に切れる問題を避ける。
-    os.environ.setdefault("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", "0")
-    os.environ.setdefault("PUSH_STREAM_ONOPEN_REFRESH_THROTTLE", "1")
-    os.environ.setdefault("PUSH_STREAM_ONOPEN_REFRESH_MIN_INTERVAL_SEC", "15")
-    os.environ.setdefault("PUSH_STREAM_ONOPEN_REFRESH_RUNNING_TTL_SEC", "5")
-    os.environ.setdefault("PUSH_STREAM_AFTER_OPEN_REFRESH_DELAY_SEC", "0.15")
+    # V6: 既に別patchが PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1 を入れていても強制解除する。
+    # 非破壊refreshなので clear/unregister は行わない。
+    _force_env("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", "0")
+    _force_env("PUSH_STREAM_ONOPEN_REFRESH_CLEAR_FIRST", "0")
+    _force_env("PUSH_STREAM_ONOPEN_REFRESH_UNREGISTER_FIRST", "0")
+    _force_env("PUSH_STREAM_ONOPEN_REFRESH_WAIT_AFTER_CLEAR", "0.0")
+    _force_env("PUSH_STREAM_AFTER_OPEN_REFRESH_DELAY_SEC", "0.05")
+    _force_env("PUSH_STREAM_ONOPEN_WS_READY_TIMEOUT_SEC", "0.75")
 
-    os.environ.setdefault("PUSH_STREAM_RECONNECT_BACKOFF_BASE_SEC", "2.0")
-    os.environ.setdefault("PUSH_STREAM_RECONNECT_BACKOFF_MAX_SEC", "60.0")
-    os.environ.setdefault("PUSH_STREAM_RECONNECT_STABLE_RESET_SEC", "45.0")
-    os.environ.setdefault("PUSH_STREAM_SHORT_LIVED_SEC", "5.0")
-    os.environ.setdefault("PUSH_STREAM_SHORT_LIVED_EXTRA_COOLDOWN_SEC", "20.0")
+    _setdefault_env("PUSH_STREAM_ONOPEN_REFRESH_THROTTLE", "1")
+    _setdefault_env("PUSH_STREAM_ONOPEN_REFRESH_MIN_INTERVAL_SEC", "10")
+    _setdefault_env("PUSH_STREAM_ONOPEN_REFRESH_RUNNING_TTL_SEC", "3")
 
-    os.environ.setdefault("PUSH_STREAM_ONOPEN_REFRESH_FORCE", "0")
-    os.environ.setdefault("PUSH_STREAM_ONOPEN_REFRESH_CLEAR_FIRST", "0")
-    os.environ.setdefault("PUSH_STREAM_ONOPEN_REFRESH_UNREGISTER_FIRST", "0")
-    os.environ.setdefault("PUSH_STREAM_ONOPEN_REFRESH_WAIT_AFTER_CLEAR", "0.0")
+    _setdefault_env("PUSH_STREAM_RECONNECT_BACKOFF_BASE_SEC", "2.0")
+    _setdefault_env("PUSH_STREAM_RECONNECT_BACKOFF_MAX_SEC", "60.0")
+    _setdefault_env("PUSH_STREAM_RECONNECT_STABLE_RESET_SEC", "45.0")
+    _setdefault_env("PUSH_STREAM_SHORT_LIVED_SEC", "5.0")
+    _setdefault_env("PUSH_STREAM_SHORT_LIVED_EXTRA_COOLDOWN_SEC", "20.0")
 
-    os.environ.setdefault("PUSH_STREAM_SINGLE_OWNER_LOCK", "1")
-    os.environ.setdefault("PUSH_STREAM_SINGLE_OWNER_WAIT_RETRY", "1")
-    os.environ.setdefault("PUSH_STREAM_SINGLE_OWNER_RETRY_SEC", "5.0")
-    os.environ.setdefault("PUSH_STREAM_SINGLE_OWNER_LOG_EVERY_SEC", "30.0")
-
-    os.environ.setdefault("PUSH_STREAM_EMPTY_OWNER_LOCK_FAIL_OPEN", "1")
-    os.environ.setdefault("PUSH_STREAM_EMPTY_OWNER_LOCK_REQUIRE_OWNER_CONTEXT", "1")
+    _setdefault_env("PUSH_STREAM_ONOPEN_REFRESH_FORCE", "0")
+    _setdefault_env("PUSH_STREAM_SINGLE_OWNER_LOCK", "1")
+    _setdefault_env("PUSH_STREAM_SINGLE_OWNER_WAIT_RETRY", "1")
+    _setdefault_env("PUSH_STREAM_SINGLE_OWNER_RETRY_SEC", "5.0")
+    _setdefault_env("PUSH_STREAM_SINGLE_OWNER_LOG_EVERY_SEC", "30.0")
+    _setdefault_env("PUSH_STREAM_EMPTY_OWNER_LOCK_FAIL_OPEN", "1")
+    _setdefault_env("PUSH_STREAM_EMPTY_OWNER_LOCK_REQUIRE_OWNER_CONTEXT", "1")
 
 
 def _lock_path() -> str:
@@ -279,26 +298,26 @@ def _patch_transport() -> bool:
         return False
     try:
         cur = getattr(transport, "_safe_refresh_subscriptions_after_open", None)
-        if getattr(cur, "_push_reconnect_stability_v5", False):
+        if getattr(cur, "_push_reconnect_stability_v6", False):
             return True
 
         def _safe_refresh_subscriptions_after_open_patched() -> None:
             try:
-                if transport._env_bool("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", False):
-                    logger.warning("[push_stream] refresh after open skipped by env PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1")
-                    return
-                delay = max(0.0, _env_float("PUSH_STREAM_AFTER_OPEN_REFRESH_DELAY_SEC", 0.15))
+                # V6ではここで再度強制解除。後続patchがenvを戻しても実行時に戻す。
+                if os.environ.get("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH") != "0":
+                    _force_env("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", "0")
+                delay = max(0.0, _env_float("PUSH_STREAM_AFTER_OPEN_REFRESH_DELAY_SEC", 0.05))
                 if delay > 0:
                     time.sleep(delay)
-                if not transport._wait_for_ws_ready(timeout=max(0.2, _env_float("PUSH_STREAM_ONOPEN_WS_READY_TIMEOUT_SEC", 1.0))):
+                if not transport._wait_for_ws_ready(timeout=max(0.2, _env_float("PUSH_STREAM_ONOPEN_WS_READY_TIMEOUT_SEC", 0.75))):
                     logger.warning("[push_stream] refresh after open skipped: ws not ready")
                     return
                 force = _env_bool("PUSH_STREAM_ONOPEN_REFRESH_FORCE", False)
-                clear_first = _env_bool("PUSH_STREAM_ONOPEN_REFRESH_CLEAR_FIRST", False)
-                unregister_first = _env_bool("PUSH_STREAM_ONOPEN_REFRESH_UNREGISTER_FIRST", False)
-                wait_after_clear = _env_float("PUSH_STREAM_ONOPEN_REFRESH_WAIT_AFTER_CLEAR", 0.0)
+                clear_first = False
+                unregister_first = False
+                wait_after_clear = 0.0
                 logger.warning(
-                    "[PUSH RECONNECT STABILITY] on_open non-destructive refresh force=%s clear_first=%s unregister_first=%s wait_after_clear=%.3f delay=%.3f",
+                    "[PUSH RECONNECT STABILITY] on_open non-destructive refresh v6 force=%s clear_first=%s unregister_first=%s wait_after_clear=%.3f delay=%.3f",
                     force,
                     clear_first,
                     unregister_first,
@@ -320,9 +339,10 @@ def _patch_transport() -> bool:
         _safe_refresh_subscriptions_after_open_patched._push_reconnect_stability_v3 = True  # type: ignore[attr-defined]
         _safe_refresh_subscriptions_after_open_patched._push_reconnect_stability_v4 = True  # type: ignore[attr-defined]
         _safe_refresh_subscriptions_after_open_patched._push_reconnect_stability_v5 = True  # type: ignore[attr-defined]
+        _safe_refresh_subscriptions_after_open_patched._push_reconnect_stability_v6 = True  # type: ignore[attr-defined]
         _safe_refresh_subscriptions_after_open_patched._original = cur  # type: ignore[attr-defined]
         transport._safe_refresh_subscriptions_after_open = _safe_refresh_subscriptions_after_open_patched
-        logger.warning("[PUSH RECONNECT STABILITY] patched transport on_open non-destructive refresh enabled")
+        logger.warning("[PUSH RECONNECT STABILITY] patched transport on_open non-destructive refresh forced")
         return True
     except Exception:
         logger.exception("[PUSH RECONNECT STABILITY] transport patch failed")
@@ -362,7 +382,7 @@ def _patch_runner() -> bool:
         return False
     try:
         cur = getattr(runner, "_run_forever_loop", None)
-        if getattr(cur, "_push_reconnect_stability_v5", False):
+        if getattr(cur, "_push_reconnect_stability_v6", False):
             return True
         original = cur
 
@@ -465,9 +485,10 @@ def _patch_runner() -> bool:
         _run_forever_loop_patched._push_reconnect_stability_v3 = True  # type: ignore[attr-defined]
         _run_forever_loop_patched._push_reconnect_stability_v4 = True  # type: ignore[attr-defined]
         _run_forever_loop_patched._push_reconnect_stability_v5 = True  # type: ignore[attr-defined]
+        _run_forever_loop_patched._push_reconnect_stability_v6 = True  # type: ignore[attr-defined]
         _run_forever_loop_patched._original = original  # type: ignore[attr-defined]
         runner._run_forever_loop = _run_forever_loop_patched
-        logger.warning("[PUSH RECONNECT STABILITY] patched runner reconnect cooldown=True single_owner=True wait_retry=True empty_owner_failopen=True onopen_refresh=True")
+        logger.warning("[PUSH RECONNECT STABILITY] patched runner reconnect cooldown=True single_owner=True wait_retry=True empty_owner_failopen=True onopen_refresh_force=True")
         return True
     except Exception:
         logger.exception("[PUSH RECONNECT STABILITY] runner patch failed")
@@ -487,7 +508,7 @@ def install(retry: bool = True) -> bool:
         return True
     if _apply():
         _INSTALLED = True
-        logger.warning("[PUSH RECONNECT STABILITY] installed v5")
+        logger.warning("[PUSH RECONNECT STABILITY] installed v6")
         return True
     if retry and not _INSTALLING:
         _INSTALLING = True
@@ -498,7 +519,7 @@ def install(retry: bool = True) -> bool:
                 for _ in range(120):
                     if _apply():
                         _INSTALLED = True
-                        logger.warning("[PUSH RECONNECT STABILITY] installed v5 by retry")
+                        logger.warning("[PUSH RECONNECT STABILITY] installed v6 by retry")
                         return
                     time.sleep(0.25)
                 logger.warning("[PUSH RECONNECT STABILITY] retry exhausted")
