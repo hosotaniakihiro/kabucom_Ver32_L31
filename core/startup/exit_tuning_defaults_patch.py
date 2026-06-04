@@ -1,9 +1,16 @@
 # ============================================================
 # File   : core/startup/exit_tuning_defaults_patch.py
-# Version: V1.3-FAST-CUT-LOSS-SCALPING
+# Version: V1.4-PROTECT-PROFIT-BEFORE-LOSS
 # ------------------------------------------------------------
 # Purpose:
 #   EXIT条件をよりスキャルピング寄りへ調整する。
+#
+# V1.4:
+#   - 利確も損にならないうちに撤退したい要望への対策。
+#   - +0.03%でも一度プラスになったら利益ロック対象にする。
+#   - ロック後は建値割れまで待たず、ほぼ建値〜微益で撤退。
+#   - 小ロットは +0.05% で全利確寄り。
+#   - 部分利確を +0.10% -> +0.06% へ早める。
 #
 # V1.3:
 #   - 損失拡大後に返済して、その後戻る問題への対策。
@@ -44,50 +51,58 @@ def install() -> bool:
     if _INSTALLED:
         return True
     try:
-        # 逆行は早めに切る。0.25%では遅いので0.15%へ。
+        # 逆行は早めに切る。
         _force("ABSOLUTE_ENTRY_STOP_LOSS_PCT", "0.15")
         _force("TRAILING_DRAWDOWN_PCT", "0.0015")
 
         # 一度も利益方向へ進まない銘柄は待たない。
         _force("THREE_MIN_PROFIT_ESCAPE_SEC", "20")
-        _force("THREE_MIN_PROFIT_ESCAPE_TARGET_PCT", "0.06")
-        _force("THREE_MIN_PROFIT_ESCAPE_MIN_CURRENT_PCT", "-0.03")
-        _force("THREE_MIN_FLAT_EXIT_ABS_PCT", "0.03")
+        _force("THREE_MIN_PROFIT_ESCAPE_TARGET_PCT", "0.04")
+        _force("THREE_MIN_PROFIT_ESCAPE_MIN_CURRENT_PCT", "-0.02")
+        _force("THREE_MIN_FLAT_EXIT_ABS_PCT", "0.02")
 
         # 停滞・伸びない銘柄は30秒で撤退寄り。
         _force("EARLY_PROFIT_GUARD_ENABLED", "1")
         _force("EARLY_NO_PROGRESS_SECONDS", "30")
-        _force("EARLY_NO_PROGRESS_NEED_PCT", "0.0002")
+        _force("EARLY_NO_PROGRESS_NEED_PCT", "0.00015")
         _force("EARLY_STAGNATION_EXIT_ENABLED", "1")
         _force("EARLY_STAGNATION_SECONDS", "30")
-        _force("EARLY_STAGNATION_NEED_PCT", "0.0002")
+        _force("EARLY_STAGNATION_NEED_PCT", "0.00015")
 
-        # +0.10%で半分利確。200株未満は小ロット全利確で逃げる。
+        # 利確を早める。少しでも乗ったら半分逃がす。
         _force("PARTIAL_PROFIT_ENABLED", "1")
-        _force("PARTIAL_PROFIT_TRIGGER_PCT", "0.10")
+        _force("PARTIAL_PROFIT_TRIGGER_PCT", "0.06")
         _force("PARTIAL_PROFIT_RATIO", "0.50")
         _setdefault("PARTIAL_PROFIT_MIN_QTY", "200")
 
-        # 薄利即利確も少し早める。
+        # 小ロット/薄利は損になる前に逃げる。
         _force("BLOWOFF_PROFIT_TAKE_ENABLED", "1")
-        _force("BLOWOFF_SMALL_QTY_FULL_TAKE_PCT", "0.08")
-        _force("BLOWOFF_PARTIAL_TAKE_PCT", "0.10")
-        _force("BLOWOFF_FULL_TAKE_PCT", "0.18")
+        _force("BLOWOFF_SMALL_QTY_FULL_TAKE_PCT", "0.05")
+        _force("BLOWOFF_PARTIAL_TAKE_PCT", "0.06")
+        _force("BLOWOFF_FULL_TAKE_PCT", "0.12")
         _setdefault("BLOWOFF_SMALL_QTY_MAX", "199")
         _force("BLOWOFF_PARTIAL_RATIO", "0.50")
         _force("BLOWOFF_CONFIRM_ENABLED", "1")
         _force("BLOWOFF_REQUIRE_VOLUME_AND_SLOPE", "0")
         _force("BLOWOFF_CONFIRM_FAIL_OPEN", "1")
 
-        # 利益ロック。少しでも伸びたあとに建値割れまで待たない。
-        _force("ENTRY_TRAIL_RETRACE_EXIT_PCT", "0.06")
+        # 利益ロック。+0.03%でも一度プラスになったら、損になる前に撤退対象。
+        _force("ENTRY_TRAIL_RETRACE_EXIT_PCT", "0.03")
         _force("EXIT_PROFIT_LOCK_ENABLED", "1")
-        _force("EXIT_PROFIT_LOCK_MIN_MFE_PCT", "0.05")
-        _force("EXIT_PROFIT_LOCK_FLOOR_PCT", "0.00")
-        _force("EXIT_PROFIT_LOCK_RETRACE_MIN_MFE_PCT", "0.08")
-        _force("EXIT_PROFIT_LOCK_RETRACE_PCT", "0.03")
+        _force("EXIT_PROFIT_LOCK_MIN_MFE_PCT", "0.03")
+        _force("EXIT_PROFIT_LOCK_FLOOR_PCT", "0.01")
+        _force("EXIT_PROFIT_LOCK_RETRACE_MIN_MFE_PCT", "0.04")
+        _force("EXIT_PROFIT_LOCK_RETRACE_PCT", "0.015")
         _setdefault("EXIT_PROFIT_LOCK_SMALL_QTY_MAX", "199")
-        _force("EXIT_PROFIT_LOCK_SMALL_FULL_TAKE_PCT", "0.08")
+        _force("EXIT_PROFIT_LOCK_SMALL_FULL_TAKE_PCT", "0.05")
+
+        # 実装側で使われている場合に備えた別名系。未使用なら無害。
+        _force("BREAKEVEN_PROTECT_ENABLED", "1")
+        _force("BREAKEVEN_PROTECT_MIN_MFE_PCT", "0.03")
+        _force("BREAKEVEN_PROTECT_EXIT_FLOOR_PCT", "0.005")
+        _force("PROFIT_TO_LOSS_EXIT_ENABLED", "1")
+        _force("PROFIT_TO_LOSS_MIN_MFE_PCT", "0.03")
+        _force("PROFIT_TO_LOSS_EXIT_BEFORE_PCT", "0.005")
 
         # EXITループ自体も早く回す/詰まりにくくする。
         _force("EXIT_LOOP_RUN_TIMEOUT_SEC", "2.0")
@@ -102,7 +117,7 @@ def install() -> bool:
 
         _INSTALLED = True
         logger.warning(
-            "[EXIT TUNING DEFAULTS] installed FAST_CUT stop=%s partial=%s blowoff_small=%s blowoff_partial=%s blowoff_full=%s trail=%s escape_sec=%s flat=%s early_sec=%s lock_min_mfe=%s lock_floor=%s loop_timeout=%s tonosama_sell=%s",
+            "[EXIT TUNING DEFAULTS] installed PROFIT_PROTECT stop=%s partial=%s blowoff_small=%s blowoff_partial=%s blowoff_full=%s trail=%s escape_sec=%s flat=%s early_sec=%s lock_min_mfe=%s lock_floor=%s lock_retrace=%s loop_timeout=%s tonosama_sell=%s",
             os.environ.get("ABSOLUTE_ENTRY_STOP_LOSS_PCT"),
             os.environ.get("PARTIAL_PROFIT_TRIGGER_PCT"),
             os.environ.get("BLOWOFF_SMALL_QTY_FULL_TAKE_PCT"),
@@ -114,6 +129,7 @@ def install() -> bool:
             os.environ.get("EARLY_NO_PROGRESS_SECONDS"),
             os.environ.get("EXIT_PROFIT_LOCK_MIN_MFE_PCT"),
             os.environ.get("EXIT_PROFIT_LOCK_FLOOR_PCT"),
+            os.environ.get("EXIT_PROFIT_LOCK_RETRACE_PCT"),
             os.environ.get("EXIT_LOOP_RUN_TIMEOUT_SEC"),
             os.environ.get("TONOSAMA_EXIT_SELL_ENABLED"),
         )
