@@ -1,35 +1,27 @@
 # ============================================================
 # File   : core/startup/scheduler_exit_bootstrap.py
-# Version: FINAL-PRODUCTION-REV1.3-EXIT-NO-BROKER-EMPTY-HARD-SKIP
+# Version: FINAL-PRODUCTION-REV1.4-EXIT-ALWAYS-CHECK-POSITIONS
 # ------------------------------------------------------------
 # 【概要】
 #   EXIT order sender 接続と EXIT loop scheduler 登録。
 #
+# REV1.4:
+#   - recent_empty_confirmed による empty fast skip をデフォルト無効化。
+#   - 2026-06-04ログで、EXIT scheduler が
+#       empty fast skip reason=recent_empty_confirmed
+#     を繰り返し、exit_loop_5s 本体が呼ばれず、DB fallback / broker再読込 / executor fallback
+#     が走らないため、建玉復元できずイグジットされなかった。
+#   - 今後は5秒ごとに必ず exit_loop_5s を呼び、get_open_positions_safe() に
+#     DB/GC/global_data/brokerの全ソース確認を任せる。
+#   - どうしても軽量skipしたい場合のみ EXIT_EMPTY_FAST_SKIP_ENABLED=1 を明示する。
+#
 # REV1.3:
 #   - broker authoritative empty だけで exit_loop_5s を完全skipしない。
-#   - 2026-06-03ログで、実建玉/ローカル状態の復元前に
-#       [EXIT SCHEDULER] empty fast skip reason=broker_authoritative_empty
-#     が5秒ごとに出続け、exit_loop自体が起動しないためイグジット不能になっていた。
-#   - broker empty は軽量skipの根拠としては使わず、直近 exit_loop が空確認した場合のみ
-#     EXIT_EMPTY_FAST_SKIP_TTL_SEC の短いTTLでskipする。
-#   - どうしても旧挙動に戻したい場合のみ EXIT_BROKER_EMPTY_IMMEDIATE_SKIP=1 を明示する。
-#
-# REV1.2:
-#   - open_position_sync_throttle_patch が設定する実際の属性名
-#       open_positions_source_mode
-#       open_positions_broker_read_ok
-#       open_positions_synced_count
-#     を見て、broker authoritative empty なら exit_loop_5s を初回から即skip
-#   - これにより建玉なしでも18秒走って previous still running になる問題を抑止
-#   - 建玉ありそうなglobal状態があれば従来通りexit_loopを実行
-#
-# REV1.1:
-#   - 建玉なし確認後、短いTTLだけexit_loopをスキップ
 #
 # ENV:
-#   EXIT_EMPTY_FAST_SKIP_ENABLED=1
-#   EXIT_EMPTY_FAST_SKIP_TTL_SEC=10
-#   EXIT_BROKER_EMPTY_IMMEDIATE_SKIP=0   # REV1.3 default: disabled
+#   EXIT_EMPTY_FAST_SKIP_ENABLED=0      # REV1.4 default
+#   EXIT_EMPTY_FAST_SKIP_TTL_SEC=3
+#   EXIT_BROKER_EMPTY_IMMEDIATE_SKIP=0
 # ============================================================
 
 from __future__ import annotations
@@ -116,11 +108,7 @@ def _global_has_open_positions_hint() -> bool:
 
 
 def _broker_authoritative_empty_hint() -> bool:
-    """open_position_sync_throttle_patch の broker empty キャッシュを確認する。
-
-    REV1.3では、これはログ/旧互換用のヒントに留める。
-    デフォルトではこの結果だけで exit_loop_5s をskipしない。
-    """
+    """互換用。REV1.4ではデフォルトでskipに使わない。"""
     if not _env_bool("EXIT_BROKER_EMPTY_IMMEDIATE_SKIP", False):
         return False
     if _global_has_open_positions_hint():
@@ -134,7 +122,6 @@ def _broker_authoritative_empty_hint() -> bool:
     except Exception:
         pass
 
-    # 互換: 旧名が設定されている環境も見る。
     try:
         old_empty = bool(getattr(global_data, "open_position_broker_authoritative_empty", False))
         old_until = getattr(global_data, "open_position_broker_authoritative_empty_until", None)
@@ -179,7 +166,7 @@ def _maybe_log_broker_empty_observed() -> None:
             return
         _LAST_BROKER_EMPTY_LOG_TS = now
         logger.warning(
-            "[EXIT SCHEDULER] broker empty observed but not hard-skipping exit_loop immediate_skip=%s mode=%s read_ok=%s cnt=%s rev=1.3",
+            "[EXIT SCHEDULER] broker empty observed but exit_loop will still run immediate_skip=%s mode=%s read_ok=%s cnt=%s rev=1.4",
             os.getenv("EXIT_BROKER_EMPTY_IMMEDIATE_SKIP", "0"),
             getattr(global_data, "open_positions_source_mode", ""),
             getattr(global_data, "open_positions_broker_read_ok", None),
@@ -190,16 +177,16 @@ def _maybe_log_broker_empty_observed() -> None:
 
 
 def _empty_fast_skip_active() -> bool:
-    if not _env_bool("EXIT_EMPTY_FAST_SKIP_ENABLED", True):
+    # REV1.4: デフォルトは無効。ここで止めるとDB/broker fallbackが走らない。
+    if not _env_bool("EXIT_EMPTY_FAST_SKIP_ENABLED", False):
         return False
     if _global_has_open_positions_hint():
         return False
-    # REV1.3: broker empty だけで即skipしない。旧挙動は環境変数で明示した時だけ。
     if _broker_authoritative_empty_hint():
         return True
     if _EMPTY_CONFIRMED_AT_TS is None:
         return False
-    ttl = _env_float("EXIT_EMPTY_FAST_SKIP_TTL_SEC", 10.0)
+    ttl = _env_float("EXIT_EMPTY_FAST_SKIP_TTL_SEC", 3.0)
     return (time.time() - float(_EMPTY_CONFIRMED_AT_TS)) < ttl
 
 
@@ -208,7 +195,7 @@ def _mark_empty_confirmed() -> None:
     _EMPTY_CONFIRMED_AT_TS = time.time()
     try:
         global_data.exit_empty_confirmed_at = dt.datetime.now()
-        global_data.exit_empty_fast_skip_until_ts = _EMPTY_CONFIRMED_AT_TS + _env_float("EXIT_EMPTY_FAST_SKIP_TTL_SEC", 10.0)
+        global_data.exit_empty_fast_skip_until_ts = _EMPTY_CONFIRMED_AT_TS + _env_float("EXIT_EMPTY_FAST_SKIP_TTL_SEC", 3.0)
     except Exception:
         pass
 
@@ -255,7 +242,7 @@ def _skip_reason() -> str:
         if _broker_authoritative_empty_hint():
             return "broker_authoritative_empty_explicit_env"
         if _EMPTY_CONFIRMED_AT_TS is not None:
-            remain = (_EMPTY_CONFIRMED_AT_TS + _env_float("EXIT_EMPTY_FAST_SKIP_TTL_SEC", 10.0)) - time.time()
+            remain = (_EMPTY_CONFIRMED_AT_TS + _env_float("EXIT_EMPTY_FAST_SKIP_TTL_SEC", 3.0)) - time.time()
             return f"recent_empty_confirmed remain={max(0.0, remain):.3f}s"
     except Exception:
         pass
@@ -282,7 +269,7 @@ def run_exit_loop_market_guarded() -> None:
             logger.exception("[EXIT SCHEDULER] import failed: trading.exit.exit_loop.exit_loop_5s")
             return
         _LAST_STARTED_TS = time.time()
-        logger.info("[EXIT SCHEDULER] exit_loop_5s start")
+        logger.info("[EXIT SCHEDULER] exit_loop_5s start forced_position_check=1")
         ret = exit_loop_5s()
         logger.info("[EXIT SCHEDULER] exit_loop_5s done ret=%s", ret)
 
@@ -312,9 +299,10 @@ def register_exit_loop_safe() -> bool:
             global_data.exit_loop_scheduler_failed = False
             global_data.exit_loop_scheduler_error = ""
             global_data.exit_broker_empty_immediate_skip_default = "0"
+            global_data.exit_empty_fast_skip_default = "0"
         except Exception:
             pass
-        logger.info("[startup.scheduler_startup] exit loop scheduler registered every=5s broker_empty_immediate_skip_default=0")
+        logger.info("[startup.scheduler_startup] exit loop scheduler registered every=5s broker_empty_immediate_skip_default=0 empty_fast_skip_default=0")
         log_scheduler_snapshot("after exit loop scheduler register")
         return True
     except Exception:
@@ -328,6 +316,10 @@ def register_exit_loop_safe() -> bool:
 
 
 def install() -> bool:
+    # 起動時に既存環境変数が無ければ、fast skipを必ず無効へ寄せる。
+    os.environ.setdefault("EXIT_EMPTY_FAST_SKIP_ENABLED", "0")
+    os.environ.setdefault("EXIT_EMPTY_FAST_SKIP_TTL_SEC", "3")
+    os.environ.setdefault("EXIT_BROKER_EMPTY_IMMEDIATE_SKIP", "0")
     ok1 = install_exit_order_sender_safe()
     ok2 = register_exit_loop_safe()
     return bool(ok1 and ok2)
