@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/subscription_manager/target_builder.py
-# Version: V1.0-PUSH-SUBSCRIPTION-TARGET-BUILDER-100-TO-50
+# Version: V1.1-PUSH-SUBSCRIPTION-TARGET-BUILDER-ROTATION-FASTPATH
 # ------------------------------------------------------------
 # Purpose:
 #   - ranking_selector で最大100銘柄候補を作る
@@ -8,6 +8,12 @@
 #   - filters を適用
 #   - rotation.py で50銘柄に制限
 #   - core.py に最終登録対象50銘柄を返す
+#
+# Fix V1.1:
+#   - rotation_A / rotation_B では、rotation_core から渡された明示symbolsを
+#     そのまま登録対象にする fast path を追加。
+#   - これにより、50銘柄register直前に ranking DB / filters を毎回再計算して
+#     60秒timeoutになる問題を避ける。
 # ============================================================
 
 from __future__ import annotations
@@ -39,6 +45,14 @@ from .symbols import collect_symbols_from_explicit, dedupe_keep_order, limit_sym
 logger = logging.getLogger(__name__)
 
 REGISTER_MAX_SYMBOLS = 100
+
+
+def _is_rotation_reason(reason: Any) -> bool:
+    try:
+        s = str(reason or "").strip().lower()
+        return s.startswith("rotation_") or s.startswith("push_rotation_") or s in {"rotation", "rotate"}
+    except Exception:
+        return False
 
 
 def _merge_priority_symbols(
@@ -76,7 +90,6 @@ def load_selected_ranking_symbols(max_symbols: int = REGISTER_MAX_SYMBOLS) -> li
                 selected[:30],
             )
             return selected
-
         logger.warning(
             "[SUB MANAGER TARGET] ranking_selector returned empty -> fallback"
         )
@@ -113,6 +126,35 @@ def build_target_symbols(
       必ず50件以内の銘柄リスト。
     """
     explicit = collect_symbols_from_explicit(symbols)
+    explicit = dedupe_keep_order(normalize_symbols(explicit))
+
+    # rotation_core はすでに100銘柄候補からA/B各50銘柄を切り出して渡す。
+    # ここでランキングDBやfreshness filterを再実行すると、登録APIに到達する前に
+    # register timeout を消費するため、rotation時は明示symbolsをそのまま使う。
+    if _is_rotation_reason(reason) and explicit:
+        selected_push_symbols = enforce_register_limit(
+            explicit,
+            register_chunk_size=REGISTER_CHUNK_SIZE,
+            reason=reason,
+        )
+        logger.info(
+            "[SUB MANAGER TARGET] rotation explicit fastpath reason=%s selected=%d head=%s",
+            reason,
+            len(selected_push_symbols),
+            selected_push_symbols[:30],
+        )
+        save_symbol_lists_to_global_data(
+            raw_symbols=selected_push_symbols,
+            buy_symbols=selected_push_symbols,
+            sell_symbols=[],
+            filtered_symbols=selected_push_symbols,
+            ranking_symbols=[],
+            rotation_a_symbols=selected_push_symbols if str(reason).lower().endswith("_a") else [],
+            rotation_b_symbols=selected_push_symbols if str(reason).lower().endswith("_b") else [],
+            priority_symbols=[],
+            position_symbols=[],
+        )
+        return selected_push_symbols
 
     ranking_symbols = load_selected_ranking_symbols(max_symbols=max_symbols)
     ranking_symbols = apply_common_stock_filter(
