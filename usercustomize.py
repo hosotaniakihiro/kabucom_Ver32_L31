@@ -38,17 +38,12 @@ def _is_database_collector_context() -> bool:
         pass
     return False
 
-# PUSH WebSocketは main.py がオーナー。DB/collector系は lock を握らない。
 _install("PUSH_RECONNECT_STABILITY", "core.startup.push_stream_reconnect_stability_patch")
 _install("PUSH_MAIN_OWNER_POLICY", "core.startup.push_main_owner_lock_policy_patch")
 _install("PUSH_EMPTY_OWNER_FAILOPEN", "core.startup.push_empty_owner_lock_failopen_patch")
 _install("PUSH_ONOPEN_SAFE_REFRESH", "core.startup.push_onopen_refresh_safe_patch")
-
-# ranking WALはDB専用/通常プロセスどちらでも早めにしきい値を下げてからguardを有効化する。
 _install("RANKING_WAL_AGGRESSIVE_TRUNCATE", "core.startup.ranking_wal_aggressive_truncate_patch")
 
-# DB専用プロセスでは、ENTRY/TONOSAMA/AI系の重いruntime patchを読み込まない。
-# main_database.pyのメモリ消費を抑え、ranking WAL guardなどDB系だけを有効にする。
 if _is_database_collector_context():
     _install("RANKING_WAL_MEMORY_GUARD", "core.startup.ranking_wal_checkpoint_memory_guard_patch")
     _install("YAHOO_COMPUTE_SCHEMA_NA_GUARD", "core.startup.yahoo_compute_schema_na_guard_patch")
@@ -59,6 +54,7 @@ else:
     _install("EXIT_EXECUTOR_BROKER_V2", "core.startup.exit_executor_broker_fallback_v2_patch")
     _install("EXIT_LOOP_TIMEOUT_GUARD", "core.startup.exit_loop_timeout_guard_patch")
     _install("ENTRY_RANKING_SCALP_RESCUE", "core.startup.entry_ranking_scalp_order_rescue_patch")
+    _install("RANKING_ENTRY_WIDER_TOP", "core.startup.ranking_entry_wider_top_universe_patch")
     _install("RANKING_WAL_MEMORY_GUARD", "core.startup.ranking_wal_checkpoint_memory_guard_patch")
     _install("TONOSAMA_RUNTIME_25SEC_BUDGET", "core.startup.tonosama_runtime_25sec_budget_patch")
     _install("TONOSAMA_LUNCH_REOPEN_RECENT", "core.startup.tonosama_lunch_reopen_recent_patch")
@@ -88,4 +84,3 @@ else:
     _install("TONOSAMA_ORPHAN_CLEANUP", "core.startup.tonosama_orphan_thread_cleanup_patch")
     _install("TONOSAMA_RANKING_MA_FALLBACK", "core.startup.tonosama_ranking_ma_fallback_patch")
     _install("SUMMARY_AI_WEAK_NEUTRAL_GUARD", "core.startup.summary_ai_weak_neutral_guard_patch")
-    _install("ENTRY_IMMEDIATE_MOVEMENT_GUARD", "core.startup.entry_immediate_movement_guard_patch")
