@@ -1,21 +1,20 @@
 # ============================================================
 # File   : core/startup/summary_mtf_diff_from_1m_patch.py
-# Version: V1-INSTALL-MTF-DIFF-FROM-1M-DB
+# Version: V1.1-INSTALL-MTF-DIFF-FROM-1M-DB-KWARGS-COMPAT
 # ------------------------------------------------------------
 # 目的:
 #   3分足/5分足のサマリー更新時に、既存3m/5m最新時刻以降の1分足をDBから読み、
 #   MA75計算用の直前履歴込みで差分3m/5mサマリーを作成・保存する。
 #
-# ポイント:
-#   - 3m/5mの最新保存済みdatetimeを確認
-#   - その直前74本 + それ以降の1mから作った差分バーを連結
-#   - indicator/scoringを再計算
-#   - DB保存は差分バーのみ
-#   - original diff_update はその後も実行し、表示/entryの既存流れは維持
+# V1.1:
+#   - scheduler runner から diff_update(now=..., display=..., run_entry=...) が来ても、
+#     既存 SummaryController.diff_update(interval) へ余分なkwargsを渡さない。
+#   - interval=1 でも original diff_update を壊さない。
 # ============================================================
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from typing import Any
@@ -164,6 +163,33 @@ def _run_diff_from_1m(interval: int) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _call_original_diff_update(self, interval_i: int, *args, **kwargs):
+    """既存 diff_update(interval) 互換。scheduler由来の now/display/run_entry 等は渡さない。"""
+    orig = _ORIG_DIFF_UPDATE
+    if not callable(orig):
+        return pd.DataFrame()
+
+    if args:
+        logger.debug("[SUMMARY MTF DIFF 1M PATCH] ignored original positional extras interval=%s args=%s", interval_i, len(args))
+    if kwargs:
+        logger.debug("[SUMMARY MTF DIFF 1M PATCH] ignored original kwargs interval=%s keys=%s", interval_i, sorted(kwargs.keys()))
+
+    # 現行 SummaryController.diff_update は self, interval のみ。
+    # 将来kwargs対応になった場合だけ、受け取れるkwargsを限定して渡す。
+    try:
+        sig = inspect.signature(orig)
+        params = sig.parameters
+        accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        if accepts_var_kw:
+            return orig(self, interval_i, **kwargs)
+        allowed = {k: v for k, v in kwargs.items() if k in params and k not in {"self", "interval"}}
+        if allowed:
+            return orig(self, interval_i, **allowed)
+    except Exception:
+        pass
+    return orig(self, interval_i)
+
+
 def _patched_diff_update(self, interval: int, *args, **kwargs):
     interval_i = int(interval)
     precomputed_latest = pd.DataFrame()
@@ -171,7 +197,7 @@ def _patched_diff_update(self, interval: int, *args, **kwargs):
         precomputed_latest = _run_diff_from_1m(interval_i)
 
     try:
-        return _ORIG_DIFF_UPDATE(self, interval_i, *args, **kwargs)  # type: ignore[misc]
+        return _call_original_diff_update(self, interval_i, *args, **kwargs)
     except Exception:
         logger.exception("[SUMMARY MTF DIFF 1M PATCH] original diff_update failed interval=%s", interval_i)
         if isinstance(precomputed_latest, pd.DataFrame) and not precomputed_latest.empty:
@@ -197,17 +223,25 @@ def install() -> bool:
         if not callable(cur):
             logger.warning("[SUMMARY MTF DIFF 1M PATCH] diff_update unavailable")
             return False
-        if getattr(cur, "_summary_mtf_diff_from_1m_v1", False):
+        if getattr(cur, "_summary_mtf_diff_from_1m_v11", False):
             _INSTALLED = True
             return True
 
-        _ORIG_DIFF_UPDATE = cur
-        _patched_diff_update._summary_mtf_diff_from_1m_v1 = True  # type: ignore[attr-defined]
-        _patched_diff_update._original = cur  # type: ignore[attr-defined]
+        # v1 wrapper が既に入っている場合は、そのoriginalを拾って二重kwargs不具合を回避する。
+        _ORIG_DIFF_UPDATE = getattr(cur, "_original", cur)
+        _patched_diff_update._summary_mtf_diff_from_1m_v11 = True  # type: ignore[attr-defined]
+        _patched_diff_update._original = _ORIG_DIFF_UPDATE  # type: ignore[attr-defined]
         cls.diff_update = _patched_diff_update
+        try:
+            inst = getattr(sc, "summary_controller", None)
+            if inst is not None:
+                # class method差し替えなので通常不要。明示的に触っておく。
+                setattr(inst.__class__, "diff_update", _patched_diff_update)
+        except Exception:
+            pass
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY MTF DIFF 1M PATCH] installed enabled=True history_rows=%s allow_partial=%s",
+            "[SUMMARY MTF DIFF 1M PATCH] installed v1.1 enabled=True history_rows=%s allow_partial=%s",
             os.getenv("SUMMARY_MTF_DIFF_HISTORY_ROWS", "74"),
             os.getenv("SUMMARY_MTF_DIFF_ALLOW_PARTIAL_BAR", "0"),
         )
