@@ -1,13 +1,18 @@
 # ============================================================
 # File   : trading/board/board_signal.py
-# Version: Ver01-BOARD-IMBALANCE-COLLAPSE-SIGNALS
+# Version: Ver02-BOARD-IMBALANCE-COLLAPSE-PASSIVE-PRICE
 # ------------------------------------------------------------
-# 板情報をエントリー直前ガードと保有中EXITに使うための軽量判定。
+# 板情報をエントリー直前ガード、保有中EXIT、発注指値補正に使う。
 #
 # ENTRY:
 #   - BUYなのに買い板が弱すぎる
 #   - SELLなのに買い板が強すぎる
 #   - 進行方向の反対側に巨大壁がある
+#
+# ORDER PRICE:
+#   - BUY: 厚い売り板の1ティック下へ指値候補を寄せる
+#   - SELL: 厚い買い板の1ティック上へ指値候補を寄せる
+#   - 板が取れない/壁がない/補正が危険な場合は従来価格を返す
 #
 # EXIT:
 #   - BUY保有中に買い支え板が崩れる
@@ -105,6 +110,40 @@ def _parse_dt(v: Any) -> Optional[dt.datetime]:
         return None
 
 
+def _tick_size(price: float) -> float:
+    """東証呼値単位の安全側近似。"""
+    p = float(price or 0.0)
+    if p <= 0:
+        return 1.0
+    if p <= 1000:
+        return 0.1
+    if p <= 3000:
+        return 0.5
+    if p <= 5000:
+        return 1.0
+    if p <= 30000:
+        return 5.0
+    if p <= 50000:
+        return 10.0
+    if p <= 300000:
+        return 50.0
+    if p <= 500000:
+        return 100.0
+    if p <= 3000000:
+        return 500.0
+    return 1000.0
+
+
+def _round_to_tick(price: float, *, side: str) -> float:
+    tick = _tick_size(price)
+    if tick <= 0:
+        return float(price)
+    x = float(price) / tick
+    if str(side).upper() == "BUY":
+        return math.floor(x + 1e-9) * tick
+    return math.ceil(x - 1e-9) * tick
+
+
 def _fetch_and_remember(symbol: str, *, exchange: int, fallback_price: float = 0.0) -> Optional[dict[str, Any]]:
     sym = _norm_symbol(symbol)
     if not sym:
@@ -173,17 +212,7 @@ def analyze_entry_board_imbalance(symbol: str, *, side: str, exchange: int = 1) 
     elif wall_enabled and side_u == "SELL" and bid_sum >= ask_sum * wall_ratio and bid_sum >= wall_min_qty:
         reason = "ENTRY_BOARD_SELL_BID_WALL"
 
-    detail = {
-        "symbol": sym,
-        "side": side_u,
-        "bid_sum": bid_sum,
-        "ask_sum": ask_sum,
-        "bid_ask_ratio": ratio,
-        "levels": levels,
-        "best_bid": _safe_float(snap.get("best_bid"), 0.0),
-        "best_ask": _safe_float(snap.get("best_ask"), 0.0),
-        "reason": reason,
-    }
+    detail = {"symbol": sym, "side": side_u, "bid_sum": bid_sum, "ask_sum": ask_sum, "bid_ask_ratio": ratio, "levels": levels, "best_bid": _safe_float(snap.get("best_bid"), 0.0), "best_ask": _safe_float(snap.get("best_ask"), 0.0), "reason": reason}
     if reason:
         logger.warning("[BOARD ENTRY IMBALANCE NG] %s", detail)
         return detail
@@ -191,28 +220,91 @@ def analyze_entry_board_imbalance(symbol: str, *, side: str, exchange: int = 1) 
     return None
 
 
-def analyze_exit_board_collapse(
-    symbol: str,
-    *,
-    position_side: str,
-    current_price: float = 0.0,
-    exchange: int = 1,
-) -> Optional[dict[str, Any]]:
+def suggest_passive_entry_price(symbol: str, *, side: str, bid: float = 0.0, ask: float = 0.0, exchange: int = 1) -> Optional[dict[str, Any]]:
+    """厚い板の1ティック手前に指値候補を置く。BUY=売り壁1ティック下、SELL=買い壁1ティック上。"""
+    if not _env_bool("ENTRY_BOARD_PASSIVE_PRICE_ENABLED", True):
+        return None
+    sym = _norm_symbol(symbol)
+    side_u = str(side or "").strip().upper()
+    if side_u not in {"BUY", "SELL"}:
+        return None
+    snap = _fetch_and_remember(sym, exchange=exchange)
+    if not snap:
+        return None
+    best_bid = _safe_float(snap.get("best_bid"), bid) or _safe_float(bid, 0.0)
+    best_ask = _safe_float(snap.get("best_ask"), ask) or _safe_float(ask, 0.0)
+    if best_bid <= 0 or best_ask <= 0:
+        return None
+
+    levels = _env_int("ENTRY_BOARD_PASSIVE_WALL_LEVELS", 10)
+    min_wall_qty = _env_float("ENTRY_BOARD_PASSIVE_MIN_WALL_QTY", 1500.0)
+    wall_mult = _env_float("ENTRY_BOARD_PASSIVE_WALL_MULTIPLIER", 2.5)
+    max_aggress_ticks = _env_int("ENTRY_BOARD_PASSIVE_MAX_AGGRESS_TICKS", 3)
+    allow_cross = _env_bool("ENTRY_BOARD_PASSIVE_ALLOW_MARKETABLE", True)
+
+    ladder_key = "sell" if side_u == "BUY" else "buy"
+    ladder = snap.get(ladder_key)
+    if not isinstance(ladder, list) or not ladder:
+        return None
+    qtys = [_safe_float(r.get("qty"), 0.0) for r in ladder[:levels] if isinstance(r, dict)]
+    avg_qty = (sum(qtys) / len(qtys)) if qtys else 0.0
+    threshold = max(min_wall_qty, avg_qty * wall_mult)
+    wall = None
+    for r in ladder[:levels]:
+        if not isinstance(r, dict):
+            continue
+        px = _safe_float(r.get("price"), 0.0)
+        qty = _safe_float(r.get("qty"), 0.0)
+        if px <= 0 or qty < threshold:
+            continue
+        if side_u == "BUY" and px >= best_ask:
+            wall = {"price": px, "qty": qty}
+            break
+        if side_u == "SELL" and px <= best_bid:
+            wall = {"price": px, "qty": qty}
+            break
+    if not wall:
+        return None
+
+    wall_price = _safe_float(wall.get("price"), 0.0)
+    tick = _tick_size(wall_price)
+    if side_u == "BUY":
+        candidate = _round_to_tick(wall_price - tick, side="BUY")
+        base = best_ask
+        max_price = best_ask + tick * max(0, max_aggress_ticks)
+        if not allow_cross:
+            max_price = best_ask
+        candidate = min(candidate, max_price)
+        candidate = max(candidate, best_bid)
+    else:
+        candidate = _round_to_tick(wall_price + tick, side="SELL")
+        base = best_bid
+        min_price = best_bid - tick * max(0, max_aggress_ticks)
+        if not allow_cross:
+            min_price = best_bid
+        candidate = max(candidate, min_price)
+        candidate = min(candidate, best_ask)
+    if candidate <= 0:
+        return None
+
+    detail = {"symbol": sym, "side": side_u, "price": float(candidate), "base_price": float(base), "best_bid": float(best_bid), "best_ask": float(best_ask), "wall_price": float(wall_price), "wall_qty": _safe_float(wall.get("qty"), 0.0), "threshold": threshold, "avg_qty": avg_qty, "tick": tick, "levels": levels, "marketable_allowed": allow_cross, "reason": "ENTRY_BOARD_PASSIVE_ONE_TICK_BEFORE_WALL"}
+    logger.warning("[BOARD PASSIVE ENTRY PRICE] %s", detail)
+    return detail
+
+
+def analyze_exit_board_collapse(symbol: str, *, position_side: str, current_price: float = 0.0, exchange: int = 1) -> Optional[dict[str, Any]]:
     """保有中用。支え板崩壊/逆板優勢ならEXIT理由を返す。"""
     if not _env_bool("EXIT_BOARD_COLLAPSE_ENABLED", True):
         return None
-
     sym = _norm_symbol(symbol)
     side_u = str(position_side or "").strip().upper()
     is_buy = side_u.startswith("BUY") or side_u in {"2", "買", "買い"}
     is_sell = side_u.startswith("SELL") or side_u.startswith("SHORT") or side_u in {"1", "売", "売り"}
     if not sym or (not is_buy and not is_sell):
         return None
-
     snap = _fetch_and_remember(sym, exchange=exchange, fallback_price=current_price)
     if not snap:
         return None
-
     levels = _env_int("EXIT_BOARD_COLLAPSE_LEVELS", 5)
     bid_sum, ask_sum, ratio = _imbalance(snap, levels)
     now_dt = _parse_dt(snap.get("fetched_at")) or dt.datetime.now()
@@ -221,7 +313,6 @@ def analyze_exit_board_collapse(
     support_drop_ratio = _env_float("EXIT_BOARD_COLLAPSE_SUPPORT_DROP_RATIO", 0.45)
     buy_min_ratio = _env_float("EXIT_BOARD_BUY_MIN_BID_ASK_RATIO", 0.55)
     sell_max_ratio = _env_float("EXIT_BOARD_SELL_MAX_BID_ASK_RATIO", 1.80)
-
     old = None
     hist = list(_HISTORY.get(sym, []))
     for h in reversed(hist):
@@ -231,11 +322,9 @@ def analyze_exit_board_collapse(
             break
     if old is None and len(hist) >= 2:
         old = hist[0]
-
     old_bid = old_ask = old_ratio = 0.0
     if isinstance(old, dict) and old is not snap:
         old_bid, old_ask, old_ratio = _imbalance(old, levels)
-
     reason = None
     if is_buy:
         if ratio < buy_min_ratio:
@@ -247,26 +336,11 @@ def analyze_exit_board_collapse(
             reason = "EXIT_BOARD_SELL_ASK_SUPPORT_WEAK"
         elif old_ask >= min_support_qty and ask_sum <= old_ask * max(0.0, 1.0 - support_drop_ratio):
             reason = "EXIT_BOARD_SELL_SUPPORT_COLLAPSE"
-
     if not reason:
         return None
-
-    detail = {
-        "symbol": sym,
-        "side": side_u,
-        "reason": reason,
-        "bid_sum": bid_sum,
-        "ask_sum": ask_sum,
-        "bid_ask_ratio": ratio,
-        "old_bid_sum": old_bid,
-        "old_ask_sum": old_ask,
-        "old_bid_ask_ratio": old_ratio,
-        "levels": levels,
-        "lookback_sec": lookback_sec,
-        "current_price": current_price,
-    }
+    detail = {"symbol": sym, "side": side_u, "reason": reason, "bid_sum": bid_sum, "ask_sum": ask_sum, "bid_ask_ratio": ratio, "old_bid_sum": old_bid, "old_ask_sum": old_ask, "old_bid_ask_ratio": old_ratio, "levels": levels, "lookback_sec": lookback_sec, "current_price": current_price}
     logger.warning("[BOARD EXIT COLLAPSE] %s", detail)
     return detail
 
 
-__all__ = ["analyze_entry_board_imbalance", "analyze_exit_board_collapse"]
+__all__ = ["analyze_entry_board_imbalance", "suggest_passive_entry_price", "analyze_exit_board_collapse"]
