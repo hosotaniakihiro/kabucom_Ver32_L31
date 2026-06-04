@@ -10,7 +10,7 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.29-SUMMARY-AI-ASYNC-INSTALL
+# Version: Ver38.30-MTF-DIFF-FROM-1M-INSTALL
 # ------------------------------------------------------------
 # ✔ SUMMARY AI async entry patch を main runtime patch 一覧へ明示追加
 # ✔ TONOSAMA final liquidity lost-volume fallback threshold を 2.3 に調整
@@ -19,6 +19,7 @@
 # ✔ _log_skip reason衝突ガードを全runtime patch後の最後に再適用
 # ✔ RANKING ENTRY controller timeoutを拡張
 # ✔ RANKING_ENTRY 強スコアの技術フィルタ全落ちを救済
+# ✔ 3m/5m summary を最新3m/5m時刻以降の1m差分から補完
 # ✔ 既存の起動処理は維持
 # ============================================================
 
@@ -37,6 +38,10 @@ os.environ.setdefault("SUMMARY_PARALLEL_FORCE_1_3_5", "0")
 os.environ.setdefault("SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC", "90")
 os.environ.setdefault("SUMMARY_PARALLEL_TIMEOUT_MIN_SEC", "90")
 os.environ.setdefault("SUMMARY_PARALLEL_INTERVAL_WORKERS", "3")
+os.environ.setdefault("SUMMARY_MTF_DIFF_FROM_1M_ENABLED", "1")
+os.environ.setdefault("SUMMARY_MTF_DIFF_HISTORY_ROWS", "74")
+os.environ.setdefault("SUMMARY_MTF_DIFF_MAX_1M_ROWS", "250000")
+os.environ.setdefault("SUMMARY_MTF_DIFF_ALLOW_PARTIAL_BAR", "0")
 os.environ.setdefault("MIN_5SEC_PRICE_CHANGE_PCT", "0.01")
 os.environ.setdefault("TONOSAMA_MIN_5SEC_PRICE_CHANGE_PCT", "0.01")
 os.environ.setdefault("ENTRY_MIN_5SEC_PRICE_CHANGE_PCT", "0.01")
@@ -146,6 +151,7 @@ def _install_main_runtime_patches():
         ("core.startup.indicator_fragmentation_runtime_patch", "install"),
         ("core.startup.entry_controller_runtime_reject_patch", "install"),
         ("core.startup.fast_startup_runtime_patch", "install"),
+        ("core.startup.summary_mtf_diff_from_1m_patch", "install"),
         ("core.startup.entry_qty_min_lot_runtime_patch", "install"),
         ("core.startup.low_movement_entry_guard_patch", "install"),
         ("core.startup.entry_final_filter_failopen_patch", "install"),
