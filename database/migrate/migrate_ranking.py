@@ -1,6 +1,6 @@
 # ============================================================
 # File   : database/migrate/migrate_ranking.py
-# Version: Ver35-STARTUP-RANKING-RAW-MIGRATION-LOCK-RETRY
+# Version: Ver36-RESTORE-MIGRATE-RANKING-COMPAT-EXPORT
 # ------------------------------------------------------------
 # ✔ ADD ONLY 原則厳守
 # ✔ Base_ranking create_all保持
@@ -13,6 +13,7 @@
 # ✔ 既存データ破壊なし
 # ✔ writer側からスキーマ責務を移管
 # ✔ raw schema BEGIN IMMEDIATE database is locked を短時間リトライして起動停止を防止
+# ✔ Ver36: migrate_main 互換の migrate_ranking alias を復旧
 # ============================================================
 
 from __future__ import annotations
@@ -474,4 +475,13 @@ def run_migration(engine) -> dict[str, Any]:
     return result
 
 
-__all__ = ["run_migration"]
+def migrate_ranking(engine) -> dict[str, Any]:
+    """
+    Backward-compatible entry point expected by database.migrate.migrate_main.
+    Keep this alias so startup imports do not fail when callers import
+    `migrate_ranking` directly from this module.
+    """
+    return run_migration(engine)
+
+
+__all__ = ["run_migration", "migrate_ranking"]
