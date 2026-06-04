@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/push_stream_reconnect_stability_patch.py
-# Version: V3-PUSH-SINGLE-OWNER-WAIT-RETRY
+# Version: V4-PUSH-EMPTY-OWNER-LOCK-FAILOPEN
 # ------------------------------------------------------------
 # Purpose:
 #   kabu Station WebSocket can reset connections with WinError 10054
@@ -11,16 +11,17 @@
 #   - on_open refresh is skipped by default.
 #   - reconnect wait uses exponential backoff with extra cooldown for short-lived connections.
 #   - cross-process single-owner file lock prevents competing WebSocket clients.
-#   - V3: if the lock is held, do not return permanently. Keep retrying until the
-#     owner disappears or this process is stopped. This prevents startup logs like
-#       run loop skipped reason=single_owner_lock_held
-#     from leaving PUSH dead with total_received=0 for the whole session.
+#   - if the lock is held, do not return permanently. Keep retrying.
+#   - V4: an empty lock with no pid cannot be verified and caused permanent
+#     total_received=0. In push_receiver/main contexts, treat owner_pid=None +
+#     empty text as stale and fail-open instead of waiting forever.
 # ============================================================
 from __future__ import annotations
 
 import logging
 import os
 import re
+import sys
 import tempfile
 import threading
 import time
@@ -52,32 +53,46 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _argv_text() -> str:
+    try:
+        return " ".join(str(x) for x in sys.argv).lower()
+    except Exception:
+        return ""
+
+
+def _is_push_owner_candidate_context() -> bool:
+    txt = _argv_text()
+    if "db_prepare_runner.py" in txt or "summary_database_runner.py" in txt or "ranking_collector_runner.py" in txt or "yahoo_complement_runner.py" in txt:
+        return False
+    return "push_receiver_runner.py" in txt or "main.py" in txt
+
+
 def _set_default_env() -> None:
-    # 接続直後の登録更新は既定で停止。登録更新はrotation側に任せる。
     os.environ.setdefault("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", "1")
     os.environ.setdefault("PUSH_STREAM_ONOPEN_REFRESH_THROTTLE", "1")
     os.environ.setdefault("PUSH_STREAM_ONOPEN_REFRESH_MIN_INTERVAL_SEC", "60")
     os.environ.setdefault("PUSH_STREAM_ONOPEN_REFRESH_RUNNING_TTL_SEC", "20")
     os.environ.setdefault("PUSH_STREAM_AFTER_OPEN_REFRESH_DELAY_SEC", "8.0")
 
-    # 再接続バックオフ。
     os.environ.setdefault("PUSH_STREAM_RECONNECT_BACKOFF_BASE_SEC", "2.0")
     os.environ.setdefault("PUSH_STREAM_RECONNECT_BACKOFF_MAX_SEC", "60.0")
     os.environ.setdefault("PUSH_STREAM_RECONNECT_STABLE_RESET_SEC", "45.0")
     os.environ.setdefault("PUSH_STREAM_SHORT_LIVED_SEC", "5.0")
     os.environ.setdefault("PUSH_STREAM_SHORT_LIVED_EXTRA_COOLDOWN_SEC", "20.0")
 
-    # on_open refreshは非破壊。
     os.environ.setdefault("PUSH_STREAM_ONOPEN_REFRESH_FORCE", "0")
     os.environ.setdefault("PUSH_STREAM_ONOPEN_REFRESH_CLEAR_FIRST", "0")
     os.environ.setdefault("PUSH_STREAM_ONOPEN_REFRESH_UNREGISTER_FIRST", "0")
     os.environ.setdefault("PUSH_STREAM_ONOPEN_REFRESH_WAIT_AFTER_CLEAR", "0.0")
 
-    # 単一オーナー。ただしV3ではロック中に永久終了しない。
     os.environ.setdefault("PUSH_STREAM_SINGLE_OWNER_LOCK", "1")
     os.environ.setdefault("PUSH_STREAM_SINGLE_OWNER_WAIT_RETRY", "1")
     os.environ.setdefault("PUSH_STREAM_SINGLE_OWNER_RETRY_SEC", "5.0")
     os.environ.setdefault("PUSH_STREAM_SINGLE_OWNER_LOG_EVERY_SEC", "30.0")
+
+    # Empty lock has no pid and cannot be verified. It previously caused permanent wait.
+    os.environ.setdefault("PUSH_STREAM_EMPTY_OWNER_LOCK_FAIL_OPEN", "1")
+    os.environ.setdefault("PUSH_STREAM_EMPTY_OWNER_LOCK_REQUIRE_OWNER_CONTEXT", "1")
 
 
 def _lock_path() -> str:
@@ -104,7 +119,6 @@ def _pid_alive(pid: int | None) -> bool | None:
         return True
     try:
         if os.name == "nt":
-            # Windows: ctypesでOpenProcessを試す。存在しなければNone/0になる。
             import ctypes
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
             handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
@@ -142,6 +156,53 @@ def _read_lock_text(path: str, fh: Any | None = None) -> str:
         return ""
 
 
+def _empty_owner_lock_should_fail_open(text: str, pid: int | None, alive: bool | None) -> bool:
+    try:
+        if not _env_bool("PUSH_STREAM_EMPTY_OWNER_LOCK_FAIL_OPEN", True):
+            return False
+        if pid is not None or alive is not None:
+            return False
+        if str(text or "").strip() != "":
+            return False
+        if _env_bool("PUSH_STREAM_EMPTY_OWNER_LOCK_REQUIRE_OWNER_CONTEXT", True) and not _is_push_owner_candidate_context():
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _lock_conflict_response(path: str, fh: Any, *, log_prefix: str) -> tuple[bool, Any, dict[str, Any]]:
+    text = _read_lock_text(path, fh)
+    pid = _parse_owner_pid(text)
+    alive = _pid_alive(pid)
+    if _empty_owner_lock_should_fail_open(text, pid, alive):
+        logger.warning(
+            "[PUSH RECONNECT STABILITY] empty owner PUSH lock detected -> fail-open owner context. path=%s pid=%s argv=%s",
+            path,
+            os.getpid(),
+            sys.argv,
+        )
+        try:
+            fh.close()
+        except Exception:
+            pass
+        return True, None, {"path": path, "empty_owner_failopen": True, "owner_pid": pid, "owner_alive": alive, "text": ""}
+
+    logger.warning(
+        "%s path=%s owner_pid=%s owner_alive=%s text=%s -> wait/retry",
+        log_prefix,
+        path,
+        pid,
+        alive,
+        text.strip()[:160],
+    )
+    try:
+        fh.close()
+    except Exception:
+        pass
+    return False, None, {"path": path, "owner_pid": pid, "owner_alive": alive, "text": text.strip()[:200]}
+
+
 def _try_acquire_single_owner_lock() -> tuple[bool, Any, dict[str, Any]]:
     if not _env_bool("PUSH_STREAM_SINGLE_OWNER_LOCK", True):
         return True, None, {"lock_enabled": False}
@@ -164,41 +225,21 @@ def _try_acquire_single_owner_lock() -> tuple[bool, Any, dict[str, Any]]:
             try:
                 msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
             except OSError:
-                text = _read_lock_text(path, fh)
-                pid = _parse_owner_pid(text)
-                alive = _pid_alive(pid)
-                logger.warning(
-                    "[PUSH RECONNECT STABILITY] another process owns PUSH WebSocket lock path=%s owner_pid=%s owner_alive=%s text=%s -> wait/retry",
+                return _lock_conflict_response(
                     path,
-                    pid,
-                    alive,
-                    text.strip()[:160],
+                    fh,
+                    log_prefix="[PUSH RECONNECT STABILITY] another process owns PUSH WebSocket lock",
                 )
-                try:
-                    fh.close()
-                except Exception:
-                    pass
-                return False, None, {"path": path, "owner_pid": pid, "owner_alive": alive, "text": text.strip()[:200]}
         else:
             import fcntl
             try:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
-                text = _read_lock_text(path, fh)
-                pid = _parse_owner_pid(text)
-                alive = _pid_alive(pid)
-                logger.warning(
-                    "[PUSH RECONNECT STABILITY] another process owns PUSH WebSocket lock path=%s owner_pid=%s owner_alive=%s text=%s -> wait/retry",
+                return _lock_conflict_response(
                     path,
-                    pid,
-                    alive,
-                    text.strip()[:160],
+                    fh,
+                    log_prefix="[PUSH RECONNECT STABILITY] another process owns PUSH WebSocket lock",
                 )
-                try:
-                    fh.close()
-                except Exception:
-                    pass
-                return False, None, {"path": path, "owner_pid": pid, "owner_alive": alive, "text": text.strip()[:200]}
 
         fh.seek(0)
         fh.truncate()
@@ -248,7 +289,7 @@ def _patch_transport() -> bool:
         return False
     try:
         cur = getattr(transport, "_safe_refresh_subscriptions_after_open", None)
-        if getattr(cur, "_push_reconnect_stability_v3", False):
+        if getattr(cur, "_push_reconnect_stability_v4", False):
             return True
 
         def _safe_refresh_subscriptions_after_open_patched() -> None:
@@ -279,6 +320,7 @@ def _patch_transport() -> bool:
         _safe_refresh_subscriptions_after_open_patched._push_reconnect_stability_v1 = True  # type: ignore[attr-defined]
         _safe_refresh_subscriptions_after_open_patched._push_reconnect_stability_v2 = True  # type: ignore[attr-defined]
         _safe_refresh_subscriptions_after_open_patched._push_reconnect_stability_v3 = True  # type: ignore[attr-defined]
+        _safe_refresh_subscriptions_after_open_patched._push_reconnect_stability_v4 = True  # type: ignore[attr-defined]
         _safe_refresh_subscriptions_after_open_patched._original = cur  # type: ignore[attr-defined]
         transport._safe_refresh_subscriptions_after_open = _safe_refresh_subscriptions_after_open_patched
         logger.warning("[PUSH RECONNECT STABILITY] patched transport on_open refresh skipped_by_default=True")
@@ -296,6 +338,8 @@ def _wait_for_single_owner_lock(state: Any, _safe_set_runtime: Any) -> Any:
         ok_lock, lock_handle, detail = _try_acquire_single_owner_lock()
         if ok_lock:
             _safe_set_runtime("push_stream_skipped_reason", "")
+            if detail.get("empty_owner_failopen"):
+                _safe_set_runtime("push_stream_lock_mode", "empty_owner_failopen")
             return lock_handle
         _safe_set_runtime("push_stream_running", False)
         _safe_set_runtime("push_stream_skipped_reason", "single_owner_lock_held_waiting")
@@ -319,7 +363,7 @@ def _patch_runner() -> bool:
         return False
     try:
         cur = getattr(runner, "_run_forever_loop", None)
-        if getattr(cur, "_push_reconnect_stability_v3", False):
+        if getattr(cur, "_push_reconnect_stability_v4", False):
             return True
         original = cur
 
@@ -332,12 +376,14 @@ def _patch_runner() -> bool:
                     logger.warning("[push_stream] run loop stopped before acquiring single-owner lock")
                     return
             else:
-                ok_lock, lock_handle, _detail = _try_acquire_single_owner_lock()
+                ok_lock, lock_handle, detail = _try_acquire_single_owner_lock()
                 if not ok_lock:
                     _safe_set_runtime("push_stream_running", False)
                     _safe_set_runtime("push_stream_skipped_reason", "single_owner_lock_held")
                     logger.warning("[push_stream] run loop skipped reason=single_owner_lock_held")
                     return
+                if detail.get("empty_owner_failopen"):
+                    _safe_set_runtime("push_stream_lock_mode", "empty_owner_failopen")
             _LOCK_HANDLE = lock_handle
             _safe_set_runtime("push_stream_running", True)
 
@@ -349,7 +395,7 @@ def _patch_runner() -> bool:
             short_extra = max(0.0, _env_float("PUSH_STREAM_SHORT_LIVED_EXTRA_COOLDOWN_SEC", 20.0))
             reconnect_wait = base
             logger.info(
-                "[push_stream] run loop start url=%s version=%s reconnect_backoff=%.1f..%.1fs stable_reset=%.1fs short_lived=%.1fs extra=%.1fs single_owner=%s",
+                "[push_stream] run loop start url=%s version=%s reconnect_backoff=%.1f..%.1fs stable_reset=%.1fs short_lived=%.1fs extra=%.1fs single_owner=%s lock_mode=%s",
                 ws_url,
                 getattr(runner, "VERSION", "unknown"),
                 base,
@@ -358,6 +404,7 @@ def _patch_runner() -> bool:
                 short_lived_sec,
                 short_extra,
                 lock_handle is not None,
+                "locked" if lock_handle is not None else "failopen_or_disabled",
             )
 
             try:
@@ -417,9 +464,10 @@ def _patch_runner() -> bool:
         _run_forever_loop_patched._push_reconnect_stability_v1 = True  # type: ignore[attr-defined]
         _run_forever_loop_patched._push_reconnect_stability_v2 = True  # type: ignore[attr-defined]
         _run_forever_loop_patched._push_reconnect_stability_v3 = True  # type: ignore[attr-defined]
+        _run_forever_loop_patched._push_reconnect_stability_v4 = True  # type: ignore[attr-defined]
         _run_forever_loop_patched._original = original  # type: ignore[attr-defined]
         runner._run_forever_loop = _run_forever_loop_patched
-        logger.warning("[PUSH RECONNECT STABILITY] patched runner reconnect cooldown=True single_owner=True wait_retry=True")
+        logger.warning("[PUSH RECONNECT STABILITY] patched runner reconnect cooldown=True single_owner=True wait_retry=True empty_owner_failopen=True")
         return True
     except Exception:
         logger.exception("[PUSH RECONNECT STABILITY] runner patch failed")
@@ -439,7 +487,7 @@ def install(retry: bool = True) -> bool:
         return True
     if _apply():
         _INSTALLED = True
-        logger.warning("[PUSH RECONNECT STABILITY] installed v3")
+        logger.warning("[PUSH RECONNECT STABILITY] installed v4")
         return True
     if retry and not _INSTALLING:
         _INSTALLING = True
@@ -450,7 +498,7 @@ def install(retry: bool = True) -> bool:
                 for _ in range(120):
                     if _apply():
                         _INSTALLED = True
-                        logger.warning("[PUSH RECONNECT STABILITY] installed v3 by retry")
+                        logger.warning("[PUSH RECONNECT STABILITY] installed v4 by retry")
                         return
                     time.sleep(0.25)
                 logger.warning("[PUSH RECONNECT STABILITY] retry exhausted")
