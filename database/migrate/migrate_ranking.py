@@ -1,19 +1,17 @@
 # ============================================================
 # File   : database/migrate/migrate_ranking.py
-# Version: Ver36-RESTORE-MIGRATE-RANKING-COMPAT-EXPORT
+# Version: Ver37-FIX-RANKING-SUMMARY-SCHEMA-CALL
 # ------------------------------------------------------------
 # ✔ ADD ONLY 原則厳守
 # ✔ Base_ranking create_all保持
 # ✔ ranking_raw_1min は database.schema.ranking_raw_schema を正本にする
 # ✔ ranking_snapshot_1min は database.schema.ranking_snapshot_schema を正本にする
-# ✔ ranking_ma_1min 列保証
 # ✔ ranking_summary_1min / 3min / 5min を起動時に作成・補完
-# ✔ 旧カテゴリ別テーブル（値上がり率_ALL 等）を起動時に作成・補完
 # ✔ SAFE MIGRATION MODE 対応
 # ✔ 既存データ破壊なし
-# ✔ writer側からスキーマ責務を移管
 # ✔ raw schema BEGIN IMMEDIATE database is locked を短時間リトライして起動停止を防止
-# ✔ Ver36: migrate_main 互換の migrate_ranking alias を復旧
+# ✔ migrate_main 互換の migrate_ranking alias を保持
+# ✔ Ver37: ensure_ranking_summary_table(con, interval=...) に修正
 # ============================================================
 
 from __future__ import annotations
@@ -28,10 +26,7 @@ from typing import Any
 from sqlalchemy import text
 
 from database.bases import Base_ranking
-from database.schema.ranking_raw_schema import (
-    ensure_ranking_raw_table,
-    get_ranking_raw_schema_status,
-)
+from database.schema.ranking_raw_schema import ensure_ranking_raw_table, get_ranking_raw_schema_status
 from database.schema.ranking_snapshot_schema import (
     ensure_ranking_snapshot_table,
     patch_ranking_snapshot_schema,
@@ -40,11 +35,6 @@ from database.schema.ranking_snapshot_schema import (
 from database.schema.ranking_summary_schema import ensure_ranking_summary_table
 
 logger = logging.getLogger(__name__)
-
-
-# ============================================================
-# constants
-# ============================================================
 
 LEGACY_RANKING_TYPES: tuple[str, ...] = (
     "値上がり率",
@@ -55,9 +45,7 @@ LEGACY_RANKING_TYPES: tuple[str, ...] = (
     "売買代金急増",
     "TICK回数",
 )
-
 LEGACY_MARKETS: tuple[str, ...] = ("ALL", "TP", "TS", "TG")
-
 LEGACY_CATEGORY_COLUMNS: dict[str, str] = {
     "id": "INTEGER",
     "symbol": "TEXT",
@@ -99,44 +87,22 @@ def _is_sqlite_locked(exc: BaseException) -> bool:
     return "database is locked" in s or "database table is locked" in s or "database busy" in s
 
 
-def _begin_immediate_with_retry(
-    con: sqlite3.Connection,
-    *,
-    label: str,
-    attempts: int | None = None,
-    sleep_sec: float | None = None,
-) -> bool:
+def _begin_immediate_with_retry(con: sqlite3.Connection, *, label: str, attempts: int | None = None, sleep_sec: float | None = None) -> bool:
     max_attempts = max(1, attempts if attempts is not None else _env_int("RANKING_MIGRATION_BEGIN_RETRY", 8))
     wait = max(0.1, sleep_sec if sleep_sec is not None else _env_float("RANKING_MIGRATION_BEGIN_RETRY_SLEEP", 0.75))
     for i in range(1, max_attempts + 1):
         try:
             con.execute("BEGIN IMMEDIATE")
             if i > 1:
-                logger.warning(
-                    "[RANKING MIGRATION] BEGIN IMMEDIATE retry success label=%s attempt=%s/%s",
-                    label,
-                    i,
-                    max_attempts,
-                )
+                logger.warning("[RANKING MIGRATION] BEGIN IMMEDIATE retry success label=%s attempt=%s/%s", label, i, max_attempts)
             return True
         except sqlite3.OperationalError as exc:
             if not _is_sqlite_locked(exc) or i >= max_attempts:
                 raise
-            logger.warning(
-                "[RANKING MIGRATION] BEGIN IMMEDIATE locked label=%s attempt=%s/%s sleep=%.2fs error=%s",
-                label,
-                i,
-                max_attempts,
-                wait,
-                exc,
-            )
+            logger.warning("[RANKING MIGRATION] BEGIN IMMEDIATE locked label=%s attempt=%s/%s sleep=%.2fs error=%s", label, i, max_attempts, wait, exc)
             time.sleep(wait)
     return False
 
-
-# ============================================================
-# helpers
-# ============================================================
 
 def _quote_ident(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
@@ -164,18 +130,10 @@ def _open_sqlite_from_engine(engine: Any) -> sqlite3.Connection | None:
     if not db_path:
         logger.warning("[RANKING MIGRATION] sqlite path not resolved from engine")
         return None
-
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-
     timeout = _env_float("RANKING_MIGRATION_SQLITE_TIMEOUT", 60.0)
-    con = sqlite3.connect(
-        str(path),
-        timeout=timeout,
-        check_same_thread=False,
-        isolation_level=None,
-    )
-
+    con = sqlite3.connect(str(path), timeout=timeout, check_same_thread=False, isolation_level=None)
     try:
         con.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
         con.execute("PRAGMA journal_mode=WAL")
@@ -185,7 +143,6 @@ def _open_sqlite_from_engine(engine: Any) -> sqlite3.Connection | None:
         con.execute("PRAGMA cache_size=-50000")
     except Exception:
         logger.warning("[RANKING MIGRATION] sqlite PRAGMA setup partially failed", exc_info=True)
-
     return con
 
 
@@ -198,42 +155,21 @@ def _existing_columns_sqlite(con: sqlite3.Connection, table: str) -> set[str]:
         return set()
 
 
-def _safe_add_column_sqlite(
-    con: sqlite3.Connection,
-    *,
-    table: str,
-    column: str,
-    col_type: str,
-) -> bool:
+def _safe_add_column_sqlite(con: sqlite3.Connection, *, table: str, column: str, col_type: str) -> bool:
     existing = _existing_columns_sqlite(con, table)
     if column in existing:
         return False
-
     add_type = str(col_type or "TEXT")
     upper = add_type.upper()
-
     if "DEFAULT CURRENT_TIMESTAMP" in upper:
-        add_type = add_type.replace("DEFAULT CURRENT_TIMESTAMP", "")
-        add_type = add_type.replace("default current_timestamp", "")
-
+        add_type = add_type.replace("DEFAULT CURRENT_TIMESTAMP", "").replace("default current_timestamp", "")
     upper = add_type.upper()
     if "NOT NULL" in upper and "DEFAULT" not in upper:
-        add_type = add_type.replace("NOT NULL", "")
-        add_type = add_type.replace("not null", "")
-
+        add_type = add_type.replace("NOT NULL", "").replace("not null", "")
     add_type = " ".join(add_type.split()).strip() or "TEXT"
-
     try:
-        con.execute(
-            f"ALTER TABLE {_quote_ident(table)} "
-            f"ADD COLUMN {_quote_ident(column)} {add_type}"
-        )
-        logger.warning(
-            "[RANKING MIGRATION] added missing column table=%s column=%s type=%s",
-            table,
-            column,
-            add_type,
-        )
+        con.execute(f"ALTER TABLE {_quote_ident(table)} ADD COLUMN {_quote_ident(column)} {add_type}")
+        logger.warning("[RANKING MIGRATION] added missing column table=%s column=%s type=%s", table, column, add_type)
         return True
     except sqlite3.OperationalError as exc:
         if "duplicate column" in str(exc).lower():
@@ -244,62 +180,31 @@ def _safe_add_column_sqlite(
 def _ensure_table_and_column(engine, table: str, column: str, col_type: str) -> bool:
     with engine.begin() as conn:
         conn.execute(text("PRAGMA busy_timeout=30000"))
-
-        tables = {
-            row[0]
-            for row in conn.execute(
-                text("SELECT name FROM sqlite_master WHERE type='table'")
-            )
-        }
-
+        tables = {row[0] for row in conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))}
         if table not in tables:
             logger.info("[RANKING MIGRATION] create minimal table table=%s first_column=%s", table, column)
             conn.execute(text(f"CREATE TABLE {_quote_ident(table)} ({_quote_ident(column)} {col_type})"))
             return True
-
-        cols = {
-            row[1]
-            for row in conn.execute(
-                text(f"PRAGMA table_info({_quote_ident(table)})")
-            )
-        }
-
+        cols = {row[1] for row in conn.execute(text(f"PRAGMA table_info({_quote_ident(table)})"))}
         if column in cols:
             return False
-
         add_type = str(col_type or "TEXT")
-
         upper = add_type.upper()
         if "DEFAULT CURRENT_TIMESTAMP" in upper:
-            add_type = add_type.replace("DEFAULT CURRENT_TIMESTAMP", "")
-            add_type = add_type.replace("default current_timestamp", "")
-
+            add_type = add_type.replace("DEFAULT CURRENT_TIMESTAMP", "").replace("default current_timestamp", "")
         upper = add_type.upper()
         if "NOT NULL" in upper and "DEFAULT" not in upper:
-            add_type = add_type.replace("NOT NULL", "")
-            add_type = add_type.replace("not null", "")
-
+            add_type = add_type.replace("NOT NULL", "").replace("not null", "")
         add_type = " ".join(add_type.split()).strip() or "TEXT"
-
         logger.info("[RANKING MIGRATION] add column table=%s column=%s type=%s", table, column, add_type)
-        conn.execute(
-            text(
-                f"ALTER TABLE {_quote_ident(table)} "
-                f"ADD COLUMN {_quote_ident(column)} {add_type}"
-            )
-        )
+        conn.execute(text(f"ALTER TABLE {_quote_ident(table)} ADD COLUMN {_quote_ident(column)} {add_type}"))
         return True
 
-
-# ============================================================
-# ensure schemas
-# ============================================================
 
 def _ensure_ranking_snapshot_schema(engine) -> dict[str, Any]:
     con = _open_sqlite_from_engine(engine)
     if con is None:
         return {"ok": False, "reason": "no_sqlite_connection"}
-
     try:
         _begin_immediate_with_retry(con, label="snapshot_schema")
         ensure_ranking_snapshot_table(con)
@@ -309,12 +214,9 @@ def _ensure_ranking_snapshot_schema(engine) -> dict[str, Any]:
             unique_ok = ensure_ranking_snapshot_unique_index(con)
         except Exception:
             logger.warning("[RANKING MIGRATION] snapshot unique index ensure failed", exc_info=True)
-
         con.execute("COMMIT")
-
         logger.info("[RANKING MIGRATION] snapshot schema ensured unique_ok=%s", unique_ok)
         return {"ok": True, "unique_ok": unique_ok}
-
     except Exception as e:
         try:
             con.execute("ROLLBACK")
@@ -322,7 +224,6 @@ def _ensure_ranking_snapshot_schema(engine) -> dict[str, Any]:
             pass
         logger.exception("[RANKING MIGRATION] snapshot schema ensure failed")
         return {"ok": False, "error": str(e)}
-
     finally:
         try:
             con.close()
@@ -331,38 +232,26 @@ def _ensure_ranking_snapshot_schema(engine) -> dict[str, Any]:
 
 
 def _ensure_ranking_raw_schema(engine) -> dict[str, Any]:
-    """
-    raw schema は database.schema.ranking_raw_schema を正本にする。
-    ロック時は短時間リトライし、失敗しても起動継続できる形で返す。
-    """
     con = _open_sqlite_from_engine(engine)
     if con is None:
         return {"ok": False, "reason": "no_sqlite_connection"}
-
     try:
         _begin_immediate_with_retry(con, label="raw_schema")
         ensure_ranking_raw_table(con)
         status = get_ranking_raw_schema_status(con)
         con.execute("COMMIT")
-
         logger.info("[RANKING MIGRATION] raw schema ensured status=%s", status)
         return {"ok": True, "status": status}
-
     except sqlite3.OperationalError as e:
         try:
             con.execute("ROLLBACK")
         except Exception:
             pass
         if _is_sqlite_locked(e):
-            logger.warning(
-                "[RANKING MIGRATION] raw schema ensure skipped reason=database_locked_after_retry error=%s",
-                e,
-                exc_info=True,
-            )
+            logger.warning("[RANKING MIGRATION] raw schema ensure skipped reason=database_locked_after_retry error=%s", e, exc_info=True)
             return {"ok": False, "skip": True, "reason": "database_locked_after_retry", "error": str(e)}
         logger.exception("[RANKING MIGRATION] raw schema ensure failed")
         return {"ok": False, "error": str(e)}
-
     except Exception as e:
         try:
             con.execute("ROLLBACK")
@@ -370,7 +259,6 @@ def _ensure_ranking_raw_schema(engine) -> dict[str, Any]:
             pass
         logger.exception("[RANKING MIGRATION] raw schema ensure failed")
         return {"ok": False, "error": str(e)}
-
     finally:
         try:
             con.close()
@@ -382,13 +270,12 @@ def _ensure_ranking_summary_schemas(engine) -> dict[str, Any]:
     con = _open_sqlite_from_engine(engine)
     if con is None:
         return {"ok": False, "reason": "no_sqlite_connection"}
-
     try:
         _begin_immediate_with_retry(con, label="summary_schema")
         results: dict[str, Any] = {}
         for interval in (1, 3, 5):
             table = f"ranking_summary_{interval}min"
-            ensure_ranking_summary_table(con, table_name=table)
+            ensure_ranking_summary_table(con, interval=interval)
             results[table] = True
         con.execute("COMMIT")
         logger.info("[RANKING MIGRATION] summary schemas ensured results=%s", results)
@@ -425,9 +312,6 @@ def _ensure_legacy_category_tables(engine) -> dict[str, Any]:
 
 
 def run_migration(engine) -> dict[str, Any]:
-    """
-    ranking DB の起動時マイグレーション入口。
-    """
     result: dict[str, Any] = {
         "ok": True,
         "base_create_all": None,
@@ -436,7 +320,6 @@ def run_migration(engine) -> dict[str, Any]:
         "summary_schemas": None,
         "legacy_category_tables": None,
     }
-
     try:
         Base_ranking.metadata.create_all(engine)
         result["base_create_all"] = {"ok": True}
@@ -465,7 +348,6 @@ def run_migration(engine) -> dict[str, Any]:
         r = _ensure_legacy_category_tables(engine)
         result["legacy_category_tables"] = r
         if isinstance(r, dict) and not r.get("ok", False):
-            # 旧カテゴリ表は互換用。ここで起動を止めない。
             logger.warning("[RANKING MIGRATION] legacy category tables had errors but startup continues result=%s", r)
     except Exception as exc:
         logger.exception("[RANKING MIGRATION] legacy category ensure step failed")
@@ -476,11 +358,6 @@ def run_migration(engine) -> dict[str, Any]:
 
 
 def migrate_ranking(engine) -> dict[str, Any]:
-    """
-    Backward-compatible entry point expected by database.migrate.migrate_main.
-    Keep this alias so startup imports do not fail when callers import
-    `migrate_ranking` directly from this module.
-    """
     return run_migration(engine)
 
 
