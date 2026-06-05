@@ -1,18 +1,16 @@
 # ============================================================
 # File   : core/startup/entry_order_short_mtf_neutral_rescue_patch.py
-# Version: V4-PATCH-GUARD-FUNCTIONS-DIRECTLY
+# Version: V5-ALL-ZERO-NEUTRAL-PASS
 # ------------------------------------------------------------
 # 目的:
 #   SUMMARY_AI が AI_OK / FINAL ENTRY SAFETY GUARD / ENTRY_QTY_FINAL まで通過後、
 #   注文作成直前で SHORT_MTF_NOT_BUY_ALIGNED / SHORT_MTF_NOT_SELL_ALIGNED により
-#   1mだけ方向一致・3m/5mが0または欠損のケースまで落ちる問題を救済する。
+#   1m/3m/5m がすべて0.0の中立ケースまで落ちる問題を救済する。
 #
-# V4:
-#   - build_entry_order 後の retry だけでなく、
-#     entry_order_builder._summary_mtf_direction_guard と
-#     entry_limit_passive_runtime_patch._summary_ai_strict_guard を直接wrap。
-#   - source=SUMMARY / entry_type=SUMMARY_AI の行も救済対象にする。
-#   - 3m/5m が反対方向ではなく neutral の時だけ通す。
+# V5:
+#   - slope_1m/slope_3m/slope_5m がすべて0.0近傍の場合は、
+#     反対方向ではなく未確定・中立として通す。
+#   - 従来の「1mだけ方向一致、3m/5m neutral」救済も維持。
 #   - 板、信用、数量、低ボラ、API発注ガードは維持。
 # ============================================================
 
@@ -113,6 +111,11 @@ def _slope_values(row: dict[str, Any]) -> dict[str, float]:
     }
 
 
+def _is_all_zero_slopes(slopes: dict[str, float]) -> bool:
+    eps = abs(_env_float("ENTRY_ORDER_SHORT_MTF_ZERO_EPS", 0.0000001))
+    return all(abs(float(v or 0.0)) <= eps for v in slopes.values())
+
+
 def _is_short_mtf_reason(reason: Any) -> bool:
     s = _norm(reason)
     return s in {
@@ -148,8 +151,23 @@ def _can_rescue(row: dict[str, Any], *, symbol: str, side: str, source: str, res
 
     eps = abs(_env_float("ENTRY_ORDER_SHORT_MTF_NEUTRAL_EPS", 0.0))
     slopes = _slope_values(row)
-    s1 = slopes["slope_1m"]
 
+    # すべて0.0は反対方向ではなく、未確定・中立として通す。
+    if _env_bool("ENTRY_ORDER_ALLOW_ALL_ZERO_SHORT_MTF", True) and _is_all_zero_slopes(slopes):
+        return True, {
+            "reason": "all_zero_short_mtf_neutral_rescue",
+            "symbol": symbol or row.get("symbol"),
+            "side": side_u,
+            "score": score,
+            "min_score": min_score,
+            "slopes": slopes,
+            "eps": eps,
+            "source": source or row.get("source"),
+            "entry_type": row.get("entry_type"),
+            "original_reason": result.get("reason") if isinstance(result, dict) else None,
+        }
+
+    s1 = slopes["slope_1m"]
     if side_u == "BUY":
         aligned_1m = s1 > eps
         hard_opposite = {k: v for k, v in slopes.items() if k != "slope_1m" and v < -eps}
@@ -257,7 +275,7 @@ def _patch_guard_function(obj: Any, name: str) -> bool:
     old = getattr(obj, name, None)
     if not callable(old):
         return False
-    if getattr(old, "_short_mtf_neutral_guard_v4", False):
+    if getattr(old, "_short_mtf_neutral_guard_v5", False):
         return True
     original = getattr(old, "_original", old)
 
@@ -272,12 +290,13 @@ def _patch_guard_function(obj: Any, name: str) -> bool:
             row, symbol, side, source = _context_from_args(args, kwargs)
             ok, detail = _can_rescue(row, symbol=symbol, side=side, source=source, result=result if isinstance(result, dict) else None)
             if ok:
-                logger.warning("[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] guard bypass v4 target=%s.%s detail=%s original=%s", getattr(obj, "__name__", obj.__class__.__name__), name, detail, result)
+                logger.warning("[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] guard bypass v5 target=%s.%s detail=%s original=%s", getattr(obj, "__name__", obj.__class__.__name__), name, detail, result)
                 return None
         except Exception:
             logger.exception("[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] guard wrapper failed target=%s.%s", obj, name)
         return result
 
+    guard_wrapper._short_mtf_neutral_guard_v5 = True  # type: ignore[attr-defined]
     guard_wrapper._short_mtf_neutral_guard_v4 = True  # type: ignore[attr-defined]
     guard_wrapper._original = original  # type: ignore[attr-defined]
     setattr(obj, name, guard_wrapper)
@@ -308,7 +327,7 @@ def install() -> bool:
             _patch_direct_guards(eob)
         except Exception:
             pass
-        logger.warning("[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] already installed v4")
+        logger.warning("[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] already installed v5")
         return True
 
     try:
@@ -319,7 +338,7 @@ def install() -> bool:
         if not callable(original):
             logger.error("[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] build_entry_order not callable")
             return False
-        if getattr(original, "_short_mtf_neutral_rescue_v4", False):
+        if getattr(original, "_short_mtf_neutral_rescue_v5", False):
             _INSTALLED = True
             return True
 
@@ -353,19 +372,20 @@ def install() -> bool:
                     d["short_mtf_neutral_rescue"] = True
                     d["short_mtf_neutral_rescue_detail"] = detail
                     retry["detail"] = d
-                    logger.warning("[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] rescued v4 detail=%s retry=%s", detail, retry)
+                    logger.warning("[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] rescued v5 detail=%s retry=%s", detail, retry)
                     return retry
 
-                logger.warning("[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] retry_still_ng_v4 detail=%s retry=%s", detail, retry)
+                logger.warning("[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] retry_still_ng_v5 detail=%s retry=%s", detail, retry)
                 return retry
             except Exception:
                 logger.exception("[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] wrapper failed; return original result")
                 return result
 
-        wrapped_build_entry_order._short_mtf_neutral_rescue_v1 = True  # type: ignore[attr-defined]
-        wrapped_build_entry_order._short_mtf_neutral_rescue_v2 = True  # type: ignore[attr-defined]
-        wrapped_build_entry_order._short_mtf_neutral_rescue_v3 = True  # type: ignore[attr-defined]
+        wrapped_build_entry_order._short_mtf_neutral_rescue_v5 = True  # type: ignore[attr-defined]
         wrapped_build_entry_order._short_mtf_neutral_rescue_v4 = True  # type: ignore[attr-defined]
+        wrapped_build_entry_order._short_mtf_neutral_rescue_v3 = True  # type: ignore[attr-defined]
+        wrapped_build_entry_order._short_mtf_neutral_rescue_v2 = True  # type: ignore[attr-defined]
+        wrapped_build_entry_order._short_mtf_neutral_rescue_v1 = True  # type: ignore[attr-defined]
         wrapped_build_entry_order._original = _ORIGINAL  # type: ignore[attr-defined]
         eob.build_entry_order = wrapped_build_entry_order
         try:
@@ -375,10 +395,11 @@ def install() -> bool:
 
         _INSTALLED = True
         logger.warning(
-            "[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] installed v4 enabled=%s min_score=%.3f eps=%.6f patched_guards=%s",
+            "[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] installed v5 enabled=%s min_score=%.3f eps=%.6f allow_all_zero=%s patched_guards=%s",
             _env_bool("ENTRY_ORDER_SHORT_MTF_NEUTRAL_RESCUE", True),
             _env_float("ENTRY_ORDER_SHORT_MTF_NEUTRAL_MIN_SCORE", 1.0),
             _env_float("ENTRY_ORDER_SHORT_MTF_NEUTRAL_EPS", 0.0),
+            _env_bool("ENTRY_ORDER_ALLOW_ALL_ZERO_SHORT_MTF", True),
             patched_guards,
         )
         return True
