@@ -1,19 +1,24 @@
 # ============================================================
 # File   : trading/push/push_stream/protected_symbols.py
-# Version: Ver02-PROTECTED-PUSH-SYMBOLS-PRIORITY
+# Version: Ver03-PROTECT-DB-OPEN-POSITIONS
 # ------------------------------------------------------------
 # PUSH登録から絶対に外したくない銘柄を解決する。
 #
 # 優先順位:
-#   1. 保有中銘柄 / 実建玉復元銘柄
+#   1. 保有中銘柄 / 実建玉復元銘柄 / positions.db上のOPEN銘柄
 #   2. EXIT中 / 未約定注文中銘柄
 #   3. ENTRY注文直後 / 直近ENTRY候補
 #   4. AI_OK / 候補銘柄
 #
-# 目的:
-#   - 50銘柄制限/A-Bローテーション中でも、売買中銘柄を優先登録する
-#   - 5秒EXIT / trail exit / 未約定cancel の監視漏れを減らす
-#   - 保護銘柄が多すぎる場合でも、リスクの高いものを優先する
+# Ver03:
+#   - broker authoritative 中でも、EXIT価格取得に必要なため positions.db の
+#     OPEN銘柄をPUSH登録保護対象へ含める。
+#   - ログ上で DB open 9716 は存在するのに PUSH/summary/board に価格が無く、
+#       [EXIT PRICE] unavailable symbol=9716
+#       [EXIT] skip no latest price symbol=9716
+#     でEXIT判定不能になっていた。
+#   - DB建玉をpublishし直すのではなく、PUSH登録保護だけに使うため、
+#     stale DB建玉を実建玉として扱う副作用は抑える。
 # ============================================================
 
 from __future__ import annotations
@@ -51,7 +56,8 @@ def _env_int(name: str, default: int) -> int:
 
 
 ENABLE_PROTECTED_PUSH_SYMBOLS = _env_bool('ENABLE_PROTECTED_PUSH_SYMBOLS', True)
-PROTECTED_PUSH_MAX_SYMBOLS = _env_int('PROTECTED_PUSH_MAX_SYMBOLS', 20)
+PROTECTED_PUSH_MAX_SYMBOLS = _env_int('PROTECTED_PUSH_MAX_SYMBOLS', 30)
+PROTECTED_PUSH_INCLUDE_DB_OPEN = _env_bool('PROTECTED_PUSH_INCLUDE_DB_OPEN', True)
 
 
 def _normalize(s: Any) -> str | None:
@@ -171,6 +177,21 @@ def _from_global_context_positions() -> list[str]:
     return []
 
 
+def _from_db_open_positions() -> list[str]:
+    if not PROTECTED_PUSH_INCLUDE_DB_OPEN:
+        return []
+    try:
+        from trading.position.open_position_sync import load_open_positions_from_db
+        positions = load_open_positions_from_db()
+        syms = _symbols_from_any(positions)
+        if syms:
+            logger.warning('[PROTECTED PUSH] DB open positions protected symbols=%s', syms[:30])
+        return syms
+    except Exception:
+        logger.debug('[PROTECTED PUSH] DB open positions load failed', exc_info=True)
+    return []
+
+
 def _from_runtime_open_positions() -> list[str]:
     try:
         from trading.runtime_persistence.runtime_state_store import load_open_positions
@@ -215,6 +236,7 @@ def _priority_buckets() -> list[tuple[str, list[str]]]:
     )
 
     buckets = [
+        ('P1_POSITION_DB', _from_db_open_positions()),
         ('P1_POSITION_GC', _from_global_context_positions()),
         ('P1_POSITION_RUNTIME', _from_runtime_open_positions()),
         ('P1_POSITION_GLOBAL', _symbols_from_global_attrs(position_attrs, label='P1_POSITION')),
