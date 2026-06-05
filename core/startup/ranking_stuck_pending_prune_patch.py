@@ -75,9 +75,18 @@ def _pending_count() -> int:
 
 
 def _mark_and_prune_stuck_ranking_pending() -> int:
-    """ATR/RANGE/信用ガード等で落ち続けるRANKING pendingを掃除する。"""
-    max_retry = max(1, _env_int("RANKING_STUCK_PENDING_MAX_CONTROLLER_RETRY", 2))
-    max_age_sec = max(30.0, _env_float("RANKING_STUCK_PENDING_MAX_AGE_SEC", 120.0))
+    """
+    ATR/RANGE/信用ガード等で落ち続けるRANKING pendingを掃除する。
+
+    v2:
+      - retry回数だけでは削除しない。
+      - pending作成直後にcontrollerが複数回走ると retry>=2 になり、0.2秒程度で
+        RANKING_STUCK_PENDING_RETRY_OR_AGE により消える問題を防ぐ。
+      - 最低滞留時間を過ぎた上で retry上限、または最大滞留時間で削除する。
+    """
+    max_retry = max(1, _env_int("RANKING_STUCK_PENDING_MAX_CONTROLLER_RETRY", 3))
+    min_age_sec = max(5.0, _env_float("RANKING_STUCK_PENDING_MIN_AGE_SEC", 30.0))
+    max_age_sec = max(min_age_sec, _env_float("RANKING_STUCK_PENDING_MAX_AGE_SEC", 120.0))
     now = time.time()
 
     try:
@@ -97,11 +106,13 @@ def _mark_and_prune_stuck_ranking_pending() -> int:
             entry["_ranking_controller_retry_count"] = int(float(entry.get("_ranking_controller_retry_count") or 0)) + 1
             entry["_ranking_last_controller_retry_ts"] = now
             logger.info(
-                "[RANKING STUCK PENDING] mark symbol=%s retry=%s age=%.1fs score=%.4f",
+                "[RANKING STUCK PENDING] mark symbol=%s retry=%s age=%.1fs score=%.4f min_age=%.1fs max_age=%.1fs",
                 sym,
                 entry.get("_ranking_controller_retry_count"),
                 now - float(first),
                 _score(entry),
+                min_age_sec,
+                max_age_sec,
             )
 
         def pred(sym: str, entry: dict) -> bool:
@@ -110,18 +121,28 @@ def _mark_and_prune_stuck_ranking_pending() -> int:
             retry = int(float(entry.get("_ranking_controller_retry_count") or 0))
             first = float(entry.get("_ranking_pending_first_seen_ts") or now)
             age = now - first
-            if retry >= max_retry:
-                return True
+
+            # 作成直後は絶対に消さない。発注executorへ渡る猶予を必ず残す。
+            if age < min_age_sec:
+                return False
+
+            # 最大滞留時間を超えたpendingは掃除する。
             if age >= max_age_sec:
                 return True
+
+            # retry上限だけではなく、最低滞留時間経過後に限って掃除する。
+            if retry >= max_retry:
+                return True
+
             return False
 
         removed = int(prune(pred, reason="RANKING_STUCK_PENDING_RETRY_OR_AGE"))
         if removed:
             logger.warning(
-                "[RANKING STUCK PENDING] pruned removed=%s max_retry=%s max_age=%.1fs",
+                "[RANKING STUCK PENDING] pruned removed=%s max_retry=%s min_age=%.1fs max_age=%.1fs",
                 removed,
                 max_retry,
+                min_age_sec,
                 max_age_sec,
             )
         return removed
@@ -136,7 +157,7 @@ def _patch_once() -> bool:
         cur = getattr(tasks, "_run_ranking_entry_safe", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_ranking_stuck_pending_prune_v1", False):
+        if getattr(cur, "_ranking_stuck_pending_prune_v2", False):
             return True
         orig = getattr(cur, "_original", cur)
 
@@ -155,9 +176,10 @@ def _patch_once() -> bool:
             return orig()
 
         patched._ranking_stuck_pending_prune_v1 = True  # type: ignore[attr-defined]
+        patched._ranking_stuck_pending_prune_v2 = True  # type: ignore[attr-defined]
         patched._original = orig  # type: ignore[attr-defined]
         tasks._run_ranking_entry_safe = patched
-        logger.warning("[RANKING STUCK PENDING] patched _run_ranking_entry_safe v1")
+        logger.warning("[RANKING STUCK PENDING] patched _run_ranking_entry_safe v2 min_age_guard=True")
         return True
     except Exception:
         logger.exception("[RANKING STUCK PENDING] patch failed")
@@ -168,7 +190,7 @@ def _watch():
     for i in range(120):
         ok = _patch_once()
         if i in (0, 1, 5, 15, 30, 60, 119):
-            logger.warning("[RANKING STUCK PENDING] enforce ok=%s", ok)
+            logger.warning("[RANKING STUCK PENDING] enforce ok=%s v2", ok)
         time.sleep(0.5)
 
 
@@ -176,12 +198,13 @@ def install() -> bool:
     global _DONE
     if _DONE:
         return _patch_once()
-    os.environ.setdefault("RANKING_STUCK_PENDING_MAX_CONTROLLER_RETRY", "2")
+    os.environ.setdefault("RANKING_STUCK_PENDING_MAX_CONTROLLER_RETRY", "3")
+    os.environ.setdefault("RANKING_STUCK_PENDING_MIN_AGE_SEC", "30")
     os.environ.setdefault("RANKING_STUCK_PENDING_MAX_AGE_SEC", "120")
     ok = _patch_once()
     threading.Thread(target=_watch, name="ranking-stuck-pending-prune", daemon=True).start()
     _DONE = True
-    logger.warning("[RANKING STUCK PENDING] installed v1 ok=%s watcher=True", ok)
+    logger.warning("[RANKING STUCK PENDING] installed v2 ok=%s watcher=True min_age_guard=True", ok)
     return True
 
 
