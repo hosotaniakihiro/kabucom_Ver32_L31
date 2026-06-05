@@ -51,9 +51,11 @@ if _is_database_collector_context():
 else:
     _install("REENTRY_STALE_429_EXIT_SAFETY", "core.startup.entry_reentry_stale_429_exit_safety_patch")
     _install("EXIT_TUNING_DEFAULTS", "core.startup.exit_tuning_defaults_patch")
+    _install("EXIT_NOISE_CONFIRM_GUARD", "core.startup.exit_noise_confirm_guard_patch")
     _install("EXIT_EXECUTOR_BROKER_V2", "core.startup.exit_executor_broker_fallback_v2_patch")
     _install("EXIT_LOOP_TIMEOUT_GUARD", "core.startup.exit_loop_timeout_guard_patch")
     _install("ENTRY_LATE_SESSION_TIME_GUARD", "core.startup.entry_late_session_time_guard_patch")
+    _install("ENTRY_MA5_THIRD_BAR_GUARD", "core.startup.entry_ma5_third_bar_slope_guard_patch")
     _install("ENTRY_RANKING_SCALP_RESCUE", "core.startup.entry_ranking_scalp_order_rescue_patch")
     _install("RANKING_ENTRY_WIDER_TOP", "core.startup.ranking_entry_wider_top_universe_patch")
     _install("RANKING_WAL_MEMORY_GUARD", "core.startup.ranking_wal_checkpoint_memory_guard_patch")
