@@ -38,26 +38,48 @@ def install() -> bool:
         from core.startup import watchlist_recent_liquidity_guard_patch as mod
         from core.startup import watchlist_recent_liquidity_bulk_patch as bulk
 
-        def _filter_symbols_failopen_empty(symbols: Iterable[Any], *, context: str) -> List[str]:
-            items = mod._dedupe(symbols)
+        def _fallback_for_liq_unavailable(items: list[str], *, context: str, reason: str) -> list[str]:
             max_last_good_age = mod._env_float("WATCHLIST_LIQ_EMPTY_LAST_GOOD_SEC", 900.0)
+            fallback = _last_good(max_last_good_age)
+            if fallback:
+                logger.warning(
+                    "[WATCHLIST LIQ EMPTY SAFE] use last_good context=%s reason=%s current_count=%s fallback_count=%s age_sec=%.1f",
+                    context,
+                    reason,
+                    len(items),
+                    len(fallback),
+                    time.time() - _LAST_GOOD_TS,
+                )
+                return fallback
+
+            if mod._env_bool("WATCHLIST_RECENT_LIQ_ALLOW_FAIL_OPEN_WITHOUT_LAST_GOOD", False):
+                logger.warning(
+                    "[WATCHLIST LIQ EMPTY SAFE] explicit fail-open allowed context=%s reason=%s count=%s",
+                    context,
+                    reason,
+                    len(items),
+                )
+                _remember_good(items, context=context)
+                return items
+
+            logger.warning(
+                "[WATCHLIST LIQ EMPTY SAFE] fail-closed context=%s reason=%s count=%s no_last_good; return empty to avoid low-liquidity registration",
+                context,
+                reason,
+                len(items),
+            )
+            return []
+
+        def _filter_symbols_safe(symbols: Iterable[Any], *, context: str) -> List[str]:
+            items = mod._dedupe(symbols)
 
             if not mod._env_bool("WATCHLIST_RECENT_LIQ_ENABLED", True):
                 _remember_good(items, context=context)
                 return items
 
-            if not items and _is_push_register_context(context):
-                fallback = _last_good(max_last_good_age)
-                if fallback:
-                    logger.warning(
-                        "[WATCHLIST LIQ EMPTY FAILOPEN] fail-open context=%s count=0 reason=empty_input_last_good fallback=%s age_sec=%.1f",
-                        context, len(fallback), time.time() - _LAST_GOOD_TS,
-                    )
-                    return fallback
-                logger.warning(
-                    "[WATCHLIST LIQ EMPTY FAILOPEN] empty input context=%s no last_good available -> keep empty",
-                    context,
-                )
+            if not items:
+                if _is_push_register_context(context):
+                    return _fallback_for_liq_unavailable(items, context=context, reason="empty_input")
                 return items
 
             protected = mod._protected_symbols()
@@ -65,17 +87,12 @@ def install() -> bool:
             check_items = [s for s in items if s not in protected]
             stats_map, timed_out = bulk._bulk_stats(mod, check_items)
 
-            if timed_out and mod._env_bool("WATCHLIST_RECENT_LIQ_FAIL_OPEN_ON_TIMEOUT", True):
-                logger.warning("[WATCHLIST LIQ EMPTY FAILOPEN] fail-open context=%s count=%s reason=timeout_or_main_skip", context, len(items))
-                _remember_good(items, context=context)
-                return items
+            # 低流動性除外を優先する。timeout/main_skip時に全通ししない。
+            if timed_out:
+                return _fallback_for_liq_unavailable(items, context=context, reason="timeout_or_main_skip")
 
             if check_items and not stats_map:
-                # PUSH登録でここを空にするとWebSocket登録が0件になり受信が止まる。
-                # 起動直後・サマリー未作成・DB更新遅延は監視銘柄を落とさず通す。
-                logger.warning("[WATCHLIST LIQ EMPTY FAILOPEN] fail-open context=%s count=%s reason=no_recent_summary_hit protected=%s", context, len(items), len(protected_items))
-                _remember_good(items, context=context)
-                return items
+                return _fallback_for_liq_unavailable(items, context=context, reason="no_recent_summary_hit")
 
             kept: List[str] = []
             skipped: List[dict[str, Any]] = []
@@ -90,8 +107,7 @@ def install() -> bool:
                 st = stats_map.get(s) or {}
                 detail = {"symbol": s, **st, "min_latest_volume": min_latest, "min_avg_volume": min_avg, "min_turnover": min_turnover}
                 if not st:
-                    # 一部だけ欠けている場合も登録用途では落としすぎない。
-                    kept.append(s)
+                    skipped.append({"reason": "NO_RECENT_LIQ_DATA", **detail})
                 elif bulk._as_float(st.get("latest_volume"), 0.0) < min_latest:
                     skipped.append({"reason": "LATEST_VOLUME_LOW", **detail})
                 elif bulk._as_float(st.get("avg_volume"), 0.0) < min_avg:
@@ -102,29 +118,38 @@ def install() -> bool:
                     kept.append(s)
 
             if not kept and items:
-                logger.warning("[WATCHLIST LIQ EMPTY FAILOPEN] fail-open context=%s count=%s reason=all_filtered", context, len(items))
-                _remember_good(items, context=context)
-                return items
+                # 全滅時も全通ししない。直近の良好リストがあればそれを使う。
+                return _fallback_for_liq_unavailable(items, context=context, reason="all_filtered")
 
             if skipped:
-                logger.warning("[WATCHLIST LIQ EMPTY FAILOPEN] filtered context=%s before=%s after=%s protected=%s skipped=%s", context, len(items), len(kept), len(protected_items), skipped[:80])
+                logger.warning(
+                    "[WATCHLIST LIQ EMPTY SAFE] filtered context=%s before=%s after=%s protected=%s skipped=%s",
+                    context,
+                    len(items),
+                    len(kept),
+                    len(protected_items),
+                    skipped[:80],
+                )
             else:
-                logger.info("[WATCHLIST LIQ EMPTY FAILOPEN] passed context=%s count=%s protected=%s", context, len(kept), len(protected_items))
+                logger.info("[WATCHLIST LIQ EMPTY SAFE] passed context=%s count=%s protected=%s", context, len(kept), len(protected_items))
 
             _remember_good(kept, context=context)
             return kept
 
-        mod._filter_symbols = _filter_symbols_failopen_empty
+        mod._filter_symbols = _filter_symbols_safe
         _INSTALLED = True
-        logger.warning("[WATCHLIST LIQ EMPTY FAILOPEN] installed V2 last_good_empty_input=1")
+        logger.warning(
+            "[WATCHLIST LIQ EMPTY SAFE] installed no_fail_open_without_last_good=1 allow_explicit_failopen=%s",
+            mod._env_bool("WATCHLIST_RECENT_LIQ_ALLOW_FAIL_OPEN_WITHOUT_LAST_GOOD", False),
+        )
         return True
     except Exception:
-        logger.exception("[WATCHLIST LIQ EMPTY FAILOPEN] install failed")
+        logger.exception("[WATCHLIST LIQ EMPTY SAFE] install failed")
         return False
 
 try:
     install()
 except Exception:
-    logger.exception("[WATCHLIST LIQ EMPTY FAILOPEN] auto install failed")
+    logger.exception("[WATCHLIST LIQ EMPTY SAFE] auto install failed")
 
 __all__ = ["install"]
