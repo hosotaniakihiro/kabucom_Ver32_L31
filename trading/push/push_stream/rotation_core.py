@@ -1,6 +1,16 @@
 # ============================================================
 # File   : trading/push/push_stream/rotation_core.py
-# Version: PRODUCTION-STABLE-REV5-PUSH-ROTATION-WS-STABLE-GRACE
+# Version: PRODUCTION-STABLE-REV6-PUSH-FIXED15-VARIABLE35-ROTATION
+# ------------------------------------------------------------
+# PUSH登録制限50銘柄に対して、毎ターン固定銘柄を入れつつ、
+# 残り枠をA/Bでローテーションする。
+#
+#   Aターン: 固定15 + A可変35
+#   Bターン: 固定15 + B可変35
+#
+# ENV:
+#   PUSH_ROTATION_FIXED_SYMBOLS=15
+#   PUSH_ROTATION_VARIABLE_SYMBOLS=35
 # ============================================================
 
 from __future__ import annotations
@@ -28,7 +38,7 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
-VERSION = "PRODUCTION-STABLE-REV5-PUSH-ROTATION-WS-STABLE-GRACE"
+VERSION = "PRODUCTION-STABLE-REV6-PUSH-FIXED15-VARIABLE35-ROTATION"
 
 
 def _env_float(name: str, default: float) -> float:
@@ -39,6 +49,16 @@ def _env_float(name: str, default: float) -> float:
         return float(v)
     except Exception:
         return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
 
 
 def enable_rotation(enabled: bool = True) -> None:
@@ -76,33 +96,62 @@ def _resolve_protected_safe() -> list[str]:
     return []
 
 
+def _rotation_slot_sizes() -> tuple[int, int]:
+    chunk = max(1, int(DEFAULT_REGISTER_CHUNK_SIZE or 50))
+    fixed = max(0, _env_int("PUSH_ROTATION_FIXED_SYMBOLS", 15))
+    fixed = min(fixed, chunk)
+    variable_default = max(0, chunk - fixed)
+    variable = max(0, _env_int("PUSH_ROTATION_VARIABLE_SYMBOLS", variable_default))
+    variable = min(variable, max(0, chunk - fixed))
+    return fixed, variable
+
+
 def _build_protected_rotation_batches(targets: list[str]) -> tuple[list[str], list[str], list[str]]:
+    """
+    50銘柄制限内で、固定枠 + 可変枠を作る。
+
+    例: chunk=50, fixed=15, variable=35
+      A = fixed15 + normal[0:35]
+      B = fixed15 + normal[35:70]
+
+    protected が15を超える場合:
+      - 先頭15だけを毎ターン固定にする
+      - 残りのprotectedは normal 側の先頭へ戻し、A/B可変枠で回す
+    """
     targets = _dedupe([str(x).strip().upper() for x in targets])
-    protected = _resolve_protected_safe()
+    protected_all = _resolve_protected_safe()
+    fixed_slots, variable_slots = _rotation_slot_sizes()
+    chunk = max(1, int(DEFAULT_REGISTER_CHUNK_SIZE or 50))
 
-    if not protected:
-        first = targets[:DEFAULT_REGISTER_CHUNK_SIZE]
-        second = targets[DEFAULT_REGISTER_CHUNK_SIZE:DEFAULT_REGISTER_CHUNK_SIZE * 2]
-        return first, second, []
+    fixed = _dedupe(protected_all[:fixed_slots])
+    fixed_set = set(fixed)
 
-    protected = protected[:max(0, DEFAULT_REGISTER_CHUNK_SIZE)]
-    protected_set = set(protected)
-    normal = [x for x in targets if x not in protected_set]
-    normal_slots = max(0, DEFAULT_REGISTER_CHUNK_SIZE - len(protected))
+    # protectedの16番目以降も捨てず、可変枠の先頭へ入れる。
+    protected_overflow = [x for x in protected_all[fixed_slots:] if x not in fixed_set]
+    normal_from_targets = [x for x in targets if x not in fixed_set]
+    variable_pool = _dedupe(protected_overflow + normal_from_targets)
 
-    first = _dedupe(protected + normal[:normal_slots])[:DEFAULT_REGISTER_CHUNK_SIZE]
-    second = _dedupe(protected + normal[normal_slots:normal_slots * 2])[:DEFAULT_REGISTER_CHUNK_SIZE]
+    first = _dedupe(fixed + variable_pool[:variable_slots])[:chunk]
+    second = _dedupe(fixed + variable_pool[variable_slots:variable_slots * 2])[:chunk]
+
+    # B側が足りない場合でも、Aと重複しすぎない範囲で後続を入れる。完全空ならAだけで回す。
+    if fixed and not second and len(variable_pool) > 0:
+        second = _dedupe(fixed + variable_pool[:variable_slots])[:chunk]
 
     logger.warning(
-        "[push_stream] protected rotation batches protected=%d normal=%d A=%d B=%d headA=%s headB=%s",
-        len(protected),
-        len(normal),
+        "[push_stream] fixed/variable rotation batches fixed=%d variable_slots=%d protected_total=%d protected_overflow=%d variable_pool=%d A=%d B=%d head_fixed=%s headA=%s headB=%s",
+        len(fixed),
+        variable_slots,
+        len(protected_all),
+        len(protected_overflow),
+        len(variable_pool),
         len(first),
         len(second),
+        fixed[:15],
         first[:15],
         second[:15],
     )
-    return first, second, protected
+    return first, second, fixed
 
 
 def _log_ws_not_ready_if_needed(*, ws_wait_count: int, last_ws_wait_log_ts: float) -> float:
@@ -208,12 +257,15 @@ def _run_rotation_side(*, label: str, symbols: list[str]) -> bool:
 
 
 def _rotation_worker() -> None:
+    fixed_slots, variable_slots = _rotation_slot_sizes()
     logger.info(
-        "[push_stream] rotation worker started version=%s hold=%.3fs register_timeout=%.3fs chunk=%d stable_grace=%.3fs",
+        "[push_stream] rotation worker started version=%s hold=%.3fs register_timeout=%.3fs chunk=%d fixed_slots=%d variable_slots=%d stable_grace=%.3fs",
         VERSION,
         ROTATE_HOLD_SEC,
         REGISTER_TIMEOUT_SEC,
         DEFAULT_REGISTER_CHUNK_SIZE,
+        fixed_slots,
+        variable_slots,
         _env_float("PUSH_ROTATION_WS_STABLE_GRACE_SEC", 3.0),
     )
 
@@ -250,11 +302,11 @@ def _rotation_worker() -> None:
                 continue
 
             empty_count = 0
-            first, second, protected = _build_protected_rotation_batches(list(targets))
+            first, second, fixed = _build_protected_rotation_batches(list(targets))
             logger.info(
-                "[push_stream] rotation cycle targets=%d protected=%d first=%d second=%d next=%s headA=%s headB=%s refresh_callable=%s ws_ready=%s",
+                "[push_stream] rotation cycle targets=%d fixed=%d first=%d second=%d next=%s headA=%s headB=%s refresh_callable=%s ws_ready=%s",
                 len(targets),
-                len(protected),
+                len(fixed),
                 len(first),
                 len(second),
                 next_label,
