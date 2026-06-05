@@ -1,6 +1,6 @@
 # ============================================================
 # trading/handlers/entry_precheck_ranking.py
-# Ver: FINAL-RANKING-PRECHECK-LATEST-TIME-COL
+# Ver: FINAL-RANKING-PRECHECK-RAW-FALLBACK
 # ------------------------------------------------------------
 # ✔ DB WAL / timeout対応
 # ✔ snapshot鮮度チェック
@@ -10,12 +10,13 @@
 # ✔ production hardened
 #
 # Fix:
-#   - ranking_snapshot_1min に snapshot_time と datetime が両方ある場合、
-#     snapshot_time が古いまま残り、datetime だけ最新更新されることがある。
-#   - 従来は snapshot_time を固定優先していたため、実データは新しいのに
-#     RANKING_PRECHECK_NG snapshot_stale でランキング発注を止めていた。
-#   - 各候補時刻列の MAX を実際に読み、一番新しい parsed_dt を持つ列を採用する。
-#   - MAX(datetime) が重い場合に備え、rowid DESC LIMIT の軽量fallbackも持つ。
+#   - ranking_snapshot_1min が古いままでも、ranking_raw_1min 等には
+#     当日最新データが保存されているケースがある。
+#   - 2026-06-05ログでは ranking collector は api_success=6 で成功しているが、
+#     precheck は ranking_snapshot_1min の 2026-06-04 16:22:14 を見て
+#     RANKING_PRECHECK_NG snapshot_stale になり、pendingを全削除していた。
+#   - snapshot stale 時は fresh な raw/summary 系ランキングテーブルへfallbackし、
+#     latest rows を global_data.latest_ranking_snapshot に復元する。
 # ============================================================
 
 from __future__ import annotations
@@ -39,6 +40,12 @@ except Exception:  # pragma: no cover - runtime fallback
 
 RANKING_DB_DIR = get_path("raw_ranking")
 SNAPSHOT_TABLE = "ranking_snapshot_1min"
+RAW_FALLBACK_TABLES = (
+    "ranking_raw_1min",
+    "ranking_summary_1min",
+    "ranking_raw",
+    "ranking_snapshot",
+)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -51,9 +58,20 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
 MAX_SNAPSHOT_AGE_SEC = _env_int("RANKING_PRECHECK_MAX_SNAPSHOT_AGE_SEC", 300)
 MIN_ROWS_READY = _env_int("RANKING_PRECHECK_MIN_ROWS", 1)
 FAST_SCAN_ROWS = _env_int("RANKING_PRECHECK_FAST_SCAN_ROWS", 3000)
+RAW_FALLBACK_MAX_ROWS = _env_int("RANKING_PRECHECK_RAW_FALLBACK_MAX_ROWS", 2000)
 
 
 print(
@@ -124,7 +142,7 @@ def _count_rows(cur: sqlite3.Cursor, table: str) -> int:
 
 def _candidate_time_cols(cols: list[str]) -> list[str]:
     colset = {str(c).lower(): c for c in cols}
-    priority = ["datetime", "snapshot_time", "timestamp", "created_at", "updated_at", "date_time", "dt", "time"]
+    priority = ["datetime", "snapshot_time", "timestamp", "received_at", "inserted_at", "created_at", "updated_at", "date_time", "dt", "time"]
     out: list[str] = []
     for p in priority:
         if p in colset and colset[p] not in out:
@@ -241,6 +259,87 @@ def _not_ready(reason: str = "unknown", **extra: Any) -> Dict[str, Any]:
     return d
 
 
+def _resolve_type(rows: list[dict[str, Any]]) -> Any:
+    try:
+        ranking_types = {r.get("rank_type") or r.get("ranking_type") or r.get("type") or r.get("category") for r in rows if r.get("rank_type") or r.get("ranking_type") or r.get("type") or r.get("category")}
+        return ranking_types.pop() if len(ranking_types) == 1 else None
+    except Exception:
+        return None
+
+
+def _cache_snapshot(rows: list[dict[str, Any]], ranking_type: Any, latest_raw: Any, db_path: str, table: str) -> None:
+    try:
+        global_data.latest_ranking_snapshot = rows
+        global_data.latest_ranking_type = ranking_type
+        global_data.latest_ranking_snapshot_time = latest_raw
+        global_data.latest_ranking_db_path = db_path
+        global_data.latest_ranking_snapshot_table = table
+    except Exception:
+        logger.warning("[RANKING CACHE RESTORE FAILED]", exc_info=True)
+
+
+def _try_fresh_raw_fallback(cur: sqlite3.Cursor, db_path: str, *, stale_detail: dict[str, Any] | None = None) -> Dict[str, Any] | None:
+    if not _env_bool("RANKING_PRECHECK_RAW_FALLBACK_ENABLED", True):
+        return None
+
+    diag_all: list[dict[str, Any]] = []
+    for table in RAW_FALLBACK_TABLES:
+        try:
+            if not _table_exists(cur, table):
+                continue
+            total_rows = _count_rows(cur, table)
+            if total_rows < max(1, MIN_ROWS_READY):
+                continue
+            cols = _table_columns(cur, table)
+            if not cols:
+                continue
+            time_col, latest_raw, latest_dt, time_diag = _pick_latest_time_col(cur, table, cols)
+            diag_all.append({"table": table, "rows": total_rows, "time_col": time_col, "latest": latest_raw, "parsed": str(latest_dt) if latest_dt else None, "diag": time_diag})
+            if not _is_snapshot_fresh(latest_dt):
+                continue
+            rows = _load_snapshot_rows(cur, table, time_col, latest_raw, limit=RAW_FALLBACK_MAX_ROWS)
+            if not rows:
+                continue
+            resolved_type = _resolve_type(rows)
+            _cache_snapshot(rows, resolved_type, latest_raw, db_path, table)
+            logger.warning(
+                "[RANKING READY][RAW_FALLBACK] rows=%d total_rows=%d type=%s table=%s time_col=%s latest=%s parsed=%s db=%s stale_detail=%s",
+                len(rows),
+                total_rows,
+                resolved_type,
+                table,
+                time_col,
+                latest_raw,
+                latest_dt,
+                db_path,
+                stale_detail,
+            )
+            return {
+                "is_ready": True,
+                "explicit_ready": False,
+                "derived_ready": True,
+                "has_snapshot": True,
+                "snapshot_count": len(rows),
+                "ranking_type": resolved_type,
+                "source": "db_raw_fallback",
+                "reason": "fresh_raw_fallback",
+                "db": db_path,
+                "table": table,
+                "time_col": time_col,
+                "latest": latest_raw,
+                "parsed": str(latest_dt) if latest_dt else None,
+                "total_rows": total_rows,
+                "raw_fallback_diag": diag_all,
+                "stale_detail": stale_detail or {},
+            }
+        except Exception:
+            logger.debug("[RANKING PRECHECK] raw fallback failed table=%s", table, exc_info=True)
+            continue
+    if diag_all:
+        logger.warning("[RANKING PRECHECK] raw fallback unavailable diag=%s stale_detail=%s", diag_all, stale_detail)
+    return None
+
+
 def _check_ranking_ready() -> Dict[str, Any]:
     snapshot = getattr(global_data, "latest_ranking_snapshot", None)
     ranking_type = getattr(global_data, "latest_ranking_type", None)
@@ -269,10 +368,16 @@ def _check_ranking_ready() -> Dict[str, Any]:
         cur = conn.cursor()
 
         if not _table_exists(cur, SNAPSHOT_TABLE):
+            fallback = _try_fresh_raw_fallback(cur, ranking_db_path, stale_detail={"reason": "snapshot_table_missing", "table": SNAPSHOT_TABLE})
+            if fallback:
+                return fallback
             return _not_ready("snapshot_table_missing", db=ranking_db_path, table=SNAPSHOT_TABLE)
 
         total_rows = _count_rows(cur, SNAPSHOT_TABLE)
         if total_rows < max(1, MIN_ROWS_READY):
+            fallback = _try_fresh_raw_fallback(cur, ranking_db_path, stale_detail={"reason": "snapshot_table_empty", "table": SNAPSHOT_TABLE, "total_rows": total_rows})
+            if fallback:
+                return fallback
             return _not_ready("snapshot_table_empty", db=ranking_db_path, table=SNAPSHOT_TABLE, total_rows=total_rows)
 
         cols = _table_columns(cur, SNAPSHOT_TABLE)
@@ -284,8 +389,19 @@ def _check_ranking_ready() -> Dict[str, Any]:
                 age_sec = (datetime.now() - latest_dt).total_seconds() if latest_dt else None
             except Exception:
                 pass
+            stale_detail = {
+                "db": ranking_db_path,
+                "table": SNAPSHOT_TABLE,
+                "time_col": time_col,
+                "latest": latest_raw,
+                "parsed": str(latest_dt) if latest_dt else None,
+                "age_sec": age_sec,
+                "max_age_sec": MAX_SNAPSHOT_AGE_SEC,
+                "total_rows": total_rows,
+                "time_diag": time_diag,
+            }
             logger.warning(
-                "[RANKING STALE] db=%s table=%s time_col=%s latest=%s parsed=%s age_sec=%s max_age_sec=%s total_rows=%s time_diag=%s",
+                "[RANKING STALE] db=%s table=%s time_col=%s latest=%s parsed=%s age_sec=%s max_age_sec=%s total_rows=%s time_diag=%s -> try raw fallback",
                 ranking_db_path,
                 SNAPSHOT_TABLE,
                 time_col,
@@ -296,21 +412,16 @@ def _check_ranking_ready() -> Dict[str, Any]:
                 total_rows,
                 time_diag,
             )
-            return _not_ready(
-                "snapshot_stale",
-                db=ranking_db_path,
-                table=SNAPSHOT_TABLE,
-                time_col=time_col,
-                latest=latest_raw,
-                parsed=str(latest_dt) if latest_dt else None,
-                age_sec=age_sec,
-                max_age_sec=MAX_SNAPSHOT_AGE_SEC,
-                total_rows=total_rows,
-                time_diag=time_diag,
-            )
+            fallback = _try_fresh_raw_fallback(cur, ranking_db_path, stale_detail=stale_detail)
+            if fallback:
+                return fallback
+            return _not_ready("snapshot_stale", **stale_detail)
 
         snapshot_rows = _load_snapshot_rows(cur, SNAPSHOT_TABLE, time_col, latest_raw)
         if not snapshot_rows:
+            fallback = _try_fresh_raw_fallback(cur, ranking_db_path, stale_detail={"reason": "snapshot_rows_empty_for_latest", "table": SNAPSHOT_TABLE, "time_col": time_col, "latest": latest_raw, "total_rows": total_rows, "time_diag": time_diag})
+            if fallback:
+                return fallback
             return _not_ready(
                 "snapshot_rows_empty_for_latest",
                 db=ranking_db_path,
@@ -321,16 +432,8 @@ def _check_ranking_ready() -> Dict[str, Any]:
                 time_diag=time_diag,
             )
 
-        ranking_types = {r.get("rank_type") or r.get("ranking_type") or r.get("type") for r in snapshot_rows if r.get("rank_type") or r.get("ranking_type") or r.get("type")}
-        resolved_type = ranking_types.pop() if len(ranking_types) == 1 else None
-
-        try:
-            global_data.latest_ranking_snapshot = snapshot_rows
-            global_data.latest_ranking_type = resolved_type
-            global_data.latest_ranking_snapshot_time = latest_raw
-            global_data.latest_ranking_db_path = ranking_db_path
-        except Exception:
-            logger.warning("[RANKING CACHE RESTORE FAILED]", exc_info=True)
+        resolved_type = _resolve_type(snapshot_rows)
+        _cache_snapshot(snapshot_rows, resolved_type, latest_raw, ranking_db_path, SNAPSHOT_TABLE)
 
         logger.info(
             "[RANKING READY][DB] snapshot=%d total_rows=%d type=%s time_col=%s latest=%s parsed=%s db=%s time_diag=%s",
