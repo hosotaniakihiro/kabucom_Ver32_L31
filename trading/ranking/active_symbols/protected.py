@@ -1,16 +1,16 @@
 # ============================================================
 # File   : trading/ranking/active_symbols/protected.py
-# Version: Ver1.2-ACTIVE-SYMBOLS-PROTECTED-OPEN-POSITIONS-ONLY
+# Version: Ver1.3-PROTECT-PENDING-FOR-BOARD
 # ------------------------------------------------------------
 # 【目的】
 #   active_symbols から絶対に外してはいけない銘柄を返す。
 #
-# Ver1.2:
-#   - pending_entries を原則 protected に含めない。
-#   - 6266 のように「未保有・未約定・発注失敗後の pending」が
-#     active protected に残り続ける問題を防ぐ。
-#   - 本当に保護すべき対象は DB/Broker/global_data.open_positions の建玉。
-#   - 必要な場合のみ ACTIVE_PROTECT_PENDING_SYMBOLS=1 で旧挙動を復活可能。
+# Ver1.3:
+#   - Summary AI approved / pending 銘柄で board_missing が発生し、
+#     発注直前に止まる問題への対策。
+#   - pending_entries をデフォルトで protected に戻す。
+#   - ただし不要なら ACTIVE_PROTECT_PENDING_SYMBOLS=0 で無効化可能。
+#   - 建玉保護は従来通り最優先。
 # ============================================================
 
 from __future__ import annotations
@@ -25,12 +25,12 @@ from .normalize import normalize_symbol
 logger = logging.getLogger(__name__)
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
+def _env_bool(name: str, default: bool = True) -> bool:
     try:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
             return bool(default)
-        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
     except Exception:
         return bool(default)
 
@@ -48,29 +48,14 @@ def _extract_symbol_from_item(item: Any) -> str:
     try:
         if item is None:
             return ""
-
         if isinstance(item, dict):
-            for key in (
-                "symbol",
-                "Symbol",
-                "銘柄コード",
-                "code",
-                "stock_code",
-                "StockCode",
-            ):
+            for key in ("symbol", "Symbol", "銘柄コード", "code", "stock_code", "StockCode"):
                 if key in item:
                     ns = normalize_symbol(item.get(key))
                     if ns:
                         return ns
             return ""
-
-        for attr in (
-            "symbol",
-            "Symbol",
-            "code",
-            "stock_code",
-            "StockCode",
-        ):
+        for attr in ("symbol", "Symbol", "code", "stock_code", "StockCode"):
             try:
                 if hasattr(item, attr):
                     ns = normalize_symbol(getattr(item, attr))
@@ -78,9 +63,7 @@ def _extract_symbol_from_item(item: Any) -> str:
                         return ns
             except Exception:
                 pass
-
         return normalize_symbol(item)
-
     except Exception:
         return ""
 
@@ -96,7 +79,6 @@ def _is_open_position_item(item: Any) -> bool:
                 return False
             qty = item.get("qty", item.get("HoldQty", item.get("LeavesQty", item.get("Quantity"))))
             if qty is None:
-                # open_positions dict の value が簡易dictの場合は qty が無いこともあるので許容
                 return True
             try:
                 return float(qty) > 0
@@ -107,36 +89,31 @@ def _is_open_position_item(item: Any) -> bool:
         return True
 
 
-def _add_from_mapping_or_iterable(protected: Set[str], obj: Any, *, source: str) -> None:
+def _add_from_mapping_or_iterable(protected: Set[str], obj: Any, *, source: str, require_open_position: bool = True) -> None:
     try:
         if obj is None:
             return
-
         if isinstance(obj, dict):
             for key, value in obj.items():
-                # {symbol: position_dict} 形式を想定。
-                # value が明確に closed/qty=0 なら保護しない。
-                if _is_open_position_item(value):
-                    _add_symbol(protected, key)
-                    sym = _extract_symbol_from_item(value)
-                    if sym:
-                        protected.add(sym)
+                if require_open_position and not _is_open_position_item(value):
+                    continue
+                _add_symbol(protected, key)
+                sym = _extract_symbol_from_item(value)
+                if sym:
+                    protected.add(sym)
             return
-
         if isinstance(obj, (list, tuple, set)):
             for item in obj:
-                if not _is_open_position_item(item):
+                if require_open_position and not _is_open_position_item(item):
                     continue
                 sym = _extract_symbol_from_item(item)
                 if sym:
                     protected.add(sym)
             return
-
-        if _is_open_position_item(obj):
+        if (not require_open_position) or _is_open_position_item(obj):
             sym = _extract_symbol_from_item(obj)
             if sym:
                 protected.add(sym)
-
     except Exception:
         logger.debug("[ACTIVE PROTECTED] failed to read source=%s", source, exc_info=True)
 
@@ -144,7 +121,6 @@ def _add_from_mapping_or_iterable(protected: Set[str], obj: Any, *, source: str)
 def _load_db_open_positions_safe() -> dict[str, dict[str, Any]]:
     try:
         from trading.position.open_position_sync import sync_open_positions_from_db
-
         return sync_open_positions_from_db(force_log=False) or {}
     except Exception:
         logger.debug("[ACTIVE PROTECTED] DB open position sync failed", exc_info=True)
@@ -152,30 +128,27 @@ def _load_db_open_positions_safe() -> dict[str, dict[str, Any]]:
 
 
 def _add_pending_if_enabled(protected: Set[str]) -> None:
-    """
-    旧挙動の互換用。
-    通常は pending を protected に入れない。
-    """
-    if not _env_bool("ACTIVE_PROTECT_PENDING_SYMBOLS", False):
+    # board_missing対策として、pending銘柄はデフォルトで保護する。
+    if not _env_bool("ACTIVE_PROTECT_PENDING_SYMBOLS", True):
         try:
             pending = getattr(global_data, "pending_entries", None)
             n = len(pending) if isinstance(pending, dict) else 0
             if n:
-                logger.info(
-                    "[ACTIVE PROTECTED] pending symbols not protected count=%s set ACTIVE_PROTECT_PENDING_SYMBOLS=1 to enable old behavior",
-                    n,
-                )
+                logger.info("[ACTIVE PROTECTED] pending symbols not protected count=%s ACTIVE_PROTECT_PENDING_SYMBOLS=0", n)
         except Exception:
             pass
         return
-
     try:
+        before = len(protected)
         _add_from_mapping_or_iterable(
             protected,
             getattr(global_data, "pending_entries", None),
             source="global_data.pending_entries",
+            require_open_position=False,
         )
-        logger.warning("[ACTIVE PROTECTED] pending protection enabled by env")
+        added = len(protected) - before
+        if added:
+            logger.warning("[ACTIVE PROTECTED] pending protection enabled added=%s", added)
     except Exception:
         logger.debug("[ACTIVE PROTECTED] failed global_data.pending_entries", exc_info=True)
 
@@ -183,32 +156,26 @@ def _add_pending_if_enabled(protected: Set[str]) -> None:
 def get_protected_symbols() -> Set[str]:
     protected: Set[str] = set()
 
-    # 最優先: DB positions(status=OPEN)
     try:
         db_positions = _load_db_open_positions_safe()
-        _add_from_mapping_or_iterable(protected, db_positions, source="DB.positions")
+        _add_from_mapping_or_iterable(protected, db_positions, source="DB.positions", require_open_position=True)
     except Exception:
         logger.debug("[ACTIVE PROTECTED] failed DB positions", exc_info=True)
 
-    # global_data.open_positions
     try:
         _add_from_mapping_or_iterable(
             protected,
             getattr(global_data, "open_positions", None),
             source="global_data.open_positions",
+            require_open_position=True,
         )
     except Exception:
         logger.debug("[ACTIVE PROTECTED] failed global_data.open_positions", exc_info=True)
 
-    # pending_entries は原則保護対象外。
     _add_pending_if_enabled(protected)
 
     if protected:
-        logger.warning(
-            "[ACTIVE PROTECTED] protected symbols count=%d symbols=%s",
-            len(protected),
-            sorted(protected),
-        )
+        logger.warning("[ACTIVE PROTECTED] protected symbols count=%d symbols=%s", len(protected), sorted(protected))
 
     return protected
 
