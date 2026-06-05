@@ -1,11 +1,12 @@
 # ============================================================
 # File   : trading/push/push_stream/rotation_core.py
-# Version: PRODUCTION-STABLE-REV4-PUSH-ROTATION-SAME-SIDE-RETRY
+# Version: PRODUCTION-STABLE-REV5-PUSH-ROTATION-WS-STABLE-GRACE
 # ============================================================
 
 from __future__ import annotations
 
 import logging
+import os
 import time
 
 from . import state
@@ -27,7 +28,17 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
-VERSION = "PRODUCTION-STABLE-REV4-PUSH-ROTATION-SAME-SIDE-RETRY"
+VERSION = "PRODUCTION-STABLE-REV5-PUSH-ROTATION-WS-STABLE-GRACE"
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
 
 
 def enable_rotation(enabled: bool = True) -> None:
@@ -111,11 +122,65 @@ def _log_ws_not_ready_if_needed(*, ws_wait_count: int, last_ws_wait_log_ts: floa
     return last_ws_wait_log_ts
 
 
+def _ws_stable_age_sec() -> float | None:
+    try:
+        last_connect = getattr(state, "_last_connect_at", None)
+        if last_connect is None:
+            return None
+        return max(0.0, (getattr(__import__("datetime"), "datetime").datetime.now() - last_connect.replace(tzinfo=None)).total_seconds())
+    except Exception:
+        return None
+
+
+def _wait_for_stable_ws_before_register(label: str) -> bool:
+    """
+    reconnect直後にregister/unregisterを入れると、kabu Station 側から
+    WinError 10054 で切られやすい。接続直後は少し待ってからregisterする。
+    """
+    grace = max(0.0, _env_float("PUSH_ROTATION_WS_STABLE_GRACE_SEC", 3.0))
+    deadline_extra = max(1.0, _env_float("PUSH_ROTATION_WS_STABLE_MAX_WAIT_SEC", 8.0))
+    deadline = time.time() + deadline_extra
+
+    while not state._stop_event.is_set():
+        if not state._connected_event.is_set() or not _is_ws_alive():
+            logger.warning("[push_stream] rotation %s wait stable skipped: ws not ready", label)
+            return False
+
+        age = _ws_stable_age_sec()
+        if age is None or age >= grace:
+            return True
+
+        remain = grace - age
+        if time.time() >= deadline:
+            logger.warning(
+                "[push_stream] rotation %s ws stable wait timeout age=%.2fs grace=%.2fs -> continue",
+                label,
+                age,
+                grace,
+            )
+            return True
+
+        logger.info(
+            "[push_stream] rotation %s waiting ws stable age=%.2fs grace=%.2fs remain=%.2fs",
+            label,
+            age,
+            grace,
+            remain,
+        )
+        _sleep_or_stop(min(0.5, max(0.1, remain)))
+
+    return False
+
+
 def _run_rotation_side(*, label: str, symbols: list[str]) -> bool:
     if state._stop_event.is_set():
         return False
     if not symbols:
         logger.warning("[push_stream] rotation %s skipped: empty symbols", label)
+        return False
+
+    if not _wait_for_stable_ws_before_register(label):
+        _sleep_or_stop(1.0)
         return False
 
     reason = f"rotation_{label}"
@@ -144,11 +209,12 @@ def _run_rotation_side(*, label: str, symbols: list[str]) -> bool:
 
 def _rotation_worker() -> None:
     logger.info(
-        "[push_stream] rotation worker started version=%s hold=%.3fs register_timeout=%.3fs chunk=%d",
+        "[push_stream] rotation worker started version=%s hold=%.3fs register_timeout=%.3fs chunk=%d stable_grace=%.3fs",
         VERSION,
         ROTATE_HOLD_SEC,
         REGISTER_TIMEOUT_SEC,
         DEFAULT_REGISTER_CHUNK_SIZE,
+        _env_float("PUSH_ROTATION_WS_STABLE_GRACE_SEC", 3.0),
     )
 
     empty_count = 0
