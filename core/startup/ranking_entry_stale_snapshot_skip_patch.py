@@ -1,21 +1,17 @@
 # ============================================================
 # File   : core/startup/ranking_entry_stale_snapshot_skip_patch.py
-# Version: V1-RANKING-STALE-SNAPSHOT-SKIP
+# Version: V2-ENFORCE-AFTER-MARKET-HOURS-PATCH
 # ------------------------------------------------------------
 # 目的:
-#   ranking DB / ranking_snapshot_1min が stale の時に、
-#   ranking entry が pending だけ作って entry_controller 側で
-#   RANKING_PRECHECK_NG になる無駄ループを止める。
+#   ranking DB / ranking_snapshot_1min が stale の時に、ranking entry が
+#   pending だけ作って entry_controller 側で RANKING_PRECHECK_NG になる
+#   無駄ループを止める。
 #
-# 背景:
-#   ログ例:
-#     RANKING_PRECHECK_NG latest=2026-06-04 16:22:14 age_sec=73801
-#     pending_before={'4095':1,'4270':1,'3905':1,'5016':1}
-#
-# 方針:
-#   - _run_ranking_entry_safe() の前に ranking_snapshot_1min の鮮度を見る。
-#   - stale なら build_fn を呼ばず、pendingを作らず 0 を返す。
-#   - Summary/PULLBACK/TONOSAMA は止めない。
+# V2:
+#   - 後続の ranking_entry_market_hours_skip_patch が _run_ranking_entry_safe
+#     を再ラップしても、この stale guard が必ず最外側に戻るよう watcher を追加。
+#   - stale 検知時に ranking pending を可能な範囲で掃除する。
+#   - datetime/snapshot_time が前営業日のままなら fail-closed。
 # ============================================================
 from __future__ import annotations
 
@@ -23,6 +19,8 @@ import datetime as dt
 import logging
 import os
 import sqlite3
+import threading
+import time
 from functools import wraps
 from typing import Any
 
@@ -73,7 +71,7 @@ def _parse_dt(v: Any) -> dt.datetime | None:
 def _latest_snapshot_time(db_path: str) -> tuple[dt.datetime | None, str, int]:
     if not db_path:
         return None, "no_db_path", 0
-    cols = ["updated_at", "datetime", "snapshot_time", "created_at", "time"]
+    cols = ["updated_at", "datetime", "snapshot_time", "received_at", "inserted_at", "created_at", "time"]
     tables = ["ranking_snapshot_1min", "ranking_snapshot", "ranking_raw"]
     try:
         with sqlite3.connect(str(db_path), timeout=2.0) as conn:
@@ -122,10 +120,12 @@ def _ranking_snapshot_fresh() -> tuple[bool, dict[str, Any]]:
         db_path = None
 
     latest, src, rows = _latest_snapshot_time(str(db_path or ""))
-    max_age = _env_float("RANKING_ENTRY_SNAPSHOT_MAX_AGE_SEC", 300.0)
+    max_age = _env_float("RANKING_ENTRY_SNAPSHOT_MAX_AGE_SEC", _env_float("RANKING_PRECHECK_MAX_AGE_SEC", 300.0))
     now = dt.datetime.now()
     age = None if latest is None else (now - latest).total_seconds()
-    ok = latest is not None and age is not None and age <= max_age
+    require_today = _env_bool("RANKING_ENTRY_REQUIRE_TODAY", True)
+    same_day = latest is not None and latest.date() == now.date()
+    ok = latest is not None and age is not None and age <= max_age and (same_day or not require_today)
     diag = {
         "ok": bool(ok),
         "db": str(db_path or ""),
@@ -134,55 +134,112 @@ def _ranking_snapshot_fresh() -> tuple[bool, dict[str, Any]]:
         "rows": rows,
         "age_sec": None if age is None else round(float(age), 3),
         "max_age_sec": max_age,
+        "require_today": require_today,
+        "same_day": bool(same_day),
     }
     return bool(ok), diag
 
 
-def install() -> bool:
-    global _INSTALLED, _ORIG_RUN
-    if _INSTALLED:
-        return True
+def _clear_ranking_pending(reason: str, diag: dict[str, Any]) -> None:
+    if not _env_bool("RANKING_ENTRY_CLEAR_PENDING_ON_STALE", True):
+        return
+    try:
+        from trading.entry import pending_manager
+        root = getattr(pending_manager, "pending_entries", None)
+        if isinstance(root, dict):
+            before = {str(k): len(v) if hasattr(v, "__len__") else 1 for k, v in root.items()}
+            root.clear()
+            logger.warning("[RANKING STALE SNAPSHOT SKIP] cleared pending_manager pending reason=%s before=%s diag=%s", reason, before, diag)
+    except Exception:
+        logger.debug("[RANKING STALE SNAPSHOT SKIP] pending_manager clear skipped", exc_info=True)
+
+    try:
+        from global_state import global_data
+        root = getattr(global_data, "pending_entries", None)
+        if isinstance(root, dict):
+            before = {str(k): len(v) if hasattr(v, "__len__") else 1 for k, v in root.items()}
+            root.clear()
+            logger.warning("[RANKING STALE SNAPSHOT SKIP] cleared global pending reason=%s before=%s diag=%s", reason, before, diag)
+    except Exception:
+        logger.debug("[RANKING STALE SNAPSHOT SKIP] global pending clear skipped", exc_info=True)
+
+
+def _make_wrapper(orig):
+    @wraps(orig)
+    def wrapped_run_ranking_entry_safe(*args: Any, **kwargs: Any):
+        try:
+            ok, diag = _ranking_snapshot_fresh()
+            if not ok:
+                logger.warning("[RANKING STALE SNAPSHOT SKIP] skip ranking entry before pending diag=%s", diag)
+                _clear_ranking_pending("ranking_snapshot_stale", diag)
+                return 0
+            logger.info("[RANKING STALE SNAPSHOT SKIP] ranking snapshot fresh diag=%s", diag)
+        except Exception:
+            logger.exception("[RANKING STALE SNAPSHOT SKIP] precheck failed -> fail closed ranking entry")
+            return 0
+        return orig(*args, **kwargs)
+
+    wrapped_run_ranking_entry_safe._ranking_stale_snapshot_skip_v2 = True  # type: ignore[attr-defined]
+    wrapped_run_ranking_entry_safe._original = orig  # type: ignore[attr-defined]
+    return wrapped_run_ranking_entry_safe
+
+
+def _patch_once() -> bool:
+    global _ORIG_RUN
     try:
         if not _env_bool("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE", True):
             logger.warning("[RANKING STALE SNAPSHOT SKIP] disabled by env")
             return False
-        os.environ.setdefault("RANKING_ENTRY_SNAPSHOT_MAX_AGE_SEC", "300")
         import trading.entry_exit.tasks as tasks
         cur = getattr(tasks, "_run_ranking_entry_safe", None)
-        if getattr(cur, "_ranking_stale_snapshot_skip_v1", False):
-            _INSTALLED = True
-            return True
         if not callable(cur):
             logger.warning("[RANKING STALE SNAPSHOT SKIP] target missing")
             return False
-        _ORIG_RUN = getattr(cur, "_original", cur)
+        if getattr(cur, "_ranking_stale_snapshot_skip_v2", False):
+            return True
+        _ORIG_RUN = cur
+        tasks._run_ranking_entry_safe = _make_wrapper(cur)
+        logger.warning("[RANKING STALE SNAPSHOT SKIP] patched outermost target=%s", getattr(cur, "__name__", type(cur)))
+        return True
+    except Exception:
+        logger.exception("[RANKING STALE SNAPSHOT SKIP] patch_once failed")
+        return False
 
-        @wraps(_ORIG_RUN)
-        def wrapped_run_ranking_entry_safe(*args: Any, **kwargs: Any):
-            try:
-                ok, diag = _ranking_snapshot_fresh()
-                if not ok:
-                    logger.warning("[RANKING STALE SNAPSHOT SKIP] skip ranking entry before pending diag=%s", diag)
-                    return 0
-                logger.info("[RANKING STALE SNAPSHOT SKIP] ranking snapshot fresh diag=%s", diag)
-            except Exception:
-                logger.exception("[RANKING STALE SNAPSHOT SKIP] precheck failed -> fail closed ranking entry")
-                return 0
-            return _ORIG_RUN(*args, **kwargs)
 
-        wrapped_run_ranking_entry_safe._ranking_stale_snapshot_skip_v1 = True  # type: ignore[attr-defined]
-        wrapped_run_ranking_entry_safe._original = _ORIG_RUN  # type: ignore[attr-defined]
-        tasks._run_ranking_entry_safe = wrapped_run_ranking_entry_safe
-        _INSTALLED = True
+def _watch() -> None:
+    # Other startup patches can re-wrap _run_ranking_entry_safe repeatedly.
+    # Re-apply this stale guard as the outermost wrapper for the first two minutes.
+    for i in range(240):
+        ok = _patch_once()
+        if i in (0, 1, 5, 15, 30, 60, 120, 239):
+            logger.warning("[RANKING STALE SNAPSHOT SKIP] enforce ok=%s i=%s", ok, i)
+        time.sleep(0.5)
+
+
+def install() -> bool:
+    global _INSTALLED
+    try:
+        os.environ.setdefault("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE", "1")
+        os.environ.setdefault("RANKING_ENTRY_REQUIRE_TODAY", "1")
+        os.environ.setdefault("RANKING_ENTRY_CLEAR_PENDING_ON_STALE", "1")
+        os.environ.setdefault("RANKING_ENTRY_SNAPSHOT_MAX_AGE_SEC", "300")
+        ok = _patch_once()
+        if not _INSTALLED:
+            threading.Thread(target=_watch, name="ranking-stale-snapshot-skip-enforcer", daemon=True).start()
+            _INSTALLED = True
         logger.warning(
-            "[RANKING STALE SNAPSHOT SKIP] installed v1 enabled=%s max_age=%s",
+            "[RANKING STALE SNAPSHOT SKIP] installed v2 ok=%s enabled=%s max_age=%s require_today=%s clear_pending=%s",
+            ok,
             os.getenv("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE", "1"),
             os.getenv("RANKING_ENTRY_SNAPSHOT_MAX_AGE_SEC"),
+            os.getenv("RANKING_ENTRY_REQUIRE_TODAY"),
+            os.getenv("RANKING_ENTRY_CLEAR_PENDING_ON_STALE"),
         )
         return True
     except Exception:
         logger.exception("[RANKING STALE SNAPSHOT SKIP] install failed")
         return False
+
 
 try:
     install()
