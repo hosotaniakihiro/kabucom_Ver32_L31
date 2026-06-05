@@ -1,21 +1,21 @@
 # ============================================================
 # File   : core/startup/push_onopen_refresh_safe_patch.py
-# Version: V2.0-PUSH-ONOPEN-FAST-NONDESTRUCTIVE-REFRESH
+# Version: V2.1-PUSH-ONOPEN-STABLE-DELAYED-REFRESH
 # ------------------------------------------------------------
 # 目的:
-#   WebSocket reconnect直後、rotation workerを待つ前に非破壊登録を入れる。
+#   WebSocket reconnect直後の非破壊refreshで kabu Station を再切断させない。
 #
 # 背景:
-#   V1は12秒遅延/30秒min_intervalだったため、ログ上で
-#     delayed safe refresh scheduled delay=12.0s
-#     skipped recent ... min_interval=30.0s
-#   となり、接続寿命内に登録が間に合わないケースが残っていた。
+#   V2.0 は delay=0.05s / ready_wait=0.75s で on_open_safe_fast を実行していた。
+#   ログ上では CONNECTED 直後に refresh が入り、その直後に connected=False へ戻る
+#   ケースがあるため、rotation_core の ws stable grace と同じ考え方に寄せる。
 #
 # 方針:
-#   - delay既定 0.05秒
-#   - min_interval既定 5秒
-#   - clear/unregisterは常にFalse既定
-#   - PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1 が残っていても強制解除
+#   - on_open直後は最低3秒待つ。
+#   - ws ready確認も4秒まで待つ。
+#   - min_intervalは15秒へ延長する。
+#   - clear/unregisterは常にFalse既定のまま。
+#   - refreshは非破壊で1回だけ。通常のA/B登録はrotation workerへ任せる。
 # ============================================================
 from __future__ import annotations
 
@@ -67,13 +67,22 @@ def _force_env(name: str, value: str) -> None:
 
 def _apply_defaults() -> None:
     _force_env("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", "0")
-    os.environ.setdefault("PUSH_STREAM_ONOPEN_SAFE_REFRESH_DELAY_SEC", "0.05")
-    os.environ.setdefault("PUSH_STREAM_ONOPEN_SAFE_REFRESH_MIN_INTERVAL_SEC", "5.0")
-    os.environ.setdefault("PUSH_STREAM_ONOPEN_SAFE_READY_WAIT_SEC", "0.75")
+    os.environ.setdefault("PUSH_STREAM_ONOPEN_SAFE_REFRESH_DELAY_SEC", "3.0")
+    os.environ.setdefault("PUSH_STREAM_ONOPEN_SAFE_REFRESH_MIN_INTERVAL_SEC", "15.0")
+    os.environ.setdefault("PUSH_STREAM_ONOPEN_SAFE_READY_WAIT_SEC", "4.0")
     os.environ.setdefault("PUSH_STREAM_ONOPEN_SAFE_FORCE", "0")
     os.environ.setdefault("PUSH_STREAM_ONOPEN_SAFE_CLEAR_FIRST", "0")
     os.environ.setdefault("PUSH_STREAM_ONOPEN_SAFE_UNREGISTER_FIRST", "0")
     os.environ.setdefault("PUSH_STREAM_ONOPEN_SAFE_WAIT_AFTER_CLEAR_SEC", "0.0")
+
+
+def _ws_connected_and_alive() -> bool:
+    try:
+        from trading.push.push_stream import state
+        from trading.push.push_stream.transport import _is_ws_alive
+        return bool(state._connected_event.is_set()) and bool(_is_ws_alive())
+    except Exception:
+        return False
 
 
 def _safe_onopen_refresh_worker() -> None:
@@ -83,8 +92,8 @@ def _safe_onopen_refresh_worker() -> None:
             logger.warning("[PUSH ONOPEN SAFE REFRESH] skipped by env")
             return
 
-        delay = max(0.0, _env_float("PUSH_STREAM_ONOPEN_SAFE_REFRESH_DELAY_SEC", 0.05))
-        min_interval = max(0.2, _env_float("PUSH_STREAM_ONOPEN_SAFE_REFRESH_MIN_INTERVAL_SEC", 5.0))
+        delay = max(0.0, _env_float("PUSH_STREAM_ONOPEN_SAFE_REFRESH_DELAY_SEC", 3.0))
+        min_interval = max(1.0, _env_float("PUSH_STREAM_ONOPEN_SAFE_REFRESH_MIN_INTERVAL_SEC", 15.0))
         now = time.monotonic()
         global _LAST_STARTED_TS
         with _LOCK:
@@ -99,11 +108,15 @@ def _safe_onopen_refresh_worker() -> None:
             _LAST_STARTED_TS = now
 
         logger.warning(
-            "[PUSH ONOPEN SAFE REFRESH] fast non-destructive refresh scheduled delay=%.2fs force=False clear_first=False unregister_first=False",
+            "[PUSH ONOPEN SAFE REFRESH] stable delayed non-destructive refresh scheduled delay=%.2fs force=False clear_first=False unregister_first=False",
             delay,
         )
         if delay > 0:
             time.sleep(delay)
+
+        if not _ws_connected_and_alive():
+            logger.warning("[PUSH ONOPEN SAFE REFRESH] skipped: ws lost before delayed refresh")
+            return
 
         try:
             from trading.push.push_stream import transport
@@ -114,15 +127,19 @@ def _safe_onopen_refresh_worker() -> None:
         wait_fn = getattr(transport, "_wait_for_ws_ready", None)
         call_fn = getattr(transport, "_call_refresh", None)
         if callable(wait_fn):
-            if not bool(wait_fn(timeout=_env_float("PUSH_STREAM_ONOPEN_SAFE_READY_WAIT_SEC", 0.75))):
-                logger.warning("[PUSH ONOPEN SAFE REFRESH] skipped: ws not ready after short delay")
+            if not bool(wait_fn(timeout=_env_float("PUSH_STREAM_ONOPEN_SAFE_READY_WAIT_SEC", 4.0))):
+                logger.warning("[PUSH ONOPEN SAFE REFRESH] skipped: ws not ready after stable delay")
                 return
+        if not _ws_connected_and_alive():
+            logger.warning("[PUSH ONOPEN SAFE REFRESH] skipped: ws lost after ready wait")
+            return
         if not callable(call_fn):
             logger.warning("[PUSH ONOPEN SAFE REFRESH] skipped: _call_refresh not callable")
             return
+
         result = call_fn(
             force=False,
-            reason="on_open_safe_fast",
+            reason="on_open_safe_stable",
             clear_first=False,
             unregister_first=False,
             wait_after_clear=0.0,
@@ -137,10 +154,10 @@ def _patched_start_refresh_after_open_thread() -> None:
         _apply_defaults()
         threading.Thread(
             target=_safe_onopen_refresh_worker,
-            name="push-onopen-safe-refresh-fast",
+            name="push-onopen-safe-refresh-stable",
             daemon=True,
         ).start()
-        logger.warning("[PUSH ONOPEN SAFE REFRESH] fast thread started")
+        logger.warning("[PUSH ONOPEN SAFE REFRESH] stable thread started")
     except Exception:
         logger.exception("[PUSH ONOPEN SAFE REFRESH] thread start failed")
 
@@ -160,7 +177,7 @@ def install() -> bool:
             logger.debug("[PUSH ONOPEN SAFE REFRESH] ws_callbacks patch skipped", exc_info=True)
 
         _INSTALLED = True
-        logger.warning("[PUSH ONOPEN SAFE REFRESH] installed v2 fast")
+        logger.warning("[PUSH ONOPEN SAFE REFRESH] installed v2.1 stable delayed")
         return True
     except Exception:
         logger.exception("[PUSH ONOPEN SAFE REFRESH] install failed")
