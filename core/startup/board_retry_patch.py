@@ -1,12 +1,14 @@
 # ============================================================
 # File   : core/startup/board_retry_patch.py
-# Version: V1.3-BOARD-SIDE-MA5-OPENING-RELAX
+# Version: V1.4-BOARD-MISSING-HARD-BLOCK
 # ------------------------------------------------------------
 # A/B PUSHローテーション中の板未取得を短時間リトライする。
-# 追加修正:
-#   - final_entry_safety_guard からの板取得にも side/source を渡す
-#   - 寄り直後に 3m/5m 履歴が足りないだけの MA5_BREAKOUT は fail-open
-#   - daily_src 重複列は sanitize 前に同名列を整理してログ増殖を抑える
+#
+# V1.4:
+#   - final_entry_safety_guard で bid/ask が取れない場合、
+#     ENTRY_ALLOW_ENTRY_WITHOUT_BOARD=1 が外部で立っていても、
+#     ENTRY_BOARD_MISSING_HARD_BLOCK=1 をデフォルトとして新規エントリーを停止する。
+#   - 板が0のまま BOARD_MISSING_ALLOW で進む危険な挙動を止める。
 # ============================================================
 
 from __future__ import annotations
@@ -53,15 +55,6 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
-def _safe_float(v: Any, default: float = 0.0) -> float:
-    try:
-        if v is None or str(v).strip() == "":
-            return float(default)
-        return float(v)
-    except Exception:
-        return float(default)
-
-
 def _norm_symbol(v: Any) -> str:
     try:
         s = str(v or "").strip().upper()
@@ -87,8 +80,8 @@ def _is_valid_board(board: Any) -> bool:
     try:
         if not isinstance(board, dict):
             return False
-        bid = board.get("bid_price") or board.get("bid") or board.get("BidPrice")
-        ask = board.get("ask_price") or board.get("ask") or board.get("AskPrice")
+        bid = board.get("bid_price") or board.get("bid") or board.get("best_bid") or board.get("BidPrice")
+        ask = board.get("ask_price") or board.get("ask") or board.get("best_ask") or board.get("AskPrice")
         return float(bid or 0) > 0 and float(ask or 0) > 0
     except Exception:
         return False
@@ -118,7 +111,6 @@ def _retry_fetch_board(original, symbol: Any, *args, source: str = "", side: str
     try:
         board = original(symbol, *args, **kwargs)
     except TypeError:
-        # source/side を受け取らない既存関数でも落とさない。
         board = original(symbol)
     if _is_valid_board(board):
         return board
@@ -136,64 +128,51 @@ def _retry_fetch_board(original, symbol: Any, *args, source: str = "", side: str
     extra_wait_sec = max(0.0, _env_float("ENTRY_BOARD_RETRY_EXTRA_WAIT_SEC", 0.3))
 
     last_board = board
-
     for i in range(1, retry_count + 1):
         if wait_sec <= 0:
             break
         logger.warning(
             "[BOARD RETRY] board missing symbol=%s side=%s source=%s retry=%s/%s wait=%.2fs reason=push_rotation_4p5s",
-            sym,
-            side,
-            source,
-            i,
-            retry_count,
-            wait_sec,
+            sym, side, source, i, retry_count, wait_sec,
         )
         time.sleep(wait_sec)
         try:
             last_board = original(symbol, *args, **kwargs)
-            if _is_valid_board(last_board):
-                logger.warning("[BOARD RETRY] board recovered symbol=%s side=%s source=%s retry=%s board=%s", sym, side, source, i, last_board)
-                return last_board
         except TypeError:
             try:
                 last_board = original(symbol)
-                if _is_valid_board(last_board):
-                    logger.warning("[BOARD RETRY] board recovered symbol=%s side=%s source=%s retry=%s board=%s", sym, side, source, i, last_board)
-                    return last_board
             except Exception:
                 logger.debug("[BOARD RETRY] retry failed symbol=%s retry=%s", sym, i, exc_info=True)
+                continue
         except Exception:
             logger.debug("[BOARD RETRY] retry failed symbol=%s retry=%s", sym, i, exc_info=True)
+            continue
+        if _is_valid_board(last_board):
+            logger.warning("[BOARD RETRY] board recovered symbol=%s side=%s source=%s retry=%s board=%s", sym, side, source, i, last_board)
+            return last_board
 
     for j in range(1, extra_count + 1):
         if extra_wait_sec <= 0:
             break
         logger.warning(
             "[BOARD RETRY] board still missing symbol=%s side=%s source=%s extra_retry=%s/%s wait=%.2fs reason=rotation_boundary_possible",
-            sym,
-            side,
-            source,
-            j,
-            extra_count,
-            extra_wait_sec,
+            sym, side, source, j, extra_count, extra_wait_sec,
         )
         time.sleep(extra_wait_sec)
         try:
             last_board = original(symbol, *args, **kwargs)
-            if _is_valid_board(last_board):
-                logger.warning("[BOARD RETRY] board recovered on extra symbol=%s side=%s source=%s extra_retry=%s board=%s", sym, side, source, j, last_board)
-                return last_board
         except TypeError:
             try:
                 last_board = original(symbol)
-                if _is_valid_board(last_board):
-                    logger.warning("[BOARD RETRY] board recovered on extra symbol=%s side=%s source=%s extra_retry=%s board=%s", sym, side, source, j, last_board)
-                    return last_board
             except Exception:
                 logger.debug("[BOARD RETRY] extra retry failed symbol=%s retry=%s", sym, j, exc_info=True)
+                continue
         except Exception:
             logger.debug("[BOARD RETRY] extra retry failed symbol=%s retry=%s", sym, j, exc_info=True)
+            continue
+        if _is_valid_board(last_board):
+            logger.warning("[BOARD RETRY] board recovered on extra symbol=%s side=%s source=%s extra_retry=%s board=%s", sym, side, source, j, last_board)
+            return last_board
 
     logger.warning("[BOARD RETRY] board still missing symbol=%s side=%s source=%s after retries=%s extra=%s", sym, side, source, retry_count, extra_count)
     return last_board
@@ -201,13 +180,13 @@ def _retry_fetch_board(original, symbol: Any, *args, source: str = "", side: str
 
 def _wrap_get_latest_bid_ask(original):
     original = _unwrap_original(original)
-    if getattr(original, "_board_retry_v13", False):
+    if getattr(original, "_board_retry_v14", False):
         return original
 
     def _get_latest_bid_ask_retry(symbol: Any, *args, **kwargs):
         return _retry_fetch_board(original, symbol, *args, **kwargs)
 
-    _get_latest_bid_ask_retry._board_retry_v13 = True  # type: ignore[attr-defined]
+    _get_latest_bid_ask_retry._board_retry_v14 = True  # type: ignore[attr-defined]
     _get_latest_bid_ask_retry._original = original  # type: ignore[attr-defined]
     return _get_latest_bid_ask_retry
 
@@ -223,7 +202,7 @@ def _make_entry_order_builder_retry(original_get_latest_bid_ask):
             side=str(side or ""),
         )
 
-    _get_board_with_retry._board_retry_v13 = True  # type: ignore[attr-defined]
+    _get_board_with_retry._board_retry_v14 = True  # type: ignore[attr-defined]
     _get_board_with_retry._original = original_get_latest_bid_ask  # type: ignore[attr-defined]
     return _get_board_with_retry
 
@@ -266,6 +245,13 @@ def _install_final_safety_side_aware_board() -> bool:
                 bid_qty = bid_qty or bidq2
                 ask_qty = ask_qty or askq2
             if bid <= 0 or ask <= 0:
+                # Safety first: 板が取れない時は原則エントリー禁止。
+                # 外部で ENTRY_ALLOW_ENTRY_WITHOUT_BOARD=1 が残っていても、
+                # ENTRY_BOARD_MISSING_HARD_BLOCK=1(default) が優先される。
+                if _env_bool("ENTRY_BOARD_MISSING_HARD_BLOCK", True):
+                    fsg._log_ng("board_missing", symbol, side, bid=bid, ask=ask, message="板が取れないため新規エントリー停止")
+                    logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_MISSING_HARD_BLOCK symbol=%s side=%s bid=%s ask=%s", symbol, side, bid, ask)
+                    return False
                 if fsg._env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", False):
                     logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_MISSING_ALLOW symbol=%s side=%s bid=%s ask=%s", symbol, side, bid, ask)
                     return True
@@ -293,7 +279,7 @@ def _install_final_safety_side_aware_board() -> bool:
         fsg._try_get_bid_ask_from_api = _try_get_bid_ask_from_api_side
         fsg._board_guard = _board_guard_side_aware
         _SIDE_PATCHED = True
-        logger.warning("[BOARD RETRY] patched final_entry_safety_guard board fetch with side/source")
+        logger.warning("[BOARD RETRY] patched final_entry_safety_guard board fetch with side/source hard_block=%s", _env_bool("ENTRY_BOARD_MISSING_HARD_BLOCK", True))
         return True
     except Exception:
         logger.exception("[BOARD RETRY] final_entry_safety_guard side-aware board patch failed")
@@ -322,7 +308,7 @@ def _ma5_opening_missing_only(ret: Any) -> bool:
 
 
 def _wrap_opening_ma5_relax(fn, label: str):
-    if not callable(fn) or getattr(fn, "_ma5_opening_relax_v13", False):
+    if not callable(fn) or getattr(fn, "_ma5_opening_relax_v14", False):
         return fn
 
     def _wrapped(*args, **kwargs):
@@ -332,7 +318,7 @@ def _wrap_opening_ma5_relax(fn, label: str):
             return None
         return ret
 
-    _wrapped._ma5_opening_relax_v13 = True  # type: ignore[attr-defined]
+    _wrapped._ma5_opening_relax_v14 = True  # type: ignore[attr-defined]
     _wrapped._original = fn  # type: ignore[attr-defined]
     return _wrapped
 
@@ -374,7 +360,7 @@ def _install_daily_src_duplicate_cleanup() -> bool:
         import pandas as pd
         import trading.summary.controller_utils as cu
         old = getattr(cu, "sanitize_df", None)
-        if not callable(old) or getattr(old, "_daily_src_cleanup_v13", False):
+        if not callable(old) or getattr(old, "_daily_src_cleanup_v14", False):
             _DAILY_DUP_PATCHED = True
             return True
 
@@ -383,13 +369,12 @@ def _install_daily_src_duplicate_cleanup() -> bool:
                 if isinstance(df, pd.DataFrame) and not df.empty:
                     daily_src_cols = [c for c in df.columns if str(c).endswith("_daily_src")]
                     if daily_src_cols:
-                        # 同名 daily_src 列は後勝ちで整理してから既存 sanitize に渡す。
                         df = df.loc[:, ~df.columns.duplicated(keep="last")].copy()
             except Exception:
                 pass
             return old(df)
 
-        _sanitize_df_daily_cleanup._daily_src_cleanup_v13 = True  # type: ignore[attr-defined]
+        _sanitize_df_daily_cleanup._daily_src_cleanup_v14 = True  # type: ignore[attr-defined]
         _sanitize_df_daily_cleanup._original = old  # type: ignore[attr-defined]
         cu.sanitize_df = _sanitize_df_daily_cleanup
         _DAILY_DUP_PATCHED = True
@@ -402,6 +387,10 @@ def _install_daily_src_duplicate_cleanup() -> bool:
 
 def install() -> bool:
     global _PATCHED
+    # 安全側の既定値。ユーザーが明示的に0にしない限り、板なしエントリーは禁止。
+    os.environ.setdefault("ENTRY_BOARD_MISSING_HARD_BLOCK", "1")
+    os.environ.setdefault("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", "0")
+
     if not _env_bool("ENTRY_BOARD_RETRY_ENABLED", True):
         logger.warning("[BOARD RETRY] disabled by env")
         return False
@@ -442,7 +431,7 @@ def install() -> bool:
 
     _PATCHED = bool(ok_any or side_ok or ma5_ok or dup_ok)
     logger.warning(
-        "[BOARD RETRY] installed=%s enabled=%s wait_sec=%.2f retry_count=%s extra_wait=%.2f extra_count=%s only_pending=%s side_patch=%s ma5_opening_relax=%s daily_dup_cleanup=%s",
+        "[BOARD RETRY] installed=%s enabled=%s wait_sec=%.2f retry_count=%s extra_wait=%.2f extra_count=%s only_pending=%s side_patch=%s ma5_opening_relax=%s daily_dup_cleanup=%s board_hard_block=%s allow_without_board=%s",
         _PATCHED,
         _env_bool("ENTRY_BOARD_RETRY_ENABLED", True),
         wait_sec,
@@ -453,6 +442,8 @@ def install() -> bool:
         side_ok,
         ma5_ok,
         dup_ok,
+        _env_bool("ENTRY_BOARD_MISSING_HARD_BLOCK", True),
+        _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", False),
     )
     return _PATCHED
 
@@ -461,5 +452,6 @@ try:
     install()
 except Exception:
     logger.exception("[BOARD RETRY] auto install failed")
+
 
 __all__ = ["install"]
