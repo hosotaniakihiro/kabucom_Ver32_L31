@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/subscription_manager/core.py
-# Version: V3.5-ENV-CLEAR-WAIT-FOR-ROTATION
+# Version: V3.6-ROTATION-UNREGISTER-WAIT-0P2
 # ------------------------------------------------------------
 # Function:
 #   - subscription manager 公開API
@@ -10,10 +10,10 @@
 #
 # Important:
 #   - kabu Station の同時登録上限は50銘柄
-#   - unregister/all のREST応答直後でも、kabu Station内部の登録解除反映が
-#     少し遅れることがある。
-#   - 固定0.5秒では 4002006 レジスト数エラーが出やすいため、
-#     KABU_REGISTER_UNREGISTER_WAIT_SEC を既定値として使う。
+#   - PUSHローテーションの設計は以下:
+#       登録 -> 4.8秒保持 -> 解除 -> 0.2秒待機 -> 登録 -> 4.8秒保持
+#   - startup/on_open等の初回clearは安全側に1.5秒待つが、rotation_* 理由では
+#     PUSH_ROTATION_UNREGISTER_WAIT_SEC=0.2 を優先する。
 # ============================================================
 
 from __future__ import annotations
@@ -50,14 +50,19 @@ def _env_float(name: str, default: float) -> float:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
             return float(default)
-        return float(v)
+        return float(str(v).replace(",", ""))
     except Exception:
         return float(default)
 
 
 def _default_wait_after_clear_sec() -> float:
-    # rotation_settings.py でも setdefault するが、core単体import時にも安全な既定値を持つ。
+    # startup/on_open用の安全側既定値。rotation_* では使わない。
     return max(0.0, _env_float("KABU_REGISTER_UNREGISTER_WAIT_SEC", 1.5))
+
+
+def _rotation_wait_after_clear_sec() -> float:
+    # ユーザー設計: 登録 -> 4.8秒 -> 解除 -> 0.2秒 -> 登録。
+    return max(0.0, _env_float("PUSH_ROTATION_UNREGISTER_WAIT_SEC", 0.2))
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -101,8 +106,9 @@ def _is_force_clear_reason(reason: Any) -> bool:
         return False
 
 
-def _extract_wait_after_clear_sec(kwargs: dict[str, Any]) -> float:
-    default_wait = _default_wait_after_clear_sec()
+def _extract_wait_after_clear_sec(kwargs: dict[str, Any], *, is_rotation: bool = False) -> float:
+    rotation_default = _rotation_wait_after_clear_sec()
+    default_wait = rotation_default if is_rotation else _default_wait_after_clear_sec()
     for key in (
         "wait_after_clear_sec",
         "unregister_wait_sec",
@@ -111,8 +117,7 @@ def _extract_wait_after_clear_sec(kwargs: dict[str, Any]) -> float:
     ):
         if key in kwargs and kwargs.get(key) is not None:
             v = max(0.0, _safe_float(kwargs.get(key), default_wait))
-            # 0指定は「既定に戻す」扱い。rotation_register から0.0が来ても
-            # kabu Station内部反映待ちを潰さない。
+            # rotationでは0指定も「0.2秒設計」へ戻す。startup/on_openは1.5秒へ戻す。
             return default_wait if v <= 0 else v
     return default_wait
 
@@ -148,19 +153,20 @@ def refresh_subscriptions(
 
     保証:
       - run_refresh_sequence() へ渡す target_symbols は最大50件
-      - on_open / startup / rotation は既存登録を全解除してから登録する
+      - rotation_* は登録→保持→解除→0.2秒→登録の設計に合わせる
+      - on_open / startup は既存登録を全解除してから安全側に登録する
     """
 
     is_rotation = _is_rotation_reason(reason)
     is_force_clear = _is_force_clear_reason(reason)
-    wait_after_clear_sec = _extract_wait_after_clear_sec(kwargs)
+    wait_after_clear_sec = _extract_wait_after_clear_sec(kwargs, is_rotation=is_rotation)
 
     if is_rotation or is_force_clear:
         force = True
         clear_first = True
         unregister_first = True
         if wait_after_clear_sec <= 0:
-            wait_after_clear_sec = _default_wait_after_clear_sec()
+            wait_after_clear_sec = _rotation_wait_after_clear_sec() if is_rotation else _default_wait_after_clear_sec()
 
     target_symbols = build_target_symbols(
         symbols=symbols,
@@ -208,7 +214,8 @@ def refresh_subscriptions(
         skip_guard = "rotation_force_noskip"
         decided_clear_first = True
         unregister_first = True
-        clear_policy = "rotation_force_clear"
+        clear_policy = "rotation_force_clear_0p2"
+        wait_after_clear_sec = _rotation_wait_after_clear_sec()
     elif is_force_clear:
         skip = False
         skip_guard = "on_open_force_clear"
