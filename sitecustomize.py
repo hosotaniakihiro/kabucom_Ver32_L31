@@ -1,14 +1,14 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver35-RANKING-FINAL-RESCUE
+# Version: Ver36-RANKING-WATCHDOG-TONOSAMA-RAW1-FALLBACK
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # 失敗しても本体起動は止めない。
 #
-# Ver35 Fix:
-#   - Ranking pending が entry_controller まで到達しても、
-#     ATR_1M_FILTER_NG / AI_GATE_NG(mtf_low) で全落ちする問題に対応するため
-#     ranking_entry_final_rescue_patch を自動installする。
+# Ver36 Fix:
+#   - ranking_entry が長時間 running のまま残り、以後のエントリーが
+#     skip され続ける問題に対応するため ranking_entry watchdog を自動install。
+#   - Tonosama は 3m/5m 履歴 stale 時も raw1 fallback を優先する。
 # ============================================================
 
 from __future__ import annotations
@@ -129,6 +129,9 @@ def _install_tonosama_surge_defaults() -> None:
     try:
         os.environ.setdefault("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING", "1")
         os.environ.setdefault("TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY", "1")
+        os.environ.setdefault("TONOSAMA_ALLOW_HISTORY_MISSING_ENTRY", "1")
+        os.environ.setdefault("TONOSAMA_DROP_HISTORY_MISSING_ENTRY", "0")
+        os.environ.setdefault("TONOSAMA_RAW1_RESAMPLE_FALLBACK", "1")
         os.environ.setdefault("TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE", "3.0")
         os.environ.setdefault("TONOSAMA_5SEC_ADVISORY_ENABLED", "1")
         os.environ.setdefault("TONOSAMA_5SEC_ALLOW_ZERO_IF_PRIMARY_PASS", "1")
@@ -213,43 +216,26 @@ def _install_tonosama_surge_defaults() -> None:
         os.environ.setdefault("RANKING_FINAL_RESCUE_MIN_SCORE", "55")
         os.environ.setdefault("RANKING_FINAL_RESCUE_ATR_MIN_RATIO", "0.0005")
         os.environ.setdefault("RANKING_FINAL_RESCUE_AI_FAILOPEN", "1")
+        os.environ.setdefault("RANKING_ENTRY_WATCHDOG_ENABLED", "1")
+        os.environ.setdefault("RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC", "55")
 
         _write_boot_evidence("TONOSAMA_SURGE_DEFAULTS_SET", {
-            "short_mtf_require_all": os.environ.get("ENTRY_SHORT_MTF_REQUIRE_ALL"),
-            "short_mtf_min_aligned": os.environ.get("ENTRY_SHORT_MTF_MIN_ALIGNED"),
-            "ranking_source_db_fallback": os.environ.get("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED"),
-            "ranking_hl_patch": os.environ.get("RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH_ENABLED"),
-            "ranking_stuck_pending_retry": os.environ.get("RANKING_STUCK_PENDING_MAX_CONTROLLER_RETRY"),
-            "ranking_final_rescue": os.environ.get("RANKING_FINAL_RESCUE_AI_FAILOPEN"),
-            "entry_direction_recursion_failopen": os.environ.get("ENTRY_DIRECTION_RECURSION_FAILOPEN_ENABLED"),
-            "summary_date_guard": os.environ.get("SUMMARY_DB_DATE_GUARD_ENABLED"),
-            "tonosama_price_range_rescue": os.environ.get("TONOSAMA_PRICE_CHANGE_OR_RANGE_ENABLED"),
-            "tonosama_volume_surge_zero_rescue": os.environ.get("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_ENABLED"),
-            "tonosama_slope_range_rescue": os.environ.get("TONOSAMA_SLOPE_RANGE_RESCUE_ENABLED"),
-            "tonosama_ai_soft_rescue": os.environ.get("TONOSAMA_AI_SOFT_RESCUE"),
-            "tonosama_entry_timeout_sec": os.environ.get("TONOSAMA_ENTRY_TIMEOUT_SEC"),
-            "tonosama_dispatch_timeout_pending": os.environ.get("TONOSAMA_DISPATCH_CONTROLLER_ON_TIMEOUT_PENDING"),
+            "ranking_watchdog": os.environ.get("RANKING_ENTRY_WATCHDOG_ENABLED"),
+            "ranking_watchdog_timeout": os.environ.get("RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC"),
+            "tonosama_raw1_resample": os.environ.get("TONOSAMA_RAW1_RESAMPLE_FALLBACK"),
+            "tonosama_allow_without_history": os.environ.get("TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY"),
+            "tonosama_drop_history_missing": os.environ.get("TONOSAMA_DROP_HISTORY_MISSING_ENTRY"),
             "entry_lock_wait_sources": os.environ.get("ENTRY_CONTROLLER_LOCK_WAIT_SOURCES"),
             "entry_lock_wait_sec": os.environ.get("ENTRY_CONTROLLER_LOCK_WAIT_SEC"),
             "entry_summary_lock_wait_sec": os.environ.get("ENTRY_CONTROLLER_SUMMARY_LOCK_WAIT_SEC"),
         })
         logger.warning(
-            "[SITECUSTOMIZE] defaults short_mtf_require_all=%s short_mtf_min_aligned=%s ranking_source_db_fallback=%s ranking_hl_patch=%s ranking_stuck_retry=%s ranking_final_rescue=%s entry_direction_recursion_failopen=%s summary_date_guard=%s warning_only_climax=%s tonosama_price_range_rescue=%s tonosama_volume_surge_zero_rescue=%s tonosama_slope_range_rescue=%s ai_soft_rescue=%s tonosama_timeout=%s dispatch_timeout_pending=%s entry_lock_wait_sources=%s entry_lock_wait_sec=%s summary_lock_wait_sec=%s",
-            os.environ.get("ENTRY_SHORT_MTF_REQUIRE_ALL"),
-            os.environ.get("ENTRY_SHORT_MTF_MIN_ALIGNED"),
-            os.environ.get("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED"),
-            os.environ.get("RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH_ENABLED"),
-            os.environ.get("RANKING_STUCK_PENDING_MAX_CONTROLLER_RETRY"),
-            os.environ.get("RANKING_FINAL_RESCUE_AI_FAILOPEN"),
-            os.environ.get("ENTRY_DIRECTION_RECURSION_FAILOPEN_ENABLED"),
-            os.environ.get("SUMMARY_DB_DATE_GUARD_ENABLED"),
-            os.environ.get("TONOSAMA_ALLOW_WARNING_ONLY_CLIMAX"),
-            os.environ.get("TONOSAMA_PRICE_CHANGE_OR_RANGE_ENABLED"),
-            os.environ.get("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_ENABLED"),
-            os.environ.get("TONOSAMA_SLOPE_RANGE_RESCUE_ENABLED"),
-            os.environ.get("TONOSAMA_AI_SOFT_RESCUE"),
-            os.environ.get("TONOSAMA_ENTRY_TIMEOUT_SEC"),
-            os.environ.get("TONOSAMA_DISPATCH_CONTROLLER_ON_TIMEOUT_PENDING"),
+            "[SITECUSTOMIZE] defaults ranking_watchdog=%s timeout=%s tonosama_raw1_resample=%s allow_without_history=%s drop_history_missing=%s entry_lock_wait_sources=%s entry_lock_wait_sec=%s summary_lock_wait_sec=%s",
+            os.environ.get("RANKING_ENTRY_WATCHDOG_ENABLED"),
+            os.environ.get("RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC"),
+            os.environ.get("TONOSAMA_RAW1_RESAMPLE_FALLBACK"),
+            os.environ.get("TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY"),
+            os.environ.get("TONOSAMA_DROP_HISTORY_MISSING_ENTRY"),
             os.environ.get("ENTRY_CONTROLLER_LOCK_WAIT_SOURCES"),
             os.environ.get("ENTRY_CONTROLLER_LOCK_WAIT_SEC"),
             os.environ.get("ENTRY_CONTROLLER_SUMMARY_LOCK_WAIT_SEC"),
@@ -282,6 +268,7 @@ def _install_summary_mtf_catchup_safely() -> None:
 _write_boot_evidence("PYTHON_START")
 _install_boot_exception_hook()
 _install_tonosama_surge_defaults()
+_install_module("core.startup.ranking_entry_market_hours_skip_patch", "RANKING_ENTRY_WATCHDOG", disabled_env="DISABLE_RANKING_ENTRY_WATCHDOG_PATCH")
 _install_module("core.startup.entry_log_skip_reason_collision_patch", "ENTRY_LOG_SKIP_GUARD", disabled_env="DISABLE_ENTRY_LOG_SKIP_GUARD")
 _install_module("core.startup.summary_db_date_guard_patch", "SUMMARY_DB_DATE_GUARD", disabled_env="DISABLE_SUMMARY_DB_DATE_GUARD_PATCH")
 _install_module("core.startup.summary_save_quality_guard_patch", "SUMMARY_SAVE_QUALITY_GUARD", disabled_env="DISABLE_SUMMARY_SAVE_QUALITY_GUARD")
