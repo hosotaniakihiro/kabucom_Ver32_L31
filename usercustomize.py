@@ -65,6 +65,12 @@ _env_default("RANKING_SNAPSHOT_MAX_AGE_SEC", "300")
 _env_default("RANKING_ENTRY_ALLOW_STALE_FALLBACK", "0")
 _env_default("RANKING_ENTRY_RAW_FALLBACK_ONLY_TODAY", "1")
 
+# Ranking AIモデル未配置時も、強いランキング候補は小ロットで通す。
+_env_default("RANKING_AI_GATE_FAILOPEN_ENABLED", "1")
+_env_default("RANKING_AI_GATE_FAILOPEN_MIN_SCORE", "50")
+_env_default("RANKING_AI_GATE_FAILOPEN_MIN_TURNOVER", "50000000")
+_env_default("RANKING_AI_GATE_FAILOPEN_MIN_VOLUME", "30000")
+
 # Tonosama / 3m・5m stale summary はfail-closed寄りにする。
 _env_default("TONOSAMA_STALE_SUMMARY_FAILOPEN", "0")
 _env_default("TONOSAMA_RECENT_3M5M_FAILOPEN", "0")
@@ -86,7 +92,7 @@ _env_default("PULLBACK_ENTRY_MIN_VOLUME", "30000")
 _env_default("PULLBACK_ENTRY_MIN_TURNOVER", "10000000")
 
 logger.warning(
-    "[USERCUSTOMIZE] runtime defaults applied summary_ai_daily_risk=%s liq_run_in_main=%s liq_fail_open=%s liq_min_turnover=%s final_liq_min_turnover=%s protect_pending=%s exit_cooldown=%s board_allow=%s board_hard=%s ranking_stale_skip=%s ranking_require_today=%s ranking_clear_pending=%s tonosama_mtf_stale_fail_closed=%s pullback=%s",
+    "[USERCUSTOMIZE] runtime defaults applied summary_ai_daily_risk=%s liq_run_in_main=%s liq_fail_open=%s liq_min_turnover=%s final_liq_min_turnover=%s protect_pending=%s exit_cooldown=%s board_allow=%s board_hard=%s ranking_stale_skip=%s ranking_require_today=%s ranking_clear_pending=%s ranking_ai_failopen=%s tonosama_mtf_stale_fail_closed=%s pullback=%s",
     os.getenv("SUMMARY_AI_PRE_FILTER_DAILY_RISK"),
     os.getenv("WATCHLIST_RECENT_LIQ_BULK_RUN_IN_MAIN"),
     os.getenv("WATCHLIST_RECENT_LIQ_FAIL_OPEN_ON_TIMEOUT"),
@@ -99,6 +105,7 @@ logger.warning(
     os.getenv("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE"),
     os.getenv("RANKING_ENTRY_REQUIRE_TODAY"),
     os.getenv("RANKING_ENTRY_CLEAR_PENDING_ON_STALE"),
+    os.getenv("RANKING_AI_GATE_FAILOPEN_ENABLED"),
     os.getenv("TONOSAMA_MTF_STALE_FAIL_CLOSED"),
     os.getenv("PULLBACK_ENTRY_ENABLED"),
 )
@@ -171,6 +178,7 @@ else:
     _install("TONOSAMA_LUNCH_REOPEN_RECENT", "core.startup.tonosama_lunch_reopen_recent_patch")
     _install("YAHOO_COMPUTE_SCHEMA_NA_GUARD", "core.startup.yahoo_compute_schema_na_guard_patch")
     _install("RANKING_ENTRY_FAST_BUDGET_OVERRIDE", "core.startup.ranking_entry_fast_budget_override_patch")
+    _install("RANKING_AI_GATE_FAILOPEN", "core.startup.ranking_entry_gate_failopen_patch")
     _install("TONOSAMA_RECENT_3M5M_FAILOPEN", "core.startup.tonosama_recent3m5m_failopen_patch")
     _install("TONOSAMA_FAILOPEN_DIRECTION_RESCUE", "core.startup.tonosama_failopen_direction_rescue_patch")
     _install("TONOSAMA_ATR1M_RESCUE", "core.startup.tonosama_atr1m_filter_rescue_patch")
@@ -190,3 +198,4 @@ else:
     # _run_ranking_entry_safe after the first stale guard install.
     _install("RANKING_STALE_SNAPSHOT_SKIP_LAST", "core.startup.ranking_entry_stale_snapshot_skip_patch")
     _install("BOARD_MISSING_PROTECTED_ALLOW", "core.startup.board_missing_protected_allow_patch")
+    _install("RANKING_AI_GATE_FAILOPEN_LAST", "core.startup.ranking_entry_gate_failopen_patch")
