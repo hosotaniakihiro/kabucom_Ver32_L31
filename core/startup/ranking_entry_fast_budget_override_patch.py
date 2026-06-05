@@ -28,20 +28,21 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 
 
 def _apply_once() -> bool:
-    # 他patchや環境変数が 150/180/120 を指定しても、ここで必ず高速上限へ丸める。
     runtime = _clamp(_float_env("RANKING_ENTRY_FAST_RUNTIME_BUDGET_SEC", 25.0), 10.0, 25.0)
     build = _clamp(_float_env("RANKING_ENTRY_FAST_BUILD_TIMEOUT_SEC", 30.0), 15.0, 30.0)
     controller = _clamp(_float_env("RANKING_ENTRY_FAST_CONTROLLER_TIMEOUT_SEC", 30.0), 15.0, 30.0)
     lock_wait = _clamp(_float_env("SUMMARY_AI_ENTRY_CONTROLLER_LOCK_WAIT_SEC", 15.0), 3.0, 15.0)
+    max_pending = str(int(_clamp(_float_env("RANKING_ENTRY_FAST_MAX_PENDING_PER_RUN", 4.0), 1.0, 6.0)))
 
     os.environ["RANKING_ENTRY_RUNTIME_BUDGET_SEC"] = str(runtime)
     os.environ["RANKING_ENTRY_BUILD_TIMEOUT_SEC"] = str(build)
     os.environ["RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC"] = str(controller)
-    os.environ["RANKING_ENTRY_MAX_PENDING_PER_RUN"] = os.getenv("RANKING_ENTRY_FAST_MAX_PENDING_PER_RUN", "1")
+    os.environ["RANKING_ENTRY_FAST_MAX_PENDING_PER_RUN"] = max_pending
+    os.environ["RANKING_ENTRY_MAX_PENDING_PER_RUN"] = max_pending
     os.environ["SUMMARY_AI_ENTRY_CONTROLLER_LOCK_WAIT_SEC"] = str(lock_wait)
     os.environ.setdefault("SUMMARY_AI_ENTRY_CONTROLLER_LOCK_POLL_SEC", "0.25")
-    os.environ.setdefault("RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC", "60")
-    os.environ.setdefault("RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC", "180")
+    os.environ.setdefault("RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC", "20")
+    os.environ.setdefault("RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC", "60")
 
     try:
         import trading.entry_exit.tasks as tasks
@@ -58,13 +59,15 @@ def _watch_loop() -> None:
             ok = _apply_once()
             if i in (0, 1, 5, 15, 30, 60, 120, 180, 239):
                 logger.warning(
-                    "[RANKING ENTRY FAST BUDGET OVERRIDE] enforce ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s summary_lock_wait=%s cap=25/30/30",
+                    "[RANKING ENTRY FAST BUDGET OVERRIDE] enforce ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s summary_lock_wait=%s cooldown=%s/%s cap=25/30/30 pending_default=4",
                     ok,
                     os.environ.get("RANKING_ENTRY_RUNTIME_BUDGET_SEC"),
                     os.environ.get("RANKING_ENTRY_BUILD_TIMEOUT_SEC"),
                     os.environ.get("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC"),
                     os.environ.get("RANKING_ENTRY_MAX_PENDING_PER_RUN"),
                     os.environ.get("SUMMARY_AI_ENTRY_CONTROLLER_LOCK_WAIT_SEC"),
+                    os.environ.get("RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC"),
+                    os.environ.get("RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC"),
                 )
         except Exception:
             logger.exception("[RANKING ENTRY FAST BUDGET OVERRIDE] enforce failed")
@@ -81,7 +84,7 @@ def install() -> bool:
         threading.Thread(target=_watch_loop, name="ranking-entry-fast-budget-override", daemon=True).start()
         _INSTALLED = True
         logger.warning(
-            "[RANKING ENTRY FAST BUDGET OVERRIDE] installed v7 ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s summary_lock_wait=%s watcher=True cap=25/30/30",
+            "[RANKING ENTRY FAST BUDGET OVERRIDE] installed v8 ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s summary_lock_wait=%s watcher=True pending_default=4",
             ok,
             os.environ.get("RANKING_ENTRY_RUNTIME_BUDGET_SEC"),
             os.environ.get("RANKING_ENTRY_BUILD_TIMEOUT_SEC"),
