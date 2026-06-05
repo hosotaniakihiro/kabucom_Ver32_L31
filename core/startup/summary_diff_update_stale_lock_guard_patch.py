@@ -40,7 +40,7 @@ def _clear_stale_locks_once(context: str = "manual") -> int:
         if not isinstance(inflight, dict):
             return 0
         now = dt.datetime.now()
-        stale_sec = _env_float("SUMMARY_DIFF_UPDATE_STALE_LOCK_SEC", 90.0)
+        stale_sec = _env_float("SUMMARY_DIFF_UPDATE_STALE_LOCK_SEC", 30.0)
         cleared = 0
         lock = guard if guard is not None else threading.Lock()
         with lock:
@@ -54,9 +54,20 @@ def _clear_stale_locks_once(context: str = "manual") -> int:
                     held = max(0.0, (now - started_at).total_seconds())
                     if held < stale_sec:
                         continue
-                    inflight[int(interval)] = {"running": False, "started_at": None, "tid": None, "thread": None, "stale_cleared_at": now, "stale_context": context, "held_sec": held}
+                    inflight[int(interval)] = {
+                        "running": False,
+                        "started_at": None,
+                        "tid": None,
+                        "thread": None,
+                        "stale_cleared_at": now,
+                        "stale_context": context,
+                        "held_sec": held,
+                    }
                     cleared += 1
-                    logger.error("[SUMMARY DIFF STALE LOCK GUARD] cleared stale diff_update lock interval=%s held=%.3fs threshold=%.3fs meta=%s context=%s", interval, held, stale_sec, meta, context)
+                    logger.error(
+                        "[SUMMARY DIFF STALE LOCK GUARD] cleared stale diff_update lock interval=%s held=%.3fs threshold=%.3fs meta=%s context=%s",
+                        interval, held, stale_sec, meta, context,
+                    )
                 except Exception:
                     logger.exception("[SUMMARY DIFF STALE LOCK GUARD] clear one failed interval=%s", interval)
         return cleared
@@ -72,9 +83,9 @@ def _patch_enter_interval() -> bool:
         if not callable(cur):
             logger.warning("[SUMMARY DIFF STALE LOCK GUARD] _enter_interval unavailable")
             return False
-        if getattr(cur, "_summary_diff_stale_lock_guard_v1", False):
+        if getattr(cur, "_summary_diff_stale_lock_guard_v2", False):
             return True
-        original = cur
+        original = getattr(cur, "_original", cur)
 
         def _patched_enter_interval(interval: int) -> bool:
             try:
@@ -83,6 +94,7 @@ def _patch_enter_interval() -> bool:
                 pass
             return original(interval)
 
+        _patched_enter_interval._summary_diff_stale_lock_guard_v2 = True  # type: ignore[attr-defined]
         _patched_enter_interval._summary_diff_stale_lock_guard_v1 = True  # type: ignore[attr-defined]
         _patched_enter_interval._original = original  # type: ignore[attr-defined]
         sc._enter_interval = _patched_enter_interval
@@ -95,12 +107,12 @@ def _patch_enter_interval() -> bool:
 def _watch_loop() -> None:
     while True:
         try:
-            interval = max(5.0, _env_float("SUMMARY_DIFF_UPDATE_STALE_LOCK_WATCH_INTERVAL_SEC", 10.0))
+            interval = max(2.0, _env_float("SUMMARY_DIFF_UPDATE_STALE_LOCK_WATCH_INTERVAL_SEC", 5.0))
             _clear_stale_locks_once(context="watcher")
             time.sleep(interval)
         except Exception:
             logger.exception("[SUMMARY DIFF STALE LOCK GUARD] watcher failed")
-            time.sleep(10.0)
+            time.sleep(5.0)
 
 
 def install() -> bool:
@@ -108,15 +120,32 @@ def install() -> bool:
     if not _env_bool("SUMMARY_DIFF_UPDATE_STALE_LOCK_GUARD_ENABLED", True):
         logger.warning("[SUMMARY DIFF STALE LOCK GUARD] disabled by env")
         return False
-    os.environ.setdefault("SUMMARY_DIFF_UPDATE_STALE_LOCK_SEC", "90")
-    os.environ.setdefault("SUMMARY_DIFF_UPDATE_STALE_LOCK_WATCH_INTERVAL_SEC", "10")
+    # 1分足エントリー用なので90秒は長すぎる。30秒で解除する。
+    old_stale = os.environ.get("SUMMARY_DIFF_UPDATE_STALE_LOCK_SEC")
+    try:
+        if old_stale is None or float(old_stale) > 30.0:
+            os.environ["SUMMARY_DIFF_UPDATE_STALE_LOCK_SEC"] = "30"
+    except Exception:
+        os.environ["SUMMARY_DIFF_UPDATE_STALE_LOCK_SEC"] = "30"
+    old_watch = os.environ.get("SUMMARY_DIFF_UPDATE_STALE_LOCK_WATCH_INTERVAL_SEC")
+    try:
+        if old_watch is None or float(old_watch) > 5.0:
+            os.environ["SUMMARY_DIFF_UPDATE_STALE_LOCK_WATCH_INTERVAL_SEC"] = "5"
+    except Exception:
+        os.environ["SUMMARY_DIFF_UPDATE_STALE_LOCK_WATCH_INTERVAL_SEC"] = "5"
     ok = _patch_enter_interval()
     _clear_stale_locks_once(context="install")
     if ok and not _WATCHER_STARTED:
         _WATCHER_STARTED = True
         threading.Thread(target=_watch_loop, name="summary-diff-stale-lock-guard", daemon=True).start()
     _INSTALLED = bool(ok)
-    logger.warning("[SUMMARY DIFF STALE LOCK GUARD] installed ok=%s stale_sec=%s watch_interval=%s watcher=%s", ok, os.environ.get("SUMMARY_DIFF_UPDATE_STALE_LOCK_SEC"), os.environ.get("SUMMARY_DIFF_UPDATE_STALE_LOCK_WATCH_INTERVAL_SEC"), _WATCHER_STARTED)
+    logger.warning(
+        "[SUMMARY DIFF STALE LOCK GUARD] installed v2 ok=%s stale_sec=%s watch_interval=%s watcher=%s",
+        ok,
+        os.environ.get("SUMMARY_DIFF_UPDATE_STALE_LOCK_SEC"),
+        os.environ.get("SUMMARY_DIFF_UPDATE_STALE_LOCK_WATCH_INTERVAL_SEC"),
+        _WATCHER_STARTED,
+    )
     return bool(ok)
 
 try:
