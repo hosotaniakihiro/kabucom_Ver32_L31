@@ -226,10 +226,14 @@ def install() -> bool:
     os.environ.setdefault('TONOSAMA_STUCK_PENDING_LOW_SCORE_THRESHOLD', '3.0')
     os.environ.setdefault('TONOSAMA_STUCK_PENDING_MIN_AGE_SEC', '30')
     os.environ.setdefault('TONOSAMA_STUCK_PENDING_MAX_AGE_SEC', '120')
+    # PUSH WebSocket再接続や50銘柄ローテで1分足publishが数分遅れることがあるため、
+    # 殿様のfresh判定は180秒ではなく300秒を標準にする。
+    os.environ.setdefault('TONOSAMA_WAIT_PUSH_SUMMARY_MAX_AGE_SEC', '300')
+    os.environ.setdefault('TONOSAMA_HISTORY_FALLBACK_MAX_AGE_SEC', '300')
     ok = _patch_once()
     threading.Thread(target=_watch, name='tonosama-skip-build-when-pending-exists', daemon=True).start()
     _DONE = True
-    logger.warning('[TONOSAMA SKIP BUILD WHEN PENDING EXISTS] installed v4 ok=%s watcher=True market_guard=True stuck_prune=True min_age_guard=True', ok)
+    logger.warning('[TONOSAMA SKIP BUILD WHEN PENDING EXISTS] installed v4 ok=%s watcher=True market_guard=True stuck_prune=True min_age_guard=True fresh_max_age=300', ok)
     return True
 
 
