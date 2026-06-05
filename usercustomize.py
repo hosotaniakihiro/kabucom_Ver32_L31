@@ -55,7 +55,24 @@ _env_default("ENTRY_BOARD_MISSING_QTY_RATIO", "0.50")
 
 # Ranking DB が stale の時は pending を作らず、Summary/Pullback 側に任せる。
 _env_default("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE", "1")
+_env_default("RANKING_ENTRY_STALE_FAIL_CLOSED", "1")
+_env_default("RANKING_ENTRY_ABORT_ON_STALE", "1")
+_env_default("RANKING_ENTRY_CLEAR_PENDING_ON_STALE", "1")
+_env_default("RANKING_ENTRY_REQUIRE_TODAY", "1")
 _env_default("RANKING_ENTRY_SNAPSHOT_MAX_AGE_SEC", "300")
+_env_default("RANKING_PRECHECK_MAX_AGE_SEC", "300")
+_env_default("RANKING_SNAPSHOT_MAX_AGE_SEC", "300")
+_env_default("RANKING_ENTRY_ALLOW_STALE_FALLBACK", "0")
+_env_default("RANKING_ENTRY_RAW_FALLBACK_ONLY_TODAY", "1")
+
+# Tonosama / 3m・5m stale summary はfail-closed寄りにする。
+_env_default("TONOSAMA_STALE_SUMMARY_FAILOPEN", "0")
+_env_default("TONOSAMA_RECENT_3M5M_FAILOPEN", "0")
+_env_default("TONOSAMA_ALLOW_STALE_MTF_ENTRY", "0")
+_env_default("TONOSAMA_MTF_STALE_FAIL_CLOSED", "1")
+_env_default("TONOSAMA_SUMMARY_MAX_AGE_SEC", "300")
+_env_default("TONOSAMA_HISTORY_MAX_AGE_SEC", "300")
+_env_default("SUMMARY_MTF_ENTRY_MAX_AGE_SEC", "300")
 
 # 押し目買い/戻り売りエントリー。
 _env_default("PULLBACK_ENTRY_ENABLED", "1")
@@ -69,7 +86,7 @@ _env_default("PULLBACK_ENTRY_MIN_VOLUME", "30000")
 _env_default("PULLBACK_ENTRY_MIN_TURNOVER", "10000000")
 
 logger.warning(
-    "[USERCUSTOMIZE] runtime defaults applied summary_ai_daily_risk=%s liq_run_in_main=%s liq_fail_open=%s liq_min_turnover=%s final_liq_min_turnover=%s protect_pending=%s exit_cooldown=%s board_allow=%s board_hard=%s ranking_stale_skip=%s pullback=%s",
+    "[USERCUSTOMIZE] runtime defaults applied summary_ai_daily_risk=%s liq_run_in_main=%s liq_fail_open=%s liq_min_turnover=%s final_liq_min_turnover=%s protect_pending=%s exit_cooldown=%s board_allow=%s board_hard=%s ranking_stale_skip=%s ranking_require_today=%s ranking_clear_pending=%s tonosama_mtf_stale_fail_closed=%s pullback=%s",
     os.getenv("SUMMARY_AI_PRE_FILTER_DAILY_RISK"),
     os.getenv("WATCHLIST_RECENT_LIQ_BULK_RUN_IN_MAIN"),
     os.getenv("WATCHLIST_RECENT_LIQ_FAIL_OPEN_ON_TIMEOUT"),
@@ -80,6 +97,9 @@ logger.warning(
     os.getenv("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"),
     os.getenv("ENTRY_BOARD_MISSING_HARD_BLOCK"),
     os.getenv("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE"),
+    os.getenv("RANKING_ENTRY_REQUIRE_TODAY"),
+    os.getenv("RANKING_ENTRY_CLEAR_PENDING_ON_STALE"),
+    os.getenv("TONOSAMA_MTF_STALE_FAIL_CLOSED"),
     os.getenv("PULLBACK_ENTRY_ENABLED"),
 )
 
@@ -166,4 +186,7 @@ else:
     _install("RANKING_ENTRY_INTRADAY_CAP", "core.startup.ranking_entry_intraday_cap_patch")
     _install("SUMMARY_AI_NO_DIRECT_SYNC", "core.startup.summary_ai_no_direct_sync_patch")
     _install("RANKING_ENTRY_MARKET_HOURS_SKIP", "core.startup.ranking_entry_market_hours_skip_patch")
+    # Re-apply ranking stale guard last because market-hours and other patches can re-wrap
+    # _run_ranking_entry_safe after the first stale guard install.
+    _install("RANKING_STALE_SNAPSHOT_SKIP_LAST", "core.startup.ranking_entry_stale_snapshot_skip_patch")
     _install("BOARD_MISSING_PROTECTED_ALLOW", "core.startup.board_missing_protected_allow_patch")
