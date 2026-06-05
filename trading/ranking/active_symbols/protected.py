@@ -1,20 +1,21 @@
 # ============================================================
 # File   : trading/ranking/active_symbols/protected.py
-# Version: Ver1.3-PROTECT-PENDING-FOR-BOARD
+# Version: Ver1.4-PENDING-AND-EXIT-COOLDOWN
 # ------------------------------------------------------------
 # 【目的】
 #   active_symbols から絶対に外してはいけない銘柄を返す。
 #
-# Ver1.3:
-#   - Summary AI approved / pending 銘柄で board_missing が発生し、
-#     発注直前に止まる問題への対策。
-#   - pending_entries をデフォルトで protected に戻す。
-#   - ただし不要なら ACTIVE_PROTECT_PENDING_SYMBOLS=0 で無効化可能。
-#   - 建玉保護は従来通り最優先。
+# Ver1.4:
+#   - pending_entries は board_missing 対策としてデフォルト保護。
+#   - EXIT完了銘柄は即時に固定枠から外さず、同期遅延対策で
+#     ACTIVE_EXIT_COOLDOWN_PROTECT_SEC 秒だけ保護。
+#   - クールダウン期限切れ後は自動で固定枠から外す。
+#   - 建玉 / pending / board retry / hot 候補は引き続き保護対象。
 # ============================================================
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import os
 from typing import Any, Set
@@ -33,6 +34,33 @@ def _env_bool(name: str, default: bool = True) -> bool:
         return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
     except Exception:
         return bool(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _now() -> dt.datetime:
+    return dt.datetime.now()
+
+
+def _to_dt(v: Any) -> dt.datetime | None:
+    try:
+        if isinstance(v, dt.datetime):
+            return v
+        if isinstance(v, (int, float)):
+            return dt.datetime.fromtimestamp(float(v))
+        if v:
+            return dt.datetime.fromisoformat(str(v).replace("T", " "))
+    except Exception:
+        return None
+    return None
 
 
 def _add_symbol(protected: Set[str], value: Any) -> None:
@@ -69,7 +97,6 @@ def _extract_symbol_from_item(item: Any) -> str:
 
 
 def _is_open_position_item(item: Any) -> bool:
-    """pending候補ではなく、建玉らしいものだけを true にする。"""
     try:
         if item is None:
             return False
@@ -128,7 +155,6 @@ def _load_db_open_positions_safe() -> dict[str, dict[str, Any]]:
 
 
 def _add_pending_if_enabled(protected: Set[str]) -> None:
-    # board_missing対策として、pending銘柄はデフォルトで保護する。
     if not _env_bool("ACTIVE_PROTECT_PENDING_SYMBOLS", True):
         try:
             pending = getattr(global_data, "pending_entries", None)
@@ -153,6 +179,56 @@ def _add_pending_if_enabled(protected: Set[str]) -> None:
         logger.debug("[ACTIVE PROTECTED] failed global_data.pending_entries", exc_info=True)
 
 
+def _add_expiring_map(protected: Set[str], attr: str, *, source: str) -> None:
+    try:
+        mp = getattr(global_data, attr, None)
+        if not isinstance(mp, dict):
+            return
+        now = _now()
+        expired = []
+        kept = []
+        for sym, until in list(mp.items()):
+            ns = normalize_symbol(sym)
+            if not ns:
+                expired.append(sym)
+                continue
+            until_dt = _to_dt(until)
+            if until_dt is None or until_dt <= now:
+                expired.append(sym)
+                continue
+            protected.add(ns)
+            kept.append(ns)
+        for sym in expired:
+            try:
+                mp.pop(sym, None)
+            except Exception:
+                pass
+        if kept:
+            logger.warning("[ACTIVE PROTECTED] %s protected count=%s symbols=%s", source, len(kept), sorted(set(kept)))
+        if expired:
+            logger.info("[ACTIVE PROTECTED] %s expired removed=%s", source, len(expired))
+    except Exception:
+        logger.debug("[ACTIVE PROTECTED] failed expiring map source=%s attr=%s", source, attr, exc_info=True)
+
+
+def _add_exit_cooldown_if_enabled(protected: Set[str]) -> None:
+    if not _env_bool("ACTIVE_PROTECT_EXIT_COOLDOWN_SYMBOLS", True):
+        return
+    # exit_recent_protect_marker_patch が設定する正式名。
+    _add_expiring_map(protected, "active_protected_exit_cooldown_until", source="exit_cooldown")
+    # 互換: 他パッチ/手動で使える候補名。
+    _add_expiring_map(protected, "recent_exit_protect_until", source="recent_exit")
+
+
+def _add_board_retry_and_hot_if_enabled(protected: Set[str]) -> None:
+    if _env_bool("ACTIVE_PROTECT_BOARD_RETRY_SYMBOLS", True):
+        _add_expiring_map(protected, "active_protected_board_retry_until", source="board_retry")
+        _add_expiring_map(protected, "board_missing_retry_until", source="board_retry_compat")
+    if _env_bool("ACTIVE_PROTECT_HOT_SYMBOLS", True):
+        _add_expiring_map(protected, "active_protected_hot_until", source="hot")
+        _add_expiring_map(protected, "early_breakout_hot_until", source="early_breakout_hot")
+
+
 def get_protected_symbols() -> Set[str]:
     protected: Set[str] = set()
 
@@ -173,6 +249,8 @@ def get_protected_symbols() -> Set[str]:
         logger.debug("[ACTIVE PROTECTED] failed global_data.open_positions", exc_info=True)
 
     _add_pending_if_enabled(protected)
+    _add_exit_cooldown_if_enabled(protected)
+    _add_board_retry_and_hot_if_enabled(protected)
 
     if protected:
         logger.warning("[ACTIVE PROTECTED] protected symbols count=%d symbols=%s", len(protected), sorted(protected))
