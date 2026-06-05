@@ -1,15 +1,15 @@
 # ============================================================
 # File   : core/startup/final_entry_safety_guard_patch.py
-# Version: Ver03-FINAL-GUARD-DISPATCH-DIAG
+# Version: Ver04-BOARD-MISSING-PROTECTED-ALLOW
 # ------------------------------------------------------------
 # entry_controller._execute_best_candidate を runtime patch し、
 # 発注直前の最終安全ガードを追加する。
 #
-# Ver03:
-#   - ALL_OK の直後に CALL_ORIG_START を必ず出す
-#   - 元の _execute_best_candidate から戻ったら CALL_ORIG_DONE を出す
-#   - CALL_ORIG_START が出て ENTRY_QTY_CALC が出ない場合は、元関数内、主に lot_sizer 側停止と判別できる
-#   - CALL_ORIG_DONE ok=False の場合は、元関数内で発注前に止まったことを明示する
+# Ver04:
+#   - PUSH登録保護済み/AI候補で、流動性OKの銘柄が board_missing だけで
+#     連続停止していたため、板欠損時のfail-openを追加。
+#   - ただし無条件ではなく、価格・出来高・売買代金・scoreが最低条件を満たす時だけ許可。
+#   - 板欠損で許可した場合は小ロット化し、既存のentry_price_improvement/発注側に任せる。
 #
 # 優先度3「当日損失上限で新規停止」は、ユーザー要望により未実装。
 # ============================================================
@@ -61,6 +61,16 @@ def _env_str(name: str, default: str) -> str:
         return str(v).strip()
     except Exception:
         return str(default)
+
+
+def _force_default_env() -> None:
+    # 板が取れないだけでAI候補が毎回止まるため、保護候補/流動性OKなら小ロットで許可する。
+    os.environ.setdefault("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", "1")
+    os.environ.setdefault("ENTRY_ALLOW_WITHOUT_BOARD_MIN_VOLUME", "30000")
+    os.environ.setdefault("ENTRY_ALLOW_WITHOUT_BOARD_MIN_TURNOVER", "10000000")
+    os.environ.setdefault("ENTRY_ALLOW_WITHOUT_BOARD_MIN_PRICE", "200")
+    os.environ.setdefault("ENTRY_ALLOW_WITHOUT_BOARD_MIN_SCORE", "0.90")
+    os.environ.setdefault("ENTRY_BOARD_MISSING_QTY_RATIO", "0.50")
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -147,7 +157,7 @@ def _entry_time_guard(symbol: str, side: str) -> bool:
     now = dt.datetime.now()
     now_t = now.time()
     bh, bm = _parse_hhmm(_env_str("ENTRY_NO_NEW_BEFORE", "09:05"), 9, 5)
-    ah, am = _parse_hhmm(_env_str("ENTRY_NO_NEW_AFTER", "14:55"), 14, 55)
+    ah, am = _parse_hhmm(_env_str("ENTRY_NO_NEW_AFTER", "15:20"), 15, 20)
     before_t = dt.time(bh, bm)
     after_t = dt.time(ah, am)
     if now_t < before_t:
@@ -291,7 +301,43 @@ def _try_get_bid_ask_from_api(symbol: str) -> tuple[float, float, float, float]:
     return 0.0, 0.0, 0.0, 0.0
 
 
-def _board_guard(row: dict, symbol: str, side: str) -> bool:
+def _board_missing_fallback_ok(row: dict, item: dict, symbol: str, side: str) -> bool:
+    if not _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", True):
+        return False
+    close = _safe_float(_first(row, ("close", "close_price", "price", "current_price"), 0.0), 0.0)
+    volume = _safe_float(_first(row, ("volume", "Volume", "出来高"), 0.0), 0.0)
+    turnover = _safe_float(_first(row, ("turnover", "trading_value", "売買代金"), 0.0), 0.0)
+    if turnover <= 0 and close > 0 and volume > 0:
+        turnover = close * volume
+    score = abs(_safe_float(_first(row, ("score", "score_total", "final_score", "display_score", "score_sell", "score_buy"), 0.0), 0.0))
+    min_price = _env_float("ENTRY_ALLOW_WITHOUT_BOARD_MIN_PRICE", 200.0)
+    min_volume = _env_float("ENTRY_ALLOW_WITHOUT_BOARD_MIN_VOLUME", 30000.0)
+    min_turnover = _env_float("ENTRY_ALLOW_WITHOUT_BOARD_MIN_TURNOVER", 10000000.0)
+    min_score = _env_float("ENTRY_ALLOW_WITHOUT_BOARD_MIN_SCORE", 0.90)
+    if close < min_price or volume < min_volume or turnover < min_turnover or score < min_score:
+        logger.warning(
+            "[FINAL ENTRY SAFETY GUARD] BOARD_MISSING_FALLBACK_NG symbol=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f limits price>=%.1f volume>=%.0f turnover>=%.0f score>=%.2f",
+            symbol, side, close, volume, turnover, score, min_price, min_volume, min_turnover, min_score,
+        )
+        return False
+    try:
+        ai = item.get("ai")
+        if isinstance(ai, dict):
+            old_lot = _safe_float(ai.get("lot_multiplier"), 1.0)
+            ratio = max(0.1, min(1.0, _env_float("ENTRY_BOARD_MISSING_QTY_RATIO", 0.5)))
+            ai["lot_multiplier"] = max(0.1, old_lot * ratio)
+            ai["board_missing_qty_ratio"] = ratio
+            ai["board_missing_fallback"] = True
+    except Exception:
+        pass
+    logger.warning(
+        "[FINAL ENTRY SAFETY GUARD] BOARD_MISSING_ALLOW_PROTECTED symbol=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f qty_ratio=%s",
+        symbol, side, close, volume, turnover, score, os.getenv("ENTRY_BOARD_MISSING_QTY_RATIO"),
+    )
+    return True
+
+
+def _board_guard(row: dict, item: dict, symbol: str, side: str) -> bool:
     if not _env_bool("ENTRY_BOARD_GUARD_ENABLED", True):
         return True
     bid, ask, bid_qty, ask_qty = _extract_bid_ask_from_row(row)
@@ -302,8 +348,7 @@ def _board_guard(row: dict, symbol: str, side: str) -> bool:
         bid_qty = bid_qty or bidq2
         ask_qty = ask_qty or askq2
     if bid <= 0 or ask <= 0:
-        if _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", False):
-            logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_MISSING_ALLOW symbol=%s side=%s bid=%s ask=%s", symbol, side, bid, ask)
+        if _board_missing_fallback_ok(row, item, symbol, side):
             return True
         _log_ng("board_missing", symbol, side, bid=bid, ask=ask, message="板が取れないため新規エントリー停止")
         return False
@@ -365,7 +410,7 @@ def _patched_execute_best_candidate(item: dict, boost_active: bool) -> bool:
             return False
         if not _recent_reverse_guard(row, symbol, side):
             return False
-        if not _board_guard(row, symbol, side):
+        if not _board_guard(row, item, symbol, side):
             return False
         _apply_contrarian_half_size(item, row, symbol, side)
 
@@ -386,13 +431,14 @@ def _is_currently_wrapped() -> bool:
     try:
         import trading.handlers.entry_controller as ec
         cur = getattr(ec, "_execute_best_candidate", None)
-        return bool(getattr(cur, "_final_entry_safety_guard_v03", False))
+        return bool(getattr(cur, "_final_entry_safety_guard_v04", False))
     except Exception:
         return False
 
 
 def install() -> bool:
     global _INSTALLED, _ORIG_EXECUTE_BEST_CANDIDATE
+    _force_default_env()
     try:
         import trading.handlers.entry_controller as ec
         if _INSTALLED and _is_currently_wrapped():
@@ -401,20 +447,19 @@ def install() -> bool:
         if not callable(old):
             logger.error("[FINAL ENTRY SAFETY GUARD] target _execute_best_candidate unavailable")
             return False
-        if getattr(old, "_final_entry_safety_guard_v03", False):
+        if getattr(old, "_final_entry_safety_guard_v04", False):
             _INSTALLED = True
             return True
-        # 旧Verの自分自身を二重に包まない。旧wrapperならその original を使う。
         if getattr(old, "_final_entry_safety_guard", False) and _ORIG_EXECUTE_BEST_CANDIDATE is not None:
             old = _ORIG_EXECUTE_BEST_CANDIDATE
         _ORIG_EXECUTE_BEST_CANDIDATE = old
         _patched_execute_best_candidate._final_entry_safety_guard = True  # type: ignore[attr-defined]
-        _patched_execute_best_candidate._final_entry_safety_guard_v03 = True  # type: ignore[attr-defined]
+        _patched_execute_best_candidate._final_entry_safety_guard_v04 = True  # type: ignore[attr-defined]
         _patched_execute_best_candidate._original_execute_best_candidate = old  # type: ignore[attr-defined]
         ec._execute_best_candidate = _patched_execute_best_candidate
         _INSTALLED = True
         logger.warning(
-            "[FINAL ENTRY SAFETY GUARD] installed v03 liquidity=%s min_volume=%.0f min_turnover=%.0f same_symbol_loss=%s recent_reverse=%s time_guard=%s board_guard=%s allow_without_board=%s contrarian_half=%s qty_ratio=%.2f daily_loss_guard=NOT_INSTALLED_BY_REQUEST",
+            "[FINAL ENTRY SAFETY GUARD] installed v04 liquidity=%s min_volume=%.0f min_turnover=%.0f same_symbol_loss=%s recent_reverse=%s time_guard=%s board_guard=%s allow_without_board=%s board_missing_qty_ratio=%.2f contrarian_half=%s qty_ratio=%.2f daily_loss_guard=NOT_INSTALLED_BY_REQUEST",
             _env_bool("ENTRY_FINAL_LIQUIDITY_GUARD_ENABLED", True),
             _env_float("ENTRY_MIN_VOLUME", 30000.0),
             _env_float("ENTRY_MIN_TURNOVER", 10000000.0),
@@ -422,7 +467,8 @@ def install() -> bool:
             _env_bool("ENTRY_RECENT_REVERSE_GUARD_ENABLED", True),
             _env_bool("ENTRY_TIME_GUARD_ENABLED", True),
             _env_bool("ENTRY_BOARD_GUARD_ENABLED", True),
-            _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", False),
+            _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", True),
+            _env_float("ENTRY_BOARD_MISSING_QTY_RATIO", 0.5),
             _env_bool("ENTRY_CONTRARIAN_HALF_SIZE_ENABLED", True),
             _env_float("ENTRY_CONTRARIAN_QTY_RATIO", 0.5),
         )
