@@ -44,6 +44,15 @@ _env_default("ACTIVE_EXIT_COOLDOWN_PROTECT_SEC", "60")
 _env_default("ACTIVE_PROTECT_BOARD_RETRY_SYMBOLS", "1")
 _env_default("ACTIVE_PROTECT_HOT_SYMBOLS", "1")
 
+# 板欠損だけで新規を完全停止しない。後段patchで価格/出来高/売買代金/scoreを確認し、小ロット化する。
+os.environ["ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"] = "1"
+os.environ["ENTRY_BOARD_MISSING_HARD_BLOCK"] = "0"
+_env_default("ENTRY_ALLOW_WITHOUT_BOARD_MIN_VOLUME", "30000")
+_env_default("ENTRY_ALLOW_WITHOUT_BOARD_MIN_TURNOVER", "10000000")
+_env_default("ENTRY_ALLOW_WITHOUT_BOARD_MIN_PRICE", "200")
+_env_default("ENTRY_ALLOW_WITHOUT_BOARD_MIN_SCORE", "0.90")
+_env_default("ENTRY_BOARD_MISSING_QTY_RATIO", "0.50")
+
 # 押し目買い/戻り売りエントリー。
 _env_default("PULLBACK_ENTRY_ENABLED", "1")
 _env_default("PULLBACK_ENTRY_MAX_CANDIDATES", "5")
@@ -56,7 +65,7 @@ _env_default("PULLBACK_ENTRY_MIN_VOLUME", "30000")
 _env_default("PULLBACK_ENTRY_MIN_TURNOVER", "10000000")
 
 logger.warning(
-    "[USERCUSTOMIZE] runtime defaults applied summary_ai_daily_risk=%s liq_run_in_main=%s liq_fail_open=%s liq_min_turnover=%s final_liq_min_turnover=%s protect_pending=%s exit_cooldown=%s pullback=%s",
+    "[USERCUSTOMIZE] runtime defaults applied summary_ai_daily_risk=%s liq_run_in_main=%s liq_fail_open=%s liq_min_turnover=%s final_liq_min_turnover=%s protect_pending=%s exit_cooldown=%s board_allow=%s board_hard=%s pullback=%s",
     os.getenv("SUMMARY_AI_PRE_FILTER_DAILY_RISK"),
     os.getenv("WATCHLIST_RECENT_LIQ_BULK_RUN_IN_MAIN"),
     os.getenv("WATCHLIST_RECENT_LIQ_FAIL_OPEN_ON_TIMEOUT"),
@@ -64,6 +73,8 @@ logger.warning(
     os.getenv("FINAL_ENTRY_TONOSAMA_MIN_TURNOVER"),
     os.getenv("ACTIVE_PROTECT_PENDING_SYMBOLS"),
     os.getenv("ACTIVE_EXIT_COOLDOWN_PROTECT_SEC"),
+    os.getenv("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"),
+    os.getenv("ENTRY_BOARD_MISSING_HARD_BLOCK"),
     os.getenv("PULLBACK_ENTRY_ENABLED"),
 )
 
@@ -149,3 +160,4 @@ else:
     _install("RANKING_ENTRY_INTRADAY_CAP", "core.startup.ranking_entry_intraday_cap_patch")
     _install("SUMMARY_AI_NO_DIRECT_SYNC", "core.startup.summary_ai_no_direct_sync_patch")
     _install("RANKING_ENTRY_MARKET_HOURS_SKIP", "core.startup.ranking_entry_market_hours_skip_patch")
+    _install("BOARD_MISSING_PROTECTED_ALLOW", "core.startup.board_missing_protected_allow_patch")
