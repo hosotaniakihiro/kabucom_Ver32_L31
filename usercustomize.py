@@ -4,6 +4,58 @@ import os
 import sys
 logger = logging.getLogger(__name__)
 
+
+def _env_default(name: str, value: str) -> None:
+    try:
+        if os.getenv(name) is None or str(os.getenv(name)).strip() == "":
+            os.environ[name] = str(value)
+    except Exception:
+        pass
+
+
+# ============================================================
+# Runtime defaults from 2026-06-05 log diagnosis
+# ------------------------------------------------------------
+# 1) SUMMARY-AI candidates were canceled by
+#    reason=SYMBOL_STOP_AFTER_FIRST_LOSS even though the daily stop guard
+#    is not desired for current operation.
+# 2) Recent liquidity DB read was HARD-SKIPPED in main.py and the system
+#    fail-opened 100 symbols, allowing low-liquidity symbols into PUSH
+#    rotation / entry candidates.
+#
+# Keep these as defaults only: an explicit environment variable set by a
+# launcher still wins.
+# ============================================================
+_env_default("SUMMARY_AI_PRE_FILTER_DAILY_RISK", "0")
+_env_default("SUMMARY_AI_DISABLE_SYMBOL_STOP_AFTER_FIRST_LOSS", "1")
+_env_default("DAILY_RISK_SYMBOL_STOP_AFTER_FIRST_LOSS", "0")
+_env_default("DAILY_RISK_STOP_AFTER_FIRST_LOSS", "0")
+_env_default("SYMBOL_STOP_AFTER_FIRST_LOSS_ENABLED", "0")
+
+_env_default("WATCHLIST_RECENT_LIQ_ENABLED", "1")
+_env_default("WATCHLIST_RECENT_LIQ_BULK_RUN_IN_MAIN", "1")
+_env_default("WATCHLIST_RECENT_LIQ_BULK_SKIP_DB_IN_MAIN", "0")
+_env_default("WATCHLIST_RECENT_LIQ_FAIL_OPEN_ON_TIMEOUT", "0")
+_env_default("WATCHLIST_RECENT_LIQ_BULK_TIMEOUT_SEC", "0.75")
+_env_default("WATCHLIST_RECENT_LIQ_BULK_SQL_HARD_TIMEOUT_SEC", "1.0")
+_env_default("WATCHLIST_RECENT_LIQ_MIN_LATEST_VOLUME", "3000")
+_env_default("WATCHLIST_RECENT_LIQ_MIN_AVG_VOLUME", "3000")
+_env_default("WATCHLIST_RECENT_LIQ_MIN_TURNOVER_YEN", "1000000")
+
+_env_default("FINAL_ENTRY_TONOSAMA_LIQUIDITY_FALLBACK", "1")
+_env_default("FINAL_ENTRY_TONOSAMA_MIN_VOLUME", "30000")
+_env_default("FINAL_ENTRY_TONOSAMA_MIN_TURNOVER", "10000000")
+
+logger.warning(
+    "[USERCUSTOMIZE] runtime defaults applied summary_ai_daily_risk=%s liq_run_in_main=%s liq_fail_open=%s liq_min_turnover=%s final_liq_min_turnover=%s",
+    os.getenv("SUMMARY_AI_PRE_FILTER_DAILY_RISK"),
+    os.getenv("WATCHLIST_RECENT_LIQ_BULK_RUN_IN_MAIN"),
+    os.getenv("WATCHLIST_RECENT_LIQ_FAIL_OPEN_ON_TIMEOUT"),
+    os.getenv("WATCHLIST_RECENT_LIQ_MIN_TURNOVER_YEN"),
+    os.getenv("FINAL_ENTRY_TONOSAMA_MIN_TURNOVER"),
+)
+
+
 def _install(label: str, module_name: str) -> None:
     try:
         mod = __import__(module_name, fromlist=["install"])
@@ -12,6 +64,7 @@ def _install(label: str, module_name: str) -> None:
         logger.warning("[USERCUSTOMIZE] %s auto install ok=%s", label, ok)
     except Exception:
         logger.exception("[USERCUSTOMIZE] %s auto install failed", label)
+
 
 def _is_database_collector_context() -> bool:
     try:
@@ -37,6 +90,7 @@ def _is_database_collector_context() -> bool:
     except Exception:
         pass
     return False
+
 
 _install("PUSH_RECONNECT_STABILITY", "core.startup.push_stream_reconnect_stability_patch")
 _install("PUSH_MAIN_OWNER_POLICY", "core.startup.push_main_owner_lock_policy_patch")
