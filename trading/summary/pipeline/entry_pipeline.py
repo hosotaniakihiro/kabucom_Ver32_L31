@@ -1,11 +1,13 @@
 # ============================================================
 # File   : trading/summary/pipeline/entry_pipeline.py
-# Version: Ver2.8-SUMMARY-AI-LIQUIDITY-RESCUE
+# Version: Ver2.9-STRICT-SUMMARY-LIQUIDITY
 # ------------------------------------------------------------
 # ✔ AI approved rows → entry execution
 # ✔ SUMMARY AI通常エントリーとイナゴ liquidity_shock 条件を分離
 # ✔ SUMMARY liquidity の min_score を BUY / SELL で分離
 # ✔ Ver2.8: Summary AI承認済み候補が liquidity だけで全落ちする問題を救済
+# ✔ Ver2.9: 低流動性銘柄へのエントリーを防ぐため、rescueでも
+#            出来高3万株・売買代金1000万円を必須化
 # ============================================================
 
 from __future__ import annotations
@@ -308,18 +310,18 @@ def _summary_ai_liquidity_rescue(row: dict, *, symbol: str, side: str, close: fl
     min_score = _env_float("SUMMARY_AI_RESCUE_MIN_SCORE", 1.0)
     min_range = _env_float("SUMMARY_AI_RESCUE_MIN_RANGE_PCT", 1.5)
     min_mtf = _env_float("SUMMARY_AI_RESCUE_MIN_MTF", 5.0)
-    min_volume = _env_float("SUMMARY_AI_RESCUE_MIN_VOLUME", 0.0)
-    min_turnover = _env_float("SUMMARY_AI_RESCUE_MIN_TURNOVER", 0.0)
+    min_volume = _env_float("SUMMARY_AI_RESCUE_MIN_VOLUME", _env_float("ENTRY_STRICT_MIN_VOLUME", 30000.0))
+    min_turnover = _env_float("SUMMARY_AI_RESCUE_MIN_TURNOVER", _env_float("ENTRY_STRICT_MIN_TURNOVER", 10_000_000.0))
     ok = close >= min_price and effective_score >= min_score and range_pct >= min_range and mtf >= min_mtf and volume >= min_volume and turnover >= min_turnover
     if ok:
         logger.warning(
-            "[entry_pipeline] SUMMARY AI liquidity rescue allow symbol=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f range=%.3f mtf=%.3f slope_abs=%.6f",
-            symbol, side, close, volume, turnover, effective_score, range_pct, mtf, slope_abs,
+            "[entry_pipeline] SUMMARY AI liquidity rescue allow symbol=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f range=%.3f mtf=%.3f slope_abs=%.6f min_volume=%.0f min_turnover=%.0f",
+            symbol, side, close, volume, turnover, effective_score, range_pct, mtf, slope_abs, min_volume, min_turnover,
         )
         return True
     logger.info(
-        "[entry_pipeline] SUMMARY AI liquidity rescue no symbol=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f range=%.3f mtf=%.3f need_price=%.1f need_score=%.2f need_range=%.2f need_mtf=%.2f",
-        symbol, side, close, volume, turnover, effective_score, range_pct, mtf, min_price, min_score, min_range, min_mtf,
+        "[entry_pipeline] SUMMARY AI liquidity rescue no symbol=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f range=%.3f mtf=%.3f need_price=%.1f need_score=%.2f need_range=%.2f need_mtf=%.2f need_volume=%.0f need_turnover=%.0f",
+        symbol, side, close, volume, turnover, effective_score, range_pct, mtf, min_price, min_score, min_range, min_mtf, min_volume, min_turnover,
     )
     return False
 
@@ -337,12 +339,12 @@ def _allow_summary_ai_liquidity(row: dict, *, symbol: str, interval: int) -> boo
     effective_score = max(score, buy_score, sell_score)
     side = _resolve_side(row, buy_score=buy_score, sell_score=sell_score, raw_score=raw_score)
     min_price = _env_float("SUMMARY_ENTRY_MIN_PRICE", _env_float("ENTRY_MIN_PRICE", 200.0))
-    min_volume = _env_float("SUMMARY_ENTRY_MIN_VOLUME", _env_float("ENTRY_MIN_VOLUME", 3000.0))
-    min_turnover = _env_float("SUMMARY_ENTRY_MIN_TURNOVER", _env_float("ENTRY_MIN_TURNOVER", 3_000_000.0))
+    min_volume = _env_float("SUMMARY_ENTRY_MIN_VOLUME", _env_float("ENTRY_MIN_VOLUME", _env_float("ENTRY_STRICT_MIN_VOLUME", 30000.0)))
+    min_turnover = _env_float("SUMMARY_ENTRY_MIN_TURNOVER", _env_float("ENTRY_MIN_TURNOVER", _env_float("ENTRY_STRICT_MIN_TURNOVER", 10_000_000.0)))
     min_score = _resolve_summary_liquidity_min_score(row, side=side)
     ok = close > min_price and volume >= min_volume and turnover >= min_turnover and effective_score >= min_score
     if ok:
-        logger.info("[entry_pipeline] summary liquidity allow symbol=%s interval=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f min_score=%.2f", symbol, interval, side, close, volume, turnover, effective_score, min_score)
+        logger.info("[entry_pipeline] summary liquidity allow symbol=%s interval=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f min_score=%.2f min_volume=%.0f min_turnover=%.0f", symbol, interval, side, close, volume, turnover, effective_score, min_score, min_volume, min_turnover)
         return True
     if _summary_ai_liquidity_rescue(row, symbol=symbol, side=side, close=close, volume=volume, turnover=turnover, effective_score=effective_score):
         return True
