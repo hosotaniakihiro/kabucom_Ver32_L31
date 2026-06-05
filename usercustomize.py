@@ -15,16 +15,6 @@ def _env_default(name: str, value: str) -> None:
 
 # ============================================================
 # Runtime defaults from 2026-06-05 log diagnosis
-# ------------------------------------------------------------
-# 1) SUMMARY-AI candidates were canceled by
-#    reason=SYMBOL_STOP_AFTER_FIRST_LOSS even though the daily stop guard
-#    is not desired for current operation.
-# 2) Recent liquidity DB read was HARD-SKIPPED in main.py and the system
-#    fail-opened 100 symbols, allowing low-liquidity symbols into PUSH
-#    rotation / entry candidates.
-#
-# Keep these as defaults only: an explicit environment variable set by a
-# launcher still wins.
 # ============================================================
 _env_default("SUMMARY_AI_PRE_FILTER_DAILY_RISK", "0")
 _env_default("SUMMARY_AI_DISABLE_SYMBOL_STOP_AFTER_FIRST_LOSS", "1")
@@ -46,13 +36,23 @@ _env_default("FINAL_ENTRY_TONOSAMA_LIQUIDITY_FALLBACK", "1")
 _env_default("FINAL_ENTRY_TONOSAMA_MIN_VOLUME", "30000")
 _env_default("FINAL_ENTRY_TONOSAMA_MIN_TURNOVER", "10000000")
 
+# PUSH 50枠の固定保護ルール。
+# pending は board_missing 対策で保護、EXIT後は60秒だけ残して自動解除。
+_env_default("ACTIVE_PROTECT_PENDING_SYMBOLS", "1")
+_env_default("ACTIVE_PROTECT_EXIT_COOLDOWN_SYMBOLS", "1")
+_env_default("ACTIVE_EXIT_COOLDOWN_PROTECT_SEC", "60")
+_env_default("ACTIVE_PROTECT_BOARD_RETRY_SYMBOLS", "1")
+_env_default("ACTIVE_PROTECT_HOT_SYMBOLS", "1")
+
 logger.warning(
-    "[USERCUSTOMIZE] runtime defaults applied summary_ai_daily_risk=%s liq_run_in_main=%s liq_fail_open=%s liq_min_turnover=%s final_liq_min_turnover=%s",
+    "[USERCUSTOMIZE] runtime defaults applied summary_ai_daily_risk=%s liq_run_in_main=%s liq_fail_open=%s liq_min_turnover=%s final_liq_min_turnover=%s protect_pending=%s exit_cooldown=%s",
     os.getenv("SUMMARY_AI_PRE_FILTER_DAILY_RISK"),
     os.getenv("WATCHLIST_RECENT_LIQ_BULK_RUN_IN_MAIN"),
     os.getenv("WATCHLIST_RECENT_LIQ_FAIL_OPEN_ON_TIMEOUT"),
     os.getenv("WATCHLIST_RECENT_LIQ_MIN_TURNOVER_YEN"),
     os.getenv("FINAL_ENTRY_TONOSAMA_MIN_TURNOVER"),
+    os.getenv("ACTIVE_PROTECT_PENDING_SYMBOLS"),
+    os.getenv("ACTIVE_EXIT_COOLDOWN_PROTECT_SEC"),
 )
 
 
@@ -107,6 +107,7 @@ else:
     _install("REENTRY_STALE_429_EXIT_SAFETY", "core.startup.entry_reentry_stale_429_exit_safety_patch")
     _install("EXIT_TUNING_DEFAULTS", "core.startup.exit_tuning_defaults_patch")
     _install("EXIT_NOISE_CONFIRM_GUARD", "core.startup.exit_noise_confirm_guard_patch")
+    _install("EXIT_RECENT_PROTECT_MARKER", "core.startup.exit_recent_protect_marker_patch")
     _install("EXIT_EXECUTOR_BROKER_V2", "core.startup.exit_executor_broker_fallback_v2_patch")
     _install("EXIT_DB_STALE_GUARD", "core.startup.exit_db_stale_position_guard_patch")
     _install("EXIT_LOOP_TIMEOUT_GUARD", "core.startup.exit_loop_timeout_guard_patch")
