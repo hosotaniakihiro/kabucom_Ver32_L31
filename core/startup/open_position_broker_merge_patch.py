@@ -1,22 +1,23 @@
 # ============================================================
 # File   : core/startup/open_position_broker_merge_patch.py
-# Version: V1.6-BROKER-EMPTY-SUSPICIOUS-DB-FALLBACK
+# Version: V1.7-BROKER-AUTHORITATIVE-CLOSE-STALE-DB
 # ------------------------------------------------------------
 # broker reader の信用実建玉を authoritative source として
 # global_data.open_positions / protected / EXIT監視へ渡す runtime patch。
 #
-# V1.6:
-#   - broker API が read_ok=True でも、raw/credit_candidates があり、
-#     全件 skipped_qty/skipped_price の場合は「正しい空」と見なさない。
-#   - DB信用建玉がある場合は DB fallback する。
-#   - DB信用建玉が無くても既存 global_data.open_positions がある場合は、
-#     すぐ消さず一時保持する。
-#   - これにより credit_open=0 skipped_qty=15 のような quantity parse 疑いで
-#     EXIT監視対象を消してしまう問題を防ぐ。
+# V1.7:
+#   - 株ステーションを正とする。
+#   - broker read_ok=True かつ broker信用建玉0件なら、positions.db の古いOPEN残骸を
+#     global_data/GCへ戻さない。
+#   - さらに DB側の stale OPEN/PENDING 行を CLOSED 扱いへ更新する。
+#   - 9716 のような「実際は未保有だがDBにOPENが残る」銘柄を
+#     protected / EXIT対象に戻さない。
 #
 # ENV:
-#   OPEN_POSITION_ALLOW_DB_FALLBACK_ON_PARSE_SUSPICIOUS=1  # default in V1.6
-#   OPEN_POSITION_KEEP_EXISTING_ON_PARSE_SUSPICIOUS=1      # default in V1.6
+#   OPEN_POSITION_BROKER_AUTHORITATIVE=1              # default
+#   OPEN_POSITION_CLOSE_STALE_DB_WHEN_BROKER_EMPTY=1 # default
+#   OPEN_POSITION_ALLOW_DB_FALLBACK_ON_PARSE_SUSPICIOUS=0 # default
+#   OPEN_POSITION_KEEP_EXISTING_ON_PARSE_SUSPICIOUS=0      # default
 # ============================================================
 
 from __future__ import annotations
@@ -31,6 +32,10 @@ logger = logging.getLogger(__name__)
 _INSTALLED = False
 _ORIGINAL_SYNC = None
 
+CLOSED_STATUSES = {
+    "CLOSED", "CLOSE", "EXITED", "EXIT", "DONE", "CANCELED", "CANCELLED", "REJECTED", "FAILED"
+}
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     try:
@@ -38,9 +43,9 @@ def _env_bool(name: str, default: bool = False) -> bool:
         if v is None or str(v).strip() == "":
             return bool(default)
         s = str(v).strip().lower()
-        if s in {"1", "true", "yes", "y", "on", "ok"}:
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
             return True
-        if s in {"0", "false", "no", "n", "off", "ng"}:
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
             return False
         return bool(default)
     except Exception:
@@ -191,10 +196,80 @@ def _clear_open_positions_dict(gd_positions: Dict[str, Dict[str, Any]]) -> None:
     for k in list(gd_positions.keys()):
         try:
             src = str((gd_positions.get(k) or {}).get("_position_source") or "")
-            if (not src) or src.startswith("DB.positions") or src.startswith("KABU.positions") or src.startswith("BROKER"):
+            if (not src) or src.startswith("DB.positions") or src.startswith("KABU.positions") or src.startswith("BROKER") or src.startswith("EXISTING"):
                 gd_positions.pop(k, None)
         except Exception:
             pass
+
+
+def _close_stale_db_positions(*, stale_symbols: set[str], reason: str) -> int:
+    if not stale_symbols:
+        return 0
+    if not _env_bool("OPEN_POSITION_CLOSE_STALE_DB_WHEN_BROKER_EMPTY", True):
+        return 0
+    try:
+        from database import Session_position
+        from database.models import Position
+    except Exception:
+        logger.exception("[OPEN POSITION BROKER PATCH] stale DB close import failed")
+        return 0
+
+    session = None
+    changed = 0
+    now = dt.datetime.now()
+    try:
+        session = Session_position()
+        rows = session.query(Position).all()
+        for p in rows or []:
+            s = _normalize_symbol(getattr(p, "symbol", ""))
+            if not s or s not in stale_symbols:
+                continue
+            st = _text(getattr(p, "status", "OPEN")).upper()
+            if st in CLOSED_STATUSES:
+                continue
+            try:
+                setattr(p, "status", "CLOSED")
+            except Exception:
+                pass
+            for attr, value in (
+                ("exit_reason", reason),
+                ("close_reason", reason),
+                ("updated_at", now),
+                ("exit_time", now),
+                ("closed_time", now),
+                ("close_time", now),
+            ):
+                try:
+                    if hasattr(p, attr):
+                        setattr(p, attr, value)
+                except Exception:
+                    pass
+            changed += 1
+        if changed:
+            session.commit()
+            logger.warning(
+                "[OPEN POSITION BROKER PATCH] closed stale DB positions by broker sync count=%d symbols=%s reason=%s",
+                changed,
+                sorted(stale_symbols),
+                reason,
+            )
+        else:
+            session.rollback()
+    except Exception:
+        try:
+            if session is not None:
+                session.rollback()
+        except Exception:
+            pass
+        logger.exception("[OPEN POSITION BROKER PATCH] close stale DB positions failed symbols=%s", sorted(stale_symbols))
+        return 0
+    finally:
+        try:
+            if session is not None:
+                session.close()
+        except Exception:
+            pass
+    return changed
 
 
 def _merge_and_publish(db_positions: Dict[str, Dict[str, Any]], broker_positions: Dict[str, Dict[str, Any]], *, broker_read_ok: bool, broker_status: dict | None = None) -> Dict[str, Dict[str, Any]]:
@@ -203,13 +278,27 @@ def _merge_and_publish(db_positions: Dict[str, Dict[str, Any]], broker_positions
     broker_status = broker_status or {}
     parse_suspicious = _broker_parse_suspicious(broker_positions=broker_positions, broker_read_ok=broker_read_ok, broker_status=broker_status)
 
-    allow_parse_suspicious_db_fallback = _env_bool("OPEN_POSITION_ALLOW_DB_FALLBACK_ON_PARSE_SUSPICIOUS", True)
-    keep_existing_on_parse_suspicious = _env_bool("OPEN_POSITION_KEEP_EXISTING_ON_PARSE_SUSPICIOUS", True)
+    broker_authoritative = _env_bool("OPEN_POSITION_BROKER_AUTHORITATIVE", True)
+    allow_parse_suspicious_db_fallback = _env_bool("OPEN_POSITION_ALLOW_DB_FALLBACK_ON_PARSE_SUSPICIOUS", False)
+    keep_existing_on_parse_suspicious = _env_bool("OPEN_POSITION_KEEP_EXISTING_ON_PARSE_SUSPICIOUS", False)
 
-    if broker_read_ok:
+    stale_symbols: set[str] = set()
+
+    if broker_read_ok and broker_authoritative:
         if broker_positions:
             merged = dict(broker_positions)
             source_mode = "broker_credit_authoritative"
+            stale_symbols = set(db_credit.keys()) - set(broker_positions.keys())
+        else:
+            # 株ステーションが読めていて信用建玉0件なら、DB/既存を正に戻さない。
+            merged = {}
+            source_mode = "broker_credit_authoritative_empty_parse_suspicious_cleared" if parse_suspicious else "broker_credit_authoritative_empty_ok"
+            stale_symbols = set(db_credit.keys()) | set(existing_credit.keys())
+    elif broker_read_ok:
+        if broker_positions:
+            merged = dict(broker_positions)
+            source_mode = "broker_credit_authoritative"
+            stale_symbols = set(db_credit.keys()) - set(broker_positions.keys())
         elif parse_suspicious and allow_parse_suspicious_db_fallback and db_credit:
             merged = dict(db_credit)
             source_mode = "db_credit_fallback_broker_parse_suspicious"
@@ -219,9 +308,13 @@ def _merge_and_publish(db_positions: Dict[str, Dict[str, Any]], broker_positions
         else:
             merged = {}
             source_mode = "broker_credit_authoritative_empty_parse_suspicious_no_fallback" if parse_suspicious else "broker_credit_authoritative_empty_ok"
+            stale_symbols = set(db_credit.keys()) | set(existing_credit.keys())
     else:
         merged = dict(db_credit or existing_credit)
         source_mode = "db_credit_fallback_broker_read_failed"
+
+    if stale_symbols and broker_read_ok:
+        _close_stale_db_positions(stale_symbols=stale_symbols, reason=f"BROKER_SYNC_NO_POSITION:{source_mode}")
 
     gd_positions = _ensure_open_positions()
     before_keys = {_normalize_symbol(k) for k in gd_positions.keys()}
@@ -251,15 +344,17 @@ def _merge_and_publish(db_positions: Dict[str, Dict[str, Any]], broker_positions
         global_data.open_positions_broker_status = broker_status
         global_data.open_positions_db_fallback_on_parse_suspicious = bool(allow_parse_suspicious_db_fallback)
         global_data.open_positions_keep_existing_on_parse_suspicious = bool(keep_existing_on_parse_suspicious)
+        global_data.open_positions_broker_authoritative = bool(broker_authoritative)
+        global_data.open_positions_stale_db_symbols_closed = sorted(stale_symbols)
     except Exception:
         pass
 
     changed = before_keys != merged_keys
     logger.warning(
-        "[OPEN POSITION BROKER PATCH] merged credit open positions count=%d changed=%s mode=%s broker_read_ok=%s parse_suspicious=%s db_fallback_on_parse_suspicious=%s keep_existing_on_parse_suspicious=%s broker_status=%s db_count=%d db_credit=%d existing_credit=%d broker_count=%d symbols=%s",
+        "[OPEN POSITION BROKER PATCH] merged credit open positions count=%d changed=%s mode=%s broker_read_ok=%s parse_suspicious=%s broker_authoritative=%s db_fallback_on_parse_suspicious=%s keep_existing_on_parse_suspicious=%s stale_closed=%s broker_status=%s db_count=%d db_credit=%d existing_credit=%d broker_count=%d symbols=%s",
         len(merged), changed, source_mode, broker_read_ok, parse_suspicious,
-        allow_parse_suspicious_db_fallback, keep_existing_on_parse_suspicious,
-        broker_status, len(db_positions or {}), len(db_credit), len(existing_credit), len(broker_positions or {}), sorted(merged.keys()),
+        broker_authoritative, allow_parse_suspicious_db_fallback, keep_existing_on_parse_suspicious,
+        sorted(stale_symbols), broker_status, len(db_positions or {}), len(db_credit), len(existing_credit), len(broker_positions or {}), sorted(merged.keys()),
     )
     return merged
 
@@ -294,12 +389,18 @@ def install() -> bool:
     except Exception:
         pass
 
-    os.environ.setdefault("OPEN_POSITION_ALLOW_DB_FALLBACK_ON_PARSE_SUSPICIOUS", "1")
-    os.environ.setdefault("OPEN_POSITION_KEEP_EXISTING_ON_PARSE_SUSPICIOUS", "1")
+    os.environ.setdefault("OPEN_POSITION_BROKER_AUTHORITATIVE", "1")
+    os.environ.setdefault("OPEN_POSITION_CLOSE_STALE_DB_WHEN_BROKER_EMPTY", "1")
+    os.environ.setdefault("OPEN_POSITION_ALLOW_DB_FALLBACK_ON_PARSE_SUSPICIOUS", "0")
+    os.environ.setdefault("OPEN_POSITION_KEEP_EXISTING_ON_PARSE_SUSPICIOUS", "0")
 
     _INSTALLED = True
     logger.warning(
-        "[OPEN POSITION BROKER PATCH] installed v1.6 broker_credit_authoritative=True parse_suspicious_db_fallback_default=True keep_existing_default=True no_cash_exit=True"
+        "[OPEN POSITION BROKER PATCH] installed v1.7 broker_authoritative=%s close_stale_db=%s parse_suspicious_db_fallback=%s keep_existing=%s no_cash_exit=True",
+        os.environ.get("OPEN_POSITION_BROKER_AUTHORITATIVE"),
+        os.environ.get("OPEN_POSITION_CLOSE_STALE_DB_WHEN_BROKER_EMPTY"),
+        os.environ.get("OPEN_POSITION_ALLOW_DB_FALLBACK_ON_PARSE_SUSPICIOUS"),
+        os.environ.get("OPEN_POSITION_KEEP_EXISTING_ON_PARSE_SUSPICIOUS"),
     )
     return True
 
