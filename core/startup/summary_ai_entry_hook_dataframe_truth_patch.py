@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/summary_ai_entry_hook_dataframe_truth_patch.py
-# Version: V1.1-FINAL-BOARD-GUARD-COMPAT
+# Version: V1.2-FINAL-BOARD-AND-RANKING-PRECHECK-COMPAT
 # ------------------------------------------------------------
 # 【目的】
 #   scheduler_jobs.summary.summary_ai_entry_hook_v20.run_summary_ai_entry_safe で
@@ -14,6 +14,11 @@
 #     3引数版へ差し替わっても、4引数呼び出しで TypeError にならない
 #     互換ラッパーを追加する。
 #   - エントリー直前の板ガードで落ちて候補実行が止まる問題を防止する。
+#
+# V1.2:
+#   - RANKING pending が既にある場合、古い ranking_snapshot_1min だけで
+#     entry_controller が止まらないよう ranking_precheck_pending_failopen_patch も
+#     起動時に同時installする。
 # ============================================================
 
 from __future__ import annotations
@@ -178,13 +183,26 @@ def _install_final_entry_board_guard_compat() -> bool:
         return False
 
 
+def _install_ranking_precheck_pending_failopen() -> bool:
+    try:
+        import core.startup.ranking_precheck_pending_failopen_patch as patch
+        fn = getattr(patch, "install", None)
+        ok = bool(fn()) if callable(fn) else False
+        logger.warning("[SUMMARY AI HOOK DF TRUTH PATCH] ranking precheck pending failopen installed=%s", ok)
+        return ok
+    except Exception:
+        logger.exception("[SUMMARY AI HOOK DF TRUTH PATCH] ranking precheck pending failopen install failed")
+        return False
+
+
 def install() -> bool:
     global _PATCHED, _ORIGINAL_RESULT_TO_DICT
 
     ok_board = _install_final_entry_board_guard_compat()
+    ok_rank_precheck = _install_ranking_precheck_pending_failopen()
 
     if _PATCHED:
-        return True and ok_board
+        return True and ok_board and ok_rank_precheck
 
     try:
         import scheduler_jobs.summary.summary_ai_entry_hook_v20 as target
@@ -192,21 +210,21 @@ def install() -> bool:
         cur = getattr(target, "_result_to_dict", None)
         if not callable(cur):
             logger.warning("[SUMMARY AI HOOK DF TRUTH PATCH] target _result_to_dict not callable")
-            return bool(ok_board)
+            return bool(ok_board and ok_rank_precheck)
         if getattr(cur, "_summary_ai_hook_df_truth_patch", False):
             _PATCHED = True
-            return True and ok_board
+            return True and ok_board and ok_rank_precheck
 
         _ORIGINAL_RESULT_TO_DICT = cur
         _patched_result_to_dict._summary_ai_hook_df_truth_patch = True  # type: ignore[attr-defined]
         target._result_to_dict = _patched_result_to_dict
 
         _PATCHED = True
-        logger.warning("[SUMMARY AI HOOK DF TRUTH PATCH] installed board_compat=%s", ok_board)
-        return True and ok_board
+        logger.warning("[SUMMARY AI HOOK DF TRUTH PATCH] installed board_compat=%s ranking_precheck_failopen=%s", ok_board, ok_rank_precheck)
+        return True and ok_board and ok_rank_precheck
     except Exception:
         logger.exception("[SUMMARY AI HOOK DF TRUTH PATCH] install failed")
-        return bool(ok_board)
+        return bool(ok_board and ok_rank_precheck)
 
 
 __all__ = ["install"]
