@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any, Iterable, List
 
@@ -13,6 +14,26 @@ _LAST_GOOD_TS: float = 0.0
 def _is_push_register_context(context: str) -> bool:
     text = str(context or "").lower()
     return "push" in text or "rotation" in text or "register" in text
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(str(v).strip()))
+    except Exception:
+        return int(default)
 
 
 def _remember_good(symbols: list[str], *, context: str) -> None:
@@ -28,6 +49,27 @@ def _last_good(max_age_sec: float = 900.0) -> list[str]:
     if (time.time() - _LAST_GOOD_TS) > max_age_sec:
         return []
     return list(_LAST_GOOD_REGISTER_SYMBOLS)
+
+
+def _safe_failopen_subset(items: list[str], *, context: str, reason: str) -> list[str]:
+    if not items:
+        return []
+    min_keep = max(1, _env_int("WATCHLIST_RECENT_LIQ_FAILOPEN_MIN_KEEP", 30))
+    max_keep = max(min_keep, _env_int("WATCHLIST_RECENT_LIQ_FAILOPEN_MAX_KEEP", 50))
+    # 登録50制限を守るため、起動直後のDBタイムアウト時は先頭から最大50件だけ通す。
+    out = list(items[:max_keep])
+    logger.warning(
+        "[WATCHLIST LIQ EMPTY SAFE] fail-open subset context=%s reason=%s before=%s after=%s min_keep=%s max_keep=%s head=%s",
+        context,
+        reason,
+        len(items),
+        len(out),
+        min_keep,
+        max_keep,
+        out[:20],
+    )
+    _remember_good(out, context=context)
+    return out
 
 
 def install() -> bool:
@@ -51,6 +93,11 @@ def install() -> bool:
                     time.time() - _LAST_GOOD_TS,
                 )
                 return fallback
+
+            # 起動直後やDBタイムアウトで last_good が無い場合でも、PUSH登録対象を0件にしない。
+            # ここで空にすると ws_alive=True でも登録更新が止まり、PUSH受信が細る。
+            if _is_push_register_context(context) and _env_bool("WATCHLIST_RECENT_LIQ_FAILOPEN_WITHOUT_LAST_GOOD_FOR_PUSH", True):
+                return _safe_failopen_subset(items, context=context, reason=reason)
 
             if mod._env_bool("WATCHLIST_RECENT_LIQ_ALLOW_FAIL_OPEN_WITHOUT_LAST_GOOD", False):
                 logger.warning(
@@ -87,7 +134,6 @@ def install() -> bool:
             check_items = [s for s in items if s not in protected]
             stats_map, timed_out = bulk._bulk_stats(mod, check_items)
 
-            # 低流動性除外を優先する。timeout/main_skip時に全通ししない。
             if timed_out:
                 return _fallback_for_liq_unavailable(items, context=context, reason="timeout_or_main_skip")
 
@@ -118,7 +164,6 @@ def install() -> bool:
                     kept.append(s)
 
             if not kept and items:
-                # 全滅時も全通ししない。直近の良好リストがあればそれを使う。
                 return _fallback_for_liq_unavailable(items, context=context, reason="all_filtered")
 
             if skipped:
@@ -139,7 +184,10 @@ def install() -> bool:
         mod._filter_symbols = _filter_symbols_safe
         _INSTALLED = True
         logger.warning(
-            "[WATCHLIST LIQ EMPTY SAFE] installed no_fail_open_without_last_good=1 allow_explicit_failopen=%s",
+            "[WATCHLIST LIQ EMPTY SAFE] installed v2 push_failopen_without_last_good=%s min_keep=%s max_keep=%s explicit_failopen=%s",
+            _env_bool("WATCHLIST_RECENT_LIQ_FAILOPEN_WITHOUT_LAST_GOOD_FOR_PUSH", True),
+            _env_int("WATCHLIST_RECENT_LIQ_FAILOPEN_MIN_KEEP", 30),
+            _env_int("WATCHLIST_RECENT_LIQ_FAILOPEN_MAX_KEEP", 50),
             mod._env_bool("WATCHLIST_RECENT_LIQ_ALLOW_FAIL_OPEN_WITHOUT_LAST_GOOD", False),
         )
         return True
