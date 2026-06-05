@@ -53,6 +53,10 @@ _env_default("ENTRY_ALLOW_WITHOUT_BOARD_MIN_PRICE", "200")
 _env_default("ENTRY_ALLOW_WITHOUT_BOARD_MIN_SCORE", "0.90")
 _env_default("ENTRY_BOARD_MISSING_QTY_RATIO", "0.50")
 
+# Ranking DB が stale の時は pending を作らず、Summary/Pullback 側に任せる。
+_env_default("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE", "1")
+_env_default("RANKING_ENTRY_SNAPSHOT_MAX_AGE_SEC", "300")
+
 # 押し目買い/戻り売りエントリー。
 _env_default("PULLBACK_ENTRY_ENABLED", "1")
 _env_default("PULLBACK_ENTRY_MAX_CANDIDATES", "5")
@@ -65,7 +69,7 @@ _env_default("PULLBACK_ENTRY_MIN_VOLUME", "30000")
 _env_default("PULLBACK_ENTRY_MIN_TURNOVER", "10000000")
 
 logger.warning(
-    "[USERCUSTOMIZE] runtime defaults applied summary_ai_daily_risk=%s liq_run_in_main=%s liq_fail_open=%s liq_min_turnover=%s final_liq_min_turnover=%s protect_pending=%s exit_cooldown=%s board_allow=%s board_hard=%s pullback=%s",
+    "[USERCUSTOMIZE] runtime defaults applied summary_ai_daily_risk=%s liq_run_in_main=%s liq_fail_open=%s liq_min_turnover=%s final_liq_min_turnover=%s protect_pending=%s exit_cooldown=%s board_allow=%s board_hard=%s ranking_stale_skip=%s pullback=%s",
     os.getenv("SUMMARY_AI_PRE_FILTER_DAILY_RISK"),
     os.getenv("WATCHLIST_RECENT_LIQ_BULK_RUN_IN_MAIN"),
     os.getenv("WATCHLIST_RECENT_LIQ_FAIL_OPEN_ON_TIMEOUT"),
@@ -75,6 +79,7 @@ logger.warning(
     os.getenv("ACTIVE_EXIT_COOLDOWN_PROTECT_SEC"),
     os.getenv("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"),
     os.getenv("ENTRY_BOARD_MISSING_HARD_BLOCK"),
+    os.getenv("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE"),
     os.getenv("PULLBACK_ENTRY_ENABLED"),
 )
 
@@ -138,6 +143,7 @@ else:
     _install("ENTRY_LATE_SESSION_TIME_GUARD", "core.startup.entry_late_session_time_guard_patch")
     _install("ENTRY_MA5_THIRD_BAR_GUARD", "core.startup.entry_ma5_third_bar_slope_guard_patch")
     _install("PULLBACK_ENTRY_PIPELINE", "core.startup.pullback_entry_pipeline_patch")
+    _install("RANKING_STALE_SNAPSHOT_SKIP", "core.startup.ranking_entry_stale_snapshot_skip_patch")
     _install("ENTRY_RANKING_SCALP_RESCUE", "core.startup.entry_ranking_scalp_order_rescue_patch")
     _install("RANKING_ENTRY_WIDER_TOP", "core.startup.ranking_entry_wider_top_universe_patch")
     _install("RANKING_WAL_MEMORY_GUARD", "core.startup.ranking_wal_checkpoint_memory_guard_patch")
