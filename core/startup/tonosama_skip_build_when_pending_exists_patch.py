@@ -83,9 +83,15 @@ def _mark_and_prune_stuck_tonosama_pending() -> int:
     """
     ATR/RANGE等で落ち続けるTONOSAMA pendingは、pending_existsループにより
     新規TONOSAMA候補生成を止める。ここで一定回数以上再評価済みの候補を掃除する。
+
+    v4:
+      - retry回数だけでは削除しない。
+      - pending作成直後にcontrollerが複数回走ると即pruneされる問題を防ぐ。
+      - 最低滞留時間を過ぎた上で retry上限、または最大滞留時間で削除する。
     """
     max_retry = max(1, _env_int('TONOSAMA_STUCK_PENDING_MAX_CONTROLLER_RETRY', 3))
-    max_age_sec = max(30.0, _env_float('TONOSAMA_STUCK_PENDING_MAX_AGE_SEC', 120.0))
+    min_age_sec = max(5.0, _env_float('TONOSAMA_STUCK_PENDING_MIN_AGE_SEC', 30.0))
+    max_age_sec = max(min_age_sec, _env_float('TONOSAMA_STUCK_PENDING_MAX_AGE_SEC', 120.0))
     low_score_max_retry = max(1, _env_int('TONOSAMA_STUCK_PENDING_LOW_SCORE_MAX_RETRY', 2))
     low_score = _env_float('TONOSAMA_STUCK_PENDING_LOW_SCORE_THRESHOLD', 3.0)
     now = time.time()
@@ -108,11 +114,13 @@ def _mark_and_prune_stuck_tonosama_pending() -> int:
             entry['_tonosama_controller_retry_count'] = int(float(entry.get('_tonosama_controller_retry_count') or 0)) + 1
             entry['_tonosama_last_controller_retry_ts'] = now
             logger.info(
-                '[TONOSAMA STUCK PENDING] mark symbol=%s retry=%s age=%.1fs score=%.4f',
+                '[TONOSAMA STUCK PENDING] mark symbol=%s retry=%s age=%.1fs score=%.4f min_age=%.1fs max_age=%.1fs',
                 _sym,
                 entry.get('_tonosama_controller_retry_count'),
                 now - float(first),
                 _score(entry),
+                min_age_sec,
+                max_age_sec,
             )
 
         def pred(sym: str, entry: dict) -> bool:
@@ -122,21 +130,32 @@ def _mark_and_prune_stuck_tonosama_pending() -> int:
             first = float(entry.get('_tonosama_pending_first_seen_ts') or now)
             age = now - first
             sc = _score(entry)
-            # 低スコアTONOSAMAは2回で掃除。通常は3回または120秒で掃除。
-            if sc > 0 and sc < low_score and retry >= low_score_max_retry:
-                return True
-            if retry >= max_retry:
-                return True
+
+            # 作成直後は絶対に消さない。発注executorへ渡る猶予を必ず残す。
+            if age < min_age_sec:
+                return False
+
+            # 最大滞留時間を超えたpendingは掃除する。
             if age >= max_age_sec:
                 return True
+
+            # 低スコアTONOSAMAも最低滞留時間後に限って掃除する。
+            if sc > 0 and sc < low_score and retry >= low_score_max_retry:
+                return True
+
+            # retry上限だけではなく、最低滞留時間経過後に限って掃除する。
+            if retry >= max_retry:
+                return True
+
             return False
 
         removed = int(prune(pred, reason='TONOSAMA_STUCK_PENDING_RETRY_OR_AGE'))
         if removed:
             logger.warning(
-                '[TONOSAMA STUCK PENDING] pruned removed=%s max_retry=%s max_age=%.1fs low_score<%.2f low_score_retry=%s',
+                '[TONOSAMA STUCK PENDING] pruned removed=%s max_retry=%s min_age=%.1fs max_age=%.1fs low_score<%.2f low_score_retry=%s',
                 removed,
                 max_retry,
+                min_age_sec,
                 max_age_sec,
                 low_score,
                 low_score_max_retry,
@@ -153,7 +172,7 @@ def _patch_once() -> bool:
         cur = getattr(tasks, '_run_tonosama_entry_safe', None)
         if not callable(cur):
             return False
-        if getattr(cur, '_tonosama_skip_build_when_pending_exists_v3', False):
+        if getattr(cur, '_tonosama_skip_build_when_pending_exists_v4', False):
             return True
         orig = getattr(cur, '_original', cur)
 
@@ -180,9 +199,10 @@ def _patch_once() -> bool:
         patched._tonosama_skip_build_when_pending_exists_v1 = True
         patched._tonosama_skip_build_when_pending_exists_v2 = True
         patched._tonosama_skip_build_when_pending_exists_v3 = True
+        patched._tonosama_skip_build_when_pending_exists_v4 = True
         patched._original = orig
         tasks._run_tonosama_entry_safe = patched
-        logger.warning('[TONOSAMA SKIP BUILD WHEN PENDING EXISTS] patched _run_tonosama_entry_safe v3 market_guard=True stuck_prune=True')
+        logger.warning('[TONOSAMA SKIP BUILD WHEN PENDING EXISTS] patched _run_tonosama_entry_safe v4 market_guard=True stuck_prune=True min_age_guard=True')
         return True
     except Exception:
         logger.exception('[TONOSAMA SKIP BUILD WHEN PENDING EXISTS] patch failed')
@@ -193,7 +213,7 @@ def _watch():
     for i in range(120):
         ok = _patch_once()
         if i in (0, 1, 5, 15, 30, 60, 119):
-            logger.warning('[TONOSAMA SKIP BUILD WHEN PENDING EXISTS] enforce ok=%s market_guard=True stuck_prune=True', ok)
+            logger.warning('[TONOSAMA SKIP BUILD WHEN PENDING EXISTS] enforce ok=%s market_guard=True stuck_prune=True v4', ok)
         time.sleep(0.5)
 
 
@@ -204,11 +224,12 @@ def install() -> bool:
     os.environ.setdefault('TONOSAMA_STUCK_PENDING_MAX_CONTROLLER_RETRY', '3')
     os.environ.setdefault('TONOSAMA_STUCK_PENDING_LOW_SCORE_MAX_RETRY', '2')
     os.environ.setdefault('TONOSAMA_STUCK_PENDING_LOW_SCORE_THRESHOLD', '3.0')
+    os.environ.setdefault('TONOSAMA_STUCK_PENDING_MIN_AGE_SEC', '30')
     os.environ.setdefault('TONOSAMA_STUCK_PENDING_MAX_AGE_SEC', '120')
     ok = _patch_once()
     threading.Thread(target=_watch, name='tonosama-skip-build-when-pending-exists', daemon=True).start()
     _DONE = True
-    logger.warning('[TONOSAMA SKIP BUILD WHEN PENDING EXISTS] installed v3 ok=%s watcher=True market_guard=True stuck_prune=True', ok)
+    logger.warning('[TONOSAMA SKIP BUILD WHEN PENDING EXISTS] installed v4 ok=%s watcher=True market_guard=True stuck_prune=True min_age_guard=True', ok)
     return True
 
 
