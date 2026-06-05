@@ -1,23 +1,19 @@
 # ============================================================
 # File   : trading/push/push_stream/monitor.py
-# Version: Ver1.4-WS-STALE-WATCHDOG-RECOVER
+# Version: Ver1.5-WS-DISCONNECTED-WATCHDOG-RECOVER
 # ------------------------------------------------------------
 # PUSH監視ログ。
+#
+# Ver1.5:
+#   - connected=False / ws_alive=False のまま last_recv が止まるケースも
+#     stale として検出する。
+#   - 古い ws_app / sender を明示 close/clear して runner の再接続へ流す。
 #
 # Ver1.4:
 #   - ws ping timeout / WinError 10054 後に connected_event が残る、または
 #     sock.connected=True でも last_recv が止まるケースを検出
 #   - stale が一定回数続いたら WebSocket を強制 close して runner の再接続へ流す
 #   - 再接続後は on_open refresh が clear_first + unregister_first で再登録する
-#
-# Ver1.3:
-#   - main.py memory-only mode では flush stall / auto recover を出さない
-#   - main.py側で誤ってflush workerを自動再起動しない
-#   - PUSH受信は memory df / latest cache / 5秒足 用として継続
-#
-# Ver1.2:
-#   - flush_alive=False かつ queue>0 の場合、flush worker を自動再起動
-#   - writer_ready=False の場合でも writers._ensure_stream_writer() に任せて遅延復旧
 # ============================================================
 
 from __future__ import annotations
@@ -34,6 +30,9 @@ from .runtime import _safe_iso, _sync_push_df_to_global, _safe_set_runtime
 from .transport import _clear_sender, _is_ws_alive
 
 logger = logging.getLogger(__name__)
+
+
+VERSION = "Ver1.5-WS-DISCONNECTED-WATCHDOG-RECOVER"
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -118,7 +117,7 @@ def _force_close_ws_for_reconnect(reason: str, *, stale_age: float | None, stale
                 logger.debug("[PUSH MONITOR][WS STALE] ws_app.close failed", exc_info=True)
 
         logger.warning(
-            "[PUSH MONITOR][WS STALE RECOVER] force close requested reason=%s stale_age=%s stale_count=%d; runner will reconnect and on_open will refresh subscriptions",
+            "[PUSH MONITOR][WS STALE RECOVER] force close requested reason=%s stale_age=%s stale_count=%d; runner will reconnect and rotation/on_open will refresh subscriptions",
             reason,
             None if stale_age is None else round(stale_age, 1),
             stale_count,
@@ -177,7 +176,7 @@ def _recover_flush_worker_if_needed(*, queue_size: int, flush_alive: bool, write
 
 
 def _monitor_worker() -> None:
-    logger.info("[push_stream] monitor worker started")
+    logger.info("[push_stream] monitor worker started version=%s", VERSION)
     loop_count = 0
     stall_count = 0
     ws_stale_count = 0
@@ -195,8 +194,8 @@ def _monitor_worker() -> None:
             ws_alive = _is_ws_alive()
             total_received = int(getattr(state, "_total_received", 0) or 0)
             last_recv_age = _seconds_since(getattr(state, "_last_message_at", None))
-            stale_limit_sec = max(20.0, _env_float("PUSH_STREAM_WS_STALE_SEC", 45.0))
-            stale_trigger_count = max(2, int(_env_float("PUSH_STREAM_WS_STALE_COUNT", 3.0)))
+            stale_limit_sec = max(15.0, _env_float("PUSH_STREAM_WS_STALE_SEC", 30.0))
+            stale_trigger_count = max(2, int(_env_float("PUSH_STREAM_WS_STALE_COUNT", 2.0)))
 
             _sync_push_df_to_global()
 
@@ -221,7 +220,9 @@ def _monitor_worker() -> None:
             # WebSocket watchdog:
             # - connected_event=True なのに sock が死んでいる
             # - sock.connected=True でも一定時間メッセージが来ない
-            # どちらも古い接続を close して runner の再接続に任せる。
+            # - connected_event=False / ws_alive=False のまま最後の受信から一定時間が経過
+            #   している。このケースでは runner がまだ run_forever 内で戻っていない、または
+            #   古い ws_app が残っている可能性があるため、明示 close して再接続を促す。
             received_moved = total_received > last_seen_received
             last_seen_received = total_received
             ws_stale_reason = None
@@ -229,6 +230,11 @@ def _monitor_worker() -> None:
                 ws_stale_reason = "connected_event_true_but_ws_not_alive"
             elif connected and ws_alive and total_received > 0 and not received_moved and last_recv_age is not None and last_recv_age >= stale_limit_sec:
                 ws_stale_reason = "last_recv_stale_while_ws_alive"
+            elif (not connected) and (not ws_alive) and total_received > 0 and last_recv_age is not None and last_recv_age >= stale_limit_sec:
+                ws_stale_reason = "disconnected_and_ws_not_alive_after_recv"
+            elif (not connected) and (not ws_alive) and total_received <= 0 and loop_count >= 4:
+                # 起動直後に接続が確立しないケースも早めに古いws_appを閉じる。
+                ws_stale_reason = "startup_ws_never_connected"
 
             if ws_stale_reason:
                 ws_stale_count += 1
@@ -258,50 +264,33 @@ def _monitor_worker() -> None:
                 _safe_set_runtime("push_stream_memory_only", True)
                 _safe_set_runtime("push_writer_running", False)
                 _safe_set_runtime("push_flush_stalled", False)
-                if queue_size > 0:
-                    try:
-                        with state._push_queue.mutex:
-                            state._push_queue.queue.clear()
-                    except Exception:
-                        logger.debug("[PUSH MONITOR][MEMORY ONLY] queue clear skipped", exc_info=True)
-                    logger.warning(
-                        "[PUSH MONITOR][MEMORY ONLY] cleared DB queue in main process queue_before=%d",
-                        queue_size,
-                    )
-                time.sleep(MONITOR_INTERVAL_SEC)
-                continue
-
-            if queue_size > 0 and state._total_received > 0 and state._total_flushed <= 0:
-                stall_count += 1
-                _safe_set_runtime("push_flush_stalled", True)
-                _safe_set_runtime("push_flush_stall_count", stall_count)
-                logger.error(
-                    "[PUSH MONITOR][FLUSH STALL] queue=%d received=%d flushed=%d flush_alive=%s writer_ready=%s stall_count=%d last_recv=%s last_flush=%s",
-                    queue_size,
-                    state._total_received,
-                    state._total_flushed,
-                    flush_alive,
-                    writer_ready,
-                    stall_count,
-                    _safe_iso(state._last_message_at),
-                    _safe_iso(state._last_flush_at),
-                )
-                _recover_flush_worker_if_needed(
-                    queue_size=queue_size,
-                    flush_alive=flush_alive,
-                    writer_ready=writer_ready,
-                    stall_count=stall_count,
-                )
             else:
-                stall_count = 0
-                _safe_set_runtime("push_flush_stalled", False)
+                if queue_size > 0 and not flush_alive:
+                    stall_count += 1
+                    _safe_set_runtime("push_flush_stalled", True)
+                    _safe_set_runtime("push_flush_stall_count", stall_count)
+                    logger.warning(
+                        "[PUSH MONITOR][FLUSH STALL] queue=%d flush_alive=%s writer_ready=%s stall_count=%d",
+                        queue_size,
+                        flush_alive,
+                        writer_ready,
+                        stall_count,
+                    )
+                    if stall_count >= 2:
+                        _recover_flush_worker_if_needed(
+                            queue_size=queue_size,
+                            flush_alive=flush_alive,
+                            writer_ready=writer_ready,
+                            stall_count=stall_count,
+                        )
+                        stall_count = 0
+                else:
+                    stall_count = 0
+                    _safe_set_runtime("push_flush_stalled", False)
 
         except Exception:
-            logger.exception("[push_stream] monitor worker failed")
+            logger.exception("[push_stream] monitor worker loop failed")
 
         time.sleep(MONITOR_INTERVAL_SEC)
 
     logger.info("[push_stream] monitor worker stopped")
-
-
-__all__ = ["_monitor_worker"]
