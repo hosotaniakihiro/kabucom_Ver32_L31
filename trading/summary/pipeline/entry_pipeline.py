@@ -1,25 +1,11 @@
 # ============================================================
 # File   : trading/summary/pipeline/entry_pipeline.py
-# Version: Ver2.7-PRODUCTION-RETURN-EXECUTION-RESULT
+# Version: Ver2.8-SUMMARY-AI-LIQUIDITY-RESCUE
 # ------------------------------------------------------------
 # ✔ AI approved rows → entry execution
-# ✔ DataFrame / list / dict / Series 両対応
-# ✔ 重複エントリー防止
-# ✔ positionチェック
-# ✔ DB positions(status=OPEN) も position_skip 対象にする
-# ✔ global_data.get_positions 不在でも落とさない fallback
-# ✔ blowoff top filter
-# ✔ run_summary_entry_executor 呼び出し
-# ✔ NaN / None 防御
-# ✔ source / interval 補完
-# ✔ summary→pending→entry_controller 整合
-# ✔ skip理由の件数可視化
-# ✔ production hardened
 # ✔ SUMMARY AI通常エントリーとイナゴ liquidity_shock 条件を分離
 # ✔ SUMMARY liquidity の min_score を BUY / SELL で分離
-# ✔ SELL信用売り不可銘柄を pending 登録前に除外
-# ✔ Ver2.7: run_summary_entry_executor の戻り値を上位へ返す
-# ✔ Ver2.7: result=None による entry_pipeline_no_order 誤判定を防止
+# ✔ Ver2.8: Summary AI承認済み候補が liquidity だけで全落ちする問題を救済
 # ============================================================
 
 from __future__ import annotations
@@ -111,6 +97,16 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
 def _clean_nan_dict(d: dict) -> dict:
     out = {}
     try:
@@ -173,15 +169,9 @@ def _resolve_side_from_row(row: dict) -> str:
 
 def _resolve_summary_liquidity_min_score(row: dict, *, side: str) -> float:
     if side == "SELL":
-        return _env_float(
-            "SUMMARY_ENTRY_MIN_LIQUIDITY_SCORE_SELL",
-            _env_float("SUMMARY_ENTRY_MIN_SCORE_SELL", _env_float("MIN_ENTRY_SCORE_SELL_SUMMARY", 1.0)),
-        )
+        return _env_float("SUMMARY_ENTRY_MIN_LIQUIDITY_SCORE_SELL", _env_float("SUMMARY_ENTRY_MIN_SCORE_SELL", _env_float("MIN_ENTRY_SCORE_SELL_SUMMARY", 1.0)))
     if side == "BUY":
-        return _env_float(
-            "SUMMARY_ENTRY_MIN_LIQUIDITY_SCORE_BUY",
-            _env_float("SUMMARY_ENTRY_MIN_SCORE_BUY", _env_float("SUMMARY_ENTRY_MIN_LIQUIDITY_SCORE", 3.0)),
-        )
+        return _env_float("SUMMARY_ENTRY_MIN_LIQUIDITY_SCORE_BUY", _env_float("SUMMARY_ENTRY_MIN_SCORE_BUY", _env_float("SUMMARY_ENTRY_MIN_LIQUIDITY_SCORE", 3.0)))
     return _env_float("SUMMARY_ENTRY_MIN_LIQUIDITY_SCORE", 3.0)
 
 
@@ -271,14 +261,12 @@ def _already_in_position(symbol: str) -> bool:
                 return True
         except Exception:
             logger.debug("[entry_pipeline] DB position sync check failed symbol=%s", symbol, exc_info=True)
-
         positions_getter = getattr(global_data, "get_positions", None)
         if callable(positions_getter):
             positions = positions_getter()
         else:
             logger.warning("[entry_pipeline] global_data.get_positions not found; fallback open_positions symbol=%s", symbol)
             positions = getattr(global_data, "open_positions", None)
-
         return _positions_contains_symbol(positions, symbol)
     except Exception:
         logger.exception("[entry_pipeline] position check failed symbol=%s", symbol)
@@ -289,15 +277,51 @@ def _is_inago_source(row: dict) -> bool:
     source = str(row.get("source") or "").upper()
     strategy = str(row.get("strategy") or row.get("entry_strategy") or "").upper()
     reason = str(row.get("reason") or row.get("ai_reason") or "").upper()
-    return (
-        "INAGO" in source
-        or "TONOSAMA" in source
-        or "LIQUIDITY_SHOCK" in source
-        or "INAGO" in strategy
-        or "TONOSAMA" in strategy
-        or "LIQUIDITY_SHOCK" in strategy
-        or "LIQUIDITY" in reason and "SHOCK" in reason
+    return ("INAGO" in source or "TONOSAMA" in source or "LIQUIDITY_SHOCK" in source or "INAGO" in strategy or "TONOSAMA" in strategy or "LIQUIDITY_SHOCK" in strategy or "LIQUIDITY" in reason and "SHOCK" in reason)
+
+
+def _range_pct(row: dict, close: float) -> float:
+    high = _safe_float(_first(row, ["high", "high_price"], 0.0), 0.0)
+    low = _safe_float(_first(row, ["low", "low_price"], 0.0), 0.0)
+    base = close if close > 0 else max(high, low, 1.0)
+    if high > 0 and low > 0 and high >= low and base > 0:
+        return (high - low) / base * 100.0
+    return 0.0
+
+
+def _summary_ai_liquidity_rescue(row: dict, *, symbol: str, side: str, close: float, volume: float, turnover: float, effective_score: float) -> bool:
+    if not _env_bool("SUMMARY_AI_ENTRY_LIQUIDITY_RESCUE_ENABLED", True):
+        return False
+    source = str(row.get("source") or "").upper()
+    entry_type = str(row.get("entry_type") or "").upper()
+    reason = str(row.get("reason") or row.get("ai_reason") or "")
+    is_summary_ai = source in {"SUMMARY", "SUMMARY_AI", "PUSH"} or entry_type == "SUMMARY_AI" or "src=SUMMARY" in reason
+    if not is_summary_ai:
+        return False
+    range_pct = _range_pct(row, close)
+    mtf = max(
+        _safe_float(_first(row, ["mtf", "score_mtf", "mtf_score"], 0.0), 0.0),
+        _safe_float(_first(row, ["score_mtf_short", "score_mtf_daily"], 0.0), 0.0),
     )
+    slope_abs = abs(_safe_float(_first(row, ["slope_atr_scaled", "slope", "score_slope"], 0.0), 0.0))
+    min_price = _env_float("SUMMARY_AI_RESCUE_MIN_PRICE", 300.0)
+    min_score = _env_float("SUMMARY_AI_RESCUE_MIN_SCORE", 1.0)
+    min_range = _env_float("SUMMARY_AI_RESCUE_MIN_RANGE_PCT", 1.5)
+    min_mtf = _env_float("SUMMARY_AI_RESCUE_MIN_MTF", 5.0)
+    min_volume = _env_float("SUMMARY_AI_RESCUE_MIN_VOLUME", 0.0)
+    min_turnover = _env_float("SUMMARY_AI_RESCUE_MIN_TURNOVER", 0.0)
+    ok = close >= min_price and effective_score >= min_score and range_pct >= min_range and mtf >= min_mtf and volume >= min_volume and turnover >= min_turnover
+    if ok:
+        logger.warning(
+            "[entry_pipeline] SUMMARY AI liquidity rescue allow symbol=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f range=%.3f mtf=%.3f slope_abs=%.6f",
+            symbol, side, close, volume, turnover, effective_score, range_pct, mtf, slope_abs,
+        )
+        return True
+    logger.info(
+        "[entry_pipeline] SUMMARY AI liquidity rescue no symbol=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f range=%.3f mtf=%.3f need_price=%.1f need_score=%.2f need_range=%.2f need_mtf=%.2f",
+        symbol, side, close, volume, turnover, effective_score, range_pct, mtf, min_price, min_score, min_range, min_mtf,
+    )
+    return False
 
 
 def _allow_summary_ai_liquidity(row: dict, *, symbol: str, interval: int) -> bool:
@@ -306,32 +330,23 @@ def _allow_summary_ai_liquidity(row: dict, *, symbol: str, interval: int) -> boo
     turnover = _safe_float(_first(row, ["turnover", "trading_value", "売買代金"], 0.0), 0.0)
     if turnover <= 0 and close > 0 and volume > 0:
         turnover = close * volume
-
     raw_score = _safe_float(_first(row, ["score", "score_total", "final_score", "display_score"], 0.0), 0.0)
     score = abs(raw_score)
     buy_score = _safe_float(_first(row, ["buy_score", "score_buy"], 0.0), 0.0)
     sell_score = _safe_float(_first(row, ["sell_score", "score_sell"], 0.0), 0.0)
     effective_score = max(score, buy_score, sell_score)
     side = _resolve_side(row, buy_score=buy_score, sell_score=sell_score, raw_score=raw_score)
-
     min_price = _env_float("SUMMARY_ENTRY_MIN_PRICE", _env_float("ENTRY_MIN_PRICE", 200.0))
     min_volume = _env_float("SUMMARY_ENTRY_MIN_VOLUME", _env_float("ENTRY_MIN_VOLUME", 3000.0))
     min_turnover = _env_float("SUMMARY_ENTRY_MIN_TURNOVER", _env_float("ENTRY_MIN_TURNOVER", 3_000_000.0))
     min_score = _resolve_summary_liquidity_min_score(row, side=side)
-
     ok = close > min_price and volume >= min_volume and turnover >= min_turnover and effective_score >= min_score
-
     if ok:
-        logger.info(
-            "[entry_pipeline] summary liquidity allow symbol=%s interval=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f min_score=%.2f",
-            symbol, interval, side, close, volume, turnover, effective_score, min_score,
-        )
+        logger.info("[entry_pipeline] summary liquidity allow symbol=%s interval=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f min_score=%.2f", symbol, interval, side, close, volume, turnover, effective_score, min_score)
         return True
-
-    logger.info(
-        "[entry_pipeline] summary liquidity deny symbol=%s interval=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f min_price=%.1f min_volume=%.0f min_turnover=%.0f min_score=%.2f",
-        symbol, interval, side, close, volume, turnover, effective_score, min_price, min_volume, min_turnover, min_score,
-    )
+    if _summary_ai_liquidity_rescue(row, symbol=symbol, side=side, close=close, volume=volume, turnover=turnover, effective_score=effective_score):
+        return True
+    logger.info("[entry_pipeline] summary liquidity deny symbol=%s interval=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f min_price=%.1f min_volume=%.0f min_turnover=%.0f min_score=%.2f", symbol, interval, side, close, volume, turnover, effective_score, min_price, min_volume, min_turnover, min_score)
     return False
 
 
@@ -395,24 +410,19 @@ def _build_exec_dataframe(rows: List[Any], interval: int) -> pd.DataFrame:
             else:
                 d["interval"] = _safe_interval(d.get("interval"))
             records.append(d)
-
         if not records:
             return pd.DataFrame()
-
         df_exec = pd.DataFrame(records)
         if "source" not in df_exec.columns:
             df_exec["source"] = DEFAULT_SOURCE
         else:
             df_exec["source"] = df_exec["source"].fillna(DEFAULT_SOURCE)
-
         if "interval" not in df_exec.columns:
             df_exec["interval"] = interval
         else:
             df_exec["interval"] = df_exec["interval"].apply(lambda x: interval if _safe_interval(x) is None else _safe_interval(x))
-
         if "symbol" in df_exec.columns:
             df_exec["symbol"] = df_exec["symbol"].astype(str).str.replace(r"\.0$", "", regex=True)
-
         return df_exec
     except Exception:
         logger.exception("[entry_pipeline] build exec dataframe failed interval=%s", interval)
@@ -452,20 +462,17 @@ def run_entry_pipeline(approved_rows: Any, df_summary: pd.DataFrame | None, inte
         if not rows:
             logger.info("[entry_pipeline] no approved rows interval=%s", interval)
             return {"executed": False, "entries": 0, "interval": interval, "skip_reason": "no_approved_rows"}
-
         total_in = len(rows)
         skipped_no_symbol = 0
         skipped_liquidity = 0
         skipped_sell_credit = 0
         skipped_position = 0
         filtered: List[Any] = []
-
         for r in rows:
             symbol = _get_symbol(r)
             if not symbol:
                 skipped_no_symbol += 1
                 continue
-
             try:
                 row_dict = _clean_nan_dict(_row_to_dict(r))
                 if not row_dict.get("source"):
@@ -474,12 +481,10 @@ def run_entry_pipeline(approved_rows: Any, df_summary: pd.DataFrame | None, inte
                     row_dict["interval"] = interval
                 else:
                     row_dict["interval"] = _safe_interval(row_dict.get("interval"))
-
                 if not _allow_entry_liquidity(row_dict, symbol=symbol, interval=int(interval)):
                     skipped_liquidity += 1
                     logger.info("[entry_pipeline] skip liquidity symbol=%s interval=%s source=%s", symbol, interval, row_dict.get("source"))
                     continue
-
                 if not _allow_sell_credit_before_pending(row_dict, symbol=symbol, interval=int(interval)):
                     skipped_sell_credit += 1
                     continue
@@ -487,81 +492,31 @@ def run_entry_pipeline(approved_rows: Any, df_summary: pd.DataFrame | None, inte
                 logger.exception("[entry_pipeline] pre-entry filters failed symbol=%s", symbol)
                 skipped_liquidity += 1
                 continue
-
             if _already_in_position(symbol):
                 skipped_position += 1
                 logger.info("[entry_pipeline] skip position symbol=%s interval=%s", symbol, interval)
                 continue
-
             filtered.append(row_dict)
-
         before_blowoff = len(filtered)
         filtered = _filter_blowoff(filtered, df_summary)
         after_blowoff = len(filtered)
         skipped_blowoff = before_blowoff - after_blowoff
-
-        logger.info(
-            "[entry_pipeline] summary interval=%s approved=%s no_symbol=%s liquidity_skip=%s sell_credit_skip=%s position_skip=%s blowoff_skip=%s executable=%s",
-            interval, total_in, skipped_no_symbol, skipped_liquidity, skipped_sell_credit, skipped_position, skipped_blowoff, len(filtered),
-        )
-
+        logger.info("[entry_pipeline] summary interval=%s approved=%s no_symbol=%s liquidity_skip=%s sell_credit_skip=%s position_skip=%s blowoff_skip=%s executable=%s", interval, total_in, skipped_no_symbol, skipped_liquidity, skipped_sell_credit, skipped_position, skipped_blowoff, len(filtered))
         if not filtered:
             logger.info("[entry_pipeline] no tradable rows after filters interval=%s", interval)
-            return {
-                "executed": False,
-                "entries": 0,
-                "approved": total_in,
-                "interval": interval,
-                "skip_reason": "no_tradable_rows_after_filters",
-                "skipped": {
-                    "no_symbol": skipped_no_symbol,
-                    "liquidity": skipped_liquidity,
-                    "sell_credit": skipped_sell_credit,
-                    "position": skipped_position,
-                    "blowoff": skipped_blowoff,
-                },
-            }
-
+            return {"executed": False, "entries": 0, "approved": total_in, "interval": interval, "skip_reason": "no_tradable_rows_after_filters", "skipped": {"no_symbol": skipped_no_symbol, "liquidity": skipped_liquidity, "sell_credit": skipped_sell_credit, "position": skipped_position, "blowoff": skipped_blowoff}}
         df_exec = _build_exec_dataframe(filtered, interval)
         if df_exec.empty:
             logger.info("[entry_pipeline] df_exec empty interval=%s", interval)
             return {"executed": False, "entries": 0, "approved": total_in, "interval": interval, "skip_reason": "df_exec_empty"}
-
-        logger.info(
-            "[entry_pipeline] calling executor interval=%s symbols=%s source_counts=%s",
-            interval,
-            ",".join(df_exec["symbol"].astype(str).tolist()) if "symbol" in df_exec.columns else "N/A",
-            df_exec["source"].value_counts(dropna=False).to_dict() if "source" in df_exec.columns else {},
-        )
-
+        logger.info("[entry_pipeline] calling executor interval=%s symbols=%s source_counts=%s", interval, ",".join(df_exec["symbol"].astype(str).tolist()) if "symbol" in df_exec.columns else "N/A", df_exec["source"].value_counts(dropna=False).to_dict() if "source" in df_exec.columns else {})
         result = run_summary_entry_executor(df_exec, df_summary, interval)
         executed = _result_executed(result)
+        logger.info("[entry_pipeline] executed entries=%s interval=%s executed=%s result_type=%s result=%s", len(df_exec), interval, executed, type(result).__name__, result)
+        return {"executed": executed, "entries": len(df_exec), "approved": total_in, "interval": interval, "result": result, "skip_reason": None if executed else "summary_entry_executor_no_order", "skipped": {"no_symbol": skipped_no_symbol, "liquidity": skipped_liquidity, "sell_credit": skipped_sell_credit, "position": skipped_position, "blowoff": skipped_blowoff}}
+    except Exception as e:
+        logger.exception("[entry_pipeline] fatal error interval=%s err=%s", interval, e)
+        return {"executed": False, "entries": 0, "interval": interval, "skip_reason": "entry_pipeline_exception", "error": str(e)}
 
-        logger.info(
-            "[entry_pipeline] executed entries=%s interval=%s executed=%s result_type=%s result=%s",
-            len(df_exec),
-            interval,
-            executed,
-            type(result).__name__,
-            result,
-        )
 
-        return {
-            "executed": executed,
-            "entries": len(df_exec),
-            "approved": total_in,
-            "interval": interval,
-            "result": result,
-            "skip_reason": None if executed else "summary_entry_executor_no_order",
-            "skipped": {
-                "no_symbol": skipped_no_symbol,
-                "liquidity": skipped_liquidity,
-                "sell_credit": skipped_sell_credit,
-                "position": skipped_position,
-                "blowoff": skipped_blowoff,
-            },
-        }
-
-    except Exception:
-        logger.exception("[entry_pipeline] failed interval=%s", interval)
-        return {"executed": False, "entries": 0, "interval": interval, "skip_reason": "entry_pipeline_exception"}
+__all__ = ["run_entry_pipeline"]
