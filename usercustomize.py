@@ -55,6 +55,7 @@ else:
     _install("EXIT_EXECUTOR_BROKER_V2", "core.startup.exit_executor_broker_fallback_v2_patch")
     _install("EXIT_DB_STALE_GUARD", "core.startup.exit_db_stale_position_guard_patch")
     _install("EXIT_LOOP_TIMEOUT_GUARD", "core.startup.exit_loop_timeout_guard_patch")
+    _install("SUMMARY_DIFF_STALE_LOCK_GUARD", "core.startup.summary_diff_update_stale_lock_guard_patch")
     _install("ENTRY_LATE_SESSION_TIME_GUARD", "core.startup.entry_late_session_time_guard_patch")
     _install("ENTRY_MA5_THIRD_BAR_GUARD", "core.startup.entry_ma5_third_bar_slope_guard_patch")
     _install("ENTRY_RANKING_SCALP_RESCUE", "core.startup.entry_ranking_scalp_order_rescue_patch")
