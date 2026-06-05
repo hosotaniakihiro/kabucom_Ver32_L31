@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/subscription_manager/core.py
-# Version: V3.4-SKIP-EMPTY-ROTATION-TARGET
+# Version: V3.5-ENV-CLEAR-WAIT-FOR-ROTATION
 # ------------------------------------------------------------
 # Function:
 #   - subscription manager 公開API
@@ -10,18 +10,16 @@
 #
 # Important:
 #   - kabu Station の同時登録上限は50銘柄
-#   - 既に50銘柄が登録済みの状態で /register を追加実行すると
-#     Code=4002006 レジスト数エラー になることがある
-#
-# Fix V3.4:
-#   - rotation_A/B で target=0 の場合は unregister_all しない。
-#   - on_open で50銘柄を登録した直後に rotation_B empty が走り、
-#     50銘柄を全解除してしまう事故を防ぐ。
+#   - unregister/all のREST応答直後でも、kabu Station内部の登録解除反映が
+#     少し遅れることがある。
+#   - 固定0.5秒では 4002006 レジスト数エラーが出やすいため、
+#     KABU_REGISTER_UNREGISTER_WAIT_SEC を既定値として使う。
 # ============================================================
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Optional
 
 from . import state
@@ -46,7 +44,20 @@ from .target_builder import REGISTER_MAX_SYMBOLS, build_target_symbols
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_WAIT_AFTER_CLEAR_SEC = 0.5
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _default_wait_after_clear_sec() -> float:
+    # rotation_settings.py でも setdefault するが、core単体import時にも安全な既定値を持つ。
+    return max(0.0, _env_float("KABU_REGISTER_UNREGISTER_WAIT_SEC", 1.5))
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -91,6 +102,7 @@ def _is_force_clear_reason(reason: Any) -> bool:
 
 
 def _extract_wait_after_clear_sec(kwargs: dict[str, Any]) -> float:
+    default_wait = _default_wait_after_clear_sec()
     for key in (
         "wait_after_clear_sec",
         "unregister_wait_sec",
@@ -98,8 +110,11 @@ def _extract_wait_after_clear_sec(kwargs: dict[str, Any]) -> float:
         "wait_after_unregister_sec",
     ):
         if key in kwargs and kwargs.get(key) is not None:
-            return max(0.0, _safe_float(kwargs.get(key), DEFAULT_WAIT_AFTER_CLEAR_SEC))
-    return DEFAULT_WAIT_AFTER_CLEAR_SEC
+            v = max(0.0, _safe_float(kwargs.get(key), default_wait))
+            # 0指定は「既定に戻す」扱い。rotation_register から0.0が来ても
+            # kabu Station内部反映待ちを潰さない。
+            return default_wait if v <= 0 else v
+    return default_wait
 
 
 def _normalize_bool_optional(v: Any, default: bool) -> bool:
@@ -133,8 +148,7 @@ def refresh_subscriptions(
 
     保証:
       - run_refresh_sequence() へ渡す target_symbols は最大50件
-      - on_open / startup は既存登録を全解除してから登録する
-      - rotation は target が空でなければ clear/register する
+      - on_open / startup / rotation は既存登録を全解除してから登録する
     """
 
     is_rotation = _is_rotation_reason(reason)
@@ -146,7 +160,7 @@ def refresh_subscriptions(
         clear_first = True
         unregister_first = True
         if wait_after_clear_sec <= 0:
-            wait_after_clear_sec = DEFAULT_WAIT_AFTER_CLEAR_SEC
+            wait_after_clear_sec = _default_wait_after_clear_sec()
 
     target_symbols = build_target_symbols(
         symbols=symbols,
@@ -163,10 +177,6 @@ def refresh_subscriptions(
     with state.manager_lock:
         current_symbols = list(state.last_registered_symbols)
 
-    # 重要:
-    # rotation_B などで target=0 の時に unregister_all すると、
-    # 直前の on_open で登録した50銘柄を全解除してしまう。
-    # rotationの空ターゲットは「今回は交代先なし」として現状維持する。
     if is_rotation and len(target_symbols) == 0 and len(current_symbols) > 0:
         logger.warning(
             "[SUB MANAGER CORE] skip empty rotation refresh keep current reason=%s current=%d target=0",
