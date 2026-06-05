@@ -42,6 +42,7 @@ _install("PUSH_RECONNECT_STABILITY", "core.startup.push_stream_reconnect_stabili
 _install("PUSH_MAIN_OWNER_POLICY", "core.startup.push_main_owner_lock_policy_patch")
 _install("PUSH_EMPTY_OWNER_FAILOPEN", "core.startup.push_empty_owner_lock_failopen_patch")
 _install("PUSH_ONOPEN_SAFE_REFRESH", "core.startup.push_onopen_refresh_safe_patch")
+_install("RANKING_API_GLOBAL_THROTTLE", "core.startup.ranking_api_global_throttle_patch")
 _install("RANKING_WAL_AGGRESSIVE_TRUNCATE", "core.startup.ranking_wal_aggressive_truncate_patch")
 
 if _is_database_collector_context():
