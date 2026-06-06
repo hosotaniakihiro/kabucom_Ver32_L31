@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/startup.py
-# Version: FINAL-PRODUCTION-REV23.9-TONOSAMA-FAST-SCORE-PREFILTER
+# Version: FINAL-PRODUCTION-REV24.0-REST-FULL-BOARD-ENTRY
 # ------------------------------------------------------------
 # 【概要】
 #   system_startup の公開入口
@@ -35,6 +35,10 @@
 # REV23.9:
 #   - tonosama_fast_score_prefilter_patch を起動時に明示適用
 #   - TONOSAMAのfinal_score_low候補をAI/5秒特徴取得前に早期除外
+#
+# REV24.0:
+#   - rest_full_board_entry_patch を起動時に明示適用
+#   - エントリー候補のLIMIT注文だけ REST /board 複数段板で最終価格補正
 # ============================================================
 
 from __future__ import annotations
@@ -110,9 +114,16 @@ def _install_entrypoint_runtime_patches() -> None:
     except Exception:
         logger.exception("[startup.entrypoint] tonosama fast score prefilter install failed")
 
+    try:
+        from core.startup.rest_full_board_entry_patch import install as install_rest_full_board_entry_patch
+
+        install_rest_full_board_entry_patch()
+    except Exception:
+        logger.exception("[startup.entrypoint] REST full board entry patch install failed")
+
 
 def system_startup():
-    logger.info("🚀 system_startup entry REV23.9-TONOSAMA-FAST-SCORE-PREFILTER")
+    logger.info("🚀 system_startup entry REV24.0-REST-FULL-BOARD-ENTRY")
     _install_entrypoint_runtime_patches()
     return run_system_startup()
 
