@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/startup.py
-# Version: FINAL-PRODUCTION-REV24.5-BOARD-RUNTIME-DIAGNOSTICS
+# Version: FINAL-PRODUCTION-REV24.6-BOARD-RUNTIME-SAFETY-CLAMP
 # ------------------------------------------------------------
 # 【概要】
 #   system_startup の公開入口
@@ -60,6 +60,10 @@
 # REV24.5:
 #   - board_runtime_diagnostics_patch を設定ブリッジ直後に明示適用
 #   - 板関連runtime設定の実効値を起動時に一覧ログ出力
+#
+# REV24.6:
+#   - board_runtime_safety_clamp_patch を診断前に明示適用
+#   - 危険な板関連設定値を安全範囲へ補正してから診断ログ出力
 # ============================================================
 
 from __future__ import annotations
@@ -78,6 +82,13 @@ def _install_entrypoint_runtime_patches() -> None:
         install_board_settings_env_bridge()
     except Exception:
         logger.exception("[startup.entrypoint] board settings env bridge install failed")
+
+    try:
+        from core.startup.board_runtime_safety_clamp_patch import install as install_board_runtime_safety_clamp
+
+        install_board_runtime_safety_clamp()
+    except Exception:
+        logger.exception("[startup.entrypoint] board runtime safety clamp install failed")
 
     try:
         from core.startup.board_runtime_diagnostics_patch import install as install_board_runtime_diagnostics
@@ -186,7 +197,7 @@ def _install_entrypoint_runtime_patches() -> None:
 
 
 def system_startup():
-    logger.info("🚀 system_startup entry REV24.5-BOARD-RUNTIME-DIAGNOSTICS")
+    logger.info("🚀 system_startup entry REV24.6-BOARD-RUNTIME-SAFETY-CLAMP")
     _install_entrypoint_runtime_patches()
     return run_system_startup()
 
