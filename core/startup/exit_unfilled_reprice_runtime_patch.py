@@ -1,9 +1,11 @@
 # ============================================================
 # File   : core/startup/exit_unfilled_reprice_runtime_patch.py
-# Version: V1-EXIT-UNFILLED-REPRICE-ONCE
+# Version: V1.1-EXIT-UNFILLED-REPRICE-ONCE-TEMP-MARKET
 # ------------------------------------------------------------
 # 返済指値が未約定で残った場合、短時間で取消し、建玉をOPENへ戻して
-# execute_exit() をもう一度呼ぶ。2回目も未約定なら成行fallbackを許容。
+# execute_exit() をもう一度呼ぶ。最終fallbackで成行を使う場合も、
+# EXIT_REST_FULL_BOARD_ENABLED / EXIT_LIMIT_BOARD_TOUCH_ENABLED は
+# その1回だけ一時的にOFFにし、呼び出し後に必ず復元する。
 # ============================================================
 
 from __future__ import annotations
@@ -148,29 +150,54 @@ def _restore_position_open(symbol: str) -> None:
         logger.debug("[EXIT UNFILLED REPRICE] memory restore skipped", exc_info=True)
 
 
+def _execute_exit_with_optional_market(symbol: str, *, reason: str, exit_price: float, market_fallback: bool) -> None:
+    from trading.exit.executor import execute_exit
+    if not market_fallback:
+        execute_exit(symbol, reason=reason, exit_price=exit_price)
+        return
+
+    saved = {
+        "EXIT_REST_FULL_BOARD_ENABLED": os.environ.get("EXIT_REST_FULL_BOARD_ENABLED"),
+        "EXIT_LIMIT_BOARD_TOUCH_ENABLED": os.environ.get("EXIT_LIMIT_BOARD_TOUCH_ENABLED"),
+    }
+    try:
+        os.environ["EXIT_REST_FULL_BOARD_ENABLED"] = "0"
+        os.environ["EXIT_LIMIT_BOARD_TOUCH_ENABLED"] = "0"
+        logger.warning("[EXIT UNFILLED REPRICE] temporary MARKET fallback enabled symbol=%s reason=%s", symbol, reason)
+        execute_exit(symbol, reason=reason, exit_price=exit_price)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        logger.warning("[EXIT UNFILLED REPRICE] restored exit board env after MARKET fallback symbol=%s", symbol)
+
+
 def _retry_exit(symbol: str, order: Dict[str, Any]) -> None:
     symbol = _sym(symbol)
     if not symbol:
         return
+    market_fallback = False
     with _LOCK:
         r = _RETRY_ROUNDS.get(symbol, 0)
         max_rounds = _env_int("EXIT_UNFILLED_REPRICE_MAX_ROUNDS", 1)
         if r >= max_rounds:
             if _env_bool("EXIT_UNFILLED_REPRICE_MARKET_ON_FINAL", True):
-                os.environ["EXIT_REST_FULL_BOARD_ENABLED"] = "0"
-                os.environ["EXIT_LIMIT_BOARD_TOUCH_ENABLED"] = "0"
-                logger.warning("[EXIT UNFILLED REPRICE] final retry will use MARKET fallback symbol=%s round=%s", symbol, r)
+                market_fallback = True
+                logger.warning("[EXIT UNFILLED REPRICE] final retry will use one-shot MARKET fallback symbol=%s round=%s", symbol, r)
             else:
                 logger.warning("[EXIT UNFILLED REPRICE] max retry reached symbol=%s round=%s", symbol, r)
                 return
         _RETRY_ROUNDS[symbol] = r + 1
 
     try:
-        from trading.exit.executor import execute_exit
         ref_price = _f(order.get("Price"), 0.0)
         reason = f"unfilled_exit_reprice_round_{_RETRY_ROUNDS.get(symbol, 0)}"
-        logger.warning("[EXIT UNFILLED REPRICE] retry execute_exit symbol=%s ref_price=%s reason=%s", symbol, ref_price, reason)
-        execute_exit(symbol, reason=reason, exit_price=ref_price if ref_price > 0 else 1.0)
+        if market_fallback:
+            reason += "_market_fallback"
+        logger.warning("[EXIT UNFILLED REPRICE] retry execute_exit symbol=%s ref_price=%s reason=%s market=%s", symbol, ref_price, reason, market_fallback)
+        _execute_exit_with_optional_market(symbol, reason=reason, exit_price=ref_price if ref_price > 0 else 1.0, market_fallback=market_fallback)
     except Exception:
         logger.exception("[EXIT UNFILLED REPRICE] retry execute_exit failed symbol=%s", symbol)
 
@@ -241,7 +268,7 @@ def install() -> bool:
         _THREAD_STARTED = True
     _INSTALLED = True
     logger.warning(
-        "[EXIT UNFILLED REPRICE] installed cancel_sec=%.2f max_rounds=%s market_on_final=%s",
+        "[EXIT UNFILLED REPRICE] installed cancel_sec=%.2f max_rounds=%s market_on_final=%s temp_market=True",
         _env_float("EXIT_UNFILLED_CANCEL_SEC", 1.2),
         _env_int("EXIT_UNFILLED_REPRICE_MAX_ROUNDS", 1),
         _env_bool("EXIT_UNFILLED_REPRICE_MARKET_ON_FINAL", True),
