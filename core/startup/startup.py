@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/startup.py
-# Version: FINAL-PRODUCTION-REV24.3-CLOSING-STALE-RECONCILE
+# Version: FINAL-PRODUCTION-REV24.4-BOARD-SETTINGS-ENV-BRIDGE
 # ------------------------------------------------------------
 # 【概要】
 #   system_startup の公開入口
@@ -52,6 +52,10 @@
 # REV24.3:
 #   - exit_closing_stale_reconcile_runtime_patch を起動時に明示適用
 #   - CLOSINGが長時間残った場合、ブローカー建玉と照合してOPEN/CLOSEDへ救済
+#
+# REV24.4:
+#   - board_settings_env_bridge_patch を最初に明示適用
+#   - settings.ini / settings.local.ini の板関連設定を runtime patch の os.getenv へ反映
 # ============================================================
 
 from __future__ import annotations
@@ -64,6 +68,13 @@ logger = logging.getLogger(__name__)
 
 
 def _install_entrypoint_runtime_patches() -> None:
+    try:
+        from core.startup.board_settings_env_bridge_patch import install as install_board_settings_env_bridge
+
+        install_board_settings_env_bridge()
+    except Exception:
+        logger.exception("[startup.entrypoint] board settings env bridge install failed")
+
     try:
         from core.startup.tonosama_history_missing_guard_patch import install as install_tonosama_history_guard
 
@@ -164,7 +175,7 @@ def _install_entrypoint_runtime_patches() -> None:
 
 
 def system_startup():
-    logger.info("🚀 system_startup entry REV24.3-CLOSING-STALE-RECONCILE")
+    logger.info("🚀 system_startup entry REV24.4-BOARD-SETTINGS-ENV-BRIDGE")
     _install_entrypoint_runtime_patches()
     return run_system_startup()
 
