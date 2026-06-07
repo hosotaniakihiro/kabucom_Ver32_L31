@@ -1,9 +1,18 @@
 # ============================================================
 # File   : core/startup/entry_summary_retry_rotation_runtime_patch.py
-# Version: V1.0-SUMMARY-AI-RETRY-ROTATION-3ROUNDS
+# Version: V1.1-SUMMARY-AI-REST-BOARD-REPRICE-ONCE
 # ------------------------------------------------------------
 # SUMMARY_AIでAI_OKになった候補を、未約定2秒キャンセル後に
-# pendingへ戻し、最大3巡まで循環させる。
+# pendingへ戻す。
+#
+# V1.0:
+#   - 最大3巡まで循環。
+#
+# V1.1:
+#   - RESTフル板エントリー有効時は、再queueを原則1回だけにする。
+#   - 再queue時にもう一度 build_entry_order() を通るため、REST板で
+#     価格を再計算できる。
+#   - 1回再挑戦しても約定しない場合は、同銘柄に粘らず次候補へ進む。
 # ============================================================
 
 from __future__ import annotations
@@ -50,6 +59,18 @@ def _sym(v: Any) -> str:
     return s[:-2] if s.endswith(".0") else s
 
 
+def _rest_board_reprice_mode() -> bool:
+    return _env_bool("ENTRY_REST_FULL_BOARD_ENABLED", True) and _env_bool("ENTRY_REST_REPRICE_RETRY_ONCE", True)
+
+
+def _retry_max_rounds_default() -> int:
+    return 1 if _rest_board_reprice_mode() else 3
+
+
+def _retry_cooldown_default() -> float:
+    return 4.0 if _rest_board_reprice_mode() else 2.5
+
+
 def _is_summary_ai(entry: Dict[str, Any]) -> bool:
     src = str(entry.get("source") or "").strip().upper()
     typ = str(entry.get("entry_type") or "").strip().upper()
@@ -59,14 +80,14 @@ def _is_summary_ai(entry: Dict[str, Any]) -> bool:
 def _set_short_cooldown(symbol: str) -> None:
     try:
         from global_state import global_data
-        sec = _env_float("ENTRY_SUMMARY_RETRY_SYMBOL_COOLDOWN_SEC", 2.5)
+        sec = _env_float("ENTRY_SUMMARY_RETRY_SYMBOL_COOLDOWN_SEC", _retry_cooldown_default())
         if sec <= 0:
             return
         until = dt.datetime.now() + dt.timedelta(seconds=sec)
         if not hasattr(global_data, "trade_restricted") or not isinstance(global_data.trade_restricted, dict):
             global_data.trade_restricted = {}
         global_data.trade_restricted[_sym(symbol)] = until
-        logger.warning("[SUMMARY RETRY ROTATION] short cooldown symbol=%s until=%s", symbol, until)
+        logger.warning("[SUMMARY RETRY ROTATION] short cooldown symbol=%s until=%s sec=%.2f rest_reprice=%s", symbol, until, sec, _rest_board_reprice_mode())
     except Exception:
         logger.exception("[SUMMARY RETRY ROTATION] cooldown failed symbol=%s", symbol)
 
@@ -86,9 +107,13 @@ def _remember_order(order_id: str, symbol: str, side: str) -> None:
         saved["entry_type"] = saved.get("entry_type") or "SUMMARY_AI"
         saved["summary_retry_round"] = int(saved.get("summary_retry_round") or 0)
         saved["summary_retry_original_order_id"] = str(order_id)
+        saved["rest_board_reprice_retry"] = bool(_rest_board_reprice_mode())
         with _LOCK:
             _ORDER_ENTRY_MAP[str(order_id)] = saved
-        logger.warning("[SUMMARY RETRY ROTATION] remember order_id=%s symbol=%s side=%s round=%s", order_id, symbol, side, saved.get("summary_retry_round"))
+        logger.warning(
+            "[SUMMARY RETRY ROTATION] remember order_id=%s symbol=%s side=%s round=%s rest_reprice=%s",
+            order_id, symbol, side, saved.get("summary_retry_round"), saved.get("rest_board_reprice_retry"),
+        )
     except Exception:
         logger.exception("[SUMMARY RETRY ROTATION] remember failed order_id=%s", order_id)
 
@@ -101,21 +126,31 @@ def on_unfilled_order_cancelled(symbol: str, order_id: str) -> bool:
             entry = _ORDER_ENTRY_MAP.pop(str(order_id), None)
         if not isinstance(entry, dict) or not _is_summary_ai(entry):
             return False
-        max_rounds = _env_int("ENTRY_SUMMARY_RETRY_MAX_ROUNDS", 3)
+
+        max_rounds = _env_int("ENTRY_SUMMARY_RETRY_MAX_ROUNDS", _retry_max_rounds_default())
         new_round = int(entry.get("summary_retry_round") or 0) + 1
         if new_round > max_rounds:
-            logger.warning("[SUMMARY RETRY ROTATION] max rounds reached symbol=%s order_id=%s round=%s max=%s", symbol, order_id, new_round, max_rounds)
+            logger.warning(
+                "[SUMMARY RETRY ROTATION] max rounds reached symbol=%s order_id=%s round=%s max=%s rest_reprice=%s -> move next candidate",
+                symbol, order_id, new_round, max_rounds, entry.get("rest_board_reprice_retry"),
+            )
             return False
+
         entry["summary_retry_round"] = new_round
         entry["summary_retry_prev_order_id"] = str(order_id)
         entry["created_at"] = dt.datetime.now()
         entry["symbol"] = _sym(entry.get("symbol") or symbol)
         entry["source"] = entry.get("source") or "SUMMARY"
         entry["entry_type"] = entry.get("entry_type") or "SUMMARY_AI"
+        entry["retry_reprice_reason"] = "unfilled_cancel_rest_board_reprice" if _rest_board_reprice_mode() else "unfilled_cancel_retry"
+
         from trading.entry.pending_manager import add_pending, snapshot_root
         ok = add_pending(entry)
         _set_short_cooldown(entry["symbol"])
-        logger.warning("[SUMMARY RETRY ROTATION] requeue symbol=%s side=%s round=%s/%s ok=%s root=%s", entry.get("symbol"), entry.get("side"), new_round, max_rounds, ok, snapshot_root())
+        logger.warning(
+            "[SUMMARY RETRY ROTATION] requeue symbol=%s side=%s round=%s/%s ok=%s root=%s rest_reprice=%s reason=%s",
+            entry.get("symbol"), entry.get("side"), new_round, max_rounds, ok, snapshot_root(), entry.get("rest_board_reprice_retry"), entry.get("retry_reprice_reason"),
+        )
         return bool(ok)
     except Exception:
         logger.exception("[SUMMARY RETRY ROTATION] requeue failed symbol=%s order_id=%s", symbol, order_id)
@@ -159,7 +194,12 @@ def install() -> bool:
         wrapped_add_entry_inflight._original = old_add  # type: ignore[attr-defined]
         global_data.add_entry_inflight = wrapped_add_entry_inflight
     _INSTALLED = True
-    logger.warning("[SUMMARY RETRY ROTATION] installed max_rounds=%s cooldown_sec=%s", _env_int("ENTRY_SUMMARY_RETRY_MAX_ROUNDS", 3), _env_float("ENTRY_SUMMARY_RETRY_SYMBOL_COOLDOWN_SEC", 2.5))
+    logger.warning(
+        "[SUMMARY RETRY ROTATION] installed max_rounds=%s cooldown_sec=%.2f rest_reprice_once=%s",
+        _env_int("ENTRY_SUMMARY_RETRY_MAX_ROUNDS", _retry_max_rounds_default()),
+        _env_float("ENTRY_SUMMARY_RETRY_SYMBOL_COOLDOWN_SEC", _retry_cooldown_default()),
+        _rest_board_reprice_mode(),
+    )
     return True
 
 try:
