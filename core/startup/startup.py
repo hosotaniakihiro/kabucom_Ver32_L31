@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/startup.py
-# Version: FINAL-PRODUCTION-REV24.1-REST-BOARD-ENTRY-EXIT-REPRICE
+# Version: FINAL-PRODUCTION-REV24.2-EXIT-FILL-CONFIRM
 # ------------------------------------------------------------
 # 【概要】
 #   system_startup の公開入口
@@ -44,6 +44,10 @@
 #   - exit_limit_pending_close_runtime_patch を起動時に明示適用
 #   - exit_unfilled_reprice_runtime_patch を起動時に明示適用
 #   - 指値EXITを注文受付だけでCLOSEDにせず、未約定時は取消→再EXITへ回す
+#
+# REV24.2:
+#   - exit_order_fill_confirm_runtime_patch を起動時に明示適用
+#   - CLOSING返済注文を監視し、全約定なら正式CLOSEDへ確定
 # ============================================================
 
 from __future__ import annotations
@@ -140,9 +144,16 @@ def _install_entrypoint_runtime_patches() -> None:
     except Exception:
         logger.exception("[startup.entrypoint] exit unfilled reprice patch install failed")
 
+    try:
+        from core.startup.exit_order_fill_confirm_runtime_patch import install as install_exit_order_fill_confirm_patch
+
+        install_exit_order_fill_confirm_patch()
+    except Exception:
+        logger.exception("[startup.entrypoint] exit order fill confirm patch install failed")
+
 
 def system_startup():
-    logger.info("🚀 system_startup entry REV24.1-REST-BOARD-ENTRY-EXIT-REPRICE")
+    logger.info("🚀 system_startup entry REV24.2-EXIT-FILL-CONFIRM")
     _install_entrypoint_runtime_patches()
     return run_system_startup()
 
