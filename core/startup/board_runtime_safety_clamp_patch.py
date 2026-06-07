@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/board_runtime_safety_clamp_patch.py
-# Version: V1.1-BOARD-RUNTIME-SAFETY-CLAMP-RECONCILE-REST
+# Version: V1.2-BOARD-RUNTIME-SAFETY-CLAMP-API-MONITOR
 # ------------------------------------------------------------
 # settings.ini / env に危険な値が入っても、板関連runtime設定を
 # 起動時に安全範囲へ補正する。
@@ -52,6 +52,10 @@ _FLOAT_RANGES = {
     "EXIT_CLOSING_STALE_SEC": (5.0, 300.0, 20.0),
     "EXIT_CLOSING_RECONCILE_INTERVAL_SEC": (1.0, 60.0, 5.0),
     "EXIT_CLOSING_RECONCILE_REST_TIMEOUT_SEC": (0.5, 5.0, 1.5),
+
+    # API monitor
+    "BOARD_REST_API_MONITOR_INTERVAL_SEC": (10.0, 300.0, 60.0),
+    "BOARD_REST_API_MONITOR_WARN_BOARD_PER_MIN": (10.0, 2000.0, 120.0),
 }
 
 _INT_RANGES = {
@@ -83,6 +87,7 @@ _BOOL_KEYS = [
     "EXIT_FILL_CONFIRM_ENABLED",
     "EXIT_CLOSING_RECONCILE_ENABLED",
     "EXIT_CLOSING_RECONCILE_ALLOW_MEMORY_FALLBACK",
+    "BOARD_REST_API_MONITOR_ENABLED",
 ]
 
 _TRUE = {"1", "true", "yes", "y", "on", "enable", "enabled", "ok"}
@@ -188,12 +193,15 @@ def install() -> bool:
     notes = _dependency_clamps()
     _INSTALLED = True
     logger.warning(
-        "[BOARD RUNTIME SAFETY] installed changed=%s keys=%s notes=%s reconcile_rest_timeout=%s memory_fallback=%s",
+        "[BOARD RUNTIME SAFETY] installed changed=%s keys=%s notes=%s reconcile_rest_timeout=%s memory_fallback=%s api_monitor=%s monitor_interval=%s warn_board_per_min=%s",
         len(changed_keys),
         changed_keys[:40],
         notes,
         os.environ.get("EXIT_CLOSING_RECONCILE_REST_TIMEOUT_SEC"),
         os.environ.get("EXIT_CLOSING_RECONCILE_ALLOW_MEMORY_FALLBACK"),
+        os.environ.get("BOARD_REST_API_MONITOR_ENABLED"),
+        os.environ.get("BOARD_REST_API_MONITOR_INTERVAL_SEC"),
+        os.environ.get("BOARD_REST_API_MONITOR_WARN_BOARD_PER_MIN"),
     )
     return True
 
