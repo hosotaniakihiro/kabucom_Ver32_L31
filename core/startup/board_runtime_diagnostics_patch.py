@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/board_runtime_diagnostics_patch.py
-# Version: V1-BOARD-RUNTIME-DIAGNOSTICS
+# Version: V1.1-BOARD-RUNTIME-DIAGNOSTICS-RECONCILE-REST
 # ------------------------------------------------------------
 # 起動時にRESTフル板/未約定/返済CLOSING関連の実効設定を
 # 1回だけまとめてログ出力する。
@@ -72,6 +72,8 @@ _GROUPS = {
         "EXIT_CLOSING_RECONCILE_ENABLED",
         "EXIT_CLOSING_STALE_SEC",
         "EXIT_CLOSING_RECONCILE_INTERVAL_SEC",
+        "EXIT_CLOSING_RECONCILE_REST_TIMEOUT_SEC",
+        "EXIT_CLOSING_RECONCILE_ALLOW_MEMORY_FALLBACK",
     ],
 }
 
@@ -99,7 +101,7 @@ def install() -> bool:
         logger.warning(_summary_line(name, keys))
 
     logger.warning(
-        "[BOARD RUNTIME DIAG] EFFECTIVE entry_rest=%s entry_imbalance=%s entry_double_check=%s exit_rest=%s exit_pending_close=%s exit_reprice=%s exit_fill_confirm=%s exit_stale_reconcile=%s",
+        "[BOARD RUNTIME DIAG] EFFECTIVE entry_rest=%s entry_imbalance=%s entry_double_check=%s exit_rest=%s exit_pending_close=%s exit_reprice=%s exit_fill_confirm=%s exit_stale_reconcile=%s reconcile_memory_fallback=%s",
         _bool_on("ENTRY_REST_FULL_BOARD_ENABLED"),
         _bool_on("ENTRY_REST_FULL_BOARD_IMBALANCE_GUARD_ENABLED"),
         _bool_on("ENTRY_REST_FULL_BOARD_DOUBLE_CHECK_ENABLED"),
@@ -108,6 +110,7 @@ def install() -> bool:
         _bool_on("EXIT_UNFILLED_REPRICE_ENABLED"),
         _bool_on("EXIT_FILL_CONFIRM_ENABLED"),
         _bool_on("EXIT_CLOSING_RECONCILE_ENABLED"),
+        _bool_on("EXIT_CLOSING_RECONCILE_ALLOW_MEMORY_FALLBACK"),
     )
     _INSTALLED = True
     return True
