@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/startup.py
-# Version: FINAL-PRODUCTION-REV24.7-BOARD-REST-API-MONITOR
+# Version: FINAL-PRODUCTION-REV24.8-BOARD-RUNTIME-SELF-CHECK
 # ------------------------------------------------------------
 # 【概要】
 #   system_startup の公開入口
@@ -68,6 +68,10 @@
 # REV24.7:
 #   - board_rest_api_monitor_patch を診断後・REST利用パッチ前に明示適用
 #   - kabusapi /board /positions /orders の呼び出し回数を1分ごとに監視
+#
+# REV24.8:
+#   - board_runtime_self_check_patch を全runtime patch適用後に明示適用
+#   - APIを叩かずに、板/EXIT関連patchのwrap状態を起動ログで確認
 # ============================================================
 
 from __future__ import annotations
@@ -206,9 +210,16 @@ def _install_entrypoint_runtime_patches() -> None:
     except Exception:
         logger.exception("[startup.entrypoint] exit closing stale reconcile patch install failed")
 
+    try:
+        from core.startup.board_runtime_self_check_patch import install as install_board_runtime_self_check
+
+        install_board_runtime_self_check()
+    except Exception:
+        logger.exception("[startup.entrypoint] board runtime self check install failed")
+
 
 def system_startup():
-    logger.info("🚀 system_startup entry REV24.7-BOARD-REST-API-MONITOR")
+    logger.info("🚀 system_startup entry REV24.8-BOARD-RUNTIME-SELF-CHECK")
     _install_entrypoint_runtime_patches()
     return run_system_startup()
 
