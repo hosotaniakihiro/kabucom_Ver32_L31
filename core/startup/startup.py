@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/startup.py
-# Version: FINAL-PRODUCTION-REV24.6-BOARD-RUNTIME-SAFETY-CLAMP
+# Version: FINAL-PRODUCTION-REV24.7-BOARD-REST-API-MONITOR
 # ------------------------------------------------------------
 # 【概要】
 #   system_startup の公開入口
@@ -64,6 +64,10 @@
 # REV24.6:
 #   - board_runtime_safety_clamp_patch を診断前に明示適用
 #   - 危険な板関連設定値を安全範囲へ補正してから診断ログ出力
+#
+# REV24.7:
+#   - board_rest_api_monitor_patch を診断後・REST利用パッチ前に明示適用
+#   - kabusapi /board /positions /orders の呼び出し回数を1分ごとに監視
 # ============================================================
 
 from __future__ import annotations
@@ -96,6 +100,13 @@ def _install_entrypoint_runtime_patches() -> None:
         install_board_runtime_diagnostics()
     except Exception:
         logger.exception("[startup.entrypoint] board runtime diagnostics install failed")
+
+    try:
+        from core.startup.board_rest_api_monitor_patch import install as install_board_rest_api_monitor
+
+        install_board_rest_api_monitor()
+    except Exception:
+        logger.exception("[startup.entrypoint] board REST API monitor install failed")
 
     try:
         from core.startup.tonosama_history_missing_guard_patch import install as install_tonosama_history_guard
@@ -197,7 +208,7 @@ def _install_entrypoint_runtime_patches() -> None:
 
 
 def system_startup():
-    logger.info("🚀 system_startup entry REV24.6-BOARD-RUNTIME-SAFETY-CLAMP")
+    logger.info("🚀 system_startup entry REV24.7-BOARD-REST-API-MONITOR")
     _install_entrypoint_runtime_patches()
     return run_system_startup()
 
