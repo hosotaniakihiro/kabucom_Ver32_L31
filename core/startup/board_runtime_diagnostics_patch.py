@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/board_runtime_diagnostics_patch.py
-# Version: V1.2-BOARD-RUNTIME-DIAGNOSTICS-API-MONITOR
+# Version: V1.3-BOARD-RUNTIME-DIAGNOSTICS-SELF-CHECK-PATH
 # ------------------------------------------------------------
 # 起動時にRESTフル板/未約定/返済CLOSING関連の実効設定を
 # 1回だけまとめてログ出力する。
@@ -80,6 +80,9 @@ _GROUPS = {
         "BOARD_REST_API_MONITOR_INTERVAL_SEC",
         "BOARD_REST_API_MONITOR_WARN_BOARD_PER_MIN",
     ],
+    "SELF_CHECK": [
+        "BOARD_RUNTIME_SELF_CHECK_PATH",
+    ],
 }
 
 
@@ -106,7 +109,7 @@ def install() -> bool:
         logger.warning(_summary_line(name, keys))
 
     logger.warning(
-        "[BOARD RUNTIME DIAG] EFFECTIVE entry_rest=%s entry_imbalance=%s entry_double_check=%s exit_rest=%s exit_pending_close=%s exit_reprice=%s exit_fill_confirm=%s exit_stale_reconcile=%s reconcile_memory_fallback=%s api_monitor=%s",
+        "[BOARD RUNTIME DIAG] EFFECTIVE entry_rest=%s entry_imbalance=%s entry_double_check=%s exit_rest=%s exit_pending_close=%s exit_reprice=%s exit_fill_confirm=%s exit_stale_reconcile=%s reconcile_memory_fallback=%s api_monitor=%s self_check_path=%s",
         _bool_on("ENTRY_REST_FULL_BOARD_ENABLED"),
         _bool_on("ENTRY_REST_FULL_BOARD_IMBALANCE_GUARD_ENABLED"),
         _bool_on("ENTRY_REST_FULL_BOARD_DOUBLE_CHECK_ENABLED"),
@@ -117,6 +120,7 @@ def install() -> bool:
         _bool_on("EXIT_CLOSING_RECONCILE_ENABLED"),
         _bool_on("EXIT_CLOSING_RECONCILE_ALLOW_MEMORY_FALLBACK"),
         _bool_on("BOARD_REST_API_MONITOR_ENABLED"),
+        _v("BOARD_RUNTIME_SELF_CHECK_PATH"),
     )
     _INSTALLED = True
     return True
