@@ -1,23 +1,32 @@
 # ============================================================
 # File   : core/startup/exit_closing_stale_reconcile_runtime_patch.py
-# Version: V1-STALE-CLOSING-BROKER-RECONCILE
+# Version: V1.1-STALE-CLOSING-BROKER-REST-FIRST
 # ------------------------------------------------------------
 # CLOSINGのまま長時間残った建玉を救済する。
 #
 # 方針:
 #   - positions.db の CLOSING が一定秒数以上残ったら確認対象
+#   - 原則、ブローカーREST建玉取得に成功した時だけOPEN/CLOSEDへ救済
 #   - ブローカー建玉に同銘柄が残っていなければ CLOSED 確定
 #   - ブローカー建玉に同銘柄が残っていれば OPEN に戻す
 #   - ブローカー取得に失敗した場合は何もしない
+#
+# V1.1:
+#   - global_data.open_positions を最優先しない。
+#   - メモリ状態でCLOSING救済を確定すると誤判定の危険があるため、
+#     REST建玉取得成功時だけ確定判断する。
 # ============================================================
 
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import os
 import threading
 import time
+import urllib.parse
+import urllib.request
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -75,25 +84,71 @@ def _row_age_sec(row: Any) -> float:
     return 999999.0
 
 
-def _load_broker_open_symbols() -> tuple[bool, set[str]]:
-    # 1. global_data がブローカー同期済みならまずそこを見る。
-    symbols: set[str] = set()
-    try:
-        from global_state import global_data
-        positions = getattr(global_data, "open_positions", None)
-        if isinstance(positions, dict):
-            for k, v in positions.items():
-                sym = _sym(k or (v.get("symbol") if isinstance(v, dict) else ""))
-                if sym:
-                    status = str(v.get("status") if isinstance(v, dict) else "OPEN").upper()
-                    if status not in {"CLOSED", "CLOSE", "EXITED", "DONE", "CANCELED", "CANCELLED", "REJECTED"}:
-                        symbols.add(sym)
-            if symbols:
-                return True, symbols
-    except Exception:
-        logger.debug("[EXIT CLOSING RECONCILE] global_data broker symbols failed", exc_info=True)
+def _extract_position_rows(ret: Any) -> list[dict]:
+    if isinstance(ret, dict):
+        rows = ret.get("Positions") or ret.get("positions") or ret.get("Data") or ret.get("data") or []
+    else:
+        rows = ret
+    if isinstance(rows, list):
+        return [x for x in rows if isinstance(x, dict)]
+    return []
 
-    # 2. kabu REST positions helper があれば使う。環境差を吸収するため複数候補。
+
+def _rows_to_open_symbols(rows: list[dict]) -> set[str]:
+    out: set[str] = set()
+    for p in rows or []:
+        sym = _sym(p.get("Symbol") or p.get("symbol") or p.get("Code") or p.get("code"))
+        qty = _f(
+            p.get("LeavesQty")
+            or p.get("HoldQty")
+            or p.get("Qty")
+            or p.get("qty")
+            or p.get("LeavesQuantity")
+            or p.get("HoldQuantity"),
+            0.0,
+        )
+        if sym and qty > 0:
+            out.add(sym)
+    return out
+
+
+def _get_token() -> str | None:
+    try:
+        from token_manager import get_valid_token, refresh_token
+        return get_valid_token() or refresh_token()
+    except Exception:
+        logger.debug("[EXIT CLOSING RECONCILE] token unavailable", exc_info=True)
+        return None
+
+
+def _fetch_positions_rest_direct() -> tuple[bool, set[str]]:
+    token = _get_token()
+    if not token:
+        return False, set()
+    base = os.getenv("KABUSAPI_BASE_URL", "http://localhost:18080/kabusapi").rstrip("/")
+    # kabuS API positions は product 指定なしでも返る環境が多いが、念のため現物/信用候補も試す。
+    urls = [
+        f"{base}/positions",
+        f"{base}/positions?{urllib.parse.urlencode({'product': 2})}",
+        f"{base}/positions?{urllib.parse.urlencode({'product': 0})}",
+    ]
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={"X-API-KEY": token}, method="GET")
+            with urllib.request.urlopen(req, timeout=_env_float("EXIT_CLOSING_RECONCILE_REST_TIMEOUT_SEC", 1.5)) as res:
+                raw = json.loads(res.read().decode("utf-8", errors="replace"))
+            rows = _extract_position_rows(raw)
+            symbols = _rows_to_open_symbols(rows)
+            logger.info("[EXIT CLOSING RECONCILE] REST positions ok url=%s rows=%s symbols=%s", url, len(rows), sorted(symbols)[:20])
+            return True, symbols
+        except Exception:
+            logger.debug("[EXIT CLOSING RECONCILE] direct REST positions failed url=%s", url, exc_info=True)
+            continue
+    return False, set()
+
+
+def _load_broker_open_symbols() -> tuple[bool, set[str]]:
+    # 1. まずブローカーREST helperを試す。
     candidates = [
         ("kabu_api.positions", "get_positions"),
         ("kabu_api.position", "get_positions"),
@@ -107,20 +162,36 @@ def _load_broker_open_symbols() -> tuple[bool, set[str]]:
             if not callable(fn):
                 continue
             ret = fn()
-            rows = ret.get("Positions", ret.get("positions", [])) if isinstance(ret, dict) else ret
-            if not isinstance(rows, list):
-                continue
-            for p in rows:
-                if not isinstance(p, dict):
-                    continue
-                sym = _sym(p.get("Symbol") or p.get("symbol") or p.get("Code") or p.get("code"))
-                qty = _f(p.get("LeavesQty") or p.get("HoldQty") or p.get("Qty") or p.get("qty") or p.get("LeavesQuantity"), 0.0)
-                if sym and qty > 0:
-                    symbols.add(sym)
+            rows = _extract_position_rows(ret)
+            symbols = _rows_to_open_symbols(rows)
+            logger.info("[EXIT CLOSING RECONCILE] helper positions ok module=%s rows=%s symbols=%s", mod_name, len(rows), sorted(symbols)[:20])
             return True, symbols
         except Exception:
             continue
 
+    # 2. helperが無い/失敗する場合は直接REST。
+    ok, symbols = _fetch_positions_rest_direct()
+    if ok:
+        return True, symbols
+
+    # 3. 最後の補助: 明示許可時だけメモリを見る。デフォルトでは使わない。
+    if not _env_bool("EXIT_CLOSING_RECONCILE_ALLOW_MEMORY_FALLBACK", False):
+        return False, set()
+    symbols: set[str] = set()
+    try:
+        from global_state import global_data
+        positions = getattr(global_data, "open_positions", None)
+        if isinstance(positions, dict):
+            for k, v in positions.items():
+                sym = _sym(k or (v.get("symbol") if isinstance(v, dict) else ""))
+                if sym:
+                    status = str(v.get("status") if isinstance(v, dict) else "OPEN").upper()
+                    if status not in {"CLOSED", "CLOSE", "EXITED", "DONE", "CANCELED", "CANCELLED", "REJECTED"}:
+                        symbols.add(sym)
+            logger.warning("[EXIT CLOSING RECONCILE] memory fallback used symbols=%s", sorted(symbols)[:20])
+            return True, symbols
+    except Exception:
+        logger.debug("[EXIT CLOSING RECONCILE] memory fallback failed", exc_info=True)
     return False, set()
 
 
@@ -166,14 +237,14 @@ def _loop() -> None:
 
     interval = max(1.0, _env_float("EXIT_CLOSING_RECONCILE_INTERVAL_SEC", 5.0))
     stale_sec = max(2.0, _env_float("EXIT_CLOSING_STALE_SEC", 20.0))
-    logger.warning("[EXIT CLOSING RECONCILE] loop start interval=%.1fs stale_sec=%.1fs", interval, stale_sec)
+    logger.warning("[EXIT CLOSING RECONCILE] loop start interval=%.1fs stale_sec=%.1fs rest_first=True", interval, stale_sec)
 
     while True:
         session = None
         try:
             ok, broker_symbols = _load_broker_open_symbols()
             if not ok:
-                logger.debug("[EXIT CLOSING RECONCILE] broker symbols unavailable -> skip")
+                logger.debug("[EXIT CLOSING RECONCILE] broker REST symbols unavailable -> skip")
                 time.sleep(interval)
                 continue
             session = Session_position()
@@ -187,13 +258,13 @@ def _loop() -> None:
                 if age < stale_sec:
                     continue
                 if sym in broker_symbols:
-                    _open_row(row, "closing_stale_broker_still_open")
+                    _open_row(row, "closing_stale_broker_rest_still_open")
                     changed += 1
-                    logger.warning("[EXIT CLOSING RECONCILE] stale CLOSING -> OPEN symbol=%s age=%.1fs broker_open=True", sym, age)
+                    logger.warning("[EXIT CLOSING RECONCILE] stale CLOSING -> OPEN symbol=%s age=%.1fs broker_open=True source=REST", sym, age)
                 else:
-                    _close_row(row, "closing_stale_broker_flat_confirmed")
+                    _close_row(row, "closing_stale_broker_rest_flat_confirmed")
                     changed += 1
-                    logger.warning("[EXIT CLOSING RECONCILE] stale CLOSING -> CLOSED symbol=%s age=%.1fs broker_open=False", sym, age)
+                    logger.warning("[EXIT CLOSING RECONCILE] stale CLOSING -> CLOSED symbol=%s age=%.1fs broker_open=False source=REST", sym, age)
                     try:
                         from global_state import global_data
                         positions = getattr(global_data, "open_positions", None)
@@ -233,9 +304,11 @@ def install() -> bool:
         _THREAD_STARTED = True
     _INSTALLED = True
     logger.warning(
-        "[EXIT CLOSING RECONCILE] installed stale_sec=%.1f interval=%.1f",
+        "[EXIT CLOSING RECONCILE] installed stale_sec=%.1f interval=%.1f rest_timeout=%.1f memory_fallback=%s",
         _env_float("EXIT_CLOSING_STALE_SEC", 20.0),
         _env_float("EXIT_CLOSING_RECONCILE_INTERVAL_SEC", 5.0),
+        _env_float("EXIT_CLOSING_RECONCILE_REST_TIMEOUT_SEC", 1.5),
+        _env_bool("EXIT_CLOSING_RECONCILE_ALLOW_MEMORY_FALLBACK", False),
     )
     return True
 
