@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/startup.py
-# Version: FINAL-PRODUCTION-REV24.2-EXIT-FILL-CONFIRM
+# Version: FINAL-PRODUCTION-REV24.3-CLOSING-STALE-RECONCILE
 # ------------------------------------------------------------
 # 【概要】
 #   system_startup の公開入口
@@ -48,6 +48,10 @@
 # REV24.2:
 #   - exit_order_fill_confirm_runtime_patch を起動時に明示適用
 #   - CLOSING返済注文を監視し、全約定なら正式CLOSEDへ確定
+#
+# REV24.3:
+#   - exit_closing_stale_reconcile_runtime_patch を起動時に明示適用
+#   - CLOSINGが長時間残った場合、ブローカー建玉と照合してOPEN/CLOSEDへ救済
 # ============================================================
 
 from __future__ import annotations
@@ -151,9 +155,16 @@ def _install_entrypoint_runtime_patches() -> None:
     except Exception:
         logger.exception("[startup.entrypoint] exit order fill confirm patch install failed")
 
+    try:
+        from core.startup.exit_closing_stale_reconcile_runtime_patch import install as install_exit_closing_stale_reconcile_patch
+
+        install_exit_closing_stale_reconcile_patch()
+    except Exception:
+        logger.exception("[startup.entrypoint] exit closing stale reconcile patch install failed")
+
 
 def system_startup():
-    logger.info("🚀 system_startup entry REV24.2-EXIT-FILL-CONFIRM")
+    logger.info("🚀 system_startup entry REV24.3-CLOSING-STALE-RECONCILE")
     _install_entrypoint_runtime_patches()
     return run_system_startup()
 
