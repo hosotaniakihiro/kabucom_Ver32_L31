@@ -1,10 +1,14 @@
 # ============================================================
 # File   : core/startup/rest_full_board_entry_patch.py
-# Version: V1-CANDIDATE-ONLY
+# Version: V1.1-CANDIDATE-ONLY-IMBALANCE-GUARD
 # ------------------------------------------------------------
 # build_entry_order() が作った LIMIT 注文だけ、kabu Station REST
 # /board の複数段板で最終価格を補正する。
 # 常時監視銘柄にはRESTを叩かず、エントリー候補だけに限定する。
+#
+# V1.1:
+#   - 上位N本の買い板合計 / 売り板合計を使い、反対板が重すぎる
+#     エントリーを止める任意ガードを追加。
 # ============================================================
 
 from __future__ import annotations
@@ -182,6 +186,32 @@ def _decide_price(board: dict, side: str) -> tuple[float, str, dict]:
     return _round(p, side), mode, {"bid": bid, "ask": ask, "tick": t, "thick_level": lv, "bid_total_topN": _sum_qty(bids, n), "ask_total_topN": _sum_qty(asks, n), "depth": n}
 
 
+def _imbalance_ng(board: dict, side: str) -> dict | None:
+    if not _env_bool("ENTRY_REST_FULL_BOARD_IMBALANCE_GUARD_ENABLED", True):
+        return None
+    n = int(_env_float("ENTRY_REST_FULL_BOARD_IMBALANCE_DEPTH", 5))
+    bids, asks = list(board.get("bids") or []), list(board.get("asks") or [])
+    bid_total = _sum_qty(bids, n)
+    ask_total = _sum_qty(asks, n)
+    min_same = _env_float("ENTRY_REST_FULL_BOARD_MIN_SAME_SIDE_TOTAL", 300.0)
+    max_opp_ratio = _env_float("ENTRY_REST_FULL_BOARD_MAX_OPPOSITE_RATIO", 2.5)
+    min_ratio_denom = max(1.0, _env_float("ENTRY_REST_FULL_BOARD_RATIO_MIN_DENOM", 100.0))
+
+    if side == "BUY":
+        ratio = ask_total / max(bid_total, min_ratio_denom)
+        if bid_total < min_same:
+            return {"reason": "REST_FULL_BOARD_BUY_SUPPORT_TOO_THIN", "bid_total_topN": bid_total, "ask_total_topN": ask_total, "depth": n, "min_same_side_total": min_same}
+        if ratio > max_opp_ratio:
+            return {"reason": "REST_FULL_BOARD_BUY_SELL_WALL_TOO_HEAVY", "bid_total_topN": bid_total, "ask_total_topN": ask_total, "opposite_ratio": ratio, "max_opposite_ratio": max_opp_ratio, "depth": n}
+    elif side == "SELL":
+        ratio = bid_total / max(ask_total, min_ratio_denom)
+        if ask_total < min_same:
+            return {"reason": "REST_FULL_BOARD_SELL_RESISTANCE_TOO_THIN", "bid_total_topN": bid_total, "ask_total_topN": ask_total, "depth": n, "min_same_side_total": min_same}
+        if ratio > max_opp_ratio:
+            return {"reason": "REST_FULL_BOARD_SELL_BUY_WALL_TOO_HEAVY", "bid_total_topN": bid_total, "ask_total_topN": ask_total, "opposite_ratio": ratio, "max_opposite_ratio": max_opp_ratio, "depth": n}
+    return None
+
+
 def _patch_result(ret: dict, *, symbol: str, side: str, source: str) -> dict:
     if not isinstance(ret, dict) or not ret.get("ok") or not _source_enabled(source):
         return ret
@@ -201,6 +231,14 @@ def _patch_result(ret: dict, *, symbol: str, side: str, source: str) -> dict:
     max_spread = _env_float("ENTRY_REST_FULL_BOARD_MAX_SPREAD_PCT", _env_float("ENTRY_MAX_SPREAD_PCT", 0.15))
     if spread_pct > max_spread and _env_bool("ENTRY_REST_FULL_BOARD_STRICT_GUARD", True):
         return {"ok": False, "reason": "REST_FULL_BOARD_SPREAD_TOO_WIDE", "detail": {**detail, "bid": bid, "ask": ask, "spread_pct": spread_pct, "max_spread_pct": max_spread}}
+
+    imbalance_ng = _imbalance_ng(board, side)
+    if imbalance_ng is not None:
+        if _env_bool("ENTRY_REST_FULL_BOARD_IMBALANCE_STRICT", True):
+            logger.warning("[REST FULL BOARD] IMBALANCE_NG symbol=%s side=%s source=%s detail=%s", sym, side, source, imbalance_ng)
+            return {"ok": False, "reason": imbalance_ng.get("reason") or "REST_FULL_BOARD_IMBALANCE_NG", "detail": {**detail, **imbalance_ng, "rest_full_board": True, "spread_pct": spread_pct}}
+        detail["rest_full_board_imbalance_warning"] = imbalance_ng
+
     old = _safe_float(detail.get("price"))
     new, mode, meta = _decide_price(board, side)
     if new <= 0:
@@ -243,7 +281,11 @@ def install() -> bool:
         eob.build_entry_order = wrapped
         ec.build_entry_order = wrapped
         _INSTALLED = True
-        logger.warning("[REST FULL BOARD] installed candidate-only REST /board price patch")
+        logger.warning(
+            "[REST FULL BOARD] installed candidate-only REST /board price patch imbalance_guard=%s opposite_ratio=%.2f",
+            _env_bool("ENTRY_REST_FULL_BOARD_IMBALANCE_GUARD_ENABLED", True),
+            _env_float("ENTRY_REST_FULL_BOARD_MAX_OPPOSITE_RATIO", 2.5),
+        )
         return True
     except Exception:
         logger.exception("[REST FULL BOARD] install failed")
