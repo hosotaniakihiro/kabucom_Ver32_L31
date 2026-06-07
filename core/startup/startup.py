@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/startup.py
-# Version: FINAL-PRODUCTION-REV24.0-REST-FULL-BOARD-ENTRY
+# Version: FINAL-PRODUCTION-REV24.1-REST-BOARD-ENTRY-EXIT-REPRICE
 # ------------------------------------------------------------
 # 【概要】
 #   system_startup の公開入口
@@ -39,6 +39,11 @@
 # REV24.0:
 #   - rest_full_board_entry_patch を起動時に明示適用
 #   - エントリー候補のLIMIT注文だけ REST /board 複数段板で最終価格補正
+#
+# REV24.1:
+#   - exit_limit_pending_close_runtime_patch を起動時に明示適用
+#   - exit_unfilled_reprice_runtime_patch を起動時に明示適用
+#   - 指値EXITを注文受付だけでCLOSEDにせず、未約定時は取消→再EXITへ回す
 # ============================================================
 
 from __future__ import annotations
@@ -121,9 +126,23 @@ def _install_entrypoint_runtime_patches() -> None:
     except Exception:
         logger.exception("[startup.entrypoint] REST full board entry patch install failed")
 
+    try:
+        from core.startup.exit_limit_pending_close_runtime_patch import install as install_exit_limit_pending_close_patch
+
+        install_exit_limit_pending_close_patch()
+    except Exception:
+        logger.exception("[startup.entrypoint] exit limit pending close patch install failed")
+
+    try:
+        from core.startup.exit_unfilled_reprice_runtime_patch import install as install_exit_unfilled_reprice_patch
+
+        install_exit_unfilled_reprice_patch()
+    except Exception:
+        logger.exception("[startup.entrypoint] exit unfilled reprice patch install failed")
+
 
 def system_startup():
-    logger.info("🚀 system_startup entry REV24.0-REST-FULL-BOARD-ENTRY")
+    logger.info("🚀 system_startup entry REV24.1-REST-BOARD-ENTRY-EXIT-REPRICE")
     _install_entrypoint_runtime_patches()
     return run_system_startup()
 
