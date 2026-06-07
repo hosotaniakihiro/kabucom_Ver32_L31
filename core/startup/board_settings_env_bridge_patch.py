@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/board_settings_env_bridge_patch.py
-# Version: V1.1-SETTINGS-INI-TO-ENV-BRIDGE-RECONCILE-REST
+# Version: V1.2-SETTINGS-INI-TO-ENV-BRIDGE-API-MONITOR
 # ------------------------------------------------------------
 # RESTフル板/返済指値/未約定管理のruntime patchは os.getenv() を読む。
 # そのため settings.ini に書いた値を起動時に os.environ へ反映する。
@@ -77,6 +77,11 @@ _DEFAULTS = {
     "EXIT_CLOSING_RECONCILE_INTERVAL_SEC": "5",
     "EXIT_CLOSING_RECONCILE_REST_TIMEOUT_SEC": "1.5",
     "EXIT_CLOSING_RECONCILE_ALLOW_MEMORY_FALLBACK": "0",
+
+    # REST API monitor
+    "BOARD_REST_API_MONITOR_ENABLED": "1",
+    "BOARD_REST_API_MONITOR_INTERVAL_SEC": "60",
+    "BOARD_REST_API_MONITOR_WARN_BOARD_PER_MIN": "120",
 }
 
 _SECTIONS = ("board_runtime", "entry", "exit", "DEFAULT")
@@ -136,7 +141,7 @@ def install() -> bool:
         applied += 1
     _INSTALLED = True
     logger.warning(
-        "[BOARD SETTINGS ENV] installed applied=%s kept_existing_env=%s entry_rest=%s exit_rest=%s exit_reconcile=%s reconcile_rest_timeout=%s memory_fallback=%s",
+        "[BOARD SETTINGS ENV] installed applied=%s kept_existing_env=%s entry_rest=%s exit_rest=%s exit_reconcile=%s reconcile_rest_timeout=%s memory_fallback=%s api_monitor=%s",
         applied,
         kept,
         os.environ.get("ENTRY_REST_FULL_BOARD_ENABLED"),
@@ -144,6 +149,7 @@ def install() -> bool:
         os.environ.get("EXIT_CLOSING_RECONCILE_ENABLED"),
         os.environ.get("EXIT_CLOSING_RECONCILE_REST_TIMEOUT_SEC"),
         os.environ.get("EXIT_CLOSING_RECONCILE_ALLOW_MEMORY_FALLBACK"),
+        os.environ.get("BOARD_REST_API_MONITOR_ENABLED"),
     )
     return True
 
