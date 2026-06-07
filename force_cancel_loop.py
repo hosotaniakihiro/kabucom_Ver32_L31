@@ -5,6 +5,7 @@
 # ・未約定の指値注文を全キャンセル
 # ・global_data / pending_entries に依存しない
 # ・401 / timeout / 切断耐性あり
+# ・起動直後の API TOKEN 未設定にも耐性あり
 # ============================================================
 
 import time
@@ -35,10 +36,49 @@ CANCELABLE_STATES = {1, 2, 3, 4}
 
 
 # ============================================================
+# API TOKEN 準備確認
+# ============================================================
+
+def _has_api_token():
+    """
+    起動直後は login/token 設定より先に force_cancel_loop が動く場合がある。
+    この状態で get_headers() を呼ぶと RuntimeError になるため、事前に待避する。
+    """
+    try:
+        from kabu_api import global_data
+        token = getattr(global_data, "API_TOKEN", None)
+        return bool(token)
+    except Exception:
+        return False
+
+
+def _safe_get_headers(context):
+    """
+    API TOKEN 未準備時は例外にせず None を返す。
+    呼び出し側は None の場合、その tick をスキップする。
+    """
+    if not _has_api_token():
+        logger.warning("[FORCE_CANCEL] API TOKEN not ready; skip %s", context)
+        return None
+
+    try:
+        return get_headers()
+    except RuntimeError as e:
+        if "API TOKEN is not set" in str(e):
+            logger.warning("[FORCE_CANCEL] API TOKEN not ready in get_headers; skip %s", context)
+            return None
+        raise
+
+
+# ============================================================
 # 注文キャンセル
 # ============================================================
 
 def cancel_order(order_id):
+    headers = _safe_get_headers("cancel_order")
+    if headers is None:
+        return False
+
     payload = {
         "OrderId": order_id,
         "Password": PASSWORD,
@@ -47,7 +87,7 @@ def cancel_order(order_id):
     try:
         r = requests.put(
             f"{BASE_URL}/cancelorder",
-            headers=get_headers(),
+            headers=headers,
             json=payload,
             timeout=(2, 5),
         )
@@ -57,15 +97,18 @@ def cancel_order(order_id):
             f"[FORCE_CANCEL] order_id={order_id} "
             f"status={r.status_code} body={r.text}"
         )
+        return True
 
     except HTTPError as e:
         logger.error(
             f"[FORCE_CANCEL] HTTP error order_id={order_id} "
             f"status={e.response.status_code if e.response else 'N/A'}"
         )
+        return False
 
     except Exception:
         logger.exception(f"[FORCE_CANCEL] unexpected error order_id={order_id}")
+        return False
 
 
 # ============================================================
@@ -73,10 +116,14 @@ def cancel_order(order_id):
 # ============================================================
 
 def get_orders():
+    headers = _safe_get_headers("get_orders")
+    if headers is None:
+        return []
+
     try:
         r = requests.get(
             f"{BASE_URL}/orders",
-            headers=get_headers(),          # ★ 認証必須
+            headers=headers,          # ★ 認証必須
             timeout=(2, 5),
         )
         r.raise_for_status()
@@ -85,7 +132,7 @@ def get_orders():
 
         # kabu API は dict / list 両方あり得る
         if isinstance(data, dict):
-            return data.get("Orders", [])
+            return data.get("Orders", []) or data.get("orders", []) or []
         if isinstance(data, list):
             return data
 
@@ -106,6 +153,13 @@ def get_orders():
         logger.warning("⚠ kabu API connection error (get_orders)")
         return []
 
+    except RuntimeError as e:
+        if "API TOKEN is not set" in str(e):
+            logger.warning("[FORCE_CANCEL] API TOKEN not ready; skip get_orders")
+            return []
+        logger.exception("❌ runtime error in get_orders")
+        return []
+
     except Exception:
         logger.exception("❌ unexpected error in get_orders")
         return []
@@ -121,6 +175,11 @@ def start_force_cancel_loop(interval_sec=30):
 
     while True:
         try:
+            if not _has_api_token():
+                logger.warning("[FORCE_CANCEL] API TOKEN not ready; waiting")
+                time.sleep(interval_sec)
+                continue
+
             orders = get_orders()
             if not orders:
                 time.sleep(interval_sec)
