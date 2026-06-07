@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/startup.py
-# Version: FINAL-PRODUCTION-REV24.4-BOARD-SETTINGS-ENV-BRIDGE
+# Version: FINAL-PRODUCTION-REV24.5-BOARD-RUNTIME-DIAGNOSTICS
 # ------------------------------------------------------------
 # 【概要】
 #   system_startup の公開入口
@@ -56,6 +56,10 @@
 # REV24.4:
 #   - board_settings_env_bridge_patch を最初に明示適用
 #   - settings.ini / settings.local.ini の板関連設定を runtime patch の os.getenv へ反映
+#
+# REV24.5:
+#   - board_runtime_diagnostics_patch を設定ブリッジ直後に明示適用
+#   - 板関連runtime設定の実効値を起動時に一覧ログ出力
 # ============================================================
 
 from __future__ import annotations
@@ -74,6 +78,13 @@ def _install_entrypoint_runtime_patches() -> None:
         install_board_settings_env_bridge()
     except Exception:
         logger.exception("[startup.entrypoint] board settings env bridge install failed")
+
+    try:
+        from core.startup.board_runtime_diagnostics_patch import install as install_board_runtime_diagnostics
+
+        install_board_runtime_diagnostics()
+    except Exception:
+        logger.exception("[startup.entrypoint] board runtime diagnostics install failed")
 
     try:
         from core.startup.tonosama_history_missing_guard_patch import install as install_tonosama_history_guard
@@ -175,7 +186,7 @@ def _install_entrypoint_runtime_patches() -> None:
 
 
 def system_startup():
-    logger.info("🚀 system_startup entry REV24.4-BOARD-SETTINGS-ENV-BRIDGE")
+    logger.info("🚀 system_startup entry REV24.5-BOARD-RUNTIME-DIAGNOSTICS")
     _install_entrypoint_runtime_patches()
     return run_system_startup()
 
