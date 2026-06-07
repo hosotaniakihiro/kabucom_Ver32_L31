@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/rest_full_board_entry_patch.py
-# Version: V1.1-CANDIDATE-ONLY-IMBALANCE-GUARD
+# Version: V1.2-CANDIDATE-ONLY-DOUBLE-CHECK
 # ------------------------------------------------------------
 # build_entry_order() が作った LIMIT 注文だけ、kabu Station REST
 # /board の複数段板で最終価格を補正する。
@@ -9,6 +9,10 @@
 # V1.1:
 #   - 上位N本の買い板合計 / 売り板合計を使い、反対板が重すぎる
 #     エントリーを止める任意ガードを追加。
+#
+# V1.2:
+#   - 短時間でREST板を2回確認し、厚い板や同方向板合計が急に消えた
+#     場合は見せ板/不安定板としてエントリー停止する任意ガードを追加。
 # ============================================================
 
 from __future__ import annotations
@@ -101,17 +105,17 @@ def _get_token() -> str | None:
         return None
 
 
-def _fetch_board(symbol: str) -> dict | None:
+def _fetch_board(symbol: str, *, force: bool = False) -> dict | None:
     now = time.monotonic()
     cache_sec = _env_float("ENTRY_REST_FULL_BOARD_CACHE_SEC", 0.8)
     cached = _CACHE.get(symbol)
-    if cached and now - cached[0] <= cache_sec:
+    if not force and cached and now - cached[0] <= cache_sec:
         out = dict(cached[1])
         out["cache_hit"] = True
         return out
 
     min_interval = _env_float("ENTRY_REST_FULL_BOARD_MIN_INTERVAL_SEC", 0.7)
-    if cached and now - _LAST_CALL.get(symbol, 0.0) < min_interval:
+    if not force and cached and now - _LAST_CALL.get(symbol, 0.0) < min_interval:
         out = dict(cached[1])
         out["cache_hit"] = True
         out["rate_limited_cache"] = True
@@ -129,7 +133,7 @@ def _fetch_board(symbol: str) -> dict | None:
         with urllib.request.urlopen(req, timeout=_env_float("ENTRY_REST_FULL_BOARD_TIMEOUT_SEC", 0.8)) as res:
             raw = json.loads(res.read().decode("utf-8", errors="replace"))
     except Exception:
-        logger.debug("[REST FULL BOARD] request failed symbol=%s", symbol, exc_info=True)
+        logger.debug("[REST FULL BOARD] request failed symbol=%s force=%s", symbol, force, exc_info=True)
         return None
     if not isinstance(raw, dict):
         return None
@@ -150,7 +154,7 @@ def _fetch_board(symbol: str) -> dict | None:
     ask = _safe_float(raw.get("AskPrice")) or (asks[0]["price"] if asks else 0.0)
     if bid <= 0 or ask <= 0 or ask < bid:
         return None
-    board = {"bid": bid, "ask": ask, "bids": bids, "asks": asks, "source": "rest_board"}
+    board = {"bid": bid, "ask": ask, "bids": bids, "asks": asks, "source": "rest_board", "force": bool(force)}
     _CACHE[symbol] = (now, board)
     return dict(board)
 
@@ -164,6 +168,13 @@ def _thick(levels: list[dict], fallback_price: float) -> dict:
     usable = [x for x in levels if _safe_float(x.get("qty")) >= min_qty]
     src = usable or levels or [{"level": 1, "price": fallback_price, "qty": 0.0}]
     return max(src, key=lambda x: _safe_float(x.get("qty")))
+
+
+def _find_level_qty(levels: list[dict], price: float) -> float:
+    for lv in levels:
+        if abs(_safe_float(lv.get("price")) - float(price)) < 1e-9:
+            return _safe_float(lv.get("qty"))
+    return 0.0
 
 
 def _decide_price(board: dict, side: str) -> tuple[float, str, dict]:
@@ -212,6 +223,77 @@ def _imbalance_ng(board: dict, side: str) -> dict | None:
     return None
 
 
+def _double_check_ng(symbol: str, first_board: dict, side: str) -> dict | None:
+    if not _env_bool("ENTRY_REST_FULL_BOARD_DOUBLE_CHECK_ENABLED", True):
+        return None
+    wait_sec = max(0.0, _env_float("ENTRY_REST_FULL_BOARD_DOUBLE_CHECK_WAIT_SEC", 0.25))
+    remain_ratio = max(0.0, min(1.0, _env_float("ENTRY_REST_FULL_BOARD_DOUBLE_CHECK_MIN_REMAIN_RATIO", 0.60)))
+    n = int(_env_float("ENTRY_REST_FULL_BOARD_IMBALANCE_DEPTH", 5))
+
+    first_bids = list(first_board.get("bids") or [])
+    first_asks = list(first_board.get("asks") or [])
+    if side == "BUY":
+        first_levels = first_bids
+        first_total = _sum_qty(first_bids, n)
+        thick1 = _thick(first_bids, _safe_float(first_board.get("bid")))
+        level_key = "bid"
+    else:
+        first_levels = first_asks
+        first_total = _sum_qty(first_asks, n)
+        thick1 = _thick(first_asks, _safe_float(first_board.get("ask")))
+        level_key = "ask"
+
+    thick_price = _safe_float(thick1.get("price"))
+    thick_qty1 = _safe_float(thick1.get("qty"))
+    if wait_sec > 0:
+        time.sleep(wait_sec)
+
+    second = _fetch_board(symbol, force=True)
+    if not second:
+        if _env_bool("ENTRY_REST_FULL_BOARD_DOUBLE_CHECK_FAIL_OPEN", True):
+            return None
+        return {"reason": "REST_FULL_BOARD_DOUBLE_CHECK_MISSING", "wait_sec": wait_sec, "first_total_topN": first_total, "thick_level_first": thick1}
+
+    second_bids = list(second.get("bids") or [])
+    second_asks = list(second.get("asks") or [])
+    if side == "BUY":
+        second_levels = second_bids
+        second_total = _sum_qty(second_bids, n)
+    else:
+        second_levels = second_asks
+        second_total = _sum_qty(second_asks, n)
+    thick_qty2 = _find_level_qty(second_levels, thick_price)
+
+    total_floor = first_total * remain_ratio
+    thick_floor = thick_qty1 * remain_ratio
+    if first_total > 0 and second_total < total_floor:
+        return {
+            "reason": f"REST_FULL_BOARD_{side}_SIDE_TOTAL_DISAPPEARED",
+            "wait_sec": wait_sec,
+            "remain_ratio": remain_ratio,
+            "first_total_topN": first_total,
+            "second_total_topN": second_total,
+            "depth": n,
+            "level_side": level_key,
+        }
+    if thick_qty1 > 0 and thick_qty2 < thick_floor:
+        return {
+            "reason": f"REST_FULL_BOARD_{side}_THICK_LEVEL_DISAPPEARED",
+            "wait_sec": wait_sec,
+            "remain_ratio": remain_ratio,
+            "thick_price": thick_price,
+            "thick_qty_first": thick_qty1,
+            "thick_qty_second": thick_qty2,
+            "thick_level_first": thick1,
+            "level_side": level_key,
+        }
+    logger.info(
+        "[REST FULL BOARD] DOUBLE_CHECK_OK symbol=%s side=%s wait=%.3f first_total=%.0f second_total=%.0f thick_price=%s qty %.0f->%.0f",
+        symbol, side, wait_sec, first_total, second_total, thick_price, thick_qty1, thick_qty2,
+    )
+    return None
+
+
 def _patch_result(ret: dict, *, symbol: str, side: str, source: str) -> dict:
     if not isinstance(ret, dict) or not ret.get("ok") or not _source_enabled(source):
         return ret
@@ -238,6 +320,13 @@ def _patch_result(ret: dict, *, symbol: str, side: str, source: str) -> dict:
             logger.warning("[REST FULL BOARD] IMBALANCE_NG symbol=%s side=%s source=%s detail=%s", sym, side, source, imbalance_ng)
             return {"ok": False, "reason": imbalance_ng.get("reason") or "REST_FULL_BOARD_IMBALANCE_NG", "detail": {**detail, **imbalance_ng, "rest_full_board": True, "spread_pct": spread_pct}}
         detail["rest_full_board_imbalance_warning"] = imbalance_ng
+
+    double_ng = _double_check_ng(sym, board, side)
+    if double_ng is not None:
+        if _env_bool("ENTRY_REST_FULL_BOARD_DOUBLE_CHECK_STRICT", True):
+            logger.warning("[REST FULL BOARD] DOUBLE_CHECK_NG symbol=%s side=%s source=%s detail=%s", sym, side, source, double_ng)
+            return {"ok": False, "reason": double_ng.get("reason") or "REST_FULL_BOARD_DOUBLE_CHECK_NG", "detail": {**detail, **double_ng, "rest_full_board": True, "spread_pct": spread_pct}}
+        detail["rest_full_board_double_check_warning"] = double_ng
 
     old = _safe_float(detail.get("price"))
     new, mode, meta = _decide_price(board, side)
@@ -282,9 +371,12 @@ def install() -> bool:
         ec.build_entry_order = wrapped
         _INSTALLED = True
         logger.warning(
-            "[REST FULL BOARD] installed candidate-only REST /board price patch imbalance_guard=%s opposite_ratio=%.2f",
+            "[REST FULL BOARD] installed candidate-only REST /board price patch imbalance_guard=%s opposite_ratio=%.2f double_check=%s wait=%.3f remain=%.2f",
             _env_bool("ENTRY_REST_FULL_BOARD_IMBALANCE_GUARD_ENABLED", True),
             _env_float("ENTRY_REST_FULL_BOARD_MAX_OPPOSITE_RATIO", 2.5),
+            _env_bool("ENTRY_REST_FULL_BOARD_DOUBLE_CHECK_ENABLED", True),
+            _env_float("ENTRY_REST_FULL_BOARD_DOUBLE_CHECK_WAIT_SEC", 0.25),
+            _env_float("ENTRY_REST_FULL_BOARD_DOUBLE_CHECK_MIN_REMAIN_RATIO", 0.60),
         )
         return True
     except Exception:
