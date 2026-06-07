@@ -1,15 +1,22 @@
 # ============================================================
 # File   : core/startup/board_runtime_self_check_patch.py
-# Version: V1-BOARD-RUNTIME-SELF-CHECK
+# Version: V1.1-BOARD-RUNTIME-SELF-CHECK-PERSIST
 # ------------------------------------------------------------
 # マーケット時間外でも確認できる起動時セルフチェック。
 # APIは叩かず、runtime patchが実際にwrap/起動されているかを確認する。
+#
+# V1.1:
+#   - runtime/diagnostics/board_runtime_self_check.json に結果保存
+#   - ログが流れても後から確認できるようにする
 # ============================================================
 
 from __future__ import annotations
 
+import datetime as dt
+import json
 import logging
 import os
+from pathlib import Path
 import urllib.request
 from typing import Any
 
@@ -67,7 +74,11 @@ def _check_exit_executor() -> dict:
         close_payload = getattr(ex, "_build_kabu_close_payload", None)
         close_db = getattr(ex, "_close_db_position", None)
         out["available"] = callable(close_payload) or callable(close_db)
-        out["limit_board_touch_wrapped"] = _chain_has(close_payload, "_exit_limit_board_touch_wrapped_v11") or _chain_has(close_payload, "_exit_limit_board_touch_wrapped") if callable(close_payload) else False
+        if callable(close_payload):
+            out["limit_board_touch_wrapped"] = (
+                _chain_has(close_payload, "_exit_limit_board_touch_wrapped_v11")
+                or _chain_has(close_payload, "_exit_limit_board_touch_wrapped")
+            )
         out["pending_close_wrapped"] = _chain_has(close_db, "_exit_limit_pending_close_wrapped") if callable(close_db) else False
     except Exception as e:
         out["error"] = repr(e)
@@ -93,6 +104,23 @@ def _check_urlopen_monitor() -> dict:
     }
 
 
+def _diagnostics_path() -> Path:
+    raw = os.getenv("BOARD_RUNTIME_SELF_CHECK_PATH", "").strip()
+    if raw:
+        return Path(raw)
+    return Path("runtime") / "diagnostics" / "board_runtime_self_check.json"
+
+
+def _save_result(payload: dict) -> None:
+    try:
+        p = _diagnostics_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        logger.warning("[BOARD RUNTIME SELF CHECK] saved path=%s", p)
+    except Exception:
+        logger.exception("[BOARD RUNTIME SELF CHECK] save diagnostics failed")
+
+
 def install() -> bool:
     global _INSTALLED
     if _INSTALLED:
@@ -109,6 +137,7 @@ def install() -> bool:
             "exit_reprice": _b("EXIT_UNFILLED_REPRICE_ENABLED"),
             "exit_fill_confirm": _b("EXIT_FILL_CONFIRM_ENABLED"),
             "exit_closing_reconcile": _b("EXIT_CLOSING_RECONCILE_ENABLED"),
+            "api_monitor": _b("BOARD_REST_API_MONITOR_ENABLED"),
         },
     }
     ok = True
@@ -119,6 +148,14 @@ def install() -> bool:
         ok = ok and bool(checks["urlopen_monitor"].get("urlopen_wrapped"))
     except Exception:
         ok = False
+
+    payload = {
+        "ok": bool(ok),
+        "checked_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "checks": checks,
+        "diagnostics_path": str(_diagnostics_path()),
+    }
+    _save_result(payload)
     level = logger.warning if ok else logger.error
     level("[BOARD RUNTIME SELF CHECK] ok=%s checks=%s", ok, checks)
     _INSTALLED = True
