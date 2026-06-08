@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/final_entry_safety_guard_patch.py
-# Version: Ver04-BOARD-MISSING-PROTECTED-ALLOW
+# Version: Ver05-BOARD-GUARD-CALL-COMPAT
 # ------------------------------------------------------------
 # entry_controller._execute_best_candidate を runtime patch し、
 # 発注直前の最終安全ガードを追加する。
@@ -10,6 +10,11 @@
 #     連続停止していたため、板欠損時のfail-openを追加。
 #   - ただし無条件ではなく、価格・出来高・売買代金・scoreが最低条件を満たす時だけ許可。
 #   - 板欠損で許可した場合は小ロット化し、既存のentry_price_improvement/発注側に任せる。
+#
+# Ver05:
+#   - _board_guard の呼び出し形式を 3引数/4引数 両対応にする。
+#   - 古い runtime patch が _patched_board_guard(row, symbol, side) 形式で残っていても、
+#     _board_guard(row, item, symbol, side) 形式で呼ばれても TypeError で落ちないようにする。
 #
 # 優先度3「当日損失上限で新規停止」は、ユーザー要望により未実装。
 # ============================================================
@@ -337,7 +342,32 @@ def _board_missing_fallback_ok(row: dict, item: dict, symbol: str, side: str) ->
     return True
 
 
-def _board_guard(row: dict, item: dict, symbol: str, side: str) -> bool:
+def _board_guard(row: dict, item: dict | None = None, symbol: str | None = None, side: str | None = None, *_, **__) -> bool:
+    """
+    板ガード。
+
+    互換性のため、以下の両方を許容する。
+      - _board_guard(row, symbol, side)
+      - _board_guard(row, item, symbol, side)
+
+    旧runtime/別patchが 3引数形式を前提にしていても、ここで吸収して
+    patched execute failed の TypeError を防ぐ。
+    """
+    if side is None and symbol is not None:
+        # 旧形式: _board_guard(row, symbol, side)
+        side = symbol
+        symbol = item  # type: ignore[assignment]
+        item = None
+
+    row = _row_to_dict(row)
+    item = item if isinstance(item, dict) else {}
+    symbol = _norm_symbol(symbol or _first(row, ("symbol", "Symbol", "code", "銘柄コード"), ""))
+    side = _norm_side(side or _first(row, ("side", "entry_decision", "ai_side"), ""))
+
+    if not symbol or side not in {"BUY", "SELL"}:
+        _log_ng("board_guard_invalid_args", symbol, side, row_keys=list(row.keys()), item_keys=list(item.keys()))
+        return False
+
     if not _env_bool("ENTRY_BOARD_GUARD_ENABLED", True):
         return True
     bid, ask, bid_qty, ask_qty = _extract_bid_ask_from_row(row)
@@ -367,6 +397,10 @@ def _board_guard(row: dict, item: dict, symbol: str, side: str) -> bool:
         return False
     logger.info("[FINAL ENTRY SAFETY GUARD] BOARD_OK symbol=%s side=%s bid=%.4f ask=%.4f spread_pct=%.4f bid_qty=%.0f ask_qty=%.0f", symbol, side, bid, ask, spread_pct, bid_qty, ask_qty)
     return True
+
+
+# 互換名。古いログ/別パッチで _patched_board_guard と表示される環境でも同じ実装を使う。
+_patched_board_guard = _board_guard
 
 
 def _apply_contrarian_half_size(item: dict, row: dict, symbol: str, side: str) -> None:
@@ -431,7 +465,7 @@ def _is_currently_wrapped() -> bool:
     try:
         import trading.handlers.entry_controller as ec
         cur = getattr(ec, "_execute_best_candidate", None)
-        return bool(getattr(cur, "_final_entry_safety_guard_v04", False))
+        return bool(getattr(cur, "_final_entry_safety_guard_v05", False))
     except Exception:
         return False
 
@@ -447,19 +481,19 @@ def install() -> bool:
         if not callable(old):
             logger.error("[FINAL ENTRY SAFETY GUARD] target _execute_best_candidate unavailable")
             return False
-        if getattr(old, "_final_entry_safety_guard_v04", False):
+        if getattr(old, "_final_entry_safety_guard_v05", False):
             _INSTALLED = True
             return True
         if getattr(old, "_final_entry_safety_guard", False) and _ORIG_EXECUTE_BEST_CANDIDATE is not None:
             old = _ORIG_EXECUTE_BEST_CANDIDATE
         _ORIG_EXECUTE_BEST_CANDIDATE = old
         _patched_execute_best_candidate._final_entry_safety_guard = True  # type: ignore[attr-defined]
-        _patched_execute_best_candidate._final_entry_safety_guard_v04 = True  # type: ignore[attr-defined]
+        _patched_execute_best_candidate._final_entry_safety_guard_v05 = True  # type: ignore[attr-defined]
         _patched_execute_best_candidate._original_execute_best_candidate = old  # type: ignore[attr-defined]
         ec._execute_best_candidate = _patched_execute_best_candidate
         _INSTALLED = True
         logger.warning(
-            "[FINAL ENTRY SAFETY GUARD] installed v04 liquidity=%s min_volume=%.0f min_turnover=%.0f same_symbol_loss=%s recent_reverse=%s time_guard=%s board_guard=%s allow_without_board=%s board_missing_qty_ratio=%.2f contrarian_half=%s qty_ratio=%.2f daily_loss_guard=NOT_INSTALLED_BY_REQUEST",
+            "[FINAL ENTRY SAFETY GUARD] installed v05 liquidity=%s min_volume=%.0f min_turnover=%.0f same_symbol_loss=%s recent_reverse=%s time_guard=%s board_guard=%s allow_without_board=%s board_missing_qty_ratio=%.2f contrarian_half=%s qty_ratio=%.2f daily_loss_guard=NOT_INSTALLED_BY_REQUEST",
             _env_bool("ENTRY_FINAL_LIQUIDITY_GUARD_ENABLED", True),
             _env_float("ENTRY_MIN_VOLUME", 30000.0),
             _env_float("ENTRY_MIN_TURNOVER", 10000000.0),
