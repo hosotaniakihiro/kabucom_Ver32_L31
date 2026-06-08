@@ -53,7 +53,8 @@ _env_default("ENTRY_ALLOW_WITHOUT_BOARD_MIN_PRICE", "200")
 _env_default("ENTRY_ALLOW_WITHOUT_BOARD_MIN_SCORE", "0.90")
 _env_default("ENTRY_BOARD_MISSING_QTY_RATIO", "0.50")
 
-# Ranking DB が stale の時は pending を作らず、Summary/Pullback 側に任せる。
+# Ranking DB が stale / empty / unusable の時は pending を作らず、Summary/Pullback 側に任せる。
+_env_default("RANKING_TODAY_EMPTY_FAIL_CLOSED", "1")
 _env_default("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE", "1")
 _env_default("RANKING_ENTRY_STALE_FAIL_CLOSED", "1")
 _env_default("RANKING_ENTRY_ABORT_ON_STALE", "1")
@@ -79,6 +80,7 @@ _env_default("TONOSAMA_MTF_STALE_FAIL_CLOSED", "1")
 _env_default("TONOSAMA_SUMMARY_MAX_AGE_SEC", "300")
 _env_default("TONOSAMA_HISTORY_MAX_AGE_SEC", "300")
 _env_default("SUMMARY_MTF_ENTRY_MAX_AGE_SEC", "300")
+_env_default("SUMMARY_SUPPRESS_LUNCH_FALLBACK_AFTER_PM", "1")
 
 # 押し目買い/戻り売りエントリー。
 _env_default("PULLBACK_ENTRY_ENABLED", "1")
@@ -92,7 +94,7 @@ _env_default("PULLBACK_ENTRY_MIN_VOLUME", "30000")
 _env_default("PULLBACK_ENTRY_MIN_TURNOVER", "10000000")
 
 logger.warning(
-    "[USERCUSTOMIZE] runtime defaults applied summary_ai_daily_risk=%s liq_run_in_main=%s liq_fail_open=%s liq_min_turnover=%s final_liq_min_turnover=%s protect_pending=%s exit_cooldown=%s board_allow=%s board_hard=%s ranking_stale_skip=%s ranking_require_today=%s ranking_clear_pending=%s ranking_ai_failopen=%s tonosama_mtf_stale_fail_closed=%s pullback=%s",
+    "[USERCUSTOMIZE] runtime defaults applied summary_ai_daily_risk=%s liq_run_in_main=%s liq_fail_open=%s liq_min_turnover=%s final_liq_min_turnover=%s protect_pending=%s exit_cooldown=%s board_allow=%s board_hard=%s ranking_empty_failclosed=%s ranking_stale_skip=%s ranking_require_today=%s ranking_clear_pending=%s ranking_ai_failopen=%s tonosama_mtf_stale_fail_closed=%s suppress_lunch_pm=%s pullback=%s",
     os.getenv("SUMMARY_AI_PRE_FILTER_DAILY_RISK"),
     os.getenv("WATCHLIST_RECENT_LIQ_BULK_RUN_IN_MAIN"),
     os.getenv("WATCHLIST_RECENT_LIQ_FAIL_OPEN_ON_TIMEOUT"),
@@ -102,11 +104,13 @@ logger.warning(
     os.getenv("ACTIVE_EXIT_COOLDOWN_PROTECT_SEC"),
     os.getenv("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"),
     os.getenv("ENTRY_BOARD_MISSING_HARD_BLOCK"),
+    os.getenv("RANKING_TODAY_EMPTY_FAIL_CLOSED"),
     os.getenv("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE"),
     os.getenv("RANKING_ENTRY_REQUIRE_TODAY"),
     os.getenv("RANKING_ENTRY_CLEAR_PENDING_ON_STALE"),
     os.getenv("RANKING_AI_GATE_FAILOPEN_ENABLED"),
     os.getenv("TONOSAMA_MTF_STALE_FAIL_CLOSED"),
+    os.getenv("SUMMARY_SUPPRESS_LUNCH_FALLBACK_AFTER_PM"),
     os.getenv("PULLBACK_ENTRY_ENABLED"),
 )
 
@@ -153,6 +157,8 @@ _install("PUSH_EMPTY_OWNER_FAILOPEN", "core.startup.push_empty_owner_lock_failop
 _install("PUSH_ONOPEN_SAFE_REFRESH", "core.startup.push_onopen_refresh_safe_patch")
 _install("RANKING_API_GLOBAL_THROTTLE", "core.startup.ranking_api_global_throttle_patch")
 _install("RANKING_WAL_AGGRESSIVE_TRUNCATE", "core.startup.ranking_wal_aggressive_truncate_patch")
+_install("RANKING_EMPTY_TODAY_FAILCLOSED", "core.startup.ranking_empty_today_failclosed_patch")
+_install("SUMMARY_AFTERNOON_STALE_GUARD", "core.startup.summary_fallback_afternoon_stale_guard_patch")
 
 if _is_database_collector_context():
     _install("RANKING_WAL_MEMORY_GUARD", "core.startup.ranking_wal_checkpoint_memory_guard_patch")
@@ -194,8 +200,10 @@ else:
     _install("RANKING_ENTRY_INTRADAY_CAP", "core.startup.ranking_entry_intraday_cap_patch")
     _install("SUMMARY_AI_NO_DIRECT_SYNC", "core.startup.summary_ai_no_direct_sync_patch")
     _install("RANKING_ENTRY_MARKET_HOURS_SKIP", "core.startup.ranking_entry_market_hours_skip_patch")
-    # Re-apply ranking stale guard last because market-hours and other patches can re-wrap
+    # Re-apply ranking stale/empty guards last because market-hours and other patches can re-wrap
     # _run_ranking_entry_safe after the first stale guard install.
+    _install("RANKING_EMPTY_TODAY_FAILCLOSED_LAST", "core.startup.ranking_empty_today_failclosed_patch")
     _install("RANKING_STALE_SNAPSHOT_SKIP_LAST", "core.startup.ranking_entry_stale_snapshot_skip_patch")
+    _install("SUMMARY_AFTERNOON_STALE_GUARD_LAST", "core.startup.summary_fallback_afternoon_stale_guard_patch")
     _install("BOARD_MISSING_PROTECTED_ALLOW", "core.startup.board_missing_protected_allow_patch")
     _install("RANKING_AI_GATE_FAILOPEN_LAST", "core.startup.ranking_entry_gate_failopen_patch")
