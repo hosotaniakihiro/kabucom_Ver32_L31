@@ -1,20 +1,17 @@
 # ============================================================
 # File   : core/startup/ranking_entry_stale_snapshot_skip_patch.py
-# Version: V3-STALE-SNAPSHOT-WARN-ONLY-FAILOPEN
+# Version: V4-STALE-SNAPSHOT-FORCE-FAILOPEN
 # ------------------------------------------------------------
 # 目的:
-#   ranking DB / ranking_snapshot_1min が stale の時に診断ログを出す。
+#   ranking DB / ranking_snapshot_1min が stale/empty の時に診断ログを出す。
+#   ただし、stale/empty だけで ranking entry を止めない。
 #
-# V3:
-#   - 2026-06-05 実運用ログで ranking_snapshot_1min.updated_at が前日
-#     のままでも、ranking raw / push / runtime summary は当日更新され、
-#     ranking entry 候補を作れる状態だった。
-#   - V2 の fail-closed は pending作成前に ranking entry 自体を止め、
-#     「エントリーされない」原因になったため、デフォルトを warn-only に変更。
-#   - stale 時も原則 orig を実行する。明示的に
-#       RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE=1
-#     を設定した場合だけ旧fail-closed動作に戻せる。
-#   - stale 時の pending clear もデフォルトOFF。
+# V4:
+#   - 実運用ログで ranking20260608.db rows=0/latest=None のため
+#     ranking entry が pending 作成前に skip されていた。
+#   - エントリー発火停止を避けるため、デフォルトは強制 fail-open。
+#   - 旧環境変数 RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE=1 が残っていても
+#     ALLOW_LEGACY_RANKING_STALE_FAIL_CLOSED=1 を明示しない限り無視する。
 # ============================================================
 from __future__ import annotations
 
@@ -75,7 +72,6 @@ def _latest_snapshot_time(db_path: str) -> tuple[dt.datetime | None, str, int]:
     if not db_path:
         return None, "no_db_path", 0
     cols = ["updated_at", "datetime", "snapshot_time", "received_at", "inserted_at", "created_at", "time"]
-    # ranking_snapshot_1min が古く残るケースがあるため、raw/summary系も見る。
     tables = [
         "ranking_snapshot_1min",
         "ranking_raw_1min",
@@ -90,6 +86,7 @@ def _latest_snapshot_time(db_path: str) -> tuple[dt.datetime | None, str, int]:
             best_dt = None
             best_src = "no_time"
             best_rows = 0
+            table_counts: dict[str, int] = {}
             for table in tables:
                 if table not in existing:
                     continue
@@ -97,6 +94,7 @@ def _latest_snapshot_time(db_path: str) -> tuple[dt.datetime | None, str, int]:
                     cnt = int(cur.execute(f"select count(*) from {table}").fetchone()[0] or 0)
                 except Exception:
                     cnt = 0
+                table_counts[table] = cnt
                 best_rows = max(best_rows, cnt)
                 if cnt <= 0:
                     continue
@@ -115,6 +113,8 @@ def _latest_snapshot_time(db_path: str) -> tuple[dt.datetime | None, str, int]:
                             best_src = f"{table}.{col}"
                     except Exception:
                         continue
+            if best_rows <= 0:
+                logger.warning("[RANKING STALE SNAPSHOT SKIP] ranking db empty diag path=%s tables=%s", db_path, table_counts)
             return best_dt, best_src, best_rows
     except Exception:
         logger.exception("[RANKING STALE SNAPSHOT SKIP] db inspect failed path=%s", db_path)
@@ -150,6 +150,20 @@ def _ranking_snapshot_fresh() -> tuple[bool, dict[str, Any]]:
     return bool(ok), diag
 
 
+def _legacy_fail_closed_allowed() -> bool:
+    """
+    旧設定 RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE=1 が残っていても、
+    それだけでは ranking entry を止めない。
+    """
+    return bool(
+        _env_bool("RANKING_ENTRY_FORCE_FAIL_CLOSED_ON_STALE", False)
+        or (
+            _env_bool("ALLOW_LEGACY_RANKING_STALE_FAIL_CLOSED", False)
+            and _env_bool("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE", False)
+        )
+    )
+
+
 def _clear_ranking_pending(reason: str, diag: dict[str, Any]) -> None:
     if not _env_bool("RANKING_ENTRY_CLEAR_PENDING_ON_STALE", False):
         return
@@ -180,34 +194,34 @@ def _make_wrapper(orig):
         try:
             ok, diag = _ranking_snapshot_fresh()
             if not ok:
-                if _env_bool("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE", False):
-                    logger.warning("[RANKING STALE SNAPSHOT SKIP] skip ranking entry before pending diag=%s", diag)
+                if _legacy_fail_closed_allowed():
+                    logger.warning("[RANKING STALE SNAPSHOT SKIP] explicit fail-closed skip ranking entry diag=%s", diag)
                     _clear_ranking_pending("ranking_snapshot_stale", diag)
                     return 0
-                logger.warning("[RANKING STALE SNAPSHOT SKIP] stale but fail-open continue ranking entry diag=%s", diag)
+                logger.warning("[RANKING STALE SNAPSHOT SKIP] stale/empty but FORCE FAIL-OPEN continue ranking entry diag=%s", diag)
             else:
                 logger.info("[RANKING STALE SNAPSHOT SKIP] ranking snapshot fresh diag=%s", diag)
         except Exception:
-            if _env_bool("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE", False):
-                logger.exception("[RANKING STALE SNAPSHOT SKIP] precheck failed -> fail closed ranking entry")
+            if _legacy_fail_closed_allowed():
+                logger.exception("[RANKING STALE SNAPSHOT SKIP] precheck failed -> explicit fail-closed ranking entry")
                 return 0
-            logger.exception("[RANKING STALE SNAPSHOT SKIP] precheck failed -> fail-open ranking entry")
+            logger.exception("[RANKING STALE SNAPSHOT SKIP] precheck failed -> FORCE FAIL-OPEN ranking entry")
         return orig(*args, **kwargs)
 
-    wrapped_run_ranking_entry_safe._ranking_stale_snapshot_skip_v3 = True  # type: ignore[attr-defined]
+    wrapped_run_ranking_entry_safe._ranking_stale_snapshot_skip_v4 = True  # type: ignore[attr-defined]
     wrapped_run_ranking_entry_safe._original = orig  # type: ignore[attr-defined]
     return wrapped_run_ranking_entry_safe
 
 
 def _unwrap_old_stale_guard(cur):
-    # V2 wrapper が既に入っている場合は、その内側の original へ戻してからV3を被せる。
     try:
-        if getattr(cur, "_ranking_stale_snapshot_skip_v3", False):
+        if getattr(cur, "_ranking_stale_snapshot_skip_v4", False):
             return cur
-        if getattr(cur, "_ranking_stale_snapshot_skip_v2", False):
-            orig = getattr(cur, "_original", None)
-            if callable(orig):
-                return orig
+        for flag in ("_ranking_stale_snapshot_skip_v3", "_ranking_stale_snapshot_skip_v2"):
+            if getattr(cur, flag, False):
+                orig = getattr(cur, "_original", None)
+                if callable(orig):
+                    return orig
     except Exception:
         pass
     return cur
@@ -221,15 +235,17 @@ def _patch_once() -> bool:
         if not callable(cur):
             logger.warning("[RANKING STALE SNAPSHOT SKIP] target missing")
             return False
-        if getattr(cur, "_ranking_stale_snapshot_skip_v3", False):
+        if getattr(cur, "_ranking_stale_snapshot_skip_v4", False):
             return True
         base = _unwrap_old_stale_guard(cur)
         _ORIG_RUN = base
         tasks._run_ranking_entry_safe = _make_wrapper(base)
         logger.warning(
-            "[RANKING STALE SNAPSHOT SKIP] patched outermost v3 target=%s skip_if_stale=%s clear_pending=%s",
+            "[RANKING STALE SNAPSHOT SKIP] patched outermost v4 target=%s skip_if_stale=%s legacy_fail_closed=%s force_fail_closed=%s clear_pending=%s",
             getattr(base, "__name__", type(base)),
             os.getenv("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE", "0"),
+            os.getenv("ALLOW_LEGACY_RANKING_STALE_FAIL_CLOSED", "0"),
+            os.getenv("RANKING_ENTRY_FORCE_FAIL_CLOSED_ON_STALE", "0"),
             os.getenv("RANKING_ENTRY_CLEAR_PENDING_ON_STALE", "0"),
         )
         return True
@@ -239,20 +255,19 @@ def _patch_once() -> bool:
 
 
 def _watch() -> None:
-    # Other startup patches can re-wrap _run_ranking_entry_safe repeatedly.
-    # Re-apply this guard as the outermost wrapper for the first two minutes.
     for i in range(240):
         ok = _patch_once()
         if i in (0, 1, 5, 15, 30, 60, 120, 239):
-            logger.warning("[RANKING STALE SNAPSHOT SKIP] enforce v3 ok=%s i=%s", ok, i)
+            logger.warning("[RANKING STALE SNAPSHOT SKIP] enforce v4 ok=%s i=%s", ok, i)
         time.sleep(0.5)
 
 
 def install() -> bool:
     global _INSTALLED
     try:
-        # V3はデフォルトでfail-open。旧挙動が必要な時だけ環境変数で明示する。
-        os.environ.setdefault("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE", "0")
+        os.environ["RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE"] = "0"
+        os.environ.setdefault("ALLOW_LEGACY_RANKING_STALE_FAIL_CLOSED", "0")
+        os.environ.setdefault("RANKING_ENTRY_FORCE_FAIL_CLOSED_ON_STALE", "0")
         os.environ.setdefault("RANKING_ENTRY_REQUIRE_TODAY", "1")
         os.environ.setdefault("RANKING_ENTRY_CLEAR_PENDING_ON_STALE", "0")
         os.environ.setdefault("RANKING_ENTRY_SNAPSHOT_MAX_AGE_SEC", "300")
@@ -261,9 +276,11 @@ def install() -> bool:
             threading.Thread(target=_watch, name="ranking-stale-snapshot-skip-enforcer", daemon=True).start()
             _INSTALLED = True
         logger.warning(
-            "[RANKING STALE SNAPSHOT SKIP] installed v3 ok=%s skip_if_stale=%s max_age=%s require_today=%s clear_pending=%s",
+            "[RANKING STALE SNAPSHOT SKIP] installed v4 ok=%s skip_if_stale=%s legacy_fail_closed=%s force_fail_closed=%s max_age=%s require_today=%s clear_pending=%s",
             ok,
             os.getenv("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE", "0"),
+            os.getenv("ALLOW_LEGACY_RANKING_STALE_FAIL_CLOSED", "0"),
+            os.getenv("RANKING_ENTRY_FORCE_FAIL_CLOSED_ON_STALE", "0"),
             os.getenv("RANKING_ENTRY_SNAPSHOT_MAX_AGE_SEC"),
             os.getenv("RANKING_ENTRY_REQUIRE_TODAY"),
             os.getenv("RANKING_ENTRY_CLEAR_PENDING_ON_STALE", "0"),
