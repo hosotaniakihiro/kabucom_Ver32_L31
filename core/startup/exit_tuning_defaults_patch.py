@@ -1,19 +1,15 @@
 # ============================================================
 # File   : core/startup/exit_tuning_defaults_patch.py
-# Version: V1.8-LET-PROFIT-RUN-LONGER
+# Version: V1.9-USER-TRAILING-0P2
 # ------------------------------------------------------------
 # Purpose:
-#   EXIT条件を「早く逃げる」から「利益を伸ばす」方向へ再調整する。
+#   EXIT条件を「利益は伸ばす」が、ユーザー指定の
+#   高値/安値から0.2%戻りで利確する方向へ統一する。
 #
-# V1.8:
-#   - 6323 が +0.3387% で保有115秒、idle92秒により
-#     EARLY_STAGNATION_BUY で早期利確されたため緩和。
-#   - 既存の V1.7-PROFIT-PROTECT-WITH-ORDER-WAIT が薄利撤退へ戻していたため、
-#     ユーザー要望「利益は伸ばしたい」に合わせて上書き。
-#   - 停滞撤退 90秒 -> 180秒。
-#   - progress_need 0.05% -> 0.08%。
-#   - +0.35%未満では停滞撤退しない floor を追加。
-#   - EXIT_LOOP timeout は注文完了待ちのため 15秒を維持。
+# V1.9:
+#   - BUY: entry後高値から -0.2% で利確、SELLは反対方向。
+#   - 0.30%系のトレーリング設定を0.20%へ統一。
+#   - 停滞撤退/分割利確/吹き上げ利確の既存方針は維持。
 # ============================================================
 
 from __future__ import annotations
@@ -50,7 +46,8 @@ def install() -> bool:
         # エントリー直後のブレで損切りしすぎない設定。
         _force("ABSOLUTE_ENTRY_STOP_LOSS_PCT", "0.35")
         _force("TONOSAMA_STOP_LOSS_PCT", "0.40")
-        _force("TRAILING_DRAWDOWN_PCT", "0.0030")
+        # ratio形式の旧トレーリングも、ユーザー指定0.2%へ統一。
+        _force("TRAILING_DRAWDOWN_PCT", "0.0020")
         _force("EXIT_INITIAL_STOP_GRACE_SEC", "30")
         _force("EXIT_INITIAL_GRACE_HARD_STOP_PCT", "0.60")
 
@@ -88,13 +85,13 @@ def install() -> bool:
         _force("BLOWOFF_REQUIRE_VOLUME_AND_SLOPE", "0")
         _force("BLOWOFF_CONFIRM_FAIL_OPEN", "1")
 
-        # 利益ロックは +0.25% から。床は +0.05%。
-        _force("ENTRY_TRAIL_RETRACE_EXIT_PCT", "0.30")
+        # 利益ロックは +0.25% から。床は +0.05%。戻り幅はユーザー指定0.2%。
+        _force("ENTRY_TRAIL_RETRACE_EXIT_PCT", "0.20")
         _force("EXIT_PROFIT_LOCK_ENABLED", "1")
         _force("EXIT_PROFIT_LOCK_MIN_MFE_PCT", "0.25")
         _force("EXIT_PROFIT_LOCK_FLOOR_PCT", "0.05")
-        _force("EXIT_PROFIT_LOCK_RETRACE_MIN_MFE_PCT", "0.35")
-        _force("EXIT_PROFIT_LOCK_RETRACE_PCT", "0.12")
+        _force("EXIT_PROFIT_LOCK_RETRACE_MIN_MFE_PCT", "0.25")
+        _force("EXIT_PROFIT_LOCK_RETRACE_PCT", "0.20")
         _setdefault("EXIT_PROFIT_LOCK_SMALL_QTY_MAX", "199")
         _force("EXIT_PROFIT_LOCK_SMALL_FULL_TAKE_PCT", "0.50")
 
@@ -106,9 +103,9 @@ def install() -> bool:
         _force("PROFIT_TO_LOSS_MIN_MFE_PCT", "0.25")
         _force("PROFIT_TO_LOSS_EXIT_BEFORE_PCT", "0.02")
 
-        # 利益トレーリング。
-        _force("EXIT_PROFIT_TRAIL_START_PCT", "0.50")
-        _force("EXIT_PROFIT_TRAIL_DRAWDOWN_PCT", "0.30")
+        # 利益トレーリング: percent形式も0.20へ統一。
+        _force("EXIT_PROFIT_TRAIL_START_PCT", "0.25")
+        _force("EXIT_PROFIT_TRAIL_DRAWDOWN_PCT", "0.20")
 
         # EXIT注文の完了待ちに必要。2秒だと previous worker still alive が連発する。
         _force("EXIT_LOOP_RUN_TIMEOUT_SEC", "15.0")
@@ -123,7 +120,7 @@ def install() -> bool:
 
         _INSTALLED = True
         logger.warning(
-            "[EXIT TUNING DEFAULTS] installed LET_PROFIT_RUN_LONGER stop=%s tonosama_stop=%s partial=%s blowoff_small=%s blowoff_partial=%s blowoff_full=%s trail_start=%s trail_dd=%s escape_sec=%s early_sec=%s early_floor=%s lock_min_mfe=%s lock_floor=%s lock_retrace=%s loop_timeout=%s tonosama_sell=%s",
+            "[EXIT TUNING DEFAULTS] installed USER_TRAILING_0P2 stop=%s tonosama_stop=%s partial=%s blowoff_small=%s blowoff_partial=%s blowoff_full=%s trail_start=%s trail_dd=%s entry_retrace=%s lock_retrace=%s escape_sec=%s early_sec=%s early_floor=%s lock_min_mfe=%s lock_floor=%s loop_timeout=%s tonosama_sell=%s",
             os.environ.get("ABSOLUTE_ENTRY_STOP_LOSS_PCT"),
             os.environ.get("TONOSAMA_STOP_LOSS_PCT"),
             os.environ.get("PARTIAL_PROFIT_TRIGGER_PCT"),
@@ -132,12 +129,13 @@ def install() -> bool:
             os.environ.get("BLOWOFF_FULL_TAKE_PCT"),
             os.environ.get("EXIT_PROFIT_TRAIL_START_PCT"),
             os.environ.get("EXIT_PROFIT_TRAIL_DRAWDOWN_PCT"),
+            os.environ.get("ENTRY_TRAIL_RETRACE_EXIT_PCT"),
+            os.environ.get("EXIT_PROFIT_LOCK_RETRACE_PCT"),
             os.environ.get("THREE_MIN_PROFIT_ESCAPE_SEC"),
             os.environ.get("EARLY_NO_PROGRESS_SECONDS"),
             os.environ.get("EARLY_STAGNATION_MIN_PROFIT_PCT"),
             os.environ.get("EXIT_PROFIT_LOCK_MIN_MFE_PCT"),
             os.environ.get("EXIT_PROFIT_LOCK_FLOOR_PCT"),
-            os.environ.get("EXIT_PROFIT_LOCK_RETRACE_PCT"),
             os.environ.get("EXIT_LOOP_RUN_TIMEOUT_SEC"),
             os.environ.get("TONOSAMA_EXIT_SELL_ENABLED"),
         )
