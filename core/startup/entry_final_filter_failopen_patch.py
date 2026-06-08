@@ -1,402 +1,203 @@
 # ============================================================
 # File   : core/startup/entry_final_filter_failopen_patch.py
-# Version: V2.3-SCALPING-REENTRY-RANGE-RELAX
+# Version: V2.4-FAST-STARTUP-QUIET-DEFAULTS
 # ------------------------------------------------------------
-# 【目的】
-#   候補・AI・pending までは通るのに、最後で全落ちする問題の緩和。
-#
-# V2.3:
-#   - 勝ち銘柄の当日再エントリー設定を起動時に明示する。
-#   - RANGE/LOW_MOVE/ENTRY_ORDER の既定値をスキャルピング寄りに緩和する。
-#   - entry_order_builder は import 時に環境変数を定数化するため、既にimport済みでも
-#     runtime属性を書き換えて即反映する。
-#   - 方向確認は完全OFFにせず、min_strengthを1.0へ緩和し weak allow を使いやすくする。
-#
-# V2.2:
-#   - 最新ログでは PENDING_BUCKET は source=TONOSAMA なのに、ATR判定では
-#       ENTRY_SKIP reason=ATR_1M_FILTER_NG
-#       detail={'reason':'1m本数不足', 'atr':None, 'bars':14}
-#     で止まっていた。
-#   - entry_controller 内で行が変換されると top-level source が落ちることがあるため、
-#     _raw / raw / entry_conditions / conditions / pipeline_source まで見て TONOSAMA 判定する。
-#   - reason=1m本数不足 / atr=None / no_atr の場合は bars=14 ちょうどでも fail-open。
+# AI_OK後に落ちすぎる最終ガードを緩和する。
+# V2.4:
+#   - env default set を1件ずつWARNING出力しない。
+#   - まとめて1行だけ出す。
+#   - 起動時のログI/OとWARNING formatter負荷を削減。
 # ============================================================
-
 from __future__ import annotations
-
 import logging
 import os
 from typing import Any
-
 logger = logging.getLogger(__name__)
 _PATCHED = False
-
-
-_ATR_INSUFFICIENT_WORDS = (
-    "1m未生成",
-    "1m本数不足",
-    "ATR計算不可",
-    "symbol列なし",
-    "OHLC列不足",
-    "no_atr_data",
-    "no_atr",
-    "atr=None",
-    "'atr': None",
-    '"atr": None',
-    "bars",
-    "本数不足",
-    "未生成",
-)
-
+_ENV_SET: list[str] = []
+_ATR_INSUFFICIENT_WORDS = ('1m未生成','1m本数不足','ATR計算不可','symbol列なし','OHLC列不足','no_atr_data','no_atr','atr=None',"'atr': None",'"atr": None','bars','本数不足','未生成')
 
 def _setdefault_env(name: str, value: str) -> None:
     try:
         cur = os.getenv(name)
-        if cur is None or str(cur).strip() == "":
+        if cur is None or str(cur).strip() == '':
             os.environ[name] = str(value)
-            logger.warning("[ENTRY FINAL FILTER FAILOPEN] env default set %s=%s", name, value)
+            _ENV_SET.append(f'{name}={value}')
     except Exception:
         pass
-
 
 def _env_bool(name: str, default: bool = True) -> bool:
     try:
         v = os.getenv(name)
-        if v is None or str(v).strip() == "":
-            return bool(default)
-        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
-    except Exception:
-        return bool(default)
-
+        if v is None or str(v).strip() == '': return bool(default)
+        return str(v).strip().lower() in {'1','true','yes','y','on','ok','enable','enabled'}
+    except Exception: return bool(default)
 
 def _safe_str(v: Any) -> str:
-    try:
-        return str(v or "").strip()
-    except Exception:
-        return ""
-
+    try: return str(v or '').strip()
+    except Exception: return ''
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
-        if v is None or str(v).strip() == "":
-            return float(default)
-        return float(str(v).replace(",", ""))
-    except Exception:
-        return float(default)
-
+        if v is None or str(v).strip() == '': return float(default)
+        return float(str(v).replace(',', ''))
+    except Exception: return float(default)
 
 def _row_dict(entry_row: Any) -> dict:
     try:
-        if isinstance(entry_row, dict):
-            return entry_row
-        if hasattr(entry_row, "to_dict"):
-            d = entry_row.to_dict()
-            return d if isinstance(d, dict) else {}
-    except Exception:
-        pass
+        if isinstance(entry_row, dict): return entry_row
+        if hasattr(entry_row, 'to_dict'):
+            d = entry_row.to_dict(); return d if isinstance(d, dict) else {}
+    except Exception: pass
     return {}
 
-
 def _dicts(entry_row: Any) -> list[dict]:
-    base = _row_dict(entry_row)
-    out: list[dict] = []
-    if base:
-        out.append(base)
-    for k in ("_raw", "raw", "source_row", "candidate_raw", "entry_conditions", "conditions", "metrics", "features", "detail", "ai_detail"):
+    base = _row_dict(entry_row); out = []
+    if base: out.append(base)
+    for k in ('_raw','raw','source_row','candidate_raw','entry_conditions','conditions','metrics','features','detail','ai_detail'):
         try:
             v = base.get(k) if isinstance(base, dict) else None
-            d = v if isinstance(v, dict) else (v.to_dict() if hasattr(v, "to_dict") else None)
-            if isinstance(d, dict):
-                out.append(d)
-                for kk in ("_raw", "raw", "entry_conditions", "conditions", "metrics", "features", "detail", "ai_detail"):
-                    vv = d.get(kk)
-                    dd = vv if isinstance(vv, dict) else (vv.to_dict() if hasattr(vv, "to_dict") else None)
-                    if isinstance(dd, dict):
-                        out.append(dd)
-        except Exception:
-            pass
+            d = v if isinstance(v, dict) else (v.to_dict() if hasattr(v, 'to_dict') else None)
+            if isinstance(d, dict): out.append(d)
+        except Exception: pass
     return out
-
 
 def _is_tonosama_entry(entry_row: Any) -> bool:
     for row in _dicts(entry_row):
-        src = _safe_str(row.get("source") or row.get("pipeline_source") or row.get("entry_source")).upper()
-        et = _safe_str(row.get("entry_type") or row.get("type") or row.get("strategy")).upper()
-        reason = _safe_str(row.get("ai_reason") or row.get("reason") or row.get("source_reason")).upper()
-        if src == "TONOSAMA" or et == "TONOSAMA" or "TONOSAMA" in reason:
-            return True
+        src = _safe_str(row.get('source') or row.get('pipeline_source') or row.get('entry_source')).upper()
+        et = _safe_str(row.get('entry_type') or row.get('type') or row.get('strategy')).upper()
+        reason = _safe_str(row.get('ai_reason') or row.get('reason') or row.get('source_reason')).upper()
+        if src == 'TONOSAMA' or et == 'TONOSAMA' or 'TONOSAMA' in reason: return True
     return False
-
 
 def _has_explicit_atr(entry_row: Any) -> bool:
     for row in _dicts(entry_row):
-        price = _safe_float(row.get("close_price") or row.get("close") or row.get("price") or row.get("current_price"), 0.0)
-        atr = _safe_float(row.get("atr_1m") or row.get("atr") or row.get("ATR") or row.get("atr14") or row.get("atr_14"), 0.0)
-        if price > 0 and atr > 0:
-            return True
+        price = _safe_float(row.get('close_price') or row.get('close') or row.get('price') or row.get('current_price'), 0.0)
+        atr = _safe_float(row.get('atr_1m') or row.get('atr') or row.get('ATR') or row.get('atr14') or row.get('atr_14'), 0.0)
+        if price > 0 and atr > 0: return True
     return False
-
 
 def _ret_ok(ret: Any) -> bool:
     try:
-        if isinstance(ret, tuple) and len(ret) > 0:
-            return bool(ret[0])
+        if isinstance(ret, tuple) and len(ret) > 0: return bool(ret[0])
         return bool(ret)
-    except Exception:
-        return False
-
+    except Exception: return False
 
 def _ret_detail(ret: Any) -> Any:
     try:
-        if isinstance(ret, tuple) and len(ret) > 1:
-            return ret[1]
-    except Exception:
-        pass
+        if isinstance(ret, tuple) and len(ret) > 1: return ret[1]
+    except Exception: pass
     return None
-
 
 def _detail_bars(detail: Any) -> float:
     try:
-        if isinstance(detail, dict):
-            return _safe_float(detail.get("bars"), -1.0)
-    except Exception:
-        pass
+        if isinstance(detail, dict): return _safe_float(detail.get('bars'), -1.0)
+    except Exception: pass
     return -1.0
-
 
 def _detail_atr_missing(detail: Any) -> bool:
     try:
         if isinstance(detail, dict):
-            if detail.get("atr") is None or detail.get("atr_1m") is None:
-                return True
-            reason = _safe_str(detail.get("reason"))
-            if any(w in reason for w in _ATR_INSUFFICIENT_WORDS):
-                return True
-    except Exception:
-        pass
+            if detail.get('atr') is None or detail.get('atr_1m') is None: return True
+            reason = _safe_str(detail.get('reason'))
+            if any(w in reason for w in _ATR_INSUFFICIENT_WORDS): return True
+    except Exception: pass
     text = _safe_str(detail)
     return any(w in text for w in _ATR_INSUFFICIENT_WORDS)
 
-
 def _looks_atr_history_gap(entry_row: Any = None, detail: Any = None) -> bool:
-    try:
-        if _has_explicit_atr(entry_row):
-            return False
-        if detail is None:
-            return True
-        if _detail_atr_missing(detail):
-            return True
-        bars = _detail_bars(detail)
-        # 14本ちょうどでもATRがNone/本数不足ならfail-open対象。
-        if 0 <= bars <= _safe_float(os.getenv("ATR_1M_FILTER_TONOSAMA_MIN_BARS"), 14.0):
-            return True
-        return False
-    except Exception:
-        return False
-
+    if _has_explicit_atr(entry_row): return False
+    if detail is None: return True
+    if _detail_atr_missing(detail): return True
+    bars = _detail_bars(detail)
+    return bool(0 <= bars <= _safe_float(os.getenv('ATR_1M_FILTER_TONOSAMA_MIN_BARS'), 14.0))
 
 def _apply_scalping_defaults() -> None:
-    """AI_OK後に落ちすぎていた最終ガードを、スキャルピング運用向けに緩和する。"""
     defaults = {
-        # 勝ち銘柄の再エントリー。発注送信だけで2回上限に当たる問題を避ける。
-        "ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL": "2",
-        "ENTRY_COUNT_SENT_ORDER_AS_DAILY_ENTRY": "1",
-        "ENTRY_WINNING_SYMBOL_REENTRY_ENABLED": "1",
-        "ENTRY_WINNING_SYMBOL_MAX_DAILY_ENTRIES": "4",
-        "ENTRY_WINNING_SYMBOL_MIN_DAILY_PNL": "1",
-        "ENTRY_WINNING_SYMBOL_REQUIRE_WIN_GT_LOSS": "1",
-        "ENTRY_WINNING_SYMBOL_IGNORE_SENT_ONLY": "1",
-        "ENTRY_STOP_AFTER_FIRST_LOSS_ONLY_IF_NET_NEGATIVE": "1",
-        # RANGE_5M / LOW_MOVE を少し緩和。流動性・板・信用・MA逆行ガードは維持。
-        "RANGE_5M_FILTER_NG_FAIL_OPEN": "1",
-        "LOW_MOVE_TONOSAMA_MIN_RANGE_PCT": "0.005",
-        "LOW_MOVE_TONOSAMA_STRONG_RANGE_PCT": "0.010",
-        "LOW_MOVE_MIN_RANGE_PCT_HIGH_PRICE": "0.005",
-        "LOW_MOVE_MIN_RANGE_PCT_LOW_PRICE": "0.010",
-        "LOW_MOVE_RANKING_MIN_RANGE_PCT_HIGH_PRICE": "0.005",
-        "LOW_MOVE_RANKING_MIN_RANGE_PCT_LOW_PRICE": "0.008",
-        "LOW_MOVE_RANKING_MIN_SCORE_FOR_NO_HIGHLOW": "55.0",
-        "LOW_MOVE_RANKING_MIN_ABS_SLOPE": "0.0005",
-        "LOW_MOVE_TONOSAMA_MIN_ABS_SLOPE": "0.00005",
-        "LOW_MOVE_MIN_ABS_SLOPE_HIGH_PRICE": "0.0001",
-        "LOW_MOVE_MIN_ABS_SLOPE_LOW_PRICE": "0.00015",
-        # build_entry_order 側の低変動最終防衛。
-        "ENTRY_ORDER_MIN_RANGE_PCT": "0.005",
-        "ENTRY_ORDER_MIN_ATR_RATIO": "0.0025",
-        "ENTRY_ORDER_REQUIRE_ATR": "0",
-        "ENTRY_ORDER_REQUIRE_HIGH_LOW": "0",
-        # 方向確認は完全OFFにしない。弱いが反対ではない候補を許可しやすくする。
-        "ENTRY_DIRECTION_CONFIRM_MIN_STRENGTH": "1.0",
-        "ENTRY_DIRECTION_CONFIRM_STRICT": "0",
-        "ENTRY_ORDER_SHORT_MTF_NEUTRAL_MIN_SCORE": "1.0",
-        "ENTRY_ORDER_SHORT_MTF_NEUTRAL_EPS": "0.0",
+        'ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL':'2','ENTRY_COUNT_SENT_ORDER_AS_DAILY_ENTRY':'1','ENTRY_WINNING_SYMBOL_REENTRY_ENABLED':'1','ENTRY_WINNING_SYMBOL_MAX_DAILY_ENTRIES':'4','ENTRY_WINNING_SYMBOL_MIN_DAILY_PNL':'1','ENTRY_WINNING_SYMBOL_REQUIRE_WIN_GT_LOSS':'1','ENTRY_WINNING_SYMBOL_IGNORE_SENT_ONLY':'1','ENTRY_STOP_AFTER_FIRST_LOSS_ONLY_IF_NET_NEGATIVE':'1',
+        'RANGE_5M_FILTER_NG_FAIL_OPEN':'1','LOW_MOVE_TONOSAMA_MIN_RANGE_PCT':'0.005','LOW_MOVE_TONOSAMA_STRONG_RANGE_PCT':'0.010','LOW_MOVE_MIN_RANGE_PCT_HIGH_PRICE':'0.005','LOW_MOVE_MIN_RANGE_PCT_LOW_PRICE':'0.010','LOW_MOVE_RANKING_MIN_RANGE_PCT_HIGH_PRICE':'0.005','LOW_MOVE_RANKING_MIN_RANGE_PCT_LOW_PRICE':'0.008','LOW_MOVE_RANKING_MIN_SCORE_FOR_NO_HIGHLOW':'55.0','LOW_MOVE_RANKING_MIN_ABS_SLOPE':'0.0005','LOW_MOVE_TONOSAMA_MIN_ABS_SLOPE':'0.00005','LOW_MOVE_MIN_ABS_SLOPE_HIGH_PRICE':'0.0001','LOW_MOVE_MIN_ABS_SLOPE_LOW_PRICE':'0.00015',
+        'ENTRY_ORDER_MIN_RANGE_PCT':'0.005','ENTRY_ORDER_MIN_ATR_RATIO':'0.0025','ENTRY_ORDER_REQUIRE_ATR':'0','ENTRY_ORDER_REQUIRE_HIGH_LOW':'0','ENTRY_DIRECTION_CONFIRM_MIN_STRENGTH':'1.0','ENTRY_DIRECTION_CONFIRM_STRICT':'0','ENTRY_ORDER_SHORT_MTF_NEUTRAL_MIN_SCORE':'1.0','ENTRY_ORDER_SHORT_MTF_NEUTRAL_EPS':'0.0',
     }
-    for k, v in defaults.items():
-        _setdefault_env(k, v)
-
+    for k, v in defaults.items(): _setdefault_env(k, v)
 
 def _patch_import_time_constants() -> None:
-    """既にimport済みのモジュール定数にも env の緩和値を反映する。"""
     try:
         import trading.handlers.entry_order_builder as eob
-        eob.ENTRY_ORDER_MIN_RANGE_PCT = _safe_float(os.getenv("ENTRY_ORDER_MIN_RANGE_PCT"), 0.005)
-        eob.ENTRY_ORDER_MIN_ATR_RATIO = _safe_float(os.getenv("ENTRY_ORDER_MIN_ATR_RATIO"), 0.0025)
-        eob.ENTRY_ORDER_REQUIRE_ATR = _env_bool("ENTRY_ORDER_REQUIRE_ATR", False)
-        eob.ENTRY_ORDER_REQUIRE_HIGH_LOW = _env_bool("ENTRY_ORDER_REQUIRE_HIGH_LOW", False)
-        logger.warning(
-            "[ENTRY FINAL FILTER FAILOPEN] entry_order_builder constants patched min_range=%.4f min_atr=%.4f require_atr=%s require_high_low=%s",
-            eob.ENTRY_ORDER_MIN_RANGE_PCT,
-            eob.ENTRY_ORDER_MIN_ATR_RATIO,
-            eob.ENTRY_ORDER_REQUIRE_ATR,
-            eob.ENTRY_ORDER_REQUIRE_HIGH_LOW,
-        )
+        eob.ENTRY_ORDER_MIN_RANGE_PCT = _safe_float(os.getenv('ENTRY_ORDER_MIN_RANGE_PCT'), 0.005)
+        eob.ENTRY_ORDER_MIN_ATR_RATIO = _safe_float(os.getenv('ENTRY_ORDER_MIN_ATR_RATIO'), 0.0025)
+        eob.ENTRY_ORDER_REQUIRE_ATR = _env_bool('ENTRY_ORDER_REQUIRE_ATR', False)
+        eob.ENTRY_ORDER_REQUIRE_HIGH_LOW = _env_bool('ENTRY_ORDER_REQUIRE_HIGH_LOW', False)
+        logger.warning('[ENTRY FINAL FILTER FAILOPEN] entry_order_builder constants patched min_range=%.4f min_atr=%.4f require_atr=%s require_high_low=%s', eob.ENTRY_ORDER_MIN_RANGE_PCT, eob.ENTRY_ORDER_MIN_ATR_RATIO, eob.ENTRY_ORDER_REQUIRE_ATR, eob.ENTRY_ORDER_REQUIRE_HIGH_LOW)
     except Exception:
-        logger.exception("[ENTRY FINAL FILTER FAILOPEN] entry_order_builder constant patch failed")
-
-
+        logger.exception('[ENTRY FINAL FILTER FAILOPEN] entry_order_builder constant patch failed')
 
 def install() -> bool:
-    global _PATCHED
-    if _PATCHED:
-        return True
-
-    _setdefault_env("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", "1")
-    _setdefault_env("ATR_1M_FILTER_TONOSAMA_HISTORY_FAIL_OPEN", "1")
-    _setdefault_env("ATR_1M_FILTER_TONOSAMA_MIN_BARS", "14")
-    _setdefault_env("PENDING_PROTECT_PUSH_SYMBOLS", "1")
-    _setdefault_env("PENDING_PROTECT_PUSH_MAX_KEEP", "50")
-    _setdefault_env("ENTRY_BOARD_RETRY_ENABLED", "1")
-    _setdefault_env("ENTRY_BOARD_RETRY_WAIT_SEC", "4.5")
-    _setdefault_env("ENTRY_BOARD_RETRY_COUNT", "1")
-    _setdefault_env("ENTRY_BOARD_RETRY_EXTRA_WAIT_SEC", "0.3")
-    _setdefault_env("ENTRY_BOARD_RETRY_EXTRA_COUNT", "1")
-    _setdefault_env("ENTRY_BOARD_RETRY_SYMBOLS_ONLY_PENDING", "0")
-    _setdefault_env("ENTRY_SHORT_MTF_REQUIRED", "1")
-    _setdefault_env("ENTRY_SHORT_MTF_REQUIRE_ALL", "1")
-    _setdefault_env("ENTRY_SHORT_MTF_SLOPE_EPS", "0.0")
-    _setdefault_env("ENTRY_DAILY_MTF_OPTIONAL", "1")
-    _setdefault_env("ENTRY_MA5_BREAKOUT_ENABLED", "1")
-    _setdefault_env("ENTRY_MA5_BREAKOUT_TFS", "3,5")
-    _setdefault_env("ENTRY_MA5_BREAKOUT_MIN_BAR", "1")
-    _setdefault_env("ENTRY_MA5_BREAKOUT_MAX_BAR", "3")
-    _setdefault_env("ENTRY_MA5_BREAKOUT_LOOKBACK", "20")
-    _setdefault_env("ENTRY_MA5_BREAKOUT_REQUIRE_DATA", "1")
-    _setdefault_env("ENTRY_MA5_BREAKOUT_DB_BACKFILL", "1")
-    _setdefault_env("ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN", "1")
-    _setdefault_env("ENTRY_DIRECTION_CONFIRM_ERROR_FAIL_OPEN", "0")
+    global _PATCHED, _ENV_SET
+    if _PATCHED: return True
+    _ENV_SET = []
+    for k, v in {
+        'ENTRY_ALLOW_ENTRY_WITHOUT_BOARD':'1','ATR_1M_FILTER_TONOSAMA_HISTORY_FAIL_OPEN':'1','ATR_1M_FILTER_TONOSAMA_MIN_BARS':'14','PENDING_PROTECT_PUSH_SYMBOLS':'1','PENDING_PROTECT_PUSH_MAX_KEEP':'50','ENTRY_BOARD_RETRY_ENABLED':'1','ENTRY_BOARD_RETRY_WAIT_SEC':'4.5','ENTRY_BOARD_RETRY_COUNT':'1','ENTRY_BOARD_RETRY_EXTRA_WAIT_SEC':'0.3','ENTRY_BOARD_RETRY_EXTRA_COUNT':'1','ENTRY_BOARD_RETRY_SYMBOLS_ONLY_PENDING':'0','ENTRY_SHORT_MTF_REQUIRED':'1','ENTRY_SHORT_MTF_REQUIRE_ALL':'1','ENTRY_SHORT_MTF_SLOPE_EPS':'0.0','ENTRY_DAILY_MTF_OPTIONAL':'1','ENTRY_MA5_BREAKOUT_ENABLED':'1','ENTRY_MA5_BREAKOUT_TFS':'3,5','ENTRY_MA5_BREAKOUT_MIN_BAR':'1','ENTRY_MA5_BREAKOUT_MAX_BAR':'3','ENTRY_MA5_BREAKOUT_LOOKBACK':'20','ENTRY_MA5_BREAKOUT_REQUIRE_DATA':'1','ENTRY_MA5_BREAKOUT_DB_BACKFILL':'1','ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN':'1','ENTRY_DIRECTION_CONFIRM_ERROR_FAIL_OPEN':'0'
+    }.items(): _setdefault_env(k, v)
     _apply_scalping_defaults()
+    if _ENV_SET:
+        logger.warning('[ENTRY FINAL FILTER FAILOPEN] env defaults set count=%s keys=%s', len(_ENV_SET), [x.split('=',1)[0] for x in _ENV_SET])
     _patch_import_time_constants()
-
     try:
         import trading.handlers.entry_controller as ec
     except Exception:
-        logger.exception("[ENTRY FINAL FILTER FAILOPEN] entry_controller import failed")
-        return False
-
+        logger.exception('[ENTRY FINAL FILTER FAILOPEN] entry_controller import failed'); return False
     try:
-        orig_atr = getattr(ec, "atr_1m_filter", None)
-        if callable(orig_atr) and not getattr(orig_atr, "_tonosama_atr_failopen_wrapper_v23", False):
+        orig_atr = getattr(ec, 'atr_1m_filter', None)
+        if callable(orig_atr) and not getattr(orig_atr, '_tonosama_atr_failopen_wrapper_v24', False):
             def _atr_tonosama_failopen(entry_row: Any = None, *args, **kwargs):
                 try:
                     ret = orig_atr(entry_row, *args, **kwargs)
-                    if (not _ret_ok(ret)) and _env_bool("ATR_1M_FILTER_TONOSAMA_HISTORY_FAIL_OPEN", True):
+                    if (not _ret_ok(ret)) and _env_bool('ATR_1M_FILTER_TONOSAMA_HISTORY_FAIL_OPEN', True):
                         detail = _ret_detail(ret)
                         if _is_tonosama_entry(entry_row) and _looks_atr_history_gap(entry_row=entry_row, detail=detail):
-                            logger.warning(
-                                "[ENTRY FINAL FILTER FAILOPEN] atr_1m_filter TONOSAMA history gap -> fail-open. symbol=%s ret=%s detail=%s nested_tonosama=True",
-                                _row_dict(entry_row).get("symbol"), ret, detail,
-                            )
+                            logger.warning('[ENTRY FINAL FILTER FAILOPEN] atr_1m_filter TONOSAMA history gap -> fail-open symbol=%s', _row_dict(entry_row).get('symbol'))
                             return True
                     return ret
                 except Exception as e:
-                    allow = _is_tonosama_entry(entry_row) and _env_bool("ATR_1M_FILTER_TONOSAMA_ERROR_FAIL_OPEN", False)
-                    logger.warning("[ENTRY FINAL FILTER FAILOPEN] atr_1m_filter error. tonosama_fail_open=%s err=%s", allow, e, exc_info=False)
+                    allow = _is_tonosama_entry(entry_row) and _env_bool('ATR_1M_FILTER_TONOSAMA_ERROR_FAIL_OPEN', False)
+                    logger.warning('[ENTRY FINAL FILTER FAILOPEN] atr_1m_filter error tonosama_fail_open=%s err=%s', allow, e, exc_info=False)
                     return bool(allow)
-
-            _atr_tonosama_failopen._tonosama_atr_failopen_wrapper = True  # type: ignore[attr-defined]
-            _atr_tonosama_failopen._tonosama_atr_failopen_wrapper_v2 = True  # type: ignore[attr-defined]
-            _atr_tonosama_failopen._tonosama_atr_failopen_wrapper_v22 = True  # type: ignore[attr-defined]
-            _atr_tonosama_failopen._tonosama_atr_failopen_wrapper_v23 = True  # type: ignore[attr-defined]
-            _atr_tonosama_failopen._original_atr_1m_filter = orig_atr  # type: ignore[attr-defined]
-            setattr(ec, "atr_1m_filter", _atr_tonosama_failopen)
-            logger.warning("[ENTRY FINAL FILTER FAILOPEN] atr_1m_filter TONOSAMA nested-source history-gap wrapper installed v2.3")
+            _atr_tonosama_failopen._tonosama_atr_failopen_wrapper_v23 = True
+            _atr_tonosama_failopen._tonosama_atr_failopen_wrapper_v24 = True
+            _atr_tonosama_failopen._original_atr_1m_filter = orig_atr
+            setattr(ec, 'atr_1m_filter', _atr_tonosama_failopen)
+            logger.warning('[ENTRY FINAL FILTER FAILOPEN] atr_1m_filter TONOSAMA wrapper installed v2.4')
     except Exception:
-        logger.exception("[ENTRY FINAL FILTER FAILOPEN] atr_1m wrapper install failed")
-
+        logger.exception('[ENTRY FINAL FILTER FAILOPEN] atr_1m wrapper install failed')
     try:
-        orig_range = getattr(ec, "range_5m_filter", None)
-        if callable(orig_range) and not getattr(orig_range, "_range5m_failopen_wrapper_v23", False):
+        orig_range = getattr(ec, 'range_5m_filter', None)
+        if callable(orig_range) and not getattr(orig_range, '_range5m_failopen_wrapper_v24', False):
             def _range5m_failopen(entry_row: Any = None, *args, **kwargs):
                 try:
                     ret = orig_range(entry_row, *args, **kwargs)
-                    if isinstance(ret, tuple):
-                        return ret
-                    if ret is False and _env_bool("RANGE_5M_FILTER_NG_FAIL_OPEN", True):
-                        logger.warning("[ENTRY FINAL FILTER FAILOPEN] range_5m_filter returned NG -> fail-open. Other guards still apply.")
-                        return True
+                    if isinstance(ret, tuple): return ret
+                    if ret is False and _env_bool('RANGE_5M_FILTER_NG_FAIL_OPEN', True): return True
                     return ret
                 except RecursionError:
-                    allow = _env_bool("RANGE_5M_FILTER_RECURSION_FAIL_OPEN", True)
-                    logger.error("[ENTRY FINAL FILTER FAILOPEN] range_5m_filter recursion. fail_open=%s", allow, exc_info=False)
-                    return bool(allow)
-                except Exception as e:
-                    allow = _env_bool("RANGE_5M_FILTER_ERROR_FAIL_OPEN", True)
-                    logger.warning("[ENTRY FINAL FILTER FAILOPEN] range_5m_filter error. fail_open=%s err=%s", allow, e, exc_info=False)
-                    return bool(allow)
-
-            _range5m_failopen._range5m_failopen_wrapper = True  # type: ignore[attr-defined]
-            _range5m_failopen._range5m_failopen_wrapper_v23 = True  # type: ignore[attr-defined]
-            _range5m_failopen._original_range_5m_filter = orig_range  # type: ignore[attr-defined]
-            setattr(ec, "range_5m_filter", _range5m_failopen)
-            logger.warning("[ENTRY FINAL FILTER FAILOPEN] range_5m_filter wrapper installed v2.3")
+                    return bool(_env_bool('RANGE_5M_FILTER_RECURSION_FAIL_OPEN', True))
+                except Exception:
+                    return bool(_env_bool('RANGE_5M_FILTER_ERROR_FAIL_OPEN', True))
+            _range5m_failopen._range5m_failopen_wrapper_v23 = True
+            _range5m_failopen._range5m_failopen_wrapper_v24 = True
+            _range5m_failopen._original_range_5m_filter = orig_range
+            setattr(ec, 'range_5m_filter', _range5m_failopen)
+            logger.warning('[ENTRY FINAL FILTER FAILOPEN] range_5m_filter wrapper installed v2.4')
     except Exception:
-        logger.exception("[ENTRY FINAL FILTER FAILOPEN] range_5m wrapper install failed")
-
-    for mod_name, label in [
-        ("core.startup.entry_direction_failclosed_patch", "direction guarded patch"),
-        ("core.startup.pending_protect_push_patch", "pending protect push patch"),
-        ("core.startup.board_retry_patch", "board retry patch"),
-        ("core.startup.entry_mtf_short_required_daily_optional_patch", "short MTF daily optional patch"),
-        ("core.startup.entry_ma5_breakout_count_patch", "MA5 breakout count patch"),
-    ]:
+        logger.exception('[ENTRY FINAL FILTER FAILOPEN] range_5m wrapper install failed')
+    for mod_name, label in [('core.startup.entry_direction_failclosed_patch','direction guarded patch'),('core.startup.pending_protect_push_patch','pending protect push patch'),('core.startup.board_retry_patch','board retry patch'),('core.startup.entry_mtf_short_required_daily_optional_patch','short MTF daily optional patch'),('core.startup.entry_ma5_breakout_count_patch','MA5 breakout count patch')]:
         try:
-            mod = __import__(mod_name, fromlist=["install"])
-            fn = getattr(mod, "install", None)
-            ok = fn() if callable(fn) else False
-            logger.warning("[ENTRY FINAL FILTER FAILOPEN] %s installed=%s", label, ok)
+            mod = __import__(mod_name, fromlist=['install']); fn = getattr(mod, 'install', None); ok = fn() if callable(fn) else False
+            logger.warning('[ENTRY FINAL FILTER FAILOPEN] %s installed=%s', label, ok)
         except Exception:
-            logger.exception("[ENTRY FINAL FILTER FAILOPEN] %s install failed", label)
-
+            logger.exception('[ENTRY FINAL FILTER FAILOPEN] %s install failed', label)
     _PATCHED = True
-    logger.warning(
-        "[ENTRY FINAL FILTER FAILOPEN] installed v2.3 atr_tonosama_history_fail_open=%s atr_min_bars=%s range_fail_open=%s allow_without_board=%s max_symbol_entries=%s winning_reentry=%s winning_max=%s low_move_tonosama_min_range=%s entry_order_min_range=%s entry_order_min_atr=%s direction_min_strength=%s direction_strict=%s pending_protect_push=%s board_retry=%s short_mtf_required=%s daily_mtf_optional=%s ma5_breakout=%s direction_recursion_fail_open=%s direction_error_fail_open=%s",
-        _env_bool("ATR_1M_FILTER_TONOSAMA_HISTORY_FAIL_OPEN", True),
-        os.getenv("ATR_1M_FILTER_TONOSAMA_MIN_BARS"),
-        _env_bool("RANGE_5M_FILTER_NG_FAIL_OPEN", True),
-        os.getenv("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"),
-        os.getenv("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL"),
-        os.getenv("ENTRY_WINNING_SYMBOL_REENTRY_ENABLED"),
-        os.getenv("ENTRY_WINNING_SYMBOL_MAX_DAILY_ENTRIES"),
-        os.getenv("LOW_MOVE_TONOSAMA_MIN_RANGE_PCT"),
-        os.getenv("ENTRY_ORDER_MIN_RANGE_PCT"),
-        os.getenv("ENTRY_ORDER_MIN_ATR_RATIO"),
-        os.getenv("ENTRY_DIRECTION_CONFIRM_MIN_STRENGTH"),
-        os.getenv("ENTRY_DIRECTION_CONFIRM_STRICT"),
-        os.getenv("PENDING_PROTECT_PUSH_SYMBOLS"),
-        os.getenv("ENTRY_BOARD_RETRY_ENABLED"),
-        os.getenv("ENTRY_SHORT_MTF_REQUIRED"),
-        os.getenv("ENTRY_DAILY_MTF_OPTIONAL"),
-        os.getenv("ENTRY_MA5_BREAKOUT_ENABLED"),
-        os.getenv("ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN"),
-        os.getenv("ENTRY_DIRECTION_CONFIRM_ERROR_FAIL_OPEN"),
-    )
+    logger.warning('[ENTRY FINAL FILTER FAILOPEN] installed v2.4 atr_failopen=%s range_failopen=%s allow_without_board=%s defaults_count=%s', _env_bool('ATR_1M_FILTER_TONOSAMA_HISTORY_FAIL_OPEN', True), _env_bool('RANGE_5M_FILTER_NG_FAIL_OPEN', True), os.getenv('ENTRY_ALLOW_ENTRY_WITHOUT_BOARD'), len(_ENV_SET))
     return True
-
-
-try:
-    install()
-except Exception:
-    logger.exception("[ENTRY FINAL FILTER FAILOPEN] auto install failed")
-
-
-__all__ = ["install"]
+try: install()
+except Exception: logger.exception('[ENTRY FINAL FILTER FAILOPEN] auto install failed')
+__all__ = ['install']
