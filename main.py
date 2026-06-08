@@ -10,7 +10,7 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.31-LUNCH-BLOCK-1130
+# Version: Ver38.32-RANKING-NO-HIGHLOW-RELAX
 # ------------------------------------------------------------
 # ✔ SUMMARY AI async entry patch を main runtime patch 一覧へ明示追加
 # ✔ TONOSAMA final liquidity lost-volume fallback threshold を 2.3 に調整
@@ -21,6 +21,7 @@
 # ✔ RANKING_ENTRY 強スコアの技術フィルタ全落ちを救済
 # ✔ 3m/5m summary を最新3m/5m時刻以降の1m差分から補完
 # ✔ ENTRY_LUNCH_BLOCK_START のデフォルトを 11:30 に設定
+# ✔ RANKING high/low欠損時のLOW MOVE条件をスキャル向けに緩和
 # ✔ 既存の起動処理は維持
 # ============================================================
 
@@ -60,6 +61,10 @@ os.environ.setdefault("FINAL_ENTRY_TONOSAMA_SCORE_ONLY_MIN_SCORE", "2.3")
 os.environ.setdefault("FINAL_ENTRY_TONOSAMA_DEDICATED_OK_MIN_SCORE", "2.3")
 os.environ.setdefault("ENTRY_LUNCH_BLOCK_START", "11:30")
 os.environ.setdefault("ENTRY_LUNCH_BLOCK_END", "12:30")
+# RANKING pending は high/low が欠損しやすい。高スコア候補を no_high_low だけで全落ちさせない。
+os.environ.setdefault("LOW_MOVE_RANKING_MIN_ATR_RATIO", "0.0020")
+os.environ.setdefault("LOW_MOVE_RANKING_MIN_ABS_SLOPE", "0.0")
+os.environ.setdefault("LOW_MOVE_RANKING_MIN_SCORE_FOR_NO_HIGHLOW", "70.0")
 
 try:
     from core.logging.console_tee import setup_console_tee, rebind_logging_streams_to_console_tee
@@ -298,7 +303,7 @@ def main():
         except Exception:
             logger.exception("ats_register_loop start failed")
         try:
-            Thread(target=force_cancel_loop, daemon=True).start()
+            Thread(target=start_force_cancel_loop, daemon=True).start()
         except Exception:
             logger.exception("force_cancel_loop start failed")
         try:
