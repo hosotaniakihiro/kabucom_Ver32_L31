@@ -39,35 +39,24 @@ CANCELABLE_STATES = {1, 2, 3, 4}
 # API TOKEN 準備確認
 # ============================================================
 
-def _has_api_token():
-    """
-    起動直後は login/token 設定より先に force_cancel_loop が動く場合がある。
-    この状態で get_headers() を呼ぶと RuntimeError になるため、事前に待避する。
-    """
-    try:
-        from kabu_api import global_data
-        token = getattr(global_data, "API_TOKEN", None)
-        return bool(token)
-    except Exception:
-        return False
-
-
 def _safe_get_headers(context):
     """
-    API TOKEN 未準備時は例外にせず None を返す。
-    呼び出し側は None の場合、その tick をスキップする。
-    """
-    if not _has_api_token():
-        logger.warning("[FORCE_CANCEL] API TOKEN not ready; skip %s", context)
-        return None
+    api_common.get_headers() に token_manager/global_state の待機・復元を任せる。
 
+    以前の _has_api_token() は kabu_api.global_data を見ていたが、api_common 側は
+    global_state.global_data を正として使っているため、API token refreshed 後も
+    未準備扱いになることがあった。
+    """
     try:
         return get_headers()
     except RuntimeError as e:
         if "API TOKEN is not set" in str(e):
-            logger.warning("[FORCE_CANCEL] API TOKEN not ready in get_headers; skip %s", context)
+            logger.warning("[FORCE_CANCEL] API TOKEN not ready; skip %s", context)
             return None
         raise
+    except Exception:
+        logger.exception("[FORCE_CANCEL] get_headers failed; skip %s", context)
+        return None
 
 
 # ============================================================
@@ -175,11 +164,6 @@ def start_force_cancel_loop(interval_sec=30):
 
     while True:
         try:
-            if not _has_api_token():
-                logger.warning("[FORCE_CANCEL] API TOKEN not ready; waiting")
-                time.sleep(interval_sec)
-                continue
-
             orders = get_orders()
             if not orders:
                 time.sleep(interval_sec)
