@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/entry_ma5_third_bar_slope_guard_patch.py
-# Version: V2-RANKING-STRONG-FAILOPEN
+# Version: V3-STRONG-SCORE-FAILOPEN
 # ------------------------------------------------------------
 # BUY:
 #   3分足・5分足で価格がMA5を超えて1本目/2本目では入らず、
@@ -9,9 +9,12 @@
 #   3分足・5分足で価格がMA5を下抜けて1本目/2本目では入らず、
 #   3本目でMA5傾きがマイナスの時だけ許可する。
 #
-# V2:
-#   - RANKING 強スコア候補は、このガードだけで候補ゼロにしない。
-#   - ただし通常候補/低スコア候補は従来通り MA5 方向確認を維持。
+# V3:
+#   - entry_controller の候補itemでは source=RANKING が欠落する場合があり、
+#     V2 の RANKING_STRONG_FAILOPEN が発動せず、score 90 の候補まで
+#     ma5_third_bar_slope_ng で全落ちしていた。
+#   - strong score 候補は source が取れなくても、このガード単独では落とさない。
+#   - 低スコア候補は従来通り MA5 方向確認を維持。
 # ============================================================
 from __future__ import annotations
 
@@ -81,7 +84,7 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
 
 def _row_sources(item: dict[str, Any]):
     try:
-        for src in (item, item.get("entry_row"), item.get("entry"), item.get("row")):
+        for src in (item, item.get("entry_row"), item.get("entry"), item.get("row"), item.get("raw"), item.get("_raw")):
             if isinstance(src, dict):
                 yield src
     except Exception:
@@ -104,7 +107,7 @@ def _symbol_from_item(item: dict[str, Any]) -> str:
 def _side_from_item(item: dict[str, Any]) -> str:
     try:
         for src in _row_sources(item):
-            s = str(src.get("side") or src.get("entry_decision") or "").strip().upper()
+            s = str(src.get("side") or src.get("entry_decision") or src.get("resolved_side") or "").strip().upper()
             if s in {"BUY", "SELL"}:
                 return s
     except Exception:
@@ -113,11 +116,15 @@ def _side_from_item(item: dict[str, Any]) -> str:
 
 
 def _source_from_item(item: dict[str, Any]) -> str:
+    keys = ("source", "entry_source", "entry_type", "pipeline_source", "ranking_entry_mode", "ranking_source")
     try:
+        vals = []
         for src in _row_sources(item):
-            s = str(src.get("source") or src.get("entry_source") or src.get("entry_type") or "").strip().upper()
-            if s:
-                return s
+            for k in keys:
+                v = src.get(k)
+                if v:
+                    vals.append(str(v).strip().upper())
+        return ",".join(vals)
     except Exception:
         pass
     return ""
@@ -132,6 +139,9 @@ def _score_from_item(item: dict[str, Any]) -> float:
         "display_score",
         "score_total",
         "total_score",
+        "ranking_only_score",
+        "ranking_strength",
+        "snapshot_score",
     )
     try:
         vals = []
@@ -144,17 +154,26 @@ def _score_from_item(item: dict[str, Any]) -> float:
         return 0.0
 
 
-def _ranking_strong_failopen_ok(item: dict[str, Any], diag: dict[str, Any]) -> bool:
-    if not _env_bool("ENTRY_MA5_THIRD_BAR_RANKING_STRONG_FAILOPEN", True):
+def _strong_failopen_ok(item: dict[str, Any], diag: dict[str, Any]) -> bool:
+    if not _env_bool("ENTRY_MA5_THIRD_BAR_STRONG_SCORE_FAILOPEN", True):
         return False
+
     source = _source_from_item(item)
-    if "RANKING" not in source:
-        return False
     score = _score_from_item(item)
-    min_score = _env_float("ENTRY_MA5_THIRD_BAR_RANKING_FAILOPEN_MIN_SCORE", 80.0)
+    min_score = _env_float(
+        "ENTRY_MA5_THIRD_BAR_STRONG_FAILOPEN_MIN_SCORE",
+        _env_float("ENTRY_MA5_THIRD_BAR_RANKING_FAILOPEN_MIN_SCORE", 75.0),
+    )
     if score < min_score:
         return False
-    # 逆行が極端な場合は維持する。通常の少し遅れたMA5だけなら通す。
+
+    # 明示的にRANKINGなら通す。sourceが欠落していても high score は通す。
+    allow_unknown_source = _env_bool("ENTRY_MA5_THIRD_BAR_STRONG_FAILOPEN_ALLOW_UNKNOWN_SOURCE", True)
+    if source and "RANKING" not in source and not _env_bool("ENTRY_MA5_THIRD_BAR_STRONG_FAILOPEN_ALL_SOURCES", False):
+        return False
+    if not source and not allow_unknown_source:
+        return False
+
     max_bad_slope_abs = _env_float("ENTRY_MA5_THIRD_BAR_RANKING_MAX_BAD_SLOPE_ABS", 999999.0)
     try:
         bad_slopes = []
@@ -165,15 +184,24 @@ def _ranking_strong_failopen_ok(item: dict[str, Any], diag: dict[str, Any]) -> b
             return False
     except Exception:
         pass
+
     logger.warning(
-        "[ENTRY MA5 THIRD BAR GUARD] RANKING_STRONG_FAILOPEN symbol=%s side=%s score=%.3f min_score=%.3f diag=%s",
+        "[ENTRY MA5 THIRD BAR GUARD] STRONG_SCORE_FAILOPEN symbol=%s side=%s source=%s score=%.3f min_score=%.3f diag=%s",
         diag.get("symbol"),
         diag.get("side"),
+        source or "UNKNOWN",
         score,
         min_score,
         diag,
     )
     return True
+
+
+def _ranking_strong_failopen_ok(item: dict[str, Any], diag: dict[str, Any]) -> bool:
+    # backward-compatible env name
+    if not _env_bool("ENTRY_MA5_THIRD_BAR_RANKING_STRONG_FAILOPEN", True):
+        return False
+    return _strong_failopen_ok(item, diag)
 
 
 def _latest_rows_for_symbol(tf: int, symbol: str):
@@ -238,7 +266,7 @@ def _passes_ma5_guard(item: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
         if not ok:
             out = {"symbol": symbol, "side": side, "checks": checks, "reason": "ma5_third_bar_slope_ng"}
             if _ranking_strong_failopen_ok(item, out):
-                out["reason"] = "ma5_third_bar_ranking_strong_failopen"
+                out["reason"] = "ma5_third_bar_strong_score_failopen"
                 return True, out
             return False, out
     if seen <= 0:
@@ -275,9 +303,12 @@ def _patched_build_scored_candidates(*args, **kwargs):
 def install() -> bool:
     global _INSTALLED, _ORIG_BUILD
     try:
+        os.environ.setdefault("ENTRY_MA5_THIRD_BAR_STRONG_SCORE_FAILOPEN", "1")
+        os.environ.setdefault("ENTRY_MA5_THIRD_BAR_STRONG_FAILOPEN_ALLOW_UNKNOWN_SOURCE", "1")
+        os.environ.setdefault("ENTRY_MA5_THIRD_BAR_STRONG_FAILOPEN_MIN_SCORE", os.environ.get("ENTRY_MA5_THIRD_BAR_RANKING_FAILOPEN_MIN_SCORE", "75"))
         import trading.handlers.entry_controller as ec
         cur = getattr(ec, "_build_scored_candidates", None)
-        if getattr(cur, "_entry_ma5_third_bar_guard_v2", False):
+        if getattr(cur, "_entry_ma5_third_bar_guard_v3", False):
             _INSTALLED = True
             return True
         original = getattr(cur, "_original", None) if callable(cur) else None
@@ -288,19 +319,21 @@ def install() -> bool:
         else:
             logger.warning("[ENTRY MA5 THIRD BAR GUARD] target missing")
             return False
+        _patched_build_scored_candidates._entry_ma5_third_bar_guard_v3 = True  # type: ignore[attr-defined]
         _patched_build_scored_candidates._entry_ma5_third_bar_guard_v2 = True  # type: ignore[attr-defined]
         _patched_build_scored_candidates._entry_ma5_third_bar_guard_v1 = True  # type: ignore[attr-defined]
         _patched_build_scored_candidates._original = _ORIG_BUILD  # type: ignore[attr-defined]
         ec._build_scored_candidates = _patched_build_scored_candidates
         _INSTALLED = True
         logger.warning(
-            "[ENTRY MA5 THIRD BAR GUARD] installed v2 enabled=%s tfs=%s min_bars=%s fail_open=%s ranking_strong_failopen=%s min_score=%.2f max_bad_slope_abs=%.3f",
+            "[ENTRY MA5 THIRD BAR GUARD] installed v3 enabled=%s tfs=%s min_bars=%s fail_open=%s strong_failopen=%s min_score=%.2f allow_unknown_source=%s max_bad_slope_abs=%.3f",
             _env_bool("ENTRY_MA5_THIRD_BAR_SLOPE_GUARD_ENABLED", True),
             _tfs(),
             _env_int("ENTRY_MA5_THIRD_BAR_MIN_BARS", 3),
             _env_bool("ENTRY_MA5_THIRD_BAR_FAIL_OPEN", True),
-            _env_bool("ENTRY_MA5_THIRD_BAR_RANKING_STRONG_FAILOPEN", True),
-            _env_float("ENTRY_MA5_THIRD_BAR_RANKING_FAILOPEN_MIN_SCORE", 80.0),
+            _env_bool("ENTRY_MA5_THIRD_BAR_STRONG_SCORE_FAILOPEN", True),
+            _env_float("ENTRY_MA5_THIRD_BAR_STRONG_FAILOPEN_MIN_SCORE", 75.0),
+            _env_bool("ENTRY_MA5_THIRD_BAR_STRONG_FAILOPEN_ALLOW_UNKNOWN_SOURCE", True),
             _env_float("ENTRY_MA5_THIRD_BAR_RANKING_MAX_BAD_SLOPE_ABS", 999999.0),
         )
         return True
