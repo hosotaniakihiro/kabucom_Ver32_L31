@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/startup_config.py
-# Version: FINAL-PRODUCTION-REV23.1-STARTUP-CONFIG
+# Version: FINAL-PRODUCTION-REV23.2-STARTUP-CONFIG-TOKEN-ALIASES
 #          -RANKING-SUMMARY-BOOTSTRAP-FLAGS
 # ------------------------------------------------------------
 # 【概要】
@@ -13,16 +13,9 @@
 #   ✔ path 定義
 #   ✔ 汎用 helper
 #
-# 【REV23.1 変更点】
-#   ✔ ranking summary bootstrap 用 runtime flags を追加
-#   ✔ ranking_summary_bootstrap_started
-#   ✔ ranking_summary_bootstrap_done
-#   ✔ ranking_summary_bootstrap_failed
-#   ✔ ranking_summary_bootstrap_result
-#   ✔ ranking_summary_bootstrap_saved
-#   ✔ ranking_summary_bootstrap_snapshot_rows
-#   ✔ ranking_summary_bootstrap_db_path
-#   ✔ 既存機能削除ゼロ
+# REV23.2:
+#   ✔ refresh_token_safe 後に global_data の token alias 全部へ同期
+#   ✔ token_manager.API_TOKEN へも明示同期し、clear_all 後も api_common が復旧可能にする
 # ============================================================
 
 from __future__ import annotations
@@ -33,6 +26,7 @@ import logging
 from configparser import ConfigParser
 from typing import Any, Callable
 
+import token_manager
 from token_manager import refresh_token
 from config.paths import get_path
 from global_state import global_data
@@ -43,7 +37,7 @@ PUSH_DIR = str(get_path("raw_push"))
 SUMMARY_DIR = get_path("summary_db_dir")
 RANKING_DIR = get_path("ranking")
 
-VERSION = "FINAL-PRODUCTION-REV23.1-STARTUP-CONFIG-RANKING-SUMMARY-BOOTSTRAP-FLAGS"
+VERSION = "FINAL-PRODUCTION-REV23.2-STARTUP-CONFIG-TOKEN-ALIASES-RANKING-SUMMARY-BOOTSTRAP-FLAGS"
 
 
 # ============================================================
@@ -172,6 +166,17 @@ def _set_flag(name: str, value: Any) -> None:
         )
 
 
+def _sync_token_aliases(token: str) -> None:
+    if not token:
+        return
+    for name in ("token_value", "API_TOKEN", "api_token", "token", "kabu_api_token"):
+        _set_flag(name, token)
+    try:
+        token_manager.API_TOKEN = token
+    except Exception:
+        logger.debug("[startup.config] token_manager alias sync failed", exc_info=True)
+
+
 def _init_push_flags() -> None:
     # PUSH
     _set_flag("push_writer_running", False)
@@ -286,7 +291,7 @@ def init_runtime_flags(ws_url: str = "") -> None:
         # ranking summary bootstrap
         _init_ranking_summary_bootstrap_flags()
 
-        # scheduler / schedule loop
+        # schedule loop
         _init_scheduler_flags()
 
         # summary debug
@@ -309,8 +314,9 @@ def refresh_token_safe(api_password: str) -> None:
     token 取得失敗時は startup 継続不可のため raise。
     """
     try:
-        global_data.token_value = refresh_token(api_password)
-        logger.info("🔐 API token refreshed")
+        token = refresh_token(api_password)
+        _sync_token_aliases(token)
+        logger.info("🔐 API token refreshed aliases_synced=True")
     except Exception:
         logger.exception("❌ Token refresh failed")
         raise
