@@ -65,12 +65,20 @@ _env_default("RANKING_PRECHECK_MAX_AGE_SEC", "300")
 _env_default("RANKING_SNAPSHOT_MAX_AGE_SEC", "300")
 _env_default("RANKING_ENTRY_ALLOW_STALE_FALLBACK", "0")
 _env_default("RANKING_ENTRY_RAW_FALLBACK_ONLY_TODAY", "1")
+_env_default("RANKING_PRECHECK_PENDING_FAILOPEN_ENABLED", "0")
 
-# Ranking AIモデル未配置時も、強いランキング候補は小ロットで通す。
+# Ranking AIモデル未配置時も、強いランキング候補は小ロットで通す。ただし価格範囲外/MTF=0は救済しない。
 _env_default("RANKING_AI_GATE_FAILOPEN_ENABLED", "1")
 _env_default("RANKING_AI_GATE_FAILOPEN_MIN_SCORE", "50")
 _env_default("RANKING_AI_GATE_FAILOPEN_MIN_TURNOVER", "50000000")
 _env_default("RANKING_AI_GATE_FAILOPEN_MIN_VOLUME", "30000")
+_env_default("ENTRY_RANKING_SCALP_MIN_PRICE", "1500")
+_env_default("ENTRY_RANKING_SCALP_MAX_PRICE", "7000")
+_env_default("ENTRY_RANKING_SCALP_MIN_MTF", "0.5")
+_env_default("ENTRY_RANKING_SCALP_ALLOW_ZERO_MTF_RESCUE", "0")
+_env_default("ENTRY_RANKING_SCALP_AI_FALLBACK_ANY_NG", "0")
+_env_default("ENTRY_RANKING_SCALP_RANGE_NO_HIGHLOW_FAILOPEN", "0")
+_env_default("ENTRY_RANKING_SCALP_RANGE_ERROR_FAILOPEN", "0")
 
 # Tonosama / 3m・5m stale summary はfail-closed寄りにする。
 _env_default("TONOSAMA_STALE_SUMMARY_FAILOPEN", "0")
@@ -94,21 +102,21 @@ _env_default("PULLBACK_ENTRY_MIN_VOLUME", "30000")
 _env_default("PULLBACK_ENTRY_MIN_TURNOVER", "10000000")
 
 logger.warning(
-    "[USERCUSTOMIZE] runtime defaults applied summary_ai_daily_risk=%s liq_run_in_main=%s liq_fail_open=%s liq_min_turnover=%s final_liq_min_turnover=%s protect_pending=%s exit_cooldown=%s board_allow=%s board_hard=%s ranking_empty_failclosed=%s ranking_stale_skip=%s ranking_require_today=%s ranking_clear_pending=%s ranking_ai_failopen=%s tonosama_mtf_stale_fail_closed=%s suppress_lunch_pm=%s pullback=%s",
+    "[USERCUSTOMIZE] runtime defaults applied summary_ai_daily_risk=%s liq_run_in_main=%s liq_fail_open=%s ranking_precheck_pending_failopen=%s ranking_empty_failclosed=%s ranking_stale_skip=%s ranking_require_today=%s ranking_clear_pending=%s ranking_ai_failopen=%s scalp_price=%s-%s scalp_min_mtf=%s zero_mtf_rescue=%s scalp_ai_any_ng=%s tonosama_mtf_stale_fail_closed=%s suppress_lunch_pm=%s pullback=%s",
     os.getenv("SUMMARY_AI_PRE_FILTER_DAILY_RISK"),
     os.getenv("WATCHLIST_RECENT_LIQ_BULK_RUN_IN_MAIN"),
     os.getenv("WATCHLIST_RECENT_LIQ_FAIL_OPEN_ON_TIMEOUT"),
-    os.getenv("WATCHLIST_RECENT_LIQ_MIN_TURNOVER_YEN"),
-    os.getenv("FINAL_ENTRY_TONOSAMA_MIN_TURNOVER"),
-    os.getenv("ACTIVE_PROTECT_PENDING_SYMBOLS"),
-    os.getenv("ACTIVE_EXIT_COOLDOWN_PROTECT_SEC"),
-    os.getenv("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"),
-    os.getenv("ENTRY_BOARD_MISSING_HARD_BLOCK"),
+    os.getenv("RANKING_PRECHECK_PENDING_FAILOPEN_ENABLED"),
     os.getenv("RANKING_TODAY_EMPTY_FAIL_CLOSED"),
     os.getenv("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE"),
     os.getenv("RANKING_ENTRY_REQUIRE_TODAY"),
     os.getenv("RANKING_ENTRY_CLEAR_PENDING_ON_STALE"),
     os.getenv("RANKING_AI_GATE_FAILOPEN_ENABLED"),
+    os.getenv("ENTRY_RANKING_SCALP_MIN_PRICE"),
+    os.getenv("ENTRY_RANKING_SCALP_MAX_PRICE"),
+    os.getenv("ENTRY_RANKING_SCALP_MIN_MTF"),
+    os.getenv("ENTRY_RANKING_SCALP_ALLOW_ZERO_MTF_RESCUE"),
+    os.getenv("ENTRY_RANKING_SCALP_AI_FALLBACK_ANY_NG"),
     os.getenv("TONOSAMA_MTF_STALE_FAIL_CLOSED"),
     os.getenv("SUMMARY_SUPPRESS_LUNCH_FALLBACK_AFTER_PM"),
     os.getenv("PULLBACK_ENTRY_ENABLED"),
@@ -207,3 +215,4 @@ else:
     _install("SUMMARY_AFTERNOON_STALE_GUARD_LAST", "core.startup.summary_fallback_afternoon_stale_guard_patch")
     _install("BOARD_MISSING_PROTECTED_ALLOW", "core.startup.board_missing_protected_allow_patch")
     _install("RANKING_AI_GATE_FAILOPEN_LAST", "core.startup.ranking_entry_gate_failopen_patch")
+    _install("ENTRY_RANKING_SCALP_RESCUE_LAST", "core.startup.entry_ranking_scalp_order_rescue_patch")
