@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/ws_callbacks.py
-# Version: Ver1.4-PUSH-STREAM-WS-CALLBACKS-REFRESH-AFTER-OPEN-FIX
+# Version: Ver1.5-PUSH-STREAM-WS-CALLBACKS-SOCK-NONE-DISCONNECT-FIX
 # ------------------------------------------------------------
 # PUSH WebSocket callback。
 #
@@ -8,6 +8,7 @@
 #   - WebSocket接続後に必ず subscription refresh thread を起動する
 #   - rotation_enabled=False の memory-only mode でも登録銘柄を送信する
 #   - 保有銘柄が protected に入っても、実際のPUSH登録が走らない問題を修正
+#   - websocket-client の sock=None 競合を接続断扱いにして再接続へ寄せる
 # ============================================================
 
 from __future__ import annotations
@@ -48,6 +49,17 @@ def _safe_row_head(row: Any) -> str:
         return f"type={type(row).__name__}"
     except Exception:
         return "unknown"
+
+
+def _mark_disconnected(reason: str) -> None:
+    """on_close を経由しない異常系でも runtime 状態を接続断へ戻す。"""
+    try:
+        state._last_disconnect_at = _now()
+        state._connected_event.clear()
+        _clear_sender()
+        _safe_set_runtime("ws_connected", False)
+    except Exception:
+        logger.exception("[push_stream] failed to mark disconnected reason=%s", reason)
 
 
 def _update_latest_price_cache_safe(row: dict) -> None:
@@ -91,7 +103,6 @@ def on_message(ws: websocket.WebSocketApp, message: Any) -> None:
             state._total_dropped += 1
             logger.warning("[push_stream] normalize returned empty payload=%s", _safe_payload_head(payload))
             return
-
         _update_latest_price_cache_safe(row)
         _update_5sec_bar_safe(row)
 
@@ -124,12 +135,25 @@ def on_error(ws, error):
     state._last_error_at = _now()
     state._total_errors += 1
     msg = str(error)
+
+    # websocket-client 内部で、切断済み WebSocketApp の self.sock が None のまま
+    # dispatcher.read(self.sock.sock, ...) に進むことがある。
+    # これはアプリ側では接続断として扱い、ERROR traceback を連発させない。
+    if "NoneType" in msg and "sock" in msg:
+        logger.warning("[push_stream] ws socket already closed; mark disconnected: %s", msg)
+        _mark_disconnected("sock_none")
+        return
+
     if "10054" in msg or isinstance(error, ConnectionResetError):
         logger.warning("[push_stream] ws reset by peer: %s", msg)
+        _mark_disconnected("reset_by_peer")
         return
+
     if "ping/pong timed out" in msg:
         logger.warning("[push_stream] ws ping timeout: %s", msg)
+        _mark_disconnected("ping_timeout")
         return
+
     logger.error("--- ERROR ---")
     logger.error("%s", error, exc_info=True if isinstance(error, BaseException) else False)
 
