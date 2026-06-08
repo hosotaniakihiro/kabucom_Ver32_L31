@@ -36,6 +36,16 @@ def _env_bool(name: str, default: bool = True) -> bool:
         return bool(default)
 
 
+def _ensure_min_env_float(name: str, minimum: float) -> None:
+    try:
+        cur = _env_float(name, minimum)
+        if cur < minimum:
+            os.environ[name] = str(float(minimum))
+            logger.warning("[RANKING ENTRY MARKET HOURS SKIP] env raised %s %.1f->%.1f", name, cur, minimum)
+    except Exception:
+        os.environ[name] = str(float(minimum))
+
+
 def _in_session(now=None):
     now = now or dt.datetime.now()
     t = now.time()
@@ -71,14 +81,14 @@ def _install_companion_patches() -> bool:
 
 def _run_with_watchdog(orig) -> Any:
     """
-    ranking_entry が DB/API 待ちで固まると schedule_loop 側の running が残り、
-    以後の 1分エントリーが全部 skip される。別 thread で orig() を走らせ、
-    timeout 後は wrapper を返して schedule_loop の running を解除する。
+    ranking_entry は pending 作成後に entry_controller.run_entry_pipeline まで実行する。
+    旧 55秒では pending 4件処理中に timeout し、pending が残り続けるため、
+    watchdog は controller timeout(120s) より長い 180秒以上にする。
     """
     if not _env_bool("RANKING_ENTRY_WATCHDOG_ENABLED", True):
         return orig()
 
-    timeout_sec = max(10.0, _env_float("RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC", 55.0))
+    timeout_sec = max(180.0, _env_float("RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC", 180.0))
     result: dict[str, Any] = {"done": False, "ret": None, "error": None}
 
     def _target() -> None:
@@ -101,7 +111,7 @@ def _run_with_watchdog(orig) -> Any:
             elapsed,
             timeout_sec,
             True,
-            "previous ranking_entry would block all later entry ticks; worker is daemon and next tick may retry",
+            "ranking entry still blocked after extended timeout; worker is daemon and next tick may retry",
         )
         return 0
 
@@ -119,19 +129,13 @@ def _entry_stale_timeout_for_key(key: str) -> float:
     if "tonosama_entry" in key:
         return _env_float("TONOSAMA_ENTRY_SCHEDULER_STALE_SEC", base)
     if "ranking_entry" in key:
-        return _env_float("RANKING_ENTRY_SCHEDULER_STALE_SEC", max(75.0, base))
+        return _env_float("RANKING_ENTRY_SCHEDULER_STALE_SEC", max(120.0, base))
     if "entry" in key:
         return base
     return 0.0
 
 
 def _clear_task_running_if_stale(source: str, *, force: bool = False) -> bool:
-    """trading.entry_exit.tasks 内部の *_RUNNING フラグ残りを解除する。
-
-    schedule_loop 側の running は解除できても、tasks.py 内部の
-    _TONOSAMA_ENTRY_RUNNING / _RANKING_ENTRY_RUNNING が True のままだと
-    `previous_still_running` で再び止まる。ログの 300秒超 stuck をここで復旧する。
-    """
     source_u = str(source or "").upper()
     try:
         import trading.entry_exit.tasks as tasks
@@ -150,7 +154,7 @@ def _clear_task_running_if_stale(source: str, *, force: bool = False) -> bool:
         started_name = "_RANKING_ENTRY_STARTED_AT"
         cooldown_name = "_RANKING_ENTRY_COOLDOWN_UNTIL"
         orphan_name = None
-        timeout = _env_float("RANKING_ENTRY_TASK_STALE_SEC", _env_float("RANKING_ENTRY_SCHEDULER_STALE_SEC", 90.0))
+        timeout = _env_float("RANKING_ENTRY_TASK_STALE_SEC", _env_float("RANKING_ENTRY_SCHEDULER_STALE_SEC", 180.0))
     else:
         return False
 
@@ -209,19 +213,12 @@ def _install_task_stale_running_clear() -> bool:
         "[ENTRY TASK STALE CLEAR] installed enabled=%s tonosama_task_timeout=%.1fs ranking_task_timeout=%.1fs",
         _env_bool("ENTRY_TASK_STALE_RUNNING_CLEAR_ENABLED", True),
         _env_float("TONOSAMA_ENTRY_TASK_STALE_SEC", _env_float("TONOSAMA_ENTRY_SCHEDULER_STALE_SEC", 90.0)),
-        _env_float("RANKING_ENTRY_TASK_STALE_SEC", _env_float("RANKING_ENTRY_SCHEDULER_STALE_SEC", 90.0)),
+        _env_float("RANKING_ENTRY_TASK_STALE_SEC", _env_float("RANKING_ENTRY_SCHEDULER_STALE_SEC", 180.0)),
     )
     return True
 
 
 def _install_scheduler_stale_running_clear() -> bool:
-    """
-    schedule_loop の _is_job_running を外側から補強する。
-
-    実運用ログで `tags:entry,tonosama_entry` が 200秒以上 running のまま残り、
-    以後 `previous_still_running` で entry が発火しない状態を確認したため、
-    entry系だけ stale running を解除する。
-    """
     global _SCHEDULER_STALE_PATCHED
     if _SCHEDULER_STALE_PATCHED:
         return True
@@ -295,7 +292,7 @@ def _install_scheduler_stale_running_clear() -> bool:
             _env_bool("ENTRY_SCHEDULER_STALE_RUNNING_CLEAR_ENABLED", True),
             _env_float("ENTRY_SCHEDULER_STALE_RUNNING_CLEAR_SEC", 90.0),
             _env_float("TONOSAMA_ENTRY_SCHEDULER_STALE_SEC", _env_float("ENTRY_SCHEDULER_STALE_RUNNING_CLEAR_SEC", 90.0)),
-            _env_float("RANKING_ENTRY_SCHEDULER_STALE_SEC", max(75.0, _env_float("ENTRY_SCHEDULER_STALE_RUNNING_CLEAR_SEC", 90.0))),
+            _env_float("RANKING_ENTRY_SCHEDULER_STALE_SEC", max(120.0, _env_float("ENTRY_SCHEDULER_STALE_RUNNING_CLEAR_SEC", 90.0))),
         )
         return True
     except Exception:
@@ -334,7 +331,7 @@ def _patch_once():
         logger.warning(
             "[RANKING ENTRY MARKET HOURS SKIP] patched _run_ranking_entry_safe watchdog=%s timeout=%.1fs task_stale_clear=%s companion=%s",
             _env_bool("RANKING_ENTRY_WATCHDOG_ENABLED", True),
-            _env_float("RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC", 55.0),
+            _env_float("RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC", 180.0),
             task_ok,
             companion_ok,
         )
@@ -361,11 +358,12 @@ def install():
     os.environ.setdefault("ENTRY_SCHEDULER_STALE_RUNNING_CLEAR_ENABLED", "1")
     os.environ.setdefault("ENTRY_SCHEDULER_STALE_RUNNING_CLEAR_SEC", "90")
     os.environ.setdefault("TONOSAMA_ENTRY_SCHEDULER_STALE_SEC", "60")
-    os.environ.setdefault("RANKING_ENTRY_SCHEDULER_STALE_SEC", "75")
     os.environ.setdefault("TONOSAMA_ENTRY_TASK_STALE_SEC", "60")
-    os.environ.setdefault("RANKING_ENTRY_TASK_STALE_SEC", "75")
     os.environ.setdefault("RANKING_ENTRY_PUSH_SUMMARY_FALLBACK_ENABLED", "1")
     os.environ.setdefault("RANKING_PUSH_FALLBACK_MAX_ROWS", "80")
+    _ensure_min_env_float("RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC", 180.0)
+    _ensure_min_env_float("RANKING_ENTRY_SCHEDULER_STALE_SEC", 180.0)
+    _ensure_min_env_float("RANKING_ENTRY_TASK_STALE_SEC", 180.0)
     companion_ok = _install_companion_patches()
     stale_ok = _install_scheduler_stale_running_clear()
     task_ok = _install_task_stale_running_clear()
