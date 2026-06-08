@@ -1,382 +1,160 @@
-# ============================================================
-# File   : core/startup/fast_startup_runtime_patch.py
-# Version: PRODUCTION-FAST-STARTUP-PATCH-V15-DISPLAY-LABEL-GUARD
-# ------------------------------------------------------------
-# 目的:
-#   main.py 起動直後の重い処理を軽くする。
-#   さらに、OPEN建玉同期に broker 実建玉マージpatchを入れる。
-#   さらに、EXIT_EXECUTOR が内部建玉を見つけられない場合でも、
-#   broker信用建玉から復元して返済注文できるpatchを起動時に入れる。
-#   さらに、AI確認前に予算上限で買えない高価格銘柄を除外するpatchを入れる。
-#   さらに、symbol_flags.db を起動時に global_data へキャッシュする。
-#   さらに、PUSH rows があるのに summary が0件になる場合の direct OHLC patch を入れる。
-#   さらに、定時サマリーAI許可銘柄の最大発注数を10にする。
-#   さらに、エントリー価格0.3%損切り・高値/安値0.3%トレーリングEXITを入れる。
-#   さらに、SUMMARY_AIのエントリー指値を BUY=ask / SELL=bid にする。
-#   さらに、未約定新規指値を2秒で取消し、次候補のENTRYを起動する。
-#   さらに、同一銘柄当日2回まで・銘柄別-2000円停止を入れる。
-#   さらに、出来高/売買代金/値動きが弱い銘柄のエントリーを止める。
-#   さらに、1m/3m/5m summary parallel patch を明示installし、短期MTF用の3足を更新しやすくする。
-#   さらに、SUMMARY表示タイトルにDataFrame本体が混入する問題を防ぐ。
-# ============================================================
-
 from __future__ import annotations
 
+import importlib
 import logging
 import os
-from typing import Any
+import threading
+from typing import Callable
 
 logger = logging.getLogger(__name__)
-
 _PATCHED = False
+_BG_STARTED = False
 
 
 def _env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
     if v is None or str(v).strip() == "":
         return bool(default)
-    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 
 
 def _env_int(name: str, default: int) -> int:
     try:
         v = os.getenv(name)
-        if v is None or str(v).strip() == "":
-            return int(default)
-        return int(float(v))
+        return int(default) if v is None or str(v).strip() == "" else int(float(v))
     except Exception:
         return int(default)
 
 
-def _patch_summary_schema_bootstrap() -> None:
-    skip_schema = _env_bool("FAST_STARTUP_SKIP_SUMMARY_SCHEMA_BOOTSTRAP", True)
-    if not skip_schema:
-        logger.warning(
-            "[FAST STARTUP PATCH] summary schema bootstrap skip disabled env=FAST_STARTUP_SKIP_SUMMARY_SCHEMA_BOOTSTRAP"
-        )
-        return
-
+def _run_install(label: str, module_name: str, fn_name: str = "install") -> bool:
     try:
-        import database.session as ds
+        mod = importlib.import_module(module_name)
+        fn = getattr(mod, fn_name, None)
+        ok = bool(fn()) if callable(fn) else False
+        logger.warning("[FAST STARTUP PATCH] %s installed=%s", label, ok)
+        return ok
     except Exception:
-        logger.exception("[FAST STARTUP PATCH] database.session import failed for schema skip")
-        return
-
-    old_bootstrap = getattr(ds, "_bootstrap_summary_schema", None)
-    if not callable(old_bootstrap):
-        logger.warning("[FAST STARTUP PATCH] _bootstrap_summary_schema not callable")
-        return
-
-    if getattr(old_bootstrap, "_fast_startup_schema_skip", False):
-        return
-
-    def _skip_summary_schema_bootstrap(engine):
-        logger.warning(
-            "[FAST STARTUP PATCH] summary schema bootstrap skipped in main.py "
-            "reason=main_database_handles_schema env=FAST_STARTUP_SKIP_SUMMARY_SCHEMA_BOOTSTRAP"
-        )
-        return None
-
-    _skip_summary_schema_bootstrap._fast_startup_schema_skip = True  # type: ignore[attr-defined]
-    _skip_summary_schema_bootstrap._original_bootstrap = old_bootstrap  # type: ignore[attr-defined]
-    ds._bootstrap_summary_schema = _skip_summary_schema_bootstrap
-
-    logger.warning("[FAST STARTUP PATCH] database.session._bootstrap_summary_schema patched to no-op")
-
-
-def _install_summary_parallel_patch() -> None:
-    try:
-        from core.startup.summary_parallel_intervals_runtime_patch import install as install_summary_parallel_patch
-
-        ok = install_summary_parallel_patch()
-        logger.warning("[FAST STARTUP PATCH] summary_parallel_intervals_runtime_patch installed=%s", ok)
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] summary_parallel_intervals_runtime_patch install failed")
-
-
-def _install_summary_display_label_guard_patch() -> None:
-    try:
-        from core.startup.summary_display_label_guard_patch import install as install_display_label_guard_patch
-
-        ok = install_display_label_guard_patch()
-        logger.warning("[FAST STARTUP PATCH] summary_display_label_guard_patch installed=%s", ok)
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] summary_display_label_guard_patch install failed")
-
-
-def _install_symbol_flags_bootstrap() -> None:
-    try:
-        from core.startup.symbol_flags_bootstrap import install_symbol_flags_cache
-
-        ok = install_symbol_flags_cache(force=True)
-        logger.warning("[FAST STARTUP PATCH] symbol_flags_bootstrap installed=%s", ok)
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] symbol_flags_bootstrap install failed")
-
-
-def _install_open_position_broker_merge_patch() -> None:
-    try:
-        from core.startup.open_position_broker_merge_patch import install as install_open_position_patch
-
-        ok = install_open_position_patch()
-        logger.warning("[FAST STARTUP PATCH] open_position_broker_merge_patch installed=%s", ok)
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] open_position_broker_merge_patch install failed")
-
-
-def _install_exit_executor_broker_position_patch() -> None:
-    try:
-        from core.startup.exit_executor_broker_position_patch import install as install_exit_executor_patch
-
-        ok = install_exit_executor_patch()
-        logger.warning("[FAST STARTUP PATCH] exit_executor_broker_position_patch installed=%s", ok)
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] exit_executor_broker_position_patch install failed")
-
-
-def _install_exit_trail_03_patch() -> None:
-    try:
-        from core.startup.exit_trail_03_runtime_patch import install as install_exit_trail_03_patch
-
-        ok = install_exit_trail_03_patch()
-        logger.warning("[FAST STARTUP PATCH] exit_trail_03_runtime_patch installed=%s", ok)
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] exit_trail_03_runtime_patch install failed")
-
-
-def _install_entry_passive_limit_patch() -> None:
-    try:
-        from core.startup.entry_limit_passive_runtime_patch import install as install_entry_passive_limit_patch
-
-        ok = install_entry_passive_limit_patch()
-        logger.warning("[FAST STARTUP PATCH] entry_limit_passive_runtime_patch installed=%s", ok)
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] entry_limit_passive_runtime_patch install failed")
-
-
-def _install_entry_cancel_2s_next_patch() -> None:
-    try:
-        from core.startup.entry_unfilled_cancel_2s_runtime_patch import install as install_entry_cancel_2s_patch
-
-        ok = install_entry_cancel_2s_patch()
-        logger.warning("[FAST STARTUP PATCH] entry_unfilled_cancel_2s_runtime_patch installed=%s", ok)
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] entry_unfilled_cancel_2s_runtime_patch install failed")
-
-
-def _install_entry_daily_risk_patch() -> None:
-    try:
-        from core.startup.entry_daily_risk_runtime_patch import install as install_entry_daily_risk_patch
-
-        ok = install_entry_daily_risk_patch()
-        logger.warning("[FAST STARTUP PATCH] entry_daily_risk_runtime_patch installed=%s", ok)
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] entry_daily_risk_runtime_patch install failed")
-
-
-def _install_entry_liquidity_patch() -> None:
-    try:
-        from core.startup.entry_liquidity_runtime_patch import install as install_entry_liquidity_patch
-
-        ok = install_entry_liquidity_patch()
-        logger.warning("[FAST STARTUP PATCH] entry_liquidity_runtime_patch installed=%s", ok)
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] entry_liquidity_runtime_patch install failed")
-
-
-def _install_entry_affordability_patch() -> None:
-    try:
-        from core.startup.entry_affordability_runtime_patch import install as install_affordability_patch
-        from trading.entry.entry_budget import log_entry_budget_config
-
-        log_entry_budget_config(prefix="[FAST STARTUP PATCH][ENTRY BUDGET]")
-        ok = install_affordability_patch()
-        logger.warning("[FAST STARTUP PATCH] entry_affordability_runtime_patch installed=%s", ok)
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] entry_affordability_runtime_patch install failed")
-
-
-def _install_push_direct_ohlc_patch() -> None:
-    try:
-        from core.startup.push_summary_direct_ohlc_runtime_patch import install as install_push_direct_ohlc_patch
-
-        ok = install_push_direct_ohlc_patch()
-        logger.warning("[FAST STARTUP PATCH] push_summary_direct_ohlc_runtime_patch installed=%s", ok)
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] push_summary_direct_ohlc_runtime_patch install failed")
-
-
-def _install_entry_max_approved_patch() -> None:
-    try:
-        import trading.handlers.entry_controller as ec
-
-        old_value = getattr(ec, "MAX_APPROVED_PER_RUN", None)
-        new_value = _env_int("ENTRY_MAX_APPROVED_PER_RUN", 10)
-        if new_value <= 0:
-            new_value = 10
-
-        setattr(ec, "MAX_APPROVED_PER_RUN", int(new_value))
-
-        logger.warning(
-            "[FAST STARTUP PATCH] entry_controller.MAX_APPROVED_PER_RUN patched old=%s new=%s env=ENTRY_MAX_APPROVED_PER_RUN",
-            old_value,
-            getattr(ec, "MAX_APPROVED_PER_RUN", None),
-        )
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] entry MAX_APPROVED_PER_RUN patch failed")
-
-
-def install() -> bool:
-    global _PATCHED
-    if _PATCHED:
-        return True
-
-    try:
-        import core.startup.scheduler_bootstrap as sb
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] scheduler_bootstrap import failed")
+        logger.exception("[FAST STARTUP PATCH] %s install failed", label)
         return False
 
-    try:
-        _install_summary_parallel_patch()
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] summary parallel patch failed")
 
+def _install_symbol_flags_bootstrap() -> bool:
     try:
-        _install_summary_display_label_guard_patch()
+        mod = importlib.import_module("core.startup.symbol_flags_bootstrap")
+        fn = getattr(mod, "install_symbol_flags_cache", None)
+        ok = bool(fn(force=True)) if callable(fn) else False
+        logger.warning("[FAST STARTUP PATCH] symbol_flags_bootstrap installed=%s", ok)
+        return ok
     except Exception:
-        logger.exception("[FAST STARTUP PATCH] summary display label guard patch failed")
+        logger.exception("[FAST STARTUP PATCH] symbol_flags_bootstrap install failed")
+        return False
 
+
+def _patch_summary_schema_bootstrap() -> bool:
+    if not _env_bool("FAST_STARTUP_SKIP_SUMMARY_SCHEMA_BOOTSTRAP", True):
+        return False
     try:
-        _install_symbol_flags_bootstrap()
+        import database.session as ds
+        old = getattr(ds, "_bootstrap_summary_schema", None)
+        if not callable(old) or getattr(old, "_fast_startup_schema_skip", False):
+            return True
+        def noop(engine):
+            return None
+        noop._fast_startup_schema_skip = True
+        noop._original_bootstrap = old
+        ds._bootstrap_summary_schema = noop
+        logger.warning("[FAST STARTUP PATCH] database.session._bootstrap_summary_schema patched to no-op")
+        return True
     except Exception:
-        logger.exception("[FAST STARTUP PATCH] symbol flags bootstrap failed")
+        logger.exception("[FAST STARTUP PATCH] schema bootstrap patch failed")
+        return False
 
+
+def _patch_entry_max_approved() -> bool:
     try:
-        _patch_summary_schema_bootstrap()
+        import trading.handlers.entry_controller as ec
+        old = getattr(ec, "MAX_APPROVED_PER_RUN", None)
+        val = _env_int("ENTRY_MAX_APPROVED_PER_RUN", 10)
+        if val <= 0:
+            val = 10
+        setattr(ec, "MAX_APPROVED_PER_RUN", int(val))
+        logger.warning("[FAST STARTUP PATCH] entry_controller.MAX_APPROVED_PER_RUN patched old=%s new=%s", old, getattr(ec, "MAX_APPROVED_PER_RUN", None))
+        return True
     except Exception:
-        logger.exception("[FAST STARTUP PATCH] summary schema skip patch failed")
+        logger.exception("[FAST STARTUP PATCH] entry max approved patch failed")
+        return False
 
-    try:
-        _install_open_position_broker_merge_patch()
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] open position broker patch failed")
 
+def _patch_ranking_bootstrap() -> bool:
     try:
-        _install_exit_executor_broker_position_patch()
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] exit executor broker patch failed")
-
-    try:
-        _install_exit_trail_03_patch()
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] exit trail 0.3 patch failed")
-
-    try:
-        _install_entry_passive_limit_patch()
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] entry passive limit patch failed")
-
-    try:
-        _install_entry_cancel_2s_next_patch()
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] entry cancel 2s next patch failed")
-
-    try:
-        _install_entry_daily_risk_patch()
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] entry daily risk patch failed")
-
-    try:
-        _install_entry_liquidity_patch()
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] entry liquidity patch failed")
-
-    try:
-        _install_entry_affordability_patch()
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] entry affordability patch failed")
-
-    try:
-        _install_push_direct_ohlc_patch()
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] push direct OHLC patch failed")
-
-    try:
-        _install_entry_max_approved_patch()
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] entry MAX_APPROVED_PER_RUN patch failed")
-
-    try:
+        import core.startup.scheduler_bootstrap as sb
         old_lookback = getattr(sb, "_DEFAULT_RANKING_LOOKBACK_MINUTES", None)
         new_lookback = _env_int("FAST_STARTUP_RANKING_LOOKBACK_MIN", 60)
         if new_lookback > 0:
             setattr(sb, "_DEFAULT_RANKING_LOOKBACK_MINUTES", int(new_lookback))
-        logger.warning(
-            "[FAST STARTUP PATCH] ranking lookback patched old=%s new=%s env=FAST_STARTUP_RANKING_LOOKBACK_MIN",
-            old_lookback,
-            getattr(sb, "_DEFAULT_RANKING_LOOKBACK_MINUTES", None),
-        )
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] lookback patch failed")
-
-    try:
         old_job = getattr(sb, "_run_ranking_summary_all_job_safe", None)
         if callable(old_job) and not getattr(old_job, "_fast_startup_wrapped", False):
-
-            def _ranking_job_safe_no_return(*args: Any, **kwargs: Any):
-                ret = old_job(*args, **kwargs)
-                try:
-                    sb._set_global_attr("last_ranking_summary_job_result_type", type(ret).__name__)
-                    if isinstance(ret, dict):
-                        sb._set_global_attr(
-                            "last_ranking_summary_job_result_summary",
-                            {
-                                k: {
-                                    "type": type(v).__name__,
-                                    "rows": len(v) if hasattr(v, "__len__") else None,
-                                }
-                                for k, v in ret.items()
-                            },
-                        )
-                except Exception:
-                    pass
+            def no_return(*args, **kwargs):
+                old_job(*args, **kwargs)
                 return None
-
-            _ranking_job_safe_no_return._fast_startup_wrapped = True  # type: ignore[attr-defined]
-            sb._run_ranking_summary_all_job_safe = _ranking_job_safe_no_return
-            logger.warning("[FAST STARTUP PATCH] ranking summary scheduled job return suppressed")
+            no_return._fast_startup_wrapped = True
+            no_return._original = old_job
+            sb._run_ranking_summary_all_job_safe = no_return
+        logger.warning("[FAST STARTUP PATCH] ranking bootstrap patched lookback %s->%s", old_lookback, getattr(sb, "_DEFAULT_RANKING_LOOKBACK_MINUTES", None))
+        return True
     except Exception:
-        logger.exception("[FAST STARTUP PATCH] ranking return suppression failed")
+        logger.exception("[FAST STARTUP PATCH] ranking bootstrap patch failed")
+        return False
 
-    try:
-        skip_initial = _env_bool("FAST_STARTUP_SKIP_INITIAL_RANKING_TICK", True)
-        if skip_initial:
-            import __main__ as main_mod
-            old_initial = getattr(main_mod, "_run_initial_ranking_tick_once", None)
-            if callable(old_initial) and not getattr(old_initial, "_fast_startup_noop", False):
 
-                def _skip_initial_ranking_tick_once():
-                    logger.warning(
-                        "[FAST STARTUP PATCH] initial ranking tick skipped env=FAST_STARTUP_SKIP_INITIAL_RANKING_TICK"
-                    )
-                    return None
+def _background_heavy() -> None:
+    jobs: list[Callable[[], bool]] = [
+        _install_symbol_flags_bootstrap,
+        lambda: _run_install("open_position_broker_merge_patch", "core.startup.open_position_broker_merge_patch"),
+        lambda: _run_install("exit_executor_broker_position_patch", "core.startup.exit_executor_broker_position_patch"),
+        lambda: _run_install("exit_trail_03_runtime_patch", "core.startup.exit_trail_03_runtime_patch"),
+        lambda: _run_install("entry_unfilled_cancel_2s_runtime_patch", "core.startup.entry_unfilled_cancel_2s_runtime_patch"),
+        lambda: _run_install("entry_liquidity_runtime_patch", "core.startup.entry_liquidity_runtime_patch"),
+        lambda: _run_install("entry_affordability_runtime_patch", "core.startup.entry_affordability_runtime_patch"),
+        lambda: _run_install("push_summary_direct_ohlc_runtime_patch", "core.startup.push_summary_direct_ohlc_runtime_patch"),
+    ]
+    logger.warning("[FAST STARTUP PATCH] background heavy installs start count=%s", len(jobs))
+    for job in jobs:
+        try:
+            job()
+        except Exception:
+            logger.exception("[FAST STARTUP PATCH] background job failed")
+    logger.warning("[FAST STARTUP PATCH] background heavy installs done")
 
-                _skip_initial_ranking_tick_once._fast_startup_noop = True  # type: ignore[attr-defined]
-                setattr(main_mod, "_run_initial_ranking_tick_once", _skip_initial_ranking_tick_once)
-                logger.warning("[FAST STARTUP PATCH] main initial ranking tick patched to no-op")
-    except Exception:
-        logger.exception("[FAST STARTUP PATCH] initial ranking tick patch failed")
+
+def install() -> bool:
+    global _PATCHED, _BG_STARTED
+    if _PATCHED:
+        return True
+
+    _run_install("summary_parallel_intervals_runtime_patch", "core.startup.summary_parallel_intervals_runtime_patch")
+    _run_install("summary_display_label_guard_patch", "core.startup.summary_display_label_guard_patch")
+    _patch_summary_schema_bootstrap()
+    _run_install("entry_limit_passive_runtime_patch", "core.startup.entry_limit_passive_runtime_patch")
+    _run_install("entry_daily_risk_runtime_patch", "core.startup.entry_daily_risk_runtime_patch")
+    _patch_entry_max_approved()
+    _patch_ranking_bootstrap()
+
+    if _env_bool("FAST_STARTUP_ASYNC_HEAVY_PATCHES", True):
+        if not _BG_STARTED:
+            _BG_STARTED = True
+            threading.Thread(target=_background_heavy, name="fast-startup-heavy-installs", daemon=True).start()
+            logger.warning("[FAST STARTUP PATCH] heavy installs scheduled background")
+    else:
+        _background_heavy()
 
     _PATCHED = True
-    logger.warning(
-        "[FAST STARTUP PATCH] installed v15 summary_parallel=True summary_display_label_guard=True entry_affordability=True symbol_flags_bootstrap=True push_direct_ohlc=True entry_max_approved=%s exit_trail_0p3=True entry_limit_board_touch=True entry_cancel_2s_next=True entry_daily_risk=True entry_liquidity=True",
-        10,
-    )
+    logger.warning("[FAST STARTUP PATCH] installed v16 async_heavy=%s", _env_bool("FAST_STARTUP_ASYNC_HEAVY_PATCHES", True))
     return True
-
 
 try:
     install()
 except Exception:
     logger.exception("[FAST STARTUP PATCH] auto install failed")
+
+__all__ = ["install"]
