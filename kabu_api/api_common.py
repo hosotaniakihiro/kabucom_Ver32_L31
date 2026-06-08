@@ -1,15 +1,61 @@
 # kabu_api/api_common.py
+import logging
+
 import requests
 from token_manager import get_valid_token
 from global_state import global_data
+
 API_URL = "http://localhost:18080/kabusapi"
+logger = logging.getLogger(__name__)
+
+
+def _set_global_token(token: str) -> None:
+    """global_data の複数互換属性へ token を同期する。"""
+    if not token:
+        return
+    for name in ("token_value", "API_TOKEN", "api_token", "token"):
+        try:
+            setattr(global_data, name, token)
+        except Exception:
+            pass
+
+
+def _get_api_token() -> str:
+    """
+    kabuステ API token を安全に取得する。
+
+    旧実装は global_data.token_value だけを見ていたため、
+    token_manager 側に token が存在しても force_cancel_loop / entry / exit 側で
+    `API TOKEN is not set in global_data` になっていた。
+    """
+    for name in ("token_value", "API_TOKEN", "api_token", "token"):
+        try:
+            token = getattr(global_data, name, None)
+            if token:
+                return str(token)
+        except Exception:
+            pass
+
+    try:
+        token = get_valid_token()
+    except Exception:
+        logger.exception("[API COMMON] get_valid_token failed")
+        token = None
+
+    if token:
+        token = str(token)
+        _set_global_token(token)
+        logger.warning("[API COMMON] token restored from token_manager into global_data")
+        return token
+
+    raise RuntimeError("API TOKEN is not set in global_data/token_manager")
 
 
 def get_trading_unit(symbol: str, exchange: int = 1) -> int:
     """
     銘柄ごとの単元株数を /board から取得
     """
-    token = get_valid_token()
+    token = _get_api_token()
     url = f"{API_URL}/board/{symbol}@{exchange}"
     headers = {"Content-Type": "application/json", "X-API-KEY": token}
     try:
@@ -25,7 +71,7 @@ def get_margin_available() -> float:
     """
     信用建余力を /wallet/margin から取得
     """
-    token = get_valid_token()
+    token = _get_api_token()
     url = f"{API_URL}/wallet/margin"
     headers = {"Content-Type": "application/json", "X-API-KEY": token}
     try:
@@ -51,15 +97,13 @@ def calculate_shares(price: float, budget: float = 500000, unit_size: int = 100)
     qty = int(lots * unit_size)
     return qty
 
+
 def get_headers():
     """
     kabuステ API 用 共通ヘッダ
     """
-    token = global_data.token_value
-    if not token:
-        raise RuntimeError("API TOKEN is not set in global_data")
-
+    token = _get_api_token()
     return {
         "X-API-KEY": token,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
