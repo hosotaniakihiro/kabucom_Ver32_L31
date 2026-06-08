@@ -13,9 +13,6 @@ def _env_default(name: str, value: str) -> None:
         pass
 
 
-# ============================================================
-# Runtime defaults from 2026-06-05 log diagnosis
-# ============================================================
 _env_default("SUMMARY_AI_PRE_FILTER_DAILY_RISK", "0")
 _env_default("SUMMARY_AI_DISABLE_SYMBOL_STOP_AFTER_FIRST_LOSS", "1")
 _env_default("DAILY_RISK_SYMBOL_STOP_AFTER_FIRST_LOSS", "0")
@@ -36,15 +33,12 @@ _env_default("FINAL_ENTRY_TONOSAMA_LIQUIDITY_FALLBACK", "1")
 _env_default("FINAL_ENTRY_TONOSAMA_MIN_VOLUME", "30000")
 _env_default("FINAL_ENTRY_TONOSAMA_MIN_TURNOVER", "10000000")
 
-# PUSH 50枠の固定保護ルール。
-# pending は board_missing 対策で保護、EXIT後は60秒だけ残して自動解除。
 _env_default("ACTIVE_PROTECT_PENDING_SYMBOLS", "1")
 _env_default("ACTIVE_PROTECT_EXIT_COOLDOWN_SYMBOLS", "1")
 _env_default("ACTIVE_EXIT_COOLDOWN_PROTECT_SEC", "60")
 _env_default("ACTIVE_PROTECT_BOARD_RETRY_SYMBOLS", "1")
 _env_default("ACTIVE_PROTECT_HOT_SYMBOLS", "1")
 
-# 板欠損だけで新規を完全停止しない。後段patchで価格/出来高/売買代金/scoreを確認し、小ロット化する。
 os.environ["ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"] = "1"
 os.environ["ENTRY_BOARD_MISSING_HARD_BLOCK"] = "0"
 _env_default("ENTRY_ALLOW_WITHOUT_BOARD_MIN_VOLUME", "30000")
@@ -53,10 +47,10 @@ _env_default("ENTRY_ALLOW_WITHOUT_BOARD_MIN_PRICE", "200")
 _env_default("ENTRY_ALLOW_WITHOUT_BOARD_MIN_SCORE", "0.90")
 _env_default("ENTRY_BOARD_MISSING_QTY_RATIO", "0.50")
 
-# Ranking DB が stale / empty / unusable の時は pending を作らず、Summary/Pullback 側に任せる。
 _env_default("RANKING_TODAY_EMPTY_FAIL_CLOSED", "1")
-_env_default("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE", "1")
+os.environ["RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE"] = "1"
 _env_default("RANKING_ENTRY_STALE_FAIL_CLOSED", "1")
+_env_default("RANKING_ENTRY_STALE_FAILOPEN_ENABLED", "0")
 _env_default("RANKING_ENTRY_ABORT_ON_STALE", "1")
 _env_default("RANKING_ENTRY_CLEAR_PENDING_ON_STALE", "1")
 _env_default("RANKING_ENTRY_REQUIRE_TODAY", "1")
@@ -67,7 +61,6 @@ _env_default("RANKING_ENTRY_ALLOW_STALE_FALLBACK", "0")
 _env_default("RANKING_ENTRY_RAW_FALLBACK_ONLY_TODAY", "1")
 _env_default("RANKING_PRECHECK_PENDING_FAILOPEN_ENABLED", "0")
 
-# Ranking AIモデル未配置時も、強いランキング候補は小ロットで通す。ただし価格範囲外/MTF=0は救済しない。
 _env_default("RANKING_AI_GATE_FAILOPEN_ENABLED", "1")
 _env_default("RANKING_AI_GATE_FAILOPEN_MIN_SCORE", "50")
 _env_default("RANKING_AI_GATE_FAILOPEN_MIN_TURNOVER", "50000000")
@@ -80,7 +73,6 @@ _env_default("ENTRY_RANKING_SCALP_AI_FALLBACK_ANY_NG", "0")
 _env_default("ENTRY_RANKING_SCALP_RANGE_NO_HIGHLOW_FAILOPEN", "0")
 _env_default("ENTRY_RANKING_SCALP_RANGE_ERROR_FAILOPEN", "0")
 
-# Tonosama / 3m・5m stale summary はfail-closed寄りにする。
 _env_default("TONOSAMA_STALE_SUMMARY_FAILOPEN", "0")
 _env_default("TONOSAMA_RECENT_3M5M_FAILOPEN", "0")
 _env_default("TONOSAMA_ALLOW_STALE_MTF_ENTRY", "0")
@@ -90,7 +82,6 @@ _env_default("TONOSAMA_HISTORY_MAX_AGE_SEC", "300")
 _env_default("SUMMARY_MTF_ENTRY_MAX_AGE_SEC", "300")
 _env_default("SUMMARY_SUPPRESS_LUNCH_FALLBACK_AFTER_PM", "1")
 
-# 押し目買い/戻り売りエントリー。
 _env_default("PULLBACK_ENTRY_ENABLED", "1")
 _env_default("PULLBACK_ENTRY_MAX_CANDIDATES", "5")
 _env_default("PULLBACK_ENTRY_LOT_RATIO", "0.5")
@@ -102,13 +93,14 @@ _env_default("PULLBACK_ENTRY_MIN_VOLUME", "30000")
 _env_default("PULLBACK_ENTRY_MIN_TURNOVER", "10000000")
 
 logger.warning(
-    "[USERCUSTOMIZE] runtime defaults applied summary_ai_daily_risk=%s liq_run_in_main=%s liq_fail_open=%s ranking_precheck_pending_failopen=%s ranking_empty_failclosed=%s ranking_stale_skip=%s ranking_require_today=%s ranking_clear_pending=%s ranking_ai_failopen=%s scalp_price=%s-%s scalp_min_mtf=%s zero_mtf_rescue=%s scalp_ai_any_ng=%s tonosama_mtf_stale_fail_closed=%s suppress_lunch_pm=%s pullback=%s",
+    "[USERCUSTOMIZE] runtime defaults applied summary_ai_daily_risk=%s liq_run_in_main=%s liq_fail_open=%s ranking_precheck_pending_failopen=%s ranking_empty_failclosed=%s ranking_stale_skip=%s ranking_stale_failopen=%s ranking_require_today=%s ranking_clear_pending=%s ranking_ai_failopen=%s scalp_price=%s-%s scalp_min_mtf=%s zero_mtf_rescue=%s scalp_ai_any_ng=%s tonosama_mtf_stale_fail_closed=%s suppress_lunch_pm=%s pullback=%s",
     os.getenv("SUMMARY_AI_PRE_FILTER_DAILY_RISK"),
     os.getenv("WATCHLIST_RECENT_LIQ_BULK_RUN_IN_MAIN"),
     os.getenv("WATCHLIST_RECENT_LIQ_FAIL_OPEN_ON_TIMEOUT"),
     os.getenv("RANKING_PRECHECK_PENDING_FAILOPEN_ENABLED"),
     os.getenv("RANKING_TODAY_EMPTY_FAIL_CLOSED"),
     os.getenv("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE"),
+    os.getenv("RANKING_ENTRY_STALE_FAILOPEN_ENABLED"),
     os.getenv("RANKING_ENTRY_REQUIRE_TODAY"),
     os.getenv("RANKING_ENTRY_CLEAR_PENDING_ON_STALE"),
     os.getenv("RANKING_AI_GATE_FAILOPEN_ENABLED"),
@@ -137,26 +129,17 @@ def _is_database_collector_context() -> bool:
     try:
         argv = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
         if any(x in argv for x in (
-            "main_database.py",
-            "db_prepare_runner.py",
-            "ranking_collector_runner.py",
-            "push_receiver_runner.py",
-            "yahoo_complement_runner.py",
-            "summary_database_runner.py",
+            "main_database.py", "db_prepare_runner.py", "ranking_collector_runner.py",
+            "push_receiver_runner.py", "yahoo_complement_runner.py", "summary_database_runner.py",
             "data_collectors_runner.py",
         )):
             return True
-        if os.getenv("AUTOSTOCK_DATA_COLLECTORS_PROCESS") == "1":
-            return True
-        if os.getenv("AUTOSTOCK_MAIN_DATABASE_PROCESS") == "1":
-            return True
-        if os.getenv("AUTOSTOCK_SUMMARY_DB_WRITER") == "1":
-            return True
-        if os.getenv("AUTOSTOCK_RANKING_COLLECTOR_PROCESS") == "1":
-            return True
+        return any(os.getenv(k) == "1" for k in (
+            "AUTOSTOCK_DATA_COLLECTORS_PROCESS", "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+            "AUTOSTOCK_SUMMARY_DB_WRITER", "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
+        ))
     except Exception:
-        pass
-    return False
+        return False
 
 
 _install("PUSH_RECONNECT_STABILITY", "core.startup.push_stream_reconnect_stability_patch")
@@ -208,11 +191,10 @@ else:
     _install("RANKING_ENTRY_INTRADAY_CAP", "core.startup.ranking_entry_intraday_cap_patch")
     _install("SUMMARY_AI_NO_DIRECT_SYNC", "core.startup.summary_ai_no_direct_sync_patch")
     _install("RANKING_ENTRY_MARKET_HOURS_SKIP", "core.startup.ranking_entry_market_hours_skip_patch")
-    # Re-apply ranking stale/empty guards last because market-hours and other patches can re-wrap
-    # _run_ranking_entry_safe after the first stale guard install.
     _install("RANKING_EMPTY_TODAY_FAILCLOSED_LAST", "core.startup.ranking_empty_today_failclosed_patch")
     _install("RANKING_STALE_SNAPSHOT_SKIP_LAST", "core.startup.ranking_entry_stale_snapshot_skip_patch")
     _install("SUMMARY_AFTERNOON_STALE_GUARD_LAST", "core.startup.summary_fallback_afternoon_stale_guard_patch")
     _install("BOARD_MISSING_PROTECTED_ALLOW", "core.startup.board_missing_protected_allow_patch")
     _install("RANKING_AI_GATE_FAILOPEN_LAST", "core.startup.ranking_entry_gate_failopen_patch")
     _install("ENTRY_RANKING_SCALP_RESCUE_LAST", "core.startup.entry_ranking_scalp_order_rescue_patch")
+    _install("RANKING_STALE_FINAL_LAST", "core.startup.ranking_entry_stale_failclosed_final_patch")
