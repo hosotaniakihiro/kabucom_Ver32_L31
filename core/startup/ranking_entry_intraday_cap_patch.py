@@ -3,7 +3,6 @@ import logging, os, threading, time
 logger = logging.getLogger(__name__)
 _DONE = False
 
-
 def apply_cap() -> bool:
     os.environ['RANKING_ENTRY_RUNTIME_BUDGET_SEC'] = os.getenv('RANKING_ENTRY_FAST_RUNTIME_BUDGET_SEC', '150')
     os.environ['RANKING_ENTRY_BUILD_TIMEOUT_SEC'] = os.getenv('RANKING_ENTRY_FAST_BUILD_TIMEOUT_SEC', '180')
@@ -21,43 +20,23 @@ def apply_cap() -> bool:
         return False
     return True
 
-
 def watch():
-    for i in range(240):
+    loops = max(1, min(int(float(os.getenv('RANKING_ENTRY_INTRADAY_CAP_WATCH_LOOPS', '8') or 8)), 30))
+    sleep_sec = max(0.5, min(float(os.getenv('RANKING_ENTRY_INTRADAY_CAP_WATCH_SLEEP_SEC', '2.0') or 2.0), 5.0))
+    for i in range(loops):
         ok = apply_cap()
-        if i in (0, 1, 5, 15, 30, 60, 120, 239):
-            logger.warning(
-                '[RANKING ENTRY INTRADAY CAP] enforce ok=%s runtime=%s build=%s controller=%s max_pending=%s summary_lock_wait=%s',
-                ok,
-                os.environ.get('RANKING_ENTRY_RUNTIME_BUDGET_SEC'),
-                os.environ.get('RANKING_ENTRY_BUILD_TIMEOUT_SEC'),
-                os.environ.get('RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'),
-                os.environ.get('RANKING_ENTRY_MAX_PENDING_PER_RUN'),
-                os.environ.get('SUMMARY_AI_ENTRY_CONTROLLER_LOCK_WAIT_SEC'),
-            )
-        time.sleep(0.5)
-
+        if i in (0, loops - 1):
+            logger.warning('[RANKING ENTRY INTRADAY CAP] enforce v3 i=%s/%s ok=%s runtime=%s build=%s controller=%s max_pending=%s', i, loops, ok, os.environ.get('RANKING_ENTRY_RUNTIME_BUDGET_SEC'), os.environ.get('RANKING_ENTRY_BUILD_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_MAX_PENDING_PER_RUN'))
+        time.sleep(sleep_sec)
 
 def install() -> bool:
     global _DONE
-    if _DONE:
-        return apply_cap()
+    if _DONE: return True
     ok = apply_cap()
     threading.Thread(target=watch, name='ranking-entry-intraday-cap', daemon=True).start()
     _DONE = True
-    logger.warning(
-        '[RANKING ENTRY INTRADAY CAP] installed v2 ok=%s runtime=%s build=%s controller=%s summary_lock_wait=%s watcher=True',
-        ok,
-        os.environ.get('RANKING_ENTRY_RUNTIME_BUDGET_SEC'),
-        os.environ.get('RANKING_ENTRY_BUILD_TIMEOUT_SEC'),
-        os.environ.get('RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'),
-        os.environ.get('SUMMARY_AI_ENTRY_CONTROLLER_LOCK_WAIT_SEC'),
-    )
+    logger.warning('[RANKING ENTRY INTRADAY CAP] installed v3 ok=%s runtime=%s build=%s controller=%s watcher=True', ok, os.environ.get('RANKING_ENTRY_RUNTIME_BUDGET_SEC'), os.environ.get('RANKING_ENTRY_BUILD_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'))
     return True
-
-
-try:
-    install()
-except Exception:
-    logger.exception('[RANKING ENTRY INTRADAY CAP] auto install failed')
+try: install()
+except Exception: logger.exception('[RANKING ENTRY INTRADAY CAP] auto install failed')
 __all__ = ['install']
