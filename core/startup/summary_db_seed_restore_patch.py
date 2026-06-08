@@ -1,30 +1,17 @@
 # ============================================================
 # File   : core/startup/summary_db_seed_restore_patch.py
-# Version: V1.4-NO-PREV-DAY-PUSH-HISTORY-POLLUTION
+# Version: V1.5-ASYNC-IN-MAIN
 # ------------------------------------------------------------
 # 目的:
 #   main.py は split mode / entry_only のため summary DB へ正式保存しない。
 #   ただし、エントリー判定・AI判定・Discord表示では
 #   main_database.py が保存した stock_summary_1min/3min/5min の履歴が必要。
 #
-# V1.4:
-#   - 当日 summaryYYYYMMDD.db に別日データを混ぜない方針に合わせ、
-#     previous summary DB を source=push の SUMMARY HISTORY へ入れない。
-#   - current DB が薄い場合でも、前日DBを丸ごと restore 結果に差し替えない。
-#   - previous DB は参照ログのみ。必要なら別途 historical cache に分離する。
-#
-# V1.3:
-#   - 前日DB seed は history cache には入れるが、source=push の merged latest へは載せない
-#   - 5/26起動時に 5/25 の4231銘柄が PUSH最新扱いになり、5MA早期クロス判定が
-#     前日データを見てしまう問題を防止
-#   - 当日DB seed は従来通り merged へ載せてもよい
-#
-# 既存内容:
-#   - system_startup の summary_engine rebind 後に summaryYYYYMMDD.db を読む
-#   - stock_summary_1min/3min/5min を各銘柄ごとに最新75本だけ復元
-#   - GlobalContext の history cache へ復元
+# V1.5:
+#   - main.py 起動時の restore_summary_db_seed() を非同期化。
+#   - 1m/3m/5m の大量復元で scheduler / entry の開始が数分遅れる問題を防ぐ。
+#   - main_database.py / collector 系と force=True は従来通り同期。
 # ============================================================
-
 from __future__ import annotations
 
 import datetime as dt
@@ -32,6 +19,9 @@ import logging
 import os
 import re
 import sqlite3
+import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -46,13 +36,18 @@ _TABLES = {
 }
 
 _RESTORED = False
+_ASYNC_LOCK = threading.Lock()
+_ASYNC_THREAD: threading.Thread | None = None
+_ASYNC_STARTED_AT: float | None = None
+_ASYNC_SEQ = 0
+_ASYNC_ACTIVE = threading.local()
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
     v = os.getenv(name)
     if v is None or str(v).strip() == "":
         return bool(default)
-    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 
 
 def _env_int(name: str, default: int) -> int:
@@ -63,6 +58,48 @@ def _env_int(name: str, default: int) -> int:
         return int(float(v))
     except Exception:
         return int(default)
+
+
+def _is_main_py_context() -> bool:
+    try:
+        argv = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+        if "main_database.py" in argv:
+            return False
+        if any(x in argv for x in (
+            "db_prepare_runner.py",
+            "ranking_collector_runner.py",
+            "push_receiver_runner.py",
+            "yahoo_complement_runner.py",
+            "summary_database_runner.py",
+            "data_collectors_runner.py",
+        )):
+            return False
+        if any(os.getenv(k) == "1" for k in (
+            "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+            "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+            "AUTOSTOCK_SUMMARY_DB_WRITER",
+            "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
+        )):
+            return False
+        return "main.py" in argv
+    except Exception:
+        return False
+
+
+def _async_alive() -> bool:
+    try:
+        return _ASYNC_THREAD is not None and _ASYNC_THREAD.is_alive()
+    except Exception:
+        return False
+
+
+def _async_age() -> float:
+    try:
+        if _ASYNC_STARTED_AT is None:
+            return 0.0
+        return max(0.0, time.time() - float(_ASYNC_STARTED_AT))
+    except Exception:
+        return 0.0
 
 
 def _today() -> dt.date:
@@ -299,48 +336,33 @@ def _normalize_summary_df(df: pd.DataFrame, interval: int, *, target_date: Optio
     try:
         if df is None or df.empty:
             return pd.DataFrame()
-
         out = df.copy()
         out = out.loc[:, ~out.columns.duplicated()].copy()
-
         if "__seed_rn" in out.columns:
             out = out.drop(columns=["__seed_rn"], errors="ignore")
-
         if "symbol" in out.columns:
             out["symbol"] = out["symbol"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
         else:
             return pd.DataFrame()
-
-        alias_pairs = (
-            ("open", "open_price"),
-            ("high", "high_price"),
-            ("low", "low_price"),
-            ("close", "close_price"),
-        )
-        for canonical, alias in alias_pairs:
+        for canonical, alias in (("open", "open_price"), ("high", "high_price"), ("low", "low_price"), ("close", "close_price")):
             if canonical not in out.columns and alias in out.columns:
                 out[canonical] = out[alias]
             if alias not in out.columns and canonical in out.columns:
                 out[alias] = out[canonical]
-
         if "close" not in out.columns and "price" in out.columns:
             out["close"] = out["price"]
             if "close_price" not in out.columns:
                 out["close_price"] = out["price"]
-
         if "datetime" not in out.columns:
             if "end_time" in out.columns:
                 out["datetime"] = out["end_time"]
             elif "start_time" in out.columns:
                 out["datetime"] = out["start_time"]
-
         if "source" not in out.columns:
             out["source"] = "push"
         else:
             out["source"] = out["source"].fillna("push").astype(str).str.strip().replace({"": "push"})
-
         out["interval"] = interval
-
         for col in (
             "score", "score_total", "final_score", "display_score", "score_buy", "score_sell",
             "slope", "slope_atr_scaled", "score_slope", "mtf", "score_mtf", "mtf_score",
@@ -349,7 +371,6 @@ def _normalize_summary_df(df: pd.DataFrame, interval: int, *, target_date: Optio
         ):
             if col in out.columns:
                 out[col] = pd.to_numeric(out[col], errors="coerce")
-
         if "datetime" in out.columns:
             out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
             out = out.dropna(subset=["datetime"])
@@ -360,7 +381,6 @@ def _normalize_summary_df(df: pd.DataFrame, interval: int, *, target_date: Optio
             out = out.drop_duplicates(subset=["symbol", "datetime", "source"], keep="last")
         else:
             out = out.drop_duplicates(subset=["symbol", "source"], keep="last")
-
         out = out[out["symbol"].astype(str).str.strip() != ""].reset_index(drop=True)
         return out
     except Exception:
@@ -391,21 +411,17 @@ def _publish_interval(interval: int, df: pd.DataFrame) -> dict[str, Any]:
     stats: dict[str, Any] = {"interval": interval, "rows": 0, "push_rows": 0, "ranking_rows": 0}
     if df is None or df.empty:
         return stats
-
     try:
         from global_state import global_data
         from core.global_context.context import global_context as GC
-
         try:
             GC.set_summary_history(interval, df, source="db_seed")
         except Exception:
             logger.exception("[SUMMARY DB SEED RESTORE] set_summary_history failed interval=%s", interval)
-
         try:
             setattr(global_data, f"summary_{interval}m_df", df.copy())
         except Exception:
             pass
-
         stale_for_merged, stale_reason = _seed_is_stale_for_merged(df)
         if stale_for_merged:
             logger.warning(
@@ -422,19 +438,16 @@ def _publish_interval(interval: int, df: pd.DataFrame) -> dict[str, Any]:
             push_mask = ~ranking_mask
             push_df = df.loc[push_mask].copy()
             ranking_df = df.loc[ranking_mask].copy()
-
             if not push_df.empty:
                 try:
                     global_data.set_push_merged_summary(interval, push_df)
                 except Exception:
                     logger.exception("[SUMMARY DB SEED RESTORE] set_push_merged_summary failed interval=%s", interval)
-
             if not ranking_df.empty:
                 try:
                     global_data.set_ranking_merged_summary(interval, ranking_df)
                 except Exception:
                     logger.exception("[SUMMARY DB SEED RESTORE] set_ranking_merged_summary failed interval=%s", interval)
-
         stats.update(
             rows=int(len(df)),
             push_rows=int(len(push_df)),
@@ -470,14 +483,7 @@ def _read_all_intervals_from_path(path: Path, *, per_symbol_rows: int, max_rows:
 
 
 def _build_result_from_frames(path: Path, frames: dict[int, pd.DataFrame], *, per_symbol_rows: int, max_rows: int, target_date: Optional[dt.date]) -> dict[str, Any]:
-    result: dict[str, Any] = {
-        "ok": True,
-        "path": str(path),
-        "target_date": str(target_date) if target_date else None,
-        "per_symbol_rows": int(per_symbol_rows),
-        "max_rows": int(max_rows),
-        "intervals": {},
-    }
+    result: dict[str, Any] = {"ok": True, "path": str(path), "target_date": str(target_date) if target_date else None, "per_symbol_rows": int(per_symbol_rows), "max_rows": int(max_rows), "intervals": {}}
     for interval, table in _TABLES.items():
         df = frames.get(interval, pd.DataFrame())
         stats = _publish_interval(interval, df)
@@ -506,13 +512,7 @@ def _build_result_from_frames(path: Path, frames: dict[int, pd.DataFrame], *, pe
 
 
 def _restore_from_path(path: Path, *, per_symbol_rows: int, max_rows: int, target_date: Optional[dt.date]) -> dict[str, Any]:
-    logger.warning(
-        "[SUMMARY DB SEED RESTORE] start path=%s per_symbol_rows=%s max_rows=%s target_date=%s",
-        path,
-        per_symbol_rows,
-        max_rows,
-        target_date,
-    )
+    logger.warning("[SUMMARY DB SEED RESTORE] start path=%s per_symbol_rows=%s max_rows=%s target_date=%s", path, per_symbol_rows, max_rows, target_date)
     frames = _read_all_intervals_from_path(path, per_symbol_rows=per_symbol_rows, max_rows=max_rows, target_date=target_date)
     return _build_result_from_frames(path, frames, per_symbol_rows=per_symbol_rows, max_rows=max_rows, target_date=target_date)
 
@@ -530,11 +530,9 @@ def _result_needs_previous_seed(result: dict[str, Any], *, per_symbol_rows: int)
         return False, "disabled"
     if _total_restored_rows(result) <= 0:
         return True, "current_empty"
-
     intervals = result.get("intervals") or {}
     if not intervals:
         return True, "no_intervals"
-
     min_bars = max(1, _env_int("SUMMARY_DB_SEED_RESTORE_MIN_CURRENT_BARS_PER_SYMBOL", min(30, int(per_symbol_rows))))
     weak = []
     macd_total = 0
@@ -547,35 +545,27 @@ def _result_needs_previous_seed(result: dict[str, Any], *, per_symbol_rows: int)
         signal_total += max(0, int(st.get("signal_nonzero") or 0))
         if rows <= 0 or max_rows_per_symbol < min_bars:
             weak.append(f"{key}m:max_rows_per_symbol={max_rows_per_symbol}<min={min_bars}")
-
     if weak:
         return True, ";".join(weak)
-
     if _env_bool("SUMMARY_DB_SEED_RESTORE_REQUIRE_MACD_SIGNAL", False) and (macd_total <= 0 or signal_total <= 0):
         return True, f"macd_signal_zero macd={macd_total} signal={signal_total}"
-
     return False, "current_sufficient"
 
 
-def restore_summary_db_seed(db_path: Any = None, *, force: bool = False) -> dict[str, Any]:
+def _restore_summary_db_seed_sync(db_path: Any = None, *, force: bool = False) -> dict[str, Any]:
     global _RESTORED
-
     if not force and _RESTORED:
         logger.info("[SUMMARY DB SEED RESTORE] already restored -> skip")
         return {"ok": True, "skipped": True, "reason": "already_restored"}
-
     if not _env_bool("SUMMARY_DB_SEED_RESTORE_ENABLED", True):
         logger.warning("[SUMMARY DB SEED RESTORE] disabled by env SUMMARY_DB_SEED_RESTORE_ENABLED")
         return {"ok": False, "skipped": True, "reason": "disabled"}
-
     path = _resolve_db_path(db_path)
     if path is None:
         logger.warning("[SUMMARY DB SEED RESTORE] db path unresolved")
         return {"ok": False, "reason": "db_path_unresolved"}
-
     current_requested_path = path
     target_date = _target_date_for_current_path(current_requested_path)
-
     if not path.exists():
         logger.warning("[SUMMARY DB SEED RESTORE] db missing path=%s", path)
         prev_path = _resolve_previous_seed_db_path(path)
@@ -586,33 +576,20 @@ def restore_summary_db_seed(db_path: Any = None, *, force: bool = False) -> dict
             path = prev_path
             target_date = _parse_summary_date(prev_path)
         else:
-            logger.warning(
-                "[SUMMARY DB SEED RESTORE] current missing but previous push-history restore disabled current=%s previous=%s",
-                path,
-                prev_path,
-            )
+            logger.warning("[SUMMARY DB SEED RESTORE] current missing but previous push-history restore disabled current=%s previous=%s", path, prev_path)
             return {"ok": False, "reason": "db_missing_previous_history_disabled", "path": str(path), "previous": str(prev_path)}
-
     per_symbol_rows = max(1, _env_int("SUMMARY_DB_SEED_RESTORE_BARS_PER_SYMBOL", 75))
     max_rows_default = max(1000, per_symbol_rows * 6000)
     max_rows = max(1000, _env_int("SUMMARY_DB_SEED_RESTORE_MAX_ROWS_PER_TF", max_rows_default))
-
     try:
         result = _restore_from_path(path, per_symbol_rows=per_symbol_rows, max_rows=max_rows, target_date=target_date)
         result["seed_source"] = "current_summary_db"
-
         needs_prev, reason = _result_needs_previous_seed(result, per_symbol_rows=per_symbol_rows)
         if needs_prev:
             prev_path = _resolve_previous_seed_db_path(path)
             if prev_path is not None and str(prev_path) != str(path):
                 if _env_bool("SUMMARY_DB_SEED_RESTORE_ALLOW_PREV_AS_PUSH_HISTORY", False):
-                    logger.warning(
-                        "[SUMMARY DB SEED RESTORE] current summary DB insufficient -> restore previous seed current=%s previous=%s reason=%s per_symbol_rows=%s allow_prev_as_push_history=True",
-                        path,
-                        prev_path,
-                        reason,
-                        per_symbol_rows,
-                    )
+                    logger.warning("[SUMMARY DB SEED RESTORE] current summary DB insufficient -> restore previous seed current=%s previous=%s reason=%s per_symbol_rows=%s allow_prev_as_push_history=True", path, prev_path, reason, per_symbol_rows)
                     prev_target_date = _parse_summary_date(prev_path)
                     prev_result = _restore_from_path(prev_path, per_symbol_rows=per_symbol_rows, max_rows=max_rows, target_date=prev_target_date)
                     prev_result["seed_source"] = "previous_summary_db_insufficient_current"
@@ -620,12 +597,7 @@ def restore_summary_db_seed(db_path: Any = None, *, force: bool = False) -> dict
                     prev_result["current_insufficient_reason"] = reason
                     result = prev_result
                 else:
-                    logger.warning(
-                        "[SUMMARY DB SEED RESTORE] current summary DB insufficient but previous seed is NOT injected into push history current=%s previous=%s reason=%s. Keep current-day seed only.",
-                        path,
-                        prev_path,
-                        reason,
-                    )
+                    logger.warning("[SUMMARY DB SEED RESTORE] current summary DB insufficient but previous seed is NOT injected into push history current=%s previous=%s reason=%s. Keep current-day seed only.", path, prev_path, reason)
                     result["seed_source"] = "current_summary_db_insufficient_prev_not_injected"
                     result["current_insufficient_reason"] = reason
                     result["previous_candidate_path"] = str(prev_path)
@@ -634,20 +606,57 @@ def restore_summary_db_seed(db_path: Any = None, *, force: bool = False) -> dict
                 result["current_insufficient_reason"] = reason
         else:
             result["current_sufficient_reason"] = reason
-
         _RESTORED = True
-        logger.warning(
-            "[SUMMARY DB SEED RESTORE] done path=%s seed_source=%s total_rows=%s reason=%s target_date=%s",
-            result.get("path"),
-            result.get("seed_source"),
-            _total_restored_rows(result),
-            result.get("current_insufficient_reason") or result.get("current_sufficient_reason"),
-            result.get("target_date"),
-        )
+        logger.warning("[SUMMARY DB SEED RESTORE] done path=%s seed_source=%s total_rows=%s reason=%s target_date=%s", result.get("path"), result.get("seed_source"), _total_restored_rows(result), result.get("current_insufficient_reason") or result.get("current_sufficient_reason"), result.get("target_date"))
         return result
     except Exception as e:
         logger.exception("[SUMMARY DB SEED RESTORE] failed path=%s", path)
         return {"ok": False, "reason": "exception", "error": str(e), "path": str(path)}
+
+
+def _async_worker(seq: int, db_path: Any, kwargs: dict[str, Any]) -> None:
+    global _ASYNC_THREAD, _ASYNC_STARTED_AT
+    try:
+        setattr(_ASYNC_ACTIVE, "running", True)
+        logger.warning("[SUMMARY DB SEED RESTORE ASYNC] worker start seq=%s db_path=%s kwargs=%s", seq, db_path, kwargs)
+        res = _restore_summary_db_seed_sync(db_path, **kwargs)
+        logger.warning("[SUMMARY DB SEED RESTORE ASYNC] worker done seq=%s elapsed=%.3fs rows=%s ok=%s reason=%s", seq, _async_age(), _total_restored_rows(res) if isinstance(res, dict) else 0, (res or {}).get("ok") if isinstance(res, dict) else None, (res or {}).get("reason") if isinstance(res, dict) else None)
+    except Exception:
+        logger.exception("[SUMMARY DB SEED RESTORE ASYNC] worker failed seq=%s", seq)
+    finally:
+        setattr(_ASYNC_ACTIVE, "running", False)
+        with _ASYNC_LOCK:
+            try:
+                cur_name = getattr(_ASYNC_THREAD, "name", "") if _ASYNC_THREAD is not None else ""
+                if cur_name == f"summary-db-seed-restore-async-{seq}":
+                    _ASYNC_THREAD = None
+                    _ASYNC_STARTED_AT = None
+            except Exception:
+                pass
+
+
+def restore_summary_db_seed(db_path: Any = None, *, force: bool = False) -> dict[str, Any]:
+    global _ASYNC_THREAD, _ASYNC_STARTED_AT, _ASYNC_SEQ
+    if force or bool(getattr(_ASYNC_ACTIVE, "running", False)):
+        return _restore_summary_db_seed_sync(db_path, force=force)
+    if _env_bool("SUMMARY_DB_SEED_RESTORE_ASYNC_IN_MAIN", True) and _is_main_py_context():
+        with _ASYNC_LOCK:
+            if _async_alive():
+                logger.warning("[SUMMARY DB SEED RESTORE ASYNC] already running -> return immediately age=%.3fs thread=%s", _async_age(), getattr(_ASYNC_THREAD, "name", ""))
+                return {"ok": True, "skipped": True, "async_running": True, "reason": "async_worker_already_running"}
+            _ASYNC_SEQ += 1
+            seq = _ASYNC_SEQ
+            _ASYNC_STARTED_AT = time.time()
+            _ASYNC_THREAD = threading.Thread(
+                target=_async_worker,
+                args=(seq, db_path, {"force": force}),
+                name=f"summary-db-seed-restore-async-{seq}",
+                daemon=True,
+            )
+            _ASYNC_THREAD.start()
+            logger.warning("[SUMMARY DB SEED RESTORE ASYNC] started worker seq=%s -> return immediately main_context=True", seq)
+            return {"ok": True, "skipped": True, "async_started": True, "seq": seq, "reason": "async_in_main"}
+    return _restore_summary_db_seed_sync(db_path, force=force)
 
 
 __all__ = ["restore_summary_db_seed"]
