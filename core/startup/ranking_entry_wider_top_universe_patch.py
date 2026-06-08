@@ -1,73 +1,52 @@
 from __future__ import annotations
-import logging
-import os
-import threading
-import time
+import logging, os, threading, time
 logger = logging.getLogger(__name__)
 _INSTALLED = False
 
 def _set(name: str, value: str) -> None:
-    try:
-        os.environ[name] = str(value)
-    except Exception:
-        pass
+    try: os.environ[name] = str(value)
+    except Exception: pass
 
 def _apply_once() -> bool:
     try:
-        _set("RANKING_ENTRY_PREFILTER_MAX_RANK", os.getenv("RANKING_ENTRY_WIDER_MAX_RANK", "80"))
-        _set("RANKING_ENTRY_PREFILTER_MAX_ROWS", os.getenv("RANKING_ENTRY_WIDER_MAX_ROWS", "600"))
-        _set("RANKING_ENTRY_PREFILTER_MAX_PER_TYPE", os.getenv("RANKING_ENTRY_WIDER_MAX_PER_TYPE", "90"))
-        _set("RANKING_ENTRY_PREFILTER_MAX_PER_SIDE", os.getenv("RANKING_ENTRY_WIDER_MAX_PER_SIDE", "320"))
-        _set("RANKING_ENTRY_FAST_MAX_PENDING_PER_RUN", os.getenv("RANKING_ENTRY_WIDER_MAX_PENDING_PER_RUN", "4"))
-        _set("RANKING_ENTRY_MAX_PENDING_PER_RUN", os.getenv("RANKING_ENTRY_WIDER_MAX_PENDING_PER_RUN", "4"))
-        _set("RANKING_ENTRY_INTERVAL_MIN", os.getenv("RANKING_ENTRY_WIDER_INTERVAL_MIN", "1"))
-        _set("ENTRY_RANKING_SCALP_MIN_SCORE", os.getenv("ENTRY_RANKING_SCALP_MIN_SCORE", "45"))
-        _set("ENTRY_RANKING_SCALP_RANGE_MIN_PCT", os.getenv("ENTRY_RANKING_SCALP_RANGE_MIN_PCT", "0.0035"))
+        _set('RANKING_ENTRY_PREFILTER_MAX_RANK', os.getenv('RANKING_ENTRY_WIDER_MAX_RANK', '80'))
+        _set('RANKING_ENTRY_PREFILTER_MAX_ROWS', os.getenv('RANKING_ENTRY_WIDER_MAX_ROWS', '600'))
+        _set('RANKING_ENTRY_PREFILTER_MAX_PER_TYPE', os.getenv('RANKING_ENTRY_WIDER_MAX_PER_TYPE', '90'))
+        _set('RANKING_ENTRY_PREFILTER_MAX_PER_SIDE', os.getenv('RANKING_ENTRY_WIDER_MAX_PER_SIDE', '320'))
+        _set('RANKING_ENTRY_FAST_MAX_PENDING_PER_RUN', os.getenv('RANKING_ENTRY_WIDER_MAX_PENDING_PER_RUN', '4'))
+        _set('RANKING_ENTRY_MAX_PENDING_PER_RUN', os.getenv('RANKING_ENTRY_WIDER_MAX_PENDING_PER_RUN', '4'))
+        _set('RANKING_ENTRY_INTERVAL_MIN', os.getenv('RANKING_ENTRY_WIDER_INTERVAL_MIN', '1'))
+        _set('ENTRY_RANKING_SCALP_MIN_SCORE', os.getenv('ENTRY_RANKING_SCALP_MIN_SCORE', '45'))
+        _set('ENTRY_RANKING_SCALP_RANGE_MIN_PCT', os.getenv('ENTRY_RANKING_SCALP_RANGE_MIN_PCT', '0.0035'))
         try:
             from config.ranking_entry_config import RANKING_ENTRY_CONFIG
-            RANKING_ENTRY_CONFIG["RANKING"]["MAX_RANK_POSITION"] = int(float(os.environ["RANKING_ENTRY_PREFILTER_MAX_RANK"]))
-            RANKING_ENTRY_CONFIG["SCORE"]["MIN_ENTRY_SCORE"] = float(os.getenv("RANKING_ENTRY_WIDER_MIN_SCORE", "60"))
-            RANKING_ENTRY_CONFIG["PRICE_MOVE"]["MAX_STEP_MOVE_PCT"] = float(os.getenv("RANKING_ENTRY_WIDER_MAX_STEP_MOVE_PCT", "2.5"))
-            RANKING_ENTRY_CONFIG["PRICE_MOVE"]["MAX_DAY_CHANGE_PCT"] = float(os.getenv("RANKING_ENTRY_WIDER_MAX_DAY_CHANGE_PCT", "12.0"))
-        except Exception:
-            pass
+            RANKING_ENTRY_CONFIG['RANKING']['MAX_RANK_POSITION'] = int(float(os.environ['RANKING_ENTRY_PREFILTER_MAX_RANK']))
+            RANKING_ENTRY_CONFIG['SCORE']['MIN_ENTRY_SCORE'] = float(os.getenv('RANKING_ENTRY_WIDER_MIN_SCORE', '60'))
+            RANKING_ENTRY_CONFIG['PRICE_MOVE']['MAX_STEP_MOVE_PCT'] = float(os.getenv('RANKING_ENTRY_WIDER_MAX_STEP_MOVE_PCT', '2.5'))
+            RANKING_ENTRY_CONFIG['PRICE_MOVE']['MAX_DAY_CHANGE_PCT'] = float(os.getenv('RANKING_ENTRY_WIDER_MAX_DAY_CHANGE_PCT', '12.0'))
+        except Exception: pass
         return True
     except Exception:
-        logger.exception("[RANKING ENTRY WIDER TOP] apply failed")
+        logger.exception('[RANKING ENTRY WIDER TOP] apply failed')
         return False
 
 def _watch_loop() -> None:
-    for i in range(240):
+    loops = max(1, min(int(float(os.getenv('RANKING_ENTRY_WIDER_WATCH_LOOPS', '8') or 8)), 30))
+    sleep_sec = max(0.5, min(float(os.getenv('RANKING_ENTRY_WIDER_WATCH_SLEEP_SEC', '2.0') or 2.0), 5.0))
+    for i in range(loops):
         ok = _apply_once()
-        if i in (0, 1, 5, 15, 30, 60, 120, 180, 239):
-            logger.warning(
-                "[RANKING ENTRY WIDER TOP] enforce ok=%s max_rank=%s max_rows=%s per_type=%s per_side=%s pending_per_run=%s interval_min=%s min_score=%s scalp_score=%s range_min=%s",
-                ok,
-                os.environ.get("RANKING_ENTRY_PREFILTER_MAX_RANK"),
-                os.environ.get("RANKING_ENTRY_PREFILTER_MAX_ROWS"),
-                os.environ.get("RANKING_ENTRY_PREFILTER_MAX_PER_TYPE"),
-                os.environ.get("RANKING_ENTRY_PREFILTER_MAX_PER_SIDE"),
-                os.environ.get("RANKING_ENTRY_MAX_PENDING_PER_RUN"),
-                os.environ.get("RANKING_ENTRY_INTERVAL_MIN"),
-                os.getenv("RANKING_ENTRY_WIDER_MIN_SCORE", "60"),
-                os.environ.get("ENTRY_RANKING_SCALP_MIN_SCORE"),
-                os.environ.get("ENTRY_RANKING_SCALP_RANGE_MIN_PCT"),
-            )
-        time.sleep(0.5)
+        if i in (0, loops - 1):
+            logger.warning('[RANKING ENTRY WIDER TOP] enforce v2 i=%s/%s ok=%s', i, loops, ok)
+        time.sleep(sleep_sec)
 
 def install() -> bool:
     global _INSTALLED
-    if _INSTALLED:
-        return _apply_once()
+    if _INSTALLED: return True
     ok = _apply_once()
-    threading.Thread(target=_watch_loop, name="ranking-entry-wider-top", daemon=True).start()
+    threading.Thread(target=_watch_loop, name='ranking-entry-wider-top', daemon=True).start()
     _INSTALLED = True
-    logger.warning("[RANKING ENTRY WIDER TOP] installed ok=%s", ok)
+    logger.warning('[RANKING ENTRY WIDER TOP] installed v2 ok=%s', ok)
     return ok
-
-try:
-    install()
-except Exception:
-    logger.exception("[RANKING ENTRY WIDER TOP] auto install failed")
-
-__all__ = ["install"]
+try: install()
+except Exception: logger.exception('[RANKING ENTRY WIDER TOP] auto install failed')
+__all__ = ['install']
