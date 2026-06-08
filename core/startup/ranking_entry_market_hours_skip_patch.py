@@ -9,6 +9,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 _DONE = False
+_SCHEDULER_STALE_PATCHED = False
 
 _TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 
@@ -83,6 +84,102 @@ def _run_with_watchdog(orig) -> Any:
     return result.get("ret")
 
 
+def _entry_stale_timeout_for_key(key: str) -> float:
+    """entry系 schedule job の running 残りを解除する秒数。"""
+    base = _env_float("ENTRY_SCHEDULER_STALE_RUNNING_CLEAR_SEC", 90.0)
+    if "tonosama_entry" in key:
+        return _env_float("TONOSAMA_ENTRY_SCHEDULER_STALE_SEC", base)
+    if "ranking_entry" in key:
+        return _env_float("RANKING_ENTRY_SCHEDULER_STALE_SEC", max(75.0, base))
+    if "entry" in key:
+        return base
+    return 0.0
+
+
+def _install_scheduler_stale_running_clear() -> bool:
+    """
+    schedule_loop の _is_job_running を外側から補強する。
+
+    実運用ログで `tags:entry,tonosama_entry` が 200秒以上 running のまま残り、
+    以後 `previous_still_running` で entry が発火しない状態を確認したため、
+    entry系だけ stale running を解除する。
+    """
+    global _SCHEDULER_STALE_PATCHED
+    if _SCHEDULER_STALE_PATCHED:
+        return True
+    if not _env_bool("ENTRY_SCHEDULER_STALE_RUNNING_CLEAR_ENABLED", True):
+        return False
+
+    try:
+        import core.startup.schedule_loop as sl
+
+        orig = getattr(sl, "_is_job_running", None)
+        if not callable(orig):
+            logger.warning("[ENTRY SCHEDULER STALE CLEAR] schedule_loop._is_job_running missing")
+            return False
+        if getattr(orig, "_entry_scheduler_stale_clear_v1", False):
+            _SCHEDULER_STALE_PATCHED = True
+            return True
+
+        def patched_is_job_running(key: str) -> bool:
+            try:
+                key_s = str(key)
+                timeout_sec = _entry_stale_timeout_for_key(key_s)
+                if timeout_sec > 0:
+                    lock = getattr(sl, "_RUNNING_JOBS_LOCK", None)
+                    running = getattr(sl, "_RUNNING_JOBS", None)
+                    if lock is not None and isinstance(running, dict):
+                        with lock:
+                            meta = running.get(key_s)
+                            started_at = meta.get("started_at") if isinstance(meta, dict) else None
+                            elapsed = 0.0
+                            if isinstance(started_at, dt.datetime):
+                                elapsed = max(0.0, (dt.datetime.now() - started_at).total_seconds())
+                            if meta and elapsed >= timeout_sec:
+                                running.pop(key_s, None)
+                                try:
+                                    stats_set = getattr(sl, "_stats_set", None)
+                                    stats_inc = getattr(sl, "_stats_inc", None)
+                                    if callable(stats_inc):
+                                        stats_inc(key_s, "stale_running_cleared_count", 1)
+                                    if callable(stats_set):
+                                        stats_set(
+                                            key_s,
+                                            last_stale_clear_at=str(dt.datetime.now()),
+                                            last_stale_clear_elapsed_sec=round(float(elapsed), 3),
+                                            last_stale_clear_timeout_sec=round(float(timeout_sec), 3),
+                                        )
+                                except Exception:
+                                    pass
+                                logger.warning(
+                                    "[ENTRY SCHEDULER STALE CLEAR] cleared stale running key=%s elapsed=%.3fs timeout=%.3fs meta=%s",
+                                    key_s,
+                                    elapsed,
+                                    timeout_sec,
+                                    meta,
+                                )
+                                return False
+            except Exception:
+                logger.exception("[ENTRY SCHEDULER STALE CLEAR] check failed key=%s", key)
+            return bool(orig(key))
+
+        patched_is_job_running._entry_scheduler_stale_clear_v1 = True  # type: ignore[attr-defined]
+        patched_is_job_running._original = orig  # type: ignore[attr-defined]
+        sl._is_job_running = patched_is_job_running
+        _SCHEDULER_STALE_PATCHED = True
+        logger.warning(
+            "[ENTRY SCHEDULER STALE CLEAR] installed enabled=%s default_timeout=%.1fs tonosama_timeout=%.1fs ranking_timeout=%.1fs",
+            _env_bool("ENTRY_SCHEDULER_STALE_RUNNING_CLEAR_ENABLED", True),
+            _env_float("ENTRY_SCHEDULER_STALE_RUNNING_CLEAR_SEC", 90.0),
+            _env_float("TONOSAMA_ENTRY_SCHEDULER_STALE_SEC", _env_float("ENTRY_SCHEDULER_STALE_RUNNING_CLEAR_SEC", 90.0)),
+            _env_float("RANKING_ENTRY_SCHEDULER_STALE_SEC", max(75.0, _env_float("ENTRY_SCHEDULER_STALE_RUNNING_CLEAR_SEC", 90.0))),
+        )
+        return True
+    except Exception:
+        logger.exception("[ENTRY SCHEDULER STALE CLEAR] install failed")
+        return False
+
+
 def _patch_once():
     try:
         import trading.entry_exit.tasks as tasks
@@ -118,19 +215,21 @@ def _patch_once():
 def _watch():
     for i in range(240):
         ok = _patch_once()
+        stale_ok = _install_scheduler_stale_running_clear()
         if i in (0, 1, 5, 15, 30, 60, 120, 239):
-            logger.warning("[RANKING ENTRY MARKET HOURS SKIP] enforce ok=%s", ok)
+            logger.warning("[RANKING ENTRY MARKET HOURS SKIP] enforce ok=%s stale_clear_ok=%s", ok, stale_ok)
         time.sleep(0.5)
 
 
 def install():
     global _DONE
+    stale_ok = _install_scheduler_stale_running_clear()
     if _DONE:
-        return _patch_once()
+        return bool(_patch_once() and stale_ok)
     ok = _patch_once()
     threading.Thread(target=_watch, name="ranking-entry-market-hours-skip", daemon=True).start()
     _DONE = True
-    logger.warning("[RANKING ENTRY MARKET HOURS SKIP] installed ok=%s watcher=True", ok)
+    logger.warning("[RANKING ENTRY MARKET HOURS SKIP] installed ok=%s stale_clear_ok=%s watcher=True", ok, stale_ok)
     return True
 
 
