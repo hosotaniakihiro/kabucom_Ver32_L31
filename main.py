@@ -10,7 +10,7 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.33-INSTALL-MA5-THIRD-BAR-RANKING-FAILOPEN
+# Version: Ver38.34-HARD-LIQUIDITY-MOVEMENT-GUARD
 # ------------------------------------------------------------
 # ✔ SUMMARY AI async entry patch を main runtime patch 一覧へ明示追加
 # ✔ TONOSAMA final liquidity lost-volume fallback threshold を 2.3 に調整
@@ -23,6 +23,7 @@
 # ✔ ENTRY_LUNCH_BLOCK_START のデフォルトを 11:30 に設定
 # ✔ RANKING high/low欠損時のLOW MOVE条件をスキャル向けに緩和
 # ✔ ENTRY MA5 third bar guard V2 を main runtime patch に追加
+# ✔ 発注直前の出来高・売買代金・値動きハードガードを追加
 # ✔ 既存の起動処理は維持
 # ============================================================
 
@@ -69,6 +70,14 @@ os.environ.setdefault("LOW_MOVE_RANKING_MIN_SCORE_FOR_NO_HIGHLOW", "70.0")
 # 強いランキング候補は MA5 third-bar ガード単体で全落ちさせない。
 os.environ.setdefault("ENTRY_MA5_THIRD_BAR_RANKING_STRONG_FAILOPEN", "1")
 os.environ.setdefault("ENTRY_MA5_THIRD_BAR_RANKING_FAILOPEN_MIN_SCORE", "80.0")
+# ただし発注直前では低出来高・低売買代金・低変動を必ず除外する。
+os.environ.setdefault("ENTRY_HARD_LIQUIDITY_MOVEMENT_GUARD_ENABLED", "1")
+os.environ.setdefault("ENTRY_HARD_MIN_VOLUME", "100000")
+os.environ.setdefault("ENTRY_HARD_MIN_TURNOVER", "50000000")
+os.environ.setdefault("ENTRY_HARD_REQUIRE_MOVEMENT", "1")
+os.environ.setdefault("ENTRY_HARD_MIN_RANGE_PCT", "0.006")
+os.environ.setdefault("ENTRY_HARD_MIN_ATR_RATIO", "0.003")
+os.environ.setdefault("ENTRY_HARD_MIN_ABS_SLOPE", "0.001")
 
 try:
     from core.logging.console_tee import setup_console_tee, rebind_logging_streams_to_console_tee
@@ -171,6 +180,7 @@ def _install_main_runtime_patches():
         ("core.startup.entry_limit_passive_runtime_patch", "install"),
         ("core.startup.final_entry_safety_guard_patch", "install"),
         ("core.startup.entry_ma5_third_bar_slope_guard_patch", "install"),
+        ("core.startup.final_entry_liquidity_movement_hard_guard_patch", "install"),
         ("core.startup.summary_ai_more_candidates_patch", "install"),
         ("core.startup.summary_ai_async_entry_patch", "install"),
         ("core.startup.entry_order_mtf_slope_fill_patch", "install"),
