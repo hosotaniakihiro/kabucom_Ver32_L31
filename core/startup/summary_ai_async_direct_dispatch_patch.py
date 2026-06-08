@@ -1,19 +1,16 @@
 # ============================================================
 # File   : core/startup/summary_ai_async_direct_dispatch_patch.py
-# Version: V1-QUEUED-ASYNC-DIRECT-DISPATCH-FALLBACK
+# Version: V2-REINSTALL-AFTER-ASYNC-PATCH
 # ------------------------------------------------------------
 # 目的:
 #   SUMMARY AI が AI_OK を出しても、summary_ai_async_entry_patch が
 #   executed=False / skip=queued_async を返したまま実際の entry_controller
 #   dispatch が薄いケースを救済する。
 #
-# 方針:
-#   - 既存 async queue は維持する。
-#   - queued_async を検出したら、approved_rows を別 thread で
-#     run_summary_entry_executor へ直接渡す保険 dispatch を行う。
-#   - summary parent はブロックしない。
-#   - entry_controller lock が混んでいても summary_ai_entry_controller_bridge_patch
-#     側の lock wait / retry に任せる。
+# V2:
+#   - このpatchが summary_ai_async_entry_patch より先に入っても、後から
+#     async patch に上書きされるため、短時間 watcher で再installする。
+#   - main runtime patch 順に依存しない。
 # ============================================================
 from __future__ import annotations
 
@@ -28,6 +25,7 @@ _INSTALLED = False
 _ORIG = None
 _SEQ = 0
 _LOCK = threading.Lock()
+_WATCHER_STARTED = False
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -87,9 +85,9 @@ def _result_executed(result: Any) -> bool:
         if isinstance(result, dict):
             if bool(result.get("executed")):
                 return True
-            for key in ("executed_count", "order_count", "submitted_count", "sent_count", "registered"):
+            for key in ("executed_count", "order_count", "submitted_count", "sent_count"):
                 try:
-                    if int(result.get(key) or 0) > 0 and key != "registered":
+                    if int(result.get(key) or 0) > 0:
                         return True
                 except Exception:
                     pass
@@ -161,7 +159,6 @@ def _direct_worker(seq: int, approved_rows: list[Any], df_summary: Any, interval
             )
             if executed:
                 return
-            # pending登録だけ成功している場合は次回/既存controllerに任せる。過剰再投入を避ける。
             if isinstance(result, dict) and int(result.get("registered") or 0) > 0:
                 return
         except Exception:
@@ -176,14 +173,11 @@ def _patched_execute_ai_ok_entries_bulk(*args: Any, **kwargs: Any):
     try:
         if not _env_bool("SUMMARY_AI_DIRECT_DISPATCH_ON_QUEUED_ASYNC", True):
             return result
-        dry_run = bool(kwargs.get("dry_run", True))
-        if dry_run:
+        if bool(kwargs.get("dry_run", True)):
             return result
         if _result_executed(result) or not _is_queued_async(result):
             return result
-        approved_rows = []
-        if isinstance(result, dict):
-            approved_rows = list(result.get("approved_rows") or [])
+        approved_rows = list(result.get("approved_rows") or []) if isinstance(result, dict) else []
         if not approved_rows:
             return result
         df_summary = kwargs.get("df_summary")
@@ -192,13 +186,12 @@ def _patched_execute_ai_ok_entries_bulk(*args: Any, **kwargs: Any):
         with _LOCK:
             _SEQ += 1
             seq = _SEQ
-        th = threading.Thread(
+        threading.Thread(
             target=_direct_worker,
             args=(seq, approved_rows, df_summary, interval, max_attempts),
             daemon=True,
             name=f"summary-ai-direct-dispatch-{seq}",
-        )
-        th.start()
+        ).start()
         logger.warning(
             "[SUMMARY AI DIRECT DISPATCH] scheduled seq=%s interval=%s approved=%s symbols=%s original_skip=%s",
             seq,
@@ -217,38 +210,56 @@ def _patched_execute_ai_ok_entries_bulk(*args: Any, **kwargs: Any):
     return result
 
 
-def install() -> bool:
+def _patch_once() -> bool:
     global _INSTALLED, _ORIG
-    if _INSTALLED:
-        return True
-    if not _env_bool("SUMMARY_AI_DIRECT_DISPATCH_ON_QUEUED_ASYNC", True):
-        logger.warning("[SUMMARY AI DIRECT DISPATCH] disabled by env")
-        return False
     try:
         from trading.entry.summary_ai import executor as exec_mod
         from trading.entry.summary_ai import runner as runner_mod
         cur = getattr(exec_mod, "execute_ai_ok_entries_bulk", None)
         if not callable(cur):
-            logger.error("[SUMMARY AI DIRECT DISPATCH] target missing")
+            logger.debug("[SUMMARY AI DIRECT DISPATCH] target missing")
             return False
-        if getattr(cur, "_summary_ai_direct_dispatch_v1", False):
+        if getattr(cur, "_summary_ai_direct_dispatch_v2", False):
             _INSTALLED = True
             return True
         _ORIG = cur
         _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v1 = True  # type: ignore[attr-defined]
+        _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v2 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._original = cur  # type: ignore[attr-defined]
         exec_mod.execute_ai_ok_entries_bulk = _patched_execute_ai_ok_entries_bulk
         runner_mod.execute_ai_ok_entries_bulk = _patched_execute_ai_ok_entries_bulk
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY AI DIRECT DISPATCH] installed enabled=True delay=%.2fs attempts=%s",
+            "[SUMMARY AI DIRECT DISPATCH] patched target=%s delay=%.2fs attempts=%s",
+            getattr(cur, "__name__", type(cur).__name__),
             _env_float("SUMMARY_AI_DIRECT_DISPATCH_DELAY_SEC", 0.35),
             _env_int("SUMMARY_AI_DIRECT_DISPATCH_MAX_ATTEMPTS", 2),
         )
         return True
     except Exception:
-        logger.exception("[SUMMARY AI DIRECT DISPATCH] install failed")
+        logger.exception("[SUMMARY AI DIRECT DISPATCH] patch_once failed")
         return False
+
+
+def _watch_reinstall() -> None:
+    for i in range(max(1, _env_int("SUMMARY_AI_DIRECT_DISPATCH_WATCH_LOOPS", 180))):
+        ok = _patch_once()
+        if i in (0, 1, 5, 15, 30, 60, 120, 179):
+            logger.warning("[SUMMARY AI DIRECT DISPATCH] enforce i=%s ok=%s", i, ok)
+        time.sleep(max(0.1, _env_float("SUMMARY_AI_DIRECT_DISPATCH_WATCH_SLEEP_SEC", 0.5)))
+
+
+def install() -> bool:
+    global _WATCHER_STARTED
+    if not _env_bool("SUMMARY_AI_DIRECT_DISPATCH_ON_QUEUED_ASYNC", True):
+        logger.warning("[SUMMARY AI DIRECT DISPATCH] disabled by env")
+        return False
+    ok = _patch_once()
+    if not _WATCHER_STARTED:
+        _WATCHER_STARTED = True
+        threading.Thread(target=_watch_reinstall, daemon=True, name="summary-ai-direct-dispatch-enforcer").start()
+    logger.warning("[SUMMARY AI DIRECT DISPATCH] installed/enforcing ok=%s watcher=%s", ok, _WATCHER_STARTED)
+    return bool(ok)
 
 
 try:
