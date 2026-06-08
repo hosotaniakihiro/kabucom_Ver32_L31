@@ -1,24 +1,17 @@
 # ============================================================
 # File   : core/startup/ranking_entry_final_rescue_patch.py
-# Version: V1.0-RANKING-FINAL-RESCUE
+# Version: V1.1-RANKING-FINAL-RESCUE-SAFE-AI
 # ------------------------------------------------------------
 # 目的:
 #   RANKING pending が entry_controller まで到達しているのに、
-#   最終段で全落ちして注文が出ない問題を緩和する。
+#   最終段で全落ちして注文が出ない問題を、古い/弱いAI判定を
+#   無理に通さない範囲で緩和する。
 #
-# 最新ログの主因:
-#   - ENTRY_SKIP reason=ATR_1M_FILTER_NG
-#     例: 9824 atr/price=0.000679 min_ratio=0.001000
-#   - AI_GATE_NG reason=mtf_low
-#   - ranking entry model not found: AI\model\ranking_entry_lgbm.pkl
-#   - range_5m_filter wrapper が df_5m キーワード引数に未対応
-#
-# 方針:
-#   - RANKING候補だけ対象。
-#   - 高スコアRANKINGはATR閾値を少し緩める。
-#   - ranking model 未配置 / mtf_low だけで全落ちしないよう、
-#     高スコア・出来高ありなら AI allow に救済する。
-#   - range_5m_filter は entry_row 形式と df_5m形式の両方を安全に受ける。
+# V1.1:
+#   - ATR救済とrange_5m_filterのTypeError互換は維持。
+#   - AI_GATEのfail-openはデフォルトOFFにする。
+#   - ranking stale failclosed と組み合わせ、古いランキングや
+#     mtf_lowだけの弱い候補をAI rescueで通さない。
 # ============================================================
 
 from __future__ import annotations
@@ -149,10 +142,9 @@ def _patch_entry_controller() -> bool:
 
     ok_any = False
 
-    # 1) ATR rescue for high-score RANKING.
     try:
         cur = getattr(ec, "atr_1m_filter", None)
-        if callable(cur) and not getattr(cur, "_ranking_final_rescue_atr_v1", False):
+        if callable(cur) and not getattr(cur, "_ranking_final_rescue_atr_v11", False):
             orig = getattr(cur, "_original_atr_1m_filter", cur)
 
             def patched_atr(entry_row: Any = None, *args, **kwargs):
@@ -184,17 +176,17 @@ def _patch_entry_controller() -> bool:
                     return ret
 
             patched_atr._ranking_final_rescue_atr_v1 = True  # type: ignore[attr-defined]
+            patched_atr._ranking_final_rescue_atr_v11 = True  # type: ignore[attr-defined]
             patched_atr._original_atr_1m_filter = orig  # type: ignore[attr-defined]
             ec.atr_1m_filter = patched_atr
             ok_any = True
-            logger.warning("[RANKING FINAL RESCUE] patched entry_controller.atr_1m_filter v1")
+            logger.warning("[RANKING FINAL RESCUE] patched entry_controller.atr_1m_filter v1.1")
     except Exception:
         logger.exception("[RANKING FINAL RESCUE] atr patch failed")
 
-    # 2) Range wrapper keyword compatibility. If original wrapper cannot accept df_5m, call safely / fail-open only when configured.
     try:
         cur = getattr(ec, "range_5m_filter", None)
-        if callable(cur) and not getattr(cur, "_ranking_final_rescue_range_v1", False):
+        if callable(cur) and not getattr(cur, "_ranking_final_rescue_range_v11", False):
             orig = getattr(cur, "_original_range_5m_filter", cur)
 
             def patched_range(entry_row: Any = None, *args, **kwargs):
@@ -216,17 +208,17 @@ def _patch_entry_controller() -> bool:
                     return bool(allow)
 
             patched_range._ranking_final_rescue_range_v1 = True  # type: ignore[attr-defined]
+            patched_range._ranking_final_rescue_range_v11 = True  # type: ignore[attr-defined]
             patched_range._original_range_5m_filter = orig  # type: ignore[attr-defined]
             ec.range_5m_filter = patched_range
             ok_any = True
-            logger.warning("[RANKING FINAL RESCUE] patched entry_controller.range_5m_filter v1")
+            logger.warning("[RANKING FINAL RESCUE] patched entry_controller.range_5m_filter v1.1")
     except Exception:
         logger.exception("[RANKING FINAL RESCUE] range patch failed")
 
-    # 3) AI rescue. When ranking model is missing / mtf_low only, high-score RANKING can proceed.
     try:
         cur = getattr(ec, "ai_final_entry_check", None)
-        if callable(cur) and not getattr(cur, "_ranking_final_rescue_ai_v1", False):
+        if callable(cur) and not getattr(cur, "_ranking_final_rescue_ai_v11", False):
             orig = getattr(cur, "_original_ai_final_entry_check", cur)
 
             def patched_ai(entry_row: Any = None, *args, **kwargs):
@@ -234,13 +226,12 @@ def _patch_entry_controller() -> bool:
                 try:
                     if isinstance(ai, dict) and ai.get("allow"):
                         return ai
-                    if not _env_bool("RANKING_FINAL_RESCUE_AI_FAILOPEN", True):
+                    if not _env_bool("RANKING_FINAL_RESCUE_AI_FAILOPEN", False):
                         return ai
                     if not _ranking_rescue_ok(entry_row):
                         return ai
                     reason = _safe_str(ai.get("reason") if isinstance(ai, dict) else ai).lower()
-                    # ranking model未配置時は AI.entry_gate 側で mtf_low 等の安全側NGになりやすい。
-                    rescue_reasons = [x.strip().lower() for x in os.getenv("RANKING_FINAL_RESCUE_AI_REASONS", "mtf_low,model not found,ranking entry model not found").split(",")]
+                    rescue_reasons = [x.strip().lower() for x in os.getenv("RANKING_FINAL_RESCUE_AI_REASONS", "model not found,ranking entry model not found").split(",")]
                     if reason and not any(x and x in reason for x in rescue_reasons):
                         return ai
                     sc = _score(entry_row)
@@ -266,10 +257,11 @@ def _patch_entry_controller() -> bool:
                     return ai
 
             patched_ai._ranking_final_rescue_ai_v1 = True  # type: ignore[attr-defined]
+            patched_ai._ranking_final_rescue_ai_v11 = True  # type: ignore[attr-defined]
             patched_ai._original_ai_final_entry_check = orig  # type: ignore[attr-defined]
             ec.ai_final_entry_check = patched_ai
             ok_any = True
-            logger.warning("[RANKING FINAL RESCUE] patched entry_controller.ai_final_entry_check v1")
+            logger.warning("[RANKING FINAL RESCUE] patched entry_controller.ai_final_entry_check v1.1 failopen_default=%s", os.environ.get("RANKING_FINAL_RESCUE_AI_FAILOPEN"))
     except Exception:
         logger.exception("[RANKING FINAL RESCUE] ai patch failed")
 
@@ -281,16 +273,16 @@ def install() -> bool:
     if _DONE:
         return _patch_entry_controller()
     os.environ.setdefault("RANKING_FINAL_RESCUE_MIN_SCORE", "55")
-    os.environ.setdefault("RANKING_FINAL_RESCUE_MIN_VOLUME", "0")
+    os.environ.setdefault("RANKING_FINAL_RESCUE_MIN_VOLUME", "30000")
     os.environ.setdefault("RANKING_FINAL_RESCUE_ATR_FAILOPEN", "1")
     os.environ.setdefault("RANKING_FINAL_RESCUE_ATR_MIN_RATIO", "0.0005")
     os.environ.setdefault("RANKING_FINAL_RESCUE_RANGE_ERROR_FAILOPEN", "1")
-    os.environ.setdefault("RANKING_FINAL_RESCUE_AI_FAILOPEN", "1")
+    os.environ.setdefault("RANKING_FINAL_RESCUE_AI_FAILOPEN", "0")
     os.environ.setdefault("RANKING_FINAL_RESCUE_AI_CONFIDENCE", "0.72")
-    os.environ.setdefault("RANKING_FINAL_RESCUE_AI_REASONS", "mtf_low,model not found,ranking entry model not found")
+    os.environ.setdefault("RANKING_FINAL_RESCUE_AI_REASONS", "model not found,ranking entry model not found")
     ok = _patch_entry_controller()
     _DONE = True
-    logger.warning("[RANKING FINAL RESCUE] installed v1 ok=%s min_score=%s atr_min_ratio=%s ai_failopen=%s", ok, os.environ.get("RANKING_FINAL_RESCUE_MIN_SCORE"), os.environ.get("RANKING_FINAL_RESCUE_ATR_MIN_RATIO"), os.environ.get("RANKING_FINAL_RESCUE_AI_FAILOPEN"))
+    logger.warning("[RANKING FINAL RESCUE] installed v1.1 ok=%s min_score=%s min_volume=%s atr_min_ratio=%s ai_failopen=%s", ok, os.environ.get("RANKING_FINAL_RESCUE_MIN_SCORE"), os.environ.get("RANKING_FINAL_RESCUE_MIN_VOLUME"), os.environ.get("RANKING_FINAL_RESCUE_ATR_MIN_RATIO"), os.environ.get("RANKING_FINAL_RESCUE_AI_FAILOPEN"))
     return ok
 
 
