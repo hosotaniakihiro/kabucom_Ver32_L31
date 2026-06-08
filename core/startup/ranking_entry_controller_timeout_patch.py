@@ -1,22 +1,14 @@
 # ============================================================
 # File   : core/startup/ranking_entry_controller_timeout_patch.py
-# Version: V1.7-RANKING-PENDING-PRECHECK-BYPASS
+# Version: V1.8-RANKING-CONTROLLER-FAST-FAIL
 # ------------------------------------------------------------
-# RANKING ENTRY は pending 作成後の entry_controller が timeout / filter NG
-# になると pending が残り、max_pending=1 のため次回以降のランキング候補生成が
-# 全停止しやすい。
+# RANKING ENTRY は pending 作成後の entry_controller が長時間ロックを握ると、
+# TONOSAMA / SUMMARY の発注判定を待たせて timeout させる。
 #
-# V1.6の問題:
-#   - ranking_snapshot_1min が stale の時に build_fn を呼ばない。
-#   - ただし実運用では latest_ranking_df / runtime ranking から候補が作れる場合がある。
-#   - さらに entry_controller 側の precheck_ranking_entry() が pending より先に
-#     RANKING_PRECHECK_NG snapshot_stale で return し、pending があっても発注審査に進まない。
-#
-# V1.7対策:
-#   - stale snapshot だけではランキングビルドを止めない設定をデフォルトにする。
-#   - RANKING pending が存在する場合、entry_controller.precheck_ranking_entry を
-#     controlled bypass して発注審査へ進める。
-#   - controller_ok=True 後の即pruneは引き続き禁止。
+# V1.8:
+#   - controller timeout を120秒へ引き上げる旧挙動を廃止。
+#   - build timeout / controller timeout / runtime budget は短い値を優先。
+#   - pending が残ったまま controller が返った場合は次回へ回し、他sourceを詰まらせない。
 # ============================================================
 
 from __future__ import annotations
@@ -76,7 +68,7 @@ def _parse_dt(v: Any) -> dt.datetime | None:
 def _latest_snapshot_time(db_path: str) -> tuple[dt.datetime | None, str, int]:
     if not db_path:
         return None, "no_db_path", 0
-    tables = ["ranking_snapshot_1min", "ranking_snapshot", "ranking_raw"]
+    tables = ["ranking_snapshot_1min", "ranking_snapshot", "ranking_raw", "ranking_raw_1min"]
     cols = ["updated_at", "datetime", "snapshot_time", "created_at", "time"]
     try:
         with sqlite3.connect(str(db_path), timeout=2.0) as conn:
@@ -117,8 +109,6 @@ def _latest_snapshot_time(db_path: str) -> tuple[dt.datetime | None, str, int]:
 
 
 def _ranking_snapshot_precheck() -> tuple[bool, dict[str, Any]]:
-    # v1.7: デフォルトでは stale snapshot だけでビルドを止めない。
-    # latest_ranking_df / runtime ranking から候補が作れる環境があるため。
     if not _env_bool("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE", False):
         return True, {"reason": "disabled"}
     try:
@@ -210,9 +200,9 @@ def _pending_symbols_for_source(source: str) -> list[str]:
 
 
 def _prune_pending_for_source(source: str, reason: str) -> int:
-    if not _env_bool("RANKING_ENTRY_PRUNE_STALE_PENDING_AFTER_DISPATCH", False):
+    if not _env_bool("RANKING_ENTRY_PRUNE_STALE_PENDING_AFTER_DISPATCH", True):
         return 0
-    min_age_sec = max(5.0, _env_float("RANKING_ENTRY_STALE_PENDING_MIN_AGE_SEC", 30.0))
+    min_age_sec = max(5.0, _env_float("RANKING_ENTRY_STALE_PENDING_MIN_AGE_SEC", 20.0))
     source_u = str(source or "").upper()
     now = time.time()
     try:
@@ -235,16 +225,17 @@ def _prune_pending_for_source(source: str, reason: str) -> int:
 
 def _force_runtime_timeouts(tasks) -> None:
     try:
-        build = max(float(getattr(tasks, "RANKING_ENTRY_BUILD_TIMEOUT_SEC", 0.0) or 0.0), _env_float("RANKING_ENTRY_BUILD_TIMEOUT_SEC", 180.0), 180.0)
-        controller = max(float(getattr(tasks, "RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", 0.0) or 0.0), _env_float("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", 120.0), 120.0)
-        tasks.RANKING_ENTRY_BUILD_TIMEOUT_SEC = build
-        tasks.RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC = controller
+        build_default = _env_float("RANKING_ENTRY_BUILD_TIMEOUT_SEC", 25.0)
+        controller_default = _env_float("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", 25.0)
+        runtime_default = _env_float("RANKING_ENTRY_RUNTIME_BUDGET_SEC", 25.0)
+        tasks.RANKING_ENTRY_BUILD_TIMEOUT_SEC = max(10.0, min(float(getattr(tasks, "RANKING_ENTRY_BUILD_TIMEOUT_SEC", build_default) or build_default), build_default))
+        tasks.RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC = max(8.0, min(float(getattr(tasks, "RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", controller_default) or controller_default), controller_default))
+        os.environ["RANKING_ENTRY_RUNTIME_BUDGET_SEC"] = str(max(10.0, min(_env_float("RANKING_ENTRY_RUNTIME_BUDGET_SEC", runtime_default), runtime_default)))
     except Exception:
         logger.debug("[RANKING ENTRY TIMEOUT PATCH] force runtime timeouts failed", exc_info=True)
 
 
 def _patch_entry_controller_precheck() -> bool:
-    """RANKING pendingが存在する時だけ、entry_controllerのstale snapshot precheckを迂回する。"""
     global _ORIG_ENTRY_CONTROLLER_PRECHECK
     if not _env_bool("RANKING_ENTRY_BYPASS_PRECHECK_WHEN_PENDING", True):
         return False
@@ -253,7 +244,7 @@ def _patch_entry_controller_precheck() -> bool:
         cur = getattr(ec, "precheck_ranking_entry", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_ranking_pending_precheck_bypass_v17", False):
+        if getattr(cur, "_ranking_pending_precheck_bypass_v18", False):
             return True
         orig = getattr(cur, "_original", cur)
         _ORIG_ENTRY_CONTROLLER_PRECHECK = orig
@@ -271,20 +262,17 @@ def _patch_entry_controller_precheck() -> bool:
                         out["bypass_reason"] = "RANKING_PENDING_EXISTS"
                         out["pending_count"] = cnt
                         out["original_detail_reason"] = pre.get("detail_reason") or pre.get("reason")
-                        logger.warning(
-                            "[RANKING PRECHECK BYPASS] pending exists -> allow entry_controller pending_count=%s original=%s",
-                            cnt,
-                            pre,
-                        )
+                        logger.warning("[RANKING PRECHECK BYPASS] pending exists -> allow entry_controller pending_count=%s original=%s", cnt, pre)
                         return out
             except Exception:
                 logger.debug("[RANKING PRECHECK BYPASS] check failed", exc_info=True)
             return pre
 
         patched_precheck._ranking_pending_precheck_bypass_v17 = True  # type: ignore[attr-defined]
+        patched_precheck._ranking_pending_precheck_bypass_v18 = True  # type: ignore[attr-defined]
         patched_precheck._original = orig  # type: ignore[attr-defined]
         ec.precheck_ranking_entry = patched_precheck
-        logger.warning("[RANKING PRECHECK BYPASS] patched entry_controller.precheck_ranking_entry v1.7")
+        logger.warning("[RANKING PRECHECK BYPASS] patched entry_controller.precheck_ranking_entry v1.8")
         return True
     except Exception:
         logger.exception("[RANKING PRECHECK BYPASS] patch failed")
@@ -299,14 +287,11 @@ def _dispatch_ranking_controller(tasks, timeout_sec: float) -> bool:
 def _dispatch_and_cleanup_ranking(tasks, *, timeout_sec: float, cleanup_reason: str) -> bool:
     before_symbols = _pending_symbols_for_source("RANKING")
     ok = _dispatch_ranking_controller(tasks, timeout_sec)
-    time.sleep(max(0.0, _env_float("RANKING_ENTRY_POST_DISPATCH_GRACE_SEC", 1.0)))
+    time.sleep(max(0.0, _env_float("RANKING_ENTRY_POST_DISPATCH_GRACE_SEC", 0.2)))
     after_count = _pending_count_for_source("RANKING")
     if after_count > 0:
-        if ok and not _env_bool("RANKING_ENTRY_PRUNE_AFTER_SUCCESSFUL_CONTROLLER", False):
-            logger.warning("[RANKING ENTRY SCHEDULE] keep ranking pending after controller_ok=True before_symbols=%s after_count=%s reason=%s prune_after_success=False", before_symbols, after_count, cleanup_reason)
-            return ok
         removed = _prune_pending_for_source("RANKING", cleanup_reason)
-        logger.warning("[RANKING ENTRY SCHEDULE] stale ranking pending cleanup controller_ok=%s before_symbols=%s after_count=%s removed=%s reason=%s", ok, before_symbols, after_count, removed, cleanup_reason)
+        logger.warning("[RANKING ENTRY SCHEDULE] ranking pending after controller controller_ok=%s before_symbols=%s after_count=%s removed=%s reason=%s", ok, before_symbols, after_count, removed, cleanup_reason)
     return ok
 
 
@@ -328,7 +313,7 @@ def _patched_run_ranking_entry_safe() -> int:
         tasks._RANKING_ENTRY_RUNNING = True
         tasks._RANKING_ENTRY_STARTED_AT = started_dt
     try:
-        logger.info("[RANKING ENTRY SCHEDULE] fire at=%s patched=v1.7", started_dt.strftime("%Y-%m-%d %H:%M:%S"))
+        logger.info("[RANKING ENTRY SCHEDULE] fire at=%s patched=v1.8", started_dt.strftime("%Y-%m-%d %H:%M:%S"))
         fresh, diag = _ranking_snapshot_precheck()
         if not fresh:
             logger.warning("[RANKING ENTRY SCHEDULE] skipped reason=ranking_snapshot_stale_before_build diag=%s", diag)
@@ -383,46 +368,43 @@ def _patched_run_ranking_entry_safe() -> int:
 
 def install() -> bool:
     global _INSTALLED, _ORIG_RANKING_SAFE
-    if _INSTALLED:
-        _patch_entry_controller_precheck()
-        return True
     try:
-        # v1.7: stale snapshot だけでは止めない。必要なら環境変数で1に戻せる。
-        os.environ.setdefault("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE", "0")
+        os.environ["RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE"] = "0"
         os.environ.setdefault("RANKING_ENTRY_BYPASS_PRECHECK_WHEN_PENDING", "1")
         os.environ.setdefault("RANKING_ENTRY_SNAPSHOT_MAX_AGE_SEC", "300")
         old_runtime_budget = os.environ.get("RANKING_ENTRY_RUNTIME_BUDGET_SEC")
         old_max_pending = os.environ.get("RANKING_ENTRY_MAX_PENDING_PER_RUN")
         old_prune = os.environ.get("RANKING_ENTRY_PRUNE_STALE_PENDING_AFTER_DISPATCH")
-        os.environ["RANKING_ENTRY_RUNTIME_BUDGET_SEC"] = str(max(_env_float("RANKING_ENTRY_RUNTIME_BUDGET_SEC", 150.0), 150.0))
-        os.environ["RANKING_ENTRY_MAX_PENDING_PER_RUN"] = str(max(int(float(os.environ.get("RANKING_ENTRY_MAX_PENDING_PER_RUN") or 3)), 3))
-        os.environ.setdefault("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", "120")
-        os.environ.setdefault("RANKING_ENTRY_BUILD_TIMEOUT_SEC", "180")
-        os.environ.setdefault("RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC", "90")
-        os.environ.setdefault("RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC", "300")
-        os.environ.setdefault("RANKING_ENTRY_PRUNE_STALE_PENDING_AFTER_DISPATCH", "0")
+        os.environ["RANKING_ENTRY_RUNTIME_BUDGET_SEC"] = str(min(_env_float("RANKING_ENTRY_RUNTIME_BUDGET_SEC", 25.0), 25.0))
+        os.environ["RANKING_ENTRY_MAX_PENDING_PER_RUN"] = str(max(int(float(os.environ.get("RANKING_ENTRY_MAX_PENDING_PER_RUN") or 4)), 4))
+        os.environ["RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC"] = str(min(_env_float("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", 25.0), 25.0))
+        os.environ["RANKING_ENTRY_BUILD_TIMEOUT_SEC"] = str(min(_env_float("RANKING_ENTRY_BUILD_TIMEOUT_SEC", 25.0), 25.0))
+        os.environ.setdefault("RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC", "20")
+        os.environ.setdefault("RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC", "60")
+        os.environ.setdefault("RANKING_ENTRY_PRUNE_STALE_PENDING_AFTER_DISPATCH", "1")
         os.environ.setdefault("RANKING_ENTRY_PRUNE_AFTER_SUCCESSFUL_CONTROLLER", "0")
-        os.environ.setdefault("RANKING_ENTRY_STALE_PENDING_MIN_AGE_SEC", "30")
-        os.environ.setdefault("RANKING_ENTRY_POST_DISPATCH_GRACE_SEC", "1.0")
+        os.environ.setdefault("RANKING_ENTRY_STALE_PENDING_MIN_AGE_SEC", "20")
+        os.environ.setdefault("RANKING_ENTRY_POST_DISPATCH_GRACE_SEC", "0.2")
         import trading.entry_exit.tasks as tasks
         old_controller = float(getattr(tasks, "RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", 20.0) or 20.0)
         old_build = float(getattr(tasks, "RANKING_ENTRY_BUILD_TIMEOUT_SEC", 90.0) or 90.0)
         _force_runtime_timeouts(tasks)
-        new_controller = float(getattr(tasks, "RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", 120.0) or 120.0)
-        new_build = float(getattr(tasks, "RANKING_ENTRY_BUILD_TIMEOUT_SEC", 180.0) or 180.0)
+        new_controller = float(getattr(tasks, "RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", 25.0) or 25.0)
+        new_build = float(getattr(tasks, "RANKING_ENTRY_BUILD_TIMEOUT_SEC", 25.0) or 25.0)
         _patch_entry_controller_precheck()
         cur = getattr(tasks, "_run_ranking_entry_safe", None)
-        if callable(cur) and not getattr(cur, "_ranking_timeout_dispatch_patch_v17", False):
+        if callable(cur) and not getattr(cur, "_ranking_timeout_dispatch_patch_v18", False):
             _ORIG_RANKING_SAFE = cur
             _patched_run_ranking_entry_safe._ranking_timeout_dispatch_patch_v14 = True  # type: ignore[attr-defined]
             _patched_run_ranking_entry_safe._ranking_timeout_dispatch_patch_v15 = True  # type: ignore[attr-defined]
             _patched_run_ranking_entry_safe._ranking_timeout_dispatch_patch_v16 = True  # type: ignore[attr-defined]
             _patched_run_ranking_entry_safe._ranking_timeout_dispatch_patch_v17 = True  # type: ignore[attr-defined]
+            _patched_run_ranking_entry_safe._ranking_timeout_dispatch_patch_v18 = True  # type: ignore[attr-defined]
             _patched_run_ranking_entry_safe._original = cur  # type: ignore[attr-defined]
             tasks._run_ranking_entry_safe = _patched_run_ranking_entry_safe
         _INSTALLED = True
         logger.warning(
-            "[RANKING ENTRY TIMEOUT PATCH] installed v1.7 controller_timeout %.1f->%.1f build_timeout %.1f->%.1f runtime_budget old=%s new=%s max_pending old=%s new=%s stale_prune old=%s new=%s stale_snapshot_skip=%s precheck_bypass=%s",
+            "[RANKING ENTRY TIMEOUT PATCH] installed v1.8 controller_timeout %.1f->%.1f build_timeout %.1f->%.1f runtime_budget old=%s new=%s max_pending old=%s new=%s stale_prune old=%s new=%s stale_snapshot_skip=%s precheck_bypass=%s",
             old_controller,
             new_controller,
             old_build,
