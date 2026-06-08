@@ -6,13 +6,17 @@
 # ・global_data / pending_entries に依存しない
 # ・401 / timeout / 切断耐性あり
 # ・起動直後の API TOKEN 未設定にも耐性あり
+# ・401時は token refresh 後に1回だけ再試行
 # ============================================================
 
-import time
-import logging
-import requests
+from __future__ import annotations
+
 import configparser
-from requests.exceptions import ReadTimeout, ConnectionError, HTTPError
+import logging
+import time
+
+import requests
+from requests.exceptions import ConnectionError, HTTPError, ReadTimeout
 
 from kabu_api.api_common import get_headers
 
@@ -34,47 +38,65 @@ PASSWORD = conf.get("aukabu", "password", fallback="")
 # ------------------------------------------------------------
 CANCELABLE_STATES = {1, 2, 3, 4}
 _LAST_TOKEN_WARN_AT = 0.0
+_LAST_401_REFRESH_AT = 0.0
 
 
 # ============================================================
 # API TOKEN 準備確認
 # ============================================================
 
-def _direct_token_fallback():
-    """api_common 経由で取れない時の最後の保険。
+def _sync_global_token(token: str | None) -> None:
+    if not token:
+        return
+    try:
+        from global_state import global_data
+        for name in ("token_value", "API_TOKEN", "api_token", "token", "kabu_api_token"):
+            try:
+                setattr(global_data, name, token)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
-    startup_config.refresh_token_safe が global_data.clear_all の前後で alias を失っても、
-    token_manager.API_TOKEN / settings.ini token から復旧する。
-    """
+
+def _direct_token_fallback():
+    """api_common 経由で取れない時の最後の保険。"""
     try:
         import token_manager
         token = getattr(token_manager, "API_TOKEN", None)
         if not token:
             token = token_manager.get_valid_token()
         if token:
-            try:
-                from global_state import global_data
-                for name in ("token_value", "API_TOKEN", "api_token", "token", "kabu_api_token"):
-                    try:
-                        setattr(global_data, name, token)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            return {"X-API-KEY": str(token), "Content-Type": "application/json"}
+            token = str(token)
+            _sync_global_token(token)
+            return {"X-API-KEY": token, "Content-Type": "application/json"}
     except Exception:
         logger.debug("[FORCE_CANCEL] direct token fallback failed", exc_info=True)
     return None
 
 
-def _safe_get_headers(context):
-    """
-    api_common.get_headers() に token_manager/global_state の待機・復元を任せる。
+def _refresh_headers_after_401(context: str):
+    """401時に token を再取得し、global_data/api_common へ同期する。"""
+    global _LAST_401_REFRESH_AT
+    now = time.time()
+    if now - _LAST_401_REFRESH_AT < 3.0:
+        logger.warning("[FORCE_CANCEL] 401 refresh throttled context=%s", context)
+        return _direct_token_fallback()
+    _LAST_401_REFRESH_AT = now
+    try:
+        import token_manager
+        token = token_manager.refresh_token()
+        if token:
+            token = str(token)
+            _sync_global_token(token)
+            logger.warning("[FORCE_CANCEL] API TOKEN refreshed after 401 context=%s", context)
+            return {"X-API-KEY": token, "Content-Type": "application/json"}
+    except Exception:
+        logger.exception("[FORCE_CANCEL] token refresh after 401 failed context=%s", context)
+    return _direct_token_fallback()
 
-    以前の _has_api_token() は kabu_api.global_data を見ていたが、api_common 側は
-    global_state.global_data を正として使っているため、API token refreshed 後も
-    未準備扱いになることがあった。
-    """
+
+def _safe_get_headers(context):
     global _LAST_TOKEN_WARN_AT
     try:
         return get_headers()
@@ -108,90 +130,88 @@ def cancel_order(order_id):
     if headers is None:
         return False
 
-    payload = {
-        "OrderId": order_id,
-        "Password": PASSWORD,
-    }
+    payload = {"OrderId": order_id, "Password": PASSWORD}
 
-    try:
-        r = requests.put(
-            f"{BASE_URL}/cancelorder",
-            headers=headers,
-            json=payload,
-            timeout=(2, 5),
-        )
-        r.raise_for_status()
-
-        logger.warning(
-            f"[FORCE_CANCEL] order_id={order_id} "
-            f"status={r.status_code} body={r.text}"
-        )
-        return True
-
-    except HTTPError as e:
-        logger.error(
-            f"[FORCE_CANCEL] HTTP error order_id={order_id} "
-            f"status={e.response.status_code if e.response else 'N/A'}"
-        )
-        return False
-
-    except Exception:
-        logger.exception(f"[FORCE_CANCEL] unexpected error order_id={order_id}")
-        return False
+    for attempt in (1, 2):
+        try:
+            r = requests.put(
+                f"{BASE_URL}/cancelorder",
+                headers=headers,
+                json=payload,
+                timeout=(2, 5),
+            )
+            if r.status_code == 401 and attempt == 1:
+                logger.warning("[FORCE_CANCEL] cancel_order got 401 -> refresh token and retry order_id=%s", order_id)
+                headers = _refresh_headers_after_401("cancel_order")
+                if headers is None:
+                    return False
+                continue
+            r.raise_for_status()
+            logger.warning("[FORCE_CANCEL] order_id=%s status=%s body=%s", order_id, r.status_code, r.text)
+            return True
+        except HTTPError as e:
+            logger.error("[FORCE_CANCEL] HTTP error order_id=%s status=%s", order_id, e.response.status_code if e.response else "N/A")
+            return False
+        except Exception:
+            logger.exception("[FORCE_CANCEL] unexpected error order_id=%s", order_id)
+            return False
+    return False
 
 
 # ============================================================
 # kabu API : 注文取得
 # ============================================================
 
+def _parse_orders_response(data):
+    if isinstance(data, dict):
+        return data.get("Orders", []) or data.get("orders", []) or []
+    if isinstance(data, list):
+        return data
+    return []
+
+
 def get_orders():
     headers = _safe_get_headers("get_orders")
     if headers is None:
         return []
 
-    try:
-        r = requests.get(
-            f"{BASE_URL}/orders",
-            headers=headers,          # ★ 認証必須
-            timeout=(2, 5),
-        )
-        r.raise_for_status()
-
-        data = r.json()
-
-        # kabu API は dict / list 両方あり得る
-        if isinstance(data, dict):
-            return data.get("Orders", []) or data.get("orders", []) or []
-        if isinstance(data, list):
-            return data
-
-        return []
-
-    except HTTPError as e:
-        if e.response is not None and e.response.status_code == 401:
-            logger.error("❌ kabu API Unauthorized (401) in get_orders")
-        else:
-            logger.exception("❌ kabu API HTTP error in get_orders")
-        return []
-
-    except ReadTimeout:
-        logger.warning("⚠ kabu API read timeout (get_orders)")
-        return []
-
-    except ConnectionError:
-        logger.warning("⚠ kabu API connection error (get_orders)")
-        return []
-
-    except RuntimeError as e:
-        if "API TOKEN is not set" in str(e):
-            logger.warning("[FORCE_CANCEL] API TOKEN not ready; skip get_orders")
+    for attempt in (1, 2):
+        try:
+            r = requests.get(
+                f"{BASE_URL}/orders",
+                headers=headers,
+                timeout=(2, 5),
+            )
+            if r.status_code == 401 and attempt == 1:
+                logger.warning("[FORCE_CANCEL] get_orders got 401 -> refresh token and retry")
+                headers = _refresh_headers_after_401("get_orders")
+                if headers is None:
+                    return []
+                continue
+            r.raise_for_status()
+            return _parse_orders_response(r.json())
+        except HTTPError as e:
+            if e.response is not None and e.response.status_code == 401:
+                logger.warning("[FORCE_CANCEL] kabu API Unauthorized (401) in get_orders after retry")
+            else:
+                logger.exception("❌ kabu API HTTP error in get_orders")
             return []
-        logger.exception("❌ runtime error in get_orders")
-        return []
-
-    except Exception:
-        logger.exception("❌ unexpected error in get_orders")
-        return []
+        except ReadTimeout:
+            logger.warning("⚠ kabu API read timeout (get_orders)")
+            return []
+        except ConnectionError:
+            logger.warning("⚠ kabu API connection error (get_orders)")
+            return []
+        except RuntimeError as e:
+            if "API TOKEN is not set" in str(e):
+                logger.warning("[FORCE_CANCEL] API TOKEN not ready; skip get_orders")
+                return []
+            logger.exception("❌ runtime error in get_orders")
+            return []
+        except Exception:
+            logger.exception("❌ unexpected error in get_orders")
+            return []
+    return []
 
 
 # ============================================================
@@ -199,7 +219,6 @@ def get_orders():
 # ============================================================
 
 def start_force_cancel_loop(interval_sec=30):
-
     logger.warning("🛑 FORCE CANCEL LOOP START (%ss)", interval_sec)
 
     while True:
@@ -219,20 +238,14 @@ def start_force_cancel_loop(interval_sec=30):
                 if not order_id:
                     continue
 
-                # 指値 & 未約定 & Cancel可能
                 is_limit = price not in (0, None)
                 is_open = qty and cum < qty
                 can_cancel = state in CANCELABLE_STATES
 
                 if is_limit and is_open and can_cancel:
-                    logger.warning(
-                        f"[FORCE_CANCEL] CANCEL "
-                        f"order_id={order_id} state={state} "
-                        f"{cum}/{qty}"
-                    )
+                    logger.warning("[FORCE_CANCEL] CANCEL order_id=%s state=%s %s/%s", order_id, state, cum, qty)
                     cancel_order(order_id)
-                    time.sleep(0.3)  # API 連打防止
-
+                    time.sleep(0.3)
         except Exception:
             logger.exception("[FORCE_CANCEL LOOP ERROR]")
 
