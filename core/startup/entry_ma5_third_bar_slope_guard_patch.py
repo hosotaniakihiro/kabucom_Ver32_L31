@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/entry_ma5_third_bar_slope_guard_patch.py
-# Version: V1-MA5-THIRD-BAR-SLOPE-CONFIRM
+# Version: V2-RANKING-STRONG-FAILOPEN
 # ------------------------------------------------------------
 # BUY:
 #   3分足・5分足で価格がMA5を超えて1本目/2本目では入らず、
@@ -8,6 +8,10 @@
 # SELL:
 #   3分足・5分足で価格がMA5を下抜けて1本目/2本目では入らず、
 #   3本目でMA5傾きがマイナスの時だけ許可する。
+#
+# V2:
+#   - RANKING 強スコア候補は、このガードだけで候補ゼロにしない。
+#   - ただし通常候補/低スコア候補は従来通り MA5 方向確認を維持。
 # ============================================================
 from __future__ import annotations
 
@@ -40,6 +44,16 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
 def _tfs() -> list[int]:
     raw = os.getenv("ENTRY_MA5_THIRD_BAR_REQUIRED_TFS", "3,5")
     out: list[int] = []
@@ -65,15 +79,23 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return float(default)
 
 
-def _symbol_from_item(item: dict[str, Any]) -> str:
+def _row_sources(item: dict[str, Any]):
     try:
         for src in (item, item.get("entry_row"), item.get("entry"), item.get("row")):
             if isinstance(src, dict):
-                s = str(src.get("symbol") or "").strip()
-                if s.endswith(".0"):
-                    s = s[:-2]
-                if s:
-                    return s
+                yield src
+    except Exception:
+        return
+
+
+def _symbol_from_item(item: dict[str, Any]) -> str:
+    try:
+        for src in _row_sources(item):
+            s = str(src.get("symbol") or "").strip()
+            if s.endswith(".0"):
+                s = s[:-2]
+            if s:
+                return s
     except Exception:
         pass
     return ""
@@ -81,14 +103,77 @@ def _symbol_from_item(item: dict[str, Any]) -> str:
 
 def _side_from_item(item: dict[str, Any]) -> str:
     try:
-        for src in (item, item.get("entry_row"), item.get("entry"), item.get("row")):
-            if isinstance(src, dict):
-                s = str(src.get("side") or src.get("entry_decision") or "").strip().upper()
-                if s in {"BUY", "SELL"}:
-                    return s
+        for src in _row_sources(item):
+            s = str(src.get("side") or src.get("entry_decision") or "").strip().upper()
+            if s in {"BUY", "SELL"}:
+                return s
     except Exception:
         pass
     return ""
+
+
+def _source_from_item(item: dict[str, Any]) -> str:
+    try:
+        for src in _row_sources(item):
+            s = str(src.get("source") or src.get("entry_source") or src.get("entry_type") or "").strip().upper()
+            if s:
+                return s
+    except Exception:
+        pass
+    return ""
+
+
+def _score_from_item(item: dict[str, Any]) -> float:
+    keys = (
+        "priority",
+        "pending_score",
+        "score",
+        "final_score",
+        "display_score",
+        "score_total",
+        "total_score",
+    )
+    try:
+        vals = []
+        for src in _row_sources(item):
+            for k in keys:
+                if k in src:
+                    vals.append(abs(_safe_float(src.get(k), 0.0)))
+        return max(vals, default=0.0)
+    except Exception:
+        return 0.0
+
+
+def _ranking_strong_failopen_ok(item: dict[str, Any], diag: dict[str, Any]) -> bool:
+    if not _env_bool("ENTRY_MA5_THIRD_BAR_RANKING_STRONG_FAILOPEN", True):
+        return False
+    source = _source_from_item(item)
+    if "RANKING" not in source:
+        return False
+    score = _score_from_item(item)
+    min_score = _env_float("ENTRY_MA5_THIRD_BAR_RANKING_FAILOPEN_MIN_SCORE", 80.0)
+    if score < min_score:
+        return False
+    # 逆行が極端な場合は維持する。通常の少し遅れたMA5だけなら通す。
+    max_bad_slope_abs = _env_float("ENTRY_MA5_THIRD_BAR_RANKING_MAX_BAD_SLOPE_ABS", 999999.0)
+    try:
+        bad_slopes = []
+        for c in diag.get("checks", []) or []:
+            if isinstance(c, dict) and c.get("ok") is False:
+                bad_slopes.append(abs(_safe_float(c.get("ma5_slope"), 0.0)))
+        if bad_slopes and max(bad_slopes) > max_bad_slope_abs:
+            return False
+    except Exception:
+        pass
+    logger.warning(
+        "[ENTRY MA5 THIRD BAR GUARD] RANKING_STRONG_FAILOPEN symbol=%s side=%s score=%.3f min_score=%.3f diag=%s",
+        diag.get("symbol"),
+        diag.get("side"),
+        score,
+        min_score,
+        diag,
+    )
+    return True
 
 
 def _latest_rows_for_symbol(tf: int, symbol: str):
@@ -151,7 +236,11 @@ def _passes_ma5_guard(item: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
             continue
         seen += 1
         if not ok:
-            return False, {"symbol": symbol, "side": side, "checks": checks, "reason": "ma5_third_bar_slope_ng"}
+            out = {"symbol": symbol, "side": side, "checks": checks, "reason": "ma5_third_bar_slope_ng"}
+            if _ranking_strong_failopen_ok(item, out):
+                out["reason"] = "ma5_third_bar_ranking_strong_failopen"
+                return True, out
+            return False, out
     if seen <= 0:
         if _env_bool("ENTRY_MA5_THIRD_BAR_FAIL_OPEN", True):
             return True, {"symbol": symbol, "side": side, "checks": checks, "reason": "no_tf_data_fail_open"}
@@ -188,7 +277,7 @@ def install() -> bool:
     try:
         import trading.handlers.entry_controller as ec
         cur = getattr(ec, "_build_scored_candidates", None)
-        if getattr(cur, "_entry_ma5_third_bar_guard_v1", False):
+        if getattr(cur, "_entry_ma5_third_bar_guard_v2", False):
             _INSTALLED = True
             return True
         original = getattr(cur, "_original", None) if callable(cur) else None
@@ -199,11 +288,21 @@ def install() -> bool:
         else:
             logger.warning("[ENTRY MA5 THIRD BAR GUARD] target missing")
             return False
+        _patched_build_scored_candidates._entry_ma5_third_bar_guard_v2 = True  # type: ignore[attr-defined]
         _patched_build_scored_candidates._entry_ma5_third_bar_guard_v1 = True  # type: ignore[attr-defined]
         _patched_build_scored_candidates._original = _ORIG_BUILD  # type: ignore[attr-defined]
         ec._build_scored_candidates = _patched_build_scored_candidates
         _INSTALLED = True
-        logger.warning("[ENTRY MA5 THIRD BAR GUARD] installed v1 enabled=%s tfs=%s min_bars=%s fail_open=%s", _env_bool("ENTRY_MA5_THIRD_BAR_SLOPE_GUARD_ENABLED", True), _tfs(), _env_int("ENTRY_MA5_THIRD_BAR_MIN_BARS", 3), _env_bool("ENTRY_MA5_THIRD_BAR_FAIL_OPEN", True))
+        logger.warning(
+            "[ENTRY MA5 THIRD BAR GUARD] installed v2 enabled=%s tfs=%s min_bars=%s fail_open=%s ranking_strong_failopen=%s min_score=%.2f max_bad_slope_abs=%.3f",
+            _env_bool("ENTRY_MA5_THIRD_BAR_SLOPE_GUARD_ENABLED", True),
+            _tfs(),
+            _env_int("ENTRY_MA5_THIRD_BAR_MIN_BARS", 3),
+            _env_bool("ENTRY_MA5_THIRD_BAR_FAIL_OPEN", True),
+            _env_bool("ENTRY_MA5_THIRD_BAR_RANKING_STRONG_FAILOPEN", True),
+            _env_float("ENTRY_MA5_THIRD_BAR_RANKING_FAILOPEN_MIN_SCORE", 80.0),
+            _env_float("ENTRY_MA5_THIRD_BAR_RANKING_MAX_BAD_SLOPE_ABS", 999999.0),
+        )
         return True
     except Exception:
         logger.exception("[ENTRY MA5 THIRD BAR GUARD] install failed")
