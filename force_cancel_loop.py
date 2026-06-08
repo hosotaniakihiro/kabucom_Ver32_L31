@@ -33,11 +33,39 @@ PASSWORD = conf.get("aukabu", "password", fallback="")
 # 1=Received, 2=Accepted, 3=Working, 4=PartiallyContracted
 # ------------------------------------------------------------
 CANCELABLE_STATES = {1, 2, 3, 4}
+_LAST_TOKEN_WARN_AT = 0.0
 
 
 # ============================================================
 # API TOKEN 準備確認
 # ============================================================
+
+def _direct_token_fallback():
+    """api_common 経由で取れない時の最後の保険。
+
+    startup_config.refresh_token_safe が global_data.clear_all の前後で alias を失っても、
+    token_manager.API_TOKEN / settings.ini token から復旧する。
+    """
+    try:
+        import token_manager
+        token = getattr(token_manager, "API_TOKEN", None)
+        if not token:
+            token = token_manager.get_valid_token()
+        if token:
+            try:
+                from global_state import global_data
+                for name in ("token_value", "API_TOKEN", "api_token", "token", "kabu_api_token"):
+                    try:
+                        setattr(global_data, name, token)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            return {"X-API-KEY": str(token), "Content-Type": "application/json"}
+    except Exception:
+        logger.debug("[FORCE_CANCEL] direct token fallback failed", exc_info=True)
+    return None
+
 
 def _safe_get_headers(context):
     """
@@ -47,14 +75,26 @@ def _safe_get_headers(context):
     global_state.global_data を正として使っているため、API token refreshed 後も
     未準備扱いになることがあった。
     """
+    global _LAST_TOKEN_WARN_AT
     try:
         return get_headers()
     except RuntimeError as e:
         if "API TOKEN is not set" in str(e):
-            logger.warning("[FORCE_CANCEL] API TOKEN not ready; skip %s", context)
+            headers = _direct_token_fallback()
+            if headers is not None:
+                logger.warning("[FORCE_CANCEL] API TOKEN restored by direct fallback context=%s", context)
+                return headers
+            now = time.time()
+            if now - _LAST_TOKEN_WARN_AT >= 5.0:
+                logger.warning("[FORCE_CANCEL] API TOKEN not ready; skip %s", context)
+                _LAST_TOKEN_WARN_AT = now
             return None
         raise
     except Exception:
+        headers = _direct_token_fallback()
+        if headers is not None:
+            logger.warning("[FORCE_CANCEL] API TOKEN restored after get_headers error context=%s", context)
+            return headers
         logger.exception("[FORCE_CANCEL] get_headers failed; skip %s", context)
         return None
 
