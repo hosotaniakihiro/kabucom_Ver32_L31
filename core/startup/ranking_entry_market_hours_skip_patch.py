@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 _DONE = False
 _SCHEDULER_STALE_PATCHED = False
 _TASK_STALE_PATCHED = False
+_COMPANION_PATCHED = False
 
 _TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 
@@ -39,6 +40,33 @@ def _in_session(now=None):
     now = now or dt.datetime.now()
     t = now.time()
     return (dt.time(9, 0) <= t <= dt.time(11, 30)) or (dt.time(12, 30) <= t <= dt.time(15, 30))
+
+
+def _install_companion_patches() -> bool:
+    """
+    この patch は sitecustomize から確実に install されるため、
+    token互換と ranking DB empty fallback もここから連鎖 install する。
+    """
+    global _COMPANION_PATCHED
+    ok_any = False
+    try:
+        from core.startup import kabu_api_token_runtime_patch as token_patch
+        ok = bool(token_patch.install())
+        ok_any = ok_any or ok
+    except Exception:
+        logger.debug("[RANKING ENTRY MARKET HOURS SKIP] companion token patch skipped", exc_info=True)
+
+    try:
+        from core.startup import ranking_entry_push_fallback_patch as push_fb
+        ok = bool(push_fb.install())
+        ok_any = ok_any or ok
+    except Exception:
+        logger.debug("[RANKING ENTRY MARKET HOURS SKIP] companion push fallback patch skipped", exc_info=True)
+
+    if ok_any and not _COMPANION_PATCHED:
+        logger.warning("[RANKING ENTRY MARKET HOURS SKIP] companion patches installed token/push_fallback ok_any=%s", ok_any)
+    _COMPANION_PATCHED = _COMPANION_PATCHED or ok_any
+    return ok_any
 
 
 def _run_with_watchdog(orig) -> Any:
@@ -277,6 +305,7 @@ def _install_scheduler_stale_running_clear() -> bool:
 
 def _patch_once():
     try:
+        companion_ok = _install_companion_patches()
         import trading.entry_exit.tasks as tasks
 
         task_ok = _install_task_stale_running_clear()
@@ -295,6 +324,7 @@ def _patch_once():
             if not _in_session(now):
                 logger.warning("[RANKING ENTRY MARKET HOURS SKIP] skip outside session now=%s", now.strftime("%Y-%m-%d %H:%M:%S"))
                 return 0
+            _install_companion_patches()
             _clear_task_running_if_stale("RANKING")
             return _run_with_watchdog(orig)
 
@@ -302,10 +332,11 @@ def _patch_once():
         patched._original = orig  # type: ignore[attr-defined]
         tasks._run_ranking_entry_safe = patched
         logger.warning(
-            "[RANKING ENTRY MARKET HOURS SKIP] patched _run_ranking_entry_safe watchdog=%s timeout=%.1fs task_stale_clear=%s",
+            "[RANKING ENTRY MARKET HOURS SKIP] patched _run_ranking_entry_safe watchdog=%s timeout=%.1fs task_stale_clear=%s companion=%s",
             _env_bool("RANKING_ENTRY_WATCHDOG_ENABLED", True),
             _env_float("RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC", 55.0),
             task_ok,
+            companion_ok,
         )
         return True
     except Exception:
@@ -315,11 +346,12 @@ def _patch_once():
 
 def _watch():
     for i in range(240):
+        companion_ok = _install_companion_patches()
         ok = _patch_once()
         stale_ok = _install_scheduler_stale_running_clear()
         task_ok = _install_task_stale_running_clear()
         if i in (0, 1, 5, 15, 30, 60, 120, 239):
-            logger.warning("[RANKING ENTRY MARKET HOURS SKIP] enforce ok=%s stale_clear_ok=%s task_clear_ok=%s", ok, stale_ok, task_ok)
+            logger.warning("[RANKING ENTRY MARKET HOURS SKIP] enforce ok=%s stale_clear_ok=%s task_clear_ok=%s companion_ok=%s", ok, stale_ok, task_ok, companion_ok)
         time.sleep(0.5)
 
 
@@ -332,6 +364,9 @@ def install():
     os.environ.setdefault("RANKING_ENTRY_SCHEDULER_STALE_SEC", "75")
     os.environ.setdefault("TONOSAMA_ENTRY_TASK_STALE_SEC", "60")
     os.environ.setdefault("RANKING_ENTRY_TASK_STALE_SEC", "75")
+    os.environ.setdefault("RANKING_ENTRY_PUSH_SUMMARY_FALLBACK_ENABLED", "1")
+    os.environ.setdefault("RANKING_PUSH_FALLBACK_MAX_ROWS", "80")
+    companion_ok = _install_companion_patches()
     stale_ok = _install_scheduler_stale_running_clear()
     task_ok = _install_task_stale_running_clear()
     if _DONE:
@@ -339,7 +374,7 @@ def install():
     ok = _patch_once()
     threading.Thread(target=_watch, name="ranking-entry-market-hours-skip", daemon=True).start()
     _DONE = True
-    logger.warning("[RANKING ENTRY MARKET HOURS SKIP] installed ok=%s stale_clear_ok=%s task_clear_ok=%s watcher=True", ok, stale_ok, task_ok)
+    logger.warning("[RANKING ENTRY MARKET HOURS SKIP] installed ok=%s stale_clear_ok=%s task_clear_ok=%s companion_ok=%s watcher=True", ok, stale_ok, task_ok, companion_ok)
     return True
 
 
