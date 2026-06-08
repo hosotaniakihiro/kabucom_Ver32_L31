@@ -1,14 +1,15 @@
 # ============================================================
 # File   : core/startup/summary_ai_more_candidates_patch.py
-# Version: Ver1.1-SUMMARY-AI-MORE-CANDIDATES-WITH-CONTROLLER-ENRICH
+# Version: Ver1.2-SUMMARY-AI-FINAL-GATE-RELAX
 # ------------------------------------------------------------
 # 【目的】
 #   AIに「もっとエントリーできるか」を確認させるため、
 #   SUMMARY_AI runner へ渡す候補数を起動時に拡張する。
 #
-# 【Ver1.1 追加】
-#   - summary_controller_enrich_runtime_patch を同時に install
-#   - 表示/保存/AI前の df_latest に ranking / daily MTF を付与する
+# Ver1.2:
+#   - SUMMARY_AI / TONOSAMA の upstream 承認済み候補が、entry_controller の
+#     BUY score>=5.0 旧閾値だけで最終落ちする問題を防ぐため、
+#     entry_controller_final_gate_relax_patch を同時 install。
 # ============================================================
 
 from __future__ import annotations
@@ -54,11 +55,23 @@ def _install_controller_enrich_patch() -> bool:
         return False
 
 
+def _install_final_gate_relax_patch() -> bool:
+    try:
+        from core.startup.entry_controller_final_gate_relax_patch import install as install_relax
+        ok = bool(install_relax())
+        logger.warning("[SUMMARY AI MORE CANDIDATES PATCH] entry_controller_final_gate_relax_patch installed=%s", ok)
+        return ok
+    except Exception:
+        logger.exception("[SUMMARY AI MORE CANDIDATES PATCH] entry_controller_final_gate_relax_patch install failed")
+        return False
+
+
 def install() -> bool:
     global _INSTALLED
 
     # summary_controller 側の補強は、このpatchが既に入っていても再install確認する。
     _install_controller_enrich_patch()
+    _install_final_gate_relax_patch()
 
     if _INSTALLED:
         logger.warning("[SUMMARY AI MORE CANDIDATES PATCH] already installed")
@@ -92,7 +105,7 @@ def install() -> bool:
             logger.error("[SUMMARY AI MORE CANDIDATES PATCH] runner.run_summary_ai_entry_from_df not callable")
             return False
 
-        if getattr(original, "_summary_ai_more_candidates_v1", False):
+        if getattr(original, "_summary_ai_more_candidates_v12", False):
             _INSTALLED = True
             return True
 
@@ -120,18 +133,18 @@ def install() -> bool:
             return original(*args, **kwargs)
 
         _wrapped_run_summary_ai_entry_from_df._summary_ai_more_candidates_v1 = True  # type: ignore[attr-defined]
+        _wrapped_run_summary_ai_entry_from_df._summary_ai_more_candidates_v12 = True  # type: ignore[attr-defined]
         _wrapped_run_summary_ai_entry_from_df._original = original  # type: ignore[attr-defined]
         runner.run_summary_ai_entry_from_df = _wrapped_run_summary_ai_entry_from_df
 
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY AI MORE CANDIDATES PATCH] installed top_n=%s tonosama_max=%s bypass_slope=%s",
+            "[SUMMARY AI MORE CANDIDATES PATCH] installed top_n=%s tonosama_max=%s bypass_slope=%s final_gate_relax=True",
             top_n,
             tonosama_max,
             bypass_slope,
         )
         return True
-
     except Exception:
         logger.exception("[SUMMARY AI MORE CANDIDATES PATCH] install failed")
         return False
