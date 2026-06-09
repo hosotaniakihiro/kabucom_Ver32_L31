@@ -135,21 +135,25 @@ if _is_main_py():
         "AUTOSTOCK_MAIN_SKIP_TONOSAMA_ENTRY": "0",
         "AUTOSTOCK_MAIN_SKIP_SUMMARY_PUSH_BG": "0",
         "AUTOSTOCK_MAIN_SKIP_RANKING_SUMMARY_SCHEDULE": "0",
+        "AUTOSTOCK_MAIN_SKIP_SUMMARY_PARENT_TICK": "0",
+        "AUTOSTOCK_MAIN_SKIP_EXIT_LOOP_WHEN_BROKER_EMPTY": "0",
         "AUTOSTOCK_MAIN_ENABLE_EXIT_LOOP": "1",
         "AUTOSTOCK_MAIN_ENABLE_RANKING_ENTRY": "1",
         "AUTOSTOCK_MAIN_ENABLE_TONOSAMA_ENTRY": "1",
         "AUTOSTOCK_MAIN_ENABLE_SUMMARY_AI_ENTRY": "1",
         "AUTOSTOCK_MAIN_ENABLE_SUMMARY_PARENT_TICK": "1",
         "AUTOSTOCK_MAIN_ENABLE_RANKING_SUMMARY_SCHEDULE": "1",
+        "FORCE_ENABLE_MAIN_SUMMARY_PARENT_TICK": "1",
     }.items():
         _env_default(k, v)
     logger.warning(
-        "[USERCUSTOMIZE] main restore defaults mode=%s exit=%s ranking=%s tonosama=%s summary_ai=%s",
+        "[USERCUSTOMIZE] main restore defaults mode=%s exit=%s ranking=%s tonosama=%s summary_ai=%s summary_parent=%s",
         os.getenv("AUTOSTOCK_MAIN_OPERATION_MODE"),
         os.getenv("AUTOSTOCK_MAIN_ENABLE_EXIT_LOOP"),
         os.getenv("AUTOSTOCK_MAIN_ENABLE_RANKING_ENTRY"),
         os.getenv("AUTOSTOCK_MAIN_ENABLE_TONOSAMA_ENTRY"),
         os.getenv("AUTOSTOCK_MAIN_ENABLE_SUMMARY_AI_ENTRY"),
+        os.getenv("AUTOSTOCK_MAIN_ENABLE_SUMMARY_PARENT_TICK"),
     )
 
 os.environ["ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"] = "1"
