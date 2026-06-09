@@ -1,11 +1,13 @@
 # ============================================================
-# token_manager.py（Ver25-API-SETTINGS-CANDIDATES）
+# token_manager.py（Ver26-API-PASSWORD-CACHE-SAFE-REFRESH）
 # ------------------------------------------------------------
 # ・main.py / startup.py から安全に import RefreshToken が可能
 # ・循環importなし
 # ・プロジェクト共通 settings.ini に [trade] だけがある場合でも停止しない
 # ・[aukabu] / [kabusapi] を含む設定ファイルを候補から順に探す
-# ・token 保存は API セクションが見つかった設定ファイルへ行う
+# ・startup_config から渡された apipassword をメモリキャッシュし、
+#   force_cancel_loop などの 401 後 refresh_token() 引数なし呼び出しでも再利用する
+# ・token 保存は API セクションが見つかった設定ファイルへだけ行う
 # ============================================================
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from pathlib import Path
 API_URL = "http://localhost:18080/kabusapi"
 CONFIG_PATH = "settings.ini"  # backward compatible default name
 API_TOKEN = None
+API_PASSWORD = None
 _CONFIG_FILE_PATH: str | None = None
 
 
@@ -51,7 +54,13 @@ def _config_candidates() -> list[Path]:
     out: list[Path] = []
 
     # Explicit API config path has highest priority.
-    for env_name in ("KABUSAPI_SETTING_INI", "AUKABU_SETTING_INI", "KABU_API_SETTING_INI", "SETTING_INI_PATH", "KABU_SETTING_INI"):
+    for env_name in (
+        "KABUSAPI_SETTING_INI",
+        "AUKABU_SETTING_INI",
+        "KABU_API_SETTING_INI",
+        "SETTING_INI_PATH",
+        "KABU_SETTING_INI",
+    ):
         v = os.getenv(env_name)
         if v:
             out.append(Path(v))
@@ -93,6 +102,15 @@ def _get_section(conf: ConfigParser) -> str | None:
     return None
 
 
+def _diagnostic(conf: ConfigParser) -> tuple[str, str]:
+    try:
+        existing = conf.get("__diagnostic__", "existing_files", fallback="")
+        tried = conf.get("__diagnostic__", "tried", fallback="")
+        return existing, tried
+    except Exception:
+        return "", ""
+
+
 # ============================================================
 # 設定ファイル読込
 # ============================================================
@@ -114,11 +132,14 @@ def _load_settings() -> ConfigParser:
             continue
 
     # APIセクションが無い場合でも、互換のため空ConfigParserを返す。
-    # _require_section() が分かりやすいエラーを出す。
+    # refresh_token(apipassword=...) はこの状態でも実行できる。
     conf = ConfigParser()
     _CONFIG_FILE_PATH = None
     tried = [str(p) for p in _config_candidates()]
-    conf["__diagnostic__"] = {"existing_files": " | ".join(last_existing), "tried": " | ".join(tried)}
+    conf["__diagnostic__"] = {
+        "existing_files": " | ".join(last_existing),
+        "tried": " | ".join(tried),
+    }
     return conf
 
 
@@ -126,13 +147,7 @@ def _require_section(conf: ConfigParser) -> str:
     sec = _get_section(conf)
     if sec:
         return sec
-    existing = ""
-    tried = ""
-    try:
-        existing = conf.get("__diagnostic__", "existing_files", fallback="")
-        tried = conf.get("__diagnostic__", "tried", fallback="")
-    except Exception:
-        pass
+    existing, tried = _diagnostic(conf)
     raise ValueError(
         "[aukabu] or [kabusapi] があるAPI設定ファイルが見つかりません。"
         " settings.ini は [trade] 用に使えるため、API認証は settings.local.ini / kabusapi.ini / aukabu.ini "
@@ -141,38 +156,78 @@ def _require_section(conf: ConfigParser) -> str:
     )
 
 
+def _resolve_apipassword(conf: ConfigParser, sec: str | None, apipassword=None) -> str | None:
+    """startup_config が渡した apipassword をキャッシュし、後続の refresh_token() でも再利用する。"""
+    global API_PASSWORD
+
+    if apipassword:
+        API_PASSWORD = str(apipassword)
+        return API_PASSWORD
+
+    if API_PASSWORD:
+        return str(API_PASSWORD)
+
+    if sec:
+        try:
+            v = conf.get(sec, "apipassword", fallback=None)
+            if v:
+                API_PASSWORD = str(v)
+                return API_PASSWORD
+        except Exception:
+            pass
+
+    for env_name in (
+        "KABUSAPI_APIPASSWORD",
+        "AUKABU_APIPASSWORD",
+        "KABU_API_PASSWORD",
+        "KABUSAPI_PASSWORD",
+    ):
+        v = os.getenv(env_name)
+        if v:
+            API_PASSWORD = str(v)
+            return API_PASSWORD
+
+    return None
+
+
 # ============================================================
 # Token 保存
 # ============================================================
-def _save_token(token):
+def _save_token(token) -> bool:
+    """APIセクションが見つかる場合だけ token を保存する。trade-only settings.ini では失敗させない。"""
     conf = _load_settings()
-    sec = _require_section(conf)
+    sec = _get_section(conf)
+    if not sec:
+        return False
 
     conf.set(sec, "token", token)
     path = _CONFIG_FILE_PATH or CONFIG_PATH
     with open(path, "w", encoding="utf-8") as f:
         conf.write(f)
+    return True
 
 
 # ============================================================
 # Token 再取得
 # ============================================================
 def refresh_token(apipassword=None):
-    global API_TOKEN
+    global API_TOKEN, API_PASSWORD
 
     conf = _load_settings()
-    sec = _require_section(conf)
+    sec = _get_section(conf)
+    api_password = _resolve_apipassword(conf, sec, apipassword)
 
-    if apipassword is None:
-        apipassword = conf.get(sec, "apipassword", fallback=None)
-
-    if not apipassword:
-        raise ValueError(f"API設定ファイルに apipassword がありません path={_CONFIG_FILE_PATH} section={sec}")
+    if not api_password:
+        existing, tried = _diagnostic(conf)
+        raise ValueError(
+            "API設定ファイルに apipassword がありません。"
+            f" path={_CONFIG_FILE_PATH} section={sec} existing={existing} tried={tried}"
+        )
 
     url = f"{API_URL}/token"
     headers = {"Content-Type": "application/json"}
 
-    data = json.dumps({"APIPassword": apipassword}).encode()
+    data = json.dumps({"APIPassword": api_password}).encode()
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
 
     with urllib.request.urlopen(req, timeout=5) as res:
@@ -184,7 +239,14 @@ def refresh_token(apipassword=None):
         raise ValueError("token を取得できませんでした")
 
     API_TOKEN = token
-    _save_token(token)
+    API_PASSWORD = str(api_password)
+
+    # API ini がある場合だけ保存。無い構成でも 401 後リカバリは成功させる。
+    try:
+        _save_token(token)
+    except Exception:
+        # 保存失敗で runtime token refresh 自体を失敗させない。
+        pass
 
     return token
 
