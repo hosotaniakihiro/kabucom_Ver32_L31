@@ -1,36 +1,20 @@
 # ============================================================
 # File   : core/startup/main_disable_exit_loop_schedule_patch.py
-# Version: V3-MAIN-STAGED-ENTRY-EXIT-SCHEDULE
+# Version: V4-MAIN-STAGED-ENTRY-EXIT-SCHEDULE-FULL-DEFAULT
 # ------------------------------------------------------------
 # Purpose:
-#   main.py 起動安定化用。
+#   main.py の entry/exit schedule job を段階復帰スイッチで制御する。
 #
-#   関数内の skip/preflight は通常効くが、schedule dispatch直後や
-#   job thread start直後、skipログ前に Windows 0xC0000006 で落ちるケースがある。
-#   そのため main.py では DB/cache参照へ進み得る schedule job を
-#   段階復帰スイッチで制御する。
-#
-# V3 staged restore:
-#   default mode = entry_only
-#
-#   entry_only:
-#     - entry/order の軽量基盤は残す
-#     - exit_loop_5s は止める
-#     - ranking_entry / tonosama_entry / summary_ai は止める
-#
-#   entry_exit:
-#     - exit_loop_5s を戻す
-#     - ranking/tonosama/summary_ai はまだ止める
-#
-#   full:
-#     - ranking/tonosama/summary_ai も戻す
+# V4:
+#   デフォルトを full に戻す。
+#   entry / exit_loop_5s / ranking_entry / tonosama_entry を通常復帰する。
+#   不安定時だけ AUTOSTOCK_MAIN_OPERATION_MODE=entry_only で安全モードへ戻す。
 #
 # ENV:
-#   AUTOSTOCK_MAIN_OPERATION_MODE=entry_only|entry_exit|full
-#   AUTOSTOCK_MAIN_ENABLE_EXIT_LOOP=1
-#   AUTOSTOCK_MAIN_ENABLE_RANKING_ENTRY=1
-#   AUTOSTOCK_MAIN_ENABLE_TONOSAMA_ENTRY=1
-#   AUTOSTOCK_MAIN_ENABLE_SUMMARY_AI_ENTRY=1
+#   AUTOSTOCK_MAIN_OPERATION_MODE=full|entry_exit|entry_only
+#   AUTOSTOCK_MAIN_ENABLE_EXIT_LOOP=0/1
+#   AUTOSTOCK_MAIN_ENABLE_RANKING_ENTRY=0/1
+#   AUTOSTOCK_MAIN_ENABLE_TONOSAMA_ENTRY=0/1
 # ============================================================
 from __future__ import annotations
 
@@ -59,9 +43,9 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def _mode() -> str:
     try:
-        return str(os.getenv("AUTOSTOCK_MAIN_OPERATION_MODE", "entry_only") or "entry_only").strip().lower()
+        return str(os.getenv("AUTOSTOCK_MAIN_OPERATION_MODE", "full") or "full").strip().lower()
     except Exception:
-        return "entry_only"
+        return "full"
 
 
 def _is_main_py_process() -> bool:
@@ -75,7 +59,7 @@ def _allow_exit() -> bool:
     if not _is_main_py_process():
         return True
     if _mode() in {"entry_exit", "full", "all"}:
-        return True
+        return _env_bool("AUTOSTOCK_MAIN_ENABLE_EXIT_LOOP", True)
     return _env_bool("AUTOSTOCK_MAIN_ENABLE_EXIT_LOOP", False)
 
 
@@ -83,7 +67,7 @@ def _allow_ranking_entry() -> bool:
     if not _is_main_py_process():
         return True
     if _mode() in {"full", "all"}:
-        return True
+        return _env_bool("AUTOSTOCK_MAIN_ENABLE_RANKING_ENTRY", True)
     return _env_bool("AUTOSTOCK_MAIN_ENABLE_RANKING_ENTRY", False)
 
 
@@ -91,7 +75,7 @@ def _allow_tonosama_entry() -> bool:
     if not _is_main_py_process():
         return True
     if _mode() in {"full", "all"}:
-        return True
+        return _env_bool("AUTOSTOCK_MAIN_ENABLE_TONOSAMA_ENTRY", True)
     return _env_bool("AUTOSTOCK_MAIN_ENABLE_TONOSAMA_ENTRY", False)
 
 
@@ -125,7 +109,7 @@ def _disable_tonosama_entry() -> bool:
 def _noop_exit_loop(*args, **kwargs):
     logger.info(
         "[MAIN STAGED ENTRY/EXIT SCHEDULE] skipped exit_loop_5s in main.py mode=%s. "
-        "Set AUTOSTOCK_MAIN_OPERATION_MODE=entry_exit or AUTOSTOCK_MAIN_ENABLE_EXIT_LOOP=1 to restore.",
+        "Set AUTOSTOCK_MAIN_OPERATION_MODE=entry_exit/full or AUTOSTOCK_MAIN_ENABLE_EXIT_LOOP=1 to restore.",
         _mode(),
     )
     return None
@@ -283,7 +267,7 @@ def install() -> bool:
 
     _INSTALLED = True
     logger.warning(
-        "[MAIN STAGED ENTRY/EXIT SCHEDULE] installed v3 main_py=%s mode=%s disable_exit=%s disable_ranking=%s disable_tonosama=%s changed=%s scanned_jobs=%s removed_jobs=%s replaced_jobs=%s",
+        "[MAIN STAGED ENTRY/EXIT SCHEDULE] installed v4 main_py=%s mode=%s disable_exit=%s disable_ranking=%s disable_tonosama=%s changed=%s scanned_jobs=%s removed_jobs=%s replaced_jobs=%s",
         _is_main_py_process(),
         _mode(),
         _disable_exit(),
