@@ -38,6 +38,13 @@ def _env_bool(name: str, default: bool = False) -> bool:
         return bool(default)
 
 
+def _operation_mode() -> str:
+    try:
+        return str(os.getenv('AUTOSTOCK_MAIN_OPERATION_MODE', 'full') or 'full').strip().lower()
+    except Exception:
+        return 'full'
+
+
 def _is_main_py_process() -> bool:
     try:
         return Path(sys.argv[0]).name.lower() == 'main.py'
@@ -47,19 +54,14 @@ def _is_main_py_process() -> bool:
 
 def _main_skip_tonosama_entry() -> bool:
     """
-    main.py は entry/exit 側プロセスとして起動継続を優先する。
-
-    2026-06-09 の 0xC0000006 連続停止では、PUSH/summary/ranking/exit のNAS直読を
-    順次止めた後、最後に tags:entry,tonosama_entry の dispatch 直後で落ちた。
-    TONOSAMA builder は PUSH/summary/ranking/5秒足/履歴へフォールバックしやすく、
-    NAS SQLite 不安定時に main.py を巻き込むため、既定では main.py で実行しない。
-
-    main_database.py / 専用プロセスでTONOSAMAを動かす場合はそちらで実行する。
-    どうしても main.py で戻す場合だけ AUTOSTOCK_MAIN_SKIP_TONOSAMA_ENTRY=0 を指定する。
+    entry_only 安全モード時だけ main.py の TONOSAMA builder を止める。
+    V7: デフォルト full 復帰。AUTOSTOCK_MAIN_SKIP_TONOSAMA_ENTRY を明示した場合のみ優先。
     """
     if not _is_main_py_process():
         return False
-    return _env_bool('AUTOSTOCK_MAIN_SKIP_TONOSAMA_ENTRY', True)
+    if os.getenv('AUTOSTOCK_MAIN_SKIP_TONOSAMA_ENTRY') is not None:
+        return _env_bool('AUTOSTOCK_MAIN_SKIP_TONOSAMA_ENTRY', False)
+    return _operation_mode() not in {'full', 'all'} and not _env_bool('AUTOSTOCK_MAIN_ENABLE_TONOSAMA_ENTRY', False)
 
 
 def _source(entry: Any) -> str:
@@ -119,14 +121,6 @@ def _is_entry_time_now() -> bool:
 
 
 def _mark_and_prune_stuck_tonosama_pending() -> int:
-    """
-    ATR/RANGE等で落ち続けるTONOSAMA pendingは、pending_existsループにより
-    新規TONOSAMA候補生成を止める。ここで一定回数以上再評価済みの候補を掃除する。
-
-    v5:
-      - pending 1件では builder を止めない。max_pending到達時だけ controller-only。
-      - stale pending は最短20秒、最大90秒で掃除し、次候補生成へ戻す。
-    """
     max_retry = max(1, _env_int('TONOSAMA_STUCK_PENDING_MAX_CONTROLLER_RETRY', 2))
     min_age_sec = max(5.0, _env_float('TONOSAMA_STUCK_PENDING_MIN_AGE_SEC', 20.0))
     max_age_sec = max(min_age_sec, _env_float('TONOSAMA_STUCK_PENDING_MAX_AGE_SEC', 90.0))
@@ -201,15 +195,16 @@ def _patch_once() -> bool:
         cur = getattr(tasks, '_run_tonosama_entry_safe', None)
         if not callable(cur):
             return False
-        if getattr(cur, '_tonosama_skip_build_when_pending_exists_v6', False):
+        if getattr(cur, '_tonosama_skip_build_when_pending_exists_v7', False):
             return True
         orig = getattr(cur, '_original', cur)
 
         def patched():
             if _main_skip_tonosama_entry():
                 logger.warning(
-                    '[TONOSAMA SKIP BUILD WHEN PENDING EXISTS] main.py skip tonosama entry job to avoid NAS DB/cache read. '
-                    'Set AUTOSTOCK_MAIN_SKIP_TONOSAMA_ENTRY=0 to restore legacy behavior.'
+                    '[TONOSAMA SKIP BUILD WHEN PENDING EXISTS] main.py skip tonosama entry job mode=%s. '
+                    'Set AUTOSTOCK_MAIN_OPERATION_MODE=full or AUTOSTOCK_MAIN_SKIP_TONOSAMA_ENTRY=0 to restore.',
+                    _operation_mode(),
                 )
                 return 0
 
@@ -227,7 +222,6 @@ def _patch_once() -> bool:
                     logger.warning('[TONOSAMA SKIP BUILD WHEN PENDING EXISTS] pending=%s but market/lunch closed -> keep pending and skip controller dispatch', cnt)
                     return 0
 
-                # pending枠が残っている間は新規候補生成を止めない。
                 if cnt < max_pending:
                     logger.warning('[TONOSAMA SKIP BUILD WHEN PENDING EXISTS] pending=%s/%s -> run builder to keep rotation', cnt, max_pending)
                     return orig()
@@ -247,9 +241,10 @@ def _patch_once() -> bool:
         patched._tonosama_skip_build_when_pending_exists_v4 = True
         patched._tonosama_skip_build_when_pending_exists_v5 = True
         patched._tonosama_skip_build_when_pending_exists_v6 = True
+        patched._tonosama_skip_build_when_pending_exists_v7 = True
         patched._original = orig
         tasks._run_tonosama_entry_safe = patched
-        logger.warning('[TONOSAMA SKIP BUILD WHEN PENDING EXISTS] patched _run_tonosama_entry_safe v6 market_guard=True stuck_prune=True room_build=True main_skip=%s', _main_skip_tonosama_entry())
+        logger.warning('[TONOSAMA SKIP BUILD WHEN PENDING EXISTS] patched _run_tonosama_entry_safe v7 market_guard=True stuck_prune=True room_build=True main_skip=%s mode=%s', _main_skip_tonosama_entry(), _operation_mode())
         return True
     except Exception:
         logger.exception('[TONOSAMA SKIP BUILD WHEN PENDING EXISTS] patch failed')
@@ -259,27 +254,25 @@ def _patch_once() -> bool:
 def _watch():
     for i in range(120):
         ok = _patch_once()
-        if i in (0, 1, 5, 15, 30, 60, 119):
-            logger.warning('[TONOSAMA SKIP BUILD WHEN PENDING EXISTS] enforce ok=%s market_guard=True stuck_prune=True v6 max_pending=%s main_skip=%s', ok, os.environ.get('TONOSAMA_MAX_PENDING_PER_LOOP'), _main_skip_tonosama_entry())
-        time.sleep(0.5)
+        if i in (0, 1, 5, 30, 119):
+            logger.warning('[TONOSAMA SKIP BUILD WHEN PENDING EXISTS] enforce ok=%s market_guard=True stuck_prune=True v7 max_pending=%s main_skip=%s mode=%s', ok, _max_pending(), _main_skip_tonosama_entry(), _operation_mode())
+        time.sleep(2.0)
 
 
 def install() -> bool:
     global _DONE
     if _DONE:
-        return _patch_once()
-    os.environ.setdefault('AUTOSTOCK_MAIN_SKIP_TONOSAMA_ENTRY', '1')
-    os.environ.setdefault('TONOSAMA_MAX_PENDING_PER_LOOP', '2')
-    os.environ.setdefault('TONOSAMA_STUCK_PENDING_MAX_CONTROLLER_RETRY', '2')
-    os.environ.setdefault('TONOSAMA_STUCK_PENDING_LOW_SCORE_MAX_RETRY', '1')
-    os.environ.setdefault('TONOSAMA_STUCK_PENDING_LOW_SCORE_THRESHOLD', '3.0')
-    os.environ.setdefault('TONOSAMA_STUCK_PENDING_MIN_AGE_SEC', '20')
-    os.environ.setdefault('TONOSAMA_STUCK_PENDING_MAX_AGE_SEC', '90')
-    os.environ.setdefault('TONOSAMA_PENDING_CONTROLLER_DISPATCH_TIMEOUT_SEC', '25')
-    os.environ.setdefault('TONOSAMA_WAIT_PUSH_SUMMARY_MAX_AGE_SEC', '300')
-    os.environ.setdefault('TONOSAMA_HISTORY_FALLBACK_MAX_AGE_SEC', '300')
+        return True
     ok = _patch_once()
-    threading.Thread(target=_watch, name='tonosama-skip-build-when-pending-exists', daemon=True).start()
+    threading.Thread(target=_watch, name='tonosama-skip-build-pending-watch', daemon=True).start()
     _DONE = True
-    logger.warning('[TONOSAMA SKIP BUILD WHEN PENDING EXISTS] installed v6 ok=%s watcher=True market_guard=True stuck_prune=True room_build=True fresh_max_age=300 max_pending=%s main_skip=%s', ok, os.environ.get('TONOSAMA_MAX_PENDING_PER_LOOP'), _main_skip_tonosama_entry())
+    logger.warning('[TONOSAMA SKIP BUILD WHEN PENDING EXISTS] installed v7 ok=%s watcher=True market_guard=True stuck_prune=True room_build=True fresh_max_age=300 max_pending=%s main_skip=%s mode=%s', ok, _max_pending(), _main_skip_tonosama_entry(), _operation_mode())
     return ok
+
+
+try:
+    install()
+except Exception:
+    logger.exception('[TONOSAMA SKIP BUILD WHEN PENDING EXISTS] auto install failed')
+
+__all__ = ['install']
