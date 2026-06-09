@@ -1,22 +1,22 @@
 # ============================================================
 # File   : scripts/data_collectors_runner.py
-# Version: DATA-COLLECTORS-PARENT-RUNNER-V7-SKIP-RANKING-COLLECTOR-SAFE
+# Version: DATA-COLLECTORS-PARENT-RUNNER-V8-NO-NAS-HEARTBEAT-STARTUP
 # ------------------------------------------------------------
 # Purpose:
 #   - DB作成 / ランキング取得 / PUSH受信 / Yahoo補完 / サマリーDB保存を一括起動する親runner
 #   - main.py とは別プロセスで動かす
+#
+# V8:
+#   ✔ collector 子プロセス起動直前の mark_component_start / heartbeat を既定で無効化。
+#     NAS上 heartbeat SQLite への WAL 書き込みが Windows 0xC0000006 の誘因になる環境があるため。
+#   ✔ child started のログを Popen 直後に必ず出してから、任意の heartbeat を行う。
+#   ✔ heartbeat を戻す場合は AUTOSTOCK_COLLECTOR_PARENT_HEARTBEAT=1 を明示する。
 #
 # V7:
 #   ✔ ranking_collector_runner.py 起動直後に Windows 0xC0000006 で親ごと落ちる環境向けに、
 #     既定で ranking_collector をスキップ可能にした。
 #   ✔ PUSH受信 / Yahoo補完 / summary_database を先に安定起動させる。
 #   ✔ ランキング収集を戻す場合は AUTOSTOCK_ENABLE_RANKING_COLLECTOR=1 を明示する。
-#
-# V6:
-#   ✔ ranking20260602.db-wal 肥大化対策の既定値を子プロセス環境に投入
-#   ✔ ranking writer の WAL checkpoint/TRUNCATE patch を有効化
-#   ✔ SQLite cache/temp_store を低メモリ寄りにする
-#   ✔ pandas/numexpr 系の余計なスレッド増加を抑制
 # ============================================================
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -39,29 +39,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from data_collectors.config import HEARTBEAT_INTERVAL_SEC, RESTART_DELAY_SEC
 from data_collectors.logging_setup import setup_logging
-
-try:
-    from trading.runtime_persistence.heartbeat_watchdog import heartbeat, mark_component_start, mark_component_stop
-except Exception:  # heartbeat 自体が壊れてもcollectorは止めない
-    def heartbeat(*args, **kwargs):
-        return None
-    def mark_component_start(*args, **kwargs):
-        return None
-    def mark_component_stop(*args, **kwargs):
-        return None
-
-DB_PREPARE_RUNNER = SCRIPTS_DIR / "db_prepare_runner.py"
-RANKING_COLLECTOR_RUNNER = SCRIPTS_DIR / "ranking_collector_runner.py"
-PUSH_RECEIVER_RUNNER = SCRIPTS_DIR / "push_receiver_runner.py"
-YAHOO_COMPLEMENT_RUNNER = SCRIPTS_DIR / "yahoo_complement_runner.py"
-SUMMARY_DATABASE_RUNNER = SCRIPTS_DIR / "summary_database_runner.py"
-
-BASE_PROCESS_SPECS = {
-    "ranking_collector": RANKING_COLLECTOR_RUNNER,
-    "push_receiver": PUSH_RECEIVER_RUNNER,
-    "yahoo_complement": YAHOO_COMPLEMENT_RUNNER,
-    "summary_database": SUMMARY_DATABASE_RUNNER,
-}
 
 _STOP = False
 _TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
@@ -78,6 +55,61 @@ def _env_bool(name: str, default: bool = False) -> bool:
     except Exception:
         pass
     return bool(default)
+
+
+def _parent_heartbeat_enabled() -> bool:
+    # 0xC0000006 対策として、親runnerからNAS heartbeat DBへは既定で書かない。
+    return _env_bool("AUTOSTOCK_COLLECTOR_PARENT_HEARTBEAT", False)
+
+
+def _safe_heartbeat(component: str, status: str = "OK", detail: dict | None = None) -> None:
+    if not _parent_heartbeat_enabled():
+        return
+    try:
+        from trading.runtime_persistence.heartbeat_watchdog import heartbeat
+        heartbeat(component, status=status, detail=detail)
+    except Exception:
+        logging.getLogger(__name__).debug(
+            "[DATA COLLECTORS] heartbeat skipped component=%s status=%s", component, status, exc_info=True
+        )
+
+
+def _safe_mark_start(component: str, detail: dict | None = None) -> None:
+    if not _parent_heartbeat_enabled():
+        return
+    try:
+        from trading.runtime_persistence.heartbeat_watchdog import mark_component_start
+        mark_component_start(component, detail)
+    except Exception:
+        logging.getLogger(__name__).debug(
+            "[DATA COLLECTORS] mark start skipped component=%s", component, exc_info=True
+        )
+
+
+def _safe_mark_stop(component: str, detail: dict | None = None) -> None:
+    if not _parent_heartbeat_enabled():
+        return
+    try:
+        from trading.runtime_persistence.heartbeat_watchdog import mark_component_stop
+        mark_component_stop(component, detail)
+    except Exception:
+        logging.getLogger(__name__).debug(
+            "[DATA COLLECTORS] mark stop skipped component=%s", component, exc_info=True
+        )
+
+
+DB_PREPARE_RUNNER = SCRIPTS_DIR / "db_prepare_runner.py"
+RANKING_COLLECTOR_RUNNER = SCRIPTS_DIR / "ranking_collector_runner.py"
+PUSH_RECEIVER_RUNNER = SCRIPTS_DIR / "push_receiver_runner.py"
+YAHOO_COMPLEMENT_RUNNER = SCRIPTS_DIR / "yahoo_complement_runner.py"
+SUMMARY_DATABASE_RUNNER = SCRIPTS_DIR / "summary_database_runner.py"
+
+BASE_PROCESS_SPECS = {
+    "push_receiver": PUSH_RECEIVER_RUNNER,
+    "yahoo_complement": YAHOO_COMPLEMENT_RUNNER,
+    "summary_database": SUMMARY_DATABASE_RUNNER,
+    "ranking_collector": RANKING_COLLECTOR_RUNNER,
+}
 
 
 def _python_exe() -> str:
@@ -106,6 +138,10 @@ def _build_env() -> dict[str, str]:
 
     # data collector側ではエントリー実行しない。
     env.setdefault("ENABLE_SUMMARY_ENTRY_TICK", "0")
+
+    # 親runner/子起動直後の監視DB書き込みでNAS SQLiteを踏まない。
+    env.setdefault("AUTOSTOCK_COLLECTOR_PARENT_HEARTBEAT", "0")
+    env.setdefault("AUTOSTOCK_DISABLE_NAS_HEARTBEAT", "1")
 
     # ---- Memory / SQLite WAL guard defaults ----
     env.setdefault("PYTHONMALLOC", "malloc")
@@ -148,6 +184,11 @@ def _process_specs(logger: logging.Logger) -> dict[str, Path]:
             "Set AUTOSTOCK_ENABLE_RANKING_COLLECTOR=1 or AUTOSTOCK_SKIP_RANKING_COLLECTOR=0 to enable."
         )
 
+    # push_receiver も切り分けたい場合だけ明示スキップ可能。
+    if _env_bool("AUTOSTOCK_SKIP_PUSH_RECEIVER", False) and "push_receiver" in specs:
+        specs.pop("push_receiver", None)
+        logger.warning("[DATA COLLECTORS] push_receiver skipped by AUTOSTOCK_SKIP_PUSH_RECEIVER=1")
+
     return specs
 
 
@@ -162,7 +203,7 @@ def _run_db_prepare(logger: logging.Logger) -> None:
     env = _build_env()
     logger.info("[DATA COLLECTORS] db_prepare start cmd=%s", cmd)
     logger.info(
-        "[DATA COLLECTORS] child env summary owner=%s mode=%s writer=%s skip_main=%s role=%s wal_truncate_mb=%s sqlite_cache=%s",
+        "[DATA COLLECTORS] child env summary owner=%s mode=%s writer=%s skip_main=%s role=%s wal_truncate_mb=%s sqlite_cache=%s parent_hb=%s",
         env.get("AUTOSTOCK_SUMMARY_SAVE_OWNER"),
         env.get("AUTOSTOCK_SUMMARY_SAVE_MODE"),
         env.get("AUTOSTOCK_SUMMARY_DB_WRITER"),
@@ -170,13 +211,14 @@ def _run_db_prepare(logger: logging.Logger) -> None:
         env.get("SUMMARY_DB_WRITER_ROLE"),
         env.get("RANKING_WRITER_WAL_TRUNCATE_MB"),
         env.get("RANKING_SQLITE_CACHE_KB"),
+        env.get("AUTOSTOCK_COLLECTOR_PARENT_HEARTBEAT"),
     )
-    mark_component_start("db_prepare_runner", {"cmd": cmd})
+    _safe_mark_start("db_prepare_runner", {"cmd": cmd})
     ret = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=env, text=True)
     if ret.returncode != 0:
-        heartbeat("db_prepare_runner", status="ERROR", detail={"returncode": ret.returncode})
+        _safe_heartbeat("db_prepare_runner", status="ERROR", detail={"returncode": ret.returncode})
         raise RuntimeError(f"db_prepare failed returncode={ret.returncode}")
-    heartbeat("db_prepare_runner", status="DONE", detail={"returncode": ret.returncode})
+    _safe_heartbeat("db_prepare_runner", status="DONE", detail={"returncode": ret.returncode})
     logger.info("[DATA COLLECTORS] db_prepare done")
 
 
@@ -186,7 +228,7 @@ def _start_child(logger: logging.Logger, name: str, path: Path) -> subprocess.Po
     env = _build_env()
     logger.info("[DATA COLLECTORS] start child name=%s cmd=%s", name, cmd)
     logger.info(
-        "[DATA COLLECTORS] child env name=%s summary owner=%s mode=%s writer=%s skip_main=%s main_entry_only=%s role=%s yahoo_owner=%s wal_truncate_mb=%s sqlite_cache=%s",
+        "[DATA COLLECTORS] child env name=%s summary owner=%s mode=%s writer=%s skip_main=%s main_entry_only=%s role=%s yahoo_owner=%s wal_truncate_mb=%s sqlite_cache=%s parent_hb=%s",
         name,
         env.get("AUTOSTOCK_SUMMARY_SAVE_OWNER"),
         env.get("AUTOSTOCK_SUMMARY_SAVE_MODE"),
@@ -197,29 +239,33 @@ def _start_child(logger: logging.Logger, name: str, path: Path) -> subprocess.Po
         env.get("AUTOSTOCK_YAHOO_COMPLEMENT_OWNER"),
         env.get("RANKING_WRITER_WAL_TRUNCATE_MB"),
         env.get("RANKING_SQLITE_CACHE_KB"),
+        env.get("AUTOSTOCK_COLLECTOR_PARENT_HEARTBEAT"),
     )
-    mark_component_start(f"collector_{name}", {"cmd": cmd, "path": str(path)})
+
+    # 重要: Popen前にNAS heartbeat DBへ書かない。ここで落ちると child started が出ない。
     proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), env=env, text=True)
-    heartbeat(f"collector_{name}", status="STARTED", detail={"pid": proc.pid, "cmd": cmd})
     logger.info("[DATA COLLECTORS] child started name=%s pid=%s", name, proc.pid)
+
+    _safe_mark_start(f"collector_{name}", {"cmd": cmd, "path": str(path), "pid": proc.pid})
+    _safe_heartbeat(f"collector_{name}", status="STARTED", detail={"pid": proc.pid, "cmd": cmd})
     return proc
 
 
 def _terminate_child(logger: logging.Logger, name: str, proc: subprocess.Popen) -> None:
     if proc.poll() is not None:
-        mark_component_stop(f"collector_{name}", {"pid": proc.pid, "returncode": proc.poll(), "already_stopped": True})
+        _safe_mark_stop(f"collector_{name}", {"pid": proc.pid, "returncode": proc.poll(), "already_stopped": True})
         return
     logger.warning("[DATA COLLECTORS] terminate child name=%s pid=%s", name, proc.pid)
-    heartbeat(f"collector_{name}", status="TERMINATING", detail={"pid": proc.pid})
+    _safe_heartbeat(f"collector_{name}", status="TERMINATING", detail={"pid": proc.pid})
     try:
         proc.terminate()
         proc.wait(timeout=10)
-        mark_component_stop(f"collector_{name}", {"pid": proc.pid, "returncode": proc.poll()})
+        _safe_mark_stop(f"collector_{name}", {"pid": proc.pid, "returncode": proc.poll()})
     except subprocess.TimeoutExpired:
         logger.error("[DATA COLLECTORS] kill child name=%s pid=%s", name, proc.pid)
         proc.kill()
         proc.wait(timeout=5)
-        mark_component_stop(f"collector_{name}", {"pid": proc.pid, "returncode": proc.poll(), "killed": True})
+        _safe_mark_stop(f"collector_{name}", {"pid": proc.pid, "returncode": proc.poll(), "killed": True})
 
 
 def _handle_signal(signum, frame) -> None:
@@ -237,6 +283,7 @@ def main() -> int:
     logger.info("=" * 80)
     logger.info("[DATA COLLECTORS] START project_root=%s python=%s", PROJECT_ROOT, _python_exe())
     logger.info("[DATA COLLECTORS] specs=%s", {k: str(v) for k, v in specs.items()})
+    logger.info("[DATA COLLECTORS] parent heartbeat enabled=%s", _parent_heartbeat_enabled())
     logger.info("=" * 80)
 
     _run_db_prepare(logger)
@@ -253,15 +300,15 @@ def main() -> int:
                 if rc is None:
                     continue
                 logger.error("[DATA COLLECTORS] child exited name=%s pid=%s returncode=%s -> restart", name, proc.pid, rc)
-                heartbeat(f"collector_{name}", status="EXITED", detail={"pid": proc.pid, "returncode": rc})
-                mark_component_stop(f"collector_{name}", {"pid": proc.pid, "returncode": rc})
+                _safe_heartbeat(f"collector_{name}", status="EXITED", detail={"pid": proc.pid, "returncode": rc})
+                _safe_mark_stop(f"collector_{name}", {"pid": proc.pid, "returncode": rc})
                 if _STOP:
                     continue
                 time.sleep(RESTART_DELAY_SEC)
                 procs[name] = _start_child(logger, name, specs[name])
             if now - last_hb >= HEARTBEAT_INTERVAL_SEC:
                 last_hb = now
-                heartbeat(
+                _safe_heartbeat(
                     "data_collectors_runner",
                     status="RUNNING",
                     detail={"children": {name: {"pid": proc.pid, "returncode": proc.poll()} for name, proc in procs.items()}},
@@ -274,7 +321,7 @@ def main() -> int:
                 _terminate_child(logger, name, proc)
             except Exception:
                 logger.exception("[DATA COLLECTORS] child terminate failed name=%s", name)
-        heartbeat("data_collectors_runner", status="STOPPED", detail={})
+        _safe_heartbeat("data_collectors_runner", status="STOPPED", detail={})
         logger.warning("[DATA COLLECTORS] STOPPED")
     return 0
 
