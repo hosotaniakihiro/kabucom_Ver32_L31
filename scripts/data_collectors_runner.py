@@ -1,10 +1,16 @@
 # ============================================================
 # File   : scripts/data_collectors_runner.py
-# Version: DATA-COLLECTORS-PARENT-RUNNER-V6-MEMORY-WAL-GUARD-DEFAULTS
+# Version: DATA-COLLECTORS-PARENT-RUNNER-V7-SKIP-RANKING-COLLECTOR-SAFE
 # ------------------------------------------------------------
 # Purpose:
 #   - DB作成 / ランキング取得 / PUSH受信 / Yahoo補完 / サマリーDB保存を一括起動する親runner
 #   - main.py とは別プロセスで動かす
+#
+# V7:
+#   ✔ ranking_collector_runner.py 起動直後に Windows 0xC0000006 で親ごと落ちる環境向けに、
+#     既定で ranking_collector をスキップ可能にした。
+#   ✔ PUSH受信 / Yahoo補完 / summary_database を先に安定起動させる。
+#   ✔ ランキング収集を戻す場合は AUTOSTOCK_ENABLE_RANKING_COLLECTOR=1 を明示する。
 #
 # V6:
 #   ✔ ranking20260602.db-wal 肥大化対策の既定値を子プロセス環境に投入
@@ -50,7 +56,7 @@ PUSH_RECEIVER_RUNNER = SCRIPTS_DIR / "push_receiver_runner.py"
 YAHOO_COMPLEMENT_RUNNER = SCRIPTS_DIR / "yahoo_complement_runner.py"
 SUMMARY_DATABASE_RUNNER = SCRIPTS_DIR / "summary_database_runner.py"
 
-PROCESS_SPECS = {
+BASE_PROCESS_SPECS = {
     "ranking_collector": RANKING_COLLECTOR_RUNNER,
     "push_receiver": PUSH_RECEIVER_RUNNER,
     "yahoo_complement": YAHOO_COMPLEMENT_RUNNER,
@@ -58,6 +64,20 @@ PROCESS_SPECS = {
 }
 
 _STOP = False
+_TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+_FALSE = {"0", "false", "no", "n", "off", "disable", "disabled"}
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    try:
+        raw = str(os.getenv(name, "")).strip().lower()
+        if raw in _TRUE:
+            return True
+        if raw in _FALSE:
+            return False
+    except Exception:
+        pass
+    return bool(default)
 
 
 def _python_exe() -> str:
@@ -112,6 +132,23 @@ def _build_env() -> dict[str, str]:
     env.setdefault("RANKING_WRITER_FLUSH_ON_THRESHOLD", "1")
 
     return env
+
+
+def _process_specs(logger: logging.Logger) -> dict[str, Path]:
+    specs = dict(BASE_PROCESS_SPECS)
+
+    # 0xC0000006切り分け中はランキング収集子プロセスを既定で起動しない。
+    # 有効化する場合: set AUTOSTOCK_ENABLE_RANKING_COLLECTOR=1
+    enable_ranking = _env_bool("AUTOSTOCK_ENABLE_RANKING_COLLECTOR", False)
+    skip_ranking = _env_bool("AUTOSTOCK_SKIP_RANKING_COLLECTOR", not enable_ranking)
+    if skip_ranking and "ranking_collector" in specs:
+        specs.pop("ranking_collector", None)
+        logger.warning(
+            "[DATA COLLECTORS] ranking_collector skipped by default to avoid startup 0xC0000006. "
+            "Set AUTOSTOCK_ENABLE_RANKING_COLLECTOR=1 or AUTOSTOCK_SKIP_RANKING_COLLECTOR=0 to enable."
+        )
+
+    return specs
 
 
 def _check_file(path: Path) -> None:
@@ -194,16 +231,20 @@ def main() -> int:
     logger = setup_logging("data_collectors_runner")
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
+
+    specs = _process_specs(logger)
+
     logger.info("=" * 80)
     logger.info("[DATA COLLECTORS] START project_root=%s python=%s", PROJECT_ROOT, _python_exe())
-    logger.info("[DATA COLLECTORS] specs=%s", {k: str(v) for k, v in PROCESS_SPECS.items()})
+    logger.info("[DATA COLLECTORS] specs=%s", {k: str(v) for k, v in specs.items()})
     logger.info("=" * 80)
+
     _run_db_prepare(logger)
     procs: Dict[str, subprocess.Popen] = {}
     try:
-        for name, path in PROCESS_SPECS.items():
+        for name, path in specs.items():
             procs[name] = _start_child(logger, name, path)
-            time.sleep(0.5)
+            time.sleep(1.0)
         last_hb = 0.0
         while not _STOP:
             now = time.time()
@@ -217,7 +258,7 @@ def main() -> int:
                 if _STOP:
                     continue
                 time.sleep(RESTART_DELAY_SEC)
-                procs[name] = _start_child(logger, name, PROCESS_SPECS[name])
+                procs[name] = _start_child(logger, name, specs[name])
             if now - last_hb >= HEARTBEAT_INTERVAL_SEC:
                 last_hb = now
                 heartbeat(
