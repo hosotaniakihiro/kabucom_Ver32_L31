@@ -57,6 +57,8 @@ DEFAULTS = {
     "DAILY_RISK_SYMBOL_STOP_AFTER_FIRST_LOSS": "0",
     "DAILY_RISK_STOP_AFTER_FIRST_LOSS": "0",
     "SYMBOL_STOP_AFTER_FIRST_LOSS_ENABLED": "0",
+    "ENTRY_ORDER_EXCHANGE": "9",
+    "KABU_ORDER_EXCHANGE": "9",
     "WATCHLIST_RECENT_LIQ_ENABLED": "1",
     "WATCHLIST_RECENT_LIQ_BULK_RUN_IN_MAIN": "1",
     "WATCHLIST_RECENT_LIQ_BULK_SKIP_DB_IN_MAIN": "0",
@@ -160,14 +162,17 @@ os.environ["ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"] = "1"
 os.environ["ENTRY_BOARD_MISSING_HARD_BLOCK"] = "0"
 os.environ["RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE"] = "1"
 os.environ["RANKING_SNAPSHOT_TECH_BRIDGE_ENABLED"] = "1"
+os.environ["ENTRY_ORDER_EXCHANGE"] = "9"
+os.environ["KABU_ORDER_EXCHANGE"] = "9"
 
 logger.warning(
-    "[USERCUSTOMIZE] runtime defaults lite ranking_stale_skip=%s ranking_empty_failclosed=%s ranking_tech_bridge=%s tonosama_mtf_stale_fail_closed=%s pullback=%s",
+    "[USERCUSTOMIZE] runtime defaults lite ranking_stale_skip=%s ranking_empty_failclosed=%s ranking_tech_bridge=%s tonosama_mtf_stale_fail_closed=%s pullback=%s order_exchange=%s",
     os.getenv("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE"),
     os.getenv("RANKING_TODAY_EMPTY_FAIL_CLOSED"),
     os.getenv("RANKING_SNAPSHOT_TECH_BRIDGE_ENABLED"),
     os.getenv("TONOSAMA_MTF_STALE_FAIL_CLOSED"),
     os.getenv("PULLBACK_ENTRY_ENABLED"),
+    os.getenv("ENTRY_ORDER_EXCHANGE"),
 )
 
 
@@ -193,6 +198,7 @@ BASE_SYNC_PATCHES = [
 ]
 
 MAIN_SYNC_PATCHES = [
+    ("ORDER_EXCHANGE_SOR", "core.startup.order_exchange_sor_patch"),
     ("REENTRY_STALE_429_EXIT_SAFETY", "core.startup.entry_reentry_stale_429_exit_safety_patch"),
     ("EXIT_TUNING_DEFAULTS", "core.startup.exit_tuning_defaults_patch"),
     ("EXIT_NOISE_CONFIRM_GUARD", "core.startup.exit_noise_confirm_guard_patch"),
