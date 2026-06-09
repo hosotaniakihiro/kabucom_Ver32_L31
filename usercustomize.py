@@ -64,6 +64,34 @@ for k, v in {
 }.items():
     _env_default(k, v)
 
+# main.py default restore: entry / exit_loop_5s / ranking / tonosama / summary AI are ON.
+# To return to the previous crash-safe mode, set AUTOSTOCK_MAIN_OPERATION_MODE=entry_only before launch.
+if _is_main_py():
+    for k, v in {
+        "AUTOSTOCK_MAIN_OPERATION_MODE": "full",
+        "AUTOSTOCK_MAIN_DISABLE_SCHEDULED_ENTRY_JOBS": "0",
+        "AUTOSTOCK_MAIN_DISABLE_SCHEDULED_EXIT_LOOP": "0",
+        "AUTOSTOCK_MAIN_SKIP_RANKING_ENTRY": "0",
+        "AUTOSTOCK_MAIN_SKIP_TONOSAMA_ENTRY": "0",
+        "AUTOSTOCK_MAIN_SKIP_SUMMARY_PUSH_BG": "0",
+        "AUTOSTOCK_MAIN_SKIP_RANKING_SUMMARY_SCHEDULE": "0",
+        "AUTOSTOCK_MAIN_ENABLE_EXIT_LOOP": "1",
+        "AUTOSTOCK_MAIN_ENABLE_RANKING_ENTRY": "1",
+        "AUTOSTOCK_MAIN_ENABLE_TONOSAMA_ENTRY": "1",
+        "AUTOSTOCK_MAIN_ENABLE_SUMMARY_AI_ENTRY": "1",
+        "AUTOSTOCK_MAIN_ENABLE_SUMMARY_PARENT_TICK": "1",
+        "AUTOSTOCK_MAIN_ENABLE_RANKING_SUMMARY_SCHEDULE": "1",
+    }.items():
+        _env_default(k, v)
+    logger.warning(
+        "[USERCUSTOMIZE] main restore defaults mode=%s exit=%s ranking=%s tonosama=%s summary_ai=%s",
+        os.getenv("AUTOSTOCK_MAIN_OPERATION_MODE"),
+        os.getenv("AUTOSTOCK_MAIN_ENABLE_EXIT_LOOP"),
+        os.getenv("AUTOSTOCK_MAIN_ENABLE_RANKING_ENTRY"),
+        os.getenv("AUTOSTOCK_MAIN_ENABLE_TONOSAMA_ENTRY"),
+        os.getenv("AUTOSTOCK_MAIN_ENABLE_SUMMARY_AI_ENTRY"),
+    )
+
 os.environ["ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"] = "1"
 os.environ["ENTRY_BOARD_MISSING_HARD_BLOCK"] = "0"
 os.environ["RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE"] = "1"
