@@ -39,6 +39,13 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 
 
+def _operation_mode() -> str:
+    try:
+        return str(os.getenv("AUTOSTOCK_MAIN_OPERATION_MODE", "full") or "full").strip().lower()
+    except Exception:
+        return "full"
+
+
 def _is_main_py_process() -> bool:
     try:
         return Path(sys.argv[0]).name.lower() == "main.py"
@@ -47,18 +54,12 @@ def _is_main_py_process() -> bool:
 
 
 def _main_skip_ranking_entry() -> bool:
-    """
-    main.py is the entry/exit process and is not the ranking DB owner.
-
-    Repeated Windows 0xC0000006 crashes were observed after this wrapper called
-    the original ranking entry job and the job resolved/read
-    \\192.168.0.22\\...\\rankingYYYYMMDD.db.  The DB-owner process
-    (main_database.py) should handle ranking collection/build work.  Keep main.py
-    alive by default and allow legacy behavior only when explicitly requested.
-    """
+    """entry_only 安全モード時だけ main.py の ranking entry を止める。"""
     if not _is_main_py_process():
         return False
-    return _env_bool("AUTOSTOCK_MAIN_SKIP_RANKING_ENTRY", True)
+    if os.getenv("AUTOSTOCK_MAIN_SKIP_RANKING_ENTRY") is not None:
+        return _env_bool("AUTOSTOCK_MAIN_SKIP_RANKING_ENTRY", False)
+    return _operation_mode() not in {"full", "all"} and not _env_bool("AUTOSTOCK_MAIN_ENABLE_RANKING_ENTRY", False)
 
 
 def _source(entry: Any) -> str:
@@ -106,15 +107,6 @@ def _pending_count() -> int:
 
 
 def _mark_and_prune_stuck_ranking_pending() -> int:
-    """
-    ATR/RANGE/信用ガード等で落ち続けるRANKING pendingを掃除する。
-
-    v2:
-      - retry回数だけでは削除しない。
-      - pending作成直後にcontrollerが複数回走ると retry>=2 になり、0.2秒程度で
-        RANKING_STUCK_PENDING_RETRY_OR_AGE により消える問題を防ぐ。
-      - 最低滞留時間を過ぎた上で retry上限、または最大滞留時間で削除する。
-    """
     max_retry = max(1, _env_int("RANKING_STUCK_PENDING_MAX_CONTROLLER_RETRY", 3))
     min_age_sec = max(5.0, _env_float("RANKING_STUCK_PENDING_MIN_AGE_SEC", 30.0))
     max_age_sec = max(min_age_sec, _env_float("RANKING_STUCK_PENDING_MAX_AGE_SEC", 120.0))
@@ -153,18 +145,12 @@ def _mark_and_prune_stuck_ranking_pending() -> int:
             first = float(entry.get("_ranking_pending_first_seen_ts") or now)
             age = now - first
 
-            # 作成直後は絶対に消さない。発注executorへ渡る猶予を必ず残す。
             if age < min_age_sec:
                 return False
-
-            # 最大滞留時間を超えたpendingは掃除する。
             if age >= max_age_sec:
                 return True
-
-            # retry上限だけではなく、最低滞留時間経過後に限って掃除する。
             if retry >= max_retry:
                 return True
-
             return False
 
         removed = int(prune(pred, reason="RANKING_STUCK_PENDING_RETRY_OR_AGE"))
@@ -188,15 +174,16 @@ def _patch_once() -> bool:
         cur = getattr(tasks, "_run_ranking_entry_safe", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_ranking_stuck_pending_prune_v3", False):
+        if getattr(cur, "_ranking_stuck_pending_prune_v4", False):
             return True
         orig = getattr(cur, "_original", cur)
 
         def patched():
             if _main_skip_ranking_entry():
                 logger.warning(
-                    "[RANKING STUCK PENDING] main.py skip ranking entry job to avoid NAS ranking DB read. "
-                    "Set AUTOSTOCK_MAIN_SKIP_RANKING_ENTRY=0 to restore legacy behavior."
+                    "[RANKING STUCK PENDING] main.py skip ranking entry job mode=%s. "
+                    "Set AUTOSTOCK_MAIN_OPERATION_MODE=full or AUTOSTOCK_MAIN_SKIP_RANKING_ENTRY=0 to restore.",
+                    _operation_mode(),
                 )
                 return 0
 
@@ -216,43 +203,37 @@ def _patch_once() -> bool:
         patched._ranking_stuck_pending_prune_v1 = True  # type: ignore[attr-defined]
         patched._ranking_stuck_pending_prune_v2 = True  # type: ignore[attr-defined]
         patched._ranking_stuck_pending_prune_v3 = True  # type: ignore[attr-defined]
+        patched._ranking_stuck_pending_prune_v4 = True  # type: ignore[attr-defined]
         patched._original = orig  # type: ignore[attr-defined]
         tasks._run_ranking_entry_safe = patched
-        logger.warning(
-            "[RANKING STUCK PENDING] patched _run_ranking_entry_safe v3 min_age_guard=True main_skip=%s",
-            _main_skip_ranking_entry(),
-        )
+        logger.warning("[RANKING STUCK PENDING] patched _run_ranking_entry_safe v4 min_age_guard=True main_skip=%s mode=%s", _main_skip_ranking_entry(), _operation_mode())
         return True
     except Exception:
         logger.exception("[RANKING STUCK PENDING] patch failed")
         return False
 
 
-def _watch():
-    for i in range(120):
+def _watch() -> None:
+    loops = max(1, min(_env_int("RANKING_STUCK_PENDING_ENFORCE_LOOPS", 120), 300))
+    sleep_sec = max(0.5, min(_env_float("RANKING_STUCK_PENDING_ENFORCE_SLEEP_SEC", 2.0), 10.0))
+    for i in range(loops):
         ok = _patch_once()
-        if i in (0, 1, 5, 15, 30, 60, 119):
-            logger.warning("[RANKING STUCK PENDING] enforce ok=%s v3 main_skip=%s", ok, _main_skip_ranking_entry())
-        time.sleep(0.5)
+        if i in (0, 1, 5, 30, loops - 1):
+            logger.warning("[RANKING STUCK PENDING] enforce ok=%s v4 main_skip=%s mode=%s", ok, _main_skip_ranking_entry(), _operation_mode())
+        time.sleep(sleep_sec)
 
 
 def install() -> bool:
     global _DONE
     if _DONE:
-        return _patch_once()
-    os.environ.setdefault("RANKING_STUCK_PENDING_MAX_CONTROLLER_RETRY", "3")
-    os.environ.setdefault("RANKING_STUCK_PENDING_MIN_AGE_SEC", "30")
-    os.environ.setdefault("RANKING_STUCK_PENDING_MAX_AGE_SEC", "120")
-    os.environ.setdefault("AUTOSTOCK_MAIN_SKIP_RANKING_ENTRY", "1")
+        ok = _patch_once()
+        logger.warning("[RANKING STUCK PENDING] enforce ok=%s v4 main_skip=%s mode=%s", ok, _main_skip_ranking_entry(), _operation_mode())
+        return bool(ok)
     ok = _patch_once()
-    threading.Thread(target=_watch, name="ranking-stuck-pending-prune", daemon=True).start()
+    threading.Thread(target=_watch, name="ranking-stuck-pending-prune-watch", daemon=True).start()
     _DONE = True
-    logger.warning(
-        "[RANKING STUCK PENDING] installed v3 ok=%s watcher=True min_age_guard=True main_skip=%s",
-        ok,
-        _main_skip_ranking_entry(),
-    )
-    return True
+    logger.warning("[RANKING STUCK PENDING] installed v4 ok=%s watcher=True min_age_guard=True main_skip=%s mode=%s", ok, _main_skip_ranking_entry(), _operation_mode())
+    return bool(ok)
 
 
 try:
