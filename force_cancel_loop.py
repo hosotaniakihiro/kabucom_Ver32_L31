@@ -1,6 +1,6 @@
 # ============================================================
 # force_cancel_loop.py（BUY_SELL 準拠・安全最終版）
-# Version: V2.1-401-GLOBAL-TOKEN-FIRST
+# Version: V2.2-401-REFRESH-FIRST-CACHED-PASSWORD
 # ------------------------------------------------------------
 # ・30秒ごとに kabusapi/orders を直接確認
 # ・未約定の指値注文を全キャンセル
@@ -9,10 +9,10 @@
 # ・起動直後の API TOKEN 未設定にも耐性あり
 # ・401時は token refresh 後に1回だけ再試行
 #
-# V2.1:
-# ・401時に token_manager.refresh_token() を即呼びして ini 必須エラーを出さない。
-# ・startup_config 側で更新済みの global_data / api_common / token_manager.API_TOKEN を優先する。
-# ・API設定iniが無い環境では、既存トークン再同期で復旧し、無ければ静かにskipする。
+# V2.2:
+# ・401後は stale な既存runtime tokenを再利用せず、まず token_manager.refresh_token() を試す。
+# ・token_manager 側の apipassword cache により、API iniが分離/未検出でも起動時passwordで再取得できる。
+# ・refresh不可の場合だけ既存token fallbackへ落とす。
 # ============================================================
 
 from __future__ import annotations
@@ -90,7 +90,7 @@ def _read_global_token() -> str | None:
 
 
 def _headers_from_existing_token(context: str):
-    """startup_config 等で既に同期されたtokenを優先して使う。"""
+    """startup_config 等で既に同期されたtokenを使う。401後の最優先にはしない。"""
     token = _read_global_token()
     if not token:
         try:
@@ -135,16 +135,12 @@ def _refresh_headers_after_401(context: str):
     global _LAST_401_REFRESH_AT, _LAST_REFRESH_ERROR_WARN_AT
     now = time.time()
 
-    # まず起動時に同期済みのtokenを使う。iniが無い環境ではこれが最優先。
-    headers = _headers_from_existing_token(context)
-    if headers is not None:
-        return headers
-
     if now - _LAST_401_REFRESH_AT < 3.0:
         logger.warning("[FORCE_CANCEL] 401 refresh throttled context=%s", context)
         return _direct_token_fallback(context)
     _LAST_401_REFRESH_AT = now
 
+    # 401を返したtokenは stale の可能性が高いので、既存token再利用より refresh を優先する。
     try:
         import token_manager
         token = token_manager.refresh_token()
@@ -154,7 +150,7 @@ def _refresh_headers_after_401(context: str):
             logger.warning("[FORCE_CANCEL] API TOKEN refreshed after 401 context=%s", context)
             return {"X-API-KEY": token, "Content-Type": "application/json"}
     except Exception as e:
-        # API ini未配置は想定内。ERROR tracebackを連発せず、既存token fallbackへ落とす。
+        # API ini未配置/一時失敗は想定内。ERROR tracebackを連発せず、既存token fallbackへ落とす。
         if now - _LAST_REFRESH_ERROR_WARN_AT >= 30.0:
             logger.warning("[FORCE_CANCEL] token refresh after 401 unavailable context=%s err=%s", context, e)
             _LAST_REFRESH_ERROR_WARN_AT = now
