@@ -1,21 +1,10 @@
 # ============================================================
 # File   : core/startup/push_onopen_refresh_safe_patch.py
-# Version: V2.1-PUSH-ONOPEN-STABLE-DELAYED-REFRESH
+# Version: V2.2-PUSH-ONOPEN-STABLE-DELAYED-REFRESH-MAIN-PUSH-DB-SKIP
 # ------------------------------------------------------------
 # 目的:
 #   WebSocket reconnect直後の非破壊refreshで kabu Station を再切断させない。
-#
-# 背景:
-#   V2.0 は delay=0.05s / ready_wait=0.75s で on_open_safe_fast を実行していた。
-#   ログ上では CONNECTED 直後に refresh が入り、その直後に connected=False へ戻る
-#   ケースがあるため、rotation_core の ws stable grace と同じ考え方に寄せる。
-#
-# 方針:
-#   - on_open直後は最低3秒待つ。
-#   - ws ready確認も4秒まで待つ。
-#   - min_intervalは15秒へ延長する。
-#   - clear/unregisterは常にFalse既定のまま。
-#   - refreshは非破壊で1回だけ。通常のA/B登録はrotation workerへ任せる。
+#   さらに main.py 起動時の PUSH DB 直読み復元をskipする軽量patchも先に入れる。
 # ============================================================
 from __future__ import annotations
 
@@ -74,6 +63,18 @@ def _apply_defaults() -> None:
     os.environ.setdefault("PUSH_STREAM_ONOPEN_SAFE_CLEAR_FIRST", "0")
     os.environ.setdefault("PUSH_STREAM_ONOPEN_SAFE_UNREGISTER_FIRST", "0")
     os.environ.setdefault("PUSH_STREAM_ONOPEN_SAFE_WAIT_AFTER_CLEAR_SEC", "0.0")
+    os.environ.setdefault("AUTOSTOCK_MAIN_SKIP_PUSH_DB_RESTORE", "1")
+
+
+def _install_main_push_db_restore_skip() -> bool:
+    try:
+        from core.startup.main_skip_push_db_restore_patch import install as install_skip
+        ok = bool(install_skip())
+        logger.warning("[PUSH ONOPEN SAFE REFRESH] main push DB restore skip patch installed=%s", ok)
+        return ok
+    except Exception:
+        logger.exception("[PUSH ONOPEN SAFE REFRESH] main push DB restore skip patch failed")
+        return False
 
 
 def _ws_connected_and_alive() -> bool:
@@ -117,13 +118,11 @@ def _safe_onopen_refresh_worker() -> None:
         if not _ws_connected_and_alive():
             logger.warning("[PUSH ONOPEN SAFE REFRESH] skipped: ws lost before delayed refresh")
             return
-
         try:
             from trading.push.push_stream import transport
         except Exception:
             logger.exception("[PUSH ONOPEN SAFE REFRESH] transport import failed")
             return
-
         wait_fn = getattr(transport, "_wait_for_ws_ready", None)
         call_fn = getattr(transport, "_call_refresh", None)
         if callable(wait_fn):
@@ -168,6 +167,8 @@ def install() -> bool:
         return True
     try:
         _apply_defaults()
+        _install_main_push_db_restore_skip()
+
         from trading.push.push_stream import transport
         transport._start_refresh_after_open_thread = _patched_start_refresh_after_open_thread
         try:
@@ -177,7 +178,7 @@ def install() -> bool:
             logger.debug("[PUSH ONOPEN SAFE REFRESH] ws_callbacks patch skipped", exc_info=True)
 
         _INSTALLED = True
-        logger.warning("[PUSH ONOPEN SAFE REFRESH] installed v2.1 stable delayed")
+        logger.warning("[PUSH ONOPEN SAFE REFRESH] installed v2.2 stable delayed + main push DB restore skip")
         return True
     except Exception:
         logger.exception("[PUSH ONOPEN SAFE REFRESH] install failed")
