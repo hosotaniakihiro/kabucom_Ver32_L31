@@ -1,12 +1,19 @@
 # ============================================================
 # File   : core/startup/ranking_entry_snapshot_technical_bridge_patch.py
-# Version: V2-RANKING-SNAPSHOT-DB-TECH-BRIDGE
+# Version: V3-RANKING-SNAPSHOT-DB-TECH-BRIDGE-PARAM-FIX
 # ------------------------------------------------------------
 # 目的:
 #   PUSH summary history が main.py 側で空、かつ prefilter後のrowから
 #   ma/atr/slope/macd/rsi列が落ちている場合でも、ranking_snapshot_1min
 #   の最新行をsymbol指定で直接読み直し、Ranking entry の pending / entry_row
 #   にtechnical列を流す。
+#
+# V3 Fix:
+#   - V2のDB lookup SQLで placeholder 順が逆だった。
+#     SQL: WHERE symbol=? ORDER BY CASE WHEN rank_type=? THEN ...
+#     params: [rank_type, symbol] になっていたため、symbol=? に rank_type が入り
+#     常に0件になっていた。paramsを [symbol, rank_type] に修正。
+#   - lookup miss / table / columns / db path を warning で出す。
 # ============================================================
 from __future__ import annotations
 
@@ -33,7 +40,11 @@ _EXTRA_COPY = (
 )
 _TECH_DB_COLS = tuple(
     [f"{b}_{tf}m" for tf in (1, 3, 5) for b in _BASE_TECH]
-    + ["open", "high", "low", "close", "price", "current_price", "volume", "turnover", "datetime", "snapshot_time", "symbol", "symbolname"]
+    + [
+        "open", "high", "low", "close", "price", "current_price", "volume", "turnover",
+        "datetime", "snapshot_time", "symbol", "symbolname", "rank_type", "ranking_type",
+        "change_percentage", "change_rate",
+    ]
 )
 
 
@@ -142,48 +153,65 @@ def _has_real_tech(row: dict[str, Any]) -> bool:
         return False
 
 
-@lru_cache(maxsize=1024)
+@lru_cache(maxsize=2048)
 def _load_snapshot_tech_cached(symbol: str, rank_type: str, side: str, bucket_minute: int) -> tuple[tuple[str, Any], ...]:
     """LRU cache keyにminute bucketを入れ、1分ごとに自然更新する。"""
     del side, bucket_minute
     db = _ranking_db_path()
-    if not symbol or not os.path.exists(db):
+    if not symbol:
+        logger.warning("[RANKING SNAPSHOT TECH BRIDGE] db lookup skipped empty symbol")
+        return tuple()
+    if not os.path.exists(db):
+        logger.warning("[RANKING SNAPSHOT TECH BRIDGE] db lookup skipped missing db symbol=%s db=%s", symbol, db)
         return tuple()
     try:
-        with sqlite3.connect(db, timeout=2.0) as conn:
+        with sqlite3.connect(db, timeout=3.0) as conn:
             conn.row_factory = sqlite3.Row
             cols = _table_columns(conn, "ranking_snapshot_1min")
             if not cols:
+                logger.warning("[RANKING SNAPSHOT TECH BRIDGE] db lookup skipped table/columns missing symbol=%s db=%s", symbol, db)
                 return tuple()
             select_cols = [c for c in _TECH_DB_COLS if c in cols]
-            for c in ("ma5_1m", "ma25_1m", "ma75_1m", "rsi_1m", "macd_1m", "signal_1m", "atr_1m", "slope_1m"):
+            for c in ("ma5_1m", "ma25_1m", "ma75_1m", "rsi_1m", "macd_1m", "signal_1m", "macd_hist_1m", "atr_1m", "slope_1m", "slope_atr_scaled_1m"):
                 if c in cols and c not in select_cols:
                     select_cols.append(c)
             if "symbol" not in select_cols and "symbol" in cols:
                 select_cols.append("symbol")
             if not select_cols:
+                logger.warning("[RANKING SNAPSHOT TECH BRIDGE] db lookup skipped no selectable cols symbol=%s db=%s", symbol, db)
                 return tuple()
+
+            # CRITICAL: placeholder order must match SQL order.
+            # WHERE symbol=? が先、ORDER BY CASE WHEN rank_type=? が後。
             where = "symbol=?"
             params: list[Any] = [symbol]
-            # rank_typeが一致する行を優先。ただし無い場合も拾う。
             order_rank_type = "0"
             if rank_type and "rank_type" in cols:
                 order_rank_type = "CASE WHEN rank_type=? THEN 0 ELSE 1 END"
-                params.insert(0, rank_type)
+                params.append(rank_type)
+            elif rank_type and "ranking_type" in cols:
+                order_rank_type = "CASE WHEN ranking_type=? THEN 0 ELSE 1 END"
+                params.append(rank_type)
+
             dt_col = "datetime" if "datetime" in cols else ("snapshot_time" if "snapshot_time" in cols else None)
             order_dt = f"{dt_col} DESC" if dt_col else "rowid DESC"
             sql = f"SELECT {', '.join(select_cols)} FROM ranking_snapshot_1min WHERE {where} ORDER BY {order_rank_type}, {order_dt}, rowid DESC LIMIT 1"
             row = conn.execute(sql, params).fetchone()
             if not row:
+                # fallback: typeを完全に無視してsymbol最新を拾う
+                sql2 = f"SELECT {', '.join(select_cols)} FROM ranking_snapshot_1min WHERE symbol=? ORDER BY {order_dt}, rowid DESC LIMIT 1"
+                row = conn.execute(sql2, [symbol]).fetchone()
+            if not row:
+                logger.warning("[RANKING SNAPSHOT TECH BRIDGE] db lookup miss symbol=%s rank_type=%s db=%s", symbol, rank_type, db)
                 return tuple()
             d = dict(row)
             logger.warning(
-                "[RANKING SNAPSHOT TECH BRIDGE] db lookup symbol=%s rank_type=%s cols=%s ma5_1m=%s atr_1m=%s slope_1m=%s macd_1m=%s dt=%s",
-                symbol, rank_type, len(d), d.get("ma5_1m"), d.get("atr_1m"), d.get("slope_1m"), d.get("macd_1m"), d.get("datetime") or d.get("snapshot_time"),
+                "[RANKING SNAPSHOT TECH BRIDGE] db lookup hit symbol=%s rank_type=%s db=%s cols=%s ma5_1m=%s atr_1m=%s slope_1m=%s macd_1m=%s signal_1m=%s dt=%s",
+                symbol, rank_type, db, len(d), d.get("ma5_1m"), d.get("atr_1m"), d.get("slope_1m"), d.get("macd_1m"), d.get("signal_1m"), d.get("datetime") or d.get("snapshot_time"),
             )
             return tuple(d.items())
     except Exception:
-        logger.debug("[RANKING SNAPSHOT TECH BRIDGE] db lookup failed symbol=%s db=%s", symbol, db, exc_info=True)
+        logger.exception("[RANKING SNAPSHOT TECH BRIDGE] db lookup failed symbol=%s rank_type=%s db=%s", symbol, rank_type, db)
         return tuple()
 
 
@@ -195,7 +223,7 @@ def _merge_db_snapshot_tech(row: dict[str, Any]) -> tuple[dict[str, Any], int]:
     sym = _symbol(row)
     rt = str(row.get("rank_type") or row.get("ranking_type") or "").strip()
     side = str(row.get("side") or row.get("entry_decision") or "").strip().upper()
-    bucket = int(dt.datetime.now().timestamp() // max(10, _env_int("RANKING_SNAPSHOT_TECH_DB_CACHE_SEC", 60)))
+    bucket = int(dt.datetime.now().timestamp() // max(10, _env_int("RANKING_SNAPSHOT_TECH_DB_CACHE_SEC", 30)))
     items = _load_snapshot_tech_cached(sym, rt, side, bucket)
     if not items:
         return row, 0
@@ -205,7 +233,6 @@ def _merge_db_snapshot_tech(row: dict[str, Any]) -> tuple[dict[str, Any], int]:
     for k, v in src.items():
         if not _has_value(v):
             continue
-        # row側が欠損または0ならDB snapshot値で補完する。
         if k not in out or not _has_value(out.get(k)) or (_sf(out.get(k), 0.0) == 0.0 and _sf(v, 0.0) != 0.0):
             out[k] = v
             copied += 1
@@ -216,7 +243,6 @@ def _merge_db_snapshot_tech(row: dict[str, Any]) -> tuple[dict[str, Any], int]:
 
 
 def _choose_tf(row: dict[str, Any]) -> int:
-    """Entry controller の1分ATR/MAガードには1mを優先する。なければ3m/5m。"""
     for tf in (1, 3, 5):
         if _sf(row.get(f"atr_{tf}m"), 0.0) > 0 or _sf(row.get(f"ma5_{tf}m"), 0.0) > 0 or abs(_sf(row.get(f"slope_{tf}m"), 0.0)) > 0:
             return tf
@@ -231,17 +257,12 @@ def _copy_snapshot_tech(row: dict[str, Any]) -> tuple[dict[str, Any], int, int]:
     tf = _choose_tf(out)
     copied = int(db_copied)
 
-    # unsuffixed aliases: downstream guards often read ma5/atr/slope directly.
     for base in _BASE_TECH:
         src = f"{base}_{tf}m"
         if src in out and _has_value(out.get(src)):
             if base not in out or not _has_value(out.get(base)) or _sf(out.get(base), 0.0) == 0.0:
                 out[base] = out.get(src)
                 copied += 1
-        for t in (1, 3, 5):
-            k = f"{base}_{t}m"
-            if k in out and _has_value(out.get(k)):
-                out[k] = out.get(k)
 
     close = _first(out, "close", "close_1m", "price", "current_price", "close_price")
     if close is not None:
@@ -293,7 +314,7 @@ def _patch_entry_from_ranking() -> bool:
     patched = False
 
     cur_attach = getattr(efr, "attach_ranking_technicals", None)
-    if callable(cur_attach) and not getattr(cur_attach, "_snapshot_technical_bridge_v2", False):
+    if callable(cur_attach) and not getattr(cur_attach, "_snapshot_technical_bridge_v3", False):
         orig_attach = getattr(cur_attach, "_original", cur_attach)
 
         @wraps(orig_attach)
@@ -304,28 +325,26 @@ def _patch_entry_from_ranking() -> bool:
                 logger.debug("[RANKING SNAPSHOT TECH BRIDGE] original attach failed; use raw row", exc_info=True)
                 ret = row
             try:
-                # orig_attach/alias patch が列を落とす場合があるため、元rowとretを再マージ。
                 base = dict(row or {})
                 if isinstance(ret, dict):
                     base.update(ret)
                 out, copied, tf = _copy_snapshot_tech(base)
-                if copied > 0:
-                    logger.info(
-                        "[RANKING SNAPSHOT TECH BRIDGE] attached symbol=%s copied=%s tf=%sm db=%s atr=%s ma5=%s slope=%s macd=%s signal=%s",
-                        out.get("symbol"), copied, tf, out.get("ranking_tech_db_lookup"), out.get("atr"), out.get("ma5"), out.get("slope"), out.get("macd"), out.get("signal"),
-                    )
+                logger.info(
+                    "[RANKING SNAPSHOT TECH BRIDGE] attached symbol=%s copied=%s tf=%sm db=%s atr=%s ma5=%s slope=%s macd=%s signal=%s",
+                    out.get("symbol"), copied, tf, out.get("ranking_tech_db_lookup"), out.get("atr"), out.get("ma5"), out.get("slope"), out.get("macd"), out.get("signal"),
+                )
                 return out
             except Exception:
                 logger.exception("[RANKING SNAPSHOT TECH BRIDGE] attach bridge failed")
                 return ret
 
-        attach_wrapper._snapshot_technical_bridge_v2 = True  # type: ignore[attr-defined]
+        attach_wrapper._snapshot_technical_bridge_v3 = True  # type: ignore[attr-defined]
         attach_wrapper._original = orig_attach  # type: ignore[attr-defined]
         efr.attach_ranking_technicals = attach_wrapper
         patched = True
 
     cur_builder = getattr(efr, "build_entry_row", None)
-    if callable(cur_builder) and not getattr(cur_builder, "_snapshot_technical_bridge_v2", False):
+    if callable(cur_builder) and not getattr(cur_builder, "_snapshot_technical_bridge_v3", False):
         orig_builder = getattr(cur_builder, "_original", cur_builder)
 
         @wraps(orig_builder)
@@ -340,21 +359,20 @@ def _patch_entry_from_ranking() -> bool:
                 for key in _EXTRA_COPY:
                     if key in bridged and _has_value(bridged.get(key)):
                         entry[key] = bridged.get(key)
-                entry.setdefault("ranking_tech_ready", bridged.get("ranking_tech_ready", False))
-                entry.setdefault("technical_ready", bridged.get("technical_ready", False))
-                entry.setdefault("ranking_tech_source", bridged.get("ranking_tech_source", "ranking_snapshot_1min" if copied else ""))
-                entry.setdefault("ranking_tech_reason", bridged.get("ranking_tech_reason", f"snapshot_technical_bridge_tf={tf}m" if copied else ""))
-                entry.setdefault("ranking_tech_db_lookup", bridged.get("ranking_tech_db_lookup", False))
-                if copied > 0:
-                    logger.info("[RANKING SNAPSHOT TECH BRIDGE] build_entry_row copied symbol=%s copied=%s tf=%sm db=%s", entry.get("symbol") or bridged.get("symbol"), copied, tf, bridged.get("ranking_tech_db_lookup"))
+                entry["ranking_tech_ready"] = bool(bridged.get("ranking_tech_ready", False))
+                entry["technical_ready"] = bool(bridged.get("technical_ready", False))
+                entry["ranking_tech_source"] = bridged.get("ranking_tech_source", "ranking_snapshot_1min" if copied else "")
+                entry["ranking_tech_reason"] = bridged.get("ranking_tech_reason", f"snapshot_technical_bridge_tf={tf}m" if copied else "")
+                entry["ranking_tech_db_lookup"] = bool(bridged.get("ranking_tech_db_lookup", False))
+                logger.info("[RANKING SNAPSHOT TECH BRIDGE] build_entry_row copied symbol=%s copied=%s tf=%sm db=%s", entry.get("symbol") or bridged.get("symbol"), copied, tf, bridged.get("ranking_tech_db_lookup"))
             return entry
 
-        build_entry_row_wrapper._snapshot_technical_bridge_v2 = True  # type: ignore[attr-defined]
+        build_entry_row_wrapper._snapshot_technical_bridge_v3 = True  # type: ignore[attr-defined]
         build_entry_row_wrapper._original = orig_builder  # type: ignore[attr-defined]
         efr.build_entry_row = build_entry_row_wrapper
         patched = True
 
-    return patched or bool(getattr(getattr(efr, "attach_ranking_technicals", None), "_snapshot_technical_bridge_v2", False))
+    return patched or bool(getattr(getattr(efr, "attach_ranking_technicals", None), "_snapshot_technical_bridge_v3", False))
 
 
 def install() -> bool:
@@ -365,10 +383,10 @@ def install() -> bool:
     try:
         os.environ.setdefault("RANKING_SNAPSHOT_TECH_BRIDGE_ENABLED", "1")
         os.environ.setdefault("RANKING_SNAPSHOT_TECH_DB_LOOKUP", "1")
-        os.environ.setdefault("RANKING_SNAPSHOT_TECH_DB_CACHE_SEC", "60")
+        os.environ.setdefault("RANKING_SNAPSHOT_TECH_DB_CACHE_SEC", "30")
         ok = _patch_entry_from_ranking()
         _INSTALLED = bool(ok)
-        logger.warning("[RANKING SNAPSHOT TECH BRIDGE] installed v2 db_lookup=%s ok=%s", _env_bool("RANKING_SNAPSHOT_TECH_DB_LOOKUP", True), ok)
+        logger.warning("[RANKING SNAPSHOT TECH BRIDGE] installed v3 db_lookup=%s ok=%s", _env_bool("RANKING_SNAPSHOT_TECH_DB_LOOKUP", True), ok)
         return bool(ok)
     except Exception:
         logger.exception("[RANKING SNAPSHOT TECH BRIDGE] install failed")
