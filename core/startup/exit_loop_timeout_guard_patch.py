@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/exit_loop_timeout_guard_patch.py
-# Version: V2.1-MAIN-BROKER-EMPTY-PREFLIGHT
+# Version: V2.2-NO-STALE-BROKER-EMPTY-SKIP
 # ------------------------------------------------------------
 # Purpose:
 #   exit_loop_5s が broker/API/DB 読み込みなどで長時間固まり、
@@ -13,16 +13,22 @@
 #   - worker が EXIT_LOOP_RUN_TIMEOUT_SEC を超えたら scheduler 側は戻る。
 #   - worker が EXIT_LOOP_ORPHAN_REPLACE_SEC を超えてまだ生きている場合、
 #     古い worker は orphan として参照を切り、新しい worker を起動する。
-#   - V2.1: main.py で broker信用建玉0件が確認済みなら worker自体を作らず即return。
-#     NAS SQLite不安定時に、worker start直後に旧参照/DB fallbackへ進み 0xC0000006 で
-#     プロセス終了する経路を防ぐ。
+#
+# V2.2:
+#   - main.py の broker_authoritative_empty preflight skip をデフォルト無効化。
+#   - 理由: 2026-06-09 14:35-14:39 のログで、別経路では
+#     positions rows=2 symbols=['147A'] が取れているのに、
+#     stale な open_position_broker_authoritative_empty により
+#     exit_loop worker が毎回 skip され、利確/損切監視が止まるため。
+#   - AUTOSTOCK_MAIN_SKIP_EXIT_LOOP_WHEN_BROKER_EMPTY=1 を明示した場合のみ、
+#     旧skipを有効にできる。
 #
 # ENV:
 #   EXIT_LOOP_TIMEOUT_GUARD_ENABLED=1
-#   EXIT_LOOP_RUN_TIMEOUT_SEC=4.0
-#   EXIT_LOOP_STUCK_WARN_SEC=8.0
+#   EXIT_LOOP_RUN_TIMEOUT_SEC=15.0
+#   EXIT_LOOP_STUCK_WARN_SEC=20.0
 #   EXIT_LOOP_ORPHAN_REPLACE_SEC=45.0
-#   AUTOSTOCK_MAIN_SKIP_EXIT_LOOP_WHEN_BROKER_EMPTY=1
+#   AUTOSTOCK_MAIN_SKIP_EXIT_LOOP_WHEN_BROKER_EMPTY=0
 # ============================================================
 
 from __future__ import annotations
@@ -69,19 +75,63 @@ def _is_main_py_process() -> bool:
         return False
 
 
+def _global_has_any_position() -> bool:
+    """API/DBを叩かず、既存メモリ上に建玉らしきものがあればTrue。"""
+    try:
+        from global_state import global_data
+    except Exception:
+        return False
+
+    for name in (
+        "open_positions",
+        "open_position_map",
+        "active_positions",
+        "position_cache",
+        "open_position_cache",
+        "current_positions",
+        "positions",
+        "runtime_positions",
+        "entry_positions",
+    ):
+        try:
+            v = getattr(global_data, name, None)
+            if v is not None and len(v) > 0:
+                return True
+        except Exception:
+            pass
+
+    for name in (
+        "open_positions_synced_count",
+        "broker_positions_count",
+        "positions_count",
+        "open_position_count",
+    ):
+        try:
+            if int(getattr(global_data, name, 0) or 0) > 0:
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
 def _main_broker_empty_prefight_skip() -> bool:
     """
     worker生成前の最終安全弁。
 
-    scheduler_exit_bootstrap.run_exit_loop_market_guarded 側にも同じskipがあるが、
-    timeout_guard は worker thread を先に作るため、main.py ではここでも判定する。
-    broker信用建玉0件が既に global_data に反映されている場合は、exit_loop workerを
-    起動しない。
+    V2.2ではデフォルト無効。staleな broker_authoritative_empty が残ると、
+    実建玉があるにもかかわらず exit_loop_5s が毎回 skip されるため。
     """
     if not _is_main_py_process():
         return False
-    if not _env_bool("AUTOSTOCK_MAIN_SKIP_EXIT_LOOP_WHEN_BROKER_EMPTY", True):
+    if not _env_bool("AUTOSTOCK_MAIN_SKIP_EXIT_LOOP_WHEN_BROKER_EMPTY", False):
         return False
+
+    # メモリ上に少しでも建玉が見えていれば絶対にskipしない。
+    if _global_has_any_position():
+        logger.warning("[EXIT LOOP TIMEOUT GUARD] broker-empty preflight bypassed because memory positions exist")
+        return False
+
     try:
         import core.startup.scheduler_exit_bootstrap as boot
         checker = getattr(boot, "_main_skip_exit_loop_when_broker_empty", None)
@@ -90,28 +140,8 @@ def _main_broker_empty_prefight_skip() -> bool:
     except Exception:
         logger.debug("[EXIT LOOP TIMEOUT GUARD] main broker empty preflight via boot failed", exc_info=True)
 
-    # boot helper が取れない場合の軽量fallback。broker/API/DBは絶対に叩かない。
     try:
         from global_state import global_data
-
-        for name in (
-            "open_positions",
-            "open_position_map",
-            "active_positions",
-            "position_cache",
-            "open_position_cache",
-            "current_positions",
-            "positions",
-            "runtime_positions",
-            "entry_positions",
-        ):
-            v = getattr(global_data, name, None)
-            try:
-                if v is not None and len(v) > 0:
-                    return False
-            except Exception:
-                pass
-
         mode = str(getattr(global_data, "open_positions_source_mode", "") or "")
         read_ok = bool(getattr(global_data, "open_positions_broker_read_ok", False))
         cnt = int(getattr(global_data, "open_positions_synced_count", 0) or 0)
@@ -174,7 +204,7 @@ def install() -> bool:
     try:
         import core.startup.scheduler_exit_bootstrap as boot
         current = getattr(boot, "run_exit_loop_market_guarded", None)
-        if getattr(current, "_exit_loop_timeout_guard_v21", False):
+        if getattr(current, "_exit_loop_timeout_guard_v22", False):
             _INSTALLED = True
             return True
         original = getattr(current, "_original", current)
@@ -203,23 +233,18 @@ def install() -> bool:
 
         def _patched_run_exit_loop_market_guarded() -> None:
             global _WORKER_THREAD, _WORKER_STARTED_AT, _WORKER_SEQ
-            timeout_sec = _env_float("EXIT_LOOP_RUN_TIMEOUT_SEC", 4.0)
-            stuck_warn_sec = _env_float("EXIT_LOOP_STUCK_WARN_SEC", 8.0)
+            timeout_sec = _env_float("EXIT_LOOP_RUN_TIMEOUT_SEC", 15.0)
+            stuck_warn_sec = _env_float("EXIT_LOOP_STUCK_WARN_SEC", 20.0)
             orphan_replace_sec = _env_float("EXIT_LOOP_ORPHAN_REPLACE_SEC", 45.0)
 
-            # main.py + broker信用建玉0件では、worker thread自体を起動しない。
-            # scheduler_exit_bootstrap側skipに到達する前に worker start 直後で落ちる経路を塞ぐ。
             if _main_broker_empty_prefight_skip():
-                logger.info(
-                    "[EXIT LOOP TIMEOUT GUARD] preflight skip worker reason=main_py_broker_authoritative_empty"
-                )
+                logger.info("[EXIT LOOP TIMEOUT GUARD] preflight skip worker reason=main_py_broker_authoritative_empty")
                 return
 
             with _WORKER_LOCK:
                 if _worker_alive():
                     age = _worker_age()
                     if age >= orphan_replace_sec:
-                        # 建玉ゼロが確認済みなら orphan replacement も起動しない。
                         if _main_broker_empty_prefight_skip():
                             _clear_worker_ref("main_empty_orphan_clear")
                             logger.info(
@@ -244,10 +269,7 @@ def install() -> bool:
                                 getattr(_WORKER_THREAD, "name", ""),
                             )
                         else:
-                            logger.info(
-                                "[EXIT LOOP TIMEOUT GUARD] worker already running -> skip new worker age=%.3fs",
-                                age,
-                            )
+                            logger.info("[EXIT LOOP TIMEOUT GUARD] worker already running -> skip new worker age=%.3fs", age)
                         return
 
                 _WORKER_SEQ += 1
@@ -276,6 +298,7 @@ def install() -> bool:
         _patched_run_exit_loop_market_guarded._exit_loop_timeout_guard_v1 = True  # type: ignore[attr-defined]
         _patched_run_exit_loop_market_guarded._exit_loop_timeout_guard_v2 = True  # type: ignore[attr-defined]
         _patched_run_exit_loop_market_guarded._exit_loop_timeout_guard_v21 = True  # type: ignore[attr-defined]
+        _patched_run_exit_loop_market_guarded._exit_loop_timeout_guard_v22 = True  # type: ignore[attr-defined]
         _patched_run_exit_loop_market_guarded._original = original  # type: ignore[attr-defined]
         boot.run_exit_loop_market_guarded = _patched_run_exit_loop_market_guarded
 
@@ -293,18 +316,19 @@ def install() -> bool:
         except Exception:
             logger.debug("[EXIT LOOP TIMEOUT GUARD] schedule job replace failed", exc_info=True)
 
-        os.environ.setdefault("EXIT_LOOP_RUN_TIMEOUT_SEC", "4.0")
-        os.environ.setdefault("EXIT_LOOP_STUCK_WARN_SEC", "8.0")
+        os.environ.setdefault("EXIT_LOOP_RUN_TIMEOUT_SEC", "15.0")
+        os.environ.setdefault("EXIT_LOOP_STUCK_WARN_SEC", "20.0")
         os.environ.setdefault("EXIT_LOOP_ORPHAN_REPLACE_SEC", "45.0")
-        os.environ.setdefault("AUTOSTOCK_MAIN_SKIP_EXIT_LOOP_WHEN_BROKER_EMPTY", "1")
+        # V2.2: stale broker-empty skipがEXITを止めるため、明示指定がない限り無効。
+        os.environ.setdefault("AUTOSTOCK_MAIN_SKIP_EXIT_LOOP_WHEN_BROKER_EMPTY", "0")
 
         _INSTALLED = True
         logger.warning(
-            "[EXIT LOOP TIMEOUT GUARD] installed v2.1 timeout=%s stuck_warn=%s orphan_replace=%s main_empty_preflight=%s",
+            "[EXIT LOOP TIMEOUT GUARD] installed v2.2 timeout=%s stuck_warn=%s orphan_replace=%s main_empty_preflight=%s",
             os.environ.get("EXIT_LOOP_RUN_TIMEOUT_SEC"),
             os.environ.get("EXIT_LOOP_STUCK_WARN_SEC"),
             os.environ.get("EXIT_LOOP_ORPHAN_REPLACE_SEC"),
-            os.environ.get("AUTOSTOCK_MAIN_SKIP_EXIT_LOOP_WHEN_BROKER_EMPTY", "1"),
+            os.environ.get("AUTOSTOCK_MAIN_SKIP_EXIT_LOOP_WHEN_BROKER_EMPTY", "0"),
         )
         return True
     except Exception:
