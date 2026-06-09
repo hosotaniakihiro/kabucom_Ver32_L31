@@ -1,13 +1,9 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver37-MAIN-LITE-ASYNC-PATCHES
+# Version: Ver38-RANKING-SNAPSHOT-TECH-ALIAS
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
-# Ver37:
-#   - main.py 起動前に30個近いpatchを同期installしていたため、
-#     [BOOT]/[MAIN] へ到達する前に遅くなっていた。
-#   - main.py では最低限の保護だけ同期し、重いpatchはbackgroundへ回す。
-#   - main_database.py / collector 系は従来通り同期寄り。
+# main.py は軽量同期 + background install。
 # ============================================================
 from __future__ import annotations
 
@@ -76,6 +72,7 @@ def _is_database_process() -> bool:
 def _install_boot_exception_hook() -> None:
     try:
         old_hook = sys.excepthook
+
         def _hook(exc_type, exc, tb):
             try:
                 _write_boot_evidence("UNCAUGHT_EXCEPTION", "".join(traceback.format_exception(exc_type, exc, tb)))
@@ -85,6 +82,7 @@ def _install_boot_exception_hook() -> None:
                 old_hook(exc_type, exc, tb)
             except Exception:
                 pass
+
         sys.excepthook = _hook
         _write_boot_evidence("BOOT_EXCEPTION_HOOK_INSTALLED")
     except Exception:
@@ -119,23 +117,92 @@ def _install_liq_empty_fallback_only_if_enabled() -> None:
     _install_module("core.startup.liquidity_empty_fallback_patch", "LIQ_EMPTY_FALLBACK")
 
 
-def _install_tonosama_surge_defaults() -> None:
+def _install_runtime_defaults() -> None:
     try:
         defaults = {
-            "TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING":"1", "TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY":"1", "TONOSAMA_ALLOW_HISTORY_MISSING_ENTRY":"1", "TONOSAMA_DROP_HISTORY_MISSING_ENTRY":"0", "TONOSAMA_RAW1_RESAMPLE_FALLBACK":"1", "TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE":"3.0", "TONOSAMA_5SEC_ADVISORY_ENABLED":"1", "TONOSAMA_5SEC_ALLOW_ZERO_IF_PRIMARY_PASS":"1", "TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC":"0", "TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT":"0.0", "TONOSAMA_ALLOW_HISTORY_MISSING_STRONG_MOVE":"1", "TONOSAMA_ALLOW_WARNING_ONLY_CLIMAX":"1", "TONOSAMA_WARNING_ONLY_MAX_PRICE_CHANGE_PCT":"0.50", "TONOSAMA_PRICE_CHANGE_OR_RANGE_ENABLED":"1", "TONOSAMA_PRICE_CHANGE_OR_RANGE_MIN_RANGE_PCT":"3.0", "TONOSAMA_PRICE_CHANGE_OR_RANGE_MIN_VOLUME":"50000", "TONOSAMA_PRICE_CHANGE_OR_RANGE_MIN_SURGE":"3.0", "TONOSAMA_AI_FALLBACK_PRICE_RANGE_RESCUE":"1", "TONOSAMA_AI_FALLBACK_MIN_PRICE_CHANGE_PCT":"0.0", "TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_ENABLED":"1", "TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_MIN_VOLUME":"500000", "TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_MIN_RANGE_PCT":"4.0", "TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_MIN_ABS_SCORE":"0.8", "TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_MIN_MTF":"1.0", "TONOSAMA_SLOPE_RANGE_RESCUE_ENABLED":"1", "TONOSAMA_SLOPE_RANGE_RESCUE_MIN_RANGE_PCT":"4.0", "TONOSAMA_SLOPE_RANGE_RESCUE_MIN_VOLUME":"500000", "TONOSAMA_SLOPE_RANGE_RESCUE_MIN_SURGE":"0.0", "TONOSAMA_SLOPE_RANGE_RESCUE_MIN_ABS_SCORE":"0.0",
-            "TONOSAMA_ENTRY_TIMEOUT_SEC":"45", "TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC":"12", "TONOSAMA_DISPATCH_CONTROLLER_ON_TIMEOUT_PENDING":"1", "TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_SEC":"10", "TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC":"60",
-            "ENTRY_CONTROLLER_LOCK_WAIT_ENABLED":"1", "ENTRY_CONTROLLER_LOCK_WAIT_SOURCES":"RANKING,TONOSAMA,SUMMARY", "ENTRY_CONTROLLER_LOCK_WAIT_SEC":"75", "ENTRY_CONTROLLER_SUMMARY_LOCK_WAIT_SEC":"75", "ENTRY_CONTROLLER_RANKING_LOCK_WAIT_ENABLED":"1", "ENTRY_CONTROLLER_RANKING_LOCK_WAIT_SEC":"75", "ENTRY_CONTROLLER_LOCK_WAIT_TIMEOUT_SKIP_ORIGINAL":"1", "ENTRY_CONTROLLER_SOURCE_PREFILTER_ENABLED":"1", "ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE":"1", "ENTRY_CONTROLLER_TONOSAMA_MIN_SCORE":"0.01", "ENTRY_DIRECTION_RECURSION_FAILOPEN_ENABLED":"1",
-            "ENTRY_SHORT_MTF_REQUIRED":"1", "ENTRY_SHORT_MTF_FORCE_2OF3":"1", "ENTRY_SHORT_MTF_MIN_ALIGNED":"2", "ENTRY_SHORT_MTF_MIN_AVAILABLE":"2", "ENTRY_SHORT_MTF_SLOPE_EPS":"0.0", "ENTRY_DAILY_MTF_OPTIONAL":"1", "ENTRY_SHORT_MTF_DB_BACKFILL":"1", "ENTRY_SHORT_MTF_ZERO_NEUTRAL":"1",
-            "LOW_MOVE_TONOSAMA_MIN_ENTRY_PRICE":"300", "LOW_MOVE_TONOSAMA_ALLOW_NO_HIGHLOW_FALLBACK":"1", "LOW_MOVE_TONOSAMA_NO_HIGHLOW_FALLBACK_RANGE_PCT":"0.012", "FINAL_ENTRY_TONOSAMA_LIQUIDITY_FALLBACK":"1", "FINAL_ENTRY_TONOSAMA_MIN_VOLUME":"10000", "FINAL_ENTRY_TONOSAMA_MIN_TURNOVER":"3000000", "FINAL_ENTRY_TONOSAMA_MIN_VOLUME_SPEED":"1.0",
-            "SUMMARY_DB_DATE_GUARD_ENABLED":"1", "SUMMARY_DB_DATE_GUARD_CLEANUP_ENABLED":"0", "RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH_ENABLED":"1", "RANKING_ENTRY_HIGH_LOW_SNAPSHOT_LOOKBACK_ROWS":"12", "RANKING_ENTRY_HIGH_LOW_SNAPSHOT_MAX_AGE_MIN":"30", "RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED":"1", "RANKING_ENTRY_SOURCE_DB_LOOKBACK_MIN":"8", "RANKING_ENTRY_SOURCE_DB_MAX_ROWS":"2000", "RANKING_STUCK_PENDING_MAX_CONTROLLER_RETRY":"2", "RANKING_STUCK_PENDING_MAX_AGE_SEC":"120", "RANKING_FINAL_RESCUE_MIN_SCORE":"55", "RANKING_FINAL_RESCUE_ATR_MIN_RATIO":"0.0005", "RANKING_FINAL_RESCUE_AI_FAILOPEN":"1", "RANKING_ENTRY_WATCHDOG_ENABLED":"1", "RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC":"55",
+            "RANKING_ENTRY_WATCHDOG_ENABLED": "1",
+            "RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC": "55",
+            "RANKING_ENTRY_SNAPSHOT_TECH_ALIAS_ENABLED": "1",
+            "RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED": "1",
+            "RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH_ENABLED": "1",
+            "RANKING_ENTRY_HIGH_LOW_SNAPSHOT_LOOKBACK_ROWS": "12",
+            "RANKING_ENTRY_HIGH_LOW_SNAPSHOT_MAX_AGE_MIN": "30",
+            "RANKING_STUCK_PENDING_MAX_CONTROLLER_RETRY": "2",
+            "RANKING_STUCK_PENDING_MAX_AGE_SEC": "120",
+            "RANKING_FINAL_RESCUE_MIN_SCORE": "55",
+            "RANKING_FINAL_RESCUE_ATR_MIN_RATIO": "0.0005",
+            "RANKING_FINAL_RESCUE_AI_FAILOPEN": "1",
+            # Ranking prefilter accepts low-price liquid names from config; final low-move guard must not re-block only by price.
+            "LOW_MOVE_RANKING_MIN_ENTRY_PRICE": "300",
+            "LOW_MOVE_RANKING_MAX_ENTRY_PRICE": "7000",
+            "LOW_MOVE_RANKING_MIN_RANGE_PCT_LOW_PRICE": "0.008",
+            "LOW_MOVE_RANKING_MIN_RANGE_PCT_HIGH_PRICE": "0.006",
+            "LOW_MOVE_RANKING_STRONG_RANGE_PCT": "0.014",
+            "LOW_MOVE_RANKING_MIN_ABS_SLOPE": "0.0000",
+            "TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING": "1",
+            "TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY": "1",
+            "TONOSAMA_ALLOW_HISTORY_MISSING_ENTRY": "1",
+            "TONOSAMA_DROP_HISTORY_MISSING_ENTRY": "0",
+            "TONOSAMA_RAW1_RESAMPLE_FALLBACK": "1",
+            "TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE": "3.0",
+            "TONOSAMA_5SEC_ADVISORY_ENABLED": "1",
+            "TONOSAMA_5SEC_ALLOW_ZERO_IF_PRIMARY_PASS": "1",
+            "TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC": "0",
+            "TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT": "0.0",
+            "TONOSAMA_ALLOW_HISTORY_MISSING_STRONG_MOVE": "1",
+            "TONOSAMA_ALLOW_WARNING_ONLY_CLIMAX": "1",
+            "TONOSAMA_WARNING_ONLY_MAX_PRICE_CHANGE_PCT": "0.50",
+            "TONOSAMA_PRICE_CHANGE_OR_RANGE_ENABLED": "1",
+            "TONOSAMA_PRICE_CHANGE_OR_RANGE_MIN_RANGE_PCT": "3.0",
+            "TONOSAMA_PRICE_CHANGE_OR_RANGE_MIN_VOLUME": "50000",
+            "TONOSAMA_PRICE_CHANGE_OR_RANGE_MIN_SURGE": "3.0",
+            "TONOSAMA_ENTRY_TIMEOUT_SEC": "45",
+            "TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC": "12",
+            "TONOSAMA_DISPATCH_CONTROLLER_ON_TIMEOUT_PENDING": "1",
+            "TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_SEC": "10",
+            "TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC": "60",
+            "ENTRY_CONTROLLER_LOCK_WAIT_ENABLED": "1",
+            "ENTRY_CONTROLLER_LOCK_WAIT_SOURCES": "RANKING,TONOSAMA,SUMMARY",
+            "ENTRY_CONTROLLER_LOCK_WAIT_SEC": "75",
+            "ENTRY_CONTROLLER_SUMMARY_LOCK_WAIT_SEC": "75",
+            "ENTRY_CONTROLLER_RANKING_LOCK_WAIT_ENABLED": "1",
+            "ENTRY_CONTROLLER_RANKING_LOCK_WAIT_SEC": "75",
+            "ENTRY_CONTROLLER_LOCK_WAIT_TIMEOUT_SKIP_ORIGINAL": "1",
+            "ENTRY_CONTROLLER_SOURCE_PREFILTER_ENABLED": "1",
+            "ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE": "1",
+            "ENTRY_CONTROLLER_TONOSAMA_MIN_SCORE": "0.01",
+            "ENTRY_DIRECTION_RECURSION_FAILOPEN_ENABLED": "1",
+            "ENTRY_SHORT_MTF_REQUIRED": "1",
+            "ENTRY_SHORT_MTF_FORCE_2OF3": "1",
+            "ENTRY_SHORT_MTF_MIN_ALIGNED": "2",
+            "ENTRY_SHORT_MTF_MIN_AVAILABLE": "2",
+            "ENTRY_SHORT_MTF_SLOPE_EPS": "0.0",
+            "ENTRY_DAILY_MTF_OPTIONAL": "1",
+            "ENTRY_SHORT_MTF_DB_BACKFILL": "1",
+            "ENTRY_SHORT_MTF_ZERO_NEUTRAL": "1",
+            "LOW_MOVE_TONOSAMA_MIN_ENTRY_PRICE": "300",
+            "LOW_MOVE_TONOSAMA_ALLOW_NO_HIGHLOW_FALLBACK": "1",
+            "FINAL_ENTRY_TONOSAMA_LIQUIDITY_FALLBACK": "1",
+            "FINAL_ENTRY_TONOSAMA_MIN_VOLUME": "10000",
+            "FINAL_ENTRY_TONOSAMA_MIN_TURNOVER": "3000000",
+            "SUMMARY_DB_DATE_GUARD_ENABLED": "1",
+            "SUMMARY_DB_DATE_GUARD_CLEANUP_ENABLED": "0",
         }
         for k, v in defaults.items():
             os.environ.setdefault(k, v)
         os.environ["ENTRY_SHORT_MTF_REQUIRE_ALL"] = "0"
-        _write_boot_evidence("TONOSAMA_SURGE_DEFAULTS_SET", {"ranking_watchdog": os.environ.get("RANKING_ENTRY_WATCHDOG_ENABLED")})
-        logger.warning("[SITECUSTOMIZE] defaults lite ranking_watchdog=%s timeout=%s tonosama_raw1_resample=%s", os.environ.get("RANKING_ENTRY_WATCHDOG_ENABLED"), os.environ.get("RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC"), os.environ.get("TONOSAMA_RAW1_RESAMPLE_FALLBACK"))
+        _write_boot_evidence("RUNTIME_DEFAULTS_SET", {"ranking_snapshot_alias": os.environ.get("RANKING_ENTRY_SNAPSHOT_TECH_ALIAS_ENABLED")})
+        logger.warning(
+            "[SITECUSTOMIZE] defaults lite ranking_watchdog=%s timeout=%s snapshot_tech_alias=%s ranking_price=%s-%s tonosama_raw1_resample=%s",
+            os.environ.get("RANKING_ENTRY_WATCHDOG_ENABLED"),
+            os.environ.get("RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC"),
+            os.environ.get("RANKING_ENTRY_SNAPSHOT_TECH_ALIAS_ENABLED"),
+            os.environ.get("LOW_MOVE_RANKING_MIN_ENTRY_PRICE"),
+            os.environ.get("LOW_MOVE_RANKING_MAX_ENTRY_PRICE"),
+            os.environ.get("TONOSAMA_RAW1_RESAMPLE_FALLBACK"),
+        )
     except Exception:
-        _write_boot_evidence("TONOSAMA_SURGE_DEFAULTS_EXCEPTION", traceback.format_exc())
+        _write_boot_evidence("RUNTIME_DEFAULTS_EXCEPTION", traceback.format_exc())
 
 
 def _install_summary_mtf_catchup_safely() -> None:
@@ -155,6 +222,7 @@ def _install_summary_mtf_catchup_safely() -> None:
 
 SYNC_MAIN_PATCHES = [
     ("core.startup.ranking_entry_market_hours_skip_patch", "RANKING_ENTRY_WATCHDOG", "DISABLE_RANKING_ENTRY_WATCHDOG_PATCH"),
+    ("core.startup.ranking_entry_snapshot_technical_alias_patch", "RANKING_SNAPSHOT_TECH_ALIAS", "DISABLE_RANKING_SNAPSHOT_TECH_ALIAS_PATCH"),
     ("core.startup.entry_log_skip_reason_collision_patch", "ENTRY_LOG_SKIP_GUARD", "DISABLE_ENTRY_LOG_SKIP_GUARD"),
     ("core.startup.entry_controller_pipeline_lock_wait_patch", "ENTRY_CONTROLLER_LOCK_WAIT", "DISABLE_ENTRY_CONTROLLER_LOCK_WAIT_PATCH"),
     ("core.startup.entry_controller_source_prefilter_patch", "ENTRY_CONTROLLER_SOURCE_PREFILTER", "DISABLE_ENTRY_CONTROLLER_SOURCE_PREFILTER_PATCH"),
@@ -204,7 +272,7 @@ def _background_main_patch_loop() -> None:
 
 _write_boot_evidence("PYTHON_START")
 _install_boot_exception_hook()
-_install_tonosama_surge_defaults()
+_install_runtime_defaults()
 
 if _is_main_py_process() and not _is_database_process() and _env_on("SITECUSTOMIZE_MAIN_LITE", True):
     _install_patch_list(SYNC_MAIN_PATCHES)
