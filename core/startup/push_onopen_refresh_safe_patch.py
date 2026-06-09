@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/push_onopen_refresh_safe_patch.py
-# Version: V2.6-PUSH-ONOPEN-STABLE-DELAYED-REFRESH-MAIN-NAS-SKIP
+# Version: V2.7-PUSH-ONOPEN-STABLE-DELAYED-REFRESH-MAIN-NAS-SKIP-DUE-FILTER
 # ------------------------------------------------------------
 # 目的:
 #   WebSocket reconnect直後の非破壊refreshで kabu Station を再切断させない。
@@ -70,6 +70,8 @@ def _apply_defaults() -> None:
     os.environ.setdefault("AUTOSTOCK_MAIN_SKIP_SUMMARY_PUSH_BG", "1")
     os.environ.setdefault("AUTOSTOCK_MAIN_SKIP_RANKING_SUMMARY_SCHEDULE", "1")
     os.environ.setdefault("AUTOSTOCK_MAIN_DISABLE_SCHEDULED_EXIT_LOOP", "1")
+    os.environ.setdefault("AUTOSTOCK_MAIN_DISABLE_SCHEDULED_ENTRY_JOBS", "1")
+    os.environ.setdefault("AUTOSTOCK_MAIN_SCHEDULE_DUE_FILTER", "1")
 
 
 def _install_main_push_db_restore_skip() -> bool:
@@ -124,6 +126,17 @@ def _install_main_disable_exit_loop_schedule() -> bool:
         return ok
     except Exception:
         logger.exception("[PUSH ONOPEN SAFE REFRESH] main scheduled exit loop disable patch failed")
+        return False
+
+
+def _install_main_schedule_due_filter() -> bool:
+    try:
+        from core.startup.main_schedule_due_filter_patch import install as install_skip
+        ok = bool(install_skip())
+        logger.warning("[PUSH ONOPEN SAFE REFRESH] main schedule due filter patch installed=%s", ok)
+        return ok
+    except Exception:
+        logger.exception("[PUSH ONOPEN SAFE REFRESH] main schedule due filter patch failed")
         return False
 
 
@@ -222,6 +235,7 @@ def install() -> bool:
         _install_main_summary_push_bg_skip()
         _install_main_ranking_summary_schedule_skip()
         _install_main_disable_exit_loop_schedule()
+        _install_main_schedule_due_filter()
 
         from trading.push.push_stream import transport
         transport._start_refresh_after_open_thread = _patched_start_refresh_after_open_thread
@@ -232,7 +246,7 @@ def install() -> bool:
             logger.debug("[PUSH ONOPEN SAFE REFRESH] ws_callbacks patch skipped", exc_info=True)
 
         _INSTALLED = True
-        logger.warning("[PUSH ONOPEN SAFE REFRESH] installed v2.6 stable delayed + main NAS skip patches")
+        logger.warning("[PUSH ONOPEN SAFE REFRESH] installed v2.7 stable delayed + main NAS skip patches + due filter")
         return True
     except Exception:
         logger.exception("[PUSH ONOPEN SAFE REFRESH] install failed")
