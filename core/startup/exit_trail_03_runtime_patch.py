@@ -1,15 +1,19 @@
 # ============================================================
 # File   : core/startup/exit_trail_03_runtime_patch.py
-# Version: V1.1-COST-AWARE
+# Version: V1.2-COST-AWARE-TRAIL-0P2
 # ------------------------------------------------------------
-# BUY : entry price -0.3% で返済
-# BUY : entry後の最高値から -0.3% で返済
-# SELL: entry price +0.3% で返済
-# SELL: entry後の最安値から +0.3% で返済
+# Purpose:
+#   Cost-aware EXIT wrapper.
 #
-# V1.1:
-#   信用金利 0.01% と、返済成行の1ティック不利約定を考慮する。
-#   表面利益ではなく effective_profit_pct をログ・一部利確判定に使う。
+#   BUY : absolute stop uses ABSOLUTE_ENTRY_STOP_LOSS_PCT, default 0.35%
+#   SELL: absolute stop uses ABSOLUTE_ENTRY_STOP_LOSS_PCT, default 0.35%
+#   BUY : entry後の最高値から -0.2% で返済
+#   SELL: entry後の最安値から +0.2% で返済
+#
+# V1.2:
+#   - 旧 0.3% 固定を廃止し、ユーザー指定の戻り幅 0.2% に統一。
+#   - absolute stop は exit_tuning_defaults 側の設定を尊重し、ここで0.3へ戻さない。
+#   - 信用金利 0.01% と、返済成行の1ティック不利約定を考慮する。
 # ============================================================
 
 from __future__ import annotations
@@ -39,7 +43,7 @@ def _env_float(name: str, default: float) -> float:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
             return float(default)
-        return float(v)
+        return float(str(v).replace(",", ""))
     except Exception:
         return float(default)
 
@@ -57,10 +61,10 @@ def _sym(v: Any) -> str:
 def _state(symbol: str) -> Dict[str, Any]:
     try:
         from global_state import global_data
-        root = getattr(global_data, "exit_trail_03_state", None)
+        root = getattr(global_data, "exit_trail_02_state", None)
         if not isinstance(root, dict):
             root = {}
-            setattr(global_data, "exit_trail_03_state", root)
+            setattr(global_data, "exit_trail_02_state", root)
         s = _sym(symbol)
         d = root.get(s)
         if not isinstance(d, dict):
@@ -87,6 +91,15 @@ def _pos_get(pos: Any, *keys: str) -> Any:
     return None
 
 
+def _trail_pct() -> float:
+    # percent表記。0.20 = 0.20%。
+    return max(_env_float("EXIT_PROFIT_TRAIL_DRAWDOWN_PCT", _env_float("ENTRY_TRAIL_RETRACE_EXIT_PCT", 0.20)), 0.01)
+
+
+def _abs_stop_pct(current_default: float = 0.35) -> float:
+    return max(_env_float("ABSOLUTE_ENTRY_STOP_LOSS_PCT", current_default), 0.01)
+
+
 def _tick_size(price: float) -> float:
     # 簡易版。細かい呼値単位は銘柄区分で変わるため、まずは1円を標準にする。
     # 必要なら環境変数 EXIT_MARKET_SLIPPAGE_TICK_SIZE_YEN で上書きする。
@@ -101,7 +114,7 @@ def _cost_params(current: float) -> tuple[float, float, float]:
 
 
 def _effective_exit_price(side: str, current: float) -> float:
-    interest_pct, ticks, tick_yen = _cost_params(current)
+    _interest_pct, ticks, tick_yen = _cost_params(current)
     slip = ticks * tick_yen
     if side == "BUY":
         # BUY建玉の返済は売り。成行だと1ティック安く約定しやすい前提。
@@ -116,14 +129,6 @@ def _profit_pct(side: str, entry: float, current: float) -> float:
     if side == "BUY":
         return (current - entry) / entry * 100.0
     return (entry - current) / entry * 100.0
-
-
-def _effective_profit_pct(side: str, entry: float, current: float) -> float:
-    if entry <= 0 or current <= 0:
-        return 0.0
-    interest_pct, _ticks, _tick_yen = _cost_params(current)
-    effective_price = _effective_exit_price(side, current)
-    return _profit_pct(side, entry, effective_price) - interest_pct
 
 
 def _cost_detail(side: str, entry: float, current: float) -> Dict[str, Any]:
@@ -150,47 +155,55 @@ def install() -> bool:
     try:
         import trading.exit.exit_position_runner as r
     except Exception:
-        logger.exception("[EXIT TRAIL 0.3 COST] import failed")
+        logger.exception("[EXIT TRAIL 0.2 COST] import failed")
         return False
 
-    r.ABSOLUTE_ENTRY_STOP_LOSS_PCT = 0.30
-    r.ENTRY_TRAIL_RETRACE_EXIT_PCT = 0.30
+    current_abs = _f(getattr(r, "ABSOLUTE_ENTRY_STOP_LOSS_PCT", 0.35), 0.35)
+    abs_pct = _abs_stop_pct(current_abs)
+    trail_pct = _trail_pct()
+
+    # ここで0.3へ戻さない。exit_tuning_defaults/user envを尊重する。
+    r.ABSOLUTE_ENTRY_STOP_LOSS_PCT = abs_pct
+    r.ENTRY_TRAIL_RETRACE_EXIT_PCT = trail_pct
+    os.environ["ENTRY_TRAIL_RETRACE_EXIT_PCT"] = f"{trail_pct:.2f}"
+    os.environ["EXIT_PROFIT_TRAIL_DRAWDOWN_PCT"] = f"{trail_pct:.2f}"
 
     old_abs = getattr(r, "_judge_absolute_entry_stop_loss", None)
     old_trail = getattr(r, "_judge_entry_trail_retrace_exit", None)
     old_partial = getattr(r, "_judge_partial_profit_take", None)
 
-    if callable(old_abs) and not getattr(old_abs, "_trail03_cost_wrapped", False):
-        def abs03(*, symbol: str, side: str, entry_price: float, current_price: float):
+    if callable(old_abs) and not getattr(old_abs, "_trail02_cost_wrapped", False):
+        def abs_cost(*, symbol: str, side: str, entry_price: float, current_price: float):
             side_u = str(side or "").upper()
             entry = _f(entry_price)
             cur = _f(current_price)
+            pct = _abs_stop_pct(abs_pct)
             if entry <= 0 or cur <= 0 or side_u not in {"BUY", "SELL"}:
                 return False, "", {}
-            pct = 0.30
             cost = _cost_detail(side_u, entry, cur)
             effective_price = cost["effective_exit_price"]
             if side_u == "BUY":
-                line = entry * 0.997
+                line = entry * (1.0 - pct / 100.0)
                 adverse = (entry - effective_price) / entry * 100.0
                 detail = {"side": side_u, "entry_price": entry, "line": line, "adverse_pct": adverse, "threshold_pct": pct, **cost}
                 if effective_price <= line:
-                    return True, f"ENTRY_PRICE_0P3_EXIT_BUY_COST entry={entry:.4f} effective={effective_price:.4f} current={cur:.4f} line={line:.4f}", detail
+                    return True, f"ENTRY_PRICE_STOP_EXIT_BUY_COST pct={pct:.2f} entry={entry:.4f} effective={effective_price:.4f} current={cur:.4f} line={line:.4f}", detail
                 return False, "", detail
-            line = entry * 1.003
+            line = entry * (1.0 + pct / 100.0)
             adverse = (effective_price - entry) / entry * 100.0
             detail = {"side": side_u, "entry_price": entry, "line": line, "adverse_pct": adverse, "threshold_pct": pct, **cost}
             if effective_price >= line:
-                return True, f"ENTRY_PRICE_0P3_EXIT_SELL_COST entry={entry:.4f} effective={effective_price:.4f} current={cur:.4f} line={line:.4f}", detail
+                return True, f"ENTRY_PRICE_STOP_EXIT_SELL_COST pct={pct:.2f} entry={entry:.4f} effective={effective_price:.4f} current={cur:.4f} line={line:.4f}", detail
             return False, "", detail
-        abs03._trail03_cost_wrapped = True  # type: ignore[attr-defined]
-        r._judge_absolute_entry_stop_loss = abs03
+        abs_cost._trail02_cost_wrapped = True  # type: ignore[attr-defined]
+        r._judge_absolute_entry_stop_loss = abs_cost
 
-    if callable(old_trail) and not getattr(old_trail, "_trail03_cost_wrapped", False):
-        def trail03(*, symbol: str, pos: Dict[str, Any], side: str, entry_price: float, current_price: float, ctx: Any):
+    if callable(old_trail) and not getattr(old_trail, "_trail02_cost_wrapped", False):
+        def trail02(*, symbol: str, pos: Dict[str, Any], side: str, entry_price: float, current_price: float, ctx: Any):
             side_u = str(side or "").upper()
             entry = _f(entry_price)
             cur = _f(current_price)
+            pct = _trail_pct()
             if entry <= 0 or cur <= 0 or side_u not in {"BUY", "SELL"}:
                 return False, "", {}
 
@@ -226,21 +239,21 @@ def install() -> bool:
             effective_price = cost["effective_exit_price"]
 
             if side_u == "BUY":
-                line = high * 0.997
+                line = high * (1.0 - pct / 100.0)
                 retrace = (high - effective_price) / high * 100.0 if high > 0 else 0.0
-                detail = {"side": side_u, "entry_price": entry, "highest": high, "line": line, "retrace_pct": retrace, "threshold_pct": 0.30, **cost}
+                detail = {"side": side_u, "entry_price": entry, "highest": high, "line": line, "retrace_pct": retrace, "threshold_pct": pct, **cost}
                 if high > entry and effective_price <= line:
-                    return True, f"HIGH_0P3_TRAIL_EXIT_BUY_COST high={high:.4f} effective={effective_price:.4f} current={cur:.4f} line={line:.4f}", detail
+                    return True, f"HIGH_0P2_TRAIL_EXIT_BUY_COST high={high:.4f} effective={effective_price:.4f} current={cur:.4f} line={line:.4f}", detail
                 return False, "", detail
 
-            line = low * 1.003
+            line = low * (1.0 + pct / 100.0)
             retrace = (effective_price - low) / low * 100.0 if low > 0 else 0.0
-            detail = {"side": side_u, "entry_price": entry, "lowest": low, "line": line, "retrace_pct": retrace, "threshold_pct": 0.30, **cost}
+            detail = {"side": side_u, "entry_price": entry, "lowest": low, "line": line, "retrace_pct": retrace, "threshold_pct": pct, **cost}
             if low < entry and effective_price >= line:
-                return True, f"LOW_0P3_TRAIL_EXIT_SELL_COST low={low:.4f} effective={effective_price:.4f} current={cur:.4f} line={line:.4f}", detail
+                return True, f"LOW_0P2_TRAIL_EXIT_SELL_COST low={low:.4f} effective={effective_price:.4f} current={cur:.4f} line={line:.4f}", detail
             return False, "", detail
-        trail03._trail03_cost_wrapped = True  # type: ignore[attr-defined]
-        r._judge_entry_trail_retrace_exit = trail03
+        trail02._trail02_cost_wrapped = True  # type: ignore[attr-defined]
+        r._judge_entry_trail_retrace_exit = trail02
 
     if callable(old_partial) and not getattr(old_partial, "_partial_cost_wrapped", False):
         def partial_cost(*, symbol: str, pos: Dict[str, Any], side: str, entry_price: float, current_price: float, ctx: Any):
@@ -251,7 +264,7 @@ def install() -> bool:
                 return False, "", {}
             try:
                 enabled = bool(getattr(r, "PARTIAL_PROFIT_ENABLED", True))
-                trigger = _f(getattr(r, "PARTIAL_PROFIT_TRIGGER_PCT", 0.20), 0.20)
+                trigger = _f(getattr(r, "PARTIAL_PROFIT_TRIGGER_PCT", 0.40), 0.40)
                 min_qty = int(_f(getattr(r, "PARTIAL_PROFIT_MIN_QTY", 200), 200))
                 ratio = _f(getattr(r, "PARTIAL_PROFIT_RATIO", 0.50), 0.50)
                 qty = int(_f(_pos_get(pos, "qty", "quantity"), 0))
@@ -272,7 +285,9 @@ def install() -> bool:
 
     _INSTALLED = True
     logger.warning(
-        "[EXIT TRAIL 0.3 COST] installed entry_line=0.3 trail_line=0.3 interest_pct=%.4f slippage_ticks=%.2f tick_yen=%.4f",
+        "[EXIT TRAIL 0.2 COST] installed abs_line=%.2f trail_line=%.2f interest_pct=%.4f slippage_ticks=%.2f tick_yen=%.4f",
+        _abs_stop_pct(abs_pct),
+        _trail_pct(),
         _env_float("EXIT_CREDIT_INTEREST_PCT", 0.01),
         _env_float("EXIT_MARKET_SLIPPAGE_TICKS", 1.0),
         _env_float("EXIT_MARKET_SLIPPAGE_TICK_SIZE_YEN", 1.0),
@@ -283,7 +298,7 @@ def install() -> bool:
 try:
     install()
 except Exception:
-    logger.exception("[EXIT TRAIL 0.3 COST] auto install failed")
+    logger.exception("[EXIT TRAIL 0.2 COST] auto install failed")
 
 
 __all__ = ["install"]
