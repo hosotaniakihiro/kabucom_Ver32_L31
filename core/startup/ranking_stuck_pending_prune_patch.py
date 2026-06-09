@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,35 @@ def _env_float(name: str, default: float) -> float:
         return float(v)
     except Exception:
         return float(default)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return bool(default)
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+
+
+def _is_main_py_process() -> bool:
+    try:
+        return Path(sys.argv[0]).name.lower() == "main.py"
+    except Exception:
+        return False
+
+
+def _main_skip_ranking_entry() -> bool:
+    """
+    main.py is the entry/exit process and is not the ranking DB owner.
+
+    Repeated Windows 0xC0000006 crashes were observed after this wrapper called
+    the original ranking entry job and the job resolved/read
+    \\192.168.0.22\\...\\rankingYYYYMMDD.db.  The DB-owner process
+    (main_database.py) should handle ranking collection/build work.  Keep main.py
+    alive by default and allow legacy behavior only when explicitly requested.
+    """
+    if not _is_main_py_process():
+        return False
+    return _env_bool("AUTOSTOCK_MAIN_SKIP_RANKING_ENTRY", True)
 
 
 def _source(entry: Any) -> str:
@@ -157,11 +188,18 @@ def _patch_once() -> bool:
         cur = getattr(tasks, "_run_ranking_entry_safe", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_ranking_stuck_pending_prune_v2", False):
+        if getattr(cur, "_ranking_stuck_pending_prune_v3", False):
             return True
         orig = getattr(cur, "_original", cur)
 
         def patched():
+            if _main_skip_ranking_entry():
+                logger.warning(
+                    "[RANKING STUCK PENDING] main.py skip ranking entry job to avoid NAS ranking DB read. "
+                    "Set AUTOSTOCK_MAIN_SKIP_RANKING_ENTRY=0 to restore legacy behavior."
+                )
+                return 0
+
             cnt = _pending_count()
             if cnt > 0:
                 pruned = _mark_and_prune_stuck_ranking_pending()
@@ -177,9 +215,13 @@ def _patch_once() -> bool:
 
         patched._ranking_stuck_pending_prune_v1 = True  # type: ignore[attr-defined]
         patched._ranking_stuck_pending_prune_v2 = True  # type: ignore[attr-defined]
+        patched._ranking_stuck_pending_prune_v3 = True  # type: ignore[attr-defined]
         patched._original = orig  # type: ignore[attr-defined]
         tasks._run_ranking_entry_safe = patched
-        logger.warning("[RANKING STUCK PENDING] patched _run_ranking_entry_safe v2 min_age_guard=True")
+        logger.warning(
+            "[RANKING STUCK PENDING] patched _run_ranking_entry_safe v3 min_age_guard=True main_skip=%s",
+            _main_skip_ranking_entry(),
+        )
         return True
     except Exception:
         logger.exception("[RANKING STUCK PENDING] patch failed")
@@ -190,7 +232,7 @@ def _watch():
     for i in range(120):
         ok = _patch_once()
         if i in (0, 1, 5, 15, 30, 60, 119):
-            logger.warning("[RANKING STUCK PENDING] enforce ok=%s v2", ok)
+            logger.warning("[RANKING STUCK PENDING] enforce ok=%s v3 main_skip=%s", ok, _main_skip_ranking_entry())
         time.sleep(0.5)
 
 
@@ -201,10 +243,15 @@ def install() -> bool:
     os.environ.setdefault("RANKING_STUCK_PENDING_MAX_CONTROLLER_RETRY", "3")
     os.environ.setdefault("RANKING_STUCK_PENDING_MIN_AGE_SEC", "30")
     os.environ.setdefault("RANKING_STUCK_PENDING_MAX_AGE_SEC", "120")
+    os.environ.setdefault("AUTOSTOCK_MAIN_SKIP_RANKING_ENTRY", "1")
     ok = _patch_once()
     threading.Thread(target=_watch, name="ranking-stuck-pending-prune", daemon=True).start()
     _DONE = True
-    logger.warning("[RANKING STUCK PENDING] installed v2 ok=%s watcher=True min_age_guard=True", ok)
+    logger.warning(
+        "[RANKING STUCK PENDING] installed v3 ok=%s watcher=True min_age_guard=True main_skip=%s",
+        ok,
+        _main_skip_ranking_entry(),
+    )
     return True
 
 
