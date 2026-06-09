@@ -1,19 +1,14 @@
 # ============================================================
 # File   : core/startup/ranking_entry_snapshot_technical_bridge_patch.py
-# Version: V3-RANKING-SNAPSHOT-DB-TECH-BRIDGE-PARAM-FIX
+# Version: V4-RANKING-SNAPSHOT-HISTORY-COMPUTE-FALLBACK
 # ------------------------------------------------------------
 # 目的:
-#   PUSH summary history が main.py 側で空、かつ prefilter後のrowから
-#   ma/atr/slope/macd/rsi列が落ちている場合でも、ranking_snapshot_1min
-#   の最新行をsymbol指定で直接読み直し、Ranking entry の pending / entry_row
-#   にtechnical列を流す。
+#   ranking_snapshot_1min の技術列が NULL の日でも、symbol の直近
+#   snapshot 履歴から MA/ATR/slope/MACD を簡易算出して Ranking entry に渡す。
 #
-# V3 Fix:
-#   - V2のDB lookup SQLで placeholder 順が逆だった。
-#     SQL: WHERE symbol=? ORDER BY CASE WHEN rank_type=? THEN ...
-#     params: [rank_type, symbol] になっていたため、symbol=? に rank_type が入り
-#     常に0件になっていた。paramsを [symbol, rank_type] に修正。
-#   - lookup miss / table / columns / db path を warning で出す。
+# V4 Fix:
+#   - DB lookup は hit しているが ma5_1m/atr_1m/slope_1m/macd_1m が NULL。
+#   - symbol の直近価格履歴から fallback technical を計算する。
 # ============================================================
 from __future__ import annotations
 
@@ -153,9 +148,104 @@ def _has_real_tech(row: dict[str, Any]) -> bool:
         return False
 
 
+def _mean(vals: list[float]) -> float:
+    vals = [float(x) for x in vals if math.isfinite(float(x))]
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def _ema(vals: list[float], span: int) -> float:
+    if not vals:
+        return 0.0
+    alpha = 2.0 / (float(span) + 1.0)
+    e = float(vals[0])
+    for v in vals[1:]:
+        e = alpha * float(v) + (1.0 - alpha) * e
+    return e
+
+
+def _rsi(vals: list[float], period: int = 14) -> float:
+    if len(vals) < 2:
+        return 50.0
+    diffs = [vals[i] - vals[i - 1] for i in range(1, len(vals))]
+    use = diffs[-period:]
+    gains = [max(0.0, x) for x in use]
+    losses = [max(0.0, -x) for x in use]
+    ag = _mean(gains)
+    al = _mean(losses)
+    if al <= 0:
+        return 100.0 if ag > 0 else 50.0
+    rs = ag / al
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _calc_from_history(rows: list[dict[str, Any]], tf: int = 1) -> dict[str, Any]:
+    if not rows:
+        return {}
+    rows = list(reversed(rows))  # DB DESC -> chronological
+    closes = [_sf(_first(r, "close", "current_price", "price"), 0.0) for r in rows]
+    highs = [_sf(_first(r, "high", "current_price", "price", "close"), 0.0) for r in rows]
+    lows = [_sf(_first(r, "low", "current_price", "price", "close"), 0.0) for r in rows]
+    vols = [_sf(_first(r, "volume", "trading_volume"), 0.0) for r in rows]
+    closes = [x for x in closes if x > 0]
+    if not closes:
+        return {}
+    last = closes[-1]
+    prev = closes[-2] if len(closes) >= 2 else last
+    high_last = highs[-1] if highs and highs[-1] > 0 else last
+    low_last = lows[-1] if lows and lows[-1] > 0 else last
+    ma5 = _mean(closes[-5:])
+    ma25 = _mean(closes[-25:]) if len(closes) >= 5 else ma5
+    ma75 = _mean(closes[-75:]) if len(closes) >= 5 else ma25
+    slope = ((last - prev) / prev) if prev > 0 else 0.0
+    slope_pct = slope * 100.0
+    rngs = []
+    for h, l, c in zip(highs[-14:], lows[-14:], closes[-14:]):
+        if h > 0 and l > 0 and c > 0:
+            rngs.append(abs(h - l) / c)
+    atr = _mean(rngs) if rngs else abs(last - prev) / prev if prev > 0 else 0.0
+    ema12 = _ema(closes[-40:], 12)
+    ema26 = _ema(closes[-60:], 26)
+    macd = ema12 - ema26
+    signal = macd * 0.8
+    hist = macd - signal
+    out: dict[str, Any] = {
+        f"ma5_{tf}m": ma5,
+        f"ma25_{tf}m": ma25,
+        f"ma75_{tf}m": ma75,
+        f"rsi_{tf}m": _rsi(closes),
+        f"macd_{tf}m": macd,
+        f"signal_{tf}m": signal,
+        f"macd_hist_{tf}m": hist,
+        f"atr_{tf}m": atr,
+        f"slope_{tf}m": slope,
+        f"slope_pct_{tf}m": slope_pct,
+        f"slope_atr_scaled_{tf}m": (slope / atr) if atr > 0 else 0.0,
+        f"price_change_pct_{tf}m": ((last - prev) / prev * 100.0) if prev > 0 else 0.0,
+        f"volume_sma5_{tf}m": _mean(vols[-5:]) if vols else 0.0,
+        f"volume_sma25_{tf}m": _mean(vols[-25:]) if vols else 0.0,
+        f"volume_ratio5_{tf}m": (vols[-1] / _mean(vols[-5:])) if vols and _mean(vols[-5:]) > 0 else 0.0,
+        f"technical_ready_{tf}m": 1,
+        "technical_ready": 1,
+        "ranking_tech_history_compute": True,
+        "ranking_tech_source": f"ranking_snapshot_history_compute_{tf}m",
+        "ranking_tech_reason": "ranking_snapshot_db_cols_null_compute_from_price_history",
+    }
+    # base aliases too
+    for base in _BASE_TECH:
+        src = f"{base}_{tf}m"
+        if src in out:
+            out[base] = out[src]
+    out["close"] = last
+    out["price"] = last
+    out["current_price"] = last
+    out["high"] = high_last
+    out["low"] = low_last
+    out["open"] = _sf(_first(rows[-1], "open", "price", "current_price", "close"), last)
+    return out
+
+
 @lru_cache(maxsize=2048)
 def _load_snapshot_tech_cached(symbol: str, rank_type: str, side: str, bucket_minute: int) -> tuple[tuple[str, Any], ...]:
-    """LRU cache keyにminute bucketを入れ、1分ごとに自然更新する。"""
     del side, bucket_minute
     db = _ranking_db_path()
     if not symbol:
@@ -181,9 +271,6 @@ def _load_snapshot_tech_cached(symbol: str, rank_type: str, side: str, bucket_mi
                 logger.warning("[RANKING SNAPSHOT TECH BRIDGE] db lookup skipped no selectable cols symbol=%s db=%s", symbol, db)
                 return tuple()
 
-            # CRITICAL: placeholder order must match SQL order.
-            # WHERE symbol=? が先、ORDER BY CASE WHEN rank_type=? が後。
-            where = "symbol=?"
             params: list[Any] = [symbol]
             order_rank_type = "0"
             if rank_type and "rank_type" in cols:
@@ -195,10 +282,9 @@ def _load_snapshot_tech_cached(symbol: str, rank_type: str, side: str, bucket_mi
 
             dt_col = "datetime" if "datetime" in cols else ("snapshot_time" if "snapshot_time" in cols else None)
             order_dt = f"{dt_col} DESC" if dt_col else "rowid DESC"
-            sql = f"SELECT {', '.join(select_cols)} FROM ranking_snapshot_1min WHERE {where} ORDER BY {order_rank_type}, {order_dt}, rowid DESC LIMIT 1"
+            sql = f"SELECT {', '.join(select_cols)} FROM ranking_snapshot_1min WHERE symbol=? ORDER BY {order_rank_type}, {order_dt}, rowid DESC LIMIT 1"
             row = conn.execute(sql, params).fetchone()
             if not row:
-                # fallback: typeを完全に無視してsymbol最新を拾う
                 sql2 = f"SELECT {', '.join(select_cols)} FROM ranking_snapshot_1min WHERE symbol=? ORDER BY {order_dt}, rowid DESC LIMIT 1"
                 row = conn.execute(sql2, [symbol]).fetchone()
             if not row:
@@ -209,6 +295,20 @@ def _load_snapshot_tech_cached(symbol: str, rank_type: str, side: str, bucket_mi
                 "[RANKING SNAPSHOT TECH BRIDGE] db lookup hit symbol=%s rank_type=%s db=%s cols=%s ma5_1m=%s atr_1m=%s slope_1m=%s macd_1m=%s signal_1m=%s dt=%s",
                 symbol, rank_type, db, len(d), d.get("ma5_1m"), d.get("atr_1m"), d.get("slope_1m"), d.get("macd_1m"), d.get("signal_1m"), d.get("datetime") or d.get("snapshot_time"),
             )
+            if not _has_real_tech(d) and _env_bool("RANKING_SNAPSHOT_TECH_HISTORY_COMPUTE", True):
+                hist_cols = [c for c in [
+                    "symbol", "datetime", "snapshot_time", "rank_type", "ranking_type", "open", "high", "low", "close", "price", "current_price", "volume", "trading_volume", "turnover"
+                ] if c in cols]
+                if hist_cols:
+                    hist_sql = f"SELECT {', '.join(hist_cols)} FROM ranking_snapshot_1min WHERE symbol=? ORDER BY {order_dt}, rowid DESC LIMIT ?"
+                    hist_rows = [dict(x) for x in conn.execute(hist_sql, [symbol, max(10, _env_int("RANKING_SNAPSHOT_TECH_HISTORY_ROWS", 80))]).fetchall()]
+                    calc = _calc_from_history(hist_rows, tf=1)
+                    if calc:
+                        d.update(calc)
+                        logger.warning(
+                            "[RANKING SNAPSHOT TECH BRIDGE] history compute filled symbol=%s rows=%s ma5=%.4f atr=%.6f slope=%.6f macd=%.6f",
+                            symbol, len(hist_rows), _sf(calc.get("ma5_1m")), _sf(calc.get("atr_1m")), _sf(calc.get("slope_1m")), _sf(calc.get("macd_1m")),
+                        )
             return tuple(d.items())
     except Exception:
         logger.exception("[RANKING SNAPSHOT TECH BRIDGE] db lookup failed symbol=%s rank_type=%s db=%s", symbol, rank_type, db)
@@ -238,7 +338,7 @@ def _merge_db_snapshot_tech(row: dict[str, Any]) -> tuple[dict[str, Any], int]:
             copied += 1
     if copied:
         out["ranking_tech_db_lookup"] = True
-        out["ranking_tech_db_source"] = "ranking_snapshot_1min_latest_by_symbol"
+        out["ranking_tech_db_source"] = src.get("ranking_tech_source") or "ranking_snapshot_1min_latest_by_symbol"
     return out, copied
 
 
@@ -314,7 +414,7 @@ def _patch_entry_from_ranking() -> bool:
     patched = False
 
     cur_attach = getattr(efr, "attach_ranking_technicals", None)
-    if callable(cur_attach) and not getattr(cur_attach, "_snapshot_technical_bridge_v3", False):
+    if callable(cur_attach) and not getattr(cur_attach, "_snapshot_technical_bridge_v4", False):
         orig_attach = getattr(cur_attach, "_original", cur_attach)
 
         @wraps(orig_attach)
@@ -330,21 +430,21 @@ def _patch_entry_from_ranking() -> bool:
                     base.update(ret)
                 out, copied, tf = _copy_snapshot_tech(base)
                 logger.info(
-                    "[RANKING SNAPSHOT TECH BRIDGE] attached symbol=%s copied=%s tf=%sm db=%s atr=%s ma5=%s slope=%s macd=%s signal=%s",
-                    out.get("symbol"), copied, tf, out.get("ranking_tech_db_lookup"), out.get("atr"), out.get("ma5"), out.get("slope"), out.get("macd"), out.get("signal"),
+                    "[RANKING SNAPSHOT TECH BRIDGE] attached symbol=%s copied=%s tf=%sm db=%s hist=%s atr=%s ma5=%s slope=%s macd=%s signal=%s",
+                    out.get("symbol"), copied, tf, out.get("ranking_tech_db_lookup"), out.get("ranking_tech_history_compute"), out.get("atr"), out.get("ma5"), out.get("slope"), out.get("macd"), out.get("signal"),
                 )
                 return out
             except Exception:
                 logger.exception("[RANKING SNAPSHOT TECH BRIDGE] attach bridge failed")
                 return ret
 
-        attach_wrapper._snapshot_technical_bridge_v3 = True  # type: ignore[attr-defined]
+        attach_wrapper._snapshot_technical_bridge_v4 = True  # type: ignore[attr-defined]
         attach_wrapper._original = orig_attach  # type: ignore[attr-defined]
         efr.attach_ranking_technicals = attach_wrapper
         patched = True
 
     cur_builder = getattr(efr, "build_entry_row", None)
-    if callable(cur_builder) and not getattr(cur_builder, "_snapshot_technical_bridge_v3", False):
+    if callable(cur_builder) and not getattr(cur_builder, "_snapshot_technical_bridge_v4", False):
         orig_builder = getattr(cur_builder, "_original", cur_builder)
 
         @wraps(orig_builder)
@@ -364,15 +464,19 @@ def _patch_entry_from_ranking() -> bool:
                 entry["ranking_tech_source"] = bridged.get("ranking_tech_source", "ranking_snapshot_1min" if copied else "")
                 entry["ranking_tech_reason"] = bridged.get("ranking_tech_reason", f"snapshot_technical_bridge_tf={tf}m" if copied else "")
                 entry["ranking_tech_db_lookup"] = bool(bridged.get("ranking_tech_db_lookup", False))
-                logger.info("[RANKING SNAPSHOT TECH BRIDGE] build_entry_row copied symbol=%s copied=%s tf=%sm db=%s", entry.get("symbol") or bridged.get("symbol"), copied, tf, bridged.get("ranking_tech_db_lookup"))
+                entry["ranking_tech_history_compute"] = bool(bridged.get("ranking_tech_history_compute", False))
+                logger.info(
+                    "[RANKING SNAPSHOT TECH BRIDGE] build_entry_row copied symbol=%s copied=%s tf=%sm db=%s hist=%s atr=%s ma5=%s slope=%s macd=%s",
+                    entry.get("symbol") or bridged.get("symbol"), copied, tf, bridged.get("ranking_tech_db_lookup"), bridged.get("ranking_tech_history_compute"), entry.get("atr"), entry.get("ma5"), entry.get("slope"), entry.get("macd"),
+                )
             return entry
 
-        build_entry_row_wrapper._snapshot_technical_bridge_v3 = True  # type: ignore[attr-defined]
+        build_entry_row_wrapper._snapshot_technical_bridge_v4 = True  # type: ignore[attr-defined]
         build_entry_row_wrapper._original = orig_builder  # type: ignore[attr-defined]
         efr.build_entry_row = build_entry_row_wrapper
         patched = True
 
-    return patched or bool(getattr(getattr(efr, "attach_ranking_technicals", None), "_snapshot_technical_bridge_v3", False))
+    return patched or bool(getattr(getattr(efr, "attach_ranking_technicals", None), "_snapshot_technical_bridge_v4", False))
 
 
 def install() -> bool:
@@ -384,9 +488,16 @@ def install() -> bool:
         os.environ.setdefault("RANKING_SNAPSHOT_TECH_BRIDGE_ENABLED", "1")
         os.environ.setdefault("RANKING_SNAPSHOT_TECH_DB_LOOKUP", "1")
         os.environ.setdefault("RANKING_SNAPSHOT_TECH_DB_CACHE_SEC", "30")
+        os.environ.setdefault("RANKING_SNAPSHOT_TECH_HISTORY_COMPUTE", "1")
+        os.environ.setdefault("RANKING_SNAPSHOT_TECH_HISTORY_ROWS", "80")
         ok = _patch_entry_from_ranking()
         _INSTALLED = bool(ok)
-        logger.warning("[RANKING SNAPSHOT TECH BRIDGE] installed v3 db_lookup=%s ok=%s", _env_bool("RANKING_SNAPSHOT_TECH_DB_LOOKUP", True), ok)
+        logger.warning(
+            "[RANKING SNAPSHOT TECH BRIDGE] installed v4 db_lookup=%s history_compute=%s ok=%s",
+            _env_bool("RANKING_SNAPSHOT_TECH_DB_LOOKUP", True),
+            _env_bool("RANKING_SNAPSHOT_TECH_HISTORY_COMPUTE", True),
+            ok,
+        )
         return bool(ok)
     except Exception:
         logger.exception("[RANKING SNAPSHOT TECH BRIDGE] install failed")
