@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/ranking_wal_checkpoint_memory_guard_patch.py
-# Version: V1-RANKING-WAL-CHECKPOINT-MEMORY-GUARD
+# Version: V2-RANKING-WAL-CHECKPOINT-MEMORY-GUARD-MAIN-SKIP
 # ------------------------------------------------------------
 # Purpose:
 #   main_database.py / ranking collector can keep rankingYYYYMMDD.db-wal
@@ -13,12 +13,19 @@
 #   - Run PASSIVE checkpoints after flush.
 #   - If -wal file exceeds threshold, run TRUNCATE checkpoint.
 #   - gc.collect() after large flushes to release dataframe/tuple pressure.
+#
+# V2:
+#   - main.py is an entry/exit process, not the ranking DB owner.
+#   - Do NOT run NAS SQLite WAL checkpoints from main.py.  On Windows/NAS,
+#     PRAGMA wal_checkpoint against rankingYYYYMMDD.db can terminate the
+#     process with 0xC0000006.  main_database.py owns ranking DB maintenance.
 # ============================================================
 from __future__ import annotations
 
 import gc
 import logging
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -27,6 +34,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 _INSTALLED = False
 _INSTALLING = False
+_SKIPPED_MAIN = False
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -56,6 +64,18 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _is_main_py_process() -> bool:
+    try:
+        return Path(sys.argv[0]).name.lower() == "main.py"
+    except Exception:
+        return False
+
+
+def _skip_in_main_py() -> bool:
+    # Default ON: ranking DB/WAL maintenance belongs to main_database.py.
+    return _is_main_py_process() and _env_bool("AUTOSTOCK_MAIN_SKIP_RANKING_WAL_GUARD", True)
+
+
 def _wal_path(db_path: Any) -> Path | None:
     try:
         if not db_path:
@@ -76,6 +96,15 @@ def _wal_mb(db_path: Any) -> float:
 
 
 def _checkpoint(writer: Any, *, mode: str, reason: str) -> bool:
+    if _skip_in_main_py():
+        logger.warning(
+            "[RANKING WAL GUARD] checkpoint skipped in main.py mode=%s reason=%s db=%s. "
+            "main_database.py owns ranking WAL maintenance.",
+            mode,
+            reason,
+            getattr(writer, "db_path", None),
+        )
+        return False
     try:
         conn = getattr(writer, "conn", None)
         cursor = getattr(writer, "cursor", None)
@@ -99,8 +128,16 @@ def _checkpoint(writer: Any, *, mode: str, reason: str) -> bool:
 
 
 def _apply() -> bool:
-    global _INSTALLED
+    global _INSTALLED, _SKIPPED_MAIN
     if _INSTALLED:
+        return True
+    if _skip_in_main_py():
+        _INSTALLED = True
+        _SKIPPED_MAIN = True
+        logger.warning(
+            "[RANKING WAL GUARD] skipped install in main.py by AUTOSTOCK_MAIN_SKIP_RANKING_WAL_GUARD=1. "
+            "main_database.py handles ranking WAL checkpoint/truncate."
+        )
         return True
     try:
         import trading.ranking.ranking_db_writer as mod
@@ -112,7 +149,7 @@ def _apply() -> bool:
         return False
 
     try:
-        if getattr(cls, "_ranking_wal_guard_v1", False):
+        if getattr(cls, "_ranking_wal_guard_v2", False) or getattr(cls, "_ranking_wal_guard_v1", False):
             _INSTALLED = True
             return True
 
@@ -122,6 +159,12 @@ def _apply() -> bool:
 
         def _open_connection_patched(self, *args: Any, **kwargs: Any):
             ret = orig_open(self, *args, **kwargs)
+            if _skip_in_main_py():
+                logger.warning(
+                    "[RANKING WAL GUARD] sqlite tuning skipped in main.py db=%s",
+                    getattr(self, "db_path", None),
+                )
+                return ret
             try:
                 cursor = getattr(self, "cursor", None)
                 if cursor is not None:
@@ -143,6 +186,9 @@ def _apply() -> bool:
 
         def _flush_patched(self, *args: Any, **kwargs: Any):
             ret = orig_flush(self, *args, **kwargs)
+            if _skip_in_main_py():
+                logger.warning("[RANKING WAL GUARD] after-flush guard skipped in main.py db=%s", getattr(self, "db_path", None))
+                return ret
             try:
                 if not ret:
                     return ret
@@ -159,6 +205,9 @@ def _apply() -> bool:
             return ret
 
         def _loop_patched(self, *args: Any, **kwargs: Any):
+            if _skip_in_main_py():
+                logger.warning("[RANKING WAL GUARD] loop wrapper bypassed in main.py db=%s", getattr(self, "db_path", None))
+                return orig_loop(self, *args, **kwargs)
             # Original loop handles flush. This wrapper adds idle checkpoint every N seconds.
             last_idle_checkpoint = 0.0
             idle_interval = max(5.0, _env_float("RANKING_WRITER_IDLE_CHECKPOINT_SEC", 60.0))
@@ -188,20 +237,20 @@ def _apply() -> bool:
                     logger.exception("[RANKING WAL GUARD] loop error")
                     time.sleep(1.0)
 
-        _open_connection_patched._ranking_wal_guard_v1 = True  # type: ignore[attr-defined]
+        _open_connection_patched._ranking_wal_guard_v2 = True  # type: ignore[attr-defined]
         _open_connection_patched._original = orig_open  # type: ignore[attr-defined]
-        _flush_patched._ranking_wal_guard_v1 = True  # type: ignore[attr-defined]
+        _flush_patched._ranking_wal_guard_v2 = True  # type: ignore[attr-defined]
         _flush_patched._original = orig_flush  # type: ignore[attr-defined]
-        _loop_patched._ranking_wal_guard_v1 = True  # type: ignore[attr-defined]
+        _loop_patched._ranking_wal_guard_v2 = True  # type: ignore[attr-defined]
         _loop_patched._original = orig_loop  # type: ignore[attr-defined]
 
         cls._open_connection = _open_connection_patched
         cls.flush = _flush_patched
         cls._loop = _loop_patched
-        cls._ranking_wal_guard_v1 = True
+        cls._ranking_wal_guard_v2 = True
         _INSTALLED = True
         logger.warning(
-            "[RANKING WAL GUARD] installed v1 wal_truncate_mb=%.1f cache_kb=%s idle_checkpoint_sec=%.1f",
+            "[RANKING WAL GUARD] installed v2 wal_truncate_mb=%.1f cache_kb=%s idle_checkpoint_sec=%.1f",
             _env_float("RANKING_WRITER_WAL_TRUNCATE_MB", 128.0),
             _env_int("RANKING_SQLITE_CACHE_KB", -8192),
             _env_float("RANKING_WRITER_IDLE_CHECKPOINT_SEC", 60.0),
