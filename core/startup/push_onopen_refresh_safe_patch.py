@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/push_onopen_refresh_safe_patch.py
-# Version: V2.4-PUSH-ONOPEN-STABLE-DELAYED-REFRESH-MAIN-NAS-SKIP
+# Version: V2.5-PUSH-ONOPEN-STABLE-DELAYED-REFRESH-MAIN-NAS-SKIP
 # ------------------------------------------------------------
 # 目的:
 #   WebSocket reconnect直後の非破壊refreshで kabu Station を再切断させない。
@@ -68,6 +68,7 @@ def _apply_defaults() -> None:
     os.environ.setdefault("AUTOSTOCK_MAIN_SKIP_PUSH_SUMMARY_FALLBACK", "1")
     os.environ.setdefault("AUTOSTOCK_MAIN_SKIP_RANKING_SUMMARY_BOOTSTRAP", "1")
     os.environ.setdefault("AUTOSTOCK_MAIN_SKIP_SUMMARY_PUSH_BG", "1")
+    os.environ.setdefault("AUTOSTOCK_MAIN_SKIP_RANKING_SUMMARY_SCHEDULE", "1")
 
 
 def _install_main_push_db_restore_skip() -> bool:
@@ -100,6 +101,17 @@ def _install_main_summary_push_bg_skip() -> bool:
         return ok
     except Exception:
         logger.exception("[PUSH ONOPEN SAFE REFRESH] main summary push BG skip patch failed")
+        return False
+
+
+def _install_main_ranking_summary_schedule_skip() -> bool:
+    try:
+        from core.startup.main_skip_ranking_summary_schedule_patch import install as install_skip
+        ok = bool(install_skip())
+        logger.warning("[PUSH ONOPEN SAFE REFRESH] main ranking summary schedule skip patch installed=%s", ok)
+        return ok
+    except Exception:
+        logger.exception("[PUSH ONOPEN SAFE REFRESH] main ranking summary schedule skip patch failed")
         return False
 
 
@@ -196,6 +208,7 @@ def install() -> bool:
         _install_main_push_db_restore_skip()
         _install_main_ranking_summary_bootstrap_skip()
         _install_main_summary_push_bg_skip()
+        _install_main_ranking_summary_schedule_skip()
 
         from trading.push.push_stream import transport
         transport._start_refresh_after_open_thread = _patched_start_refresh_after_open_thread
@@ -206,7 +219,7 @@ def install() -> bool:
             logger.debug("[PUSH ONOPEN SAFE REFRESH] ws_callbacks patch skipped", exc_info=True)
 
         _INSTALLED = True
-        logger.warning("[PUSH ONOPEN SAFE REFRESH] installed v2.4 stable delayed + main NAS skip patches")
+        logger.warning("[PUSH ONOPEN SAFE REFRESH] installed v2.5 stable delayed + main NAS skip patches")
         return True
     except Exception:
         logger.exception("[PUSH ONOPEN SAFE REFRESH] install failed")
@@ -217,6 +230,3 @@ try:
     install()
 except Exception:
     logger.exception("[PUSH ONOPEN SAFE REFRESH] auto install failed")
-
-
-__all__ = ["install"]
