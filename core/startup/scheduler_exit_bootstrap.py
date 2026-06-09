@@ -1,9 +1,17 @@
 # ============================================================
 # File   : core/startup/scheduler_exit_bootstrap.py
-# Version: FINAL-PRODUCTION-REV1.4-EXIT-ALWAYS-CHECK-POSITIONS
+# Version: FINAL-PRODUCTION-REV1.5-MAIN-BROKER-EMPTY-SAFE-SKIP
 # ------------------------------------------------------------
 # 【概要】
 #   EXIT order sender 接続と EXIT loop scheduler 登録。
+#
+# REV1.5:
+#   - main.py は entry/exit の軽量プロセスとして起動継続を優先する。
+#   - broker信用建玉0件が確認済みの場合、main.py では exit_loop_5s 本体を呼ばずに即skipする。
+#   - NAS SQLite不安定時に、建玉なしにもかかわらず exit_loop がDB fallbackへ進んで
+#     Windows 0xC0000006 で落ちる経路を回避する。
+#   - 実建玉がある場合、global_data の軽量ヒントがある場合は従来通り exit_loop_5s を呼ぶ。
+#   - 明示的に従来動作へ戻したい場合は AUTOSTOCK_MAIN_SKIP_EXIT_LOOP_WHEN_BROKER_EMPTY=0。
 #
 # REV1.4:
 #   - recent_empty_confirmed による empty fast skip をデフォルト無効化。
@@ -22,6 +30,7 @@
 #   EXIT_EMPTY_FAST_SKIP_ENABLED=0      # REV1.4 default
 #   EXIT_EMPTY_FAST_SKIP_TTL_SEC=3
 #   EXIT_BROKER_EMPTY_IMMEDIATE_SKIP=0
+#   AUTOSTOCK_MAIN_SKIP_EXIT_LOOP_WHEN_BROKER_EMPTY=1
 # ============================================================
 
 from __future__ import annotations
@@ -29,6 +38,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import sys
 import time
 from typing import Any
 
@@ -68,6 +78,13 @@ def _env_float(name: str, default: float) -> float:
     except Exception:
         pass
     return float(default)
+
+
+def _is_main_py_process() -> bool:
+    try:
+        return os.path.basename(str(sys.argv[0] or "")).lower() == "main.py"
+    except Exception:
+        return False
 
 
 def _as_len(v: Any) -> int:
@@ -155,6 +172,23 @@ def _broker_empty_observed_for_log() -> bool:
         return False
 
 
+def _main_skip_exit_loop_when_broker_empty() -> bool:
+    """
+    main.py 専用の安全弁。
+
+    main.py はDB所有者ではないため、brokerが信用建玉0件を返している状態では
+    exit_loop_5s を呼ばず、NAS DB fallbackへ進ませない。
+    実建玉がある/ありそうな軽量ヒントがある場合はskipしない。
+    """
+    if not _is_main_py_process():
+        return False
+    if not _env_bool("AUTOSTOCK_MAIN_SKIP_EXIT_LOOP_WHEN_BROKER_EMPTY", True):
+        return False
+    if _global_has_open_positions_hint():
+        return False
+    return _broker_empty_observed_for_log()
+
+
 def _maybe_log_broker_empty_observed() -> None:
     global _LAST_BROKER_EMPTY_LOG_TS
     try:
@@ -165,8 +199,17 @@ def _maybe_log_broker_empty_observed() -> None:
         if (now - _LAST_BROKER_EMPTY_LOG_TS) < interval:
             return
         _LAST_BROKER_EMPTY_LOG_TS = now
+        if _main_skip_exit_loop_when_broker_empty():
+            logger.warning(
+                "[EXIT SCHEDULER] broker empty observed -> main.py will skip exit_loop immediate_skip=%s mode=%s read_ok=%s cnt=%s rev=1.5",
+                os.getenv("AUTOSTOCK_MAIN_SKIP_EXIT_LOOP_WHEN_BROKER_EMPTY", "1"),
+                getattr(global_data, "open_positions_source_mode", ""),
+                getattr(global_data, "open_positions_broker_read_ok", None),
+                getattr(global_data, "open_positions_synced_count", None),
+            )
+            return
         logger.warning(
-            "[EXIT SCHEDULER] broker empty observed but exit_loop will still run immediate_skip=%s mode=%s read_ok=%s cnt=%s rev=1.4",
+            "[EXIT SCHEDULER] broker empty observed but exit_loop will still run immediate_skip=%s mode=%s read_ok=%s cnt=%s rev=1.5",
             os.getenv("EXIT_BROKER_EMPTY_IMMEDIATE_SKIP", "0"),
             getattr(global_data, "open_positions_source_mode", ""),
             getattr(global_data, "open_positions_broker_read_ok", None),
@@ -239,6 +282,8 @@ def install_exit_order_sender_safe() -> bool:
 
 def _skip_reason() -> str:
     try:
+        if _main_skip_exit_loop_when_broker_empty():
+            return "main_py_broker_authoritative_empty"
         if _broker_authoritative_empty_hint():
             return "broker_authoritative_empty_explicit_env"
         if _EMPTY_CONFIRMED_AT_TS is not None:
@@ -257,6 +302,11 @@ def run_exit_loop_market_guarded() -> None:
             return
 
         _maybe_log_broker_empty_observed()
+
+        if _main_skip_exit_loop_when_broker_empty():
+            logger.info("[EXIT SCHEDULER] empty fast skip reason=%s", _skip_reason())
+            _mark_empty_confirmed()
+            return
 
         if _empty_fast_skip_active():
             logger.info("[EXIT SCHEDULER] empty fast skip reason=%s", _skip_reason())
@@ -300,9 +350,10 @@ def register_exit_loop_safe() -> bool:
             global_data.exit_loop_scheduler_error = ""
             global_data.exit_broker_empty_immediate_skip_default = "0"
             global_data.exit_empty_fast_skip_default = "0"
+            global_data.autostock_main_skip_exit_loop_when_broker_empty = os.getenv("AUTOSTOCK_MAIN_SKIP_EXIT_LOOP_WHEN_BROKER_EMPTY", "1")
         except Exception:
             pass
-        logger.info("[startup.scheduler_startup] exit loop scheduler registered every=5s broker_empty_immediate_skip_default=0 empty_fast_skip_default=0")
+        logger.info("[startup.scheduler_startup] exit loop scheduler registered every=5s broker_empty_immediate_skip_default=0 empty_fast_skip_default=0 main_empty_skip_default=1")
         log_scheduler_snapshot("after exit loop scheduler register")
         return True
     except Exception:
@@ -320,6 +371,7 @@ def install() -> bool:
     os.environ.setdefault("EXIT_EMPTY_FAST_SKIP_ENABLED", "0")
     os.environ.setdefault("EXIT_EMPTY_FAST_SKIP_TTL_SEC", "3")
     os.environ.setdefault("EXIT_BROKER_EMPTY_IMMEDIATE_SKIP", "0")
+    os.environ.setdefault("AUTOSTOCK_MAIN_SKIP_EXIT_LOOP_WHEN_BROKER_EMPTY", "1")
     ok1 = install_exit_order_sender_safe()
     ok2 = register_exit_loop_safe()
     return bool(ok1 and ok2)
