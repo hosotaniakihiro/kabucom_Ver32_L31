@@ -1,35 +1,25 @@
 # ============================================================
 # File   : core/startup/main_schedule_due_filter_patch.py
-# Version: V2-MAIN-SCHEDULE-DUE-FILTER-STAGED
+# Version: V3-MAIN-SCHEDULE-DUE-FILTER-FULL-DEFAULT
 # ------------------------------------------------------------
-# main.py は entry/order 側の軽量プロセスとして起動させる。
-# NAS SQLite が不安定な環境では、関数内 skip まで到達する前に
-# schedule job thread 起動直後で 0xC0000006 になるケースがある。
+# main.py の schedule job を due/dispatch 直前で制御する。
 #
-# V2:
-#   いきなり全機能を戻さず、段階復帰できるようにする。
-#   default mode は entry_only。
+# 2026-06-09 の NAS SQLite / WebSocket 不安定時には、job thread 起動直後に
+# 0xC0000006 で落ちるケースがあったため entry_only 安全モードを追加した。
 #
-#   entry_only で許可するもの:
-#     - main.py 本体
-#     - entry/order の軽量基盤
+# V3:
+#   デフォルトを full に戻す。
+#   main.py で entry / exit_loop_5s / ranking / tonosama / summary AI を復帰する。
+#   不安定時だけ AUTOSTOCK_MAIN_OPERATION_MODE=entry_only で安全モードへ戻せる。
 #
-#   entry_only で止めるもの:
-#     - exit_loop_5s
-#     - ranking_entry
-#     - tonosama_entry
-#     - summary_ai / summary direct dispatch
-#     - ranking_summary_all
-#     - summary_parent_tick
-#
-# ENV staged restore:
-#   AUTOSTOCK_MAIN_OPERATION_MODE=entry_only|entry_exit|full
-#   AUTOSTOCK_MAIN_ENABLE_EXIT_LOOP=1
-#   AUTOSTOCK_MAIN_ENABLE_RANKING_ENTRY=1
-#   AUTOSTOCK_MAIN_ENABLE_TONOSAMA_ENTRY=1
-#   AUTOSTOCK_MAIN_ENABLE_SUMMARY_AI_ENTRY=1
-#   AUTOSTOCK_MAIN_ENABLE_SUMMARY_PARENT_TICK=1
-#   AUTOSTOCK_MAIN_ENABLE_RANKING_SUMMARY_SCHEDULE=1
+# ENV staged restore / fallback:
+#   AUTOSTOCK_MAIN_OPERATION_MODE=full|entry_exit|entry_only
+#   AUTOSTOCK_MAIN_ENABLE_EXIT_LOOP=0/1
+#   AUTOSTOCK_MAIN_ENABLE_RANKING_ENTRY=0/1
+#   AUTOSTOCK_MAIN_ENABLE_TONOSAMA_ENTRY=0/1
+#   AUTOSTOCK_MAIN_ENABLE_SUMMARY_AI_ENTRY=0/1
+#   AUTOSTOCK_MAIN_ENABLE_SUMMARY_PARENT_TICK=0/1
+#   AUTOSTOCK_MAIN_ENABLE_RANKING_SUMMARY_SCHEDULE=0/1
 # ============================================================
 from __future__ import annotations
 
@@ -60,9 +50,9 @@ def _env_bool(name: str, default: bool = True) -> bool:
 
 def _mode() -> str:
     try:
-        return str(os.getenv("AUTOSTOCK_MAIN_OPERATION_MODE", "entry_only") or "entry_only").strip().lower()
+        return str(os.getenv("AUTOSTOCK_MAIN_OPERATION_MODE", "full") or "full").strip().lower()
     except Exception:
-        return "entry_only"
+        return "full"
 
 
 def _is_main_py() -> bool:
@@ -103,42 +93,42 @@ def _key_or_tags_contain(tags: set[str], key_s: str, *needles: str) -> bool:
 def _allow_exit_loop() -> bool:
     mode = _mode()
     if mode in {"entry_exit", "full", "all"}:
-        return True
+        return _env_bool("AUTOSTOCK_MAIN_ENABLE_EXIT_LOOP", True)
     return _env_bool("AUTOSTOCK_MAIN_ENABLE_EXIT_LOOP", False)
 
 
 def _allow_ranking_entry() -> bool:
     mode = _mode()
     if mode in {"full", "all"}:
-        return True
+        return _env_bool("AUTOSTOCK_MAIN_ENABLE_RANKING_ENTRY", True)
     return _env_bool("AUTOSTOCK_MAIN_ENABLE_RANKING_ENTRY", False)
 
 
 def _allow_tonosama_entry() -> bool:
     mode = _mode()
     if mode in {"full", "all"}:
-        return True
+        return _env_bool("AUTOSTOCK_MAIN_ENABLE_TONOSAMA_ENTRY", True)
     return _env_bool("AUTOSTOCK_MAIN_ENABLE_TONOSAMA_ENTRY", False)
 
 
 def _allow_summary_ai_entry() -> bool:
     mode = _mode()
     if mode in {"full", "all"}:
-        return True
+        return _env_bool("AUTOSTOCK_MAIN_ENABLE_SUMMARY_AI_ENTRY", True)
     return _env_bool("AUTOSTOCK_MAIN_ENABLE_SUMMARY_AI_ENTRY", False)
 
 
 def _allow_ranking_summary() -> bool:
     mode = _mode()
     if mode in {"full", "all"}:
-        return True
+        return _env_bool("AUTOSTOCK_MAIN_ENABLE_RANKING_SUMMARY_SCHEDULE", True)
     return _env_bool("AUTOSTOCK_MAIN_ENABLE_RANKING_SUMMARY_SCHEDULE", False)
 
 
 def _allow_summary_parent_tick() -> bool:
     mode = _mode()
     if mode in {"full", "all"}:
-        return True
+        return _env_bool("AUTOSTOCK_MAIN_ENABLE_SUMMARY_PARENT_TICK", True)
     return _env_bool("AUTOSTOCK_MAIN_ENABLE_SUMMARY_PARENT_TICK", False)
 
 
@@ -263,7 +253,7 @@ def install() -> bool:
 
         _INSTALLED = True
         logger.warning(
-            "[MAIN SCHEDULE DUE FILTER] installed v2 enabled=%s main_py=%s mode=%s allow_exit=%s allow_ranking=%s allow_tonosama=%s allow_summary_ai=%s allow_summary_parent=%s allow_ranking_summary=%s",
+            "[MAIN SCHEDULE DUE FILTER] installed v3 enabled=%s main_py=%s mode=%s allow_exit=%s allow_ranking=%s allow_tonosama=%s allow_summary_ai=%s allow_summary_parent=%s allow_ranking_summary=%s",
             _env_bool("AUTOSTOCK_MAIN_SCHEDULE_DUE_FILTER", True),
             _is_main_py(),
             _mode(),
