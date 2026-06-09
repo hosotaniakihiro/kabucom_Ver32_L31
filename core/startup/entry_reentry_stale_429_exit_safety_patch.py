@@ -1,13 +1,13 @@
 # ============================================================
 # File   : core/startup/entry_reentry_stale_429_exit_safety_patch.py
-# Version: V1.1-REENTRY-STALE-429-EXIT-SAFETY
+# Version: V1.2-NO-TABLE-SAFE-RESET
 # ------------------------------------------------------------
-# 目的:
-#   1. 未約定/キャンセルの entry_sent_count だけで同一銘柄を止めない
-#   2. スキャルピング向けに同一銘柄の当日再エントリー余地を広げる
-#   3. PUSH stale 時はランキング由来サマリー代替を許可するための runtime flags を立てる
-#   4. trading.ranking.api_client.get_data_from_api の 429 を直接 cooldown/cache 化する
-#   5. EXIT empty fast skip 中も broker 建玉確認を間引き過ぎない設定にする
+# Purpose:
+#   1. 未約定/キャンセルの entry_sent_count だけで同一銘柄を止めない。
+#   2. trade_guard DB が作成直後で daily risk table 未作成でも起動ログへ
+#      Traceback を出さない。
+#   3. PUSH stale 時のランキング由来サマリー代替、ランキングAPI 429冷却、
+#      EXIT empty時のbroker確認を維持する。
 # ============================================================
 
 from __future__ import annotations
@@ -101,17 +101,40 @@ def _trade_guard_db_path() -> str:
     return os.getenv("TRADE_GUARD_DB_PATH", str(Path(base) / f"trade_guard{_today()}.db"))
 
 
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    try:
+        row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", (table,)).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+
 def _reset_sent_only_counts() -> bool:
+    """Reset sent-only counters only when the daily risk tables already exist.
+
+    起動直後や初回DB作成時は entry_daily_risk_runtime_patch 側の schema ensure より
+    先にここが走る場合がある。その場合は正常な未作成状態なので Traceback にしない。
+    """
     if not _env_bool("ENTRY_DAILY_RISK_ZERO_SENT_COUNT_ON_START", True):
         return False
+    path = _trade_guard_db_path()
+    if not path or not Path(path).exists():
+        logger.warning("[REENTRY SAFETY] sent-only reset skipped db not found path=%s", path)
+        return False
     try:
-        path = _trade_guard_db_path()
-        if not path or not Path(path).exists():
-            logger.warning("[REENTRY SAFETY] sent-only reset skipped db not found path=%s", path)
-            return False
         now_s = dt.datetime.now().replace(microsecond=0).isoformat(sep=" ")
         with sqlite3.connect(path, timeout=3.0) as conn:
             conn.execute("PRAGMA busy_timeout=3000")
+            has_symbol = _table_exists(conn, "symbol_daily_entry_risk")
+            has_global = _table_exists(conn, "global_daily_entry_risk")
+            if not has_symbol or not has_global:
+                logger.warning(
+                    "[REENTRY SAFETY] sent-only reset skipped daily risk tables missing path=%s symbol_table=%s global_table=%s",
+                    path,
+                    has_symbol,
+                    has_global,
+                )
+                return False
             cur1 = conn.execute(
                 "UPDATE symbol_daily_entry_risk SET entry_sent_count=0, updated_at=? WHERE trade_date=? AND COALESCE(entry_count,0)=0 AND COALESCE(entry_sent_count,0)>0",
                 (now_s, _today()),
@@ -123,6 +146,13 @@ def _reset_sent_only_counts() -> bool:
             conn.commit()
         logger.warning("[REENTRY SAFETY] reset sent-only counts path=%s symbol_rows=%s global_rows=%s", path, getattr(cur1, "rowcount", None), getattr(cur2, "rowcount", None))
         return True
+    except sqlite3.OperationalError as e:
+        msg = str(e).lower()
+        if "no such table" in msg:
+            logger.warning("[REENTRY SAFETY] sent-only reset skipped table missing path=%s err=%s", path, e)
+            return False
+        logger.exception("[REENTRY SAFETY] reset sent-only counts sqlite failed")
+        return False
     except Exception:
         logger.exception("[REENTRY SAFETY] reset sent-only counts failed")
         return False
@@ -134,8 +164,7 @@ def _install_daily_risk_reentry_patch() -> bool:
     except Exception:
         logger.exception("[REENTRY SAFETY] daily risk module import failed")
         return False
-
-    if getattr(dr, "_reentry_sent_only_ignored_v11", False):
+    if getattr(dr, "_reentry_sent_only_ignored_v12", False):
         return True
 
     def _record_entry_sent_noop(symbol: Any) -> None:
@@ -177,9 +206,7 @@ def _install_daily_risk_reentry_patch() -> bool:
             symbol_seen_entries = max(entry_count, entry_sent_count)
             count_mode = "max_entry_count_or_sent_count"
 
-        effective_max_entries = max_entries
-        if winning_symbol:
-            effective_max_entries = max(max_entries, winning_max_entries)
+        effective_max_entries = max(max_entries, winning_max_entries) if winning_symbol else max_entries
 
         if global_max_trades > 0 and int(grow.get("trade_count") or 0) >= global_max_trades:
             return True, "GLOBAL_DAILY_TRADE_LIMIT", {"symbol": symbol, "side": side_u, "max_trades": global_max_trades, **grow}
@@ -198,6 +225,7 @@ def _install_daily_risk_reentry_patch() -> bool:
 
     dr._risk_block_reason = _risk_block_reason_reentry
     dr._reentry_sent_only_ignored_v11 = True
+    dr._reentry_sent_only_ignored_v12 = True
     logger.warning("[REENTRY SAFETY] daily risk patched max_entries=%s winning_max=%s count_sent=%s", _env_int("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", 4), _env_int("ENTRY_WINNING_SYMBOL_MAX_DAILY_ENTRIES", 6), _env_bool("ENTRY_COUNT_SENT_ORDER_AS_DAILY_ENTRY", False))
     return True
 
@@ -218,12 +246,9 @@ def _install_ranking_api_client_429_guard() -> bool:
     except Exception:
         logger.exception("[RANKING 429 GUARD] api_client import failed")
         return False
-
     old = getattr(api, "get_data_from_api", None)
-    if not callable(old):
-        return False
-    if getattr(old, "_ranking_api_429_guard_v11", False):
-        return True
+    if not callable(old) or getattr(old, "_ranking_api_429_guard_v12", False):
+        return bool(callable(old))
 
     @functools.wraps(old)
     def _get_data_from_api_429_guard(params: dict[str, Any], *, timeout_sec: float = None, retry_max: int = None) -> dict[str, Any] | None:
@@ -237,31 +262,29 @@ def _install_ranking_api_client_429_guard() -> bool:
             if now - float(saved_at) <= ttl:
                 logger.warning("[RANKING 429 GUARD] cooldown -> reuse cache params=%s remain=%.1fs age=%.1fs", params, cooldown_until - now, now - float(saved_at))
                 return payload
-            logger.warning("[RANKING 429 GUARD] cooldown cache expired params=%s age=%.1fs", params, now - float(saved_at))
             return None
-
-        effective_retry = retry_max
-        if effective_retry is None:
-            effective_retry = _env_int("RANKING_API_429_RETRY_MAX", 1)
-        effective_timeout = timeout_sec if timeout_sec is not None else getattr(api, "API_TIMEOUT_SEC", 5.0)
-
-        result = old(params, timeout_sec=effective_timeout, retry_max=effective_retry)
-        if result is not None:
-            _RANKING_CACHE[key] = (result, time.time())
-            return result
-
-        # 既存実装は429でも最終的にNoneを返すため、ログ後の連打をここで冷却する。
+        try:
+            effective_retry = retry_max if retry_max is not None else _env_int("RANKING_API_429_RETRY_MAX", 1)
+            effective_timeout = timeout_sec if timeout_sec is not None else getattr(api, "API_TIMEOUT_SEC", 5.0)
+            result = old(params, timeout_sec=effective_timeout, retry_max=effective_retry)
+            if result is not None:
+                _RANKING_CACHE[key] = (result, time.time())
+                return result
+        except Exception as e:
+            if not _is_429(e):
+                raise
         cooldown = _env_float("RANKING_API_429_COOLDOWN_SEC", 30.0)
         _RANKING_COOLDOWN_UNTIL[key] = time.time() + cooldown
         if _env_bool("RANKING_API_429_USE_LAST_SUCCESS", True) and cache_item:
             payload, saved_at = cache_item
             if time.time() - float(saved_at) <= ttl:
-                logger.warning("[RANKING 429 GUARD] None/likely429 -> reuse cache params=%s cooldown=%.1fs", params, cooldown)
+                logger.warning("[RANKING 429 GUARD] 429/None -> reuse cache params=%s cooldown=%.1fs", params, cooldown)
                 return payload
-        logger.warning("[RANKING 429 GUARD] None/likely429 -> cooldown params=%s cooldown=%.1fs", params, cooldown)
+        logger.warning("[RANKING 429 GUARD] 429/None -> cooldown params=%s cooldown=%.1fs", params, cooldown)
         return None
 
     _get_data_from_api_429_guard._ranking_api_429_guard_v11 = True  # type: ignore[attr-defined]
+    _get_data_from_api_429_guard._ranking_api_429_guard_v12 = True  # type: ignore[attr-defined]
     _get_data_from_api_429_guard._original = old  # type: ignore[attr-defined]
     api.get_data_from_api = _get_data_from_api_429_guard
     logger.warning("[RANKING 429 GUARD] api_client.get_data_from_api patched cooldown=%ss retry_max=%s", os.getenv("RANKING_API_429_COOLDOWN_SEC"), os.getenv("RANKING_API_429_RETRY_MAX"))
@@ -269,7 +292,7 @@ def _install_ranking_api_client_429_guard() -> bool:
 
 
 def _wrap_ranking_callable(mod: Any, name: str, fn: Callable[..., Any]) -> bool:
-    if getattr(fn, "_ranking_429_cache_wrapped_v11", False):
+    if getattr(fn, "_ranking_429_cache_wrapped_v12", False):
         return False
     key = f"{getattr(mod, '__name__', repr(mod))}.{name}"
 
@@ -297,6 +320,7 @@ def _wrap_ranking_callable(mod: Any, name: str, fn: Callable[..., Any]) -> bool:
             raise
 
     _wrapped._ranking_429_cache_wrapped_v11 = True  # type: ignore[attr-defined]
+    _wrapped._ranking_429_cache_wrapped_v12 = True  # type: ignore[attr-defined]
     setattr(mod, name, _wrapped)
     return True
 
@@ -352,10 +376,8 @@ def _install_exit_empty_broker_safety() -> bool:
         logger.exception("[EXIT EMPTY BROKER SAFETY] exit_handler import failed")
         return False
     old = getattr(eh, "run_exit_pipeline", None)
-    if not callable(old):
-        return False
-    if getattr(old, "_exit_empty_broker_safety_wrapped_v11", False):
-        return True
+    if not callable(old) or getattr(old, "_exit_empty_broker_safety_wrapped_v12", False):
+        return bool(callable(old))
 
     @functools.wraps(old)
     def _run_exit_pipeline_broker_safety(*args: Any, **kwargs: Any) -> Any:
@@ -369,6 +391,7 @@ def _install_exit_empty_broker_safety() -> bool:
         return old(*args, **kwargs)
 
     _run_exit_pipeline_broker_safety._exit_empty_broker_safety_wrapped_v11 = True  # type: ignore[attr-defined]
+    _run_exit_pipeline_broker_safety._exit_empty_broker_safety_wrapped_v12 = True  # type: ignore[attr-defined]
     _run_exit_pipeline_broker_safety._original = old  # type: ignore[attr-defined]
     eh.run_exit_pipeline = _run_exit_pipeline_broker_safety
     main_mod = sys.modules.get("__main__")
