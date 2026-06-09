@@ -1,24 +1,30 @@
 # ============================================================
 # File   : core/startup/main_skip_push_db_restore_patch.py
-# Version: V2-MAIN-SKIP-PUSH-DB-RESTORE-AND-PUSH-STACK
+# Version: V3-MAIN-SKIP-PUSH-DB-RESTORE-STACK-AND-SUMMARY-FALLBACK
 # ------------------------------------------------------------
 # Purpose:
 #   main.py 起動時に、NAS上の pushYYYYMMDD.db を同期的に直読み復元しない。
 #   さらに main.py 側の PUSH storage writer / PUSH symbol bridge / PUSH stream
 #   起動を既定でスキップし、0xC0000006 の発生面を最小化する。
 #
+#   V3:
+#   - PUSH stack を止めた状態で PUSH summary runner が空を返した場合、
+#     scheduler_jobs.summary.runner_core が fallback_push_summary_df() で
+#     DB/cache を読みに行く経路も main.py では停止する。
+#
 # Reason:
-#   2026-06-09 のログで safe migration と PUSH DB復元スキップは通過したが、
-#   その後 main.py 側で PUSH DB writer が push20260609.db に接続し、
-#   symbol bootstrap / position sync 後に Python例外ではなく Windows 0xC0000006 で
-#   プロセス終了した。
+#   2026-06-09 のログで safe migration / PUSH DB復元 / PUSH stack skip は通過したが、
+#   その後 1分 PUSH summary が空になり、
+#     runner returned empty PUSH -> trying push-only fallback from db/cache
+#   の直後に Python例外ではなく Windows 0xC0000006 でプロセス終了した。
 #
 # Policy:
 #   - main.py は起動継続を最優先する。
-#   - DB作成 / PUSH保存 / PUSH登録 / PUSH受信は main_database.py 側に寄せる。
+#   - DB作成 / PUSH保存 / PUSH登録 / PUSH受信 / PUSH DB fallback は main_database.py 側に寄せる。
 #   - main.py 側でPUSHスタックを戻したい場合だけ
 #       AUTOSTOCK_MAIN_SKIP_PUSH_STACK=0
 #       AUTOSTOCK_MAIN_SKIP_PUSH_DB_RESTORE=0
+#       AUTOSTOCK_MAIN_SKIP_PUSH_SUMMARY_FALLBACK=0
 #     を明示する。
 # ============================================================
 
@@ -39,6 +45,7 @@ _ORIGINAL_START_PUSH_STACK = None
 _ORIGINAL_START_PUSH_STORAGE_SAFE = None
 _ORIGINAL_START_PUSH_STREAM_EARLY_SAFE = None
 _ORIGINAL_START_PUSH_STREAM_FALLBACK_SAFE = None
+_ORIGINAL_FALLBACK_PUSH_SUMMARY_DF = None
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -70,6 +77,12 @@ def _should_skip_push_stack() -> bool:
     if not _is_main_py_process():
         return False
     return _env_bool("AUTOSTOCK_MAIN_SKIP_PUSH_STACK", True)
+
+
+def _should_skip_push_summary_fallback() -> bool:
+    if not _is_main_py_process():
+        return False
+    return _env_bool("AUTOSTOCK_MAIN_SKIP_PUSH_SUMMARY_FALLBACK", True)
 
 
 def _set_empty_push_df(reason: str, push_dir=None) -> None:
@@ -194,6 +207,51 @@ def _patched_start_push_stream_fallback_safe():
     return False
 
 
+def _patched_fallback_push_summary_df(interval, now=None, *args, **kwargs):
+    if _should_skip_push_summary_fallback():
+        logger.warning(
+            "[MAIN SKIP PUSH SUMMARY FALLBACK] skipped fallback_push_summary_df interval=%s now=%s "
+            "in main.py to avoid NAS SQLite/cache fallback 0xC0000006. "
+            "main_database.py handles PUSH summary DB/cache. "
+            "Set AUTOSTOCK_MAIN_SKIP_PUSH_SUMMARY_FALLBACK=0 to restore legacy behavior.",
+            interval,
+            now,
+        )
+        return pd.DataFrame()
+
+    if callable(_ORIGINAL_FALLBACK_PUSH_SUMMARY_DF):
+        return _ORIGINAL_FALLBACK_PUSH_SUMMARY_DF(interval, now=now, *args, **kwargs)
+    return pd.DataFrame()
+
+
+def _install_push_summary_fallback_skip() -> None:
+    global _ORIGINAL_FALLBACK_PUSH_SUMMARY_DF
+
+    try:
+        import scheduler_jobs.summary.fallback_loader as fallback_loader_mod
+
+        current = getattr(fallback_loader_mod, "fallback_push_summary_df", None)
+        if getattr(current, "__name__", "") != "_patched_fallback_push_summary_df":
+            _ORIGINAL_FALLBACK_PUSH_SUMMARY_DF = current
+            fallback_loader_mod.fallback_push_summary_df = _patched_fallback_push_summary_df
+
+        # runner_core.py は `from .fallback_loader import fallback_push_summary_df` で
+        # 関数参照を保持するため、既にimport済みならこちらも差し替える。
+        try:
+            import scheduler_jobs.summary.runner_core as runner_core_mod
+            runner_core_mod.fallback_push_summary_df = _patched_fallback_push_summary_df
+        except Exception:
+            logger.debug("[MAIN SKIP PUSH SUMMARY FALLBACK] runner_core patch skipped", exc_info=True)
+
+        logger.warning(
+            "[MAIN SKIP PUSH SUMMARY FALLBACK] installed enabled=%s main_py=%s",
+            _should_skip_push_summary_fallback(),
+            _is_main_py_process(),
+        )
+    except Exception:
+        logger.exception("[MAIN SKIP PUSH SUMMARY FALLBACK] install failed")
+
+
 def install() -> bool:
     global _INSTALLED
     global _ORIGINAL_BOOTSTRAP_PUSH
@@ -205,6 +263,7 @@ def install() -> bool:
     try:
         os.environ.setdefault("AUTOSTOCK_MAIN_SKIP_PUSH_DB_RESTORE", "1")
         os.environ.setdefault("AUTOSTOCK_MAIN_SKIP_PUSH_STACK", "1")
+        os.environ.setdefault("AUTOSTOCK_MAIN_SKIP_PUSH_SUMMARY_FALLBACK", "1")
         os.environ.setdefault("PUSH_STREAM_DB_WRITE", "0")
         os.environ.setdefault("PUSH_STREAM_ORDER_BOOK_WRITE", "0")
 
@@ -254,12 +313,15 @@ def install() -> bool:
         except Exception:
             logger.debug("[MAIN SKIP PUSH DB RESTORE] push_startup patch skipped", exc_info=True)
 
+        _install_push_summary_fallback_skip()
+
         _INSTALLED = True
         logger.warning(
-            "[MAIN SKIP PUSH DB RESTORE] installed enabled=%s main_py=%s push_stack_skip=%s",
+            "[MAIN SKIP PUSH DB RESTORE] installed enabled=%s main_py=%s push_stack_skip=%s push_summary_fallback_skip=%s",
             _should_skip_db_restore(),
             _is_main_py_process(),
             _should_skip_push_stack(),
+            _should_skip_push_summary_fallback(),
         )
         return True
     except Exception:
