@@ -1,15 +1,18 @@
 # ============================================================
 # File   : core/startup/summary_mtf_diff_from_1m_patch.py
-# Version: V1.1-INSTALL-MTF-DIFF-FROM-1M-DB-KWARGS-COMPAT
+# Version: V1.2-MAIN-NAS-INPAGE-SAFE-SKIP
 # ------------------------------------------------------------
 # 目的:
 #   3分足/5分足のサマリー更新時に、既存3m/5m最新時刻以降の1分足をDBから読み、
 #   MA75計算用の直前履歴込みで差分3m/5mサマリーを作成・保存する。
 #
-# V1.1:
-#   - scheduler runner から diff_update(now=..., display=..., run_entry=...) が来ても、
-#     既存 SummaryController.diff_update(interval) へ余分なkwargsを渡さない。
-#   - interval=1 でも original diff_update を壊さない。
+# V1.2:
+#   - main.py 実行中は、NAS SQLite 直読みを伴う original diff_update / 1m差分生成を
+#     既定でスキップする。main_database.py がDB生成・DB更新を担当する split 運用では、
+#     main.py がNAS上DBを直接読みに行くと Windows 0xC0000006(in-page error) で
+#     プロセスごと落ちることがあるため。
+#   - スキップ時は global_data の既存 summary cache があれば返し、無ければ空DFで返す。
+#   - AUTOSTOCK_MAIN_ALLOW_NAS_SUMMARY_DIFF_UPDATE=1 で旧動作に戻せる。
 # ============================================================
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ from __future__ import annotations
 import inspect
 import logging
 import os
+import sys
 from typing import Any
 
 import pandas as pd
@@ -25,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 _INSTALLED = False
 _ORIG_DIFF_UPDATE = None
+_LAST_MAIN_SKIP_LOG: dict[int, float] = {}
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -42,6 +47,75 @@ def _safe_len(x: Any) -> int:
         return 0 if x is None else len(x)
     except Exception:
         return 0
+
+
+def _is_main_py_process() -> bool:
+    try:
+        argv = " ".join(str(x) for x in (getattr(sys, "argv", None) or []))
+        return "main.py" in argv.replace("\\", "/").lower()
+    except Exception:
+        return False
+
+
+def _main_should_skip_nas_diff_update() -> bool:
+    """main.py では NAS SQLite 直読みサマリー更新を既定で止める。"""
+    if not _is_main_py_process():
+        return False
+    if _env_bool("AUTOSTOCK_MAIN_ALLOW_NAS_SUMMARY_DIFF_UPDATE", False):
+        return False
+    if _env_bool("AUTOSTOCK_MAIN_SKIP_NAS_SUMMARY_DIFF_UPDATE", True):
+        return True
+    if _env_bool("SUMMARY_MAIN_ENTRY_ONLY", False):
+        return True
+    if _env_bool("SUMMARY_SKIP_DB_SAVE_IN_MAIN", False):
+        return True
+    role = str(os.getenv("SUMMARY_DB_WRITER_ROLE") or "").strip().lower()
+    return role in {"entry_only", "main_entry_only", "read_only", "no_save"}
+
+
+def _cached_latest_from_global(interval: int) -> pd.DataFrame:
+    try:
+        from global_state import global_data
+        candidates = []
+        for name in (
+            f"latest_summary_{int(interval)}m_df",
+            f"summary_{int(interval)}m_latest_df",
+            f"summary_{int(interval)}m_df",
+        ):
+            try:
+                candidates.append(getattr(global_data, name, None))
+            except Exception:
+                pass
+        for method_name in ("get_latest_summary", "get_push_merged_summary", "get_summary_history"):
+            try:
+                fn = getattr(global_data, method_name, None)
+                if callable(fn):
+                    candidates.append(fn(int(interval)))
+            except Exception:
+                pass
+        for x in candidates:
+            if isinstance(x, pd.DataFrame) and not x.empty:
+                return _normalize_summary_df(x, interval=int(interval))
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def _log_main_skip(interval: int, rows: int) -> None:
+    try:
+        import time
+        now = time.time()
+        last = float(_LAST_MAIN_SKIP_LOG.get(int(interval), 0.0) or 0.0)
+        if now - last < 30.0:
+            return
+        _LAST_MAIN_SKIP_LOG[int(interval)] = now
+        logger.warning(
+            "[SUMMARY MTF DIFF 1M PATCH] main.py NAS diff_update skipped interval=%s cached_rows=%s reason=avoid_windows_0xc0000006 allow_env=AUTOSTOCK_MAIN_ALLOW_NAS_SUMMARY_DIFF_UPDATE",
+            interval,
+            rows,
+        )
+    except Exception:
+        pass
 
 
 def _normalize_summary_df(df: pd.DataFrame, *, interval: int) -> pd.DataFrame:
@@ -97,6 +171,10 @@ def _run_diff_from_1m(interval: int) -> pd.DataFrame:
         return pd.DataFrame()
     if not _env_bool("SUMMARY_MTF_DIFF_FROM_1M_ENABLED", True):
         return pd.DataFrame()
+    if _main_should_skip_nas_diff_update():
+        cached = _cached_latest_from_global(int(interval))
+        _log_main_skip(int(interval), _safe_len(cached))
+        return cached
 
     try:
         from trading.summary.pipeline.incremental_mtf_from_1min import (
@@ -169,6 +247,11 @@ def _call_original_diff_update(self, interval_i: int, *args, **kwargs):
     if not callable(orig):
         return pd.DataFrame()
 
+    if _main_should_skip_nas_diff_update():
+        cached = _cached_latest_from_global(int(interval_i))
+        _log_main_skip(int(interval_i), _safe_len(cached))
+        return cached
+
     if args:
         logger.debug("[SUMMARY MTF DIFF 1M PATCH] ignored original positional extras interval=%s args=%s", interval_i, len(args))
     if kwargs:
@@ -197,7 +280,12 @@ def _patched_diff_update(self, interval: int, *args, **kwargs):
         precomputed_latest = _run_diff_from_1m(interval_i)
 
     try:
-        return _call_original_diff_update(self, interval_i, *args, **kwargs)
+        out = _call_original_diff_update(self, interval_i, *args, **kwargs)
+        if isinstance(out, pd.DataFrame) and not out.empty:
+            return out
+        if isinstance(precomputed_latest, pd.DataFrame) and not precomputed_latest.empty:
+            return precomputed_latest
+        return out if isinstance(out, pd.DataFrame) else pd.DataFrame()
     except Exception:
         logger.exception("[SUMMARY MTF DIFF 1M PATCH] original diff_update failed interval=%s", interval_i)
         if isinstance(precomputed_latest, pd.DataFrame) and not precomputed_latest.empty:
@@ -223,27 +311,27 @@ def install() -> bool:
         if not callable(cur):
             logger.warning("[SUMMARY MTF DIFF 1M PATCH] diff_update unavailable")
             return False
-        if getattr(cur, "_summary_mtf_diff_from_1m_v11", False):
+        if getattr(cur, "_summary_mtf_diff_from_1m_v12", False):
             _INSTALLED = True
             return True
 
-        # v1 wrapper が既に入っている場合は、そのoriginalを拾って二重kwargs不具合を回避する。
+        # v1/v1.1 wrapper が既に入っている場合は、そのoriginalを拾って二重kwargs不具合を回避する。
         _ORIG_DIFF_UPDATE = getattr(cur, "_original", cur)
-        _patched_diff_update._summary_mtf_diff_from_1m_v11 = True  # type: ignore[attr-defined]
+        _patched_diff_update._summary_mtf_diff_from_1m_v12 = True  # type: ignore[attr-defined]
         _patched_diff_update._original = _ORIG_DIFF_UPDATE  # type: ignore[attr-defined]
         cls.diff_update = _patched_diff_update
         try:
             inst = getattr(sc, "summary_controller", None)
             if inst is not None:
-                # class method差し替えなので通常不要。明示的に触っておく。
                 setattr(inst.__class__, "diff_update", _patched_diff_update)
         except Exception:
             pass
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY MTF DIFF 1M PATCH] installed v1.1 enabled=True history_rows=%s allow_partial=%s",
+            "[SUMMARY MTF DIFF 1M PATCH] installed v1.2 enabled=True history_rows=%s allow_partial=%s main_nas_skip=%s",
             os.getenv("SUMMARY_MTF_DIFF_HISTORY_ROWS", "74"),
             os.getenv("SUMMARY_MTF_DIFF_ALLOW_PARTIAL_BAR", "0"),
+            _main_should_skip_nas_diff_update(),
         )
         return True
     except Exception:
