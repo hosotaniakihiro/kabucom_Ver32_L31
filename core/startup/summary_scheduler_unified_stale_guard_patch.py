@@ -1,21 +1,16 @@
 # ============================================================
 # File   : core/startup/summary_scheduler_unified_stale_guard_patch.py
-# Version: V3-MAIN-SKIP-PARENT-TICK
+# Version: V4-MAIN-FULL-RESTORE-PARENT-TICK
 # ------------------------------------------------------------
 # 【目的】
-#   main.py entry_only で scheduler_jobs.summary.scheduler の親tickが
+#   main.py entry_only では scheduler_jobs.summary.scheduler の親tickが
 #   NAS上の summary/push/cache を読みに行き 0xC0000006 で落ちる問題を防止する。
 #
-# 【今回の症状】
-#   [startup.schedule_loop] job thread start key=tags:summary_parent_tick
-#   func=core.startup.summary_scheduler_unified_stale_guard_patch.tick_patched
-#   の直後に Windows 0xC0000006 で終了。
-#
-# 【方針】
-#   - main.py entry_only では summary parent tick 本体を呼ばず即return
-#   - legacy PUSH fallback も従来通り no-op 化
-#   - 既存の stale reset は維持
-#   - main_database.py / data collector process では従来通り動かす
+# V4:
+#   - main.py の既定運用を full とし、summary_parent_tick を復帰。
+#   - AUTOSTOCK_MAIN_OPERATION_MODE=entry_only / safe のときだけ親tickをskip。
+#   - usercustomize.py より先にこのpatchが入っても、勝手に
+#     AUTOSTOCK_MAIN_SKIP_SUMMARY_PARENT_TICK=1 をsetdefaultしない。
 # ============================================================
 from __future__ import annotations
 
@@ -61,6 +56,13 @@ def _argv_main_py() -> bool:
         return False
 
 
+def _operation_mode() -> str:
+    try:
+        return str(os.getenv('AUTOSTOCK_MAIN_OPERATION_MODE') or 'full').strip().lower()
+    except Exception:
+        return 'full'
+
+
 def _main_entry_only() -> bool:
     try:
         if _b('AUTOSTOCK_MAIN_DATABASE_PROCESS', False) or _b('AUTOSTOCK_DATA_COLLECTORS_PROCESS', False):
@@ -76,6 +78,9 @@ def _main_skip_parent_tick() -> bool:
         return False
     if _b('FORCE_ENABLE_MAIN_SUMMARY_PARENT_TICK', False):
         return False
+    mode = _operation_mode()
+    if mode in ('full', 'restore', 'live', 'normal'):
+        return _b('AUTOSTOCK_MAIN_SKIP_SUMMARY_PARENT_TICK', False)
     return _b('AUTOSTOCK_MAIN_SKIP_SUMMARY_PARENT_TICK', True)
 
 
@@ -86,7 +91,7 @@ def _push_bg_all() -> bool:
 def _suppress_fallback() -> bool:
     if _b('FORCE_ENABLE_LEGACY_PUSH_SUMMARY_FALLBACK', False):
         return False
-    return _main_entry_only() and _push_bg_all()
+    return _main_entry_only() and _push_bg_all() and _main_skip_parent_tick()
 
 
 def _reset_push_fallback_state(scheduler, context: str) -> None:
@@ -142,11 +147,17 @@ def install() -> bool:
 
     try:
         if _main_entry_only():
-            os.environ.setdefault('AUTOSTOCK_MAIN_SKIP_SUMMARY_PARENT_TICK', '1')
-            os.environ['ENABLE_PUSH_SUMMARY_FALLBACK_WHEN_UNIFIED_BLOCKED'] = '0'
-            os.environ.setdefault('SUMMARY_PUSH_BG_ALL_INTERVALS', '0')
-            os.environ.setdefault('SUMMARY_PUSH_BG_LONG_INTERVALS', '0')
-            logger.warning('[SUMMARY SCHEDULER STALE GUARD] main entry process: parent tick/fallback guarded')
+            mode = _operation_mode()
+            if mode not in ('full', 'restore', 'live', 'normal'):
+                os.environ.setdefault('AUTOSTOCK_MAIN_SKIP_SUMMARY_PARENT_TICK', '1')
+                os.environ['ENABLE_PUSH_SUMMARY_FALLBACK_WHEN_UNIFIED_BLOCKED'] = '0'
+                os.environ.setdefault('SUMMARY_PUSH_BG_ALL_INTERVALS', '0')
+                os.environ.setdefault('SUMMARY_PUSH_BG_LONG_INTERVALS', '0')
+                logger.warning('[SUMMARY SCHEDULER STALE GUARD] main entry process: parent tick/fallback guarded mode=%s', mode)
+            else:
+                os.environ.setdefault('AUTOSTOCK_MAIN_SKIP_SUMMARY_PARENT_TICK', '0')
+                os.environ.setdefault('FORCE_ENABLE_MAIN_SUMMARY_PARENT_TICK', '1')
+                logger.warning('[SUMMARY SCHEDULER STALE GUARD] main full mode: parent tick restored mode=%s', mode)
 
         if _suppress_fallback() or _main_skip_parent_tick():
             os.environ['ENABLE_PUSH_SUMMARY_FALLBACK_WHEN_UNIFIED_BLOCKED'] = '0'
@@ -155,7 +166,7 @@ def install() -> bool:
         _reset_unified_if_stale(scheduler, 'install')
 
         old_enabled = getattr(scheduler, '_push_fallback_when_blocked_enabled', None)
-        if callable(old_enabled) and not getattr(old_enabled, '_stale_guard_patch_v3', False):
+        if callable(old_enabled) and not getattr(old_enabled, '_stale_guard_patch_v4', False):
             def enabled_patched():
                 if _suppress_fallback() or _main_skip_parent_tick():
                     logger.info('[SUMMARY SCHEDULER STALE GUARD] legacy PUSH fallback enabled? -> False')
@@ -164,13 +175,13 @@ def install() -> bool:
                     return bool(old_enabled())
                 except Exception:
                     return False
+            enabled_patched._stale_guard_patch_v4 = True  # type: ignore[attr-defined]
             enabled_patched._stale_guard_patch_v3 = True  # type: ignore[attr-defined]
-            enabled_patched._stale_guard_patch_v2 = True  # type: ignore[attr-defined]
             enabled_patched._original = old_enabled  # type: ignore[attr-defined]
             scheduler._push_fallback_when_blocked_enabled = enabled_patched
 
         old_fallback = getattr(scheduler, '_run_push_fallback_when_unified_blocked', None)
-        if callable(old_fallback) and not getattr(old_fallback, '_stale_guard_patch_v3', False):
+        if callable(old_fallback) and not getattr(old_fallback, '_stale_guard_patch_v4', False):
             def fallback_patched(now, *, reason: str):
                 if _suppress_fallback() or _main_skip_parent_tick():
                     _reset_push_fallback_state(scheduler, f'suppressed:{reason}')
@@ -184,33 +195,33 @@ def install() -> bool:
                     )
                     return None
                 return old_fallback(now, reason=reason)
+            fallback_patched._stale_guard_patch_v4 = True  # type: ignore[attr-defined]
             fallback_patched._stale_guard_patch_v3 = True  # type: ignore[attr-defined]
-            fallback_patched._stale_guard_patch_v2 = True  # type: ignore[attr-defined]
             fallback_patched._original = old_fallback  # type: ignore[attr-defined]
             scheduler._run_push_fallback_when_unified_blocked = fallback_patched
 
         old_tick = getattr(scheduler, '_run_summary_tick', None)
-        if callable(old_tick) and not getattr(old_tick, '_stale_guard_patch_v3', False):
+        if callable(old_tick) and not getattr(old_tick, '_stale_guard_patch_v4', False):
             def tick_patched(now=None):
                 _reset_unified_if_stale(scheduler, 'before_parent_tick')
                 if _main_skip_parent_tick():
                     _reset_push_fallback_state(scheduler, 'main_parent_tick_skip')
                     logger.warning(
-                        '[SUMMARY SCHEDULER STALE GUARD] main.py skip summary parent tick to avoid NAS DB/cache read. Set AUTOSTOCK_MAIN_SKIP_SUMMARY_PARENT_TICK=0 to restore legacy behavior.'
+                        '[SUMMARY SCHEDULER STALE GUARD] main.py skip summary parent tick to avoid NAS DB/cache read. Set AUTOSTOCK_MAIN_SKIP_SUMMARY_PARENT_TICK=0 or AUTOSTOCK_MAIN_OPERATION_MODE=full to restore.'
                     )
                     return {'ok': True, 'skipped': True, 'reason': 'main_py_summary_parent_tick_skip'}
                 if _suppress_fallback():
                     _reset_push_fallback_state(scheduler, 'before_parent_tick_suppress')
                 return old_tick(now=now)
+            tick_patched._stale_guard_patch_v4 = True  # type: ignore[attr-defined]
             tick_patched._stale_guard_patch_v3 = True  # type: ignore[attr-defined]
-            tick_patched._stale_guard_patch_v2 = True  # type: ignore[attr-defined]
             tick_patched._original = old_tick  # type: ignore[attr-defined]
             scheduler._run_summary_tick = tick_patched
 
         _PATCHED = True
         logger.warning(
-            '[SUMMARY SCHEDULER STALE GUARD] installed v3 suppress_fallback=%s main_entry_only=%s parent_skip=%s push_bg_all=%s stale_sec=%.1f',
-            _suppress_fallback(), _main_entry_only(), _main_skip_parent_tick(), _push_bg_all(), _f('SUMMARY_UNIFIED_BG_STALE_SEC', 60.0),
+            '[SUMMARY SCHEDULER STALE GUARD] installed v4 suppress_fallback=%s main_entry_only=%s parent_skip=%s push_bg_all=%s mode=%s stale_sec=%.1f',
+            _suppress_fallback(), _main_entry_only(), _main_skip_parent_tick(), _push_bg_all(), _operation_mode(), _f('SUMMARY_UNIFIED_BG_STALE_SEC', 60.0),
         )
         return True
     except Exception:
