@@ -1,13 +1,35 @@
 # ============================================================
 # File   : core/startup/main_schedule_due_filter_patch.py
-# Version: V1-MAIN-SCHEDULE-DUE-FILTER
+# Version: V2-MAIN-SCHEDULE-DUE-FILTER-STAGED
 # ------------------------------------------------------------
 # main.py は entry/order 側の軽量プロセスとして起動させる。
 # NAS SQLite が不安定な環境では、関数内 skip まで到達する前に
 # schedule job thread 起動直後で 0xC0000006 になるケースがある。
 #
-# そのため schedule_loop の due job 検出/dispatch の最外層で、
-# main.py では DB owner 系 job を thread 起動前に除外する。
+# V2:
+#   いきなり全機能を戻さず、段階復帰できるようにする。
+#   default mode は entry_only。
+#
+#   entry_only で許可するもの:
+#     - main.py 本体
+#     - entry/order の軽量基盤
+#
+#   entry_only で止めるもの:
+#     - exit_loop_5s
+#     - ranking_entry
+#     - tonosama_entry
+#     - summary_ai / summary direct dispatch
+#     - ranking_summary_all
+#     - summary_parent_tick
+#
+# ENV staged restore:
+#   AUTOSTOCK_MAIN_OPERATION_MODE=entry_only|entry_exit|full
+#   AUTOSTOCK_MAIN_ENABLE_EXIT_LOOP=1
+#   AUTOSTOCK_MAIN_ENABLE_RANKING_ENTRY=1
+#   AUTOSTOCK_MAIN_ENABLE_TONOSAMA_ENTRY=1
+#   AUTOSTOCK_MAIN_ENABLE_SUMMARY_AI_ENTRY=1
+#   AUTOSTOCK_MAIN_ENABLE_SUMMARY_PARENT_TICK=1
+#   AUTOSTOCK_MAIN_ENABLE_RANKING_SUMMARY_SCHEDULE=1
 # ============================================================
 from __future__ import annotations
 
@@ -34,6 +56,13 @@ def _env_bool(name: str, default: bool = True) -> bool:
         return bool(default)
     except Exception:
         return bool(default)
+
+
+def _mode() -> str:
+    try:
+        return str(os.getenv("AUTOSTOCK_MAIN_OPERATION_MODE", "entry_only") or "entry_only").strip().lower()
+    except Exception:
+        return "entry_only"
 
 
 def _is_main_py() -> bool:
@@ -66,6 +95,53 @@ def _safe_job_key(schedule_loop: Any, job: Any) -> str:
     return repr(job)
 
 
+def _key_or_tags_contain(tags: set[str], key_s: str, *needles: str) -> bool:
+    blob = " ".join([key_s, *sorted(tags)]).lower()
+    return any(str(n).lower() in blob for n in needles)
+
+
+def _allow_exit_loop() -> bool:
+    mode = _mode()
+    if mode in {"entry_exit", "full", "all"}:
+        return True
+    return _env_bool("AUTOSTOCK_MAIN_ENABLE_EXIT_LOOP", False)
+
+
+def _allow_ranking_entry() -> bool:
+    mode = _mode()
+    if mode in {"full", "all"}:
+        return True
+    return _env_bool("AUTOSTOCK_MAIN_ENABLE_RANKING_ENTRY", False)
+
+
+def _allow_tonosama_entry() -> bool:
+    mode = _mode()
+    if mode in {"full", "all"}:
+        return True
+    return _env_bool("AUTOSTOCK_MAIN_ENABLE_TONOSAMA_ENTRY", False)
+
+
+def _allow_summary_ai_entry() -> bool:
+    mode = _mode()
+    if mode in {"full", "all"}:
+        return True
+    return _env_bool("AUTOSTOCK_MAIN_ENABLE_SUMMARY_AI_ENTRY", False)
+
+
+def _allow_ranking_summary() -> bool:
+    mode = _mode()
+    if mode in {"full", "all"}:
+        return True
+    return _env_bool("AUTOSTOCK_MAIN_ENABLE_RANKING_SUMMARY_SCHEDULE", False)
+
+
+def _allow_summary_parent_tick() -> bool:
+    mode = _mode()
+    if mode in {"full", "all"}:
+        return True
+    return _env_bool("AUTOSTOCK_MAIN_ENABLE_SUMMARY_PARENT_TICK", False)
+
+
 def _blocked_reason(job: Any, key: str | None = None) -> str | None:
     """main.py で thread 起動前に落とす schedule job を判定。"""
     if not _is_main_py():
@@ -76,29 +152,32 @@ def _blocked_reason(job: Any, key: str | None = None) -> str | None:
     tags = _safe_tags_from_job(job)
     key_s = str(key or "")
 
-    disable_entry = _env_bool("AUTOSTOCK_MAIN_DISABLE_SCHEDULED_ENTRY_JOBS", True)
-    disable_exit = _env_bool("AUTOSTOCK_MAIN_DISABLE_SCHEDULED_EXIT_LOOP", True)
-    disable_ranking_summary = _env_bool("AUTOSTOCK_MAIN_SKIP_RANKING_SUMMARY_SCHEDULE", True)
-    disable_summary_parent = _env_bool("AUTOSTOCK_MAIN_SKIP_SUMMARY_PARENT_TICK", True)
+    # Backward compatible hard-disable envs. Explicitly set only.
+    if os.getenv("AUTOSTOCK_MAIN_DISABLE_SCHEDULED_ENTRY_JOBS") is not None:
+        if _env_bool("AUTOSTOCK_MAIN_DISABLE_SCHEDULED_ENTRY_JOBS", False):
+            if _key_or_tags_contain(tags, key_s, "tonosama_entry", "ranking_entry", "summary_ai"):
+                return "main_py_entry_job_disabled_legacy_env"
+    if os.getenv("AUTOSTOCK_MAIN_DISABLE_SCHEDULED_EXIT_LOOP") is not None:
+        if _env_bool("AUTOSTOCK_MAIN_DISABLE_SCHEDULED_EXIT_LOOP", False) and _key_or_tags_contain(tags, key_s, "exit_loop_5s"):
+            return "main_py_exit_loop_disabled_legacy_env"
 
-    if disable_entry and "entry" in tags and ({"tonosama_entry", "ranking_entry"} & tags):
-        return "main_py_entry_job_disabled"
-    if disable_exit and "exit_loop_5s" in tags:
-        return "main_py_exit_loop_disabled"
-    if disable_ranking_summary and "ranking_summary_all" in tags:
-        return "main_py_ranking_summary_disabled"
-    if disable_summary_parent and "summary_parent_tick" in tags:
-        return "main_py_summary_parent_tick_disabled"
+    if _key_or_tags_contain(tags, key_s, "exit_loop_5s") and not _allow_exit_loop():
+        return "main_py_exit_loop_disabled_stage"
 
-    # 念のため key 文字列でも判定する。
-    if disable_entry and ("tonosama_entry" in key_s or "ranking_entry" in key_s):
-        return "main_py_entry_job_disabled_key"
-    if disable_exit and "exit_loop_5s" in key_s:
-        return "main_py_exit_loop_disabled_key"
-    if disable_ranking_summary and "ranking_summary_all" in key_s:
-        return "main_py_ranking_summary_disabled_key"
-    if disable_summary_parent and "summary_parent_tick" in key_s:
-        return "main_py_summary_parent_tick_disabled_key"
+    if _key_or_tags_contain(tags, key_s, "tonosama_entry") and not _allow_tonosama_entry():
+        return "main_py_tonosama_entry_disabled_stage"
+
+    if _key_or_tags_contain(tags, key_s, "ranking_entry") and not _allow_ranking_entry():
+        return "main_py_ranking_entry_disabled_stage"
+
+    if _key_or_tags_contain(tags, key_s, "summary_ai", "ai_summary", "summary_direct_dispatch") and not _allow_summary_ai_entry():
+        return "main_py_summary_ai_disabled_stage"
+
+    if _key_or_tags_contain(tags, key_s, "ranking_summary_all") and not _allow_ranking_summary():
+        return "main_py_ranking_summary_disabled_stage"
+
+    if _key_or_tags_contain(tags, key_s, "summary_parent_tick") and not _allow_summary_parent_tick():
+        return "main_py_summary_parent_tick_disabled_stage"
 
     return None
 
@@ -154,14 +233,25 @@ def install() -> bool:
                     continue
                 out.append(job)
             if skipped:
-                logger.warning("[MAIN SCHEDULE DUE FILTER] filtered due jobs before dispatch skipped=%s kept=%s", skipped, [_safe_job_key(schedule_loop, j) for j in out])
+                logger.warning(
+                    "[MAIN SCHEDULE DUE FILTER] filtered due jobs before dispatch mode=%s skipped=%s kept=%s",
+                    _mode(),
+                    skipped,
+                    [_safe_job_key(schedule_loop, j) for j in out],
+                )
             return out
 
         def _patched_dispatch_due_job(job: Any, *args: Any, **kwargs: Any) -> bool:
             key = _safe_job_key(schedule_loop, job)
             reason = _blocked_reason(job, key)
             if reason:
-                logger.warning("[MAIN SCHEDULE DUE FILTER] dispatch blocked before thread key=%s tags=%s reason=%s", key, sorted(_safe_tags_from_job(job)), reason)
+                logger.warning(
+                    "[MAIN SCHEDULE DUE FILTER] dispatch blocked before thread mode=%s key=%s tags=%s reason=%s",
+                    _mode(),
+                    key,
+                    sorted(_safe_tags_from_job(job)),
+                    reason,
+                )
                 _advance_job(schedule_loop, job)
                 return False
             return bool(old_dispatch(job, *args, **kwargs))
@@ -173,9 +263,16 @@ def install() -> bool:
 
         _INSTALLED = True
         logger.warning(
-            "[MAIN SCHEDULE DUE FILTER] installed v1 enabled=%s main_py=%s",
+            "[MAIN SCHEDULE DUE FILTER] installed v2 enabled=%s main_py=%s mode=%s allow_exit=%s allow_ranking=%s allow_tonosama=%s allow_summary_ai=%s allow_summary_parent=%s allow_ranking_summary=%s",
             _env_bool("AUTOSTOCK_MAIN_SCHEDULE_DUE_FILTER", True),
             _is_main_py(),
+            _mode(),
+            _allow_exit_loop(),
+            _allow_ranking_entry(),
+            _allow_tonosama_entry(),
+            _allow_summary_ai_entry(),
+            _allow_summary_parent_tick(),
+            _allow_ranking_summary(),
         )
         return True
     except Exception:
