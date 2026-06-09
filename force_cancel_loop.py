@@ -1,5 +1,6 @@
 # ============================================================
 # force_cancel_loop.py（BUY_SELL 準拠・安全最終版）
+# Version: V2.1-401-GLOBAL-TOKEN-FIRST
 # ------------------------------------------------------------
 # ・30秒ごとに kabusapi/orders を直接確認
 # ・未約定の指値注文を全キャンセル
@@ -7,6 +8,11 @@
 # ・401 / timeout / 切断耐性あり
 # ・起動直後の API TOKEN 未設定にも耐性あり
 # ・401時は token refresh 後に1回だけ再試行
+#
+# V2.1:
+# ・401時に token_manager.refresh_token() を即呼びして ini 必須エラーを出さない。
+# ・startup_config 側で更新済みの global_data / api_common / token_manager.API_TOKEN を優先する。
+# ・API設定iniが無い環境では、既存トークン再同期で復旧し、無ければ静かにskipする。
 # ============================================================
 
 from __future__ import annotations
@@ -39,6 +45,7 @@ PASSWORD = conf.get("aukabu", "password", fallback="")
 CANCELABLE_STATES = {1, 2, 3, 4}
 _LAST_TOKEN_WARN_AT = 0.0
 _LAST_401_REFRESH_AT = 0.0
+_LAST_REFRESH_ERROR_WARN_AT = 0.0
 
 
 # ============================================================
@@ -57,32 +64,87 @@ def _sync_global_token(token: str | None) -> None:
                 pass
     except Exception:
         pass
+    try:
+        import token_manager
+        try:
+            token_manager.API_TOKEN = token
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
-def _direct_token_fallback():
-    """api_common 経由で取れない時の最後の保険。"""
+def _read_global_token() -> str | None:
+    try:
+        from global_state import global_data
+        for name in ("token_value", "API_TOKEN", "api_token", "token", "kabu_api_token"):
+            try:
+                token = getattr(global_data, name, None)
+                if token:
+                    return str(token)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+
+def _headers_from_existing_token(context: str):
+    """startup_config 等で既に同期されたtokenを優先して使う。"""
+    token = _read_global_token()
+    if not token:
+        try:
+            import token_manager
+            token = getattr(token_manager, "API_TOKEN", None)
+        except Exception:
+            token = None
+    if token:
+        token = str(token)
+        _sync_global_token(token)
+        logger.warning("[FORCE_CANCEL] API TOKEN reused from existing runtime token context=%s", context)
+        return {"X-API-KEY": token, "Content-Type": "application/json"}
+    return None
+
+
+def _direct_token_fallback(context: str = "unknown"):
+    """api_common 経由で取れない時の最後の保険。ini必須エラーは抑制する。"""
+    headers = _headers_from_existing_token(context)
+    if headers is not None:
+        return headers
     try:
         import token_manager
         token = getattr(token_manager, "API_TOKEN", None)
         if not token:
-            token = token_manager.get_valid_token()
+            try:
+                token = token_manager.get_valid_token()
+            except Exception as e:
+                # settings.ini に [trade] だけの運用ではここが ValueError になる。
+                logger.debug("[FORCE_CANCEL] token_manager.get_valid_token unavailable context=%s err=%s", context, e)
+                token = None
         if token:
             token = str(token)
             _sync_global_token(token)
             return {"X-API-KEY": token, "Content-Type": "application/json"}
     except Exception:
-        logger.debug("[FORCE_CANCEL] direct token fallback failed", exc_info=True)
+        logger.debug("[FORCE_CANCEL] direct token fallback failed context=%s", context, exc_info=True)
     return None
 
 
 def _refresh_headers_after_401(context: str):
     """401時に token を再取得し、global_data/api_common へ同期する。"""
-    global _LAST_401_REFRESH_AT
+    global _LAST_401_REFRESH_AT, _LAST_REFRESH_ERROR_WARN_AT
     now = time.time()
+
+    # まず起動時に同期済みのtokenを使う。iniが無い環境ではこれが最優先。
+    headers = _headers_from_existing_token(context)
+    if headers is not None:
+        return headers
+
     if now - _LAST_401_REFRESH_AT < 3.0:
         logger.warning("[FORCE_CANCEL] 401 refresh throttled context=%s", context)
-        return _direct_token_fallback()
+        return _direct_token_fallback(context)
     _LAST_401_REFRESH_AT = now
+
     try:
         import token_manager
         token = token_manager.refresh_token()
@@ -91,9 +153,12 @@ def _refresh_headers_after_401(context: str):
             _sync_global_token(token)
             logger.warning("[FORCE_CANCEL] API TOKEN refreshed after 401 context=%s", context)
             return {"X-API-KEY": token, "Content-Type": "application/json"}
-    except Exception:
-        logger.exception("[FORCE_CANCEL] token refresh after 401 failed context=%s", context)
-    return _direct_token_fallback()
+    except Exception as e:
+        # API ini未配置は想定内。ERROR tracebackを連発せず、既存token fallbackへ落とす。
+        if now - _LAST_REFRESH_ERROR_WARN_AT >= 30.0:
+            logger.warning("[FORCE_CANCEL] token refresh after 401 unavailable context=%s err=%s", context, e)
+            _LAST_REFRESH_ERROR_WARN_AT = now
+    return _direct_token_fallback(context)
 
 
 def _safe_get_headers(context):
@@ -102,7 +167,7 @@ def _safe_get_headers(context):
         return get_headers()
     except RuntimeError as e:
         if "API TOKEN is not set" in str(e):
-            headers = _direct_token_fallback()
+            headers = _direct_token_fallback(context)
             if headers is not None:
                 logger.warning("[FORCE_CANCEL] API TOKEN restored by direct fallback context=%s", context)
                 return headers
@@ -113,7 +178,7 @@ def _safe_get_headers(context):
             return None
         raise
     except Exception:
-        headers = _direct_token_fallback()
+        headers = _direct_token_fallback(context)
         if headers is not None:
             logger.warning("[FORCE_CANCEL] API TOKEN restored after get_headers error context=%s", context)
             return headers
