@@ -133,6 +133,11 @@ def install() -> bool:
         return True
 
     _run_install("summary_parallel_intervals_runtime_patch", "core.startup.summary_parallel_intervals_runtime_patch")
+    # summary_parallel_intervals_runtime_patch intentionally forces PUSH BG in main-entry-only mode.
+    # On this environment, any main.py-side PUSH summary DB/cache path can terminate Windows with
+    # 0xC0000006 on NAS SQLite reads. Re-apply the main.py skip immediately after summary_parallel
+    # installs so later scheduler ticks cannot start job_summary(PUSH) from main.py.
+    _run_install("main_skip_summary_push_bg_patch", "core.startup.main_skip_summary_push_bg_patch")
     _run_install("summary_display_label_guard_patch", "core.startup.summary_display_label_guard_patch")
     _patch_summary_schema_bootstrap()
     _run_install("entry_limit_passive_runtime_patch", "core.startup.entry_limit_passive_runtime_patch")
@@ -149,7 +154,7 @@ def install() -> bool:
         _background_heavy()
 
     _PATCHED = True
-    logger.warning("[FAST STARTUP PATCH] installed v16 async_heavy=%s", _env_bool("FAST_STARTUP_ASYNC_HEAVY_PATCHES", True))
+    logger.warning("[FAST STARTUP PATCH] installed v17 async_heavy=%s", _env_bool("FAST_STARTUP_ASYNC_HEAVY_PATCHES", True))
     return True
 
 try:
