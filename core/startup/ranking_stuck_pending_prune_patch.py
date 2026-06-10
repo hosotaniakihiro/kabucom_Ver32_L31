@@ -10,6 +10,9 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 _DONE = False
+_RUN_LOCK = threading.Lock()
+_RUN_STARTED_AT = 0.0
+_RUN_SEQ = 0
 
 
 def _env_int(name: str, default: int) -> int:
@@ -106,7 +109,7 @@ def _pending_count() -> int:
     return total
 
 
-def _mark_and_prune_stuck_ranking_pending() -> int:
+def _mark_and_prune_stuck_ranking_pending(reason: str = "RANKING_STUCK_PENDING_RETRY_OR_AGE") -> int:
     max_retry = max(1, _env_int("RANKING_STUCK_PENDING_MAX_CONTROLLER_RETRY", 3))
     min_age_sec = max(5.0, _env_float("RANKING_STUCK_PENDING_MIN_AGE_SEC", 30.0))
     max_age_sec = max(min_age_sec, _env_float("RANKING_STUCK_PENDING_MAX_AGE_SEC", 120.0))
@@ -153,11 +156,12 @@ def _mark_and_prune_stuck_ranking_pending() -> int:
                 return True
             return False
 
-        removed = int(prune(pred, reason="RANKING_STUCK_PENDING_RETRY_OR_AGE"))
+        removed = int(prune(pred, reason=reason))
         if removed:
             logger.warning(
-                "[RANKING STUCK PENDING] pruned removed=%s max_retry=%s min_age=%.1fs max_age=%.1fs",
+                "[RANKING STUCK PENDING] pruned removed=%s reason=%s max_retry=%s min_age=%.1fs max_age=%.1fs",
                 removed,
+                reason,
                 max_retry,
                 min_age_sec,
                 max_age_sec,
@@ -168,17 +172,39 @@ def _mark_and_prune_stuck_ranking_pending() -> int:
         return 0
 
 
+def _clear_runtime_overlap_if_stale() -> bool:
+    """schedulerのprevious_still_running化を避けるため、古い実行中マークを自前で解放する。"""
+    global _RUN_STARTED_AT
+    if not _RUN_LOCK.locked():
+        return False
+    stale_sec = max(10.0, _env_float("RANKING_ENTRY_RUNTIME_STALE_SEC", 45.0))
+    age = time.time() - float(_RUN_STARTED_AT or 0.0)
+    if age < stale_sec:
+        return False
+
+    logger.warning(
+        "[RANKING STUCK PENDING] previous ranking run still active age=%.1fs >= %.1fs; "
+        "skip this cycle and prune stale pending instead of starting another heavy run",
+        age,
+        stale_sec,
+    )
+    _mark_and_prune_stuck_ranking_pending(reason="RANKING_ENTRY_RUNTIME_STALE_SKIP")
+    return True
+
+
 def _patch_once() -> bool:
     try:
         import trading.entry_exit.tasks as tasks
         cur = getattr(tasks, "_run_ranking_entry_safe", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_ranking_stuck_pending_prune_v4", False):
+        if getattr(cur, "_ranking_stuck_pending_prune_v5", False):
             return True
         orig = getattr(cur, "_original", cur)
 
         def patched():
+            global _RUN_STARTED_AT, _RUN_SEQ
+
             if _main_skip_ranking_entry():
                 logger.warning(
                     "[RANKING STUCK PENDING] main.py skip ranking entry job mode=%s. "
@@ -187,26 +213,58 @@ def _patch_once() -> bool:
                 )
                 return 0
 
-            cnt = _pending_count()
-            if cnt > 0:
-                pruned = _mark_and_prune_stuck_ranking_pending()
-                if pruned:
-                    left = _pending_count()
+            if not _RUN_LOCK.acquire(blocking=False):
+                _clear_runtime_overlap_if_stale()
+                return 0
+
+            _RUN_SEQ += 1
+            seq = _RUN_SEQ
+            _RUN_STARTED_AT = time.time()
+            budget_sec = max(5.0, _env_float("RANKING_ENTRY_RUNTIME_WARN_SEC", 25.0))
+            try:
+                cnt = _pending_count()
+                if cnt > 0:
+                    pruned = _mark_and_prune_stuck_ranking_pending()
+                    if pruned:
+                        left = _pending_count()
+                        logger.warning(
+                            "[RANKING STUCK PENDING] pre-build pruned=%s before=%s after=%s",
+                            pruned,
+                            cnt,
+                            left,
+                        )
+
+                ret = orig()
+                return ret
+            finally:
+                elapsed = time.time() - _RUN_STARTED_AT
+                if elapsed >= budget_sec:
                     logger.warning(
-                        "[RANKING STUCK PENDING] pre-build pruned=%s before=%s after=%s",
-                        pruned,
-                        cnt,
-                        left,
+                        "[RANKING STUCK PENDING] ranking_entry run slow seq=%s elapsed=%.1fs warn_sec=%.1fs",
+                        seq,
+                        elapsed,
+                        budget_sec,
                     )
-            return orig()
+                _RUN_STARTED_AT = 0.0
+                try:
+                    _RUN_LOCK.release()
+                except RuntimeError:
+                    pass
 
         patched._ranking_stuck_pending_prune_v1 = True  # type: ignore[attr-defined]
         patched._ranking_stuck_pending_prune_v2 = True  # type: ignore[attr-defined]
         patched._ranking_stuck_pending_prune_v3 = True  # type: ignore[attr-defined]
         patched._ranking_stuck_pending_prune_v4 = True  # type: ignore[attr-defined]
+        patched._ranking_stuck_pending_prune_v5 = True  # type: ignore[attr-defined]
         patched._original = orig  # type: ignore[attr-defined]
         tasks._run_ranking_entry_safe = patched
-        logger.warning("[RANKING STUCK PENDING] patched _run_ranking_entry_safe v4 min_age_guard=True main_skip=%s mode=%s", _main_skip_ranking_entry(), _operation_mode())
+        logger.warning(
+            "[RANKING STUCK PENDING] patched _run_ranking_entry_safe v5 overlap_guard=True runtime_warn=%ss stale=%ss main_skip=%s mode=%s",
+            os.getenv("RANKING_ENTRY_RUNTIME_WARN_SEC", "25"),
+            os.getenv("RANKING_ENTRY_RUNTIME_STALE_SEC", "45"),
+            _main_skip_ranking_entry(),
+            _operation_mode(),
+        )
         return True
     except Exception:
         logger.exception("[RANKING STUCK PENDING] patch failed")
@@ -214,12 +272,12 @@ def _patch_once() -> bool:
 
 
 def _watch() -> None:
-    loops = max(1, min(_env_int("RANKING_STUCK_PENDING_ENFORCE_LOOPS", 120), 300))
-    sleep_sec = max(0.5, min(_env_float("RANKING_STUCK_PENDING_ENFORCE_SLEEP_SEC", 2.0), 10.0))
+    loops = max(1, min(_env_int("RANKING_STUCK_PENDING_ENFORCE_LOOPS", 30), 120))
+    sleep_sec = max(1.0, min(_env_float("RANKING_STUCK_PENDING_ENFORCE_SLEEP_SEC", 3.0), 10.0))
     for i in range(loops):
         ok = _patch_once()
-        if i in (0, 1, 5, 30, loops - 1):
-            logger.warning("[RANKING STUCK PENDING] enforce ok=%s v4 main_skip=%s mode=%s", ok, _main_skip_ranking_entry(), _operation_mode())
+        if i in (0, loops - 1):
+            logger.warning("[RANKING STUCK PENDING] enforce ok=%s v5 main_skip=%s mode=%s", ok, _main_skip_ranking_entry(), _operation_mode())
         time.sleep(sleep_sec)
 
 
@@ -227,12 +285,11 @@ def install() -> bool:
     global _DONE
     if _DONE:
         ok = _patch_once()
-        logger.warning("[RANKING STUCK PENDING] enforce ok=%s v4 main_skip=%s mode=%s", ok, _main_skip_ranking_entry(), _operation_mode())
         return bool(ok)
     ok = _patch_once()
     threading.Thread(target=_watch, name="ranking-stuck-pending-prune-watch", daemon=True).start()
     _DONE = True
-    logger.warning("[RANKING STUCK PENDING] installed v4 ok=%s watcher=True min_age_guard=True main_skip=%s mode=%s", ok, _main_skip_ranking_entry(), _operation_mode())
+    logger.warning("[RANKING STUCK PENDING] installed v5 ok=%s watcher=True overlap_guard=True main_skip=%s mode=%s", ok, _main_skip_ranking_entry(), _operation_mode())
     return bool(ok)
 
 
