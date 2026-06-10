@@ -27,6 +27,28 @@ def install() -> bool:
         "PUSH_INCREMENTAL_MA75_SUMMARY_LOOKBACK_DAYS": "1",
         "PUSH_INCREMENTAL_MA75_TAIL_ROWS": "90",
 
+        # メモリ余裕を使って SQLite の temp/cache をメモリ寄せする。
+        "SQLITE_MEMORY_PRAGMAS_ENABLED": "1",
+        "SQLITE_MEMORY_TEMP_STORE": "MEMORY",
+        "SQLITE_MEMORY_CACHE_KB": "-65536",
+        "SQLITE_BUSY_TIMEOUT_MS": "5000",
+        "SQLITE_MMAP_SIZE_BYTES": "268435456",
+        "SQLITE_CACHE_SPILL_OFF": "1",
+        "RANKING_SQLITE_TEMP_STORE": "MEMORY",
+        "SUMMARY_SQLITE_TEMP_STORE": "MEMORY",
+        "PUSH_SQLITE_TEMP_STORE": "MEMORY",
+        "YAHOO_SQLITE_TEMP_STORE": "MEMORY",
+        "RANKING_SQLITE_CACHE_KB": "-65536",
+        "SUMMARY_SQLITE_CACHE_KB": "-131072",
+        "PUSH_SQLITE_CACHE_KB": "-65536",
+        "YAHOO_SQLITE_CACHE_KB": "-65536",
+
+        # summary履歴キャッシュ系。対応モジュールがある場合に有効化される。
+        "SUMMARY_HISTORY_MEMORY_CACHE": "1",
+        "SUMMARY_HISTORY_CACHE_TTL_SEC": "300",
+        "SUMMARY_HISTORY_CACHE_MAX_SYMBOLS": "800",
+        "SUMMARY_HISTORY_CACHE_TAIL_ROWS": "90",
+
         # NAS heartbeat / BLAS thread抑制。
         "AUTOSTOCK_COLLECTOR_PARENT_HEARTBEAT": "0",
         "AUTOSTOCK_DISABLE_NAS_HEARTBEAT": "1",
@@ -37,4 +59,11 @@ def install() -> bool:
     }
     for key, value in defaults.items():
         os.environ.setdefault(key, value)
+
+    try:
+        from core.startup.sqlite_memory_pragmas_patch import install as _install_sqlite_memory_pragmas
+        _install_sqlite_memory_pragmas()
+    except Exception:
+        pass
+
     return True
