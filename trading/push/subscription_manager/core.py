@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/subscription_manager/core.py
-# Version: V3.6-ROTATION-UNREGISTER-WAIT-0P2
+# Version: V3.7-SAFE-RECONNECT-NO-EMPTY-CLEAR
 # ------------------------------------------------------------
 # Function:
 #   - subscription manager 公開API
@@ -12,8 +12,9 @@
 #   - kabu Station の同時登録上限は50銘柄
 #   - PUSHローテーションの設計は以下:
 #       登録 -> 4.8秒保持 -> 解除 -> 0.2秒待機 -> 登録 -> 4.8秒保持
-#   - startup/on_open等の初回clearは安全側に1.5秒待つが、rotation_* 理由では
+#   - startup等の初回clearは安全側に1.5秒待つが、rotation_* 理由では
 #     PUSH_ROTATION_UNREGISTER_WAIT_SEC=0.2 を優先する。
+#   - on_open / reconnect 系は target=0 で既存登録を消さない。
 # ============================================================
 
 from __future__ import annotations
@@ -45,6 +46,21 @@ from .target_builder import REGISTER_MAX_SYMBOLS, build_target_symbols
 logger = logging.getLogger(__name__)
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None:
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in ("1", "true", "yes", "y", "on"):
+            return True
+        if s in ("0", "false", "no", "n", "off"):
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
+
+
 def _env_float(name: str, default: float) -> float:
     try:
         v = os.getenv(name)
@@ -56,7 +72,7 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _default_wait_after_clear_sec() -> float:
-    # startup/on_open用の安全側既定値。rotation_* では使わない。
+    # startup用の安全側既定値。rotation_* では使わない。
     return max(0.0, _env_float("KABU_REGISTER_UNREGISTER_WAIT_SEC", 1.5))
 
 
@@ -86,21 +102,43 @@ def _is_rotation_reason(reason: Any) -> bool:
         return False
 
 
-def _is_force_clear_reason(reason: Any) -> bool:
+def _is_safe_reconnect_reason(reason: Any) -> bool:
     """
-    kabu Station に既存登録が残っている可能性が高い refresh 理由。
-    ここでは必ず unregister_all → register にする。
+    WebSocket再接続直後の安全refresh。
+    ranking DB が空の瞬間でも既存PUSH登録を0件で上書きしない。
     """
     try:
         s = str(reason or "").strip().lower()
         if not s:
             return False
         return (
-            s in {"on_open", "startup", "startup_bridge", "startup_bridge_rotation_a", "startup_bridge_rotation_b"}
+            s == "on_open"
             or s.startswith("on_open")
-            or s.startswith("startup")
             or s.startswith("reconnect")
             or s.startswith("ws_reconnect")
+        )
+    except Exception:
+        return False
+
+
+def _is_force_clear_reason(reason: Any) -> bool:
+    """
+    kabu Station に既存登録が残っている可能性が高く、明示的に全解除したいrefresh理由。
+
+    注意:
+      - on_open / reconnect はここに含めない。
+        再接続直後に ranking DB が空扱いになると target=0 で unregister_all されるため。
+      - 必要な場合だけ PUSH_ONOPEN_FORCE_CLEAR=1 で旧挙動に戻せる。
+    """
+    try:
+        s = str(reason or "").strip().lower()
+        if not s:
+            return False
+        if _is_safe_reconnect_reason(s):
+            return _env_bool("PUSH_ONOPEN_FORCE_CLEAR", False)
+        return (
+            s in {"startup", "startup_bridge", "startup_bridge_rotation_a", "startup_bridge_rotation_b"}
+            or s.startswith("startup")
         )
     except Exception:
         return False
@@ -114,10 +152,11 @@ def _extract_wait_after_clear_sec(kwargs: dict[str, Any], *, is_rotation: bool =
         "unregister_wait_sec",
         "clear_wait_sec",
         "wait_after_unregister_sec",
+        "wait_after_clear",
     ):
         if key in kwargs and kwargs.get(key) is not None:
             v = max(0.0, _safe_float(kwargs.get(key), default_wait))
-            # rotationでは0指定も「0.2秒設計」へ戻す。startup/on_openは1.5秒へ戻す。
+            # rotationでは0指定も「0.2秒設計」へ戻す。startupは1.5秒へ戻す。
             return default_wait if v <= 0 else v
     return default_wait
 
@@ -154,10 +193,12 @@ def refresh_subscriptions(
     保証:
       - run_refresh_sequence() へ渡す target_symbols は最大50件
       - rotation_* は登録→保持→解除→0.2秒→登録の設計に合わせる
-      - on_open / startup は既存登録を全解除してから安全側に登録する
+      - on_open / reconnect は0件候補で既存登録を全解除しない
+      - startup は既存登録を全解除してから安全側に登録する
     """
 
     is_rotation = _is_rotation_reason(reason)
+    is_safe_reconnect = _is_safe_reconnect_reason(reason)
     is_force_clear = _is_force_clear_reason(reason)
     wait_after_clear_sec = _extract_wait_after_clear_sec(kwargs, is_rotation=is_rotation)
 
@@ -167,6 +208,12 @@ def refresh_subscriptions(
         unregister_first = True
         if wait_after_clear_sec <= 0:
             wait_after_clear_sec = _rotation_wait_after_clear_sec() if is_rotation else _default_wait_after_clear_sec()
+    elif is_safe_reconnect:
+        # 再接続直後はHTTP registerだけを再送し、unregister_allで空白時間を作らない。
+        force = True
+        clear_first = False
+        unregister_first = False
+        wait_after_clear_sec = 0.0
 
     target_symbols = build_target_symbols(
         symbols=symbols,
@@ -183,11 +230,14 @@ def refresh_subscriptions(
     with state.manager_lock:
         current_symbols = list(state.last_registered_symbols)
 
-    if is_rotation and len(target_symbols) == 0 and len(current_symbols) > 0:
+    if len(target_symbols) == 0 and (is_rotation or is_safe_reconnect or is_force_clear):
         logger.warning(
-            "[SUB MANAGER CORE] skip empty rotation refresh keep current reason=%s current=%d target=0",
+            "[SUB MANAGER CORE] skip empty safe refresh keep current reason=%s current=%d target=0 rotation=%s reconnect=%s force_clear=%s",
             reason,
             len(current_symbols),
+            is_rotation,
+            is_safe_reconnect,
+            is_force_clear,
         )
         return True
 
@@ -218,10 +268,17 @@ def refresh_subscriptions(
         wait_after_clear_sec = _rotation_wait_after_clear_sec()
     elif is_force_clear:
         skip = False
-        skip_guard = "on_open_force_clear"
+        skip_guard = "startup_force_clear"
         decided_clear_first = True
         unregister_first = True
-        clear_policy = "on_open_force_clear"
+        clear_policy = "startup_force_clear"
+    elif is_safe_reconnect:
+        skip = False
+        skip_guard = "safe_reconnect_register_only"
+        decided_clear_first = False
+        unregister_first = False
+        clear_policy = "safe_reconnect_register_only"
+        wait_after_clear_sec = 0.0
     else:
         skip, skip_guard = should_skip_on_open_refresh(
             reason=reason,
@@ -263,7 +320,7 @@ def refresh_subscriptions(
 
     logger.info(
         "[SUB MANAGER CORE] refresh start reason=%s force=%s clear_first=%s unregister_first=%s clear_policy=%s "
-        "current=%d target=%d removed=%d added=%d diff_ratio=%.3f wait_after_clear=%.3fs rotation=%s force_clear=%s",
+        "current=%d target=%d removed=%d added=%d diff_ratio=%.3f wait_after_clear=%.3fs rotation=%s reconnect=%s force_clear=%s",
         reason,
         force,
         decided_clear_first,
@@ -276,6 +333,7 @@ def refresh_subscriptions(
         diff_ratio,
         wait_after_clear_sec,
         is_rotation,
+        is_safe_reconnect,
         is_force_clear,
     )
 
@@ -313,18 +371,19 @@ def refresh_subscriptions(
         mark_reason(reason)
 
         logger.info(
-            "[SUB MANAGER CORE] refresh done reason=%s current=%d target=%d rotation=%s force_clear=%s wait_after_clear=%.3fs",
+            "[SUB MANAGER CORE] refresh done reason=%s current=%d target=%d rotation=%s reconnect=%s force_clear=%s wait_after_clear=%.3fs",
             reason,
             len(current_symbols),
             len(target_symbols),
             is_rotation,
+            is_safe_reconnect,
             is_force_clear,
             wait_after_clear_sec,
         )
         return True
 
     logger.warning(
-        "[SUB MANAGER CORE] refresh failed reason=%s current=%d target=%d removed=%d added=%d diff_ratio=%.3f rotation=%s force_clear=%s",
+        "[SUB MANAGER CORE] refresh failed reason=%s current=%d target=%d removed=%d added=%d diff_ratio=%.3f rotation=%s reconnect=%s force_clear=%s",
         reason,
         len(current_symbols),
         len(target_symbols),
@@ -332,6 +391,7 @@ def refresh_subscriptions(
         len(added),
         diff_ratio,
         is_rotation,
+        is_safe_reconnect,
         is_force_clear,
     )
     return False
