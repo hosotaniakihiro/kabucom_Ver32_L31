@@ -13,6 +13,7 @@ _SCHEDULER_STALE_PATCHED = False
 _TASK_STALE_PATCHED = False
 _COMPANION_PATCHED = False
 _WATCHER_STARTED = False
+_LAST_PATCH_LOG_TS = 0.0
 
 _TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 
@@ -37,6 +38,16 @@ def _env_bool(name: str, default: bool = True) -> bool:
         return bool(default)
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
 def _ensure_min_env_float(name: str, minimum: float) -> None:
     try:
         cur = _env_float(name, minimum)
@@ -53,10 +64,19 @@ def _in_session(now=None):
     return (dt.time(9, 0) <= t <= dt.time(11, 30)) or (dt.time(12, 30) <= t <= dt.time(15, 30))
 
 
+def _rate_limited_log(message: str, *args: Any) -> None:
+    global _LAST_PATCH_LOG_TS
+    now = time.time()
+    interval = max(3.0, _env_float("RANKING_ENTRY_MARKET_PATCH_LOG_INTERVAL_SEC", 60.0))
+    if now - _LAST_PATCH_LOG_TS >= interval:
+        _LAST_PATCH_LOG_TS = now
+        logger.warning(message, *args)
+
+
 def _install_companion_patches() -> bool:
     """
     token互換と ranking DB empty fallback を連鎖 install する。
-    V1.3: 起動遅延対策として、成功後は二度と呼び直さない。
+    V1.4: 成功後は二度と呼び直さない。
     """
     global _COMPANION_PATCHED
     if _COMPANION_PATCHED:
@@ -86,7 +106,7 @@ def _run_with_watchdog(orig) -> Any:
     if not _env_bool("RANKING_ENTRY_WATCHDOG_ENABLED", True):
         return orig()
 
-    timeout_sec = max(180.0, _env_float("RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC", 180.0))
+    timeout_sec = max(30.0, _env_float("RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC", 30.0))
     result: dict[str, Any] = {"done": False, "ret": None, "error": None}
 
     def _target() -> None:
@@ -109,7 +129,7 @@ def _run_with_watchdog(orig) -> Any:
             elapsed,
             timeout_sec,
             True,
-            "ranking entry still blocked after extended timeout; worker is daemon and next tick may retry",
+            "ranking entry still blocked after timeout; worker is daemon and next tick may retry",
         )
         return 0
 
@@ -126,7 +146,7 @@ def _entry_stale_timeout_for_key(key: str) -> float:
     if "tonosama_entry" in key:
         return _env_float("TONOSAMA_ENTRY_SCHEDULER_STALE_SEC", base)
     if "ranking_entry" in key:
-        return _env_float("RANKING_ENTRY_SCHEDULER_STALE_SEC", max(120.0, base))
+        return _env_float("RANKING_ENTRY_SCHEDULER_STALE_SEC", max(30.0, base))
     if "entry" in key:
         return base
     return 0.0
@@ -139,7 +159,6 @@ def _clear_task_running_if_stale(source: str, *, force: bool = False) -> bool:
     except Exception:
         logger.debug("[ENTRY TASK STALE CLEAR] tasks import failed source=%s", source_u, exc_info=True)
         return False
-
     if "TONOSAMA" in source_u:
         running_name = "_TONOSAMA_ENTRY_RUNNING"
         started_name = "_TONOSAMA_ENTRY_STARTED_AT"
@@ -151,7 +170,7 @@ def _clear_task_running_if_stale(source: str, *, force: bool = False) -> bool:
         started_name = "_RANKING_ENTRY_STARTED_AT"
         cooldown_name = "_RANKING_ENTRY_COOLDOWN_UNTIL"
         orphan_name = None
-        timeout = _env_float("RANKING_ENTRY_TASK_STALE_SEC", _env_float("RANKING_ENTRY_SCHEDULER_STALE_SEC", 180.0))
+        timeout = _env_float("RANKING_ENTRY_TASK_STALE_SEC", _env_float("RANKING_ENTRY_SCHEDULER_STALE_SEC", 30.0))
     else:
         return False
 
@@ -208,7 +227,7 @@ def _install_task_stale_running_clear() -> bool:
         "[ENTRY TASK STALE CLEAR] installed enabled=%s tonosama_task_timeout=%.1fs ranking_task_timeout=%.1fs",
         _env_bool("ENTRY_TASK_STALE_RUNNING_CLEAR_ENABLED", True),
         _env_float("TONOSAMA_ENTRY_TASK_STALE_SEC", _env_float("TONOSAMA_ENTRY_SCHEDULER_STALE_SEC", 90.0)),
-        _env_float("RANKING_ENTRY_TASK_STALE_SEC", _env_float("RANKING_ENTRY_SCHEDULER_STALE_SEC", 180.0)),
+        _env_float("RANKING_ENTRY_TASK_STALE_SEC", _env_float("RANKING_ENTRY_SCHEDULER_STALE_SEC", 30.0)),
     )
     return True
 
@@ -222,7 +241,6 @@ def _install_scheduler_stale_running_clear() -> bool:
 
     try:
         import core.startup.schedule_loop as sl
-
         orig = getattr(sl, "_is_job_running", None)
         if not callable(orig):
             logger.warning("[ENTRY SCHEDULER STALE CLEAR] schedule_loop._is_job_running missing")
@@ -273,12 +291,16 @@ def _install_scheduler_stale_running_clear() -> bool:
             _env_bool("ENTRY_SCHEDULER_STALE_RUNNING_CLEAR_ENABLED", True),
             _env_float("ENTRY_SCHEDULER_STALE_RUNNING_CLEAR_SEC", 90.0),
             _env_float("TONOSAMA_ENTRY_SCHEDULER_STALE_SEC", _env_float("ENTRY_SCHEDULER_STALE_RUNNING_CLEAR_SEC", 90.0)),
-            _env_float("RANKING_ENTRY_SCHEDULER_STALE_SEC", max(120.0, _env_float("ENTRY_SCHEDULER_STALE_RUNNING_CLEAR_SEC", 90.0))),
+            _env_float("RANKING_ENTRY_SCHEDULER_STALE_SEC", max(30.0, _env_float("ENTRY_SCHEDULER_STALE_RUNNING_CLEAR_SEC", 90.0))),
         )
         return True
     except Exception:
         logger.exception("[ENTRY SCHEDULER STALE CLEAR] install failed")
         return False
+
+
+def _is_stuck_pending_wrapper(fn: Any) -> bool:
+    return bool(callable(fn) and any(getattr(fn, f"_ranking_stuck_pending_prune_v{i}", False) for i in range(1, 10)))
 
 
 def _patch_once():
@@ -293,8 +315,22 @@ def _patch_once():
         cur = getattr(tasks, "_run_ranking_entry_safe", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_ranking_market_hours_skip_v2_watchdog", False):
+
+        # V1.4: ranking_stuck_pending_prune が既にtimebox/overlapを持つ場合は、
+        # ここでさらに watchdog wrapper を重ねない。属性だけ付けて相互再wrapを止める。
+        if _is_stuck_pending_wrapper(cur):
+            cur._ranking_market_hours_skip_v2_watchdog = True  # type: ignore[attr-defined]
+            cur._ranking_market_hours_skip_v14_passthrough = True  # type: ignore[attr-defined]
+            _rate_limited_log(
+                "[RANKING ENTRY MARKET HOURS SKIP] detected ranking_stuck_pending wrapper -> no rewrap v1.4 companion=%s task_clear=%s",
+                companion_ok,
+                task_ok,
+            )
             return True
+
+        if getattr(cur, "_ranking_market_hours_skip_v14", False) or getattr(cur, "_ranking_market_hours_skip_v2_watchdog", False):
+            return True
+
         orig = getattr(cur, "_original", cur)
 
         def patched():
@@ -305,13 +341,14 @@ def _patch_once():
             _clear_task_running_if_stale("RANKING")
             return _run_with_watchdog(orig)
 
+        patched._ranking_market_hours_skip_v14 = True  # type: ignore[attr-defined]
         patched._ranking_market_hours_skip_v2_watchdog = True  # type: ignore[attr-defined]
         patched._original = orig  # type: ignore[attr-defined]
         tasks._run_ranking_entry_safe = patched
-        logger.warning(
-            "[RANKING ENTRY MARKET HOURS SKIP] patched _run_ranking_entry_safe watchdog=%s timeout=%.1fs task_stale_clear=%s companion=%s",
+        _rate_limited_log(
+            "[RANKING ENTRY MARKET HOURS SKIP] patched _run_ranking_entry_safe v1.4 watchdog=%s timeout=%.1fs task_stale_clear=%s companion=%s",
             _env_bool("RANKING_ENTRY_WATCHDOG_ENABLED", True),
-            _env_float("RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC", 180.0),
+            _env_float("RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC", 30.0),
             task_ok,
             companion_ok,
         )
@@ -322,14 +359,15 @@ def _patch_once():
 
 
 def _watch():
-    # 起動直後だけ数回確認。0.5秒×240回の再installループは起動遅延・ログ肥大化の原因になる。
-    for i in range(12):
+    loops = max(1, min(_env_int("RANKING_ENTRY_MARKET_HOURS_ENFORCE_LOOPS", 4), 12))
+    sleep_sec = max(1.0, min(_env_float("RANKING_ENTRY_MARKET_HOURS_ENFORCE_SLEEP_SEC", 3.0), 10.0))
+    for i in range(loops):
         ok = _patch_once()
         stale_ok = _install_scheduler_stale_running_clear()
         task_ok = _install_task_stale_running_clear()
-        if i in (0, 1, 3, 6, 11):
-            logger.warning("[RANKING ENTRY MARKET HOURS SKIP] enforce v1.3 ok=%s stale_clear_ok=%s task_clear_ok=%s companion_ok=%s", ok, stale_ok, task_ok, _COMPANION_PATCHED)
-        time.sleep(2.0)
+        if i in (0, loops - 1):
+            logger.warning("[RANKING ENTRY MARKET HOURS SKIP] enforce v1.4 i=%s/%s ok=%s stale_clear_ok=%s task_clear_ok=%s companion_ok=%s", i, loops, ok, stale_ok, task_ok, _COMPANION_PATCHED)
+        time.sleep(sleep_sec)
 
 
 def install():
@@ -339,11 +377,11 @@ def install():
     os.environ.setdefault("ENTRY_SCHEDULER_STALE_RUNNING_CLEAR_SEC", "90")
     os.environ.setdefault("TONOSAMA_ENTRY_SCHEDULER_STALE_SEC", "60")
     os.environ.setdefault("TONOSAMA_ENTRY_TASK_STALE_SEC", "60")
+    os.environ.setdefault("RANKING_ENTRY_SCHEDULER_STALE_SEC", "30")
+    os.environ.setdefault("RANKING_ENTRY_TASK_STALE_SEC", "30")
+    os.environ.setdefault("RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC", "30")
     os.environ.setdefault("RANKING_ENTRY_PUSH_SUMMARY_FALLBACK_ENABLED", "1")
     os.environ.setdefault("RANKING_PUSH_FALLBACK_MAX_ROWS", "80")
-    _ensure_min_env_float("RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC", 180.0)
-    _ensure_min_env_float("RANKING_ENTRY_SCHEDULER_STALE_SEC", 180.0)
-    _ensure_min_env_float("RANKING_ENTRY_TASK_STALE_SEC", 180.0)
 
     if _DONE:
         return True
@@ -356,7 +394,7 @@ def install():
         threading.Thread(target=_watch, name="ranking-entry-market-hours-skip", daemon=True).start()
         _WATCHER_STARTED = True
     _DONE = True
-    logger.warning("[RANKING ENTRY MARKET HOURS SKIP] installed v1.3 ok=%s stale_clear_ok=%s task_clear_ok=%s companion_ok=%s watcher=%s", ok, stale_ok, task_ok, companion_ok, _WATCHER_STARTED)
+    logger.warning("[RANKING ENTRY MARKET HOURS SKIP] installed v1.4 ok=%s stale_clear_ok=%s task_clear_ok=%s companion_ok=%s watcher=%s", ok, stale_ok, task_ok, companion_ok, _WATCHER_STARTED)
     return True
 
 
