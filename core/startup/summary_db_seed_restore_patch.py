@@ -1,16 +1,17 @@
 # ============================================================
 # File   : core/startup/summary_db_seed_restore_patch.py
-# Version: V1.5-ASYNC-IN-MAIN
+# Version: V1.6-SKIP-IN-MAIN-PROCESS
 # ------------------------------------------------------------
 # 目的:
 #   main.py は split mode / entry_only のため summary DB へ正式保存しない。
-#   ただし、エントリー判定・AI判定・Discord表示では
-#   main_database.py が保存した stock_summary_1min/3min/5min の履歴が必要。
+#   エントリー判定・AI判定・Discord表示用の summary seed は、
+#   main_database.py / DB owner 側だけで実行する。
 #
-# V1.5:
-#   - main.py 起動時の restore_summary_db_seed() を非同期化。
-#   - 1m/3m/5m の大量復元で scheduler / entry の開始が数分遅れる問題を防ぐ。
-#   - main_database.py / collector 系と force=True は従来通り同期。
+# V1.6:
+#   - main.py では restore_summary_db_seed() を完全スキップする。
+#   - 旧V1.5の async restore でも 270〜458秒走り、summary DB lock と
+#     fallback/rebuild 遅延を誘発していたため、main process では無効化。
+#   - force=True または SUMMARY_DB_SEED_RESTORE_RUN_IN_MAIN=1 の場合のみ main.py でも実行可能。
 # ============================================================
 from __future__ import annotations
 
@@ -84,6 +85,16 @@ def _is_main_py_context() -> bool:
         return "main.py" in argv
     except Exception:
         return False
+
+
+def _main_seed_restore_disabled(force: bool = False) -> bool:
+    if force:
+        return False
+    if not _is_main_py_context():
+        return False
+    if _env_bool("SUMMARY_DB_SEED_RESTORE_RUN_IN_MAIN", False):
+        return False
+    return _env_bool("SUMMARY_DB_SEED_RESTORE_SKIP_IN_MAIN", True)
 
 
 def _async_alive() -> bool:
@@ -190,9 +201,9 @@ def _count_summary_rows(path: Path) -> int:
         return 0
     total = 0
     try:
-        with sqlite3.connect(str(path), timeout=10) as conn:
+        with sqlite3.connect(str(path), timeout=5) as conn:
             try:
-                conn.execute("PRAGMA busy_timeout=10000")
+                conn.execute("PRAGMA busy_timeout=5000")
                 conn.execute("PRAGMA query_only=ON")
             except Exception:
                 pass
@@ -470,9 +481,9 @@ def _publish_interval(interval: int, df: pd.DataFrame) -> dict[str, Any]:
 
 def _read_all_intervals_from_path(path: Path, *, per_symbol_rows: int, max_rows: int, target_date: Optional[dt.date]) -> dict[int, pd.DataFrame]:
     out: dict[int, pd.DataFrame] = {}
-    with sqlite3.connect(str(path), timeout=30) as conn:
+    with sqlite3.connect(str(path), timeout=15) as conn:
         try:
-            conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute("PRAGMA busy_timeout=15000")
             conn.execute("PRAGMA query_only=ON")
         except Exception:
             pass
@@ -554,6 +565,12 @@ def _result_needs_previous_seed(result: dict[str, Any], *, per_symbol_rows: int)
 
 def _restore_summary_db_seed_sync(db_path: Any = None, *, force: bool = False) -> dict[str, Any]:
     global _RESTORED
+    if _main_seed_restore_disabled(force=force):
+        _RESTORED = True
+        logger.warning(
+            "[SUMMARY DB SEED RESTORE] skipped in main.py to avoid DB lock. main_database.py handles seed restore. set SUMMARY_DB_SEED_RESTORE_RUN_IN_MAIN=1 or force=True to override."
+        )
+        return {"ok": True, "skipped": True, "reason": "skip_in_main_process"}
     if not force and _RESTORED:
         logger.info("[SUMMARY DB SEED RESTORE] already restored -> skip")
         return {"ok": True, "skipped": True, "reason": "already_restored"}
@@ -637,6 +654,8 @@ def _async_worker(seq: int, db_path: Any, kwargs: dict[str, Any]) -> None:
 
 def restore_summary_db_seed(db_path: Any = None, *, force: bool = False) -> dict[str, Any]:
     global _ASYNC_THREAD, _ASYNC_STARTED_AT, _ASYNC_SEQ
+    if _main_seed_restore_disabled(force=force):
+        return _restore_summary_db_seed_sync(db_path, force=force)
     if force or bool(getattr(_ASYNC_ACTIVE, "running", False)):
         return _restore_summary_db_seed_sync(db_path, force=force)
     if _env_bool("SUMMARY_DB_SEED_RESTORE_ASYNC_IN_MAIN", True) and _is_main_py_context():
