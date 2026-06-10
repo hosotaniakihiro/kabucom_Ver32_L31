@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/ranking_entry_stale_failclosed_final_patch.py
-# Version: V4-LUNCH-AWARE-FAST-SKIP
+# Version: V5-LUNCH-AWARE-FAST-SKIP-BUDGET-HARD-STOP
 # ============================================================
 from __future__ import annotations
 import datetime as dt
@@ -14,6 +14,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 _INSTALLED = False
 _SCHED_STALE_INSTALLED = False
+_BUDGET_HARD_STOP_INSTALLED = False
 
 def _b(name: str, default: bool) -> bool:
     v = os.getenv(name)
@@ -37,6 +38,19 @@ def _install_schedule_stale_release() -> bool:
         return bool(ok)
     except Exception:
         logger.exception('[RANKING STALE FINAL] companion schedule stale release install failed')
+        return False
+
+def _install_budget_hard_stop() -> bool:
+    global _BUDGET_HARD_STOP_INSTALLED
+    try:
+        mod = __import__('core.startup.ranking_entry_budget_hard_stop_v6_patch', fromlist=['install'])
+        fn = getattr(mod, 'install', None)
+        ok = bool(fn()) if callable(fn) else False
+        _BUDGET_HARD_STOP_INSTALLED = bool(ok)
+        logger.warning('[RANKING STALE FINAL] companion budget hard stop installed=%s', ok)
+        return bool(ok)
+    except Exception:
+        logger.exception('[RANKING STALE FINAL] companion budget hard stop install failed')
         return False
 
 def _parse_hhmm(name: str, default: str) -> dt.time:
@@ -89,7 +103,8 @@ def _fresh_diag() -> tuple[bool, dict[str, Any]]:
     tables = ('ranking_snapshot_1min','ranking_raw_1min','ranking_summary_1min','ranking_snapshot','ranking_raw')
     cols = ('datetime','updated_at','snapshot_time','received_at','inserted_at','created_at','time')
     try:
-        with sqlite3.connect(db_path, timeout=2.0) as conn:
+        with sqlite3.connect(db_path, timeout=1.0) as conn:
+            conn.execute('PRAGMA busy_timeout=800')
             cur = conn.cursor()
             existing = {r[0] for r in cur.execute("select name from sqlite_master where type='table'").fetchall()}
             for table in tables:
@@ -151,6 +166,7 @@ def _wrap(orig):
     @wraps(orig)
     def wrapped(*args, **kwargs):
         _install_schedule_stale_release()
+        _install_budget_hard_stop()
         if _b('RANKING_ENTRY_STALE_FAILOPEN_ENABLED', False): return orig(*args, **kwargs)
         phase = _market_phase()
         if phase in {'before_open', 'lunch_break', 'after_no_new'}:
@@ -169,19 +185,21 @@ def _wrap(orig):
     wrapped._ranking_stale_final_v2 = True
     wrapped._ranking_stale_final_v3 = True
     wrapped._ranking_stale_final_v4 = True
+    wrapped._ranking_stale_final_v5 = True
     wrapped._original = orig
     return wrapped
 
 def _patch_once() -> bool:
     try:
         _install_schedule_stale_release()
+        _install_budget_hard_stop()
         import trading.entry_exit.tasks as tasks
         cur = getattr(tasks, '_run_ranking_entry_safe', None)
         if not callable(cur): return False
-        if getattr(cur, '_ranking_stale_final_v4', False): return True
-        base = getattr(cur, '_original', cur) if (getattr(cur, '_ranking_stale_final_v3', False) or getattr(cur, '_ranking_stale_final_v2', False) or getattr(cur, '_ranking_stale_final_v1', False)) else cur
+        if getattr(cur, '_ranking_stale_final_v5', False): return True
+        base = getattr(cur, '_original', cur) if (getattr(cur, '_ranking_stale_final_v4', False) or getattr(cur, '_ranking_stale_final_v3', False) or getattr(cur, '_ranking_stale_final_v2', False) or getattr(cur, '_ranking_stale_final_v1', False)) else cur
         tasks._run_ranking_entry_safe = _wrap(base)
-        logger.warning('[RANKING STALE FINAL] patched outermost v4 target=%s', getattr(base, '__name__', type(base)))
+        logger.warning('[RANKING STALE FINAL] patched outermost v5 target=%s', getattr(base, '__name__', type(base)))
         return True
     except Exception:
         logger.exception('[RANKING STALE FINAL] patch failed'); return False
@@ -191,7 +209,7 @@ def _watch():
     sleep_sec = max(0.5, min(float(os.getenv('RANKING_STALE_FINAL_WATCH_SLEEP_SEC', '2.0') or 2.0), 5.0))
     for i in range(loops):
         ok = _patch_once()
-        if i in (0, loops - 1): logger.warning('[RANKING STALE FINAL] enforce v4 i=%s/%s ok=%s schedule_stale=%s', i, loops, ok, _SCHED_STALE_INSTALLED)
+        if i in (0, loops - 1): logger.warning('[RANKING STALE FINAL] enforce v5 i=%s/%s ok=%s schedule_stale=%s budget_hard_stop=%s', i, loops, ok, _SCHED_STALE_INSTALLED, _BUDGET_HARD_STOP_INSTALLED)
         time.sleep(sleep_sec)
 
 def install() -> bool:
@@ -204,15 +222,18 @@ def install() -> bool:
     os.environ.setdefault('RANKING_ENTRY_LUNCH_REOPEN_MAX_AGE_SEC', '7200')
     os.environ.setdefault('RANKING_ENTRY_LUNCH_MIN_LATEST_TIME', '11:00')
     os.environ.setdefault('SCHEDULE_LOOP_STALE_RELEASE_ENABLED', '1')
-    os.environ.setdefault('SCHEDULE_LOOP_STALE_RANKING_ENTRY_SEC', '35')
+    os.environ.setdefault('SCHEDULE_LOOP_STALE_RANKING_ENTRY_SEC', '25')
     os.environ.setdefault('SCHEDULE_LOOP_STALE_YAHOO_COMPLEMENT_SEC', '180')
     os.environ.setdefault('SCHEDULE_LOOP_STALE_EXIT_SEC', '25')
+    os.environ.setdefault('RANKING_ENTRY_LIGHT_MIN_SCORE', '50')
+    os.environ.setdefault('RANKING_ENTRY_LIGHT_MIN_TURNOVER', '50000000')
     if _INSTALLED:
         _install_schedule_stale_release()
+        _install_budget_hard_stop()
         return True
     ok = _patch_once(); _INSTALLED = True
     threading.Thread(target=_watch, name='ranking-stale-final-watch', daemon=True).start()
-    logger.warning('[RANKING STALE FINAL] installed v4 ok=%s failopen=%s schedule_stale=%s lunch_reopen=%s', ok, os.getenv('RANKING_ENTRY_STALE_FAILOPEN_ENABLED'), _SCHED_STALE_INSTALLED, os.getenv('RANKING_ENTRY_LUNCH_REOPEN_STALE_FAILOPEN'))
+    logger.warning('[RANKING STALE FINAL] installed v5 ok=%s failopen=%s schedule_stale=%s lunch_reopen=%s budget_hard_stop=%s', ok, os.getenv('RANKING_ENTRY_STALE_FAILOPEN_ENABLED'), _SCHED_STALE_INSTALLED, os.getenv('RANKING_ENTRY_LUNCH_REOPEN_STALE_FAILOPEN'), _BUDGET_HARD_STOP_INSTALLED)
     return ok
 try: install()
 except Exception: logger.exception('[RANKING STALE FINAL] auto install failed')
