@@ -2,6 +2,7 @@ from __future__ import annotations
 import logging, os, threading, time
 logger = logging.getLogger(__name__)
 _INSTALLED = False
+_LIGHT_INSTALLED = False
 
 
 def _float_env(name: str, default: float) -> float:
@@ -34,12 +35,38 @@ def _install_min_pending_timeout_rescue() -> bool:
         return False
 
 
+def _install_light_companion() -> bool:
+    global _LIGHT_INSTALLED
+    try:
+        mod = __import__('core.startup.ranking_entry_budget_hard_stop_v6_patch', fromlist=['install'])
+        fn = getattr(mod, 'install', None)
+        ok = bool(fn()) if callable(fn) else False
+        _LIGHT_INSTALLED = bool(ok)
+        logger.warning('[RANKING ENTRY FAST BUDGET OVERRIDE] light companion installed=%s', ok)
+        return bool(ok)
+    except Exception:
+        logger.exception('[RANKING ENTRY FAST BUDGET OVERRIDE] light companion install failed')
+        return False
+
+
+def _force_light_budget() -> None:
+    os.environ['RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS'] = '12'
+    os.environ['RANKING_ENTRY_FAST_MAX_SYMBOLS'] = '12'
+    os.environ['RANKING_ENTRY_FAST_MAX_PER_SIDE'] = '8'
+    os.environ['RANKING_ENTRY_FAST_MAX_PER_TYPE'] = '6'
+    os.environ['RANKING_ENTRY_RUNTIME_BUDGET_SEC'] = '12'
+    os.environ['RANKING_ENTRY_RUNTIME_WARN_SEC'] = '12'
+    os.environ['RANKING_ENTRY_RUNTIME_STALE_SEC'] = '18'
+    os.environ['RANKING_ENTRY_MAX_PENDING_PER_RUN'] = '3'
+    os.environ['RANKING_ENTRY_FAST_MAX_PENDING_PER_RUN'] = '3'
+    os.environ['RANKING_ENTRY_SKIP_TECH_SAVE'] = '1'
+    os.environ['RANKING_ENTRY_TECH_READONLY'] = '1'
+    os.environ['RANKING_ENTRY_TECH_READ_BATCH_SIZE'] = '12'
+    os.environ.setdefault('RANKING_ENTRY_LIGHT_MIN_SCORE', '50')
+    os.environ.setdefault('RANKING_ENTRY_LIGHT_MIN_TURNOVER', '50000000')
+
+
 def _apply_once() -> bool:
-    # V13: force 25/30/30 even when stale env vars from older v11/v5 remain.
-    # V12 still read RANKING_ENTRY_FAST_* env values first, so an existing
-    # runtime=15/build=18/controller=12 process kept budget_sec=15.0.
-    # Keep the path bounded, but always raise the effective floor to the agreed
-    # 25/30/30 seconds and max_pending=4 for ranking entries.
     raw_runtime = _float_env('RANKING_ENTRY_FAST_RUNTIME_BUDGET_SEC', 25.0)
     raw_build = _float_env('RANKING_ENTRY_FAST_BUILD_TIMEOUT_SEC', 30.0)
     raw_controller = _float_env('RANKING_ENTRY_FAST_CONTROLLER_TIMEOUT_SEC', 30.0)
@@ -47,7 +74,6 @@ def _apply_once() -> bool:
     build = 30.0 if raw_build < 30.0 else min(float(raw_build), 30.0)
     controller = 30.0 if raw_controller < 30.0 else min(float(raw_controller), 30.0)
     lock_wait = max(1.0, min(_float_env('SUMMARY_AI_ENTRY_CONTROLLER_LOCK_WAIT_SEC', 8.0), 10.0))
-    max_pending = '4'
     os.environ['RANKING_ENTRY_FAST_RUNTIME_BUDGET_SEC'] = str(runtime)
     os.environ['RANKING_ENTRY_FAST_BUILD_TIMEOUT_SEC'] = str(build)
     os.environ['RANKING_ENTRY_FAST_CONTROLLER_TIMEOUT_SEC'] = str(controller)
@@ -56,8 +82,8 @@ def _apply_once() -> bool:
     os.environ['RANKING_ENTRY_RUNTIME_STALE_SEC'] = '35.0'
     os.environ['RANKING_ENTRY_BUILD_TIMEOUT_SEC'] = str(build)
     os.environ['RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'] = str(controller)
-    os.environ['RANKING_ENTRY_FAST_MAX_PENDING_PER_RUN'] = max_pending
-    os.environ['RANKING_ENTRY_MAX_PENDING_PER_RUN'] = max_pending
+    os.environ['RANKING_ENTRY_FAST_MAX_PENDING_PER_RUN'] = '4'
+    os.environ['RANKING_ENTRY_MAX_PENDING_PER_RUN'] = '4'
     os.environ['RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS'] = '24'
     os.environ['RANKING_ENTRY_FAST_MAX_SYMBOLS'] = '24'
     os.environ['RANKING_ENTRY_ULTRA_MAX_SOURCE_ROWS'] = '300'
@@ -69,6 +95,8 @@ def _apply_once() -> bool:
     os.environ.setdefault('RANKING_ENTRY_SNAPSHOT_MAX_AGE_SEC', '300')
     _install_fast_stale_guard()
     _install_min_pending_timeout_rescue()
+    _install_light_companion()
+    _force_light_budget()
     try:
         import trading.entry_exit.tasks as tasks
         tasks.RANKING_ENTRY_BUILD_TIMEOUT_SEC = float(os.environ['RANKING_ENTRY_BUILD_TIMEOUT_SEC'])
@@ -84,7 +112,7 @@ def _watch_loop() -> None:
     for i in range(loops):
         ok = _apply_once()
         if i in (0, loops - 1):
-            logger.warning('[RANKING ENTRY FAST BUDGET OVERRIDE] enforce v13 i=%s/%s ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s', i, loops, ok, os.environ.get('RANKING_ENTRY_RUNTIME_BUDGET_SEC'), os.environ.get('RANKING_ENTRY_BUILD_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_MAX_PENDING_PER_RUN'))
+            logger.warning('[RANKING ENTRY FAST BUDGET OVERRIDE] enforce v14 i=%s/%s ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s rows=%s light=%s', i, loops, ok, os.environ.get('RANKING_ENTRY_RUNTIME_BUDGET_SEC'), os.environ.get('RANKING_ENTRY_BUILD_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_MAX_PENDING_PER_RUN'), os.environ.get('RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS'), _LIGHT_INSTALLED)
         time.sleep(sleep_sec)
 
 
@@ -95,7 +123,7 @@ def install() -> bool:
     ok = _apply_once()
     threading.Thread(target=_watch_loop, name='ranking-entry-fast-budget-override', daemon=True).start()
     _INSTALLED = True
-    logger.warning('[RANKING ENTRY FAST BUDGET OVERRIDE] installed v13 ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s watcher=True', ok, os.environ.get('RANKING_ENTRY_RUNTIME_BUDGET_SEC'), os.environ.get('RANKING_ENTRY_BUILD_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_MAX_PENDING_PER_RUN'))
+    logger.warning('[RANKING ENTRY FAST BUDGET OVERRIDE] installed v14 ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s rows=%s light=%s watcher=True', ok, os.environ.get('RANKING_ENTRY_RUNTIME_BUDGET_SEC'), os.environ.get('RANKING_ENTRY_BUILD_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_MAX_PENDING_PER_RUN'), os.environ.get('RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS'), _LIGHT_INSTALLED)
     return True
 
 
