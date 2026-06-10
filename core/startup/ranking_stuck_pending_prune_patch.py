@@ -13,6 +13,7 @@ _DONE = False
 _RUN_LOCK = threading.Lock()
 _RUN_STARTED_AT = 0.0
 _RUN_SEQ = 0
+_SUMMARY_FALLBACK_PATCHED = False
 
 
 def _env_int(name: str, default: int) -> int:
@@ -40,6 +41,36 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if v is None or str(v).strip() == "":
         return bool(default)
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+
+
+def _cap_env_float(name: str, hard_cap: float, default: float) -> float:
+    cur = _env_float(name, default)
+    val = max(1.0, min(float(cur), float(hard_cap)))
+    os.environ[name] = str(val)
+    return val
+
+
+def _cap_env_int(name: str, hard_cap: int, default: int) -> int:
+    cur = _env_int(name, default)
+    val = max(1, min(int(cur), int(hard_cap)))
+    os.environ[name] = str(val)
+    return val
+
+
+def _force_ranking_runtime_caps() -> dict[str, Any]:
+    """実入口側でも重い ranking_entry を短い予算に丸める。"""
+    caps = {
+        "runtime_budget": _cap_env_float("RANKING_ENTRY_RUNTIME_BUDGET_SEC", 15.0, 15.0),
+        "runtime_warn": _cap_env_float("RANKING_ENTRY_RUNTIME_WARN_SEC", 15.0, 15.0),
+        "runtime_stale": _cap_env_float("RANKING_ENTRY_RUNTIME_STALE_SEC", 20.0, 20.0),
+        "build_timeout": _cap_env_float("RANKING_ENTRY_BUILD_TIMEOUT_SEC", 18.0, 18.0),
+        "controller_timeout": _cap_env_float("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", 12.0, 12.0),
+        "max_pending": _cap_env_int("RANKING_ENTRY_MAX_PENDING_PER_RUN", 3, 3),
+        "prefilter_rows": _cap_env_int("RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS", 24, 24),
+        "max_symbols": _cap_env_int("RANKING_ENTRY_FAST_MAX_SYMBOLS", 24, 24),
+        "source_rows": _cap_env_int("RANKING_ENTRY_ULTRA_MAX_SOURCE_ROWS", 300, 300),
+    }
+    return caps
 
 
 def _operation_mode() -> str:
@@ -177,7 +208,7 @@ def _clear_runtime_overlap_if_stale() -> bool:
     global _RUN_STARTED_AT
     if not _RUN_LOCK.locked():
         return False
-    stale_sec = max(10.0, _env_float("RANKING_ENTRY_RUNTIME_STALE_SEC", 45.0))
+    stale_sec = max(10.0, _env_float("RANKING_ENTRY_RUNTIME_STALE_SEC", 20.0))
     age = time.time() - float(_RUN_STARTED_AT or 0.0)
     if age < stale_sec:
         return False
@@ -192,13 +223,77 @@ def _clear_runtime_overlap_if_stale() -> bool:
     return True
 
 
+def _patch_summary_fallback_loader() -> bool:
+    """PUSH表示/判定で source=push の実データを recovery_yahoo より優先させる。"""
+    global _SUMMARY_FALLBACK_PATCHED
+    try:
+        import pandas as pd
+        import scheduler_jobs.summary.fallback_loader as fl
+
+        cur = getattr(fl, "filter_push_like_rows", None)
+        if getattr(cur, "_real_push_priority_v1", False):
+            _SUMMARY_FALLBACK_PATCHED = True
+            return True
+        orig_filter = cur
+
+        def _src_series(df: pd.DataFrame):
+            return df["source"].astype(str).str.lower().str.strip()
+
+        def _patched_filter_push_like_rows(df: pd.DataFrame) -> pd.DataFrame:
+            try:
+                x = fl.normalize_df(df)
+                if x.empty or "source" not in x.columns:
+                    return x
+                src = _src_series(x)
+                real_push_mask = (
+                    src.eq("push")
+                    | src.str.contains("push_stream", na=False)
+                    | src.str.contains("incremental", na=False)
+                    | src.str.contains("summary_recovery_push", na=False)
+                    | src.str.contains("resample", na=False)
+                ) & ~src.str.contains("summary_recovery_yahoo", na=False)
+                real = x.loc[real_push_mask].copy()
+                if not real.empty:
+                    logger.info(
+                        "[summary.fallback_loader] real-push priority rows=%s -> %s source_dist=%s",
+                        len(x),
+                        len(real),
+                        real["source"].astype(str).value_counts().head(10).to_dict(),
+                    )
+                    return real.reset_index(drop=True)
+
+                if callable(orig_filter):
+                    return orig_filter(x)
+                return x.reset_index(drop=True)
+            except Exception:
+                logger.exception("[summary.fallback_loader] real-push priority filter failed")
+                if callable(orig_filter):
+                    try:
+                        return orig_filter(df)
+                    except Exception:
+                        pass
+                return df
+
+        _patched_filter_push_like_rows._real_push_priority_v1 = True  # type: ignore[attr-defined]
+        _patched_filter_push_like_rows._original = orig_filter  # type: ignore[attr-defined]
+        fl.filter_push_like_rows = _patched_filter_push_like_rows
+        _SUMMARY_FALLBACK_PATCHED = True
+        logger.warning("[RANKING STUCK PENDING] patched summary.fallback_loader real push priority v1")
+        return True
+    except Exception:
+        logger.exception("[RANKING STUCK PENDING] summary fallback loader patch failed")
+        return False
+
+
 def _patch_once() -> bool:
     try:
+        _force_ranking_runtime_caps()
+        _patch_summary_fallback_loader()
         import trading.entry_exit.tasks as tasks
         cur = getattr(tasks, "_run_ranking_entry_safe", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_ranking_stuck_pending_prune_v5", False):
+        if getattr(cur, "_ranking_stuck_pending_prune_v6", False):
             return True
         orig = getattr(cur, "_original", cur)
 
@@ -213,6 +308,7 @@ def _patch_once() -> bool:
                 )
                 return 0
 
+            caps = _force_ranking_runtime_caps()
             if not _RUN_LOCK.acquire(blocking=False):
                 _clear_runtime_overlap_if_stale()
                 return 0
@@ -220,48 +316,69 @@ def _patch_once() -> bool:
             _RUN_SEQ += 1
             seq = _RUN_SEQ
             _RUN_STARTED_AT = time.time()
-            budget_sec = max(5.0, _env_float("RANKING_ENTRY_RUNTIME_WARN_SEC", 25.0))
-            try:
-                cnt = _pending_count()
-                if cnt > 0:
-                    pruned = _mark_and_prune_stuck_ranking_pending()
-                    if pruned:
-                        left = _pending_count()
-                        logger.warning(
-                            "[RANKING STUCK PENDING] pre-build pruned=%s before=%s after=%s",
-                            pruned,
-                            cnt,
-                            left,
-                        )
+            join_sec = max(5.0, min(float(caps.get("runtime_budget") or 15.0), 15.0))
+            state: dict[str, Any] = {"done": False, "ret": 0, "exc": None}
 
-                ret = orig()
-                return ret
-            finally:
-                elapsed = time.time() - _RUN_STARTED_AT
-                if elapsed >= budget_sec:
-                    logger.warning(
-                        "[RANKING STUCK PENDING] ranking_entry run slow seq=%s elapsed=%.1fs warn_sec=%.1fs",
-                        seq,
-                        elapsed,
-                        budget_sec,
-                    )
-                _RUN_STARTED_AT = 0.0
+            def _worker() -> None:
+                global _RUN_STARTED_AT
                 try:
-                    _RUN_LOCK.release()
-                except RuntimeError:
-                    pass
+                    cnt = _pending_count()
+                    if cnt > 0:
+                        pruned = _mark_and_prune_stuck_ranking_pending()
+                        if pruned:
+                            left = _pending_count()
+                            logger.warning(
+                                "[RANKING STUCK PENDING] pre-build pruned=%s before=%s after=%s",
+                                pruned,
+                                cnt,
+                                left,
+                            )
+                    state["ret"] = orig()
+                except Exception as exc:
+                    state["exc"] = exc
+                    logger.exception("[RANKING STUCK PENDING] ranking_entry worker failed seq=%s", seq)
+                finally:
+                    elapsed = time.time() - float(_RUN_STARTED_AT or time.time())
+                    state["done"] = True
+                    if elapsed >= join_sec:
+                        logger.warning(
+                            "[RANKING STUCK PENDING] ranking_entry worker finished slow seq=%s elapsed=%.1fs join_sec=%.1fs",
+                            seq,
+                            elapsed,
+                            join_sec,
+                        )
+                    _RUN_STARTED_AT = 0.0
+                    try:
+                        _RUN_LOCK.release()
+                    except RuntimeError:
+                        pass
+
+            th = threading.Thread(target=_worker, name=f"ranking-entry-timebox-{seq}", daemon=True)
+            th.start()
+            th.join(join_sec)
+            if th.is_alive():
+                logger.warning(
+                    "[RANKING STUCK PENDING] ranking_entry timeboxed seq=%s join_sec=%.1fs; return now, worker continues guarded by lock caps=%s",
+                    seq,
+                    join_sec,
+                    caps,
+                )
+                return 0
+            if state.get("exc") is not None:
+                raise state["exc"]
+            return state.get("ret", 0)
 
         patched._ranking_stuck_pending_prune_v1 = True  # type: ignore[attr-defined]
         patched._ranking_stuck_pending_prune_v2 = True  # type: ignore[attr-defined]
         patched._ranking_stuck_pending_prune_v3 = True  # type: ignore[attr-defined]
         patched._ranking_stuck_pending_prune_v4 = True  # type: ignore[attr-defined]
         patched._ranking_stuck_pending_prune_v5 = True  # type: ignore[attr-defined]
+        patched._ranking_stuck_pending_prune_v6 = True  # type: ignore[attr-defined]
         patched._original = orig  # type: ignore[attr-defined]
         tasks._run_ranking_entry_safe = patched
         logger.warning(
-            "[RANKING STUCK PENDING] patched _run_ranking_entry_safe v5 overlap_guard=True runtime_warn=%ss stale=%ss main_skip=%s mode=%s",
-            os.getenv("RANKING_ENTRY_RUNTIME_WARN_SEC", "25"),
-            os.getenv("RANKING_ENTRY_RUNTIME_STALE_SEC", "45"),
+            "[RANKING STUCK PENDING] patched _run_ranking_entry_safe v6 timebox=15s overlap_guard=True caps=%s main_skip=%s mode=%s",
+            _force_ranking_runtime_caps(),
             _main_skip_ranking_entry(),
             _operation_mode(),
         )
@@ -277,7 +394,7 @@ def _watch() -> None:
     for i in range(loops):
         ok = _patch_once()
         if i in (0, loops - 1):
-            logger.warning("[RANKING STUCK PENDING] enforce ok=%s v5 main_skip=%s mode=%s", ok, _main_skip_ranking_entry(), _operation_mode())
+            logger.warning("[RANKING STUCK PENDING] enforce ok=%s v6 main_skip=%s mode=%s summary_fallback=%s", ok, _main_skip_ranking_entry(), _operation_mode(), _SUMMARY_FALLBACK_PATCHED)
         time.sleep(sleep_sec)
 
 
@@ -289,7 +406,7 @@ def install() -> bool:
     ok = _patch_once()
     threading.Thread(target=_watch, name="ranking-stuck-pending-prune-watch", daemon=True).start()
     _DONE = True
-    logger.warning("[RANKING STUCK PENDING] installed v5 ok=%s watcher=True overlap_guard=True main_skip=%s mode=%s", ok, _main_skip_ranking_entry(), _operation_mode())
+    logger.warning("[RANKING STUCK PENDING] installed v6 ok=%s watcher=True timebox=15s summary_fallback=%s main_skip=%s mode=%s", ok, _SUMMARY_FALLBACK_PATCHED, _main_skip_ranking_entry(), _operation_mode())
     return bool(ok)
 
 
