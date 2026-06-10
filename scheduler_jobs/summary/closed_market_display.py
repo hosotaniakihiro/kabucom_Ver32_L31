@@ -3,7 +3,7 @@
 #====================================================================================================
 # ============================================================
 # File   : scheduler_jobs/summary/closed_market_display.py
-# Version: PRODUCTION-STABLE-CLOSED-MARKET-DISPLAY-V1.2-SESSION-GUARD
+# Version: PRODUCTION-STABLE-CLOSED-MARKET-DISPLAY-V1.3-MAIN-READONLY
 # ------------------------------------------------------------
 # 【概要】
 #   時間外 / 昼休み / 休場日の PUSHサマリー表示を担当する。
@@ -11,12 +11,19 @@
 # V1.2:
 #   - 後場開始後(12:30-15:30)に誤って closed-market rebuild が呼ばれても即skipする。
 #   - 12:31 に latest_dt=11:30 を再保存して fresh summary を上書きする問題を防止する。
+#
+# V1.3:
+#   - main.py の昼休み/時間外では closed-market one-shot rebuild と DB保存をデフォルト禁止。
+#   - main.py は表示用に既存DB/メモリを読むだけにし、summary DB 更新は main_database.py に寄せる。
+#   - これにより昼休み中の stock_summary_1min UPSERT lock / fallback rebuild lock を抑制する。
 # ============================================================
 
 from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
+import sys
 from typing import Optional
 
 import pandas as pd
@@ -40,6 +47,33 @@ _INTERVAL_TABLE_MAP = {
     3: "stock_summary_3min",
     5: "stock_summary_5min",
 }
+
+
+def _is_main_process() -> bool:
+    try:
+        argv0 = (sys.argv[0] or "").replace("\\", "/").lower()
+        return argv0.endswith("/main.py") or argv0 == "main.py"
+    except Exception:
+        return False
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    try:
+        v = os.environ.get(name)
+        if v is None:
+            return default
+        return str(v).strip().lower() in {"1", "true", "yes", "on"}
+    except Exception:
+        return default
+
+
+def _main_closed_market_readonly() -> bool:
+    """main.py の時間外/昼休みは DB 書込・再計算を避ける。"""
+    if not _is_main_process():
+        return False
+    if _env_bool("SUMMARY_CLOSED_MARKET_MAIN_ALLOW_DB_WRITE", False):
+        return False
+    return True
 
 
 def _is_regular_session(now: Optional[dt.datetime]) -> bool:
@@ -157,6 +191,14 @@ def rebuild_closed_market_push_summary(
         )
         return pd.DataFrame()
 
+    if _main_closed_market_readonly():
+        logger.warning(
+            "[summary.runners] closed-market rebuild skipped interval=%s reason=main_closed_market_readonly now=%s",
+            interval,
+            now,
+        )
+        return pd.DataFrame()
+
     rebuild_now = _resolve_closed_market_rebuild_now(now)
 
     runner = resolve_push_summary_runner()
@@ -263,12 +305,18 @@ def display_closed_market_push_summary(
 
         log_df_state("closed-market push fallback", interval, df)
 
-    if df.empty:
+    if df.empty and not _main_closed_market_readonly():
         df = rebuild_closed_market_push_summary(interval=interval, now=now)
         df = normalize_df(df)
         df = filter_push_like_rows(df)
         df = clamp_future_rows(df, interval=interval, now=_resolve_closed_market_rebuild_now(now))
         log_df_state("closed-market rebuild after normalize", interval, df)
+    elif df.empty:
+        logger.warning(
+            "[summary.runners] closed-market rebuild skipped interval=%s reason=main_closed_market_readonly now=%s",
+            interval,
+            now,
+        )
 
     if df.empty:
         logger.warning(
@@ -278,7 +326,16 @@ def display_closed_market_push_summary(
         )
         return df
 
-    save_summary_safe(df, interval, source="push")
+    if _main_closed_market_readonly():
+        logger.info(
+            "[summary.runners] closed-market display readonly interval=%s rows=%d latest_dt=%s reason=main_closed_market_readonly",
+            interval,
+            len(df),
+            latest_dt_str(df),
+        )
+    else:
+        save_summary_safe(df, interval, source="push")
+
     display_push_summary_safe(df, interval, now=now)
     return df
 
