@@ -15,6 +15,7 @@ _RUN_STARTED_AT = 0.0
 _RUN_SEQ = 0
 _SUMMARY_FALLBACK_PATCHED = False
 _MIN_PENDING_PATCHED = False
+_MIN_PENDING_LOGGED = False
 
 
 def _env_int(name: str, default: int) -> int:
@@ -151,12 +152,16 @@ def _pending_count() -> int:
 
 def _install_min_pending_patch() -> bool:
     """Ensure candidate>=1 is not lost just before pending_add timeout."""
-    global _MIN_PENDING_PATCHED
+    global _MIN_PENDING_PATCHED, _MIN_PENDING_LOGGED
+    if _MIN_PENDING_PATCHED:
+        return True
     try:
         from core.startup import ranking_entry_min_pending_on_timeout_patch as mp
         ok = bool(mp.install())
         _MIN_PENDING_PATCHED = ok
-        logger.warning("[RANKING STUCK PENDING] min pending timeout rescue installed=%s", ok)
+        if not _MIN_PENDING_LOGGED or not ok:
+            logger.warning("[RANKING STUCK PENDING] min pending timeout rescue installed=%s", ok)
+            _MIN_PENDING_LOGGED = True
         return ok
     except Exception:
         logger.exception("[RANKING STUCK PENDING] min pending timeout rescue install failed")
@@ -414,7 +419,7 @@ def _patch_once() -> bool:
 
 
 def _watch() -> None:
-    loops = max(1, min(_env_int("RANKING_STUCK_PENDING_ENFORCE_LOOPS", 30), 120))
+    loops = max(1, min(_env_int("RANKING_STUCK_PENDING_ENFORCE_LOOPS", 12), 60))
     sleep_sec = max(1.0, min(_env_float("RANKING_STUCK_PENDING_ENFORCE_SLEEP_SEC", 3.0), 10.0))
     for i in range(loops):
         ok = _patch_once()
