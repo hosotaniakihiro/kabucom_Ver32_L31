@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/entry_board_imbalance_advisory_patch.py
-# Version: V2-DIRECT-FSG-BOARD-WALL-GUARD
+# Version: V3-IDEMPOTENT-QUIET-ENFORCER
 # ------------------------------------------------------------
 # 目的:
 #   final_entry_safety_guard は ALL_OK まで通っているのに、後段の
@@ -8,12 +8,11 @@
 #   ENTRY_BOARD_SELL_STRONG_BID 等で order build 前に False を返し、
 #   RANKING / TONOSAMA の実注文が止まるケースを救済する。
 #
-# V2:
-#   - board_wall_stall_exit_patch は final_entry_safety_guard._board_guard を
-#     _patched_board_guard に直接差し替えるため、関数名探索では刺さらなかった。
-#   - board_wall_stall_exit_patch._patched_board_guard 自体を 4引数互換で差し替え、
-#     RANKING/TONOSAMA の board imbalance NG を advisory 化する。
-#   - fsg._board_guard も最後段で再差し替えする。
+# V3:
+#   - install() が何度呼ばれても watcher を増やさない。
+#   - patch対象が既に advisory の場合は再patchしない。
+#   - final_entry_board_guard_signature_last_patch 等に後から上書きされた時だけ再差し替え。
+#   - enforceログを大幅に減らし、09:39ログのような再patch連打を抑制する。
 # ============================================================
 from __future__ import annotations
 
@@ -27,6 +26,8 @@ logger = logging.getLogger(__name__)
 _INSTALLED = False
 _ORIG_BW_BOARD_GUARD = None
 _ORIG_FSG_BOARD_GUARD = None
+_LAST_PATCH_LOG_TS = 0.0
+_LAST_INSTALL_LOG_TS = 0.0
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -37,6 +38,26 @@ def _env_bool(name: str, default: bool = True) -> bool:
         return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
     except Exception:
         return bool(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
 
 
 def _get(row: Any, name: str, default=None):
@@ -111,30 +132,16 @@ def _analyze_board_imbalance(symbol: str, side: str):
     try:
         from trading.board.board_signal import analyze_entry_board_imbalance
         try:
-            return analyze_entry_board_imbalance(symbol, side=side, exchange=int(float(os.getenv("ENTRY_BOARD_EXCHANGE", os.getenv("EXIT_BOARD_WALL_EXCHANGE", "1")))))
+            return analyze_entry_board_imbalance(
+                symbol,
+                side=side,
+                exchange=int(float(os.getenv("ENTRY_BOARD_EXCHANGE", os.getenv("EXIT_BOARD_WALL_EXCHANGE", "1")))),
+            )
         except TypeError:
             return analyze_entry_board_imbalance(symbol, side=side)
     except Exception:
         logger.debug("[BOARD IMBALANCE ADVISORY] analyze failed symbol=%s side=%s", symbol, side, exc_info=True)
         return None
-
-
-def _should_advisory_allow(row: Any, symbol: str, side: str, ret: Any = None) -> bool:
-    if not _env_bool("ENTRY_BOARD_IMBALANCE_ADVISORY_ENABLED", True):
-        return False
-    if not _is_rank_or_tono(row):
-        return False
-    if ret is True:
-        return False
-    if ret is False:
-        return True
-    text = str(ret)
-    return (
-        "ENTRY_BOARD_SELL_STRONG_BID" in text
-        or "ENTRY_BOARD_BUY_STRONG_ASK" in text
-        or "BOARD_ENTRY_IMBALANCE" in text
-        or "board_imbalance" in text.lower()
-    )
 
 
 def _advisory_board_guard(row: Any, item: Any = None, symbol: Any = None, side: Any = None, *args: Any, **kwargs: Any) -> bool:
@@ -159,8 +166,6 @@ def _advisory_board_guard(row: Any, item: Any = None, symbol: Any = None, side: 
         detail = _analyze_board_imbalance(sym, sd)
         if detail:
             logger.warning("[BOARD IMBALANCE ADVISORY] allow source=RANKING_OR_TONOSAMA symbol=%s side=%s detail=%s", sym, sd, detail)
-            return True
-        logger.debug("[BOARD IMBALANCE ADVISORY] no imbalance detail symbol=%s side=%s source=%s", sym, sd, source)
         return True
 
     # その他 source は既存挙動。
@@ -170,18 +175,44 @@ def _advisory_board_guard(row: Any, item: Any = None, symbol: Any = None, side: 
     return True
 
 
+_advisory_board_guard._board_imbalance_advisory_v3 = True  # type: ignore[attr-defined]
+_advisory_board_guard._board_imbalance_advisory_v2 = True  # type: ignore[attr-defined]
+
+
+def _is_ours(fn: Any) -> bool:
+    return bool(
+        callable(fn)
+        and (
+            getattr(fn, "_board_imbalance_advisory_v3", False)
+            or getattr(fn, "_board_imbalance_advisory_v2", False)
+        )
+    )
+
+
+def _rate_limited_patch_log(message: str, *args: Any) -> None:
+    global _LAST_PATCH_LOG_TS
+    now = time.time()
+    interval = max(1.0, _env_float("ENTRY_BOARD_ADVISORY_PATCH_LOG_INTERVAL_SEC", 20.0))
+    if now - _LAST_PATCH_LOG_TS >= interval:
+        _LAST_PATCH_LOG_TS = now
+        logger.warning(message, *args)
+
+
 def _patch_once() -> bool:
     global _ORIG_BW_BOARD_GUARD, _ORIG_FSG_BOARD_GUARD
+    changed = False
     ok = False
+
     try:
         import core.startup.board_wall_stall_exit_patch as bw
         cur = getattr(bw, "_patched_board_guard", None)
-        if callable(cur) and not getattr(cur, "_board_imbalance_advisory_v2", False):
-            _ORIG_BW_BOARD_GUARD = cur
-            _advisory_board_guard._board_imbalance_advisory_v2 = True  # type: ignore[attr-defined]
-            _advisory_board_guard._original = cur  # type: ignore[attr-defined]
+        if _is_ours(cur):
+            ok = True
+        elif callable(cur):
+            _ORIG_BW_BOARD_GUARD = getattr(cur, "_original", cur)
+            _advisory_board_guard._original = _ORIG_BW_BOARD_GUARD  # type: ignore[attr-defined]
             bw._patched_board_guard = _advisory_board_guard
-            logger.warning("[BOARD IMBALANCE ADVISORY] patched board_wall_stall_exit_patch._patched_board_guard")
+            changed = True
             ok = True
     except Exception:
         logger.debug("[BOARD IMBALANCE ADVISORY] board_wall patch skipped", exc_info=True)
@@ -189,39 +220,47 @@ def _patch_once() -> bool:
     try:
         import core.startup.final_entry_safety_guard_patch as fsg
         cur = getattr(fsg, "_board_guard", None)
-        # board_wall が fsg._board_guard を持っている場合、直接 advisory に差し替える。
-        if callable(cur) and not getattr(cur, "_board_imbalance_advisory_v2", False):
-            _ORIG_FSG_BOARD_GUARD = cur
-            _advisory_board_guard._board_imbalance_advisory_v2 = True  # type: ignore[attr-defined]
-            _advisory_board_guard._original_fsg = cur  # type: ignore[attr-defined]
+        if _is_ours(cur):
+            ok = True
+        elif callable(cur):
+            _ORIG_FSG_BOARD_GUARD = getattr(cur, "_original_fsg", cur)
+            _advisory_board_guard._original_fsg = _ORIG_FSG_BOARD_GUARD  # type: ignore[attr-defined]
             fsg._board_guard = _advisory_board_guard
             if hasattr(fsg, "_patched_board_guard"):
                 fsg._patched_board_guard = _advisory_board_guard
-            logger.warning("[BOARD IMBALANCE ADVISORY] patched final_entry_safety_guard._board_guard direct")
+            changed = True
             ok = True
     except Exception:
         logger.debug("[BOARD IMBALANCE ADVISORY] final guard patch skipped", exc_info=True)
 
+    if changed:
+        _rate_limited_patch_log("[BOARD IMBALANCE ADVISORY] patched/recovered board guard v3")
     return ok
 
 
 def _watch() -> None:
-    loops = 120
+    loops = max(1, min(_env_int("ENTRY_BOARD_ADVISORY_ENFORCE_LOOPS", 30), 120))
+    sleep_sec = max(1.0, min(_env_float("ENTRY_BOARD_ADVISORY_ENFORCE_SLEEP_SEC", 2.0), 10.0))
     for i in range(loops):
         ok = _patch_once()
-        if i in (0, 1, 5, 15, 30, 60, 119):
-            logger.warning("[BOARD IMBALANCE ADVISORY] enforce v2 i=%s ok=%s", i, ok)
-        time.sleep(0.5)
+        if i in (0, loops - 1):
+            logger.warning("[BOARD IMBALANCE ADVISORY] enforce v3 i=%s ok=%s", i, ok)
+        time.sleep(sleep_sec)
 
 
 def install() -> bool:
-    global _INSTALLED
+    global _INSTALLED, _LAST_INSTALL_LOG_TS
     os.environ["ENTRY_BOARD_IMBALANCE_ADVISORY_ENABLED"] = "1"
     ok = _patch_once()
     if not _INSTALLED:
         threading.Thread(target=_watch, name="board-imbalance-advisory-enforcer", daemon=True).start()
         _INSTALLED = True
-    logger.warning("[BOARD IMBALANCE ADVISORY] installed v2 ok=%s watcher=True", ok)
+        logger.warning("[BOARD IMBALANCE ADVISORY] installed v3 ok=%s watcher=True quiet=True", ok)
+    else:
+        now = time.time()
+        if now - _LAST_INSTALL_LOG_TS >= max(5.0, _env_float("ENTRY_BOARD_ADVISORY_INSTALL_LOG_INTERVAL_SEC", 60.0)):
+            _LAST_INSTALL_LOG_TS = now
+            logger.warning("[BOARD IMBALANCE ADVISORY] already installed v3 ok=%s watcher=False", ok)
     return True
 
 
