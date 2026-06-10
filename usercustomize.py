@@ -52,6 +52,11 @@ def _is_main_py() -> bool:
 
 # Runtime defaults only. These are cheap and safe before main startup.
 DEFAULTS = {
+    "AUTOSTOCK_MAIN_SKIP_SUMMARY_DB_SAVE": "1",
+    "RANKING_ENTRY_HARD_TIMEOUT_SEC": "15",
+    "RANKING_ENTRY_FAST_RUNTIME_BUDGET_SEC": "15",
+    "RANKING_ENTRY_FAST_BUILD_TIMEOUT_SEC": "18",
+    "RANKING_ENTRY_FAST_CONTROLLER_TIMEOUT_SEC": "12",
     "SUMMARY_AI_PRE_FILTER_DAILY_RISK": "0",
     "SUMMARY_AI_DISABLE_SYMBOL_STOP_AFTER_FIRST_LOSS": "1",
     "DAILY_RISK_SYMBOL_STOP_AFTER_FIRST_LOSS": "0",
@@ -149,13 +154,14 @@ if _is_main_py():
     }.items():
         _env_default(k, v)
     logger.warning(
-        "[USERCUSTOMIZE] main restore defaults mode=%s exit=%s ranking=%s tonosama=%s summary_ai=%s summary_parent=%s",
+        "[USERCUSTOMIZE] main restore defaults mode=%s exit=%s ranking=%s tonosama=%s summary_ai=%s summary_parent=%s summary_db_save_skip=%s",
         os.getenv("AUTOSTOCK_MAIN_OPERATION_MODE"),
         os.getenv("AUTOSTOCK_MAIN_ENABLE_EXIT_LOOP"),
         os.getenv("AUTOSTOCK_MAIN_ENABLE_RANKING_ENTRY"),
         os.getenv("AUTOSTOCK_MAIN_ENABLE_TONOSAMA_ENTRY"),
         os.getenv("AUTOSTOCK_MAIN_ENABLE_SUMMARY_AI_ENTRY"),
         os.getenv("AUTOSTOCK_MAIN_ENABLE_SUMMARY_PARENT_TICK"),
+        os.getenv("AUTOSTOCK_MAIN_SKIP_SUMMARY_DB_SAVE"),
     )
 
 os.environ["ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"] = "1"
@@ -198,6 +204,7 @@ BASE_SYNC_PATCHES = [
 ]
 
 MAIN_SYNC_PATCHES = [
+    ("MAIN_SUMMARY_DB_SAVE_SKIP", "core.startup.main_summary_db_save_skip_patch"),
     ("ORDER_EXCHANGE_SOR", "core.startup.order_exchange_sor_patch"),
     ("REENTRY_STALE_429_EXIT_SAFETY", "core.startup.entry_reentry_stale_429_exit_safety_patch"),
     ("EXIT_TUNING_DEFAULTS", "core.startup.exit_tuning_defaults_patch"),
