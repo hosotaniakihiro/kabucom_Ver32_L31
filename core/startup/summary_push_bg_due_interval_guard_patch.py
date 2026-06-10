@@ -1,15 +1,17 @@
 # ============================================================
 # File   : core/startup/summary_push_bg_due_interval_guard_patch.py
-# Version: V5-MAIN-SESSION-ONLY-DB-QUIET
+# Version: V5.1-MAIN-SESSION-ONLY-DB-QUIET-SEED-FAST
 # ------------------------------------------------------------
 # 目的:
 #   main.py(entry_only) で PUSH 1m/3m/5m をBG実行する際、
 #   3分足・5分足を毎分投入しないようにしつつ、1分足は確実に表示する。
 #
-# V5 修正:
+# V5.1 修正:
 #   ✔ 昼休み/時間外の main.py では summary BG を起動しない
 #      - 11:30〜12:30 の lunch break で stock_summary_1min lock を作らない
 #      - main_database.py 側の保存・補完を優先
+#   ✔ summary_seed_restore_main_fast_patch を同時install
+#      - main.py で前日 summary DB の重い COUNT scan をしない
 #   ✔ DB保存は main_database.py 側が担当し、main.py は表示/AIを優先
 # ============================================================
 
@@ -96,7 +98,6 @@ def _should_skip_main_outside_session(now: dt.datetime, interval: int) -> tuple[
             return False, "not_main"
         if _is_market_session(now):
             return False, "in_session"
-        # 明示許可時だけ、昼休み/時間外も main.py で summary BG を回す
         if _env_bool("SUMMARY_PUSH_BG_ALLOW_OUTSIDE_SESSION_IN_MAIN", False):
             return False, "allow_env"
         return True, f"outside_session interval={interval} now={now}"
@@ -145,6 +146,17 @@ def _install_display_first_patch() -> bool:
         return ok
     except Exception:
         logger.exception("[SUMMARY PUSH BG DUE GUARD] display-first save skip patch install failed")
+        return False
+
+
+def _install_seed_fast_patch() -> bool:
+    try:
+        from core.startup.summary_seed_restore_main_fast_patch import install as install_seed_fast
+        ok = bool(install_seed_fast())
+        logger.warning("[SUMMARY PUSH BG DUE GUARD] seed restore main-fast patch installed=%s", ok)
+        return ok
+    except Exception:
+        logger.exception("[SUMMARY PUSH BG DUE GUARD] seed restore main-fast patch install failed")
         return False
 
 
@@ -281,22 +293,26 @@ def install() -> bool:
     global _PATCHED, _ORIGINAL_SUBMIT
     if _PATCHED:
         _install_display_first_patch()
+        _install_seed_fast_patch()
         return True
     try:
         import core.startup.summary_parallel_intervals_runtime_patch as sp
         cur = getattr(sp, "_submit_bg_push_interval", None)
-        if getattr(cur, "_summary_push_bg_due_guard_v5", False):
+        if getattr(cur, "_summary_push_bg_due_guard_v51", False):
             _PATCHED = True
             _install_display_first_patch()
+            _install_seed_fast_patch()
             return True
         _ORIGINAL_SUBMIT = cur
         _patched_submit_bg_push_interval._summary_push_bg_due_guard = True  # type: ignore[attr-defined]
         _patched_submit_bg_push_interval._summary_push_bg_due_guard_v5 = True  # type: ignore[attr-defined]
+        _patched_submit_bg_push_interval._summary_push_bg_due_guard_v51 = True  # type: ignore[attr-defined]
         sp._submit_bg_push_interval = _patched_submit_bg_push_interval
         _PATCHED = True
         display_first_ok = _install_display_first_patch()
+        seed_fast_ok = _install_seed_fast_patch()
         logger.warning(
-            "[SUMMARY PUSH BG DUE GUARD] installed v5 due_only=%s stale_1m=%.1f stale_3m=%.1f stale_5m=%.1f dedicated_1m=%s skip_outside_session_main=%s display_first=%s original=%s",
+            "[SUMMARY PUSH BG DUE GUARD] installed v5.1 due_only=%s stale_1m=%.1f stale_3m=%.1f stale_5m=%.1f dedicated_1m=%s skip_outside_session_main=%s display_first=%s seed_fast=%s original=%s",
             _env_bool("SUMMARY_PUSH_BG_LONG_INTERVAL_DUE_ONLY", True),
             _stale_sec_for_interval(1),
             _stale_sec_for_interval(3),
@@ -304,6 +320,7 @@ def install() -> bool:
             _env_bool("SUMMARY_PUSH_1M_DEDICATED_THREAD", True),
             _env_bool("SUMMARY_PUSH_BG_SKIP_OUTSIDE_SESSION_IN_MAIN", True),
             display_first_ok,
+            seed_fast_ok,
             getattr(cur, "__name__", str(cur)),
         )
         return True
