@@ -1,15 +1,15 @@
 # ============================================================
 # File   : core/startup/summary_push_bg_due_interval_guard_patch.py
-# Version: V4-ONE-MINUTE-DEDICATED-THREAD-DISPLAY-FIRST
+# Version: V5-MAIN-SESSION-ONLY-DB-QUIET
 # ------------------------------------------------------------
 # 目的:
 #   main.py(entry_only) で PUSH 1m/3m/5m をBG実行する際、
 #   3分足・5分足を毎分投入しないようにしつつ、1分足は確実に表示する。
 #
-# V4 修正:
-#   ✔ 1分足専用 daemon Thread は維持
-#   ✔ main.py側の1分足PUSHは、計算後に保存処理で止まらないよう
-#     summary_main_skip_save_for_display_patch を同時installする
+# V5 修正:
+#   ✔ 昼休み/時間外の main.py では summary BG を起動しない
+#      - 11:30〜12:30 の lunch break で stock_summary_1min lock を作らない
+#      - main_database.py 側の保存・補完を優先
 #   ✔ DB保存は main_database.py 側が担当し、main.py は表示/AIを優先
 # ============================================================
 
@@ -18,6 +18,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import sys
 import threading
 import time
 
@@ -26,6 +27,7 @@ _PATCHED = False
 _ORIGINAL_SUBMIT = None
 _RUNNING_BY_INTERVAL: dict[int, tuple[float, str]] = {}
 _LOCK = threading.RLock()
+_SESSION_SKIP_LOGGED: dict[str, float] = {}
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -46,6 +48,72 @@ def _env_float(name: str, default: float) -> float:
         return max(1.0, float(raw))
     except Exception:
         return float(default)
+
+
+def _is_main_py_context() -> bool:
+    try:
+        argv = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+        if "main_database.py" in argv:
+            return False
+        if any(x in argv for x in (
+            "summary_database_runner.py",
+            "yahoo_complement_runner.py",
+            "ranking_collector_runner.py",
+            "push_receiver_runner.py",
+            "data_collectors_runner.py",
+        )):
+            return False
+        if any(os.getenv(k) == "1" for k in (
+            "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+            "AUTOSTOCK_SUMMARY_DB_WRITER",
+            "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+            "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
+        )):
+            return False
+        return "main.py" in argv
+    except Exception:
+        return False
+
+
+def _is_market_session(now: dt.datetime) -> bool:
+    """JP cash session approximation for main.py background work."""
+    try:
+        t = now.time()
+        am_start = dt.time(9, 0)
+        am_end = dt.time(11, 30)
+        pm_start = dt.time(12, 30)
+        pm_end = dt.time(15, 30)
+        return (am_start <= t < am_end) or (pm_start <= t < pm_end)
+    except Exception:
+        return True
+
+
+def _should_skip_main_outside_session(now: dt.datetime, interval: int) -> tuple[bool, str]:
+    try:
+        if not _env_bool("SUMMARY_PUSH_BG_SKIP_OUTSIDE_SESSION_IN_MAIN", True):
+            return False, "disabled"
+        if not _is_main_py_context():
+            return False, "not_main"
+        if _is_market_session(now):
+            return False, "in_session"
+        # 明示許可時だけ、昼休み/時間外も main.py で summary BG を回す
+        if _env_bool("SUMMARY_PUSH_BG_ALLOW_OUTSIDE_SESSION_IN_MAIN", False):
+            return False, "allow_env"
+        return True, f"outside_session interval={interval} now={now}"
+    except Exception:
+        return False, "check_failed"
+
+
+def _log_session_skip_once(key: str, msg: str, *args) -> None:
+    try:
+        now_ts = time.time()
+        interval = _env_float("SUMMARY_PUSH_BG_SESSION_SKIP_LOG_INTERVAL_SEC", 60.0)
+        last = float(_SESSION_SKIP_LOGGED.get(key, 0.0) or 0.0)
+        if now_ts - last >= interval:
+            _SESSION_SKIP_LOGGED[key] = now_ts
+            logger.warning(msg, *args)
+    except Exception:
+        logger.warning(msg, *args)
 
 
 def _stale_sec_for_interval(interval: int) -> float:
@@ -110,6 +178,18 @@ def _patched_submit_bg_push_interval(*, interval: int, now: dt.datetime, display
         return None
 
     iv = int(interval)
+
+    skip_session, reason_session = _should_skip_main_outside_session(now, iv)
+    if skip_session:
+        _log_session_skip_once(
+            f"session:{iv}",
+            "[SUMMARY PUSH BG DUE GUARD] skipped reason=main_outside_session interval=%s now=%s detail=%s",
+            iv,
+            now,
+            reason_session,
+        )
+        return None
+
     due_only = _env_bool("SUMMARY_PUSH_BG_LONG_INTERVAL_DUE_ONLY", True)
     if due_only and iv in (3, 5) and not _is_due(iv, now):
         logger.warning(
@@ -205,23 +285,24 @@ def install() -> bool:
     try:
         import core.startup.summary_parallel_intervals_runtime_patch as sp
         cur = getattr(sp, "_submit_bg_push_interval", None)
-        if getattr(cur, "_summary_push_bg_due_guard_v4", False):
+        if getattr(cur, "_summary_push_bg_due_guard_v5", False):
             _PATCHED = True
             _install_display_first_patch()
             return True
         _ORIGINAL_SUBMIT = cur
         _patched_submit_bg_push_interval._summary_push_bg_due_guard = True  # type: ignore[attr-defined]
-        _patched_submit_bg_push_interval._summary_push_bg_due_guard_v4 = True  # type: ignore[attr-defined]
+        _patched_submit_bg_push_interval._summary_push_bg_due_guard_v5 = True  # type: ignore[attr-defined]
         sp._submit_bg_push_interval = _patched_submit_bg_push_interval
         _PATCHED = True
         display_first_ok = _install_display_first_patch()
         logger.warning(
-            "[SUMMARY PUSH BG DUE GUARD] installed v4 due_only=%s stale_1m=%.1f stale_3m=%.1f stale_5m=%.1f dedicated_1m=%s display_first=%s original=%s",
+            "[SUMMARY PUSH BG DUE GUARD] installed v5 due_only=%s stale_1m=%.1f stale_3m=%.1f stale_5m=%.1f dedicated_1m=%s skip_outside_session_main=%s display_first=%s original=%s",
             _env_bool("SUMMARY_PUSH_BG_LONG_INTERVAL_DUE_ONLY", True),
             _stale_sec_for_interval(1),
             _stale_sec_for_interval(3),
             _stale_sec_for_interval(5),
             _env_bool("SUMMARY_PUSH_1M_DEDICATED_THREAD", True),
+            _env_bool("SUMMARY_PUSH_BG_SKIP_OUTSIDE_SESSION_IN_MAIN", True),
             display_first_ok,
             getattr(cur, "__name__", str(cur)),
         )
