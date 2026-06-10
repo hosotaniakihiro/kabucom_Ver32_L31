@@ -12,14 +12,6 @@ def _float_env(name: str, default: float) -> float:
         return float(default)
 
 
-def _clamp(v: float, lo: float, hi: float) -> float:
-    try:
-        x = float(v)
-    except Exception:
-        x = float(lo)
-    return max(float(lo), min(float(hi), x))
-
-
 def _install_fast_stale_guard() -> bool:
     try:
         os.environ.setdefault('RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE', '1')
@@ -43,15 +35,19 @@ def _install_min_pending_timeout_rescue() -> bool:
 
 
 def _apply_once() -> bool:
-    # V12: align with ranking_stuck_pending_prune_patch v7.
-    # V11 narrowed budgets to 15/18/12, which caused scoring/pending_add to stop
-    # before a candidate could be added. Keep the fast path bounded, but allow
-    # enough time for candidate scoring and controller dispatch.
-    runtime = _clamp(_float_env('RANKING_ENTRY_FAST_RUNTIME_BUDGET_SEC', 25.0), 10.0, 25.0)
-    build = _clamp(_float_env('RANKING_ENTRY_FAST_BUILD_TIMEOUT_SEC', 30.0), 10.0, 30.0)
-    controller = _clamp(_float_env('RANKING_ENTRY_FAST_CONTROLLER_TIMEOUT_SEC', 30.0), 10.0, 30.0)
-    lock_wait = _clamp(_float_env('SUMMARY_AI_ENTRY_CONTROLLER_LOCK_WAIT_SEC', 8.0), 1.0, 10.0)
-    max_pending = str(int(_clamp(_float_env('RANKING_ENTRY_FAST_MAX_PENDING_PER_RUN', 4.0), 1.0, 4.0)))
+    # V13: force 25/30/30 even when stale env vars from older v11/v5 remain.
+    # V12 still read RANKING_ENTRY_FAST_* env values first, so an existing
+    # runtime=15/build=18/controller=12 process kept budget_sec=15.0.
+    # Keep the path bounded, but always raise the effective floor to the agreed
+    # 25/30/30 seconds and max_pending=4 for ranking entries.
+    raw_runtime = _float_env('RANKING_ENTRY_FAST_RUNTIME_BUDGET_SEC', 25.0)
+    raw_build = _float_env('RANKING_ENTRY_FAST_BUILD_TIMEOUT_SEC', 30.0)
+    raw_controller = _float_env('RANKING_ENTRY_FAST_CONTROLLER_TIMEOUT_SEC', 30.0)
+    runtime = 25.0 if raw_runtime < 25.0 else min(float(raw_runtime), 25.0)
+    build = 30.0 if raw_build < 30.0 else min(float(raw_build), 30.0)
+    controller = 30.0 if raw_controller < 30.0 else min(float(raw_controller), 30.0)
+    lock_wait = max(1.0, min(_float_env('SUMMARY_AI_ENTRY_CONTROLLER_LOCK_WAIT_SEC', 8.0), 10.0))
+    max_pending = '4'
     os.environ['RANKING_ENTRY_FAST_RUNTIME_BUDGET_SEC'] = str(runtime)
     os.environ['RANKING_ENTRY_FAST_BUILD_TIMEOUT_SEC'] = str(build)
     os.environ['RANKING_ENTRY_FAST_CONTROLLER_TIMEOUT_SEC'] = str(controller)
@@ -88,7 +84,7 @@ def _watch_loop() -> None:
     for i in range(loops):
         ok = _apply_once()
         if i in (0, loops - 1):
-            logger.warning('[RANKING ENTRY FAST BUDGET OVERRIDE] enforce v12 i=%s/%s ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s', i, loops, ok, os.environ.get('RANKING_ENTRY_RUNTIME_BUDGET_SEC'), os.environ.get('RANKING_ENTRY_BUILD_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_MAX_PENDING_PER_RUN'))
+            logger.warning('[RANKING ENTRY FAST BUDGET OVERRIDE] enforce v13 i=%s/%s ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s', i, loops, ok, os.environ.get('RANKING_ENTRY_RUNTIME_BUDGET_SEC'), os.environ.get('RANKING_ENTRY_BUILD_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_MAX_PENDING_PER_RUN'))
         time.sleep(sleep_sec)
 
 
@@ -99,7 +95,7 @@ def install() -> bool:
     ok = _apply_once()
     threading.Thread(target=_watch_loop, name='ranking-entry-fast-budget-override', daemon=True).start()
     _INSTALLED = True
-    logger.warning('[RANKING ENTRY FAST BUDGET OVERRIDE] installed v12 ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s watcher=True', ok, os.environ.get('RANKING_ENTRY_RUNTIME_BUDGET_SEC'), os.environ.get('RANKING_ENTRY_BUILD_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_MAX_PENDING_PER_RUN'))
+    logger.warning('[RANKING ENTRY FAST BUDGET OVERRIDE] installed v13 ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s watcher=True', ok, os.environ.get('RANKING_ENTRY_RUNTIME_BUDGET_SEC'), os.environ.get('RANKING_ENTRY_BUILD_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_MAX_PENDING_PER_RUN'))
     return True
 
 
