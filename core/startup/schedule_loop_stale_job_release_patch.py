@@ -10,6 +10,8 @@ from typing import Any
 logger = logging.getLogger(__name__)
 _DONE = False
 _WATCH_STARTED = False
+_INSTALL_LOGGED = False
+_PATCH_LOGGED = False
 
 
 def _env_float(name: str, default: float) -> float:
@@ -131,13 +133,14 @@ def _release_stale_running_jobs(reason: str = "periodic") -> int:
 
 
 def _patch_once() -> bool:
+    global _PATCH_LOGGED
     try:
         import core.startup.schedule_loop as sl
 
         cur = getattr(sl, "_is_job_running", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_stale_release_v1", False):
+        if getattr(cur, "_stale_release_v2", False) or getattr(cur, "_stale_release_v1", False):
             _release_stale_running_jobs(reason="enforce")
             return True
 
@@ -151,15 +154,18 @@ def _patch_once() -> bool:
             return bool(orig(key))
 
         _patched_is_job_running._stale_release_v1 = True  # type: ignore[attr-defined]
+        _patched_is_job_running._stale_release_v2 = True  # type: ignore[attr-defined]
         _patched_is_job_running._original = orig  # type: ignore[attr-defined]
         sl._is_job_running = _patched_is_job_running
-        logger.warning(
-            "[SCHEDULE LOOP STALE RELEASE] patched _is_job_running v1 ranking=%.1fs yahoo=%.1fs exit=%.1fs default=%.1fs",
-            _env_float("SCHEDULE_LOOP_STALE_RANKING_ENTRY_SEC", 35.0),
-            _env_float("SCHEDULE_LOOP_STALE_YAHOO_COMPLEMENT_SEC", 180.0),
-            _env_float("SCHEDULE_LOOP_STALE_EXIT_SEC", 25.0),
-            _env_float("SCHEDULE_LOOP_STALE_DEFAULT_SEC", 180.0),
-        )
+        if not _PATCH_LOGGED:
+            logger.warning(
+                "[SCHEDULE LOOP STALE RELEASE] patched _is_job_running v2 ranking=%.1fs yahoo=%.1fs exit=%.1fs default=%.1fs",
+                _env_float("SCHEDULE_LOOP_STALE_RANKING_ENTRY_SEC", 35.0),
+                _env_float("SCHEDULE_LOOP_STALE_YAHOO_COMPLEMENT_SEC", 180.0),
+                _env_float("SCHEDULE_LOOP_STALE_EXIT_SEC", 25.0),
+                _env_float("SCHEDULE_LOOP_STALE_DEFAULT_SEC", 180.0),
+            )
+            _PATCH_LOGGED = True
         _release_stale_running_jobs(reason="install")
         return True
     except Exception:
@@ -168,17 +174,17 @@ def _patch_once() -> bool:
 
 
 def _watch() -> None:
-    loops = int(max(1, min(_env_float("SCHEDULE_LOOP_STALE_RELEASE_WATCH_LOOPS", 240), 720)))
-    sleep_sec = max(1.0, min(_env_float("SCHEDULE_LOOP_STALE_RELEASE_WATCH_SLEEP_SEC", 3.0), 15.0))
+    loops = int(max(1, min(_env_float("SCHEDULE_LOOP_STALE_RELEASE_WATCH_LOOPS", 24), 120)))
+    sleep_sec = max(1.0, min(_env_float("SCHEDULE_LOOP_STALE_RELEASE_WATCH_SLEEP_SEC", 5.0), 15.0))
     for i in range(loops):
         ok = _patch_once()
-        if i in (0, loops - 1) or i % 20 == 0:
-            logger.warning("[SCHEDULE LOOP STALE RELEASE] enforce i=%s/%s ok=%s", i, loops, ok)
+        if i in (0, loops - 1):
+            logger.warning("[SCHEDULE LOOP STALE RELEASE] enforce v2 i=%s/%s ok=%s", i, loops, ok)
         time.sleep(sleep_sec)
 
 
 def install() -> bool:
-    global _DONE, _WATCH_STARTED
+    global _DONE, _WATCH_STARTED, _INSTALL_LOGGED
     if not _env_bool("SCHEDULE_LOOP_STALE_RELEASE_ENABLED", True):
         logger.warning("[SCHEDULE LOOP STALE RELEASE] disabled by env")
         return False
@@ -187,7 +193,9 @@ def install() -> bool:
         threading.Thread(target=_watch, name="schedule-loop-stale-release-watch", daemon=True).start()
         _WATCH_STARTED = True
     _DONE = True
-    logger.warning("[SCHEDULE LOOP STALE RELEASE] installed v1 ok=%s watcher=True", ok)
+    if not _INSTALL_LOGGED:
+        logger.warning("[SCHEDULE LOOP STALE RELEASE] installed v2 ok=%s watcher=%s", ok, _WATCH_STARTED)
+        _INSTALL_LOGGED = True
     return bool(ok)
 
 
