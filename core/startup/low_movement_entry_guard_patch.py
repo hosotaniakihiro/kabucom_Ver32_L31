@@ -1,9 +1,15 @@
 # ============================================================
 # File   : core/startup/low_movement_entry_guard_patch.py
-# Version: Ver15-RANKING-NO-HIGHLOW-MOMENTUM-FALLBACK
+# Version: Ver16-RANKING-ZERO-ATR-TURNOVER-DAY-SOFTPASS
 # ------------------------------------------------------------
 # あまり動かない銘柄へのエントリーを発注直前で止める。
 # さらに、ランキング方向に逆らうエントリーも禁止する。
+#
+# Ver16:
+#   - Ver15の RANKING no_highlow momentum fallback は ATR/slope 依存が強く、
+#     ranking snapshot tech が atr=0/slope=0 の時間帯に全落ちしていた。
+#   - RANKING 強候補だけ score/volume/turnover/day% で soft-pass 可能にした。
+#   - high==low も「実レンジ0」ではなく snapshot high/low不完全として扱う。
 #
 # Ver15:
 #   - RANKING pending はランキング情報だけで作るため high/low が
@@ -47,7 +53,7 @@ def _env_float(name: str, default: float) -> float:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
             return float(default)
-        return float(v)
+        return float(str(v).replace(",", ""))
     except Exception:
         return float(default)
 
@@ -170,9 +176,118 @@ def _range_pct_from_row(row: dict) -> float:
     return v
 
 
-def _ranking_momentum_ok(row: dict, *, close: float, symbol: str, high: float, low: float) -> bool:
+def _turnover_from_row(row: dict, *, close: float) -> float:
+    explicit = _safe_float(
+        _first(
+            row,
+            (
+                "turnover",
+                "trading_value",
+                "trading_amount",
+                "turnover_value",
+                "amount",
+                "売買代金",
+            ),
+            0.0,
+        ),
+        0.0,
+    )
+    if explicit > 0:
+        return explicit
+    vol = _safe_float(_first(row, ("volume", "Volume", "trading_volume", "出来高"), 0.0), 0.0)
+    if close > 0 and vol > 0:
+        return close * vol
+    return 0.0
+
+
+def _day_pct_from_row(row: dict) -> float:
+    return _safe_float(
+        _first(
+            row,
+            (
+                "day_change_pct",
+                "change_pct",
+                "change_percentage",
+                "change_rate",
+                "day",
+                "day_pct",
+                "騰落率",
+            ),
+            0.0,
+        ),
+        0.0,
+    )
+
+
+def _ranking_strong_snapshot_ok(row: dict, *, close: float, symbol: str, high: float, low: float, range_pct: float) -> bool:
+    if not _env_bool("LOW_MOVE_RANKING_ZERO_ATR_SOFTPASS", True):
+        return False
+
+    score = _safe_float(_first(row, ("pending_score", "score", "final_score", "display_score", "score_total"), 0.0), 0.0)
+    vol = _safe_float(_first(row, ("volume", "Volume", "trading_volume", "出来高"), 0.0), 0.0)
+    turnover = _turnover_from_row(row, close=close)
+    day_pct = _day_pct_from_row(row)
+    atr = _safe_float(_first(row, ("atr", "atr_1m", "atr_5m"), 0.0), 0.0)
+
+    min_score = _env_float("LOW_MOVE_RANKING_ZERO_ATR_MIN_SCORE", _env_float("LOW_MOVE_RANKING_MIN_SCORE_FOR_NO_HIGHLOW", 70.0))
+    min_volume = _env_float("LOW_MOVE_RANKING_ZERO_ATR_MIN_VOLUME", 30000.0)
+    min_turnover = _env_float("LOW_MOVE_RANKING_ZERO_ATR_MIN_TURNOVER", 100000000.0)
+    min_day_abs = _env_float("LOW_MOVE_RANKING_ZERO_ATR_MIN_DAY_ABS_PCT", 3.0)
+    max_range = _env_float("LOW_MOVE_RANKING_ZERO_ATR_MAX_RANGE_PCT", 0.0025)
+
+    high_low_broken = not (high > 0 and low > 0 and close > 0 and high > low)
+    zero_or_tiny_range = range_pct <= max_range
+    zero_atr = atr <= 0
+
+    ok = (
+        score >= min_score
+        and vol >= min_volume
+        and turnover >= min_turnover
+        and abs(day_pct) >= min_day_abs
+        and (zero_atr or high_low_broken or zero_or_tiny_range)
+    )
+    if ok:
+        logger.warning(
+            "[LOW MOVE GUARD] RANKING zero-ATR/high-low soft-pass symbol=%s close=%.1f high=%.1f low=%.1f range_pct=%.6f atr=%.6f score=%.2f vol=%.0f turnover=%.0f day=%.3f",
+            symbol,
+            close,
+            high,
+            low,
+            range_pct,
+            atr,
+            score,
+            vol,
+            turnover,
+            day_pct,
+        )
+        return True
+
+    logger.warning(
+        "[LOW MOVE GUARD] RANKING zero-ATR/high-low soft-pass NG symbol=%s close=%.1f high=%.1f low=%.1f range_pct=%.6f atr=%.6f score=%.2f/%s vol=%.0f/%s turnover=%.0f/%s day=%.3f/%s",
+        symbol,
+        close,
+        high,
+        low,
+        range_pct,
+        atr,
+        score,
+        min_score,
+        vol,
+        min_volume,
+        turnover,
+        min_turnover,
+        day_pct,
+        min_day_abs,
+    )
+    return False
+
+
+def _ranking_momentum_ok(row: dict, *, close: float, symbol: str, high: float, low: float, range_pct: float = 0.0) -> bool:
     if not _env_bool("LOW_MOVE_RANKING_ALLOW_NO_HIGHLOW_MOMENTUM", True):
         return False
+
+    if _ranking_strong_snapshot_ok(row, close=close, symbol=symbol, high=high, low=low, range_pct=range_pct):
+        return True
 
     atr = _safe_float(_first(row, ("atr", "atr_1m", "atr_5m"), 0.0), 0.0)
     atr_ratio = atr / close if close > 0 else 0.0
@@ -357,16 +472,16 @@ def _low_movement_guard(entry_row: Any) -> bool:
 
     range_pct = 0.0
     range_source = "high_low"
-    if high > 0 and low > 0 and high >= low:
+    if high > 0 and low > 0 and high > low:
         range_pct = (high - low) / close if close > 0 else 0.0
     else:
         range_pct = _range_pct_from_row(row)
         range_source = "row_range_pct"
         if range_pct <= 0:
-            if source_ranking and _ranking_momentum_ok(row, close=close, symbol=symbol, high=high, low=low):
+            if source_ranking and _ranking_momentum_ok(row, close=close, symbol=symbol, high=high, low=low, range_pct=range_pct):
                 return True
             logger.warning(
-                "[LOW MOVE GUARD] NG symbol=%s reason=no_high_low close=%.1f high=%.1f low=%.1f row_range_pct=%.4f raw_merged=%s keys=%s",
+                "[LOW MOVE GUARD] NG symbol=%s reason=no_or_flat_high_low close=%.1f high=%.1f low=%.1f row_range_pct=%.4f raw_merged=%s keys=%s",
                 symbol, close, high, low, range_pct, row.get("_raw_merged_for_low_move_guard"), sorted(list(row.keys()))[:80],
             )
             return False
@@ -389,6 +504,8 @@ def _low_movement_guard(entry_row: Any) -> bool:
         strong_range_pct = _env_float("LOW_MOVE_STRONG_RANGE_PCT", 0.020)
 
     if range_pct < min_range_pct:
+        if source_ranking and _ranking_momentum_ok(row, close=close, symbol=symbol, high=high, low=low, range_pct=range_pct):
+            return True
         logger.warning(
             "[LOW MOVE GUARD] NG symbol=%s reason=range_too_small close=%.1f high=%.1f low=%.1f range_pct=%.4f min=%.4f source=%s tonosama=%s ranking=%s",
             symbol, close, high, low, range_pct, min_range_pct, range_source, source_tonosama, source_ranking,
@@ -413,6 +530,8 @@ def _low_movement_guard(entry_row: Any) -> bool:
         else:
             min_abs_slope = _env_float("LOW_MOVE_MIN_ABS_SLOPE_LOW_PRICE", 0.0003) if close < split else _env_float("LOW_MOVE_MIN_ABS_SLOPE_HIGH_PRICE", 0.0002)
         if abs_slope < min_abs_slope and range_pct < strong_range_pct:
+            if source_ranking and _ranking_strong_snapshot_ok(row, close=close, symbol=symbol, high=high, low=low, range_pct=range_pct):
+                return True
             logger.warning(
                 "[LOW MOVE GUARD] NG symbol=%s reason=slope_too_small close=%.1f abs_slope=%.6f min=%.6f range_pct=%.4f strong_range=%.4f source=%s tonosama=%s ranking=%s",
                 symbol, close, abs_slope, min_abs_slope, range_pct, strong_range_pct, range_source, source_tonosama, source_ranking,
@@ -425,6 +544,8 @@ def _low_movement_guard(entry_row: Any) -> bool:
             )
 
     if abs(macd) < 0.0001 and abs(signal) < 0.0001 and max_abs_slope < 0.0001 and range_pct < strong_range_pct:
+        if source_ranking and _ranking_strong_snapshot_ok(row, close=close, symbol=symbol, high=high, low=low, range_pct=range_pct):
+            return True
         logger.warning(
             "[LOW MOVE GUARD] NG symbol=%s reason=no_momentum macd=%.6f signal=%.6f slope=%.6f range_pct=%.4f strong_range=%.4f source=%s tonosama=%s ranking=%s",
             symbol, macd, signal, max_abs_slope, range_pct, strong_range_pct, range_source, source_tonosama, source_ranking,
@@ -461,6 +582,15 @@ def _patched_range_5m_filter(entry_row: Any = None, *args, **kwargs):
                     "[LOW MOVE GUARD] original range_5m_filter NG ignored for TONOSAMA; recheck low movement guard. symbol=%s",
                     _norm_symbol(_first(_row_to_dict(entry_row), ("symbol", "code", "stock_code"), "")),
                 )
+            elif _is_ranking_entry(entry_row) and _ranking_momentum_ok(
+                _row_to_dict(entry_row),
+                close=_safe_float(_first(_row_to_dict(entry_row), ("close_price", "close", "price", "current_price"), 0.0), 0.0),
+                symbol=_norm_symbol(_first(_row_to_dict(entry_row), ("symbol", "code", "stock_code"), "")),
+                high=_safe_float(_first(_row_to_dict(entry_row), ("high_price", "high"), 0.0), 0.0),
+                low=_safe_float(_first(_row_to_dict(entry_row), ("low_price", "low"), 0.0), 0.0),
+                range_pct=_range_pct_from_row(_row_to_dict(entry_row)),
+            ):
+                logger.warning("[LOW MOVE GUARD] original range_5m_filter NG ignored for strong RANKING")
             else:
                 return False
         return _apply_all_entry_guards(entry_row)
@@ -480,7 +610,19 @@ def _patched_atr_1m_filter(entry_row: Any = None, *args, **kwargs):
         if isinstance(allow, tuple):
             return allow
         if not bool(allow):
-            return False
+            row = _row_to_dict(entry_row)
+            close = _safe_float(_first(row, ("close_price", "close", "price", "current_price"), 0.0), 0.0)
+            if _is_ranking_entry(entry_row) and _ranking_momentum_ok(
+                row,
+                close=close,
+                symbol=_norm_symbol(_first(row, ("symbol", "code", "stock_code"), "")),
+                high=_safe_float(_first(row, ("high_price", "high"), 0.0), 0.0),
+                low=_safe_float(_first(row, ("low_price", "low"), 0.0), 0.0),
+                range_pct=_range_pct_from_row(row),
+            ):
+                logger.warning("[LOW MOVE GUARD] original atr_1m_filter NG ignored for strong RANKING")
+            else:
+                return False
         return _apply_all_entry_guards(entry_row)
     except RecursionError:
         logger.error("[LOW MOVE GUARD] recursion detected in patched atr filter. fail-safe NG. Check duplicate wrappers.", exc_info=False)
@@ -499,6 +641,7 @@ def _is_low_move_wrapped(func: Any) -> bool:
             or getattr(func, "_low_move_guard_v13", False)
             or getattr(func, "_low_move_guard_v14", False)
             or getattr(func, "_low_move_guard_v15", False)
+            or getattr(func, "_low_move_guard_v16", False)
         )
     except Exception:
         return False
@@ -506,6 +649,13 @@ def _is_low_move_wrapped(func: Any) -> bool:
 
 def install() -> bool:
     global _INSTALLED, _ORIG_ATR_FILTER, _ORIG_RANGE_FILTER
+    os.environ.setdefault("LOW_MOVE_RANKING_ZERO_ATR_SOFTPASS", "1")
+    os.environ.setdefault("LOW_MOVE_RANKING_ZERO_ATR_MIN_SCORE", "70")
+    os.environ.setdefault("LOW_MOVE_RANKING_ZERO_ATR_MIN_VOLUME", "30000")
+    os.environ.setdefault("LOW_MOVE_RANKING_ZERO_ATR_MIN_TURNOVER", "100000000")
+    os.environ.setdefault("LOW_MOVE_RANKING_ZERO_ATR_MIN_DAY_ABS_PCT", "3.0")
+    os.environ.setdefault("LOW_MOVE_RANKING_ZERO_ATR_MAX_RANGE_PCT", "0.0025")
+
     ok_direction = _install_ranking_direction_guard()
     ok_scoring_bridge = _install_scoring_flag_pattern_bridge()
     ok_entry_direction = _install_entry_direction_confirm_guard()
@@ -522,31 +672,33 @@ def install() -> bool:
         old_atr = getattr(ec, "atr_1m_filter", None)
         old_range = getattr(ec, "range_5m_filter", None)
 
-        if callable(old_atr) and not _is_low_move_wrapped(old_atr):
-            _ORIG_ATR_FILTER = old_atr
-            _patched_atr_1m_filter._low_move_guard_v15 = True  # type: ignore[attr-defined]
-            _patched_atr_1m_filter._original = old_atr  # type: ignore[attr-defined]
+        if callable(old_atr) and not getattr(old_atr, "_low_move_guard_v16", False):
+            _ORIG_ATR_FILTER = getattr(old_atr, "_original", old_atr)
+            _patched_atr_1m_filter._low_move_guard_v16 = True  # type: ignore[attr-defined]
+            _patched_atr_1m_filter._original = _ORIG_ATR_FILTER  # type: ignore[attr-defined]
             ec.atr_1m_filter = _patched_atr_1m_filter
-            logger.warning("[LOW MOVE GUARD] patched entry_controller.atr_1m_filter")
+            logger.warning("[LOW MOVE GUARD] patched entry_controller.atr_1m_filter v16")
         else:
-            logger.warning("[LOW MOVE GUARD] atr_1m_filter already wrapped or missing")
+            logger.warning("[LOW MOVE GUARD] atr_1m_filter already wrapped v16 or missing")
 
-        if callable(old_range) and not _is_low_move_wrapped(old_range):
-            _ORIG_RANGE_FILTER = old_range
-            _patched_range_5m_filter._low_move_guard_v15 = True  # type: ignore[attr-defined]
-            _patched_range_5m_filter._original = old_range  # type: ignore[attr-defined]
+        if callable(old_range) and not getattr(old_range, "_low_move_guard_v16", False):
+            _ORIG_RANGE_FILTER = getattr(old_range, "_original", old_range)
+            _patched_range_5m_filter._low_move_guard_v16 = True  # type: ignore[attr-defined]
+            _patched_range_5m_filter._original = _ORIG_RANGE_FILTER  # type: ignore[attr-defined]
             ec.range_5m_filter = _patched_range_5m_filter
-            logger.warning("[LOW MOVE GUARD] patched entry_controller.range_5m_filter")
+            logger.warning("[LOW MOVE GUARD] patched entry_controller.range_5m_filter v16")
         else:
-            logger.warning("[LOW MOVE GUARD] range_5m_filter already wrapped or missing")
+            logger.warning("[LOW MOVE GUARD] range_5m_filter already wrapped v16 or missing")
 
         _INSTALLED = True
         logger.warning(
-            "[LOW MOVE GUARD] installed v15 raw_merge=True ranking_no_highlow_momentum=%s ranking_min_price=%s ranking_max_price=%s ranking_min_score=%s tonosama_max_price=%s tonosama_min_range=%s tonosama_ignore_orig_range_ng=%s direction=%s scoring_bridge=%s entry_direction=%s final_safety=%s price_improve=%s ma_cross=%s vwap=%s",
-            _env_bool("LOW_MOVE_RANKING_ALLOW_NO_HIGHLOW_MOMENTUM", True),
+            "[LOW MOVE GUARD] installed v16 raw_merge=True ranking_zero_atr_softpass=%s min_score=%s min_turnover=%s min_day_abs=%s ranking_min_price=%s ranking_max_price=%s tonosama_max_price=%s tonosama_min_range=%s tonosama_ignore_orig_range_ng=%s direction=%s scoring_bridge=%s entry_direction=%s final_safety=%s price_improve=%s ma_cross=%s vwap=%s",
+            _env_bool("LOW_MOVE_RANKING_ZERO_ATR_SOFTPASS", True),
+            os.getenv("LOW_MOVE_RANKING_ZERO_ATR_MIN_SCORE", "70"),
+            os.getenv("LOW_MOVE_RANKING_ZERO_ATR_MIN_TURNOVER", "100000000"),
+            os.getenv("LOW_MOVE_RANKING_ZERO_ATR_MIN_DAY_ABS_PCT", "3.0"),
             os.getenv("LOW_MOVE_RANKING_MIN_ENTRY_PRICE", os.getenv("LOW_MOVE_MIN_ENTRY_PRICE", "1500")),
             os.getenv("LOW_MOVE_RANKING_MAX_ENTRY_PRICE", os.getenv("LOW_MOVE_MAX_ENTRY_PRICE", "7000")),
-            os.getenv("LOW_MOVE_RANKING_MIN_SCORE_FOR_NO_HIGHLOW", "70.0"),
             os.getenv("LOW_MOVE_TONOSAMA_MAX_ENTRY_PRICE", "12000"),
             os.getenv("LOW_MOVE_TONOSAMA_MIN_RANGE_PCT", "0.006"),
             _env_bool("LOW_MOVE_TONOSAMA_IGNORE_ORIG_RANGE_NG", True),
