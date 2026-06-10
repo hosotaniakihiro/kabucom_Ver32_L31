@@ -1,31 +1,23 @@
 # ============================================================
 # File   : core/startup/main_skip_push_db_restore_patch.py
-# Version: V3-MAIN-SKIP-PUSH-DB-RESTORE-STACK-AND-SUMMARY-FALLBACK
+# Version: V4-MAIN-SKIP-PUSH-DB-RESTORE-MEMORY-SUMMARY-FALLBACK
 # ------------------------------------------------------------
 # Purpose:
 #   main.py 起動時に、NAS上の pushYYYYMMDD.db を同期的に直読み復元しない。
 #   さらに main.py 側の PUSH storage writer / PUSH symbol bridge / PUSH stream
 #   起動を既定でスキップし、0xC0000006 の発生面を最小化する。
 #
-#   V3:
+#   V4:
 #   - PUSH stack を止めた状態で PUSH summary runner が空を返した場合、
-#     scheduler_jobs.summary.runner_core が fallback_push_summary_df() で
-#     DB/cache を読みに行く経路も main.py では停止する。
-#
-# Reason:
-#   2026-06-09 のログで safe migration / PUSH DB復元 / PUSH stack skip は通過したが、
-#   その後 1分 PUSH summary が空になり、
-#     runner returned empty PUSH -> trying push-only fallback from db/cache
-#   の直後に Python例外ではなく Windows 0xC0000006 でプロセス終了した。
+#     main.py では DB/cache fallback を読まない方針は維持する。
+#   - ただし空 DataFrame 固定だと後場再起動直後に summary/AI が空になるため、
+#     GlobalContext のメモリ上 summary_history_cache / merged_summary / push_summary_cache
+#     からだけ復元する memory-only fallback を追加する。
 #
 # Policy:
 #   - main.py は起動継続を最優先する。
-#   - DB作成 / PUSH保存 / PUSH登録 / PUSH受信 / PUSH DB fallback は main_database.py 側に寄せる。
-#   - main.py 側でPUSHスタックを戻したい場合だけ
-#       AUTOSTOCK_MAIN_SKIP_PUSH_STACK=0
-#       AUTOSTOCK_MAIN_SKIP_PUSH_DB_RESTORE=0
-#       AUTOSTOCK_MAIN_SKIP_PUSH_SUMMARY_FALLBACK=0
-#     を明示する。
+#   - NAS DB作成 / PUSH保存 / PUSH登録 / PUSH受信 / PUSH DB fallback は main_database.py 側に寄せる。
+#   - main.py はメモリ上に既にある summary だけを利用する。
 # ============================================================
 
 from __future__ import annotations
@@ -46,6 +38,7 @@ _ORIGINAL_START_PUSH_STORAGE_SAFE = None
 _ORIGINAL_START_PUSH_STREAM_EARLY_SAFE = None
 _ORIGINAL_START_PUSH_STREAM_FALLBACK_SAFE = None
 _ORIGINAL_FALLBACK_PUSH_SUMMARY_DF = None
+_MEMORY_FALLBACK_LOGGED = set()
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -207,13 +200,103 @@ def _patched_start_push_stream_fallback_safe():
     return False
 
 
+def _normalize_interval(interval):
+    try:
+        if str(interval).lower() in {"1", "1m", "1min"}:
+            return 1
+        if str(interval).lower() in {"3", "3m", "3min"}:
+            return 3
+        if str(interval).lower() in {"5", "5m", "5min"}:
+            return 5
+        return int(interval)
+    except Exception:
+        return interval
+
+
+def _memory_push_summary_fallback(interval, now=None) -> pd.DataFrame:
+    """Return only in-process memory summary; never read NAS DB/cache here."""
+    if not _env_bool("AUTOSTOCK_MAIN_PUSH_SUMMARY_MEMORY_FALLBACK", True):
+        return pd.DataFrame()
+    tf = _normalize_interval(interval)
+    candidates: list[tuple[str, pd.DataFrame]] = []
+
+    # 1) global_context summary history (full rows, best for indicator/display rebuild)
+    try:
+        from core.global_context.context import global_context
+        if hasattr(global_context, "get_summary_history"):
+            df = global_context.get_summary_history(tf, source="push")
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                candidates.append(("summary_history", df))
+        if hasattr(global_context, "get_merged_summary"):
+            df = global_context.get_merged_summary(tf, source="push")
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                candidates.append(("merged_summary", df))
+        cache = getattr(global_context, "push_summary_cache", None)
+        if isinstance(cache, dict):
+            df = cache.get(tf)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                candidates.append(("push_summary_cache", df))
+    except Exception:
+        logger.debug("[MAIN SKIP PUSH SUMMARY FALLBACK] memory global_context fallback failed", exc_info=True)
+
+    # 2) global_state/global_data compatibility
+    try:
+        from global_state import global_data
+        for attr in (f"merged_summary_{tf}", f"summary_{tf}", f"push_summary_{tf}"):
+            df = getattr(global_data, attr, None)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                candidates.append((f"global_data.{attr}", df))
+        getter = getattr(global_data, "get_push_summary", None)
+        if callable(getter):
+            df = getter(tf)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                candidates.append(("global_data.get_push_summary", df))
+    except Exception:
+        logger.debug("[MAIN SKIP PUSH SUMMARY FALLBACK] memory global_data fallback failed", exc_info=True)
+
+    for source, df in candidates:
+        try:
+            out = df.copy()
+            if "datetime" in out.columns:
+                out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+                # Keep only today rows when possible; avoid old seed leaking into PM session.
+                today = pd.Timestamp.now().normalize()
+                mask_today = out["datetime"].dt.normalize().eq(today)
+                if mask_today.any():
+                    out = out.loc[mask_today].copy()
+            if out.empty:
+                continue
+            key = (tf, source)
+            if key not in _MEMORY_FALLBACK_LOGGED:
+                latest = None
+                if "datetime" in out.columns:
+                    latest = pd.to_datetime(out["datetime"], errors="coerce").max()
+                logger.warning(
+                    "[MAIN SKIP PUSH SUMMARY FALLBACK] memory fallback interval=%s source=%s rows=%s latest=%s now=%s",
+                    tf,
+                    source,
+                    len(out),
+                    latest,
+                    now,
+                )
+                _MEMORY_FALLBACK_LOGGED.add(key)
+            return out.reset_index(drop=True)
+        except Exception:
+            logger.debug("[MAIN SKIP PUSH SUMMARY FALLBACK] candidate failed source=%s", source, exc_info=True)
+
+    return pd.DataFrame()
+
+
 def _patched_fallback_push_summary_df(interval, now=None, *args, **kwargs):
     if _should_skip_push_summary_fallback():
+        df_mem = _memory_push_summary_fallback(interval, now=now)
+        if isinstance(df_mem, pd.DataFrame) and not df_mem.empty:
+            return df_mem
         logger.warning(
-            "[MAIN SKIP PUSH SUMMARY FALLBACK] skipped fallback_push_summary_df interval=%s now=%s "
-            "in main.py to avoid NAS SQLite/cache fallback 0xC0000006. "
+            "[MAIN SKIP PUSH SUMMARY FALLBACK] skipped DB/cache fallback_push_summary_df interval=%s now=%s "
+            "in main.py to avoid NAS SQLite/cache fallback 0xC0000006; no memory summary available. "
             "main_database.py handles PUSH summary DB/cache. "
-            "Set AUTOSTOCK_MAIN_SKIP_PUSH_SUMMARY_FALLBACK=0 to restore legacy behavior.",
+            "Set AUTOSTOCK_MAIN_SKIP_PUSH_SUMMARY_FALLBACK=0 to restore legacy DB fallback.",
             interval,
             now,
         )
@@ -244,8 +327,9 @@ def _install_push_summary_fallback_skip() -> None:
             logger.debug("[MAIN SKIP PUSH SUMMARY FALLBACK] runner_core patch skipped", exc_info=True)
 
         logger.warning(
-            "[MAIN SKIP PUSH SUMMARY FALLBACK] installed enabled=%s main_py=%s",
+            "[MAIN SKIP PUSH SUMMARY FALLBACK] installed enabled=%s memory=%s main_py=%s",
             _should_skip_push_summary_fallback(),
+            _env_bool("AUTOSTOCK_MAIN_PUSH_SUMMARY_MEMORY_FALLBACK", True),
             _is_main_py_process(),
         )
     except Exception:
@@ -264,6 +348,7 @@ def install() -> bool:
         os.environ.setdefault("AUTOSTOCK_MAIN_SKIP_PUSH_DB_RESTORE", "1")
         os.environ.setdefault("AUTOSTOCK_MAIN_SKIP_PUSH_STACK", "1")
         os.environ.setdefault("AUTOSTOCK_MAIN_SKIP_PUSH_SUMMARY_FALLBACK", "1")
+        os.environ.setdefault("AUTOSTOCK_MAIN_PUSH_SUMMARY_MEMORY_FALLBACK", "1")
         os.environ.setdefault("PUSH_STREAM_DB_WRITE", "0")
         os.environ.setdefault("PUSH_STREAM_ORDER_BOOK_WRITE", "0")
 
@@ -317,11 +402,12 @@ def install() -> bool:
 
         _INSTALLED = True
         logger.warning(
-            "[MAIN SKIP PUSH DB RESTORE] installed enabled=%s main_py=%s push_stack_skip=%s push_summary_fallback_skip=%s",
+            "[MAIN SKIP PUSH DB RESTORE] installed enabled=%s main_py=%s push_stack_skip=%s push_summary_fallback_skip=%s memory_fallback=%s",
             _should_skip_db_restore(),
             _is_main_py_process(),
             _should_skip_push_stack(),
             _should_skip_push_summary_fallback(),
+            _env_bool("AUTOSTOCK_MAIN_PUSH_SUMMARY_MEMORY_FALLBACK", True),
         )
         return True
     except Exception:
