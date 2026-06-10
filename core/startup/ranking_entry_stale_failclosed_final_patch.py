@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/ranking_entry_stale_failclosed_final_patch.py
-# Version: V2-FAST-STARTUP-WATCHER
+# Version: V3-FAST-STARTUP-WATCHER-SCHEDULE-STALE-RELEASE
 # ============================================================
 from __future__ import annotations
 import datetime as dt
@@ -13,6 +13,7 @@ from functools import wraps
 from typing import Any
 logger = logging.getLogger(__name__)
 _INSTALLED = False
+_SCHED_STALE_INSTALLED = False
 
 def _b(name: str, default: bool) -> bool:
     v = os.getenv(name)
@@ -24,6 +25,19 @@ def _f(name: str, default: float) -> float:
         v = os.getenv(name)
         return default if v is None or str(v).strip() == '' else float(v)
     except Exception: return default
+
+def _install_schedule_stale_release() -> bool:
+    global _SCHED_STALE_INSTALLED
+    try:
+        mod = __import__('core.startup.schedule_loop_stale_job_release_patch', fromlist=['install'])
+        fn = getattr(mod, 'install', None)
+        ok = bool(fn()) if callable(fn) else False
+        _SCHED_STALE_INSTALLED = bool(ok)
+        logger.warning('[RANKING STALE FINAL] companion schedule stale release installed=%s', ok)
+        return bool(ok)
+    except Exception:
+        logger.exception('[RANKING STALE FINAL] companion schedule stale release install failed')
+        return False
 
 def _parse_ts(v: Any):
     try:
@@ -88,6 +102,7 @@ def _clear_pending(diag: dict[str, Any]) -> None:
 def _wrap(orig):
     @wraps(orig)
     def wrapped(*args, **kwargs):
+        _install_schedule_stale_release()
         if _b('RANKING_ENTRY_STALE_FAILOPEN_ENABLED', False): return orig(*args, **kwargs)
         ok, diag = _fresh_diag()
         if not ok:
@@ -97,17 +112,19 @@ def _wrap(orig):
         return orig(*args, **kwargs)
     wrapped._ranking_stale_final_v1 = True
     wrapped._ranking_stale_final_v2 = True
+    wrapped._ranking_stale_final_v3 = True
     wrapped._original = orig
     return wrapped
 
 def _patch_once() -> bool:
     try:
+        _install_schedule_stale_release()
         import trading.entry_exit.tasks as tasks
         cur = getattr(tasks, '_run_ranking_entry_safe', None)
         if not callable(cur): return False
-        if getattr(cur, '_ranking_stale_final_v2', False) or getattr(cur, '_ranking_stale_final_v1', False): return True
+        if getattr(cur, '_ranking_stale_final_v3', False) or getattr(cur, '_ranking_stale_final_v2', False) or getattr(cur, '_ranking_stale_final_v1', False): return True
         tasks._run_ranking_entry_safe = _wrap(cur)
-        logger.warning('[RANKING STALE FINAL] patched outermost v2 target=%s', getattr(cur, '__name__', type(cur)))
+        logger.warning('[RANKING STALE FINAL] patched outermost v3 target=%s', getattr(cur, '__name__', type(cur)))
         return True
     except Exception:
         logger.exception('[RANKING STALE FINAL] patch failed'); return False
@@ -117,7 +134,7 @@ def _watch():
     sleep_sec = max(0.5, min(float(os.getenv('RANKING_STALE_FINAL_WATCH_SLEEP_SEC', '2.0') or 2.0), 5.0))
     for i in range(loops):
         ok = _patch_once()
-        if i in (0, loops - 1): logger.warning('[RANKING STALE FINAL] enforce v2 i=%s/%s ok=%s', i, loops, ok)
+        if i in (0, loops - 1): logger.warning('[RANKING STALE FINAL] enforce v3 i=%s/%s ok=%s schedule_stale=%s', i, loops, ok, _SCHED_STALE_INSTALLED)
         time.sleep(sleep_sec)
 
 def install() -> bool:
@@ -125,10 +142,16 @@ def install() -> bool:
     os.environ.setdefault('RANKING_ENTRY_STALE_FAILOPEN_ENABLED', '0')
     os.environ.setdefault('RANKING_ENTRY_CLEAR_PENDING_ON_STALE', '1')
     os.environ.setdefault('RANKING_ENTRY_SNAPSHOT_MAX_AGE_SEC', '300')
-    if _INSTALLED: return True
+    os.environ.setdefault('SCHEDULE_LOOP_STALE_RELEASE_ENABLED', '1')
+    os.environ.setdefault('SCHEDULE_LOOP_STALE_RANKING_ENTRY_SEC', '35')
+    os.environ.setdefault('SCHEDULE_LOOP_STALE_YAHOO_COMPLEMENT_SEC', '180')
+    os.environ.setdefault('SCHEDULE_LOOP_STALE_EXIT_SEC', '25')
+    if _INSTALLED:
+        _install_schedule_stale_release()
+        return True
     ok = _patch_once(); _INSTALLED = True
     threading.Thread(target=_watch, name='ranking-stale-final-watch', daemon=True).start()
-    logger.warning('[RANKING STALE FINAL] installed v2 ok=%s failopen=%s', ok, os.getenv('RANKING_ENTRY_STALE_FAILOPEN_ENABLED'))
+    logger.warning('[RANKING STALE FINAL] installed v3 ok=%s failopen=%s schedule_stale=%s', ok, os.getenv('RANKING_ENTRY_STALE_FAILOPEN_ENABLED'), _SCHED_STALE_INSTALLED)
     return ok
 try: install()
 except Exception: logger.exception('[RANKING STALE FINAL] auto install failed')
