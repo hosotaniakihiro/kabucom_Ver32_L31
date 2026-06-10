@@ -1,6 +1,6 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver39-YAHOO-DB-WARMUP-RANKING-HARD-TIMEOUT
+# Version: Ver40-SQLITE-MEMORY-PRAGMAS
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # main.py は軽量同期 + background install。
@@ -134,7 +134,6 @@ def _install_runtime_defaults() -> None:
             "RANKING_FINAL_RESCUE_MIN_SCORE": "55",
             "RANKING_FINAL_RESCUE_ATR_MIN_RATIO": "0.0005",
             "RANKING_FINAL_RESCUE_AI_FAILOPEN": "1",
-            # Ranking prefilter accepts low-price liquid names from config; final low-move guard must not re-block only by price.
             "LOW_MOVE_RANKING_MIN_ENTRY_PRICE": "300",
             "LOW_MOVE_RANKING_MAX_ENTRY_PRICE": "7000",
             "LOW_MOVE_RANKING_MIN_RANGE_PCT_LOW_PRICE": "0.008",
@@ -192,13 +191,20 @@ def _install_runtime_defaults() -> None:
             "YAHOO_COMPLEMENT_DB_WARMUP_LOOKBACK_DAYS": "7",
             "SUMMARY_DB_DATE_GUARD_ENABLED": "1",
             "SUMMARY_DB_DATE_GUARD_CLEANUP_ENABLED": "0",
+            # SQLite memory assist defaults. main_database_cpu_guard_env/data_collectors_runner may override before child launch.
+            "SQLITE_MEMORY_PRAGMAS_ENABLED": "1",
+            "SQLITE_MEMORY_TEMP_STORE": "MEMORY",
+            "SQLITE_MEMORY_CACHE_KB": "-65536",
+            "SQLITE_BUSY_TIMEOUT_MS": "5000",
+            "SQLITE_MMAP_SIZE_BYTES": "268435456",
+            "SQLITE_CACHE_SPILL_OFF": "1",
         }
         for k, v in defaults.items():
             os.environ.setdefault(k, v)
         os.environ["ENTRY_SHORT_MTF_REQUIRE_ALL"] = "0"
-        _write_boot_evidence("RUNTIME_DEFAULTS_SET", {"ranking_snapshot_alias": os.environ.get("RANKING_ENTRY_SNAPSHOT_TECH_ALIAS_ENABLED")})
+        _write_boot_evidence("RUNTIME_DEFAULTS_SET", {"ranking_snapshot_alias": os.environ.get("RANKING_ENTRY_SNAPSHOT_TECH_ALIAS_ENABLED"), "sqlite_memory": os.environ.get("SQLITE_MEMORY_PRAGMAS_ENABLED")})
         logger.warning(
-            "[SITECUSTOMIZE] defaults lite ranking_watchdog=%s timeout=%s hard_timeout=%s snapshot_tech_alias=%s ranking_price=%s-%s tonosama_raw1_resample=%s yahoo_db_warmup=%s",
+            "[SITECUSTOMIZE] defaults lite ranking_watchdog=%s timeout=%s hard_timeout=%s snapshot_tech_alias=%s ranking_price=%s-%s tonosama_raw1_resample=%s yahoo_db_warmup=%s sqlite_memory=%s cache=%s mmap=%s",
             os.environ.get("RANKING_ENTRY_WATCHDOG_ENABLED"),
             os.environ.get("RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC"),
             os.environ.get("RANKING_ENTRY_HARD_TIMEOUT_SEC"),
@@ -207,6 +213,9 @@ def _install_runtime_defaults() -> None:
             os.environ.get("LOW_MOVE_RANKING_MAX_ENTRY_PRICE"),
             os.environ.get("TONOSAMA_RAW1_RESAMPLE_FALLBACK"),
             os.environ.get("YAHOO_COMPLEMENT_DB_WARMUP_ENABLED"),
+            os.environ.get("SQLITE_MEMORY_PRAGMAS_ENABLED"),
+            os.environ.get("SQLITE_MEMORY_CACHE_KB"),
+            os.environ.get("SQLITE_MMAP_SIZE_BYTES"),
         )
     except Exception:
         _write_boot_evidence("RUNTIME_DEFAULTS_EXCEPTION", traceback.format_exc())
@@ -228,6 +237,7 @@ def _install_summary_mtf_catchup_safely() -> None:
 
 
 SYNC_MAIN_PATCHES = [
+    ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
     ("core.startup.ranking_entry_market_hours_skip_patch", "RANKING_ENTRY_WATCHDOG", "DISABLE_RANKING_ENTRY_WATCHDOG_PATCH"),
     ("core.startup.ranking_entry_snapshot_technical_alias_patch", "RANKING_SNAPSHOT_TECH_ALIAS", "DISABLE_RANKING_SNAPSHOT_TECH_ALIAS_PATCH"),
     ("core.startup.entry_log_skip_reason_collision_patch", "ENTRY_LOG_SKIP_GUARD", "DISABLE_ENTRY_LOG_SKIP_GUARD"),
