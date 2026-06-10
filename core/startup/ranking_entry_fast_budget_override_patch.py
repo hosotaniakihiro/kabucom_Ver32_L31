@@ -54,9 +54,11 @@ def _force_light_budget() -> None:
     os.environ['RANKING_ENTRY_FAST_MAX_SYMBOLS'] = '12'
     os.environ['RANKING_ENTRY_FAST_MAX_PER_SIDE'] = '8'
     os.environ['RANKING_ENTRY_FAST_MAX_PER_TYPE'] = '6'
-    os.environ['RANKING_ENTRY_RUNTIME_BUDGET_SEC'] = '12'
-    os.environ['RANKING_ENTRY_RUNTIME_WARN_SEC'] = '12'
-    os.environ['RANKING_ENTRY_RUNTIME_STALE_SEC'] = '18'
+    os.environ['RANKING_ENTRY_RUNTIME_BUDGET_SEC'] = '15'
+    os.environ['RANKING_ENTRY_RUNTIME_WARN_SEC'] = '15'
+    os.environ['RANKING_ENTRY_RUNTIME_STALE_SEC'] = '20'
+    os.environ['RANKING_ENTRY_BUILD_TIMEOUT_SEC'] = '18'
+    os.environ['RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'] = '12'
     os.environ['RANKING_ENTRY_MAX_PENDING_PER_RUN'] = '3'
     os.environ['RANKING_ENTRY_FAST_MAX_PENDING_PER_RUN'] = '3'
     os.environ['RANKING_ENTRY_SKIP_TECH_SAVE'] = '1'
@@ -67,25 +69,25 @@ def _force_light_budget() -> None:
 
 
 def _apply_once() -> bool:
-    raw_runtime = _float_env('RANKING_ENTRY_FAST_RUNTIME_BUDGET_SEC', 25.0)
-    raw_build = _float_env('RANKING_ENTRY_FAST_BUILD_TIMEOUT_SEC', 30.0)
-    raw_controller = _float_env('RANKING_ENTRY_FAST_CONTROLLER_TIMEOUT_SEC', 30.0)
-    runtime = 25.0 if raw_runtime < 25.0 else min(float(raw_runtime), 25.0)
-    build = 30.0 if raw_build < 30.0 else min(float(raw_build), 30.0)
-    controller = 30.0 if raw_controller < 30.0 else min(float(raw_controller), 30.0)
+    raw_runtime = _float_env('RANKING_ENTRY_FAST_RUNTIME_BUDGET_SEC', 15.0)
+    raw_build = _float_env('RANKING_ENTRY_FAST_BUILD_TIMEOUT_SEC', 18.0)
+    raw_controller = _float_env('RANKING_ENTRY_FAST_CONTROLLER_TIMEOUT_SEC', 12.0)
+    runtime = max(5.0, min(float(raw_runtime), 15.0))
+    build = max(6.0, min(float(raw_build), 18.0))
+    controller = max(5.0, min(float(raw_controller), 12.0))
     lock_wait = max(1.0, min(_float_env('SUMMARY_AI_ENTRY_CONTROLLER_LOCK_WAIT_SEC', 8.0), 10.0))
     os.environ['RANKING_ENTRY_FAST_RUNTIME_BUDGET_SEC'] = str(runtime)
     os.environ['RANKING_ENTRY_FAST_BUILD_TIMEOUT_SEC'] = str(build)
     os.environ['RANKING_ENTRY_FAST_CONTROLLER_TIMEOUT_SEC'] = str(controller)
     os.environ['RANKING_ENTRY_RUNTIME_BUDGET_SEC'] = str(runtime)
     os.environ['RANKING_ENTRY_RUNTIME_WARN_SEC'] = str(runtime)
-    os.environ['RANKING_ENTRY_RUNTIME_STALE_SEC'] = '35.0'
+    os.environ['RANKING_ENTRY_RUNTIME_STALE_SEC'] = '20.0'
     os.environ['RANKING_ENTRY_BUILD_TIMEOUT_SEC'] = str(build)
     os.environ['RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'] = str(controller)
-    os.environ['RANKING_ENTRY_FAST_MAX_PENDING_PER_RUN'] = '4'
-    os.environ['RANKING_ENTRY_MAX_PENDING_PER_RUN'] = '4'
-    os.environ['RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS'] = '24'
-    os.environ['RANKING_ENTRY_FAST_MAX_SYMBOLS'] = '24'
+    os.environ['RANKING_ENTRY_FAST_MAX_PENDING_PER_RUN'] = '3'
+    os.environ['RANKING_ENTRY_MAX_PENDING_PER_RUN'] = '3'
+    os.environ['RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS'] = '12'
+    os.environ['RANKING_ENTRY_FAST_MAX_SYMBOLS'] = '12'
     os.environ['RANKING_ENTRY_ULTRA_MAX_SOURCE_ROWS'] = '300'
     os.environ['SUMMARY_AI_ENTRY_CONTROLLER_LOCK_WAIT_SEC'] = str(lock_wait)
     os.environ.setdefault('SUMMARY_AI_ENTRY_CONTROLLER_LOCK_POLL_SEC', '0.25')
@@ -112,7 +114,7 @@ def _watch_loop() -> None:
     for i in range(loops):
         ok = _apply_once()
         if i in (0, loops - 1):
-            logger.warning('[RANKING ENTRY FAST BUDGET OVERRIDE] enforce v14 i=%s/%s ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s rows=%s light=%s', i, loops, ok, os.environ.get('RANKING_ENTRY_RUNTIME_BUDGET_SEC'), os.environ.get('RANKING_ENTRY_BUILD_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_MAX_PENDING_PER_RUN'), os.environ.get('RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS'), _LIGHT_INSTALLED)
+            logger.warning('[RANKING ENTRY FAST BUDGET OVERRIDE] enforce v15 i=%s/%s ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s rows=%s light=%s', i, loops, ok, os.environ.get('RANKING_ENTRY_RUNTIME_BUDGET_SEC'), os.environ.get('RANKING_ENTRY_BUILD_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_MAX_PENDING_PER_RUN'), os.environ.get('RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS'), _LIGHT_INSTALLED)
         time.sleep(sleep_sec)
 
 
@@ -123,7 +125,7 @@ def install() -> bool:
     ok = _apply_once()
     threading.Thread(target=_watch_loop, name='ranking-entry-fast-budget-override', daemon=True).start()
     _INSTALLED = True
-    logger.warning('[RANKING ENTRY FAST BUDGET OVERRIDE] installed v14 ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s rows=%s light=%s watcher=True', ok, os.environ.get('RANKING_ENTRY_RUNTIME_BUDGET_SEC'), os.environ.get('RANKING_ENTRY_BUILD_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_MAX_PENDING_PER_RUN'), os.environ.get('RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS'), _LIGHT_INSTALLED)
+    logger.warning('[RANKING ENTRY FAST BUDGET OVERRIDE] installed v15 ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s rows=%s light=%s watcher=True', ok, os.environ.get('RANKING_ENTRY_RUNTIME_BUDGET_SEC'), os.environ.get('RANKING_ENTRY_BUILD_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_MAX_PENDING_PER_RUN'), os.environ.get('RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS'), _LIGHT_INSTALLED)
     return True
 
 
