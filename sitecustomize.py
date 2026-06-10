@@ -1,6 +1,6 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver38-RANKING-SNAPSHOT-TECH-ALIAS
+# Version: Ver39-YAHOO-DB-WARMUP-RANKING-HARD-TIMEOUT
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # main.py は軽量同期 + background install。
@@ -122,6 +122,8 @@ def _install_runtime_defaults() -> None:
         defaults = {
             "RANKING_ENTRY_WATCHDOG_ENABLED": "1",
             "RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC": "55",
+            "RANKING_ENTRY_HARD_TIMEOUT_ENABLED": "1",
+            "RANKING_ENTRY_HARD_TIMEOUT_SEC": "28",
             "RANKING_ENTRY_SNAPSHOT_TECH_ALIAS_ENABLED": "1",
             "RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED": "1",
             "RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH_ENABLED": "1",
@@ -185,6 +187,9 @@ def _install_runtime_defaults() -> None:
             "FINAL_ENTRY_TONOSAMA_LIQUIDITY_FALLBACK": "1",
             "FINAL_ENTRY_TONOSAMA_MIN_VOLUME": "10000",
             "FINAL_ENTRY_TONOSAMA_MIN_TURNOVER": "3000000",
+            "YAHOO_COMPLEMENT_DB_WARMUP_ENABLED": "1",
+            "YAHOO_COMPLEMENT_DB_WARMUP_MIN_BARS": "75",
+            "YAHOO_COMPLEMENT_DB_WARMUP_LOOKBACK_DAYS": "7",
             "SUMMARY_DB_DATE_GUARD_ENABLED": "1",
             "SUMMARY_DB_DATE_GUARD_CLEANUP_ENABLED": "0",
         }
@@ -193,13 +198,15 @@ def _install_runtime_defaults() -> None:
         os.environ["ENTRY_SHORT_MTF_REQUIRE_ALL"] = "0"
         _write_boot_evidence("RUNTIME_DEFAULTS_SET", {"ranking_snapshot_alias": os.environ.get("RANKING_ENTRY_SNAPSHOT_TECH_ALIAS_ENABLED")})
         logger.warning(
-            "[SITECUSTOMIZE] defaults lite ranking_watchdog=%s timeout=%s snapshot_tech_alias=%s ranking_price=%s-%s tonosama_raw1_resample=%s",
+            "[SITECUSTOMIZE] defaults lite ranking_watchdog=%s timeout=%s hard_timeout=%s snapshot_tech_alias=%s ranking_price=%s-%s tonosama_raw1_resample=%s yahoo_db_warmup=%s",
             os.environ.get("RANKING_ENTRY_WATCHDOG_ENABLED"),
             os.environ.get("RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC"),
+            os.environ.get("RANKING_ENTRY_HARD_TIMEOUT_SEC"),
             os.environ.get("RANKING_ENTRY_SNAPSHOT_TECH_ALIAS_ENABLED"),
             os.environ.get("LOW_MOVE_RANKING_MIN_ENTRY_PRICE"),
             os.environ.get("LOW_MOVE_RANKING_MAX_ENTRY_PRICE"),
             os.environ.get("TONOSAMA_RAW1_RESAMPLE_FALLBACK"),
+            os.environ.get("YAHOO_COMPLEMENT_DB_WARMUP_ENABLED"),
         )
     except Exception:
         _write_boot_evidence("RUNTIME_DEFAULTS_EXCEPTION", traceback.format_exc())
@@ -238,6 +245,8 @@ BACKGROUND_MAIN_PATCHES = [
     ("core.startup.ranking_entry_high_low_from_snapshot_patch", "RANKING_ENTRY_HIGH_LOW_SNAPSHOT", "DISABLE_RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH"),
     ("core.startup.ranking_entry_final_rescue_patch", "RANKING_FINAL_RESCUE", "DISABLE_RANKING_FINAL_RESCUE_PATCH"),
     ("core.startup.ranking_stuck_pending_prune_patch", "RANKING_STUCK_PENDING_PRUNE", "DISABLE_RANKING_STUCK_PENDING_PRUNE_PATCH"),
+    ("core.startup.ranking_entry_hard_timeout_patch", "RANKING_ENTRY_HARD_TIMEOUT", "DISABLE_RANKING_ENTRY_HARD_TIMEOUT_PATCH"),
+    ("core.startup.yahoo_complement_db_warmup_patch", "YAHOO_COMPLEMENT_DB_WARMUP", "DISABLE_YAHOO_COMPLEMENT_DB_WARMUP_PATCH"),
     ("core.startup.entry_direction_recursion_failopen_patch", "ENTRY_DIRECTION_RECURSION_FAILOPEN", "DISABLE_ENTRY_DIRECTION_RECURSION_FAILOPEN_PATCH"),
     ("core.startup.entry_mtf_short_required_daily_optional_patch", "SHORT_MTF_2OF3_GUARD", "DISABLE_SHORT_MTF_2OF3_GUARD_PATCH"),
     ("core.startup.entry_controller_tonosama_ai_bridge_patch", "TONOSAMA_AI_BRIDGE", "DISABLE_TONOSAMA_AI_BRIDGE_PATCH"),
