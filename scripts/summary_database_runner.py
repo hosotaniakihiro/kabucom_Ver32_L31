@@ -1,11 +1,11 @@
 # ============================================================
 # File   : scripts/summary_database_runner.py
-# Version: SUMMARY-DATABASE-RUNNER-V6-FLUSH-SUMMARY-SAVE-SPOOL
+# Version: SUMMARY-DATABASE-RUNNER-V7-CPU-THROTTLE-SPOOL-INTERVAL
 # ------------------------------------------------------------
 # Purpose:
 #   - main_database.py 側で定時サマリー計算・DB保存を担当する子プロセス
 #   - DB保存 owner は database 側へ寄せる
-#   - main.py側でDBロック時にスプールしたsummary行を毎分flushする
+#   - CPU高止まり対策として、表示OFF/3m5m境界実行/spool flush間引き/slow tick skipを入れる
 # ============================================================
 
 from __future__ import annotations
@@ -37,17 +37,30 @@ def _install_database_summary_env() -> None:
     os.environ["AUTOSTOCK_SUMMARY_SAVE_OWNER"] = "database"
     os.environ["AUTOSTOCK_SUMMARY_SAVE_MODE"] = "save"
 
-    os.environ.setdefault("SUMMARY_DATABASE_RUNNER_DISPLAY", "1")
-    os.environ.setdefault("SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY", "1")
+    # main_database.py は保存専用寄せ。表示/通知は main.py 側に寄せる。
+    os.environ.setdefault("SUMMARY_DATABASE_RUNNER_DISPLAY", "0")
+    os.environ.setdefault("SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY", "0")
     os.environ.setdefault("SUMMARY_SAVE_SPOOL_FLUSH", "1")
+
+    # CPU高止まり対策: 1m/3m/5mを毎分すべて回さない。
+    # 1mは毎分、3m/5mは時間境界だけにする。
+    os.environ.setdefault("SUMMARY_PUSH_DISPLAY_ALL_INTERVALS", "0")
+
+    # spool flushを毎tick前後に無条件実行しない。
+    os.environ.setdefault("SUMMARY_SAVE_SPOOL_FLUSH_MIN_INTERVAL_SEC", "120")
+    os.environ.setdefault("SUMMARY_SAVE_SPOOL_FLUSH_MAX_FILES", "10")
+
+    # 1回のtickが重い場合、次tickを1回休ませてCPUを戻す。
+    os.environ.setdefault("SUMMARY_DATABASE_SLOW_TICK_SEC", "45")
+    os.environ.setdefault("SUMMARY_DATABASE_SKIP_NEXT_ON_SLOW_TICK", "1")
 
     os.environ["SUMMARY_SKIP_DB_SAVE_IN_MAIN"] = "0"
     os.environ["SUMMARY_MAIN_ENTRY_ONLY"] = "0"
     os.environ["SUMMARY_DB_WRITER_ROLE"] = "database"
 
     os.environ.setdefault("ENABLE_SUMMARY_ENTRY_TICK", "0")
-    os.environ.setdefault("PUSH_INCREMENTAL_MA75_SUMMARY_LOOKBACK_DAYS", "3")
-    os.environ.setdefault("PUSH_INCREMENTAL_MA75_TAIL_ROWS", "120")
+    os.environ.setdefault("PUSH_INCREMENTAL_MA75_SUMMARY_LOOKBACK_DAYS", "1")
+    os.environ.setdefault("PUSH_INCREMENTAL_MA75_TAIL_ROWS", "90")
 
 
 _install_database_summary_env()
@@ -63,6 +76,7 @@ from scheduler_jobs.summary.time_locked_runner import run_time_locked_summary_jo
 
 
 _STOP = False
+_LAST_SPOOL_FLUSH_TS = 0.0
 
 
 def _env_true(name: str, default: bool = False) -> bool:
@@ -75,6 +89,20 @@ def _env_true(name: str, default: bool = False) -> bool:
     except Exception:
         pass
     return bool(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(str(os.getenv(name, str(default))).strip())
+    except Exception:
+        return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(float(str(os.getenv(name, str(default))).strip()))
+    except Exception:
+        return int(default)
 
 
 def _handle_signal(signum, frame) -> None:
@@ -99,6 +127,9 @@ def _sleep_until_next_minute(logger: logging.Logger) -> None:
 
 
 def _warmup_multiday_ma75_cache(logger: logging.Logger) -> Any:
+    if not _env_true("SUMMARY_DATABASE_MA75_WARMUP", default=True):
+        logger.warning("[SUMMARY DB RUNNER] multiday MA75 warmup skipped by SUMMARY_DATABASE_MA75_WARMUP=0")
+        return None
     try:
         logger.info("[SUMMARY DB RUNNER] multiday MA75 warmup start")
 
@@ -128,14 +159,24 @@ def _warmup_multiday_ma75_cache(logger: logging.Logger) -> Any:
         return None
 
 
-def _flush_summary_save_spool(logger: logging.Logger, *, reason: str) -> dict:
+def _flush_summary_save_spool(logger: logging.Logger, *, reason: str, force: bool = False) -> dict:
+    global _LAST_SPOOL_FLUSH_TS
+
     if not _env_true("SUMMARY_SAVE_SPOOL_FLUSH", default=True):
         return {"disabled": True}
+
+    now_ts = time.monotonic()
+    min_interval = max(0.0, _env_float("SUMMARY_SAVE_SPOOL_FLUSH_MIN_INTERVAL_SEC", 120.0))
+    if not force and _LAST_SPOOL_FLUSH_TS and now_ts - _LAST_SPOOL_FLUSH_TS < min_interval:
+        return {"skipped": True, "reason": "min_interval", "age_sec": round(now_ts - _LAST_SPOOL_FLUSH_TS, 3)}
+
     try:
+        max_files = max(1, _env_int("SUMMARY_SAVE_SPOOL_FLUSH_MAX_FILES", 10))
         from trading.summary.persistence.summary_save_spool import flush_summary_spool
-        result = flush_summary_spool(max_files=50)
+        result = flush_summary_spool(max_files=max_files)
+        _LAST_SPOOL_FLUSH_TS = now_ts
         if result.get("files", 0):
-            logger.warning("[SUMMARY DB RUNNER] spool flush reason=%s result=%s", reason, result)
+            logger.warning("[SUMMARY DB RUNNER] spool flush reason=%s max_files=%s result=%s", reason, max_files, result)
         return result
     except Exception:
         logger.exception("[SUMMARY DB RUNNER] spool flush failed reason=%s", reason)
@@ -166,7 +207,8 @@ def main() -> int:
     logger.info("[SUMMARY DB RUNNER] AUTOSTOCK_SUMMARY_SAVE_OWNER=%s", os.getenv("AUTOSTOCK_SUMMARY_SAVE_OWNER"))
     logger.info("[SUMMARY DB RUNNER] AUTOSTOCK_SUMMARY_SAVE_MODE=%s", os.getenv("AUTOSTOCK_SUMMARY_SAVE_MODE"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_DATABASE_RUNNER_DISPLAY=%s", os.getenv("SUMMARY_DATABASE_RUNNER_DISPLAY"))
-    logger.info("[SUMMARY DB RUNNER] SUMMARY_SAVE_SPOOL_FLUSH=%s", os.getenv("SUMMARY_SAVE_SPOOL_FLUSH"))
+    logger.info("[SUMMARY DB RUNNER] SUMMARY_PUSH_DISPLAY_ALL_INTERVALS=%s", os.getenv("SUMMARY_PUSH_DISPLAY_ALL_INTERVALS"))
+    logger.info("[SUMMARY DB RUNNER] SUMMARY_SAVE_SPOOL_FLUSH=%s min_interval=%s max_files=%s", os.getenv("SUMMARY_SAVE_SPOOL_FLUSH"), os.getenv("SUMMARY_SAVE_SPOOL_FLUSH_MIN_INTERVAL_SEC"), os.getenv("SUMMARY_SAVE_SPOOL_FLUSH_MAX_FILES"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY=%s patch_ok=%s", os.getenv("SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY"), patch_ok)
     logger.info("[SUMMARY DB RUNNER] SUMMARY_SKIP_DB_SAVE_IN_MAIN=%s", os.getenv("SUMMARY_SKIP_DB_SAVE_IN_MAIN"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_MAIN_ENTRY_ONLY=%s", os.getenv("SUMMARY_MAIN_ENTRY_ONLY"))
@@ -174,12 +216,14 @@ def main() -> int:
     logger.info("[SUMMARY DB RUNNER] ENABLE_RANKING_SUMMARY_TICK=%s", os.getenv("ENABLE_RANKING_SUMMARY_TICK"))
     logger.info("[SUMMARY DB RUNNER] PUSH_INCREMENTAL_MA75_SUMMARY_LOOKBACK_DAYS=%s", os.getenv("PUSH_INCREMENTAL_MA75_SUMMARY_LOOKBACK_DAYS"))
     logger.info("[SUMMARY DB RUNNER] PUSH_INCREMENTAL_MA75_TAIL_ROWS=%s", os.getenv("PUSH_INCREMENTAL_MA75_TAIL_ROWS"))
+    logger.info("[SUMMARY DB RUNNER] slow_tick_sec=%s skip_next_on_slow=%s", os.getenv("SUMMARY_DATABASE_SLOW_TICK_SEC"), os.getenv("SUMMARY_DATABASE_SKIP_NEXT_ON_SLOW_TICK"))
     logger.info("=" * 80)
 
     _warmup_multiday_ma75_cache(logger)
-    _flush_summary_save_spool(logger, reason="startup")
+    _flush_summary_save_spool(logger, reason="startup", force=True)
 
     last_run_minute: dt.datetime | None = None
+    skip_next_tick = False
 
     while not _STOP:
         now = _floor_minute()
@@ -190,13 +234,19 @@ def main() -> int:
 
         last_run_minute = now
 
+        if skip_next_tick:
+            skip_next_tick = False
+            logger.warning("[SUMMARY DB RUNNER] tick skipped once after slow previous tick now=%s", now)
+            _sleep_until_next_minute(logger)
+            continue
+
         try:
             _install_database_summary_env()
             ranking_enabled = _env_true("ENABLE_RANKING_SUMMARY_TICK", default=False)
-            display_enabled = _env_true("SUMMARY_DATABASE_RUNNER_DISPLAY", default=True)
+            display_enabled = _env_true("SUMMARY_DATABASE_RUNNER_DISPLAY", default=False)
 
             logger.info(
-                "[SUMMARY DB RUNNER] tick start now=%s run_push=True run_ranking=%s display=%s run_entry=False save_owner=%s save_mode=%s skip_main=%s role=%s empty_notify=%s spool_flush=%s",
+                "[SUMMARY DB RUNNER] tick start now=%s run_push=True run_ranking=%s display=%s run_entry=False save_owner=%s save_mode=%s skip_main=%s role=%s empty_notify=%s spool_flush=%s push_all_intervals=%s",
                 now,
                 ranking_enabled,
                 display_enabled,
@@ -206,6 +256,7 @@ def main() -> int:
                 os.getenv("SUMMARY_DB_WRITER_ROLE"),
                 os.getenv("SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY"),
                 os.getenv("SUMMARY_SAVE_SPOOL_FLUSH"),
+                os.getenv("SUMMARY_PUSH_DISPLAY_ALL_INTERVALS"),
             )
 
             _flush_summary_save_spool(logger, reason="before_tick")
@@ -222,6 +273,16 @@ def main() -> int:
 
             _flush_summary_save_spool(logger, reason="after_tick")
 
+            elapsed = time.perf_counter() - t0
+            slow_tick_sec = max(1.0, _env_float("SUMMARY_DATABASE_SLOW_TICK_SEC", 45.0))
+            if elapsed >= slow_tick_sec and _env_true("SUMMARY_DATABASE_SKIP_NEXT_ON_SLOW_TICK", default=True):
+                skip_next_tick = True
+                logger.warning(
+                    "[SUMMARY DB RUNNER] slow tick detected elapsed=%.3fs threshold=%.3fs -> skip next tick once",
+                    elapsed,
+                    slow_tick_sec,
+                )
+
             push_rows = {
                 int(k): len(v) if hasattr(v, "__len__") else 0
                 for k, v in (result.get("push", {}) or {}).items()
@@ -235,7 +296,7 @@ def main() -> int:
             logger.info(
                 "[SUMMARY DB RUNNER] tick done now=%s elapsed=%.3fs push_rows=%s ranking_rows=%s display=%s",
                 now,
-                time.perf_counter() - t0,
+                elapsed,
                 push_rows,
                 ranking_rows,
                 display_enabled,
