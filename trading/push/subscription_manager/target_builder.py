@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/subscription_manager/target_builder.py
-# Version: V1.1-PUSH-SUBSCRIPTION-TARGET-BUILDER-ROTATION-FASTPATH
+# Version: V1.2-RUNTIME-FALLBACK-WHEN-RANKING-EMPTY
 # ------------------------------------------------------------
 # Purpose:
 #   - ranking_selector で最大100銘柄候補を作る
@@ -14,6 +14,12 @@
 #     そのまま登録対象にする fast path を追加。
 #   - これにより、50銘柄register直前に ranking DB / filters を毎回再計算して
 #     60秒timeoutになる問題を避ける。
+#
+# Fix V1.2:
+#   - ranking DB が空/未使用状態でも、runtime.monitor_symbols / push_symbols 等の
+#     直近100銘柄を fallback として使う。
+#   - on_open / reconnect 直後に ranking_selector empty -> target=0 となり、
+#     登録済み銘柄を全解除する事故を防ぐ。
 # ============================================================
 
 from __future__ import annotations
@@ -28,6 +34,7 @@ from .filters import (
     filter_by_symbol_flags_targets,
 )
 from .global_store import save_symbol_lists_to_global_data
+from .globals_access import safe_get_global_data, safe_getattr
 from .priority_symbols import (
     collect_open_position_symbols,
     collect_priority_push_symbols,
@@ -70,6 +77,61 @@ def _merge_priority_symbols(
         merged = merged[: int(max_symbols)]
 
     return merged
+
+
+def _runtime_symbol_attr_names() -> tuple[str, ...]:
+    return (
+        # active_symbol_manager / push_stream runtime seed 系
+        "runtime_monitor_symbols",
+        "monitor_symbols",
+        "push_register_symbols",
+        "register_symbols",
+        "active_symbols",
+        "active_push_symbols",
+        # subscription/global_store 系
+        "push_symbols",
+        "subscription_targets",
+        "ats_register_targets",
+        "ats_targets",
+        "should_register_symbols",
+        "filtered_candidate_symbols",
+        "buy_candidate_symbols",
+    )
+
+
+def _collect_runtime_symbols(max_symbols: int = REGISTER_MAX_SYMBOLS) -> list[str]:
+    """
+    ranking DB が空の瞬間でも、直近に構築済みの100銘柄を再利用する。
+
+    ログ例:
+      [PUSH RUNTIME] seeded push/register symbols ... count=100
+    のように runtime 側には候補が残っていることがあるため、on_open / reconnect の
+    fallback としてここを優先する。
+    """
+    gd = safe_get_global_data()
+    if gd is None:
+        return []
+
+    for name in _runtime_symbol_attr_names():
+        try:
+            raw = safe_getattr(gd, name, None)
+            symbols = collect_symbols_from_explicit(raw)
+            symbols = dedupe_keep_order(normalize_symbols(symbols))
+            if symbols:
+                if max_symbols and max_symbols > 0:
+                    symbols = symbols[: int(max_symbols)]
+                logger.info(
+                    "[SUB MANAGER TARGET] runtime fallback selected attr=%s count=%d head=%s",
+                    name,
+                    len(symbols),
+                    symbols[:30],
+                )
+                return symbols
+        except Exception:
+            logger.debug("[SUB MANAGER TARGET] runtime fallback attr failed name=%s", name, exc_info=True)
+            continue
+
+    return []
 
 
 def load_selected_ranking_symbols(max_symbols: int = REGISTER_MAX_SYMBOLS) -> list[str]:
@@ -156,6 +218,8 @@ def build_target_symbols(
         )
         return selected_push_symbols
 
+    runtime_symbols = _collect_runtime_symbols(max_symbols=max_symbols)
+
     ranking_symbols = load_selected_ranking_symbols(max_symbols=max_symbols)
     ranking_symbols = apply_common_stock_filter(
         ranking_symbols,
@@ -186,12 +250,26 @@ def build_target_symbols(
         raw_symbols = dedupe_keep_order(list(priority_filtered) + list(ranking_symbols))
         source_name = "priority_plus_selected_ranking"
     else:
-        fallback = dedupe_keep_order(list(priority_filtered) + list(explicit))
+        fallback = dedupe_keep_order(list(priority_filtered) + list(explicit) + list(runtime_symbols))
         raw_symbols = apply_common_stock_filter(fallback, db_path=SYMBOL_FLAGS_DB_PATH)
         raw_symbols = apply_freshness_filter(raw_symbols)
         if priority_filtered:
             raw_symbols = dedupe_keep_order(list(priority_filtered) + list(raw_symbols))
-        source_name = "priority_plus_fallback_explicit"
+        if not raw_symbols and runtime_symbols:
+            # reconnect直後はfreshness/summary側が未復元のことがある。
+            # runtime側は直近ACTIVE/PUSHで作った候補なので、ここでは最後の砦として採用する。
+            raw_symbols = list(runtime_symbols)
+            source_name = "priority_plus_runtime_fallback_unfiltered"
+            logger.warning(
+                "[SUB MANAGER TARGET] runtime fallback used without filters reason=%s count=%d head=%s",
+                reason,
+                len(raw_symbols),
+                raw_symbols[:30],
+            )
+        elif runtime_symbols:
+            source_name = "priority_plus_fallback_explicit_runtime"
+        else:
+            source_name = "priority_plus_fallback_explicit"
 
     raw_symbols = dedupe_keep_order(normalize_symbols(raw_symbols))
 
@@ -202,6 +280,16 @@ def build_target_symbols(
 
     buy_symbols = dedupe_keep_order(normalize_symbols(buy_symbols))
     sell_symbols = dedupe_keep_order(normalize_symbols(sell_symbols))
+
+    if not buy_symbols and runtime_symbols and not ranking_symbols:
+        # symbol_flags が一時的に読めない場合でも reconnect でtarget=0にしない。
+        buy_symbols = dedupe_keep_order(normalize_symbols(runtime_symbols))
+        logger.warning(
+            "[SUB MANAGER TARGET] buy_symbols empty -> runtime fallback promoted reason=%s count=%d head=%s",
+            reason,
+            len(buy_symbols),
+            buy_symbols[:30],
+        )
 
     push_symbols_all = _merge_priority_symbols(
         priority_filtered,
@@ -261,6 +349,11 @@ def build_target_symbols(
     )
 
     logger.info("[SUB MANAGER TARGET] source=%s reason=%s", source_name, reason)
+    logger.info(
+        "[SUB MANAGER TARGET] runtime fallback count=%d symbols=%s",
+        len(runtime_symbols),
+        runtime_symbols[:50],
+    )
     logger.info(
         "[SUB MANAGER TARGET] priority count=%d symbols=%s",
         len(priority_filtered),
