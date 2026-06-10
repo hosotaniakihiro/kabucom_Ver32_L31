@@ -14,6 +14,7 @@ _RUN_LOCK = threading.Lock()
 _RUN_STARTED_AT = 0.0
 _RUN_SEQ = 0
 _SUMMARY_FALLBACK_PATCHED = False
+_MIN_PENDING_PATCHED = False
 
 
 def _env_int(name: str, default: int) -> int:
@@ -43,32 +44,40 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 
 
-def _cap_env_float(name: str, hard_cap: float, default: float) -> float:
+def _cap_env_float(name: str, hard_cap: float, default: float, *, floor: float = 1.0) -> float:
     cur = _env_float(name, default)
-    val = max(1.0, min(float(cur), float(hard_cap)))
+    val = max(float(floor), min(float(cur), float(hard_cap)))
     os.environ[name] = str(val)
     return val
 
 
-def _cap_env_int(name: str, hard_cap: int, default: int) -> int:
+def _cap_env_int(name: str, hard_cap: int, default: int, *, floor: int = 1) -> int:
     cur = _env_int(name, default)
-    val = max(1, min(int(cur), int(hard_cap)))
+    val = max(int(floor), min(int(cur), int(hard_cap)))
     os.environ[name] = str(val)
     return val
 
 
 def _force_ranking_runtime_caps() -> dict[str, Any]:
-    """実入口側でも重い ranking_entry を短い予算に丸める。"""
+    """Keep ranking_entry bounded without overriding fast-budget rescue too tightly.
+
+    V6 forced runtime/build/controller to 15/18/12s. That was too short: logs showed
+    candidates were found but pending_add was skipped by timeout, leaving created=0.
+    V7 aligns the cap with ranking_entry_fast_budget_override defaults: 25/30/30s.
+    """
+    runtime_default = _env_float("RANKING_ENTRY_FAST_RUNTIME_BUDGET_SEC", 25.0)
+    build_default = _env_float("RANKING_ENTRY_FAST_BUILD_TIMEOUT_SEC", 30.0)
+    controller_default = _env_float("RANKING_ENTRY_FAST_CONTROLLER_TIMEOUT_SEC", 30.0)
     caps = {
-        "runtime_budget": _cap_env_float("RANKING_ENTRY_RUNTIME_BUDGET_SEC", 15.0, 15.0),
-        "runtime_warn": _cap_env_float("RANKING_ENTRY_RUNTIME_WARN_SEC", 15.0, 15.0),
-        "runtime_stale": _cap_env_float("RANKING_ENTRY_RUNTIME_STALE_SEC", 20.0, 20.0),
-        "build_timeout": _cap_env_float("RANKING_ENTRY_BUILD_TIMEOUT_SEC", 18.0, 18.0),
-        "controller_timeout": _cap_env_float("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", 12.0, 12.0),
-        "max_pending": _cap_env_int("RANKING_ENTRY_MAX_PENDING_PER_RUN", 3, 3),
-        "prefilter_rows": _cap_env_int("RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS", 24, 24),
-        "max_symbols": _cap_env_int("RANKING_ENTRY_FAST_MAX_SYMBOLS", 24, 24),
-        "source_rows": _cap_env_int("RANKING_ENTRY_ULTRA_MAX_SOURCE_ROWS", 300, 300),
+        "runtime_budget": _cap_env_float("RANKING_ENTRY_RUNTIME_BUDGET_SEC", 25.0, runtime_default, floor=15.0),
+        "runtime_warn": _cap_env_float("RANKING_ENTRY_RUNTIME_WARN_SEC", 25.0, runtime_default, floor=15.0),
+        "runtime_stale": _cap_env_float("RANKING_ENTRY_RUNTIME_STALE_SEC", 35.0, 35.0, floor=20.0),
+        "build_timeout": _cap_env_float("RANKING_ENTRY_BUILD_TIMEOUT_SEC", 30.0, build_default, floor=18.0),
+        "controller_timeout": _cap_env_float("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", 30.0, controller_default, floor=12.0),
+        "max_pending": _cap_env_int("RANKING_ENTRY_MAX_PENDING_PER_RUN", 4, 4, floor=3),
+        "prefilter_rows": _cap_env_int("RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS", 32, 24, floor=12),
+        "max_symbols": _cap_env_int("RANKING_ENTRY_FAST_MAX_SYMBOLS", 32, 24, floor=12),
+        "source_rows": _cap_env_int("RANKING_ENTRY_ULTRA_MAX_SOURCE_ROWS", 300, 300, floor=120),
     }
     return caps
 
@@ -140,6 +149,20 @@ def _pending_count() -> int:
     return total
 
 
+def _install_min_pending_patch() -> bool:
+    """Ensure candidate>=1 is not lost just before pending_add timeout."""
+    global _MIN_PENDING_PATCHED
+    try:
+        from core.startup import ranking_entry_min_pending_on_timeout_patch as mp
+        ok = bool(mp.install())
+        _MIN_PENDING_PATCHED = ok
+        logger.warning("[RANKING STUCK PENDING] min pending timeout rescue installed=%s", ok)
+        return ok
+    except Exception:
+        logger.exception("[RANKING STUCK PENDING] min pending timeout rescue install failed")
+        return False
+
+
 def _mark_and_prune_stuck_ranking_pending(reason: str = "RANKING_STUCK_PENDING_RETRY_OR_AGE") -> int:
     max_retry = max(1, _env_int("RANKING_STUCK_PENDING_MAX_CONTROLLER_RETRY", 3))
     min_age_sec = max(5.0, _env_float("RANKING_STUCK_PENDING_MIN_AGE_SEC", 30.0))
@@ -178,7 +201,6 @@ def _mark_and_prune_stuck_ranking_pending(reason: str = "RANKING_STUCK_PENDING_R
             retry = int(float(entry.get("_ranking_controller_retry_count") or 0))
             first = float(entry.get("_ranking_pending_first_seen_ts") or now)
             age = now - first
-
             if age < min_age_sec:
                 return False
             if age >= max_age_sec:
@@ -208,7 +230,7 @@ def _clear_runtime_overlap_if_stale() -> bool:
     global _RUN_STARTED_AT
     if not _RUN_LOCK.locked():
         return False
-    stale_sec = max(10.0, _env_float("RANKING_ENTRY_RUNTIME_STALE_SEC", 20.0))
+    stale_sec = max(20.0, _env_float("RANKING_ENTRY_RUNTIME_STALE_SEC", 35.0))
     age = time.time() - float(_RUN_STARTED_AT or 0.0)
     if age < stale_sec:
         return False
@@ -287,13 +309,14 @@ def _patch_summary_fallback_loader() -> bool:
 
 def _patch_once() -> bool:
     try:
+        _install_min_pending_patch()
         _force_ranking_runtime_caps()
         _patch_summary_fallback_loader()
         import trading.entry_exit.tasks as tasks
         cur = getattr(tasks, "_run_ranking_entry_safe", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_ranking_stuck_pending_prune_v6", False):
+        if getattr(cur, "_ranking_stuck_pending_prune_v7", False):
             return True
         orig = getattr(cur, "_original", cur)
 
@@ -316,7 +339,7 @@ def _patch_once() -> bool:
             _RUN_SEQ += 1
             seq = _RUN_SEQ
             _RUN_STARTED_AT = time.time()
-            join_sec = max(5.0, min(float(caps.get("runtime_budget") or 15.0), 15.0))
+            join_sec = max(15.0, min(float(caps.get("runtime_budget") or 25.0), 25.0))
             state: dict[str, Any] = {"done": False, "ret": 0, "exc": None}
 
             def _worker() -> None:
@@ -374,11 +397,13 @@ def _patch_once() -> bool:
         patched._ranking_stuck_pending_prune_v4 = True  # type: ignore[attr-defined]
         patched._ranking_stuck_pending_prune_v5 = True  # type: ignore[attr-defined]
         patched._ranking_stuck_pending_prune_v6 = True  # type: ignore[attr-defined]
+        patched._ranking_stuck_pending_prune_v7 = True  # type: ignore[attr-defined]
         patched._original = orig  # type: ignore[attr-defined]
         tasks._run_ranking_entry_safe = patched
         logger.warning(
-            "[RANKING STUCK PENDING] patched _run_ranking_entry_safe v6 timebox=15s overlap_guard=True caps=%s main_skip=%s mode=%s",
+            "[RANKING STUCK PENDING] patched _run_ranking_entry_safe v7 timebox=25s overlap_guard=True caps=%s min_pending=%s main_skip=%s mode=%s",
             _force_ranking_runtime_caps(),
+            _MIN_PENDING_PATCHED,
             _main_skip_ranking_entry(),
             _operation_mode(),
         )
@@ -394,7 +419,7 @@ def _watch() -> None:
     for i in range(loops):
         ok = _patch_once()
         if i in (0, loops - 1):
-            logger.warning("[RANKING STUCK PENDING] enforce ok=%s v6 main_skip=%s mode=%s summary_fallback=%s", ok, _main_skip_ranking_entry(), _operation_mode(), _SUMMARY_FALLBACK_PATCHED)
+            logger.warning("[RANKING STUCK PENDING] enforce ok=%s v7 main_skip=%s mode=%s summary_fallback=%s min_pending=%s", ok, _main_skip_ranking_entry(), _operation_mode(), _SUMMARY_FALLBACK_PATCHED, _MIN_PENDING_PATCHED)
         time.sleep(sleep_sec)
 
 
@@ -406,7 +431,7 @@ def install() -> bool:
     ok = _patch_once()
     threading.Thread(target=_watch, name="ranking-stuck-pending-prune-watch", daemon=True).start()
     _DONE = True
-    logger.warning("[RANKING STUCK PENDING] installed v6 ok=%s watcher=True timebox=15s summary_fallback=%s main_skip=%s mode=%s", ok, _SUMMARY_FALLBACK_PATCHED, _main_skip_ranking_entry(), _operation_mode())
+    logger.warning("[RANKING STUCK PENDING] installed v7 ok=%s watcher=True timebox=25s summary_fallback=%s min_pending=%s main_skip=%s mode=%s", ok, _SUMMARY_FALLBACK_PATCHED, _MIN_PENDING_PATCHED, _main_skip_ranking_entry(), _operation_mode())
     return bool(ok)
 
 
