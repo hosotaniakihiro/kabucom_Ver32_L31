@@ -1,25 +1,11 @@
 # ============================================================
 # File   : main_database.py
-# Version: DATA-COLLECTORS-MAIN-DATABASE-ENTRY-V3-TOKEN-BOOTSTRAP
+# Version: DATA-COLLECTORS-MAIN-DATABASE-ENTRY-V3-TOKEN-BOOTSTRAP-CPU-GUARD
 # ------------------------------------------------------------
 # Purpose:
 #   - DB作成 / ランキング取得 / PUSH銘柄登録 / PUSH受信 を起動する入口
 #   - 既存 main.py とは分離する
 #   - 実体は scripts/data_collectors_runner.py に委譲する
-#
-# V3 Fix:
-#   ✔ 朝一に main_database.py 単独起動しても kabu Station token を取得する
-#   ✔ token_manager.refresh_token() により settings.ini の token を更新する
-#   ✔ 子プロセス ranking_collector / push_receiver が settings.ini から token を読める
-#   ✔ cwd を PROJECT_ROOT に固定し、settings.ini の読み違いを防止する
-#   ✔ main.py を先に起動しなくても data collectors が開始できる
-#
-# Usage:
-#   D:\Users\owner\anaconda3\python.exe F:\script\python\kabu\kabucom_Ver32_L31\main_database.py
-#
-# Notes:
-#   - main.py は summary作成 / AI判定 / entry判定 / 表示 / 通知 を担当
-#   - main_database.py は data collectors 系だけを担当
 # ============================================================
 
 from __future__ import annotations
@@ -43,10 +29,6 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
-# ============================================================
-# logging fallback
-# ============================================================
-
 def _ensure_basic_logging() -> None:
     try:
         root = logging.getLogger()
@@ -60,9 +42,14 @@ def _ensure_basic_logging() -> None:
         pass
 
 
-# ============================================================
-# token bootstrap
-# ============================================================
+def _install_cpu_guard_env() -> None:
+    try:
+        from core.startup.main_database_cpu_guard_env import install
+        ok = install()
+        logger.info("[MAIN DATABASE] cpu guard env installed ok=%s", ok)
+    except Exception:
+        logger.exception("[MAIN DATABASE] cpu guard env install failed; continue")
+
 
 def _read_api_password_from_settings() -> str:
     conf = ConfigParser()
@@ -78,18 +65,6 @@ def _read_api_password_from_settings() -> str:
 
 
 def _bootstrap_kabu_token_for_data_collectors() -> bool:
-    """
-    main_database.py 単独起動用 token 初期化。
-
-    main.py の system_startup() は呼ばない。
-    理由:
-      - system_startup() は summary / scheduler / push stack なども起動する
-      - main_database.py は data collectors だけを起動したい
-
-    ここでは最低限、kabu Station API token の refresh だけ行う。
-    token_manager.refresh_token() は settings.ini に token を保存するため、
-    その後に起動する子プロセスでも token を利用できる。
-    """
     _ensure_basic_logging()
 
     try:
@@ -109,7 +84,6 @@ def _bootstrap_kabu_token_for_data_collectors() -> bool:
             logger.error("[MAIN DATABASE] token bootstrap failed: empty token returned")
             return False
 
-        # 念のため同一プロセス内でも読める状態にする
         try:
             _ = get_valid_token()
         except Exception:
@@ -132,26 +106,7 @@ def _bootstrap_kabu_token_for_data_collectors() -> bool:
         return False
 
 
-# ============================================================
-# main
-# ============================================================
-
 def main() -> int:
-    """
-    data_collectors_runner.py の main() を呼び出す入口。
-
-    起動順序:
-      1. cwd を PROJECT_ROOT に固定
-      2. data collector process として mark
-      3. kabu Station API token を refresh して settings.ini に保存
-      4. data_collectors_runner.py を起動
-
-    data_collectors_runner.py 側で、以下を実行する。
-      1. db_prepare_runner.py
-      2. ranking_collector_runner.py
-      3. push_receiver_runner.py
-      4. 子プロセス監視
-    """
     _ensure_basic_logging()
 
     try:
@@ -163,6 +118,8 @@ def main() -> int:
     logger.info("========== MAIN DATABASE BOOT START ==========")
     logger.info("[MAIN DATABASE] PROJECT_ROOT=%s", PROJECT_ROOT)
     logger.info("[MAIN DATABASE] cwd=%s", os.getcwd())
+
+    _install_cpu_guard_env()
 
     try:
         from data_collectors.split_mode import mark_as_data_collector_process
