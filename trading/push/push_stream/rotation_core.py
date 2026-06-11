@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/rotation_core.py
-# Version: PRODUCTION-STABLE-REV6.2-PUSH-FIXED-FALLBACK-FROM-TARGETS
+# Version: PRODUCTION-STABLE-REV7-PUSH-VENDOR-SAFE-ROTATION-CORE
 # ------------------------------------------------------------
 # PUSH登録制限50銘柄に対して、毎ターン固定銘柄を入れつつ、
 # 残り枠をA/Bでローテーションする。
@@ -12,14 +12,11 @@
 #   A register -> hold -> unregister_all -> wait -> B register
 #   B register -> hold -> unregister_all -> wait -> A register
 #
-# ENV:
-#   PUSH_ROTATION_FIXED_SYMBOLS=15
-#   PUSH_ROTATION_VARIABLE_SYMBOLS=35
-#
-# REV6.2:
-#   - protected/open-position symbols が空でも fixed=0 にしない。
-#   - PUSH_ROTATION_FIXED_FALLBACK_FROM_TARGETS=1 の場合、targets先頭から
-#     固定15枠を作り、A/B両ターンに必ず固定枠として入れる。
+# REV7:
+#   - Former startup-patch behavior integrated into core.
+#   - Each rotation side now does:
+#       close_ws -> REST unregister_all/register -> wait_ws_ready -> 4.8s hold
+#   - fixed=0 fallback from targets remains built in.
 # ============================================================
 
 from __future__ import annotations
@@ -27,8 +24,9 @@ from __future__ import annotations
 import logging
 import os
 import time
+from typing import Any
 
-from . import state
+from . import state, transport
 from .rotation_logging import log_register_targets_with_names
 from .rotation_register import run_one_batch_with_timeout
 from .rotation_settings import (
@@ -47,7 +45,7 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
-VERSION = "PRODUCTION-STABLE-REV6.2-PUSH-FIXED-FALLBACK-FROM-TARGETS"
+VERSION = "PRODUCTION-STABLE-REV7-PUSH-VENDOR-SAFE-ROTATION-CORE"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -88,11 +86,11 @@ def enable_rotation(enabled: bool = True) -> None:
 
 
 def _sleep_or_stop(seconds: float) -> bool:
-    end = time.time() + max(0.0, float(seconds))
-    while time.time() < end:
+    end = time.monotonic() + max(0.0, float(seconds))
+    while time.monotonic() < end:
         if state._stop_event.is_set():
             return True
-        time.sleep(min(0.1, max(0.0, end - time.time())))
+        time.sleep(min(0.1, max(0.0, end - time.monotonic())))
     return state._stop_event.is_set()
 
 
@@ -135,10 +133,6 @@ def _build_protected_rotation_batches(targets: list[str]) -> tuple[list[str], li
       A = fixed15 + normal[0:35]
       B = fixed15 + normal[35:70]
 
-    protected が15を超える場合:
-      - 先頭15だけを毎ターン固定にする
-      - 残りのprotectedは normal 側の先頭へ戻し、A/B可変枠で回す
-
     protected が空の場合:
       - targets先頭から固定枠を作る。
       - これにより fixed=0 / A=50 / B=50 ではなく、固定15 + 可変35になる。
@@ -159,8 +153,6 @@ def _build_protected_rotation_batches(targets: list[str]) -> tuple[list[str], li
         fixed = _dedupe(fixed + fallback_from_targets)[:fixed_slots]
 
     fixed_set = set(fixed)
-
-    # protectedの16番目以降も捨てず、可変枠の先頭へ入れる。
     protected_overflow = [x for x in protected_all[fixed_slots:] if x not in fixed_set]
     normal_from_targets = [x for x in targets if x not in fixed_set]
     variable_pool = _dedupe(protected_overflow + normal_from_targets)
@@ -168,7 +160,6 @@ def _build_protected_rotation_batches(targets: list[str]) -> tuple[list[str], li
     first = _dedupe(fixed + variable_pool[:variable_slots])[:chunk]
     second = _dedupe(fixed + variable_pool[variable_slots:variable_slots * 2])[:chunk]
 
-    # B側が足りない場合でも、Aと重複しすぎない範囲で後続を入れる。完全空ならAだけで回す。
     if fixed and not second and len(variable_pool) > 0:
         second = _dedupe(fixed + variable_pool[:variable_slots])[:chunk]
 
@@ -206,55 +197,76 @@ def _log_ws_not_ready_if_needed(*, ws_wait_count: int, last_ws_wait_log_ts: floa
     return last_ws_wait_log_ts
 
 
-def _ws_stable_age_sec() -> float | None:
+def _is_ws_ready() -> bool:
     try:
-        last_connect = getattr(state, "_last_connect_at", None)
-        if last_connect is None:
-            return None
-        return max(0.0, (getattr(__import__("datetime"), "datetime").datetime.now() - last_connect.replace(tzinfo=None)).total_seconds())
+        return bool(state._connected_event.is_set() and _is_ws_alive())
     except Exception:
-        return None
+        return False
 
 
-def _wait_for_stable_ws_before_register(label: str) -> bool:
-    """
-    reconnect直後にregister/unregisterを入れると、kabu Station 側から
-    WinError 10054 で切られやすい。接続直後は少し待ってからregisterする。
-    grace=0 の場合は、接続確認だけ行って即registerする。
-    """
-    grace = max(0.0, _env_float("PUSH_ROTATION_WS_STABLE_GRACE_SEC", 3.0))
-    deadline_extra = max(1.0, _env_float("PUSH_ROTATION_WS_STABLE_MAX_WAIT_SEC", 8.0))
-    deadline = time.time() + deadline_extra
+def _wait_ws_ready_after_register(label: str) -> bool:
+    timeout = max(0.0, _env_float("PUSH_ROTATION_WAIT_WS_READY_AFTER_REGISTER_SEC", 4.0))
+    settle = max(0.0, _env_float("PUSH_ROTATION_WAIT_WS_READY_AFTER_REGISTER_SETTLE_SEC", 0.25))
+    if timeout <= 0:
+        return True
 
-    while not state._stop_event.is_set():
-        if not state._connected_event.is_set() or not _is_ws_alive():
-            logger.warning("[push_stream] rotation %s wait stable postponed: ws not ready; retry same side", label)
-            return False
-
-        age = _ws_stable_age_sec()
-        if age is None or age >= grace:
+    logger.info("[push_stream] rotation %s waiting WS ready after REST register timeout=%.3fs", label, timeout)
+    end = time.monotonic() + timeout
+    while time.monotonic() < end and not state._stop_event.is_set():
+        if _is_ws_ready():
+            if settle > 0:
+                _sleep_or_stop(settle)
+            logger.info("[push_stream] rotation %s WS ready after REST register -> hold can start settle=%.3fs", label, settle)
             return True
+        time.sleep(0.05)
 
-        remain = grace - age
-        if time.time() >= deadline:
-            logger.warning(
-                "[push_stream] rotation %s ws stable wait timeout age=%.2fs grace=%.2fs -> continue",
-                label,
-                age,
-                grace,
-            )
-            return True
-
-        logger.info(
-            "[push_stream] rotation %s waiting ws stable age=%.2fs grace=%.2fs remain=%.2fs",
-            label,
-            age,
-            grace,
-            remain,
-        )
-        _sleep_or_stop(min(0.5, max(0.1, remain)))
-
+    logger.warning(
+        "[push_stream] rotation %s WS not ready after REST register timeout=%.3fs connected_event=%s ws_alive=%s",
+        label,
+        timeout,
+        state._connected_event.is_set(),
+        _is_ws_alive(),
+    )
     return False
+
+
+def _close_ws_before_register(label: str) -> None:
+    if not _env_bool("PUSH_ROTATION_CLOSE_WS_BEFORE_REGISTER", True):
+        return
+
+    ws_app: Any = None
+    try:
+        with state._ws_state_lock:
+            ws_app = getattr(state, "_ws_app", None)
+    except Exception:
+        ws_app = None
+
+    try:
+        state._connected_event.clear()
+    except Exception:
+        pass
+    try:
+        transport._clear_sender()
+    except Exception:
+        pass
+    try:
+        setattr(state, "_last_expected_ws_close_at", time.monotonic())
+    except Exception:
+        pass
+
+    if ws_app is not None:
+        logger.info(
+            "[push_stream] rotation %s proactively closing WS before REST register to avoid vendor 10054 goodbye",
+            label,
+        )
+        try:
+            ws_app.close()
+        except Exception:
+            logger.debug("[push_stream] rotation %s ws close before register failed", label, exc_info=True)
+
+    settle = max(0.0, _env_float("PUSH_ROTATION_WS_CLOSE_SETTLE_SEC", 0.15))
+    if settle > 0:
+        time.sleep(settle)
 
 
 def _run_rotation_side(*, label: str, symbols: list[str]) -> bool:
@@ -264,13 +276,23 @@ def _run_rotation_side(*, label: str, symbols: list[str]) -> bool:
         logger.warning("[push_stream] rotation %s skipped: empty symbols", label)
         return False
 
-    if not _wait_for_stable_ws_before_register(label):
-        _sleep_or_stop(1.0)
-        return False
-
     reason = f"rotation_{label}"
     log_register_targets_with_names(symbols, label=label, reason=reason)
-    ok = run_one_batch_with_timeout(label=label, symbols=symbols, timeout_sec=REGISTER_TIMEOUT_SEC)
+
+    ok = False
+    try:
+        setattr(state, "_rotation_register_in_progress", True)
+        logger.warning(
+            "[push_stream] rotation %s vendor-safe cycle core-v7: close_ws -> REST unregister/register -> wait_ws_ready -> hold",
+            label,
+        )
+        _close_ws_before_register(label)
+        ok = run_one_batch_with_timeout(label=label, symbols=symbols, timeout_sec=REGISTER_TIMEOUT_SEC)
+    finally:
+        try:
+            setattr(state, "_rotation_register_in_progress", False)
+        except Exception:
+            pass
 
     if not ok:
         logger.warning(
@@ -281,8 +303,16 @@ def _run_rotation_side(*, label: str, symbols: list[str]) -> bool:
         _sleep_or_stop(1.0)
         return False
 
+    if not _wait_ws_ready_after_register(label):
+        logger.warning(
+            "[push_stream] rotation %s WS not ready after register -> retry same side without switching size=%d",
+            label,
+            len(symbols),
+        )
+        return False
+
     logger.info(
-        "[push_stream] rotation %s hold start ok=%s hold=%.3fs size=%d",
+        "[push_stream] rotation %s hold start ok=%s hold=%.3fs size=%d ws_ready=True",
         label,
         ok,
         ROTATE_HOLD_SEC,
@@ -295,14 +325,13 @@ def _run_rotation_side(*, label: str, symbols: list[str]) -> bool:
 def _rotation_worker() -> None:
     fixed_slots, variable_slots = _rotation_slot_sizes()
     logger.info(
-        "[push_stream] rotation worker started version=%s hold=%.3fs register_timeout=%.3fs chunk=%d fixed_slots=%d variable_slots=%d stable_grace=%.3fs",
+        "[push_stream] rotation worker started version=%s hold=%.3fs register_timeout=%.3fs chunk=%d fixed_slots=%d variable_slots=%d vendor_safe_core=True",
         VERSION,
         ROTATE_HOLD_SEC,
         REGISTER_TIMEOUT_SEC,
         DEFAULT_REGISTER_CHUNK_SIZE,
         fixed_slots,
         variable_slots,
-        _env_float("PUSH_ROTATION_WS_STABLE_GRACE_SEC", 3.0),
     )
 
     empty_count = 0
@@ -316,6 +345,7 @@ def _rotation_worker() -> None:
                 time.sleep(1.0)
                 continue
 
+            # 初回だけはWS接続を待つ。各turnでは close_ws -> REST register -> reconnect を使う。
             if not state._connected_event.is_set() or not _is_ws_alive():
                 ws_wait_count += 1
                 last_ws_wait_log_ts = _log_ws_not_ready_if_needed(
@@ -330,10 +360,7 @@ def _rotation_worker() -> None:
             if not targets:
                 empty_count += 1
                 if empty_count == 1 or empty_count % 15 == 0:
-                    logger.warning(
-                        "[push_stream] rotation waiting: no real targets empty_count=%d",
-                        empty_count,
-                    )
+                    logger.warning("[push_stream] rotation waiting: no real targets empty_count=%d", empty_count)
                 time.sleep(2.0)
                 continue
 
@@ -357,8 +384,6 @@ def _rotation_worker() -> None:
                 next_label = "B" if ok and second else "A"
                 continue
 
-            # Bだけを特別扱いしない。ここでwsが落ちても _run_rotation_side がFalseを返し、
-            # next_label はBのまま維持されるため、再接続後にBから再開する。
             ok = _run_rotation_side(label="B", symbols=list(second))
             next_label = "A" if ok else "B"
 
