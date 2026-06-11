@@ -12,11 +12,13 @@ import os
 import sys
 from typing import Dict
 
+from .runtime_env_default_registry import SITE_GROUP_ORDER, USER_GROUP_ORDER
+from .runtime_env_default_registry import VERSION as REGISTRY_VERSION
 from .runtime_env_defaults import VERSION as DEFAULTS_VERSION
 from .runtime_env_defaults import apply_site_defaults, apply_user_defaults, env_bool
 
 logger = logging.getLogger(__name__)
-VERSION = "REV1-RUNTIME-ENV-DEFAULTS-PATCH"
+VERSION = "REV2-RUNTIME-ENV-DEFAULTS-PATCH-REGISTRY-AWARE"
 _INSTALLED = False
 
 
@@ -53,16 +55,21 @@ def install() -> bool:
         _INSTALLED = True
         if env_bool("RUNTIME_ENV_DEFAULTS_VERBOSE", False):
             logger.warning(
-                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s applied=%s context=%s",
+                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s applied=%s context=%s site_groups=%s user_groups=%s",
                 VERSION,
                 DEFAULTS_VERSION,
+                REGISTRY_VERSION,
                 len(applied),
                 context,
+                ",".join(SITE_GROUP_ORDER),
+                ",".join(USER_GROUP_ORDER),
             )
         else:
             logger.warning(
-                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s applied=%s context=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s",
+                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s applied=%s context=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s",
                 VERSION,
+                DEFAULTS_VERSION,
+                REGISTRY_VERSION,
                 len(applied),
                 context,
                 os.environ.get("SITECUSTOMIZE_ENABLE_RESCUE_PATCHES"),
