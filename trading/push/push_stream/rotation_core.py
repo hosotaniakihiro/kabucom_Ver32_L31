@@ -1,12 +1,16 @@
 # ============================================================
 # File   : trading/push/push_stream/rotation_core.py
-# Version: PRODUCTION-STABLE-REV6-PUSH-FIXED15-VARIABLE35-ROTATION
+# Version: PRODUCTION-STABLE-REV6.1-PUSH-STRICT-AB-ROTATION
 # ------------------------------------------------------------
 # PUSH登録制限50銘柄に対して、毎ターン固定銘柄を入れつつ、
 # 残り枠をA/Bでローテーションする。
 #
 #   Aターン: 固定15 + A可変35
 #   Bターン: 固定15 + B可変35
+#
+# User design:
+#   A register -> hold -> unregister_all -> wait -> B register
+#   B register -> hold -> unregister_all -> wait -> A register
 #
 # ENV:
 #   PUSH_ROTATION_FIXED_SYMBOLS=15
@@ -38,7 +42,7 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
-VERSION = "PRODUCTION-STABLE-REV6-PUSH-FIXED15-VARIABLE35-ROTATION"
+VERSION = "PRODUCTION-STABLE-REV6.1-PUSH-STRICT-AB-ROTATION"
 
 
 def _env_float(name: str, default: float) -> float:
@@ -185,6 +189,7 @@ def _wait_for_stable_ws_before_register(label: str) -> bool:
     """
     reconnect直後にregister/unregisterを入れると、kabu Station 側から
     WinError 10054 で切られやすい。接続直後は少し待ってからregisterする。
+    grace=0 の場合は、接続確認だけ行って即registerする。
     """
     grace = max(0.0, _env_float("PUSH_ROTATION_WS_STABLE_GRACE_SEC", 3.0))
     deadline_extra = max(1.0, _env_float("PUSH_ROTATION_WS_STABLE_MAX_WAIT_SEC", 8.0))
@@ -192,7 +197,7 @@ def _wait_for_stable_ws_before_register(label: str) -> bool:
 
     while not state._stop_event.is_set():
         if not state._connected_event.is_set() or not _is_ws_alive():
-            logger.warning("[push_stream] rotation %s wait stable skipped: ws not ready", label)
+            logger.warning("[push_stream] rotation %s wait stable postponed: ws not ready; retry same side", label)
             return False
 
         age = _ws_stable_age_sec()
@@ -313,7 +318,7 @@ def _rotation_worker() -> None:
                 first[:10],
                 second[:10],
                 callable(state._refresh_callable),
-                True,
+                bool(state._connected_event.is_set() and _is_ws_alive()),
             )
 
             if next_label == "A" or not second:
@@ -321,11 +326,8 @@ def _rotation_worker() -> None:
                 next_label = "B" if ok and second else "A"
                 continue
 
-            if not state._connected_event.is_set() or not _is_ws_alive():
-                logger.warning("[push_stream] rotation B skipped because ws became not ready")
-                _sleep_or_stop(2.0)
-                continue
-
+            # Bだけを特別扱いしない。ここでwsが落ちても _run_rotation_side がFalseを返し、
+            # next_label はBのまま維持されるため、再接続後にBから再開する。
             ok = _run_rotation_side(label="B", symbols=list(second))
             next_label = "A" if ok else "B"
 
