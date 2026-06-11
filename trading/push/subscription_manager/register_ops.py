@@ -1,10 +1,11 @@
 # ============================================================
 # File   : trading/push/subscription_manager/register_ops.py
-# Version: PRODUCTION-STABLE-REV1.8-KABUSAPI-PARTIAL-REGISTER-OK
+# Version: PRODUCTION-STABLE-REV1.9-KABUSAPI-VENDOR-UNREGISTERALL-NOBODY
 # Function:
 #   - register / unregister / clear の実行を担当する
 #   - kabu Station 公式ひな形に合わせて HTTP PUT /kabusapi/register を使う
 #   - WebSocket は受信専用、登録は HTTP API に分離する
+#   - /kabusapi/unregister/all は公式ひな形に合わせて body なし PUT で送る
 # ============================================================
 
 from __future__ import annotations
@@ -336,23 +337,34 @@ def _resolve_unregister_url() -> str:
     )
 
 
-def _http_json_request(*, url: str, method: str, payload: dict, api_key: str, timeout: float = 10.0) -> tuple[bool, Any]:
+def _build_request(*, url: str, method: str, payload: Optional[dict], api_key: str) -> urllib.request.Request:
+    """Build kabusapi request.
+
+    register/unregister use JSON body.  unregister/all follows the vendor sample and sends
+    a PUT request with no body (Content-Length: 0 behavior from urllib).
+    """
+    method = (_safe_str(method) or "PUT").upper()
+    body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, body, method=method)
+    req.add_header("Content-Type", "application/json")
+    if api_key:
+        req.add_header("X-API-KEY", api_key)
+    return req
+
+
+def _http_json_request(*, url: str, method: str, payload: Optional[dict], api_key: str, timeout: float = 10.0) -> tuple[bool, Any]:
     url = _normalize_http_url(url)
     method = (_safe_str(method) or "PUT").upper()
     if not url:
         logger.warning("[SUB MANAGER] HTTP %s skipped: invalid url=%r", method, url)
         return False, "invalid_url"
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     try:
-        req = urllib.request.Request(url, body, method=method)
+        req = _build_request(url=url, method=method, payload=payload, api_key=api_key)
     except Exception as e:
         logger.exception("[SUB MANAGER] HTTP %s request build failed url=%r", method, url)
         if is_transport_error(e):
             mark_transport_broken(reason=f"http_{method.lower()}_build", exc=e)
         return False, str(e)
-    req.add_header("Content-Type", "application/json")
-    if api_key:
-        req.add_header("X-API-KEY", api_key)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as res:
             raw = res.read()
@@ -408,8 +420,8 @@ def run_unregister_all() -> bool:
     if not api_key:
         logger.warning("[SUB MANAGER] unregister_all skipped: API key unavailable")
         return True
-    ok, content = _http_json_request(url=url, method="PUT", payload={}, api_key=api_key)
-    logger.info("[SUB MANAGER] unregister_all done ok=%s content=%r", ok, content)
+    ok, content = _http_json_request(url=url, method="PUT", payload=None, api_key=api_key)
+    logger.info("[SUB MANAGER] unregister_all done vendor_body=None ok=%s content=%r", ok, content)
     return ok
 
 
