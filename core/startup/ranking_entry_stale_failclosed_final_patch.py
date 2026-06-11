@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/ranking_entry_stale_failclosed_final_patch.py
-# Version: V6-PM-STARTUP-WARMUP-STALE-GRACE
+# Version: V7-FUTURE-TIMESTAMP-GUARD
 # ============================================================
 from __future__ import annotations
 import datetime as dt
@@ -39,7 +39,6 @@ def _install_schedule_stale_release() -> bool:
         fn = getattr(mod, 'install', None)
         ok = bool(fn()) if callable(fn) else False
         _SCHED_STALE_INSTALLED = bool(ok)
-        # v6: companion may be called from every ranking tick; avoid noisy repeated logs.
         if not getattr(_install_schedule_stale_release, '_logged', False):
             logger.warning('[RANKING STALE FINAL] companion schedule stale release installed=%s', ok)
             setattr(_install_schedule_stale_release, '_logged', True)
@@ -61,7 +60,6 @@ def _install_budget_hard_stop() -> bool:
             setattr(_install_budget_hard_stop, '_logged', True)
         return bool(ok)
     except Exception:
-        # Optional companion; keep this patch safe when the file is absent.
         if _b('RANKING_STALE_FINAL_LOG_OPTIONAL_COMPANION_ERRORS', False):
             logger.exception('[RANKING STALE FINAL] companion budget hard stop install failed')
         return False
@@ -142,9 +140,14 @@ def _fresh_diag() -> tuple[bool, dict[str, Any]]:
         logger.exception('[RANKING STALE FINAL] inspect failed db=%s', db_path)
     age = None if best is None else (now - best).total_seconds()
     max_age = _f('RANKING_ENTRY_SNAPSHOT_MAX_AGE_SEC', 300.0)
+    max_future = _f('RANKING_ENTRY_MAX_FUTURE_SNAPSHOT_SEC', 30.0)
+    future_sec = None if age is None or age >= 0 else abs(float(age))
+    future_ok = future_sec is None or future_sec <= max_future
     phase = _market_phase(now)
-    ok = bool(best is not None and age is not None and age <= max_age and best.date() == now.date())
-    return ok, {'db': db_path, 'latest': None if best is None else str(best), 'source': source, 'rows': rows, 'age_sec': age, 'max_age_sec': max_age, 'today': str(now.date()), 'phase': phase}
+    ok = bool(best is not None and age is not None and age <= max_age and future_ok and best.date() == now.date())
+    if best is not None and not future_ok:
+        logger.warning('[RANKING STALE FINAL] future timestamp rejected latest=%s now=%s future_sec=%.1f max_future=%.1f source=%s', best, now, future_sec, max_future, source)
+    return ok, {'db': db_path, 'latest': None if best is None else str(best), 'source': source, 'rows': rows, 'age_sec': age, 'future_sec': future_sec, 'max_future_sec': max_future, 'max_age_sec': max_age, 'today': str(now.date()), 'phase': phase}
 
 
 def _latest_is_usable_intraday(diag: dict[str, Any], *, max_age_env: str, max_age_default: float) -> bool:
@@ -153,10 +156,12 @@ def _latest_is_usable_intraday(diag: dict[str, Any], *, max_age_env: str, max_ag
         latest = _parse_ts(diag.get('latest'))
         if latest is None or latest.date() != now.date():
             return False
+        age = diag.get('age_sec')
+        if age is None or float(age) < -_f('RANKING_ENTRY_MAX_FUTURE_SNAPSHOT_SEC', 30.0):
+            return False
         min_latest = dt.datetime.combine(now.date(), _parse_hhmm('RANKING_ENTRY_LUNCH_MIN_LATEST_TIME', '11:00'))
         max_age = _f(max_age_env, max_age_default)
-        age = diag.get('age_sec')
-        return bool(latest >= min_latest and age is not None and float(age) <= max_age)
+        return bool(latest >= min_latest and float(age) <= max_age)
     except Exception:
         return False
 
@@ -178,13 +183,6 @@ def _is_lunch_reopen_allowed(diag: dict[str, Any]) -> bool:
 
 
 def _is_startup_warmup_allowed(diag: dict[str, Any]) -> bool:
-    """Allow ranking entry briefly after a PM restart while ranking API catches up.
-
-    This fixes the case: restart at 12:54, latest ranking row is 12:40, normal
-    300s stale guard blocks entries before the first post-restart ranking fetch.
-    The allowance is intentionally bounded by process uptime and by same-day
-    intraday latest timestamp.
-    """
     global _STARTUP_WARMUP_LOGGED
     if not _b('RANKING_ENTRY_STARTUP_STALE_GRACE_ENABLED', True):
         return False
@@ -246,6 +244,7 @@ def _wrap(orig):
     wrapped._ranking_stale_final_v4 = True
     wrapped._ranking_stale_final_v5 = True
     wrapped._ranking_stale_final_v6 = True
+    wrapped._ranking_stale_final_v7 = True
     wrapped._original = orig
     return wrapped
 
@@ -257,10 +256,10 @@ def _patch_once() -> bool:
         import trading.entry_exit.tasks as tasks
         cur = getattr(tasks, '_run_ranking_entry_safe', None)
         if not callable(cur): return False
-        if getattr(cur, '_ranking_stale_final_v6', False): return True
-        base = getattr(cur, '_original', cur) if (getattr(cur, '_ranking_stale_final_v5', False) or getattr(cur, '_ranking_stale_final_v4', False) or getattr(cur, '_ranking_stale_final_v3', False) or getattr(cur, '_ranking_stale_final_v2', False) or getattr(cur, '_ranking_stale_final_v1', False)) else cur
+        if getattr(cur, '_ranking_stale_final_v7', False): return True
+        base = getattr(cur, '_original', cur) if (getattr(cur, '_ranking_stale_final_v6', False) or getattr(cur, '_ranking_stale_final_v5', False) or getattr(cur, '_ranking_stale_final_v4', False) or getattr(cur, '_ranking_stale_final_v3', False) or getattr(cur, '_ranking_stale_final_v2', False) or getattr(cur, '_ranking_stale_final_v1', False)) else cur
         tasks._run_ranking_entry_safe = _wrap(base)
-        logger.warning('[RANKING STALE FINAL] patched outermost v6 target=%s', getattr(base, '__name__', type(base)))
+        logger.warning('[RANKING STALE FINAL] patched outermost v7 target=%s', getattr(base, '__name__', type(base)))
         return True
     except Exception:
         logger.exception('[RANKING STALE FINAL] patch failed'); return False
@@ -271,7 +270,7 @@ def _watch():
     sleep_sec = max(0.5, min(float(os.getenv('RANKING_STALE_FINAL_WATCH_SLEEP_SEC', '2.0') or 2.0), 5.0))
     for i in range(loops):
         ok = _patch_once()
-        if i in (0, loops - 1): logger.warning('[RANKING STALE FINAL] enforce v6 i=%s/%s ok=%s schedule_stale=%s budget_hard_stop=%s', i, loops, ok, _SCHED_STALE_INSTALLED, _BUDGET_HARD_STOP_INSTALLED)
+        if i in (0, loops - 1): logger.warning('[RANKING STALE FINAL] enforce v7 i=%s/%s ok=%s schedule_stale=%s budget_hard_stop=%s', i, loops, ok, _SCHED_STALE_INSTALLED, _BUDGET_HARD_STOP_INSTALLED)
         time.sleep(sleep_sec)
 
 
@@ -280,6 +279,7 @@ def install() -> bool:
     os.environ.setdefault('RANKING_ENTRY_STALE_FAILOPEN_ENABLED', '0')
     os.environ.setdefault('RANKING_ENTRY_CLEAR_PENDING_ON_STALE', '1')
     os.environ.setdefault('RANKING_ENTRY_SNAPSHOT_MAX_AGE_SEC', '300')
+    os.environ.setdefault('RANKING_ENTRY_MAX_FUTURE_SNAPSHOT_SEC', '30')
     os.environ.setdefault('RANKING_ENTRY_LUNCH_REOPEN_STALE_FAILOPEN', '1')
     os.environ.setdefault('RANKING_ENTRY_LUNCH_REOPEN_GRACE_MIN', '20')
     os.environ.setdefault('RANKING_ENTRY_LUNCH_REOPEN_MAX_AGE_SEC', '7200')
@@ -299,7 +299,7 @@ def install() -> bool:
         return True
     ok = _patch_once(); _INSTALLED = True
     threading.Thread(target=_watch, name='ranking-stale-final-watch', daemon=True).start()
-    logger.warning('[RANKING STALE FINAL] installed v6 ok=%s failopen=%s schedule_stale=%s lunch_reopen=%s startup_grace=%s budget_hard_stop=%s', ok, os.getenv('RANKING_ENTRY_STALE_FAILOPEN_ENABLED'), _SCHED_STALE_INSTALLED, os.getenv('RANKING_ENTRY_LUNCH_REOPEN_STALE_FAILOPEN'), os.getenv('RANKING_ENTRY_STARTUP_STALE_GRACE_ENABLED'), _BUDGET_HARD_STOP_INSTALLED)
+    logger.warning('[RANKING STALE FINAL] installed v7 ok=%s failopen=%s schedule_stale=%s lunch_reopen=%s startup_grace=%s budget_hard_stop=%s max_future=%s', ok, os.getenv('RANKING_ENTRY_STALE_FAILOPEN_ENABLED'), _SCHED_STALE_INSTALLED, os.getenv('RANKING_ENTRY_LUNCH_REOPEN_STALE_FAILOPEN'), os.getenv('RANKING_ENTRY_STARTUP_STALE_GRACE_ENABLED'), _BUDGET_HARD_STOP_INSTALLED, os.getenv('RANKING_ENTRY_MAX_FUTURE_SNAPSHOT_SEC'))
     return ok
 try: install()
 except Exception: logger.exception('[RANKING STALE FINAL] auto install failed')
