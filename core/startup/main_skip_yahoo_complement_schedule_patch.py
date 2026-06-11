@@ -10,7 +10,8 @@ logger = logging.getLogger(__name__)
 
 _INSTALLED = False
 _ORIG_DISPATCH = None
-_ORIG_DISPATCH_ONCE = None
+_ORIG_REGISTER_YAHOO = None
+_ORIG_YAHOO_WRAPPER = None
 
 
 def _is_main_py() -> bool:
@@ -31,6 +32,10 @@ def _env_on(name: str, default: bool = True) -> bool:
         return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
     except Exception:
         return bool(default)
+
+
+def _skip_enabled() -> bool:
+    return _is_main_py() and _env_on("AUTOSTOCK_MAIN_SKIP_YAHOO_COMPLEMENT", True) and not _env_on("AUTOSTOCK_ENABLE_YAHOO_COMPLEMENT_IN_MAIN", False) and not _env_on("YAHOO_COMPLEMENT_RUN_IN_MAIN", False)
 
 
 def _safe_tags(job: Any) -> list[str]:
@@ -78,11 +83,81 @@ def _advance_next_run(job: Any) -> None:
         pass
 
 
-def install() -> bool:
-    global _INSTALLED, _ORIG_DISPATCH, _ORIG_DISPATCH_ONCE
+def _remove_yahoo_jobs() -> int:
+    try:
+        import schedule
+    except Exception:
+        return 0
+    removed = 0
+    try:
+        for job in list(getattr(schedule, "jobs", []) or []):
+            if _is_yahoo_complement_job(job):
+                try:
+                    schedule.cancel_job(job)
+                    removed += 1
+                except Exception:
+                    _advance_next_run(job)
+                    removed += 1
+    except Exception:
+        logger.exception("[MAIN SKIP YAHOO COMPLEMENT] remove yahoo jobs failed")
+    return removed
 
-    if _INSTALLED:
-        return True
+
+def _patch_yahoo_module() -> bool:
+    """Hard block Yahoo complement inside main.py, even if registration happens after this patch."""
+    global _ORIG_REGISTER_YAHOO, _ORIG_YAHOO_WRAPPER
+    try:
+        import core.yahoo_tasks as yt
+    except Exception:
+        # yahoo_tasks may not be imported yet. schedule-loop dispatch patch still protects due jobs.
+        return False
+
+    changed = False
+    try:
+        cur_register = getattr(yt, "register_yahoo_tasks", None)
+        if callable(cur_register) and not getattr(cur_register, "_main_skip_yahoo_v2", False):
+            _ORIG_REGISTER_YAHOO = cur_register
+
+            def register_patched(*args: Any, **kwargs: Any):
+                if _skip_enabled():
+                    removed = _remove_yahoo_jobs()
+                    logger.warning(
+                        "[MAIN SKIP YAHOO COMPLEMENT] register blocked in main.py removed=%s argv=%s",
+                        removed,
+                        sys.argv,
+                    )
+                    return False
+                return _ORIG_REGISTER_YAHOO(*args, **kwargs)
+
+            register_patched._main_skip_yahoo_v2 = True
+            yt.register_yahoo_tasks = register_patched
+            changed = True
+    except Exception:
+        logger.exception("[MAIN SKIP YAHOO COMPLEMENT] patch register_yahoo_tasks failed")
+
+    try:
+        cur_wrapper = getattr(yt, "_yahoo_wrapper", None)
+        if callable(cur_wrapper) and not getattr(cur_wrapper, "_main_skip_yahoo_v2", False):
+            _ORIG_YAHOO_WRAPPER = cur_wrapper
+
+            def yahoo_wrapper_patched(*args: Any, **kwargs: Any):
+                if _skip_enabled():
+                    logger.warning("[MAIN SKIP YAHOO COMPLEMENT] _yahoo_wrapper blocked in main.py")
+                    return None
+                return _ORIG_YAHOO_WRAPPER(*args, **kwargs)
+
+            yahoo_wrapper_patched._main_skip_yahoo_v2 = True
+            yt._yahoo_wrapper = yahoo_wrapper_patched
+            changed = True
+    except Exception:
+        logger.exception("[MAIN SKIP YAHOO COMPLEMENT] patch _yahoo_wrapper failed")
+
+    return changed
+
+
+def install() -> bool:
+    global _INSTALLED, _ORIG_DISPATCH
+
     if not _is_main_py():
         logger.warning("[MAIN SKIP YAHOO COMPLEMENT] skipped non-main context argv=%s", sys.argv)
         return False
@@ -98,11 +173,13 @@ def install() -> bool:
         return False
 
     try:
+        module_patched = _patch_yahoo_module()
+
         if _ORIG_DISPATCH is None and hasattr(sl, "_dispatch_due_job"):
             _ORIG_DISPATCH = sl._dispatch_due_job
 
             def _dispatch_patched(job: Any, *args: Any, **kwargs: Any) -> bool:
-                if _is_yahoo_complement_job(job):
+                if _skip_enabled() and _is_yahoo_complement_job(job):
                     _advance_next_run(job)
                     logger.warning(
                         "[MAIN SKIP YAHOO COMPLEMENT] skipped due job tags=%s func=%s next_run=%s",
@@ -115,17 +192,13 @@ def install() -> bool:
 
             sl._dispatch_due_job = _dispatch_patched
 
-        # Proactively move any already-due yahoo complement jobs away at install time.
-        skipped = 0
-        for job in list(getattr(schedule, "jobs", []) or []):
-            if _is_yahoo_complement_job(job):
-                _advance_next_run(job)
-                skipped += 1
-
+        removed = _remove_yahoo_jobs()
         _INSTALLED = True
         logger.warning(
-            "[MAIN SKIP YAHOO COMPLEMENT] installed v1 enabled=True pre_advanced=%s argv=%s",
-            skipped,
+            "[MAIN SKIP YAHOO COMPLEMENT] installed v2 enabled=True removed=%s module_patched=%s jobs=%s argv=%s",
+            removed,
+            module_patched,
+            len(getattr(schedule, "jobs", []) or []),
             sys.argv,
         )
         return True
