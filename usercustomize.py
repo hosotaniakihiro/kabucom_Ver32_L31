@@ -67,7 +67,7 @@ DEFAULTS = {
     "SYMBOL_STOP_AFTER_FIRST_LOSS_ENABLED": "0",
     "ENTRY_ORDER_EXCHANGE": "9",
     "KABU_ORDER_EXCHANGE": "9",
-    # PUSH core-integrated defaults.  Legacy PUSH startup shims are disabled
+    # PUSH core-integrated defaults. Legacy PUSH startup shims are disabled
     # by default below; keep their operational env policy here.
     "PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH": "1",
     "PUSH_STREAM_ONOPEN_REFRESH_CLEAR_FIRST": "0",
@@ -157,6 +157,8 @@ DEFAULTS = {
     "TONOSAMA_SUMMARY_MAX_AGE_SEC": "300",
     "TONOSAMA_HISTORY_MAX_AGE_SEC": "300",
     "SUMMARY_MTF_ENTRY_MAX_AGE_SEC": "300",
+    "USERCUSTOMIZE_ENABLE_TONOSAMA_RESCUE_PATCHES": "0",
+    "USERCUSTOMIZE_ENABLE_LEGACY_TONOSAMA_FAILOPEN_PATCHES": "0",
     "SUMMARY_SUPPRESS_LUNCH_FALLBACK_AFTER_PM": "1",
     "PULLBACK_ENTRY_ENABLED": "1",
     "PULLBACK_ENTRY_MAX_CANDIDATES": "5",
@@ -233,11 +235,12 @@ for _k, _v in {
     os.environ[_k] = _v
 
 logger.warning(
-    "[USERCUSTOMIZE] runtime defaults lite ranking_stale_skip=%s ranking_empty_failclosed=%s ranking_tech_bridge=%s tonosama_mtf_stale_fail_closed=%s pullback=%s order_exchange=%s ranking_rescue_turnover=%s low_move_turnover=%s yahoo_skip=%s push_core=%s legacy_push_patches=%s",
+    "[USERCUSTOMIZE] runtime defaults lite ranking_stale_skip=%s ranking_empty_failclosed=%s ranking_tech_bridge=%s tonosama_mtf_stale_fail_closed=%s tonosama_rescue_patches=%s pullback=%s order_exchange=%s ranking_rescue_turnover=%s low_move_turnover=%s yahoo_skip=%s push_core=%s legacy_push_patches=%s",
     os.getenv("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE"),
     os.getenv("RANKING_TODAY_EMPTY_FAIL_CLOSED"),
     os.getenv("RANKING_SNAPSHOT_TECH_BRIDGE_ENABLED"),
     os.getenv("TONOSAMA_MTF_STALE_FAIL_CLOSED"),
+    os.getenv("USERCUSTOMIZE_ENABLE_TONOSAMA_RESCUE_PATCHES"),
     os.getenv("PULLBACK_ENTRY_ENABLED"),
     os.getenv("ENTRY_ORDER_EXCHANGE"),
     os.getenv("RANKING_FINAL_RESCUE_MIN_TURNOVER"),
@@ -310,22 +313,25 @@ MAIN_BG_PATCHES = [
     ("YAHOO_COMPUTE_SCHEMA_NA_GUARD", "core.startup.yahoo_compute_schema_na_guard_patch"),
     ("RANKING_ENTRY_FAST_BUDGET_OVERRIDE", "core.startup.ranking_entry_fast_budget_override_patch"),
     ("RANKING_AI_GATE_FAILOPEN", "core.startup.ranking_entry_gate_failopen_patch"),
-    ("TONOSAMA_RECENT_3M5M_FAILOPEN", "core.startup.tonosama_recent3m5m_failopen_patch"),
-    ("TONOSAMA_FAILOPEN_DIRECTION_RESCUE", "core.startup.tonosama_failopen_direction_rescue_patch"),
-    ("TONOSAMA_ATR1M_RESCUE", "core.startup.tonosama_atr1m_filter_rescue_patch"),
-    ("TONOSAMA_RANGE5M_RESCUE", "core.startup.tonosama_range5m_filter_rescue_patch"),
-    ("TONOSAMA_STALE_SUMMARY_FAILOPEN", "core.startup.tonosama_fresh_summary_stale_failopen_override_patch"),
     ("WATCHLIST_LIQ_EMPTY_FAILOPEN", "core.startup.watchlist_liq_empty_failopen_register_patch"),
     ("TONOSAMA_DEDICATED_OK_FINAL_ACCEPT", "core.startup.tonosama_dedicated_ok_final_accept_patch"),
     ("TONOSAMA_ONE_PENDING", "core.startup.tonosama_one_pending_per_loop_patch"),
     ("TONOSAMA_SKIP_BUILD_WHEN_PENDING_EXISTS", "core.startup.tonosama_skip_build_when_pending_exists_patch"),
     ("TONOSAMA_CONTROLLER_TIMEOUT", "core.startup.tonosama_controller_timeout_patch"),
     ("TONOSAMA_CONTROLLER_TIMEOUT_EXTEND", "core.startup.tonosama_controller_timeout_extend_patch"),
-    ("TONOSAMA_RANGE5M_TUPLE_FAILOPEN", "core.startup.tonosama_range_5m_tuple_failopen_patch"),
     ("RANKING_ENTRY_INTRADAY_CAP", "core.startup.ranking_entry_intraday_cap_patch"),
     ("SUMMARY_AI_NO_DIRECT_SYNC", "core.startup.summary_ai_no_direct_sync_patch"),
     ("RANKING_ENTRY_MARKET_HOURS_SKIP", "core.startup.ranking_entry_market_hours_skip_patch"),
     ("RANKING_STALE_FINAL", "core.startup.ranking_entry_stale_failclosed_final_patch"),
+]
+
+TONOSAMA_RESCUE_PATCHES = [
+    ("TONOSAMA_RECENT_3M5M_FAILOPEN", "core.startup.tonosama_recent3m5m_failopen_patch"),
+    ("TONOSAMA_FAILOPEN_DIRECTION_RESCUE", "core.startup.tonosama_failopen_direction_rescue_patch"),
+    ("TONOSAMA_ATR1M_RESCUE", "core.startup.tonosama_atr1m_filter_rescue_patch"),
+    ("TONOSAMA_RANGE5M_RESCUE", "core.startup.tonosama_range5m_filter_rescue_patch"),
+    ("TONOSAMA_STALE_SUMMARY_FAILOPEN", "core.startup.tonosama_fresh_summary_stale_failopen_override_patch"),
+    ("TONOSAMA_RANGE5M_TUPLE_FAILOPEN", "core.startup.tonosama_range_5m_tuple_failopen_patch"),
 ]
 
 DB_PATCHES = [
@@ -339,9 +345,24 @@ def _install_many(items) -> None:
         _install(label, module_name)
 
 
+def _install_tonosama_rescue_patches() -> None:
+    if _env_on("USERCUSTOMIZE_ENABLE_TONOSAMA_RESCUE_PATCHES", False) or _env_on(
+        "USERCUSTOMIZE_ENABLE_LEGACY_TONOSAMA_FAILOPEN_PATCHES", False
+    ):
+        logger.warning("[USERCUSTOMIZE] TONOSAMA rescue patches enabled count=%s", len(TONOSAMA_RESCUE_PATCHES))
+        _install_many(TONOSAMA_RESCUE_PATCHES)
+    else:
+        logger.warning(
+            "[USERCUSTOMIZE] TONOSAMA rescue/failopen patches skipped count=%s; "
+            "set USERCUSTOMIZE_ENABLE_TONOSAMA_RESCUE_PATCHES=1 to restore.",
+            len(TONOSAMA_RESCUE_PATCHES),
+        )
+
+
 def _bg_main() -> None:
     logger.warning("[USERCUSTOMIZE] main background patches start count=%s", len(MAIN_BG_PATCHES))
     _install_many(MAIN_BG_PATCHES)
+    _install_tonosama_rescue_patches()
     logger.warning("[USERCUSTOMIZE] main background patches done")
 
 
@@ -364,3 +385,4 @@ elif _is_main_py() and _env_on("USERCUSTOMIZE_MAIN_LITE", True):
     logger.warning("[USERCUSTOMIZE] main lite mode enabled sync=%s background=%s", len(MAIN_SYNC_PATCHES), len(MAIN_BG_PATCHES))
 else:
     _install_many(MAIN_SYNC_PATCHES + MAIN_BG_PATCHES)
+    _install_tonosama_rescue_patches()
