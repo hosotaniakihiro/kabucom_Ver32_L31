@@ -132,7 +132,7 @@ DEFAULTS = {
     "RANKING_ENTRY_RAW_FALLBACK_ONLY_TODAY": "1",
     "RANKING_PRECHECK_PENDING_FAILOPEN_ENABLED": "0",
     "RANKING_SNAPSHOT_TECH_BRIDGE_ENABLED": "1",
-    "RANKING_AI_GATE_FAILOPEN_ENABLED": "1",
+    "RANKING_AI_GATE_FAILOPEN_ENABLED": "0",
     "RANKING_AI_GATE_FAILOPEN_MIN_SCORE": "50",
     "RANKING_AI_GATE_FAILOPEN_MIN_TURNOVER": "30000000",
     "RANKING_AI_GATE_FAILOPEN_MIN_VOLUME": "30000",
@@ -150,6 +150,8 @@ DEFAULTS = {
     "ENTRY_RANKING_SCALP_AI_FALLBACK_ANY_NG": "0",
     "ENTRY_RANKING_SCALP_RANGE_NO_HIGHLOW_FAILOPEN": "0",
     "ENTRY_RANKING_SCALP_RANGE_ERROR_FAILOPEN": "0",
+    "USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES": "0",
+    "USERCUSTOMIZE_ENABLE_LEGACY_RANKING_FAILOPEN_PATCHES": "0",
     "TONOSAMA_STALE_SUMMARY_FAILOPEN": "0",
     "TONOSAMA_RECENT_3M5M_FAILOPEN": "0",
     "TONOSAMA_ALLOW_STALE_MTF_ENTRY": "0",
@@ -217,28 +219,34 @@ os.environ["RANKING_SNAPSHOT_TECH_BRIDGE_ENABLED"] = "1"
 os.environ["ENTRY_ORDER_EXCHANGE"] = "9"
 os.environ["KABU_ORDER_EXCHANGE"] = "9"
 
-# RANKING early-session rescue: override earlier sitecustomize setdefault values.
-# The 2026-06-11 log showed strong RANKING candidates being killed by zero ATR / flat high-low
-# and by a fixed 100M turnover threshold before enough intraday history was available.
-for _k, _v in {
-    "RANKING_AI_GATE_FAILOPEN_MIN_SCORE": "50",
-    "RANKING_AI_GATE_FAILOPEN_MIN_TURNOVER": "30000000",
-    "RANKING_AI_GATE_FAILOPEN_MIN_VOLUME": "30000",
-    "RANKING_ENTRY_LIGHT_MIN_SCORE": "50",
-    "RANKING_ENTRY_LIGHT_MIN_TURNOVER": "30000000",
-    "RANKING_FINAL_RESCUE_MIN_SCORE": "50",
-    "RANKING_FINAL_RESCUE_MIN_TURNOVER": "30000000",
-    "LOW_MOVE_RANKING_ZERO_ATR_MIN_SCORE": "50",
-    "LOW_MOVE_RANKING_MIN_SCORE_FOR_NO_HIGHLOW": "50",
-    "LOW_MOVE_RANKING_ZERO_ATR_MIN_TURNOVER": "30000000",
-}.items():
-    os.environ[_k] = _v
+# RANKING rescue thresholds are still defined here, but the rescue/fail-open
+# patches are no longer loaded by default.  Set
+# USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES=1 when early-session rescue is
+# intentionally needed.
+if _env_on("USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES", False) or _env_on(
+    "USERCUSTOMIZE_ENABLE_LEGACY_RANKING_FAILOPEN_PATCHES", False
+):
+    for _k, _v in {
+        "RANKING_AI_GATE_FAILOPEN_ENABLED": "1",
+        "RANKING_AI_GATE_FAILOPEN_MIN_SCORE": "50",
+        "RANKING_AI_GATE_FAILOPEN_MIN_TURNOVER": "30000000",
+        "RANKING_AI_GATE_FAILOPEN_MIN_VOLUME": "30000",
+        "RANKING_ENTRY_LIGHT_MIN_SCORE": "50",
+        "RANKING_ENTRY_LIGHT_MIN_TURNOVER": "30000000",
+        "RANKING_FINAL_RESCUE_MIN_SCORE": "50",
+        "RANKING_FINAL_RESCUE_MIN_TURNOVER": "30000000",
+        "LOW_MOVE_RANKING_ZERO_ATR_MIN_SCORE": "50",
+        "LOW_MOVE_RANKING_MIN_SCORE_FOR_NO_HIGHLOW": "50",
+        "LOW_MOVE_RANKING_ZERO_ATR_MIN_TURNOVER": "30000000",
+    }.items():
+        os.environ[_k] = _v
 
 logger.warning(
-    "[USERCUSTOMIZE] runtime defaults lite ranking_stale_skip=%s ranking_empty_failclosed=%s ranking_tech_bridge=%s tonosama_mtf_stale_fail_closed=%s tonosama_rescue_patches=%s pullback=%s order_exchange=%s ranking_rescue_turnover=%s low_move_turnover=%s yahoo_skip=%s push_core=%s legacy_push_patches=%s",
+    "[USERCUSTOMIZE] runtime defaults lite ranking_stale_skip=%s ranking_empty_failclosed=%s ranking_tech_bridge=%s ranking_rescue_patches=%s tonosama_mtf_stale_fail_closed=%s tonosama_rescue_patches=%s pullback=%s order_exchange=%s ranking_rescue_turnover=%s low_move_turnover=%s yahoo_skip=%s push_core=%s legacy_push_patches=%s",
     os.getenv("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE"),
     os.getenv("RANKING_TODAY_EMPTY_FAIL_CLOSED"),
     os.getenv("RANKING_SNAPSHOT_TECH_BRIDGE_ENABLED"),
+    os.getenv("USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES"),
     os.getenv("TONOSAMA_MTF_STALE_FAIL_CLOSED"),
     os.getenv("USERCUSTOMIZE_ENABLE_TONOSAMA_RESCUE_PATCHES"),
     os.getenv("PULLBACK_ENTRY_ENABLED"),
@@ -305,14 +313,12 @@ MAIN_BG_PATCHES = [
     ("EXIT_DB_STALE_GUARD", "core.startup.exit_db_stale_position_guard_patch"),
     ("EXIT_LOOP_TIMEOUT_GUARD", "core.startup.exit_loop_timeout_guard_patch"),
     ("ENTRY_MA5_THIRD_BAR_GUARD", "core.startup.entry_ma5_third_bar_slope_guard_patch"),
-    ("ENTRY_RANKING_SCALP_RESCUE", "core.startup.entry_ranking_scalp_order_rescue_patch"),
     ("RANKING_ENTRY_WIDER_TOP", "core.startup.ranking_entry_wider_top_universe_patch"),
     ("RANKING_WAL_MEMORY_GUARD", "core.startup.ranking_wal_checkpoint_memory_guard_patch"),
     ("TONOSAMA_RUNTIME_25SEC_BUDGET", "core.startup.tonosama_runtime_25sec_budget_patch"),
     ("TONOSAMA_LUNCH_REOPEN_RECENT", "core.startup.tonosama_lunch_reopen_recent_patch"),
     ("YAHOO_COMPUTE_SCHEMA_NA_GUARD", "core.startup.yahoo_compute_schema_na_guard_patch"),
     ("RANKING_ENTRY_FAST_BUDGET_OVERRIDE", "core.startup.ranking_entry_fast_budget_override_patch"),
-    ("RANKING_AI_GATE_FAILOPEN", "core.startup.ranking_entry_gate_failopen_patch"),
     ("WATCHLIST_LIQ_EMPTY_FAILOPEN", "core.startup.watchlist_liq_empty_failopen_register_patch"),
     ("TONOSAMA_DEDICATED_OK_FINAL_ACCEPT", "core.startup.tonosama_dedicated_ok_final_accept_patch"),
     ("TONOSAMA_ONE_PENDING", "core.startup.tonosama_one_pending_per_loop_patch"),
@@ -323,6 +329,11 @@ MAIN_BG_PATCHES = [
     ("SUMMARY_AI_NO_DIRECT_SYNC", "core.startup.summary_ai_no_direct_sync_patch"),
     ("RANKING_ENTRY_MARKET_HOURS_SKIP", "core.startup.ranking_entry_market_hours_skip_patch"),
     ("RANKING_STALE_FINAL", "core.startup.ranking_entry_stale_failclosed_final_patch"),
+]
+
+RANKING_RESCUE_PATCHES = [
+    ("ENTRY_RANKING_SCALP_RESCUE", "core.startup.entry_ranking_scalp_order_rescue_patch"),
+    ("RANKING_AI_GATE_FAILOPEN", "core.startup.ranking_entry_gate_failopen_patch"),
 ]
 
 TONOSAMA_RESCUE_PATCHES = [
@@ -345,6 +356,20 @@ def _install_many(items) -> None:
         _install(label, module_name)
 
 
+def _install_ranking_rescue_patches() -> None:
+    if _env_on("USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES", False) or _env_on(
+        "USERCUSTOMIZE_ENABLE_LEGACY_RANKING_FAILOPEN_PATCHES", False
+    ):
+        logger.warning("[USERCUSTOMIZE] RANKING rescue/failopen patches enabled count=%s", len(RANKING_RESCUE_PATCHES))
+        _install_many(RANKING_RESCUE_PATCHES)
+    else:
+        logger.warning(
+            "[USERCUSTOMIZE] RANKING rescue/failopen patches skipped count=%s; "
+            "set USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES=1 to restore.",
+            len(RANKING_RESCUE_PATCHES),
+        )
+
+
 def _install_tonosama_rescue_patches() -> None:
     if _env_on("USERCUSTOMIZE_ENABLE_TONOSAMA_RESCUE_PATCHES", False) or _env_on(
         "USERCUSTOMIZE_ENABLE_LEGACY_TONOSAMA_FAILOPEN_PATCHES", False
@@ -362,6 +387,7 @@ def _install_tonosama_rescue_patches() -> None:
 def _bg_main() -> None:
     logger.warning("[USERCUSTOMIZE] main background patches start count=%s", len(MAIN_BG_PATCHES))
     _install_many(MAIN_BG_PATCHES)
+    _install_ranking_rescue_patches()
     _install_tonosama_rescue_patches()
     logger.warning("[USERCUSTOMIZE] main background patches done")
 
@@ -385,4 +411,5 @@ elif _is_main_py() and _env_on("USERCUSTOMIZE_MAIN_LITE", True):
     logger.warning("[USERCUSTOMIZE] main lite mode enabled sync=%s background=%s", len(MAIN_SYNC_PATCHES), len(MAIN_BG_PATCHES))
 else:
     _install_many(MAIN_SYNC_PATCHES + MAIN_BG_PATCHES)
+    _install_ranking_rescue_patches()
     _install_tonosama_rescue_patches()
