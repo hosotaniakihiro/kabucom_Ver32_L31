@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import logging
 import os
 import sys
@@ -28,16 +29,28 @@ def _env_on(name: str, default: bool = False) -> bool:
 def _is_database_collector_context() -> bool:
     try:
         argv = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
-        if any(x in argv for x in (
-            "main_database.py", "db_prepare_runner.py", "ranking_collector_runner.py",
-            "push_receiver_runner.py", "yahoo_complement_runner.py", "summary_database_runner.py",
-            "data_collectors_runner.py",
-        )):
+        if any(
+            x in argv
+            for x in (
+                "main_database.py",
+                "db_prepare_runner.py",
+                "ranking_collector_runner.py",
+                "push_receiver_runner.py",
+                "yahoo_complement_runner.py",
+                "summary_database_runner.py",
+                "data_collectors_runner.py",
+            )
+        ):
             return True
-        return any(os.getenv(k) == "1" for k in (
-            "AUTOSTOCK_DATA_COLLECTORS_PROCESS", "AUTOSTOCK_MAIN_DATABASE_PROCESS",
-            "AUTOSTOCK_SUMMARY_DB_WRITER", "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
-        ))
+        return any(
+            os.getenv(k) == "1"
+            for k in (
+                "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+                "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+                "AUTOSTOCK_SUMMARY_DB_WRITER",
+                "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
+            )
+        )
     except Exception:
         return False
 
@@ -50,130 +63,20 @@ def _is_main_py() -> bool:
         return False
 
 
-# Runtime defaults only. These are cheap and safe before main startup.
-DEFAULTS = {
-    "AUTOSTOCK_MAIN_SKIP_SUMMARY_DB_SAVE": "1",
-    "AUTOSTOCK_MAIN_SKIP_YAHOO_COMPLEMENT": "1",
-    "YAHOO_COMPLEMENT_RUN_IN_MAIN": "0",
-    "AUTOSTOCK_ENABLE_YAHOO_COMPLEMENT_IN_MAIN": "0",
-    "RANKING_ENTRY_HARD_TIMEOUT_SEC": "15",
-    "RANKING_ENTRY_FAST_RUNTIME_BUDGET_SEC": "15",
-    "RANKING_ENTRY_FAST_BUILD_TIMEOUT_SEC": "18",
-    "RANKING_ENTRY_FAST_CONTROLLER_TIMEOUT_SEC": "12",
-    "SUMMARY_AI_PRE_FILTER_DAILY_RISK": "0",
-    "SUMMARY_AI_DISABLE_SYMBOL_STOP_AFTER_FIRST_LOSS": "1",
-    "DAILY_RISK_SYMBOL_STOP_AFTER_FIRST_LOSS": "0",
-    "DAILY_RISK_STOP_AFTER_FIRST_LOSS": "0",
-    "SYMBOL_STOP_AFTER_FIRST_LOSS_ENABLED": "0",
-    "ENTRY_ORDER_EXCHANGE": "9",
-    "KABU_ORDER_EXCHANGE": "9",
-    # PUSH core-integrated defaults. Legacy PUSH startup shims are disabled
-    # by default below; keep their operational env policy here.
-    "PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH": "1",
-    "PUSH_STREAM_ONOPEN_REFRESH_CLEAR_FIRST": "0",
-    "PUSH_STREAM_ONOPEN_REFRESH_UNREGISTER_FIRST": "0",
-    "PUSH_STREAM_ONOPEN_REFRESH_WAIT_AFTER_CLEAR": "0.0",
-    "PUSH_STREAM_AFTER_OPEN_REFRESH_DELAY_SEC": "0.50",
-    "PUSH_STREAM_ONOPEN_WS_READY_TIMEOUT_SEC": "1.0",
-    "PUSH_WS_VENDOR_RUN_FOREVER": "1",
-    "PUSH_WS_ENABLE_PING": "0",
-    "PUSH_ROTATION_CLOSE_WS_BEFORE_REGISTER": "1",
-    "PUSH_ROTATION_REGISTER_WITH_WS_CLOSED": "1",
-    "PUSH_STREAM_PAUSE_RECONNECT_DURING_REGISTER": "1",
-    "PUSH_ROTATION_WS_CLOSE_SETTLE_SEC": "0.15",
-    "PUSH_ROTATION_UNREGISTER_WAIT_SEC": "0.2",
-    "PUSH_ROTATION_WAIT_WS_READY_AFTER_REGISTER": "1",
-    "PUSH_ROTATION_POST_REGISTER_WS_READY_TIMEOUT_SEC": "4.0",
-    "PUSH_ROTATION_POST_REGISTER_WS_POLL_SEC": "0.05",
-    "PUSH_ROTATION_POST_REGISTER_WS_SETTLE_SEC": "0.25",
-    "PUSH_STREAM_RECONNECT_BACKOFF_BASE_SEC": "0.3",
-    "PUSH_STREAM_RECONNECT_BACKOFF_MAX_SEC": "1.0",
-    "PUSH_STREAM_RECONNECT_STABLE_RESET_SEC": "5.0",
-    "PUSH_STREAM_SHORT_LIVED_SEC": "1.0",
-    "PUSH_STREAM_SHORT_LIVED_EXTRA_COOLDOWN_SEC": "0.0",
-    "PUSH_STREAM_SINGLE_OWNER_LOCK": "1",
-    "PUSH_STREAM_SINGLE_OWNER_WAIT_RETRY": "1",
-    "PUSH_STREAM_SINGLE_OWNER_RETRY_SEC": "1.0",
-    "PUSH_STREAM_SINGLE_OWNER_LOG_EVERY_SEC": "20.0",
-    "PUSH_STREAM_EMPTY_OWNER_LOCK_FAIL_OPEN": "1",
-    "PUSH_STREAM_EMPTY_OWNER_LOCK_REQUIRE_OWNER_CONTEXT": "1",
-    "WATCHLIST_RECENT_LIQ_ENABLED": "1",
-    "WATCHLIST_RECENT_LIQ_BULK_RUN_IN_MAIN": "1",
-    "WATCHLIST_RECENT_LIQ_BULK_SKIP_DB_IN_MAIN": "0",
-    "WATCHLIST_RECENT_LIQ_FAIL_OPEN_ON_TIMEOUT": "0",
-    "WATCHLIST_RECENT_LIQ_BULK_TIMEOUT_SEC": "0.75",
-    "WATCHLIST_RECENT_LIQ_BULK_SQL_HARD_TIMEOUT_SEC": "1.0",
-    "WATCHLIST_RECENT_LIQ_MIN_LATEST_VOLUME": "3000",
-    "WATCHLIST_RECENT_LIQ_MIN_AVG_VOLUME": "3000",
-    "WATCHLIST_RECENT_LIQ_MIN_TURNOVER_YEN": "1000000",
-    "FINAL_ENTRY_TONOSAMA_LIQUIDITY_FALLBACK": "1",
-    "FINAL_ENTRY_TONOSAMA_MIN_VOLUME": "30000",
-    "FINAL_ENTRY_TONOSAMA_MIN_TURNOVER": "10000000",
-    "ACTIVE_PROTECT_PENDING_SYMBOLS": "1",
-    "ACTIVE_PROTECT_EXIT_COOLDOWN_SYMBOLS": "1",
-    "ACTIVE_EXIT_COOLDOWN_PROTECT_SEC": "60",
-    "ACTIVE_PROTECT_BOARD_RETRY_SYMBOLS": "1",
-    "ACTIVE_PROTECT_HOT_SYMBOLS": "1",
-    "ENTRY_ALLOW_WITHOUT_BOARD_MIN_VOLUME": "30000",
-    "ENTRY_ALLOW_WITHOUT_BOARD_MIN_TURNOVER": "10000000",
-    "ENTRY_ALLOW_WITHOUT_BOARD_MIN_PRICE": "200",
-    "ENTRY_ALLOW_WITHOUT_BOARD_MIN_SCORE": "0.90",
-    "ENTRY_BOARD_MISSING_QTY_RATIO": "0.50",
-    "RANKING_TODAY_EMPTY_FAIL_CLOSED": "1",
-    "RANKING_ENTRY_STALE_FAIL_CLOSED": "1",
-    "RANKING_ENTRY_STALE_FAILOPEN_ENABLED": "0",
-    "RANKING_ENTRY_ABORT_ON_STALE": "1",
-    "RANKING_ENTRY_CLEAR_PENDING_ON_STALE": "1",
-    "RANKING_ENTRY_REQUIRE_TODAY": "1",
-    "RANKING_ENTRY_SNAPSHOT_MAX_AGE_SEC": "300",
-    "RANKING_PRECHECK_MAX_AGE_SEC": "300",
-    "RANKING_SNAPSHOT_MAX_AGE_SEC": "300",
-    "RANKING_ENTRY_ALLOW_STALE_FALLBACK": "0",
-    "RANKING_ENTRY_RAW_FALLBACK_ONLY_TODAY": "1",
-    "RANKING_PRECHECK_PENDING_FAILOPEN_ENABLED": "0",
-    "RANKING_SNAPSHOT_TECH_BRIDGE_ENABLED": "1",
-    "RANKING_AI_GATE_FAILOPEN_ENABLED": "0",
-    "RANKING_AI_GATE_FAILOPEN_MIN_SCORE": "50",
-    "RANKING_AI_GATE_FAILOPEN_MIN_TURNOVER": "30000000",
-    "RANKING_AI_GATE_FAILOPEN_MIN_VOLUME": "30000",
-    "RANKING_ENTRY_LIGHT_MIN_SCORE": "50",
-    "RANKING_ENTRY_LIGHT_MIN_TURNOVER": "30000000",
-    "RANKING_FINAL_RESCUE_MIN_SCORE": "50",
-    "RANKING_FINAL_RESCUE_MIN_TURNOVER": "30000000",
-    "LOW_MOVE_RANKING_ZERO_ATR_MIN_SCORE": "50",
-    "LOW_MOVE_RANKING_MIN_SCORE_FOR_NO_HIGHLOW": "50",
-    "LOW_MOVE_RANKING_ZERO_ATR_MIN_TURNOVER": "30000000",
-    "ENTRY_RANKING_SCALP_MIN_PRICE": "1500",
-    "ENTRY_RANKING_SCALP_MAX_PRICE": "7000",
-    "ENTRY_RANKING_SCALP_MIN_MTF": "0.5",
-    "ENTRY_RANKING_SCALP_ALLOW_ZERO_MTF_RESCUE": "0",
-    "ENTRY_RANKING_SCALP_AI_FALLBACK_ANY_NG": "0",
-    "ENTRY_RANKING_SCALP_RANGE_NO_HIGHLOW_FAILOPEN": "0",
-    "ENTRY_RANKING_SCALP_RANGE_ERROR_FAILOPEN": "0",
-    "USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES": "0",
-    "USERCUSTOMIZE_ENABLE_LEGACY_RANKING_FAILOPEN_PATCHES": "0",
-    "TONOSAMA_STALE_SUMMARY_FAILOPEN": "0",
-    "TONOSAMA_RECENT_3M5M_FAILOPEN": "0",
-    "TONOSAMA_ALLOW_STALE_MTF_ENTRY": "0",
-    "TONOSAMA_MTF_STALE_FAIL_CLOSED": "1",
-    "TONOSAMA_SUMMARY_MAX_AGE_SEC": "300",
-    "TONOSAMA_HISTORY_MAX_AGE_SEC": "300",
-    "SUMMARY_MTF_ENTRY_MAX_AGE_SEC": "300",
-    "USERCUSTOMIZE_ENABLE_TONOSAMA_RESCUE_PATCHES": "0",
-    "USERCUSTOMIZE_ENABLE_LEGACY_TONOSAMA_FAILOPEN_PATCHES": "0",
-    "SUMMARY_SUPPRESS_LUNCH_FALLBACK_AFTER_PM": "1",
-    "PULLBACK_ENTRY_ENABLED": "1",
-    "PULLBACK_ENTRY_MAX_CANDIDATES": "5",
-    "PULLBACK_ENTRY_LOT_RATIO": "0.5",
-    "PULLBACK_ENTRY_MIN_PULLBACK_PCT": "0.25",
-    "PULLBACK_ENTRY_MAX_PULLBACK_PCT": "1.50",
-    "PULLBACK_ENTRY_NEAR_MA_PCT": "0.35",
-    "PULLBACK_ENTRY_MIN_REBOUND_VOL_RATIO": "0.80",
-    "PULLBACK_ENTRY_MIN_VOLUME": "30000",
-    "PULLBACK_ENTRY_MIN_TURNOVER": "10000000",
-}
-for k, v in DEFAULTS.items():
-    _env_default(k, v)
+def _install_runtime_defaults() -> bool:
+    """Install centralized default env values without overriding user-provided env."""
+    try:
+        from core.startup.runtime_env_defaults_patch import install as _install_defaults
+
+        ok = bool(_install_defaults())
+        logger.warning("[USERCUSTOMIZE] centralized runtime defaults ok=%s", ok)
+        return ok
+    except Exception:
+        logger.exception("[USERCUSTOMIZE] centralized runtime defaults failed")
+        return False
+
+
+_install_runtime_defaults()
 
 # main.py default restore: entry / exit_loop_5s / ranking / tonosama / summary AI are ON.
 # To return to the previous crash-safe mode, set AUTOSTOCK_MAIN_OPERATION_MODE=entry_only before launch.
@@ -212,6 +115,7 @@ if _is_main_py():
         os.getenv("AUTOSTOCK_MAIN_SKIP_YAHOO_COMPLEMENT"),
     )
 
+# These are intentionally hard overrides from the production recovery policy.
 os.environ["ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"] = "1"
 os.environ["ENTRY_BOARD_MISSING_HARD_BLOCK"] = "0"
 os.environ["RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE"] = "1"
@@ -219,8 +123,8 @@ os.environ["RANKING_SNAPSHOT_TECH_BRIDGE_ENABLED"] = "1"
 os.environ["ENTRY_ORDER_EXCHANGE"] = "9"
 os.environ["KABU_ORDER_EXCHANGE"] = "9"
 
-# RANKING rescue thresholds are still defined here, but the rescue/fail-open
-# patches are no longer loaded by default.  Set
+# RANKING rescue thresholds are centralized in runtime_env_defaults.py, but
+# the rescue/fail-open patches are no longer loaded by default.  Set
 # USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES=1 when early-session rescue is
 # intentionally needed.
 if _env_on("USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES", False) or _env_on(
@@ -242,7 +146,7 @@ if _env_on("USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES", False) or _env_on(
         os.environ[_k] = _v
 
 logger.warning(
-    "[USERCUSTOMIZE] runtime defaults lite ranking_stale_skip=%s ranking_empty_failclosed=%s ranking_tech_bridge=%s ranking_rescue_patches=%s tonosama_mtf_stale_fail_closed=%s tonosama_rescue_patches=%s pullback=%s order_exchange=%s ranking_rescue_turnover=%s low_move_turnover=%s yahoo_skip=%s push_core=%s legacy_push_patches=%s",
+    "[USERCUSTOMIZE] runtime defaults centralized ranking_stale_skip=%s ranking_empty_failclosed=%s ranking_tech_bridge=%s ranking_rescue_patches=%s tonosama_mtf_stale_fail_closed=%s tonosama_rescue_patches=%s pullback=%s order_exchange=%s ranking_rescue_turnover=%s low_move_turnover=%s yahoo_skip=%s push_core=%s legacy_push_patches=%s",
     os.getenv("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE"),
     os.getenv("RANKING_TODAY_EMPTY_FAIL_CLOSED"),
     os.getenv("RANKING_SNAPSHOT_TECH_BRIDGE_ENABLED"),
@@ -257,7 +161,6 @@ logger.warning(
     "integrated",
     os.getenv("USERCUSTOMIZE_ENABLE_LEGACY_PUSH_PATCHES", "0"),
 )
-
 
 _INSTALLED_MODULES: set[str] = set()
 _INSTALL_LOCK = threading.RLock()
