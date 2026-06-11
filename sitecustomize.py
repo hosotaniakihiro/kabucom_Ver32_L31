@@ -1,9 +1,10 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver41-SIMPLE-RESCUE-GATES
+# Version: Ver42-DB-MINIMAL-SYNC
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # main.py は軽量同期 + background install。
+# DB/data collector系はDB専用の最小同期パッチだけにして起動を軽くする。
 # 救済/fail-open系はデフォルトOFFにして、本体判定を優先する。
 # ============================================================
 from __future__ import annotations
@@ -271,6 +272,11 @@ def _install_summary_mtf_catchup_safely() -> None:
         _write_boot_evidence("SUMMARY_MTF_CATCHUP_EXCEPTION", traceback.format_exc())
 
 
+# DB/data collector系はSQLiteとDBキャッチアップだけで十分。ENTRY/RANKING判定系はmain.py側で読む。
+DB_SYNC_PATCHES = [
+    ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
+]
+
 SYNC_MAIN_PATCHES = [
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
     ("core.startup.ranking_entry_market_hours_skip_patch", "RANKING_ENTRY_WATCHDOG", "DISABLE_RANKING_ENTRY_WATCHDOG_PATCH"),
@@ -358,10 +364,10 @@ _install_boot_exception_hook()
 _install_runtime_defaults()
 
 if _is_database_process():
-    _install_patch_list(SYNC_MAIN_PATCHES)
+    _install_patch_list(DB_SYNC_PATCHES)
     _install_liq_empty_fallback_only_if_enabled()
     _install_summary_mtf_catchup_safely()
-    logger.warning("[SITECUSTOMIZE] database context detected; heavy entry/rescue patches skipped argv=%s", sys.argv)
+    logger.warning("[SITECUSTOMIZE] database context detected; DB minimal patches installed=%s heavy entry/rescue patches skipped argv=%s", len(DB_SYNC_PATCHES), sys.argv)
 elif _is_main_py_process() and _env_on("SITECUSTOMIZE_MAIN_LITE", True):
     _install_patch_list(SYNC_MAIN_PATCHES)
     threading.Thread(target=_background_main_patch_loop, name="sitecustomize-main-bg-patches", daemon=True).start()
