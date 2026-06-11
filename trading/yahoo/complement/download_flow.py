@@ -28,6 +28,18 @@ def _env_int(name: str, default: int, *, min_value: int | None = None, max_value
         return default
 
 
+def _env_float(name: str, default: float, *, min_value: float | None = None, max_value: float | None = None) -> float:
+    try:
+        v = float(str(os.getenv(name, str(default))).strip())
+        if min_value is not None:
+            v = max(v, min_value)
+        if max_value is not None:
+            v = min(v, max_value)
+        return v
+    except Exception:
+        return default
+
+
 def _limit_symbols(symbols, *, limit: int):
     try:
         items = list(symbols or [])
@@ -37,6 +49,16 @@ def _limit_symbols(symbols, *, limit: int):
         return items
     logger.warning("[YAHOO MAIN CACHE] symbol limited before=%s after=%s", len(items), limit)
     return items[:limit]
+
+
+def _over_budget(start_ts: float, budget_sec: float, *, label: str) -> bool:
+    if budget_sec <= 0:
+        return False
+    elapsed = time.time() - start_ts
+    if elapsed > budget_sec:
+        logger.warning("[YAHOO MAIN CACHE] budget exceeded label=%s elapsed=%.3fs budget=%.3fs -> skip remaining", label, elapsed, budget_sec)
+        return True
+    return False
 
 
 def run_periodic_yahoo_complement_main_cache_only():
@@ -56,15 +78,18 @@ def run_periodic_yahoo_complement_main_cache_only():
         border_time = get_yahoo_border_time()
         end_dt = min(now, border_time)
         target_date = end_dt.date()
-        max_symbols = _env_int("AUTOSTOCK_MAIN_YAHOO_MEMORY_MAX_SYMBOLS", 80, min_value=1, max_value=500)
+        # main.py は「即時利用」が目的なので、初期値は1チャンク未満に抑える。
+        max_symbols = _env_int("AUTOSTOCK_MAIN_YAHOO_MEMORY_MAX_SYMBOLS", 40, min_value=1, max_value=500)
+        budget_sec = _env_float("AUTOSTOCK_MAIN_YAHOO_MEMORY_BUDGET_SEC", 35.0, min_value=5.0, max_value=180.0)
         logger.info(
-            "[YAHOO MAIN CACHE] start now=%s border_time=%s end_dt=%s target_date=%s intervals=%s max_symbols=%s save_db=0 update_cache=1",
+            "[YAHOO MAIN CACHE] start now=%s border_time=%s end_dt=%s target_date=%s intervals=%s max_symbols=%s budget=%.1fs save_db=0 update_cache=1",
             now,
             border_time,
             end_dt,
             target_date,
             YAHOO_SUMMARY_INTERVALS,
             max_symbols,
+            budget_sec,
         )
 
         # ranking DB / state の軽い読込は許可。重い summary DB 保存はしない。
@@ -76,6 +101,10 @@ def run_periodic_yahoo_complement_main_cache_only():
             restore_db_backfilled_state(target_date)
         except Exception:
             logger.debug("[YAHOO MAIN CACHE] restore_db_backfilled_state failed; continue", exc_info=True)
+
+        if _over_budget(job_ts, budget_sec, label="after_state_restore"):
+            log_step("main_cache_skip_budget_after_state_restore", job_ts, save_db=0, update_cache=1)
+            return None
 
         reflect_symbols = resolve_all_ranking_symbols_for_reflect(target_date=target_date)
         if not reflect_symbols:
@@ -89,6 +118,10 @@ def run_periodic_yahoo_complement_main_cache_only():
         if not download_symbols:
             logger.info("[YAHOO MAIN CACHE] no download symbols -> skip reflect_symbols=%s", len(reflect_symbols))
             log_step("main_cache_skip_no_download_symbols", job_ts, reflect_symbols=len(reflect_symbols))
+            return None
+
+        if _over_budget(job_ts, budget_sec, label="before_download"):
+            log_step("main_cache_skip_budget_before_download", job_ts, reflect_symbols=len(reflect_symbols), download_symbols=len(download_symbols), save_db=0, update_cache=1)
             return None
 
         raw_df = download_by_start_map(
@@ -108,6 +141,11 @@ def run_periodic_yahoo_complement_main_cache_only():
         if df.empty:
             logger.info("[YAHOO MAIN CACHE] normalize empty rows_raw=%s", len(raw_df))
             log_step("main_cache_normalize_empty", job_ts, rows_raw=len(raw_df))
+            return None
+
+        if _over_budget(job_ts, budget_sec, label="before_compute_cache_update"):
+            # DL済みデータを捨てるより、次回の軽い周期へ譲る。entry/exitを詰まらせないことを優先。
+            log_step("main_cache_skip_budget_before_compute", job_ts, rows=len(df), download_symbols=len(download_symbols), reflect_symbols=len(reflect_symbols), save_db=0, update_cache=0)
             return None
 
         from trading.yahoo.pipeline.complement_pipeline import run_yahoo_complement_pipeline
