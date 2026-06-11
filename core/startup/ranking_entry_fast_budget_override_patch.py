@@ -67,6 +67,18 @@ def _force_light_budget() -> None:
     os.environ.setdefault('RANKING_ENTRY_LIGHT_MIN_SCORE', '50')
     os.environ.setdefault('RANKING_ENTRY_LIGHT_MIN_TURNOVER', '50000000')
 
+    # 2026-06-11: main.py logs showed ranking build timing out before candidate
+    # evaluation because the DB fallback read 1500 rows from multiple ranking
+    # tables on the NAS.  Entry only needs a fresh snapshot head here; force the
+    # source fallback to read the small snapshot tables only and cache them.
+    os.environ['RANKING_ENTRY_SOURCE_DB_TABLES'] = 'ranking_snapshot_1min,ranking_snapshot'
+    os.environ['RANKING_ENTRY_SOURCE_DB_MAX_ROWS'] = '300'
+    os.environ['RANKING_ENTRY_SOURCE_DB_SCAN_ROWS'] = '300'
+    os.environ['RANKING_ENTRY_SOURCE_DB_LOOKBACK_MIN'] = '10'
+    os.environ['RANKING_ENTRY_SOURCE_DB_CACHE_TTL_SEC'] = '30'
+    os.environ['RANKING_ENTRY_SOURCE_DB_SQLITE_TIMEOUT_SEC'] = '0.4'
+    os.environ['RANKING_ENTRY_SOURCE_DB_BUSY_TIMEOUT_MS'] = '300'
+
 
 def _apply_once() -> bool:
     raw_runtime = _float_env('RANKING_ENTRY_FAST_RUNTIME_BUDGET_SEC', 15.0)
@@ -114,7 +126,7 @@ def _watch_loop() -> None:
     for i in range(loops):
         ok = _apply_once()
         if i in (0, loops - 1):
-            logger.warning('[RANKING ENTRY FAST BUDGET OVERRIDE] enforce v15 i=%s/%s ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s rows=%s light=%s', i, loops, ok, os.environ.get('RANKING_ENTRY_RUNTIME_BUDGET_SEC'), os.environ.get('RANKING_ENTRY_BUILD_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_MAX_PENDING_PER_RUN'), os.environ.get('RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS'), _LIGHT_INSTALLED)
+            logger.warning('[RANKING ENTRY FAST BUDGET OVERRIDE] enforce v16 i=%s/%s ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s rows=%s source_tables=%s source_scan=%s light=%s', i, loops, ok, os.environ.get('RANKING_ENTRY_RUNTIME_BUDGET_SEC'), os.environ.get('RANKING_ENTRY_BUILD_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_MAX_PENDING_PER_RUN'), os.environ.get('RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS'), os.environ.get('RANKING_ENTRY_SOURCE_DB_TABLES'), os.environ.get('RANKING_ENTRY_SOURCE_DB_SCAN_ROWS'), _LIGHT_INSTALLED)
         time.sleep(sleep_sec)
 
 
@@ -125,7 +137,7 @@ def install() -> bool:
     ok = _apply_once()
     threading.Thread(target=_watch_loop, name='ranking-entry-fast-budget-override', daemon=True).start()
     _INSTALLED = True
-    logger.warning('[RANKING ENTRY FAST BUDGET OVERRIDE] installed v15 ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s rows=%s light=%s watcher=True', ok, os.environ.get('RANKING_ENTRY_RUNTIME_BUDGET_SEC'), os.environ.get('RANKING_ENTRY_BUILD_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_MAX_PENDING_PER_RUN'), os.environ.get('RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS'), _LIGHT_INSTALLED)
+    logger.warning('[RANKING ENTRY FAST BUDGET OVERRIDE] installed v16 ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s rows=%s source_tables=%s source_scan=%s light=%s watcher=True', ok, os.environ.get('RANKING_ENTRY_RUNTIME_BUDGET_SEC'), os.environ.get('RANKING_ENTRY_BUILD_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_MAX_PENDING_PER_RUN'), os.environ.get('RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS'), os.environ.get('RANKING_ENTRY_SOURCE_DB_TABLES'), os.environ.get('RANKING_ENTRY_SOURCE_DB_SCAN_ROWS'), _LIGHT_INSTALLED)
     return True
 
 
