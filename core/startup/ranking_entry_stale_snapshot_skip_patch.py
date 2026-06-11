@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/ranking_entry_stale_snapshot_skip_patch.py
-# Version: V5-FAST-STARTUP-WATCHER
+# Version: V6-FUTURE-TIMESTAMP-GUARD
 # ============================================================
 from __future__ import annotations
 import datetime as dt
@@ -78,11 +78,16 @@ def _ranking_snapshot_fresh() -> tuple[bool, dict[str, Any]]:
         logger.exception('[RANKING STALE SNAPSHOT SKIP] resolve db failed'); db_path = None
     latest, src, rows = _latest_snapshot_time(str(db_path or ''))
     max_age = _env_float('RANKING_ENTRY_SNAPSHOT_MAX_AGE_SEC', _env_float('RANKING_PRECHECK_MAX_AGE_SEC', 300.0))
+    max_future = _env_float('RANKING_ENTRY_MAX_FUTURE_SNAPSHOT_SEC', 30.0)
     now = dt.datetime.now(); age = None if latest is None else (now - latest).total_seconds()
     require_today = _env_bool('RANKING_ENTRY_REQUIRE_TODAY', True)
     same_day = latest is not None and latest.date() == now.date()
-    ok = latest is not None and age is not None and age <= max_age and (same_day or not require_today)
-    return bool(ok), {'ok': bool(ok), 'db': str(db_path or ''), 'latest': latest.isoformat(sep=' ') if latest else None, 'source': src, 'rows': rows, 'age_sec': None if age is None else round(float(age), 3), 'max_age_sec': max_age, 'require_today': require_today, 'same_day': bool(same_day)}
+    future_sec = None if age is None or age >= 0 else abs(float(age))
+    future_ok = future_sec is None or future_sec <= max_future
+    ok = latest is not None and age is not None and age <= max_age and future_ok and (same_day or not require_today)
+    if latest is not None and not future_ok:
+        logger.warning('[RANKING STALE SNAPSHOT SKIP] future timestamp rejected latest=%s now=%s future_sec=%.1f max_future=%.1f src=%s', latest, now, future_sec, max_future, src)
+    return bool(ok), {'ok': bool(ok), 'db': str(db_path or ''), 'latest': latest.isoformat(sep=' ') if latest else None, 'source': src, 'rows': rows, 'age_sec': None if age is None else round(float(age), 3), 'future_sec': None if future_sec is None else round(float(future_sec), 3), 'max_future_sec': max_future, 'max_age_sec': max_age, 'require_today': require_today, 'same_day': bool(same_day)}
 
 def _legacy_fail_closed_allowed() -> bool:
     return bool(_env_bool('RANKING_ENTRY_FORCE_FAIL_CLOSED_ON_STALE', False) or (_env_bool('ALLOW_LEGACY_RANKING_STALE_FAIL_CLOSED', False) and _env_bool('RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE', False)))
@@ -118,6 +123,7 @@ def _make_wrapper(orig):
         return orig(*args, **kwargs)
     wrapped_run_ranking_entry_safe._ranking_stale_snapshot_skip_v4 = True
     wrapped_run_ranking_entry_safe._ranking_stale_snapshot_skip_v5 = True
+    wrapped_run_ranking_entry_safe._ranking_stale_snapshot_skip_v6 = True
     wrapped_run_ranking_entry_safe._original = orig
     return wrapped_run_ranking_entry_safe
 
@@ -127,9 +133,10 @@ def _patch_once() -> bool:
         import trading.entry_exit.tasks as tasks
         cur = getattr(tasks, '_run_ranking_entry_safe', None)
         if not callable(cur): return False
-        if getattr(cur, '_ranking_stale_snapshot_skip_v5', False) or getattr(cur, '_ranking_stale_snapshot_skip_v4', False): return True
-        _ORIG_RUN = cur; tasks._run_ranking_entry_safe = _make_wrapper(cur)
-        logger.warning('[RANKING STALE SNAPSHOT SKIP] patched outermost v5 target=%s', getattr(cur, '__name__', type(cur)))
+        if getattr(cur, '_ranking_stale_snapshot_skip_v6', False): return True
+        base = getattr(cur, '_original', cur) if (getattr(cur, '_ranking_stale_snapshot_skip_v5', False) or getattr(cur, '_ranking_stale_snapshot_skip_v4', False)) else cur
+        _ORIG_RUN = base; tasks._run_ranking_entry_safe = _make_wrapper(base)
+        logger.warning('[RANKING STALE SNAPSHOT SKIP] patched outermost v6 target=%s', getattr(base, '__name__', type(base)))
         return True
     except Exception:
         logger.exception('[RANKING STALE SNAPSHOT SKIP] patch_once failed'); return False
@@ -139,7 +146,7 @@ def _watch() -> None:
     sleep_sec = max(0.5, min(float(os.getenv('RANKING_STALE_SNAPSHOT_WATCH_SLEEP_SEC', '2.0') or 2.0), 5.0))
     for i in range(loops):
         ok = _patch_once()
-        if i in (0, loops - 1): logger.warning('[RANKING STALE SNAPSHOT SKIP] enforce v5 i=%s/%s ok=%s', i, loops, ok)
+        if i in (0, loops - 1): logger.warning('[RANKING STALE SNAPSHOT SKIP] enforce v6 i=%s/%s ok=%s', i, loops, ok)
         time.sleep(sleep_sec)
 
 def install() -> bool:
@@ -151,10 +158,11 @@ def install() -> bool:
         os.environ.setdefault('RANKING_ENTRY_REQUIRE_TODAY', '1')
         os.environ.setdefault('RANKING_ENTRY_CLEAR_PENDING_ON_STALE', '0')
         os.environ.setdefault('RANKING_ENTRY_SNAPSHOT_MAX_AGE_SEC', '300')
+        os.environ.setdefault('RANKING_ENTRY_MAX_FUTURE_SNAPSHOT_SEC', '30')
         if _INSTALLED: return True
         ok = _patch_once(); _INSTALLED = True
         threading.Thread(target=_watch, name='ranking-stale-snapshot-skip-enforcer', daemon=True).start()
-        logger.warning('[RANKING STALE SNAPSHOT SKIP] installed v5 ok=%s max_age=%s', ok, os.getenv('RANKING_ENTRY_SNAPSHOT_MAX_AGE_SEC'))
+        logger.warning('[RANKING STALE SNAPSHOT SKIP] installed v6 ok=%s max_age=%s max_future=%s', ok, os.getenv('RANKING_ENTRY_SNAPSHOT_MAX_AGE_SEC'), os.getenv('RANKING_ENTRY_MAX_FUTURE_SNAPSHOT_SEC'))
         return True
     except Exception:
         logger.exception('[RANKING STALE SNAPSHOT SKIP] install failed'); return False
