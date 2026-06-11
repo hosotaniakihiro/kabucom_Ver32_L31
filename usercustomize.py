@@ -101,8 +101,15 @@ DEFAULTS = {
     "RANKING_SNAPSHOT_TECH_BRIDGE_ENABLED": "1",
     "RANKING_AI_GATE_FAILOPEN_ENABLED": "1",
     "RANKING_AI_GATE_FAILOPEN_MIN_SCORE": "50",
-    "RANKING_AI_GATE_FAILOPEN_MIN_TURNOVER": "50000000",
+    "RANKING_AI_GATE_FAILOPEN_MIN_TURNOVER": "30000000",
     "RANKING_AI_GATE_FAILOPEN_MIN_VOLUME": "30000",
+    "RANKING_ENTRY_LIGHT_MIN_SCORE": "50",
+    "RANKING_ENTRY_LIGHT_MIN_TURNOVER": "30000000",
+    "RANKING_FINAL_RESCUE_MIN_SCORE": "50",
+    "RANKING_FINAL_RESCUE_MIN_TURNOVER": "30000000",
+    "LOW_MOVE_RANKING_ZERO_ATR_MIN_SCORE": "50",
+    "LOW_MOVE_RANKING_MIN_SCORE_FOR_NO_HIGHLOW": "50",
+    "LOW_MOVE_RANKING_ZERO_ATR_MIN_TURNOVER": "30000000",
     "ENTRY_RANKING_SCALP_MIN_PRICE": "1500",
     "ENTRY_RANKING_SCALP_MAX_PRICE": "7000",
     "ENTRY_RANKING_SCALP_MIN_MTF": "0.5",
@@ -171,14 +178,33 @@ os.environ["RANKING_SNAPSHOT_TECH_BRIDGE_ENABLED"] = "1"
 os.environ["ENTRY_ORDER_EXCHANGE"] = "9"
 os.environ["KABU_ORDER_EXCHANGE"] = "9"
 
+# RANKING early-session rescue: override earlier sitecustomize setdefault values.
+# The 2026-06-11 log showed strong RANKING candidates being killed by zero ATR / flat high-low
+# and by a fixed 100M turnover threshold before enough intraday history was available.
+for _k, _v in {
+    "RANKING_AI_GATE_FAILOPEN_MIN_SCORE": "50",
+    "RANKING_AI_GATE_FAILOPEN_MIN_TURNOVER": "30000000",
+    "RANKING_AI_GATE_FAILOPEN_MIN_VOLUME": "30000",
+    "RANKING_ENTRY_LIGHT_MIN_SCORE": "50",
+    "RANKING_ENTRY_LIGHT_MIN_TURNOVER": "30000000",
+    "RANKING_FINAL_RESCUE_MIN_SCORE": "50",
+    "RANKING_FINAL_RESCUE_MIN_TURNOVER": "30000000",
+    "LOW_MOVE_RANKING_ZERO_ATR_MIN_SCORE": "50",
+    "LOW_MOVE_RANKING_MIN_SCORE_FOR_NO_HIGHLOW": "50",
+    "LOW_MOVE_RANKING_ZERO_ATR_MIN_TURNOVER": "30000000",
+}.items():
+    os.environ[_k] = _v
+
 logger.warning(
-    "[USERCUSTOMIZE] runtime defaults lite ranking_stale_skip=%s ranking_empty_failclosed=%s ranking_tech_bridge=%s tonosama_mtf_stale_fail_closed=%s pullback=%s order_exchange=%s",
+    "[USERCUSTOMIZE] runtime defaults lite ranking_stale_skip=%s ranking_empty_failclosed=%s ranking_tech_bridge=%s tonosama_mtf_stale_fail_closed=%s pullback=%s order_exchange=%s ranking_rescue_turnover=%s low_move_turnover=%s",
     os.getenv("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE"),
     os.getenv("RANKING_TODAY_EMPTY_FAIL_CLOSED"),
     os.getenv("RANKING_SNAPSHOT_TECH_BRIDGE_ENABLED"),
     os.getenv("TONOSAMA_MTF_STALE_FAIL_CLOSED"),
     os.getenv("PULLBACK_ENTRY_ENABLED"),
     os.getenv("ENTRY_ORDER_EXCHANGE"),
+    os.getenv("RANKING_FINAL_RESCUE_MIN_TURNOVER"),
+    os.getenv("LOW_MOVE_RANKING_ZERO_ATR_MIN_TURNOVER"),
 )
 
 
