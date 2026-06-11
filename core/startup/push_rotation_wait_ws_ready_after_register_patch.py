@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/push_rotation_wait_ws_ready_after_register_patch.py
-# Version: V1-PUSH-ROTATION-WAIT-WS-READY-AFTER-REGISTER
+# Version: V2-PUSH-ROTATION-WAIT-WS-READY-AFTER-REGISTER-REBIND-REFRESH
 # ------------------------------------------------------------
 # Purpose:
 #   V12 vendor-safe rotation closes the WebSocket before REST
@@ -15,6 +15,9 @@
 #     connected/alive before starting the 4.8s hold.
 #   - If WS does not come back within timeout, do not switch side;
 #     retry the same A/B side.
+#   - V2: rotation_register.py imports transport._call_refresh at import time.
+#     Rebind that local reference to the patched ws-closed-aware transport
+#     function, otherwise rotation_* still logs ws_not_ready and skips REST register.
 # ============================================================
 from __future__ import annotations
 
@@ -53,6 +56,14 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _is_rotation_reason(reason: Any) -> bool:
+    try:
+        s = str(reason or "").strip().lower()
+        return s.startswith("rotation_") or s.startswith("push_rotation_") or s in {"rotation", "rotate"}
+    except Exception:
+        return False
+
+
 def _force_env(name: str, value: str) -> None:
     try:
         old = os.environ.get(name)
@@ -68,11 +79,138 @@ def _set_default_env() -> None:
     _force_env("PUSH_STREAM_PAUSE_RECONNECT_DURING_REGISTER", "1")
     _force_env("PUSH_STREAM_RECONNECT_BACKOFF_BASE_SEC", "0.3")
     _force_env("PUSH_STREAM_RECONNECT_BACKOFF_MAX_SEC", "1.0")
+    # Register is intentionally allowed while WS is closed in vendor-safe rotation.
+    _force_env("PUSH_ROTATION_REGISTER_WITH_WS_CLOSED", "1")
     # Wait for actual WS readiness before the 4.8s hold starts.
     _force_env("PUSH_ROTATION_WAIT_WS_READY_AFTER_REGISTER", "1")
     _force_env("PUSH_ROTATION_POST_REGISTER_WS_READY_TIMEOUT_SEC", "4.0")
     _force_env("PUSH_ROTATION_POST_REGISTER_WS_POLL_SEC", "0.05")
     _force_env("PUSH_ROTATION_POST_REGISTER_WS_SETTLE_SEC", "0.25")
+
+
+def _make_ws_closed_aware_call_refresh(transport: Any):
+    def _call_refresh_ws_closed_aware(force: bool = True, reason: str = "on_open", **kwargs) -> Any:
+        fn = getattr(transport.state, "_refresh_callable", None)
+        if not callable(fn):
+            transport.logger.info("[push_stream] refresh callable not set -> skip")
+            return None
+
+        allow_ws_closed = _is_rotation_reason(reason) and _env_bool("PUSH_ROTATION_REGISTER_WITH_WS_CLOSED", True)
+        try:
+            ws_ready = bool(transport.state._connected_event.is_set() and transport._is_ws_alive())
+        except Exception:
+            ws_ready = False
+
+        if not ws_ready and not allow_ws_closed:
+            transport.logger.warning("[push_stream] refresh skipped reason=%s ws_not_ready", reason)
+            return None
+        if not ws_ready and allow_ws_closed:
+            transport.logger.warning(
+                "[push_stream] refresh reason=%s allowed with ws_closed for vendor rotation v2",
+                reason,
+            )
+
+        try:
+            skip, skip_reason = transport._refresh_recent_or_running(reason)
+            if skip:
+                transport.logger.warning("[push_stream] refresh skipped reason=%s guard=%s", reason, skip_reason)
+                try:
+                    transport._safe_set_runtime("subscription_refresh_skip_reason", skip_reason)
+                except Exception:
+                    pass
+                return True
+        except Exception:
+            pass
+
+        attempts: list[tuple[str, dict[str, Any]]] = [
+            ("full", {"force": force, "reason": reason, **kwargs}),
+            ("force_reason", {"force": force, "reason": reason}),
+            ("force_only", {"force": force}),
+            ("kwargs_only", dict(kwargs)),
+            ("none", {}),
+        ]
+        try:
+            transport._mark_refresh_started()
+            transport._safe_set_runtime("subscription_refresh_running", True)
+            transport.logger.info(
+                "[push_stream] refresh start reason=%s ws_ready=%s allow_ws_closed=%s kwargs_keys=%s",
+                reason,
+                ws_ready,
+                allow_ws_closed,
+                sorted(list(kwargs.keys())),
+            )
+            last_type_error: TypeError | None = None
+            for label, call_kwargs in attempts:
+                try:
+                    transport.logger.info(
+                        "[push_stream] refresh attempt start reason=%s mode=%s kwargs_keys=%s",
+                        reason,
+                        label,
+                        sorted(list(call_kwargs.keys())),
+                    )
+                    result = fn(**call_kwargs)
+                    transport.logger.info(
+                        "[push_stream] refresh done reason=%s result_type=%s result=%r",
+                        reason,
+                        type(result).__name__ if result is not None else "NoneType",
+                        result,
+                    )
+                    return result
+                except TypeError as e:
+                    last_type_error = e
+                    transport.logger.warning(
+                        "[push_stream] refresh attempt TypeError reason=%s mode=%s err=%s -> retry with fewer args",
+                        reason,
+                        label,
+                        e,
+                    )
+                    continue
+            if last_type_error is not None:
+                transport.logger.warning(
+                    "[push_stream] refresh all signatures failed reason=%s last_type_error=%s",
+                    reason,
+                    last_type_error,
+                )
+            return None
+        except Exception:
+            transport.logger.exception("[push_stream] refresh failed reason=%s", reason)
+            return None
+        finally:
+            try:
+                transport._mark_refresh_done()
+                transport._safe_set_runtime("subscription_refresh_running", False)
+            except Exception:
+                pass
+
+    _call_refresh_ws_closed_aware._push_rotation_wait_ws_ready_v2 = True  # type: ignore[attr-defined]
+    return _call_refresh_ws_closed_aware
+
+
+def _patch_rotation_register_refresh_binding() -> bool:
+    """rotation_register imported _call_refresh by value, so rebind it after transport is patched."""
+    try:
+        import trading.push.push_stream.transport as transport
+        import trading.push.push_stream.rotation_register as rr
+    except Exception:
+        logger.debug("[PUSH ROTATION WAIT WS] rotation_register/transport not ready", exc_info=True)
+        return False
+
+    try:
+        cur_transport_call = getattr(transport, "_call_refresh", None)
+        if not getattr(cur_transport_call, "_push_rotation_wait_ws_ready_v2", False):
+            cur_transport_call = _make_ws_closed_aware_call_refresh(transport)
+            cur_transport_call._original = getattr(transport, "_call_refresh", None)  # type: ignore[attr-defined]
+            transport._call_refresh = cur_transport_call
+            logger.warning("[PUSH ROTATION WAIT WS] patched transport _call_refresh ws-closed-aware v2")
+
+        cur_rr_call = getattr(rr, "_call_refresh", None)
+        if cur_rr_call is not cur_transport_call:
+            rr._call_refresh = cur_transport_call
+            logger.warning("[PUSH ROTATION WAIT WS] rebound rotation_register._call_refresh to ws-closed-aware transport v2")
+        return True
+    except Exception:
+        logger.exception("[PUSH ROTATION WAIT WS] rotation_register refresh rebind failed")
+        return False
 
 
 def _wait_ws_ready_after_register(label: str, state: Any, transport: Any, rc: Any) -> bool:
@@ -150,7 +288,7 @@ def _patch_rotation_core() -> bool:
 
     try:
         cur = getattr(rc, "_run_rotation_side", None)
-        if getattr(cur, "_push_rotation_wait_ws_ready_v1", False):
+        if getattr(cur, "_push_rotation_wait_ws_ready_v2", False):
             return True
         original = cur
 
@@ -160,6 +298,9 @@ def _patch_rotation_core() -> bool:
             if not symbols:
                 rc.logger.warning("[push_stream] rotation %s skipped: empty symbols", label)
                 return False
+
+            # Ensure rotation_register uses the ws-closed-aware refresh before dispatch.
+            _patch_rotation_register_refresh_binding()
 
             reason = f"rotation_{label}"
             try:
@@ -171,7 +312,7 @@ def _patch_rotation_core() -> bool:
             try:
                 setattr(state, "_rotation_register_in_progress", True)
                 rc.logger.warning(
-                    "[push_stream] rotation %s vendor-safe cycle v13: close_ws -> REST unregister/register -> wait_ws_ready -> hold",
+                    "[push_stream] rotation %s vendor-safe cycle v14: close_ws -> REST unregister/register -> wait_ws_ready -> hold",
                     label,
                 )
                 _close_ws_before_rotation_register(label, state, transport)
@@ -188,7 +329,6 @@ def _patch_rotation_core() -> bool:
                 )
                 rc._sleep_or_stop(1.0)
                 return False
-
             if not _wait_ws_ready_after_register(label, state, transport, rc):
                 rc._sleep_or_stop(0.5)
                 return False
@@ -203,10 +343,10 @@ def _patch_rotation_core() -> bool:
             rc._sleep_or_stop(rc.ROTATE_HOLD_SEC)
             return True
 
-        _run_rotation_side_wait_ws_ready._push_rotation_wait_ws_ready_v1 = True  # type: ignore[attr-defined]
+        _run_rotation_side_wait_ws_ready._push_rotation_wait_ws_ready_v2 = True  # type: ignore[attr-defined]
         _run_rotation_side_wait_ws_ready._original = original  # type: ignore[attr-defined]
         rc._run_rotation_side = _run_rotation_side_wait_ws_ready
-        logger.warning("[PUSH ROTATION WAIT WS] patched rotation_core wait-ws-ready-after-register v1")
+        logger.warning("[PUSH ROTATION WAIT WS] patched rotation_core wait-ws-ready-after-register v2")
         return True
     except Exception:
         logger.exception("[PUSH ROTATION WAIT WS] rotation_core patch failed")
@@ -215,7 +355,9 @@ def _patch_rotation_core() -> bool:
 
 def _apply() -> bool:
     _set_default_env()
-    return bool(_patch_rotation_core())
+    ok_rebind = _patch_rotation_register_refresh_binding()
+    ok_rotation = _patch_rotation_core()
+    return bool(ok_rebind and ok_rotation)
 
 
 def install(retry: bool = True) -> bool:
@@ -224,7 +366,7 @@ def install(retry: bool = True) -> bool:
         return True
     if _apply():
         _INSTALLED = True
-        logger.warning("[PUSH ROTATION WAIT WS] installed v1 wait_ws_ready_after_register")
+        logger.warning("[PUSH ROTATION WAIT WS] installed v2 wait_ws_ready_after_register rebind_refresh")
         return True
     if retry and not _INSTALLING:
         _INSTALLING = True
@@ -235,7 +377,7 @@ def install(retry: bool = True) -> bool:
                 for _ in range(120):
                     if _apply():
                         _INSTALLED = True
-                        logger.warning("[PUSH ROTATION WAIT WS] installed v1 by retry wait_ws_ready_after_register")
+                        logger.warning("[PUSH ROTATION WAIT WS] installed v2 by retry wait_ws_ready_after_register rebind_refresh")
                         return
                     time.sleep(0.25)
                 logger.warning("[PUSH ROTATION WAIT WS] retry exhausted")
