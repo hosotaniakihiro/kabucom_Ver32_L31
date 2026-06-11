@@ -1,23 +1,27 @@
 # ============================================================
 # File   : trading/push/subscription_manager/register_ops.py
-# Version: PRODUCTION-STABLE-REV1.9-KABUSAPI-VENDOR-UNREGISTERALL-NOBODY
+# Version: PRODUCTION-STABLE-REV2.0-KABUSAPI-SEQUENCE-LOCK
 # Function:
 #   - register / unregister / clear の実行を担当する
 #   - kabu Station 公式ひな形に合わせて HTTP PUT /kabusapi/register を使う
 #   - WebSocket は受信専用、登録は HTTP API に分離する
 #   - /kabusapi/unregister/all は公式ひな形に合わせて body なし PUT で送る
+#   - unregister_all -> wait -> register の一連処理を直列化し、4002006 を抑止する
 # ============================================================
 
 from __future__ import annotations
 
 import configparser
+import contextlib
 import json
 import logging
 import os
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Optional, Sequence
+from typing import Any, Iterator, Optional, Sequence
 
 from .globals_access import safe_get_global_data, safe_getattr
 from .symbols import dedupe_keep_order, normalize_symbol
@@ -36,6 +40,9 @@ DEFAULT_BASE_URL = "http://localhost:18080/kabusapi"
 DEFAULT_REGISTER_URL = f"{DEFAULT_BASE_URL}/register"
 DEFAULT_UNREGISTER_ALL_URL = f"{DEFAULT_BASE_URL}/unregister/all"
 DEFAULT_UNREGISTER_URL = f"{DEFAULT_BASE_URL}/unregister"
+
+_SEQUENCE_LOCK = threading.RLock()
+_FILE_LOCK_HANDLE: Any = None
 
 
 def _safe_str(v: Any) -> str:
@@ -61,6 +68,21 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return float(v)
     except Exception:
         return float(default)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
 
 
 def _normalize_symbols(symbols: Sequence[str]) -> list[str]:
@@ -340,7 +362,7 @@ def _resolve_unregister_url() -> str:
 def _build_request(*, url: str, method: str, payload: Optional[dict], api_key: str) -> urllib.request.Request:
     """Build kabusapi request.
 
-    register/unregister use JSON body.  unregister/all follows the vendor sample and sends
+    register/unregister use JSON body. unregister/all follows the vendor sample and sends
     a PUT request with no body (Content-Length: 0 behavior from urllib).
     """
     method = (_safe_str(method) or "PUT").upper()
@@ -411,6 +433,93 @@ def _is_partial_register_error(content: Any) -> bool:
         return False
 
 
+def _sequence_lock_path() -> str:
+    return os.getenv("KABU_REGISTER_SEQUENCE_LOCK_PATH") or os.path.join(
+        tempfile.gettempdir(), "autostock_kabustation_register_sequence.lock"
+    )
+
+
+@contextlib.contextmanager
+def _registration_sequence_lock(reason: str = "unknown") -> Iterator[None]:
+    """Serialize kabusapi register/unregister sequences.
+
+    kabu Station treats /register as a 50-symbol total replacement-sensitive resource. If two
+    threads/processes interleave unregister_all and register, /register can return 4002006 even
+    after a successful unregister_all.  This lock keeps the whole sequence atomic from our side.
+    """
+    file_lock_enabled = _env_bool("KABU_REGISTER_SEQUENCE_FILE_LOCK", True)
+    timeout_sec = max(0.5, _safe_float(os.getenv("KABU_REGISTER_SEQUENCE_LOCK_TIMEOUT_SEC"), 20.0))
+    poll_sec = max(0.05, _safe_float(os.getenv("KABU_REGISTER_SEQUENCE_LOCK_POLL_SEC"), 0.10))
+    path = _sequence_lock_path()
+    fh = None
+    started = time.monotonic()
+    with _SEQUENCE_LOCK:
+        if file_lock_enabled:
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+            except Exception:
+                pass
+            try:
+                fh = open(path, "a+", encoding="utf-8")
+                while True:
+                    try:
+                        if os.name == "nt":
+                            import msvcrt
+                            fh.seek(0)
+                            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                        else:
+                            import fcntl
+                            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fh.seek(0)
+                        fh.truncate()
+                        fh.write(f"pid={os.getpid()} reason={reason} acquired_at={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                        fh.flush()
+                        logger.info("[SUB MANAGER] register sequence lock acquired reason=%s path=%s", reason, path)
+                        break
+                    except OSError:
+                        if time.monotonic() - started >= timeout_sec:
+                            logger.warning("[SUB MANAGER] register sequence lock timeout reason=%s path=%s -> continue without file lock", reason, path)
+                            try:
+                                fh.close()
+                            except Exception:
+                                pass
+                            fh = None
+                            break
+                        time.sleep(poll_sec)
+            except Exception:
+                logger.exception("[SUB MANAGER] register sequence file lock failed reason=%s path=%s -> continue", reason, path)
+                try:
+                    if fh is not None:
+                        fh.close()
+                except Exception:
+                    pass
+                fh = None
+        try:
+            yield
+        finally:
+            if fh is not None:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        fh.seek(0)
+                        try:
+                            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                        except Exception:
+                            pass
+                    else:
+                        import fcntl
+                        try:
+                            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                        except Exception:
+                            pass
+                    logger.info("[SUB MANAGER] register sequence lock released reason=%s path=%s", reason, path)
+                finally:
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
+
+
 def run_unregister_all() -> bool:
     api_key = _resolve_api_key()
     url = _resolve_unregister_all_url()
@@ -443,21 +552,6 @@ def run_unregister_symbols(symbols: Sequence[str]) -> bool:
     return ok
 
 
-def run_register_chunks(symbols: Sequence[str], *, exchange: int = DEFAULT_EXCHANGE, chunk_size: int = REGISTER_CHUNK_SIZE) -> bool:
-    del chunk_size
-    normalized = _truncate_to_register_limit(symbols)
-    if not normalized:
-        logger.info("[SUB MANAGER] register skipped empty target")
-        return True
-    ok, content = _register_once_with_content(normalized, exchange=exchange)
-    if ok:
-        return True
-    if _is_partial_register_error(content):
-        logger.warning("[SUB MANAGER] register partial accepted as usable size=%d content=%r", len(normalized), content)
-        return True
-    return False
-
-
 def _register_once_with_content(symbols: Sequence[str], *, exchange: int = DEFAULT_EXCHANGE) -> tuple[bool, Any]:
     normalized = _truncate_to_register_limit(symbols)
     if not normalized:
@@ -470,6 +564,22 @@ def _register_once_with_content(symbols: Sequence[str], *, exchange: int = DEFAU
     ok, content = _http_json_request(url=url, method="PUT", payload=payload, api_key=api_key)
     logger.info("[SUB MANAGER] register done size=%d ok=%s content=%r", len(normalized), ok, content)
     return ok, content
+
+
+def run_register_chunks(symbols: Sequence[str], *, exchange: int = DEFAULT_EXCHANGE, chunk_size: int = REGISTER_CHUNK_SIZE) -> bool:
+    del chunk_size
+    normalized = _truncate_to_register_limit(symbols)
+    if not normalized:
+        logger.info("[SUB MANAGER] register skipped empty target")
+        return True
+    with _registration_sequence_lock("register_chunks"):
+        ok, content = _register_once_with_content(normalized, exchange=exchange)
+    if ok:
+        return True
+    if _is_partial_register_error(content):
+        logger.warning("[SUB MANAGER] register partial accepted as usable size=%d content=%r", len(normalized), content)
+        return True
+    return False
 
 
 def run_refresh_sequence(
@@ -492,65 +602,67 @@ def run_refresh_sequence(
         wait_sec = _safe_float(wait_after_clear_sec, DEFAULT_UNREGISTER_TO_REGISTER_WAIT_SEC)
     wait_sec = max(0.0, float(wait_sec))
 
-    logger.info(
-        "[SUB MANAGER] refresh sequence start current=%d target=%d clear_first=%s unregister_first=%s wait_after_clear=%.3fs",
-        len(current_symbols or []),
-        len(normalized_target),
-        bool(clear_first),
-        bool(unregister_first),
-        wait_sec,
-    )
-
-    if clear_first:
-        ok = run_unregister_all()
-        if not ok:
-            logger.warning("[SUB MANAGER] clear_first failed but continue register=True")
-        if wait_sec > 0:
-            logger.info("[SUB MANAGER] wait after unregister all %.3fs before register size=%d", wait_sec, len(normalized_target))
-            time.sleep(wait_sec)
-    elif unregister_first and current_symbols:
-        ok = run_unregister_symbols(current_symbols)
-        if not ok:
-            logger.warning("[SUB MANAGER] unregister_first failed but continue register=True")
-        if wait_sec > 0:
-            logger.info("[SUB MANAGER] wait after unregister symbols %.3fs before register size=%d", wait_sec, len(normalized_target))
-            time.sleep(wait_sec)
-
-    ok, content = _register_once_with_content(normalized_target, exchange=exchange)
-    if ok:
-        return True
-
-    if _is_partial_register_error(content):
-        logger.warning(
-            "[SUB MANAGER] register partial accepted as usable -> hold rotation size=%d content=%r",
+    reason = "clear_register" if clear_first else "unregister_register" if unregister_first else "register"
+    with _registration_sequence_lock(reason):
+        logger.info(
+            "[SUB MANAGER] refresh sequence start current=%d target=%d clear_first=%s unregister_first=%s wait_after_clear=%.3fs locked=True",
+            len(current_symbols or []),
             len(normalized_target),
-            content,
+            bool(clear_first),
+            bool(unregister_first),
+            wait_sec,
         )
-        return True
 
-    if _is_register_count_error(content):
-        logger.warning(
-            "[SUB MANAGER] register count error -> unregister_all and retry once wait=%.3fs content=%r",
-            REGISTER_COUNT_ERROR_RETRY_WAIT_SEC,
-            content,
-        )
-        run_unregister_all()
-        if REGISTER_COUNT_ERROR_RETRY_WAIT_SEC > 0:
-            time.sleep(REGISTER_COUNT_ERROR_RETRY_WAIT_SEC)
-        ok2, content2 = _register_once_with_content(normalized_target, exchange=exchange)
-        logger.info("[SUB MANAGER] register retry after clear ok=%s content=%r", ok2, content2)
-        if ok2:
+        if clear_first:
+            ok = run_unregister_all()
+            if not ok:
+                logger.warning("[SUB MANAGER] clear_first failed but continue register=True")
+            if wait_sec > 0:
+                logger.info("[SUB MANAGER] wait after unregister all %.3fs before register size=%d", wait_sec, len(normalized_target))
+                time.sleep(wait_sec)
+        elif unregister_first and current_symbols:
+            ok = run_unregister_symbols(current_symbols)
+            if not ok:
+                logger.warning("[SUB MANAGER] unregister_first failed but continue register=True")
+            if wait_sec > 0:
+                logger.info("[SUB MANAGER] wait after unregister symbols %.3fs before register size=%d", wait_sec, len(normalized_target))
+                time.sleep(wait_sec)
+
+        ok, content = _register_once_with_content(normalized_target, exchange=exchange)
+        if ok:
             return True
-        if _is_partial_register_error(content2):
+
+        if _is_partial_register_error(content):
             logger.warning(
-                "[SUB MANAGER] register retry partial accepted as usable -> hold rotation size=%d content=%r",
+                "[SUB MANAGER] register partial accepted as usable -> hold rotation size=%d content=%r",
                 len(normalized_target),
-                content2,
+                content,
             )
             return True
-        return False
 
-    return False
+        if _is_register_count_error(content):
+            logger.warning(
+                "[SUB MANAGER] register count error -> unregister_all and retry once wait=%.3fs content=%r locked=True",
+                REGISTER_COUNT_ERROR_RETRY_WAIT_SEC,
+                content,
+            )
+            run_unregister_all()
+            if REGISTER_COUNT_ERROR_RETRY_WAIT_SEC > 0:
+                time.sleep(REGISTER_COUNT_ERROR_RETRY_WAIT_SEC)
+            ok2, content2 = _register_once_with_content(normalized_target, exchange=exchange)
+            logger.info("[SUB MANAGER] register retry after clear ok=%s content=%r", ok2, content2)
+            if ok2:
+                return True
+            if _is_partial_register_error(content2):
+                logger.warning(
+                    "[SUB MANAGER] register retry partial accepted as usable -> hold rotation size=%d content=%r",
+                    len(normalized_target),
+                    content2,
+                )
+                return True
+            return False
+
+        return False
 
 
 __all__ = [
