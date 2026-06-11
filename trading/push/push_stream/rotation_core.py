@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/rotation_core.py
-# Version: PRODUCTION-STABLE-REV6.1-PUSH-STRICT-AB-ROTATION
+# Version: PRODUCTION-STABLE-REV6.2-PUSH-FIXED-FALLBACK-FROM-TARGETS
 # ------------------------------------------------------------
 # PUSH登録制限50銘柄に対して、毎ターン固定銘柄を入れつつ、
 # 残り枠をA/Bでローテーションする。
@@ -15,6 +15,11 @@
 # ENV:
 #   PUSH_ROTATION_FIXED_SYMBOLS=15
 #   PUSH_ROTATION_VARIABLE_SYMBOLS=35
+#
+# REV6.2:
+#   - protected/open-position symbols が空でも fixed=0 にしない。
+#   - PUSH_ROTATION_FIXED_FALLBACK_FROM_TARGETS=1 の場合、targets先頭から
+#     固定15枠を作り、A/B両ターンに必ず固定枠として入れる。
 # ============================================================
 
 from __future__ import annotations
@@ -42,7 +47,19 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
-VERSION = "PRODUCTION-STABLE-REV6.1-PUSH-STRICT-AB-ROTATION"
+VERSION = "PRODUCTION-STABLE-REV6.2-PUSH-FIXED-FALLBACK-FROM-TARGETS"
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return bool(default)
+    s = str(v).strip().lower()
+    if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+        return True
+    if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled", ""}:
+        return False
+    return bool(default)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -121,6 +138,10 @@ def _build_protected_rotation_batches(targets: list[str]) -> tuple[list[str], li
     protected が15を超える場合:
       - 先頭15だけを毎ターン固定にする
       - 残りのprotectedは normal 側の先頭へ戻し、A/B可変枠で回す
+
+    protected が空の場合:
+      - targets先頭から固定枠を作る。
+      - これにより fixed=0 / A=50 / B=50 ではなく、固定15 + 可変35になる。
     """
     targets = _dedupe([str(x).strip().upper() for x in targets])
     protected_all = _resolve_protected_safe()
@@ -128,6 +149,15 @@ def _build_protected_rotation_batches(targets: list[str]) -> tuple[list[str], li
     chunk = max(1, int(DEFAULT_REGISTER_CHUNK_SIZE or 50))
 
     fixed = _dedupe(protected_all[:fixed_slots])
+    fallback_enabled = _env_bool("PUSH_ROTATION_FIXED_FALLBACK_FROM_TARGETS", True)
+    fallback_from_targets: list[str] = []
+
+    if fallback_enabled and fixed_slots > 0 and len(fixed) < fixed_slots:
+        need = fixed_slots - len(fixed)
+        fixed_existing = set(fixed)
+        fallback_from_targets = [x for x in targets if x not in fixed_existing][:need]
+        fixed = _dedupe(fixed + fallback_from_targets)[:fixed_slots]
+
     fixed_set = set(fixed)
 
     # protectedの16番目以降も捨てず、可変枠の先頭へ入れる。
@@ -143,10 +173,11 @@ def _build_protected_rotation_batches(targets: list[str]) -> tuple[list[str], li
         second = _dedupe(fixed + variable_pool[:variable_slots])[:chunk]
 
     logger.warning(
-        "[push_stream] fixed/variable rotation batches fixed=%d variable_slots=%d protected_total=%d protected_overflow=%d variable_pool=%d A=%d B=%d head_fixed=%s headA=%s headB=%s",
+        "[push_stream] fixed/variable rotation batches fixed=%d variable_slots=%d protected_total=%d fixed_fallback=%d protected_overflow=%d variable_pool=%d A=%d B=%d head_fixed=%s headA=%s headB=%s",
         len(fixed),
         variable_slots,
         len(protected_all),
+        len(fallback_from_targets),
         len(protected_overflow),
         len(variable_pool),
         len(first),
