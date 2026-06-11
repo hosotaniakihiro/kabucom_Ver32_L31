@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/ws_callbacks.py
-# Version: Ver1.5-PUSH-STREAM-WS-CALLBACKS-SOCK-NONE-DISCONNECT-FIX
+# Version: Ver1.6-PUSH-STREAM-WS-CALLBACKS-EXPECTED-10054-QUIET
 # ------------------------------------------------------------
 # PUSH WebSocket callback。
 #
@@ -9,11 +9,16 @@
 #   - rotation_enabled=False の memory-only mode でも登録銘柄を送信する
 #   - 保有銘柄が protected に入っても、実際のPUSH登録が走らない問題を修正
 #   - websocket-client の sock=None 競合を接続断扱いにして再接続へ寄せる
+#   - V1.6: rotation中の kabu Station 10054 は想定内切断として扱い、
+#           「既存の接続はリモート ホストに強制的に切断されました。 - goodbye」
+#           の表示を抑制する。
 # ============================================================
 
 from __future__ import annotations
 
 import logging
+import os
+import time
 from typing import Any
 
 import websocket
@@ -26,6 +31,76 @@ from .dataframe import _append_df
 from .writers import _queue_put
 
 logger = logging.getLogger(__name__)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
+
+
+def _is_expected_rotation_disconnect() -> bool:
+    """Return True when a 10054 is expected because we intentionally rotate registrations."""
+    try:
+        if bool(getattr(state, "_rotation_register_in_progress", False)):
+            return True
+    except Exception:
+        pass
+    try:
+        last = getattr(state, "_last_expected_ws_close_at", 0.0) or 0.0
+        if last and (time.monotonic() - float(last)) <= 8.0:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+class _Expected10054Filter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if not _env_bool("PUSH_WS_SUPPRESS_EXPECTED_10054_TEXT", True):
+                return True
+            msg = record.getMessage()
+            if not isinstance(msg, str):
+                return True
+            text = msg.lower()
+            # websocket-client may emit this independently of our callback as:
+            # "[WinError 10054] ... - goodbye". It is noise during A/B rotation;
+            # our own monitor/reconnect logs still show the real state.
+            if "10054" in text and ("goodbye" in text or "既存の接続" in msg or "reset by peer" in text):
+                return False
+        except Exception:
+            return True
+        return True
+
+
+def _install_expected_10054_filter() -> None:
+    try:
+        if not _env_bool("PUSH_WS_SUPPRESS_EXPECTED_10054_TEXT", True):
+            return
+        flt = _Expected10054Filter()
+        for name in ("websocket", "websocket._app", "websocket._core", "websocket._logging"):
+            lg = logging.getLogger(name)
+            if not any(isinstance(f, _Expected10054Filter) for f in getattr(lg, "filters", [])):
+                lg.addFilter(flt)
+        root = logging.getLogger()
+        for h in list(getattr(root, "handlers", []) or []):
+            if not any(isinstance(f, _Expected10054Filter) for f in getattr(h, "filters", [])):
+                h.addFilter(flt)
+    except Exception:
+        logger.debug("[push_stream] expected 10054 filter install failed", exc_info=True)
+
+
+_install_expected_10054_filter()
 
 
 def _safe_payload_head(payload: Any) -> str:
@@ -145,6 +220,10 @@ def on_error(ws, error):
         return
 
     if "10054" in msg or isinstance(error, ConnectionResetError):
+        if _is_expected_rotation_disconnect():
+            logger.info("[push_stream] expected vendor ws reset during rotation; reconnecting")
+            _mark_disconnected("expected_rotation_reset")
+            return
         logger.warning("[push_stream] ws reset by peer: %s", msg)
         _mark_disconnected("reset_by_peer")
         return
@@ -160,7 +239,10 @@ def on_error(ws, error):
 
 def on_close(ws: websocket.WebSocketApp, close_status_code=None, close_msg=None) -> None:
     state._last_disconnect_at = _now()
-    logger.warning("--- DISCONNECTED --- code=%s msg=%s", close_status_code, close_msg)
+    if _is_expected_rotation_disconnect():
+        logger.info("--- DISCONNECTED expected_rotation --- code=%s msg=%s", close_status_code, close_msg)
+    else:
+        logger.warning("--- DISCONNECTED --- code=%s msg=%s", close_status_code, close_msg)
     state._connected_event.clear()
     _clear_sender()
     _safe_set_runtime("ws_connected", False)
