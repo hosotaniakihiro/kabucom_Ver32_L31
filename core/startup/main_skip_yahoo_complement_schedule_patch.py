@@ -39,20 +39,21 @@ def _full_yahoo_enabled() -> bool:
     return _env_on("AUTOSTOCK_ENABLE_YAHOO_COMPLEMENT_IN_MAIN", False) or _env_on("YAHOO_COMPLEMENT_RUN_IN_MAIN", False)
 
 
-def _memory_enabled() -> bool:
-    # main.py should use Yahoo補完 immediately, but only as a cache-only path.
-    # DB writes remain disabled in main.py and are handled by main_database.py.
-    return _is_main_py() and not _full_yahoo_enabled() and _env_on("AUTOSTOCK_MAIN_YAHOO_MEMORY_COMPLEMENT", True)
-
-
 def _skip_enabled() -> bool:
-    # AUTOSTOCK_MAIN_SKIP_YAHOO_COMPLEMENT=1 means: skip the heavy DB-writing Yahoo job.
-    # It must not disable the memory-only path requested for main.py immediate use.
+    # In main.py, skipping must win over memory-cache fallback.
+    # Heavy Yahoo download/futures were blocking ranking/tonosama entry even when DB save was disabled.
+    return _is_main_py() and _env_on("AUTOSTOCK_MAIN_SKIP_YAHOO_COMPLEMENT", True) and not _full_yahoo_enabled()
+
+
+def _memory_enabled() -> bool:
+    # Explicit opt-in only. Default is disabled because main_database.py owns Yahoo補完.
+    if _skip_enabled():
+        return False
     return (
         _is_main_py()
-        and _env_on("AUTOSTOCK_MAIN_SKIP_YAHOO_COMPLEMENT", True)
         and not _full_yahoo_enabled()
-        and not _memory_enabled()
+        and _env_on("AUTOSTOCK_MAIN_YAHOO_MEMORY_COMPLEMENT", False)
+        and _env_on("AUTOSTOCK_MAIN_YAHOO_MEMORY_EXPLICIT_ENABLE", False)
     )
 
 
@@ -122,6 +123,9 @@ def _remove_yahoo_jobs() -> int:
 
 
 def _run_memory_yahoo_job():
+    if _skip_enabled():
+        logger.warning("[MAIN YAHOO COMPLEMENT POLICY] memory yahoo job suppressed by skip policy")
+        return None
     from trading.yahoo.complement.download_flow import run_periodic_yahoo_complement_main_cache_only
 
     logger.warning("[MAIN YAHOO COMPLEMENT POLICY] memory-only yahoo job start save_db=0 update_cache=1")
@@ -129,7 +133,7 @@ def _run_memory_yahoo_job():
 
 
 def _patch_yahoo_module() -> bool:
-    """Apply main.py policy: DB-writing Yahoo is blocked; memory-only Yahoo is allowed by default."""
+    """Apply main.py policy: Yahoo complement is fully blocked by default in main.py."""
     global _ORIG_REGISTER_YAHOO, _ORIG_YAHOO_WRAPPER, _ORIG_YAHOO_JOB
     try:
         import core.yahoo_tasks as yt
@@ -140,18 +144,18 @@ def _patch_yahoo_module() -> bool:
 
     try:
         cur_job = getattr(yt, "yahoo_minutely_complement_job", None)
-        if callable(cur_job) and not getattr(cur_job, "_main_yahoo_policy_v5", False):
+        if callable(cur_job) and not getattr(cur_job, "_main_yahoo_policy_v6", False):
             _ORIG_YAHOO_JOB = cur_job
 
             def yahoo_job_patched(*args: Any, **kwargs: Any):
-                if _memory_enabled():
-                    return _run_memory_yahoo_job()
                 if _skip_enabled():
                     logger.warning("[MAIN YAHOO COMPLEMENT POLICY] yahoo job fully skipped in main.py")
                     return None
+                if _memory_enabled():
+                    return _run_memory_yahoo_job()
                 return _ORIG_YAHOO_JOB(*args, **kwargs)
 
-            yahoo_job_patched._main_yahoo_policy_v5 = True
+            yahoo_job_patched._main_yahoo_policy_v6 = True
             yt.yahoo_minutely_complement_job = yahoo_job_patched
             changed = True
     except Exception:
@@ -159,16 +163,10 @@ def _patch_yahoo_module() -> bool:
 
     try:
         cur_register = getattr(yt, "register_yahoo_tasks", None)
-        if callable(cur_register) and not getattr(cur_register, "_main_yahoo_policy_v5", False):
+        if callable(cur_register) and not getattr(cur_register, "_main_yahoo_policy_v6", False):
             _ORIG_REGISTER_YAHOO = cur_register
 
             def register_patched(*args: Any, **kwargs: Any):
-                if _memory_enabled():
-                    logger.warning(
-                        "[MAIN YAHOO COMPLEMENT POLICY] register allowed as memory-only in main.py argv=%s",
-                        sys.argv,
-                    )
-                    return _ORIG_REGISTER_YAHOO(*args, **kwargs)
                 if _skip_enabled():
                     removed = _remove_yahoo_jobs()
                     logger.warning(
@@ -177,9 +175,15 @@ def _patch_yahoo_module() -> bool:
                         sys.argv,
                     )
                     return False
+                if _memory_enabled():
+                    logger.warning(
+                        "[MAIN YAHOO COMPLEMENT POLICY] register allowed as explicit memory-only in main.py argv=%s",
+                        sys.argv,
+                    )
+                    return _ORIG_REGISTER_YAHOO(*args, **kwargs)
                 return _ORIG_REGISTER_YAHOO(*args, **kwargs)
 
-            register_patched._main_yahoo_policy_v5 = True
+            register_patched._main_yahoo_policy_v6 = True
             yt.register_yahoo_tasks = register_patched
             changed = True
     except Exception:
@@ -187,18 +191,18 @@ def _patch_yahoo_module() -> bool:
 
     try:
         cur_wrapper = getattr(yt, "_yahoo_wrapper", None)
-        if callable(cur_wrapper) and not getattr(cur_wrapper, "_main_yahoo_policy_v5", False):
+        if callable(cur_wrapper) and not getattr(cur_wrapper, "_main_yahoo_policy_v6", False):
             _ORIG_YAHOO_WRAPPER = cur_wrapper
 
             def yahoo_wrapper_patched(*args: Any, **kwargs: Any):
-                if _memory_enabled():
-                    return _run_memory_yahoo_job()
                 if _skip_enabled():
                     logger.warning("[MAIN YAHOO COMPLEMENT POLICY] _yahoo_wrapper fully blocked in main.py")
                     return None
+                if _memory_enabled():
+                    return _run_memory_yahoo_job()
                 return _ORIG_YAHOO_WRAPPER(*args, **kwargs)
 
-            yahoo_wrapper_patched._main_yahoo_policy_v5 = True
+            yahoo_wrapper_patched._main_yahoo_policy_v6 = True
             yt._yahoo_wrapper = yahoo_wrapper_patched
             changed = True
     except Exception:
@@ -215,13 +219,14 @@ def install() -> bool:
         return False
 
     try:
-        # main.py default: use Yahoo immediately as memory/cache only; never do heavy DB writes.
-        os.environ.setdefault("AUTOSTOCK_MAIN_SKIP_YAHOO_COMPLEMENT", "1")
-        os.environ.setdefault("AUTOSTOCK_MAIN_YAHOO_MEMORY_COMPLEMENT", "1")
-        os.environ.setdefault("YAHOO_COMPLEMENT_RUN_IN_MAIN", "0")
-        os.environ.setdefault("AUTOSTOCK_ENABLE_YAHOO_COMPLEMENT_IN_MAIN", "0")
-        os.environ.setdefault("AUTOSTOCK_MAIN_YAHOO_MEMORY_MAX_SYMBOLS", "40")
-        os.environ.setdefault("AUTOSTOCK_MAIN_YAHOO_MEMORY_BUDGET_SEC", "35")
+        # main.py default: never run Yahoo complement. main_database.py owns Yahoo補完 and DB/cache generation.
+        os.environ["AUTOSTOCK_MAIN_SKIP_YAHOO_COMPLEMENT"] = "1"
+        os.environ["AUTOSTOCK_MAIN_YAHOO_MEMORY_COMPLEMENT"] = "0"
+        os.environ["AUTOSTOCK_MAIN_YAHOO_MEMORY_EXPLICIT_ENABLE"] = "0"
+        os.environ["YAHOO_COMPLEMENT_RUN_IN_MAIN"] = "0"
+        os.environ["AUTOSTOCK_ENABLE_YAHOO_COMPLEMENT_IN_MAIN"] = "0"
+        os.environ.setdefault("AUTOSTOCK_MAIN_YAHOO_MEMORY_MAX_SYMBOLS", "0")
+        os.environ.setdefault("AUTOSTOCK_MAIN_YAHOO_MEMORY_BUDGET_SEC", "0")
 
         import schedule
         from core.startup import schedule_loop as sl
@@ -236,10 +241,10 @@ def install() -> bool:
             _ORIG_DISPATCH = sl._dispatch_due_job
 
             def _dispatch_patched(job: Any, *args: Any, **kwargs: Any) -> bool:
-                if _skip_enabled() and _is_yahoo_complement_job(job):
+                if _is_main_py() and _is_yahoo_complement_job(job) and not _full_yahoo_enabled():
                     _advance_next_run(job)
                     logger.warning(
-                        "[MAIN YAHOO COMPLEMENT POLICY] skipped due job tags=%s func=%s next_run=%s",
+                        "[MAIN YAHOO COMPLEMENT POLICY] skipped due yahoo job tags=%s func=%s next_run=%s",
                         _safe_tags(job),
                         _job_func_name(job),
                         getattr(job, "next_run", None),
@@ -249,10 +254,10 @@ def install() -> bool:
 
             sl._dispatch_due_job = _dispatch_patched
 
-        removed = _remove_yahoo_jobs() if _skip_enabled() else 0
+        removed = _remove_yahoo_jobs()
         _INSTALLED = True
         logger.warning(
-            "[MAIN YAHOO COMPLEMENT POLICY] installed v5 mode=%s removed=%s module_patched=%s jobs=%s memory=%s skip=%s argv=%s",
+            "[MAIN YAHOO COMPLEMENT POLICY] installed v6 mode=%s removed=%s module_patched=%s jobs=%s memory=%s skip=%s argv=%s",
             "full" if _full_yahoo_enabled() else ("memory" if _memory_enabled() else "skip"),
             removed,
             module_patched,
