@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/push_stream_reconnect_stability_patch.py
-# Version: V10-PUSH-FAST-RECONNECT-SAVE-FIRST
+# Version: V11-PUSH-VENDOR-WEBSOCKET-RUNFOREVER
 # ------------------------------------------------------------
 # Purpose:
 #   Stabilize kabu Station PUSH WebSocket startup/reconnect.
@@ -8,8 +8,10 @@
 # Policy:
 #   - Do NOT run an extra on_open refresh. A/B rotation owns register.
 #   - Keep the requested unregister_all -> 0.2s -> register rotation design.
-#   - If kabu Station resets the WS after a successful register, reconnect quickly
-#     so PUSH DB save gaps stay small.
+#   - Match the vendor sample for WebSocket by default: ws.run_forever().
+#     ping_interval / ping_timeout are opt-in only because kabu Station can
+#     close the existing connection with WinError 10054 / goodbye.
+#   - Keep a single PUSH WebSocket owner per PC/process group.
 # ============================================================
 from __future__ import annotations
 
@@ -33,7 +35,12 @@ def _env_bool(name: str, default: bool) -> bool:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
             return bool(default)
-        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+            return False
+        return bool(default)
     except Exception:
         return bool(default)
 
@@ -64,7 +71,7 @@ def _is_push_owner_candidate_context() -> bool:
         "yahoo_complement_runner.py",
     )):
         return False
-    return "push_receiver_runner.py" in txt or "main.py" in txt
+    return "push_receiver_runner.py" in txt or "main.py" in txt or "main_database.py" in txt
 
 
 def _force_env(name: str, value: str) -> None:
@@ -94,7 +101,14 @@ def _set_default_env() -> None:
     _force_env("PUSH_STREAM_AFTER_OPEN_REFRESH_DELAY_SEC", "0.50")
     _force_env("PUSH_STREAM_ONOPEN_WS_READY_TIMEOUT_SEC", "1.0")
 
-    # V10: kabu Station can reset the WS after a successful register.
+    # V11: vendor sample compatibility. kabu Station sample uses ws.run_forever()
+    # without ping settings. Keep ping opt-in only.
+    _force_env("PUSH_WS_VENDOR_RUN_FOREVER", "1")
+    _force_env("PUSH_WS_ENABLE_PING", "0")
+    _setdefault_env("PUSH_WS_PING_INTERVAL_SEC", "20")
+    _setdefault_env("PUSH_WS_PING_TIMEOUT_SEC", "10")
+
+    # kabu Station can reset the WS after a successful register.
     # Keep reconnect gap tiny and do not grow to 12s again.
     _force_env("PUSH_STREAM_RECONNECT_BACKOFF_BASE_SEC", "0.3")
     _force_env("PUSH_STREAM_RECONNECT_BACKOFF_MAX_SEC", "1.0")
@@ -288,20 +302,20 @@ def _patch_transport() -> bool:
         return False
     try:
         cur = getattr(transport, "_safe_refresh_subscriptions_after_open", None)
-        if getattr(cur, "_push_reconnect_stability_v10", False):
+        if getattr(cur, "_push_reconnect_stability_v11", False):
             return True
 
         def _safe_refresh_subscriptions_after_open_patched() -> None:
             try:
-                logger.warning("[PUSH RECONNECT STABILITY] on_open refresh skipped v10; rotation handles register")
+                logger.warning("[PUSH RECONNECT STABILITY] on_open refresh skipped v11; rotation handles register")
                 return
             except Exception:
                 logger.exception("[push_stream] refresh after open failed")
 
-        _safe_refresh_subscriptions_after_open_patched._push_reconnect_stability_v10 = True  # type: ignore[attr-defined]
+        _safe_refresh_subscriptions_after_open_patched._push_reconnect_stability_v11 = True  # type: ignore[attr-defined]
         _safe_refresh_subscriptions_after_open_patched._original = cur  # type: ignore[attr-defined]
         transport._safe_refresh_subscriptions_after_open = _safe_refresh_subscriptions_after_open_patched
-        logger.warning("[PUSH RECONNECT STABILITY] patched transport on_open refresh skip v10")
+        logger.warning("[PUSH RECONNECT STABILITY] patched transport on_open refresh skip v11")
         return True
     except Exception:
         logger.exception("[PUSH RECONNECT STABILITY] transport patch failed")
@@ -329,6 +343,26 @@ def _wait_for_single_owner_lock(state: Any, _safe_set_runtime: Any) -> Any:
     return None
 
 
+def _run_vendor_forever(ws_app: Any) -> None:
+    """Run WebSocketApp in the same style as the official kabu Station sample by default."""
+    enable_ping = _env_bool("PUSH_WS_ENABLE_PING", False)
+    vendor_mode = _env_bool("PUSH_WS_VENDOR_RUN_FOREVER", True)
+    if vendor_mode and not enable_ping:
+        logger.warning("[push_stream] run_forever vendor mode: no ping_interval/no reconnect arg")
+        try:
+            return ws_app.run_forever()
+        except TypeError:
+            return ws_app.run_forever()
+
+    ping_interval = max(0.0, _env_float("PUSH_WS_PING_INTERVAL_SEC", 20.0))
+    ping_timeout = max(0.0, _env_float("PUSH_WS_PING_TIMEOUT_SEC", 10.0))
+    logger.warning("[push_stream] run_forever ping mode interval=%.1f timeout=%.1f", ping_interval, ping_timeout)
+    try:
+        return ws_app.run_forever(ping_interval=ping_interval, ping_timeout=ping_timeout, reconnect=0)
+    except TypeError:
+        return ws_app.run_forever(ping_interval=ping_interval, ping_timeout=ping_timeout)
+
+
 def _patch_runner() -> bool:
     try:
         import websocket
@@ -341,7 +375,7 @@ def _patch_runner() -> bool:
         return False
     try:
         cur = getattr(runner, "_run_forever_loop", None)
-        if getattr(cur, "_push_reconnect_stability_v10", False):
+        if getattr(cur, "_push_reconnect_stability_v11", False):
             return True
         original = cur
 
@@ -369,9 +403,10 @@ def _patch_runner() -> bool:
             max_wait = max(base, _env_float("PUSH_STREAM_RECONNECT_BACKOFF_MAX_SEC", 1.0))
             fixed_fast = _env_bool("PUSH_STREAM_FAST_FIXED_RECONNECT", True)
             logger.info(
-                "[push_stream] run loop start url=%s version=%s reconnect_fast=%.1f..%.1fs fixed=%s single_owner=%s lock_mode=%s",
+                "[push_stream] run loop start url=%s version=%s reconnect_fast=%.1f..%.1fs fixed=%s single_owner=%s lock_mode=%s vendor_ws=%s ping=%s",
                 ws_url, getattr(runner, "VERSION", "unknown"), base, max_wait, fixed_fast,
                 lock_handle is not None, "locked" if lock_handle is not None else "failopen_or_disabled",
+                _env_bool("PUSH_WS_VENDOR_RUN_FOREVER", True), _env_bool("PUSH_WS_ENABLE_PING", False),
             )
             try:
                 while not state._stop_event.is_set():
@@ -379,14 +414,20 @@ def _patch_runner() -> bool:
                     try:
                         _safe_set_runtime("push_stream_running", True)
                         _safe_set_runtime("push_ws_url", ws_url)
-                        ws_app = websocket.WebSocketApp(ws_url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
+                        ws_app = websocket.WebSocketApp(
+                            ws_url,
+                            on_open=on_open,
+                            on_message=on_message,
+                            on_error=on_error,
+                            on_close=on_close,
+                        )
                         with state._ws_state_lock:
                             state._ws_app = ws_app
-                        logger.info("[push_stream] websocket callbacks wired open=%s message=%s error=%s close=%s", callable(on_open), callable(on_message), callable(on_error), callable(on_close))
-                        try:
-                            ws_app.run_forever(ping_interval=20, ping_timeout=10, reconnect=0)
-                        except TypeError:
-                            ws_app.run_forever(ping_interval=20, ping_timeout=10)
+                        logger.info(
+                            "[push_stream] websocket callbacks wired open=%s message=%s error=%s close=%s",
+                            callable(on_open), callable(on_message), callable(on_error), callable(on_close),
+                        )
+                        _run_vendor_forever(ws_app)
                     except Exception:
                         logger.exception("[push_stream] run_forever crashed")
                     finally:
@@ -399,7 +440,7 @@ def _patch_runner() -> bool:
                         break
                     lived = time.monotonic() - connected_started
                     sleep_sec = base if fixed_fast else min(max_wait, base)
-                    logger.warning("[push_stream] reconnect after %.1fs lived=%.1fs fixed_fast=%s", sleep_sec, lived, fixed_fast)
+                    logger.warning("[push_stream] reconnect after %.1fs lived=%.1fs fixed_fast=%s vendor_ws=%s", sleep_sec, lived, fixed_fast, _env_bool("PUSH_WS_VENDOR_RUN_FOREVER", True))
                     time.sleep(sleep_sec)
                 _safe_set_runtime("push_stream_running", False)
                 logger.info("[push_stream] run loop stopped")
@@ -407,10 +448,10 @@ def _patch_runner() -> bool:
                 _release_single_owner_lock(lock_handle)
                 _LOCK_HANDLE = None
 
-        _run_forever_loop_patched._push_reconnect_stability_v10 = True  # type: ignore[attr-defined]
+        _run_forever_loop_patched._push_reconnect_stability_v11 = True  # type: ignore[attr-defined]
         _run_forever_loop_patched._original = original  # type: ignore[attr-defined]
         runner._run_forever_loop = _run_forever_loop_patched
-        logger.warning("[PUSH RECONNECT STABILITY] patched runner v10 save-first fast-reconnect single_owner=True wait_retry=True")
+        logger.warning("[PUSH RECONNECT STABILITY] patched runner v11 vendor-run-forever save-first fast-reconnect")
         return True
     except Exception:
         logger.exception("[PUSH RECONNECT STABILITY] runner patch failed")
@@ -430,7 +471,7 @@ def install(retry: bool = True) -> bool:
         return True
     if _apply():
         _INSTALLED = True
-        logger.warning("[PUSH RECONNECT STABILITY] installed v10 save_first fast_reconnect")
+        logger.warning("[PUSH RECONNECT STABILITY] installed v11 vendor_run_forever")
         return True
     if retry and not _INSTALLING:
         _INSTALLING = True
@@ -441,7 +482,7 @@ def install(retry: bool = True) -> bool:
                 for _ in range(120):
                     if _apply():
                         _INSTALLED = True
-                        logger.warning("[PUSH RECONNECT STABILITY] installed v10 by retry save_first fast_reconnect")
+                        logger.warning("[PUSH RECONNECT STABILITY] installed v11 by retry vendor_run_forever")
                         return
                     time.sleep(0.25)
                 logger.warning("[PUSH RECONNECT STABILITY] retry exhausted")
