@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Iterable, Tuple
 
-VERSION = "REV1-RUNTIME-ENV-DEFAULT-REGISTRY"
+VERSION = "REV2-RUNTIME-ENV-DEFAULT-REGISTRY-TRADE-CATEGORIES"
 
 
 @dataclass(frozen=True)
@@ -25,6 +25,16 @@ class RuntimeDefaultGroup:
     purpose: str
     settings_section: str
     safety: str
+
+
+@dataclass(frozen=True)
+class RuntimeDefaultKeyCategory:
+    """Metadata for a key-level settings.ini migration category."""
+
+    name: str
+    settings_section: str
+    purpose: str
+    env_keys: Tuple[str, ...]
 
 
 GROUPS: Tuple[RuntimeDefaultGroup, ...] = (
@@ -105,6 +115,73 @@ GROUPS: Tuple[RuntimeDefaultGroup, ...] = (
 GROUP_BY_NAME: Dict[str, RuntimeDefaultGroup] = {group.name: group for group in GROUPS}
 DICT_TO_GROUP: Dict[str, RuntimeDefaultGroup] = {group.dict_name: group for group in GROUPS}
 
+# Key-level categories do not change runtime behavior.  They document the
+# first settings.ini split targets inside the larger default dictionaries.
+KEY_CATEGORIES: Tuple[RuntimeDefaultKeyCategory, ...] = (
+    RuntimeDefaultKeyCategory(
+        name="trade_budget",
+        settings_section="trade_budget",
+        purpose="Capital allocation, candidate count, and lot sizing knobs that should eventually live in settings.ini.",
+        env_keys=(
+            "ENTRY_RANKING_SCALP_MAX_PRICE",
+            "ENTRY_RANKING_SCALP_MIN_PRICE",
+            "ENTRY_RANKING_SCALP_MIN_MTF",
+            "PULLBACK_ENTRY_LOT_RATIO",
+            "PULLBACK_ENTRY_MAX_CANDIDATES",
+        ),
+    ),
+    RuntimeDefaultKeyCategory(
+        name="order",
+        settings_section="order",
+        purpose="Broker routing and order exchange defaults.  Exchange=9 is order/SOR routing, not PUSH registration exchange.",
+        env_keys=(
+            "ENTRY_ORDER_EXCHANGE",
+            "KABU_ORDER_EXCHANGE",
+        ),
+    ),
+    RuntimeDefaultKeyCategory(
+        name="entry_limits",
+        settings_section="entry_limits",
+        purpose="Final entry liquidity, board-missing allowance, watchlist liquidity, and pullback-entry thresholds.",
+        env_keys=(
+            "WATCHLIST_RECENT_LIQ_MIN_LATEST_VOLUME",
+            "WATCHLIST_RECENT_LIQ_MIN_AVG_VOLUME",
+            "WATCHLIST_RECENT_LIQ_MIN_TURNOVER_YEN",
+            "ENTRY_ALLOW_WITHOUT_BOARD_MIN_VOLUME",
+            "ENTRY_ALLOW_WITHOUT_BOARD_MIN_TURNOVER",
+            "ENTRY_ALLOW_WITHOUT_BOARD_MIN_PRICE",
+            "ENTRY_ALLOW_WITHOUT_BOARD_MIN_SCORE",
+            "ENTRY_BOARD_MISSING_QTY_RATIO",
+            "PULLBACK_ENTRY_ENABLED",
+            "PULLBACK_ENTRY_MIN_PULLBACK_PCT",
+            "PULLBACK_ENTRY_MAX_PULLBACK_PCT",
+            "PULLBACK_ENTRY_NEAR_MA_PCT",
+            "PULLBACK_ENTRY_MIN_REBOUND_VOL_RATIO",
+            "PULLBACK_ENTRY_MIN_VOLUME",
+            "PULLBACK_ENTRY_MIN_TURNOVER",
+        ),
+    ),
+    RuntimeDefaultKeyCategory(
+        name="daily_risk",
+        settings_section="daily_risk",
+        purpose="Daily and symbol stop toggles.  Current policy keeps all-loss/first-loss stop guards disabled by default.",
+        env_keys=(
+            "SUMMARY_AI_PRE_FILTER_DAILY_RISK",
+            "SUMMARY_AI_DISABLE_SYMBOL_STOP_AFTER_FIRST_LOSS",
+            "DAILY_RISK_SYMBOL_STOP_AFTER_FIRST_LOSS",
+            "DAILY_RISK_STOP_AFTER_FIRST_LOSS",
+            "SYMBOL_STOP_AFTER_FIRST_LOSS_ENABLED",
+        ),
+    ),
+)
+
+KEY_CATEGORY_BY_NAME: Dict[str, RuntimeDefaultKeyCategory] = {
+    category.name: category for category in KEY_CATEGORIES
+}
+ENV_KEY_TO_CATEGORY: Dict[str, RuntimeDefaultKeyCategory] = {
+    key: category for category in KEY_CATEGORIES for key in category.env_keys
+}
+
 # Applying order is intentionally explicit.  Keep this in sync with
 # runtime_env_defaults.apply_site_defaults/apply_user_defaults.
 SITE_GROUP_ORDER: Tuple[str, ...] = (
@@ -137,6 +214,11 @@ def iter_groups() -> Iterable[RuntimeDefaultGroup]:
     return iter(GROUPS)
 
 
+def iter_key_categories() -> Iterable[RuntimeDefaultKeyCategory]:
+    """Return key-level settings.ini migration categories."""
+    return iter(KEY_CATEGORIES)
+
+
 def group_names(order: Tuple[str, ...]) -> Tuple[str, ...]:
     """Validate and return a group-order tuple."""
     for name in order:
@@ -148,13 +230,18 @@ def group_names(order: Tuple[str, ...]) -> Tuple[str, ...]:
 __all__ = [
     "VERSION",
     "RuntimeDefaultGroup",
+    "RuntimeDefaultKeyCategory",
     "GROUPS",
     "GROUP_BY_NAME",
     "DICT_TO_GROUP",
+    "KEY_CATEGORIES",
+    "KEY_CATEGORY_BY_NAME",
+    "ENV_KEY_TO_CATEGORY",
     "SITE_GROUP_ORDER",
     "USER_GROUP_ORDER",
     "DB_MINIMAL_GROUP_ORDER",
     "HELPER_MINIMAL_GROUP_ORDER",
     "iter_groups",
+    "iter_key_categories",
     "group_names",
 ]
