@@ -1,10 +1,11 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver42-DB-MINIMAL-SYNC
+# Version: Ver43-NONMAIN-MINIMAL
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # main.py は軽量同期 + background install。
 # DB/data collector系はDB専用の最小同期パッチだけにして起動を軽くする。
+# main.pyでもDBでもない補助スクリプトは、原則SQLite最小ロードにする。
 # 救済/fail-open系はデフォルトOFFにして、本体判定を優先する。
 # ============================================================
 from __future__ import annotations
@@ -226,6 +227,8 @@ def _install_runtime_defaults() -> None:
             "SITECUSTOMIZE_ENABLE_RANKING_FINAL_RESCUE_PATCH": "0",
             "SITECUSTOMIZE_ENABLE_TONOSAMA_EXTRA_RESCUE_PATCHES": "0",
             "SITECUSTOMIZE_ENABLE_SUMMARY_AI_RESCUE_PATCHES": "0",
+            # 非main/非DBの補助スクリプトはデフォルト最小ロード。必要時だけFULLへ戻す。
+            "SITECUSTOMIZE_ENABLE_FULL_NONMAIN": "0",
             # SQLite memory assist defaults. main_database_cpu_guard_env/data_collectors_runner may override before child launch.
             "SQLITE_MEMORY_PRAGMAS_ENABLED": "1",
             "SQLITE_MEMORY_TEMP_STORE": "MEMORY",
@@ -239,7 +242,7 @@ def _install_runtime_defaults() -> None:
         os.environ["ENTRY_SHORT_MTF_REQUIRE_ALL"] = "0"
         _write_boot_evidence("RUNTIME_DEFAULTS_SET", {"ranking_snapshot_alias": os.environ.get("RANKING_ENTRY_SNAPSHOT_TECH_ALIAS_ENABLED"), "sqlite_memory": os.environ.get("SQLITE_MEMORY_PRAGMAS_ENABLED")})
         logger.warning(
-            "[SITECUSTOMIZE] defaults lite ranking_watchdog=%s timeout=%s hard_timeout=%s snapshot_tech_alias=%s ranking_price=%s-%s rescue=%s tonosama_raw1_resample=%s yahoo_db_warmup=%s sqlite_memory=%s cache=%s mmap=%s",
+            "[SITECUSTOMIZE] defaults lite ranking_watchdog=%s timeout=%s hard_timeout=%s snapshot_tech_alias=%s ranking_price=%s-%s rescue=%s tonosama_raw1_resample=%s yahoo_db_warmup=%s sqlite_memory=%s cache=%s mmap=%s full_nonmain=%s",
             os.environ.get("RANKING_ENTRY_WATCHDOG_ENABLED"),
             os.environ.get("RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC"),
             os.environ.get("RANKING_ENTRY_HARD_TIMEOUT_SEC"),
@@ -252,6 +255,7 @@ def _install_runtime_defaults() -> None:
             os.environ.get("SQLITE_MEMORY_PRAGMAS_ENABLED"),
             os.environ.get("SQLITE_MEMORY_CACHE_KB"),
             os.environ.get("SQLITE_MMAP_SIZE_BYTES"),
+            os.environ.get("SITECUSTOMIZE_ENABLE_FULL_NONMAIN"),
         )
     except Exception:
         _write_boot_evidence("RUNTIME_DEFAULTS_EXCEPTION", traceback.format_exc())
@@ -272,11 +276,12 @@ def _install_summary_mtf_catchup_safely() -> None:
         _write_boot_evidence("SUMMARY_MTF_CATCHUP_EXCEPTION", traceback.format_exc())
 
 
-# DB/data collector系はSQLiteとDBキャッチアップだけで十分。ENTRY/RANKING判定系はmain.py側で読む。
+# DB/data collector系と非main補助スクリプトはSQLite中心の最小ロード。
 DB_SYNC_PATCHES = [
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
 ]
 
+# main.pyだけで同期適用する売買系の最小ガード。
 SYNC_MAIN_PATCHES = [
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
     ("core.startup.ranking_entry_market_hours_skip_patch", "RANKING_ENTRY_WATCHDOG", "DISABLE_RANKING_ENTRY_WATCHDOG_PATCH"),
@@ -359,6 +364,16 @@ def _background_main_patch_loop() -> None:
     logger.warning("[SITECUSTOMIZE] main background patches done")
 
 
+def _install_nonmain_minimal() -> None:
+    _install_patch_list(DB_SYNC_PATCHES)
+    _install_liq_empty_fallback_only_if_enabled()
+    logger.warning(
+        "[SITECUSTOMIZE] non-main helper context detected; minimal patches installed=%s full trading patches skipped argv=%s",
+        len(DB_SYNC_PATCHES),
+        sys.argv,
+    )
+
+
 _write_boot_evidence("PYTHON_START")
 _install_boot_exception_hook()
 _install_runtime_defaults()
@@ -372,10 +387,13 @@ elif _is_main_py_process() and _env_on("SITECUSTOMIZE_MAIN_LITE", True):
     _install_patch_list(SYNC_MAIN_PATCHES)
     threading.Thread(target=_background_main_patch_loop, name="sitecustomize-main-bg-patches", daemon=True).start()
     logger.warning("[SITECUSTOMIZE] main lite mode enabled sync=%s background=%s", len(SYNC_MAIN_PATCHES), len(BACKGROUND_MAIN_PATCHES))
-else:
+elif _env_on("SITECUSTOMIZE_ENABLE_FULL_NONMAIN", False):
+    logger.warning("[SITECUSTOMIZE] full non-main mode enabled by env; installing trading patches argv=%s", sys.argv)
     _install_patch_list(SYNC_MAIN_PATCHES + BACKGROUND_MAIN_PATCHES)
     _install_optional_rescue_patches()
     _install_liq_empty_fallback_only_if_enabled()
     _install_summary_mtf_catchup_safely()
+else:
+    _install_nonmain_minimal()
 
 _write_boot_evidence("SITECUSTOMIZE_DONE")
