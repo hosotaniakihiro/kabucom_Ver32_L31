@@ -1,9 +1,10 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver40-SQLITE-MEMORY-PRAGMAS
+# Version: Ver41-SIMPLE-RESCUE-GATES
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # main.py は軽量同期 + background install。
+# 救済/fail-open系はデフォルトOFFにして、本体判定を優先する。
 # ============================================================
 from __future__ import annotations
 
@@ -57,6 +58,13 @@ def _env_on(name: str, default: bool = False) -> bool:
         return bool(default)
 
 
+def _argv_text() -> str:
+    try:
+        return " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+    except Exception:
+        return ""
+
+
 def _is_main_py_process() -> bool:
     try:
         argv = [str(x).replace("\\", "/").lower() for x in sys.argv]
@@ -66,7 +74,27 @@ def _is_main_py_process() -> bool:
 
 
 def _is_database_process() -> bool:
-    return any(_env_on(x, False) for x in ("AUTOSTOCK_DATA_COLLECTORS_PROCESS", "AUTOSTOCK_SUMMARY_DB_WRITER", "AUTOSTOCK_MAIN_DATABASE_PROCESS"))
+    # main_database.py / runner系はENTRY/TONOSAMAの重い起動パッチを不要にする。
+    try:
+        argv = _argv_text()
+        if any(x in argv for x in (
+            "main_database.py",
+            "data_collectors_runner.py",
+            "db_prepare_runner.py",
+            "push_receiver_runner.py",
+            "yahoo_complement_runner.py",
+            "summary_database_runner.py",
+            "ranking_collector_runner.py",
+        )):
+            return True
+    except Exception:
+        pass
+    return any(_env_on(x, False) for x in (
+        "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+        "AUTOSTOCK_SUMMARY_DB_WRITER",
+        "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+        "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
+    ))
 
 
 def _install_boot_exception_hook() -> None:
@@ -131,29 +159,30 @@ def _install_runtime_defaults() -> None:
             "RANKING_ENTRY_HIGH_LOW_SNAPSHOT_MAX_AGE_MIN": "30",
             "RANKING_STUCK_PENDING_MAX_CONTROLLER_RETRY": "2",
             "RANKING_STUCK_PENDING_MAX_AGE_SEC": "120",
-            "RANKING_FINAL_RESCUE_MIN_SCORE": "55",
+            # rescue/fail-open系は通常OFF。本当に必要な時だけ下の rescue gate でONに戻す。
+            "RANKING_FINAL_RESCUE_AI_FAILOPEN": "0",
+            "RANKING_FINAL_RESCUE_MIN_SCORE": "50",
             "RANKING_FINAL_RESCUE_ATR_MIN_RATIO": "0.0005",
-            "RANKING_FINAL_RESCUE_AI_FAILOPEN": "1",
             "LOW_MOVE_RANKING_MIN_ENTRY_PRICE": "300",
             "LOW_MOVE_RANKING_MAX_ENTRY_PRICE": "7000",
             "LOW_MOVE_RANKING_MIN_RANGE_PCT_LOW_PRICE": "0.008",
             "LOW_MOVE_RANKING_MIN_RANGE_PCT_HIGH_PRICE": "0.006",
             "LOW_MOVE_RANKING_STRONG_RANGE_PCT": "0.014",
             "LOW_MOVE_RANKING_MIN_ABS_SLOPE": "0.0000",
-            "TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING": "1",
-            "TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY": "1",
-            "TONOSAMA_ALLOW_HISTORY_MISSING_ENTRY": "1",
-            "TONOSAMA_DROP_HISTORY_MISSING_ENTRY": "0",
+            "TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING": "0",
+            "TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY": "0",
+            "TONOSAMA_ALLOW_HISTORY_MISSING_ENTRY": "0",
+            "TONOSAMA_DROP_HISTORY_MISSING_ENTRY": "1",
             "TONOSAMA_RAW1_RESAMPLE_FALLBACK": "1",
             "TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE": "3.0",
             "TONOSAMA_5SEC_ADVISORY_ENABLED": "1",
-            "TONOSAMA_5SEC_ALLOW_ZERO_IF_PRIMARY_PASS": "1",
-            "TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC": "0",
+            "TONOSAMA_5SEC_ALLOW_ZERO_IF_PRIMARY_PASS": "0",
+            "TONOSAMA_AI_FALLBACK_REJECT_ZERO_5SEC": "1",
             "TONOSAMA_AI_FALLBACK_MIN_5SEC_CHANGE_PCT": "0.0",
-            "TONOSAMA_ALLOW_HISTORY_MISSING_STRONG_MOVE": "1",
+            "TONOSAMA_ALLOW_HISTORY_MISSING_STRONG_MOVE": "0",
             "TONOSAMA_ALLOW_WARNING_ONLY_CLIMAX": "1",
             "TONOSAMA_WARNING_ONLY_MAX_PRICE_CHANGE_PCT": "0.50",
-            "TONOSAMA_PRICE_CHANGE_OR_RANGE_ENABLED": "1",
+            "TONOSAMA_PRICE_CHANGE_OR_RANGE_ENABLED": "0",
             "TONOSAMA_PRICE_CHANGE_OR_RANGE_MIN_RANGE_PCT": "3.0",
             "TONOSAMA_PRICE_CHANGE_OR_RANGE_MIN_VOLUME": "50000",
             "TONOSAMA_PRICE_CHANGE_OR_RANGE_MIN_SURGE": "3.0",
@@ -172,7 +201,7 @@ def _install_runtime_defaults() -> None:
             "ENTRY_CONTROLLER_SOURCE_PREFILTER_ENABLED": "1",
             "ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE": "1",
             "ENTRY_CONTROLLER_TONOSAMA_MIN_SCORE": "0.01",
-            "ENTRY_DIRECTION_RECURSION_FAILOPEN_ENABLED": "1",
+            "ENTRY_DIRECTION_RECURSION_FAILOPEN_ENABLED": "0",
             "ENTRY_SHORT_MTF_REQUIRED": "1",
             "ENTRY_SHORT_MTF_FORCE_2OF3": "1",
             "ENTRY_SHORT_MTF_MIN_ALIGNED": "2",
@@ -182,15 +211,20 @@ def _install_runtime_defaults() -> None:
             "ENTRY_SHORT_MTF_DB_BACKFILL": "1",
             "ENTRY_SHORT_MTF_ZERO_NEUTRAL": "1",
             "LOW_MOVE_TONOSAMA_MIN_ENTRY_PRICE": "300",
-            "LOW_MOVE_TONOSAMA_ALLOW_NO_HIGHLOW_FALLBACK": "1",
+            "LOW_MOVE_TONOSAMA_ALLOW_NO_HIGHLOW_FALLBACK": "0",
             "FINAL_ENTRY_TONOSAMA_LIQUIDITY_FALLBACK": "1",
-            "FINAL_ENTRY_TONOSAMA_MIN_VOLUME": "10000",
-            "FINAL_ENTRY_TONOSAMA_MIN_TURNOVER": "3000000",
+            "FINAL_ENTRY_TONOSAMA_MIN_VOLUME": "30000",
+            "FINAL_ENTRY_TONOSAMA_MIN_TURNOVER": "10000000",
             "YAHOO_COMPLEMENT_DB_WARMUP_ENABLED": "1",
             "YAHOO_COMPLEMENT_DB_WARMUP_MIN_BARS": "75",
             "YAHOO_COMPLEMENT_DB_WARMUP_LOOKBACK_DAYS": "7",
             "SUMMARY_DB_DATE_GUARD_ENABLED": "1",
             "SUMMARY_DB_DATE_GUARD_CLEANUP_ENABLED": "0",
+            "SITECUSTOMIZE_ENABLE_RESCUE_PATCHES": "0",
+            "SITECUSTOMIZE_ENABLE_ENTRY_FAILOPEN_PATCHES": "0",
+            "SITECUSTOMIZE_ENABLE_RANKING_FINAL_RESCUE_PATCH": "0",
+            "SITECUSTOMIZE_ENABLE_TONOSAMA_EXTRA_RESCUE_PATCHES": "0",
+            "SITECUSTOMIZE_ENABLE_SUMMARY_AI_RESCUE_PATCHES": "0",
             # SQLite memory assist defaults. main_database_cpu_guard_env/data_collectors_runner may override before child launch.
             "SQLITE_MEMORY_PRAGMAS_ENABLED": "1",
             "SQLITE_MEMORY_TEMP_STORE": "MEMORY",
@@ -204,13 +238,14 @@ def _install_runtime_defaults() -> None:
         os.environ["ENTRY_SHORT_MTF_REQUIRE_ALL"] = "0"
         _write_boot_evidence("RUNTIME_DEFAULTS_SET", {"ranking_snapshot_alias": os.environ.get("RANKING_ENTRY_SNAPSHOT_TECH_ALIAS_ENABLED"), "sqlite_memory": os.environ.get("SQLITE_MEMORY_PRAGMAS_ENABLED")})
         logger.warning(
-            "[SITECUSTOMIZE] defaults lite ranking_watchdog=%s timeout=%s hard_timeout=%s snapshot_tech_alias=%s ranking_price=%s-%s tonosama_raw1_resample=%s yahoo_db_warmup=%s sqlite_memory=%s cache=%s mmap=%s",
+            "[SITECUSTOMIZE] defaults lite ranking_watchdog=%s timeout=%s hard_timeout=%s snapshot_tech_alias=%s ranking_price=%s-%s rescue=%s tonosama_raw1_resample=%s yahoo_db_warmup=%s sqlite_memory=%s cache=%s mmap=%s",
             os.environ.get("RANKING_ENTRY_WATCHDOG_ENABLED"),
             os.environ.get("RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC"),
             os.environ.get("RANKING_ENTRY_HARD_TIMEOUT_SEC"),
             os.environ.get("RANKING_ENTRY_SNAPSHOT_TECH_ALIAS_ENABLED"),
             os.environ.get("LOW_MOVE_RANKING_MIN_ENTRY_PRICE"),
             os.environ.get("LOW_MOVE_RANKING_MAX_ENTRY_PRICE"),
+            os.environ.get("SITECUSTOMIZE_ENABLE_RESCUE_PATCHES"),
             os.environ.get("TONOSAMA_RAW1_RESAMPLE_FALLBACK"),
             os.environ.get("YAHOO_COMPLEMENT_DB_WARMUP_ENABLED"),
             os.environ.get("SQLITE_MEMORY_PRAGMAS_ENABLED"),
@@ -253,26 +288,38 @@ BACKGROUND_MAIN_PATCHES = [
     ("core.startup.ranking_entry_flat_price_guard_patch", "RANKING_FLAT_PRICE_DB_FALLBACK", "DISABLE_RANKING_FLAT_PRICE_PATCH"),
     ("core.startup.ranking_entry_source_db_fallback_patch", "RANKING_ENTRY_SOURCE_DB_FALLBACK", "DISABLE_RANKING_ENTRY_SOURCE_DB_FALLBACK_PATCH"),
     ("core.startup.ranking_entry_high_low_from_snapshot_patch", "RANKING_ENTRY_HIGH_LOW_SNAPSHOT", "DISABLE_RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH"),
-    ("core.startup.ranking_entry_final_rescue_patch", "RANKING_FINAL_RESCUE", "DISABLE_RANKING_FINAL_RESCUE_PATCH"),
     ("core.startup.ranking_stuck_pending_prune_patch", "RANKING_STUCK_PENDING_PRUNE", "DISABLE_RANKING_STUCK_PENDING_PRUNE_PATCH"),
     ("core.startup.ranking_entry_hard_timeout_patch", "RANKING_ENTRY_HARD_TIMEOUT", "DISABLE_RANKING_ENTRY_HARD_TIMEOUT_PATCH"),
     ("core.startup.yahoo_complement_db_warmup_patch", "YAHOO_COMPLEMENT_DB_WARMUP", "DISABLE_YAHOO_COMPLEMENT_DB_WARMUP_PATCH"),
-    ("core.startup.entry_direction_recursion_failopen_patch", "ENTRY_DIRECTION_RECURSION_FAILOPEN", "DISABLE_ENTRY_DIRECTION_RECURSION_FAILOPEN_PATCH"),
     ("core.startup.entry_mtf_short_required_daily_optional_patch", "SHORT_MTF_2OF3_GUARD", "DISABLE_SHORT_MTF_2OF3_GUARD_PATCH"),
     ("core.startup.entry_controller_tonosama_ai_bridge_patch", "TONOSAMA_AI_BRIDGE", "DISABLE_TONOSAMA_AI_BRIDGE_PATCH"),
-    ("core.startup.low_movement_tonosama_no_highlow_patch", "LOW_MOVE_TONOSAMA_FALLBACK", "DISABLE_LOW_MOVE_TONOSAMA_FALLBACK_PATCH"),
     ("core.startup.final_entry_tonosama_liquidity_patch", "FINAL_TONOSAMA_LIQUIDITY", "DISABLE_FINAL_TONOSAMA_LIQUIDITY_PATCH"),
-    ("core.startup.tonosama_pending_warning_relax_patch", "TONOSAMA_PENDING_WARNING_RELAX", "DISABLE_TONOSAMA_PENDING_WARNING_RELAX_PATCH"),
-    ("core.startup.tonosama_price_change_or_range_patch", "TONOSAMA_PRICE_RANGE_RESCUE", "DISABLE_TONOSAMA_PRICE_RANGE_RESCUE_PATCH"),
-    ("core.startup.tonosama_volume_surge_zero_rescue_patch", "TONOSAMA_VOLUME_SURGE_ZERO_RESCUE", "DISABLE_TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_PATCH"),
-    ("core.startup.tonosama_slope_range_rescue_patch", "TONOSAMA_SLOPE_RANGE_RESCUE", "DISABLE_TONOSAMA_SLOPE_RANGE_RESCUE_PATCH"),
     ("core.startup.tonosama_fast_score_prefilter_patch", "TONOSAMA_FAST_SCORE_PREFILTER", "DISABLE_TONOSAMA_FAST_SCORE_PREFILTER_PATCH"),
     ("core.startup.tonosama_fresh_summary_wait_fix_patch", "TONOSAMA_FRESH_SUMMARY_WAIT_FIX", "DISABLE_TONOSAMA_FRESH_SUMMARY_WAIT_FIX_PATCH"),
-    ("core.startup.summary_ai_liquidity_rescue_patch", "SUMMARY_AI_LIQ_RESCUE", "DISABLE_SUMMARY_AI_LIQ_RESCUE_PATCH"),
     ("core.startup.summary_ai_entry_hook_dataframe_truth_patch", "SUMMARY_AI_DF_TRUTH_PATCH", "DISABLE_SUMMARY_AI_DF_TRUTH_PATCH"),
     ("core.startup.summary_mtf_early_ready_patch", "SUMMARY_MTF_EARLY_READY", "DISABLE_SUMMARY_MTF_EARLY_READY_PATCH"),
     ("trading.audit_logging.install_audit_logging", "AUDIT_LOGGING", "DISABLE_AUDIT_LOGGING"),
     ("core.startup.summary_controller_concat_duplicate_columns_patch", "SUMMARY_CONTROLLER_DUPCOL_PATCH", "DISABLE_SUMMARY_CONTROLLER_DUPCOL_PATCH"),
+]
+
+ENTRY_FAILOPEN_PATCHES = [
+    ("core.startup.entry_direction_recursion_failopen_patch", "ENTRY_DIRECTION_RECURSION_FAILOPEN", "DISABLE_ENTRY_DIRECTION_RECURSION_FAILOPEN_PATCH"),
+]
+
+RANKING_RESCUE_PATCHES = [
+    ("core.startup.ranking_entry_final_rescue_patch", "RANKING_FINAL_RESCUE", "DISABLE_RANKING_FINAL_RESCUE_PATCH"),
+]
+
+TONOSAMA_EXTRA_RESCUE_PATCHES = [
+    ("core.startup.low_movement_tonosama_no_highlow_patch", "LOW_MOVE_TONOSAMA_FALLBACK", "DISABLE_LOW_MOVE_TONOSAMA_FALLBACK_PATCH"),
+    ("core.startup.tonosama_pending_warning_relax_patch", "TONOSAMA_PENDING_WARNING_RELAX", "DISABLE_TONOSAMA_PENDING_WARNING_RELAX_PATCH"),
+    ("core.startup.tonosama_price_change_or_range_patch", "TONOSAMA_PRICE_RANGE_RESCUE", "DISABLE_TONOSAMA_PRICE_RANGE_RESCUE_PATCH"),
+    ("core.startup.tonosama_volume_surge_zero_rescue_patch", "TONOSAMA_VOLUME_SURGE_ZERO_RESCUE", "DISABLE_TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_PATCH"),
+    ("core.startup.tonosama_slope_range_rescue_patch", "TONOSAMA_SLOPE_RANGE_RESCUE", "DISABLE_TONOSAMA_SLOPE_RANGE_RESCUE_PATCH"),
+]
+
+SUMMARY_AI_RESCUE_PATCHES = [
+    ("core.startup.summary_ai_liquidity_rescue_patch", "SUMMARY_AI_LIQ_RESCUE", "DISABLE_SUMMARY_AI_LIQ_RESCUE_PATCH"),
 ]
 
 
@@ -281,9 +328,26 @@ def _install_patch_list(items) -> None:
         _install_module(module_name, label, disabled_env=disabled_env)
 
 
+def _install_optional_rescue_patches() -> None:
+    all_rescue = _env_on("SITECUSTOMIZE_ENABLE_RESCUE_PATCHES", False)
+    groups = [
+        ("ENTRY failopen", ENTRY_FAILOPEN_PATCHES, all_rescue or _env_on("SITECUSTOMIZE_ENABLE_ENTRY_FAILOPEN_PATCHES", False)),
+        ("RANKING final rescue", RANKING_RESCUE_PATCHES, all_rescue or _env_on("SITECUSTOMIZE_ENABLE_RANKING_FINAL_RESCUE_PATCH", False) or _env_on("USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES", False)),
+        ("TONOSAMA extra rescue", TONOSAMA_EXTRA_RESCUE_PATCHES, all_rescue or _env_on("SITECUSTOMIZE_ENABLE_TONOSAMA_EXTRA_RESCUE_PATCHES", False) or _env_on("USERCUSTOMIZE_ENABLE_TONOSAMA_RESCUE_PATCHES", False)),
+        ("SUMMARY AI rescue", SUMMARY_AI_RESCUE_PATCHES, all_rescue or _env_on("SITECUSTOMIZE_ENABLE_SUMMARY_AI_RESCUE_PATCHES", False)),
+    ]
+    for label, items, enabled in groups:
+        if enabled:
+            logger.warning("[SITECUSTOMIZE] optional %s patches enabled count=%s", label, len(items))
+            _install_patch_list(items)
+        else:
+            logger.warning("[SITECUSTOMIZE] optional %s patches skipped count=%s", label, len(items))
+
+
 def _background_main_patch_loop() -> None:
     logger.warning("[SITECUSTOMIZE] main background patches start count=%s", len(BACKGROUND_MAIN_PATCHES))
     _install_patch_list(BACKGROUND_MAIN_PATCHES)
+    _install_optional_rescue_patches()
     _install_liq_empty_fallback_only_if_enabled()
     _install_summary_mtf_catchup_safely()
     logger.warning("[SITECUSTOMIZE] main background patches done")
@@ -293,12 +357,18 @@ _write_boot_evidence("PYTHON_START")
 _install_boot_exception_hook()
 _install_runtime_defaults()
 
-if _is_main_py_process() and not _is_database_process() and _env_on("SITECUSTOMIZE_MAIN_LITE", True):
+if _is_database_process():
+    _install_patch_list(SYNC_MAIN_PATCHES)
+    _install_liq_empty_fallback_only_if_enabled()
+    _install_summary_mtf_catchup_safely()
+    logger.warning("[SITECUSTOMIZE] database context detected; heavy entry/rescue patches skipped argv=%s", sys.argv)
+elif _is_main_py_process() and _env_on("SITECUSTOMIZE_MAIN_LITE", True):
     _install_patch_list(SYNC_MAIN_PATCHES)
     threading.Thread(target=_background_main_patch_loop, name="sitecustomize-main-bg-patches", daemon=True).start()
     logger.warning("[SITECUSTOMIZE] main lite mode enabled sync=%s background=%s", len(SYNC_MAIN_PATCHES), len(BACKGROUND_MAIN_PATCHES))
 else:
     _install_patch_list(SYNC_MAIN_PATCHES + BACKGROUND_MAIN_PATCHES)
+    _install_optional_rescue_patches()
     _install_liq_empty_fallback_only_if_enabled()
     _install_summary_mtf_catchup_safely()
 
