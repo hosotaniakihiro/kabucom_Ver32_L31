@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/__init__.py
-# Version: Ver1.4-PUSH-STREAM-PACKAGE-COMPAT-SPLIT-MODE
+# Version: Ver1.5-PUSH-STREAM-PACKAGE-COMPAT-STABILITY-PATCH
 # ------------------------------------------------------------
 # ✔ 旧 trading.push.push_stream 公開API互換
 # ✔ 分割後モジュールの再エクスポート
@@ -9,6 +9,7 @@
 #   PUSH_ROTATION_HOLD_SEC=4.8 / PUSH_ROTATION_UNREGISTER_WAIT_SEC=0.2
 #   のデフォルトを注入する
 # ✔ main_database.py 分離運用時、main.py側からのPUSH受信起動をno-op化
+# ✔ PUSH rotation stability patch を自動適用
 # ============================================================
 
 from __future__ import annotations
@@ -22,6 +23,16 @@ from . import rotation_settings as rotation_settings
 from . import rotation_symbols as rotation_symbols
 from . import rotation_register as rotation_register
 from . import rotation_logging as rotation_logging
+
+# PUSHローテーション安定化パッチ。
+# - rotation_* で unregister_all を強制しない
+# - fixed=0ならA/Bを50/50へ補正
+# - liquidity guardで100->30へ崩れた場合はfail-open
+try:
+    from . import rotation_stability_patch as rotation_stability_patch
+    rotation_stability_patch.install()
+except Exception:
+    logger.exception("[push_stream] rotation_stability_patch install failed")
 
 from .transport import (
     set_refresh_callable,
@@ -82,6 +93,7 @@ __all__ = [
     "rotation_symbols",
     "rotation_register",
     "rotation_logging",
+    "rotation_stability_patch",
     "set_refresh_callable",
     "refresh_subscriptions",
     "get_ws_sender",
