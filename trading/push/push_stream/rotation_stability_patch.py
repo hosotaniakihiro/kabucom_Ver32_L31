@@ -5,7 +5,7 @@ import os
 from typing import Any, Iterable, Sequence
 
 logger = logging.getLogger(__name__)
-VERSION = "V1.1-ROTATION-CLEAR-AB50"
+VERSION = "V1.2-ROTATION-ONOPEN-CLEAR-AB50"
 _INSTALLED = False
 
 
@@ -42,6 +42,11 @@ def _d(xs: Iterable[Any]) -> list[str]:
 def _rot(reason: Any) -> bool:
     s = str(reason or "").lower()
     return s.startswith("rotation_") or s.startswith("push_rotation_") or s in {"rotation", "rotate"}
+
+
+def _onopen(reason: Any) -> bool:
+    s = str(reason or "").lower()
+    return s.startswith("on_open") or s.startswith("onopen") or "on_open" in s
 
 
 def _patch_batches() -> bool:
@@ -124,11 +129,19 @@ def _patch_refresh() -> bool:
     def refresh(symbols: Any = None, *, reason: str = "manual", force: bool = False,
                 max_symbols: int = core.REGISTER_MAX_SYMBOLS, clear_first: Any = None,
                 unregister_first: Any = None, **kwargs: Any) -> bool:
+        target = None
+        if _rot(reason) or _onopen(reason):
+            target = core.build_target_symbols(symbols=symbols, max_symbols=max_symbols, reason=reason)
+            target = core.enforce_register_limit(target, register_chunk_size=core.REGISTER_CHUNK_SIZE, reason=reason)
         if not _rot(reason):
+            if _onopen(reason) and target:
+                wait = max(0.0, _f("PUSH_ROTATION_UNREGISTER_WAIT_SEC", 0.2))
+                logger.info("[PUSH ROTATION STABILITY] onopen clear/register reason=%s target=%d wait=%.3f", reason, len(target), wait)
+                return orig(symbols=target, reason=reason, force=True, max_symbols=max_symbols,
+                            clear_first=True, unregister_first=True,
+                            wait_after_clear_sec=wait, unregister_wait_sec=wait, **kwargs)
             return orig(symbols=symbols, reason=reason, force=force, max_symbols=max_symbols,
                         clear_first=clear_first, unregister_first=unregister_first, **kwargs)
-        target = core.build_target_symbols(symbols=symbols, max_symbols=max_symbols, reason=reason)
-        target = core.enforce_register_limit(target, register_chunk_size=core.REGISTER_CHUNK_SIZE, reason=reason)
         if not target:
             return True
         with core.state.manager_lock:
