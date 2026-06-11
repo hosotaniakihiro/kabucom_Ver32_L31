@@ -16,9 +16,11 @@ from .runtime_env_default_registry import SITE_GROUP_ORDER, USER_GROUP_ORDER
 from .runtime_env_default_registry import VERSION as REGISTRY_VERSION
 from .runtime_env_defaults import VERSION as DEFAULTS_VERSION
 from .runtime_env_defaults import apply_site_defaults, apply_user_defaults, env_bool
+from .runtime_settings_ini_loader import VERSION as SETTINGS_INI_VERSION
+from .runtime_settings_ini_loader import load_settings_ini
 
 logger = logging.getLogger(__name__)
-VERSION = "REV2-RUNTIME-ENV-DEFAULTS-PATCH-REGISTRY-AWARE"
+VERSION = "REV3-RUNTIME-ENV-DEFAULTS-PATCH-OPTIONAL-SETTINGS-INI"
 _INSTALLED = False
 
 
@@ -39,8 +41,10 @@ def _argv_context() -> str:
 def install() -> bool:
     """Apply centralized defaults once.
 
-    Returns True when defaults are available. Existing environment variables are
-    not overwritten by apply_*_defaults(); operator overrides remain intact.
+    Order of precedence:
+    1. Explicit process environment variables win.
+    2. Optional settings.ini fills missing values when present.
+    3. Built-in centralized defaults fill the remaining missing values.
     """
     global _INSTALLED
     if _INSTALLED:
@@ -48,6 +52,7 @@ def install() -> bool:
 
     try:
         context = _argv_context()
+        settings_applied: Dict[str, str] = load_settings_ini(context=context)
         applied: Dict[str, str] = {}
         applied.update(apply_site_defaults(context=context))
         applied.update(apply_user_defaults(context=context))
@@ -55,10 +60,12 @@ def install() -> bool:
         _INSTALLED = True
         if env_bool("RUNTIME_ENV_DEFAULTS_VERBOSE", False):
             logger.warning(
-                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s applied=%s context=%s site_groups=%s user_groups=%s",
+                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s",
                 VERSION,
                 DEFAULTS_VERSION,
                 REGISTRY_VERSION,
+                SETTINGS_INI_VERSION,
+                len(settings_applied),
                 len(applied),
                 context,
                 ",".join(SITE_GROUP_ORDER),
@@ -66,10 +73,12 @@ def install() -> bool:
             )
         else:
             logger.warning(
-                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s applied=%s context=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s",
+                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s",
                 VERSION,
                 DEFAULTS_VERSION,
                 REGISTRY_VERSION,
+                SETTINGS_INI_VERSION,
+                len(settings_applied),
                 len(applied),
                 context,
                 os.environ.get("SITECUSTOMIZE_ENABLE_RESCUE_PATCHES"),
