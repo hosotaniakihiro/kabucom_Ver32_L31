@@ -3,6 +3,7 @@ import logging, os, threading, time
 logger = logging.getLogger(__name__)
 _INSTALLED = False
 _LIGHT_INSTALLED = False
+_TECH_RESCUE_INSTALLED = False
 
 
 def _float_env(name: str, default: float) -> float:
@@ -49,6 +50,21 @@ def _install_light_companion() -> bool:
         return False
 
 
+def _install_snapshot_tech_rescue() -> bool:
+    global _TECH_RESCUE_INSTALLED
+    try:
+        os.environ.setdefault('RANKING_ENTRY_FAST_SNAPSHOT_TECH_RESCUE', '1')
+        mod = __import__('core.startup.ranking_entry_fast_snapshot_tech_rescue_patch', fromlist=['install'])
+        fn = getattr(mod, 'install', None)
+        ok = bool(fn()) if callable(fn) else False
+        _TECH_RESCUE_INSTALLED = bool(ok)
+        logger.warning('[RANKING ENTRY FAST BUDGET OVERRIDE] snapshot tech rescue installed=%s', ok)
+        return bool(ok)
+    except Exception:
+        logger.exception('[RANKING ENTRY FAST BUDGET OVERRIDE] snapshot tech rescue install failed')
+        return False
+
+
 def _force_light_budget() -> None:
     os.environ['RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS'] = '12'
     os.environ['RANKING_ENTRY_FAST_MAX_SYMBOLS'] = '12'
@@ -64,6 +80,7 @@ def _force_light_budget() -> None:
     os.environ['RANKING_ENTRY_SKIP_TECH_SAVE'] = '1'
     os.environ['RANKING_ENTRY_TECH_READONLY'] = '1'
     os.environ['RANKING_ENTRY_TECH_READ_BATCH_SIZE'] = '12'
+    os.environ['RANKING_ENTRY_FAST_SNAPSHOT_TECH_RESCUE'] = '1'
     os.environ.setdefault('RANKING_ENTRY_LIGHT_MIN_SCORE', '50')
     os.environ.setdefault('RANKING_ENTRY_LIGHT_MIN_TURNOVER', '50000000')
 
@@ -111,6 +128,7 @@ def _apply_once() -> bool:
     _install_min_pending_timeout_rescue()
     _install_light_companion()
     _force_light_budget()
+    _install_snapshot_tech_rescue()
     try:
         import trading.entry_exit.tasks as tasks
         tasks.RANKING_ENTRY_BUILD_TIMEOUT_SEC = float(os.environ['RANKING_ENTRY_BUILD_TIMEOUT_SEC'])
@@ -126,7 +144,7 @@ def _watch_loop() -> None:
     for i in range(loops):
         ok = _apply_once()
         if i in (0, loops - 1):
-            logger.warning('[RANKING ENTRY FAST BUDGET OVERRIDE] enforce v16 i=%s/%s ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s rows=%s source_tables=%s source_scan=%s light=%s', i, loops, ok, os.environ.get('RANKING_ENTRY_RUNTIME_BUDGET_SEC'), os.environ.get('RANKING_ENTRY_BUILD_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_MAX_PENDING_PER_RUN'), os.environ.get('RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS'), os.environ.get('RANKING_ENTRY_SOURCE_DB_TABLES'), os.environ.get('RANKING_ENTRY_SOURCE_DB_SCAN_ROWS'), _LIGHT_INSTALLED)
+            logger.warning('[RANKING ENTRY FAST BUDGET OVERRIDE] enforce v17 i=%s/%s ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s rows=%s source_tables=%s source_scan=%s light=%s tech_rescue=%s', i, loops, ok, os.environ.get('RANKING_ENTRY_RUNTIME_BUDGET_SEC'), os.environ.get('RANKING_ENTRY_BUILD_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_MAX_PENDING_PER_RUN'), os.environ.get('RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS'), os.environ.get('RANKING_ENTRY_SOURCE_DB_TABLES'), os.environ.get('RANKING_ENTRY_SOURCE_DB_SCAN_ROWS'), _LIGHT_INSTALLED, _TECH_RESCUE_INSTALLED)
         time.sleep(sleep_sec)
 
 
@@ -137,7 +155,7 @@ def install() -> bool:
     ok = _apply_once()
     threading.Thread(target=_watch_loop, name='ranking-entry-fast-budget-override', daemon=True).start()
     _INSTALLED = True
-    logger.warning('[RANKING ENTRY FAST BUDGET OVERRIDE] installed v16 ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s rows=%s source_tables=%s source_scan=%s light=%s watcher=True', ok, os.environ.get('RANKING_ENTRY_RUNTIME_BUDGET_SEC'), os.environ.get('RANKING_ENTRY_BUILD_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_MAX_PENDING_PER_RUN'), os.environ.get('RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS'), os.environ.get('RANKING_ENTRY_SOURCE_DB_TABLES'), os.environ.get('RANKING_ENTRY_SOURCE_DB_SCAN_ROWS'), _LIGHT_INSTALLED)
+    logger.warning('[RANKING ENTRY FAST BUDGET OVERRIDE] installed v17 ok=%s runtime_budget=%s build_timeout=%s controller_timeout=%s max_pending=%s rows=%s source_tables=%s source_scan=%s light=%s tech_rescue=%s watcher=True', ok, os.environ.get('RANKING_ENTRY_RUNTIME_BUDGET_SEC'), os.environ.get('RANKING_ENTRY_BUILD_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC'), os.environ.get('RANKING_ENTRY_MAX_PENDING_PER_RUN'), os.environ.get('RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS'), os.environ.get('RANKING_ENTRY_SOURCE_DB_TABLES'), os.environ.get('RANKING_ENTRY_SOURCE_DB_SCAN_ROWS'), _LIGHT_INSTALLED, _TECH_RESCUE_INSTALLED)
     return True
 
 
