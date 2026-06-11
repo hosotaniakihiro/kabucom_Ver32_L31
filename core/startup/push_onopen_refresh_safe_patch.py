@@ -1,10 +1,11 @@
 # ============================================================
 # File   : core/startup/push_onopen_refresh_safe_patch.py
-# Version: V2.7-PUSH-ONOPEN-STABLE-DELAYED-REFRESH-MAIN-NAS-SKIP-DUE-FILTER
+# Version: V2.8-PUSH-ONOPEN-RESPECT-SAVE-FIRST
 # ------------------------------------------------------------
 # 目的:
 #   WebSocket reconnect直後の非破壊refreshで kabu Station を再切断させない。
-#   さらに main.py 起動時の NAS DB 直読み/同期bootstrapをskipする軽量patchも先に入れる。
+#   V2.8: push_stream_reconnect_stability_patch V8 が
+#         PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1 を設定した場合は上書きしない。
 # ============================================================
 from __future__ import annotations
 
@@ -54,8 +55,19 @@ def _force_env(name: str, value: str) -> None:
         pass
 
 
+def _setdefault_env(name: str, value: str) -> None:
+    try:
+        if os.environ.get(name) is None or str(os.environ.get(name)).strip() == "":
+            os.environ[name] = str(value)
+    except Exception:
+        pass
+
+
 def _apply_defaults() -> None:
-    _force_env("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", "0")
+    # V2.8: Do not undo V8 save-first mode.
+    # If the reconnect stability patch already forced skip=1, keep it.
+    # If unset, keep legacy default (0) so this patch can still operate alone.
+    _setdefault_env("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", "0")
     os.environ.setdefault("PUSH_STREAM_ONOPEN_SAFE_REFRESH_DELAY_SEC", "3.0")
     os.environ.setdefault("PUSH_STREAM_ONOPEN_SAFE_REFRESH_MIN_INTERVAL_SEC", "15.0")
     os.environ.setdefault("PUSH_STREAM_ONOPEN_SAFE_READY_WAIT_SEC", "4.0")
@@ -152,6 +164,9 @@ def _ws_connected_and_alive() -> bool:
 def _safe_onopen_refresh_worker() -> None:
     try:
         _apply_defaults()
+        if _env_bool("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", False):
+            logger.warning("[PUSH ONOPEN SAFE REFRESH] skipped: save-first skip_after_open_refresh=1; rotation handles register")
+            return
         if not _env_bool("PUSH_STREAM_ONOPEN_SAFE_REFRESH_ENABLED", True):
             logger.warning("[PUSH ONOPEN SAFE REFRESH] skipped by env")
             return
@@ -214,6 +229,9 @@ def _safe_onopen_refresh_worker() -> None:
 def _patched_start_refresh_after_open_thread() -> None:
     try:
         _apply_defaults()
+        if _env_bool("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", False):
+            logger.warning("[PUSH ONOPEN SAFE REFRESH] thread not started: save-first skip_after_open_refresh=1")
+            return
         threading.Thread(
             target=_safe_onopen_refresh_worker,
             name="push-onopen-safe-refresh-stable",
@@ -246,7 +264,7 @@ def install() -> bool:
             logger.debug("[PUSH ONOPEN SAFE REFRESH] ws_callbacks patch skipped", exc_info=True)
 
         _INSTALLED = True
-        logger.warning("[PUSH ONOPEN SAFE REFRESH] installed v2.7 stable delayed + main NAS skip patches + due filter")
+        logger.warning("[PUSH ONOPEN SAFE REFRESH] installed v2.8 respect save-first skip")
         return True
     except Exception:
         logger.exception("[PUSH ONOPEN SAFE REFRESH] install failed")
