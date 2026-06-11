@@ -1,20 +1,23 @@
 # ============================================================
 # File   : trading/push/push_stream/rotation_register.py
-# Version: PRODUCTION-STABLE-REV3-PUSH-ROTATION-REGISTER-NON-DESTRUCTIVE
+# Version: PRODUCTION-STABLE-REV4-PUSH-ROTATION-REGISTER-DESIGNED-CLEAR
 # ------------------------------------------------------------
 # PUSH A/Bローテーション用の登録委譲API。
 #
 # Responsibilities:
 #   - 50銘柄登録を subscription_manager refresh_callable へ委譲
-#   - 既定では clear_first / unregister_first を使わない
-#   - kabu Station WinError 10054 対策として、rotationごとの全解除を禁止
+#   - WebSocket へ ws.send で直接 register しない
+#   - kabu Station 公式ひな形どおり、登録/解除は HTTP PUT API へ分離
+#   - ユーザー設計どおり rotation_* は以下で運用する:
+#       A登録 -> 4.8秒保持 -> unregister_all -> 0.2秒待機 -> B登録
+#       B登録 -> 4.8秒保持 -> unregister_all -> 0.2秒待機 -> A登録
 #   - timeout付き登録で rotation worker を止めない
 #
 # Env override:
 #   PUSH_ROTATION_REGISTER_FORCE=0/1
 #   PUSH_ROTATION_CLEAR_FIRST=0/1
 #   PUSH_ROTATION_UNREGISTER_FIRST=0/1
-#   PUSH_ROTATION_WAIT_AFTER_CLEAR_SEC=0.0
+#   PUSH_ROTATION_WAIT_AFTER_CLEAR_SEC=0.2
 # ============================================================
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ from .transport import _call_refresh
 
 logger = logging.getLogger(__name__)
 
-VERSION = "PRODUCTION-STABLE-REV3-PUSH-ROTATION-REGISTER-NON-DESTRUCTIVE"
+VERSION = "PRODUCTION-STABLE-REV4-PUSH-ROTATION-REGISTER-DESIGNED-CLEAR"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -101,10 +104,10 @@ def register_symbols(symbols: Iterable[str], force: bool = False, **kwargs: Any)
     kabu Station への実登録は subscription_manager の refresh_callable に委譲する。
 
     重要:
-      - ここでは WebSocket ws.send による直接 register はしない
-      - REV3: 既定では全解除しない。rotationごとに unregister/register を連発すると
-        kabu Station が WinError 10054 で切断するため。
-      - 全解除が必要な緊急時だけ環境変数で明示的に有効化する。
+      - ここでは WebSocket ws.send による直接 register はしない。
+      - 公式ひな形どおり、register/unregister/unregister_all は HTTP PUT API 側で行う。
+      - rotation_* ではユーザー指定どおり unregister_all -> 0.2秒 -> register を使う。
+      - on_open/reconnect は subscription_manager 側で register-only にできる。
     """
 
     cleaned, raw_count, filler_count, invalid_count = clean_symbol_list(symbols)
@@ -118,7 +121,6 @@ def register_symbols(symbols: Iterable[str], force: bool = False, **kwargs: Any)
             invalid_count,
         )
         return False
-
     if not callable(state._refresh_callable):
         logger.warning(
             "[push_stream] register_symbols skipped: refresh callable missing size=%d head=%s",
@@ -130,7 +132,7 @@ def register_symbols(symbols: Iterable[str], force: bool = False, **kwargs: Any)
     reason = str(kwargs.get("reason") or "rotation")
     label = str(kwargs.get("label") or reason.replace("rotation_", "").upper())
 
-    # force引数より環境変数を優先。ただし既定はFalse。
+    # force引数より環境変数を優先。実際の rotation_* clear 方針は subscription_manager 側でも強制する。
     effective_force = _env_bool("PUSH_ROTATION_REGISTER_FORCE", bool(force and False))
     clear_first = _env_bool("PUSH_ROTATION_CLEAR_FIRST", False)
     unregister_first = _env_bool("PUSH_ROTATION_UNREGISTER_FIRST", False)
@@ -258,22 +260,3 @@ def run_one_batch_with_timeout(
             len(cleaned),
         )
         return False
-
-    finally:
-        try:
-            ex.shutdown(wait=False, cancel_futures=True)
-        except TypeError:
-            ex.shutdown(wait=False)
-        except Exception:
-            logger.debug("[push_stream] rotation %s executor shutdown failed", label, exc_info=True)
-
-
-__all__ = [
-    "VERSION",
-    "REGISTER_TIMEOUT_SEC",
-    "UNREGISTER_TO_REGISTER_WAIT_SEC",
-    "refresh_result_to_ok",
-    "register_symbols",
-    "run_one_batch",
-    "run_one_batch_with_timeout",
-]
