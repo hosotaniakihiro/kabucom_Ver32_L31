@@ -1,22 +1,18 @@
 # ============================================================
 # File   : core/startup/ranking_entry_final_rescue_patch.py
-# Version: V1.3-RANKING-FINAL-RESCUE-ZERO-ATR-SOFTPASS
+# Version: V1.4-RANKING-ZERO-ATR-DEFAULTS-FIRST
 # ------------------------------------------------------------
 # 目的:
 #   RANKING pending が entry_controller まで到達しているのに、
-#   最終段で全落ちして注文が出ない問題を、古い/弱いAI判定を
-#   無理に通さない範囲で緩和する。
+#   最終段で全落ちして注文が出ない問題を緩和する。
 #
-# V1.2:
-#   - sitecustomize 側の既定値 RANKING_FINAL_RESCUE_AI_FAILOPEN=1 に
-#     負けないよう、このモジュールではAI fail-openを明示的に0へ強制。
-#   - ATR救済とrange_5m_filterのTypeError互換は維持。
-#
-# V1.3:
-#   - RANKING snapshot 由来で high/low が欠損・同値、または ATR=0 の場合、
-#     score/volume/turnover/day% が強い候補だけ ATR/range ガードを soft-pass。
-#   - PUSH summary が空、ranking_technical_1min が未作成の時間帯でも、
-#     ランキング急騰/急落の強候補を LOW MOVE GUARD で全落ちさせない。
+# V1.4:
+#   - sitecustomize/usercustomize の読み込み順に依存しないよう、
+#     LOW_MOVE_RANKING_ZERO_ATR_* をこのパッチで先に強制設定する。
+#   - 09時台のランキング snapshot では day_change_pct が entry_row に
+#     引き継がれず 0.000 になるケースがあるため、zero-ATR/high==low
+#     救済では min_day_abs を 0.0 にする。
+#   - min_turnover は 1億 -> 3,000万へ緩和。低出来高は引き続き3万で制限。
 # ============================================================
 
 from __future__ import annotations
@@ -82,7 +78,7 @@ def _is_ranking_row(row: Any) -> bool:
     try:
         src = _safe_str(d.get("source") or d.get("pipeline_source") or d.get("entry_source")).upper()
         et = _safe_str(d.get("entry_type") or d.get("type") or d.get("strategy")).upper()
-        return src == "RANKING" or et == "RANKING"
+        return src == "RANKING" or et == "RANKING" or d.get("rank_type") is not None
     except Exception:
         return False
 
@@ -90,11 +86,14 @@ def _is_ranking_row(row: Any) -> bool:
 def _score(row: Any) -> float:
     d = _row_dict(row)
     return max(
+        _safe_float(d.get("pending_score"), 0.0),
         _safe_float(d.get("score"), 0.0),
         _safe_float(d.get("score_buy"), 0.0),
         _safe_float(d.get("score_sell"), 0.0),
         _safe_float(d.get("ranking_score"), 0.0),
         _safe_float(d.get("final_score"), 0.0),
+        _safe_float(d.get("display_score"), 0.0),
+        _safe_float(d.get("score_total"), 0.0),
     )
 
 
@@ -119,6 +118,7 @@ def _turnover(row: Any) -> float:
     vol = _volume(row)
     explicit = _safe_float(
         d.get("turnover")
+        or d.get("turnover_raw")
         or d.get("trading_value")
         or d.get("trading_amount")
         or d.get("turnover_value")
@@ -169,13 +169,41 @@ def _mtf(row: Any) -> float:
     )
 
 
+def _force_ranking_zero_atr_defaults() -> None:
+    # Force, not setdefault: sitecustomize may have already set old 100M/70/3.0 values.
+    forced = {
+        "RANKING_FINAL_RESCUE_MIN_SCORE": "50",
+        "RANKING_FINAL_RESCUE_MIN_TURNOVER": "30000000",
+        "RANKING_FINAL_RESCUE_MIN_DAY_ABS_PCT": "0.0",
+        "RANKING_FINAL_RESCUE_ATR_SOFTPASS": "1",
+        "RANKING_FINAL_RESCUE_RANGE_SOFTPASS": "1",
+        "LOW_MOVE_RANKING_ZERO_ATR_SOFTPASS": "1",
+        "LOW_MOVE_RANKING_ZERO_ATR_MIN_SCORE": "50",
+        "LOW_MOVE_RANKING_MIN_SCORE_FOR_NO_HIGHLOW": "50",
+        "LOW_MOVE_RANKING_ZERO_ATR_MIN_TURNOVER": "30000000",
+        "LOW_MOVE_RANKING_ZERO_ATR_MIN_DAY_ABS_PCT": "0.0",
+        "LOW_MOVE_RANKING_MIN_ATR_RATIO": "0.0",
+        "LOW_MOVE_RANKING_MIN_ABS_SLOPE": "0.0",
+        "RANKING_ENTRY_RESCUE_MIN_TURNOVER": "30000000",
+        "RANKING_ENTRY_RESCUE_RECURSION_MIN_TURNOVER": "30000000",
+    }
+    changed = {}
+    for k, v in forced.items():
+        old = os.environ.get(k)
+        os.environ[k] = v
+        if old != v:
+            changed[k] = (old, v)
+    if changed:
+        logger.warning("[RANKING FINAL RESCUE] forced early ranking rescue env changed=%s", changed)
+
+
 def _ranking_rescue_ok(row: Any) -> bool:
     if not _is_ranking_row(row):
         return False
     sc = _score(row)
     price = _price(row)
     vol = _volume(row)
-    min_score = _env_float("RANKING_FINAL_RESCUE_MIN_SCORE", 55.0)
+    min_score = _env_float("RANKING_FINAL_RESCUE_MIN_SCORE", 50.0)
     min_volume = _env_float("RANKING_FINAL_RESCUE_MIN_VOLUME", 30000.0)
     if price <= 0:
         return False
@@ -187,18 +215,13 @@ def _ranking_rescue_ok(row: Any) -> bool:
 
 
 def _ranking_low_move_soft_ok(row: Any) -> bool:
-    """Allow only strong RANKING candidates through zero-ATR/high-low-broken guards.
-
-    This is intentionally stricter than _ranking_rescue_ok(): it requires enough
-    turnover and day movement so low-liquidity / truly flat names are still rejected.
-    """
     if not _ranking_rescue_ok(row):
         return False
 
     turnover = _turnover(row)
     day_abs = abs(_day_pct(row))
-    min_turnover = _env_float("RANKING_FINAL_RESCUE_MIN_TURNOVER", 100000000.0)
-    min_day_abs = _env_float("RANKING_FINAL_RESCUE_MIN_DAY_ABS_PCT", 3.0)
+    min_turnover = _env_float("RANKING_FINAL_RESCUE_MIN_TURNOVER", 30000000.0)
+    min_day_abs = _env_float("RANKING_FINAL_RESCUE_MIN_DAY_ABS_PCT", 0.0)
     if min_turnover > 0 and turnover < min_turnover:
         return False
     if min_day_abs > 0 and day_abs < min_day_abs:
@@ -206,8 +229,6 @@ def _ranking_low_move_soft_ok(row: Any) -> bool:
 
     high, low, close = _high_low_close(row)
     atr = _atr(row)
-    # Snapshot-derived rows often have missing high/low or high==low before enough
-    # intraday history exists. Strong ranking rows should not be killed solely by that.
     if atr <= 0:
         return True
     if not (high > 0 and low > 0 and close > 0 and high > low):
@@ -228,7 +249,7 @@ def _patch_entry_controller() -> bool:
 
     try:
         cur = getattr(ec, "atr_1m_filter", None)
-        if callable(cur) and not getattr(cur, "_ranking_final_rescue_atr_v13", False):
+        if callable(cur) and not getattr(cur, "_ranking_final_rescue_atr_v14", False):
             orig = getattr(cur, "_original_atr_1m_filter", cur)
 
             def patched_atr(entry_row: Any = None, *args, **kwargs):
@@ -253,34 +274,24 @@ def _patch_entry_controller() -> bool:
                     if _env_bool("RANKING_FINAL_RESCUE_ATR_SOFTPASS", True) and _ranking_low_move_soft_ok(entry_row):
                         logger.warning(
                             "[RANKING FINAL RESCUE] ATR soft-pass symbol=%s score=%.3f atr=%.6f price=%.3f ratio=%.6f turnover=%.0f day=%.3f range_pct=%.6f",
-                            _row_dict(entry_row).get("symbol"),
-                            _score(entry_row),
-                            atr,
-                            price,
-                            ratio,
-                            _turnover(entry_row),
-                            _day_pct(entry_row),
-                            _range_pct(entry_row),
+                            _row_dict(entry_row).get("symbol"), _score(entry_row), atr, price, ratio, _turnover(entry_row), _day_pct(entry_row), _range_pct(entry_row),
                         )
                         return True
                     return ret
                 except Exception:
                     return ret
 
-            patched_atr._ranking_final_rescue_atr_v1 = True  # type: ignore[attr-defined]
-            patched_atr._ranking_final_rescue_atr_v11 = True  # type: ignore[attr-defined]
-            patched_atr._ranking_final_rescue_atr_v12 = True  # type: ignore[attr-defined]
-            patched_atr._ranking_final_rescue_atr_v13 = True  # type: ignore[attr-defined]
+            patched_atr._ranking_final_rescue_atr_v14 = True  # type: ignore[attr-defined]
             patched_atr._original_atr_1m_filter = orig  # type: ignore[attr-defined]
             ec.atr_1m_filter = patched_atr
             ok_any = True
-            logger.warning("[RANKING FINAL RESCUE] patched entry_controller.atr_1m_filter v1.3")
+            logger.warning("[RANKING FINAL RESCUE] patched entry_controller.atr_1m_filter v1.4")
     except Exception:
         logger.exception("[RANKING FINAL RESCUE] atr patch failed")
 
     try:
         cur = getattr(ec, "range_5m_filter", None)
-        if callable(cur) and not getattr(cur, "_ranking_final_rescue_range_v13", False):
+        if callable(cur) and not getattr(cur, "_ranking_final_rescue_range_v14", False):
             orig = getattr(cur, "_original_range_5m_filter", cur)
 
             def patched_range(entry_row: Any = None, *args, **kwargs):
@@ -292,14 +303,7 @@ def _patch_entry_controller() -> bool:
                         high, low, close = _high_low_close(entry_row)
                         logger.warning(
                             "[RANKING FINAL RESCUE] RANGE soft-pass symbol=%s score=%.3f high=%.3f low=%.3f close=%.3f range_pct=%.6f turnover=%.0f day=%.3f",
-                            _row_dict(entry_row).get("symbol"),
-                            _score(entry_row),
-                            high,
-                            low,
-                            close,
-                            _range_pct(entry_row),
-                            _turnover(entry_row),
-                            _day_pct(entry_row),
+                            _row_dict(entry_row).get("symbol"), _score(entry_row), high, low, close, _range_pct(entry_row), _turnover(entry_row), _day_pct(entry_row),
                         )
                         return True
                     return ret
@@ -327,20 +331,17 @@ def _patch_entry_controller() -> bool:
                     logger.warning("[RANKING FINAL RESCUE] range_5m_filter error fail_open=%s err=%s", allow, e)
                     return bool(allow)
 
-            patched_range._ranking_final_rescue_range_v1 = True  # type: ignore[attr-defined]
-            patched_range._ranking_final_rescue_range_v11 = True  # type: ignore[attr-defined]
-            patched_range._ranking_final_rescue_range_v12 = True  # type: ignore[attr-defined]
-            patched_range._ranking_final_rescue_range_v13 = True  # type: ignore[attr-defined]
+            patched_range._ranking_final_rescue_range_v14 = True  # type: ignore[attr-defined]
             patched_range._original_range_5m_filter = orig  # type: ignore[attr-defined]
             ec.range_5m_filter = patched_range
             ok_any = True
-            logger.warning("[RANKING FINAL RESCUE] patched entry_controller.range_5m_filter v1.3")
+            logger.warning("[RANKING FINAL RESCUE] patched entry_controller.range_5m_filter v1.4")
     except Exception:
         logger.exception("[RANKING FINAL RESCUE] range patch failed")
 
     try:
         cur = getattr(ec, "ai_final_entry_check", None)
-        if callable(cur) and not getattr(cur, "_ranking_final_rescue_ai_v13", False):
+        if callable(cur) and not getattr(cur, "_ranking_final_rescue_ai_v14", False):
             orig = getattr(cur, "_original_ai_final_entry_check", cur)
 
             def patched_ai(entry_row: Any = None, *args, **kwargs):
@@ -371,14 +372,11 @@ def _patch_entry_controller() -> bool:
                 except Exception:
                     return ai
 
-            patched_ai._ranking_final_rescue_ai_v1 = True  # type: ignore[attr-defined]
-            patched_ai._ranking_final_rescue_ai_v11 = True  # type: ignore[attr-defined]
-            patched_ai._ranking_final_rescue_ai_v12 = True  # type: ignore[attr-defined]
-            patched_ai._ranking_final_rescue_ai_v13 = True  # type: ignore[attr-defined]
+            patched_ai._ranking_final_rescue_ai_v14 = True  # type: ignore[attr-defined]
             patched_ai._original_ai_final_entry_check = orig  # type: ignore[attr-defined]
             ec.ai_final_entry_check = patched_ai
             ok_any = True
-            logger.warning("[RANKING FINAL RESCUE] patched entry_controller.ai_final_entry_check v1.3 failopen=%s", os.environ.get("RANKING_FINAL_RESCUE_AI_FAILOPEN"))
+            logger.warning("[RANKING FINAL RESCUE] patched entry_controller.ai_final_entry_check v1.4 failopen=%s", os.environ.get("RANKING_FINAL_RESCUE_AI_FAILOPEN"))
     except Exception:
         logger.exception("[RANKING FINAL RESCUE] ai patch failed")
 
@@ -387,17 +385,13 @@ def _patch_entry_controller() -> bool:
 
 def install() -> bool:
     global _DONE
+    _force_ranking_zero_atr_defaults()
     if _DONE:
         return _patch_entry_controller()
-    os.environ.setdefault("RANKING_FINAL_RESCUE_MIN_SCORE", "55")
     os.environ.setdefault("RANKING_FINAL_RESCUE_MIN_VOLUME", "30000")
-    os.environ.setdefault("RANKING_FINAL_RESCUE_MIN_TURNOVER", "100000000")
-    os.environ.setdefault("RANKING_FINAL_RESCUE_MIN_DAY_ABS_PCT", "3.0")
     os.environ.setdefault("RANKING_FINAL_RESCUE_SOFTPASS_MAX_RANGE_PCT", "0.0025")
     os.environ.setdefault("RANKING_FINAL_RESCUE_ATR_FAILOPEN", "1")
     os.environ.setdefault("RANKING_FINAL_RESCUE_ATR_MIN_RATIO", "0.0005")
-    os.environ.setdefault("RANKING_FINAL_RESCUE_ATR_SOFTPASS", "1")
-    os.environ.setdefault("RANKING_FINAL_RESCUE_RANGE_SOFTPASS", "1")
     os.environ.setdefault("RANKING_FINAL_RESCUE_RANGE_ERROR_FAILOPEN", "1")
     old_ai = os.environ.get("RANKING_FINAL_RESCUE_AI_FAILOPEN")
     os.environ["RANKING_FINAL_RESCUE_AI_FAILOPEN"] = "0"
@@ -408,7 +402,7 @@ def install() -> bool:
     ok = _patch_entry_controller()
     _DONE = True
     logger.warning(
-        "[RANKING FINAL RESCUE] installed v1.3 ok=%s min_score=%s min_volume=%s min_turnover=%s min_day_abs=%s atr_min_ratio=%s ai_failopen=%s",
+        "[RANKING FINAL RESCUE] installed v1.4 ok=%s min_score=%s min_volume=%s min_turnover=%s min_day_abs=%s atr_min_ratio=%s ai_failopen=%s low_move_score=%s low_move_turnover=%s low_move_day_abs=%s",
         ok,
         os.environ.get("RANKING_FINAL_RESCUE_MIN_SCORE"),
         os.environ.get("RANKING_FINAL_RESCUE_MIN_VOLUME"),
@@ -416,6 +410,9 @@ def install() -> bool:
         os.environ.get("RANKING_FINAL_RESCUE_MIN_DAY_ABS_PCT"),
         os.environ.get("RANKING_FINAL_RESCUE_ATR_MIN_RATIO"),
         os.environ.get("RANKING_FINAL_RESCUE_AI_FAILOPEN"),
+        os.environ.get("LOW_MOVE_RANKING_ZERO_ATR_MIN_SCORE"),
+        os.environ.get("LOW_MOVE_RANKING_ZERO_ATR_MIN_TURNOVER"),
+        os.environ.get("LOW_MOVE_RANKING_ZERO_ATR_MIN_DAY_ABS_PCT"),
     )
     return ok
 
