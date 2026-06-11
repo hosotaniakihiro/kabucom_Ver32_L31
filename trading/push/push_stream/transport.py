@@ -1,22 +1,13 @@
 # ============================================================
 # File   : trading/push/push_stream/transport.py
-# Version: Ver1.5-PUSH-STREAM-TRANSPORT-ONOPEN-REFRESH-THROTTLE
+# Version: Ver1.6-PUSH-STREAM-TRANSPORT-ROTATION-WS-CLOSED-AWARE
 # ------------------------------------------------------------
-# ✔ WebSocket sender install / clear
-# ✔ ws alive 判定
-# ✔ refresh callable 管理
-# ✔ on_open 後 refresh
-# ✔ PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1 で on_open refresh を抑止可能
-# ✔ ConnectionResetError / BrokenPipeError / OSError を安全処理
-# ✔ ws.send 失敗時に connected_event clear + sender clear
-# ✔ register_symbols 側へ RuntimeError として安全伝搬
-# ✔ refresh の戻り値 / result_type / kwargs を詳細ログ
-# ✔ refresh 空振りの可視化強化
-# ✔ on_open / watchdog refresh は clear_first + unregister_first を優先し、
-#   callable の引数差異があっても安全に段階的フォールバック
-# ✔ on_open refresh storm guard:
-#   WinError 10054 連発時に unregister_all/register も連発しないよう、
-#   直近成功/実行中 refresh を一定秒スキップ
+# WebSocket transport helpers.
+#
+# REV1.6:
+#   - rotation_A / rotation_B registration is REST based, not WS-send based.
+#   - Therefore rotation refresh may run while WebSocket is intentionally closed.
+#   - This integrates the former startup monkey-patch behavior into the core module.
 # ============================================================
 
 from __future__ import annotations
@@ -36,6 +27,8 @@ from .runtime import _now, _safe_set_runtime
 
 logger = logging.getLogger(__name__)
 
+VERSION = "Ver1.6-PUSH-STREAM-TRANSPORT-ROTATION-WS-CLOSED-AWARE"
+
 _last_refresh_started_ts = 0.0
 _last_refresh_done_ts = 0.0
 _refresh_guard_lock = threading.Lock()
@@ -47,9 +40,9 @@ def _env_bool(name: str, default: bool = False) -> bool:
         if v is None:
             return bool(default)
         s = str(v).strip().lower()
-        if s in {"1", "true", "yes", "y", "on"}:
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
             return True
-        if s in {"0", "false", "no", "n", "off"}:
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled", ""}:
             return False
         return bool(default)
     except Exception:
@@ -66,6 +59,14 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _is_rotation_reason(reason: str) -> bool:
+    return str(reason or "").startswith("rotation_")
+
+
+def _allow_refresh_with_ws_closed(reason: str) -> bool:
+    return _is_rotation_reason(reason) and _env_bool("PUSH_ROTATION_REGISTER_WITH_WS_CLOSED", True)
+
+
 # ============================================================
 # ws state
 # ============================================================
@@ -76,22 +77,13 @@ def _get_ws_app() -> Optional[websocket.WebSocketApp]:
 
 
 def _is_ws_alive(ws: Optional[websocket.WebSocketApp] = None) -> bool:
-    """
-    WebSocketApp が送信可能そうか確認する。
-
-    注意:
-      - sock.connected=True でも send 直後に WinError 10054 になることがある
-      - ここは事前判定であり、send 失敗は _sender 側で最終捕捉する
-    """
     try:
         target = ws if ws is not None else _get_ws_app()
         if target is None:
             return False
-
         sock = getattr(target, "sock", None)
         if sock is None:
             return False
-
         return bool(getattr(sock, "connected", False))
     except Exception:
         return False
@@ -104,9 +96,6 @@ def _clear_sender() -> None:
 
 
 def _mark_ws_disconnected(reason: str = "unknown") -> None:
-    """
-    WebSocket 切断状態を runtime / event / sender に反映する。
-    """
     state._last_disconnect_at = _now()
     state._connected_event.clear()
     _safe_set_runtime("ws_connected", False)
@@ -115,14 +104,6 @@ def _mark_ws_disconnected(reason: str = "unknown") -> None:
 
 
 def _install_sender(ws: websocket.WebSocketApp) -> None:
-    """
-    ws.send を安全に包んだ sender を state に登録する。
-
-    重要:
-      - ws.send 中に WinError 10054 / ConnectionResetError が出ることがある
-      - その場合は sender を clear し、connected_event を落とす
-      - 上位には RuntimeError として返し、rotation 側で warning 扱いにする
-    """
     with state._sender_lock:
 
         def _sender(raw: str) -> Any:
@@ -137,19 +118,15 @@ def _install_sender(ws: websocket.WebSocketApp) -> None:
 
             try:
                 return ws.send(raw)
-
             except WebSocketConnectionClosedException as e:
                 _mark_ws_disconnected("sender_websocket_closed")
                 raise RuntimeError("ws send failed: websocket closed") from e
-
             except ConnectionResetError as e:
                 _mark_ws_disconnected("sender_connection_reset")
                 raise RuntimeError("ws send failed: connection reset") from e
-
             except BrokenPipeError as e:
                 _mark_ws_disconnected("sender_broken_pipe")
                 raise RuntimeError("ws send failed: broken pipe") from e
-
             except OSError as e:
                 _mark_ws_disconnected(f"sender_os_error:{getattr(e, 'winerror', None)}")
                 raise RuntimeError(f"ws send failed: os error {e}") from e
@@ -166,12 +143,10 @@ def get_ws_sender() -> Optional[Callable[[str], Any]]:
 
 def _wait_for_ws_ready(timeout: float = WS_READY_WAIT_SEC) -> bool:
     deadline = time.time() + max(0.1, float(timeout))
-
     while time.time() < deadline and not state._stop_event.is_set():
         if state._connected_event.is_set() and _is_ws_alive():
             return True
         time.sleep(WS_READY_POLL_SEC)
-
     return state._connected_event.is_set() and _is_ws_alive()
 
 
@@ -184,26 +159,18 @@ def set_refresh_callable(fn: Optional[Callable[..., Any]]) -> None:
         state._refresh_callable = None
         logger.info("[push_stream] set_refresh_callable: False")
         return
-
     if not callable(fn):
         logger.warning("[push_stream] set_refresh_callable rejected: not callable")
         return
-
     if fn is refresh_subscriptions:
-        logger.warning(
-            "[push_stream] rejected self refresh callable: refresh_subscriptions (keep existing)"
-        )
+        logger.warning("[push_stream] rejected self refresh callable: refresh_subscriptions (keep existing)")
         return
-
     state._refresh_callable = fn
-    logger.info(
-        "[push_stream] set_refresh_callable: True fn=%s",
-        getattr(fn, "__name__", type(fn).__name__),
-    )
+    logger.info("[push_stream] set_refresh_callable: True fn=%s", getattr(fn, "__name__", type(fn).__name__))
 
 
 def _refresh_recent_or_running(reason: str) -> tuple[bool, str]:
-    """on_open refresh 連発を抑止する。"""
+    """Throttle only on_open refresh storms. rotation_* must not be throttled here."""
     if reason != "on_open":
         return False, "not_on_open"
     if not _env_bool("PUSH_STREAM_ONOPEN_REFRESH_THROTTLE", True):
@@ -233,12 +200,14 @@ def _mark_refresh_done() -> None:
         _last_refresh_done_ts = time.monotonic()
 
 
-def _invoke_refresh_callable(fn: Callable[..., Any], *, force: bool, reason: str, kwargs: dict[str, Any]) -> Any:
-    """
-    subscription_manager は版によって受け取る引数が違う。
-    on_open / watchdog 復旧では clear_first + unregister_first を優先するが、
-    TypeError の場合は段階的に引数を減らして必ず再登録を試す。
-    """
+def _invoke_refresh_callable(
+    fn: Callable[..., Any],
+    *,
+    force: bool,
+    reason: str,
+    kwargs: dict[str, Any],
+    allow_ws_closed: bool = False,
+) -> Any:
     attempts: list[tuple[str, dict[str, Any]]] = [
         ("full", {"force": force, "reason": reason, **kwargs}),
         ("force_reason", {"force": force, "reason": reason}),
@@ -249,14 +218,15 @@ def _invoke_refresh_callable(fn: Callable[..., Any], *, force: bool, reason: str
     last_type_error: TypeError | None = None
 
     for label, call_kwargs in attempts:
-        if not state._connected_event.is_set() or not _is_ws_alive():
+        if not allow_ws_closed and (not state._connected_event.is_set() or not _is_ws_alive()):
             logger.warning("[push_stream] refresh attempt skipped reason=%s mode=%s ws_not_ready", reason, label)
             return None
         try:
             logger.info(
-                "[push_stream] refresh attempt start reason=%s mode=%s kwargs_keys=%s",
+                "[push_stream] refresh attempt start reason=%s mode=%s allow_ws_closed=%s kwargs_keys=%s",
                 reason,
                 label,
+                allow_ws_closed,
                 sorted(list(call_kwargs.keys())),
             )
             return fn(**call_kwargs)
@@ -277,42 +247,51 @@ def _invoke_refresh_callable(fn: Callable[..., Any], *, force: bool, reason: str
 
 def _call_refresh(force: bool = True, reason: str = "on_open", **kwargs) -> Any:
     fn = state._refresh_callable
+    reason_s = str(reason or "")
+    allow_ws_closed = _allow_refresh_with_ws_closed(reason_s)
 
     if not callable(fn):
         logger.info("[push_stream] refresh callable not set -> skip")
         return None
 
-    if not state._connected_event.is_set() or not _is_ws_alive():
-        logger.warning("[push_stream] refresh skipped reason=%s ws_not_ready", reason)
+    if not allow_ws_closed and (not state._connected_event.is_set() or not _is_ws_alive()):
+        logger.warning("[push_stream] refresh skipped reason=%s ws_not_ready", reason_s)
         return None
 
-    skip, skip_reason = _refresh_recent_or_running(reason)
+    skip, skip_reason = _refresh_recent_or_running(reason_s)
     if skip:
-        logger.warning("[push_stream] refresh skipped reason=%s guard=%s", reason, skip_reason)
+        logger.warning("[push_stream] refresh skipped reason=%s guard=%s", reason_s, skip_reason)
         _safe_set_runtime("subscription_refresh_skip_reason", skip_reason)
         return True
 
     try:
         _mark_refresh_started()
         _safe_set_runtime("subscription_refresh_running", True)
-        logger.info(
-            "[push_stream] refresh start reason=%s kwargs_keys=%s",
-            reason,
-            sorted(list(kwargs.keys())),
+        if allow_ws_closed:
+            logger.warning(
+                "[push_stream] refresh reason=%s allowed with ws_closed for REST rotation kwargs_keys=%s",
+                reason_s,
+                sorted(list(kwargs.keys())),
+            )
+        else:
+            logger.info("[push_stream] refresh start reason=%s kwargs_keys=%s", reason_s, sorted(list(kwargs.keys())))
+        result = _invoke_refresh_callable(
+            fn,
+            force=force,
+            reason=reason_s,
+            kwargs=dict(kwargs),
+            allow_ws_closed=allow_ws_closed,
         )
-        result = _invoke_refresh_callable(fn, force=force, reason=reason, kwargs=dict(kwargs))
         logger.info(
             "[push_stream] refresh done reason=%s result_type=%s result=%r",
-            reason,
+            reason_s,
             type(result).__name__ if result is not None else "NoneType",
             result,
         )
         return result
-
     except Exception:
-        logger.exception("[push_stream] refresh failed reason=%s", reason)
+        logger.exception("[push_stream] refresh failed reason=%s", reason_s)
         return None
-
     finally:
         _mark_refresh_done()
         _safe_set_runtime("subscription_refresh_running", False)
@@ -323,15 +302,11 @@ def _safe_refresh_subscriptions_after_open() -> None:
         if _env_bool("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", False):
             logger.warning("[push_stream] refresh after open skipped by env PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1")
             return
-
-        # 10054連発時に接続直後すぐ unregister/register せず、少し安定待ちする。
         delay = max(float(AFTER_OPEN_REFRESH_DELAY_SEC), _env_float("PUSH_STREAM_AFTER_OPEN_REFRESH_DELAY_SEC", 2.0))
         time.sleep(delay)
-
         if not _wait_for_ws_ready(timeout=WS_READY_WAIT_SEC):
             logger.warning("[push_stream] refresh after open skipped: ws not ready")
             return
-
         _call_refresh(
             force=True,
             reason="on_open",
@@ -339,26 +314,21 @@ def _safe_refresh_subscriptions_after_open() -> None:
             unregister_first=True,
             wait_after_clear=0.5,
         )
-
     except Exception:
         logger.exception("[push_stream] refresh after open failed")
 
 
 def refresh_subscriptions(*args, **kwargs) -> Any:
     fn = state._refresh_callable
-
     if not callable(fn):
         logger.info("[push_stream] refresh_subscriptions skipped (callable missing)")
         return None
-
     if fn is refresh_subscriptions:
         logger.error("[push_stream] refresh_subscriptions recursion blocked: fn is self")
         return None
-
     if not state._connected_event.is_set() or not _is_ws_alive():
         logger.warning("[push_stream] refresh_subscriptions skipped: ws_not_ready")
         return None
-
     try:
         _safe_set_runtime("subscription_refresh_running", True)
         result = fn(*args, **kwargs)
@@ -368,7 +338,6 @@ def refresh_subscriptions(*args, **kwargs) -> Any:
             result,
         )
         return result
-
     except TypeError as e:
         logger.warning("[push_stream] refresh_subscriptions TypeError err=%s -> retry safe no-arg", e)
         try:
@@ -382,11 +351,9 @@ def refresh_subscriptions(*args, **kwargs) -> Any:
         except Exception:
             logger.exception("[push_stream] refresh_subscriptions no-arg retry failed")
             return None
-
     except Exception:
         logger.exception("[push_stream] refresh_subscriptions failed")
         return None
-
     finally:
         _safe_set_runtime("subscription_refresh_running", False)
 
@@ -407,7 +374,6 @@ def _start_refresh_after_open_thread() -> None:
     if _env_bool("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", False):
         logger.warning("[push_stream] refresh after open thread not started by env PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1")
         return
-
     threading.Thread(
         target=_safe_refresh_subscriptions_after_open,
         name="push-refresh-after-open",
@@ -416,6 +382,7 @@ def _start_refresh_after_open_thread() -> None:
 
 
 __all__ = [
+    "VERSION",
     "_get_ws_app",
     "_is_ws_alive",
     "_clear_sender",
