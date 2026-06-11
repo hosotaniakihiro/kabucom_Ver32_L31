@@ -1,11 +1,11 @@
 # ============================================================
 # File   : core/startup/push_onopen_refresh_safe_patch.py
-# Version: V2.8-PUSH-ONOPEN-RESPECT-SAVE-FIRST
+# Version: V2.9-PUSH-ONOPEN-SKIP-BY-DEFAULT
 # ------------------------------------------------------------
 # 目的:
 #   WebSocket reconnect直後の非破壊refreshで kabu Station を再切断させない。
-#   V2.8: push_stream_reconnect_stability_patch V8 が
-#         PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1 を設定した場合は上書きしない。
+#   V2.9: save-firstを標準化し、このパッチ単体でも on_open refresh を起動しない。
+#         登録は rotation_A/B 側の unregister_all -> wait -> register に一本化する。
 # ============================================================
 from __future__ import annotations
 
@@ -64,10 +64,10 @@ def _setdefault_env(name: str, value: str) -> None:
 
 
 def _apply_defaults() -> None:
-    # V2.8: Do not undo V8 save-first mode.
-    # If the reconnect stability patch already forced skip=1, keep it.
-    # If unset, keep legacy default (0) so this patch can still operate alone.
-    _setdefault_env("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", "0")
+    # V2.9: save-first is the safe default.  Do not run an extra on_open refresh
+    # before the A/B rotation worker; that refresh has been causing short-lived WS
+    # disconnects and very small PUSH save counts.
+    _setdefault_env("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", "1")
     os.environ.setdefault("PUSH_STREAM_ONOPEN_SAFE_REFRESH_DELAY_SEC", "3.0")
     os.environ.setdefault("PUSH_STREAM_ONOPEN_SAFE_REFRESH_MIN_INTERVAL_SEC", "15.0")
     os.environ.setdefault("PUSH_STREAM_ONOPEN_SAFE_READY_WAIT_SEC", "4.0")
@@ -164,7 +164,7 @@ def _ws_connected_and_alive() -> bool:
 def _safe_onopen_refresh_worker() -> None:
     try:
         _apply_defaults()
-        if _env_bool("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", False):
+        if _env_bool("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", True):
             logger.warning("[PUSH ONOPEN SAFE REFRESH] skipped: save-first skip_after_open_refresh=1; rotation handles register")
             return
         if not _env_bool("PUSH_STREAM_ONOPEN_SAFE_REFRESH_ENABLED", True):
@@ -229,7 +229,7 @@ def _safe_onopen_refresh_worker() -> None:
 def _patched_start_refresh_after_open_thread() -> None:
     try:
         _apply_defaults()
-        if _env_bool("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", False):
+        if _env_bool("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", True):
             logger.warning("[PUSH ONOPEN SAFE REFRESH] thread not started: save-first skip_after_open_refresh=1")
             return
         threading.Thread(
@@ -264,7 +264,7 @@ def install() -> bool:
             logger.debug("[PUSH ONOPEN SAFE REFRESH] ws_callbacks patch skipped", exc_info=True)
 
         _INSTALLED = True
-        logger.warning("[PUSH ONOPEN SAFE REFRESH] installed v2.8 respect save-first skip")
+        logger.warning("[PUSH ONOPEN SAFE REFRESH] installed v2.9 skip on-open refresh by default")
         return True
     except Exception:
         logger.exception("[PUSH ONOPEN SAFE REFRESH] install failed")
