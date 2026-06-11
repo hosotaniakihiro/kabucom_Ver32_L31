@@ -41,9 +41,15 @@ def _infer_side_from_shape(close_pos: float, upper: float, lower: float) -> tupl
     return None, f"shape_unknown close_pos={close_pos:.1f} upper={upper:.1f} lower={lower:.1f}"
 
 
+def _legacy_failopen_enabled() -> bool:
+    return _on("USERCUSTOMIZE_ENABLE_LEGACY_TONOSAMA_FAILOPEN_PATCHES", False) or _on(
+        "TONOSAMA_FAILOPEN_DIRECTION_RESCUE", False
+    )
+
+
 def _rescue(row, reason):
-    if not _on("TONOSAMA_FAILOPEN_DIRECTION_RESCUE", True):
-        return False, "disabled"
+    if not _legacy_failopen_enabled():
+        return False, "legacy_failopen_disabled"
     r = str(reason or "")
     target = (
         ("price change low" in r and "range_rescue_direction_ng" in r)
@@ -98,6 +104,13 @@ def install():
     global _INSTALLED, _ORIG
     if _INSTALLED:
         return True
+    if not _legacy_failopen_enabled():
+        _INSTALLED = True
+        logger.warning(
+            "[TONOSAMA FAILOPEN DIRECTION RESCUE] skipped; legacy fail-open disabled. "
+            "Set USERCUSTOMIZE_ENABLE_LEGACY_TONOSAMA_FAILOPEN_PATCHES=1 or TONOSAMA_FAILOPEN_DIRECTION_RESCUE=1 to restore."
+        )
+        return True
     try:
         import trading.entry.tonosama.runner as runner
         import trading.entry.tonosama.ai_gate as ai_gate
@@ -130,7 +143,7 @@ def install():
         runner.ai_check_tonosama_entry = patched
         ai_gate.ai_check_tonosama_entry = patched
         _INSTALLED = True
-        logger.warning("[TONOSAMA FAILOPEN DIRECTION RESCUE] installed V2 shape_direction=%s", _on("TONOSAMA_FAILOPEN_DIRECTION_RESCUE_ALLOW_SHAPE", True))
+        logger.warning("[TONOSAMA FAILOPEN DIRECTION RESCUE] installed legacy V2 shape_direction=%s", _on("TONOSAMA_FAILOPEN_DIRECTION_RESCUE_ALLOW_SHAPE", True))
         return True
     except Exception:
         logger.exception("[TONOSAMA FAILOPEN DIRECTION RESCUE] install failed")
