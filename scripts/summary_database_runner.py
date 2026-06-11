@@ -1,11 +1,11 @@
 # ============================================================
 # File   : scripts/summary_database_runner.py
-# Version: SUMMARY-DATABASE-RUNNER-V7-CPU-THROTTLE-SPOOL-INTERVAL
+# Version: SUMMARY-DATABASE-RUNNER-V8-FORCE-CPU-THROTTLE
 # ------------------------------------------------------------
 # Purpose:
 #   - main_database.py 側で定時サマリー計算・DB保存を担当する子プロセス
 #   - DB保存 owner は database 側へ寄せる
-#   - CPU高止まり対策として、表示OFF/3m5m境界実行/spool flush間引き/slow tick skipを入れる
+#   - CPU高止まり対策として、表示OFF/3m5m境界実行/spool flush間引き/slow tick skipを強制する
 # ============================================================
 
 from __future__ import annotations
@@ -38,13 +38,16 @@ def _install_database_summary_env() -> None:
     os.environ["AUTOSTOCK_SUMMARY_SAVE_MODE"] = "save"
 
     # main_database.py は保存専用寄せ。表示/通知は main.py 側に寄せる。
-    os.environ.setdefault("SUMMARY_DATABASE_RUNNER_DISPLAY", "0")
-    os.environ.setdefault("SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY", "0")
+    os.environ["SUMMARY_DATABASE_RUNNER_DISPLAY"] = "0"
+    os.environ["SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY"] = "0"
     os.environ.setdefault("SUMMARY_SAVE_SPOOL_FLUSH", "1")
 
     # CPU高止まり対策: 1m/3m/5mを毎分すべて回さない。
-    # 1mは毎分、3m/5mは時間境界だけにする。
-    os.environ.setdefault("SUMMARY_PUSH_DISPLAY_ALL_INTERVALS", "0")
+    # sitecustomize/summary_parallel が 1 を入れる場合があるため、ここは必ず強制上書きする。
+    os.environ["SUMMARY_PUSH_DISPLAY_ALL_INTERVALS"] = "0"
+    os.environ["SUMMARY_PARALLEL_FORCE_1_3_5"] = "0"
+    os.environ["SUMMARY_PARALLEL_INTERVAL_WORKERS"] = "1"
+    os.environ["SUMMARY_PUSH_BG_INTERVAL_WORKERS"] = "1"
 
     # spool flushを毎tick前後に無条件実行しない。
     os.environ.setdefault("SUMMARY_SAVE_SPOOL_FLUSH_MIN_INTERVAL_SEC", "120")
@@ -58,7 +61,8 @@ def _install_database_summary_env() -> None:
     os.environ["SUMMARY_MAIN_ENTRY_ONLY"] = "0"
     os.environ["SUMMARY_DB_WRITER_ROLE"] = "database"
 
-    os.environ.setdefault("ENABLE_SUMMARY_ENTRY_TICK", "0")
+    os.environ["ENABLE_SUMMARY_ENTRY_TICK"] = "0"
+    os.environ["ENABLE_RANKING_SUMMARY_TICK"] = "0"
     os.environ.setdefault("PUSH_INCREMENTAL_MA75_SUMMARY_LOOKBACK_DAYS", "1")
     os.environ.setdefault("PUSH_INCREMENTAL_MA75_TAIL_ROWS", "90")
 
@@ -208,6 +212,7 @@ def main() -> int:
     logger.info("[SUMMARY DB RUNNER] AUTOSTOCK_SUMMARY_SAVE_MODE=%s", os.getenv("AUTOSTOCK_SUMMARY_SAVE_MODE"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_DATABASE_RUNNER_DISPLAY=%s", os.getenv("SUMMARY_DATABASE_RUNNER_DISPLAY"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_PUSH_DISPLAY_ALL_INTERVALS=%s", os.getenv("SUMMARY_PUSH_DISPLAY_ALL_INTERVALS"))
+    logger.info("[SUMMARY DB RUNNER] SUMMARY_PARALLEL_FORCE_1_3_5=%s workers=%s bg_workers=%s", os.getenv("SUMMARY_PARALLEL_FORCE_1_3_5"), os.getenv("SUMMARY_PARALLEL_INTERVAL_WORKERS"), os.getenv("SUMMARY_PUSH_BG_INTERVAL_WORKERS"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_SAVE_SPOOL_FLUSH=%s min_interval=%s max_files=%s", os.getenv("SUMMARY_SAVE_SPOOL_FLUSH"), os.getenv("SUMMARY_SAVE_SPOOL_FLUSH_MIN_INTERVAL_SEC"), os.getenv("SUMMARY_SAVE_SPOOL_FLUSH_MAX_FILES"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY=%s patch_ok=%s", os.getenv("SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY"), patch_ok)
     logger.info("[SUMMARY DB RUNNER] SUMMARY_SKIP_DB_SAVE_IN_MAIN=%s", os.getenv("SUMMARY_SKIP_DB_SAVE_IN_MAIN"))
@@ -246,7 +251,7 @@ def main() -> int:
             display_enabled = _env_true("SUMMARY_DATABASE_RUNNER_DISPLAY", default=False)
 
             logger.info(
-                "[SUMMARY DB RUNNER] tick start now=%s run_push=True run_ranking=%s display=%s run_entry=False save_owner=%s save_mode=%s skip_main=%s role=%s empty_notify=%s spool_flush=%s push_all_intervals=%s",
+                "[SUMMARY DB RUNNER] tick start now=%s run_push=True run_ranking=%s display=%s run_entry=False save_owner=%s save_mode=%s skip_main=%s role=%s empty_notify=%s spool_flush=%s push_all_intervals=%s force_1_3_5=%s workers=%s",
                 now,
                 ranking_enabled,
                 display_enabled,
@@ -257,6 +262,8 @@ def main() -> int:
                 os.getenv("SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY"),
                 os.getenv("SUMMARY_SAVE_SPOOL_FLUSH"),
                 os.getenv("SUMMARY_PUSH_DISPLAY_ALL_INTERVALS"),
+                os.getenv("SUMMARY_PARALLEL_FORCE_1_3_5"),
+                os.getenv("SUMMARY_PARALLEL_INTERVAL_WORKERS"),
             )
 
             _flush_summary_save_spool(logger, reason="before_tick")
