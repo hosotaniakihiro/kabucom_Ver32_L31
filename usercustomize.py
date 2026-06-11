@@ -53,6 +53,9 @@ def _is_main_py() -> bool:
 # Runtime defaults only. These are cheap and safe before main startup.
 DEFAULTS = {
     "AUTOSTOCK_MAIN_SKIP_SUMMARY_DB_SAVE": "1",
+    "AUTOSTOCK_MAIN_SKIP_YAHOO_COMPLEMENT": "1",
+    "YAHOO_COMPLEMENT_RUN_IN_MAIN": "0",
+    "AUTOSTOCK_ENABLE_YAHOO_COMPLEMENT_IN_MAIN": "0",
     "RANKING_ENTRY_HARD_TIMEOUT_SEC": "15",
     "RANKING_ENTRY_FAST_RUNTIME_BUDGET_SEC": "15",
     "RANKING_ENTRY_FAST_BUILD_TIMEOUT_SEC": "18",
@@ -151,6 +154,9 @@ if _is_main_py():
         "AUTOSTOCK_MAIN_SKIP_RANKING_SUMMARY_SCHEDULE": "0",
         "AUTOSTOCK_MAIN_SKIP_SUMMARY_PARENT_TICK": "0",
         "AUTOSTOCK_MAIN_SKIP_EXIT_LOOP_WHEN_BROKER_EMPTY": "0",
+        "AUTOSTOCK_MAIN_SKIP_YAHOO_COMPLEMENT": "1",
+        "YAHOO_COMPLEMENT_RUN_IN_MAIN": "0",
+        "AUTOSTOCK_ENABLE_YAHOO_COMPLEMENT_IN_MAIN": "0",
         "AUTOSTOCK_MAIN_ENABLE_EXIT_LOOP": "1",
         "AUTOSTOCK_MAIN_ENABLE_RANKING_ENTRY": "1",
         "AUTOSTOCK_MAIN_ENABLE_TONOSAMA_ENTRY": "1",
@@ -161,7 +167,7 @@ if _is_main_py():
     }.items():
         _env_default(k, v)
     logger.warning(
-        "[USERCUSTOMIZE] main restore defaults mode=%s exit=%s ranking=%s tonosama=%s summary_ai=%s summary_parent=%s summary_db_save_skip=%s",
+        "[USERCUSTOMIZE] main restore defaults mode=%s exit=%s ranking=%s tonosama=%s summary_ai=%s summary_parent=%s summary_db_save_skip=%s yahoo_skip=%s",
         os.getenv("AUTOSTOCK_MAIN_OPERATION_MODE"),
         os.getenv("AUTOSTOCK_MAIN_ENABLE_EXIT_LOOP"),
         os.getenv("AUTOSTOCK_MAIN_ENABLE_RANKING_ENTRY"),
@@ -169,6 +175,7 @@ if _is_main_py():
         os.getenv("AUTOSTOCK_MAIN_ENABLE_SUMMARY_AI_ENTRY"),
         os.getenv("AUTOSTOCK_MAIN_ENABLE_SUMMARY_PARENT_TICK"),
         os.getenv("AUTOSTOCK_MAIN_SKIP_SUMMARY_DB_SAVE"),
+        os.getenv("AUTOSTOCK_MAIN_SKIP_YAHOO_COMPLEMENT"),
     )
 
 os.environ["ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"] = "1"
@@ -196,7 +203,7 @@ for _k, _v in {
     os.environ[_k] = _v
 
 logger.warning(
-    "[USERCUSTOMIZE] runtime defaults lite ranking_stale_skip=%s ranking_empty_failclosed=%s ranking_tech_bridge=%s tonosama_mtf_stale_fail_closed=%s pullback=%s order_exchange=%s ranking_rescue_turnover=%s low_move_turnover=%s",
+    "[USERCUSTOMIZE] runtime defaults lite ranking_stale_skip=%s ranking_empty_failclosed=%s ranking_tech_bridge=%s tonosama_mtf_stale_fail_closed=%s pullback=%s order_exchange=%s ranking_rescue_turnover=%s low_move_turnover=%s yahoo_skip=%s",
     os.getenv("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE"),
     os.getenv("RANKING_TODAY_EMPTY_FAIL_CLOSED"),
     os.getenv("RANKING_SNAPSHOT_TECH_BRIDGE_ENABLED"),
@@ -205,6 +212,7 @@ logger.warning(
     os.getenv("ENTRY_ORDER_EXCHANGE"),
     os.getenv("RANKING_FINAL_RESCUE_MIN_TURNOVER"),
     os.getenv("LOW_MOVE_RANKING_ZERO_ATR_MIN_TURNOVER"),
+    os.getenv("AUTOSTOCK_MAIN_SKIP_YAHOO_COMPLEMENT"),
 )
 
 
@@ -230,6 +238,7 @@ BASE_SYNC_PATCHES = [
 ]
 
 MAIN_SYNC_PATCHES = [
+    ("MAIN_SKIP_YAHOO_COMPLEMENT", "core.startup.main_skip_yahoo_complement_schedule_patch"),
     ("MAIN_SUMMARY_DB_SAVE_SKIP", "core.startup.main_summary_db_save_skip_patch"),
     ("ORDER_EXCHANGE_SOR", "core.startup.order_exchange_sor_patch"),
     ("REENTRY_STALE_429_EXIT_SAFETY", "core.startup.entry_reentry_stale_429_exit_safety_patch"),
