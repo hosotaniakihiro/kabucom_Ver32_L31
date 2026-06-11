@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/ranking_entry_stale_failclosed_final_patch.py
-# Version: V7-FUTURE-TIMESTAMP-GUARD
+# Version: V8-IGNORE-FUTURE-TIMESTAMPS
 # ============================================================
 from __future__ import annotations
 import datetime as dt
@@ -114,7 +114,9 @@ def _fresh_diag() -> tuple[bool, dict[str, Any]]:
         db_path = str(get_today_ranking_db_path())
     except Exception: db_path = ''
     now = dt.datetime.now().replace(microsecond=0)
-    best = None; source = 'none'; rows = 0
+    max_age = _f('RANKING_ENTRY_SNAPSHOT_MAX_AGE_SEC', 300.0)
+    max_future = _f('RANKING_ENTRY_MAX_FUTURE_SNAPSHOT_SEC', 30.0)
+    best = None; source = 'none'; rows = 0; future_best = None; future_source = 'none'; ignored_future = 0
     tables = ('ranking_snapshot_1min','ranking_raw_1min','ranking_summary_1min','ranking_snapshot','ranking_raw')
     cols = ('datetime','updated_at','snapshot_time','received_at','inserted_at','created_at','time')
     try:
@@ -133,21 +135,28 @@ def _fresh_diag() -> tuple[bool, dict[str, Any]]:
                 for col in cols:
                     if col not in table_cols: continue
                     try:
-                        ts = _parse_ts(cur.execute(f'select max({col}) from {table}').fetchone()[0])
-                        if ts is not None and (best is None or ts > best): best = ts; source = f'{table}.{col}'
+                        raw = cur.execute(f'select max({col}) from {table}').fetchone()[0]
+                        ts = _parse_ts(raw)
+                        if ts is None:
+                            continue
+                        age_tmp = (now - ts).total_seconds()
+                        if age_tmp < -max_future:
+                            ignored_future += 1
+                            if future_best is None or ts > future_best:
+                                future_best = ts; future_source = f'{table}.{col}'
+                            continue
+                        if best is None or ts > best:
+                            best = ts; source = f'{table}.{col}'
                     except Exception: pass
     except Exception:
         logger.exception('[RANKING STALE FINAL] inspect failed db=%s', db_path)
     age = None if best is None else (now - best).total_seconds()
-    max_age = _f('RANKING_ENTRY_SNAPSHOT_MAX_AGE_SEC', 300.0)
-    max_future = _f('RANKING_ENTRY_MAX_FUTURE_SNAPSHOT_SEC', 30.0)
-    future_sec = None if age is None or age >= 0 else abs(float(age))
-    future_ok = future_sec is None or future_sec <= max_future
+    future_sec = None if future_best is None else abs((now - future_best).total_seconds())
     phase = _market_phase(now)
-    ok = bool(best is not None and age is not None and age <= max_age and future_ok and best.date() == now.date())
-    if best is not None and not future_ok:
-        logger.warning('[RANKING STALE FINAL] future timestamp rejected latest=%s now=%s future_sec=%.1f max_future=%.1f source=%s', best, now, future_sec, max_future, source)
-    return ok, {'db': db_path, 'latest': None if best is None else str(best), 'source': source, 'rows': rows, 'age_sec': age, 'future_sec': future_sec, 'max_future_sec': max_future, 'max_age_sec': max_age, 'today': str(now.date()), 'phase': phase}
+    ok = bool(best is not None and age is not None and 0 <= float(age) <= max_age and best.date() == now.date())
+    if ignored_future:
+        logger.warning('[RANKING STALE FINAL] ignored future ranking timestamps count=%s future_latest=%s now=%s future_sec=%s source=%s usable_latest=%s usable_source=%s', ignored_future, future_best, now, None if future_sec is None else round(future_sec, 1), future_source, best, source)
+    return ok, {'db': db_path, 'latest': None if best is None else str(best), 'source': source, 'rows': rows, 'age_sec': age, 'future_sec': future_sec, 'future_latest': None if future_best is None else str(future_best), 'future_source': future_source, 'ignored_future_count': ignored_future, 'max_future_sec': max_future, 'max_age_sec': max_age, 'today': str(now.date()), 'phase': phase}
 
 
 def _latest_is_usable_intraday(diag: dict[str, Any], *, max_age_env: str, max_age_default: float) -> bool:
@@ -157,7 +166,7 @@ def _latest_is_usable_intraday(diag: dict[str, Any], *, max_age_env: str, max_ag
         if latest is None or latest.date() != now.date():
             return False
         age = diag.get('age_sec')
-        if age is None or float(age) < -_f('RANKING_ENTRY_MAX_FUTURE_SNAPSHOT_SEC', 30.0):
+        if age is None or float(age) < 0:
             return False
         min_latest = dt.datetime.combine(now.date(), _parse_hhmm('RANKING_ENTRY_LUNCH_MIN_LATEST_TIME', '11:00'))
         max_age = _f(max_age_env, max_age_default)
@@ -245,6 +254,7 @@ def _wrap(orig):
     wrapped._ranking_stale_final_v5 = True
     wrapped._ranking_stale_final_v6 = True
     wrapped._ranking_stale_final_v7 = True
+    wrapped._ranking_stale_final_v8 = True
     wrapped._original = orig
     return wrapped
 
@@ -256,51 +266,33 @@ def _patch_once() -> bool:
         import trading.entry_exit.tasks as tasks
         cur = getattr(tasks, '_run_ranking_entry_safe', None)
         if not callable(cur): return False
-        if getattr(cur, '_ranking_stale_final_v7', False): return True
-        base = getattr(cur, '_original', cur) if (getattr(cur, '_ranking_stale_final_v6', False) or getattr(cur, '_ranking_stale_final_v5', False) or getattr(cur, '_ranking_stale_final_v4', False) or getattr(cur, '_ranking_stale_final_v3', False) or getattr(cur, '_ranking_stale_final_v2', False) or getattr(cur, '_ranking_stale_final_v1', False)) else cur
-        tasks._run_ranking_entry_safe = _wrap(base)
-        logger.warning('[RANKING STALE FINAL] patched outermost v7 target=%s', getattr(base, '__name__', type(base)))
-        return True
+        if getattr(cur, '_ranking_stale_final_v8', False): return True
+        base = getattr(cur, '_original', cur) if (getattr(cur, '_ranking_stale_final_v7', False) or getattr(cur, '_ranking_stale_final_v6', False) or getattr(cur, '_ranking_stale_final_v5', False) or getattr(cur, '_ranking_stale_final_v4', False) or getattr(cur, '_ranking_stale_final_v3', False) or getattr(cur, '_ranking_stale_final_v2', False) or getattr(cur, '_ranking_stale_final_v1', False)) else cur
+        setattr(tasks, '_run_ranking_entry_safe', _wrap(base)); return True
     except Exception:
-        logger.exception('[RANKING STALE FINAL] patch failed'); return False
+        logger.exception('[RANKING STALE FINAL] patch failed')
+        return False
 
 
-def _watch():
-    loops = max(1, min(int(float(os.getenv('RANKING_STALE_FINAL_WATCH_LOOPS', '8') or 8)), 30))
-    sleep_sec = max(0.5, min(float(os.getenv('RANKING_STALE_FINAL_WATCH_SLEEP_SEC', '2.0') or 2.0), 5.0))
-    for i in range(loops):
+def _watcher():
+    loops = int(_f('RANKING_STALE_FINAL_WATCH_LOOPS', 8))
+    sleep = _f('RANKING_STALE_FINAL_WATCH_SLEEP_SEC', 2.0)
+    for i in range(max(1, loops)):
         ok = _patch_once()
-        if i in (0, loops - 1): logger.warning('[RANKING STALE FINAL] enforce v7 i=%s/%s ok=%s schedule_stale=%s budget_hard_stop=%s', i, loops, ok, _SCHED_STALE_INSTALLED, _BUDGET_HARD_STOP_INSTALLED)
-        time.sleep(sleep_sec)
+        if i == 0 or not ok:
+            logger.warning('[RANKING STALE FINAL] enforce v8 i=%s/%s ok=%s schedule_stale=%s budget_hard_stop=%s', i, loops, ok, _SCHED_STALE_INSTALLED, _BUDGET_HARD_STOP_INSTALLED)
+        time.sleep(max(0.2, sleep))
 
 
 def install() -> bool:
     global _INSTALLED
-    os.environ.setdefault('RANKING_ENTRY_STALE_FAILOPEN_ENABLED', '0')
-    os.environ.setdefault('RANKING_ENTRY_CLEAR_PENDING_ON_STALE', '1')
-    os.environ.setdefault('RANKING_ENTRY_SNAPSHOT_MAX_AGE_SEC', '300')
-    os.environ.setdefault('RANKING_ENTRY_MAX_FUTURE_SNAPSHOT_SEC', '30')
-    os.environ.setdefault('RANKING_ENTRY_LUNCH_REOPEN_STALE_FAILOPEN', '1')
-    os.environ.setdefault('RANKING_ENTRY_LUNCH_REOPEN_GRACE_MIN', '20')
-    os.environ.setdefault('RANKING_ENTRY_LUNCH_REOPEN_MAX_AGE_SEC', '7200')
-    os.environ.setdefault('RANKING_ENTRY_LUNCH_MIN_LATEST_TIME', '11:00')
-    os.environ.setdefault('RANKING_ENTRY_STARTUP_STALE_GRACE_ENABLED', '1')
-    os.environ.setdefault('RANKING_ENTRY_STARTUP_STALE_GRACE_MIN', '15')
-    os.environ.setdefault('RANKING_ENTRY_STARTUP_STALE_MAX_AGE_SEC', '7200')
-    os.environ.setdefault('SCHEDULE_LOOP_STALE_RELEASE_ENABLED', '1')
-    os.environ.setdefault('SCHEDULE_LOOP_STALE_RANKING_ENTRY_SEC', '25')
-    os.environ.setdefault('SCHEDULE_LOOP_STALE_YAHOO_COMPLEMENT_SEC', '180')
-    os.environ.setdefault('SCHEDULE_LOOP_STALE_EXIT_SEC', '25')
-    os.environ.setdefault('RANKING_ENTRY_LIGHT_MIN_SCORE', '50')
-    os.environ.setdefault('RANKING_ENTRY_LIGHT_MIN_TURNOVER', '50000000')
-    if _INSTALLED:
-        _install_schedule_stale_release()
-        _install_budget_hard_stop()
-        return True
-    ok = _patch_once(); _INSTALLED = True
-    threading.Thread(target=_watch, name='ranking-stale-final-watch', daemon=True).start()
-    logger.warning('[RANKING STALE FINAL] installed v7 ok=%s failopen=%s schedule_stale=%s lunch_reopen=%s startup_grace=%s budget_hard_stop=%s max_future=%s', ok, os.getenv('RANKING_ENTRY_STALE_FAILOPEN_ENABLED'), _SCHED_STALE_INSTALLED, os.getenv('RANKING_ENTRY_LUNCH_REOPEN_STALE_FAILOPEN'), os.getenv('RANKING_ENTRY_STARTUP_STALE_GRACE_ENABLED'), _BUDGET_HARD_STOP_INSTALLED, os.getenv('RANKING_ENTRY_MAX_FUTURE_SNAPSHOT_SEC'))
-    return ok
-try: install()
-except Exception: logger.exception('[RANKING STALE FINAL] auto install failed')
+    ok = _patch_once()
+    if not _INSTALLED:
+        _INSTALLED = True
+        if _b('RANKING_STALE_FINAL_WATCHER', True):
+            threading.Thread(target=_watcher, name='ranking-stale-final-watch', daemon=True).start()
+        logger.warning('[RANKING STALE FINAL] installed v8 ok=%s failopen=%s schedule_stale=%s lunch_reopen=%s startup_grace=%s budget_hard_stop=%s max_future=%s', ok, _b('RANKING_ENTRY_STALE_FAILOPEN_ENABLED', False), _SCHED_STALE_INSTALLED, _b('RANKING_ENTRY_LUNCH_REOPEN_STALE_FAILOPEN', True), _b('RANKING_ENTRY_STARTUP_STALE_GRACE_ENABLED', True), _BUDGET_HARD_STOP_INSTALLED, _f('RANKING_ENTRY_MAX_FUTURE_SNAPSHOT_SEC', 30.0))
+    return bool(ok)
+
+
 __all__ = ['install']
