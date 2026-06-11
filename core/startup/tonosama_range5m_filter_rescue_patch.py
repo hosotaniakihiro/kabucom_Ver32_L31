@@ -1,22 +1,11 @@
 # ============================================================
 # File   : core/startup/tonosama_range5m_filter_rescue_patch.py
-# Version: V1-TONOSAMA-RANGE5M-FILTER-RESCUE
+# Version: V2-TONOSAMA-RANGE5M-FILTER-RESCUE-OPT-IN
 # ------------------------------------------------------------
-# Purpose:
-#   Tonosama candidates are created from volume-surge/intrabar features.
-#   entry_controller runs trading.filters.volatility_filter.range_5m_filter
-#   before AI gate. For Tonosama, this can reject a strong candidate when
-#   the generic 5m df fallback ratio is small:
-#
-#     RANGE_5M_FILTER_NG detail={'side': 'BUY'}
-#     [VOL FILTER] RANGE df fallback allow=False ratio=0.0042 min_pct=0.012
-#
-#   If Tonosama raw features show strong intrabar range and volume surge,
-#   allow it to proceed to AI/final safety instead of stopping here.
-#
-# Scope:
-#   - Only source/entry_type == TONOSAMA
-#   - SUMMARY/RANKING are unchanged
+# Legacy rescue shim.  The original patch allowed Tonosama candidates to pass
+# the generic 5m range filter when raw intrabar features were strong.  Keep it
+# available as an explicit escape hatch, but do not wrap entry_controller by
+# default.
 # ============================================================
 
 from __future__ import annotations
@@ -32,7 +21,7 @@ _ORIG_EC_RANGE = None
 _ORIG_VF_RANGE = None
 
 
-def _env_on(name: str, default: bool = True) -> bool:
+def _env_on(name: str, default: bool = False) -> bool:
     try:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
@@ -40,6 +29,12 @@ def _env_on(name: str, default: bool = True) -> bool:
         return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
     except Exception:
         return bool(default)
+
+
+def _legacy_rescue_enabled() -> bool:
+    return _env_on("USERCUSTOMIZE_ENABLE_LEGACY_TONOSAMA_FAILOPEN_PATCHES", False) or _env_on(
+        "TONOSAMA_RANGE5M_FILTER_RESCUE", False
+    )
 
 
 def _env_float(name: str, default: float) -> float:
@@ -104,8 +99,8 @@ def _get_num(row: dict, keys: tuple[str, ...], default: float = 0.0) -> float:
 
 
 def _tonosama_should_rescue(row: dict) -> tuple[bool, str]:
-    if not _env_on("TONOSAMA_RANGE5M_FILTER_RESCUE", True):
-        return False, "disabled"
+    if not _legacy_rescue_enabled():
+        return False, "legacy_rescue_disabled"
     if not _is_tonosama(row):
         return False, "not_tonosama"
 
@@ -184,6 +179,13 @@ def install() -> bool:
     global _INSTALLED, _ORIG_EC_RANGE, _ORIG_VF_RANGE
     if _INSTALLED:
         return True
+    if not _legacy_rescue_enabled():
+        _INSTALLED = True
+        logger.warning(
+            "[TONOSAMA RANGE5M RESCUE] skipped; legacy rescue disabled. "
+            "Set USERCUSTOMIZE_ENABLE_LEGACY_TONOSAMA_FAILOPEN_PATCHES=1 or TONOSAMA_RANGE5M_FILTER_RESCUE=1 to restore."
+        )
+        return True
     try:
         import trading.handlers.entry_controller as ec
         import trading.filters.volatility_filter as vf
@@ -193,12 +195,13 @@ def install() -> bool:
         if not callable(cur_ec):
             logger.warning("[TONOSAMA RANGE5M RESCUE] target missing ec.range_5m_filter")
             return False
-        if getattr(cur_ec, "_tonosama_range5m_rescue_v1", False):
+        if getattr(cur_ec, "_tonosama_range5m_rescue_v2", False) or getattr(cur_ec, "_tonosama_range5m_rescue_v1", False):
             _INSTALLED = True
             return True
 
         _ORIG_EC_RANGE = getattr(cur_ec, "_original", cur_ec)
         _ORIG_VF_RANGE = cur_vf if callable(cur_vf) else None
+        _patched_range_5m_filter._tonosama_range5m_rescue_v2 = True  # type: ignore[attr-defined]
         _patched_range_5m_filter._tonosama_range5m_rescue_v1 = True  # type: ignore[attr-defined]
         _patched_range_5m_filter._original = _ORIG_EC_RANGE  # type: ignore[attr-defined]
         ec.range_5m_filter = _patched_range_5m_filter
@@ -207,8 +210,7 @@ def install() -> bool:
             vf.range_5m_filter = _patched_range_5m_filter
         _INSTALLED = True
         logger.warning(
-            "[TONOSAMA RANGE5M RESCUE] installed v1 enabled=%s min_range=%s min_surge=%s min_volume=%s min_score=%s",
-            _env_on("TONOSAMA_RANGE5M_FILTER_RESCUE", True),
+            "[TONOSAMA RANGE5M RESCUE] installed legacy v2 min_range=%s min_surge=%s min_volume=%s min_score=%s",
             os.getenv("TONOSAMA_RANGE5M_RESCUE_MIN_INTRABAR_RANGE_PCT", "3.0"),
             os.getenv("TONOSAMA_RANGE5M_RESCUE_MIN_SURGE", "3.0"),
             os.getenv("TONOSAMA_RANGE5M_RESCUE_MIN_VOLUME", "50000"),
