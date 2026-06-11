@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/kabu_api_token_runtime_patch.py
-# Version: V2-IDEMPOTENT-FAST-STARTUP
+# Version: V3-POSITIONS-401-REFRESH-RETRY
 # ------------------------------------------------------------
 # 目的:
 #   force_cancel_loop.py / kabu_api.positions.py が古い token 属性
@@ -8,11 +8,10 @@
 #   startup_config の token refresh 後も `API TOKEN not ready` / `token 不在`
 #   を出し続ける問題を runtime patch で吸収する。
 #
-# V2:
-#   - 起動時に多数のstartup patchから install() が連鎖呼び出しされても、
-#     2回目以降は即returnして再wrap/大量ログを出さない。
-#   - force_cancel_loop / kabu_api.positions 側にも marker を付け、
-#     既にpatch済みなら再代入しない。
+# V3:
+#   - kabu_api.positions.get_positions が 401 を受けたら token_manager.refresh_token()
+#     で再発行し、global tokenへ同期して1回だけリトライする。
+#   - refresh_token の引数有無差異に対応する。
 # ============================================================
 from __future__ import annotations
 
@@ -22,6 +21,30 @@ from typing import Any
 logger = logging.getLogger(__name__)
 _INSTALLED = False
 _OK: bool | None = None
+
+
+def _sync_global_token(token: str) -> None:
+    if not token:
+        return
+    try:
+        from global_state import global_data
+        for name in ("token_value", "API_TOKEN", "api_token", "token"):
+            try:
+                setattr(global_data, name, token)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        import kabu_api.global_data as kgd  # type: ignore
+        for name in ("token_value", "API_TOKEN", "api_token", "token"):
+            try:
+                setattr(kgd, name, token)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 def _resolve_token() -> str | None:
@@ -52,28 +75,47 @@ def _resolve_token() -> str | None:
     return None
 
 
-def _sync_global_token(token: str) -> None:
-    if not token:
-        return
+def _refresh_token_safe(logger_pos: logging.Logger | None = None) -> str | None:
+    log = logger_pos or logger
     try:
-        from global_state import global_data
-        for name in ("token_value", "API_TOKEN", "api_token", "token"):
-            try:
-                setattr(global_data, name, token)
-            except Exception:
-                pass
+        import token_manager
     except Exception:
+        log.warning("[KABU API TOKEN PATCH] token_manager import failed", exc_info=True)
+        return None
+
+    # 既存実装差異に対応: refresh_token() / refresh_token(api_password) の両方を試す。
+    try:
+        token = token_manager.refresh_token()
+        if token:
+            token = str(token)
+            _sync_global_token(token)
+            log.warning("[KABU API TOKEN PATCH] token refreshed by refresh_token() token_len=%s", len(token))
+            return token
+    except TypeError:
         pass
+    except Exception:
+        log.warning("[KABU API TOKEN PATCH] refresh_token() failed; try with settings", exc_info=True)
 
     try:
-        import kabu_api.global_data as kgd  # type: ignore
-        for name in ("token_value", "API_TOKEN", "api_token", "token"):
-            try:
-                setattr(kgd, name, token)
-            except Exception:
-                pass
+        from pathlib import Path
+        from configparser import ConfigParser
+        root = Path(__file__).resolve().parents[2]
+        conf = ConfigParser()
+        conf.read(str(root / "settings.ini"), encoding="utf-8")
+        section = "aukabu" if conf.has_section("aukabu") else "kabusapi"
+        api_password = conf.get(section, "apipassword", fallback="")
+        if not api_password:
+            log.warning("[KABU API TOKEN PATCH] apipassword missing; cannot refresh token")
+            return None
+        token = token_manager.refresh_token(api_password)
+        if token:
+            token = str(token)
+            _sync_global_token(token)
+            log.warning("[KABU API TOKEN PATCH] token refreshed with settings token_len=%s", len(token))
+            return token
     except Exception:
-        pass
+        log.warning("[KABU API TOKEN PATCH] refresh_token(api_password) failed", exc_info=True)
+    return None
 
 
 def _patch_force_cancel_loop() -> bool:
@@ -81,7 +123,7 @@ def _patch_force_cancel_loop() -> bool:
         import force_cancel_loop as fcl
         old_has = getattr(fcl, "_has_api_token", None)
         old_headers = getattr(fcl, "_safe_get_headers", None)
-        if getattr(old_has, "_kabu_api_token_runtime_patch_v2", False) and getattr(old_headers, "_kabu_api_token_runtime_patch_v2", False):
+        if getattr(old_has, "_kabu_api_token_runtime_patch_v3", False) and getattr(old_headers, "_kabu_api_token_runtime_patch_v3", False):
             return True
 
         def _has_api_token_patched() -> bool:
@@ -104,11 +146,11 @@ def _patch_force_cancel_loop() -> bool:
                 logger.exception("[FORCE_CANCEL] get_headers failed; skip %s", context)
                 return None
 
-        _has_api_token_patched._kabu_api_token_runtime_patch_v2 = True  # type: ignore[attr-defined]
-        _safe_get_headers_patched._kabu_api_token_runtime_patch_v2 = True  # type: ignore[attr-defined]
+        _has_api_token_patched._kabu_api_token_runtime_patch_v3 = True  # type: ignore[attr-defined]
+        _safe_get_headers_patched._kabu_api_token_runtime_patch_v3 = True  # type: ignore[attr-defined]
         fcl._has_api_token = _has_api_token_patched
         fcl._safe_get_headers = _safe_get_headers_patched
-        logger.warning("[KABU API TOKEN PATCH] force_cancel_loop token helpers patched v2")
+        logger.warning("[KABU API TOKEN PATCH] force_cancel_loop token helpers patched v3")
         return True
     except Exception:
         logger.exception("[KABU API TOKEN PATCH] force_cancel_loop patch failed")
@@ -121,9 +163,8 @@ def _patch_positions_module() -> bool:
         import requests
         import time
 
-        if getattr(getattr(pos, "get_positions", None), "_kabu_api_token_runtime_patch_v2", False) and getattr(getattr(pos, "sync_positions_from_kabus", None), "_kabu_api_token_runtime_patch_v2", False):
+        if getattr(getattr(pos, "get_positions", None), "_kabu_api_token_runtime_patch_v3", False) and getattr(getattr(pos, "sync_positions_from_kabus", None), "_kabu_api_token_runtime_patch_v3", False):
             return True
-
         API_URL = getattr(pos, "API_URL", "http://localhost:18080/kabusapi")
         logger_pos = getattr(pos, "logger", logger)
 
@@ -140,14 +181,28 @@ def _patch_positions_module() -> bool:
 
             token = _resolve_token()
             if not token:
+                logger_pos.warning("⚠ get_positions: token 不在 → refresh attempt")
+                token = _refresh_token_safe(logger_pos)
+            if not token:
                 logger_pos.warning("⚠ get_positions: token 不在 → skip")
                 return getattr(pos, "_POS_CACHE", None) or []
 
-            headers = {"Content-Type": "application/json", "X-API-KEY": token}
             url = f"{API_URL}/positions"
+            refreshed_after_401 = False
             for i in range(3):
                 try:
+                    headers = {"Content-Type": "application/json", "X-API-KEY": token}
                     res = requests.get(url, headers=headers, timeout=10)
+                    if res.status_code == 401 and not refreshed_after_401:
+                        logger_pos.warning("⚠ get_positions got 401 -> refresh token and retry once")
+                        new_token = _refresh_token_safe(logger_pos)
+                        if new_token:
+                            token = new_token
+                            refreshed_after_401 = True
+                            time.sleep(0.2)
+                            continue
+                        logger_pos.warning("⚠ get_positions token refresh after 401 failed -> use cache")
+                        return getattr(pos, "_POS_CACHE", None) or []
                     if res.status_code == 429:
                         logger_pos.warning("⚠ /positions rate limited (429) → skip this cycle")
                         time.sleep(0.5)
@@ -173,11 +228,13 @@ def _patch_positions_module() -> bool:
             return getattr(pos, "_POS_CACHE", None) or []
 
         old_sync = getattr(pos, "sync_positions_from_kabus", None)
-        if getattr(old_sync, "_kabu_api_token_runtime_patch_v2", False):
+        if getattr(old_sync, "_kabu_api_token_runtime_patch_v2", False) or getattr(old_sync, "_kabu_api_token_runtime_patch_v3", False):
             old_sync = getattr(old_sync, "_original", None)
 
         def sync_positions_from_kabus_patched(*args: Any, **kwargs: Any):
             token = _resolve_token()
+            if not token:
+                token = _refresh_token_safe(logger_pos)
             if not token:
                 logger_pos.warning("⚠ sync_positions: token 不在 → skip")
                 return None
@@ -185,12 +242,12 @@ def _patch_positions_module() -> bool:
                 return old_sync(*args, **kwargs)
             return None
 
-        get_positions_patched._kabu_api_token_runtime_patch_v2 = True  # type: ignore[attr-defined]
-        sync_positions_from_kabus_patched._kabu_api_token_runtime_patch_v2 = True  # type: ignore[attr-defined]
+        get_positions_patched._kabu_api_token_runtime_patch_v3 = True  # type: ignore[attr-defined]
+        sync_positions_from_kabus_patched._kabu_api_token_runtime_patch_v3 = True  # type: ignore[attr-defined]
         sync_positions_from_kabus_patched._original = old_sync  # type: ignore[attr-defined]
         pos.get_positions = get_positions_patched
         pos.sync_positions_from_kabus = sync_positions_from_kabus_patched
-        logger.warning("[KABU API TOKEN PATCH] kabu_api.positions patched v2")
+        logger.warning("[KABU API TOKEN PATCH] kabu_api.positions patched v3")
         return True
     except Exception:
         logger.exception("[KABU API TOKEN PATCH] kabu_api.positions patch failed")
@@ -205,7 +262,7 @@ def install() -> bool:
     ok2 = _patch_positions_module()
     _OK = bool(ok1 or ok2)
     _INSTALLED = True
-    logger.warning("[KABU API TOKEN PATCH] installed v2 force_cancel=%s positions=%s", ok1, ok2)
+    logger.warning("[KABU API TOKEN PATCH] installed v3 force_cancel=%s positions=%s", ok1, ok2)
     return bool(_OK)
 
 
