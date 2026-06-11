@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/summary/persistence/summary_save_spool.py
-# Version: V1-SUMMARY-SAVE-SPOOL-LOCK-RETRY
+# Version: V2-SUMMARY-SAVE-SPOOL-CORRUPT-QUARANTINE
 # ------------------------------------------------------------
 # 目的:
 #   summary DB が database is locked の時でも、計算済みサマリーを失わない。
@@ -8,11 +8,13 @@
 # 仕組み:
 #   - main.py 側の補助保存でDBロックになったら jsonl.gz へスプール
 #   - main_database.py / summary_database_runner 側で毎分 flush して summary DB へ保存
+#   - 壊れた gzip/json spool は .bad へ隔離し、毎回再読込しない
 #
 # 注意:
 #   - スプールはDBではなくファイルなので、SQLiteロックの影響を受けない
 #   - flush成功後は .done へrename
-#   - flush失敗時は残して次回再試行
+#   - DBロック等の一時失敗時は残して次回再試行
+#   - 読み取り不能な破損ファイルのみ .bad へ隔離
 # ============================================================
 
 from __future__ import annotations
@@ -31,6 +33,11 @@ from typing import Any
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+try:
+    _BAD_GZIP_ERRORS = (EOFError, gzip.BadGzipFile, OSError, UnicodeDecodeError, json.JSONDecodeError)
+except AttributeError:  # pragma: no cover - old Python compatibility
+    _BAD_GZIP_ERRORS = (EOFError, OSError, UnicodeDecodeError, json.JSONDecodeError)
 
 
 def _spool_dir() -> Path:
@@ -121,6 +128,26 @@ def _key_cols(work: pd.DataFrame, table_cols: list[str], interval: int) -> list[
     if {"symbol", "date", "time"}.issubset(cols) and {"symbol", "date", "time"}.issubset(tcols):
         return ["symbol", "date", "time"]
     return []
+
+
+def _rename_with_suffix(path: Path, suffix: str) -> Path:
+    dst = path.with_suffix(path.suffix + suffix)
+    if not dst.exists():
+        return dst
+    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return path.with_name(f"{path.name}.{stamp}{suffix}")
+
+
+def _quarantine_bad_spool(path: Path, err: BaseException) -> str:
+    """Move an unreadable spool file away from *.jsonl.gz retry glob."""
+    try:
+        bad = _rename_with_suffix(path, ".bad")
+        path.rename(bad)
+        logger.error("[SUMMARY SAVE SPOOL] corrupt file quarantined path=%s bad=%s err=%r", path, bad, err)
+        return str(bad)
+    except Exception:
+        logger.exception("[SUMMARY SAVE SPOOL] corrupt file quarantine failed path=%s err=%r", path, err)
+        return ""
 
 
 def spool_summary_df(df: pd.DataFrame, *, interval: int, source: str, reason: str = "db_locked") -> str:
@@ -234,16 +261,21 @@ def _save_direct(df: pd.DataFrame, *, interval: int, source: str, date_yyyymmdd:
 def flush_summary_spool(*, max_files: int = 50) -> dict:
     d = _spool_dir()
     files = sorted(d.glob("summary_spool_*.jsonl.gz"), key=lambda p: p.stat().st_mtime)[:max_files]
-    result = {"files": len(files), "flushed_files": 0, "saved_rows": 0, "failed_files": 0}
+    result = {"files": len(files), "flushed_files": 0, "saved_rows": 0, "failed_files": 0, "bad_files": 0}
     for path in files:
         try:
-            meta, df = _read_spool(path)
+            try:
+                meta, df = _read_spool(path)
+            except _BAD_GZIP_ERRORS as e:
+                result["bad_files"] += 1
+                _quarantine_bad_spool(path, e)
+                continue
             interval = int(meta.get("interval") or 1)
             source = str(meta.get("source") or "push")
             ymd = str(meta.get("date_yyyymmdd") or _detect_yyyymmdd(df))
             saved = _save_direct(df, interval=interval, source=source, date_yyyymmdd=ymd)
             if saved > 0:
-                done = path.with_suffix(path.suffix + ".done")
+                done = _rename_with_suffix(path, ".done")
                 try:
                     path.rename(done)
                 except Exception:
