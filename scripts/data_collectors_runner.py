@@ -1,22 +1,15 @@
 # ============================================================
 # File   : scripts/data_collectors_runner.py
-# Version: DATA-COLLECTORS-PARENT-RUNNER-V8-NO-NAS-HEARTBEAT-STARTUP
+# Version: DATA-COLLECTORS-PARENT-RUNNER-V9-CPU-LITE-CHILD-ENV
 # ------------------------------------------------------------
 # Purpose:
 #   - DB作成 / ランキング取得 / PUSH受信 / Yahoo補完 / サマリーDB保存を一括起動する親runner
 #   - main.py とは別プロセスで動かす
 #
-# V8:
-#   ✔ collector 子プロセス起動直前の mark_component_start / heartbeat を既定で無効化。
-#     NAS上 heartbeat SQLite への WAL 書き込みが Windows 0xC0000006 の誘因になる環境があるため。
-#   ✔ child started のログを Popen 直後に必ず出してから、任意の heartbeat を行う。
-#   ✔ heartbeat を戻す場合は AUTOSTOCK_COLLECTOR_PARENT_HEARTBEAT=1 を明示する。
-#
-# V7:
-#   ✔ ranking_collector_runner.py 起動直後に Windows 0xC0000006 で親ごと落ちる環境向けに、
-#     既定で ranking_collector をスキップ可能にした。
-#   ✔ PUSH受信 / Yahoo補完 / summary_database を先に安定起動させる。
-#   ✔ ランキング収集を戻す場合は AUTOSTOCK_ENABLE_RANKING_COLLECTOR=1 を明示する。
+# V9:
+#   ✔ main_database.py CPU高止まり対策として、子プロセス起動前の環境変数で
+#     起動時の重い修復/MTF indicator fill/並列summaryを抑制する。
+#   ✔ SQLite temp/cache はメモリ寄せにする。
 # ============================================================
 
 from __future__ import annotations
@@ -136,8 +129,30 @@ def _build_env() -> dict[str, str]:
     env["SUMMARY_MAIN_ENTRY_ONLY"] = "0"
     env["SUMMARY_DB_WRITER_ROLE"] = "database"
 
-    # data collector側ではエントリー実行しない。
-    env.setdefault("ENABLE_SUMMARY_ENTRY_TICK", "0")
+    # data collector側ではエントリー/ランキング/表示系を実行しない。
+    env["ENABLE_SUMMARY_ENTRY_TICK"] = "0"
+    env["ENABLE_RANKING_SUMMARY_TICK"] = "0"
+    env["SUMMARY_DATABASE_RUNNER_DISPLAY"] = "0"
+    env["SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY"] = "0"
+
+    # CPU高止まり対策: 1m/3m/5mを毎分すべて並列実行しない。
+    env["SUMMARY_PUSH_DISPLAY_ALL_INTERVALS"] = "0"
+    env["SUMMARY_PARALLEL_FORCE_1_3_5"] = "0"
+    env["SUMMARY_PARALLEL_INTERVAL_WORKERS"] = "1"
+    env["SUMMARY_PUSH_BG_INTERVAL_WORKERS"] = "1"
+    env["SUMMARY_PUSH_BG_ALL_INTERVALS"] = "0"
+    env["SUMMARY_PUSH_BG_LONG_INTERVALS"] = "0"
+
+    # 起動時の重い補修処理を抑制。必要な場合だけ手動で有効化する。
+    env.setdefault("SUMMARY_EXISTING_NULL_REPAIR_ENABLED", "0")
+    env.setdefault("SUMMARY_EXISTING_NULL_REPAIR_STARTUP", "0")
+    env.setdefault("SUMMARY_EXISTING_NULL_REPAIR_MAX_ROWS", "20000")
+    env.setdefault("SUMMARY_MTF_INDICATOR_FILL_ENABLED", "0")
+    env.setdefault("SUMMARY_MTF_INDICATOR_FILL_STARTUP", "0")
+    env.setdefault("SUMMARY_MTF_INDICATOR_FILL_HISTORY_DAYS", "1")
+    env.setdefault("SUMMARY_MTF_INDICATOR_FILL_CHUNK", "100")
+    env.setdefault("SUMMARY_MTF_INDICATOR_FILL_RETRIES", "2")
+    env.setdefault("SUMMARY_MTF_CATCHUP_INDICATOR_FILL", "0")
 
     # 親runner/子起動直後の監視DB書き込みでNAS SQLiteを踏まない。
     env.setdefault("AUTOSTOCK_COLLECTOR_PARENT_HEARTBEAT", "0")
@@ -151,14 +166,27 @@ def _build_env() -> dict[str, str]:
     env.setdefault("MKL_NUM_THREADS", "1")
     env.setdefault("NUMEXPR_NUM_THREADS", "1")
 
+    env.setdefault("SQLITE_MEMORY_PRAGMAS_ENABLED", "1")
+    env.setdefault("SQLITE_MEMORY_TEMP_STORE", "MEMORY")
+    env.setdefault("SQLITE_MEMORY_CACHE_KB", "-65536")
+    env.setdefault("SQLITE_MMAP_SIZE_BYTES", "268435456")
+    env.setdefault("SQLITE_CACHE_SPILL_OFF", "1")
+    env.setdefault("SQLITE_BUSY_TIMEOUT_MS", "5000")
+
     # ranking DB writer WAL肥大化対策。
     env.setdefault("RANKING_WRITER_PASSIVE_CHECKPOINT_AFTER_FLUSH", "1")
     env.setdefault("RANKING_WRITER_IDLE_PASSIVE_CHECKPOINT", "1")
     env.setdefault("RANKING_WRITER_IDLE_CHECKPOINT_SEC", "60")
-    env.setdefault("RANKING_WRITER_WAL_TRUNCATE_MB", "128")
-    env.setdefault("RANKING_WRITER_WAL_AUTOCHECKPOINT", "200")
-    env.setdefault("RANKING_SQLITE_CACHE_KB", "-8192")
-    env.setdefault("RANKING_SQLITE_TEMP_STORE", "FILE")
+    env.setdefault("RANKING_WRITER_WAL_TRUNCATE_MB", "64")
+    env.setdefault("RANKING_WRITER_WAL_AUTOCHECKPOINT", "100")
+    env.setdefault("RANKING_SQLITE_CACHE_KB", "-65536")
+    env.setdefault("RANKING_SQLITE_TEMP_STORE", "MEMORY")
+    env.setdefault("SUMMARY_SQLITE_CACHE_KB", "-131072")
+    env.setdefault("SUMMARY_SQLITE_TEMP_STORE", "MEMORY")
+    env.setdefault("PUSH_SQLITE_CACHE_KB", "-65536")
+    env.setdefault("PUSH_SQLITE_TEMP_STORE", "MEMORY")
+    env.setdefault("YAHOO_SQLITE_CACHE_KB", "-65536")
+    env.setdefault("YAHOO_SQLITE_TEMP_STORE", "MEMORY")
     env.setdefault("RANKING_WRITER_GC_AFTER_FLUSH", "1")
     env.setdefault("RANKING_WRITER_IDLE_GC", "1")
 
@@ -203,7 +231,7 @@ def _run_db_prepare(logger: logging.Logger) -> None:
     env = _build_env()
     logger.info("[DATA COLLECTORS] db_prepare start cmd=%s", cmd)
     logger.info(
-        "[DATA COLLECTORS] child env summary owner=%s mode=%s writer=%s skip_main=%s role=%s wal_truncate_mb=%s sqlite_cache=%s parent_hb=%s",
+        "[DATA COLLECTORS] child env summary owner=%s mode=%s writer=%s skip_main=%s role=%s wal_truncate_mb=%s sqlite_cache=%s parent_hb=%s summary_parallel=%s mtf_fill=%s null_repair=%s",
         env.get("AUTOSTOCK_SUMMARY_SAVE_OWNER"),
         env.get("AUTOSTOCK_SUMMARY_SAVE_MODE"),
         env.get("AUTOSTOCK_SUMMARY_DB_WRITER"),
@@ -212,6 +240,9 @@ def _run_db_prepare(logger: logging.Logger) -> None:
         env.get("RANKING_WRITER_WAL_TRUNCATE_MB"),
         env.get("RANKING_SQLITE_CACHE_KB"),
         env.get("AUTOSTOCK_COLLECTOR_PARENT_HEARTBEAT"),
+        env.get("SUMMARY_PARALLEL_INTERVAL_WORKERS"),
+        env.get("SUMMARY_MTF_INDICATOR_FILL_ENABLED"),
+        env.get("SUMMARY_EXISTING_NULL_REPAIR_ENABLED"),
     )
     _safe_mark_start("db_prepare_runner", {"cmd": cmd})
     ret = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=env, text=True)
@@ -228,7 +259,7 @@ def _start_child(logger: logging.Logger, name: str, path: Path) -> subprocess.Po
     env = _build_env()
     logger.info("[DATA COLLECTORS] start child name=%s cmd=%s", name, cmd)
     logger.info(
-        "[DATA COLLECTORS] child env name=%s summary owner=%s mode=%s writer=%s skip_main=%s main_entry_only=%s role=%s yahoo_owner=%s wal_truncate_mb=%s sqlite_cache=%s parent_hb=%s",
+        "[DATA COLLECTORS] child env name=%s summary owner=%s mode=%s writer=%s skip_main=%s main_entry_only=%s role=%s yahoo_owner=%s wal_truncate_mb=%s sqlite_cache=%s parent_hb=%s summary_parallel=%s mtf_fill=%s null_repair=%s",
         name,
         env.get("AUTOSTOCK_SUMMARY_SAVE_OWNER"),
         env.get("AUTOSTOCK_SUMMARY_SAVE_MODE"),
@@ -240,6 +271,9 @@ def _start_child(logger: logging.Logger, name: str, path: Path) -> subprocess.Po
         env.get("RANKING_WRITER_WAL_TRUNCATE_MB"),
         env.get("RANKING_SQLITE_CACHE_KB"),
         env.get("AUTOSTOCK_COLLECTOR_PARENT_HEARTBEAT"),
+        env.get("SUMMARY_PARALLEL_INTERVAL_WORKERS"),
+        env.get("SUMMARY_MTF_INDICATOR_FILL_ENABLED"),
+        env.get("SUMMARY_EXISTING_NULL_REPAIR_ENABLED"),
     )
 
     # 重要: Popen前にNAS heartbeat DBへ書かない。ここで落ちると child started が出ない。
