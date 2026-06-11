@@ -248,8 +248,17 @@ logger.warning(
 )
 
 
+_INSTALLED_MODULES: set[str] = set()
+_INSTALL_LOCK = threading.RLock()
+
+
 def _install(label: str, module_name: str) -> None:
     try:
+        with _INSTALL_LOCK:
+            if (not _env_on("USERCUSTOMIZE_ALLOW_DUPLICATE_PATCHES", False)) and module_name in _INSTALLED_MODULES:
+                logger.warning("[USERCUSTOMIZE] %s duplicate module skipped module=%s", label, module_name)
+                return
+            _INSTALLED_MODULES.add(module_name)
         mod = __import__(module_name, fromlist=["install"])
         fn = getattr(mod, "install", None)
         ok = bool(fn()) if callable(fn) else False
@@ -316,13 +325,7 @@ MAIN_BG_PATCHES = [
     ("RANKING_ENTRY_INTRADAY_CAP", "core.startup.ranking_entry_intraday_cap_patch"),
     ("SUMMARY_AI_NO_DIRECT_SYNC", "core.startup.summary_ai_no_direct_sync_patch"),
     ("RANKING_ENTRY_MARKET_HOURS_SKIP", "core.startup.ranking_entry_market_hours_skip_patch"),
-    ("RANKING_EMPTY_TODAY_FAILCLOSED_LAST", "core.startup.ranking_empty_today_failclosed_patch"),
-    ("RANKING_STALE_SNAPSHOT_SKIP_LAST", "core.startup.ranking_entry_stale_snapshot_skip_patch"),
-    ("RANKING_SNAPSHOT_TECH_BRIDGE_LAST", "core.startup.ranking_entry_snapshot_technical_bridge_patch"),
-    ("SUMMARY_AFTERNOON_STALE_GUARD_LAST", "core.startup.summary_fallback_afternoon_stale_guard_patch"),
-    ("RANKING_AI_GATE_FAILOPEN_LAST", "core.startup.ranking_entry_gate_failopen_patch"),
-    ("ENTRY_RANKING_SCALP_RESCUE_LAST", "core.startup.entry_ranking_scalp_order_rescue_patch"),
-    ("RANKING_STALE_FINAL_LAST", "core.startup.ranking_entry_stale_failclosed_final_patch"),
+    ("RANKING_STALE_FINAL", "core.startup.ranking_entry_stale_failclosed_final_patch"),
 ]
 
 DB_PATCHES = [
