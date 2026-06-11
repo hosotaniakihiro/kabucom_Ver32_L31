@@ -1,17 +1,17 @@
 # ============================================================
 # File   : core/startup/ranking_entry_filter_rescue_patch.py
-# Version: V1.5-WIDER-RECURSION-MAX-RANK
+# Version: V1.6-EARLY-SESSION-TURNOVER-RELAX
 # ------------------------------------------------------------
 # 目的:
 #   スコア上位母数を80位まで広げた後も、
 #   FLAT_PRICE_FILTER_RECURSION救済側だけ max_rank=10 のままで、
 #   rank 11〜30 の高流動性候補が rank_low で落ちる問題を修正。
 #
-# V1.5:
-#   - 再帰系救済の既定 max_rank を 10 -> 30 に拡大。
-#   - 通常救済の既定 max_rank も 10 -> 30 に拡大。
-#   - min_score=55 / min_turnover=1億 / min_volume=3万は維持。
-#   - 価格範囲 300〜7000円、方向一致 BUY day>=0 / SELL day<=0 は維持。
+# V1.6:
+#   - 09時台のランキング強候補が TURNOVER_NG turnover=3,000〜5,000万で
+#     全落ちしないよう、救済側の既定 min_turnover を 1億 -> 3,000万へ緩和。
+#   - 低出来高は引き続き min_volume=3万でブロック。
+#   - 方向一致 BUY day>=0 / SELL day<=0、価格範囲 300〜7000円は維持。
 # ============================================================
 
 from __future__ import annotations
@@ -113,7 +113,7 @@ def _rescue_allowed(row: dict[str, Any], side: str, score: float, reason: Any) -
 
     min_score = _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_SCORE" if recursion_reason else "RANKING_ENTRY_RESCUE_MIN_SCORE", 55.0 if recursion_reason else 60.0)
     max_rank = _env_int("RANKING_ENTRY_RESCUE_RECURSION_MAX_RANK" if recursion_reason else "RANKING_ENTRY_RESCUE_MAX_RANK", 30)
-    min_turnover = _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_TURNOVER" if recursion_reason else "RANKING_ENTRY_RESCUE_MIN_TURNOVER", 100000000.0)
+    min_turnover = _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_TURNOVER" if recursion_reason else "RANKING_ENTRY_RESCUE_MIN_TURNOVER", 30000000.0)
     min_volume = _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_VOLUME" if recursion_reason else "RANKING_ENTRY_RESCUE_MIN_VOLUME", 30000.0)
     min_abs_day = _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_ABS_DAY_PCT" if recursion_reason else "RANKING_ENTRY_RESCUE_MIN_ABS_DAY_PCT", 0.0 if recursion_reason else 3.0)
     min_price = _env_float("RANKING_ENTRY_RESCUE_MIN_PRICE", 300.0)
@@ -200,20 +200,22 @@ def install() -> bool:
     try:
         os.environ.setdefault("RANKING_ENTRY_RESCUE_RECURSION_MAX_RANK", "30")
         os.environ.setdefault("RANKING_ENTRY_RESCUE_MAX_RANK", "30")
+        os.environ.setdefault("RANKING_ENTRY_RESCUE_MIN_TURNOVER", "30000000")
+        os.environ.setdefault("RANKING_ENTRY_RESCUE_RECURSION_MIN_TURNOVER", "30000000")
         import trading.ranking.entry_from_ranking as efr
         cur = getattr(efr, "_passes_ranking_only_filters", None)
         if not callable(cur):
             logger.warning("[RANKING FILTER RESCUE] target unavailable")
             return False
-        if getattr(cur, "_ranking_filter_rescue_v15", False):
+        if getattr(cur, "_ranking_filter_rescue_v16", False):
             _INSTALLED = True
             return True
         _ORIG = cur
-        _patched_passes_ranking_only_filters._ranking_filter_rescue_v15 = True  # type: ignore[attr-defined]
+        _patched_passes_ranking_only_filters._ranking_filter_rescue_v16 = True  # type: ignore[attr-defined]
         _patched_passes_ranking_only_filters._original = cur  # type: ignore[attr-defined]
         efr._passes_ranking_only_filters = _patched_passes_ranking_only_filters
         _INSTALLED = True
-        logger.warning("[RANKING FILTER RESCUE] installed v1.5 enabled=%s min_score=%.1f recursion_min_score=%.1f max_rank=%s recursion_max_rank=%s recursion_min_turnover=%.0f", _env_bool("RANKING_ENTRY_STRONG_TECH_RESCUE_ENABLED", True), _env_float("RANKING_ENTRY_RESCUE_MIN_SCORE", 60.0), _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_SCORE", 55.0), _env_int("RANKING_ENTRY_RESCUE_MAX_RANK", 30), _env_int("RANKING_ENTRY_RESCUE_RECURSION_MAX_RANK", 30), _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_TURNOVER", 100000000.0))
+        logger.warning("[RANKING FILTER RESCUE] installed v1.6 enabled=%s min_score=%.1f recursion_min_score=%.1f max_rank=%s recursion_max_rank=%s min_turnover=%.0f recursion_min_turnover=%.0f", _env_bool("RANKING_ENTRY_STRONG_TECH_RESCUE_ENABLED", True), _env_float("RANKING_ENTRY_RESCUE_MIN_SCORE", 60.0), _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_SCORE", 55.0), _env_int("RANKING_ENTRY_RESCUE_MAX_RANK", 30), _env_int("RANKING_ENTRY_RESCUE_RECURSION_MAX_RANK", 30), _env_float("RANKING_ENTRY_RESCUE_MIN_TURNOVER", 30000000.0), _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_TURNOVER", 30000000.0))
         return True
     except Exception:
         logger.exception("[RANKING FILTER RESCUE] install failed")
