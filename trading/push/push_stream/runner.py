@@ -1,20 +1,20 @@
 # ============================================================
 # File   : trading/push/push_stream/runner.py
-# Version: Ver1.7-PRODUCTION-PUSH-STREAM-MAIN-MEMORY-ONLY-DB-FLUSH-OFF
+# Version: Ver1.8-PRODUCTION-PUSH-STREAM-CORE-VENDOR-ROTATION
 # ------------------------------------------------------------
 # 【概要】
 #   kabu Station PUSH WebSocket runner
+#
+# 【REV1.8】
+#   ✔ vendor sample compatible run_forever() を本体実装
+#   ✔ ローテーションREST登録中はWS再接続を一時停止
+#   ✔ PUSH reconnect stability patch の runner 差し替えを不要化
 #
 # 【REV1.7】
 #   ✔ main.py / main_database.py 分離運用時、main.py側では
 #     push_stream DB writer / order_book writer / flush worker を強制OFF
 #   ✔ main.py側は WebSocket受信・latest price cache・5秒足・push_df 更新だけを担当
 #   ✔ stream_data へのflushログ/DB保存は main_database.py 側だけに寄せる
-#
-# 【REV1.6】
-#   ✔ enable_rotate=False の memory-only mode でも refresh_callable を設定する
-#   ✔ rotation worker OFF でも WebSocket on_open 後の登録refreshを可能にする
-#   ✔ 保有銘柄 protected が登録対象に入っても kabuステーションへ送信されない問題を修正
 # ============================================================
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ from .constants import RECONNECT_WAIT_SEC
 
 logger = logging.getLogger(__name__)
 
-VERSION = "Ver1.7-PRODUCTION-PUSH-STREAM-MAIN-MEMORY-ONLY-DB-FLUSH-OFF"
+VERSION = "Ver1.8-PRODUCTION-PUSH-STREAM-CORE-VENDOR-ROTATION"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -60,13 +60,23 @@ def _env_bool(name: str, default: bool) -> bool:
         if v is None:
             return bool(default)
         s = str(v).strip().lower()
-        if s in {"1", "true", "yes", "y", "on"}:
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
             return True
-        if s in {"0", "false", "no", "n", "off"}:
+        if s in {"0", "false", "no", "n", "off", "disable", "disabled"}:
             return False
         return bool(default)
     except Exception:
         return bool(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
 
 
 def _should_disable_push_db_write_in_this_process() -> bool:
@@ -253,12 +263,45 @@ def _sync_runtime_status_after_start() -> None:
         logger.debug("[push_stream] sync runtime status failed", exc_info=True)
 
 
+def _run_vendor_forever(ws_app: Any) -> None:
+    """Official kabu Station sample uses ws.run_forever() without ping args."""
+    vendor_mode = _env_bool("PUSH_WS_VENDOR_RUN_FOREVER", True)
+    enable_ping = _env_bool("PUSH_WS_ENABLE_PING", False)
+    if vendor_mode and not enable_ping:
+        logger.warning("[push_stream] run_forever vendor mode: no ping_interval/no reconnect arg")
+        ws_app.run_forever()
+        return
+
+    ping_interval = max(0.0, _env_float("PUSH_WS_PING_INTERVAL_SEC", 20.0))
+    ping_timeout = max(0.0, _env_float("PUSH_WS_PING_TIMEOUT_SEC", 10.0))
+    logger.warning("[push_stream] run_forever ping mode interval=%.1f timeout=%.1f", ping_interval, ping_timeout)
+    try:
+        ws_app.run_forever(ping_interval=ping_interval, ping_timeout=ping_timeout, reconnect=0)
+    except TypeError:
+        ws_app.run_forever(ping_interval=ping_interval, ping_timeout=ping_timeout)
+
+
+def _wait_while_rotation_registering() -> None:
+    if not _env_bool("PUSH_STREAM_PAUSE_RECONNECT_DURING_REGISTER", True):
+        return
+    while bool(getattr(state, "_rotation_register_in_progress", False)) and not state._stop_event.is_set():
+        logger.info("[push_stream] reconnect paused: rotation register in progress")
+        time.sleep(0.1)
+
+
 def _run_forever_loop() -> None:
     _safe_set_runtime("push_stream_running", True)
     ws_url = _resolve_ws_url()
-    logger.info("[push_stream] run loop start url=%s version=%s", ws_url, VERSION)
+    logger.info(
+        "[push_stream] run loop start url=%s version=%s vendor_ws=%s pause_during_register=%s",
+        ws_url,
+        VERSION,
+        _env_bool("PUSH_WS_VENDOR_RUN_FOREVER", True),
+        _env_bool("PUSH_STREAM_PAUSE_RECONNECT_DURING_REGISTER", True),
+    )
 
     while not state._stop_event.is_set():
+        _wait_while_rotation_registering()
         try:
             _safe_set_runtime("push_ws_url", ws_url)
             ws_app = websocket.WebSocketApp(
@@ -280,10 +323,7 @@ def _run_forever_loop() -> None:
                 callable(on_close),
             )
 
-            try:
-                ws_app.run_forever(ping_interval=20, ping_timeout=10, reconnect=0)
-            except TypeError:
-                ws_app.run_forever(ping_interval=20, ping_timeout=10)
+            _run_vendor_forever(ws_app)
 
         except Exception:
             logger.exception("[push_stream] run_forever crashed")
@@ -297,8 +337,11 @@ def _run_forever_loop() -> None:
         if state._stop_event.is_set():
             break
 
-        logger.warning("[push_stream] reconnect after %.1fs", RECONNECT_WAIT_SEC)
-        time.sleep(RECONNECT_WAIT_SEC)
+        base = max(0.1, _env_float("PUSH_STREAM_RECONNECT_BACKOFF_BASE_SEC", RECONNECT_WAIT_SEC))
+        max_wait = max(base, _env_float("PUSH_STREAM_RECONNECT_BACKOFF_MAX_SEC", base))
+        wait_sec = min(max_wait, base)
+        logger.warning("[push_stream] reconnect after %.1fs vendor_ws=%s", wait_sec, _env_bool("PUSH_WS_VENDOR_RUN_FOREVER", True))
+        time.sleep(wait_sec)
 
     _safe_set_runtime("push_stream_running", False)
     logger.info("[push_stream] run loop stopped")
