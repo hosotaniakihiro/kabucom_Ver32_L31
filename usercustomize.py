@@ -67,6 +67,36 @@ DEFAULTS = {
     "SYMBOL_STOP_AFTER_FIRST_LOSS_ENABLED": "0",
     "ENTRY_ORDER_EXCHANGE": "9",
     "KABU_ORDER_EXCHANGE": "9",
+    # PUSH core-integrated defaults.  Legacy PUSH startup shims are disabled
+    # by default below; keep their operational env policy here.
+    "PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH": "1",
+    "PUSH_STREAM_ONOPEN_REFRESH_CLEAR_FIRST": "0",
+    "PUSH_STREAM_ONOPEN_REFRESH_UNREGISTER_FIRST": "0",
+    "PUSH_STREAM_ONOPEN_REFRESH_WAIT_AFTER_CLEAR": "0.0",
+    "PUSH_STREAM_AFTER_OPEN_REFRESH_DELAY_SEC": "0.50",
+    "PUSH_STREAM_ONOPEN_WS_READY_TIMEOUT_SEC": "1.0",
+    "PUSH_WS_VENDOR_RUN_FOREVER": "1",
+    "PUSH_WS_ENABLE_PING": "0",
+    "PUSH_ROTATION_CLOSE_WS_BEFORE_REGISTER": "1",
+    "PUSH_ROTATION_REGISTER_WITH_WS_CLOSED": "1",
+    "PUSH_STREAM_PAUSE_RECONNECT_DURING_REGISTER": "1",
+    "PUSH_ROTATION_WS_CLOSE_SETTLE_SEC": "0.15",
+    "PUSH_ROTATION_UNREGISTER_WAIT_SEC": "0.2",
+    "PUSH_ROTATION_WAIT_WS_READY_AFTER_REGISTER": "1",
+    "PUSH_ROTATION_POST_REGISTER_WS_READY_TIMEOUT_SEC": "4.0",
+    "PUSH_ROTATION_POST_REGISTER_WS_POLL_SEC": "0.05",
+    "PUSH_ROTATION_POST_REGISTER_WS_SETTLE_SEC": "0.25",
+    "PUSH_STREAM_RECONNECT_BACKOFF_BASE_SEC": "0.3",
+    "PUSH_STREAM_RECONNECT_BACKOFF_MAX_SEC": "1.0",
+    "PUSH_STREAM_RECONNECT_STABLE_RESET_SEC": "5.0",
+    "PUSH_STREAM_SHORT_LIVED_SEC": "1.0",
+    "PUSH_STREAM_SHORT_LIVED_EXTRA_COOLDOWN_SEC": "0.0",
+    "PUSH_STREAM_SINGLE_OWNER_LOCK": "1",
+    "PUSH_STREAM_SINGLE_OWNER_WAIT_RETRY": "1",
+    "PUSH_STREAM_SINGLE_OWNER_RETRY_SEC": "1.0",
+    "PUSH_STREAM_SINGLE_OWNER_LOG_EVERY_SEC": "20.0",
+    "PUSH_STREAM_EMPTY_OWNER_LOCK_FAIL_OPEN": "1",
+    "PUSH_STREAM_EMPTY_OWNER_LOCK_REQUIRE_OWNER_CONTEXT": "1",
     "WATCHLIST_RECENT_LIQ_ENABLED": "1",
     "WATCHLIST_RECENT_LIQ_BULK_RUN_IN_MAIN": "1",
     "WATCHLIST_RECENT_LIQ_BULK_SKIP_DB_IN_MAIN": "0",
@@ -203,7 +233,7 @@ for _k, _v in {
     os.environ[_k] = _v
 
 logger.warning(
-    "[USERCUSTOMIZE] runtime defaults lite ranking_stale_skip=%s ranking_empty_failclosed=%s ranking_tech_bridge=%s tonosama_mtf_stale_fail_closed=%s pullback=%s order_exchange=%s ranking_rescue_turnover=%s low_move_turnover=%s yahoo_skip=%s",
+    "[USERCUSTOMIZE] runtime defaults lite ranking_stale_skip=%s ranking_empty_failclosed=%s ranking_tech_bridge=%s tonosama_mtf_stale_fail_closed=%s pullback=%s order_exchange=%s ranking_rescue_turnover=%s low_move_turnover=%s yahoo_skip=%s push_core=%s legacy_push_patches=%s",
     os.getenv("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE"),
     os.getenv("RANKING_TODAY_EMPTY_FAIL_CLOSED"),
     os.getenv("RANKING_SNAPSHOT_TECH_BRIDGE_ENABLED"),
@@ -213,6 +243,8 @@ logger.warning(
     os.getenv("RANKING_FINAL_RESCUE_MIN_TURNOVER"),
     os.getenv("LOW_MOVE_RANKING_ZERO_ATR_MIN_TURNOVER"),
     os.getenv("AUTOSTOCK_MAIN_SKIP_YAHOO_COMPLEMENT"),
+    "integrated",
+    os.getenv("USERCUSTOMIZE_ENABLE_LEGACY_PUSH_PATCHES", "0"),
 )
 
 
@@ -226,11 +258,14 @@ def _install(label: str, module_name: str) -> None:
         logger.exception("[USERCUSTOMIZE] %s auto install failed", label)
 
 
-BASE_SYNC_PATCHES = [
+LEGACY_PUSH_PATCHES = [
     ("PUSH_RECONNECT_STABILITY", "core.startup.push_stream_reconnect_stability_patch"),
+    ("PUSH_ONOPEN_SAFE_REFRESH", "core.startup.push_onopen_refresh_safe_patch"),
+]
+
+BASE_SYNC_PATCHES = [
     ("PUSH_MAIN_OWNER_POLICY", "core.startup.push_main_owner_lock_policy_patch"),
     ("PUSH_EMPTY_OWNER_FAILOPEN", "core.startup.push_empty_owner_lock_failopen_patch"),
-    ("PUSH_ONOPEN_SAFE_REFRESH", "core.startup.push_onopen_refresh_safe_patch"),
     ("RANKING_API_GLOBAL_THROTTLE", "core.startup.ranking_api_global_throttle_patch"),
     ("RANKING_WAL_AGGRESSIVE_TRUNCATE", "core.startup.ranking_wal_aggressive_truncate_patch"),
     ("RANKING_EMPTY_TODAY_FAILCLOSED", "core.startup.ranking_empty_today_failclosed_patch"),
@@ -306,6 +341,14 @@ def _bg_main() -> None:
     _install_many(MAIN_BG_PATCHES)
     logger.warning("[USERCUSTOMIZE] main background patches done")
 
+
+if _env_on("USERCUSTOMIZE_ENABLE_LEGACY_PUSH_PATCHES", False):
+    _install_many(LEGACY_PUSH_PATCHES)
+else:
+    logger.warning(
+        "[USERCUSTOMIZE] legacy PUSH startup shims skipped; core-integrated PUSH is active. "
+        "Set USERCUSTOMIZE_ENABLE_LEGACY_PUSH_PATCHES=1 to restore legacy shims."
+    )
 
 _install_many(BASE_SYNC_PATCHES)
 
