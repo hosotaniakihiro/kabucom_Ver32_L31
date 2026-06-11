@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/rotation_register.py
-# Version: PRODUCTION-STABLE-REV4-PUSH-ROTATION-REGISTER-DESIGNED-CLEAR
+# Version: PRODUCTION-STABLE-REV5-PUSH-ROTATION-DYNAMIC-TRANSPORT-CALL
 # ------------------------------------------------------------
 # PUSH A/Bローテーション用の登録委譲API。
 #
@@ -13,11 +13,11 @@
 #       B登録 -> 4.8秒保持 -> unregister_all -> 0.2秒待機 -> A登録
 #   - timeout付き登録で rotation worker を止めない
 #
-# Env override:
-#   PUSH_ROTATION_REGISTER_FORCE=0/1
-#   PUSH_ROTATION_CLEAR_FIRST=0/1
-#   PUSH_ROTATION_UNREGISTER_FIRST=0/1
-#   PUSH_ROTATION_WAIT_AFTER_CLEAR_SEC=0.2
+# REV5:
+#   - from .transport import _call_refresh の固定参照を廃止。
+#   - 毎回 transport._call_refresh を動的に呼ぶ。
+#   - これにより起動時パッチで rotation_register._call_refresh を
+#     再バインドする必要をなくす。
 # ============================================================
 
 from __future__ import annotations
@@ -34,11 +34,11 @@ from .rotation_settings import (
     UNREGISTER_TO_REGISTER_WAIT_SEC,
 )
 from .rotation_symbols import clean_symbol_list
-from .transport import _call_refresh
+from . import transport
 
 logger = logging.getLogger(__name__)
 
-VERSION = "PRODUCTION-STABLE-REV4-PUSH-ROTATION-REGISTER-DESIGNED-CLEAR"
+VERSION = "PRODUCTION-STABLE-REV5-PUSH-ROTATION-DYNAMIC-TRANSPORT-CALL"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -137,7 +137,7 @@ def register_symbols(symbols: Iterable[str], force: bool = False, **kwargs: Any)
     clear_first = _env_bool("PUSH_ROTATION_CLEAR_FIRST", False)
     unregister_first = _env_bool("PUSH_ROTATION_UNREGISTER_FIRST", False)
     wait_after_clear = _env_float("PUSH_ROTATION_WAIT_AFTER_CLEAR_SEC", 0.0)
-    unregister_wait = _env_float("PUSH_ROTATION_UNREGISTER_WAIT_SEC", wait_after_clear)
+    unregister_wait = _env_float("PUSH_ROTATION_UNREGISTER_WAIT_SEC", wait_after_clear or UNREGISTER_TO_REGISTER_WAIT_SEC)
 
     try:
         logger.warning(
@@ -151,7 +151,10 @@ def register_symbols(symbols: Iterable[str], force: bool = False, **kwargs: Any)
             wait_after_clear,
         )
 
-        result = _call_refresh(
+        # Important: resolve dynamically from transport module.
+        # Older code imported _call_refresh directly and therefore required a startup monkey patch
+        # to rebind stale references.  This removes that patch dependency.
+        result = transport._call_refresh(
             force=effective_force,
             reason=reason,
             clear_first=clear_first,
@@ -260,3 +263,17 @@ def run_one_batch_with_timeout(
             len(cleaned),
         )
         return False
+    finally:
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            ex.shutdown(wait=False)
+
+
+__all__ = [
+    "VERSION",
+    "refresh_result_to_ok",
+    "register_symbols",
+    "run_one_batch",
+    "run_one_batch_with_timeout",
+]
