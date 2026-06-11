@@ -1,11 +1,13 @@
 # ============================================================
 # File   : core/startup/push_onopen_refresh_safe_patch.py
-# Version: V2.9-PUSH-ONOPEN-SKIP-BY-DEFAULT
+# Version: V3.0-PUSH-ONOPEN-SKIP-AND-ROTATION-WS-READY-WAIT
 # ------------------------------------------------------------
 # 目的:
 #   WebSocket reconnect直後の非破壊refreshで kabu Station を再切断させない。
 #   V2.9: save-firstを標準化し、このパッチ単体でも on_open refresh を起動しない。
 #         登録は rotation_A/B 側の unregister_all -> wait -> register に一本化する。
+#   V3.0: rotation REST register 後、WebSocket再接続が確認できるまで
+#         4.8秒holdを開始しない追加パッチを同期インストールする。
 # ============================================================
 from __future__ import annotations
 
@@ -84,6 +86,11 @@ def _apply_defaults() -> None:
     os.environ.setdefault("AUTOSTOCK_MAIN_DISABLE_SCHEDULED_EXIT_LOOP", "1")
     os.environ.setdefault("AUTOSTOCK_MAIN_DISABLE_SCHEDULED_ENTRY_JOBS", "1")
     os.environ.setdefault("AUTOSTOCK_MAIN_SCHEDULE_DUE_FILTER", "1")
+    # V3.0: make rotation hold wait until WebSocket is really back.
+    os.environ["PUSH_ROTATION_WAIT_WS_READY_AFTER_REGISTER"] = "1"
+    os.environ["PUSH_ROTATION_POST_REGISTER_WS_READY_TIMEOUT_SEC"] = "4.0"
+    os.environ["PUSH_ROTATION_POST_REGISTER_WS_POLL_SEC"] = "0.05"
+    os.environ["PUSH_ROTATION_POST_REGISTER_WS_SETTLE_SEC"] = "0.25"
 
 
 def _install_main_push_db_restore_skip() -> bool:
@@ -149,6 +156,17 @@ def _install_main_schedule_due_filter() -> bool:
         return ok
     except Exception:
         logger.exception("[PUSH ONOPEN SAFE REFRESH] main schedule due filter patch failed")
+        return False
+
+
+def _install_rotation_wait_ws_ready_patch() -> bool:
+    try:
+        from core.startup.push_rotation_wait_ws_ready_after_register_patch import install as install_wait
+        ok = bool(install_wait())
+        logger.warning("[PUSH ONOPEN SAFE REFRESH] rotation wait-ws-ready patch installed=%s", ok)
+        return ok
+    except Exception:
+        logger.exception("[PUSH ONOPEN SAFE REFRESH] rotation wait-ws-ready patch failed")
         return False
 
 
@@ -248,6 +266,7 @@ def install() -> bool:
         return True
     try:
         _apply_defaults()
+        _install_rotation_wait_ws_ready_patch()
         _install_main_push_db_restore_skip()
         _install_main_ranking_summary_bootstrap_skip()
         _install_main_summary_push_bg_skip()
@@ -264,7 +283,7 @@ def install() -> bool:
             logger.debug("[PUSH ONOPEN SAFE REFRESH] ws_callbacks patch skipped", exc_info=True)
 
         _INSTALLED = True
-        logger.warning("[PUSH ONOPEN SAFE REFRESH] installed v2.9 skip on-open refresh by default")
+        logger.warning("[PUSH ONOPEN SAFE REFRESH] installed v3.0 skip on-open refresh + rotation ws-ready wait")
         return True
     except Exception:
         logger.exception("[PUSH ONOPEN SAFE REFRESH] install failed")
