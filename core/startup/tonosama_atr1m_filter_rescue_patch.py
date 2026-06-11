@@ -1,17 +1,10 @@
 # ============================================================
 # File   : core/startup/tonosama_atr1m_filter_rescue_patch.py
-# Version: V1-TONOSAMA-ATR1M-FILTER-RESCUE
+# Version: V2-TONOSAMA-ATR1M-FILTER-RESCUE-OPT-IN
 # ------------------------------------------------------------
-# Purpose:
-#   Tonosama can create a valid pending entry from PUSH/volume-surge features,
-#   but entry_controller stops before AI gate when generic ATR 1m filter fails
-#   only because the 1m df has too few bars:
-#
-#     [VOL FILTER] ATR df fallback fail-close symbol=4180 reason=1m本数不足 bars=14
-#     ENTRY_SKIP 4180 reason=ATR_1M_FILTER_NG
-#
-#   For Tonosama only, if the raw candidate has enough volume surge/range/score,
-#   allow the candidate to proceed to AI/final safety. SUMMARY/RANKING unchanged.
+# Legacy rescue shim.  The original patch allowed Tonosama candidates to pass
+# the generic ATR 1m filter when the 1m history was short.  Keep it available as
+# an explicit escape hatch, but do not wrap entry_controller by default.
 # ============================================================
 
 from __future__ import annotations
@@ -26,7 +19,7 @@ _INSTALLED = False
 _ORIG_EC_ATR = None
 
 
-def _env_on(name: str, default: bool = True) -> bool:
+def _env_on(name: str, default: bool = False) -> bool:
     try:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
@@ -34,6 +27,12 @@ def _env_on(name: str, default: bool = True) -> bool:
         return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
     except Exception:
         return bool(default)
+
+
+def _legacy_rescue_enabled() -> bool:
+    return _env_on("USERCUSTOMIZE_ENABLE_LEGACY_TONOSAMA_FAILOPEN_PATCHES", False) or _env_on(
+        "TONOSAMA_ATR1M_FILTER_RESCUE", False
+    )
 
 
 def _env_float(name: str, default: float) -> float:
@@ -96,8 +95,8 @@ def _get_num(row: dict, keys: tuple[str, ...], default: float = 0.0) -> float:
 
 
 def _should_rescue(row: dict) -> tuple[bool, str]:
-    if not _env_on("TONOSAMA_ATR1M_FILTER_RESCUE", True):
-        return False, "disabled"
+    if not _legacy_rescue_enabled():
+        return False, "legacy_rescue_disabled"
     if not _is_tonosama(row):
         return False, "not_tonosama"
 
@@ -150,6 +149,13 @@ def install() -> bool:
     global _INSTALLED, _ORIG_EC_ATR
     if _INSTALLED:
         return True
+    if not _legacy_rescue_enabled():
+        _INSTALLED = True
+        logger.warning(
+            "[TONOSAMA ATR1M RESCUE] skipped; legacy rescue disabled. "
+            "Set USERCUSTOMIZE_ENABLE_LEGACY_TONOSAMA_FAILOPEN_PATCHES=1 or TONOSAMA_ATR1M_FILTER_RESCUE=1 to restore."
+        )
+        return True
     try:
         import trading.handlers.entry_controller as ec
         import trading.filters.volatility_filter as vf
@@ -158,11 +164,12 @@ def install() -> bool:
         if not callable(cur):
             logger.warning("[TONOSAMA ATR1M RESCUE] target missing ec.atr_1m_filter")
             return False
-        if getattr(cur, "_tonosama_atr1m_rescue_v1", False):
+        if getattr(cur, "_tonosama_atr1m_rescue_v2", False) or getattr(cur, "_tonosama_atr1m_rescue_v1", False):
             _INSTALLED = True
             return True
 
         _ORIG_EC_ATR = getattr(cur, "_original", cur)
+        _patched_atr_1m_filter._tonosama_atr1m_rescue_v2 = True  # type: ignore[attr-defined]
         _patched_atr_1m_filter._tonosama_atr1m_rescue_v1 = True  # type: ignore[attr-defined]
         _patched_atr_1m_filter._original = _ORIG_EC_ATR  # type: ignore[attr-defined]
         ec.atr_1m_filter = _patched_atr_1m_filter
@@ -170,8 +177,7 @@ def install() -> bool:
             vf.atr_1m_filter = _patched_atr_1m_filter
         _INSTALLED = True
         logger.warning(
-            "[TONOSAMA ATR1M RESCUE] installed v1 enabled=%s min_range=%s min_surge=%s min_volume=%s min_score=%s",
-            _env_on("TONOSAMA_ATR1M_FILTER_RESCUE", True),
+            "[TONOSAMA ATR1M RESCUE] installed legacy v2 min_range=%s min_surge=%s min_volume=%s min_score=%s",
             os.getenv("TONOSAMA_ATR1M_RESCUE_MIN_INTRABAR_RANGE_PCT", "3.0"),
             os.getenv("TONOSAMA_ATR1M_RESCUE_MIN_SURGE", "3.0"),
             os.getenv("TONOSAMA_ATR1M_RESCUE_MIN_VOLUME", "50000"),
