@@ -1,0 +1,112 @@
+; kabucom_Ver32_L31 runtime settings template
+; This file is a TEMPLATE only. It is not loaded automatically yet.
+; Copy to settings.ini in the project root when settings-file loading is enabled.
+;
+; Current runtime source of truth remains:
+;   core/startup/runtime_env_defaults.py
+;   environment variables
+;
+; Sections below mirror core/startup/runtime_env_default_registry.py.
+
+[trade_budget]
+; Per-symbol budget / price range / candidate sizing.
+; These keys are currently provided through environment variables.
+; Uncomment and adjust after settings.ini loading is enabled.
+;
+; ENTRY_RANKING_SCALP_MAX_PRICE = 7000
+; ENTRY_RANKING_SCALP_MIN_PRICE = 200
+; ENTRY_RANKING_SCALP_MIN_MTF = 0
+; PULLBACK_ENTRY_LOT_RATIO = 1.0
+; PULLBACK_ENTRY_MAX_CANDIDATES = 3
+
+[order]
+; Order exchange settings.
+; NOTE: ORDER Exchange=9 is SOR. PUSH register still uses market exchange such as 1/2.
+;
+; ENTRY_ORDER_EXCHANGE = 9
+; KABU_ORDER_EXCHANGE = 9
+
+[entry_limits]
+; Watchlist, board-missing fallback, pullback entry and liquidity limits.
+;
+; WATCHLIST_RECENT_LIQ_MIN_LATEST_VOLUME = 3000
+; WATCHLIST_RECENT_LIQ_MIN_AVG_VOLUME = 3000
+; WATCHLIST_RECENT_LIQ_MIN_TURNOVER_YEN = 1000000
+;
+; ENTRY_ALLOW_WITHOUT_BOARD_MIN_VOLUME = 30000
+; ENTRY_ALLOW_WITHOUT_BOARD_MIN_TURNOVER = 10000000
+; ENTRY_ALLOW_WITHOUT_BOARD_MIN_PRICE = 200
+; ENTRY_ALLOW_WITHOUT_BOARD_MIN_SCORE = 0
+; ENTRY_BOARD_MISSING_QTY_RATIO = 1.0
+;
+; PULLBACK_ENTRY_ENABLED = 1
+; PULLBACK_ENTRY_MIN_PULLBACK_PCT = 0.002
+; PULLBACK_ENTRY_MAX_PULLBACK_PCT = 0.02
+; PULLBACK_ENTRY_NEAR_MA_PCT = 0.004
+; PULLBACK_ENTRY_MIN_REBOUND_VOL_RATIO = 1.2
+; PULLBACK_ENTRY_MIN_VOLUME = 30000
+; PULLBACK_ENTRY_MIN_TURNOVER = 10000000
+
+[daily_risk]
+; Daily risk / symbol stop settings.
+; The current policy keeps all-loss daily stop guards disabled unless explicitly enabled.
+;
+; SUMMARY_AI_PRE_FILTER_DAILY_RISK = 0
+; SUMMARY_AI_DISABLE_SYMBOL_STOP_AFTER_FIRST_LOSS = 1
+; DAILY_RISK_SYMBOL_STOP_AFTER_FIRST_LOSS = 0
+; DAILY_RISK_STOP_AFTER_FIRST_LOSS = 0
+; SYMBOL_STOP_AFTER_FIRST_LOSS_ENABLED = 0
+
+[push]
+; PUSH rotation and websocket defaults.
+; Current design: fixed15 + A35 / fixed15 + B35, unregister_all between turns.
+;
+; PUSH_ROTATION_ENABLED = 1
+; PUSH_ROTATION_HOLD_SEC = 4.8
+; PUSH_ROTATION_CLEAR_WAIT_SEC = 0.2
+; PUSH_ROTATION_BATCH_SIZE = 50
+; PUSH_FIXED_SLOT_COUNT = 15
+; PUSH_WS_VENDOR_RUN_FOREVER = 1
+; PUSH_WS_ENABLE_PING = 0
+
+[rescue]
+; Rescue/failopen patches are normally OFF after simplification.
+; Enable only for temporary investigation.
+;
+; USERCUSTOMIZE_ENABLE_TONOSAMA_RESCUE_PATCHES = 0
+; USERCUSTOMIZE_ENABLE_LEGACY_TONOSAMA_FAILOPEN_PATCHES = 0
+; USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES = 0
+; USERCUSTOMIZE_ENABLE_LEGACY_RANKING_FAILOPEN_PATCHES = 0
+; SITECUSTOMIZE_ENABLE_RESCUE_PATCHES = 0
+; SITECUSTOMIZE_ENABLE_ENTRY_FAILOPEN_PATCHES = 0
+; SITECUSTOMIZE_ENABLE_RANKING_FINAL_RESCUE_PATCH = 0
+; SITECUSTOMIZE_ENABLE_TONOSAMA_EXTRA_RESCUE_PATCHES = 0
+; SITECUSTOMIZE_ENABLE_SUMMARY_AI_RESCUE_PATCHES = 0
+
+[database]
+; DB and SQLite defaults. DB/data collector processes should load minimal patches only.
+;
+; SQLITE_BUSY_TIMEOUT_MS = 30000
+; SQLITE_WAL_CHECKPOINT = 0
+; SITECUSTOMIZE_ENABLE_FULL_NONMAIN = 0
+
+[ranking_entry]
+; Ranking entry controls and stale guards.
+;
+; RANKING_AI_GATE_FAILOPEN_ENABLED = 0
+; RANKING_ENTRY_RUN_IN_MAIN = 1
+; RANKING_SNAPSHOT_MAX_AGE_SEC = 300
+
+[tonosama]
+; Tonosama normal controls. Rescue/failopen belongs to [rescue].
+;
+; TONOSAMA_RUNTIME_25SEC_BUDGET = 1
+; TONOSAMA_ONE_PENDING = 1
+; TONOSAMA_SKIP_BUILD_WHEN_PENDING_EXISTS = 1
+
+[summary_yahoo]
+; Summary/Yahoo complement defaults.
+;
+; DAILY_SIGNAL_CACHE_RUN_IN_MAIN = 0
+; SUMMARY_AI_RUN_IN_MAIN = 1
+; YAHOO_COMPLEMENT_RUN_IN_MAIN = 1
