@@ -20,7 +20,7 @@ from .runtime_settings_ini_loader import VERSION as SETTINGS_INI_VERSION
 from .runtime_settings_ini_loader import load_settings_ini
 
 logger = logging.getLogger(__name__)
-VERSION = "REV4-RUNTIME-ENV-DEFAULTS-PATCH-ENTRY-FIRE-RESCUE"
+VERSION = "REV5-RUNTIME-ENV-DEFAULTS-PATCH-RANKING-ENTRY-RESCUE"
 _INSTALLED = False
 
 
@@ -54,6 +54,22 @@ def _install_entry_fire_rescue(context: str) -> bool:
         return False
 
 
+def _install_ranking_entry_runtime_rescue(context: str) -> bool:
+    """Install narrow RANKING entry rescue for mtf_low and zero-range startup rows."""
+    try:
+        if context not in {"main", "helper"}:
+            return False
+        if os.environ.get("DISABLE_RANKING_ENTRY_RUNTIME_RESCUE_PATCH", "").strip() == "1":
+            logger.warning("[RUNTIME ENV DEFAULTS PATCH] ranking entry runtime rescue disabled by env")
+            return False
+        from . import ranking_entry_runtime_rescue_patch
+
+        return bool(ranking_entry_runtime_rescue_patch.install())
+    except Exception:
+        logger.exception("[RUNTIME ENV DEFAULTS PATCH] ranking entry runtime rescue install failed")
+        return False
+
+
 def install() -> bool:
     """Apply centralized defaults once.
 
@@ -74,11 +90,12 @@ def install() -> bool:
         applied.update(apply_site_defaults(context=context))
         applied.update(apply_user_defaults(context=context))
         entry_fire_rescue_ok = _install_entry_fire_rescue(context)
+        ranking_entry_rescue_ok = _install_ranking_entry_runtime_rescue(context)
 
         _INSTALLED = True
         if env_bool("RUNTIME_ENV_DEFAULTS_VERBOSE", False):
             logger.warning(
-                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s entry_fire_rescue=%s",
+                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s entry_fire_rescue=%s ranking_entry_rescue=%s",
                 VERSION,
                 DEFAULTS_VERSION,
                 REGISTRY_VERSION,
@@ -89,10 +106,11 @@ def install() -> bool:
                 ",".join(SITE_GROUP_ORDER),
                 ",".join(USER_GROUP_ORDER),
                 entry_fire_rescue_ok,
+                ranking_entry_rescue_ok,
             )
         else:
             logger.warning(
-                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_fire_rescue=%s",
+                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_fire_rescue=%s ranking_entry_rescue=%s",
                 VERSION,
                 DEFAULTS_VERSION,
                 REGISTRY_VERSION,
@@ -104,6 +122,7 @@ def install() -> bool:
                 os.environ.get("USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES"),
                 os.environ.get("USERCUSTOMIZE_ENABLE_TONOSAMA_RESCUE_PATCHES"),
                 entry_fire_rescue_ok,
+                ranking_entry_rescue_ok,
             )
         return True
     except Exception:
