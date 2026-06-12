@@ -1,6 +1,6 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver44-CENTRALIZED-RUNTIME-DEFAULTS
+# Version: Ver45-YAHOO-DIRECT-UPSERT-CONFLICT-PATCH
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # main.py は軽量同期 + background install。
@@ -198,11 +198,13 @@ def _install_summary_mtf_catchup_safely() -> None:
 # DB/data collector系と非main補助スクリプトはSQLite中心の最小ロード。
 DB_SYNC_PATCHES = [
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
+    ("core.startup.yahoo_summary_direct_upsert_conflict_patch", "YAHOO_DIRECT_UPSERT_CONFLICT", "DISABLE_YAHOO_DIRECT_UPSERT_CONFLICT_PATCH"),
 ]
 
 # main.pyだけで同期適用する売買系の最小ガード。
 SYNC_MAIN_PATCHES = [
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
+    ("core.startup.yahoo_summary_direct_upsert_conflict_patch", "YAHOO_DIRECT_UPSERT_CONFLICT", "DISABLE_YAHOO_DIRECT_UPSERT_CONFLICT_PATCH"),
     ("core.startup.ranking_entry_market_hours_skip_patch", "RANKING_ENTRY_WATCHDOG", "DISABLE_RANKING_ENTRY_WATCHDOG_PATCH"),
     ("core.startup.ranking_entry_snapshot_technical_alias_patch", "RANKING_SNAPSHOT_TECH_ALIAS", "DISABLE_RANKING_SNAPSHOT_TECH_ALIAS_PATCH"),
     ("core.startup.entry_log_skip_reason_collision_patch", "ENTRY_LOG_SKIP_GUARD", "DISABLE_ENTRY_LOG_SKIP_GUARD"),
