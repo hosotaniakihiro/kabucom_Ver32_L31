@@ -1,6 +1,6 @@
 # ============================================================
 # File   : main_database.py
-# Version: DATA-COLLECTORS-MAIN-DATABASE-ENTRY-V3-TOKEN-BOOTSTRAP-CPU-GUARD
+# Version: DATA-COLLECTORS-MAIN-DATABASE-ENTRY-V4-SUMMARY-SQLITE-LOCK-TOLERANCE
 # ------------------------------------------------------------
 # Purpose:
 #   - DB作成 / ランキング取得 / PUSH銘柄登録 / PUSH受信 を起動する入口
@@ -49,6 +49,22 @@ def _install_cpu_guard_env() -> None:
         logger.info("[MAIN DATABASE] cpu guard env installed ok=%s", ok)
     except Exception:
         logger.exception("[MAIN DATABASE] cpu guard env install failed; continue")
+
+
+def _install_summary_sqlite_lock_tolerance() -> None:
+    """Install summary DB lock tolerance before spawning child collectors.
+
+    The actual summary/Yahoo/MTF work runs in child processes. Installing this
+    patch here is still useful because it sets environment defaults that are
+    inherited by those child processes. The sqlite3.connect monkey patch also
+    protects any summary DB access done directly in main_database.py.
+    """
+    try:
+        from core.startup.summary_sqlite_lock_tolerance_patch import install
+        ok = install()
+        logger.warning("[MAIN DATABASE] summary sqlite lock tolerance installed ok=%s", ok)
+    except Exception:
+        logger.exception("[MAIN DATABASE] summary sqlite lock tolerance install failed; continue")
 
 
 def _read_api_password_from_settings() -> str:
@@ -120,6 +136,7 @@ def main() -> int:
     logger.info("[MAIN DATABASE] cwd=%s", os.getcwd())
 
     _install_cpu_guard_env()
+    _install_summary_sqlite_lock_tolerance()
 
     try:
         from data_collectors.split_mode import mark_as_data_collector_process
