@@ -187,6 +187,7 @@ LEGACY_PUSH_PATCHES = [
 ]
 
 BASE_SYNC_PATCHES = [
+    ("KABUSAPI_TOKEN_RETRY_REGISTER", "core.startup.kabusapi_token_retry_register_patch"),
     ("PUSH_MAIN_OWNER_POLICY", "core.startup.push_main_owner_lock_policy_patch"),
     ("PUSH_EMPTY_OWNER_FAILOPEN", "core.startup.push_empty_owner_lock_failopen_patch"),
     ("RANKING_API_GLOBAL_THROTTLE", "core.startup.ranking_api_global_throttle_patch"),
