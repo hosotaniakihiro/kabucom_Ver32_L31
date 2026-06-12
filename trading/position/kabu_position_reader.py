@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/position/kabu_position_reader.py
-# Version: V1.4-KABU-CREDIT-POSITION-READER-ROBUST-QTY
+# Version: V1.5-KABU-CREDIT-POSITION-READER-401-RETRY
 # ------------------------------------------------------------
 # kabu Station の建玉一覧から「信用建玉だけ」を読み、
 # symbol -> position dict に正規化する。
@@ -14,6 +14,11 @@
 #   - 数量/価格パースを強化。カンマ、全角数字、空白、文字混在を吸収。
 #   - HoldQty/LeavesQty が文字列 "1,000" 等の場合に 0 扱いされる問題を防ぐ。
 #   - 全信用候補が skipped_qty の場合に qty_samples を status/log へ出す。
+#
+# V1.5:
+#   - /positions?product=2 が 401 を返した場合、token_manager.refresh_token()
+#     でAPIキーを再取得し、global_data / kabu_api.global_data / register_opsへ同期して1回だけ再試行する。
+#   - それでも401の場合はERROR tracebackではなくWARNINGで空dictを返す。
 # ============================================================
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ import datetime as dt
 import json
 import logging
 import re
+import urllib.error
 import urllib.parse
 import urllib.request
 import unicodedata
@@ -168,11 +174,78 @@ def _pick_positive_float(d: dict, keys: Sequence[str], default: float = 0.0) -> 
     return float(default)
 
 
+def _sync_token(token: str | None) -> None:
+    if not token:
+        return
+    token = str(token).strip()
+    if not token:
+        return
+    for module_name in ("global_state", "kabu_api.global_data", "token_manager"):
+        try:
+            if module_name == "global_state":
+                from global_state import global_data as target  # type: ignore
+            else:
+                import importlib
+                target = importlib.import_module(module_name)
+            for name in ("token_value", "API_TOKEN", "api_token", "token", "kabu_api_token"):
+                try:
+                    setattr(target, name, token)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    try:
+        from trading.push.subscription_manager import register_ops
+        for name in ("_API_KEY", "API_KEY", "_api_key"):
+            try:
+                setattr(register_ops, name, token)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _refresh_token_after_401() -> str:
+    try:
+        import token_manager
+        token = token_manager.refresh_token()
+        if token:
+            token = str(token).strip()
+            _sync_token(token)
+            logger.warning("[KABU POSITION READER] token refreshed after 401 token_len=%s", len(token))
+            return token
+    except TypeError:
+        pass
+    except Exception as e:
+        logger.warning("[KABU POSITION READER] refresh_token() failed after 401 err=%s", e)
+    try:
+        from pathlib import Path
+        from configparser import ConfigParser
+        import token_manager
+        root = Path(__file__).resolve().parents[2]
+        conf = ConfigParser()
+        conf.read(str(root / "settings.ini"), encoding="utf-8")
+        section = "aukabu" if conf.has_section("aukabu") else "kabusapi"
+        api_password = conf.get(section, "apipassword", fallback="")
+        if api_password:
+            token = token_manager.refresh_token(api_password)
+            if token:
+                token = str(token).strip()
+                _sync_token(token)
+                logger.warning("[KABU POSITION READER] token refreshed with settings after 401 token_len=%s", len(token))
+                return token
+    except Exception as e:
+        logger.warning("[KABU POSITION READER] refresh_token(settings) failed after 401 err=%s", e)
+    return ""
+
+
 def _resolve_base_and_token() -> tuple[str, str]:
     try:
         from trading.push.subscription_manager.register_ops import _resolve_api_key, _resolve_base_url
         base = str(_resolve_base_url() or "").strip().rstrip("/")
         token = str(_resolve_api_key() or "").strip()
+        if token:
+            _sync_token(token)
         return base, token
     except Exception:
         logger.debug("[KABU POSITION READER] resolve failed", exc_info=True)
@@ -197,10 +270,7 @@ def _iter_items(payload: Any) -> Iterable[dict]:
             yield payload
 
 
-def _fetch_positions_payload(*, product: int = 2) -> Any:
-    base, token = _resolve_base_and_token()
-    if not base or not token:
-        raise RuntimeError("base/token unavailable")
+def _urlopen_positions(base: str, token: str, *, product: int) -> Any:
     url = base.rstrip("/") + "/positions?" + urllib.parse.urlencode({"product": int(product)})
     req = urllib.request.Request(url, method="GET")
     req.add_header("Content-Type", "application/json")
@@ -210,6 +280,28 @@ def _fetch_positions_payload(*, product: int = 2) -> Any:
         if not raw:
             return []
         return json.loads(raw.decode("utf-8"))
+
+
+def _fetch_positions_payload(*, product: int = 2) -> Any:
+    base, token = _resolve_base_and_token()
+    if not base or not token:
+        raise RuntimeError("base/token unavailable")
+    try:
+        return _urlopen_positions(base, token, product=product)
+    except urllib.error.HTTPError as e:
+        if getattr(e, "code", None) != 401:
+            raise
+        logger.warning("[KABU POSITION READER] got 401 -> refresh token and retry once")
+        new_token = _refresh_token_after_401()
+        if not new_token:
+            raise
+        try:
+            return _urlopen_positions(base, new_token, product=product)
+        except urllib.error.HTTPError as e2:
+            if getattr(e2, "code", None) == 401:
+                logger.warning("[KABU POSITION READER] still 401 after refresh -> skip this cycle")
+                return []
+            raise
 
 
 def _is_credit_position(x: dict) -> bool:
