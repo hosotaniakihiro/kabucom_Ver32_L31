@@ -1,9 +1,13 @@
 # ============================================================
 # File   : trading/push/subscription_manager/liquidity_guard.py
-# Version: PRODUCTION-STABLE-PUSH-LIQUIDITY-GUARD-V1.1-MIN-SURVIVORS
+# Version: PRODUCTION-STABLE-PUSH-LIQUIDITY-GUARD-V1.2-ROTATION-FLOOR50
 # ------------------------------------------------------------
 # 【概要】
 #   PUSH登録対象から、日中出来高・売買代金が少なすぎる銘柄を除外する。
+#
+# V1.2 Fix:
+#   - recent liquidity fallback後にさらに 30 銘柄まで削られ、A/B rotation が崩れる問題を抑止。
+#   - 既定の最低生存数を 50 件へ引き上げ、50件登録単位を維持しやすくする。
 #
 # V1.1 Fix:
 #   - liquidity map の取得率は十分でも、条件が厳しすぎて登録対象が 100 -> 1 のように
@@ -69,8 +73,9 @@ MIN_COVERAGE_RATIO = _env_float("PUSH_REGISTER_LIQUIDITY_MIN_COVERAGE_RATIO", 0.
 
 # 100銘柄rotationが 1〜数銘柄まで削られると、PUSH購読が不安定化する。
 # 条件が厳しすぎた場合だけ、上位流動性候補を戻して最低数を確保する。
-MIN_SURVIVOR_COUNT = _env_int("PUSH_REGISTER_LIQUIDITY_MIN_SURVIVOR_COUNT", 30)
-MIN_SURVIVOR_RATIO = _env_float("PUSH_REGISTER_LIQUIDITY_MIN_SURVIVOR_RATIO", 0.25)
+# A/B 50件登録単位を崩さないため、既定の最低生存数は50件にする。
+MIN_SURVIVOR_COUNT = _env_int("PUSH_REGISTER_LIQUIDITY_MIN_SURVIVOR_COUNT", 50)
+MIN_SURVIVOR_RATIO = _env_float("PUSH_REGISTER_LIQUIDITY_MIN_SURVIVOR_RATIO", 0.50)
 RESCUE_MISSING_SYMBOLS = _env_bool("PUSH_REGISTER_LIQUIDITY_RESCUE_MISSING_SYMBOLS", True)
 
 DEFAULT_ROOT = r"\\192.168.0.22\AutoStockBuyAndSell"
@@ -380,7 +385,6 @@ def get_liquidity_map() -> Dict[str, Dict[str, float]]:
             "[PUSH LIQUIDITY GUARD] ranking db not found -> pass-through"
         )
         return {}
-
     if (
         _CACHE_MAP
         and _CACHE_DB_PATH == db_path
