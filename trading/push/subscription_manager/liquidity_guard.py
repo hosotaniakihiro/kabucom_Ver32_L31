@@ -1,18 +1,20 @@
 # ============================================================
 # File   : trading/push/subscription_manager/liquidity_guard.py
-# Version: PRODUCTION-STABLE-PUSH-LIQUIDITY-GUARD-V1.2-ROTATION-FLOOR50
+# Version: PRODUCTION-STABLE-PUSH-LIQUIDITY-GUARD-V1.3-ROTATION-AB100
 # ------------------------------------------------------------
 # 【概要】
 #   PUSH登録対象から、日中出来高・売買代金が少なすぎる銘柄を除外する。
 #
+# V1.3 Fix:
+#   - A/B 50銘柄ローテーション中に候補100件が liquidity guard で50件へ縮退し、
+#     B側が空になる問題を修正。
+#   - source が push_stream.rotation / rotation_A / rotation_B 系の場合、
+#     入力が100件以上なら最低100件を維持する。
+#   - 条件未達銘柄は警告ログに残すが、ローテーション母集団は壊さない。
+#
 # V1.2 Fix:
 #   - recent liquidity fallback後にさらに 30 銘柄まで削られ、A/B rotation が崩れる問題を抑止。
 #   - 既定の最低生存数を 50 件へ引き上げ、50件登録単位を維持しやすくする。
-#
-# V1.1 Fix:
-#   - liquidity map の取得率は十分でも、条件が厳しすぎて登録対象が 100 -> 1 のように
-#     崩壊すると WebSocket rotation が不安定になる。
-#   - kept が少なすぎる場合は、流動性の高い除外候補/欠損候補を順に戻し、最低登録数を確保する。
 # ============================================================
 
 from __future__ import annotations
@@ -71,15 +73,17 @@ MIN_DAY_TURNOVER = _env_float("PUSH_REGISTER_MIN_DAY_TURNOVER", 10000000.0)
 CACHE_TTL_SEC = _env_float("PUSH_REGISTER_LIQUIDITY_CACHE_TTL_SEC", 20.0)
 MIN_COVERAGE_RATIO = _env_float("PUSH_REGISTER_LIQUIDITY_MIN_COVERAGE_RATIO", 0.20)
 
-# 100銘柄rotationが 1〜数銘柄まで削られると、PUSH購読が不安定化する。
-# 条件が厳しすぎた場合だけ、上位流動性候補を戻して最低数を確保する。
-# A/B 50件登録単位を崩さないため、既定の最低生存数は50件にする。
+# 通常登録は最低50件を守る。A/B rotation母集団は下の ROTATION_MIN_SURVIVOR_COUNT で100件を守る。
 MIN_SURVIVOR_COUNT = _env_int("PUSH_REGISTER_LIQUIDITY_MIN_SURVIVOR_COUNT", 50)
 MIN_SURVIVOR_RATIO = _env_float("PUSH_REGISTER_LIQUIDITY_MIN_SURVIVOR_RATIO", 0.50)
 RESCUE_MISSING_SYMBOLS = _env_bool("PUSH_REGISTER_LIQUIDITY_RESCUE_MISSING_SYMBOLS", True)
 
-DEFAULT_ROOT = r"\\192.168.0.22\AutoStockBuyAndSell"
+# A/B 50銘柄ローテーション用。100銘柄入力を50へ削ると B=0 になりローテーションが壊れる。
+ROTATION_MIN_SURVIVOR_COUNT = _env_int("PUSH_REGISTER_LIQUIDITY_ROTATION_MIN_SURVIVOR_COUNT", 100)
+ROTATION_MIN_SURVIVOR_RATIO = _env_float("PUSH_REGISTER_LIQUIDITY_ROTATION_MIN_SURVIVOR_RATIO", 1.00)
+ROTATION_PRESERVE_FULL_POOL = _env_bool("PUSH_REGISTER_LIQUIDITY_ROTATION_PRESERVE_FULL_POOL", True)
 
+DEFAULT_ROOT = r"\\192.168.0.22\AutoStockBuyAndSell"
 
 _SYMBOL_COL_CANDIDATES = (
     "symbol",
@@ -117,7 +121,6 @@ _TABLE_HINTS = (
     "ranking",
 )
 
-
 _CACHE_TS: float = 0.0
 _CACHE_DB_PATH: Optional[str] = None
 _CACHE_MAP: Dict[str, Dict[str, float]] = {}
@@ -126,29 +129,21 @@ _CACHE_MAP: Dict[str, Dict[str, float]] = {}
 def _normalize_symbol(symbol: Any) -> Optional[str]:
     if symbol is None:
         return None
-
     s = str(symbol).strip().upper()
-
     if not s:
         return None
-
     if s.endswith(".T"):
         s = s[:-2]
-
     if s.endswith(".0"):
         s2 = s[:-2]
         if s2.isdigit():
             s = s2
-
     if not s or s in {"NONE", "NULL", "NAN", "NA", "-", "0"}:
         return None
-
     if not s.isalnum():
         return None
-
     if not (3 <= len(s) <= 5):
         return None
-
     return s
 
 
@@ -164,12 +159,6 @@ def _numeric_expr(col: str) -> str:
 def _find_existing_ranking_db_path() -> Optional[str]:
     """
     rankingYYYYMMDD.db を探す。
-    優先:
-      1. PUSH_REGISTER_RANKING_DB_PATH
-      2. RANKING_DB_PATH
-      3. KABU_RANKING_DB_PATH
-      4. \\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\ranking\rankingYYYYMMDD.db
-      5. 直近7日分
     """
     for env_name in (
         "PUSH_REGISTER_RANKING_DB_PATH",
@@ -182,23 +171,18 @@ def _find_existing_ranking_db_path() -> Optional[str]:
 
     root = os.environ.get("AUTO_STOCK_ROOT") or os.environ.get("KABU_AUTO_STOCK_ROOT") or DEFAULT_ROOT
     ranking_dir = Path(root) / "raw_data" / "kabu_station" / "ranking"
-
     today = dt.datetime.now().date()
-
     for i in range(0, 8):
         d = today - dt.timedelta(days=i)
         p = ranking_dir / f"ranking{d:%Y%m%d}.db"
         if p.exists():
             return str(p)
-
     return None
 
 
 def _table_names(conn: sqlite3.Connection) -> List[str]:
     try:
-        rows = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()
+        rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         return [str(r[0]) for r in rows if r and r[0]]
     except Exception:
         logger.debug("[PUSH LIQUIDITY GUARD] failed to list tables", exc_info=True)
@@ -210,11 +194,7 @@ def _pragma_columns(conn: sqlite3.Connection, table: str) -> List[str]:
         rows = conn.execute(f"PRAGMA table_info({_quote_ident(table)})").fetchall()
         return [str(r[1]) for r in rows if len(r) >= 2]
     except Exception:
-        logger.debug(
-            "[PUSH LIQUIDITY GUARD] failed to pragma table=%s",
-            table,
-            exc_info=True,
-        )
+        logger.debug("[PUSH LIQUIDITY GUARD] failed to pragma table=%s", table, exc_info=True)
         return []
 
 
@@ -233,51 +213,37 @@ def _is_target_table(table: str) -> bool:
 
 def _load_liquidity_map_from_db(db_path: str) -> Dict[str, Dict[str, float]]:
     """
-    ranking DB 内の有効そうなテーブルから、
-    symbol -> {volume, turnover, price} を作る。
-
+    ranking DB 内の有効そうなテーブルから、symbol -> {volume, turnover, price} を作る。
     複数テーブルに同一銘柄があれば最大値を採用する。
     """
     out: Dict[str, Dict[str, float]] = {}
-
     if not db_path or not Path(db_path).exists():
         return out
 
     try:
         conn = sqlite3.connect(db_path, timeout=3.0)
     except Exception:
-        logger.debug(
-            "[PUSH LIQUIDITY GUARD] sqlite connect failed db=%s",
-            db_path,
-            exc_info=True,
-        )
+        logger.debug("[PUSH LIQUIDITY GUARD] sqlite connect failed db=%s", db_path, exc_info=True)
         return out
 
     try:
         tables = _table_names(conn)
-
         used_tables = 0
-
         for table in tables:
             if not _is_target_table(table):
                 continue
-
             cols = _pragma_columns(conn, table)
             if not cols:
                 continue
-
             symbol_col = _pick_col(cols, _SYMBOL_COL_CANDIDATES)
             volume_col = _pick_col(cols, _VOLUME_COL_CANDIDATES)
             price_col = _pick_col(cols, _PRICE_COL_CANDIDATES)
-
             if symbol_col is None or volume_col is None:
                 continue
 
             used_tables += 1
-
             symbol_expr = _quote_ident(symbol_col)
             volume_expr = _numeric_expr(volume_col)
-
             if price_col is not None:
                 price_expr = _numeric_expr(price_col)
                 turnover_expr = f"({price_expr} * {volume_expr})"
@@ -320,17 +286,14 @@ def _load_liquidity_map_from_db(db_path: str) -> Dict[str, Dict[str, float]]:
                 s = _normalize_symbol(symbol)
                 if not s:
                     continue
-
                 try:
                     v = float(volume or 0.0)
                 except Exception:
                     v = 0.0
-
                 try:
                     p = float(price or 0.0)
                 except Exception:
                     p = 0.0
-
                 try:
                     tv = float(turnover or 0.0)
                 except Exception:
@@ -338,11 +301,7 @@ def _load_liquidity_map_from_db(db_path: str) -> Dict[str, Dict[str, float]]:
 
                 prev = out.get(s)
                 if prev is None:
-                    out[s] = {
-                        "volume": v,
-                        "price": p,
-                        "turnover": tv,
-                    }
+                    out[s] = {"volume": v, "price": p, "turnover": tv}
                 else:
                     prev["volume"] = max(float(prev.get("volume") or 0.0), v)
                     prev["price"] = max(float(prev.get("price") or 0.0), p)
@@ -354,16 +313,10 @@ def _load_liquidity_map_from_db(db_path: str) -> Dict[str, Dict[str, float]]:
             used_tables,
             len(out),
         )
-
         return out
-
     except Exception:
-        logger.exception(
-            "[PUSH LIQUIDITY GUARD] load liquidity map failed db=%s",
-            db_path,
-        )
+        logger.exception("[PUSH LIQUIDITY GUARD] load liquidity map failed db=%s", db_path)
         return out
-
     finally:
         try:
             conn.close()
@@ -372,33 +325,25 @@ def _load_liquidity_map_from_db(db_path: str) -> Dict[str, Dict[str, float]]:
 
 
 def get_liquidity_map() -> Dict[str, Dict[str, float]]:
-    """
-    TTL付きで liquidity map を返す。
-    """
+    """TTL付きで liquidity map を返す。"""
     global _CACHE_TS, _CACHE_DB_PATH, _CACHE_MAP
-
     now = time.time()
     db_path = _find_existing_ranking_db_path()
-
     if not db_path:
-        logger.warning(
-            "[PUSH LIQUIDITY GUARD] ranking db not found -> pass-through"
-        )
+        logger.warning("[PUSH LIQUIDITY GUARD] ranking db not found -> pass-through")
         return {}
-    if (
-        _CACHE_MAP
-        and _CACHE_DB_PATH == db_path
-        and now - _CACHE_TS <= CACHE_TTL_SEC
-    ):
+    if _CACHE_MAP and _CACHE_DB_PATH == db_path and now - _CACHE_TS <= CACHE_TTL_SEC:
         return _CACHE_MAP
-
     m = _load_liquidity_map_from_db(db_path)
-
     _CACHE_TS = now
     _CACHE_DB_PATH = db_path
     _CACHE_MAP = m
-
     return m
+
+
+def _is_rotation_source(source: str) -> bool:
+    s = str(source or "").lower()
+    return "rotation" in s or "push_stream.rotation" in s
 
 
 def _rescue_min_survivors(
@@ -430,7 +375,6 @@ def _rescue_min_survivors(
     keep_set = set(kept)
     rescued: List[str] = list(kept)
 
-    # 流動性が高い順に戻す。volumeだけ不足していてturnoverは大きい銘柄を救う。
     removed_ranked = sorted(
         removed,
         key=lambda x: (float(x[2] or 0.0), float(x[1] or 0.0)),
@@ -454,7 +398,15 @@ def _rescue_min_survivors(
                 rescued.append(sym)
                 keep_set.add(sym)
 
-    # 最後に元のrotation順へ戻す。
+    # それでも足りない場合は元リスト順で戻す。rotation母集団の縮退を絶対に避ける。
+    for sym in cleaned:
+        if len(rescued) >= required:
+            break
+        if sym in keep_set:
+            continue
+        rescued.append(sym)
+        keep_set.add(sym)
+
     order = {s: i for i, s in enumerate(cleaned)}
     rescued_sorted = sorted(rescued, key=lambda s: order.get(s, 10**9))
     logger.warning(
@@ -483,10 +435,10 @@ def filter_register_targets_by_liquidity(
     PUSH登録対象から薄商い銘柄を除外する。
 
     DB取得率が低すぎる場合は、安全のため元リストを返す。
+    A/B 50銘柄ローテーション母集団では、100件入力を50件へ削らない。
     """
     cleaned: List[str] = []
     seen: set[str] = set()
-
     for x in symbols or []:
         s = _normalize_symbol(x)
         if not s or s in seen:
@@ -497,25 +449,20 @@ def filter_register_targets_by_liquidity(
     if not cleaned:
         return []
 
+    rotation_source = _is_rotation_source(source)
+
     if not ENABLED:
-        logger.info(
-            "[PUSH LIQUIDITY GUARD] disabled source=%s count=%d",
-            source,
-            len(cleaned),
-        )
+        logger.info("[PUSH LIQUIDITY GUARD] disabled source=%s count=%d", source, len(cleaned))
         return cleaned
 
     if min_day_volume is None:
         min_day_volume = MIN_DAY_VOLUME
-
     if min_day_turnover is None:
         min_day_turnover = MIN_DAY_TURNOVER
-
     if min_coverage_ratio is None:
         min_coverage_ratio = MIN_COVERAGE_RATIO
 
     liquidity_map = get_liquidity_map()
-
     if not liquidity_map:
         logger.warning(
             "[PUSH LIQUIDITY GUARD] pass-through source=%s reason=no_liquidity_map count=%d",
@@ -526,11 +473,9 @@ def filter_register_targets_by_liquidity(
 
     matched = [s for s in cleaned if s in liquidity_map]
     coverage = len(matched) / max(1, len(cleaned))
-
     if coverage < float(min_coverage_ratio):
         logger.warning(
-            "[PUSH LIQUIDITY GUARD] pass-through source=%s reason=low_coverage "
-            "count=%d matched=%d coverage=%.3f min_coverage=%.3f",
+            "[PUSH LIQUIDITY GUARD] pass-through source=%s reason=low_coverage count=%d matched=%d coverage=%.3f min_coverage=%.3f",
             source,
             len(cleaned),
             len(matched),
@@ -542,24 +487,28 @@ def filter_register_targets_by_liquidity(
     kept: List[str] = []
     removed: List[Tuple[str, float, float]] = []
     missing: List[str] = []
-
     for s in cleaned:
         info = liquidity_map.get(s)
-
         if not info:
             missing.append(s)
             continue
-
         volume = float(info.get("volume") or 0.0)
         turnover = float(info.get("turnover") or 0.0)
-
         if volume >= float(min_day_volume) and turnover >= float(min_day_turnover):
             kept.append(s)
         else:
             removed.append((s, volume, turnover))
 
-    min_keep = max(0, int(MIN_SURVIVOR_COUNT))
-    min_ratio = max(0.0, min(1.0, float(MIN_SURVIVOR_RATIO)))
+    if rotation_source and ROTATION_PRESERVE_FULL_POOL and len(cleaned) >= 100:
+        min_keep = max(int(ROTATION_MIN_SURVIVOR_COUNT), 100)
+        min_ratio = max(float(ROTATION_MIN_SURVIVOR_RATIO), 1.0)
+    elif rotation_source:
+        min_keep = max(int(ROTATION_MIN_SURVIVOR_COUNT), int(MIN_SURVIVOR_COUNT))
+        min_ratio = max(float(ROTATION_MIN_SURVIVOR_RATIO), float(MIN_SURVIVOR_RATIO))
+    else:
+        min_keep = max(0, int(MIN_SURVIVOR_COUNT))
+        min_ratio = max(0.0, min(1.0, float(MIN_SURVIVOR_RATIO)))
+
     kept_final = _rescue_min_survivors(
         cleaned,
         kept,
@@ -570,10 +519,19 @@ def filter_register_targets_by_liquidity(
         min_ratio=min_ratio,
     )
 
+    # 最終安全弁: 100件rotation母集団は絶対に50件へ縮退させない。
+    if rotation_source and ROTATION_PRESERVE_FULL_POOL and len(cleaned) >= 100 and len(kept_final) < 100:
+        logger.warning(
+            "[PUSH LIQUIDITY GUARD] rotation preserve full pool source=%s before=%d after=%d -> pass-through head=%s",
+            source,
+            len(cleaned),
+            len(kept_final),
+            cleaned[:20],
+        )
+        kept_final = cleaned
+
     logger.info(
-        "[PUSH LIQUIDITY GUARD] source=%s before=%d after=%d removed=%d missing=%d "
-        "matched=%d coverage=%.3f min_day_volume=%.0f min_day_turnover=%.0f "
-        "min_survivor_count=%d min_survivor_ratio=%.3f removed_head=%s kept_head=%s",
+        "[PUSH LIQUIDITY GUARD] source=%s before=%d after=%d removed=%d missing=%d matched=%d coverage=%.3f min_day_volume=%.0f min_day_turnover=%.0f min_survivor_count=%d min_survivor_ratio=%.3f rotation=%s removed_head=%s kept_head=%s",
         source,
         len(cleaned),
         len(kept_final),
@@ -585,10 +543,10 @@ def filter_register_targets_by_liquidity(
         float(min_day_turnover),
         min_keep,
         min_ratio,
+        rotation_source,
         removed[:10],
         kept_final[:10],
     )
-
     return kept_final
 
 
