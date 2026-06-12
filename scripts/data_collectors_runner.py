@@ -1,10 +1,15 @@
 # ============================================================
 # File   : scripts/data_collectors_runner.py
-# Version: DATA-COLLECTORS-PARENT-RUNNER-V9-CPU-LITE-CHILD-ENV
+# Version: DATA-COLLECTORS-PARENT-RUNNER-V10-RANKING-DELAYED-START
 # ------------------------------------------------------------
 # Purpose:
 #   - DB作成 / ランキング取得 / PUSH受信 / Yahoo補完 / サマリーDB保存を一括起動する親runner
 #   - main.py とは別プロセスで動かす
+#
+# V10:
+#   ✔ ranking_collector を既定で起動に戻す。
+#   ✔ 起動時 0xC0000006 再発を避けるため、ranking_collector は他collector起動後に遅延起動する。
+#   ✔ 明示的に止めたい場合だけ AUTOSTOCK_SKIP_RANKING_COLLECTOR=1 を使う。
 #
 # V9:
 #   ✔ main_database.py CPU高止まり対策として、子プロセス起動前の環境変数で
@@ -48,6 +53,16 @@ def _env_bool(name: str, default: bool = False) -> bool:
     except Exception:
         pass
     return bool(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        raw = str(os.getenv(name, "")).strip()
+        if raw:
+            return float(raw)
+    except Exception:
+        pass
+    return float(default)
 
 
 def _parent_heartbeat_enabled() -> bool:
@@ -101,6 +116,7 @@ BASE_PROCESS_SPECS = {
     "push_receiver": PUSH_RECEIVER_RUNNER,
     "yahoo_complement": YAHOO_COMPLEMENT_RUNNER,
     "summary_database": SUMMARY_DATABASE_RUNNER,
+    # ranking は最後に起動する。起動直後のDB/NAS負荷を避けるため main() 側で遅延する。
     "ranking_collector": RANKING_COLLECTOR_RUNNER,
 }
 
@@ -201,15 +217,16 @@ def _build_env() -> dict[str, str]:
 def _process_specs(logger: logging.Logger) -> dict[str, Path]:
     specs = dict(BASE_PROCESS_SPECS)
 
-    # 0xC0000006切り分け中はランキング収集子プロセスを既定で起動しない。
-    # 有効化する場合: set AUTOSTOCK_ENABLE_RANKING_COLLECTOR=1
-    enable_ranking = _env_bool("AUTOSTOCK_ENABLE_RANKING_COLLECTOR", False)
+    # ranking_collector は既定で起動する。
+    # 起動直後の 0xC0000006 / NAS負荷が気になる場合は、main() 側で遅延起動する。
+    # 完全に止めたい場合だけ AUTOSTOCK_SKIP_RANKING_COLLECTOR=1 を指定する。
+    enable_ranking = _env_bool("AUTOSTOCK_ENABLE_RANKING_COLLECTOR", True)
     skip_ranking = _env_bool("AUTOSTOCK_SKIP_RANKING_COLLECTOR", not enable_ranking)
     if skip_ranking and "ranking_collector" in specs:
         specs.pop("ranking_collector", None)
         logger.warning(
-            "[DATA COLLECTORS] ranking_collector skipped by default to avoid startup 0xC0000006. "
-            "Set AUTOSTOCK_ENABLE_RANKING_COLLECTOR=1 or AUTOSTOCK_SKIP_RANKING_COLLECTOR=0 to enable."
+            "[DATA COLLECTORS] ranking_collector skipped by explicit env. "
+            "Set AUTOSTOCK_SKIP_RANKING_COLLECTOR=0 or AUTOSTOCK_ENABLE_RANKING_COLLECTOR=1 to enable."
         )
 
     # push_receiver も切り分けたい場合だけ明示スキップ可能。
@@ -324,6 +341,14 @@ def main() -> int:
     procs: Dict[str, subprocess.Popen] = {}
     try:
         for name, path in specs.items():
+            if name == "ranking_collector":
+                delay_sec = max(0.0, _env_float("AUTOSTOCK_RANKING_COLLECTOR_START_DELAY_SEC", 20.0))
+                if delay_sec > 0:
+                    logger.warning(
+                        "[DATA COLLECTORS] ranking_collector delayed start waiting %.1fs after db/push/yahoo/summary startup",
+                        delay_sec,
+                    )
+                    time.sleep(delay_sec)
             procs[name] = _start_child(logger, name, path)
             time.sleep(1.0)
         last_hb = 0.0
