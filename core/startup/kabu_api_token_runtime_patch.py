@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/kabu_api_token_runtime_patch.py
-# Version: V3-POSITIONS-401-REFRESH-RETRY
+# Version: V4-POSITIONS-401-CACHE-NO-ERROR
 # ------------------------------------------------------------
 # 目的:
 #   force_cancel_loop.py / kabu_api.positions.py が古い token 属性
@@ -12,6 +12,12 @@
 #   - kabu_api.positions.get_positions が 401 を受けたら token_manager.refresh_token()
 #     で再発行し、global tokenへ同期して1回だけリトライする。
 #   - refresh_token の引数有無差異に対応する。
+#
+# V4:
+#   - PUSH register/unregister のローテーションと token refresh が競合した場合、
+#     /positions が refresh 後も一時的に 401 になることがある。
+#   - 2回目以降の 401 を unexpected ERROR に落とさず、この周期だけ cache/[] を返す。
+#   - これにより「最終的には positions ok なのに ERROR だけ出る」誤警告を抑止する。
 # ============================================================
 from __future__ import annotations
 
@@ -123,7 +129,7 @@ def _patch_force_cancel_loop() -> bool:
         import force_cancel_loop as fcl
         old_has = getattr(fcl, "_has_api_token", None)
         old_headers = getattr(fcl, "_safe_get_headers", None)
-        if getattr(old_has, "_kabu_api_token_runtime_patch_v3", False) and getattr(old_headers, "_kabu_api_token_runtime_patch_v3", False):
+        if getattr(old_has, "_kabu_api_token_runtime_patch_v4", False) and getattr(old_headers, "_kabu_api_token_runtime_patch_v4", False):
             return True
 
         def _has_api_token_patched() -> bool:
@@ -146,11 +152,11 @@ def _patch_force_cancel_loop() -> bool:
                 logger.exception("[FORCE_CANCEL] get_headers failed; skip %s", context)
                 return None
 
-        _has_api_token_patched._kabu_api_token_runtime_patch_v3 = True  # type: ignore[attr-defined]
-        _safe_get_headers_patched._kabu_api_token_runtime_patch_v3 = True  # type: ignore[attr-defined]
+        _has_api_token_patched._kabu_api_token_runtime_patch_v4 = True  # type: ignore[attr-defined]
+        _safe_get_headers_patched._kabu_api_token_runtime_patch_v4 = True  # type: ignore[attr-defined]
         fcl._has_api_token = _has_api_token_patched
         fcl._safe_get_headers = _safe_get_headers_patched
-        logger.warning("[KABU API TOKEN PATCH] force_cancel_loop token helpers patched v3")
+        logger.warning("[KABU API TOKEN PATCH] force_cancel_loop token helpers patched v4")
         return True
     except Exception:
         logger.exception("[KABU API TOKEN PATCH] force_cancel_loop patch failed")
@@ -163,10 +169,14 @@ def _patch_positions_module() -> bool:
         import requests
         import time
 
-        if getattr(getattr(pos, "get_positions", None), "_kabu_api_token_runtime_patch_v3", False) and getattr(getattr(pos, "sync_positions_from_kabus", None), "_kabu_api_token_runtime_patch_v3", False):
+        if getattr(getattr(pos, "get_positions", None), "_kabu_api_token_runtime_patch_v4", False) and getattr(getattr(pos, "sync_positions_from_kabus", None), "_kabu_api_token_runtime_patch_v4", False):
             return True
         API_URL = getattr(pos, "API_URL", "http://localhost:18080/kabusapi")
         logger_pos = getattr(pos, "logger", logger)
+
+        def _cached_positions() -> list[Any]:
+            cached = getattr(pos, "_POS_CACHE", None)
+            return cached if isinstance(cached, list) else []
 
         def get_positions_patched():
             now = time.time()
@@ -185,7 +195,7 @@ def _patch_positions_module() -> bool:
                 token = _refresh_token_safe(logger_pos)
             if not token:
                 logger_pos.warning("⚠ get_positions: token 不在 → skip")
-                return getattr(pos, "_POS_CACHE", None) or []
+                return _cached_positions()
 
             url = f"{API_URL}/positions"
             refreshed_after_401 = False
@@ -193,25 +203,28 @@ def _patch_positions_module() -> bool:
                 try:
                     headers = {"Content-Type": "application/json", "X-API-KEY": token}
                     res = requests.get(url, headers=headers, timeout=10)
-                    if res.status_code == 401 and not refreshed_after_401:
-                        logger_pos.warning("⚠ get_positions got 401 -> refresh token and retry once")
-                        new_token = _refresh_token_safe(logger_pos)
-                        if new_token:
-                            token = new_token
-                            refreshed_after_401 = True
-                            time.sleep(0.2)
-                            continue
-                        logger_pos.warning("⚠ get_positions token refresh after 401 failed -> use cache")
-                        return getattr(pos, "_POS_CACHE", None) or []
+                    if res.status_code == 401:
+                        if not refreshed_after_401:
+                            logger_pos.warning("⚠ get_positions got 401 -> refresh token and retry once")
+                            new_token = _refresh_token_safe(logger_pos)
+                            if new_token:
+                                token = new_token
+                                refreshed_after_401 = True
+                                time.sleep(0.2)
+                                continue
+                            logger_pos.warning("⚠ get_positions token refresh after 401 failed -> use cache")
+                            return _cached_positions()
+                        logger_pos.warning("⚠ get_positions still 401 after token refresh -> use cache this cycle")
+                        return _cached_positions()
                     if res.status_code == 429:
                         logger_pos.warning("⚠ /positions rate limited (429) → skip this cycle")
                         time.sleep(0.5)
-                        return getattr(pos, "_POS_CACHE", None) or []
+                        return _cached_positions()
                     res.raise_for_status()
                     positions = res.json()
                     if not isinstance(positions, list):
                         logger_pos.error("❌ /positions 不正レスポンス: %s", positions)
-                        return getattr(pos, "_POS_CACHE", None) or []
+                        return _cached_positions()
                     pos._POS_CACHE = positions
                     pos._POS_CACHE_TIME = now
                     return positions
@@ -221,14 +234,21 @@ def _patch_positions_module() -> bool:
                 except requests.exceptions.ConnectionError:
                     logger_pos.warning("⚠ get_positions connection error retry=%s", i + 1)
                     time.sleep(0.5)
+                except requests.exceptions.HTTPError as e:
+                    status = getattr(getattr(e, "response", None), "status_code", None)
+                    if status == 401:
+                        logger_pos.warning("⚠ get_positions HTTP 401 after retry path -> use cache this cycle")
+                        return _cached_positions()
+                    logger_pos.error("❌ get_positions HTTP error status=%s", status, exc_info=True)
+                    return _cached_positions()
                 except Exception:
                     logger_pos.error("❌ get_positions unexpected error", exc_info=True)
-                    return getattr(pos, "_POS_CACHE", None) or []
+                    return _cached_positions()
             logger_pos.warning("⚠ get_positions failed after retries → use cache")
-            return getattr(pos, "_POS_CACHE", None) or []
+            return _cached_positions()
 
         old_sync = getattr(pos, "sync_positions_from_kabus", None)
-        if getattr(old_sync, "_kabu_api_token_runtime_patch_v2", False) or getattr(old_sync, "_kabu_api_token_runtime_patch_v3", False):
+        if getattr(old_sync, "_kabu_api_token_runtime_patch_v2", False) or getattr(old_sync, "_kabu_api_token_runtime_patch_v3", False) or getattr(old_sync, "_kabu_api_token_runtime_patch_v4", False):
             old_sync = getattr(old_sync, "_original", None)
 
         def sync_positions_from_kabus_patched(*args: Any, **kwargs: Any):
@@ -242,12 +262,12 @@ def _patch_positions_module() -> bool:
                 return old_sync(*args, **kwargs)
             return None
 
-        get_positions_patched._kabu_api_token_runtime_patch_v3 = True  # type: ignore[attr-defined]
-        sync_positions_from_kabus_patched._kabu_api_token_runtime_patch_v3 = True  # type: ignore[attr-defined]
+        get_positions_patched._kabu_api_token_runtime_patch_v4 = True  # type: ignore[attr-defined]
+        sync_positions_from_kabus_patched._kabu_api_token_runtime_patch_v4 = True  # type: ignore[attr-defined]
         sync_positions_from_kabus_patched._original = old_sync  # type: ignore[attr-defined]
         pos.get_positions = get_positions_patched
         pos.sync_positions_from_kabus = sync_positions_from_kabus_patched
-        logger.warning("[KABU API TOKEN PATCH] kabu_api.positions patched v3")
+        logger.warning("[KABU API TOKEN PATCH] kabu_api.positions patched v4")
         return True
     except Exception:
         logger.exception("[KABU API TOKEN PATCH] kabu_api.positions patch failed")
@@ -262,7 +282,7 @@ def install() -> bool:
     ok2 = _patch_positions_module()
     _OK = bool(ok1 or ok2)
     _INSTALLED = True
-    logger.warning("[KABU API TOKEN PATCH] installed v3 force_cancel=%s positions=%s", ok1, ok2)
+    logger.warning("[KABU API TOKEN PATCH] installed v4 force_cancel=%s positions=%s", ok1, ok2)
     return bool(_OK)
 
 
