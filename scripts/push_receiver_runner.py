@@ -1,6 +1,6 @@
 # ============================================================
 # File   : scripts/push_receiver_runner.py
-# Version: DATA-COLLECTORS-PUSH-RECEIVER-RUNNER-V2-TOKEN-RETRY
+# Version: DATA-COLLECTORS-PUSH-RECEIVER-RUNNER-V3-PUSH-RECEIVED-AT-DATETIME
 # ============================================================
 
 from __future__ import annotations
@@ -13,10 +13,19 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# Install this before importing the long-running PUSH runtime.  usercustomize.py
-# also tries to install it, but this explicit import guarantees that the child
-# process handling /register and /unregister/all can refresh the kabu Station
-# token after Code 4001009 / APIキー不一致 and retry once.
+try:
+    from core.startup.push_stream_data_received_at_datetime_patch import install as _install_push_received_at
+
+    _push_received_at_ok = bool(_install_push_received_at())
+    logging.getLogger(__name__).warning(
+        "[PUSH RECEIVER RUNNER] PUSH_STREAM_DATA_RECEIVED_AT_DATETIME forced install ok=%s",
+        _push_received_at_ok,
+    )
+except Exception:
+    logging.getLogger(__name__).exception(
+        "[PUSH RECEIVER RUNNER] PUSH_STREAM_DATA_RECEIVED_AT_DATETIME forced install failed"
+    )
+
 try:
     from core.startup.kabusapi_token_retry_register_patch import install as _install_token_retry
 
