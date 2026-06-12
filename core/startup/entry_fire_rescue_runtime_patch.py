@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/entry_fire_rescue_runtime_patch.py
-# Version: V1-ENTRY-FIRE-RESCUE-LOW-SCORE-RANKING-TIMEOUT
+# Version: V2-ENTRY-FIRE-RESCUE-SELL-CREDIT-PREFILTER
 # ------------------------------------------------------------
 # Purpose:
 #   2026-06-12 logs showed entry did not reach order dispatch because:
@@ -11,9 +11,13 @@
 #       candidates before 1min strong rows can be evaluated.
 #     - ranking entry build is hard-capped at 18s and repeatedly enters cooldown
 #       when elapsed is only slightly above 18s.
+#     - SELL candidates with explicit short_ok=0 / sell_target=0 reached AI_OK
+#       and were removed later, consuming the approved slot.
 #
 #   This patch is intentionally runtime-only and fail-open only for the score
 #   scale mismatch. Liquidity / price / daily-risk / order guards remain intact.
+#   Explicit short-sale NG rows are removed before final AI_OK selection so the
+#   next BUY/SELL-allowed candidate can be selected instead.
 # ============================================================
 from __future__ import annotations
 
@@ -25,7 +29,7 @@ from functools import wraps
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V1-ENTRY-FIRE-RESCUE-LOW-SCORE-RANKING-TIMEOUT"
+VERSION = "V2-ENTRY-FIRE-RESCUE-SELL-CREDIT-PREFILTER"
 _INSTALLED = False
 _WATCHER_STARTED = False
 
@@ -79,6 +83,9 @@ def _set_default_envs() -> None:
         # AI gate direct dispatch should not fail solely because summary DB has no
         # freshly materialized row during PUSH rotation; later order guards still run.
         "SUMMARY_AI_DIRECT_LIQ_REQUIRE_DATA": "0",
+        # Pre-selection SELL credit guard: explicit short_ok=0/sell_target=0 rows
+        # must not consume AI_OK approved slots.
+        "SUMMARY_AI_SELL_CREDIT_PREFILTER": "1",
         # Ranking: avoid 18s timeout -> 30s cooldown loop observed in logs.
         "RANKING_ENTRY_BUILD_TIMEOUT_SEC": "30",
         "RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC": "18",
@@ -95,8 +102,26 @@ def _set_default_envs() -> None:
         os.environ.setdefault(k, v)
 
 
+def _norm_symbol(v: Any) -> str:
+    try:
+        s = str(v or "").strip()
+        if s.endswith(".0"):
+            s = s[:-2]
+        return s
+    except Exception:
+        return ""
+
+
+def _norm_side(v: Any, default: str = "BUY") -> str:
+    try:
+        s = str(v or default).strip().upper()
+        return s if s in {"BUY", "SELL"} else default
+    except Exception:
+        return default
+
+
 def _score_for_side(item: dict[str, Any]) -> float:
-    side = str(item.get("side") or item.get("ai_side") or "BUY").upper()
+    side = _norm_side(item.get("side") or item.get("ai_side"), "BUY")
     if side == "SELL":
         return max(
             _safe_float(item.get("sell_score")),
@@ -108,6 +133,62 @@ def _score_for_side(item: dict[str, Any]) -> float:
         _safe_float(item.get("score_total")),
         _safe_float(item.get("final_score")),
     )
+
+
+def _merged_item_dicts(item: dict[str, Any]) -> list[dict[str, Any]]:
+    dicts: list[dict[str, Any]] = []
+    if isinstance(item, dict):
+        dicts.append(item)
+        for k in ("ai_row", "source_row", "row", "summary_row"):
+            v = item.get(k)
+            if isinstance(v, dict):
+                dicts.append(v)
+    return dicts
+
+
+def _pick_from_item(item: dict[str, Any], *keys: str) -> Any:
+    for d in _merged_item_dicts(item):
+        for k in keys:
+            if k in d:
+                return d.get(k)
+    return None
+
+
+def _flag_is_explicit_false(v: Any) -> bool:
+    if v is None:
+        return False
+    try:
+        if isinstance(v, bool):
+            return not v
+        s = str(v).strip().lower()
+        if s in {"", "none", "nan", "null"}:
+            return False
+        return s in {"0", "false", "no", "n", "ng", "不可", "×", "x"}
+    except Exception:
+        return False
+
+
+def _sell_credit_block_reason(item: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+    """Return block reason only when the row explicitly says SELL is not allowed."""
+    side = _norm_side(
+        _pick_from_item(item, "side", "ai_side", "entry_decision"),
+        "BUY",
+    )
+    if side != "SELL":
+        return False, "", {}
+
+    symbol = _norm_symbol(_pick_from_item(item, "symbol", "Symbol"))
+    checks = {
+        "short_ok": _pick_from_item(item, "short_ok", "shortable", "short_sale_ok", "is_short_ok"),
+        "sell_target": _pick_from_item(item, "sell_target", "is_sell_target", "can_sell", "sellable"),
+        "margin_sellable": _pick_from_item(item, "margin_sellable", "credit_sellable", "can_margin_sell"),
+    }
+    explicit_ng = {k: v for k, v in checks.items() if _flag_is_explicit_false(v)}
+    if not explicit_ng:
+        return False, "", {}
+
+    detail = {"symbol": symbol, "side": side, **explicit_ng}
+    return True, "sell_credit_not_allowed", detail
 
 
 def _patch_candidates() -> bool:
@@ -131,7 +212,7 @@ def _patch_runner() -> bool:
         cur = getattr(r, "run_summary_ai_entry_from_df", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_entry_fire_rescue_v1", False):
+        if getattr(cur, "_entry_fire_rescue_v2", False):
             return True
         orig = cur
 
@@ -147,7 +228,7 @@ def _patch_runner() -> bool:
             kwargs.setdefault("use_pre_slope_filter", not _env_bool("ENTRY_BYPASS_SLOPE_FILTER", True))
             return orig(*args, **kwargs)
 
-        patched_run_summary_ai_entry_from_df._entry_fire_rescue_v1 = True  # type: ignore[attr-defined]
+        patched_run_summary_ai_entry_from_df._entry_fire_rescue_v2 = True  # type: ignore[attr-defined]
         patched_run_summary_ai_entry_from_df._original = orig  # type: ignore[attr-defined]
         r.run_summary_ai_entry_from_df = patched_run_summary_ai_entry_from_df
 
@@ -169,7 +250,7 @@ def _patch_ai_gate() -> bool:
         cur = getattr(g, "run_ai_gate_for_candidates", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_entry_fire_rescue_v1", False):
+        if getattr(cur, "_entry_fire_rescue_v2", False):
             return True
         orig = cur
 
@@ -203,7 +284,7 @@ def _patch_ai_gate() -> bool:
                 logger.exception("[ENTRY FIRE RESCUE] score_low rescue failed")
             return results
 
-        patched_run_ai_gate_for_candidates._entry_fire_rescue_v1 = True  # type: ignore[attr-defined]
+        patched_run_ai_gate_for_candidates._entry_fire_rescue_v2 = True  # type: ignore[attr-defined]
         patched_run_ai_gate_for_candidates._original = orig  # type: ignore[attr-defined]
         g.run_ai_gate_for_candidates = patched_run_ai_gate_for_candidates
         try:
@@ -217,11 +298,62 @@ def _patch_ai_gate() -> bool:
         return False
 
 
+def _patch_sell_credit_prefilter() -> bool:
+    try:
+        from trading.entry.summary_ai import executor as e
+
+        cur = getattr(e, "_filter_blocked_ai_ok_items", None)
+        if not callable(cur):
+            return False
+        if getattr(cur, "_entry_fire_rescue_sell_credit_v2", False):
+            return True
+        orig = cur
+
+        @wraps(orig)
+        def patched_filter_blocked_ai_ok_items(ok_items):
+            if not _env_bool("SUMMARY_AI_SELL_CREDIT_PREFILTER", True):
+                return orig(ok_items)
+            if not ok_items:
+                return orig(ok_items)
+
+            kept = []
+            skipped = []
+            try:
+                for item in list(ok_items or []):
+                    if not isinstance(item, dict):
+                        kept.append(item)
+                        continue
+                    blocked, reason, detail = _sell_credit_block_reason(item)
+                    if blocked:
+                        skipped.append({"reason": reason, **detail})
+                        continue
+                    kept.append(item)
+                if skipped:
+                    logger.warning(
+                        "[ENTRY FIRE RESCUE] SUMMARY_AI SELL credit prefilter before selection before=%s after=%s skipped=%s",
+                        len(ok_items),
+                        len(kept),
+                        skipped[:50],
+                    )
+                return orig(kept)
+            except Exception:
+                logger.exception("[ENTRY FIRE RESCUE] SELL credit prefilter failed; fail-open to original")
+                return orig(ok_items)
+
+        patched_filter_blocked_ai_ok_items._entry_fire_rescue_sell_credit_v2 = True  # type: ignore[attr-defined]
+        patched_filter_blocked_ai_ok_items._original = orig  # type: ignore[attr-defined]
+        e._filter_blocked_ai_ok_items = patched_filter_blocked_ai_ok_items
+        return True
+    except Exception:
+        logger.debug("[ENTRY FIRE RESCUE] sell credit prefilter patch skipped", exc_info=True)
+        return False
+
+
 def _patch_ranking_timeout_controller() -> bool:
     try:
         import core.startup.ranking_entry_controller_timeout_patch as p
 
-        if getattr(p, "_entry_fire_rescue_relaxed_v1", False):
+        if getattr(p, "_entry_fire_rescue_relaxed_v2", False):
             return True
 
         def relaxed_force_runtime_timeouts(tasks) -> None:
@@ -252,7 +384,7 @@ def _patch_ranking_timeout_controller() -> bool:
                 logger.debug("[ENTRY FIRE RESCUE] relaxed ranking caps failed", exc_info=True)
 
         p._force_runtime_timeouts = relaxed_force_runtime_timeouts
-        p._entry_fire_rescue_relaxed_v1 = True
+        p._entry_fire_rescue_relaxed_v2 = True
         return True
     except Exception:
         logger.debug("[ENTRY FIRE RESCUE] ranking timeout patch skipped", exc_info=True)
@@ -265,6 +397,7 @@ def _patch_once() -> dict[str, bool]:
         "candidates": _patch_candidates(),
         "runner": _patch_runner(),
         "ai_gate": _patch_ai_gate(),
+        "sell_credit_prefilter": _patch_sell_credit_prefilter(),
         "ranking_timeout": _patch_ranking_timeout_controller(),
     }
 
