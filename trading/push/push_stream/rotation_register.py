@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/rotation_register.py
-# Version: PRODUCTION-STABLE-REV5-PUSH-ROTATION-DYNAMIC-TRANSPORT-CALL
+# Version: PRODUCTION-STABLE-REV6-PUSH-ROTATION-PRE-REFRESH-TOKEN
 # ------------------------------------------------------------
 # PUSH A/Bローテーション用の登録委譲API。
 #
@@ -13,11 +13,11 @@
 #       B登録 -> 4.8秒保持 -> unregister_all -> 0.2秒待機 -> A登録
 #   - timeout付き登録で rotation worker を止めない
 #
-# REV5:
-#   - from .transport import _call_refresh の固定参照を廃止。
-#   - 毎回 transport._call_refresh を動的に呼ぶ。
-#   - これにより起動時パッチで rotation_register._call_refresh を
-#     再バインドする必要をなくす。
+# REV6:
+#   - rotation_A / rotation_B の REST unregister_all/register 直前に
+#     kabu Station token を refresh し、環境変数へ反映する。
+#   - 4001009 APIキー不一致は、PUSH子プロセス側の古い X-API-KEY が
+#     原因になりやすいため、register callable を呼ぶ前に必ず更新する。
 # ============================================================
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ from . import transport
 
 logger = logging.getLogger(__name__)
 
-VERSION = "PRODUCTION-STABLE-REV5-PUSH-ROTATION-DYNAMIC-TRANSPORT-CALL"
+VERSION = "PRODUCTION-STABLE-REV6-PUSH-ROTATION-PRE-REFRESH-TOKEN"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -59,6 +59,56 @@ def _env_float(name: str, default: float) -> float:
         return float(str(v).replace(",", ""))
     except Exception:
         return float(default)
+
+
+def _set_runtime_token_env(token: str) -> None:
+    token_s = str(token or "").strip()
+    if not token_s:
+        return
+    for name in (
+        "KABU_API_KEY",
+        "KABUSAPI_API_KEY",
+        "X_API_KEY",
+        "KABU_TOKEN",
+        "KABUSAPI_TOKEN",
+        "KABU_STATION_API_KEY",
+        "KABUSTATION_API_KEY",
+    ):
+        try:
+            os.environ[name] = token_s
+        except Exception:
+            pass
+
+
+def _refresh_kabu_token_before_rotation(reason: str) -> bool:
+    """Refresh kabu Station token in the PUSH child before REST register/unregister.
+
+    The subscription manager may hold a stale X-API-KEY even though the parent
+    main_database.py refreshed a token.  Refreshing here makes the child process
+    update token_manager.API_TOKEN and common env aliases immediately before the
+    REST rotation call.
+    """
+    if not _env_bool("PUSH_ROTATION_REFRESH_TOKEN_BEFORE_REGISTER", True):
+        return False
+    try:
+        import token_manager
+
+        token = token_manager.refresh_token()
+        _set_runtime_token_env(token)
+        logger.warning(
+            "[PUSH ROTATION TOKEN REFRESH] refreshed before register reason=%s token_len=%d",
+            reason,
+            len(str(token or "")),
+        )
+        return True
+    except Exception as e:
+        logger.warning(
+            "[PUSH ROTATION TOKEN REFRESH] failed before register reason=%s err=%s",
+            reason,
+            e,
+            exc_info=True,
+        )
+        return False
 
 
 def refresh_result_to_ok(result: Any) -> bool:
@@ -140,6 +190,8 @@ def register_symbols(symbols: Iterable[str], force: bool = False, **kwargs: Any)
     unregister_wait = _env_float("PUSH_ROTATION_UNREGISTER_WAIT_SEC", wait_after_clear or UNREGISTER_TO_REGISTER_WAIT_SEC)
 
     try:
+        _refresh_kabu_token_before_rotation(reason)
+
         logger.warning(
             "[push_stream] refresh call reason=%s size=%d head=%s force=%s clear_first=%s unregister_first=%s wait_after_clear=%.3fs",
             reason,
