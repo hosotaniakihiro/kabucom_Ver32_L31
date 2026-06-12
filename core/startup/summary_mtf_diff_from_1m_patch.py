@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/summary_mtf_diff_from_1m_patch.py
-# Version: V1.2-MAIN-NAS-INPAGE-SAFE-SKIP
+# Version: V1.3-MAIN-1M-ENTRY-FEED-NOT-SKIPPED
 # ------------------------------------------------------------
 # 目的:
 #   3分足/5分足のサマリー更新時に、既存3m/5m最新時刻以降の1分足をDBから読み、
@@ -13,6 +13,14 @@
 #     プロセスごと落ちることがあるため。
 #   - スキップ時は global_data の既存 summary cache があれば返し、無ければ空DFで返す。
 #   - AUTOSTOCK_MAIN_ALLOW_NAS_SUMMARY_DIFF_UPDATE=1 で旧動作に戻せる。
+#
+# V1.3:
+#   - interval=1 は main.py エントリー判定の主入力なので、NAS差分スキップで空DFを返さない。
+#     1分足は既存 SummaryController.diff_update / PUSH fallback 側に通す。
+#   - これにより、ログの
+#       main.py NAS diff_update skipped interval=1 cached_rows=0
+#       runner returned empty PUSH interval=1
+#     から Summary-AI / Tonosama の候補が消える問題を防ぐ。
 # ============================================================
 
 from __future__ import annotations
@@ -57,8 +65,17 @@ def _is_main_py_process() -> bool:
         return False
 
 
-def _main_should_skip_nas_diff_update() -> bool:
-    """main.py では NAS SQLite 直読みサマリー更新を既定で止める。"""
+def _main_should_skip_nas_diff_update(interval: int | None = None) -> bool:
+    """main.py では NAS SQLite 直読みサマリー更新を既定で止める。
+
+    interval=1 はエントリー判定の主入力であり、ここで空DFを返すと
+    Summary-AI/Tonosama が候補0件になる。1分足は既存controller/fallbackに任せる。
+    """
+    try:
+        if interval is not None and int(interval) == 1:
+            return False
+    except Exception:
+        pass
     if not _is_main_py_process():
         return False
     if _env_bool("AUTOSTOCK_MAIN_ALLOW_NAS_SUMMARY_DIFF_UPDATE", False):
@@ -171,7 +188,7 @@ def _run_diff_from_1m(interval: int) -> pd.DataFrame:
         return pd.DataFrame()
     if not _env_bool("SUMMARY_MTF_DIFF_FROM_1M_ENABLED", True):
         return pd.DataFrame()
-    if _main_should_skip_nas_diff_update():
+    if _main_should_skip_nas_diff_update(int(interval)):
         cached = _cached_latest_from_global(int(interval))
         _log_main_skip(int(interval), _safe_len(cached))
         return cached
@@ -241,17 +258,11 @@ def _run_diff_from_1m(interval: int) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def _call_original_diff_update(self, interval_i: int, *args, **kwargs):
+def _invoke_original_diff_update(self, interval_i: int, *args, **kwargs):
     """既存 diff_update(interval) 互換。scheduler由来の now/display/run_entry 等は渡さない。"""
     orig = _ORIG_DIFF_UPDATE
     if not callable(orig):
         return pd.DataFrame()
-
-    if _main_should_skip_nas_diff_update():
-        cached = _cached_latest_from_global(int(interval_i))
-        _log_main_skip(int(interval_i), _safe_len(cached))
-        return cached
-
     if args:
         logger.debug("[SUMMARY MTF DIFF 1M PATCH] ignored original positional extras interval=%s args=%s", interval_i, len(args))
     if kwargs:
@@ -273,6 +284,14 @@ def _call_original_diff_update(self, interval_i: int, *args, **kwargs):
     return orig(self, interval_i)
 
 
+def _call_original_diff_update(self, interval_i: int, *args, **kwargs):
+    if _main_should_skip_nas_diff_update(int(interval_i)):
+        cached = _cached_latest_from_global(int(interval_i))
+        _log_main_skip(int(interval_i), _safe_len(cached))
+        return cached
+    return _invoke_original_diff_update(self, interval_i, *args, **kwargs)
+
+
 def _patched_diff_update(self, interval: int, *args, **kwargs):
     interval_i = int(interval)
     precomputed_latest = pd.DataFrame()
@@ -285,6 +304,20 @@ def _patched_diff_update(self, interval: int, *args, **kwargs):
             return out
         if isinstance(precomputed_latest, pd.DataFrame) and not precomputed_latest.empty:
             return precomputed_latest
+
+        # V1.3 safety: interval=1 must not be killed by an empty cache. If any older wrapper or
+        # transient cache returned empty, try the original once more directly so PUSH fallback can run.
+        if interval_i == 1:
+            try:
+                direct = _invoke_original_diff_update(self, interval_i, *args, **kwargs)
+                if isinstance(direct, pd.DataFrame) and not direct.empty:
+                    logger.warning(
+                        "[SUMMARY MTF DIFF 1M PATCH] interval=1 recovered by original diff_update rows=%s",
+                        _safe_len(direct),
+                    )
+                    return direct
+            except Exception:
+                logger.exception("[SUMMARY MTF DIFF 1M PATCH] interval=1 direct original failed")
         return out if isinstance(out, pd.DataFrame) else pd.DataFrame()
     except Exception:
         logger.exception("[SUMMARY MTF DIFF 1M PATCH] original diff_update failed interval=%s", interval_i)
@@ -311,12 +344,13 @@ def install() -> bool:
         if not callable(cur):
             logger.warning("[SUMMARY MTF DIFF 1M PATCH] diff_update unavailable")
             return False
-        if getattr(cur, "_summary_mtf_diff_from_1m_v12", False):
+        if getattr(cur, "_summary_mtf_diff_from_1m_v13", False):
             _INSTALLED = True
             return True
 
-        # v1/v1.1 wrapper が既に入っている場合は、そのoriginalを拾って二重kwargs不具合を回避する。
+        # v1/v1.1/v1.2 wrapper が既に入っている場合は、そのoriginalを拾って二重kwargs不具合を回避する。
         _ORIG_DIFF_UPDATE = getattr(cur, "_original", cur)
+        _patched_diff_update._summary_mtf_diff_from_1m_v13 = True  # type: ignore[attr-defined]
         _patched_diff_update._summary_mtf_diff_from_1m_v12 = True  # type: ignore[attr-defined]
         _patched_diff_update._original = _ORIG_DIFF_UPDATE  # type: ignore[attr-defined]
         cls.diff_update = _patched_diff_update
@@ -328,10 +362,11 @@ def install() -> bool:
             pass
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY MTF DIFF 1M PATCH] installed v1.2 enabled=True history_rows=%s allow_partial=%s main_nas_skip=%s",
+            "[SUMMARY MTF DIFF 1M PATCH] installed v1.3 enabled=True history_rows=%s allow_partial=%s main_nas_skip=%s interval1_skip=%s",
             os.getenv("SUMMARY_MTF_DIFF_HISTORY_ROWS", "74"),
             os.getenv("SUMMARY_MTF_DIFF_ALLOW_PARTIAL_BAR", "0"),
-            _main_should_skip_nas_diff_update(),
+            _main_should_skip_nas_diff_update(3),
+            _main_should_skip_nas_diff_update(1),
         )
         return True
     except Exception:
