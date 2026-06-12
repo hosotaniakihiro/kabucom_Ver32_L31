@@ -30,6 +30,22 @@ def _safe_nunique(out: pd.DataFrame, col: str) -> int:
         return 0
 
 
+def _install_summary_mtf_owner_guard() -> None:
+    """Install DB-owner guard for startup MTF catchup.
+
+    usercustomize installs this module in every DB/data-collector process.
+    sitecustomize may already have scheduled summary_multiframe_startup_catchup_patch's
+    delayed background thread.  Installing this guard here lets non-owner child
+    processes replace that delayed callback before it wakes.
+    """
+    try:
+        from core.startup.summary_mtf_catchup_owner_guard_patch import install as _install_guard
+        ok = bool(_install_guard())
+        logger.warning("[YAHOO COMPUTE SCHEMA NA GUARD] summary mtf owner guard install ok=%s", ok)
+    except Exception:
+        logger.warning("[YAHOO COMPUTE SCHEMA NA GUARD] summary mtf owner guard install failed", exc_info=True)
+
+
 def _repair_yahoo_signal_columns(c, df: pd.DataFrame, *, interval: int | None = None) -> pd.DataFrame:
     """
     Yahoo補完では scoring_pipeline が内部成分(mom/vel等)だけを作り、
@@ -58,12 +74,10 @@ def _repair_yahoo_signal_columns(c, df: pd.DataFrame, *, interval: int | None = 
         prev_close = close.groupby(grp, sort=False).shift(1).replace(0, pd.NA)
         close_denom = close.replace(0, pd.NA)
 
-        # slope: close pct change per bar. 既存が全ゼロ/NAの時だけ復元。
         slope_pct = ((close - prev_close) / prev_close * 100.0).replace([float("inf"), float("-inf")], pd.NA).fillna(0.0)
         if "slope" not in out.columns or _all_zero_or_na(out["slope"]):
             out["slope"] = slope_pct
 
-        # ATRが無ければ簡易TR/rollingで補完。
         atr = _num(c, out, "atr")
         if _all_zero_or_na(atr):
             tr1 = (high - low).abs()
@@ -119,7 +133,6 @@ def _repair_yahoo_signal_columns(c, df: pd.DataFrame, *, interval: int | None = 
         buy = (trend_buy + osc_buy + component + vol_component).replace([float("inf"), float("-inf")], pd.NA).fillna(0.0)
         sell = (trend_sell + osc_sell + component + vol_component).replace([float("inf"), float("-inf")], pd.NA).fillna(0.0)
 
-        # 超低情報行は0のままにする。
         valid = close.gt(0) & (prev_close.notna() | ma5.notna() | rsi.notna() | macd.notna())
         buy = buy.where(valid, 0.0)
         sell = sell.where(valid, 0.0)
@@ -153,7 +166,6 @@ def _repair_yahoo_signal_columns(c, df: pd.DataFrame, *, interval: int | None = 
         if _all_zero_or_na(display_score):
             out["display_score"] = abs_score
 
-        # mtf/score_mtf: 短期MA方向とscoreの向きを最低限反映。
         mtf_val = pd.Series(0.0, index=out.index, dtype="float64")
         mtf_val = mtf_val.where(~((ma5_gap > 0) & (pd.to_numeric(out["slope"], errors="coerce") > 0)), 1.0)
         mtf_val = mtf_val.where(~((ma5_gap < 0) & (pd.to_numeric(out["slope"], errors="coerce") < 0)), -1.0)
@@ -186,11 +198,12 @@ def install() -> bool:
     global _INSTALLED
     if _INSTALLED:
         return True
+    _install_summary_mtf_owner_guard()
     try:
         import trading.yahoo.pipeline.complement.compute as c
 
-        old_schema = getattr(c, 'ensure_actual_db_schema_columns', None)
-        if not getattr(old_schema, '_na_guard_v2', False):
+        old_schema = getattr(c, "ensure_actual_db_schema_columns", None)
+        if not getattr(old_schema, "_na_guard_v2", False):
             def patched_schema(df, interval):
                 try:
                     out = c.safe_df(df)
@@ -204,7 +217,7 @@ def install() -> bool:
                     added_cols = []
                     zero_filled_cols = []
                     for col in db_cols:
-                        if col == 'id' or col in out.columns:
+                        if col == "id" or col in out.columns:
                             continue
                         dv = c._default_value_for_missing_db_col(col)
                         out[col] = dv
@@ -218,42 +231,42 @@ def install() -> bool:
                         if is_zero:
                             zero_filled_cols.append(col)
                     after_cols = set(map(str, out.columns))
-                    still_missing = [x for x in db_cols if x != 'id' and x not in after_cols]
-                    computed_or_existing = [x for x in db_cols if x != 'id' and x in before_cols]
-                    logger.warning('[YAHOO SUMMARY SCHEMA CHECK] table=%s interval=%s db_cols=%s df_cols_before=%s df_cols_after=%s added_cols=%s zero_filled_cols=%s still_missing=%s computed_or_existing=%s', table, interval, len(db_cols), len(before_cols), len(out.columns), added_cols[:120], zero_filled_cols[:120], still_missing[:120], computed_or_existing[:120])
-                    preferred = [x for x in db_cols if x in out.columns and x != 'id']
+                    still_missing = [x for x in db_cols if x != "id" and x not in after_cols]
+                    computed_or_existing = [x for x in db_cols if x != "id" and x in before_cols]
+                    logger.warning("[YAHOO SUMMARY SCHEMA CHECK] table=%s interval=%s db_cols=%s df_cols_before=%s df_cols_after=%s added_cols=%s zero_filled_cols=%s still_missing=%s computed_or_existing=%s", table, interval, len(db_cols), len(before_cols), len(out.columns), added_cols[:120], zero_filled_cols[:120], still_missing[:120], computed_or_existing[:120])
+                    preferred = [x for x in db_cols if x in out.columns and x != "id"]
                     others = [x for x in out.columns if x not in preferred]
                     return out[preferred + others].copy()
                 except Exception:
-                    logger.exception('[YAHOO COMPUTE] ensure actual db schema columns failed interval=%s', interval)
+                    logger.exception("[YAHOO COMPUTE] ensure actual db schema columns failed interval=%s", interval)
                     return c.safe_df(df)
 
             patched_schema._na_guard_v2 = True
             patched_schema._original = old_schema
             c.ensure_actual_db_schema_columns = patched_schema
 
-        old_score = getattr(c, 'ensure_score_columns', None)
-        if not getattr(old_score, '_signal_repair_v1', False):
+        old_score = getattr(c, "ensure_score_columns", None)
+        if not getattr(old_score, "_signal_repair_v1", False):
             def patched_score(df):
                 try:
                     out = old_score(df) if callable(old_score) else c.safe_df(df)
                     return _repair_yahoo_signal_columns(c, out, interval=None)
                 except Exception:
-                    logger.exception('[YAHOO COMPUTE SIGNAL REPAIR] patched ensure_score_columns failed')
+                    logger.exception("[YAHOO COMPUTE SIGNAL REPAIR] patched ensure_score_columns failed")
                     return c.safe_df(df)
 
             patched_score._signal_repair_v1 = True
             patched_score._original = old_score
             c.ensure_score_columns = patched_score
 
-        old_extra = getattr(c, 'ensure_yahoo_extra_calculated_columns', None)
-        if not getattr(old_extra, '_signal_repair_v1', False):
+        old_extra = getattr(c, "ensure_yahoo_extra_calculated_columns", None)
+        if not getattr(old_extra, "_signal_repair_v1", False):
             def patched_extra(df, interval):
                 try:
                     out = old_extra(df, interval) if callable(old_extra) else c.safe_df(df)
                     return _repair_yahoo_signal_columns(c, out, interval=int(interval))
                 except Exception:
-                    logger.exception('[YAHOO COMPUTE SIGNAL REPAIR] patched ensure_yahoo_extra_calculated_columns failed interval=%s', interval)
+                    logger.exception("[YAHOO COMPUTE SIGNAL REPAIR] patched ensure_yahoo_extra_calculated_columns failed interval=%s", interval)
                     return c.safe_df(df)
 
             patched_extra._signal_repair_v1 = True
@@ -261,15 +274,17 @@ def install() -> bool:
             c.ensure_yahoo_extra_calculated_columns = patched_extra
 
         _INSTALLED = True
-        logger.warning('[YAHOO COMPUTE SCHEMA NA GUARD] installed V2 signal_repair=True')
+        logger.warning("[YAHOO COMPUTE SCHEMA NA GUARD] installed V3 signal_repair=True mtf_owner_guard=True")
         return True
     except Exception:
-        logger.exception('[YAHOO COMPUTE SCHEMA NA GUARD] install failed')
+        logger.exception("[YAHOO COMPUTE SCHEMA NA GUARD] install failed")
         return False
+
 
 try:
     install()
 except Exception:
-    logger.exception('[YAHOO COMPUTE SCHEMA NA GUARD] auto install failed')
+    logger.exception("[YAHOO COMPUTE SCHEMA NA GUARD] auto install failed")
 
-__all__ = ['install']
+
+__all__ = ["install"]
