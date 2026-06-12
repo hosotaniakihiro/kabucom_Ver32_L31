@@ -36,11 +36,47 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _target_keep_count(items: list[str]) -> int:
+    if not items:
+        return 0
+    default_target = 100 if len(items) >= 80 else min(len(items), 50)
+    target = _env_int("WATCHLIST_RECENT_LIQ_FAILOPEN_TARGET_KEEP", default_target)
+    return max(1, min(len(items), int(target)))
+
+
+def _merge_keep_order(primary: list[str], items: list[str], *, target: int) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for src in (primary or [], items or []):
+        s = str(src).strip().upper()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+        if len(out) >= target:
+            break
+    return out
+
+
 def _remember_good(symbols: list[str], *, context: str) -> None:
     global _LAST_GOOD_REGISTER_SYMBOLS, _LAST_GOOD_TS
-    if symbols and _is_push_register_context(context):
-        _LAST_GOOD_REGISTER_SYMBOLS = list(symbols)
-        _LAST_GOOD_TS = time.time()
+    if not symbols or not _is_push_register_context(context):
+        return
+
+    # 25銘柄などに縮んだ一時結果で、より大きい last_good を上書きしない。
+    min_good = max(1, _env_int("WATCHLIST_LIQ_EMPTY_MIN_LAST_GOOD_KEEP", 50))
+    if len(symbols) < min_good and len(_LAST_GOOD_REGISTER_SYMBOLS) >= min_good:
+        logger.warning(
+            "[WATCHLIST LIQ EMPTY SAFE] keep previous last_good context=%s new_count=%s prev_count=%s min_good=%s",
+            context,
+            len(symbols),
+            len(_LAST_GOOD_REGISTER_SYMBOLS),
+            min_good,
+        )
+        return
+
+    _LAST_GOOD_REGISTER_SYMBOLS = list(symbols)
+    _LAST_GOOD_TS = time.time()
 
 
 def _last_good(max_age_sec: float = 900.0) -> list[str]:
@@ -54,18 +90,21 @@ def _last_good(max_age_sec: float = 900.0) -> list[str]:
 def _safe_failopen_subset(items: list[str], *, context: str, reason: str) -> list[str]:
     if not items:
         return []
-    min_keep = max(1, _env_int("WATCHLIST_RECENT_LIQ_FAILOPEN_MIN_KEEP", 30))
-    max_keep = max(min_keep, _env_int("WATCHLIST_RECENT_LIQ_FAILOPEN_MAX_KEEP", 50))
-    # 登録50制限を守るため、起動直後のDBタイムアウト時は先頭から最大50件だけ通す。
+    min_keep = max(1, _env_int("WATCHLIST_RECENT_LIQ_FAILOPEN_MIN_KEEP", 50))
+    target_keep = _target_keep_count(items)
+    max_keep = max(min_keep, _env_int("WATCHLIST_RECENT_LIQ_FAILOPEN_MAX_KEEP", target_keep))
+    max_keep = min(len(items), max_keep)
+    # PUSH rotation は内部で50件ずつ分割登録するため、ここでは100件候補を維持してよい。
     out = list(items[:max_keep])
     logger.warning(
-        "[WATCHLIST LIQ EMPTY SAFE] fail-open subset context=%s reason=%s before=%s after=%s min_keep=%s max_keep=%s head=%s",
+        "[WATCHLIST LIQ EMPTY SAFE] fail-open subset context=%s reason=%s before=%s after=%s min_keep=%s max_keep=%s target_keep=%s head=%s",
         context,
         reason,
         len(items),
         len(out),
         min_keep,
         max_keep,
+        target_keep,
         out[:20],
     )
     _remember_good(out, context=context)
@@ -84,6 +123,23 @@ def install() -> bool:
             max_last_good_age = mod._env_float("WATCHLIST_LIQ_EMPTY_LAST_GOOD_SEC", 900.0)
             fallback = _last_good(max_last_good_age)
             if fallback:
+                if _is_push_register_context(context):
+                    target_keep = _target_keep_count(items)
+                    if items and len(fallback) < target_keep:
+                        merged = _merge_keep_order(fallback, items, target=target_keep)
+                        logger.warning(
+                            "[WATCHLIST LIQ EMPTY SAFE] expand small last_good context=%s reason=%s current_count=%s fallback_count=%s expanded_count=%s target_keep=%s age_sec=%.1f",
+                            context,
+                            reason,
+                            len(items),
+                            len(fallback),
+                            len(merged),
+                            target_keep,
+                            time.time() - _LAST_GOOD_TS,
+                        )
+                        _remember_good(merged, context=context)
+                        return merged
+
                 logger.warning(
                     "[WATCHLIST LIQ EMPTY SAFE] use last_good context=%s reason=%s current_count=%s fallback_count=%s age_sec=%.1f",
                     context,
@@ -184,10 +240,12 @@ def install() -> bool:
         mod._filter_symbols = _filter_symbols_safe
         _INSTALLED = True
         logger.warning(
-            "[WATCHLIST LIQ EMPTY SAFE] installed v2 push_failopen_without_last_good=%s min_keep=%s max_keep=%s explicit_failopen=%s",
+            "[WATCHLIST LIQ EMPTY SAFE] installed v3 push_failopen_without_last_good=%s min_keep=%s max_keep=%s target_keep=%s min_last_good=%s explicit_failopen=%s",
             _env_bool("WATCHLIST_RECENT_LIQ_FAILOPEN_WITHOUT_LAST_GOOD_FOR_PUSH", True),
-            _env_int("WATCHLIST_RECENT_LIQ_FAILOPEN_MIN_KEEP", 30),
-            _env_int("WATCHLIST_RECENT_LIQ_FAILOPEN_MAX_KEEP", 50),
+            _env_int("WATCHLIST_RECENT_LIQ_FAILOPEN_MIN_KEEP", 50),
+            _env_int("WATCHLIST_RECENT_LIQ_FAILOPEN_MAX_KEEP", 100),
+            _env_int("WATCHLIST_RECENT_LIQ_FAILOPEN_TARGET_KEEP", 100),
+            _env_int("WATCHLIST_LIQ_EMPTY_MIN_LAST_GOOD_KEEP", 50),
             mod._env_bool("WATCHLIST_RECENT_LIQ_ALLOW_FAIL_OPEN_WITHOUT_LAST_GOOD", False),
         )
         return True
