@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/rotation_register.py
-# Version: PRODUCTION-STABLE-REV6-PUSH-ROTATION-PRE-REFRESH-TOKEN
+# Version: PRODUCTION-STABLE-REV7-PUSH-ROTATION-NO-PRE-REFRESH
 # ------------------------------------------------------------
 # PUSH A/Bローテーション用の登録委譲API。
 #
@@ -16,8 +16,14 @@
 # REV6:
 #   - rotation_A / rotation_B の REST unregister_all/register 直前に
 #     kabu Station token を refresh し、環境変数へ反映する。
-#   - 4001009 APIキー不一致は、PUSH子プロセス側の古い X-API-KEY が
-#     原因になりやすいため、register callable を呼ぶ前に必ず更新する。
+#
+# REV7:
+#   - 事前 token refresh のデフォルトを OFF にする。
+#   - /token をローテーションごとに叩くと、kabu Station 側の有効APIキーが
+#     頻繁に切り替わり、positions / register / unregister と競合して
+#     4001009 APIキー不一致や一時401を誘発する。
+#   - 401/4001009時の必要時 refresh は token retry patch 側に任せる。
+#   - 明示的に戻したい場合だけ PUSH_ROTATION_REFRESH_TOKEN_BEFORE_REGISTER=1 を設定する。
 # ============================================================
 
 from __future__ import annotations
@@ -38,7 +44,7 @@ from . import transport
 
 logger = logging.getLogger(__name__)
 
-VERSION = "PRODUCTION-STABLE-REV6-PUSH-ROTATION-PRE-REFRESH-TOKEN"
+VERSION = "PRODUCTION-STABLE-REV7-PUSH-ROTATION-NO-PRE-REFRESH"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -81,14 +87,15 @@ def _set_runtime_token_env(token: str) -> None:
 
 
 def _refresh_kabu_token_before_rotation(reason: str) -> bool:
-    """Refresh kabu Station token in the PUSH child before REST register/unregister.
+    """Optionally refresh kabu Station token in the PUSH child before REST register.
 
-    The subscription manager may hold a stale X-API-KEY even though the parent
-    main_database.py refreshed a token.  Refreshing here makes the child process
-    update token_manager.API_TOKEN and common env aliases immediately before the
-    REST rotation call.
+    Default is intentionally OFF.  Calling /token before every 4.8s rotation
+    invalidates the previous token and can race with /positions, /register and
+    /unregister/all in other threads/processes.  Keep this only as an emergency
+    opt-in switch for environments where the child process really cannot see the
+    current token.
     """
-    if not _env_bool("PUSH_ROTATION_REFRESH_TOKEN_BEFORE_REGISTER", True):
+    if not _env_bool("PUSH_ROTATION_REFRESH_TOKEN_BEFORE_REGISTER", False):
         return False
     try:
         import token_manager
