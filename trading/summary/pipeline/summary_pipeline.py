@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/summary/pipeline/summary_pipeline.py
-# Version: Ver32_L06-SPLIT-PUSH-SUMMARY-PIPELINE-MAIN-EMPTY-FASTRETURN
+# Version: Ver32_L07-SPLIT-PUSH-SUMMARY-PIPELINE-EMPTY-PUSH-REUSE-SUMMARY
 # ------------------------------------------------------------
 # Purpose:
 #   PUSH/Yahoo由来 stock_summary 用 pipeline 入口。
@@ -12,6 +12,7 @@
 #     trading.summary.indicators.atr_slope_safe を優先使用
 #   - main.py で summary/push が両方空の場合は legacy candidate を呼ばず空DFを返す
 #     （NAS SQLite/cache fallback 経由の Windows 0xC0000006 を避ける）
+#   - push_df が空で summary_df がある場合は、空DFで既存PUSHサマリーを上書きしない
 # ============================================================
 
 from __future__ import annotations
@@ -91,6 +92,11 @@ def _main_skip_empty_pipeline_candidates() -> bool:
     if not _is_main_py_process():
         return False
     return _env_bool("AUTOSTOCK_MAIN_SKIP_EMPTY_SUMMARY_PIPELINE", True)
+
+
+def _reuse_summary_when_push_empty() -> bool:
+    """push_df が一時的に空の時、既存 summary_df を返してサマリー0行上書きを防ぐ。"""
+    return _env_bool("AUTOSTOCK_REUSE_SUMMARY_ON_EMPTY_PUSH", True)
 
 
 def _guard_get_depth() -> int:
@@ -203,6 +209,25 @@ def _postprocess_output(
     return out.reset_index(drop=True)
 
 
+def _reuse_existing_summary_output(
+    summary_df: pd.DataFrame,
+    *,
+    interval: int,
+    latest_only: bool,
+    reason: str,
+) -> pd.DataFrame:
+    logger.warning(
+        "[summary_pipeline] reuse existing summary interval=%s reason=%s rows=%s symbols=%s latest_dt=%s latest_only=%s",
+        interval,
+        reason,
+        len(summary_df),
+        safe_symbols(summary_df),
+        safe_latest_dt(summary_df),
+        latest_only,
+    )
+    return _postprocess_output(summary_df, interval=interval, latest_only=latest_only)
+
+
 def run_summary_pipeline(
     summary_df: Optional[pd.DataFrame] = None,
     push_df: Optional[pd.DataFrame] = None,
@@ -255,6 +280,14 @@ def run_summary_pipeline(
             )
             return pd.DataFrame()
 
+        if len(push_df2) == 0 and len(summary_df2) > 0 and _reuse_summary_when_push_empty():
+            return _reuse_existing_summary_output(
+                summary_df2,
+                interval=interval_n,
+                latest_only=latest_only,
+                reason="push_df_empty",
+            )
+
         candidates = (
             try_incremental_engine,
             try_summary_controller,
@@ -280,6 +313,14 @@ def run_summary_pipeline(
                 )
 
                 if isinstance(out, pd.DataFrame):
+                    if len(out) == 0 and len(push_df2) == 0 and len(summary_df2) > 0 and _reuse_summary_when_push_empty():
+                        return _reuse_existing_summary_output(
+                            summary_df2,
+                            interval=interval_n,
+                            latest_only=latest_only,
+                            reason=f"candidate_empty:{getattr(fn, '__name__', '?')}",
+                        )
+
                     post = _postprocess_output(
                         out,
                         interval=interval_n,
@@ -331,6 +372,14 @@ def run_summary_pipeline(
                 interval_n,
                 safe_symbols(push_df2),
                 safe_latest_dt(push_df2),
+            )
+
+        if len(summary_df2) > 0 and _reuse_summary_when_push_empty():
+            return _reuse_existing_summary_output(
+                summary_df2,
+                interval=interval_n,
+                latest_only=latest_only,
+                reason="no_candidate_succeeded",
             )
 
         return pd.DataFrame()
