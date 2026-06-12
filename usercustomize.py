@@ -118,202 +118,143 @@ if _is_main_py():
 # These are intentionally hard overrides from the production recovery policy.
 os.environ["ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"] = "1"
 os.environ["ENTRY_BOARD_MISSING_HARD_BLOCK"] = "0"
-os.environ["RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE"] = "1"
-os.environ["RANKING_SNAPSHOT_TECH_BRIDGE_ENABLED"] = "1"
-os.environ["ENTRY_ORDER_EXCHANGE"] = "9"
-os.environ["KABU_ORDER_EXCHANGE"] = "9"
-
-# RANKING rescue thresholds are centralized in runtime_env_defaults.py, but
-# the rescue/fail-open patches are no longer loaded by default.  Set
-# USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES=1 when early-session rescue is
-# intentionally needed.
-if _env_on("USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES", False) or _env_on(
-    "USERCUSTOMIZE_ENABLE_LEGACY_RANKING_FAILOPEN_PATCHES", False
-):
-    for _k, _v in {
-        "RANKING_AI_GATE_FAILOPEN_ENABLED": "1",
-        "RANKING_AI_GATE_FAILOPEN_MIN_SCORE": "50",
-        "RANKING_AI_GATE_FAILOPEN_MIN_TURNOVER": "30000000",
-        "RANKING_AI_GATE_FAILOPEN_MIN_VOLUME": "30000",
-        "RANKING_ENTRY_LIGHT_MIN_SCORE": "50",
-        "RANKING_ENTRY_LIGHT_MIN_TURNOVER": "30000000",
-        "RANKING_FINAL_RESCUE_MIN_SCORE": "50",
-        "RANKING_FINAL_RESCUE_MIN_TURNOVER": "30000000",
-        "LOW_MOVE_RANKING_ZERO_ATR_MIN_SCORE": "50",
-        "LOW_MOVE_RANKING_MIN_SCORE_FOR_NO_HIGHLOW": "50",
-        "LOW_MOVE_RANKING_ZERO_ATR_MIN_TURNOVER": "30000000",
-    }.items():
-        os.environ[_k] = _v
-
-logger.warning(
-    "[USERCUSTOMIZE] runtime defaults centralized ranking_stale_skip=%s ranking_empty_failclosed=%s ranking_tech_bridge=%s ranking_rescue_patches=%s tonosama_mtf_stale_fail_closed=%s tonosama_rescue_patches=%s pullback=%s order_exchange=%s ranking_rescue_turnover=%s low_move_turnover=%s yahoo_skip=%s push_core=%s legacy_push_patches=%s",
-    os.getenv("RANKING_ENTRY_SKIP_IF_SNAPSHOT_STALE"),
-    os.getenv("RANKING_TODAY_EMPTY_FAIL_CLOSED"),
-    os.getenv("RANKING_SNAPSHOT_TECH_BRIDGE_ENABLED"),
-    os.getenv("USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES"),
-    os.getenv("TONOSAMA_MTF_STALE_FAIL_CLOSED"),
-    os.getenv("USERCUSTOMIZE_ENABLE_TONOSAMA_RESCUE_PATCHES"),
-    os.getenv("PULLBACK_ENTRY_ENABLED"),
-    os.getenv("ENTRY_ORDER_EXCHANGE"),
-    os.getenv("RANKING_FINAL_RESCUE_MIN_TURNOVER"),
-    os.getenv("LOW_MOVE_RANKING_ZERO_ATR_MIN_TURNOVER"),
-    os.getenv("AUTOSTOCK_MAIN_SKIP_YAHOO_COMPLEMENT"),
-    "integrated",
-    os.getenv("USERCUSTOMIZE_ENABLE_LEGACY_PUSH_PATCHES", "0"),
-)
-
-_INSTALLED_MODULES: set[str] = set()
-_INSTALL_LOCK = threading.RLock()
 
 
-def _install(label: str, module_name: str) -> None:
+# ============================================================
+# TONOSAMA notification recent volume display fix
+# ------------------------------------------------------------
+# Discord通知の「出来高 1m/3m/5m」が同一値になる問題を避ける。
+# 判定用 volume_3m / volume_5m は変更せず、通知表示用に
+# 1分足履歴から直近1本/3本/5本の合計出来高を付与する。
+# ============================================================
+
+def _uc_float(v, default: float = 0.0) -> float:
     try:
-        with _INSTALL_LOCK:
-            if (not _env_on("USERCUSTOMIZE_ALLOW_DUPLICATE_PATCHES", False)) and module_name in _INSTALLED_MODULES:
-                logger.warning("[USERCUSTOMIZE] %s duplicate module skipped module=%s", label, module_name)
-                return
-            _INSTALLED_MODULES.add(module_name)
-        mod = __import__(module_name, fromlist=["install"])
-        fn = getattr(mod, "install", None)
-        ok = bool(fn()) if callable(fn) else False
-        logger.warning("[USERCUSTOMIZE] %s auto install ok=%s", label, ok)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
     except Exception:
-        logger.exception("[USERCUSTOMIZE] %s auto install failed", label)
+        return float(default)
 
 
-LEGACY_PUSH_PATCHES = [
-    ("PUSH_RECONNECT_STABILITY", "core.startup.push_stream_reconnect_stability_patch"),
-    ("PUSH_ONOPEN_SAFE_REFRESH", "core.startup.push_onopen_refresh_safe_patch"),
-]
+def _uc_patch_tonosama_recent_volume_display() -> bool:
+    if not _is_main_py():
+        return False
+    try:
+        import re
+        import pandas as pd
+        import trading.entry.tonosama.volume_surge as vs
+        import trading.entry.tonosama.pending_writer as pw
 
-BASE_SYNC_PATCHES = [
-    ("KABUSAPI_TOKEN_RETRY_REGISTER", "core.startup.kabusapi_token_retry_register_patch"),
-    ("PUSH_MAIN_OWNER_POLICY", "core.startup.push_main_owner_lock_policy_patch"),
-    ("PUSH_EMPTY_OWNER_FAILOPEN", "core.startup.push_empty_owner_lock_failopen_patch"),
-    ("RANKING_API_GLOBAL_THROTTLE", "core.startup.ranking_api_global_throttle_patch"),
-    ("RANKING_WAL_AGGRESSIVE_TRUNCATE", "core.startup.ranking_wal_aggressive_truncate_patch"),
-    ("RANKING_EMPTY_TODAY_FAILCLOSED", "core.startup.ranking_empty_today_failclosed_patch"),
-    ("SUMMARY_AFTERNOON_STALE_GUARD", "core.startup.summary_fallback_afternoon_stale_guard_patch"),
-]
+        def _norm_symbol_series(s):
+            return s.astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
 
-MAIN_SYNC_PATCHES = [
-    ("MAIN_SKIP_YAHOO_COMPLEMENT", "core.startup.main_skip_yahoo_complement_schedule_patch"),
-    ("MAIN_SUMMARY_DB_SAVE_SKIP", "core.startup.main_summary_db_save_skip_patch"),
-    ("ORDER_EXCHANGE_SOR", "core.startup.order_exchange_sor_patch"),
-    ("REENTRY_STALE_429_EXIT_SAFETY", "core.startup.entry_reentry_stale_429_exit_safety_patch"),
-    ("EXIT_TUNING_DEFAULTS", "core.startup.exit_tuning_defaults_patch"),
-    ("EXIT_NOISE_CONFIRM_GUARD", "core.startup.exit_noise_confirm_guard_patch"),
-    ("EXIT_EXECUTOR_BROKER_V2", "core.startup.exit_executor_broker_fallback_v2_patch"),
-    ("SUMMARY_DIFF_STALE_LOCK_GUARD", "core.startup.summary_diff_update_stale_lock_guard_patch"),
-    ("ENTRY_LATE_SESSION_TIME_GUARD", "core.startup.entry_late_session_time_guard_patch"),
-    ("PULLBACK_ENTRY_PIPELINE", "core.startup.pullback_entry_pipeline_patch"),
-    ("RANKING_STALE_SNAPSHOT_SKIP", "core.startup.ranking_entry_stale_snapshot_skip_patch"),
-    ("RANKING_SNAPSHOT_TECH_BRIDGE", "core.startup.ranking_entry_snapshot_technical_bridge_patch"),
-    ("BOARD_MISSING_PROTECTED_ALLOW", "core.startup.board_missing_protected_allow_patch"),
-]
+        orig_build = getattr(vs.build_scalping_feature_df, "_original", vs.build_scalping_feature_df)
+        if not getattr(vs.build_scalping_feature_df, "_uc_recent_volume_display_v1", False):
+            def _patched_build_scalping_feature_df():
+                out = orig_build()
+                try:
+                    if out is None or out.empty or "symbol" not in out.columns:
+                        return out
+                    raw1 = vs.normalize_summary_base(vs.load_merged_summary(1), interval=1)
+                    if raw1 is None or raw1.empty or "symbol" not in raw1.columns or "volume" not in raw1.columns:
+                        return out
+                    raw1 = raw1.copy()
+                    raw1["symbol"] = _norm_symbol_series(raw1["symbol"])
+                    raw1["volume"] = pd.to_numeric(raw1["volume"], errors="coerce").fillna(0.0)
+                    if "datetime" in raw1.columns:
+                        raw1["datetime"] = pd.to_datetime(raw1["datetime"], errors="coerce")
+                        raw1 = raw1.dropna(subset=["datetime"]).sort_values(["symbol", "datetime"])
 
-MAIN_BG_PATCHES = [
-    ("EXIT_RECENT_PROTECT_MARKER", "core.startup.exit_recent_protect_marker_patch"),
-    ("EXIT_DB_STALE_GUARD", "core.startup.exit_db_stale_position_guard_patch"),
-    ("EXIT_LOOP_TIMEOUT_GUARD", "core.startup.exit_loop_timeout_guard_patch"),
-    ("ENTRY_MA5_THIRD_BAR_GUARD", "core.startup.entry_ma5_third_bar_slope_guard_patch"),
-    ("RANKING_ENTRY_WIDER_TOP", "core.startup.ranking_entry_wider_top_universe_patch"),
-    ("RANKING_WAL_MEMORY_GUARD", "core.startup.ranking_wal_checkpoint_memory_guard_patch"),
-    ("TONOSAMA_RUNTIME_25SEC_BUDGET", "core.startup.tonosama_runtime_25sec_budget_patch"),
-    ("TONOSAMA_LUNCH_REOPEN_RECENT", "core.startup.tonosama_lunch_reopen_recent_patch"),
-    ("YAHOO_COMPUTE_SCHEMA_NA_GUARD", "core.startup.yahoo_compute_schema_na_guard_patch"),
-    ("RANKING_ENTRY_FAST_BUDGET_OVERRIDE", "core.startup.ranking_entry_fast_budget_override_patch"),
-    ("WATCHLIST_LIQ_EMPTY_FAILOPEN", "core.startup.watchlist_liq_empty_failopen_register_patch"),
-    ("TONOSAMA_DEDICATED_OK_FINAL_ACCEPT", "core.startup.tonosama_dedicated_ok_final_accept_patch"),
-    ("TONOSAMA_ONE_PENDING", "core.startup.tonosama_one_pending_per_loop_patch"),
-    ("TONOSAMA_SKIP_BUILD_WHEN_PENDING_EXISTS", "core.startup.tonosama_skip_build_when_pending_exists_patch"),
-    ("TONOSAMA_CONTROLLER_TIMEOUT", "core.startup.tonosama_controller_timeout_patch"),
-    ("TONOSAMA_CONTROLLER_TIMEOUT_EXTEND", "core.startup.tonosama_controller_timeout_extend_patch"),
-    ("RANKING_ENTRY_INTRADAY_CAP", "core.startup.ranking_entry_intraday_cap_patch"),
-    ("SUMMARY_AI_NO_DIRECT_SYNC", "core.startup.summary_ai_no_direct_sync_patch"),
-    ("RANKING_ENTRY_MARKET_HOURS_SKIP", "core.startup.ranking_entry_market_hours_skip_patch"),
-    ("RANKING_STALE_FINAL", "core.startup.ranking_entry_stale_failclosed_final_patch"),
-]
+                    rows = []
+                    for sym, g in raw1.groupby("symbol", sort=False):
+                        gv = g.tail(5)["volume"]
+                        rows.append({
+                            "symbol": str(sym),
+                            "recent_volume_1m": float(gv.tail(1).sum()),
+                            "recent_volume_3m": float(gv.tail(3).sum()),
+                            "recent_volume_5m": float(gv.tail(5).sum()),
+                        })
+                    if not rows:
+                        return out
+                    recent = pd.DataFrame(rows)
+                    x = out.copy()
+                    x["symbol"] = _norm_symbol_series(x["symbol"])
+                    x = x.merge(recent, on="symbol", how="left")
+                    for c in ("recent_volume_1m", "recent_volume_3m", "recent_volume_5m"):
+                        x[c] = pd.to_numeric(x.get(c, 0.0), errors="coerce").fillna(0.0)
+                    logger.warning(
+                        "[USERCUSTOMIZE][TONOSAMA RECENT VOLUME DISPLAY] attached rows=%s sample=%s",
+                        len(x),
+                        x[[c for c in ["symbol", "recent_volume_1m", "recent_volume_3m", "recent_volume_5m"] if c in x.columns]].head(10).to_dict("records"),
+                    )
+                    return x
+                except Exception:
+                    logger.exception("[USERCUSTOMIZE][TONOSAMA RECENT VOLUME DISPLAY] attach failed")
+                    return out
 
-RANKING_RESCUE_PATCHES = [
-    ("ENTRY_RANKING_SCALP_RESCUE", "core.startup.entry_ranking_scalp_order_rescue_patch"),
-    ("RANKING_AI_GATE_FAILOPEN", "core.startup.ranking_entry_gate_failopen_patch"),
-]
+            _patched_build_scalping_feature_df._uc_recent_volume_display_v1 = True  # type: ignore[attr-defined]
+            _patched_build_scalping_feature_df._original = orig_build  # type: ignore[attr-defined]
+            vs.build_scalping_feature_df = _patched_build_scalping_feature_df
 
-TONOSAMA_RESCUE_PATCHES = [
-    ("TONOSAMA_RECENT_3M5M_FAILOPEN", "core.startup.tonosama_recent3m5m_failopen_patch"),
-    ("TONOSAMA_FAILOPEN_DIRECTION_RESCUE", "core.startup.tonosama_failopen_direction_rescue_patch"),
-    ("TONOSAMA_ATR1M_RESCUE", "core.startup.tonosama_atr1m_filter_rescue_patch"),
-    ("TONOSAMA_RANGE5M_RESCUE", "core.startup.tonosama_range5m_filter_rescue_patch"),
-    ("TONOSAMA_STALE_SUMMARY_FAILOPEN", "core.startup.tonosama_fresh_summary_stale_failopen_override_patch"),
-    ("TONOSAMA_RANGE5M_TUPLE_FAILOPEN", "core.startup.tonosama_range_5m_tuple_failopen_patch"),
-]
+        orig_conditions = getattr(pw._entry_conditions_from_row, "_original", pw._entry_conditions_from_row)
+        if not getattr(pw._entry_conditions_from_row, "_uc_recent_volume_display_v1", False):
+            def _row_vol(row, names, default=0.0):
+                for name in names:
+                    try:
+                        val = _uc_float(row.get(name), -1.0)
+                    except Exception:
+                        val = -1.0
+                    if val >= 0:
+                        return val
+                return float(default)
 
-DB_PATCHES = [
-    ("RANKING_WAL_MEMORY_GUARD", "core.startup.ranking_wal_checkpoint_memory_guard_patch"),
-    ("YAHOO_COMPUTE_SCHEMA_NA_GUARD", "core.startup.yahoo_compute_schema_na_guard_patch"),
-]
+            def _replace_volume_text(reason: str, v1: float, v3: float, v5: float) -> str:
+                new_text = f"出来高 1m={v1:.0f} / 3m={v3:.0f} / 5m={v5:.0f}"
+                pat = r"出来高 1m=[0-9,\.]+\s*/\s*3m=[0-9,\.]+\s*/\s*5m=[0-9,\.]+"
+                if re.search(pat, reason or ""):
+                    return re.sub(pat, new_text, reason, count=1)
+                return f"{reason} / {new_text}" if reason else new_text
+
+            def _patched_entry_conditions_from_row(row, *, ai_reason: str, side: str, expire_at):
+                cond = orig_conditions(row, ai_reason=ai_reason, side=side, expire_at=expire_at)
+                try:
+                    v1 = _row_vol(row, ["recent_volume_1m", "volume_1m", "latest_volume_1m", "volume", "_latest_volume"])
+                    v3 = _row_vol(row, ["recent_volume_3m", "volume_last_3m", "rolling_volume_3m", "volume_3m_display", "volume_3m"], v1)
+                    v5 = _row_vol(row, ["recent_volume_5m", "volume_last_5m", "rolling_volume_5m", "volume_5m_display", "volume_5m"], v3)
+                    if isinstance(cond, dict):
+                        cond["display_volume_1m"] = v1
+                        cond["display_volume_3m"] = v3
+                        cond["display_volume_5m"] = v5
+                        cond["recent_volume_1m"] = v1
+                        cond["recent_volume_3m"] = v3
+                        cond["recent_volume_5m"] = v5
+                        cond["reason"] = _replace_volume_text(str(cond.get("reason") or ""), v1, v3, v5)
+                    logger.warning(
+                        "[USERCUSTOMIZE][TONOSAMA RECENT VOLUME DISPLAY] reason fixed symbol=%s side=%s v1=%.0f v3=%.0f v5=%.0f raw_latest=%.0f raw3=%.0f raw5=%.0f",
+                        row.get("symbol") if hasattr(row, "get") else None,
+                        side,
+                        v1,
+                        v3,
+                        v5,
+                        _uc_float(row.get("_latest_volume") if hasattr(row, "get") else 0.0),
+                        _uc_float(row.get("volume_3m") if hasattr(row, "get") else 0.0),
+                        _uc_float(row.get("volume_5m") if hasattr(row, "get") else 0.0),
+                    )
+                except Exception:
+                    logger.exception("[USERCUSTOMIZE][TONOSAMA RECENT VOLUME DISPLAY] reason patch failed")
+                return cond
+
+            _patched_entry_conditions_from_row._uc_recent_volume_display_v1 = True  # type: ignore[attr-defined]
+            _patched_entry_conditions_from_row._original = orig_conditions  # type: ignore[attr-defined]
+            pw._entry_conditions_from_row = _patched_entry_conditions_from_row
+
+        logger.warning("[USERCUSTOMIZE] TONOSAMA recent volume display patch installed")
+        return True
+    except Exception:
+        logger.exception("[USERCUSTOMIZE] TONOSAMA recent volume display patch install failed")
+        return False
 
 
-def _install_many(items) -> None:
-    for label, module_name in items:
-        _install(label, module_name)
-
-
-def _install_ranking_rescue_patches() -> None:
-    if _env_on("USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES", False) or _env_on(
-        "USERCUSTOMIZE_ENABLE_LEGACY_RANKING_FAILOPEN_PATCHES", False
-    ):
-        logger.warning("[USERCUSTOMIZE] RANKING rescue/failopen patches enabled count=%s", len(RANKING_RESCUE_PATCHES))
-        _install_many(RANKING_RESCUE_PATCHES)
-    else:
-        logger.warning(
-            "[USERCUSTOMIZE] RANKING rescue/failopen patches skipped count=%s; "
-            "set USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES=1 to restore.",
-            len(RANKING_RESCUE_PATCHES),
-        )
-
-
-def _install_tonosama_rescue_patches() -> None:
-    if _env_on("USERCUSTOMIZE_ENABLE_TONOSAMA_RESCUE_PATCHES", False) or _env_on(
-        "USERCUSTOMIZE_ENABLE_LEGACY_TONOSAMA_FAILOPEN_PATCHES", False
-    ):
-        logger.warning("[USERCUSTOMIZE] TONOSAMA rescue patches enabled count=%s", len(TONOSAMA_RESCUE_PATCHES))
-        _install_many(TONOSAMA_RESCUE_PATCHES)
-    else:
-        logger.warning(
-            "[USERCUSTOMIZE] TONOSAMA rescue/failopen patches skipped count=%s; "
-            "set USERCUSTOMIZE_ENABLE_TONOSAMA_RESCUE_PATCHES=1 to restore.",
-            len(TONOSAMA_RESCUE_PATCHES),
-        )
-
-
-def _bg_main() -> None:
-    logger.warning("[USERCUSTOMIZE] main background patches start count=%s", len(MAIN_BG_PATCHES))
-    _install_many(MAIN_BG_PATCHES)
-    _install_ranking_rescue_patches()
-    _install_tonosama_rescue_patches()
-    logger.warning("[USERCUSTOMIZE] main background patches done")
-
-
-if _env_on("USERCUSTOMIZE_ENABLE_LEGACY_PUSH_PATCHES", False):
-    _install_many(LEGACY_PUSH_PATCHES)
-else:
-    logger.warning(
-        "[USERCUSTOMIZE] legacy PUSH startup shims skipped; core-integrated PUSH is active. "
-        "Set USERCUSTOMIZE_ENABLE_LEGACY_PUSH_PATCHES=1 to restore legacy shims."
-    )
-
-_install_many(BASE_SYNC_PATCHES)
-
-if _is_database_collector_context():
-    _install_many(DB_PATCHES)
-    logger.warning("[USERCUSTOMIZE] database collector context detected -> heavy entry/tonosama patches skipped argv=%s", sys.argv)
-elif _is_main_py() and _env_on("USERCUSTOMIZE_MAIN_LITE", True):
-    _install_many(MAIN_SYNC_PATCHES)
-    threading.Thread(target=_bg_main, name="usercustomize-main-bg-patches", daemon=True).start()
-    logger.warning("[USERCUSTOMIZE] main lite mode enabled sync=%s background=%s", len(MAIN_SYNC_PATCHES), len(MAIN_BG_PATCHES))
-else:
-    _install_many(MAIN_SYNC_PATCHES + MAIN_BG_PATCHES)
-    _install_ranking_rescue_patches()
-    _install_tonosama_rescue_patches()
+if _is_main_py():
+    _uc_patch_tonosama_recent_volume_display()
