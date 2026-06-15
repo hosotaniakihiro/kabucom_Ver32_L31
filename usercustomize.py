@@ -4,6 +4,8 @@ import logging
 import os
 import sys
 import threading
+import time
+from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +26,16 @@ def _env_on(name: str, default: bool = False) -> bool:
         return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
     except Exception:
         return bool(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
 
 
 def _is_database_collector_context() -> bool:
@@ -119,14 +131,6 @@ if _is_main_py():
 os.environ["ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"] = "1"
 os.environ["ENTRY_BOARD_MISSING_HARD_BLOCK"] = "0"
 
-
-# ============================================================
-# TONOSAMA notification recent volume display fix
-# ------------------------------------------------------------
-# Discord通知の「出来高 1m/3m/5m」が同一値になる問題を避ける。
-# 判定用 volume_3m / volume_5m は変更せず、通知表示用に
-# 1分足履歴から直近1本/3本/5本の合計出来高を付与する。
-# ============================================================
 
 def _uc_float(v, default: float = 0.0) -> float:
     try:
@@ -231,15 +235,12 @@ def _uc_patch_tonosama_recent_volume_display() -> bool:
                         cond["recent_volume_5m"] = v5
                         cond["reason"] = _replace_volume_text(str(cond.get("reason") or ""), v1, v3, v5)
                     logger.warning(
-                        "[USERCUSTOMIZE][TONOSAMA RECENT VOLUME DISPLAY] reason fixed symbol=%s side=%s v1=%.0f v3=%.0f v5=%.0f raw_latest=%.0f raw3=%.0f raw5=%.0f",
+                        "[USERCUSTOMIZE][TONOSAMA RECENT VOLUME DISPLAY] reason fixed symbol=%s side=%s v1=%.0f v3=%.0f v5=%.0f",
                         row.get("symbol") if hasattr(row, "get") else None,
                         side,
                         v1,
                         v3,
                         v5,
-                        _uc_float(row.get("_latest_volume") if hasattr(row, "get") else 0.0),
-                        _uc_float(row.get("volume_3m") if hasattr(row, "get") else 0.0),
-                        _uc_float(row.get("volume_5m") if hasattr(row, "get") else 0.0),
                     )
                 except Exception:
                     logger.exception("[USERCUSTOMIZE][TONOSAMA RECENT VOLUME DISPLAY] reason patch failed")
@@ -256,5 +257,137 @@ def _uc_patch_tonosama_recent_volume_display() -> bool:
         return False
 
 
+def _uc_norm_symbol(v: Any) -> str:
+    s = str(v or "").strip().upper()
+    if s.endswith(".T"):
+        s = s[:-2]
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+    return s
+
+
+def _uc_dedupe_symbols(values: Iterable[Any]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in values or []:
+        s = _uc_norm_symbol(x)
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _uc_is_push_rotation_context(context: str) -> bool:
+    c = str(context or "").lower()
+    return "push.rotation" in c or "apply_register_liquidity_guard" in c or "push_stream.rotation" in c
+
+
+def _uc_patch_watchlist_recent_liq_rotation_failopen() -> bool:
+    """Keep PUSH registration alive when recent summary is missing/stale.
+
+    The normal recent-liquidity guard is still useful for entry decisions, but
+    applying it before PUSH registration can create a deadlock: no recent summary
+    -> no registration target -> no new PUSH summary.  For rotation contexts only,
+    fail open to the original candidate set when the guard would leave too few
+    targets.
+    """
+    if not _is_main_py():
+        return False
+    try:
+        try:
+            from core.startup.watchlist_recent_liquidity_bulk_patch import install as _bulk_install
+            _bulk_install()
+        except Exception:
+            logger.exception("[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] bulk install before wrap failed")
+
+        import core.startup.watchlist_recent_liquidity_guard_patch as base
+
+        orig_filter = getattr(base, "_filter_symbols", None)
+        if not callable(orig_filter):
+            logger.warning("[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] base _filter_symbols missing")
+            return False
+        if getattr(orig_filter, "_uc_push_rotation_failopen_v1", False):
+            return True
+
+        def _patched_filter_symbols(symbols: Iterable[Any], *, context: str) -> list[str]:
+            items = _uc_dedupe_symbols(symbols)
+            out = orig_filter(items, context=context)
+            out_items = _uc_dedupe_symbols(out)
+            if _uc_is_push_rotation_context(context) and items:
+                min_keep = max(1, min(len(items), _env_int("UC_PUSH_ROTATION_LIQ_FAILOPEN_MIN_KEEP", 50)))
+                if len(out_items) < min_keep:
+                    logger.warning(
+                        "[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] context=%s before=%s after=%s min_keep=%s -> keep original targets",
+                        context,
+                        len(items),
+                        len(out_items),
+                        min_keep,
+                    )
+                    return items
+            return out_items
+
+        _patched_filter_symbols._uc_push_rotation_failopen_v1 = True  # type: ignore[attr-defined]
+        _patched_filter_symbols._original = orig_filter  # type: ignore[attr-defined]
+        base._filter_symbols = _patched_filter_symbols
+
+        try:
+            import trading.push.push_stream.rotation_symbols as rot_sym
+            old_apply = getattr(rot_sym, "apply_register_liquidity_guard", None)
+            if callable(old_apply) and not getattr(old_apply, "_uc_push_rotation_apply_failopen_v1", False):
+                def _patched_apply_register_liquidity_guard(targets):
+                    items = _uc_dedupe_symbols(targets)
+                    out = old_apply(targets)
+                    out_items = _uc_dedupe_symbols(out)
+                    if items:
+                        min_keep = max(1, min(len(items), _env_int("UC_PUSH_ROTATION_LIQ_FAILOPEN_MIN_KEEP", 50)))
+                        if len(out_items) < min_keep:
+                            logger.warning(
+                                "[USERCUSTOMIZE][PUSH ROTATION APPLY FAILOPEN] before=%s after=%s min_keep=%s -> keep original targets",
+                                len(items),
+                                len(out_items),
+                                min_keep,
+                            )
+                            return items
+                    return out_items
+
+                _patched_apply_register_liquidity_guard._uc_push_rotation_apply_failopen_v1 = True  # type: ignore[attr-defined]
+                _patched_apply_register_liquidity_guard._original = old_apply  # type: ignore[attr-defined]
+                rot_sym.apply_register_liquidity_guard = _patched_apply_register_liquidity_guard
+                try:
+                    import trading.push.push_stream.rotation as rot
+                    rot._apply_register_liquidity_guard = _patched_apply_register_liquidity_guard
+                except Exception:
+                    pass
+        except Exception:
+            logger.exception("[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] rotation apply wrap failed")
+
+        logger.warning(
+            "[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] installed min_keep=%s",
+            os.getenv("UC_PUSH_ROTATION_LIQ_FAILOPEN_MIN_KEEP", "50"),
+        )
+        return True
+    except Exception:
+        logger.exception("[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] install failed")
+        return False
+
+
+def _uc_delayed_watchlist_patch_loop() -> None:
+    # sitecustomize can install background patches after usercustomize.  Repeat the
+    # wrapper briefly so the final installed function remains fail-open for PUSH rotation.
+    for _ in range(10):
+        try:
+            _uc_patch_watchlist_recent_liq_rotation_failopen()
+        except Exception:
+            logger.exception("[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] delayed retry failed")
+        time.sleep(1.0)
+
+
 if _is_main_py():
     _uc_patch_tonosama_recent_volume_display()
+    _uc_patch_watchlist_recent_liq_rotation_failopen()
+    threading.Thread(
+        target=_uc_delayed_watchlist_patch_loop,
+        name="usercustomize-push-rotation-liq-failopen",
+        daemon=True,
+    ).start()
