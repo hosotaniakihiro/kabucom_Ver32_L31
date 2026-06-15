@@ -20,7 +20,7 @@ from .runtime_settings_ini_loader import VERSION as SETTINGS_INI_VERSION
 from .runtime_settings_ini_loader import load_settings_ini
 
 logger = logging.getLogger(__name__)
-VERSION = "REV7-RUNTIME-ENV-DEFAULTS-PATCH-STRICT-LOW-VOL-GUARD"
+VERSION = "REV8-RUNTIME-ENV-DEFAULTS-PATCH-PUSH-REGISTER-RECOVERY"
 _INSTALLED = False
 
 
@@ -94,6 +94,24 @@ def _install_low_volatility_entry_guard(context: str) -> bool:
         return False
 
 
+def _install_push_registration_recovery(context: str) -> bool:
+    """Install PUSH register 4001009 retry and target top-up in DB/PUSH processes."""
+    try:
+        # main_database.py and helper runners include push_receiver_runner.py.
+        # Installing in main is also safe because the patch only wraps modules if imported.
+        if context not in {"main_database", "helper", "main"}:
+            return False
+        if os.environ.get("DISABLE_PUSH_REGISTER_RECOVERY_PATCH", "").strip() == "1":
+            logger.warning("[RUNTIME ENV DEFAULTS PATCH] push register recovery disabled by env")
+            return False
+        from . import push_registration_recovery_patch
+
+        return bool(push_registration_recovery_patch.install())
+    except Exception:
+        logger.exception("[RUNTIME ENV DEFAULTS PATCH] push register recovery install failed")
+        return False
+
+
 def install() -> bool:
     """Apply centralized defaults once.
 
@@ -103,6 +121,7 @@ def install() -> bool:
     3. Built-in centralized defaults fill the remaining missing values.
     4. Trading-process runtime rescue patches may add safe fail-open defaults.
     5. Final risk veto patches such as low-volatility guard remain fail-closed.
+    6. PUSH register recovery keeps main_database.py registration healthy.
     """
     global _INSTALLED
     if _INSTALLED:
@@ -117,11 +136,12 @@ def install() -> bool:
         entry_fire_rescue_ok = _install_entry_fire_rescue(context)
         ranking_entry_rescue_ok = _install_ranking_entry_runtime_rescue(context)
         low_vol_guard_ok = _install_low_volatility_entry_guard(context)
+        push_register_recovery_ok = _install_push_registration_recovery(context)
 
         _INSTALLED = True
         if env_bool("RUNTIME_ENV_DEFAULTS_VERBOSE", False):
             logger.warning(
-                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s",
+                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s",
                 VERSION,
                 DEFAULTS_VERSION,
                 REGISTRY_VERSION,
@@ -134,10 +154,11 @@ def install() -> bool:
                 entry_fire_rescue_ok,
                 ranking_entry_rescue_ok,
                 low_vol_guard_ok,
+                push_register_recovery_ok,
             )
         else:
             logger.warning(
-                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s",
+                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s",
                 VERSION,
                 DEFAULTS_VERSION,
                 REGISTRY_VERSION,
@@ -151,6 +172,7 @@ def install() -> bool:
                 entry_fire_rescue_ok,
                 ranking_entry_rescue_ok,
                 low_vol_guard_ok,
+                push_register_recovery_ok,
             )
         return True
     except Exception:
