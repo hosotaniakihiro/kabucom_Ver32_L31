@@ -20,7 +20,7 @@ from .runtime_settings_ini_loader import VERSION as SETTINGS_INI_VERSION
 from .runtime_settings_ini_loader import load_settings_ini
 
 logger = logging.getLogger(__name__)
-VERSION = "REV6-RUNTIME-ENV-DEFAULTS-PATCH-LOW-VOL-GUARD"
+VERSION = "REV7-RUNTIME-ENV-DEFAULTS-PATCH-STRICT-LOW-VOL-GUARD"
 _INSTALLED = False
 
 
@@ -80,7 +80,15 @@ def _install_low_volatility_entry_guard(context: str) -> bool:
             return False
         from . import low_volatility_entry_guard_patch
 
-        return bool(low_volatility_entry_guard_patch.install())
+        base_ok = bool(low_volatility_entry_guard_patch.install())
+        strict_ok = False
+        try:
+            from . import low_volatility_entry_guard_strict_patch
+
+            strict_ok = bool(low_volatility_entry_guard_strict_patch.install())
+        except Exception:
+            logger.exception("[RUNTIME ENV DEFAULTS PATCH] strict low volatility guard install failed")
+        return bool(base_ok or strict_ok)
     except Exception:
         logger.exception("[RUNTIME ENV DEFAULTS PATCH] low volatility entry guard install failed")
         return False
