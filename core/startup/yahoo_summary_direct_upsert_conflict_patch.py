@@ -28,7 +28,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-VERSION = "REV1-YAHOO-SUMMARY-DIRECT-UPSERT-CONFLICT"
+VERSION = "REV1-YAHOO-SUMMARY-DIRECT-UPSERT-CONFLICT+PUSH-FALLBACK-FIX"
 _INSTALLED = False
 _ORIG_DIRECT = None
 
@@ -207,21 +207,33 @@ def _patched_direct_sqlite_upsert_summary_df(df, *, interval: int, db_path: Opti
                 pass
 
 
+def _install_push_summary_and_price_fix() -> bool:
+    try:
+        from core.startup import push_summary_fallback_and_active_price_patch as mod
+        ok = bool(mod.install())
+        logger.warning("[YAHOO SAVE CONFLICT PATCH] chained push summary/active price patch ok=%s version=%s", ok, getattr(mod, "VERSION", "unknown"))
+        return ok
+    except Exception:
+        logger.exception("[YAHOO SAVE CONFLICT PATCH] chained push summary/active price patch failed")
+        return False
+
+
 def install() -> bool:
     global _INSTALLED, _ORIG_DIRECT
     if _INSTALLED:
         return True
+    chained_ok = _install_push_summary_and_price_fix()
     try:
         import trading.yahoo.pipeline.complement.save as save_mod
 
         _ORIG_DIRECT = getattr(save_mod, "_direct_sqlite_upsert_summary_df", None)
         save_mod._direct_sqlite_upsert_summary_df = _patched_direct_sqlite_upsert_summary_df
         _INSTALLED = True
-        logger.warning("[YAHOO SAVE CONFLICT PATCH] installed version=%s", VERSION)
+        logger.warning("[YAHOO SAVE CONFLICT PATCH] installed version=%s chained_push_fix=%s", VERSION, chained_ok)
         return True
     except Exception:
         logger.exception("[YAHOO SAVE CONFLICT PATCH] install failed version=%s", VERSION)
-        return False
+        return bool(chained_ok)
 
 
 __all__ = ["install", "VERSION"]
