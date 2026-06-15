@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 from typing import Dict, Mapping, MutableMapping, Optional
 
-VERSION = "REV3-RUNTIME-ENV-DEFAULTS-CENTRALIZED-USER"
+VERSION = "REV4-RUNTIME-ENV-DEFAULTS-ACTIVE-PREMARKET-LIQUIDITY"
 
 _TRUE = {"1", "true", "yes", "on", "y"}
 _FALSE = {"0", "false", "no", "off", "n", ""}
@@ -80,6 +80,14 @@ PUSH_DEFAULTS: Dict[str, str] = {
     "PUSH_STREAM_SINGLE_OWNER_LOG_EVERY_SEC": "20.0",
     "PUSH_STREAM_EMPTY_OWNER_LOCK_FAIL_OPEN": "1",
     "PUSH_STREAM_EMPTY_OWNER_LOCK_REQUIRE_OWNER_CONTEXT": "1",
+    # 寄前SBIは価格列が無いことが多い。価格が分かるものだけ価格帯チェックし、
+    # 価格不明はPUSH登録直前のランキングDB流動性ガードへ渡す。
+    "ACTIVE_PREMARKET_ALLOW_NO_PRICE": "1",
+    # 低流動性銘柄を残しすぎない。A/B 100件固定を優先しすぎると薄商いも戻るため、
+    # PUSH登録直前では最低50件まで縮退を許可する。
+    "PUSH_REGISTER_LIQUIDITY_ROTATION_PRESERVE_FULL_POOL": "0",
+    "PUSH_REGISTER_LIQUIDITY_ROTATION_MIN_SURVIVOR_COUNT": "50",
+    "PUSH_REGISTER_LIQUIDITY_ROTATION_MIN_SURVIVOR_RATIO": "0.50",
     "USERCUSTOMIZE_ENABLE_LEGACY_PUSH_PATCHES": "0",
 }
 
