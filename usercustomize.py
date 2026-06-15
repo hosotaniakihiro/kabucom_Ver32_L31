@@ -90,8 +90,6 @@ def _install_runtime_defaults() -> bool:
 
 _install_runtime_defaults()
 
-# main.py default restore: entry / exit_loop_5s / ranking / tonosama / summary AI are ON.
-# To return to the previous crash-safe mode, set AUTOSTOCK_MAIN_OPERATION_MODE=entry_only before launch.
 if _is_main_py():
     for k, v in {
         "AUTOSTOCK_MAIN_OPERATION_MODE": "full",
@@ -127,7 +125,6 @@ if _is_main_py():
         os.getenv("AUTOSTOCK_MAIN_SKIP_YAHOO_COMPLEMENT"),
     )
 
-# These are intentionally hard overrides from the production recovery policy.
 os.environ["ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"] = "1"
 os.environ["ENTRY_BOARD_MISSING_HARD_BLOCK"] = "0"
 
@@ -169,7 +166,6 @@ def _uc_patch_tonosama_recent_volume_display() -> bool:
                     if "datetime" in raw1.columns:
                         raw1["datetime"] = pd.to_datetime(raw1["datetime"], errors="coerce")
                         raw1 = raw1.dropna(subset=["datetime"]).sort_values(["symbol", "datetime"])
-
                     rows = []
                     for sym, g in raw1.groupby("symbol", sort=False):
                         gv = g.tail(5)["volume"]
@@ -196,7 +192,6 @@ def _uc_patch_tonosama_recent_volume_display() -> bool:
                 except Exception:
                     logger.exception("[USERCUSTOMIZE][TONOSAMA RECENT VOLUME DISPLAY] attach failed")
                     return out
-
             _patched_build_scalping_feature_df._uc_recent_volume_display_v1 = True  # type: ignore[attr-defined]
             _patched_build_scalping_feature_df._original = orig_build  # type: ignore[attr-defined]
             vs.build_scalping_feature_df = _patched_build_scalping_feature_df
@@ -245,11 +240,9 @@ def _uc_patch_tonosama_recent_volume_display() -> bool:
                 except Exception:
                     logger.exception("[USERCUSTOMIZE][TONOSAMA RECENT VOLUME DISPLAY] reason patch failed")
                 return cond
-
             _patched_entry_conditions_from_row._uc_recent_volume_display_v1 = True  # type: ignore[attr-defined]
             _patched_entry_conditions_from_row._original = orig_conditions  # type: ignore[attr-defined]
             pw._entry_conditions_from_row = _patched_entry_conditions_from_row
-
         logger.warning("[USERCUSTOMIZE] TONOSAMA recent volume display patch installed")
         return True
     except Exception:
@@ -267,8 +260,8 @@ def _uc_norm_symbol(v: Any) -> str:
 
 
 def _uc_dedupe_symbols(values: Iterable[Any]) -> list[str]:
-    out: list[str] = []
-    seen: set[str] = set()
+    out = []
+    seen = set()
     for x in values or []:
         s = _uc_norm_symbol(x)
         if not s or s in seen:
@@ -284,14 +277,7 @@ def _uc_is_push_rotation_context(context: str) -> bool:
 
 
 def _uc_patch_watchlist_recent_liq_rotation_failopen() -> bool:
-    """Keep PUSH registration alive when recent summary is missing/stale.
-
-    The normal recent-liquidity guard is still useful for entry decisions, but
-    applying it before PUSH registration can create a deadlock: no recent summary
-    -> no registration target -> no new PUSH summary.  For rotation contexts only,
-    fail open to the original candidate set when the guard would leave too few
-    targets.
-    """
+    """Keep PUSH registration alive when recent summary is missing/stale."""
     if not _is_main_py():
         return False
     try:
@@ -350,7 +336,6 @@ def _uc_patch_watchlist_recent_liq_rotation_failopen() -> bool:
                             )
                             return items
                     return out_items
-
                 _patched_apply_register_liquidity_guard._uc_push_rotation_apply_failopen_v1 = True  # type: ignore[attr-defined]
                 _patched_apply_register_liquidity_guard._original = old_apply  # type: ignore[attr-defined]
                 rot_sym.apply_register_liquidity_guard = _patched_apply_register_liquidity_guard
@@ -373,8 +358,6 @@ def _uc_patch_watchlist_recent_liq_rotation_failopen() -> bool:
 
 
 def _uc_delayed_watchlist_patch_loop() -> None:
-    # sitecustomize can install background patches after usercustomize.  Repeat the
-    # wrapper briefly so the final installed function remains fail-open for PUSH rotation.
     for _ in range(10):
         try:
             _uc_patch_watchlist_recent_liq_rotation_failopen()
