@@ -1,9 +1,14 @@
 # ============================================================
 # File   : trading/push/subscription_manager/liquidity_guard.py
-# Version: PRODUCTION-STABLE-PUSH-LIQUIDITY-GUARD-V1.3-ROTATION-AB100
+# Version: PRODUCTION-STABLE-PUSH-LIQUIDITY-GUARD-V1.4-DB-VALUE-COLS
 # ------------------------------------------------------------
 # 【概要】
 #   PUSH登録対象から、日中出来高・売買代金が少なすぎる銘柄を除外する。
+#
+# V1.4 Fix:
+#   - ranking DB の売買代金列(trading_value/turnover/売買代金 等)を直接読む。
+#   - 価格列が無いテーブルでも売買代金列があれば liquidity map を作る。
+#   - volume列が無いが売買代金/価格がある場合も、銘柄情報を空にしない。
 #
 # V1.3 Fix:
 #   - A/B 50銘柄ローテーション中に候補100件が liquidity guard で50件へ縮退し、
@@ -11,10 +16,6 @@
 #   - source が push_stream.rotation / rotation_A / rotation_B 系の場合、
 #     入力が100件以上なら最低100件を維持する。
 #   - 条件未達銘柄は警告ログに残すが、ローテーション母集団は壊さない。
-#
-# V1.2 Fix:
-#   - recent liquidity fallback後にさらに 30 銘柄まで削られ、A/B rotation が崩れる問題を抑止。
-#   - 既定の最低生存数を 50 件へ引き上げ、50件登録単位を維持しやすくする。
 # ============================================================
 
 from __future__ import annotations
@@ -107,6 +108,15 @@ _PRICE_COL_CANDIDATES = (
     "close_price",
     "price",
     "現在値",
+)
+
+_VALUE_COL_CANDIDATES = (
+    "trading_value",
+    "turnover",
+    "value",
+    "売買代金",
+    "売買金額",
+    "TradingValue",
 )
 
 _TABLE_HINTS = (
@@ -229,6 +239,7 @@ def _load_liquidity_map_from_db(db_path: str) -> Dict[str, Dict[str, float]]:
     try:
         tables = _table_names(conn)
         used_tables = 0
+        queried_tables = 0
         for table in tables:
             if not _is_target_table(table):
                 continue
@@ -238,46 +249,48 @@ def _load_liquidity_map_from_db(db_path: str) -> Dict[str, Dict[str, float]]:
             symbol_col = _pick_col(cols, _SYMBOL_COL_CANDIDATES)
             volume_col = _pick_col(cols, _VOLUME_COL_CANDIDATES)
             price_col = _pick_col(cols, _PRICE_COL_CANDIDATES)
-            if symbol_col is None or volume_col is None:
+            value_col = _pick_col(cols, _VALUE_COL_CANDIDATES)
+            if symbol_col is None:
+                continue
+            if volume_col is None and price_col is None and value_col is None:
                 continue
 
             used_tables += 1
             symbol_expr = _quote_ident(symbol_col)
-            volume_expr = _numeric_expr(volume_col)
-            if price_col is not None:
-                price_expr = _numeric_expr(price_col)
+            volume_expr = _numeric_expr(volume_col) if volume_col is not None else "0.0"
+            price_expr = _numeric_expr(price_col) if price_col is not None else "0.0"
+            value_expr = _numeric_expr(value_col) if value_col is not None else "0.0"
+
+            # 売買代金列がある場合はそれを優先。無い場合だけ price * volume で推定する。
+            if value_col is not None:
+                turnover_expr = value_expr
+            elif price_col is not None and volume_col is not None:
                 turnover_expr = f"({price_expr} * {volume_expr})"
-                sql = f"""
-                    SELECT
-                        {symbol_expr} AS symbol,
-                        MAX({volume_expr}) AS max_volume,
-                        MAX({price_expr}) AS max_price,
-                        MAX({turnover_expr}) AS max_turnover
-                    FROM {_quote_ident(table)}
-                    WHERE {symbol_expr} IS NOT NULL
-                    GROUP BY {symbol_expr}
-                """
             else:
-                sql = f"""
-                    SELECT
-                        {symbol_expr} AS symbol,
-                        MAX({volume_expr}) AS max_volume,
-                        0.0 AS max_price,
-                        0.0 AS max_turnover
-                    FROM {_quote_ident(table)}
-                    WHERE {symbol_expr} IS NOT NULL
-                    GROUP BY {symbol_expr}
-                """
+                turnover_expr = "0.0"
+
+            sql = f"""
+                SELECT
+                    {symbol_expr} AS symbol,
+                    MAX({volume_expr}) AS max_volume,
+                    MAX({price_expr}) AS max_price,
+                    MAX({turnover_expr}) AS max_turnover
+                FROM {_quote_ident(table)}
+                WHERE {symbol_expr} IS NOT NULL
+                GROUP BY {symbol_expr}
+            """
 
             try:
                 rows = conn.execute(sql).fetchall()
+                queried_tables += 1
             except Exception:
                 logger.debug(
-                    "[PUSH LIQUIDITY GUARD] query failed table=%s symbol_col=%s volume_col=%s price_col=%s",
+                    "[PUSH LIQUIDITY GUARD] query failed table=%s symbol_col=%s volume_col=%s price_col=%s value_col=%s",
                     table,
                     symbol_col,
                     volume_col,
                     price_col,
+                    value_col,
                     exc_info=True,
                 )
                 continue
@@ -299,6 +312,9 @@ def _load_liquidity_map_from_db(db_path: str) -> Dict[str, Dict[str, float]]:
                 except Exception:
                     tv = 0.0
 
+                if v <= 0 and p <= 0 and tv <= 0:
+                    continue
+
                 prev = out.get(s)
                 if prev is None:
                     out[s] = {"volume": v, "price": p, "turnover": tv}
@@ -308,9 +324,10 @@ def _load_liquidity_map_from_db(db_path: str) -> Dict[str, Dict[str, float]]:
                     prev["turnover"] = max(float(prev.get("turnover") or 0.0), tv)
 
         logger.info(
-            "[PUSH LIQUIDITY GUARD] liquidity map loaded db=%s tables=%d symbols=%d",
+            "[PUSH LIQUIDITY GUARD] liquidity map loaded db=%s tables=%d queried=%d symbols=%d",
             db_path,
             used_tables,
+            queried_tables,
             len(out),
         )
         return out
