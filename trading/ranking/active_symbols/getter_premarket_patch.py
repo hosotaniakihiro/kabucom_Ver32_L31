@@ -53,6 +53,17 @@ def install() -> bool:
         logger.exception("[ACTIVE GETTER PREMARKET PATCH] import failed")
         return False
 
+    allow_intraday_sbi = _env_bool("ACTIVE_ALLOW_INTRADAY_PREMARKET_FALLBACK", False)
+    if not allow_intraday_sbi:
+        # manager.py imports this as a module-level constant.  Override it too
+        # so update_active_symbols() itself cannot fall back to premarket SBI
+        # after 09:00 just because today's ranking is temporarily empty/stale.
+        try:
+            setattr(mgr, "USE_PREMARKET_WHEN_TODAY_RANKING_EMPTY", False)
+            os.environ["ACTIVE_USE_PREMARKET_WHEN_TODAY_RANKING_EMPTY"] = "0"
+        except Exception:
+            logger.debug("[ACTIVE GETTER PREMARKET PATCH] manager fallback override failed", exc_info=True)
+
     original_get_active_symbols = getattr(mgr, "get_active_symbols", None)
 
     def _patched_get_active_symbols(*args, **kwargs) -> List[str]:
@@ -71,7 +82,7 @@ def install() -> bool:
             source_premarket = bool(get_global_attr("active_symbol_premarket_mode", False))
             preserve_premarket = _env_bool("ACTIVE_GETTER_PRESERVE_PREMARKET_MODE", True)
             skip_guard_when_premarket = _env_bool("ACTIVE_GETTER_SKIP_PRICE_GUARD_FOR_PREMARKET", True)
-            allow_intraday_sbi = _env_bool("ACTIVE_ALLOW_INTRADAY_PREMARKET_FALLBACK", False)
+            allow_intraday_sbi_now = _env_bool("ACTIVE_ALLOW_INTRADAY_PREMARKET_FALLBACK", False)
 
             if (
                 current_is_premarket
@@ -87,7 +98,7 @@ def install() -> bool:
                 )
                 return symbols[: getattr(mgr, "MAX_ACTIVE_SYMBOLS", 100)]
 
-            if source_premarket and not current_is_premarket and not allow_intraday_sbi:
+            if source_premarket and not current_is_premarket and not allow_intraday_sbi_now:
                 logger.info(
                     "[ACTIVE GETTER PREMARKET PATCH] market-hours ranking mode: re-guard former premarket symbols count=%d",
                     len(symbols),
@@ -122,7 +133,10 @@ def install() -> bool:
     mgr.get_rotation_symbols = lambda *a, **k: _patched_get_active_symbols()[: getattr(mgr, "MAX_ACTIVE_SYMBOLS", 100)]
 
     _INSTALLED = True
-    logger.warning("[ACTIVE GETTER PREMARKET PATCH] installed premarket_only_before_open=True")
+    logger.warning(
+        "[ACTIVE GETTER PREMARKET PATCH] installed premarket_only_before_open=True intraday_sbi_fallback=%s",
+        allow_intraday_sbi,
+    )
     return True
 
 
