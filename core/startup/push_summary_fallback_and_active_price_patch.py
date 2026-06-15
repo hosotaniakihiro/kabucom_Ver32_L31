@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Runtime fixes for 2026-06-15 startup logs.
+Runtime fixes for startup PUSH/summary/active-symbol issues.
 
 Fixes:
   1. ACTIVE SUMMARY PRICE FALLBACK SQL emitted "incomplete input" because the
@@ -8,9 +8,11 @@ Fixes:
   2. PUSH summary fallback could miss persisted rows saved with source="push"
      because the fallback source list / push-like filter did not include the
      plain "push" source used by runner_core._save_summary_if_owner(...).
-
-This module is intentionally narrow and safe to install from sitecustomize via
-an already-loaded startup patch.
+  3. Premarket SBI rows often have no price column.  After the SQL fix, only a
+     small subset of symbols may have summary prices at 09:00-09:30, and the
+     strict final price guard can shrink 100 PUSH symbols down to 0-2 symbols.
+     In premarket mode, keep unknown-price symbols by default while still
+     applying the 2500-7000 price guard to symbols with known prices.
 """
 from __future__ import annotations
 
@@ -26,7 +28,7 @@ from typing import Any, Dict, Iterable
 import pandas as pd
 
 logger = logging.getLogger(__name__)
-VERSION = "REV1-PUSH-SUMMARY-FALLBACK-ACTIVE-PRICE-SQL"
+VERSION = "REV2-PUSH-SUMMARY-FALLBACK-ACTIVE-PRICE-PREMARKET-FAILOPEN"
 _INSTALLED = False
 
 
@@ -35,7 +37,12 @@ def _env_bool(name: str, default: bool = True) -> bool:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
             return bool(default)
-        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
+            return False
+        return bool(default)
     except Exception:
         return bool(default)
 
@@ -140,8 +147,10 @@ def _patched_summary_price_fallback_map(symbols: Iterable[str]) -> Dict[str, Dic
 
                 if "datetime" in cols:
                     dt_expr = _qident("datetime")
+                    dt_expr_t2 = f"t2.{_qident('datetime')}"
                 elif "date" in cols and "time" in cols:
                     dt_expr = f"({_qident('date')} || ' ' || {_qident('time')})"
+                    dt_expr_t2 = f"(t2.{_qident('date')} || ' ' || t2.{_qident('time')})"
                 else:
                     continue
 
@@ -159,7 +168,6 @@ def _patched_summary_price_fallback_map(symbols: Iterable[str]) -> Dict[str, Dic
                 placeholders = ",".join(["?"] * len(remain))
                 table_q = _qident(table)
                 symbol_q = _qident("symbol")
-                # The original SQL missed the final ')' after the correlated subquery.
                 sql = f"""
                     SELECT CAST({symbol_q} AS TEXT) AS symbol,
                            {_qident(price_col)} AS price,
@@ -167,7 +175,7 @@ def _patched_summary_price_fallback_map(symbols: Iterable[str]) -> Dict[str, Dic
                     FROM {table_q}
                     WHERE CAST({symbol_q} AS TEXT) IN ({placeholders})
                       AND {dt_expr} = (
-                          SELECT MAX({dt_expr})
+                          SELECT MAX({dt_expr_t2})
                           FROM {table_q} t2
                           WHERE CAST(t2.{symbol_q} AS TEXT) = CAST({table_q}.{symbol_q} AS TEXT)
                       )
@@ -206,11 +214,25 @@ def _patched_summary_price_fallback_map(symbols: Iterable[str]) -> Dict[str, Dic
         return {}
 
 
+def _patched_allow_unknown_price(*, premarket_mode: bool) -> bool:
+    try:
+        if _env_bool("ACTIVE_FINAL_PRICE_GUARD_ALLOW_UNKNOWN_PRICE", False):
+            return True
+        # 寄前SBIの価格欠損で100銘柄が0-2銘柄へ縮退するのを防ぐ。
+        # 価格が取れた銘柄は final_guard_min_price 側で従来通り min/max price を判定する。
+        if premarket_mode and _env_bool("ACTIVE_PREMARKET_ALLOW_NO_PRICE", True):
+            return True
+        return False
+    except Exception:
+        return bool(premarket_mode)
+
+
 def _patch_active_price_sql() -> bool:
     try:
         import trading.ranking.active_symbols.liquidity as liq
         liq._summary_price_fallback_map = _patched_summary_price_fallback_map
-        logger.warning("[ACTIVE SUMMARY PRICE FALLBACK PATCH] installed version=%s", VERSION)
+        liq._allow_unknown_price = _patched_allow_unknown_price
+        logger.warning("[ACTIVE SUMMARY PRICE FALLBACK PATCH] installed version=%s premarket_unknown_price_default=True", VERSION)
         return True
     except Exception:
         logger.exception("[ACTIVE SUMMARY PRICE FALLBACK PATCH] install failed version=%s", VERSION)
@@ -266,8 +288,6 @@ def _patch_push_summary_fallback() -> bool:
             interval_i = int(interval)
             now_i = (now or fl.now_naive()).replace(tzinfo=None, microsecond=0)
             candidates: list[tuple[str, pd.DataFrame]] = []
-            # Plain source='push' is used by runner_core DB saves.  Also try a broad
-            # table read and let the patched push-like filter remove non-PUSH rows.
             for src in ("push", "SUMMARY", "summary", None):
                 try:
                     df = fl.load_latest_summary_from_db(interval_i, source_filter=src, now=now_i)
@@ -289,7 +309,6 @@ def _patch_push_summary_fallback() -> bool:
         fl.filter_push_like_rows = patched_filter_push_like_rows
         fl.fallback_push_summary_df = patched_fallback_push_summary_df
 
-        # runner_core imports these functions by name, so patch already-loaded references too.
         try:
             import scheduler_jobs.summary.runner_core as rc
             rc.filter_push_like_rows = patched_filter_push_like_rows
