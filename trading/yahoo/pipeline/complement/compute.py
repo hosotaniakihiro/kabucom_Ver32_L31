@@ -141,6 +141,20 @@ def _default_value_for_missing_db_col(col: str) -> Any:
     return 0.0
 
 
+def _is_zero_default_value(value: Any) -> bool:
+    """pd.NA/NaNを真偽値評価せず、0系の安全値だけを判定する。"""
+    try:
+        if value is None or pd.isna(value):
+            return False
+    except Exception:
+        if value is None:
+            return False
+    try:
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and float(value) == 0.0
+    except Exception:
+        return False
+
+
 # ============================================================
 # prepare
 # ============================================================
@@ -474,7 +488,7 @@ def ensure_actual_db_schema_columns(df: pd.DataFrame, interval: int) -> pd.DataF
             default_value = _default_value_for_missing_db_col(col)
             out[col] = default_value
             added_cols.append(col)
-            if default_value in (0, 0.0):
+            if _is_zero_default_value(default_value):
                 zero_filled_cols.append(col)
 
         after_cols = set(map(str, out.columns))
