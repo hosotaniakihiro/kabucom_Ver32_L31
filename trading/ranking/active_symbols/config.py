@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/ranking/active_symbols/config.py
-# Version: Ver1.3-ACTIVE-SYMBOLS-PRICE-RANGE-2500-7000
+# Version: Ver1.4-ACTIVE-SYMBOLS-PREMARKET-ONLY-BEFORE-OPEN
 # ============================================================
 from __future__ import annotations
 import os
@@ -66,7 +66,9 @@ PREMARKET_START_HOUR = env_int("ACTIVE_PREMARKET_START_HOUR", 7)
 PREMARKET_START_MINUTE = env_int("ACTIVE_PREMARKET_START_MINUTE", 0)
 PREMARKET_END_HOUR = env_int("ACTIVE_PREMARKET_END_HOUR", 9)
 PREMARKET_END_MINUTE = env_int("ACTIVE_PREMARKET_END_MINUTE", 0)
-USE_PREMARKET_WHEN_TODAY_RANKING_EMPTY = env_bool("ACTIVE_USE_PREMARKET_WHEN_TODAY_RANKING_EMPTY", True)
+# 寄前SBI 100銘柄は寄り前だけ使用する。ザラ場中はランキングを参照する。
+# どうしてもランキング空時にSBIへ戻したい場合のみ 1 にする。
+USE_PREMARKET_WHEN_TODAY_RANKING_EMPTY = env_bool("ACTIVE_USE_PREMARKET_WHEN_TODAY_RANKING_EMPTY", False)
 PREMARKET_ALLOW_NO_PRICE = env_bool("ACTIVE_PREMARKET_ALLOW_NO_PRICE", True)
 
 ENABLE_LIQUIDITY_FILTER = env_bool("ACTIVE_ENABLE_LIQUIDITY_FILTER", True)
