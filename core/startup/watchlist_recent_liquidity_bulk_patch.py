@@ -1,9 +1,17 @@
 # ============================================================
 # File   : core/startup/watchlist_recent_liquidity_bulk_patch.py
-# Version: V1.3-HARD-SKIP-DB-READ-IN-MAIN-PROCESS
+# Version: V1.4-PUSH-ROTATION-ALWAYS-FAIL-OPEN
 # ------------------------------------------------------------
 # watchlist_recent_liquidity_guard_patch の per-symbol SQLite 読取を
-# 1回のbulk読取に差し替え、さらにNAS DBが遅い場合はfail-openする。
+# 1回のbulk読取に差し替える。
+#
+# V1.4:
+#   - push.rotation.apply_register_liquidity_guard では summary DB を読まず、
+#     必ず元の候補を返す。
+#   - 理由: PUSH登録前の銘柄はまだPUSH summaryが無いのが正常。
+#     ここで NO_RECENT_SUMMARY 除外すると、PUSH未登録→summary無し→除外→未登録
+#     の循環で A/B 50銘柄ローテーションが成立しない。
+#   - PUSH登録の最低流動性は別の ranking/day liquidity guard 側で見る。
 #
 # V1.3:
 #   - main.py 判定を sys.argv/env だけでなく data_collectors.split_mode に統一
@@ -11,17 +19,6 @@
 #   - main.py 側では thread を作らず即 fail-open する
 #   - SQLite progress_handler で長時間SELECTを中断しやすくする
 #   - timeout後にdaemon workerが132秒後に read done を出す問題を抑制
-#
-# V1.2:
-#   - main.py では既定でsummary DB bulk read自体を起動しない
-#   - 理由: timeout後もdaemon workerがNAS SQLite SELECTを継続し、
-#           60〜132秒後に read done となってPUSH/ATSへ悪影響が出るため
-#   - main.pyで強制実行したい場合のみ WATCHLIST_RECENT_LIQ_BULK_RUN_IN_MAIN=1
-#
-# V1.1:
-#   - 100銘柄分を1回の SELECT ... IN (...) で取得
-#   - DB読取は専用スレッドで実行し、最大 WATCHLIST_RECENT_LIQ_BULK_TIMEOUT_SEC だけ待つ
-#   - timeout/DB遅延時は監視銘柄を落とさず fail-open して後続処理を止めない
 # ============================================================
 
 from __future__ import annotations
@@ -70,6 +67,14 @@ def _env_bool(name: str, default: bool = False) -> bool:
         return bool(default)
 
 
+def _is_push_rotation_context(context: Any) -> bool:
+    try:
+        s = str(context or "").strip().lower()
+        return s.startswith("push.rotation") or s.startswith("rotation") or "push_stream.rotation" in s
+    except Exception:
+        return False
+
+
 def _is_main_py_process() -> bool:
     try:
         argv = [str(x).replace("\\", "/").lower() for x in sys.argv]
@@ -79,12 +84,6 @@ def _is_main_py_process() -> bool:
 
 
 def _split_mode_says_main_should_skip_db_work() -> bool:
-    """
-    main.py / main_database.py 分離判定の正本。
-
-    旧判定では AUTOSTOCK_SUMMARY_DB_WRITER=1 等がmain.py側に残ると
-    database process と誤判定して、main.pyで重いsummary DB readを開始していた。
-    """
     try:
         from data_collectors.split_mode import should_skip_data_collector_work_in_main
         return bool(should_skip_data_collector_work_in_main())
@@ -134,10 +133,7 @@ def _read_bulk_stats_sync(mod: Any, missing: List[str], symbols_total: int) -> d
         conn.execute("PRAGMA busy_timeout=250")
 
         def _progress_handler() -> int:
-            # 0=continue, nonzero=abort
-            if time.monotonic() > deadline:
-                return 1
-            return 0
+            return 1 if time.monotonic() > deadline else 0
 
         try:
             conn.set_progress_handler(_progress_handler, 10_000)
@@ -320,10 +316,17 @@ def install() -> bool:
         if not mod._env_bool("WATCHLIST_RECENT_LIQ_ENABLED", True):
             return items
 
+        if _is_push_rotation_context(context):
+            logger.warning(
+                "[WATCHLIST RECENT LIQ BULK] push rotation context=%s -> fail-open keep original count=%s reason=summary_not_available_before_registration",
+                context,
+                len(items),
+            )
+            return items
+
         protected = mod._protected_symbols()
         protected_items = [s for s in items if s in protected]
-        check_items = [s for s in items if s not in protected]
-        stats_map, timed_out = _bulk_stats(mod, check_items)
+        stats_map, timed_out = _bulk_stats(mod, [s for s in items if s not in protected])
 
         if timed_out and mod._env_bool("WATCHLIST_RECENT_LIQ_FAIL_OPEN_ON_TIMEOUT", True):
             logger.warning(
@@ -376,7 +379,7 @@ def install() -> bool:
     mod._filter_symbols = _filter_symbols_bulk
     _INSTALLED = True
     logger.warning(
-        "[WATCHLIST RECENT LIQ BULK] installed v1.3 bulk summary read timeout=%.2fs hard_timeout=%.2fs fail_open=%s skip_db_in_main=%s split_mode_skip=%s argv_main=%s",
+        "[WATCHLIST RECENT LIQ BULK] installed v1.4 push_rotation_fail_open timeout=%.2fs hard_timeout=%.2fs fail_open=%s skip_db_in_main=%s split_mode_skip=%s argv_main=%s",
         _env_float("WATCHLIST_RECENT_LIQ_BULK_TIMEOUT_SEC", 1.5),
         _env_float("WATCHLIST_RECENT_LIQ_BULK_SQL_HARD_TIMEOUT_SEC", 2.0),
         mod._env_bool("WATCHLIST_RECENT_LIQ_FAIL_OPEN_ON_TIMEOUT", True),
@@ -385,6 +388,7 @@ def install() -> bool:
         _is_main_py_process(),
     )
     return True
+
 
 try:
     install()
