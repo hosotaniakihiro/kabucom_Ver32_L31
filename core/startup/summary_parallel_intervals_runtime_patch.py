@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/summary_parallel_intervals_runtime_patch.py
-# Version: Ver10-LIGHTWEIGHT-DEFAULTS-NO-FORCE-ALL
+# Version: Ver11-MAIN-TICK-TIMEOUT-CAP
 # ------------------------------------------------------------
 # 1分・3分・5分サマリーを並列実行する runtime patch。
 #
@@ -8,6 +8,9 @@
 #   ✔ CPU高止まり対策として、既定で 1m/3m/5m 全足強制をしない。
 #   ✔ main.py は親tickを詰まらせないが、長足BGも既定では増やさない。
 #   ✔ workers/bg_workers 既定を 1 にしてスレッド増殖を抑える。
+# Ver11 Fix:
+#   ✔ main.py / entry-only process では 90秒 timeout を引き継がず、
+#     25秒で親tickを返す。summary_parent_tick 80秒化を防ぐ。
 # ============================================================
 
 from __future__ import annotations
@@ -100,8 +103,35 @@ def _is_main_entry_only_process() -> bool:
         return False
 
 
+def _main_tick_timeout_cap_enabled() -> bool:
+    # main.py は発注・PUSH監視を止めないことを優先する。長い集計は main_database.py 側。
+    return _is_main_entry_only_process() and not _env_bool("SUMMARY_MAIN_ALLOW_LONG_TICK", False)
+
+
 def _ensure_timeout_min() -> None:
     try:
+        if _main_tick_timeout_cap_enabled():
+            cap = _env_float("SUMMARY_MAIN_TICK_TIMEOUT_CAP_SEC", 25.0)
+            cur_raw = os.getenv("SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC")
+            cur = float(cur_raw) if cur_raw is not None and str(cur_raw).strip() != "" else cap
+            if cur > cap:
+                os.environ["SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC"] = str(int(cap) if float(cap).is_integer() else cap)
+                logger.warning(
+                    "[SUMMARY PARALLEL] timeout capped old=%s new=%s reason=main_entry_tick_latency",
+                    cur_raw,
+                    os.environ.get("SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC"),
+                )
+            min_raw = os.getenv("SUMMARY_PARALLEL_TIMEOUT_MIN_SEC")
+            min_sec = float(min_raw) if min_raw is not None and str(min_raw).strip() != "" else cap
+            if min_sec > cap:
+                os.environ["SUMMARY_PARALLEL_TIMEOUT_MIN_SEC"] = str(int(cap) if float(cap).is_integer() else cap)
+                logger.warning(
+                    "[SUMMARY PARALLEL] timeout min capped old=%s new=%s reason=main_entry_tick_latency",
+                    min_raw,
+                    os.environ.get("SUMMARY_PARALLEL_TIMEOUT_MIN_SEC"),
+                )
+            return
+
         min_sec = _env_float("SUMMARY_PARALLEL_TIMEOUT_MIN_SEC", 30.0)
         cur_raw = os.getenv("SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC")
         cur = float(cur_raw) if cur_raw is not None and str(cur_raw).strip() != "" else min_sec
@@ -109,8 +139,8 @@ def _ensure_timeout_min() -> None:
             os.environ["SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC"] = str(int(min_sec) if float(min_sec).is_integer() else min_sec)
             logger.warning("[SUMMARY PARALLEL] timeout raised old=%s new=%s reason=min_timeout_for_summary", cur_raw, os.environ.get("SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC"))
     except Exception:
-        os.environ["SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC"] = "30"
-        logger.warning("[SUMMARY PARALLEL] timeout fallback set 30")
+        os.environ["SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC"] = "25" if _main_tick_timeout_cap_enabled() else "30"
+        logger.warning("[SUMMARY PARALLEL] timeout fallback set %s", os.environ.get("SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC"))
 
 
 def _executor() -> ThreadPoolExecutor:
@@ -361,17 +391,17 @@ def install() -> bool:
         import scheduler_jobs.summary.runners as runners
         import scheduler_jobs.summary.scheduler as scheduler
         cur = getattr(tlr, "run_time_locked_summary_jobs", None)
-        if getattr(cur, "_summary_parallel_intervals_v10", False):
+        if getattr(cur, "_summary_parallel_intervals_v11", False):
             _INSTALLED = True
             return True
         _ORIG_TIME_LOCKED = cur
-        _patched_run_time_locked_summary_jobs._summary_parallel_intervals_v10 = True  # type: ignore[attr-defined]
+        _patched_run_time_locked_summary_jobs._summary_parallel_intervals_v11 = True  # type: ignore[attr-defined]
         tlr.run_time_locked_summary_jobs = _patched_run_time_locked_summary_jobs
         runners.run_time_locked_summary_jobs = _patched_run_time_locked_summary_jobs
         scheduler.run_time_locked_summary_jobs = _patched_run_time_locked_summary_jobs
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY PARALLEL] installed v10 enabled=%s workers=%s bg_workers=%s timeout=%.1f ranking_parallel=%s force_1_3_5=%s push_all_intervals=%s push_bg_all=%s push_bg_long=%s main_entry_only=%s min_timeout=%s",
+            "[SUMMARY PARALLEL] installed v11 enabled=%s workers=%s bg_workers=%s timeout=%.1f ranking_parallel=%s force_1_3_5=%s push_all_intervals=%s push_bg_all=%s push_bg_long=%s main_entry_only=%s min_timeout=%s cap_enabled=%s",
             _env_bool("SUMMARY_PARALLEL_INTERVALS_ENABLED", True),
             _env_int("SUMMARY_PARALLEL_INTERVAL_WORKERS", 1),
             _env_int("SUMMARY_PUSH_BG_INTERVAL_WORKERS", 1),
@@ -383,6 +413,7 @@ def install() -> bool:
             _push_bg_long_intervals_enabled(),
             _is_main_entry_only_process(),
             os.getenv("SUMMARY_PARALLEL_TIMEOUT_MIN_SEC"),
+            _main_tick_timeout_cap_enabled(),
         )
         return True
     except Exception as e:
