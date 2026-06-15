@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/summary_mtf_diff_from_1m_patch.py
-# Version: V1.3-MAIN-1M-ENTRY-FEED-NOT-SKIPPED
+# Version: V1.4-MAIN-CACHED-1M-MTF-FALLBACK
 # ------------------------------------------------------------
 # 目的:
 #   3分足/5分足のサマリー更新時に、既存3m/5m最新時刻以降の1分足をDBから読み、
@@ -17,10 +17,13 @@
 # V1.3:
 #   - interval=1 は main.py エントリー判定の主入力なので、NAS差分スキップで空DFを返さない。
 #     1分足は既存 SummaryController.diff_update / PUSH fallback 側に通す。
-#   - これにより、ログの
-#       main.py NAS diff_update skipped interval=1 cached_rows=0
-#       runner returned empty PUSH interval=1
-#     から Summary-AI / Tonosama の候補が消える問題を防ぐ。
+#
+# V1.4:
+#   - main.py で3m/5m NAS差分更新をスキップした場合、既存3m/5m cache が空なら
+#     global_data上の1m PUSH履歴から軽量に3m/5m OHLCを再生成して publish する。
+#   - これにより起動直後/ローテーション復帰直後の
+#       MERGED GET tf=3 source=push rows=0
+#     を回避し、Summary-AI/MTFガードが全空で止まる問題を緩和する。
 # ============================================================
 
 from __future__ import annotations
@@ -118,6 +121,47 @@ def _cached_latest_from_global(interval: int) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def _cached_1m_history_from_global() -> pd.DataFrame:
+    """NASを読まず、global_dataに残っている1m PUSH履歴だけを集める。"""
+    try:
+        from global_state import global_data
+        candidates = []
+        for name in (
+            "summary_1m_df",
+            "latest_summary_1m_df",
+            "summary_1m_latest_df",
+            "push_summary_1m_df",
+            "push_merged_summary_1m_df",
+        ):
+            try:
+                candidates.append(getattr(global_data, name, None))
+            except Exception:
+                pass
+        for method_name in ("get_summary_history", "get_push_merged_summary", "get_latest_summary"):
+            try:
+                fn = getattr(global_data, method_name, None)
+                if callable(fn):
+                    candidates.append(fn(1))
+            except Exception:
+                pass
+        dfs = []
+        for x in candidates:
+            if isinstance(x, pd.DataFrame) and not x.empty:
+                df = _normalize_summary_df(x, interval=1)
+                if not df.empty:
+                    dfs.append(df)
+        if not dfs:
+            return pd.DataFrame()
+        out = pd.concat(dfs, ignore_index=True, sort=False)
+        if "symbol" in out.columns and "datetime" in out.columns:
+            out = out.drop_duplicates(subset=["symbol", "datetime"], keep="last")
+            out = out.sort_values(["symbol", "datetime"], kind="stable")
+        return out.reset_index(drop=True)
+    except Exception:
+        logger.exception("[SUMMARY MTF DIFF 1M PATCH] cached 1m history load failed")
+        return pd.DataFrame()
+
+
 def _log_main_skip(interval: int, rows: int) -> None:
     try:
         import time
@@ -156,6 +200,33 @@ def _normalize_summary_df(df: pd.DataFrame, *, interval: int) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _ensure_basic_score_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    if out.empty:
+        return out
+    defaults = {
+        "score": 0.0,
+        "score_total": 0.0,
+        "final_score": 0.0,
+        "display_score": 0.0,
+        "score_buy": 0.0,
+        "score_sell": 0.0,
+        "slope": 0.0,
+        "slope_atr_scaled": 0.0,
+        "score_slope": 0.0,
+        "mtf": 0.0,
+        "score_mtf": 0.0,
+        "mtf_score": 0.0,
+        "rsi": 50.0,
+        "macd": 0.0,
+        "signal": 0.0,
+    }
+    for col, val in defaults.items():
+        if col not in out.columns:
+            out[col] = val
+    return out
+
+
 def _publish_to_global(interval: int, df_hist: pd.DataFrame, df_latest: pd.DataFrame) -> None:
     try:
         from global_state import global_data
@@ -165,6 +236,14 @@ def _publish_to_global(interval: int, df_hist: pd.DataFrame, df_latest: pd.DataF
             logger.debug("[SUMMARY MTF DIFF 1M PATCH] set_push_merged_summary unavailable interval=%s", interval, exc_info=True)
         try:
             setattr(global_data, f"summary_{interval}m_df", df_hist.copy())
+        except Exception:
+            pass
+        try:
+            setattr(global_data, f"latest_summary_{interval}m_df", df_latest.copy())
+        except Exception:
+            pass
+        try:
+            setattr(global_data, f"summary_{interval}m_latest_df", df_latest.copy())
         except Exception:
             pass
         try:
@@ -183,6 +262,106 @@ def _publish_to_global(interval: int, df_hist: pd.DataFrame, df_latest: pd.DataF
         logger.exception("[SUMMARY MTF DIFF 1M PATCH] global publish failed interval=%s", interval)
 
 
+def _resample_cached_1m_to_mtf(interval: int) -> pd.DataFrame:
+    """main.py用: 1m cacheから3m/5mを軽量生成。DB保存はしない。"""
+    interval_i = int(interval)
+    if interval_i not in (3, 5):
+        return pd.DataFrame()
+    one = _cached_1m_history_from_global()
+    if one.empty:
+        return pd.DataFrame()
+    try:
+        one = one.copy()
+        if "datetime" not in one.columns or "symbol" not in one.columns:
+            return pd.DataFrame()
+        one["datetime"] = pd.to_datetime(one["datetime"], errors="coerce")
+        one = one.dropna(subset=["datetime", "symbol"])
+        if one.empty:
+            return pd.DataFrame()
+        # 必須OHLCの補完。PUSH由来はclose/priceだけのことがある。
+        if "close" not in one.columns and "price" in one.columns:
+            one["close"] = one["price"]
+        for col in ("open", "high", "low"):
+            if col not in one.columns:
+                one[col] = one.get("close")
+        if "close" not in one.columns:
+            return pd.DataFrame()
+        vol_col = "volume" if "volume" in one.columns else ("vol" if "vol" in one.columns else None)
+        if vol_col is None:
+            one["volume"] = 0.0
+            vol_col = "volume"
+        for col in ("open", "high", "low", "close", vol_col):
+            one[col] = pd.to_numeric(one[col], errors="coerce")
+        one = one.dropna(subset=["close"])
+        if one.empty:
+            return pd.DataFrame()
+
+        frames = []
+        rule = f"{interval_i}min"
+        agg = {
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            vol_col: "sum",
+        }
+        optional_last = [
+            "symbolname", "name", "market", "exchange", "source",
+            "price", "vwap", "ma5", "ma25", "ma75",
+        ]
+        for col in optional_last:
+            if col in one.columns and col not in agg:
+                agg[col] = "last"
+
+        for sym, g in one.sort_values("datetime", kind="stable").groupby("symbol", sort=False):
+            g = g.drop_duplicates(subset=["datetime"], keep="last").set_index("datetime")
+            if g.empty:
+                continue
+            r = g.resample(rule, label="right", closed="right").agg(agg).dropna(subset=["close"])
+            if r.empty:
+                continue
+            r["symbol"] = str(sym)
+            r = r.reset_index()
+            if vol_col != "volume" and vol_col in r.columns and "volume" not in r.columns:
+                r["volume"] = r[vol_col]
+            frames.append(r)
+        if not frames:
+            return pd.DataFrame()
+        hist = pd.concat(frames, ignore_index=True, sort=False)
+        hist = _normalize_summary_df(hist, interval=interval_i)
+        if hist.empty:
+            return pd.DataFrame()
+
+        try:
+            from trading.summary.pipeline.indicator_pipeline import run_indicator_pipeline
+            hist = run_indicator_pipeline(hist.copy(), interval_i)
+            hist = _normalize_summary_df(hist, interval=interval_i)
+        except Exception:
+            logger.debug("[SUMMARY MTF DIFF 1M PATCH] cached mtf indicator failed interval=%s", interval_i, exc_info=True)
+        try:
+            from trading.scoring.core.scoring_pipeline import run_scoring_pipeline
+            hist = run_scoring_pipeline(hist.copy(), interval=f"{interval_i}min")
+            hist = _normalize_summary_df(hist, interval=interval_i)
+        except Exception:
+            logger.debug("[SUMMARY MTF DIFF 1M PATCH] cached mtf scoring failed interval=%s", interval_i, exc_info=True)
+
+        hist = _ensure_basic_score_columns(hist)
+        latest = hist.sort_values(["symbol", "datetime"], kind="stable").groupby("symbol", as_index=False).tail(1)
+        _publish_to_global(interval_i, hist, latest)
+        logger.warning(
+            "[SUMMARY MTF DIFF 1M PATCH] main.py cached 1m -> %sm fallback published hist_rows=%s latest_rows=%s symbols=%s latest_dt=%s",
+            interval_i,
+            _safe_len(hist),
+            _safe_len(latest),
+            int(latest["symbol"].nunique()) if "symbol" in latest.columns else 0,
+            hist["datetime"].max() if "datetime" in hist.columns else None,
+        )
+        return latest.reset_index(drop=True)
+    except Exception:
+        logger.exception("[SUMMARY MTF DIFF 1M PATCH] cached 1m -> mtf fallback failed interval=%s", interval_i)
+        return pd.DataFrame()
+
+
 def _run_diff_from_1m(interval: int) -> pd.DataFrame:
     if int(interval) not in (3, 5):
         return pd.DataFrame()
@@ -190,8 +369,12 @@ def _run_diff_from_1m(interval: int) -> pd.DataFrame:
         return pd.DataFrame()
     if _main_should_skip_nas_diff_update(int(interval)):
         cached = _cached_latest_from_global(int(interval))
-        _log_main_skip(int(interval), _safe_len(cached))
-        return cached
+        if not cached.empty:
+            _log_main_skip(int(interval), _safe_len(cached))
+            return cached
+        fallback = _resample_cached_1m_to_mtf(int(interval))
+        _log_main_skip(int(interval), _safe_len(fallback))
+        return fallback
 
     try:
         from trading.summary.pipeline.incremental_mtf_from_1min import (
@@ -268,8 +451,6 @@ def _invoke_original_diff_update(self, interval_i: int, *args, **kwargs):
     if kwargs:
         logger.debug("[SUMMARY MTF DIFF 1M PATCH] ignored original kwargs interval=%s keys=%s", interval_i, sorted(kwargs.keys()))
 
-    # 現行 SummaryController.diff_update は self, interval のみ。
-    # 将来kwargs対応になった場合だけ、受け取れるkwargsを限定して渡す。
     try:
         sig = inspect.signature(orig)
         params = sig.parameters
@@ -287,6 +468,8 @@ def _invoke_original_diff_update(self, interval_i: int, *args, **kwargs):
 def _call_original_diff_update(self, interval_i: int, *args, **kwargs):
     if _main_should_skip_nas_diff_update(int(interval_i)):
         cached = _cached_latest_from_global(int(interval_i))
+        if cached.empty and int(interval_i) in (3, 5):
+            cached = _resample_cached_1m_to_mtf(int(interval_i))
         _log_main_skip(int(interval_i), _safe_len(cached))
         return cached
     return _invoke_original_diff_update(self, interval_i, *args, **kwargs)
@@ -305,8 +488,6 @@ def _patched_diff_update(self, interval: int, *args, **kwargs):
         if isinstance(precomputed_latest, pd.DataFrame) and not precomputed_latest.empty:
             return precomputed_latest
 
-        # V1.3 safety: interval=1 must not be killed by an empty cache. If any older wrapper or
-        # transient cache returned empty, try the original once more directly so PUSH fallback can run.
         if interval_i == 1:
             try:
                 direct = _invoke_original_diff_update(self, interval_i, *args, **kwargs)
@@ -344,12 +525,12 @@ def install() -> bool:
         if not callable(cur):
             logger.warning("[SUMMARY MTF DIFF 1M PATCH] diff_update unavailable")
             return False
-        if getattr(cur, "_summary_mtf_diff_from_1m_v13", False):
+        if getattr(cur, "_summary_mtf_diff_from_1m_v14", False):
             _INSTALLED = True
             return True
 
-        # v1/v1.1/v1.2 wrapper が既に入っている場合は、そのoriginalを拾って二重kwargs不具合を回避する。
         _ORIG_DIFF_UPDATE = getattr(cur, "_original", cur)
+        _patched_diff_update._summary_mtf_diff_from_1m_v14 = True  # type: ignore[attr-defined]
         _patched_diff_update._summary_mtf_diff_from_1m_v13 = True  # type: ignore[attr-defined]
         _patched_diff_update._summary_mtf_diff_from_1m_v12 = True  # type: ignore[attr-defined]
         _patched_diff_update._original = _ORIG_DIFF_UPDATE  # type: ignore[attr-defined]
@@ -362,7 +543,7 @@ def install() -> bool:
             pass
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY MTF DIFF 1M PATCH] installed v1.3 enabled=True history_rows=%s allow_partial=%s main_nas_skip=%s interval1_skip=%s",
+            "[SUMMARY MTF DIFF 1M PATCH] installed v1.4 enabled=True cached_1m_mtf_fallback=True history_rows=%s allow_partial=%s main_nas_skip=%s interval1_skip=%s",
             os.getenv("SUMMARY_MTF_DIFF_HISTORY_ROWS", "74"),
             os.getenv("SUMMARY_MTF_DIFF_ALLOW_PARTIAL_BAR", "0"),
             _main_should_skip_nas_diff_update(3),
