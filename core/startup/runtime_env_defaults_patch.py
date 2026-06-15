@@ -20,7 +20,7 @@ from .runtime_settings_ini_loader import VERSION as SETTINGS_INI_VERSION
 from .runtime_settings_ini_loader import load_settings_ini
 
 logger = logging.getLogger(__name__)
-VERSION = "REV8-RUNTIME-ENV-DEFAULTS-PATCH-PUSH-REGISTER-RECOVERY"
+VERSION = "REV9-RUNTIME-ENV-DEFAULTS-PATCH-DAY-POSITION-GUARD"
 _INSTALLED = False
 
 
@@ -112,6 +112,22 @@ def _install_push_registration_recovery(context: str) -> bool:
         return False
 
 
+def _install_common_day_position_guard(context: str) -> bool:
+    """Install common intraday position veto for TONOSAMA/RANKING/SUMMARY pending entries."""
+    try:
+        if context not in {"main", "helper"}:
+            return False
+        if os.environ.get("DISABLE_COMMON_ENTRY_DAY_POSITION_GUARD", "").strip() == "1":
+            logger.warning("[RUNTIME ENV DEFAULTS PATCH] common day position guard disabled by env")
+            return False
+        from . import common_entry_day_position_guard_patch
+
+        return bool(common_entry_day_position_guard_patch.install())
+    except Exception:
+        logger.exception("[RUNTIME ENV DEFAULTS PATCH] common day position guard install failed")
+        return False
+
+
 def install() -> bool:
     """Apply centralized defaults once.
 
@@ -122,6 +138,7 @@ def install() -> bool:
     4. Trading-process runtime rescue patches may add safe fail-open defaults.
     5. Final risk veto patches such as low-volatility guard remain fail-closed.
     6. PUSH register recovery keeps main_database.py registration healthy.
+    7. Common day-position guard blocks late SELL/BUY extremes across entry sources.
     """
     global _INSTALLED
     if _INSTALLED:
@@ -137,11 +154,12 @@ def install() -> bool:
         ranking_entry_rescue_ok = _install_ranking_entry_runtime_rescue(context)
         low_vol_guard_ok = _install_low_volatility_entry_guard(context)
         push_register_recovery_ok = _install_push_registration_recovery(context)
+        day_position_guard_ok = _install_common_day_position_guard(context)
 
         _INSTALLED = True
         if env_bool("RUNTIME_ENV_DEFAULTS_VERBOSE", False):
             logger.warning(
-                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s",
+                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s",
                 VERSION,
                 DEFAULTS_VERSION,
                 REGISTRY_VERSION,
@@ -155,10 +173,11 @@ def install() -> bool:
                 ranking_entry_rescue_ok,
                 low_vol_guard_ok,
                 push_register_recovery_ok,
+                day_position_guard_ok,
             )
         else:
             logger.warning(
-                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s",
+                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s",
                 VERSION,
                 DEFAULTS_VERSION,
                 REGISTRY_VERSION,
@@ -173,6 +192,7 @@ def install() -> bool:
                 ranking_entry_rescue_ok,
                 low_vol_guard_ok,
                 push_register_recovery_ok,
+                day_position_guard_ok,
             )
         return True
     except Exception:
