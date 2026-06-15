@@ -2,15 +2,10 @@
 """
 Active symbol getter patch.
 
-Problem seen in logs:
-  update_active_symbols() builds 100 premarket SBI symbols with
-  ACTIVE_PREMARKET_ALLOW_NO_PRICE=1, but later get_active_symbols() is called
-  outside the premarket time window and re-runs final_guard_min_price with
-  premarket_mode=False. Because those SBI symbols often still have no price in
-  the local liquidity map, the getter shrinks 100 -> 0 and PUSH cannot resolve
-  monitor/register symbols.
-
-This patch preserves the source mode that produced the current active list.
+Premarket SBI symbols are useful only before the market opens.  During market
+hours, even if the last active list was created from the premarket SBI source,
+getters must re-guard/rebuild against the normal ranking-derived universe so
+PUSH rotation follows live ranking activity.
 """
 from __future__ import annotations
 
@@ -52,6 +47,8 @@ def install() -> bool:
         from trading.ranking.active_symbols.normalize import dedupe_keep_order
         from trading.ranking.active_symbols.protected import get_protected_symbols
         from trading.ranking.active_symbols.ranking_source import build_liquidity_map
+        from trading.ranking.active_symbols.premarket_source import is_premarket_time
+        from trading.ranking.active_symbols.normalize import now as now_dt
     except Exception:
         logger.exception("[ACTIVE GETTER PREMARKET PATCH] import failed")
         return False
@@ -70,24 +67,33 @@ def install() -> bool:
             return []
 
         try:
+            current_is_premarket = bool(is_premarket_time(now_dt()))
             source_premarket = bool(get_global_attr("active_symbol_premarket_mode", False))
             preserve_premarket = _env_bool("ACTIVE_GETTER_PRESERVE_PREMARKET_MODE", True)
             skip_guard_when_premarket = _env_bool("ACTIVE_GETTER_SKIP_PRICE_GUARD_FOR_PREMARKET", True)
+            allow_intraday_sbi = _env_bool("ACTIVE_ALLOW_INTRADAY_PREMARKET_FALLBACK", False)
 
-            if source_premarket and preserve_premarket and skip_guard_when_premarket:
-                # The list was already guarded in premarket mode. Do not re-run
-                # a stricter non-premarket guard from passive getters.
+            if (
+                current_is_premarket
+                and source_premarket
+                and preserve_premarket
+                and skip_guard_when_premarket
+            ):
+                # 寄前時間中だけ、寄前SBI由来リストを再ガードせず保持する。
                 logger.info(
-                    "[ACTIVE GETTER PREMARKET PATCH] keep symbols without non-premarket re-guard count=%d head=%s",
+                    "[ACTIVE GETTER PREMARKET PATCH] keep premarket symbols before open count=%d head=%s",
                     len(symbols),
                     symbols[:20],
                 )
                 return symbols[: getattr(mgr, "MAX_ACTIVE_SYMBOLS", 100)]
 
-            from trading.ranking.active_symbols.premarket_source import is_premarket_time
-            from trading.ranking.active_symbols.normalize import now as now_dt
+            if source_premarket and not current_is_premarket and not allow_intraday_sbi:
+                logger.info(
+                    "[ACTIVE GETTER PREMARKET PATCH] market-hours ranking mode: re-guard former premarket symbols count=%d",
+                    len(symbols),
+                )
 
-            premarket_mode = bool(source_premarket and preserve_premarket) or bool(is_premarket_time(now_dt()))
+            premarket_mode = bool(current_is_premarket and source_premarket and preserve_premarket)
             symbols = final_guard_min_price(
                 symbols,
                 protected=get_protected_symbols(),
@@ -116,7 +122,7 @@ def install() -> bool:
     mgr.get_rotation_symbols = lambda *a, **k: _patched_get_active_symbols()[: getattr(mgr, "MAX_ACTIVE_SYMBOLS", 100)]
 
     _INSTALLED = True
-    logger.warning("[ACTIVE GETTER PREMARKET PATCH] installed preserve_premarket_mode=True")
+    logger.warning("[ACTIVE GETTER PREMARKET PATCH] installed premarket_only_before_open=True")
     return True
 
 
