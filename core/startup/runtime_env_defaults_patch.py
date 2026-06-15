@@ -20,7 +20,7 @@ from .runtime_settings_ini_loader import VERSION as SETTINGS_INI_VERSION
 from .runtime_settings_ini_loader import load_settings_ini
 
 logger = logging.getLogger(__name__)
-VERSION = "REV5-RUNTIME-ENV-DEFAULTS-PATCH-RANKING-ENTRY-RESCUE"
+VERSION = "REV6-RUNTIME-ENV-DEFAULTS-PATCH-LOW-VOL-GUARD"
 _INSTALLED = False
 
 
@@ -70,6 +70,22 @@ def _install_ranking_entry_runtime_rescue(context: str) -> bool:
         return False
 
 
+def _install_low_volatility_entry_guard(context: str) -> bool:
+    """Install final low-volatility veto for trading entry processes."""
+    try:
+        if context not in {"main", "helper"}:
+            return False
+        if os.environ.get("DISABLE_LOW_VOLATILITY_ENTRY_GUARD", "").strip() == "1":
+            logger.warning("[RUNTIME ENV DEFAULTS PATCH] low volatility entry guard disabled by env")
+            return False
+        from . import low_volatility_entry_guard_patch
+
+        return bool(low_volatility_entry_guard_patch.install())
+    except Exception:
+        logger.exception("[RUNTIME ENV DEFAULTS PATCH] low volatility entry guard install failed")
+        return False
+
+
 def install() -> bool:
     """Apply centralized defaults once.
 
@@ -78,6 +94,7 @@ def install() -> bool:
     2. Optional settings.ini fills missing values when present.
     3. Built-in centralized defaults fill the remaining missing values.
     4. Trading-process runtime rescue patches may add safe fail-open defaults.
+    5. Final risk veto patches such as low-volatility guard remain fail-closed.
     """
     global _INSTALLED
     if _INSTALLED:
@@ -91,11 +108,12 @@ def install() -> bool:
         applied.update(apply_user_defaults(context=context))
         entry_fire_rescue_ok = _install_entry_fire_rescue(context)
         ranking_entry_rescue_ok = _install_ranking_entry_runtime_rescue(context)
+        low_vol_guard_ok = _install_low_volatility_entry_guard(context)
 
         _INSTALLED = True
         if env_bool("RUNTIME_ENV_DEFAULTS_VERBOSE", False):
             logger.warning(
-                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s entry_fire_rescue=%s ranking_entry_rescue=%s",
+                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s",
                 VERSION,
                 DEFAULTS_VERSION,
                 REGISTRY_VERSION,
@@ -107,10 +125,11 @@ def install() -> bool:
                 ",".join(USER_GROUP_ORDER),
                 entry_fire_rescue_ok,
                 ranking_entry_rescue_ok,
+                low_vol_guard_ok,
             )
         else:
             logger.warning(
-                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_fire_rescue=%s ranking_entry_rescue=%s",
+                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s",
                 VERSION,
                 DEFAULTS_VERSION,
                 REGISTRY_VERSION,
@@ -123,6 +142,7 @@ def install() -> bool:
                 os.environ.get("USERCUSTOMIZE_ENABLE_TONOSAMA_RESCUE_PATCHES"),
                 entry_fire_rescue_ok,
                 ranking_entry_rescue_ok,
+                low_vol_guard_ok,
             )
         return True
     except Exception:
