@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/summary_no_overlap_runtime_patch.py
-# Version: Ver01-SUMMARY-NO-OVERLAP-GUARD
+# Version: Ver02-SUMMARY-NO-OVERLAP-GUARD-STALE-INFLIGHT-CLEAR
 # ------------------------------------------------------------
 # Purpose:
 #   summary parent tick / unified runner が前回処理を残したまま
@@ -10,6 +10,7 @@
 #   ログ例:
 #     [SUMMARY PARALLEL] tick timeout ... timeout=55.0s done=0 total=1
 #     fallback_state={'running': True, 'reason': 'previous_unified_bg_still_running'}
+#     [summary_controller] duplicate diff_update skipped ... holder_held=109s
 #
 #   この状態で次tickを開始すると、DB読み書き・summary計算・AI候補生成が
 #   重なり、3分/5分サマリー空、tonosama timeout、entry遅延につながる。
@@ -18,11 +19,13 @@
 #   - scheduler_jobs.summary.time_locked_runner / runners / scheduler の
 #     run_time_locked_summary_jobs をまとめてラップする。
 #   - 前回summaryがまだ実行中なら即returnし、次tickへ重ねない。
+#   - 古い summary_controller._SUMMARY_INFLIGHT ロックは自動解除する。
 #   - デフォルトで summary parallel の負荷も下げる。
 #
 # ENV:
 #   SUMMARY_NO_OVERLAP_ENABLED=1
 #   SUMMARY_NO_OVERLAP_MAX_SEC=70
+#   SUMMARY_CONTROLLER_INFLIGHT_STALE_CLEAR_SEC=45
 #   SUMMARY_PARALLEL_INTERVAL_WORKERS=1       # 未設定時のみ
 #   SUMMARY_PARALLEL_RANKING_ENABLED=0        # 未設定時のみ
 #   SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC=25  # 未設定時のみ
@@ -30,6 +33,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import os
 import threading
@@ -79,11 +83,75 @@ def _set_default_env() -> None:
         "SUMMARY_PARALLEL_RANKING_ENABLED": "0",
         "SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC": "25",
         "SUMMARY_PARALLEL_SKIP_IF_ANY_RUNNING": "1",
+        "SUMMARY_CONTROLLER_INFLIGHT_STALE_CLEAR_SEC": "45",
     }
     for k, v in defaults.items():
         if os.getenv(k) is None or str(os.getenv(k)).strip() == "":
             os.environ[k] = v
             logger.warning("[SUMMARY NO OVERLAP] default env set %s=%s", k, v)
+
+
+def _patch_summary_controller_inflight_stale_clear() -> bool:
+    """Clear stale per-interval diff_update inflight locks left by timed-out worker threads."""
+    try:
+        import trading.summary.summary_controller as sc
+
+        old_enter = getattr(sc, "_enter_interval", None)
+        if not callable(old_enter):
+            logger.warning("[SUMMARY NO OVERLAP] summary_controller._enter_interval missing")
+            return False
+        if getattr(old_enter, "_summary_inflight_stale_clear_v2", False):
+            return True
+
+        guard = getattr(sc, "_SUMMARY_INFLIGHT_GUARD", None)
+        inflight = getattr(sc, "_SUMMARY_INFLIGHT", None)
+        if guard is None or not isinstance(inflight, dict):
+            logger.warning("[SUMMARY NO OVERLAP] summary_controller inflight state missing")
+            return False
+
+        def _patched_enter_interval(interval: int) -> bool:
+            try:
+                interval_i = int(interval)
+            except Exception:
+                interval_i = interval
+            stale_sec = _env_float("SUMMARY_CONTROLLER_INFLIGHT_STALE_CLEAR_SEC", 45.0)
+            try:
+                now = dt.datetime.now()
+                with guard:
+                    meta = inflight.get(interval_i)
+                    if meta and bool(meta.get("running", False)):
+                        started_at = meta.get("started_at")
+                        held_sec = 0.0
+                        try:
+                            if isinstance(started_at, dt.datetime):
+                                held_sec = max(0.0, (now - started_at).total_seconds())
+                        except Exception:
+                            held_sec = 0.0
+                        if held_sec >= stale_sec:
+                            logger.error(
+                                "[SUMMARY NO OVERLAP][INFLIGHT STALE CLEAR] interval=%s held=%.3fs stale_sec=%.1f holder_tid=%s holder_thread=%s -> clear stale running flag",
+                                interval_i,
+                                held_sec,
+                                stale_sec,
+                                meta.get("tid"),
+                                meta.get("thread"),
+                            )
+                            inflight[interval_i] = {"running": False, "started_at": None, "tid": None, "thread": None}
+            except Exception:
+                logger.exception("[SUMMARY NO OVERLAP][INFLIGHT STALE CLEAR] pre-clear failed interval=%s", interval)
+            return old_enter(interval)
+
+        _patched_enter_interval._summary_inflight_stale_clear_v2 = True  # type: ignore[attr-defined]
+        _patched_enter_interval._original = old_enter  # type: ignore[attr-defined]
+        sc._enter_interval = _patched_enter_interval
+        logger.warning(
+            "[SUMMARY NO OVERLAP] summary_controller inflight stale clear installed stale_sec=%.1f",
+            _env_float("SUMMARY_CONTROLLER_INFLIGHT_STALE_CLEAR_SEC", 45.0),
+        )
+        return True
+    except Exception:
+        logger.exception("[SUMMARY NO OVERLAP] summary_controller inflight stale clear install failed")
+        return False
 
 
 def _make_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
@@ -146,11 +214,13 @@ def _make_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
 def install() -> bool:
     global _INSTALLED, _ORIGINAL
     if _INSTALLED:
+        _patch_summary_controller_inflight_stale_clear()
         logger.warning("[SUMMARY NO OVERLAP] already installed")
         return True
 
     try:
         _set_default_env()
+        _patch_summary_controller_inflight_stale_clear()
 
         # 先に parallel patch があるなら読み込ませる。無ければ無視。
         try:
@@ -181,12 +251,13 @@ def install() -> bool:
 
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY NO OVERLAP] installed enabled=%s max_sec=%.1f workers=%s ranking_parallel=%s timeout=%s",
+            "[SUMMARY NO OVERLAP] installed enabled=%s max_sec=%.1f workers=%s ranking_parallel=%s timeout=%s inflight_stale_sec=%.1f",
             _env_bool("SUMMARY_NO_OVERLAP_ENABLED", True),
             _env_float("SUMMARY_NO_OVERLAP_MAX_SEC", 70.0),
             os.getenv("SUMMARY_PARALLEL_INTERVAL_WORKERS"),
             os.getenv("SUMMARY_PARALLEL_RANKING_ENABLED"),
             os.getenv("SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC"),
+            _env_float("SUMMARY_CONTROLLER_INFLIGHT_STALE_CLEAR_SEC", 45.0),
         )
         return True
     except Exception:
