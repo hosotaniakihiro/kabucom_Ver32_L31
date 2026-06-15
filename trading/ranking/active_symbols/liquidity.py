@@ -1,24 +1,18 @@
 # ============================================================
 # File   : trading/ranking/active_symbols/liquidity.py
-# Version: Ver1.5-FAST-STARTUP-SKIP-SUMMARY-PRICE-FALLBACK
+# Version: Ver1.6-FIX-SUMMARY-PRICE-SQL-STRICT-MISSING-PRICE
 # ------------------------------------------------------------
 # Purpose:
 #   - PUSH登録候補の流動性/価格フィルタ
 #   - 低位株や極端に流動性が低い銘柄を除外する
 #   - 監視銘柄を価格条件内に制限する
 #
-# Ver1.5:
-#   - main.py 起動時に止まって見える原因だった summary DB 価格補完を
-#     既定でスキップ可能にする。
-#   - ACTIVE_SUMMARY_PRICE_FALLBACK_ENABLED=0 で完全無効。
-#   - ACTIVE_SUMMARY_PRICE_FALLBACK_RUN_IN_MAIN=1 のときだけ main.py でも実行。
-#   - 1銘柄ずつSELECTする方式をやめ、IN句の一括取得に変更。
-#   - timeout/busy_timeoutを短縮可能にする。
-#
-# Ver1.4:
-#   - liquidity_map に価格が無い場合、summaryYYYYMMDD.db の
-#     stock_summary_1min/3min/5min から直近 close/current_price を取得して
-#     価格ガードへ利用する。
+# Ver1.6:
+#   - summary DB 価格補完SQLの閉じ括弧不足で
+#     "incomplete input" になっていた不具合を修正。
+#   - 価格補完ができなかった銘柄を既定で除外する。
+#     ただし寄前SBIで価格がまだ取れない場合のみ、envで緩和可能。
+#   - ACTIVE_FINAL_PRICE_GUARD_ALLOW_UNKNOWN_PRICE=1 で従来のfail-openへ戻せる。
 # ============================================================
 
 from __future__ import annotations
@@ -52,7 +46,12 @@ def _env_bool(name: str, default: bool = True) -> bool:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
             return bool(default)
-        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
+            return False
+        return bool(default)
     except Exception:
         return bool(default)
 
@@ -158,11 +157,12 @@ def _summary_price_fallback_map(symbols: Iterable[str]) -> Dict[str, Dict[str, f
                 if "symbol" not in cols:
                     continue
 
-                dt_expr = None
                 if "datetime" in cols:
                     dt_expr = _qident("datetime")
+                    dt_expr_t2 = f"t2.{_qident('datetime')}"
                 elif "date" in cols and "time" in cols:
                     dt_expr = f"({_qident('date')} || ' ' || {_qident('time')})"
+                    dt_expr_t2 = f"(t2.{_qident('date')} || ' ' || t2.{_qident('time')})"
                 else:
                     continue
 
@@ -178,17 +178,21 @@ def _summary_price_fallback_map(symbols: Iterable[str]) -> Dict[str, Dict[str, f
                 if not remain:
                     break
                 placeholders = ",".join(["?"] * len(remain))
+                table_q = _qident(table)
+                symbol_q = _qident("symbol")
                 # symbolごとの最新行を1回のSQLで取得する。
+                # Ver1.6: 旧SQLはサブクエリの閉じ括弧が無く "incomplete input" になっていた。
                 sql = f"""
-                    SELECT CAST({_qident('symbol')} AS TEXT) AS symbol,
+                    SELECT CAST({symbol_q} AS TEXT) AS symbol,
                            {_qident(price_col)} AS price,
                            {dt_expr} AS dtv
-                    FROM {_qident(table)}
-                    WHERE CAST({_qident('symbol')} AS TEXT) IN ({placeholders})
+                    FROM {table_q}
+                    WHERE CAST({symbol_q} AS TEXT) IN ({placeholders})
                       AND {dt_expr} = (
-                          SELECT MAX({dt_expr})
-                          FROM {_qident(table)} t2
-                          WHERE CAST(t2.{_qident('symbol')} AS TEXT) = CAST({_qident(table)}.{_qident('symbol')} AS TEXT)
+                          SELECT MAX({dt_expr_t2})
+                          FROM {table_q} t2
+                          WHERE CAST(t2.{symbol_q} AS TEXT) = CAST({table_q}.{symbol_q} AS TEXT)
+                      )
                 """
                 try:
                     rows = conn.execute(sql, remain).fetchall()
@@ -391,6 +395,16 @@ def filter_liquid_symbols(
     return kept
 
 
+def _allow_unknown_price(*, premarket_mode: bool) -> bool:
+    # 旧挙動へ戻したい場合の逃げ道。
+    if _env_bool("ACTIVE_FINAL_PRICE_GUARD_ALLOW_UNKNOWN_PRICE", False):
+        return True
+    # 寄前SBIはCSVに価格列が無い場合があるため、必要なら明示的に許可できる。
+    if premarket_mode and _env_bool("ACTIVE_PREMARKET_ALLOW_NO_PRICE", False):
+        return True
+    return False
+
+
 def final_guard_min_price(
     symbols: Iterable[str],
     *,
@@ -407,15 +421,15 @@ def final_guard_min_price(
     liquidity_map = liquidity_map or {}
 
     logger.warning(
-        "[ACTIVE FINAL PRICE GUARD] start symbols=%d premarket=%s fallback_enabled=%s run_in_main=%s",
+        "[ACTIVE FINAL PRICE GUARD] start symbols=%d premarket=%s fallback_enabled=%s run_in_main=%s allow_unknown_price=%s",
         len(items),
         premarket_mode,
         _summary_price_fallback_enabled(),
         os.getenv("ACTIVE_SUMMARY_PRICE_FALLBACK_RUN_IN_MAIN"),
+        _allow_unknown_price(premarket_mode=premarket_mode),
     )
 
     # 価格情報が無い候補は summary DB から直近価格を補完する。
-    # main.pyでは既定スキップ。価格不明銘柄はfail-openで残す。
     missing_price_symbols = []
     for s in items:
         sym = normalize_symbol(s)
@@ -433,8 +447,10 @@ def final_guard_min_price(
 
     kept: List[str] = []
     removed: List[str] = []
-    missing_info: List[str] = []
+    missing_info_kept: List[str] = []
+    missing_info_removed: List[str] = []
     price_guarded: List[str] = []
+    allow_unknown = _allow_unknown_price(premarket_mode=premarket_mode)
 
     for s in items:
         sym = normalize_symbol(s)
@@ -448,12 +464,21 @@ def final_guard_min_price(
         info = liquidity_map.get(sym)
 
         if not _has_usable_liquidity_info(info):
-            kept.append(sym)
-            missing_info.append(sym)
+            if allow_unknown:
+                kept.append(sym)
+                missing_info_kept.append(sym)
+            else:
+                removed.append(sym)
+                missing_info_removed.append(sym)
             continue
 
         assert info is not None
         price = _get_price(info)
+        if price <= 0 and not allow_unknown:
+            removed.append(sym)
+            missing_info_removed.append(sym)
+            continue
+
         if price > 0:
             price_guarded.append(sym)
             if not _price_ok(price):
@@ -470,24 +495,27 @@ def final_guard_min_price(
         else:
             removed.append(sym)
 
-    if removed or missing_info or premarket_mode:
+    if removed or missing_info_kept or missing_info_removed or premarket_mode:
         logger.warning(
-            "[ACTIVE FINAL PRICE GUARD] before=%d after=%d removed=%d missing_info_kept=%d "
-            "premarket=%s price_guarded=%d min_price=%.1f max_price=%.1f removed_head=%s missing_info_head=%s",
+            "[ACTIVE FINAL PRICE GUARD] before=%d after=%d removed=%d missing_info_kept=%d missing_info_removed=%d "
+            "premarket=%s allow_unknown_price=%s price_guarded=%d min_price=%.1f max_price=%.1f removed_head=%s missing_kept_head=%s missing_removed_head=%s",
             len(items),
             len(kept),
             len(removed),
-            len(missing_info),
+            len(missing_info_kept),
+            len(missing_info_removed),
             premarket_mode,
+            allow_unknown,
             len(price_guarded),
             MIN_PRICE,
             MAX_PRICE,
             removed[:30],
-            missing_info[:30],
+            missing_info_kept[:30],
+            missing_info_removed[:30],
         )
     else:
         logger.info(
-            "[ACTIVE FINAL PRICE GUARD] before=%d after=%d removed=0 missing_info_kept=0 premarket=%s price_guarded=%d min_price=%.1f max_price=%.1f",
+            "[ACTIVE FINAL PRICE GUARD] before=%d after=%d removed=0 missing_info_kept=0 missing_info_removed=0 premarket=%s price_guarded=%d min_price=%.1f max_price=%.1f",
             len(items),
             len(kept),
             premarket_mode,
