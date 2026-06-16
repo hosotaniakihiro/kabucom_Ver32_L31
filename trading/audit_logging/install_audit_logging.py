@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/audit_logging/install_audit_logging.py
-# Version: Ver01-AUDIT-LOGGING-INSTALLER
+# Version: Ver02-AUDIT-LOGGING-INSTALLER-FULL-TRADE-LINKS
 # ------------------------------------------------------------
 # バックテスト/監査ログ用パッチを起動時にまとめて有効化する。
 # main.py / main_database.py / startup_orchestrator.py などから
@@ -22,6 +22,8 @@ def install_audit_logging() -> bool:
 
     有効化対象:
       - audit DB schema 作成
+      - audit DB full-link拡張(entry_id/reason/snapshot)
+      - positions.db reason/snapshot schema補完
       - entry_controller ENTRY_SKIP / AI_OK / ORDER結果 保存
       - buy_sell_entry _send_order 保存
 
@@ -46,6 +48,22 @@ def install_audit_logging() -> bool:
         ok_all = False
 
     try:
+        from core.startup.position_trade_reason_schema_patch import install as install_position_reason_schema
+        if not install_position_reason_schema():
+            ok_all = False
+    except Exception:
+        logger.exception('[AUDIT INSTALL] position reason schema patch failed')
+        ok_all = False
+
+    try:
+        from core.startup.audit_full_trade_link_patch import install as install_audit_full_link
+        if not install_audit_full_link():
+            ok_all = False
+    except Exception:
+        logger.exception('[AUDIT INSTALL] audit full trade link patch failed')
+        ok_all = False
+
+    try:
         from trading.audit_logging.entry_controller_audit_patch import install as install_entry_controller_patch
         if not install_entry_controller_patch():
             ok_all = False
@@ -64,9 +82,9 @@ def install_audit_logging() -> bool:
     _INSTALLED = True
 
     if ok_all:
-        logger.warning('[AUDIT INSTALL] audit logging installed successfully')
+        logger.warning('[AUDIT INSTALL] audit logging installed successfully full_trade_links=True')
     else:
-        logger.warning('[AUDIT INSTALL] audit logging installed with some failures')
+        logger.warning('[AUDIT INSTALL] audit logging installed with some failures full_trade_links=True')
 
     return ok_all
 
