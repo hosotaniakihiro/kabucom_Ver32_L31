@@ -1,10 +1,12 @@
 # ============================================================
 # File   : trading/audit_logging/entry_audit.py
-# Version: Ver02-ENTRY-AUDIT-TECHNICAL-SNAPSHOT
+# Version: Ver03-ENTRY-AUDIT-FULL-LINKS
 # ------------------------------------------------------------
 # Helper functions for writing entry pipeline audit records.
 # These wrappers are intentionally safe: audit failure must not stop trading.
 # ============================================================
+
+from __future__ import annotations
 
 import json
 from datetime import datetime
@@ -21,9 +23,13 @@ _TECH_KEYS = (
     # identity / source
     'symbol', 'symbolname', 'datetime', 'dt', 'source', 'entry_source', 'trigger_type',
     'interval', 'interval_min', 'tf', 'timeframe', 'direction', 'side',
+    # ranking identity
+    'rank_type', 'ranking_type', 'rank', 'rank_position', 'ranking_rank', 'ranking_snapshot_time',
+    'snapshot_time', 'rank_type_id', 'market', 'category', 'categoryname',
     # prices / candles
     'open', 'high', 'low', 'close', 'price', 'current_price', 'close_price',
     'volume', 'turnover', 'turnover_yen', 'trading_value', 'vwap',
+    'change_rate', 'change_percentage', 'price_delta_1m', 'volume_delta_1m', 'volume_speed',
     # scoring
     'score', 'score_buy', 'score_sell', 'score_total', 'final_score', 'display_score',
     'score_slope', 'score_mtf', 'score_momentum', 'score_volume', 'score_liquidity',
@@ -47,7 +53,7 @@ _TECH_KEYS = (
     'signal_5m', 'hist_5m', 'atr_5m', 'slope_5m', 'slope_atr_scaled_5m',
     'vwap_5m', 'volume_5m', 'turnover_5m', 'range_pct_5m',
     # guard / explanation fields often attached by pipelines
-    'guard_reason', 'skip_reason', 'reason', 'entry_reason', 'ai_reason',
+    'guard_reason', 'skip_reason', 'reason', 'entry_reason', 'ai_reason', 'reason_code',
     'liquidity_ok', 'volume_sum', 'avg_volume', 'latest_volume', 'latest_dt',
 )
 
@@ -95,12 +101,12 @@ def _safe_jsonable(v: Any) -> Any:
             return None
 
 
-def _safe_text(v: Any, max_len: int = 2000) -> str:
+def _safe_text(v: Any, max_len: int = 20000) -> str:
     try:
         if isinstance(v, str):
             s = v
         else:
-            s = json.dumps(_safe_jsonable(v), ensure_ascii=False, default=str)
+            s = json.dumps(_safe_jsonable(v), ensure_ascii=False, default=str, separators=(',', ':'))
     except Exception:
         s = str(v)
     return s[:max_len]
@@ -117,13 +123,41 @@ def _row_get(row: Any, key: str, default: Any = None) -> Any:
         return default
 
 
-def _build_technical_snapshot(entry_row: Any, ai: Any, ai_msg: str, side: str) -> str:
-    """Return compact JSON snapshot of summary/ranking entry indicators.
+def _norm_symbol(v: Any) -> str:
+    try:
+        s = str(v or '').strip()
+        if s.endswith('.0'):
+            s = s[:-2]
+        return s
+    except Exception:
+        return ''
 
-    The entry pipelines pass a row-like object with many columns. We keep all
-    known technical/MTF/scoring columns and also group detected *_1m/*_3m/*_5m
-    values, so later analysis can answer: why did SUMMARY enter here?
-    """
+
+def _source_from_row(entry_row: Any) -> str:
+    return str(_row_get(entry_row, 'source') or _row_get(entry_row, 'entry_source') or '').upper()
+
+
+def _ranking_type(entry_row: Any) -> str:
+    return str(_row_get(entry_row, 'ranking_type') or _row_get(entry_row, 'rank_type') or _row_get(entry_row, 'categoryname') or '')
+
+
+def _rank_position(entry_row: Any) -> int:
+    return _safe_int(_row_get(entry_row, 'rank_position') or _row_get(entry_row, 'rank') or _row_get(entry_row, 'ranking_rank'), 0)
+
+
+def _snapshot_time(entry_row: Any) -> str:
+    return str(_row_get(entry_row, 'ranking_snapshot_time') or _row_get(entry_row, 'snapshot_time') or _row_get(entry_row, 'datetime') or _row_get(entry_row, 'dt') or '')
+
+
+def _build_entry_id(symbol: str, side: str, entry_row: Any) -> str:
+    source = _source_from_row(entry_row) or 'ENTRY'
+    when = str(_row_get(entry_row, 'datetime') or _row_get(entry_row, 'dt') or _snapshot_time(entry_row) or datetime.now().isoformat(timespec='seconds'))
+    keep = ''.join(ch for ch in when if ch.isdigit())[:14] or datetime.now().strftime('%Y%m%d%H%M%S')
+    return f'{source}-{keep}-{_norm_symbol(symbol)}-{str(side or "").upper() or "NA"}'
+
+
+def _build_technical_snapshot(entry_row: Any, ai: Any, ai_msg: str, side: str, entry_id: str = '') -> str:
+    """Return compact JSON snapshot of summary/ranking entry indicators."""
     try:
         row = dict(entry_row or {}) if isinstance(entry_row, dict) else {}
         if not row and hasattr(entry_row, 'to_dict'):
@@ -138,8 +172,6 @@ def _build_technical_snapshot(entry_row: Any, ai: Any, ai_msg: str, side: str) -
             if value is not None and value != '':
                 flat[key] = _safe_jsonable(value)
 
-        # Include any display_* and *_score fields not listed above because these
-        # are useful for Discord/log correlation and future backtests.
         for key, value in row.items():
             sk = str(key)
             if sk in flat:
@@ -159,29 +191,42 @@ def _build_technical_snapshot(entry_row: Any, ai: Any, ai_msg: str, side: str) -
                 by_tf[tf] = bucket
 
         payload = {
-            'schema': 'summary_entry_technical_snapshot_v1',
+            'schema': 'entry_technical_snapshot_v2',
+            'entry_id': entry_id,
             'captured_at': datetime.now().isoformat(timespec='seconds'),
             'side': str(side or '').upper(),
             'source': str(flat.get('source') or flat.get('entry_source') or ''),
+            'ranking': {
+                'ranking_type': _ranking_type(entry_row),
+                'rank_position': _rank_position(entry_row),
+                'ranking_snapshot_time': _snapshot_time(entry_row),
+            },
             'interval_min': _safe_int(flat.get('interval') or flat.get('interval_min'), 0),
             'technical': flat,
             'by_timeframe': by_tf,
             'ai': _safe_jsonable(ai if isinstance(ai, dict) else {}),
             'ai_msg': str(ai_msg or '')[:2000],
         }
-        return _safe_text(payload, max_len=12000)
+        return _safe_text(payload, max_len=20000)
     except Exception:
-        return _safe_text({'schema': 'summary_entry_technical_snapshot_v1', 'error': 'build_failed'}, max_len=12000)
+        return _safe_text({'schema': 'entry_technical_snapshot_v2', 'entry_id': entry_id, 'error': 'build_failed'}, max_len=20000)
 
 
 def audit_entry_skip(symbol: str, reason: str, detail: dict | None = None) -> None:
     try:
+        detail = detail or {}
+        side = str(detail.get('side') or '').upper()
+        source = str(detail.get('source') or detail.get('entry_source') or '').upper()
+        entry_id = detail.get('entry_id') or ''
         record_filter_event(
             datetime=datetime.now().isoformat(timespec='seconds'),
             symbol=str(symbol),
             filter_name=str(reason),
             passed=False,
             detail=_safe_text(detail or {}),
+            entry_id=entry_id,
+            source=source,
+            side=side,
         )
     except Exception:
         return
@@ -189,6 +234,7 @@ def audit_entry_skip(symbol: str, reason: str, detail: dict | None = None) -> No
 
 def audit_candidate_ok(symbol: str, side: str, entry_row: dict, ai: dict, ai_msg: str = '') -> None:
     try:
+        entry_id = _build_entry_id(symbol, side, entry_row)
         score = _safe_float(_row_get(entry_row, 'score'), 0.0)
         score_buy = _safe_float(_row_get(entry_row, 'score_buy'), score)
         score_sell = _safe_float(_row_get(entry_row, 'score_sell'), 0.0)
@@ -199,7 +245,7 @@ def audit_candidate_ok(symbol: str, side: str, entry_row: dict, ai: dict, ai_msg
             or score,
             score,
         )
-
+        reason_code = str(_row_get(entry_row, 'reason_code') or _row_get(entry_row, 'guard_reason') or '')
         record_candidate_event(
             datetime=str(
                 _row_get(entry_row, 'datetime')
@@ -216,19 +262,43 @@ def audit_candidate_ok(symbol: str, side: str, entry_row: dict, ai: dict, ai_msg
             final_score=final_score,
             ai_result='AI_OK',
             reason=_safe_text({
+                'entry_id': entry_id,
                 'ai_reason': ai.get('reason') if isinstance(ai, dict) else '',
                 'ai_msg': ai_msg,
                 'confidence': ai.get('confidence') if isinstance(ai, dict) else None,
                 'entry_reason': _row_get(entry_row, 'reason') or _row_get(entry_row, 'entry_reason') or '',
+                'reason_code': reason_code,
+                'ranking_type': _ranking_type(entry_row),
+                'rank_position': _rank_position(entry_row),
             }),
-            technical_snapshot=_build_technical_snapshot(entry_row, ai, ai_msg, side),
+            technical_snapshot=_build_technical_snapshot(entry_row, ai, ai_msg, side, entry_id=entry_id),
+            entry_id=entry_id,
+            reason_code=reason_code,
+            ranking_type=_ranking_type(entry_row),
+            rank_position=_rank_position(entry_row),
+            ranking_snapshot_time=_snapshot_time(entry_row),
         )
     except Exception:
         return
 
 
-def audit_order(symbol: str, side: str, qty: int, order_type: str, price: Any, status: str, order_id: str | None = None, reason: str | None = None) -> None:
+def audit_order(
+    symbol: str,
+    side: str,
+    qty: int,
+    order_type: str,
+    price: Any,
+    status: str,
+    order_id: str | None = None,
+    reason: str | None = None,
+    entry_row: dict | None = None,
+    ai: dict | None = None,
+    ai_msg: str = '',
+    entry_id: str | None = None,
+) -> None:
     try:
+        entry_row = entry_row or {}
+        entry_id = entry_id or _build_entry_id(symbol, side, entry_row)
         record_order_event(
             datetime=datetime.now().isoformat(timespec='seconds'),
             symbol=str(symbol),
@@ -240,6 +310,11 @@ def audit_order(symbol: str, side: str, qty: int, order_type: str, price: Any, s
             price=_safe_float(price, 0.0),
             filled_price=None,
             cancel_reason=reason,
+            reason=reason,
+            entry_id=entry_id,
+            entry_source=_source_from_row(entry_row),
+            entry_mode=str(_row_get(entry_row, 'entry_mode') or _row_get(entry_row, 'trigger_type') or ''),
+            technical_snapshot=_build_technical_snapshot(entry_row, ai or {}, ai_msg, side, entry_id=entry_id) if entry_row else '',
         )
     except Exception:
         return
