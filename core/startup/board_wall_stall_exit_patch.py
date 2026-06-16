@@ -1,58 +1,37 @@
 # ============================================================
 # File   : core/startup/board_wall_stall_exit_patch.py
-# Version: Ver02-BOARD-ENTRY-IMBALANCE-AND-FAST-EXIT
+# Version: Ver03-TEMP-EXIT-STOP
 # ------------------------------------------------------------
 # 板情報を実運用に接続する runtime patch。
 #
 # ENTRY直前:
 #   - final_entry_safety_guard の _board_guard を包み、
 #     スプレッド/最良気配チェック後に複数段板の偏りを確認する。
-#   - BUYなのに買い板が弱い、SELLなのに買い板が強い、
-#     進行方向の反対側に巨大壁がある場合だけ拒否する。
 #
 # EXIT:
-#   - BUY保有中に買い支え板が崩れたら早期EXIT。
-#   - SELL保有中に売り支え板が崩れたら早期EXIT。
-#   - 既存の「壁が食われているのに価格が止まる」EXITも維持。
+#   - AUTOSTOCK_TEMP_DISABLE_EXIT=1 の間は EXIT pipeline 自体を停止する。
+#   - 停止解除後は、板崩壊/壁食われ失速の早期EXITを既存どおり維持する。
 #
-# 環境変数:
-#   ENTRY_BOARD_IMBALANCE_ENABLED=1
-#   ENTRY_BOARD_IMBALANCE_LEVELS=5
-#   ENTRY_BOARD_BUY_MIN_BID_ASK_RATIO=0.70
-#   ENTRY_BOARD_SELL_MAX_BID_ASK_RATIO=1.30
-#   ENTRY_BOARD_WALL_REJECT_ENABLED=1
-#   ENTRY_BOARD_WALL_REJECT_RATIO=3.00
-#   ENTRY_BOARD_WALL_MIN_QTY=1500
-#
-#   EXIT_BOARD_COLLAPSE_ENABLED=1
-#   EXIT_BOARD_COLLAPSE_LEVELS=5
-#   EXIT_BOARD_COLLAPSE_LOOKBACK_SEC=6
-#   EXIT_BOARD_COLLAPSE_SUPPORT_DROP_RATIO=0.45
-#   EXIT_BOARD_COLLAPSE_MIN_SUPPORT_QTY=800
-#   EXIT_BOARD_BUY_MIN_BID_ASK_RATIO=0.55
-#   EXIT_BOARD_SELL_MAX_BID_ASK_RATIO=1.80
-#
-#   EXIT_BOARD_WALL_STALL_ENABLED=1
-#   EXIT_BOARD_WALL_LOOKBACK_SEC=8
-#   EXIT_BOARD_WALL_MIN_EATEN_RATIO=0.35
-#   EXIT_BOARD_WALL_MIN_QTY=1000
-#   EXIT_BOARD_WALL_STALL_MAX_MOVE_PCT=0.0008
-#   EXIT_BOARD_WALL_NEAR_LEVELS=3
-#   EXIT_BOARD_WALL_EXCHANGE=1
+# 一時停止解除:
+#   AUTOSTOCK_TEMP_DISABLE_EXIT=0
 # ============================================================
 
 from __future__ import annotations
 
 import logging
 import os
+import sys
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 _INSTALLED = False
 _ENTRY_INSTALLED = False
+_EXIT_PIPELINE_STOP_INSTALLED = False
 _ORIG_CHECK_NORMAL_EXIT = None
 _ORIG_CHECK_TONOSAMA_EXIT = None
+_ORIG_RUN_EXIT_PIPELINE = None
+_ORIG_MAIN_RUN_EXIT_PIPELINE = None
 _ORIG_BOARD_GUARD = None
 
 
@@ -81,6 +60,11 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _exit_temp_disabled() -> bool:
+    # 今回の運用要望: EXITを一時停止。解除したい時だけ AUTOSTOCK_TEMP_DISABLE_EXIT=0 を指定する。
+    return _env_bool("AUTOSTOCK_TEMP_DISABLE_EXIT", True) or _env_bool("EXIT_TEMP_STOP", False)
+
+
 def _get(obj: Any, name: str, default=None):
     try:
         if isinstance(obj, dict):
@@ -103,14 +87,57 @@ def _position_side(pos: Any) -> str:
     return str(_get(pos, "side") or _get(pos, "Side") or "BUY").upper()
 
 
+def _patched_run_exit_pipeline(*args, **kwargs):
+    logger.warning(
+        "[EXIT TEMP STOP] run_exit_pipeline skipped AUTOSTOCK_TEMP_DISABLE_EXIT=%s EXIT_TEMP_STOP=%s",
+        os.getenv("AUTOSTOCK_TEMP_DISABLE_EXIT"),
+        os.getenv("EXIT_TEMP_STOP"),
+    )
+    return None
+
+
+def _install_exit_pipeline_temp_stop() -> bool:
+    global _EXIT_PIPELINE_STOP_INSTALLED, _ORIG_RUN_EXIT_PIPELINE, _ORIG_MAIN_RUN_EXIT_PIPELINE
+    if not _exit_temp_disabled():
+        logger.warning("[EXIT TEMP STOP] disabled by env -> EXIT pipeline remains active")
+        return False
+    try:
+        import trading.handlers.exit_handler as eh
+
+        cur = getattr(eh, "run_exit_pipeline", None)
+        if callable(cur) and not getattr(cur, "_exit_temp_stop_patch", False):
+            _ORIG_RUN_EXIT_PIPELINE = cur
+            _patched_run_exit_pipeline._exit_temp_stop_patch = True  # type: ignore[attr-defined]
+            _patched_run_exit_pipeline._original = cur  # type: ignore[attr-defined]
+            eh.run_exit_pipeline = _patched_run_exit_pipeline
+
+        # main.py は `from trading.handlers.exit_handler import run_exit_pipeline` 済みなので、
+        # __main__ 側のグローバル参照も差し替える。
+        main_mod = sys.modules.get("__main__")
+        if main_mod is not None:
+            main_cur = getattr(main_mod, "run_exit_pipeline", None)
+            if callable(main_cur) and not getattr(main_cur, "_exit_temp_stop_patch", False):
+                _ORIG_MAIN_RUN_EXIT_PIPELINE = main_cur
+                setattr(main_mod, "run_exit_pipeline", _patched_run_exit_pipeline)
+
+        _EXIT_PIPELINE_STOP_INSTALLED = True
+        logger.warning("[EXIT TEMP STOP] installed: EXIT pipeline is temporarily stopped")
+        return True
+    except Exception:
+        logger.exception("[EXIT TEMP STOP] install failed")
+        return False
+
+
 def _board_fast_exit_reason(pos: Any, price: float) -> str | None:
     """支え板崩壊EXIT → 壁食われ失速EXIT の順で確認する。"""
+    if _exit_temp_disabled():
+        return None
+
     symbol = _position_symbol(pos)
     side = _position_side(pos)
     if not symbol or price <= 0:
         return None
 
-    # 1) 保有方向の支え板崩壊を先に見る。損切/撤退を速くする目的。
     try:
         from trading.board.board_signal import analyze_exit_board_collapse
 
@@ -134,7 +161,6 @@ def _board_fast_exit_reason(pos: Any, price: float) -> str | None:
     except Exception:
         logger.debug("[BOARD FAST EXIT PATCH] collapse analyze failed symbol=%s", symbol, exc_info=True)
 
-    # 2) 既存ロジック: 壁が食われているのに価格が伸びない場合。
     if not _env_bool("EXIT_BOARD_WALL_STALL_ENABLED", True):
         return None
     try:
@@ -165,6 +191,8 @@ def _board_fast_exit_reason(pos: Any, price: float) -> str | None:
 
 
 def _patched_check_normal_exit(pos: Any, price: float, now):
+    if _exit_temp_disabled():
+        return None
     reason = _board_fast_exit_reason(pos, price)
     if reason:
         return reason
@@ -174,6 +202,8 @@ def _patched_check_normal_exit(pos: Any, price: float, now):
 
 
 def _patched_check_tonosama_exit(pos: Any, price: float, now):
+    if _exit_temp_disabled():
+        return None
     reason = _board_fast_exit_reason(pos, price)
     if reason:
         return reason
@@ -183,13 +213,11 @@ def _patched_check_tonosama_exit(pos: Any, price: float, now):
 
 
 def _patched_board_guard(row: dict, symbol: str, side: str) -> bool:
-    # 既存の最良気配/スプレッド/薄板チェックを先に通す。
     if callable(_ORIG_BOARD_GUARD):
         ok = bool(_ORIG_BOARD_GUARD(row, symbol, side))
         if not ok:
             return False
 
-    # 複数段板の偏りチェック。取得失敗時は fail-open。
     try:
         from trading.board.board_signal import analyze_entry_board_imbalance
         import core.startup.final_entry_safety_guard_patch as fsg
@@ -251,6 +279,10 @@ def _install_entry_board_imbalance_guard() -> bool:
 def install() -> bool:
     global _INSTALLED, _ORIG_CHECK_NORMAL_EXIT, _ORIG_CHECK_TONOSAMA_EXIT
     ok_entry = _install_entry_board_imbalance_guard()
+    ok_stop = _install_exit_pipeline_temp_stop()
+
+    if _exit_temp_disabled():
+        return bool(ok_entry or ok_stop)
 
     try:
         import trading.handlers.exit_handler as eh
@@ -296,13 +328,4 @@ def install() -> bool:
         return True
     except Exception:
         logger.exception("[BOARD FAST EXIT PATCH] install failed")
-        return bool(ok_entry)
-
-
-try:
-    install()
-except Exception:
-    logger.exception("[BOARD FAST EXIT PATCH] auto install failed")
-
-
-__all__ = ["install"]
+        return bool(ok_entry or ok_stop)
