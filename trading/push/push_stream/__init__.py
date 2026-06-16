@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/__init__.py
-# Version: Ver1.5-PUSH-STREAM-PACKAGE-COMPAT-STABILITY-PATCH
+# Version: Ver1.6-PUSH-ROTATION-LIQ-KEEP100-PATCH
 # ------------------------------------------------------------
 # ✔ 旧 trading.push.push_stream 公開API互換
 # ✔ 分割後モジュールの再エクスポート
@@ -10,6 +10,7 @@
 #   のデフォルトを注入する
 # ✔ main_database.py 分離運用時、main.py側からのPUSH受信起動をno-op化
 # ✔ PUSH rotation stability patch を自動適用
+# ✔ rotation用 liquidity guard で100→50へ崩れる問題を補正
 # ============================================================
 
 from __future__ import annotations
@@ -33,6 +34,15 @@ try:
     rotation_stability_patch.install()
 except Exception:
     logger.exception("[push_stream] rotation_stability_patch install failed")
+
+# PUSHローテーション専用の流動性ガード補正。
+# stability patch の後に入れることで、100銘柄候補が50銘柄へ削られて
+# Bグループが消えるケースを最終的に防ぐ。
+try:
+    from . import rotation_liquidity_keep100_patch as rotation_liquidity_keep100_patch
+    rotation_liquidity_keep100_patch.install()
+except Exception:
+    logger.exception("[push_stream] rotation_liquidity_keep100_patch install failed")
 
 from .transport import (
     set_refresh_callable,
@@ -94,6 +104,7 @@ __all__ = [
     "rotation_register",
     "rotation_logging",
     "rotation_stability_patch",
+    "rotation_liquidity_keep100_patch",
     "set_refresh_callable",
     "refresh_subscriptions",
     "get_ws_sender",
