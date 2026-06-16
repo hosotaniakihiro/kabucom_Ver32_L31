@@ -17,7 +17,7 @@ from .runtime_settings_ini_loader import VERSION as SETTINGS_INI_VERSION
 from .runtime_settings_ini_loader import load_settings_ini
 
 logger = logging.getLogger(__name__)
-VERSION = "REV13-RUNTIME-ENV-DEFAULTS-PATCH-ENTRY-COUNT-UNBLOCK"
+VERSION = "REV14-RUNTIME-ENV-DEFAULTS-PATCH-DATABASE-OWNER"
 _INSTALLED = False
 
 
@@ -154,6 +154,20 @@ def _install_tonosama_pending_candidate_audit(context: str) -> bool:
         return False
 
 
+def _install_database_owner(context: str) -> bool:
+    try:
+        if context not in {"main", "helper", "main_database"}:
+            return False
+        if os.environ.get("DISABLE_DATABASE_OWNER_RUNTIME_PATCH", "").strip() == "1":
+            logger.warning("[RUNTIME ENV DEFAULTS PATCH] database owner patch disabled by env")
+            return False
+        from . import database_owner_runtime_patch
+        return bool(database_owner_runtime_patch.install())
+    except Exception:
+        logger.exception("[RUNTIME ENV DEFAULTS PATCH] database owner install failed")
+        return False
+
+
 def _install_entry_count_unblock(context: str) -> bool:
     try:
         if context not in {"main", "helper", "main_database"}:
@@ -178,6 +192,7 @@ def install() -> bool:
         applied: Dict[str, str] = {}
         applied.update(apply_site_defaults(context=context))
         applied.update(apply_user_defaults(context=context))
+        database_owner_ok = _install_database_owner(context)
         entry_count_unblock_ok = _install_entry_count_unblock(context)
         entry_fire_rescue_ok = _install_entry_fire_rescue(context)
         ranking_entry_rescue_ok = _install_ranking_entry_runtime_rescue(context)
@@ -189,7 +204,7 @@ def install() -> bool:
         tonosama_pending_audit_ok = _install_tonosama_pending_candidate_audit(context)
         _INSTALLED = True
         logger.warning(
-            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s tonosama_exit_infer=%s tonosama_pending_audit=%s verbose=%s",
+            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s database_owner=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s tonosama_exit_infer=%s tonosama_pending_audit=%s verbose=%s",
             VERSION,
             DEFAULTS_VERSION,
             REGISTRY_VERSION,
@@ -199,6 +214,7 @@ def install() -> bool:
             context,
             ",".join(SITE_GROUP_ORDER),
             ",".join(USER_GROUP_ORDER),
+            database_owner_ok,
             os.environ.get("SITECUSTOMIZE_ENABLE_RESCUE_PATCHES"),
             os.environ.get("USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES"),
             os.environ.get("USERCUSTOMIZE_ENABLE_TONOSAMA_RESCUE_PATCHES"),
