@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/audit_logging/recorder.py
-# Version: Ver01-AUDIT-RECORDER
+# Version: Ver02-AUDIT-RECORDER-TECHNICAL-SNAPSHOT
 # ============================================================
 
 import os
@@ -29,6 +29,17 @@ def _connect():
     return conn
 
 
+def _ensure_column(cur, table: str, column: str, ddl: str) -> None:
+    try:
+        cols = {str(r[1]) for r in cur.execute(f'PRAGMA table_info("{table}")').fetchall()}
+        if column not in cols:
+            cur.execute(f'ALTER TABLE "{table}" ADD COLUMN {ddl}')
+    except Exception:
+        # Schema migration failure must not stop trading. Insert failures will be
+        # handled by the caller and printed by _insert.
+        pass
+
+
 def ensure_audit_db():
     with _LOCK:
         conn = _connect()
@@ -48,9 +59,11 @@ def ensure_audit_db():
             final_score REAL,
             ai_result TEXT,
             reason TEXT,
+            technical_snapshot TEXT,
             created_at TEXT
         )
         ''')
+        _ensure_column(cur, 'candidate_history', 'technical_snapshot', 'technical_snapshot TEXT')
 
         cur.execute('''
         CREATE TABLE IF NOT EXISTS filter_history (
@@ -133,8 +146,8 @@ def record_candidate_event(**kwargs):
     INSERT INTO candidate_history (
         datetime, symbol, side, source, interval_min,
         score_buy, score_sell, score_total, final_score,
-        ai_result, reason, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ai_result, reason, technical_snapshot, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     '''
 
     values = (
@@ -149,6 +162,7 @@ def record_candidate_event(**kwargs):
         kwargs.get('final_score'),
         kwargs.get('ai_result'),
         kwargs.get('reason'),
+        kwargs.get('technical_snapshot'),
         datetime.now().isoformat(),
     )
 
