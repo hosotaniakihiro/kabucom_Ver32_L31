@@ -1,14 +1,14 @@
 # ============================================================
-# token_manager.py（Ver27-SETTINGS-INI-FIRST-API-AUTH）
+# token_manager.py（Ver28-SETTINGS-INI-ONLY-API-AUTH）
 # ------------------------------------------------------------
 # ・main.py / startup.py から安全に import RefreshToken が可能
 # ・循環importなし
-# ・API認証設定は settings.ini を最優先で読む
-# ・古い setting.ini が残っていても、settings.ini があればそちらを優先する
-# ・[aukabu] / [kabusapi] を含む設定ファイルを候補から順に探す
+# ・API認証設定は settings.ini に集約する
+# ・settings.local.ini / setting.ini / kabusapi.ini / aukabu.ini は読まない
+# ・[aukabu] / [kabusapi] は settings.ini または config/settings.ini からのみ読む
 # ・startup_config から渡された apipassword をメモリキャッシュし、
 #   force_cancel_loop などの 401 後 refresh_token() 引数なし呼び出しでも再利用する
-# ・token 保存は API セクションが見つかった設定ファイルへだけ行う
+# ・token 保存も settings.ini または config/settings.ini にだけ行う
 # ============================================================
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from configparser import ConfigParser
 from pathlib import Path
 
 API_URL = "http://localhost:18080/kabusapi"
-CONFIG_PATH = "settings.ini"  # API認証の標準ファイル名
+CONFIG_PATH = "settings.ini"  # API認証の唯一の標準ファイル名
 API_TOKEN = None
 API_PASSWORD = None
 _CONFIG_FILE_PATH: str | None = None
@@ -52,18 +52,18 @@ def _project_root_candidates() -> list[Path]:
 
 
 def _config_candidates() -> list[Path]:
+    """settings.ini だけを候補にする。
+
+    以前は settings.local.ini / setting.ini / kabusapi.ini / aukabu.ini も候補にしていたが、
+    複数ファイルに古い token が残ると APIキー不一致の原因になる。
+    そのため、API認証は settings.ini に完全集約する。
+    """
     out: list[Path] = []
 
-    # Explicit API config path has highest priority.
-    # SETTINGS_INI_PATH / KABU_SETTINGS_INI を先にして、settings.ini 指定を最優先にする。
+    # 明示指定も settings.ini 系だけ許可する。
     for env_name in (
         "SETTINGS_INI_PATH",
         "KABU_SETTINGS_INI",
-        "SETTING_INI_PATH",
-        "KABU_SETTING_INI",
-        "KABUSAPI_SETTING_INI",
-        "AUKABU_SETTING_INI",
-        "KABU_API_SETTING_INI",
     ):
         v = os.getenv(env_name)
         if v:
@@ -71,25 +71,8 @@ def _config_candidates() -> list[Path]:
 
     for root in _project_root_candidates():
         out.extend([
-            # local override: settings.ini 系を最優先
-            root / "settings.local.ini",
-            root / "setting.local.ini",
-            root / "config" / "settings.local.ini",
-            root / "config" / "setting.local.ini",
-
-            # dedicated API files
-            root / "kabusapi.ini",
-            root / "aukabu.ini",
-            root / "config" / "kabusapi.ini",
-            root / "config" / "aukabu.ini",
-
-            # standard API auth file: settings.ini first
             root / "settings.ini",
             root / "config" / "settings.ini",
-
-            # legacy fallback only. ここに古いtokenが残っていても settings.ini があれば使わない。
-            root / "setting.ini",
-            root / "config" / "setting.ini",
         ])
 
     uniq: list[Path] = []
@@ -160,9 +143,9 @@ def _require_section(conf: ConfigParser) -> str:
         return sec
     existing, tried = _diagnostic(conf)
     raise ValueError(
-        "[aukabu] or [kabusapi] があるAPI設定ファイルが見つかりません。"
+        "[aukabu] or [kabusapi] がある settings.ini が見つかりません。"
         " API認証は settings.ini の [kabusapi] または [aukabu] に集約してください。"
-        " 必要なら環境変数 SETTINGS_INI_PATH で明示指定できます。"
+        " 必要なら環境変数 SETTINGS_INI_PATH で settings.ini を明示指定できます。"
         f" existing={existing} tried={tried}"
     )
 
@@ -205,7 +188,7 @@ def _resolve_apipassword(conf: ConfigParser, sec: str | None, apipassword=None) 
 # Token 保存
 # ============================================================
 def _save_token(token) -> bool:
-    """APIセクションが見つかる場合だけ token を保存する。"""
+    """settings.ini にだけ token を保存する。"""
     conf = _load_settings()
     sec = _get_section(conf)
     if not sec:
@@ -231,7 +214,7 @@ def refresh_token(apipassword=None):
     if not api_password:
         existing, tried = _diagnostic(conf)
         raise ValueError(
-            "API設定ファイルに apipassword がありません。"
+            "settings.ini に apipassword がありません。"
             f" path={_CONFIG_FILE_PATH} section={sec} existing={existing} tried={tried}"
         )
 
@@ -252,11 +235,10 @@ def refresh_token(apipassword=None):
     API_TOKEN = token
     API_PASSWORD = str(api_password)
 
-    # API ini がある場合だけ保存。無い構成でも 401 後リカバリは成功させる。
+    # settings.ini がある場合だけ保存。保存失敗でも runtime token refresh 自体は成功させる。
     try:
         _save_token(token)
     except Exception:
-        # 保存失敗で runtime token refresh 自体を失敗させない。
         pass
 
     return token
