@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/audit_logging/entry_controller_audit_patch.py
-# Version: Ver01-ENTRY-CONTROLLER-AUDIT-PATCH
+# Version: Ver02-ENTRY-CONTROLLER-AUDIT-FULL-LINKS
 # ------------------------------------------------------------
 # entry_controller に監査ログを後付けするための安全パッチ。
 # 売買判定ロジックは変更せず、DB保存だけを追加する。
@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +39,7 @@ def install() -> bool:
             audit_entry_skip,
             audit_candidate_ok,
             audit_order,
+            _build_entry_id,
         )
     except Exception:
         logger.exception('[AUDIT PATCH] import failed')
@@ -60,12 +60,14 @@ def install() -> bool:
         return _ORIGINAL_LOG_SKIP(symbol, reason, **detail)
 
     def patched_execute_best_candidate(item: dict, boost_active: bool) -> bool:
+        entry_id = ''
         try:
             symbol = item.get('symbol')
             side = item.get('side')
             entry_row = item.get('entry_row') or {}
             ai = item.get('ai') or {}
             ai_msg = item.get('ai_msg') or ''
+            entry_id = _build_entry_id(symbol, side, entry_row)
             audit_candidate_ok(symbol=symbol, side=side, entry_row=entry_row, ai=ai, ai_msg=ai_msg)
         except Exception:
             pass
@@ -77,6 +79,7 @@ def install() -> bool:
             side = item.get('side')
             entry_row = item.get('entry_row') or {}
             ai = item.get('ai') or {}
+            ai_msg = item.get('ai_msg') or ''
             price = ec._resolve_price(entry_row)
             qty = ec.calculate_entry_quantity(
                 symbol=symbol,
@@ -93,6 +96,10 @@ def install() -> bool:
                 price=price,
                 status='CANDIDATE_SELECTED',
                 reason='before_execute_best_candidate',
+                entry_row=entry_row,
+                ai=ai,
+                ai_msg=ai_msg,
+                entry_id=entry_id,
             )
         except Exception:
             pass
@@ -103,6 +110,8 @@ def install() -> bool:
             symbol = item.get('symbol')
             side = item.get('side')
             entry_row = item.get('entry_row') or {}
+            ai = item.get('ai') or {}
+            ai_msg = item.get('ai_msg') or ''
             price = ec._resolve_price(entry_row)
             audit_order(
                 symbol=symbol,
@@ -112,6 +121,10 @@ def install() -> bool:
                 price=price,
                 status='ORDER_ACCEPTED' if ok else 'FAILED_OR_SKIPPED',
                 reason='execute_best_candidate_result',
+                entry_row=entry_row,
+                ai=ai,
+                ai_msg=ai_msg,
+                entry_id=entry_id,
             )
         except Exception:
             pass
@@ -123,5 +136,5 @@ def install() -> bool:
     ec._AUDIT_LOGGING_PATCH_INSTALLED = True
     _INSTALLED = True
 
-    logger.warning('[AUDIT PATCH] entry_controller audit logging installed')
+    logger.warning('[AUDIT PATCH] entry_controller audit logging installed full_links=True')
     return True
