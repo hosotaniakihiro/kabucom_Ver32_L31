@@ -17,7 +17,7 @@ from .runtime_settings_ini_loader import VERSION as SETTINGS_INI_VERSION
 from .runtime_settings_ini_loader import load_settings_ini
 
 logger = logging.getLogger(__name__)
-VERSION = "REV15-RUNTIME-ENV-DEFAULTS-PATCH-FULL-PIPELINE-STABILITY"
+VERSION = "REV16-RUNTIME-ENV-DEFAULTS-PATCH-DAYTRADE-CREDIT-FORCE-CLOSE"
 _INSTALLED = False
 
 
@@ -154,6 +154,20 @@ def _install_tonosama_pending_candidate_audit(context: str) -> bool:
         return False
 
 
+def _install_daytrade_credit_force_close(context: str) -> bool:
+    try:
+        if context not in {"main", "helper"}:
+            return False
+        if os.environ.get("DISABLE_DAYTRADE_CREDIT_FORCE_CLOSE_PATCH", "").strip() == "1":
+            logger.warning("[RUNTIME ENV DEFAULTS PATCH] daytrade credit force close disabled by env")
+            return False
+        from . import daytrade_credit_force_close_patch
+        return bool(daytrade_credit_force_close_patch.install())
+    except Exception:
+        logger.exception("[RUNTIME ENV DEFAULTS PATCH] daytrade credit force close install failed")
+        return False
+
+
 def _install_database_owner(context: str) -> bool:
     try:
         if context not in {"main", "helper", "main_database"}:
@@ -217,9 +231,10 @@ def install() -> bool:
         strict_final_liq_ok = _install_strict_final_liquidity_guard(context)
         tonosama_exit_infer_ok = _install_tonosama_exit_source_infer(context)
         tonosama_pending_audit_ok = _install_tonosama_pending_candidate_audit(context)
+        daytrade_credit_ok = _install_daytrade_credit_force_close(context)
         _INSTALLED = True
         logger.warning(
-            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s database_owner=%s full_pipeline=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s tonosama_exit_infer=%s tonosama_pending_audit=%s verbose=%s",
+            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s database_owner=%s full_pipeline=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s tonosama_exit_infer=%s tonosama_pending_audit=%s daytrade_credit=%s verbose=%s",
             VERSION,
             DEFAULTS_VERSION,
             REGISTRY_VERSION,
@@ -243,6 +258,7 @@ def install() -> bool:
             strict_final_liq_ok,
             tonosama_exit_infer_ok,
             tonosama_pending_audit_ok,
+            daytrade_credit_ok,
             env_bool("RUNTIME_ENV_DEFAULTS_VERBOSE", False),
         )
         return True
