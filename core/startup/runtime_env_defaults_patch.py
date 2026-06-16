@@ -20,7 +20,7 @@ from .runtime_settings_ini_loader import VERSION as SETTINGS_INI_VERSION
 from .runtime_settings_ini_loader import load_settings_ini
 
 logger = logging.getLogger(__name__)
-VERSION = "REV10-RUNTIME-ENV-DEFAULTS-PATCH-STRICT-FINAL-LIQUIDITY"
+VERSION = "REV11-RUNTIME-ENV-DEFAULTS-PATCH-TONOSAMA-EXIT-INFER"
 _INSTALLED = False
 
 
@@ -144,6 +144,22 @@ def _install_strict_final_liquidity_guard(context: str) -> bool:
         return False
 
 
+def _install_tonosama_exit_source_infer(context: str) -> bool:
+    """Ensure TONOSAMA/殿様イナゴ entries use the dedicated fast exit path."""
+    try:
+        if context not in {"main", "helper"}:
+            return False
+        if os.environ.get("DISABLE_TONOSAMA_EXIT_SOURCE_INFER_PATCH", "").strip() == "1":
+            logger.warning("[RUNTIME ENV DEFAULTS PATCH] tonosama exit infer disabled by env")
+            return False
+        from . import tonosama_exit_source_infer_patch
+
+        return bool(tonosama_exit_source_infer_patch.install())
+    except Exception:
+        logger.exception("[RUNTIME ENV DEFAULTS PATCH] tonosama exit infer install failed")
+        return False
+
+
 def install() -> bool:
     """Apply centralized defaults once.
 
@@ -156,6 +172,7 @@ def install() -> bool:
     6. PUSH register recovery keeps main_database.py registration healthy.
     7. Common day-position guard blocks late SELL/BUY extremes across entry sources.
     8. Strict final liquidity guard blocks thin/stale symbols immediately before order send.
+    9. TONOSAMA exit inference routes 殿様イナゴ positions to fast scalping exit.
     """
     global _INSTALLED
     if _INSTALLED:
@@ -173,11 +190,12 @@ def install() -> bool:
         push_register_recovery_ok = _install_push_registration_recovery(context)
         day_position_guard_ok = _install_common_day_position_guard(context)
         strict_final_liq_ok = _install_strict_final_liquidity_guard(context)
+        tonosama_exit_infer_ok = _install_tonosama_exit_source_infer(context)
 
         _INSTALLED = True
         if env_bool("RUNTIME_ENV_DEFAULTS_VERBOSE", False):
             logger.warning(
-                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s",
+                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s tonosama_exit_infer=%s",
                 VERSION,
                 DEFAULTS_VERSION,
                 REGISTRY_VERSION,
@@ -193,10 +211,11 @@ def install() -> bool:
                 push_register_recovery_ok,
                 day_position_guard_ok,
                 strict_final_liq_ok,
+                tonosama_exit_infer_ok,
             )
         else:
             logger.warning(
-                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s",
+                "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s tonosama_exit_infer=%s",
                 VERSION,
                 DEFAULTS_VERSION,
                 REGISTRY_VERSION,
@@ -213,6 +232,7 @@ def install() -> bool:
                 push_register_recovery_ok,
                 day_position_guard_ok,
                 strict_final_liq_ok,
+                tonosama_exit_infer_ok,
             )
         return True
     except Exception:
