@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/ranking/active_symbols/__init__.py
-# Version: Ver1.1-ACTIVE-SYMBOLS-PACKAGE-PREMARKET-GETTER-PATCH
+# Version: Ver1.2-ACTIVE-SYMBOLS-DB-RANKING-FALLBACK
 # ============================================================
 from __future__ import annotations
 
@@ -29,7 +29,22 @@ try:
     from .getter_premarket_patch import install as _install_getter_premarket_patch
 
     _install_getter_premarket_patch()
-    from .manager import (  # re-export patched callables
+except Exception:
+    pass
+
+# 場中に today_ranking が0件になる場合でも、当日の ranking DB から
+# active / push / register symbols を復元する。
+try:
+    from .db_ranking_fallback_patch import install as _install_db_ranking_fallback_patch
+
+    _install_db_ranking_fallback_patch()
+except Exception:
+    pass
+
+# Re-export patched callables from manager.
+try:
+    from .manager import (
+        update_active_symbols,
         get_active_symbols,
         get_current_active_symbols,
         get_monitor_symbols,
@@ -37,6 +52,7 @@ try:
         get_register_symbols,
         get_subscription_symbols,
         get_rotation_symbols,
+        debug_active_symbols,
     )
 except Exception:
     pass
