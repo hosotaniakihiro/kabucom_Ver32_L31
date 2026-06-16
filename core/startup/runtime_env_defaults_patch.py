@@ -17,7 +17,7 @@ from .runtime_settings_ini_loader import VERSION as SETTINGS_INI_VERSION
 from .runtime_settings_ini_loader import load_settings_ini
 
 logger = logging.getLogger(__name__)
-VERSION = "REV16-RUNTIME-ENV-DEFAULTS-PATCH-DAYTRADE-CREDIT-FORCE-CLOSE"
+VERSION = "REV17-RUNTIME-ENV-DEFAULTS-PATCH-SUMMARY-DB-LOCK-PRESSURE"
 _INSTALLED = False
 
 
@@ -210,6 +210,20 @@ def _install_full_pipeline_stability(context: str) -> bool:
         return False
 
 
+def _install_summary_db_lock_pressure(context: str) -> bool:
+    try:
+        if context not in {"main", "helper", "main_database"}:
+            return False
+        if os.environ.get("DISABLE_SUMMARY_DB_LOCK_PRESSURE_PATCH", "").strip() == "1":
+            logger.warning("[RUNTIME ENV DEFAULTS PATCH] summary DB lock pressure patch disabled by env")
+            return False
+        from . import summary_db_lock_pressure_patch
+        return bool(summary_db_lock_pressure_patch.install())
+    except Exception:
+        logger.exception("[RUNTIME ENV DEFAULTS PATCH] summary DB lock pressure install failed")
+        return False
+
+
 def install() -> bool:
     global _INSTALLED
     if _INSTALLED:
@@ -220,6 +234,7 @@ def install() -> bool:
         applied: Dict[str, str] = {}
         applied.update(apply_site_defaults(context=context))
         applied.update(apply_user_defaults(context=context))
+        summary_lock_pressure_ok = _install_summary_db_lock_pressure(context)
         database_owner_ok = _install_database_owner(context)
         full_pipeline_ok = _install_full_pipeline_stability(context)
         entry_count_unblock_ok = _install_entry_count_unblock(context)
@@ -234,7 +249,7 @@ def install() -> bool:
         daytrade_credit_ok = _install_daytrade_credit_force_close(context)
         _INSTALLED = True
         logger.warning(
-            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s database_owner=%s full_pipeline=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s tonosama_exit_infer=%s tonosama_pending_audit=%s daytrade_credit=%s verbose=%s",
+            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s summary_lock_pressure=%s database_owner=%s full_pipeline=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s tonosama_exit_infer=%s tonosama_pending_audit=%s daytrade_credit=%s verbose=%s",
             VERSION,
             DEFAULTS_VERSION,
             REGISTRY_VERSION,
@@ -244,6 +259,7 @@ def install() -> bool:
             context,
             ",".join(SITE_GROUP_ORDER),
             ",".join(USER_GROUP_ORDER),
+            summary_lock_pressure_ok,
             database_owner_ok,
             full_pipeline_ok,
             os.environ.get("SITECUSTOMIZE_ENABLE_RESCUE_PATCHES"),
