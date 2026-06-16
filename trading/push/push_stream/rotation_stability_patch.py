@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import datetime as _dt
 import logging
 import os
+import sqlite3
 from typing import Any, Iterable, Sequence
 
 logger = logging.getLogger(__name__)
-VERSION = "V1.3-ROTATION-TARGET-TOPUP-AB100"
+VERSION = "V1.4-ROTATION-DB-FALLBACK-AB100"
 _INSTALLED = False
 
 
@@ -35,7 +37,8 @@ def _d(xs: Iterable[Any]) -> list[str]:
     for x in xs or []:
         s = str(x).strip().upper()
         if s and s not in seen:
-            seen.add(s); out.append(s)
+            seen.add(s)
+            out.append(s)
     return out
 
 
@@ -49,15 +52,89 @@ def _onopen(reason: Any) -> bool:
     return s.startswith("on_open") or s.startswith("onopen") or "on_open" in s
 
 
+def _today_yyyymmdd() -> str:
+    for name in ("TRADE_DATE", "KABU_TRADE_DATE", "ATS_TRADE_DATE", "TARGET_DATE"):
+        v = str(os.environ.get(name, "")).strip()
+        if len(v) >= 8:
+            digits = "".join(ch for ch in v if ch.isdigit())
+            if len(digits) >= 8:
+                return digits[:8]
+    return _dt.date.today().strftime("%Y%m%d")
+
+
+def _iter_existing_db_paths(kind: str) -> list[str]:
+    ymd = _today_yyyymmdd()
+    roots = _d([
+        os.environ.get("AUTOSTOCK_ROOT"),
+        os.environ.get("AUTO_STOCK_ROOT"),
+        os.environ.get("KABU_DATA_ROOT"),
+        os.environ.get("RAW_DATA_ROOT"),
+        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data",
+    ])
+    paths: list[str] = []
+    for root in roots:
+        if not root:
+            continue
+        root = str(root).rstrip("\\/")
+        if kind == "ranking":
+            paths.extend([
+                rf"{root}\kabu_station\ranking\ranking{ymd}.db",
+                rf"{root}\ranking\ranking{ymd}.db",
+            ])
+        elif kind == "summary":
+            paths.extend([
+                rf"{root}\kabu_station\summary\summary{ymd}.db",
+                rf"{root}\summary\summary{ymd}.db",
+            ])
+    return [p for p in _d(paths) if os.path.exists(p)]
+
+
+def _sqlite_symbols_from_db(path: str, *, max_rows: int = 250) -> list[str]:
+    out: list[str] = []
+    try:
+        con = sqlite3.connect(path, timeout=0.25)
+        try:
+            cur = con.cursor()
+            tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+            preferred = [
+                t for t in tables
+                if any(k in t.lower() for k in ("ranking", "snapshot", "summary", "stock_summary"))
+            ] or tables
+            for table in preferred:
+                if len(out) >= max_rows:
+                    break
+                try:
+                    cols = [r[1] for r in cur.execute(f'PRAGMA table_info("{table}")').fetchall()]
+                except Exception:
+                    continue
+                col = next((c for c in cols if c.lower() in {"symbol", "code", "銘柄コード"}), None)
+                if not col:
+                    continue
+                order_col = next(
+                    (c for c in cols if c.lower() in {"datetime", "created_at", "updated_at", "currentpricetime", "time", "timestamp"}),
+                    None,
+                )
+                sql = f'SELECT DISTINCT "{col}" FROM "{table}" WHERE "{col}" IS NOT NULL'
+                if order_col:
+                    sql += f' ORDER BY "{order_col}" DESC'
+                sql += f' LIMIT {int(max_rows)}'
+                try:
+                    vals = [r[0] for r in cur.execute(sql).fetchall()]
+                except Exception:
+                    continue
+                out = _d(out + vals)
+            return out[:max_rows]
+        finally:
+            con.close()
+    except Exception:
+        logger.debug("[PUSH ROTATION DB FALLBACK] sqlite read failed path=%s", path, exc_info=True)
+        return []
+
+
 def _patch_target_resolution() -> bool:
     """
-    runtime.ats_register_targets が50銘柄しか無い場合でも、
-    active_symbol_manager / global_data / dynamic providers から不足分を補充し、
-    100銘柄候補を作って A=50 / B=50 ローテーションへ戻す。
-
-    重要:
-      rotation_core は `from .rotation_symbols import resolve_register_targets` で
-      関数参照を保持しているため、rotation_core 側の参照も同時に差し替える。
+    runtime / global_data / active_symbol_manager が空でも、ランキングDB/サマリーDBから
+    登録候補を復元して A=50 / B=50 ローテーションへ戻す。
     """
     try:
         from . import rotation_core
@@ -90,7 +167,7 @@ def _patch_target_resolution() -> bool:
             return
         before = len(dst)
         dst[:] = _d(list(dst) + list(real))
-        logger.info(
+        logger.warning(
             "[PUSH ROTATION TARGET TOPUP] source=%s raw=%d real=%d added=%d total=%d head=%s",
             source,
             raw_count,
@@ -120,9 +197,7 @@ def _patch_target_resolution() -> bool:
         return None
 
     def _collect_runtime_all(dst: list[str]) -> None:
-        # 既存の _resolve_from_runtime は「最初に見つかった実銘柄リスト」でreturnする。
-        # ここでは全キーを集約し、runtime.ats_register_targets 50銘柄だけで止まらないようにする。
-        for key in getattr(rotation_symbols, "_RUNTIME_SYMBOL_KEYS", ()):
+        for key in getattr(rotation_symbols, "_RUNTIME_SYMBOL_KEYS", ()):  # collect all, not first-hit only
             try:
                 src = rotation_symbols._safe_get_runtime(key)
             except Exception:
@@ -213,7 +288,6 @@ def _patch_target_resolution() -> bool:
                 logger.debug("[PUSH ROTATION TARGET TOPUP] active getter failed name=%s", name, exc_info=True)
 
     def _collect_dynamic_providers_all(dst: list[str]) -> None:
-        # 既存 _resolve_from_dynamic_providers は最初のproviderでreturnするため、ここでは全部集約する。
         import importlib
 
         for module_name, func_name in getattr(rotation_symbols, "_DYNAMIC_SYMBOL_PROVIDERS", ()):
@@ -229,6 +303,18 @@ def _patch_target_resolution() -> bool:
                     func_name,
                     exc_info=True,
                 )
+
+    def _collect_db_fallback(dst: list[str]) -> None:
+        if not _b("PUSH_ROTATION_DB_FALLBACK", True):
+            return
+        max_rows = max(50, _i("PUSH_ROTATION_DB_FALLBACK_MAX", 300))
+        for kind in ("ranking", "summary"):
+            for path in _iter_existing_db_paths(kind):
+                vals = _sqlite_symbols_from_db(path, max_rows=max_rows)
+                if vals:
+                    _add(dst, vals, source=f"db.{kind}:{path}")
+                if len(dst) >= max(100, _i("PUSH_ROTATION_TARGET_MIN_KEEP", 100)):
+                    return
 
     def resolve_monitor_symbols_patched() -> list[str]:
         max_keep = max(1, _i("PUSH_ROTATION_TARGET_MAX_KEEP", rotation_symbols.DEFAULT_REGISTER_MAX_SYMBOLS))
@@ -246,6 +332,10 @@ def _patch_target_resolution() -> bool:
         if len(merged) < min_keep:
             _collect_dynamic_providers_all(merged)
 
+        # 最後の保険: 共有メモリが全て空でも、ランキングDB/サマリーDBから復元する。
+        if len(merged) < min_keep:
+            _collect_db_fallback(merged)
+
         merged = _d(merged)[:max_keep]
 
         if merged:
@@ -259,7 +349,7 @@ def _patch_target_resolution() -> bool:
             )
             return merged
 
-        logger.warning("[PUSH ROTATION TARGET TOPUP] no symbols resolved after topup")
+        logger.warning("[PUSH ROTATION TARGET TOPUP] no symbols resolved after topup including db fallback")
         return []
 
     def resolve_register_targets_patched() -> list[str]:
