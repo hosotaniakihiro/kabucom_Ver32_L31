@@ -1,6 +1,6 @@
 # ============================================================
 # File   : data_collectors/config.py
-# Version: DATA-COLLECTORS-CONFIG-V1
+# Version: DATA-COLLECTORS-CONFIG-V2-CONSOLE-LOG-DIR
 # ============================================================
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ def find_project_root() -> Path:
 
 
 PROJECT_ROOT = find_project_root()
-
 DEFAULT_BASE_DIR = r"\\192.168.0.22\AutoStockBuyAndSell"
 BASE_DIR = Path(os.environ.get("KABU_BASE_DIR", DEFAULT_BASE_DIR))
 
@@ -24,7 +23,10 @@ PUSH_DIR = RAW_DATA_DIR / "push"
 RANKING_DIR = RAW_DATA_DIR / "ranking"
 SUMMARY_DIR = RAW_DATA_DIR / "summary"
 SUBSCRIPTION_DIR = RAW_DATA_DIR / "push_subscription"
-LOG_DIR = BASE_DIR / "Logs" / "data_collectors"
+
+# コンソールログはNASではなく、指定されたローカル/共有ドライブへ保存する。
+# 変更したい場合は KABU_CONSOLE_LOG_DIR を設定する。
+LOG_DIR = Path(os.environ.get("KABU_CONSOLE_LOG_DIR", r"X:\logs\console"))
 
 
 def trade_date_yyyymmdd() -> str:
