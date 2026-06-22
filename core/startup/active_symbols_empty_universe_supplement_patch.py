@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/active_symbols_empty_universe_supplement_patch.py
-# Version: V1-ACTIVE-EMPTY-UNIVERSE-SUPPLEMENT
+# Version: V2-ACTIVE-EMPTY-UNIVERSE-DIRECT-DB-FALLBACK
 # ------------------------------------------------------------
 # Purpose:
 #   During market hours, active_symbols.manager normally restricts
@@ -10,8 +10,10 @@
 #   allowed_universe is empty, the strict universe check drops every
 #   daily_watchlist/global candidate and logs skipped_universe=xxxx.
 #
-#   This patch relaxes only that empty-universe case so PUSH can keep a
-#   100-symbol target without relying on the later DB fallback path.
+#   V2 also patches _build_today_ranking_candidates itself. If the in-memory
+#   today_ranking route returns empty, it loads symbols directly from today's
+#   ranking DB and returns them as primary candidates. This prevents the
+#   manager from entering the empty-universe path in the first place.
 # ============================================================
 from __future__ import annotations
 
@@ -22,10 +24,23 @@ logger = logging.getLogger(__name__)
 
 _PATCHED = False
 _ORIGINAL_SUPPLEMENT = None
+_ORIGINAL_BUILD_TODAY = None
+
+
+def _load_db_fallback_symbols(target: int) -> list[str]:
+    try:
+        from trading.ranking.active_symbols import db_ranking_fallback_patch as dbfb
+
+        loader = getattr(dbfb, "_load_symbols_from_ranking_db", None)
+        if callable(loader):
+            return list(loader(max_rows=max(int(target) * 3, 300)) or [])[: int(target)]
+    except Exception:
+        logger.debug("[ACTIVE EMPTY UNIVERSE PATCH] db fallback loader failed", exc_info=True)
+    return []
 
 
 def install() -> bool:
-    global _PATCHED, _ORIGINAL_SUPPLEMENT
+    global _PATCHED, _ORIGINAL_SUPPLEMENT, _ORIGINAL_BUILD_TODAY
     if _PATCHED:
         return True
 
@@ -157,8 +172,66 @@ def install() -> bool:
             return active, diag
 
         manager._supplement_active_to_target = _patched_supplement_active_to_target
+
+        build_today = getattr(manager, "_build_today_ranking_candidates", None)
+        if callable(build_today):
+            _ORIGINAL_BUILD_TODAY = build_today
+
+            def _patched_build_today_ranking_candidates(*, now, eligible_symbols, protected, liquidity_map):
+                candidates, universe, source_name = build_today(
+                    now=now,
+                    eligible_symbols=eligible_symbols,
+                    protected=protected,
+                    liquidity_map=liquidity_map,
+                )
+                if candidates or universe:
+                    return candidates, universe, source_name
+
+                try:
+                    target = int(getattr(manager, "TARGET_ACTIVE_SYMBOLS", 100) or 100)
+                except Exception:
+                    target = 100
+
+                raw = _load_db_fallback_symbols(target=max(target * 3, 300))
+                fallback: list[str] = []
+                skipped_flags = 0
+                for sym in raw:
+                    ns = manager.normalize_symbol(sym)
+                    if not ns:
+                        continue
+                    if manager.ACTIVE_REQUIRE_SYMBOL_FLAGS and ns not in eligible_symbols and ns not in protected:
+                        skipped_flags += 1
+                        continue
+                    if ns not in fallback:
+                        fallback.append(ns)
+                    if len(fallback) >= target:
+                        break
+
+                if fallback:
+                    logger.warning(
+                        "[ACTIVE EMPTY UNIVERSE PATCH] direct today_ranking db fallback candidates=%s universe=%s target=%s skipped_flags=%s head=%s",
+                        len(fallback),
+                        len(fallback),
+                        target,
+                        skipped_flags,
+                        fallback[:20],
+                    )
+                    return fallback, set(fallback), "today_ranking_db_direct_fallback"
+
+                logger.warning(
+                    "[ACTIVE EMPTY UNIVERSE PATCH] direct today_ranking db fallback empty skipped_flags=%s raw=%s",
+                    skipped_flags,
+                    len(raw),
+                )
+                return candidates, universe, source_name
+
+            manager._build_today_ranking_candidates = _patched_build_today_ranking_candidates
+
         _PATCHED = True
-        logger.warning("[ACTIVE EMPTY UNIVERSE PATCH] installed")
+        logger.warning(
+            "[ACTIVE EMPTY UNIVERSE PATCH] installed version=V2 direct_today_fallback=%s",
+            bool(callable(build_today)),
+        )
         return True
     except Exception:
         logger.exception("[ACTIVE EMPTY UNIVERSE PATCH] install failed")
