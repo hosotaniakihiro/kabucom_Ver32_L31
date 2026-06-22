@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/summary_stale_guard_patch.py
-# Version: REV2-SUMMARY-STALE-GUARD-MERGED-GET
+# Version: REV3-SUMMARY-STALE-GUARD-MERGED-GET-ACTIVE-EMPTY-UNIVERSE
 # ------------------------------------------------------------
 # 【概要】
 #   PUSH / ranking summary が古いまま merged summary に残り、
@@ -12,6 +12,8 @@
 #   - 計算用 summary_history は履歴が必要なので除外しない。
 #   - 最新足が 3m/5m の完成足として少し遅れるケースを考慮し、
 #     「現在時刻からの絶対 stale」だけでなく「最新足から見て古すぎる行」も落とす。
+#   - DB系プロセスでランキング universe が空のとき、active symbols 補充が全落ちしない
+#     軽量パッチも同時に入れる。
 # ============================================================
 
 from __future__ import annotations
@@ -256,10 +258,24 @@ def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sani
         return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
 
 
+def _install_active_empty_universe_patch() -> None:
+    try:
+        if os.getenv("DISABLE_ACTIVE_EMPTY_UNIVERSE_PATCH", "").strip() == "1":
+            logger.warning("[SUMMARY STALE GUARD PATCH] active empty-universe patch disabled by env")
+            return
+        from core.startup.active_symbols_empty_universe_supplement_patch import install as install_active_patch
+
+        ok = bool(install_active_patch())
+        logger.warning("[SUMMARY STALE GUARD PATCH] active empty-universe patch ok=%s", ok)
+    except Exception:
+        logger.exception("[SUMMARY STALE GUARD PATCH] active empty-universe patch install failed")
+
+
 def install() -> bool:
     global _PATCHED, _ORIGINAL_SANITIZE_SUMMARY_DF, _ORIGINAL_GET_MERGED_SUMMARY
 
     if _PATCHED:
+        _install_active_empty_universe_patch()
         return True
 
     try:
@@ -268,6 +284,7 @@ def install() -> bool:
         original_sanitize = getattr(ctx, "_sanitize_summary_df", None)
         if original_sanitize is None:
             logger.warning("[SUMMARY STALE GUARD PATCH] skipped: _sanitize_summary_df not found")
+            _install_active_empty_universe_patch()
             return False
 
         _ORIGINAL_SANITIZE_SUMMARY_DF = original_sanitize
@@ -296,11 +313,13 @@ def install() -> bool:
             setattr(global_context_cls, "get_merged_summary", _get_merged_summary_with_stale_guard)
 
         _PATCHED = True
-        logger.info("[SUMMARY STALE GUARD PATCH] installed rev=2 sanitize=True merged_get=%s", bool(original_get_merged))
+        _install_active_empty_universe_patch()
+        logger.info("[SUMMARY STALE GUARD PATCH] installed rev=3 sanitize=True merged_get=%s active_empty_universe=True", bool(original_get_merged))
         return True
 
     except Exception:
         logger.exception("[SUMMARY STALE GUARD PATCH] install failed")
+        _install_active_empty_universe_patch()
         return False
 
 
