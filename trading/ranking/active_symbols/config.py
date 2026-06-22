@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/ranking/active_symbols/config.py
-# Version: Ver1.4-ACTIVE-SYMBOLS-PREMARKET-ONLY-BEFORE-OPEN
+# Version: Ver1.5-ACTIVE-SYMBOLS-MIN-PRICE-200
 # ============================================================
 from __future__ import annotations
 import os
@@ -75,8 +75,8 @@ ENABLE_LIQUIDITY_FILTER = env_bool("ACTIVE_ENABLE_LIQUIDITY_FILTER", True)
 MIN_TRADING_VALUE = env_float("ACTIVE_MIN_TRADING_VALUE", 20_000_000)
 MIN_VOLUME = env_float("ACTIVE_MIN_VOLUME", 3_000)
 MIN_TICK_COUNT = env_float("ACTIVE_MIN_TICK_COUNT", 10)
-# 監視銘柄は2500円以上に限定。
-MIN_PRICE = env_float("ACTIVE_MIN_PRICE", 2_500)
+# 監視銘柄は200円以上に限定。
+MIN_PRICE = env_float("ACTIVE_MIN_PRICE", 200)
 # 監視銘柄は7000円以下に限定。0以下にすると上限なし。
 MAX_PRICE = env_float("ACTIVE_MAX_PRICE", 7_000)
 KEEP_PROTECTED_EVEN_IF_ILLIQUID = env_bool("ACTIVE_KEEP_PROTECTED_EVEN_IF_ILLIQUID", True)
