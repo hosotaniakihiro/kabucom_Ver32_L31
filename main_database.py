@@ -1,16 +1,18 @@
 # ============================================================
 # File   : main_database.py
-# Version: DATA-COLLECTORS-MAIN-DATABASE-ENTRY-V5-SUMMARY-STALE-GUARD
+# Version: DATA-COLLECTORS-MAIN-DATABASE-ENTRY-V6-CONSOLE-LOG-FILE
 # ------------------------------------------------------------
 # Purpose:
 #   - DB作成 / ランキング取得 / PUSH銘柄登録 / PUSH受信 を起動する入口
 #   - 既存 main.py とは分離する
 #   - 実体は scripts/data_collectors_runner.py に委譲する
 #   - main_database.py 経由でも古い PUSH/ranking summary を候補に残さない
+#   - main_database.py のコンソールログに時刻を付け、ファイルにも保存する
 # ============================================================
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import os
 import sys
@@ -28,17 +30,52 @@ except Exception:
     pass
 
 logger = logging.getLogger(__name__)
+_MAIN_DATABASE_LOG_FILE_INSTALLED = False
 
 
 def _ensure_basic_logging() -> None:
+    """Configure timestamped console logging and save main_database logs to file.
+
+    sitecustomize/usercustomize may create root handlers before main_database.py
+    starts.  In that case logging.basicConfig() is ignored, so force the formatter
+    on existing handlers as well.  The child collector output is captured/saved by
+    scripts/data_collectors_runner.py.
+    """
+    global _MAIN_DATABASE_LOG_FILE_INSTALLED
     try:
         root = logging.getLogger()
-        if not root.handlers:
-            logging.basicConfig(
-                level=logging.INFO,
-                format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-            )
         root.setLevel(logging.INFO)
+
+        fmt = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+
+        if not root.handlers:
+            sh = logging.StreamHandler(sys.stdout)
+            sh.setFormatter(fmt)
+            root.addHandler(sh)
+        else:
+            for h in root.handlers:
+                try:
+                    h.setFormatter(fmt)
+                except Exception:
+                    pass
+
+        if not _MAIN_DATABASE_LOG_FILE_INSTALLED:
+            try:
+                from data_collectors.config import LOG_DIR
+                LOG_DIR.mkdir(parents=True, exist_ok=True)
+                ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+                pid = os.getpid()
+                log_path = LOG_DIR / f"main_database_{ts}_{pid}.log"
+                fh = logging.FileHandler(log_path, encoding="utf-8")
+                fh.setFormatter(fmt)
+                root.addHandler(fh)
+                _MAIN_DATABASE_LOG_FILE_INSTALLED = True
+                logging.getLogger(__name__).warning("[MAIN DATABASE LOG] save to: %s", log_path)
+            except Exception:
+                logging.getLogger(__name__).exception("[MAIN DATABASE LOG] file handler install failed")
     except Exception:
         pass
 
