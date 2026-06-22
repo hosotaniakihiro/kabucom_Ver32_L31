@@ -1,11 +1,12 @@
 # ============================================================
 # File   : scripts/summary_database_runner.py
-# Version: SUMMARY-DATABASE-RUNNER-V8-FORCE-CPU-THROTTLE
+# Version: SUMMARY-DATABASE-RUNNER-V9-PERIODIC-MTF-DB-SAVE
 # ------------------------------------------------------------
 # Purpose:
 #   - main_database.py 側で定時サマリー計算・DB保存を担当する子プロセス
 #   - DB保存 owner は database 側へ寄せる
-#   - CPU高止まり対策として、表示OFF/3m5m境界実行/spool flush間引き/slow tick skipを強制する
+#   - 1m/3m/5m のPUSH由来サマリーを毎分DB保存する
+#   - 表示/Discordは抑止し、保存専用として動かす
 # ============================================================
 
 from __future__ import annotations
@@ -42,9 +43,14 @@ def _install_database_summary_env() -> None:
     os.environ["SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY"] = "0"
     os.environ.setdefault("SUMMARY_SAVE_SPOOL_FLUSH", "1")
 
-    # CPU高止まり対策: 1m/3m/5mを毎分すべて回さない。
-    # sitecustomize/summary_parallel が 1 を入れる場合があるため、ここは必ず強制上書きする。
-    os.environ["SUMMARY_PUSH_DISPLAY_ALL_INTERVALS"] = "0"
+    # DB保存専用プロセスでは、PUSH由来の 1m/3m/5m を毎分計算・保存する。
+    # 以前はCPU対策で SUMMARY_PUSH_DISPLAY_ALL_INTERVALS=0 を強制していたため、
+    # 3m/5m が時間境界または起動時catchup中心になりやすかった。
+    # 重い場合のみ settings.ini / 環境変数で SUMMARY_DATABASE_MTF_EVERY_MINUTE=0 に戻せる。
+    raw_mtf_every_minute = str(os.getenv("SUMMARY_DATABASE_MTF_EVERY_MINUTE", "1")).strip().lower()
+    mtf_every_minute = "0" if raw_mtf_every_minute in {"0", "false", "no", "off", "disable", "disabled"} else "1"
+    os.environ["SUMMARY_DATABASE_MTF_EVERY_MINUTE"] = mtf_every_minute
+    os.environ["SUMMARY_PUSH_DISPLAY_ALL_INTERVALS"] = mtf_every_minute
     os.environ["SUMMARY_PARALLEL_FORCE_1_3_5"] = "0"
     os.environ["SUMMARY_PARALLEL_INTERVAL_WORKERS"] = "1"
     os.environ["SUMMARY_PUSH_BG_INTERVAL_WORKERS"] = "1"
@@ -211,6 +217,7 @@ def main() -> int:
     logger.info("[SUMMARY DB RUNNER] AUTOSTOCK_SUMMARY_SAVE_OWNER=%s", os.getenv("AUTOSTOCK_SUMMARY_SAVE_OWNER"))
     logger.info("[SUMMARY DB RUNNER] AUTOSTOCK_SUMMARY_SAVE_MODE=%s", os.getenv("AUTOSTOCK_SUMMARY_SAVE_MODE"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_DATABASE_RUNNER_DISPLAY=%s", os.getenv("SUMMARY_DATABASE_RUNNER_DISPLAY"))
+    logger.info("[SUMMARY DB RUNNER] SUMMARY_DATABASE_MTF_EVERY_MINUTE=%s", os.getenv("SUMMARY_DATABASE_MTF_EVERY_MINUTE"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_PUSH_DISPLAY_ALL_INTERVALS=%s", os.getenv("SUMMARY_PUSH_DISPLAY_ALL_INTERVALS"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_PARALLEL_FORCE_1_3_5=%s workers=%s bg_workers=%s", os.getenv("SUMMARY_PARALLEL_FORCE_1_3_5"), os.getenv("SUMMARY_PARALLEL_INTERVAL_WORKERS"), os.getenv("SUMMARY_PUSH_BG_INTERVAL_WORKERS"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_SAVE_SPOOL_FLUSH=%s min_interval=%s max_files=%s", os.getenv("SUMMARY_SAVE_SPOOL_FLUSH"), os.getenv("SUMMARY_SAVE_SPOOL_FLUSH_MIN_INTERVAL_SEC"), os.getenv("SUMMARY_SAVE_SPOOL_FLUSH_MAX_FILES"))
@@ -251,7 +258,7 @@ def main() -> int:
             display_enabled = _env_true("SUMMARY_DATABASE_RUNNER_DISPLAY", default=False)
 
             logger.info(
-                "[SUMMARY DB RUNNER] tick start now=%s run_push=True run_ranking=%s display=%s run_entry=False save_owner=%s save_mode=%s skip_main=%s role=%s empty_notify=%s spool_flush=%s push_all_intervals=%s force_1_3_5=%s workers=%s",
+                "[SUMMARY DB RUNNER] tick start now=%s run_push=True run_ranking=%s display=%s run_entry=False save_owner=%s save_mode=%s skip_main=%s role=%s empty_notify=%s spool_flush=%s mtf_every_minute=%s push_all_intervals=%s force_1_3_5=%s workers=%s",
                 now,
                 ranking_enabled,
                 display_enabled,
@@ -261,6 +268,7 @@ def main() -> int:
                 os.getenv("SUMMARY_DB_WRITER_ROLE"),
                 os.getenv("SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY"),
                 os.getenv("SUMMARY_SAVE_SPOOL_FLUSH"),
+                os.getenv("SUMMARY_DATABASE_MTF_EVERY_MINUTE"),
                 os.getenv("SUMMARY_PUSH_DISPLAY_ALL_INTERVALS"),
                 os.getenv("SUMMARY_PARALLEL_FORCE_1_3_5"),
                 os.getenv("SUMMARY_PARALLEL_INTERVAL_WORKERS"),
