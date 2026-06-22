@@ -1,10 +1,16 @@
 # ============================================================
 # File   : scripts/data_collectors_runner.py
-# Version: DATA-COLLECTORS-PARENT-RUNNER-V10-RANKING-DELAYED-START
+# Version: DATA-COLLECTORS-PARENT-RUNNER-V11-CHILD-CONSOLE-CAPTURE
 # ------------------------------------------------------------
 # Purpose:
 #   - DB作成 / ランキング取得 / PUSH受信 / Yahoo補完 / サマリーDB保存を一括起動する親runner
 #   - main.py とは別プロセスで動かす
+#   - 子プロセスの stdout/stderr を親runnerで受け取り、時刻付きでコンソールとログへ保存する
+#
+# V11:
+#   ✔ db_prepare / push_receiver / yahoo_complement / summary_database / ranking_collector の
+#     print / logging / sitecustomize 出力を [CHILD:name] として時刻付き保存する。
+#   ✔ 保存先は data_collectors.config.LOG_DIR。既定は X:\logs\console。
 #
 # V10:
 #   ✔ ranking_collector を既定で起動に戻す。
@@ -19,12 +25,12 @@
 
 from __future__ import annotations
 
-import datetime as dt
 import logging
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Dict
@@ -41,6 +47,7 @@ from data_collectors.logging_setup import setup_logging
 _STOP = False
 _TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 _FALSE = {"0", "false", "no", "n", "off", "disable", "disabled"}
+_CAPTURE_THREADS: list[threading.Thread] = []
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -174,6 +181,9 @@ def _build_env() -> dict[str, str]:
     env.setdefault("AUTOSTOCK_COLLECTOR_PARENT_HEARTBEAT", "0")
     env.setdefault("AUTOSTOCK_DISABLE_NAS_HEARTBEAT", "1")
 
+    # 子プロセスの print/logging を親runnerが即時に読めるようにする。
+    env.setdefault("PYTHONUNBUFFERED", "1")
+
     # ---- Memory / SQLite WAL guard defaults ----
     env.setdefault("PYTHONMALLOC", "malloc")
     env.setdefault("MALLOC_TRIM_THRESHOLD_", "65536")
@@ -242,6 +252,45 @@ def _check_file(path: Path) -> None:
         raise FileNotFoundError(f"runner not found: {path}")
 
 
+def _pump_child_output(logger: logging.Logger, name: str, stream) -> None:
+    try:
+        for line in iter(stream.readline, ""):
+            text = str(line).rstrip("\r\n")
+            if text:
+                logger.info("[CHILD:%s] %s", name, text)
+    except Exception:
+        logger.exception("[DATA COLLECTORS] child output pump failed name=%s", name)
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
+def _popen_captured(logger: logging.Logger, name: str, cmd: list[str], env: dict[str, str]) -> subprocess.Popen:
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(PROJECT_ROOT),
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if proc.stdout is not None:
+        th = threading.Thread(
+            target=_pump_child_output,
+            args=(logger, name, proc.stdout),
+            name=f"console-capture-{name}-{proc.pid}",
+            daemon=True,
+        )
+        th.start()
+        _CAPTURE_THREADS.append(th)
+    return proc
+
+
 def _run_db_prepare(logger: logging.Logger) -> None:
     _check_file(DB_PREPARE_RUNNER)
     cmd = [_python_exe(), str(DB_PREPARE_RUNNER)]
@@ -262,11 +311,12 @@ def _run_db_prepare(logger: logging.Logger) -> None:
         env.get("SUMMARY_EXISTING_NULL_REPAIR_ENABLED"),
     )
     _safe_mark_start("db_prepare_runner", {"cmd": cmd})
-    ret = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=env, text=True)
-    if ret.returncode != 0:
-        _safe_heartbeat("db_prepare_runner", status="ERROR", detail={"returncode": ret.returncode})
-        raise RuntimeError(f"db_prepare failed returncode={ret.returncode}")
-    _safe_heartbeat("db_prepare_runner", status="DONE", detail={"returncode": ret.returncode})
+    proc = _popen_captured(logger, "db_prepare", cmd, env)
+    ret = proc.wait()
+    if ret != 0:
+        _safe_heartbeat("db_prepare_runner", status="ERROR", detail={"returncode": ret})
+        raise RuntimeError(f"db_prepare failed returncode={ret}")
+    _safe_heartbeat("db_prepare_runner", status="DONE", detail={"returncode": ret})
     logger.info("[DATA COLLECTORS] db_prepare done")
 
 
@@ -294,7 +344,7 @@ def _start_child(logger: logging.Logger, name: str, path: Path) -> subprocess.Po
     )
 
     # 重要: Popen前にNAS heartbeat DBへ書かない。ここで落ちると child started が出ない。
-    proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), env=env, text=True)
+    proc = _popen_captured(logger, name, cmd, env)
     logger.info("[DATA COLLECTORS] child started name=%s pid=%s", name, proc.pid)
 
     _safe_mark_start(f"collector_{name}", {"cmd": cmd, "path": str(path), "pid": proc.pid})
