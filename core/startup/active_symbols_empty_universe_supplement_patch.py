@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/active_symbols_empty_universe_supplement_patch.py
-# Version: V2-ACTIVE-EMPTY-UNIVERSE-DIRECT-DB-FALLBACK
+# Version: V3-ACTIVE-EMPTY-UNIVERSE-DIRECT-DB-FALLBACK-PRICE-KEEP100
 # ------------------------------------------------------------
 # Purpose:
 #   During market hours, active_symbols.manager normally restricts
@@ -14,6 +14,11 @@
 #   today_ranking route returns empty, it loads symbols directly from today's
 #   ranking DB and returns them as primary candidates. This prevents the
 #   manager from entering the empty-universe path in the first place.
+#
+#   V3 also patches final_guard_min_price. If price information is missing
+#   and the final price guard would reduce the active list below the target,
+#   it restores only unknown-price symbols up to the target. Symbols with a
+#   known price outside the configured price band are still removed.
 # ============================================================
 from __future__ import annotations
 
@@ -25,6 +30,7 @@ logger = logging.getLogger(__name__)
 _PATCHED = False
 _ORIGINAL_SUPPLEMENT = None
 _ORIGINAL_BUILD_TODAY = None
+_ORIGINAL_FINAL_PRICE_GUARD = None
 
 
 def _load_db_fallback_symbols(target: int) -> list[str]:
@@ -40,7 +46,7 @@ def _load_db_fallback_symbols(target: int) -> list[str]:
 
 
 def install() -> bool:
-    global _PATCHED, _ORIGINAL_SUPPLEMENT, _ORIGINAL_BUILD_TODAY
+    global _PATCHED, _ORIGINAL_SUPPLEMENT, _ORIGINAL_BUILD_TODAY, _ORIGINAL_FINAL_PRICE_GUARD
     if _PATCHED:
         return True
 
@@ -227,10 +233,97 @@ def install() -> bool:
 
             manager._build_today_ranking_candidates = _patched_build_today_ranking_candidates
 
+        try:
+            import trading.ranking.active_symbols.liquidity as liquidity
+
+            final_guard = getattr(liquidity, "final_guard_min_price", None)
+            normalize_symbol = getattr(liquidity, "normalize_symbol", manager.normalize_symbol)
+            dedupe_keep_order = getattr(liquidity, "dedupe_keep_order", None)
+            _get_price = getattr(liquidity, "_get_price", None)
+            _price_ok = getattr(liquidity, "_price_ok", None)
+            _has_positive_value = getattr(liquidity, "_has_positive_value", None)
+
+            if callable(final_guard):
+                _ORIGINAL_FINAL_PRICE_GUARD = final_guard
+
+                def _patched_final_guard_min_price(symbols, *, protected, liquidity_map, premarket_mode):
+                    original_items = list(dedupe_keep_order(symbols)) if callable(dedupe_keep_order) else list(symbols or [])
+                    kept = list(final_guard(
+                        original_items,
+                        protected=protected,
+                        liquidity_map=liquidity_map,
+                        premarket_mode=premarket_mode,
+                    ) or [])
+
+                    try:
+                        target = int(getattr(manager, "TARGET_ACTIVE_SYMBOLS", 100) or 100)
+                    except Exception:
+                        target = 100
+                    if len(kept) >= target:
+                        return kept
+
+                    kept_set = {normalize_symbol(s) for s in kept}
+                    restored: list[str] = []
+                    for sym in original_items:
+                        ns = normalize_symbol(sym)
+                        if not ns or ns in kept_set:
+                            continue
+                        if ns in (protected or set()):
+                            kept.append(ns)
+                            kept_set.add(ns)
+                            restored.append(ns)
+                        else:
+                            info = (liquidity_map or {}).get(ns)
+                            price = 0.0
+                            try:
+                                price = float(_get_price(info or {}) if callable(_get_price) else 0.0)
+                            except Exception:
+                                price = 0.0
+
+                            # Known out-of-band prices stay removed. Unknown-price
+                            # symbols are restored only to keep the PUSH watchlist at target.
+                            if price > 0:
+                                try:
+                                    if callable(_price_ok) and not _price_ok(price):
+                                        continue
+                                except Exception:
+                                    continue
+                            else:
+                                has_known_price = False
+                                try:
+                                    if callable(_has_positive_value):
+                                        has_known_price = bool(_has_positive_value(info, ("current_price", "price", "close", "last_price", "close_price", "現在値")))
+                                except Exception:
+                                    has_known_price = False
+                                if has_known_price:
+                                    continue
+
+                            kept.append(ns)
+                            kept_set.add(ns)
+                            restored.append(ns)
+                        if len(kept) >= target:
+                            break
+
+                    if restored:
+                        logger.warning(
+                            "[ACTIVE EMPTY UNIVERSE PATCH] final price guard keep-target before=%s after=%s target=%s restored_unknown_price=%s head=%s",
+                            len(original_items),
+                            len(kept),
+                            target,
+                            len(restored),
+                            restored[:30],
+                        )
+                    return kept
+
+                liquidity.final_guard_min_price = _patched_final_guard_min_price
+        except Exception:
+            logger.debug("[ACTIVE EMPTY UNIVERSE PATCH] final price guard patch skipped", exc_info=True)
+
         _PATCHED = True
         logger.warning(
-            "[ACTIVE EMPTY UNIVERSE PATCH] installed version=V2 direct_today_fallback=%s",
+            "[ACTIVE EMPTY UNIVERSE PATCH] installed version=V3 direct_today_fallback=%s final_price_keep_target=%s",
             bool(callable(build_today)),
+            _ORIGINAL_FINAL_PRICE_GUARD is not None,
         )
         return True
     except Exception:
