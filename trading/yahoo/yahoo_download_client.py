@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/yahoo/yahoo_download_client.py
-# Version: Ver2.0-PRODUCTION-YAHOO-DOWNLOAD-CLIENT-HARD-TIMEOUT
+# Version: Ver2.1-PRODUCTION-YAHOO-DOWNLOAD-CLIENT-KEYERROR-SAFE
 # ------------------------------------------------------------
 # ✔ safe_download
 # ✔ Yahoo 1m 安定取得
@@ -13,6 +13,7 @@
 # ✔ volume safety
 # ✔ 20分遅延フィルタ
 # ✔ yfinance crash guard
+# ✔ yfinance shared._DFS KeyError 防御
 # ✔ No objects to concatenate 防御
 # ✔ dataframe構造保証
 # ✔ production safe
@@ -23,15 +24,15 @@
 # ✔ serial retry safe
 # ✔ ticker= 明示で単一銘柄固定
 # ✔ yfinance call timeout
-# ✔ 1銘柄ハングでも全体停止しない
+# ✔ 1銘柄ハング/失敗でも全体停止しない
 # ============================================================
 
 from __future__ import annotations
 
 import datetime as dt
 import logging
-import time
 import threading
+import time
 from typing import Optional
 
 import numpy as np
@@ -57,69 +58,22 @@ YF_DOWNLOAD_TIMEOUT_SEC = 15.0
 # ============================================================
 
 def _normalize_symbol_token(symbol: str) -> str:
-    s = str(symbol or "").strip().upper()
-    return s
+    return str(symbol or "").strip().upper()
 
 
 def _normalize_yahoo_symbol(symbol: str) -> str:
     s = _normalize_symbol_token(symbol)
     if not s:
         return s
-
     if s.endswith(".T"):
         return s
-
     if s.isdigit():
         return f"{s}.T"
-
     return s
 
 
-def _extract_symbol_only_columns(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
-    """
-    yfinance の MultiIndex columns から対象 symbol の列だけを厳密抽出する。
-    """
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    out = df.copy()
-    target = _normalize_symbol_token(symbol)
-    target_alt = _normalize_symbol_token(_normalize_yahoo_symbol(symbol))
-
-    try:
-        if not isinstance(out.columns, pd.MultiIndex):
-            return out
-
-        keep_cols = []
-
-        for col in out.columns:
-            try:
-                if not isinstance(col, tuple) or len(col) < 2:
-                    continue
-
-                sym = _normalize_symbol_token(col[1])
-
-                if sym == target or sym == target_alt:
-                    keep_cols.append(col)
-            except Exception:
-                continue
-
-        if not keep_cols:
-            logger.warning(
-                "[YAHOO DEBUG] %s no matching MultiIndex columns found raw_cols=%s",
-                symbol,
-                list(out.columns),
-            )
-            return pd.DataFrame()
-
-        out = out.loc[:, keep_cols].copy()
-        out.columns = [str(c[0]).strip() for c in keep_cols]
-
-        return out
-
-    except Exception:
-        logger.exception("[YAHOO DEBUG] %s symbol-only extract failed", symbol)
-        return pd.DataFrame()
+def _plain_symbol(symbol: str) -> str:
+    return str(symbol or "").strip().upper().replace(".T", "")
 
 
 # ============================================================
@@ -134,55 +88,118 @@ def _ensure_series(value):
     return value
 
 
+def _empty_df() -> pd.DataFrame:
+    return pd.DataFrame()
+
+
 def _drop_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
-        return pd.DataFrame()
-
+        return _empty_df()
     out = df.copy()
-
     try:
         out = out.loc[:, ~out.columns.duplicated(keep="last")]
     except Exception:
         logger.exception("[YAHOO DEBUG] duplicate columns drop failed")
-
     return out
 
 
 def _drop_duplicate_index(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
-        return pd.DataFrame()
-
+        return _empty_df()
     out = df.copy()
-
     try:
         out = out[~out.index.duplicated(keep="last")]
     except Exception:
         logger.exception("[YAHOO DEBUG] duplicate index drop failed")
-
     return out
 
 
 def _replace_inf(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
-        return pd.DataFrame()
-
+        return _empty_df()
     out = df.copy()
-
     try:
         out = out.replace([np.inf, -np.inf], np.nan)
     except Exception:
         logger.exception("[YAHOO DEBUG] replace inf failed")
-
     return out
 
 
 # ============================================================
-# column normalize
+# yfinance MultiIndex helpers
+# ============================================================
+
+def _extract_symbol_only_columns(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """
+    yfinance の MultiIndex columns から対象 symbol の列だけを厳密抽出する。
+    単一tickerの通常DataFrameならそのまま返す。
+    """
+    if df is None or df.empty:
+        return _empty_df()
+
+    out = df.copy()
+    target = _normalize_symbol_token(symbol)
+    target_alt = _normalize_symbol_token(_normalize_yahoo_symbol(symbol))
+
+    try:
+        if not isinstance(out.columns, pd.MultiIndex):
+            return out
+
+        keep_cols = []
+        for col in out.columns:
+            try:
+                if not isinstance(col, tuple):
+                    continue
+                tokens = [_normalize_symbol_token(x) for x in col if x is not None]
+                if target in tokens or target_alt in tokens:
+                    keep_cols.append(col)
+            except Exception:
+                continue
+
+        # yf.download(tickers="9399.T") では MultiIndex の第2階層が ticker ではない場合がある。
+        # 単一銘柄で ticker 階層が見つからない場合は、価格列だけを残す方向にフォールバックする。
+        if not keep_cols:
+            price_names = {"open", "high", "low", "close", "adj close", "volume"}
+            fallback_cols = []
+            for col in out.columns:
+                try:
+                    if isinstance(col, tuple) and str(col[0]).strip().lower() in price_names:
+                        fallback_cols.append(col)
+                except Exception:
+                    continue
+            if fallback_cols:
+                keep_cols = fallback_cols
+            else:
+                logger.warning(
+                    "[YAHOO DEBUG] %s no matching MultiIndex columns found raw_cols=%s",
+                    symbol,
+                    list(out.columns),
+                )
+                return _empty_df()
+
+        out = out.loc[:, keep_cols].copy()
+        new_cols = []
+        for c in keep_cols:
+            try:
+                new_cols.append(str(c[0]).strip())
+            except Exception:
+                new_cols.append(str(c).strip())
+        out.columns = new_cols
+        return out
+
+    except Exception:
+        logger.exception("[YAHOO DEBUG] %s symbol-only extract failed", symbol)
+        return _empty_df()
+
+
+# ============================================================
+# column/index normalize
 # ============================================================
 
 def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return _empty_df()
     out = df.copy()
-
     try:
         if isinstance(out.columns, pd.MultiIndex):
             flattened = []
@@ -199,13 +216,13 @@ def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
             out.columns = flattened
     except Exception:
         logger.exception("[YAHOO DEBUG] flatten columns failed")
-
     return out
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return _empty_df()
     out = _flatten_columns(df)
-
     new_cols = []
     for c in out.columns:
         s = str(c).strip().lower()
@@ -216,44 +233,32 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         s = s.replace(")", "")
         s = s.replace(".", "_")
         new_cols.append(s)
-
     out.columns = new_cols
-    out = _drop_duplicate_columns(out)
-    return out
+    return _drop_duplicate_columns(out)
 
-
-# ============================================================
-# index normalize
-# ============================================================
 
 def _normalize_index(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return _empty_df()
     out = _drop_duplicate_index(df)
     out = out.reset_index()
 
     rename_map = {}
     for c in out.columns:
         cl = str(c).strip().lower()
-        if cl == "datetime":
+        if cl in {"datetime", "date", "index"}:
             rename_map[c] = "time"
-        elif cl == "date":
-            rename_map[c] = "time"
-        elif cl == "index":
-            rename_map[c] = "time"
-
     if rename_map:
         out = out.rename(columns=rename_map)
 
-    out = _drop_duplicate_columns(out)
-    return out
+    return _drop_duplicate_columns(out)
 
-
-# ============================================================
-# datetime normalize
-# ============================================================
 
 def _normalize_datetime(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
+    if df is None or df.empty:
+        return _empty_df()
 
+    out = df.copy()
     if "time" not in out.columns:
         for c in list(out.columns):
             cl = str(c).lower()
@@ -264,11 +269,10 @@ def _normalize_datetime(df: pd.DataFrame) -> pd.DataFrame:
                     break
 
     if "time" not in out.columns:
-        return pd.DataFrame()
+        return _empty_df()
 
     out["time"] = pd.to_datetime(_ensure_series(out["time"]), errors="coerce")
     out = out.dropna(subset=["time"])
-
     if out.empty:
         return out
 
@@ -276,23 +280,24 @@ def _normalize_datetime(df: pd.DataFrame) -> pd.DataFrame:
         if getattr(out["time"].dt, "tz", None) is not None:
             out["time"] = out["time"].dt.tz_convert("Asia/Tokyo").dt.tz_localize(None)
         else:
-            out["time"] = (
-                pd.to_datetime(out["time"], errors="coerce")
-                .dt.tz_localize("UTC")
-                .dt.tz_convert("Asia/Tokyo")
-                .dt.tz_localize(None)
-            )
+            # yfinanceのtimestampは多くの場合UTC相当。失敗時は元のnaive値を残す。
+            try:
+                out["time"] = (
+                    pd.to_datetime(out["time"], errors="coerce")
+                    .dt.tz_localize("UTC")
+                    .dt.tz_convert("Asia/Tokyo")
+                    .dt.tz_localize(None)
+                )
+            except Exception:
+                out["time"] = pd.to_datetime(_ensure_series(out["time"]), errors="coerce")
     except Exception:
         logger.exception("[YAHOO DEBUG] datetime JST normalize failed")
 
     out = out.dropna(subset=["time"])
-
     try:
-        out = out.sort_values("time")
-        out = out.drop_duplicates(subset=["time"], keep="last")
+        out = out.sort_values("time").drop_duplicates(subset=["time"], keep="last")
     except Exception:
         logger.exception("[YAHOO DEBUG] datetime sort/dedup failed")
-
     return out
 
 
@@ -302,11 +307,9 @@ def _normalize_datetime(df: pd.DataFrame) -> pd.DataFrame:
 
 def _pick_first_matching_column(df: pd.DataFrame, patterns: list[str]) -> Optional[str]:
     cols = list(df.columns)
-
     for p in patterns:
         if p in cols:
             return p
-
     for c in cols:
         cl = str(c).lower()
         for p in patterns:
@@ -314,13 +317,14 @@ def _pick_first_matching_column(df: pd.DataFrame, patterns: list[str]) -> Option
                 continue
             if p in cl:
                 return c
-
     return None
 
 
 def _normalize_prices(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
+    if df is None or df.empty:
+        return _empty_df()
 
+    out = df.copy()
     mapping = {
         "open_price": ["open_price", "open"],
         "high_price": ["high_price", "high"],
@@ -344,21 +348,19 @@ def _normalize_prices(df: pd.DataFrame) -> pd.DataFrame:
             missing,
             list(out.columns),
         )
-        return pd.DataFrame()
+        return _empty_df()
 
     if "volume" not in out.columns:
         out["volume"] = pd.NA
 
     for col in ["open_price", "high_price", "low_price", "close_price", "volume"]:
-        s = _ensure_series(out[col])
-        out[col] = pd.to_numeric(s, errors="coerce")
+        out[col] = pd.to_numeric(_ensure_series(out[col]), errors="coerce")
 
     out = _replace_inf(out)
     out = out.dropna(subset=["open_price", "high_price", "low_price", "close_price"])
-
     if out.empty:
         logger.warning("[YAHOO DEBUG] empty after OHLC numeric validation")
-        return pd.DataFrame()
+        return _empty_df()
 
     zero_mask = (
         out[["open_price", "high_price", "low_price", "close_price"]]
@@ -371,40 +373,38 @@ def _normalize_prices(df: pd.DataFrame) -> pd.DataFrame:
 
     zero_count = int(zero_mask.sum())
     if zero_count > 0:
-        logger.warning(
-            "[YAHOO DEBUG] dropping zero OHLCV rows=%d/%d",
-            zero_count,
-            len(out),
-        )
+        logger.warning("[YAHOO DEBUG] dropping zero OHLCV rows=%d/%d", zero_count, len(out))
         out = out.loc[~zero_mask].copy()
 
+    # downstream互換用 alias
+    out["open"] = out["open_price"]
+    out["high"] = out["high_price"]
+    out["low"] = out["low_price"]
+    out["close"] = out["close_price"]
     return out
 
 
 # ============================================================
-# volume safety
+# volume/delay safety
 # ============================================================
 
 def _fix_volume(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return _empty_df()
     out = df.copy()
-
     if "volume" not in out.columns:
         return out
-
     try:
         out["volume"] = pd.to_numeric(_ensure_series(out["volume"]), errors="coerce")
         out.loc[out["volume"] < 0, "volume"] = 0.0
     except Exception:
         out["volume"] = pd.to_numeric(_ensure_series(out["volume"]), errors="coerce")
-
     return out
 
 
-# ============================================================
-# delay filter
-# ============================================================
-
 def _apply_delay_filter(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return _empty_df()
     cutoff = dt.datetime.now().replace(second=0, microsecond=0) - dt.timedelta(minutes=YAHOO_DELAY_MIN)
     return df[df["time"] <= cutoff].copy()
 
@@ -424,22 +424,42 @@ def _yf_download_worker(store: dict, yahoo_symbol: str, interval: str) -> None:
             threads=False,
             group_by="column",
         )
-        store["df"] = df
+        if df is None:
+            store["df"] = _empty_df()
+        elif isinstance(df, pd.DataFrame):
+            store["df"] = df
+        else:
+            try:
+                store["df"] = pd.DataFrame(df)
+            except Exception:
+                store["df"] = _empty_df()
         store["error"] = None
+    except KeyError as e:
+        # yfinance内部 shared._DFS[ticker] 欠落。銘柄単位の一時失敗なので全体停止させない。
+        store["df"] = _empty_df()
+        store["error"] = None
+        store["soft_error"] = f"KeyError: {e}"
+    except ValueError as e:
+        # No objects to concatenate 等。空DFで安全にスキップ。
+        store["df"] = _empty_df()
+        store["error"] = None
+        store["soft_error"] = f"ValueError: {e}"
     except Exception as e:
-        store["df"] = pd.DataFrame()
-        store["error"] = e
+        # その他も銘柄単位では空DFにする。例外スタック連発でメイン処理を止めない。
+        store["df"] = _empty_df()
+        store["error"] = None
+        store["soft_error"] = f"{type(e).__name__}: {e}"
 
 
-def _download_raw_once(
-    symbol: str,
-    interval: str = "1m",
-) -> pd.DataFrame:
+def _download_raw_once(symbol: str, interval: str = "1m") -> pd.DataFrame:
     yahoo_symbol = _normalize_yahoo_symbol(symbol)
+    if not yahoo_symbol:
+        return _empty_df()
 
     store: dict = {
-        "df": pd.DataFrame(),
+        "df": _empty_df(),
         "error": None,
+        "soft_error": None,
     }
 
     th = threading.Thread(
@@ -460,31 +480,34 @@ def _download_raw_once(
             yahoo_symbol,
             YF_DOWNLOAD_TIMEOUT_SEC,
         )
-        return pd.DataFrame()
+        return _empty_df()
+
+    soft_error = store.get("soft_error")
+    if soft_error:
+        logger.warning(
+            "[YAHOO DEBUG] yf.download soft failed symbol=%s yahoo_symbol=%s interval=%s err=%s elapsed=%.3fs",
+            symbol,
+            yahoo_symbol,
+            interval,
+            soft_error,
+            max(time.time() - started, 0.0),
+        )
+        return _empty_df()
 
     err = store.get("error")
     if err is not None:
-        raise err
+        logger.warning(
+            "[YAHOO DEBUG] yf.download failed symbol=%s yahoo_symbol=%s interval=%s err=%s",
+            symbol,
+            yahoo_symbol,
+            interval,
+            err,
+        )
+        return _empty_df()
 
     df = store.get("df")
-    if df is None:
-        return pd.DataFrame()
-
-    if not isinstance(df, pd.DataFrame):
-        try:
-            df = pd.DataFrame(df)
-        except Exception:
-            return pd.DataFrame()
-
-    """try:
-        logger.info(
-            "[YAHOO DEBUG] yf.download done symbol=%s rows=%s elapsed=%.3fs",
-            symbol,
-            0 if df is None else len(df),
-            max(time.time() - started, 0.0),
-        )
-    except Exception:
-        pass"""
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return _empty_df()
 
     return df.copy()
 
@@ -500,75 +523,33 @@ def safe_download(
     interval: str = "1m",
 ) -> pd.DataFrame:
     """
-    Yahoo 1min download safe wrapper
+    Yahoo 1min download safe wrapper.
+    1銘柄の yfinance 失敗/KeyError/empty/timeout は空DataFrameとして返し、全体処理は止めない。
     """
-
     if not symbol:
-        return pd.DataFrame()
+        return _empty_df()
 
-    raw_df = pd.DataFrame()
-    last_error = None
+    raw_df = _empty_df()
 
     for attempt in range(1, YAHOO_MAX_RETRIES + 1):
         attempt_started = time.time()
+        raw_df = _download_raw_once(symbol=symbol, interval=interval)
 
-        try:
-            raw_df = _download_raw_once(symbol=symbol, interval=interval)
-
-            if raw_df is None or raw_df.empty:
-                logger.debug(
-                    "[YAHOO DEBUG] %s empty dataframe attempt=%d/%d elapsed=%.3fs",
-                    symbol,
-                    attempt,
-                    YAHOO_MAX_RETRIES,
-                    max(time.time() - attempt_started, 0.0),
-                )
-            last_error = None
+        if raw_df is not None and not raw_df.empty:
             break
 
-        except ValueError as e:
-            last_error = e
-            if "No objects to concatenate" in str(e):
-                logger.warning(
-                    "[YAHOO DEBUG] %s no objects to concatenate attempt=%d/%d",
-                    symbol,
-                    attempt,
-                    YAHOO_MAX_RETRIES,
-                )
-                return pd.DataFrame()
-
-            logger.exception(
-                "[YAHOO DEBUG] download value error %s attempt=%d/%d",
-                symbol,
-                attempt,
-                YAHOO_MAX_RETRIES,
-            )
-
-        except RuntimeError as e:
-            last_error = e
-            logger.exception(
-                "[YAHOO DEBUG] runtime download failed %s attempt=%d/%d",
-                symbol,
-                attempt,
-                YAHOO_MAX_RETRIES,
-            )
-
-        except Exception as e:
-            last_error = e
-            logger.exception(
-                "[YAHOO DEBUG] download failed %s attempt=%d/%d",
-                symbol,
-                attempt,
-                YAHOO_MAX_RETRIES,
-            )
-
-        time.sleep(YAHOO_RETRY_SLEEP_SEC)
-
-    if last_error is not None and (raw_df is None or raw_df.empty):
-        return pd.DataFrame()
+        logger.debug(
+            "[YAHOO DEBUG] %s empty dataframe attempt=%d/%d elapsed=%.3fs",
+            symbol,
+            attempt,
+            YAHOO_MAX_RETRIES,
+            max(time.time() - attempt_started, 0.0),
+        )
+        if attempt < YAHOO_MAX_RETRIES:
+            time.sleep(YAHOO_RETRY_SLEEP_SEC)
 
     if raw_df is None or raw_df.empty:
-        return pd.DataFrame()
+        return _empty_df()
 
     try:
         out = raw_df.copy()
@@ -578,46 +559,40 @@ def safe_download(
         out = _extract_symbol_only_columns(out, symbol)
         if out.empty:
             logger.warning("[YAHOO DEBUG] %s symbol-only extraction empty", symbol)
-            return pd.DataFrame()
+            return _empty_df()
 
         out = _drop_duplicate_columns(out)
         out = _drop_duplicate_index(out)
         out = _normalize_columns(out)
         out = _normalize_index(out)
         out = _normalize_datetime(out)
-
         if out.empty:
             return out
 
         if start_dt is not None:
             out = out[out["time"] >= start_dt - dt.timedelta(days=2)]
-
         if end_dt is not None:
             out = out[out["time"] <= end_dt]
-
         if out.empty:
             return out
 
         out = _normalize_prices(out)
         if out.empty:
             logger.warning("[YAHOO DEBUG] %s normalize_prices empty", symbol)
-            return pd.DataFrame()
+            return _empty_df()
 
         out = _fix_volume(out)
         out = _replace_inf(out)
         out = _apply_delay_filter(out)
-
         if out.empty:
             logger.debug("[YAHOO DEBUG] %s empty after delay filter", symbol)
             return out
 
         out = out.sort_values("time").drop_duplicates(subset=["time"], keep="last").copy()
-
         out["datetime"] = out["time"]
-        out["symbol"] = str(symbol).replace(".T", "")
-
+        out["symbol"] = _plain_symbol(symbol)
         return out
 
     except Exception:
         logger.exception("[YAHOO DEBUG] normalization failed %s", symbol)
-        return pd.DataFrame()
+        return _empty_df()
