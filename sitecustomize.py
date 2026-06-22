@@ -1,6 +1,6 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver45-YAHOO-DIRECT-UPSERT-CONFLICT-PATCH
+# Version: Ver46-DB-SUMMARY-STALE-GUARD
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # main.py は軽量同期 + background install。
@@ -199,6 +199,7 @@ def _install_summary_mtf_catchup_safely() -> None:
 DB_SYNC_PATCHES = [
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
     ("core.startup.yahoo_summary_direct_upsert_conflict_patch", "YAHOO_DIRECT_UPSERT_CONFLICT", "DISABLE_YAHOO_DIRECT_UPSERT_CONFLICT_PATCH"),
+    ("core.startup.summary_stale_guard_patch", "SUMMARY_STALE_GUARD", "DISABLE_SUMMARY_STALE_GUARD_PATCH"),
 ]
 
 # main.pyだけで同期適用する売買系の最小ガード。
