@@ -1,7 +1,16 @@
 # evaluate_signals.py
+import logging
 import pandas as pd
 from configparser import ConfigParser
-from colorama import init
+
+logger = logging.getLogger(__name__)
+
+try:
+    from colorama import init
+except Exception:
+    def init(*args, **kwargs):
+        return None
+    logger.warning("[OPTIONAL IMPORT] colorama is not installed; continuing without colored console output")
 
 # 既存の評価関数をインポート
 
