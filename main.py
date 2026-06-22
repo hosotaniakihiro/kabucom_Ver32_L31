@@ -10,10 +10,20 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.35-SUMMARY-STALE-GUARD
+# Version: Ver38.34-HARD-LIQUIDITY-MOVEMENT-GUARD
 # ------------------------------------------------------------
-# ✔ SUMMARY stale guard patch を main runtime patch 一覧へ追加
-# ✔ 古い PUSH / ranking summary が候補に残る問題を抑止
+# ✔ SUMMARY AI async entry patch を main runtime patch 一覧へ明示追加
+# ✔ TONOSAMA final liquidity lost-volume fallback threshold を 2.3 に調整
+# ✔ TONOSAMA volatility entry-row rescue を main runtime に追加
+# ✔ NAS sqlite I/O guard を main runtime に追加
+# ✔ _log_skip reason衝突ガードを全runtime patch後の最後に再適用
+# ✔ RANKING ENTRY controller timeoutを拡張
+# ✔ RANKING_ENTRY 強スコアの技術フィルタ全落ちを救済
+# ✔ 3m/5m summary を最新3m/5m時刻以降の1m差分から補完
+# ✔ ENTRY_LUNCH_BLOCK_START のデフォルトを 11:30 に設定
+# ✔ RANKING high/low欠損時のLOW MOVE条件をスキャル向けに緩和
+# ✔ ENTRY MA5 third bar guard V2 を main runtime patch に追加
+# ✔ 発注直前の出来高・売買代金・値動きハードガードを追加
 # ✔ 既存の起動処理は維持
 # ============================================================
 
@@ -53,11 +63,14 @@ os.environ.setdefault("FINAL_ENTRY_TONOSAMA_SCORE_ONLY_MIN_SCORE", "2.3")
 os.environ.setdefault("FINAL_ENTRY_TONOSAMA_DEDICATED_OK_MIN_SCORE", "2.3")
 os.environ.setdefault("ENTRY_LUNCH_BLOCK_START", "11:30")
 os.environ.setdefault("ENTRY_LUNCH_BLOCK_END", "12:30")
+# RANKING pending は high/low が欠損しやすい。高スコア候補を no_high_low だけで全落ちさせない。
 os.environ.setdefault("LOW_MOVE_RANKING_MIN_ATR_RATIO", "0.0020")
 os.environ.setdefault("LOW_MOVE_RANKING_MIN_ABS_SLOPE", "0.0")
 os.environ.setdefault("LOW_MOVE_RANKING_MIN_SCORE_FOR_NO_HIGHLOW", "70.0")
+# 強いランキング候補は MA5 third-bar ガード単体で全落ちさせない。
 os.environ.setdefault("ENTRY_MA5_THIRD_BAR_RANKING_STRONG_FAILOPEN", "1")
 os.environ.setdefault("ENTRY_MA5_THIRD_BAR_RANKING_FAILOPEN_MIN_SCORE", "80.0")
+# ただし発注直前では低出来高・低売買代金・低変動を必ず除外する。
 os.environ.setdefault("ENTRY_HARD_LIQUIDITY_MOVEMENT_GUARD_ENABLED", "1")
 os.environ.setdefault("ENTRY_HARD_MIN_VOLUME", "100000")
 os.environ.setdefault("ENTRY_HARD_MIN_TURNOVER", "50000000")
@@ -65,13 +78,6 @@ os.environ.setdefault("ENTRY_HARD_REQUIRE_MOVEMENT", "1")
 os.environ.setdefault("ENTRY_HARD_MIN_RANGE_PCT", "0.006")
 os.environ.setdefault("ENTRY_HARD_MIN_ATR_RATIO", "0.003")
 os.environ.setdefault("ENTRY_HARD_MIN_ABS_SLOPE", "0.001")
-os.environ.setdefault("SUMMARY_STALE_GUARD_ENABLED", "1")
-os.environ.setdefault("PUSH_SUMMARY_1MIN_MAX_AGE_SEC", "120")
-os.environ.setdefault("PUSH_SUMMARY_3MIN_MAX_AGE_SEC", "240")
-os.environ.setdefault("PUSH_SUMMARY_5MIN_MAX_AGE_SEC", "420")
-os.environ.setdefault("RANKING_SUMMARY_1MIN_MAX_AGE_SEC", "180")
-os.environ.setdefault("RANKING_SUMMARY_3MIN_MAX_AGE_SEC", "300")
-os.environ.setdefault("RANKING_SUMMARY_5MIN_MAX_AGE_SEC", "480")
 
 try:
     from core.logging.console_tee import setup_console_tee, rebind_logging_streams_to_console_tee
@@ -162,7 +168,6 @@ def _factory_position_state():
 
 def _install_main_runtime_patches():
     patches = [
-        ("core.startup.summary_stale_guard_patch", "install"),
         ("core.startup.nas_sqlite_io_guard_patch", "install"),
         ("core.startup.indicator_fragmentation_runtime_patch", "install"),
         ("core.startup.entry_controller_runtime_reject_patch", "install"),
@@ -216,7 +221,7 @@ def _install_summary_entry_runtime_context():
         def _get_summary_runtime_kwargs():
             return {"signal_state_map": getattr(global_data, "signal_state_map", {}), "prev_state_map": getattr(global_data, "prev_state_map", {}), "position_state_map": getattr(global_data, "position_state_map", {}), "recent_realized_pnl_map": getattr(global_data, "recent_realized_pnl_map", {}), "df_1m_summary": getattr(global_data, "summary_1m_df", None), "df_3m_summary": getattr(global_data, "summary_3m_df", None), "df_5m_summary": getattr(global_data, "summary_5m_df", None), "discord_sender": getattr(global_data, "discord_sender", None), "discord_webhook_url": getattr(global_data, "discord_webhook_url", None)}
         global_data.get_summary_runtime_kwargs = _get_summary_runtime_kwargs
-        logger.info("summary/entry runtime context installed (signal_state_map=%s prev_state_map=%s position_state_map=%s)", type(global_data.signal_state_map).__name__, type(global_data.prev_state_map).__name__, type(global_data.position_state_map).__name__)
+        logger.info("✅ summary/entry runtime context installed (signal_state_map=%s prev_state_map=%s position_state_map=%s)", type(global_data.signal_state_map).__name__, type(global_data.prev_state_map).__name__, type(global_data.position_state_map).__name__)
         heartbeat("main_runtime_context", status="OK", detail={"signal_state_map": type(global_data.signal_state_map).__name__})
     except Exception:
         heartbeat("main_runtime_context", status="ERROR"); logger.exception("summary/entry runtime context install failed")
@@ -241,46 +246,46 @@ def _resolve_push_refresh_callable():
     for mod_name, fn_name in candidates:
         try:
             mod = importlib.import_module(mod_name); fn = getattr(mod, fn_name, None)
-            if callable(fn): logger.info("push refresh callable resolved: %s.%s", mod_name, fn_name); return fn
+            if callable(fn): logger.info("✅ push refresh callable resolved: %s.%s", mod_name, fn_name); return fn
         except Exception: logger.debug("push refresh callable resolve failed: %s.%s", mod_name, fn_name, exc_info=True)
-    logger.warning("push refresh callable unresolved"); return None
+    logger.warning("⚠ push refresh callable unresolved"); return None
 
 def _install_push_refresh_callable():
     try:
         refresh_fn = _resolve_push_refresh_callable()
         if callable(refresh_fn):
-            global_data.push_refresh_callable = refresh_fn; logger.info("global_data.push_refresh_callable installed"); heartbeat("push_refresh_callable", status="OK", detail={"fn": getattr(refresh_fn, "__name__", repr(refresh_fn))})
+            global_data.push_refresh_callable = refresh_fn; logger.info("✅ global_data.push_refresh_callable installed"); heartbeat("push_refresh_callable", status="OK", detail={"fn": getattr(refresh_fn, "__name__", repr(refresh_fn))})
         else:
-            global_data.push_refresh_callable = None; logger.warning("global_data.push_refresh_callable not installed"); heartbeat("push_refresh_callable", status="NG")
+            global_data.push_refresh_callable = None; logger.warning("⚠ global_data.push_refresh_callable not installed"); heartbeat("push_refresh_callable", status="NG")
     except Exception:
         heartbeat("push_refresh_callable", status="ERROR"); logger.exception("push_refresh_callable install failed")
 
 def _start_push_stream_safely():
     try:
         start_fn = getattr(push_stream, "start_push_stream", None)
-        if not callable(start_fn): logger.error("push_stream.start_push_stream unavailable"); heartbeat("main_push_stream", status="NG", detail={"reason": "start_push_stream unavailable"}); return False
+        if not callable(start_fn): logger.error("❌ push_stream.start_push_stream unavailable"); heartbeat("main_push_stream", status="NG", detail={"reason": "start_push_stream unavailable"}); return False
         refresh_fn = getattr(global_data, "push_refresh_callable", None)
-        logger.info("starting push_stream with refresh_callable=%s", getattr(refresh_fn, "__name__", repr(refresh_fn)) if callable(refresh_fn) else None)
+        logger.info("🟡 starting push_stream with refresh_callable=%s", getattr(refresh_fn, "__name__", repr(refresh_fn)) if callable(refresh_fn) else None)
         heartbeat("main_push_stream", status="START", detail={"refresh_callable": getattr(refresh_fn, "__name__", repr(refresh_fn)) if callable(refresh_fn) else None})
-        start_fn(refresh_callable=refresh_fn, enable_rotate=False); logger.info("push_stream.start_push_stream started"); heartbeat("main_push_stream", status="OK"); return True
+        start_fn(refresh_callable=refresh_fn, enable_rotate=False); logger.info("✅ push_stream.start_push_stream started"); heartbeat("main_push_stream", status="OK"); return True
     except Exception:
         heartbeat("main_push_stream", status="ERROR"); logger.exception("push_stream start failed"); return False
 
 def _run_initial_summary_tick_once():
     try:
-        if callable(run_summary_tick_once): logger.info("initial summary tick once start"); heartbeat("initial_summary_tick", status="START"); run_summary_tick_once(); logger.info("initial summary tick once done"); heartbeat("initial_summary_tick", status="OK")
-        else: logger.warning("initial summary tick once skipped (run_summary_tick_once unavailable)"); heartbeat("initial_summary_tick", status="SKIP")
+        if callable(run_summary_tick_once): logger.info("🟡 initial summary tick once start"); heartbeat("initial_summary_tick", status="START"); run_summary_tick_once(); logger.info("✅ initial summary tick once done"); heartbeat("initial_summary_tick", status="OK")
+        else: logger.warning("⚠ initial summary tick once skipped (run_summary_tick_once unavailable)"); heartbeat("initial_summary_tick", status="SKIP")
     except Exception: heartbeat("initial_summary_tick", status="ERROR"); logger.exception("initial summary tick once failed")
 
 def _run_initial_ranking_tick_once():
     try:
         from trading.summary.ranking.runner import run_time_locked_jobs
-        if callable(run_time_locked_jobs): logger.info("initial ranking tick once start via ranking.runner.run_time_locked_jobs"); heartbeat("initial_ranking_tick", status="START", detail={"via": "run_time_locked_jobs"}); result = run_time_locked_jobs(display=True); logger.info("initial ranking tick once done via run_time_locked_jobs targets=%s", sorted(list(result.keys())) if isinstance(result, dict) else []); heartbeat("initial_ranking_tick", status="OK", detail={"via": "run_time_locked_jobs"}); return
+        if callable(run_time_locked_jobs): logger.info("🟡 initial ranking tick once start via ranking.runner.run_time_locked_jobs"); heartbeat("initial_ranking_tick", status="START", detail={"via": "run_time_locked_jobs"}); result = run_time_locked_jobs(display=True); logger.info("✅ initial ranking tick once done via run_time_locked_jobs targets=%s", sorted(list(result.keys())) if isinstance(result, dict) else []); heartbeat("initial_ranking_tick", status="OK", detail={"via": "run_time_locked_jobs"}); return
     except Exception: heartbeat("initial_ranking_tick", status="ERROR", detail={"via": "run_time_locked_jobs"}); logger.exception("initial ranking tick via run_time_locked_jobs failed")
     try:
         from trading.ranking.summary.runner import run_ranking_summary_once
-        if callable(run_ranking_summary_once): logger.info("initial ranking summary once start"); heartbeat("initial_ranking_tick", status="START", detail={"via": "run_ranking_summary_once"}); run_ranking_summary_once(); logger.info("initial ranking summary once done"); heartbeat("initial_ranking_tick", status="OK", detail={"via": "run_ranking_summary_once"})
-        else: logger.warning("initial ranking tick skipped (callable unavailable)"); heartbeat("initial_ranking_tick", status="SKIP")
+        if callable(run_ranking_summary_once): logger.info("🟡 initial ranking summary once start"); heartbeat("initial_ranking_tick", status="START", detail={"via": "run_ranking_summary_once"}); run_ranking_summary_once(); logger.info("✅ initial ranking summary once done"); heartbeat("initial_ranking_tick", status="OK", detail={"via": "run_ranking_summary_once"})
+        else: logger.warning("⚠ initial ranking tick skipped (callable unavailable)"); heartbeat("initial_ranking_tick", status="SKIP")
     except Exception: heartbeat("initial_ranking_tick", status="ERROR", detail={"via": "run_ranking_summary_once"}); logger.exception("initial ranking summary tick failed")
 
 def main():
@@ -290,7 +295,7 @@ def main():
         _install_main_runtime_patches()
         _install_summary_entry_runtime_context()
         system_startup()
-        try: rebind_logging_streams_to_console_tee(); logger.info("logging streams rebound to console tee")
+        try: rebind_logging_streams_to_console_tee(); logger.info("✅ logging streams rebound to console tee")
         except Exception: logger.exception("logging rebind failed")
         build_symbol_name_map()
         _install_push_refresh_callable()
