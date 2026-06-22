@@ -1,19 +1,14 @@
 # ============================================================
 # File   : utils/alerts_util.py
-# Version: Ver3.3-PRODUCTION-DISCORD-FINAL-DF-BLOCK-GUARD
+# Version: Ver3.4-DISCORD-WEBHOOK-URL-GUARD
 # ------------------------------------------------------------
-# ✔ 既存機能完全保持（削除ゼロ）
-# ✔ Discord 429 RateLimit完全対策
-# ✔ Retry-After 自動待機
-# ✔ 送信間隔制御（0.7秒）
-# ✔ ENTRY / EXIT Embed互換
-# ✔ ranking互換 send_discord_notify 保持
-# ✔ announce_bridge / jobs / runners から discord_sender として直接使える
-# ✔ 長文自動分割対応
-# ✔ 例外耐性強化
-# ✔ 最終防衛: SUMMARY/AI PASSED 系の横長1行通知を送信直前に3行化
-# ✔ 最終防衛: interval_label に DataFrame が入った見出しを送信直前に修復
-# ✔ 最終防衛: 見出し直後に DataFrame repr 本体が混入したブロックを丸ごと削除
+# Discord通知ユーティリティ
+# - settings.ini の [discord] webhook_url を優先
+# - YOUR_DISCORD_WEBHOOK_URL 等のプレースホルダー/不正URLは送信前にスキップ
+# - Discord 429 RateLimit 対応
+# - 長文分割対応
+# - SUMMARY/AI PASSED 系の横長1行通知を送信直前に3行化
+# - DataFrame repr が混入したSUMMARY見出しを送信直前に修復
 # ============================================================
 
 from __future__ import annotations
@@ -25,6 +20,7 @@ import time
 from datetime import datetime
 from threading import Lock
 from typing import Any, Callable, Iterable, List, Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -37,10 +33,6 @@ conf = configparser.ConfigParser()
 conf.read("settings.ini", encoding="utf-8")
 DISCORD_WEBHOOK = conf.get("discord", "webhook_url", fallback="").strip()
 
-if not DISCORD_WEBHOOK:
-    logger.warning("⚠️ settings.ini の [discord] webhook_url が未設定です。")
-
-
 # ------------------------------------------------------------
 # RateLimit制御
 # ------------------------------------------------------------
@@ -50,6 +42,19 @@ DEFAULT_MAX_LEN = 1800
 
 _last_send_time = 0.0
 _send_lock = Lock()
+
+_PLACEHOLDER_WEBHOOK_VALUES = {
+    "",
+    "YOUR_DISCORD_WEBHOOK_URL",
+    "DISCORD_WEBHOOK_URL",
+    "WEBHOOK_URL",
+    "YOUR_WEBHOOK_URL",
+    "none",
+    "null",
+    "dummy",
+    "sample",
+    "example",
+}
 
 
 # ------------------------------------------------------------
@@ -74,11 +79,47 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return default
 
 
+def _is_valid_discord_webhook_url(url: Optional[str]) -> bool:
+    """Discord webhook URLとして実送信してよい文字列かを検証する。"""
+    try:
+        s = _safe_str(url).strip()
+        if not s:
+            return False
+        if s in _PLACEHOLDER_WEBHOOK_VALUES:
+            return False
+        if s.upper() in _PLACEHOLDER_WEBHOOK_VALUES:
+            return False
+        if "YOUR_" in s.upper() or "PLACEHOLDER" in s.upper():
+            return False
+
+        parsed = urlparse(s)
+        if parsed.scheme not in {"http", "https"}:
+            return False
+        if not parsed.netloc:
+            return False
+
+        # Discord webhook 以外を完全禁止にはしないが、最低限 http(s) URL だけ許可する。
+        return True
+    except Exception:
+        return False
+
+
 def _resolve_webhook_url(webhook_url: Optional[str] = None) -> str:
     url = _safe_str(webhook_url).strip()
     if url:
         return url
-    return DISCORD_WEBHOOK
+    return _safe_str(DISCORD_WEBHOOK).strip()
+
+
+def _resolve_valid_webhook_url(webhook_url: Optional[str] = None) -> str:
+    resolved = _resolve_webhook_url(webhook_url)
+    if not _is_valid_discord_webhook_url(resolved):
+        return ""
+    return resolved
+
+
+if not _is_valid_discord_webhook_url(DISCORD_WEBHOOK):
+    logger.warning("⚠️ settings.ini の [discord] webhook_url が未設定または不正です。Discord送信はスキップします。")
 
 
 # ------------------------------------------------------------
@@ -112,16 +153,13 @@ _SUMMARY_ONE_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# AI/SUMMARY見出しの interval_label に DataFrame repr が入る事故を送信直前に直す。
 _DF_TITLE_RE = re.compile(
     r"(?P<head>=+\s*(?:📊\s*)?(?:🤖\s*)?(?:SUMMARY TOP10|PUSH SUMMARY TOP10|RANKING SUMMARY TOP10|AI PASSED BUY CANDIDATES|AI PASSED SELL CANDIDATES|AI PASSED EXIT CANDIDATES)\s*)"
     r"\(.*?\[\s*\d+\s+rows\s+x\s+\d+\s+columns\s*\]\s*\)\s*(?P<tail>=+)",
     re.IGNORECASE | re.DOTALL,
 )
-
 _DF_REPR_LINE_RE = re.compile(r"^\s*(?:\.\.\.|\d+)\s+\S+\s+.*\.\.\.\s+.*$")
 _ROWS_COLS_LINE_RE = re.compile(r"^\s*\[\s*\d+\s+rows\s+x\s+\d+\s+columns\s*\]\)?\s*=*\s*$", re.IGNORECASE)
-_HEADER_WITH_DF_START_RE = re.compile(r"^(?P<head>.*?(?:SUMMARY TOP10|AI PASSED BUY CANDIDATES|AI PASSED SELL CANDIDATES|AI PASSED EXIT CANDIDATES).*?)(?:\(|\s+)\s*symbol\s+", re.IGNORECASE)
 
 
 def _contains_summary_title(line: str) -> bool:
@@ -135,7 +173,6 @@ def _looks_like_df_header_start(line: str) -> bool:
 
 
 def _clean_title_from_df_start(line: str) -> str:
-    """DataFrame repr が付いた見出し行を安全な見出しへ戻す。"""
     s = _safe_str(line).rstrip()
     upper = s.upper()
     title = None
@@ -153,19 +190,7 @@ def _clean_title_from_df_start(line: str) -> str:
 
 
 def _strip_dataframe_repr_blocks(text: str) -> str:
-    """
-    DataFrame repr が見出しに混入したブロックを丸ごと削除/修復する。
-
-    対象例:
-      📊 SUMMARY TOP10      symbol id ...
-      0 1301 ...
-      ...
-      [4109 rows x 173 columns]
-
-      ========== 🤖 AI PASSED SELL CANDIDATES (     symbol id ...
-      ...
-      [4109 rows x 173 columns]) ==========
-    """
+    """DataFrame repr が見出しに混入したブロックを丸ごと削除/修復する。"""
     try:
         s = _safe_str(text)
         if "rows x" not in s and "columns" not in s and "symbol" not in s.lower():
@@ -174,7 +199,6 @@ def _strip_dataframe_repr_blocks(text: str) -> str:
         lines = s.replace("\r\n", "\n").replace("\r", "\n").split("\n")
         out: list[str] = []
         skipping_df = False
-        skip_replaced = False
 
         for line in lines:
             raw = line.rstrip()
@@ -182,7 +206,6 @@ def _strip_dataframe_repr_blocks(text: str) -> str:
             if skipping_df:
                 if _ROWS_COLS_LINE_RE.match(raw) or "rows x" in raw:
                     skipping_df = False
-                    skip_replaced = False
                 continue
 
             if _looks_like_df_header_start(raw):
@@ -190,7 +213,6 @@ def _strip_dataframe_repr_blocks(text: str) -> str:
                 if not out or out[-1] != clean:
                     out.append(clean)
                 skipping_df = True
-                skip_replaced = True
                 continue
 
             if _DF_REPR_LINE_RE.match(raw):
@@ -242,7 +264,6 @@ def _summary_reason_to_ja(reason: str, *, buy: str, sell: str, slope: str, mtf: 
         if abs(macd_f) > 0:
             parts.append(f"MACD={macd_f:.3f}")
 
-        # 既に日本語理由が入っている場合は、重複が少なければ追加。
         if raw and raw not in {"-", "flag_score"}:
             if "売りスコア優勢" not in raw and "買いスコア優勢" not in raw:
                 parts.append(raw)
@@ -255,9 +276,7 @@ def _summary_reason_to_ja(reason: str, *, buy: str, sell: str, slope: str, mtf: 
 
 
 def _normalize_summary_one_line(line: str) -> str:
-    """
-    どの通知ルートから来ても、横長SUMMARY候補行を3行に直す最終防衛。
-    """
+    """横長SUMMARY候補行を3行に直す最終防衛。"""
     try:
         s = _safe_str(line).rstrip()
         if not s or "score=" not in s.lower() or "理由=" not in s:
@@ -333,7 +352,6 @@ def _split_message_chunks(text: str, max_len: int = DEFAULT_MAX_LEN) -> List[str
         line = line.rstrip()
         add_len = len(line) + 1
 
-        # 単独行が長すぎる場合は強制分割
         if len(line) > max_len:
             if current:
                 chunks.append("\n".join(current))
@@ -379,10 +397,10 @@ def _wait_rate_limit():
 # ------------------------------------------------------------
 
 def _post_discord(payload, *, webhook_url: Optional[str] = None, timeout: int = DEFAULT_TIMEOUT) -> bool:
-    resolved_webhook = _resolve_webhook_url(webhook_url)
+    resolved_webhook = _resolve_valid_webhook_url(webhook_url)
 
     if not resolved_webhook:
-        logger.warning("⚠️ Discord送信スキップ: webhook_url 未設定")
+        logger.warning("⚠️ Discord送信スキップ: webhook_url 未設定または不正")
         return False
 
     if not payload:
@@ -410,6 +428,15 @@ def _post_discord(payload, *, webhook_url: Optional[str] = None, timeout: int = 
 
             logger.warning("⚠️ Discord response status=%s body=%s", r.status_code, getattr(r, "text", "")[:300])
             return False
+        except requests.exceptions.MissingSchema as e:
+            logger.warning("⚠️ Discord送信スキップ: webhook_url 不正 err=%s", e)
+            return False
+        except requests.exceptions.InvalidSchema as e:
+            logger.warning("⚠️ Discord送信スキップ: webhook_url 不正 err=%s", e)
+            return False
+        except requests.exceptions.InvalidURL as e:
+            logger.warning("⚠️ Discord送信スキップ: webhook_url 不正 err=%s", e)
+            return False
         except Exception as e:
             logger.error("❌ Discord送信エラー: %s", e, exc_info=True)
             return False
@@ -426,10 +453,10 @@ def send_discord_message(
     webhook_url: Optional[str] = None,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> bool:
-    resolved_webhook = _resolve_webhook_url(webhook_url)
+    resolved_webhook = _resolve_valid_webhook_url(webhook_url)
 
     if not resolved_webhook:
-        logger.warning("⚠️ Discord Webhook URL 未設定")
+        logger.warning("⚠️ Discord Webhook URL 未設定または不正のため送信スキップ")
         return False
 
     payload = {}
@@ -462,9 +489,9 @@ def send_discord_text(
     if not msg:
         return False
 
-    resolved_webhook = _resolve_webhook_url(webhook_url)
+    resolved_webhook = _resolve_valid_webhook_url(webhook_url)
     if not resolved_webhook:
-        logger.warning("⚠️ Discord Webhook URL 未設定")
+        logger.warning("⚠️ Discord Webhook URL 未設定または不正のため送信スキップ")
         return False
 
     msg = _normalize_discord_summary_text(msg)
@@ -501,7 +528,7 @@ def build_discord_sender(
     max_len: int = DEFAULT_MAX_LEN,
 ) -> Callable[[str], bool]:
     """runner / job に渡せる discord_sender を返す。"""
-    resolved_webhook = _resolve_webhook_url(webhook_url)
+    resolved_webhook = _resolve_valid_webhook_url(webhook_url)
 
     def _sender(text: str) -> bool:
         return send_discord_text(text, webhook_url=resolved_webhook, timeout=timeout, max_len=max_len)
