@@ -1,11 +1,12 @@
 # ============================================================
 # File   : main_database.py
-# Version: DATA-COLLECTORS-MAIN-DATABASE-ENTRY-V4-SUMMARY-SQLITE-LOCK-TOLERANCE
+# Version: DATA-COLLECTORS-MAIN-DATABASE-ENTRY-V5-SUMMARY-STALE-GUARD
 # ------------------------------------------------------------
 # Purpose:
 #   - DB作成 / ランキング取得 / PUSH銘柄登録 / PUSH受信 を起動する入口
 #   - 既存 main.py とは分離する
 #   - 実体は scripts/data_collectors_runner.py に委譲する
+#   - main_database.py 経由でも古い PUSH/ranking summary を候補に残さない
 # ============================================================
 
 from __future__ import annotations
@@ -65,6 +66,35 @@ def _install_summary_sqlite_lock_tolerance() -> None:
         logger.warning("[MAIN DATABASE] summary sqlite lock tolerance installed ok=%s", ok)
     except Exception:
         logger.exception("[MAIN DATABASE] summary sqlite lock tolerance install failed; continue")
+
+
+def _install_summary_stale_guard() -> None:
+    """Install stale summary guard for main_database.py / child collectors.
+
+    main.py has its own runtime patch bootstrap, but main_database.py is a
+    separate entrypoint.  When data collectors publish merged summary through
+    core.global_context.context, this guard prevents old PUSH/ranking rows from
+    staying alive as fresh candidates.
+    """
+    try:
+        # Defaults are inherited by any child collector processes.
+        defaults = {
+            "SUMMARY_STALE_GUARD_ENABLED": "1",
+            "PUSH_SUMMARY_1MIN_MAX_AGE_SEC": "120",
+            "PUSH_SUMMARY_3MIN_MAX_AGE_SEC": "240",
+            "PUSH_SUMMARY_5MIN_MAX_AGE_SEC": "420",
+            "RANKING_SUMMARY_1MIN_MAX_AGE_SEC": "180",
+            "RANKING_SUMMARY_3MIN_MAX_AGE_SEC": "300",
+            "RANKING_SUMMARY_5MIN_MAX_AGE_SEC": "480",
+        }
+        for key, value in defaults.items():
+            os.environ.setdefault(key, value)
+
+        from core.startup.summary_stale_guard_patch import install
+        ok = install()
+        logger.warning("[MAIN DATABASE] summary stale guard installed ok=%s", ok)
+    except Exception:
+        logger.exception("[MAIN DATABASE] summary stale guard install failed; continue")
 
 
 def _read_api_password_from_settings() -> str:
@@ -137,6 +167,7 @@ def main() -> int:
 
     _install_cpu_guard_env()
     _install_summary_sqlite_lock_tolerance()
+    _install_summary_stale_guard()
 
     try:
         from data_collectors.split_mode import mark_as_data_collector_process
