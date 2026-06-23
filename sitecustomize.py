@@ -1,12 +1,18 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver46-DB-SUMMARY-STALE-GUARD
+# Version: Ver47-DBPREPARE-ONLY-SCHEMA-AND-LIGHT-MTF-CATCHUP
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # main.py は軽量同期 + background install。
 # DB/data collector系はDB専用の最小同期パッチだけにして起動を軽くする。
-# main.pyでもDBでもない補助スクリプトは、原則SQLite最小ロードにする。
 # 救済/fail-open系はデフォルトOFFにして、本体判定を優先する。
+#
+# V47:
+#   - SUMMARY RANKING SCHEMA REPAIR は既定で db_prepare_runner.py だけに限定。
+#     push_receiver / yahoo_complement / summary_database で ALTER TABLE 確認が多重実行される問題を抑制。
+#   - SUMMARY MTF STARTUP CATCHUP も既定で db_prepare_runner.py だけに限定。
+#     子プロセスごとに3分足/5分足catchupが走る問題を抑制。
+#   - db_prepare中のMTF catchupは軽量既定値へ変更。
 # ============================================================
 from __future__ import annotations
 
@@ -75,8 +81,23 @@ def _is_main_py_process() -> bool:
         return False
 
 
+def _is_db_prepare_process() -> bool:
+    try:
+        argv = _argv_text()
+        return "db_prepare_runner.py" in argv
+    except Exception:
+        return False
+
+
+def _is_main_database_process() -> bool:
+    try:
+        argv = _argv_text()
+        return "main_database.py" in argv
+    except Exception:
+        return False
+
+
 def _is_database_process() -> bool:
-    # main_database.py / runner系はENTRY/TONOSAMAの重い起動パッチを不要にする。
     try:
         argv = _argv_text()
         if any(x in argv for x in (
@@ -97,6 +118,52 @@ def _is_database_process() -> bool:
         "AUTOSTOCK_MAIN_DATABASE_PROCESS",
         "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
     ))
+
+
+def _configure_db_startup_scope_defaults() -> None:
+    """Keep DB startup repair/catchup single-owner by default."""
+    try:
+        db_prepare = _is_db_prepare_process()
+        main_database = _is_main_database_process()
+
+        # summary ranking schema repair performs ALTER TABLE checks on summary DB.
+        # Running it in every child process causes NAS SQLite startup lock pressure.
+        # Default owner is db_prepare only. main_database can be allowed explicitly.
+        allow_schema_in_main = _env_on("SUMMARY_SCHEMA_REPAIR_IN_MAIN_DATABASE", False)
+        if not db_prepare and not (main_database and allow_schema_in_main):
+            os.environ.setdefault("DISABLE_SUMMARY_RANKING_SCHEMA_REPAIR_PATCH", "1")
+            os.environ.setdefault("SUMMARY_RANKING_SCHEMA_REPAIR_SCOPE", "db_prepare_only")
+        else:
+            os.environ.pop("DISABLE_SUMMARY_RANKING_SCHEMA_REPAIR_PATCH", None)
+            os.environ.setdefault("SUMMARY_RANKING_SCHEMA_REPAIR_SCOPE", "db_prepare_owner")
+
+        # Startup MTF catchup is also DB-heavy. Run it once in db_prepare by default.
+        if not db_prepare and not _env_on("SUMMARY_MTF_CATCHUP_RUN_IN_THIS_PROCESS", False):
+            os.environ.setdefault("DISABLE_SUMMARY_MTF_CATCHUP", "1")
+
+        if db_prepare:
+            # Light intraday catchup: fill recent gaps, not rebuild hours of 3m/5m bars.
+            os.environ["SUMMARY_MTF_CATCHUP_MA_BARS"] = os.environ.get("SUMMARY_MTF_CATCHUP_MA_BARS_OPERATOR", "20")
+            os.environ["SUMMARY_MTF_CATCHUP_EXTRA_MINUTES"] = os.environ.get("SUMMARY_MTF_CATCHUP_EXTRA_MINUTES_OPERATOR", "10")
+            os.environ["SUMMARY_MTF_CATCHUP_MAX_ROWS"] = os.environ.get("SUMMARY_MTF_CATCHUP_MAX_ROWS_OPERATOR", "20000")
+            os.environ["SUMMARY_MTF_CATCHUP_UPSERT_CHUNK_SIZE"] = os.environ.get("SUMMARY_MTF_CATCHUP_UPSERT_CHUNK_SIZE_OPERATOR", "200")
+            os.environ["SUMMARY_MTF_CATCHUP_BUSY_TIMEOUT_MS"] = os.environ.get("SUMMARY_MTF_CATCHUP_BUSY_TIMEOUT_MS_OPERATOR", "15000")
+            os.environ["SUMMARY_MTF_CATCHUP_SQLITE_TIMEOUT"] = os.environ.get("SUMMARY_MTF_CATCHUP_SQLITE_TIMEOUT_OPERATOR", "20")
+            os.environ.setdefault("SUMMARY_MTF_INDICATOR_FILL_AFTER_CATCHUP", "0")
+            os.environ.setdefault("SUMMARY_MTF_INDICATOR_FILL_AFTER_EMPTY_CATCHUP", "0")
+
+        _write_boot_evidence(
+            "DB_STARTUP_SCOPE_CONFIGURED",
+            {
+                "db_prepare": db_prepare,
+                "main_database": main_database,
+                "schema_disabled": os.environ.get("DISABLE_SUMMARY_RANKING_SCHEMA_REPAIR_PATCH"),
+                "mtf_disabled": os.environ.get("DISABLE_SUMMARY_MTF_CATCHUP"),
+                "mtf_ma_bars": os.environ.get("SUMMARY_MTF_CATCHUP_MA_BARS"),
+            },
+        )
+    except Exception:
+        _write_boot_evidence("DB_STARTUP_SCOPE_CONFIG_EXCEPTION", traceback.format_exc())
 
 
 def _install_boot_exception_hook() -> None:
@@ -148,13 +215,6 @@ def _install_liq_empty_fallback_only_if_enabled() -> None:
 
 
 def _install_runtime_defaults() -> None:
-    """Install centralized runtime defaults.
-
-    The old large os.environ.setdefault(...) dictionary now lives in
-    core.startup.runtime_env_defaults. Existing operator env values are not
-    overwritten. Keep the historical ENTRY_SHORT_MTF_REQUIRE_ALL override here
-    because it intentionally forces 2-of-3 MTF behavior.
-    """
     try:
         _ensure_project_root()
         mod = __import__("core.startup.runtime_env_defaults_patch", fromlist=["install"])
@@ -172,7 +232,6 @@ def _install_runtime_defaults() -> None:
             os.environ.get("SITECUSTOMIZE_ENABLE_FULL_NONMAIN"),
         )
     except Exception:
-        # Minimal fallback only.  Do not reintroduce the old large defaults here.
         os.environ.setdefault("SQLITE_MEMORY_PRAGMAS_ENABLED", "1")
         os.environ.setdefault("SITECUSTOMIZE_ENABLE_FULL_NONMAIN", "0")
         os.environ.setdefault("SITECUSTOMIZE_ENABLE_RESCUE_PATCHES", "0")
@@ -183,9 +242,10 @@ def _install_runtime_defaults() -> None:
 def _install_summary_mtf_catchup_safely() -> None:
     try:
         if os.environ.get("DISABLE_SUMMARY_MTF_CATCHUP", "").strip() == "1":
+            logger.warning("[SITECUSTOMIZE] summary mtf catchup skipped by scope/env argv=%s", sys.argv)
             return
-        if _is_main_py_process() and not _is_database_process() and not _env_on("SUMMARY_MTF_CATCHUP_RUN_IN_MAIN", False):
-            logger.warning("[SITECUSTOMIZE] summary mtf catchup skipped in main.py; main_database.py handles DB catchup")
+        if not _is_db_prepare_process() and not _env_on("SUMMARY_MTF_CATCHUP_RUN_IN_THIS_PROCESS", False):
+            logger.warning("[SITECUSTOMIZE] summary mtf catchup skipped outside db_prepare argv=%s", sys.argv)
             return
         os.environ.setdefault("SUMMARY_MTF_STARTUP_CATCHUP_ENABLED", "1")
         os.environ.setdefault("SUMMARY_MTF_CATCHUP_INTERVALS", "3,5")
@@ -195,14 +255,12 @@ def _install_summary_mtf_catchup_safely() -> None:
         _write_boot_evidence("SUMMARY_MTF_CATCHUP_EXCEPTION", traceback.format_exc())
 
 
-# DB/data collector系と非main補助スクリプトはSQLite中心の最小ロード。
 DB_SYNC_PATCHES = [
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
     ("core.startup.yahoo_summary_direct_upsert_conflict_patch", "YAHOO_DIRECT_UPSERT_CONFLICT", "DISABLE_YAHOO_DIRECT_UPSERT_CONFLICT_PATCH"),
     ("core.startup.summary_stale_guard_patch", "SUMMARY_STALE_GUARD", "DISABLE_SUMMARY_STALE_GUARD_PATCH"),
 ]
 
-# main.pyだけで同期適用する売買系の最小ガード。
 SYNC_MAIN_PATCHES = [
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
     ("core.startup.yahoo_summary_direct_upsert_conflict_patch", "YAHOO_DIRECT_UPSERT_CONFLICT", "DISABLE_YAHOO_DIRECT_UPSERT_CONFLICT_PATCH"),
@@ -287,6 +345,7 @@ def _background_main_patch_loop() -> None:
 
 
 def _install_nonmain_minimal() -> None:
+    _configure_db_startup_scope_defaults()
     _install_patch_list(DB_SYNC_PATCHES)
     _install_liq_empty_fallback_only_if_enabled()
     logger.warning(
@@ -299,6 +358,7 @@ def _install_nonmain_minimal() -> None:
 _write_boot_evidence("PYTHON_START")
 _install_boot_exception_hook()
 _install_runtime_defaults()
+_configure_db_startup_scope_defaults()
 
 if _is_database_process():
     _install_patch_list(DB_SYNC_PATCHES)
