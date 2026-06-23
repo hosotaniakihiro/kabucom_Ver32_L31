@@ -1,24 +1,27 @@
 # ============================================================
 # force_cancel_loop.py（BUY_SELL 準拠・安全最終版）
-# Version: V2.2-401-REFRESH-FIRST-CACHED-PASSWORD
+# Version: V2.3-ORDERS-429-BACKOFF
 # ------------------------------------------------------------
 # ・30秒ごとに kabusapi/orders を直接確認
 # ・未約定の指値注文を全キャンセル
 # ・global_data / pending_entries に依存しない
-# ・401 / timeout / 切断耐性あり
+# ・401 / 429 / timeout / 切断耐性あり
 # ・起動直後の API TOKEN 未設定にも耐性あり
 # ・401時は token refresh 後に1回だけ再試行
+# ・429時は token refresh せず、backoffしてAPI連打を止める
 #
-# V2.2:
-# ・401後は stale な既存runtime tokenを再利用せず、まず token_manager.refresh_token() を試す。
-# ・token_manager 側の apipassword cache により、API iniが分離/未検出でも起動時passwordで再取得できる。
-# ・refresh不可の場合だけ既存token fallbackへ落とす。
+# V2.3:
+# ・get_orders にプロセス内レート制限を追加。
+# ・429 Too Many Requests は認証エラーではないため refresh_token() へ流さない。
+# ・settings.ini [API_RATE_LIMIT] から間隔/backoffを調整可能。
 # ============================================================
 
 from __future__ import annotations
 
 import configparser
 import logging
+import os
+import threading
 import time
 
 import requests
@@ -34,8 +37,49 @@ BASE_URL = "http://localhost:18080/kabusapi"
 # settings.ini
 # ------------------------------------------------------------
 conf = configparser.ConfigParser()
-conf.read("settings.ini", encoding="utf-8")
+conf.read(["settings.ini", "config/settings.ini"], encoding="utf-8-sig")
 PASSWORD = conf.get("aukabu", "password", fallback="")
+
+
+def _conf_get_float(section: str, key: str, default: float) -> float:
+    """settings.ini の値を安全に float として読む。"""
+    env_key = f"KABU_{key}".upper()
+    try:
+        v = os.getenv(env_key)
+        if v is not None and str(v).strip() != "":
+            return float(v)
+    except Exception:
+        pass
+
+    for sec in (section, section.lower(), section.upper()):
+        try:
+            if conf.has_section(sec):
+                v = conf.get(sec, key, fallback=None)
+                if v is not None and str(v).strip() != "":
+                    return float(v)
+        except Exception:
+            pass
+    return float(default)
+
+
+# ------------------------------------------------------------
+# kabu API rate limit
+# ------------------------------------------------------------
+_GET_ORDERS_MIN_INTERVAL_SEC = max(
+    0.0,
+    _conf_get_float("API_RATE_LIMIT", "kabu_get_orders_min_interval_sec", 3.0),
+)
+_KABU_429_BACKOFF_SEC = max(
+    1.0,
+    _conf_get_float("API_RATE_LIMIT", "kabu_429_backoff_sec", 5.0),
+)
+_TOKEN_REFRESH_MIN_INTERVAL_SEC = max(
+    3.0,
+    _conf_get_float("API_RATE_LIMIT", "token_refresh_min_interval_sec", 30.0),
+)
+
+_GET_ORDERS_LOCK = threading.Lock()
+_LAST_GET_ORDERS_MONO = 0.0
 
 # ------------------------------------------------------------
 # Cancel 可能 State
@@ -46,6 +90,46 @@ CANCELABLE_STATES = {1, 2, 3, 4}
 _LAST_TOKEN_WARN_AT = 0.0
 _LAST_401_REFRESH_AT = 0.0
 _LAST_REFRESH_ERROR_WARN_AT = 0.0
+_LAST_429_WARN_AT = 0.0
+
+
+def _rate_limit_get_orders() -> None:
+    """プロセス内の /orders 連打を抑制する。"""
+    global _LAST_GET_ORDERS_MONO
+    if _GET_ORDERS_MIN_INTERVAL_SEC <= 0:
+        return
+
+    with _GET_ORDERS_LOCK:
+        now = time.monotonic()
+        wait = _GET_ORDERS_MIN_INTERVAL_SEC - (now - _LAST_GET_ORDERS_MONO)
+        if wait > 0:
+            time.sleep(wait)
+        _LAST_GET_ORDERS_MONO = time.monotonic()
+
+
+def _retry_after_seconds(response) -> float:
+    try:
+        raw = response.headers.get("Retry-After")
+        if raw is not None and str(raw).strip() != "":
+            return max(float(raw), _KABU_429_BACKOFF_SEC)
+    except Exception:
+        pass
+    return _KABU_429_BACKOFF_SEC
+
+
+def _handle_429(context: str, response=None) -> None:
+    """429はtoken不一致ではなく呼び出し過多。refreshせずbackoffする。"""
+    global _LAST_429_WARN_AT
+    sleep_sec = _retry_after_seconds(response) if response is not None else _KABU_429_BACKOFF_SEC
+    now = time.time()
+    if now - _LAST_429_WARN_AT >= 5.0:
+        logger.warning(
+            "[FORCE_CANCEL] %s got 429 Too Many Requests -> backoff %.1fs; token refresh skipped",
+            context,
+            sleep_sec,
+        )
+        _LAST_429_WARN_AT = now
+    time.sleep(sleep_sec)
 
 
 # ============================================================
@@ -135,7 +219,7 @@ def _refresh_headers_after_401(context: str):
     global _LAST_401_REFRESH_AT, _LAST_REFRESH_ERROR_WARN_AT
     now = time.time()
 
-    if now - _LAST_401_REFRESH_AT < 3.0:
+    if now - _LAST_401_REFRESH_AT < _TOKEN_REFRESH_MIN_INTERVAL_SEC:
         logger.warning("[FORCE_CANCEL] 401 refresh throttled context=%s", context)
         return _direct_token_fallback(context)
     _LAST_401_REFRESH_AT = now
@@ -201,6 +285,9 @@ def cancel_order(order_id):
                 json=payload,
                 timeout=(2, 5),
             )
+            if r.status_code == 429:
+                _handle_429("cancel_order", r)
+                return False
             if r.status_code == 401 and attempt == 1:
                 logger.warning("[FORCE_CANCEL] cancel_order got 401 -> refresh token and retry order_id=%s", order_id)
                 headers = _refresh_headers_after_401("cancel_order")
@@ -211,7 +298,11 @@ def cancel_order(order_id):
             logger.warning("[FORCE_CANCEL] order_id=%s status=%s body=%s", order_id, r.status_code, r.text)
             return True
         except HTTPError as e:
-            logger.error("[FORCE_CANCEL] HTTP error order_id=%s status=%s", order_id, e.response.status_code if e.response else "N/A")
+            status = e.response.status_code if e.response is not None else "N/A"
+            if status == 429:
+                _handle_429("cancel_order", e.response)
+            else:
+                logger.error("[FORCE_CANCEL] HTTP error order_id=%s status=%s", order_id, status)
             return False
         except Exception:
             logger.exception("[FORCE_CANCEL] unexpected error order_id=%s", order_id)
@@ -238,11 +329,15 @@ def get_orders():
 
     for attempt in (1, 2):
         try:
+            _rate_limit_get_orders()
             r = requests.get(
                 f"{BASE_URL}/orders",
                 headers=headers,
                 timeout=(2, 5),
             )
+            if r.status_code == 429:
+                _handle_429("get_orders", r)
+                return []
             if r.status_code == 401 and attempt == 1:
                 logger.warning("[FORCE_CANCEL] get_orders got 401 -> refresh token and retry")
                 headers = _refresh_headers_after_401("get_orders")
@@ -252,7 +347,10 @@ def get_orders():
             r.raise_for_status()
             return _parse_orders_response(r.json())
         except HTTPError as e:
-            if e.response is not None and e.response.status_code == 401:
+            status = e.response.status_code if e.response is not None else None
+            if status == 429:
+                _handle_429("get_orders", e.response)
+            elif status == 401:
                 logger.warning("[FORCE_CANCEL] kabu API Unauthorized (401) in get_orders after retry")
             else:
                 logger.exception("❌ kabu API HTTP error in get_orders")
@@ -280,7 +378,13 @@ def get_orders():
 # ============================================================
 
 def start_force_cancel_loop(interval_sec=30):
-    logger.warning("🛑 FORCE CANCEL LOOP START (%ss)", interval_sec)
+    logger.warning(
+        "🛑 FORCE CANCEL LOOP START (%ss) get_orders_min_interval=%.1fs backoff_429=%.1fs refresh_min_interval=%.1fs",
+        interval_sec,
+        _GET_ORDERS_MIN_INTERVAL_SEC,
+        _KABU_429_BACKOFF_SEC,
+        _TOKEN_REFRESH_MIN_INTERVAL_SEC,
+    )
 
     while True:
         try:
