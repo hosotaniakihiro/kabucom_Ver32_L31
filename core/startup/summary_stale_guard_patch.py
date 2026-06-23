@@ -1,19 +1,16 @@
 # ============================================================
 # File   : core/startup/summary_stale_guard_patch.py
-# Version: REV3-SUMMARY-STALE-GUARD-MERGED-GET-ACTIVE-EMPTY-UNIVERSE
+# Version: REV4-SUMMARY-STALE-GUARD-MIN-KEEP-LATEST
 # ------------------------------------------------------------
 # 【概要】
 #   PUSH / ranking summary が古いまま merged summary に残り、
 #   古い価格・古い slope・古い RSI/MACD でエントリー候補になる問題を防ぐ。
 #
-# 【方針】
-#   - core.global_context.context の sanitize / get_merged_summary を monkey patch する。
-#   - 表示用 / エントリー候補用 merged summary だけを stale 除外する。
-#   - 計算用 summary_history は履歴が必要なので除外しない。
-#   - 最新足が 3m/5m の完成足として少し遅れるケースを考慮し、
-#     「現在時刻からの絶対 stale」だけでなく「最新足から見て古すぎる行」も落とす。
-#   - DB系プロセスでランキング universe が空のとき、active symbols 補充が全落ちしない
-#     軽量パッチも同時に入れる。
+# REV4:
+#   - summary runner が遅延した時に relative stale guard で候補が極端に減り、
+#     404件 -> 12件のようになる問題を防ぐ。
+#   - stale判定後の行数が少なすぎる場合、最新行から最低件数だけ残す。
+#   - 既定: PUSH 1m/3m/5m は最低50件、rankingは最低50件。
 # ============================================================
 
 from __future__ import annotations
@@ -82,13 +79,6 @@ def _normalize_tf(tf: Any) -> Any:
 
 
 def _max_age_sec(source: Any, tf: Any) -> Optional[int]:
-    """
-    source/tf 別の絶対 stale 秒数。
-
-    注意:
-      3m/5m は最新完成足が現在時刻より数分前になるため、
-      drop_stale_summary_rows() では絶対 stale に加え、最新足からの相対 stale も使う。
-    """
     source = _normalize_source(source)
     tf = _normalize_tf(tf)
 
@@ -132,7 +122,6 @@ def _max_age_sec(source: Any, tf: Any) -> Optional[int]:
 
 
 def _relative_lag_sec(source: Any, tf: Any) -> Optional[int]:
-    """最新足から見て、銘柄行として許容する遅れ秒数。"""
     source = _normalize_source(source)
     tf = _normalize_tf(tf)
 
@@ -146,8 +135,6 @@ def _relative_lag_sec(source: Any, tf: Any) -> Optional[int]:
     except Exception:
         tf_int = 1
 
-    # 例: 3m は最新足から約7分、5m は約11分まで許容。
-    # 13:04 時点で最新3m足が 13:00 のようなケースは残しつつ、10:15などを落とす。
     default = max(180, tf_int * 120 + 60)
 
     if source.startswith("push"):
@@ -157,6 +144,25 @@ def _relative_lag_sec(source: Any, tf: Any) -> Optional[int]:
     if source == "legacy":
         return _env_int(f"LEGACY_SUMMARY_{tf_int}MIN_RELATIVE_LAG_SEC", default)
     return None
+
+
+def _min_keep_rows(source: Any, tf: Any) -> int:
+    source_s = _normalize_source(source)
+    tf_n = _normalize_tf(tf)
+    if tf_n == "daily":
+        return 0
+    try:
+        tf_int = int(tf_n)
+    except Exception:
+        tf_int = 1
+
+    if source_s.startswith("push"):
+        default = 50 if tf_int in (1, 3, 5) else 20
+        return _env_int(f"PUSH_SUMMARY_{tf_int}MIN_KEEP_ROWS", default)
+    if source_s == "ranking":
+        default = 50 if tf_int in (1, 3, 5) else 20
+        return _env_int(f"RANKING_SUMMARY_{tf_int}MIN_KEEP_ROWS", default)
+    return _env_int(f"SUMMARY_{tf_int}MIN_KEEP_ROWS", 0)
 
 
 def _best_time_col(df: pd.DataFrame) -> Optional[str]:
@@ -169,6 +175,23 @@ def _best_time_col(df: pd.DataFrame) -> Optional[str]:
         return None
 
 
+def _latest_fallback_rows(out: pd.DataFrame, *, time_col: str, min_keep: int) -> pd.DataFrame:
+    if min_keep <= 0 or out.empty:
+        return out.iloc[0:0].copy()
+    try:
+        work = out[out[time_col].notna()].copy()
+        if work.empty:
+            return out.iloc[0:0].copy()
+        work = work.sort_values(time_col, ascending=False)
+        if "symbol" in work.columns:
+            # 同一銘柄の重複を避け、なるべく候補銘柄数を残す。
+            work = work.drop_duplicates(subset=["symbol"], keep="first")
+        return work.head(int(min_keep)).copy().reset_index(drop=True)
+    except Exception:
+        logger.debug("[SUMMARY STALE DROP] latest fallback failed", exc_info=True)
+        return out.iloc[0:0].copy()
+
+
 def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sanitize") -> pd.DataFrame:
     try:
         if df is None or not isinstance(df, pd.DataFrame) or df.empty:
@@ -176,6 +199,7 @@ def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sani
 
         max_age = _max_age_sec(source, tf)
         relative_lag = _relative_lag_sec(source, tf)
+        min_keep = _min_keep_rows(source, tf)
         if (max_age is None or max_age <= 0) and (relative_lag is None or relative_lag <= 0):
             return df
 
@@ -221,12 +245,28 @@ def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sani
             except Exception:
                 latest_dt = None
 
-        # 絶対 stale または最新足からの相対 stale のどちらかを満たせば残す。
-        # 3m/5m の最新完成足が数分前でも、最新足周辺の銘柄は落とさない。
         valid_mask = valid_mask & (absolute_mask | relative_mask)
 
         out2 = out.loc[valid_mask].copy().reset_index(drop=True)
         after = int(len(out2))
+
+        if min_keep > 0 and before >= min_keep and after < min_keep:
+            fallback = _latest_fallback_rows(out, time_col=time_col, min_keep=min_keep)
+            if len(fallback) > after:
+                logger.warning(
+                    "[SUMMARY STALE DROP] min_keep fallback source=%s tf=%s label=%s before=%s stale_after=%s fallback_after=%s min_keep=%s latest_dt=%s now=%s",
+                    source,
+                    tf,
+                    label,
+                    before,
+                    after,
+                    len(fallback),
+                    min_keep,
+                    latest_dt,
+                    now,
+                )
+                out2 = fallback
+                after = int(len(out2))
 
         if after != before:
             oldest_kept = None
@@ -238,7 +278,7 @@ def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sani
                 pass
 
             logger.warning(
-                "[SUMMARY STALE DROP] source=%s tf=%s label=%s before=%s after=%s max_age_sec=%s relative_lag_sec=%s latest_dt=%s oldest_kept=%s newest_kept=%s now=%s",
+                "[SUMMARY STALE DROP] source=%s tf=%s label=%s before=%s after=%s max_age_sec=%s relative_lag_sec=%s min_keep=%s latest_dt=%s oldest_kept=%s newest_kept=%s now=%s",
                 source,
                 tf,
                 label,
@@ -246,6 +286,7 @@ def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sani
                 after,
                 max_age,
                 relative_lag,
+                min_keep,
                 latest_dt,
                 oldest_kept,
                 newest_kept,
@@ -286,7 +327,6 @@ def install() -> bool:
             logger.warning("[SUMMARY STALE GUARD PATCH] skipped: _sanitize_summary_df not found")
             _install_active_empty_universe_patch()
             return False
-
         _ORIGINAL_SANITIZE_SUMMARY_DF = original_sanitize
 
         def _sanitize_summary_df_with_stale_guard(
@@ -314,7 +354,7 @@ def install() -> bool:
 
         _PATCHED = True
         _install_active_empty_universe_patch()
-        logger.info("[SUMMARY STALE GUARD PATCH] installed rev=3 sanitize=True merged_get=%s active_empty_universe=True", bool(original_get_merged))
+        logger.info("[SUMMARY STALE GUARD PATCH] installed rev=4 sanitize=True merged_get=%s active_empty_universe=True", bool(original_get_merged))
         return True
 
     except Exception:
