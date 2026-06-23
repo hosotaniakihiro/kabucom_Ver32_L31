@@ -1,16 +1,15 @@
 # ============================================================
 # File   : trading/ranking/ranking_db_writer_lock_patch.py
-# Version: PRODUCTION-STABLE-RANKING-DB-WRITER-LOCK-PATCH-V5-DEDICATED-CONNECTION
+# Version: PRODUCTION-STABLE-RANKING-DB-WRITER-LOCK-PATCH-V6-LOW-LATENCY
 # ------------------------------------------------------------
 # Purpose:
 #   ranking_db_writer.py 本体を大きく壊さず、SQLite locked / cursor再入 /
 #   commit時未完了SQL 対策を後付けする。
 #
-# V5:
-#   - flush 時は writer.conn / writer.cursor を使わず、専用の短命sqlite接続で保存する。
-#   - self.cursor に残った PRAGMA / SELECT statement の影響を commit へ持ち込まない。
-#   - locked / statements in progress 時は rollback + close してから retry。
-#   - retry sleep を短縮し、ranking writer が entry controller を長時間詰まらせにくくする。
+# V6:
+#   - NAS SQLiteで毎flush journal_mode=WAL を再設定すると遅いので既定OFF。
+#   - executemany batch を 1000 へ増やし、Python/SQLite往復を減らす。
+#   - busy timeout/retryを短めにして、詰まったら次flushへ回す。
 # ============================================================
 
 from __future__ import annotations
@@ -42,6 +41,16 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "on", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
 def _is_locked_error(err: Any) -> bool:
     s = str(err or "").lower()
     return "database is locked" in s or "database table is locked" in s or "locked" in s
@@ -64,7 +73,7 @@ def _buffer_count(writer: Any) -> int:
 
 
 def _chunks(items: list[Any], size: int):
-    size = max(1, int(size or 200))
+    size = max(1, int(size or 1000))
     for i in range(0, len(items), size):
         yield items[i:i + size]
 
@@ -133,12 +142,25 @@ def _open_dedicated_connection(db_path: Path, busy_timeout_ms: int) -> sqlite3.C
     cur = conn.cursor()
     try:
         _exec_and_drain(cur, f"PRAGMA busy_timeout={int(busy_timeout_ms)};")
-        try:
-            _exec_and_drain(cur, "PRAGMA journal_mode=WAL;")
-        except sqlite3.OperationalError:
-            logger.debug("[RANKING DB WRITER LOCK PATCH] journal_mode pragma skipped", exc_info=True)
+        # journal_mode は接続ごとに再設定するとNASで非常に遅い場合がある。
+        # DB初期化側でWAL済みの想定。必要時だけ env で有効化する。
+        if _env_bool("RANKING_WRITER_SET_JOURNAL_EACH_FLUSH", False):
+            try:
+                _exec_and_drain(cur, "PRAGMA journal_mode=WAL;")
+            except sqlite3.OperationalError:
+                logger.debug("[RANKING DB WRITER LOCK PATCH] journal_mode pragma skipped", exc_info=True)
         _exec_and_drain(cur, "PRAGMA synchronous=NORMAL;")
         _exec_and_drain(cur, "PRAGMA temp_store=MEMORY;")
+        try:
+            _exec_and_drain(cur, f"PRAGMA cache_size={_env_int('RANKING_WRITER_CACHE_SIZE', -65536)};")
+        except Exception:
+            pass
+        try:
+            mmap_size = _env_int("RANKING_WRITER_MMAP_SIZE", 268435456)
+            if mmap_size > 0:
+                _exec_and_drain(cur, f"PRAGMA mmap_size={mmap_size};")
+        except Exception:
+            pass
     finally:
         try:
             cur.close()
@@ -159,14 +181,14 @@ def install_ranking_db_writer_lock_patch() -> bool:
         logger.warning("[RANKING DB WRITER LOCK PATCH] RankingDBWriter not found")
         return False
 
-    if getattr(cls, "_lock_retry_patch_v5_installed", False):
+    if getattr(cls, "_lock_retry_patch_v6_installed", False):
         return True
 
-    busy_timeout_ms = _env_int("RANKING_WRITER_BUSY_TIMEOUT_MS", 8000)
-    retry_max = _env_int("RANKING_WRITER_LOCK_RETRY_MAX", 3)
-    retry_base_sec = _env_float("RANKING_WRITER_LOCK_RETRY_BASE_SEC", 0.25)
-    retry_max_sleep_sec = _env_float("RANKING_WRITER_LOCK_RETRY_MAX_SLEEP_SEC", 1.0)
-    batch_size = _env_int("RANKING_WRITER_SQL_BATCH_SIZE", 150)
+    busy_timeout_ms = _env_int("RANKING_WRITER_BUSY_TIMEOUT_MS", 5000)
+    retry_max = _env_int("RANKING_WRITER_LOCK_RETRY_MAX", 1)
+    retry_base_sec = _env_float("RANKING_WRITER_LOCK_RETRY_BASE_SEC", 0.20)
+    retry_max_sleep_sec = _env_float("RANKING_WRITER_LOCK_RETRY_MAX_SLEEP_SEC", 0.80)
+    batch_size = _env_int("RANKING_WRITER_SQL_BATCH_SIZE", 1000)
 
     try:
         target.DEFAULT_BUSY_TIMEOUT_MS = int(busy_timeout_ms)
@@ -177,12 +199,13 @@ def install_ranking_db_writer_lock_patch() -> bool:
 
     def flush_replace_upsert(self, *args, **kwargs) -> bool:
         with self.lock:
-            if getattr(self, "_flush_v5_running", False):
+            if getattr(self, "_flush_v6_running", False):
                 logger.warning("[RANKING DB WRITER LOCK PATCH] flush skipped reason=already_running buffer=%s", _buffer_count(self))
                 return False
             if not (self.raw_buffer or self.snapshot_buffer or self.legacy_buffer):
                 logger.debug("[RANKING DB WRITER] flush skipped empty")
                 return True
+            self._flush_v6_running = True
             self._flush_v5_running = True
             self._flush_v4_running = True
             raw_rows = list(self.raw_buffer or [])
@@ -245,7 +268,7 @@ def install_ranking_db_writer_lock_patch() -> bool:
                     conn = _open_dedicated_connection(db_path, busy_timeout_ms)
                     cur = conn.cursor()
                     logger.info(
-                        "[RANKING DB WRITER] flush prepare v5 dedicated-conn raw=%d snapshot=%d legacy=%d snapshot_types=%s raw_types=%s batch_size=%d db=%s",
+                        "[RANKING DB WRITER] flush prepare v6 dedicated-conn raw=%d snapshot=%d legacy=%d snapshot_types=%s raw_types=%s batch_size=%d db=%s",
                         len(raw_rows), len(snapshot_rows), len(legacy_rows),
                         _type_counts(target, snapshot_rows), _type_counts(target, raw_rows), batch_size, db_path,
                     )
@@ -277,7 +300,7 @@ def install_ranking_db_writer_lock_patch() -> bool:
                         except Exception:
                             pass
                     logger.info(
-                        "[RANKING DB WRITER] flush done v5 snapshot=%d raw=%d legacy=0 elapsed=%.3fs buffer_after=%d",
+                        "[RANKING DB WRITER] flush done v6 snapshot=%d raw=%d legacy=0 elapsed=%.3fs buffer_after=%d",
                         saved_snapshot, saved_raw, time.time() - t0, _buffer_count(self),
                     )
                     return True
@@ -293,19 +316,19 @@ def install_ranking_db_writer_lock_patch() -> bool:
                     if not retryable:
                         _return_to_front(self, raw_rows, snapshot_rows, legacy_rows)
                         _mark_flush_error(self, last_error, t0)
-                        logger.exception("[RANKING DB WRITER] flush failed v5 non-retryable")
+                        logger.exception("[RANKING DB WRITER] flush failed v6 non-retryable")
                         return False
                     if attempt >= int(retry_max):
                         _return_to_front(self, raw_rows, snapshot_rows, legacy_rows)
                         _mark_flush_error(self, last_error, t0)
                         logger.warning(
-                            "[RANKING DB WRITER LOCK PATCH] retryable persists v5 attempt=%s/%s returned_to_buffer=%s saved_snapshot=%s saved_raw=%s err=%s",
+                            "[RANKING DB WRITER LOCK PATCH] retryable persists v6 attempt=%s/%s returned_to_buffer=%s saved_snapshot=%s saved_raw=%s err=%s",
                             attempt, retry_max, _buffer_count(self), last_snapshot, last_raw, e,
                         )
                         return False
                     sleep_sec = min(float(retry_max_sleep_sec), float(retry_base_sec) * (2 ** attempt))
                     logger.warning(
-                        "[RANKING DB WRITER LOCK PATCH] retry v5 attempt=%s/%s sleep=%.2fs rows snapshot=%d raw=%d buffer=%s err=%s",
+                        "[RANKING DB WRITER LOCK PATCH] retry v6 attempt=%s/%s sleep=%.2fs rows snapshot=%d raw=%d buffer=%s err=%s",
                         attempt + 1, retry_max, sleep_sec, len(snapshot_rows), len(raw_rows), _buffer_count(self), e,
                     )
                     time.sleep(sleep_sec)
@@ -319,7 +342,7 @@ def install_ranking_db_writer_lock_patch() -> bool:
                         pass
                     _return_to_front(self, raw_rows, snapshot_rows, legacy_rows)
                     _mark_flush_error(self, last_error, t0)
-                    logger.exception("[RANKING DB WRITER] flush failed v5 returned rows to buffer")
+                    logger.exception("[RANKING DB WRITER] flush failed v6 returned rows to buffer")
                     return False
                 finally:
                     try:
@@ -340,11 +363,13 @@ def install_ranking_db_writer_lock_patch() -> bool:
         finally:
             try:
                 with self.lock:
+                    self._flush_v6_running = False
                     self._flush_v5_running = False
                     self._flush_v4_running = False
                     self._flush_v3_running = False
             except Exception:
                 try:
+                    self._flush_v6_running = False
                     self._flush_v5_running = False
                     self._flush_v4_running = False
                     self._flush_v3_running = False
@@ -352,6 +377,7 @@ def install_ranking_db_writer_lock_patch() -> bool:
                     pass
 
     cls.flush = flush_replace_upsert
+    cls._lock_retry_patch_v6_installed = True
     cls._lock_retry_patch_v5_installed = True
     cls._lock_retry_patch_v4_installed = True
     cls._lock_retry_patch_v3_installed = True
@@ -359,8 +385,13 @@ def install_ranking_db_writer_lock_patch() -> bool:
     cls._lock_retry_patch_installed = True
 
     logger.warning(
-        "[RANKING DB WRITER LOCK PATCH] installed v5 dedicated-connection busy_timeout_ms=%s retry_max=%s base=%.2fs max_sleep=%.2fs batch_size=%s",
-        busy_timeout_ms, retry_max, retry_base_sec, retry_max_sleep_sec, batch_size,
+        "[RANKING DB WRITER LOCK PATCH] installed v6 low-latency busy_timeout_ms=%s retry_max=%s base=%.2fs max_sleep=%.2fs batch_size=%s journal_each_flush=%s",
+        busy_timeout_ms,
+        retry_max,
+        retry_base_sec,
+        retry_max_sleep_sec,
+        batch_size,
+        _env_bool("RANKING_WRITER_SET_JOURNAL_EACH_FLUSH", False),
     )
     return True
 
