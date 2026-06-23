@@ -1,6 +1,6 @@
 # ============================================================
 # File   : scheduler_jobs/summary/time_locked_runner.py
-# Version: PRODUCTION-STABLE-TIME-LOCKED-SUMMARY-RUNNER-V1.1-PUSH-ALL-INTERVAL-DISPLAY
+# Version: PRODUCTION-STABLE-TIME-LOCKED-SUMMARY-RUNNER-V1.2-BOUNDARY-PUSH-MTF
 # ------------------------------------------------------------
 # 【概要】
 #   毎時0分起点の 1min / 3min / 5min 定時実行を管理する。
@@ -9,17 +9,13 @@
 #   - market session 内: PUSH / RANKING 実行
 #   - market session 外: PUSH の保存済み最新サマリー表示
 #   - RANKING は従来通り 1min 毎分、3min :00/:03、5min :00/:05
-#   - PUSH由来サマリーは、Discord/画面確認用に 1min / 3min / 5min を毎回表示する
+#   - PUSH由来サマリーも既定では境界実行に戻す
 #   - 時間外は ranking / entry を止める
 #
-# 【重要 V1.1】
-#   ユーザー要望:
-#     「PUSH由来のランキングは1分足、3分足、5分足を表示させて」
-#
-#   対応:
-#     - 親tickが1分ごとに動くたび、PUSH側は [1, 3, 5] を対象にする
-#     - RANKING側は従来通り interval boundary のみ実行する
-#     - 無効化したい場合は環境変数 SUMMARY_PUSH_DISPLAY_ALL_INTERVALS=0
+# 【重要 V1.2】
+#   1m/3m/5mを毎分すべて実行すると、summary DB runner が10分超遅延し、
+#   stale guardで候補が大量に落ちる。既定は境界実行へ戻す。
+#   毎分全intervalが必要な場合のみ SUMMARY_PUSH_DISPLAY_ALL_INTERVALS=1。
 # ============================================================
 
 from __future__ import annotations
@@ -56,12 +52,13 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 def _push_display_all_intervals_enabled() -> bool:
     """
-    PUSH由来サマリーは毎分 1m/3m/5m を表示する。
+    PUSH由来サマリーの対象interval。
 
-    3m/5mの計算自体が重い場合だけ、
-    SUMMARY_PUSH_DISPLAY_ALL_INTERVALS=0 にすると従来の時間境界実行へ戻せる。
+    V1.2:
+      既定は False。毎分 1m/3m/5m を全部走らせるとDB保存が遅延しやすい。
+      SUMMARY_PUSH_DISPLAY_ALL_INTERVALS=1 の場合だけ全intervalを毎分走らせる。
     """
-    return _env_flag("SUMMARY_PUSH_DISPLAY_ALL_INTERVALS", default=True)
+    return _env_flag("SUMMARY_PUSH_DISPLAY_ALL_INTERVALS", default=False)
 
 
 def _all_summary_intervals() -> list[int]:
@@ -71,10 +68,6 @@ def _all_summary_intervals() -> list[int]:
 def closed_market_display_targets(now: dt.datetime) -> list[int]:
     """
     時間外 / 昼休み / 休場日でも表示する対象 interval を作る。
-
-    V1.1:
-      PUSH表示は常に 1m/3m/5m を見たいので、既定では [1,3,5] を返す。
-      従来周期へ戻す場合のみ SUMMARY_PUSH_DISPLAY_ALL_INTERVALS=0。
     """
     try:
         n = (now or now_naive()).replace(second=0, microsecond=0)
@@ -103,8 +96,8 @@ def closed_market_display_targets(now: dt.datetime) -> list[int]:
 
 def _push_targets_from_time_locked_targets(targets: list[int]) -> list[int]:
     """
-    PUSH側だけは毎分 1m/3m/5m を表示対象にする。
-    RANKING側は resolve_target_intervals の結果をそのまま使う。
+    PUSH側の対象interval。
+    既定では ranking_targets と同じ境界実行にし、summary DB runner の遅延を抑える。
     """
     if _push_display_all_intervals_enabled():
         return _all_summary_intervals()
@@ -123,7 +116,7 @@ def run_time_locked_summary_jobs(
     毎時0分起点の定時サマリー実行。
 
     market session 内:
-      - PUSH: 既定で 1m / 3m / 5m を毎回計算・表示
+      - PUSH: 既定では時間境界に従って 1m / 3m / 5m を計算・保存
       - RANKING: resolve_target_intervals(now) に従い、従来通り時間境界のみ計算・表示
 
     market session 外 / 昼休み / 休場日:
