@@ -1,10 +1,15 @@
 # ============================================================
 # File   : core/startup/sqlite_memory_pragmas_patch.py
-# Version: SQLITE-MEMORY-PRAGMAS-PATCH-V1
+# Version: SQLITE-MEMORY-PRAGMAS-PATCH-V2-RANKING-LEGACY-SCHEMA
 # ------------------------------------------------------------
 # Purpose:
 #   main_database.py / data collector 子プロセスの SQLite 接続に対して、
 #   メモリに余裕がある環境向けの PRAGMA を自動適用する。
+#
+#   V2:
+#   - ranking の種類別 legacy table が既存DBに残っている場合も、
+#     writer保存前に不足列を ALTER TABLE で自動補修する。
+#   - 例: table 値上がり率_ALL has no column named rank を防止する。
 #
 # Notes:
 #   - 既存コードの sqlite3.connect 呼び出しを横取りし、接続直後に軽量PRAGMAを適用する。
@@ -24,8 +29,24 @@ logger = logging.getLogger(__name__)
 
 _ORIG_CONNECT = sqlite3.connect
 _INSTALLED = False
+_RANKING_LEGACY_SCHEMA_PATCHED = False
 _TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 _FALSE = {"0", "false", "no", "n", "off", "disable", "disabled"}
+
+
+LEGACY_RANKING_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("symbol", "TEXT"),
+    ("symbolname", "TEXT"),
+    ("current_price", "REAL"),
+    ("change_percentage", "REAL"),
+    ("change_ratio", "REAL"),
+    ("trading_volume", "REAL"),
+    ("trading_value", "REAL"),
+    ("turnover", "REAL"),
+    ("tick_count", "INTEGER"),
+    ("inserted_at", "TEXT"),
+    ("rank", "INTEGER"),
+)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -162,23 +183,101 @@ def _patched_connect(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connec
     return conn
 
 
+def _install_ranking_legacy_schema_patch() -> bool:
+    """Patch RankingDBWriter legacy table ensure for existing old DB files.
+
+    ranking_db_writer.py の CREATE TABLE IF NOT EXISTS は既存テーブルの列不足を
+    補修しないため、古い ranking DB では INSERT rank で落ちる。
+    ここで _ensure_legacy_table を包み、CREATE 後に PRAGMA table_info -> ALTER TABLE
+    を実行して不足列を自動追加する。
+    """
+    global _RANKING_LEGACY_SCHEMA_PATCHED
+    if _RANKING_LEGACY_SCHEMA_PATCHED:
+        return True
+    if _env_bool("DISABLE_RANKING_LEGACY_SCHEMA_REPAIR_PATCH", False):
+        return False
+
+    try:
+        from database.sqlite import quote_ident
+        import trading.ranking.ranking_db_writer as writer_mod
+
+        cls = getattr(writer_mod, "RankingDBWriter", None)
+        old = getattr(cls, "_ensure_legacy_table", None) if cls is not None else None
+        if cls is None or not callable(old):
+            return False
+        if getattr(old, "_ranking_legacy_schema_repair_patch", False):
+            _RANKING_LEGACY_SCHEMA_PATCHED = True
+            return True
+
+        def _patched_ensure_legacy_table(self: Any, table: str) -> None:
+            old(self, table)
+            cur = getattr(self, "cursor", None)
+            if cur is None:
+                return
+
+            q = quote_ident(table)
+            try:
+                cur.execute(f"PRAGMA table_info({q})")
+                existing = {str(row[1]) for row in cur.fetchall()}
+            except Exception:
+                logger.debug("[RANKING LEGACY SCHEMA REPAIR] table_info failed table=%s", table, exc_info=True)
+                return
+
+            added: list[str] = []
+            for col, decl in LEGACY_RANKING_COLUMNS:
+                if col in existing:
+                    continue
+                try:
+                    cur.execute(f"ALTER TABLE {q} ADD COLUMN {quote_ident(col)} {decl}")
+                    added.append(col)
+                    existing.add(col)
+                except sqlite3.OperationalError as e:
+                    # 競合・並行起動などで既に追加済みなら継続する。
+                    msg = str(e).lower()
+                    if "duplicate column" in msg or "already exists" in msg:
+                        existing.add(col)
+                        continue
+                    raise
+
+            if added:
+                logger.warning(
+                    "[RANKING LEGACY SCHEMA REPAIR] table=%s added_columns=%s",
+                    table,
+                    added,
+                )
+
+        _patched_ensure_legacy_table._ranking_legacy_schema_repair_patch = True  # type: ignore[attr-defined]
+        _patched_ensure_legacy_table._original = old  # type: ignore[attr-defined]
+        cls._ensure_legacy_table = _patched_ensure_legacy_table
+        _RANKING_LEGACY_SCHEMA_PATCHED = True
+        logger.warning("[RANKING LEGACY SCHEMA REPAIR] installed")
+        return True
+    except Exception:
+        logger.exception("[RANKING LEGACY SCHEMA REPAIR] install failed")
+        return False
+
+
 def install() -> bool:
     global _INSTALLED
+
+    ranking_schema_ok = _install_ranking_legacy_schema_patch()
+
     if _INSTALLED:
         return True
     if not _env_bool("SQLITE_MEMORY_PRAGMAS_ENABLED", True):
-        return False
+        return bool(ranking_schema_ok)
     try:
         sqlite3.connect = _patched_connect  # type: ignore[assignment]
         _INSTALLED = True
         logger.warning(
-            "[SQLITE MEMORY PRAGMAS] installed temp_store=%s cache_kb=%s mmap=%s spill_off=%s",
+            "[SQLITE MEMORY PRAGMAS] installed temp_store=%s cache_kb=%s mmap=%s spill_off=%s ranking_legacy_schema=%s",
             os.getenv("SQLITE_MEMORY_TEMP_STORE", "MEMORY"),
             os.getenv("SQLITE_MEMORY_CACHE_KB", "-65536"),
             os.getenv("SQLITE_MMAP_SIZE_BYTES", "268435456"),
             os.getenv("SQLITE_CACHE_SPILL_OFF", "1"),
+            ranking_schema_ok,
         )
         return True
     except Exception:
         logger.exception("[SQLITE MEMORY PRAGMAS] install failed")
-        return False
+        return bool(ranking_schema_ok)
