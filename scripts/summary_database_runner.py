@@ -1,12 +1,16 @@
 # ============================================================
 # File   : scripts/summary_database_runner.py
-# Version: SUMMARY-DATABASE-RUNNER-V9-PERIODIC-MTF-DB-SAVE
+# Version: SUMMARY-DATABASE-RUNNER-V10-BOUNDARY-MTF-LOW-LATENCY
 # ------------------------------------------------------------
 # Purpose:
 #   - main_database.py 側で定時サマリー計算・DB保存を担当する子プロセス
 #   - DB保存 owner は database 側へ寄せる
-#   - 1m/3m/5m のPUSH由来サマリーを毎分DB保存する
-#   - 表示/Discordは抑止し、保存専用として動かす
+#   - PUSH由来サマリーを毎分DB保存する
+#
+# V10:
+#   - 3m/5m を毎分強制計算しない。境界分だけ計算して遅延を防ぐ。
+#   - slow tick 後の「次tickスキップ」を既定OFFにし、遅延復帰を早める。
+#   - spool flush は起動時/定期だけに抑え、after_tick連続失敗で重くしない。
 # ============================================================
 
 from __future__ import annotations
@@ -43,25 +47,26 @@ def _install_database_summary_env() -> None:
     os.environ["SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY"] = "0"
     os.environ.setdefault("SUMMARY_SAVE_SPOOL_FLUSH", "1")
 
-    # DB保存専用プロセスでは、PUSH由来の 1m/3m/5m を毎分計算・保存する。
-    # 以前はCPU対策で SUMMARY_PUSH_DISPLAY_ALL_INTERVALS=0 を強制していたため、
-    # 3m/5m が時間境界または起動時catchup中心になりやすかった。
-    # 重い場合のみ settings.ini / 環境変数で SUMMARY_DATABASE_MTF_EVERY_MINUTE=0 に戻せる。
-    raw_mtf_every_minute = str(os.getenv("SUMMARY_DATABASE_MTF_EVERY_MINUTE", "1")).strip().lower()
-    mtf_every_minute = "0" if raw_mtf_every_minute in {"0", "false", "no", "off", "disable", "disabled"} else "1"
+    # V10:
+    # 3m/5mを毎分計算すると、NAS SQLite + 404銘柄級で1tickが10分超に肥大化し、
+    # PUSH summary が stale drop される。既定は境界分だけ実行に戻す。
+    # どうしても毎分3m/5mを計算したい場合だけ settings.ini/env で 1 にする。
+    raw_mtf_every_minute = str(os.getenv("SUMMARY_DATABASE_MTF_EVERY_MINUTE", "0")).strip().lower()
+    mtf_every_minute = "1" if raw_mtf_every_minute in {"1", "true", "yes", "on", "enable", "enabled"} else "0"
     os.environ["SUMMARY_DATABASE_MTF_EVERY_MINUTE"] = mtf_every_minute
     os.environ["SUMMARY_PUSH_DISPLAY_ALL_INTERVALS"] = mtf_every_minute
     os.environ["SUMMARY_PARALLEL_FORCE_1_3_5"] = "0"
     os.environ["SUMMARY_PARALLEL_INTERVAL_WORKERS"] = "1"
     os.environ["SUMMARY_PUSH_BG_INTERVAL_WORKERS"] = "1"
 
-    # spool flushを毎tick前後に無条件実行しない。
-    os.environ.setdefault("SUMMARY_SAVE_SPOOL_FLUSH_MIN_INTERVAL_SEC", "120")
-    os.environ.setdefault("SUMMARY_SAVE_SPOOL_FLUSH_MAX_FILES", "10")
+    # spool flush は毎tick前後に無条件実行しない。
+    os.environ.setdefault("SUMMARY_SAVE_SPOOL_FLUSH_MIN_INTERVAL_SEC", "300")
+    os.environ.setdefault("SUMMARY_SAVE_SPOOL_FLUSH_MAX_FILES", "3")
+    os.environ.setdefault("SUMMARY_SAVE_SPOOL_FLUSH_AFTER_TICK", "0")
 
-    # 1回のtickが重い場合、次tickを1回休ませてCPUを戻す。
+    # slow tick 後に次tickを休ませると、すでに遅れているサマリーがさらに古くなる。
     os.environ.setdefault("SUMMARY_DATABASE_SLOW_TICK_SEC", "45")
-    os.environ.setdefault("SUMMARY_DATABASE_SKIP_NEXT_ON_SLOW_TICK", "1")
+    os.environ.setdefault("SUMMARY_DATABASE_SKIP_NEXT_ON_SLOW_TICK", "0")
 
     os.environ["SUMMARY_SKIP_DB_SAVE_IN_MAIN"] = "0"
     os.environ["SUMMARY_MAIN_ENTRY_ONLY"] = "0"
@@ -175,13 +180,16 @@ def _flush_summary_save_spool(logger: logging.Logger, *, reason: str, force: boo
     if not _env_true("SUMMARY_SAVE_SPOOL_FLUSH", default=True):
         return {"disabled": True}
 
+    if reason == "after_tick" and not _env_true("SUMMARY_SAVE_SPOOL_FLUSH_AFTER_TICK", default=False):
+        return {"skipped": True, "reason": "after_tick_disabled"}
+
     now_ts = time.monotonic()
-    min_interval = max(0.0, _env_float("SUMMARY_SAVE_SPOOL_FLUSH_MIN_INTERVAL_SEC", 120.0))
+    min_interval = max(0.0, _env_float("SUMMARY_SAVE_SPOOL_FLUSH_MIN_INTERVAL_SEC", 300.0))
     if not force and _LAST_SPOOL_FLUSH_TS and now_ts - _LAST_SPOOL_FLUSH_TS < min_interval:
         return {"skipped": True, "reason": "min_interval", "age_sec": round(now_ts - _LAST_SPOOL_FLUSH_TS, 3)}
 
     try:
-        max_files = max(1, _env_int("SUMMARY_SAVE_SPOOL_FLUSH_MAX_FILES", 10))
+        max_files = max(1, _env_int("SUMMARY_SAVE_SPOOL_FLUSH_MAX_FILES", 3))
         from trading.summary.persistence.summary_save_spool import flush_summary_spool
         result = flush_summary_spool(max_files=max_files)
         _LAST_SPOOL_FLUSH_TS = now_ts
@@ -220,7 +228,7 @@ def main() -> int:
     logger.info("[SUMMARY DB RUNNER] SUMMARY_DATABASE_MTF_EVERY_MINUTE=%s", os.getenv("SUMMARY_DATABASE_MTF_EVERY_MINUTE"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_PUSH_DISPLAY_ALL_INTERVALS=%s", os.getenv("SUMMARY_PUSH_DISPLAY_ALL_INTERVALS"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_PARALLEL_FORCE_1_3_5=%s workers=%s bg_workers=%s", os.getenv("SUMMARY_PARALLEL_FORCE_1_3_5"), os.getenv("SUMMARY_PARALLEL_INTERVAL_WORKERS"), os.getenv("SUMMARY_PUSH_BG_INTERVAL_WORKERS"))
-    logger.info("[SUMMARY DB RUNNER] SUMMARY_SAVE_SPOOL_FLUSH=%s min_interval=%s max_files=%s", os.getenv("SUMMARY_SAVE_SPOOL_FLUSH"), os.getenv("SUMMARY_SAVE_SPOOL_FLUSH_MIN_INTERVAL_SEC"), os.getenv("SUMMARY_SAVE_SPOOL_FLUSH_MAX_FILES"))
+    logger.info("[SUMMARY DB RUNNER] SUMMARY_SAVE_SPOOL_FLUSH=%s min_interval=%s max_files=%s after_tick=%s", os.getenv("SUMMARY_SAVE_SPOOL_FLUSH"), os.getenv("SUMMARY_SAVE_SPOOL_FLUSH_MIN_INTERVAL_SEC"), os.getenv("SUMMARY_SAVE_SPOOL_FLUSH_MAX_FILES"), os.getenv("SUMMARY_SAVE_SPOOL_FLUSH_AFTER_TICK"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY=%s patch_ok=%s", os.getenv("SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY"), patch_ok)
     logger.info("[SUMMARY DB RUNNER] SUMMARY_SKIP_DB_SAVE_IN_MAIN=%s", os.getenv("SUMMARY_SKIP_DB_SAVE_IN_MAIN"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_MAIN_ENTRY_ONLY=%s", os.getenv("SUMMARY_MAIN_ENTRY_ONLY"))
@@ -290,13 +298,20 @@ def main() -> int:
 
             elapsed = time.perf_counter() - t0
             slow_tick_sec = max(1.0, _env_float("SUMMARY_DATABASE_SLOW_TICK_SEC", 45.0))
-            if elapsed >= slow_tick_sec and _env_true("SUMMARY_DATABASE_SKIP_NEXT_ON_SLOW_TICK", default=True):
-                skip_next_tick = True
-                logger.warning(
-                    "[SUMMARY DB RUNNER] slow tick detected elapsed=%.3fs threshold=%.3fs -> skip next tick once",
-                    elapsed,
-                    slow_tick_sec,
-                )
+            if elapsed >= slow_tick_sec:
+                if _env_true("SUMMARY_DATABASE_SKIP_NEXT_ON_SLOW_TICK", default=False):
+                    skip_next_tick = True
+                    logger.warning(
+                        "[SUMMARY DB RUNNER] slow tick detected elapsed=%.3fs threshold=%.3fs -> skip next tick once",
+                        elapsed,
+                        slow_tick_sec,
+                    )
+                else:
+                    logger.warning(
+                        "[SUMMARY DB RUNNER] slow tick detected elapsed=%.3fs threshold=%.3fs -> continue next tick",
+                        elapsed,
+                        slow_tick_sec,
+                    )
 
             push_rows = {
                 int(k): len(v) if hasattr(v, "__len__") else 0
