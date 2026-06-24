@@ -1,11 +1,14 @@
 # ============================================================
 # File   : TaskSchedule/SubScript/run_night_yahoo_full_summary/main.py
-# Version: V2-TASK-NIGHT-YAHOO-DAILY-AND-FULL-SUMMARY
+# Version: V3-TASK-NIGHT-YAHOO-DAILY-DIRECT-CHART
 # ------------------------------------------------------------
 # Windowsタスクスケジューラ用入口。
 #   1) Yahoo日足全銘柄更新→daily_db/stock_analysis.db保存
 #   2) 最新営業日のYahoo 1m全銘柄取得
 #   3) 1m/3m/5m summary計算→summary DB保存
+#
+# V3:
+#   - 日足更新は yfinance が空の場合に Yahoo chart API 直接取得へフォールバック
 # ============================================================
 
 from __future__ import annotations
@@ -29,8 +32,16 @@ os.environ.setdefault("NIGHT_YAHOO_INTERVALS", "1,3,5")
 os.environ.setdefault("NIGHT_YAHOO_UPDATE_DAILY", "1")
 os.environ.setdefault("NIGHT_YAHOO_DAILY_PERIOD", "3y")
 os.environ.setdefault("NIGHT_YAHOO_DAILY_PAUSE_SEC", "0.05")
+os.environ.setdefault("NIGHT_YAHOO_DIRECT_TIMEOUT", "20")
 
-from scripts.night_yahoo_daily_update_batch import main as daily_main
+# 夜間日足は sitecustomize の yfinance fail-cache 影響を受けることがあるため、
+# daily module を先に読み込み、直接 chart API フォールバックを差し込む。
+from scripts import night_yahoo_daily_update_batch as _daily_batch
+from scripts import night_yahoo_daily_direct_chart_patch as _daily_chart_patch
+
+_daily_chart_patch.install()
+
+daily_main = _daily_batch.main
 from scripts.night_yahoo_full_summary_batch import main as summary_main
 
 
