@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Cooldown Yahoo parallel fetch when it repeatedly returns zero frames."""
+"""Cooldown Yahoo parallel fetch when it repeatedly returns zero frames.
+
+This patch is installed in main/main_database/helper contexts. It also chains the
+summary fresh-overwrite guard so stale merged PUSH summaries are replaced by
+fresher candidates instead of staying stuck for tens of minutes.
+"""
 from __future__ import annotations
 
 import logging
@@ -8,7 +13,7 @@ import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V1-YAHOO-PARALLEL-EMPTY-COOLDOWN"
+VERSION = "V2-YAHOO-EMPTY-COOLDOWN-AND-SUMMARY-FRESH"
 _INSTALLED = False
 
 
@@ -28,25 +33,44 @@ def _set_defaults() -> None:
     os.environ.setdefault("YAHOO_PARALLEL_EMPTY_BATCH_THRESHOLD", "2")
     os.environ.setdefault("YAHOO_PARALLEL_EMPTY_BATCH_COOLDOWN_SEC", "900")
     os.environ.setdefault("YAHOO_PARALLEL_EMPTY_MIN_SYMBOLS", "20")
+    os.environ.setdefault("SUMMARY_FRESH_OVERWRITE_EXISTING_STALE_SEC", "180")
+    os.environ.setdefault("SUMMARY_FRESH_OVERWRITE_MIN_NEWER_SEC", "30")
+
+
+def _install_summary_fresh_overwrite() -> bool:
+    try:
+        if os.environ.get("DISABLE_SUMMARY_FRESH_OVERWRITE_PATCH", "").strip() == "1":
+            logger.warning("[YAHOO PARALLEL EMPTY COOLDOWN] summary fresh overwrite disabled by env")
+            return False
+        from core.startup.summary_fresh_overwrite_patch import install as _install
+        ok = bool(_install())
+        logger.warning("[YAHOO PARALLEL EMPTY COOLDOWN] summary fresh overwrite chained ok=%s", ok)
+        return ok
+    except Exception:
+        logger.exception("[YAHOO PARALLEL EMPTY COOLDOWN] summary fresh overwrite chained install failed")
+        return False
 
 
 def install() -> bool:
     global _INSTALLED
     if _INSTALLED:
+        _install_summary_fresh_overwrite()
         return True
     if str(os.getenv("DISABLE_YAHOO_PARALLEL_EMPTY_COOLDOWN_PATCH", "")).strip() == "1":
         logger.warning("[YAHOO PARALLEL EMPTY COOLDOWN] disabled by env")
+        _install_summary_fresh_overwrite()
         return False
     _set_defaults()
+    fresh_ok = _install_summary_fresh_overwrite()
     try:
         import trading.yahoo.yahoo_parallel_fetch as ypf  # type: ignore
     except Exception:
         logger.debug("[YAHOO PARALLEL EMPTY COOLDOWN] yahoo_parallel_fetch not importable yet", exc_info=True)
-        return False
+        return bool(fresh_ok)
 
     old = getattr(ypf, "parallel_fetch_symbols", None)
     if not callable(old):
-        return False
+        return bool(fresh_ok)
     if getattr(old, "_yahoo_parallel_empty_cooldown", False):
         _INSTALLED = True
         return True
@@ -68,7 +92,6 @@ def install() -> bool:
                 state["empty_count"],
             )
             return []
-
         ret = old(symbols, *args, **kwargs)
         try:
             result_len = len(ret or [])
@@ -98,11 +121,12 @@ def install() -> bool:
     ypf.parallel_fetch_symbols = _wrapped  # type: ignore[attr-defined]
     _INSTALLED = True
     logger.warning(
-        "[YAHOO PARALLEL EMPTY COOLDOWN] installed version=%s threshold=%s cooldown=%s min_symbols=%s",
+        "[YAHOO PARALLEL EMPTY COOLDOWN] installed version=%s threshold=%s cooldown=%s min_symbols=%s summary_fresh=%s",
         VERSION,
         os.getenv("YAHOO_PARALLEL_EMPTY_BATCH_THRESHOLD"),
         os.getenv("YAHOO_PARALLEL_EMPTY_BATCH_COOLDOWN_SEC"),
         os.getenv("YAHOO_PARALLEL_EMPTY_MIN_SYMBOLS"),
+        fresh_ok,
     )
     return True
 
