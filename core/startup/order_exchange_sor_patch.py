@@ -1,11 +1,11 @@
 # ============================================================
 # File   : core/startup/order_exchange_sor_patch.py
-# Version: V1-FORCE-SOR-EXCHANGE-9
+# Version: V2-FORCE-ALL-SENDORDER-SOR-EXCHANGE-9
 # ------------------------------------------------------------
 # Purpose:
 #   kabu Station order payload の Exchange を SOR=9 に統一する。
-#   entry_handler の直接指値、buy_sell_entry の最良気配指値、成行、逆指値を
-#   すべて _make_payload 入口で強制補正する。
+#   新規・返済・強制返済・再指値など、/sendorder に流れる payload は
+#   送信直前でも必ず Exchange=9 に補正する。
 # ============================================================
 
 from __future__ import annotations
@@ -17,20 +17,52 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 _INSTALLED = False
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        v = os.getenv(name)
-        if v is None or str(v).strip() == "":
-            return int(default)
-        return int(float(v))
-    except Exception:
-        return int(default)
+_TARGET_EXCHANGE = 9
 
 
 def _target_exchange() -> int:
-    return _env_int("ENTRY_ORDER_EXCHANGE", _env_int("KABU_ORDER_EXCHANGE", 9))
+    """ユーザー方針: 全発注を SOR=9 に固定する。"""
+    return _TARGET_EXCHANGE
+
+
+def _force_env() -> None:
+    # 既存コードがどの環境変数名を見ても 9 になるように寄せる。
+    for name in (
+        "ENTRY_ORDER_EXCHANGE",
+        "KABU_ORDER_EXCHANGE",
+        "ORDER_EXCHANGE",
+        "EXCHANGE",
+    ):
+        os.environ[name] = str(_target_exchange())
+
+
+def _safe_symbol(payload: Any) -> Any:
+    try:
+        if isinstance(payload, dict):
+            return payload.get("Symbol") or payload.get("symbol")
+    except Exception:
+        pass
+    return None
+
+
+def _force_payload_exchange(payload: Any, *, label: str = "payload") -> Any:
+    """dict payload の Exchange を最終的に SOR=9 へ上書きする。"""
+    if not isinstance(payload, dict):
+        return payload
+    try:
+        before = payload.get("Exchange")
+        payload["Exchange"] = int(_target_exchange())
+        if before != payload.get("Exchange"):
+            logger.warning(
+                "[ORDER EXCHANGE SOR] %s Exchange forced before=%s after=%s symbol=%s",
+                label,
+                before,
+                payload.get("Exchange"),
+                _safe_symbol(payload),
+            )
+    except Exception:
+        logger.exception("[ORDER EXCHANGE SOR] %s Exchange force failed payload=%s", label, payload)
+    return payload
 
 
 def _patch_buy_sell_entry() -> bool:
@@ -62,7 +94,7 @@ def _patch_buy_sell_entry() -> bool:
 
     try:
         cur = getattr(bse, "_make_payload", None)
-        if callable(cur) and not getattr(cur, "_order_exchange_sor_v1", False):
+        if callable(cur) and not getattr(cur, "_order_exchange_sor_v2", False):
             orig = getattr(cur, "_original", cur)
 
             @wraps(orig)
@@ -70,24 +102,21 @@ def _patch_buy_sell_entry() -> bool:
                 requested = kwargs.get("exchange", None)
                 kwargs["exchange"] = _target_exchange()
                 payload = orig(symbol, side, qty, price, *args, **kwargs)
+                _force_payload_exchange(payload, label="buy_sell_entry._make_payload")
                 try:
-                    if isinstance(payload, dict):
-                        before = payload.get("Exchange")
-                        payload["Exchange"] = int(_target_exchange())
-                        if before != payload.get("Exchange"):
-                            logger.warning(
-                                "[ORDER EXCHANGE SOR] payload Exchange forced symbol=%s side=%s requested=%s payload_before=%s payload_after=%s",
-                                symbol,
-                                side,
-                                requested,
-                                before,
-                                payload.get("Exchange"),
-                            )
+                    if requested not in (None, _target_exchange()):
+                        logger.warning(
+                            "[ORDER EXCHANGE SOR] requested exchange ignored symbol=%s side=%s requested=%s forced=%s",
+                            symbol,
+                            side,
+                            requested,
+                            _target_exchange(),
+                        )
                 except Exception:
-                    logger.exception("[ORDER EXCHANGE SOR] payload post-force failed symbol=%s", symbol)
+                    pass
                 return payload
 
-            patched_make_payload._order_exchange_sor_v1 = True  # type: ignore[attr-defined]
+            patched_make_payload._order_exchange_sor_v2 = True  # type: ignore[attr-defined]
             patched_make_payload._original = orig  # type: ignore[attr-defined]
             bse._make_payload = patched_make_payload
             logger.warning("[ORDER EXCHANGE SOR] patched buy_sell_entry._make_payload target_exchange=%s", target)
@@ -95,7 +124,7 @@ def _patch_buy_sell_entry() -> bool:
     except Exception:
         logger.exception("[ORDER EXCHANGE SOR] _make_payload patch failed")
 
-    # 関数のdefault引数も9へ寄せる。呼び出し側が明示exchange=1を渡しても _make_payload で最後に9へ強制する。
+    # 関数の default 引数も 9 へ寄せる。呼び出し側が明示 exchange=1 を渡しても _make_payload で最後に 9 へ強制する。
     for name in (
         "execute_buy_at_best_ask",
         "execute_short_at_best_bid",
@@ -108,7 +137,6 @@ def _patch_buy_sell_entry() -> bool:
             fn = getattr(bse, name, None)
             defaults = getattr(fn, "__defaults__", None)
             if callable(fn) and defaults:
-                # 各関数の最後の通常defaultが exchange=1 のため、最後だけ9へ置換する。
                 d = list(defaults)
                 if d:
                     old = d[-1]
@@ -135,32 +163,20 @@ def _patch_send_order_common() -> bool:
         cur = getattr(so, "send_order_common", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_order_exchange_sor_v1", False):
+        if getattr(cur, "_order_exchange_sor_v2", False):
             return True
         orig = getattr(cur, "_original", cur)
 
         @wraps(orig)
         def patched_send_order_common(payload: Any, *args, **kwargs):
-            try:
-                if isinstance(payload, dict):
-                    before = payload.get("Exchange")
-                    payload["Exchange"] = int(_target_exchange())
-                    if before != payload.get("Exchange"):
-                        logger.warning(
-                            "[ORDER EXCHANGE SOR] send_order_common payload Exchange forced before=%s after=%s symbol=%s",
-                            before,
-                            payload.get("Exchange"),
-                            payload.get("Symbol"),
-                        )
-            except Exception:
-                logger.exception("[ORDER EXCHANGE SOR] send_order_common force failed")
+            payload = _force_payload_exchange(payload, label="send_order_common")
             return orig(payload, *args, **kwargs)
 
-        patched_send_order_common._order_exchange_sor_v1 = True  # type: ignore[attr-defined]
+        patched_send_order_common._order_exchange_sor_v2 = True  # type: ignore[attr-defined]
         patched_send_order_common._original = orig  # type: ignore[attr-defined]
         so.send_order_common = patched_send_order_common
 
-        # buy_sell_entry は関数を import 済みなので、参照も差し替える。
+        # buy_sell_entry は関数を import 済みのことがあるため、参照も差し替える。
         try:
             import kabu_api.buy_sell_entry as bse
             bse.send_order_common = patched_send_order_common
@@ -174,19 +190,62 @@ def _patch_send_order_common() -> bool:
         return False
 
 
+def _patch_requests_post_sendorder() -> bool:
+    """
+    最終・最終防衛。
+    どこかのモジュールが send_order_common を通さず requests.post(.../sendorder, json=payload) した場合も、
+    /sendorder の json payload だけ Exchange=9 にする。Discord等の通常POSTには触らない。
+    """
+    try:
+        import requests
+    except Exception:
+        logger.exception("[ORDER EXCHANGE SOR] import requests failed")
+        return False
+
+    try:
+        cur = getattr(requests, "post", None)
+        if not callable(cur):
+            return False
+        if getattr(cur, "_order_exchange_sor_v2", False):
+            return True
+        orig = getattr(cur, "_original", cur)
+
+        @wraps(orig)
+        def patched_requests_post(url: Any, *args, **kwargs):
+            try:
+                url_s = str(url or "")
+                if "/sendorder" in url_s.lower():
+                    payload = kwargs.get("json", None)
+                    if isinstance(payload, dict):
+                        kwargs["json"] = _force_payload_exchange(payload, label="requests.post(/sendorder).json")
+            except Exception:
+                logger.exception("[ORDER EXCHANGE SOR] requests.post sendorder force failed")
+            return orig(url, *args, **kwargs)
+
+        patched_requests_post._order_exchange_sor_v2 = True  # type: ignore[attr-defined]
+        patched_requests_post._original = orig  # type: ignore[attr-defined]
+        requests.post = patched_requests_post
+        logger.warning("[ORDER EXCHANGE SOR] patched requests.post /sendorder final-final defense target_exchange=%s", _target_exchange())
+        return True
+    except Exception:
+        logger.exception("[ORDER EXCHANGE SOR] requests.post patch failed")
+        return False
+
+
 def install() -> bool:
     global _INSTALLED
-    os.environ["ENTRY_ORDER_EXCHANGE"] = str(_target_exchange())
-    os.environ["KABU_ORDER_EXCHANGE"] = str(_target_exchange())
+    _force_env()
     ok1 = _patch_buy_sell_entry()
     ok2 = _patch_send_order_common()
-    _INSTALLED = bool(ok1 or ok2)
+    ok3 = _patch_requests_post_sendorder()
+    _INSTALLED = bool(ok1 or ok2 or ok3)
     logger.warning(
-        "[ORDER EXCHANGE SOR] installed v1 ok=%s target_exchange=%s buy_sell_entry=%s send_order_common=%s",
+        "[ORDER EXCHANGE SOR] installed v2 ok=%s target_exchange=%s buy_sell_entry=%s send_order_common=%s requests_post=%s",
         _INSTALLED,
         _target_exchange(),
         ok1,
         ok2,
+        ok3,
     )
     return _INSTALLED
 
@@ -195,5 +254,6 @@ try:
     install()
 except Exception:
     logger.exception("[ORDER EXCHANGE SOR] auto install failed")
+
 
 __all__ = ["install"]
