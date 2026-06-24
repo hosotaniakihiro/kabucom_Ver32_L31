@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/summary_stale_guard_patch.py
-# Version: REV4-SUMMARY-STALE-GUARD-MIN-KEEP-LATEST
+# Version: REV5-SUMMARY-STALE-GUARD-GLOBAL-LAG-FALLBACK
 # ------------------------------------------------------------
 # 【概要】
 #   PUSH / ranking summary が古いまま merged summary に残り、
@@ -11,6 +11,13 @@
 #     404件 -> 12件のようになる問題を防ぐ。
 #   - stale判定後の行数が少なすぎる場合、最新行から最低件数だけ残す。
 #   - 既定: PUSH 1m/3m/5m は最低50件、rankingは最低50件。
+#
+# REV5:
+#   - summary全体の最新時刻が壁時計より遅れている場合、max_ageで大量DROPせず、
+#     「銘柄ごとの最新1行」を残す global-lag fallback を追加。
+#   - 222件 -> 50件/73件のような stale drop 多発を抑える。
+#   - fallback行には summary_stale=True / summary_stale_age_sec を付与して、
+#     古いデータであることを後段が判別できるようにする。
 # ============================================================
 
 from __future__ import annotations
@@ -192,6 +199,25 @@ def _latest_fallback_rows(out: pd.DataFrame, *, time_col: str, min_keep: int) ->
         return out.iloc[0:0].copy()
 
 
+def _latest_per_symbol_rows(out: pd.DataFrame, *, time_col: str, max_rows: int) -> pd.DataFrame:
+    """全体が遅延している時に、銘柄ごとの最新行をなるべく残す。"""
+    try:
+        if out is None or out.empty or time_col not in out.columns:
+            return pd.DataFrame() if out is None else out.iloc[0:0].copy()
+        work = out[out[time_col].notna()].copy()
+        if work.empty:
+            return out.iloc[0:0].copy()
+        work = work.sort_values(time_col, ascending=False)
+        if "symbol" in work.columns:
+            work = work.drop_duplicates(subset=["symbol"], keep="first")
+        if max_rows and max_rows > 0:
+            work = work.head(int(max_rows))
+        return work.copy().reset_index(drop=True)
+    except Exception:
+        logger.debug("[SUMMARY STALE DROP] latest per-symbol fallback failed", exc_info=True)
+        return out.iloc[0:0].copy()
+
+
 def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sanitize") -> pd.DataFrame:
     try:
         if df is None or not isinstance(df, pd.DataFrame) or df.empty:
@@ -230,15 +256,58 @@ def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sani
         before = int(len(out))
         valid_mask = dt_series.notna() & age_sec.ge(0)
 
+        latest_dt = None
+        latest_age_sec = None
+        try:
+            latest_dt = dt_series.max()
+            if pd.notna(latest_dt):
+                latest_age_sec = float((now - latest_dt).total_seconds())
+        except Exception:
+            latest_dt = None
+            latest_age_sec = None
+
+        # REV5: summary runner 側が遅延して最新時刻そのものが古い場合、
+        # max_ageで大半を捨てると候補母集団が50件程度まで激減する。
+        # この場合は stale であることを明示しながら、銘柄ごとの最新行を残す。
+        global_lag_enabled = _env_bool("SUMMARY_STALE_KEEP_LATEST_PER_SYMBOL_ON_GLOBAL_LAG", True)
+        global_lag_grace = _env_int("SUMMARY_STALE_GLOBAL_LAG_GRACE_SEC", 30)
+        if (
+            global_lag_enabled
+            and max_age is not None
+            and max_age > 0
+            and latest_age_sec is not None
+            and latest_age_sec > float(max_age + global_lag_grace)
+        ):
+            max_rows = _env_int("SUMMARY_STALE_GLOBAL_LAG_MAX_KEEP_ROWS", 1000)
+            fallback = _latest_per_symbol_rows(out, time_col=time_col, max_rows=max_rows)
+            try:
+                fallback["summary_stale"] = True
+                fallback["summary_stale_age_sec"] = latest_age_sec
+                fallback["summary_stale_reason"] = "global_lag_latest_per_symbol"
+            except Exception:
+                pass
+            logger.warning(
+                "[SUMMARY STALE DROP] global lag fallback source=%s tf=%s label=%s before=%s after=%s max_age_sec=%s latest_age_sec=%.1f latest_dt=%s now=%s max_keep=%s",
+                source,
+                tf,
+                label,
+                before,
+                len(fallback),
+                max_age,
+                latest_age_sec,
+                latest_dt,
+                now,
+                max_rows,
+            )
+            return fallback
+
         absolute_mask = pd.Series(False, index=out.index)
         if max_age is not None and max_age > 0:
             absolute_mask = age_sec.le(float(max_age))
 
         relative_mask = pd.Series(False, index=out.index)
-        latest_dt = None
         if relative_lag is not None and relative_lag > 0:
             try:
-                latest_dt = dt_series.max()
                 if pd.notna(latest_dt):
                     cutoff = latest_dt - pd.Timedelta(seconds=float(relative_lag))
                     relative_mask = dt_series.ge(cutoff)
@@ -354,7 +423,7 @@ def install() -> bool:
 
         _PATCHED = True
         _install_active_empty_universe_patch()
-        logger.info("[SUMMARY STALE GUARD PATCH] installed rev=4 sanitize=True merged_get=%s active_empty_universe=True", bool(original_get_merged))
+        logger.info("[SUMMARY STALE GUARD PATCH] installed rev=5 sanitize=True merged_get=%s active_empty_universe=True", bool(original_get_merged))
         return True
 
     except Exception:
