@@ -1,22 +1,17 @@
 # ============================================================
 # File   : core/startup/final_entry_safety_guard_patch.py
-# Version: Ver06-BOARD-GUARD-SAFE-CALL
+# Version: Ver07-BOARD-GUARD-COMPAT-NO-BLOCKING-BOARD-API
 # ------------------------------------------------------------
 # entry_controller._execute_best_candidate を runtime patch し、
 # 発注直前の最終安全ガードを追加する。
 #
-# Ver04:
-#   - PUSH登録保護済み/AI候補で、流動性OKの銘柄が board_missing だけで
-#     連続停止していたため、板欠損時のfail-openを追加。
-#   - ただし無条件ではなく、価格・出来高・売買代金・scoreが最低条件を満たす時だけ許可。
-#   - 板欠損で許可した場合は小ロット化し、既存のentry_price_improvement/発注側に任せる。
-#
-# Ver05:
-#   - _board_guard の呼び出し形式を 3引数/4引数 両対応にする。
-#
-# Ver06:
-#   - 起動中に別patchが _board_guard を3引数版 _patched_board_guard に差し替えても、
-#     呼び出し側で4引数失敗→3引数再試行する safe call を追加。
+# Ver07:
+#   - _board_guard / _patched_board_guard を可変引数対応に統一。
+#   - 3引数版/4引数版の外部patchが混在しても TypeError で落とさない。
+#   - 板API取得は ENTRY_BOARD_API_LOOKUP_ENABLED=1 の時だけ実行。
+#     既定では /board への追加RESTを避け、bid/ask欠損時は保護条件を満たす候補だけ
+#     ENTRY_ALLOW_ENTRY_WITHOUT_BOARD で小ロットfail-openする。
+#   - 401/timeout時も候補処理を詰まらせず board_missing fallback に回す。
 #
 # 優先度3「当日損失上限で新規停止」は、ユーザー要望により未実装。
 # ============================================================
@@ -27,7 +22,7 @@ import datetime as dt
 import logging
 import os
 import time
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -35,43 +30,49 @@ _INSTALLED = False
 _ORIG_EXECUTE_BEST_CANDIDATE = None
 
 
+_TRUE_SET = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+_FALSE_SET = {"0", "false", "no", "n", "off", "ng", "disable", "disabled", ""}
+
+
 def _env_bool(name: str, default: bool = True) -> bool:
     try:
-        v = os.getenv(name)
-        if v is None:
+        raw = os.getenv(name)
+        if raw is None:
             return bool(default)
-        s = str(v).strip().lower()
-        if s in {"1", "true", "yes", "y", "on"}:
+        s = str(raw).strip().lower()
+        if s in _TRUE_SET:
             return True
-        if s in {"0", "false", "no", "n", "off", ""}:
+        if s in _FALSE_SET:
             return False
-        return bool(default)
     except Exception:
-        return bool(default)
+        pass
+    return bool(default)
 
 
 def _env_float(name: str, default: float) -> float:
     try:
-        v = os.getenv(name)
-        if v is None or str(v).strip() == "":
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
             return float(default)
-        return float(v)
+        return float(raw)
     except Exception:
         return float(default)
 
 
 def _env_str(name: str, default: str) -> str:
     try:
-        v = os.getenv(name)
-        if v is None or str(v).strip() == "":
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
             return str(default)
-        return str(v).strip()
+        return str(raw).strip()
     except Exception:
         return str(default)
 
 
 def _force_default_env() -> None:
-    # 板が取れないだけでAI候補が毎回止まるため、保護候補/流動性OKなら小ロットで許可する。
+    # 板APIはkabu StationのREST負荷/401 retry/timeoutの原因になりやすいため既定OFF。
+    # row内にbid/askが無い場合は、流動性・score条件を満たす候補のみ小ロットで許可する。
+    os.environ.setdefault("ENTRY_BOARD_API_LOOKUP_ENABLED", "0")
     os.environ.setdefault("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", "1")
     os.environ.setdefault("ENTRY_ALLOW_WITHOUT_BOARD_MIN_VOLUME", "30000")
     os.environ.setdefault("ENTRY_ALLOW_WITHOUT_BOARD_MIN_TURNOVER", "10000000")
@@ -291,6 +292,9 @@ def _extract_bid_ask_from_row(row: dict) -> tuple[float, float, float, float]:
 
 
 def _try_get_bid_ask_from_api(symbol: str) -> tuple[float, float, float, float]:
+    if not _env_bool("ENTRY_BOARD_API_LOOKUP_ENABLED", False):
+        logger.info("[FINAL ENTRY SAFETY GUARD] BOARD_API_LOOKUP_SKIP symbol=%s enabled=0", symbol)
+        return 0.0, 0.0, 0.0, 0.0
     try:
         from utils_common import get_latest_bid_ask
         res = get_latest_bid_ask(symbol)
@@ -303,8 +307,8 @@ def _try_get_bid_ask_from_api(symbol: str) -> tuple[float, float, float, float]:
             )
         if isinstance(res, (list, tuple)) and len(res) >= 2:
             return _safe_float(res[0], 0.0), _safe_float(res[1], 0.0), 0.0, 0.0
-    except Exception:
-        logger.debug("[FINAL ENTRY SAFETY GUARD] get_latest_bid_ask failed symbol=%s", symbol, exc_info=True)
+    except Exception as e:
+        logger.warning("[FINAL ENTRY SAFETY GUARD] get_latest_bid_ask skipped by error symbol=%s error=%s", symbol, e)
     return 0.0, 0.0, 0.0, 0.0
 
 
@@ -344,31 +348,44 @@ def _board_missing_fallback_ok(row: dict, item: dict, symbol: str, side: str) ->
     return True
 
 
-def _board_guard(row: dict, item: dict | None = None, symbol: str | None = None, side: str | None = None, *_, **__) -> bool:
-    """
-    板ガード。
+def _coerce_board_guard_args(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[dict, dict, str, str]:
+    row = _row_to_dict(args[0] if len(args) >= 1 else kwargs.get("row"))
+    item: dict = {}
+    symbol: Any = kwargs.get("symbol")
+    side: Any = kwargs.get("side")
 
-    互換性のため、以下の両方を許容する。
-      - _board_guard(row, symbol, side)
-      - _board_guard(row, item, symbol, side)
-    """
-    if side is None and symbol is not None:
-        # 旧形式: _board_guard(row, symbol, side)
-        side = symbol
-        symbol = item  # type: ignore[assignment]
-        item = None
+    if len(args) >= 4:
+        item = args[1] if isinstance(args[1], dict) else {}
+        symbol = args[2]
+        side = args[3]
+    elif len(args) >= 3:
+        # old: guard(row, symbol, side)
+        item = kwargs.get("item") if isinstance(kwargs.get("item"), dict) else {}
+        symbol = args[1]
+        side = args[2]
+    elif len(args) >= 2:
+        # semi-old: guard(row, item) or guard(row, symbol)
+        if isinstance(args[1], dict):
+            item = args[1]
+        else:
+            symbol = args[1]
 
-    row = _row_to_dict(row)
-    item = item if isinstance(item, dict) else {}
+    if not isinstance(item, dict):
+        item = {}
     symbol = _norm_symbol(symbol or _first(row, ("symbol", "Symbol", "code", "銘柄コード"), ""))
     side = _norm_side(side or _first(row, ("side", "entry_decision", "ai_side"), ""))
+    return row, item, symbol, side
 
+
+def _board_guard(*args, **kwargs) -> bool:
+    """板ガード。3引数/4引数/keyword混在をすべて許容する。"""
+    row, item, symbol, side = _coerce_board_guard_args(args, kwargs)
     if not symbol or side not in {"BUY", "SELL"}:
         _log_ng("board_guard_invalid_args", symbol, side, row_keys=list(row.keys()), item_keys=list(item.keys()))
         return False
-
     if not _env_bool("ENTRY_BOARD_GUARD_ENABLED", True):
         return True
+
     bid, ask, bid_qty, ask_qty = _extract_bid_ask_from_row(row)
     if bid <= 0 or ask <= 0:
         bid2, ask2, bidq2, askq2 = _try_get_bid_ask_from_api(symbol)
@@ -376,11 +393,13 @@ def _board_guard(row: dict, item: dict | None = None, symbol: str | None = None,
         ask = ask or ask2
         bid_qty = bid_qty or bidq2
         ask_qty = ask_qty or askq2
+
     if bid <= 0 or ask <= 0:
         if _board_missing_fallback_ok(row, item, symbol, side):
             return True
         _log_ng("board_missing", symbol, side, bid=bid, ask=ask, message="板が取れないため新規エントリー停止")
         return False
+
     mid = (bid + ask) / 2.0
     spread_pct = ((ask - bid) / mid) * 100.0 if mid > 0 else 999.0
     max_spread = _env_float("ENTRY_MAX_SPREAD_PCT", 0.15)
@@ -398,33 +417,50 @@ def _board_guard(row: dict, item: dict | None = None, symbol: str | None = None,
     return True
 
 
-# 互換名。古いログ/別パッチで _patched_board_guard と表示される環境でも同じ実装を使う。
-_patched_board_guard = _board_guard
+def _patched_board_guard(*args, **kwargs) -> bool:
+    """互換名。外部から4引数で呼ばれても絶対に TypeError にしない。"""
+    return _board_guard(*args, **kwargs)
 
 
 def _call_board_guard(row: dict, item: dict, symbol: str, side: str) -> bool:
-    """外部patchで _board_guard が3引数関数に差し替わっても落とさない安全呼び出し。"""
-    guard = _board_guard
-    try:
-        return bool(guard(row, item, symbol, side))
-    except TypeError as e:
-        logger.warning(
-            "[FINAL ENTRY SAFETY GUARD] BOARD_GUARD_RETRY_3ARGS symbol=%s side=%s guard=%s error=%s",
-            symbol,
-            side,
-            getattr(guard, "__name__", repr(guard)),
-            e,
-        )
+    """外部patchで board guard が3引数関数に差し替わっても落とさない安全呼び出し。"""
+    candidates: list[Callable[..., Any]] = []
+    for name in ("_patched_board_guard", "_board_guard"):
+        fn = globals().get(name)
+        if callable(fn) and fn not in candidates:
+            candidates.append(fn)
+    for guard in candidates:
         try:
-            return bool(guard(row, symbol, side))
-        except TypeError:
-            logger.exception(
-                "[FINAL ENTRY SAFETY GUARD] BOARD_GUARD_RETRY_3ARGS_FAILED symbol=%s side=%s guard=%s",
+            return bool(guard(row, item, symbol, side))
+        except TypeError as e4:
+            logger.warning(
+                "[FINAL ENTRY SAFETY GUARD] BOARD_GUARD_RETRY_3ARGS symbol=%s side=%s guard=%s error=%s",
                 symbol,
                 side,
                 getattr(guard, "__name__", repr(guard)),
+                e4,
             )
-            return False
+            try:
+                return bool(guard(row, symbol, side))
+            except TypeError as e3:
+                logger.warning(
+                    "[FINAL ENTRY SAFETY GUARD] BOARD_GUARD_SKIP_INCOMPATIBLE symbol=%s side=%s guard=%s error=%s",
+                    symbol,
+                    side,
+                    getattr(guard, "__name__", repr(guard)),
+                    e3,
+                )
+                continue
+        except Exception as e:
+            logger.warning(
+                "[FINAL ENTRY SAFETY GUARD] BOARD_GUARD_ERROR_FALLBACK symbol=%s side=%s guard=%s error=%s",
+                symbol,
+                side,
+                getattr(guard, "__name__", repr(guard)),
+                e,
+            )
+            return _board_missing_fallback_ok(row, item, symbol, side)
+    return _board_missing_fallback_ok(row, item, symbol, side)
 
 
 def _apply_contrarian_half_size(item: dict, row: dict, symbol: str, side: str) -> None:
@@ -489,7 +525,7 @@ def _is_currently_wrapped() -> bool:
     try:
         import trading.handlers.entry_controller as ec
         cur = getattr(ec, "_execute_best_candidate", None)
-        return bool(getattr(cur, "_final_entry_safety_guard_v06", False))
+        return bool(getattr(cur, "_final_entry_safety_guard_v07", False))
     except Exception:
         return False
 
@@ -505,19 +541,19 @@ def install() -> bool:
         if not callable(old):
             logger.error("[FINAL ENTRY SAFETY GUARD] target _execute_best_candidate unavailable")
             return False
-        if getattr(old, "_final_entry_safety_guard_v06", False):
+        if getattr(old, "_final_entry_safety_guard_v07", False):
             _INSTALLED = True
             return True
         if getattr(old, "_final_entry_safety_guard", False) and _ORIG_EXECUTE_BEST_CANDIDATE is not None:
             old = _ORIG_EXECUTE_BEST_CANDIDATE
         _ORIG_EXECUTE_BEST_CANDIDATE = old
         _patched_execute_best_candidate._final_entry_safety_guard = True  # type: ignore[attr-defined]
-        _patched_execute_best_candidate._final_entry_safety_guard_v06 = True  # type: ignore[attr-defined]
+        _patched_execute_best_candidate._final_entry_safety_guard_v07 = True  # type: ignore[attr-defined]
         _patched_execute_best_candidate._original_execute_best_candidate = old  # type: ignore[attr-defined]
         ec._execute_best_candidate = _patched_execute_best_candidate
         _INSTALLED = True
         logger.warning(
-            "[FINAL ENTRY SAFETY GUARD] installed v06 liquidity=%s min_volume=%.0f min_turnover=%.0f same_symbol_loss=%s recent_reverse=%s time_guard=%s board_guard=%s allow_without_board=%s board_missing_qty_ratio=%.2f contrarian_half=%s qty_ratio=%.2f daily_loss_guard=NOT_INSTALLED_BY_REQUEST",
+            "[FINAL ENTRY SAFETY GUARD] installed v07 liquidity=%s min_volume=%.0f min_turnover=%.0f same_symbol_loss=%s recent_reverse=%s time_guard=%s board_guard=%s board_api_lookup=%s allow_without_board=%s board_missing_qty_ratio=%.2f contrarian_half=%s qty_ratio=%.2f daily_loss_guard=NOT_INSTALLED_BY_REQUEST",
             _env_bool("ENTRY_FINAL_LIQUIDITY_GUARD_ENABLED", True),
             _env_float("ENTRY_MIN_VOLUME", 30000.0),
             _env_float("ENTRY_MIN_TURNOVER", 10000000.0),
@@ -525,6 +561,7 @@ def install() -> bool:
             _env_bool("ENTRY_RECENT_REVERSE_GUARD_ENABLED", True),
             _env_bool("ENTRY_TIME_GUARD_ENABLED", True),
             _env_bool("ENTRY_BOARD_GUARD_ENABLED", True),
+            _env_bool("ENTRY_BOARD_API_LOOKUP_ENABLED", False),
             _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", True),
             _env_float("ENTRY_BOARD_MISSING_QTY_RATIO", 0.5),
             _env_bool("ENTRY_CONTRARIAN_HALF_SIZE_ENABLED", True),
@@ -542,4 +579,4 @@ except Exception:
     logger.exception("[FINAL ENTRY SAFETY GUARD] auto install failed")
 
 
-__all__ = ["install"]
+__all__ = ["install", "_board_guard", "_patched_board_guard", "_call_board_guard"]
