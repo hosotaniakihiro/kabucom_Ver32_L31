@@ -8,7 +8,8 @@ Apply the remaining production-safe fixes in one startup patch, in the order
 requested by operation priority:
 
 1. Yahoo complement: reduce non-differential summary reflection during market.
-2. kabu Station token/API key: propagate refreshed token to all common holders.
+2. kabu Station token/API key: propagate startup token to all common holders,
+   then keep runtime calls on settings.ini token without automatic refresh.
 3. PUSH A/B rotation: use strict clear/register timing and avoid stale register state.
 4. 3m/5m summary recovery: enable DB/global-context fallback instead of hard empty.
 5. Entry/exit scheduler congestion: shorten per-symbol waits and avoid one candidate
@@ -29,7 +30,7 @@ from functools import wraps
 from typing import Any, Callable, Iterable, Optional
 
 logger = logging.getLogger(__name__)
-VERSION = "V1.1-FULL-PIPELINE-STABILITY-SUMMARY-LATEST-PREFER"
+VERSION = "V1.2-FULL-PIPELINE-STABILITY-STARTUP-ONCE-TOKEN"
 _INSTALLED = False
 
 
@@ -92,8 +93,26 @@ def _publish_token(token: Any, source: str = "unknown") -> bool:
         return False
 
 
+def _install_token_startup_once_policy() -> bool:
+    """Disable automatic runtime token refresh after startup.
+
+    main_database.py may refresh once at startup and save settings.ini before this
+    patch is installed.  After this point, all processes should read settings.ini
+    / runtime cache and should not call /token automatically on 401.
+    """
+    try:
+        if os.environ.get("DISABLE_TOKEN_STARTUP_ONCE_POLICY_PATCH", "").strip() == "1":
+            logger.warning("[FULL PIPELINE STABILITY] startup-once token policy disabled by env")
+            return False
+        from . import token_startup_once_policy_patch
+        return bool(token_startup_once_policy_patch.install())
+    except Exception:
+        logger.exception("[FULL PIPELINE STABILITY] startup-once token policy install failed")
+        return False
+
+
 def _install_token_unifier() -> bool:
-    """Make token refresh results immediately visible to legacy modules."""
+    """Make token results immediately visible to legacy modules."""
     ok = False
     try:
         import token_manager  # type: ignore
@@ -200,7 +219,9 @@ def _install_push_rotation_defaults() -> bool:
         "PUSH_REGISTER_RETRY_ON_REGIST_COUNT_ERROR": "1",
         "PUSH_REGISTER_LOCK_TIMEOUT_SEC": "2.0",
         "PUSH_REGISTER_HTTP_TIMEOUT_SEC": "3.0",
-        "PUSH_REGISTER_RECOVERY_REFRESH_TOKEN": "1",
+        # Do not call /token during live rotation.  Use settings.ini token only.
+        "PUSH_REGISTER_RECOVERY_REFRESH_TOKEN": "0",
+        "PUSH_REGISTER_AUTH_RETRY_ENABLED": "0",
         "BOARD_RETRY_DURING_ROTATION_SEC": "0.2",
         "BOARD_ALLOW_MISSING_DURING_ROTATION": "1",
     }
@@ -287,8 +308,7 @@ def _install_register_ops_guard() -> bool:
                     content = ret.get("content") or ret.get("vendor_body") or ret
                     text = str(content)
                     if "APIキー不一致" in text or "4001009" in text:
-                        # Force next pass to refresh token instead of reusing stale headers.
-                        os.environ["PUSH_REGISTER_FORCE_TOKEN_REFRESH_NEXT"] = "1"
+                        logger.warning("[FULL PIPELINE STABILITY] API key mismatch observed; runtime token refresh is disabled by startup-once policy")
                     if "レジスト数エラー" in text or "4002006" in text:
                         os.environ["PUSH_REGISTER_FORCE_UNREGISTER_ALL_NEXT"] = "1"
             except Exception:
@@ -314,6 +334,7 @@ def install() -> bool:
             return False
         context = _argv_context()
         yahoo_ok = _install_yahoo_differential_reflect()
+        token_policy_ok = _install_token_startup_once_policy()
         token_ok = _install_token_unifier()
         push_env_ok = _install_push_rotation_defaults()
         push_guard_ok = _install_register_ops_guard()
@@ -322,10 +343,11 @@ def install() -> bool:
         entry_ok = _install_entry_exit_congestion_defaults()
         _INSTALLED = True
         logger.warning(
-            "[FULL PIPELINE STABILITY] installed version=%s context=%s yahoo_diff=%s token=%s push_env=%s push_guard=%s summary_recovery=%s summary_latest=%s entry_exit=%s",
+            "[FULL PIPELINE STABILITY] installed version=%s context=%s yahoo_diff=%s token_policy=%s token=%s push_env=%s push_guard=%s summary_recovery=%s summary_latest=%s entry_exit=%s",
             VERSION,
             context,
             yahoo_ok,
+            token_policy_ok,
             token_ok,
             push_env_ok,
             push_guard_ok,
