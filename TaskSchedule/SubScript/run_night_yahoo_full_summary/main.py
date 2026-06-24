@@ -1,9 +1,11 @@
 # ============================================================
 # File   : TaskSchedule/SubScript/run_night_yahoo_full_summary/main.py
-# Version: V1-TASK-NIGHT-YAHOO-FULL-SUMMARY
+# Version: V2-TASK-NIGHT-YAHOO-DAILY-AND-FULL-SUMMARY
 # ------------------------------------------------------------
 # Windowsタスクスケジューラ用入口。
-# 最新営業日のYahoo 1m全銘柄取得→1m/3m/5m summary計算→summary DB保存。
+#   1) Yahoo日足全銘柄更新→daily_db/stock_analysis.db保存
+#   2) 最新営業日のYahoo 1m全銘柄取得
+#   3) 1m/3m/5m summary計算→summary DB保存
 # ============================================================
 
 from __future__ import annotations
@@ -23,7 +25,24 @@ os.environ.setdefault("NIGHT_YAHOO_BATCH_SIZE", "80")
 os.environ.setdefault("NIGHT_YAHOO_PAUSE_SEC", "1.0")
 os.environ.setdefault("NIGHT_YAHOO_INTERVALS", "1,3,5")
 
-from scripts.night_yahoo_full_summary_batch import main
+# 日足更新設定。重すぎる場合は環境変数で調整。
+os.environ.setdefault("NIGHT_YAHOO_UPDATE_DAILY", "1")
+os.environ.setdefault("NIGHT_YAHOO_DAILY_PERIOD", "3y")
+os.environ.setdefault("NIGHT_YAHOO_DAILY_PAUSE_SEC", "0.05")
+
+from scripts.night_yahoo_daily_update_batch import main as daily_main
+from scripts.night_yahoo_full_summary_batch import main as summary_main
+
+
+def main() -> int:
+    daily_enabled = str(os.environ.get("NIGHT_YAHOO_UPDATE_DAILY", "1")).strip().lower() not in {"0", "false", "no", "off"}
+
+    if daily_enabled:
+        daily_ret = int(daily_main([]) or 0)
+        if daily_ret != 0 and str(os.environ.get("NIGHT_YAHOO_DAILY_STRICT", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+            return daily_ret
+
+    return int(summary_main([]) or 0)
 
 
 if __name__ == "__main__":
