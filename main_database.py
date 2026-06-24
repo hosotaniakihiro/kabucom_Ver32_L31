@@ -1,6 +1,6 @@
 # ============================================================
 # File   : main_database.py
-# Version: DATA-COLLECTORS-MAIN-DATABASE-ENTRY-V6-CONSOLE-LOG-FILE
+# Version: DATA-COLLECTORS-MAIN-DATABASE-ENTRY-V7-SUMMARY-WAL-CHECKPOINT
 # ------------------------------------------------------------
 # Purpose:
 #   - DB作成 / ランキング取得 / PUSH銘柄登録 / PUSH受信 を起動する入口
@@ -8,6 +8,7 @@
 #   - 実体は scripts/data_collectors_runner.py に委譲する
 #   - main_database.py 経由でも古い PUSH/ranking summary を候補に残さない
 #   - main_database.py のコンソールログに時刻を付け、ファイルにも保存する
+#   - summary DB の WAL を1分ごとに checkpoint して .db 本体へ反映する
 # ============================================================
 
 from __future__ import annotations
@@ -103,6 +104,25 @@ def _install_summary_sqlite_lock_tolerance() -> None:
         logger.warning("[MAIN DATABASE] summary sqlite lock tolerance installed ok=%s", ok)
     except Exception:
         logger.exception("[MAIN DATABASE] summary sqlite lock tolerance install failed; continue")
+
+
+def _install_summary_wal_checkpoint() -> None:
+    """Install a 1-minute WAL checkpoint loop for summaryYYYYMMDD.db.
+
+    This copies committed frames from summaryYYYYMMDD.db-wal into the .db file
+    without changing the writer logic.  PASSIVE mode is the default to avoid
+    increasing writer/reader lock contention on NAS SQLite.
+    """
+    try:
+        os.environ.setdefault("SUMMARY_WAL_CHECKPOINT_ENABLED", "1")
+        os.environ.setdefault("SUMMARY_WAL_CHECKPOINT_INTERVAL_SEC", "60")
+        os.environ.setdefault("SUMMARY_WAL_CHECKPOINT_MODE", "PASSIVE")
+        os.environ.setdefault("SUMMARY_WAL_CHECKPOINT_BUSY_TIMEOUT_MS", "5000")
+        from core.startup.summary_wal_checkpoint_patch import install
+        ok = install()
+        logger.warning("[MAIN DATABASE] summary wal checkpoint installed ok=%s", ok)
+    except Exception:
+        logger.exception("[MAIN DATABASE] summary wal checkpoint install failed; continue")
 
 
 def _install_summary_stale_guard() -> None:
@@ -204,6 +224,7 @@ def main() -> int:
 
     _install_cpu_guard_env()
     _install_summary_sqlite_lock_tolerance()
+    _install_summary_wal_checkpoint()
     _install_summary_stale_guard()
 
     try:
