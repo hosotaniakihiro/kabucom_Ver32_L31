@@ -1,15 +1,16 @@
 # ============================================================
 # File   : scripts/night_yahoo_daily_update_batch.py
-# Version: V1-NIGHT-YAHOO-DAILY-UPDATE-BATCH
+# Version: V2-NIGHT-YAHOO-DAILY-YF-FALLBACK
 # ------------------------------------------------------------
-# 【概要】
-#   夜間にYahoo Financeから全銘柄の日足を取得し、日足テクニカル・
-#   ローソク足・売買シグナル・ランキング指標を計算して
-#   daily_db/stock_analysis.db に保存する。
+# 夜間にYahoo Financeから全銘柄の日足を取得し、日足テクニカル・
+# ローソク足・売買シグナル・ランキング指標を計算して
+# daily_db/stock_analysis.db に保存する。
 #
-# 【目的】
-#   翌営業日の起動時点で、日足MTF/日足フィルターに使う最新日足データを
-#   あらかじめ揃える。
+# V2:
+#   - yfinance取得を ticker文字列 positional 呼び出しに変更
+#   - yf.Ticker(...).history() フォールバックを追加
+#   - 取得失敗理由をログに出す
+#   - 連続NGが多すぎる場合はネットワーク/Yahoo側異常として早期停止
 # ============================================================
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ except Exception:
     DEFAULT_BASE_DIR = r"\\192.168.0.22\AutoStockBuyAndSell"
 
 LOG = logging.getLogger("night_yahoo_daily_update_batch")
-VERSION = "V1-NIGHT-YAHOO-DAILY-UPDATE-BATCH"
+VERSION = "V2-NIGHT-YAHOO-DAILY-YF-FALLBACK"
 
 DB_DIR_NAME = "daily_db"
 DB_FILE_NAME = "stock_analysis.db"
@@ -123,8 +124,7 @@ def _load_symbols_from_symbol_flags_db(path: Path) -> list[dict[str, str]]:
                 select_cols.append(name_col)
             if market_col:
                 select_cols.append(market_col)
-            sql = f"SELECT DISTINCT {', '.join(select_cols)} FROM {table}"
-            rows = con.execute(sql).fetchall()
+            rows = con.execute(f"SELECT DISTINCT {', '.join(select_cols)} FROM {table}").fetchall()
             out: dict[str, dict[str, str]] = {}
             for row in rows:
                 s = _normalize_symbol(row[0])
@@ -263,19 +263,50 @@ def _fetch_daily_one(symbol: str, *, period: str, start: Optional[str]) -> pd.Da
     ticker = _to_yahoo_ticker(symbol)
     if not ticker:
         return pd.DataFrame()
-    kwargs: dict[str, Any] = {
-        "tickers": ticker,
-        "interval": "1d",
-        "auto_adjust": False,
-        "progress": False,
-        "threads": False,
-    }
-    if start:
-        kwargs["start"] = start
-    else:
-        kwargs["period"] = period
-    raw = yf.download(**kwargs)
-    return _standardize_daily(raw, symbol)
+
+    errors: list[str] = []
+
+    # 1) yfinance標準の単一ticker指定。tickers= ではなく positional にする。
+    try:
+        kwargs: dict[str, Any] = {
+            "interval": "1d",
+            "auto_adjust": False,
+            "progress": False,
+            "threads": False,
+        }
+        if start:
+            kwargs["start"] = start
+        else:
+            kwargs["period"] = period
+        raw = yf.download(ticker, **kwargs)
+        out = _standardize_daily(raw, symbol)
+        if not out.empty:
+            return out
+        errors.append("download_empty")
+    except Exception as e:
+        errors.append(f"download_error={type(e).__name__}:{e}")
+
+    # 2) フォールバック: Ticker.history
+    try:
+        hist_kwargs: dict[str, Any] = {
+            "interval": "1d",
+            "auto_adjust": False,
+        }
+        if start:
+            hist_kwargs["start"] = start
+        else:
+            hist_kwargs["period"] = period
+        raw = yf.Ticker(ticker).history(**hist_kwargs)
+        out = _standardize_daily(raw, symbol)
+        if not out.empty:
+            LOG.info("[NIGHT YAHOO DAILY] fallback history ok symbol=%s ticker=%s rows=%s", symbol, ticker, len(out))
+            return out
+        errors.append("history_empty")
+    except Exception as e:
+        errors.append(f"history_error={type(e).__name__}:{e}")
+
+    LOG.warning("[NIGHT YAHOO DAILY] no daily data symbol=%s ticker=%s reason=%s", symbol, ticker, ";".join(errors))
+    return pd.DataFrame()
 
 
 def _add_change_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -326,8 +357,7 @@ def _sqlite_type(s: pd.Series) -> str:
 def _ensure_table(conn: sqlite3.Connection, table: str, df: pd.DataFrame, pk_cols: list[str]) -> None:
     cols_sql = []
     for col in df.columns:
-        col_type = _sqlite_type(df[col])
-        cols_sql.append(f'"{col}" {col_type}')
+        cols_sql.append(f'"{col}" {_sqlite_type(df[col])}')
     pk = ", ".join([f'"{c}"' for c in pk_cols])
     conn.execute(f'CREATE TABLE IF NOT EXISTS {table} ({", ".join(cols_sql)}, PRIMARY KEY ({pk}))')
     existing = {str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -424,6 +454,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--batch-size", type=int, default=int(os.environ.get("NIGHT_YAHOO_DAILY_BATCH_SIZE", "1")), help="reserved; per-symbol safer by default")
     parser.add_argument("--pause-sec", type=float, default=float(os.environ.get("NIGHT_YAHOO_DAILY_PAUSE_SEC", "0.05")))
     parser.add_argument("--limit", type=int, default=int(os.environ.get("NIGHT_YAHOO_DAILY_LIMIT", "0")))
+    parser.add_argument("--max-consecutive-fail", type=int, default=int(os.environ.get("NIGHT_YAHOO_DAILY_MAX_CONSECUTIVE_FAIL", "60")))
     args = parser.parse_args(argv)
 
     db_path = _db_path()
@@ -438,16 +469,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     rows = 0
     total = len(records)
     start_arg = args.start.strip() or None
+    consecutive_fail = 0
 
     for i, rec in enumerate(records, start=1):
         symbol, success, msg, nrows = process_symbol(rec, period=args.period, start=start_arg, db_path=db_path)
         rows += int(nrows or 0)
         if success:
             ok += 1
+            consecutive_fail = 0
             LOG.info("[NIGHT YAHOO DAILY] [%s/%s] OK symbol=%s %s", i, total, symbol, msg)
         else:
             failed += 1
+            consecutive_fail += 1
             LOG.warning("[NIGHT YAHOO DAILY] [%s/%s] NG symbol=%s %s", i, total, symbol, msg)
+            if ok == 0 and consecutive_fail >= int(args.max_consecutive_fail):
+                LOG.error(
+                    "[NIGHT YAHOO DAILY] abort: first %s symbols all failed. network/yfinance/yahoo may be unavailable. last_symbol=%s",
+                    consecutive_fail,
+                    symbol,
+                )
+                break
         if args.pause_sec > 0:
             time.sleep(float(args.pause_sec))
 
