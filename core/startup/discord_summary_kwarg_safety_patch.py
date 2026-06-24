@@ -1,14 +1,12 @@
 # ============================================================
 # File   : core/startup/discord_summary_kwarg_safety_patch.py
-# Version: V2.6-DISPLAY-KWARG-SAFETY-3LINES-READABLE-LABELS-JA-REASON
+# Version: V2.7-DISPLAY-KWARG-SAFETY-FALLBACK
 # ------------------------------------------------------------
-# 目的:
+# Purpose:
 #   1) display系関数へ interval=1 等の未知kwargsが渡っても壊れないようにする。
-#   2) Discord SUMMARY TOP10 を 1銘柄3行固定にする。
-#      - 1行目: 銘柄 + Price/Score/Buy/Sell
-#      - 2行目: Slope/MTF/RSI/MACD
-#      - 3行目: 理由=日本語理由
+#   2) Discord SUMMARY TOP10 を読みやすい3行表示に寄せる。
 #   3) 古い「結果時刻」のSUMMARYをDiscordへ送らない。
+#   4) 定時表示に空DF/Noneが渡った場合、直近の完成済みsummaryを再取得して表示する。
 # ============================================================
 
 from __future__ import annotations
@@ -27,12 +25,29 @@ _PATCHED = False
 _ORIGINALS: dict[str, Callable] = {}
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enabled", "enable"}
+    except Exception:
+        return bool(default)
+
+
 def _is_df_like(v: Any) -> bool:
     try:
         import pandas as pd
         return isinstance(v, pd.DataFrame)
     except Exception:
         return False
+
+
+def _df_empty(v: Any) -> bool:
+    try:
+        return (v is None) or (_is_df_like(v) and bool(v.empty))
+    except Exception:
+        return True
 
 
 def _label_from_value(v: Any) -> str | None:
@@ -45,6 +60,19 @@ def _label_from_value(v: Any) -> str | None:
         if not s or len(s) > 40 or "\n" in s:
             return None
         return s
+
+
+def _interval_min_from_label(label: Any) -> int:
+    try:
+        if isinstance(label, (int, float)):
+            return max(1, int(label))
+        s = str(label or "").strip().lower()
+        m = re.search(r"(\d+)", s)
+        if m:
+            return max(1, int(m.group(1)))
+    except Exception:
+        pass
+    return 1
 
 
 def _normalize(summary_df: Any, interval_label: Any, kwargs: dict[str, Any]) -> tuple[Any, str, dict[str, Any]]:
@@ -94,9 +122,87 @@ def _safe_call(fn: Callable, summary_df: Any, interval_label: str, notify_discor
         raise
 
 
+def _call_candidate(fn: Callable, *args, **kwargs) -> Any:
+    try:
+        return fn(*args, **kwargs)
+    except TypeError:
+        return None
+    except Exception:
+        logger.debug("[SUMMARY DISPLAY FALLBACK] candidate call failed fn=%s", getattr(fn, "__name__", fn), exc_info=True)
+        return None
+
+
+def _fallback_summary_df(summary_df: Any, interval_label: str, fn_name: str, kwargs: dict[str, Any]) -> Any:
+    """定時表示でNone/空DFが来た時に、直近の完成済みsummaryを取り直す。"""
+    if not _df_empty(summary_df):
+        return summary_df
+    if not _env_bool("SUMMARY_DISPLAY_FALLBACK_ENABLED", True):
+        return summary_df
+
+    interval_min = _interval_min_from_label(interval_label)
+    source_hint = str(kwargs.get("source") or "").strip().lower()
+    if not source_hint:
+        source_hint = "ranking" if "ranking" in str(fn_name).lower() else "push"
+
+    try:
+        from core.global_context import context as gc
+    except Exception:
+        logger.debug("[SUMMARY DISPLAY FALLBACK] global_context import failed", exc_info=True)
+        return summary_df
+
+    candidates: list[tuple[str, Callable | None]] = []
+    if source_hint == "ranking":
+        candidates.extend([
+            ("gc.get_ranking_summary", getattr(gc, "get_ranking_summary", None)),
+            ("gc.get_merged_summary", getattr(gc, "get_merged_summary", None)),
+        ])
+    else:
+        candidates.extend([
+            ("gc.get_push_summary", getattr(gc, "get_push_summary", None)),
+            ("gc.get_merged_summary", getattr(gc, "get_merged_summary", None)),
+            ("gc.get_summary", getattr(gc, "get_summary", None)),
+        ])
+
+    for label, fn in candidates:
+        if not callable(fn):
+            continue
+        call_patterns = [
+            ((interval_min,), {"source": source_hint}),
+            ((), {"tf": interval_min, "source": source_hint}),
+            ((), {"interval": interval_min, "source": source_hint}),
+            ((), {"interval_min": interval_min, "source": source_hint}),
+            ((interval_min,), {}),
+            ((), {"tf": interval_min}),
+            ((), {"interval": interval_min}),
+            ((), {"interval_min": interval_min}),
+        ]
+        for args, kw in call_patterns:
+            df = _call_candidate(fn, *args, **kw)
+            if not _df_empty(df):
+                try:
+                    rows = len(df) if hasattr(df, "__len__") else "?"
+                    cols = len(getattr(df, "columns", []) or [])
+                except Exception:
+                    rows, cols = "?", "?"
+                logger.warning(
+                    "[SUMMARY DISPLAY FALLBACK] recovered summary fn=%s source=%s interval=%s rows=%s cols=%s original_empty=%s",
+                    label, source_hint, interval_min, rows, cols, _df_empty(summary_df),
+                )
+                return df
+
+    logger.warning(
+        "[SUMMARY DISPLAY FALLBACK] no completed summary available fn=%s source=%s interval=%s original_empty=%s",
+        fn_name, source_hint, interval_min, _df_empty(summary_df),
+    )
+    return summary_df
+
+
 def _wrap(fn: Callable) -> Callable:
+    fn_name = getattr(fn, "__name__", str(fn))
+
     def _wrapped(summary_df=None, interval_label="1min", *, notify_discord=True, **kwargs):
         summary_df, interval_label, kwargs = _normalize(summary_df, interval_label, kwargs)
+        summary_df = _fallback_summary_df(summary_df, interval_label, fn_name, kwargs)
         return _safe_call(fn, summary_df, interval_label, notify_discord, kwargs)
 
     _wrapped._discord_kwarg_safety_patch = True  # type: ignore[attr-defined]
@@ -213,22 +319,18 @@ def _stale_limit_min(interval_min: int) -> float:
 
 def _should_skip_stale_discord(lines: list[str], title: str | None) -> tuple[bool, str]:
     try:
-        if str(os.getenv("SUMMARY_DISCORD_STALE_GUARD", "1")).strip().lower() in {"0", "false", "no", "off"}:
+        if not _env_bool("SUMMARY_DISCORD_STALE_GUARD", True):
             return False, "disabled"
-
         text = (str(title or "") + "\n" + "\n".join(str(x) for x in (lines or [])))[:6000]
         if "SUMMARY TOP10" not in text and "PUSH SUMMARY TOP10" not in text and "RANKING SUMMARY TOP10" not in text:
             return False, "not_summary"
-
         result_dt = _extract_result_dt(text)
         if result_dt is None:
             return False, "no_result_time"
-
         interval_min = _extract_interval_min(text)
         now = dt.datetime.now().replace(tzinfo=None, microsecond=0)
         age_min = (now - result_dt).total_seconds() / 60.0
         limit = _stale_limit_min(interval_min)
-
         if age_min > limit:
             return True, f"result_dt={result_dt} now={now} age_min={age_min:.1f} limit_min={limit:.1f} interval={interval_min}"
         return False, f"fresh age_min={age_min:.1f} limit_min={limit:.1f} interval={interval_min}"
@@ -239,7 +341,7 @@ def _should_skip_stale_discord(lines: list[str], title: str | None) -> tuple[boo
 def _install_stale_send_guard(disp: Any) -> int:
     try:
         old = getattr(disp, "_send_to_discord", None)
-        if not callable(old) or getattr(old, "_summary_discord_stale_guard_v26", False):
+        if not callable(old) or getattr(old, "_summary_discord_stale_guard_v27", False):
             return 0
 
         def _send_guarded(lines: list[str], title: str | None = None) -> None:
@@ -250,7 +352,7 @@ def _install_stale_send_guard(disp: Any) -> int:
             logger.info("[DISCORD SUMMARY STALE GUARD] allow summary discord %s", reason)
             return old(lines, title=title)
 
-        _send_guarded._summary_discord_stale_guard_v26 = True  # type: ignore[attr-defined]
+        _send_guarded._summary_discord_stale_guard_v27 = True  # type: ignore[attr-defined]
         _send_guarded._original = old  # type: ignore[attr-defined]
         disp._send_to_discord = _send_guarded
         return 1
@@ -262,49 +364,37 @@ def _install_stale_send_guard(disp: Any) -> int:
 def _reason_ja(row: Any, side: str) -> str:
     side_u = str(side or "").upper()
     parts: list[str] = []
-
     buy = _f(_first(row, ("disp_buy_score", "score_buy", "buy_score"), 0.0))
     sell = _f(_first(row, ("disp_sell_score", "score_sell", "sell_score"), 0.0))
     slope = _f(_first(row, ("disp_slope", "slope", "score_slope", "slope_atr_scaled"), 0.0))
     mtf = _f(_first(row, ("disp_mtf", "mtf", "score_mtf", "mtf_score"), 0.0))
     rsi = _f(_first(row, ("disp_rsi", "rsi"), 50.0), 50.0)
     macd = _f(_first(row, ("disp_macd", "macd"), 0.0))
-
     if side_u == "BUY":
         if buy > 0:
             parts.append(f"買いスコア優勢 buy={buy:.2f}")
-        if slope > 0:
-            parts.append(f"上向き傾き slope={slope:.4f}")
-        else:
-            parts.append(f"傾きは弱い slope={slope:.4f}")
+        parts.append(f"上向き傾き slope={slope:.4f}" if slope > 0 else f"傾きは弱い slope={slope:.4f}")
     else:
         if sell > 0:
             parts.append(f"売りスコア優勢 sell={sell:.2f}")
-        if slope < 0:
-            parts.append(f"下向き傾き slope={slope:.4f}")
-        else:
-            parts.append(f"下落傾きは弱い slope={slope:.4f}")
-
+        parts.append(f"下向き傾き slope={slope:.4f}" if slope < 0 else f"下落傾きは弱い slope={slope:.4f}")
     if mtf:
         parts.append(f"複数時間足={mtf:.2f}")
     if rsi != 50.0:
         parts.append(f"RSI={rsi:.1f}")
     if macd:
         parts.append(f"MACD={macd:.3f}")
-
     code_reason = _clean(_first(row, ("reason", "entry_reason", "flag_reason", "signal_reason"), ""), max_len=40)
     if code_reason and code_reason not in {"-", "flag_score"}:
         parts.append(f"元理由={code_reason}")
     elif code_reason == "flag_score":
         parts.append("スコア条件で抽出")
-
     return " / ".join(parts) if parts else "理由データ不足: スコア・傾き・補助指標から判定"
 
 
 def _compact_candidate_line(i: int, row: Any, *, side: str) -> str:
     symbol = _clean(_first(row, ("symbol",), ""), max_len=8)
     name = _clean(_first(row, ("symbolname_view", "symbolname", "name"), ""), max_len=18)
-
     score = _first(row, ("disp_score", "score", "display_score", "final_score"), np.nan)
     buy = _first(row, ("disp_buy_score", "score_buy", "buy_score"), np.nan)
     sell = _first(row, ("disp_sell_score", "score_sell", "sell_score"), np.nan)
@@ -314,7 +404,6 @@ def _compact_candidate_line(i: int, row: Any, *, side: str) -> str:
     rsi = _first(row, ("disp_rsi", "rsi"), np.nan)
     macd = _first(row, ("disp_macd", "macd"), np.nan)
     reason = _reason_ja(row, side)
-
     mark = "🟦" if str(side).upper() == "BUY" else "🟥"
     return (
         f"{mark} {i}. {symbol} {name} Price={_fmt_price(close)} Score={_fmt_metric(score)} Buy={_fmt_metric(buy)} Sell={_fmt_metric(sell)}\n"
@@ -330,15 +419,14 @@ def _install_compact_discord_builder(disp: Any) -> int:
         if callable(old):
             def _candidate(i: int, row: Any, *, side: str) -> str:
                 return _compact_candidate_line(i, row, side=side)
-            _candidate._discord_3lines_readable_labels_ja_reason_v26 = True  # type: ignore[attr-defined]
+            _candidate._discord_3lines_readable_labels_ja_reason_v27 = True  # type: ignore[attr-defined]
             _candidate._original = old  # type: ignore[attr-defined]
             disp._build_discord_candidate_2lines = _candidate
             patched += 1
-
         old_reason = getattr(disp, "_reason_text_for_discord", None)
         def _reason(row: Any, side: str) -> str:
             return _reason_ja(row, side)
-        _reason._discord_3lines_readable_labels_ja_reason_v26 = True  # type: ignore[attr-defined]
+        _reason._discord_3lines_readable_labels_ja_reason_v27 = True  # type: ignore[attr-defined]
         _reason._original = old_reason  # type: ignore[attr-defined]
         disp._reason_text_for_discord = _reason
         patched += 1
@@ -353,7 +441,6 @@ def install() -> bool:
         return True
     try:
         import scheduler_jobs.summary.display as disp
-
         patched = 0
         for name in (
             "print_summary_top10",
@@ -369,15 +456,15 @@ def install() -> bool:
                 _ORIGINALS[name] = fn
                 setattr(disp, name, _wrap(fn))
                 patched += 1
-
         compact_patched = _install_compact_discord_builder(disp)
         stale_patched = _install_stale_send_guard(disp)
         _PATCHED = True
         logger.warning(
-            "[DISCORD KWARG SAFETY] installed V2.6 patched=%s three_lines_readable_labels=%s stale_guard=%s",
+            "[DISCORD KWARG SAFETY] installed V2.7 patched=%s three_lines_readable_labels=%s stale_guard=%s display_fallback=%s",
             patched,
             compact_patched,
             stale_patched,
+            _env_bool("SUMMARY_DISPLAY_FALLBACK_ENABLED", True),
         )
         return True
     except Exception:
