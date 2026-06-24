@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/summary/persistence/summary_save_spool.py
-# Version: V2-SUMMARY-SAVE-SPOOL-CORRUPT-QUARANTINE
+# Version: V3-SUMMARY-SAVE-SPOOL-ROBUST-FLUSH
 # ------------------------------------------------------------
 # 目的:
 #   summary DB が database is locked の時でも、計算済みサマリーを失わない。
@@ -10,11 +10,12 @@
 #   - main_database.py / summary_database_runner 側で毎分 flush して summary DB へ保存
 #   - 壊れた gzip/json spool は .bad へ隔離し、毎回再読込しない
 #
-# 注意:
-#   - スプールはDBではなくファイルなので、SQLiteロックの影響を受けない
-#   - flush成功後は .done へrename
-#   - DBロック等の一時失敗時は残して次回再試行
-#   - 読み取り不能な破損ファイルのみ .bad へ隔離
+# V3:
+#   - SQLiteに直接bindできない dict/list/tuple/numpy scalar を安全に変換する。
+#   - datetime/date/time/source/interval を補完し、キー列不足で failed_files が残り続ける
+#     ケースを減らす。
+#   - 失敗時に path / rows / cols / keys / db / table / reason をログに出し、次の原因特定を
+#     可能にする。
 # ============================================================
 
 from __future__ import annotations
@@ -80,10 +81,32 @@ def _norm_df(df: pd.DataFrame, *, source: str) -> pd.DataFrame:
     out = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
     if out.empty:
         return out
+
     if "symbol" in out.columns:
         out["symbol"] = out["symbol"].astype(str).str.replace(".0", "", regex=False).str.strip()
+
+    # datetime が無い spool でも date/time/time_range から復元できる範囲で補完する。
     if "datetime" in out.columns:
-        out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+        dt_s = pd.to_datetime(out["datetime"], errors="coerce")
+        out["datetime"] = dt_s.dt.strftime("%Y-%m-%d %H:%M:%S")
+        if "date" not in out.columns:
+            out["date"] = dt_s.dt.strftime("%Y-%m-%d")
+        if "time" not in out.columns:
+            out["time"] = dt_s.dt.strftime("%H:%M:%S")
+    elif "date" in out.columns and "time" in out.columns:
+        try:
+            dt_s = pd.to_datetime(out["date"].astype(str) + " " + out["time"].astype(str), errors="coerce")
+            out["datetime"] = dt_s.dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+    elif "date" in out.columns and "time_range" in out.columns:
+        try:
+            t = out["time_range"].astype(str).str.extract(r"(\d{1,2}:\d{2}(?::\d{2})?)", expand=False)
+            dt_s = pd.to_datetime(out["date"].astype(str) + " " + t.fillna(""), errors="coerce")
+            out["datetime"] = dt_s.dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+
     if "date" in out.columns:
         try:
             s = pd.to_datetime(out["date"], errors="coerce")
@@ -91,15 +114,25 @@ def _norm_df(df: pd.DataFrame, *, source: str) -> pd.DataFrame:
             out["date"] = f.where(f.notna(), out["date"].astype(str))
         except Exception:
             out["date"] = out["date"].astype(str)
+
     for c in ("time", "time_range"):
         if c in out.columns:
             out[c] = out[c].astype(str)
+
     if "source" not in out.columns:
         out["source"] = source
     else:
         out["source"] = out["source"].fillna(source).astype(str)
+
+    if "interval" not in out.columns:
+        try:
+            out["interval"] = int(float(str(os.getenv("SUMMARY_SAVE_SPOOL_INTERVAL_FALLBACK", "1"))))
+        except Exception:
+            out["interval"] = 1
+
     if "last_update" not in out.columns:
         out["last_update"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     return out
 
 
@@ -115,6 +148,21 @@ def _sqlite_value(v: Any):
         return v.strftime("%Y-%m-%d %H:%M:%S")
     if isinstance(v, dt.date):
         return v.strftime("%Y-%m-%d")
+    # numpy scalar / pandas scalar をPython標準型へ変換
+    try:
+        item = getattr(v, "item", None)
+        if callable(item) and not isinstance(v, (str, bytes, bytearray)):
+            return item()
+    except Exception:
+        pass
+    # list/dict/tuple/set はSQLiteへ直接bindできないためJSON文字列化
+    if isinstance(v, (dict, list, tuple, set)):
+        try:
+            return json.dumps(v, ensure_ascii=False, default=str)
+        except Exception:
+            return str(v)
+    if isinstance(v, bool):
+        return int(v)
     return v
 
 
@@ -198,32 +246,50 @@ def _read_spool(path: Path) -> tuple[dict, pd.DataFrame]:
 def _save_direct(df: pd.DataFrame, *, interval: int, source: str, date_yyyymmdd: str) -> int:
     work = _norm_df(df, source=source)
     if work.empty:
+        logger.warning("[SUMMARY SAVE SPOOL] empty dataframe interval=%s source=%s date=%s", interval, source, date_yyyymmdd)
         return 0
     db_path = os.path.join(_summary_db_dir(), f"summary{date_yyyymmdd}.db")
     table = _table(interval)
     con = None
     try:
         if not os.path.exists(db_path):
-            logger.error("[SUMMARY SAVE SPOOL] target db not found path=%s", db_path)
+            logger.error("[SUMMARY SAVE SPOOL] target db not found path=%s rows=%s cols=%s", db_path, len(work), list(work.columns)[:50])
             return 0
-        con = sqlite3.connect(db_path, timeout=5.0, isolation_level=None)
-        con.execute("PRAGMA busy_timeout = 5000")
+        con = sqlite3.connect(db_path, timeout=8.0, isolation_level=None)
+        con.execute("PRAGMA busy_timeout = 8000")
         exists = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
         if exists is None:
-            logger.error("[SUMMARY SAVE SPOOL] target table not found table=%s path=%s", table, db_path)
+            logger.error("[SUMMARY SAVE SPOOL] target table not found table=%s path=%s rows=%s", table, db_path, len(work))
             return 0
         table_cols = [str(r[1]) for r in con.execute(f"PRAGMA table_info({table})").fetchall()]
         keys = _key_cols(work, table_cols, interval)
         if not keys:
-            logger.error("[SUMMARY SAVE SPOOL] no key cols interval=%s table=%s", interval, table)
+            logger.error(
+                "[SUMMARY SAVE SPOOL] no key cols interval=%s table=%s rows=%s work_cols=%s table_cols=%s",
+                interval,
+                table,
+                len(work),
+                list(work.columns)[:80],
+                table_cols[:80],
+            )
             return 0
         if "source" in table_cols:
             work["source"] = str(source).lower()
-        if "interval" in table_cols and "interval" not in work.columns:
+        if "interval" in table_cols:
             work["interval"] = int(interval)
         cols = [c for c in table_cols if c in work.columns and c != "id"]
+        before = len(work)
         work = work.dropna(subset=keys).drop_duplicates(subset=keys, keep="last").reset_index(drop=True)
         if work.empty or not cols:
+            logger.warning(
+                "[SUMMARY SAVE SPOOL] no rows after key cleanup interval=%s source=%s table=%s before=%s keys=%s cols=%s",
+                interval,
+                source,
+                table,
+                before,
+                keys,
+                cols[:50],
+            )
             return 0
         con.execute("BEGIN IMMEDIATE")
         delete_sql = f"DELETE FROM {table} WHERE " + " AND ".join([f"{c}=?" for c in keys])
@@ -233,9 +299,18 @@ def _save_direct(df: pd.DataFrame, *, interval: int, source: str, date_yyyymmdd:
         records = [tuple(_sqlite_value(row.get(c)) for c in cols) for _, row in work[cols].iterrows()]
         con.executemany(insert_sql, records)
         con.commit()
+        logger.warning(
+            "[SUMMARY SAVE SPOOL] direct flush ok interval=%s source=%s table=%s rows=%s keys=%s cols=%s",
+            interval,
+            source,
+            table,
+            len(records),
+            keys,
+            len(cols),
+        )
         return int(len(records))
     except sqlite3.OperationalError as e:
-        logger.warning("[SUMMARY SAVE SPOOL] flush locked interval=%s source=%s err=%s", interval, source, e)
+        logger.warning("[SUMMARY SAVE SPOOL] flush locked interval=%s source=%s db=%s table=%s rows=%s err=%s", interval, source, db_path, table, len(work), e)
         try:
             if con is not None:
                 con.rollback()
@@ -243,7 +318,15 @@ def _save_direct(df: pd.DataFrame, *, interval: int, source: str, date_yyyymmdd:
             pass
         return 0
     except Exception:
-        logger.exception("[SUMMARY SAVE SPOOL] flush failed interval=%s source=%s", interval, source)
+        logger.exception(
+            "[SUMMARY SAVE SPOOL] flush failed interval=%s source=%s db=%s table=%s rows=%s cols=%s",
+            interval,
+            source,
+            db_path,
+            table,
+            len(work),
+            list(work.columns)[:80],
+        )
         try:
             if con is not None:
                 con.rollback()
@@ -273,6 +356,15 @@ def flush_summary_spool(*, max_files: int = 50) -> dict:
             interval = int(meta.get("interval") or 1)
             source = str(meta.get("source") or "push")
             ymd = str(meta.get("date_yyyymmdd") or _detect_yyyymmdd(df))
+            logger.warning(
+                "[SUMMARY SAVE SPOOL] flush file start path=%s rows=%s interval=%s source=%s date=%s cols=%s",
+                path,
+                len(df),
+                interval,
+                source,
+                ymd,
+                list(df.columns)[:40],
+            )
             saved = _save_direct(df, interval=interval, source=source, date_yyyymmdd=ymd)
             if saved > 0:
                 done = _rename_with_suffix(path, ".done")
@@ -285,6 +377,14 @@ def flush_summary_spool(*, max_files: int = 50) -> dict:
                 logger.warning("[SUMMARY SAVE SPOOL] flushed path=%s saved=%s", path, saved)
             else:
                 result["failed_files"] += 1
+                logger.warning(
+                    "[SUMMARY SAVE SPOOL] flush file kept for retry path=%s rows=%s interval=%s source=%s date=%s",
+                    path,
+                    len(df),
+                    interval,
+                    source,
+                    ymd,
+                )
         except Exception:
             result["failed_files"] += 1
             logger.exception("[SUMMARY SAVE SPOOL] flush file failed path=%s", path)
