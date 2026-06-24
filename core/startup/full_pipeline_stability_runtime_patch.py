@@ -13,6 +13,7 @@ requested by operation priority:
 4. 3m/5m summary recovery: enable DB/global-context fallback instead of hard empty.
 5. Entry/exit scheduler congestion: shorten per-symbol waits and avoid one candidate
    blocking the whole entry pass.
+6. PUSH summary cache: prefer fresh latest rows when merged history is stale.
 
 This patch intentionally keeps final safety guards such as liquidity, position,
 order, and hard API errors. It only removes unnecessary duplicate work and stale
@@ -28,7 +29,7 @@ from functools import wraps
 from typing import Any, Callable, Iterable, Optional
 
 logger = logging.getLogger(__name__)
-VERSION = "V1-FULL-PIPELINE-STABILITY"
+VERSION = "V1.1-FULL-PIPELINE-STABILITY-SUMMARY-LATEST-PREFER"
 _INSTALLED = False
 
 
@@ -219,10 +220,25 @@ def _install_summary_recovery_defaults() -> bool:
         "ENTRY_SHORT_MTF_MIN_AVAILABLE": "1",
         "ENTRY_SHORT_MTF_MIN_ALIGNED": "1",
         "ENTRY_DAILY_MTF_OPTIONAL": "1",
+        # If interval=1 history cache becomes stale, latest PUSH rows must win.
+        "SUMMARY_FORCE_LATEST_WHEN_HISTORY_LAG_SEC": "180",
+        "SUMMARY_FORCE_LATEST_MIN_SYMBOLS": "20",
     }
     for k, v in defaults.items():
         _setdefault_env(k, v)
     return True
+
+
+def _install_summary_latest_prefer() -> bool:
+    try:
+        if os.environ.get("DISABLE_SUMMARY_LATEST_PREFER_PATCH", "").strip() == "1":
+            logger.warning("[FULL PIPELINE STABILITY] summary latest prefer disabled by env")
+            return False
+        from . import summary_latest_prefer_patch
+        return bool(summary_latest_prefer_patch.install())
+    except Exception:
+        logger.exception("[FULL PIPELINE STABILITY] summary latest prefer install failed")
+        return False
 
 
 def _install_entry_exit_congestion_defaults() -> bool:
@@ -302,10 +318,11 @@ def install() -> bool:
         push_env_ok = _install_push_rotation_defaults()
         push_guard_ok = _install_register_ops_guard()
         summary_ok = _install_summary_recovery_defaults()
+        summary_latest_ok = _install_summary_latest_prefer()
         entry_ok = _install_entry_exit_congestion_defaults()
         _INSTALLED = True
         logger.warning(
-            "[FULL PIPELINE STABILITY] installed version=%s context=%s yahoo_diff=%s token=%s push_env=%s push_guard=%s summary_recovery=%s entry_exit=%s",
+            "[FULL PIPELINE STABILITY] installed version=%s context=%s yahoo_diff=%s token=%s push_env=%s push_guard=%s summary_recovery=%s summary_latest=%s entry_exit=%s",
             VERSION,
             context,
             yahoo_ok,
@@ -313,6 +330,7 @@ def install() -> bool:
             push_env_ok,
             push_guard_ok,
             summary_ok,
+            summary_latest_ok,
             entry_ok,
         )
         return True
