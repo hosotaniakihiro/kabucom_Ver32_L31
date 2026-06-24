@@ -1,14 +1,15 @@
 # ============================================================
 # File   : TaskSchedule/SubScript/run_night_yahoo_full_summary/main.py
-# Version: V3-TASK-NIGHT-YAHOO-DAILY-DIRECT-CHART
+# Version: V4-TASK-NIGHT-YAHOO-DAILY-INCREMENTAL
 # ------------------------------------------------------------
 # Windowsタスクスケジューラ用入口。
-#   1) Yahoo日足全銘柄更新→daily_db/stock_analysis.db保存
+#   1) Yahoo日足差分更新→daily_db/stock_analysis.db保存
 #   2) 最新営業日のYahoo 1m全銘柄取得
 #   3) 1m/3m/5m summary計算→summary DB保存
 #
-# V3:
-#   - 日足更新は yfinance が空の場合に Yahoo chart API 直接取得へフォールバック
+# V4:
+#   - 日足更新は DB最新日以降だけ取得・計算・保存する差分方式
+#   - 指標計算用にDB履歴から直近N本をウォームアップとして読む
 # ============================================================
 
 from __future__ import annotations
@@ -33,13 +34,17 @@ os.environ.setdefault("NIGHT_YAHOO_UPDATE_DAILY", "1")
 os.environ.setdefault("NIGHT_YAHOO_DAILY_PERIOD", "3y")
 os.environ.setdefault("NIGHT_YAHOO_DAILY_PAUSE_SEC", "0.05")
 os.environ.setdefault("NIGHT_YAHOO_DIRECT_TIMEOUT", "20")
+os.environ.setdefault("NIGHT_YAHOO_DAILY_WARMUP_ROWS", "320")
+os.environ.setdefault("NIGHT_YAHOO_DAILY_FORCE_FULL", "0")
 
 # 夜間日足は sitecustomize の yfinance fail-cache 影響を受けることがあるため、
-# daily module を先に読み込み、直接 chart API フォールバックを差し込む。
+# daily module を先に読み込み、直接 chart API フォールバックと差分更新を差し込む。
 from scripts import night_yahoo_daily_update_batch as _daily_batch
 from scripts import night_yahoo_daily_direct_chart_patch as _daily_chart_patch
+from scripts import night_yahoo_daily_incremental_patch as _daily_incremental_patch
 
 _daily_chart_patch.install()
+_daily_incremental_patch.install(_daily_batch)
 
 daily_main = _daily_batch.main
 from scripts.night_yahoo_full_summary_batch import main as summary_main
