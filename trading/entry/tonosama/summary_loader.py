@@ -1,13 +1,18 @@
 # ============================================================
 # File   : trading/entry/tonosama/summary_loader.py
-# Version: Ver1.6-TONOSAMA-SUMMARY-DB-FALLBACK
+# Version: Ver1.7-BLOCK-FUTURE-SUMMARY
 # ------------------------------------------------------------
 # 目的:
 #   殿様イナゴ用のサマリー読込。
-#   main.py 側で summary_parent_tick を skip している運用では、global_data / 
+#   main.py 側で summary_parent_tick を skip している運用では、global_data /
 #   global_context の completed summary が空になることがある。
 #   その場合でも summaryYYYYMMDD.db の stock_summary_{1,3,5}min から
 #   当日最新行を直接読み、Tonosama base feature empty を回避する。
+#
+# Ver1.7:
+#   - 当日データでも現在時刻より未来の summary 行は除外する。
+#   - 未来行だけが最新になって price_change=0.0 扱いとなり、
+#     price_change_low_abs で全落ちする問題を防ぐ。
 # ============================================================
 
 from __future__ import annotations
@@ -69,6 +74,10 @@ def _now_naive() -> dt.datetime:
         return dt.datetime.now()
 
 
+def _future_tolerance_sec() -> float:
+    return max(0.0, _env_float("TONOSAMA_SUMMARY_FUTURE_TOLERANCE_SEC", 60.0))
+
+
 def _latest_dt(df: pd.DataFrame):
     try:
         if isinstance(df, pd.DataFrame) and not df.empty and "datetime" in df.columns:
@@ -100,8 +109,44 @@ def _today_yyyymmdd() -> str:
     return _today_naive().strftime("%Y%m%d")
 
 
+def _drop_future_rows(df: pd.DataFrame, *, interval: int, via: str) -> pd.DataFrame:
+    if df is None or df.empty or "datetime" not in df.columns:
+        return pd.DataFrame() if df is None else df
+    if not _env_bool("TONOSAMA_BLOCK_FUTURE_SUMMARY_ROWS", True):
+        return df
+    try:
+        x = df.copy()
+        x["datetime"] = pd.to_datetime(x["datetime"], errors="coerce")
+        before = len(x)
+        now = _now_naive()
+        cutoff = now + dt.timedelta(seconds=_future_tolerance_sec())
+        future_mask = x["datetime"].notna() & (x["datetime"].dt.tz_localize(None) > cutoff)
+        if bool(future_mask.any()):
+            latest_before = x["datetime"].max()
+            x = x[~future_mask].copy()
+            logger.warning(
+                "[TONOSAMA ENTRY] future summary rows dropped interval=%s via=%s before=%s after=%s dropped=%s latest_before=%s latest_after=%s now=%s tolerance=%.1fs",
+                interval,
+                via,
+                before,
+                len(x),
+                int(future_mask.sum()),
+                latest_before,
+                x["datetime"].max() if not x.empty else None,
+                now,
+                _future_tolerance_sec(),
+            )
+        return x
+    except Exception:
+        logger.debug("[TONOSAMA ENTRY] future row filter failed interval=%s via=%s", interval, via, exc_info=True)
+        return df
+
+
 def _reject_prev_day_history(df: pd.DataFrame, *, interval: int, via: str) -> pd.DataFrame:
     if df is None or df.empty:
+        return pd.DataFrame()
+    df = _drop_future_rows(df, interval=interval, via=via)
+    if df.empty:
         return pd.DataFrame()
     if _env_bool("TONOSAMA_ALLOW_PREV_DAY_SUMMARY_HISTORY", False):
         return df
@@ -130,6 +175,10 @@ def _latest_slot_today(df: pd.DataFrame, *, interval: int, via: str) -> pd.DataF
         x["datetime"] = pd.to_datetime(x["datetime"], errors="coerce")
         x = x.dropna(subset=["datetime"])
         if x.empty:
+            return pd.DataFrame()
+        x = _drop_future_rows(x, interval=interval, via=via)
+        if x.empty:
+            logger.warning("[TONOSAMA ENTRY] latest slot empty after future filter interval=%s via=%s", interval, via)
             return pd.DataFrame()
         if not _env_bool("TONOSAMA_ALLOW_PREV_DAY_SUMMARY_HISTORY", False):
             today = _today_naive()
@@ -194,22 +243,27 @@ def _load_summary_db_latest_slot(interval: int) -> pd.DataFrame:
             dt_col = "datetime" if "datetime" in cols else ("time" if "time" in cols else None)
             if dt_col is None:
                 return pd.DataFrame()
-            sql_latest = f"SELECT MAX({dt_col}) FROM {table} WHERE date({dt_col})=?"
-            latest = conn.execute(sql_latest, (today,)).fetchone()[0]
+            now_cutoff = (_now_naive() + dt.timedelta(seconds=_future_tolerance_sec())).strftime("%Y-%m-%d %H:%M:%S")
+            sql_latest = f"SELECT MAX({dt_col}) FROM {table} WHERE date({dt_col})=? AND {dt_col}<=?"
+            latest = conn.execute(sql_latest, (today, now_cutoff)).fetchone()[0]
             if not latest:
+                logger.warning("[TONOSAMA ENTRY] summary db fallback no non-future rows interval=%s table=%s cutoff=%s db=%s", interval, table, now_cutoff, db)
                 return pd.DataFrame()
             latest_ts = pd.to_datetime(latest, errors="coerce")
             if pd.isna(latest_ts):
                 return pd.DataFrame()
             age = (_now_naive() - pd.Timestamp(latest_ts).to_pydatetime().replace(tzinfo=None)).total_seconds()
+            if age < -_future_tolerance_sec():
+                logger.warning("[TONOSAMA ENTRY] summary db fallback future blocked interval=%s latest=%s age=%.1fs db=%s", interval, latest, age, db)
+                return pd.DataFrame()
             if age > max_age:
                 logger.warning("[TONOSAMA ENTRY] summary db fallback stale interval=%s latest=%s age=%.1fs max_age=%.1fs db=%s", interval, latest, age, max_age, db)
                 return pd.DataFrame()
-            # latest slotが薄い場合があるので少し遡る。ただし当日・max_rows内に制限。
+            # latest slotが薄い場合があるので少し遡る。ただし当日・max_rows内・未来除外に制限。
             lookback_min = max(interval * 6, _env_int("TONOSAMA_SUMMARY_DB_FALLBACK_LOOKBACK_MIN", 30))
             start = (pd.Timestamp(latest_ts).to_pydatetime().replace(tzinfo=None) - dt.timedelta(minutes=lookback_min)).strftime("%Y-%m-%d %H:%M:%S")
-            sql = f"SELECT * FROM {table} WHERE {dt_col}>=? AND date({dt_col})=? ORDER BY {dt_col} DESC LIMIT ?"
-            rows = conn.execute(sql, (start, today, max_rows)).fetchall()
+            sql = f"SELECT * FROM {table} WHERE {dt_col}>=? AND date({dt_col})=? AND {dt_col}<=? ORDER BY {dt_col} DESC LIMIT ?"
+            rows = conn.execute(sql, (start, today, now_cutoff, max_rows)).fetchall()
             if not rows:
                 return pd.DataFrame()
             df = pd.DataFrame([dict(r) for r in rows])
@@ -217,6 +271,7 @@ def _load_summary_db_latest_slot(interval: int) -> pd.DataFrame:
                 df["datetime"] = df[dt_col]
             df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
             df = df.dropna(subset=["datetime"])
+            df = _drop_future_rows(df, interval=interval, via="summary_db_latest_slot")
             if df.empty:
                 return pd.DataFrame()
             logger.warning(
@@ -265,6 +320,7 @@ def _load_history_latest_slot(interval: int) -> tuple[pd.DataFrame, str]:
         try:
             raw = _safe_df(loader())
             latest_slot = _latest_slot_today(raw, interval=interval, via=via) if via != "summary_db_latest_slot" else raw
+            latest_slot = _drop_future_rows(latest_slot, interval=interval, via=via)
             if latest_slot.empty:
                 continue
             latest = _latest_dt(latest_slot)
@@ -281,25 +337,33 @@ def _maybe_replace_stale_with_history(df: pd.DataFrame, *, interval: int, via: s
     if df is None or df.empty:
         return pd.DataFrame()
     if not _env_bool("TONOSAMA_REPLACE_STALE_MERGED_WITH_HISTORY", True):
-        return df
+        return _drop_future_rows(df, interval=interval, via=via)
+    df = _drop_future_rows(df, interval=interval, via=via)
+    if df.empty:
+        hist, hist_via = _load_history_latest_slot(interval)
+        logger.warning("[TONOSAMA ENTRY] merged summary became empty after future filter interval=%s via=%s hist_via=%s hist_rows=%s hist_latest=%s", interval, via, hist_via, 0 if hist is None else len(hist), _latest_dt(hist))
+        return hist if hist is not None else pd.DataFrame()
     max_age = max(30.0, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_MAX_AGE_SEC", 180.0))
     history_max_age = max(max_age, _env_float("TONOSAMA_HISTORY_FALLBACK_MAX_AGE_SEC", 600.0))
     age = _latest_age_sec(df)
     latest = _latest_dt(df)
-    if age is None or age <= max_age:
+    if age is None or (0 <= age <= max_age):
         return df
+    if age is not None and age < -_future_tolerance_sec():
+        logger.warning("[TONOSAMA ENTRY] merged summary future blocked interval=%s via=%s latest=%s age=%.1fs", interval, via, latest, age)
+        df = pd.DataFrame()
     hist, hist_via = _load_history_latest_slot(interval)
     hist_age = _latest_age_sec(hist)
     hist_latest = _latest_dt(hist)
-    if hist is not None and not hist.empty and hist_age is not None and hist_age <= history_max_age:
+    if hist is not None and not hist.empty and hist_age is not None and 0 <= hist_age <= history_max_age:
         logger.warning(
-            "[TONOSAMA ENTRY] merged summary stale -> history/db latest fallback interval=%s merged_via=%s merged_latest=%s merged_age=%.1fs hist_via=%s hist_latest=%s hist_age=%.1fs rows=%s max_age=%.1fs history_max_age=%.1fs",
-            interval, via, latest, age, hist_via, hist_latest, hist_age, len(hist), max_age, history_max_age,
+            "[TONOSAMA ENTRY] merged summary stale/future -> history/db latest fallback interval=%s merged_via=%s merged_latest=%s merged_age=%s hist_via=%s hist_latest=%s hist_age=%.1fs rows=%s max_age=%.1fs history_max_age=%.1fs",
+            interval, via, latest, None if age is None else round(float(age), 1), hist_via, hist_latest, hist_age, len(hist), max_age, history_max_age,
         )
         return hist
     logger.warning(
-        "[TONOSAMA ENTRY] merged summary stale and history/db latest unavailable interval=%s via=%s latest=%s age=%.1fs hist_via=%s hist_latest=%s hist_age=%s hist_rows=%s max_age=%.1fs history_max_age=%.1fs",
-        interval, via, latest, age, hist_via, hist_latest, None if hist_age is None else round(float(hist_age), 1), 0 if hist is None else len(hist), max_age, history_max_age,
+        "[TONOSAMA ENTRY] merged summary stale/future and history/db latest unavailable interval=%s via=%s latest=%s age=%s hist_via=%s hist_latest=%s hist_age=%s hist_rows=%s max_age=%.1fs history_max_age=%.1fs",
+        interval, via, latest, None if age is None else round(float(age), 1), hist_via, hist_latest, None if hist_age is None else round(float(hist_age), 1), 0 if hist is None else len(hist), max_age, history_max_age,
     )
     return df
 
@@ -312,8 +376,9 @@ def _call_summary_getter(interval: int) -> pd.DataFrame | None:
             df = _safe_df(fn(interval))
             if not df.empty:
                 df = _maybe_replace_stale_with_history(df, interval=interval, via="get_push_merged_summary")
-                logger.info("[TONOSAMA ENTRY] loaded push merged summary interval=%s rows=%s latest_dt=%s via=get_push_merged_summary", interval, len(df), _latest_dt(df))
-                return df
+                if not df.empty:
+                    logger.info("[TONOSAMA ENTRY] loaded push merged summary interval=%s rows=%s latest_dt=%s via=get_push_merged_summary", interval, len(df), _latest_dt(df))
+                    return df
     except Exception:
         logger.debug("[TONOSAMA ENTRY] get_push_merged_summary failed interval=%s", interval, exc_info=True)
 
@@ -326,8 +391,9 @@ def _call_summary_getter(interval: int) -> pd.DataFrame | None:
                 df = pd.DataFrame()
             if not df.empty:
                 df = _maybe_replace_stale_with_history(df, interval=interval, via="get_merged_summary_source_push")
-                logger.info("[TONOSAMA ENTRY] loaded push merged summary interval=%s rows=%s latest_dt=%s via=get_merged_summary_source_push", interval, len(df), _latest_dt(df))
-                return df
+                if not df.empty:
+                    logger.info("[TONOSAMA ENTRY] loaded push merged summary interval=%s rows=%s latest_dt=%s via=get_merged_summary_source_push", interval, len(df), _latest_dt(df))
+                    return df
     except Exception:
         logger.debug("[TONOSAMA ENTRY] get_merged_summary(source=push) failed interval=%s", interval, exc_info=True)
 
@@ -368,8 +434,9 @@ def _call_summary_getter(interval: int) -> pd.DataFrame | None:
                 df = _reject_prev_day_history(df, interval=interval, via="legacy_no_source")
                 if not df.empty:
                     df = _maybe_replace_stale_with_history(df, interval=interval, via="legacy_no_source")
-                    logger.warning("[TONOSAMA ENTRY] loaded merged summary interval=%s rows=%s latest_dt=%s via=legacy_no_source fallback_may_be_stale", interval, len(df), _latest_dt(df))
-                    return df
+                    if not df.empty:
+                        logger.warning("[TONOSAMA ENTRY] loaded merged summary interval=%s rows=%s latest_dt=%s via=legacy_no_source fallback_may_be_stale", interval, len(df), _latest_dt(df))
+                        return df
     except Exception:
         logger.debug("[TONOSAMA ENTRY] get_merged_summary legacy failed interval=%s", interval, exc_info=True)
 
@@ -389,7 +456,10 @@ def load_merged_summary(interval: int) -> pd.DataFrame:
         if not isinstance(df, pd.DataFrame):
             logger.warning("[TONOSAMA ENTRY] merged summary is not DataFrame interval=%s type=%s", interval, type(df).__name__)
             return pd.DataFrame()
-        out = df.copy()
+        out = _drop_future_rows(df.copy(), interval=int(interval), via="load_merged_summary")
+        if out.empty:
+            logger.warning("[TONOSAMA ENTRY] merged summary empty after future filter interval=%s", interval)
+            return pd.DataFrame()
         out["_interval"] = int(interval)
         return out
     except Exception:
@@ -400,7 +470,9 @@ def load_merged_summary(interval: int) -> pd.DataFrame:
 def normalize_summary_base(df: pd.DataFrame, *, interval: int) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
-    x = df.copy()
+    x = _drop_future_rows(df.copy(), interval=interval, via="normalize_summary_base")
+    if x.empty:
+        return pd.DataFrame()
     x["_interval"] = int(interval)
     if "symbol" not in x.columns:
         return pd.DataFrame()
