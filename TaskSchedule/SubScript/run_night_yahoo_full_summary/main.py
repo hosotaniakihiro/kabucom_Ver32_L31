@@ -1,15 +1,15 @@
 # ============================================================
 # File   : TaskSchedule/SubScript/run_night_yahoo_full_summary/main.py
-# Version: V5-TASK-NIGHT-YAHOO-DAILY-FULL-COLUMNS
+# Version: V6-TASK-NIGHT-YAHOO-DAILY-TIMEOUT
 # ------------------------------------------------------------
 # Windowsタスクスケジューラ用入口。
 #   1) Yahoo日足差分更新→daily_db/stock_analysis.db保存
 #   2) 最新営業日のYahoo 1m全銘柄取得
 #   3) 1m/3m/5m summary計算→summary DB保存
 #
-# V5:
+# V6:
 #   - 日足DBへ主要テクニカル/ローソク足/売買シグナル/ランキング列を必ず保存
-#   - 既存DBに不足列がある場合は列追加し、up-to-date銘柄も直近履歴から補修
+#   - 1銘柄の処理が詰まった場合、タイムアウトでスキップして次へ進む
 # ============================================================
 
 from __future__ import annotations
@@ -38,17 +38,21 @@ os.environ.setdefault("NIGHT_YAHOO_DAILY_WARMUP_ROWS", "320")
 os.environ.setdefault("NIGHT_YAHOO_DAILY_FORCE_FULL", "0")
 os.environ.setdefault("NIGHT_YAHOO_DAILY_FULLCOL_REPAIR", "1")
 os.environ.setdefault("NIGHT_YAHOO_DAILY_FULLCOL_REPAIR_ROWS", "320")
+os.environ.setdefault("NIGHT_YAHOO_DAILY_SYMBOL_TIMEOUT_SEC", "90")
+os.environ.setdefault("NIGHT_YAHOO_DAILY_TIMEOUT_WORKERS", "4")
 
 # 夜間日足は sitecustomize の yfinance fail-cache 影響を受けることがあるため、
-# daily module を先に読み込み、直接 chart API・差分更新・full columns補修を差し込む。
+# daily module を先に読み込み、直接 chart API・差分更新・full columns補修・timeoutを差し込む。
 from scripts import night_yahoo_daily_update_batch as _daily_batch
 from scripts import night_yahoo_daily_direct_chart_patch as _daily_chart_patch
 from scripts import night_yahoo_daily_incremental_patch as _daily_incremental_patch
 from scripts import night_yahoo_daily_full_columns_patch as _daily_full_columns_patch
+from scripts import night_yahoo_daily_timeout_patch as _daily_timeout_patch
 
 _daily_chart_patch.install()
 _daily_incremental_patch.install(_daily_batch)
 _daily_full_columns_patch.install(_daily_batch)
+_daily_timeout_patch.install(_daily_batch)
 
 daily_main = _daily_batch.main
 from scripts.night_yahoo_full_summary_batch import main as summary_main
