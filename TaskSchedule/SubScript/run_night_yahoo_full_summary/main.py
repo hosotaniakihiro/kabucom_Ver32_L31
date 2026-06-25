@@ -1,16 +1,16 @@
 # ============================================================
 # File   : TaskSchedule/SubScript/run_night_yahoo_full_summary/main.py
-# Version: V8-TASK-NIGHT-YAHOO-WARNING-FILTER
+# Version: V9-TASK-NIGHT-YAHOO-CHUNK-SAVE
 # ------------------------------------------------------------
 # Windowsタスクスケジューラ用入口。
 #   1) Yahoo日足差分更新→daily_db/stock_analysis.db保存
 #   2) 最新営業日のYahoo 1m全銘柄取得
 #   3) 1m/3m/5m summary計算→summary DB保存
 #
-# V8:
+# V9:
+#   - NAS上SQLiteへの日足保存をchunk commitへ変更
 #   - pandas PerformanceWarning の大量ログを抑止
 #   - 夜間日足は yfinance に戻らず Yahoo chart API 直接取得を既定にする
-#   - 1銘柄の処理が詰まった場合、タイムアウトでスキップして次へ進む
 # ============================================================
 
 from __future__ import annotations
@@ -43,9 +43,12 @@ os.environ.setdefault("NIGHT_YAHOO_DAILY_FULLCOL_REPAIR", "1")
 os.environ.setdefault("NIGHT_YAHOO_DAILY_FULLCOL_REPAIR_ROWS", "320")
 os.environ.setdefault("NIGHT_YAHOO_DAILY_SYMBOL_TIMEOUT_SEC", "30")
 os.environ.setdefault("NIGHT_YAHOO_DAILY_TIMEOUT_WORKERS", "4")
+os.environ.setdefault("NIGHT_YAHOO_DAILY_SAVE_CHUNK_SIZE", "500")
+os.environ.setdefault("NIGHT_YAHOO_DAILY_SQLITE_TIMEOUT", "10")
+os.environ.setdefault("NIGHT_YAHOO_DAILY_SQLITE_BUSY_TIMEOUT_MS", "10000")
 
 # 夜間日足は sitecustomize の yfinance fail-cache 影響を受けることがあるため、
-# daily module を先に読み込み、直接 chart API・差分更新・full columns補修・timeoutを差し込む。
+# daily module を先に読み込み、直接 chart API・差分更新・full columns補修・chunk保存・timeoutを差し込む。
 from scripts import night_yahoo_daily_warning_filter_patch as _daily_warning_filter_patch
 _daily_warning_filter_patch.install()
 
@@ -53,11 +56,13 @@ from scripts import night_yahoo_daily_update_batch as _daily_batch
 from scripts import night_yahoo_daily_direct_chart_patch as _daily_chart_patch
 from scripts import night_yahoo_daily_incremental_patch as _daily_incremental_patch
 from scripts import night_yahoo_daily_full_columns_patch as _daily_full_columns_patch
+from scripts import night_yahoo_daily_save_chunk_patch as _daily_save_chunk_patch
 from scripts import night_yahoo_daily_timeout_patch as _daily_timeout_patch
 
 _daily_chart_patch.install()
 _daily_incremental_patch.install(_daily_batch)
 _daily_full_columns_patch.install(_daily_batch)
+_daily_save_chunk_patch.install(_daily_batch)
 _daily_timeout_patch.install(_daily_batch)
 
 daily_main = _daily_batch.main
