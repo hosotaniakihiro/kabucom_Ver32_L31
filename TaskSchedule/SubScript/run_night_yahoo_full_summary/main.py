@@ -1,13 +1,14 @@
 # ============================================================
 # File   : TaskSchedule/SubScript/run_night_yahoo_full_summary/main.py
-# Version: V7-TASK-NIGHT-YAHOO-DIRECT-ONLY
+# Version: V8-TASK-NIGHT-YAHOO-WARNING-FILTER
 # ------------------------------------------------------------
 # Windowsタスクスケジューラ用入口。
 #   1) Yahoo日足差分更新→daily_db/stock_analysis.db保存
 #   2) 最新営業日のYahoo 1m全銘柄取得
 #   3) 1m/3m/5m summary計算→summary DB保存
 #
-# V7:
+# V8:
+#   - pandas PerformanceWarning の大量ログを抑止
 #   - 夜間日足は yfinance に戻らず Yahoo chart API 直接取得を既定にする
 #   - 1銘柄の処理が詰まった場合、タイムアウトでスキップして次へ進む
 # ============================================================
@@ -45,6 +46,9 @@ os.environ.setdefault("NIGHT_YAHOO_DAILY_TIMEOUT_WORKERS", "4")
 
 # 夜間日足は sitecustomize の yfinance fail-cache 影響を受けることがあるため、
 # daily module を先に読み込み、直接 chart API・差分更新・full columns補修・timeoutを差し込む。
+from scripts import night_yahoo_daily_warning_filter_patch as _daily_warning_filter_patch
+_daily_warning_filter_patch.install()
+
 from scripts import night_yahoo_daily_update_batch as _daily_batch
 from scripts import night_yahoo_daily_direct_chart_patch as _daily_chart_patch
 from scripts import night_yahoo_daily_incremental_patch as _daily_incremental_patch
