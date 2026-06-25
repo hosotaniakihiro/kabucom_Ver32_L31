@@ -1,14 +1,14 @@
 # ============================================================
 # File   : TaskSchedule/SubScript/run_night_yahoo_full_summary/main.py
-# Version: V6-TASK-NIGHT-YAHOO-DAILY-TIMEOUT
+# Version: V7-TASK-NIGHT-YAHOO-DIRECT-ONLY
 # ------------------------------------------------------------
 # Windowsタスクスケジューラ用入口。
 #   1) Yahoo日足差分更新→daily_db/stock_analysis.db保存
 #   2) 最新営業日のYahoo 1m全銘柄取得
 #   3) 1m/3m/5m summary計算→summary DB保存
 #
-# V6:
-#   - 日足DBへ主要テクニカル/ローソク足/売買シグナル/ランキング列を必ず保存
+# V7:
+#   - 夜間日足は yfinance に戻らず Yahoo chart API 直接取得を既定にする
 #   - 1銘柄の処理が詰まった場合、タイムアウトでスキップして次へ進む
 # ============================================================
 
@@ -33,12 +33,14 @@ os.environ.setdefault("NIGHT_YAHOO_INTERVALS", "1,3,5")
 os.environ.setdefault("NIGHT_YAHOO_UPDATE_DAILY", "1")
 os.environ.setdefault("NIGHT_YAHOO_DAILY_PERIOD", "3y")
 os.environ.setdefault("NIGHT_YAHOO_DAILY_PAUSE_SEC", "0.05")
-os.environ.setdefault("NIGHT_YAHOO_DIRECT_TIMEOUT", "20")
+os.environ.setdefault("NIGHT_YAHOO_DIRECT_TIMEOUT", "10")
+# Chart API が失敗した銘柄で yfinance へ戻ると固まることがあるため、夜間は直接取得だけにする。
+os.environ.setdefault("NIGHT_YAHOO_DIRECT_ONLY", "1")
 os.environ.setdefault("NIGHT_YAHOO_DAILY_WARMUP_ROWS", "320")
 os.environ.setdefault("NIGHT_YAHOO_DAILY_FORCE_FULL", "0")
 os.environ.setdefault("NIGHT_YAHOO_DAILY_FULLCOL_REPAIR", "1")
 os.environ.setdefault("NIGHT_YAHOO_DAILY_FULLCOL_REPAIR_ROWS", "320")
-os.environ.setdefault("NIGHT_YAHOO_DAILY_SYMBOL_TIMEOUT_SEC", "90")
+os.environ.setdefault("NIGHT_YAHOO_DAILY_SYMBOL_TIMEOUT_SEC", "30")
 os.environ.setdefault("NIGHT_YAHOO_DAILY_TIMEOUT_WORKERS", "4")
 
 # 夜間日足は sitecustomize の yfinance fail-cache 影響を受けることがあるため、
