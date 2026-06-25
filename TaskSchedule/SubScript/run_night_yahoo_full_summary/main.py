@@ -1,16 +1,16 @@
 # ============================================================
 # File   : TaskSchedule/SubScript/run_night_yahoo_full_summary/main.py
-# Version: V9-TASK-NIGHT-YAHOO-CHUNK-SAVE
+# Version: V11-TASK-NIGHT-YAHOO-STAGE-LOG
 # ------------------------------------------------------------
 # Windowsタスクスケジューラ用入口。
 #   1) Yahoo日足差分更新→daily_db/stock_analysis.db保存
 #   2) 最新営業日のYahoo 1m全銘柄取得
 #   3) 1m/3m/5m summary計算→summary DB保存
 #
-# V9:
+# V11:
+#   - 銘柄ごとの fetch / compute / save stage ログを追加
 #   - NAS上SQLiteへの日足保存をchunk commitへ変更
 #   - pandas PerformanceWarning の大量ログを抑止
-#   - 夜間日足は yfinance に戻らず Yahoo chart API 直接取得を既定にする
 # ============================================================
 
 from __future__ import annotations
@@ -57,12 +57,14 @@ from scripts import night_yahoo_daily_direct_chart_patch as _daily_chart_patch
 from scripts import night_yahoo_daily_incremental_patch as _daily_incremental_patch
 from scripts import night_yahoo_daily_full_columns_patch as _daily_full_columns_patch
 from scripts import night_yahoo_daily_save_chunk_patch as _daily_save_chunk_patch
+from scripts import night_yahoo_daily_stage_log_patch as _daily_stage_log_patch
 from scripts import night_yahoo_daily_timeout_patch as _daily_timeout_patch
 
 _daily_chart_patch.install()
 _daily_incremental_patch.install(_daily_batch)
 _daily_full_columns_patch.install(_daily_batch)
 _daily_save_chunk_patch.install(_daily_batch)
+_daily_stage_log_patch.install(_daily_batch)
 _daily_timeout_patch.install(_daily_batch)
 
 daily_main = _daily_batch.main
