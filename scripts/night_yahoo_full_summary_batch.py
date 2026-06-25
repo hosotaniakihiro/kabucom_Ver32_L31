@@ -1,6 +1,6 @@
 # ============================================================
 # File   : scripts/night_yahoo_full_summary_batch.py
-# Version: V1-NIGHT-YAHOO-FULL-SUMMARY-BATCH
+# Version: V2-NIGHT-YAHOO-FULL-SUMMARY-SAVE-BY-BAR-DATE
 # ------------------------------------------------------------
 # 【概要】
 #   夜間にYahoo Financeから全銘柄の最新営業日1分足を取得し、
@@ -15,6 +15,7 @@
 #   - yfinance 1mデータをバッチ取得
 #   - 1mから3m/5mを生成
 #   - 既存のYahoo補完compute/saveを使用し、summary DB schemaに合わせて保存
+#   - NIGHT_YAHOO_MINUTE_SAVE_BY_BAR_DATE=1 の場合、足の日付ごとに summaryYYYYMMDD.db へ分割保存
 #   - 失敗銘柄があっても継続
 #
 # 【実行例】
@@ -50,7 +51,7 @@ from trading.yahoo.pipeline.complement.save import save_summary_df
 from trading.yahoo.pipeline.complement.constants import DEFAULT_BASE_DIR
 
 LOG = logging.getLogger("night_yahoo_full_summary_batch")
-VERSION = "V1-NIGHT-YAHOO-FULL-SUMMARY-BATCH"
+VERSION = "V2-NIGHT-YAHOO-FULL-SUMMARY-SAVE-BY-BAR-DATE"
 
 
 # ============================================================
@@ -63,6 +64,13 @@ def _setup_logging() -> None:
         level=getattr(logging, level, logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.environ.get(name)
+    if v is None or str(v).strip() == "":
+        return bool(default)
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 
 
 # ============================================================
@@ -147,7 +155,6 @@ def _load_symbols_from_csv(path: Path) -> list[str]:
     except Exception:
         LOG.warning("[NIGHT YAHOO] csv load failed path=%s", path, exc_info=True)
         return []
-
     candidate_cols = ["symbol", "code", "コード", "銘柄コード", "Symbol"]
     col = next((c for c in candidate_cols if c in df.columns), None)
     if col is None and len(df.columns) > 0:
@@ -404,11 +411,73 @@ def resample_ohlcv(df_1m: pd.DataFrame, interval: int) -> pd.DataFrame:
 
 
 # ============================================================
+# save helpers
+# ============================================================
+
+def _date_series_for_save(df: pd.DataFrame) -> pd.Series:
+    """保存先 summaryYYYYMMDD.db を決めるための足の日付Seriesを返す。"""
+    if df is None or df.empty:
+        return pd.Series(dtype="object")
+
+    if "datetime" in df.columns:
+        s = pd.to_datetime(df["datetime"], errors="coerce")
+    elif "date" in df.columns:
+        s = pd.to_datetime(df["date"], errors="coerce")
+    else:
+        return pd.Series([None] * len(df), index=df.index, dtype="object")
+
+    try:
+        return s.dt.strftime("%Y%m%d")
+    except Exception:
+        return pd.Series([None] * len(df), index=df.index, dtype="object")
+
+
+def save_summary_df_by_bar_date(computed: pd.DataFrame, *, interval: int) -> int:
+    """
+    computedを足の日付ごとに分割して保存する。
+
+    save_summary_df() 側はDF内の最大datetimeから summaryYYYYMMDD.db を決めるため、
+    5日分をまとめて渡すと実行日/最新日のDBに過去日分まで混ざる。
+    ここで日付単位に分割してから保存することで、
+    2026-06-23 の足は summary20260623.db へ、2026-06-24 の足は summary20260624.db へ入る。
+    """
+    out = computed.copy() if computed is not None else pd.DataFrame()
+    if out.empty:
+        return 0
+
+    save_dates = _date_series_for_save(out)
+    if save_dates.empty or save_dates.isna().all():
+        LOG.warning("[NIGHT YAHOO] save_by_bar_date no usable date interval=%s rows=%s -> normal save", interval, len(out))
+        return int(save_summary_df(out, interval=int(interval)) or 0)
+
+    total_saved = 0
+    valid_dates = sorted({str(x) for x in save_dates.dropna().unique() if str(x) and str(x).lower() != "nat"})
+    for yyyymmdd in valid_dates:
+        part = out.loc[save_dates == yyyymmdd].copy()
+        if part.empty:
+            continue
+        saved = int(save_summary_df(part, interval=int(interval)) or 0)
+        total_saved += saved
+        LOG.warning(
+            "[NIGHT YAHOO] saved by bar date interval=%s save_date=%s rows=%s saved=%s symbols=%s latest=%s",
+            interval,
+            yyyymmdd,
+            len(part),
+            saved,
+            part["symbol"].nunique() if "symbol" in part.columns else 0,
+            part["datetime"].max() if "datetime" in part.columns else None,
+        )
+    return int(total_saved)
+
+
+# ============================================================
 # run
 # ============================================================
 
 def build_and_save(df_1m: pd.DataFrame, intervals: tuple[int, ...]) -> dict[int, dict[str, int]]:
     result: dict[int, dict[str, int]] = {}
+    save_by_bar_date = _env_bool("NIGHT_YAHOO_MINUTE_SAVE_BY_BAR_DATE", True)
+
     for interval in intervals:
         raw = resample_ohlcv(df_1m, interval)
         if raw.empty:
@@ -422,15 +491,20 @@ def build_and_save(df_1m: pd.DataFrame, intervals: tuple[int, ...]) -> dict[int,
             result[int(interval)] = {"raw": len(raw), "computed": 0, "saved": 0}
             continue
 
-        saved = save_summary_df(computed, interval=int(interval))
+        if save_by_bar_date:
+            saved = save_summary_df_by_bar_date(computed, interval=int(interval))
+        else:
+            saved = save_summary_df(computed, interval=int(interval))
+
         LOG.warning(
-            "[NIGHT YAHOO] saved interval=%s raw=%s computed=%s saved=%s symbols=%s latest=%s",
+            "[NIGHT YAHOO] saved interval=%s raw=%s computed=%s saved=%s symbols=%s latest=%s save_by_bar_date=%s",
             interval,
             len(raw),
             len(computed),
             saved,
             computed["symbol"].nunique() if "symbol" in computed.columns else 0,
             computed["datetime"].max() if "datetime" in computed.columns else None,
+            int(save_by_bar_date),
         )
         result[int(interval)] = {"raw": len(raw), "computed": len(computed), "saved": int(saved or 0)}
     return result
@@ -450,7 +524,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     intervals = tuple(int(x) for x in str(args.intervals).replace(" ", "").split(",") if x)
     intervals = tuple(x for x in intervals if x in {1, 3, 5}) or (1, 3, 5)
 
-    LOG.warning("[NIGHT YAHOO] START version=%s market_date=%s intervals=%s", VERSION, market_date.date(), intervals)
+    LOG.warning("[NIGHT YAHOO] START version=%s market_date=%s intervals=%s save_by_bar_date=%s", VERSION, market_date.date(), intervals, int(_env_bool("NIGHT_YAHOO_MINUTE_SAVE_BY_BAR_DATE", True)))
 
     symbols = load_all_symbols()
     if args.limit and args.limit > 0:
