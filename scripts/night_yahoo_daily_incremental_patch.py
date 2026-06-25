@@ -1,6 +1,6 @@
 # ============================================================
 # File   : scripts/night_yahoo_daily_incremental_patch.py
-# Version: V1-NIGHT-YAHOO-DAILY-INCREMENTAL-FROM-DB
+# Version: V2-NIGHT-YAHOO-DAILY-INCREMENTAL-END-DATE
 # ------------------------------------------------------------
 # 夜間Yahoo日足バッチを、DB最新日以降だけ取得・計算・保存する
 # 差分更新方式へ差し替えるパッチ。
@@ -8,8 +8,9 @@
 # 方針:
 #   1) stock_analysis_latest / history から銘柄ごとの最新日を取得
 #   2) Yahooから最新日の翌日以降だけ取得
-#   3) 指標計算用にDB historyから直近N本をウォームアップとして読む
-#   4) 計算後、DBに未格納の日付分だけ history/latest へupsert
+#   3) NIGHT_YAHOO_DAILY_END_DATE があれば、その日付までに制限
+#   4) 指標計算用にDB historyから直近N本をウォームアップとして読む
+#   5) 計算後、DBに未格納の日付分だけ history/latest へupsert
 # ============================================================
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from typing import Any, Optional
 import pandas as pd
 
 LOG = logging.getLogger("night_yahoo_daily_incremental_patch")
-VERSION = "V1-NIGHT-YAHOO-DAILY-INCREMENTAL-FROM-DB"
+VERSION = "V2-NIGHT-YAHOO-DAILY-INCREMENTAL-END-DATE"
 _INSTALLED = False
 
 
@@ -38,6 +39,17 @@ def _normalize_symbol(symbol: Any) -> str:
     if s.endswith(".0"):
         s = s[:-2]
     return s.zfill(4) if s.isdigit() and len(s) < 4 else s
+
+
+def _parse_end_date() -> Optional[pd.Timestamp]:
+    raw = str(os.environ.get("NIGHT_YAHOO_DAILY_END_DATE", "")).strip()
+    if not raw:
+        return None
+    try:
+        return pd.Timestamp(raw).normalize()
+    except Exception:
+        LOG.warning("[NIGHT YAHOO DAILY INCR] invalid NIGHT_YAHOO_DAILY_END_DATE=%s ignored", raw)
+        return None
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -166,34 +178,56 @@ def install(daily_mod: Any) -> bool:
 
         force_full = str(os.environ.get("NIGHT_YAHOO_DAILY_FORCE_FULL", "0")).strip().lower() in {"1", "true", "yes", "on"}
         warmup_rows = int(float(os.environ.get("NIGHT_YAHOO_DAILY_WARMUP_ROWS", "320")))
+        end_dt = _parse_end_date()
 
         latest_dt = None if force_full else _get_latest_date(Path(db_path), symbol, daily_mod)
+
+        # すでにDB最新日が上限日以上なら、保存対象なし。
+        if latest_dt is not None and end_dt is not None and latest_dt >= end_dt:
+            return symbol, True, f"up-to-date latest={_date_str(latest_dt)} end={_date_str(end_dt)}", 0
 
         # 明示 start がある場合は従来どおりその日から。なければDB最新日の翌日から差分取得。
         effective_start = start
         if latest_dt is not None and not effective_start:
             effective_start = _date_str(latest_dt + pd.Timedelta(days=1))
 
+        # 開始日が上限日を超える場合は取得不要。
+        if effective_start and end_dt is not None:
+            try:
+                if pd.Timestamp(effective_start).normalize() > end_dt:
+                    base = _date_str(latest_dt) if latest_dt is not None else "-"
+                    return symbol, True, f"up-to-date latest={base} end={_date_str(end_dt)}", 0
+            except Exception:
+                pass
+
         try:
             raw_new = daily_mod._fetch_daily_one(symbol, period=period, start=effective_start)
             if raw_new is None or raw_new.empty:
                 if latest_dt is not None:
-                    return symbol, True, f"up-to-date latest={_date_str(latest_dt)}", 0
+                    return symbol, True, f"up-to-date latest={_date_str(latest_dt)}" + (f" end={_date_str(end_dt)}" if end_dt is not None else ""), 0
                 return symbol, False, "no daily data", 0
 
             raw_new["date"] = pd.to_datetime(raw_new["date"], errors="coerce").dt.normalize()
             raw_new = raw_new.dropna(subset=["date"])
 
+            if end_dt is not None:
+                raw_new = raw_new[raw_new["date"] <= end_dt].copy()
+                if raw_new.empty:
+                    base = _date_str(latest_dt) if latest_dt is not None else "-"
+                    return symbol, True, f"up-to-date latest={base} end={_date_str(end_dt)}", 0
+
             if latest_dt is not None:
                 raw_new = raw_new[raw_new["date"] > latest_dt].copy()
                 if raw_new.empty:
-                    return symbol, True, f"up-to-date latest={_date_str(latest_dt)}", 0
+                    return symbol, True, f"up-to-date latest={_date_str(latest_dt)}" + (f" end={_date_str(end_dt)}" if end_dt is not None else ""), 0
 
             warmup = pd.DataFrame()
             if latest_dt is not None:
                 warmup = _load_warmup_prices(Path(db_path), symbol, daily_mod, warmup_rows)
 
             calc_prices = _merge_prices(warmup, raw_new, symbol)
+            if end_dt is not None and not calc_prices.empty:
+                calc_prices = calc_prices[pd.to_datetime(calc_prices["date"], errors="coerce").dt.normalize() <= end_dt].copy()
             if calc_prices.empty:
                 return symbol, False, "no calc prices", 0
 
@@ -203,35 +237,39 @@ def install(daily_mod: Any) -> bool:
 
             computed["date"] = pd.to_datetime(computed["date"], errors="coerce")
             computed = computed.dropna(subset=["date"])
+            if end_dt is not None:
+                computed = computed[computed["date"].dt.normalize() <= end_dt].copy()
+
             if latest_dt is not None:
                 save_df = computed[computed["date"].dt.normalize() > latest_dt].copy()
             else:
                 save_df = computed.copy()
 
             if save_df.empty:
-                return symbol, True, f"up-to-date latest={_date_str(latest_dt)}", 0
+                base = _date_str(latest_dt) if latest_dt is not None else "-"
+                return symbol, True, f"up-to-date latest={base}" + (f" end={_date_str(end_dt)}" if end_dt is not None else ""), 0
 
             save_df["date"] = save_df["date"].dt.strftime("%Y-%m-%d")
             hist, lat = daily_mod._save_symbol_df(Path(db_path), save_df)
             new_min = pd.to_datetime(save_df["date"], errors="coerce").min()
             new_max = pd.to_datetime(save_df["date"], errors="coerce").max()
-            return symbol, True, f"incremental saved new_rows={hist} latest={lat} range={_date_str(new_min)}..{_date_str(new_max)} db_latest_before={_date_str(latest_dt) if latest_dt is not None else '-'}", hist
+            return symbol, True, f"incremental saved new_rows={hist} latest={lat} range={_date_str(new_min)}..{_date_str(new_max)} db_latest_before={_date_str(latest_dt) if latest_dt is not None else '-'}" + (f" end={_date_str(end_dt)}" if end_dt is not None else ""), hist
         except Exception as e:
             LOG.warning("[NIGHT YAHOO DAILY INCR] symbol failed symbol=%s err=%s", symbol, e, exc_info=True)
             return symbol, False, str(e), 0
 
     daily_mod.process_symbol = process_symbol_incremental
     daily_mod._NIGHT_YAHOO_DAILY_INCREMENTAL_PATCHED = True
-    # 表示用のversionも上書きして、ログで差分版だと分かるようにする。
     try:
-        daily_mod.VERSION = "V3-NIGHT-YAHOO-DAILY-INCREMENTAL-DB"
+        daily_mod.VERSION = "V5-NIGHT-YAHOO-DAILY-INCREMENTAL-END-DATE"
     except Exception:
         pass
     _INSTALLED = True
     LOG.warning(
-        "[NIGHT YAHOO DAILY INCR] installed version=%s warmup_rows=%s force_full=%s",
+        "[NIGHT YAHOO DAILY INCR] installed version=%s warmup_rows=%s force_full=%s end_date=%s",
         VERSION,
         os.environ.get("NIGHT_YAHOO_DAILY_WARMUP_ROWS", "320"),
         os.environ.get("NIGHT_YAHOO_DAILY_FORCE_FULL", "0"),
+        os.environ.get("NIGHT_YAHOO_DAILY_END_DATE", ""),
     )
     return True
