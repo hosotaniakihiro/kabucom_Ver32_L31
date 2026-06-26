@@ -2,26 +2,24 @@
 """
 PUSH registration recovery patch.
 
-Fixes production failure modes observed in PUSH rotation:
+Current production policy:
 
-1. kabusapi register/unregister_all returns Code=4001009 / APIキー不一致.
-   The original subscription_manager.register_ops sent one request with the
-   currently resolved X-API-KEY and returned False.  This patch now does a
-   lightweight preflight token sync before register/unregister so the first
-   request uses the newest token when another process has refreshed it.  If an
-   auth error still occurs, it retries once after token_manager.refresh_token().
-   It also updates common env/global slots so subsequent calls resolve the same
-   token.
+1. Token/auth handling is owned by:
+   - main_database.py parent preflight
+   - token_manager.py parent-only refresh guard
+   - core.startup.kabusapi_token_retry_register_patch v5 canonical token wrapper
 
-2. PUSH rotation uses the first runtime symbol list even when it has already
-   shrunk to a partial list such as 21 symbols.  This patch tops up the list
-   from global_data and dynamic providers up to PUSH_REGISTER_MIN_KEEP
-   (default 100) before A/B splitting.
+2. This patch must NOT wrap register_ops._http_json_request, must NOT sync tokens,
+   and must NOT refresh/retry on 4001009 / APIキー不一致.
 
-3. When the WebSocket becomes stale and reconnects, we need clear evidence that
-   the next register cycle really rebuilt the 100-symbol pool and sent a 50-name
-   A/B turn.  V3 adds audit logs around resolve_register_targets(),
-   run_register_chunks(), and run_refresh_sequence().
+3. This patch only keeps the safe parts:
+   - audit logs around register target/sequence
+   - top-up of PUSH targets to 100 symbols before A/B splitting
+
+Reason:
+Older versions of this patch re-wrapped _http_json_request after the canonical token
+wrapper and could overwrite or retry token handling in child processes.  That made
+PUSH registration diagnostics ambiguous and could fight the startup-once token policy.
 """
 from __future__ import annotations
 
@@ -32,10 +30,8 @@ from typing import Any, Iterable, Sequence
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V3-PUSH-REGISTER-RECOVERY-AUDIT"
+VERSION = "V4-PUSH-REGISTER-RECOVERY-NO-TOKEN-WRAPPER"
 _INSTALLED = False
-_LAST_PREFLIGHT_TOKEN = ""
-_LAST_PREFLIGHT_TS = 0.0
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -43,7 +39,12 @@ def _env_bool(name: str, default: bool = True) -> bool:
         v = os.environ.get(name)
         if v is None or str(v).strip() == "":
             return bool(default)
-        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+            return False
+        return bool(default)
     except Exception:
         return bool(default)
 
@@ -56,111 +57,6 @@ def _env_int(name: str, default: int) -> int:
         return int(float(str(v).replace(",", "")))
     except Exception:
         return int(default)
-
-
-def _env_float(name: str, default: float) -> float:
-    try:
-        v = os.environ.get(name)
-        if v is None or str(v).strip() == "":
-            return float(default)
-        return float(str(v).replace(",", ""))
-    except Exception:
-        return float(default)
-
-
-def _is_auth_error(content: Any) -> bool:
-    try:
-        if isinstance(content, dict):
-            code = str(content.get("Code") or content.get("code") or "")
-            msg = str(content.get("Message") or content.get("message") or "")
-            return code in {"4001009", "401"} or "APIキー不一致" in msg or "Unauthorized" in msg
-        s = str(content)
-        return "4001009" in s or "APIキー不一致" in s or "401" in s or "Unauthorized" in s
-    except Exception:
-        return False
-
-
-def _publish_token(token: str) -> None:
-    token = str(token or "").strip()
-    if not token:
-        return
-    for key in ("KABU_API_KEY", "KABUSAPI_API_KEY", "KABUSAPI_TOKEN", "KABU_TOKEN", "X_API_KEY"):
-        os.environ[key] = token
-    try:
-        import token_manager  # type: ignore
-        try:
-            token_manager.API_TOKEN = token
-        except Exception:
-            pass
-    except Exception:
-        pass
-    for module_name, attr_name in (("global_state", "global_data"), ("core.global_context.context", "global_data")):
-        try:
-            mod = __import__(module_name, fromlist=[attr_name])
-            gd = getattr(mod, attr_name, None)
-            if gd is None:
-                continue
-            for name in ("kabu_api_key", "kabusapi_api_key", "api_key", "token", "kabu_token", "kabusapi_token"):
-                try:
-                    setattr(gd, name, token)
-                except Exception:
-                    pass
-            try:
-                headers = getattr(gd, "headers", None)
-                if isinstance(headers, dict):
-                    headers["X-API-KEY"] = token
-            except Exception:
-                pass
-        except Exception:
-            continue
-
-
-def _get_cached_or_valid_token() -> str:
-    global _LAST_PREFLIGHT_TOKEN, _LAST_PREFLIGHT_TS
-    now = time.monotonic()
-    min_interval = max(0.0, _env_float("PUSH_REGISTER_PREFLIGHT_TOKEN_MIN_INTERVAL_SEC", 1.0))
-    if _LAST_PREFLIGHT_TOKEN and (now - _LAST_PREFLIGHT_TS) < min_interval:
-        return _LAST_PREFLIGHT_TOKEN
-
-    token = ""
-    try:
-        import token_manager  # type: ignore
-        fn = getattr(token_manager, "get_valid_token", None)
-        if callable(fn):
-            token = str(fn() or "").strip()
-        if not token:
-            token = str(getattr(token_manager, "API_TOKEN", "") or "").strip()
-    except Exception:
-        token = ""
-
-    if not token:
-        for key in ("KABU_API_KEY", "KABUSAPI_API_KEY", "KABUSAPI_TOKEN", "KABU_TOKEN", "X_API_KEY"):
-            token = str(os.environ.get(key) or "").strip()
-            if token:
-                break
-
-    if token:
-        _LAST_PREFLIGHT_TOKEN = token
-        _LAST_PREFLIGHT_TS = now
-        _publish_token(token)
-    return token
-
-
-def _refresh_token_once() -> str:
-    global _LAST_PREFLIGHT_TOKEN, _LAST_PREFLIGHT_TS
-    try:
-        import token_manager  # type: ignore
-        token = token_manager.refresh_token()
-        token = str(token or "").strip()
-        if token:
-            _LAST_PREFLIGHT_TOKEN = token
-            _LAST_PREFLIGHT_TS = time.monotonic()
-            _publish_token(token)
-            logger.warning("[PUSH REGISTER RECOVERY] refreshed kabusapi token for register/unregister token_len=%d", len(token))
-            return token
-    except Exception:
-        logger.exception("[PUSH REGISTER RECOVERY] token refresh failed")
-    return ""
 
 
 def _dedupe(items: Iterable[str]) -> list[str]:
@@ -202,40 +98,12 @@ def _patch_register_ops() -> bool:
 
     ok_any = False
 
-    if not getattr(ro, "_PUSH_REGISTER_RECOVERY_HTTP_PATCHED", False):
-        orig_http = getattr(ro, "_http_json_request", None)
-        if callable(orig_http):
-            def _http_json_request_patched(*, url: str, method: str, payload: Any, api_key: str, timeout: float = 10.0):
-                request_token = str(api_key or "").strip()
-                if _env_bool("PUSH_REGISTER_PREFLIGHT_TOKEN_SYNC", True):
-                    synced = _get_cached_or_valid_token()
-                    if synced and synced != request_token:
-                        logger.info(
-                            "[PUSH REGISTER RECOVERY] preflight token sync method=%s url=%s old_len=%d new_len=%d",
-                            method, url, len(request_token), len(synced),
-                        )
-                        request_token = synced
-
-                ok, content = orig_http(url=url, method=method, payload=payload, api_key=request_token, timeout=timeout)
-                if ok or not _is_auth_error(content):
-                    return ok, content
-                if not _env_bool("PUSH_REGISTER_AUTH_RETRY_ENABLED", True):
-                    return ok, content
-                logger.warning(
-                    "[PUSH REGISTER RECOVERY] auth error on %s %s -> refresh token and retry once content=%r",
-                    method, url, content,
-                )
-                new_token = _refresh_token_once()
-                if not new_token:
-                    return ok, content
-                ok2, content2 = orig_http(url=url, method=method, payload=payload, api_key=new_token, timeout=timeout)
-                logger.warning("[PUSH REGISTER RECOVERY] retry result method=%s ok=%s content=%r", method, ok2, content2)
-                return ok2, content2
-
-            ro._http_json_request = _http_json_request_patched  # type: ignore[attr-defined]
-            ro._PUSH_REGISTER_RECOVERY_HTTP_PATCHED = True  # type: ignore[attr-defined]
-            logger.warning("[PUSH REGISTER RECOVERY] register_ops auth retry + preflight token sync patched")
-            ok_any = True
+    # IMPORTANT: Do not patch ro._http_json_request here.
+    # Token handling must remain owned by kabusapi_token_retry_register_patch v5.
+    if not getattr(ro, "_PUSH_REGISTER_RECOVERY_HTTP_DISABLED_V4", False):
+        ro._PUSH_REGISTER_RECOVERY_HTTP_DISABLED_V4 = True  # type: ignore[attr-defined]
+        ro._PUSH_REGISTER_RECOVERY_HTTP_PATCHED = False  # type: ignore[attr-defined]
+        logger.warning("[PUSH REGISTER RECOVERY] register_ops auth retry/preflight token sync disabled; canonical token wrapper owns HTTP")
 
     if not getattr(ro, "_PUSH_REGISTER_RECOVERY_SEQUENCE_AUDIT_PATCHED", False):
         orig_refresh = getattr(ro, "run_refresh_sequence", None)
@@ -258,6 +126,7 @@ def _patch_register_ops() -> bool:
                 )
                 return ok
             ro.run_refresh_sequence = run_refresh_sequence_patched  # type: ignore[attr-defined]
+            ok_any = True
 
         if callable(orig_chunks):
             def run_register_chunks_patched(symbols, *args, **kwargs):
@@ -275,12 +144,12 @@ def _patch_register_ops() -> bool:
                 )
                 return ok
             ro.run_register_chunks = run_register_chunks_patched  # type: ignore[attr-defined]
+            ok_any = True
 
         ro._PUSH_REGISTER_RECOVERY_SEQUENCE_AUDIT_PATCHED = True  # type: ignore[attr-defined]
         logger.warning("[PUSH REGISTER RECOVERY] register_ops sequence audit patched")
-        ok_any = True
 
-    return ok_any or bool(getattr(ro, "_PUSH_REGISTER_RECOVERY_HTTP_PATCHED", False))
+    return ok_any or bool(getattr(ro, "_PUSH_REGISTER_RECOVERY_SEQUENCE_AUDIT_PATCHED", False))
 
 
 def _extend_symbols(rs: Any, base: Sequence[str], extra: Sequence[str], limit: int) -> list[str]:
@@ -396,17 +265,20 @@ def install() -> bool:
     if not _env_bool("PUSH_REGISTER_RECOVERY_PATCH_ENABLED", True):
         logger.warning("[PUSH REGISTER RECOVERY] disabled by env")
         return False
+
+    # Keep env flags explicit so later code does not re-enable runtime token behavior.
+    os.environ.setdefault("PUSH_REGISTER_PREFLIGHT_TOKEN_SYNC", "0")
+    os.environ.setdefault("PUSH_REGISTER_AUTH_RETRY_ENABLED", "0")
+
     ok_register = _patch_register_ops()
     ok_symbols = _patch_rotation_symbols()
     _INSTALLED = bool(ok_register or ok_symbols)
     logger.warning(
-        "[PUSH REGISTER RECOVERY] installed version=%s register_retry=%s preflight_token_sync=%s target_topup=%s min_keep=%s audit=%s",
+        "[PUSH REGISTER RECOVERY] installed version=%s register_audit=%s http_token_wrapper=False auth_retry=False preflight_token_sync=False target_topup=%s min_keep=%s audit=True",
         VERSION,
         ok_register,
-        _env_bool("PUSH_REGISTER_PREFLIGHT_TOKEN_SYNC", True),
         ok_symbols,
         _env_int("PUSH_REGISTER_MIN_KEEP", 100),
-        True,
     )
     return _INSTALLED
 
