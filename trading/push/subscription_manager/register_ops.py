@@ -1,12 +1,13 @@
 # ============================================================
 # File   : trading/push/subscription_manager/register_ops.py
-# Version: PRODUCTION-STABLE-REV2.0-KABUSAPI-SEQUENCE-LOCK
+# Version: PRODUCTION-STABLE-REV2.1-ABORT-REGISTER-ON-CLEAR-FAIL
 # Function:
 #   - register / unregister / clear の実行を担当する
 #   - kabu Station 公式ひな形に合わせて HTTP PUT /kabusapi/register を使う
 #   - WebSocket は受信専用、登録は HTTP API に分離する
 #   - /kabusapi/unregister/all は公式ひな形に合わせて body なし PUT で送る
 #   - unregister_all -> wait -> register の一連処理を直列化し、4002006 を抑止する
+#   - clear/unregister が失敗した場合は register へ進まず即中断する
 # ============================================================
 
 from __future__ import annotations
@@ -124,7 +125,7 @@ def _extract_api_key_like(v: Any) -> str:
     if isinstance(v, dict):
         for k in (
             "X-API-KEY", "x-api-key", "api_key", "apikey", "kabu_api_key",
-            "kabusapi_api_key", "token", "kabu_token", "kabusapi_token", "password",
+            "kabusapi_api_key", "token", "kabu_token", "kabusapi_token",
         ):
             if k in v:
                 s = _clean_api_key(v.get(k))
@@ -136,16 +137,18 @@ def _extract_api_key_like(v: Any) -> str:
 def _candidate_ini_paths() -> list[str]:
     here = os.getcwd()
     candidates = [
-        os.path.join(here, "setting.ini"),
         os.path.join(here, "settings.ini"),
-        os.path.join(here, "config.ini"),
-        os.path.join(os.path.dirname(here), "setting.ini"),
+        os.path.join(here, "config", "settings.ini"),
     ]
+    for env_name in ("SETTINGS_INI_PATH", "KABU_SETTINGS_INI"):
+        p = _safe_str(os.environ.get(env_name))
+        if p:
+            candidates.insert(0, p)
     gd = safe_get_global_data()
     if gd is not None:
         for name in ("setting_ini_path", "settings_path", "config_path", "ini_path"):
             p = _safe_str(safe_getattr(gd, name, None))
-            if p:
+            if p and os.path.basename(p).lower() == "settings.ini":
                 candidates.insert(0, p)
     out: list[str] = []
     seen = set()
@@ -162,15 +165,16 @@ def _read_aukabu_ini() -> tuple[str, str]:
             if not os.path.exists(path):
                 continue
             cp = configparser.ConfigParser()
-            cp.read(path, encoding="utf-8")
-            if not cp.has_section("aukabu"):
+            cp.read(path, encoding="utf-8-sig")
+            sec = "aukabu" if cp.has_section("aukabu") else "kabusapi" if cp.has_section("kabusapi") else ""
+            if not sec:
                 continue
-            token = _clean_api_key(cp.get("aukabu", "token", fallback=""))
-            apipassword = _safe_str(cp.get("aukabu", "apipassword", fallback=""))
+            token = _clean_api_key(cp.get(sec, "token", fallback=""))
+            apipassword = _safe_str(cp.get(sec, "apipassword", fallback=""))
             if token or apipassword:
                 return token, apipassword
         except Exception:
-            logger.exception("[SUB MANAGER] setting.ini read failed path=%s", path)
+            logger.exception("[SUB MANAGER] settings.ini read failed path=%s", path)
     return "", ""
 
 
@@ -180,8 +184,8 @@ def _get_global_api_key() -> str:
         return ""
     candidates = (
         "kabu_api_key", "kabusapi_api_key", "api_key", "apikey", "token",
-        "kabu_token", "kabusapi_token", "X_API_KEY", "x_api_key", "api_password",
-        "password", "headers", "request_headers", "settings", "config",
+        "kabu_token", "kabusapi_token", "X_API_KEY", "x_api_key", "headers",
+        "request_headers", "settings", "config",
     )
     for name in candidates:
         try:
@@ -204,7 +208,7 @@ def _get_global_api_key() -> str:
 def _get_env_api_key() -> str:
     for key in (
         "KABU_API_KEY", "KABUSAPI_API_KEY", "X_API_KEY", "KABU_TOKEN",
-        "KABUSAPI_TOKEN", "API_KEY", "APIKEY", "PASSWORD", "KABU_PASSWORD",
+        "KABUSAPI_TOKEN", "KABU_API_TOKEN", "AUKABU_TOKEN", "API_TOKEN", "TOKEN",
     ):
         s = _extract_api_key_like(os.environ.get(key))
         if s:
@@ -218,7 +222,7 @@ def _get_settings_api_key() -> str:
             mod = __import__(module_name, fromlist=["*"])
             for name in (
                 "KABU_API_KEY", "KABUSAPI_API_KEY", "X_API_KEY", "KABU_TOKEN",
-                "KABUSAPI_TOKEN", "API_KEY", "PASSWORD", "HEADERS",
+                "KABUSAPI_TOKEN", "KABU_API_TOKEN", "AUKABU_TOKEN", "API_TOKEN", "TOKEN", "HEADERS",
             ):
                 if hasattr(mod, name):
                     s = _extract_api_key_like(getattr(mod, name))
@@ -360,11 +364,6 @@ def _resolve_unregister_url() -> str:
 
 
 def _build_request(*, url: str, method: str, payload: Optional[dict], api_key: str) -> urllib.request.Request:
-    """Build kabusapi request.
-
-    register/unregister use JSON body. unregister/all follows the vendor sample and sends
-    a PUT request with no body (Content-Length: 0 behavior from urllib).
-    """
     method = (_safe_str(method) or "PUT").upper()
     body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, body, method=method)
@@ -433,6 +432,22 @@ def _is_partial_register_error(content: Any) -> bool:
         return False
 
 
+def _is_api_key_mismatch(content: Any) -> bool:
+    try:
+        if isinstance(content, dict):
+            code = str(content.get("Code") or "")
+            msg = str(content.get("Message") or "")
+            return code == "4001009" or "APIキー不一致" in msg
+        s = str(content)
+        return "4001009" in s or "APIキー不一致" in s
+    except Exception:
+        return False
+
+
+def _abort_on_clear_failure() -> bool:
+    return _env_bool("PUSH_REGISTER_ABORT_IF_CLEAR_FAILED", True)
+
+
 def _sequence_lock_path() -> str:
     return os.getenv("KABU_REGISTER_SEQUENCE_LOCK_PATH") or os.path.join(
         tempfile.gettempdir(), "autostock_kabustation_register_sequence.lock"
@@ -441,12 +456,6 @@ def _sequence_lock_path() -> str:
 
 @contextlib.contextmanager
 def _registration_sequence_lock(reason: str = "unknown") -> Iterator[None]:
-    """Serialize kabusapi register/unregister sequences.
-
-    kabu Station treats /register as a 50-symbol total replacement-sensitive resource. If two
-    threads/processes interleave unregister_all and register, /register can return 4002006 even
-    after a successful unregister_all.  This lock keeps the whole sequence atomic from our side.
-    """
     file_lock_enabled = _env_bool("KABU_REGISTER_SEQUENCE_FILE_LOCK", True)
     timeout_sec = max(0.5, _safe_float(os.getenv("KABU_REGISTER_SEQUENCE_LOCK_TIMEOUT_SEC"), 20.0))
     poll_sec = max(0.05, _safe_float(os.getenv("KABU_REGISTER_SEQUENCE_LOCK_POLL_SEC"), 0.10))
@@ -528,7 +537,7 @@ def run_unregister_all() -> bool:
         return True
     if not api_key:
         logger.warning("[SUB MANAGER] unregister_all skipped: API key unavailable")
-        return True
+        return False
     ok, content = _http_json_request(url=url, method="PUT", payload=None, api_key=api_key)
     logger.info("[SUB MANAGER] unregister_all done vendor_body=None ok=%s content=%r", ok, content)
     return ok
@@ -545,7 +554,7 @@ def run_unregister_symbols(symbols: Sequence[str]) -> bool:
         return True
     if not api_key:
         logger.warning("[SUB MANAGER] unregister_symbols skipped: API key unavailable")
-        return True
+        return False
     payload = {"Symbols": make_symbol_objects(normalized)}
     ok, content = _http_json_request(url=url, method="PUT", payload=payload, api_key=api_key)
     logger.info("[SUB MANAGER] unregister_symbols done count=%d ok=%s content=%r", len(normalized), ok, content)
@@ -616,14 +625,18 @@ def run_refresh_sequence(
         if clear_first:
             ok = run_unregister_all()
             if not ok:
-                logger.warning("[SUB MANAGER] clear_first failed but continue register=True")
+                logger.error("[SUB MANAGER] clear_first failed -> abort register abort_if_clear_failed=%s", _abort_on_clear_failure())
+                if _abort_on_clear_failure():
+                    return False
             if wait_sec > 0:
                 logger.info("[SUB MANAGER] wait after unregister all %.3fs before register size=%d", wait_sec, len(normalized_target))
                 time.sleep(wait_sec)
         elif unregister_first and current_symbols:
             ok = run_unregister_symbols(current_symbols)
             if not ok:
-                logger.warning("[SUB MANAGER] unregister_first failed but continue register=True")
+                logger.error("[SUB MANAGER] unregister_first failed -> abort register abort_if_clear_failed=%s", _abort_on_clear_failure())
+                if _abort_on_clear_failure():
+                    return False
             if wait_sec > 0:
                 logger.info("[SUB MANAGER] wait after unregister symbols %.3fs before register size=%d", wait_sec, len(normalized_target))
                 time.sleep(wait_sec)
@@ -646,7 +659,10 @@ def run_refresh_sequence(
                 REGISTER_COUNT_ERROR_RETRY_WAIT_SEC,
                 content,
             )
-            run_unregister_all()
+            clear_ok = run_unregister_all()
+            if not clear_ok:
+                logger.error("[SUB MANAGER] register count recovery unregister_all failed -> abort retry")
+                return False
             if REGISTER_COUNT_ERROR_RETRY_WAIT_SEC > 0:
                 time.sleep(REGISTER_COUNT_ERROR_RETRY_WAIT_SEC)
             ok2, content2 = _register_once_with_content(normalized_target, exchange=exchange)
@@ -662,6 +678,8 @@ def run_refresh_sequence(
                 return True
             return False
 
+        if _is_api_key_mismatch(content):
+            logger.error("[SUB MANAGER] register failed by API key mismatch; check startup token bootstrap/settings.ini content=%r", content)
         return False
 
 
