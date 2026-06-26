@@ -1,24 +1,18 @@
 # ============================================================
 # File   : core/startup/watchlist_recent_liquidity_bulk_patch.py
-# Version: V1.4-PUSH-ROTATION-ALWAYS-FAIL-OPEN
+# Version: V1.5-PUSH-REGISTRATION-RECENT-LIQ-FAIL-OPEN
 # ------------------------------------------------------------
 # watchlist_recent_liquidity_guard_patch の per-symbol SQLite 読取を
 # 1回のbulk読取に差し替える。
 #
-# V1.4:
-#   - push.rotation.apply_register_liquidity_guard では summary DB を読まず、
-#     必ず元の候補を返す。
-#   - 理由: PUSH登録前の銘柄はまだPUSH summaryが無いのが正常。
-#     ここで NO_RECENT_SUMMARY 除外すると、PUSH未登録→summary無し→除外→未登録
-#     の循環で A/B 50銘柄ローテーションが成立しない。
-#   - PUSH登録の最低流動性は別の ranking/day liquidity guard 側で見る。
-#
-# V1.3:
-#   - main.py 判定を sys.argv/env だけでなく data_collectors.split_mode に統一
-#   - main.py 側に AUTOSTOCK_SUMMARY_DB_WRITER 等が紛れ込んでもDB読取しない
-#   - main.py 側では thread を作らず即 fail-open する
-#   - SQLite progress_handler で長時間SELECTを中断しやすくする
-#   - timeout後にdaemon workerが132秒後に read done を出す問題を抑制
+# V1.5:
+#   - active.get_* / active.update_active_symbols 経由で PUSH 登録母集団を作る時も、
+#     NO_RECENT_SUMMARY だけで50件未満へ縮退させない。
+#   - PUSH登録前は「今日のPUSH summaryが無い」のが正常なので、ここで削ると
+#     PUSH未登録 -> summary無し -> 除外 -> 未登録 の循環になる。
+#   - 登録前の候補は最低 UC_PUSH_ROTATION_LIQ_FAILOPEN_MIN_KEEP
+#     または WATCHLIST_RECENT_LIQ_MIN_KEEP_ON_MISSING 件を維持する。
+#   - 低流動性の最終除外は entry 側の最終ガードに残す。
 # ============================================================
 
 from __future__ import annotations
@@ -41,7 +35,7 @@ def _as_float(v: Any, default: float = 0.0) -> float:
     try:
         if v is None or str(v).strip() == "":
             return float(default)
-        x = float(v)
+        x = float(str(v).replace(",", ""))
         return float(default) if x != x else x
     except Exception:
         return float(default)
@@ -52,9 +46,19 @@ def _env_float(name: str, default: float) -> float:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
             return float(default)
-        return float(v)
+        return float(str(v).replace(",", ""))
     except Exception:
         return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(str(v).replace(",", "")))
+    except Exception:
+        return int(default)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -67,12 +71,53 @@ def _env_bool(name: str, default: bool = False) -> bool:
         return bool(default)
 
 
-def _is_push_rotation_context(context: Any) -> bool:
+def _norm_context(context: Any) -> str:
     try:
-        s = str(context or "").strip().lower()
-        return s.startswith("push.rotation") or s.startswith("rotation") or "push_stream.rotation" in s
+        return str(context or "").strip().lower()
     except Exception:
-        return False
+        return ""
+
+
+def _is_push_rotation_context(context: Any) -> bool:
+    c = _norm_context(context)
+    return (
+        c.startswith("push.rotation")
+        or c.startswith("rotation")
+        or "push_stream.rotation" in c
+        or "apply_register_liquidity_guard" in c
+    )
+
+
+def _is_push_registration_source_context(context: Any) -> bool:
+    """Contexts that feed PUSH registration targets before PUSH summary exists."""
+    c = _norm_context(context)
+    if _is_push_rotation_context(c):
+        return True
+    return c in {
+        "active.get_active_symbols",
+        "active.get_current_active_symbols",
+        "active.get_monitor_symbols",
+        "active.get_push_symbols",
+        "active.get_register_symbols",
+        "active.get_subscription_symbols",
+        "active.get_rotation_symbols",
+        "active.update_active_symbols",
+    } or c.startswith("active.get_")
+
+
+def _min_keep_for_registration(before: int) -> int:
+    if before <= 0:
+        return 0
+    return max(
+        1,
+        min(
+            int(before),
+            max(
+                _env_int("UC_PUSH_ROTATION_LIQ_FAILOPEN_MIN_KEEP", 50),
+                _env_int("WATCHLIST_RECENT_LIQ_MIN_KEEP_ON_MISSING", 50),
+            ),
+        ),
+    )
 
 
 def _is_main_py_process() -> bool:
@@ -230,7 +275,7 @@ def _read_bulk_stats_sync(mod: Any, missing: List[str], symbols_total: int) -> d
 
 
 def _bulk_stats(mod: Any, symbols: List[str]) -> tuple[dict[str, dict[str, Any]], bool]:
-    """returns (stats_map, timed_out_or_skipped)."""
+    """Return (stats_map, timed_out_or_skipped)."""
     symbols = mod._dedupe(symbols)
     if not symbols:
         return {}, False
@@ -270,7 +315,7 @@ def _bulk_stats(mod: Any, symbols: List[str]) -> tuple[dict[str, dict[str, Any]]
 
     box: dict[str, Any] = {"done": False, "result": {}, "error": None}
 
-    def _worker():
+    def _worker() -> None:
         try:
             box["result"] = _read_bulk_stats_sync(mod, missing, len(symbols))
         except Exception as e:
@@ -316,6 +361,8 @@ def install() -> bool:
         if not mod._env_bool("WATCHLIST_RECENT_LIQ_ENABLED", True):
             return items
 
+        # PUSH登録直前は summary DB が未作成/未保存でも正常。
+        # rotation context は無条件で元リストを維持する。
         if _is_push_rotation_context(context):
             logger.warning(
                 "[WATCHLIST RECENT LIQ BULK] push rotation context=%s -> fail-open keep original count=%s reason=summary_not_available_before_registration",
@@ -337,6 +384,7 @@ def install() -> bool:
 
         kept: List[str] = []
         skipped: List[dict[str, Any]] = []
+        missing_count = 0
         min_latest = mod._env_float("WATCHLIST_RECENT_LIQ_MIN_LATEST_VOLUME", 3000.0)
         min_avg = mod._env_float("WATCHLIST_RECENT_LIQ_MIN_AVG_VOLUME", 3000.0)
         min_turnover = mod._env_float("WATCHLIST_RECENT_LIQ_MIN_TURNOVER_YEN", 1_000_000.0)
@@ -354,6 +402,7 @@ def install() -> bool:
                 "min_turnover": min_turnover,
             }
             if not st:
+                missing_count += 1
                 skipped.append({"reason": "NO_RECENT_SUMMARY", **detail})
             elif _as_float(st.get("latest_volume"), 0.0) < min_latest:
                 skipped.append({"reason": "LATEST_VOLUME_LOW", **detail})
@@ -363,6 +412,22 @@ def install() -> bool:
                 skipped.append({"reason": "TURNOVER_LOW", **detail})
             else:
                 kept.append(s)
+
+        # active.get_* は PUSH登録母集団にも使われる。
+        # 今日のsummary未作成で50件未満に縮退する場合は、元候補を維持する。
+        if _is_push_registration_source_context(context) and items:
+            min_keep = _min_keep_for_registration(len(items))
+            mostly_missing = missing_count >= max(1, int(len(items) * _env_float("WATCHLIST_RECENT_LIQ_MISSING_FAILOPEN_RATIO", 0.50)))
+            if len(kept) < min_keep and mostly_missing:
+                logger.warning(
+                    "[WATCHLIST RECENT LIQ BULK] registration source fail-open context=%s before=%s after=%s missing=%s min_keep=%s -> keep original targets reason=NO_RECENT_SUMMARY_BEFORE_PUSH",
+                    context,
+                    len(items),
+                    len(kept),
+                    missing_count,
+                    min_keep,
+                )
+                return items
 
         if skipped:
             logger.warning(
@@ -379,13 +444,14 @@ def install() -> bool:
     mod._filter_symbols = _filter_symbols_bulk
     _INSTALLED = True
     logger.warning(
-        "[WATCHLIST RECENT LIQ BULK] installed v1.4 push_rotation_fail_open timeout=%.2fs hard_timeout=%.2fs fail_open=%s skip_db_in_main=%s split_mode_skip=%s argv_main=%s",
+        "[WATCHLIST RECENT LIQ BULK] installed v1.5 push_registration_fail_open=1 timeout=%.2fs hard_timeout=%.2fs fail_open=%s skip_db_in_main=%s split_mode_skip=%s argv_main=%s min_keep=%s",
         _env_float("WATCHLIST_RECENT_LIQ_BULK_TIMEOUT_SEC", 1.5),
         _env_float("WATCHLIST_RECENT_LIQ_BULK_SQL_HARD_TIMEOUT_SEC", 2.0),
         mod._env_bool("WATCHLIST_RECENT_LIQ_FAIL_OPEN_ON_TIMEOUT", True),
         _should_skip_db_read_in_main(),
         _split_mode_says_main_should_skip_db_work(),
         _is_main_py_process(),
+        _min_keep_for_registration(100),
     )
     return True
 
