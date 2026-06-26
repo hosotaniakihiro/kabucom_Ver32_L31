@@ -19,7 +19,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V1-TOKEN-STARTUP-ONCE-SETTINGS-INI-NO-RUNTIME-REFRESH"
+VERSION = "V2-TOKEN-STARTUP-BOOTSTRAP-ONCE-THEN-NO-RUNTIME-REFRESH"
 _INSTALLED = False
 _ORIG_REFRESH = None
 _ORIG_REQUEST = None
@@ -30,7 +30,12 @@ def _env_bool(name: str, default: bool) -> bool:
         v = os.environ.get(name)
         if v is None or str(v).strip() == "":
             return bool(default)
-        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+            return False
+        return bool(default)
     except Exception:
         return bool(default)
 
@@ -70,7 +75,7 @@ def _read_settings_token() -> str:
             return token
     except Exception:
         pass
-    for key in ("KABU_API_TOKEN", "KABUSAPI_TOKEN", "AUKABU_TOKEN", "API_TOKEN", "TOKEN", "KABU_API_KEY", "KABUSAPI_API_KEY"):
+    for key in ("KABU_API_TOKEN", "KABUSAPI_TOKEN", "AUKABU_TOKEN", "API_TOKEN", "TOKEN", "KABU_API_KEY", "KABUSAPI_API_KEY", "X_API_KEY", "KABU_TOKEN"):
         token = str(os.environ.get(key) or "").strip()
         if token:
             return token
@@ -89,7 +94,6 @@ def _publish_env_token(token: str) -> None:
         "TOKEN",
         "KABU_API_KEY",
         "KABUSAPI_API_KEY",
-        "KABUSAPI_TOKEN",
         "KABU_TOKEN",
         "X_API_KEY",
     ):
@@ -102,6 +106,49 @@ def _publish_env_token(token: str) -> None:
         token_manager.API_TOKEN = token
     except Exception:
         pass
+
+
+def _startup_bootstrap_token(original_refresh) -> str:
+    """Acquire a fresh token exactly at process startup before refresh is disabled.
+
+    This intentionally ignores an existing settings.ini token.  Old settings.ini tokens
+    are the cause of startup-time 4001009/APIキー不一致, so the first bootstrap pass
+    must overwrite them.  Runtime 401 handling remains disabled after this function.
+    """
+    if not _env_bool("KABU_TOKEN_REFRESH_ON_STARTUP", True):
+        token = _read_settings_token()
+        if token:
+            _publish_env_token(token)
+        logger.warning(
+            "[TOKEN STARTUP ONCE] startup bootstrap disabled; using existing settings.ini token token_len=%d",
+            len(token),
+        )
+        return token
+
+    try:
+        token = str(original_refresh() or "").strip()
+        if token:
+            _publish_env_token(token)
+            os.environ["KABU_TOKEN_STARTUP_BOOTSTRAPPED"] = "1"
+            logger.warning(
+                "[TOKEN STARTUP ONCE] startup bootstrap token refreshed/saved token_len=%d",
+                len(token),
+            )
+            return token
+        logger.error("[TOKEN STARTUP ONCE] startup bootstrap returned empty token")
+    except Exception:
+        logger.exception("[TOKEN STARTUP ONCE] startup bootstrap token refresh failed")
+
+    # Fail-open to existing settings.ini token so diagnostics can continue, but keep
+    # runtime refresh disabled.  API-key mismatch will be surfaced by callers.
+    token = _read_settings_token()
+    if token:
+        _publish_env_token(token)
+    logger.warning(
+        "[TOKEN STARTUP ONCE] fallback to existing settings.ini token after bootstrap failure token_len=%d",
+        len(token),
+    )
+    return token
 
 
 def _patch_token_manager() -> bool:
@@ -120,6 +167,9 @@ def _patch_token_manager() -> bool:
         logger.warning("[TOKEN STARTUP ONCE] token_manager.refresh_token missing")
         return False
     _ORIG_REFRESH = original
+
+    # First and only automatic /token call for this process startup.
+    startup_token = _startup_bootstrap_token(original)
 
     def refresh_token_startup_once(apipassword=None, *args, **kwargs):
         # Explicit manual override, for emergency use only.
@@ -140,21 +190,19 @@ def _patch_token_manager() -> bool:
             )
             return token
 
-        # If settings.ini has no token yet, allow a single bootstrap acquisition.
-        token = original(apipassword=apipassword) if apipassword is not None else original()
-        try:
-            _publish_env_token(str(token or ""))
-        except Exception:
-            pass
-        logger.warning("[TOKEN STARTUP ONCE] bootstrap token acquired because settings.ini token was empty token_len=%d", len(str(token or "")))
-        return token
+        # No token available.  Do not silently refresh during live trading unless the
+        # emergency env flag above is enabled; surface the problem clearly.
+        logger.error(
+            "[TOKEN STARTUP ONCE] runtime refresh suppressed but settings.ini token is empty; restart with KABU_TOKEN_REFRESH_ON_STARTUP=1 or fix settings.ini"
+        )
+        return ""
 
     try:
         refresh_token_startup_once._original = original  # type: ignore[attr-defined]
         refresh_token_startup_once._token_startup_once_policy = True  # type: ignore[attr-defined]
         token_manager.refresh_token = refresh_token_startup_once  # type: ignore[attr-defined]
         token_manager._TOKEN_STARTUP_ONCE_POLICY_PATCHED = True  # type: ignore[attr-defined]
-        token = _read_settings_token()
+        token = startup_token or _read_settings_token()
         if token:
             _publish_env_token(token)
         logger.warning("[TOKEN STARTUP ONCE] token_manager patched no_runtime_refresh=True token_len=%d", len(token))
@@ -212,21 +260,23 @@ def install() -> bool:
         logger.warning("[TOKEN STARTUP ONCE] disabled by env")
         return False
 
-    # Make retry patches skip refresh by default.  They may still retry the same
-    # settings.ini token if their own code does so, but they will not issue /token.
+    # Make retry patches skip refresh by default.  Startup bootstrap above is the
+    # only automatic /token call; after that, runtime 401 refresh remains disabled.
     os.environ.setdefault("PUSH_REGISTER_AUTH_RETRY_ENABLED", "0")
     os.environ.setdefault("KABU_TOKEN_ALLOW_RUNTIME_REFRESH", "0")
     os.environ.setdefault("KABU_TOKEN_FORCE_REFRESH", "0")
+    os.environ.setdefault("KABU_TOKEN_REFRESH_ON_STARTUP", "1")
 
     ok_tm = _patch_token_manager()
     ok_req = _patch_requests_no_401_refresh()
     _INSTALLED = bool(ok_tm or ok_req)
     logger.warning(
-        "[TOKEN STARTUP ONCE] installed version=%s token_manager=%s requests=%s auth_retry=%s",
+        "[TOKEN STARTUP ONCE] installed version=%s token_manager=%s requests=%s auth_retry=%s startup_refresh=%s",
         VERSION,
         ok_tm,
         ok_req,
         os.environ.get("PUSH_REGISTER_AUTH_RETRY_ENABLED"),
+        os.environ.get("KABU_TOKEN_REFRESH_ON_STARTUP"),
     )
     return _INSTALLED
 
