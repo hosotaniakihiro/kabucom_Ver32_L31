@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 from typing import Dict, Mapping, MutableMapping, Optional
 
-VERSION = "REV4-RUNTIME-ENV-DEFAULTS-ACTIVE-PREMARKET-LIQUIDITY"
+VERSION = "REV5-RUNTIME-ENV-DEFAULTS-PUSH-KEEP-WS-BACKOFF"
 
 _TRUE = {"1", "true", "yes", "on", "y"}
 _FALSE = {"0", "false", "no", "off", "n", ""}
@@ -51,9 +51,11 @@ def _set_defaults(defaults: Mapping[str, str], *, environ: Optional[MutableMappi
 PUSH_DEFAULTS: Dict[str, str] = {
     "PUSH_WS_VENDOR_RUN_FOREVER": "1",
     "PUSH_WS_ENABLE_PING": "0",
-    "PUSH_ROTATION_CLOSE_BEFORE_REGISTER": "1",
-    "PUSH_ROTATION_CLOSE_WS_BEFORE_REGISTER": "1",
-    "PUSH_ROTATION_REGISTER_WITH_WS_CLOSED": "1",
+    # Keep a live websocket by default.  When REST unregister/register is rejected
+    # by kabu Station, closing WS first destroys the only working PUSH feed.
+    "PUSH_ROTATION_CLOSE_BEFORE_REGISTER": "0",
+    "PUSH_ROTATION_CLOSE_WS_BEFORE_REGISTER": "0",
+    "PUSH_ROTATION_REGISTER_WITH_WS_CLOSED": "0",
     "PUSH_ROTATION_WAIT_WS_READY_AFTER_REGISTER": "1",
     "PUSH_ROTATION_HOLD_SEC": "4.8",
     "PUSH_ROTATION_CLEAR_GAP_SEC": "0.2",
@@ -62,6 +64,9 @@ PUSH_DEFAULTS: Dict[str, str] = {
     "PUSH_ROTATION_POST_REGISTER_WS_READY_TIMEOUT_SEC": "4.0",
     "PUSH_ROTATION_POST_REGISTER_WS_POLL_SEC": "0.05",
     "PUSH_ROTATION_POST_REGISTER_WS_SETTLE_SEC": "0.25",
+    "PUSH_ROTATION_FAILURE_BACKOFF_SEC": "180",
+    "PUSH_ROTATION_FAILURE_BACKOFF_MAX_SEC": "600",
+    "PUSH_ROTATION_FAILURE_BACKOFF_MULTIPLIER": "1.5",
     "PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH": "1",
     "PUSH_STREAM_ONOPEN_REFRESH_CLEAR_FIRST": "0",
     "PUSH_STREAM_ONOPEN_REFRESH_UNREGISTER_FIRST": "0",
