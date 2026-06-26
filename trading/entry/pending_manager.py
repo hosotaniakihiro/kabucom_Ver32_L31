@@ -1,7 +1,7 @@
 # ============================================================
 # File   : trading/entry/pending_manager.py
-# Purpose: pending_entries 完全一元管理（FINAL）
-# Version: Ver02-NO-MIXED-BUY-SELL-PER-SYMBOL
+# Purpose: pending_entries 完全一元管理
+# Version: Ver03-STALE-DUPLICATE-REFRESH
 # ------------------------------------------------------------
 # ✔ pending_entries = dict[str, list[dict]] を絶対保証
 # ✔ 直代入 / 型崩れを STACKTRACE 付きで検出
@@ -11,16 +11,18 @@
 # ✔ ROOT 可視化・件数監視・空状態の原因追跡を強化
 # ✔ reject理由を可視化
 # ✔ interval違い / SELL不可 / 古い候補を安全に掃除できる prune_entries を追加
-#
-# Ver02:
 # ✔ 同一銘柄 bucket 内の BUY / SELL 混在を禁止
-# ✔ 既存 BUY に対する SELL 追加、既存 SELL に対する BUY 追加を拒否
 # ✔ 既に混在している bucket は発注列挙時に全削除して安全停止
-# ✔ 「表示はBUYなのに実発注はSELL」事故を防止
+#
+# Ver03:
+# ✔ pending duplicate が残り続けて新しい SUMMARY_AI 候補を捨てる問題を修正
+# ✔ 同一 identity の既存 pending が一定秒数以上古い場合は、新しい entry で置換
+# ✔ 置換時に stale_duplicate_replaced ログを出し、古い候補で永久停止しないようにする
 # ============================================================
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import os
 import traceback
@@ -40,26 +42,37 @@ def _env_bool(name: str, default: bool = True) -> bool:
         if v is None:
             return bool(default)
         s = str(v).strip().lower()
-        if s in {"1", "true", "yes", "y", "on"}:
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
             return True
-        if s in {"0", "false", "no", "n", "off", ""}:
+        if s in {"0", "false", "no", "n", "off", "", "disable", "disabled"}:
             return False
         return bool(default)
     except Exception:
         return bool(default)
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
+
+
 PENDING_REJECT_MIXED_SIDE = _env_bool("PENDING_REJECT_MIXED_SIDE", True)
 PENDING_CLEAR_ALREADY_MIXED_BUCKET = _env_bool("PENDING_CLEAR_ALREADY_MIXED_BUCKET", True)
+PENDING_REPLACE_STALE_DUPLICATE = _env_bool("PENDING_REPLACE_STALE_DUPLICATE", True)
+PENDING_DUPLICATE_STALE_SEC = max(1.0, _env_float("PENDING_DUPLICATE_STALE_SEC", 20.0))
+PENDING_DEFAULT_MAX_AGE_SEC = max(PENDING_DUPLICATE_STALE_SEC, _env_float("PENDING_DEFAULT_MAX_AGE_SEC", 180.0))
 
 
 # ============================================================
 # 内部: pending_entries root ガード
 # ============================================================
 def _ensure_root() -> None:
-    """
-    pending_entries の存在・型を保証する唯一の場所
-    """
+    """pending_entries の存在・型を保証する唯一の場所。"""
     if not hasattr(global_data, "pending_entries"):
         global_data.pending_entries = {}
         logger.debug("🧱 pending_entries root CREATED")
@@ -81,9 +94,7 @@ def _ensure_root() -> None:
 # 内部: bucket 正規化
 # ============================================================
 def _normalize_bucket(bucket: Any, symbol: str) -> List[Dict]:
-    """
-    bucket を必ず list[dict] に正規化
-    """
+    """bucket を必ず list[dict] に正規化。"""
     if bucket is None:
         return []
 
@@ -104,8 +115,7 @@ def _normalize_bucket(bucket: Any, symbol: str) -> List[Dict]:
                 cleaned.append(e)
             else:
                 logger.error(
-                    "❌ INVALID pending entry dropped "
-                    "symbol=%s type=%s value=%r",
+                    "❌ INVALID pending entry dropped symbol=%s type=%s value=%r",
                     symbol,
                     type(e),
                     e,
@@ -113,8 +123,7 @@ def _normalize_bucket(bucket: Any, symbol: str) -> List[Dict]:
         return cleaned
 
     logger.error(
-        "❌ INVALID pending bucket type reset "
-        "symbol=%s type=%s value=%r",
+        "❌ INVALID pending bucket type reset symbol=%s type=%s value=%r",
         symbol,
         type(bucket),
         bucket,
@@ -176,9 +185,7 @@ def _bucket_has_mixed_side(bucket: List[Dict]) -> bool:
 
 
 def _entry_identity(entry: Dict[str, Any]) -> Tuple[str, str, str, str]:
-    """
-    重複判定用 identity。
-    """
+    """重複判定用 identity。"""
     try:
         return (
             _norm_str(entry.get("source")),
@@ -202,23 +209,119 @@ def _entry_debug(entry: Dict[str, Any]) -> Dict[str, Any]:
             "score": entry.get("score"),
             "score_buy": entry.get("score_buy"),
             "score_sell": entry.get("score_sell"),
+            "created_at": entry.get("created_at"),
+            "updated_at": entry.get("updated_at"),
         }
     except Exception:
         return {}
+
+
+def _now() -> dt.datetime:
+    return dt.datetime.now()
+
+
+def _parse_dt(v: Any) -> dt.datetime | None:
+    try:
+        if isinstance(v, dt.datetime):
+            return v.replace(tzinfo=None)
+        if v is None or str(v).strip() == "":
+            return None
+        s = str(v).strip()
+        try:
+            # pandas Timestamp / ISO文字列をできる範囲で吸収
+            return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            pass
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+            try:
+                return dt.datetime.strptime(s, fmt)
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+
+def _entry_created_at(entry: Dict[str, Any]) -> dt.datetime | None:
+    if not isinstance(entry, dict):
+        return None
+    for key in ("created_at", "pending_created_at", "entry_time", "datetime", "dt", "time"):
+        ts = _parse_dt(entry.get(key))
+        if ts is not None:
+            return ts
+    return None
+
+
+def _entry_age_sec(entry: Dict[str, Any]) -> float | None:
+    ts = _entry_created_at(entry)
+    if ts is None:
+        return None
+    try:
+        return max(0.0, (_now() - ts).total_seconds())
+    except Exception:
+        return None
+
+
+def _prepare_new_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(entry)
+    now = _now()
+    if _entry_created_at(out) is None:
+        out["created_at"] = now
+    out["updated_at"] = now
+    return out
+
+
+def _is_stale_duplicate(old_entry: Dict[str, Any], new_entry: Dict[str, Any]) -> tuple[bool, str, float | None]:
+    if not PENDING_REPLACE_STALE_DUPLICATE:
+        return False, "disabled", None
+    old_age = _entry_age_sec(old_entry)
+    if old_age is None:
+        # 作成時刻の無い古いpendingは永久残留の原因になりやすいので置換対象にする。
+        return True, "old_created_at_missing", None
+    stale_sec = PENDING_DUPLICATE_STALE_SEC
+    try:
+        # SUMMARY_AI は実行周期が短く、古い重複が残ると発火不能になるため短めに置換。
+        if _norm_str(new_entry.get("entry_type")) == "SUMMARY_AI" or _norm_str(new_entry.get("source")) == "SUMMARY":
+            stale_sec = max(5.0, _env_float("PENDING_SUMMARY_AI_DUPLICATE_STALE_SEC", PENDING_DUPLICATE_STALE_SEC))
+    except Exception:
+        pass
+    if old_age >= stale_sec:
+        return True, f"old_age_sec>={stale_sec:.1f}", old_age
+    return False, f"old_age_sec<{stale_sec:.1f}", old_age
+
+
+def _drop_expired_entries(bucket: List[Dict[str, Any]], *, symbol: str) -> List[Dict[str, Any]]:
+    kept: List[Dict[str, Any]] = []
+    removed = 0
+    for e in bucket:
+        age = _entry_age_sec(e)
+        if age is not None and age >= PENDING_DEFAULT_MAX_AGE_SEC:
+            removed += 1
+            logger.info(
+                "🧹 pending expired before add symbol=%s age=%.1fs max_age=%.1fs identity=%s entry=%s",
+                symbol,
+                age,
+                PENDING_DEFAULT_MAX_AGE_SEC,
+                _entry_identity(e),
+                _entry_debug(e),
+            )
+            continue
+        kept.append(e)
+    if removed:
+        logger.info("🧹 pending expired cleanup symbol=%s removed=%d kept=%d", symbol, removed, len(kept))
+    return kept
 
 
 # ============================================================
 # 公開API: pending root snapshot（デバッグ用）
 # ============================================================
 def snapshot_root() -> Dict[str, int]:
-    """
-    Returns:
-        {symbol: bucket_size}
-    """
+    """Returns: {symbol: bucket_size}"""
     _ensure_root()
     snap: Dict[str, int] = {}
     for sym, bucket in list(global_data.pending_entries.items()):
         normalized = _normalize_bucket(bucket, sym)
+        normalized = _drop_expired_entries(normalized, symbol=str(sym))
         if normalized:
             global_data.pending_entries[sym] = normalized
             snap[sym] = len(normalized)
@@ -235,6 +338,7 @@ def get_bucket(symbol: str) -> List[Dict]:
     sym = str(symbol)
     raw = global_data.pending_entries.get(sym)
     normalized = _normalize_bucket(raw, sym)
+    normalized = _drop_expired_entries(normalized, symbol=sym)
     if normalized:
         global_data.pending_entries[sym] = normalized
     else:
@@ -249,15 +353,12 @@ def replace_bucket(symbol: str, new_bucket: List[Dict]) -> None:
     _ensure_root()
     sym = str(symbol)
     normalized = _normalize_bucket(new_bucket, sym)
+    normalized = _drop_expired_entries(normalized, symbol=sym)
     if normalized:
         global_data.pending_entries[sym] = normalized
     else:
         global_data.pending_entries.pop(sym, None)
-    logger.debug(
-        "🔁 pending bucket replaced symbol=%s size=%d",
-        sym,
-        len(normalized),
-    )
+    logger.debug("🔁 pending bucket replaced symbol=%s size=%d", sym, len(normalized))
 
 
 # ============================================================
@@ -268,11 +369,7 @@ def has_source(symbol: str, source: str) -> bool:
         return False
     bucket = get_bucket(symbol)
     src = _norm_str(source)
-    return any(
-        _norm_str(e.get("source")) == src
-        for e in bucket
-        if isinstance(e, dict)
-    )
+    return any(_norm_str(e.get("source")) == src for e in bucket if isinstance(e, dict))
 
 
 # ============================================================
@@ -281,15 +378,9 @@ def has_source(symbol: str, source: str) -> bool:
 def has_identity(symbol: str, entry: Dict[str, Any]) -> bool:
     if not symbol or not isinstance(entry, dict):
         return False
-
     target = _entry_identity(entry)
     bucket = get_bucket(symbol)
-
-    return any(
-        _entry_identity(e) == target
-        for e in bucket
-        if isinstance(e, dict)
-    )
+    return any(_entry_identity(e) == target for e in bucket if isinstance(e, dict))
 
 
 # ============================================================
@@ -310,14 +401,12 @@ def add_pending(entry: Dict) -> bool:
         logger.error("❌ entry is not dict: %r", entry)
         return False
 
+    entry = _prepare_new_entry(entry)
     symbol = entry.get("symbol")
     source = entry.get("source")
 
     if not symbol or not source:
-        logger.error(
-            "❌ invalid pending entry (symbol/source missing): %r",
-            entry,
-        )
+        logger.error("❌ invalid pending entry (symbol/source missing): %r", entry)
         return False
 
     sym = str(symbol)
@@ -355,19 +444,49 @@ def add_pending(entry: Dict) -> bool:
             )
             return False
 
+    new_bucket: List[Dict[str, Any]] = []
+    replaced = False
     for e in bucket:
         old_identity = _entry_identity(e)
-
         if old_identity == new_identity:
+            stale, why, old_age = _is_stale_duplicate(e, entry)
+            if stale:
+                new_bucket.append(entry)
+                replaced = True
+                logger.warning(
+                    "🔁 pending duplicate stale replaced symbol=%s source=%s identity=%s old_age=%s reason=%s old=%s new=%s",
+                    sym,
+                    src,
+                    new_identity,
+                    None if old_age is None else round(old_age, 1),
+                    why,
+                    _entry_debug(e),
+                    _entry_debug(entry),
+                )
+                continue
+            new_bucket.append(e)
             logger.info(
-                "⏭ pending duplicate skipped symbol=%s source=%s identity=%s",
+                "⏭ pending duplicate skipped symbol=%s source=%s identity=%s old_age=%s reason=%s",
                 sym,
                 src,
                 new_identity,
+                None if old_age is None else round(old_age, 1),
+                why,
             )
+            # 同一identityが複数ある異常状態を避けるため、残りはそのまま維持して終了する。
+            for rest in bucket[len(new_bucket):]:
+                if rest is not e:
+                    new_bucket.append(rest)
+            replace_bucket(sym, new_bucket)
             return False
+        new_bucket.append(e)
 
-    new_bucket = bucket + [entry]
+    if replaced:
+        replace_bucket(sym, new_bucket)
+        logger.info("📦 pending_root_snapshot=%s", snapshot_root())
+        return True
+
+    new_bucket.append(entry)
     replace_bucket(sym, new_bucket)
 
     logger.info(
@@ -381,12 +500,7 @@ def add_pending(entry: Dict) -> bool:
         len(new_bucket),
         new_identity,
     )
-
-    logger.debug(
-        "📦 pending_root_snapshot=%s",
-        snapshot_root(),
-    )
-
+    logger.debug("📦 pending_root_snapshot=%s", snapshot_root())
     return True
 
 
@@ -394,13 +508,11 @@ def add_pending(entry: Dict) -> bool:
 # entry_controller 用: 全 pending を安全に列挙
 # ============================================================
 def iter_entries() -> Iterator[Tuple[str, Dict]]:
-    """
-    Yields:
-        (symbol, entry_dict)
-    """
+    """Yields: (symbol, entry_dict)"""
     _ensure_root()
     for sym, bucket in list(global_data.pending_entries.items()):
         normalized = _normalize_bucket(bucket, sym)
+        normalized = _drop_expired_entries(normalized, symbol=str(sym))
         if normalized:
             if PENDING_REJECT_MIXED_SIDE and _bucket_has_mixed_side(normalized):
                 logger.warning(
@@ -425,9 +537,7 @@ def iter_entries() -> Iterator[Tuple[str, Dict]]:
 # entry_controller 用: 発火後に1件だけ安全に削除
 # ============================================================
 def pop_entry(symbol: str, entry: Dict) -> None:
-    """
-    指定 entry を bucket から1件だけ削除
-    """
+    """指定 entry を bucket から1件だけ削除。"""
     _ensure_root()
     sym = str(symbol)
     bucket = get_bucket(sym)
@@ -443,13 +553,7 @@ def pop_entry(symbol: str, entry: Dict) -> None:
         new_bucket.append(e)
 
     replace_bucket(sym, new_bucket)
-
-    logger.info(
-        "🧹 pending popped symbol=%s removed=%s remain=%d",
-        sym,
-        removed,
-        len(new_bucket),
-    )
+    logger.info("🧹 pending popped symbol=%s removed=%s remain=%d", sym, removed, len(new_bucket))
 
 
 # ============================================================
