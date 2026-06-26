@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/summary/pipeline/indicator_short_history_patch.py
-# Version: PRODUCTION-STABLE-INDICATOR-SHORT-HISTORY-PATCH-V2-READY-FILL
+# Version: PRODUCTION-STABLE-INDICATOR-SHORT-HISTORY-PATCH-V3-NEUTRAL-SCORE-SUPPRESS
 # ------------------------------------------------------------
 # Purpose:
 #   indicator_pipeline の短履歴問題を補正する。
@@ -16,6 +16,11 @@
 #   - score_slope がある場合は slope / slope_atr_scaled へ逆補完する
 #   - close + score + slope系がある行は technical_ready=True に補正する
 #   - usable_technical_ready も維持する
+#
+# V3:
+#   - hist_len < 3 かつ rsi=50/macd=0/signal=0/slope=0 の中立行で、
+#     score=-1 / score_sell=1 のようなデフォルト売りスコアを0に抑制する。
+#   - 本当に下向きの行、MACD/RSI/傾きが出ている行は抑制しない。
 # ============================================================
 
 from __future__ import annotations
@@ -138,6 +143,53 @@ def _safe_bool_series(s: Any, index) -> pd.Series:
     return pd.Series(False, index=index, dtype="bool")
 
 
+def _series_from_col(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    if col not in df.columns:
+        return pd.Series(default, index=df.index, dtype="float64")
+    return pd.to_numeric(df[col], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(default)
+
+
+def _suppress_neutral_default_scores(out: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """短履歴で全指標が中立なのに付いたデフォルト売りスコアを消す。"""
+    try:
+        if out.empty:
+            return out, 0
+        hist_len = _series_from_col(out, "symbol_hist_len", 0.0)
+        score = _series_from_col(out, "score", 0.0)
+        score_sell = _series_from_col(out, "score_sell", 0.0)
+        score_buy = _series_from_col(out, "score_buy", 0.0)
+        slope = _series_from_col(out, "slope", 0.0).abs()
+        slope_atr = _series_from_col(out, "slope_atr_scaled", 0.0).abs()
+        score_slope = _series_from_col(out, "score_slope", 0.0).abs()
+        rsi = _series_from_col(out, "rsi", 50.0)
+        macd = _series_from_col(out, "macd", 0.0).abs()
+        signal = _series_from_col(out, "signal", 0.0).abs()
+
+        short_hist = hist_len < 3
+        neutral = (
+            (slope <= 1e-12)
+            & (slope_atr <= 1e-12)
+            & (score_slope <= 1e-12)
+            & ((rsi - 50.0).abs() <= 1e-9)
+            & (macd <= 1e-12)
+            & (signal <= 1e-12)
+        )
+        default_sell = (score < 0) & (score_sell > 0) & (score_buy <= 0)
+        mask = short_hist & neutral & default_sell
+        n = int(mask.sum())
+        if n:
+            for col in ("score", "score_total", "final_score", "display_score", "score_sell"):
+                if col in out.columns:
+                    out.loc[mask, col] = 0.0
+            if "score_buy" in out.columns:
+                out.loc[mask, "score_buy"] = 0.0
+            out.loc[mask, "neutral_default_score_suppressed"] = True
+        return out, n
+    except Exception:
+        logger.exception("[IND SHORT PATCH] neutral score suppress failed")
+        return out, 0
+
+
 def add_short_history_indicators(df: pd.DataFrame, *, interval: Any = None) -> pd.DataFrame:
     if not isinstance(df, pd.DataFrame) or df.empty or "symbol" not in df.columns:
         return df
@@ -159,7 +211,6 @@ def add_short_history_indicators(df: pd.DataFrame, *, interval: Any = None) -> p
         pct = pd.Series(np.nan, index=out.index, dtype="float64")
         prev_close = pd.Series(np.nan, index=out.index, dtype="float64")
 
-    # score_slope が先にある場合、slopeの元として使う。
     score_slope = pd.to_numeric(out.get("score_slope", pd.Series(np.nan, index=out.index)), errors="coerce").replace([np.inf, -np.inf], np.nan)
     score_slope_scaled = (score_slope / 100.0).clip(-0.2, 0.2)
 
@@ -176,7 +227,6 @@ def add_short_history_indicators(df: pd.DataFrame, *, interval: Any = None) -> p
         tr = pd.concat([(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
         atr_light = tr.groupby(out["symbol"], sort=False).transform(lambda x: x.rolling(3, min_periods=1).mean())
         atr_light = atr_light.replace([np.inf, -np.inf], np.nan)
-        # high/lowが同値でもATR列自体は残す。0でも「計算済み」として扱う。
         atr_light = atr_light.where(close.notna(), np.nan).fillna(0.0)
     except Exception:
         atr_light = pd.Series(0.0, index=out.index, dtype="float64")
@@ -188,7 +238,6 @@ def add_short_history_indicators(df: pd.DataFrame, *, interval: Any = None) -> p
     except Exception:
         pass
 
-    # hist_len=1 でも rsi=50 を入れる。
     try:
         gain = diff.clip(lower=0)
         loss = (-diff.clip(upper=0))
@@ -204,7 +253,6 @@ def add_short_history_indicators(df: pd.DataFrame, *, interval: Any = None) -> p
 
     out, n_rsi = _fill_missing_numeric(out, "rsi", rsi_light, zero_is_missing=False)
 
-    # hist_len=1 でも macd/signal/hist は0として補完する。
     try:
         ema_fast = close.groupby(out["symbol"], sort=False).transform(lambda x: x.ewm(span=3, adjust=False, min_periods=1).mean())
         ema_slow = close.groupby(out["symbol"], sort=False).transform(lambda x: x.ewm(span=6, adjust=False, min_periods=1).mean())
@@ -224,11 +272,16 @@ def add_short_history_indicators(df: pd.DataFrame, *, interval: Any = None) -> p
     score_slope_light = (slope_for_score * 100.0).clip(-20, 20)
     out, n_score_slope = _fill_missing_numeric(out, "score_slope", score_slope_light, zero_is_missing=True, allow_zero_value=False)
 
-    # MTF列がNaNの場合は0を入れて欠損表示を防ぐ。
     zero_mtf = pd.Series(0.0, index=out.index, dtype="float64")
     out, n_mtf = _fill_missing_numeric(out, "mtf", zero_mtf, zero_is_missing=False)
     out, n_score_mtf = _fill_missing_numeric(out, "score_mtf", zero_mtf, zero_is_missing=False)
     out, n_mtf_score = _fill_missing_numeric(out, "mtf_score", zero_mtf, zero_is_missing=False)
+
+    suppressed_neutral_scores = 0
+    try:
+        out, suppressed_neutral_scores = _suppress_neutral_default_scores(out)
+    except Exception:
+        logger.exception("[IND SHORT PATCH] neutral default score suppress wrapper failed")
 
     try:
         score_any = pd.to_numeric(out.get("score", out.get("final_score", pd.Series(np.nan, index=out.index))), errors="coerce").notna()
@@ -267,6 +320,7 @@ def add_short_history_indicators(df: pd.DataFrame, *, interval: Any = None) -> p
             "mtf": n_mtf,
             "score_mtf": n_score_mtf,
             "mtf_score": n_mtf_score,
+            "neutral_default_score_suppressed": suppressed_neutral_scores,
             "usable_ready": int(pd.Series(out.get("usable_technical_ready", False)).fillna(False).astype(bool).sum()),
             "technical_ready": int(pd.Series(out.get("technical_ready", False)).fillna(False).astype(bool).sum()),
         },
@@ -292,7 +346,6 @@ def install_indicator_short_history_patch() -> bool:
         logger.warning("[IND SHORT PATCH] run_indicator_pipeline not callable")
         return False
 
-    # 既存patchがある場合は元関数まで戻して二重patchを避ける。
     try:
         seen = set()
         while callable(getattr(orig_run, "_original", None)) and id(orig_run) not in seen:
@@ -320,10 +373,11 @@ def install_indicator_short_history_patch() -> bool:
     target.run_indicator_pipeline = run_indicator_pipeline_patched
     target.indicator_pipeline = indicator_pipeline_patched
     target.apply_indicator_pipeline = apply_indicator_pipeline_patched
+    target._short_history_patch_v3_installed = True
     target._short_history_patch_v2_installed = True
     target._short_history_patch_v1_installed = True
     _PATCHED = True
-    logger.warning("[IND SHORT PATCH] installed V2 ready_fill")
+    logger.warning("[IND SHORT PATCH] installed V3 neutral_score_suppress")
     return True
 
 
