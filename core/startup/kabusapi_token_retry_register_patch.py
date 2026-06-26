@@ -1,24 +1,21 @@
 # ============================================================
 # File   : core/startup/kabusapi_token_retry_register_patch.py
-# Version: V4-KABUSAPI-REGISTER-CANONICAL-TOKEN-NO-RUNTIME-REFRESH
+# Version: V5-KABUSAPI-REGISTER-CANONICAL-TOKEN-CHILD-NO-BOOTSTRAP
 # ------------------------------------------------------------
 # Purpose:
 #   PUSH subscription register/unregister may run in child processes.
 #   Operational policy is startup-once token handling:
-#     - token is obtained once before live register/unregister and stored in settings.ini/runtime cache
-#     - live register/unregister must NOT call /token automatically after startup/bootstrap
+#     - token is obtained once by parent main_database.py/main.py and stored in settings.ini/runtime cache
+#     - child push_receiver must NOT call /token or bypass token_manager child guards
+#     - live register/unregister must use the canonical settings/runtime token
 #     - 4001009 / APIキー不一致 must be surfaced as a real auth failure
-#
-#   This patch is loaded in the process that actually performs PUSH REST register.
-#   It performs one defensive startup bootstrap before patching register_ops.
-#   After that, every /register and /unregister request ignores stale api_key args
-#   from later wrappers and uses the canonical token from token_manager.API_TOKEN or settings.ini.
 # ============================================================
 from __future__ import annotations
 
 import configparser
 import logging
 import os
+import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -38,6 +35,14 @@ _TOKEN_ENV_KEYS = (
     "X_API_KEY",
     "KABU_API_KEY",
     "KABUSAPI_API_KEY",
+)
+
+_CHILD_MARKERS = (
+    "push_receiver_runner.py",
+    "ranking_collector_runner.py",
+    "summary_database_runner.py",
+    "yahoo_complement_runner.py",
+    "db_prepare_runner.py",
 )
 
 
@@ -63,6 +68,28 @@ def _env_bool(name: str, default: bool) -> bool:
         return bool(default)
     except Exception:
         return bool(default)
+
+
+def _argv_text() -> str:
+    try:
+        return " ".join(str(x) for x in getattr(sys, "argv", [])).lower()
+    except Exception:
+        return ""
+
+
+def _is_child_process() -> bool:
+    txt = _argv_text()
+    if any(marker in txt for marker in _CHILD_MARKERS):
+        return True
+    for key in ("DATA_COLLECTOR_CHILD", "KABU_CHILD_PROCESS", "IS_CHILD_PROCESS"):
+        if _env_bool(key, False):
+            return True
+    return False
+
+
+def _is_parent_process() -> bool:
+    txt = _argv_text()
+    return "main_database.py" in txt or "main.py" in txt
 
 
 def _is_api_key_mismatch(content: Any) -> bool:
@@ -157,7 +184,7 @@ def _canonical_token() -> tuple[str, str]:
 
     This intentionally ignores the api_key argument passed by wrappers, because older
     recovery patches may pass stale env/global tokens.  The canonical order is:
-      1. token_manager.API_TOKEN, which is populated by startup bootstrap
+      1. token_manager.API_TOKEN, which should be populated by parent startup/preflight
       2. settings.ini [aukabu]/[kabusapi] token
       3. explicit token environment variables as last fallback
     """
@@ -186,16 +213,37 @@ def _read_settings_or_runtime_token() -> str:
 
 
 def _bootstrap_token_once() -> str:
-    """Acquire one fresh token before PUSH REST registration starts.
+    """Acquire no token in child processes.
 
-    This is not runtime retry.  It runs once when this startup patch is installed in
-    the process that will call /kabusapi/register.  It uses token_manager.refresh_token's
-    original function when another startup-once wrapper is already installed.
+    Previous versions called token_manager.refresh_token._original() here.  That bypassed
+    token_manager's child-process guard and let push_receiver call /token after the
+    parent preflight.  In kabu Station this can make the token used by other child
+    processes inconsistent.  Children now only read the parent-issued token.
     """
     global _BOOTSTRAPPED
     if _BOOTSTRAPPED:
         return _read_settings_or_runtime_token()
     _BOOTSTRAPPED = True
+
+    if _is_child_process() and not _env_bool("KABU_REGISTER_ALLOW_CHILD_BOOTSTRAP_TOKEN", False):
+        token, source = _canonical_token()
+        logger.warning(
+            "[KABUSAPI TOKEN RETRY REGISTER] child process detected; /token bootstrap skipped source=%s token_len=%d argv=%s",
+            source,
+            len(token),
+            _argv_text(),
+        )
+        return token
+
+    if (not _is_parent_process()) and not _env_bool("KABU_REGISTER_ALLOW_NONPARENT_BOOTSTRAP_TOKEN", False):
+        token, source = _canonical_token()
+        logger.warning(
+            "[KABUSAPI TOKEN RETRY REGISTER] non-parent process; /token bootstrap skipped source=%s token_len=%d argv=%s",
+            source,
+            len(token),
+            _argv_text(),
+        )
+        return token
 
     if not _env_bool("KABU_REGISTER_BOOTSTRAP_TOKEN_ON_INSTALL", True):
         token, source = _canonical_token()
@@ -210,13 +258,14 @@ def _bootstrap_token_once() -> str:
         import token_manager
         refresh = getattr(token_manager, "refresh_token", None)
         if callable(refresh):
-            original = getattr(refresh, "_original", refresh)
-            token = _safe_str(original())
+            # Deliberately call the public refresh wrapper, not _original, so the
+            # parent/child guard in token_manager cannot be bypassed.
+            token = _safe_str(refresh())
             if token:
                 _publish_token(token)
                 os.environ["KABU_REGISTER_BOOTSTRAP_DONE"] = "1"
                 logger.warning(
-                    "[KABUSAPI TOKEN RETRY REGISTER] startup bootstrap token refreshed/saved before register token_len=%d",
+                    "[KABUSAPI TOKEN RETRY REGISTER] parent startup bootstrap token refreshed/saved before register token_len=%d",
                     len(token),
                 )
                 return token
@@ -246,7 +295,7 @@ def _install_now() -> bool:
             logger.debug("[KABUSAPI TOKEN RETRY REGISTER] register_ops not ready", exc_info=True)
             return False
 
-        if getattr(ops, "_kabusapi_token_retry_register_v4", False):
+        if getattr(ops, "_kabusapi_token_retry_register_v5", False):
             _INSTALLED = True
             return True
 
@@ -309,16 +358,16 @@ def _install_now() -> bool:
             )
             return ok, content
 
-        _resolve_api_key_patched._kabusapi_token_retry_register_v4 = True  # type: ignore[attr-defined]
+        _resolve_api_key_patched._kabusapi_token_retry_register_v5 = True  # type: ignore[attr-defined]
         _resolve_api_key_patched._original = orig_resolve  # type: ignore[attr-defined]
-        _http_json_request_patched._kabusapi_token_retry_register_v4 = True  # type: ignore[attr-defined]
+        _http_json_request_patched._kabusapi_token_retry_register_v5 = True  # type: ignore[attr-defined]
         _http_json_request_patched._original = orig_http  # type: ignore[attr-defined]
 
         ops._resolve_api_key = _resolve_api_key_patched
         ops._http_json_request = _http_json_request_patched
-        ops._kabusapi_token_retry_register_v4 = True
+        ops._kabusapi_token_retry_register_v5 = True
         _INSTALLED = True
-        logger.warning("[KABUSAPI TOKEN RETRY REGISTER] installed v4 canonical_token=True startup_bootstrap=True no_runtime_refresh=True")
+        logger.warning("[KABUSAPI TOKEN RETRY REGISTER] installed v5 canonical_token=True child_no_bootstrap=True no_runtime_refresh=True")
         return True
 
 
