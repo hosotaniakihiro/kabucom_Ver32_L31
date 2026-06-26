@@ -1,6 +1,6 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver47-DBPREPARE-ONLY-SCHEMA-AND-LIGHT-MTF-CATCHUP
+# Version: Ver48-ENTRY-EXECUTE-TIMEOUT-GUARD
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # main.py は軽量同期 + background install。
@@ -13,6 +13,10 @@
 #   - SUMMARY MTF STARTUP CATCHUP も既定で db_prepare_runner.py だけに限定。
 #     子プロセスごとに3分足/5分足catchupが走る問題を抑制。
 #   - db_prepare中のMTF catchupは軽量既定値へ変更。
+#
+# V48:
+#   - entry_controller._execute_best_candidate の長時間ぶら下がり対策として
+#     ENTRY_EXECUTE_TIMEOUT_GUARD を main.py 同期パッチに追加。
 # ============================================================
 from __future__ import annotations
 
@@ -126,9 +130,6 @@ def _configure_db_startup_scope_defaults() -> None:
         db_prepare = _is_db_prepare_process()
         main_database = _is_main_database_process()
 
-        # summary ranking schema repair performs ALTER TABLE checks on summary DB.
-        # Running it in every child process causes NAS SQLite startup lock pressure.
-        # Default owner is db_prepare only. main_database can be allowed explicitly.
         allow_schema_in_main = _env_on("SUMMARY_SCHEMA_REPAIR_IN_MAIN_DATABASE", False)
         if not db_prepare and not (main_database and allow_schema_in_main):
             os.environ.setdefault("DISABLE_SUMMARY_RANKING_SCHEMA_REPAIR_PATCH", "1")
@@ -137,12 +138,10 @@ def _configure_db_startup_scope_defaults() -> None:
             os.environ.pop("DISABLE_SUMMARY_RANKING_SCHEMA_REPAIR_PATCH", None)
             os.environ.setdefault("SUMMARY_RANKING_SCHEMA_REPAIR_SCOPE", "db_prepare_owner")
 
-        # Startup MTF catchup is also DB-heavy. Run it once in db_prepare by default.
         if not db_prepare and not _env_on("SUMMARY_MTF_CATCHUP_RUN_IN_THIS_PROCESS", False):
             os.environ.setdefault("DISABLE_SUMMARY_MTF_CATCHUP", "1")
 
         if db_prepare:
-            # Light intraday catchup: fill recent gaps, not rebuild hours of 3m/5m bars.
             os.environ["SUMMARY_MTF_CATCHUP_MA_BARS"] = os.environ.get("SUMMARY_MTF_CATCHUP_MA_BARS_OPERATOR", "20")
             os.environ["SUMMARY_MTF_CATCHUP_EXTRA_MINUTES"] = os.environ.get("SUMMARY_MTF_CATCHUP_EXTRA_MINUTES_OPERATOR", "10")
             os.environ["SUMMARY_MTF_CATCHUP_MAX_ROWS"] = os.environ.get("SUMMARY_MTF_CATCHUP_MAX_ROWS_OPERATOR", "20000")
@@ -269,6 +268,7 @@ SYNC_MAIN_PATCHES = [
     ("core.startup.entry_log_skip_reason_collision_patch", "ENTRY_LOG_SKIP_GUARD", "DISABLE_ENTRY_LOG_SKIP_GUARD"),
     ("core.startup.entry_controller_pipeline_lock_wait_patch", "ENTRY_CONTROLLER_LOCK_WAIT", "DISABLE_ENTRY_CONTROLLER_LOCK_WAIT_PATCH"),
     ("core.startup.entry_controller_source_prefilter_patch", "ENTRY_CONTROLLER_SOURCE_PREFILTER", "DISABLE_ENTRY_CONTROLLER_SOURCE_PREFILTER_PATCH"),
+    ("core.startup.entry_execute_timeout_guard_patch", "ENTRY_EXECUTE_TIMEOUT_GUARD", "DISABLE_ENTRY_EXECUTE_TIMEOUT_GUARD_PATCH"),
 ]
 
 BACKGROUND_MAIN_PATCHES = [
