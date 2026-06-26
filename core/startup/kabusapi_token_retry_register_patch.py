@@ -1,12 +1,17 @@
 # ============================================================
 # File   : core/startup/kabusapi_token_retry_register_patch.py
-# Version: V1-KABUSAPI-REGISTER-4001009-TOKEN-REFRESH
+# Version: V2-KABUSAPI-REGISTER-4001009-NO-RUNTIME-REFRESH
 # ------------------------------------------------------------
 # Purpose:
 #   PUSH subscription register/unregister may run in child processes.
-#   If an old X-API-KEY remains in env/global state, kabu Station returns
-#   Code 4001009 / APIキー不一致.  Patch register_ops so register APIs
-#   prefer a freshly refreshed runtime token and retry once on 4001009.
+#   Operational policy is startup-once token handling:
+#     - token is obtained at startup and stored in settings.ini/runtime cache
+#     - live register/unregister must NOT call /token automatically
+#     - 4001009 / APIキー不一致 must be surfaced as a real auth failure
+#
+#   This patch only normalizes token resolution/publishing from the existing
+#   settings.ini/runtime token.  It intentionally does not refresh/retry with a
+#   newly acquired token on API key mismatch.
 # ============================================================
 from __future__ import annotations
 
@@ -25,6 +30,10 @@ _TOKEN_ENV_KEYS = (
     "X_API_KEY",
     "KABU_TOKEN",
     "KABUSAPI_TOKEN",
+    "KABU_API_TOKEN",
+    "AUKABU_TOKEN",
+    "API_TOKEN",
+    "TOKEN",
 )
 
 
@@ -74,16 +83,25 @@ def _publish_token(token: str) -> str:
     return token
 
 
-def _refresh_token(reason: str = "register_4001009") -> str:
+def _read_settings_or_runtime_token() -> str:
+    """Return the already-issued startup token without calling /token."""
     try:
         import token_manager
-        token = _safe_str(token_manager.refresh_token())
+        fn = getattr(token_manager, "get_valid_token", None)
+        if callable(fn):
+            token = _safe_str(fn())
+            if token:
+                return _publish_token(token)
+        token = _safe_str(getattr(token_manager, "API_TOKEN", None))
         if token:
-            _publish_token(token)
-            logger.warning("[KABUSAPI TOKEN RETRY REGISTER] refreshed token reason=%s token_len=%d", reason, len(token))
-            return token
+            return _publish_token(token)
     except Exception:
-        logger.exception("[KABUSAPI TOKEN RETRY REGISTER] refresh_token failed reason=%s", reason)
+        pass
+
+    for key in _TOKEN_ENV_KEYS:
+        token = _safe_str(os.environ.get(key))
+        if token:
+            return _publish_token(token)
     return ""
 
 
@@ -98,7 +116,7 @@ def _install_now() -> bool:
             logger.debug("[KABUSAPI TOKEN RETRY REGISTER] register_ops not ready", exc_info=True)
             return False
 
-        if getattr(ops, "_kabusapi_token_retry_register_v1", False):
+        if getattr(ops, "_kabusapi_token_retry_register_v2", False):
             _INSTALLED = True
             return True
 
@@ -108,56 +126,41 @@ def _install_now() -> bool:
             return False
 
         def _resolve_api_key_patched(*args: Any, **kwargs: Any) -> str:
-            # Prefer in-memory token_manager token first.  If empty, use original resolver.
-            try:
-                import token_manager
-                token = _safe_str(getattr(token_manager, "API_TOKEN", None))
-                if token:
-                    return _publish_token(token)
-            except Exception:
-                pass
+            token = _read_settings_or_runtime_token()
+            if token:
+                return token
             try:
                 token = _safe_str(orig_resolve(*args, **kwargs))
                 if token:
-                    return token
+                    return _publish_token(token)
             except Exception:
                 logger.debug("[KABUSAPI TOKEN RETRY REGISTER] original _resolve_api_key failed", exc_info=True)
-            # Last chance: refresh from APIPassword in child process.
-            token = _refresh_token(reason="resolve_empty")
-            return token
+            logger.warning("[KABUSAPI TOKEN RETRY REGISTER] no startup/settings.ini token available; runtime refresh disabled")
+            return ""
 
         def _http_json_request_patched(*, url: str, method: str, payload: Any, api_key: str, timeout: float = 10.0):
             token = _safe_str(api_key) or _resolve_api_key_patched()
             ok, content = orig_http(url=url, method=method, payload=payload, api_key=token, timeout=timeout)
             if ok or not _is_api_key_mismatch(content):
                 return ok, content
-            logger.warning(
-                "[KABUSAPI TOKEN RETRY REGISTER] detected API key mismatch method=%s url=%s -> refresh and retry once content=%r",
+            logger.error(
+                "[KABUSAPI TOKEN RETRY REGISTER] API key mismatch method=%s url=%s; runtime refresh/retry disabled by startup-once policy content=%r",
                 method,
                 url,
                 content,
             )
-            new_token = _refresh_token(reason="http_4001009")
-            if not new_token or new_token == token:
-                return ok, content
-            ok2, content2 = orig_http(url=url, method=method, payload=payload, api_key=new_token, timeout=timeout)
-            logger.warning(
-                "[KABUSAPI TOKEN RETRY REGISTER] retry after token refresh ok=%s content=%r",
-                ok2,
-                content2,
-            )
-            return ok2, content2
+            return ok, content
 
-        _resolve_api_key_patched._kabusapi_token_retry_register_v1 = True  # type: ignore[attr-defined]
+        _resolve_api_key_patched._kabusapi_token_retry_register_v2 = True  # type: ignore[attr-defined]
         _resolve_api_key_patched._original = orig_resolve  # type: ignore[attr-defined]
-        _http_json_request_patched._kabusapi_token_retry_register_v1 = True  # type: ignore[attr-defined]
+        _http_json_request_patched._kabusapi_token_retry_register_v2 = True  # type: ignore[attr-defined]
         _http_json_request_patched._original = orig_http  # type: ignore[attr-defined]
 
         ops._resolve_api_key = _resolve_api_key_patched
         ops._http_json_request = _http_json_request_patched
-        ops._kabusapi_token_retry_register_v1 = True
+        ops._kabusapi_token_retry_register_v2 = True
         _INSTALLED = True
-        logger.warning("[KABUSAPI TOKEN RETRY REGISTER] installed v1")
+        logger.warning("[KABUSAPI TOKEN RETRY REGISTER] installed v2 no_runtime_refresh=True")
         return True
 
 
