@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/summary_mtf_early_ready_patch.py
-# Version: V1.1-SUMMARY-MTF-EARLY-MA5-READY-AND-HISTORY-CACHE
+# Version: V1.2-SUMMARY-MTF-EARLY-READY-CHAIN-NEUTRAL-SCORE-GUARD
 # ------------------------------------------------------------
 # 【目的】
 #   SUMMARY 3m/5m の AI entry が
@@ -12,6 +12,11 @@
 #     次サイクルで履歴不足に戻る問題を修正。
 #   - choose_merged_cache_payload() を runtime patch し、1m/3m/5m すべてで
 #     df_hist を merged cache に保持する。
+#
+# 【V1.2追加】
+#   - summary_controller_neutral_score_guard_patch を連鎖installする。
+#   - controller_projection / controller_cache 後段で
+#     score=-1 / score_sell=1 / RSI=50 / MACD=0 / slope=0 が復活する問題を抑制。
 #
 # 【背景】
 #   AI/entry_gate.py Ver26.33 は SUMMARY 3m/5m で symbol_hist_len < 14 を
@@ -43,6 +48,7 @@ logger = logging.getLogger(__name__)
 _PATCHED = False
 _ORIGINAL_SUMMARY_MTF_STATUS = None
 _CONTROLLER_CACHE_PATCHED = False
+_NEUTRAL_SCORE_GUARD_INSTALLED = False
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -152,7 +158,6 @@ def _early_ma5_ready(row: dict[str, Any], *, interval: int, reason: str) -> tupl
         return False, f"score_low:{score:.3f}<{min_score:.3f}"
 
     if close <= 0 or ma5 <= 0:
-        # ma5がない場合でも、slope方向が強ければ救済する。
         if side == "BUY" and slope >= min_slope:
             return True, f"early_mtf_buy_slope_only:hist={hist:.0f}:slope={slope:.5f}:score={score:.2f}"
         if side == "SELL" and slope <= -min_slope:
@@ -172,17 +177,24 @@ def _early_ma5_ready(row: dict[str, Any], *, interval: int, reason: str) -> tupl
     return False, "side_ng"
 
 
+def _install_neutral_score_guard() -> bool:
+    global _NEUTRAL_SCORE_GUARD_INSTALLED
+    if _NEUTRAL_SCORE_GUARD_INSTALLED:
+        return True
+    try:
+        from core.startup import summary_controller_neutral_score_guard_patch as neutral_guard
+        ok = bool(neutral_guard.install())
+        _NEUTRAL_SCORE_GUARD_INSTALLED = ok
+        logger.warning("[SUMMARY MTF EARLY READY PATCH] neutral score guard installed=%s", ok)
+        return ok
+    except Exception:
+        logger.exception("[SUMMARY MTF EARLY READY PATCH] neutral score guard install failed")
+        return False
+
+
 def _install_controller_cache_history_payload_patch() -> bool:
     """
     3m/5m merged cache が latest-only になるのを防ぐ。
-
-    ログ上の症状:
-      existing merged summary rejected from history merge because it looks latest-only
-      technical_ready=False / rsi=0 / macd=0 / ma25=0 / ma75=0
-
-    原因:
-      choose_merged_cache_payload() が interval != 1 では df_latest だけを保存していた。
-      そのため、3m/5mの履歴が次回マージに残らず、指標計算の履歴長が不足する。
     """
     global _CONTROLLER_CACHE_PATCHED
     if _CONTROLLER_CACHE_PATCHED:
@@ -209,6 +221,12 @@ def _install_controller_cache_history_payload_patch() -> bool:
                 )
                 payload = cc.dedupe_symbol_datetime(payload, normalize_fn=normalize_fn)
                 payload = cc.attach_display_ready(payload)
+
+                try:
+                    from core.startup.summary_controller_neutral_score_guard_patch import neutralize_summary_scores
+                    payload = neutralize_summary_scores(payload, context=f"choose_merged_cache_payload:{interval}")
+                except Exception:
+                    pass
 
                 if isinstance(payload, pd.DataFrame) and not payload.empty:
                     logger.warning(
@@ -250,10 +268,11 @@ def _install_controller_cache_history_payload_patch() -> bool:
 def install() -> bool:
     global _PATCHED, _ORIGINAL_SUMMARY_MTF_STATUS
 
+    neutral_ok = _install_neutral_score_guard()
     controller_ok = _install_controller_cache_history_payload_patch()
 
     if _PATCHED:
-        return bool(controller_ok)
+        return bool(controller_ok or neutral_ok)
 
     try:
         import AI.entry_gate as target
@@ -261,10 +280,10 @@ def install() -> bool:
         cur = getattr(target, "_summary_mtf_status", None)
         if not callable(cur):
             logger.warning("[SUMMARY MTF EARLY READY PATCH] target _summary_mtf_status not callable")
-            return bool(controller_ok)
+            return bool(controller_ok or neutral_ok)
         if getattr(cur, "_summary_mtf_early_ready_patch", False):
             _PATCHED = True
-            return bool(controller_ok)
+            return bool(controller_ok or neutral_ok)
 
         _ORIGINAL_SUMMARY_MTF_STATUS = cur
 
@@ -290,11 +309,15 @@ def install() -> bool:
         _patched_summary_mtf_status._summary_mtf_early_ready_patch = True  # type: ignore[attr-defined]
         target._summary_mtf_status = _patched_summary_mtf_status
         _PATCHED = True
-        logger.warning("[SUMMARY MTF EARLY READY PATCH] installed controller_cache_history_payload=%s", controller_ok)
+        logger.warning(
+            "[SUMMARY MTF EARLY READY PATCH] installed controller_cache_history_payload=%s neutral_score_guard=%s",
+            controller_ok,
+            neutral_ok,
+        )
         return True
     except Exception:
         logger.exception("[SUMMARY MTF EARLY READY PATCH] install failed")
-        return bool(controller_ok)
+        return bool(controller_ok or neutral_ok)
 
 
 __all__ = ["install"]
