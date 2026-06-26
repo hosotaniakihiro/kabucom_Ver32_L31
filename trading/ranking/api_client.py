@@ -1,12 +1,13 @@
 # ============================================================
 # File   : trading/ranking/api_client.py
-# Version: Ver2.1-RANKING-API-CLIENT-TOKEN-REFRESH-ON-401
+# Version: Ver2.2-RANKING-API-CLIENT-STARTUP-ONCE-TOKEN
 # ------------------------------------------------------------
 # ✔ kabu Station ranking API client
 # ✔ timeout 対応
 # ✔ retry 対応
 # ✔ HTTPError / URLError / socket timeout / JSON decode safe
-# ✔ 4001009(APIキー不一致) / 401 時に refresh_token() して即時再試行
+# ✔ 4001009(APIキー不一致) / 401 時に runtime refresh しない
+# ✔ settings.ini / startup token policy に統一
 # ✔ logger 統一
 # ✔ elapsed ログ
 # ============================================================
@@ -23,10 +24,9 @@ import urllib.request
 from typing import Any
 
 try:
-    from token_manager import get_valid_token, refresh_token
+    from token_manager import get_valid_token
 except Exception:  # pragma: no cover - startup import safety
-    from token_manager import get_valid_token  # type: ignore
-    refresh_token = None  # type: ignore
+    get_valid_token = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -74,33 +74,14 @@ def _is_api_key_mismatch(status: Any, body_json: Any, body_text: str = "") -> bo
     return False
 
 
-def _refresh_token_after_mismatch(params: dict[str, Any], attempt: int) -> str | None:
-    """401/4001009 の直後に token を再取得する。失敗しても呼び出し元で通常retryに戻す。"""
-    if refresh_token is None:
-        logger.warning(
-            "[RANKING API CLIENT] token refresh unavailable after API key mismatch attempt=%s params=%s",
-            attempt,
-            params,
-        )
-        return None
-
-    try:
-        token = refresh_token()
-        if token:
-            logger.warning(
-                "[RANKING API CLIENT] refreshed token after API key mismatch attempt=%s token_len=%s params=%s",
-                attempt,
-                len(str(token)),
-                params,
-            )
-            return str(token)
-    except Exception:
-        logger.exception(
-            "[RANKING API CLIENT] token refresh failed after API key mismatch attempt=%s params=%s",
-            attempt,
-            params,
-        )
-    return None
+def _get_startup_token() -> str:
+    """Read the startup/settings.ini token without calling refresh_token()."""
+    if callable(get_valid_token):
+        try:
+            return str(get_valid_token() or "").strip()
+        except Exception:
+            logger.warning("[RANKING API CLIENT] get_valid_token failed; request will proceed without token", exc_info=True)
+    return ""
 
 
 def _request_once(params: dict[str, Any], token: str | None, timeout_sec: float) -> dict[str, Any]:
@@ -127,12 +108,11 @@ def get_data_from_api(
     params = _sanitize_params(params)
 
     last_exc: Exception | None = None
-    refreshed_once = False
 
     for attempt in range(1, retry_max + 1):
         t0 = time.perf_counter()
         try:
-            token = get_valid_token()
+            token = _get_startup_token()
 
             logger.info(
                 "[RANKING API CLIENT] request start attempt=%s/%s params=%s timeout=%.1fs",
@@ -184,34 +164,15 @@ def get_data_from_api(
             )
             last_exc = e
 
-            if (not refreshed_once) and _is_api_key_mismatch(getattr(e, "code", None), body_json, body_text):
-                refreshed_once = True
-                new_token = _refresh_token_after_mismatch(params, attempt)
-                if new_token:
-                    retry_t0 = time.perf_counter()
-                    try:
-                        payload = _request_once(params, new_token, timeout_sec)
-                        retry_elapsed = time.perf_counter() - retry_t0
-                        rows = payload.get("Ranking") if isinstance(payload, dict) else None
-                        row_count = len(rows) if isinstance(rows, list) else 0
-                        logger.info(
-                            "[RANKING API CLIENT] retry after token refresh ok attempt=%s/%s params=%s rows=%s elapsed=%.3fs",
-                            attempt,
-                            retry_max,
-                            params,
-                            row_count,
-                            retry_elapsed,
-                        )
-                        return payload
-                    except Exception as retry_exc:
-                        last_exc = retry_exc if isinstance(retry_exc, Exception) else e
-                        logger.warning(
-                            "[RANKING API CLIENT] retry after token refresh failed attempt=%s/%s params=%s err=%r",
-                            attempt,
-                            retry_max,
-                            params,
-                            retry_exc,
-                        )
+            if _is_api_key_mismatch(getattr(e, "code", None), body_json, body_text):
+                logger.error(
+                    "[RANKING API CLIENT] API key mismatch; runtime refresh disabled by startup-once policy params=%s token_len=%s",
+                    params,
+                    len(str(token or "")),
+                )
+                # APIキー不一致は同じsettings.ini tokenで再試行しても改善しないため、
+                # live loopを詰まらせないよう即時に失敗を返す。
+                break
 
         except urllib.error.URLError as e:
             elapsed = time.perf_counter() - t0
