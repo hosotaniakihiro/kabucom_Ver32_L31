@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/summary_ai_entry_hook_dataframe_truth_patch.py
-# Version: V1.3-WEAK-SUMMARY-AI-AND-PUSH-LIQUIDITY-CAP
+# Version: V1.4-SUMMARY-AI-APPROVAL-DIAG-AND-PRICE200
 # ------------------------------------------------------------
 # 【目的】
 #   scheduler_jobs.summary.summary_ai_entry_hook_v20.run_summary_ai_entry_safe で
@@ -9,20 +9,12 @@
 #
 #   が出る問題を runtime patch で防止する。
 #
-# V1.1:
-#   - final_entry_safety_guard_patch の _board_guard が別runtime patchにより
-#     3引数版へ差し替わっても、4引数呼び出しで TypeError にならない
-#     互換ラッパーを追加する。
-#   - エントリー直前の板ガードで落ちて候補実行が止まる問題を防止する。
-#
-# V1.2:
-#   - RANKING pending が既にある場合、古い ranking_snapshot_1min だけで
-#     entry_controller が止まらないよう ranking_precheck_pending_failopen_patch も
-#     起動時に同時installする。
-#
-# V1.3:
-#   - SUMMARY/PUSH由来で rankScore=0 かつ 3m=0/5m=0 の弱いAI_OKをAI_NG化する。
-#   - PUSH liquidity guard の rotation 全100件救済を解除し、50件程度まで削れるようにする。
+# V1.4:
+#   - SUMMARY AI executor の approved 化前フィルタで、古い3000円下限を200円へ補正する。
+#   - AI_OK が全落ちした時、daily risk / trade restriction / reject cache /
+#     price range のどれで落ちたかを銘柄ごとに必ずログ出力する。
+#   - 価格帯だけで候補が全滅する状態を避け、最終的な低流動性・板・日次リスクは
+#     後段の entry guard に残す。
 # ============================================================
 
 from __future__ import annotations
@@ -40,6 +32,8 @@ _ORIGINAL_FINAL_BOARD_GUARD = None
 _WEAK_SUMMARY_AI_PATCHED = False
 _ORIGINAL_RUN_AI_GATE_FOR_CANDIDATES = None
 _PUSH_LIQUIDITY_CAP_PATCHED = False
+_SUMMARY_AI_APPROVAL_DIAG_PATCHED = False
+_ORIGINAL_ENTRY_PRICE_BOUNDS = None
 
 _KEYS_MAY_BE_DF = (
     "candidates",
@@ -183,12 +177,10 @@ def _weak_summary_ai_ng(item: dict[str, Any]) -> tuple[bool, str]:
             abs(_safe_float(ai_row.get("mtf", source_row.get("mtf", 0.0)), 0.0)),
         )
 
-        # reason文字列の 3m=0.00 / 5m=0.00 を強く見る。ログで問題になった形を直撃する。
         reason_has_zero_3m5m = ("3m=0.00" in reason or "3m=0" in reason) and ("5m=0.00" in reason or "5m=0" in reason)
         if reason_has_zero_3m5m and abs(rank_score) <= 1e-9:
             return True, "weak_summary_ai_zero_rank_and_zero_3m5m"
 
-        # 列ベースでも、rank/MTF/3m/5mが全部無い場合は止める。
         v3 = max(
             abs(_safe_float(ai_row.get("score_3m", source_row.get("score_3m", 0.0)), 0.0)),
             abs(_safe_float(ai_row.get("score_total_3m", source_row.get("score_total_3m", 0.0)), 0.0)),
@@ -284,6 +276,134 @@ def _install_push_liquidity_rotation_cap() -> bool:
         return False
 
 
+def _install_summary_ai_approval_diag_and_price_floor() -> bool:
+    """Patch SUMMARY AI approved selection so price floor is 200 and skip reasons are visible."""
+    global _SUMMARY_AI_APPROVAL_DIAG_PATCHED, _ORIGINAL_ENTRY_PRICE_BOUNDS
+    if _SUMMARY_AI_APPROVAL_DIAG_PATCHED:
+        return True
+    try:
+        import trading.entry.summary_ai.executor as exec_mod
+
+        min_override = max(0.0, _env_float("SUMMARY_AI_APPROVAL_MIN_PRICE_OVERRIDE", 200.0))
+        os.environ["SUMMARY_AI_ENTRY_MIN_PRICE"] = str(min_override)
+        os.environ["ENTRY_MIN_PRICE"] = str(min_override)
+        try:
+            exec_mod.DEFAULT_MIN_PRICE_FOR_ENTRY = float(min_override)
+        except Exception:
+            pass
+
+        cur_bounds = getattr(exec_mod, "_entry_price_bounds", None)
+        if callable(cur_bounds) and not getattr(cur_bounds, "_summary_ai_price200_patch_v1", False):
+            _ORIGINAL_ENTRY_PRICE_BOUNDS = cur_bounds
+
+            def _patched_entry_price_bounds():
+                min_price, max_price, diag = _ORIGINAL_ENTRY_PRICE_BOUNDS()
+                try:
+                    old_min = float(min_price or 0.0)
+                    if min_override > 0 and (old_min <= 0 or old_min > min_override):
+                        min_price = float(min_override)
+                    if not isinstance(diag, dict):
+                        diag = {"raw_diag": str(diag)}
+                    diag = dict(diag)
+                    diag["summary_ai_price200_patch"] = True
+                    diag["old_min_price"] = old_min
+                    diag["effective_min_price"] = float(min_price or 0.0)
+                    diag["min_override"] = min_override
+                except Exception:
+                    pass
+                return min_price, max_price, diag
+
+            _patched_entry_price_bounds._summary_ai_price200_patch_v1 = True  # type: ignore[attr-defined]
+            _patched_entry_price_bounds._original = cur_bounds  # type: ignore[attr-defined]
+            exec_mod._entry_price_bounds = _patched_entry_price_bounds
+
+        orig_filter = getattr(exec_mod, "_filter_blocked_ai_ok_items", None)
+        if callable(orig_filter) and not getattr(orig_filter, "_summary_ai_approval_diag_v1", False):
+            def _patched_filter_blocked_ai_ok_items(ok_items):
+                try:
+                    if not ok_items:
+                        return []
+                    kept = []
+                    skipped = []
+                    min_price, max_price, price_diag = exec_mod._entry_price_bounds()
+                    for item in ok_items:
+                        symbol = exec_mod._pick_symbol(item)
+                        side = exec_mod._row_side(item)
+                        price = exec_mod._pick_price(item)
+                        reason = ""
+                        detail: dict[str, Any] = {}
+
+                        if price > 0 and min_price > 0 and price < min_price:
+                            reason = "price_below_entry_min_price"
+                            detail = {"price": price, "min_price": min_price, "max_price": max_price, "min_notional_100": round(price * 100, 1)}
+                        elif price > 0 and max_price > 0 and price > max_price:
+                            reason = "price_over_entry_max_price"
+                            detail = {"price": price, "min_price": min_price, "max_price": max_price, "min_notional_100": round(price * 100, 1)}
+                        else:
+                            daily_blocked, daily_reason, daily_detail = exec_mod._daily_risk_block_reason(symbol, side)
+                            if daily_blocked:
+                                reason = str(daily_reason or "DAILY_RISK_BLOCK")
+                                detail = {"source": "daily_risk_pre_approval", "detail": daily_detail}
+                            else:
+                                restricted, until = exec_mod._is_trade_restricted_symbol(symbol)
+                                if restricted:
+                                    reason = "trade_restricted"
+                                    detail = {"until": str(until)}
+                                else:
+                                    sell_rejected, reject_reason = exec_mod._is_sell_reject_cached(symbol, side)
+                                    if sell_rejected:
+                                        reason = "sell_reject_cache"
+                                        detail = {"detail": str(reject_reason)}
+
+                        if reason:
+                            row = {"symbol": symbol, "side": side, "reason": reason, **detail}
+                            skipped.append(row)
+                            logger.warning("[SUMMARY AI APPROVAL DIAG] skipped symbol=%s side=%s reason=%s detail=%s", symbol, side, reason, detail)
+                        else:
+                            kept.append(item)
+
+                    counts: dict[str, int] = {}
+                    for s in skipped:
+                        r = str(s.get("reason") or "UNKNOWN")
+                        counts[r] = counts.get(r, 0) + 1
+                    if skipped:
+                        logger.warning(
+                            "[SUMMARY AI APPROVAL DIAG] filter result before=%s after=%s skipped=%s counts=%s min_price=%s max_price=%s price_diag=%s skipped_head=%s",
+                            len(ok_items),
+                            len(kept),
+                            len(skipped),
+                            counts,
+                            min_price,
+                            max_price,
+                            price_diag,
+                            skipped[:80],
+                        )
+                    else:
+                        logger.info(
+                            "[SUMMARY AI APPROVAL DIAG] filter passed before=%s after=%s min_price=%s max_price=%s price_diag=%s",
+                            len(ok_items), len(kept), min_price, max_price, price_diag,
+                        )
+                    return kept
+                except Exception:
+                    logger.exception("[SUMMARY AI APPROVAL DIAG] patched filter failed; fallback original")
+                    return orig_filter(ok_items)
+
+            _patched_filter_blocked_ai_ok_items._summary_ai_approval_diag_v1 = True  # type: ignore[attr-defined]
+            _patched_filter_blocked_ai_ok_items._original = orig_filter  # type: ignore[attr-defined]
+            exec_mod._filter_blocked_ai_ok_items = _patched_filter_blocked_ai_ok_items
+
+        _SUMMARY_AI_APPROVAL_DIAG_PATCHED = True
+        logger.warning(
+            "[SUMMARY AI APPROVAL DIAG] installed price_min_override=%.0f executor_default_min=%s",
+            min_override,
+            getattr(exec_mod, "DEFAULT_MIN_PRICE_FOR_ENTRY", None),
+        )
+        return True
+    except Exception:
+        logger.exception("[SUMMARY AI APPROVAL DIAG] install failed")
+        return False
+
+
 def _install_final_entry_board_guard_compat() -> bool:
     """Keep final_entry_safety_guard_patch._board_guard callable with both 3 and 4 args.
 
@@ -314,10 +434,8 @@ def _install_final_entry_board_guard_compat() -> bool:
             symbol = str(symbol or "")
             side = str(side or "").upper()
             try:
-                # まず現在の実体が4引数対応ならそのまま通す。
                 return bool(_ORIGINAL_FINAL_BOARD_GUARD(row, item, symbol, side))  # type: ignore[misc]
             except TypeError as e4:
-                # 古い/別パッチの3引数版は row, symbol, side を想定して呼ぶ。
                 try:
                     logger.warning(
                         "[FINAL ENTRY BOARD GUARD COMPAT] fallback 4args->3args symbol=%s side=%s err=%s",
@@ -366,9 +484,10 @@ def install() -> bool:
     ok_rank_precheck = _install_ranking_precheck_pending_failopen()
     ok_weak_ai = _install_summary_ai_weak_filter()
     ok_liq_cap = _install_push_liquidity_rotation_cap()
+    ok_approval_diag = _install_summary_ai_approval_diag_and_price_floor()
 
     if _PATCHED:
-        return True and ok_board and ok_rank_precheck and ok_weak_ai and ok_liq_cap
+        return True and ok_board and ok_rank_precheck and ok_weak_ai and ok_liq_cap and ok_approval_diag
 
     try:
         import scheduler_jobs.summary.summary_ai_entry_hook_v20 as target
@@ -376,10 +495,10 @@ def install() -> bool:
         cur = getattr(target, "_result_to_dict", None)
         if not callable(cur):
             logger.warning("[SUMMARY AI HOOK DF TRUTH PATCH] target _result_to_dict not callable")
-            return bool(ok_board and ok_rank_precheck and ok_weak_ai and ok_liq_cap)
+            return bool(ok_board and ok_rank_precheck and ok_weak_ai and ok_liq_cap and ok_approval_diag)
         if getattr(cur, "_summary_ai_hook_df_truth_patch", False):
             _PATCHED = True
-            return True and ok_board and ok_rank_precheck and ok_weak_ai and ok_liq_cap
+            return True and ok_board and ok_rank_precheck and ok_weak_ai and ok_liq_cap and ok_approval_diag
 
         _ORIGINAL_RESULT_TO_DICT = cur
         _patched_result_to_dict._summary_ai_hook_df_truth_patch = True  # type: ignore[attr-defined]
@@ -387,16 +506,17 @@ def install() -> bool:
 
         _PATCHED = True
         logger.warning(
-            "[SUMMARY AI HOOK DF TRUTH PATCH] installed board_compat=%s ranking_precheck_failopen=%s weak_ai=%s liq_cap=%s",
+            "[SUMMARY AI HOOK DF TRUTH PATCH] installed board_compat=%s ranking_precheck_failopen=%s weak_ai=%s liq_cap=%s approval_diag=%s",
             ok_board,
             ok_rank_precheck,
             ok_weak_ai,
             ok_liq_cap,
+            ok_approval_diag,
         )
-        return True and ok_board and ok_rank_precheck and ok_weak_ai and ok_liq_cap
+        return True and ok_board and ok_rank_precheck and ok_weak_ai and ok_liq_cap and ok_approval_diag
     except Exception:
         logger.exception("[SUMMARY AI HOOK DF TRUTH PATCH] install failed")
-        return bool(ok_board and ok_rank_precheck and ok_weak_ai and ok_liq_cap)
+        return bool(ok_board and ok_rank_precheck and ok_weak_ai and ok_liq_cap and ok_approval_diag)
 
 
 __all__ = ["install"]
