@@ -1,6 +1,6 @@
 # ============================================================
 # File   : main_database.py
-# Version: DATA-COLLECTORS-MAIN-DATABASE-ENTRY-V7-SUMMARY-WAL-CHECKPOINT
+# Version: DATA-COLLECTORS-MAIN-DATABASE-ENTRY-V8-KABU-TOKEN-PREFLIGHT
 # ------------------------------------------------------------
 # Purpose:
 #   - DB作成 / ランキング取得 / PUSH銘柄登録 / PUSH受信 を起動する入口
@@ -9,16 +9,21 @@
 #   - main_database.py 経由でも古い PUSH/ranking summary を候補に残さない
 #   - main_database.py のコンソールログに時刻を付け、ファイルにも保存する
 #   - summary DB の WAL を1分ごとに checkpoint して .db 本体へ反映する
+#   - /token 取得直後に実APIで token preflight を行い、認証NGなら子プロセスを起動しない
 # ============================================================
 
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import os
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 from configparser import ConfigParser
+from typing import Any
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -32,6 +37,8 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 _MAIN_DATABASE_LOG_FILE_INSTALLED = False
+
+KABU_API_BASE_URL = "http://localhost:18080/kabusapi"
 
 
 def _ensure_basic_logging() -> None:
@@ -167,6 +174,149 @@ def _read_api_password_from_settings() -> str:
     return ""
 
 
+def _safe_content_text(value: Any, limit: int = 240) -> str:
+    try:
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    except Exception:
+        text = str(value)
+    text = text.replace("\r", " ").replace("\n", " ")
+    return text[:limit]
+
+
+def _is_api_key_mismatch(content: Any) -> bool:
+    try:
+        if isinstance(content, dict):
+            code = str(content.get("Code") or "")
+            msg = str(content.get("Message") or "")
+            return code == "4001009" or "APIキー不一致" in msg
+        s = str(content)
+        return "4001009" in s or "APIキー不一致" in s
+    except Exception:
+        return False
+
+
+def _kabu_preflight_request(token: str, endpoint: str, timeout: float = 5.0) -> tuple[bool, int | None, Any]:
+    url = f"{KABU_API_BASE_URL}{endpoint}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Content-Type": "application/json",
+            "X-API-KEY": str(token or ""),
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            raw = res.read().decode("utf-8", errors="ignore")
+            try:
+                content = json.loads(raw) if raw else {}
+            except Exception:
+                content = raw
+            return True, int(getattr(res, "status", 200) or 200), content
+    except urllib.error.HTTPError as e:
+        raw = ""
+        try:
+            raw = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            raw = ""
+        try:
+            content = json.loads(raw) if raw else str(e)
+        except Exception:
+            content = raw or str(e)
+        status = int(getattr(e, "code", 0) or 0)
+        return False, status, content
+    except Exception as e:
+        return False, None, str(e)
+
+
+def _preflight_kabu_token(token: str) -> bool:
+    """Validate the freshly acquired token with real kabu API calls before spawning children.
+
+    /token can succeed while subsequent APIs still reject X-API-KEY.  This guard
+    catches that condition early and prevents push_receiver/ranking_collector from
+    starting with an unusable token.
+    """
+    token = str(token or "").strip()
+    if not token:
+        logger.error("[MAIN DATABASE] kabu token preflight failed: empty token")
+        return False
+
+    endpoints = [
+        "/positions",
+        "/wallet/cash",
+    ]
+
+    auth_failures: list[tuple[str, int | None, Any]] = []
+    transport_failures: list[tuple[str, int | None, Any]] = []
+
+    for endpoint in endpoints:
+        ok, status, content = _kabu_preflight_request(token, endpoint)
+        if ok:
+            logger.warning(
+                "[MAIN DATABASE] kabu token preflight ok endpoint=%s status=%s token_len=%d",
+                endpoint,
+                status,
+                len(token),
+            )
+            os.environ["KABU_TOKEN_PREFLIGHT_OK"] = "1"
+            os.environ["KABU_TOKEN_PREFLIGHT_ENDPOINT"] = endpoint
+            return True
+
+        if status in (401, 403) or _is_api_key_mismatch(content):
+            auth_failures.append((endpoint, status, content))
+            logger.error(
+                "[MAIN DATABASE] kabu token preflight auth failed endpoint=%s status=%s content=%s token_len=%d",
+                endpoint,
+                status,
+                _safe_content_text(content),
+                len(token),
+            )
+            continue
+
+        # 400/404 etc. means the request reached kabu Station and was not rejected
+        # by API key.  For authentication preflight, this is enough to prove token
+        # was accepted; log it as accepted-with-endpoint-error.
+        if status is not None:
+            logger.warning(
+                "[MAIN DATABASE] kabu token preflight accepted endpoint=%s status=%s content=%s token_len=%d",
+                endpoint,
+                status,
+                _safe_content_text(content),
+                len(token),
+            )
+            os.environ["KABU_TOKEN_PREFLIGHT_OK"] = "1"
+            os.environ["KABU_TOKEN_PREFLIGHT_ENDPOINT"] = endpoint
+            return True
+
+        transport_failures.append((endpoint, status, content))
+        logger.error(
+            "[MAIN DATABASE] kabu token preflight transport failed endpoint=%s error=%s",
+            endpoint,
+            _safe_content_text(content),
+        )
+
+    if auth_failures:
+        endpoint, status, content = auth_failures[-1]
+        logger.error(
+            "[MAIN DATABASE] abort: token was obtained but rejected by kabu API endpoint=%s status=%s content=%s. "
+            "Please restart kabu Station, enable API, and confirm settings.ini apipassword matches kabu Station.",
+            endpoint,
+            status,
+            _safe_content_text(content),
+        )
+    elif transport_failures:
+        endpoint, _status, content = transport_failures[-1]
+        logger.error(
+            "[MAIN DATABASE] abort: kabu API preflight could not connect endpoint=%s error=%s. "
+            "Please confirm kabu Station API is running on localhost:18080.",
+            endpoint,
+            _safe_content_text(content),
+        )
+    else:
+        logger.error("[MAIN DATABASE] abort: kabu token preflight failed for unknown reason")
+    return False
+
+
 def _bootstrap_kabu_token_for_data_collectors() -> bool:
     _ensure_basic_logging()
 
@@ -178,7 +328,6 @@ def _bootstrap_kabu_token_for_data_collectors() -> bool:
                 "[MAIN DATABASE] token bootstrap failed: settings.ini apipassword missing"
             )
             return False
-
         from token_manager import refresh_token, get_valid_token
 
         token = refresh_token(api_password)
@@ -192,6 +341,12 @@ def _bootstrap_kabu_token_for_data_collectors() -> bool:
         except Exception:
             pass
 
+        if not _preflight_kabu_token(str(token)):
+            logger.error(
+                "[MAIN DATABASE] token bootstrap failed: preflight rejected token; children will not start"
+            )
+            return False
+
         try:
             from global_state import global_data
             global_data.token_value = token
@@ -199,7 +354,7 @@ def _bootstrap_kabu_token_for_data_collectors() -> bool:
             logger.debug("[MAIN DATABASE] global_data.token_value set skipped", exc_info=True)
 
         logger.info(
-            "[MAIN DATABASE] kabu token refreshed for data collectors token_len=%s",
+            "[MAIN DATABASE] kabu token refreshed and preflight passed for data collectors token_len=%s",
             len(str(token)),
         )
         return True
@@ -236,8 +391,8 @@ def main() -> int:
 
     if not _bootstrap_kabu_token_for_data_collectors():
         logger.error(
-            "[MAIN DATABASE] abort because token bootstrap failed. "
-            "Please confirm kabu Station is running and API password is correct."
+            "[MAIN DATABASE] abort because token bootstrap/preflight failed. "
+            "Please confirm kabu Station is running, API is enabled, and API password is correct."
         )
         return 1
 
