@@ -1,12 +1,13 @@
 # ============================================================
-# token_manager.py（Ver30-PARENT-ONLY-TOKEN-REFRESH）
+# token_manager.py（Ver31-PARENT-REFRESH-TTL-GUARD）
 # ------------------------------------------------------------
 # ・API認証設定は settings.ini に集約する
 # ・token 保存も settings.ini または config/settings.ini にだけ行う
 # ・/token 呼び出しは原則 main.py / main_database.py の親プロセスだけ許可する
 # ・push_receiver / ranking_collector / summary_database / yahoo_complement / db_prepare 等の
 #   子プロセスでは /token を呼ばず、settings.ini の token を読むだけにする
-# ・子プロセスが後から /token を呼んで PUSH 用 token を失効させる事故を防ぐ
+# ・親プロセス同士でも短時間に /token を再発行しない
+# ・別親プロセスが後から /token を呼んで既存子プロセスの token を失効させる事故を防ぐ
 # ============================================================
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import json
 import logging
 import os
 import sys
+import time
 import urllib.request
 from configparser import ConfigParser
 from pathlib import Path
@@ -52,6 +54,16 @@ def _env_bool(name: str, default: bool = False) -> bool:
         return bool(default)
     except Exception:
         return bool(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).strip().replace(",", ""))
+    except Exception:
+        return float(default)
 
 
 def _argv_text() -> str:
@@ -203,6 +215,16 @@ def _resolve_apipassword(conf: ConfigParser, sec: str | None, apipassword=None) 
     return None
 
 
+def _settings_file_age_sec() -> float | None:
+    try:
+        path = _CONFIG_FILE_PATH or CONFIG_PATH
+        if not path:
+            return None
+        return max(0.0, time.time() - os.path.getmtime(path))
+    except Exception:
+        return None
+
+
 def _save_token(token) -> bool:
     conf = _load_settings()
     sec = _get_section(conf)
@@ -264,10 +286,11 @@ def get_valid_token():
 
 
 def refresh_token(apipassword=None):
-    """Refresh token only in the parent process.
+    """Refresh token only when it is safe to issue a new kabu Station token.
 
-    Child runners must not call /token because later /token calls can invalidate the
-    token that push_receiver is using for /register and /unregister/all.
+    Child runners must not call /token.  Parent processes also avoid issuing a new
+    token when settings.ini was updated recently, because a second parent started a
+    few minutes later can invalidate the token used by already-running children.
     """
     global API_TOKEN, API_PASSWORD
 
@@ -291,6 +314,29 @@ def refresh_token(apipassword=None):
 
     conf = _load_settings()
     sec = _get_section(conf)
+    if not sec:
+        existing, tried = _diagnostic(conf)
+        raise ValueError(
+            "settings.ini に [aukabu] または [kabusapi] がありません。"
+            f" path={_CONFIG_FILE_PATH} existing={existing} tried={tried}"
+        )
+
+    existing_token = str(conf.get(sec, "token", fallback="") or "").strip()
+    ttl_sec = max(0.0, _env_float("KABU_TOKEN_PARENT_REFRESH_TTL_SEC", 3600.0))
+    age_sec = _settings_file_age_sec()
+    force_parent_refresh = _env_bool("KABU_TOKEN_FORCE_PARENT_REFRESH", False) or _env_bool("KABU_TOKEN_FORCE_REFRESH", False)
+
+    if existing_token and not force_parent_refresh and ttl_sec > 0 and age_sec is not None and age_sec <= ttl_sec:
+        token = _publish_token(existing_token)
+        logger.warning(
+            "[TOKEN MANAGER] parent refresh skipped by ttl; using recent settings.ini token token_len=%d age=%.1fs ttl=%.1fs argv=%s",
+            len(str(token or "")),
+            age_sec,
+            ttl_sec,
+            _argv_text(),
+        )
+        return token
+
     api_password = _resolve_apipassword(conf, sec, apipassword)
 
     if not api_password:
