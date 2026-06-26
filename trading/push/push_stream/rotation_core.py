@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/rotation_core.py
-# Version: PRODUCTION-STABLE-REV7-PUSH-VENDOR-SAFE-ROTATION-CORE
+# Version: PRODUCTION-STABLE-REV8-PUSH-ROTATION-BACKOFF-KEEP-WS
 # ------------------------------------------------------------
 # PUSH登録制限50銘柄に対して、毎ターン固定銘柄を入れつつ、
 # 残り枠をA/Bでローテーションする。
@@ -8,15 +8,11 @@
 #   Aターン: 固定15 + A可変35
 #   Bターン: 固定15 + B可変35
 #
-# User design:
-#   A register -> hold -> unregister_all -> wait -> B register
-#   B register -> hold -> unregister_all -> wait -> A register
-#
-# REV7:
-#   - Former startup-patch behavior integrated into core.
-#   - Each rotation side now does:
-#       close_ws -> REST unregister_all/register -> wait_ws_ready -> 4.8s hold
-#   - fixed=0 fallback from targets remains built in.
+# REV8:
+#   - REST register/unregister failure no longer retries every second.
+#   - Failure triggers configurable backoff so PUSH DB receiving is prioritized.
+#   - WebSocket is kept alive by default before REST registration.
+#     Set PUSH_ROTATION_CLOSE_WS_BEFORE_REGISTER=1 to restore old close-before-register behavior.
 # ============================================================
 
 from __future__ import annotations
@@ -45,7 +41,7 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
-VERSION = "PRODUCTION-STABLE-REV7-PUSH-VENDOR-SAFE-ROTATION-CORE"
+VERSION = "PRODUCTION-STABLE-REV8-PUSH-ROTATION-BACKOFF-KEEP-WS"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -126,17 +122,6 @@ def _rotation_slot_sizes() -> tuple[int, int]:
 
 
 def _build_protected_rotation_batches(targets: list[str]) -> tuple[list[str], list[str], list[str]]:
-    """
-    50銘柄制限内で、固定枠 + 可変枠を作る。
-
-    例: chunk=50, fixed=15, variable=35
-      A = fixed15 + normal[0:35]
-      B = fixed15 + normal[35:70]
-
-    protected が空の場合:
-      - targets先頭から固定枠を作る。
-      - これにより fixed=0 / A=50 / B=50 ではなく、固定15 + 可変35になる。
-    """
     targets = _dedupe([str(x).strip().upper() for x in targets])
     protected_all = _resolve_protected_safe()
     fixed_slots, variable_slots = _rotation_slot_sizes()
@@ -231,7 +216,14 @@ def _wait_ws_ready_after_register(label: str) -> bool:
 
 
 def _close_ws_before_register(label: str) -> None:
-    if not _env_bool("PUSH_ROTATION_CLOSE_WS_BEFORE_REGISTER", True):
+    # With kabu Station auth instability, closing a live websocket before a REST
+    # unregister/register attempt can destroy the only working PUSH feed.  Keep WS
+    # alive by default; allow old behavior only by explicit env opt-in.
+    if not _env_bool("PUSH_ROTATION_CLOSE_WS_BEFORE_REGISTER", False):
+        logger.info(
+            "[push_stream] rotation %s keep WS before REST register by env PUSH_ROTATION_CLOSE_WS_BEFORE_REGISTER=0",
+            label,
+        )
         return
 
     ws_app: Any = None
@@ -269,7 +261,15 @@ def _close_ws_before_register(label: str) -> None:
         time.sleep(settle)
 
 
-def _run_rotation_side(*, label: str, symbols: list[str]) -> bool:
+def _rotation_failure_backoff_seconds(failure_count: int) -> float:
+    base = max(0.0, _env_float("PUSH_ROTATION_FAILURE_BACKOFF_SEC", 180.0))
+    max_sec = max(base, _env_float("PUSH_ROTATION_FAILURE_BACKOFF_MAX_SEC", 600.0))
+    multiplier = max(1.0, _env_float("PUSH_ROTATION_FAILURE_BACKOFF_MULTIPLIER", 1.5))
+    n = max(0, int(failure_count) - 1)
+    return min(max_sec, base * (multiplier ** n))
+
+
+def _run_rotation_side(*, label: str, symbols: list[str], failure_count: int = 0) -> bool:
     if state._stop_event.is_set():
         return False
     if not symbols:
@@ -283,8 +283,9 @@ def _run_rotation_side(*, label: str, symbols: list[str]) -> bool:
     try:
         setattr(state, "_rotation_register_in_progress", True)
         logger.warning(
-            "[push_stream] rotation %s vendor-safe cycle core-v7: close_ws -> REST unregister/register -> wait_ws_ready -> hold",
+            "[push_stream] rotation %s guarded cycle rev8: keep_ws_default -> REST unregister/register -> wait_ws_ready -> hold failure_count=%d",
             label,
+            failure_count,
         )
         _close_ws_before_register(label)
         ok = run_one_batch_with_timeout(label=label, symbols=symbols, timeout_sec=REGISTER_TIMEOUT_SEC)
@@ -295,12 +296,17 @@ def _run_rotation_side(*, label: str, symbols: list[str]) -> bool:
             pass
 
     if not ok:
+        backoff = _rotation_failure_backoff_seconds(failure_count)
         logger.warning(
-            "[push_stream] rotation %s register failed -> retry same side without switching size=%d",
+            "[push_stream] rotation %s register failed -> backoff %.1fs and keep same side size=%d failure_count=%d ws_alive=%s connected_event=%s",
             label,
+            backoff,
             len(symbols),
+            failure_count,
+            _is_ws_alive(),
+            state._connected_event.is_set(),
         )
-        _sleep_or_stop(1.0)
+        _sleep_or_stop(backoff)
         return False
 
     if not _wait_ws_ready_after_register(label):
@@ -325,19 +331,21 @@ def _run_rotation_side(*, label: str, symbols: list[str]) -> bool:
 def _rotation_worker() -> None:
     fixed_slots, variable_slots = _rotation_slot_sizes()
     logger.info(
-        "[push_stream] rotation worker started version=%s hold=%.3fs register_timeout=%.3fs chunk=%d fixed_slots=%d variable_slots=%d vendor_safe_core=True",
+        "[push_stream] rotation worker started version=%s hold=%.3fs register_timeout=%.3fs chunk=%d fixed_slots=%d variable_slots=%d keep_ws_default=True failure_backoff=%.1fs",
         VERSION,
         ROTATE_HOLD_SEC,
         REGISTER_TIMEOUT_SEC,
         DEFAULT_REGISTER_CHUNK_SIZE,
         fixed_slots,
         variable_slots,
+        _rotation_failure_backoff_seconds(1),
     )
 
     empty_count = 0
     ws_wait_count = 0
     last_ws_wait_log_ts = 0.0
     next_label = "A"
+    failure_count = 0
 
     while not state._stop_event.is_set():
         try:
@@ -345,7 +353,6 @@ def _rotation_worker() -> None:
                 time.sleep(1.0)
                 continue
 
-            # 初回だけはWS接続を待つ。各turnでは close_ws -> REST register -> reconnect を使う。
             if not state._connected_event.is_set() or not _is_ws_alive():
                 ws_wait_count += 1
                 last_ws_wait_log_ts = _log_ws_not_ready_if_needed(
@@ -367,7 +374,7 @@ def _rotation_worker() -> None:
             empty_count = 0
             first, second, fixed = _build_protected_rotation_batches(list(targets))
             logger.info(
-                "[push_stream] rotation cycle targets=%d fixed=%d first=%d second=%d next=%s headA=%s headB=%s refresh_callable=%s ws_ready=%s",
+                "[push_stream] rotation cycle targets=%d fixed=%d first=%d second=%d next=%s headA=%s headB=%s refresh_callable=%s ws_ready=%s failure_count=%d",
                 len(targets),
                 len(fixed),
                 len(first),
@@ -377,15 +384,26 @@ def _rotation_worker() -> None:
                 second[:10],
                 callable(state._refresh_callable),
                 bool(state._connected_event.is_set() and _is_ws_alive()),
+                failure_count,
             )
 
             if next_label == "A" or not second:
-                ok = _run_rotation_side(label="A", symbols=list(first))
-                next_label = "B" if ok and second else "A"
+                ok = _run_rotation_side(label="A", symbols=list(first), failure_count=failure_count + 1)
+                if ok:
+                    failure_count = 0
+                    next_label = "B" if second else "A"
+                else:
+                    failure_count += 1
+                    next_label = "A"
                 continue
 
-            ok = _run_rotation_side(label="B", symbols=list(second))
-            next_label = "A" if ok else "B"
+            ok = _run_rotation_side(label="B", symbols=list(second), failure_count=failure_count + 1)
+            if ok:
+                failure_count = 0
+                next_label = "A"
+            else:
+                failure_count += 1
+                next_label = "B"
 
         except Exception:
             logger.exception("[push_stream] rotation worker loop failed; continue")
