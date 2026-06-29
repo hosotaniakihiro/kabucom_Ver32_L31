@@ -1,33 +1,35 @@
 # ============================================================
 # File   : core/startup/summary_ai_async_entry_patch.py
-# Version: Ver08-RETRY-NO-ORDER-PIPELINE-BUSY
+# Version: Ver09-SNAPSHOT-DIRECT-ORDER
 # ------------------------------------------------------------
 # Purpose:
-#   SUMMARY AI の実発注で direct sync が 200秒超ブロックし、
-#   summary parent / display / entry_controller lock を詰まらせる問題を防ぐ。
+#   SUMMARY AI の実発注を非同期化しつつ、pending がサイクル中に
+#   入れ替わって注文が空振りする問題を防ぐ。
 #
-# Ver08:
-#   - worker実行結果が entry_controller_lock_timeout だけでなく、
-#     entry_controller_no_order / entry_pipeline_no_order / already_running 系でも
-#     同じ approved を短時間リトライする。
-#   - RANKING pipeline が一瞬先に entry_controller を握った場合でも、
-#     Summary AI の承認済み候補を捨てずに注文化を再試行する。
-#   - stale既定を90秒へ延長し、15時台の重いサマリー処理でもリトライ猶予を確保。
+# Ver09:
+#   - summary_entry.execute_entry_pipeline を runtime patch し、
+#     SUMMARY_AI で登録した entries のスナップショットを直接発注評価する。
+#   - entry_controller が global pending_root を再スキャンする前提を避け、
+#     pending_moved_without_order / entry_controller_no_order の空振りを減らす。
+#   - 既存の async queue / retry は維持。
 # ============================================================
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import os
 import threading
 import time
-from collections import deque
+from collections import deque, defaultdict
+from copy import deepcopy
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 _INSTALLED = False
 _ORIG_EXECUTE = None
+_ORIG_SUMMARY_ENTRY_PIPELINE = None
 _ASYNC_LOCK = threading.Lock()
 _QUEUE: deque[dict[str, Any]] = deque()
 _WORKER_RUNNING = False
@@ -41,6 +43,10 @@ os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", "90")
 os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY", "1")
 os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX", "8")
 os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_SLEEP_SEC", "2.0")
+os.environ.setdefault("SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT", "1")
+
+_TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+_FALSE = {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -49,9 +55,9 @@ def _env_bool(name: str, default: bool = True) -> bool:
         if v is None or str(v).strip() == "":
             return bool(default)
         s = str(v).strip().lower()
-        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+        if s in _TRUE:
             return True
-        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
+        if s in _FALSE:
             return False
         return bool(default)
     except Exception:
@@ -101,7 +107,7 @@ def _symbols(rows: Any, limit: int = 20) -> list[str]:
 def _unwrap_result(result: Any) -> Any:
     cur = result
     try:
-        for _ in range(8):
+        for _ in range(10):
             if isinstance(cur, dict) and isinstance(cur.get("result"), dict):
                 cur = cur.get("result")
                 continue
@@ -115,14 +121,14 @@ def _skip_reason(result: Any) -> str:
     try:
         reasons: list[str] = []
         cur = result
-        for _ in range(10):
+        for _ in range(12):
             if not isinstance(cur, dict):
                 break
             for k in ("skip_reason", "lock_wait_reason", "reason", "status"):
                 r = cur.get(k)
                 if r:
                     reasons.append(str(r))
-            nxt = cur.get("result")
+            nxt = cur.get("result") or cur.get("pipeline_result")
             if not isinstance(nxt, dict):
                 break
             cur = nxt
@@ -134,13 +140,13 @@ def _skip_reason(result: Any) -> str:
 def _pending_counts(result: Any) -> tuple[int, int]:
     try:
         cur = result
-        for _ in range(8):
+        for _ in range(10):
             if isinstance(cur, dict):
                 before = cur.get("pending_count_before")
                 after = cur.get("pending_count_after")
                 if before is not None or after is not None:
                     return int(before or 0), int(after or 0)
-                cur = cur.get("result")
+                cur = cur.get("result") or cur.get("pipeline_result")
                 continue
             break
     except Exception:
@@ -154,21 +160,24 @@ def _is_retryable_controller_busy(result: Any) -> bool:
         unwrapped = _unwrap_result(result)
         retryable = bool(unwrapped.get("retryable")) if isinstance(unwrapped, dict) else False
         before, after = _pending_counts(result)
-        busy_markers = (
+        retry_markers = (
             "lock_timeout",
             "entry_controller_lock_timeout",
             "entry_controller_no_order",
             "entry_controller_no_order_after_retry",
             "entry_pipeline_no_order",
+            "summary_entry_executor_no_order",
+            "pending_moved_without_order",
+            "snapshot_no_order",
+            "order_id_empty_retryable",
             "already_running",
             "queued_async",
             "pipeline_busy",
         )
         if retryable:
             return True
-        if any(x in text for x in busy_markers):
+        if any(x in text for x in retry_markers):
             return True
-        # pending が残っていて executed=False の場合は、注文化できなかっただけなので再試行対象。
         if isinstance(result, dict) and not bool(result.get("executed")) and (before > 0 or after > 0):
             return True
         return False
@@ -214,6 +223,288 @@ def _build_approved_rows(ai_results: Any, max_entries: int) -> list[Any]:
     except Exception:
         logger.exception("[SUMMARY AI ASYNC ENTRY] build approved rows failed")
     return []
+
+
+def _norm_symbol(v: Any) -> str:
+    try:
+        s = str(v or "").strip()
+        if s.endswith(".0") and s[:-2].isdigit():
+            return s[:-2]
+        return s
+    except Exception:
+        return ""
+
+
+def _entries_to_list(entries: Any) -> list[dict[str, Any]]:
+    try:
+        from trading.summary import summary_entry as se
+        fn = getattr(se, "normalize_approved_rows", None)
+        if callable(fn):
+            rows = fn(entries)
+        else:
+            rows = list(entries or []) if isinstance(entries, (list, tuple)) else ([entries] if isinstance(entries, dict) else [])
+        out: list[dict[str, Any]] = []
+        for r in rows or []:
+            if isinstance(r, dict):
+                d = dict(r)
+                sym = _norm_symbol(d.get("symbol"))
+                if sym:
+                    d["symbol"] = sym
+                    out.append(d)
+        return out
+    except Exception:
+        logger.exception("[SUMMARY AI DIRECT SNAPSHOT] entries normalize failed")
+        return []
+
+
+def _build_boost_active(ec: Any) -> bool:
+    try:
+        gd = getattr(ec, "global_data")
+        regime = getattr(gd, "current_regime", 0)
+        drawdown = getattr(gd, "current_drawdown", 0.0)
+        collapse_prob = getattr(gd, "collapse_prob", 0.0)
+        consecutive_losses = getattr(gd, "consecutive_losses", 0)
+        win_rate = getattr(gd, "recent_win_rate", 0.5)
+        boost_active = bool(ec.boost_engine.update(
+            win_rate=win_rate,
+            regime=regime,
+            drawdown=drawdown,
+            collapse_prob=collapse_prob,
+            consecutive_losses=consecutive_losses,
+            regime_changed=getattr(gd, "regime_changed", False),
+        ))
+        try:
+            ec.boost_monitor.update(
+                active=boost_active,
+                win_rate=win_rate,
+                drawdown=drawdown,
+                collapse_prob=collapse_prob,
+                regime=regime,
+            )
+        except Exception:
+            logger.debug("[SUMMARY AI DIRECT SNAPSHOT] boost monitor update failed", exc_info=True)
+        return boost_active
+    except Exception:
+        logger.exception("[SUMMARY AI DIRECT SNAPSHOT] boost update failed; fallback inactive")
+        return False
+
+
+def _summary_ai_direct_snapshot_execute(entries: Any, *, pipeline_source: str | None = None, interval: int | None = None) -> dict[str, Any]:
+    rows = _entries_to_list(entries)
+    if not rows:
+        return {"executed": False, "entries": 0, "skip_reason": "no_entries", "result": None}
+
+    try:
+        import trading.handlers.entry_controller as ec
+        from trading.entry.pending_manager import pop_entry, snapshot_root
+    except Exception:
+        logger.exception("[SUMMARY AI DIRECT SNAPSHOT] import entry_controller failed")
+        if callable(_ORIG_SUMMARY_ENTRY_PIPELINE):
+            return _ORIG_SUMMARY_ENTRY_PIPELINE(entries, pipeline_source=pipeline_source, interval=interval)
+        return {"executed": False, "entries": len(rows), "skip_reason": "entry_controller_import_failed", "result": None, "retryable": True}
+
+    if not _env_bool("SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT", True):
+        if callable(_ORIG_SUMMARY_ENTRY_PIPELINE):
+            return _ORIG_SUMMARY_ENTRY_PIPELINE(entries, pipeline_source=pipeline_source, interval=interval)
+        return {"executed": False, "entries": len(rows), "skip_reason": "direct_snapshot_disabled_no_original", "result": None}
+
+    lock = getattr(ec, "_pipeline_lock", None)
+    acquired = False
+    try:
+        if lock is not None:
+            acquired = bool(lock.acquire(blocking=False))
+            if not acquired:
+                logger.warning("[SUMMARY AI DIRECT SNAPSHOT] entry_controller lock busy entries=%s symbols=%s", len(rows), _symbols(rows))
+                return {
+                    "executed": False,
+                    "entries": len(rows),
+                    "skip_reason": "entry_controller_lock_timeout",
+                    "retryable": True,
+                    "result": None,
+                    "pending_root": snapshot_root(),
+                }
+
+        try:
+            market_open = bool(ec.is_market_open()) and bool(ec._is_trading_hours())
+        except Exception:
+            market_open = True
+        if not market_open:
+            return {"executed": False, "entries": len(rows), "skip_reason": "market_closed", "result": None}
+
+        if pipeline_source:
+            pipeline_source = ec._normalize_source(pipeline_source)
+        if interval is not None:
+            interval = ec._normalize_interval(interval)
+
+        if pipeline_source and pipeline_source not in getattr(ec, "PIPELINE_SOURCE", set()):
+            return {"executed": False, "entries": len(rows), "skip_reason": "invalid_pipeline_source", "result": None}
+
+        if ec._api_rate_limited():
+            return {"executed": False, "entries": len(rows), "skip_reason": "api_rate_limit", "retryable": True, "result": None}
+        if not ec.ai_health_ok():
+            return {"executed": False, "entries": len(rows), "skip_reason": "ai_health_ng", "result": None}
+        if not ec.risk_ok():
+            return {"executed": False, "entries": len(rows), "skip_reason": "risk_guard_ng", "result": None}
+        if ec.detect_index_shock() != 0:
+            return {"executed": False, "entries": len(rows), "skip_reason": "index_shock", "result": None}
+        if not ec.allow_entry_by_market(
+            now=dt.datetime.now(),
+            nikkei_velocity=getattr(ec.global_data, "nikkei_velocity", None),
+            api_429_count=getattr(ec.global_data, "api_429_count", 0),
+            board_update_delay_sec=getattr(ec.global_data, "board_delay_sec", None),
+        ):
+            return {"executed": False, "entries": len(rows), "skip_reason": "market_guard_ng", "result": None}
+
+        ec.reset_entry_lock()
+        boost_active = _build_boost_active(ec)
+        open_position_symbols = ec._normalize_open_positions(getattr(ec.global_data, "open_positions", None))
+
+        by_symbol: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            sym = _norm_symbol(row.get("symbol"))
+            if sym:
+                row["symbol"] = sym
+                by_symbol[sym].append(row)
+
+        global_scored_candidates: list[dict[str, Any]] = []
+        for symbol, bucket in by_symbol.items():
+            try:
+                scored = ec._build_scored_candidates(
+                    symbol=symbol,
+                    entries=sorted(
+                        bucket,
+                        key=lambda e: (
+                            ec.ENTRY_TYPE_PRIORITY.get(e.get("entry_type"), 0),
+                            ec._safe_float(e.get("score"), 0.0),
+                            e.get("created_at") or dt.datetime.min,
+                        ),
+                        reverse=True,
+                    ),
+                    open_position_symbols=open_position_symbols,
+                    boost_active=boost_active,
+                    pipeline_source=pipeline_source,
+                    interval=interval,
+                )
+                if scored:
+                    global_scored_candidates.extend(scored)
+            except Exception:
+                logger.exception("[SUMMARY AI DIRECT SNAPSHOT] candidate build failed symbol=%s", symbol)
+
+        if not global_scored_candidates:
+            logger.info("[SUMMARY AI DIRECT SNAPSHOT] no candidates after evaluation entries=%s root=%s", len(rows), snapshot_root())
+            return {
+                "executed": False,
+                "entries": len(rows),
+                "approved_count": 0,
+                "skip_reason": "snapshot_no_ai_approved_candidates",
+                "retryable": True,
+                "result": None,
+                "pending_root": snapshot_root(),
+            }
+
+        global_scored_candidates.sort(
+            key=lambda x: (x.get("priority_score", 0.0), x.get("confidence", 0.0)),
+            reverse=True,
+        )
+
+        max_per_run = int(getattr(ec, "MAX_APPROVED_PER_RUN", 3) or 3)
+        approved_count = 0
+        attempted_count = 0
+        executed_symbols: set[str] = set()
+        order_results: list[dict[str, Any]] = []
+
+        logger.warning(
+            "[SUMMARY AI DIRECT SNAPSHOT] ranked total=%s top=%s pipeline_source=%s interval=%s",
+            len(global_scored_candidates),
+            [
+                {
+                    "symbol": x.get("symbol"),
+                    "side": x.get("side"),
+                    "priority": round(ec._safe_float(x.get("priority_score"), 0.0), 4),
+                    "conf": round(ec._safe_float(x.get("confidence"), 0.0), 4),
+                }
+                for x in global_scored_candidates[:10]
+            ],
+            pipeline_source,
+            interval,
+        )
+
+        for item in global_scored_candidates:
+            if approved_count >= max_per_run:
+                break
+            symbol = item.get("symbol")
+            side = item.get("side")
+            entry = item.get("entry")
+            if not symbol or symbol in executed_symbols:
+                continue
+            if symbol in open_position_symbols:
+                continue
+            if ec._is_symbol_trade_restricted(symbol):
+                continue
+            if not ec.lock_symbol(symbol):
+                continue
+            attempted_count += 1
+            ok = bool(ec._execute_best_candidate(item, boost_active=boost_active))
+            order_results.append({"symbol": symbol, "side": side, "ok": ok})
+            if not ok:
+                continue
+            approved_count += 1
+            executed_symbols.add(symbol)
+            try:
+                pop_entry(symbol, entry)
+            except Exception:
+                logger.exception("[SUMMARY AI DIRECT SNAPSHOT] pop_entry failed symbol=%s", symbol)
+
+        executed = approved_count > 0
+        out = {
+            "executed": executed,
+            "entries": len(rows),
+            "approved_count": approved_count,
+            "attempted_count": attempted_count,
+            "result": order_results,
+            "pipeline_source": pipeline_source,
+            "interval": interval,
+            "skip_reason": None if executed else "snapshot_no_order",
+            "retryable": not executed,
+            "pending_root": snapshot_root(),
+        }
+        logger.warning("[SUMMARY AI DIRECT SNAPSHOT] done %s", out)
+        return out
+    except Exception as e:
+        logger.exception("[SUMMARY AI DIRECT SNAPSHOT] failed err=%s", e)
+        return {"executed": False, "entries": len(rows), "skip_reason": "snapshot_entry_exception", "error": str(e), "retryable": True}
+    finally:
+        try:
+            if acquired and lock is not None:
+                lock.release()
+        except Exception:
+            logger.debug("[SUMMARY AI DIRECT SNAPSHOT] lock release failed", exc_info=True)
+
+
+def _install_summary_entry_snapshot_patch() -> bool:
+    global _ORIG_SUMMARY_ENTRY_PIPELINE
+    try:
+        from trading.summary import summary_entry as se
+        current = getattr(se, "execute_entry_pipeline", None)
+        if getattr(current, "_summary_ai_direct_snapshot_v9", False):
+            logger.warning("[SUMMARY AI DIRECT SNAPSHOT] already installed v9")
+            return True
+        _ORIG_SUMMARY_ENTRY_PIPELINE = getattr(current, "_original", None) or current
+        if not callable(_ORIG_SUMMARY_ENTRY_PIPELINE):
+            logger.warning("[SUMMARY AI DIRECT SNAPSHOT] original summary entry pipeline missing")
+            return False
+
+        def _patched_execute_entry_pipeline(entries, *, pipeline_source: str | None = None, interval: int | None = None):
+            return _summary_ai_direct_snapshot_execute(entries, pipeline_source=pipeline_source, interval=interval)
+
+        _patched_execute_entry_pipeline._summary_ai_direct_snapshot_v9 = True  # type: ignore[attr-defined]
+        _patched_execute_entry_pipeline._original = _ORIG_SUMMARY_ENTRY_PIPELINE  # type: ignore[attr-defined]
+        se.execute_entry_pipeline = _patched_execute_entry_pipeline
+        logger.warning("[SUMMARY AI DIRECT SNAPSHOT] installed v9 enabled=%s", _env_bool("SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT", True))
+        return True
+    except Exception:
+        logger.exception("[SUMMARY AI DIRECT SNAPSHOT] install failed")
+        return False
 
 
 def _execute_original(item: dict[str, Any]) -> Any:
@@ -306,7 +597,7 @@ def _run_worker_loop() -> None:
                 seq, interval, time.time() - started, _summarize_result(result),
             )
         except Exception as e:
-            logger.exception("[SUMMARY AI ASYNC ENTRY] worker failed seq=%s interval=%s err=%s", seq, interval, e)
+            logger.exception("[SUMMARY AI ASYNC ENTRY] worker failed seq=%s err=%s", seq, e)
 
 
 def _ensure_worker_started() -> None:
@@ -396,7 +687,7 @@ def _patched_execute_ai_ok_entries_bulk(
     if dropped:
         logger.warning("[SUMMARY AI ASYNC ENTRY] queued latest and dropped old count=%s seq=%s interval=%s", dropped, seq, interval)
     logger.warning(
-        "[SUMMARY AI ASYNC ENTRY] queued seq=%s interval=%s approved=%s symbols=%s queue_size=%s stale_sec=%.3f direct_sync=False executed=False submitted_async=True retry_busy=%s retry_max=%s retry_sleep=%.2f",
+        "[SUMMARY AI ASYNC ENTRY] queued seq=%s interval=%s approved=%s symbols=%s queue_size=%s stale_sec=%.3f direct_sync=False executed=False submitted_async=True retry_busy=%s retry_max=%s retry_sleep=%.2f snapshot_direct=%s",
         seq,
         interval,
         len(approved_rows),
@@ -406,6 +697,7 @@ def _patched_execute_ai_ok_entries_bulk(
         _env_bool("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY", True),
         _env_int("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX", 8),
         _env_float("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_SLEEP_SEC", 2.0),
+        _env_bool("SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT", True),
     )
     return {
         "executed": False,
@@ -434,18 +726,21 @@ def install() -> bool:
         if _env_int("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX", 8) < 8:
             os.environ["SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX"] = "8"
 
+        _install_summary_entry_snapshot_patch()
+
         from trading.entry.summary_ai import executor as exec_mod
         from trading.entry.summary_ai import runner as runner_mod
 
         current = getattr(exec_mod, "execute_ai_ok_entries_bulk", None)
-        if getattr(current, "_summary_ai_async_entry_patch_v8", False):
+        if getattr(current, "_summary_ai_async_entry_patch_v9", False):
             _INSTALLED = True
-            logger.warning("[SUMMARY AI ASYNC ENTRY] already installed v8")
+            logger.warning("[SUMMARY AI ASYNC ENTRY] already installed v9")
             return True
-        _ORIG_EXECUTE = getattr(current, "_original", None) if getattr(current, "_summary_ai_async_entry_patch_v7", False) else current
+        _ORIG_EXECUTE = getattr(current, "_original", None) if getattr(current, "_summary_ai_async_entry_patch_v8", False) else current
         if not callable(_ORIG_EXECUTE):
             _ORIG_EXECUTE = current
 
+        _patched_execute_ai_ok_entries_bulk._summary_ai_async_entry_patch_v9 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_async_entry_patch_v8 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_async_entry_patch_v7 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._original = _ORIG_EXECUTE  # type: ignore[attr-defined]
@@ -454,7 +749,7 @@ def install() -> bool:
 
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY AI ASYNC ENTRY] installed v8 enabled=%s direct_sync=%s queue_max=%s stale_sec=%.3f latest_only=True queued_is_not_executed=True retry_busy=%s retry_max=%s retry_sleep=%.2f",
+            "[SUMMARY AI ASYNC ENTRY] installed v9 enabled=%s direct_sync=%s queue_max=%s stale_sec=%.3f latest_only=True queued_is_not_executed=True retry_busy=%s retry_max=%s retry_sleep=%.2f snapshot_direct=%s",
             _env_bool("SUMMARY_AI_ASYNC_ENTRY", True),
             _env_bool("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC", False),
             _env_int("SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX", 1),
@@ -462,6 +757,7 @@ def install() -> bool:
             _env_bool("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY", True),
             _env_int("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX", 8),
             _env_float("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_SLEEP_SEC", 2.0),
+            _env_bool("SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT", True),
         )
         return True
     except Exception as e:
