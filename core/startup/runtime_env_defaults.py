@@ -16,14 +16,13 @@ from __future__ import annotations
 import os
 from typing import Dict, Mapping, MutableMapping, Optional
 
-VERSION = "REV5-RUNTIME-ENV-DEFAULTS-PUSH-KEEP-WS-BACKOFF"
+VERSION = "REV6-RUNTIME-ENV-DEFAULTS-SUMMARY-PRICE-CAP"
 
 _TRUE = {"1", "true", "yes", "on", "y"}
 _FALSE = {"0", "false", "no", "off", "n", ""}
 
 
 def env_bool(name: str, default: bool = False) -> bool:
-    """Return a tolerant boolean value from os.environ."""
     raw = os.environ.get(name)
     if raw is None:
         return bool(default)
@@ -36,7 +35,6 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 
 def _set_defaults(defaults: Mapping[str, str], *, environ: Optional[MutableMapping[str, str]] = None) -> Dict[str, str]:
-    """Set missing environment variables and return keys that were filled."""
     env = environ if environ is not None else os.environ
     applied: Dict[str, str] = {}
     for key, value in defaults.items():
@@ -46,13 +44,9 @@ def _set_defaults(defaults: Mapping[str, str], *, environ: Optional[MutableMappi
     return applied
 
 
-# PUSH core-integrated defaults. These reflect the mainline PUSH rotation
-# implementation and keep old monkey-patch shims off by default.
 PUSH_DEFAULTS: Dict[str, str] = {
     "PUSH_WS_VENDOR_RUN_FOREVER": "1",
     "PUSH_WS_ENABLE_PING": "0",
-    # Keep a live websocket by default.  When REST unregister/register is rejected
-    # by kabu Station, closing WS first destroys the only working PUSH feed.
     "PUSH_ROTATION_CLOSE_BEFORE_REGISTER": "0",
     "PUSH_ROTATION_CLOSE_WS_BEFORE_REGISTER": "0",
     "PUSH_ROTATION_REGISTER_WITH_WS_CLOSED": "0",
@@ -85,19 +79,13 @@ PUSH_DEFAULTS: Dict[str, str] = {
     "PUSH_STREAM_SINGLE_OWNER_LOG_EVERY_SEC": "20.0",
     "PUSH_STREAM_EMPTY_OWNER_LOCK_FAIL_OPEN": "1",
     "PUSH_STREAM_EMPTY_OWNER_LOCK_REQUIRE_OWNER_CONTEXT": "1",
-    # 寄前SBIは価格列が無いことが多い。価格が分かるものだけ価格帯チェックし、
-    # 価格不明はPUSH登録直前のランキングDB流動性ガードへ渡す。
     "ACTIVE_PREMARKET_ALLOW_NO_PRICE": "1",
-    # 低流動性銘柄を残しすぎない。A/B 100件固定を優先しすぎると薄商いも戻るため、
-    # PUSH登録直前では最低50件まで縮退を許可する。
     "PUSH_REGISTER_LIQUIDITY_ROTATION_PRESERVE_FULL_POOL": "0",
     "PUSH_REGISTER_LIQUIDITY_ROTATION_MIN_SURVIVOR_COUNT": "50",
     "PUSH_REGISTER_LIQUIDITY_ROTATION_MIN_SURVIVOR_RATIO": "0.50",
     "USERCUSTOMIZE_ENABLE_LEGACY_PUSH_PATCHES": "0",
 }
 
-# Rescue/fail-open defaults. Safety-first: normal operation uses mainline
-# checks; rescue layers are opt-in via explicit environment variables.
 RESCUE_DEFAULTS: Dict[str, str] = {
     "SITECUSTOMIZE_ENABLE_RESCUE_PATCHES": "0",
     "SITECUSTOMIZE_ENABLE_ENTRY_FAILOPEN_PATCHES": "0",
@@ -122,8 +110,6 @@ RESCUE_DEFAULTS: Dict[str, str] = {
     "LOW_MOVE_TONOSAMA_ALLOW_NO_HIGHLOW_FALLBACK": "0",
 }
 
-# SQLite / DB-friendly defaults. These are intentionally small because DB
-# processes should not receive trading decision patches.
 DB_DEFAULTS: Dict[str, str] = {
     "SQLITE_MEMORY_PRAGMAS_ENABLED": "1",
     "SQLITE_MEMORY_TEMP_STORE": "MEMORY",
@@ -135,12 +121,10 @@ DB_DEFAULTS: Dict[str, str] = {
     "SQLITE_SYNCHRONOUS": "NORMAL",
 }
 
-# Non-main helpers should stay light unless explicitly promoted to full mode.
 HELPER_DEFAULTS: Dict[str, str] = {
     "SITECUSTOMIZE_ENABLE_FULL_NONMAIN": "0",
 }
 
-# main.py / usercustomize runtime restore defaults.
 MAIN_RESTORE_DEFAULTS: Dict[str, str] = {
     "AUTOSTOCK_MAIN_OPERATION_MODE": "full",
     "AUTOSTOCK_MAIN_DISABLE_SCHEDULED_ENTRY_JOBS": "0",
@@ -160,7 +144,6 @@ MAIN_RESTORE_DEFAULTS: Dict[str, str] = {
     "FORCE_ENABLE_MAIN_SUMMARY_PARENT_TICK": "1",
 }
 
-# Ranking / entry safety defaults: keep safety guards on, but not fail-open.
 RANKING_ENTRY_DEFAULTS: Dict[str, str] = {
     "RANKING_ENTRY_WATCHDOG_ENABLED": "1",
     "RANKING_ENTRY_WATCHDOG_TIMEOUT_SEC": "55",
@@ -235,8 +218,8 @@ TONOSAMA_DEFAULTS: Dict[str, str] = {
     "TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_SEC": "10",
     "TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC": "60",
     "ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE": "1",
-    "ENTRY_CONTROLLER_TONOSAMA_MIN_SCORE": "0.01",
-    "LOW_MOVE_TONOSAMA_MIN_ENTRY_PRICE": "300",
+    "ENTRY_CONTROLLER_TONOSAMA_MIN_PENDING_SCORE": "1.0",
+    "TONOSAMA_ORDER_MAX_AGE_SEC": "240",
     "FINAL_ENTRY_TONOSAMA_LIQUIDITY_FALLBACK": "1",
     "FINAL_ENTRY_TONOSAMA_MIN_VOLUME": "30000",
     "FINAL_ENTRY_TONOSAMA_MIN_TURNOVER": "10000000",
@@ -291,7 +274,6 @@ ENTRY_DEFAULTS: Dict[str, str] = {
     "ENTRY_ALLOW_WITHOUT_BOARD_MIN_TURNOVER": "10000000",
     "ENTRY_ALLOW_WITHOUT_BOARD_MIN_PRICE": "200",
     "ENTRY_ALLOW_WITHOUT_BOARD_MIN_SCORE": "0.90",
-    "ENTRY_BOARD_MISSING_QTY_RATIO": "0.50",
     "PULLBACK_ENTRY_ENABLED": "1",
     "PULLBACK_ENTRY_MAX_CANDIDATES": "5",
     "PULLBACK_ENTRY_LOT_RATIO": "0.5",
@@ -314,6 +296,13 @@ SUMMARY_YAHOO_DEFAULTS: Dict[str, str] = {
     "SUMMARY_DB_DATE_GUARD_ENABLED": "1",
     "SUMMARY_DB_DATE_GUARD_CLEANUP_ENABLED": "0",
     "SUMMARY_SUPPRESS_LUNCH_FALLBACK_AFTER_PM": "1",
+    "TRADE_UNIVERSE_MIN_PRICE": "200",
+    "TRADE_UNIVERSE_MAX_PRICE": "7000",
+    "SUMMARY_PIPELINE_MIN_PRICE": "200",
+    "SUMMARY_PIPELINE_MAX_PRICE": "7000",
+    "SUMMARY_DISPLAY_MAX_PRICE": "7000",
+    "ENTRY_MAX_PRICE": "7000",
+    "RANKING_MAX_PRICE": "7000",
 }
 
 
@@ -353,43 +342,6 @@ def apply_summary_yahoo_defaults(*, environ: Optional[MutableMapping[str, str]] 
     return _set_defaults(SUMMARY_YAHOO_DEFAULTS, environ=environ)
 
 
-def apply_site_defaults(context: str = "unknown", *, environ: Optional[MutableMapping[str, str]] = None) -> Dict[str, str]:
-    """Defaults intended for sitecustomize.py."""
-    applied: Dict[str, str] = {}
-    for group in (
-        apply_push_defaults,
-        apply_rescue_defaults,
-        apply_db_defaults,
-        apply_helper_defaults,
-        apply_ranking_entry_defaults,
-        apply_tonosama_defaults,
-        apply_entry_defaults,
-        apply_summary_yahoo_defaults,
-    ):
-        applied.update(group(environ=environ))
-    if env_bool("RUNTIME_ENV_DEFAULTS_VERBOSE", False):
-        print(f"[RUNTIME ENV DEFAULTS] site context={context} version={VERSION} applied={len(applied)}")
-    return applied
-
-
-def apply_user_defaults(context: str = "unknown", *, environ: Optional[MutableMapping[str, str]] = None) -> Dict[str, str]:
-    """Defaults intended for usercustomize.py."""
-    applied: Dict[str, str] = {}
-    for group in (
-        apply_push_defaults,
-        apply_rescue_defaults,
-        apply_main_restore_defaults,
-        apply_ranking_entry_defaults,
-        apply_tonosama_defaults,
-        apply_entry_defaults,
-        apply_summary_yahoo_defaults,
-    ):
-        applied.update(group(environ=environ))
-    if env_bool("RUNTIME_ENV_DEFAULTS_VERBOSE", False):
-        print(f"[RUNTIME ENV DEFAULTS] user context={context} version={VERSION} applied={len(applied)}")
-    return applied
-
-
 __all__ = [
     "VERSION",
     "env_bool",
@@ -402,6 +354,4 @@ __all__ = [
     "apply_tonosama_defaults",
     "apply_entry_defaults",
     "apply_summary_yahoo_defaults",
-    "apply_site_defaults",
-    "apply_user_defaults",
 ]
