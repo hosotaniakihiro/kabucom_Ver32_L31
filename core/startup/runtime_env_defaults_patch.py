@@ -2,11 +2,11 @@
 """
 Compatibility installer for centralized runtime environment defaults.
 
-V22 fixes an ImportError seen in data collector children:
-    cannot import name 'apply_site_defaults' from core.startup.runtime_env_defaults
-The defaults module currently exposes grouped apply_*_defaults functions, so this
-module now builds apply_site_defaults/apply_user_defaults locally when the old
-aggregate helpers are not present.
+REV23:
+  - classify child runners explicitly instead of treating every script as helper.
+  - prevent db_prepare/yahoo/summary/ranking/push collector children from starting
+    trading/entry/daytrade patches.
+  - keep DB/data patches in database collector processes.
 """
 from __future__ import annotations
 
@@ -22,11 +22,10 @@ from .runtime_settings_ini_loader import load_settings_ini
 from . import runtime_env_defaults as _defaults
 
 logger = logging.getLogger(__name__)
-VERSION = "REV22-RUNTIME-ENV-DEFAULTS-PATCH-COMPAT-GROUPED-DEFAULTS"
+VERSION = "REV23-RUNTIME-ENV-DEFAULTS-STRICT-PROCESS-SCOPE"
 DEFAULTS_VERSION = getattr(_defaults, "VERSION", "unknown")
 env_bool = getattr(_defaults, "env_bool")
 _INSTALLED = False
-
 
 _GROUP_APPLIERS: dict[str, Callable[..., Dict[str, str]]] = {
     "push": getattr(_defaults, "apply_push_defaults"),
@@ -39,6 +38,11 @@ _GROUP_APPLIERS: dict[str, Callable[..., Dict[str, str]]] = {
     "entry": getattr(_defaults, "apply_entry_defaults"),
     "summary_yahoo": getattr(_defaults, "apply_summary_yahoo_defaults"),
 }
+
+DB_CONTEXTS = {"main_database", "db_prepare", "push_receiver", "summary_database", "ranking_collector", "yahoo_complement"}
+DATA_COLLECTOR_CONTEXTS = {"push_receiver", "summary_database", "ranking_collector", "yahoo_complement"}
+TRADING_CONTEXTS = {"main"}
+GENERIC_HELPER_CONTEXTS = {"helper"}
 
 
 def _apply_groups(order: tuple[str, ...], *, context: str) -> Dict[str, str]:
@@ -74,8 +78,18 @@ def _argv_context() -> str:
         text = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
         if "main_database.py" in text:
             return "main_database"
-        if "main.py" in text:
+        if text.endswith("main.py") or "/main.py" in text:
             return "main"
+        if "db_prepare_runner.py" in text:
+            return "db_prepare"
+        if "push_receiver_runner.py" in text:
+            return "push_receiver"
+        if "summary_database_runner.py" in text:
+            return "summary_database"
+        if "ranking_collector_runner.py" in text:
+            return "ranking_collector"
+        if "yahoo_complement_runner.py" in text:
+            return "yahoo_complement"
         if text:
             return "helper"
     except Exception:
@@ -99,12 +113,12 @@ def _safe_install(label: str, context: str, allowed: set[str], env_disable: str,
 
 
 def _install_entry_fire_rescue(context: str) -> bool:
-    return _safe_install("entry fire rescue", context, {"main", "helper"}, "DISABLE_ENTRY_FIRE_RESCUE_PATCH", "entry_fire_rescue_runtime_patch")
+    return _safe_install("entry fire rescue", context, TRADING_CONTEXTS, "DISABLE_ENTRY_FIRE_RESCUE_PATCH", "entry_fire_rescue_runtime_patch")
 
 
 def _install_summary_pending_stale_guard(context: str) -> bool:
     try:
-        if context not in {"main", "helper"}:
+        if context not in TRADING_CONTEXTS:
             return False
         if os.environ.get("DISABLE_SUMMARY_ENTRY_PENDING_FIX_PATCH", "").strip() == "1":
             logger.warning("[RUNTIME ENV DEFAULTS PATCH] summary pending stale guard disabled by env")
@@ -120,16 +134,16 @@ def _install_summary_pending_stale_guard(context: str) -> bool:
 
 
 def _install_summary_db_realtime_priority(context: str) -> bool:
-    return _safe_install("summary DB realtime priority", context, {"main_database", "helper"}, "DISABLE_SUMMARY_DB_REALTIME_PRIORITY_PATCH", "summary_db_realtime_priority_patch")
+    return _safe_install("summary DB realtime priority", context, DB_CONTEXTS, "DISABLE_SUMMARY_DB_REALTIME_PRIORITY_PATCH", "summary_db_realtime_priority_patch")
 
 
 def _install_ranking_entry_runtime_rescue(context: str) -> bool:
-    return _safe_install("ranking entry runtime rescue", context, {"main", "helper"}, "DISABLE_RANKING_ENTRY_RUNTIME_RESCUE_PATCH", "ranking_entry_runtime_rescue_patch")
+    return _safe_install("ranking entry runtime rescue", context, TRADING_CONTEXTS, "DISABLE_RANKING_ENTRY_RUNTIME_RESCUE_PATCH", "ranking_entry_runtime_rescue_patch")
 
 
 def _install_low_volatility_entry_guard(context: str) -> bool:
     try:
-        if context not in {"main", "helper"}:
+        if context not in TRADING_CONTEXTS:
             return False
         if os.environ.get("DISABLE_LOW_VOLATILITY_ENTRY_GUARD", "").strip() == "1":
             logger.warning("[RUNTIME ENV DEFAULTS PATCH] low volatility entry guard disabled by env")
@@ -149,55 +163,55 @@ def _install_low_volatility_entry_guard(context: str) -> bool:
 
 
 def _install_push_registration_recovery(context: str) -> bool:
-    return _safe_install("push register recovery", context, {"main_database", "helper", "main"}, "DISABLE_PUSH_REGISTER_RECOVERY_PATCH", "push_registration_recovery_patch")
+    return _safe_install("push register recovery", context, {"main", "main_database", "push_receiver"}, "DISABLE_PUSH_REGISTER_RECOVERY_PATCH", "push_registration_recovery_patch")
 
 
 def _install_common_day_position_guard(context: str) -> bool:
-    return _safe_install("common day position guard", context, {"main", "helper"}, "DISABLE_COMMON_ENTRY_DAY_POSITION_GUARD", "common_entry_day_position_guard_patch")
+    return _safe_install("common day position guard", context, TRADING_CONTEXTS, "DISABLE_COMMON_ENTRY_DAY_POSITION_GUARD", "common_entry_day_position_guard_patch")
 
 
 def _install_strict_final_liquidity_guard(context: str) -> bool:
-    return _safe_install("strict final liquidity guard", context, {"main", "helper"}, "DISABLE_ENTRY_HANDLER_STRICT_RECENT_LIQ_PATCH", "entry_handler_strict_recent_liquidity_patch")
+    return _safe_install("strict final liquidity guard", context, TRADING_CONTEXTS, "DISABLE_ENTRY_HANDLER_STRICT_RECENT_LIQ_PATCH", "entry_handler_strict_recent_liquidity_patch")
 
 
 def _install_tonosama_exit_source_infer(context: str) -> bool:
-    return _safe_install("tonosama exit infer", context, {"main", "helper"}, "DISABLE_TONOSAMA_EXIT_SOURCE_INFER_PATCH", "tonosama_exit_source_infer_patch")
+    return _safe_install("tonosama exit infer", context, TRADING_CONTEXTS, "DISABLE_TONOSAMA_EXIT_SOURCE_INFER_PATCH", "tonosama_exit_source_infer_patch")
 
 
 def _install_tonosama_pending_candidate_audit(context: str) -> bool:
-    return _safe_install("tonosama pending candidate audit", context, {"main", "helper"}, "DISABLE_TONOSAMA_PENDING_CANDIDATE_AUDIT_PATCH", "tonosama_pending_candidate_audit_patch")
+    return _safe_install("tonosama pending candidate audit", context, TRADING_CONTEXTS, "DISABLE_TONOSAMA_PENDING_CANDIDATE_AUDIT_PATCH", "tonosama_pending_candidate_audit_patch")
 
 
 def _install_daytrade_credit_force_close(context: str) -> bool:
-    return _safe_install("daytrade credit force close", context, {"main", "helper"}, "DISABLE_DAYTRADE_CREDIT_FORCE_CLOSE_PATCH", "daytrade_credit_force_close_patch")
+    return _safe_install("daytrade credit force close", context, TRADING_CONTEXTS, "DISABLE_DAYTRADE_CREDIT_FORCE_CLOSE_PATCH", "daytrade_credit_force_close_patch")
 
 
 def _install_database_owner(context: str) -> bool:
-    return _safe_install("database owner", context, {"main", "helper", "main_database"}, "DISABLE_DATABASE_OWNER_RUNTIME_PATCH", "database_owner_runtime_patch")
+    return _safe_install("database owner", context, DB_CONTEXTS | TRADING_CONTEXTS | GENERIC_HELPER_CONTEXTS, "DISABLE_DATABASE_OWNER_RUNTIME_PATCH", "database_owner_runtime_patch")
 
 
 def _install_entry_count_unblock(context: str) -> bool:
-    return _safe_install("entry count unblock", context, {"main", "helper", "main_database"}, "DISABLE_ENTRY_COUNT_UNBLOCK_PATCH", "entry_count_unblock_runtime_patch")
+    return _safe_install("entry count unblock", context, TRADING_CONTEXTS | {"main_database"}, "DISABLE_ENTRY_COUNT_UNBLOCK_PATCH", "entry_count_unblock_runtime_patch")
 
 
 def _install_full_pipeline_stability(context: str) -> bool:
-    return _safe_install("full pipeline stability", context, {"main", "helper", "main_database"}, "DISABLE_FULL_PIPELINE_STABILITY_PATCH", "full_pipeline_stability_runtime_patch")
+    return _safe_install("full pipeline stability", context, DB_CONTEXTS | TRADING_CONTEXTS | GENERIC_HELPER_CONTEXTS, "DISABLE_FULL_PIPELINE_STABILITY_PATCH", "full_pipeline_stability_runtime_patch")
 
 
 def _install_summary_db_lock_pressure(context: str) -> bool:
-    return _safe_install("summary DB lock pressure", context, {"main", "helper", "main_database"}, "DISABLE_SUMMARY_DB_LOCK_PRESSURE_PATCH", "summary_db_lock_pressure_patch")
+    return _safe_install("summary DB lock pressure", context, DB_CONTEXTS | TRADING_CONTEXTS | GENERIC_HELPER_CONTEXTS, "DISABLE_SUMMARY_DB_LOCK_PRESSURE_PATCH", "summary_db_lock_pressure_patch")
 
 
 def _install_intraday_load_guard(context: str) -> bool:
-    return _safe_install("intraday load guard", context, {"main", "helper", "main_database"}, "DISABLE_INTRADAY_LOAD_GUARD_PATCH", "intraday_load_guard_patch")
+    return _safe_install("intraday load guard", context, DB_CONTEXTS | TRADING_CONTEXTS | GENERIC_HELPER_CONTEXTS, "DISABLE_INTRADAY_LOAD_GUARD_PATCH", "intraday_load_guard_patch")
 
 
 def _install_yahoo_parallel_empty_cooldown(context: str) -> bool:
-    return _safe_install("yahoo parallel empty cooldown", context, {"main_database", "helper", "main"}, "DISABLE_YAHOO_PARALLEL_EMPTY_COOLDOWN_PATCH", "yahoo_parallel_empty_cooldown_patch")
+    return _safe_install("yahoo parallel empty cooldown", context, DB_CONTEXTS | TRADING_CONTEXTS | GENERIC_HELPER_CONTEXTS, "DISABLE_YAHOO_PARALLEL_EMPTY_COOLDOWN_PATCH", "yahoo_parallel_empty_cooldown_patch")
 
 
 def _install_ranking_legacy_inline_flush(context: str) -> bool:
-    return _safe_install("ranking legacy inline flush", context, {"main_database", "helper", "main"}, "DISABLE_RANKING_LEGACY_INLINE_FLUSH_PATCH", "ranking_legacy_inline_flush_patch")
+    return _safe_install("ranking legacy inline flush", context, DB_CONTEXTS | TRADING_CONTEXTS | GENERIC_HELPER_CONTEXTS, "DISABLE_RANKING_LEGACY_INLINE_FLUSH_PATCH", "ranking_legacy_inline_flush_patch")
 
 
 def install() -> bool:
