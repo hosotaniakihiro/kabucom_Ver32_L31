@@ -17,7 +17,7 @@ from .runtime_settings_ini_loader import VERSION as SETTINGS_INI_VERSION
 from .runtime_settings_ini_loader import load_settings_ini
 
 logger = logging.getLogger(__name__)
-VERSION = "REV20-RUNTIME-ENV-DEFAULTS-PATCH-SUMMARY-PENDING-STALE-GUARD"
+VERSION = "REV21-RUNTIME-ENV-DEFAULTS-PATCH-DB-REALTIME-SUMMARY-PRIORITY"
 _INSTALLED = False
 
 
@@ -50,13 +50,6 @@ def _install_entry_fire_rescue(context: str) -> bool:
 
 
 def _install_summary_pending_stale_guard(context: str) -> bool:
-    """
-    SUMMARY_AI の古いDB fallback候補を pending 登録前に止める。
-
-    以前は別パッチ経由で遅れて入る場合があり、main.py 起動ログで
-    [SUMMARY ENTRY PENDING FIX] installed v2 のまま残ることがあった。
-    runtime defaults の早い段階で明示 install して、v3 以降を確実に有効化する。
-    """
     try:
         if context not in {"main", "helper"}:
             return False
@@ -70,6 +63,21 @@ def _install_summary_pending_stale_guard(context: str) -> bool:
         return bool(summary_entry_pending_existing_fix_patch.install())
     except Exception:
         logger.exception("[RUNTIME ENV DEFAULTS PATCH] summary pending stale guard install failed")
+        return False
+
+
+def _install_summary_db_realtime_priority(context: str) -> bool:
+    """Install DB-process 1m-first summary latency guard."""
+    try:
+        if context not in {"main_database", "helper"}:
+            return False
+        if os.environ.get("DISABLE_SUMMARY_DB_REALTIME_PRIORITY_PATCH", "").strip() == "1":
+            logger.warning("[RUNTIME ENV DEFAULTS PATCH] summary DB realtime priority disabled by env")
+            return False
+        from . import summary_db_realtime_priority_patch
+        return bool(summary_db_realtime_priority_patch.install())
+    except Exception:
+        logger.exception("[RUNTIME ENV DEFAULTS PATCH] summary DB realtime priority install failed")
         return False
 
 
@@ -304,6 +312,7 @@ def install() -> bool:
         yahoo_parallel_empty_ok = _install_yahoo_parallel_empty_cooldown(context)
         ranking_legacy_inline_ok = _install_ranking_legacy_inline_flush(context)
         summary_lock_pressure_ok = _install_summary_db_lock_pressure(context)
+        summary_db_realtime_ok = _install_summary_db_realtime_priority(context)
         database_owner_ok = _install_database_owner(context)
         full_pipeline_ok = _install_full_pipeline_stability(context)
         entry_count_unblock_ok = _install_entry_count_unblock(context)
@@ -319,7 +328,7 @@ def install() -> bool:
         daytrade_credit_ok = _install_daytrade_credit_force_close(context)
         _INSTALLED = True
         logger.warning(
-            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s intraday_load_guard=%s yahoo_parallel_empty=%s ranking_legacy_inline=%s summary_lock_pressure=%s database_owner=%s full_pipeline=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s summary_pending_stale=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s tonosama_exit_infer=%s tonosama_pending_audit=%s daytrade_credit=%s verbose=%s",
+            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s intraday_load_guard=%s yahoo_parallel_empty=%s ranking_legacy_inline=%s summary_lock_pressure=%s summary_db_realtime=%s database_owner=%s full_pipeline=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s summary_pending_stale=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s tonosama_exit_infer=%s tonosama_pending_audit=%s daytrade_credit=%s verbose=%s",
             VERSION,
             DEFAULTS_VERSION,
             REGISTRY_VERSION,
@@ -333,6 +342,7 @@ def install() -> bool:
             yahoo_parallel_empty_ok,
             ranking_legacy_inline_ok,
             summary_lock_pressure_ok,
+            summary_db_realtime_ok,
             database_owner_ok,
             full_pipeline_ok,
             os.environ.get("SITECUSTOMIZE_ENABLE_RESCUE_PATCHES"),
