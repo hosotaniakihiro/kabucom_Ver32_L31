@@ -1,20 +1,20 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/ranking_writer_lock_buffer_relief_patch.py
-# Version: V2-RANKING-WRITER-LOCK-BUFFER-RELIEF-SPLIT-LEGACY
+# Version: V3-RANKING-WRITER-DROP-LOCKED-RETRY-BUFFERS
 # ------------------------------------------------------------
 # Purpose:
-#   Ranking DB writer repeatedly failed at snapshot DELETE with
-#   sqlite3.OperationalError: database is locked.  A key amplifier was that
-#   legacy_buffer was mixed with raw/snapshot rows.  The V6 lock patch delegates
-#   mixed legacy flushes back to the original writer, so the original DELETE path
-#   was still used and buffers grew to tens of thousands of rows.
+#   NAS SQLite ranking DB can stay locked while summary enrichment reads the
+#   large ranking_snapshot table.  When a flush fails, returning raw/snapshot
+#   rows to the front of the buffer causes repeated lock loops.  For live
+#   trading freshness, in-memory ranking/runtime symbols are more important than
+#   preserving every failed DB write.
 #
-#   This patch keeps ranking runtime fresh by:
-#     - disabling legacy ranking-table buffering by default in live fast mode
-#     - removing legacy_buffer before flush so V6 raw/snapshot path is used
-#     - trimming raw/snapshot retry buffers after a failed flush
-#     - dropping legacy retry buffers after a failed flush
+#   This patch:
+#     - disables legacy buffering by default
+#     - removes legacy before flush so V6 raw/snapshot path is used
+#     - drops raw/snapshot retry buffers by default after locked flush failure
+#     - keeps only if env explicitly asks to keep them
 # ============================================================
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from functools import wraps
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V2-RANKING-WRITER-LOCK-BUFFER-RELIEF-SPLIT-LEGACY"
+VERSION = "V3-RANKING-WRITER-DROP-LOCKED-RETRY-BUFFERS"
 _INSTALLED = False
 
 
@@ -60,11 +60,27 @@ def _trim_list(values: Any, limit: int) -> list:
         return []
 
 
+def _set_default_or_cap(name: str, value: str) -> None:
+    try:
+        cur = os.getenv(name)
+        if cur is None or str(cur).strip() == "":
+            os.environ[name] = value
+            return
+        # If caller inherited older large defaults, cap them down for live lock relief.
+        if int(float(str(cur).replace(",", ""))) > int(float(value)):
+            os.environ[name] = value
+    except Exception:
+        os.environ[name] = value
+
+
 def _trim_buffers(writer, *, reason: str) -> dict[str, int]:
-    raw_limit = _env_int("RANKING_WRITER_RETRY_RAW_MAX_ROWS", 3000)
-    snapshot_limit = _env_int("RANKING_WRITER_RETRY_SNAPSHOT_MAX_ROWS", 3000)
+    # By default drop failed retry buffers.  Set RANKING_WRITER_KEEP_LOCKED_RETRY_ROWS=1
+    # to keep a small tail for forensic persistence.
+    keep_locked = _env_bool("RANKING_WRITER_KEEP_LOCKED_RETRY_ROWS", False)
+    raw_limit = _env_int("RANKING_WRITER_RETRY_RAW_MAX_ROWS", 300 if keep_locked else 0)
+    snapshot_limit = _env_int("RANKING_WRITER_RETRY_SNAPSHOT_MAX_ROWS", 300 if keep_locked else 0)
     keep_legacy = _env_bool("RANKING_WRITER_RETRY_KEEP_LEGACY", False)
-    legacy_limit = _env_int("RANKING_WRITER_RETRY_LEGACY_MAX_ROWS", 0 if not keep_legacy else 1000)
+    legacy_limit = _env_int("RANKING_WRITER_RETRY_LEGACY_MAX_ROWS", 0 if not keep_legacy else 300)
 
     with writer.lock:
         before = {
@@ -86,13 +102,14 @@ def _trim_buffers(writer, *, reason: str) -> dict[str, int]:
             pass
     if before != after:
         logger.warning(
-            "[RANKING WRITER RELIEF] trimmed buffers reason=%s before=%s after=%s limits={raw:%s,snapshot:%s,legacy:%s}",
+            "[RANKING WRITER RELIEF] trimmed buffers reason=%s before=%s after=%s limits={raw:%s,snapshot:%s,legacy:%s} keep_locked=%s",
             reason,
             before,
             after,
             raw_limit,
             snapshot_limit,
             legacy_limit,
+            keep_locked,
         )
     return after
 
@@ -132,17 +149,19 @@ def install() -> bool:
             logger.warning("[RANKING WRITER RELIEF] RankingDBWriter class missing")
             return False
 
-        os.environ.setdefault("RANKING_WRITER_RETRY_RAW_MAX_ROWS", "3000")
-        os.environ.setdefault("RANKING_WRITER_RETRY_SNAPSHOT_MAX_ROWS", "3000")
+        os.environ.setdefault("RANKING_WRITER_KEEP_LOCKED_RETRY_ROWS", "0")
+        _set_default_or_cap("RANKING_WRITER_RETRY_RAW_MAX_ROWS", "0")
+        _set_default_or_cap("RANKING_WRITER_RETRY_SNAPSHOT_MAX_ROWS", "0")
         os.environ.setdefault("RANKING_WRITER_RETRY_KEEP_LEGACY", "0")
-        os.environ.setdefault("RANKING_WRITER_RETRY_LEGACY_MAX_ROWS", "0")
+        _set_default_or_cap("RANKING_WRITER_RETRY_LEGACY_MAX_ROWS", "0")
         os.environ.setdefault("RANKING_WRITER_DISABLE_LEGACY_ON_LOCK_RELIEF", "1")
         os.environ.setdefault("RANKING_WRITER_BUFFER_SIZE", "1000")
         os.environ.setdefault("RANKING_WRITER_FLUSH_ON_THRESHOLD", "0")
         os.environ.setdefault("RANKING_DB_WRITER_BUSY_TIMEOUT_MS", "30000")
+        os.environ.setdefault("RANKING_WRITER_LOCK_RETRY_MAX", "1")
 
         old_add = getattr(cls, "add_ranking_rows", None)
-        if callable(old_add) and not getattr(old_add, "_ranking_writer_relief_v2", False):
+        if callable(old_add) and not getattr(old_add, "_ranking_writer_relief_v3", False):
             @wraps(old_add)
             def _patched_add(self, *args, **kwargs):
                 if _env_bool("RANKING_WRITER_DISABLE_LEGACY_ON_LOCK_RELIEF", True):
@@ -152,22 +171,25 @@ def install() -> bool:
                     except Exception:
                         pass
                 ret = old_add(self, *args, **kwargs)
+                # Do not keep old failed buffers after new rows arrive.
                 _trim_buffers(self, reason="after_add")
                 return ret
 
+            _patched_add._ranking_writer_relief_v3 = True  # type: ignore[attr-defined]
             _patched_add._ranking_writer_relief_v2 = True  # type: ignore[attr-defined]
             _patched_add._original = old_add  # type: ignore[attr-defined]
             cls.add_ranking_rows = _patched_add
 
         old_flush = getattr(cls, "flush", None)
-        if callable(old_flush) and not getattr(old_flush, "_ranking_writer_relief_v2", False):
+        if callable(old_flush) and not getattr(old_flush, "_ranking_writer_relief_v3", False):
             @wraps(old_flush)
             def _patched_flush(self, *args, **kwargs):
                 dropped_legacy = _drop_legacy_before_flush(self)
                 ok = bool(old_flush(self, *args, **kwargs))
                 if not ok:
-                    _trim_buffers(self, reason="flush_failed")
+                    _trim_buffers(self, reason="flush_failed_drop_locked")
                 else:
+                    # also remove any old retained retry rows after success
                     _trim_buffers(self, reason="flush_ok_cleanup")
                 if dropped_legacy:
                     logger.warning(
@@ -177,6 +199,7 @@ def install() -> bool:
                     )
                 return ok
 
+            _patched_flush._ranking_writer_relief_v3 = True  # type: ignore[attr-defined]
             _patched_flush._ranking_writer_relief_v2 = True  # type: ignore[attr-defined]
             _patched_flush._original = old_flush  # type: ignore[attr-defined]
             cls.flush = _patched_flush
@@ -193,11 +216,12 @@ def install() -> bool:
 
         _INSTALLED = True
         logger.warning(
-            "[RANKING WRITER RELIEF] installed version=%s raw_limit=%s snapshot_limit=%s keep_legacy=%s buffer_size_env=%s",
+            "[RANKING WRITER RELIEF] installed version=%s raw_limit=%s snapshot_limit=%s keep_legacy=%s keep_locked=%s buffer_size_env=%s",
             VERSION,
             os.environ.get("RANKING_WRITER_RETRY_RAW_MAX_ROWS"),
             os.environ.get("RANKING_WRITER_RETRY_SNAPSHOT_MAX_ROWS"),
             os.environ.get("RANKING_WRITER_RETRY_KEEP_LEGACY"),
+            os.environ.get("RANKING_WRITER_KEEP_LOCKED_RETRY_ROWS"),
             os.environ.get("RANKING_WRITER_BUFFER_SIZE"),
         )
         return True
