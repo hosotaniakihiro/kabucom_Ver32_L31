@@ -178,7 +178,6 @@ def _sanitize_dataframe(df):
 
     return df
 
-
 # ============================================================
 # COLUMN NORMALIZATION
 # ============================================================
@@ -351,22 +350,63 @@ def _ensure_flag_columns(df):
 
 def _safe_merge_flags(df_base, df_new):
 
+    if df_base is None or not isinstance(df_base, pd.DataFrame):
+        return df_base
+
     if df_new is None or not isinstance(df_new, pd.DataFrame):
         return df_base
 
     try:
 
-        new_cols = [c for c in df_new.columns if c.startswith("flag_")]
+        new_cols = [c for c in df_new.columns if str(c).startswith("flag_")]
 
         if not new_cols:
             return df_base
 
+        if df_new.empty:
+            logger.warning(
+                "[FLAG GEN] merge skipped: new flag DataFrame is empty base_rows=%s",
+                len(df_base),
+            )
+            return df_base
+
+        base_len = len(df_base)
+        new_len = len(df_new)
+
+        if base_len == 0:
+            return df_base
+
+        # pandasのindex自動整列で MultiIndex / RangeIndex 混在時に落ちるため、
+        # 必ず位置ベースのSeriesに変換してから base の行数へ合わせる。
         for c in new_cols:
 
             try:
-                df_base[c] = df_new[c].values
+                s = df_new[c]
+
+                # 重複列名の場合は DataFrame になることがあるため先頭列だけ採用
+                if isinstance(s, pd.DataFrame):
+                    s = s.iloc[:, 0]
+
+                s = s.reset_index(drop=True)
+
+                if new_len >= base_len:
+                    values = s.iloc[:base_len].values
+                else:
+                    values = pd.Series(0, index=range(base_len))
+                    values.iloc[:new_len] = s.values
+                    values = values.values
+
+                df_base[c] = values
+
             except Exception:
-                df_base[c] = df_new[c]
+                logger.exception(
+                    "[FLAG GEN] merge column failed col=%s base_rows=%s new_rows=%s",
+                    c,
+                    base_len,
+                    new_len,
+                )
+                if c not in df_base.columns:
+                    df_base[c] = 0
 
     except Exception:
 
