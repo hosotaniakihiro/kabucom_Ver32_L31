@@ -5,20 +5,20 @@
 #   - header helper
 #   - TOP10表示前の対象外フィルタ
 # ------------------------------------------------------------
-# Version: Ver1.2-PRODUCTION-DISPLAY-BUY-SELL-SCORE-SEPARATION
+# Version: Ver1.3-PRODUCTION-DISPLAY-PRICE-CAP
 # ------------------------------------------------------------
 # ✔ BUY TOP10 は buy_score / score_buy が正の銘柄だけ表示
 # ✔ SELL TOP10 は sell_score / score_sell が正の銘柄だけ表示
 # ✔ score_buy=0 の SELL 銘柄が BUY TOP10 に混ざる問題を修正
 # ✔ score_sell=0 の BUY 銘柄が SELL TOP10 に混ざる問題を修正
 # ✔ slope 環境変数を緩めても BUY/SELL の銘柄が同じにならない
+# ✔ 表示・AI候補の価格上限を ENTRY / TRADE_UNIVERSE と共通化
 # ============================================================
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
 
 import pandas as pd
 
@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 DEFAULT_DISPLAY_MIN_PRICE = 200.0
+DEFAULT_DISPLAY_MAX_PRICE = 7000.0
 DEFAULT_DISPLAY_MIN_BUY_SLOPE = 0.01
 DEFAULT_DISPLAY_MAX_SELL_SLOPE = -0.01
 DEFAULT_DISPLAY_MIN_BUY_SCORE = 0.000001
@@ -53,22 +54,40 @@ def _resolve_min_price() -> float:
     """
     表示・候補共通の最低株価。
 
-    close <= 200 を対象外にするため、
-    判定は close > 200。
+    close <= 200 を対象外にするため、判定は close > min_price。
     """
-    v1 = os.getenv("SUMMARY_DISPLAY_MIN_PRICE")
-    if v1 is not None and str(v1).strip() != "":
-        return _env_float("SUMMARY_DISPLAY_MIN_PRICE", DEFAULT_DISPLAY_MIN_PRICE)
-
-    v2 = os.getenv("TRADE_UNIVERSE_MIN_PRICE")
-    if v2 is not None and str(v2).strip() != "":
-        return _env_float("TRADE_UNIVERSE_MIN_PRICE", DEFAULT_DISPLAY_MIN_PRICE)
-
-    v3 = os.getenv("ENTRY_MIN_PRICE")
-    if v3 is not None and str(v3).strip() != "":
-        return _env_float("ENTRY_MIN_PRICE", DEFAULT_DISPLAY_MIN_PRICE)
+    for name in (
+        "SUMMARY_DISPLAY_MIN_PRICE",
+        "TRADE_UNIVERSE_MIN_PRICE",
+        "ENTRY_MIN_PRICE",
+        "RANKING_MIN_PRICE",
+    ):
+        v = os.getenv(name)
+        if v is not None and str(v).strip() != "":
+            return _env_float(name, DEFAULT_DISPLAY_MIN_PRICE)
 
     return float(DEFAULT_DISPLAY_MIN_PRICE)
+
+
+def _resolve_max_price() -> float:
+    """
+    表示・AI候補共通の最高株価。
+
+    エントリー側の上限とズレると、発注対象外の高価格銘柄が
+    SUMMARY TOP10 / AI PASSED に表示されるため、ここでも同じ上限を使う。
+    0 以下を指定した場合だけ上限無効として扱う。
+    """
+    for name in (
+        "SUMMARY_DISPLAY_MAX_PRICE",
+        "TRADE_UNIVERSE_MAX_PRICE",
+        "ENTRY_MAX_PRICE",
+        "RANKING_MAX_PRICE",
+    ):
+        v = os.getenv(name)
+        if v is not None and str(v).strip() != "":
+            return _env_float(name, DEFAULT_DISPLAY_MAX_PRICE)
+
+    return float(DEFAULT_DISPLAY_MAX_PRICE)
 
 
 def _resolve_min_buy_slope() -> float:
@@ -179,12 +198,25 @@ def _select_sell_score_series(df: pd.DataFrame) -> pd.Series:
     return pd.Series(0.0, index=df.index, dtype="float64")
 
 
+def _apply_price_cap(price_s: pd.Series, min_price: float, max_price: float) -> pd.Series:
+    mask = price_s > float(min_price)
+    if float(max_price) > 0:
+        mask &= price_s <= float(max_price)
+    return mask
+
+
+def _price_condition_text(min_price: float, max_price: float) -> str:
+    if float(max_price) > 0:
+        return f"{float(min_price):.1f} < close <= {float(max_price):.1f}"
+    return f"close > {float(min_price):.1f}"
+
+
 def _apply_buy_display_guard(df: pd.DataFrame) -> pd.DataFrame:
     """
     BUY TOP10 / AI BUY 表示前フィルタ。
 
     条件:
-      close > 200
+      min_price < close <= max_price
       slope > min_buy_slope
       buy_score > 0
 
@@ -198,6 +230,7 @@ def _apply_buy_display_guard(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
     min_price = _resolve_min_price()
+    max_price = _resolve_max_price()
     min_slope = _resolve_min_buy_slope()
     min_buy_score = _resolve_min_buy_score()
 
@@ -206,22 +239,24 @@ def _apply_buy_display_guard(df: pd.DataFrame) -> pd.DataFrame:
     buy_s = _select_buy_score_series(out)
 
     before = len(out)
+    price_mask = _apply_price_cap(price_s, min_price, max_price)
 
     out = out[
-        (price_s > float(min_price))
+        price_mask
         & (slope_s > float(min_slope))
         & (buy_s > float(min_buy_score))
     ].copy()
 
     logger.info(
-        "[SUMMARY DISPLAY SORTING] BUY guard condition='close > %.1f and slope > %.4f and buy_score > %.6f' "
-        "before=%s after=%s skipped=%s buy_score_nonzero=%s",
-        float(min_price),
+        "[SUMMARY DISPLAY SORTING] BUY guard condition='%s and slope > %.4f and buy_score > %.6f' "
+        "before=%s after=%s skipped=%s price_ok=%s buy_score_nonzero=%s",
+        _price_condition_text(min_price, max_price),
         float(min_slope),
         float(min_buy_score),
         before,
         len(out),
         before - len(out),
+        int(price_mask.sum()),
         int((buy_s > float(min_buy_score)).sum()),
     )
 
@@ -233,7 +268,7 @@ def _apply_sell_display_guard(df: pd.DataFrame) -> pd.DataFrame:
     SELL TOP10 / AI SELL 表示前フィルタ。
 
     条件:
-      close > 200
+      min_price < close <= max_price
       slope < max_sell_slope
       sell_score > 0
 
@@ -247,6 +282,7 @@ def _apply_sell_display_guard(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
     min_price = _resolve_min_price()
+    max_price = _resolve_max_price()
     max_slope = _resolve_max_sell_slope()
     min_sell_score = _resolve_min_sell_score()
 
@@ -255,22 +291,24 @@ def _apply_sell_display_guard(df: pd.DataFrame) -> pd.DataFrame:
     sell_s = _select_sell_score_series(out)
 
     before = len(out)
+    price_mask = _apply_price_cap(price_s, min_price, max_price)
 
     out = out[
-        (price_s > float(min_price))
+        price_mask
         & (slope_s < float(max_slope))
         & (sell_s > float(min_sell_score))
     ].copy()
 
     logger.info(
-        "[SUMMARY DISPLAY SORTING] SELL guard condition='close > %.1f and slope < %.4f and sell_score > %.6f' "
-        "before=%s after=%s skipped=%s sell_score_nonzero=%s",
-        float(min_price),
+        "[SUMMARY DISPLAY SORTING] SELL guard condition='%s and slope < %.4f and sell_score > %.6f' "
+        "before=%s after=%s skipped=%s price_ok=%s sell_score_nonzero=%s",
+        _price_condition_text(min_price, max_price),
         float(max_slope),
         float(min_sell_score),
         before,
         len(out),
         before - len(out),
+        int(price_mask.sum()),
         int((sell_s > float(min_sell_score)).sum()),
     )
 
@@ -332,7 +370,8 @@ def prepare_buy_df(df: pd.DataFrame) -> pd.DataFrame:
 
     重要:
       TOP10抽出前に対象外を除外する。
-      close <= 200 は除外。
+      close <= min_price は除外。
+      close > max_price は除外。
       buy_score <= 0 は除外。
     """
     df = dedupe_one_row_per_symbol(df)
@@ -357,7 +396,8 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
 
     重要:
       TOP10抽出前に対象外を除外する。
-      close <= 200 は除外。
+      close <= min_price は除外。
+      close > max_price は除外。
       sell_score <= 0 は除外。
     """
     df = dedupe_one_row_per_symbol(df)
@@ -407,7 +447,8 @@ def prepare_ai_buy_df(df: pd.DataFrame) -> pd.DataFrame:
     AI BUY通過表示用。
 
     AI通過済みでも、
-      close <= 200
+      close <= min_price
+      close > max_price
       buy_score <= 0
     は表示対象外。
     """
@@ -425,7 +466,8 @@ def prepare_ai_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     AI SELL通過表示用。
 
     AI通過済みでも、
-      close <= 200
+      close <= min_price
+      close > max_price
       sell_score <= 0
     は表示対象外。
     """
