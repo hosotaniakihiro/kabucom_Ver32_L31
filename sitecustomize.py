@@ -1,6 +1,6 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver49-SUMMARY-AI-CANDIDATE-REFILL
+# Version: Ver50-PUSH-SUMMARY-REALTIME-DB-PROCESS
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # main.py は軽量同期 + background install。
@@ -22,6 +22,10 @@
 #   - SUMMARY AI の候補が SELL不可除外で0件になる場合に、候補母集団を
 #     拡大し、必要時はTONOSAMA前段フィルタなしで一度だけ再評価する
 #     SUMMARY_AI_CANDIDATE_REFILL を main.py background patch に追加。
+#
+# V50:
+#   - PUSH保存後の1分足summary遅延対策として、DB/data collector系の
+#     minimal patch に PUSH_SUMMARY_REALTIME を追加。
 # ============================================================
 from __future__ import annotations
 
@@ -263,6 +267,7 @@ DB_SYNC_PATCHES = [
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
     ("core.startup.yahoo_summary_direct_upsert_conflict_patch", "YAHOO_DIRECT_UPSERT_CONFLICT", "DISABLE_YAHOO_DIRECT_UPSERT_CONFLICT_PATCH"),
     ("core.startup.summary_stale_guard_patch", "SUMMARY_STALE_GUARD", "DISABLE_SUMMARY_STALE_GUARD_PATCH"),
+    ("core.startup.push_summary_realtime_patch", "PUSH_SUMMARY_REALTIME", "DISABLE_PUSH_SUMMARY_REALTIME_PATCH"),
 ]
 
 SYNC_MAIN_PATCHES = [
