@@ -1,24 +1,72 @@
 # -*- coding: utf-8 -*-
 """
 Compatibility installer for centralized runtime environment defaults.
+
+V22 fixes an ImportError seen in data collector children:
+    cannot import name 'apply_site_defaults' from core.startup.runtime_env_defaults
+The defaults module currently exposes grouped apply_*_defaults functions, so this
+module now builds apply_site_defaults/apply_user_defaults locally when the old
+aggregate helpers are not present.
 """
 from __future__ import annotations
 
 import logging
 import os
 import sys
-from typing import Dict
+from typing import Callable, Dict
 
 from .runtime_env_default_registry import SITE_GROUP_ORDER, USER_GROUP_ORDER
 from .runtime_env_default_registry import VERSION as REGISTRY_VERSION
-from .runtime_env_defaults import VERSION as DEFAULTS_VERSION
-from .runtime_env_defaults import apply_site_defaults, apply_user_defaults, env_bool
 from .runtime_settings_ini_loader import VERSION as SETTINGS_INI_VERSION
 from .runtime_settings_ini_loader import load_settings_ini
+from . import runtime_env_defaults as _defaults
 
 logger = logging.getLogger(__name__)
-VERSION = "REV21-RUNTIME-ENV-DEFAULTS-PATCH-DB-REALTIME-SUMMARY-PRIORITY"
+VERSION = "REV22-RUNTIME-ENV-DEFAULTS-PATCH-COMPAT-GROUPED-DEFAULTS"
+DEFAULTS_VERSION = getattr(_defaults, "VERSION", "unknown")
+env_bool = getattr(_defaults, "env_bool")
 _INSTALLED = False
+
+
+_GROUP_APPLIERS: dict[str, Callable[..., Dict[str, str]]] = {
+    "push": getattr(_defaults, "apply_push_defaults"),
+    "rescue": getattr(_defaults, "apply_rescue_defaults"),
+    "db": getattr(_defaults, "apply_db_defaults"),
+    "helper": getattr(_defaults, "apply_helper_defaults"),
+    "main_restore": getattr(_defaults, "apply_main_restore_defaults"),
+    "ranking_entry": getattr(_defaults, "apply_ranking_entry_defaults"),
+    "tonosama": getattr(_defaults, "apply_tonosama_defaults"),
+    "entry": getattr(_defaults, "apply_entry_defaults"),
+    "summary_yahoo": getattr(_defaults, "apply_summary_yahoo_defaults"),
+}
+
+
+def _apply_groups(order: tuple[str, ...], *, context: str) -> Dict[str, str]:
+    applied: Dict[str, str] = {}
+    for name in order:
+        fn = _GROUP_APPLIERS.get(name)
+        if not callable(fn):
+            logger.warning("[RUNTIME ENV DEFAULTS PATCH] group applier missing name=%s context=%s", name, context)
+            continue
+        try:
+            applied.update(fn())
+        except Exception:
+            logger.exception("[RUNTIME ENV DEFAULTS PATCH] group apply failed name=%s context=%s", name, context)
+    return applied
+
+
+def apply_site_defaults(*, context: str = "unknown") -> Dict[str, str]:
+    old = getattr(_defaults, "apply_site_defaults", None)
+    if callable(old):
+        return old(context=context)
+    return _apply_groups(SITE_GROUP_ORDER, context=context)
+
+
+def apply_user_defaults(*, context: str = "unknown") -> Dict[str, str]:
+    old = getattr(_defaults, "apply_user_defaults", None)
+    if callable(old):
+        return old(context=context)
+    return _apply_groups(USER_GROUP_ORDER, context=context)
 
 
 def _argv_context() -> str:
@@ -35,18 +83,23 @@ def _argv_context() -> str:
     return "unknown"
 
 
-def _install_entry_fire_rescue(context: str) -> bool:
+def _safe_install(label: str, context: str, allowed: set[str], env_disable: str, module_name: str) -> bool:
     try:
-        if context not in {"main", "helper"}:
+        if context not in allowed:
             return False
-        if os.environ.get("DISABLE_ENTRY_FIRE_RESCUE_PATCH", "").strip() == "1":
-            logger.warning("[RUNTIME ENV DEFAULTS PATCH] entry fire rescue disabled by env")
+        if os.environ.get(env_disable, "").strip() == "1":
+            logger.warning("[RUNTIME ENV DEFAULTS PATCH] %s disabled by env", label)
             return False
-        from . import entry_fire_rescue_runtime_patch
-        return bool(entry_fire_rescue_runtime_patch.install())
+        mod = __import__(f"core.startup.{module_name}", fromlist=["install"])
+        fn = getattr(mod, "install", None)
+        return bool(fn()) if callable(fn) else False
     except Exception:
-        logger.exception("[RUNTIME ENV DEFAULTS PATCH] entry fire rescue install failed")
+        logger.exception("[RUNTIME ENV DEFAULTS PATCH] %s install failed", label)
         return False
+
+
+def _install_entry_fire_rescue(context: str) -> bool:
+    return _safe_install("entry fire rescue", context, {"main", "helper"}, "DISABLE_ENTRY_FIRE_RESCUE_PATCH", "entry_fire_rescue_runtime_patch")
 
 
 def _install_summary_pending_stale_guard(context: str) -> bool:
@@ -67,32 +120,11 @@ def _install_summary_pending_stale_guard(context: str) -> bool:
 
 
 def _install_summary_db_realtime_priority(context: str) -> bool:
-    """Install DB-process 1m-first summary latency guard."""
-    try:
-        if context not in {"main_database", "helper"}:
-            return False
-        if os.environ.get("DISABLE_SUMMARY_DB_REALTIME_PRIORITY_PATCH", "").strip() == "1":
-            logger.warning("[RUNTIME ENV DEFAULTS PATCH] summary DB realtime priority disabled by env")
-            return False
-        from . import summary_db_realtime_priority_patch
-        return bool(summary_db_realtime_priority_patch.install())
-    except Exception:
-        logger.exception("[RUNTIME ENV DEFAULTS PATCH] summary DB realtime priority install failed")
-        return False
+    return _safe_install("summary DB realtime priority", context, {"main_database", "helper"}, "DISABLE_SUMMARY_DB_REALTIME_PRIORITY_PATCH", "summary_db_realtime_priority_patch")
 
 
 def _install_ranking_entry_runtime_rescue(context: str) -> bool:
-    try:
-        if context not in {"main", "helper"}:
-            return False
-        if os.environ.get("DISABLE_RANKING_ENTRY_RUNTIME_RESCUE_PATCH", "").strip() == "1":
-            logger.warning("[RUNTIME ENV DEFAULTS PATCH] ranking entry runtime rescue disabled by env")
-            return False
-        from . import ranking_entry_runtime_rescue_patch
-        return bool(ranking_entry_runtime_rescue_patch.install())
-    except Exception:
-        logger.exception("[RUNTIME ENV DEFAULTS PATCH] ranking entry runtime rescue install failed")
-        return False
+    return _safe_install("ranking entry runtime rescue", context, {"main", "helper"}, "DISABLE_RANKING_ENTRY_RUNTIME_RESCUE_PATCH", "ranking_entry_runtime_rescue_patch")
 
 
 def _install_low_volatility_entry_guard(context: str) -> bool:
@@ -117,185 +149,55 @@ def _install_low_volatility_entry_guard(context: str) -> bool:
 
 
 def _install_push_registration_recovery(context: str) -> bool:
-    try:
-        if context not in {"main_database", "helper", "main"}:
-            return False
-        if os.environ.get("DISABLE_PUSH_REGISTER_RECOVERY_PATCH", "").strip() == "1":
-            logger.warning("[RUNTIME ENV DEFAULTS PATCH] push register recovery disabled by env")
-            return False
-        from . import push_registration_recovery_patch
-        return bool(push_registration_recovery_patch.install())
-    except Exception:
-        logger.exception("[RUNTIME ENV DEFAULTS PATCH] push register recovery install failed")
-        return False
+    return _safe_install("push register recovery", context, {"main_database", "helper", "main"}, "DISABLE_PUSH_REGISTER_RECOVERY_PATCH", "push_registration_recovery_patch")
 
 
 def _install_common_day_position_guard(context: str) -> bool:
-    try:
-        if context not in {"main", "helper"}:
-            return False
-        if os.environ.get("DISABLE_COMMON_ENTRY_DAY_POSITION_GUARD", "").strip() == "1":
-            logger.warning("[RUNTIME ENV DEFAULTS PATCH] common day position guard disabled by env")
-            return False
-        from . import common_entry_day_position_guard_patch
-        return bool(common_entry_day_position_guard_patch.install())
-    except Exception:
-        logger.exception("[RUNTIME ENV DEFAULTS PATCH] common day position guard install failed")
-        return False
+    return _safe_install("common day position guard", context, {"main", "helper"}, "DISABLE_COMMON_ENTRY_DAY_POSITION_GUARD", "common_entry_day_position_guard_patch")
 
 
 def _install_strict_final_liquidity_guard(context: str) -> bool:
-    try:
-        if context not in {"main", "helper"}:
-            return False
-        if os.environ.get("DISABLE_ENTRY_HANDLER_STRICT_RECENT_LIQ_PATCH", "").strip() == "1":
-            logger.warning("[RUNTIME ENV DEFAULTS PATCH] strict final liquidity guard disabled by env")
-            return False
-        from . import entry_handler_strict_recent_liquidity_patch
-        return bool(entry_handler_strict_recent_liquidity_patch.install())
-    except Exception:
-        logger.exception("[RUNTIME ENV DEFAULTS PATCH] strict final liquidity guard install failed")
-        return False
+    return _safe_install("strict final liquidity guard", context, {"main", "helper"}, "DISABLE_ENTRY_HANDLER_STRICT_RECENT_LIQ_PATCH", "entry_handler_strict_recent_liquidity_patch")
 
 
 def _install_tonosama_exit_source_infer(context: str) -> bool:
-    try:
-        if context not in {"main", "helper"}:
-            return False
-        if os.environ.get("DISABLE_TONOSAMA_EXIT_SOURCE_INFER_PATCH", "").strip() == "1":
-            logger.warning("[RUNTIME ENV DEFAULTS PATCH] tonosama exit infer disabled by env")
-            return False
-        from . import tonosama_exit_source_infer_patch
-        return bool(tonosama_exit_source_infer_patch.install())
-    except Exception:
-        logger.exception("[RUNTIME ENV DEFAULTS PATCH] tonosama exit infer install failed")
-        return False
+    return _safe_install("tonosama exit infer", context, {"main", "helper"}, "DISABLE_TONOSAMA_EXIT_SOURCE_INFER_PATCH", "tonosama_exit_source_infer_patch")
 
 
 def _install_tonosama_pending_candidate_audit(context: str) -> bool:
-    try:
-        if context not in {"main", "helper"}:
-            return False
-        if os.environ.get("DISABLE_TONOSAMA_PENDING_CANDIDATE_AUDIT_PATCH", "").strip() == "1":
-            logger.warning("[RUNTIME ENV DEFAULTS PATCH] tonosama pending candidate audit disabled by env")
-            return False
-        from . import tonosama_pending_candidate_audit_patch
-        return bool(tonosama_pending_candidate_audit_patch.install())
-    except Exception:
-        logger.exception("[RUNTIME ENV DEFAULTS PATCH] tonosama pending candidate audit install failed")
-        return False
+    return _safe_install("tonosama pending candidate audit", context, {"main", "helper"}, "DISABLE_TONOSAMA_PENDING_CANDIDATE_AUDIT_PATCH", "tonosama_pending_candidate_audit_patch")
 
 
 def _install_daytrade_credit_force_close(context: str) -> bool:
-    try:
-        if context not in {"main", "helper"}:
-            return False
-        if os.environ.get("DISABLE_DAYTRADE_CREDIT_FORCE_CLOSE_PATCH", "").strip() == "1":
-            logger.warning("[RUNTIME ENV DEFAULTS PATCH] daytrade credit force close disabled by env")
-            return False
-        from . import daytrade_credit_force_close_patch
-        return bool(daytrade_credit_force_close_patch.install())
-    except Exception:
-        logger.exception("[RUNTIME ENV DEFAULTS PATCH] daytrade credit force close install failed")
-        return False
+    return _safe_install("daytrade credit force close", context, {"main", "helper"}, "DISABLE_DAYTRADE_CREDIT_FORCE_CLOSE_PATCH", "daytrade_credit_force_close_patch")
 
 
 def _install_database_owner(context: str) -> bool:
-    try:
-        if context not in {"main", "helper", "main_database"}:
-            return False
-        if os.environ.get("DISABLE_DATABASE_OWNER_RUNTIME_PATCH", "").strip() == "1":
-            logger.warning("[RUNTIME ENV DEFAULTS PATCH] database owner patch disabled by env")
-            return False
-        from . import database_owner_runtime_patch
-        return bool(database_owner_runtime_patch.install())
-    except Exception:
-        logger.exception("[RUNTIME ENV DEFAULTS PATCH] database owner install failed")
-        return False
+    return _safe_install("database owner", context, {"main", "helper", "main_database"}, "DISABLE_DATABASE_OWNER_RUNTIME_PATCH", "database_owner_runtime_patch")
 
 
 def _install_entry_count_unblock(context: str) -> bool:
-    try:
-        if context not in {"main", "helper", "main_database"}:
-            return False
-        if os.environ.get("DISABLE_ENTRY_COUNT_UNBLOCK_PATCH", "").strip() == "1":
-            logger.warning("[RUNTIME ENV DEFAULTS PATCH] entry count unblock disabled by env")
-            return False
-        from . import entry_count_unblock_runtime_patch
-        return bool(entry_count_unblock_runtime_patch.install())
-    except Exception:
-        logger.exception("[RUNTIME ENV DEFAULTS PATCH] entry count unblock install failed")
-        return False
+    return _safe_install("entry count unblock", context, {"main", "helper", "main_database"}, "DISABLE_ENTRY_COUNT_UNBLOCK_PATCH", "entry_count_unblock_runtime_patch")
 
 
 def _install_full_pipeline_stability(context: str) -> bool:
-    try:
-        if context not in {"main", "helper", "main_database"}:
-            return False
-        if os.environ.get("DISABLE_FULL_PIPELINE_STABILITY_PATCH", "").strip() == "1":
-            logger.warning("[RUNTIME ENV DEFAULTS PATCH] full pipeline stability disabled by env")
-            return False
-        from . import full_pipeline_stability_runtime_patch
-        return bool(full_pipeline_stability_runtime_patch.install())
-    except Exception:
-        logger.exception("[RUNTIME ENV DEFAULTS PATCH] full pipeline stability install failed")
-        return False
+    return _safe_install("full pipeline stability", context, {"main", "helper", "main_database"}, "DISABLE_FULL_PIPELINE_STABILITY_PATCH", "full_pipeline_stability_runtime_patch")
 
 
 def _install_summary_db_lock_pressure(context: str) -> bool:
-    try:
-        if context not in {"main", "helper", "main_database"}:
-            return False
-        if os.environ.get("DISABLE_SUMMARY_DB_LOCK_PRESSURE_PATCH", "").strip() == "1":
-            logger.warning("[RUNTIME ENV DEFAULTS PATCH] summary DB lock pressure patch disabled by env")
-            return False
-        from . import summary_db_lock_pressure_patch
-        return bool(summary_db_lock_pressure_patch.install())
-    except Exception:
-        logger.exception("[RUNTIME ENV DEFAULTS PATCH] summary DB lock pressure install failed")
-        return False
+    return _safe_install("summary DB lock pressure", context, {"main", "helper", "main_database"}, "DISABLE_SUMMARY_DB_LOCK_PRESSURE_PATCH", "summary_db_lock_pressure_patch")
 
 
 def _install_intraday_load_guard(context: str) -> bool:
-    try:
-        if context not in {"main", "helper", "main_database"}:
-            return False
-        if os.environ.get("DISABLE_INTRADAY_LOAD_GUARD_PATCH", "").strip() == "1":
-            logger.warning("[RUNTIME ENV DEFAULTS PATCH] intraday load guard disabled by env")
-            return False
-        from . import intraday_load_guard_patch
-        return bool(intraday_load_guard_patch.install())
-    except Exception:
-        logger.exception("[RUNTIME ENV DEFAULTS PATCH] intraday load guard install failed")
-        return False
+    return _safe_install("intraday load guard", context, {"main", "helper", "main_database"}, "DISABLE_INTRADAY_LOAD_GUARD_PATCH", "intraday_load_guard_patch")
 
 
 def _install_yahoo_parallel_empty_cooldown(context: str) -> bool:
-    try:
-        if context not in {"main_database", "helper", "main"}:
-            return False
-        if os.environ.get("DISABLE_YAHOO_PARALLEL_EMPTY_COOLDOWN_PATCH", "").strip() == "1":
-            logger.warning("[RUNTIME ENV DEFAULTS PATCH] yahoo parallel empty cooldown disabled by env")
-            return False
-        from . import yahoo_parallel_empty_cooldown_patch
-        return bool(yahoo_parallel_empty_cooldown_patch.install())
-    except Exception:
-        logger.exception("[RUNTIME ENV DEFAULTS PATCH] yahoo parallel empty cooldown install failed")
-        return False
+    return _safe_install("yahoo parallel empty cooldown", context, {"main_database", "helper", "main"}, "DISABLE_YAHOO_PARALLEL_EMPTY_COOLDOWN_PATCH", "yahoo_parallel_empty_cooldown_patch")
 
 
 def _install_ranking_legacy_inline_flush(context: str) -> bool:
-    try:
-        if context not in {"main_database", "helper", "main"}:
-            return False
-        if os.environ.get("DISABLE_RANKING_LEGACY_INLINE_FLUSH_PATCH", "").strip() == "1":
-            logger.warning("[RUNTIME ENV DEFAULTS PATCH] ranking legacy inline flush disabled by env")
-            return False
-        from . import ranking_legacy_inline_flush_patch
-        return bool(ranking_legacy_inline_flush_patch.install())
-    except Exception:
-        logger.exception("[RUNTIME ENV DEFAULTS PATCH] ranking legacy inline flush install failed")
-        return False
+    return _safe_install("ranking legacy inline flush", context, {"main_database", "helper", "main"}, "DISABLE_RANKING_LEGACY_INLINE_FLUSH_PATCH", "ranking_legacy_inline_flush_patch")
 
 
 def install() -> bool:
@@ -308,6 +210,7 @@ def install() -> bool:
         applied: Dict[str, str] = {}
         applied.update(apply_site_defaults(context=context))
         applied.update(apply_user_defaults(context=context))
+
         intraday_load_guard_ok = _install_intraday_load_guard(context)
         yahoo_parallel_empty_ok = _install_yahoo_parallel_empty_cooldown(context)
         ranking_legacy_inline_ok = _install_ranking_legacy_inline_flush(context)
@@ -367,4 +270,4 @@ def install() -> bool:
         return False
 
 
-__all__ = ["VERSION", "install"]
+__all__ = ["VERSION", "install", "apply_site_defaults", "apply_user_defaults"]
