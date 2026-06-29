@@ -17,7 +17,7 @@ from .runtime_settings_ini_loader import VERSION as SETTINGS_INI_VERSION
 from .runtime_settings_ini_loader import load_settings_ini
 
 logger = logging.getLogger(__name__)
-VERSION = "REV19-RUNTIME-ENV-DEFAULTS-PATCH-LEGACY-YAHOO-COOLDOWN"
+VERSION = "REV20-RUNTIME-ENV-DEFAULTS-PATCH-SUMMARY-PENDING-STALE-GUARD"
 _INSTALLED = False
 
 
@@ -46,6 +46,30 @@ def _install_entry_fire_rescue(context: str) -> bool:
         return bool(entry_fire_rescue_runtime_patch.install())
     except Exception:
         logger.exception("[RUNTIME ENV DEFAULTS PATCH] entry fire rescue install failed")
+        return False
+
+
+def _install_summary_pending_stale_guard(context: str) -> bool:
+    """
+    SUMMARY_AI の古いDB fallback候補を pending 登録前に止める。
+
+    以前は別パッチ経由で遅れて入る場合があり、main.py 起動ログで
+    [SUMMARY ENTRY PENDING FIX] installed v2 のまま残ることがあった。
+    runtime defaults の早い段階で明示 install して、v3 以降を確実に有効化する。
+    """
+    try:
+        if context not in {"main", "helper"}:
+            return False
+        if os.environ.get("DISABLE_SUMMARY_ENTRY_PENDING_FIX_PATCH", "").strip() == "1":
+            logger.warning("[RUNTIME ENV DEFAULTS PATCH] summary pending stale guard disabled by env")
+            return False
+        os.environ.setdefault("SUMMARY_SKIP_STALE_PENDING_ENABLED", "1")
+        os.environ.setdefault("SUMMARY_SKIP_MISSING_DATETIME_PENDING", "1")
+        os.environ.setdefault("SUMMARY_ENTRY_PENDING_MAX_AGE_SEC", "180")
+        from . import summary_entry_pending_existing_fix_patch
+        return bool(summary_entry_pending_existing_fix_patch.install())
+    except Exception:
+        logger.exception("[RUNTIME ENV DEFAULTS PATCH] summary pending stale guard install failed")
         return False
 
 
@@ -283,6 +307,7 @@ def install() -> bool:
         database_owner_ok = _install_database_owner(context)
         full_pipeline_ok = _install_full_pipeline_stability(context)
         entry_count_unblock_ok = _install_entry_count_unblock(context)
+        summary_pending_stale_ok = _install_summary_pending_stale_guard(context)
         entry_fire_rescue_ok = _install_entry_fire_rescue(context)
         ranking_entry_rescue_ok = _install_ranking_entry_runtime_rescue(context)
         low_vol_guard_ok = _install_low_volatility_entry_guard(context)
@@ -294,7 +319,7 @@ def install() -> bool:
         daytrade_credit_ok = _install_daytrade_credit_force_close(context)
         _INSTALLED = True
         logger.warning(
-            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s intraday_load_guard=%s yahoo_parallel_empty=%s ranking_legacy_inline=%s summary_lock_pressure=%s database_owner=%s full_pipeline=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s tonosama_exit_infer=%s tonosama_pending_audit=%s daytrade_credit=%s verbose=%s",
+            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s intraday_load_guard=%s yahoo_parallel_empty=%s ranking_legacy_inline=%s summary_lock_pressure=%s database_owner=%s full_pipeline=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s summary_pending_stale=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s tonosama_exit_infer=%s tonosama_pending_audit=%s daytrade_credit=%s verbose=%s",
             VERSION,
             DEFAULTS_VERSION,
             REGISTRY_VERSION,
@@ -314,6 +339,7 @@ def install() -> bool:
             os.environ.get("USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES"),
             os.environ.get("USERCUSTOMIZE_ENABLE_TONOSAMA_RESCUE_PATCHES"),
             entry_count_unblock_ok,
+            summary_pending_stale_ok,
             entry_fire_rescue_ok,
             ranking_entry_rescue_ok,
             low_vol_guard_ok,
