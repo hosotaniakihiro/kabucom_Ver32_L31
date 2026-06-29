@@ -1,40 +1,17 @@
 # ============================================================
 # File   : core/startup/summary_mtf_early_ready_patch.py
-# Version: V1.2-SUMMARY-MTF-EARLY-READY-CHAIN-NEUTRAL-SCORE-GUARD
+# Version: V1.3-SUMMARY-MTF-EARLY-READY-CHAIN-PUSH-RAW-FALLBACK
 # ------------------------------------------------------------
 # 【目的】
 #   SUMMARY 3m/5m の AI entry が
 #     summary_mtf_not_ready:hist_short:<14
 #   で全落ちし、5MAを超えた初動を拾えない問題を緩和する。
 #
-# 【V1.1追加】
-#   - summary_controller の 3m/5m merged cache が latest-only で保存され、
-#     次サイクルで履歴不足に戻る問題を修正。
-#   - choose_merged_cache_payload() を runtime patch し、1m/3m/5m すべてで
-#     df_hist を merged cache に保持する。
-#
-# 【V1.2追加】
-#   - summary_controller_neutral_score_guard_patch を連鎖installする。
-#   - controller_projection / controller_cache 後段で
-#     score=-1 / score_sell=1 / RSI=50 / MACD=0 / slope=0 が復活する問題を抑制。
-#
-# 【背景】
-#   AI/entry_gate.py Ver26.33 は SUMMARY 3m/5m で symbol_hist_len < 14 を
-#   fail-close する。これは安全だが、ユーザー要望の
-#   「3分足/5分足の5MA超えの早い段階で入りたい」と矛盾する。
-#
-# 【方針】
-#   - AI.entry_gate._summary_mtf_status を runtime patch
-#   - 元判定が hist_short で block の場合だけ救済判定
-#   - technical_ready/display_ready があり、hist が一定以上、MA5/close/slope の方向が合う場合は skip に変換
-#   - それ以外は元の block を維持
-#   - controller_cache は latest-only payload ではなく history payload を保持
-#
-# 【ENV】
-#   SUMMARY_MTF_EARLY_READY_ENABLED=1
-#   SUMMARY_MTF_EARLY_HIST_MIN=5
-#   SUMMARY_MTF_EARLY_MIN_SCORE=1.0
-#   SUMMARY_MTF_EARLY_MIN_SLOPE=0.0001
+# 【V1.3追加】
+#   - main.py memory_only 運用で 3m/5m PUSH summary が空になる場合に備え、
+#     summary_mtf_push_raw_fallback_patch を連鎖installする。
+#   - global_data.push_df など raw PUSH から3m/5mを軽量生成するため、
+#     MERGED GET tf=3 source=push rows=0 の起動直後問題を緩和する。
 # ============================================================
 
 from __future__ import annotations
@@ -49,6 +26,7 @@ _PATCHED = False
 _ORIGINAL_SUMMARY_MTF_STATUS = None
 _CONTROLLER_CACHE_PATCHED = False
 _NEUTRAL_SCORE_GUARD_INSTALLED = False
+_PUSH_RAW_FALLBACK_INSTALLED = False
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -192,10 +170,23 @@ def _install_neutral_score_guard() -> bool:
         return False
 
 
+def _install_push_raw_fallback() -> bool:
+    global _PUSH_RAW_FALLBACK_INSTALLED
+    if _PUSH_RAW_FALLBACK_INSTALLED:
+        return True
+    try:
+        from core.startup import summary_mtf_push_raw_fallback_patch as raw_fallback
+        ok = bool(raw_fallback.install())
+        _PUSH_RAW_FALLBACK_INSTALLED = ok
+        logger.warning("[SUMMARY MTF EARLY READY PATCH] push raw mtf fallback installed=%s", ok)
+        return ok
+    except Exception:
+        logger.exception("[SUMMARY MTF EARLY READY PATCH] push raw mtf fallback install failed")
+        return False
+
+
 def _install_controller_cache_history_payload_patch() -> bool:
-    """
-    3m/5m merged cache が latest-only になるのを防ぐ。
-    """
+    """3m/5m merged cache が latest-only になるのを防ぐ。"""
     global _CONTROLLER_CACHE_PATCHED
     if _CONTROLLER_CACHE_PATCHED:
         return True
@@ -214,11 +205,7 @@ def _install_controller_cache_history_payload_patch() -> bool:
 
         def _choose_merged_cache_payload_history_first(interval, df_hist, df_latest, normalize_fn):
             try:
-                payload = cc.limit_history_rows_per_symbol(
-                    df_hist,
-                    int(interval),
-                    normalize_fn=normalize_fn,
-                )
+                payload = cc.limit_history_rows_per_symbol(df_hist, int(interval), normalize_fn=normalize_fn)
                 payload = cc.dedupe_symbol_datetime(payload, normalize_fn=normalize_fn)
                 payload = cc.attach_display_ready(payload)
 
@@ -239,16 +226,10 @@ def _install_controller_cache_history_payload_patch() -> bool:
                     )
                     return payload
 
-                logger.warning(
-                    "[SUMMARY CACHE HISTORY PAYLOAD PATCH] interval=%s history empty -> fallback old latest payload",
-                    interval,
-                )
+                logger.warning("[SUMMARY CACHE HISTORY PAYLOAD PATCH] interval=%s history empty -> fallback old latest payload", interval)
                 return old_fn(interval, df_hist, df_latest, normalize_fn)
             except Exception:
-                logger.exception(
-                    "[SUMMARY CACHE HISTORY PAYLOAD PATCH] failed interval=%s -> fallback old",
-                    interval,
-                )
+                logger.exception("[SUMMARY CACHE HISTORY PAYLOAD PATCH] failed interval=%s -> fallback old", interval)
                 return old_fn(interval, df_hist, df_latest, normalize_fn)
 
         _choose_merged_cache_payload_history_first._history_payload_patch_v1 = True  # type: ignore[attr-defined]
@@ -256,9 +237,7 @@ def _install_controller_cache_history_payload_patch() -> bool:
         cc.choose_merged_cache_payload = _choose_merged_cache_payload_history_first
 
         _CONTROLLER_CACHE_PATCHED = True
-        logger.warning(
-            "[SUMMARY MTF EARLY READY PATCH] controller_cache history payload patch installed: merged cache keeps history for 1m/3m/5m"
-        )
+        logger.warning("[SUMMARY MTF EARLY READY PATCH] controller_cache history payload patch installed: merged cache keeps history for 1m/3m/5m")
         return True
     except Exception:
         logger.exception("[SUMMARY MTF EARLY READY PATCH] controller_cache history payload patch install failed")
@@ -270,9 +249,10 @@ def install() -> bool:
 
     neutral_ok = _install_neutral_score_guard()
     controller_ok = _install_controller_cache_history_payload_patch()
+    raw_fallback_ok = _install_push_raw_fallback()
 
     if _PATCHED:
-        return bool(controller_ok or neutral_ok)
+        return bool(controller_ok or neutral_ok or raw_fallback_ok)
 
     try:
         import AI.entry_gate as target
@@ -280,10 +260,10 @@ def install() -> bool:
         cur = getattr(target, "_summary_mtf_status", None)
         if not callable(cur):
             logger.warning("[SUMMARY MTF EARLY READY PATCH] target _summary_mtf_status not callable")
-            return bool(controller_ok or neutral_ok)
+            return bool(controller_ok or neutral_ok or raw_fallback_ok)
         if getattr(cur, "_summary_mtf_early_ready_patch", False):
             _PATCHED = True
-            return bool(controller_ok or neutral_ok)
+            return bool(controller_ok or neutral_ok or raw_fallback_ok)
 
         _ORIGINAL_SUMMARY_MTF_STATUS = cur
 
@@ -310,14 +290,15 @@ def install() -> bool:
         target._summary_mtf_status = _patched_summary_mtf_status
         _PATCHED = True
         logger.warning(
-            "[SUMMARY MTF EARLY READY PATCH] installed controller_cache_history_payload=%s neutral_score_guard=%s",
+            "[SUMMARY MTF EARLY READY PATCH] installed controller_cache_history_payload=%s neutral_score_guard=%s push_raw_fallback=%s",
             controller_ok,
             neutral_ok,
+            raw_fallback_ok,
         )
         return True
     except Exception:
         logger.exception("[SUMMARY MTF EARLY READY PATCH] install failed")
-        return bool(controller_ok or neutral_ok)
+        return bool(controller_ok or neutral_ok or raw_fallback_ok)
 
 
 __all__ = ["install"]
