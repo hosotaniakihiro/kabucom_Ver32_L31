@@ -40,11 +40,26 @@ def _b(v) -> bool:
         return False
 
 
-def _add_reason(row, key: str, score: int):
-    """reason dict に安全加算"""
-    if "score_reasons" not in row or not isinstance(row["score_reasons"], dict):
-        row["score_reasons"] = {}
-    row["score_reasons"][key] = row["score_reasons"].get(key, 0) + int(score)
+def _add_reason(df: pd.DataFrame, idx, key: str, score: int):
+    """score_reasons dict に安全加算して DataFrame へ確実に反映する"""
+    try:
+        cur = df.at[idx, "score_reasons"] if "score_reasons" in df.columns else {}
+
+        if not isinstance(cur, dict):
+            cur = {}
+        else:
+            cur = dict(cur)
+
+        cur[key] = cur.get(key, 0) + int(score)
+        df.at[idx, "score_reasons"] = cur
+
+    except Exception:
+        logger.exception(
+            "[pattern_dispatcher] add reason failed idx=%s key=%s score=%s",
+            idx,
+            key,
+            score,
+        )
 
 
 # ============================================================
@@ -110,7 +125,7 @@ def dispatch_patterns(df: pd.DataFrame) -> pd.DataFrame:
                 continue
 
             df.at[idx, "score_total"] += score
-            _add_reason(df.at[idx], key, score)
+            _add_reason(df, idx, key, score)
 
         # ================================
         # 🔵 BUY BONUS（ini 直結）
@@ -118,7 +133,7 @@ def dispatch_patterns(df: pd.DataFrame) -> pd.DataFrame:
         for key, score in BUY_BONUS_TABLE.items():
             if _b(row.get(key)):
                 df.at[idx, "score_total"] += score
-                _add_reason(df.at[idx], key, score)
+                _add_reason(df, idx, key, score)
 
         # ================================
         # 🔴 SELL ENTRY
@@ -139,7 +154,7 @@ def dispatch_patterns(df: pd.DataFrame) -> pd.DataFrame:
                 continue
 
             df.at[idx, "score_total"] += score
-            _add_reason(df.at[idx], key, score)
+            _add_reason(df, idx, key, score)
 
         # ================================
         # 🔴 SELL BONUS（ini 直結）
@@ -147,7 +162,7 @@ def dispatch_patterns(df: pd.DataFrame) -> pd.DataFrame:
         for key, score in SELL_BONUS_TABLE.items():
             if _b(row.get(key)):
                 df.at[idx, "score_total"] += score
-                _add_reason(df.at[idx], key, score)
+                _add_reason(df, idx, key, score)
 
         # ================================
         # 🔵 BUY / 🔴 SELL ロジック BONUS
@@ -157,7 +172,7 @@ def dispatch_patterns(df: pd.DataFrame) -> pd.DataFrame:
             if b_score:
                 df.at[idx, "score_total"] += int(b_score)
                 for k in b_labels:
-                    _add_reason(df.at[idx], k, int(b_score))
+                    _add_reason(df, idx, k, int(b_score))
         except Exception:
             pass
 
@@ -166,7 +181,7 @@ def dispatch_patterns(df: pd.DataFrame) -> pd.DataFrame:
             if s_score:
                 df.at[idx, "score_total"] += int(s_score)
                 for k in s_labels:
-                    _add_reason(df.at[idx], k, int(s_score))
+                    _add_reason(df, idx, k, int(s_score))
         except Exception:
             pass
 
