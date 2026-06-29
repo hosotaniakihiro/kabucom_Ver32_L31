@@ -88,7 +88,20 @@ def _install_runtime_defaults() -> bool:
         return False
 
 
+def _install_summary_pending_age_relax() -> bool:
+    try:
+        from core.startup.summary_entry_pending_age_relax_patch import install as _install_age_relax
+
+        ok = bool(_install_age_relax())
+        logger.warning("[USERCUSTOMIZE] summary pending age relax ok=%s max_age=%s", ok, os.getenv("SUMMARY_ENTRY_PENDING_MAX_AGE_SEC"))
+        return ok
+    except Exception:
+        logger.exception("[USERCUSTOMIZE] summary pending age relax failed")
+        return False
+
+
 _install_runtime_defaults()
+_install_summary_pending_age_relax()
 
 if _is_main_py():
     for k, v in {
