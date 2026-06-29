@@ -1,15 +1,19 @@
 # ============================================================
 # File   : core/startup/final_entry_liquidity_movement_hard_guard_patch.py
-# Version: V3-TONOSAMA-LATEST-VOLUME-FALLBACK
+# Version: V4-SCALP-LIQUIDITY-THRESHOLD-RELAX
 # ------------------------------------------------------------
 # 発注直前の最終ハードガード。
 #
+# V4:
+#   - 2026-06-29 14:46 ログで 9264 が volume=33,300 / turnover=56,610,000
+#     なのに ENTRY_HARD_MIN_VOLUME=100,000 で落ちていた。
+#   - ユーザー運用方針の「直近出来高>=3,000 / 売買代金>=100万円」よりは
+#     少し厳しめ、ただしエントリー数を殺しすぎない既定値へ変更。
+#   - default: volume 100,000 -> 30,000, turnover 50,000,000 -> 10,000,000
+#
 # V3:
 #   - TONOSAMA候補の出来高は volume ではなく _latest_volume に入ることがある。
-#   - 2026-06-29 13:22ログで 7746 が AI_GATE_OK 後、
-#     _latest_volume=6,462,800 なのに volume_missing で落ちたため、
-#     _latest_volume / latest_volume / recent_volume_3m/5m も採用する。
-#   - 既存の流動性・値動きハードガードは維持する。
+#   - _latest_volume / latest_volume / recent_volume_3m/5m も採用する。
 # ============================================================
 from __future__ import annotations
 
@@ -18,6 +22,7 @@ import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
+VERSION = "V4-SCALP-LIQUIDITY-THRESHOLD-RELAX"
 _INSTALLED = False
 _ORIG_EXECUTE = None
 
@@ -145,7 +150,6 @@ def _merge_item_row(item: Any) -> dict:
             for k, v in item.items():
                 if k not in row or row.get(k) in (None, ""):
                     row[k] = v
-            # Some wrappers place the real candidate under item['entry'] or item['entry_row'].
             _copy_nested("item_alias", item, row)
     except Exception:
         pass
@@ -157,10 +161,7 @@ def _range_pct(row: dict, close: float) -> tuple[float, str]:
     low = _safe_float(_first(row, ("low", "low_price", "LowPrice"), 0.0), 0.0)
     if close > 0 and high > 0 and low > 0 and high >= low:
         return (high - low) / close, "high_low"
-    raw = _safe_float(
-        _first(row, ("_intrabar_range_pct", "intrabar_range_pct", "range_pct", "price_range_pct", "range_1m_pct", "range_3m_pct", "range_5m_pct", "disp_range_pct"), 0.0),
-        0.0,
-    )
+    raw = _safe_float(_first(row, ("_intrabar_range_pct", "intrabar_range_pct", "range_pct", "price_range_pct", "range_1m_pct", "range_3m_pct", "range_5m_pct", "disp_range_pct"), 0.0), 0.0)
     if raw > 1.0:
         raw = raw / 100.0
     return max(0.0, raw), "row_range_pct"
@@ -175,33 +176,8 @@ def _hard_guard(item: Any) -> bool:
     side = _norm_side(_first(row, ("side", "entry_decision", "ai_side"), ""))
     close = _safe_float(_first(row, ("close", "close_price", "price", "current_price"), 0.0), 0.0)
 
-    volume, volume_source = _first_positive(
-        row,
-        (
-            "volume", "Volume", "出来高", "day_volume", "acc_volume", "trading_volume",
-            "_latest_volume", "latest_volume", "latest_vol", "recent_volume",
-            "recent_volume_1m", "recent_volume_3m", "recent_volume_5m",
-            "display_volume_1m", "display_volume_3m", "display_volume_5m",
-            "volume_1m", "volume_3m", "volume_5m", "latest_volume_1m",
-            "volume_raw", "raw_volume", "turnover_volume", "_volume",
-            "_latest_volume_raw_alias", "latest_volume_raw_alias", "recent_volume_1m_raw_alias",
-            "display_volume_1m_raw_alias", "volume_item_alias", "_latest_volume_item_alias",
-            "volume_raw_alias", "Volume_raw_alias", "出来高_raw_alias", "day_volume_raw_alias",
-            "acc_volume_raw_alias", "trading_volume_raw_alias",
-        ),
-        0.0,
-    )
-    turnover, turnover_source = _first_positive(
-        row,
-        (
-            "turnover", "trading_value", "売買代金", "day_turnover", "acc_turnover", "turnover_value",
-            "turnover_raw", "raw_turnover", "trading_value_raw", "売買代金_raw",
-            "turnover_raw_alias", "trading_value_raw_alias", "売買代金_raw_alias",
-            "day_turnover_raw_alias", "acc_turnover_raw_alias", "turnover_value_raw_alias",
-            "turnover_item_alias", "turnover_raw_item_alias", "trading_value_item_alias",
-        ),
-        0.0,
-    )
+    volume, volume_source = _first_positive(row, ("volume", "Volume", "出来高", "day_volume", "acc_volume", "trading_volume", "_latest_volume", "latest_volume", "latest_vol", "recent_volume", "recent_volume_1m", "recent_volume_3m", "recent_volume_5m", "display_volume_1m", "display_volume_3m", "display_volume_5m", "volume_1m", "volume_3m", "volume_5m", "latest_volume_1m", "volume_raw", "raw_volume", "turnover_volume", "_volume", "_latest_volume_raw_alias", "latest_volume_raw_alias", "recent_volume_1m_raw_alias", "display_volume_1m_raw_alias", "volume_item_alias", "_latest_volume_item_alias", "volume_raw_alias", "Volume_raw_alias", "出来高_raw_alias", "day_volume_raw_alias", "acc_volume_raw_alias", "trading_volume_raw_alias"), 0.0)
+    turnover, turnover_source = _first_positive(row, ("turnover", "trading_value", "売買代金", "day_turnover", "acc_turnover", "turnover_value", "turnover_raw", "raw_turnover", "trading_value_raw", "売買代金_raw", "turnover_raw_alias", "trading_value_raw_alias", "売買代金_raw_alias", "day_turnover_raw_alias", "acc_turnover_raw_alias", "turnover_value_raw_alias", "turnover_item_alias", "turnover_raw_item_alias", "trading_value_item_alias"), 0.0)
     if turnover <= 0 and close > 0 and volume > 0:
         turnover = close * volume
         turnover_source = "close_x_volume"
@@ -209,26 +185,17 @@ def _hard_guard(item: Any) -> bool:
         volume = turnover / close
         volume_source = "turnover_div_close"
 
-    min_volume = _env_float("ENTRY_HARD_MIN_VOLUME", 100000.0)
-    min_turnover = _env_float("ENTRY_HARD_MIN_TURNOVER", 50000000.0)
+    min_volume = _env_float("ENTRY_HARD_MIN_VOLUME", 30000.0)
+    min_turnover = _env_float("ENTRY_HARD_MIN_TURNOVER", 10000000.0)
 
     if volume <= 0:
-        logger.warning(
-            "[ENTRY HARD GUARD] NG symbol=%s side=%s reason=volume_missing close=%.2f turnover=%.0f turnover_source=%s keys=%s",
-            symbol, side, close, turnover, turnover_source, sorted(list(row.keys()))[:140],
-        )
+        logger.warning("[ENTRY HARD GUARD] NG symbol=%s side=%s reason=volume_missing close=%.2f turnover=%.0f turnover_source=%s keys=%s", symbol, side, close, turnover, turnover_source, sorted(list(row.keys()))[:140])
         return False
     if volume < min_volume:
-        logger.warning(
-            "[ENTRY HARD GUARD] NG symbol=%s side=%s reason=low_volume volume=%.0f min_volume=%.0f close=%.2f turnover=%.0f volume_source=%s turnover_source=%s",
-            symbol, side, volume, min_volume, close, turnover, volume_source, turnover_source,
-        )
+        logger.warning("[ENTRY HARD GUARD] NG symbol=%s side=%s reason=low_volume volume=%.0f min_volume=%.0f close=%.2f turnover=%.0f volume_source=%s turnover_source=%s", symbol, side, volume, min_volume, close, turnover, volume_source, turnover_source)
         return False
     if turnover < min_turnover:
-        logger.warning(
-            "[ENTRY HARD GUARD] NG symbol=%s side=%s reason=low_turnover turnover=%.0f min_turnover=%.0f volume=%.0f close=%.2f volume_source=%s turnover_source=%s",
-            symbol, side, turnover, min_turnover, volume, close, volume_source, turnover_source,
-        )
+        logger.warning("[ENTRY HARD GUARD] NG symbol=%s side=%s reason=low_turnover turnover=%.0f min_turnover=%.0f volume=%.0f close=%.2f volume_source=%s turnover_source=%s", symbol, side, turnover, min_turnover, volume, close, volume_source, turnover_source)
         return False
 
     if not _env_bool("ENTRY_HARD_REQUIRE_MOVEMENT", True):
@@ -246,16 +213,10 @@ def _hard_guard(item: Any) -> bool:
 
     movement_ok = range_value >= min_range or atr_ratio >= min_atr_ratio or abs(slope) >= min_abs_slope
     if not movement_ok:
-        logger.warning(
-            "[ENTRY HARD GUARD] NG symbol=%s side=%s reason=low_movement close=%.2f range_pct=%.5f min_range=%.5f range_source=%s atr_ratio=%.5f min_atr=%.5f slope=%.6f min_abs_slope=%.6f volume=%.0f turnover=%.0f volume_source=%s turnover_source=%s",
-            symbol, side, close, range_value, min_range, range_source, atr_ratio, min_atr_ratio, slope, min_abs_slope, volume, turnover, volume_source, turnover_source,
-        )
+        logger.warning("[ENTRY HARD GUARD] NG symbol=%s side=%s reason=low_movement close=%.2f range_pct=%.5f min_range=%.5f range_source=%s atr_ratio=%.5f min_atr=%.5f slope=%.6f min_abs_slope=%.6f volume=%.0f turnover=%.0f volume_source=%s turnover_source=%s", symbol, side, close, range_value, min_range, range_source, atr_ratio, min_atr_ratio, slope, min_abs_slope, volume, turnover, volume_source, turnover_source)
         return False
 
-    logger.info(
-        "[ENTRY HARD GUARD] OK symbol=%s side=%s close=%.2f volume=%.0f turnover=%.0f range_pct=%.5f atr_ratio=%.5f slope=%.6f volume_source=%s turnover_source=%s",
-        symbol, side, close, volume, turnover, range_value, atr_ratio, slope, volume_source, turnover_source,
-    )
+    logger.info("[ENTRY HARD GUARD] OK symbol=%s side=%s close=%.2f volume=%.0f turnover=%.0f range_pct=%.5f atr_ratio=%.5f slope=%.6f volume_source=%s turnover_source=%s", symbol, side, close, volume, turnover, range_value, atr_ratio, slope, volume_source, turnover_source)
     return True
 
 
@@ -276,20 +237,21 @@ def install() -> bool:
         if not callable(cur):
             logger.warning("[ENTRY HARD GUARD] target missing")
             return False
-        if getattr(cur, "_entry_hard_liq_move_guard_v3", False):
+        if getattr(cur, "_entry_hard_liq_move_guard_v4", False):
             _INSTALLED = True
             return True
-        _ORIG_EXECUTE = getattr(cur, "_original", cur) if (getattr(cur, "_entry_hard_liq_move_guard_v1", False) or getattr(cur, "_entry_hard_liq_move_guard_v2", False)) else cur
+        _ORIG_EXECUTE = getattr(cur, "_original", cur) if (getattr(cur, "_entry_hard_liq_move_guard_v1", False) or getattr(cur, "_entry_hard_liq_move_guard_v2", False) or getattr(cur, "_entry_hard_liq_move_guard_v3", False)) else cur
         _patched_execute_best_candidate._entry_hard_liq_move_guard_v1 = True  # type: ignore[attr-defined]
         _patched_execute_best_candidate._entry_hard_liq_move_guard_v2 = True  # type: ignore[attr-defined]
         _patched_execute_best_candidate._entry_hard_liq_move_guard_v3 = True  # type: ignore[attr-defined]
+        _patched_execute_best_candidate._entry_hard_liq_move_guard_v4 = True  # type: ignore[attr-defined]
         _patched_execute_best_candidate._original = _ORIG_EXECUTE  # type: ignore[attr-defined]
         ec._execute_best_candidate = _patched_execute_best_candidate
         _INSTALLED = True
         logger.warning(
-            "[ENTRY HARD GUARD] installed v3 min_volume=%.0f min_turnover=%.0f min_range=%.5f min_atr=%.5f min_abs_slope=%.6f require_movement=%s latest_volume_fallback=True raw_fallback=True",
-            _env_float("ENTRY_HARD_MIN_VOLUME", 100000.0),
-            _env_float("ENTRY_HARD_MIN_TURNOVER", 50000000.0),
+            "[ENTRY HARD GUARD] installed v4 min_volume=%.0f min_turnover=%.0f min_range=%.5f min_atr=%.5f min_abs_slope=%.6f require_movement=%s latest_volume_fallback=True raw_fallback=True",
+            _env_float("ENTRY_HARD_MIN_VOLUME", 30000.0),
+            _env_float("ENTRY_HARD_MIN_TURNOVER", 10000000.0),
             _env_float("ENTRY_HARD_MIN_RANGE_PCT", 0.006),
             _env_float("ENTRY_HARD_MIN_ATR_RATIO", 0.003),
             _env_float("ENTRY_HARD_MIN_ABS_SLOPE", 0.001),
@@ -305,4 +267,4 @@ try:
 except Exception:
     logger.exception("[ENTRY HARD GUARD] auto install failed")
 
-__all__ = ["install"]
+__all__ = ["install", "VERSION"]
