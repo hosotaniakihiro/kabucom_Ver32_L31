@@ -1,24 +1,25 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/entry_fire_rescue_runtime_patch.py
-# Version: V3-ENTRY-FIRE-RESCUE-PRE-AI-SELL-CREDIT-FILTER
+# Version: V4-ENTRY-FIRE-RESCUE-PRE-AI-SELL-CREDIT-GUARD-CALL
 # ------------------------------------------------------------
 # Purpose:
-#   2026-06-12 logs showed entry did not reach order dispatch because:
+#   2026-06-12/2026-06-29 logs showed entry did not reach order dispatch because:
 #     - SUMMARY AI / candidate thresholds still assumed old 5.0/1.0 scale
 #       while current PUSH scores are about 0.1-0.3.
 #     - 3min/MTF readiness can be zero during rotation/Yahoo fallback, killing
 #       candidates before 1min strong rows can be evaluated.
-#     - ranking entry build is hard-capped at 18s and repeatedly enters cooldown
-#       when elapsed is only slightly above 18s.
-#     - SELL candidates with explicit short_ok=0 / sell_target=0 reached AI_OK
-#       and were removed later, consuming the approved slot.
+#     - ranking entry build is hard-capped and repeatedly enters cooldown.
+#     - SELL candidates with short_ok=0 / sell_target=0 reached AI_OK and were
+#       removed later, consuming the approved slot.
 #
-# V3:
-#   - Remove explicit SELL-credit-NG rows before run_ai_gate_for_candidates().
-#     This prevents non-shortable names such as 4889/7352 from becoming AI_OK
-#     and wasting approved slots.  The existing approved-stage filter remains
-#     as a second safety net.
+# V4:
+#   - Candidate rows often do not carry short_ok/sell_target columns yet.
+#     Therefore, before run_ai_gate_for_candidates(), call can_sell_symbol(symbol)
+#     for SELL rows when explicit flags are missing.
+#   - This prevents 4107/3512/7352 style non-shortable names from appearing as
+#     SUMMARY AI AI_OK and then being removed only at approved stage.
+#   - Approved-stage filter remains as a second safety net.
 # ============================================================
 from __future__ import annotations
 
@@ -30,7 +31,7 @@ from functools import wraps
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V3-ENTRY-FIRE-RESCUE-PRE-AI-SELL-CREDIT-FILTER"
+VERSION = "V4-ENTRY-FIRE-RESCUE-PRE-AI-SELL-CREDIT-GUARD-CALL"
 _INSTALLED = False
 _WATCHER_STARTED = False
 
@@ -50,7 +51,12 @@ def _env_bool(name: str, default: bool = True) -> bool:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
             return bool(default)
-        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
+            return False
+        return bool(default)
     except Exception:
         return bool(default)
 
@@ -82,6 +88,7 @@ def _set_default_envs() -> None:
         "SUMMARY_AI_DIRECT_LIQ_REQUIRE_DATA": "0",
         "SUMMARY_AI_SELL_CREDIT_PREFILTER": "1",
         "SUMMARY_AI_SELL_CREDIT_PREFILTER_BEFORE_AI": "1",
+        "SUMMARY_AI_SELL_CREDIT_PREFILTER_CALL_GUARD": "1",
         "RANKING_ENTRY_BUILD_TIMEOUT_SEC": "30",
         "RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC": "18",
         "RANKING_ENTRY_RUNTIME_BUDGET_SEC": "30",
@@ -179,8 +186,45 @@ def _flag_is_explicit_false(v: Any) -> bool:
         return False
 
 
+def _row_has_any_credit_flag(item: Any) -> bool:
+    for key in (
+        "short_ok",
+        "shortable",
+        "short_sale_ok",
+        "is_short_ok",
+        "short_sellable",
+        "sell_target",
+        "is_sell_target",
+        "can_sell",
+        "sellable",
+        "margin_sellable",
+        "credit_sellable",
+        "can_margin_sell",
+    ):
+        if _pick_from_item(item, key) is not None:
+            return True
+    return False
+
+
+def _call_sell_credit_guard(symbol: str) -> tuple[bool, str, dict[str, Any]]:
+    """Call central sell credit guard only when enabled and symbol exists."""
+    if not symbol or not _env_bool("SUMMARY_AI_SELL_CREDIT_PREFILTER_CALL_GUARD", True):
+        return False, "", {}
+    try:
+        from AI.sell_credit_guard import can_sell_symbol
+
+        ok = bool(can_sell_symbol(symbol))
+        if ok:
+            return False, "", {}
+        return True, "sell_credit_guard_ng", {"symbol": symbol, "side": "SELL", "guard_call": "can_sell_symbol_false"}
+    except Exception as e:
+        # Fail-open: do not drop candidates if the guard itself is unavailable.
+        logger.debug("[ENTRY FIRE RESCUE] can_sell_symbol pre-AI check failed symbol=%s err=%s", symbol, e, exc_info=True)
+        return False, "", {}
+
+
 def _sell_credit_block_reason(item: Any) -> tuple[bool, str, dict[str, Any]]:
-    """Return block reason only when the row explicitly says SELL is not allowed."""
+    """Return block reason when a SELL row is definitely not short-sellable."""
     side = _norm_side(
         _pick_from_item(item, "side", "ai_side", "entry_decision", "signal"),
         "BUY",
@@ -195,15 +239,21 @@ def _sell_credit_block_reason(item: Any) -> tuple[bool, str, dict[str, Any]]:
         "margin_sellable": _pick_from_item(item, "margin_sellable", "credit_sellable", "can_margin_sell"),
     }
     explicit_ng = {k: v for k, v in checks.items() if _flag_is_explicit_false(v)}
-    if not explicit_ng:
-        return False, "", {}
+    if explicit_ng:
+        detail = {"symbol": symbol, "side": side, **explicit_ng}
+        return True, "sell_credit_guard_ng", detail
 
-    detail = {"symbol": symbol, "side": side, **explicit_ng}
-    return True, "sell_credit_guard_ng", detail
+    # Many SUMMARY candidate rows do not carry short_ok/sell_target yet.
+    # In that case, call the canonical guard before AI gate so non-shortable
+    # SELL rows never become AI_OK.
+    if not _row_has_any_credit_flag(item):
+        return _call_sell_credit_guard(symbol)
+
+    return False, "", {}
 
 
 def _prefilter_sell_credit_ng_candidates(candidates: Any) -> tuple[Any, list[dict[str, Any]]]:
-    """Filter explicit SELL credit NG rows while preserving DataFrame/list shape."""
+    """Filter SELL credit NG rows while preserving DataFrame/list shape."""
     if not _env_bool("SUMMARY_AI_SELL_CREDIT_PREFILTER_BEFORE_AI", True):
         return candidates, []
     if candidates is None:
@@ -266,7 +316,7 @@ def _patch_runner() -> bool:
         cur = getattr(r, "run_summary_ai_entry_from_df", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_entry_fire_rescue_v3", False):
+        if getattr(cur, "_entry_fire_rescue_v4", False):
             return True
         orig = getattr(cur, "_original", cur)
 
@@ -281,6 +331,7 @@ def _patch_runner() -> bool:
             kwargs.setdefault("use_pre_slope_filter", not _env_bool("ENTRY_BYPASS_SLOPE_FILTER", True))
             return orig(*args, **kwargs)
 
+        patched_run_summary_ai_entry_from_df._entry_fire_rescue_v4 = True  # type: ignore[attr-defined]
         patched_run_summary_ai_entry_from_df._entry_fire_rescue_v3 = True  # type: ignore[attr-defined]
         patched_run_summary_ai_entry_from_df._entry_fire_rescue_v2 = True  # type: ignore[attr-defined]
         patched_run_summary_ai_entry_from_df._original = orig  # type: ignore[attr-defined]
@@ -302,7 +353,7 @@ def _patch_ai_gate() -> bool:
         cur = getattr(g, "run_ai_gate_for_candidates", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_entry_fire_rescue_v3", False):
+        if getattr(cur, "_entry_fire_rescue_v4", False):
             return True
         orig = getattr(cur, "_original", cur)
 
@@ -352,6 +403,7 @@ def _patch_ai_gate() -> bool:
                 logger.exception("[ENTRY FIRE RESCUE] score_low rescue failed")
             return results
 
+        patched_run_ai_gate_for_candidates._entry_fire_rescue_v4 = True  # type: ignore[attr-defined]
         patched_run_ai_gate_for_candidates._entry_fire_rescue_v3 = True  # type: ignore[attr-defined]
         patched_run_ai_gate_for_candidates._entry_fire_rescue_v2 = True  # type: ignore[attr-defined]
         patched_run_ai_gate_for_candidates._original = orig  # type: ignore[attr-defined]
@@ -374,7 +426,7 @@ def _patch_sell_credit_prefilter() -> bool:
         cur = getattr(e, "_filter_blocked_ai_ok_items", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_entry_fire_rescue_sell_credit_v3", False):
+        if getattr(cur, "_entry_fire_rescue_sell_credit_v4", False):
             return True
         orig = getattr(cur, "_original", cur)
 
@@ -398,6 +450,7 @@ def _patch_sell_credit_prefilter() -> bool:
                 logger.exception("[ENTRY FIRE RESCUE] SELL credit prefilter failed; fail-open to original")
                 return orig(ok_items)
 
+        patched_filter_blocked_ai_ok_items._entry_fire_rescue_sell_credit_v4 = True  # type: ignore[attr-defined]
         patched_filter_blocked_ai_ok_items._entry_fire_rescue_sell_credit_v3 = True  # type: ignore[attr-defined]
         patched_filter_blocked_ai_ok_items._entry_fire_rescue_sell_credit_v2 = True  # type: ignore[attr-defined]
         patched_filter_blocked_ai_ok_items._original = orig  # type: ignore[attr-defined]
@@ -412,7 +465,7 @@ def _patch_ranking_timeout_controller() -> bool:
     try:
         import core.startup.ranking_entry_controller_timeout_patch as p
 
-        if getattr(p, "_entry_fire_rescue_relaxed_v3", False):
+        if getattr(p, "_entry_fire_rescue_relaxed_v4", False):
             return True
 
         def relaxed_force_runtime_timeouts(tasks) -> None:
@@ -443,6 +496,7 @@ def _patch_ranking_timeout_controller() -> bool:
                 logger.debug("[ENTRY FIRE RESCUE] relaxed ranking caps failed", exc_info=True)
 
         p._force_runtime_timeouts = relaxed_force_runtime_timeouts
+        p._entry_fire_rescue_relaxed_v4 = True
         p._entry_fire_rescue_relaxed_v3 = True
         p._entry_fire_rescue_relaxed_v2 = True
         return True
