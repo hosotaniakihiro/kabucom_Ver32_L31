@@ -1,6 +1,6 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver48-ENTRY-EXECUTE-TIMEOUT-GUARD
+# Version: Ver49-SUMMARY-AI-CANDIDATE-REFILL
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # main.py は軽量同期 + background install。
@@ -17,6 +17,11 @@
 # V48:
 #   - entry_controller._execute_best_candidate の長時間ぶら下がり対策として
 #     ENTRY_EXECUTE_TIMEOUT_GUARD を main.py 同期パッチに追加。
+#
+# V49:
+#   - SUMMARY AI の候補が SELL不可除外で0件になる場合に、候補母集団を
+#     拡大し、必要時はTONOSAMA前段フィルタなしで一度だけ再評価する
+#     SUMMARY_AI_CANDIDATE_REFILL を main.py background patch に追加。
 # ============================================================
 from __future__ import annotations
 
@@ -288,6 +293,7 @@ BACKGROUND_MAIN_PATCHES = [
     ("core.startup.tonosama_fast_score_prefilter_patch", "TONOSAMA_FAST_SCORE_PREFILTER", "DISABLE_TONOSAMA_FAST_SCORE_PREFILTER_PATCH"),
     ("core.startup.tonosama_fresh_summary_wait_fix_patch", "TONOSAMA_FRESH_SUMMARY_WAIT_FIX", "DISABLE_TONOSAMA_FRESH_SUMMARY_WAIT_FIX_PATCH"),
     ("core.startup.summary_ai_entry_hook_dataframe_truth_patch", "SUMMARY_AI_DF_TRUTH_PATCH", "DISABLE_SUMMARY_AI_DF_TRUTH_PATCH"),
+    ("core.startup.summary_ai_candidate_refill_patch", "SUMMARY_AI_CANDIDATE_REFILL", "DISABLE_SUMMARY_AI_CANDIDATE_REFILL_PATCH"),
     ("core.startup.summary_mtf_early_ready_patch", "SUMMARY_MTF_EARLY_READY", "DISABLE_SUMMARY_MTF_EARLY_READY_PATCH"),
     ("trading.audit_logging.install_audit_logging", "AUDIT_LOGGING", "DISABLE_AUDIT_LOGGING"),
     ("core.startup.summary_controller_concat_duplicate_columns_patch", "SUMMARY_CONTROLLER_DUPCOL_PATCH", "DISABLE_SUMMARY_CONTROLLER_DUPCOL_PATCH"),
