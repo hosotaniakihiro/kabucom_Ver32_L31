@@ -1,31 +1,15 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver50-PUSH-SUMMARY-REALTIME-DB-PROCESS
+# Version: Ver51-SUMMARY-CONTROLLER-LATEST-ENRICH
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # main.py は軽量同期 + background install。
 # DB/data collector系はDB専用の最小同期パッチだけにして起動を軽くする。
 # 救済/fail-open系はデフォルトOFFにして、本体判定を優先する。
 #
-# V47:
-#   - SUMMARY RANKING SCHEMA REPAIR は既定で db_prepare_runner.py だけに限定。
-#     push_receiver / yahoo_complement / summary_database で ALTER TABLE 確認が多重実行される問題を抑制。
-#   - SUMMARY MTF STARTUP CATCHUP も既定で db_prepare_runner.py だけに限定。
-#     子プロセスごとに3分足/5分足catchupが走る問題を抑制。
-#   - db_prepare中のMTF catchupは軽量既定値へ変更。
-#
-# V48:
-#   - entry_controller._execute_best_candidate の長時間ぶら下がり対策として
-#     ENTRY_EXECUTE_TIMEOUT_GUARD を main.py 同期パッチに追加。
-#
-# V49:
-#   - SUMMARY AI の候補が SELL不可除外で0件になる場合に、候補母集団を
-#     拡大し、必要時はTONOSAMA前段フィルタなしで一度だけ再評価する
-#     SUMMARY_AI_CANDIDATE_REFILL を main.py background patch に追加。
-#
-# V50:
-#   - PUSH保存後の1分足summary遅延対策として、DB/data collector系の
-#     minimal patch に PUSH_SUMMARY_REALTIME を追加。
+# V51:
+#   - summary_controller の latest DF に ranking_score / daily MTF を
+#     保存・cache・entry直前で付与する SUMMARY_CONTROLLER_LATEST_ENRICH を追加。
 # ============================================================
 from __future__ import annotations
 
@@ -96,16 +80,14 @@ def _is_main_py_process() -> bool:
 
 def _is_db_prepare_process() -> bool:
     try:
-        argv = _argv_text()
-        return "db_prepare_runner.py" in argv
+        return "db_prepare_runner.py" in _argv_text()
     except Exception:
         return False
 
 
 def _is_main_database_process() -> bool:
     try:
-        argv = _argv_text()
-        return "main_database.py" in argv
+        return "main_database.py" in _argv_text()
     except Exception:
         return False
 
@@ -134,11 +116,9 @@ def _is_database_process() -> bool:
 
 
 def _configure_db_startup_scope_defaults() -> None:
-    """Keep DB startup repair/catchup single-owner by default."""
     try:
         db_prepare = _is_db_prepare_process()
         main_database = _is_main_database_process()
-
         allow_schema_in_main = _env_on("SUMMARY_SCHEMA_REPAIR_IN_MAIN_DATABASE", False)
         if not db_prepare and not (main_database and allow_schema_in_main):
             os.environ.setdefault("DISABLE_SUMMARY_RANKING_SCHEMA_REPAIR_PATCH", "1")
@@ -146,10 +126,8 @@ def _configure_db_startup_scope_defaults() -> None:
         else:
             os.environ.pop("DISABLE_SUMMARY_RANKING_SCHEMA_REPAIR_PATCH", None)
             os.environ.setdefault("SUMMARY_RANKING_SCHEMA_REPAIR_SCOPE", "db_prepare_owner")
-
         if not db_prepare and not _env_on("SUMMARY_MTF_CATCHUP_RUN_IN_THIS_PROCESS", False):
             os.environ.setdefault("DISABLE_SUMMARY_MTF_CATCHUP", "1")
-
         if db_prepare:
             os.environ["SUMMARY_MTF_CATCHUP_MA_BARS"] = os.environ.get("SUMMARY_MTF_CATCHUP_MA_BARS_OPERATOR", "20")
             os.environ["SUMMARY_MTF_CATCHUP_EXTRA_MINUTES"] = os.environ.get("SUMMARY_MTF_CATCHUP_EXTRA_MINUTES_OPERATOR", "10")
@@ -159,17 +137,7 @@ def _configure_db_startup_scope_defaults() -> None:
             os.environ["SUMMARY_MTF_CATCHUP_SQLITE_TIMEOUT"] = os.environ.get("SUMMARY_MTF_CATCHUP_SQLITE_TIMEOUT_OPERATOR", "20")
             os.environ.setdefault("SUMMARY_MTF_INDICATOR_FILL_AFTER_CATCHUP", "0")
             os.environ.setdefault("SUMMARY_MTF_INDICATOR_FILL_AFTER_EMPTY_CATCHUP", "0")
-
-        _write_boot_evidence(
-            "DB_STARTUP_SCOPE_CONFIGURED",
-            {
-                "db_prepare": db_prepare,
-                "main_database": main_database,
-                "schema_disabled": os.environ.get("DISABLE_SUMMARY_RANKING_SCHEMA_REPAIR_PATCH"),
-                "mtf_disabled": os.environ.get("DISABLE_SUMMARY_MTF_CATCHUP"),
-                "mtf_ma_bars": os.environ.get("SUMMARY_MTF_CATCHUP_MA_BARS"),
-            },
-        )
+        _write_boot_evidence("DB_STARTUP_SCOPE_CONFIGURED", {"db_prepare": db_prepare, "main_database": main_database, "schema_disabled": os.environ.get("DISABLE_SUMMARY_RANKING_SCHEMA_REPAIR_PATCH"), "mtf_disabled": os.environ.get("DISABLE_SUMMARY_MTF_CATCHUP"), "mtf_ma_bars": os.environ.get("SUMMARY_MTF_CATCHUP_MA_BARS")})
     except Exception:
         _write_boot_evidence("DB_STARTUP_SCOPE_CONFIG_EXCEPTION", traceback.format_exc())
 
@@ -177,7 +145,6 @@ def _configure_db_startup_scope_defaults() -> None:
 def _install_boot_exception_hook() -> None:
     try:
         old_hook = sys.excepthook
-
         def _hook(exc_type, exc, tb):
             try:
                 _write_boot_evidence("UNCAUGHT_EXCEPTION", "".join(traceback.format_exception(exc_type, exc, tb)))
@@ -187,7 +154,6 @@ def _install_boot_exception_hook() -> None:
                 old_hook(exc_type, exc, tb)
             except Exception:
                 pass
-
         sys.excepthook = _hook
         _write_boot_evidence("BOOT_EXCEPTION_HOOK_INSTALLED")
     except Exception:
@@ -268,11 +234,13 @@ DB_SYNC_PATCHES = [
     ("core.startup.yahoo_summary_direct_upsert_conflict_patch", "YAHOO_DIRECT_UPSERT_CONFLICT", "DISABLE_YAHOO_DIRECT_UPSERT_CONFLICT_PATCH"),
     ("core.startup.summary_stale_guard_patch", "SUMMARY_STALE_GUARD", "DISABLE_SUMMARY_STALE_GUARD_PATCH"),
     ("core.startup.push_summary_realtime_patch", "PUSH_SUMMARY_REALTIME", "DISABLE_PUSH_SUMMARY_REALTIME_PATCH"),
+    ("core.startup.summary_controller_latest_enrich_patch", "SUMMARY_CONTROLLER_LATEST_ENRICH", "DISABLE_SUMMARY_CONTROLLER_LATEST_ENRICH_PATCH"),
 ]
 
 SYNC_MAIN_PATCHES = [
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
     ("core.startup.yahoo_summary_direct_upsert_conflict_patch", "YAHOO_DIRECT_UPSERT_CONFLICT", "DISABLE_YAHOO_DIRECT_UPSERT_CONFLICT_PATCH"),
+    ("core.startup.summary_controller_latest_enrich_patch", "SUMMARY_CONTROLLER_LATEST_ENRICH", "DISABLE_SUMMARY_CONTROLLER_LATEST_ENRICH_PATCH"),
     ("core.startup.ranking_entry_market_hours_skip_patch", "RANKING_ENTRY_WATCHDOG", "DISABLE_RANKING_ENTRY_WATCHDOG_PATCH"),
     ("core.startup.ranking_entry_snapshot_technical_alias_patch", "RANKING_SNAPSHOT_TECH_ALIAS", "DISABLE_RANKING_SNAPSHOT_TECH_ALIAS_PATCH"),
     ("core.startup.entry_log_skip_reason_collision_patch", "ENTRY_LOG_SKIP_GUARD", "DISABLE_ENTRY_LOG_SKIP_GUARD"),
@@ -359,11 +327,7 @@ def _install_nonmain_minimal() -> None:
     _configure_db_startup_scope_defaults()
     _install_patch_list(DB_SYNC_PATCHES)
     _install_liq_empty_fallback_only_if_enabled()
-    logger.warning(
-        "[SITECUSTOMIZE] non-main helper context detected; minimal patches installed=%s full trading patches skipped argv=%s",
-        len(DB_SYNC_PATCHES),
-        sys.argv,
-    )
+    logger.warning("[SITECUSTOMIZE] non-main helper context detected; minimal patches installed=%s full trading patches skipped argv=%s", len(DB_SYNC_PATCHES), sys.argv)
 
 
 _write_boot_evidence("PYTHON_START")
