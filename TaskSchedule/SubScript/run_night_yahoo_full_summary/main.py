@@ -1,11 +1,15 @@
 # ============================================================
 # File   : TaskSchedule/SubScript/run_night_yahoo_full_summary/main.py
-# Version: V12-TASK-NIGHT-YAHOO-LIGHT-COMPUTE
+# Version: V13-TASK-NIGHT-YAHOO-PANDAS-SAFETY
 # ------------------------------------------------------------
 # Windowsタスクスケジューラ用入口。
 #   1) Yahoo日足差分更新→daily_db/stock_analysis.db保存
 #   2) 最新営業日のYahoo 1m全銘柄取得
 #   3) 1m/3m/5m summary計算→summary DB保存
+#
+# V13:
+#   - yfinance/pandas返却形揺れ対策を起動時に適用
+#   - Series ambiguous / No objects to concatenate の連続失敗を抑止
 #
 # V12:
 #   - 外部の重い日足計算パイプラインを使わず、軽量固定208列計算を既定にする
@@ -53,6 +57,10 @@ os.environ.setdefault("NIGHT_YAHOO_DAILY_SQLITE_BUSY_TIMEOUT_MS", "10000")
 from scripts import night_yahoo_daily_warning_filter_patch as _daily_warning_filter_patch
 _daily_warning_filter_patch.install()
 
+# pandas/yfinance の返却形揺れで銘柄ごとに連続失敗する問題を先に抑止する。
+from scripts import night_yahoo_pandas_safety_patch as _pandas_safety_patch
+_pandas_safety_patch.install()
+
 from scripts import night_yahoo_daily_update_batch as _daily_batch
 from scripts import night_yahoo_daily_direct_chart_patch as _daily_chart_patch
 from scripts import night_yahoo_daily_incremental_patch as _daily_incremental_patch
@@ -62,6 +70,8 @@ from scripts import night_yahoo_daily_save_chunk_patch as _daily_save_chunk_patc
 from scripts import night_yahoo_daily_stage_log_patch as _daily_stage_log_patch
 from scripts import night_yahoo_daily_timeout_patch as _daily_timeout_patch
 
+# module読み込み後に、対象関数にも安全ラッパーを当てる。
+_pandas_safety_patch.install(_daily_batch, _daily_full_columns_patch)
 _daily_chart_patch.install()
 _daily_incremental_patch.install(_daily_batch)
 _daily_full_columns_patch.install(_daily_batch)
@@ -69,6 +79,7 @@ _daily_light_compute_patch.install(_daily_batch)
 _daily_save_chunk_patch.install(_daily_batch)
 _daily_stage_log_patch.install(_daily_batch)
 _daily_timeout_patch.install(_daily_batch)
+_pandas_safety_patch.install(_daily_batch, _daily_full_columns_patch)
 
 daily_main = _daily_batch.main
 from scripts.night_yahoo_full_summary_batch import main as summary_main
