@@ -1,25 +1,22 @@
 # ============================================================
 # File   : trading/ranking/active_symbols/ranking_source.py
-# Version: Ver1.1-ACTIVE-SYMBOLS-CATEGORY-QUOTA-SELECTION
+# Version: Ver1.2-ACTIVE-SYMBOLS-CATEGORY-QUOTA-DB-FALLBACK
 # ------------------------------------------------------------
 # 今日ランキングからの監視100銘柄候補をカテゴリ配分で作る。
 #
-# 配分:
-#   1. 値上がり率ランキングで売買代金上位30銘柄
-#   2. 値下がり率ランキングで売買代金上位10銘柄
-#   3. 売買代金ランキングで上昇率上位30銘柄
-#   4. 売買代金ランキングで下落率上位10銘柄
-#   5. 残りはTICKデータ上位で100銘柄まで補充
-#
-# 価格:
-#   監視銘柄は 200円以上 5000円以下を基本にする。
-#   上限は ACTIVE_MAX_PRICE で変更可能。
+# Ver1.2:
+#   - push_receiver / summary_database は別プロセスのため、ranking_collector の
+#     global_data.latest_ranking が共有されず today_ranking symbols=0 になる。
+#   - global_data.latest_ranking が空の場合、rankingYYYYMMDD.db の
+#     ranking_snapshot / ranking_snapshot_1min / ranking_raw から最新ランキングを読む。
 # ============================================================
 from __future__ import annotations
 
 import datetime as dt
 import logging
-from typing import Any, Dict, List, Optional, Set, Tuple
+import sqlite3
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
 
 import pandas as pd
 
@@ -52,13 +49,113 @@ from .normalize import (
 )
 
 logger = logging.getLogger(__name__)
+_DB_CACHE: dict[str, Any] = {"ts": 0.0, "data": {}}
+
+
+def _rank_type_to_key(v: Any) -> str:
+    s = str(v or "").strip()
+    return s or "ranking"
+
+
+def _read_latest_ranking_from_db(limit_per_type: int = 250) -> Dict[Any, pd.DataFrame]:
+    """Load latest ranking frames from today's ranking DB when in-memory ranking is empty."""
+    try:
+        import time
+        now_ts = time.time()
+        cache_ttl = 10.0
+        if isinstance(_DB_CACHE.get("data"), dict) and now_ts - float(_DB_CACHE.get("ts") or 0.0) < cache_ttl:
+            data = _DB_CACHE.get("data") or {}
+            if data:
+                return data
+
+        from database.paths.ranking_paths import get_ranking_db_path
+        db_path = Path(get_ranking_db_path())
+        if not db_path.exists():
+            return {}
+
+        tables: list[str] = []
+        with sqlite3.connect(str(db_path), timeout=3.0) as conn:
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("PRAGMA busy_timeout=3000")
+            try:
+                table_rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                names = {str(x[0]) for x in table_rows}
+            except Exception:
+                names = set()
+            for t in ("ranking_snapshot", "ranking_snapshot_1min", "ranking_raw"):
+                if t in names:
+                    tables.append(t)
+            if not tables:
+                return {}
+
+            frames: Dict[Any, pd.DataFrame] = {}
+            for table in tables:
+                try:
+                    cols = [str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+                    if not cols or "symbol" not in cols:
+                        continue
+                    dt_col = "datetime" if "datetime" in cols else ("snapshot_time" if "snapshot_time" in cols else "inserted_at")
+                    type_col = "ranking_type" if "ranking_type" in cols else ("rank_type" if "rank_type" in cols else "category")
+                    price_col = "current_price" if "current_price" in cols else ("price" if "price" in cols else "0")
+                    vol_col = "trading_volume" if "trading_volume" in cols else ("volume" if "volume" in cols else "0")
+                    val_col = "trading_value" if "trading_value" in cols else ("turnover" if "turnover" in cols else "0")
+                    tick_col = "tick_count" if "tick_count" in cols else "0"
+                    change_col = "change_percentage" if "change_percentage" in cols else ("change_rate" if "change_rate" in cols else "0")
+                    symbolname_col = "symbolname" if "symbolname" in cols else "''"
+                    rank_col = "rank" if "rank" in cols else "0"
+                    where = f"date({dt_col}) = date('now','localtime')" if dt_col in cols else "1=1"
+                    sql = f"""
+                    SELECT symbol,
+                           {symbolname_col} AS symbolname,
+                           {dt_col} AS datetime,
+                           {type_col} AS ranking_type,
+                           {price_col} AS current_price,
+                           {vol_col} AS trading_volume,
+                           {val_col} AS trading_value,
+                           {tick_col} AS tick_count,
+                           {change_col} AS change_percentage,
+                           {rank_col} AS rank
+                    FROM {table}
+                    WHERE {where}
+                    ORDER BY {dt_col} DESC
+                    LIMIT {int(limit_per_type) * 10}
+                    """
+                    df = pd.read_sql_query(sql, conn)
+                    if df.empty:
+                        continue
+                    df["_table"] = table
+                    df["ranking_type"] = df["ranking_type"].fillna("").astype(str)
+                    for rtype, g in df.groupby("ranking_type", dropna=False):
+                        key = _rank_type_to_key(rtype)
+                        part = g.head(limit_per_type).copy()
+                        if key in frames:
+                            frames[key] = pd.concat([frames[key], part], ignore_index=True)
+                        else:
+                            frames[key] = part
+                except Exception:
+                    logger.debug("[ACTIVE DB FALLBACK] table read failed table=%s", table, exc_info=True)
+
+        if frames:
+            _DB_CACHE["ts"] = now_ts
+            _DB_CACHE["data"] = frames
+            logger.warning(
+                "[ACTIVE DB FALLBACK] loaded ranking db frames=%s rows=%s db=%s keys=%s",
+                len(frames),
+                sum(len(x) for x in frames.values()),
+                db_path,
+                list(frames.keys())[:10],
+            )
+        return frames
+    except Exception:
+        logger.debug("[ACTIVE DB FALLBACK] load failed", exc_info=True)
+        return {}
 
 
 def get_latest_ranking_dict() -> Dict[Any, pd.DataFrame]:
     latest = getattr(global_data, "latest_ranking", None)
-    if isinstance(latest, dict):
+    if isinstance(latest, dict) and latest:
         return latest
-    return {}
+    return _read_latest_ranking_from_db()
 
 
 def _rank_key_text(key: Any) -> str:
@@ -188,15 +285,9 @@ def _price_band_filter(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _ranking_frames_by_kind(*, today_only: bool = True, now: Optional[dt.datetime] = None) -> Dict[str, List[pd.DataFrame]]:
-    frames: Dict[str, List[pd.DataFrame]] = {
-        "gainers": [],
-        "losers": [],
-        "value": [],
-        "tick": [],
-        "volume_speed": [],
-        "other": [],
-    }
-    for key, df in get_latest_ranking_dict().items():
+    frames: Dict[str, List[pd.DataFrame]] = {"gainers": [], "losers": [], "value": [], "tick": [], "volume_speed": [], "other": []}
+    raw = get_latest_ranking_dict()
+    for key, df in raw.items():
         try:
             ndf = normalize_ranking_df(df, rank_key=key)
             ndf = _today_filter(ndf, today_only=today_only, now=now)
@@ -209,6 +300,8 @@ def _ranking_frames_by_kind(*, today_only: bool = True, now: Optional[dt.datetim
             frames[kind].append(ndf)
         except Exception:
             logger.debug("[ACTIVE] ranking df normalize failed", exc_info=True)
+    if raw and not any(frames.values()):
+        logger.warning("[ACTIVE CATEGORY QUOTA] ranking frames all empty after normalize/filter raw_keys=%s today_only=%s", list(raw.keys())[:10], today_only)
     return frames
 
 
@@ -248,7 +341,6 @@ def _append_unique(dst: List[str], src: List[str], *, max_total: int = TARGET_AC
 
 
 def category_quota_ranking_symbols(now: Optional[dt.datetime] = None) -> List[str]:
-    """ユーザー指定のカテゴリ配分で今日ランキングから監視候補を作る。"""
     frames = _ranking_frames_by_kind(today_only=True, now=now)
     gainers = _concat_kind(frames, "gainers")
     losers = _concat_kind(frames, "losers")
@@ -258,21 +350,13 @@ def category_quota_ranking_symbols(now: Optional[dt.datetime] = None) -> List[st
         tick = _concat_kind(frames, "volume_speed")
 
     selected: List[str] = []
-
-    # 1. 値上がり率ランキングで売買代金上位30銘柄
     _append_unique(selected, _pick_symbols(gainers, n=ACTIVE_GAINERS_BY_VALUE_N, sort_col="trading_value", ascending=False))
-
-    # 2. 値下がり率ランキングで売買代金上位10銘柄
     _append_unique(selected, _pick_symbols(losers, n=ACTIVE_LOSERS_BY_VALUE_N, sort_col="trading_value", ascending=False))
-
-    # 3. 売買代金ランキングで上昇率上位30銘柄
     if not value.empty:
         v_up = value[value.get("change_percentage", 0) >= 0].copy() if "change_percentage" in value.columns else value.copy()
     else:
         v_up = pd.DataFrame()
     _append_unique(selected, _pick_symbols(v_up, n=ACTIVE_VALUE_BY_GAINERS_N, sort_col="change_percentage", ascending=False))
-
-    # 4. 売買代金ランキングで下落率上位10銘柄
     if not value.empty:
         v_down = value[value.get("change_percentage", 0) < 0].copy() if "change_percentage" in value.columns else value.copy()
         try:
@@ -282,22 +366,12 @@ def category_quota_ranking_symbols(now: Optional[dt.datetime] = None) -> List[st
     else:
         v_down = pd.DataFrame()
     _append_unique(selected, _pick_symbols(v_down, n=ACTIVE_VALUE_BY_LOSERS_N, sort_col="_abs_change", ascending=False))
-
-    # 5. 残りはTICK上位で100まで補充
     tick_pick = _pick_symbols(tick, n=ACTIVE_TICK_SUPPLEMENT_N, sort_col="tick_count", ascending=False)
     _append_unique(selected, tick_pick, max_total=TARGET_ACTIVE_SYMBOLS)
 
     logger.warning(
-        "[ACTIVE CATEGORY QUOTA] selected=%d gainers_by_value=%d losers_by_value=%d value_up=%d value_down=%d tick_supplement=%d min_price=%.1f max_price=%.1f head=%s",
-        len(selected),
-        ACTIVE_GAINERS_BY_VALUE_N,
-        ACTIVE_LOSERS_BY_VALUE_N,
-        ACTIVE_VALUE_BY_GAINERS_N,
-        ACTIVE_VALUE_BY_LOSERS_N,
-        ACTIVE_TICK_SUPPLEMENT_N,
-        MIN_PRICE,
-        MAX_PRICE,
-        selected[:20],
+        "[ACTIVE CATEGORY QUOTA] selected=%d gainers=%d losers=%d value=%d tick=%d min_price=%.1f max_price=%.1f head=%s",
+        len(selected), len(gainers), len(losers), len(value), len(tick), MIN_PRICE, MAX_PRICE, selected[:20],
     )
     return selected[:TARGET_ACTIVE_SYMBOLS]
 
@@ -318,14 +392,7 @@ def merged_latest_ranking_df(*, today_only: bool = True, now: Optional[dt.dateti
     merged = pd.concat(frames, ignore_index=True)
     if merged.empty or "symbol" not in merged.columns:
         return pd.DataFrame()
-    agg = {
-        "current_price": "max",
-        "trading_volume": "max",
-        "trading_value": "max",
-        "tick_count": "max",
-        "volume_speed": "max",
-        "change_percentage": "max",
-    }
+    agg = {"current_price": "max", "trading_volume": "max", "trading_value": "max", "tick_count": "max", "volume_speed": "max", "change_percentage": "max"}
     try:
         merged = merged.groupby("symbol", as_index=False).agg(agg).reset_index(drop=True)
     except Exception:
