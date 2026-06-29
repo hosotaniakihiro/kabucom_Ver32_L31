@@ -1,5 +1,5 @@
 # ============================================================
-# token_manager.py（Ver32-STARTUP-TOKEN-SAVE-VERIFY）
+# token_manager.py（Ver33-SETTINGS-DIRECT-WRITE-FALLBACK）
 # ------------------------------------------------------------
 # ・API認証設定は settings.ini に集約する
 # ・token 保存も settings.ini または config/settings.ini にだけ行う
@@ -14,6 +14,11 @@
 # ・保存失敗や保存後不一致を debug で握りつぶさず、例外として起動を止める。
 # ・settings.ini の探索に AUTOSTOCK_SETTINGS_INI / AUTOSTOCK_SETTINGS_INI_PATH も追加する。
 # ・token_tail をログに出し、親取得 token と settings.ini token のズレを確認できるようにする。
+#
+# Ver33:
+# ・Windowsで settings.ini への os.replace が WinError 5 になる環境向けに、
+#   同一ファイルへの直接上書き fallback を追加する。
+# ・atomic replace が失敗しても、直接書き込みで保存検証まで通れば起動を継続する。
 # ============================================================
 
 from __future__ import annotations
@@ -259,7 +264,26 @@ def _read_token_from_config_path(path: str | Path) -> str:
         return ""
 
 
+def _direct_write_config(conf: ConfigParser, path: str | Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        conf.write(f)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+
+
 def _atomic_write_config(conf: ConfigParser, path: str | Path) -> None:
+    """Write settings.ini.
+
+    Preferred path is atomic temp-file + os.replace.  On some Windows setups
+    os.replace can fail with WinError 5 even though direct write is allowed
+    (for example, antivirus/editor/file-indexer interference).  In that case,
+    fallback to direct overwrite and let _save_token verify the contents.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
@@ -271,13 +295,29 @@ def _atomic_write_config(conf: ConfigParser, path: str | Path) -> None:
                 os.fsync(f.fileno())
             except Exception:
                 pass
-        os.replace(tmp_name, path)
+        try:
+            os.replace(tmp_name, path)
+            return
+        except PermissionError as e:
+            logger.warning(
+                "[TOKEN MANAGER] atomic settings.ini replace denied; fallback direct write path=%s err=%s",
+                path,
+                e,
+            )
+            _direct_write_config(conf, path)
+            return
     except Exception:
         try:
             os.unlink(tmp_name)
         except Exception:
             pass
         raise
+    finally:
+        try:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+        except Exception:
+            pass
 
 
 def _save_token(token) -> bool:
