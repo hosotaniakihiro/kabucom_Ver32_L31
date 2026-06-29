@@ -1,15 +1,15 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver51-SUMMARY-CONTROLLER-LATEST-ENRICH
+# Version: Ver52-ACTIVE-SYMBOL-TARGET-FILL
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # main.py は軽量同期 + background install。
 # DB/data collector系はDB専用の最小同期パッチだけにして起動を軽くする。
 # 救済/fail-open系はデフォルトOFFにして、本体判定を優先する。
 #
-# V51:
-#   - summary_controller の latest DF に ranking_score / daily MTF を
-#     保存・cache・entry直前で付与する SUMMARY_CONTROLLER_LATEST_ENRICH を追加。
+# V52:
+#   - ACTIVE が symbol_flags 等で98件止まりになる場合に、適格銘柄から
+#     100件へ補充する ACTIVE_SYMBOL_TARGET_FILL を追加。
 # ============================================================
 from __future__ import annotations
 
@@ -235,12 +235,14 @@ DB_SYNC_PATCHES = [
     ("core.startup.summary_stale_guard_patch", "SUMMARY_STALE_GUARD", "DISABLE_SUMMARY_STALE_GUARD_PATCH"),
     ("core.startup.push_summary_realtime_patch", "PUSH_SUMMARY_REALTIME", "DISABLE_PUSH_SUMMARY_REALTIME_PATCH"),
     ("core.startup.summary_controller_latest_enrich_patch", "SUMMARY_CONTROLLER_LATEST_ENRICH", "DISABLE_SUMMARY_CONTROLLER_LATEST_ENRICH_PATCH"),
+    ("core.startup.active_symbol_target_fill_patch", "ACTIVE_SYMBOL_TARGET_FILL", "DISABLE_ACTIVE_SYMBOL_TARGET_FILL_PATCH"),
 ]
 
 SYNC_MAIN_PATCHES = [
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
     ("core.startup.yahoo_summary_direct_upsert_conflict_patch", "YAHOO_DIRECT_UPSERT_CONFLICT", "DISABLE_YAHOO_DIRECT_UPSERT_CONFLICT_PATCH"),
     ("core.startup.summary_controller_latest_enrich_patch", "SUMMARY_CONTROLLER_LATEST_ENRICH", "DISABLE_SUMMARY_CONTROLLER_LATEST_ENRICH_PATCH"),
+    ("core.startup.active_symbol_target_fill_patch", "ACTIVE_SYMBOL_TARGET_FILL", "DISABLE_ACTIVE_SYMBOL_TARGET_FILL_PATCH"),
     ("core.startup.ranking_entry_market_hours_skip_patch", "RANKING_ENTRY_WATCHDOG", "DISABLE_RANKING_ENTRY_WATCHDOG_PATCH"),
     ("core.startup.ranking_entry_snapshot_technical_alias_patch", "RANKING_SNAPSHOT_TECH_ALIAS", "DISABLE_RANKING_SNAPSHOT_TECH_ALIAS_PATCH"),
     ("core.startup.entry_log_skip_reason_collision_patch", "ENTRY_LOG_SKIP_GUARD", "DISABLE_ENTRY_LOG_SKIP_GUARD"),
