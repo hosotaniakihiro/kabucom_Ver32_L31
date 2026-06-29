@@ -110,6 +110,7 @@ def _patch_ranking_bootstrap() -> bool:
 def _background_heavy() -> None:
     jobs: list[Callable[[], bool]] = [
         _install_symbol_flags_bootstrap,
+        lambda: _run_install("summary_mtf_push_raw_fallback_patch", "core.startup.summary_mtf_push_raw_fallback_patch"),
         lambda: _run_install("open_position_broker_merge_patch", "core.startup.open_position_broker_merge_patch"),
         lambda: _run_install("exit_executor_broker_position_patch", "core.startup.exit_executor_broker_position_patch"),
         lambda: _run_install("exit_trail_03_runtime_patch", "core.startup.exit_trail_03_runtime_patch"),
@@ -144,6 +145,7 @@ def install() -> bool:
     _run_install("entry_daily_risk_runtime_patch", "core.startup.entry_daily_risk_runtime_patch")
     _patch_entry_max_approved()
     _patch_ranking_bootstrap()
+    _run_install("summary_mtf_push_raw_fallback_patch", "core.startup.summary_mtf_push_raw_fallback_patch")
 
     if _env_bool("FAST_STARTUP_ASYNC_HEAVY_PATCHES", True):
         if not _BG_STARTED:
@@ -154,7 +156,7 @@ def install() -> bool:
         _background_heavy()
 
     _PATCHED = True
-    logger.warning("[FAST STARTUP PATCH] installed v17 async_heavy=%s", _env_bool("FAST_STARTUP_ASYNC_HEAVY_PATCHES", True))
+    logger.warning("[FAST STARTUP PATCH] installed v18 raw_push_mtf=True async_heavy=%s", _env_bool("FAST_STARTUP_ASYNC_HEAVY_PATCHES", True))
     return True
 
 try:
