@@ -1,23 +1,20 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/ranking_writer_lock_buffer_relief_patch.py
-# Version: V1-RANKING-WRITER-LOCK-BUFFER-RELIEF
+# Version: V2-RANKING-WRITER-LOCK-BUFFER-RELIEF-SPLIT-LEGACY
 # ------------------------------------------------------------
 # Purpose:
-#   2026-06-29 logs showed ranking_db_writer repeatedly failing at
-#   snapshot delete with sqlite3.OperationalError: database is locked.
-#   The original writer then returns all failed rows to the front of the
-#   buffer, so raw/snapshot/legacy buffers grow to tens of thousands of rows
-#   and each retry becomes slower and more likely to hit the lock again.
+#   Ranking DB writer repeatedly failed at snapshot DELETE with
+#   sqlite3.OperationalError: database is locked.  A key amplifier was that
+#   legacy_buffer was mixed with raw/snapshot rows.  The V6 lock patch delegates
+#   mixed legacy flushes back to the original writer, so the original DELETE path
+#   was still used and buffers grew to tens of thousands of rows.
 #
 #   This patch keeps ranking runtime fresh by:
 #     - disabling legacy ranking-table buffering by default in live fast mode
+#     - removing legacy_buffer before flush so V6 raw/snapshot path is used
 #     - trimming raw/snapshot retry buffers after a failed flush
 #     - dropping legacy retry buffers after a failed flush
-#
-# Safety:
-#   ranking_raw and ranking_snapshot remain the primary tables. Legacy tables
-#   are redundant compatibility tables and are the largest lock amplifier.
 # ============================================================
 from __future__ import annotations
 
@@ -27,7 +24,7 @@ from functools import wraps
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V1-RANKING-WRITER-LOCK-BUFFER-RELIEF"
+VERSION = "V2-RANKING-WRITER-LOCK-BUFFER-RELIEF-SPLIT-LEGACY"
 _INSTALLED = False
 
 
@@ -83,6 +80,10 @@ def _trim_buffers(writer, *, reason: str) -> dict[str, int]:
             "snapshot": len(getattr(writer, "snapshot_buffer", []) or []),
             "legacy": len(getattr(writer, "legacy_buffer", []) or []),
         }
+        try:
+            writer._mark_runtime()
+        except Exception:
+            pass
     if before != after:
         logger.warning(
             "[RANKING WRITER RELIEF] trimmed buffers reason=%s before=%s after=%s limits={raw:%s,snapshot:%s,legacy:%s}",
@@ -94,6 +95,29 @@ def _trim_buffers(writer, *, reason: str) -> dict[str, int]:
             legacy_limit,
         )
     return after
+
+
+def _drop_legacy_before_flush(writer) -> int:
+    if _env_bool("RANKING_WRITER_RETRY_KEEP_LEGACY", False):
+        return 0
+    with writer.lock:
+        legacy_n = len(getattr(writer, "legacy_buffer", []) or [])
+        if legacy_n:
+            writer.legacy_buffer = []
+            try:
+                writer.enable_legacy_save = False
+            except Exception:
+                pass
+            try:
+                writer._mark_runtime()
+            except Exception:
+                pass
+    if legacy_n:
+        logger.warning(
+            "[RANKING WRITER RELIEF] dropped legacy before primary flush legacy=%d reason=avoid_original_writer_delete_lock",
+            legacy_n,
+        )
+    return legacy_n
 
 
 def install() -> bool:
@@ -118,7 +142,7 @@ def install() -> bool:
         os.environ.setdefault("RANKING_DB_WRITER_BUSY_TIMEOUT_MS", "30000")
 
         old_add = getattr(cls, "add_ranking_rows", None)
-        if callable(old_add) and not getattr(old_add, "_ranking_writer_relief_v1", False):
+        if callable(old_add) and not getattr(old_add, "_ranking_writer_relief_v2", False):
             @wraps(old_add)
             def _patched_add(self, *args, **kwargs):
                 if _env_bool("RANKING_WRITER_DISABLE_LEGACY_ON_LOCK_RELIEF", True):
@@ -128,37 +152,41 @@ def install() -> bool:
                     except Exception:
                         pass
                 ret = old_add(self, *args, **kwargs)
-                # Prevent a previous failed huge buffer from continuing forever.
                 _trim_buffers(self, reason="after_add")
                 return ret
 
-            _patched_add._ranking_writer_relief_v1 = True  # type: ignore[attr-defined]
+            _patched_add._ranking_writer_relief_v2 = True  # type: ignore[attr-defined]
             _patched_add._original = old_add  # type: ignore[attr-defined]
             cls.add_ranking_rows = _patched_add
 
         old_flush = getattr(cls, "flush", None)
-        if callable(old_flush) and not getattr(old_flush, "_ranking_writer_relief_v1", False):
+        if callable(old_flush) and not getattr(old_flush, "_ranking_writer_relief_v2", False):
             @wraps(old_flush)
             def _patched_flush(self, *args, **kwargs):
+                dropped_legacy = _drop_legacy_before_flush(self)
                 ok = bool(old_flush(self, *args, **kwargs))
                 if not ok:
                     _trim_buffers(self, reason="flush_failed")
                 else:
-                    # Legacy rows should not remain after a successful primary flush.
-                    if not _env_bool("RANKING_WRITER_RETRY_KEEP_LEGACY", False):
-                        _trim_buffers(self, reason="flush_ok_cleanup")
+                    _trim_buffers(self, reason="flush_ok_cleanup")
+                if dropped_legacy:
+                    logger.warning(
+                        "[RANKING WRITER RELIEF] primary flush result after legacy split ok=%s dropped_legacy=%d",
+                        ok,
+                        dropped_legacy,
+                    )
                 return ok
 
-            _patched_flush._ranking_writer_relief_v1 = True  # type: ignore[attr-defined]
+            _patched_flush._ranking_writer_relief_v2 = True  # type: ignore[attr-defined]
             _patched_flush._original = old_flush  # type: ignore[attr-defined]
             cls.flush = _patched_flush
 
-        # If singleton already exists, tune it immediately.
         try:
             w = getattr(mod, "ranking_writer", None)
             if w is not None:
                 w.enable_legacy_save = False
                 w.buffer_size = max(int(getattr(w, "buffer_size", 1) or 1), _env_int("RANKING_WRITER_BUFFER_SIZE", 1000))
+                _drop_legacy_before_flush(w)
                 _trim_buffers(w, reason="install")
         except Exception:
             logger.debug("[RANKING WRITER RELIEF] singleton tune skipped", exc_info=True)
