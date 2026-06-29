@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 from typing import Dict, Mapping, MutableMapping, Optional
 
-VERSION = "REV6-RUNTIME-ENV-DEFAULTS-SUMMARY-PRICE-CAP"
+VERSION = "REV7-RUNTIME-ENV-DEFAULTS-COMPAT-WRAPPERS-SUMMARY-PRICE-CAP"
 
 _TRUE = {"1", "true", "yes", "on", "y"}
 _FALSE = {"0", "false", "no", "off", "n", ""}
@@ -42,6 +42,13 @@ def _set_defaults(defaults: Mapping[str, str], *, environ: Optional[MutableMappi
             env[key] = str(value)
             applied[key] = str(value)
     return applied
+
+
+def _merge_applied(*items: Dict[str, str]) -> Dict[str, str]:
+    merged: Dict[str, str] = {}
+    for item in items:
+        merged.update(item or {})
+    return merged
 
 
 PUSH_DEFAULTS: Dict[str, str] = {
@@ -342,6 +349,31 @@ def apply_summary_yahoo_defaults(*, environ: Optional[MutableMapping[str, str]] 
     return _set_defaults(SUMMARY_YAHOO_DEFAULTS, environ=environ)
 
 
+def apply_site_defaults(*, context: str = "", environ: Optional[MutableMapping[str, str]] = None) -> Dict[str, str]:
+    """Compatibility wrapper used by runtime_env_defaults_patch.py/sitecustomize.py."""
+    return _merge_applied(
+        apply_push_defaults(environ=environ),
+        apply_rescue_defaults(environ=environ),
+        apply_db_defaults(environ=environ),
+        apply_helper_defaults(environ=environ),
+        apply_ranking_entry_defaults(environ=environ),
+        apply_tonosama_defaults(environ=environ),
+        apply_entry_defaults(environ=environ),
+        apply_summary_yahoo_defaults(environ=environ),
+    )
+
+
+def apply_user_defaults(*, context: str = "", environ: Optional[MutableMapping[str, str]] = None) -> Dict[str, str]:
+    """Compatibility wrapper used by runtime_env_defaults_patch.py/usercustomize.py."""
+    return _merge_applied(
+        apply_main_restore_defaults(environ=environ),
+        apply_ranking_entry_defaults(environ=environ),
+        apply_tonosama_defaults(environ=environ),
+        apply_entry_defaults(environ=environ),
+        apply_summary_yahoo_defaults(environ=environ),
+    )
+
+
 __all__ = [
     "VERSION",
     "env_bool",
@@ -354,4 +386,6 @@ __all__ = [
     "apply_tonosama_defaults",
     "apply_entry_defaults",
     "apply_summary_yahoo_defaults",
+    "apply_site_defaults",
+    "apply_user_defaults",
 ]
