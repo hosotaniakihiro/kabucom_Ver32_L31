@@ -1,10 +1,17 @@
 # ============================================================
 # File   : core/startup/common_entry_day_position_guard_patch.py
-# Version: Ver1.0-COMMON-DAY-POSITION-GUARD
+# Version: Ver1.1-SCALP-CLIMAX-GUARD-RELAX
 # ------------------------------------------------------------
 # 目的:
 #   TONOSAMA / RANKING / SUMMARY_AI など pending_manager.add_pending を通る
 #   全エントリーに、当日レンジ位置ガードを共通適用する。
+#
+# V1.1:
+#   - 2026-06-29 14:46 ログで 9941 が day_pos=85.4 / from_open=3.65 /
+#     vwap_gap=3.02 でブロックされ、候補は出るが発注0件になっていた。
+#   - 80%超えだけで即ブロックせず、90%以上、または 始値比/VWAP乖離が
+#     より強い場合だけ止める。
+#   - 既定値: high_zone 80->90, from_open 3->5, vwap 2->4
 #
 #   SELL: 当日安値圏で、始値比/VWAP乖離/短期価格変化が下方向に伸び切った候補を拒否。
 #   BUY : 当日高値圏で、始値比/VWAP乖離/短期価格変化が上方向に伸び切った候補を拒否。
@@ -20,7 +27,7 @@ from typing import Any
 import pandas as pd
 
 logger = logging.getLogger(__name__)
-VERSION = "Ver1.0-COMMON-DAY-POSITION-GUARD"
+VERSION = "Ver1.1-SCALP-CLIMAX-GUARD-RELAX"
 _INSTALLED = False
 _CACHE: dict[str, tuple[float, dict[str, Any] | None]] = {}
 
@@ -130,7 +137,6 @@ def _entry_price(entry: dict[str, Any]) -> float:
 def _load_symbol_1m_today(symbol: str) -> pd.DataFrame:
     try:
         from trading.entry.tonosama.summary_loader import load_merged_summary, normalize_summary_base
-
         raw = normalize_summary_base(load_merged_summary(1), interval=1)
         if raw is None or raw.empty or "symbol" not in raw.columns:
             return pd.DataFrame()
@@ -255,11 +261,11 @@ def _reject_reason(entry: dict[str, Any], metrics: dict[str, Any], pm: Any = Non
     from_open = _safe_float(metrics.get("from_open_pct"), 0.0)
     vwap_gap = _safe_float(metrics.get("vwap_gap_pct"), 0.0)
     price_chg = _extract_price_chg(entry)
-    low_zone = _env_float("COMMON_ENTRY_DAY_POSITION_LOW_ZONE_PCT", 20.0)
-    high_zone = _env_float("COMMON_ENTRY_DAY_POSITION_HIGH_ZONE_PCT", 80.0)
-    open_extreme = abs(_env_float("COMMON_ENTRY_DAY_POSITION_FROM_OPEN_EXTREME_PCT", 3.0))
-    vwap_extreme = abs(_env_float("COMMON_ENTRY_DAY_POSITION_VWAP_EXTREME_PCT", 2.0))
-    short_chg_extreme = abs(_env_float("COMMON_ENTRY_DAY_POSITION_SHORT_CHG_EXTREME_PCT", 0.50))
+    low_zone = _env_float("COMMON_ENTRY_DAY_POSITION_LOW_ZONE_PCT", 10.0)
+    high_zone = _env_float("COMMON_ENTRY_DAY_POSITION_HIGH_ZONE_PCT", 90.0)
+    open_extreme = abs(_env_float("COMMON_ENTRY_DAY_POSITION_FROM_OPEN_EXTREME_PCT", 5.0))
+    vwap_extreme = abs(_env_float("COMMON_ENTRY_DAY_POSITION_VWAP_EXTREME_PCT", 4.0))
+    short_chg_extreme = abs(_env_float("COMMON_ENTRY_DAY_POSITION_SHORT_CHG_EXTREME_PCT", 1.00))
     strict_zone_only = _env_bool("COMMON_ENTRY_DAY_POSITION_STRICT_ZONE_ONLY", False)
 
     if side == "SELL" and day_pos <= low_zone:
@@ -290,11 +296,7 @@ def _attach_metrics(entry: dict[str, Any], metrics: dict[str, Any], *, reject_re
         })
         if reject_reason:
             cond["day_position_reject_reason"] = reject_reason
-        day_text = (
-            f"当日位置 {float(metrics.get('day_position_pct', 50.0)):.1f}%"
-            f" / 始値比 {float(metrics.get('from_open_pct', 0.0)):.2f}%"
-            f" / VWAP乖離 {float(metrics.get('vwap_gap_pct', 0.0)):.2f}%"
-        )
+        day_text = f"当日位置 {float(metrics.get('day_position_pct', 50.0)):.1f}% / 始値比 {float(metrics.get('from_open_pct', 0.0)):.2f}% / VWAP乖離 {float(metrics.get('vwap_gap_pct', 0.0)):.2f}%"
         reason = str(cond.get("reason") or "")
         if "当日位置" not in reason:
             cond["reason"] = f"{reason} / {day_text}" if reason else day_text
@@ -311,9 +313,8 @@ def install() -> bool:
         return False
     try:
         import trading.entry.pending_manager as pm
-
         orig_add = getattr(pm.add_pending, "_common_day_position_original", pm.add_pending)
-        if getattr(pm.add_pending, "_common_day_position_guard_v1", False):
+        if getattr(pm.add_pending, "_common_day_position_guard_v11", False):
             _INSTALLED = True
             return True
 
@@ -329,26 +330,16 @@ def install() -> bool:
                         if reject:
                             logger.warning(
                                 "[COMMON DAY POSITION GUARD] reject symbol=%s source=%s type=%s side=%s reason=%s day_pos=%.1f from_open=%.2f vwap_gap=%.2f price=%.1f open=%.1f high=%.1f low=%.1f vwap=%.1f latest_1m=%s",
-                                symbol,
-                                entry.get("source"),
-                                entry.get("entry_type"),
-                                _entry_side(entry, pm),
-                                reject,
-                                _safe_float(metrics.get("day_position_pct"), 50.0),
-                                _safe_float(metrics.get("from_open_pct"), 0.0),
-                                _safe_float(metrics.get("vwap_gap_pct"), 0.0),
-                                _safe_float(metrics.get("price"), 0.0),
-                                _safe_float(metrics.get("day_open"), 0.0),
-                                _safe_float(metrics.get("day_high"), 0.0),
-                                _safe_float(metrics.get("day_low"), 0.0),
-                                _safe_float(metrics.get("day_vwap"), 0.0),
-                                metrics.get("latest_1m_dt"),
+                                symbol, entry.get("source"), entry.get("entry_type"), _entry_side(entry, pm), reject,
+                                _safe_float(metrics.get("day_position_pct"), 50.0), _safe_float(metrics.get("from_open_pct"), 0.0), _safe_float(metrics.get("vwap_gap_pct"), 0.0),
+                                _safe_float(metrics.get("price"), 0.0), _safe_float(metrics.get("day_open"), 0.0), _safe_float(metrics.get("day_high"), 0.0), _safe_float(metrics.get("day_low"), 0.0), _safe_float(metrics.get("day_vwap"), 0.0), metrics.get("latest_1m_dt"),
                             )
                             return False
             except Exception:
                 logger.exception("[COMMON DAY POSITION GUARD] pre-add check failed; fail-open entry=%s", entry)
             return bool(orig_add(entry))
 
+        _patched_add_pending._common_day_position_guard_v11 = True  # type: ignore[attr-defined]
         _patched_add_pending._common_day_position_guard_v1 = True  # type: ignore[attr-defined]
         _patched_add_pending._common_day_position_original = orig_add  # type: ignore[attr-defined]
         pm.add_pending = _patched_add_pending
@@ -356,10 +347,10 @@ def install() -> bool:
         logger.warning(
             "[COMMON DAY POSITION GUARD] installed version=%s low_zone=%s high_zone=%s from_open_extreme=%s vwap_extreme=%s sources=%s",
             VERSION,
-            os.getenv("COMMON_ENTRY_DAY_POSITION_LOW_ZONE_PCT", "20"),
-            os.getenv("COMMON_ENTRY_DAY_POSITION_HIGH_ZONE_PCT", "80"),
-            os.getenv("COMMON_ENTRY_DAY_POSITION_FROM_OPEN_EXTREME_PCT", "3"),
-            os.getenv("COMMON_ENTRY_DAY_POSITION_VWAP_EXTREME_PCT", "2"),
+            os.getenv("COMMON_ENTRY_DAY_POSITION_LOW_ZONE_PCT", "10"),
+            os.getenv("COMMON_ENTRY_DAY_POSITION_HIGH_ZONE_PCT", "90"),
+            os.getenv("COMMON_ENTRY_DAY_POSITION_FROM_OPEN_EXTREME_PCT", "5"),
+            os.getenv("COMMON_ENTRY_DAY_POSITION_VWAP_EXTREME_PCT", "4"),
             os.getenv("COMMON_ENTRY_DAY_POSITION_SOURCES", "TONOSAMA,RANKING,SUMMARY,SUMMARY_AI,AI,PUSH"),
         )
         return True
