@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/ranking/active_symbols/config.py
-# Version: Ver1.5-ACTIVE-SYMBOLS-MIN-PRICE-200
+# Version: Ver1.6-ACTIVE-SYMBOLS-MIN-TURNOVER-1M
 # ============================================================
 from __future__ import annotations
 import os
@@ -72,7 +72,9 @@ USE_PREMARKET_WHEN_TODAY_RANKING_EMPTY = env_bool("ACTIVE_USE_PREMARKET_WHEN_TOD
 PREMARKET_ALLOW_NO_PRICE = env_bool("ACTIVE_PREMARKET_ALLOW_NO_PRICE", True)
 
 ENABLE_LIQUIDITY_FILTER = env_bool("ACTIVE_ENABLE_LIQUIDITY_FILTER", True)
-MIN_TRADING_VALUE = env_float("ACTIVE_MIN_TRADING_VALUE", 20_000_000)
+# 2026-06-29ログで 20,000,000 円では today_ranking 98銘柄が全落ちした。
+# ユーザー指定の監視条件「直近5本売買代金100万円」に合わせ、監視母集団は100万円を既定にする。
+MIN_TRADING_VALUE = env_float("ACTIVE_MIN_TRADING_VALUE", 1_000_000)
 MIN_VOLUME = env_float("ACTIVE_MIN_VOLUME", 3_000)
 MIN_TICK_COUNT = env_float("ACTIVE_MIN_TICK_COUNT", 10)
 # 監視銘柄は200円以上に限定。
