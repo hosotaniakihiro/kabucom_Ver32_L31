@@ -1,5 +1,5 @@
 # ============================================================
-# token_manager.py（Ver31-PARENT-REFRESH-TTL-GUARD）
+# token_manager.py（Ver32-STARTUP-TOKEN-SAVE-VERIFY）
 # ------------------------------------------------------------
 # ・API認証設定は settings.ini に集約する
 # ・token 保存も settings.ini または config/settings.ini にだけ行う
@@ -8,6 +8,12 @@
 #   子プロセスでは /token を呼ばず、settings.ini の token を読むだけにする
 # ・親プロセス同士でも短時間に /token を再発行しない
 # ・別親プロセスが後から /token を呼んで既存子プロセスの token を失効させる事故を防ぐ
+#
+# Ver32:
+# ・親が /token で取得した token を settings.ini に保存した後、必ず読み直して同一確認する。
+# ・保存失敗や保存後不一致を debug で握りつぶさず、例外として起動を止める。
+# ・settings.ini の探索に AUTOSTOCK_SETTINGS_INI / AUTOSTOCK_SETTINGS_INI_PATH も追加する。
+# ・token_tail をログに出し、親取得 token と settings.ini token のズレを確認できるようにする。
 # ============================================================
 
 from __future__ import annotations
@@ -16,6 +22,7 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import time
 import urllib.request
 from configparser import ConfigParser
@@ -39,6 +46,11 @@ _CHILD_MARKERS = (
     "yahoo_complement_runner.py",
     "db_prepare_runner.py",
 )
+
+
+def _token_tail(token: Any) -> str:
+    s = str(token or "").strip()
+    return s[-4:] if s else ""
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -104,9 +116,9 @@ def _project_root_candidates() -> list[Path]:
     seen: set[str] = set()
     for p in out:
         try:
-            key = str(p.resolve())
+            key = str(p.resolve()).lower()
         except Exception:
-            key = str(p)
+            key = str(p).lower()
         if key not in seen:
             seen.add(key)
             uniq.append(p)
@@ -115,10 +127,19 @@ def _project_root_candidates() -> list[Path]:
 
 def _config_candidates() -> list[Path]:
     out: list[Path] = []
-    for env_name in ("SETTINGS_INI_PATH", "KABU_SETTINGS_INI"):
+
+    # token_startup_once_policy_patch.py と探索名を合わせる。
+    for env_name in (
+        "AUTOSTOCK_SETTINGS_INI",
+        "AUTOSTOCK_SETTINGS_INI_PATH",
+        "SETTINGS_INI",
+        "SETTINGS_INI_PATH",
+        "KABU_SETTINGS_INI",
+    ):
         v = os.getenv(env_name)
         if v:
             out.append(Path(v))
+
     for root in _project_root_candidates():
         out.extend([root / "settings.ini", root / "config" / "settings.ini"])
 
@@ -126,9 +147,9 @@ def _config_candidates() -> list[Path]:
     seen: set[str] = set()
     for p in out:
         try:
-            key = str(p.resolve())
+            key = str(p.resolve()).lower()
         except Exception:
-            key = str(p)
+            key = str(p).lower()
         if key not in seen:
             seen.add(key)
             uniq.append(p)
@@ -136,6 +157,7 @@ def _config_candidates() -> list[Path]:
 
 
 def _get_section(conf: ConfigParser) -> str | None:
+    # ConfigParser is case-insensitive by default, so [aukabu] / [AuKabu] are equivalent.
     if conf.has_section("aukabu"):
         return "aukabu"
     if conf.has_section("kabusapi"):
@@ -225,15 +247,73 @@ def _settings_file_age_sec() -> float | None:
         return None
 
 
+def _read_token_from_config_path(path: str | Path) -> str:
+    try:
+        conf = ConfigParser()
+        conf.read(str(path), encoding="utf-8-sig")
+        sec = _get_section(conf)
+        if not sec:
+            return ""
+        return str(conf.get(sec, "token", fallback="") or "").strip()
+    except Exception:
+        return ""
+
+
+def _atomic_write_config(conf: ConfigParser, path: str | Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            conf.write(f)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except Exception:
+            pass
+        raise
+
+
 def _save_token(token) -> bool:
+    token_s = str(token or "").strip()
+    if not token_s:
+        raise ValueError("empty token cannot be saved")
+
     conf = _load_settings()
     sec = _get_section(conf)
     if not sec:
-        return False
-    conf.set(sec, "token", str(token))
+        existing, tried = _diagnostic(conf)
+        raise ValueError(
+            "settings.ini に [aukabu] または [kabusapi] がないため token を保存できません。"
+            f" existing={existing} tried={tried}"
+        )
+
+    conf.set(sec, "token", token_s)
     path = _CONFIG_FILE_PATH or CONFIG_PATH
-    with open(path, "w", encoding="utf-8") as f:
-        conf.write(f)
+    _atomic_write_config(conf, path)
+
+    saved = _read_token_from_config_path(path)
+    if saved != token_s:
+        raise RuntimeError(
+            "settings.ini token save verification failed "
+            f"path={path} expected_tail={_token_tail(token_s)} actual_tail={_token_tail(saved)} "
+            f"expected_len={len(token_s)} actual_len={len(saved)}"
+        )
+
+    os.environ["AUTOSTOCK_SETTINGS_INI_ACTIVE"] = str(path)
+    logger.warning(
+        "[TOKEN MANAGER] settings.ini token saved/verified path=%s section=%s token_len=%d token_tail=%s",
+        path,
+        sec,
+        len(token_s),
+        _token_tail(token_s),
+    )
     return True
 
 
@@ -288,7 +368,7 @@ def get_valid_token():
 def refresh_token(apipassword=None):
     """Refresh token only when it is safe to issue a new kabu Station token.
 
-    Child runners must not call /token.  Parent processes also avoid issuing a new
+    Child runners must not call /token. Parent processes also avoid issuing a new
     token when settings.ini was updated recently, because a second parent started a
     few minutes later can invalidate the token used by already-running children.
     """
@@ -297,8 +377,9 @@ def refresh_token(apipassword=None):
     if _is_child_process() and not _env_bool("KABU_TOKEN_ALLOW_CHILD_REFRESH", False):
         token = get_valid_token()
         logger.warning(
-            "[TOKEN MANAGER] child refresh suppressed; using settings.ini token token_len=%d argv=%s",
+            "[TOKEN MANAGER] child refresh suppressed; using settings.ini token token_len=%d token_tail=%s argv=%s",
             len(str(token or "")),
+            _token_tail(token),
             _argv_text(),
         )
         return token
@@ -306,8 +387,9 @@ def refresh_token(apipassword=None):
     if (not _is_parent_process()) and _env_bool("KABU_TOKEN_PARENT_ONLY_REFRESH", True) and not _env_bool("KABU_TOKEN_ALLOW_NONPARENT_REFRESH", False):
         token = get_valid_token()
         logger.warning(
-            "[TOKEN MANAGER] non-parent refresh suppressed; using settings.ini token token_len=%d argv=%s",
+            "[TOKEN MANAGER] non-parent refresh suppressed; using settings.ini token token_len=%d token_tail=%s argv=%s",
             len(str(token or "")),
+            _token_tail(token),
             _argv_text(),
         )
         return token
@@ -329,8 +411,9 @@ def refresh_token(apipassword=None):
     if existing_token and not force_parent_refresh and ttl_sec > 0 and age_sec is not None and age_sec <= ttl_sec:
         token = _publish_token(existing_token)
         logger.warning(
-            "[TOKEN MANAGER] parent refresh skipped by ttl; using recent settings.ini token token_len=%d age=%.1fs ttl=%.1fs argv=%s",
+            "[TOKEN MANAGER] parent refresh skipped by ttl; using recent settings.ini token token_len=%d token_tail=%s age=%.1fs ttl=%.1fs argv=%s",
             len(str(token or "")),
+            _token_tail(token),
             age_sec,
             ttl_sec,
             _argv_text(),
@@ -355,18 +438,23 @@ def refresh_token(apipassword=None):
         raw = res.read().decode()
         result = json.loads(raw)
 
-    token = result.get("Token")
+    token = str(result.get("Token") or "").strip()
     if not token:
         raise ValueError("token を取得できませんでした")
 
+    # 重要: settings.ini を canonical source にしているため、publish より先に保存検証する。
+    # 保存に失敗した状態で API_TOKEN だけ更新すると、直後の requests フックが古い settings.ini token を再注入して 401 になる。
+    _save_token(token)
     _publish_token(token)
     API_PASSWORD = str(api_password)
-    try:
-        _save_token(token)
-    except Exception:
-        logger.debug("[TOKEN MANAGER] save token failed", exc_info=True)
 
-    logger.warning("[TOKEN MANAGER] parent token refreshed/saved token_len=%d argv=%s", len(str(token or "")), _argv_text())
+    logger.warning(
+        "[TOKEN MANAGER] parent token refreshed/saved token_len=%d token_tail=%s settings=%s argv=%s",
+        len(str(token or "")),
+        _token_tail(token),
+        os.environ.get("AUTOSTOCK_SETTINGS_INI_ACTIVE", _CONFIG_FILE_PATH or ""),
+        _argv_text(),
+    )
     return token
 
 
@@ -415,6 +503,7 @@ def install_requests_401_retry_patch() -> bool:
 
         def _patched_request(self, method, url, **kwargs):
             is_kabu = _is_kabu_api_url(url) and not _is_token_url(url)
+            token = None
             if is_kabu:
                 try:
                     token = get_valid_token()
@@ -427,7 +516,13 @@ def install_requests_401_retry_patch() -> bool:
                 return resp
 
             if _is_child_process() or not _env_bool("KABU_TOKEN_ALLOW_RUNTIME_REFRESH", False):
-                logger.warning("[KABU API REQUESTS 401 RETRY] 401 refresh suppressed url=%s child=%s", url, _is_child_process())
+                logger.warning(
+                    "[KABU API REQUESTS 401 RETRY] 401 refresh suppressed url=%s child=%s token_len=%d token_tail=%s",
+                    url,
+                    _is_child_process(),
+                    len(str(token or "")),
+                    _token_tail(token),
+                )
                 return resp
 
             try:
@@ -437,10 +532,11 @@ def install_requests_401_retry_patch() -> bool:
                 retry_kwargs.setdefault("timeout", kwargs.get("timeout", None))
                 retry_resp = original(self, method, url, **retry_kwargs)
                 logger.warning(
-                    "[KABU API REQUESTS 401 RETRY] url=%s status_before=401 status_after=%s token_len=%s",
+                    "[KABU API REQUESTS 401 RETRY] url=%s status_before=401 status_after=%s token_len=%s token_tail=%s",
                     str(url),
                     getattr(retry_resp, "status_code", None),
                     len(str(new_token or "")),
+                    _token_tail(new_token),
                 )
                 return retry_resp
             except Exception:
