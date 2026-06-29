@@ -1,17 +1,14 @@
 # ============================================================
 # File   : core/startup/push_summary_realtime_patch.py
-# Version: REV3-PUSH-SUMMARY-REALTIME-MTF-BOOTSTRAP
+# Version: REV4-PUSH-SUMMARY-REALTIME-FRESH-BOOTSTRAP
 # ------------------------------------------------------------
 # PUSH DB flush後にsummaryを軽く再計算するruntime patch。
-# 旧版は1分足のみが既定だったため、3分足/5分足が空または古いままになり、
-# TONOSAMA/ENTRY側で tf=3 source=push rows=0 になっていた。
 #
-# REV3:
-#   - 既定の再計算対象を 1,3,5 に変更。
-#   - flush が発生しない memory_only 側や起動直後でも、PUSH/summary関係プロセスでは
-#     起動後に一度だけ 1,3,5 を再計算する bootstrap を追加。
-#   - rebuild は scheduler_jobs.summary.runner_core.job_summary に統一し、
-#     push_summary_engine の module/function 解決差異に依存しない。
+# REV4:
+#   - 起動直後 bootstrap で 3m/5m まで再計算すると、PUSH履歴不足時に
+#     latest_dt=11:35 の古い5分足が global cache に入ることがある。
+#   - bootstrap は既定で 1m のみに限定する。
+#   - 通常の push_flush 後 rebuild は従来通り 1,3,5 を対象にする。
 # ============================================================
 
 from __future__ import annotations
@@ -34,6 +31,7 @@ _TRIGGER_LOCK = threading.RLock()
 _TRIGGER_RUNNING = False
 _LAST_TRIGGER_AT = 0.0
 _DEFAULT_INTERVALS = (1, 3, 5)
+_BOOTSTRAP_DEFAULT_INTERVALS = (1,)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -77,6 +75,10 @@ def _default_intervals() -> list[int]:
     return _parse_intervals(os.getenv("PUSH_SUMMARY_REALTIME_DEFAULT_INTERVALS"), default=_DEFAULT_INTERVALS)
 
 
+def _bootstrap_intervals() -> list[int]:
+    return _parse_intervals(os.getenv("PUSH_SUMMARY_REALTIME_BOOTSTRAP_INTERVALS"), default=_BOOTSTRAP_DEFAULT_INTERVALS)
+
+
 def _argv_text() -> str:
     try:
         return " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
@@ -85,7 +87,6 @@ def _argv_text() -> str:
 
 
 def _should_bootstrap_rebuild_here() -> bool:
-    """起動直後の空/古いMTF補完はPUSH/summaryに関係するDB系プロセスだけで行う。"""
     if not _env_bool("PUSH_SUMMARY_REALTIME_BOOTSTRAP_REBUILD_ENABLED", True):
         return False
     if _env_bool("PUSH_SUMMARY_REALTIME_BOOTSTRAP_FORCE", False):
@@ -128,10 +129,8 @@ def _safe_symbol_count(df: Any) -> int:
 
 
 def _build_summary(interval: int) -> pd.DataFrame:
-    """runner_core.job_summary を使って、DB保存経路と同じ処理でsummaryを作る。"""
     try:
         from scheduler_jobs.summary.runner_core import job_summary
-
         n = dt.datetime.now().replace(second=0, microsecond=0)
         df = job_summary(int(interval), display=False, now=n, run_entry=False)
         return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
@@ -163,11 +162,10 @@ def _summary_rebuild_worker(intervals: list[int], reason: str) -> None:
             _LAST_TRIGGER_AT = time.time()
 
 
-def _trigger_summary_rebuild(reason: str, *, ignore_cooldown: bool = False) -> None:
+def _trigger_summary_rebuild(reason: str, *, ignore_cooldown: bool = False, intervals_override: list[int] | None = None) -> None:
     global _TRIGGER_RUNNING, _LAST_TRIGGER_AT
     if not _env_bool("PUSH_SUMMARY_REALTIME_REBUILD_ENABLED", True):
         return
-
     cooldown = _env_float("PUSH_SUMMARY_REALTIME_COOLDOWN_SEC", 20.0)
     now = time.time()
     with _TRIGGER_LOCK:
@@ -179,14 +177,9 @@ def _trigger_summary_rebuild(reason: str, *, ignore_cooldown: bool = False) -> N
             return
         _TRIGGER_RUNNING = True
 
-    intervals = _parse_intervals(os.getenv("PUSH_SUMMARY_REALTIME_INTERVALS"), default=_default_intervals())
+    intervals = list(intervals_override or _parse_intervals(os.getenv("PUSH_SUMMARY_REALTIME_INTERVALS"), default=_default_intervals()))
     logger.warning("[PUSH SUMMARY REALTIME] rebuild queued intervals=%s reason=%s", intervals, reason)
-    th = threading.Thread(
-        target=_summary_rebuild_worker,
-        args=(intervals, reason),
-        daemon=True,
-        name="PushSummaryRealtimeRebuild",
-    )
+    th = threading.Thread(target=_summary_rebuild_worker, args=(intervals, reason), daemon=True, name="PushSummaryRealtimeRebuild")
     th.start()
 
 
@@ -194,15 +187,13 @@ def _patch_push_db_writer() -> bool:
     global _ORIGINAL_STREAM_WRITER_FLUSH
     try:
         import trading.push.push_db_writer as writer_mod
-
         cls = getattr(writer_mod, "StreamDBWriter", None)
         original = getattr(cls, "flush", None) if cls is not None else None
         if not callable(original):
             logger.warning("[PUSH SUMMARY REALTIME] StreamDBWriter.flush not found")
             return False
-        if getattr(original, "_push_summary_realtime_patched_v3", False):
+        if getattr(original, "_push_summary_realtime_patched_v4", False):
             return True
-
         _ORIGINAL_STREAM_WRITER_FLUSH = original
 
         def _flush_with_realtime_summary(self, *args, **kwargs):
@@ -219,6 +210,7 @@ def _patch_push_db_writer() -> bool:
                 logger.debug("[PUSH SUMMARY REALTIME] flush post-trigger failed", exc_info=True)
             return ok
 
+        _flush_with_realtime_summary._push_summary_realtime_patched_v4 = True  # type: ignore[attr-defined]
         _flush_with_realtime_summary._push_summary_realtime_patched_v3 = True  # type: ignore[attr-defined]
         setattr(cls, "flush", _flush_with_realtime_summary)
         return True
@@ -231,15 +223,17 @@ def _schedule_bootstrap_rebuild() -> None:
     if not _should_bootstrap_rebuild_here():
         return
     delay = _env_float("PUSH_SUMMARY_REALTIME_BOOTSTRAP_DELAY_SEC", 3.0)
+    intervals = _bootstrap_intervals()
 
     def _delayed_bootstrap() -> None:
         try:
             if delay > 0:
                 time.sleep(delay)
-            _trigger_summary_rebuild(reason="install_bootstrap", ignore_cooldown=True)
+            _trigger_summary_rebuild(reason="install_bootstrap", ignore_cooldown=True, intervals_override=intervals)
         except Exception:
             logger.debug("[PUSH SUMMARY REALTIME] bootstrap trigger failed", exc_info=True)
 
+    logger.warning("[PUSH SUMMARY REALTIME] bootstrap scheduled intervals=%s delay=%.1fs", intervals, delay)
     threading.Thread(target=_delayed_bootstrap, daemon=True, name="PushSummaryRealtimeBootstrap").start()
 
 
@@ -250,8 +244,6 @@ def install() -> bool:
     if not _env_bool("PUSH_SUMMARY_REALTIME_PATCH_ENABLED", True):
         logger.warning("[PUSH SUMMARY REALTIME] disabled by env")
         return False
-
-    # 互換用。存在すれば function import 環境にも build_summary を付与する。
     try:
         from core.startup import push_summary_realtime_callable_fix_patch
         push_summary_realtime_callable_fix_patch.install()
@@ -263,12 +255,13 @@ def install() -> bool:
     intervals = _parse_intervals(os.getenv("PUSH_SUMMARY_REALTIME_INTERVALS"), default=_default_intervals())
     bootstrap = _should_bootstrap_rebuild_here()
     logger.warning(
-        "[PUSH SUMMARY REALTIME] installed ok=%s engine_db_fallback=%s flush_trigger=%s intervals=%s bootstrap=%s version=REV3 argv=%s",
+        "[PUSH SUMMARY REALTIME] installed ok=%s engine_db_fallback=%s flush_trigger=%s intervals=%s bootstrap=%s bootstrap_intervals=%s version=REV4 argv=%s",
         _PATCHED,
         False,
         ok_writer,
         intervals,
         bootstrap,
+        _bootstrap_intervals(),
         sys.argv,
     )
     if _PATCHED and bootstrap:
