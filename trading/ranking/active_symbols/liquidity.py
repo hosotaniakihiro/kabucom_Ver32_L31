@@ -1,18 +1,24 @@
 # ============================================================
 # File   : trading/ranking/active_symbols/liquidity.py
-# Version: Ver1.6-FIX-SUMMARY-PRICE-SQL-STRICT-MISSING-PRICE
+# Version: Ver1.7-FAILOPEN-ALL-REMOVED-ACTIVE-LIQUIDITY
 # ------------------------------------------------------------
 # Purpose:
 #   - PUSH登録候補の流動性/価格フィルタ
 #   - 低位株や極端に流動性が低い銘柄を除外する
 #   - 監視銘柄を価格条件内に制限する
 #
+# Ver1.7:
+#   - 2026-06-29 15:02 ログで today_ranking before=98 after=0、
+#     hot_symbols before=16 after=0 となり、PUSH登録候補が全滅した。
+#   - ランキング側の流動性情報が欠ける/列名不一致のとき、require_info=True と
+#     min_value/min_volume 判定だけで全候補を落としてしまう。
+#   - ライブ運用では「0銘柄監視」より「価格条件内のランキング100銘柄を監視」
+#     の方が安全なので、全滅時のみ fail-open する。
+#   - ACTIVE_LIQUIDITY_FAILOPEN_IF_ALL_REMOVED=0 で無効化可能。
+#
 # Ver1.6:
-#   - summary DB 価格補完SQLの閉じ括弧不足で
-#     "incomplete input" になっていた不具合を修正。
+#   - summary DB 価格補完SQLの閉じ括弧不足で "incomplete input" を修正。
 #   - 価格補完ができなかった銘柄を既定で除外する。
-#     ただし寄前SBIで価格がまだ取れない場合のみ、envで緩和可能。
-#   - ACTIVE_FINAL_PRICE_GUARD_ALLOW_UNKNOWN_PRICE=1 で従来のfail-openへ戻せる。
 # ============================================================
 
 from __future__ import annotations
@@ -39,6 +45,7 @@ from .normalize import dedupe_keep_order, normalize_symbol, to_float
 from .ranking_source import build_liquidity_map
 
 logger = logging.getLogger(__name__)
+VERSION = "Ver1.7-FAILOPEN-ALL-REMOVED-ACTIVE-LIQUIDITY"
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -79,10 +86,7 @@ def _today() -> str:
 
 
 def _summary_db_path() -> str:
-    base = os.getenv(
-        "SUMMARY_DB_DIR",
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary",
-    )
+    base = os.getenv("SUMMARY_DB_DIR", r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary")
     return os.getenv("SUMMARY_DB_PATH", str(Path(base) / f"summary{_today()}.db"))
 
 
@@ -92,10 +96,7 @@ def _qident(name: Any) -> str:
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     try:
-        return conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-            (table,),
-        ).fetchone() is not None
+        return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
     except Exception:
         return False
 
@@ -116,24 +117,13 @@ def _summary_price_fallback_enabled() -> bool:
 
 
 def _summary_price_fallback_map(symbols: Iterable[str]) -> Dict[str, Dict[str, float]]:
-    """
-    寄前SBIやランキング側に価格列が無い場合の最終価格補完。
-
-    main.py起動時にNAS SQLiteへ100銘柄×複数テーブルのSELECTを行うと
-    起動停止に見えるため、既定ではmain.pyではスキップする。
-    main_database.py側や手動検証では env で有効化できる。
-    """
     cleaned = [normalize_symbol(s) for s in dedupe_keep_order(symbols)]
     cleaned = [s for s in cleaned if s]
     if not cleaned:
         return {}
 
     if not _summary_price_fallback_enabled():
-        logger.warning(
-            "[ACTIVE SUMMARY PRICE FALLBACK] skipped symbols=%d reason=disabled_or_main_process run_in_main=%s",
-            len(cleaned),
-            os.getenv("ACTIVE_SUMMARY_PRICE_FALLBACK_RUN_IN_MAIN"),
-        )
+        logger.warning("[ACTIVE SUMMARY PRICE FALLBACK] skipped symbols=%d reason=disabled_or_main_process run_in_main=%s", len(cleaned), os.getenv("ACTIVE_SUMMARY_PRICE_FALLBACK_RUN_IN_MAIN"))
         return {}
 
     path = _summary_db_path()
@@ -180,8 +170,6 @@ def _summary_price_fallback_map(symbols: Iterable[str]) -> Dict[str, Dict[str, f
                 placeholders = ",".join(["?"] * len(remain))
                 table_q = _qident(table)
                 symbol_q = _qident("symbol")
-                # symbolごとの最新行を1回のSQLで取得する。
-                # Ver1.6: 旧SQLはサブクエリの閉じ括弧が無く "incomplete input" になっていた。
                 sql = f"""
                     SELECT CAST({symbol_q} AS TEXT) AS symbol,
                            {_qident(price_col)} AS price,
@@ -204,20 +192,8 @@ def _summary_price_fallback_map(symbols: Iterable[str]) -> Dict[str, Dict[str, f
                     sym = normalize_symbol(row[0])
                     price = to_float(row[1], 0.0)
                     if sym and price > 0 and sym not in out:
-                        out[sym] = {
-                            "current_price": price,
-                            "price": price,
-                            "close": price,
-                            "summary_price_table": table,
-                        }
-        logger.warning(
-            "[ACTIVE SUMMARY PRICE FALLBACK] loaded symbols=%d hit=%d missing=%d elapsed=%.3fs path=%s",
-            len(cleaned),
-            len(out),
-            max(0, len(cleaned) - len(out)),
-            time.monotonic() - t0,
-            path,
-        )
+                        out[sym] = {"current_price": price, "price": price, "close": price, "summary_price_table": table}
+        logger.warning("[ACTIVE SUMMARY PRICE FALLBACK] loaded symbols=%d hit=%d missing=%d elapsed=%.3fs path=%s", len(cleaned), len(out), max(0, len(cleaned) - len(out)), time.monotonic() - t0, path)
         return out
     except sqlite3.OperationalError as e:
         logger.warning("[ACTIVE SUMMARY PRICE FALLBACK] sqlite skipped path=%s symbols=%d err=%s", path, len(cleaned), e, exc_info=False)
@@ -242,22 +218,7 @@ def _has_positive_value(info: Optional[Dict[str, Any]], keys: Iterable[str]) -> 
 def _has_usable_liquidity_info(info: Optional[Dict[str, Any]]) -> bool:
     if not info:
         return False
-    return _has_positive_value(
-        info,
-        (
-            "current_price",
-            "price",
-            "close",
-            "last_price",
-            "close_price",
-            "現在値",
-            "trading_value",
-            "turnover",
-            "trading_volume",
-            "volume",
-            "tick_count",
-        ),
-    )
+    return _has_positive_value(info, ("current_price", "price", "close", "last_price", "close_price", "現在値", "trading_value", "turnover", "trading_volume", "volume", "tick_count"))
 
 
 def _get_price(info: Dict[str, Any]) -> float:
@@ -298,13 +259,7 @@ def _price_ok(price: float) -> bool:
     return True
 
 
-def is_liquid_symbol(
-    symbol: Any,
-    *,
-    liquidity_map: Optional[Dict[str, Dict[str, float]]] = None,
-    protected: Optional[Set[str]] = None,
-    require_info: bool = False,
-) -> bool:
+def is_liquid_symbol(symbol: Any, *, liquidity_map: Optional[Dict[str, Dict[str, float]]] = None, protected: Optional[Set[str]] = None, require_info: bool = False) -> bool:
     if not ENABLE_LIQUIDITY_FILTER:
         return True
 
@@ -323,7 +278,6 @@ def is_liquid_symbol(
         return not require_info
 
     assert info is not None
-
     price = _get_price(info)
     volume = _get_volume(info)
     value = _get_value(info)
@@ -341,14 +295,26 @@ def is_liquid_symbol(
     return True
 
 
-def filter_liquid_symbols(
-    symbols: Iterable[Any],
-    *,
-    protected: Optional[Set[str]] = None,
-    liquidity_map: Optional[Dict[str, Dict[str, float]]] = None,
-    context: str = "",
-    require_info: bool = False,
-) -> List[str]:
+def _failopen_if_all_removed(cleaned: list[str], kept: list[str], removed: list[str], *, context: str, require_info: bool) -> list[str]:
+    if kept or not cleaned:
+        return kept
+    if not _env_bool("ACTIVE_LIQUIDITY_FAILOPEN_IF_ALL_REMOVED", True):
+        return kept
+    min_before = int(max(1, _env_float("ACTIVE_LIQUIDITY_FAILOPEN_MIN_BEFORE", 5.0)))
+    if len(cleaned) < min_before:
+        return kept
+    logger.warning(
+        "[ACTIVE LIQUIDITY FILTER FAILOPEN] context=%s before=%d after=0 removed=%d require_info=%s reason=all_removed_keep_original head=%s",
+        context,
+        len(cleaned),
+        len(removed),
+        require_info,
+        cleaned[:30],
+    )
+    return cleaned
+
+
+def filter_liquid_symbols(symbols: Iterable[Any], *, protected: Optional[Set[str]] = None, liquidity_map: Optional[Dict[str, Dict[str, float]]] = None, context: str = "", require_info: bool = False) -> List[str]:
     cleaned = dedupe_keep_order(symbols)
     if not ENABLE_LIQUIDITY_FILTER:
         return cleaned
@@ -365,19 +331,15 @@ def filter_liquid_symbols(
         if not _has_usable_liquidity_info(info):
             missing_info.append(sym)
 
-        if is_liquid_symbol(
-            sym,
-            liquidity_map=liquidity_map,
-            protected=protected,
-            require_info=require_info,
-        ):
+        if is_liquid_symbol(sym, liquidity_map=liquidity_map, protected=protected, require_info=require_info):
             kept.append(sym)
         else:
             removed.append(sym)
 
+    kept = _failopen_if_all_removed(cleaned, kept, removed, context=context, require_info=require_info)
+
     logger.info(
-        "[ACTIVE LIQUIDITY FILTER] context=%s before=%d after=%d removed=%d missing_info=%d require_info=%s "
-        "min_value=%.0f min_volume=%.0f min_tick=%.0f min_price=%.0f max_price=%.0f removed_head=%s missing_head=%s",
+        "[ACTIVE LIQUIDITY FILTER] context=%s before=%d after=%d removed=%d missing_info=%d require_info=%s min_value=%.0f min_volume=%.0f min_tick=%.0f min_price=%.0f max_price=%.0f removed_head=%s missing_head=%s",
         context,
         len(cleaned),
         len(kept),
@@ -392,26 +354,18 @@ def filter_liquid_symbols(
         removed[:20],
         missing_info[:20],
     )
-    return kept
+    return dedupe_keep_order(kept)
 
 
 def _allow_unknown_price(*, premarket_mode: bool) -> bool:
-    # 旧挙動へ戻したい場合の逃げ道。
     if _env_bool("ACTIVE_FINAL_PRICE_GUARD_ALLOW_UNKNOWN_PRICE", False):
         return True
-    # 寄前SBIはCSVに価格列が無い場合があるため、必要なら明示的に許可できる。
     if premarket_mode and _env_bool("ACTIVE_PREMARKET_ALLOW_NO_PRICE", False):
         return True
     return False
 
 
-def final_guard_min_price(
-    symbols: Iterable[str],
-    *,
-    protected: Set[str],
-    liquidity_map: Dict[str, Dict[str, float]],
-    premarket_mode: bool,
-) -> List[str]:
+def final_guard_min_price(symbols: Iterable[str], *, protected: Set[str], liquidity_map: Dict[str, Dict[str, float]], premarket_mode: bool) -> List[str]:
     items = dedupe_keep_order(symbols)
 
     if not ENABLE_LIQUIDITY_FILTER:
@@ -429,7 +383,6 @@ def final_guard_min_price(
         _allow_unknown_price(premarket_mode=premarket_mode),
     )
 
-    # 価格情報が無い候補は summary DB から直近価格を補完する。
     missing_price_symbols = []
     for s in items:
         sym = normalize_symbol(s)
@@ -456,13 +409,10 @@ def final_guard_min_price(
         sym = normalize_symbol(s)
         if not sym:
             continue
-
         if sym in protected:
             kept.append(sym)
             continue
-
         info = liquidity_map.get(sym)
-
         if not _has_usable_liquidity_info(info):
             if allow_unknown:
                 kept.append(sym)
@@ -471,57 +421,30 @@ def final_guard_min_price(
                 removed.append(sym)
                 missing_info_removed.append(sym)
             continue
-
         assert info is not None
         price = _get_price(info)
         if price <= 0 and not allow_unknown:
             removed.append(sym)
             missing_info_removed.append(sym)
             continue
-
         if price > 0:
             price_guarded.append(sym)
             if not _price_ok(price):
                 removed.append(sym)
                 continue
-
-        if is_liquid_symbol(
-            sym,
-            liquidity_map=liquidity_map,
-            protected=protected,
-            require_info=False,
-        ):
+        if is_liquid_symbol(sym, liquidity_map=liquidity_map, protected=protected, require_info=False):
             kept.append(sym)
         else:
             removed.append(sym)
 
+    kept = _failopen_if_all_removed(items, kept, removed, context="final_price_guard", require_info=False)
+
     if removed or missing_info_kept or missing_info_removed or premarket_mode:
         logger.warning(
-            "[ACTIVE FINAL PRICE GUARD] before=%d after=%d removed=%d missing_info_kept=%d missing_info_removed=%d "
-            "premarket=%s allow_unknown_price=%s price_guarded=%d min_price=%.1f max_price=%.1f removed_head=%s missing_kept_head=%s missing_removed_head=%s",
-            len(items),
-            len(kept),
-            len(removed),
-            len(missing_info_kept),
-            len(missing_info_removed),
-            premarket_mode,
-            allow_unknown,
-            len(price_guarded),
-            MIN_PRICE,
-            MAX_PRICE,
-            removed[:30],
-            missing_info_kept[:30],
-            missing_info_removed[:30],
+            "[ACTIVE FINAL PRICE GUARD] before=%d after=%d removed=%d missing_info_kept=%d missing_info_removed=%d premarket=%s allow_unknown_price=%s price_guarded=%d min_price=%.1f max_price=%.1f removed_head=%s missing_kept_head=%s missing_removed_head=%s",
+            len(items), len(kept), len(removed), len(missing_info_kept), len(missing_info_removed), premarket_mode, allow_unknown, len(price_guarded), MIN_PRICE, MAX_PRICE, removed[:30], missing_info_kept[:30], missing_info_removed[:30],
         )
     else:
-        logger.info(
-            "[ACTIVE FINAL PRICE GUARD] before=%d after=%d removed=0 missing_info_kept=0 missing_info_removed=0 premarket=%s price_guarded=%d min_price=%.1f max_price=%.1f",
-            len(items),
-            len(kept),
-            premarket_mode,
-            len(price_guarded),
-            MIN_PRICE,
-            MAX_PRICE,
-        )
+        logger.info("[ACTIVE FINAL PRICE GUARD] before=%d after=%d removed=0 missing_info_kept=0 missing_info_removed=0 premarket=%s price_guarded=%d min_price=%.1f max_price=%.1f", len(items), len(kept), premarket_mode, len(price_guarded), MIN_PRICE, MAX_PRICE)
 
     return dedupe_keep_order(kept)
