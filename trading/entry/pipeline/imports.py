@@ -4,7 +4,7 @@
 #   - entry pipeline の遅延 import / optional import 集約
 #   - import 失敗時も scheduler を止めない
 # ------------------------------------------------------------
-# Version: Ver39-PRODUCTION-ENTRY-PIPELINE-IMPORTS
+# Version: Ver40-PRODUCTION-ENTRY-PIPELINE-IMPORTS-OPTIONAL-TORCH
 # ============================================================
 
 from __future__ import annotations
@@ -73,7 +73,6 @@ try:
 except Exception:
     summary_controller = None
     logger.exception("[IMPORT FAIL] summary_controller import failed")
-
 
 try:
     from trading.summary.position_filter import can_entry_symbol
@@ -247,6 +246,16 @@ try:
     from trading.core.trading_engine import trading_engine
 
     logger.info("[IMPORT OK] AI trading_engine loaded")
+
+except ModuleNotFoundError as e:
+    trading_engine = None
+    if str(getattr(e, "name", "")) == "torch" or "torch" in str(e):
+        logger.warning(
+            "[IMPORT OPTIONAL] AI trading_engine skipped because optional torch is not installed. "
+            "Summary-AI / ranking / tonosama entry can continue without RL trading_engine."
+        )
+    else:
+        logger.exception("[IMPORT FAIL] AI trading_engine import failed")
 
 except Exception:
     trading_engine = None
