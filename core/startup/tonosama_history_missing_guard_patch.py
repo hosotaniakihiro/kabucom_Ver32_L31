@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/tonosama_history_missing_guard_patch.py
-# Version: V5.0-RAW1-HISTORY-RESAMPLE-RATIO
+# Version: V5.1-RAW1-HISTORY-5M-MIN-BARS-RELAX
 # ------------------------------------------------------------
 # 目的:
 #   1) 3m/5m summary が stale/empty でも、1m summary 履歴が新鮮なら
@@ -9,6 +9,7 @@
 #   3) history_missing/failopen 行でも、低出来高・低変動・5秒無反応の
 #      弱い候補はDROPする。
 #   4) ratio_nonnull=0 の擬似3m/5mは本物の急増履歴として採用しない。
+#   5) 5mだけ raw1 必要本数を緩和し、3mの判定は維持する。
 # ============================================================
 
 from __future__ import annotations
@@ -100,7 +101,21 @@ def _enable_controlled_history_fallback_defaults() -> None:
     _setdefault_env("TONOSAMA_HISTORY_MISSING_QUALITY_GUARD", "1")
     _setdefault_env("TONOSAMA_RAW1_HISTORY_RESAMPLE", "1")
     _setdefault_env("TONOSAMA_RAW1_HISTORY_MIN_BARS", "8")
+    _setdefault_env("TONOSAMA_RAW1_HISTORY_MIN_BARS_3M", "8")
+    _setdefault_env("TONOSAMA_RAW1_HISTORY_MIN_BARS_5M", "5")
     _setdefault_env("TONOSAMA_SURGE_RATIO_MIN_PERIODS", "1")
+
+
+def _raw1_min_bars_for_interval(interval: int) -> int:
+    try:
+        interval_i = int(interval)
+    except Exception:
+        interval_i = 1
+    if interval_i == 5:
+        return max(1, _env_int("TONOSAMA_RAW1_HISTORY_MIN_BARS_5M", 5))
+    if interval_i == 3:
+        return max(1, _env_int("TONOSAMA_RAW1_HISTORY_MIN_BARS_3M", 8))
+    return max(1, _env_int("TONOSAMA_RAW1_HISTORY_MIN_BARS", 8))
 
 
 def _patch_volatility_filter_thresholds() -> None:
@@ -206,7 +221,7 @@ def _call_global_data_history(interval: int) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def _load_raw1_history(vs: Any) -> pd.DataFrame:
+def _load_raw1_history(vs: Any, *, interval: int = 1) -> pd.DataFrame:
     """1分足の履歴を優先取得する。最新1本だけの merged summary では急増率が作れないため。"""
     frames: list[tuple[str, pd.DataFrame]] = []
     if _env_bool("TONOSAMA_RAW1_HISTORY_RESAMPLE", True):
@@ -245,23 +260,23 @@ def _load_raw1_history(vs: Any) -> pd.DataFrame:
             logger.debug("[TONOSAMA RAW1 HISTORY] normalize failed source=%s", label, exc_info=True)
 
     if not norm_parts:
-        logger.warning("[TONOSAMA RAW1 HISTORY] no usable 1m history stats=%s", stats)
+        logger.warning("[TONOSAMA RAW1 HISTORY] no usable 1m history interval=%s stats=%s", interval, stats)
         return pd.DataFrame()
 
     out = pd.concat(norm_parts, ignore_index=True, sort=False)
     out = out.drop_duplicates(subset=["symbol", "datetime"], keep="last").sort_values(["symbol", "datetime"])
-    min_bars = max(1, _env_int("TONOSAMA_RAW1_HISTORY_MIN_BARS", 8))
+    min_bars = _raw1_min_bars_for_interval(interval)
     counts = out.groupby("symbol")["datetime"].transform("count") if not out.empty else pd.Series(dtype="int64")
     enough = out[counts >= min_bars].copy()
     if enough.empty:
         logger.warning(
-            "[TONOSAMA RAW1 HISTORY] insufficient 1m history rows=%s symbols=%s min_bars=%s stats=%s",
-            len(out), int(out["symbol"].nunique()) if "symbol" in out.columns else 0, min_bars, stats,
+            "[TONOSAMA RAW1 HISTORY] insufficient 1m history interval=%s rows=%s symbols=%s min_bars=%s stats=%s",
+            interval, len(out), int(out["symbol"].nunique()) if "symbol" in out.columns else 0, min_bars, stats,
         )
         return out
     logger.warning(
-        "[TONOSAMA RAW1 HISTORY] loaded rows=%s symbols=%s usable_rows=%s usable_symbols=%s min_bars=%s latest=%s stats=%s",
-        len(out), int(out["symbol"].nunique()) if "symbol" in out.columns else 0,
+        "[TONOSAMA RAW1 HISTORY] loaded interval=%s rows=%s symbols=%s usable_rows=%s usable_symbols=%s min_bars=%s latest=%s stats=%s",
+        interval, len(out), int(out["symbol"].nunique()) if "symbol" in out.columns else 0,
         len(enough), int(enough["symbol"].nunique()) if "symbol" in enough.columns else 0,
         min_bars, enough["datetime"].max(), stats,
     )
@@ -272,7 +287,8 @@ def _resample_1m_to_interval(vs: Any, interval: int) -> pd.DataFrame:
     try:
         if not _env_bool("TONOSAMA_RAW1_RESAMPLE_FALLBACK", True):
             return pd.DataFrame()
-        raw1 = _load_raw1_history(vs)
+        interval_i = int(interval)
+        raw1 = _load_raw1_history(vs, interval=interval_i)
         if raw1 is None or raw1.empty or "datetime" not in raw1.columns:
             return pd.DataFrame()
         x = raw1.copy()
@@ -299,7 +315,7 @@ def _resample_1m_to_interval(vs: Any, interval: int) -> pd.DataFrame:
             return pd.DataFrame()
 
         out_parts: list[pd.DataFrame] = []
-        rule = f"{int(interval)}min"
+        rule = f"{interval_i}min"
         for symbol, g in x.sort_values("datetime").groupby("symbol"):
             try:
                 gg = g.set_index("datetime")
@@ -318,20 +334,21 @@ def _resample_1m_to_interval(vs: Any, interval: int) -> pd.DataFrame:
                     rr["symbolname"] = str(g["symbolname"].dropna().iloc[-1]) if "symbolname" in g.columns and not g["symbolname"].dropna().empty else symbol
                 except Exception:
                     rr["symbolname"] = symbol
-                rr["source"] = f"tonosama_raw1_history_resample_{interval}m"
-                rr["interval"] = int(interval)
+                rr["source"] = f"tonosama_raw1_history_resample_{interval_i}m"
+                rr["interval"] = interval_i
                 out_parts.append(rr)
             except Exception:
-                logger.debug("[TONOSAMA RAW1 RESAMPLE] symbol failed interval=%s symbol=%s", interval, symbol, exc_info=True)
+                logger.debug("[TONOSAMA RAW1 RESAMPLE] symbol failed interval=%s symbol=%s", interval_i, symbol, exc_info=True)
         out = pd.concat(out_parts, ignore_index=True) if out_parts else pd.DataFrame()
         if not out.empty:
             logger.warning(
-                "[TONOSAMA RAW1 RESAMPLE] built interval=%sm rows=%s symbols=%s latest=%s volume_nonzero=%s",
-                interval,
+                "[TONOSAMA RAW1 RESAMPLE] built interval=%sm rows=%s symbols=%s latest=%s volume_nonzero=%s raw1_min_bars=%s",
+                interval_i,
                 len(out),
                 out["symbol"].nunique() if "symbol" in out.columns else 0,
                 out["datetime"].max() if "datetime" in out.columns else None,
                 int((pd.to_numeric(out.get("volume", 0), errors="coerce").fillna(0) > 0).sum()) if "volume" in out.columns else 0,
+                _raw1_min_bars_for_interval(interval_i),
             )
         return out
     except Exception:
@@ -429,7 +446,7 @@ def _patch_volume_surge_rolling_before_recent() -> None:
         if not callable(cur):
             logger.warning("[TONOSAMA SURGE ROLLING PATCH] target add_volume_surge_features not callable")
             return
-        if getattr(cur, "_raw1_resample_fallback_patch_v5", False):
+        if getattr(cur, "_raw1_resample_fallback_patch_v51", False):
             return
         _ORIGINAL_ADD_SURGE = cur
 
@@ -459,10 +476,10 @@ def _patch_volume_surge_rolling_before_recent() -> None:
                 logger.exception("[TONOSAMA SURGE ROLLING PATCH] patched add_volume_surge_features failed interval=%s", interval_i)
                 return _ORIGINAL_ADD_SURGE(df, interval=interval_i) if callable(_ORIGINAL_ADD_SURGE) else pd.DataFrame()
 
-        _patched_add_volume_surge_features._raw1_resample_fallback_patch_v5 = True  # type: ignore[attr-defined]
+        _patched_add_volume_surge_features._raw1_resample_fallback_patch_v51 = True  # type: ignore[attr-defined]
         _patched_add_volume_surge_features._original = cur  # type: ignore[attr-defined]
         vs.add_volume_surge_features = _patched_add_volume_surge_features
-        logger.warning("[TONOSAMA SURGE ROLLING PATCH] installed raw1 history resample fallback v5")
+        logger.warning("[TONOSAMA SURGE ROLLING PATCH] installed raw1 history resample fallback v5.1")
     except Exception:
         logger.exception("[TONOSAMA SURGE ROLLING PATCH] install failed")
 
@@ -625,19 +642,20 @@ def install() -> bool:
         if not callable(cur):
             logger.warning("[TONOSAMA HISTORY GUARD] target build_scalping_feature_df not callable")
             return False
-        if getattr(cur, "_tonosama_history_guard_patch_v5", False):
+        if getattr(cur, "_tonosama_history_guard_patch_v51", False):
             _PATCHED = True
             return True
         _ORIGINAL_BUILD = cur
-        _patched_build_scalping_feature_df._tonosama_history_guard_patch_v5 = True  # type: ignore[attr-defined]
+        _patched_build_scalping_feature_df._tonosama_history_guard_patch_v51 = True  # type: ignore[attr-defined]
         _patched_build_scalping_feature_df._original = cur  # type: ignore[attr-defined]
         runner.build_scalping_feature_df = _patched_build_scalping_feature_df
         _PATCHED = True
         logger.warning(
-            "[TONOSAMA HISTORY GUARD] installed v5 raw1_resample=%s raw1_history=%s min_bars=%s ratio_min_periods=%s allow_history_missing=%s drop_history_missing=%s quality_guard=%s min_volume=%.0f min_price_change=%.3f min_range=%.3f",
+            "[TONOSAMA HISTORY GUARD] installed v5.1 raw1_resample=%s raw1_history=%s min_bars_3m=%s min_bars_5m=%s ratio_min_periods=%s allow_history_missing=%s drop_history_missing=%s quality_guard=%s min_volume=%.0f min_price_change=%.3f min_range=%.3f",
             _env_bool("TONOSAMA_RAW1_RESAMPLE_FALLBACK", True),
             _env_bool("TONOSAMA_RAW1_HISTORY_RESAMPLE", True),
-            _env_int("TONOSAMA_RAW1_HISTORY_MIN_BARS", 8),
+            _raw1_min_bars_for_interval(3),
+            _raw1_min_bars_for_interval(5),
             _env_int("TONOSAMA_SURGE_RATIO_MIN_PERIODS", 1),
             _env_bool("TONOSAMA_ALLOW_HISTORY_MISSING_ENTRY", True),
             _env_bool("TONOSAMA_DROP_HISTORY_MISSING_ENTRY", False),
