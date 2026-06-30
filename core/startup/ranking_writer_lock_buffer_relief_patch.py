@@ -1,19 +1,20 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/ranking_writer_lock_buffer_relief_patch.py
-# Version: V4-RANKING-WRITER-RETRY-ENV-FIX
+# Version: V5-RANKING-WRITER-PRESERVE-QUEUED-ROWS
 # ------------------------------------------------------------
 # Purpose:
 #   NAS SQLite ranking DB can stay locked while summary enrichment reads the
 #   large ranking_snapshot table.  When a flush fails, returning raw/snapshot
 #   rows to the front of the buffer causes repeated lock loops.
 #
-# V4:
-#   - Fix env name mismatch. ranking_db_writer_lock_patch reads
-#     RANKING_WRITER_BUSY_TIMEOUT_MS, not RANKING_DB_WRITER_BUSY_TIMEOUT_MS.
-#   - Raise lock retry from 1 to 6 and backoff to 1-5s so short NAS locks can
-#     clear without returning rows to the buffer.
-#   - Continue dropping failed retry buffers by default for live freshness.
+# V5:
+#   - Do NOT trim raw/snapshot buffers immediately after add_ranking_rows().
+#     V4 defaulted retry limits to 0 and then called _trim_buffers(reason=after_add),
+#     which could erase newly queued ranking rows before RankingDBWriter.flush().
+#   - Keep the lock-relief behavior only for failed flush retry buffers.
+#   - Preserve a small retry window by default so transient NAS locks do not drop
+#     the newest ranking snapshot immediately.
 # ============================================================
 from __future__ import annotations
 
@@ -23,7 +24,7 @@ from functools import wraps
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V4-RANKING-WRITER-RETRY-ENV-FIX"
+VERSION = "V5-RANKING-WRITER-PRESERVE-QUEUED-ROWS"
 _INSTALLED = False
 
 
@@ -49,9 +50,9 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def _trim_list(values: Any, limit: int) -> list:
     try:
-        if limit <= 0:
-            return []
         xs = list(values or [])
+        if limit <= 0:
+            return xs
         if len(xs) <= limit:
             return xs
         return xs[-limit:]
@@ -83,35 +84,50 @@ def _set_default_or_floor(name: str, value: str) -> None:
         os.environ[name] = value
 
 
-def _trim_buffers(writer, *, reason: str) -> dict[str, int]:
-    keep_locked = _env_bool("RANKING_WRITER_KEEP_LOCKED_RETRY_ROWS", False)
+def _set_default_preserve_nonempty(name: str, value: str) -> None:
+    try:
+        cur = os.getenv(name)
+        if cur is None or str(cur).strip() == "":
+            os.environ[name] = value
+    except Exception:
+        os.environ[name] = value
+
+
+def _buffer_lengths(writer) -> dict[str, int]:
+    return {
+        "raw": len(getattr(writer, "raw_buffer", []) or []),
+        "snapshot": len(getattr(writer, "snapshot_buffer", []) or []),
+        "legacy": len(getattr(writer, "legacy_buffer", []) or []),
+    }
+
+
+def _trim_buffers(writer, *, reason: str, allow_primary_trim: bool = False) -> dict[str, int]:
+    """Trim retry buffers only when it is safe.
+
+    Important: never erase newly queued raw/snapshot rows before the writer has
+    had a chance to flush them.  V4 did this via reason=after_add with limits=0.
+    """
+    keep_locked = _env_bool("RANKING_WRITER_KEEP_LOCKED_RETRY_ROWS", True)
     raw_limit = _env_int("RANKING_WRITER_RETRY_RAW_MAX_ROWS", 300 if keep_locked else 0)
     snapshot_limit = _env_int("RANKING_WRITER_RETRY_SNAPSHOT_MAX_ROWS", 300 if keep_locked else 0)
     keep_legacy = _env_bool("RANKING_WRITER_RETRY_KEEP_LEGACY", False)
     legacy_limit = _env_int("RANKING_WRITER_RETRY_LEGACY_MAX_ROWS", 0 if not keep_legacy else 300)
 
     with writer.lock:
-        before = {
-            "raw": len(getattr(writer, "raw_buffer", []) or []),
-            "snapshot": len(getattr(writer, "snapshot_buffer", []) or []),
-            "legacy": len(getattr(writer, "legacy_buffer", []) or []),
-        }
-        writer.raw_buffer = _trim_list(getattr(writer, "raw_buffer", []), raw_limit)
-        writer.snapshot_buffer = _trim_list(getattr(writer, "snapshot_buffer", []), snapshot_limit)
+        before = _buffer_lengths(writer)
+        if allow_primary_trim:
+            writer.raw_buffer = _trim_list(getattr(writer, "raw_buffer", []), raw_limit)
+            writer.snapshot_buffer = _trim_list(getattr(writer, "snapshot_buffer", []), snapshot_limit)
         writer.legacy_buffer = _trim_list(getattr(writer, "legacy_buffer", []), legacy_limit)
-        after = {
-            "raw": len(getattr(writer, "raw_buffer", []) or []),
-            "snapshot": len(getattr(writer, "snapshot_buffer", []) or []),
-            "legacy": len(getattr(writer, "legacy_buffer", []) or []),
-        }
+        after = _buffer_lengths(writer)
         try:
             writer._mark_runtime()
         except Exception:
             pass
     if before != after:
         logger.warning(
-            "[RANKING WRITER RELIEF] trimmed buffers reason=%s before=%s after=%s limits={raw:%s,snapshot:%s,legacy:%s} keep_locked=%s",
-            reason, before, after, raw_limit, snapshot_limit, legacy_limit, keep_locked,
+            "[RANKING WRITER RELIEF] trimmed buffers reason=%s before=%s after=%s limits={raw:%s,snapshot:%s,legacy:%s} keep_locked=%s allow_primary_trim=%s",
+            reason, before, after, raw_limit, snapshot_limit, legacy_limit, keep_locked, allow_primary_trim,
         )
     return after
 
@@ -148,9 +164,9 @@ def install() -> bool:
             logger.warning("[RANKING WRITER RELIEF] RankingDBWriter class missing")
             return False
 
-        os.environ.setdefault("RANKING_WRITER_KEEP_LOCKED_RETRY_ROWS", "0")
-        _set_default_or_cap("RANKING_WRITER_RETRY_RAW_MAX_ROWS", "0")
-        _set_default_or_cap("RANKING_WRITER_RETRY_SNAPSHOT_MAX_ROWS", "0")
+        os.environ.setdefault("RANKING_WRITER_KEEP_LOCKED_RETRY_ROWS", "1")
+        _set_default_preserve_nonempty("RANKING_WRITER_RETRY_RAW_MAX_ROWS", "300")
+        _set_default_preserve_nonempty("RANKING_WRITER_RETRY_SNAPSHOT_MAX_ROWS", "300")
         os.environ.setdefault("RANKING_WRITER_RETRY_KEEP_LEGACY", "0")
         _set_default_or_cap("RANKING_WRITER_RETRY_LEGACY_MAX_ROWS", "0")
         os.environ.setdefault("RANKING_WRITER_DISABLE_LEGACY_ON_LOCK_RELIEF", "1")
@@ -164,7 +180,7 @@ def install() -> bool:
         os.environ.setdefault("RANKING_DB_WRITER_BUSY_TIMEOUT_MS", os.environ.get("RANKING_WRITER_BUSY_TIMEOUT_MS", "30000"))
 
         old_add = getattr(cls, "add_ranking_rows", None)
-        if callable(old_add) and not getattr(old_add, "_ranking_writer_relief_v4", False):
+        if callable(old_add) and not getattr(old_add, "_ranking_writer_relief_v5", False):
             @wraps(old_add)
             def _patched_add(self, *args, **kwargs):
                 if _env_bool("RANKING_WRITER_DISABLE_LEGACY_ON_LOCK_RELIEF", True):
@@ -173,29 +189,37 @@ def install() -> bool:
                         self.enable_legacy_save = False
                     except Exception:
                         pass
+                before = _buffer_lengths(self)
                 ret = old_add(self, *args, **kwargs)
-                _trim_buffers(self, reason="after_add")
+                after = _buffer_lengths(self)
+                logger.info(
+                    "[RANKING WRITER RELIEF] add preserved primary buffers before=%s after=%s reason=before_flush_no_trim version=%s",
+                    before, after, VERSION,
+                )
+                _trim_buffers(self, reason="after_add_legacy_only", allow_primary_trim=False)
                 return ret
 
+            _patched_add._ranking_writer_relief_v5 = True  # type: ignore[attr-defined]
             _patched_add._ranking_writer_relief_v4 = True  # type: ignore[attr-defined]
             _patched_add._ranking_writer_relief_v3 = True  # type: ignore[attr-defined]
             _patched_add._original = old_add  # type: ignore[attr-defined]
             cls.add_ranking_rows = _patched_add
 
         old_flush = getattr(cls, "flush", None)
-        if callable(old_flush) and not getattr(old_flush, "_ranking_writer_relief_v4", False):
+        if callable(old_flush) and not getattr(old_flush, "_ranking_writer_relief_v5", False):
             @wraps(old_flush)
             def _patched_flush(self, *args, **kwargs):
                 dropped_legacy = _drop_legacy_before_flush(self)
                 ok = bool(old_flush(self, *args, **kwargs))
                 if not ok:
-                    _trim_buffers(self, reason="flush_failed_drop_locked")
+                    _trim_buffers(self, reason="flush_failed_retry_window", allow_primary_trim=True)
                 else:
-                    _trim_buffers(self, reason="flush_ok_cleanup")
+                    _trim_buffers(self, reason="flush_ok_legacy_cleanup", allow_primary_trim=False)
                 if dropped_legacy:
                     logger.warning("[RANKING WRITER RELIEF] primary flush result after legacy split ok=%s dropped_legacy=%d", ok, dropped_legacy)
                 return ok
 
+            _patched_flush._ranking_writer_relief_v5 = True  # type: ignore[attr-defined]
             _patched_flush._ranking_writer_relief_v4 = True  # type: ignore[attr-defined]
             _patched_flush._ranking_writer_relief_v3 = True  # type: ignore[attr-defined]
             _patched_flush._original = old_flush  # type: ignore[attr-defined]
@@ -211,13 +235,13 @@ def install() -> bool:
                 except Exception:
                     pass
                 _drop_legacy_before_flush(w)
-                _trim_buffers(w, reason="install")
+                _trim_buffers(w, reason="install_legacy_only", allow_primary_trim=False)
         except Exception:
             logger.debug("[RANKING WRITER RELIEF] singleton tune skipped", exc_info=True)
 
         _INSTALLED = True
         logger.warning(
-            "[RANKING WRITER RELIEF] installed version=%s raw_limit=%s snapshot_limit=%s keep_legacy=%s keep_locked=%s buffer_size_env=%s busy_timeout=%s retry_max=%s retry_base=%s retry_max_sleep=%s",
+            "[RANKING WRITER RELIEF] installed version=%s raw_limit=%s snapshot_limit=%s keep_legacy=%s keep_locked=%s buffer_size_env=%s busy_timeout=%s retry_max=%s retry_base=%s retry_max_sleep=%s primary_trim_after_add=0",
             VERSION,
             os.environ.get("RANKING_WRITER_RETRY_RAW_MAX_ROWS"),
             os.environ.get("RANKING_WRITER_RETRY_SNAPSHOT_MAX_ROWS"),
