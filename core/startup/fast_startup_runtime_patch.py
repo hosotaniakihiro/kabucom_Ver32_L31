@@ -9,7 +9,7 @@ from typing import Callable
 logger = logging.getLogger(__name__)
 _PATCHED = False
 _BG_STARTED = False
-VERSION = "v20-main-1m-summary-light-tick"
+VERSION = "v21-main-light-tick-tonosama-tz-guard"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -134,21 +134,12 @@ def install() -> bool:
     if _PATCHED:
         return True
 
-    # Apply timeout relief before summary_parallel_intervals_runtime_patch is imported.
-    # This makes the parallel patch read the lighter main.py defaults from env first.
     _run_install("summary_parallel_timeout_relief_patch:pre", "core.startup.summary_parallel_timeout_relief_patch")
     _run_install("summary_parallel_intervals_runtime_patch", "core.startup.summary_parallel_intervals_runtime_patch")
-    # Re-apply once more because summary_parallel_intervals_runtime_patch may set/cap attrs during install.
     _run_install("summary_parallel_timeout_relief_patch:post", "core.startup.summary_parallel_timeout_relief_patch")
-
-    # Patch runner_core after summary_parallel imported it. This keeps parent tick fast:
-    # 1m df build returns quickly, while SUMMARY AI entry continues asynchronously.
     _run_install("summary_main_1m_light_tick_patch", "core.startup.summary_main_1m_light_tick_patch")
+    _run_install("tonosama_datetime_tz_guard_patch", "core.startup.tonosama_datetime_tz_guard_patch")
 
-    # summary_parallel_intervals_runtime_patch intentionally forces PUSH BG in main-entry-only mode.
-    # On this environment, any main.py-side PUSH summary DB/cache path can terminate Windows with
-    # 0xC0000006 on NAS SQLite reads. Re-apply the main.py skip immediately after summary_parallel
-    # installs so later scheduler ticks cannot start job_summary(PUSH) from main.py.
     _run_install("main_skip_summary_push_bg_patch", "core.startup.main_skip_summary_push_bg_patch")
     _run_install("summary_display_label_guard_patch", "core.startup.summary_display_label_guard_patch")
     _patch_summary_schema_bootstrap()
