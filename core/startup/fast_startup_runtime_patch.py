@@ -9,6 +9,7 @@ from typing import Callable
 logger = logging.getLogger(__name__)
 _PATCHED = False
 _BG_STARTED = False
+VERSION = "v19-summary-parallel-timeout-relief"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -133,7 +134,13 @@ def install() -> bool:
     if _PATCHED:
         return True
 
+    # Apply timeout relief before summary_parallel_intervals_runtime_patch is imported.
+    # This makes the parallel patch read the lighter main.py defaults from env first.
+    _run_install("summary_parallel_timeout_relief_patch:pre", "core.startup.summary_parallel_timeout_relief_patch")
     _run_install("summary_parallel_intervals_runtime_patch", "core.startup.summary_parallel_intervals_runtime_patch")
+    # Re-apply once more because summary_parallel_intervals_runtime_patch may set/cap attrs during install.
+    _run_install("summary_parallel_timeout_relief_patch:post", "core.startup.summary_parallel_timeout_relief_patch")
+
     # summary_parallel_intervals_runtime_patch intentionally forces PUSH BG in main-entry-only mode.
     # On this environment, any main.py-side PUSH summary DB/cache path can terminate Windows with
     # 0xC0000006 on NAS SQLite reads. Re-apply the main.py skip immediately after summary_parallel
@@ -156,7 +163,7 @@ def install() -> bool:
         _background_heavy()
 
     _PATCHED = True
-    logger.warning("[FAST STARTUP PATCH] installed v18 raw_push_mtf=True async_heavy=%s", _env_bool("FAST_STARTUP_ASYNC_HEAVY_PATCHES", True))
+    logger.warning("[FAST STARTUP PATCH] installed %s raw_push_mtf=True async_heavy=%s", VERSION, _env_bool("FAST_STARTUP_ASYNC_HEAVY_PATCHES", True))
     return True
 
 try:
@@ -164,4 +171,4 @@ try:
 except Exception:
     logger.exception("[FAST STARTUP PATCH] auto install failed")
 
-__all__ = ["install"]
+__all__ = ["install", "VERSION"]
