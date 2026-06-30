@@ -2,6 +2,8 @@
 """
 Compatibility installer for centralized runtime environment defaults.
 
+REV24:
+  - force install SUMMARY AI safety guard from this always-loaded module.
 REV23:
   - classify child runners explicitly instead of treating every script as helper.
   - prevent db_prepare/yahoo/summary/ranking/push collector children from starting
@@ -22,7 +24,7 @@ from .runtime_settings_ini_loader import load_settings_ini
 from . import runtime_env_defaults as _defaults
 
 logger = logging.getLogger(__name__)
-VERSION = "REV23-RUNTIME-ENV-DEFAULTS-STRICT-PROCESS-SCOPE"
+VERSION = "REV24-RUNTIME-ENV-DEFAULTS-FORCE-SUMMARY-AI-SAFETY"
 DEFAULTS_VERSION = getattr(_defaults, "VERSION", "unknown")
 env_bool = getattr(_defaults, "env_bool")
 _INSTALLED = False
@@ -109,6 +111,29 @@ def _safe_install(label: str, context: str, allowed: set[str], env_disable: str,
         return bool(fn()) if callable(fn) else False
     except Exception:
         logger.exception("[RUNTIME ENV DEFAULTS PATCH] %s install failed", label)
+        return False
+
+
+def _force_install_summary_ai_safety_guard(context: str) -> bool:
+    """Install this from runtime defaults because usercustomize/sitecustomize definitely import this module."""
+    try:
+        if context not in TRADING_CONTEXTS:
+            return False
+        if os.environ.get("DISABLE_SUMMARY_AI_SAFETY_GUARD", "").strip() == "1":
+            logger.warning("[RUNTIME ENV DEFAULTS PATCH] summary AI safety guard disabled by env")
+            return False
+        os.environ.setdefault("SUMMARY_AI_REQUIRE_PUSH_WRITER_READY", "1")
+        os.environ.setdefault("SUMMARY_AI_REQUIRE_FRESH_PUSH_1M", "1")
+        os.environ.setdefault("SUMMARY_AI_MAX_PUSH_1M_AGE_SEC", "120")
+        os.environ.setdefault("SUMMARY_STALE_DB_FALLBACK_MAX_AGE_SEC", "420")
+        os.environ.setdefault("TONOSAMA_DISABLE_HISTORY_FAILOPEN", "1")
+        os.environ.setdefault("TONOSAMA_REQUIRE_TECHNICAL_READY", "1")
+        from . import summary_ai_candidate_refill_patch
+        ok = bool(summary_ai_candidate_refill_patch.install())
+        logger.warning("[RUNTIME ENV DEFAULTS PATCH] forced SUMMARY AI SAFETY GUARD ok=%s context=%s", ok, context)
+        return ok
+    except Exception:
+        logger.exception("[RUNTIME ENV DEFAULTS PATCH] forced SUMMARY AI SAFETY GUARD install failed")
         return False
 
 
@@ -233,6 +258,7 @@ def install() -> bool:
         database_owner_ok = _install_database_owner(context)
         full_pipeline_ok = _install_full_pipeline_stability(context)
         entry_count_unblock_ok = _install_entry_count_unblock(context)
+        summary_ai_safety_ok = _force_install_summary_ai_safety_guard(context)
         summary_pending_stale_ok = _install_summary_pending_stale_guard(context)
         entry_fire_rescue_ok = _install_entry_fire_rescue(context)
         ranking_entry_rescue_ok = _install_ranking_entry_runtime_rescue(context)
@@ -245,7 +271,7 @@ def install() -> bool:
         daytrade_credit_ok = _install_daytrade_credit_force_close(context)
         _INSTALLED = True
         logger.warning(
-            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s intraday_load_guard=%s yahoo_parallel_empty=%s ranking_legacy_inline=%s summary_lock_pressure=%s summary_db_realtime=%s database_owner=%s full_pipeline=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s summary_pending_stale=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s tonosama_exit_infer=%s tonosama_pending_audit=%s daytrade_credit=%s verbose=%s",
+            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s intraday_load_guard=%s yahoo_parallel_empty=%s ranking_legacy_inline=%s summary_lock_pressure=%s summary_db_realtime=%s database_owner=%s full_pipeline=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s summary_ai_safety=%s summary_pending_stale=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s tonosama_exit_infer=%s tonosama_pending_audit=%s daytrade_credit=%s verbose=%s",
             VERSION,
             DEFAULTS_VERSION,
             REGISTRY_VERSION,
@@ -266,6 +292,7 @@ def install() -> bool:
             os.environ.get("USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES"),
             os.environ.get("USERCUSTOMIZE_ENABLE_TONOSAMA_RESCUE_PATCHES"),
             entry_count_unblock_ok,
+            summary_ai_safety_ok,
             summary_pending_stale_ok,
             entry_fire_rescue_ok,
             ranking_entry_rescue_ok,
