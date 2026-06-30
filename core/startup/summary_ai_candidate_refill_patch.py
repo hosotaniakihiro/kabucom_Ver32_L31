@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_ai_candidate_refill_patch.py
-# Version: V3-SUMMARY-AI-SAFETY-GUARD-FRESH-RAW-PUSH-FALLBACK
+# Version: V4-SUMMARY-AI-SCORE-BRIDGE-FRESH-RAW-PUSH-FALLBACK
 # ------------------------------------------------------------
 # Purpose:
 #   SUMMARY_AI candidate refill + safety guards.
@@ -12,12 +12,15 @@
 #   - Drop Tonosama history-missing fail-open rows.
 #
 # V3:
-#   - 2026-06-30 12:42 main.py logs showed PUSH raw DB fallback had fresh rows,
-#     but SUMMARY_AI was blocked with no_fresh_push_1m rows=0 because the guard
-#     returned the first empty global_context DataFrame.
 #   - Prefer the first non-empty global_context 1m summary.
 #   - If global_context is empty, use patched fallback_loader.fallback_push_summary_df(1)
 #     / raw push DB fallback as a valid freshness source.
+#
+# V4:
+#   - Before SUMMARY_AI candidate creation, bridge existing display/summary score
+#     columns into ai_disp_buy_score / ai_disp_sell_score / config_*_score.
+#   - Fixes logs where display_push rows had score_buy/score_sell but
+#     SUMMARY AI CANDIDATES saw ai_disp_buy_score=0 and config_buy_score=0.
 # ============================================================
 from __future__ import annotations
 
@@ -28,7 +31,7 @@ from functools import wraps
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V3-SUMMARY-AI-SAFETY-GUARD-FRESH-RAW-PUSH-FALLBACK"
+VERSION = "V4-SUMMARY-AI-SCORE-BRIDGE-FRESH-RAW-PUSH-FALLBACK"
 _INSTALLED = False
 
 
@@ -130,12 +133,7 @@ def _df_latest_age_sec(df: Any) -> tuple[bool, float | None, dt.datetime | None,
 
 
 def _get_push_1m_context() -> Any:
-    """Return a fresh-ish 1m PUSH dataframe candidate for safety checks.
-
-    V2 returned the first global_context call result even when it was an empty
-    DataFrame. V3 skips empty results and finally asks fallback_loader, whose
-    fallback is patched to read fresh rows directly from pushYYYYMMDD.db.
-    """
+    """Return a fresh-ish 1m PUSH dataframe candidate for safety checks."""
     first_empty = None
     try:
         import core.global_context.context as ctx
@@ -189,10 +187,6 @@ def _push_writer_state() -> tuple[bool, str]:
     if not _env_bool("SUMMARY_AI_REQUIRE_PUSH_WRITER_READY", True):
         return True, "writer_check_disabled"
 
-    # In main.py, PUSH may be intentionally memory-only; a separate DB collector
-    # process can still persist PUSH. When fresh raw DB fallback is available,
-    # the writer check should not block SUMMARY_AI only because this process has
-    # writer_ready=False. Keep the old protection for non-main/no-fresh cases.
     if _env_bool("SUMMARY_AI_WRITER_CHECK_ALLOW_FRESH_RAW_DB", True):
         df = _get_push_1m_context()
         ok, age, latest, rows = _df_latest_age_sec(df)
@@ -296,6 +290,119 @@ def _blocked_result(reason: str) -> dict[str, Any]:
     }
 
 
+def _num_series(df: Any, names: tuple[str, ...], default: float = 0.0):
+    import pandas as pd
+    for name in names:
+        try:
+            if name in getattr(df, "columns", []):
+                return pd.to_numeric(df[name], errors="coerce").fillna(default).astype(float)
+        except Exception:
+            continue
+    return pd.Series(default, index=df.index, dtype="float64")
+
+
+def _max_series(*series: Any):
+    import pandas as pd
+    frames = []
+    for s in series:
+        try:
+            frames.append(pd.to_numeric(s, errors="coerce").fillna(0.0).astype(float))
+        except Exception:
+            pass
+    if not frames:
+        return None
+    return pd.concat(frames, axis=1).max(axis=1).fillna(0.0)
+
+
+def _bridge_summary_ai_score_columns(df: Any) -> Any:
+    """Normalize display/summary scores into the columns used by SUMMARY_AI candidates.
+
+    This is intentionally conservative: it only derives from existing score-like columns.
+    It does not invent entries from price/volume alone.
+    """
+    if not _env_bool("SUMMARY_AI_SCORE_BRIDGE_ENABLED", True):
+        return df
+    try:
+        import pandas as pd
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return df
+        out = df.copy()
+        idx = out.index
+
+        old_ai_buy = _num_series(out, ("ai_disp_buy_score", "disp_buy_score"), 0.0)
+        old_ai_sell = _num_series(out, ("ai_disp_sell_score", "disp_sell_score"), 0.0).abs()
+        cfg_buy = _num_series(out, ("config_buy_score", "config_buy_entry_score", "config_buy_bonus_score"), 0.0)
+        cfg_sell = _num_series(out, ("config_sell_score", "config_sell_entry_score", "config_sell_bonus_score"), 0.0).abs()
+
+        score_buy = _num_series(out, ("score_buy", "buy_score", "buy", "buy_signal_score"), 0.0)
+        score_sell = _num_series(out, ("score_sell", "sell_score", "sell", "sell_signal_score"), 0.0).abs()
+        score_total = _num_series(out, ("score_total", "total_score", "combined_score", "final_score", "display_score", "score"), 0.0)
+        buy_from_total = score_total.clip(lower=0.0)
+        sell_from_total = (-score_total).clip(lower=0.0)
+
+        new_buy = _max_series(old_ai_buy, cfg_buy, score_buy, buy_from_total)
+        new_sell = _max_series(old_ai_sell, cfg_sell, score_sell, sell_from_total)
+        if new_buy is None or new_sell is None:
+            return df
+        new_buy = pd.Series(new_buy, index=idx).fillna(0.0).astype(float)
+        new_sell = pd.Series(new_sell, index=idx).fillna(0.0).abs().astype(float)
+        new_total = new_buy - new_sell
+
+        before_buy_pos = int((old_ai_buy > 0).sum())
+        before_sell_pos = int((old_ai_sell > 0).sum())
+        after_buy_pos = int((new_buy > 0).sum())
+        after_sell_pos = int((new_sell > 0).sum())
+
+        out["ai_disp_buy_score"] = new_buy
+        out["ai_disp_sell_score"] = new_sell
+        out["config_buy_score"] = _max_series(cfg_buy, score_buy, buy_from_total).fillna(0.0)
+        out["config_sell_score"] = _max_series(cfg_sell, score_sell, sell_from_total).fillna(0.0)
+        out["score_buy"] = new_buy
+        out["buy_score"] = new_buy
+        out["score_sell"] = new_sell
+        out["sell_score"] = new_sell
+        out["score_total"] = new_total
+        out["total_score"] = new_total
+        out["final_score"] = new_total
+        out["display_score"] = new_total
+        out["ai_disp_total_score"] = new_total
+        out["ai_disp_final_score"] = new_total
+
+        if after_buy_pos != before_buy_pos or after_sell_pos != before_sell_pos:
+            logger.warning(
+                "[SUMMARY AI SCORE BRIDGE] applied rows=%s buy_positive %s->%s sell_positive %s->%s buy_max=%.2f sell_max=%.2f cols=%s",
+                len(out),
+                before_buy_pos,
+                after_buy_pos,
+                before_sell_pos,
+                after_sell_pos,
+                float(new_buy.max()) if len(new_buy) else 0.0,
+                float(new_sell.max()) if len(new_sell) else 0.0,
+                [c for c in ("score_buy", "buy_score", "score_sell", "sell_score", "score_total", "final_score", "display_score", "score") if c in out.columns],
+            )
+        return out
+    except Exception:
+        logger.exception("[SUMMARY AI SCORE BRIDGE] failed; use original df")
+        return df
+
+
+def _bridge_runner_args(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    try:
+        new_args = list(args)
+        new_kwargs = dict(kwargs)
+        if new_args:
+            new_args[0] = _bridge_summary_ai_score_columns(new_args[0])
+        else:
+            for key in ("summary_df", "df", "source_df", "base_df"):
+                if key in new_kwargs:
+                    new_kwargs[key] = _bridge_summary_ai_score_columns(new_kwargs[key])
+                    break
+        return tuple(new_args), new_kwargs
+    except Exception:
+        logger.exception("[SUMMARY AI SCORE BRIDGE] arg bridge failed")
+        return args, kwargs
+
+
 def _apply_wide_kwargs(kwargs: dict[str, Any], *, refill: bool = False) -> dict[str, Any]:
     out = dict(kwargs)
     top_n = max(1, _env_int("SUMMARY_AI_REFILL_TOP_N", 60))
@@ -344,7 +451,7 @@ def _install_summary_ai_guard() -> bool:
         if not callable(cur):
             logger.warning("[SUMMARY AI SAFETY GUARD] target missing")
             return False
-        if getattr(cur, "_summary_ai_candidate_refill_v3", False):
+        if getattr(cur, "_summary_ai_candidate_refill_v4", False):
             return True
         orig = getattr(cur, "_original", cur)
 
@@ -363,7 +470,8 @@ def _install_summary_ai_guard() -> bool:
                     return _blocked_result(reason)
 
             wide_kwargs = _apply_wide_kwargs(kwargs, refill=False)
-            first = cur(*args, **wide_kwargs)
+            bridged_args, bridged_kwargs = _bridge_runner_args(args, wide_kwargs)
+            first = cur(*bridged_args, **bridged_kwargs)
             if not _env_bool("SUMMARY_AI_REFILL_RETRY_WITHOUT_TONOSAMA", True):
                 return first
             if not _result_needs_refill(first):
@@ -372,6 +480,7 @@ def _install_summary_ai_guard() -> bool:
             retry_kwargs = _apply_wide_kwargs(kwargs, refill=True)
             retry_kwargs["use_tonosama_filter"] = False
             retry_kwargs["fail_open_tonosama"] = False
+            retry_args, retry_kwargs = _bridge_runner_args(args, retry_kwargs)
             logger.warning(
                 "[SUMMARY AI CANDIDATE REFILL] first pass empty -> retry without TONOSAMA first=%s retry_top_n=%s source=%s interval=%s",
                 _summarize_result(first),
@@ -379,7 +488,7 @@ def _install_summary_ai_guard() -> bool:
                 retry_kwargs.get("source"),
                 retry_kwargs.get("interval"),
             )
-            second = cur(*args, **retry_kwargs)
+            second = cur(*retry_args, **retry_kwargs)
             if isinstance(second, dict):
                 second = dict(second)
                 second["candidate_refill_used"] = True
@@ -387,6 +496,7 @@ def _install_summary_ai_guard() -> bool:
                 second["candidate_refill_retry"] = _summarize_result(second)
             return second
 
+        patched_run_summary_ai_entry_from_df._summary_ai_candidate_refill_v4 = True  # type: ignore[attr-defined]
         patched_run_summary_ai_entry_from_df._summary_ai_candidate_refill_v3 = True  # type: ignore[attr-defined]
         patched_run_summary_ai_entry_from_df._summary_ai_candidate_refill_v2 = True  # type: ignore[attr-defined]
         patched_run_summary_ai_entry_from_df._original = orig  # type: ignore[attr-defined]
@@ -397,13 +507,14 @@ def _install_summary_ai_guard() -> bool:
         except Exception:
             pass
         logger.warning(
-            "[SUMMARY AI SAFETY GUARD] installed version=%s top_n=%s tonosama_max=%s writer_required=%s fresh_required=%s raw_fallback=%s",
+            "[SUMMARY AI SAFETY GUARD] installed version=%s top_n=%s tonosama_max=%s writer_required=%s fresh_required=%s raw_fallback=%s score_bridge=%s",
             VERSION,
             _env_int("SUMMARY_AI_REFILL_TOP_N", 60),
             _env_int("SUMMARY_AI_REFILL_TONOSAMA_MAX_CANDIDATES", 60),
             _env_bool("SUMMARY_AI_REQUIRE_PUSH_WRITER_READY", True),
             _env_bool("SUMMARY_AI_REQUIRE_FRESH_PUSH_1M", True),
             _env_bool("SUMMARY_AI_FRESH_CHECK_ALLOW_RAW_DB_FALLBACK", True),
+            _env_bool("SUMMARY_AI_SCORE_BRIDGE_ENABLED", True),
         )
         return True
     except Exception:
@@ -511,6 +622,7 @@ def install() -> bool:
     os.environ.setdefault("SUMMARY_AI_MAX_PUSH_1M_AGE_SEC", "120")
     os.environ.setdefault("SUMMARY_AI_FRESH_CHECK_ALLOW_RAW_DB_FALLBACK", "1")
     os.environ.setdefault("SUMMARY_AI_WRITER_CHECK_ALLOW_FRESH_RAW_DB", "1")
+    os.environ.setdefault("SUMMARY_AI_SCORE_BRIDGE_ENABLED", "1")
     os.environ.setdefault("SUMMARY_STALE_DB_FALLBACK_MAX_AGE_SEC", "420")
     os.environ.setdefault("TONOSAMA_DISABLE_HISTORY_FAILOPEN", "1")
     os.environ.setdefault("TONOSAMA_REQUIRE_TECHNICAL_READY", "1")
