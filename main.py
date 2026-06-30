@@ -10,8 +10,9 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.34-HARD-LIQUIDITY-MOVEMENT-GUARD
+# Version: Ver38.35-ENTRY-LOCK-RECOVER
 # ------------------------------------------------------------
+# ✔ entry_controller stale pipeline lock recovery patch を追加
 # ✔ SUMMARY AI async entry patch を main runtime patch 一覧へ明示追加
 # ✔ TONOSAMA final liquidity lost-volume fallback threshold を 2.3 に調整
 # ✔ TONOSAMA volatility entry-row rescue を main runtime に追加
@@ -63,6 +64,9 @@ os.environ.setdefault("FINAL_ENTRY_TONOSAMA_SCORE_ONLY_MIN_SCORE", "2.3")
 os.environ.setdefault("FINAL_ENTRY_TONOSAMA_DEDICATED_OK_MIN_SCORE", "2.3")
 os.environ.setdefault("ENTRY_LUNCH_BLOCK_START", "11:30")
 os.environ.setdefault("ENTRY_LUNCH_BLOCK_END", "12:30")
+# entry_controller が詰まって SUMMARY AI が entry_controller_lock_timeout になる場合に自動復旧。
+os.environ.setdefault("ENTRY_PIPELINE_LOCK_RECOVER_ENABLED", "1")
+os.environ.setdefault("ENTRY_PIPELINE_LOCK_STALE_SEC", "20")
 # RANKING pending は high/low が欠損しやすい。高スコア候補を no_high_low だけで全落ちさせない。
 os.environ.setdefault("LOW_MOVE_RANKING_MIN_ATR_RATIO", "0.0020")
 os.environ.setdefault("LOW_MOVE_RANKING_MIN_ABS_SLOPE", "0.0")
@@ -185,6 +189,7 @@ def _install_main_runtime_patches():
         ("core.startup.summary_ai_async_entry_patch", "install"),
         ("core.startup.entry_order_mtf_slope_fill_patch", "install"),
         ("core.startup.summary_ai_entry_controller_bridge_patch", "install"),
+        ("core.startup.entry_controller_stale_lock_recover_patch", "install"),
         ("core.startup.discord_summary_display_compact_patch", "install"),
         ("core.startup.discord_summary_kwarg_safety_patch", "install"),
         ("core.startup.ranking_entry_flat_price_guard_patch", "install"),

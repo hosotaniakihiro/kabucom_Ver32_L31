@@ -1,16 +1,13 @@
 # ============================================================
 # File: database/session.py
-# Ver44-NAS-STABLE-MODELS-CANONICAL-SUMMARY-SCHEMA
+# Ver45-LAZY-PER-DB-INIT-LOCK-SAFE
 # ------------------------------------------------------------
 # ✔ DB engine / Session 管理
 # ✔ SQLite NAS向け busy_timeout / WAL / NullPool 設定
 # ✔ summary DB のテーブル作成は database/models.py の ORM 定義を正本にする
 # ✔ 既存 summary DB への不足カラム追加も models.py の Base_summary.metadata から自動生成
-# ✔ session.py 側の手書き SUMMARY_BOOTSTRAP_COLUMNS を廃止
-# ✔ time_range / date / time / start_time / end_time / trading_value / updated_at なども
-#   models.py にあれば自動で補完対象になる
-# ✔ create_all() は既存テーブルに不足カラムを追加しないため、毎起動 PRAGMA で差分補完
-# ✔ SQLite の ALTER TABLE ADD COLUMN では NOT NULL を付けず、安全に列追加する
+# ✔ Session_position() がランキングDB等の全DB初期化を巻き込まないよう DB別lazy init化
+# ✔ ranking DB が locked でも position/summary/push の利用を止めない
 # ============================================================
 
 from __future__ import annotations
@@ -18,7 +15,10 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 import logging
+import os
 import sqlite3
+import threading
+import time
 from typing import Any
 
 from sqlalchemy import create_engine, text
@@ -55,6 +55,9 @@ _Session_ranking = None
 _Session_tosama = None
 
 _initialized = False
+_init_lock = threading.RLock()
+_initialized_names: set[str] = set()
+_last_init_error_ts: dict[str, float] = {}
 
 push_engine = None
 summary_engine = None
@@ -67,11 +70,14 @@ tosama_engine = None
 # SQLITE CONFIG (NAS HARD MODE)
 # ============================================================
 
-SQLITE_TIMEOUT_SEC = 60
-SQLITE_BUSY_TIMEOUT_MS = 60000
-SQLITE_CACHE_SIZE = -50000
-SQLITE_SYNCHRONOUS = "NORMAL"
-SQLITE_JOURNAL_MODE = "WAL"
+SQLITE_TIMEOUT_SEC = int(float(os.getenv("SQLITE_TIMEOUT_SEC", "60")))
+SQLITE_BUSY_TIMEOUT_MS = int(float(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "60000")))
+SQLITE_CACHE_SIZE = int(float(os.getenv("SQLITE_CACHE_SIZE", "-50000")))
+SQLITE_SYNCHRONOUS = os.getenv("SQLITE_SYNCHRONOUS", "NORMAL")
+SQLITE_JOURNAL_MODE = os.getenv("SQLITE_JOURNAL_MODE", "WAL")
+DB_INIT_RETRY_COUNT = int(float(os.getenv("DB_INIT_RETRY_COUNT", "3")))
+DB_INIT_RETRY_SLEEP_SEC = float(os.getenv("DB_INIT_RETRY_SLEEP_SEC", "1.0"))
+DB_INIT_ERROR_COOLDOWN_SEC = float(os.getenv("DB_INIT_ERROR_COOLDOWN_SEC", "5.0"))
 
 ENGINE_KWARGS = dict(
     echo=False,
@@ -87,6 +93,11 @@ ENGINE_KWARGS = dict(
 # ============================================================
 # SQLITE FILE INIT
 # ============================================================
+
+def _is_locked_error(e: Exception) -> bool:
+    s = str(e).lower()
+    return "database is locked" in s or "database table is locked" in s or "database schema is locked" in s
+
 
 def _initialize_sqlite_file(path: Path) -> None:
     conn = sqlite3.connect(str(path), timeout=SQLITE_TIMEOUT_SEC)
@@ -157,7 +168,10 @@ def _best_effort_configure_existing_db(path: Path) -> None:
         finally:
             cur.close()
             conn.close()
-    except Exception:
+    except Exception as e:
+        if _is_locked_error(e):
+            logger.warning("[DB INIT] existing DB configuration skipped locked path=%s err=%s", path, e)
+            return
         logger.warning("[DB INIT] existing DB configuration skipped: %s", path)
 
 
@@ -175,11 +189,26 @@ def _attach_runtime_pragmas(engine) -> None:
     def set_sqlite_pragma(dbapi_connection, connection_record):  # noqa: ANN001, ARG001
         cursor = dbapi_connection.cursor()
         try:
-            cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};")
-            cursor.execute("PRAGMA temp_store=MEMORY;")
-            cursor.execute(f"PRAGMA cache_size={SQLITE_CACHE_SIZE};")
-            cursor.execute(f"PRAGMA synchronous={SQLITE_SYNCHRONOUS};")
-            cursor.execute("PRAGMA foreign_keys=ON;")
+            try:
+                cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};")
+            except Exception:
+                pass
+            try:
+                cursor.execute("PRAGMA temp_store=MEMORY;")
+            except Exception:
+                pass
+            try:
+                cursor.execute(f"PRAGMA cache_size={SQLITE_CACHE_SIZE};")
+            except Exception:
+                pass
+            try:
+                cursor.execute(f"PRAGMA synchronous={SQLITE_SYNCHRONOUS};")
+            except Exception:
+                pass
+            try:
+                cursor.execute("PRAGMA foreign_keys=ON;")
+            except Exception:
+                pass
         finally:
             cursor.close()
 
@@ -198,23 +227,46 @@ def _today_ymd() -> str:
     return date.today().strftime("%Y%m%d")
 
 
-def _force_create_sqlite_file(engine) -> None:
-    try:
-        with engine.begin() as conn:
-            conn.exec_driver_sql("SELECT 1;")
-    except Exception as e:
-        logger.error("❌ DB file creation failed: %s", e)
-        raise
+def _force_create_sqlite_file(engine, *, name: str = "?") -> None:
+    last = None
+    for attempt in range(1, max(1, DB_INIT_RETRY_COUNT) + 1):
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql("SELECT 1;")
+            return
+        except Exception as e:
+            last = e
+            if _is_locked_error(e) and attempt < max(1, DB_INIT_RETRY_COUNT):
+                logger.warning(
+                    "[DB INIT] file touch locked retry name=%s attempt=%s/%s sleep=%.2fs err=%s",
+                    name,
+                    attempt,
+                    DB_INIT_RETRY_COUNT,
+                    DB_INIT_RETRY_SLEEP_SEC,
+                    e,
+                )
+                time.sleep(max(0.05, DB_INIT_RETRY_SLEEP_SEC))
+                continue
+            logger.error("❌ DB file creation failed name=%s: %s", name, e)
+            raise
+    if last is not None:
+        raise last
 
 
 def _log_engine_info(engine, name: str) -> None:
     logger.info("📂 [%s] %s", name, str(engine.url))
 
 
-def _ensure_tables(engine, base) -> None:
+def _ensure_tables(engine, base, *, name: str = "?") -> None:
     tables = list(base.metadata.tables.keys()) if base is not None else []
     if tables:
-        base.metadata.create_all(engine)
+        try:
+            base.metadata.create_all(engine)
+        except Exception as e:
+            if _is_locked_error(e):
+                logger.warning("[DB INIT] create_all locked name=%s tables=%s err=%s", name, tables, e)
+                raise
+            raise
 
 
 def _quote_ident(name: str) -> str:
@@ -404,7 +456,7 @@ def _bootstrap_summary_schema(engine) -> None:
 
 
 # ============================================================
-# ENGINE BUILD
+# ENGINE BUILD / LAZY INIT
 # ============================================================
 
 def _build_engine(db_path: Path, base, name: str):
@@ -419,11 +471,79 @@ def _build_engine(db_path: Path, base, name: str):
     _attach_runtime_pragmas(engine)
 
     if base is not None:
-        _ensure_tables(engine, base)
+        _ensure_tables(engine, base, name=name)
 
-    _force_create_sqlite_file(engine)
+    _force_create_sqlite_file(engine, name=name)
     _log_engine_info(engine, name)
     return engine
+
+
+def _paths_for_today() -> dict[str, Path]:
+    today = _today_ymd()
+    return {
+        "push": get_path("raw_push") / f"push{today}.db",
+        "summary": get_path("summary") / f"summary{today}.db",
+        "position": get_path("runtime_positions") / "positions.db",
+        "ranking": get_path("raw_ranking") / f"ranking{today}.db",
+        "tosama": get_path("ai_data") / f"tosama{today}.db",
+    }
+
+
+def _init_one(name: str) -> None:
+    global _push_engine, _summary_engine, _position_engine, _ranking_engine, _tosama_engine
+    global _Session_push, _Session_summary, _Session_position, _Session_ranking, _Session_tosama
+    global push_engine, summary_engine, position_engine, ranking_engine, tosama_engine
+
+    if name in _initialized_names:
+        return
+
+    now = time.time()
+    last_err = _last_init_error_ts.get(name)
+    if last_err and now - last_err < DB_INIT_ERROR_COOLDOWN_SEC:
+        raise RuntimeError(f"DB init cooldown active name={name}")
+
+    paths = _paths_for_today()
+    if name == "push":
+        _push_engine = _build_engine(paths["push"], Base_push, "PUSH")
+        _Session_push = sessionmaker(bind=_push_engine)
+        push_engine = _push_engine
+    elif name == "summary":
+        _summary_engine = _build_engine(paths["summary"], Base_summary, "SUMMARY")
+        try:
+            _bootstrap_summary_schema(_summary_engine)
+        except Exception:
+            logger.exception("❌ summary schema bootstrap failed")
+        _Session_summary = sessionmaker(bind=_summary_engine)
+        summary_engine = _summary_engine
+    elif name == "position":
+        _position_engine = _build_engine(paths["position"], Base_position, "POSITION")
+        _Session_position = sessionmaker(bind=_position_engine)
+        position_engine = _position_engine
+    elif name == "ranking":
+        _ranking_engine = _build_engine(paths["ranking"], Base_ranking, "RANKING")
+        _Session_ranking = sessionmaker(bind=_ranking_engine)
+        ranking_engine = _ranking_engine
+    elif name == "tosama":
+        _tosama_engine = _build_engine(paths["tosama"], None, "TOSAMA")
+        _Session_tosama = sessionmaker(bind=_tosama_engine)
+        tosama_engine = _tosama_engine
+    else:
+        raise ValueError(f"unknown db session name={name}")
+
+    _initialized_names.add(name)
+
+
+def _ensure_initialized(name: str) -> None:
+    with _init_lock:
+        try:
+            _init_one(name)
+        except Exception as e:
+            _last_init_error_ts[name] = time.time()
+            if _is_locked_error(e):
+                logger.warning("[DB INIT] lazy init locked name=%s err=%s", name, e)
+            else:
+                logger.exception("[DB INIT] lazy init failed name=%s", name)
+            raise
 
 
 # ============================================================
@@ -431,56 +551,26 @@ def _build_engine(db_path: Path, base, name: str):
 # ============================================================
 
 def init_engines() -> None:
-    global _push_engine, _summary_engine
-    global _position_engine, _ranking_engine, _tosama_engine
-    global _Session_push, _Session_summary
-    global _Session_position, _Session_ranking, _Session_tosama
     global _initialized
-    global push_engine, summary_engine
-    global position_engine, ranking_engine, tosama_engine
-
     if _initialized:
         return
-
-    logger.info("🚀 INIT ENGINES (NAS STABLE MODELS CANONICAL SUMMARY SCHEMA)")
-
-    today = _today_ymd()
-
-    push_path = get_path("raw_push") / f"push{today}.db"
-    _push_engine = _build_engine(push_path, Base_push, "PUSH")
-    _Session_push = sessionmaker(bind=_push_engine)
-
-    summary_path = get_path("summary") / f"summary{today}.db"
-    _summary_engine = _build_engine(summary_path, Base_summary, "SUMMARY")
-
-    try:
-        _bootstrap_summary_schema(_summary_engine)
-    except Exception:
-        logger.exception("❌ summary schema bootstrap failed")
-
-    _Session_summary = sessionmaker(bind=_summary_engine)
-
-    position_path = get_path("runtime_positions") / "positions.db"
-    _position_engine = _build_engine(position_path, Base_position, "POSITION")
-    _Session_position = sessionmaker(bind=_position_engine)
-
-    ranking_path = get_path("raw_ranking") / f"ranking{today}.db"
-    _ranking_engine = _build_engine(ranking_path, Base_ranking, "RANKING")
-    _Session_ranking = sessionmaker(bind=_ranking_engine)
-
-    tosama_path = get_path("ai_data") / f"tosama{today}.db"
-    _tosama_engine = _build_engine(tosama_path, None, "TOSAMA")
-    _Session_tosama = sessionmaker(bind=_tosama_engine)
-
-    push_engine = _push_engine
-    summary_engine = _summary_engine
-    position_engine = _position_engine
-    ranking_engine = _ranking_engine
-    tosama_engine = _tosama_engine
-
-    _initialized = True
-
-    logger.info("✅ ALL ENGINES INITIALIZED (NAS STABLE FINAL)")
+    with _init_lock:
+        if _initialized:
+            return
+        logger.info("🚀 INIT ENGINES (NAS STABLE MODELS CANONICAL SUMMARY SCHEMA LAZY PER DB)")
+        for name in ("push", "summary", "position", "ranking", "tosama"):
+            try:
+                _init_one(name)
+            except Exception as e:
+                _last_init_error_ts[name] = time.time()
+                if _is_locked_error(e):
+                    # ranking等の補助DBがロック中でも、既に初期化できたDBは使えるようにする。
+                    logger.warning("[DB INIT] init_engines skipped locked db name=%s err=%s", name, e)
+                    continue
+                logger.exception("[DB INIT] init_engines failed db=%s", name)
+                continue
+        _initialized = len(_initialized_names) >= 3  # push/summary/position が揃えば実運用は続行可能
+        logger.info("✅ ENGINES INITIALIZED PARTIAL_OK initialized=%s names=%s", _initialized, sorted(_initialized_names))
 
 
 def _auto_init() -> None:
@@ -493,8 +583,10 @@ class _SessionProxy:
         self.name = name
 
     def __call__(self, *args, **kwargs):
-        _auto_init()
+        _ensure_initialized(self.name)
         real = globals()[f"_Session_{self.name}"]
+        if real is None:
+            raise RuntimeError(f"Session not initialized name={self.name}")
         return real(*args, **kwargs)
 
 
@@ -506,27 +598,27 @@ Session_tosama = _SessionProxy("tosama")
 
 
 def get_push_engine():
-    _auto_init()
+    _ensure_initialized("push")
     return _push_engine
 
 
 def get_summary_engine():
-    _auto_init()
+    _ensure_initialized("summary")
     return _summary_engine
 
 
 def get_position_engine():
-    _auto_init()
+    _ensure_initialized("position")
     return _position_engine
 
 
 def get_ranking_engine():
-    _auto_init()
+    _ensure_initialized("ranking")
     return _ranking_engine
 
 
 def get_tosama_engine():
-    _auto_init()
+    _ensure_initialized("tosama")
     return _tosama_engine
 
 
