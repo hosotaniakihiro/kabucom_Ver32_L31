@@ -2,17 +2,17 @@
 """
 Runtime fixes for startup PUSH/summary/active-symbol issues.
 
-Fixes:
+REV3:
+  - 2026-06-30 09:05 logs showed PUSH DB was live, but summary fallback still used
+    stale summary_recovery_push_1m rows from 08:47-08:50 with volume=0.
+  - Add a fresh fallback source built directly from pushYYYYMMDD.db / stream_data_raw.
+  - Prefer fresh raw PUSH DB rows before older summary_recovery rows.
+
+REV2:
   1. ACTIVE SUMMARY PRICE FALLBACK SQL emitted "incomplete input" because the
      correlated MAX(datetime) subquery was missing its closing parenthesis.
-  2. PUSH summary fallback could miss persisted rows saved with source="push"
-     because the fallback source list / push-like filter did not include the
-     plain "push" source used by runner_core._save_summary_if_owner(...).
-  3. Premarket SBI rows often have no price column.  After the SQL fix, only a
-     small subset of symbols may have summary prices at 09:00-09:30, and the
-     strict final price guard can shrink 100 PUSH symbols down to 0-2 symbols.
-     In premarket mode, keep unknown-price symbols by default while still
-     applying the 2500-7000 price guard to symbols with known prices.
+  2. PUSH summary fallback could miss persisted rows saved with source="push".
+  3. Premarket SBI rows often have no price column; keep unknown-price symbols by default.
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from typing import Any, Dict, Iterable
 import pandas as pd
 
 logger = logging.getLogger(__name__)
-VERSION = "REV2-PUSH-SUMMARY-FALLBACK-ACTIVE-PRICE-PREMARKET-FAILOPEN"
+VERSION = "REV3-PUSH-RAW-DB-FRESH-FALLBACK"
 _INSTALLED = False
 
 
@@ -75,6 +75,17 @@ def _summary_db_path() -> str:
         r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary",
     )
     return os.getenv("SUMMARY_DB_PATH", str(Path(base) / f"summary{_today()}.db"))
+
+
+def _push_db_path() -> str:
+    base = os.getenv(
+        "PUSH_DB_DIR",
+        os.getenv(
+            "RAW_PUSH_DIR",
+            r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\push",
+        ),
+    )
+    return os.getenv("PUSH_DB_PATH", str(Path(base) / f"push{_today()}.db"))
 
 
 def _qident(name: Any) -> str:
@@ -218,8 +229,6 @@ def _patched_allow_unknown_price(*, premarket_mode: bool) -> bool:
     try:
         if _env_bool("ACTIVE_FINAL_PRICE_GUARD_ALLOW_UNKNOWN_PRICE", False):
             return True
-        # 寄前SBIの価格欠損で100銘柄が0-2銘柄へ縮退するのを防ぐ。
-        # 価格が取れた銘柄は final_guard_min_price 側で従来通り min/max price を判定する。
         if premarket_mode and _env_bool("ACTIVE_PREMARKET_ALLOW_NO_PRICE", True):
             return True
         return False
@@ -239,6 +248,131 @@ def _patch_active_price_sql() -> bool:
         return False
 
 
+def _safe_to_num(s):
+    return pd.to_numeric(s, errors="coerce")
+
+
+def _load_recent_push_raw_summary(interval_i: int, *, now_i: dt.datetime) -> pd.DataFrame:
+    if not _env_bool("PUSH_SUMMARY_RAW_DB_FALLBACK_ENABLED", True):
+        return pd.DataFrame()
+    path = _push_db_path()
+    p = Path(path)
+    if not p.exists():
+        logger.warning("[PUSH RAW DB FALLBACK] db not found path=%s patch=%s", path, VERSION)
+        return pd.DataFrame()
+
+    lookback_min = int(max(2, _env_float("PUSH_SUMMARY_RAW_DB_FALLBACK_LOOKBACK_MIN", 10.0)))
+    limit = int(max(100, _env_float("PUSH_SUMMARY_RAW_DB_FALLBACK_LIMIT", 50000.0)))
+    timeout_sec = max(0.05, _env_float("PUSH_SUMMARY_RAW_DB_FALLBACK_TIMEOUT_SEC", 0.8))
+    busy_ms = int(max(50, _env_float("PUSH_SUMMARY_RAW_DB_FALLBACK_BUSY_TIMEOUT_MS", 500.0)))
+    since = now_i - dt.timedelta(minutes=lookback_min)
+
+    try:
+        with sqlite3.connect(str(p), timeout=timeout_sec) as conn:
+            conn.execute(f"PRAGMA busy_timeout={busy_ms};")
+            table = "stream_data_raw" if _table_exists(conn, "stream_data_raw") else "stream_data"
+            cols = _table_cols(conn, table)
+            if not {"symbol", "datetime", "price"}.issubset(cols):
+                logger.warning("[PUSH RAW DB FALLBACK] required cols missing table=%s cols=%s path=%s", table, sorted(cols), path)
+                return pd.DataFrame()
+            wanted = [
+                "symbol", "symbolname", "datetime", "date", "time", "price", "volume",
+                "trading_value", "vwap", "opening_price", "high_price", "low_price",
+            ]
+            if "received_at" in cols:
+                wanted.append("received_at")
+            select_cols = [c for c in wanted if c in cols]
+            date_filter = now_i.strftime("%Y-%m-%d")
+            where_parts = []
+            params: list[Any] = []
+            if "date" in cols:
+                where_parts.append("date = ?")
+                params.append(date_filter)
+            if "received_at" in cols:
+                where_parts.append("received_at >= ?")
+                params.append(since.isoformat())
+            else:
+                where_parts.append("datetime >= ?")
+                params.append(since.isoformat())
+            where = " AND ".join(where_parts) if where_parts else "1=1"
+            sql = f"SELECT {','.join(_qident(c) for c in select_cols)} FROM {_qident(table)} WHERE {where} ORDER BY datetime DESC LIMIT ?"
+            params.append(limit)
+            df = pd.read_sql_query(sql, conn, params=params)
+    except Exception:
+        logger.debug("[PUSH RAW DB FALLBACK] load failed path=%s interval=%s", path, interval_i, exc_info=True)
+        return pd.DataFrame()
+
+    if df.empty:
+        logger.warning("[PUSH RAW DB FALLBACK] empty path=%s interval=%s since=%s patch=%s", path, interval_i, since, VERSION)
+        return df
+
+    try:
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+        df = df.dropna(subset=["datetime", "symbol"])
+        df["price"] = _safe_to_num(df["price"])
+        df = df.dropna(subset=["price"])
+        df = df[df["price"] > 0].copy()
+        if df.empty:
+            return pd.DataFrame()
+        df["symbol"] = df["symbol"].astype(str).str.strip()
+        df = df[df["symbol"] != ""].copy()
+        try:
+            df["slot"] = df["datetime"].dt.floor(f"{int(interval_i)}min")
+        except Exception:
+            df["slot"] = df["datetime"]
+        latest_slot = df["slot"].max()
+        df = df[df["slot"] == latest_slot].copy()
+        df = df.sort_values(["symbol", "datetime"])
+        if "volume" in df.columns:
+            df["volume"] = _safe_to_num(df["volume"]).fillna(0.0)
+        else:
+            df["volume"] = 0.0
+        if "trading_value" in df.columns:
+            df["trading_value"] = _safe_to_num(df["trading_value"]).fillna(0.0)
+        else:
+            df["trading_value"] = 0.0
+        if "symbolname" not in df.columns:
+            df["symbolname"] = ""
+
+        grouped = df.groupby("symbol", sort=False)
+        out = pd.DataFrame({
+            "symbol": grouped["symbol"].last(),
+            "symbolname": grouped["symbolname"].last(),
+            "datetime": grouped["slot"].last(),
+            "open": grouped["price"].first(),
+            "high": grouped["price"].max(),
+            "low": grouped["price"].min(),
+            "close": grouped["price"].last(),
+            "volume": grouped["volume"].max(),
+            "trading_value": grouped["trading_value"].max(),
+        }).reset_index(drop=True)
+        out["price"] = out["close"]
+        out["current_price"] = out["close"]
+        out["open_price"] = out["open"]
+        out["high_price"] = out["high"]
+        out["low_price"] = out["low"]
+        out["close_price"] = out["close"]
+        out["interval"] = int(interval_i)
+        out["source"] = "push_stream_raw_db"
+        out["date"] = pd.to_datetime(out["datetime"], errors="coerce").dt.strftime("%Y-%m-%d")
+        out["time"] = pd.to_datetime(out["datetime"], errors="coerce").dt.strftime("%H:%M:%S")
+        out["start_time"] = out["time"]
+        out["end_time"] = out["time"]
+        logger.warning(
+            "[PUSH RAW DB FALLBACK] loaded interval=%s rows=%s symbols=%s latest_dt=%s path=%s patch=%s",
+            interval_i,
+            len(out),
+            out["symbol"].nunique() if "symbol" in out.columns else 0,
+            out["datetime"].max() if "datetime" in out.columns and not out.empty else None,
+            path,
+            VERSION,
+        )
+        return out
+    except Exception:
+        logger.exception("[PUSH RAW DB FALLBACK] transform failed path=%s interval=%s patch=%s", path, interval_i, VERSION)
+        return pd.DataFrame()
+
+
 def _patch_push_summary_fallback() -> bool:
     try:
         import scheduler_jobs.summary.fallback_loader as fl
@@ -254,7 +388,7 @@ def _patch_push_summary_fallback() -> bool:
                 src = x["source"].astype(str)
                 src_l = src.str.lower().str.strip()
                 mask = (
-                    src_l.isin({"push", "summary", "push_summary", "summary_push"})
+                    src_l.isin({"push", "summary", "push_summary", "summary_push", "push_stream_raw_db"})
                     | src.str.contains("push_stream", case=False, na=False)
                     | src.str.contains("yahoo_pipeline", case=False, na=False)
                     | src.str.contains("incremental", case=False, na=False)
@@ -276,18 +410,48 @@ def _patch_push_summary_fallback() -> bool:
                     return orig_filter(df)
                 return x
 
-        def patched_fallback_push_summary_df(interval: int, *, now=None) -> pd.DataFrame:
-            if callable(orig_fallback):
-                try:
-                    df0 = orig_fallback(interval, now=now)
-                    if isinstance(df0, pd.DataFrame) and not df0.empty:
-                        return df0
-                except Exception:
-                    logger.debug("[summary.fallback_loader] original push fallback failed interval=%s", interval, exc_info=True)
+        def _is_fresh_enough(df: pd.DataFrame, interval_i: int, now_i: dt.datetime) -> bool:
+            try:
+                ts = fl.extract_latest_timestamp(df)
+                if ts is None:
+                    return False
+                return bool(fl.is_fresh_timestamp(ts, interval_i, for_ranking=False, now=now_i))
+            except Exception:
+                return False
 
+        def patched_fallback_push_summary_df(interval: int, *, now=None) -> pd.DataFrame:
             interval_i = int(interval)
             now_i = (now or fl.now_naive()).replace(tzinfo=None, microsecond=0)
+
+            raw_df = _load_recent_push_raw_summary(interval_i, now_i=now_i)
+            if isinstance(raw_df, pd.DataFrame) and not raw_df.empty:
+                raw_df = fl.normalize_df(raw_df)
+                raw_df = fl._slot_aligned_latest_rows(raw_df, interval=interval_i, now=now_i)
+                if not raw_df.empty and _is_fresh_enough(raw_df, interval_i, now_i):
+                    logger.warning(
+                        "[summary.fallback_loader] selected fresh push raw DB fallback interval=%s rows=%s symbols=%s latest_dt=%s patch=%s",
+                        interval_i,
+                        len(raw_df),
+                        fl.symbols_count(raw_df),
+                        fl.latest_dt_str(raw_df),
+                        VERSION,
+                    )
+                    return raw_df.reset_index(drop=True)
+
+            if callable(orig_fallback):
+                try:
+                    df0 = orig_fallback(interval_i, now=now_i)
+                    if isinstance(df0, pd.DataFrame) and not df0.empty:
+                        if _is_fresh_enough(df0, interval_i, now_i):
+                            return df0
+                        if not raw_df.empty:
+                            return raw_df.reset_index(drop=True)
+                except Exception:
+                    logger.debug("[summary.fallback_loader] original push fallback failed interval=%s", interval_i, exc_info=True)
+
             candidates: list[tuple[str, pd.DataFrame]] = []
+            if isinstance(raw_df, pd.DataFrame) and not raw_df.empty:
+                candidates.append((f"db.push_raw[{interval_i}].patched", raw_df))
             for src in ("push", "SUMMARY", "summary", None):
                 try:
                     df = fl.load_latest_summary_from_db(interval_i, source_filter=src, now=now_i)
@@ -316,7 +480,7 @@ def _patch_push_summary_fallback() -> bool:
         except Exception:
             pass
 
-        logger.warning("[PUSH SUMMARY FALLBACK PATCH] installed version=%s", VERSION)
+        logger.warning("[PUSH SUMMARY FALLBACK PATCH] installed version=%s raw_db_fallback=True", VERSION)
         return True
     except Exception:
         logger.exception("[PUSH SUMMARY FALLBACK PATCH] install failed version=%s", VERSION)
