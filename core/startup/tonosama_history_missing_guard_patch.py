@@ -1,12 +1,13 @@
 # ============================================================
 # File   : core/startup/tonosama_history_missing_guard_patch.py
-# Version: V3.0-RAW1-RESAMPLE-FALLBACK-NO-FAILCLOSE
+# Version: V4.0-HISTORY-MISSING-QUALITY-GUARD
 # ------------------------------------------------------------
 # 目的:
 #   1) 3m/5m summary が stale/empty でも、1m summary が新鮮なら
 #      raw1 から 3m/5m を即時 resample して Tonosama 候補0を防ぐ。
 #   2) sitecustomize の controlled fail-open 設定を OFF に戻さない。
-#   3) history_missing/failopen 行を既定で DROP しない。
+#   3) history_missing/failopen 行でも、低出来高・低変動・5秒無反応の
+#      弱い候補はDROPする。
 # ============================================================
 
 from __future__ import annotations
@@ -46,7 +47,7 @@ def _env_float(name: str, default: float) -> float:
         raw = os.getenv(name)
         if raw is None or str(raw).strip() == "":
             return float(default)
-        return float(raw)
+        return float(str(raw).replace(",", ""))
     except Exception:
         return float(default)
 
@@ -73,9 +74,8 @@ def _set_env(name: str, value: str) -> None:
 
 def _enable_controlled_history_fallback_defaults() -> None:
     """
-    15:19ログではこの旧patchが fail-open を 0 に戻したため
-    allow_without_history=False になり base feature empty になっていた。
     raw1 が新鮮な場合は復旧を優先し、最後の保険として controlled fail-open も許可する。
+    ただし V4 では fail-open 行に品質ガードを追加し、低出来高・低変動は落とす。
     """
     if _env_bool("TONOSAMA_FORCE_HISTORY_FAILCLOSE", False):
         logger.warning("[TONOSAMA HISTORY GUARD] explicit fail-close requested by env")
@@ -86,6 +86,7 @@ def _enable_controlled_history_fallback_defaults() -> None:
     _set_env("TONOSAMA_DROP_HISTORY_MISSING_ENTRY", "0")
     _setdefault_env("TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE", "3.0")
     _setdefault_env("TONOSAMA_RAW1_RESAMPLE_FALLBACK", "1")
+    _setdefault_env("TONOSAMA_HISTORY_MISSING_QUALITY_GUARD", "1")
 
 
 def _patch_volatility_filter_thresholds() -> None:
@@ -135,6 +136,28 @@ def _first_existing(df: pd.DataFrame, names: list[str]) -> str | None:
         if n in df.columns:
             return n
     return None
+
+
+def _num(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    try:
+        if df is None or df.empty or col not in df.columns:
+            return pd.Series(default, index=df.index if df is not None else None, dtype="float64")
+        return pd.to_numeric(df[col], errors="coerce").fillna(default)
+    except Exception:
+        return pd.Series(default, index=df.index if df is not None else None, dtype="float64")
+
+
+def _max_existing_numeric(df: pd.DataFrame, names: list[str], default: float = 0.0) -> pd.Series:
+    try:
+        found = [n for n in names if n in df.columns]
+        if not found:
+            return pd.Series(default, index=df.index, dtype="float64")
+        out = pd.Series(default, index=df.index, dtype="float64")
+        for n in found:
+            out = pd.concat([out, _num(df, n, default)], axis=1).max(axis=1).fillna(default)
+        return out
+    except Exception:
+        return pd.Series(default, index=df.index if df is not None else None, dtype="float64")
 
 
 def _resample_1m_to_interval(vs: Any, interval: int) -> pd.DataFrame:
@@ -316,9 +339,10 @@ def _sample(df: pd.DataFrame, limit: int = 8) -> list[dict[str, Any]]:
     if df is None or df.empty:
         return []
     cols = [c for c in [
-        "symbol", "symbolname", "close", "_max_volume_surge_ratio", "_max_price_change_pct",
+        "symbol", "symbolname", "close", "volume", "_latest_volume", "_max_volume_surge_ratio", "_max_price_change_pct",
         "_surge_tf", "_volume_surge_history_missing", "_volume_surge_failopen",
-        "_body_change_pct", "_intrabar_range_pct", "_slope", "price_change_5s_pct",
+        "_body_change_pct", "_intrabar_range_pct", "_slope", "price_change_5s_pct", "volume_surge_ratio_5s",
+        "_history_failopen_turnover", "_history_failopen_quality_ok",
     ] if c in df.columns]
     out: list[dict[str, Any]] = []
     for _, row in df.head(limit).iterrows():
@@ -337,6 +361,41 @@ def _sample(df: pd.DataFrame, limit: int = 8) -> list[dict[str, Any]]:
     return out
 
 
+def _history_missing_quality_mask(df: pd.DataFrame) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(False, index=df.index if df is not None else None, dtype="bool")
+
+    latest_vol = _max_existing_numeric(df, ["_latest_volume", "latest_volume", "volume", "volume_1m", "volume_3m", "volume_5m"], 0.0)
+    close = _max_existing_numeric(df, ["close", "close_price", "current_price", "price"], 0.0)
+    turnover = latest_vol * close
+
+    price_abs = _num(df, "_max_price_change_pct", 0.0).abs()
+    body_abs = _num(df, "_body_change_pct", 0.0).abs()
+    range_abs = _num(df, "_intrabar_range_pct", 0.0).abs()
+    five_abs = _num(df, "price_change_5s_pct", 0.0).abs()
+    five_surge = _num(df, "volume_surge_ratio_5s", 0.0)
+
+    min_volume = _env_float("TONOSAMA_HISTORY_MISSING_MIN_VOLUME", 500000.0)
+    min_turnover = _env_float("TONOSAMA_HISTORY_MISSING_MIN_TURNOVER", 10000000.0)
+    min_price = _env_float("TONOSAMA_HISTORY_MISSING_MIN_PRICE_CHANGE_PCT", 0.50)
+    min_body = _env_float("TONOSAMA_HISTORY_MISSING_MIN_BODY_PCT", 0.30)
+    min_range = _env_float("TONOSAMA_HISTORY_MISSING_MIN_RANGE_PCT", 1.00)
+    min_5sec = _env_float("TONOSAMA_HISTORY_MISSING_MIN_5SEC_CHANGE_PCT", 0.05)
+    min_5sec_surge = _env_float("TONOSAMA_HISTORY_MISSING_MIN_5SEC_SURGE", 1.20)
+
+    liquidity_ok = (latest_vol >= min_volume) & (turnover >= min_turnover)
+    movement_ok = (price_abs >= min_price) | (body_abs >= min_body) | (range_abs >= min_range) | (five_abs >= min_5sec)
+    five_ok = (five_abs >= min_5sec) | (five_surge >= min_5sec_surge) | (five_surge <= 0)
+
+    ok = (liquidity_ok & movement_ok & five_ok).fillna(False).astype(bool)
+    try:
+        df["_history_failopen_turnover"] = turnover
+        df["_history_failopen_quality_ok"] = ok
+    except Exception:
+        pass
+    return ok
+
+
 def _pass_history_missing_failopen(df: pd.DataFrame, *, stage: str) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
@@ -345,19 +404,64 @@ def _pass_history_missing_failopen(df: pd.DataFrame, *, stage: str) -> pd.DataFr
     if not has_missing and not has_failopen:
         return df
     try:
-        missing = df.get("_volume_surge_history_missing", pd.Series(False, index=df.index)).fillna(False).astype(bool)
-        failopen = df.get("_volume_surge_failopen", pd.Series(False, index=df.index)).fillna(False).astype(bool)
-        affected = int((missing | failopen).sum())
+        x = df.copy()
+        missing = x.get("_volume_surge_history_missing", pd.Series(False, index=x.index)).fillna(False).astype(bool)
+        failopen = x.get("_volume_surge_failopen", pd.Series(False, index=x.index)).fillna(False).astype(bool)
+        affected_mask = (missing | failopen).fillna(False).astype(bool)
+        affected = int(affected_mask.sum())
     except Exception:
-        affected = 0
+        logger.debug("[TONOSAMA HISTORY GUARD] affected mask failed stage=%s", stage, exc_info=True)
+        return df
+
+    if not affected:
+        logger.warning(
+            "[TONOSAMA HISTORY GUARD] pass-through history-missing/failopen rows stage=%s rows=%s affected=0 sample=[]",
+            stage,
+            len(df),
+        )
+        return df
+
+    if not _env_bool("TONOSAMA_HISTORY_MISSING_QUALITY_GUARD", True):
+        logger.warning(
+            "[TONOSAMA HISTORY GUARD] pass-through history-missing/failopen rows stage=%s rows=%s affected=%s quality_guard=0 sample=%s",
+            stage,
+            len(x),
+            affected,
+            _sample(x.loc[affected_mask].copy()),
+        )
+        return x
+
+    quality_ok = _history_missing_quality_mask(x)
+    drop_mask = affected_mask & ~quality_ok
+    kept = x.loc[~drop_mask].copy()
+    dropped = int(drop_mask.sum())
+    if dropped:
+        logger.warning(
+            "[TONOSAMA HISTORY GUARD] drop weak history-missing/failopen rows stage=%s before=%s after=%s dropped=%s thresholds=%s sample=%s",
+            stage,
+            len(x),
+            len(kept),
+            dropped,
+            {
+                "min_volume": _env_float("TONOSAMA_HISTORY_MISSING_MIN_VOLUME", 500000.0),
+                "min_turnover": _env_float("TONOSAMA_HISTORY_MISSING_MIN_TURNOVER", 10000000.0),
+                "min_price_change_pct": _env_float("TONOSAMA_HISTORY_MISSING_MIN_PRICE_CHANGE_PCT", 0.50),
+                "min_body_pct": _env_float("TONOSAMA_HISTORY_MISSING_MIN_BODY_PCT", 0.30),
+                "min_range_pct": _env_float("TONOSAMA_HISTORY_MISSING_MIN_RANGE_PCT", 1.00),
+                "min_5sec_change_pct": _env_float("TONOSAMA_HISTORY_MISSING_MIN_5SEC_CHANGE_PCT", 0.05),
+            },
+            _sample(x.loc[drop_mask].copy()),
+        )
     logger.warning(
-        "[TONOSAMA HISTORY GUARD] pass-through history-missing/failopen rows stage=%s rows=%s affected=%s sample=%s",
+        "[TONOSAMA HISTORY GUARD] pass-through history-missing/failopen rows stage=%s rows=%s affected=%s kept=%s dropped=%s sample=%s",
         stage,
-        len(df),
+        len(x),
         affected,
-        _sample(df.loc[(missing | failopen)].copy()) if affected else [],
+        int((affected_mask & quality_ok).sum()),
+        dropped,
+        _sample(kept.loc[affected_mask.reindex(kept.index, fill_value=False)].copy()) if not kept.empty else [],
     )
-    return df
+    return kept
 
 
 def _patched_build_scalping_feature_df(*args, **kwargs):
@@ -389,19 +493,23 @@ def install() -> bool:
         if not callable(cur):
             logger.warning("[TONOSAMA HISTORY GUARD] target build_scalping_feature_df not callable")
             return False
-        if getattr(cur, "_tonosama_history_guard_patch_v3", False):
+        if getattr(cur, "_tonosama_history_guard_patch_v4", False):
             _PATCHED = True
             return True
         _ORIGINAL_BUILD = cur
-        _patched_build_scalping_feature_df._tonosama_history_guard_patch_v3 = True  # type: ignore[attr-defined]
+        _patched_build_scalping_feature_df._tonosama_history_guard_patch_v4 = True  # type: ignore[attr-defined]
         _patched_build_scalping_feature_df._original = cur  # type: ignore[attr-defined]
         runner.build_scalping_feature_df = _patched_build_scalping_feature_df
         _PATCHED = True
         logger.warning(
-            "[TONOSAMA HISTORY GUARD] installed v3 raw1_resample=%s allow_history_missing=%s drop_history_missing=%s",
+            "[TONOSAMA HISTORY GUARD] installed v4 raw1_resample=%s allow_history_missing=%s drop_history_missing=%s quality_guard=%s min_volume=%.0f min_price_change=%.3f min_range=%.3f",
             _env_bool("TONOSAMA_RAW1_RESAMPLE_FALLBACK", True),
             _env_bool("TONOSAMA_ALLOW_HISTORY_MISSING_ENTRY", True),
             _env_bool("TONOSAMA_DROP_HISTORY_MISSING_ENTRY", False),
+            _env_bool("TONOSAMA_HISTORY_MISSING_QUALITY_GUARD", True),
+            _env_float("TONOSAMA_HISTORY_MISSING_MIN_VOLUME", 500000.0),
+            _env_float("TONOSAMA_HISTORY_MISSING_MIN_PRICE_CHANGE_PCT", 0.50),
+            _env_float("TONOSAMA_HISTORY_MISSING_MIN_RANGE_PCT", 1.00),
         )
         return True
     except Exception:
