@@ -1,17 +1,16 @@
 # ============================================================
 # File   : trading/ranking/summary/score.py
-# Version: Ver1.2-PRODUCTION-RANKING-SUMMARY-SCORE
-#          -SAFE-NAN-FLOAT64-FIX
+# Version: Ver1.3-PRODUCTION-RANKING-SUMMARY-SCORE-REPAIR-ZERO
 # ------------------------------------------------------------
 # ranking summary 用 score column 補完モジュール
 # ------------------------------------------------------------
-# 🔥 Ver1.2 修正:
 # ✔ pd.Series(pd.NA, dtype="float64") を全面廃止
 # ✔ np.nan ベースで float64 初期化
 # ✔ score / score_total / final_score / display_score を保証
 # ✔ score_buy / score_sell を保証
 # ✔ score_slope / score_mtf を保証
 # ✔ ranking_score / rank_score 等の候補列から base score を復元
+# ✔ 既存 score 系列が全0なら ranking_score などの非ゼロ候補から修復
 # ✔ 文字列数値 / カンマ / 空文字 / <NA> を安全処理
 # ✔ 重複列 DataFrame 化にも対応
 # ✔ 機能削除ゼロ
@@ -47,8 +46,24 @@ BASE_SCORE_CANDIDATES = [
     "display_score",
     "ranking_score",
     "rank_score",
+    "ranking_momentum",
+    "rank_momentum",
     "summary_score",
     "total_score",
+    "score_rank_base",
+    "best_rank_score",
+    "rank_score_base",
+]
+
+RANKING_REPAIR_CANDIDATES = [
+    "ranking_score",
+    "rank_score",
+    "ranking_momentum",
+    "rank_momentum",
+    "summary_score",
+    "score_rank_base",
+    "best_rank_score",
+    "rank_score_base",
 ]
 
 
@@ -157,6 +172,47 @@ def _combine_first_numeric(
     return out.fillna(float(default)).astype("float64")
 
 
+def _combine_nonzero_numeric(
+    df: pd.DataFrame,
+    candidates: Iterable[str],
+    *,
+    default: float = 0.0,
+) -> pd.Series:
+    """0/NaNをスキップして、最初の非ゼロ候補を採用する。"""
+    if df is None or not isinstance(df, pd.DataFrame):
+        return pd.Series(dtype="float64")
+
+    out = pd.Series(float(default), index=df.index, dtype="float64")
+    used = pd.Series(False, index=df.index, dtype="bool")
+
+    for col in candidates:
+        if col not in df.columns:
+            continue
+        s = _safe_numeric_series(df, col, default=None, fill=False)
+        mask = (~used) & s.notna() & s.fillna(0.0).ne(0.0)
+        if mask.any():
+            out.loc[mask] = s.loc[mask].astype("float64")
+            used.loc[mask] = True
+
+    return out.astype("float64")
+
+
+def _nonzero_count(s: pd.Series) -> int:
+    try:
+        return int(pd.to_numeric(s, errors="coerce").fillna(0.0).ne(0.0).sum())
+    except Exception:
+        return 0
+
+
+def _repair_zero_series(current: pd.Series, repair: pd.Series) -> pd.Series:
+    cur = pd.to_numeric(current, errors="coerce").fillna(0.0).astype("float64")
+    rep = pd.to_numeric(repair, errors="coerce").fillna(0.0).astype("float64")
+    mask = cur.eq(0.0) & rep.ne(0.0)
+    if mask.any():
+        cur.loc[mask] = rep.loc[mask]
+    return cur.astype("float64")
+
+
 def ensure_score_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     ranking summary 用の score 系列を安全に補完する。
@@ -187,34 +243,52 @@ def ensure_score_columns(df: pd.DataFrame) -> pd.DataFrame:
         BASE_SCORE_CANDIDATES,
         default=0.0,
     )
+    repair_score = _combine_nonzero_numeric(
+        x,
+        RANKING_REPAIR_CANDIDATES,
+        default=0.0,
+    )
 
     if "score" in x.columns:
         x["score"] = _safe_numeric_series(x, "score", default=0.0, fill=True)
+        x["score"] = _repair_zero_series(x["score"], repair_score)
     else:
-        x["score"] = base_score
+        x["score"] = _repair_zero_series(base_score, repair_score)
 
     if "score_total" in x.columns:
         x["score_total"] = _safe_numeric_series(x, "score_total", default=0.0, fill=True)
+        x["score_total"] = _repair_zero_series(x["score_total"], x["score"])
     else:
         x["score_total"] = x["score"]
 
     if "final_score" in x.columns:
         x["final_score"] = _safe_numeric_series(x, "final_score", default=0.0, fill=True)
+        x["final_score"] = _repair_zero_series(x["final_score"], x["score_total"])
     else:
         x["final_score"] = x["score_total"]
 
     if "display_score" in x.columns:
         x["display_score"] = _safe_numeric_series(x, "display_score", default=0.0, fill=True)
+        x["display_score"] = _repair_zero_series(x["display_score"], x["final_score"])
     else:
         x["display_score"] = x["final_score"]
 
+    # 既存 score_buy / score_sell が全0のまま存在する場合、final_scoreから復元する。
     if "score_buy" in x.columns:
         x["score_buy"] = _safe_numeric_series(x, "score_buy", default=0.0, fill=True)
+        x["score_buy"] = _repair_zero_series(
+            x["score_buy"],
+            pd.to_numeric(x["final_score"], errors="coerce").fillna(0.0).clip(lower=0.0),
+        )
     else:
         x["score_buy"] = pd.to_numeric(x["final_score"], errors="coerce").fillna(0.0).clip(lower=0.0)
 
     if "score_sell" in x.columns:
         x["score_sell"] = _safe_numeric_series(x, "score_sell", default=0.0, fill=True)
+        x["score_sell"] = _repair_zero_series(
+            x["score_sell"],
+            (-pd.to_numeric(x["final_score"], errors="coerce").fillna(0.0)).clip(lower=0.0),
+        )
     else:
         x["score_sell"] = (-pd.to_numeric(x["final_score"], errors="coerce").fillna(0.0)).clip(lower=0.0)
 
@@ -237,13 +311,14 @@ def ensure_score_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     try:
         logger.info(
-            "[RANKING SUMMARY SCORE] ensured rows=%d score_nonnull=%d score_nonzero=%d final_nonnull=%d buy_nonzero=%d sell_nonzero=%d",
+            "[RANKING SUMMARY SCORE] ensured rows=%d score_nonnull=%d score_nonzero=%d final_nonnull=%d buy_nonzero=%d sell_nonzero=%d repair_nonzero=%d",
             len(x),
             int(pd.to_numeric(x["score"], errors="coerce").notna().sum()),
             int(pd.to_numeric(x["score"], errors="coerce").fillna(0.0).ne(0).sum()),
             int(pd.to_numeric(x["final_score"], errors="coerce").notna().sum()),
             int(pd.to_numeric(x["score_buy"], errors="coerce").fillna(0.0).ne(0).sum()),
             int(pd.to_numeric(x["score_sell"], errors="coerce").fillna(0.0).ne(0).sum()),
+            _nonzero_count(repair_score),
         )
     except Exception:
         logger.exception("[RANKING SUMMARY SCORE] ensure score log failed")
