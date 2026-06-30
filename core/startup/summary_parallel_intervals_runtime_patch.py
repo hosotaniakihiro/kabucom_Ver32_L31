@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/summary_parallel_intervals_runtime_patch.py
-# Version: Ver11-MAIN-TICK-TIMEOUT-CAP
+# Version: Ver12-MAIN-WAIT-PUSH-1M-ONLY
 # ------------------------------------------------------------
 # 1分・3分・5分サマリーを並列実行する runtime patch。
 #
@@ -11,6 +11,10 @@
 # Ver11 Fix:
 #   ✔ main.py / entry-only process では 90秒 timeout を引き継がず、
 #     25秒で親tickを返す。summary_parent_tick 80秒化を防ぐ。
+# Ver12 Fix:
+#   ✔ main.py / entry-only process では PUSH同期待ち対象を既定で1分足だけにする。
+#   ✔ 3分/5分は raw fallback / cache / DB fallback から読む前提にして、
+#     5分足待ちによる親tick timeoutを防ぐ。
 # ============================================================
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+_VERSION_TAG = "v12"
 _INSTALLED = False
 _ORIG_TIME_LOCKED = None
 _RUNNING_LOCK = threading.RLock()
@@ -224,6 +229,11 @@ def _push_bg_long_intervals_enabled() -> bool:
     return _env_bool("SUMMARY_PUSH_BG_LONG_INTERVALS", False)
 
 
+def _main_wait_push_1m_only_enabled() -> bool:
+    # main.py は発注判断優先。5分足は使うが、同期完了は待たない。
+    return _is_main_entry_only_process() and _env_bool("SUMMARY_MAIN_WAIT_PUSH_1M_ONLY", True)
+
+
 def _resolve_targets(now: dt.datetime, in_session: bool) -> tuple[list[int], list[int]]:
     base = _base_time_locked_targets(now, in_session)
     force_all = _force_all_targets_enabled()
@@ -240,6 +250,25 @@ def _resolve_targets(now: dt.datetime, in_session: bool) -> tuple[list[int], lis
 
 def _split_push_wait_and_bg(push_targets: list[int], *, in_session: bool) -> tuple[list[int], list[int]]:
     targets = sorted({int(x) for x in push_targets if int(x) in {1, 3, 5}})
+
+    # Ver12: main.py / entry-only では 5分足を同期で待たない。
+    # 3分/5分は summary_mtf_push_raw_fallback / cache / DB fallback 側で読む。
+    # 明示的にBGを有効化していない限り、長足計算ジョブ自体もmain.pyからは投げない。
+    if _main_wait_push_1m_only_enabled():
+        wait = [1]
+        long_targets = [x for x in targets if int(x) in (3, 5)]
+        if _env_bool("SUMMARY_MAIN_BG_LONG_PUSH_ENABLED", False):
+            if (not bool(in_session)) and _env_bool("SUMMARY_PUSH_SKIP_BG_WHEN_OUT_OF_SESSION", True):
+                return wait, []
+            return wait, long_targets
+        if long_targets:
+            logger.warning(
+                "[SUMMARY PARALLEL] main wait limited to 1m; long push targets not waited targets=%s wait=%s skipped_long=%s reason=main_entry_latency",
+                targets,
+                wait,
+                long_targets,
+            )
+        return wait, []
 
     if _is_main_entry_only_process() and _env_bool("SUMMARY_MAIN_BG_PUSH_ENABLED", False):
         if (not bool(in_session)) and _env_bool("SUMMARY_PUSH_SKIP_BG_WHEN_OUT_OF_SESSION", True):
@@ -321,11 +350,11 @@ def _patched_run_time_locked_summary_jobs(*, now: Optional[dt.datetime] = None, 
     timeout = _env_float("SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC", 30.0)
     try:
         logger.warning(
-            "[SUMMARY PARALLEL] tick start now=%s push_targets=%s wait_push_targets=%s bg_push_targets=%s ranking_targets=%s run_push=%s run_ranking=%s display=%s run_entry=%s in_session=%s workers=%s bg_workers=%s timeout=%.1f force_1_3_5=%s push_all_intervals=%s push_bg_all=%s push_bg_long=%s main_entry_only=%s",
+            "[SUMMARY PARALLEL] tick start now=%s push_targets=%s wait_push_targets=%s bg_push_targets=%s ranking_targets=%s run_push=%s run_ranking=%s display=%s run_entry=%s in_session=%s workers=%s bg_workers=%s timeout=%.1f force_1_3_5=%s push_all_intervals=%s push_bg_all=%s push_bg_long=%s main_entry_only=%s main_wait_1m_only=%s",
             n, push_targets, wait_push_targets, bg_push_targets, ranking_targets, run_push, run_ranking, display, run_entry,
             in_session, _env_int("SUMMARY_PARALLEL_INTERVAL_WORKERS", 1), _env_int("SUMMARY_PUSH_BG_INTERVAL_WORKERS", 1), timeout,
             _force_all_targets_enabled(), _push_all_intervals_enabled(), _push_bg_all_intervals_enabled(),
-            _push_bg_long_intervals_enabled(), _is_main_entry_only_process(),
+            _push_bg_long_intervals_enabled(), _is_main_entry_only_process(), _main_wait_push_1m_only_enabled(),
         )
         ex = _executor()
 
@@ -376,6 +405,8 @@ def install() -> bool:
     _setdefault_env("SUMMARY_PUSH_BG_ALL_INTERVALS", "0")
     _setdefault_env("SUMMARY_PUSH_BG_LONG_INTERVALS", "0")
     _setdefault_env("SUMMARY_PUSH_DISPLAY_ALL_INTERVALS", "0")
+    _setdefault_env("SUMMARY_MAIN_WAIT_PUSH_1M_ONLY", "1")
+    _setdefault_env("SUMMARY_MAIN_BG_LONG_PUSH_ENABLED", "0")
     _setdefault_env("SUMMARY_PARALLEL_TIMEOUT_MIN_SEC", "30")
     _setdefault_env("SUMMARY_PARALLEL_INTERVAL_WORKERS", "1")
     _setdefault_env("SUMMARY_PUSH_BG_INTERVAL_WORKERS", "1")
@@ -391,17 +422,17 @@ def install() -> bool:
         import scheduler_jobs.summary.runners as runners
         import scheduler_jobs.summary.scheduler as scheduler
         cur = getattr(tlr, "run_time_locked_summary_jobs", None)
-        if getattr(cur, "_summary_parallel_intervals_v11", False):
+        if getattr(cur, "_summary_parallel_intervals_v12", False):
             _INSTALLED = True
             return True
         _ORIG_TIME_LOCKED = cur
-        _patched_run_time_locked_summary_jobs._summary_parallel_intervals_v11 = True  # type: ignore[attr-defined]
+        _patched_run_time_locked_summary_jobs._summary_parallel_intervals_v12 = True  # type: ignore[attr-defined]
         tlr.run_time_locked_summary_jobs = _patched_run_time_locked_summary_jobs
         runners.run_time_locked_summary_jobs = _patched_run_time_locked_summary_jobs
         scheduler.run_time_locked_summary_jobs = _patched_run_time_locked_summary_jobs
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY PARALLEL] installed v11 enabled=%s workers=%s bg_workers=%s timeout=%.1f ranking_parallel=%s force_1_3_5=%s push_all_intervals=%s push_bg_all=%s push_bg_long=%s main_entry_only=%s min_timeout=%s cap_enabled=%s",
+            "[SUMMARY PARALLEL] installed v12 enabled=%s workers=%s bg_workers=%s timeout=%.1f ranking_parallel=%s force_1_3_5=%s push_all_intervals=%s push_bg_all=%s push_bg_long=%s main_entry_only=%s main_wait_1m_only=%s min_timeout=%s cap_enabled=%s",
             _env_bool("SUMMARY_PARALLEL_INTERVALS_ENABLED", True),
             _env_int("SUMMARY_PARALLEL_INTERVAL_WORKERS", 1),
             _env_int("SUMMARY_PUSH_BG_INTERVAL_WORKERS", 1),
@@ -412,6 +443,7 @@ def install() -> bool:
             _push_bg_all_intervals_enabled(),
             _push_bg_long_intervals_enabled(),
             _is_main_entry_only_process(),
+            _main_wait_push_1m_only_enabled(),
             os.getenv("SUMMARY_PARALLEL_TIMEOUT_MIN_SEC"),
             _main_tick_timeout_cap_enabled(),
         )
