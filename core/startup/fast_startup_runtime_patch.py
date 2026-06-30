@@ -9,7 +9,7 @@ from typing import Callable
 logger = logging.getLogger(__name__)
 _PATCHED = False
 _BG_STARTED = False
-VERSION = "v19-summary-parallel-timeout-relief"
+VERSION = "v20-main-1m-summary-light-tick"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -140,6 +140,10 @@ def install() -> bool:
     _run_install("summary_parallel_intervals_runtime_patch", "core.startup.summary_parallel_intervals_runtime_patch")
     # Re-apply once more because summary_parallel_intervals_runtime_patch may set/cap attrs during install.
     _run_install("summary_parallel_timeout_relief_patch:post", "core.startup.summary_parallel_timeout_relief_patch")
+
+    # Patch runner_core after summary_parallel imported it. This keeps parent tick fast:
+    # 1m df build returns quickly, while SUMMARY AI entry continues asynchronously.
+    _run_install("summary_main_1m_light_tick_patch", "core.startup.summary_main_1m_light_tick_patch")
 
     # summary_parallel_intervals_runtime_patch intentionally forces PUSH BG in main-entry-only mode.
     # On this environment, any main.py-side PUSH summary DB/cache path can terminate Windows with
