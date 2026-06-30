@@ -1,21 +1,20 @@
 # ============================================================
 # File   : core/startup/summary_stale_guard_patch.py
-# Version: REV5-SUMMARY-STALE-GUARD-GLOBAL-LAG-FALLBACK
+# Version: REV6-SUMMARY-STALE-GUARD-DROP-FUTURE-FIRST
 # ------------------------------------------------------------
 # 【概要】
 #   PUSH / ranking summary が古いまま merged summary に残り、
 #   古い価格・古い slope・古い RSI/MACD でエントリー候補になる問題を防ぐ。
 #
-# REV4:
-#   - summary runner が遅延した時に relative stale guard で候補が極端に減り、
-#     404件 -> 12件のようになる問題を防ぐ。
-#   - stale判定後の行数が少なすぎる場合、最新行から最低件数だけ残す。
-#   - 既定: PUSH 1m/3m/5m は最低50件、rankingは最低50件。
+# REV6:
+#   - 2026-06-30 11:00ログで now=11:00 に対し latest_dt=15:35 の未来行が
+#     min_keep fallback により50件残っていた。
+#   - 未来時刻行は stale/min_keep/global-lag 判定より前に必ず除外する。
+#   - 全行が未来なら空DFを返す。未来データでの表示・AI・発注を防止する。
 #
 # REV5:
 #   - summary全体の最新時刻が壁時計より遅れている場合、max_ageで大量DROPせず、
 #     「銘柄ごとの最新1行」を残す global-lag fallback を追加。
-#   - 222件 -> 50件/73件のような stale drop 多発を抑える。
 #   - fallback行には summary_stale=True / summary_stale_age_sec を付与して、
 #     古いデータであることを後段が判別できるようにする。
 # ============================================================
@@ -33,6 +32,7 @@ logger = logging.getLogger(__name__)
 _PATCHED = False
 _ORIGINAL_SANITIZE_SUMMARY_DF = None
 _ORIGINAL_GET_MERGED_SUMMARY = None
+VERSION = "REV6-SUMMARY-STALE-GUARD-DROP-FUTURE-FIRST"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -96,28 +96,12 @@ def _max_age_sec(source: Any, tf: Any) -> Optional[int]:
         return None
 
     if source.startswith("push"):
-        defaults = {
-            1: 180,
-            3: 600,
-            5: 900,
-            10: 1200,
-            15: 1500,
-            30: 2400,
-            60: 4800,
-        }
+        defaults = {1: 180, 3: 600, 5: 900, 10: 1200, 15: 1500, 30: 2400, 60: 4800}
         default = int(defaults.get(tf, 600))
         return _env_int(f"PUSH_SUMMARY_{tf}MIN_MAX_AGE_SEC", default)
 
     if source == "ranking":
-        defaults = {
-            1: 240,
-            3: 720,
-            5: 1020,
-            10: 1500,
-            15: 1800,
-            30: 3600,
-            60: 7200,
-        }
+        defaults = {1: 240, 3: 720, 5: 1020, 10: 1500, 15: 1800, 30: 3600, 60: 7200}
         default = int(defaults.get(tf, 900))
         return _env_int(f"RANKING_SUMMARY_{tf}MIN_MAX_AGE_SEC", default)
 
@@ -172,6 +156,17 @@ def _min_keep_rows(source: Any, tf: Any) -> int:
     return _env_int(f"SUMMARY_{tf_int}MIN_KEEP_ROWS", 0)
 
 
+def _future_allow_sec(source: Any, tf: Any) -> int:
+    try:
+        tf_n = _normalize_tf(tf)
+        tf_int = int(tf_n) if tf_n != "daily" else 1
+    except Exception:
+        tf_int = 1
+    default = max(10, min(60, tf_int * 12))
+    src = _normalize_source(source).upper()
+    return _env_int(f"{src}_SUMMARY_{tf_int}MIN_FUTURE_ALLOW_SEC", _env_int("SUMMARY_FUTURE_ALLOW_SEC", default))
+
+
 def _best_time_col(df: pd.DataFrame) -> Optional[str]:
     try:
         for col in ("datetime", "end_time", "start_time", "time"):
@@ -191,7 +186,6 @@ def _latest_fallback_rows(out: pd.DataFrame, *, time_col: str, min_keep: int) ->
             return out.iloc[0:0].copy()
         work = work.sort_values(time_col, ascending=False)
         if "symbol" in work.columns:
-            # 同一銘柄の重複を避け、なるべく候補銘柄数を残す。
             work = work.drop_duplicates(subset=["symbol"], keep="first")
         return work.head(int(min_keep)).copy().reset_index(drop=True)
     except Exception:
@@ -200,7 +194,6 @@ def _latest_fallback_rows(out: pd.DataFrame, *, time_col: str, min_keep: int) ->
 
 
 def _latest_per_symbol_rows(out: pd.DataFrame, *, time_col: str, max_rows: int) -> pd.DataFrame:
-    """全体が遅延している時に、銘柄ごとの最新行をなるべく残す。"""
     try:
         if out is None or out.empty or time_col not in out.columns:
             return pd.DataFrame() if out is None else out.iloc[0:0].copy()
@@ -233,12 +226,7 @@ def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sani
         if not time_col:
             logger.warning(
                 "[SUMMARY STALE DROP] source=%s tf=%s label=%s before=%s after=0 reason=time_col_missing max_age_sec=%s relative_lag_sec=%s",
-                source,
-                tf,
-                label,
-                len(df),
-                max_age,
-                relative_lag,
+                source, tf, label, len(df), max_age, relative_lag,
             )
             return df.iloc[0:0].copy()
 
@@ -250,6 +238,28 @@ def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sani
             pass
 
         now = pd.Timestamp.now()
+        before_original = int(len(out))
+
+        # REV6: future rows are invalid for live trading and must never be kept by min_keep/global-lag fallback.
+        allow_sec = _future_allow_sec(source, tf)
+        future_cutoff = now + pd.Timedelta(seconds=float(allow_sec))
+        dt_series0 = out[time_col]
+        future_mask = dt_series0.notna() & dt_series0.gt(future_cutoff)
+        future_count = int(future_mask.sum()) if len(out) else 0
+        if future_count > 0:
+            future_latest = None
+            try:
+                future_latest = dt_series0.loc[future_mask].max()
+            except Exception:
+                future_latest = None
+            out = out.loc[~future_mask].copy().reset_index(drop=True)
+            logger.warning(
+                "[SUMMARY FUTURE DROP] source=%s tf=%s label=%s before=%s future_removed=%s after=%s now=%s allow_sec=%s future_latest=%s version=%s",
+                source, tf, label, before_original, future_count, len(out), now, allow_sec, future_latest, VERSION,
+            )
+            if out.empty:
+                return out
+
         dt_series = out[time_col]
         age_sec = (now - dt_series).dt.total_seconds()
 
@@ -266,9 +276,6 @@ def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sani
             latest_dt = None
             latest_age_sec = None
 
-        # REV5: summary runner 側が遅延して最新時刻そのものが古い場合、
-        # max_ageで大半を捨てると候補母集団が50件程度まで激減する。
-        # この場合は stale であることを明示しながら、銘柄ごとの最新行を残す。
         global_lag_enabled = _env_bool("SUMMARY_STALE_KEEP_LATEST_PER_SYMBOL_ON_GLOBAL_LAG", True)
         global_lag_grace = _env_int("SUMMARY_STALE_GLOBAL_LAG_GRACE_SEC", 30)
         if (
@@ -288,16 +295,7 @@ def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sani
                 pass
             logger.warning(
                 "[SUMMARY STALE DROP] global lag fallback source=%s tf=%s label=%s before=%s after=%s max_age_sec=%s latest_age_sec=%.1f latest_dt=%s now=%s max_keep=%s",
-                source,
-                tf,
-                label,
-                before,
-                len(fallback),
-                max_age,
-                latest_age_sec,
-                latest_dt,
-                now,
-                max_rows,
+                source, tf, label, before, len(fallback), max_age, latest_age_sec, latest_dt, now, max_rows,
             )
             return fallback
 
@@ -315,7 +313,6 @@ def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sani
                 latest_dt = None
 
         valid_mask = valid_mask & (absolute_mask | relative_mask)
-
         out2 = out.loc[valid_mask].copy().reset_index(drop=True)
         after = int(len(out2))
 
@@ -324,20 +321,12 @@ def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sani
             if len(fallback) > after:
                 logger.warning(
                     "[SUMMARY STALE DROP] min_keep fallback source=%s tf=%s label=%s before=%s stale_after=%s fallback_after=%s min_keep=%s latest_dt=%s now=%s",
-                    source,
-                    tf,
-                    label,
-                    before,
-                    after,
-                    len(fallback),
-                    min_keep,
-                    latest_dt,
-                    now,
+                    source, tf, label, before, after, len(fallback), min_keep, latest_dt, now,
                 )
                 out2 = fallback
                 after = int(len(out2))
 
-        if after != before:
+        if after != before or future_count > 0:
             oldest_kept = None
             newest_kept = None
             try:
@@ -347,19 +336,8 @@ def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sani
                 pass
 
             logger.warning(
-                "[SUMMARY STALE DROP] source=%s tf=%s label=%s before=%s after=%s max_age_sec=%s relative_lag_sec=%s min_keep=%s latest_dt=%s oldest_kept=%s newest_kept=%s now=%s",
-                source,
-                tf,
-                label,
-                before,
-                after,
-                max_age,
-                relative_lag,
-                min_keep,
-                latest_dt,
-                oldest_kept,
-                newest_kept,
-                now,
+                "[SUMMARY STALE DROP] source=%s tf=%s label=%s before=%s after=%s max_age_sec=%s relative_lag_sec=%s min_keep=%s latest_dt=%s oldest_kept=%s newest_kept=%s now=%s future_removed=%s",
+                source, tf, label, before_original, after, max_age, relative_lag, min_keep, latest_dt, oldest_kept, newest_kept, now, future_count,
             )
 
         return out2
@@ -374,7 +352,6 @@ def _install_active_empty_universe_patch() -> None:
             logger.warning("[SUMMARY STALE GUARD PATCH] active empty-universe patch disabled by env")
             return
         from core.startup.active_symbols_empty_universe_supplement_patch import install as install_active_patch
-
         ok = bool(install_active_patch())
         logger.warning("[SUMMARY STALE GUARD PATCH] active empty-universe patch ok=%s", ok)
     except Exception:
@@ -398,12 +375,7 @@ def install() -> bool:
             return False
         _ORIGINAL_SANITIZE_SUMMARY_DF = original_sanitize
 
-        def _sanitize_summary_df_with_stale_guard(
-            df: Any,
-            tf: Any,
-            source: str,
-            symbol_name_map=None,
-        ) -> pd.DataFrame:
+        def _sanitize_summary_df_with_stale_guard(df: Any, tf: Any, source: str, symbol_name_map=None) -> pd.DataFrame:
             out = original_sanitize(df, tf=tf, source=source, symbol_name_map=symbol_name_map)
             return drop_stale_summary_rows(out, source=source, tf=tf, label="merged_sanitize")
 
@@ -423,7 +395,7 @@ def install() -> bool:
 
         _PATCHED = True
         _install_active_empty_universe_patch()
-        logger.info("[SUMMARY STALE GUARD PATCH] installed rev=5 sanitize=True merged_get=%s active_empty_universe=True", bool(original_get_merged))
+        logger.info("[SUMMARY STALE GUARD PATCH] installed version=%s sanitize=True merged_get=%s active_empty_universe=True", VERSION, bool(original_get_merged))
         return True
 
     except Exception:
@@ -432,4 +404,4 @@ def install() -> bool:
         return False
 
 
-__all__ = ["install", "drop_stale_summary_rows"]
+__all__ = ["install", "drop_stale_summary_rows", "VERSION"]
