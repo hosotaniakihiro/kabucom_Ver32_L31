@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/summary_ai/candidates.py
-# Version: PRODUCTION-STABLE-REV2.2-SCORE-CONFIG-FLAGS
+# Version: PRODUCTION-STABLE-REV2.3-FRESH-LATEST-FIRST
 # ------------------------------------------------------------
 # Purpose:
 #   - SUMMARY / RANKING SUMMARY の DataFrame からAI gate候補を作る
@@ -8,6 +8,8 @@
 #   - 各行に ai_side / side = BUY or SELL を付与し、AI gate側で行ごとに判定する
 #   - score_config.ini の [buy_entry] / [buy_bonus] / [sell_entry] / [sell_bonus]
 #     をAI候補作成前に score_buy / score_sell へ反映する
+#   - Ver2.3: 古い高スコア行を採用しないよう、候補作成前に鮮度フィルタを入れる
+#   - Ver2.3: 同一銘柄dedupeは _ai_quality より datetime 最新を優先する
 # ============================================================
 
 from __future__ import annotations
@@ -58,9 +60,9 @@ def _env_bool(name: str, default: bool = False) -> bool:
         if v is None:
             return bool(default)
         s = str(v).strip().lower()
-        if s in {"1", "true", "yes", "on", "y"}:
+        if s in {"1", "true", "yes", "on", "y", "ok", "enable", "enabled"}:
             return True
-        if s in {"0", "false", "no", "off", "n", ""}:
+        if s in {"0", "false", "no", "off", "n", "ng", "disable", "disabled", ""}:
             return False
         return bool(default)
     except Exception:
@@ -104,6 +106,23 @@ def _entry_max_sell_slope() -> float:
         if v is not None and str(v).strip() != "":
             return _env_float(name, DEFAULT_MAX_SELL_SLOPE)
     return float(DEFAULT_MAX_SELL_SLOPE)
+
+
+def _summary_ai_max_candidate_age_sec(default: float = 900.0) -> float:
+    """
+    pending側の stale guard と候補作成側の鮮度を合わせる。
+    0以下なら鮮度フィルタ無効。
+    """
+    for name in (
+        "SUMMARY_AI_MAX_CANDIDATE_AGE_SEC",
+        "SUMMARY_ENTRY_PENDING_MAX_AGE_SEC",
+        "SUMMARY_AI_PENDING_MAX_AGE_SEC",
+        "ENTRY_CANDIDATE_MAX_AGE_SEC",
+    ):
+        v = os.getenv(name)
+        if v is not None and str(v).strip() != "":
+            return _env_float(name, default)
+    return float(default)
 
 
 def _safe_symbols(df: pd.DataFrame, n: int = 30) -> list[str]:
@@ -432,16 +451,81 @@ def dedupe_one_row_per_symbol(df: pd.DataFrame) -> pd.DataFrame:
             if col in out.columns:
                 quality += pd.to_numeric(out[col], errors="coerce").notna().astype(int) * weight
         out["_ai_quality"] = quality
-        sort_cols = ["symbol", "_ai_quality"]
-        ascending = [True, False]
+
+        # 旧実装は _ai_quality を datetime より優先していたため、
+        # 古い高スコア行が stale pending skipped になる事故が起きていた。
+        # エントリー候補は必ず最新足を優先し、同時刻内だけ quality で選ぶ。
         if "datetime" in out.columns:
-            sort_cols.append("datetime")
-            ascending.append(False)
-        out = out.sort_values(sort_cols, ascending=ascending, na_position="last", kind="mergesort")
+            out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+            try:
+                out["datetime"] = out["datetime"].dt.tz_localize(None)
+            except Exception:
+                pass
+            out = out.sort_values(
+                ["symbol", "datetime", "_ai_quality"],
+                ascending=[True, False, False],
+                na_position="last",
+                kind="mergesort",
+            )
+        else:
+            out = out.sort_values(
+                ["symbol", "_ai_quality"],
+                ascending=[True, False],
+                na_position="last",
+                kind="mergesort",
+            )
+
         out = out.drop_duplicates(subset=["symbol"], keep="first")
         return out.drop(columns=["_ai_quality"], errors="ignore").reset_index(drop=True)
     except Exception:
         logger.exception("[SUMMARY AI CANDIDATES] dedupe failed")
+        return out.reset_index(drop=True)
+
+
+def _filter_fresh_candidate_rows(df: pd.DataFrame) -> pd.DataFrame:
+    out = safe_df(df)
+    if out.empty:
+        return out
+    if not _env_bool("SUMMARY_AI_CANDIDATE_FRESHNESS_FILTER_ENABLED", True):
+        return out
+    if "datetime" not in out.columns:
+        logger.warning("[SUMMARY AI CANDIDATES] freshness filter skipped reason=no_datetime rows=%s", len(out))
+        return out
+
+    max_age = _summary_ai_max_candidate_age_sec(900.0)
+    if max_age <= 0:
+        logger.warning("[SUMMARY AI CANDIDATES] freshness filter disabled max_age=%.1fs", max_age)
+        return out
+
+    try:
+        dt_s = pd.to_datetime(out["datetime"], errors="coerce")
+        try:
+            dt_s = dt_s.dt.tz_localize(None)
+        except Exception:
+            pass
+
+        now = pd.Timestamp.now()
+        age_sec = (now - dt_s).dt.total_seconds()
+        before = len(out)
+        latest = dt_s.max()
+        oldest = dt_s.min()
+
+        keep = dt_s.notna() & (age_sec >= -60.0) & (age_sec <= float(max_age))
+        out = out[keep].copy()
+        out["datetime"] = dt_s[keep]
+
+        logger.warning(
+            "[SUMMARY AI CANDIDATES] freshness filter rows=%s->%s max_age=%.1fs latest=%s oldest=%s now=%s",
+            before,
+            len(out),
+            float(max_age),
+            latest,
+            oldest,
+            now,
+        )
+        return out.reset_index(drop=True)
+    except Exception:
+        logger.exception("[SUMMARY AI CANDIDATES] freshness filter failed; continue fail-open")
         return out.reset_index(drop=True)
 
 
@@ -451,6 +535,10 @@ def _prepare_base(summary_df: pd.DataFrame, *, require_buy_target: bool, exclude
         return df
     df = filter_common_stock_rows(df, require_buy_target=require_buy_target, exclude_etf_fund=exclude_etf_fund)
     if df.empty:
+        return df
+    df = _filter_fresh_candidate_rows(df)
+    if df.empty:
+        logger.warning("[SUMMARY AI CANDIDATES] no fresh rows after freshness filter")
         return df
     return dedupe_one_row_per_symbol(df)
 
@@ -479,7 +567,7 @@ def _buy_candidates_from_prepared(df: pd.DataFrame, *, interval: int | str, top_
     out = df[base_mask].copy()
     if out.empty:
         try:
-            top_buy = df.sort_values("ai_disp_buy_score", ascending=False).head(10)[[c for c in ("symbol", "ai_disp_buy_score", "config_buy_score", "ai_disp_sell_score", "ai_disp_close", "ai_disp_volume", "ai_disp_slope") if c in df.columns]].to_dict(orient="records")
+            top_buy = df.sort_values("ai_disp_buy_score", ascending=False).head(10)[[c for c in ("symbol", "datetime", "ai_disp_buy_score", "config_buy_score", "ai_disp_sell_score", "ai_disp_close", "ai_disp_volume", "ai_disp_slope") if c in df.columns]].to_dict(orient="records")
         except Exception:
             top_buy = []
         logger.warning(
@@ -503,7 +591,12 @@ def _buy_candidates_from_prepared(df: pd.DataFrame, *, interval: int | str, top_
         + pd.to_numeric(out["ai_disp_slope"], errors="coerce").fillna(0.0)
         - pd.to_numeric(out["ai_disp_sell_score"], errors="coerce").fillna(0.0) * 5.0
     )
-    out = out.sort_values(["_ai_sort_score", "ai_disp_buy_score", "ai_disp_total_score"], ascending=[False, False, False], na_position="last", kind="mergesort").head(top_n)
+    sort_cols = ["_ai_sort_score", "ai_disp_buy_score", "ai_disp_total_score"]
+    ascending = [False, False, False]
+    if "datetime" in out.columns:
+        sort_cols = ["datetime"] + sort_cols
+        ascending = [False] + ascending
+    out = out.sort_values(sort_cols, ascending=ascending, na_position="last", kind="mergesort").head(top_n)
     out = out.drop(columns=["_ai_sort_score"], errors="ignore").reset_index(drop=True)
     out["ai_side"] = "BUY"
     out["side"] = "BUY"
@@ -546,7 +639,12 @@ def _sell_candidates_from_prepared(df: pd.DataFrame, *, interval: int | str, top
         - pd.to_numeric(out["ai_disp_slope"], errors="coerce").fillna(0.0) * 3.0
         - pd.to_numeric(out["ai_disp_total_score"], errors="coerce").fillna(0.0)
     )
-    out = out.sort_values(["_ai_sort_score", "ai_disp_sell_score"], ascending=[False, False], na_position="last", kind="mergesort").head(top_n)
+    sort_cols = ["_ai_sort_score", "ai_disp_sell_score"]
+    ascending = [False, False]
+    if "datetime" in out.columns:
+        sort_cols = ["datetime"] + sort_cols
+        ascending = [False] + ascending
+    out = out.sort_values(sort_cols, ascending=ascending, na_position="last", kind="mergesort").head(top_n)
     out = out.drop(columns=["_ai_sort_score"], errors="ignore").reset_index(drop=True)
     out["ai_side"] = "SELL"
     out["side"] = "SELL"
