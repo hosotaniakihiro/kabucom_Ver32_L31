@@ -2,6 +2,8 @@
 """
 Compatibility installer for centralized runtime environment defaults.
 
+REV25:
+  - set default RANKING_API_CALL_SLEEP_SEC=0.5 for ranking collector contexts.
 REV24:
   - force install SUMMARY AI safety guard from this always-loaded module.
 REV23:
@@ -24,7 +26,7 @@ from .runtime_settings_ini_loader import load_settings_ini
 from . import runtime_env_defaults as _defaults
 
 logger = logging.getLogger(__name__)
-VERSION = "REV24-RUNTIME-ENV-DEFAULTS-FORCE-SUMMARY-AI-SAFETY"
+VERSION = "REV25-RUNTIME-ENV-DEFAULTS-RANKING-API-0P5S"
 DEFAULTS_VERSION = getattr(_defaults, "VERSION", "unknown")
 env_bool = getattr(_defaults, "env_bool")
 _INSTALLED = False
@@ -112,6 +114,23 @@ def _safe_install(label: str, context: str, allowed: set[str], env_disable: str,
     except Exception:
         logger.exception("[RUNTIME ENV DEFAULTS PATCH] %s install failed", label)
         return False
+
+
+def _apply_ranking_api_spacing_default(context: str) -> Dict[str, str]:
+    """Default ranking API interval to 0.5s unless settings.ini/env overrides it."""
+    applied: Dict[str, str] = {}
+    try:
+        if context in {"main_database", "ranking_collector"}:
+            if os.getenv("RANKING_API_CALL_SLEEP_SEC") is None or str(os.getenv("RANKING_API_CALL_SLEEP_SEC")).strip() == "":
+                os.environ["RANKING_API_CALL_SLEEP_SEC"] = "0.5"
+                applied["RANKING_API_CALL_SLEEP_SEC"] = "0.5"
+            # 明示sleepを使うため、1分分散モードは実質無視されるが、ログ上も分かりやすくOFFにする。
+            if os.getenv("RANKING_API_SPREAD_OVER_MINUTE") is None or str(os.getenv("RANKING_API_SPREAD_OVER_MINUTE")).strip() == "":
+                os.environ["RANKING_API_SPREAD_OVER_MINUTE"] = "0"
+                applied["RANKING_API_SPREAD_OVER_MINUTE"] = "0"
+    except Exception:
+        logger.exception("[RUNTIME ENV DEFAULTS PATCH] ranking api spacing default failed context=%s", context)
+    return applied
 
 
 def _force_install_summary_ai_safety_guard(context: str) -> bool:
@@ -249,6 +268,8 @@ def install() -> bool:
         applied: Dict[str, str] = {}
         applied.update(apply_site_defaults(context=context))
         applied.update(apply_user_defaults(context=context))
+        ranking_spacing_applied = _apply_ranking_api_spacing_default(context)
+        applied.update(ranking_spacing_applied)
 
         intraday_load_guard_ok = _install_intraday_load_guard(context)
         yahoo_parallel_empty_ok = _install_yahoo_parallel_empty_cooldown(context)
@@ -271,7 +292,7 @@ def install() -> bool:
         daytrade_credit_ok = _install_daytrade_credit_force_close(context)
         _INSTALLED = True
         logger.warning(
-            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s intraday_load_guard=%s yahoo_parallel_empty=%s ranking_legacy_inline=%s summary_lock_pressure=%s summary_db_realtime=%s database_owner=%s full_pipeline=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s summary_ai_safety=%s summary_pending_stale=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s tonosama_exit_infer=%s tonosama_pending_audit=%s daytrade_credit=%s verbose=%s",
+            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s ranking_api_sleep=%s ranking_spacing_applied=%s intraday_load_guard=%s yahoo_parallel_empty=%s ranking_legacy_inline=%s summary_lock_pressure=%s summary_db_realtime=%s database_owner=%s full_pipeline=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s summary_ai_safety=%s summary_pending_stale=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s tonosama_exit_infer=%s tonosama_pending_audit=%s daytrade_credit=%s verbose=%s",
             VERSION,
             DEFAULTS_VERSION,
             REGISTRY_VERSION,
@@ -281,6 +302,8 @@ def install() -> bool:
             context,
             ",".join(SITE_GROUP_ORDER),
             ",".join(USER_GROUP_ORDER),
+            os.environ.get("RANKING_API_CALL_SLEEP_SEC"),
+            ranking_spacing_applied,
             intraday_load_guard_ok,
             yahoo_parallel_empty_ok,
             ranking_legacy_inline_ok,
