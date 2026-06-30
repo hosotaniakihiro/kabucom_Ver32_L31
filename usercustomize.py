@@ -100,8 +100,21 @@ def _install_summary_pending_age_relax() -> bool:
         return False
 
 
+def _install_summary_mtf_duplicate_datetime_guard() -> bool:
+    try:
+        from core.startup.summary_mtf_duplicate_datetime_guard_patch import install as _install_guard
+
+        ok = bool(_install_guard())
+        logger.warning("[USERCUSTOMIZE] summary MTF duplicate datetime guard ok=%s", ok)
+        return ok
+    except Exception:
+        logger.exception("[USERCUSTOMIZE] summary MTF duplicate datetime guard failed")
+        return False
+
+
 _install_runtime_defaults()
 _install_summary_pending_age_relax()
+_install_summary_mtf_duplicate_datetime_guard()
 
 if _is_main_py():
     for k, v in {
