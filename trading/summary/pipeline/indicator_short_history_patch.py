@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/summary/pipeline/indicator_short_history_patch.py
-# Version: PRODUCTION-STABLE-INDICATOR-SHORT-HISTORY-PATCH-V3-NEUTRAL-SCORE-SUPPRESS
+# Version: PRODUCTION-STABLE-INDICATOR-SHORT-HISTORY-PATCH-V4-NAN-HIST-GUARD
 # ------------------------------------------------------------
 # Purpose:
 #   indicator_pipeline の短履歴問題を補正する。
@@ -21,6 +21,10 @@
 #   - hist_len < 3 かつ rsi=50/macd=0/signal=0/slope=0 の中立行で、
 #     score=-1 / score_sell=1 のようなデフォルト売りスコアを0に抑制する。
 #   - 本当に下向きの行、MACD/RSI/傾きが出ている行は抑制しない。
+#
+# V4:
+#   - symbol_hist_len 列が無い/全NaNの短履歴DFで int(NaN) にならないよう
+#     _profile() を防御化する。
 # ============================================================
 
 from __future__ import annotations
@@ -63,11 +67,28 @@ def _nonzero(df: pd.DataFrame, col: str) -> int:
         return 0
 
 
+def _hist_max(df: pd.DataFrame) -> int:
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return 0
+        if "symbol_hist_len" not in df.columns:
+            return 0
+        s = pd.to_numeric(df["symbol_hist_len"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        if s.dropna().empty:
+            return 0
+        v = s.fillna(0).max()
+        if pd.isna(v) or not np.isfinite(float(v)):
+            return 0
+        return int(float(v))
+    except Exception:
+        return 0
+
+
 def _profile(df: pd.DataFrame) -> dict[str, int]:
     return {
         "rows": int(len(df)) if isinstance(df, pd.DataFrame) else 0,
         "symbols": int(df["symbol"].astype(str).nunique()) if isinstance(df, pd.DataFrame) and not df.empty and "symbol" in df.columns else 0,
-        "hist_max": int(pd.to_numeric(df.get("symbol_hist_len", pd.Series(dtype=float)), errors="coerce").fillna(0).max()) if isinstance(df, pd.DataFrame) and not df.empty else 0,
+        "hist_max": _hist_max(df),
         "technical_ready": int(pd.Series(df.get("technical_ready", False)).fillna(False).astype(bool).sum()) if isinstance(df, pd.DataFrame) and not df.empty else 0,
         "usable_ready": int(pd.Series(df.get("usable_technical_ready", False)).fillna(False).astype(bool).sum()) if isinstance(df, pd.DataFrame) and not df.empty else 0,
         "slope_nonnull": _nonnull(df, "slope"),
@@ -373,11 +394,12 @@ def install_indicator_short_history_patch() -> bool:
     target.run_indicator_pipeline = run_indicator_pipeline_patched
     target.indicator_pipeline = indicator_pipeline_patched
     target.apply_indicator_pipeline = apply_indicator_pipeline_patched
+    target._short_history_patch_v4_installed = True
     target._short_history_patch_v3_installed = True
     target._short_history_patch_v2_installed = True
     target._short_history_patch_v1_installed = True
     _PATCHED = True
-    logger.warning("[IND SHORT PATCH] installed V3 neutral_score_suppress")
+    logger.warning("[IND SHORT PATCH] installed V4 nan_hist_guard")
     return True
 
 
