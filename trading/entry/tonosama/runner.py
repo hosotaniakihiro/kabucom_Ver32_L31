@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/tonosama/runner.py
-# Version: Ver1.8-TONOSAMA-WICK-REVERSAL-STRICT-GUARD
+# Version: Ver1.9-TONOSAMA-FINAL-SLOPE-STRONG-MOVE-FAILOPEN
 # ------------------------------------------------------------
 # ✔ 5秒足は必須にしない。
 # ✔ REQUIRE_5SEC_BAR=False の場合、5秒足が取れていても 0.0% 横ばいだけでは落とさない。
@@ -11,11 +11,15 @@
 #   - BUY: 上ヒゲ大 + 終値が安値圏なら、上昇率が小さくても除外
 #   - SELL: 下ヒゲ大 + 終値が高値圏なら、下落率が小さくても除外
 #   - 11:09ログの upper_wick=90%超 / close_pos=3〜10% のBUY通過を防止
+# ✔ Ver1.9:
+#   - final段階の slope_abs_too_small で _slope=0.0 の候補が全落ちする問題を補正
+#   - 価格変化・値幅・出来高が十分なら slope filter を fail-open
 # ============================================================
 from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 import time
 from typing import Any
 
@@ -74,6 +78,26 @@ _LAST_FILTER_DIAG: dict[str, Any] = {}
 
 BUY_REJECTED_CLOSE_POSITION_PCT = 35.0
 SELL_REJECTED_CLOSE_POSITION_PCT = 65.0
+
+
+def _env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
 
 
 def _num_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
@@ -175,6 +199,43 @@ def _log_filter_step(*, stage: str, before: pd.DataFrame, after: pd.DataFrame, r
         logger.debug("[TONOSAMA FILTER] step log failed stage=%s reason=%s", stage, reason, exc_info=True)
 
 
+def _strong_move_slope_failopen_mask(x: pd.DataFrame) -> pd.Series:
+    """_slope が0/欠損でも、値動き・値幅・出来高が十分ならfinal slope filterを通す。"""
+    if x is None or x.empty or not _env_bool("TONOSAMA_FINAL_SLOPE_STRONG_MOVE_FAILOPEN", True):
+        return pd.Series(False, index=x.index if x is not None else None, dtype="bool")
+    price_abs = _num_series(x, "_max_price_change_pct", 0.0).abs()
+    body_abs = _num_series(x, "_body_change_pct", 0.0).abs()
+    range_pct = _num_series(x, "_intrabar_range_pct", 0.0).abs()
+    latest_vol = _num_series(x, "_latest_volume", 0.0).combine(_num_series(x, "volume", 0.0), max)
+    surge = _num_series(x, "_max_volume_surge_ratio", 0.0)
+    slope_abs = _num_series(x, "_slope", 0.0).abs()
+
+    min_price_change = _env_float("TONOSAMA_FINAL_SLOPE_FAILOPEN_MIN_PRICE_CHANGE_PCT", 0.5)
+    min_body = _env_float("TONOSAMA_FINAL_SLOPE_FAILOPEN_MIN_BODY_PCT", 0.0)
+    min_range = _env_float("TONOSAMA_FINAL_SLOPE_FAILOPEN_MIN_RANGE_PCT", 1.0)
+    min_volume = _env_float("TONOSAMA_FINAL_SLOPE_FAILOPEN_MIN_VOLUME", 50000.0)
+    min_surge = _env_float("TONOSAMA_FINAL_SLOPE_FAILOPEN_MIN_SURGE", 0.0)
+    max_slope_abs = _env_float("TONOSAMA_FINAL_SLOPE_FAILOPEN_MAX_SLOPE_ABS", max(MIN_SLOPE, 0.001))
+
+    strong_move = (
+        (slope_abs < max_slope_abs)
+        & ((price_abs >= min_price_change) | (body_abs >= min_body if min_body > 0 else price_abs >= min_price_change))
+        & (range_pct >= min_range)
+        & (latest_vol >= min_volume)
+        & (surge >= min_surge)
+    )
+    try:
+        if strong_move.any():
+            logger.warning(
+                "[TONOSAMA FINAL SLOPE FAILOPEN] rescued=%s min_price_change=%.3f min_body=%.3f min_range=%.3f min_volume=%.0f min_surge=%.2f sample=%s",
+                int(strong_move.sum()), min_price_change, min_body, min_range, min_volume, min_surge,
+                _sample_rows(x.loc[strong_move], ["symbol", "symbolname", "close", "_latest_volume", "_max_price_change_pct", "_body_change_pct", "_intrabar_range_pct", "_max_volume_surge_ratio", "_slope", "_tonosama_score"], limit=10),
+            )
+    except Exception:
+        logger.debug("[TONOSAMA FINAL SLOPE FAILOPEN] log failed", exc_info=True)
+    return strong_move.fillna(False).astype(bool)
+
+
 def _diagnose_base_frame(x: pd.DataFrame) -> None:
     try:
         if x is None or x.empty:
@@ -222,18 +283,10 @@ def _apply_climax_guards(x: pd.DataFrame, *, stage: str, sample_cols: list[str])
     upper_wick = _num_series(x, "_upper_wick_pct")
     slope = _num_series(x, "_slope")
 
-    # BUY側: 出来高急増 + 上昇後の高値掴み/上ヒゲ反落を除外。
-    # 重要: 11:09ログでは price_chg=0.07〜0.23% と小さくても、
-    # upper_wick=90%超 / close_pos=3〜10% で明確に高値から叩き落とされていた。
-    # よって上ヒゲ反落は price_chg >= 0.50% を必須にしない。
     buy_like = (price_chg > 0) | (signed_body > 0) | (slope > 0)
     buy_too_late = buy_like & (price_chg >= MAX_BUY_PRICE_CHANGE_PCT)
     buy_high_zone = buy_like & (close_pos >= MAX_BUY_CLOSE_POSITION_PCT) & (price_chg >= BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT)
     buy_upper_wick_reversal = buy_like & (upper_wick >= MAX_BUY_UPPER_WICK_PCT) & (close_pos <= BUY_REJECTED_CLOSE_POSITION_PCT)
-    buying_climax = buy_like & (surge >= BUYING_CLIMAX_MIN_SURGE_RATIO) & (
-        (price_chg >= BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT and False)
-    )
-    # 上の式はSeries演算にしないためFalse固定。実際の過熱判定は下でSeriesとして作る。
     buying_climax = buy_like & (surge >= BUYING_CLIMAX_MIN_SURGE_RATIO) & (
         ((price_chg >= BUYING_CLIMAX_MIN_PRICE_CHANGE_PCT) & (close_pos >= MAX_BUY_CLOSE_POSITION_PCT))
         | ((upper_wick >= MAX_BUY_UPPER_WICK_PCT) & (close_pos <= BUY_REJECTED_CLOSE_POSITION_PCT))
@@ -266,7 +319,6 @@ def _apply_climax_guards(x: pd.DataFrame, *, stage: str, sample_cols: list[str])
     lower_wick = _num_series(x, "_lower_wick_pct")
     slope = _num_series(x, "_slope")
 
-    # SELL側: 出来高急増 + 下落後の安値売り/下ヒゲ反発を除外。
     drop_abs = price_chg.abs()
     sell_like = (price_chg < 0) | (signed_body < 0) | (slope < 0)
     sell_too_late = sell_like & (drop_abs >= MAX_SELL_PRICE_DROP_PCT)
@@ -396,7 +448,6 @@ def _apply_5sec_filter(x: pd.DataFrame, sample_cols: list[str]) -> pd.DataFrame:
         _log_filter_step(stage="5sec", before=before, after=x, reason="five_sec_price_change_abs_strict_ng", threshold={"MIN_5SEC_PRICE_CHANGE_PCT": MIN_5SEC_PRICE_CHANGE_PCT, "MAX_5SEC_DROP_PCT": MAX_5SEC_DROP_PCT, "REQUIRE_5SEC_BAR": REQUIRE_5SEC_BAR}, sample_cols=sample_cols)
         return x
 
-    # 5秒足が任意の場合: 0.0%横ばいでは落とさない。強い逆行だけ除外。
     before = x.copy(); has_bar = _bool_series(x, "has_5sec_bar"); chg_5s = _num_series(x, "price_change_5s_pct")
     x = x[(~has_bar) | (chg_5s > MAX_5SEC_DROP_PCT)]
     _log_filter_step(stage="5sec", before=before, after=x, reason="five_sec_advisory_drop_only_strong_reverse", threshold={"MAX_5SEC_DROP_PCT": MAX_5SEC_DROP_PCT, "REQUIRE_5SEC_BAR": REQUIRE_5SEC_BAR, "MIN_5SEC_PRICE_CHANGE_PCT_IGNORED_WHEN_OPTIONAL": MIN_5SEC_PRICE_CHANGE_PCT}, sample_cols=sample_cols)
@@ -426,8 +477,24 @@ def iter_tonosama_candidate_rows() -> pd.DataFrame:
 
     before = x.copy(); x = x[_num_series(x, "_max_price_change_pct").abs() >= MIN_PRICE_CHANGE_PCT]
     _log_filter_step(stage="final", before=before, after=x, reason="price_change_low_abs", threshold={"MIN_PRICE_CHANGE_PCT": MIN_PRICE_CHANGE_PCT}, sample_cols=sample_cols)
-    before = x.copy(); x = x[_num_series(x, "_slope").abs() >= MIN_SLOPE]
-    _log_filter_step(stage="final", before=before, after=x, reason="slope_abs_too_small", threshold={"MIN_SLOPE": MIN_SLOPE}, sample_cols=sample_cols)
+    before = x.copy()
+    slope_ok = _num_series(x, "_slope").abs() >= MIN_SLOPE
+    slope_failopen = _strong_move_slope_failopen_mask(x)
+    x = x[slope_ok | slope_failopen]
+    _log_filter_step(
+        stage="final",
+        before=before,
+        after=x,
+        reason="slope_abs_too_small",
+        threshold={
+            "MIN_SLOPE": MIN_SLOPE,
+            "failopen": "strong_move",
+            "min_price_change_pct": _env_float("TONOSAMA_FINAL_SLOPE_FAILOPEN_MIN_PRICE_CHANGE_PCT", 0.5),
+            "min_range_pct": _env_float("TONOSAMA_FINAL_SLOPE_FAILOPEN_MIN_RANGE_PCT", 1.0),
+            "min_volume": _env_float("TONOSAMA_FINAL_SLOPE_FAILOPEN_MIN_VOLUME", 50000.0),
+        },
+        sample_cols=sample_cols,
+    )
     x = _apply_climax_guards(x, stage="final", sample_cols=sample_cols)
 
     x = _apply_5sec_filter(x, sample_cols)
