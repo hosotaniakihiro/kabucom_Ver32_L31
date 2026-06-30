@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_mtf_duplicate_datetime_guard_patch.py
-# Version: V1.1-DUPLICATE-DATETIME-MERGE-GUARD-MAIN-WRITER-OPTIONAL
+# Version: V1.2-DUPLICATE-DATETIME-GUARD-REAPPLY-AFTER-TARGET-INSTALL
 # ------------------------------------------------------------
 # Purpose:
 #   1) Prevent pandas merge failure in summary_mtf_diff_from_1m_patch:
@@ -15,6 +15,9 @@
 #   2) In main.py, do not require the PUSH DB writer to be alive for Summary-AI.
 #      main.py is the entry/judgement process; main_database.py owns DB saving.
 #      Safety still requires fresh 1m PUSH context in main.py.
+#
+#   3) Re-apply this guard even if summary_mtf_diff_from_1m_patch.install()
+#      runs later and overwrites _repair_mtf_from_1m.
 # ============================================================
 from __future__ import annotations
 
@@ -24,9 +27,10 @@ import sys
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V1.1-DUPLICATE-DATETIME-MERGE-GUARD-MAIN-WRITER-OPTIONAL"
+VERSION = "V1.2-DUPLICATE-DATETIME-GUARD-REAPPLY-AFTER-TARGET-INSTALL"
 _INSTALLED = False
 _SUMMARY_AI_MAIN_WRITER_OPTIONAL_INSTALLED = False
+_TARGET_INSTALL_HOOKED = False
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -214,6 +218,56 @@ def _safe_repair_mtf_from_1m(hist: Any, one: Any, *, interval: int):
         return out
 
 
+def _patch_target_repair(*, reason: str = "install") -> bool:
+    try:
+        import core.startup.summary_mtf_diff_from_1m_patch as target
+        cur = getattr(target, "_repair_mtf_from_1m", None)
+        if getattr(cur, "_duplicate_datetime_guard_v12", False):
+            return True
+        if not callable(cur):
+            logger.warning("[SUMMARY MTF DUPLICATE DATETIME GUARD] target repair missing reason=%s", reason)
+            return False
+        _safe_repair_mtf_from_1m._duplicate_datetime_guard_v12 = True  # type: ignore[attr-defined]
+        _safe_repair_mtf_from_1m._duplicate_datetime_guard_v1 = True  # type: ignore[attr-defined]
+        _safe_repair_mtf_from_1m._original = cur  # type: ignore[attr-defined]
+        target._repair_mtf_from_1m = _safe_repair_mtf_from_1m
+        logger.warning("[SUMMARY MTF DUPLICATE DATETIME GUARD] repair wrapped version=%s reason=%s", VERSION, reason)
+        return True
+    except Exception:
+        logger.exception("[SUMMARY MTF DUPLICATE DATETIME GUARD] repair wrap failed reason=%s", reason)
+        return False
+
+
+def _install_target_install_hook() -> bool:
+    global _TARGET_INSTALL_HOOKED
+    if _TARGET_INSTALL_HOOKED:
+        return True
+    try:
+        import core.startup.summary_mtf_diff_from_1m_patch as target
+        cur_install = getattr(target, "install", None)
+        if not callable(cur_install):
+            return False
+        if getattr(cur_install, "_duplicate_datetime_guard_install_hook_v12", False):
+            _TARGET_INSTALL_HOOKED = True
+            return True
+        orig_install = getattr(cur_install, "_original", cur_install)
+
+        def _patched_target_install(*args, **kwargs):
+            ret = orig_install(*args, **kwargs)
+            _patch_target_repair(reason="after_target_install")
+            return ret
+
+        _patched_target_install._duplicate_datetime_guard_install_hook_v12 = True  # type: ignore[attr-defined]
+        _patched_target_install._original = orig_install  # type: ignore[attr-defined]
+        target.install = _patched_target_install
+        _TARGET_INSTALL_HOOKED = True
+        logger.warning("[SUMMARY MTF DUPLICATE DATETIME GUARD] target install hook installed version=%s", VERSION)
+        return True
+    except Exception:
+        logger.exception("[SUMMARY MTF DUPLICATE DATETIME GUARD] target install hook failed")
+        return False
+
+
 def _install_summary_ai_main_writer_optional() -> bool:
     global _SUMMARY_AI_MAIN_WRITER_OPTIONAL_INSTALLED
     if _SUMMARY_AI_MAIN_WRITER_OPTIONAL_INSTALLED:
@@ -254,21 +308,9 @@ def install() -> bool:
     if not _env_bool("SUMMARY_MTF_DUPLICATE_DATETIME_GUARD", True):
         logger.warning("[SUMMARY MTF DUPLICATE DATETIME GUARD] disabled by env")
     else:
-        try:
-            import core.startup.summary_mtf_diff_from_1m_patch as target
-            cur = getattr(target, "_repair_mtf_from_1m", None)
-            if not callable(cur):
-                logger.warning("[SUMMARY MTF DUPLICATE DATETIME GUARD] target missing")
-            elif getattr(cur, "_duplicate_datetime_guard_v1", False):
-                mtf_ok = True
-            else:
-                _safe_repair_mtf_from_1m._duplicate_datetime_guard_v1 = True  # type: ignore[attr-defined]
-                _safe_repair_mtf_from_1m._original = cur  # type: ignore[attr-defined]
-                target._repair_mtf_from_1m = _safe_repair_mtf_from_1m
-                mtf_ok = True
-                logger.warning("[SUMMARY MTF DUPLICATE DATETIME GUARD] installed version=%s", VERSION)
-        except Exception:
-            logger.exception("[SUMMARY MTF DUPLICATE DATETIME GUARD] install failed")
+        hook_ok = _install_target_install_hook()
+        repair_ok = _patch_target_repair(reason="install")
+        mtf_ok = bool(hook_ok or repair_ok)
     writer_optional_ok = _install_summary_ai_main_writer_optional()
     _INSTALLED = bool(mtf_ok or writer_optional_ok)
     return _INSTALLED
