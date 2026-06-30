@@ -1,24 +1,23 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_ai_candidate_refill_patch.py
-# Version: V2-SUMMARY-AI-CANDIDATE-REFILL-SAFETY-GUARDS
+# Version: V3-SUMMARY-AI-SAFETY-GUARD-FRESH-RAW-PUSH-FALLBACK
 # ------------------------------------------------------------
 # Purpose:
-#   2026-06-29 logs showed SUMMARY_AI could run while PUSH was only
-#   memory-resident:
-#       writer_ready=False / memory_only=True / total_flushed=0
+#   SUMMARY_AI candidate refill + safety guards.
 #
-#   This patch keeps the existing candidate refill behaviour, but adds
-#   fail-safe guards that are installed from this already-loaded startup
-#   module:
-#     1) block SUMMARY/SUMMARY_AI entry while PUSH writer is not ready,
-#     2) suppress stale DB fallback rows during market session,
-#     3) drop Tonosama history-missing fail-open rows.
+# V2:
+#   - Block SUMMARY/SUMMARY_AI entry while PUSH writer is not ready.
+#   - Suppress stale DB fallback rows during market session.
+#   - Drop Tonosama history-missing fail-open rows.
 #
-# Safety:
-#   - Does not bypass SELL credit guard, liquidity guard, final entry guard,
-#     market-hour guard, risk guard, order builder, or broker checks.
-#   - Only widens candidate pools after fresh/writer checks pass.
+# V3:
+#   - 2026-06-30 12:42 main.py logs showed PUSH raw DB fallback had fresh rows,
+#     but SUMMARY_AI was blocked with no_fresh_push_1m rows=0 because the guard
+#     returned the first empty global_context DataFrame.
+#   - Prefer the first non-empty global_context 1m summary.
+#   - If global_context is empty, use patched fallback_loader.fallback_push_summary_df(1)
+#     / raw push DB fallback as a valid freshness source.
 # ============================================================
 from __future__ import annotations
 
@@ -29,7 +28,7 @@ from functools import wraps
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V2-SUMMARY-AI-CANDIDATE-REFILL-SAFETY-GUARDS"
+VERSION = "V3-SUMMARY-AI-SAFETY-GUARD-FRESH-RAW-PUSH-FALLBACK"
 _INSTALLED = False
 
 
@@ -77,6 +76,13 @@ def _as_len(v: Any) -> int:
         return 0
 
 
+def _is_empty_df_like(v: Any) -> bool:
+    try:
+        return bool(v is None or getattr(v, "empty", True))
+    except Exception:
+        return True
+
+
 def _to_datetime(v: Any) -> dt.datetime | None:
     if v is None:
         return None
@@ -84,7 +90,6 @@ def _to_datetime(v: Any) -> dt.datetime | None:
         return v.replace(tzinfo=None)
     try:
         import pandas as pd
-
         ts = pd.to_datetime(v, errors="coerce")
         if pd.isna(ts):
             return None
@@ -125,34 +130,75 @@ def _df_latest_age_sec(df: Any) -> tuple[bool, float | None, dt.datetime | None,
 
 
 def _get_push_1m_context() -> Any:
+    """Return a fresh-ish 1m PUSH dataframe candidate for safety checks.
+
+    V2 returned the first global_context call result even when it was an empty
+    DataFrame. V3 skips empty results and finally asks fallback_loader, whose
+    fallback is patched to read fresh rows directly from pushYYYYMMDD.db.
+    """
+    first_empty = None
     try:
         import core.global_context.context as ctx
+        calls = (
+            ("get_push_merged_summary", {"tf": 1}),
+            ("get_push_merged_summary", {"interval": 1}),
+            ("get_merged_summary", {"tf": 1, "source": "push"}),
+            ("get_merged_summary", {"interval": 1, "source": "push"}),
+            ("get_summary_history", {"tf": 1, "source": "push"}),
+            ("get_summary_history", {"interval": 1, "source": "push"}),
+        )
+        for name, kwargs in calls:
+            fn = getattr(ctx, name, None)
+            if not callable(fn):
+                continue
+            try:
+                df = fn(**kwargs)
+            except TypeError:
+                continue
+            except Exception:
+                continue
+            if not _is_empty_df_like(df):
+                logger.info("[SUMMARY AI SAFETY GUARD] fresh-check source=global_context.%s rows=%s", name, _as_len(df))
+                return df
+            if first_empty is None:
+                first_empty = df
     except Exception:
-        return None
-    calls = (
-        ("get_push_merged_summary", {"tf": 1}),
-        ("get_push_merged_summary", {"interval": 1}),
-        ("get_merged_summary", {"tf": 1, "source": "push"}),
-        ("get_merged_summary", {"interval": 1, "source": "push"}),
-        ("get_summary_history", {"tf": 1, "source": "push"}),
-        ("get_summary_history", {"interval": 1, "source": "push"}),
-    )
-    for name, kwargs in calls:
-        fn = getattr(ctx, name, None)
-        if not callable(fn):
-            continue
+        pass
+
+    if _env_bool("SUMMARY_AI_FRESH_CHECK_ALLOW_RAW_DB_FALLBACK", True):
         try:
-            return fn(**kwargs)
-        except TypeError:
-            continue
+            import scheduler_jobs.summary.fallback_loader as fl
+            fn = getattr(fl, "fallback_push_summary_df", None)
+            if callable(fn):
+                now_i = getattr(fl, "now_naive", lambda: dt.datetime.now())()
+                df = fn(1, now=now_i)
+                if not _is_empty_df_like(df):
+                    logger.warning(
+                        "[SUMMARY AI SAFETY GUARD] fresh-check source=push_raw_db_fallback rows=%s latest=%s",
+                        _as_len(df),
+                        getattr(df, "datetime", None).max() if hasattr(df, "datetime") else None,
+                    )
+                    return df
         except Exception:
-            continue
-    return None
+            logger.debug("[SUMMARY AI SAFETY GUARD] raw db fallback fresh-check failed", exc_info=True)
+
+    return first_empty
 
 
 def _push_writer_state() -> tuple[bool, str]:
     if not _env_bool("SUMMARY_AI_REQUIRE_PUSH_WRITER_READY", True):
         return True, "writer_check_disabled"
+
+    # In main.py, PUSH may be intentionally memory-only; a separate DB collector
+    # process can still persist PUSH. When fresh raw DB fallback is available,
+    # the writer check should not block SUMMARY_AI only because this process has
+    # writer_ready=False. Keep the old protection for non-main/no-fresh cases.
+    if _env_bool("SUMMARY_AI_WRITER_CHECK_ALLOW_FRESH_RAW_DB", True):
+        df = _get_push_1m_context()
+        ok, age, latest, rows = _df_latest_age_sec(df)
+        max_age = _env_float("SUMMARY_AI_MAX_PUSH_1M_AGE_SEC", 120.0)
+        if ok and age is not None and age <= max_age and rows > 0:
+            return True, f"fresh_push_available rows={rows} latest={latest} age={age:.1f}"
 
     saw_memory_only = False
     saw_writer_false = False
@@ -298,7 +344,7 @@ def _install_summary_ai_guard() -> bool:
         if not callable(cur):
             logger.warning("[SUMMARY AI SAFETY GUARD] target missing")
             return False
-        if getattr(cur, "_summary_ai_candidate_refill_v2", False):
+        if getattr(cur, "_summary_ai_candidate_refill_v3", False):
             return True
         orig = getattr(cur, "_original", cur)
 
@@ -341,6 +387,7 @@ def _install_summary_ai_guard() -> bool:
                 second["candidate_refill_retry"] = _summarize_result(second)
             return second
 
+        patched_run_summary_ai_entry_from_df._summary_ai_candidate_refill_v3 = True  # type: ignore[attr-defined]
         patched_run_summary_ai_entry_from_df._summary_ai_candidate_refill_v2 = True  # type: ignore[attr-defined]
         patched_run_summary_ai_entry_from_df._original = orig  # type: ignore[attr-defined]
         r.run_summary_ai_entry_from_df = patched_run_summary_ai_entry_from_df
@@ -350,12 +397,13 @@ def _install_summary_ai_guard() -> bool:
         except Exception:
             pass
         logger.warning(
-            "[SUMMARY AI SAFETY GUARD] installed version=%s top_n=%s tonosama_max=%s writer_required=%s fresh_required=%s",
+            "[SUMMARY AI SAFETY GUARD] installed version=%s top_n=%s tonosama_max=%s writer_required=%s fresh_required=%s raw_fallback=%s",
             VERSION,
             _env_int("SUMMARY_AI_REFILL_TOP_N", 60),
             _env_int("SUMMARY_AI_REFILL_TONOSAMA_MAX_CANDIDATES", 60),
             _env_bool("SUMMARY_AI_REQUIRE_PUSH_WRITER_READY", True),
             _env_bool("SUMMARY_AI_REQUIRE_FRESH_PUSH_1M", True),
+            _env_bool("SUMMARY_AI_FRESH_CHECK_ALLOW_RAW_DB_FALLBACK", True),
         )
         return True
     except Exception:
@@ -461,6 +509,8 @@ def install() -> bool:
     os.environ.setdefault("SUMMARY_AI_REQUIRE_PUSH_WRITER_READY", "1")
     os.environ.setdefault("SUMMARY_AI_REQUIRE_FRESH_PUSH_1M", "1")
     os.environ.setdefault("SUMMARY_AI_MAX_PUSH_1M_AGE_SEC", "120")
+    os.environ.setdefault("SUMMARY_AI_FRESH_CHECK_ALLOW_RAW_DB_FALLBACK", "1")
+    os.environ.setdefault("SUMMARY_AI_WRITER_CHECK_ALLOW_FRESH_RAW_DB", "1")
     os.environ.setdefault("SUMMARY_STALE_DB_FALLBACK_MAX_AGE_SEC", "420")
     os.environ.setdefault("TONOSAMA_DISABLE_HISTORY_FAILOPEN", "1")
     os.environ.setdefault("TONOSAMA_REQUIRE_TECHNICAL_READY", "1")
