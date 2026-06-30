@@ -1,26 +1,32 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_mtf_duplicate_datetime_guard_patch.py
-# Version: V1-DUPLICATE-DATETIME-MERGE-GUARD
+# Version: V1.1-DUPLICATE-DATETIME-MERGE-GUARD-MAIN-WRITER-OPTIONAL
 # ------------------------------------------------------------
 # Purpose:
-#   Prevent pandas merge failure in summary_mtf_diff_from_1m_patch:
-#       ValueError: The column label 'datetime' is not unique.
+#   1) Prevent pandas merge failure in summary_mtf_diff_from_1m_patch:
+#          ValueError: The column label 'datetime' is not unique.
 #
-#   This happens after _bucket_dt is renamed to datetime while the original
-#   1m datetime column is still present.  For repair-source rows, the merge key
-#   must be the bucket-end datetime, so duplicated labels should keep the last
-#   datetime column.
+#      This happens after _bucket_dt is renamed to datetime while the original
+#      1m datetime column is still present.  For repair-source rows, the merge
+#      key must be the bucket-end datetime, so duplicated labels keep the last
+#      datetime column.
+#
+#   2) In main.py, do not require the PUSH DB writer to be alive for Summary-AI.
+#      main.py is the entry/judgement process; main_database.py owns DB saving.
+#      Safety still requires fresh 1m PUSH context in main.py.
 # ============================================================
 from __future__ import annotations
 
 import logging
 import os
+import sys
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V1-DUPLICATE-DATETIME-MERGE-GUARD"
+VERSION = "V1.1-DUPLICATE-DATETIME-MERGE-GUARD-MAIN-WRITER-OPTIONAL"
 _INSTALLED = False
+_SUMMARY_AI_MAIN_WRITER_OPTIONAL_INSTALLED = False
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -31,6 +37,43 @@ def _env_bool(name: str, default: bool = True) -> bool:
         return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
     except Exception:
         return bool(default)
+
+
+def _is_database_collector_context() -> bool:
+    try:
+        argv = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+        if any(
+            x in argv
+            for x in (
+                "main_database.py",
+                "db_prepare_runner.py",
+                "ranking_collector_runner.py",
+                "push_receiver_runner.py",
+                "yahoo_complement_runner.py",
+                "summary_database_runner.py",
+                "data_collectors_runner.py",
+            )
+        ):
+            return True
+        return any(
+            os.getenv(k) == "1"
+            for k in (
+                "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+                "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+                "AUTOSTOCK_SUMMARY_DB_WRITER",
+                "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
+            )
+        )
+    except Exception:
+        return False
+
+
+def _is_main_py_process() -> bool:
+    try:
+        argv = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+        return "main.py" in argv and not _is_database_collector_context()
+    except Exception:
+        return False
 
 
 def _dedupe_columns(df: Any, *, keep: str = "last") -> Any:
@@ -171,31 +214,64 @@ def _safe_repair_mtf_from_1m(hist: Any, one: Any, *, interval: int):
         return out
 
 
-def install() -> bool:
-    global _INSTALLED
-    if _INSTALLED:
+def _install_summary_ai_main_writer_optional() -> bool:
+    global _SUMMARY_AI_MAIN_WRITER_OPTIONAL_INSTALLED
+    if _SUMMARY_AI_MAIN_WRITER_OPTIONAL_INSTALLED:
         return True
-    if not _env_bool("SUMMARY_MTF_DUPLICATE_DATETIME_GUARD", True):
-        logger.warning("[SUMMARY MTF DUPLICATE DATETIME GUARD] disabled by env")
+    if not _env_bool("SUMMARY_AI_MAIN_PUSH_WRITER_OPTIONAL", True):
+        logger.warning("[SUMMARY AI MAIN WRITER OPTIONAL] disabled by env")
         return False
     try:
-        import core.startup.summary_mtf_diff_from_1m_patch as target
-        cur = getattr(target, "_repair_mtf_from_1m", None)
+        import core.startup.summary_ai_candidate_refill_patch as guard
+        cur = getattr(guard, "_push_writer_state", None)
         if not callable(cur):
-            logger.warning("[SUMMARY MTF DUPLICATE DATETIME GUARD] target missing")
+            logger.warning("[SUMMARY AI MAIN WRITER OPTIONAL] target missing")
             return False
-        if getattr(cur, "_duplicate_datetime_guard_v1", False):
-            _INSTALLED = True
+        if getattr(cur, "_main_writer_optional_v1", False):
+            _SUMMARY_AI_MAIN_WRITER_OPTIONAL_INSTALLED = True
             return True
-        _safe_repair_mtf_from_1m._duplicate_datetime_guard_v1 = True  # type: ignore[attr-defined]
-        _safe_repair_mtf_from_1m._original = cur  # type: ignore[attr-defined]
-        target._repair_mtf_from_1m = _safe_repair_mtf_from_1m
-        _INSTALLED = True
-        logger.warning("[SUMMARY MTF DUPLICATE DATETIME GUARD] installed version=%s", VERSION)
+        orig = getattr(cur, "_original", cur)
+
+        def _patched_push_writer_state():
+            if _is_main_py_process():
+                return True, "writer_check_skipped_in_main_py_db_saved_by_main_database"
+            return orig()
+
+        _patched_push_writer_state._main_writer_optional_v1 = True  # type: ignore[attr-defined]
+        _patched_push_writer_state._original = orig  # type: ignore[attr-defined]
+        guard._push_writer_state = _patched_push_writer_state
+        _SUMMARY_AI_MAIN_WRITER_OPTIONAL_INSTALLED = True
+        logger.warning("[SUMMARY AI MAIN WRITER OPTIONAL] installed main_py=%s", _is_main_py_process())
         return True
     except Exception:
-        logger.exception("[SUMMARY MTF DUPLICATE DATETIME GUARD] install failed")
+        logger.exception("[SUMMARY AI MAIN WRITER OPTIONAL] install failed")
         return False
+
+
+def install() -> bool:
+    global _INSTALLED
+    mtf_ok = False
+    if not _env_bool("SUMMARY_MTF_DUPLICATE_DATETIME_GUARD", True):
+        logger.warning("[SUMMARY MTF DUPLICATE DATETIME GUARD] disabled by env")
+    else:
+        try:
+            import core.startup.summary_mtf_diff_from_1m_patch as target
+            cur = getattr(target, "_repair_mtf_from_1m", None)
+            if not callable(cur):
+                logger.warning("[SUMMARY MTF DUPLICATE DATETIME GUARD] target missing")
+            elif getattr(cur, "_duplicate_datetime_guard_v1", False):
+                mtf_ok = True
+            else:
+                _safe_repair_mtf_from_1m._duplicate_datetime_guard_v1 = True  # type: ignore[attr-defined]
+                _safe_repair_mtf_from_1m._original = cur  # type: ignore[attr-defined]
+                target._repair_mtf_from_1m = _safe_repair_mtf_from_1m
+                mtf_ok = True
+                logger.warning("[SUMMARY MTF DUPLICATE DATETIME GUARD] installed version=%s", VERSION)
+        except Exception:
+            logger.exception("[SUMMARY MTF DUPLICATE DATETIME GUARD] install failed")
+    writer_optional_ok = _install_summary_ai_main_writer_optional()
+    _INSTALLED = bool(mtf_ok or writer_optional_ok)
+    return _INSTALLED
 
 
 try:
