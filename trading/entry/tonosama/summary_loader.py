@@ -1,13 +1,17 @@
 # ============================================================
 # File   : trading/entry/tonosama/summary_loader.py
-# Version: Ver1.6-TONOSAMA-SUMMARY-DB-FALLBACK
+# Version: Ver1.7-TONOSAMA-SUMMARY-DB-FUTURE-REJECT
 # ------------------------------------------------------------
 # 目的:
 #   殿様イナゴ用のサマリー読込。
-#   main.py 側で summary_parent_tick を skip している運用では、global_data / 
+#   main.py 側で summary_parent_tick を skip している運用では、global_data /
 #   global_context の completed summary が空になることがある。
 #   その場合でも summaryYYYYMMDD.db の stock_summary_{1,3,5}min から
 #   当日最新行を直接読み、Tonosama base feature empty を回避する。
+#
+#   Ver1.7:
+#     - summary DB fallback で未来時刻の足を採用しない。
+#       例: 現在 13:19 なのに 5min latest=15:35 を読む事故を防ぐ。
 # ============================================================
 
 from __future__ import annotations
@@ -100,6 +104,44 @@ def _today_yyyymmdd() -> str:
     return _today_naive().strftime("%Y%m%d")
 
 
+def _future_tolerance_sec(interval: int) -> float:
+    # 集計足のラベルが少し先時刻になる運用を考慮し、通常は足幅+30秒だけ許容。
+    default = max(30.0, float(int(interval)) * 60.0 + 30.0)
+    return max(0.0, _env_float("TONOSAMA_SUMMARY_DB_FUTURE_TOLERANCE_SEC", default))
+
+
+def _reject_future_history(df: pd.DataFrame, *, interval: int, via: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if _env_bool("TONOSAMA_ALLOW_FUTURE_SUMMARY_HISTORY", False):
+        return df
+    if "datetime" not in df.columns:
+        return df
+    try:
+        x = df.copy()
+        x["datetime"] = pd.to_datetime(x["datetime"], errors="coerce")
+        x = x.dropna(subset=["datetime"])
+        if x.empty:
+            return pd.DataFrame()
+        now = _now_naive()
+        tolerance = _future_tolerance_sec(interval)
+        cutoff = pd.Timestamp(now + dt.timedelta(seconds=tolerance))
+        before = len(x)
+        future_latest = x["datetime"].max()
+        x = x[x["datetime"] <= cutoff]
+        removed = before - len(x)
+        if removed:
+            logger.warning(
+                "[TONOSAMA ENTRY] reject future summary fallback interval=%s via=%s removed=%s before=%s after=%s latest_before=%s cutoff=%s tolerance=%.1fs allow_future=%s",
+                interval, via, removed, before, len(x), future_latest, cutoff, tolerance,
+                _env_bool("TONOSAMA_ALLOW_FUTURE_SUMMARY_HISTORY", False),
+            )
+        return x
+    except Exception:
+        logger.debug("[TONOSAMA ENTRY] future summary reject failed interval=%s via=%s", interval, via, exc_info=True)
+        return df
+
+
 def _reject_prev_day_history(df: pd.DataFrame, *, interval: int, via: str) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
@@ -129,6 +171,9 @@ def _latest_slot_today(df: pd.DataFrame, *, interval: int, via: str) -> pd.DataF
         x = df.copy()
         x["datetime"] = pd.to_datetime(x["datetime"], errors="coerce")
         x = x.dropna(subset=["datetime"])
+        if x.empty:
+            return pd.DataFrame()
+        x = _reject_future_history(x, interval=interval, via=via)
         if x.empty:
             return pd.DataFrame()
         if not _env_bool("TONOSAMA_ALLOW_PREV_DAY_SUMMARY_HISTORY", False):
@@ -185,6 +230,9 @@ def _load_summary_db_latest_slot(interval: int) -> pd.DataFrame:
         max_age = max(60.0, _env_float("TONOSAMA_SUMMARY_DB_FALLBACK_MAX_AGE_SEC", 600.0))
         max_rows = max(50, _env_int("TONOSAMA_SUMMARY_DB_FALLBACK_MAX_ROWS", 5000))
         today = _today_naive().isoformat()
+        now = _now_naive()
+        future_tolerance = _future_tolerance_sec(interval)
+        max_allowed_dt = (now + dt.timedelta(seconds=future_tolerance)).strftime("%Y-%m-%d %H:%M:%S")
         with sqlite3.connect(db, timeout=2.0) as conn:
             conn.row_factory = sqlite3.Row
             if not _table_exists(conn, table):
@@ -194,22 +242,33 @@ def _load_summary_db_latest_slot(interval: int) -> pd.DataFrame:
             dt_col = "datetime" if "datetime" in cols else ("time" if "time" in cols else None)
             if dt_col is None:
                 return pd.DataFrame()
-            sql_latest = f"SELECT MAX({dt_col}) FROM {table} WHERE date({dt_col})=?"
-            latest = conn.execute(sql_latest, (today,)).fetchone()[0]
+            sql_latest = f"SELECT MAX({dt_col}) FROM {table} WHERE date({dt_col})=? AND {dt_col}<=?"
+            latest = conn.execute(sql_latest, (today, max_allowed_dt)).fetchone()[0]
             if not latest:
+                logger.warning(
+                    "[TONOSAMA ENTRY] summary db fallback no non-future slot interval=%s now=%s max_allowed=%s tolerance=%.1fs db=%s table=%s",
+                    interval, now, max_allowed_dt, future_tolerance, db, table,
+                )
                 return pd.DataFrame()
             latest_ts = pd.to_datetime(latest, errors="coerce")
             if pd.isna(latest_ts):
                 return pd.DataFrame()
-            age = (_now_naive() - pd.Timestamp(latest_ts).to_pydatetime().replace(tzinfo=None)).total_seconds()
+            latest_py = pd.Timestamp(latest_ts).to_pydatetime().replace(tzinfo=None)
+            age = (now - latest_py).total_seconds()
+            if age < -future_tolerance:
+                logger.warning(
+                    "[TONOSAMA ENTRY] summary db fallback future rejected interval=%s latest=%s age=%.1fs now=%s tolerance=%.1fs db=%s",
+                    interval, latest, age, now, future_tolerance, db,
+                )
+                return pd.DataFrame()
             if age > max_age:
                 logger.warning("[TONOSAMA ENTRY] summary db fallback stale interval=%s latest=%s age=%.1fs max_age=%.1fs db=%s", interval, latest, age, max_age, db)
                 return pd.DataFrame()
-            # latest slotが薄い場合があるので少し遡る。ただし当日・max_rows内に制限。
+            # latest slotが薄い場合があるので少し遡る。ただし当日・max_rows内・非未来に制限。
             lookback_min = max(interval * 6, _env_int("TONOSAMA_SUMMARY_DB_FALLBACK_LOOKBACK_MIN", 30))
-            start = (pd.Timestamp(latest_ts).to_pydatetime().replace(tzinfo=None) - dt.timedelta(minutes=lookback_min)).strftime("%Y-%m-%d %H:%M:%S")
-            sql = f"SELECT * FROM {table} WHERE {dt_col}>=? AND date({dt_col})=? ORDER BY {dt_col} DESC LIMIT ?"
-            rows = conn.execute(sql, (start, today, max_rows)).fetchall()
+            start = (latest_py - dt.timedelta(minutes=lookback_min)).strftime("%Y-%m-%d %H:%M:%S")
+            sql = f"SELECT * FROM {table} WHERE {dt_col}>=? AND date({dt_col})=? AND {dt_col}<=? ORDER BY {dt_col} DESC LIMIT ?"
+            rows = conn.execute(sql, (start, today, max_allowed_dt, max_rows)).fetchall()
             if not rows:
                 return pd.DataFrame()
             df = pd.DataFrame([dict(r) for r in rows])
@@ -217,11 +276,13 @@ def _load_summary_db_latest_slot(interval: int) -> pd.DataFrame:
                 df["datetime"] = df[dt_col]
             df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
             df = df.dropna(subset=["datetime"])
+            df = _reject_future_history(df, interval=interval, via="summary_db_latest_slot")
+            df = _reject_prev_day_history(df, interval=interval, via="summary_db_latest_slot")
             if df.empty:
                 return pd.DataFrame()
             logger.warning(
-                "[TONOSAMA ENTRY] loaded summary db fallback interval=%s rows=%s symbols=%s latest=%s age=%.1fs db=%s table=%s",
-                interval, len(df), df["symbol"].nunique() if "symbol" in df.columns else 0, df["datetime"].max(), age, db, table,
+                "[TONOSAMA ENTRY] loaded summary db fallback interval=%s rows=%s symbols=%s latest=%s age=%.1fs now=%s max_allowed=%s db=%s table=%s",
+                interval, len(df), df["symbol"].nunique() if "symbol" in df.columns else 0, df["datetime"].max(), age, now, max_allowed_dt, db, table,
             )
             return df.sort_values(["symbol", "datetime"]) if "symbol" in df.columns else df
     except Exception:
@@ -284,6 +345,9 @@ def _maybe_replace_stale_with_history(df: pd.DataFrame, *, interval: int, via: s
         return df
     max_age = max(30.0, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_MAX_AGE_SEC", 180.0))
     history_max_age = max(max_age, _env_float("TONOSAMA_HISTORY_FALLBACK_MAX_AGE_SEC", 600.0))
+    df = _reject_future_history(df, interval=interval, via=via)
+    if df.empty:
+        return pd.DataFrame()
     age = _latest_age_sec(df)
     latest = _latest_dt(df)
     if age is None or age <= max_age:
@@ -291,7 +355,7 @@ def _maybe_replace_stale_with_history(df: pd.DataFrame, *, interval: int, via: s
     hist, hist_via = _load_history_latest_slot(interval)
     hist_age = _latest_age_sec(hist)
     hist_latest = _latest_dt(hist)
-    if hist is not None and not hist.empty and hist_age is not None and hist_age <= history_max_age:
+    if hist is not None and not hist.empty and hist_age is not None and -_future_tolerance_sec(interval) <= hist_age <= history_max_age:
         logger.warning(
             "[TONOSAMA ENTRY] merged summary stale -> history/db latest fallback interval=%s merged_via=%s merged_latest=%s merged_age=%.1fs hist_via=%s hist_latest=%s hist_age=%.1fs rows=%s max_age=%.1fs history_max_age=%.1fs",
             interval, via, latest, age, hist_via, hist_latest, hist_age, len(hist), max_age, history_max_age,
@@ -312,8 +376,9 @@ def _call_summary_getter(interval: int) -> pd.DataFrame | None:
             df = _safe_df(fn(interval))
             if not df.empty:
                 df = _maybe_replace_stale_with_history(df, interval=interval, via="get_push_merged_summary")
-                logger.info("[TONOSAMA ENTRY] loaded push merged summary interval=%s rows=%s latest_dt=%s via=get_push_merged_summary", interval, len(df), _latest_dt(df))
-                return df
+                if not df.empty:
+                    logger.info("[TONOSAMA ENTRY] loaded push merged summary interval=%s rows=%s latest_dt=%s via=get_push_merged_summary", interval, len(df), _latest_dt(df))
+                    return df
     except Exception:
         logger.debug("[TONOSAMA ENTRY] get_push_merged_summary failed interval=%s", interval, exc_info=True)
 
@@ -326,8 +391,9 @@ def _call_summary_getter(interval: int) -> pd.DataFrame | None:
                 df = pd.DataFrame()
             if not df.empty:
                 df = _maybe_replace_stale_with_history(df, interval=interval, via="get_merged_summary_source_push")
-                logger.info("[TONOSAMA ENTRY] loaded push merged summary interval=%s rows=%s latest_dt=%s via=get_merged_summary_source_push", interval, len(df), _latest_dt(df))
-                return df
+                if not df.empty:
+                    logger.info("[TONOSAMA ENTRY] loaded push merged summary interval=%s rows=%s latest_dt=%s via=get_merged_summary_source_push", interval, len(df), _latest_dt(df))
+                    return df
     except Exception:
         logger.debug("[TONOSAMA ENTRY] get_merged_summary(source=push) failed interval=%s", interval, exc_info=True)
 
@@ -365,15 +431,18 @@ def _call_summary_getter(interval: int) -> pd.DataFrame | None:
         if callable(fn):
             df = _safe_df(fn(interval))
             if not df.empty:
+                df = _reject_future_history(df, interval=interval, via="legacy_no_source")
                 df = _reject_prev_day_history(df, interval=interval, via="legacy_no_source")
                 if not df.empty:
                     df = _maybe_replace_stale_with_history(df, interval=interval, via="legacy_no_source")
-                    logger.warning("[TONOSAMA ENTRY] loaded merged summary interval=%s rows=%s latest_dt=%s via=legacy_no_source fallback_may_be_stale", interval, len(df), _latest_dt(df))
-                    return df
+                    if not df.empty:
+                        logger.warning("[TONOSAMA ENTRY] loaded merged summary interval=%s rows=%s latest_dt=%s via=legacy_no_source fallback_may_be_stale", interval, len(df), _latest_dt(df))
+                        return df
     except Exception:
         logger.debug("[TONOSAMA ENTRY] get_merged_summary legacy failed interval=%s", interval, exc_info=True)
 
     # 最後の保険: main.pyメモリが空でもmain_database.pyが保存したsummary DBを読む。
+    # ただし未来時刻のDB行は採用しない。
     df = _load_summary_db_latest_slot(interval)
     if not df.empty:
         return df
