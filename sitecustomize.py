@@ -1,11 +1,15 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver52-ACTIVE-SYMBOL-TARGET-FILL
+# Version: Ver53-IND-SHORT-PROFILE-NAN-GUARD
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # main.py は軽量同期 + background install。
 # DB/data collector系はDB専用の最小同期パッチだけにして起動を軽くする。
 # 救済/fail-open系はデフォルトOFFにして、本体判定を優先する。
+#
+# V53:
+#   - indicator_short_history_patch._profile の int(NaN) 落ちを防ぐ
+#     IND_SHORT_PROFILE_GUARD をDB同期パッチへ追加。
 #
 # V52:
 #   - ACTIVE が symbol_flags 等で98件止まりになる場合に、適格銘柄から
@@ -230,6 +234,7 @@ def _install_summary_mtf_catchup_safely() -> None:
 
 
 DB_SYNC_PATCHES = [
+    ("core.startup.indicator_short_history_nan_profile_guard_patch", "IND_SHORT_PROFILE_GUARD", "DISABLE_IND_SHORT_PROFILE_GUARD_PATCH"),
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
     ("core.startup.yahoo_summary_direct_upsert_conflict_patch", "YAHOO_DIRECT_UPSERT_CONFLICT", "DISABLE_YAHOO_DIRECT_UPSERT_CONFLICT_PATCH"),
     ("core.startup.summary_stale_guard_patch", "SUMMARY_STALE_GUARD", "DISABLE_SUMMARY_STALE_GUARD_PATCH"),
@@ -239,6 +244,7 @@ DB_SYNC_PATCHES = [
 ]
 
 SYNC_MAIN_PATCHES = [
+    ("core.startup.indicator_short_history_nan_profile_guard_patch", "IND_SHORT_PROFILE_GUARD", "DISABLE_IND_SHORT_PROFILE_GUARD_PATCH"),
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
     ("core.startup.yahoo_summary_direct_upsert_conflict_patch", "YAHOO_DIRECT_UPSERT_CONFLICT", "DISABLE_YAHOO_DIRECT_UPSERT_CONFLICT_PATCH"),
     ("core.startup.summary_controller_latest_enrich_patch", "SUMMARY_CONTROLLER_LATEST_ENRICH", "DISABLE_SUMMARY_CONTROLLER_LATEST_ENRICH_PATCH"),
