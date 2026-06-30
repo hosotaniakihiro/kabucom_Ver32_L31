@@ -1,19 +1,16 @@
 # ============================================================
 # File   : trading/ranking/summary/score.py
-# Version: Ver1.3-PRODUCTION-RANKING-SUMMARY-SCORE-REPAIR-ZERO
+# Version: Ver1.4-PRODUCTION-RANKING-SUMMARY-RANK-DERIVED-SCORE
 # ------------------------------------------------------------
 # ranking summary 用 score column 補完モジュール
 # ------------------------------------------------------------
-# ✔ pd.Series(pd.NA, dtype="float64") を全面廃止
-# ✔ np.nan ベースで float64 初期化
 # ✔ score / score_total / final_score / display_score を保証
 # ✔ score_buy / score_sell を保証
-# ✔ score_slope / score_mtf を保証
-# ✔ ranking_score / rank_score 等の候補列から base score を復元
-# ✔ 既存 score 系列が全0なら ranking_score などの非ゼロ候補から修復
+# ✔ ranking_score / rank_score 等から base score を復元
+# ✔ 補修元score列が無い場合は No / Rank / ranking_rank など順位列から score を生成
+# ✔ 値下がり/下降系 ranking type は SELL score として生成
 # ✔ 文字列数値 / カンマ / 空文字 / <NA> を安全処理
 # ✔ 重複列 DataFrame 化にも対応
-# ✔ 機能削除ゼロ
 # ============================================================
 
 from __future__ import annotations
@@ -37,7 +34,6 @@ SCORE_COLUMNS = [
     "score_slope",
     "score_mtf",
 ]
-
 
 BASE_SCORE_CANDIDATES = [
     "score",
@@ -66,6 +62,28 @@ RANKING_REPAIR_CANDIDATES = [
     "rank_score_base",
 ]
 
+RANK_COLUMNS = [
+    "rank",
+    "Rank",
+    "ranking_rank",
+    "disp_ranking_rank",
+    "No",
+    "no",
+    "順位",
+    "AverageRanking",
+]
+
+TYPE_COLUMNS = [
+    "ranking_type",
+    "rank_type",
+    "disp_ranking_type",
+    "type",
+    "Type",
+    "CategoryName",
+    "category_name",
+    "name_type",
+]
+
 
 def _empty_float_series(index=None) -> pd.Series:
     return pd.Series(np.nan, index=index, dtype="float64")
@@ -82,109 +100,73 @@ def _safe_numeric_series(
     default: float | None = None,
     fill: bool = False,
 ) -> pd.Series:
-    """
-    df[col] を安全に float64 Series に変換する。
-
-    - 列が存在しない場合も scalar ではなく Series を返す
-    - pd.NA + dtype=float64 問題を避ける
-    - 重複列により DataFrame が返る場合は先頭列を採用
-    - カンマ付き数値・空文字・<NA> を安全に処理する
-    """
     if df is None or not isinstance(df, pd.DataFrame):
         return pd.Series(dtype="float64")
-
     if col not in df.columns:
         if default is None:
             return _empty_float_series(df.index)
         return pd.Series(float(default), index=df.index, dtype="float64")
-
     try:
         s = df[col]
-
         if isinstance(s, pd.DataFrame):
             if s.shape[1] == 0:
-                if default is None:
-                    return _empty_float_series(df.index)
-                return pd.Series(float(default), index=df.index, dtype="float64")
+                return _empty_float_series(df.index) if default is None else pd.Series(float(default), index=df.index, dtype="float64")
             s = s.iloc[:, 0]
-
         if getattr(s, "dtype", None) == object:
             s = (
                 s.astype(str)
                 .str.replace(",", "", regex=False)
                 .str.replace("円", "", regex=False)
                 .str.strip()
-                .replace(
-                    {
-                        "": np.nan,
-                        "None": np.nan,
-                        "none": np.nan,
-                        "NULL": np.nan,
-                        "null": np.nan,
-                        "nan": np.nan,
-                        "NaN": np.nan,
-                        "<NA>": np.nan,
-                        "pd.NA": np.nan,
-                    }
-                )
+                .replace({"": np.nan, "None": np.nan, "none": np.nan, "NULL": np.nan, "null": np.nan, "nan": np.nan, "NaN": np.nan, "<NA>": np.nan, "pd.NA": np.nan})
             )
-
         out = pd.to_numeric(s, errors="coerce")
-
         if not isinstance(out, pd.Series):
             out = pd.Series(out, index=df.index, dtype="float64")
-
         out = out.astype("float64")
-
         if fill:
-            if default is None:
-                out = out.fillna(np.nan)
-            else:
-                out = out.fillna(float(default))
-
+            out = out.fillna(np.nan if default is None else float(default))
         return out
-
     except Exception:
         logger.exception("[RANKING SUMMARY SCORE] numeric conversion failed col=%s", col)
-        if default is None:
-            return _empty_float_series(df.index)
-        return pd.Series(float(default), index=df.index, dtype="float64")
+        return _empty_float_series(df.index) if default is None else pd.Series(float(default), index=df.index, dtype="float64")
 
 
-def _combine_first_numeric(
-    df: pd.DataFrame,
-    candidates: Iterable[str],
-    *,
-    default: float = 0.0,
-) -> pd.Series:
+def _text_series(df: pd.DataFrame, candidates: Iterable[str]) -> pd.Series:
     if df is None or not isinstance(df, pd.DataFrame):
-        return pd.Series(dtype="float64")
-
-    out = _empty_float_series(df.index)
-
+        return pd.Series(dtype="object")
     for col in candidates:
         if col not in df.columns:
             continue
+        try:
+            s = df[col]
+            if isinstance(s, pd.DataFrame):
+                if s.shape[1] == 0:
+                    continue
+                s = s.iloc[:, 0]
+            return s.fillna("").astype(str)
+        except Exception:
+            continue
+    return pd.Series("", index=df.index, dtype="object")
 
+
+def _combine_first_numeric(df: pd.DataFrame, candidates: Iterable[str], *, default: float = 0.0) -> pd.Series:
+    if df is None or not isinstance(df, pd.DataFrame):
+        return pd.Series(dtype="float64")
+    out = _empty_float_series(df.index)
+    for col in candidates:
+        if col not in df.columns:
+            continue
         s = _safe_numeric_series(df, col, default=None, fill=False)
         out = out.where(out.notna(), s)
-
     return out.fillna(float(default)).astype("float64")
 
 
-def _combine_nonzero_numeric(
-    df: pd.DataFrame,
-    candidates: Iterable[str],
-    *,
-    default: float = 0.0,
-) -> pd.Series:
-    """0/NaNをスキップして、最初の非ゼロ候補を採用する。"""
+def _combine_nonzero_numeric(df: pd.DataFrame, candidates: Iterable[str], *, default: float = 0.0) -> pd.Series:
     if df is None or not isinstance(df, pd.DataFrame):
         return pd.Series(dtype="float64")
-
     out = pd.Series(float(default), index=df.index, dtype="float64")
     used = pd.Series(False, index=df.index, dtype="bool")
-
     for col in candidates:
         if col not in df.columns:
             continue
@@ -193,7 +175,6 @@ def _combine_nonzero_numeric(
         if mask.any():
             out.loc[mask] = s.loc[mask].astype("float64")
             used.loc[mask] = True
-
     return out.astype("float64")
 
 
@@ -213,41 +194,67 @@ def _repair_zero_series(current: pd.Series, repair: pd.Series) -> pd.Series:
     return cur.astype("float64")
 
 
-def ensure_score_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    ranking summary 用の score 系列を安全に補完する。
+def _rank_derived_score(df: pd.DataFrame) -> pd.Series:
+    """ranking_score列が消えている時の最後の補修。順位から 50..1 点を作る。"""
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.Series(dtype="float64")
+    rank_s = _empty_float_series(df.index)
+    used_col = None
+    for col in RANK_COLUMNS:
+        if col not in df.columns:
+            continue
+        s = _safe_numeric_series(df, col, default=None, fill=False)
+        valid = s.notna() & s.gt(0)
+        if valid.any():
+            rank_s = s
+            used_col = col
+            break
+    if used_col is None:
+        return _zero_float_series(df.index)
 
-    保証する列:
-      - score
-      - score_total
-      - final_score
-      - display_score
-      - score_buy
-      - score_sell
-      - score_slope
-      - score_mtf
-    """
+    # rank=1 -> 50, rank=50 -> 1。50超えは1点に丸める。
+    score = (51.0 - rank_s).clip(lower=1.0, upper=50.0).fillna(0.0)
+
+    type_s = _text_series(df, TYPE_COLUMNS).str.lower()
+    sell_mask = type_s.str.contains("値下|下落|下降|売|sell|short|decline|down", regex=True, na=False)
+    buy_mask = type_s.str.contains("値上|上昇|買|buy|long|rise|up|急増|売買高|売買代金|tick", regex=True, na=False)
+
+    # 方向不明のランキングはBUY側の候補として扱う。SELL系だけ負値にする。
+    signed = score.copy()
+    signed.loc[sell_mask & ~buy_mask] = -score.loc[sell_mask & ~buy_mask]
+
+    try:
+        logger.info(
+            "[RANKING SUMMARY SCORE] rank-derived repair rank_col=%s rows=%d nonzero=%d sell_like=%d buy_like=%d",
+            used_col,
+            len(df),
+            _nonzero_count(signed),
+            int(sell_mask.sum()),
+            int(buy_mask.sum()),
+        )
+    except Exception:
+        pass
+    return signed.astype("float64")
+
+
+def ensure_score_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None:
         return pd.DataFrame()
 
     x = df.copy()
-
     if x.empty:
         for col in SCORE_COLUMNS:
             if col not in x.columns:
                 x[col] = pd.Series(dtype="float64")
         return x
 
-    base_score = _combine_first_numeric(
-        x,
-        BASE_SCORE_CANDIDATES,
-        default=0.0,
-    )
-    repair_score = _combine_nonzero_numeric(
-        x,
-        RANKING_REPAIR_CANDIDATES,
-        default=0.0,
-    )
+    base_score = _combine_first_numeric(x, BASE_SCORE_CANDIDATES, default=0.0)
+    repair_score = _combine_nonzero_numeric(x, RANKING_REPAIR_CANDIDATES, default=0.0)
+    rank_score = _rank_derived_score(x)
+
+    # ranking_score等が無ければ順位由来scoreを採用。
+    if _nonzero_count(repair_score) == 0 and _nonzero_count(rank_score) > 0:
+        repair_score = rank_score
 
     if "score" in x.columns:
         x["score"] = _safe_numeric_series(x, "score", default=0.0, fill=True)
@@ -273,24 +280,18 @@ def ensure_score_columns(df: pd.DataFrame) -> pd.DataFrame:
     else:
         x["display_score"] = x["final_score"]
 
-    # 既存 score_buy / score_sell が全0のまま存在する場合、final_scoreから復元する。
+    final_s = pd.to_numeric(x["final_score"], errors="coerce").fillna(0.0)
     if "score_buy" in x.columns:
         x["score_buy"] = _safe_numeric_series(x, "score_buy", default=0.0, fill=True)
-        x["score_buy"] = _repair_zero_series(
-            x["score_buy"],
-            pd.to_numeric(x["final_score"], errors="coerce").fillna(0.0).clip(lower=0.0),
-        )
+        x["score_buy"] = _repair_zero_series(x["score_buy"], final_s.clip(lower=0.0))
     else:
-        x["score_buy"] = pd.to_numeric(x["final_score"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        x["score_buy"] = final_s.clip(lower=0.0)
 
     if "score_sell" in x.columns:
         x["score_sell"] = _safe_numeric_series(x, "score_sell", default=0.0, fill=True)
-        x["score_sell"] = _repair_zero_series(
-            x["score_sell"],
-            (-pd.to_numeric(x["final_score"], errors="coerce").fillna(0.0)).clip(lower=0.0),
-        )
+        x["score_sell"] = _repair_zero_series(x["score_sell"], (-final_s).clip(lower=0.0))
     else:
-        x["score_sell"] = (-pd.to_numeric(x["final_score"], errors="coerce").fillna(0.0)).clip(lower=0.0)
+        x["score_sell"] = (-final_s).clip(lower=0.0)
 
     if "score_slope" in x.columns:
         x["score_slope"] = _safe_numeric_series(x, "score_slope", default=0.0, fill=True)
@@ -311,7 +312,7 @@ def ensure_score_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     try:
         logger.info(
-            "[RANKING SUMMARY SCORE] ensured rows=%d score_nonnull=%d score_nonzero=%d final_nonnull=%d buy_nonzero=%d sell_nonzero=%d repair_nonzero=%d",
+            "[RANKING SUMMARY SCORE] ensured rows=%d score_nonnull=%d score_nonzero=%d final_nonnull=%d buy_nonzero=%d sell_nonzero=%d repair_nonzero=%d rank_repair_nonzero=%d",
             len(x),
             int(pd.to_numeric(x["score"], errors="coerce").notna().sum()),
             int(pd.to_numeric(x["score"], errors="coerce").fillna(0.0).ne(0).sum()),
@@ -319,6 +320,7 @@ def ensure_score_columns(df: pd.DataFrame) -> pd.DataFrame:
             int(pd.to_numeric(x["score_buy"], errors="coerce").fillna(0.0).ne(0).sum()),
             int(pd.to_numeric(x["score_sell"], errors="coerce").fillna(0.0).ne(0).sum()),
             _nonzero_count(repair_score),
+            _nonzero_count(rank_score),
         )
     except Exception:
         logger.exception("[RANKING SUMMARY SCORE] ensure score log failed")
@@ -327,24 +329,14 @@ def ensure_score_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def ensure_ranking_score_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    互換用 alias。
-    旧コードが ensure_ranking_score_columns を import していても壊さない。
-    """
     return ensure_score_columns(df)
 
 
 def apply_score_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    互換用 alias。
-    """
     return ensure_score_columns(df)
 
 
 def normalize_score_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    互換用 alias。
-    """
     return ensure_score_columns(df)
 
 
