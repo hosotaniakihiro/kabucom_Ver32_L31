@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/board_missing_failopen_runtime_patch.py
-# Version: V1.3-FORCE-ALLOW-WITHOUT-BOARD
+# Version: V1.4-SUMMARY-AI-BOARD-MISSING-RESCUE
 # ------------------------------------------------------------
 # Purpose:
 #   - PUSH A/B ローテーション境界などで板が一時的に取れない場合、
@@ -10,6 +10,7 @@
 #   - main.py 側ではPUSH DB保存なしの方針を維持する。
 #   - final_entry_safety_guard_patch が先に ENTRY_ALLOW_ENTRY_WITHOUT_BOARD=0 を
 #     setdefault 済みでも、main runtime では保護fail-openを強制有効化する。
+#   - SUMMARY_AI は row / item / entry / ai / entry_row のどこにscoreや流動性があっても拾う。
 # ============================================================
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V1.3-FORCE-ALLOW-WITHOUT-BOARD"
+VERSION = "V1.4-SUMMARY-AI-BOARD-MISSING-RESCUE"
 _INSTALLED = False
 
 _TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
@@ -41,13 +42,214 @@ def _env_bool(name: str, default: bool = True) -> bool:
     return bool(default)
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return float(default)
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
 def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
         if v is None or str(v).strip() == "":
             return float(default)
-        return float(v)
+        return float(str(v).replace(",", ""))
     except Exception:
         return float(default)
+
+
+def _norm(v: Any) -> str:
+    try:
+        return str(v or "").strip().upper()
+    except Exception:
+        return ""
+
+
+def _row_to_dict_any(v: Any) -> dict[str, Any]:
+    try:
+        if isinstance(v, dict):
+            return v
+        if hasattr(v, "to_dict"):
+            d = v.to_dict()
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    return {}
+
+
+def _first_float(dicts: list[dict[str, Any]], keys: tuple[str, ...], default: float = 0.0) -> float:
+    for d in dicts:
+        if not isinstance(d, dict):
+            continue
+        for k in keys:
+            try:
+                if k in d:
+                    val = d.get(k)
+                    if val is not None and str(val).strip() != "":
+                        f = _safe_float(val, default)
+                        if f != 0 or default == 0.0:
+                            return f
+            except Exception:
+                pass
+    return float(default)
+
+
+def _first_str(dicts: list[dict[str, Any]], keys: tuple[str, ...]) -> str:
+    for d in dicts:
+        if not isinstance(d, dict):
+            continue
+        for k in keys:
+            try:
+                val = d.get(k)
+                if val is not None and str(val).strip() != "":
+                    return str(val).strip()
+            except Exception:
+                pass
+    return ""
+
+
+def _candidate_dicts(row: Any, item: Any) -> list[dict[str, Any]]:
+    row_d = _row_to_dict_any(row)
+    item_d = item if isinstance(item, dict) else {}
+    out: list[dict[str, Any]] = []
+    for d in (
+        row_d,
+        item_d,
+        _row_to_dict_any(item_d.get("entry")),
+        _row_to_dict_any(item_d.get("entry_row")),
+        _row_to_dict_any(item_d.get("row")),
+        _row_to_dict_any(item_d.get("ai")),
+    ):
+        if isinstance(d, dict) and d not in out:
+            out.append(d)
+    return out
+
+
+def _is_summary_ai_candidate(dicts: list[dict[str, Any]]) -> bool:
+    source = _norm(_first_str(dicts, ("source", "pipeline_source", "src")))
+    entry_type = _norm(_first_str(dicts, ("entry_type", "type", "strategy")))
+    model = _norm(_first_str(dicts, ("model", "model_used")))
+    reason = _norm(_first_str(dicts, ("reason", "ai_reason")))
+    if "SUMMARY" in source or "SUMMARY" in entry_type or "SUMMARY" in reason:
+        return True
+    if entry_type in {"SUMMARY_AI", "AI_SUMMARY"}:
+        return True
+    if source in {"SUMMARY", "SUMMARY_AI", "PUSH", "AI"} and ("MTF" in model or "SUMMARY" in entry_type):
+        return True
+    return False
+
+
+def _score_from_dicts(dicts: list[dict[str, Any]], side: str) -> float:
+    side_s = _norm(side)
+    if side_s == "BUY":
+        preferred = ("score_buy", "buy_score", "ai_buy_score", "confidence", "priority")
+    elif side_s == "SELL":
+        preferred = ("score_sell", "sell_score", "ai_sell_score", "confidence", "priority")
+    else:
+        preferred = ("score", "score_total", "final_score", "display_score", "priority", "confidence")
+    v = _first_float(dicts, preferred, 0.0)
+    if v:
+        return abs(v)
+    return abs(_first_float(dicts, ("score", "score_total", "final_score", "display_score", "combined_score", "priority", "confidence"), 0.0))
+
+
+def _summary_ai_without_board_ok(fsg: Any, row: Any, item: Any, symbol: str, side: str) -> bool:
+    if not _env_bool("ENTRY_SUMMARY_AI_ALLOW_WITHOUT_BOARD", True):
+        return False
+
+    dicts = _candidate_dicts(row, item)
+    if not _is_summary_ai_candidate(dicts):
+        return False
+
+    close = _first_float(dicts, ("close", "close_price", "price", "current_price", "CurrentPrice"), 0.0)
+    volume = _first_float(dicts, ("volume", "Volume", "trading_volume", "TradingVolume", "出来高", "day_volume"), 0.0)
+    turnover = _first_float(dicts, ("turnover", "trading_value", "TradingValue", "Turnover", "売買代金", "day_turnover"), 0.0)
+    if turnover <= 0 and close > 0 and volume > 0:
+        turnover = close * volume
+    score = _score_from_dicts(dicts, side)
+
+    min_price = _env_float("ENTRY_SUMMARY_AI_ALLOW_WITHOUT_BOARD_MIN_PRICE", _env_float("ENTRY_ALLOW_WITHOUT_BOARD_MIN_PRICE", 200.0))
+    min_volume = _env_float("ENTRY_SUMMARY_AI_ALLOW_WITHOUT_BOARD_MIN_VOLUME", _env_float("ENTRY_ALLOW_WITHOUT_BOARD_MIN_VOLUME", 30000.0))
+    min_turnover = _env_float("ENTRY_SUMMARY_AI_ALLOW_WITHOUT_BOARD_MIN_TURNOVER", _env_float("ENTRY_ALLOW_WITHOUT_BOARD_MIN_TURNOVER", 10000000.0))
+    min_score = _env_float("ENTRY_SUMMARY_AI_ALLOW_WITHOUT_BOARD_MIN_SCORE", 1.0)
+
+    # SCOREが強いSUMMARY_AIは、PUSH rowでvolume列が欠けても売買代金が取れていれば救済する。
+    # ただし価格・売買代金・scoreは必須。
+    volume_ok = volume >= min_volume or (turnover >= min_turnover and _env_bool("ENTRY_SUMMARY_AI_ALLOW_WITHOUT_BOARD_ALLOW_VOLUME_MISSING", True))
+    ok = close >= min_price and turnover >= min_turnover and score >= min_score and volume_ok
+    if not ok:
+        logger.warning(
+            "[FINAL ENTRY SAFETY GUARD] SUMMARY_AI_BOARD_MISSING_RESCUE_NG symbol=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f min_price=%.2f min_volume=%.0f min_turnover=%.0f min_score=%.3f source=%s entry_type=%s",
+            symbol,
+            side,
+            close,
+            volume,
+            turnover,
+            score,
+            min_price,
+            min_volume,
+            min_turnover,
+            min_score,
+            _first_str(dicts, ("source", "pipeline_source")),
+            _first_str(dicts, ("entry_type",)),
+        )
+        return False
+
+    try:
+        item_d = item if isinstance(item, dict) else {}
+        ai = item_d.get("ai")
+        if isinstance(ai, dict):
+            old_lot = _safe_float(ai.get("lot_multiplier"), 1.0) or 1.0
+            ratio = max(0.1, min(1.0, _env_float("ENTRY_SUMMARY_AI_BOARD_MISSING_QTY_RATIO", _env_float("ENTRY_BOARD_MISSING_QTY_RATIO", 0.35))))
+            ai["lot_multiplier"] = max(0.1, old_lot * ratio)
+            ai["board_missing_qty_ratio"] = ratio
+            ai["board_missing_fallback"] = True
+            ai["summary_ai_board_missing_rescue"] = True
+        entry = item_d.get("entry")
+        if isinstance(entry, dict):
+            entry["board_missing_fallback"] = True
+            entry["summary_ai_board_missing_rescue"] = True
+    except Exception:
+        pass
+
+    logger.warning(
+        "[FINAL ENTRY SAFETY GUARD] SUMMARY_AI_BOARD_MISSING_RESCUE_ALLOW symbol=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f qty_ratio=%s version=%s",
+        symbol,
+        side,
+        close,
+        volume,
+        turnover,
+        score,
+        os.getenv("ENTRY_SUMMARY_AI_BOARD_MISSING_QTY_RATIO", os.getenv("ENTRY_BOARD_MISSING_QTY_RATIO", "0.35")),
+        VERSION,
+    )
+    return True
+
+
+def _patch_summary_ai_board_missing_fallback(fsg: Any) -> bool:
+    old = getattr(fsg, "_board_missing_fallback_ok", None)
+    if getattr(old, "_summary_ai_board_missing_rescue_v14", False):
+        return True
+
+    def _board_missing_fallback_ok_v14(row: dict, item: dict, symbol: str, side: str) -> bool:
+        try:
+            if _summary_ai_without_board_ok(fsg, row, item, symbol, side):
+                return True
+        except Exception:
+            logger.debug("[BOARD MISSING FAILOPEN] summary_ai board rescue check failed", exc_info=True)
+        if callable(old):
+            return bool(old(row, item, symbol, side))
+        return False
+
+    _board_missing_fallback_ok_v14._summary_ai_board_missing_rescue_v14 = True  # type: ignore[attr-defined]
+    _board_missing_fallback_ok_v14._original = old  # type: ignore[attr-defined]
+    fsg._board_missing_fallback_ok = _board_missing_fallback_ok_v14
+    logger.warning("[BOARD MISSING FAILOPEN] summary_ai board missing fallback patched version=%s", VERSION)
+    return True
 
 
 def _patch_final_guard() -> bool:
@@ -57,7 +259,9 @@ def _patch_final_guard() -> bool:
         logger.exception("[BOARD MISSING FAILOPEN] import final_entry_safety_guard_patch failed")
         return False
 
-    if getattr(fsg, "_BOARD_MISSING_FAILOPEN_PATCHED_V13", False):
+    _patch_summary_ai_board_missing_fallback(fsg)
+
+    if getattr(fsg, "_BOARD_MISSING_FAILOPEN_PATCHED_V14", False):
         return True
 
     old_board_guard = getattr(fsg, "_board_guard", None)
@@ -148,13 +352,13 @@ def _patch_final_guard() -> bool:
         return True
 
     _board_guard_failopen._board_missing_failopen_v1 = True  # type: ignore[attr-defined]
-    _board_guard_failopen._board_missing_failopen_v13 = True  # type: ignore[attr-defined]
+    _board_guard_failopen._board_missing_failopen_v14 = True  # type: ignore[attr-defined]
     _board_guard_failopen._original_board_guard = old_board_guard  # type: ignore[attr-defined]
     _board_guard_failopen._original_patched_board_guard = old_patched_board_guard  # type: ignore[attr-defined]
     fsg._board_guard = _board_guard_failopen
     fsg._patched_board_guard = _board_guard_failopen
     fsg._BOARD_MISSING_FAILOPEN_PATCHED_V1 = True
-    fsg._BOARD_MISSING_FAILOPEN_PATCHED_V13 = True
+    fsg._BOARD_MISSING_FAILOPEN_PATCHED_V14 = True
     logger.warning("[BOARD MISSING FAILOPEN] final_entry_safety_guard board guard patched version=%s", VERSION)
     return True
 
@@ -194,6 +398,12 @@ def install() -> bool:
     os.environ.setdefault("ENTRY_ALLOW_WITHOUT_BOARD_MIN_PRICE", "200")
     os.environ.setdefault("ENTRY_ALLOW_WITHOUT_BOARD_MIN_SCORE", "0.90")
     os.environ.setdefault("ENTRY_BOARD_MISSING_QTY_RATIO", "0.50")
+    os.environ.setdefault("ENTRY_SUMMARY_AI_ALLOW_WITHOUT_BOARD", "1")
+    os.environ.setdefault("ENTRY_SUMMARY_AI_ALLOW_WITHOUT_BOARD_MIN_SCORE", "1.00")
+    os.environ.setdefault("ENTRY_SUMMARY_AI_ALLOW_WITHOUT_BOARD_MIN_TURNOVER", "10000000")
+    os.environ.setdefault("ENTRY_SUMMARY_AI_ALLOW_WITHOUT_BOARD_MIN_VOLUME", "30000")
+    os.environ.setdefault("ENTRY_SUMMARY_AI_ALLOW_WITHOUT_BOARD_ALLOW_VOLUME_MISSING", "1")
+    os.environ.setdefault("ENTRY_SUMMARY_AI_BOARD_MISSING_QTY_RATIO", "0.35")
     os.environ.setdefault("ENTRY_FINAL_BOARD_RETRY_COUNT", "0")
     os.environ.setdefault("ENTRY_FINAL_BOARD_RETRY_EXTRA_COUNT", "1")
     os.environ.setdefault("ENTRY_FINAL_BOARD_RETRY_EXTRA_WAIT_SEC", "0.2")
@@ -204,14 +414,16 @@ def install() -> bool:
     ok = bool(board_ok or lock_retry_ok or stale_rescue_ok)
     _INSTALLED = bool(ok)
     logger.warning(
-        "[BOARD MISSING FAILOPEN] installed=%s board_ok=%s lock_retry_ok=%s stale_rescue_ok=%s hard_block=%s allow_without_board=%s qty_ratio=%s version=%s",
+        "[BOARD MISSING FAILOPEN] installed=%s board_ok=%s lock_retry_ok=%s stale_rescue_ok=%s hard_block=%s allow_without_board=%s summary_ai_allow=%s qty_ratio=%s summary_ai_qty_ratio=%s version=%s",
         ok,
         board_ok,
         lock_retry_ok,
         stale_rescue_ok,
         os.getenv("ENTRY_BOARD_MISSING_HARD_BLOCK"),
         os.getenv("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"),
+        os.getenv("ENTRY_SUMMARY_AI_ALLOW_WITHOUT_BOARD"),
         os.getenv("ENTRY_BOARD_MISSING_QTY_RATIO"),
+        os.getenv("ENTRY_SUMMARY_AI_BOARD_MISSING_QTY_RATIO"),
         VERSION,
     )
     return bool(ok)
