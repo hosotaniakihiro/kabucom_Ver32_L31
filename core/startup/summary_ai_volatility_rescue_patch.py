@@ -1,33 +1,35 @@
 # ============================================================
 # File   : core/startup/summary_ai_volatility_rescue_patch.py
-# Version: V1-SUMMARY-AI-STRONG-VOL-RESCUE
+# Version: V2-SUMMARY-AI-STRONG-VOL-RESCUE-DB-FRESH-INPUT
 # ------------------------------------------------------------
 # SUMMARY_AIの強い候補が、entry_controller内の ATR_1M_FILTER_NG /
 # RANGE_5M_FILTER_NG だけで全落ちする問題を救済する。
 #
-# 低ボラ銘柄の除外は維持するため、以下を満たすSUMMARY_AIだけ通す。
-#   - score_buy/score_sell/score/final_score の絶対値 >= 3.0
-#   - turnover >= 1,000万円
-#   - volume >= 3,000 または turnover >= 1,000万円
-#   - abs(slope/slope_atr_scaled/score_slope) >= 0.001
-#   - 価格 200〜7000円
-#
-# low_movement_entry_guard_patch 等が後から entry_controller の filter を
-# 再wrapしても、watcher が再適用する。
+# V2:
+#   - main.py の PUSH memory が古い場合、Summary AI が
+#     no_fresh_scored_df で投入されないため、summaryYYYYMMDD.db の
+#     stock_summary_1min 最新scored行を AI input の代替として使う。
+#   - DBも古い場合は発注せず、MAIN_DB/PUSH鮮度不足を明確にログへ出す。
 # ============================================================
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import os
+import sqlite3
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
+import pandas as pd
+
 logger = logging.getLogger(__name__)
-VERSION = "V1-SUMMARY-AI-STRONG-VOL-RESCUE"
+VERSION = "V2-SUMMARY-AI-STRONG-VOL-RESCUE-DB-FRESH-INPUT"
 _INSTALLED = False
 _WATCHER_STARTED = False
+_MAIN_AI_INPUT_PATCHED = False
 
 
 def _env_float(name: str, default: float) -> float:
@@ -38,6 +40,16 @@ def _env_float(name: str, default: float) -> float:
         return float(str(v).replace(",", ""))
     except Exception:
         return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(str(v).replace(",", "")))
+    except Exception:
+        return int(default)
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -168,34 +180,13 @@ def _strong_summary_ai_ok(entry_row: Any, label: str) -> bool:
     if ok:
         logger.warning(
             "[SUMMARY AI VOL RESCUE] allow original_%s_NG symbol=%s side=%s price=%.1f score=%.3f turnover=%.0f volume=%.0f slope_abs=%.6f min_score=%.2f min_turnover=%.0f min_slope=%.6f version=%s",
-            label,
-            symbol,
-            _side(row),
-            price,
-            score,
-            turnover,
-            volume,
-            slope_abs,
-            min_score,
-            min_turnover,
-            min_slope,
-            VERSION,
+            label, symbol, _side(row), price, score, turnover, volume, slope_abs, min_score, min_turnover, min_slope, VERSION,
         )
         return True
 
     logger.info(
         "[SUMMARY AI VOL RESCUE] keep NG symbol=%s label=%s price=%.1f score=%.3f/%s turnover=%.0f/%s volume=%.0f/%s slope_abs=%.6f/%s",
-        symbol,
-        label,
-        price,
-        score,
-        min_score,
-        turnover,
-        min_turnover,
-        volume,
-        min_volume,
-        slope_abs,
-        min_slope,
+        symbol, label, price, score, min_score, turnover, min_turnover, volume, min_volume, slope_abs, min_slope,
     )
     return False
 
@@ -203,7 +194,7 @@ def _strong_summary_ai_ok(entry_row: Any, label: str) -> bool:
 def _wrap_filter(fn: Any, label: str):
     if not callable(fn):
         return fn
-    if getattr(fn, f"_summary_ai_vol_rescue_{label}_v1", False):
+    if getattr(fn, f"_summary_ai_vol_rescue_{label}_v2", False):
         return fn
 
     def _wrapped(entry_row: Any = None, *args: Any, **kwargs: Any):
@@ -217,11 +208,180 @@ def _wrap_filter(fn: Any, label: str):
         return ret
 
     setattr(_wrapped, f"_summary_ai_vol_rescue_{label}_v1", True)
+    setattr(_wrapped, f"_summary_ai_vol_rescue_{label}_v2", True)
     _wrapped._original = fn  # type: ignore[attr-defined]
     return _wrapped
 
 
+def _summary_db_paths() -> list[str]:
+    ymd = dt.datetime.now().strftime("%Y%m%d")
+    candidates = [
+        os.getenv("SUMMARY_MAIN_FRESH_DB_PATH"),
+        os.getenv("SUMMARY_DB_PATH"),
+        os.getenv("SUMMARY_DB_FILE"),
+    ]
+    dirs = [
+        os.getenv("SUMMARY_MAIN_FRESH_DB_DIR"),
+        os.getenv("SUMMARY_DB_DIR"),
+        os.getenv("AUTOSTOCK_SUMMARY_DIR"),
+        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary",
+        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\summary",
+        r"\\192.168.0.22\AutoStockBuyAndSell\summary",
+    ]
+    out: list[str] = []
+    for p in candidates:
+        if not p:
+            continue
+        s = str(p).replace("YYYYMMDD", ymd)
+        out.append(s)
+    for d in dirs:
+        if d:
+            out.append(str(Path(str(d)) / f"summary{ymd}.db"))
+    seen, uniq = set(), []
+    for p in out:
+        if p and p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return uniq
+
+
+def _norm_df(df: Any) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    try:
+        x = df.copy()
+        x = x.loc[:, ~pd.Index(x.columns).duplicated()].copy()
+        if "symbol" not in x.columns:
+            for c in ("Symbol", "code", "Code", "stock_code"):
+                if c in x.columns:
+                    x["symbol"] = x[c]
+                    break
+        if "datetime" not in x.columns:
+            for c in ("Datetime", "date_time", "timestamp", "created_at", "updated_at"):
+                if c in x.columns:
+                    x["datetime"] = x[c]
+                    break
+        if "symbol" not in x.columns or "datetime" not in x.columns:
+            return pd.DataFrame()
+        x["symbol"] = x["symbol"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+        x["datetime"] = pd.to_datetime(x["datetime"], errors="coerce")
+        try:
+            x["datetime"] = x["datetime"].dt.tz_localize(None)
+        except Exception:
+            pass
+        x = x.dropna(subset=["symbol", "datetime"])
+        x = x[x["symbol"].ne("")]
+        return x.reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _score_profile_df(df: pd.DataFrame) -> dict[str, Any]:
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return {"rows": 0, "score_nonzero": 0, "latest": None, "age": None}
+        def col(names: tuple[str, ...]) -> pd.Series:
+            for n in names:
+                if n in df.columns:
+                    return pd.to_numeric(df[n], errors="coerce").fillna(0.0)
+            return pd.Series(0.0, index=df.index)
+        buy = col(("score_buy", "buy_score", "ai_disp_buy_score", "config_buy_score"))
+        sell = col(("score_sell", "sell_score", "ai_disp_sell_score", "config_sell_score")).abs()
+        total = col(("score_total", "final_score", "display_score", "score"))
+        latest = pd.to_datetime(df["datetime"], errors="coerce").max() if "datetime" in df.columns else None
+        age = None
+        if latest is not None and pd.notna(latest):
+            try:
+                age = (dt.datetime.now().replace(tzinfo=None) - latest.to_pydatetime().replace(tzinfo=None)).total_seconds()
+            except Exception:
+                age = None
+        return {
+            "rows": len(df),
+            "score_nonzero": int(((buy.abs() > 0) | (sell.abs() > 0) | (total.abs() > 0)).sum()),
+            "buy_pos": int((buy > 0).sum()),
+            "sell_pos": int((sell > 0).sum()),
+            "latest": latest,
+            "age": age,
+        }
+    except Exception:
+        return {"rows": 0, "score_nonzero": 0, "latest": None, "age": None}
+
+
+def _load_fresh_summary_db_scored() -> pd.DataFrame:
+    if not _env_bool("SUMMARY_AI_DB_FRESH_INPUT_ENABLED", True):
+        return pd.DataFrame()
+    table = os.getenv("SUMMARY_AI_DB_FRESH_INPUT_TABLE", "stock_summary_1min")
+    max_age = _env_float("SUMMARY_AI_DB_FRESH_INPUT_MAX_AGE_SEC", _env_float("SUMMARY_MAIN_AI_MAX_SCORE_AGE_SEC", 300.0))
+    lookback_min = _env_int("SUMMARY_AI_DB_FRESH_INPUT_LOOKBACK_MIN", 20)
+    limit = _env_int("SUMMARY_AI_DB_FRESH_INPUT_LIMIT", 5000)
+    since = (dt.datetime.now() - dt.timedelta(minutes=lookback_min)).strftime("%Y-%m-%d %H:%M:%S")
+    for path in _summary_db_paths():
+        try:
+            if not path or not os.path.exists(path):
+                continue
+            with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.8) as con:
+                sql = f'SELECT * FROM "{table}" WHERE datetime >= ? ORDER BY datetime DESC LIMIT ?'
+                df = pd.read_sql_query(sql, con, params=[since, int(limit)])
+            x = _norm_df(df)
+            if x.empty:
+                continue
+            x = x.sort_values(["symbol", "datetime"], kind="stable").drop_duplicates("symbol", keep="last").reset_index(drop=True)
+            prof = _score_profile_df(x)
+            if int(prof.get("score_nonzero", 0) or 0) <= 0:
+                logger.warning("[SUMMARY AI DB FRESH INPUT] db has no scored rows path=%s rows=%s latest=%s", path, prof.get("rows"), prof.get("latest"))
+                continue
+            age = prof.get("age")
+            if age is not None and float(age) > max_age:
+                logger.warning(
+                    "[SUMMARY AI DB FRESH INPUT] stale db scored summary skipped path=%s rows=%s latest=%s age=%.1fs max_age=%.1fs score_nonzero=%s START_MAIN_DATABASE_OR_CHECK_PUSH",
+                    path, prof.get("rows"), prof.get("latest"), float(age), max_age, prof.get("score_nonzero"),
+                )
+                continue
+            logger.warning(
+                "[SUMMARY AI DB FRESH INPUT] selected db scored summary path=%s rows=%s latest=%s age=%s score_nonzero=%s buy_pos=%s sell_pos=%s version=%s",
+                path, prof.get("rows"), prof.get("latest"), prof.get("age"), prof.get("score_nonzero"), prof.get("buy_pos"), prof.get("sell_pos"), VERSION,
+            )
+            return x
+        except Exception as e:
+            logger.debug("[SUMMARY AI DB FRESH INPUT] db candidate failed path=%s err=%s", path, e, exc_info=True)
+    logger.warning("[SUMMARY AI DB FRESH INPUT] no fresh scored summary db available START_MAIN_DATABASE_OR_CHECK_PUSH paths=%s", _summary_db_paths()[:3])
+    return pd.DataFrame()
+
+
+def _patch_summary_main_ai_input(reason: str = "install") -> bool:
+    global _MAIN_AI_INPUT_PATCHED
+    try:
+        import core.startup.summary_main_1m_light_tick_patch as light
+        cur = getattr(light, "_get_scored_context_summary", None)
+        if not callable(cur):
+            return False
+        if getattr(cur, "_summary_ai_db_fresh_input_v2", False):
+            _MAIN_AI_INPUT_PATCHED = True
+            return True
+        orig = getattr(cur, "_original", cur)
+
+        def _patched_get_scored_context_summary(*args: Any, **kwargs: Any):
+            try:
+                ret = orig(*args, **kwargs)
+                if isinstance(ret, pd.DataFrame) and not ret.empty:
+                    return ret
+            except Exception:
+                logger.debug("[SUMMARY AI DB FRESH INPUT] original scored context failed", exc_info=True)
+            return _load_fresh_summary_db_scored()
+
+        _patched_get_scored_context_summary._summary_ai_db_fresh_input_v2 = True  # type: ignore[attr-defined]
+        _patched_get_scored_context_summary._original = orig  # type: ignore[attr-defined]
+        light._get_scored_context_summary = _patched_get_scored_context_summary
+        _MAIN_AI_INPUT_PATCHED = True
+        logger.warning("[SUMMARY AI DB FRESH INPUT] patched summary_main_1m_light_tick scored context reason=%s version=%s", reason, VERSION)
+        return True
+    except Exception:
+        logger.debug("[SUMMARY AI DB FRESH INPUT] patch failed reason=%s", reason, exc_info=True)
+        return False
+
+
 def _apply_once(reason: str = "install") -> bool:
+    ok = False
     try:
         import trading.handlers.entry_controller as ec
         changed = False
@@ -237,10 +397,11 @@ def _apply_once(reason: str = "install") -> bool:
             changed = True
         if changed:
             logger.warning("[SUMMARY AI VOL RESCUE] patched entry_controller filters reason=%s version=%s", reason, VERSION)
-        return True
+        ok = True
     except Exception:
         logger.exception("[SUMMARY AI VOL RESCUE] apply failed reason=%s", reason)
-        return False
+    input_ok = _patch_summary_main_ai_input(reason)
+    return bool(ok or input_ok)
 
 
 def _watcher() -> None:
@@ -261,12 +422,14 @@ def install() -> bool:
     os.environ.setdefault("SUMMARY_AI_VOL_RESCUE_MIN_TURNOVER", "10000000")
     os.environ.setdefault("SUMMARY_AI_VOL_RESCUE_MIN_VOLUME", "3000")
     os.environ.setdefault("SUMMARY_AI_VOL_RESCUE_MIN_ABS_SLOPE", "0.001")
+    os.environ.setdefault("SUMMARY_AI_DB_FRESH_INPUT_ENABLED", "1")
+    os.environ.setdefault("SUMMARY_AI_DB_FRESH_INPUT_MAX_AGE_SEC", "300")
     ok = _apply_once("install")
     _INSTALLED = bool(ok)
     if ok and not _WATCHER_STARTED:
         _WATCHER_STARTED = True
         threading.Thread(target=_watcher, name="summary-ai-vol-rescue-watch", daemon=True).start()
-    logger.warning("[SUMMARY AI VOL RESCUE] installed=%s watcher=%s version=%s", ok, _WATCHER_STARTED, VERSION)
+    logger.warning("[SUMMARY AI VOL RESCUE] installed=%s watcher=%s db_fresh_input=%s version=%s", ok, _WATCHER_STARTED, _MAIN_AI_INPUT_PATCHED, VERSION)
     return bool(ok)
 
 
