@@ -1,11 +1,17 @@
 # ============================================================
 # File   : core/startup/summary_ai_async_direct_dispatch_patch.py
-# Version: V8-FORCE-DIRECT-SYNC-TIMEOUT-GUARD
+# Version: V9-STRICT-EXECUTED-RESULT-AND-TIMEOUT
 # ------------------------------------------------------------
 # 目的:
 #   SUMMARY AI が AI_OK / approved を出しても、
 #   summary_ai_async_entry_patch が executed=False / skip=queued_async を返し、
 #   実発注がworker待ち・stale skip になる問題を止める。
+#
+# V9:
+#   - executor._positive_result が result['approved'] だけで True を返す問題を補正。
+#   - entries=0 / result.executed=False / no_tradable_rows_after_filters を
+#     外側 executed=True に誤変換しない。
+#   - V8の direct_sync 強制 + direct snapshot timeout は維持。
 #
 # V8:
 #   - V7の direct_sync 強制は維持。
@@ -13,14 +19,6 @@
 #     sync fallback done が出ないケースを検出するためタイムアウトを追加。
 #   - タイムアウト時は必ず direct snapshot timeout としてログに残す。
 #   - timeout 後の重複発注を避けるため、同一呼び出しでは追加retryしない。
-#
-# V7:
-#   - SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC=1 を強制する。
-#   - summary_ai_async_entry_patch 側が install 時に direct_sync=0 へ戻しても、
-#     このパッチの install / watcher で 1 に戻す。
-#   - それでも queued_async が返った場合は、承認済み行を直接 entry pipeline へ渡す。
-#   - direct snapshot の pipeline_source は approved_rows から解決し、SUMMARY候補は
-#     pipeline_source="SUMMARY" として流す。
 # ============================================================
 from __future__ import annotations
 
@@ -32,11 +30,11 @@ from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V8-FORCE-DIRECT-SYNC-TIMEOUT-GUARD"
+VERSION = "V9-STRICT-EXECUTED-RESULT-AND-TIMEOUT"
 _INSTALLED = False
 _ORIG = None
-_LOCK = threading.Lock()
 _WATCHER_STARTED = False
+_POSITIVE_RESULT_PATCHED = False
 
 _RETRYABLE_NO_ORDER_MARKERS = (
     "queued_async",
@@ -121,10 +119,7 @@ def _symbols(rows: Any, limit: int = 20) -> list[str]:
     try:
         for r in list(rows or [])[:limit]:
             d = _row_to_dict(r)
-            if d:
-                sym = str(d.get("symbol") or "").strip()
-            else:
-                sym = str(getattr(r, "symbol", "") or "").strip()
+            sym = str(d.get("symbol") or getattr(r, "symbol", "") or "").strip()
             if sym:
                 out.append(sym)
     except Exception:
@@ -141,17 +136,11 @@ def _resolve_pipeline_source(rows: list[Any]) -> str:
             nested_entry = d.get("entry") if isinstance(d.get("entry"), dict) else {}
             nested_row = d.get("entry_row") if isinstance(d.get("entry_row"), dict) else {}
             vals = [
-                d.get("pipeline_source"),
-                d.get("source"),
-                nested_entry.get("pipeline_source"),
-                nested_entry.get("source"),
-                nested_row.get("pipeline_source"),
-                nested_row.get("source"),
-                nested_ai.get("pipeline_source"),
-                nested_ai.get("source"),
-                d.get("entry_type"),
-                nested_entry.get("entry_type"),
-                nested_ai.get("entry_type"),
+                d.get("pipeline_source"), d.get("source"),
+                nested_entry.get("pipeline_source"), nested_entry.get("source"),
+                nested_row.get("pipeline_source"), nested_row.get("source"),
+                nested_ai.get("pipeline_source"), nested_ai.get("source"),
+                d.get("entry_type"), nested_entry.get("entry_type"), nested_ai.get("entry_type"),
             ]
             for v in vals:
                 s = str(v or "").strip().upper()
@@ -204,21 +193,31 @@ def _flatten_reasons(result: Any) -> str:
     return "|".join(reasons)
 
 
-def _result_executed(result: Any) -> bool:
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
+def _strict_result_executed(result: Any) -> bool:
+    """True only when an order/entry was actually submitted/executed. approvedだけではTrueにしない。"""
     try:
         if result is None:
             return False
         if isinstance(result, bool):
             return bool(result)
         if isinstance(result, dict):
-            if bool(result.get("executed")):
-                return True
-            for key in ("executed_count", "order_count", "submitted_count", "sent_count"):
-                try:
-                    if int(result.get(key) or 0) > 0:
-                        return True
-                except Exception:
-                    pass
+            if result.get("executed") is False:
+                return False
+            for key in ("executed", "order_sent", "order_submitted", "success", "entry_executed"):
+                if bool(result.get(key)):
+                    return True
+            for key in ("executed_count", "order_count", "submitted_count", "sent_count", "entries"):
+                if _safe_int(result.get(key), 0) > 0:
+                    return True
             for key in ("order_id", "OrderId", "orders", "order_ids", "sent_orders", "executed_symbols"):
                 v = result.get(key)
                 if isinstance(v, (list, tuple, set, dict)) and len(v) > 0:
@@ -227,14 +226,18 @@ def _result_executed(result: Any) -> bool:
                     return True
             for key in ("result", "pipeline_result"):
                 child = result.get(key)
-                if child is not result and _result_executed(child):
+                if child is not result and _strict_result_executed(child):
                     return True
             return False
         if isinstance(result, (list, tuple, set)):
-            return any(_result_executed(x) for x in result)
+            return any(_strict_result_executed(x) for x in result)
         return False
     except Exception:
         return False
+
+
+def _result_executed(result: Any) -> bool:
+    return _strict_result_executed(result)
 
 
 def _is_queued_async(result: Any) -> bool:
@@ -256,7 +259,7 @@ def _registered_count(result: Any) -> int:
         if isinstance(result, dict):
             direct = result.get("registered")
             if direct is not None:
-                return int(direct or 0)
+                return _safe_int(direct, 0)
             for key in ("result", "pipeline_result"):
                 n = _registered_count(result.get(key))
                 if n > 0:
@@ -288,7 +291,6 @@ def _call_with_timeout(label: str, rows: list[Any], timeout_sec: float, fn: Call
     timeout_sec = float(timeout_sec or 0.0)
     if timeout_sec <= 0:
         return fn()
-
     box: dict[str, Any] = {"done": False, "result": None, "error": None}
 
     def _target() -> None:
@@ -308,11 +310,7 @@ def _call_with_timeout(label: str, rows: list[Any], timeout_sec: float, fn: Call
     if th.is_alive():
         logger.error(
             "[SUMMARY AI DIRECT DISPATCH] %s timeout timeout=%.3fs elapsed=%.3fs symbols=%s version=%s note=inner_thread_left_daemon_to_avoid_blocking",
-            label,
-            timeout_sec,
-            elapsed,
-            symbols,
-            VERSION,
+            label, timeout_sec, elapsed, symbols, VERSION,
         )
         return {"executed": False, "timeout": True, "skip_reason": f"{label}_timeout", "elapsed_sec": elapsed, "symbols": symbols}
     if box.get("error") is not None:
@@ -331,10 +329,7 @@ def _direct_snapshot_execute(approved_rows: list[Any], interval: Any) -> Any:
         pipeline_source = _resolve_pipeline_source(approved_rows)
         logger.warning(
             "[SUMMARY AI DIRECT DISPATCH] direct snapshot pipeline_source resolved=%s symbols=%s timeout=%.3fs version=%s",
-            pipeline_source,
-            _symbols(approved_rows),
-            _env_float("SUMMARY_AI_DIRECT_SNAPSHOT_TIMEOUT_SEC", 8.0),
-            VERSION,
+            pipeline_source, _symbols(approved_rows), _env_float("SUMMARY_AI_DIRECT_SNAPSHOT_TIMEOUT_SEC", 8.0), VERSION,
         )
         return fn(approved_rows, pipeline_source=pipeline_source, interval=interval)
     except TypeError:
@@ -366,37 +361,20 @@ def _fallback_direct_dispatch(result: Any, kwargs: dict[str, Any]) -> Any:
             started = time.time()
             logger.warning(
                 "[SUMMARY AI DIRECT DISPATCH] sync fallback start attempt=%s/%s interval=%s approved=%s symbols=%s timeout=%.3fs version=%s",
-                attempt,
-                attempts,
-                interval,
-                len(approved_rows),
-                _symbols(approved_rows),
-                timeout_sec,
-                VERSION,
+                attempt, attempts, interval, len(approved_rows), _symbols(approved_rows), timeout_sec, VERSION,
             )
             snap_result = _call_with_timeout(
-                "direct_snapshot",
-                approved_rows,
-                timeout_sec,
-                lambda: _direct_snapshot_execute(approved_rows, interval),
+                "direct_snapshot", approved_rows, timeout_sec, lambda: _direct_snapshot_execute(approved_rows, interval)
             )
             last_result = snap_result
             logger.warning(
                 "[SUMMARY AI DIRECT DISPATCH] sync fallback done attempt=%s/%s elapsed=%.3fs executed=%s timeout=%s registered=%s retryable=%s reason_chain=%s result=%s",
-                attempt,
-                attempts,
-                time.time() - started,
-                _result_executed(snap_result),
-                _is_timeout_result(snap_result),
-                _registered_count(snap_result),
-                _is_retryable_no_order(snap_result),
-                _flatten_reasons(snap_result),
-                snap_result,
+                attempt, attempts, time.time() - started, _result_executed(snap_result), _is_timeout_result(snap_result),
+                _registered_count(snap_result), _is_retryable_no_order(snap_result), _flatten_reasons(snap_result), snap_result,
             )
             if _result_executed(snap_result):
                 break
             if _is_timeout_result(snap_result):
-                # inner thread が遅延して注文する可能性があるため、同一呼び出しで追加retryしない。
                 break
             if not _is_retryable_no_order(snap_result):
                 break
@@ -410,8 +388,12 @@ def _fallback_direct_dispatch(result: Any, kwargs: dict[str, Any]) -> Any:
                 out["executed"] = True
                 out["skip_reason"] = None
             elif _is_timeout_result(last_result):
+                out["executed"] = False
                 out["skip_reason"] = "direct_snapshot_timeout"
                 out["direct_dispatch_timeout"] = True
+            else:
+                out["executed"] = False
+                out["skip_reason"] = _flatten_reasons(last_result) or "entry_pipeline_no_order"
             return out
     except Exception:
         logger.exception("[SUMMARY AI DIRECT DISPATCH] sync fallback failed")
@@ -426,20 +408,40 @@ def _patched_execute_ai_ok_entries_bulk(*args: Any, **kwargs: Any):
     return _fallback_direct_dispatch(result, kwargs)
 
 
+def _install_executor_positive_result_patch(exec_mod: Any) -> bool:
+    global _POSITIVE_RESULT_PATCHED
+    try:
+        cur = getattr(exec_mod, "_positive_result", None)
+        if getattr(cur, "_summary_ai_strict_positive_v1", False):
+            _POSITIVE_RESULT_PATCHED = True
+            return True
+        _strict_result_executed._summary_ai_strict_positive_v1 = True  # type: ignore[attr-defined]
+        _strict_result_executed._original = cur  # type: ignore[attr-defined]
+        exec_mod._positive_result = _strict_result_executed
+        _POSITIVE_RESULT_PATCHED = True
+        logger.warning("[SUMMARY AI DIRECT DISPATCH] patched executor._positive_result strict version=%s", VERSION)
+        return True
+    except Exception:
+        logger.exception("[SUMMARY AI DIRECT DISPATCH] patch executor._positive_result failed")
+        return False
+
+
 def _patch_once(*, log_patch: bool = True) -> bool:
     global _INSTALLED, _ORIG
     try:
         _force_direct_sync_env()
         from trading.entry.summary_ai import executor as exec_mod
         from trading.entry.summary_ai import runner as runner_mod
+        _install_executor_positive_result_patch(exec_mod)
         cur = getattr(exec_mod, "execute_ai_ok_entries_bulk", None)
         if not callable(cur):
             logger.debug("[SUMMARY AI DIRECT DISPATCH] target missing")
             return False
-        if getattr(cur, "_summary_ai_direct_dispatch_v8", False):
+        if getattr(cur, "_summary_ai_direct_dispatch_v9", False):
             _INSTALLED = True
             return True
-        _ORIG = getattr(cur, "_original", cur) if any(getattr(cur, f"_summary_ai_direct_dispatch_v{i}", False) for i in range(1, 8)) else cur
+        _ORIG = getattr(cur, "_original", cur) if any(getattr(cur, f"_summary_ai_direct_dispatch_v{i}", False) for i in range(1, 9)) else cur
+        _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v9 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v8 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v7 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v6 = True  # type: ignore[attr-defined]
@@ -449,12 +451,13 @@ def _patch_once(*, log_patch: bool = True) -> bool:
         _INSTALLED = True
         if log_patch:
             logger.warning(
-                "[SUMMARY AI DIRECT DISPATCH] patched v8 target=%s direct_sync_env=%s attempts=%s snapshot_first=%s timeout=%.3fs source_match=True version=%s",
+                "[SUMMARY AI DIRECT DISPATCH] patched v9 target=%s direct_sync_env=%s attempts=%s snapshot_first=%s timeout=%.3fs strict_positive=%s source_match=True version=%s",
                 getattr(_ORIG, "__name__", type(_ORIG).__name__),
                 os.getenv("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC"),
                 _env_int("SUMMARY_AI_DIRECT_DISPATCH_MAX_ATTEMPTS", 2),
                 _env_bool("SUMMARY_AI_DIRECT_DISPATCH_SNAPSHOT_FIRST", True),
                 _env_float("SUMMARY_AI_DIRECT_SNAPSHOT_TIMEOUT_SEC", 8.0),
+                _POSITIVE_RESULT_PATCHED,
                 VERSION,
             )
         return True
@@ -471,13 +474,9 @@ def _watch_reinstall() -> None:
         ok = _patch_once(log_patch=False)
         if i in (0, loops - 1):
             logger.warning(
-                "[SUMMARY AI DIRECT DISPATCH] enforce v8 i=%s/%s ok=%s direct_sync_env=%s timeout=%.3fs version=%s",
-                i,
-                loops,
-                ok,
-                os.getenv("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC"),
-                _env_float("SUMMARY_AI_DIRECT_SNAPSHOT_TIMEOUT_SEC", 8.0),
-                VERSION,
+                "[SUMMARY AI DIRECT DISPATCH] enforce v9 i=%s/%s ok=%s direct_sync_env=%s timeout=%.3fs strict_positive=%s version=%s",
+                i, loops, ok, os.getenv("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC"),
+                _env_float("SUMMARY_AI_DIRECT_SNAPSHOT_TIMEOUT_SEC", 8.0), _POSITIVE_RESULT_PATCHED, VERSION,
             )
         time.sleep(sleep_sec)
 
@@ -493,7 +492,7 @@ def install() -> bool:
         _WATCHER_STARTED = True
         threading.Thread(target=_watch_reinstall, daemon=True, name="summary-ai-direct-dispatch-enforcer").start()
         logger.warning(
-            "[SUMMARY AI DIRECT DISPATCH] installed/enforcing v8 ok=%s watcher=%s loops=%s sleep=%s direct_sync_env=%s snapshot_first=%s timeout=%.3fs version=%s",
+            "[SUMMARY AI DIRECT DISPATCH] installed/enforcing v9 ok=%s watcher=%s loops=%s sleep=%s direct_sync_env=%s snapshot_first=%s timeout=%.3fs strict_positive=%s version=%s",
             ok,
             _WATCHER_STARTED,
             _env_int("SUMMARY_AI_DIRECT_DISPATCH_WATCH_LOOPS", 12),
@@ -501,6 +500,7 @@ def install() -> bool:
             os.getenv("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC"),
             _env_bool("SUMMARY_AI_DIRECT_DISPATCH_SNAPSHOT_FIRST", True),
             _env_float("SUMMARY_AI_DIRECT_SNAPSHOT_TIMEOUT_SEC", 8.0),
+            _POSITIVE_RESULT_PATCHED,
             VERSION,
         )
     return bool(ok)
