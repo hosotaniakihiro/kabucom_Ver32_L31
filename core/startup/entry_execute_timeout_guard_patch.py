@@ -1,16 +1,9 @@
 # ============================================================
 # File   : core/startup/entry_execute_timeout_guard_patch.py
-# Version: V3-REENTRANT-INFLIGHT-SAFE
+# Version: V4-TRUE-ORIGINAL-REENTRANT-SAFE
 # ------------------------------------------------------------
-# SUMMARY_AI は足 datetime ではなく created_at / updated_at を優先して stale 判定する。
-#
-# V3:
-#   - _execute_best_candidate が複数runtime patchで多重wrapされている場合、
-#     outer timeout guard が同じ symbol/side を inflight 登録した直後に、
-#     inner wrapper が同じ symbol/side を再実行し、INFLIGHT_DUPLICATE_SKIP で
-#     自己ブロックする問題を修正。
-#   - timeout runner thread 内の再入呼び出しは duplicate とみなさず、
-#     original chain を直接進める。
+# _execute_best_candidate の timeout guard。
+# 複数 runtime patch が混在しても wrapper を再帰呼び出ししない。
 # ============================================================
 from __future__ import annotations
 
@@ -23,14 +16,27 @@ import time
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
+
 _PATCHED = False
 _WATCHER_STARTED = False
-_ORIGINALS: dict[int, Callable[..., Any]] = {}
 _INFLIGHT: dict[tuple[str, str], dict[str, Any]] = {}
 _INFLIGHT_LOCK = threading.RLock()
 _LOCAL = threading.local()
 _TRUE_SET = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 _FALSE_SET = {"0", "false", "no", "n", "off", "ng", "disable", "disabled", ""}
+
+_ORIGINAL_ATTRS = (
+    "_entry_execute_timeout_guard_original",
+    "_final_entry_safety_guard_original",
+    "_original_execute_best_candidate",
+    "_original",
+)
+_PATCH_FLAGS = (
+    "_entry_execute_timeout_guard_v4",
+    "_entry_execute_timeout_guard_v3",
+    "_entry_execute_timeout_guard_v2",
+    "_entry_execute_timeout_guard_v1",
+)
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -159,6 +165,24 @@ def _extract_symbol_side(item: dict[str, Any]) -> tuple[str, str, dict[str, Any]
     return symbol, side, row
 
 
+def _unwrap_true_original(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """既存patchが持つ original 属性をたどり、wrapperではない発注本体を取得する。"""
+    seen: set[int] = set()
+    cur: Any = fn
+    while callable(cur) and id(cur) not in seen:
+        seen.add(id(cur))
+        nxt = None
+        for attr in _ORIGINAL_ATTRS:
+            cand = getattr(cur, attr, None)
+            if callable(cand) and cand is not cur:
+                nxt = cand
+                break
+        if nxt is None:
+            break
+        cur = nxt
+    return cur if callable(cur) else fn
+
+
 def _prune_pending_for_symbol(symbol: str, side: str, reason: str) -> int:
     try:
         from trading.entry import pending_manager
@@ -206,12 +230,13 @@ def _cleanup_inflight() -> None:
                 _INFLIGHT.pop(key, None)
 
 
-def _call_original_direct(orig: Callable[..., Any], item: dict[str, Any], boost_active: bool, symbol: str, side: str, reason: str) -> bool:
+def _call_direct(orig: Callable[..., Any], item: dict[str, Any], boost_active: bool, symbol: str, side: str, reason: str) -> bool:
+    true_orig = _unwrap_true_original(orig)
     try:
-        logger.warning("[ENTRY EXEC TIMEOUT GUARD] REENTRANT_DIRECT_CALL symbol=%s side=%s reason=%s", symbol, side, reason)
-        return bool(orig(item, boost_active))
+        logger.warning("[ENTRY EXEC TIMEOUT GUARD] REENTRANT_BYPASS_TO_TRUE_ORIGINAL symbol=%s side=%s reason=%s orig=%s", symbol, side, reason, getattr(true_orig, "__name__", repr(true_orig)))
+        return bool(true_orig(item, boost_active))
     except Exception as exc:
-        logger.warning("[ENTRY EXEC TIMEOUT GUARD] REENTRANT_ORIG_ERROR_RETURN_FALSE symbol=%s side=%s error=%r", symbol, side, exc)
+        logger.warning("[ENTRY EXEC TIMEOUT GUARD] TRUE_ORIG_ERROR_RETURN_FALSE symbol=%s side=%s error=%r", symbol, side, exc)
         return False
 
 
@@ -219,12 +244,13 @@ def _call_with_timeout(orig: Callable[..., Any], item: dict[str, Any], boost_act
     timeout = max(0.5, _env_float("ENTRY_EXECUTE_ORIG_TIMEOUT_SEC", 8.0))
     q: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
     key = (symbol, side)
+    true_orig = _unwrap_true_original(orig)
 
     def runner() -> None:
         prev = bool(getattr(_LOCAL, "inside_timeout_runner", False))
         _LOCAL.inside_timeout_runner = True
         try:
-            q.put_nowait(("ok", bool(orig(item, boost_active))))
+            q.put_nowait(("ok", bool(true_orig(item, boost_active))))
         except Exception as exc:
             try:
                 q.put_nowait(("err", exc))
@@ -245,7 +271,7 @@ def _call_with_timeout(orig: Callable[..., Any], item: dict[str, Any], boost_act
             age = time.time() - float(existing.get("started", time.time()))
             if _env_bool("ENTRY_EXECUTE_ALLOW_REENTRANT_INFLIGHT", True) and bool(getattr(_LOCAL, "inside_timeout_runner", False)):
                 logger.warning("[ENTRY EXEC TIMEOUT GUARD] INFLIGHT_REENTRANT_ALLOW symbol=%s side=%s age=%.1fs timeout=%.1fs", symbol, side, age, timeout)
-                return _call_original_direct(orig, item, boost_active, symbol, side, "inflight_reentrant")
+                return _call_direct(true_orig, item, boost_active, symbol, side, "inflight_reentrant")
             logger.warning("[ENTRY EXEC TIMEOUT GUARD] INFLIGHT_DUPLICATE_SKIP symbol=%s side=%s age=%.1fs timeout=%.1fs", symbol, side, age, timeout)
             return False
         _INFLIGHT[key] = {"started": time.time(), "done": False, "thread": None}
@@ -280,10 +306,10 @@ def _wrap_current() -> bool:
         cur = getattr(ec, "_execute_best_candidate", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_entry_execute_timeout_guard_v3", False):
+        if getattr(cur, "_entry_execute_timeout_guard_v4", False):
             return True
-        orig = getattr(cur, "_entry_execute_timeout_guard_original", None) or cur
-        _ORIGINALS[id(orig)] = orig
+
+        orig = _unwrap_true_original(cur) if any(bool(getattr(cur, f, False)) for f in _PATCH_FLAGS) else cur
 
         def wrapped(item: dict, boost_active: bool) -> bool:
             try:
@@ -296,8 +322,8 @@ def _wrap_current() -> bool:
                     return False
                 if not _candidate_stale_guard(item, row, symbol, side):
                     return False
-                if _env_bool("ENTRY_EXECUTE_ALLOW_REENTRANT_INFLIGHT", True) and bool(getattr(_LOCAL, "inside_timeout_runner", False)):
-                    return _call_original_direct(orig, item, boost_active, symbol, side, "wrapper_reentrant")
+                if bool(getattr(_LOCAL, "inside_timeout_runner", False)):
+                    return _call_direct(orig, item, boost_active, symbol, side, "wrapper_reentrant")
                 started = time.time()
                 ok = _call_with_timeout(orig, item, boost_active, symbol, side)
                 logger.warning("[ENTRY EXEC TIMEOUT GUARD] DONE symbol=%s side=%s ok=%s elapsed=%.3fs", symbol, side, ok, time.time() - started)
@@ -306,14 +332,15 @@ def _wrap_current() -> bool:
                 logger.exception("[ENTRY EXEC TIMEOUT GUARD] wrapper failed")
                 return False
 
+        wrapped._entry_execute_timeout_guard_v4 = True  # type: ignore[attr-defined]
         wrapped._entry_execute_timeout_guard_v3 = True  # type: ignore[attr-defined]
         wrapped._entry_execute_timeout_guard_v2 = True  # type: ignore[attr-defined]
         wrapped._entry_execute_timeout_guard_v1 = True  # type: ignore[attr-defined]
-        wrapped._entry_execute_timeout_guard_original = orig  # type: ignore[attr-defined]
+        wrapped._entry_execute_timeout_guard_original = _unwrap_true_original(orig)  # type: ignore[attr-defined]
         ec._execute_best_candidate = wrapped
         logger.warning(
-            "[ENTRY EXEC TIMEOUT GUARD] wrapped target=%s timeout=%.1fs stale_created=%.1fs stale_bar=%.1fs summary_ai_age_fix=True reentrant_inflight=True",
-            getattr(orig, "__name__", repr(orig)),
+            "[ENTRY EXEC TIMEOUT GUARD] wrapped target=%s timeout=%.1fs stale_created=%.1fs stale_bar=%.1fs true_original_safe=True",
+            getattr(wrapped._entry_execute_timeout_guard_original, "__name__", repr(wrapped._entry_execute_timeout_guard_original)),
             _env_float("ENTRY_EXECUTE_ORIG_TIMEOUT_SEC", 8.0),
             _env_float("ENTRY_EXECUTE_MAX_CANDIDATE_AGE_SEC", 90.0),
             _env_float("ENTRY_EXECUTE_MAX_BAR_AGE_SEC", 180.0),
@@ -348,7 +375,7 @@ def install() -> bool:
         _WATCHER_STARTED = True
         threading.Thread(target=_watcher_loop, name="entry-execute-timeout-guard-watcher", daemon=True).start()
         logger.warning("[ENTRY EXEC TIMEOUT GUARD] watcher started")
-    logger.warning("[ENTRY EXEC TIMEOUT GUARD] installed V3 ok=%s", ok)
+    logger.warning("[ENTRY EXEC TIMEOUT GUARD] installed V4 ok=%s", ok)
     return bool(ok)
 
 
