@@ -1,22 +1,24 @@
 # ============================================================
 # File   : core/scheduler_tasks.py
-# Version: Ver32.2-RANKING-SAVE-TIMEOUT-COOLDOWN
+# Version: Ver32.3-RANKING-SAVE-DB-RUNTIME-ONLY
 # ------------------------------------------------------------
 # Function:
 #   - アプリ全体の scheduler タスク登録を担当する
 #   - summary系 scheduler の登録を統合親tick優先で実行する
-#   - ranking_snapshot_1min 保存タスクを登録する
+#   - ranking_snapshot_1min 保存タスクは main_database.py 側だけで登録する
+#   - main.py は発注/監視優先のため ranking 保存を登録しない
 #   - import 半壊時も利用可能な関数だけ登録し、全体停止を避ける
 #
-# Ver32.2:
-#   - main.py側の ranking_save_tick が120秒以上詰まる問題を抑制
-#   - ranking save を既定3分間隔に変更
-#   - ranking save 実行にタイムアウトを追加
-#   - timeout後はクールダウンし、その間は即skip
-#   - job本体が戻らなくても scheduler thread は戻る
+# Ver32.3:
+#   - main.py側で ranking_save_tick が登録され、20秒timeoutしていた問題を修正
+#   - RANKING_SAVE_IN_MAIN_ENABLED の既定を main.py では 0 相当に変更
+#   - main_database.py / DB writer runtime では既定で ranking 保存を有効化
+#   - RANKING_SAVE_FORCE_ENABLED=1 で任意プロセスでも強制有効化可能
 #
 # ENV:
-#   RANKING_SAVE_IN_MAIN_ENABLED=1/0      default 1
+#   RANKING_SAVE_IN_MAIN_ENABLED=1/0      main.py override。default 0 in main.py
+#   RANKING_SAVE_DB_RUNTIME_ENABLED=1/0   DB runtime default 1
+#   RANKING_SAVE_FORCE_ENABLED=1/0        force enable in any process default 0
 #   RANKING_SAVE_INTERVAL_MIN=3           default 3
 #   RANKING_SAVE_TIMEOUT_SEC=20           default 20
 #   RANKING_SAVE_TIMEOUT_COOLDOWN_SEC=180 default 180
@@ -29,6 +31,7 @@ import importlib
 import inspect
 import logging
 import os
+import sys
 import threading
 import time
 from typing import Any, Callable, Optional
@@ -51,7 +54,12 @@ def _env_bool(name: str, default: bool) -> bool:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
             return bool(default)
-        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
+            return False
+        return bool(default)
     except Exception:
         return bool(default)
 
@@ -74,6 +82,43 @@ def _env_int(name: str, default: int) -> int:
         return int(float(v))
     except Exception:
         return int(default)
+
+
+def _argv_text() -> str:
+    try:
+        return " ".join(str(x).replace("\\", "/").lower() for x in (sys.argv or []))
+    except Exception:
+        return ""
+
+
+def _is_main_database_runtime() -> bool:
+    argv = _argv_text()
+    if "main_database.py" in argv or "main_database" in argv:
+        return True
+    role = str(os.getenv("KABU_RUNTIME_ROLE") or os.getenv("SUMMARY_RUNTIME_ROLE") or os.getenv("SUMMARY_DB_WRITER_ROLE") or "").strip().lower()
+    return role in {"database", "db", "db_writer", "writer", "main_database", "summary_db_writer", "ranking_db_writer"}
+
+
+def _is_main_entry_runtime() -> bool:
+    argv = _argv_text()
+    if "main_database.py" in argv or "main_database" in argv:
+        return False
+    if "main.py" in argv:
+        return True
+    role = str(os.getenv("KABU_RUNTIME_ROLE") or os.getenv("SUMMARY_RUNTIME_ROLE") or os.getenv("SUMMARY_DB_WRITER_ROLE") or "").strip().lower()
+    return role in {"main", "entry", "entry_only", "main_entry", "main_entry_only", "read_only", "no_save"}
+
+
+def _ranking_save_enabled_for_runtime() -> bool:
+    """ranking保存は原則 main_database.py だけで実行する。"""
+    if _env_bool("RANKING_SAVE_FORCE_ENABLED", False):
+        return True
+    if _is_main_database_runtime():
+        return _env_bool("RANKING_SAVE_DB_RUNTIME_ENABLED", True)
+    if _is_main_entry_runtime():
+        return _env_bool("RANKING_SAVE_IN_MAIN_ENABLED", False)
+    # どちらか判別できない場合は安全側で無効。DB runtimeは role か main_database.py で明示する。
+    return _env_bool("RANKING_SAVE_UNKNOWN_RUNTIME_ENABLED", False)
 
 
 def _resolve_attr(module_name: str, attr_name: str) -> Optional[Callable[..., Any]]:
@@ -134,13 +179,6 @@ def _safe_call(fn: Optional[Callable[..., Any]], name: str) -> None:
             logger.info("[core.scheduler_tasks] %s skipped (not available)", name)
     except Exception:
         logger.exception("[core.scheduler_tasks] %s failed", name)
-
-
-def _safe_job_name(fn: Any) -> str:
-    try:
-        return getattr(fn, "__name__", repr(fn))
-    except Exception:
-        return "unknown"
 
 
 def _has_schedule_tag(tag: str) -> bool:
@@ -257,8 +295,11 @@ def _run_ranking_save_tick() -> None:
     started_dt = dt.datetime.now()
     started = time.perf_counter()
 
-    if not _env_bool("RANKING_SAVE_IN_MAIN_ENABLED", True):
-        logger.info("[core.scheduler_tasks] ranking save skipped disabled by RANKING_SAVE_IN_MAIN_ENABLED=0")
+    if not _ranking_save_enabled_for_runtime():
+        logger.info(
+            "[core.scheduler_tasks] ranking save skipped disabled runtime main=%s main_database=%s argv=%s",
+            _is_main_entry_runtime(), _is_main_database_runtime(), _argv_text(),
+        )
         return
 
     with _RANKING_SAVE_LOCK:
@@ -272,7 +313,7 @@ def _run_ranking_save_tick() -> None:
 
     now = started_dt.replace(second=0, microsecond=0)
     timeout_sec = max(1.0, _env_float("RANKING_SAVE_TIMEOUT_SEC", 20.0))
-    logger.info("[core.scheduler_tasks] ranking save tick start hhmm=%s timeout_sec=%.1f", now.strftime("%H:%M"), timeout_sec)
+    logger.info("[core.scheduler_tasks] ranking save tick start hhmm=%s timeout_sec=%.1f runtime=main_database", now.strftime("%H:%M"), timeout_sec)
 
     def _body() -> Any:
         if callable(_job_save_ranking):
@@ -312,11 +353,18 @@ def _resolve_ranking_save_interval_min() -> int:
 
 
 def register_ranking_save_tasks() -> None:
-    """ranking_snapshot_1min 保存タスク登録。既定3分ごと :02。"""
+    """ranking_snapshot_1min 保存タスク登録。main_database.pyだけで登録する。"""
     try:
         _clear_schedule_tag(_TAG_RANKING_SAVE_TICK)
-        if not _env_bool("RANKING_SAVE_IN_MAIN_ENABLED", True):
-            logger.warning("[core.scheduler_tasks] ranking save task not registered disabled by RANKING_SAVE_IN_MAIN_ENABLED=0")
+        enabled = _ranking_save_enabled_for_runtime()
+        if not enabled:
+            logger.warning(
+                "[core.scheduler_tasks] ranking save task not registered disabled runtime main=%s main_database=%s force=%s argv=%s",
+                _is_main_entry_runtime(),
+                _is_main_database_runtime(),
+                os.getenv("RANKING_SAVE_FORCE_ENABLED"),
+                _argv_text(),
+            )
             return
 
         at_text = f":{int(_RANKING_SAVE_SECOND):02d}"
@@ -328,12 +376,13 @@ def register_ranking_save_tasks() -> None:
         job.tag(_TAG_RANKING_SAVE_TICK)
 
         logger.info(
-            "[core.scheduler_tasks] registered ranking save every %s minute(s) at %s tag=%s timeout=%.1fs cooldown=%.1fs job_save_available=%s loop_available=%s",
+            "[core.scheduler_tasks] registered ranking save every %s minute(s) at %s tag=%s timeout=%.1fs cooldown=%.1fs runtime_main_database=%s job_save_available=%s loop_available=%s",
             interval_min,
             at_text,
             _TAG_RANKING_SAVE_TICK,
             _env_float("RANKING_SAVE_TIMEOUT_SEC", 20.0),
             _env_float("RANKING_SAVE_TIMEOUT_COOLDOWN_SEC", 180.0),
+            _is_main_database_runtime(),
             callable(_job_save_ranking),
             callable(_save_ranking_data_loop),
         )
@@ -345,6 +394,10 @@ def register_ranking_save_tasks() -> None:
 
 def ensure_ranking_save_tasks_registered() -> None:
     try:
+        if not _ranking_save_enabled_for_runtime():
+            _clear_schedule_tag(_TAG_RANKING_SAVE_TICK)
+            logger.warning("[core.scheduler_tasks] ranking save ensure skipped disabled for runtime; cleared tag=%s", _TAG_RANKING_SAVE_TICK)
+            return
         if _has_schedule_tag(_TAG_RANKING_SAVE_TICK):
             logger.info("[core.scheduler_tasks] ranking save task already registered tag=%s", _TAG_RANKING_SAVE_TICK)
             return
