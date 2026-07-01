@@ -1,17 +1,22 @@
 # ============================================================
 # File   : trading/entry/summary_ai/executor.py
-# Version: REV4-TOP3-CAP-LEGACY-COMPAT
+# Version: REV5-NO-ORDER-PENDING-CLEANUP
 # ------------------------------------------------------------
 # AI_OK rows -> approved_rows -> entry_pipeline.
-# 実発注対象は最大3件に制限しつつ、既存runtime patchが参照する
-# 旧private関数名を互換維持する。
+#
+# REV5:
+#   - approved / entries / registered があるだけでは実発注成功扱いにしない。
+#   - order_id / sent_orders / executed=True など実注文の証跡だけを成功扱いにする。
+#   - entry_pipeline_no_order / snapshot_no_order / entry_controller_no_order 時は
+#     SUMMARY_AI pending を安全に掃除し、次回エントリーを詰まらせない。
+#   - no-order 時の詳細ログを追加。
 # ============================================================
 from __future__ import annotations
 
 import datetime as dt
 import logging
 import os
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set
 
 import pandas as pd
 
@@ -25,6 +30,9 @@ DEFAULT_MAX_PRICE_FOR_100_SHARE_ENTRY = 7000.0
 DEFAULT_MIN_PRICE_FOR_ENTRY = 3000.0
 
 
+# ============================================================
+# env / normalize helpers
+# ============================================================
 def _env_bool(name: str, default: bool) -> bool:
     try:
         v = os.getenv(name)
@@ -40,7 +48,7 @@ def _env_int(name: str, default: int) -> int:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
             return int(default)
-        return int(float(v))
+        return int(float(str(v).replace(",", "")))
     except Exception:
         return int(default)
 
@@ -50,21 +58,29 @@ def _env_float(name: str, default: float) -> float:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
             return float(default)
-        return float(v)
+        return float(str(v).replace(",", ""))
     except Exception:
         return float(default)
 
 
 def _norm_symbol(v: Any) -> str:
-    s = str(v or "").strip()
-    if s.endswith(".0"):
-        s = s[:-2]
-    return s
+    try:
+        s = str(v or "").strip()
+        if s.endswith(".0"):
+            ss = s[:-2]
+            if ss.isdigit():
+                return ss
+        return s
+    except Exception:
+        return ""
 
 
 def _norm_side(v: Any, default: str = "BUY") -> str:
-    s = str(v or default).strip().upper()
-    return s if s in {"BUY", "SELL"} else default
+    try:
+        s = str(v or default).strip().upper()
+        return s if s in {"BUY", "SELL"} else default
+    except Exception:
+        return default
 
 
 def _as_dict(v: Any) -> Dict[str, Any]:
@@ -162,6 +178,9 @@ def _sort_key(item: Dict[str, Any]) -> tuple[float, float, float]:
     )
 
 
+# ============================================================
+# compatibility hooks used by runtime patches
+# ============================================================
 def _price_bounds() -> tuple[float, float, dict[str, Any]]:
     min_price = DEFAULT_MIN_PRICE_FOR_ENTRY
     max_price = DEFAULT_MAX_PRICE_FOR_100_SHARE_ENTRY
@@ -199,24 +218,6 @@ def _entry_price_bounds() -> tuple[float, float, dict[str, Any]]:
     return _price_bounds()
 
 
-def _is_trade_restricted(symbol: str) -> bool:
-    try:
-        from global_state import global_data
-        root = getattr(global_data, "trade_restricted", {}) or {}
-        until = root.get(symbol)
-        if not until:
-            return False
-        if isinstance(until, dt.datetime) and dt.datetime.now() >= until:
-            try:
-                root.pop(symbol, None)
-            except Exception:
-                pass
-            return False
-        return True
-    except Exception:
-        return False
-
-
 def _is_trade_restricted_symbol(symbol: str) -> tuple[bool, Any]:
     """Legacy compatibility for runtime patches."""
     try:
@@ -234,6 +235,10 @@ def _is_trade_restricted_symbol(symbol: str) -> tuple[bool, Any]:
         return True, until
     except Exception:
         return False, None
+
+
+def _is_trade_restricted(symbol: str) -> bool:
+    return bool(_is_trade_restricted_symbol(symbol)[0])
 
 
 def _is_sell_reject_cached(symbol: str, side: str) -> tuple[bool, Any]:
@@ -269,6 +274,9 @@ def _daily_risk_block_reason(symbol: str, side: str) -> tuple[bool, str, Dict[st
     return False, "", {}
 
 
+# ============================================================
+# AI_OK prefilter / selection
+# ============================================================
 def _base_filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not ok_items:
         return []
@@ -309,7 +317,10 @@ def _base_filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dic
             continue
         kept.append(item)
     if skipped:
-        logger.warning("[SUMMARY AI EXECUTOR] prefiltered before=%s after=%s price_diag=%s skipped=%s", len(ok_items), len(kept), diag, skipped[:50])
+        logger.warning(
+            "[SUMMARY AI EXECUTOR] prefiltered before=%s after=%s price_diag=%s skipped=%s",
+            len(ok_items), len(kept), diag, skipped[:50],
+        )
     return kept
 
 
@@ -352,27 +363,150 @@ def _select_ai_ok_items(ok_items: List[Dict[str, Any]], *, max_entries: int) -> 
     return selected
 
 
-def _positive_result(result: Any) -> bool:
+# ============================================================
+# strict execution judgement + pending cleanup
+# ============================================================
+def _iter_dicts_deep(obj: Any, *, depth: int = 0) -> Iterable[Dict[str, Any]]:
+    if depth > 5:
+        return
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _iter_dicts_deep(v, depth=depth + 1)
+    elif isinstance(obj, (list, tuple, set)):
+        for v in obj:
+            yield from _iter_dicts_deep(v, depth=depth + 1)
+
+
+def _has_real_order_evidence(result: Any) -> bool:
+    """
+    実注文の証跡だけを成功扱いにする。
+    approved / entries / registered / attempted_count は「処理した数」であり注文成功ではない。
+    """
     if result is None:
         return False
     if isinstance(result, bool):
         return result
     if isinstance(result, dict):
-        for k in ("executed", "order_sent", "order_submitted", "success", "approved", "entry_executed"):
-            if bool(result.get(k)):
-                return True
-        for k in ("order_id", "OrderId", "orders", "order_ids", "sent_orders"):
-            v = result.get(k)
-            if isinstance(v, (list, tuple, set, dict)) and len(v) > 0:
-                return True
-            if not isinstance(v, (list, tuple, set, dict)) and v:
-                return True
-        return False
+        # Explicit executed=False on the top-level or nested pipeline result is authoritative unless
+        # another nested object has an actual order id/list.
+        for d in _iter_dicts_deep(result):
+            for k in ("order_id", "OrderId", "order_no", "OrderNo", "execution_id", "ExecutionID"):
+                v = d.get(k)
+                if v:
+                    return True
+            for k in ("orders", "order_ids", "sent_orders", "submitted_orders", "accepted_orders", "executed_symbols"):
+                v = d.get(k)
+                if isinstance(v, (list, tuple, set, dict)) and len(v) > 0:
+                    return True
+            for k in ("order_sent", "order_submitted", "entry_executed"):
+                if bool(d.get(k)):
+                    return True
+        return bool(result.get("executed"))
     if isinstance(result, (list, tuple, set)):
+        # A plain list from the real order layer may be orders, but a list of candidate rows is not
+        # passed here directly in normal flow. Treat non-empty list as positive for compatibility.
         return len(result) > 0
     return bool(result)
 
 
+def _positive_result(result: Any) -> bool:
+    return _has_real_order_evidence(result)
+
+
+def _collect_symbols_for_pending_cleanup(result: Any, approved_rows: Sequence[Dict[str, Any]]) -> Set[str]:
+    symbols: Set[str] = set()
+    try:
+        for d in _iter_dicts_deep(result):
+            for key in ("symbol", "Symbol", "銘柄コード", "code", "stock_code"):
+                sym = _norm_symbol(d.get(key))
+                if sym:
+                    symbols.add(sym)
+            entries = d.get("entries")
+            if isinstance(entries, list):
+                for e in entries:
+                    if isinstance(e, dict):
+                        sym = _norm_symbol(e.get("symbol") or e.get("Symbol"))
+                        if sym:
+                            symbols.add(sym)
+            pending_root = d.get("pending_root")
+            if isinstance(pending_root, dict):
+                for sym in pending_root.keys():
+                    ss = _norm_symbol(sym)
+                    if ss:
+                        symbols.add(ss)
+    except Exception:
+        logger.debug("[SUMMARY AI EXECUTOR] collect cleanup symbols from result failed", exc_info=True)
+    if not symbols:
+        for row in approved_rows or []:
+            if isinstance(row, dict):
+                sym = _norm_symbol(row.get("symbol") or row.get("Symbol"))
+                if sym:
+                    symbols.add(sym)
+    return symbols
+
+
+def _cleanup_pending_after_no_order(result: Any, approved_rows: Sequence[Dict[str, Any]], *, reason: str) -> int:
+    if not _env_bool("SUMMARY_AI_CLEAN_PENDING_ON_NO_ORDER", True):
+        return 0
+    symbols = _collect_symbols_for_pending_cleanup(result, approved_rows)
+    if not symbols:
+        return 0
+    try:
+        from trading.entry.pending_manager import prune_entries, snapshot_root
+
+        def _predicate(sym: str, entry: Dict[str, Any]) -> bool:
+            if _norm_symbol(sym) not in symbols:
+                return False
+            source = str(entry.get("source") or "").strip().upper()
+            entry_type = str(entry.get("entry_type") or "").strip().upper()
+            # SUMMARY_AI経由の候補だけ掃除し、RANKING/TONOSAMA等の別pendingは残す。
+            return entry_type == "SUMMARY_AI" or source in {"SUMMARY", "SUMMARY_AI", "PUSH", "PUSH_SUMMARY"}
+
+        removed = int(prune_entries(_predicate, reason=f"SUMMARY_AI_NO_ORDER:{reason}"))
+        logger.warning(
+            "[SUMMARY AI EXECUTOR] pending cleanup after no-order reason=%s symbols=%s removed=%s root=%s result=%s",
+            reason,
+            sorted(symbols),
+            removed,
+            snapshot_root(),
+            _summarize_no_order_result(result),
+        )
+        return removed
+    except Exception:
+        logger.exception("[SUMMARY AI EXECUTOR] pending cleanup after no-order failed reason=%s symbols=%s", reason, sorted(symbols))
+        return 0
+
+
+def _summarize_no_order_result(result: Any) -> Any:
+    try:
+        if not isinstance(result, dict):
+            return result
+        summary: Dict[str, Any] = {}
+        for k in (
+            "executed", "entries", "attempted_count", "approved", "registered", "skip_reason",
+            "reason", "error", "pending_root", "skipped",
+        ):
+            if k in result:
+                summary[k] = result.get(k)
+        nested = result.get("result") or result.get("pipeline_result")
+        if isinstance(nested, dict):
+            nested_summary: Dict[str, Any] = {}
+            for k in (
+                "executed", "entries", "attempted_count", "approved", "registered", "skip_reason",
+                "reason", "error", "pending_root", "skipped",
+            ):
+                if k in nested:
+                    nested_summary[k] = nested.get(k)
+            summary["nested"] = nested_summary
+        return summary or result
+    except Exception:
+        return str(result)
+
+
+# ============================================================
+# approved row build
+# ============================================================
 def build_approved_row(ai_ok_item: Dict[str, Any]) -> Dict[str, Any]:
     ai_row = _as_dict(ai_ok_item.get("ai_row"))
     src = _as_dict(ai_ok_item.get("source_row"))
@@ -435,6 +569,9 @@ def build_ai_ok_approved_rows(ai_results: Sequence[Dict[str, Any]], *, max_entri
     return approved
 
 
+# ============================================================
+# public executor
+# ============================================================
 def execute_ai_ok_entries_bulk(
     ai_results: Sequence[Dict[str, Any]],
     *,
@@ -457,13 +594,45 @@ def execute_ai_ok_entries_bulk(
     if entry_pipeline is None:
         return {"executed": False, "dry_run": False, "approved_rows": approved_rows, "result": None, "skip_reason": "entry_pipeline_not_found"}
     try:
-        logger.info("[SUMMARY AI EXECUTOR] REAL bulk entry start approved=%s interval=%s symbols=%s", len(approved_rows), interval, [str(x.get("symbol")) for x in approved_rows])
+        logger.info(
+            "[SUMMARY AI EXECUTOR] REAL bulk entry start approved=%s interval=%s symbols=%s",
+            len(approved_rows),
+            interval,
+            [str(x.get("symbol")) for x in approved_rows],
+        )
         result = entry_pipeline(approved_rows, df_summary, interval)
         executed = _positive_result(result)
-        logger.info("[SUMMARY AI EXECUTOR] REAL bulk entry done approved=%s executed=%s result=%s", len(approved_rows), executed, result)
-        return {"executed": executed, "dry_run": False, "approved_rows": approved_rows, "result": result, "skip_reason": None if executed else "entry_pipeline_no_order"}
+        skip_reason = None if executed else "entry_pipeline_no_order"
+        removed_pending = 0
+        if not executed:
+            removed_pending = _cleanup_pending_after_no_order(result, approved_rows, reason=skip_reason)
+            logger.warning(
+                "[SUMMARY AI EXECUTOR] NO REAL ORDER DETAIL approved=%s interval=%s symbols=%s skip=%s pending_removed=%s detail=%s",
+                len(approved_rows),
+                interval,
+                [str(x.get("symbol")) for x in approved_rows],
+                skip_reason,
+                removed_pending,
+                _summarize_no_order_result(result),
+            )
+        logger.info(
+            "[SUMMARY AI EXECUTOR] REAL bulk entry done approved=%s executed=%s pending_removed=%s result=%s",
+            len(approved_rows),
+            executed,
+            removed_pending,
+            result,
+        )
+        return {
+            "executed": executed,
+            "dry_run": False,
+            "approved_rows": approved_rows,
+            "result": result,
+            "skip_reason": skip_reason,
+            "pending_removed": removed_pending,
+        }
     except Exception:
         logger.exception("[SUMMARY AI EXECUTOR] REAL bulk entry failed")
+        _cleanup_pending_after_no_order(None, approved_rows, reason="entry_exception")
         return {"executed": False, "dry_run": False, "approved_rows": approved_rows, "result": None, "skip_reason": "entry_exception"}
 
 
