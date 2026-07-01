@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_main_1m_light_tick_patch.py
-# Version: V3-MAIN-1M-LIGHT-DB-HISTORY-COMPACT
+# Version: V4-MAIN-1M-LIGHT-DB-HISTORY-NO-RAWDB-WATCHDOG
 # ------------------------------------------------------------
 # main.py is entry-only: do not wait for/save/display heavy summary work.
-# It only calculates PUSH 1m quickly, submits Summary-AI asynchronously, and
-# reads recent 1m history from summaryYYYYMMDD.db so indicators are not limited
-# to 1-2 bars. main_database.py remains the DB writer.
+# It only calculates PUSH 1m quickly, submits Summary-AI asynchronously, reads
+# recent 1m history from summaryYYYYMMDD.db, and blocks slow raw push DB fallback
+# from main.py 1m fallback path.
 # ============================================================
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from typing import Any, Optional
 import pandas as pd
 
 logger = logging.getLogger(__name__)
-VERSION = "V3-MAIN-1M-LIGHT-DB-HISTORY-COMPACT"
+VERSION = "V4-MAIN-1M-LIGHT-DB-HISTORY-NO-RAWDB-WATCHDOG"
 _INSTALLED = False
 _HISTORY_INSTALLED = False
 _AI_EXECUTOR: ThreadPoolExecutor | None = None
@@ -219,7 +219,8 @@ def _db_candidates(day: dt.date) -> list[str]:
     seen, uniq = set(), []
     for p in out:
         if p not in seen:
-            seen.add(p); uniq.append(p)
+            seen.add(p)
+            uniq.append(p)
     return uniq
 
 
@@ -332,6 +333,17 @@ def _install_history_patch() -> bool:
         return False
 
 
+def _install_no_raw_db_watchdog() -> bool:
+    try:
+        from core.startup.summary_main_no_raw_db_fallback_watchdog_patch import install as _install
+        ok = bool(_install())
+        logger.warning("[SUMMARY MAIN LIGHT TICK] no raw DB fallback watchdog install ok=%s", ok)
+        return ok
+    except Exception:
+        logger.exception("[SUMMARY MAIN LIGHT TICK] no raw DB fallback watchdog install failed")
+        return False
+
+
 def _submit_async_ai(df: pd.DataFrame, *, interval: int, now: dt.datetime, run_entry: bool, reason: str) -> None:
     if not (_is_entry_only_context() and _env_bool("SUMMARY_MAIN_ASYNC_AI_ENTRY", True) and run_entry and int(interval) in (1, 3, 5)):
         return
@@ -379,7 +391,10 @@ def install() -> bool:
         os.environ.setdefault("SUMMARY_MAIN_HISTORY_BARS", "90")
         os.environ.setdefault("SUMMARY_MAIN_HISTORY_LOOKBACK_MIN", "180")
         os.environ.setdefault("SUMMARY_MAIN_HISTORY_MAX_SYMBOLS", "160")
+        os.environ.setdefault("SUMMARY_MAIN_DISABLE_RAW_DB_FALLBACK", "1")
+        os.environ.setdefault("SUMMARY_MAIN_SKIP_PUSH_DB_FALLBACK", "1")
         _install_history_patch()
+        _install_no_raw_db_watchdog()
 
         import scheduler_jobs.summary.runner_core as rc
         orig_job_summary = getattr(rc, "job_summary", None)
@@ -415,6 +430,7 @@ def install() -> bool:
                 t0 = time.perf_counter()
                 try:
                     _install_history_patch()
+                    _install_no_raw_db_watchdog()
                     runner = rc.resolve_push_summary_runner()
                     if not callable(runner):
                         raise RuntimeError("push summary runner is not available")
@@ -449,7 +465,7 @@ def install() -> bool:
             rc.job_1m = lambda display=True, now=None, run_entry=True: job_summary_light(1, display=display, now=now, run_entry=run_entry)
 
         _INSTALLED = True
-        logger.warning("[SUMMARY MAIN LIGHT TICK] installed version=%s main=%s db_history=%s", VERSION, _is_main_py(), os.getenv("SUMMARY_MAIN_LOAD_DB_HISTORY"))
+        logger.warning("[SUMMARY MAIN LIGHT TICK] installed version=%s main=%s db_history=%s no_raw_db=%s", VERSION, _is_main_py(), os.getenv("SUMMARY_MAIN_LOAD_DB_HISTORY"), os.getenv("SUMMARY_MAIN_DISABLE_RAW_DB_FALLBACK"))
         return True
     except Exception:
         logger.exception("[SUMMARY MAIN LIGHT TICK] install failed")
