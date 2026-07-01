@@ -1,15 +1,15 @@
 # ============================================================
 # File   : core/startup/board_retry_patch.py
-# Version: V1.5-FINAL-GUARD-SIGNATURE-FAST-FALLBACK
+# Version: V1.6-FINAL-GUARD-DIRECT-REST-BOARD-FALLBACK
 # ------------------------------------------------------------
 # A/B PUSHローテーション中の板未取得を短時間リトライする。
 #
-# V1.5:
-#   - final_entry_safety_guard._board_guard に3引数関数を差し替えていたため、
-#     呼び出し側の4引数 call で TypeError → retry になっていた。
-#   - _board_guard_side_aware を 3引数/4引数互換に変更。
-#   - ENTRY_ALLOW_ENTRY_WITHOUT_BOARD=1 かつ HARD_BLOCK=0 の時は、
-#     final guard で4.5秒待たず短時間だけ確認して fail-open する。
+# V1.6:
+#   - final_entry_safety_guard 側で実際に使われている board_retry_patch 内に、
+#     kabu Station REST /board 直接fallbackを追加。
+#   - utils_common.get_latest_bid_ask は PUSH限定のため、PUSHローテ外銘柄では
+#     bid/ask が取れず board_missing になる。RESTで補完する。
+#   - RESTでも bid/ask が取れない場合は従来通り hard block する。
 # ============================================================
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ def _env_float(name: str, default: float) -> float:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
             return float(default)
-        return float(v)
+        return float(str(v).replace(",", ""))
     except Exception:
         return float(default)
 
@@ -51,7 +51,7 @@ def _env_int(name: str, default: int) -> int:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
             return int(default)
-        return int(float(v))
+        return int(float(str(v).replace(",", "")))
     except Exception:
         return int(default)
 
@@ -77,15 +77,140 @@ def _unwrap_original(fn):
     return fn
 
 
-def _is_valid_board(board: Any) -> bool:
+def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
-        if not isinstance(board, dict):
-            return False
-        bid = board.get("bid_price") or board.get("bid") or board.get("best_bid") or board.get("BidPrice")
-        ask = board.get("ask_price") or board.get("ask") or board.get("best_ask") or board.get("AskPrice")
-        return float(bid or 0) > 0 and float(ask or 0) > 0
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
     except Exception:
-        return False
+        return float(default)
+
+
+def _extract_bid_ask(board: Any) -> tuple[float, float, float, float]:
+    if not isinstance(board, dict):
+        return 0.0, 0.0, 0.0, 0.0
+    buy1 = board.get("Buy1") if isinstance(board.get("Buy1"), dict) else {}
+    sell1 = board.get("Sell1") if isinstance(board.get("Sell1"), dict) else {}
+    bid = _safe_float(
+        board.get("bid_price")
+        or board.get("bid")
+        or board.get("best_bid")
+        or board.get("BidPrice")
+        or board.get("BestBid")
+        or buy1.get("Price"),
+        0.0,
+    )
+    ask = _safe_float(
+        board.get("ask_price")
+        or board.get("ask")
+        or board.get("best_ask")
+        or board.get("AskPrice")
+        or board.get("BestAsk")
+        or sell1.get("Price"),
+        0.0,
+    )
+    bid_qty = _safe_float(
+        board.get("bid_qty")
+        or board.get("BidQty")
+        or board.get("bid_volume")
+        or board.get("BestBidQty")
+        or buy1.get("Qty"),
+        0.0,
+    )
+    ask_qty = _safe_float(
+        board.get("ask_qty")
+        or board.get("AskQty")
+        or board.get("ask_volume")
+        or board.get("BestAskQty")
+        or sell1.get("Qty"),
+        0.0,
+    )
+    return bid, ask, bid_qty, ask_qty
+
+
+def _is_valid_board(board: Any) -> bool:
+    bid, ask, _, _ = _extract_bid_ask(board)
+    return bid > 0 and ask > 0
+
+
+def _board_dict(symbol: str, bid: float, ask: float, bid_qty: float = 0.0, ask_qty: float = 0.0, source: str = "") -> dict[str, Any]:
+    return {
+        "symbol": _norm_symbol(symbol),
+        "bid_price": bid,
+        "ask_price": ask,
+        "bid": bid,
+        "ask": ask,
+        "best_bid": bid,
+        "best_ask": ask,
+        "bid_qty": bid_qty,
+        "ask_qty": ask_qty,
+        "source": source or "board_retry",
+    }
+
+
+def _get_token() -> str:
+    try:
+        import token_manager
+        token = token_manager.get_valid_token()
+        if token:
+            return str(token).strip()
+    except Exception:
+        logger.debug("[BOARD RETRY REST] token_manager.get_valid_token failed", exc_info=True)
+    for key in ("KABU_API_TOKEN", "KABUSAPI_TOKEN", "AUKABU_TOKEN", "API_TOKEN", "TOKEN", "KABU_API_KEY", "X_API_KEY"):
+        val = os.getenv(key)
+        if val:
+            return str(val).strip()
+    return ""
+
+
+def _fetch_board_rest(symbol: str, side: str = "", source: str = "") -> dict[str, Any] | None:
+    if not _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", True):
+        return None
+    sym = _norm_symbol(symbol)
+    if not sym:
+        return None
+    token = _get_token()
+    if not token:
+        logger.warning("[BOARD RETRY REST] TOKEN_MISSING symbol=%s side=%s source=%s", sym, side, source)
+        return None
+    try:
+        import requests  # type: ignore
+    except Exception:
+        logger.warning("[BOARD RETRY REST] requests import failed symbol=%s", sym)
+        return None
+
+    timeout = max(0.3, _env_float("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", 1.5))
+    exchanges = [x.strip() for x in str(os.getenv("ENTRY_BOARD_REST_EXCHANGES", "1")).split(",") if x.strip()]
+    if not exchanges:
+        exchanges = ["1"]
+
+    for ex in exchanges:
+        url = f"http://localhost:18080/kabusapi/board/{sym}@{ex}"
+        try:
+            res = requests.get(url, headers={"X-API-KEY": token}, timeout=timeout)
+            status = getattr(res, "status_code", None)
+            if status != 200:
+                logger.warning("[BOARD RETRY REST] REST_NG symbol=%s side=%s source=%s exchange=%s status=%s", sym, side, source, ex, status)
+                continue
+            data = res.json()
+            bid, ask, bid_qty, ask_qty = _extract_bid_ask(data)
+            if bid > 0 and ask > 0:
+                logger.warning(
+                    "[BOARD RETRY REST] REST_BOARD_OK symbol=%s side=%s source=%s exchange=%s bid=%.4f ask=%.4f bid_qty=%.0f ask_qty=%.0f",
+                    sym,
+                    side,
+                    source,
+                    ex,
+                    bid,
+                    ask,
+                    bid_qty,
+                    ask_qty,
+                )
+                return _board_dict(sym, bid, ask, bid_qty, ask_qty, source="rest_board")
+            logger.warning("[BOARD RETRY REST] REST_BOARD_EMPTY symbol=%s side=%s source=%s exchange=%s keys=%s", sym, side, source, ex, sorted(list(data.keys()))[:20] if isinstance(data, dict) else type(data).__name__)
+        except Exception as exc:
+            logger.warning("[BOARD RETRY REST] REST_ERROR symbol=%s side=%s source=%s exchange=%s error=%r", sym, side, source, ex, exc)
+    return None
 
 
 def _is_pending_or_candidate(symbol: str) -> bool:
@@ -109,6 +234,7 @@ def _is_pending_or_candidate(symbol: str) -> bool:
 
 
 def _retry_fetch_board(original, symbol: Any, *args, source: str = "", side: str = "", **kwargs):
+    sym = _norm_symbol(symbol)
     try:
         board = original(symbol, *args, **kwargs)
     except TypeError:
@@ -117,19 +243,18 @@ def _retry_fetch_board(original, symbol: Any, *args, source: str = "", side: str
         return board
 
     if not _env_bool("ENTRY_BOARD_RETRY_ENABLED", True):
-        return board
+        rest_board = _fetch_board_rest(sym, side=side, source=source)
+        return rest_board or board
 
-    sym = _norm_symbol(symbol)
     if not _is_pending_or_candidate(sym):
-        return board
+        rest_board = _fetch_board_rest(sym, side=side, source=source)
+        return rest_board or board
 
     retry_count = max(0, _env_int("ENTRY_BOARD_RETRY_COUNT", 1))
     wait_sec = max(0.0, _env_float("ENTRY_BOARD_RETRY_WAIT_SEC", 4.5))
     extra_count = max(0, _env_int("ENTRY_BOARD_RETRY_EXTRA_COUNT", 2))
     extra_wait_sec = max(0.0, _env_float("ENTRY_BOARD_RETRY_EXTRA_WAIT_SEC", 0.3))
 
-    # final guard で board_missing を許容する設定なら、長い4.5秒待ちはしない。
-    # 発注可否は直後の final guard fallback で判断する。
     if str(source or "") == "final_entry_safety_guard" and _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", False) and not _env_bool("ENTRY_BOARD_MISSING_HARD_BLOCK", True):
         retry_count = min(retry_count, max(0, _env_int("ENTRY_FINAL_BOARD_RETRY_COUNT", 0)))
         wait_sec = min(wait_sec, max(0.0, _env_float("ENTRY_FINAL_BOARD_RETRY_WAIT_SEC", 0.0)))
@@ -183,18 +308,23 @@ def _retry_fetch_board(original, symbol: Any, *args, source: str = "", side: str
             logger.warning("[BOARD RETRY] board recovered on extra symbol=%s side=%s source=%s extra_retry=%s board=%s", sym, side, source, j, last_board)
             return last_board
 
-    logger.warning("[BOARD RETRY] board still missing symbol=%s side=%s source=%s after retries=%s extra=%s", sym, side, source, retry_count, extra_count)
+    rest_board = _fetch_board_rest(sym, side=side, source=source)
+    if _is_valid_board(rest_board):
+        return rest_board
+
+    logger.warning("[BOARD RETRY] board still missing symbol=%s side=%s source=%s after retries=%s extra=%s rest_direct=%s", sym, side, source, retry_count, extra_count, _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", True))
     return last_board
 
 
 def _wrap_get_latest_bid_ask(original):
     original = _unwrap_original(original)
-    if getattr(original, "_board_retry_v15", False):
+    if getattr(original, "_board_retry_v16", False):
         return original
 
     def _get_latest_bid_ask_retry(symbol: Any, *args, **kwargs):
         return _retry_fetch_board(original, symbol, *args, **kwargs)
 
+    _get_latest_bid_ask_retry._board_retry_v16 = True  # type: ignore[attr-defined]
     _get_latest_bid_ask_retry._board_retry_v15 = True  # type: ignore[attr-defined]
     _get_latest_bid_ask_retry._original = original  # type: ignore[attr-defined]
     return _get_latest_bid_ask_retry
@@ -211,6 +341,7 @@ def _make_entry_order_builder_retry(original_get_latest_bid_ask):
             side=str(side or ""),
         )
 
+    _get_board_with_retry._board_retry_v16 = True  # type: ignore[attr-defined]
     _get_board_with_retry._board_retry_v15 = True  # type: ignore[attr-defined]
     _get_board_with_retry._original = original_get_latest_bid_ask  # type: ignore[attr-defined]
     return _get_board_with_retry
@@ -230,23 +361,16 @@ def _install_final_safety_side_aware_board() -> bool:
                     res = get_latest_bid_ask(symbol, source=source, side=side)
                 except TypeError:
                     res = get_latest_bid_ask(symbol)
-                if isinstance(res, dict):
-                    return (
-                        fsg._safe_float(res.get("bid") or res.get("best_bid") or res.get("BidPrice") or res.get("bid_price"), 0.0),
-                        fsg._safe_float(res.get("ask") or res.get("best_ask") or res.get("AskPrice") or res.get("ask_price"), 0.0),
-                        fsg._safe_float(res.get("bid_qty") or res.get("BidQty") or res.get("bid_volume"), 0.0),
-                        fsg._safe_float(res.get("ask_qty") or res.get("AskQty") or res.get("ask_volume"), 0.0),
-                    )
-                if isinstance(res, (list, tuple)) and len(res) >= 2:
-                    return fsg._safe_float(res[0], 0.0), fsg._safe_float(res[1], 0.0), 0.0, 0.0
+                bid, ask, bid_qty, ask_qty = _extract_bid_ask(res)
+                if bid > 0 and ask > 0:
+                    return bid, ask, bid_qty, ask_qty
             except Exception:
                 logger.debug("[BOARD RETRY] final guard get_latest_bid_ask failed symbol=%s side=%s", symbol, side, exc_info=True)
-            return 0.0, 0.0, 0.0, 0.0
+            rest = _fetch_board_rest(symbol, side=side, source=source)
+            bid, ask, bid_qty, ask_qty = _extract_bid_ask(rest)
+            return bid, ask, bid_qty, ask_qty
 
         def _board_guard_side_aware(row: dict, item: dict | str | None = None, symbol: str | None = None, side: str | None = None, *_, **__) -> bool:
-            # 互換:
-            #   _board_guard(row, symbol, side)
-            #   _board_guard(row, item, symbol, side)
             if side is None and symbol is not None:
                 side = symbol
                 symbol = item if isinstance(item, str) else str(item or "")
@@ -266,7 +390,7 @@ def _install_final_safety_side_aware_board() -> bool:
             if bid <= 0 or ask <= 0:
                 if _env_bool("ENTRY_BOARD_MISSING_HARD_BLOCK", True):
                     fsg._log_ng("board_missing", symbol, side, bid=bid, ask=ask, message="板が取れないため新規エントリー停止")
-                    logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_MISSING_HARD_BLOCK symbol=%s side=%s bid=%s ask=%s", symbol, side, bid, ask)
+                    logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_MISSING_HARD_BLOCK symbol=%s side=%s bid=%s ask=%s rest_direct=%s", symbol, side, bid, ask, _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", True))
                     return False
                 if fsg._env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", False):
                     logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_MISSING_ALLOW symbol=%s side=%s bid=%s ask=%s fast_fallback=True", symbol, side, bid, ask)
@@ -286,6 +410,15 @@ def _install_final_safety_side_aware_board() -> bool:
             if side == "SELL" and bid_qty > 0 and bid_qty < min_best_qty:
                 fsg._log_ng("bid_board_too_thin", symbol, side, bid_qty=bid_qty, min_best_qty=min_best_qty, bid=bid, ask=ask)
                 return False
+            try:
+                row["bid"] = bid
+                row["ask"] = ask
+                row["bid_qty"] = bid_qty
+                row["ask_qty"] = ask_qty
+                if isinstance(item, dict) and isinstance(item.get("entry_row"), dict):
+                    item["entry_row"].update({"bid": bid, "ask": ask, "bid_qty": bid_qty, "ask_qty": ask_qty})
+            except Exception:
+                pass
             logger.info(
                 "[FINAL ENTRY SAFETY GUARD] BOARD_OK symbol=%s side=%s bid=%.4f ask=%.4f spread_pct=%.4f bid_qty=%.0f ask_qty=%.0f",
                 symbol, side, bid, ask, spread_pct, bid_qty, ask_qty,
@@ -296,7 +429,7 @@ def _install_final_safety_side_aware_board() -> bool:
         fsg._board_guard = _board_guard_side_aware
         fsg._patched_board_guard = _board_guard_side_aware
         _SIDE_PATCHED = True
-        logger.warning("[BOARD RETRY] patched final_entry_safety_guard board fetch with side/source hard_block=%s signature=v15", _env_bool("ENTRY_BOARD_MISSING_HARD_BLOCK", True))
+        logger.warning("[BOARD RETRY] patched final_entry_safety_guard board fetch with side/source hard_block=%s signature=v16 rest_direct=%s", _env_bool("ENTRY_BOARD_MISSING_HARD_BLOCK", True), _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", True))
         return True
     except Exception:
         logger.exception("[BOARD RETRY] final_entry_safety_guard side-aware board patch failed")
@@ -315,17 +448,15 @@ def _ma5_opening_missing_only(ret: Any) -> bool:
         details = detail.get("details") or {}
         min_rows = max(1, _env_int("ENTRY_MA5_BREAKOUT_OPENING_MIN_ROWS", 2))
         for tf_detail in details.values():
-            if not isinstance(tf_detail, dict):
-                continue
-            if tf_detail.get("reason") == "not_enough_rows" and int(tf_detail.get("rows") or 0) < min_rows:
+            if isinstance(tf_detail, dict) and tf_detail.get("reason") == "not_enough_rows" and int(tf_detail.get("rows") or 0) < min_rows:
                 return True
-        return False
     except Exception:
-        return False
+        pass
+    return False
 
 
 def _wrap_opening_ma5_relax(fn, label: str):
-    if not callable(fn) or getattr(fn, "_ma5_opening_relax_v15", False):
+    if not callable(fn) or getattr(fn, "_ma5_opening_relax_v16", False):
         return fn
 
     def _wrapped(*args, **kwargs):
@@ -335,6 +466,7 @@ def _wrap_opening_ma5_relax(fn, label: str):
             return None
         return ret
 
+    _wrapped._ma5_opening_relax_v16 = True  # type: ignore[attr-defined]
     _wrapped._ma5_opening_relax_v15 = True  # type: ignore[attr-defined]
     _wrapped._original = fn  # type: ignore[attr-defined]
     return _wrapped
@@ -377,7 +509,7 @@ def _install_daily_src_duplicate_cleanup() -> bool:
         import pandas as pd
         import trading.summary.controller_utils as cu
         old = getattr(cu, "sanitize_df", None)
-        if not callable(old) or getattr(old, "_daily_src_cleanup_v15", False):
+        if not callable(old) or getattr(old, "_daily_src_cleanup_v16", False):
             _DAILY_DUP_PATCHED = True
             return True
 
@@ -391,6 +523,7 @@ def _install_daily_src_duplicate_cleanup() -> bool:
                 pass
             return old(df)
 
+        _sanitize_df_daily_cleanup._daily_src_cleanup_v16 = True  # type: ignore[attr-defined]
         _sanitize_df_daily_cleanup._daily_src_cleanup_v15 = True  # type: ignore[attr-defined]
         _sanitize_df_daily_cleanup._original = old  # type: ignore[attr-defined]
         cu.sanitize_df = _sanitize_df_daily_cleanup
@@ -404,12 +537,14 @@ def _install_daily_src_duplicate_cleanup() -> bool:
 
 def install() -> bool:
     global _PATCHED
-    # 安全側の既定値。ユーザーが明示的に0にしない限り、板なしエントリーは禁止。
     os.environ.setdefault("ENTRY_BOARD_MISSING_HARD_BLOCK", "1")
     os.environ.setdefault("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", "0")
     os.environ.setdefault("ENTRY_FINAL_BOARD_RETRY_COUNT", "0")
     os.environ.setdefault("ENTRY_FINAL_BOARD_RETRY_EXTRA_COUNT", "1")
     os.environ.setdefault("ENTRY_FINAL_BOARD_RETRY_EXTRA_WAIT_SEC", "0.2")
+    os.environ.setdefault("ENTRY_BOARD_REST_DIRECT_ENABLED", "1")
+    os.environ.setdefault("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", "1.5")
+    os.environ.setdefault("ENTRY_BOARD_REST_EXCHANGES", "1")
 
     if not _env_bool("ENTRY_BOARD_RETRY_ENABLED", True):
         logger.warning("[BOARD RETRY] disabled by env")
@@ -426,7 +561,7 @@ def install() -> bool:
         if callable(orig):
             utils_common.get_latest_bid_ask = _wrap_get_latest_bid_ask(orig)
             ok_any = True
-            logger.warning("[BOARD RETRY] patched utils_common.get_latest_bid_ask")
+            logger.warning("[BOARD RETRY] patched utils_common.get_latest_bid_ask v16 rest_direct=%s", _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", True))
     except Exception:
         logger.exception("[BOARD RETRY] patch utils_common failed")
 
@@ -451,7 +586,7 @@ def install() -> bool:
 
     _PATCHED = bool(ok_any or side_ok or ma5_ok or dup_ok)
     logger.warning(
-        "[BOARD RETRY] installed=%s enabled=%s wait_sec=%.2f retry_count=%s extra_wait=%.2f extra_count=%s final_retry=%s/%s only_pending=%s side_patch=%s ma5_opening_relax=%s daily_dup_cleanup=%s board_hard_block=%s allow_without_board=%s",
+        "[BOARD RETRY] installed=%s version=v16 enabled=%s wait_sec=%.2f retry_count=%s extra_wait=%.2f extra_count=%s final_retry=%s/%s only_pending=%s side_patch=%s ma5_opening_relax=%s daily_dup_cleanup=%s board_hard_block=%s allow_without_board=%s rest_direct=%s rest_exchanges=%s",
         _PATCHED,
         _env_bool("ENTRY_BOARD_RETRY_ENABLED", True),
         wait_sec,
@@ -466,6 +601,8 @@ def install() -> bool:
         dup_ok,
         _env_bool("ENTRY_BOARD_MISSING_HARD_BLOCK", True),
         _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", False),
+        _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", True),
+        os.getenv("ENTRY_BOARD_REST_EXCHANGES", "1"),
     )
     return _PATCHED
 
