@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/oneshot_limit_700k_patch.py
-# Version: Ver24-ENTRY-FRESH-QUOTE-GUARD
+# Version: Ver25-ENTRY-BUDGET-700K-ENV-OVERRIDE
 # ------------------------------------------------------------
 # 起動時 runtime patches:
 # - PUSH bootstrap fast restore: 起動時PUSH DB復元を軽量化
@@ -20,6 +20,13 @@
 # - ENTRY pipeline bucket prefilter: interval/source違いpendingを事前除外
 # - SUMMARY_ENTRY duplicate pending を registered 扱いにする
 # - EXIT 利益保護 / 板対応
+#
+# Ver25:
+# - settings.ini の [trade]/[ENTRY] が 500,000 円のままでも、ユーザー方針の
+#   1銘柄70万円を runtime ENV で優先する。
+# - entry_budget._cfg は ENV を settings.ini より優先するため、
+#   ENTRY_LOW_PRICE_ONESHOT_YEN / ENTRY_HIGH_PRICE_ONESHOT_YEN / MAX_ENTRY_ONESHOT_YEN
+#   を起動時に 700000 へ補正する。
 # ============================================================
 
 from __future__ import annotations
@@ -49,6 +56,35 @@ def _env_int(name: str, default: int) -> int:
         return int(float(v))
     except Exception:
         return int(default)
+
+
+def _install_entry_budget_700k_env_override() -> bool:
+    """1銘柄70万円を entry_budget のENV優先経路へ注入する。"""
+    try:
+        # 既に明示ENV指定がある場合は尊重する。settings.ini の古い50万円だけを上書きする目的。
+        os.environ.setdefault("MAX_ENTRY_ONESHOT_YEN", "700000")
+        os.environ.setdefault("ENTRY_LOW_PRICE_ONESHOT_YEN", "700000")
+        os.environ.setdefault("ENTRY_HIGH_PRICE_ONESHOT_YEN", "700000")
+        os.environ.setdefault("ENTRY_MAX_PRICE", "7000")
+        os.environ.setdefault("ORDER_LOT_SIZE", "100")
+        os.environ.setdefault("ENTRY_AFFORDABILITY_FILTER_ENABLED", "1")
+        logger.warning(
+            "[ONESHOT LIMIT PATCH] entry budget env ensured max=%s low=%s high=%s max_price=%s lot=%s",
+            os.getenv("MAX_ENTRY_ONESHOT_YEN"),
+            os.getenv("ENTRY_LOW_PRICE_ONESHOT_YEN"),
+            os.getenv("ENTRY_HIGH_PRICE_ONESHOT_YEN"),
+            os.getenv("ENTRY_MAX_PRICE"),
+            os.getenv("ORDER_LOT_SIZE"),
+        )
+        try:
+            from trading.entry.entry_budget import log_entry_budget_config
+            log_entry_budget_config(prefix="[ENTRY AFFORDABILITY PATCH]")
+        except Exception:
+            logger.debug("[ONESHOT LIMIT PATCH] entry budget config log skipped", exc_info=True)
+        return True
+    except Exception:
+        logger.exception("[ONESHOT LIMIT PATCH] entry budget env override failed")
+        return False
 
 
 def _install_push_bootstrap_fast_restore_patch() -> bool:
@@ -355,6 +391,8 @@ def install() -> bool:
     if _INSTALLED:
         return True
 
+    ok_budget_700k = _install_entry_budget_700k_env_override()
+
     ok_push_fast_restore = _install_push_bootstrap_fast_restore_patch()
     ok_stale_db_cleanup = _install_open_position_stale_db_cleanup_patch()
     ok_open_pos_throttle = _install_open_position_sync_throttle_patch()
@@ -392,7 +430,8 @@ def install() -> bool:
     ok_sell_credit_prefilter = _install_summary_ai_sell_credit_prefilter_patch()
 
     _INSTALLED = bool(
-        ok_push_fast_restore
+        ok_budget_700k
+        or ok_push_fast_restore
         or ok_stale_db_cleanup
         or ok_open_pos_throttle
         or ok_fresh_quote
