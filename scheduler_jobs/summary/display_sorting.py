@@ -5,14 +5,13 @@
 #   - header helper
 #   - TOP10表示前の対象外フィルタ
 # ------------------------------------------------------------
-# Version: Ver1.3-PRODUCTION-DISPLAY-PRICE-CAP
+# Version: Ver1.4-TOP10-SCORE-ONLY-DISPLAY-GUARD
 # ------------------------------------------------------------
-# ✔ BUY TOP10 は buy_score / score_buy が正の銘柄だけ表示
-# ✔ SELL TOP10 は sell_score / score_sell が正の銘柄だけ表示
-# ✔ score_buy=0 の SELL 銘柄が BUY TOP10 に混ざる問題を修正
-# ✔ score_sell=0 の BUY 銘柄が SELL TOP10 に混ざる問題を修正
-# ✔ slope 環境変数を緩めても BUY/SELL の銘柄が同じにならない
-# ✔ 表示・AI候補の価格上限を ENTRY / TRADE_UNIVERSE と共通化
+# ✔ BUY TOP10 は価格範囲 + buy_score > 0 で表示
+# ✔ SELL TOP10 は価格範囲 + sell_score > 0 で表示
+# ✔ slope条件は表示TOP10では使わない
+# ✔ AI BUY / AI SELL は従来どおり AI通過フラグも見る
+# ✔ エントリー判定は変更しない。表示専用の緩和。
 # ============================================================
 
 from __future__ import annotations
@@ -50,12 +49,19 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
-def _resolve_min_price() -> float:
-    """
-    表示・候補共通の最低株価。
+def _env_bool(name: str, default: bool) -> bool:
+    try:
+        raw = str(os.getenv(name, "")).strip().lower()
+        if raw in {"1", "true", "yes", "on", "enable", "enabled"}:
+            return True
+        if raw in {"0", "false", "no", "off", "disable", "disabled"}:
+            return False
+    except Exception:
+        pass
+    return bool(default)
 
-    close <= 200 を対象外にするため、判定は close > min_price。
-    """
+
+def _resolve_min_price() -> float:
     for name in (
         "SUMMARY_DISPLAY_MIN_PRICE",
         "TRADE_UNIVERSE_MIN_PRICE",
@@ -65,18 +71,10 @@ def _resolve_min_price() -> float:
         v = os.getenv(name)
         if v is not None and str(v).strip() != "":
             return _env_float(name, DEFAULT_DISPLAY_MIN_PRICE)
-
     return float(DEFAULT_DISPLAY_MIN_PRICE)
 
 
 def _resolve_max_price() -> float:
-    """
-    表示・AI候補共通の最高株価。
-
-    エントリー側の上限とズレると、発注対象外の高価格銘柄が
-    SUMMARY TOP10 / AI PASSED に表示されるため、ここでも同じ上限を使う。
-    0 以下を指定した場合だけ上限無効として扱う。
-    """
     for name in (
         "SUMMARY_DISPLAY_MAX_PRICE",
         "TRADE_UNIVERSE_MAX_PRICE",
@@ -86,39 +84,26 @@ def _resolve_max_price() -> float:
         v = os.getenv(name)
         if v is not None and str(v).strip() != "":
             return _env_float(name, DEFAULT_DISPLAY_MAX_PRICE)
-
     return float(DEFAULT_DISPLAY_MAX_PRICE)
 
 
 def _resolve_min_buy_slope() -> float:
-    """
-    BUY対象の最低slope。
-    環境変数で緩められても、BUY/SELL分離は score_buy 側で担保する。
-    """
     v1 = os.getenv("SUMMARY_DISPLAY_MIN_BUY_SLOPE")
     if v1 is not None and str(v1).strip() != "":
         return _env_float("SUMMARY_DISPLAY_MIN_BUY_SLOPE", DEFAULT_DISPLAY_MIN_BUY_SLOPE)
-
     v2 = os.getenv("ENTRY_MIN_BUY_SLOPE")
     if v2 is not None and str(v2).strip() != "":
         return _env_float("ENTRY_MIN_BUY_SLOPE", DEFAULT_DISPLAY_MIN_BUY_SLOPE)
-
     return float(DEFAULT_DISPLAY_MIN_BUY_SLOPE)
 
 
 def _resolve_max_sell_slope() -> float:
-    """
-    SELL対象の最大slope。
-    環境変数で緩められても、BUY/SELL分離は score_sell 側で担保する。
-    """
     v1 = os.getenv("SUMMARY_DISPLAY_MAX_SELL_SLOPE")
     if v1 is not None and str(v1).strip() != "":
         return _env_float("SUMMARY_DISPLAY_MAX_SELL_SLOPE", DEFAULT_DISPLAY_MAX_SELL_SLOPE)
-
     v2 = os.getenv("ENTRY_MAX_SELL_SLOPE")
     if v2 is not None and str(v2).strip() != "":
         return _env_float("ENTRY_MAX_SELL_SLOPE", DEFAULT_DISPLAY_MAX_SELL_SLOPE)
-
     return float(DEFAULT_DISPLAY_MAX_SELL_SLOPE)
 
 
@@ -128,6 +113,16 @@ def _resolve_min_buy_score() -> float:
 
 def _resolve_min_sell_score() -> float:
     return _env_float("SUMMARY_DISPLAY_MIN_SELL_SCORE", DEFAULT_DISPLAY_MIN_SELL_SCORE)
+
+
+def _top10_slope_filter_enabled() -> bool:
+    """TOP10表示だけのslope条件。既定OFF。
+
+    エントリー判定は別ロジックで行う。ここは状態確認用のTOP10なので、
+    score_buy / score_sell が出ている銘柄をまず見せる。
+    旧挙動へ戻したい場合だけ SUMMARY_DISPLAY_TOP10_REQUIRE_SLOPE=1。
+    """
+    return _env_bool("SUMMARY_DISPLAY_TOP10_REQUIRE_SLOPE", False)
 
 
 def _num(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
@@ -167,10 +162,6 @@ def _select_slope_series(df: pd.DataFrame) -> pd.Series:
 
 
 def _select_buy_score_series(df: pd.DataFrame) -> pd.Series:
-    """
-    BUY表示に使う実スコア。
-    display_normalizer 後は disp_buy_score を優先する。
-    """
     for c in (
         "disp_buy_score",
         "buy_score",
@@ -183,10 +174,6 @@ def _select_buy_score_series(df: pd.DataFrame) -> pd.Series:
 
 
 def _select_sell_score_series(df: pd.DataFrame) -> pd.Series:
-    """
-    SELL表示に使う実スコア。
-    display_normalizer 後は disp_sell_score を優先する。
-    """
     for c in (
         "disp_sell_score",
         "sell_score",
@@ -194,7 +181,7 @@ def _select_sell_score_series(df: pd.DataFrame) -> pd.Series:
         "ai_sell_score",
     ):
         if c in df.columns:
-            return _num(df, c, 0.0)
+            return _num(df, c, 0.0).abs()
     return pd.Series(0.0, index=df.index, dtype="float64")
 
 
@@ -212,27 +199,23 @@ def _price_condition_text(min_price: float, max_price: float) -> str:
 
 
 def _apply_buy_display_guard(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    BUY TOP10 / AI BUY 表示前フィルタ。
+    """BUY TOP10 / AI BUY 表示前フィルタ。
 
-    条件:
+    既定条件:
       min_price < close <= max_price
-      slope > min_buy_slope
-      buy_score > 0
+      buy_score > min_buy_score
 
-    重要:
-      slope条件を環境変数で -999 まで緩めても、buy_score=0 の
-      SELL銘柄はBUY TOP10に入れない。
+    slope条件は表示TOP10では既定OFF。
     """
     if df is None or df.empty:
         return df
 
     out = df.copy()
-
     min_price = _resolve_min_price()
     max_price = _resolve_max_price()
     min_slope = _resolve_min_buy_slope()
     min_buy_score = _resolve_min_buy_score()
+    require_slope = _top10_slope_filter_enabled()
 
     price_s = _select_price_series(out)
     slope_s = _select_slope_series(out)
@@ -240,51 +223,51 @@ def _apply_buy_display_guard(df: pd.DataFrame) -> pd.DataFrame:
 
     before = len(out)
     price_mask = _apply_price_cap(price_s, min_price, max_price)
+    score_mask = buy_s > float(min_buy_score)
+    slope_mask = slope_s > float(min_slope)
 
-    out = out[
-        price_mask
-        & (slope_s > float(min_slope))
-        & (buy_s > float(min_buy_score))
-    ].copy()
+    keep_mask = price_mask & score_mask
+    if require_slope:
+        keep_mask &= slope_mask
+
+    out = out[keep_mask].copy()
 
     logger.info(
-        "[SUMMARY DISPLAY SORTING] BUY guard condition='%s and slope > %.4f and buy_score > %.6f' "
-        "before=%s after=%s skipped=%s price_ok=%s buy_score_nonzero=%s",
+        "[SUMMARY DISPLAY SORTING] BUY guard condition='%s and buy_score > %.6f%s' "
+        "before=%s after=%s skipped=%s price_ok=%s buy_score_nonzero=%s slope_ok=%s slope_required=%s",
         _price_condition_text(min_price, max_price),
-        float(min_slope),
         float(min_buy_score),
+        f" and slope > {float(min_slope):.4f}" if require_slope else "",
         before,
         len(out),
         before - len(out),
         int(price_mask.sum()),
-        int((buy_s > float(min_buy_score)).sum()),
+        int(score_mask.sum()),
+        int(slope_mask.sum()),
+        require_slope,
     )
 
     return out.reset_index(drop=True)
 
 
 def _apply_sell_display_guard(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    SELL TOP10 / AI SELL 表示前フィルタ。
+    """SELL TOP10 / AI SELL 表示前フィルタ。
 
-    条件:
+    既定条件:
       min_price < close <= max_price
-      slope < max_sell_slope
-      sell_score > 0
+      sell_score > min_sell_score
 
-    重要:
-      slope条件を環境変数で 999 まで緩めても、sell_score=0 の
-      BUY銘柄はSELL TOP10に入れない。
+    slope条件は表示TOP10では既定OFF。
     """
     if df is None or df.empty:
         return df
 
     out = df.copy()
-
     min_price = _resolve_min_price()
     max_price = _resolve_max_price()
     max_slope = _resolve_max_sell_slope()
     min_sell_score = _resolve_min_sell_score()
+    require_slope = _top10_slope_filter_enabled()
 
     price_s = _select_price_series(out)
     slope_s = _select_slope_series(out)
@@ -292,24 +275,28 @@ def _apply_sell_display_guard(df: pd.DataFrame) -> pd.DataFrame:
 
     before = len(out)
     price_mask = _apply_price_cap(price_s, min_price, max_price)
+    score_mask = sell_s > float(min_sell_score)
+    slope_mask = slope_s < float(max_slope)
 
-    out = out[
-        price_mask
-        & (slope_s < float(max_slope))
-        & (sell_s > float(min_sell_score))
-    ].copy()
+    keep_mask = price_mask & score_mask
+    if require_slope:
+        keep_mask &= slope_mask
+
+    out = out[keep_mask].copy()
 
     logger.info(
-        "[SUMMARY DISPLAY SORTING] SELL guard condition='%s and slope < %.4f and sell_score > %.6f' "
-        "before=%s after=%s skipped=%s price_ok=%s sell_score_nonzero=%s",
+        "[SUMMARY DISPLAY SORTING] SELL guard condition='%s and sell_score > %.6f%s' "
+        "before=%s after=%s skipped=%s price_ok=%s sell_score_nonzero=%s slope_ok=%s slope_required=%s",
         _price_condition_text(min_price, max_price),
-        float(max_slope),
         float(min_sell_score),
+        f" and slope < {float(max_slope):.4f}" if require_slope else "",
         before,
         len(out),
         before - len(out),
         int(price_mask.sum()),
-        int((sell_s > float(min_sell_score)).sum()),
+        int(score_mask.sum()),
+        int(slope_mask.sum()),
+        require_slope,
     )
 
     return out.reset_index(drop=True)
@@ -329,7 +316,6 @@ def latest_header_text(df: pd.DataFrame, title_label: str) -> str | None:
             if c in df.columns:
                 dt_col = c
                 break
-
         if dt_col is None:
             return None
 
@@ -365,15 +351,7 @@ def build_header_context(df: pd.DataFrame, interval_label: str) -> str:
 # ============================================================
 
 def prepare_buy_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    BUY TOP10用。
-
-    重要:
-      TOP10抽出前に対象外を除外する。
-      close <= min_price は除外。
-      close > max_price は除外。
-      buy_score <= 0 は除外。
-    """
+    """BUY TOP10用。価格範囲 + buy_score 正で抽出し、スコア順に並べる。"""
     df = dedupe_one_row_per_symbol(df)
     if df.empty:
         return df
@@ -391,15 +369,7 @@ def prepare_buy_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    SELL TOP10用。
-
-    重要:
-      TOP10抽出前に対象外を除外する。
-      close <= min_price は除外。
-      close > max_price は除外。
-      sell_score <= 0 は除外。
-    """
+    """SELL TOP10用。価格範囲 + sell_score 正で抽出し、スコア順に並べる。"""
     df = dedupe_one_row_per_symbol(df)
     if df.empty:
         return df
@@ -443,15 +413,6 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 
 def prepare_ai_buy_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    AI BUY通過表示用。
-
-    AI通過済みでも、
-      close <= min_price
-      close > max_price
-      buy_score <= 0
-    は表示対象外。
-    """
     out = prepare_buy_df(df)
     if out.empty:
         return out
@@ -462,15 +423,6 @@ def prepare_ai_buy_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def prepare_ai_sell_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    AI SELL通過表示用。
-
-    AI通過済みでも、
-      close <= min_price
-      close > max_price
-      sell_score <= 0
-    は表示対象外。
-    """
     out = prepare_sell_df(df)
     if out.empty:
         return out
@@ -481,10 +433,6 @@ def prepare_ai_sell_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def prepare_ai_exit_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    AI EXIT は保有銘柄の決済判定なので、
-    価格・slope・buy/sellスコアフィルタはかけない。
-    """
     df = dedupe_one_row_per_symbol(df)
     if df.empty:
         return df
