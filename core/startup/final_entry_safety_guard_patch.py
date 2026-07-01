@@ -1,11 +1,12 @@
 # ============================================================
 # File   : core/startup/final_entry_safety_guard_patch.py
-# Version: Ver10-TRUE-ORIGINAL-BOARD-QUIET
+# Version: Ver11-BOARD-GUARD-SIGNATURE-TOLERANT
 # ------------------------------------------------------------
 # 発注直前の安全ガード。
-# Ver10:
-#   - timeout guard / 他runtime patch の wrapper を original として保存しない
-#   - 板API連打を避けるため、REST補完は既定OFF・1銘柄1回・cooldown制御
+# Ver11:
+#   - _board_guard が他パッチにより 3引数版へ差し替わっても落とさない
+#   - _call_board_guard で 4引数/3引数/2引数/1引数を順に試す
+#   - TypeError を board_missing 扱いにしない
 #   - board_missing は pending を残して次サイクル再試行
 # ============================================================
 from __future__ import annotations
@@ -57,16 +58,6 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        raw = os.getenv(name)
-        if raw is None or str(raw).strip() == "":
-            return int(default)
-        return int(float(str(raw).replace(",", "")))
-    except Exception:
-        return int(default)
-
-
 def _env_str(name: str, default: str) -> str:
     try:
         raw = os.getenv(name)
@@ -93,7 +84,7 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
         if v is None or str(v).strip() == "":
             return float(default)
-        return float(v)
+        return float(str(v).replace(",", ""))
     except Exception:
         return float(default)
 
@@ -172,7 +163,13 @@ def _log_ng(reason: str, symbol: str, side: str, **detail) -> None:
 def _mark_skip(item: dict, reason: str, **detail) -> None:
     try:
         retryable = bool(detail.pop("retryable", False)) or reason == "board_missing"
-        for root in (item, item.get("entry") if isinstance(item.get("entry"), dict) else None, item.get("entry_row") if isinstance(item.get("entry_row"), dict) else None, item.get("ai") if isinstance(item.get("ai"), dict) else None):
+        roots = (
+            item,
+            item.get("entry") if isinstance(item.get("entry"), dict) else None,
+            item.get("entry_row") if isinstance(item.get("entry_row"), dict) else None,
+            item.get("ai") if isinstance(item.get("ai"), dict) else None,
+        )
+        for root in roots:
             if isinstance(root, dict):
                 root["skip_reason"] = reason
                 root["final_guard_skip_reason"] = reason
@@ -293,7 +290,6 @@ def _try_get_bid_ask_from_api(symbol: str) -> tuple[float, float, float, float]:
             logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_API_OK symbol=%s bid=%.4f ask=%.4f", symbol, bid, ask)
             return bid, ask, bid_qty, ask_qty
     except Exception as e:
-        # 429/4002006系は下位で例外文字列になることがあるため、短時間停止する。
         msg = repr(e)
         if "429" in msg or "4001006" in msg or "4002006" in msg or "API実行回数" in msg or "レジスト数" in msg:
             _BOARD_COOLDOWN_UNTIL = time.time() + max(10.0, _env_float("ENTRY_BOARD_API_ERROR_COOLDOWN_SEC", 60.0))
@@ -312,7 +308,13 @@ def _board_missing_fallback_ok(row: dict, item: dict, symbol: str, side: str) ->
     if turnover <= 0 and close > 0 and volume > 0:
         turnover = close * volume
     score = abs(_safe_float(_first(row, ("score", "score_total", "final_score", "display_score", "score_sell", "score_buy"), 0.0), 0.0))
-    if close < _env_float("ENTRY_ALLOW_WITHOUT_BOARD_MIN_PRICE", 200.0) or volume < _env_float("ENTRY_ALLOW_WITHOUT_BOARD_MIN_VOLUME", 30000.0) or turnover < _env_float("ENTRY_ALLOW_WITHOUT_BOARD_MIN_TURNOVER", 10000000.0) or score < _env_float("ENTRY_ALLOW_WITHOUT_BOARD_MIN_SCORE", 0.90):
+    if close < _env_float("ENTRY_ALLOW_WITHOUT_BOARD_MIN_PRICE", 200.0):
+        return False
+    if volume < _env_float("ENTRY_ALLOW_WITHOUT_BOARD_MIN_VOLUME", 30000.0):
+        return False
+    if turnover < _env_float("ENTRY_ALLOW_WITHOUT_BOARD_MIN_TURNOVER", 10000000.0):
+        return False
+    if score < _env_float("ENTRY_ALLOW_WITHOUT_BOARD_MIN_SCORE", 0.90):
         return False
     logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_MISSING_ALLOW_PROTECTED symbol=%s side=%s", symbol, side)
     return True
@@ -356,11 +358,36 @@ def _patched_board_guard(*args, **kwargs) -> bool:
 
 
 def _call_board_guard(row: dict, item: dict, symbol: str, side: str) -> bool:
-    try:
-        return bool(_board_guard(row, item, symbol, side))
-    except Exception as e:
-        logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_GUARD_ERROR symbol=%s side=%s error=%s", symbol, side, e)
-        return _board_missing_fallback_ok(row, item, symbol, side)
+    """Call _board_guard even if another startup patch replaced it with an older 3-arg function."""
+    guard = _board_guard
+    attempts = (
+        (row, item, symbol, side),
+        (row, symbol, side),
+        (row, item, symbol),
+        (row, item),
+        (row,),
+    )
+    last_type_error: TypeError | None = None
+    for args in attempts:
+        try:
+            ok = bool(guard(*args))
+            if args != attempts[0]:
+                logger.warning(
+                    "[FINAL ENTRY SAFETY GUARD] BOARD_GUARD_SIGNATURE_COMPAT symbol=%s side=%s argc=%s ok=%s",
+                    symbol,
+                    side,
+                    len(args),
+                    ok,
+                )
+            return ok
+        except TypeError as e:
+            last_type_error = e
+            continue
+        except Exception as e:
+            logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_GUARD_ERROR symbol=%s side=%s error=%s", symbol, side, e)
+            return _board_missing_fallback_ok(row, item, symbol, side)
+    logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_GUARD_SIGNATURE_ERROR symbol=%s side=%s error=%s", symbol, side, last_type_error)
+    return _board_missing_fallback_ok(row, item, symbol, side)
 
 
 def _guard_fail(item: dict, symbol: str, reason: str, *, pop: bool = False, **detail) -> bool:
@@ -416,7 +443,7 @@ def _is_currently_wrapped() -> bool:
     try:
         import trading.handlers.entry_controller as ec
         cur = getattr(ec, "_execute_best_candidate", None)
-        return bool(getattr(cur, "_final_entry_safety_guard_v10", False))
+        return bool(getattr(cur, "_final_entry_safety_guard_v11", False))
     except Exception:
         return False
 
@@ -432,17 +459,24 @@ def install() -> bool:
         if not callable(old):
             logger.error("[FINAL ENTRY SAFETY GUARD] target _execute_best_candidate unavailable")
             return False
-        if getattr(old, "_final_entry_safety_guard_v10", False):
+        if getattr(old, "_final_entry_safety_guard_v11", False):
             _INSTALLED = True
             return True
         _ORIG_EXECUTE_BEST_CANDIDATE = _unwrap_true_original(old)
         _patched_execute_best_candidate._final_entry_safety_guard = True  # type: ignore[attr-defined]
         _patched_execute_best_candidate._final_entry_safety_guard_v10 = True  # type: ignore[attr-defined]
+        _patched_execute_best_candidate._final_entry_safety_guard_v11 = True  # type: ignore[attr-defined]
         _patched_execute_best_candidate._final_entry_safety_guard_original = _ORIG_EXECUTE_BEST_CANDIDATE  # type: ignore[attr-defined]
         _patched_execute_best_candidate._original_execute_best_candidate = _ORIG_EXECUTE_BEST_CANDIDATE  # type: ignore[attr-defined]
         ec._execute_best_candidate = _patched_execute_best_candidate
         _INSTALLED = True
-        logger.warning("[FINAL ENTRY SAFETY GUARD] installed v10 original=%s board_api=%s rest_direct=%s allow_without_board=%s", getattr(_ORIG_EXECUTE_BEST_CANDIDATE, "__name__", repr(_ORIG_EXECUTE_BEST_CANDIDATE)), _env_bool("ENTRY_BOARD_API_LOOKUP_ENABLED", False), _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", False), _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", False))
+        logger.warning(
+            "[FINAL ENTRY SAFETY GUARD] installed v11 original=%s board_api=%s rest_direct=%s allow_without_board=%s signature_tolerant=True",
+            getattr(_ORIG_EXECUTE_BEST_CANDIDATE, "__name__", repr(_ORIG_EXECUTE_BEST_CANDIDATE)),
+            _env_bool("ENTRY_BOARD_API_LOOKUP_ENABLED", False),
+            _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", False),
+            _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", False),
+        )
         return True
     except Exception:
         logger.exception("[FINAL ENTRY SAFETY GUARD] install failed")
@@ -453,5 +487,6 @@ try:
     install()
 except Exception:
     logger.exception("[FINAL ENTRY SAFETY GUARD] auto install failed")
+
 
 __all__ = ["install", "_board_guard", "_patched_board_guard", "_call_board_guard"]
