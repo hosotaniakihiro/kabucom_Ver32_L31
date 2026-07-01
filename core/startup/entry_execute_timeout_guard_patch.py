@@ -1,8 +1,16 @@
 # ============================================================
 # File   : core/startup/entry_execute_timeout_guard_patch.py
-# Version: V2-ENTRY-EXECUTE-TIMEOUT-AND-SUMMARY-AI-AGE-GUARD
+# Version: V3-REENTRANT-INFLIGHT-SAFE
 # ------------------------------------------------------------
 # SUMMARY_AI は足 datetime ではなく created_at / updated_at を優先して stale 判定する。
+#
+# V3:
+#   - _execute_best_candidate が複数runtime patchで多重wrapされている場合、
+#     outer timeout guard が同じ symbol/side を inflight 登録した直後に、
+#     inner wrapper が同じ symbol/side を再実行し、INFLIGHT_DUPLICATE_SKIP で
+#     自己ブロックする問題を修正。
+#   - timeout runner thread 内の再入呼び出しは duplicate とみなさず、
+#     original chain を直接進める。
 # ============================================================
 from __future__ import annotations
 
@@ -20,6 +28,7 @@ _WATCHER_STARTED = False
 _ORIGINALS: dict[int, Callable[..., Any]] = {}
 _INFLIGHT: dict[tuple[str, str], dict[str, Any]] = {}
 _INFLIGHT_LOCK = threading.RLock()
+_LOCAL = threading.local()
 _TRUE_SET = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 _FALSE_SET = {"0", "false", "no", "n", "off", "ng", "disable", "disabled", ""}
 
@@ -154,11 +163,13 @@ def _prune_pending_for_symbol(symbol: str, side: str, reason: str) -> int:
     try:
         from trading.entry import pending_manager
         side_u = _norm_side(side)
+
         def pred(sym: str, entry: dict[str, Any]) -> bool:
             if _norm_symbol(sym) != symbol:
                 return False
             e_side = _norm_side(entry.get("side") or entry.get("entry_decision") or entry.get("ai_side"))
             return not e_side or e_side == side_u
+
         return int(pending_manager.prune_entries(pred, reason=reason))
     except Exception:
         logger.exception("[ENTRY EXEC TIMEOUT GUARD] pending prune failed symbol=%s side=%s reason=%s", symbol, side, reason)
@@ -195,11 +206,23 @@ def _cleanup_inflight() -> None:
                 _INFLIGHT.pop(key, None)
 
 
+def _call_original_direct(orig: Callable[..., Any], item: dict[str, Any], boost_active: bool, symbol: str, side: str, reason: str) -> bool:
+    try:
+        logger.warning("[ENTRY EXEC TIMEOUT GUARD] REENTRANT_DIRECT_CALL symbol=%s side=%s reason=%s", symbol, side, reason)
+        return bool(orig(item, boost_active))
+    except Exception as exc:
+        logger.warning("[ENTRY EXEC TIMEOUT GUARD] REENTRANT_ORIG_ERROR_RETURN_FALSE symbol=%s side=%s error=%r", symbol, side, exc)
+        return False
+
+
 def _call_with_timeout(orig: Callable[..., Any], item: dict[str, Any], boost_active: bool, symbol: str, side: str) -> bool:
     timeout = max(0.5, _env_float("ENTRY_EXECUTE_ORIG_TIMEOUT_SEC", 8.0))
     q: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
     key = (symbol, side)
+
     def runner() -> None:
+        prev = bool(getattr(_LOCAL, "inside_timeout_runner", False))
+        _LOCAL.inside_timeout_runner = True
         try:
             q.put_nowait(("ok", bool(orig(item, boost_active))))
         except Exception as exc:
@@ -208,19 +231,25 @@ def _call_with_timeout(orig: Callable[..., Any], item: dict[str, Any], boost_act
             except Exception:
                 pass
         finally:
+            _LOCAL.inside_timeout_runner = prev
             with _INFLIGHT_LOCK:
                 info = _INFLIGHT.get(key)
                 if isinstance(info, dict):
                     info["done"] = True
                     info["finished"] = time.time()
+
     with _INFLIGHT_LOCK:
         _cleanup_inflight()
         existing = _INFLIGHT.get(key)
         if isinstance(existing, dict) and not bool(existing.get("done")):
             age = time.time() - float(existing.get("started", time.time()))
+            if _env_bool("ENTRY_EXECUTE_ALLOW_REENTRANT_INFLIGHT", True) and bool(getattr(_LOCAL, "inside_timeout_runner", False)):
+                logger.warning("[ENTRY EXEC TIMEOUT GUARD] INFLIGHT_REENTRANT_ALLOW symbol=%s side=%s age=%.1fs timeout=%.1fs", symbol, side, age, timeout)
+                return _call_original_direct(orig, item, boost_active, symbol, side, "inflight_reentrant")
             logger.warning("[ENTRY EXEC TIMEOUT GUARD] INFLIGHT_DUPLICATE_SKIP symbol=%s side=%s age=%.1fs timeout=%.1fs", symbol, side, age, timeout)
             return False
         _INFLIGHT[key] = {"started": time.time(), "done": False, "thread": None}
+
     th = threading.Thread(target=runner, name=f"entry-execute-timeout-{symbol}-{side}", daemon=True)
     with _INFLIGHT_LOCK:
         if key in _INFLIGHT:
@@ -251,10 +280,11 @@ def _wrap_current() -> bool:
         cur = getattr(ec, "_execute_best_candidate", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_entry_execute_timeout_guard_v2", False):
+        if getattr(cur, "_entry_execute_timeout_guard_v3", False):
             return True
         orig = getattr(cur, "_entry_execute_timeout_guard_original", None) or cur
         _ORIGINALS[id(orig)] = orig
+
         def wrapped(item: dict, boost_active: bool) -> bool:
             try:
                 if not isinstance(item, dict):
@@ -266,6 +296,8 @@ def _wrap_current() -> bool:
                     return False
                 if not _candidate_stale_guard(item, row, symbol, side):
                     return False
+                if _env_bool("ENTRY_EXECUTE_ALLOW_REENTRANT_INFLIGHT", True) and bool(getattr(_LOCAL, "inside_timeout_runner", False)):
+                    return _call_original_direct(orig, item, boost_active, symbol, side, "wrapper_reentrant")
                 started = time.time()
                 ok = _call_with_timeout(orig, item, boost_active, symbol, side)
                 logger.warning("[ENTRY EXEC TIMEOUT GUARD] DONE symbol=%s side=%s ok=%s elapsed=%.3fs", symbol, side, ok, time.time() - started)
@@ -273,11 +305,19 @@ def _wrap_current() -> bool:
             except Exception:
                 logger.exception("[ENTRY EXEC TIMEOUT GUARD] wrapper failed")
                 return False
+
+        wrapped._entry_execute_timeout_guard_v3 = True  # type: ignore[attr-defined]
         wrapped._entry_execute_timeout_guard_v2 = True  # type: ignore[attr-defined]
         wrapped._entry_execute_timeout_guard_v1 = True  # type: ignore[attr-defined]
         wrapped._entry_execute_timeout_guard_original = orig  # type: ignore[attr-defined]
         ec._execute_best_candidate = wrapped
-        logger.warning("[ENTRY EXEC TIMEOUT GUARD] wrapped target=%s timeout=%.1fs stale_created=%.1fs stale_bar=%.1fs summary_ai_age_fix=True", getattr(orig, "__name__", repr(orig)), _env_float("ENTRY_EXECUTE_ORIG_TIMEOUT_SEC", 8.0), _env_float("ENTRY_EXECUTE_MAX_CANDIDATE_AGE_SEC", 90.0), _env_float("ENTRY_EXECUTE_MAX_BAR_AGE_SEC", 180.0))
+        logger.warning(
+            "[ENTRY EXEC TIMEOUT GUARD] wrapped target=%s timeout=%.1fs stale_created=%.1fs stale_bar=%.1fs summary_ai_age_fix=True reentrant_inflight=True",
+            getattr(orig, "__name__", repr(orig)),
+            _env_float("ENTRY_EXECUTE_ORIG_TIMEOUT_SEC", 8.0),
+            _env_float("ENTRY_EXECUTE_MAX_CANDIDATE_AGE_SEC", 90.0),
+            _env_float("ENTRY_EXECUTE_MAX_BAR_AGE_SEC", 180.0),
+        )
         return True
     except Exception:
         logger.exception("[ENTRY EXEC TIMEOUT GUARD] wrap failed")
@@ -308,7 +348,7 @@ def install() -> bool:
         _WATCHER_STARTED = True
         threading.Thread(target=_watcher_loop, name="entry-execute-timeout-guard-watcher", daemon=True).start()
         logger.warning("[ENTRY EXEC TIMEOUT GUARD] watcher started")
-    logger.warning("[ENTRY EXEC TIMEOUT GUARD] installed V2 ok=%s", ok)
+    logger.warning("[ENTRY EXEC TIMEOUT GUARD] installed V3 ok=%s", ok)
     return bool(ok)
 
 
