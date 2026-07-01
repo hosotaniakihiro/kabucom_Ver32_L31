@@ -1,15 +1,12 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_main_direct_push_force_patch.py
-# Version: V1-FORCE-MAIN-DIRECT-PUSH-1M
+# Version: V2-FORCE-MAIN-DIRECT-PUSH-1M-ROBUST-MEMORY
 # ------------------------------------------------------------
-# Purpose:
-#   Force main.py 1m summary tick to avoid heavy runner paths.
-#
-#   Some later runtime patches can re-wrap runner_core.job_summary after
-#   summary_main_1m_light_tick_patch is installed.  This patch re-applies a
-#   direct in-memory push_df 1m summary wrapper and starts a short watcher so
-#   the direct wrapper wins during startup.
+# Force main.py 1m summary tick to avoid heavy runner paths.
+# V2 uses summary_main_memory_latest_1m_patch._build_memory_1m_summary first.
+# If PUSH memory exists but direct build is empty, do not fall back to heavy
+# original paths by default.
 # ============================================================
 from __future__ import annotations
 
@@ -25,7 +22,7 @@ from typing import Any, Optional
 import pandas as pd
 
 logger = logging.getLogger(__name__)
-VERSION = "V1-FORCE-MAIN-DIRECT-PUSH-1M"
+VERSION = "V2-FORCE-MAIN-DIRECT-PUSH-1M-ROBUST-MEMORY"
 _PATCHED = False
 _WATCHER_STARTED = False
 _AI_EXECUTOR: ThreadPoolExecutor | None = None
@@ -39,9 +36,14 @@ def _env_bool(name: str, default: bool = False) -> bool:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
             return bool(default)
-        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
+            return False
     except Exception:
-        return bool(default)
+        pass
+    return bool(default)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -73,155 +75,33 @@ def _dt_key(now: Any) -> str:
     return now.strftime("%Y%m%d%H%M%S") if isinstance(now, dt.datetime) else str(now)
 
 
-def _first(df: pd.DataFrame, names: list[str]) -> str | None:
-    for n in names:
-        if n in df.columns:
-            return n
-    return None
-
-
-def _dt_series(s: Any) -> Any:
+def _raw_memory_rows() -> int:
     try:
-        return pd.to_datetime(s, errors="coerce", utc=True).dt.tz_convert("Asia/Tokyo").dt.tz_localize(None)
+        from core.startup.summary_main_memory_latest_1m_patch import _load_push_memory_df
+        df = _load_push_memory_df()
+        return len(df) if isinstance(df, pd.DataFrame) else 0
     except Exception:
-        try:
-            return pd.to_datetime(s, errors="coerce").dt.tz_localize(None)
-        except Exception:
-            return s
-
-
-def _num(df: pd.DataFrame, col: str | None, default: float = 0.0) -> pd.Series:
-    if col and col in df.columns:
-        return pd.to_numeric(df[col], errors="coerce").fillna(default)
-    return pd.Series(default, index=df.index, dtype="float64")
-
-
-def _get_push_df() -> pd.DataFrame:
-    try:
-        from global_state import global_data
-        for name in ("push_df", "PUSH_DF", "latest_push_df"):
-            obj = getattr(global_data, name, None)
-            if isinstance(obj, pd.DataFrame) and not obj.empty:
-                return obj.copy(deep=False)
-        for name in ("get_push_df", "get_latest_push_df"):
-            fn = getattr(global_data, name, None)
-            if callable(fn):
-                try:
-                    obj = fn()
-                    if isinstance(obj, pd.DataFrame) and not obj.empty:
-                        return obj.copy(deep=False)
-                except Exception:
-                    pass
-    except Exception:
-        logger.debug("[SUMMARY FORCE DIRECT 1M] push_df lookup failed", exc_info=True)
-    return pd.DataFrame()
+        return 0
 
 
 def _build_direct(now: dt.datetime) -> pd.DataFrame:
     t0 = time.perf_counter()
-    raw = _get_push_df()
-    if raw is None or raw.empty:
-        return pd.DataFrame()
     try:
-        x = raw.copy(deep=False)
-        symbol_col = _first(x, ["symbol", "Symbol", "code", "Code", "銘柄コード"])
-        price_col = _first(x, ["price", "current_price", "close", "close_price", "CurrentPrice", "現在値"])
-        dt_col = _first(x, ["datetime", "dt", "timestamp", "received_at", "time", "Time"])
-        if not symbol_col or not price_col or not dt_col:
-            logger.warning("[SUMMARY FORCE DIRECT 1M] missing cols symbol=%s price=%s datetime=%s cols=%s", symbol_col, price_col, dt_col, list(x.columns)[:80])
-            return pd.DataFrame()
-        x["symbol"] = x[symbol_col].astype(str).str.strip()
-        x["datetime"] = _dt_series(x[dt_col])
-        x["price"] = pd.to_numeric(x[price_col], errors="coerce")
-        x = x.dropna(subset=["symbol", "datetime", "price"])
-        x = x[x["symbol"].ne("") & (x["price"] > 0)]
-        if x.empty:
-            return pd.DataFrame()
-        cutoff = pd.Timestamp(now).tz_localize(None)
-        lookback = max(3, _env_int("SUMMARY_FORCE_DIRECT_LOOKBACK_MIN", 20))
-        x = x[(x["datetime"] <= cutoff + pd.Timedelta(seconds=59)) & (x["datetime"] >= cutoff - pd.Timedelta(minutes=lookback))]
-        if x.empty:
-            return pd.DataFrame()
-        symname_col = _first(x, ["symbolname", "symbol_name", "name", "SymbolName", "銘柄名"])
-        vol_col = _first(x, ["volume", "trading_volume", "latest_volume", "Volume", "出来高"])
-        value_col = _first(x, ["trading_value", "turnover", "TradingValue", "売買代金"])
-        x["symbolname"] = x[symname_col].astype(str) if symname_col else x["symbol"]
-        x["volume_src"] = _num(x, vol_col, 0.0)
-        x["trading_value_src"] = _num(x, value_col, 0.0)
-        x["slot"] = x["datetime"].dt.floor("1min")
-        x = x.sort_values(["symbol", "slot", "datetime"], kind="stable")
-        g = x.groupby(["symbol", "slot"], sort=False)
-        bars = pd.DataFrame({
-            "symbol": g["symbol"].last(),
-            "symbolname": g["symbolname"].last(),
-            "datetime": g["slot"].last(),
-            "open": g["price"].first(),
-            "high": g["price"].max(),
-            "low": g["price"].min(),
-            "close": g["price"].last(),
-            "tick_count": g["price"].size(),
-            "first_tick_at": g["datetime"].first(),
-            "last_tick_at": g["datetime"].last(),
-            "volume_src": g["volume_src"].max(),
-            "trading_value_src": g["trading_value_src"].max(),
-        }).reset_index(drop=True)
-        if bars.empty:
-            return pd.DataFrame()
-        bars = bars.sort_values(["symbol", "datetime"], kind="stable")
-        sg = bars.groupby("symbol", group_keys=False)
-        bars["volume"] = sg["volume_src"].diff().fillna(bars["volume_src"])
-        bars.loc[(bars["volume"] < 0) | bars["volume"].isna(), "volume"] = bars["volume_src"]
-        bars["trading_value"] = sg["trading_value_src"].diff().fillna(bars["trading_value_src"])
-        bars.loc[(bars["trading_value"] < 0) | bars["trading_value"].isna(), "trading_value"] = bars["trading_value_src"]
-        prev = sg["close"].shift(1)
-        bars["ma5"] = sg["close"].transform(lambda s: s.rolling(5, min_periods=1).mean())
-        bars["ma25"] = sg["close"].transform(lambda s: s.rolling(25, min_periods=1).mean())
-        bars["ma75"] = sg["close"].transform(lambda s: s.rolling(75, min_periods=1).mean())
-        bars["slope"] = ((bars["close"] - prev) / prev.replace(0, pd.NA)).fillna(0.0)
-        bars["atr"] = (bars["high"] - bars["low"]).abs().replace(0, pd.NA).fillna((bars["close"] * 0.001).abs())
-        bars["slope_atr_scaled"] = ((bars["close"] - prev).fillna(0.0) / bars["atr"].replace(0, pd.NA)).fillna(0.0) / 100.0
-        bars["rsi"] = 50.0
-        bars["macd"] = 0.0
-        bars["signal"] = 0.0
-        bars["hist"] = 0.0
-        move = (bars["slope"] * 1000.0).clip(-5.0, 5.0).fillna(0.0)
-        boost = (pd.to_numeric(bars["tick_count"], errors="coerce").fillna(0).clip(0, 20) / 20.0)
-        bars["score_buy"] = (move.where(move > 0, 0.0) + boost.where(move > 0, 0.0)).fillna(0.0)
-        bars["score_sell"] = ((-move).where(move < 0, 0.0) + boost.where(move < 0, 0.0)).fillna(0.0)
-        bars["score_slope"] = move
-        bars["score_mtf"] = 0.0
-        bars["score"] = bars["score_buy"] - bars["score_sell"]
-        bars["score_total"] = bars["score"]
-        bars["final_score"] = bars["score"]
-        bars["display_score"] = bars["score"]
-        bars["technical_ready"] = True
-        bars["symbol_hist_len"] = sg["close"].transform("count")
-        bars["price"] = bars["close"]
-        bars["current_price"] = bars["close"]
-        bars["open_price"] = bars["open"]
-        bars["high_price"] = bars["high"]
-        bars["low_price"] = bars["low"]
-        bars["close_price"] = bars["close"]
-        bars["vwap"] = bars["close"]
-        bars["interval"] = 1
-        bars["source"] = "force_main_direct_push_df_1min"
-        bars["date"] = bars["datetime"].dt.strftime("%Y-%m-%d")
-        bars["time"] = bars["datetime"].dt.strftime("%H:%M:%S")
-        bars["start_time"] = bars["time"]
-        bars["end_time"] = bars["time"]
-        bars["time_range"] = bars["time"]
-        latest = bars.groupby("symbol", sort=False, as_index=False).tail(1).reset_index(drop=True)
-        min_price = float(os.getenv("SUMMARY_FORCE_DIRECT_MIN_PRICE", os.getenv("ENTRY_MIN_PRICE", "200")) or 200)
-        max_price = float(os.getenv("SUMMARY_FORCE_DIRECT_MAX_PRICE", os.getenv("ENTRY_MAX_PRICE", "7000")) or 7000)
-        latest = latest[(pd.to_numeric(latest["close"], errors="coerce") > min_price) & (pd.to_numeric(latest["close"], errors="coerce") <= max_price)]
-        logger.warning(
-            "[SUMMARY FORCE DIRECT 1M] built rows=%s symbols=%s raw_rows=%s latest_dt=%s elapsed=%.3fs",
-            len(latest), latest["symbol"].nunique() if not latest.empty else 0, len(raw), latest["datetime"].max() if not latest.empty else None, time.perf_counter() - t0,
-        )
-        return latest.reset_index(drop=True)
+        from core.startup.summary_main_memory_latest_1m_patch import _build_memory_1m_summary
+        df = _build_memory_1m_summary(now=now)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            logger.warning(
+                "[SUMMARY FORCE DIRECT 1M] built via robust memory rows=%s symbols=%s latest_dt=%s elapsed=%.3fs version=%s",
+                len(df),
+                int(df["symbol"].nunique()) if "symbol" in df.columns else 0,
+                df["datetime"].max() if "datetime" in df.columns else None,
+                time.perf_counter() - t0,
+                VERSION,
+            )
+            return df.reset_index(drop=True)
     except Exception:
-        logger.exception("[SUMMARY FORCE DIRECT 1M] build failed")
-        return pd.DataFrame()
+        logger.debug("[SUMMARY FORCE DIRECT 1M] robust memory builder failed", exc_info=True)
+    return pd.DataFrame()
 
 
 def _store(df: pd.DataFrame) -> None:
@@ -229,23 +109,26 @@ def _store(df: pd.DataFrame) -> None:
         return
     try:
         from global_state import global_data
-        for name in ("push_summary_1", "push_summary_1min", "push_merged_summary_1", "merged_summary_1"):
-            setattr(global_data, name, df)
+        for name in ("push_summary_1", "push_summary_1min", "push_merged_summary_1", "push_merged_summary_1min", "merged_summary_1", "merged_summary_1min"):
+            try:
+                setattr(global_data, name, df)
+            except Exception:
+                pass
     except Exception:
         pass
     try:
-        from core.global_context.context import global_context as GC
-        for fn_name in ("set_push_summary", "set_merged_summary"):
-            fn = getattr(GC, fn_name, None)
+        from core.global_context.context import global_data as GD
+        for fn_name in ("set_push_summary", "set_merged_summary", "set_push_merged_summary"):
+            fn = getattr(GD, fn_name, None)
             if callable(fn):
                 try:
-                    if fn_name == "set_merged_summary":
+                    if "merged" in fn_name:
                         fn(1, df, source="push")
                     else:
                         fn(1, df)
                 except TypeError:
                     try:
-                        fn(1, df)
+                        fn(tf=1, df=df, source="push")
                     except Exception:
                         pass
     except Exception:
@@ -262,6 +145,7 @@ def _submit_ai(df: pd.DataFrame, now: dt.datetime, run_entry: bool) -> None:
             return
         _AI_RUNNING.add(key)
     df_copy = df.copy(deep=False)
+
     def _task() -> None:
         try:
             logger.warning("[SUMMARY FORCE DIRECT 1M] async AI start key=%s rows=%s", key, len(df_copy))
@@ -274,6 +158,7 @@ def _submit_ai(df: pd.DataFrame, now: dt.datetime, run_entry: bool) -> None:
             with _AI_LOCK:
                 _AI_RUNNING.discard(key)
             logger.warning("[SUMMARY FORCE DIRECT 1M] async AI done key=%s", key)
+
     _executor().submit(_task)
     logger.warning("[SUMMARY FORCE DIRECT 1M] async AI submitted key=%s rows=%s", key, len(df_copy))
 
@@ -285,7 +170,7 @@ def _patch_once(reason: str = "install") -> bool:
     try:
         import scheduler_jobs.summary.runner_core as rc
         current = getattr(rc, "job_summary", None)
-        if getattr(current, "_summary_force_direct_v1", False):
+        if getattr(current, "_summary_force_direct_v2", False):
             return True
         if _ORIGINAL_JOB_SUMMARY is None and callable(current):
             _ORIGINAL_JOB_SUMMARY = current
@@ -301,12 +186,21 @@ def _patch_once(reason: str = "install") -> bool:
             if df is not None and not df.empty:
                 _store(df)
                 _submit_ai(df, now_i, run_entry)
-                logger.warning("[SUMMARY FORCE DIRECT 1M] return interval=1 rows=%s elapsed=%.3fs mode=forced_direct", len(df), time.perf_counter() - t0)
+                logger.warning("[SUMMARY FORCE DIRECT 1M] return interval=1 rows=%s elapsed=%.3fs mode=forced_direct_v2", len(df), time.perf_counter() - t0)
                 return df
-            logger.warning("[SUMMARY FORCE DIRECT 1M] direct empty -> original fallback interval=1")
+            raw_rows = _raw_memory_rows()
+            if _env_bool("SUMMARY_FORCE_DIRECT_NO_ORIGINAL_FALLBACK_WHEN_RAW_EXISTS", True) and raw_rows > 0:
+                logger.warning(
+                    "[SUMMARY FORCE DIRECT 1M] direct empty but raw memory exists -> skip original heavy fallback interval=1 raw_rows=%s elapsed=%.3fs",
+                    raw_rows,
+                    time.perf_counter() - t0,
+                )
+                return pd.DataFrame()
+            logger.warning("[SUMMARY FORCE DIRECT 1M] direct empty -> original fallback interval=1 raw_rows=%s", raw_rows)
             return orig(interval_i, display=display, now=now_i, run_entry=run_entry, **kwargs)
 
         job_summary_force._summary_force_direct_v1 = True  # type: ignore[attr-defined]
+        job_summary_force._summary_force_direct_v2 = True  # type: ignore[attr-defined]
         job_summary_force._original = orig  # type: ignore[attr-defined]
         rc.job_summary = job_summary_force
         rc.run_push_summary_job = lambda interval=1, display=True, now=None, run_entry=True, **kwargs: job_summary_force(int(interval), display=display, now=now, run_entry=run_entry, **kwargs)
@@ -333,6 +227,7 @@ def _watcher() -> None:
 
 def install() -> bool:
     global _PATCHED, _WATCHER_STARTED
+    os.environ.setdefault("SUMMARY_FORCE_DIRECT_NO_ORIGINAL_FALLBACK_WHEN_RAW_EXISTS", "1")
     ok = _patch_once(reason="install")
     if ok and not _WATCHER_STARTED and _env_bool("SUMMARY_FORCE_DIRECT_WATCHER", True):
         _WATCHER_STARTED = True
