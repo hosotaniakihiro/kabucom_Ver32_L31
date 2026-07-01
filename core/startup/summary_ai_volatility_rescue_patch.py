@@ -1,15 +1,15 @@
 # ============================================================
 # File   : core/startup/summary_ai_volatility_rescue_patch.py
-# Version: V2-SUMMARY-AI-STRONG-VOL-RESCUE-DB-FRESH-INPUT
+# Version: V3-SUMMARY-AI-STRONG-VOL-RESCUE-SLOPE-RELAX
 # ------------------------------------------------------------
 # SUMMARY_AIの強い候補が、entry_controller内の ATR_1M_FILTER_NG /
 # RANGE_5M_FILTER_NG だけで全落ちする問題を救済する。
 #
-# V2:
-#   - main.py の PUSH memory が古い場合、Summary AI が
-#     no_fresh_scored_df で投入されないため、summaryYYYYMMDD.db の
-#     stock_summary_1min 最新scored行を AI input の代替として使う。
-#   - DBも古い場合は発注せず、MAIN_DB/PUSH鮮度不足を明確にログへ出す。
+# V3:
+#   - V2のDB fresh input fallbackを維持。
+#   - rescue最小slopeを 0.001 -> 0.0002 へ直接緩和。
+#     このmoduleは entry_controller_source_prefilter_patch より先に
+#     auto installされる場合があるため、ここを直接変更する。
 # ============================================================
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from typing import Any
 import pandas as pd
 
 logger = logging.getLogger(__name__)
-VERSION = "V2-SUMMARY-AI-STRONG-VOL-RESCUE-DB-FRESH-INPUT"
+VERSION = "V3-SUMMARY-AI-STRONG-VOL-RESCUE-SLOPE-RELAX"
 _INSTALLED = False
 _WATCHER_STARTED = False
 _MAIN_AI_INPUT_PATCHED = False
@@ -165,7 +165,7 @@ def _strong_summary_ai_ok(entry_row: Any, label: str) -> bool:
     min_score = _env_float("SUMMARY_AI_VOL_RESCUE_MIN_SCORE", 3.0)
     min_turnover = _env_float("SUMMARY_AI_VOL_RESCUE_MIN_TURNOVER", 10000000.0)
     min_volume = _env_float("SUMMARY_AI_VOL_RESCUE_MIN_VOLUME", 3000.0)
-    min_slope = _env_float("SUMMARY_AI_VOL_RESCUE_MIN_ABS_SLOPE", 0.001)
+    min_slope = _env_float("SUMMARY_AI_VOL_RESCUE_MIN_ABS_SLOPE", 0.0002)
     min_price = _env_float("SUMMARY_AI_VOL_RESCUE_MIN_PRICE", 200.0)
     max_price = _env_float("SUMMARY_AI_VOL_RESCUE_MAX_PRICE", 7000.0)
 
@@ -194,7 +194,7 @@ def _strong_summary_ai_ok(entry_row: Any, label: str) -> bool:
 def _wrap_filter(fn: Any, label: str):
     if not callable(fn):
         return fn
-    if getattr(fn, f"_summary_ai_vol_rescue_{label}_v2", False):
+    if getattr(fn, f"_summary_ai_vol_rescue_{label}_v3", False):
         return fn
 
     def _wrapped(entry_row: Any = None, *args: Any, **kwargs: Any):
@@ -209,6 +209,7 @@ def _wrap_filter(fn: Any, label: str):
 
     setattr(_wrapped, f"_summary_ai_vol_rescue_{label}_v1", True)
     setattr(_wrapped, f"_summary_ai_vol_rescue_{label}_v2", True)
+    setattr(_wrapped, f"_summary_ai_vol_rescue_{label}_v3", True)
     _wrapped._original = fn  # type: ignore[attr-defined]
     return _wrapped
 
@@ -355,7 +356,7 @@ def _patch_summary_main_ai_input(reason: str = "install") -> bool:
         cur = getattr(light, "_get_scored_context_summary", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_summary_ai_db_fresh_input_v2", False):
+        if getattr(cur, "_summary_ai_db_fresh_input_v3", False):
             _MAIN_AI_INPUT_PATCHED = True
             return True
         orig = getattr(cur, "_original", cur)
@@ -370,6 +371,7 @@ def _patch_summary_main_ai_input(reason: str = "install") -> bool:
             return _load_fresh_summary_db_scored()
 
         _patched_get_scored_context_summary._summary_ai_db_fresh_input_v2 = True  # type: ignore[attr-defined]
+        _patched_get_scored_context_summary._summary_ai_db_fresh_input_v3 = True  # type: ignore[attr-defined]
         _patched_get_scored_context_summary._original = orig  # type: ignore[attr-defined]
         light._get_scored_context_summary = _patched_get_scored_context_summary
         _MAIN_AI_INPUT_PATCHED = True
@@ -421,7 +423,7 @@ def install() -> bool:
     os.environ.setdefault("SUMMARY_AI_VOL_RESCUE_MIN_SCORE", "3.0")
     os.environ.setdefault("SUMMARY_AI_VOL_RESCUE_MIN_TURNOVER", "10000000")
     os.environ.setdefault("SUMMARY_AI_VOL_RESCUE_MIN_VOLUME", "3000")
-    os.environ.setdefault("SUMMARY_AI_VOL_RESCUE_MIN_ABS_SLOPE", "0.001")
+    os.environ.setdefault("SUMMARY_AI_VOL_RESCUE_MIN_ABS_SLOPE", "0.0002")
     os.environ.setdefault("SUMMARY_AI_DB_FRESH_INPUT_ENABLED", "1")
     os.environ.setdefault("SUMMARY_AI_DB_FRESH_INPUT_MAX_AGE_SEC", "300")
     ok = _apply_once("install")
@@ -429,7 +431,7 @@ def install() -> bool:
     if ok and not _WATCHER_STARTED:
         _WATCHER_STARTED = True
         threading.Thread(target=_watcher, name="summary-ai-vol-rescue-watch", daemon=True).start()
-    logger.warning("[SUMMARY AI VOL RESCUE] installed=%s watcher=%s db_fresh_input=%s version=%s", ok, _WATCHER_STARTED, _MAIN_AI_INPUT_PATCHED, VERSION)
+    logger.warning("[SUMMARY AI VOL RESCUE] installed=%s watcher=%s db_fresh_input=%s min_abs_slope=%s version=%s", ok, _WATCHER_STARTED, _MAIN_AI_INPUT_PATCHED, os.getenv("SUMMARY_AI_VOL_RESCUE_MIN_ABS_SLOPE"), VERSION)
     return bool(ok)
 
 
