@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/board_missing_failopen_runtime_patch.py
+# Version: V1.3-FORCE-ALLOW-WITHOUT-BOARD
+# ------------------------------------------------------------
 # Purpose:
 #   - PUSH A/B ローテーション境界などで板が一時的に取れない場合、
 #     final_entry_safety_guard の流動性/score条件を満たす候補は
 #     小ロットで fail-open する。
-#   - main.py 側ではPUSH DB保存しない方針を維持する。
-#   - SUMMARY AI の entry_controller_lock_timeout は retryable 優先へ補正する。
-#   - SUMMARY AI direct dispatch の直近候補が stale_skipped で全落ちする問題を補正する。
+#   - main.py 側ではPUSH DB保存なしの方針を維持する。
+#   - final_entry_safety_guard_patch が先に ENTRY_ALLOW_ENTRY_WITHOUT_BOARD=0 を
+#     setdefault 済みでも、main runtime では保護fail-openを強制有効化する。
 # ============================================================
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V1.2-BOARD-MISSING-LOCK-RETRY-STALE-RESCUE"
+VERSION = "V1.3-FORCE-ALLOW-WITHOUT-BOARD"
 _INSTALLED = False
 
 _TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
@@ -55,7 +57,7 @@ def _patch_final_guard() -> bool:
         logger.exception("[BOARD MISSING FAILOPEN] import final_entry_safety_guard_patch failed")
         return False
 
-    if getattr(fsg, "_BOARD_MISSING_FAILOPEN_PATCHED_V1", False):
+    if getattr(fsg, "_BOARD_MISSING_FAILOPEN_PATCHED_V13", False):
         return True
 
     old_board_guard = getattr(fsg, "_board_guard", None)
@@ -93,7 +95,6 @@ def _patch_final_guard() -> bool:
             ask_qty = ask_qty or askq2
 
         if bid <= 0 or ask <= 0:
-            # 明示的に強制ブロックした場合だけ止める。既定は候補保護fail-open。
             if _env_bool("ENTRY_BOARD_MISSING_HARD_BLOCK", False):
                 fsg._log_ng("board_missing", symbol_s, side_s, bid=bid, ask=ask, message="板が取れないため新規エントリー停止")
                 logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_MISSING_HARD_BLOCK symbol=%s side=%s bid=%s ask=%s", symbol_s, side_s, bid, ask)
@@ -147,11 +148,13 @@ def _patch_final_guard() -> bool:
         return True
 
     _board_guard_failopen._board_missing_failopen_v1 = True  # type: ignore[attr-defined]
+    _board_guard_failopen._board_missing_failopen_v13 = True  # type: ignore[attr-defined]
     _board_guard_failopen._original_board_guard = old_board_guard  # type: ignore[attr-defined]
     _board_guard_failopen._original_patched_board_guard = old_patched_board_guard  # type: ignore[attr-defined]
     fsg._board_guard = _board_guard_failopen
     fsg._patched_board_guard = _board_guard_failopen
     fsg._BOARD_MISSING_FAILOPEN_PATCHED_V1 = True
+    fsg._BOARD_MISSING_FAILOPEN_PATCHED_V13 = True
     logger.warning("[BOARD MISSING FAILOPEN] final_entry_safety_guard board guard patched version=%s", VERSION)
     return True
 
@@ -182,9 +185,10 @@ def _install_summary_entry_stale_rescue() -> bool:
 
 def install() -> bool:
     global _INSTALLED
-    # board_retry_patch の既定 HARD_BLOCK=1 を、main runtime では保護fail-openへ戻す。
+    # final_entry_safety_guard_patch が先に ENTRY_ALLOW_ENTRY_WITHOUT_BOARD=0 を setdefault しているため、
+    # ここは setdefault ではなく明示代入にする。強制ブロックしたい場合だけ *_FORCE で止める。
     os.environ["ENTRY_BOARD_MISSING_HARD_BLOCK"] = os.getenv("ENTRY_BOARD_MISSING_HARD_BLOCK_FORCE", "0")
-    os.environ.setdefault("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", "1")
+    os.environ["ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"] = os.getenv("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD_FORCE", "1")
     os.environ.setdefault("ENTRY_ALLOW_WITHOUT_BOARD_MIN_VOLUME", "30000")
     os.environ.setdefault("ENTRY_ALLOW_WITHOUT_BOARD_MIN_TURNOVER", "10000000")
     os.environ.setdefault("ENTRY_ALLOW_WITHOUT_BOARD_MIN_PRICE", "200")
