@@ -1,8 +1,14 @@
 # ============================================================
 # File   : core/startup/push_summary_realtime_patch.py
-# Version: REV4-PUSH-SUMMARY-REALTIME-FRESH-BOOTSTRAP
+# Version: REV5-PUSH-WRITER-FORCE-AND-NO-RUNTIME-TOKEN-REFRESH
 # ------------------------------------------------------------
 # PUSH DB flush後にsummaryを軽く再計算するruntime patch。
+#
+# REV5:
+#   - push_receiver_runner / main_database 側では PUSH DB writer を必ず有効化し、
+#     memory_only=True / writer_ready=False / total_flushed=0 のまま進む状態を防ぐ。
+#   - start_push_stream 呼び出し時に StreamDBWriter singleton を明示注入する。
+#   - 401時の runtime refresh を抑止し、settings.ini / 既存token再利用だけに寄せる。
 #
 # REV4:
 #   - 起動直後 bootstrap で 3m/5m まで再計算すると、PUSH履歴不足時に
@@ -27,6 +33,8 @@ logger = logging.getLogger(__name__)
 
 _PATCHED = False
 _ORIGINAL_STREAM_WRITER_FLUSH = None
+_ORIGINAL_PUSH_START = None
+_ORIGINAL_RUNNER_PUSH_START = None
 _TRIGGER_LOCK = threading.RLock()
 _TRIGGER_RUNNING = False
 _LAST_TRIGGER_AT = 0.0
@@ -54,6 +62,42 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _argv_text() -> str:
+    try:
+        return " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+    except Exception:
+        return ""
+
+
+def _is_database_or_push_receiver_process() -> bool:
+    argv = _argv_text()
+    if any(x in argv for x in (
+        "main_database.py",
+        "data_collectors_runner.py",
+        "push_receiver_runner.py",
+        "summary_database_runner.py",
+        "ranking_collector_runner.py",
+    )):
+        return True
+    return any(_env_bool(x, False) for x in (
+        "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+        "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+        "AUTOSTOCK_SUMMARY_DB_WRITER",
+        "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
+    ))
+
+
+def _force_push_writer_env_if_database_process() -> None:
+    """DB/data-collector側では PUSH DB writer を必ず有効にする。"""
+    if not _is_database_or_push_receiver_process():
+        return
+    os.environ["AUTOSTOCK_DATA_COLLECTORS_PROCESS"] = "1"
+    os.environ["AUTOSTOCK_MAIN_MEMORY_ONLY"] = "0"
+    os.environ["AUTOSTOCK_SKIP_DATA_COLLECTOR_WORK_IN_MAIN"] = "0"
+    os.environ["PUSH_STREAM_DB_WRITE"] = "1"
+    os.environ.setdefault("PUSH_STREAM_ORDER_BOOK_WRITE", "1")
+
+
 def _parse_intervals(value: str | None, default: Iterable[int] = _DEFAULT_INTERVALS) -> list[int]:
     if not value or not str(value).strip():
         return [int(x) for x in default]
@@ -77,13 +121,6 @@ def _default_intervals() -> list[int]:
 
 def _bootstrap_intervals() -> list[int]:
     return _parse_intervals(os.getenv("PUSH_SUMMARY_REALTIME_BOOTSTRAP_INTERVALS"), default=_BOOTSTRAP_DEFAULT_INTERVALS)
-
-
-def _argv_text() -> str:
-    try:
-        return " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
-    except Exception:
-        return ""
 
 
 def _should_bootstrap_rebuild_here() -> bool:
@@ -192,7 +229,7 @@ def _patch_push_db_writer() -> bool:
         if not callable(original):
             logger.warning("[PUSH SUMMARY REALTIME] StreamDBWriter.flush not found")
             return False
-        if getattr(original, "_push_summary_realtime_patched_v4", False):
+        if getattr(original, "_push_summary_realtime_patched_v5", False):
             return True
         _ORIGINAL_STREAM_WRITER_FLUSH = original
 
@@ -210,6 +247,7 @@ def _patch_push_db_writer() -> bool:
                 logger.debug("[PUSH SUMMARY REALTIME] flush post-trigger failed", exc_info=True)
             return ok
 
+        _flush_with_realtime_summary._push_summary_realtime_patched_v5 = True  # type: ignore[attr-defined]
         _flush_with_realtime_summary._push_summary_realtime_patched_v4 = True  # type: ignore[attr-defined]
         _flush_with_realtime_summary._push_summary_realtime_patched_v3 = True  # type: ignore[attr-defined]
         setattr(cls, "flush", _flush_with_realtime_summary)
@@ -217,6 +255,139 @@ def _patch_push_db_writer() -> bool:
     except Exception:
         logger.exception("[PUSH SUMMARY REALTIME] patch push_db_writer failed")
         return False
+
+
+def _ensure_stream_writer_singleton_started() -> Any:
+    """PUSH保存用 singleton を開始して返す。失敗時は None。"""
+    try:
+        _force_push_writer_env_if_database_process()
+        import trading.push.push_db_writer as writer_mod
+        writer = getattr(writer_mod, "stream_writer", None)
+        if writer is None:
+            cls = getattr(writer_mod, "StreamDBWriter", None)
+            writer = cls(enable_raw_save=True) if callable(cls) else None
+            if writer is not None:
+                setattr(writer_mod, "stream_writer", writer)
+        if writer is not None:
+            try:
+                start = getattr(writer, "start", None)
+                if callable(start):
+                    start()
+            except Exception:
+                logger.debug("[PUSH SUMMARY REALTIME] stream_writer.start skipped/failed", exc_info=True)
+        return writer
+    except Exception:
+        logger.exception("[PUSH SUMMARY REALTIME] ensure stream_writer singleton failed")
+        return None
+
+
+def _patch_push_stream_start_force_writer() -> bool:
+    """push_receiver/main_database側の start_push_stream に writer を明示注入する。"""
+    global _ORIGINAL_PUSH_START, _ORIGINAL_RUNNER_PUSH_START
+    if not _is_database_or_push_receiver_process():
+        return True
+
+    try:
+        import trading.push.push_stream.runner as runner_mod
+        import trading.push.push_stream as pkg_mod
+
+        original = getattr(runner_mod, "start_push_stream", None)
+        if not callable(original):
+            logger.warning("[PUSH SUMMARY REALTIME] runner.start_push_stream not found")
+            return False
+        if getattr(original, "_push_writer_force_patched_v5", False):
+            return True
+
+        _ORIGINAL_RUNNER_PUSH_START = original
+        _ORIGINAL_PUSH_START = getattr(pkg_mod, "_runner_start_push_stream", None)
+
+        def _start_push_stream_with_forced_writer(*args, **kwargs):
+            _force_push_writer_env_if_database_process()
+            if kwargs.get("stream_writer", None) is None:
+                writer = _ensure_stream_writer_singleton_started()
+                if writer is not None:
+                    kwargs["stream_writer"] = writer
+            # data_collector側では False を明示されても保存を優先する。
+            if kwargs.get("stream_writer") is False and _is_database_or_push_receiver_process():
+                writer = _ensure_stream_writer_singleton_started()
+                if writer is not None:
+                    kwargs["stream_writer"] = writer
+            logger.warning(
+                "[PUSH SUMMARY REALTIME] start_push_stream forced writer process_db=%s writer_injected=%s db_write_env=%s argv=%s",
+                _is_database_or_push_receiver_process(),
+                kwargs.get("stream_writer") is not None and kwargs.get("stream_writer") is not False,
+                os.getenv("PUSH_STREAM_DB_WRITE"),
+                sys.argv,
+            )
+            return original(*args, **kwargs)
+
+        _start_push_stream_with_forced_writer._push_writer_force_patched_v5 = True  # type: ignore[attr-defined]
+        setattr(runner_mod, "start_push_stream", _start_push_stream_with_forced_writer)
+        # package __init__.py は runner.start_push_stream を _runner_start_push_stream に束縛しているため、ここも差し替える。
+        try:
+            setattr(pkg_mod, "_runner_start_push_stream", _start_push_stream_with_forced_writer)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        logger.exception("[PUSH SUMMARY REALTIME] patch push_stream start force writer failed")
+        return False
+
+
+def _patch_runtime_token_refresh_suppression() -> bool:
+    """401時は runtime refresh を呼ばず、既存/settings token 再利用またはそのcycle skipに統一する。"""
+    ok = True
+    try:
+        import force_cancel_loop as fcl
+
+        def _no_refresh_headers_after_401(context: str):
+            logger.warning("[FORCE_CANCEL] 401 received; runtime refresh disabled context=%s -> reuse settings/runtime token only", context)
+            try:
+                return fcl._direct_token_fallback(context)
+            except Exception:
+                logger.debug("[FORCE_CANCEL] direct token fallback failed after 401 context=%s", context, exc_info=True)
+                return None
+
+        setattr(fcl, "_refresh_headers_after_401", _no_refresh_headers_after_401)
+    except Exception:
+        ok = False
+        logger.debug("[PUSH SUMMARY REALTIME] force_cancel_loop token refresh suppression skipped", exc_info=True)
+
+    try:
+        import trading.position.kabu_position_reader as kpr
+
+        def _no_refresh_token_after_401() -> str:
+            logger.warning("[KABU POSITION READER] 401 received; runtime refresh disabled -> skip this cycle")
+            return ""
+
+        setattr(kpr, "_refresh_token_after_401", _no_refresh_token_after_401)
+    except Exception:
+        ok = False
+        logger.debug("[PUSH SUMMARY REALTIME] kabu_position_reader token refresh suppression skipped", exc_info=True)
+
+    try:
+        import kabu_api.positions as pos
+
+        # このモジュールは通常refreshしないが、401時に長いtracebackを出さないよう requests.HTTPError を明示処理。
+        original_get_positions = getattr(pos, "get_positions", None)
+        if callable(original_get_positions) and not getattr(original_get_positions, "_no_runtime_refresh_guard_v5", False):
+            def _get_positions_no_401_traceback(*args, **kwargs):
+                try:
+                    return original_get_positions(*args, **kwargs)
+                except Exception as e:
+                    logger.warning("[kabu_api.positions] positions read skipped err=%s", e)
+                    try:
+                        return getattr(pos, "_POS_CACHE", None) or []
+                    except Exception:
+                        return []
+
+            _get_positions_no_401_traceback._no_runtime_refresh_guard_v5 = True  # type: ignore[attr-defined]
+            setattr(pos, "get_positions", _get_positions_no_401_traceback)
+    except Exception:
+        ok = False
+        logger.debug("[PUSH SUMMARY REALTIME] kabu_api.positions guard skipped", exc_info=True)
+
+    return ok
 
 
 def _schedule_bootstrap_rebuild() -> None:
@@ -244,6 +415,9 @@ def install() -> bool:
     if not _env_bool("PUSH_SUMMARY_REALTIME_PATCH_ENABLED", True):
         logger.warning("[PUSH SUMMARY REALTIME] disabled by env")
         return False
+
+    _force_push_writer_env_if_database_process()
+
     try:
         from core.startup import push_summary_realtime_callable_fix_patch
         push_summary_realtime_callable_fix_patch.install()
@@ -251,14 +425,20 @@ def install() -> bool:
         logger.debug("[PUSH SUMMARY REALTIME] callable fix optional install failed", exc_info=True)
 
     ok_writer = _patch_push_db_writer()
-    _PATCHED = bool(ok_writer)
+    ok_start = _patch_push_stream_start_force_writer()
+    ok_token = _patch_runtime_token_refresh_suppression()
+    if _is_database_or_push_receiver_process():
+        _ensure_stream_writer_singleton_started()
+
+    _PATCHED = bool(ok_writer and ok_start)
     intervals = _parse_intervals(os.getenv("PUSH_SUMMARY_REALTIME_INTERVALS"), default=_default_intervals())
     bootstrap = _should_bootstrap_rebuild_here()
     logger.warning(
-        "[PUSH SUMMARY REALTIME] installed ok=%s engine_db_fallback=%s flush_trigger=%s intervals=%s bootstrap=%s bootstrap_intervals=%s version=REV4 argv=%s",
+        "[PUSH SUMMARY REALTIME] installed ok=%s writer_patch=%s start_patch=%s token_suppression=%s intervals=%s bootstrap=%s bootstrap_intervals=%s version=REV5 argv=%s",
         _PATCHED,
-        False,
         ok_writer,
+        ok_start,
+        ok_token,
         intervals,
         bootstrap,
         _bootstrap_intervals(),
