@@ -1,6 +1,6 @@
 # ============================================================
 # File   : main_database.py
-# Version: DATA-COLLECTORS-MAIN-DATABASE-ENTRY-V8-KABU-TOKEN-PREFLIGHT
+# Version: DATA-COLLECTORS-MAIN-DATABASE-ENTRY-V9-STRICT-LIVE-SUMMARY
 # ------------------------------------------------------------
 # Purpose:
 #   - DB作成 / ランキング取得 / PUSH銘柄登録 / PUSH受信 を起動する入口
@@ -10,6 +10,7 @@
 #   - main_database.py のコンソールログに時刻を付け、ファイルにも保存する
 #   - summary DB の WAL を1分ごとに checkpoint して .db 本体へ反映する
 #   - /token 取得直後に実APIで token preflight を行い、認証NGなら子プロセスを起動しない
+#   - 前日PUSH summary の global-lag/min_keep fallback を子プロセス既定で無効化する
 # ============================================================
 
 from __future__ import annotations
@@ -142,21 +143,43 @@ def _install_summary_stale_guard() -> None:
     """
     try:
         # Defaults are inherited by any child collector processes.
+        # Important: default must be hard-drop.  Keeping latest-per-symbol on
+        # global lag caused 2026-06-30 15:19 rows to remain alive on 2026-07-01
+        # during market session.
         defaults = {
             "SUMMARY_STALE_GUARD_ENABLED": "1",
+            "SUMMARY_STALE_STRICT_TODAY_ONLY": "1",
+            "SUMMARY_STALE_KEEP_LATEST_PER_SYMBOL_ON_GLOBAL_LAG": "0",
+            "SUMMARY_STALE_GLOBAL_LAG_GRACE_SEC": "30",
             "PUSH_SUMMARY_1MIN_MAX_AGE_SEC": "120",
             "PUSH_SUMMARY_3MIN_MAX_AGE_SEC": "240",
             "PUSH_SUMMARY_5MIN_MAX_AGE_SEC": "420",
+            "PUSH_SUMMARY_1MIN_KEEP_ROWS": "0",
+            "PUSH_SUMMARY_3MIN_KEEP_ROWS": "0",
+            "PUSH_SUMMARY_5MIN_KEEP_ROWS": "0",
             "RANKING_SUMMARY_1MIN_MAX_AGE_SEC": "180",
             "RANKING_SUMMARY_3MIN_MAX_AGE_SEC": "300",
             "RANKING_SUMMARY_5MIN_MAX_AGE_SEC": "480",
+            "RANKING_SUMMARY_1MIN_KEEP_ROWS": "0",
+            "RANKING_SUMMARY_3MIN_KEEP_ROWS": "0",
+            "RANKING_SUMMARY_5MIN_KEEP_ROWS": "0",
+            # User rule: recent 5-bar turnover target is 1,000,000 yen.
+            # The old 5,000,000 default can delete all candidates around open.
+            "LIQUIDITY_MIN_TURNOVER": "1000000",
+            "SUMMARY_ENTRY_ALLOW_UNREADY_5MIN_AT_OPEN": "1",
         }
         for key, value in defaults.items():
             os.environ.setdefault(key, value)
 
         from core.startup.summary_stale_guard_patch import install
         ok = install()
-        logger.warning("[MAIN DATABASE] summary stale guard installed ok=%s", ok)
+        logger.warning(
+            "[MAIN DATABASE] summary stale guard installed ok=%s strict_today=%s global_lag_keep=%s liquidity_min_turnover=%s",
+            ok,
+            os.getenv("SUMMARY_STALE_STRICT_TODAY_ONLY"),
+            os.getenv("SUMMARY_STALE_KEEP_LATEST_PER_SYMBOL_ON_GLOBAL_LAG"),
+            os.getenv("LIQUIDITY_MIN_TURNOVER"),
+        )
     except Exception:
         logger.exception("[MAIN DATABASE] summary stale guard install failed; continue")
 
