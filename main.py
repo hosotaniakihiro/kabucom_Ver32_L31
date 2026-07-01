@@ -10,8 +10,9 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.34-HARD-LIQUIDITY-MOVEMENT-GUARD
+# Version: Ver38.35-SUMMARY-SCHEDULER-SHUTDOWN-GUARD
 # ------------------------------------------------------------
+# ✔ SUMMARY scheduler 終了時 submit RuntimeError ガードを main runtime patch に追加
 # ✔ SUMMARY AI async entry patch を main runtime patch 一覧へ明示追加
 # ✔ TONOSAMA final liquidity lost-volume fallback threshold を 2.3 に調整
 # ✔ TONOSAMA volatility entry-row rescue を main runtime に追加
@@ -168,6 +169,7 @@ def _factory_position_state():
 
 def _install_main_runtime_patches():
     patches = [
+        ("core.startup.summary_scheduler_shutdown_guard_patch", "install"),
         ("core.startup.nas_sqlite_io_guard_patch", "install"),
         ("core.startup.indicator_fragmentation_runtime_patch", "install"),
         ("core.startup.entry_controller_runtime_reject_patch", "install"),
