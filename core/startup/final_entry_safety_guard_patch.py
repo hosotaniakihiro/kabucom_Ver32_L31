@@ -1,13 +1,13 @@
 # ============================================================
 # File   : core/startup/final_entry_safety_guard_patch.py
-# Version: Ver11-BOARD-GUARD-SIGNATURE-TOLERANT
+# Version: Ver12-BOARD-GUARD-NATIVE-FALLBACK
 # ------------------------------------------------------------
 # 発注直前の安全ガード。
-# Ver11:
-#   - _board_guard が他パッチにより 3引数版へ差し替わっても落とさない
-#   - _call_board_guard で 4引数/3引数/2引数/1引数を順に試す
-#   - TypeError を board_missing 扱いにしない
-#   - board_missing は pending を残して次サイクル再試行
+# Ver12:
+#   - 他パッチが _board_guard / _patched_board_guard を 3引数版に差し替えても落とさない
+#   - _call_board_guard はこのファイル内の _native_board_guard を優先して使う
+#   - board guard のシグネチャ不一致を board_missing 扱いにしない
+#   - board_missing は緩和せず pending を残して次サイクル再試行
 # ============================================================
 from __future__ import annotations
 
@@ -23,8 +23,10 @@ _INSTALLED = False
 _ORIG_EXECUTE_BEST_CANDIDATE: Callable[..., Any] | None = None
 _BOARD_COOLDOWN_UNTIL = 0.0
 _BOARD_CACHE: dict[str, tuple[float, tuple[float, float, float, float]]] = {}
+
 _TRUE_SET = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 _FALSE_SET = {"0", "false", "no", "n", "off", "ng", "disable", "disabled", ""}
+
 _ORIGINAL_ATTRS = (
     "_final_entry_safety_guard_original",
     "_original_execute_best_candidate",
@@ -69,6 +71,7 @@ def _env_str(name: str, default: str) -> str:
 
 
 def _force_default_env() -> None:
+    # 緩和しない: 板なし発注はデフォルト不可。
     os.environ.setdefault("ENTRY_BOARD_API_LOOKUP_ENABLED", "0")
     os.environ.setdefault("ENTRY_BOARD_REST_DIRECT_ENABLED", "0")
     os.environ.setdefault("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", "0")
@@ -189,6 +192,7 @@ def _pop_pending_entry(symbol: str, item: dict, reason: str) -> None:
         if not isinstance(entry, dict):
             return
         from trading.entry.pending_manager import pop_entry, snapshot_root
+
         pop_entry(symbol, entry)
         logger.warning("[FINAL ENTRY SAFETY GUARD] PENDING_POP symbol=%s reason=%s root_after=%s", symbol, reason, snapshot_root())
     except Exception:
@@ -235,7 +239,15 @@ def _liquidity_guard(row: dict, symbol: str, side: str) -> bool:
     if turnover < min_turnover:
         _log_ng("low_turnover", symbol, side, turnover=turnover, min_turnover=min_turnover, volume=volume, close=close)
         return False
-    logger.info("[FINAL ENTRY SAFETY GUARD] LIQUIDITY_OK symbol=%s side=%s volume=%.0f turnover=%.0f min_volume=%.0f min_turnover=%.0f", symbol, side, volume, turnover, min_volume, min_turnover)
+    logger.info(
+        "[FINAL ENTRY SAFETY GUARD] LIQUIDITY_OK symbol=%s side=%s volume=%.0f turnover=%.0f min_volume=%.0f min_turnover=%.0f",
+        symbol,
+        side,
+        volume,
+        turnover,
+        min_volume,
+        min_turnover,
+    )
     return True
 
 
@@ -276,8 +288,9 @@ def _try_get_bid_ask_from_api(symbol: str) -> tuple[float, float, float, float]:
         return cached[1]
     try:
         from utils_common import get_latest_bid_ask
+
         res = get_latest_bid_ask(symbol)
-        bid, ask, bid_qty, ask_qty = 0.0, 0.0, 0.0, 0.0
+        bid = ask = bid_qty = ask_qty = 0.0
         if isinstance(res, dict):
             bid = _safe_float(res.get("bid") or res.get("best_bid") or res.get("BidPrice") or res.get("bid_price"), 0.0)
             ask = _safe_float(res.get("ask") or res.get("best_ask") or res.get("AskPrice") or res.get("ask_price"), 0.0)
@@ -285,6 +298,8 @@ def _try_get_bid_ask_from_api(symbol: str) -> tuple[float, float, float, float]:
             ask_qty = _safe_float(res.get("ask_qty") or res.get("AskQty") or res.get("ask_volume"), 0.0)
         elif isinstance(res, (list, tuple)) and len(res) >= 2:
             bid, ask = _safe_float(res[0], 0.0), _safe_float(res[1], 0.0)
+            if len(res) >= 4:
+                bid_qty, ask_qty = _safe_float(res[2], 0.0), _safe_float(res[3], 0.0)
         if bid > 0 and ask > 0:
             _BOARD_CACHE[symbol] = (now, (bid, ask, bid_qty, ask_qty))
             logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_API_OK symbol=%s bid=%.4f ask=%.4f", symbol, bid, ask)
@@ -300,6 +315,7 @@ def _try_get_bid_ask_from_api(symbol: str) -> tuple[float, float, float, float]:
 
 
 def _board_missing_fallback_ok(row: dict, item: dict, symbol: str, side: str) -> bool:
+    # 緩和しない: ENTRY_ALLOW_ENTRY_WITHOUT_BOARD=1 を明示した場合だけ許可。
     if not _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", False):
         return False
     close = _safe_float(_first(row, ("close", "close_price", "price", "current_price"), 0.0), 0.0)
@@ -320,46 +336,88 @@ def _board_missing_fallback_ok(row: dict, item: dict, symbol: str, side: str) ->
     return True
 
 
-def _board_guard(row: dict, item: dict | None = None, symbol: str | None = None, side: str | None = None, *_, **__) -> bool:
+def _native_board_guard(row: dict, item: dict | None = None, symbol: str | None = None, side: str | None = None, *_, **__) -> bool:
     item = item if isinstance(item, dict) else {}
     row = _row_to_dict(row)
     symbol = _norm_symbol(symbol or _first(row, ("symbol", "Symbol", "code", "銘柄コード"), ""))
     side = _norm_side(side or _first(row, ("side", "entry_decision", "ai_side"), ""))
+
     if not _env_bool("ENTRY_BOARD_GUARD_ENABLED", True):
         return True
+
     bid, ask, bid_qty, ask_qty = _extract_bid_ask_from_row(row)
     if bid <= 0 or ask <= 0:
         bid2, ask2, bidq2, askq2 = _try_get_bid_ask_from_api(symbol)
         bid, ask, bid_qty, ask_qty = bid or bid2, ask or ask2, bid_qty or bidq2, ask_qty or askq2
+
     if bid <= 0 or ask <= 0:
         if _board_missing_fallback_ok(row, item, symbol, side):
             return True
         _mark_skip(item, "board_missing", bid=bid, ask=ask, retryable=True)
         _log_ng("board_missing", symbol, side, bid=bid, ask=ask, retryable=True, pending_action="keep")
         return False
+
     mid = (bid + ask) / 2.0
     spread_pct = ((ask - bid) / mid) * 100.0 if mid > 0 else 999.0
     if spread_pct > _env_float("ENTRY_MAX_SPREAD_PCT", 0.20):
         _mark_skip(item, "spread_too_wide", bid=bid, ask=ask, spread_pct=spread_pct)
         _log_ng("spread_too_wide", symbol, side, bid=bid, ask=ask, spread_pct=spread_pct)
         return False
+
     try:
         row.update({"bid": bid, "ask": ask, "bid_qty": bid_qty, "ask_qty": ask_qty})
         if isinstance(item.get("entry_row"), dict):
             item["entry_row"].update({"bid": bid, "ask": ask, "bid_qty": bid_qty, "ask_qty": ask_qty})
     except Exception:
         pass
+
     logger.info("[FINAL ENTRY SAFETY GUARD] BOARD_OK symbol=%s side=%s bid=%.4f ask=%.4f spread_pct=%.4f", symbol, side, bid, ask, spread_pct)
     return True
 
 
+def _board_guard(row: dict, item: dict | None = None, symbol: str | None = None, side: str | None = None, *args, **kwargs) -> bool:
+    return _native_board_guard(row, item, symbol, side, *args, **kwargs)
+
+
 def _patched_board_guard(*args, **kwargs) -> bool:
-    return _board_guard(*args, **kwargs)
+    # 外部から4引数で呼ばれても落とさない公開互換関数。
+    return _native_board_guard(*args, **kwargs)
+
+
+def _looks_like_signature_error(exc: Exception) -> bool:
+    msg = str(exc)
+    return (
+        "positional argument" in msg
+        or "positional arguments" in msg
+        or "required positional argument" in msg
+        or "unexpected keyword argument" in msg
+        or "takes" in msg and "argument" in msg
+    )
 
 
 def _call_board_guard(row: dict, item: dict, symbol: str, side: str) -> bool:
-    """Call _board_guard even if another startup patch replaced it with an older 3-arg function."""
-    guard = _board_guard
+    """
+    Board guard dispatcher.
+
+    重要:
+    - まずこのファイル内の _native_board_guard を使う。
+      これにより、他パッチが module._board_guard を3引数版へ差し替えても影響を受けない。
+    - それでも失敗した場合だけ、互換ログを出して旧式呼び出しを試す。
+    - シグネチャ不一致は board_missing にしない。
+    """
+    try:
+        return bool(_native_board_guard(row, item, symbol, side))
+    except Exception as e:
+        if not _looks_like_signature_error(e):
+            logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_GUARD_ERROR symbol=%s side=%s error=%s", symbol, side, e)
+            return _board_missing_fallback_ok(row, item, symbol, side)
+        logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_GUARD_SIGNATURE_COMPAT_NATIVE_RETRY symbol=%s side=%s error=%s", symbol, side, e)
+
+    guard = globals().get("_board_guard")
+    if not callable(guard):
+        logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_GUARD_SIGNATURE_ERROR symbol=%s side=%s error=guard_not_callable", symbol, side)
+        return _board_missing_fallback_ok(row, item, symbol, side)
+
     attempts = (
         (row, item, symbol, side),
         (row, symbol, side),
@@ -367,26 +425,26 @@ def _call_board_guard(row: dict, item: dict, symbol: str, side: str) -> bool:
         (row, item),
         (row,),
     )
-    last_type_error: TypeError | None = None
+    last_error: Exception | None = None
     for args in attempts:
         try:
             ok = bool(guard(*args))
-            if args != attempts[0]:
-                logger.warning(
-                    "[FINAL ENTRY SAFETY GUARD] BOARD_GUARD_SIGNATURE_COMPAT symbol=%s side=%s argc=%s ok=%s",
-                    symbol,
-                    side,
-                    len(args),
-                    ok,
-                )
+            logger.warning(
+                "[FINAL ENTRY SAFETY GUARD] BOARD_GUARD_SIGNATURE_COMPAT symbol=%s side=%s argc=%s ok=%s",
+                symbol,
+                side,
+                len(args),
+                ok,
+            )
             return ok
-        except TypeError as e:
-            last_type_error = e
-            continue
         except Exception as e:
+            last_error = e
+            if _looks_like_signature_error(e):
+                continue
             logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_GUARD_ERROR symbol=%s side=%s error=%s", symbol, side, e)
             return _board_missing_fallback_ok(row, item, symbol, side)
-    logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_GUARD_SIGNATURE_ERROR symbol=%s side=%s error=%s", symbol, side, last_type_error)
+
+    logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_GUARD_SIGNATURE_ERROR symbol=%s side=%s error=%s", symbol, side, last_error)
     return _board_missing_fallback_ok(row, item, symbol, side)
 
 
@@ -405,6 +463,7 @@ def _patched_execute_best_candidate(item: dict, boost_active: bool) -> bool:
     if not callable(_ORIG_EXECUTE_BEST_CANDIDATE):
         logger.error("[FINAL ENTRY SAFETY GUARD] original _execute_best_candidate unavailable")
         return False
+
     started = time.time()
     symbol = ""
     side = ""
@@ -412,9 +471,11 @@ def _patched_execute_best_candidate(item: dict, boost_active: bool) -> bool:
         symbol = _norm_symbol(item.get("symbol"))
         row = _row_to_dict(item.get("entry_row"))
         side = _norm_side(item.get("side") or _first(row, ("side", "entry_decision", "ai_side"), ""))
+
         if side not in {"BUY", "SELL"}:
             _log_ng("unknown_side", symbol, side, item_keys=list(item.keys()))
             return _guard_fail(item, symbol, "unknown_side")
+
         if not _entry_time_guard(symbol, side):
             return _guard_fail(item, symbol, "time_guard_ng")
         if not _liquidity_guard(row, symbol, side):
@@ -423,9 +484,16 @@ def _patched_execute_best_candidate(item: dict, boost_active: bool) -> bool:
             return _guard_fail(item, symbol, "recent_reverse_guard_ng")
         if not _call_board_guard(row, item, symbol, side):
             return _guard_fail(item, symbol, "board_missing", pop=False, retryable=True)
+
         orig = _unwrap_true_original(_ORIG_EXECUTE_BEST_CANDIDATE)
         logger.info("[FINAL ENTRY SAFETY GUARD] ALL_OK symbol=%s side=%s", symbol, side)
-        logger.warning("[FINAL ENTRY SAFETY GUARD] CALL_ORIG_START symbol=%s side=%s orig=%s boost_active=%s", symbol, side, getattr(orig, "__name__", repr(orig)), boost_active)
+        logger.warning(
+            "[FINAL ENTRY SAFETY GUARD] CALL_ORIG_START symbol=%s side=%s orig=%s boost_active=%s",
+            symbol,
+            side,
+            getattr(orig, "__name__", repr(orig)),
+            boost_active,
+        )
         ok = bool(orig(item, boost_active))
         elapsed = time.time() - started
         logger.warning("[FINAL ENTRY SAFETY GUARD] CALL_ORIG_DONE symbol=%s side=%s ok=%s elapsed=%.3fs", symbol, side, ok, elapsed)
@@ -442,8 +510,9 @@ def _patched_execute_best_candidate(item: dict, boost_active: bool) -> bool:
 def _is_currently_wrapped() -> bool:
     try:
         import trading.handlers.entry_controller as ec
+
         cur = getattr(ec, "_execute_best_candidate", None)
-        return bool(getattr(cur, "_final_entry_safety_guard_v11", False))
+        return bool(getattr(cur, "_final_entry_safety_guard_v12", False))
     except Exception:
         return False
 
@@ -453,25 +522,33 @@ def install() -> bool:
     _force_default_env()
     try:
         import trading.handlers.entry_controller as ec
+
         if _INSTALLED and _is_currently_wrapped():
             return True
+
         old = getattr(ec, "_execute_best_candidate", None)
         if not callable(old):
             logger.error("[FINAL ENTRY SAFETY GUARD] target _execute_best_candidate unavailable")
             return False
-        if getattr(old, "_final_entry_safety_guard_v11", False):
+
+        if getattr(old, "_final_entry_safety_guard_v12", False):
             _INSTALLED = True
             return True
+
         _ORIG_EXECUTE_BEST_CANDIDATE = _unwrap_true_original(old)
+
         _patched_execute_best_candidate._final_entry_safety_guard = True  # type: ignore[attr-defined]
         _patched_execute_best_candidate._final_entry_safety_guard_v10 = True  # type: ignore[attr-defined]
         _patched_execute_best_candidate._final_entry_safety_guard_v11 = True  # type: ignore[attr-defined]
+        _patched_execute_best_candidate._final_entry_safety_guard_v12 = True  # type: ignore[attr-defined]
         _patched_execute_best_candidate._final_entry_safety_guard_original = _ORIG_EXECUTE_BEST_CANDIDATE  # type: ignore[attr-defined]
         _patched_execute_best_candidate._original_execute_best_candidate = _ORIG_EXECUTE_BEST_CANDIDATE  # type: ignore[attr-defined]
+
         ec._execute_best_candidate = _patched_execute_best_candidate
         _INSTALLED = True
+
         logger.warning(
-            "[FINAL ENTRY SAFETY GUARD] installed v11 original=%s board_api=%s rest_direct=%s allow_without_board=%s signature_tolerant=True",
+            "[FINAL ENTRY SAFETY GUARD] installed v12 original=%s board_api=%s rest_direct=%s allow_without_board=%s native_board_guard=True signature_tolerant=True",
             getattr(_ORIG_EXECUTE_BEST_CANDIDATE, "__name__", repr(_ORIG_EXECUTE_BEST_CANDIDATE)),
             _env_bool("ENTRY_BOARD_API_LOOKUP_ENABLED", False),
             _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", False),
@@ -489,4 +566,4 @@ except Exception:
     logger.exception("[FINAL ENTRY SAFETY GUARD] auto install failed")
 
 
-__all__ = ["install", "_board_guard", "_patched_board_guard", "_call_board_guard"]
+__all__ = ["install", "_board_guard", "_patched_board_guard", "_call_board_guard", "_native_board_guard"]
