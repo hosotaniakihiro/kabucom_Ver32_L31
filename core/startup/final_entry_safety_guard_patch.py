@@ -1,19 +1,17 @@
 # ============================================================
 # File   : core/startup/final_entry_safety_guard_patch.py
-# Version: Ver07-BOARD-GUARD-COMPAT-NO-BLOCKING-BOARD-API
+# Version: Ver08-BOARD-REST-FALLBACK-PENDING-CLEANUP
 # ------------------------------------------------------------
 # entry_controller._execute_best_candidate を runtime patch し、
 # 発注直前の最終安全ガードを追加する。
 #
-# Ver07:
-#   - _board_guard / _patched_board_guard を可変引数対応に統一。
-#   - 3引数版/4引数版の外部patchが混在しても TypeError で落とさない。
-#   - 板API取得は ENTRY_BOARD_API_LOOKUP_ENABLED=1 の時だけ実行。
-#     既定では /board への追加RESTを避け、bid/ask欠損時は保護条件を満たす候補だけ
-#     ENTRY_ALLOW_ENTRY_WITHOUT_BOARD で小ロットfail-openする。
-#   - 401/timeout時も候補処理を詰まらせず board_missing fallback に回す。
-#
-# 優先度3「当日損失上限で新規停止」は、ユーザー要望により未実装。
+# Ver08:
+#   - 発注直前の bid/ask 欠損時は REST board fallback を既定で1回だけ試す。
+#   - それでも板が取れない場合は発注しない。
+#   - board_missing / safety guard NG / order未発火時は該当pendingだけ解除し、
+#     次サイクルで古いpendingが残って候補を塞がないようにする。
+#   - main.py は PUSH DB 保存しない方針を維持する。
+#   - 優先度3「当日損失上限で新規停止」はユーザー要望により未実装。
 # ============================================================
 
 from __future__ import annotations
@@ -22,13 +20,12 @@ import datetime as dt
 import logging
 import os
 import time
-from typing import Any, Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 _INSTALLED = False
 _ORIG_EXECUTE_BEST_CANDIDATE = None
-
 
 _TRUE_SET = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 _FALSE_SET = {"0", "false", "no", "n", "off", "ng", "disable", "disabled", ""}
@@ -70,15 +67,15 @@ def _env_str(name: str, default: str) -> str:
 
 
 def _force_default_env() -> None:
-    # 板APIはkabu StationのREST負荷/401 retry/timeoutの原因になりやすいため既定OFF。
-    # row内にbid/askが無い場合は、流動性・score条件を満たす候補のみ小ロットで許可する。
-    os.environ.setdefault("ENTRY_BOARD_API_LOOKUP_ENABLED", "0")
-    os.environ.setdefault("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", "1")
-    os.environ.setdefault("ENTRY_ALLOW_WITHOUT_BOARD_MIN_VOLUME", "30000")
-    os.environ.setdefault("ENTRY_ALLOW_WITHOUT_BOARD_MIN_TURNOVER", "10000000")
-    os.environ.setdefault("ENTRY_ALLOW_WITHOUT_BOARD_MIN_PRICE", "200")
-    os.environ.setdefault("ENTRY_ALLOW_WITHOUT_BOARD_MIN_SCORE", "0.90")
-    os.environ.setdefault("ENTRY_BOARD_MISSING_QTY_RATIO", "0.50")
+    # 発注直前はPUSH板だけに依存しない。PUSHローテ中に対象銘柄が未登録でもREST /boardで補完する。
+    os.environ.setdefault("ENTRY_BOARD_API_LOOKUP_ENABLED", "1")
+    # 板なし発注は誤発注・価格未確定の原因になるため既定NG。
+    os.environ.setdefault("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", "0")
+    os.environ.setdefault("ENTRY_BOARD_MISSING_POP_PENDING", "1")
+    os.environ.setdefault("ENTRY_ORDER_FALSE_POP_PENDING", "1")
+    os.environ.setdefault("ENTRY_BOARD_API_MAX_ATTEMPTS", "1")
+    os.environ.setdefault("ENTRY_MAX_SPREAD_PCT", "0.20")
+    os.environ.setdefault("ENTRY_MIN_BEST_BOARD_QTY", "0")
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -159,6 +156,36 @@ def _log_ng(reason: str, symbol: str, side: str, **detail) -> None:
     )
 
 
+def _mark_skip(item: dict, reason: str, **detail) -> None:
+    try:
+        item["skip_reason"] = reason
+        item["final_guard_skip_reason"] = reason
+        item["final_guard_skip_detail"] = detail
+        ai = item.get("ai")
+        if isinstance(ai, dict):
+            ai["skip_reason"] = reason
+            ai["final_guard_skip_reason"] = reason
+    except Exception:
+        pass
+
+
+def _pop_pending_entry(symbol: str, item: dict, reason: str) -> None:
+    try:
+        entry = item.get("entry") if isinstance(item, dict) else None
+        if not isinstance(entry, dict):
+            return
+        from trading.entry.pending_manager import pop_entry, snapshot_root
+        pop_entry(symbol, entry)
+        logger.warning(
+            "[FINAL ENTRY SAFETY GUARD] PENDING_POP symbol=%s reason=%s root_after=%s",
+            symbol,
+            reason,
+            snapshot_root(),
+        )
+    except Exception:
+        logger.exception("[FINAL ENTRY SAFETY GUARD] pending pop failed symbol=%s reason=%s", symbol, reason)
+
+
 def _entry_time_guard(symbol: str, side: str) -> bool:
     if not _env_bool("ENTRY_TIME_GUARD_ENABLED", True):
         return True
@@ -231,14 +258,6 @@ def _same_symbol_loss_guard(symbol: str, side: str) -> bool:
                 return False
         except Exception:
             pass
-    for attr in ("recent_realized_pnl_map", "daily_symbol_realized_pnl_map", "symbol_realized_pnl_map", "realized_pnl_by_symbol"):
-        mp = getattr(global_data, attr, None)
-        if not isinstance(mp, dict):
-            continue
-        pnl = _safe_float(mp.get(symbol), 0.0)
-        if pnl < _env_float("ENTRY_SAME_SYMBOL_LOSS_LOCK_PNL_BELOW", 0.0):
-            _log_ng("same_symbol_realized_loss", symbol, side, source=attr, pnl=pnl)
-            return False
     min_count = _safe_int(_env_float("ENTRY_SAME_SYMBOL_LOSS_LOCK_MIN_COUNT", 1.0), 1)
     for attr in ("symbol_loss_count_map", "daily_symbol_loss_count_map", "recent_symbol_loss_count_map"):
         mp = getattr(global_data, attr, None)
@@ -274,10 +293,10 @@ def _recent_reverse_guard(row: dict, symbol: str, side: str) -> bool:
         logger.info("[FINAL ENTRY SAFETY GUARD] RECENT_REVERSE_SKIP symbol=%s side=%s reason=no_recent_data", symbol, side)
         return True
     if side == "BUY" and (pc3p < buy_min_3 or pc5p < buy_min_5 or pc10p < buy_min_10 or slope <= -max_bad_slope):
-        _log_ng("recent_down_against_buy", symbol, side, pc3=pc3p, pc5=pc5p, pc10=pc10p, slope=slope, limits=(buy_min_3, buy_min_5, buy_min_10, -max_bad_slope))
+        _log_ng("recent_down_against_buy", symbol, side, pc3=pc3p, pc5=pc5p, pc10=pc10p, slope=slope)
         return False
     if side == "SELL" and (pc3p > sell_max_3 or pc5p > sell_max_5 or pc10p > sell_max_10 or slope >= max_bad_slope):
-        _log_ng("recent_up_against_sell", symbol, side, pc3=pc3p, pc5=pc5p, pc10=pc10p, slope=slope, limits=(sell_max_3, sell_max_5, sell_max_10, max_bad_slope))
+        _log_ng("recent_up_against_sell", symbol, side, pc3=pc3p, pc5=pc5p, pc10=pc10p, slope=slope)
         return False
     logger.info("[FINAL ENTRY SAFETY GUARD] RECENT_REVERSE_OK symbol=%s side=%s pc3=%.3f pc5=%.3f pc10=%.3f slope=%.6f", symbol, side, pc3p, pc5p, pc10p, slope)
     return True
@@ -292,28 +311,35 @@ def _extract_bid_ask_from_row(row: dict) -> tuple[float, float, float, float]:
 
 
 def _try_get_bid_ask_from_api(symbol: str) -> tuple[float, float, float, float]:
-    if not _env_bool("ENTRY_BOARD_API_LOOKUP_ENABLED", False):
+    if not _env_bool("ENTRY_BOARD_API_LOOKUP_ENABLED", True):
         logger.info("[FINAL ENTRY SAFETY GUARD] BOARD_API_LOOKUP_SKIP symbol=%s enabled=0", symbol)
         return 0.0, 0.0, 0.0, 0.0
-    try:
-        from utils_common import get_latest_bid_ask
-        res = get_latest_bid_ask(symbol)
-        if isinstance(res, dict):
-            return (
-                _safe_float(res.get("bid") or res.get("best_bid") or res.get("BidPrice") or res.get("bid_price"), 0.0),
-                _safe_float(res.get("ask") or res.get("best_ask") or res.get("AskPrice") or res.get("ask_price"), 0.0),
-                _safe_float(res.get("bid_qty") or res.get("BidQty") or res.get("bid_volume"), 0.0),
-                _safe_float(res.get("ask_qty") or res.get("AskQty") or res.get("ask_volume"), 0.0),
-            )
-        if isinstance(res, (list, tuple)) and len(res) >= 2:
-            return _safe_float(res[0], 0.0), _safe_float(res[1], 0.0), 0.0, 0.0
-    except Exception as e:
-        logger.warning("[FINAL ENTRY SAFETY GUARD] get_latest_bid_ask skipped by error symbol=%s error=%s", symbol, e)
+    attempts = max(1, min(3, _safe_int(os.getenv("ENTRY_BOARD_API_MAX_ATTEMPTS"), 1)))
+    for i in range(attempts):
+        try:
+            from utils_common import get_latest_bid_ask
+            res = get_latest_bid_ask(symbol)
+            if isinstance(res, dict):
+                bid = _safe_float(res.get("bid") or res.get("best_bid") or res.get("BidPrice") or res.get("bid_price"), 0.0)
+                ask = _safe_float(res.get("ask") or res.get("best_ask") or res.get("AskPrice") or res.get("ask_price"), 0.0)
+                bid_qty = _safe_float(res.get("bid_qty") or res.get("BidQty") or res.get("bid_volume"), 0.0)
+                ask_qty = _safe_float(res.get("ask_qty") or res.get("AskQty") or res.get("ask_volume"), 0.0)
+                if bid > 0 and ask > 0:
+                    logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_API_OK symbol=%s attempt=%s bid=%.4f ask=%.4f", symbol, i + 1, bid, ask)
+                    return bid, ask, bid_qty, ask_qty
+            if isinstance(res, (list, tuple)) and len(res) >= 2:
+                bid = _safe_float(res[0], 0.0)
+                ask = _safe_float(res[1], 0.0)
+                if bid > 0 and ask > 0:
+                    logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_API_OK symbol=%s attempt=%s bid=%.4f ask=%.4f", symbol, i + 1, bid, ask)
+                    return bid, ask, 0.0, 0.0
+        except Exception as e:
+            logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_API_NG symbol=%s attempt=%s/%s error=%s", symbol, i + 1, attempts, e)
     return 0.0, 0.0, 0.0, 0.0
 
 
 def _board_missing_fallback_ok(row: dict, item: dict, symbol: str, side: str) -> bool:
-    if not _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", True):
+    if not _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", False):
         return False
     close = _safe_float(_first(row, ("close", "close_price", "price", "current_price"), 0.0), 0.0)
     volume = _safe_float(_first(row, ("volume", "Volume", "出来高"), 0.0), 0.0)
@@ -327,8 +353,8 @@ def _board_missing_fallback_ok(row: dict, item: dict, symbol: str, side: str) ->
     min_score = _env_float("ENTRY_ALLOW_WITHOUT_BOARD_MIN_SCORE", 0.90)
     if close < min_price or volume < min_volume or turnover < min_turnover or score < min_score:
         logger.warning(
-            "[FINAL ENTRY SAFETY GUARD] BOARD_MISSING_FALLBACK_NG symbol=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f limits price>=%.1f volume>=%.0f turnover>=%.0f score>=%.2f",
-            symbol, side, close, volume, turnover, score, min_price, min_volume, min_turnover, min_score,
+            "[FINAL ENTRY SAFETY GUARD] BOARD_MISSING_FALLBACK_NG symbol=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f",
+            symbol, side, close, volume, turnover, score,
         )
         return False
     try:
@@ -341,10 +367,7 @@ def _board_missing_fallback_ok(row: dict, item: dict, symbol: str, side: str) ->
             ai["board_missing_fallback"] = True
     except Exception:
         pass
-    logger.warning(
-        "[FINAL ENTRY SAFETY GUARD] BOARD_MISSING_ALLOW_PROTECTED symbol=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f qty_ratio=%s",
-        symbol, side, close, volume, turnover, score, os.getenv("ENTRY_BOARD_MISSING_QTY_RATIO"),
-    )
+    logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_MISSING_ALLOW_PROTECTED symbol=%s side=%s", symbol, side)
     return True
 
 
@@ -353,23 +376,19 @@ def _coerce_board_guard_args(args: tuple[Any, ...], kwargs: dict[str, Any]) -> t
     item: dict = {}
     symbol: Any = kwargs.get("symbol")
     side: Any = kwargs.get("side")
-
     if len(args) >= 4:
         item = args[1] if isinstance(args[1], dict) else {}
         symbol = args[2]
         side = args[3]
     elif len(args) >= 3:
-        # old: guard(row, symbol, side)
         item = kwargs.get("item") if isinstance(kwargs.get("item"), dict) else {}
         symbol = args[1]
         side = args[2]
     elif len(args) >= 2:
-        # semi-old: guard(row, item) or guard(row, symbol)
         if isinstance(args[1], dict):
             item = args[1]
         else:
             symbol = args[1]
-
     if not isinstance(item, dict):
         item = {}
     symbol = _norm_symbol(symbol or _first(row, ("symbol", "Symbol", "code", "銘柄コード"), ""))
@@ -378,7 +397,6 @@ def _coerce_board_guard_args(args: tuple[Any, ...], kwargs: dict[str, Any]) -> t
 
 
 def _board_guard(*args, **kwargs) -> bool:
-    """板ガード。3引数/4引数/keyword混在をすべて許容する。"""
     row, item, symbol, side = _coerce_board_guard_args(args, kwargs)
     if not symbol or side not in {"BUY", "SELL"}:
         _log_ng("board_guard_invalid_args", symbol, side, row_keys=list(row.keys()), item_keys=list(item.keys()))
@@ -397,70 +415,52 @@ def _board_guard(*args, **kwargs) -> bool:
     if bid <= 0 or ask <= 0:
         if _board_missing_fallback_ok(row, item, symbol, side):
             return True
+        _mark_skip(item, "board_missing", bid=bid, ask=ask)
         _log_ng("board_missing", symbol, side, bid=bid, ask=ask, message="板が取れないため新規エントリー停止")
         return False
 
     mid = (bid + ask) / 2.0
     spread_pct = ((ask - bid) / mid) * 100.0 if mid > 0 else 999.0
-    max_spread = _env_float("ENTRY_MAX_SPREAD_PCT", 0.15)
-    min_best_qty = _env_float("ENTRY_MIN_BEST_BOARD_QTY", 100.0)
+    max_spread = _env_float("ENTRY_MAX_SPREAD_PCT", 0.20)
+    min_best_qty = _env_float("ENTRY_MIN_BEST_BOARD_QTY", 0.0)
     if spread_pct > max_spread:
+        _mark_skip(item, "spread_too_wide", bid=bid, ask=ask, spread_pct=spread_pct)
         _log_ng("spread_too_wide", symbol, side, bid=bid, ask=ask, spread_pct=spread_pct, max_spread=max_spread)
         return False
     if side == "BUY" and ask_qty > 0 and ask_qty < min_best_qty:
+        _mark_skip(item, "ask_board_too_thin", ask_qty=ask_qty)
         _log_ng("ask_board_too_thin", symbol, side, ask_qty=ask_qty, min_best_qty=min_best_qty, bid=bid, ask=ask)
         return False
     if side == "SELL" and bid_qty > 0 and bid_qty < min_best_qty:
+        _mark_skip(item, "bid_board_too_thin", bid_qty=bid_qty)
         _log_ng("bid_board_too_thin", symbol, side, bid_qty=bid_qty, min_best_qty=min_best_qty, bid=bid, ask=ask)
         return False
+
+    try:
+        row["bid"] = bid
+        row["ask"] = ask
+        row["bid_qty"] = bid_qty
+        row["ask_qty"] = ask_qty
+        if isinstance(item, dict) and isinstance(item.get("entry_row"), dict):
+            item["entry_row"].update({"bid": bid, "ask": ask, "bid_qty": bid_qty, "ask_qty": ask_qty})
+    except Exception:
+        pass
     logger.info("[FINAL ENTRY SAFETY GUARD] BOARD_OK symbol=%s side=%s bid=%.4f ask=%.4f spread_pct=%.4f bid_qty=%.0f ask_qty=%.0f", symbol, side, bid, ask, spread_pct, bid_qty, ask_qty)
     return True
 
 
 def _patched_board_guard(*args, **kwargs) -> bool:
-    """互換名。外部から4引数で呼ばれても絶対に TypeError にしない。"""
     return _board_guard(*args, **kwargs)
 
 
 def _call_board_guard(row: dict, item: dict, symbol: str, side: str) -> bool:
-    """外部patchで board guard が3引数関数に差し替わっても落とさない安全呼び出し。"""
-    candidates: list[Callable[..., Any]] = []
-    for name in ("_patched_board_guard", "_board_guard"):
-        fn = globals().get(name)
-        if callable(fn) and fn not in candidates:
-            candidates.append(fn)
-    for guard in candidates:
-        try:
-            return bool(guard(row, item, symbol, side))
-        except TypeError as e4:
-            logger.warning(
-                "[FINAL ENTRY SAFETY GUARD] BOARD_GUARD_RETRY_3ARGS symbol=%s side=%s guard=%s error=%s",
-                symbol,
-                side,
-                getattr(guard, "__name__", repr(guard)),
-                e4,
-            )
-            try:
-                return bool(guard(row, symbol, side))
-            except TypeError as e3:
-                logger.warning(
-                    "[FINAL ENTRY SAFETY GUARD] BOARD_GUARD_SKIP_INCOMPATIBLE symbol=%s side=%s guard=%s error=%s",
-                    symbol,
-                    side,
-                    getattr(guard, "__name__", repr(guard)),
-                    e3,
-                )
-                continue
-        except Exception as e:
-            logger.warning(
-                "[FINAL ENTRY SAFETY GUARD] BOARD_GUARD_ERROR_FALLBACK symbol=%s side=%s guard=%s error=%s",
-                symbol,
-                side,
-                getattr(guard, "__name__", repr(guard)),
-                e,
-            )
-            return _board_missing_fallback_ok(row, item, symbol, side)
-    return _board_missing_fallback_ok(row, item, symbol, side)
+    try:
+        return bool(_board_guard(row, item, symbol, side))
+    except TypeError:
+        return bool(_board_guard(row, symbol, side))
+    except Exception as e:
+        logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_GUARD_ERROR symbol=%s side=%s error=%s", symbol, side, e)
+        return _board_missing_fallback_ok(row, item, symbol, side)
 
 
 def _apply_contrarian_half_size(item: dict, row: dict, symbol: str, side: str) -> None:
@@ -482,6 +482,13 @@ def _apply_contrarian_half_size(item: dict, row: dict, symbol: str, side: str) -
     logger.warning("[FINAL ENTRY SAFETY GUARD] CONTRARIAN_HALF_SIZE symbol=%s side=%s type=%s lot_multiplier %.3f -> %.3f ratio=%.3f", symbol, side, ctype, old_lot, new_lot, ratio)
 
 
+def _guard_fail(item: dict, symbol: str, reason: str, *, pop: bool = False, **detail) -> bool:
+    _mark_skip(item, reason, **detail)
+    if pop:
+        _pop_pending_entry(symbol, item, reason)
+    return False
+
+
 def _patched_execute_best_candidate(item: dict, boost_active: bool) -> bool:
     if not callable(_ORIG_EXECUTE_BEST_CANDIDATE):
         logger.error("[FINAL ENTRY SAFETY GUARD] original _execute_best_candidate unavailable")
@@ -495,17 +502,22 @@ def _patched_execute_best_candidate(item: dict, boost_active: bool) -> bool:
         side = _norm_side(item.get("side") or _first(row, ("side", "entry_decision", "ai_side"), ""))
         if side not in {"BUY", "SELL"}:
             _log_ng("unknown_side", symbol, side, item_keys=list(item.keys()))
-            return False
+            return _guard_fail(item, symbol, "unknown_side")
         if not _entry_time_guard(symbol, side):
-            return False
+            return _guard_fail(item, symbol, "time_guard_ng")
         if not _liquidity_guard(row, symbol, side):
-            return False
+            return _guard_fail(item, symbol, "liquidity_guard_ng")
         if not _same_symbol_loss_guard(symbol, side):
-            return False
+            return _guard_fail(item, symbol, "same_symbol_loss_guard_ng")
         if not _recent_reverse_guard(row, symbol, side):
-            return False
+            return _guard_fail(item, symbol, "recent_reverse_guard_ng")
         if not _call_board_guard(row, item, symbol, side):
-            return False
+            return _guard_fail(
+                item,
+                symbol,
+                "board_missing",
+                pop=_env_bool("ENTRY_BOARD_MISSING_POP_PENDING", True),
+            )
         _apply_contrarian_half_size(item, row, symbol, side)
 
         logger.info("[FINAL ENTRY SAFETY GUARD] ALL_OK symbol=%s side=%s", symbol, side)
@@ -514,7 +526,10 @@ def _patched_execute_best_candidate(item: dict, boost_active: bool) -> bool:
         elapsed = time.time() - started
         logger.warning("[FINAL ENTRY SAFETY GUARD] CALL_ORIG_DONE symbol=%s side=%s ok=%s elapsed=%.3fs", symbol, side, ok, elapsed)
         if not ok:
-            logger.warning("[FINAL ENTRY SAFETY GUARD] ORIG_RETURN_FALSE symbol=%s side=%s elapsed=%.3fs", symbol, side, elapsed)
+            reason = str(item.get("skip_reason") or item.get("final_guard_skip_reason") or "entry_controller_no_order")
+            logger.warning("[FINAL ENTRY SAFETY GUARD] ORIG_RETURN_FALSE symbol=%s side=%s reason=%s elapsed=%.3fs", symbol, side, reason, elapsed)
+            if _env_bool("ENTRY_ORDER_FALSE_POP_PENDING", True):
+                _pop_pending_entry(symbol, item, reason)
         return ok
     except Exception:
         logger.exception("[FINAL ENTRY SAFETY GUARD] patched execute failed symbol=%s side=%s", symbol, side)
@@ -525,7 +540,7 @@ def _is_currently_wrapped() -> bool:
     try:
         import trading.handlers.entry_controller as ec
         cur = getattr(ec, "_execute_best_candidate", None)
-        return bool(getattr(cur, "_final_entry_safety_guard_v07", False))
+        return bool(getattr(cur, "_final_entry_safety_guard_v08", False))
     except Exception:
         return False
 
@@ -541,19 +556,19 @@ def install() -> bool:
         if not callable(old):
             logger.error("[FINAL ENTRY SAFETY GUARD] target _execute_best_candidate unavailable")
             return False
-        if getattr(old, "_final_entry_safety_guard_v07", False):
+        if getattr(old, "_final_entry_safety_guard_v08", False):
             _INSTALLED = True
             return True
-        if getattr(old, "_final_entry_safety_guard", False) and _ORIG_EXECUTE_BEST_CANDIDATE is not None:
+        if (getattr(old, "_final_entry_safety_guard", False) or getattr(old, "_final_entry_safety_guard_v07", False)) and _ORIG_EXECUTE_BEST_CANDIDATE is not None:
             old = _ORIG_EXECUTE_BEST_CANDIDATE
         _ORIG_EXECUTE_BEST_CANDIDATE = old
         _patched_execute_best_candidate._final_entry_safety_guard = True  # type: ignore[attr-defined]
-        _patched_execute_best_candidate._final_entry_safety_guard_v07 = True  # type: ignore[attr-defined]
+        _patched_execute_best_candidate._final_entry_safety_guard_v08 = True  # type: ignore[attr-defined]
         _patched_execute_best_candidate._original_execute_best_candidate = old  # type: ignore[attr-defined]
         ec._execute_best_candidate = _patched_execute_best_candidate
         _INSTALLED = True
         logger.warning(
-            "[FINAL ENTRY SAFETY GUARD] installed v07 liquidity=%s min_volume=%.0f min_turnover=%.0f same_symbol_loss=%s recent_reverse=%s time_guard=%s board_guard=%s board_api_lookup=%s allow_without_board=%s board_missing_qty_ratio=%.2f contrarian_half=%s qty_ratio=%.2f daily_loss_guard=NOT_INSTALLED_BY_REQUEST",
+            "[FINAL ENTRY SAFETY GUARD] installed v08 liquidity=%s min_volume=%.0f min_turnover=%.0f same_symbol_loss=%s recent_reverse=%s time_guard=%s board_guard=%s board_api_lookup=%s allow_without_board=%s board_missing_pop=%s order_false_pop=%s daily_loss_guard=NOT_INSTALLED_BY_REQUEST",
             _env_bool("ENTRY_FINAL_LIQUIDITY_GUARD_ENABLED", True),
             _env_float("ENTRY_MIN_VOLUME", 30000.0),
             _env_float("ENTRY_MIN_TURNOVER", 10000000.0),
@@ -561,11 +576,10 @@ def install() -> bool:
             _env_bool("ENTRY_RECENT_REVERSE_GUARD_ENABLED", True),
             _env_bool("ENTRY_TIME_GUARD_ENABLED", True),
             _env_bool("ENTRY_BOARD_GUARD_ENABLED", True),
-            _env_bool("ENTRY_BOARD_API_LOOKUP_ENABLED", False),
-            _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", True),
-            _env_float("ENTRY_BOARD_MISSING_QTY_RATIO", 0.5),
-            _env_bool("ENTRY_CONTRARIAN_HALF_SIZE_ENABLED", True),
-            _env_float("ENTRY_CONTRARIAN_QTY_RATIO", 0.5),
+            _env_bool("ENTRY_BOARD_API_LOOKUP_ENABLED", True),
+            _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", False),
+            _env_bool("ENTRY_BOARD_MISSING_POP_PENDING", True),
+            _env_bool("ENTRY_ORDER_FALSE_POP_PENDING", True),
         )
         return True
     except Exception:
