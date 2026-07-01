@@ -1,24 +1,22 @@
 # ============================================================
 # File   : core/startup/summary_ai_async_direct_dispatch_patch.py
-# Version: V9-STRICT-EXECUTED-RESULT-AND-TIMEOUT
+# Version: V10-STRICT-EXECUTED-AND-PRICE2500
 # ------------------------------------------------------------
 # 目的:
 #   SUMMARY AI が AI_OK / approved を出しても、
 #   summary_ai_async_entry_patch が executed=False / skip=queued_async を返し、
 #   実発注がworker待ち・stale skip になる問題を止める。
 #
+# V10:
+#   - SUMMARY AI approved 選定直前に最低価格を 2,500円へ強制する。
+#   - 低価格銘柄(例: 330A/402A/336A)が上位3枠を占有して、
+#     実発注候補が snapshot_no_order になる状態を避ける。
+#   - V9 の strict executed 判定と V8 の direct snapshot timeout は維持。
+#
 # V9:
 #   - executor._positive_result が result['approved'] だけで True を返す問題を補正。
 #   - entries=0 / result.executed=False / no_tradable_rows_after_filters を
 #     外側 executed=True に誤変換しない。
-#   - V8の direct_sync 強制 + direct snapshot timeout は維持。
-#
-# V8:
-#   - V7の direct_sync 強制は維持。
-#   - direct snapshot が entry_controller 内で長時間止まり、
-#     sync fallback done が出ないケースを検出するためタイムアウトを追加。
-#   - タイムアウト時は必ず direct snapshot timeout としてログに残す。
-#   - timeout 後の重複発注を避けるため、同一呼び出しでは追加retryしない。
 # ============================================================
 from __future__ import annotations
 
@@ -30,11 +28,12 @@ from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V9-STRICT-EXECUTED-RESULT-AND-TIMEOUT"
+VERSION = "V10-STRICT-EXECUTED-AND-PRICE2500"
 _INSTALLED = False
 _ORIG = None
 _WATCHER_STARTED = False
 _POSITIVE_RESULT_PATCHED = False
+_PRICE_FLOOR_PATCHED = False
 
 _RETRYABLE_NO_ORDER_MARKERS = (
     "queued_async",
@@ -50,18 +49,6 @@ _RETRYABLE_NO_ORDER_MARKERS = (
     "no_pending_registered",
     "pipeline_filter_mismatch",
 )
-
-
-def _force_direct_sync_env() -> None:
-    os.environ["SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC"] = "1"
-    os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY", "1")
-    os.environ.setdefault("SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT", "1")
-    os.environ.setdefault("SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK", "1")
-    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_SNAPSHOT_FIRST", "1")
-    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_MAX_ATTEMPTS", "2")
-    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_RETRY_SLEEP_SEC", "0.7")
-    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_PIPELINE_SOURCE", "SUMMARY")
-    os.environ.setdefault("SUMMARY_AI_DIRECT_SNAPSHOT_TIMEOUT_SEC", "8.0")
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -94,9 +81,34 @@ def _env_float(name: str, default: float) -> float:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
             return float(default)
-        return float(v)
+        return float(str(v).replace(",", ""))
     except Exception:
         return float(default)
+
+
+def _summary_ai_price_floor() -> float:
+    return max(0.0, _env_float("SUMMARY_AI_APPROVAL_MIN_PRICE_OVERRIDE", 2500.0))
+
+
+def _force_direct_sync_env() -> None:
+    os.environ["SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC"] = "1"
+    os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY", "1")
+    os.environ.setdefault("SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT", "1")
+    os.environ.setdefault("SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK", "1")
+    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_SNAPSHOT_FIRST", "1")
+    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_MAX_ATTEMPTS", "2")
+    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_RETRY_SLEEP_SEC", "0.7")
+    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_PIPELINE_SOURCE", "SUMMARY")
+    os.environ.setdefault("SUMMARY_AI_DIRECT_SNAPSHOT_TIMEOUT_SEC", "8.0")
+
+    # settings.ini が min_price=200 の場合でも、SUMMARY AI の実発注候補は 2,500円以上へ戻す。
+    # ENTRY_MIN_PRICE も合わせて上書きし、後段 guard / entry_budget の読み取りと一致させる。
+    floor = _summary_ai_price_floor()
+    if floor > 0:
+        os.environ["SUMMARY_AI_APPROVAL_MIN_PRICE_OVERRIDE"] = str(floor)
+        os.environ["SUMMARY_AI_ENTRY_MIN_PRICE"] = str(floor)
+        os.environ["ENTRY_MIN_PRICE"] = str(floor)
+        os.environ["SUMMARY_AI_LIQ_MIN_PRICE"] = str(floor)
 
 
 def _row_to_dict(row: Any) -> dict[str, Any]:
@@ -328,8 +340,8 @@ def _direct_snapshot_execute(approved_rows: list[Any], interval: Any) -> Any:
             return None
         pipeline_source = _resolve_pipeline_source(approved_rows)
         logger.warning(
-            "[SUMMARY AI DIRECT DISPATCH] direct snapshot pipeline_source resolved=%s symbols=%s timeout=%.3fs version=%s",
-            pipeline_source, _symbols(approved_rows), _env_float("SUMMARY_AI_DIRECT_SNAPSHOT_TIMEOUT_SEC", 8.0), VERSION,
+            "[SUMMARY AI DIRECT DISPATCH] direct snapshot pipeline_source resolved=%s symbols=%s timeout=%.3fs price_floor=%.0f version=%s",
+            pipeline_source, _symbols(approved_rows), _env_float("SUMMARY_AI_DIRECT_SNAPSHOT_TIMEOUT_SEC", 8.0), _summary_ai_price_floor(), VERSION,
         )
         return fn(approved_rows, pipeline_source=pipeline_source, interval=interval)
     except TypeError:
@@ -360,8 +372,8 @@ def _fallback_direct_dispatch(result: Any, kwargs: dict[str, Any]) -> Any:
         for attempt in range(1, attempts + 1):
             started = time.time()
             logger.warning(
-                "[SUMMARY AI DIRECT DISPATCH] sync fallback start attempt=%s/%s interval=%s approved=%s symbols=%s timeout=%.3fs version=%s",
-                attempt, attempts, interval, len(approved_rows), _symbols(approved_rows), timeout_sec, VERSION,
+                "[SUMMARY AI DIRECT DISPATCH] sync fallback start attempt=%s/%s interval=%s approved=%s symbols=%s timeout=%.3fs price_floor=%.0f version=%s",
+                attempt, attempts, interval, len(approved_rows), _symbols(approved_rows), timeout_sec, _summary_ai_price_floor(), VERSION,
             )
             snap_result = _call_with_timeout(
                 "direct_snapshot", approved_rows, timeout_sec, lambda: _direct_snapshot_execute(approved_rows, interval)
@@ -426,6 +438,50 @@ def _install_executor_positive_result_patch(exec_mod: Any) -> bool:
         return False
 
 
+def _install_executor_price_floor_patch(exec_mod: Any) -> bool:
+    global _PRICE_FLOOR_PATCHED
+    try:
+        floor = _summary_ai_price_floor()
+        if floor <= 0:
+            return False
+        try:
+            exec_mod.DEFAULT_MIN_PRICE_FOR_ENTRY = float(floor)
+        except Exception:
+            pass
+        cur = getattr(exec_mod, "_entry_price_bounds", None)
+        if getattr(cur, "_summary_ai_price2500_patch_v1", False):
+            _PRICE_FLOOR_PATCHED = True
+            return True
+        if not callable(cur):
+            return False
+
+        def _patched_entry_price_bounds():
+            min_price, max_price, diag = cur()
+            try:
+                old_min = float(min_price or 0.0)
+                min_price = max(old_min, float(floor))
+                if not isinstance(diag, dict):
+                    diag = {"raw_diag": str(diag)}
+                diag = dict(diag)
+                diag["summary_ai_price2500_patch"] = True
+                diag["old_min_price"] = old_min
+                diag["effective_min_price"] = float(min_price or 0.0)
+                diag["min_override"] = float(floor)
+            except Exception:
+                pass
+            return min_price, max_price, diag
+
+        _patched_entry_price_bounds._summary_ai_price2500_patch_v1 = True  # type: ignore[attr-defined]
+        _patched_entry_price_bounds._original = cur  # type: ignore[attr-defined]
+        exec_mod._entry_price_bounds = _patched_entry_price_bounds
+        _PRICE_FLOOR_PATCHED = True
+        logger.warning("[SUMMARY AI DIRECT DISPATCH] patched executor price floor min_price=%.0f version=%s", floor, VERSION)
+        return True
+    except Exception:
+        logger.exception("[SUMMARY AI DIRECT DISPATCH] patch executor price floor failed")
+        return False
+
+
 def _patch_once(*, log_patch: bool = True) -> bool:
     global _INSTALLED, _ORIG
     try:
@@ -433,14 +489,16 @@ def _patch_once(*, log_patch: bool = True) -> bool:
         from trading.entry.summary_ai import executor as exec_mod
         from trading.entry.summary_ai import runner as runner_mod
         _install_executor_positive_result_patch(exec_mod)
+        _install_executor_price_floor_patch(exec_mod)
         cur = getattr(exec_mod, "execute_ai_ok_entries_bulk", None)
         if not callable(cur):
             logger.debug("[SUMMARY AI DIRECT DISPATCH] target missing")
             return False
-        if getattr(cur, "_summary_ai_direct_dispatch_v9", False):
+        if getattr(cur, "_summary_ai_direct_dispatch_v10", False):
             _INSTALLED = True
             return True
-        _ORIG = getattr(cur, "_original", cur) if any(getattr(cur, f"_summary_ai_direct_dispatch_v{i}", False) for i in range(1, 9)) else cur
+        _ORIG = getattr(cur, "_original", cur) if any(getattr(cur, f"_summary_ai_direct_dispatch_v{i}", False) for i in range(1, 10)) else cur
+        _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v10 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v9 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v8 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v7 = True  # type: ignore[attr-defined]
@@ -451,13 +509,15 @@ def _patch_once(*, log_patch: bool = True) -> bool:
         _INSTALLED = True
         if log_patch:
             logger.warning(
-                "[SUMMARY AI DIRECT DISPATCH] patched v9 target=%s direct_sync_env=%s attempts=%s snapshot_first=%s timeout=%.3fs strict_positive=%s source_match=True version=%s",
+                "[SUMMARY AI DIRECT DISPATCH] patched v10 target=%s direct_sync_env=%s attempts=%s snapshot_first=%s timeout=%.3fs strict_positive=%s price_floor=%.0f price_patch=%s source_match=True version=%s",
                 getattr(_ORIG, "__name__", type(_ORIG).__name__),
                 os.getenv("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC"),
                 _env_int("SUMMARY_AI_DIRECT_DISPATCH_MAX_ATTEMPTS", 2),
                 _env_bool("SUMMARY_AI_DIRECT_DISPATCH_SNAPSHOT_FIRST", True),
                 _env_float("SUMMARY_AI_DIRECT_SNAPSHOT_TIMEOUT_SEC", 8.0),
                 _POSITIVE_RESULT_PATCHED,
+                _summary_ai_price_floor(),
+                _PRICE_FLOOR_PATCHED,
                 VERSION,
             )
         return True
@@ -474,9 +534,10 @@ def _watch_reinstall() -> None:
         ok = _patch_once(log_patch=False)
         if i in (0, loops - 1):
             logger.warning(
-                "[SUMMARY AI DIRECT DISPATCH] enforce v9 i=%s/%s ok=%s direct_sync_env=%s timeout=%.3fs strict_positive=%s version=%s",
+                "[SUMMARY AI DIRECT DISPATCH] enforce v10 i=%s/%s ok=%s direct_sync_env=%s timeout=%.3fs strict_positive=%s price_floor=%.0f price_patch=%s version=%s",
                 i, loops, ok, os.getenv("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC"),
-                _env_float("SUMMARY_AI_DIRECT_SNAPSHOT_TIMEOUT_SEC", 8.0), _POSITIVE_RESULT_PATCHED, VERSION,
+                _env_float("SUMMARY_AI_DIRECT_SNAPSHOT_TIMEOUT_SEC", 8.0), _POSITIVE_RESULT_PATCHED,
+                _summary_ai_price_floor(), _PRICE_FLOOR_PATCHED, VERSION,
             )
         time.sleep(sleep_sec)
 
@@ -492,7 +553,7 @@ def install() -> bool:
         _WATCHER_STARTED = True
         threading.Thread(target=_watch_reinstall, daemon=True, name="summary-ai-direct-dispatch-enforcer").start()
         logger.warning(
-            "[SUMMARY AI DIRECT DISPATCH] installed/enforcing v9 ok=%s watcher=%s loops=%s sleep=%s direct_sync_env=%s snapshot_first=%s timeout=%.3fs strict_positive=%s version=%s",
+            "[SUMMARY AI DIRECT DISPATCH] installed/enforcing v10 ok=%s watcher=%s loops=%s sleep=%s direct_sync_env=%s snapshot_first=%s timeout=%.3fs strict_positive=%s price_floor=%.0f price_patch=%s version=%s",
             ok,
             _WATCHER_STARTED,
             _env_int("SUMMARY_AI_DIRECT_DISPATCH_WATCH_LOOPS", 12),
@@ -501,6 +562,8 @@ def install() -> bool:
             _env_bool("SUMMARY_AI_DIRECT_DISPATCH_SNAPSHOT_FIRST", True),
             _env_float("SUMMARY_AI_DIRECT_SNAPSHOT_TIMEOUT_SEC", 8.0),
             _POSITIVE_RESULT_PATCHED,
+            _summary_ai_price_floor(),
+            _PRICE_FLOOR_PATCHED,
             VERSION,
         )
     return bool(ok)
