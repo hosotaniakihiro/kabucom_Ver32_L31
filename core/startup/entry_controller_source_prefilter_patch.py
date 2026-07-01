@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/entry_controller_source_prefilter_patch.py
-# Version: V2-SUMMARY-AI-SUMMARY-COMPAT
+# Version: V3-SUMMARY-AI-SUMMARY-COMPAT-VOL-RESCUE
 # ------------------------------------------------------------
 # 目的:
 #   entry_controller._build_scored_candidates() は entries[:MAX_CANDIDATES_PER_SYMBOL]
@@ -10,12 +10,10 @@
 #   先頭10件を占有し、PIPELINE_FILTER_MISMATCH を大量に出したり、正しい候補が
 #   後ろにあるのに評価されない。
 #
-# V2:
-#   - SUMMARY_AI pipeline は SUMMARY 由来の候補を許可する。
-#   - entry_controller 本体の _entry_matches_pipeline も monkey patch し、
-#     prefilter後に本体側で再度 PIPELINE_FILTER_MISMATCH になる問題を修正。
-#   - SUMMARY_AI pipeline へ渡す候補は source=SUMMARY_AI / entry_type=SUMMARY_AI に
-#     正規化してから original build に渡す。
+# V3:
+#   - V2の SUMMARY_AI/SUMMARY 互換を維持。
+#   - SUMMARY_AI strong candidate が ATR_1M_FILTER_NG / RANGE_5M_FILTER_NG だけで
+#     全落ちする問題を防ぐため summary_ai_volatility_rescue_patch も同時install。
 # ============================================================
 
 from __future__ import annotations
@@ -72,11 +70,8 @@ def _source_compatible(entry_source: Any, pipeline_source: str | None) -> bool:
         return True
     if es == ps:
         return True
-    # SUMMARY_AI runner/dispatch で pending に入る entry は、実データ由来として
-    # source=SUMMARY のままになることがある。これは SUMMARY_AI pipeline で評価すべき候補。
     if ps == "SUMMARY_AI" and es in {"SUMMARY", "PUSH", ""}:
         return True
-    # 逆方向も念のため許可。SUMMARY pipeline から SUMMARY_AI marked entry を見ても同系統扱い。
     if ps == "SUMMARY" and es == "SUMMARY_AI":
         return True
     return False
@@ -195,6 +190,18 @@ def _patched_build_scored_candidates(*args, **kwargs):
         return _ORIGINAL_BUILD(*args, **kwargs)
 
 
+def _install_summary_ai_vol_rescue() -> bool:
+    try:
+        from core.startup import summary_ai_volatility_rescue_patch as p
+        fn = getattr(p, "install", None)
+        ok = bool(fn()) if callable(fn) else False
+        logger.warning("[ENTRY SOURCE PREFILTER] summary_ai_volatility_rescue installed=%s", ok)
+        return ok
+    except Exception:
+        logger.exception("[ENTRY SOURCE PREFILTER] summary_ai_volatility_rescue install failed")
+        return False
+
+
 def install() -> bool:
     global _INSTALLED, _ORIGINAL_BUILD, _ORIGINAL_MATCHES
     try:
@@ -203,32 +210,37 @@ def install() -> bool:
         cur = getattr(ec, "_build_scored_candidates", None)
         if not callable(cur):
             logger.warning("[ENTRY SOURCE PREFILTER] target missing")
+            _install_summary_ai_vol_rescue()
             return False
 
-        if not getattr(cur, "_entry_source_prefilter_patch_v2", False):
-            # 再インストール時は v1 wrapper の original を剥がして二重wrapを避ける。
+        if not getattr(cur, "_entry_source_prefilter_patch_v3", False):
             base = getattr(cur, "_original", cur)
             _ORIGINAL_BUILD = base
             _patched_build_scored_candidates._entry_source_prefilter_patch = True  # type: ignore[attr-defined]
             _patched_build_scored_candidates._entry_source_prefilter_patch_v2 = True  # type: ignore[attr-defined]
+            _patched_build_scored_candidates._entry_source_prefilter_patch_v3 = True  # type: ignore[attr-defined]
             _patched_build_scored_candidates._original = base  # type: ignore[attr-defined]
             ec._build_scored_candidates = _patched_build_scored_candidates
 
         match_cur = getattr(ec, "_entry_matches_pipeline", None)
-        if callable(match_cur) and not getattr(match_cur, "_entry_source_prefilter_match_v2", False):
+        if callable(match_cur) and not getattr(match_cur, "_entry_source_prefilter_match_v3", False):
             _ORIGINAL_MATCHES = getattr(match_cur, "_original", match_cur)
             _patched_entry_matches_pipeline._entry_source_prefilter_match_v2 = True  # type: ignore[attr-defined]
+            _patched_entry_matches_pipeline._entry_source_prefilter_match_v3 = True  # type: ignore[attr-defined]
             _patched_entry_matches_pipeline._original = _ORIGINAL_MATCHES  # type: ignore[attr-defined]
             ec._entry_matches_pipeline = _patched_entry_matches_pipeline
 
+        vol_ok = _install_summary_ai_vol_rescue()
         _INSTALLED = True
         logger.warning(
-            "[ENTRY SOURCE PREFILTER] installed v2 enabled=%s summary_ai_accepts_summary=True patched_match=True",
+            "[ENTRY SOURCE PREFILTER] installed v3 enabled=%s summary_ai_accepts_summary=True patched_match=True vol_rescue=%s",
             _env_bool("ENTRY_CONTROLLER_SOURCE_PREFILTER_ENABLED", True),
+            vol_ok,
         )
         return True
     except Exception:
         logger.exception("[ENTRY SOURCE PREFILTER] install failed")
+        _install_summary_ai_vol_rescue()
         return False
 
 
