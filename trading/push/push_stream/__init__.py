@@ -1,13 +1,13 @@
 # ============================================================
 # File   : trading/push/push_stream/__init__.py
-# Version: Ver2.0-MAIN-WS-GUARD-FRESHNESS-FALLBACK
+# Version: Ver2.1-MAIN-WS-HARD-SKIP-SPLIT-MODE
 # ------------------------------------------------------------
 # ✔ 旧 trading.push.push_stream 公開API互換
 # ✔ 分割後モジュールの再エクスポート
 # ✔ transport / rotation_core / runner / dataframe の公開窓口
-# ✔ main_database.py 分離運用時、main.py側の重複PUSH WSを原則no-op化
-# ✔ ただし main_database.py 側のsummary/PUSHが stale の場合、main.pyは
-#   memory-only WSとして自動復帰し、エントリー判定用の最新1分足を作る
+# ✔ main_database.py 分離運用時、main.py側の重複PUSH WSをno-op化
+# ✔ emergency時のみ AUTOSTOCK_MAIN_PUSH_WS_ENABLED=1 で main.py側WSを許可
+# ✔ optional fallback は AUTOSTOCK_MAIN_PUSH_WS_AUTO_FALLBACK=1 の明示時だけ許可
 # ✔ PUSH rotation stability patch / liquidity keep100 patch を自動適用
 # ✔ runner module 直呼び経路も同じguardへ寄せるが、再帰は防ぐ
 # ============================================================
@@ -155,27 +155,33 @@ def _latest_summary_age_sec() -> float | None:
 
 
 def _main_ws_fallback_allowed_due_to_stale_summary() -> bool:
-    if not _env_bool("AUTOSTOCK_MAIN_PUSH_WS_AUTO_FALLBACK", True):
+    """
+    split mode の main.py 側 memory-only PUSH WS fallback。
+
+    以前はデフォルト True だったため、起動直後に summary がまだ見えないだけで
+    main.py 側にも PUSH WebSocket が立ち上がり、main_database.py 側と二重接続になった。
+    通常運用では main_database.py / data_collectors_runner が PUSH受信・保存を担当するため、
+    fallback は明示的に AUTOSTOCK_MAIN_PUSH_WS_AUTO_FALLBACK=1 を指定した場合だけ許可する。
+    """
+    if not _env_bool("AUTOSTOCK_MAIN_PUSH_WS_AUTO_FALLBACK", False):
         return False
     stale_sec = max(30.0, _env_float("AUTOSTOCK_MAIN_PUSH_WS_FALLBACK_STALE_SEC", 180.0))
     age = _latest_summary_age_sec()
     if age is None:
-        # 起動直後はsummaryがまだ無い。DB側が本当に生きているか不明なので、
-        # main.py memory-only WSを許可してエントリー用の最新tickを確保する。
         logger.warning(
-            "[push_stream] main WS fallback allowed: no fresh summary visible yet stale_sec=%.1f",
+            "[push_stream] main WS fallback allowed by explicit env: no fresh summary visible yet stale_sec=%.1f",
             stale_sec,
         )
         return True
     if age > stale_sec:
         logger.warning(
-            "[push_stream] main WS fallback allowed: summary stale age=%.1fs stale_sec=%.1f",
+            "[push_stream] main WS fallback allowed by explicit env: summary stale age=%.1fs stale_sec=%.1f",
             age,
             stale_sec,
         )
         return True
     logger.info(
-        "[push_stream] main WS skip allowed: fresh summary age=%.1fs stale_sec=%.1f",
+        "[push_stream] main WS fallback not needed: fresh summary age=%.1fs stale_sec=%.1f",
         age,
         stale_sec,
     )
@@ -184,11 +190,15 @@ def _main_ws_fallback_allowed_due_to_stale_summary() -> bool:
 
 def _should_skip_push_stream_start_in_main() -> bool:
     """
-    main_database.py 分離運用では main.py のPUSH WSを原則止める。
-    ただし main_database.py 側のsummaryがmain.pyから新鮮に見えない場合、
-    main.pyをmemory-only WSへ自動復帰させる。
+    main_database.py 分離運用では main.py のPUSH WSを止める。
+
+    例外:
+      - data_collector / push_receiver プロセス自身
+      - AUTOSTOCK_MAIN_PUSH_WS_ENABLED=1 の emergency standalone
+      - AUTOSTOCK_MAIN_PUSH_WS_AUTO_FALLBACK=1 を明示し、summary stale の時だけ memory-only fallback
     """
     if _env_bool("AUTOSTOCK_MAIN_PUSH_WS_ENABLED", False):
+        logger.warning("[push_stream] main WS explicitly enabled by AUTOSTOCK_MAIN_PUSH_WS_ENABLED=1")
         return False
     try:
         from data_collectors.split_mode import (
@@ -205,6 +215,8 @@ def _should_skip_push_stream_start_in_main() -> bool:
             return False
         return True
     except Exception:
+        # split判定に失敗した場合は従来互換で起動を許可する。
+        logger.debug("[push_stream] split mode check failed; allow start for compatibility", exc_info=True)
         return False
 
 
@@ -237,8 +249,9 @@ def start_push_stream(*args, **kwargs):
         _mark_main_ws_skipped()
         logger.warning(
             "[push_stream] WS start skipped in main process; "
-            "main_database.py handles PUSH WebSocket/registration/storage and summary is fresh. "
-            "Set AUTOSTOCK_MAIN_PUSH_WS_ENABLED=1 only for emergency standalone mode."
+            "main_database.py handles PUSH WebSocket/registration/storage. "
+            "Set AUTOSTOCK_MAIN_PUSH_WS_ENABLED=1 only for emergency standalone mode, "
+            "or AUTOSTOCK_MAIN_PUSH_WS_AUTO_FALLBACK=1 for explicit memory-only fallback."
         )
         return None
 
@@ -259,7 +272,7 @@ def _runner_start_push_stream_guarded(*args, **kwargs):
         _mark_main_ws_skipped()
         logger.warning(
             "[push_stream] runner WS start skipped in main process; "
-            "main_database.py handles PUSH WebSocket/registration/storage and summary is fresh."
+            "main_database.py handles PUSH WebSocket/registration/storage."
         )
         return None
     _prepare_main_memory_only_ws()
