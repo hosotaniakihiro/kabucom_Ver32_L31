@@ -1,13 +1,14 @@
 # ============================================================
 # File   : trading/entry/summary_ai/executor.py
-# Version: REV3-TOP3-CAP-LIQUIDITY-COMPAT
+# Version: REV4-TOP3-CAP-LEGACY-COMPAT
 # ------------------------------------------------------------
 # AI_OK rows -> approved_rows -> entry_pipeline.
-# 実発注対象は最大3件に制限し、既存runtime patch互換の
-# _filter_blocked_ai_ok_items を復元する。
+# 実発注対象は最大3件に制限しつつ、既存runtime patchが参照する
+# 旧private関数名を互換維持する。
 # ============================================================
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import os
 from typing import Any, Callable, Dict, List, Optional, Sequence
@@ -22,6 +23,16 @@ DEFAULT_MAX_ENTRIES = 3
 DEFAULT_MIN_BUY_APPROVED = 0
 DEFAULT_MAX_PRICE_FOR_100_SHARE_ENTRY = 7000.0
 DEFAULT_MIN_PRICE_FOR_ENTRY = 3000.0
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -69,7 +80,22 @@ def _pick_symbol(item: Dict[str, Any]) -> str:
 def _pick_side(item: Dict[str, Any]) -> str:
     ai_row = _as_dict(item.get("ai_row"))
     src = _as_dict(item.get("source_row"))
-    return _norm_side(item.get("side") or item.get("ai_side") or ai_row.get("side") or ai_row.get("ai_side") or ai_row.get("entry_decision") or src.get("side") or src.get("ai_side") or src.get("entry_decision"), "BUY")
+    return _norm_side(
+        item.get("side")
+        or item.get("ai_side")
+        or ai_row.get("side")
+        or ai_row.get("ai_side")
+        or ai_row.get("entry_decision")
+        or src.get("side")
+        or src.get("ai_side")
+        or src.get("entry_decision"),
+        "BUY",
+    )
+
+
+def _row_side(item: Dict[str, Any]) -> str:
+    """Legacy compatibility for runtime patches."""
+    return _pick_side(item)
 
 
 def _pick_price(item: Dict[str, Any]) -> float:
@@ -110,13 +136,30 @@ def _pick_turnover(item: Dict[str, Any]) -> float:
 def _score_for_side(item: Dict[str, Any]) -> float:
     side = _pick_side(item)
     if side == "SELL":
-        return max(safe_float(item.get("sell_score")), abs(safe_float(item.get("score_total"))), abs(safe_float(item.get("final_score"))))
-    return max(safe_float(item.get("buy_score")), safe_float(item.get("score_total")), safe_float(item.get("final_score")))
+        return max(
+            safe_float(item.get("sell_score")),
+            abs(safe_float(item.get("score_total"))),
+            abs(safe_float(item.get("final_score"))),
+        )
+    return max(
+        safe_float(item.get("buy_score")),
+        safe_float(item.get("score_total")),
+        safe_float(item.get("final_score")),
+    )
+
+
+def _row_score_for_side(item: Dict[str, Any]) -> float:
+    """Legacy compatibility for runtime patches."""
+    return _score_for_side(item)
 
 
 def _sort_key(item: Dict[str, Any]) -> tuple[float, float, float]:
     side = _pick_side(item)
-    return (safe_float(item.get("confidence")), _score_for_side(item), safe_float(item.get("sell_score")) if side == "SELL" else safe_float(item.get("buy_score")))
+    return (
+        safe_float(item.get("confidence")),
+        _score_for_side(item),
+        safe_float(item.get("sell_score")) if side == "SELL" else safe_float(item.get("buy_score")),
+    )
 
 
 def _price_bounds() -> tuple[float, float, dict[str, Any]]:
@@ -124,10 +167,25 @@ def _price_bounds() -> tuple[float, float, dict[str, Any]]:
     max_price = DEFAULT_MAX_PRICE_FOR_100_SHARE_ENTRY
     diag: dict[str, Any] = {"source": "fallback"}
     try:
-        from trading.entry.entry_budget import get_entry_min_price, get_entry_max_price, get_effective_entry_max_price
+        from trading.entry.entry_budget import (
+            get_entry_min_price,
+            get_entry_max_price,
+            get_effective_entry_max_price,
+            get_max_entry_oneshot_yen,
+            get_order_lot_size,
+        )
+
         min_price = float(get_entry_min_price())
         max_price = float(get_effective_entry_max_price() or get_entry_max_price() or max_price)
-        diag["source"] = "entry_budget"
+        diag.update(
+            {
+                "source": "entry_budget",
+                "entry_min_price": min_price,
+                "entry_max_price_effective": max_price,
+                "max_oneshot_yen": float(get_max_entry_oneshot_yen()),
+                "lot_size": int(get_order_lot_size()),
+            }
+        )
     except Exception:
         pass
     min_price = _env_float("SUMMARY_AI_ENTRY_MIN_PRICE", _env_float("ENTRY_MIN_PRICE", min_price))
@@ -136,23 +194,79 @@ def _price_bounds() -> tuple[float, float, dict[str, Any]]:
     return min_price, max_price, diag
 
 
+def _entry_price_bounds() -> tuple[float, float, dict[str, Any]]:
+    """Legacy compatibility for summary_ai_entry_hook_dataframe_truth_patch."""
+    return _price_bounds()
+
+
 def _is_trade_restricted(symbol: str) -> bool:
     try:
         from global_state import global_data
         root = getattr(global_data, "trade_restricted", {}) or {}
-        return bool(root.get(symbol))
+        until = root.get(symbol)
+        if not until:
+            return False
+        if isinstance(until, dt.datetime) and dt.datetime.now() >= until:
+            try:
+                root.pop(symbol, None)
+            except Exception:
+                pass
+            return False
+        return True
     except Exception:
         return False
 
 
-def _is_sell_reject_cached(symbol: str, side: str) -> bool:
-    if side != "SELL":
-        return False
+def _is_trade_restricted_symbol(symbol: str) -> tuple[bool, Any]:
+    """Legacy compatibility for runtime patches."""
     try:
-        from AI.sell_order_reject_cache import is_sell_rejected
-        return bool(is_sell_rejected(symbol))
+        from global_state import global_data
+        root = getattr(global_data, "trade_restricted", {}) or {}
+        until = root.get(symbol)
+        if not until:
+            return False, None
+        if isinstance(until, dt.datetime) and dt.datetime.now() >= until:
+            try:
+                root.pop(symbol, None)
+            except Exception:
+                pass
+            return False, None
+        return True, until
     except Exception:
-        return False
+        return False, None
+
+
+def _is_sell_reject_cached(symbol: str, side: str) -> tuple[bool, Any]:
+    if side != "SELL":
+        return False, None
+    try:
+        from AI.sell_order_reject_cache import is_sell_rejected, get_sell_reject_reason
+        if bool(is_sell_rejected(symbol)):
+            try:
+                return True, get_sell_reject_reason(symbol)
+            except Exception:
+                return True, "sell_reject_cache"
+        return False, None
+    except Exception:
+        return False, None
+
+
+def _daily_risk_block_reason(symbol: str, side: str) -> tuple[bool, str, Dict[str, Any]]:
+    """Legacy compatibility. Fail-open if the risk patch is unavailable."""
+    if not _env_bool("SUMMARY_AI_PRE_FILTER_DAILY_RISK", True):
+        return False, "", {}
+    try:
+        from core.startup import entry_daily_risk_runtime_patch as daily_risk
+        fn = getattr(daily_risk, "_risk_block_reason", None)
+        if callable(fn):
+            blocked, reason, detail = fn(_norm_symbol(symbol), _norm_side(side, "BUY"))
+            if blocked:
+                if not isinstance(detail, dict):
+                    detail = {"detail": str(detail)}
+                return True, str(reason or "DAILY_RISK_BLOCK"), dict(detail)
+    except Exception:
+        logger.debug("[SUMMARY AI EXECUTOR] daily risk compatibility check failed; fail-open", exc_info=True)
+    return False, "", {}
 
 
 def _base_filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -181,11 +295,17 @@ def _base_filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dic
         if turnover > 0 and turnover < min_turnover:
             skipped.append({"symbol": symbol, "side": side, "reason": "low_turnover", "turnover": turnover, "min_turnover": min_turnover})
             continue
-        if _is_trade_restricted(symbol):
-            skipped.append({"symbol": symbol, "side": side, "reason": "trade_restricted"})
+        daily_blocked, daily_reason, daily_detail = _daily_risk_block_reason(symbol, side)
+        if daily_blocked:
+            skipped.append({"symbol": symbol, "side": side, "reason": daily_reason, "detail": daily_detail})
             continue
-        if _is_sell_reject_cached(symbol, side):
-            skipped.append({"symbol": symbol, "side": side, "reason": "sell_reject_cache"})
+        restricted, until = _is_trade_restricted_symbol(symbol)
+        if restricted:
+            skipped.append({"symbol": symbol, "side": side, "reason": "trade_restricted", "until": str(until)})
+            continue
+        sell_rejected, reject_reason = _is_sell_reject_cached(symbol, side)
+        if sell_rejected:
+            skipped.append({"symbol": symbol, "side": side, "reason": "sell_reject_cache", "detail": str(reject_reason)})
             continue
         kept.append(item)
     if skipped:
@@ -194,11 +314,7 @@ def _base_filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dic
 
 
 def _filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    既存 runtime patch 互換フック。
-    summary_ai_liquidity_runtime_patch はこの関数を探して追加ラップするため、
-    REV2で消した関数名を復元する。
-    """
+    """Runtime patch compatibility hook."""
     return _base_filter_blocked_ai_ok_items(ok_items)
 
 
@@ -217,7 +333,22 @@ def _select_ai_ok_items(ok_items: List[Dict[str, Any]], *, max_entries: int) -> 
     kept = _filter_blocked_ai_ok_items(ok_items)
     max_n = _effective_max_entries(max_entries)
     selected = sorted(kept, key=_sort_key, reverse=True)[:max_n]
-    logger.warning("[SUMMARY AI EXECUTOR] top3 selection requested=%s cap=%s ok_total=%s selected=%s", max_entries, max_n, len(kept), [{"symbol": _pick_symbol(x), "side": _pick_side(x), "price": _pick_price(x), "conf": round(safe_float(x.get("confidence")), 3), "score": round(_score_for_side(x), 3)} for x in selected])
+    logger.warning(
+        "[SUMMARY AI EXECUTOR] top3 selection requested=%s cap=%s ok_total=%s selected=%s",
+        max_entries,
+        max_n,
+        len(kept),
+        [
+            {
+                "symbol": _pick_symbol(x),
+                "side": _pick_side(x),
+                "price": _pick_price(x),
+                "conf": round(safe_float(x.get("confidence")), 3),
+                "score": round(_score_for_side(x), 3),
+            }
+            for x in selected
+        ],
+    )
     return selected
 
 
@@ -252,39 +383,48 @@ def build_approved_row(ai_ok_item: Dict[str, Any]) -> Dict[str, Any]:
     score_total = ai_row.get("score_total", ai_ok_item.get("score_total"))
     final_score = ai_row.get("final_score", ai_ok_item.get("final_score"))
     row = dict(src)
-    row.update({
-        "symbol": ai_ok_item.get("symbol") or ai_row.get("symbol") or src.get("symbol"),
-        "symbolname": ai_ok_item.get("symbolname") or ai_row.get("symbolname") or src.get("symbolname"),
-        "side": side,
-        "ai_side": side,
-        "entry_decision": side,
-        "source": ai_row.get("source", src.get("source", "SUMMARY")),
-        "interval": ai_row.get("interval", src.get("interval", 1)),
-        "price": price,
-        "close_price": price,
-        "close": price,
-        "confidence": ai_ok_item.get("confidence", 0.0),
-        "ai_confidence": ai_ok_item.get("confidence", 0.0),
-        "lot_multiplier": ai_ok_item.get("lot_multiplier", 1.0),
-        "ai_reason": ai_ok_item.get("reason", ""),
-        "reason": ai_ok_item.get("reason", ""),
-        "model_used": ai_ok_item.get("model_used", ""),
-        "score_total": score_total,
-        "total_score": score_total,
-        "score": score_total,
-        "buy_score": buy_score,
-        "sell_score": sell_score,
-        "score_buy": buy_score,
-        "score_sell": sell_score,
-        "final_score": final_score,
-        "display_score": final_score,
-        "turnover": ai_row.get("turnover", src.get("turnover") or src.get("trading_value")),
-        "volume": ai_row.get("volume", src.get("volume")),
-        "datetime": ai_row.get("datetime", src.get("datetime")),
-        "entry_type": ai_row.get("entry_type") or src.get("entry_type") or "SUMMARY_AI",
-        "ai_gate_allow": True,
-    })
-    logger.info("[SUMMARY AI EXECUTOR] approved row built symbol=%s side=%s conf=%.3f total=%.3f close=%s", row.get("symbol"), side, safe_float(row.get("ai_confidence")), safe_float(row.get("score_total")), row.get("close_price"))
+    row.update(
+        {
+            "symbol": ai_ok_item.get("symbol") or ai_row.get("symbol") or src.get("symbol"),
+            "symbolname": ai_ok_item.get("symbolname") or ai_row.get("symbolname") or src.get("symbolname"),
+            "side": side,
+            "ai_side": side,
+            "entry_decision": side,
+            "source": ai_row.get("source", src.get("source", "SUMMARY")),
+            "interval": ai_row.get("interval", src.get("interval", 1)),
+            "price": price,
+            "close_price": price,
+            "close": price,
+            "confidence": ai_ok_item.get("confidence", 0.0),
+            "ai_confidence": ai_ok_item.get("confidence", 0.0),
+            "lot_multiplier": ai_ok_item.get("lot_multiplier", 1.0),
+            "ai_reason": ai_ok_item.get("reason", ""),
+            "reason": ai_ok_item.get("reason", ""),
+            "model_used": ai_ok_item.get("model_used", ""),
+            "score_total": score_total,
+            "total_score": score_total,
+            "score": score_total,
+            "buy_score": buy_score,
+            "sell_score": sell_score,
+            "score_buy": buy_score,
+            "score_sell": sell_score,
+            "final_score": final_score,
+            "display_score": final_score,
+            "turnover": ai_row.get("turnover", src.get("turnover") or src.get("trading_value")),
+            "volume": ai_row.get("volume", src.get("volume")),
+            "datetime": ai_row.get("datetime", src.get("datetime")),
+            "entry_type": ai_row.get("entry_type") or src.get("entry_type") or "SUMMARY_AI",
+            "ai_gate_allow": True,
+        }
+    )
+    logger.info(
+        "[SUMMARY AI EXECUTOR] approved row built symbol=%s side=%s conf=%.3f total=%.3f close=%s",
+        row.get("symbol"),
+        side,
+        safe_float(row.get("ai_confidence")),
+        safe_float(row.get("score_total")),
+        row.get("close_price"),
+    )
     return row
 
 
@@ -295,7 +435,16 @@ def build_ai_ok_approved_rows(ai_results: Sequence[Dict[str, Any]], *, max_entri
     return approved
 
 
-def execute_ai_ok_entries_bulk(ai_results: Sequence[Dict[str, Any]], *, df_summary: pd.DataFrame, interval: int | str = 1, max_entries: int = DEFAULT_MAX_ENTRIES, dry_run: bool = True, require_market_open: bool = True, entry_pipeline: Optional[Callable[..., Any]] = None) -> Dict[str, Any]:
+def execute_ai_ok_entries_bulk(
+    ai_results: Sequence[Dict[str, Any]],
+    *,
+    df_summary: pd.DataFrame,
+    interval: int | str = 1,
+    max_entries: int = DEFAULT_MAX_ENTRIES,
+    dry_run: bool = True,
+    require_market_open: bool = True,
+    entry_pipeline: Optional[Callable[..., Any]] = None,
+) -> Dict[str, Any]:
     approved_rows = build_ai_ok_approved_rows(ai_results, max_entries=max_entries)
     if not approved_rows:
         return {"executed": False, "dry_run": dry_run, "approved_rows": [], "result": None, "skip_reason": "no_ai_ok"}
@@ -323,5 +472,11 @@ __all__ = [
     "build_approved_row",
     "build_ai_ok_approved_rows",
     "execute_ai_ok_entries_bulk",
+    "_entry_price_bounds",
     "_filter_blocked_ai_ok_items",
+    "_row_side",
+    "_row_score_for_side",
+    "_daily_risk_block_reason",
+    "_is_trade_restricted_symbol",
+    "_is_sell_reject_cached",
 ]
