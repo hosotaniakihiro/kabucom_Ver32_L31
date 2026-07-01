@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/ws_callbacks.py
-# Version: Ver1.8-PUSH-STREAM-WS-CALLBACKS-AFTER-OPEN-STATUS-AWARE
+# Version: Ver1.9-PUSH-STREAM-FORCE-REFRESH-AFTER-WS-STALE-RECOVER
 # ------------------------------------------------------------
 # PUSH WebSocket callback。
 #
@@ -16,20 +16,23 @@
 #           refresh after open thread を起動せず、started の誤ログを出さない。
 #   - V1.8: transport._start_refresh_after_open_thread() の戻り値を見て、
 #           実際に起動した時だけ started を出す。
+#   - V1.9: WS stale recover 後だけは PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1 でも
+#           購読復旧 refresh を1回実行する。通常のA/Bローテーションではskipを尊重する。
 # ============================================================
 
 from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from typing import Any
 
 import websocket
 
 from . import state
-from .runtime import _now, _safe_iso, _safe_set_runtime
-from .transport import _clear_sender, _install_sender, _start_refresh_after_open_thread
+from .runtime import _now, _safe_iso, _safe_set_runtime, _safe_get_runtime
+from .transport import _clear_sender, _install_sender, _start_refresh_after_open_thread, _call_refresh, _wait_for_ws_ready
 from .normalize import _parse_message, _normalize_push_row
 from .dataframe import _append_df
 from .writers import _queue_put
@@ -50,6 +53,16 @@ def _env_bool(name: str, default: bool) -> bool:
         return bool(default)
     except Exception:
         return bool(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
 
 
 def _is_expected_rotation_disconnect() -> bool:
@@ -252,6 +265,51 @@ def on_close(ws: websocket.WebSocketApp, close_status_code=None, close_msg=None)
     _safe_set_runtime("ws_connected", False)
 
 
+def _force_refresh_after_stale_recover_thread() -> None:
+    try:
+        delay = max(0.2, _env_float("PUSH_STREAM_STALE_RECOVER_REFRESH_DELAY_SEC", 0.7))
+        time.sleep(delay)
+        if not _wait_for_ws_ready(timeout=max(3.0, _env_float("PUSH_STREAM_STALE_RECOVER_WS_READY_TIMEOUT_SEC", 10.0))):
+            logger.warning("[push_stream] stale recover refresh skipped: ws not ready")
+            return
+        logger.warning("[push_stream] stale recover refresh start despite PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1")
+        _call_refresh(
+            force=True,
+            reason="stale_recover_on_open",
+            clear_first=True,
+            unregister_first=True,
+            wait_after_clear=0.5,
+        )
+    except Exception:
+        logger.exception("[push_stream] stale recover refresh failed")
+    finally:
+        _safe_set_runtime("push_ws_stale_recovering", False)
+
+
+def _start_stale_recover_refresh_if_needed() -> bool:
+    if not _env_bool("PUSH_STREAM_FORCE_REFRESH_AFTER_STALE_RECOVER", True):
+        return False
+    try:
+        stale_recovering = bool(_safe_get_runtime("push_ws_stale_recovering", False))
+        stale_reason = _safe_get_runtime("push_ws_stale_recover_reason", "")
+        if not stale_recovering:
+            return False
+        threading.Thread(
+            target=_force_refresh_after_stale_recover_thread,
+            name="push-refresh-after-stale-recover",
+            daemon=True,
+        ).start()
+        logger.warning(
+            "[push_stream] stale recover refresh thread started reason=%s skip_after_open_env=%s",
+            stale_reason,
+            os.getenv("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH"),
+        )
+        return True
+    except Exception:
+        logger.exception("[push_stream] stale recover refresh thread start failed")
+        return False
+
+
 def on_open(ws: websocket.WebSocketApp) -> None:
     state._last_connect_at = _now()
     logger.info("--- CONNECTED ---")
@@ -264,8 +322,12 @@ def on_open(ws: websocket.WebSocketApp) -> None:
     # その場合、rotation worker は起動しないため、on_open refresh が必要になる。
     # ただし main_database.py / push_receiver のA/Bローテーション運用では
     # PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1 を尊重し、余計な再登録 thread を起動しない。
+    # 例外として、WS stale watchdog が強制closeした直後の再接続では購読が失われやすいため、
+    # 1回だけ stale_recover_on_open refresh を実行する。
     try:
         if _env_bool("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", False):
+            if _start_stale_recover_refresh_if_needed():
+                return
             logger.warning("[push_stream] refresh after open thread skipped by ws_callbacks env PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1")
             return
         started = bool(_start_refresh_after_open_thread())
