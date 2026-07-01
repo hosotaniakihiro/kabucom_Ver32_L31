@@ -1,11 +1,15 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver55-FORCE-MAIN-DIRECT-PUSH-1M
+# Version: Ver56-SUMMARY-AI-LOW-MOVE-SOFTPASS
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # main.py は軽量同期 + background install。
 # DB/data collector系はDB専用の最小同期パッチだけにして起動を軽くする。
 # 救済/fail-open系はデフォルトOFFにして、本体判定を優先する。
+#
+# V56:
+#   - SUMMARY AIの強い候補が元atr_1m_filterの低ATRだけで止まる問題を
+#     限定soft-passする SUMMARY_AI_LOW_MOVE_SOFTPASS をbackgroundに追加。
 #
 # V55:
 #   - main.py の summary 1m が後続background patchで重いrunnerへ戻される問題を防ぐため、
@@ -276,6 +280,7 @@ BACKGROUND_MAIN_PATCHES = [
     ("core.startup.tonosama_fresh_summary_wait_fix_patch", "TONOSAMA_FRESH_SUMMARY_WAIT_FIX", "DISABLE_TONOSAMA_FRESH_SUMMARY_WAIT_FIX_PATCH"),
     ("core.startup.summary_ai_entry_hook_dataframe_truth_patch", "SUMMARY_AI_DF_TRUTH_PATCH", "DISABLE_SUMMARY_AI_DF_TRUTH_PATCH"),
     ("core.startup.summary_ai_candidate_refill_patch", "SUMMARY_AI_CANDIDATE_REFILL", "DISABLE_SUMMARY_AI_CANDIDATE_REFILL_PATCH"),
+    ("core.startup.summary_ai_low_move_softpass_patch", "SUMMARY_AI_LOW_MOVE_SOFTPASS", "DISABLE_SUMMARY_AI_LOW_MOVE_SOFTPASS_PATCH"),
     ("core.startup.summary_mtf_early_ready_patch", "SUMMARY_MTF_EARLY_READY", "DISABLE_SUMMARY_MTF_EARLY_READY_PATCH"),
     ("trading.audit_logging.install_audit_logging", "AUDIT_LOGGING", "DISABLE_AUDIT_LOGGING"),
     ("core.startup.summary_controller_concat_duplicate_columns_patch", "SUMMARY_CONTROLLER_DUPCOL_PATCH", "DISABLE_SUMMARY_CONTROLLER_DUPCOL_PATCH"),
