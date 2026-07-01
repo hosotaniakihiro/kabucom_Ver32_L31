@@ -1,9 +1,10 @@
 # ============================================================
 # File   : trading/entry/summary_ai/executor.py
-# Version: REV2-TOP3-APPROVAL-CAP
+# Version: REV3-TOP3-CAP-LIQUIDITY-COMPAT
 # ------------------------------------------------------------
 # AI_OK rows -> approved_rows -> entry_pipeline.
-# 実発注対象は最大3件に制限し、板API/発注ラッパーの過負荷を防ぐ。
+# 実発注対象は最大3件に制限し、既存runtime patch互換の
+# _filter_blocked_ai_ok_items を復元する。
 # ============================================================
 from __future__ import annotations
 
@@ -82,6 +83,30 @@ def _pick_price(item: Dict[str, Any]) -> float:
     return 0.0
 
 
+def _pick_volume(item: Dict[str, Any]) -> float:
+    ai_row = _as_dict(item.get("ai_row"))
+    src = _as_dict(item.get("source_row"))
+    for d in (item, ai_row, src):
+        for k in ("volume", "Volume", "trading_volume", "TradingVolume", "出来高"):
+            x = safe_float(d.get(k), 0.0)
+            if x > 0:
+                return x
+    return 0.0
+
+
+def _pick_turnover(item: Dict[str, Any]) -> float:
+    ai_row = _as_dict(item.get("ai_row"))
+    src = _as_dict(item.get("source_row"))
+    for d in (item, ai_row, src):
+        for k in ("turnover", "trading_value", "TradingValue", "売買代金"):
+            x = safe_float(d.get(k), 0.0)
+            if x > 0:
+                return x
+    price = _pick_price(item)
+    vol = _pick_volume(item)
+    return price * vol if price > 0 and vol > 0 else 0.0
+
+
 def _score_for_side(item: Dict[str, Any]) -> float:
     side = _pick_side(item)
     if side == "SELL":
@@ -130,6 +155,53 @@ def _is_sell_reject_cached(symbol: str, side: str) -> bool:
         return False
 
 
+def _base_filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not ok_items:
+        return []
+    min_price, max_price, diag = _price_bounds()
+    min_volume = _env_float("SUMMARY_AI_EXECUTOR_MIN_VOLUME", _env_float("ENTRY_MIN_VOLUME", 30000.0))
+    min_turnover = _env_float("SUMMARY_AI_EXECUTOR_MIN_TURNOVER", _env_float("ENTRY_MIN_TURNOVER", 10000000.0))
+    kept: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    for item in ok_items:
+        symbol = _pick_symbol(item)
+        side = _pick_side(item)
+        price = _pick_price(item)
+        volume = _pick_volume(item)
+        turnover = _pick_turnover(item)
+        if price > 0 and min_price > 0 and price < min_price:
+            skipped.append({"symbol": symbol, "side": side, "reason": "price_below_min", "price": price})
+            continue
+        if price > 0 and max_price > 0 and price > max_price:
+            skipped.append({"symbol": symbol, "side": side, "reason": "price_over_max", "price": price})
+            continue
+        if volume > 0 and volume < min_volume:
+            skipped.append({"symbol": symbol, "side": side, "reason": "low_volume", "volume": volume, "min_volume": min_volume})
+            continue
+        if turnover > 0 and turnover < min_turnover:
+            skipped.append({"symbol": symbol, "side": side, "reason": "low_turnover", "turnover": turnover, "min_turnover": min_turnover})
+            continue
+        if _is_trade_restricted(symbol):
+            skipped.append({"symbol": symbol, "side": side, "reason": "trade_restricted"})
+            continue
+        if _is_sell_reject_cached(symbol, side):
+            skipped.append({"symbol": symbol, "side": side, "reason": "sell_reject_cache"})
+            continue
+        kept.append(item)
+    if skipped:
+        logger.warning("[SUMMARY AI EXECUTOR] prefiltered before=%s after=%s price_diag=%s skipped=%s", len(ok_items), len(kept), diag, skipped[:50])
+    return kept
+
+
+def _filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    既存 runtime patch 互換フック。
+    summary_ai_liquidity_runtime_patch はこの関数を探して追加ラップするため、
+    REV2で消した関数名を復元する。
+    """
+    return _base_filter_blocked_ai_ok_items(ok_items)
+
+
 def _effective_max_entries(max_entries: int) -> int:
     try:
         requested = int(max_entries or DEFAULT_MAX_ENTRIES)
@@ -142,28 +214,7 @@ def _effective_max_entries(max_entries: int) -> int:
 def _select_ai_ok_items(ok_items: List[Dict[str, Any]], *, max_entries: int) -> List[Dict[str, Any]]:
     if not ok_items:
         return []
-    min_price, max_price, diag = _price_bounds()
-    kept: List[Dict[str, Any]] = []
-    skipped: List[Dict[str, Any]] = []
-    for item in ok_items:
-        symbol = _pick_symbol(item)
-        side = _pick_side(item)
-        price = _pick_price(item)
-        if price > 0 and min_price > 0 and price < min_price:
-            skipped.append({"symbol": symbol, "side": side, "reason": "price_below_min", "price": price})
-            continue
-        if price > 0 and max_price > 0 and price > max_price:
-            skipped.append({"symbol": symbol, "side": side, "reason": "price_over_max", "price": price})
-            continue
-        if _is_trade_restricted(symbol):
-            skipped.append({"symbol": symbol, "side": side, "reason": "trade_restricted"})
-            continue
-        if _is_sell_reject_cached(symbol, side):
-            skipped.append({"symbol": symbol, "side": side, "reason": "sell_reject_cache"})
-            continue
-        kept.append(item)
-    if skipped:
-        logger.warning("[SUMMARY AI EXECUTOR] prefiltered before=%s after=%s price_diag=%s skipped=%s", len(ok_items), len(kept), diag, skipped[:50])
+    kept = _filter_blocked_ai_ok_items(ok_items)
     max_n = _effective_max_entries(max_entries)
     selected = sorted(kept, key=_sort_key, reverse=True)[:max_n]
     logger.warning("[SUMMARY AI EXECUTOR] top3 selection requested=%s cap=%s ok_total=%s selected=%s", max_entries, max_n, len(kept), [{"symbol": _pick_symbol(x), "side": _pick_side(x), "price": _pick_price(x), "conf": round(safe_float(x.get("confidence")), 3), "score": round(_score_for_side(x), 3)} for x in selected])
@@ -265,3 +316,12 @@ def execute_ai_ok_entries_bulk(ai_results: Sequence[Dict[str, Any]], *, df_summa
     except Exception:
         logger.exception("[SUMMARY AI EXECUTOR] REAL bulk entry failed")
         return {"executed": False, "dry_run": False, "approved_rows": approved_rows, "result": None, "skip_reason": "entry_exception"}
+
+
+__all__ = [
+    "DEFAULT_MAX_ENTRIES",
+    "build_approved_row",
+    "build_ai_ok_approved_rows",
+    "execute_ai_ok_entries_bulk",
+    "_filter_blocked_ai_ok_items",
+]
