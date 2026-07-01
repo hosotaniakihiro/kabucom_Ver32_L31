@@ -1,27 +1,24 @@
 # ============================================================
 # File   : trading/push/push_stream/__init__.py
-# Version: Ver1.9-PUSH-ROTATION-LIQ-KEEP100-MAIN-WS-GUARD-NO-RECURSION
+# Version: Ver2.0-MAIN-WS-GUARD-FRESHNESS-FALLBACK
 # ------------------------------------------------------------
 # ✔ 旧 trading.push.push_stream 公開API互換
 # ✔ 分割後モジュールの再エクスポート
 # ✔ transport / rotation_core / runner / dataframe の公開窓口
-# ✔ rotation_settings を先に読み込み、
-#   PUSH_ROTATION_HOLD_SEC=4.8 / PUSH_ROTATION_UNREGISTER_WAIT_SEC=0.2
-#   のデフォルトを注入する
-# ✔ main_database.py 分離運用時、main.py側からのPUSH受信起動をno-op化
-# ✔ PUSH rotation stability patch を自動適用
-# ✔ rotation用 liquidity guard で100→50へ崩れる問題を補正
-# ✔ runner module を直接importされた場合も main.py 側の重複WS起動を止める
-# ✔ runner.start_push_stream を package start_push_stream に差し替えない
-#   - package start_push_stream -> _runner_start_push_stream -> wrapper -> package start_push_stream
-#     の再帰を防ぐ
-# ✔ runner guard は動的 _runner_start_push_stream ではなく、固定退避した本物関数を呼ぶ
+# ✔ main_database.py 分離運用時、main.py側の重複PUSH WSを原則no-op化
+# ✔ ただし main_database.py 側のsummary/PUSHが stale の場合、main.pyは
+#   memory-only WSとして自動復帰し、エントリー判定用の最新1分足を作る
+# ✔ PUSH rotation stability patch / liquidity keep100 patch を自動適用
+# ✔ runner module 直呼び経路も同じguardへ寄せるが、再帰は防ぐ
 # ============================================================
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import os
+import time
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -31,19 +28,12 @@ from . import rotation_symbols as rotation_symbols
 from . import rotation_register as rotation_register
 from . import rotation_logging as rotation_logging
 
-# PUSHローテーション安定化パッチ。
-# - rotation_* で unregister_all を強制しない
-# - fixed=0ならA/Bを50/50へ補正
-# - liquidity guardで100->30へ崩れた場合はfail-open
 try:
     from . import rotation_stability_patch as rotation_stability_patch
     rotation_stability_patch.install()
 except Exception:
     logger.exception("[push_stream] rotation_stability_patch install failed")
 
-# PUSHローテーション専用の流動性ガード補正。
-# stability patch の後に入れることで、100銘柄候補が50銘柄へ削られて
-# Bグループが消えるケースを最終的に防ぐ。
 try:
     from . import rotation_liquidity_keep100_patch as rotation_liquidity_keep100_patch
     rotation_liquidity_keep100_patch.install()
@@ -65,18 +55,13 @@ from .rotation_register import register_symbols
 from .rotation_core import enable_rotation
 from . import runner as _runner_mod
 
-# 重要:
-# runner module 側の本物の start_push_stream をここで退避する。
-# package公開入口は _runner_start_push_stream 経由で呼ぶため、
-# push_summary_realtime_patch などがここを差し替えることは許可する。
-# 一方、runner module 直呼び用guardは、差し替え後の _runner_start_push_stream ではなく
-# _TRUE_RUNNER_START_PUSH_STREAM を呼ぶ。これにより guard -> patch wrapper -> guard の再帰を防ぐ。
 _runner_start_push_stream = _runner_mod.start_push_stream
 _TRUE_RUNNER_START_PUSH_STREAM = _runner_start_push_stream
 stop_push_stream = _runner_mod.stop_push_stream
 get_status = _runner_mod.get_status
 
 _TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+_FALSE = {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -84,21 +69,124 @@ def _env_bool(name: str, default: bool = False) -> bool:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
             return bool(default)
-        return str(v).strip().lower() in _TRUE
+        s = str(v).strip().lower()
+        if s in _TRUE:
+            return True
+        if s in _FALSE:
+            return False
     except Exception:
-        return bool(default)
+        pass
+    return bool(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _parse_dt(v: Any) -> dt.datetime | None:
+    if v is None:
+        return None
+    try:
+        if isinstance(v, dt.datetime):
+            x = v
+        else:
+            s = str(v).strip()
+            if not s:
+                return None
+            x = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if x.tzinfo is not None:
+            x = x.astimezone().replace(tzinfo=None)
+        return x
+    except Exception:
+        return None
+
+
+def _latest_summary_age_sec() -> float | None:
+    """main.pyが既に持っているmerged summaryの鮮度を軽量確認する。"""
+    try:
+        from global_state import global_data
+    except Exception:
+        return None
+
+    candidates: list[Any] = []
+    for attr in (
+        "push_summary_latest_dt",
+        "latest_push_summary_dt",
+        "last_push_summary_dt",
+        "summary_1m_latest_dt",
+        "merged_summary_1m_latest_dt",
+    ):
+        try:
+            candidates.append(getattr(global_data, attr, None))
+        except Exception:
+            pass
+
+    # DataFrame系から最新datetimeを見る。import pandasは避け、属性だけで軽く見る。
+    for attr in ("push_merged_summary", "merged_summary_1min", "merged_summary_1m", "summary_1m", "push_summary_1m"):
+        try:
+            df = getattr(global_data, attr, None)
+            if df is None or not hasattr(df, "empty") or bool(getattr(df, "empty", True)):
+                continue
+            cols = list(getattr(df, "columns", []))
+            for c in ("datetime", "time", "last_tick_at", "received_at"):
+                if c in cols:
+                    val = df[c].max()
+                    candidates.append(val)
+                    break
+        except Exception:
+            continue
+
+    now = dt.datetime.now()
+    best_age: float | None = None
+    for v in candidates:
+        x = _parse_dt(v)
+        if x is None:
+            continue
+        age = (now - x).total_seconds()
+        if age >= 0 and (best_age is None or age < best_age):
+            best_age = age
+    return best_age
+
+
+def _main_ws_fallback_allowed_due_to_stale_summary() -> bool:
+    if not _env_bool("AUTOSTOCK_MAIN_PUSH_WS_AUTO_FALLBACK", True):
+        return False
+    stale_sec = max(30.0, _env_float("AUTOSTOCK_MAIN_PUSH_WS_FALLBACK_STALE_SEC", 180.0))
+    age = _latest_summary_age_sec()
+    if age is None:
+        # 起動直後はsummaryがまだ無い。DB側が本当に生きているか不明なので、
+        # main.py memory-only WSを許可してエントリー用の最新tickを確保する。
+        logger.warning(
+            "[push_stream] main WS fallback allowed: no fresh summary visible yet stale_sec=%.1f",
+            stale_sec,
+        )
+        return True
+    if age > stale_sec:
+        logger.warning(
+            "[push_stream] main WS fallback allowed: summary stale age=%.1fs stale_sec=%.1f",
+            age,
+            stale_sec,
+        )
+        return True
+    logger.info(
+        "[push_stream] main WS skip allowed: fresh summary age=%.1fs stale_sec=%.1f",
+        age,
+        stale_sec,
+    )
+    return False
 
 
 def _should_skip_push_stream_start_in_main() -> bool:
     """
-    main_database.py 分離運用では PUSH WebSocket 接続も main_database.py 側に一本化する。
-
-    理由:
-      kabu Station PUSH WS を main.py と main_database.py の両方で張ると、
-      DISCONNECTED/CONNECTED を数秒ごとに繰り返し、main.py側 summary が stale になる。
-
-    非常用で main.py 側のWSを明示的に使いたい場合のみ:
-      AUTOSTOCK_MAIN_PUSH_WS_ENABLED=1
+    main_database.py 分離運用では main.py のPUSH WSを原則止める。
+    ただし main_database.py 側のsummaryがmain.pyから新鮮に見えない場合、
+    main.pyをmemory-only WSへ自動復帰させる。
     """
     if _env_bool("AUTOSTOCK_MAIN_PUSH_WS_ENABLED", False):
         return False
@@ -110,7 +198,12 @@ def _should_skip_push_stream_start_in_main() -> bool:
         )
         if bool(is_data_collector_process()):
             return False
-        return bool(external_data_collectors_enabled()) and bool(should_skip_data_collector_work_in_main())
+        is_main_split = bool(external_data_collectors_enabled()) and bool(should_skip_data_collector_work_in_main())
+        if not is_main_split:
+            return False
+        if _main_ws_fallback_allowed_due_to_stale_summary():
+            return False
+        return True
     except Exception:
         return False
 
@@ -126,23 +219,30 @@ def _mark_main_ws_skipped() -> None:
         pass
 
 
-def start_push_stream(*args, **kwargs):
-    """
-    PUSH受信本体の公開入口。
+def _prepare_main_memory_only_ws() -> None:
+    """main.py fallback WSではDB保存・rotation登録を行わない。"""
+    try:
+        os.environ.setdefault("AUTOSTOCK_MAIN_MEMORY_ONLY", "1")
+        os.environ.setdefault("AUTOSTOCK_SKIP_DATA_COLLECTOR_WORK_IN_MAIN", "1")
+        os.environ["PUSH_STREAM_ENABLE_DB_WRITE"] = "0"
+        os.environ["PUSH_DB_WRITE_ENABLED"] = "0"
+        os.environ["PUSH_ROTATION_ENABLED"] = "0"
+        os.environ["PUSH_STREAM_ENABLE_ROTATION"] = "0"
+    except Exception:
+        pass
 
-    main_database.py 分離運用時:
-      - main_database.py / data_collectors_runner.py 側では通常起動
-      - main.py 側から呼ばれた場合は二重WebSocket接続防止のため no-op
-    """
+
+def start_push_stream(*args, **kwargs):
     if _should_skip_push_stream_start_in_main():
         _mark_main_ws_skipped()
         logger.warning(
             "[push_stream] WS start skipped in main process; "
-            "main_database.py handles PUSH WebSocket/registration/storage. "
+            "main_database.py handles PUSH WebSocket/registration/storage and summary is fresh. "
             "Set AUTOSTOCK_MAIN_PUSH_WS_ENABLED=1 only for emergency standalone mode."
         )
         return None
 
+    _prepare_main_memory_only_ws()
     return _runner_start_push_stream(*args, **kwargs)
 
 
@@ -154,23 +254,15 @@ def run_background(*args, **kwargs):
     return start_push_stream(*args, **kwargs)
 
 
-# 直接 `from trading.push.push_stream import runner` された後に
-# runner.start_push_stream を呼ばれる経路も同じguardへ寄せる。
-#
-# ただし、runner.start_push_stream に package の start_push_stream そのものを入れると、
-# push_summary_realtime_patch などが runner.start_push_stream を original として保存した場合に
-# package start_push_stream -> _runner_start_push_stream -> patch wrapper -> original -> package start_push_stream
-# の再帰になる。
-#
-# そのため runner 側には「固定退避した本物 runner 関数」を呼ぶ専用guardだけを入れる。
 def _runner_start_push_stream_guarded(*args, **kwargs):
     if _should_skip_push_stream_start_in_main():
         _mark_main_ws_skipped()
         logger.warning(
             "[push_stream] runner WS start skipped in main process; "
-            "main_database.py handles PUSH WebSocket/registration/storage."
+            "main_database.py handles PUSH WebSocket/registration/storage and summary is fresh."
         )
         return None
+    _prepare_main_memory_only_ws()
     return _TRUE_RUNNER_START_PUSH_STREAM(*args, **kwargs)
 
 
