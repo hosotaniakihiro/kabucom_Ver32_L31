@@ -1,21 +1,15 @@
 # ============================================================
 # File   : trading/board/board_client.py
-# Version: Ver02-KABU-BOARD-SNAPSHOT-CLIENT-429-THROTTLE
+# Version: Ver03-KABU-BOARD-SNAPSHOT-CLIENT-429-4002006-THROTTLE
 # ------------------------------------------------------------
 # kabuステーション REST API /board/{symbol}@{exchange} から
 # 複数段板を取得し、判定しやすい形に正規化する。
 #
-# Ver02:
-#   - SUMMARY AI / entry直前に多数候補へ一斉 board 取得して
-#     kabu Station 429(API実行回数エラー)になる問題を抑制
-#   - symbol別短時間キャッシュ
-#   - 429後のグローバルクールダウン
-#   - REST呼び出し最小間隔を追加
-#
-# 注意:
-#   - 発注はしない。取得と整形だけ。
-#   - token_manager.get_valid_token() を利用。
-#   - 失敗時は None を返す。
+# Ver03:
+#   - 429(API実行回数エラー) だけでなく、4002006(レジスト数エラー) でも
+#     グローバルクールダウンを入れる
+#   - cooldown中はRESTを叩かず、直近キャッシュがあれば返す
+#   - SUMMARY AI / entry直前の候補一斉板確認によるREST過多を抑制
 # ============================================================
 
 from __future__ import annotations
@@ -43,8 +37,9 @@ _FALSE = {"0", "false", "no", "n", "off", "disable", "disabled"}
 _CACHE_LOCK = threading.RLock()
 _BOARD_CACHE: dict[tuple[str, int, int], tuple[float, dict[str, Any]]] = {}
 _LAST_REST_CALL_TS = 0.0
-_429_COOLDOWN_UNTIL = 0.0
-_LAST_429_LOG_TS = 0.0
+_COOLDOWN_UNTIL = 0.0
+_COOLDOWN_REASON = ""
+_LAST_COOLDOWN_LOG_TS = 0.0
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -113,13 +108,15 @@ def _min_interval_sec() -> float:
     return max(0.0, _env_float("BOARD_CLIENT_MIN_INTERVAL_SEC", 0.18))
 
 
-def _cooldown_sec() -> float:
-    return max(0.0, _env_float("BOARD_CLIENT_429_COOLDOWN_SEC", 3.0))
+def _cooldown_sec(reason: str = "") -> float:
+    if "4002006" in str(reason) or "レジスト数エラー" in str(reason):
+        return max(0.0, _env_float("BOARD_CLIENT_REGISTER_ERROR_COOLDOWN_SEC", 20.0))
+    return max(0.0, _env_float("BOARD_CLIENT_429_COOLDOWN_SEC", 5.0))
 
 
-def _cached_snapshot(key: tuple[str, int, int], now: float, *, allow_stale_on_429: bool = False) -> Optional[dict[str, Any]]:
+def _cached_snapshot(key: tuple[str, int, int], now: float, *, allow_stale_on_cooldown: bool = False) -> Optional[dict[str, Any]]:
     ttl = _cache_ttl_sec()
-    stale_ttl = max(ttl, _env_float("BOARD_CLIENT_429_STALE_CACHE_SEC", 10.0)) if allow_stale_on_429 else ttl
+    stale_ttl = max(ttl, _env_float("BOARD_CLIENT_429_STALE_CACHE_SEC", 10.0)) if allow_stale_on_cooldown else ttl
     if stale_ttl <= 0:
         return None
     with _CACHE_LOCK:
@@ -140,7 +137,6 @@ def _store_cache(key: tuple[str, int, int], data: dict[str, Any]) -> None:
         return
     with _CACHE_LOCK:
         _BOARD_CACHE[key] = (time.time(), dict(data))
-        # 無制限増加を防ぐ。1回の候補数は多くても数十なので128で十分。
         if len(_BOARD_CACHE) > 128:
             oldest = sorted(_BOARD_CACHE.items(), key=lambda kv: kv[1][0])[:32]
             for k, _v in oldest:
@@ -160,17 +156,31 @@ def _wait_for_rate_limit() -> None:
         _LAST_REST_CALL_TS = time.time()
 
 
-def _mark_429(symbol: str, status: int, body: Any) -> None:
-    global _429_COOLDOWN_UNTIL, _LAST_429_LOG_TS
+def _is_rate_error(status: int, body: Any) -> tuple[bool, str]:
+    text = str(body)
+    if int(status) == 429 or "API実行回数エラー" in text or "4001006" in text:
+        return True, "429_api_rate"
+    if int(status) == 400 and ("レジスト数エラー" in text or "4002006" in text):
+        return True, "4002006_register_count"
+    return False, ""
+
+
+def _mark_cooldown(symbol: str, status: int, body: Any, reason: str) -> None:
+    global _COOLDOWN_UNTIL, _COOLDOWN_REASON, _LAST_COOLDOWN_LOG_TS
     now = time.time()
-    _429_COOLDOWN_UNTIL = max(_429_COOLDOWN_UNTIL, now + _cooldown_sec())
-    if now - _LAST_429_LOG_TS >= 1.0:
-        _LAST_429_LOG_TS = now
+    sec = _cooldown_sec(reason or body)
+    if sec <= 0:
+        return
+    _COOLDOWN_UNTIL = max(_COOLDOWN_UNTIL, now + sec)
+    _COOLDOWN_REASON = reason or f"status_{status}"
+    if now - _LAST_COOLDOWN_LOG_TS >= 1.0:
+        _LAST_COOLDOWN_LOG_TS = now
         logger.warning(
-            "[BOARD CLIENT] 429 cooldown start symbol=%s status=%s cooldown=%.2fs body=%s",
+            "[BOARD CLIENT] cooldown start symbol=%s status=%s reason=%s cooldown=%.2fs body=%s",
             symbol,
             status,
-            max(0.0, _429_COOLDOWN_UNTIL - now),
+            _COOLDOWN_REASON,
+            max(0.0, _COOLDOWN_UNTIL - now),
             body,
         )
 
@@ -198,21 +208,24 @@ def fetch_board_snapshot(
             return cached
 
     with _CACHE_LOCK:
-        cooldown_until = float(_429_COOLDOWN_UNTIL or 0.0)
+        cooldown_until = float(_COOLDOWN_UNTIL or 0.0)
+        cooldown_reason = str(_COOLDOWN_REASON or "")
     if cooldown_until > now:
-        cached = _cached_snapshot(key, now, allow_stale_on_429=True)
+        cached = _cached_snapshot(key, now, allow_stale_on_cooldown=True)
         if cached is not None:
             logger.warning(
-                "[BOARD CLIENT] 429 cooldown cache fallback symbol=%s remain=%.2fs age=%.3fs",
+                "[BOARD CLIENT] cooldown cache fallback symbol=%s remain=%.2fs reason=%s age=%.3fs",
                 symbol_n,
                 cooldown_until - now,
+                cooldown_reason,
                 cached.get("cache_age_sec", 0.0),
             )
             return cached
         logger.warning(
-            "[BOARD CLIENT] 429 cooldown active -> skip REST symbol=%s remain=%.2fs",
+            "[BOARD CLIENT] cooldown active -> skip REST symbol=%s remain=%.2fs reason=%s",
             symbol_n,
             cooldown_until - now,
+            cooldown_reason,
         )
         return None
 
@@ -233,9 +246,10 @@ def fetch_board_snapshot(
             except Exception:
                 body = res.text
             logger.warning("[BOARD CLIENT] http_ng symbol=%s status=%s body=%s", symbol_n, res.status_code, body)
-            if int(res.status_code) == 429 or "API実行回数エラー" in str(body):
-                _mark_429(symbol_n, int(res.status_code), body)
-                cached = _cached_snapshot(key, time.time(), allow_stale_on_429=True)
+            is_rate, reason = _is_rate_error(int(res.status_code), body)
+            if is_rate:
+                _mark_cooldown(symbol_n, int(res.status_code), body, reason)
+                cached = _cached_snapshot(key, time.time(), allow_stale_on_cooldown=True)
                 if cached is not None:
                     return cached
             return None
