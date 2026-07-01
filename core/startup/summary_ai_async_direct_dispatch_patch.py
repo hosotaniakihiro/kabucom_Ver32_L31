@@ -1,11 +1,18 @@
 # ============================================================
 # File   : core/startup/summary_ai_async_direct_dispatch_patch.py
-# Version: V7-FORCE-DIRECT-SYNC-ORDER-DISPATCH
+# Version: V8-FORCE-DIRECT-SYNC-TIMEOUT-GUARD
 # ------------------------------------------------------------
 # 目的:
 #   SUMMARY AI が AI_OK / approved を出しても、
 #   summary_ai_async_entry_patch が executed=False / skip=queued_async を返し、
 #   実発注がworker待ち・stale skip になる問題を止める。
+#
+# V8:
+#   - V7の direct_sync 強制は維持。
+#   - direct snapshot が entry_controller 内で長時間止まり、
+#     sync fallback done が出ないケースを検出するためタイムアウトを追加。
+#   - タイムアウト時は必ず direct snapshot timeout としてログに残す。
+#   - timeout 後の重複発注を避けるため、同一呼び出しでは追加retryしない。
 #
 # V7:
 #   - SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC=1 を強制する。
@@ -21,14 +28,13 @@ import logging
 import os
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V7-FORCE-DIRECT-SYNC-ORDER-DISPATCH"
+VERSION = "V8-FORCE-DIRECT-SYNC-TIMEOUT-GUARD"
 _INSTALLED = False
 _ORIG = None
-_SEQ = 0
 _LOCK = threading.Lock()
 _WATCHER_STARTED = False
 
@@ -57,6 +63,7 @@ def _force_direct_sync_env() -> None:
     os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_MAX_ATTEMPTS", "2")
     os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_RETRY_SLEEP_SEC", "0.7")
     os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_PIPELINE_SOURCE", "SUMMARY")
+    os.environ.setdefault("SUMMARY_AI_DIRECT_SNAPSHOT_TIMEOUT_SEC", "8.0")
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -273,6 +280,46 @@ def _is_retryable_no_order(result: Any) -> bool:
     return False
 
 
+def _is_timeout_result(result: Any) -> bool:
+    return isinstance(result, dict) and bool(result.get("timeout"))
+
+
+def _call_with_timeout(label: str, rows: list[Any], timeout_sec: float, fn: Callable[[], Any]) -> Any:
+    timeout_sec = float(timeout_sec or 0.0)
+    if timeout_sec <= 0:
+        return fn()
+
+    box: dict[str, Any] = {"done": False, "result": None, "error": None}
+
+    def _target() -> None:
+        try:
+            box["result"] = fn()
+        except Exception as e:
+            box["error"] = e
+        finally:
+            box["done"] = True
+
+    symbols = _symbols(rows)
+    started = time.time()
+    th = threading.Thread(target=_target, daemon=True, name=f"summary-ai-direct-{label}")
+    th.start()
+    th.join(timeout_sec)
+    elapsed = time.time() - started
+    if th.is_alive():
+        logger.error(
+            "[SUMMARY AI DIRECT DISPATCH] %s timeout timeout=%.3fs elapsed=%.3fs symbols=%s version=%s note=inner_thread_left_daemon_to_avoid_blocking",
+            label,
+            timeout_sec,
+            elapsed,
+            symbols,
+            VERSION,
+        )
+        return {"executed": False, "timeout": True, "skip_reason": f"{label}_timeout", "elapsed_sec": elapsed, "symbols": symbols}
+    if box.get("error") is not None:
+        raise box["error"]
+    return box.get("result")
+
+
 def _direct_snapshot_execute(approved_rows: list[Any], interval: Any) -> Any:
     if not _env_bool("SUMMARY_AI_DIRECT_DISPATCH_SNAPSHOT_FIRST", True):
         return None
@@ -283,9 +330,10 @@ def _direct_snapshot_execute(approved_rows: list[Any], interval: Any) -> Any:
             return None
         pipeline_source = _resolve_pipeline_source(approved_rows)
         logger.warning(
-            "[SUMMARY AI DIRECT DISPATCH] direct snapshot pipeline_source resolved=%s symbols=%s version=%s",
+            "[SUMMARY AI DIRECT DISPATCH] direct snapshot pipeline_source resolved=%s symbols=%s timeout=%.3fs version=%s",
             pipeline_source,
             _symbols(approved_rows),
+            _env_float("SUMMARY_AI_DIRECT_SNAPSHOT_TIMEOUT_SEC", 8.0),
             VERSION,
         )
         return fn(approved_rows, pipeline_source=pipeline_source, interval=interval)
@@ -312,32 +360,45 @@ def _fallback_direct_dispatch(result: Any, kwargs: dict[str, Any]) -> Any:
         interval = kwargs.get("interval", 1)
         attempts = max(1, _env_int("SUMMARY_AI_DIRECT_DISPATCH_MAX_ATTEMPTS", 2))
         retry_sleep = max(0.3, _env_float("SUMMARY_AI_DIRECT_DISPATCH_RETRY_SLEEP_SEC", 0.7))
+        timeout_sec = _env_float("SUMMARY_AI_DIRECT_SNAPSHOT_TIMEOUT_SEC", 8.0)
         last_result: Any = None
         for attempt in range(1, attempts + 1):
             started = time.time()
             logger.warning(
-                "[SUMMARY AI DIRECT DISPATCH] sync fallback start attempt=%s/%s interval=%s approved=%s symbols=%s version=%s",
+                "[SUMMARY AI DIRECT DISPATCH] sync fallback start attempt=%s/%s interval=%s approved=%s symbols=%s timeout=%.3fs version=%s",
                 attempt,
                 attempts,
                 interval,
                 len(approved_rows),
                 _symbols(approved_rows),
+                timeout_sec,
                 VERSION,
             )
-            snap_result = _direct_snapshot_execute(approved_rows, interval)
+            snap_result = _call_with_timeout(
+                "direct_snapshot",
+                approved_rows,
+                timeout_sec,
+                lambda: _direct_snapshot_execute(approved_rows, interval),
+            )
             last_result = snap_result
             logger.warning(
-                "[SUMMARY AI DIRECT DISPATCH] sync fallback done attempt=%s/%s elapsed=%.3fs executed=%s registered=%s retryable=%s reason_chain=%s result=%s",
+                "[SUMMARY AI DIRECT DISPATCH] sync fallback done attempt=%s/%s elapsed=%.3fs executed=%s timeout=%s registered=%s retryable=%s reason_chain=%s result=%s",
                 attempt,
                 attempts,
                 time.time() - started,
                 _result_executed(snap_result),
+                _is_timeout_result(snap_result),
                 _registered_count(snap_result),
                 _is_retryable_no_order(snap_result),
                 _flatten_reasons(snap_result),
                 snap_result,
             )
-            if _result_executed(snap_result) or not _is_retryable_no_order(snap_result):
+            if _result_executed(snap_result):
+                break
+            if _is_timeout_result(snap_result):
+                # inner thread が遅延して注文する可能性があるため、同一呼び出しで追加retryしない。
+                break
+            if not _is_retryable_no_order(snap_result):
                 break
             if attempt < attempts:
                 time.sleep(retry_sleep)
@@ -348,6 +409,9 @@ def _fallback_direct_dispatch(result: Any, kwargs: dict[str, Any]) -> Any:
             if _result_executed(last_result):
                 out["executed"] = True
                 out["skip_reason"] = None
+            elif _is_timeout_result(last_result):
+                out["skip_reason"] = "direct_snapshot_timeout"
+                out["direct_dispatch_timeout"] = True
             return out
     except Exception:
         logger.exception("[SUMMARY AI DIRECT DISPATCH] sync fallback failed")
@@ -372,10 +436,11 @@ def _patch_once(*, log_patch: bool = True) -> bool:
         if not callable(cur):
             logger.debug("[SUMMARY AI DIRECT DISPATCH] target missing")
             return False
-        if getattr(cur, "_summary_ai_direct_dispatch_v7", False):
+        if getattr(cur, "_summary_ai_direct_dispatch_v8", False):
             _INSTALLED = True
             return True
-        _ORIG = getattr(cur, "_original", cur) if any(getattr(cur, f"_summary_ai_direct_dispatch_v{i}", False) for i in range(1, 7)) else cur
+        _ORIG = getattr(cur, "_original", cur) if any(getattr(cur, f"_summary_ai_direct_dispatch_v{i}", False) for i in range(1, 8)) else cur
+        _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v8 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v7 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v6 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._original = _ORIG  # type: ignore[attr-defined]
@@ -384,11 +449,12 @@ def _patch_once(*, log_patch: bool = True) -> bool:
         _INSTALLED = True
         if log_patch:
             logger.warning(
-                "[SUMMARY AI DIRECT DISPATCH] patched v7 target=%s direct_sync_env=%s attempts=%s snapshot_first=%s source_match=True version=%s",
+                "[SUMMARY AI DIRECT DISPATCH] patched v8 target=%s direct_sync_env=%s attempts=%s snapshot_first=%s timeout=%.3fs source_match=True version=%s",
                 getattr(_ORIG, "__name__", type(_ORIG).__name__),
                 os.getenv("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC"),
                 _env_int("SUMMARY_AI_DIRECT_DISPATCH_MAX_ATTEMPTS", 2),
                 _env_bool("SUMMARY_AI_DIRECT_DISPATCH_SNAPSHOT_FIRST", True),
+                _env_float("SUMMARY_AI_DIRECT_SNAPSHOT_TIMEOUT_SEC", 8.0),
                 VERSION,
             )
         return True
@@ -405,11 +471,12 @@ def _watch_reinstall() -> None:
         ok = _patch_once(log_patch=False)
         if i in (0, loops - 1):
             logger.warning(
-                "[SUMMARY AI DIRECT DISPATCH] enforce v7 i=%s/%s ok=%s direct_sync_env=%s version=%s",
+                "[SUMMARY AI DIRECT DISPATCH] enforce v8 i=%s/%s ok=%s direct_sync_env=%s timeout=%.3fs version=%s",
                 i,
                 loops,
                 ok,
                 os.getenv("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC"),
+                _env_float("SUMMARY_AI_DIRECT_SNAPSHOT_TIMEOUT_SEC", 8.0),
                 VERSION,
             )
         time.sleep(sleep_sec)
@@ -426,13 +493,14 @@ def install() -> bool:
         _WATCHER_STARTED = True
         threading.Thread(target=_watch_reinstall, daemon=True, name="summary-ai-direct-dispatch-enforcer").start()
         logger.warning(
-            "[SUMMARY AI DIRECT DISPATCH] installed/enforcing v7 ok=%s watcher=%s loops=%s sleep=%s direct_sync_env=%s snapshot_first=%s version=%s",
+            "[SUMMARY AI DIRECT DISPATCH] installed/enforcing v8 ok=%s watcher=%s loops=%s sleep=%s direct_sync_env=%s snapshot_first=%s timeout=%.3fs version=%s",
             ok,
             _WATCHER_STARTED,
             _env_int("SUMMARY_AI_DIRECT_DISPATCH_WATCH_LOOPS", 12),
             _env_float("SUMMARY_AI_DIRECT_DISPATCH_WATCH_SLEEP_SEC", 2.0),
             os.getenv("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC"),
             _env_bool("SUMMARY_AI_DIRECT_DISPATCH_SNAPSHOT_FIRST", True),
+            _env_float("SUMMARY_AI_DIRECT_SNAPSHOT_TIMEOUT_SEC", 8.0),
             VERSION,
         )
     return bool(ok)
