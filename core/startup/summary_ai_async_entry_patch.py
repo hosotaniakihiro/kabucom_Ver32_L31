@@ -1,15 +1,17 @@
 # ============================================================
 # File   : core/startup/summary_ai_async_entry_patch.py
-# Version: Ver10-SCALP-STALE-RETRY-GUARD
+# Version: Ver11-DIRECT-SNAPSHOT-REENTRANT-LOCK
 # ------------------------------------------------------------
 # SUMMARY AI の実発注を非同期化しつつ、古い承認候補を何度も再実行して
 # no order を増やす問題を防ぐ。
 #
-# Ver10:
-#   - stale 既定を 90s -> 20s に短縮。
-#   - retry 既定を 8回 -> 2回に短縮。
-#   - snapshot_no_order / no_tradable_rows_after_filters はリトライ対象外。
-#   - direct snapshot の snapshot_no_order も retryable=False。
+# Ver11:
+#   - summary_entry.execute_entry_pipeline が run_entry_pipeline 内から呼ばれると、
+#     entry_controller._pipeline_lock は既に保持済みになる。
+#   - direct snapshot が同じlockを再取得しようとして
+#     entry_controller_lock_timeout になり発注まで進まない問題を修正。
+#   - lock busy時は既存パイプライン内のreentrant実行として、候補評価/発注へ進む。
+#   - stale/retry/queueの既定はVer10を継続。
 # ============================================================
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY", "1")
 os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX", "2")
 os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_SLEEP_SEC", "1.0")
 os.environ.setdefault("SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT", "1")
+os.environ.setdefault("SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK", "1")
 
 _TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 _FALSE = {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}
@@ -293,12 +296,21 @@ def _summary_ai_direct_snapshot_execute(entries: Any, *, pipeline_source: str | 
 
     lock = getattr(ec, "_pipeline_lock", None)
     acquired = False
+    reentrant_lock = False
     try:
         if lock is not None:
             acquired = bool(lock.acquire(blocking=False))
             if not acquired:
-                logger.warning("[SUMMARY AI DIRECT SNAPSHOT] entry_controller lock busy entries=%s symbols=%s", len(rows), _symbols(rows))
-                return {"executed": False, "entries": len(rows), "skip_reason": "entry_controller_lock_timeout", "retryable": True, "result": None, "pending_root": snapshot_root()}
+                if _env_bool("SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK", True):
+                    reentrant_lock = True
+                    logger.warning(
+                        "[SUMMARY AI DIRECT SNAPSHOT] entry_controller lock busy -> reentrant execution entries=%s symbols=%s",
+                        len(rows),
+                        _symbols(rows),
+                    )
+                else:
+                    logger.warning("[SUMMARY AI DIRECT SNAPSHOT] entry_controller lock busy entries=%s symbols=%s", len(rows), _symbols(rows))
+                    return {"executed": False, "entries": len(rows), "skip_reason": "entry_controller_lock_timeout", "retryable": True, "result": None, "pending_root": snapshot_root()}
         try:
             market_open = bool(ec.is_market_open()) and bool(ec._is_trading_hours())
         except Exception:
@@ -335,7 +347,14 @@ def _summary_ai_direct_snapshot_execute(entries: Any, *, pipeline_source: str | 
         global_scored_candidates: list[dict[str, Any]] = []
         for symbol, bucket in by_symbol.items():
             try:
-                scored = ec._build_scored_candidates(symbol=symbol, entries=sorted(bucket, key=lambda e: (ec.ENTRY_TYPE_PRIORITY.get(e.get("entry_type"), 0), ec._safe_float(e.get("score"), 0.0), e.get("created_at") or dt.datetime.min), reverse=True), open_position_symbols=open_position_symbols, boost_active=boost_active, pipeline_source=pipeline_source, interval=interval)
+                scored = ec._build_scored_candidates(
+                    symbol=symbol,
+                    entries=sorted(bucket, key=lambda e: (ec.ENTRY_TYPE_PRIORITY.get(e.get("entry_type"), 0), ec._safe_float(e.get("score"), 0.0), e.get("created_at") or dt.datetime.min), reverse=True),
+                    open_position_symbols=open_position_symbols,
+                    boost_active=boost_active,
+                    pipeline_source=pipeline_source,
+                    interval=interval,
+                )
                 if scored:
                     global_scored_candidates.extend(scored)
             except Exception:
@@ -350,7 +369,14 @@ def _summary_ai_direct_snapshot_execute(entries: Any, *, pipeline_source: str | 
         attempted_count = 0
         executed_symbols: set[str] = set()
         order_results: list[dict[str, Any]] = []
-        logger.warning("[SUMMARY AI DIRECT SNAPSHOT] ranked total=%s top=%s pipeline_source=%s interval=%s", len(global_scored_candidates), [{"symbol": x.get("symbol"), "side": x.get("side"), "priority": round(ec._safe_float(x.get("priority_score"), 0.0), 4), "conf": round(ec._safe_float(x.get("confidence"), 0.0), 4)} for x in global_scored_candidates[:10]], pipeline_source, interval)
+        logger.warning(
+            "[SUMMARY AI DIRECT SNAPSHOT] ranked total=%s top=%s pipeline_source=%s interval=%s reentrant_lock=%s",
+            len(global_scored_candidates),
+            [{"symbol": x.get("symbol"), "side": x.get("side"), "priority": round(ec._safe_float(x.get("priority_score"), 0.0), 4), "conf": round(ec._safe_float(x.get("confidence"), 0.0), 4)} for x in global_scored_candidates[:10]],
+            pipeline_source,
+            interval,
+            reentrant_lock,
+        )
         for item in global_scored_candidates:
             if approved_count >= max_per_run:
                 break
@@ -377,7 +403,7 @@ def _summary_ai_direct_snapshot_execute(entries: Any, *, pipeline_source: str | 
             except Exception:
                 logger.debug("[SUMMARY AI DIRECT SNAPSHOT] pop_entry failed symbol=%s", symbol, exc_info=True)
         executed = approved_count > 0
-        out = {"executed": executed, "entries": len(rows), "approved_count": approved_count, "attempted_count": attempted_count, "result": order_results, "pipeline_source": pipeline_source, "interval": interval, "skip_reason": None if executed else "snapshot_no_order", "retryable": False, "pending_root": snapshot_root()}
+        out = {"executed": executed, "entries": len(rows), "approved_count": approved_count, "attempted_count": attempted_count, "result": order_results, "pipeline_source": pipeline_source, "interval": interval, "skip_reason": None if executed else "snapshot_no_order", "retryable": False, "pending_root": snapshot_root(), "reentrant_lock": reentrant_lock}
         logger.warning("[SUMMARY AI DIRECT SNAPSHOT] done %s", out)
         return out
     except Exception as e:
@@ -396,20 +422,22 @@ def _install_summary_entry_snapshot_patch() -> bool:
     try:
         from trading.summary import summary_entry as se
         current = getattr(se, "execute_entry_pipeline", None)
-        if getattr(current, "_summary_ai_direct_snapshot_v10", False):
-            logger.warning("[SUMMARY AI DIRECT SNAPSHOT] already installed v10")
+        if getattr(current, "_summary_ai_direct_snapshot_v11", False):
+            logger.warning("[SUMMARY AI DIRECT SNAPSHOT] already installed v11")
             return True
         _ORIG_SUMMARY_ENTRY_PIPELINE = getattr(current, "_original", None) or current
         if not callable(_ORIG_SUMMARY_ENTRY_PIPELINE):
             logger.warning("[SUMMARY AI DIRECT SNAPSHOT] original summary entry pipeline missing")
             return False
+
         def _patched_execute_entry_pipeline(entries, *, pipeline_source: str | None = None, interval: int | None = None):
             return _summary_ai_direct_snapshot_execute(entries, pipeline_source=pipeline_source, interval=interval)
+
+        _patched_execute_entry_pipeline._summary_ai_direct_snapshot_v11 = True  # type: ignore[attr-defined]
         _patched_execute_entry_pipeline._summary_ai_direct_snapshot_v10 = True  # type: ignore[attr-defined]
-        _patched_execute_entry_pipeline._summary_ai_direct_snapshot_v9 = True  # type: ignore[attr-defined]
         _patched_execute_entry_pipeline._original = _ORIG_SUMMARY_ENTRY_PIPELINE  # type: ignore[attr-defined]
         se.execute_entry_pipeline = _patched_execute_entry_pipeline
-        logger.warning("[SUMMARY AI DIRECT SNAPSHOT] installed v10 enabled=%s", _env_bool("SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT", True))
+        logger.warning("[SUMMARY AI DIRECT SNAPSHOT] installed v11 enabled=%s reentrant_lock=%s", _env_bool("SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT", True), _env_bool("SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK", True))
         return True
     except Exception:
         logger.exception("[SUMMARY AI DIRECT SNAPSHOT] install failed")
@@ -540,13 +568,14 @@ def install() -> bool:
         from trading.entry.summary_ai import executor as exec_mod
         from trading.entry.summary_ai import runner as runner_mod
         current = getattr(exec_mod, "execute_ai_ok_entries_bulk", None)
-        if getattr(current, "_summary_ai_async_entry_patch_v10", False):
+        if getattr(current, "_summary_ai_async_entry_patch_v11", False):
             _INSTALLED = True
-            logger.warning("[SUMMARY AI ASYNC ENTRY] already installed v10")
+            logger.warning("[SUMMARY AI ASYNC ENTRY] already installed v11")
             return True
         _ORIG_EXECUTE = getattr(current, "_original", None) if getattr(current, "_summary_ai_async_entry_patch_v8", False) else current
         if not callable(_ORIG_EXECUTE):
             _ORIG_EXECUTE = current
+        _patched_execute_ai_ok_entries_bulk._summary_ai_async_entry_patch_v11 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_async_entry_patch_v10 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_async_entry_patch_v9 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_async_entry_patch_v8 = True  # type: ignore[attr-defined]
@@ -554,7 +583,7 @@ def install() -> bool:
         exec_mod.execute_ai_ok_entries_bulk = _patched_execute_ai_ok_entries_bulk
         runner_mod.execute_ai_ok_entries_bulk = _patched_execute_ai_ok_entries_bulk
         _INSTALLED = True
-        logger.warning("[SUMMARY AI ASYNC ENTRY] installed v10 enabled=%s direct_sync=%s queue_max=%s stale_sec=%.3f latest_only=True queued_is_not_executed=True retry_busy=%s retry_max=%s retry_sleep=%.2f snapshot_direct=%s", _env_bool("SUMMARY_AI_ASYNC_ENTRY", True), _env_bool("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC", False), _env_int("SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX", 1), _env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 20.0), _env_bool("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY", True), _env_int("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX", 2), _env_float("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_SLEEP_SEC", 1.0), _env_bool("SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT", True))
+        logger.warning("[SUMMARY AI ASYNC ENTRY] installed v11 enabled=%s direct_sync=%s queue_max=%s stale_sec=%.3f latest_only=True queued_is_not_executed=True retry_busy=%s retry_max=%s retry_sleep=%.2f snapshot_direct=%s reentrant_lock=%s", _env_bool("SUMMARY_AI_ASYNC_ENTRY", True), _env_bool("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC", False), _env_int("SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX", 1), _env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 20.0), _env_bool("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY", True), _env_int("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX", 2), _env_float("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_SLEEP_SEC", 1.0), _env_bool("SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT", True), _env_bool("SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK", True))
         return True
     except Exception:
         logger.exception("[SUMMARY AI ASYNC ENTRY] install failed")
