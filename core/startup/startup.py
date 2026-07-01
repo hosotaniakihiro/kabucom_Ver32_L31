@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/startup.py
-# Version: FINAL-PRODUCTION-REV25.1-ENTRY-EXECUTE-GUARD-V3
+# Version: FINAL-PRODUCTION-REV25.2-DIRECT-REST-BOARD-FALLBACK
 # ------------------------------------------------------------
 # 【概要】
 #   system_startup の公開入口
@@ -10,11 +10,10 @@
 #   - 実際の起動順序は startup_orchestrator.py に委譲
 #   - 詳細処理は push_startup / scheduler_startup / summary_startup 等へ分離
 #
-# REV25.1:
-#   - summary_entry_pending_duplicate_registered_patch を起動時に明示適用
-#   - entry_execute_timeout_guard_patch V3 を起動時に明示適用
-#   - TONOSAMA/SUMMARY_AI の _execute_best_candidate 多重wrapによる
-#     INFLIGHT_DUPLICATE_SKIP 自己ブロックを抑止
+# REV25.2:
+#   - final_entry_board_rest_direct_patch を起動時に明示適用
+#   - PUSHローテ外銘柄で final_entry_safety_guard が board_missing になり
+#     発注直前で止まる問題を、kabu Station REST /board fallback で抑止
 # ============================================================
 
 from __future__ import annotations
@@ -147,6 +146,13 @@ def _install_entrypoint_runtime_patches() -> None:
         logger.exception("[startup.entrypoint] final entry safety guard install failed")
 
     try:
+        from core.startup.final_entry_board_rest_direct_patch import install as install_final_entry_board_rest_direct_patch
+
+        install_final_entry_board_rest_direct_patch()
+    except Exception:
+        logger.exception("[startup.entrypoint] final entry direct REST board fallback install failed")
+
+    try:
         from core.startup.exit_limit_pending_close_runtime_patch import install as install_exit_limit_pending_close_patch
 
         install_exit_limit_pending_close_patch()
@@ -183,7 +189,7 @@ def _install_entrypoint_runtime_patches() -> None:
 
 
 def system_startup():
-    logger.info("🚀 system_startup entry REV25.1-ENTRY-EXECUTE-GUARD-V3")
+    logger.info("🚀 system_startup entry REV25.2-DIRECT-REST-BOARD-FALLBACK")
     _install_entrypoint_runtime_patches()
     return run_system_startup()
 
