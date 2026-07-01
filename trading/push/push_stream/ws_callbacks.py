@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/ws_callbacks.py
-# Version: Ver1.6-PUSH-STREAM-WS-CALLBACKS-EXPECTED-10054-QUIET
+# Version: Ver1.7-PUSH-STREAM-WS-CALLBACKS-HONOR-SKIP-AFTER-OPEN-REFRESH
 # ------------------------------------------------------------
 # PUSH WebSocket callback。
 #
@@ -12,6 +12,8 @@
 #   - V1.6: rotation中の kabu Station 10054 は想定内切断として扱い、
 #           「既存の接続はリモート ホストに強制的に切断されました。 - goodbye」
 #           の表示を抑制する。
+#   - V1.7: PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1 のとき、on_open側でも
+#           refresh after open thread を起動せず、started の誤ログを出さない。
 # ============================================================
 
 from __future__ import annotations
@@ -257,9 +259,13 @@ def on_open(ws: websocket.WebSocketApp) -> None:
 
     # 重要:
     # main.py memory-only mode では rotation_enabled=False のことがある。
-    # その場合、rotation worker は起動しないため、on_open で refresh を起動しないと
-    # protected銘柄を含む登録対象がkabuステーションへ送信されない。
+    # その場合、rotation worker は起動しないため、on_open refresh が必要になる。
+    # ただし main_database.py / push_receiver のA/Bローテーション運用では
+    # PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1 を尊重し、余計な再登録 thread を起動しない。
     try:
+        if _env_bool("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", False):
+            logger.warning("[push_stream] refresh after open thread skipped by ws_callbacks env PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1")
+            return
         _start_refresh_after_open_thread()
         logger.warning("[push_stream] refresh after open thread started")
     except Exception:
