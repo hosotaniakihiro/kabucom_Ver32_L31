@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/__init__.py
-# Version: Ver1.8-PUSH-ROTATION-LIQ-KEEP100-MAIN-WS-GUARD-NO-RECURSION
+# Version: Ver1.9-PUSH-ROTATION-LIQ-KEEP100-MAIN-WS-GUARD-NO-RECURSION
 # ------------------------------------------------------------
 # ✔ 旧 trading.push.push_stream 公開API互換
 # ✔ 分割後モジュールの再エクスポート
@@ -15,6 +15,7 @@
 # ✔ runner.start_push_stream を package start_push_stream に差し替えない
 #   - package start_push_stream -> _runner_start_push_stream -> wrapper -> package start_push_stream
 #     の再帰を防ぐ
+# ✔ runner guard は動的 _runner_start_push_stream ではなく、固定退避した本物関数を呼ぶ
 # ============================================================
 
 from __future__ import annotations
@@ -66,10 +67,12 @@ from . import runner as _runner_mod
 
 # 重要:
 # runner module 側の本物の start_push_stream をここで退避する。
-# 以後、package公開入口 start_push_stream はこの変数経由で呼ぶ。
-# push_summary_realtime_patch などが _runner_start_push_stream を差し替える場合も、
-# original はこの時点の本物関数を辿れるよう __wrapped__ / 専用属性を付与する。
+# package公開入口は _runner_start_push_stream 経由で呼ぶため、
+# push_summary_realtime_patch などがここを差し替えることは許可する。
+# 一方、runner module 直呼び用guardは、差し替え後の _runner_start_push_stream ではなく
+# _TRUE_RUNNER_START_PUSH_STREAM を呼ぶ。これにより guard -> patch wrapper -> guard の再帰を防ぐ。
 _runner_start_push_stream = _runner_mod.start_push_stream
+_TRUE_RUNNER_START_PUSH_STREAM = _runner_start_push_stream
 stop_push_stream = _runner_mod.stop_push_stream
 get_status = _runner_mod.get_status
 
@@ -159,7 +162,7 @@ def run_background(*args, **kwargs):
 # package start_push_stream -> _runner_start_push_stream -> patch wrapper -> original -> package start_push_stream
 # の再帰になる。
 #
-# そのため runner 側には「保存済みの本物 runner 関数」を呼ぶ専用guardだけを入れる。
+# そのため runner 側には「固定退避した本物 runner 関数」を呼ぶ専用guardだけを入れる。
 def _runner_start_push_stream_guarded(*args, **kwargs):
     if _should_skip_push_stream_start_in_main():
         _mark_main_ws_skipped()
@@ -168,12 +171,12 @@ def _runner_start_push_stream_guarded(*args, **kwargs):
             "main_database.py handles PUSH WebSocket/registration/storage."
         )
         return None
-    return _runner_start_push_stream(*args, **kwargs)
+    return _TRUE_RUNNER_START_PUSH_STREAM(*args, **kwargs)
 
 
 try:
-    _runner_start_push_stream_guarded.__wrapped__ = _runner_start_push_stream  # type: ignore[attr-defined]
-    _runner_start_push_stream_guarded._push_stream_runner_true_original = _runner_start_push_stream  # type: ignore[attr-defined]
+    _runner_start_push_stream_guarded.__wrapped__ = _TRUE_RUNNER_START_PUSH_STREAM  # type: ignore[attr-defined]
+    _runner_start_push_stream_guarded._push_stream_runner_true_original = _TRUE_RUNNER_START_PUSH_STREAM  # type: ignore[attr-defined]
     _runner_start_push_stream_guarded._push_stream_runner_guarded_no_recursion = True  # type: ignore[attr-defined]
     _runner_mod.start_push_stream = _runner_start_push_stream_guarded
     _runner_mod.start = _runner_start_push_stream_guarded
