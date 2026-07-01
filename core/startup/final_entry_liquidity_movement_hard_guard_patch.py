@@ -1,19 +1,15 @@
 # ============================================================
 # File   : core/startup/final_entry_liquidity_movement_hard_guard_patch.py
-# Version: V4-SCALP-LIQUIDITY-THRESHOLD-RELAX
+# Version: V5-SUMMARY-AI-LOW-MOVEMENT-RESCUE
 # ------------------------------------------------------------
 # 発注直前の最終ハードガード。
 #
-# V4:
-#   - 2026-06-29 14:46 ログで 9264 が volume=33,300 / turnover=56,610,000
-#     なのに ENTRY_HARD_MIN_VOLUME=100,000 で落ちていた。
-#   - ユーザー運用方針の「直近出来高>=3,000 / 売買代金>=100万円」よりは
-#     少し厳しめ、ただしエントリー数を殺しすぎない既定値へ変更。
-#   - default: volume 100,000 -> 30,000, turnover 50,000,000 -> 10,000,000
-#
-# V3:
-#   - TONOSAMA候補の出来高は volume ではなく _latest_volume に入ることがある。
-#   - _latest_volume / latest_volume / recent_volume_3m/5m も採用する。
+# V5:
+#   - SUMMARY_AI が AI_OK / 高score / 十分な出来高・売買代金なのに、
+#     1分足の high-low / ATR が小さいだけで low_movement になり、
+#     発注直前で全落ちするケースを救済する。
+#   - ただし低流動性は従来通りブロックする。
+#   - 救済条件: SUMMARY_AI かつ score>=3.0 かつ turnover>=1,000万円 かつ volume>=3万。
 # ============================================================
 from __future__ import annotations
 
@@ -22,7 +18,7 @@ import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V4-SCALP-LIQUIDITY-THRESHOLD-RELAX"
+VERSION = "V5-SUMMARY-AI-LOW-MOVEMENT-RESCUE"
 _INSTALLED = False
 _ORIG_EXECUTE = None
 
@@ -134,6 +130,7 @@ def _row_to_dict(v: Any) -> dict:
         _copy_nested("raw_alias", d.get("_raw"), d)
         _copy_nested("entry_alias", d.get("entry"), d)
         _copy_nested("row_alias", d.get("row"), d)
+        _copy_nested("ai_alias", d.get("ai"), d)
         return d
     except Exception:
         return {}
@@ -147,6 +144,7 @@ def _merge_item_row(item: Any) -> dict:
             _copy_nested("entry_alias", item.get("entry"), row)
             _copy_nested("row_alias", item.get("row"), row)
             _copy_nested("raw_alias", item.get("_raw"), row)
+            _copy_nested("ai_alias", item.get("ai"), row)
             for k, v in item.items():
                 if k not in row or row.get(k) in (None, ""):
                     row[k] = v
@@ -165,6 +163,59 @@ def _range_pct(row: dict, close: float) -> tuple[float, str]:
     if raw > 1.0:
         raw = raw / 100.0
     return max(0.0, raw), "row_range_pct"
+
+
+def _abs_score(row: dict, side: str) -> float:
+    side_u = _norm_side(side)
+    if side_u == "BUY":
+        keys = ("score_buy", "buy_score", "ai_buy_score", "priority_score", "priority", "confidence")
+    elif side_u == "SELL":
+        keys = ("score_sell", "sell_score", "ai_sell_score", "priority_score", "priority", "confidence")
+    else:
+        keys = ("score", "score_total", "final_score", "display_score", "priority_score", "priority", "confidence")
+    for k in keys:
+        v = _safe_float(row.get(k), 0.0)
+        if v:
+            return abs(v)
+    for k in ("score", "score_total", "final_score", "display_score", "combined_score"):
+        v = _safe_float(row.get(k), 0.0)
+        if v:
+            return abs(v)
+    return 0.0
+
+
+def _is_summary_ai(row: dict) -> bool:
+    text = " ".join(str(row.get(k) or "") for k in ("source", "pipeline_source", "entry_type", "strategy", "model", "model_used", "reason", "ai_reason"))
+    text = text.upper()
+    return "SUMMARY_AI" in text or "SUMMARY" in text or "MTF" in text
+
+
+def _summary_ai_low_movement_rescue(row: dict, *, symbol: str, side: str, volume: float, turnover: float, close: float, range_value: float, atr_ratio: float, slope: float) -> bool:
+    if not _env_bool("ENTRY_HARD_SUMMARY_AI_LOW_MOVEMENT_RESCUE", True):
+        return False
+    if not _is_summary_ai(row):
+        return False
+    score = _abs_score(row, side)
+    min_score = _env_float("ENTRY_HARD_SUMMARY_AI_RESCUE_MIN_SCORE", 3.0)
+    min_volume = _env_float("ENTRY_HARD_SUMMARY_AI_RESCUE_MIN_VOLUME", _env_float("ENTRY_HARD_MIN_VOLUME", 30000.0))
+    min_turnover = _env_float("ENTRY_HARD_SUMMARY_AI_RESCUE_MIN_TURNOVER", _env_float("ENTRY_HARD_MIN_TURNOVER", 10000000.0))
+    if score >= min_score and volume >= min_volume and turnover >= min_turnover and close > 0:
+        logger.warning(
+            "[ENTRY HARD GUARD] SUMMARY_AI_LOW_MOVEMENT_RESCUE symbol=%s side=%s score=%.3f close=%.2f volume=%.0f turnover=%.0f range_pct=%.5f atr_ratio=%.5f slope=%.6f min_score=%.3f version=%s",
+            symbol,
+            side,
+            score,
+            close,
+            volume,
+            turnover,
+            range_value,
+            atr_ratio,
+            slope,
+            min_score,
+            VERSION,
+        )
+        return True
+    return False
 
 
 def _hard_guard(item: Any) -> bool:
@@ -213,6 +264,8 @@ def _hard_guard(item: Any) -> bool:
 
     movement_ok = range_value >= min_range or atr_ratio >= min_atr_ratio or abs(slope) >= min_abs_slope
     if not movement_ok:
+        if _summary_ai_low_movement_rescue(row, symbol=symbol, side=side, volume=volume, turnover=turnover, close=close, range_value=range_value, atr_ratio=atr_ratio, slope=slope):
+            return True
         logger.warning("[ENTRY HARD GUARD] NG symbol=%s side=%s reason=low_movement close=%.2f range_pct=%.5f min_range=%.5f range_source=%s atr_ratio=%.5f min_atr=%.5f slope=%.6f min_abs_slope=%.6f volume=%.0f turnover=%.0f volume_source=%s turnover_source=%s", symbol, side, close, range_value, min_range, range_source, atr_ratio, min_atr_ratio, slope, min_abs_slope, volume, turnover, volume_source, turnover_source)
         return False
 
@@ -237,25 +290,28 @@ def install() -> bool:
         if not callable(cur):
             logger.warning("[ENTRY HARD GUARD] target missing")
             return False
-        if getattr(cur, "_entry_hard_liq_move_guard_v4", False):
+        if getattr(cur, "_entry_hard_liq_move_guard_v5", False):
             _INSTALLED = True
             return True
-        _ORIG_EXECUTE = getattr(cur, "_original", cur) if (getattr(cur, "_entry_hard_liq_move_guard_v1", False) or getattr(cur, "_entry_hard_liq_move_guard_v2", False) or getattr(cur, "_entry_hard_liq_move_guard_v3", False)) else cur
+        _ORIG_EXECUTE = getattr(cur, "_original", cur) if (getattr(cur, "_entry_hard_liq_move_guard_v1", False) or getattr(cur, "_entry_hard_liq_move_guard_v2", False) or getattr(cur, "_entry_hard_liq_move_guard_v3", False) or getattr(cur, "_entry_hard_liq_move_guard_v4", False)) else cur
         _patched_execute_best_candidate._entry_hard_liq_move_guard_v1 = True  # type: ignore[attr-defined]
         _patched_execute_best_candidate._entry_hard_liq_move_guard_v2 = True  # type: ignore[attr-defined]
         _patched_execute_best_candidate._entry_hard_liq_move_guard_v3 = True  # type: ignore[attr-defined]
         _patched_execute_best_candidate._entry_hard_liq_move_guard_v4 = True  # type: ignore[attr-defined]
+        _patched_execute_best_candidate._entry_hard_liq_move_guard_v5 = True  # type: ignore[attr-defined]
         _patched_execute_best_candidate._original = _ORIG_EXECUTE  # type: ignore[attr-defined]
         ec._execute_best_candidate = _patched_execute_best_candidate
         _INSTALLED = True
         logger.warning(
-            "[ENTRY HARD GUARD] installed v4 min_volume=%.0f min_turnover=%.0f min_range=%.5f min_atr=%.5f min_abs_slope=%.6f require_movement=%s latest_volume_fallback=True raw_fallback=True",
+            "[ENTRY HARD GUARD] installed v5 min_volume=%.0f min_turnover=%.0f min_range=%.5f min_atr=%.5f min_abs_slope=%.6f require_movement=%s summary_ai_low_move_rescue=%s rescue_min_score=%.3f latest_volume_fallback=True raw_fallback=True",
             _env_float("ENTRY_HARD_MIN_VOLUME", 30000.0),
             _env_float("ENTRY_HARD_MIN_TURNOVER", 10000000.0),
             _env_float("ENTRY_HARD_MIN_RANGE_PCT", 0.006),
             _env_float("ENTRY_HARD_MIN_ATR_RATIO", 0.003),
             _env_float("ENTRY_HARD_MIN_ABS_SLOPE", 0.001),
             _env_bool("ENTRY_HARD_REQUIRE_MOVEMENT", True),
+            _env_bool("ENTRY_HARD_SUMMARY_AI_LOW_MOVEMENT_RESCUE", True),
+            _env_float("ENTRY_HARD_SUMMARY_AI_RESCUE_MIN_SCORE", 3.0),
         )
         return True
     except Exception:
