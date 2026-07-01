@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/entry_controller_source_prefilter_patch.py
-# Version: V3-SUMMARY-AI-SUMMARY-COMPAT-VOL-RESCUE
+# Version: V4-SUMMARY-AI-SUMMARY-COMPAT-VOL-RESCUE-SLOPE-RELAX
 # ------------------------------------------------------------
 # 目的:
 #   entry_controller._build_scored_candidates() は entries[:MAX_CANDIDATES_PER_SYMBOL]
@@ -10,10 +10,11 @@
 #   先頭10件を占有し、PIPELINE_FILTER_MISMATCH を大量に出したり、正しい候補が
 #   後ろにあるのに評価されない。
 #
-# V3:
-#   - V2の SUMMARY_AI/SUMMARY 互換を維持。
-#   - SUMMARY_AI strong candidate が ATR_1M_FILTER_NG / RANGE_5M_FILTER_NG だけで
-#     全落ちする問題を防ぐため summary_ai_volatility_rescue_patch も同時install。
+# V4:
+#   - V3の SUMMARY_AI/SUMMARY 互換と vol rescue install を維持。
+#   - SUMMARY_AI VOL RESCUE の slope default を 0.001 -> 0.0002 に緩和。
+#     7012/3436/6754 のように buy_score=4 かつ高売買代金でも、1分ATRだけで
+#     落ちるケースを救済する。
 # ============================================================
 
 from __future__ import annotations
@@ -192,10 +193,19 @@ def _patched_build_scored_candidates(*args, **kwargs):
 
 def _install_summary_ai_vol_rescue() -> bool:
     try:
+        # Force before importing/installing rescue so setdefault in the rescue module keeps this value.
+        os.environ["SUMMARY_AI_VOL_RESCUE_MIN_ABS_SLOPE"] = os.getenv(
+            "SUMMARY_AI_VOL_RESCUE_MIN_ABS_SLOPE_OPERATOR",
+            "0.0002",
+        )
         from core.startup import summary_ai_volatility_rescue_patch as p
         fn = getattr(p, "install", None)
         ok = bool(fn()) if callable(fn) else False
-        logger.warning("[ENTRY SOURCE PREFILTER] summary_ai_volatility_rescue installed=%s", ok)
+        logger.warning(
+            "[ENTRY SOURCE PREFILTER] summary_ai_volatility_rescue installed=%s min_abs_slope=%s",
+            ok,
+            os.getenv("SUMMARY_AI_VOL_RESCUE_MIN_ABS_SLOPE"),
+        )
         return ok
     except Exception:
         logger.exception("[ENTRY SOURCE PREFILTER] summary_ai_volatility_rescue install failed")
@@ -213,29 +223,32 @@ def install() -> bool:
             _install_summary_ai_vol_rescue()
             return False
 
-        if not getattr(cur, "_entry_source_prefilter_patch_v3", False):
+        if not getattr(cur, "_entry_source_prefilter_patch_v4", False):
             base = getattr(cur, "_original", cur)
             _ORIGINAL_BUILD = base
             _patched_build_scored_candidates._entry_source_prefilter_patch = True  # type: ignore[attr-defined]
             _patched_build_scored_candidates._entry_source_prefilter_patch_v2 = True  # type: ignore[attr-defined]
             _patched_build_scored_candidates._entry_source_prefilter_patch_v3 = True  # type: ignore[attr-defined]
+            _patched_build_scored_candidates._entry_source_prefilter_patch_v4 = True  # type: ignore[attr-defined]
             _patched_build_scored_candidates._original = base  # type: ignore[attr-defined]
             ec._build_scored_candidates = _patched_build_scored_candidates
 
         match_cur = getattr(ec, "_entry_matches_pipeline", None)
-        if callable(match_cur) and not getattr(match_cur, "_entry_source_prefilter_match_v3", False):
+        if callable(match_cur) and not getattr(match_cur, "_entry_source_prefilter_match_v4", False):
             _ORIGINAL_MATCHES = getattr(match_cur, "_original", match_cur)
             _patched_entry_matches_pipeline._entry_source_prefilter_match_v2 = True  # type: ignore[attr-defined]
             _patched_entry_matches_pipeline._entry_source_prefilter_match_v3 = True  # type: ignore[attr-defined]
+            _patched_entry_matches_pipeline._entry_source_prefilter_match_v4 = True  # type: ignore[attr-defined]
             _patched_entry_matches_pipeline._original = _ORIGINAL_MATCHES  # type: ignore[attr-defined]
             ec._entry_matches_pipeline = _patched_entry_matches_pipeline
 
         vol_ok = _install_summary_ai_vol_rescue()
         _INSTALLED = True
         logger.warning(
-            "[ENTRY SOURCE PREFILTER] installed v3 enabled=%s summary_ai_accepts_summary=True patched_match=True vol_rescue=%s",
+            "[ENTRY SOURCE PREFILTER] installed v4 enabled=%s summary_ai_accepts_summary=True patched_match=True vol_rescue=%s min_abs_slope=%s",
             _env_bool("ENTRY_CONTROLLER_SOURCE_PREFILTER_ENABLED", True),
             vol_ok,
+            os.getenv("SUMMARY_AI_VOL_RESCUE_MIN_ABS_SLOPE"),
         )
         return True
     except Exception:
