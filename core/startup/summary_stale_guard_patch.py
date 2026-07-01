@@ -1,10 +1,17 @@
 # ============================================================
 # File   : core/startup/summary_stale_guard_patch.py
-# Version: REV7-SUMMARY-STALE-GUARD-STRICT-LIVE-DROP
+# Version: REV8-SUMMARY-STALE-GUARD-SAME-DAY-SOFT-LAG
 # ------------------------------------------------------------
 # 【概要】
 #   PUSH / ranking summary が古いまま merged summary に残り、
 #   古い価格・古い slope・古い RSI/MACD で表示・AI・発注候補になる問題を防ぐ。
+#
+# REV8:
+#   - 当日データの latest_dt が max_age を少し超えただけで rows=0 にする
+#     global-lag hard-drop を緩和。
+#   - 前日・非当日データは引き続き必ず破棄する。
+#   - 当日データは absolute max_age と relative_lag の通常フィルターで残す。
+#     これにより、09:23台に latest_dt=09:21 のPUSH summaryを全DROPしない。
 #
 # REV7:
 #   - 市場中の PUSH / ranking / legacy intraday summary は、当日以外を必ず破棄。
@@ -26,7 +33,7 @@ logger = logging.getLogger(__name__)
 _PATCHED = False
 _ORIGINAL_SANITIZE_SUMMARY_DF = None
 _ORIGINAL_GET_MERGED_SUMMARY = None
-VERSION = "REV7-SUMMARY-STALE-GUARD-STRICT-LIVE-DROP"
+VERSION = "REV8-SUMMARY-STALE-GUARD-SAME-DAY-SOFT-LAG"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -204,6 +211,15 @@ def _to_naive_datetime_series(s: pd.Series) -> pd.Series:
         return out
 
 
+def _same_day_latest(latest_dt: Any, now: pd.Timestamp) -> bool:
+    try:
+        if latest_dt is None or pd.isna(latest_dt):
+            return False
+        return pd.Timestamp(latest_dt).date() == pd.Timestamp(now).date()
+    except Exception:
+        return False
+
+
 def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sanitize") -> pd.DataFrame:
     try:
         if df is None or not isinstance(df, pd.DataFrame) or df.empty:
@@ -285,10 +301,14 @@ def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sani
             latest_dt = None
             latest_age_sec = None
 
-        # REV7: default is hard drop on global lag. The old fallback kept stale rows
-        # and caused previous-day PUSH summaries to be treated as live candidates.
+        # REV8: Do not hard-drop same-day rows only because the latest row is a
+        # few minutes behind. Rotation/rebuild can lag briefly. Previous-day rows
+        # are already removed above, so same-day data can safely pass through the
+        # normal absolute/relative masks instead of becoming rows=0.
         global_lag_enabled = _env_bool("SUMMARY_STALE_KEEP_LATEST_PER_SYMBOL_ON_GLOBAL_LAG", False)
         global_lag_grace = _env_int("SUMMARY_STALE_GLOBAL_LAG_GRACE_SEC", 30)
+        hard_drop_same_day = _env_bool("SUMMARY_STALE_HARD_DROP_SAME_DAY_GLOBAL_LAG", False)
+        latest_is_today = _same_day_latest(latest_dt, now)
         if (
             not global_lag_enabled
             and max_age is not None
@@ -296,11 +316,17 @@ def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sani
             and latest_age_sec is not None
             and latest_age_sec > float(max_age + global_lag_grace)
         ):
-            logger.warning(
-                "[SUMMARY STALE DROP] global lag hard-drop source=%s tf=%s label=%s before=%s after=0 max_age_sec=%s latest_age_sec=%.1f latest_dt=%s now=%s version=%s",
-                source, tf, label, before, max_age, latest_age_sec, latest_dt, now, VERSION,
-            )
-            return out.iloc[0:0].copy()
+            if latest_is_today and not hard_drop_same_day:
+                logger.warning(
+                    "[SUMMARY STALE DROP] global lag soft-keep same-day source=%s tf=%s label=%s before=%s max_age_sec=%s latest_age_sec=%.1f latest_dt=%s now=%s version=%s",
+                    source, tf, label, before, max_age, latest_age_sec, latest_dt, now, VERSION,
+                )
+            else:
+                logger.warning(
+                    "[SUMMARY STALE DROP] global lag hard-drop source=%s tf=%s label=%s before=%s after=0 max_age_sec=%s latest_age_sec=%.1f latest_dt=%s now=%s version=%s",
+                    source, tf, label, before, max_age, latest_age_sec, latest_dt, now, VERSION,
+                )
+                return out.iloc[0:0].copy()
 
         absolute_mask = pd.Series(False, index=out.index)
         if max_age is not None and max_age > 0:
