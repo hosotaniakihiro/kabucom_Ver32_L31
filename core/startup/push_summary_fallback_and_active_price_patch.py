@@ -2,6 +2,12 @@
 """
 Runtime fixes for startup PUSH/summary/active-symbol issues.
 
+REV4:
+  - 2026-07-01 09:12 logs showed summary_database used previous-day
+    PUSH summary rows: latest_dt=2026-06-30 15:19:00 while now=2026-07-01.
+  - Add a hard same-day guard for PUSH-like fallback rows.
+  - Reject fallback candidates when latest_dt is not today's date.
+
 REV3:
   - 2026-06-30 09:05 logs showed PUSH DB was live, but summary fallback still used
     stale summary_recovery_push_1m rows from 08:47-08:50 with volume=0.
@@ -28,7 +34,7 @@ from typing import Any, Dict, Iterable
 import pandas as pd
 
 logger = logging.getLogger(__name__)
-VERSION = "REV3-PUSH-RAW-DB-FRESH-FALLBACK"
+VERSION = "REV4-PUSH-FALLBACK-SAME-DAY-GUARD"
 _INSTALLED = False
 
 
@@ -67,6 +73,10 @@ def _is_main_py_process() -> bool:
 
 def _today() -> str:
     return dt.datetime.now().strftime("%Y%m%d")
+
+
+def _today_date(now_i: dt.datetime | None = None) -> dt.date:
+    return (now_i or dt.datetime.now()).date()
 
 
 def _summary_db_path() -> str:
@@ -109,6 +119,90 @@ def _table_cols(conn: sqlite3.Connection, table: str) -> set[str]:
         return set()
 
 
+def _normalize_dt_series(s: Any) -> pd.Series:
+    """Normalize datetime to tz-naive local/JST wall-clock without shifting naive rows."""
+    def _one(v: Any) -> Any:
+        try:
+            x = pd.to_datetime(v, errors="coerce")
+            if pd.isna(x):
+                return pd.NaT
+            if getattr(x, "tzinfo", None) is not None:
+                try:
+                    return x.tz_convert("Asia/Tokyo").tz_localize(None)
+                except Exception:
+                    try:
+                        return x.tz_localize(None)
+                    except Exception:
+                        return pd.NaT
+            return x
+        except Exception:
+            return pd.NaT
+
+    try:
+        if isinstance(s, pd.Series):
+            return pd.to_datetime(s.map(_one), errors="coerce")
+        return pd.to_datetime(pd.Series(s).map(_one), errors="coerce")
+    except Exception:
+        try:
+            return pd.to_datetime(s, errors="coerce")
+        except Exception:
+            return pd.Series(pd.NaT, index=getattr(s, "index", None))
+
+
+def _same_day_push_rows(df: pd.DataFrame, *, now_i: dt.datetime, label: str = "") -> pd.DataFrame:
+    """Drop previous-day/future-day PUSH-like fallback rows before freshness/candidate selection."""
+    if df is None or df.empty or "datetime" not in df.columns:
+        return pd.DataFrame() if df is None else df
+    try:
+        x = df.copy()
+        x["datetime"] = _normalize_dt_series(x["datetime"])
+        before = len(x)
+        day = _today_date(now_i)
+        # Allow only today's rows. Future rows are removed separately by normal pipeline,
+        # but keeping same-day here avoids previous session rows being ranked as live data.
+        x = x.dropna(subset=["datetime"])
+        x = x[x["datetime"].dt.date == day].copy()
+        if len(x) != before:
+            logger.warning(
+                "[PUSH FALLBACK SAME-DAY GUARD] dropped old rows label=%s before=%s after=%s today=%s latest_before=%s latest_after=%s patch=%s",
+                label,
+                before,
+                len(x),
+                day,
+                df["datetime"].max() if "datetime" in df.columns and not df.empty else None,
+                x["datetime"].max() if not x.empty else None,
+                VERSION,
+            )
+        return x.reset_index(drop=True)
+    except Exception:
+        logger.exception("[PUSH FALLBACK SAME-DAY GUARD] failed label=%s patch=%s", label, VERSION)
+        return pd.DataFrame()
+
+
+def _latest_is_today(df: pd.DataFrame, *, now_i: dt.datetime, label: str = "") -> bool:
+    try:
+        if df is None or df.empty or "datetime" not in df.columns:
+            return False
+        dtv = _normalize_dt_series(df["datetime"])
+        dtv = dtv.dropna()
+        if dtv.empty:
+            return False
+        latest = dtv.max()
+        ok = latest.date() == _today_date(now_i)
+        if not ok:
+            logger.warning(
+                "[PUSH FALLBACK SAME-DAY GUARD] reject candidate label=%s latest_dt=%s today=%s rows=%s patch=%s",
+                label,
+                latest,
+                _today_date(now_i),
+                len(df),
+                VERSION,
+            )
+        return bool(ok)
+    except Exception:
+        return False
+
+
 def _summary_price_fallback_enabled() -> bool:
     if not _env_bool("ACTIVE_SUMMARY_PRICE_FALLBACK_ENABLED", True):
         return False
@@ -143,6 +237,7 @@ def _patched_summary_price_fallback_map(symbols: Iterable[str]) -> Dict[str, Dic
     busy_ms = int(max(50.0, _env_float("ACTIVE_SUMMARY_PRICE_FALLBACK_BUSY_TIMEOUT_MS", 300.0)))
     t0 = time.monotonic()
     out: Dict[str, Dict[str, float]] = {}
+    today_s = dt.datetime.now().strftime("%Y-%m-%d")
 
     try:
         with sqlite3.connect(path, timeout=timeout_sec) as conn:
@@ -159,9 +254,13 @@ def _patched_summary_price_fallback_map(symbols: Iterable[str]) -> Dict[str, Dic
                 if "datetime" in cols:
                     dt_expr = _qident("datetime")
                     dt_expr_t2 = f"t2.{_qident('datetime')}"
+                    today_clause = f"AND substr({dt_expr}, 1, 10) = ?"
+                    today_clause_t2 = f"AND substr({dt_expr_t2}, 1, 10) = ?"
                 elif "date" in cols and "time" in cols:
                     dt_expr = f"({_qident('date')} || ' ' || {_qident('time')})"
                     dt_expr_t2 = f"(t2.{_qident('date')} || ' ' || t2.{_qident('time')})"
+                    today_clause = f"AND {_qident('date')} = ?"
+                    today_clause_t2 = f"AND t2.{_qident('date')} = ?"
                 else:
                     continue
 
@@ -185,14 +284,16 @@ def _patched_summary_price_fallback_map(symbols: Iterable[str]) -> Dict[str, Dic
                            {dt_expr} AS dtv
                     FROM {table_q}
                     WHERE CAST({symbol_q} AS TEXT) IN ({placeholders})
+                      {today_clause}
                       AND {dt_expr} = (
                           SELECT MAX({dt_expr_t2})
                           FROM {table_q} t2
                           WHERE CAST(t2.{symbol_q} AS TEXT) = CAST({table_q}.{symbol_q} AS TEXT)
+                          {today_clause_t2}
                       )
                 """
                 try:
-                    rows = conn.execute(sql, remain).fetchall()
+                    rows = conn.execute(sql, [*remain, today_s, today_s]).fetchall()
                 except Exception as e:
                     logger.warning("[ACTIVE SUMMARY PRICE FALLBACK] bulk select skipped table=%s err=%s patch=%s", table, e, VERSION, exc_info=False)
                     continue
@@ -208,10 +309,11 @@ def _patched_summary_price_fallback_map(symbols: Iterable[str]) -> Dict[str, Dic
                             "summary_price_table": table,
                         }
         logger.warning(
-            "[ACTIVE SUMMARY PRICE FALLBACK] loaded symbols=%d hit=%d missing=%d elapsed=%.3fs path=%s patch=%s",
+            "[ACTIVE SUMMARY PRICE FALLBACK] loaded symbols=%d hit=%d missing=%d date=%s elapsed=%.3fs path=%s patch=%s",
             len(cleaned),
             len(out),
             max(0, len(cleaned) - len(out)),
+            today_s,
             time.monotonic() - t0,
             path,
             VERSION,
@@ -241,7 +343,7 @@ def _patch_active_price_sql() -> bool:
         import trading.ranking.active_symbols.liquidity as liq
         liq._summary_price_fallback_map = _patched_summary_price_fallback_map
         liq._allow_unknown_price = _patched_allow_unknown_price
-        logger.warning("[ACTIVE SUMMARY PRICE FALLBACK PATCH] installed version=%s premarket_unknown_price_default=True", VERSION)
+        logger.warning("[ACTIVE SUMMARY PRICE FALLBACK PATCH] installed version=%s premarket_unknown_price_default=True same_day=True", VERSION)
         return True
     except Exception:
         logger.exception("[ACTIVE SUMMARY PRICE FALLBACK PATCH] install failed version=%s", VERSION)
@@ -288,6 +390,9 @@ def _load_recent_push_raw_summary(interval_i: int, *, now_i: dt.datetime) -> pd.
             if "date" in cols:
                 where_parts.append("date = ?")
                 params.append(date_filter)
+            else:
+                where_parts.append("substr(datetime, 1, 10) = ?")
+                params.append(date_filter)
             if "received_at" in cols:
                 where_parts.append("received_at >= ?")
                 params.append(since.isoformat())
@@ -307,7 +412,8 @@ def _load_recent_push_raw_summary(interval_i: int, *, now_i: dt.datetime) -> pd.
         return df
 
     try:
-        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+        df["datetime"] = _normalize_dt_series(df["datetime"])
+        df = _same_day_push_rows(df, now_i=now_i, label=f"raw_db.interval{interval_i}")
         df = df.dropna(subset=["datetime", "symbol"])
         df["price"] = _safe_to_num(df["price"])
         df = df.dropna(subset=["price"])
@@ -321,6 +427,9 @@ def _load_recent_push_raw_summary(interval_i: int, *, now_i: dt.datetime) -> pd.
         except Exception:
             df["slot"] = df["datetime"]
         latest_slot = df["slot"].max()
+        if pd.isna(latest_slot) or latest_slot.date() != _today_date(now_i):
+            logger.warning("[PUSH RAW DB FALLBACK] reject old latest_slot interval=%s latest_slot=%s today=%s patch=%s", interval_i, latest_slot, _today_date(now_i), VERSION)
+            return pd.DataFrame()
         df = df[df["slot"] == latest_slot].copy()
         df = df.sort_values(["symbol", "datetime"])
         if "volume" in df.columns:
@@ -346,6 +455,9 @@ def _load_recent_push_raw_summary(interval_i: int, *, now_i: dt.datetime) -> pd.
             "volume": grouped["volume"].max(),
             "trading_value": grouped["trading_value"].max(),
         }).reset_index(drop=True)
+        out = _same_day_push_rows(out, now_i=now_i, label=f"raw_db.out.interval{interval_i}")
+        if out.empty or not _latest_is_today(out, now_i=now_i, label=f"raw_db.out.interval{interval_i}"):
+            return pd.DataFrame()
         out["price"] = out["close"]
         out["current_price"] = out["close"]
         out["open_price"] = out["open"]
@@ -385,6 +497,13 @@ def _patch_push_summary_fallback() -> bool:
             if x.empty or "source" not in x.columns:
                 return x
             try:
+                # The filter may be called without explicit now. Use current local time
+                # to prevent previous-day rows from surviving in summary_database.
+                now_i = fl.now_naive().replace(tzinfo=None, microsecond=0)
+                if "datetime" in x.columns:
+                    x = _same_day_push_rows(x, now_i=now_i, label="filter_push_like_rows.input")
+                    if x.empty:
+                        return x
                 src = x["source"].astype(str)
                 src_l = src.str.lower().str.strip()
                 mask = (
@@ -396,6 +515,7 @@ def _patch_push_summary_fallback() -> bool:
                     | src.str.contains("resample", case=False, na=False)
                 )
                 out = x.loc[mask].copy()
+                out = _same_day_push_rows(out, now_i=now_i, label="filter_push_like_rows.output")
                 logger.info(
                     "[summary.fallback_loader] push-like filter patched rows=%s -> %s source_dist=%s patch=%s",
                     len(x),
@@ -410,8 +530,10 @@ def _patch_push_summary_fallback() -> bool:
                     return orig_filter(df)
                 return x
 
-        def _is_fresh_enough(df: pd.DataFrame, interval_i: int, now_i: dt.datetime) -> bool:
+        def _is_fresh_enough(df: pd.DataFrame, interval_i: int, now_i: dt.datetime, *, label: str = "") -> bool:
             try:
+                if not _latest_is_today(df, now_i=now_i, label=label):
+                    return False
                 ts = fl.extract_latest_timestamp(df)
                 if ts is None:
                     return False
@@ -419,33 +541,55 @@ def _patch_push_summary_fallback() -> bool:
             except Exception:
                 return False
 
+        def _prepare_candidate(df: pd.DataFrame, interval_i: int, now_i: dt.datetime, label: str) -> pd.DataFrame:
+            try:
+                if not isinstance(df, pd.DataFrame) or df.empty:
+                    return pd.DataFrame()
+                x = fl.normalize_df(df)
+                x = patched_filter_push_like_rows(x)
+                x = _same_day_push_rows(x, now_i=now_i, label=label)
+                if x.empty:
+                    return pd.DataFrame()
+                x = fl._slot_aligned_latest_rows(x, interval=interval_i, now=now_i)
+                x = _same_day_push_rows(x, now_i=now_i, label=f"{label}.slot")
+                if not _is_fresh_enough(x, interval_i, now_i, label=label):
+                    return pd.DataFrame()
+                return x.reset_index(drop=True)
+            except Exception:
+                logger.debug("[summary.fallback_loader] prepare candidate failed interval=%s label=%s", interval_i, label, exc_info=True)
+                return pd.DataFrame()
+
         def patched_fallback_push_summary_df(interval: int, *, now=None) -> pd.DataFrame:
             interval_i = int(interval)
             now_i = (now or fl.now_naive()).replace(tzinfo=None, microsecond=0)
 
             raw_df = _load_recent_push_raw_summary(interval_i, now_i=now_i)
+            raw_df = _prepare_candidate(raw_df, interval_i, now_i, f"raw_db.interval{interval_i}")
             if isinstance(raw_df, pd.DataFrame) and not raw_df.empty:
-                raw_df = fl.normalize_df(raw_df)
-                raw_df = fl._slot_aligned_latest_rows(raw_df, interval=interval_i, now=now_i)
-                if not raw_df.empty and _is_fresh_enough(raw_df, interval_i, now_i):
-                    logger.warning(
-                        "[summary.fallback_loader] selected fresh push raw DB fallback interval=%s rows=%s symbols=%s latest_dt=%s patch=%s",
-                        interval_i,
-                        len(raw_df),
-                        fl.symbols_count(raw_df),
-                        fl.latest_dt_str(raw_df),
-                        VERSION,
-                    )
-                    return raw_df.reset_index(drop=True)
+                logger.warning(
+                    "[summary.fallback_loader] selected fresh push raw DB fallback interval=%s rows=%s symbols=%s latest_dt=%s patch=%s",
+                    interval_i,
+                    len(raw_df),
+                    fl.symbols_count(raw_df),
+                    fl.latest_dt_str(raw_df),
+                    VERSION,
+                )
+                return raw_df.reset_index(drop=True)
 
             if callable(orig_fallback):
                 try:
                     df0 = orig_fallback(interval_i, now=now_i)
+                    df0 = _prepare_candidate(df0, interval_i, now_i, f"orig_fallback.interval{interval_i}")
                     if isinstance(df0, pd.DataFrame) and not df0.empty:
-                        if _is_fresh_enough(df0, interval_i, now_i):
-                            return df0
-                        if not raw_df.empty:
-                            return raw_df.reset_index(drop=True)
+                        logger.warning(
+                            "[summary.fallback_loader] selected original same-day fallback interval=%s rows=%s symbols=%s latest_dt=%s patch=%s",
+                            interval_i,
+                            len(df0),
+                            fl.symbols_count(df0),
+                            fl.latest_dt_str(df0),
+                            VERSION,
+                        )
+                        return df0.reset_index(drop=True)
                 except Exception:
                     logger.debug("[summary.fallback_loader] original push fallback failed interval=%s", interval_i, exc_info=True)
 
@@ -455,17 +599,17 @@ def _patch_push_summary_fallback() -> bool:
             for src in ("push", "SUMMARY", "summary", None):
                 try:
                     df = fl.load_latest_summary_from_db(interval_i, source_filter=src, now=now_i)
-                    df = patched_filter_push_like_rows(df)
-                    df = fl._slot_aligned_latest_rows(df, interval=interval_i, now=now_i)
+                    df = _prepare_candidate(df, interval_i, now_i, f"db.stock_summary_{interval_i}min[{src or '*'}]")
                     if not df.empty:
                         candidates.append((f"db.stock_summary_{interval_i}min[{src or '*'}].patched", df))
                 except Exception:
                     logger.debug("[summary.fallback_loader] patched push fallback source failed interval=%s src=%s", interval_i, src, exc_info=True)
 
             df = fl.select_best_candidate(candidates, interval=interval_i, for_ranking=False, now=now_i)
-            if not df.empty:
-                logger.warning("[summary.fallback_loader] patched push fallback selected interval=%s rows=%s symbols=%s patch=%s", interval_i, len(df), fl.symbols_count(df), VERSION)
-                return df
+            df = _same_day_push_rows(df, now_i=now_i, label=f"select_best.interval{interval_i}")
+            if not df.empty and _is_fresh_enough(df, interval_i, now_i, label=f"select_best.interval{interval_i}"):
+                logger.warning("[summary.fallback_loader] patched push fallback selected interval=%s rows=%s symbols=%s latest_dt=%s patch=%s", interval_i, len(df), fl.symbols_count(df), fl.latest_dt_str(df), VERSION)
+                return df.reset_index(drop=True)
 
             logger.warning("[summary.fallback_loader] patched fallback push summary empty interval=%s now=%s patch=%s", interval_i, now_i, VERSION)
             return pd.DataFrame()
@@ -480,7 +624,7 @@ def _patch_push_summary_fallback() -> bool:
         except Exception:
             pass
 
-        logger.warning("[PUSH SUMMARY FALLBACK PATCH] installed version=%s raw_db_fallback=True", VERSION)
+        logger.warning("[PUSH SUMMARY FALLBACK PATCH] installed version=%s raw_db_fallback=True same_day_guard=True", VERSION)
         return True
     except Exception:
         logger.exception("[PUSH SUMMARY FALLBACK PATCH] install failed version=%s", VERSION)
