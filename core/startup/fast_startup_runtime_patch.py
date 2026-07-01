@@ -9,7 +9,7 @@ from typing import Callable
 logger = logging.getLogger(__name__)
 _PATCHED = False
 _BG_STARTED = False
-VERSION = "v21-main-light-tick-tonosama-tz-guard"
+VERSION = "v22-main-direct-push-df-light-summary"
 
 
 def _env_bool(name: str, default: bool) -> bool:
