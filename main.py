@@ -10,8 +10,10 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.37-BOARD-MISSING-PROTECTED-FAILOPEN
+# Version: Ver38.38-SUMMARY-AI-LOCK-REENTRANT-FORCE
 # ------------------------------------------------------------
+# ✔ SUMMARY AI direct snapshot の reentrant lock を main.py 起動時に強制有効化
+# ✔ entry_controller_lock_timeout で SUMMARY AI 候補が発注直前に落ちる問題を抑止
 # ✔ board_missing は強い候補・流動性OKなら小ロットfail-open
 # ✔ main.py はPUSH DB保存なしのまま、PUSHメモリから最新1分足summaryを高速生成
 # ✔ SUMMARY scheduler 終了時 submit RuntimeError ガードを main runtime patch に追加
@@ -81,6 +83,11 @@ os.environ.setdefault("ENTRY_HARD_REQUIRE_MOVEMENT", "1")
 os.environ.setdefault("ENTRY_HARD_MIN_RANGE_PCT", "0.006")
 os.environ.setdefault("ENTRY_HARD_MIN_ATR_RATIO", "0.003")
 os.environ.setdefault("ENTRY_HARD_MIN_ABS_SLOPE", "0.001")
+# SUMMARY AI は entry_controller._pipeline_lock 保持中に direct snapshot へ入るため、
+# 起動時に必ず reentrant 実行を許可する。setdefault では過去の環境値 0 が残るため強制する。
+os.environ["SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK"] = "1"
+os.environ.setdefault("SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT", "1")
+os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY", "1")
 
 try:
     from core.logging.console_tee import setup_console_tee, rebind_logging_streams_to_console_tee
