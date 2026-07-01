@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/ws_callbacks.py
-# Version: Ver1.7-PUSH-STREAM-WS-CALLBACKS-HONOR-SKIP-AFTER-OPEN-REFRESH
+# Version: Ver1.8-PUSH-STREAM-WS-CALLBACKS-AFTER-OPEN-STATUS-AWARE
 # ------------------------------------------------------------
 # PUSH WebSocket callback。
 #
@@ -14,6 +14,8 @@
 #           の表示を抑制する。
 #   - V1.7: PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1 のとき、on_open側でも
 #           refresh after open thread を起動せず、started の誤ログを出さない。
+#   - V1.8: transport._start_refresh_after_open_thread() の戻り値を見て、
+#           実際に起動した時だけ started を出す。
 # ============================================================
 
 from __future__ import annotations
@@ -266,8 +268,11 @@ def on_open(ws: websocket.WebSocketApp) -> None:
         if _env_bool("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", False):
             logger.warning("[push_stream] refresh after open thread skipped by ws_callbacks env PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1")
             return
-        _start_refresh_after_open_thread()
-        logger.warning("[push_stream] refresh after open thread started")
+        started = bool(_start_refresh_after_open_thread())
+        if started:
+            logger.warning("[push_stream] refresh after open thread started")
+        else:
+            logger.warning("[push_stream] refresh after open thread not started by transport status")
     except Exception:
         logger.exception("[push_stream] failed to start refresh after open thread")
 
