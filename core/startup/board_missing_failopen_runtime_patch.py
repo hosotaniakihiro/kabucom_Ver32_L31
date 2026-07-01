@@ -6,6 +6,7 @@
 #     final_entry_safety_guard の流動性/score条件を満たす候補は
 #     小ロットで fail-open する。
 #   - main.py 側ではPUSH DB保存しない方針を維持する。
+#   - SUMMARY AI の entry_controller_lock_timeout は retryable 優先へ補正する。
 # ============================================================
 from __future__ import annotations
 
@@ -15,7 +16,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V1-BOARD-MISSING-PROTECTED-FAILOPEN"
+VERSION = "V1.1-BOARD-MISSING-AND-SUMMARY-AI-LOCK-RETRY"
 _INSTALLED = False
 
 _TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
@@ -154,6 +155,18 @@ def _patch_final_guard() -> bool:
     return True
 
 
+def _install_summary_ai_lock_retry() -> bool:
+    try:
+        from core.startup import summary_ai_lock_retry_runtime_patch as lr
+        fn = getattr(lr, "install", None)
+        ok = bool(fn()) if callable(fn) else False
+        logger.warning("[BOARD MISSING FAILOPEN] summary_ai_lock_retry installed=%s", ok)
+        return ok
+    except Exception:
+        logger.exception("[BOARD MISSING FAILOPEN] summary_ai_lock_retry install failed")
+        return False
+
+
 def install() -> bool:
     global _INSTALLED
     # board_retry_patch の既定 HARD_BLOCK=1 を、main runtime では保護fail-openへ戻す。
@@ -168,11 +181,15 @@ def install() -> bool:
     os.environ.setdefault("ENTRY_FINAL_BOARD_RETRY_EXTRA_COUNT", "1")
     os.environ.setdefault("ENTRY_FINAL_BOARD_RETRY_EXTRA_WAIT_SEC", "0.2")
 
-    ok = _patch_final_guard()
+    board_ok = _patch_final_guard()
+    lock_retry_ok = _install_summary_ai_lock_retry()
+    ok = bool(board_ok or lock_retry_ok)
     _INSTALLED = bool(ok)
     logger.warning(
-        "[BOARD MISSING FAILOPEN] installed=%s hard_block=%s allow_without_board=%s qty_ratio=%s version=%s",
+        "[BOARD MISSING FAILOPEN] installed=%s board_ok=%s lock_retry_ok=%s hard_block=%s allow_without_board=%s qty_ratio=%s version=%s",
         ok,
+        board_ok,
+        lock_retry_ok,
         os.getenv("ENTRY_BOARD_MISSING_HARD_BLOCK"),
         os.getenv("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"),
         os.getenv("ENTRY_BOARD_MISSING_QTY_RATIO"),
