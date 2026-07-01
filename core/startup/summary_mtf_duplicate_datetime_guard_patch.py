@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_mtf_duplicate_datetime_guard_patch.py
-# Version: V1.2-DUPLICATE-DATETIME-GUARD-REAPPLY-AFTER-TARGET-INSTALL
+# Version: V1.3-DUPLICATE-DATETIME-GUARD-MAIN-ENTRY-FIX
 # ------------------------------------------------------------
 # Purpose:
 #   1) Prevent pandas merge failure in summary_mtf_diff_from_1m_patch:
@@ -14,10 +14,9 @@
 #
 #   2) In main.py, do not require the PUSH DB writer to be alive for Summary-AI.
 #      main.py is the entry/judgement process; main_database.py owns DB saving.
-#      Safety still requires fresh 1m PUSH context in main.py.
+#      Safety still requires fresh quote/order guards in main.py.
 #
-#   3) Re-apply this guard even if summary_mtf_diff_from_1m_patch.install()
-#      runs later and overwrites _repair_mtf_from_1m.
+#   3) Install the main entry runtime fix loaded by usercustomize.py.
 # ============================================================
 from __future__ import annotations
 
@@ -27,7 +26,7 @@ import sys
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V1.2-DUPLICATE-DATETIME-GUARD-REAPPLY-AFTER-TARGET-INSTALL"
+VERSION = "V1.3-DUPLICATE-DATETIME-GUARD-MAIN-ENTRY-FIX"
 _INSTALLED = False
 _SUMMARY_AI_MAIN_WRITER_OPTIONAL_INSTALLED = False
 _TARGET_INSTALL_HOOKED = False
@@ -222,11 +221,12 @@ def _patch_target_repair(*, reason: str = "install") -> bool:
     try:
         import core.startup.summary_mtf_diff_from_1m_patch as target
         cur = getattr(target, "_repair_mtf_from_1m", None)
-        if getattr(cur, "_duplicate_datetime_guard_v12", False):
+        if getattr(cur, "_duplicate_datetime_guard_v13", False):
             return True
         if not callable(cur):
             logger.warning("[SUMMARY MTF DUPLICATE DATETIME GUARD] target repair missing reason=%s", reason)
             return False
+        _safe_repair_mtf_from_1m._duplicate_datetime_guard_v13 = True  # type: ignore[attr-defined]
         _safe_repair_mtf_from_1m._duplicate_datetime_guard_v12 = True  # type: ignore[attr-defined]
         _safe_repair_mtf_from_1m._duplicate_datetime_guard_v1 = True  # type: ignore[attr-defined]
         _safe_repair_mtf_from_1m._original = cur  # type: ignore[attr-defined]
@@ -247,7 +247,7 @@ def _install_target_install_hook() -> bool:
         cur_install = getattr(target, "install", None)
         if not callable(cur_install):
             return False
-        if getattr(cur_install, "_duplicate_datetime_guard_install_hook_v12", False):
+        if getattr(cur_install, "_duplicate_datetime_guard_install_hook_v13", False):
             _TARGET_INSTALL_HOOKED = True
             return True
         orig_install = getattr(cur_install, "_original", cur_install)
@@ -257,6 +257,7 @@ def _install_target_install_hook() -> bool:
             _patch_target_repair(reason="after_target_install")
             return ret
 
+        _patched_target_install._duplicate_datetime_guard_install_hook_v13 = True  # type: ignore[attr-defined]
         _patched_target_install._duplicate_datetime_guard_install_hook_v12 = True  # type: ignore[attr-defined]
         _patched_target_install._original = orig_install  # type: ignore[attr-defined]
         target.install = _patched_target_install
@@ -302,6 +303,20 @@ def _install_summary_ai_main_writer_optional() -> bool:
         return False
 
 
+def _install_main_entry_runtime_fix() -> bool:
+    if not _is_main_py_process():
+        return False
+    try:
+        from core.startup import main_entry_runtime_operator_fix_patch as p
+        fn = getattr(p, "install", None)
+        ok = bool(fn()) if callable(fn) else False
+        logger.warning("[SUMMARY MTF DUPLICATE DATETIME GUARD] main entry runtime fix installed=%s", ok)
+        return ok
+    except Exception:
+        logger.exception("[SUMMARY MTF DUPLICATE DATETIME GUARD] main entry runtime fix failed")
+        return False
+
+
 def install() -> bool:
     global _INSTALLED
     mtf_ok = False
@@ -312,7 +327,8 @@ def install() -> bool:
         repair_ok = _patch_target_repair(reason="install")
         mtf_ok = bool(hook_ok or repair_ok)
     writer_optional_ok = _install_summary_ai_main_writer_optional()
-    _INSTALLED = bool(mtf_ok or writer_optional_ok)
+    main_entry_fix_ok = _install_main_entry_runtime_fix()
+    _INSTALLED = bool(mtf_ok or writer_optional_ok or main_entry_fix_ok)
     return _INSTALLED
 
 
