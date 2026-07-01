@@ -1,23 +1,19 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver56-SUMMARY-AI-LOW-MOVE-SOFTPASS
+# Version: Ver57-FINAL-BOARD-GUARD-SIGNATURE-COMPAT
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # main.py は軽量同期 + background install。
 # DB/data collector系はDB専用の最小同期パッチだけにして起動を軽くする。
 # 救済/fail-open系はデフォルトOFFにして、本体判定を優先する。
 #
+# V57:
+#   - final_entry_safety_guard_patch._board_guard が3引数版へ差し替わっても
+#     4引数呼び出しで TypeError にならない互換パッチをbackgroundに追加。
+#
 # V56:
 #   - SUMMARY AIの強い候補が元atr_1m_filterの低ATRだけで止まる問題を
 #     限定soft-passする SUMMARY_AI_LOW_MOVE_SOFTPASS をbackgroundに追加。
-#
-# V55:
-#   - main.py の summary 1m が後続background patchで重いrunnerへ戻される問題を防ぐため、
-#     SUMMARY_FORCE_DIRECT_1M を sync / background / final の3段で再適用する。
-#
-# V54:
-#   - TONOSAMA raw1 history の tz-aware / tz-naive datetime 混在を
-#     JST tz-naive に揃える TONOSAMA_DT_TZ_GUARD を追加。
 # ============================================================
 from __future__ import annotations
 
@@ -276,6 +272,7 @@ BACKGROUND_MAIN_PATCHES = [
     ("core.startup.entry_mtf_short_required_daily_optional_patch", "SHORT_MTF_2OF3_GUARD", "DISABLE_SHORT_MTF_2OF3_GUARD_PATCH"),
     ("core.startup.entry_controller_tonosama_ai_bridge_patch", "TONOSAMA_AI_BRIDGE", "DISABLE_TONOSAMA_AI_BRIDGE_PATCH"),
     ("core.startup.final_entry_tonosama_liquidity_patch", "FINAL_TONOSAMA_LIQUIDITY", "DISABLE_FINAL_TONOSAMA_LIQUIDITY_PATCH"),
+    ("core.startup.final_entry_board_guard_signature_runtime_patch", "FINAL_BOARD_GUARD_SIGNATURE", "DISABLE_FINAL_BOARD_GUARD_SIGNATURE_PATCH"),
     ("core.startup.tonosama_fast_score_prefilter_patch", "TONOSAMA_FAST_SCORE_PREFILTER", "DISABLE_TONOSAMA_FAST_SCORE_PREFILTER_PATCH"),
     ("core.startup.tonosama_fresh_summary_wait_fix_patch", "TONOSAMA_FRESH_SUMMARY_WAIT_FIX", "DISABLE_TONOSAMA_FRESH_SUMMARY_WAIT_FIX_PATCH"),
     ("core.startup.summary_ai_entry_hook_dataframe_truth_patch", "SUMMARY_AI_DF_TRUTH_PATCH", "DISABLE_SUMMARY_AI_DF_TRUTH_PATCH"),
@@ -298,7 +295,7 @@ RANKING_RESCUE_PATCHES = [
 TONOSAMA_EXTRA_RESCUE_PATCHES = [
     ("core.startup.low_movement_tonosama_no_highlow_patch", "LOW_MOVE_TONOSAMA_FALLBACK", "DISABLE_LOW_MOVE_TONOSAMA_FALLBACK_PATCH"),
     ("core.startup.tonosama_pending_warning_relax_patch", "TONOSAMA_PENDING_WARNING_RELAX", "DISABLE_TONOSAMA_PENDING_WARNING_RELAX_PATCH"),
-    ("core.startup.tonosama_price_change_or_range_patch", "TONOSAMA_PRICE_RANGE_RESCUE", "DISABLE_TONOSAMA_PRICE_RANGE_RESCUE_PATCH"),
+    ("core.startup.tonosama_price_change_or_range_patch", "TONOSAMA_PRICE_RANGE_RESCUE", "DISABLE_TONOSAMA_PRICE_RANGE_PATCH"),
     ("core.startup.tonosama_volume_surge_zero_rescue_patch", "TONOSAMA_VOLUME_SURGE_ZERO_RESCUE", "DISABLE_TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_PATCH"),
     ("core.startup.tonosama_slope_range_rescue_patch", "TONOSAMA_SLOPE_RANGE_RESCUE", "DISABLE_TONOSAMA_SLOPE_RANGE_RESCUE_PATCH"),
 ]
@@ -337,6 +334,8 @@ def _background_main_patch_loop() -> None:
     _install_summary_mtf_catchup_safely()
     # Final re-apply after all background patches because several summary/controller patches re-wrap runner_core.job_summary.
     _install_module("core.startup.summary_main_direct_push_force_patch", "SUMMARY_FORCE_DIRECT_1M_BG_LAST", disabled_env="DISABLE_SUMMARY_FORCE_DIRECT_1M_PATCH")
+    # Final board signature re-apply after all background patches because some entry guards replace _board_guard.
+    _install_module("core.startup.final_entry_board_guard_signature_runtime_patch", "FINAL_BOARD_GUARD_SIGNATURE_LAST", disabled_env="DISABLE_FINAL_BOARD_GUARD_SIGNATURE_PATCH")
     logger.warning("[SITECUSTOMIZE] main background patches done")
 
 
