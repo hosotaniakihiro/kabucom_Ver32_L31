@@ -1,16 +1,17 @@
 # ============================================================
 # File   : core/startup/summary_mtf_diff_from_1m_patch.py
-# Version: V1.6-MAIN-CACHED-1M-MTF-MERGE-GUARD
+# Version: V1.7-MAIN-CACHED-1M-MTF-VOLUME-HISTORY-GUARD
 # ------------------------------------------------------------
 # 目的:
-#   3分足/5分足のサマリー更新時に、main.py ではNAS SQLite直読みを避け、
-#   global_data上の1分足PUSH履歴から軽量に3m/5mを生成する。
+#   main.py ではNAS SQLite直読み/保存を避け、global_data上の1分足履歴から
+#   3m/5mを軽量生成する。ただし latest 1本だけ・volume=0 のMTFを
+#   technical_ready=True として公開しない。
 #
-# V1.6:
-#   - _repair_mtf_from_1m() で _bucket_dt を datetime にrenameした際、
-#     元の datetime 列と重複して merge 側の datetime が曖昧になる問題を修正。
-#   - repair元DFは symbol + bucket_datetime の1列datetimeだけに整形してからmergeする。
-#   - merge前にキー列の重複/欠落を防御し、毎分ERRORとtimeoutを防ぐ。
+# V1.7:
+#   - 3m/5m fallback は1分足履歴が最低限ある時だけ公開。
+#   - volume が全行0のMTFはエントリー用global_contextへ公開しない。
+#   - 既存cached MTFも volume=0 / 履歴不足なら使わず、1m再集計を試す。
+#   - main.py はDB保存しない方針を維持。
 # ============================================================
 
 from __future__ import annotations
@@ -38,6 +39,16 @@ def _env_bool(name: str, default: bool = True) -> bool:
         return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "enable", "enabled"}
     except Exception:
         return bool(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
 
 
 def _safe_len(x: Any) -> int:
@@ -117,10 +128,10 @@ def _nonzero_count(df: pd.DataFrame, col: str) -> int:
 
 
 def _best_numeric_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    best_col = None
+    best_nonzero = -1
+    best_nonnull = -1
     try:
-        best_col = None
-        best_nonzero = -1
-        best_nonnull = -1
         for col in candidates:
             if col not in df.columns:
                 continue
@@ -131,9 +142,9 @@ def _best_numeric_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
                 best_col = col
                 best_nonzero = nonzero
                 best_nonnull = nonnull
-        return best_col
     except Exception:
-        return None
+        return best_col
+    return best_col
 
 
 def _ensure_basic_score_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -158,9 +169,9 @@ def _ensure_basic_score_columns(df: pd.DataFrame) -> pd.DataFrame:
         "rsi": 50.0,
         "macd": 0.0,
         "signal": 0.0,
-        "technical_ready": True,
-        "display_ready": True,
-        "usable_ready": True,
+        "technical_ready": False,
+        "display_ready": False,
+        "usable_ready": False,
     }
     for col, val in defaults.items():
         if col not in out.columns:
@@ -171,6 +182,39 @@ def _ensure_basic_score_columns(df: pd.DataFrame) -> pd.DataFrame:
             except Exception:
                 pass
     return out
+
+
+def _max_hist_per_symbol(df: pd.DataFrame) -> int:
+    try:
+        if df.empty or "symbol" not in df.columns:
+            return 0
+        return int(df.groupby("symbol").size().max())
+    except Exception:
+        return 0
+
+
+def _min_1m_rows_required(interval: int) -> int:
+    # 5m足を1本だけで作るとATR/傾き/scoreが全部0になりやすい。
+    # 起動直後は最低でも interval*3 分ぶん、設定があればそれ以上を要求する。
+    default = max(int(interval) * 3, 10)
+    return max(1, _env_int("SUMMARY_MTF_FALLBACK_MIN_1M_ROWS", default))
+
+
+def _mtf_is_usable(df: pd.DataFrame, *, interval: int, label: str) -> bool:
+    if df is None or df.empty:
+        return False
+    if "symbol" not in df.columns or "datetime" not in df.columns:
+        return False
+    volume_nonzero = _nonzero_count(df, "volume")
+    hist_max = _max_hist_per_symbol(df)
+    if _env_bool("SUMMARY_MTF_REJECT_ZERO_VOLUME", True) and volume_nonzero <= 0:
+        logger.warning("[SUMMARY MTF DIFF 1M PATCH] reject %s interval=%s reason=zero_volume rows=%s hist_max=%s", label, interval, len(df), hist_max)
+        return False
+    min_mtf_rows = max(1, _env_int("SUMMARY_MTF_FALLBACK_MIN_MTF_ROWS", 2))
+    if hist_max < min_mtf_rows:
+        logger.warning("[SUMMARY MTF DIFF 1M PATCH] reject %s interval=%s reason=short_mtf_history rows=%s hist_max=%s min=%s", label, interval, len(df), hist_max, min_mtf_rows)
+        return False
+    return True
 
 
 def _cached_latest_from_global(interval: int) -> pd.DataFrame:
@@ -195,7 +239,9 @@ def _cached_latest_from_global(interval: int) -> pd.DataFrame:
                 pass
         for x in candidates:
             if isinstance(x, pd.DataFrame) and not x.empty:
-                return _normalize_summary_df(x, interval=int(interval))
+                df = _normalize_summary_df(x, interval=int(interval))
+                if _mtf_is_usable(df, interval=int(interval), label="cached"):
+                    return df
     except Exception:
         pass
     return pd.DataFrame()
@@ -251,7 +297,7 @@ def _log_main_skip(interval: int, rows: int) -> None:
             return
         _LAST_MAIN_SKIP_LOG[int(interval)] = now
         logger.warning(
-            "[SUMMARY MTF DIFF 1M PATCH] main.py NAS diff_update skipped interval=%s cached_rows=%s reason=avoid_windows_0xc0000006 allow_env=AUTOSTOCK_MAIN_ALLOW_NAS_SUMMARY_DIFF_UPDATE",
+            "[SUMMARY MTF DIFF 1M PATCH] main.py NAS diff_update skipped interval=%s cached_rows=%s reason=entry_only_no_db_save",
             interval,
             rows,
         )
@@ -259,128 +305,10 @@ def _log_main_skip(interval: int, rows: int) -> None:
         pass
 
 
-def _latest_1m_repair_source(one: pd.DataFrame, interval_i: int, repair_cols: list[str]) -> pd.DataFrame:
-    one2 = one.copy()
-    one2 = one2.loc[:, ~pd.Index(one2.columns).duplicated()].copy()
-    one2["symbol"] = one2["symbol"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
-    one2["datetime"] = pd.to_datetime(one2["datetime"], errors="coerce")
-    one2 = one2.dropna(subset=["symbol", "datetime"])
-    if one2.empty:
-        return pd.DataFrame()
-    one2["_bucket_dt"] = one2["datetime"].dt.floor(f"{interval_i}min") + pd.Timedelta(minutes=interval_i)
-    one2 = one2.sort_values(["symbol", "_bucket_dt", "datetime"], kind="stable")
-    latest = one2.groupby(["symbol", "_bucket_dt"], as_index=False).tail(1).copy()
-    cols = [c for c in repair_cols if c in latest.columns and c not in {"symbol", "datetime", "_bucket_dt"}]
-    # ここで元の datetime を残したまま _bucket_dt を datetime へrenameすると、
-    # pandas merge時に datetime が重複して KeyError/ValueError になる。
-    src = latest[["symbol", "_bucket_dt"] + cols].copy()
-    src = src.rename(columns={"_bucket_dt": "datetime"})
-    src["datetime"] = pd.to_datetime(src["datetime"], errors="coerce")
-    src = src.dropna(subset=["symbol", "datetime"])
-    src = src.loc[:, ~pd.Index(src.columns).duplicated()].copy()
-    return src.reset_index(drop=True)
-
-
-def _repair_mtf_from_1m(hist: pd.DataFrame, one: pd.DataFrame, *, interval: int) -> pd.DataFrame:
-    out = hist.copy() if isinstance(hist, pd.DataFrame) else pd.DataFrame()
-    if out.empty or one is None or one.empty:
-        return out
-    try:
-        if "symbol" not in out.columns or "datetime" not in out.columns or "symbol" not in one.columns or "datetime" not in one.columns:
-            return out
-        interval_i = int(interval)
-        out = out.loc[:, ~pd.Index(out.columns).duplicated()].copy()
-        out["symbol"] = out["symbol"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
-        out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
-        out = out.dropna(subset=["datetime", "symbol"])
-        if out.empty:
-            return out
-
-        repair_cols = [
-            "score", "score_total", "final_score", "display_score", "combined_score",
-            "score_buy", "buy_score", "score_sell", "sell_score",
-            "slope", "slope_atr_scaled", "score_slope",
-            "rsi", "macd", "signal", "hist",
-            "mtf", "score_mtf", "mtf_score",
-            "atr", "atr_1m", "atr_3m", "atr_5m",
-            "technical_ready", "display_ready", "usable_ready",
-        ]
-        src = _latest_1m_repair_source(one, interval_i, repair_cols)
-        if src.empty or "symbol" not in src.columns or "datetime" not in src.columns:
-            logger.info("[SUMMARY MTF DIFF 1M PATCH] mtf repair skipped interval=%s reason=empty_src", interval_i)
-            return out
-        repair_cols = [c for c in repair_cols if c in src.columns]
-        if not repair_cols:
-            return out
-
-        merged = out.merge(src[["symbol", "datetime"] + repair_cols], on=["symbol", "datetime"], how="left", suffixes=("", "_1mrepair"))
-
-        repaired_cols: dict[str, int] = {}
-        for col in repair_cols:
-            rcol = f"{col}_1mrepair"
-            if rcol not in merged.columns:
-                continue
-            before_nonzero = _nonzero_count(merged, col) if col in merged.columns else 0
-            if col not in merged.columns:
-                merged[col] = merged[rcol]
-            elif col in {"technical_ready", "display_ready", "usable_ready"}:
-                mask = merged[col].isna() | merged[col].astype(str).str.lower().isin({"false", "0", "nan", "none", ""})
-                merged.loc[mask, col] = merged.loc[mask, rcol]
-            else:
-                cur = pd.to_numeric(merged[col], errors="coerce")
-                rep = pd.to_numeric(merged[rcol], errors="coerce")
-                mask = (cur.isna() | (cur.fillna(0.0).abs() == 0.0)) & rep.notna() & (rep.fillna(0.0).abs() > 0.0)
-                merged.loc[mask, col] = rep[mask]
-            after_nonzero = _nonzero_count(merged, col)
-            if after_nonzero > before_nonzero:
-                repaired_cols[col] = after_nonzero - before_nonzero
-            merged = merged.drop(columns=[rcol], errors="ignore")
-
-        if "score_total" in merged.columns:
-            for alias in ("score", "final_score", "display_score", "combined_score"):
-                if alias not in merged.columns or _nonzero_count(merged, alias) == 0:
-                    merged[alias] = merged["score_total"]
-        if "score_buy" in merged.columns and ("buy_score" not in merged.columns or _nonzero_count(merged, "buy_score") == 0):
-            merged["buy_score"] = merged["score_buy"]
-        if "score_sell" in merged.columns and ("sell_score" not in merged.columns or _nonzero_count(merged, "sell_score") == 0):
-            merged["sell_score"] = merged["score_sell"]
-
-        one2 = one.copy()
-        one2 = one2.loc[:, ~pd.Index(one2.columns).duplicated()].copy()
-        if "symbol" in one2.columns and "datetime" in one2.columns:
-            one2["symbol"] = one2["symbol"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
-            one2["datetime"] = pd.to_datetime(one2["datetime"], errors="coerce")
-            one2 = one2.dropna(subset=["symbol", "datetime"])
-            one2["_bucket_dt"] = one2["datetime"].dt.floor(f"{interval_i}min") + pd.Timedelta(minutes=interval_i)
-            vol_source = _best_numeric_column(one2, ["volume", "vol", "trading_volume", "出来高"])
-            if vol_source is not None:
-                vol_sum = one2.groupby(["symbol", "_bucket_dt"], as_index=False)[vol_source].sum().rename(columns={"_bucket_dt": "datetime", vol_source: "_bucket_volume_repair"})
-                vol_sum["datetime"] = pd.to_datetime(vol_sum["datetime"], errors="coerce")
-                merged = merged.merge(vol_sum, on=["symbol", "datetime"], how="left")
-                cur_vol = _numeric_series(merged, "volume", 0.0)
-                rep_vol = pd.to_numeric(merged.get("_bucket_volume_repair"), errors="coerce")
-                mask = (cur_vol.abs() == 0.0) & rep_vol.notna() & (rep_vol.fillna(0.0).abs() > 0.0)
-                if "volume" not in merged.columns:
-                    merged["volume"] = 0.0
-                merged.loc[mask, "volume"] = rep_vol[mask]
-                merged = merged.drop(columns=["_bucket_volume_repair"], errors="ignore")
-
-        if repaired_cols or (_nonzero_count(out, "volume") == 0 and _nonzero_count(merged, "volume") > 0):
-            logger.warning(
-                "[SUMMARY MTF DIFF 1M PATCH] mtf repaired from 1m interval=%s rows=%s repaired_cols=%s score_nonzero=%s volume_nonzero=%s",
-                interval_i,
-                len(merged),
-                repaired_cols,
-                _nonzero_count(merged, "score_total"),
-                _nonzero_count(merged, "volume"),
-            )
-        return merged.reset_index(drop=True)
-    except Exception:
-        logger.exception("[SUMMARY MTF DIFF 1M PATCH] mtf repair from 1m failed interval=%s", interval)
-        return out
-
-
 def _publish_to_global(interval: int, df_hist: pd.DataFrame, df_latest: pd.DataFrame) -> None:
+    if not _mtf_is_usable(df_hist, interval=interval, label="publish_hist"):
+        logger.warning("[SUMMARY MTF DIFF 1M PATCH] publish skipped interval=%s reason=unusable_hist rows=%s", interval, _safe_len(df_hist))
+        return
     try:
         from global_state import global_data
         for method_name, args in (
@@ -420,8 +348,20 @@ def _resample_cached_1m_to_mtf(interval: int) -> pd.DataFrame:
             return pd.DataFrame()
         one["datetime"] = pd.to_datetime(one["datetime"], errors="coerce")
         one = one.dropna(subset=["datetime", "symbol"])
+        one["symbol"] = one["symbol"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
         if one.empty:
             return pd.DataFrame()
+
+        min_rows = _min_1m_rows_required(interval_i)
+        hist_max_1m = _max_hist_per_symbol(one)
+        vol_source = _best_numeric_column(one, ["volume", "vol", "trading_volume", "出来高"])
+        if vol_source is None or _nonzero_count(one.rename(columns={vol_source: "volume"}) if vol_source else one, "volume") <= 0:
+            logger.warning("[SUMMARY MTF DIFF 1M PATCH] cached 1m -> %sm skipped reason=one_volume_zero rows=%s hist_max_1m=%s", interval_i, len(one), hist_max_1m)
+            return pd.DataFrame()
+        if hist_max_1m < min_rows:
+            logger.warning("[SUMMARY MTF DIFF 1M PATCH] cached 1m -> %sm skipped reason=short_1m_history rows=%s hist_max_1m=%s min=%s", interval_i, len(one), hist_max_1m, min_rows)
+            return pd.DataFrame()
+
         if "close" not in one.columns and "price" in one.columns:
             one["close"] = one["price"]
         for col in ("open", "high", "low"):
@@ -429,14 +369,9 @@ def _resample_cached_1m_to_mtf(interval: int) -> pd.DataFrame:
                 one[col] = one.get("close")
         if "close" not in one.columns:
             return pd.DataFrame()
-        vol_col = _best_numeric_column(one, ["volume", "vol", "trading_volume", "出来高"])
-        if vol_col is None:
-            one["volume"] = 0.0
-            vol_col = "volume"
-        elif vol_col != "volume":
-            one["volume"] = pd.to_numeric(one[vol_col], errors="coerce").fillna(0.0)
-            vol_col = "volume"
-        for col in ("open", "high", "low", "close", vol_col):
+        if vol_source != "volume":
+            one["volume"] = pd.to_numeric(one[vol_source], errors="coerce").fillna(0.0)
+        for col in ("open", "high", "low", "close", "volume"):
             one[col] = pd.to_numeric(one[col], errors="coerce")
         one = one.dropna(subset=["close"])
         if one.empty:
@@ -444,17 +379,13 @@ def _resample_cached_1m_to_mtf(interval: int) -> pd.DataFrame:
 
         frames = []
         rule = f"{interval_i}min"
-        agg = {"open": "first", "high": "max", "low": "min", "close": "last", vol_col: "sum"}
+        agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
         optional_last = [
-            "symbolname", "name", "market", "exchange", "source",
-            "price", "vwap", "ma5", "ma25", "ma75",
+            "symbolname", "name", "market", "exchange", "source", "price", "vwap", "ma5", "ma25", "ma75",
             "score", "score_total", "final_score", "display_score", "combined_score",
             "score_buy", "buy_score", "score_sell", "sell_score",
-            "slope", "slope_atr_scaled", "score_slope",
-            "rsi", "macd", "signal", "hist",
-            "mtf", "score_mtf", "mtf_score",
-            "atr", "atr_1m", "atr_3m", "atr_5m",
-            "technical_ready", "display_ready", "usable_ready",
+            "slope", "slope_atr_scaled", "score_slope", "rsi", "macd", "signal", "hist",
+            "mtf", "score_mtf", "mtf_score", "atr", "atr_1m", "atr_3m", "atr_5m",
         ]
         for col in optional_last:
             if col in one.columns and col not in agg:
@@ -468,8 +399,6 @@ def _resample_cached_1m_to_mtf(interval: int) -> pd.DataFrame:
                 continue
             r["symbol"] = str(sym)
             r = r.reset_index()
-            if vol_col != "volume" and vol_col in r.columns and "volume" not in r.columns:
-                r["volume"] = r[vol_col]
             frames.append(r)
         if not frames:
             return pd.DataFrame()
@@ -490,12 +419,16 @@ def _resample_cached_1m_to_mtf(interval: int) -> pd.DataFrame:
         except Exception:
             logger.debug("[SUMMARY MTF DIFF 1M PATCH] cached mtf scoring failed interval=%s", interval_i, exc_info=True)
         hist = _ensure_basic_score_columns(hist)
-        hist = _repair_mtf_from_1m(hist, one, interval=interval_i)
-        hist = _ensure_basic_score_columns(hist)
+        if "technical_ready" in hist.columns:
+            hist["technical_ready"] = _mtf_is_usable(hist, interval=interval_i, label="resampled_hist")
+            hist["display_ready"] = hist["technical_ready"]
+            hist["usable_ready"] = hist["technical_ready"]
+        if not _mtf_is_usable(hist, interval=interval_i, label="resampled_hist_final"):
+            return pd.DataFrame()
         latest = hist.sort_values(["symbol", "datetime"], kind="stable").groupby("symbol", as_index=False).tail(1)
         _publish_to_global(interval_i, hist, latest)
         logger.warning(
-            "[SUMMARY MTF DIFF 1M PATCH] main.py cached 1m -> %sm fallback published hist_rows=%s latest_rows=%s symbols=%s latest_dt=%s score_nonzero=%s volume_nonzero=%s",
+            "[SUMMARY MTF DIFF 1M PATCH] main.py cached 1m -> %sm fallback published hist_rows=%s latest_rows=%s symbols=%s latest_dt=%s score_nonzero=%s volume_nonzero=%s hist_max=%s",
             interval_i,
             _safe_len(hist),
             _safe_len(latest),
@@ -503,6 +436,7 @@ def _resample_cached_1m_to_mtf(interval: int) -> pd.DataFrame:
             hist["datetime"].max() if "datetime" in hist.columns else None,
             _nonzero_count(hist, "score_total"),
             _nonzero_count(hist, "volume"),
+            _max_hist_per_symbol(hist),
         )
         return latest.reset_index(drop=True)
     except Exception:
@@ -530,13 +464,7 @@ def _run_diff_from_1m(interval: int) -> pd.DataFrame:
         from trading.summary.persistence.summary_persistence import save_summary
         built = build_incremental_mtf_from_1m(interval)
         if not isinstance(built, dict) or not built.get("ok"):
-            logger.info(
-                "[SUMMARY MTF DIFF 1M PATCH] no diff interval=%s reason=%s one_raw_rows=%s latest_dt=%s",
-                interval,
-                built.get("reason") if isinstance(built, dict) else None,
-                built.get("one_raw_rows") if isinstance(built, dict) else None,
-                built.get("latest_dt") if isinstance(built, dict) else None,
-            )
+            logger.info("[SUMMARY MTF DIFF 1M PATCH] no diff interval=%s reason=%s", interval, built.get("reason") if isinstance(built, dict) else None)
             return pd.DataFrame()
         hist_df = _normalize_summary_df(built.get("history_df"), interval=interval)
         diff_seed = _normalize_summary_df(built.get("diff_df"), interval=interval)
@@ -557,15 +485,7 @@ def _run_diff_from_1m(interval: int) -> pd.DataFrame:
         except Exception:
             latest = diff_rows.copy()
         _publish_to_global(int(interval), df_hist, latest)
-        logger.warning(
-            "[SUMMARY MTF DIFF 1M PATCH] saved interval=%s diff_rows=%s diff_symbols=%s hist_rows=%s latest_dt=%s path=%s",
-            interval,
-            _safe_len(diff_rows),
-            int(diff_rows["symbol"].nunique()) if "symbol" in diff_rows.columns else 0,
-            _safe_len(df_hist),
-            built.get("latest_dt"),
-            built.get("path"),
-        )
+        logger.warning("[SUMMARY MTF DIFF 1M PATCH] saved interval=%s diff_rows=%s hist_rows=%s", interval, _safe_len(diff_rows), _safe_len(df_hist))
         return latest.reset_index(drop=True)
     except Exception:
         logger.exception("[SUMMARY MTF DIFF 1M PATCH] failed interval=%s", interval)
@@ -608,6 +528,10 @@ def _patched_diff_update(self, interval: int, *args, **kwargs):
     try:
         out = _call_original_diff_update(self, interval_i, *args, **kwargs)
         if isinstance(out, pd.DataFrame) and not out.empty:
+            if interval_i in (3, 5) and not _mtf_is_usable(out, interval=interval_i, label="original_out"):
+                if isinstance(precomputed_latest, pd.DataFrame) and not precomputed_latest.empty:
+                    return precomputed_latest
+                return pd.DataFrame()
             return out
         if isinstance(precomputed_latest, pd.DataFrame) and not precomputed_latest.empty:
             return precomputed_latest
@@ -644,15 +568,12 @@ def install() -> bool:
         if not callable(cur):
             logger.warning("[SUMMARY MTF DIFF 1M PATCH] diff_update unavailable")
             return False
-        if getattr(cur, "_summary_mtf_diff_from_1m_v16", False):
+        if getattr(cur, "_summary_mtf_diff_from_1m_v17", False):
             _INSTALLED = True
             return True
         _ORIG_DIFF_UPDATE = getattr(cur, "_original", cur)
+        _patched_diff_update._summary_mtf_diff_from_1m_v17 = True  # type: ignore[attr-defined]
         _patched_diff_update._summary_mtf_diff_from_1m_v16 = True  # type: ignore[attr-defined]
-        _patched_diff_update._summary_mtf_diff_from_1m_v15 = True  # type: ignore[attr-defined]
-        _patched_diff_update._summary_mtf_diff_from_1m_v14 = True  # type: ignore[attr-defined]
-        _patched_diff_update._summary_mtf_diff_from_1m_v13 = True  # type: ignore[attr-defined]
-        _patched_diff_update._summary_mtf_diff_from_1m_v12 = True  # type: ignore[attr-defined]
         _patched_diff_update._original = _ORIG_DIFF_UPDATE  # type: ignore[attr-defined]
         cls.diff_update = _patched_diff_update
         try:
@@ -663,9 +584,10 @@ def install() -> bool:
             pass
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY MTF DIFF 1M PATCH] installed v1.6 enabled=True cached_1m_mtf_fallback=True score_repair=True merge_guard=True history_rows=%s allow_partial=%s main_nas_skip=%s interval1_skip=%s",
-            os.getenv("SUMMARY_MTF_DIFF_HISTORY_ROWS", "74"),
-            os.getenv("SUMMARY_MTF_DIFF_ALLOW_PARTIAL_BAR", "0"),
+            "[SUMMARY MTF DIFF 1M PATCH] installed v1.7 cached_1m_mtf_fallback=True reject_zero_volume=%s min_1m_rows=%s min_mtf_rows=%s main_nas_skip=%s interval1_skip=%s",
+            _env_bool("SUMMARY_MTF_REJECT_ZERO_VOLUME", True),
+            os.getenv("SUMMARY_MTF_FALLBACK_MIN_1M_ROWS", "auto"),
+            os.getenv("SUMMARY_MTF_FALLBACK_MIN_MTF_ROWS", "2"),
             _main_should_skip_nas_diff_update(3),
             _main_should_skip_nas_diff_update(1),
         )
@@ -679,5 +601,6 @@ try:
     install()
 except Exception:
     logger.exception("[SUMMARY MTF DIFF 1M PATCH] auto install failed")
+
 
 __all__ = ["install"]
