@@ -1,15 +1,15 @@
 # ============================================================
 # File   : core/startup/final_entry_safety_guard_patch.py
-# Version: Ver08-BOARD-REST-FALLBACK-PENDING-CLEANUP
+# Version: Ver09-BOARD-MISSING-RETRY-PENDING-KEEP
 # ------------------------------------------------------------
 # entry_controller._execute_best_candidate を runtime patch し、
 # 発注直前の最終安全ガードを追加する。
 #
-# Ver08:
-#   - 発注直前の bid/ask 欠損時は REST board fallback を既定で1回だけ試す。
-#   - それでも板が取れない場合は発注しない。
-#   - board_missing / safety guard NG / order未発火時は該当pendingだけ解除し、
-#     次サイクルで古いpendingが残って候補を塞がないようにする。
+# Ver09:
+#   - board_missing では pending を削除しない。
+#   - board_missing は retryable=True として item/entry/ai に明示する。
+#   - 板なし発注は既定では許可しないが、次サイクルで再試行できるよう候補を残す。
+#   - order false 時も reason=board_missing の場合は pending を pop しない。
 #   - main.py は PUSH DB 保存しない方針を維持する。
 #   - 優先度3「当日損失上限で新規停止」はユーザー要望により未実装。
 # ============================================================
@@ -67,13 +67,16 @@ def _env_str(name: str, default: str) -> str:
 
 
 def _force_default_env() -> None:
-    # 発注直前はPUSH板だけに依存しない。PUSHローテ中に対象銘柄が未登録でもREST /boardで補完する。
+    # PUSHローテ中に対象銘柄が未登録でもREST /boardで補完する。
     os.environ.setdefault("ENTRY_BOARD_API_LOOKUP_ENABLED", "1")
     # 板なし発注は誤発注・価格未確定の原因になるため既定NG。
     os.environ.setdefault("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", "0")
-    os.environ.setdefault("ENTRY_BOARD_MISSING_POP_PENDING", "1")
+    # Ver09: 板取得失敗は一時障害として扱う。候補を消さず次サイクルで再試行する。
+    os.environ.setdefault("ENTRY_BOARD_MISSING_POP_PENDING", "0")
+    os.environ.setdefault("ENTRY_BOARD_MISSING_RETRYABLE", "1")
+    # order false は原則古いpending詰まり対策でpopするが、board_missingだけは下でpopしない。
     os.environ.setdefault("ENTRY_ORDER_FALSE_POP_PENDING", "1")
-    os.environ.setdefault("ENTRY_BOARD_API_MAX_ATTEMPTS", "1")
+    os.environ.setdefault("ENTRY_BOARD_API_MAX_ATTEMPTS", "2")
     os.environ.setdefault("ENTRY_MAX_SPREAD_PCT", "0.20")
     os.environ.setdefault("ENTRY_MIN_BEST_BOARD_QTY", "0")
 
@@ -158,19 +161,43 @@ def _log_ng(reason: str, symbol: str, side: str, **detail) -> None:
 
 def _mark_skip(item: dict, reason: str, **detail) -> None:
     try:
+        retryable = bool(detail.pop("retryable", False)) or reason == "board_missing"
         item["skip_reason"] = reason
         item["final_guard_skip_reason"] = reason
         item["final_guard_skip_detail"] = detail
+        item["retryable"] = retryable
+        item["final_guard_retryable"] = retryable
+        entry = item.get("entry")
+        if isinstance(entry, dict):
+            entry["skip_reason"] = reason
+            entry["final_guard_skip_reason"] = reason
+            entry["retryable"] = retryable
+            entry["final_guard_retryable"] = retryable
+        row = item.get("entry_row")
+        if isinstance(row, dict):
+            row["skip_reason"] = reason
+            row["final_guard_skip_reason"] = reason
+            row["retryable"] = retryable
+            row["final_guard_retryable"] = retryable
         ai = item.get("ai")
         if isinstance(ai, dict):
             ai["skip_reason"] = reason
             ai["final_guard_skip_reason"] = reason
+            ai["retryable"] = retryable
+            ai["final_guard_retryable"] = retryable
     except Exception:
         pass
 
 
 def _pop_pending_entry(symbol: str, item: dict, reason: str) -> None:
     try:
+        if reason == "board_missing" and not _env_bool("ENTRY_BOARD_MISSING_POP_PENDING", False):
+            logger.warning(
+                "[FINAL ENTRY SAFETY GUARD] PENDING_KEEP symbol=%s reason=%s retryable=True",
+                symbol,
+                reason,
+            )
+            return
         entry = item.get("entry") if isinstance(item, dict) else None
         if not isinstance(entry, dict):
             return
@@ -202,7 +229,7 @@ def _entry_time_guard(symbol: str, side: str) -> bool:
         _log_ng("time_after_allowed", symbol, side, now=now.strftime("%H:%M:%S"), no_new_after=after_t.strftime("%H:%M"))
         return False
     if _env_bool("ENTRY_LUNCH_GUARD_ENABLED", True):
-        sh, sm = _parse_hhmm(_env_str("ENTRY_LUNCH_BLOCK_START", "11:25"), 11, 25)
+        sh, sm = _parse_hhmm(_env_str("ENTRY_LUNCH_BLOCK_START", "11:30"), 11, 30)
         eh, em = _parse_hhmm(_env_str("ENTRY_LUNCH_BLOCK_END", "12:30"), 12, 30)
         st = dt.time(sh, sm)
         et = dt.time(eh, em)
@@ -314,7 +341,7 @@ def _try_get_bid_ask_from_api(symbol: str) -> tuple[float, float, float, float]:
     if not _env_bool("ENTRY_BOARD_API_LOOKUP_ENABLED", True):
         logger.info("[FINAL ENTRY SAFETY GUARD] BOARD_API_LOOKUP_SKIP symbol=%s enabled=0", symbol)
         return 0.0, 0.0, 0.0, 0.0
-    attempts = max(1, min(3, _safe_int(os.getenv("ENTRY_BOARD_API_MAX_ATTEMPTS"), 1)))
+    attempts = max(1, min(3, _safe_int(os.getenv("ENTRY_BOARD_API_MAX_ATTEMPTS"), 2)))
     for i in range(attempts):
         try:
             from utils_common import get_latest_bid_ask
@@ -335,6 +362,8 @@ def _try_get_bid_ask_from_api(symbol: str) -> tuple[float, float, float, float]:
                     return bid, ask, 0.0, 0.0
         except Exception as e:
             logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_API_NG symbol=%s attempt=%s/%s error=%s", symbol, i + 1, attempts, e)
+        if i + 1 < attempts:
+            time.sleep(max(0.05, _env_float("ENTRY_BOARD_API_RETRY_SLEEP_SEC", 0.25)))
     return 0.0, 0.0, 0.0, 0.0
 
 
@@ -415,8 +444,17 @@ def _board_guard(*args, **kwargs) -> bool:
     if bid <= 0 or ask <= 0:
         if _board_missing_fallback_ok(row, item, symbol, side):
             return True
-        _mark_skip(item, "board_missing", bid=bid, ask=ask)
-        _log_ng("board_missing", symbol, side, bid=bid, ask=ask, message="板が取れないため新規エントリー停止")
+        _mark_skip(item, "board_missing", bid=bid, ask=ask, retryable=True)
+        _log_ng(
+            "board_missing",
+            symbol,
+            side,
+            bid=bid,
+            ask=ask,
+            retryable=True,
+            pending_action="keep",
+            message="板が取れないため今回の新規エントリーは見送り、pendingを残して次サイクルで再試行",
+        )
         return False
 
     mid = (bid + ask) / 2.0
@@ -483,7 +521,12 @@ def _apply_contrarian_half_size(item: dict, row: dict, symbol: str, side: str) -
 
 
 def _guard_fail(item: dict, symbol: str, reason: str, *, pop: bool = False, **detail) -> bool:
-    _mark_skip(item, reason, **detail)
+    retryable = bool(detail.pop("retryable", False)) or reason == "board_missing"
+    _mark_skip(item, reason, retryable=retryable, **detail)
+    if reason == "board_missing":
+        # Ver09: board_missing は一時的なREST/WS/ローテ問題として扱い、pendingを残す。
+        _pop_pending_entry(symbol, item, reason)
+        return False
     if pop:
         _pop_pending_entry(symbol, item, reason)
     return False
@@ -516,7 +559,8 @@ def _patched_execute_best_candidate(item: dict, boost_active: bool) -> bool:
                 item,
                 symbol,
                 "board_missing",
-                pop=_env_bool("ENTRY_BOARD_MISSING_POP_PENDING", True),
+                pop=False,
+                retryable=True,
             )
         _apply_contrarian_half_size(item, row, symbol, side)
 
@@ -528,7 +572,9 @@ def _patched_execute_best_candidate(item: dict, boost_active: bool) -> bool:
         if not ok:
             reason = str(item.get("skip_reason") or item.get("final_guard_skip_reason") or "entry_controller_no_order")
             logger.warning("[FINAL ENTRY SAFETY GUARD] ORIG_RETURN_FALSE symbol=%s side=%s reason=%s elapsed=%.3fs", symbol, side, reason, elapsed)
-            if _env_bool("ENTRY_ORDER_FALSE_POP_PENDING", True):
+            if reason == "board_missing":
+                _pop_pending_entry(symbol, item, reason)
+            elif _env_bool("ENTRY_ORDER_FALSE_POP_PENDING", True):
                 _pop_pending_entry(symbol, item, reason)
         return ok
     except Exception:
@@ -540,7 +586,7 @@ def _is_currently_wrapped() -> bool:
     try:
         import trading.handlers.entry_controller as ec
         cur = getattr(ec, "_execute_best_candidate", None)
-        return bool(getattr(cur, "_final_entry_safety_guard_v08", False))
+        return bool(getattr(cur, "_final_entry_safety_guard_v09", False))
     except Exception:
         return False
 
@@ -556,19 +602,20 @@ def install() -> bool:
         if not callable(old):
             logger.error("[FINAL ENTRY SAFETY GUARD] target _execute_best_candidate unavailable")
             return False
-        if getattr(old, "_final_entry_safety_guard_v08", False):
+        if getattr(old, "_final_entry_safety_guard_v09", False):
             _INSTALLED = True
             return True
-        if (getattr(old, "_final_entry_safety_guard", False) or getattr(old, "_final_entry_safety_guard_v07", False)) and _ORIG_EXECUTE_BEST_CANDIDATE is not None:
+        if (getattr(old, "_final_entry_safety_guard", False) or getattr(old, "_final_entry_safety_guard_v08", False)) and _ORIG_EXECUTE_BEST_CANDIDATE is not None:
             old = _ORIG_EXECUTE_BEST_CANDIDATE
         _ORIG_EXECUTE_BEST_CANDIDATE = old
         _patched_execute_best_candidate._final_entry_safety_guard = True  # type: ignore[attr-defined]
         _patched_execute_best_candidate._final_entry_safety_guard_v08 = True  # type: ignore[attr-defined]
+        _patched_execute_best_candidate._final_entry_safety_guard_v09 = True  # type: ignore[attr-defined]
         _patched_execute_best_candidate._original_execute_best_candidate = old  # type: ignore[attr-defined]
         ec._execute_best_candidate = _patched_execute_best_candidate
         _INSTALLED = True
         logger.warning(
-            "[FINAL ENTRY SAFETY GUARD] installed v08 liquidity=%s min_volume=%.0f min_turnover=%.0f same_symbol_loss=%s recent_reverse=%s time_guard=%s board_guard=%s board_api_lookup=%s allow_without_board=%s board_missing_pop=%s order_false_pop=%s daily_loss_guard=NOT_INSTALLED_BY_REQUEST",
+            "[FINAL ENTRY SAFETY GUARD] installed v09 liquidity=%s min_volume=%.0f min_turnover=%.0f same_symbol_loss=%s recent_reverse=%s time_guard=%s board_guard=%s board_api_lookup=%s allow_without_board=%s board_missing_pop=%s board_missing_retryable=%s order_false_pop=%s daily_loss_guard=NOT_INSTALLED_BY_REQUEST",
             _env_bool("ENTRY_FINAL_LIQUIDITY_GUARD_ENABLED", True),
             _env_float("ENTRY_MIN_VOLUME", 30000.0),
             _env_float("ENTRY_MIN_TURNOVER", 10000000.0),
@@ -578,7 +625,8 @@ def install() -> bool:
             _env_bool("ENTRY_BOARD_GUARD_ENABLED", True),
             _env_bool("ENTRY_BOARD_API_LOOKUP_ENABLED", True),
             _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", False),
-            _env_bool("ENTRY_BOARD_MISSING_POP_PENDING", True),
+            _env_bool("ENTRY_BOARD_MISSING_POP_PENDING", False),
+            _env_bool("ENTRY_BOARD_MISSING_RETRYABLE", True),
             _env_bool("ENTRY_ORDER_FALSE_POP_PENDING", True),
         )
         return True
