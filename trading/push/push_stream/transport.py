@@ -1,8 +1,13 @@
 # ============================================================
 # File   : trading/push/push_stream/transport.py
-# Version: Ver1.6-PUSH-STREAM-TRANSPORT-ROTATION-WS-CLOSED-AWARE
+# Version: Ver1.7-PUSH-STREAM-TRANSPORT-AFTER-OPEN-REFRESH-STATUS
 # ------------------------------------------------------------
 # WebSocket transport helpers.
+#
+# REV1.7:
+#   - _start_refresh_after_open_thread returns True only when the thread is
+#     actually started. This prevents callers from logging "started" after
+#     PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1 skipped it.
 #
 # REV1.6:
 #   - rotation_A / rotation_B registration is REST based, not WS-send based.
@@ -27,7 +32,7 @@ from .runtime import _now, _safe_set_runtime
 
 logger = logging.getLogger(__name__)
 
-VERSION = "Ver1.6-PUSH-STREAM-TRANSPORT-ROTATION-WS-CLOSED-AWARE"
+VERSION = "Ver1.7-PUSH-STREAM-TRANSPORT-AFTER-OPEN-REFRESH-STATUS"
 
 _last_refresh_started_ts = 0.0
 _last_refresh_done_ts = 0.0
@@ -370,15 +375,16 @@ def is_connected() -> bool:
     return state._connected_event.is_set() and _is_ws_alive()
 
 
-def _start_refresh_after_open_thread() -> None:
+def _start_refresh_after_open_thread() -> bool:
     if _env_bool("PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH", False):
         logger.warning("[push_stream] refresh after open thread not started by env PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1")
-        return
+        return False
     threading.Thread(
         target=_safe_refresh_subscriptions_after_open,
         name="push-refresh-after-open",
         daemon=True,
     ).start()
+    return True
 
 
 __all__ = [
