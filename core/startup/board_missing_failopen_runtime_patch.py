@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/board_missing_failopen_runtime_patch.py
-# Version: V1.5-SUMMARY-AI-BOARD-CONTEXT-CARRY
+# Version: V1.6-SUMMARY-AI-FAST-BOARDLESS-ORDER
 # ------------------------------------------------------------
 # Purpose:
-#   - PUSH A/B ローテーション境界などで板が一時的に取れない場合、
-#     SUMMARY_AI の強い候補は小ロットで fail-open する。
-#   - 外側 final guard で取得できた bid/ask を row / item / entry / entry_row に
-#     書き戻し、多重 wrapper の内側で再度 board_missing に戻る問題を防ぐ。
+#   - PUSH A/B ローテーション境界や REST /board 429 で板が一時的に取れない場合、
+#     SUMMARY_AI の強い候補は小ロット・終値/現在値指値で fail-open する。
+#   - final_entry_safety_guard 側だけでなく、entry_order_builder 側の長い板リトライも
+#     SUMMARY_AI では即時 fallback にして、ENTRY_EXEC TIMEOUT / INFLIGHT滞留を防ぐ。
 #   - main.py 側ではPUSH DB保存なしの方針を維持する。
 # ============================================================
 from __future__ import annotations
@@ -18,7 +18,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V1.5-SUMMARY-AI-BOARD-CONTEXT-CARRY"
+VERSION = "V1.6-SUMMARY-AI-FAST-BOARDLESS-ORDER"
 _INSTALLED = False
 
 _TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
@@ -156,7 +156,6 @@ def _score_from_dicts(dicts: list[dict[str, Any]], side: str) -> float:
 
 
 def _write_board_context(row: Any, item: Any, bid: float, ask: float, bid_qty: float = 0.0, ask_qty: float = 0.0, *, source: str = "final_guard") -> None:
-    """Propagate board values so nested wrappers/build_order do not re-check as board_missing."""
     try:
         bid = _safe_float(bid, 0.0)
         ask = _safe_float(ask, 0.0)
@@ -164,6 +163,9 @@ def _write_board_context(row: Any, item: Any, bid: float, ask: float, bid_qty: f
         ask_qty = _safe_float(ask_qty, 0.0)
         if bid <= 0 or ask <= 0:
             return
+        if bid > ask:
+            bid, ask = ask, bid
+            bid_qty, ask_qty = ask_qty, bid_qty
         payload = {
             "bid": bid,
             "ask": ask,
@@ -195,14 +197,42 @@ def _write_board_context(row: Any, item: Any, bid: float, ask: float, bid_qty: f
                 continue
             seen.add(id(d))
             d.update(payload)
+            if str(d.get("skip_reason") or "") == "board_missing":
+                d.pop("skip_reason", None)
+                d.pop("final_guard_skip_reason", None)
     except Exception:
         logger.debug("[BOARD MISSING FAILOPEN] board context write failed", exc_info=True)
 
 
-def _summary_ai_without_board_ok(fsg: Any, row: Any, item: Any, symbol: str, side: str) -> bool:
+def _set_boardless_flags(row: Any, item: Any, ratio: float) -> None:
+    try:
+        targets: list[dict[str, Any]] = []
+        if isinstance(row, dict):
+            targets.append(row)
+        if isinstance(item, dict):
+            targets.append(item)
+            for key in ("entry", "entry_row", "row", "ai"):
+                sub = item.get(key)
+                if isinstance(sub, dict):
+                    targets.append(sub)
+        seen: set[int] = set()
+        for d in targets:
+            if id(d) in seen:
+                continue
+            seen.add(id(d))
+            d["board_missing_fallback"] = True
+            d["summary_ai_board_missing_rescue"] = True
+            d["board_missing_qty_ratio"] = ratio
+            if str(d.get("skip_reason") or "") == "board_missing":
+                d.pop("skip_reason", None)
+                d.pop("final_guard_skip_reason", None)
+    except Exception:
+        pass
+
+
+def _summary_ai_without_board_ok(row: Any, item: Any, symbol: str, side: str) -> bool:
     if not _env_bool("ENTRY_SUMMARY_AI_ALLOW_WITHOUT_BOARD", True):
         return False
-
     dicts = _candidate_dicts(row, item)
     if not _is_summary_ai_candidate(dicts):
         return False
@@ -218,76 +248,34 @@ def _summary_ai_without_board_ok(fsg: Any, row: Any, item: Any, symbol: str, sid
     min_volume = _env_float("ENTRY_SUMMARY_AI_ALLOW_WITHOUT_BOARD_MIN_VOLUME", _env_float("ENTRY_ALLOW_WITHOUT_BOARD_MIN_VOLUME", 30000.0))
     min_turnover = _env_float("ENTRY_SUMMARY_AI_ALLOW_WITHOUT_BOARD_MIN_TURNOVER", _env_float("ENTRY_ALLOW_WITHOUT_BOARD_MIN_TURNOVER", 10000000.0))
     min_score = _env_float("ENTRY_SUMMARY_AI_ALLOW_WITHOUT_BOARD_MIN_SCORE", 1.0)
-
     volume_ok = volume >= min_volume or (turnover >= min_turnover and _env_bool("ENTRY_SUMMARY_AI_ALLOW_WITHOUT_BOARD_ALLOW_VOLUME_MISSING", True))
     ok = close >= min_price and turnover >= min_turnover and score >= min_score and volume_ok
     if not ok:
         logger.warning(
-            "[FINAL ENTRY SAFETY GUARD] SUMMARY_AI_BOARD_MISSING_RESCUE_NG symbol=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f min_price=%.2f min_volume=%.0f min_turnover=%.0f min_score=%.3f source=%s entry_type=%s",
+            "[FINAL ENTRY SAFETY GUARD] SUMMARY_AI_BOARD_MISSING_RESCUE_NG symbol=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f min_price=%.2f min_volume=%.0f min_turnover=%.0f min_score=%.3f source=%s entry_type=%s version=%s",
             symbol, side, close, volume, turnover, score, min_price, min_volume, min_turnover, min_score,
-            _first_str(dicts, ("source", "pipeline_source")), _first_str(dicts, ("entry_type",)),
+            _first_str(dicts, ("source", "pipeline_source")), _first_str(dicts, ("entry_type",)), VERSION,
         )
         return False
 
-    try:
-        item_d = item if isinstance(item, dict) else {}
-        ai = item_d.get("ai")
-        ratio = max(0.1, min(1.0, _env_float("ENTRY_SUMMARY_AI_BOARD_MISSING_QTY_RATIO", _env_float("ENTRY_BOARD_MISSING_QTY_RATIO", 0.35))))
-        if isinstance(ai, dict):
-            old_lot = _safe_float(ai.get("lot_multiplier"), 1.0) or 1.0
-            ai["lot_multiplier"] = max(0.1, old_lot * ratio)
-            ai["board_missing_qty_ratio"] = ratio
-            ai["board_missing_fallback"] = True
-            ai["summary_ai_board_missing_rescue"] = True
-        entry = item_d.get("entry")
-        if isinstance(entry, dict):
-            entry["board_missing_fallback"] = True
-            entry["summary_ai_board_missing_rescue"] = True
-        # 板なし救済でも内側wrapperが再度 board_missing しないよう、closeを中心に疑似板を持たせる。
-        tick = max(1.0, _env_float("ENTRY_SUMMARY_AI_SYNTHETIC_BOARD_TICK", 1.0))
-        if close > 0:
-            if _norm(side) == "BUY":
-                bid = max(1.0, close - tick)
-                ask = close
-            elif _norm(side) == "SELL":
-                bid = close
-                ask = close + tick
-            else:
-                bid = max(1.0, close - tick)
-                ask = close + tick
-            _write_board_context(row, item, bid, ask, 0.0, 0.0, source="summary_ai_board_missing_synthetic")
-    except Exception:
-        pass
-
+    ratio = max(0.1, min(1.0, _env_float("ENTRY_SUMMARY_AI_BOARD_MISSING_QTY_RATIO", _env_float("ENTRY_BOARD_MISSING_QTY_RATIO", 0.35))))
+    _set_boardless_flags(row, item, ratio)
+    tick = max(1.0, _env_float("ENTRY_SUMMARY_AI_SYNTHETIC_BOARD_TICK", 1.0))
+    if close > 0:
+        if _norm(side) == "BUY":
+            bid = max(1.0, close - tick)
+            ask = close
+        elif _norm(side) == "SELL":
+            bid = close
+            ask = close + tick
+        else:
+            bid = max(1.0, close - tick)
+            ask = close + tick
+        _write_board_context(row, item, bid, ask, 0.0, 0.0, source="summary_ai_board_missing_synthetic")
     logger.warning(
-        "[FINAL ENTRY SAFETY GUARD] SUMMARY_AI_BOARD_MISSING_RESCUE_ALLOW symbol=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f qty_ratio=%s version=%s",
-        symbol, side, close, volume, turnover, score,
-        os.getenv("ENTRY_SUMMARY_AI_BOARD_MISSING_QTY_RATIO", os.getenv("ENTRY_BOARD_MISSING_QTY_RATIO", "0.35")),
-        VERSION,
+        "[FINAL ENTRY SAFETY GUARD] SUMMARY_AI_BOARD_MISSING_RESCUE_ALLOW symbol=%s side=%s close=%.2f volume=%.0f turnover=%.0f score=%.3f qty_ratio=%.2f version=%s",
+        symbol, side, close, volume, turnover, score, ratio, VERSION,
     )
-    return True
-
-
-def _patch_summary_ai_board_missing_fallback(fsg: Any) -> bool:
-    old = getattr(fsg, "_board_missing_fallback_ok", None)
-    if getattr(old, "_summary_ai_board_missing_rescue_v15", False):
-        return True
-
-    def _board_missing_fallback_ok_v15(row: dict, item: dict, symbol: str, side: str) -> bool:
-        try:
-            if _summary_ai_without_board_ok(fsg, row, item, symbol, side):
-                return True
-        except Exception:
-            logger.debug("[BOARD MISSING FAILOPEN] summary_ai board rescue check failed", exc_info=True)
-        if callable(old):
-            return bool(old(row, item, symbol, side))
-        return False
-
-    _board_missing_fallback_ok_v15._summary_ai_board_missing_rescue_v15 = True  # type: ignore[attr-defined]
-    _board_missing_fallback_ok_v15._summary_ai_board_missing_rescue_v14 = True  # type: ignore[attr-defined]
-    _board_missing_fallback_ok_v15._original = old  # type: ignore[attr-defined]
-    fsg._board_missing_fallback_ok = _board_missing_fallback_ok_v15
-    logger.warning("[BOARD MISSING FAILOPEN] summary_ai board missing fallback patched version=%s", VERSION)
     return True
 
 
@@ -298,17 +286,30 @@ def _patch_final_guard() -> bool:
         logger.exception("[BOARD MISSING FAILOPEN] import final_entry_safety_guard_patch failed")
         return False
 
-    _patch_summary_ai_board_missing_fallback(fsg)
-
+    old_fallback = getattr(fsg, "_board_missing_fallback_ok", None)
     old_board_guard = getattr(fsg, "_board_guard", None)
-    old_patched_board_guard = getattr(fsg, "_patched_board_guard", None)
 
-    def _board_guard_failopen(row: Any, item: Any = None, symbol: Any = None, side: Any = None, *args: Any, **kwargs: Any) -> bool:
+    def _board_missing_fallback_ok_v16(row: dict, item: dict, symbol: str, side: str) -> bool:
+        try:
+            if _summary_ai_without_board_ok(row, item, symbol, side):
+                return True
+        except Exception:
+            logger.debug("[BOARD MISSING FAILOPEN] summary_ai board rescue check failed", exc_info=True)
+        if callable(old_fallback):
+            try:
+                ok = bool(old_fallback(row, item, symbol, side))
+                if ok:
+                    _set_boardless_flags(row, item, _env_float("ENTRY_BOARD_MISSING_QTY_RATIO", 0.35))
+                return ok
+            except Exception:
+                logger.debug("[BOARD MISSING FAILOPEN] original fallback failed", exc_info=True)
+        return False
+
+    def _board_guard_failopen_v16(row: Any, item: Any = None, symbol: Any = None, side: Any = None, *args: Any, **kwargs: Any) -> bool:
         if side is None and symbol is not None and not isinstance(item, dict):
             side = symbol
             symbol = item
             item = None
-
         row_d = fsg._row_to_dict(row)
         item_d = item if isinstance(item, dict) else {}
         symbol_s = fsg._norm_symbol(symbol or fsg._first(row_d, ("symbol", "Symbol", "code", "銘柄コード"), ""))
@@ -317,15 +318,14 @@ def _patch_final_guard() -> bool:
         if not fsg._env_bool("ENTRY_BOARD_GUARD_ENABLED", True):
             return True
 
+        dicts = _candidate_dicts(row_d, item_d)
+        summary_ai = _is_summary_ai_candidate(dicts)
         bid, ask, bid_qty, ask_qty = fsg._extract_bid_ask_from_row(row_d)
-        if bid <= 0 or ask <= 0:
+
+        # SUMMARY_AI は REST板 429 を増やさない。PUSH row内に板がなければ保護fail-openへ進める。
+        if (bid <= 0 or ask <= 0) and not summary_ai and _env_bool("ENTRY_BOARD_API_LOOKUP_ENABLED", True):
             try:
-                bid2, ask2, bidq2, askq2 = fsg._try_get_bid_ask_from_api(symbol_s, side_s, "final_entry_safety_guard")
-            except TypeError:
-                try:
-                    bid2, ask2, bidq2, askq2 = fsg._try_get_bid_ask_from_api(symbol_s)
-                except Exception:
-                    bid2 = ask2 = bidq2 = askq2 = 0.0
+                bid2, ask2, bidq2, askq2 = fsg._try_get_bid_ask_from_api(symbol_s)
             except Exception:
                 bid2 = ask2 = bidq2 = askq2 = 0.0
             bid = bid or bid2
@@ -336,33 +336,19 @@ def _patch_final_guard() -> bool:
         if bid <= 0 or ask <= 0:
             if _env_bool("ENTRY_BOARD_MISSING_HARD_BLOCK", False):
                 fsg._log_ng("board_missing", symbol_s, side_s, bid=bid, ask=ask, message="板が取れないため新規エントリー停止")
-                logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_MISSING_HARD_BLOCK symbol=%s side=%s bid=%s ask=%s", symbol_s, side_s, bid, ask)
                 return False
-
-            if fsg._env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", True):
-                ok = False
-                try:
-                    ok = bool(fsg._board_missing_fallback_ok(row_d, item_d, symbol_s, side_s))
-                except Exception:
-                    logger.debug("[BOARD MISSING FAILOPEN] protected fallback check failed symbol=%s side=%s", symbol_s, side_s, exc_info=True)
-                    ok = False
-
-                if ok:
-                    logger.warning(
-                        "[FINAL ENTRY SAFETY GUARD] BOARD_MISSING_PROTECTED_FAILOPEN symbol=%s side=%s bid=%s ask=%s version=%s",
-                        symbol_s, side_s, bid, ask, VERSION,
-                    )
-                    return True
-
+            if fsg._env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", True) and _board_missing_fallback_ok_v16(row_d, item_d, symbol_s, side_s):
+                logger.warning(
+                    "[FINAL ENTRY SAFETY GUARD] BOARD_MISSING_PROTECTED_FAILOPEN symbol=%s side=%s bid=%s ask=%s summary_ai=%s version=%s",
+                    symbol_s, side_s, bid, ask, summary_ai, VERSION,
+                )
+                return True
             fsg._log_ng("board_missing", symbol_s, side_s, bid=bid, ask=ask, message="板が取れず、保護条件も未達のため新規エントリー停止")
             return False
 
-        # kabu Station /board の Buy1/Sell1 を逆に解釈して bid>ask になる環境がある。
-        # ここではスプレッド計算用に正規化し、後続には best_bid <= best_ask として渡す。
         if bid > ask:
             bid, ask = ask, bid
             bid_qty, ask_qty = ask_qty, bid_qty
-
         mid = (bid + ask) / 2.0
         spread_pct = ((ask - bid) / mid) * 100.0 if mid > 0 else 999.0
         max_spread = fsg._env_float("ENTRY_MAX_SPREAD_PCT", 0.15)
@@ -376,7 +362,6 @@ def _patch_final_guard() -> bool:
         if side_s == "SELL" and bid_qty > 0 and bid_qty < min_best_qty:
             fsg._log_ng("bid_board_too_thin", symbol_s, side_s, bid_qty=bid_qty, min_best_qty=min_best_qty, bid=bid, ask=ask)
             return False
-
         _write_board_context(row_d, item_d, bid, ask, bid_qty, ask_qty, source="final_guard_board_ok")
         logger.info(
             "[FINAL ENTRY SAFETY GUARD] BOARD_OK symbol=%s side=%s bid=%.4f ask=%.4f spread_pct=%.4f bid_qty=%.0f ask_qty=%.0f version=%s",
@@ -384,18 +369,60 @@ def _patch_final_guard() -> bool:
         )
         return True
 
-    _board_guard_failopen._board_missing_failopen_v1 = True  # type: ignore[attr-defined]
-    _board_guard_failopen._board_missing_failopen_v14 = True  # type: ignore[attr-defined]
-    _board_guard_failopen._board_missing_failopen_v15 = True  # type: ignore[attr-defined]
-    _board_guard_failopen._original_board_guard = old_board_guard  # type: ignore[attr-defined]
-    _board_guard_failopen._original_patched_board_guard = old_patched_board_guard  # type: ignore[attr-defined]
-    fsg._board_guard = _board_guard_failopen
-    fsg._patched_board_guard = _board_guard_failopen
+    _board_missing_fallback_ok_v16._summary_ai_board_missing_rescue_v16 = True  # type: ignore[attr-defined]
+    _board_missing_fallback_ok_v16._original = old_fallback  # type: ignore[attr-defined]
+    _board_guard_failopen_v16._board_missing_failopen_v16 = True  # type: ignore[attr-defined]
+    _board_guard_failopen_v16._original_board_guard = old_board_guard  # type: ignore[attr-defined]
+    fsg._board_missing_fallback_ok = _board_missing_fallback_ok_v16
+    fsg._board_guard = _board_guard_failopen_v16
+    fsg._patched_board_guard = _board_guard_failopen_v16
     fsg._BOARD_MISSING_FAILOPEN_PATCHED_V1 = True
     fsg._BOARD_MISSING_FAILOPEN_PATCHED_V14 = True
     fsg._BOARD_MISSING_FAILOPEN_PATCHED_V15 = True
+    fsg._BOARD_MISSING_FAILOPEN_PATCHED_V16 = True
     logger.warning("[BOARD MISSING FAILOPEN] final_entry_safety_guard board guard patched version=%s", VERSION)
     return True
+
+
+def _patch_entry_order_builder_fast_fallback() -> bool:
+    try:
+        import trading.handlers.entry_order_builder as eob
+    except Exception:
+        logger.exception("[BOARD MISSING FAILOPEN] import entry_order_builder failed")
+        return False
+    try:
+        old_get = getattr(eob, "_get_board_with_retry", None)
+        if not callable(old_get):
+            return False
+        if getattr(old_get, "_summary_ai_fast_boardless_v16", False):
+            return True
+
+        def _get_board_with_retry_fast(symbol: str, *, source: str, side: str):
+            src = str(source or "").upper()
+            if src == "SUMMARY_AI" and _env_bool("ENTRY_SUMMARY_AI_FAST_BOARDLESS_ORDER", True) and _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", True):
+                logger.warning(
+                    "[ENTRY ORDER BOARD RETRY] skip long board retry for SUMMARY_AI symbol=%s side=%s -> fallback limit version=%s",
+                    symbol, side, VERSION,
+                )
+                return None
+            return old_get(symbol, source=source, side=side)
+
+        _get_board_with_retry_fast._summary_ai_fast_boardless_v16 = True  # type: ignore[attr-defined]
+        _get_board_with_retry_fast._original = old_get  # type: ignore[attr-defined]
+        eob._get_board_with_retry = _get_board_with_retry_fast
+        setattr(eob, "ENTRY_ORDER_BOARD_RETRY_SEC", _env_float("ENTRY_ORDER_BOARD_RETRY_SEC_FORCE", 0.2))
+        setattr(eob, "ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", _env_float("ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC_FORCE", 0.1))
+        setattr(eob, "ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY", False)
+        logger.warning(
+            "[BOARD MISSING FAILOPEN] entry_order_builder fast boardless fallback patched retry_sec=%s interval=%s version=%s",
+            getattr(eob, "ENTRY_ORDER_BOARD_RETRY_SEC", None),
+            getattr(eob, "ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", None),
+            VERSION,
+        )
+        return True
+    except Exception:
+        logger.exception("[BOARD MISSING FAILOPEN] entry_order_builder fast fallback patch failed")
+        return False
 
 
 def _install_summary_ai_lock_retry() -> bool:
@@ -438,21 +465,26 @@ def install() -> bool:
     os.environ.setdefault("ENTRY_SUMMARY_AI_ALLOW_WITHOUT_BOARD_ALLOW_VOLUME_MISSING", "1")
     os.environ.setdefault("ENTRY_SUMMARY_AI_BOARD_MISSING_QTY_RATIO", "0.35")
     os.environ.setdefault("ENTRY_SUMMARY_AI_SYNTHETIC_BOARD_TICK", "1")
+    os.environ.setdefault("ENTRY_SUMMARY_AI_FAST_BOARDLESS_ORDER", "1")
     os.environ.setdefault("ENTRY_FINAL_BOARD_RETRY_COUNT", "0")
-    os.environ.setdefault("ENTRY_FINAL_BOARD_RETRY_EXTRA_COUNT", "1")
-    os.environ.setdefault("ENTRY_FINAL_BOARD_RETRY_EXTRA_WAIT_SEC", "0.2")
+    os.environ.setdefault("ENTRY_FINAL_BOARD_RETRY_EXTRA_COUNT", "0")
+    os.environ.setdefault("ENTRY_FINAL_BOARD_RETRY_EXTRA_WAIT_SEC", "0.05")
+    os.environ.setdefault("ENTRY_ORDER_BOARD_RETRY_SEC_FORCE", "0.2")
+    os.environ.setdefault("ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC_FORCE", "0.1")
 
     board_ok = _patch_final_guard()
+    order_ok = _patch_entry_order_builder_fast_fallback()
     lock_retry_ok = _install_summary_ai_lock_retry()
     stale_rescue_ok = _install_summary_entry_stale_rescue()
-    ok = bool(board_ok or lock_retry_ok or stale_rescue_ok)
+    ok = bool(board_ok or order_ok or lock_retry_ok or stale_rescue_ok)
     _INSTALLED = bool(ok)
     logger.warning(
-        "[BOARD MISSING FAILOPEN] installed=%s board_ok=%s lock_retry_ok=%s stale_rescue_ok=%s hard_block=%s allow_without_board=%s summary_ai_allow=%s qty_ratio=%s summary_ai_qty_ratio=%s version=%s",
-        ok, board_ok, lock_retry_ok, stale_rescue_ok,
+        "[BOARD MISSING FAILOPEN] installed=%s board_ok=%s order_fast_ok=%s lock_retry_ok=%s stale_rescue_ok=%s hard_block=%s allow_without_board=%s summary_ai_allow=%s fast_boardless=%s qty_ratio=%s summary_ai_qty_ratio=%s version=%s",
+        ok, board_ok, order_ok, lock_retry_ok, stale_rescue_ok,
         os.getenv("ENTRY_BOARD_MISSING_HARD_BLOCK"),
         os.getenv("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"),
         os.getenv("ENTRY_SUMMARY_AI_ALLOW_WITHOUT_BOARD"),
+        os.getenv("ENTRY_SUMMARY_AI_FAST_BOARDLESS_ORDER"),
         os.getenv("ENTRY_BOARD_MISSING_QTY_RATIO"),
         os.getenv("ENTRY_SUMMARY_AI_BOARD_MISSING_QTY_RATIO"),
         VERSION,
@@ -466,4 +498,4 @@ except Exception:
     logger.exception("[BOARD MISSING FAILOPEN] auto install failed")
 
 
-__all__ = ["install"]
+__all__ = ["VERSION", "install"]
