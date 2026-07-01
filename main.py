@@ -10,8 +10,9 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.35-SUMMARY-SCHEDULER-SHUTDOWN-GUARD
+# Version: Ver38.36-MAIN-MEMORY-LATEST-1M-SUMMARY
 # ------------------------------------------------------------
+# ✔ main.py はPUSH DB保存なしのまま、PUSHメモリから最新1分足summaryを高速生成
 # ✔ SUMMARY scheduler 終了時 submit RuntimeError ガードを main runtime patch に追加
 # ✔ SUMMARY AI async entry patch を main runtime patch 一覧へ明示追加
 # ✔ TONOSAMA final liquidity lost-volume fallback threshold を 2.3 に調整
@@ -174,6 +175,7 @@ def _install_main_runtime_patches():
         ("core.startup.indicator_fragmentation_runtime_patch", "install"),
         ("core.startup.entry_controller_runtime_reject_patch", "install"),
         ("core.startup.fast_startup_runtime_patch", "install"),
+        ("core.startup.summary_main_memory_latest_1m_patch", "install"),
         ("core.startup.summary_mtf_diff_from_1m_patch", "install"),
         ("core.startup.entry_qty_min_lot_runtime_patch", "install"),
         ("core.startup.low_movement_entry_guard_patch", "install"),
