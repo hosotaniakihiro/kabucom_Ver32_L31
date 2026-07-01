@@ -1,25 +1,29 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_ai_low_move_softpass_patch.py
-# Version: V1-SUMMARY-AI-LOW-ATR-SOFTPASS
+# Version: V2-ENFORCED-SUMMARY-AI-LOW-ATR-SOFTPASS
 # ------------------------------------------------------------
 # Purpose:
-#   - 5016 のように SUMMARY AI BUY が score/流動性は強いのに
+#   - 5016/7412 のように SUMMARY AI BUY が score/流動性は強いのに
 #     元 atr_1m_filter の ATR ratio だけで発注前に止まるケースを救済する。
 #   - 低出来高・横ばい銘柄を通さないため、SUMMARY/SUMMARY_AI かつ
 #     score/turnover/price 条件を満たす候補だけ soft-pass する。
-#   - range/方向確認ガードは維持する。
+#   - 後段 patch が entry_controller filters を再ラップしても、watcher で再適用する。
+#   - 方向確認ガードは維持する。
 # ============================================================
 from __future__ import annotations
 
 import logging
 import os
+import threading
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V1-SUMMARY-AI-LOW-ATR-SOFTPASS"
+VERSION = "V2-ENFORCED-SUMMARY-AI-LOW-ATR-SOFTPASS"
 _INSTALLED = False
+_WATCHER_STARTED = False
 _ORIG_ATR = None
 _ORIG_RANGE = None
 
@@ -168,7 +172,8 @@ def _summary_ai_low_move_softpass_ok(entry_row: Any, *, label: str) -> bool:
     turnover = _turnover(row, close)
     atr = _safe_float(_first(row, ("atr", "atr_1m", "atr_3m", "atr_5m"), 0.0), 0.0)
     atr_ratio = atr / close if close > 0 else 0.0
-    slope = max(abs(_safe_float(row.get(k), 0.0)) for k in ("slope_atr_scaled", "slope", "score_slope", "disp_slope", "_slope") if k in row) if row else 0.0
+    slope_vals = [_safe_float(row.get(k), 0.0) for k in ("slope_atr_scaled", "slope", "score_slope", "disp_slope", "_slope") if k in row]
+    slope = max([abs(x) for x in slope_vals], default=0.0)
 
     min_score = _env_float("SUMMARY_AI_LOW_MOVE_SOFTPASS_MIN_SCORE", 4.0)
     min_turnover = _env_float("SUMMARY_AI_LOW_MOVE_SOFTPASS_MIN_TURNOVER", 10000000.0)
@@ -197,7 +202,7 @@ def _summary_ai_low_move_softpass_ok(entry_row: Any, *, label: str) -> bool:
         return True
 
     logger.warning(
-        "[LOW MOVE GUARD] SUMMARY_AI_LOW_MOVE_SOFTPASS_NG label=%s symbol=%s side=%s close=%.1f score=%.3f/%s volume=%.0f/%s turnover=%.0f/%s atr_ratio=%.6f source=%s entry_type=%s",
+        "[LOW MOVE GUARD] SUMMARY_AI_LOW_MOVE_SOFTPASS_NG label=%s symbol=%s side=%s close=%.1f score=%.3f/%s volume=%.0f/%s turnover=%.0f/%s atr_ratio=%.6f source=%s entry_type=%s version=%s",
         label,
         symbol,
         side,
@@ -211,6 +216,7 @@ def _summary_ai_low_move_softpass_ok(entry_row: Any, *, label: str) -> bool:
         atr_ratio,
         _first(row, ("source", "entry_source", "pipeline_source"), ""),
         _first(row, ("entry_type", "type", "entry_kind"), ""),
+        VERSION,
     )
     return False
 
@@ -226,7 +232,7 @@ def _direction_ok(entry_row: Any) -> bool:
     return True
 
 
-def _wrap_atr_filter(old_func: Any):
+def _wrap_filter(old_func: Any, label: str):
     def _patched(entry_row: Any = None, *args: Any, **kwargs: Any):
         try:
             allow = True
@@ -236,48 +242,71 @@ def _wrap_atr_filter(old_func: Any):
                 return allow
             if bool(allow):
                 return allow
-            if _summary_ai_low_move_softpass_ok(entry_row, label="atr_1m") and _direction_ok(entry_row):
+            if _summary_ai_low_move_softpass_ok(entry_row, label=label) and _direction_ok(entry_row):
                 return True
             return False
         except RecursionError:
-            logger.error("[LOW MOVE GUARD] SUMMARY_AI low move atr wrapper recursion; fail-safe NG", exc_info=False)
+            logger.error("[LOW MOVE GUARD] SUMMARY_AI low move %s wrapper recursion; fail-safe NG", label, exc_info=False)
             return False
         except Exception as e:
-            logger.warning("[LOW MOVE GUARD] SUMMARY_AI low move atr wrapper failed: %s", e, exc_info=False)
+            logger.warning("[LOW MOVE GUARD] SUMMARY_AI low move %s wrapper failed: %s", label, e, exc_info=False)
             return False
 
+    _patched._summary_ai_low_move_softpass_v2 = True  # type: ignore[attr-defined]
     _patched._summary_ai_low_move_softpass_v1 = True  # type: ignore[attr-defined]
     _patched._original = getattr(old_func, "_original", old_func)  # type: ignore[attr-defined]
+    _patched._wrapped_target = old_func  # type: ignore[attr-defined]
     return _patched
 
 
-def _wrap_range_filter(old_func: Any):
-    def _patched(entry_row: Any = None, *args: Any, **kwargs: Any):
-        try:
-            allow = True
-            if callable(old_func):
-                allow = old_func(entry_row, *args, **kwargs)
-            if isinstance(allow, tuple):
-                return allow
-            if bool(allow):
-                return allow
-            if _summary_ai_low_move_softpass_ok(entry_row, label="range_5m") and _direction_ok(entry_row):
-                return True
-            return False
-        except RecursionError:
-            logger.error("[LOW MOVE GUARD] SUMMARY_AI low move range wrapper recursion; fail-safe NG", exc_info=False)
-            return False
-        except Exception as e:
-            logger.warning("[LOW MOVE GUARD] SUMMARY_AI low move range wrapper failed: %s", e, exc_info=False)
-            return False
+def _apply_wrappers(*, reason: str = "install") -> list[str]:
+    global _ORIG_ATR, _ORIG_RANGE
+    changed: list[str] = []
+    try:
+        import trading.handlers.entry_controller as ec
+        old_atr = getattr(ec, "atr_1m_filter", None)
+        old_range = getattr(ec, "range_5m_filter", None)
+        if callable(old_atr) and not getattr(old_atr, "_summary_ai_low_move_softpass_v2", False):
+            _ORIG_ATR = old_atr
+            ec.atr_1m_filter = _wrap_filter(old_atr, "atr_1m")
+            changed.append("atr_1m_filter")
+        if callable(old_range) and not getattr(old_range, "_summary_ai_low_move_softpass_v2", False):
+            _ORIG_RANGE = old_range
+            ec.range_5m_filter = _wrap_filter(old_range, "range_5m")
+            changed.append("range_5m_filter")
+        if changed:
+            logger.warning("[LOW MOVE GUARD] SUMMARY_AI low move softpass applied reason=%s changed=%s version=%s", reason, changed, VERSION)
+    except Exception:
+        logger.exception("[LOW MOVE GUARD] SUMMARY_AI low move softpass apply failed reason=%s", reason)
+    return changed
 
-    _patched._summary_ai_low_move_softpass_v1 = True  # type: ignore[attr-defined]
-    _patched._original = getattr(old_func, "_original", old_func)  # type: ignore[attr-defined]
-    return _patched
+
+def _watcher_loop() -> None:
+    try:
+        loops = int(_env_float("SUMMARY_AI_LOW_MOVE_SOFTPASS_WATCH_LOOPS", 90))
+        sleep_sec = _env_float("SUMMARY_AI_LOW_MOVE_SOFTPASS_WATCH_SLEEP", 1.0)
+        for i in range(max(1, loops)):
+            time.sleep(max(0.2, sleep_sec))
+            _apply_wrappers(reason=f"watcher:{i + 1}")
+        logger.warning("[LOW MOVE GUARD] SUMMARY_AI low move softpass watcher done loops=%s version=%s", loops, VERSION)
+    except Exception:
+        logger.exception("[LOW MOVE GUARD] SUMMARY_AI low move softpass watcher failed")
+
+
+def _start_watcher() -> None:
+    global _WATCHER_STARTED
+    if _WATCHER_STARTED:
+        return
+    if not _env_bool("SUMMARY_AI_LOW_MOVE_SOFTPASS_WATCHER", True):
+        return
+    _WATCHER_STARTED = True
+    th = threading.Thread(target=_watcher_loop, name="summary-ai-low-move-softpass-watcher", daemon=True)
+    th.start()
+    logger.warning("[LOW MOVE GUARD] SUMMARY_AI low move softpass watcher started version=%s", VERSION)
 
 
 def install() -> bool:
-    global _INSTALLED, _ORIG_ATR, _ORIG_RANGE
+    global _INSTALLED
     os.environ.setdefault("SUMMARY_AI_LOW_MOVE_SOFTPASS", "1")
     os.environ.setdefault("SUMMARY_AI_LOW_MOVE_SOFTPASS_MIN_SCORE", "4.0")
     os.environ.setdefault("SUMMARY_AI_LOW_MOVE_SOFTPASS_MIN_TURNOVER", "10000000")
@@ -285,34 +314,28 @@ def install() -> bool:
     os.environ.setdefault("SUMMARY_AI_LOW_MOVE_SOFTPASS_ALLOW_VOLUME_MISSING", "1")
     os.environ.setdefault("SUMMARY_AI_LOW_MOVE_SOFTPASS_MIN_PRICE", "200")
     os.environ.setdefault("SUMMARY_AI_LOW_MOVE_SOFTPASS_MAX_PRICE", "7000")
+    os.environ.setdefault("SUMMARY_AI_LOW_MOVE_SOFTPASS_WATCHER", "1")
+    os.environ.setdefault("SUMMARY_AI_LOW_MOVE_SOFTPASS_WATCH_LOOPS", "90")
+    os.environ.setdefault("SUMMARY_AI_LOW_MOVE_SOFTPASS_WATCH_SLEEP", "1.0")
 
     try:
-        from core.startup import low_movement_entry_guard_patch as lmg
         try:
+            from core.startup import low_movement_entry_guard_patch as lmg
             lmg.install()
         except Exception:
             logger.debug("[LOW MOVE GUARD] base low movement install skipped/failed", exc_info=True)
 
-        import trading.handlers.entry_controller as ec
-        old_atr = getattr(ec, "atr_1m_filter", None)
-        old_range = getattr(ec, "range_5m_filter", None)
-        changed = []
-        if callable(old_atr) and not getattr(old_atr, "_summary_ai_low_move_softpass_v1", False):
-            _ORIG_ATR = old_atr
-            ec.atr_1m_filter = _wrap_atr_filter(old_atr)
-            changed.append("atr_1m_filter")
-        if callable(old_range) and not getattr(old_range, "_summary_ai_low_move_softpass_v1", False):
-            _ORIG_RANGE = old_range
-            ec.range_5m_filter = _wrap_range_filter(old_range)
-            changed.append("range_5m_filter")
+        changed = _apply_wrappers(reason="install")
         _INSTALLED = True
+        _start_watcher()
         logger.warning(
-            "[LOW MOVE GUARD] SUMMARY_AI low move softpass installed=%s changed=%s min_score=%s min_turnover=%s min_volume=%s version=%s",
+            "[LOW MOVE GUARD] SUMMARY_AI low move softpass installed=%s changed=%s min_score=%s min_turnover=%s min_volume=%s watcher=%s version=%s",
             True,
             changed,
             os.getenv("SUMMARY_AI_LOW_MOVE_SOFTPASS_MIN_SCORE"),
             os.getenv("SUMMARY_AI_LOW_MOVE_SOFTPASS_MIN_TURNOVER"),
             os.getenv("SUMMARY_AI_LOW_MOVE_SOFTPASS_MIN_VOLUME"),
+            os.getenv("SUMMARY_AI_LOW_MOVE_SOFTPASS_WATCHER"),
             VERSION,
         )
         return True
