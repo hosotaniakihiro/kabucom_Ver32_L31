@@ -1,16 +1,21 @@
 # ============================================================
 # File   : core/startup/summary_write_gate_runtime_patch.py
-# Version: PRODUCTION-STABLE-REV2-SUMMARY-WRITE-GATE-HUGE-UPsert-SKIP
+# Version: PRODUCTION-STABLE-REV3-SUMMARY-WRITE-GATE-PROCESS-AWARE
 # ------------------------------------------------------------
 # Purpose:
 #   - summary DB の write gate が無制限待ちになり、1m/5m/recovery が
 #     互いに詰まる問題を起動時に緩和する。
-#   - 1分足は短時間だけ待つ。
-#   - 3分/5分/その他は busy 時に長時間待たず skip して次回へ回す。
-#   - 起動時/復旧時の巨大UPSERT(rows=数万〜十万)は、
-#     summary DB を長時間ロックしやすいため同期実行しない。
+#   - main.py / entry-only runtime では、起動時/復旧時の巨大UPSERTを
+#     同期実行せず、リアルタイム発注処理を守る。
+#   - main_database.py / yahoo_complement / summary_database_runner などの
+#     保存担当プロセスでは巨大UPSERTをスキップしない。
 #
-# Why REV2:
+# REV3:
+#   - data_collectors_runner 配下の yahoo_complement で rows=57028 の
+#     1m補完保存が huge upsert skipped になっていたため、プロセス判定を追加。
+#   - DB保存担当では huge_skip を無効化し、chunk/retry で保存を続ける。
+#
+# REV2:
 #   - rows=93165 / chunk=1243 の recovery UPSERT が
 #     BEGIN IMMEDIATE で database is locked になっていた。
 #   - retryを増やしても、他プロセスがsummary DBを触る限り詰まりやすい。
@@ -22,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -56,13 +62,57 @@ def _env_bool(name: str, default: bool) -> bool:
         if v is None:
             return bool(default)
         s = str(v).strip().lower()
-        if s in {"1", "true", "yes", "y", "on"}:
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
             return True
-        if s in {"0", "false", "no", "n", "off"}:
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
             return False
         return bool(default)
     except Exception:
         return bool(default)
+
+
+def _argv_text() -> str:
+    try:
+        return " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+    except Exception:
+        return ""
+
+
+def _is_summary_save_owner_process() -> bool:
+    """summary DB保存を担うプロセスでは巨大UPSERTを捨てない。"""
+    argv = _argv_text()
+    save_owner_markers = (
+        "main_database.py",
+        "data_collectors_runner.py",
+        "summary_database_runner.py",
+        "yahoo_complement",
+        "yahoo_complement_runner",
+        "run_night_yahoo",
+        "run_update_daily_data_from_yahoo",
+        "run_night_yahoo_full_summary",
+        "summary_recovery",
+    )
+    if any(x in argv for x in save_owner_markers):
+        return True
+    return any(
+        _env_bool(x, False)
+        for x in (
+            "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+            "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+            "AUTOSTOCK_SUMMARY_DB_WRITER",
+            "AUTOSTOCK_YAHOO_COMPLEMENT_PROCESS",
+            "SUMMARY_DB_SAVE_OWNER_PROCESS",
+        )
+    )
+
+
+def _is_entry_only_process() -> bool:
+    if _env_bool("SUMMARY_MAIN_ENTRY_ONLY", False):
+        return True
+    argv = _argv_text()
+    if "main.py" in argv and not _is_summary_save_owner_process():
+        return True
+    return False
 
 
 def _interval_int(v: Any, default: int = 1) -> int:
@@ -130,22 +180,32 @@ def install_summary_write_gate_runtime_patch() -> None:
         iv = _interval_int(interval, 1)
         row_count = _safe_len_rows(rows)
         table = _table_name(interval, table_name)
+        save_owner = _is_summary_save_owner_process()
+        entry_only = _is_entry_only_process()
 
         # ----------------------------------------------------
-        # 巨大recovery/closed-market rebuild系UPSERTの同期実行を止める。
+        # 巨大recovery/closed-market rebuild系UPSERTの同期実行制御。
+        # main.py はリアルタイム発注を守るため skip 可。
+        # DB保存担当プロセスは skip せず保存する。
         # ----------------------------------------------------
-        huge_skip_enabled = _env_bool("SUMMARY_SKIP_HUGE_UPSERT", True)
+        huge_skip_default = bool(entry_only and not save_owner)
+        huge_skip_enabled = _env_bool("SUMMARY_SKIP_HUGE_UPSERT", huge_skip_default)
         huge_threshold = _env_int("SUMMARY_HUGE_UPSERT_SKIP_ROWS", 50000)
+
+        if save_owner and _env_bool("SUMMARY_SAVE_OWNER_DISABLE_HUGE_SKIP", True):
+            huge_skip_enabled = False
 
         if huge_skip_enabled and row_count >= huge_threshold:
             logger.error(
                 "[SUMMARY WRITE GATE PATCH] huge upsert skipped to avoid sqlite lock "
-                "interval=%s table=%s rows=%s threshold=%s "
+                "interval=%s table=%s rows=%s threshold=%s save_owner=%s entry_only=%s "
                 "hint=set SUMMARY_SKIP_HUGE_UPSERT=0 to force, or run recovery/night batch separately",
                 iv,
                 table,
                 row_count,
                 huge_threshold,
+                save_owner,
+                entry_only,
             )
             return 0
 
@@ -157,13 +217,21 @@ def install_summary_write_gate_runtime_patch() -> None:
             sleep_base = float(os.environ.get("SUMMARY_UPSERT_SLEEP_BASE", "0.45"))
 
         # 中規模以上はロックを取りに行く時間を短くする。
-        # ここで失敗しても次回tick/夜間バッチで補完する。
+        # 保存担当プロセスでは skip_if_busy を既定で False にして、補完保存を落とさない。
         medium_threshold = _env_int("SUMMARY_MEDIUM_UPSERT_FAST_SKIP_ROWS", 5000)
         if row_count >= medium_threshold:
-            write_gate_timeout = _env_float("SUMMARY_WRITE_GATE_TIMEOUT_HUGE", 0.25)
-            skip_if_busy = True
-            retry = min(int(retry), _env_int("SUMMARY_UPSERT_RETRY_HUGE_MAX", 2))
-            sleep_base = min(float(sleep_base), _env_float("SUMMARY_UPSERT_SLEEP_HUGE_MAX", 0.10))
+            if save_owner:
+                write_gate_timeout = _env_float("SUMMARY_WRITE_GATE_TIMEOUT_SAVE_OWNER_HUGE", 20.0)
+                skip_if_busy = _env_bool("SUMMARY_SAVE_OWNER_HUGE_SKIP_IF_BUSY", False)
+                retry = max(int(retry), _env_int("SUMMARY_UPSERT_RETRY_SAVE_OWNER_HUGE_MIN", 8))
+                sleep_base = min(float(sleep_base), _env_float("SUMMARY_UPSERT_SLEEP_SAVE_OWNER_HUGE_MAX", 0.20))
+                if chunk_size is None:
+                    chunk_size = _env_int("SUMMARY_UPSERT_CHUNK_SAVE_OWNER_HUGE", 250)
+            else:
+                write_gate_timeout = _env_float("SUMMARY_WRITE_GATE_TIMEOUT_HUGE", 0.25)
+                skip_if_busy = True
+                retry = min(int(retry), _env_int("SUMMARY_UPSERT_RETRY_HUGE_MAX", 2))
+                sleep_base = min(float(sleep_base), _env_float("SUMMARY_UPSERT_SLEEP_HUGE_MAX", 0.10))
         elif write_gate_timeout is None:
             if iv == 1:
                 write_gate_timeout = _env_float("SUMMARY_WRITE_GATE_TIMEOUT_1M", 8.0)
@@ -175,7 +243,7 @@ def install_summary_write_gate_runtime_patch() -> None:
                 sleep_base = min(float(sleep_base), float(os.environ.get("SUMMARY_UPSERT_SLEEP_OTHER_MAX", "0.15")))
 
         logger.debug(
-            "[SUMMARY WRITE GATE PATCH] execute_upsert interval=%s table=%s rows=%s timeout=%s skip_if_busy=%s retry=%s sleep=%.3f",
+            "[SUMMARY WRITE GATE PATCH] execute_upsert interval=%s table=%s rows=%s timeout=%s skip_if_busy=%s retry=%s sleep=%.3f save_owner=%s entry_only=%s",
             iv,
             table,
             row_count,
@@ -183,6 +251,8 @@ def install_summary_write_gate_runtime_patch() -> None:
             skip_if_busy,
             int(retry),
             float(sleep_base),
+            save_owner,
+            entry_only,
         )
 
         return original(
@@ -201,12 +271,19 @@ def install_summary_write_gate_runtime_patch() -> None:
 
     _INSTALLED = True
     logger.warning(
-        "[SUMMARY WRITE GATE PATCH] installed 1m_timeout=%.2fs other_timeout=%.2fs other_skip_if_busy=True huge_skip=%s huge_threshold=%s",
+        "[SUMMARY WRITE GATE PATCH] installed rev3 1m_timeout=%.2fs other_timeout=%.2fs other_skip_if_busy=True huge_skip_default_entry_only=%s huge_threshold=%s save_owner=%s argv=%s",
         _env_float("SUMMARY_WRITE_GATE_TIMEOUT_1M", 8.0),
         _env_float("SUMMARY_WRITE_GATE_TIMEOUT_OTHER", 0.25),
-        _env_bool("SUMMARY_SKIP_HUGE_UPSERT", True),
+        _is_entry_only_process() and not _is_summary_save_owner_process(),
         _env_int("SUMMARY_HUGE_UPSERT_SKIP_ROWS", 50000),
+        _is_summary_save_owner_process(),
+        sys.argv,
     )
 
 
-__all__ = ["install_summary_write_gate_runtime_patch"]
+def install() -> bool:
+    install_summary_write_gate_runtime_patch()
+    return True
+
+
+__all__ = ["install_summary_write_gate_runtime_patch", "install"]
