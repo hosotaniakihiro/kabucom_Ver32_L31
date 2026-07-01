@@ -1,17 +1,18 @@
 # ============================================================
 # File   : core/startup/final_entry_board_rest_direct_patch.py
-# Version: V2-FAILOPEN-AWARE-REST-THROTTLE
+# Version: V3-NO-DIRECT-REST-UNLESS-FORCED
 # ------------------------------------------------------------
 # 目的:
-#   SUMMARY_AI / TONOSAMA の発注直前に PUSH 板が無い場合の REST /board fallback。
+#   SUMMARY_AI / TONOSAMA の発注直前に PUSH 板が無い場合、
+#   REST /board を候補ごとに連打して 429(API実行回数エラー) / 4002006(レジスト数エラー)
+#   を起こす経路を止める。
 #
-# V2:
-#   - ENTRY_ALLOW_ENTRY_WITHOUT_BOARD=1 のとき、final_entry_safety_guard では
-#     REST /board を叩き続けず、0を返して board_missing_failopen_runtime_patch の
-#     保護fail-openへ流す。
-#   - 429(API実行回数エラー) / 4002006(レジスト数エラー) が出たら短時間 cooldown し、
-#     同じエラーを候補ごとに連打しない。
-#   - token refresh は行わず、settings.ini の token を token_manager.get_valid_token() から読む。
+# V3:
+#   - ENTRY_BOARD_REST_DIRECT_FORCE=1 が無い通常運用では、
+#     ENTRY_BOARD_REST_DIRECT_ENABLED を強制的に 0 にする。
+#   - final_entry_safety_guard からはまずPUSH板だけを見る。
+#   - PUSH板が無い場合は、board_missing_failopen_runtime_patch の保護fail-openへ流す。
+#   - 非常用にREST板補完を使う場合のみ board_client.fetch_board_snapshot を経由する。
 # ============================================================
 
 from __future__ import annotations
@@ -24,11 +25,9 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V2-FAILOPEN-AWARE-REST-THROTTLE"
+VERSION = "V3-NO-DIRECT-REST-UNLESS-FORCED"
 _INSTALLED = False
 _WATCHER_STARTED = False
-_COOLDOWN_UNTIL = 0.0
-_COOLDOWN_REASON = ""
 
 _TRUE_SET = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 _FALSE_SET = {"0", "false", "no", "n", "off", "ng", "disable", "disabled", ""}
@@ -134,107 +133,53 @@ def _extract_board_values(board: Any) -> tuple[float, float, float, float]:
     return bid, ask, bid_qty, ask_qty
 
 
-def _get_token() -> str:
-    try:
-        import token_manager
-        token = token_manager.get_valid_token()
-        return str(token or "").strip()
-    except Exception:
-        logger.debug("[FINAL ENTRY BOARD REST DIRECT] token_manager.get_valid_token failed", exc_info=True)
-    for key in ("KABU_API_TOKEN", "KABUSAPI_TOKEN", "AUKABU_TOKEN", "API_TOKEN", "TOKEN", "KABU_API_KEY", "X_API_KEY"):
-        val = os.getenv(key)
-        if val:
-            return str(val).strip()
-    return ""
+def _force_disable_direct_rest_if_needed() -> None:
+    # board_retry_patch が setdefault("ENTRY_BOARD_REST_DIRECT_ENABLED", "1") しても、
+    # FORCE指定が無い通常運用では必ず0へ戻す。
+    if not _env_bool("ENTRY_BOARD_REST_DIRECT_FORCE", False):
+        os.environ["ENTRY_BOARD_REST_DIRECT_ENABLED"] = "0"
 
 
-def _cooldown_active() -> bool:
-    try:
-        return time.monotonic() < float(_COOLDOWN_UNTIL)
-    except Exception:
-        return False
-
-
-def _set_cooldown(reason: str) -> None:
-    global _COOLDOWN_UNTIL, _COOLDOWN_REASON
-    sec = max(1.0, _env_float("ENTRY_BOARD_REST_DIRECT_ERROR_COOLDOWN_SEC", 20.0))
-    _COOLDOWN_UNTIL = time.monotonic() + sec
-    _COOLDOWN_REASON = str(reason or "error")
-    logger.warning("[FINAL ENTRY BOARD REST DIRECT] cooldown start reason=%s sec=%.1f version=%s", _COOLDOWN_REASON, sec, VERSION)
-
-
-def _failopen_should_skip_rest(source: str) -> bool:
-    if not _env_bool("ENTRY_BOARD_REST_SKIP_WHEN_FAILOPEN", True):
-        return False
-    if not _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", False):
-        return False
-    src = str(source or "").lower()
-    return "final_entry_safety_guard" in src or src in {"", "summary", "summary_ai"}
-
-
-def _call_board_rest(symbol: str) -> tuple[float, float, float, float]:
-    if not _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", True):
+def _call_board_rest_via_client(symbol: str) -> tuple[float, float, float, float]:
+    _force_disable_direct_rest_if_needed()
+    if not (_env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", False) and _env_bool("ENTRY_BOARD_REST_DIRECT_FORCE", False)):
         return 0.0, 0.0, 0.0, 0.0
+
     sym = _norm_symbol(symbol)
     if not sym:
         return 0.0, 0.0, 0.0, 0.0
-    if _cooldown_active():
-        logger.warning("[FINAL ENTRY BOARD REST DIRECT] cooldown skip symbol=%s reason=%s version=%s", sym, _COOLDOWN_REASON, VERSION)
-        return 0.0, 0.0, 0.0, 0.0
-    token = _get_token()
-    if not token:
-        logger.warning("[FINAL ENTRY BOARD REST DIRECT] TOKEN_MISSING symbol=%s", sym)
+
+    try:
+        from trading.board.board_client import fetch_board_snapshot
+    except Exception:
+        logger.debug("[FINAL ENTRY BOARD REST DIRECT] board_client import failed symbol=%s", sym, exc_info=True)
         return 0.0, 0.0, 0.0, 0.0
 
     timeout = max(0.3, _env_float("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", 0.6))
-    exchanges = [x.strip() for x in str(os.getenv("ENTRY_BOARD_REST_EXCHANGES", "1")).split(",") if x.strip()]
-    if not exchanges:
-        exchanges = ["1"]
-
-    try:
-        import requests  # type: ignore
-    except Exception:
-        logger.warning("[FINAL ENTRY BOARD REST DIRECT] requests import failed symbol=%s", sym)
-        return 0.0, 0.0, 0.0, 0.0
-
+    exchanges = [x.strip() for x in str(os.getenv("ENTRY_BOARD_REST_EXCHANGES", "1")).split(",") if x.strip()] or ["1"]
     for ex in exchanges:
-        url = f"http://localhost:18080/kabusapi/board/{sym}@{ex}"
         try:
-            res = requests.get(url, headers={"X-API-KEY": token}, timeout=timeout)
-            status = getattr(res, "status_code", None)
-            if status != 200:
-                text_head = str(getattr(res, "text", ""))[:180]
-                logger.warning("[FINAL ENTRY BOARD REST DIRECT] REST_NG symbol=%s exchange=%s status=%s text=%s", sym, ex, status, text_head)
-                if status in {400, 429}:
-                    _set_cooldown(f"status_{status}")
-                continue
-            try:
-                data = res.json()
-            except Exception:
-                logger.warning("[FINAL ENTRY BOARD REST DIRECT] REST_JSON_NG symbol=%s exchange=%s text_head=%s", sym, ex, str(getattr(res, 'text', ''))[:120])
-                continue
-            bid, ask, bid_qty, ask_qty = _extract_board_values(data)
+            snap = fetch_board_snapshot(sym, exchange=int(ex), timeout=timeout, levels=5)
+            bid, ask, bid_qty, ask_qty = _extract_board_values(snap)
             if bid > 0 and ask > 0:
                 logger.warning(
-                    "[FINAL ENTRY BOARD REST DIRECT] REST_BOARD_OK symbol=%s exchange=%s bid=%.4f ask=%.4f bid_qty=%.0f ask_qty=%.0f version=%s",
+                    "[FINAL ENTRY BOARD REST DIRECT] BOARD_CLIENT_OK symbol=%s exchange=%s bid=%.4f ask=%.4f cache=%s version=%s",
                     sym,
                     ex,
                     bid,
                     ask,
-                    bid_qty,
-                    ask_qty,
+                    bool(isinstance(snap, dict) and snap.get("cache_hit")),
                     VERSION,
                 )
                 return bid, ask, bid_qty, ask_qty
-            logger.warning("[FINAL ENTRY BOARD REST DIRECT] REST_BOARD_EMPTY symbol=%s exchange=%s keys=%s", sym, ex, sorted(list(data.keys()))[:20] if isinstance(data, dict) else type(data).__name__)
-        except Exception as exc:
-            logger.warning("[FINAL ENTRY BOARD REST DIRECT] REST_ERROR symbol=%s exchange=%s error=%r", sym, ex, exc)
-            _set_cooldown("exception")
+        except Exception:
+            logger.debug("[FINAL ENTRY BOARD REST DIRECT] board_client lookup failed symbol=%s exchange=%s", sym, ex, exc_info=True)
     return 0.0, 0.0, 0.0, 0.0
 
 
 def _make_try_get_bid_ask_from_api():
     def _try_get_bid_ask_from_api(symbol: str, side: str = "", source: str = "final_entry_safety_guard") -> tuple[float, float, float, float]:
+        _force_disable_direct_rest_if_needed()
         try:
             from utils_common import get_latest_bid_ask
             try:
@@ -248,39 +193,40 @@ def _make_try_get_bid_ask_from_api():
         except Exception:
             logger.debug("[FINAL ENTRY BOARD REST DIRECT] push board lookup failed symbol=%s", symbol, exc_info=True)
 
-        if _failopen_should_skip_rest(source):
+        # 通常はここでRESTを叩かず、0を返して fail-open/hard-block 側に判断させる。
+        bid, ask, bid_qty, ask_qty = _call_board_rest_via_client(symbol)
+        if bid <= 0 or ask <= 0:
             logger.warning(
-                "[FINAL ENTRY BOARD REST DIRECT] REST_SKIP_FAILOPEN symbol=%s side=%s source=%s allow_without_board=%s version=%s",
+                "[FINAL ENTRY BOARD REST DIRECT] REST_DISABLED_OR_EMPTY symbol=%s side=%s source=%s direct_enabled=%s force=%s version=%s",
                 _norm_symbol(symbol),
                 side,
                 source,
-                os.getenv("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"),
+                _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", False),
+                _env_bool("ENTRY_BOARD_REST_DIRECT_FORCE", False),
                 VERSION,
             )
-            return 0.0, 0.0, 0.0, 0.0
-        return _call_board_rest(symbol)
+        return bid, ask, bid_qty, ask_qty
 
-    _try_get_bid_ask_from_api._final_entry_board_rest_direct_v1 = True  # type: ignore[attr-defined]
+    _try_get_bid_ask_from_api._final_entry_board_rest_direct_v3 = True  # type: ignore[attr-defined]
     _try_get_bid_ask_from_api._final_entry_board_rest_direct_v2 = True  # type: ignore[attr-defined]
+    _try_get_bid_ask_from_api._final_entry_board_rest_direct_v1 = True  # type: ignore[attr-defined]
     return _try_get_bid_ask_from_api
 
 
 def _install_once(log_patch: bool = True) -> bool:
     global _INSTALLED
     try:
+        _force_disable_direct_rest_if_needed()
         import core.startup.final_entry_safety_guard_patch as fsg
-        fn = _make_try_get_bid_ask_from_api()
-        fsg._try_get_bid_ask_from_api = fn
+        fsg._try_get_bid_ask_from_api = _make_try_get_bid_ask_from_api()
         _INSTALLED = True
         if log_patch:
             logger.warning(
-                "[FINAL ENTRY BOARD REST DIRECT] installed v2 rest_direct=%s skip_when_failopen=%s exchanges=%s timeout=%.2fs cooldown_sec=%.1f allow_without_board=%s version=%s",
-                _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", True),
-                _env_bool("ENTRY_BOARD_REST_SKIP_WHEN_FAILOPEN", True),
-                os.getenv("ENTRY_BOARD_REST_EXCHANGES", "1"),
-                _env_float("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", 0.6),
-                _env_float("ENTRY_BOARD_REST_DIRECT_ERROR_COOLDOWN_SEC", 20.0),
-                os.getenv("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"),
+                "[FINAL ENTRY BOARD REST DIRECT] installed v3 direct_enabled=%s force=%s hard_block=%s allow_without_board=%s version=%s",
+                _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", False),
+                _env_bool("ENTRY_BOARD_REST_DIRECT_FORCE", False),
+                _env_bool("ENTRY_BOARD_MISSING_HARD_BLOCK", True),
+                _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", False),
                 VERSION,
             )
         return True
@@ -301,9 +247,6 @@ def _watcher() -> None:
 
 def install() -> bool:
     global _WATCHER_STARTED
-    os.environ.setdefault("ENTRY_BOARD_REST_SKIP_WHEN_FAILOPEN", "1")
-    os.environ.setdefault("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", "0.6")
-    os.environ.setdefault("ENTRY_BOARD_REST_DIRECT_ERROR_COOLDOWN_SEC", "20")
     ok = _install_once(log_patch=True)
     if not _WATCHER_STARTED:
         _WATCHER_STARTED = True
