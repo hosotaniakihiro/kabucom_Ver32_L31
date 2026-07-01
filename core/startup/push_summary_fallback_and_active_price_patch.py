@@ -2,6 +2,13 @@
 """
 Runtime fixes for startup PUSH/summary/active-symbol issues.
 
+REV5:
+  - main.py 1m summary must never read pushYYYYMMDD.db raw fallback.
+  - 2026-07-01 10:19 logs showed REV4 raw DB fallback still made PUSH-1m take
+    93 seconds while PUSH memory itself was alive.
+  - Add hard main.py + interval=1 guards in both _load_recent_push_raw_summary()
+    and patched_fallback_push_summary_df().
+
 REV4:
   - 2026-07-01 09:12 logs showed summary_database used previous-day
     PUSH summary rows: latest_dt=2026-06-30 15:19:00 while now=2026-07-01.
@@ -34,7 +41,7 @@ from typing import Any, Dict, Iterable
 import pandas as pd
 
 logger = logging.getLogger(__name__)
-VERSION = "REV4-PUSH-FALLBACK-SAME-DAY-GUARD"
+VERSION = "REV5-MAIN-1M-NO-RAW-DB-FALLBACK"
 _INSTALLED = False
 
 
@@ -67,6 +74,27 @@ def _is_main_py_process() -> bool:
     try:
         argv = [str(x).replace("\\", "/").lower() for x in sys.argv]
         return any(x.endswith("/main.py") or x == "main.py" for x in argv)
+    except Exception:
+        return False
+
+
+def _main_1m_raw_db_fallback_blocked(interval_i: int) -> bool:
+    """main.pyの1分足ではraw/NAS DB fallbackを使わない。
+
+    main_database.py がPUSH DB保存と重いsummary復元を担当するため、main.py側で
+    pushYYYYMMDD.dbを読むとエントリー遅延になる。必要な場合だけ
+    PUSH_SUMMARY_RAW_DB_FALLBACK_RUN_IN_MAIN=1 で戻せる。
+    """
+    try:
+        if int(interval_i) != 1:
+            return False
+        if not _is_main_py_process():
+            return False
+        if _env_bool("PUSH_SUMMARY_RAW_DB_FALLBACK_RUN_IN_MAIN", False):
+            return False
+        if not _env_bool("SUMMARY_MAIN_DISABLE_RAW_DB_FALLBACK", True):
+            return False
+        return True
     except Exception:
         return False
 
@@ -158,8 +186,6 @@ def _same_day_push_rows(df: pd.DataFrame, *, now_i: dt.datetime, label: str = ""
         x["datetime"] = _normalize_dt_series(x["datetime"])
         before = len(x)
         day = _today_date(now_i)
-        # Allow only today's rows. Future rows are removed separately by normal pipeline,
-        # but keeping same-day here avoids previous session rows being ranked as live data.
         x = x.dropna(subset=["datetime"])
         x = x[x["datetime"].dt.date == day].copy()
         if len(x) != before:
@@ -227,7 +253,6 @@ def _patched_summary_price_fallback_map(symbols: Iterable[str]) -> Dict[str, Dic
             VERSION,
         )
         return {}
-
     path = _summary_db_path()
     if not path or not Path(path).exists():
         logger.warning("[ACTIVE SUMMARY PRICE FALLBACK] db not found path=%s symbols=%d patch=%s", path, len(cleaned), VERSION)
@@ -355,6 +380,13 @@ def _safe_to_num(s):
 
 
 def _load_recent_push_raw_summary(interval_i: int, *, now_i: dt.datetime) -> pd.DataFrame:
+    if _main_1m_raw_db_fallback_blocked(interval_i):
+        logger.warning(
+            "[PUSH RAW DB FALLBACK] blocked in main.py interval=%s reason=main_1m_no_raw_db patch=%s",
+            interval_i,
+            VERSION,
+        )
+        return pd.DataFrame()
     if not _env_bool("PUSH_SUMMARY_RAW_DB_FALLBACK_ENABLED", True):
         return pd.DataFrame()
     path = _push_db_path()
@@ -497,8 +529,6 @@ def _patch_push_summary_fallback() -> bool:
             if x.empty or "source" not in x.columns:
                 return x
             try:
-                # The filter may be called without explicit now. Use current local time
-                # to prevent previous-day rows from surviving in summary_database.
                 now_i = fl.now_naive().replace(tzinfo=None, microsecond=0)
                 if "datetime" in x.columns:
                     x = _same_day_push_rows(x, now_i=now_i, label="filter_push_like_rows.input")
@@ -563,6 +593,36 @@ def _patch_push_summary_fallback() -> bool:
             interval_i = int(interval)
             now_i = (now or fl.now_naive()).replace(tzinfo=None, microsecond=0)
 
+            if _main_1m_raw_db_fallback_blocked(interval_i):
+                logger.warning(
+                    "[summary.fallback_loader] REV5 main 1m raw/db fallback disabled interval=%s patch=%s",
+                    interval_i,
+                    VERSION,
+                )
+                if callable(orig_fallback):
+                    try:
+                        df0 = orig_fallback(interval_i, now=now_i)
+                        df0 = _prepare_candidate(df0, interval_i, now_i, f"orig_fallback.main_no_raw.interval{interval_i}")
+                        if isinstance(df0, pd.DataFrame) and not df0.empty:
+                            logger.warning(
+                                "[summary.fallback_loader] selected original memory fallback interval=%s rows=%s symbols=%s latest_dt=%s patch=%s",
+                                interval_i,
+                                len(df0),
+                                fl.symbols_count(df0),
+                                fl.latest_dt_str(df0),
+                                VERSION,
+                            )
+                            return df0.reset_index(drop=True)
+                    except Exception:
+                        logger.debug("[summary.fallback_loader] original memory fallback failed interval=%s", interval_i, exc_info=True)
+                logger.warning(
+                    "[summary.fallback_loader] REV5 main 1m fallback empty without raw/db interval=%s now=%s patch=%s",
+                    interval_i,
+                    now_i,
+                    VERSION,
+                )
+                return pd.DataFrame()
+
             raw_df = _load_recent_push_raw_summary(interval_i, now_i=now_i)
             raw_df = _prepare_candidate(raw_df, interval_i, now_i, f"raw_db.interval{interval_i}")
             if isinstance(raw_df, pd.DataFrame) and not raw_df.empty:
@@ -624,7 +684,12 @@ def _patch_push_summary_fallback() -> bool:
         except Exception:
             pass
 
-        logger.warning("[PUSH SUMMARY FALLBACK PATCH] installed version=%s raw_db_fallback=True same_day_guard=True", VERSION)
+        logger.warning(
+            "[PUSH SUMMARY FALLBACK PATCH] installed version=%s raw_db_fallback=%s same_day_guard=True main_1m_raw_db_blocked=%s",
+            VERSION,
+            os.getenv("PUSH_SUMMARY_RAW_DB_FALLBACK_ENABLED", "1"),
+            _main_1m_raw_db_fallback_blocked(1),
+        )
         return True
     except Exception:
         logger.exception("[PUSH SUMMARY FALLBACK PATCH] install failed version=%s", VERSION)
@@ -635,10 +700,12 @@ def install() -> bool:
     global _INSTALLED
     if _INSTALLED:
         return True
+    os.environ.setdefault("SUMMARY_MAIN_DISABLE_RAW_DB_FALLBACK", "1")
+    os.environ.setdefault("PUSH_SUMMARY_RAW_DB_FALLBACK_RUN_IN_MAIN", "0")
     ok1 = _patch_active_price_sql()
     ok2 = _patch_push_summary_fallback()
     _INSTALLED = bool(ok1 or ok2)
-    logger.warning("[PUSH SUMMARY/ACTIVE PRICE PATCH] installed=%s price=%s push_fallback=%s version=%s", _INSTALLED, ok1, ok2, VERSION)
+    logger.warning("[PUSH SUMMARY/ACTIVE PRICE PATCH] installed=%s price=%s push_fallback=%s version=%s main_1m_raw_db_blocked=%s", _INSTALLED, ok1, ok2, VERSION, _main_1m_raw_db_fallback_blocked(1))
     return _INSTALLED
 
 
