@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/push/push_stream/__init__.py
-# Version: Ver1.6-PUSH-ROTATION-LIQ-KEEP100-PATCH
+# Version: Ver1.7-PUSH-ROTATION-LIQ-KEEP100-MAIN-WS-GUARD
 # ------------------------------------------------------------
 # ✔ 旧 trading.push.push_stream 公開API互換
 # ✔ 分割後モジュールの再エクスポート
@@ -11,11 +11,13 @@
 # ✔ main_database.py 分離運用時、main.py側からのPUSH受信起動をno-op化
 # ✔ PUSH rotation stability patch を自動適用
 # ✔ rotation用 liquidity guard で100→50へ崩れる問題を補正
+# ✔ runner module を直接importされた場合も main.py 側の重複WS起動を止める
 # ============================================================
 
 from __future__ import annotations
 
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -57,19 +59,60 @@ from .dataframe import (
 )
 from .rotation_register import register_symbols
 from .rotation_core import enable_rotation
-from .runner import (
-    start_push_stream as _runner_start_push_stream,
-    stop_push_stream,
-    get_status,
-)
+from . import runner as _runner_mod
+
+_runner_start_push_stream = _runner_mod.start_push_stream
+stop_push_stream = _runner_mod.stop_push_stream
+get_status = _runner_mod.get_status
+
+_TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in _TRUE
+    except Exception:
+        return bool(default)
 
 
 def _should_skip_push_stream_start_in_main() -> bool:
+    """
+    main_database.py 分離運用では PUSH WebSocket 接続も main_database.py 側に一本化する。
+
+    理由:
+      kabu Station PUSH WS を main.py と main_database.py の両方で張ると、
+      DISCONNECTED/CONNECTED を数秒ごとに繰り返し、main.py側 summary が stale になる。
+
+    非常用で main.py 側のWSを明示的に使いたい場合のみ:
+      AUTOSTOCK_MAIN_PUSH_WS_ENABLED=1
+    """
+    if _env_bool("AUTOSTOCK_MAIN_PUSH_WS_ENABLED", False):
+        return False
     try:
-        from data_collectors.split_mode import should_skip_data_collector_work_in_main
-        return bool(should_skip_data_collector_work_in_main())
+        from data_collectors.split_mode import (
+            is_data_collector_process,
+            should_skip_data_collector_work_in_main,
+            external_data_collectors_enabled,
+        )
+        if bool(is_data_collector_process()):
+            return False
+        return bool(external_data_collectors_enabled()) and bool(should_skip_data_collector_work_in_main())
     except Exception:
         return False
+
+
+def _mark_main_ws_skipped() -> None:
+    try:
+        from .runtime import _safe_set_runtime
+        _safe_set_runtime("push_stream_running", False)
+        _safe_set_runtime("push_writer_running", False)
+        _safe_set_runtime("push_stream_memory_only", True)
+        _safe_set_runtime("push_stream_ws_skipped_in_main", True)
+    except Exception:
+        pass
 
 
 def start_push_stream(*args, **kwargs):
@@ -78,12 +121,14 @@ def start_push_stream(*args, **kwargs):
 
     main_database.py 分離運用時:
       - main_database.py / data_collectors_runner.py 側では通常起動
-      - main.py 側から呼ばれた場合は二重起動防止のため no-op
+      - main.py 側から呼ばれた場合は二重WebSocket接続防止のため no-op
     """
     if _should_skip_push_stream_start_in_main():
+        _mark_main_ws_skipped()
         logger.warning(
-            "[push_stream] start skipped in main process because "
-            "AUTOSTOCK_EXTERNAL_DATA_COLLECTORS=1; main_database.py handles PUSH."
+            "[push_stream] WS start skipped in main process; "
+            "main_database.py handles PUSH WebSocket/registration/storage. "
+            "Set AUTOSTOCK_MAIN_PUSH_WS_ENABLED=1 only for emergency standalone mode."
         )
         return None
 
@@ -96,6 +141,16 @@ def start(*args, **kwargs):
 
 def run_background(*args, **kwargs):
     return start_push_stream(*args, **kwargs)
+
+
+# 直接 `from trading.push.push_stream import runner` された後に
+# runner.start_push_stream を呼ばれる経路も同じguardへ寄せる。
+try:
+    _runner_mod.start_push_stream = start_push_stream
+    _runner_mod.start = start
+    _runner_mod.run_background = run_background
+except Exception:
+    logger.debug("[push_stream] runner guard patch failed", exc_info=True)
 
 
 __all__ = [
