@@ -1,18 +1,25 @@
 # ============================================================
 # File   : core/startup/summary_ai_async_direct_dispatch_patch.py
-# Version: V4-RETRY-REGISTERED-NO-ORDER
+# Version: V5-LATEST-ONLY-DIRECT-SNAPSHOT-FIRST
 # ------------------------------------------------------------
 # 目的:
 #   SUMMARY AI が AI_OK を出しても、summary_ai_async_entry_patch が
 #   executed=False / skip=queued_async を返したまま実際の entry_controller
 #   dispatch が薄いケースを救済する。
 #
+# V5:
+#   - 古い direct dispatch thread を latest-only で破棄する。
+#   - pending 登録前の stale skip / no_pending_registered を避けるため、
+#     まず trading.summary.summary_entry.execute_entry_pipeline を直接実行する。
+#     summary_ai_async_entry_patch 側の DIRECT SNAPSHOT patch が入っていれば、
+#     approved_rows から entry_controller._execute_best_candidate へ進む。
+#   - direct snapshot で no order の場合のみ、従来の run_summary_entry_executor
+#     へ fallback/retry する。
+#
 # V4:
 #   - run_summary_entry_executor の戻り値が registered>0 でも、executed=False
 #     / snapshot_no_order / entry_controller_no_order の場合は成功扱いで
 #     打ち切らず、次attemptへ進める。
-#   - 2026-06-29ログで approved=3 registered=3 attempted_count=3 なのに
-#     result=[ok=False,...] で no_order のまま direct dispatch が止まったため。
 #   - retryable no-order の reason_chain をログに出す。
 # ============================================================
 from __future__ import annotations
@@ -42,6 +49,7 @@ _RETRYABLE_NO_ORDER_MARKERS = (
     "entry_controller_lock_timeout",
     "pipeline_busy",
     "already_running",
+    "no_pending_registered",
 )
 
 
@@ -139,8 +147,6 @@ def _result_executed(result: Any) -> bool:
             for key in ("executed_count", "order_count", "submitted_count", "sent_count", "approved_count"):
                 try:
                     if int(result.get(key) or 0) > 0:
-                        # approved_count alone is only execution when explicit executed=True is absent?
-                        # For nested direct snapshot, approved_count is actual order-approved count.
                         if key == "approved_count" and not bool(result.get("executed")):
                             continue
                         return True
@@ -208,25 +214,98 @@ def _is_retryable_no_order(result: Any) -> bool:
         return False
 
 
+def _is_latest_seq(seq: int) -> bool:
+    if not _env_bool("SUMMARY_AI_DIRECT_DISPATCH_LATEST_ONLY", True):
+        return True
+    try:
+        with _LOCK:
+            return int(seq) == int(_SEQ)
+    except Exception:
+        return True
+
+
+def _direct_snapshot_execute(approved_rows: list[Any], interval: Any) -> Any:
+    """pending を経由せず、SUMMARY AI 承認済み候補を直接 entry pipeline へ渡す。"""
+    if not _env_bool("SUMMARY_AI_DIRECT_DISPATCH_SNAPSHOT_FIRST", True):
+        return None
+    try:
+        from trading.summary import summary_entry as se
+        fn = getattr(se, "execute_entry_pipeline", None)
+        if not callable(fn):
+            return None
+        return fn(approved_rows, pipeline_source="SUMMARY_AI", interval=interval)
+    except TypeError:
+        try:
+            from trading.summary import summary_entry as se
+            fn = getattr(se, "execute_entry_pipeline", None)
+            if callable(fn):
+                return fn(approved_rows)
+        except Exception:
+            logger.exception("[SUMMARY AI DIRECT DISPATCH] direct snapshot fallback failed")
+    except Exception:
+        logger.exception("[SUMMARY AI DIRECT DISPATCH] direct snapshot failed")
+    return None
+
+
 def _direct_worker(seq: int, approved_rows: list[Any], df_summary: Any, interval: Any, max_attempts: int) -> None:
-    delay = max(0.0, _env_float("SUMMARY_AI_DIRECT_DISPATCH_DELAY_SEC", 0.35))
+    delay = max(0.0, _env_float("SUMMARY_AI_DIRECT_DISPATCH_DELAY_SEC", 0.10))
     if delay > 0:
         time.sleep(delay)
+    if not _is_latest_seq(seq):
+        logger.warning(
+            "[SUMMARY AI DIRECT DISPATCH] skip old seq=%s latest_only=True symbols=%s",
+            seq,
+            _symbols(approved_rows),
+        )
+        return
+
+    # First path: direct snapshot. This avoids stale/no_pending_registered caused by pending registration.
+    if _env_bool("SUMMARY_AI_DIRECT_DISPATCH_SNAPSHOT_FIRST", True):
+        started = time.time()
+        logger.warning(
+            "[SUMMARY AI DIRECT DISPATCH] snapshot-first start seq=%s interval=%s approved=%s symbols=%s",
+            seq,
+            interval,
+            len(approved_rows),
+            _symbols(approved_rows),
+        )
+        snap_result = _direct_snapshot_execute(approved_rows, interval)
+        logger.warning(
+            "[SUMMARY AI DIRECT DISPATCH] snapshot-first done seq=%s elapsed=%.3fs executed=%s reason_chain=%s result=%s",
+            seq,
+            time.time() - started,
+            _result_executed(snap_result),
+            _flatten_reasons(snap_result),
+            snap_result,
+        )
+        if _result_executed(snap_result):
+            return
+        if snap_result is not None and not _is_retryable_no_order(snap_result):
+            return
+
     try:
         from trading.summary.summary_entry import run_summary_entry_executor
     except Exception:
         logger.exception("[SUMMARY AI DIRECT DISPATCH] import run_summary_entry_executor failed seq=%s", seq)
         return
 
-    retry_sleep = max(0.5, _env_float("SUMMARY_AI_DIRECT_DISPATCH_RETRY_SLEEP_SEC", 1.0))
+    retry_sleep = max(0.3, _env_float("SUMMARY_AI_DIRECT_DISPATCH_RETRY_SLEEP_SEC", 0.7))
     attempts = max(1, max_attempts)
     last_result: Any = None
 
     for attempt in range(1, attempts + 1):
+        if not _is_latest_seq(seq):
+            logger.warning(
+                "[SUMMARY AI DIRECT DISPATCH] stop old seq before attempt seq=%s attempt=%s latest_only=True symbols=%s",
+                seq,
+                attempt,
+                _symbols(approved_rows),
+            )
+            return
         started = time.time()
         try:
             logger.warning(
-                "[SUMMARY AI DIRECT DISPATCH] start seq=%s attempt=%s/%s interval=%s approved=%s symbols=%s",
+                "[SUMMARY AI DIRECT DISPATCH] fallback start seq=%s attempt=%s/%s interval=%s approved=%s symbols=%s",
                 seq,
                 attempt,
                 attempts,
@@ -241,7 +320,7 @@ def _direct_worker(seq: int, approved_rows: list[Any], df_summary: Any, interval
             reason_chain = _flatten_reasons(result)
             retryable = _is_retryable_no_order(result)
             logger.warning(
-                "[SUMMARY AI DIRECT DISPATCH] done seq=%s attempt=%s/%s elapsed=%.3fs executed=%s registered=%s retryable_no_order=%s reason_chain=%s result=%s",
+                "[SUMMARY AI DIRECT DISPATCH] fallback done seq=%s attempt=%s/%s elapsed=%.3fs executed=%s registered=%s retryable_no_order=%s reason_chain=%s result=%s",
                 seq,
                 attempt,
                 attempts,
@@ -257,7 +336,7 @@ def _direct_worker(seq: int, approved_rows: list[Any], df_summary: Any, interval
             if not retryable:
                 return
         except Exception:
-            logger.exception("[SUMMARY AI DIRECT DISPATCH] failed seq=%s attempt=%s/%s", seq, attempt, attempts)
+            logger.exception("[SUMMARY AI DIRECT DISPATCH] fallback failed seq=%s attempt=%s/%s", seq, attempt, attempts)
         if attempt < attempts:
             logger.warning(
                 "[SUMMARY AI DIRECT DISPATCH] retry no-order seq=%s next_attempt=%s/%s sleep=%.2fs symbols=%s last_reason=%s",
@@ -286,7 +365,7 @@ def _patched_execute_ai_ok_entries_bulk(*args: Any, **kwargs: Any):
             return result
         df_summary = kwargs.get("df_summary")
         interval = kwargs.get("interval", 1)
-        max_attempts = max(1, _env_int("SUMMARY_AI_DIRECT_DISPATCH_MAX_ATTEMPTS", 3))
+        max_attempts = max(1, _env_int("SUMMARY_AI_DIRECT_DISPATCH_MAX_ATTEMPTS", 2))
         with _LOCK:
             _SEQ += 1
             seq = _SEQ
@@ -297,13 +376,15 @@ def _patched_execute_ai_ok_entries_bulk(*args: Any, **kwargs: Any):
             name=f"summary-ai-direct-dispatch-{seq}",
         ).start()
         logger.warning(
-            "[SUMMARY AI DIRECT DISPATCH] scheduled seq=%s interval=%s approved=%s symbols=%s original_skip=%s attempts=%s",
+            "[SUMMARY AI DIRECT DISPATCH] scheduled seq=%s interval=%s approved=%s symbols=%s original_skip=%s attempts=%s latest_only=%s snapshot_first=%s",
             seq,
             interval,
             len(approved_rows),
             _symbols(approved_rows),
             result.get("skip_reason") if isinstance(result, dict) else None,
             max_attempts,
+            _env_bool("SUMMARY_AI_DIRECT_DISPATCH_LATEST_ONLY", True),
+            _env_bool("SUMMARY_AI_DIRECT_DISPATCH_SNAPSHOT_FIRST", True),
         )
         if isinstance(result, dict):
             out = dict(result)
@@ -324,24 +405,27 @@ def _patch_once(*, log_patch: bool = True) -> bool:
         if not callable(cur):
             logger.debug("[SUMMARY AI DIRECT DISPATCH] target missing")
             return False
-        if getattr(cur, "_summary_ai_direct_dispatch_v4", False):
+        if getattr(cur, "_summary_ai_direct_dispatch_v5", False):
             _INSTALLED = True
             return True
-        _ORIG = getattr(cur, "_original", cur) if getattr(cur, "_summary_ai_direct_dispatch_v3", False) else cur
+        _ORIG = getattr(cur, "_original", cur) if getattr(cur, "_summary_ai_direct_dispatch_v4", False) else cur
         _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v1 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v2 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v3 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v4 = True  # type: ignore[attr-defined]
+        _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v5 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._original = _ORIG  # type: ignore[attr-defined]
         exec_mod.execute_ai_ok_entries_bulk = _patched_execute_ai_ok_entries_bulk
         runner_mod.execute_ai_ok_entries_bulk = _patched_execute_ai_ok_entries_bulk
         _INSTALLED = True
         if log_patch:
             logger.warning(
-                "[SUMMARY AI DIRECT DISPATCH] patched target=%s delay=%.2fs attempts=%s retry_registered_no_order=True",
+                "[SUMMARY AI DIRECT DISPATCH] patched v5 target=%s delay=%.2fs attempts=%s latest_only=%s snapshot_first=%s",
                 getattr(_ORIG, "__name__", type(_ORIG).__name__),
-                _env_float("SUMMARY_AI_DIRECT_DISPATCH_DELAY_SEC", 0.35),
-                _env_int("SUMMARY_AI_DIRECT_DISPATCH_MAX_ATTEMPTS", 3),
+                _env_float("SUMMARY_AI_DIRECT_DISPATCH_DELAY_SEC", 0.10),
+                _env_int("SUMMARY_AI_DIRECT_DISPATCH_MAX_ATTEMPTS", 2),
+                _env_bool("SUMMARY_AI_DIRECT_DISPATCH_LATEST_ONLY", True),
+                _env_bool("SUMMARY_AI_DIRECT_DISPATCH_SNAPSHOT_FIRST", True),
             )
         return True
     except Exception:
@@ -355,7 +439,7 @@ def _watch_reinstall() -> None:
     for i in range(loops):
         ok = _patch_once(log_patch=False)
         if i in (0, loops - 1):
-            logger.warning("[SUMMARY AI DIRECT DISPATCH] enforce v4 i=%s/%s ok=%s", i, loops, ok)
+            logger.warning("[SUMMARY AI DIRECT DISPATCH] enforce v5 i=%s/%s ok=%s", i, loops, ok)
         time.sleep(sleep_sec)
 
 
@@ -364,6 +448,11 @@ def install() -> bool:
     if not _env_bool("SUMMARY_AI_DIRECT_DISPATCH_ON_QUEUED_ASYNC", True):
         logger.warning("[SUMMARY AI DIRECT DISPATCH] disabled by env")
         return False
+    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_LATEST_ONLY", "1")
+    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_SNAPSHOT_FIRST", "1")
+    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_DELAY_SEC", "0.10")
+    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_MAX_ATTEMPTS", "2")
+    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_RETRY_SLEEP_SEC", "0.7")
     if _INSTALLED and _WATCHER_STARTED:
         return True
     ok = _patch_once()
@@ -371,11 +460,13 @@ def install() -> bool:
         _WATCHER_STARTED = True
         threading.Thread(target=_watch_reinstall, daemon=True, name="summary-ai-direct-dispatch-enforcer").start()
         logger.warning(
-            "[SUMMARY AI DIRECT DISPATCH] installed/enforcing v4 ok=%s watcher=%s loops=%s sleep=%s",
+            "[SUMMARY AI DIRECT DISPATCH] installed/enforcing v5 ok=%s watcher=%s loops=%s sleep=%s latest_only=%s snapshot_first=%s",
             ok,
             _WATCHER_STARTED,
             _env_int("SUMMARY_AI_DIRECT_DISPATCH_WATCH_LOOPS", 12),
             _env_float("SUMMARY_AI_DIRECT_DISPATCH_WATCH_SLEEP_SEC", 2.0),
+            _env_bool("SUMMARY_AI_DIRECT_DISPATCH_LATEST_ONLY", True),
+            _env_bool("SUMMARY_AI_DIRECT_DISPATCH_SNAPSHOT_FIRST", True),
         )
     return bool(ok)
 
