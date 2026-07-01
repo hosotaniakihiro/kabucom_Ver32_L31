@@ -1,23 +1,19 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver54-TONOSAMA-DATETIME-TZ-GUARD
+# Version: Ver55-FORCE-MAIN-DIRECT-PUSH-1M
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # main.py は軽量同期 + background install。
 # DB/data collector系はDB専用の最小同期パッチだけにして起動を軽くする。
 # 救済/fail-open系はデフォルトOFFにして、本体判定を優先する。
 #
+# V55:
+#   - main.py の summary 1m が後続background patchで重いrunnerへ戻される問題を防ぐため、
+#     SUMMARY_FORCE_DIRECT_1M を sync / background / final の3段で再適用する。
+#
 # V54:
 #   - TONOSAMA raw1 history の tz-aware / tz-naive datetime 混在を
 #     JST tz-naive に揃える TONOSAMA_DT_TZ_GUARD を追加。
-#
-# V53:
-#   - indicator_short_history_patch._profile の int(NaN) 落ちを防ぐ
-#     IND_SHORT_PROFILE_GUARD をDB同期パッチへ追加。
-#
-# V52:
-#   - ACTIVE が symbol_flags 等で98件止まりになる場合に、適格銘柄から
-#     100件へ補充する ACTIVE_SYMBOL_TARGET_FILL を追加。
 # ============================================================
 from __future__ import annotations
 
@@ -238,7 +234,6 @@ def _install_summary_mtf_catchup_safely() -> None:
 
 
 DB_SYNC_PATCHES = [
-    ("core.startup.indicator_short_history_nan_profile_guard_patch", "IND_SHORT_PROFILE_GUARD", "DISABLE_IND_SHORT_PROFILE_GUARD_PATCH"),
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
     ("core.startup.yahoo_summary_direct_upsert_conflict_patch", "YAHOO_DIRECT_UPSERT_CONFLICT", "DISABLE_YAHOO_DIRECT_UPSERT_CONFLICT_PATCH"),
     ("core.startup.summary_stale_guard_patch", "SUMMARY_STALE_GUARD", "DISABLE_SUMMARY_STALE_GUARD_PATCH"),
@@ -259,6 +254,7 @@ SYNC_MAIN_PATCHES = [
     ("core.startup.entry_controller_pipeline_lock_wait_patch", "ENTRY_CONTROLLER_LOCK_WAIT", "DISABLE_ENTRY_CONTROLLER_LOCK_WAIT_PATCH"),
     ("core.startup.entry_controller_source_prefilter_patch", "ENTRY_CONTROLLER_SOURCE_PREFILTER", "DISABLE_ENTRY_CONTROLLER_SOURCE_PREFILTER_PATCH"),
     ("core.startup.entry_execute_timeout_guard_patch", "ENTRY_EXECUTE_TIMEOUT_GUARD", "DISABLE_ENTRY_EXECUTE_TIMEOUT_GUARD_PATCH"),
+    ("core.startup.summary_main_direct_push_force_patch", "SUMMARY_FORCE_DIRECT_1M_SYNC", "DISABLE_SUMMARY_FORCE_DIRECT_1M_PATCH"),
 ]
 
 BACKGROUND_MAIN_PATCHES = [
@@ -283,6 +279,7 @@ BACKGROUND_MAIN_PATCHES = [
     ("core.startup.summary_mtf_early_ready_patch", "SUMMARY_MTF_EARLY_READY", "DISABLE_SUMMARY_MTF_EARLY_READY_PATCH"),
     ("trading.audit_logging.install_audit_logging", "AUDIT_LOGGING", "DISABLE_AUDIT_LOGGING"),
     ("core.startup.summary_controller_concat_duplicate_columns_patch", "SUMMARY_CONTROLLER_DUPCOL_PATCH", "DISABLE_SUMMARY_CONTROLLER_DUPCOL_PATCH"),
+    ("core.startup.summary_main_direct_push_force_patch", "SUMMARY_FORCE_DIRECT_1M_BG_FINAL", "DISABLE_SUMMARY_FORCE_DIRECT_1M_PATCH"),
 ]
 
 ENTRY_FAILOPEN_PATCHES = [
@@ -333,6 +330,8 @@ def _background_main_patch_loop() -> None:
     _install_optional_rescue_patches()
     _install_liq_empty_fallback_only_if_enabled()
     _install_summary_mtf_catchup_safely()
+    # Final re-apply after all background patches because several summary/controller patches re-wrap runner_core.job_summary.
+    _install_module("core.startup.summary_main_direct_push_force_patch", "SUMMARY_FORCE_DIRECT_1M_BG_LAST", disabled_env="DISABLE_SUMMARY_FORCE_DIRECT_1M_PATCH")
     logger.warning("[SITECUSTOMIZE] main background patches done")
 
 
