@@ -10,8 +10,9 @@
 #   - realtime main loop の実行
 #   - summary / entry 用 runtime context を global_data へ注入
 # ------------------------------------------------------------
-# Version: Ver38.36-MAIN-MEMORY-LATEST-1M-SUMMARY
+# Version: Ver38.37-BOARD-MISSING-PROTECTED-FAILOPEN
 # ------------------------------------------------------------
+# ✔ board_missing は強い候補・流動性OKなら小ロットfail-open
 # ✔ main.py はPUSH DB保存なしのまま、PUSHメモリから最新1分足summaryを高速生成
 # ✔ SUMMARY scheduler 終了時 submit RuntimeError ガードを main runtime patch に追加
 # ✔ SUMMARY AI async entry patch を main runtime patch 一覧へ明示追加
@@ -193,6 +194,7 @@ def _install_main_runtime_patches():
         ("core.startup.discord_summary_kwarg_safety_patch", "install"),
         ("core.startup.ranking_entry_flat_price_guard_patch", "install"),
         ("core.startup.board_retry_patch", "install"),
+        ("core.startup.board_missing_failopen_runtime_patch", "install"),
         ("core.startup.tonosama_5sec_stopped_relax_patch", "install"),
         ("core.startup.volatility_filter_tonosama_entryrow_rescue_patch", "install"),
         ("core.startup.board_wall_stall_exit_patch", "install"),
