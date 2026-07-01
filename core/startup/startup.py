@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/startup.py
-# Version: FINAL-PRODUCTION-REV25.0-SUMMARY-PENDING-DUP-RESCUE
+# Version: FINAL-PRODUCTION-REV25.1-ENTRY-EXECUTE-GUARD-V3
 # ------------------------------------------------------------
 # 【概要】
 #   system_startup の公開入口
@@ -10,10 +10,11 @@
 #   - 実際の起動順序は startup_orchestrator.py に委譲
 #   - 詳細処理は push_startup / scheduler_startup / summary_startup 等へ分離
 #
-# REV25.0:
+# REV25.1:
 #   - summary_entry_pending_duplicate_registered_patch を起動時に明示適用
-#   - SUMMARY AI direct dispatch が duplicate existing pending を no_pending_registered と誤判定して
-#     発注前に止まる問題を抑止
+#   - entry_execute_timeout_guard_patch V3 を起動時に明示適用
+#   - TONOSAMA/SUMMARY_AI の _execute_best_candidate 多重wrapによる
+#     INFLIGHT_DUPLICATE_SKIP 自己ブロックを抑止
 # ============================================================
 
 from __future__ import annotations
@@ -125,6 +126,13 @@ def _install_entrypoint_runtime_patches() -> None:
         logger.exception("[startup.entrypoint] summary entry duplicate pending registered patch install failed")
 
     try:
+        from core.startup.entry_execute_timeout_guard_patch import install as install_entry_execute_timeout_guard_patch
+
+        install_entry_execute_timeout_guard_patch()
+    except Exception:
+        logger.exception("[startup.entrypoint] entry execute timeout guard install failed")
+
+    try:
         from core.startup.rest_full_board_entry_patch import install as install_rest_full_board_entry_patch
 
         install_rest_full_board_entry_patch()
@@ -175,7 +183,7 @@ def _install_entrypoint_runtime_patches() -> None:
 
 
 def system_startup():
-    logger.info("🚀 system_startup entry REV25.0-SUMMARY-PENDING-DUP-RESCUE")
+    logger.info("🚀 system_startup entry REV25.1-ENTRY-EXECUTE-GUARD-V3")
     _install_entrypoint_runtime_patches()
     return run_system_startup()
 
