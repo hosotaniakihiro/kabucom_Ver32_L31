@@ -1,26 +1,24 @@
 # ============================================================
 # File   : core/startup/summary_ai_async_direct_dispatch_patch.py
-# Version: V5-LATEST-ONLY-DIRECT-SNAPSHOT-FIRST
+# Version: V6-PIPELINE-SOURCE-MATCH
 # ------------------------------------------------------------
 # 目的:
 #   SUMMARY AI が AI_OK を出しても、summary_ai_async_entry_patch が
 #   executed=False / skip=queued_async を返したまま実際の entry_controller
 #   dispatch が薄いケースを救済する。
 #
+# V6:
+#   - direct snapshot 実行時に pipeline_source="SUMMARY_AI" 固定で渡していたため、
+#     approved_rows 側の source="SUMMARY" と entry_controller の source filter が不一致になり、
+#       ENTRY_SKIP reason=PIPELINE_FILTER_MISMATCH
+#     で全件落ちる問題を修正。
+#   - approved_rows の source / pipeline_source / entry_type から実sourceを解決し、
+#     SUMMARY候補は pipeline_source="SUMMARY" で entry_controller へ渡す。
+#
 # V5:
 #   - 古い direct dispatch thread を latest-only で破棄する。
 #   - pending 登録前の stale skip / no_pending_registered を避けるため、
 #     まず trading.summary.summary_entry.execute_entry_pipeline を直接実行する。
-#     summary_ai_async_entry_patch 側の DIRECT SNAPSHOT patch が入っていれば、
-#     approved_rows から entry_controller._execute_best_candidate へ進む。
-#   - direct snapshot で no order の場合のみ、従来の run_summary_entry_executor
-#     へ fallback/retry する。
-#
-# V4:
-#   - run_summary_entry_executor の戻り値が registered>0 でも、executed=False
-#     / snapshot_no_order / entry_controller_no_order の場合は成功扱いで
-#     打ち切らず、次attemptへ進める。
-#   - retryable no-order の reason_chain をログに出す。
 # ============================================================
 from __future__ import annotations
 
@@ -50,6 +48,7 @@ _RETRYABLE_NO_ORDER_MARKERS = (
     "pipeline_busy",
     "already_running",
     "no_pending_registered",
+    "pipeline_filter_mismatch",
 )
 
 
@@ -88,17 +87,74 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _row_to_dict(row: Any) -> dict[str, Any]:
+    try:
+        if row is None:
+            return {}
+        if isinstance(row, dict):
+            return row
+        if hasattr(row, "to_dict"):
+            d = row.to_dict()
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    return {}
+
+
 def _symbols(rows: Any, limit: int = 20) -> list[str]:
     out: list[str] = []
     try:
         for r in list(rows or [])[:limit]:
-            if isinstance(r, dict):
-                out.append(str(r.get("symbol") or ""))
+            d = _row_to_dict(r)
+            if d:
+                out.append(str(d.get("symbol") or ""))
             else:
                 out.append(str(getattr(r, "symbol", "")))
     except Exception:
         pass
     return [x for x in out if x]
+
+
+def _resolve_pipeline_source(rows: list[Any]) -> str:
+    """entry_controller の source filter と一致する pipeline_source を解決する。"""
+    try:
+        counts: dict[str, int] = {}
+        for r in list(rows or [])[:50]:
+            d = _row_to_dict(r)
+            nested_ai = d.get("ai") if isinstance(d.get("ai"), dict) else {}
+            nested_entry = d.get("entry") if isinstance(d.get("entry"), dict) else {}
+            nested_row = d.get("entry_row") if isinstance(d.get("entry_row"), dict) else {}
+            vals = [
+                d.get("pipeline_source"),
+                d.get("source"),
+                nested_entry.get("pipeline_source"),
+                nested_entry.get("source"),
+                nested_row.get("pipeline_source"),
+                nested_row.get("source"),
+                nested_ai.get("pipeline_source"),
+                nested_ai.get("source"),
+                d.get("entry_type"),
+                nested_entry.get("entry_type"),
+                nested_ai.get("entry_type"),
+            ]
+            for v in vals:
+                s = str(v or "").strip().upper()
+                if not s:
+                    continue
+                if s in {"SUMMARY_AI", "AI"}:
+                    # SUMMARY_AI は entry type として扱い、source にはしない。
+                    continue
+                if s in {"SUMMARY", "PUSH"}:
+                    s = "SUMMARY"
+                if s in {"RANKING", "TONOSAMA", "SUMMARY"}:
+                    counts[s] = counts.get(s, 0) + 1
+                    break
+        if counts:
+            return max(counts.items(), key=lambda kv: kv[1])[0]
+    except Exception:
+        logger.debug("[SUMMARY AI DIRECT DISPATCH] pipeline_source resolve failed", exc_info=True)
+    return os.getenv("SUMMARY_AI_DIRECT_DISPATCH_PIPELINE_SOURCE", "SUMMARY").strip().upper() or "SUMMARY"
 
 
 def _flatten_reasons(result: Any) -> str:
@@ -233,7 +289,13 @@ def _direct_snapshot_execute(approved_rows: list[Any], interval: Any) -> Any:
         fn = getattr(se, "execute_entry_pipeline", None)
         if not callable(fn):
             return None
-        return fn(approved_rows, pipeline_source="SUMMARY_AI", interval=interval)
+        pipeline_source = _resolve_pipeline_source(approved_rows)
+        logger.warning(
+            "[SUMMARY AI DIRECT DISPATCH] direct snapshot pipeline_source resolved=%s symbols=%s",
+            pipeline_source,
+            _symbols(approved_rows),
+        )
+        return fn(approved_rows, pipeline_source=pipeline_source, interval=interval)
     except TypeError:
         try:
             from trading.summary import summary_entry as se
@@ -259,7 +321,6 @@ def _direct_worker(seq: int, approved_rows: list[Any], df_summary: Any, interval
         )
         return
 
-    # First path: direct snapshot. This avoids stale/no_pending_registered caused by pending registration.
     if _env_bool("SUMMARY_AI_DIRECT_DISPATCH_SNAPSHOT_FIRST", True):
         started = time.time()
         logger.warning(
@@ -405,22 +466,23 @@ def _patch_once(*, log_patch: bool = True) -> bool:
         if not callable(cur):
             logger.debug("[SUMMARY AI DIRECT DISPATCH] target missing")
             return False
-        if getattr(cur, "_summary_ai_direct_dispatch_v5", False):
+        if getattr(cur, "_summary_ai_direct_dispatch_v6", False):
             _INSTALLED = True
             return True
-        _ORIG = getattr(cur, "_original", cur) if getattr(cur, "_summary_ai_direct_dispatch_v4", False) else cur
+        _ORIG = getattr(cur, "_original", cur) if getattr(cur, "_summary_ai_direct_dispatch_v5", False) or getattr(cur, "_summary_ai_direct_dispatch_v4", False) else cur
         _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v1 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v2 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v3 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v4 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v5 = True  # type: ignore[attr-defined]
+        _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v6 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._original = _ORIG  # type: ignore[attr-defined]
         exec_mod.execute_ai_ok_entries_bulk = _patched_execute_ai_ok_entries_bulk
         runner_mod.execute_ai_ok_entries_bulk = _patched_execute_ai_ok_entries_bulk
         _INSTALLED = True
         if log_patch:
             logger.warning(
-                "[SUMMARY AI DIRECT DISPATCH] patched v5 target=%s delay=%.2fs attempts=%s latest_only=%s snapshot_first=%s",
+                "[SUMMARY AI DIRECT DISPATCH] patched v6 target=%s delay=%.2fs attempts=%s latest_only=%s snapshot_first=%s source_match=True",
                 getattr(_ORIG, "__name__", type(_ORIG).__name__),
                 _env_float("SUMMARY_AI_DIRECT_DISPATCH_DELAY_SEC", 0.10),
                 _env_int("SUMMARY_AI_DIRECT_DISPATCH_MAX_ATTEMPTS", 2),
@@ -439,7 +501,7 @@ def _watch_reinstall() -> None:
     for i in range(loops):
         ok = _patch_once(log_patch=False)
         if i in (0, loops - 1):
-            logger.warning("[SUMMARY AI DIRECT DISPATCH] enforce v5 i=%s/%s ok=%s", i, loops, ok)
+            logger.warning("[SUMMARY AI DIRECT DISPATCH] enforce v6 i=%s/%s ok=%s", i, loops, ok)
         time.sleep(sleep_sec)
 
 
@@ -453,6 +515,7 @@ def install() -> bool:
     os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_DELAY_SEC", "0.10")
     os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_MAX_ATTEMPTS", "2")
     os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_RETRY_SLEEP_SEC", "0.7")
+    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_PIPELINE_SOURCE", "SUMMARY")
     if _INSTALLED and _WATCHER_STARTED:
         return True
     ok = _patch_once()
@@ -460,7 +523,7 @@ def install() -> bool:
         _WATCHER_STARTED = True
         threading.Thread(target=_watch_reinstall, daemon=True, name="summary-ai-direct-dispatch-enforcer").start()
         logger.warning(
-            "[SUMMARY AI DIRECT DISPATCH] installed/enforcing v5 ok=%s watcher=%s loops=%s sleep=%s latest_only=%s snapshot_first=%s",
+            "[SUMMARY AI DIRECT DISPATCH] installed/enforcing v6 ok=%s watcher=%s loops=%s sleep=%s latest_only=%s snapshot_first=%s source_match=True",
             ok,
             _WATCHER_STARTED,
             _env_int("SUMMARY_AI_DIRECT_DISPATCH_WATCH_LOOPS", 12),
