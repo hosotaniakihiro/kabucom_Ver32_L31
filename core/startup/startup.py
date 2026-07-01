@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/startup.py
-# Version: FINAL-PRODUCTION-REV24.9-FINAL-ENTRY-SAFETY-GUARD
+# Version: FINAL-PRODUCTION-REV25.0-SUMMARY-PENDING-DUP-RESCUE
 # ------------------------------------------------------------
 # 【概要】
 #   system_startup の公開入口
@@ -10,9 +10,10 @@
 #   - 実際の起動順序は startup_orchestrator.py に委譲
 #   - 詳細処理は push_startup / scheduler_startup / summary_startup 等へ分離
 #
-# REV24.9:
-#   - final_entry_safety_guard_patch を起動時に明示適用
-#   - SUMMARY AI direct snapshot の自己lock修正後、発注直前のREST板補完/pending解除を確実に有効化
+# REV25.0:
+#   - summary_entry_pending_duplicate_registered_patch を起動時に明示適用
+#   - SUMMARY AI direct dispatch が duplicate existing pending を no_pending_registered と誤判定して
+#     発注前に止まる問題を抑止
 # ============================================================
 
 from __future__ import annotations
@@ -117,6 +118,13 @@ def _install_entrypoint_runtime_patches() -> None:
         logger.exception("[startup.entrypoint] tonosama fast score prefilter install failed")
 
     try:
+        from core.startup.summary_entry_pending_duplicate_registered_patch import install as install_summary_entry_pending_duplicate_registered_patch
+
+        install_summary_entry_pending_duplicate_registered_patch()
+    except Exception:
+        logger.exception("[startup.entrypoint] summary entry duplicate pending registered patch install failed")
+
+    try:
         from core.startup.rest_full_board_entry_patch import install as install_rest_full_board_entry_patch
 
         install_rest_full_board_entry_patch()
@@ -167,7 +175,7 @@ def _install_entrypoint_runtime_patches() -> None:
 
 
 def system_startup():
-    logger.info("🚀 system_startup entry REV24.9-FINAL-ENTRY-SAFETY-GUARD")
+    logger.info("🚀 system_startup entry REV25.0-SUMMARY-PENDING-DUP-RESCUE")
     _install_entrypoint_runtime_patches()
     return run_system_startup()
 
