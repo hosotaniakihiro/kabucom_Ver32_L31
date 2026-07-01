@@ -1,22 +1,16 @@
 # ============================================================
 # File   : core/startup/summary_stale_guard_patch.py
-# Version: REV6-SUMMARY-STALE-GUARD-DROP-FUTURE-FIRST
+# Version: REV7-SUMMARY-STALE-GUARD-STRICT-LIVE-DROP
 # ------------------------------------------------------------
 # 【概要】
 #   PUSH / ranking summary が古いまま merged summary に残り、
-#   古い価格・古い slope・古い RSI/MACD でエントリー候補になる問題を防ぐ。
+#   古い価格・古い slope・古い RSI/MACD で表示・AI・発注候補になる問題を防ぐ。
 #
-# REV6:
-#   - 2026-06-30 11:00ログで now=11:00 に対し latest_dt=15:35 の未来行が
-#     min_keep fallback により50件残っていた。
-#   - 未来時刻行は stale/min_keep/global-lag 判定より前に必ず除外する。
-#   - 全行が未来なら空DFを返す。未来データでの表示・AI・発注を防止する。
-#
-# REV5:
-#   - summary全体の最新時刻が壁時計より遅れている場合、max_ageで大量DROPせず、
-#     「銘柄ごとの最新1行」を残す global-lag fallback を追加。
-#   - fallback行には summary_stale=True / summary_stale_age_sec を付与して、
-#     古いデータであることを後段が判別できるようにする。
+# REV7:
+#   - 市場中の PUSH / ranking / legacy intraday summary は、当日以外を必ず破棄。
+#   - latest_dt が max_age を超えた場合、global-lag fallback で古い行を残さない。
+#   - min_keep fallback の既定値を 0 に変更し、古い前日データを「最低件数維持」で残さない。
+#   - 旧挙動が必要な場合のみ、環境変数で明示的に戻せる。
 # ============================================================
 
 from __future__ import annotations
@@ -32,7 +26,7 @@ logger = logging.getLogger(__name__)
 _PATCHED = False
 _ORIGINAL_SANITIZE_SUMMARY_DF = None
 _ORIGINAL_GET_MERGED_SUMMARY = None
-VERSION = "REV6-SUMMARY-STALE-GUARD-DROP-FUTURE-FIRST"
+VERSION = "REV7-SUMMARY-STALE-GUARD-STRICT-LIVE-DROP"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -40,7 +34,12 @@ def _env_bool(name: str, default: bool) -> bool:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
             return bool(default)
-        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
+            return False
+        return bool(default)
     except Exception:
         return bool(default)
 
@@ -85,6 +84,11 @@ def _normalize_tf(tf: Any) -> Any:
         return tf
 
 
+def _is_intraday_live_source(source: Any) -> bool:
+    src = _normalize_source(source)
+    return src.startswith("push") or src.startswith("ranking") or src in {"legacy", "summary"}
+
+
 def _max_age_sec(source: Any, tf: Any) -> Optional[int]:
     source = _normalize_source(source)
     tf = _normalize_tf(tf)
@@ -96,17 +100,17 @@ def _max_age_sec(source: Any, tf: Any) -> Optional[int]:
         return None
 
     if source.startswith("push"):
-        defaults = {1: 180, 3: 600, 5: 900, 10: 1200, 15: 1500, 30: 2400, 60: 4800}
+        defaults = {1: 120, 3: 240, 5: 420, 10: 1200, 15: 1500, 30: 2400, 60: 4800}
         default = int(defaults.get(tf, 600))
         return _env_int(f"PUSH_SUMMARY_{tf}MIN_MAX_AGE_SEC", default)
 
-    if source == "ranking":
-        defaults = {1: 240, 3: 720, 5: 1020, 10: 1500, 15: 1800, 30: 3600, 60: 7200}
+    if source.startswith("ranking"):
+        defaults = {1: 180, 3: 300, 5: 480, 10: 1500, 15: 1800, 30: 3600, 60: 7200}
         default = int(defaults.get(tf, 900))
         return _env_int(f"RANKING_SUMMARY_{tf}MIN_MAX_AGE_SEC", default)
 
-    if source == "legacy":
-        default = 300 if tf == 1 else 900
+    if source == "legacy" or source == "summary":
+        default = 180 if tf == 1 else 480
         return _env_int(f"LEGACY_SUMMARY_{tf}MIN_MAX_AGE_SEC", default)
 
     return None
@@ -130,15 +134,19 @@ def _relative_lag_sec(source: Any, tf: Any) -> Optional[int]:
 
     if source.startswith("push"):
         return _env_int(f"PUSH_SUMMARY_{tf_int}MIN_RELATIVE_LAG_SEC", default)
-    if source == "ranking":
+    if source.startswith("ranking"):
         return _env_int(f"RANKING_SUMMARY_{tf_int}MIN_RELATIVE_LAG_SEC", default)
-    if source == "legacy":
+    if source in {"legacy", "summary"}:
         return _env_int(f"LEGACY_SUMMARY_{tf_int}MIN_RELATIVE_LAG_SEC", default)
     return None
 
 
 def _min_keep_rows(source: Any, tf: Any) -> int:
-    source_s = _normalize_source(source)
+    """Old default kept 50 rows even when all rows were stale.
+
+    For live trading this is dangerous: it can keep previous-day rows and make
+    downstream AI/entry logic believe there are candidates. Default is now 0.
+    """
     tf_n = _normalize_tf(tf)
     if tf_n == "daily":
         return 0
@@ -147,13 +155,8 @@ def _min_keep_rows(source: Any, tf: Any) -> int:
     except Exception:
         tf_int = 1
 
-    if source_s.startswith("push"):
-        default = 50 if tf_int in (1, 3, 5) else 20
-        return _env_int(f"PUSH_SUMMARY_{tf_int}MIN_KEEP_ROWS", default)
-    if source_s == "ranking":
-        default = 50 if tf_int in (1, 3, 5) else 20
-        return _env_int(f"RANKING_SUMMARY_{tf_int}MIN_KEEP_ROWS", default)
-    return _env_int(f"SUMMARY_{tf_int}MIN_KEEP_ROWS", 0)
+    src = _normalize_source(source).upper()
+    return _env_int(f"{src}_SUMMARY_{tf_int}MIN_KEEP_ROWS", _env_int(f"SUMMARY_{tf_int}MIN_KEEP_ROWS", 0))
 
 
 def _future_allow_sec(source: Any, tf: Any) -> int:
@@ -193,22 +196,12 @@ def _latest_fallback_rows(out: pd.DataFrame, *, time_col: str, min_keep: int) ->
         return out.iloc[0:0].copy()
 
 
-def _latest_per_symbol_rows(out: pd.DataFrame, *, time_col: str, max_rows: int) -> pd.DataFrame:
+def _to_naive_datetime_series(s: pd.Series) -> pd.Series:
+    out = pd.to_datetime(s, errors="coerce")
     try:
-        if out is None or out.empty or time_col not in out.columns:
-            return pd.DataFrame() if out is None else out.iloc[0:0].copy()
-        work = out[out[time_col].notna()].copy()
-        if work.empty:
-            return out.iloc[0:0].copy()
-        work = work.sort_values(time_col, ascending=False)
-        if "symbol" in work.columns:
-            work = work.drop_duplicates(subset=["symbol"], keep="first")
-        if max_rows and max_rows > 0:
-            work = work.head(int(max_rows))
-        return work.copy().reset_index(drop=True)
+        return out.dt.tz_localize(None)
     except Exception:
-        logger.debug("[SUMMARY STALE DROP] latest per-symbol fallback failed", exc_info=True)
-        return out.iloc[0:0].copy()
+        return out
 
 
 def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sanitize") -> pd.DataFrame:
@@ -225,22 +218,39 @@ def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sani
         time_col = _best_time_col(df)
         if not time_col:
             logger.warning(
-                "[SUMMARY STALE DROP] source=%s tf=%s label=%s before=%s after=0 reason=time_col_missing max_age_sec=%s relative_lag_sec=%s",
-                source, tf, label, len(df), max_age, relative_lag,
+                "[SUMMARY STALE DROP] source=%s tf=%s label=%s before=%s after=0 reason=time_col_missing max_age_sec=%s relative_lag_sec=%s version=%s",
+                source, tf, label, len(df), max_age, relative_lag, VERSION,
             )
             return df.iloc[0:0].copy()
 
         out = df.copy()
-        out[time_col] = pd.to_datetime(out[time_col], errors="coerce")
-        try:
-            out[time_col] = out[time_col].dt.tz_localize(None)
-        except Exception:
-            pass
-
-        now = pd.Timestamp.now()
+        out[time_col] = _to_naive_datetime_series(out[time_col])
+        now = pd.Timestamp.now().tz_localize(None)
         before_original = int(len(out))
 
-        # REV6: future rows are invalid for live trading and must never be kept by min_keep/global-lag fallback.
+        # Live intraday data must be today. Previous trading day rows are not safe
+        # for display, AI or entry, even when they are the latest rows in a DB.
+        today_str = now.strftime("%Y-%m-%d")
+        strict_today = _env_bool("SUMMARY_STALE_STRICT_TODAY_ONLY", True)
+        if strict_today and _is_intraday_live_source(source) and _normalize_tf(tf) != "daily":
+            dt_str = out[time_col].dt.strftime("%Y-%m-%d")
+            non_today_mask = out[time_col].notna() & dt_str.ne(today_str)
+            non_today_count = int(non_today_mask.sum()) if len(out) else 0
+            if non_today_count > 0:
+                non_today_latest = None
+                try:
+                    non_today_latest = out.loc[non_today_mask, time_col].max()
+                except Exception:
+                    non_today_latest = None
+                out = out.loc[~non_today_mask].copy().reset_index(drop=True)
+                logger.warning(
+                    "[SUMMARY NON-TODAY DROP] source=%s tf=%s label=%s before=%s non_today_removed=%s after=%s today=%s non_today_latest=%s version=%s",
+                    source, tf, label, before_original, non_today_count, len(out), today_str, non_today_latest, VERSION,
+                )
+                if out.empty:
+                    return out
+
+        # Future rows are invalid for live trading and must never be kept.
         allow_sec = _future_allow_sec(source, tf)
         future_cutoff = now + pd.Timedelta(seconds=float(allow_sec))
         dt_series0 = out[time_col]
@@ -262,7 +272,6 @@ def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sani
 
         dt_series = out[time_col]
         age_sec = (now - dt_series).dt.total_seconds()
-
         before = int(len(out))
         valid_mask = dt_series.notna() & age_sec.ge(0)
 
@@ -276,28 +285,22 @@ def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sani
             latest_dt = None
             latest_age_sec = None
 
-        global_lag_enabled = _env_bool("SUMMARY_STALE_KEEP_LATEST_PER_SYMBOL_ON_GLOBAL_LAG", True)
+        # REV7: default is hard drop on global lag. The old fallback kept stale rows
+        # and caused previous-day PUSH summaries to be treated as live candidates.
+        global_lag_enabled = _env_bool("SUMMARY_STALE_KEEP_LATEST_PER_SYMBOL_ON_GLOBAL_LAG", False)
         global_lag_grace = _env_int("SUMMARY_STALE_GLOBAL_LAG_GRACE_SEC", 30)
         if (
-            global_lag_enabled
+            not global_lag_enabled
             and max_age is not None
             and max_age > 0
             and latest_age_sec is not None
             and latest_age_sec > float(max_age + global_lag_grace)
         ):
-            max_rows = _env_int("SUMMARY_STALE_GLOBAL_LAG_MAX_KEEP_ROWS", 1000)
-            fallback = _latest_per_symbol_rows(out, time_col=time_col, max_rows=max_rows)
-            try:
-                fallback["summary_stale"] = True
-                fallback["summary_stale_age_sec"] = latest_age_sec
-                fallback["summary_stale_reason"] = "global_lag_latest_per_symbol"
-            except Exception:
-                pass
             logger.warning(
-                "[SUMMARY STALE DROP] global lag fallback source=%s tf=%s label=%s before=%s after=%s max_age_sec=%s latest_age_sec=%.1f latest_dt=%s now=%s max_keep=%s",
-                source, tf, label, before, len(fallback), max_age, latest_age_sec, latest_dt, now, max_rows,
+                "[SUMMARY STALE DROP] global lag hard-drop source=%s tf=%s label=%s before=%s after=0 max_age_sec=%s latest_age_sec=%.1f latest_dt=%s now=%s version=%s",
+                source, tf, label, before, max_age, latest_age_sec, latest_dt, now, VERSION,
             )
-            return fallback
+            return out.iloc[0:0].copy()
 
         absolute_mask = pd.Series(False, index=out.index)
         if max_age is not None and max_age > 0:
@@ -320,13 +323,13 @@ def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sani
             fallback = _latest_fallback_rows(out, time_col=time_col, min_keep=min_keep)
             if len(fallback) > after:
                 logger.warning(
-                    "[SUMMARY STALE DROP] min_keep fallback source=%s tf=%s label=%s before=%s stale_after=%s fallback_after=%s min_keep=%s latest_dt=%s now=%s",
-                    source, tf, label, before, after, len(fallback), min_keep, latest_dt, now,
+                    "[SUMMARY STALE DROP] min_keep fallback source=%s tf=%s label=%s before=%s stale_after=%s fallback_after=%s min_keep=%s latest_dt=%s now=%s version=%s",
+                    source, tf, label, before, after, len(fallback), min_keep, latest_dt, now, VERSION,
                 )
                 out2 = fallback
                 after = int(len(out2))
 
-        if after != before or future_count > 0:
+        if after != before or future_count > 0 or before_original != before:
             oldest_kept = None
             newest_kept = None
             try:
@@ -336,8 +339,8 @@ def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sani
                 pass
 
             logger.warning(
-                "[SUMMARY STALE DROP] source=%s tf=%s label=%s before=%s after=%s max_age_sec=%s relative_lag_sec=%s min_keep=%s latest_dt=%s oldest_kept=%s newest_kept=%s now=%s future_removed=%s",
-                source, tf, label, before_original, after, max_age, relative_lag, min_keep, latest_dt, oldest_kept, newest_kept, now, future_count,
+                "[SUMMARY STALE DROP] source=%s tf=%s label=%s before=%s after=%s max_age_sec=%s relative_lag_sec=%s min_keep=%s latest_dt=%s oldest_kept=%s newest_kept=%s now=%s future_removed=%s version=%s",
+                source, tf, label, before_original, after, max_age, relative_lag, min_keep, latest_dt, oldest_kept, newest_kept, now, future_count, VERSION,
             )
 
         return out2
