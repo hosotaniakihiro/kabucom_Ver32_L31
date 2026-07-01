@@ -1,17 +1,23 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_main_memory_latest_1m_patch.py
-# Purpose:
-#   - main.py は PUSH DB 保存をしない前提のまま、PUSHメモリDFから
-#     最新1分足 summary を高速生成する。
-#   - 既存 runner がDB履歴/補完/表示/enrichで重くなり、latest_dt が
-#     09:30等で止まるケースを避ける。
+# Version: V2-MAIN-MEMORY-LATEST-1M-ROBUST-COLUMNS
+# ------------------------------------------------------------
+# main.py は PUSH DB 保存をしない前提のまま、PUSHメモリDFから
+# 最新1分足 summary を高速生成する。
+#
+# V2:
+#   - PUSHメモリ raw_rows があるのに usable=0 になる問題を修正。
+#   - CurrentPriceTime が古い/時刻のみ/欠損でも received_at または now で採用。
+#   - 列名揺れ、大小文字、空白、kabu Station camel case、簡単なdict列を吸収。
+#   - メモリ行が存在する場合は original fallback に逃げにくくする。
 # ============================================================
 from __future__ import annotations
 
 import datetime as dt
 import logging
 import os
+import re
 import sys
 import time
 from functools import wraps
@@ -20,8 +26,7 @@ from typing import Any, Optional
 import pandas as pd
 
 logger = logging.getLogger(__name__)
-
-VERSION = "V1-MAIN-MEMORY-LATEST-1M"
+VERSION = "V2-MAIN-MEMORY-LATEST-1M-ROBUST-COLUMNS"
 _INSTALLED = False
 
 
@@ -48,16 +53,6 @@ def _env_int(name: str, default: int) -> int:
     except Exception:
         pass
     return int(default)
-
-
-def _env_float(name: str, default: float) -> float:
-    try:
-        v = os.getenv(name)
-        if v is not None and str(v).strip() != "":
-            return float(str(v).replace(",", "").strip())
-    except Exception:
-        pass
-    return float(default)
 
 
 def _argv_text() -> str:
@@ -105,54 +100,126 @@ def _as_df(x: Any) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _flatten_object_dict_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    try:
+        for c in list(out.columns):
+            try:
+                s = out[c].dropna()
+                if s.empty:
+                    continue
+                sample = s.iloc[0]
+                if isinstance(sample, dict):
+                    exp = pd.json_normalize(out[c]).add_prefix(f"{c}.")
+                    exp.index = out.index
+                    out = pd.concat([out.drop(columns=[c]), exp], axis=1)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    out.columns = [str(c).strip() for c in out.columns]
+    out = out.loc[:, ~pd.Index(out.columns).duplicated()].copy()
+    return out
+
+
+def _canon(s: Any) -> str:
+    return re.sub(r"[^0-9a-zA-Z一-龥ぁ-んァ-ヶー]", "", str(s or "").strip().lower())
+
+
 def _first_existing(df: pd.DataFrame, names: tuple[str, ...]) -> Optional[str]:
-    cols = {str(c).lower(): c for c in df.columns}
+    if not isinstance(df, pd.DataFrame):
+        return None
+    exact = {str(c): c for c in df.columns}
+    canon = {_canon(c): c for c in df.columns}
     for name in names:
-        if name in df.columns:
-            return name
-        lc = name.lower()
-        if lc in cols:
-            return cols[lc]
+        if name in exact:
+            return exact[name]
+        cn = _canon(name)
+        if cn in canon:
+            return canon[cn]
+    # suffix match for flattened dict columns: data.CurrentPrice etc.
+    for name in names:
+        cn = _canon(name)
+        for c in df.columns:
+            cc = _canon(c)
+            if cc.endswith(cn):
+                return c
     return None
 
 
-def _to_naive_datetime(s: Any) -> pd.Series:
+def _to_naive_datetime_any(values: Any, *, now: dt.datetime, date_values: Any = None) -> pd.Series:
+    idx = getattr(values, "index", None)
     try:
-        out = pd.to_datetime(s, errors="coerce")
-        try:
-            if getattr(out.dt, "tz", None) is not None:
-                out = out.dt.tz_convert("Asia/Tokyo").dt.tz_localize(None)
-        except Exception:
-            try:
-                out = out.dt.tz_localize(None)
-            except Exception:
-                pass
-        return out
+        s = pd.Series(values, index=idx) if not isinstance(values, pd.Series) else values.copy()
     except Exception:
-        return pd.Series(pd.NaT, index=getattr(s, "index", None))
+        return pd.Series(pd.Timestamp(now), index=idx)
+
+    # numeric/HHMMSS/time-onlyを今日の日付に寄せる
+    today_s = pd.Timestamp(now).strftime("%Y-%m-%d")
+    if date_values is not None:
+        try:
+            ds = pd.Series(date_values, index=s.index) if not isinstance(date_values, pd.Series) else date_values.reindex(s.index)
+            dparsed = pd.to_datetime(ds, errors="coerce")
+            today_by_row = dparsed.dt.strftime("%Y-%m-%d").where(dparsed.notna(), today_s)
+        except Exception:
+            today_by_row = pd.Series(today_s, index=s.index)
+    else:
+        today_by_row = pd.Series(today_s, index=s.index)
+
+    def one(v: Any, day: str) -> Any:
+        try:
+            if pd.isna(v):
+                return pd.NaT
+            txt = str(v).strip()
+            if txt == "":
+                return pd.NaT
+            # 93000 / 093000 / 09:30:00
+            if re.fullmatch(r"\d{5,6}", txt):
+                txt = txt.zfill(6)
+                return pd.Timestamp(f"{day} {txt[0:2]}:{txt[2:4]}:{txt[4:6]}")
+            if re.fullmatch(r"\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?", txt):
+                return pd.Timestamp(f"{day} {txt}")
+            ts = pd.Timestamp(v)
+            if pd.isna(ts):
+                return pd.NaT
+            if getattr(ts, "tzinfo", None) is not None:
+                try:
+                    ts = ts.tz_convert("Asia/Tokyo").tz_localize(None)
+                except Exception:
+                    ts = ts.tz_localize(None)
+            return ts
+        except Exception:
+            return pd.NaT
+
+    try:
+        out = pd.Series([one(v, d) for v, d in zip(s.tolist(), today_by_row.tolist())], index=s.index)
+        return pd.to_datetime(out, errors="coerce")
+    except Exception:
+        return pd.Series(pd.NaT, index=s.index)
 
 
 def _load_push_memory_df() -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
-
     gd = _global_data()
     if gd is not None:
-        for name in ("push_df", "stream_data", "latest_push_df", "push_data", "push_snapshot_df"):
+        for name in ("push_df", "stream_data", "latest_push_df", "push_data", "push_snapshot_df", "PUSH_DF"):
             try:
                 x = getattr(gd, name, None)
                 if isinstance(x, pd.DataFrame) and not x.empty:
                     frames.append(x)
             except Exception:
                 pass
-        try:
-            fn = getattr(gd, "get_push_df", None)
-            if callable(fn):
-                x = fn()
-                if isinstance(x, pd.DataFrame) and not x.empty:
-                    frames.append(x)
-        except Exception:
-            pass
-
+        for name in ("get_push_df", "get_latest_push_df", "get_stream_data"):
+            try:
+                fn = getattr(gd, name, None)
+                if callable(fn):
+                    x = fn()
+                    if isinstance(x, pd.DataFrame) and not x.empty:
+                        frames.append(x)
+            except Exception:
+                pass
     try:
         from trading.push.push_stream import get_push_dataframe
         x = get_push_dataframe()
@@ -163,35 +230,44 @@ def _load_push_memory_df() -> pd.DataFrame:
 
     if not frames:
         return pd.DataFrame()
-
     try:
-        out = pd.concat([_as_df(x) for x in frames if isinstance(x, pd.DataFrame) and not x.empty], ignore_index=True, sort=False)
+        out = pd.concat([_flatten_object_dict_columns(_as_df(x)) for x in frames if isinstance(x, pd.DataFrame) and not x.empty], ignore_index=True, sort=False)
         out = out.loc[:, ~pd.Index(out.columns).duplicated()].copy()
         return out.reset_index(drop=True)
     except Exception:
         logger.exception("[SUMMARY MAIN MEMORY 1M] concat push memory df failed")
-        return frames[-1].copy() if frames else pd.DataFrame()
+        return _flatten_object_dict_columns(frames[-1]) if frames else pd.DataFrame()
 
 
 def _normalize_push_ticks(df: pd.DataFrame, *, now: dt.datetime) -> pd.DataFrame:
     if not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame()
 
-    out = df.copy()
-    out.columns = [str(c).strip() for c in out.columns]
-
-    sym_col = _first_existing(out, ("symbol", "Symbol", "code", "Code", "symbol_code", "銘柄コード"))
-    price_col = _first_existing(out, ("current_price", "CurrentPrice", "price", "Price", "close", "close_price", "Close"))
-    recv_col = _first_existing(out, ("received_at", "ReceivedAt", "inserted_at", "created_at"))
-    event_col = _first_existing(out, ("datetime", "time", "current_price_time", "CurrentPriceTime", "timestamp", "PriceTime"))
-    vol_col = _first_existing(out, ("trading_volume", "TradingVolume", "volume", "Volume"))
-    val_col = _first_existing(out, ("trading_value", "TradingValue", "turnover", "Value"))
-    name_col = _first_existing(out, ("symbolname", "SymbolName", "name", "Name", "銘柄名"))
-    high_col = _first_existing(out, ("high_price", "HighPrice", "high"))
-    low_col = _first_existing(out, ("low_price", "LowPrice", "low"))
-    open_col = _first_existing(out, ("opening_price", "OpeningPrice", "open", "open_price"))
+    out = _flatten_object_dict_columns(df)
+    sym_col = _first_existing(out, ("symbol", "Symbol", "code", "Code", "symbol_code", "SymbolCode", "銘柄コード"))
+    price_col = _first_existing(out, (
+        "current_price", "CurrentPrice", "price", "Price", "close", "close_price", "Close", "ClosePrice", "現在値", "現在値段",
+    ))
+    recv_col = _first_existing(out, ("received_at", "ReceivedAt", "recv_at", "inserted_at", "created_at", "updated_at"))
+    event_col = _first_existing(out, (
+        "datetime", "Datetime", "time", "Time", "current_price_time", "CurrentPriceTime", "timestamp", "PriceTime", "時刻", "現在値時刻",
+    ))
+    date_col = _first_existing(out, ("date", "Date", "business_date", "BusinessDate", "年月日", "日付"))
+    vol_col = _first_existing(out, ("trading_volume", "TradingVolume", "volume", "Volume", "出来高", "売買高"))
+    val_col = _first_existing(out, ("trading_value", "TradingValue", "turnover", "Value", "売買代金"))
+    name_col = _first_existing(out, ("symbolname", "SymbolName", "symbol_name", "name", "Name", "銘柄名"))
+    high_col = _first_existing(out, ("high_price", "HighPrice", "high", "High", "高値"))
+    low_col = _first_existing(out, ("low_price", "LowPrice", "low", "Low", "安値"))
+    open_col = _first_existing(out, ("opening_price", "OpeningPrice", "open", "Open", "open_price", "始値"))
 
     if sym_col is None or price_col is None:
+        logger.warning(
+            "[SUMMARY MAIN MEMORY 1M] required columns missing symbol_col=%s price_col=%s cols=%s raw_rows=%s",
+            sym_col,
+            price_col,
+            list(out.columns)[:120],
+            len(out),
+        )
         return pd.DataFrame()
 
     norm = pd.DataFrame(index=out.index)
@@ -200,58 +276,66 @@ def _normalize_push_ticks(df: pd.DataFrame, *, now: dt.datetime) -> pd.DataFrame
     norm["current_price"] = norm["price"]
     norm["close"] = norm["price"]
 
-    if recv_col is not None:
-        norm["received_at"] = _to_naive_datetime(out[recv_col])
-    else:
-        norm["received_at"] = pd.NaT
-    if event_col is not None:
-        norm["event_dt"] = _to_naive_datetime(out[event_col])
-    else:
-        norm["event_dt"] = pd.NaT
+    date_values = out[date_col] if date_col is not None else None
+    recv_dt = _to_naive_datetime_any(out[recv_col], now=now, date_values=date_values) if recv_col is not None else pd.Series(pd.NaT, index=out.index)
+    event_dt = _to_naive_datetime_any(out[event_col], now=now, date_values=date_values) if event_col is not None else pd.Series(pd.NaT, index=out.index)
 
-    # main.py の判定では「PUSHを受け取った現在時刻」を優先する。
-    # kabu Station の CurrentPriceTime は値が動かない銘柄で09:30等のまま残るため、
-    # これをdatetimeに使うと summary latest_dt が古く固定される。
-    norm["tick_dt"] = norm["received_at"].where(norm["received_at"].notna(), norm["event_dt"])
+    # received_atを最優先。kabu StationのCurrentPriceTimeは約定が無いと古いままなので補助扱い。
+    norm["tick_dt"] = recv_dt.where(recv_dt.notna(), event_dt)
     norm["tick_dt"] = norm["tick_dt"].where(norm["tick_dt"].notna(), pd.Timestamp(now))
 
     try:
-        cutoff = pd.Timestamp(now).tz_localize(None) + pd.Timedelta(seconds=3)
-        floor = cutoff - pd.Timedelta(minutes=max(3, _env_int("SUMMARY_MAIN_MEMORY_LOOKBACK_MIN", 20)))
-        norm = norm[(norm["tick_dt"] <= cutoff) & (norm["tick_dt"] >= floor)].copy()
+        cutoff = pd.Timestamp(now).tz_localize(None) + pd.Timedelta(seconds=max(3, _env_int("SUMMARY_MAIN_MEMORY_FUTURE_GRACE_SEC", 75)))
+        floor = pd.Timestamp(now).tz_localize(None) - pd.Timedelta(minutes=max(1, _env_int("SUMMARY_MAIN_MEMORY_LOOKBACK_MIN", 30)))
+        keep = (norm["tick_dt"] <= cutoff) & (norm["tick_dt"] >= floor)
+        if int(keep.sum()) == 0 and len(norm) > 0:
+            # 時刻列が全滅/古い場合でもPUSHメモリがあるなら now に寄せて使う。
+            logger.warning(
+                "[SUMMARY MAIN MEMORY 1M] no rows in time window -> coerce tick_dt to now raw_rows=%s min_dt=%s max_dt=%s",
+                len(norm),
+                norm["tick_dt"].min() if "tick_dt" in norm.columns else None,
+                norm["tick_dt"].max() if "tick_dt" in norm.columns else None,
+            )
+            norm["tick_dt"] = pd.Timestamp(now).tz_localize(None)
+            keep = pd.Series(True, index=norm.index)
+        norm = norm[keep].copy()
     except Exception:
         pass
 
-    if vol_col is not None:
-        norm["trading_volume"] = pd.to_numeric(out[vol_col], errors="coerce")
-    else:
-        norm["trading_volume"] = pd.NA
-    if val_col is not None:
-        norm["trading_value"] = pd.to_numeric(out[val_col], errors="coerce")
-    else:
-        norm["trading_value"] = pd.NA
-    if name_col is not None:
-        norm["symbolname"] = out[name_col].fillna("").astype(str)
-    else:
-        norm["symbolname"] = ""
-    if high_col is not None:
-        norm["day_high"] = pd.to_numeric(out[high_col], errors="coerce")
-    else:
-        norm["day_high"] = pd.NA
-    if low_col is not None:
-        norm["day_low"] = pd.to_numeric(out[low_col], errors="coerce")
-    else:
-        norm["day_low"] = pd.NA
-    if open_col is not None:
-        norm["day_open"] = pd.to_numeric(out[open_col], errors="coerce")
-    else:
-        norm["day_open"] = pd.NA
+    norm["trading_volume"] = pd.to_numeric(out[vol_col], errors="coerce") if vol_col is not None else pd.NA
+    norm["trading_value"] = pd.to_numeric(out[val_col], errors="coerce") if val_col is not None else pd.NA
+    norm["symbolname"] = out[name_col].fillna("").astype(str) if name_col is not None else ""
+    norm["day_high"] = pd.to_numeric(out[high_col], errors="coerce") if high_col is not None else pd.NA
+    norm["day_low"] = pd.to_numeric(out[low_col], errors="coerce") if low_col is not None else pd.NA
+    norm["day_open"] = pd.to_numeric(out[open_col], errors="coerce") if open_col is not None else pd.NA
 
+    before = len(norm)
     norm = norm.dropna(subset=["symbol", "price", "tick_dt"])
-    norm = norm[norm["symbol"].astype(str).str.len() > 0].copy()
+    norm = norm[norm["symbol"].astype(str).str.len() > 0]
+    norm = norm[norm["price"] > 0].copy()
     if norm.empty:
+        logger.warning(
+            "[SUMMARY MAIN MEMORY 1M] normalized empty after drop before=%s symbol_col=%s price_col=%s recv_col=%s event_col=%s",
+            before,
+            sym_col,
+            price_col,
+            recv_col,
+            event_col,
+        )
         return pd.DataFrame()
     norm = norm.sort_values(["symbol", "tick_dt"], kind="stable").reset_index(drop=True)
+    logger.warning(
+        "[SUMMARY MAIN MEMORY 1M] normalized ticks rows=%s symbols=%s raw_rows=%s symbol_col=%s price_col=%s recv_col=%s event_col=%s latest_tick=%s version=%s",
+        len(norm),
+        int(norm["symbol"].nunique()),
+        len(out),
+        sym_col,
+        price_col,
+        recv_col,
+        event_col,
+        norm["tick_dt"].max(),
+        VERSION,
+    )
     return norm
 
 
@@ -297,6 +381,7 @@ def _build_memory_1m_summary(*, now: dt.datetime) -> pd.DataFrame:
         bars["ema26"] = bars.groupby("symbol")["close"].transform(lambda s: s.ewm(span=26, adjust=False, min_periods=1).mean())
         bars["macd"] = (bars["ema12"] - bars["ema26"]).fillna(0.0)
         bars["signal"] = bars.groupby("symbol")["macd"].transform(lambda s: s.ewm(span=9, adjust=False, min_periods=1).mean()).fillna(0.0)
+        bars["hist"] = bars["macd"] - bars["signal"]
 
         diff = bars.groupby("symbol")["close"].diff()
         gain = diff.clip(lower=0).groupby(bars["symbol"]).transform(lambda s: s.rolling(14, min_periods=1).mean())
@@ -306,13 +391,10 @@ def _build_memory_1m_summary(*, now: dt.datetime) -> pd.DataFrame:
 
         bars["symbol_hist_len"] = bars.groupby("symbol").cumcount() + 1
         latest = bars.groupby("symbol", as_index=False, group_keys=False).tail(1).copy()
-
-        # 日中累積出来高/売買代金がある場合は、それを流動性フィルタに使えるようにする。
         latest["volume"] = pd.to_numeric(latest.get("trading_volume"), errors="coerce").fillna(pd.to_numeric(latest.get("tick_count"), errors="coerce")).fillna(0.0)
         latest["turnover"] = pd.to_numeric(latest.get("trading_value"), errors="coerce")
         latest["turnover"] = latest["turnover"].fillna(latest["close"] * latest["volume"])
 
-        # 軽量スコア。重いscoring/enrichは後段の非同期・既存パッチに任せる。
         score = (latest["slope"].fillna(0.0) * 1000.0).clip(-3.0, 3.0)
         range_bonus = (latest["range_pct"].fillna(0.0) * 20.0).clip(0.0, 2.0)
         latest["score_buy"] = (score.clip(lower=0.0) + range_bonus.where(score > 0, 0.0)).fillna(0.0)
@@ -321,7 +403,6 @@ def _build_memory_1m_summary(*, now: dt.datetime) -> pd.DataFrame:
         latest["score_total"] = latest["score"]
         latest["final_score"] = latest["score"]
         latest["display_score"] = latest["score"]
-
         latest["mtf"] = latest.get("mtf", 0.0)
         latest["score_mtf"] = latest.get("score_mtf", 0.0)
         latest["mtf_score"] = latest.get("mtf_score", 0.0)
@@ -333,6 +414,13 @@ def _build_memory_1m_summary(*, now: dt.datetime) -> pd.DataFrame:
         latest["end_time"] = latest["datetime"] + pd.Timedelta(minutes=1)
         latest["time"] = latest["datetime"]
         latest["date"] = latest["datetime"].dt.date.astype(str)
+        latest["open_price"] = latest["open"]
+        latest["high_price"] = latest["high"]
+        latest["low_price"] = latest["low"]
+        latest["close_price"] = latest["close"]
+        latest["current_price"] = latest["close"]
+        latest["price"] = latest["close"]
+        latest["vwap"] = latest["close"]
 
         max_symbols = max(10, _env_int("SUMMARY_MAIN_MEMORY_MAX_SYMBOLS", 200))
         latest = latest.sort_values(["datetime", "symbol"], kind="stable").tail(max_symbols).reset_index(drop=True)
@@ -344,13 +432,14 @@ def _build_memory_1m_summary(*, now: dt.datetime) -> pd.DataFrame:
         except Exception:
             pass
         logger.warning(
-            "[SUMMARY MAIN MEMORY 1M] built rows=%s symbols=%s latest_dt=%s age_sec=%s raw_rows=%s tick_rows=%s",
+            "[SUMMARY MAIN MEMORY 1M] built rows=%s symbols=%s latest_dt=%s age_sec=%s raw_rows=%s tick_rows=%s version=%s",
             len(latest),
             int(latest["symbol"].nunique()) if "symbol" in latest.columns else 0,
             latest_dt,
             None if age is None else round(float(age), 1),
             len(raw),
             len(ticks),
+            VERSION,
         )
         return latest
     except Exception:
@@ -364,6 +453,11 @@ def _publish_latest(df: pd.DataFrame) -> None:
     try:
         gd = _global_data()
         if gd is not None:
+            for name in ("push_summary_1", "push_summary_1min", "push_merged_summary_1", "push_merged_summary_1min", "merged_summary_1", "merged_summary_1min"):
+                try:
+                    setattr(gd, name, df)
+                except Exception:
+                    pass
             fn = getattr(gd, "set_merged_summary", None) or getattr(gd, "set_push_merged_summary", None)
             if callable(fn):
                 try:
@@ -408,7 +502,7 @@ def _wrap_runner_core() -> bool:
     if not callable(orig_job_summary):
         logger.warning("[SUMMARY MAIN MEMORY 1M] runner_core.job_summary unavailable")
         return False
-    if getattr(orig_job_summary, "_summary_main_memory_latest_wrapped", False):
+    if getattr(orig_job_summary, "_summary_main_memory_latest_wrapped_v2", False):
         return True
 
     @wraps(orig_job_summary)
@@ -424,6 +518,7 @@ def _wrap_runner_core() -> bool:
             now_i = dt.datetime.now().replace(microsecond=0)
 
         t0 = time.perf_counter()
+        raw = _load_push_memory_df()
         df = _build_memory_1m_summary(now=now_i)
         if isinstance(df, pd.DataFrame) and not df.empty:
             _publish_latest(df)
@@ -436,15 +531,25 @@ def _wrap_runner_core() -> bool:
             )
             return df
 
+        if _env_bool("SUMMARY_MAIN_MEMORY_NO_HEAVY_FALLBACK_WHEN_RAW_EXISTS", True) and isinstance(raw, pd.DataFrame) and not raw.empty:
+            logger.warning(
+                "[SUMMARY MAIN MEMORY 1M] memory build empty but raw exists -> skip original heavy fallback interval=%s raw_rows=%s elapsed=%.3fs",
+                interval_i,
+                len(raw),
+                time.perf_counter() - t0,
+            )
+            return pd.DataFrame()
+
         logger.warning("[SUMMARY MAIN MEMORY 1M] memory summary empty -> original fallback interval=%s", interval_i)
         return orig_job_summary(interval_i, display=display, now=now_i, run_entry=run_entry, **kwargs)
 
     job_summary_memory._summary_main_memory_latest_wrapped = True  # type: ignore[attr-defined]
+    job_summary_memory._summary_main_memory_latest_wrapped_v2 = True  # type: ignore[attr-defined]
     job_summary_memory._original = orig_job_summary  # type: ignore[attr-defined]
     rc.job_summary = job_summary_memory
     rc.run_push_summary_job = lambda interval=1, display=True, now=None, run_entry=True, **kwargs: job_summary_memory(int(interval), display=display, now=now, run_entry=run_entry, **kwargs)
     rc.job_1m = lambda display=True, now=None, run_entry=True: job_summary_memory(1, display=display, now=now, run_entry=run_entry)
-    logger.warning("[SUMMARY MAIN MEMORY 1M] runner_core wrapped")
+    logger.warning("[SUMMARY MAIN MEMORY 1M] runner_core wrapped version=%s", VERSION)
     return True
 
 
@@ -468,9 +573,10 @@ def install() -> bool:
         return False
     try:
         os.environ.setdefault("SUMMARY_MAIN_MEMORY_LATEST_1M_ENABLED", "1")
-        os.environ.setdefault("SUMMARY_MAIN_MEMORY_LOOKBACK_MIN", "20")
+        os.environ.setdefault("SUMMARY_MAIN_MEMORY_LOOKBACK_MIN", "30")
         os.environ.setdefault("SUMMARY_MAIN_MEMORY_MAX_SYMBOLS", "200")
         os.environ.setdefault("SUMMARY_MAIN_MEMORY_ASYNC_AI", "1")
+        os.environ.setdefault("SUMMARY_MAIN_MEMORY_NO_HEAVY_FALLBACK_WHEN_RAW_EXISTS", "1")
         ok = _wrap_runner_core()
         _wrap_scheduler_runner_aliases()
         _INSTALLED = bool(ok)
@@ -487,4 +593,4 @@ except Exception:
     logger.exception("[SUMMARY MAIN MEMORY 1M] auto install failed")
 
 
-__all__ = ["VERSION", "install"]
+__all__ = ["VERSION", "install", "_build_memory_1m_summary", "_load_push_memory_df"]
