@@ -1,12 +1,18 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_main_1m_light_tick_patch.py
-# Version: V4-MAIN-1M-LIGHT-DB-HISTORY-NO-RAWDB-WATCHDOG
+# Version: V5-MAIN-1M-LIGHT-AI-SCORED-FRESH-GUARD
 # ------------------------------------------------------------
 # main.py is entry-only: do not wait for/save/display heavy summary work.
 # It only calculates PUSH 1m quickly, submits Summary-AI asynchronously, reads
 # recent 1m history from summaryYYYYMMDD.db, and blocks slow raw push DB fallback
 # from main.py 1m fallback path.
+#
+# V5:
+#   - Summary AI async submit直前で入力DFを検査する。
+#   - score_buy/score_sell/score_total/final_score/display_score が全て0のDFは
+#     AIへ渡さず、GlobalContext上の scored completed 1m PUSH summary に差し替える。
+#   - scored summary が無い/古すぎる場合は no_candidates を増やさないためAIをスキップ。
 # ============================================================
 from __future__ import annotations
 
@@ -24,7 +30,7 @@ from typing import Any, Optional
 import pandas as pd
 
 logger = logging.getLogger(__name__)
-VERSION = "V4-MAIN-1M-LIGHT-DB-HISTORY-NO-RAWDB-WATCHDOG"
+VERSION = "V5-MAIN-1M-LIGHT-AI-SCORED-FRESH-GUARD"
 _INSTALLED = False
 _HISTORY_INSTALLED = False
 _AI_EXECUTOR: ThreadPoolExecutor | None = None
@@ -55,6 +61,16 @@ def _env_int(name: str, default: int) -> int:
     except Exception:
         pass
     return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is not None and str(v).strip() != "":
+            return float(str(v).strip())
+    except Exception:
+        pass
+    return float(default)
 
 
 def _argv_text() -> str:
@@ -104,6 +120,7 @@ def _normalize_df_light(df: pd.DataFrame, *, now: dt.datetime) -> pd.DataFrame:
         return pd.DataFrame()
     try:
         out = df.copy(deep=False)
+        out = out.loc[:, ~pd.Index(out.columns).duplicated()].copy()
         if "datetime" in out.columns:
             out["datetime"] = _normalize_dt(out["datetime"])
             cutoff = pd.Timestamp(now).tz_localize(None)
@@ -162,6 +179,146 @@ def _normalize_hist(df: pd.DataFrame, *, interval: int = 1) -> pd.DataFrame:
     except Exception:
         logger.exception("[SUMMARY MAIN DB HISTORY] normalize failed interval=%s", interval)
         return pd.DataFrame()
+
+
+def _num_series(df: pd.DataFrame, names: tuple[str, ...], default: float = 0.0) -> pd.Series:
+    for name in names:
+        try:
+            if name in df.columns:
+                return pd.to_numeric(df[name], errors="coerce").fillna(default).astype(float)
+        except Exception:
+            continue
+    return pd.Series(default, index=df.index, dtype="float64")
+
+
+def _score_profile(df: Any) -> dict[str, Any]:
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return {"rows": 0, "score_nonzero": 0, "buy_pos": 0, "sell_pos": 0, "latest": None, "age": None}
+        buy = _num_series(df, ("ai_disp_buy_score", "config_buy_score", "score_buy", "buy_score", "buy", "buy_signal_score"), 0.0)
+        sell = _num_series(df, ("ai_disp_sell_score", "config_sell_score", "score_sell", "sell_score", "sell", "sell_signal_score"), 0.0).abs()
+        total = _num_series(df, ("ai_disp_total_score", "score_total", "total_score", "combined_score", "final_score", "display_score", "score"), 0.0)
+        latest = None
+        age = None
+        if "datetime" in df.columns:
+            try:
+                dts = pd.to_datetime(df["datetime"], errors="coerce")
+                try:
+                    dts = dts.dt.tz_localize(None)
+                except Exception:
+                    pass
+                latest_ts = dts.max()
+                if pd.notna(latest_ts):
+                    latest = latest_ts.to_pydatetime() if hasattr(latest_ts, "to_pydatetime") else latest_ts
+                    age = (dt.datetime.now().replace(tzinfo=None) - latest.replace(tzinfo=None)).total_seconds()
+            except Exception:
+                pass
+        return {
+            "rows": len(df),
+            "score_nonzero": int(((buy.abs() > 0) | (sell.abs() > 0) | (total.abs() > 0)).sum()),
+            "buy_pos": int((buy > 0).sum()),
+            "sell_pos": int((sell > 0).sum()),
+            "total_pos": int((total > 0).sum()),
+            "total_neg": int((total < 0).sum()),
+            "buy_max": float(buy.max()) if len(buy) else 0.0,
+            "sell_max": float(sell.max()) if len(sell) else 0.0,
+            "latest": latest,
+            "age": age,
+        }
+    except Exception:
+        return {"rows": 0, "score_nonzero": 0, "buy_pos": 0, "sell_pos": 0, "latest": None, "age": None}
+
+
+def _fresh_enough(df: pd.DataFrame) -> bool:
+    prof = _score_profile(df)
+    age = prof.get("age")
+    if age is None:
+        return True
+    return float(age) <= _env_float("SUMMARY_MAIN_AI_MAX_SCORE_AGE_SEC", 300.0)
+
+
+def _get_scored_context_summary(*, now: dt.datetime) -> pd.DataFrame:
+    if not _env_bool("SUMMARY_MAIN_AI_USE_SCORED_CONTEXT", True):
+        return pd.DataFrame()
+    try:
+        import core.global_context.context as ctx
+        calls = (
+            ("get_push_merged_summary", {"tf": 1}),
+            ("get_push_merged_summary", {"interval": 1}),
+            ("get_merged_summary", {"tf": 1, "source": "push"}),
+            ("get_merged_summary", {"interval": 1, "source": "push"}),
+            ("get_push_summary", {"tf": 1}),
+            ("get_push_summary", {"interval": 1}),
+        )
+        best = pd.DataFrame()
+        best_prof: dict[str, Any] = {"score_nonzero": -1, "age": None}
+        best_name = ""
+        for name, kwargs in calls:
+            fn = getattr(ctx, name, None)
+            if not callable(fn):
+                continue
+            try:
+                df = fn(**kwargs)
+            except TypeError:
+                continue
+            except Exception:
+                continue
+            x = _normalize_df_light(df, now=now) if isinstance(df, pd.DataFrame) else pd.DataFrame()
+            if x.empty:
+                continue
+            prof = _score_profile(x)
+            if int(prof.get("score_nonzero", 0) or 0) <= 0:
+                continue
+            if not _fresh_enough(x):
+                logger.warning(
+                    "[SUMMARY MAIN AI INPUT GUARD] skip stale scored context source=%s rows=%s latest=%s age=%s score_nonzero=%s",
+                    name, prof.get("rows"), prof.get("latest"), prof.get("age"), prof.get("score_nonzero"),
+                )
+                continue
+            if int(prof.get("score_nonzero", 0)) > int(best_prof.get("score_nonzero", -1)):
+                best = x
+                best_prof = prof
+                best_name = name
+        if isinstance(best, pd.DataFrame) and not best.empty:
+            logger.warning(
+                "[SUMMARY MAIN AI INPUT GUARD] selected scored context source=%s rows=%s latest=%s age=%s score_nonzero=%s buy_pos=%s sell_pos=%s",
+                best_name, best_prof.get("rows"), best_prof.get("latest"), best_prof.get("age"), best_prof.get("score_nonzero"), best_prof.get("buy_pos"), best_prof.get("sell_pos"),
+            )
+            return best
+    except Exception:
+        logger.exception("[SUMMARY MAIN AI INPUT GUARD] scored context lookup failed")
+    return pd.DataFrame()
+
+
+def _prepare_ai_submit_df(df: pd.DataFrame, *, interval: int, now: dt.datetime, reason: str) -> pd.DataFrame:
+    x = _normalize_df_light(df, now=now)
+    if x.empty:
+        return x
+    if int(interval) != 1 or not _env_bool("SUMMARY_MAIN_AI_REQUIRE_SCORED_INPUT", True):
+        return x
+    prof = _score_profile(x)
+    has_score = int(prof.get("score_nonzero", 0) or 0) > 0
+    is_fresh = _fresh_enough(x)
+    if has_score and is_fresh:
+        logger.warning(
+            "[SUMMARY MAIN AI INPUT GUARD] using current scored df rows=%s latest=%s age=%s score_nonzero=%s buy_pos=%s sell_pos=%s reason=%s",
+            prof.get("rows"), prof.get("latest"), prof.get("age"), prof.get("score_nonzero"), prof.get("buy_pos"), prof.get("sell_pos"), reason,
+        )
+        return x
+    repl = _get_scored_context_summary(now=now)
+    if isinstance(repl, pd.DataFrame) and not repl.empty:
+        rprof = _score_profile(repl)
+        logger.warning(
+            "[SUMMARY MAIN AI INPUT GUARD] replaced AI input current_rows=%s current_score_nonzero=%s current_latest=%s current_age=%s replacement_rows=%s replacement_score_nonzero=%s replacement_latest=%s replacement_age=%s reason=%s",
+            prof.get("rows"), prof.get("score_nonzero"), prof.get("latest"), prof.get("age"),
+            rprof.get("rows"), rprof.get("score_nonzero"), rprof.get("latest"), rprof.get("age"), reason,
+        )
+        return repl
+    logger.warning(
+        "[SUMMARY MAIN AI INPUT GUARD] async AI skipped reason=no_fresh_scored_df current_rows=%s current_score_nonzero=%s latest=%s age=%s submit_reason=%s",
+        prof.get("rows"), prof.get("score_nonzero"), prof.get("latest"), prof.get("age"), reason,
+    )
+    return pd.DataFrame()
 
 
 def _push_symbols(limit: int) -> list[str]:
@@ -347,22 +504,29 @@ def _install_no_raw_db_watchdog() -> bool:
 def _submit_async_ai(df: pd.DataFrame, *, interval: int, now: dt.datetime, run_entry: bool, reason: str) -> None:
     if not (_is_entry_only_context() and _env_bool("SUMMARY_MAIN_ASYNC_AI_ENTRY", True) and run_entry and int(interval) in (1, 3, 5)):
         return
-    rows = len(df) if isinstance(df, pd.DataFrame) else 0
+    now_i = (now or dt.datetime.now()).replace(microsecond=0) if isinstance(now, dt.datetime) else dt.datetime.now().replace(microsecond=0)
+    df_ai = _prepare_ai_submit_df(df, interval=int(interval), now=now_i, reason=reason)
+    rows = len(df_ai) if isinstance(df_ai, pd.DataFrame) else 0
     if rows <= 0:
+        logger.warning("[SUMMARY MAIN LIGHT TICK] async AI not submitted interval=%s reason=%s rows=0", interval, reason)
         return
-    key = f"summary-ai:{int(interval)}:{now.strftime('%Y%m%d%H%M%S') if isinstance(now, dt.datetime) else now}"
+    key = f"summary-ai:{int(interval)}:{now_i.strftime('%Y%m%d%H%M%S')}"
     with _AI_LOCK:
         if key in _AI_RUNNING_KEYS:
             logger.warning("[SUMMARY MAIN LIGHT TICK] async AI skipped already_running key=%s rows=%s", key, rows)
             return
         _AI_RUNNING_KEYS.add(key)
-    df_copy = df.copy(deep=False)
+    df_copy = df_ai.copy(deep=False)
 
     def _task() -> None:
         try:
-            logger.warning("[SUMMARY MAIN LIGHT TICK] async AI start key=%s interval=%s rows=%s reason=%s", key, interval, rows, reason)
+            prof = _score_profile(df_copy)
+            logger.warning(
+                "[SUMMARY MAIN LIGHT TICK] async AI start key=%s interval=%s rows=%s reason=%s latest=%s score_nonzero=%s buy_pos=%s sell_pos=%s",
+                key, interval, rows, reason, prof.get("latest"), prof.get("score_nonzero"), prof.get("buy_pos"), prof.get("sell_pos"),
+            )
             from scheduler_jobs.summary.summary_ai_entry_hook_v20 import run_summary_ai_entry_safe
-            run_summary_ai_entry_safe(interval=int(interval), now=now, df=df_copy, source="SUMMARY")
+            run_summary_ai_entry_safe(interval=int(interval), now=now_i, df=df_copy, source="SUMMARY")
         except Exception:
             logger.exception("[SUMMARY MAIN LIGHT TICK] async AI failed key=%s interval=%s", key, interval)
         finally:
@@ -393,6 +557,9 @@ def install() -> bool:
         os.environ.setdefault("SUMMARY_MAIN_HISTORY_MAX_SYMBOLS", "160")
         os.environ.setdefault("SUMMARY_MAIN_DISABLE_RAW_DB_FALLBACK", "1")
         os.environ.setdefault("SUMMARY_MAIN_SKIP_PUSH_DB_FALLBACK", "1")
+        os.environ.setdefault("SUMMARY_MAIN_AI_REQUIRE_SCORED_INPUT", "1")
+        os.environ.setdefault("SUMMARY_MAIN_AI_USE_SCORED_CONTEXT", "1")
+        os.environ.setdefault("SUMMARY_MAIN_AI_MAX_SCORE_AGE_SEC", "300")
         _install_history_patch()
         _install_no_raw_db_watchdog()
 
@@ -465,7 +632,11 @@ def install() -> bool:
             rc.job_1m = lambda display=True, now=None, run_entry=True: job_summary_light(1, display=display, now=now, run_entry=run_entry)
 
         _INSTALLED = True
-        logger.warning("[SUMMARY MAIN LIGHT TICK] installed version=%s main=%s db_history=%s no_raw_db=%s", VERSION, _is_main_py(), os.getenv("SUMMARY_MAIN_LOAD_DB_HISTORY"), os.getenv("SUMMARY_MAIN_DISABLE_RAW_DB_FALLBACK"))
+        logger.warning(
+            "[SUMMARY MAIN LIGHT TICK] installed version=%s main=%s db_history=%s no_raw_db=%s ai_scored_guard=%s ai_max_age=%s",
+            VERSION, _is_main_py(), os.getenv("SUMMARY_MAIN_LOAD_DB_HISTORY"), os.getenv("SUMMARY_MAIN_DISABLE_RAW_DB_FALLBACK"),
+            os.getenv("SUMMARY_MAIN_AI_REQUIRE_SCORED_INPUT"), os.getenv("SUMMARY_MAIN_AI_MAX_SCORE_AGE_SEC"),
+        )
         return True
     except Exception:
         logger.exception("[SUMMARY MAIN LIGHT TICK] install failed")
