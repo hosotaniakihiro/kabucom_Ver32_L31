@@ -1,12 +1,13 @@
 # ============================================================
 # File   : scheduler_jobs/summary/display_runner.py
-# Version: V4.4-SHOW-1MIN-SUMMARY-AND-GUARD-FALLBACK
+# Version: V4.5-TOP10-SCORE-ONLY-DISPLAY-GUARD
 # ------------------------------------------------------------
 # ✔ 1分足もDiscord通知できるように変更
 # ✔ SUMMARY_NOTIFY_1MIN_DISCORD=1 を既定ON
-# ✔ 表示ガードで0件になった場合、元DFからフォールバック表示する
 # ✔ PUSH / RANKING 両方に適用
-# ✔ close <= 200 除外、BUY/SELL slope条件は維持しつつ、全件落ち時だけ救済
+# ✔ close <= 200 除外
+# ✔ 表示TOP10では slope 条件を既定OFF
+# ✔ エントリー判定は変更しない。表示専用の緩和。
 # ============================================================
 
 from __future__ import annotations
@@ -88,6 +89,11 @@ def _resolve_display_max_sell_slope() -> float:
     return float(DEFAULT_DISPLAY_MAX_SELL_SLOPE)
 
 
+def _top10_slope_filter_enabled() -> bool:
+    # 表示TOP10では既定OFF。旧挙動へ戻したい場合だけ 1 にする。
+    return _env_bool("SUMMARY_DISPLAY_TOP10_REQUIRE_SLOPE", False)
+
+
 def _select_first_col(df: pd.DataFrame, candidates: tuple[str, ...]) -> Optional[str]:
     if df is None or df.empty:
         return None
@@ -157,6 +163,7 @@ def _apply_display_universe_guard(
     min_price = _resolve_display_min_price()
     min_buy_slope = _resolve_display_min_buy_slope()
     max_sell_slope = _resolve_display_max_sell_slope()
+    require_slope = _top10_slope_filter_enabled()
 
     before = len(out)
 
@@ -184,8 +191,11 @@ def _apply_display_universe_guard(
     sell_s = _to_num_series(out, sell_col, 0.0).abs()
 
     price_ok = price_s > float(min_price)
-    buy_ok = price_ok & (buy_s > 0.0) & (slope_s > float(min_buy_slope))
-    sell_ok = price_ok & (sell_s > 0.0) & (slope_s < float(max_sell_slope))
+    buy_ok = price_ok & (buy_s > 0.0)
+    sell_ok = price_ok & (sell_s > 0.0)
+    if require_slope:
+        buy_ok &= slope_s > float(min_buy_slope)
+        sell_ok &= slope_s < float(max_sell_slope)
     keep_mask = buy_ok | sell_ok
 
     filtered = out.loc[keep_mask].copy()
@@ -205,8 +215,8 @@ def _apply_display_universe_guard(
 
     logger.info(
         "[DISPLAY UNIVERSE GUARD] source=%s interval=%s price_col=%s slope_col=%s buy_col=%s sell_col=%s "
-        "condition='price > %.1f and ((buy > 0 and slope > %.4f) or (sell > 0 and slope < %.4f))' "
-        "before=%s after=%s skipped=%s skipped_head=%s",
+        "condition='price > %.1f and ((buy > 0%s) or (sell > 0%s))' "
+        "before=%s after=%s skipped=%s slope_required=%s skipped_head=%s",
         source,
         interval,
         price_col,
@@ -214,11 +224,12 @@ def _apply_display_universe_guard(
         buy_col,
         sell_col,
         float(min_price),
-        float(min_buy_slope),
-        float(max_sell_slope),
+        f" and slope > {float(min_buy_slope):.4f}" if require_slope else "",
+        f" and slope < {float(max_sell_slope):.4f}" if require_slope else "",
         before,
         after,
         before - after,
+        require_slope,
         skipped_head,
     )
 
@@ -226,11 +237,6 @@ def _apply_display_universe_guard(
 
 
 def _fallback_when_guard_empty(df: pd.DataFrame, *, interval: int, source: str) -> pd.DataFrame:
-    """
-    表示ガードで全件落ちした場合の救済。
-    1分足は動きが小さいため slope条件で全件消えやすい。
-    結果が見えないと状態確認できないので、price>min_price の範囲からスコア順で表示する。
-    """
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -267,7 +273,6 @@ def _fallback_when_guard_empty(df: pd.DataFrame, *, interval: int, source: str) 
         )
         return pd.DataFrame()
 
-    # 表示関数がBUY/SELLを分けられるように、score_buy/sellが無い場合はscoreから補完する。
     if score_col is not None:
         score_s = _to_num_series(out, score_col, 0.0)
     else:
@@ -278,7 +283,6 @@ def _fallback_when_guard_empty(df: pd.DataFrame, *, interval: int, source: str) 
     if sell_col is None or sell_col not in out.columns:
         out["score_sell"] = np.maximum(-score_s, 0.0)
 
-    # scoreがすべて0でも、候補なしではなく状態確認用に先頭を表示する。
     sort_col = score_col if score_col is not None and score_col in out.columns else None
     if sort_col:
         out["_display_abs_score"] = _to_num_series(out, sort_col, 0.0).abs()
@@ -308,13 +312,6 @@ def _fallback_when_guard_empty(df: pd.DataFrame, *, interval: int, source: str) 
 
 
 def _should_notify_discord(interval: int) -> bool:
-    """
-    旧仕様: 1分足はDiscord通知しない。
-    新仕様: 1分足も確認したい要望があるため既定ON。
-
-    OFFに戻す場合:
-      SUMMARY_NOTIFY_1MIN_DISCORD=0
-    """
     try:
         iv = int(interval)
     except Exception:
@@ -322,15 +319,6 @@ def _should_notify_discord(interval: int) -> bool:
     if iv == 1:
         return _env_bool("SUMMARY_NOTIFY_1MIN_DISCORD", True)
     return True
-
-
-def _safe_display_df(df: Any) -> pd.DataFrame:
-    try:
-        if isinstance(df, pd.DataFrame):
-            return df.copy()
-    except Exception:
-        pass
-    return pd.DataFrame()
 
 
 def display_push_summary(
