@@ -1,24 +1,19 @@
 # ============================================================
 # File   : core/startup/summary_ai_async_direct_dispatch_patch.py
-# Version: V6-PIPELINE-SOURCE-MATCH
+# Version: V7-FORCE-DIRECT-SYNC-ORDER-DISPATCH
 # ------------------------------------------------------------
 # 目的:
-#   SUMMARY AI が AI_OK を出しても、summary_ai_async_entry_patch が
-#   executed=False / skip=queued_async を返したまま実際の entry_controller
-#   dispatch が薄いケースを救済する。
+#   SUMMARY AI が AI_OK / approved を出しても、
+#   summary_ai_async_entry_patch が executed=False / skip=queued_async を返し、
+#   実発注がworker待ち・stale skip になる問題を止める。
 #
-# V6:
-#   - direct snapshot 実行時に pipeline_source="SUMMARY_AI" 固定で渡していたため、
-#     approved_rows 側の source="SUMMARY" と entry_controller の source filter が不一致になり、
-#       ENTRY_SKIP reason=PIPELINE_FILTER_MISMATCH
-#     で全件落ちる問題を修正。
-#   - approved_rows の source / pipeline_source / entry_type から実sourceを解決し、
-#     SUMMARY候補は pipeline_source="SUMMARY" で entry_controller へ渡す。
-#
-# V5:
-#   - 古い direct dispatch thread を latest-only で破棄する。
-#   - pending 登録前の stale skip / no_pending_registered を避けるため、
-#     まず trading.summary.summary_entry.execute_entry_pipeline を直接実行する。
+# V7:
+#   - SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC=1 を強制する。
+#   - summary_ai_async_entry_patch 側が install 時に direct_sync=0 へ戻しても、
+#     このパッチの install / watcher で 1 に戻す。
+#   - それでも queued_async が返った場合は、承認済み行を直接 entry pipeline へ渡す。
+#   - direct snapshot の pipeline_source は approved_rows から解決し、SUMMARY候補は
+#     pipeline_source="SUMMARY" として流す。
 # ============================================================
 from __future__ import annotations
 
@@ -29,12 +24,13 @@ import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+VERSION = "V7-FORCE-DIRECT-SYNC-ORDER-DISPATCH"
 _INSTALLED = False
 _ORIG = None
 _SEQ = 0
 _LOCK = threading.Lock()
 _WATCHER_STARTED = False
-
 
 _RETRYABLE_NO_ORDER_MARKERS = (
     "queued_async",
@@ -50,6 +46,17 @@ _RETRYABLE_NO_ORDER_MARKERS = (
     "no_pending_registered",
     "pipeline_filter_mismatch",
 )
+
+
+def _force_direct_sync_env() -> None:
+    os.environ["SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC"] = "1"
+    os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY", "1")
+    os.environ.setdefault("SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT", "1")
+    os.environ.setdefault("SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK", "1")
+    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_SNAPSHOT_FIRST", "1")
+    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_MAX_ATTEMPTS", "2")
+    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_RETRY_SLEEP_SEC", "0.7")
+    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_PIPELINE_SOURCE", "SUMMARY")
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -108,16 +115,17 @@ def _symbols(rows: Any, limit: int = 20) -> list[str]:
         for r in list(rows or [])[:limit]:
             d = _row_to_dict(r)
             if d:
-                out.append(str(d.get("symbol") or ""))
+                sym = str(d.get("symbol") or "").strip()
             else:
-                out.append(str(getattr(r, "symbol", "")))
+                sym = str(getattr(r, "symbol", "") or "").strip()
+            if sym:
+                out.append(sym)
     except Exception:
         pass
-    return [x for x in out if x]
+    return out
 
 
 def _resolve_pipeline_source(rows: list[Any]) -> str:
-    """entry_controller の source filter と一致する pipeline_source を解決する。"""
     try:
         counts: dict[str, int] = {}
         for r in list(rows or [])[:50]:
@@ -143,11 +151,10 @@ def _resolve_pipeline_source(rows: list[Any]) -> str:
                 if not s:
                     continue
                 if s in {"SUMMARY_AI", "AI"}:
-                    # SUMMARY_AI は entry type として扱い、source にはしない。
                     continue
-                if s in {"SUMMARY", "PUSH"}:
+                if s in {"PUSH", "SUMMARY"}:
                     s = "SUMMARY"
-                if s in {"RANKING", "TONOSAMA", "SUMMARY"}:
+                if s in {"SUMMARY", "RANKING", "TONOSAMA"}:
                     counts[s] = counts.get(s, 0) + 1
                     break
         if counts:
@@ -180,9 +187,8 @@ def _flatten_reasons(result: Any) -> str:
                 child = v.get(k)
                 if child is not None and child is not v:
                     walk(child, depth + 1)
-            detail = v.get("result")
-            if isinstance(detail, list):
-                walk(detail, depth + 1)
+            if isinstance(v.get("result"), list):
+                walk(v.get("result"), depth + 1)
         elif isinstance(v, (list, tuple, set)):
             for x in list(v)[:30]:
                 walk(x, depth + 1)
@@ -200,11 +206,9 @@ def _result_executed(result: Any) -> bool:
         if isinstance(result, dict):
             if bool(result.get("executed")):
                 return True
-            for key in ("executed_count", "order_count", "submitted_count", "sent_count", "approved_count"):
+            for key in ("executed_count", "order_count", "submitted_count", "sent_count"):
                 try:
                     if int(result.get(key) or 0) > 0:
-                        if key == "approved_count" and not bool(result.get("executed")):
-                            continue
                         return True
                 except Exception:
                     pass
@@ -247,13 +251,12 @@ def _registered_count(result: Any) -> int:
             if direct is not None:
                 return int(direct or 0)
             for key in ("result", "pipeline_result"):
-                child = result.get(key)
-                n = _registered_count(child)
+                n = _registered_count(result.get(key))
                 if n > 0:
                     return n
-        return 0
     except Exception:
-        return 0
+        pass
+    return 0
 
 
 def _is_retryable_no_order(result: Any) -> bool:
@@ -265,23 +268,12 @@ def _is_retryable_no_order(result: Any) -> bool:
             return True
         if _registered_count(result) > 0:
             return True
-        return False
     except Exception:
-        return False
-
-
-def _is_latest_seq(seq: int) -> bool:
-    if not _env_bool("SUMMARY_AI_DIRECT_DISPATCH_LATEST_ONLY", True):
-        return True
-    try:
-        with _LOCK:
-            return int(seq) == int(_SEQ)
-    except Exception:
-        return True
+        pass
+    return False
 
 
 def _direct_snapshot_execute(approved_rows: list[Any], interval: Any) -> Any:
-    """pending を経由せず、SUMMARY AI 承認済み候補を直接 entry pipeline へ渡す。"""
     if not _env_bool("SUMMARY_AI_DIRECT_DISPATCH_SNAPSHOT_FIRST", True):
         return None
     try:
@@ -291,9 +283,10 @@ def _direct_snapshot_execute(approved_rows: list[Any], interval: Any) -> Any:
             return None
         pipeline_source = _resolve_pipeline_source(approved_rows)
         logger.warning(
-            "[SUMMARY AI DIRECT DISPATCH] direct snapshot pipeline_source resolved=%s symbols=%s",
+            "[SUMMARY AI DIRECT DISPATCH] direct snapshot pipeline_source resolved=%s symbols=%s version=%s",
             pipeline_source,
             _symbols(approved_rows),
+            VERSION,
         )
         return fn(approved_rows, pipeline_source=pipeline_source, interval=interval)
     except TypeError:
@@ -309,172 +302,81 @@ def _direct_snapshot_execute(approved_rows: list[Any], interval: Any) -> Any:
     return None
 
 
-def _direct_worker(seq: int, approved_rows: list[Any], df_summary: Any, interval: Any, max_attempts: int) -> None:
-    delay = max(0.0, _env_float("SUMMARY_AI_DIRECT_DISPATCH_DELAY_SEC", 0.10))
-    if delay > 0:
-        time.sleep(delay)
-    if not _is_latest_seq(seq):
-        logger.warning(
-            "[SUMMARY AI DIRECT DISPATCH] skip old seq=%s latest_only=True symbols=%s",
-            seq,
-            _symbols(approved_rows),
-        )
-        return
-
-    if _env_bool("SUMMARY_AI_DIRECT_DISPATCH_SNAPSHOT_FIRST", True):
-        started = time.time()
-        logger.warning(
-            "[SUMMARY AI DIRECT DISPATCH] snapshot-first start seq=%s interval=%s approved=%s symbols=%s",
-            seq,
-            interval,
-            len(approved_rows),
-            _symbols(approved_rows),
-        )
-        snap_result = _direct_snapshot_execute(approved_rows, interval)
-        logger.warning(
-            "[SUMMARY AI DIRECT DISPATCH] snapshot-first done seq=%s elapsed=%.3fs executed=%s reason_chain=%s result=%s",
-            seq,
-            time.time() - started,
-            _result_executed(snap_result),
-            _flatten_reasons(snap_result),
-            snap_result,
-        )
-        if _result_executed(snap_result):
-            return
-        if snap_result is not None and not _is_retryable_no_order(snap_result):
-            return
-
+def _fallback_direct_dispatch(result: Any, kwargs: dict[str, Any]) -> Any:
     try:
-        from trading.summary.summary_entry import run_summary_entry_executor
-    except Exception:
-        logger.exception("[SUMMARY AI DIRECT DISPATCH] import run_summary_entry_executor failed seq=%s", seq)
-        return
-
-    retry_sleep = max(0.3, _env_float("SUMMARY_AI_DIRECT_DISPATCH_RETRY_SLEEP_SEC", 0.7))
-    attempts = max(1, max_attempts)
-    last_result: Any = None
-
-    for attempt in range(1, attempts + 1):
-        if not _is_latest_seq(seq):
-            logger.warning(
-                "[SUMMARY AI DIRECT DISPATCH] stop old seq before attempt seq=%s attempt=%s latest_only=True symbols=%s",
-                seq,
-                attempt,
-                _symbols(approved_rows),
-            )
-            return
-        started = time.time()
-        try:
-            logger.warning(
-                "[SUMMARY AI DIRECT DISPATCH] fallback start seq=%s attempt=%s/%s interval=%s approved=%s symbols=%s",
-                seq,
-                attempt,
-                attempts,
-                interval,
-                len(approved_rows),
-                _symbols(approved_rows),
-            )
-            result = run_summary_entry_executor(approved_rows, df_summary, interval)
-            last_result = result
-            executed = _result_executed(result)
-            registered = _registered_count(result)
-            reason_chain = _flatten_reasons(result)
-            retryable = _is_retryable_no_order(result)
-            logger.warning(
-                "[SUMMARY AI DIRECT DISPATCH] fallback done seq=%s attempt=%s/%s elapsed=%.3fs executed=%s registered=%s retryable_no_order=%s reason_chain=%s result=%s",
-                seq,
-                attempt,
-                attempts,
-                time.time() - started,
-                executed,
-                registered,
-                retryable,
-                reason_chain,
-                result,
-            )
-            if executed:
-                return
-            if not retryable:
-                return
-        except Exception:
-            logger.exception("[SUMMARY AI DIRECT DISPATCH] fallback failed seq=%s attempt=%s/%s", seq, attempt, attempts)
-        if attempt < attempts:
-            logger.warning(
-                "[SUMMARY AI DIRECT DISPATCH] retry no-order seq=%s next_attempt=%s/%s sleep=%.2fs symbols=%s last_reason=%s",
-                seq,
-                attempt + 1,
-                attempts,
-                retry_sleep,
-                _symbols(approved_rows),
-                _flatten_reasons(last_result),
-            )
-            time.sleep(retry_sleep)
-
-
-def _patched_execute_ai_ok_entries_bulk(*args: Any, **kwargs: Any):
-    global _SEQ
-    result = _ORIG(*args, **kwargs)
-    try:
-        if not _env_bool("SUMMARY_AI_DIRECT_DISPATCH_ON_QUEUED_ASYNC", True):
-            return result
-        if bool(kwargs.get("dry_run", True)):
-            return result
         if _result_executed(result) or not _is_queued_async(result):
             return result
         approved_rows = list(result.get("approved_rows") or []) if isinstance(result, dict) else []
         if not approved_rows:
             return result
-        df_summary = kwargs.get("df_summary")
         interval = kwargs.get("interval", 1)
-        max_attempts = max(1, _env_int("SUMMARY_AI_DIRECT_DISPATCH_MAX_ATTEMPTS", 2))
-        with _LOCK:
-            _SEQ += 1
-            seq = _SEQ
-        threading.Thread(
-            target=_direct_worker,
-            args=(seq, approved_rows, df_summary, interval, max_attempts),
-            daemon=True,
-            name=f"summary-ai-direct-dispatch-{seq}",
-        ).start()
-        logger.warning(
-            "[SUMMARY AI DIRECT DISPATCH] scheduled seq=%s interval=%s approved=%s symbols=%s original_skip=%s attempts=%s latest_only=%s snapshot_first=%s",
-            seq,
-            interval,
-            len(approved_rows),
-            _symbols(approved_rows),
-            result.get("skip_reason") if isinstance(result, dict) else None,
-            max_attempts,
-            _env_bool("SUMMARY_AI_DIRECT_DISPATCH_LATEST_ONLY", True),
-            _env_bool("SUMMARY_AI_DIRECT_DISPATCH_SNAPSHOT_FIRST", True),
-        )
+        attempts = max(1, _env_int("SUMMARY_AI_DIRECT_DISPATCH_MAX_ATTEMPTS", 2))
+        retry_sleep = max(0.3, _env_float("SUMMARY_AI_DIRECT_DISPATCH_RETRY_SLEEP_SEC", 0.7))
+        last_result: Any = None
+        for attempt in range(1, attempts + 1):
+            started = time.time()
+            logger.warning(
+                "[SUMMARY AI DIRECT DISPATCH] sync fallback start attempt=%s/%s interval=%s approved=%s symbols=%s version=%s",
+                attempt,
+                attempts,
+                interval,
+                len(approved_rows),
+                _symbols(approved_rows),
+                VERSION,
+            )
+            snap_result = _direct_snapshot_execute(approved_rows, interval)
+            last_result = snap_result
+            logger.warning(
+                "[SUMMARY AI DIRECT DISPATCH] sync fallback done attempt=%s/%s elapsed=%.3fs executed=%s registered=%s retryable=%s reason_chain=%s result=%s",
+                attempt,
+                attempts,
+                time.time() - started,
+                _result_executed(snap_result),
+                _registered_count(snap_result),
+                _is_retryable_no_order(snap_result),
+                _flatten_reasons(snap_result),
+                snap_result,
+            )
+            if _result_executed(snap_result) or not _is_retryable_no_order(snap_result):
+                break
+            if attempt < attempts:
+                time.sleep(retry_sleep)
         if isinstance(result, dict):
             out = dict(result)
-            out["direct_dispatch_scheduled"] = True
-            out["direct_dispatch_seq"] = seq
+            out["direct_dispatch_sync_fallback"] = True
+            out["direct_dispatch_result"] = last_result
+            if _result_executed(last_result):
+                out["executed"] = True
+                out["skip_reason"] = None
             return out
     except Exception:
-        logger.exception("[SUMMARY AI DIRECT DISPATCH] wrapper failed")
+        logger.exception("[SUMMARY AI DIRECT DISPATCH] sync fallback failed")
     return result
+
+
+def _patched_execute_ai_ok_entries_bulk(*args: Any, **kwargs: Any):
+    _force_direct_sync_env()
+    result = _ORIG(*args, **kwargs)
+    if bool(kwargs.get("dry_run", False)):
+        return result
+    return _fallback_direct_dispatch(result, kwargs)
 
 
 def _patch_once(*, log_patch: bool = True) -> bool:
     global _INSTALLED, _ORIG
     try:
+        _force_direct_sync_env()
         from trading.entry.summary_ai import executor as exec_mod
         from trading.entry.summary_ai import runner as runner_mod
         cur = getattr(exec_mod, "execute_ai_ok_entries_bulk", None)
         if not callable(cur):
             logger.debug("[SUMMARY AI DIRECT DISPATCH] target missing")
             return False
-        if getattr(cur, "_summary_ai_direct_dispatch_v6", False):
+        if getattr(cur, "_summary_ai_direct_dispatch_v7", False):
             _INSTALLED = True
             return True
-        _ORIG = getattr(cur, "_original", cur) if getattr(cur, "_summary_ai_direct_dispatch_v5", False) or getattr(cur, "_summary_ai_direct_dispatch_v4", False) else cur
-        _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v1 = True  # type: ignore[attr-defined]
-        _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v2 = True  # type: ignore[attr-defined]
-        _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v3 = True  # type: ignore[attr-defined]
-        _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v4 = True  # type: ignore[attr-defined]
-        _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v5 = True  # type: ignore[attr-defined]
+        _ORIG = getattr(cur, "_original", cur) if any(getattr(cur, f"_summary_ai_direct_dispatch_v{i}", False) for i in range(1, 7)) else cur
+        _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v7 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v6 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._original = _ORIG  # type: ignore[attr-defined]
         exec_mod.execute_ai_ok_entries_bulk = _patched_execute_ai_ok_entries_bulk
@@ -482,12 +384,12 @@ def _patch_once(*, log_patch: bool = True) -> bool:
         _INSTALLED = True
         if log_patch:
             logger.warning(
-                "[SUMMARY AI DIRECT DISPATCH] patched v6 target=%s delay=%.2fs attempts=%s latest_only=%s snapshot_first=%s source_match=True",
+                "[SUMMARY AI DIRECT DISPATCH] patched v7 target=%s direct_sync_env=%s attempts=%s snapshot_first=%s source_match=True version=%s",
                 getattr(_ORIG, "__name__", type(_ORIG).__name__),
-                _env_float("SUMMARY_AI_DIRECT_DISPATCH_DELAY_SEC", 0.10),
+                os.getenv("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC"),
                 _env_int("SUMMARY_AI_DIRECT_DISPATCH_MAX_ATTEMPTS", 2),
-                _env_bool("SUMMARY_AI_DIRECT_DISPATCH_LATEST_ONLY", True),
                 _env_bool("SUMMARY_AI_DIRECT_DISPATCH_SNAPSHOT_FIRST", True),
+                VERSION,
             )
         return True
     except Exception:
@@ -499,9 +401,17 @@ def _watch_reinstall() -> None:
     loops = max(1, _env_int("SUMMARY_AI_DIRECT_DISPATCH_WATCH_LOOPS", 12))
     sleep_sec = max(0.5, _env_float("SUMMARY_AI_DIRECT_DISPATCH_WATCH_SLEEP_SEC", 2.0))
     for i in range(loops):
+        _force_direct_sync_env()
         ok = _patch_once(log_patch=False)
         if i in (0, loops - 1):
-            logger.warning("[SUMMARY AI DIRECT DISPATCH] enforce v6 i=%s/%s ok=%s", i, loops, ok)
+            logger.warning(
+                "[SUMMARY AI DIRECT DISPATCH] enforce v7 i=%s/%s ok=%s direct_sync_env=%s version=%s",
+                i,
+                loops,
+                ok,
+                os.getenv("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC"),
+                VERSION,
+            )
         time.sleep(sleep_sec)
 
 
@@ -510,26 +420,20 @@ def install() -> bool:
     if not _env_bool("SUMMARY_AI_DIRECT_DISPATCH_ON_QUEUED_ASYNC", True):
         logger.warning("[SUMMARY AI DIRECT DISPATCH] disabled by env")
         return False
-    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_LATEST_ONLY", "1")
-    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_SNAPSHOT_FIRST", "1")
-    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_DELAY_SEC", "0.10")
-    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_MAX_ATTEMPTS", "2")
-    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_RETRY_SLEEP_SEC", "0.7")
-    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_PIPELINE_SOURCE", "SUMMARY")
-    if _INSTALLED and _WATCHER_STARTED:
-        return True
+    _force_direct_sync_env()
     ok = _patch_once()
     if not _WATCHER_STARTED:
         _WATCHER_STARTED = True
         threading.Thread(target=_watch_reinstall, daemon=True, name="summary-ai-direct-dispatch-enforcer").start()
         logger.warning(
-            "[SUMMARY AI DIRECT DISPATCH] installed/enforcing v6 ok=%s watcher=%s loops=%s sleep=%s latest_only=%s snapshot_first=%s source_match=True",
+            "[SUMMARY AI DIRECT DISPATCH] installed/enforcing v7 ok=%s watcher=%s loops=%s sleep=%s direct_sync_env=%s snapshot_first=%s version=%s",
             ok,
             _WATCHER_STARTED,
             _env_int("SUMMARY_AI_DIRECT_DISPATCH_WATCH_LOOPS", 12),
             _env_float("SUMMARY_AI_DIRECT_DISPATCH_WATCH_SLEEP_SEC", 2.0),
-            _env_bool("SUMMARY_AI_DIRECT_DISPATCH_LATEST_ONLY", True),
+            os.getenv("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC"),
             _env_bool("SUMMARY_AI_DIRECT_DISPATCH_SNAPSHOT_FIRST", True),
+            VERSION,
         )
     return bool(ok)
 
@@ -539,4 +443,5 @@ try:
 except Exception:
     logger.exception("[SUMMARY AI DIRECT DISPATCH] auto install failed")
 
-__all__ = ["install"]
+
+__all__ = ["install", "VERSION"]
