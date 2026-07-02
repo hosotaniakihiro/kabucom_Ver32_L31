@@ -1,24 +1,21 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver58-SUMMARY-AI-BLOWOFF-PREFILTER
+# Version: Ver59-MAIN-PUSH-DB-REFRESH
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # main.py は軽量同期 + background install。
 # DB/data collector系はDB専用の最小同期パッチだけにして起動を軽くする。
 # 救済/fail-open系はデフォルトOFFにして、本体判定を優先する。
 #
+# V59:
+#   - main.py のPUSHメモリが起動時スナップショットのまま stale になる場合、
+#     main_database.py が更新している pushYYYYMMDD.db から読み直して
+#     1分SUMMARYを作る SUMMARY_MAIN_PUSH_DB_REFRESH を同期パッチへ追加。
+#
 # V58:
 #   - Summary-AI の Top3 選定前に blowoff top 候補を除外する
 #     SUMMARY_AI_BLOWOFF_PREFILTER を同期パッチへ追加。
 #     blowoff ガードは緩和せず、Top3全滅だけを防ぐ。
-#
-# V57:
-#   - final_entry_safety_guard_patch._board_guard が3引数版へ差し替わっても
-#     4引数呼び出しで TypeError にならない互換パッチをbackgroundに追加。
-#
-# V56:
-#   - SUMMARY AIの強い候補が元atr_1m_filterの低ATRだけで止まる問題を
-#     限定soft-passする SUMMARY_AI_LOW_MOVE_SOFTPASS をbackgroundに追加。
 # ============================================================
 from __future__ import annotations
 
@@ -260,6 +257,7 @@ SYNC_MAIN_PATCHES = [
     ("core.startup.entry_controller_source_prefilter_patch", "ENTRY_CONTROLLER_SOURCE_PREFILTER", "DISABLE_ENTRY_CONTROLLER_SOURCE_PREFILTER_PATCH"),
     ("core.startup.entry_execute_timeout_guard_patch", "ENTRY_EXECUTE_TIMEOUT_GUARD", "DISABLE_ENTRY_EXECUTE_TIMEOUT_GUARD_PATCH"),
     ("core.startup.summary_ai_blowoff_prefilter_patch", "SUMMARY_AI_BLOWOFF_PREFILTER", "DISABLE_SUMMARY_AI_BLOWOFF_PREFILTER_PATCH"),
+    ("core.startup.summary_main_push_db_refresh_patch", "SUMMARY_MAIN_PUSH_DB_REFRESH", "DISABLE_SUMMARY_MAIN_PUSH_DB_REFRESH_PATCH"),
     ("core.startup.summary_main_direct_push_force_patch", "SUMMARY_FORCE_DIRECT_1M_SYNC", "DISABLE_SUMMARY_FORCE_DIRECT_1M_PATCH"),
 ]
 
@@ -287,6 +285,7 @@ BACKGROUND_MAIN_PATCHES = [
     ("core.startup.summary_mtf_early_ready_patch", "SUMMARY_MTF_EARLY_READY", "DISABLE_SUMMARY_MTF_EARLY_READY_PATCH"),
     ("trading.audit_logging.install_audit_logging", "AUDIT_LOGGING", "DISABLE_AUDIT_LOGGING"),
     ("core.startup.summary_controller_concat_duplicate_columns_patch", "SUMMARY_CONTROLLER_DUPCOL_PATCH", "DISABLE_SUMMARY_CONTROLLER_DUPCOL_PATCH"),
+    ("core.startup.summary_main_push_db_refresh_patch", "SUMMARY_MAIN_PUSH_DB_REFRESH_BG", "DISABLE_SUMMARY_MAIN_PUSH_DB_REFRESH_PATCH"),
     ("core.startup.summary_main_direct_push_force_patch", "SUMMARY_FORCE_DIRECT_1M_BG_FINAL", "DISABLE_SUMMARY_FORCE_DIRECT_1M_PATCH"),
 ]
 
@@ -339,6 +338,7 @@ def _background_main_patch_loop() -> None:
     _install_liq_empty_fallback_only_if_enabled()
     _install_summary_mtf_catchup_safely()
     # Final re-apply after all background patches because several summary/controller patches re-wrap runner_core.job_summary.
+    _install_module("core.startup.summary_main_push_db_refresh_patch", "SUMMARY_MAIN_PUSH_DB_REFRESH_BG_LAST", disabled_env="DISABLE_SUMMARY_MAIN_PUSH_DB_REFRESH_PATCH")
     _install_module("core.startup.summary_main_direct_push_force_patch", "SUMMARY_FORCE_DIRECT_1M_BG_LAST", disabled_env="DISABLE_SUMMARY_FORCE_DIRECT_1M_PATCH")
     # Final board signature re-apply after all background patches because some entry guards replace _board_guard.
     _install_module("core.startup.final_entry_board_guard_signature_runtime_patch", "FINAL_BOARD_GUARD_SIGNATURE_LAST", disabled_env="DISABLE_FINAL_BOARD_GUARD_SIGNATURE_PATCH")
