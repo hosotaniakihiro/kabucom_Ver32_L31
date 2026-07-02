@@ -1,22 +1,16 @@
 # ============================================================
 # File   : core/startup/summary_ai_async_direct_dispatch_patch.py
-# Version: V10-STRICT-EXECUTED-AND-PRICE2500
+# Version: V11-DIRECT-DISPATCH-ROLLING-AI-OK-CANDIDATES
 # ------------------------------------------------------------
 # 目的:
-#   SUMMARY AI が AI_OK / approved を出しても、
-#   summary_ai_async_entry_patch が executed=False / skip=queued_async を返し、
-#   実発注がworker待ち・stale skip になる問題を止める。
+#   SUMMARY AI が AI_OK / approved を出しても、実発注が
+#   queued_async / snapshot_no_order / entry_controller_no_order で止まる問題を止める。
 #
-# V10:
-#   - SUMMARY AI approved 選定直前に最低価格を 2,500円へ強制する。
-#   - 低価格銘柄(例: 330A/402A/336A)が上位3枠を占有して、
-#     実発注候補が snapshot_no_order になる状態を避ける。
-#   - V9 の strict executed 判定と V8 の direct snapshot timeout は維持。
-#
-# V9:
-#   - executor._positive_result が result['approved'] だけで True を返す問題を補正。
-#   - entries=0 / result.executed=False / no_tradable_rows_after_filters を
-#     外側 executed=True に誤変換しない。
+# V11:
+#   - V10 の strict executed 判定、2,500円 price floor、direct snapshot timeout を維持。
+#   - direct snapshot が no-order の場合、同じ approved_rows だけを再試行せず、
+#     元の ai_results から未試行の AI_OK 候補を追加で approved_row 化して順番に試す。
+#   - 低出来高・低変動・blowoff・板ガードは緩めない。各候補は従来の entry_pipeline / final guard を通す。
 # ============================================================
 from __future__ import annotations
 
@@ -28,7 +22,7 @@ from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V10-STRICT-EXECUTED-AND-PRICE2500"
+VERSION = "V11-DIRECT-DISPATCH-ROLLING-AI-OK-CANDIDATES"
 _INSTALLED = False
 _ORIG = None
 _WATCHER_STARTED = False
@@ -48,7 +42,11 @@ _RETRYABLE_NO_ORDER_MARKERS = (
     "already_running",
     "no_pending_registered",
     "pipeline_filter_mismatch",
+    "no_tradable_rows_after_filters",
 )
+
+_TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+_FALSE = {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -57,9 +55,9 @@ def _env_bool(name: str, default: bool = True) -> bool:
         if v is None or str(v).strip() == "":
             return bool(default)
         s = str(v).strip().lower()
-        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+        if s in _TRUE:
             return True
-        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
+        if s in _FALSE:
             return False
         return bool(default)
     except Exception:
@@ -71,7 +69,7 @@ def _env_int(name: str, default: int) -> int:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
             return int(default)
-        return int(float(v))
+        return int(float(str(v).replace(",", "")))
     except Exception:
         return int(default)
 
@@ -84,6 +82,15 @@ def _env_float(name: str, default: float) -> float:
         return float(str(v).replace(",", ""))
     except Exception:
         return float(default)
+
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(str(v).replace(",", "")))
+    except Exception:
+        return int(default)
 
 
 def _summary_ai_price_floor() -> float:
@@ -100,9 +107,10 @@ def _force_direct_sync_env() -> None:
     os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_RETRY_SLEEP_SEC", "0.7")
     os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_PIPELINE_SOURCE", "SUMMARY")
     os.environ.setdefault("SUMMARY_AI_DIRECT_SNAPSHOT_TIMEOUT_SEC", "8.0")
+    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_ROLLING", "1")
+    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_SCAN_LIMIT", "12")
+    os.environ.setdefault("SUMMARY_AI_DIRECT_DISPATCH_BATCH_SIZE", "3")
 
-    # settings.ini が min_price=200 の場合でも、SUMMARY AI の実発注候補は 2,500円以上へ戻す。
-    # ENTRY_MIN_PRICE も合わせて上書きし、後段 guard / entry_budget の読み取りと一致させる。
     floor = _summary_ai_price_floor()
     if floor > 0:
         os.environ["SUMMARY_AI_APPROVAL_MIN_PRICE_OVERRIDE"] = str(floor)
@@ -126,12 +134,16 @@ def _row_to_dict(row: Any) -> dict[str, Any]:
     return {}
 
 
+def _pick_symbol(row: Any) -> str:
+    d = _row_to_dict(row)
+    return str(d.get("symbol") or d.get("Symbol") or getattr(row, "symbol", "") or "").strip()
+
+
 def _symbols(rows: Any, limit: int = 20) -> list[str]:
     out: list[str] = []
     try:
         for r in list(rows or [])[:limit]:
-            d = _row_to_dict(r)
-            sym = str(d.get("symbol") or getattr(r, "symbol", "") or "").strip()
+            sym = _pick_symbol(r)
             if sym:
                 out.append(sym)
     except Exception:
@@ -191,7 +203,7 @@ def _flatten_reasons(result: Any) -> str:
                 r = v.get(k)
                 if r:
                     reasons.append(str(r))
-            for k in ("result", "pipeline_result"):
+            for k in ("result", "pipeline_result", "direct_dispatch_result"):
                 child = v.get(k)
                 if child is not None and child is not v:
                     walk(child, depth + 1)
@@ -203,15 +215,6 @@ def _flatten_reasons(result: Any) -> str:
 
     walk(result)
     return "|".join(reasons)
-
-
-def _safe_int(v: Any, default: int = 0) -> int:
-    try:
-        if v is None or str(v).strip() == "":
-            return int(default)
-        return int(float(v))
-    except Exception:
-        return int(default)
 
 
 def _strict_result_executed(result: Any) -> bool:
@@ -236,7 +239,7 @@ def _strict_result_executed(result: Any) -> bool:
                     return True
                 if v and not isinstance(v, (list, tuple, set, dict)):
                     return True
-            for key in ("result", "pipeline_result"):
+            for key in ("result", "pipeline_result", "direct_dispatch_result"):
                 child = result.get(key)
                 if child is not result and _strict_result_executed(child):
                     return True
@@ -272,7 +275,7 @@ def _registered_count(result: Any) -> int:
             direct = result.get("registered")
             if direct is not None:
                 return _safe_int(direct, 0)
-            for key in ("result", "pipeline_result"):
+            for key in ("result", "pipeline_result", "direct_dispatch_result"):
                 n = _registered_count(result.get(key))
                 if n > 0:
                     return n
@@ -357,44 +360,136 @@ def _direct_snapshot_execute(approved_rows: list[Any], interval: Any) -> Any:
     return None
 
 
-def _fallback_direct_dispatch(result: Any, kwargs: dict[str, Any]) -> Any:
+def _batch_size() -> int:
+    return max(1, min(_env_int("SUMMARY_AI_DIRECT_DISPATCH_BATCH_SIZE", 3), 3))
+
+
+def _rows_from_result(result: Any) -> list[Any]:
     try:
-        if _result_executed(result) or not _is_queued_async(result):
+        if isinstance(result, dict):
+            rows = result.get("approved_rows")
+            if isinstance(rows, list):
+                return list(rows)
+            rows = result.get("entries")
+            if isinstance(rows, list):
+                return list(rows)
+            for key in ("result", "pipeline_result"):
+                child = result.get(key)
+                rows = _rows_from_result(child)
+                if rows:
+                    return rows
+    except Exception:
+        pass
+    return []
+
+
+def _build_rolling_rows_from_ai_results(ai_results: Any, existing_rows: list[Any]) -> list[Any]:
+    """Build additional approved rows from AI_OK candidates. Final guards are not bypassed."""
+    if not _env_bool("SUMMARY_AI_DIRECT_DISPATCH_ROLLING", True):
+        return []
+    try:
+        from trading.entry.summary_ai import executor as ex
+        existing_symbols = set(_symbols(existing_rows, limit=100))
+        ok_items = [x for x in list(ai_results or []) if isinstance(x, dict) and bool(x.get("allow"))]
+        try:
+            kept = ex._filter_blocked_ai_ok_items(ok_items)
+        except Exception:
+            kept = ok_items
+        try:
+            ordered = sorted(kept, key=ex._sort_key, reverse=True)
+        except Exception:
+            ordered = kept
+        scan_limit = max(_batch_size(), _env_int("SUMMARY_AI_DIRECT_DISPATCH_SCAN_LIMIT", 12))
+        rows: list[Any] = []
+        for item in ordered[:scan_limit]:
+            sym = str(item.get("symbol") or "").strip()
+            if not sym or sym in existing_symbols:
+                continue
+            try:
+                row = ex.build_approved_row(item)
+            except Exception:
+                logger.debug("[SUMMARY AI DIRECT DISPATCH] build approved row failed symbol=%s", sym, exc_info=True)
+                continue
+            if row:
+                rows.append(row)
+                existing_symbols.add(sym)
+        if rows:
+            logger.warning(
+                "[SUMMARY AI DIRECT DISPATCH] rolling extra approved rows built existing=%s extra=%s symbols=%s version=%s",
+                _symbols(existing_rows, limit=100), len(rows), _symbols(rows, limit=100), VERSION,
+            )
+        return rows
+    except Exception:
+        logger.exception("[SUMMARY AI DIRECT DISPATCH] rolling row build failed")
+        return []
+
+
+def _fallback_direct_dispatch(result: Any, kwargs: dict[str, Any], args: tuple[Any, ...] = ()) -> Any:
+    try:
+        if _result_executed(result):
             return result
-        approved_rows = list(result.get("approved_rows") or []) if isinstance(result, dict) else []
+        if not (_is_queued_async(result) or _is_retryable_no_order(result)):
+            return result
+        approved_rows = _rows_from_result(result)
         if not approved_rows:
             return result
+
+        ai_results = kwargs.get("ai_results")
+        if ai_results is None and args:
+            ai_results = args[0]
+        extra_rows = _build_rolling_rows_from_ai_results(ai_results, approved_rows)
+        candidate_rows = list(approved_rows) + list(extra_rows)
+
         interval = kwargs.get("interval", 1)
         attempts = max(1, _env_int("SUMMARY_AI_DIRECT_DISPATCH_MAX_ATTEMPTS", 2))
         retry_sleep = max(0.3, _env_float("SUMMARY_AI_DIRECT_DISPATCH_RETRY_SLEEP_SEC", 0.7))
         timeout_sec = _env_float("SUMMARY_AI_DIRECT_SNAPSHOT_TIMEOUT_SEC", 8.0)
+        batch_n = _batch_size()
         last_result: Any = None
-        for attempt in range(1, attempts + 1):
-            started = time.time()
-            logger.warning(
-                "[SUMMARY AI DIRECT DISPATCH] sync fallback start attempt=%s/%s interval=%s approved=%s symbols=%s timeout=%.3fs price_floor=%.0f version=%s",
-                attempt, attempts, interval, len(approved_rows), _symbols(approved_rows), timeout_sec, _summary_ai_price_floor(), VERSION,
-            )
-            snap_result = _call_with_timeout(
-                "direct_snapshot", approved_rows, timeout_sec, lambda: _direct_snapshot_execute(approved_rows, interval)
-            )
-            last_result = snap_result
-            logger.warning(
-                "[SUMMARY AI DIRECT DISPATCH] sync fallback done attempt=%s/%s elapsed=%.3fs executed=%s timeout=%s registered=%s retryable=%s reason_chain=%s result=%s",
-                attempt, attempts, time.time() - started, _result_executed(snap_result), _is_timeout_result(snap_result),
-                _registered_count(snap_result), _is_retryable_no_order(snap_result), _flatten_reasons(snap_result), snap_result,
-            )
-            if _result_executed(snap_result):
+        attempt_records: list[dict[str, Any]] = []
+
+        batches = [candidate_rows[i:i + batch_n] for i in range(0, len(candidate_rows), batch_n)]
+        for batch_idx, batch in enumerate(batches, start=1):
+            for attempt in range(1, attempts + 1):
+                started = time.time()
+                logger.warning(
+                    "[SUMMARY AI DIRECT DISPATCH] rolling snapshot start batch=%s/%s attempt=%s/%s interval=%s approved=%s symbols=%s timeout=%.3fs price_floor=%.0f version=%s",
+                    batch_idx, len(batches), attempt, attempts, interval, len(batch), _symbols(batch), timeout_sec, _summary_ai_price_floor(), VERSION,
+                )
+                snap_result = _call_with_timeout(
+                    "direct_snapshot", batch, timeout_sec, lambda b=batch: _direct_snapshot_execute(b, interval)
+                )
+                last_result = snap_result
+                executed = _result_executed(snap_result)
+                timeout = _is_timeout_result(snap_result)
+                retryable = _is_retryable_no_order(snap_result)
+                attempt_records.append({
+                    "batch": batch_idx,
+                    "attempt": attempt,
+                    "symbols": _symbols(batch),
+                    "executed": executed,
+                    "timeout": timeout,
+                    "retryable": retryable,
+                    "reason_chain": _flatten_reasons(snap_result),
+                })
+                logger.warning(
+                    "[SUMMARY AI DIRECT DISPATCH] rolling snapshot done batch=%s/%s attempt=%s/%s elapsed=%.3fs executed=%s timeout=%s registered=%s retryable=%s reason_chain=%s result=%s",
+                    batch_idx, len(batches), attempt, attempts, time.time() - started, executed, timeout,
+                    _registered_count(snap_result), retryable, _flatten_reasons(snap_result), snap_result,
+                )
+                if executed or timeout or not retryable:
+                    break
+                if attempt < attempts:
+                    time.sleep(retry_sleep)
+            if _result_executed(last_result) or _is_timeout_result(last_result):
                 break
-            if _is_timeout_result(snap_result):
-                break
-            if not _is_retryable_no_order(snap_result):
-                break
-            if attempt < attempts:
-                time.sleep(retry_sleep)
+            # no-orderでこのバッチが終わったら、次のAI_OK候補バッチへ進む。
+
         if isinstance(result, dict):
             out = dict(result)
             out["direct_dispatch_sync_fallback"] = True
+            out["direct_dispatch_rolling"] = True
+            out["direct_dispatch_attempts"] = attempt_records
             out["direct_dispatch_result"] = last_result
             if _result_executed(last_result):
                 out["executed"] = True
@@ -417,16 +512,17 @@ def _patched_execute_ai_ok_entries_bulk(*args: Any, **kwargs: Any):
     result = _ORIG(*args, **kwargs)
     if bool(kwargs.get("dry_run", False)):
         return result
-    return _fallback_direct_dispatch(result, kwargs)
+    return _fallback_direct_dispatch(result, kwargs, args)
 
 
 def _install_executor_positive_result_patch(exec_mod: Any) -> bool:
     global _POSITIVE_RESULT_PATCHED
     try:
         cur = getattr(exec_mod, "_positive_result", None)
-        if getattr(cur, "_summary_ai_strict_positive_v1", False):
+        if getattr(cur, "_summary_ai_strict_positive_v11", False):
             _POSITIVE_RESULT_PATCHED = True
             return True
+        _strict_result_executed._summary_ai_strict_positive_v11 = True  # type: ignore[attr-defined]
         _strict_result_executed._summary_ai_strict_positive_v1 = True  # type: ignore[attr-defined]
         _strict_result_executed._original = cur  # type: ignore[attr-defined]
         exec_mod._positive_result = _strict_result_executed
@@ -449,7 +545,7 @@ def _install_executor_price_floor_patch(exec_mod: Any) -> bool:
         except Exception:
             pass
         cur = getattr(exec_mod, "_entry_price_bounds", None)
-        if getattr(cur, "_summary_ai_price2500_patch_v1", False):
+        if getattr(cur, "_summary_ai_price2500_patch_v11", False):
             _PRICE_FLOOR_PATCHED = True
             return True
         if not callable(cur):
@@ -471,6 +567,7 @@ def _install_executor_price_floor_patch(exec_mod: Any) -> bool:
                 pass
             return min_price, max_price, diag
 
+        _patched_entry_price_bounds._summary_ai_price2500_patch_v11 = True  # type: ignore[attr-defined]
         _patched_entry_price_bounds._summary_ai_price2500_patch_v1 = True  # type: ignore[attr-defined]
         _patched_entry_price_bounds._original = cur  # type: ignore[attr-defined]
         exec_mod._entry_price_bounds = _patched_entry_price_bounds
@@ -494,10 +591,11 @@ def _patch_once(*, log_patch: bool = True) -> bool:
         if not callable(cur):
             logger.debug("[SUMMARY AI DIRECT DISPATCH] target missing")
             return False
-        if getattr(cur, "_summary_ai_direct_dispatch_v10", False):
+        if getattr(cur, "_summary_ai_direct_dispatch_v11", False):
             _INSTALLED = True
             return True
-        _ORIG = getattr(cur, "_original", cur) if any(getattr(cur, f"_summary_ai_direct_dispatch_v{i}", False) for i in range(1, 10)) else cur
+        _ORIG = getattr(cur, "_original", cur) if any(getattr(cur, f"_summary_ai_direct_dispatch_v{i}", False) for i in range(1, 11)) else cur
+        _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v11 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v10 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v9 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._summary_ai_direct_dispatch_v8 = True  # type: ignore[attr-defined]
@@ -509,7 +607,7 @@ def _patch_once(*, log_patch: bool = True) -> bool:
         _INSTALLED = True
         if log_patch:
             logger.warning(
-                "[SUMMARY AI DIRECT DISPATCH] patched v10 target=%s direct_sync_env=%s attempts=%s snapshot_first=%s timeout=%.3fs strict_positive=%s price_floor=%.0f price_patch=%s source_match=True version=%s",
+                "[SUMMARY AI DIRECT DISPATCH] patched v11 target=%s direct_sync_env=%s attempts=%s snapshot_first=%s timeout=%.3fs strict_positive=%s price_floor=%.0f price_patch=%s rolling=%s scan=%s batch=%s source_match=True version=%s",
                 getattr(_ORIG, "__name__", type(_ORIG).__name__),
                 os.getenv("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC"),
                 _env_int("SUMMARY_AI_DIRECT_DISPATCH_MAX_ATTEMPTS", 2),
@@ -518,6 +616,9 @@ def _patch_once(*, log_patch: bool = True) -> bool:
                 _POSITIVE_RESULT_PATCHED,
                 _summary_ai_price_floor(),
                 _PRICE_FLOOR_PATCHED,
+                _env_bool("SUMMARY_AI_DIRECT_DISPATCH_ROLLING", True),
+                _env_int("SUMMARY_AI_DIRECT_DISPATCH_SCAN_LIMIT", 12),
+                _batch_size(),
                 VERSION,
             )
         return True
@@ -534,10 +635,10 @@ def _watch_reinstall() -> None:
         ok = _patch_once(log_patch=False)
         if i in (0, loops - 1):
             logger.warning(
-                "[SUMMARY AI DIRECT DISPATCH] enforce v10 i=%s/%s ok=%s direct_sync_env=%s timeout=%.3fs strict_positive=%s price_floor=%.0f price_patch=%s version=%s",
+                "[SUMMARY AI DIRECT DISPATCH] enforce v11 i=%s/%s ok=%s direct_sync_env=%s timeout=%.3fs strict_positive=%s price_floor=%.0f price_patch=%s rolling=%s version=%s",
                 i, loops, ok, os.getenv("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC"),
                 _env_float("SUMMARY_AI_DIRECT_SNAPSHOT_TIMEOUT_SEC", 8.0), _POSITIVE_RESULT_PATCHED,
-                _summary_ai_price_floor(), _PRICE_FLOOR_PATCHED, VERSION,
+                _summary_ai_price_floor(), _PRICE_FLOOR_PATCHED, _env_bool("SUMMARY_AI_DIRECT_DISPATCH_ROLLING", True), VERSION,
             )
         time.sleep(sleep_sec)
 
@@ -553,7 +654,7 @@ def install() -> bool:
         _WATCHER_STARTED = True
         threading.Thread(target=_watch_reinstall, daemon=True, name="summary-ai-direct-dispatch-enforcer").start()
         logger.warning(
-            "[SUMMARY AI DIRECT DISPATCH] installed/enforcing v10 ok=%s watcher=%s loops=%s sleep=%s direct_sync_env=%s snapshot_first=%s timeout=%.3fs strict_positive=%s price_floor=%.0f price_patch=%s version=%s",
+            "[SUMMARY AI DIRECT DISPATCH] installed/enforcing v11 ok=%s watcher=%s loops=%s sleep=%s direct_sync_env=%s snapshot_first=%s timeout=%.3fs strict_positive=%s price_floor=%.0f price_patch=%s rolling=%s version=%s",
             ok,
             _WATCHER_STARTED,
             _env_int("SUMMARY_AI_DIRECT_DISPATCH_WATCH_LOOPS", 12),
@@ -564,6 +665,7 @@ def install() -> bool:
             _POSITIVE_RESULT_PATCHED,
             _summary_ai_price_floor(),
             _PRICE_FLOOR_PATCHED,
+            _env_bool("SUMMARY_AI_DIRECT_DISPATCH_ROLLING", True),
             VERSION,
         )
     return bool(ok)
