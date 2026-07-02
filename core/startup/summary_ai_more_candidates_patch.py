@@ -1,10 +1,15 @@
 # ============================================================
 # File   : core/startup/summary_ai_more_candidates_patch.py
-# Version: Ver1.7-SUMMARY-AI-RANGE-REPAIR-AND-LOWMOVE-POOL
+# Version: Ver1.8-SUMMARY-AI-APPROVED-ROW-RANGE-REPAIR
 # ------------------------------------------------------------
 # Purpose:
 #   AIに「もっとエントリーできるか」を確認させるため、
 #   SUMMARY_AI runner へ渡す候補数を起動時に拡張する。
+#
+# Ver1.8:
+#   - AI_OK -> approved_row 作成後に high/low が close と同値になる問題を補正。
+#   - day_high/day_low 等の実レンジを approved_row の high/low に反映する。
+#   - 低出来高・低変動・blowoff・板・final guard の閾値は緩和しない。
 #
 # Ver1.7:
 #   - 古い SUMMARY AI LOW MOVE PREFILTER V2 が range_pct=0 だけを見て
@@ -12,12 +17,6 @@
 #   - 候補DF作成時に day_high/day_low, high_price/low_price, open-close から
 #     range_pct を補正する。
 #   - Ver1.6 の low-move pool refill も維持。
-#   - 低出来高・低変動・blowoff・板・final guard の閾値は緩和しない。
-#
-# Ver1.6:
-#   - SUMMARY AI LOW MOVE PREFILTER が全候補を LOW_MOVE と見て
-#     safety rescue で1件だけ残し、その1件が blowoff/後段NGで終わる問題を補正。
-#   - pre-approval の候補プールだけ複数件へ戻す。
 # ============================================================
 
 from __future__ import annotations
@@ -31,12 +30,13 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-VERSION = "Ver1.7-SUMMARY-AI-RANGE-REPAIR-AND-LOWMOVE-POOL"
+VERSION = "Ver1.8-SUMMARY-AI-APPROVED-ROW-RANGE-REPAIR"
 _INSTALLED = False
 _SELL_SHORT_OK_FILTER_INSTALLED = False
 _LOW_MOVE_POOL_PATCHED = False
 _LOW_MOVE_POOL_WATCHER_STARTED = False
 _RANGE_PCT_REPAIR_INSTALLED = False
+_APPROVED_ROW_RANGE_REPAIR_INSTALLED = False
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -179,6 +179,21 @@ def _install_direct_dispatch_patch() -> bool:
         return False
 
 
+def _install_approved_row_range_repair_patch(reason: str = "install") -> bool:
+    global _APPROVED_ROW_RANGE_REPAIR_INSTALLED
+    if _APPROVED_ROW_RANGE_REPAIR_INSTALLED:
+        return True
+    try:
+        from core.startup.summary_ai_approved_row_range_repair_patch import install as install_range_repair
+        ok = bool(install_range_repair())
+        _APPROVED_ROW_RANGE_REPAIR_INSTALLED = ok
+        logger.warning("[SUMMARY AI MORE CANDIDATES PATCH] approved row range repair installed=%s reason=%s version=%s", ok, reason, VERSION)
+        return ok
+    except Exception:
+        logger.exception("[SUMMARY AI MORE CANDIDATES PATCH] approved row range repair install failed reason=%s", reason)
+        return False
+
+
 def _install_range_pct_repair_patch(reason: str = "install") -> bool:
     global _RANGE_PCT_REPAIR_INSTALLED
     if _RANGE_PCT_REPAIR_INSTALLED:
@@ -192,7 +207,7 @@ def _install_range_pct_repair_patch(reason: str = "install") -> bool:
         cur = getattr(candidates, "attach_display_like_columns", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_summary_ai_range_pct_repair_v17", False):
+        if getattr(cur, "_summary_ai_range_pct_repair_v18", False) or getattr(cur, "_summary_ai_range_pct_repair_v17", False):
             _RANGE_PCT_REPAIR_INSTALLED = True
             return True
 
@@ -262,6 +277,7 @@ def _install_range_pct_repair_patch(reason: str = "install") -> bool:
             return _repair(original(*args, **kwargs))
 
         _wrapped_attach_display_like_columns._summary_ai_range_pct_repair_v17 = True  # type: ignore[attr-defined]
+        _wrapped_attach_display_like_columns._summary_ai_range_pct_repair_v18 = True  # type: ignore[attr-defined]
         _wrapped_attach_display_like_columns._original = original  # type: ignore[attr-defined]
         candidates.attach_display_like_columns = _wrapped_attach_display_like_columns
         _RANGE_PCT_REPAIR_INSTALLED = True
@@ -348,7 +364,7 @@ def _install_low_move_pool_refill_patch(reason: str = "install") -> bool:
         cur = getattr(ex, "_filter_blocked_ai_ok_items", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_summary_ai_low_move_pool_refill_v17", False):
+        if getattr(cur, "_summary_ai_low_move_pool_refill_v18", False) or getattr(cur, "_summary_ai_low_move_pool_refill_v17", False):
             _LOW_MOVE_POOL_PATCHED = True
             return True
 
@@ -394,6 +410,7 @@ def _install_low_move_pool_refill_patch(reason: str = "install") -> bool:
 
         _filter_blocked_ai_ok_items_pool_refill._summary_ai_low_move_pool_refill_v16 = True  # type: ignore[attr-defined]
         _filter_blocked_ai_ok_items_pool_refill._summary_ai_low_move_pool_refill_v17 = True  # type: ignore[attr-defined]
+        _filter_blocked_ai_ok_items_pool_refill._summary_ai_low_move_pool_refill_v18 = True  # type: ignore[attr-defined]
         _filter_blocked_ai_ok_items_pool_refill._original = original  # type: ignore[attr-defined]
         ex._filter_blocked_ai_ok_items = _filter_blocked_ai_ok_items_pool_refill
         _LOW_MOVE_POOL_PATCHED = True
@@ -416,8 +433,9 @@ def _start_low_move_pool_watcher() -> None:
         for i in range(loops):
             ok0 = _install_range_pct_repair_patch(reason=f"watcher:{i}")
             ok1 = _install_low_move_pool_refill_patch(reason=f"watcher:{i}")
+            ok2 = _install_approved_row_range_repair_patch(reason=f"watcher:{i}")
             if i in (0, loops - 1):
-                logger.warning("[SUMMARY AI MORE CANDIDATES PATCH] enforce i=%s/%s range_repair=%s low_move_pool=%s version=%s", i, loops, ok0, ok1, VERSION)
+                logger.warning("[SUMMARY AI MORE CANDIDATES PATCH] enforce i=%s/%s range_repair=%s low_move_pool=%s approved_row_range=%s version=%s", i, loops, ok0, ok1, ok2, VERSION)
             time.sleep(sleep_sec)
 
     threading.Thread(target=_watch, name="summary-ai-low-move-pool-refill", daemon=True).start()
@@ -452,13 +470,19 @@ def install() -> bool:
     _install_controller_enrich_patch()
     _install_final_gate_relax_patch()
     _install_direct_dispatch_patch()
+    _install_approved_row_range_repair_patch()
     _install_range_pct_repair_patch()
     _install_sell_short_ok_filter_patch()
     _install_low_move_pool_refill_patch()
     _start_low_move_pool_watcher()
 
     if _INSTALLED:
-        logger.warning("[SUMMARY AI MORE CANDIDATES PATCH] already installed range_repair=%s low_move_pool_refill=%s", _RANGE_PCT_REPAIR_INSTALLED, _LOW_MOVE_POOL_PATCHED)
+        logger.warning(
+            "[SUMMARY AI MORE CANDIDATES PATCH] already installed range_repair=%s low_move_pool_refill=%s approved_row_range=%s",
+            _RANGE_PCT_REPAIR_INSTALLED,
+            _LOW_MOVE_POOL_PATCHED,
+            _APPROVED_ROW_RANGE_REPAIR_INSTALLED,
+        )
         return True
 
     if not _env_bool("SUMMARY_AI_MORE_CANDIDATES_ENABLED", True):
@@ -489,12 +513,13 @@ def install() -> bool:
             logger.error("[SUMMARY AI MORE CANDIDATES PATCH] runner.run_summary_ai_entry_from_df not callable")
             return False
 
-        if getattr(original, "_summary_ai_more_candidates_v17", False):
+        if getattr(original, "_summary_ai_more_candidates_v18", False):
             _INSTALLED = True
             return True
 
         @functools.wraps(original)
         def _wrapped_run_summary_ai_entry_from_df(*args: Any, **kwargs: Any):
+            _install_approved_row_range_repair_patch(reason="before_run")
             _install_range_pct_repair_patch(reason="before_run")
             _install_low_move_pool_refill_patch(reason="before_run")
             explicit_top_n = any(k in kwargs for k in ("top_n", "max_candidates", "candidate_limit"))
@@ -517,7 +542,7 @@ def install() -> bool:
 
             score_changes = _clamp_summary_ai_scores(kwargs)
             logger.warning(
-                "[SUMMARY AI MORE CANDIDATES PATCH] run source=%s interval=%s top_n=%s max_candidates=%s candidate_limit=%s tonosama_max=%s bypass_slope=%s explicit_top_n=%s score_changes=%s range_repair=%s low_move_pool_refill=%s version=%s",
+                "[SUMMARY AI MORE CANDIDATES PATCH] run source=%s interval=%s top_n=%s max_candidates=%s candidate_limit=%s tonosama_max=%s bypass_slope=%s explicit_top_n=%s score_changes=%s range_repair=%s low_move_pool_refill=%s approved_row_range=%s version=%s",
                 kwargs.get("source", "SUMMARY"),
                 kwargs.get("interval", 1),
                 kwargs.get("top_n"),
@@ -529,6 +554,7 @@ def install() -> bool:
                 score_changes,
                 _RANGE_PCT_REPAIR_INSTALLED,
                 _LOW_MOVE_POOL_PATCHED,
+                _APPROVED_ROW_RANGE_REPAIR_INSTALLED,
                 VERSION,
             )
             return original(*args, **kwargs)
@@ -540,18 +566,20 @@ def install() -> bool:
         _wrapped_run_summary_ai_entry_from_df._summary_ai_more_candidates_v15 = True  # type: ignore[attr-defined]
         _wrapped_run_summary_ai_entry_from_df._summary_ai_more_candidates_v16 = True  # type: ignore[attr-defined]
         _wrapped_run_summary_ai_entry_from_df._summary_ai_more_candidates_v17 = True  # type: ignore[attr-defined]
+        _wrapped_run_summary_ai_entry_from_df._summary_ai_more_candidates_v18 = True  # type: ignore[attr-defined]
         _wrapped_run_summary_ai_entry_from_df._original = original  # type: ignore[attr-defined]
         runner.run_summary_ai_entry_from_df = _wrapped_run_summary_ai_entry_from_df
 
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY AI MORE CANDIDATES PATCH] installed top_n=%s tonosama_max=%s bypass_slope=%s strict_min=%.2f final_gate_relax=True direct_dispatch=True sell_short_ok_prefilter=True range_repair=%s low_move_pool_refill=%s version=%s",
+            "[SUMMARY AI MORE CANDIDATES PATCH] installed top_n=%s tonosama_max=%s bypass_slope=%s strict_min=%.2f final_gate_relax=True direct_dispatch=True sell_short_ok_prefilter=True range_repair=%s low_move_pool_refill=%s approved_row_range=%s version=%s",
             top_n,
             tonosama_max,
             bypass_slope,
             _strict_score_floor(),
             _RANGE_PCT_REPAIR_INSTALLED,
             _LOW_MOVE_POOL_PATCHED,
+            _APPROVED_ROW_RANGE_REPAIR_INSTALLED,
             VERSION,
         )
         return True
