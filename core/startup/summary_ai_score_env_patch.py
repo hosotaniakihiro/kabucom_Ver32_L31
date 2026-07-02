@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/summary_ai_score_env_patch.py
-# Version: PRODUCTION-STABLE-REV2-SUMMARY-AI-ENTRY-BUY-THRESHOLD-PATCH
+# Version: PRODUCTION-STABLE-REV3-SUMMARY-AI-ENTRY-EXEC-FIX-INSTALL
 # ------------------------------------------------------------
 # Purpose:
 #   - AI.entry_gate の SUMMARY score threshold は MIN_ENTRY_SCORE を参照する。
@@ -8,10 +8,13 @@
 #   - entry_controller.py 側の最終BUY閾値が 5.0 のままだと、
 #     BUY候補がAI_OKでも BUY_SCORE_LOW / BUY_COMPOSITE_LOW で落ちる。
 #   - 起動時に MIN_ENTRY_SCORE と entry_controller BUY閾値を実運用値へ合わせる。
+#   - REV3: SUMMARY_AI approved後の blowoff_top 過剰除外と tf=1 history 空を補修する
+#           summary_ai_entry_execution_fix_patch を同時に install する。
 #
 # Expected:
 #   - BUY score=4.0 の候補が entry_controller 最終AI gate を通過する
 #   - SELL候補の score_low:<4.000 も減る
+#   - blowoff_top は無効化せず、BUYの本当の吹き上げだけ止める
 # ============================================================
 
 from __future__ import annotations
@@ -90,6 +93,19 @@ def _patch_entry_controller_thresholds() -> dict[str, object]:
     return result
 
 
+def _install_execution_fix_patch() -> dict[str, object]:
+    result: dict[str, object] = {"installed": False}
+    try:
+        from core.startup.summary_ai_entry_execution_fix_patch import install as install_exec_fix
+
+        ok = bool(install_exec_fix())
+        result.update({"installed": ok})
+    except Exception as e:
+        logger.exception("[SUMMARY AI SCORE ENV PATCH] execution fix patch install failed")
+        result.update({"error": repr(e)})
+    return result
+
+
 def install_summary_ai_score_env_patch() -> None:
     global _INSTALLED
     if _INSTALLED:
@@ -104,13 +120,15 @@ def install_summary_ai_score_env_patch() -> None:
     _set_env_default("ENTRY_CONTROLLER_MIN_AI_CONFIDENCE_BUY", "0.60", applied, kept)
 
     controller_patch = _patch_entry_controller_thresholds()
+    execution_fix_patch = _install_execution_fix_patch()
 
     _INSTALLED = True
     logger.warning(
-        "[SUMMARY AI SCORE ENV PATCH] installed applied=%s kept=%s entry_controller=%s",
+        "[SUMMARY AI SCORE ENV PATCH] installed applied=%s kept=%s entry_controller=%s execution_fix=%s",
         applied,
         kept,
         controller_patch,
+        execution_fix_patch,
     )
 
 
