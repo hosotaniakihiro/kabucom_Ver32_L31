@@ -1,16 +1,17 @@
 # ============================================================
 # File   : core/startup/final_entry_board_guard_signature_runtime_patch.py
-# Version: V3-SUMMARY-AI-BOARD-DELEGATE-STABLE-WATCHER
+# Version: V4-SUMMARY-AI-BOARD-DELEGATE-ORDER-BUILDER
 # ------------------------------------------------------------
 # 目的:
 #   final_entry_safety_guard_patch._board_guard / _call_board_guard が
 #   他runtime patchにより差し替わっても、4引数呼び出しで TypeError にしない。
 #
-# V3:
-#   - SUMMARY_AI候補は板未取得で即 no_order にせず order_builder 側へ委譲。
+# V4:
+#   - SUMMARY_AI候補は板未取得で即 no_order にしない。
+#   - final_entry_safety_guard_patch の内側 wrapper が再度 board_missing を出しても、
+#     protected fallback を通して entry_order_builder 側へ委譲する。
+#   - 成行緩和ではない。entry_order_builder 側の board retry + close/vwap 指値 fallback に進ませる。
 #   - 同じ関数を1秒ごとに何度もwrapし直さない。
-#   - watcherは差し替え検知時だけ再wrapし、安定後は早期終了。
-#   - side/symbolの抽出を強化。
 # ============================================================
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V3-SUMMARY-AI-BOARD-DELEGATE-STABLE-WATCHER"
+VERSION = "V4-SUMMARY-AI-BOARD-DELEGATE-ORDER-BUILDER"
 _INSTALLED = False
 _WATCHER_STARTED = False
 _LAST_BOARD_GUARD_ID: int | None = None
@@ -151,7 +152,7 @@ def _is_summary_ai_item(row: dict, item: dict) -> bool:
             ai.get("reason"),
         )
         joined = "|".join(_norm(v) for v in values if v is not None)
-        return "SUMMARY_AI" in joined or "SUMMARY_AI_PREAPPROVED" in joined or "SRC=SUMMARY" in joined
+        return "SUMMARY_AI" in joined or "SUMMARY_AI_PREAPPROVED" in joined or "SRC=SUMMARY" in joined or "SOURCE=SUMMARY" in joined
     except Exception:
         return False
 
@@ -167,15 +168,15 @@ def _clear_board_missing_skip(item: dict) -> None:
         for root in roots:
             if not isinstance(root, dict):
                 continue
-            if root.get("skip_reason") == "board_missing":
-                root.pop("skip_reason", None)
-            if root.get("final_guard_skip_reason") == "board_missing":
-                root.pop("final_guard_skip_reason", None)
-                root.pop("final_guard_skip_detail", None)
-            if root.get("retryable") is True:
-                root.pop("retryable", None)
-            if root.get("final_guard_retryable") is True:
-                root.pop("final_guard_retryable", None)
+            for k in (
+                "skip_reason",
+                "final_guard_skip_reason",
+                "final_guard_skip_detail",
+                "retryable",
+                "final_guard_retryable",
+            ):
+                if root.get(k) in {"board_missing", True} or k.endswith("detail"):
+                    root.pop(k, None)
     except Exception:
         pass
 
@@ -188,22 +189,60 @@ def _summary_ai_delegate_ok(row: dict, item: dict, symbol: str, side: str, reaso
     close = _safe_float(_first(row, ("close", "close_price", "price", "current_price"), 0.0), 0.0)
     volume = _safe_float(_first(row, ("volume", "Volume", "出来高"), 0.0), 0.0)
     turnover = _safe_float(_first(row, ("turnover", "trading_value", "売買代金"), 0.0), 0.0)
+    score = abs(_safe_float(_first(row, ("score", "score_total", "final_score", "display_score", "score_buy", "buy_score", "score_sell", "sell_score"), 0.0), 0.0))
     if turnover <= 0 and close > 0 and volume > 0:
         turnover = close * volume
     if close <= 0 or volume <= 0 or turnover <= 0:
         return False
+    if volume < _safe_float(os.getenv("ENTRY_SUMMARY_AI_DELEGATE_MIN_VOLUME"), 30000.0):
+        return False
+    if turnover < _safe_float(os.getenv("ENTRY_SUMMARY_AI_DELEGATE_MIN_TURNOVER"), 10000000.0):
+        return False
+    if score < _safe_float(os.getenv("ENTRY_SUMMARY_AI_DELEGATE_MIN_SCORE"), 0.90):
+        return False
+
     _clear_board_missing_skip(item)
     logger.warning(
-        "[FINAL BOARD GUARD SIGNATURE] SUMMARY_AI_BOARD_DELEGATE symbol=%s side=%s reason=%s close=%.4f volume=%.0f turnover=%.0f version=%s",
+        "[FINAL BOARD GUARD SIGNATURE] SUMMARY_AI_BOARD_DELEGATE symbol=%s side=%s reason=%s close=%.4f volume=%.0f turnover=%.0f score=%.3f version=%s",
         symbol,
         side,
         reason,
         close,
         volume,
         turnover,
+        score,
         VERSION,
     )
     return True
+
+
+def _patch_final_safety_fallback(target: Any) -> None:
+    """
+    final_entry_safety_guard_patch の内側 wrapper が再度 _native_board_guard を呼んだ場合でも、
+    SUMMARY_AI だけは order_builder 委譲へ通す。
+    """
+    try:
+        old_fallback = getattr(target, "_board_missing_fallback_ok", None)
+        if getattr(old_fallback, "_summary_ai_delegate_fallback_v4", False):
+            return
+
+        def _board_missing_fallback_ok_patched(row: dict, item: dict, symbol: str, side: str) -> bool:
+            row_d = _row_to_dict(row)
+            item_d = _extract_item_dict(item)
+            sym = _extract_symbol(row_d, item_d, symbol)
+            sd = _extract_side(row_d, item_d, side)
+            if _summary_ai_delegate_ok(row_d, item_d, sym, sd, "native_board_missing_fallback"):
+                return True
+            if callable(old_fallback):
+                return bool(old_fallback(row, item, symbol, side))
+            return False
+
+        _board_missing_fallback_ok_patched._summary_ai_delegate_fallback_v4 = True  # type: ignore[attr-defined]
+        _board_missing_fallback_ok_patched._original = old_fallback  # type: ignore[attr-defined]
+        target._board_missing_fallback_ok = _board_missing_fallback_ok_patched
+        logger.warning("[FINAL BOARD GUARD SIGNATURE] patched _board_missing_fallback_ok version=%s", VERSION)
+    except Exception:
+        logger.exception("[FINAL BOARD GUARD SIGNATURE] patch fallback failed version=%s", VERSION)
 
 
 def _call_flexible(fn: Callable[..., Any], row: dict, item: dict, symbol: str, side: str) -> bool:
@@ -224,7 +263,7 @@ def _wrap_board_guard(target: Any) -> bool:
     cur = getattr(target, "_board_guard", None)
     if not callable(cur):
         return False
-    if getattr(cur, "_final_board_guard_signature_compat_v3", False):
+    if getattr(cur, "_final_board_guard_signature_compat_v4", False):
         _LAST_BOARD_GUARD_ID = id(cur)
         return True
     if _LAST_BOARD_GUARD_ID == id(cur):
@@ -248,17 +287,12 @@ def _wrap_board_guard(target: Any) -> bool:
             logger.warning("[FINAL BOARD GUARD SIGNATURE] BOARD_GUARD_ERROR_COMPAT symbol=%s side=%s error=%s version=%s", sym, sd, e, VERSION)
             if _summary_ai_delegate_ok(row_d, item_d, sym, sd, "board_guard_exception"):
                 return True
-            try:
-                fallback = getattr(target, "_board_missing_fallback_ok", None)
-                if callable(fallback):
-                    return bool(fallback(row_d, item_d, sym, sd))
-            except Exception:
-                pass
             return False
 
     _compat_board_guard._final_board_guard_signature_compat_v1 = True  # type: ignore[attr-defined]
     _compat_board_guard._final_board_guard_signature_compat_v2 = True  # type: ignore[attr-defined]
     _compat_board_guard._final_board_guard_signature_compat_v3 = True  # type: ignore[attr-defined]
+    _compat_board_guard._final_board_guard_signature_compat_v4 = True  # type: ignore[attr-defined]
     _compat_board_guard._original = original  # type: ignore[attr-defined]
     target._board_guard = _compat_board_guard
     _LAST_BOARD_GUARD_ID = id(_compat_board_guard)
@@ -271,7 +305,7 @@ def _wrap_call_board_guard(target: Any) -> bool:
     cur = getattr(target, "_call_board_guard", None)
     if not callable(cur):
         return False
-    if getattr(cur, "_final_board_guard_signature_call_v3", False):
+    if getattr(cur, "_final_board_guard_signature_call_v4", False):
         _LAST_CALL_GUARD_ID = id(cur)
         return True
     if _LAST_CALL_GUARD_ID == id(cur):
@@ -294,17 +328,12 @@ def _wrap_call_board_guard(target: Any) -> bool:
             logger.warning("[FINAL BOARD GUARD SIGNATURE] BOARD_GUARD_ERROR_COMPAT symbol=%s side=%s error=%s version=%s", sym, sd, e, VERSION)
             if _summary_ai_delegate_ok(row_d, item_d, sym, sd, "call_board_guard_exception"):
                 return True
-            try:
-                fallback = getattr(target, "_board_missing_fallback_ok", None)
-                if callable(fallback):
-                    return bool(fallback(row_d, item_d, sym, sd))
-            except Exception:
-                pass
             return False
 
     _compat_call_board_guard._final_board_guard_signature_call_v1 = True  # type: ignore[attr-defined]
     _compat_call_board_guard._final_board_guard_signature_call_v2 = True  # type: ignore[attr-defined]
     _compat_call_board_guard._final_board_guard_signature_call_v3 = True  # type: ignore[attr-defined]
+    _compat_call_board_guard._final_board_guard_signature_call_v4 = True  # type: ignore[attr-defined]
     _compat_call_board_guard._original = cur  # type: ignore[attr-defined]
     target._call_board_guard = _compat_call_board_guard
     _LAST_CALL_GUARD_ID = id(_compat_call_board_guard)
@@ -316,6 +345,13 @@ def _patch_once() -> bool:
     try:
         import core.startup.final_entry_safety_guard_patch as target
         os.environ.setdefault("ENTRY_SUMMARY_AI_DELEGATE_BOARD_TO_ORDER_BUILDER", "1")
+        os.environ.setdefault("ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY", "0")
+        # final_entry_safety_guard_patch の内側 wrapper 用。成行許可ではなく、order_builder の安全指値fallbackに進ませる。
+        os.environ.setdefault("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", "1")
+        os.environ.setdefault("ENTRY_ALLOW_WITHOUT_BOARD_MIN_VOLUME", os.getenv("ENTRY_SUMMARY_AI_DELEGATE_MIN_VOLUME", "30000"))
+        os.environ.setdefault("ENTRY_ALLOW_WITHOUT_BOARD_MIN_TURNOVER", os.getenv("ENTRY_SUMMARY_AI_DELEGATE_MIN_TURNOVER", "10000000"))
+        os.environ.setdefault("ENTRY_ALLOW_WITHOUT_BOARD_MIN_SCORE", os.getenv("ENTRY_SUMMARY_AI_DELEGATE_MIN_SCORE", "0.90"))
+        _patch_final_safety_fallback(target)
         ok1 = _wrap_board_guard(target)
         ok2 = _wrap_call_board_guard(target)
         return bool(ok1 or ok2)
@@ -327,13 +363,13 @@ def _patch_once() -> bool:
 def _watch() -> None:
     stable = 0
     last_pair: tuple[int | None, int | None] | None = None
-    for i in range(20):
+    for i in range(30):
         ok = _patch_once()
         pair = (_LAST_BOARD_GUARD_ID, _LAST_CALL_GUARD_ID)
         stable = stable + 1 if ok and pair == last_pair else 0
         last_pair = pair
-        if i in (0, 5, 10, 19):
-            logger.warning("[FINAL BOARD GUARD SIGNATURE] enforce i=%s/20 ok=%s stable=%s version=%s", i, ok, stable, VERSION)
+        if i in (0, 5, 10, 20, 29):
+            logger.warning("[FINAL BOARD GUARD SIGNATURE] enforce i=%s/30 ok=%s stable=%s version=%s", i, ok, stable, VERSION)
         if stable >= 3:
             logger.warning("[FINAL BOARD GUARD SIGNATURE] watcher stable exit i=%s version=%s", i, VERSION)
             return
