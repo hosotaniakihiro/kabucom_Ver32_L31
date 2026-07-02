@@ -1,19 +1,17 @@
 # ============================================================
 # File   : core/startup/summary_ai_blowoff_prefilter_patch.py
-# Version: V4-BLOWOFF-LOWMOVE-PREFILTER-MIN-KEEP
+# Version: V5-BLOWOFF-ONLY-BEFORE-TOP3-LOWMOVE-LATE
 # ------------------------------------------------------------
 # Summary-AI の Top3 選定前に危険候補を除外する。
 #
 # 方針:
 #   - blowoff ガード自体は緩和しない。
-#   - low-move ガード自体も緩和しない。
-#   - executor が Top3 を選ぶ前に、df_summary / source_row / ai_row で
-#     明らかに blowoff / low-move NG になる候補を候補リストから除外する。
-#   - ただし全候補を0件にすると、後段の厳密ガードへ到達せず
-#     approved selection rows=0 / skip=no_ai_ok で終了する。
-#   - V4では全落ち時だけ、スコア上位の最小件数を後段へ渡す。
-#     実発注の可否は entry_controller / liquidity / board / order_builder の
-#     本来の厳密ガードに委ねる。
+#   - Top3前では blowoff だけを除外する。
+#   - low-move は entry_pipeline 側の「3件cap直前」のprefilterへ一本化する。
+#     ここで low-move まで除外すると、AI_OK候補が全消えして
+#     approved=0 / no_ai_ok になり、次候補補充が効かなくなるため。
+#   - 互換用に SUMMARY_AI_LOWMOVE_PREFILTER_EARLY_ENABLED=1 の時だけ
+#     旧 early low-move を有効化できるが、既定は 0。
 # ============================================================
 from __future__ import annotations
 
@@ -29,7 +27,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V4-BLOWOFF-LOWMOVE-PREFILTER-MIN-KEEP"
+VERSION = "V5-BLOWOFF-ONLY-BEFORE-TOP3-LOWMOVE-LATE"
 _INSTALLED = False
 _WATCHER_STARTED = False
 _TRUE_VALUES = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
@@ -62,16 +60,6 @@ def _env_float(name: str, default: float) -> float:
         return x
     except Exception:
         return float(default)
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        raw = os.getenv(name)
-        if raw is None or str(raw).strip() == "":
-            return int(default)
-        return int(float(str(raw).replace(",", "")))
-    except Exception:
-        return int(default)
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -140,32 +128,6 @@ def _first(row: dict[str, Any], keys: tuple[str, ...], default: Any = None) -> A
     return default
 
 
-def _item_score(item: Any) -> float:
-    row = _pick_row(item)
-    vals = []
-    for key in (
-        "score_total",
-        "total_score",
-        "final_score",
-        "display_score",
-        "score",
-        "score_buy",
-        "buy_score",
-        "score_sell",
-        "sell_score",
-        "confidence",
-        "ai_confidence",
-    ):
-        vals.append(_safe_float(row.get(key), 0.0))
-    try:
-        raw = _as_dict(row.get("_raw"))
-        for key in ("score_total_raw", "score_buy_raw", "buy_score_raw", "pending_score"):
-            vals.append(_safe_float(raw.get(key), 0.0))
-    except Exception:
-        pass
-    return max(vals) if vals else 0.0
-
-
 def _detect_blowoff_symbols(df_summary: Any) -> set[str]:
     try:
         if df_summary is None or not isinstance(df_summary, pd.DataFrame) or df_summary.empty:
@@ -182,8 +144,9 @@ def _detect_blowoff_symbols(df_summary: Any) -> set[str]:
 
 
 def _low_move_ng(item: Any, df_summary: Any) -> tuple[bool, str, dict[str, Any]]:
-    if not _env_bool("SUMMARY_AI_LOWMOVE_PREFILTER_ENABLED", True):
-        return False, "disabled", {}
+    # 既定では early low-move は無効。entry_pipeline側で3件cap直前に判定する。
+    if not _env_bool("SUMMARY_AI_LOWMOVE_PREFILTER_EARLY_ENABLED", False):
+        return False, "early_lowmove_disabled", {}
     sym = _pick_symbol(item)
     row = _pick_row(item)
 
@@ -191,15 +154,11 @@ def _low_move_ng(item: Any, df_summary: Any) -> tuple[bool, str, dict[str, Any]]
         if sym and isinstance(df_summary, pd.DataFrame) and not df_summary.empty and "symbol" in df_summary.columns:
             x = df_summary[df_summary["symbol"].astype(str).str.replace(r"\.0$", "", regex=True) == sym]
             if not x.empty:
-                try:
-                    if "datetime" in x.columns:
-                        x = x.sort_values("datetime")
-                    latest = x.iloc[-1].to_dict()
-                    tmp = dict(row)
-                    tmp.update(latest)
-                    row = tmp
-                except Exception:
-                    pass
+                if "datetime" in x.columns:
+                    x = x.sort_values("datetime")
+                tmp = dict(row)
+                tmp.update(x.iloc[-1].to_dict())
+                row = tmp
     except Exception:
         pass
 
@@ -247,32 +206,11 @@ def _low_move_ng(item: Any, df_summary: Any) -> tuple[bool, str, dict[str, Any]]
     return False, "ok", {"symbol": sym, "range_pct": range_pct, "atr": atr}
 
 
-def _min_keep_items(items: list[Any], skipped: dict[str, list[str]]) -> list[Any]:
-    if not _env_bool("SUMMARY_AI_PREFILTER_MIN_KEEP_ENABLED", True):
-        return []
-    min_keep = max(0, _env_int("SUMMARY_AI_PREFILTER_MIN_KEEP", 3))
-    if min_keep <= 0 or not items:
-        return []
-    allow_blowoff = _env_bool("SUMMARY_AI_PREFILTER_MIN_KEEP_ALLOW_BLOWOFF", False)
-    blowoff_set = set(skipped.get("blowoff") or [])
-    candidates = []
-    for item in items:
-        sym = _pick_symbol(item)
-        if not allow_blowoff and sym in blowoff_set:
-            continue
-        candidates.append(item)
-    if not candidates and allow_blowoff:
-        candidates = list(items)
-    if not candidates:
-        return []
-    return sorted(candidates, key=_item_score, reverse=True)[:min_keep]
-
-
 def _filter_ai_results(ai_results: Sequence[dict[str, Any]] | Iterable[Any], df_summary: Any) -> tuple[list[Any], dict[str, list[str]], set[str]]:
     items = list(ai_results or [])
     top_symbols = _detect_blowoff_symbols(df_summary) if _env_bool("SUMMARY_AI_BLOWOFF_PREFILTER_ENABLED", True) else set()
     kept: list[Any] = []
-    skipped: dict[str, list[str]] = {"blowoff": [], "low_move": [], "min_keep": []}
+    skipped: dict[str, list[str]] = {"blowoff": [], "low_move": []}
     low_details: list[dict[str, Any]] = []
 
     for item in items:
@@ -289,30 +227,24 @@ def _filter_ai_results(ai_results: Sequence[dict[str, Any]] | Iterable[Any], df_
             continue
         kept.append(item)
 
-    if not kept and items:
-        restored = _min_keep_items(items, skipped)
-        if restored:
-            kept = restored
-            skipped["min_keep"] = [_pick_symbol(x) or "UNKNOWN" for x in restored]
-            logger.warning(
-                "[SUMMARY AI PREFILTER] all candidates filtered -> min_keep restored symbols=%s before=%s low_move=%s blowoff=%s version=%s",
-                skipped["min_keep"],
-                len(items),
-                sorted(set(skipped.get("low_move") or [])),
-                sorted(set(skipped.get("blowoff") or [])),
-                VERSION,
-            )
-
-    if skipped["blowoff"] or skipped["low_move"] or skipped["min_keep"]:
+    if skipped["blowoff"] or skipped["low_move"]:
         logger.warning(
-            "[SUMMARY AI PREFILTER] applied before Top3 before=%s after=%s blowoff=%s low_move=%s min_keep=%s low_details=%s top_symbols_count=%s version=%s",
+            "[SUMMARY AI PREFILTER] applied before Top3 before=%s after=%s blowoff=%s low_move=%s low_details=%s top_symbols_count=%s early_lowmove=%s version=%s",
             len(items),
             len(kept),
             sorted(set(skipped["blowoff"])),
             sorted(set(skipped["low_move"])),
-            sorted(set(skipped["min_keep"])),
             low_details[:20],
             len(top_symbols),
+            _env_bool("SUMMARY_AI_LOWMOVE_PREFILTER_EARLY_ENABLED", False),
+            VERSION,
+        )
+    else:
+        logger.info(
+            "[SUMMARY AI PREFILTER] no early skip before=%s top_symbols_count=%s early_lowmove=%s version=%s",
+            len(items),
+            len(top_symbols),
+            _env_bool("SUMMARY_AI_LOWMOVE_PREFILTER_EARLY_ENABLED", False),
             VERSION,
         )
     return kept, skipped, top_symbols
@@ -326,7 +258,7 @@ def _patch_once(reason: str = "install") -> bool:
         if not callable(cur):
             logger.warning("[SUMMARY AI PREFILTER] target missing reason=%s", reason)
             return False
-        if getattr(cur, "_summary_ai_blowoff_prefilter_v4", False):
+        if getattr(cur, "_summary_ai_blowoff_prefilter_v5", False):
             return True
 
         original = getattr(cur, "_original", cur)
@@ -339,18 +271,25 @@ def _patch_once(reason: str = "install") -> bool:
                     if isinstance(a, pd.DataFrame):
                         df_summary = a
                         break
+            before_n = len(list(ai_results or []))
             filtered, skipped, top_symbols = _filter_ai_results(ai_results, df_summary)
             result = original(filtered, *args, **kwargs)
             try:
                 if isinstance(result, dict):
-                    result["summary_ai_prefilter"] = {
-                        "before": len(list(ai_results or [])),
+                    pre = {
+                        "before": before_n,
                         "after": len(filtered),
                         "skipped": {k: sorted(set(v)) for k, v in skipped.items()},
                         "top_symbols_count": len(top_symbols),
+                        "early_lowmove": _env_bool("SUMMARY_AI_LOWMOVE_PREFILTER_EARLY_ENABLED", False),
                         "version": VERSION,
                     }
-                    result["blowoff_prefilter"] = result["summary_ai_prefilter"]
+                    result["summary_ai_prefilter"] = pre
+                    result["blowoff_prefilter"] = pre
+                    if len(filtered) == 0 and before_n > 0:
+                        result["skip_reason"] = "summary_ai_prefilter_all_blocked"
+                        if isinstance(result.get("execution"), dict):
+                            result["execution"]["skip_reason"] = "summary_ai_prefilter_all_blocked"
             except Exception:
                 pass
             return result
@@ -359,9 +298,10 @@ def _patch_once(reason: str = "install") -> bool:
         patched._summary_ai_blowoff_prefilter_v2 = True  # type: ignore[attr-defined]
         patched._summary_ai_blowoff_prefilter_v3 = True  # type: ignore[attr-defined]
         patched._summary_ai_blowoff_prefilter_v4 = True  # type: ignore[attr-defined]
+        patched._summary_ai_blowoff_prefilter_v5 = True  # type: ignore[attr-defined]
         patched._original = original  # type: ignore[attr-defined]
         ex.execute_ai_ok_entries_bulk = patched
-        logger.warning("[SUMMARY AI PREFILTER] installed reason=%s version=%s", reason, VERSION)
+        logger.warning("[SUMMARY AI PREFILTER] installed reason=%s version=%s early_lowmove=%s", reason, VERSION, _env_bool("SUMMARY_AI_LOWMOVE_PREFILTER_EARLY_ENABLED", False))
         return True
     except Exception:
         logger.exception("[SUMMARY AI PREFILTER] install failed reason=%s", reason)
@@ -379,16 +319,13 @@ def _watcher() -> None:
 
 def install() -> bool:
     global _INSTALLED, _WATCHER_STARTED
-    os.environ.setdefault("SUMMARY_AI_PREFILTER_MIN_KEEP_ENABLED", "1")
-    os.environ.setdefault("SUMMARY_AI_PREFILTER_MIN_KEEP", "3")
-    os.environ.setdefault("SUMMARY_AI_PREFILTER_MIN_KEEP_ALLOW_BLOWOFF", "0")
     ok = _patch_once("install")
     _INSTALLED = bool(ok)
     if not _WATCHER_STARTED:
         _WATCHER_STARTED = True
         threading.Thread(target=_watcher, name="summary-ai-prefilter-watch", daemon=True).start()
         logger.warning("[SUMMARY AI PREFILTER] watcher started")
-    logger.warning("[SUMMARY AI PREFILTER] install done ok=%s version=%s min_keep=%s", ok, VERSION, os.getenv("SUMMARY_AI_PREFILTER_MIN_KEEP"))
+    logger.warning("[SUMMARY AI PREFILTER] install done ok=%s version=%s", ok, VERSION)
     return bool(ok)
 
 
