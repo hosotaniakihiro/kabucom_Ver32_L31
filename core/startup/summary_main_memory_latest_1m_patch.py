@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_main_memory_latest_1m_patch.py
-# Version: V2-MAIN-MEMORY-LATEST-1M-ROBUST-COLUMNS
+# Version: V3-MAIN-MEMORY-NO-STALE-COERCE
 # ------------------------------------------------------------
 # main.py は PUSH DB 保存をしない前提のまま、PUSHメモリDFから
 # 最新1分足 summary を高速生成する。
 #
-# V2:
-#   - PUSHメモリ raw_rows があるのに usable=0 になる問題を修正。
-#   - CurrentPriceTime が古い/時刻のみ/欠損でも received_at または now で採用。
-#   - 列名揺れ、大小文字、空白、kabu Station camel case、簡単なdict列を吸収。
-#   - メモリ行が存在する場合は original fallback に逃げにくくする。
+# V3:
+#   - 古い PUSH tick を now に付け替えて「新鮮なsummary」に見せない。
+#   - raw_rows があっても tick_dt が lookback 外なら空を返す。
+#   - これにより score/slope/macd=0 の偽fresh summaryをAIへ渡さない。
+#   - 互換用に SUMMARY_MAIN_MEMORY_COERCE_OLD_TICKS_TO_NOW=1 の時だけ
+#     旧coerce動作を許可する。既定は 0。
 # ============================================================
 from __future__ import annotations
 
@@ -26,7 +27,7 @@ from typing import Any, Optional
 import pandas as pd
 
 logger = logging.getLogger(__name__)
-VERSION = "V2-MAIN-MEMORY-LATEST-1M-ROBUST-COLUMNS"
+VERSION = "V3-MAIN-MEMORY-NO-STALE-COERCE"
 _INSTALLED = False
 
 
@@ -139,7 +140,6 @@ def _first_existing(df: pd.DataFrame, names: tuple[str, ...]) -> Optional[str]:
         cn = _canon(name)
         if cn in canon:
             return canon[cn]
-    # suffix match for flattened dict columns: data.CurrentPrice etc.
     for name in names:
         cn = _canon(name)
         for c in df.columns:
@@ -154,9 +154,8 @@ def _to_naive_datetime_any(values: Any, *, now: dt.datetime, date_values: Any = 
     try:
         s = pd.Series(values, index=idx) if not isinstance(values, pd.Series) else values.copy()
     except Exception:
-        return pd.Series(pd.Timestamp(now), index=idx)
+        return pd.Series(pd.NaT, index=idx)
 
-    # numeric/HHMMSS/time-onlyを今日の日付に寄せる
     today_s = pd.Timestamp(now).strftime("%Y-%m-%d")
     if date_values is not None:
         try:
@@ -175,7 +174,6 @@ def _to_naive_datetime_any(values: Any, *, now: dt.datetime, date_values: Any = 
             txt = str(v).strip()
             if txt == "":
                 return pd.NaT
-            # 93000 / 093000 / 09:30:00
             if re.fullmatch(r"\d{5,6}", txt):
                 txt = txt.zfill(6)
                 return pd.Timestamp(f"{day} {txt[0:2]}:{txt[2:4]}:{txt[4:6]}")
@@ -262,11 +260,12 @@ def _normalize_push_ticks(df: pd.DataFrame, *, now: dt.datetime) -> pd.DataFrame
 
     if sym_col is None or price_col is None:
         logger.warning(
-            "[SUMMARY MAIN MEMORY 1M] required columns missing symbol_col=%s price_col=%s cols=%s raw_rows=%s",
+            "[SUMMARY MAIN MEMORY 1M] required columns missing symbol_col=%s price_col=%s cols=%s raw_rows=%s version=%s",
             sym_col,
             price_col,
             list(out.columns)[:120],
             len(out),
+            VERSION,
         )
         return pd.DataFrame()
 
@@ -280,27 +279,46 @@ def _normalize_push_ticks(df: pd.DataFrame, *, now: dt.datetime) -> pd.DataFrame
     recv_dt = _to_naive_datetime_any(out[recv_col], now=now, date_values=date_values) if recv_col is not None else pd.Series(pd.NaT, index=out.index)
     event_dt = _to_naive_datetime_any(out[event_col], now=now, date_values=date_values) if event_col is not None else pd.Series(pd.NaT, index=out.index)
 
-    # received_atを最優先。kabu StationのCurrentPriceTimeは約定が無いと古いままなので補助扱い。
     norm["tick_dt"] = recv_dt.where(recv_dt.notna(), event_dt)
-    norm["tick_dt"] = norm["tick_dt"].where(norm["tick_dt"].notna(), pd.Timestamp(now))
+    missing_dt = norm["tick_dt"].isna()
+    if int(missing_dt.sum()) > 0:
+        # 欠損時刻だけは now 補完を許可。古い時刻の付け替えは下で拒否する。
+        norm.loc[missing_dt, "tick_dt"] = pd.Timestamp(now).tz_localize(None)
 
     try:
-        cutoff = pd.Timestamp(now).tz_localize(None) + pd.Timedelta(seconds=max(3, _env_int("SUMMARY_MAIN_MEMORY_FUTURE_GRACE_SEC", 75)))
-        floor = pd.Timestamp(now).tz_localize(None) - pd.Timedelta(minutes=max(1, _env_int("SUMMARY_MAIN_MEMORY_LOOKBACK_MIN", 30)))
+        now_ts = pd.Timestamp(now).tz_localize(None)
+        cutoff = now_ts + pd.Timedelta(seconds=max(3, _env_int("SUMMARY_MAIN_MEMORY_FUTURE_GRACE_SEC", 75)))
+        lookback_min = max(1, _env_int("SUMMARY_MAIN_MEMORY_LOOKBACK_MIN", 30))
+        floor = now_ts - pd.Timedelta(minutes=lookback_min)
         keep = (norm["tick_dt"] <= cutoff) & (norm["tick_dt"] >= floor)
         if int(keep.sum()) == 0 and len(norm) > 0:
-            # 時刻列が全滅/古い場合でもPUSHメモリがあるなら now に寄せて使う。
-            logger.warning(
-                "[SUMMARY MAIN MEMORY 1M] no rows in time window -> coerce tick_dt to now raw_rows=%s min_dt=%s max_dt=%s",
-                len(norm),
-                norm["tick_dt"].min() if "tick_dt" in norm.columns else None,
-                norm["tick_dt"].max() if "tick_dt" in norm.columns else None,
-            )
-            norm["tick_dt"] = pd.Timestamp(now).tz_localize(None)
-            keep = pd.Series(True, index=norm.index)
+            min_dt = norm["tick_dt"].min() if "tick_dt" in norm.columns else None
+            max_dt = norm["tick_dt"].max() if "tick_dt" in norm.columns else None
+            if _env_bool("SUMMARY_MAIN_MEMORY_COERCE_OLD_TICKS_TO_NOW", False):
+                logger.warning(
+                    "[SUMMARY MAIN MEMORY 1M] no rows in time window -> COERCE OLD TICKS ENABLED raw_rows=%s min_dt=%s max_dt=%s lookback_min=%s version=%s",
+                    len(norm), min_dt, max_dt, lookback_min, VERSION,
+                )
+                norm["tick_dt"] = now_ts
+                keep = pd.Series(True, index=norm.index)
+            else:
+                try:
+                    stale_sec = (now_ts - pd.Timestamp(max_dt).tz_localize(None)).total_seconds() if max_dt is not None and not pd.isna(max_dt) else None
+                except Exception:
+                    stale_sec = None
+                logger.warning(
+                    "[SUMMARY MAIN MEMORY 1M] stale push memory rejected raw_rows=%s min_dt=%s max_dt=%s stale_sec=%s lookback_min=%s coerce_old=0 version=%s",
+                    len(norm),
+                    min_dt,
+                    max_dt,
+                    None if stale_sec is None else round(float(stale_sec), 1),
+                    lookback_min,
+                    VERSION,
+                )
+                return pd.DataFrame()
         norm = norm[keep].copy()
     except Exception:
-        pass
+        logger.debug("[SUMMARY MAIN MEMORY 1M] time window filter failed", exc_info=True)
 
     norm["trading_volume"] = pd.to_numeric(out[vol_col], errors="coerce") if vol_col is not None else pd.NA
     norm["trading_value"] = pd.to_numeric(out[val_col], errors="coerce") if val_col is not None else pd.NA
@@ -315,12 +333,13 @@ def _normalize_push_ticks(df: pd.DataFrame, *, now: dt.datetime) -> pd.DataFrame
     norm = norm[norm["price"] > 0].copy()
     if norm.empty:
         logger.warning(
-            "[SUMMARY MAIN MEMORY 1M] normalized empty after drop before=%s symbol_col=%s price_col=%s recv_col=%s event_col=%s",
+            "[SUMMARY MAIN MEMORY 1M] normalized empty after drop before=%s symbol_col=%s price_col=%s recv_col=%s event_col=%s version=%s",
             before,
             sym_col,
             price_col,
             recv_col,
             event_col,
+            VERSION,
         )
         return pd.DataFrame()
     norm = norm.sort_values(["symbol", "tick_dt"], kind="stable").reset_index(drop=True)
@@ -343,7 +362,7 @@ def _build_memory_1m_summary(*, now: dt.datetime) -> pd.DataFrame:
     raw = _load_push_memory_df()
     ticks = _normalize_push_ticks(raw, now=now)
     if ticks.empty:
-        logger.warning("[SUMMARY MAIN MEMORY 1M] no usable PUSH memory rows raw_rows=%s", len(raw) if isinstance(raw, pd.DataFrame) else 0)
+        logger.warning("[SUMMARY MAIN MEMORY 1M] no usable PUSH memory rows raw_rows=%s version=%s", len(raw) if isinstance(raw, pd.DataFrame) else 0, VERSION)
         return pd.DataFrame()
 
     try:
@@ -502,7 +521,7 @@ def _wrap_runner_core() -> bool:
     if not callable(orig_job_summary):
         logger.warning("[SUMMARY MAIN MEMORY 1M] runner_core.job_summary unavailable")
         return False
-    if getattr(orig_job_summary, "_summary_main_memory_latest_wrapped_v2", False):
+    if getattr(orig_job_summary, "_summary_main_memory_latest_wrapped_v3", False):
         return True
 
     @wraps(orig_job_summary)
@@ -524,27 +543,30 @@ def _wrap_runner_core() -> bool:
             _publish_latest(df)
             _submit_async_ai(df, now=now_i, run_entry=bool(run_entry))
             logger.warning(
-                "[SUMMARY MAIN MEMORY 1M] return memory summary rows=%s latest_dt=%s elapsed=%.3fs display_skipped=True",
+                "[SUMMARY MAIN MEMORY 1M] return memory summary rows=%s latest_dt=%s elapsed=%.3fs display_skipped=True version=%s",
                 len(df),
                 df["datetime"].max() if "datetime" in df.columns else None,
                 time.perf_counter() - t0,
+                VERSION,
             )
             return df
 
         if _env_bool("SUMMARY_MAIN_MEMORY_NO_HEAVY_FALLBACK_WHEN_RAW_EXISTS", True) and isinstance(raw, pd.DataFrame) and not raw.empty:
             logger.warning(
-                "[SUMMARY MAIN MEMORY 1M] memory build empty but raw exists -> skip original heavy fallback interval=%s raw_rows=%s elapsed=%.3fs",
+                "[SUMMARY MAIN MEMORY 1M] memory build empty but raw exists -> skip original heavy fallback interval=%s raw_rows=%s elapsed=%.3fs version=%s",
                 interval_i,
                 len(raw),
                 time.perf_counter() - t0,
+                VERSION,
             )
             return pd.DataFrame()
 
-        logger.warning("[SUMMARY MAIN MEMORY 1M] memory summary empty -> original fallback interval=%s", interval_i)
+        logger.warning("[SUMMARY MAIN MEMORY 1M] memory summary empty -> original fallback interval=%s version=%s", interval_i, VERSION)
         return orig_job_summary(interval_i, display=display, now=now_i, run_entry=run_entry, **kwargs)
 
     job_summary_memory._summary_main_memory_latest_wrapped = True  # type: ignore[attr-defined]
     job_summary_memory._summary_main_memory_latest_wrapped_v2 = True  # type: ignore[attr-defined]
+    job_summary_memory._summary_main_memory_latest_wrapped_v3 = True  # type: ignore[attr-defined]
     job_summary_memory._original = orig_job_summary  # type: ignore[attr-defined]
     rc.job_summary = job_summary_memory
     rc.run_push_summary_job = lambda interval=1, display=True, now=None, run_entry=True, **kwargs: job_summary_memory(int(interval), display=display, now=now, run_entry=run_entry, **kwargs)
@@ -577,10 +599,11 @@ def install() -> bool:
         os.environ.setdefault("SUMMARY_MAIN_MEMORY_MAX_SYMBOLS", "200")
         os.environ.setdefault("SUMMARY_MAIN_MEMORY_ASYNC_AI", "1")
         os.environ.setdefault("SUMMARY_MAIN_MEMORY_NO_HEAVY_FALLBACK_WHEN_RAW_EXISTS", "1")
+        os.environ.setdefault("SUMMARY_MAIN_MEMORY_COERCE_OLD_TICKS_TO_NOW", "0")
         ok = _wrap_runner_core()
         _wrap_scheduler_runner_aliases()
         _INSTALLED = bool(ok)
-        logger.warning("[SUMMARY MAIN MEMORY 1M] installed=%s version=%s", ok, VERSION)
+        logger.warning("[SUMMARY MAIN MEMORY 1M] installed=%s version=%s coerce_old=%s", ok, VERSION, _env_bool("SUMMARY_MAIN_MEMORY_COERCE_OLD_TICKS_TO_NOW", False))
         return bool(ok)
     except Exception:
         logger.exception("[SUMMARY MAIN MEMORY 1M] install failed")
