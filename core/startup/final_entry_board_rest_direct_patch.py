@@ -1,22 +1,23 @@
 # ============================================================
 # File   : core/startup/final_entry_board_rest_direct_patch.py
-# Version: V3-NO-DIRECT-REST-UNLESS-FORCED
+# Version: V3.1-SIDE-CONTEXT-PRESERVED
 # ------------------------------------------------------------
 # 目的:
 #   SUMMARY_AI / TONOSAMA の発注直前に PUSH 板が無い場合、
 #   REST /board を候補ごとに連打して 429(API実行回数エラー) / 4002006(レジスト数エラー)
 #   を起こす経路を止める。
 #
-# V3:
-#   - ENTRY_BOARD_REST_DIRECT_FORCE=1 が無い通常運用では、
-#     ENTRY_BOARD_REST_DIRECT_ENABLED を強制的に 0 にする。
-#   - final_entry_safety_guard からはまずPUSH板だけを見る。
-#   - PUSH板が無い場合は、board_missing_failopen_runtime_patch の保護fail-openへ流す。
-#   - 非常用にREST板補完を使う場合のみ board_client.fetch_board_snapshot を経由する。
+# V3.1:
+#   - final_entry_safety_guard_patch._native_board_guard が
+#     _try_get_bid_ask_from_api(symbol) の1引数で呼んでも、呼び出し元frameから
+#     side/source を復元して get_latest_bid_ask(symbol, source=..., side=...) へ渡す。
+#   - ログの `side=` 空欄を防ぎ、PUSH板取得・診断の方向情報を落とさない。
+#   - REST直叩きは引き続き ENTRY_BOARD_REST_DIRECT_FORCE=1 の時だけ。
 # ============================================================
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import threading
@@ -25,7 +26,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V3-NO-DIRECT-REST-UNLESS-FORCED"
+VERSION = "V3.1-SIDE-CONTEXT-PRESERVED"
 _INSTALLED = False
 _WATCHER_STARTED = False
 
@@ -84,6 +85,42 @@ def _norm_symbol(v: Any) -> str:
     if s.endswith(".T"):
         s = s[:-2]
     return s
+
+
+def _norm_side(v: Any) -> str:
+    s = str(v or "").strip().upper()
+    if s in {"BUY", "LONG", "2", "買", "買い"}:
+        return "BUY"
+    if s in {"SELL", "SHORT", "1", "売", "売り"}:
+        return "SELL"
+    return s
+
+
+def _infer_context_side_source(side: str = "", source: str = "") -> tuple[str, str]:
+    """Recover side/source when caller used legacy _try_get_bid_ask_from_api(symbol)."""
+    side_s = _norm_side(side)
+    source_s = str(source or "").strip() or "final_entry_safety_guard"
+    if side_s:
+        return side_s, source_s
+    try:
+        frame = inspect.currentframe()
+        # current -> _infer_context_side_source -> _try_get_bid_ask_from_api -> caller
+        for _ in range(6):
+            frame = frame.f_back if frame is not None else None
+            if frame is None:
+                break
+            loc = frame.f_locals
+            cand = _norm_side(loc.get("side") or loc.get("entry_side") or loc.get("ai_side"))
+            if cand:
+                side_s = cand
+            src = loc.get("source") or loc.get("entry_source")
+            if src and not source_s:
+                source_s = str(src)
+            if side_s:
+                break
+    except Exception:
+        pass
+    return side_s, source_s or "final_entry_safety_guard"
 
 
 def _extract_board_values(board: Any) -> tuple[float, float, float, float]:
@@ -180,6 +217,7 @@ def _call_board_rest_via_client(symbol: str) -> tuple[float, float, float, float
 def _make_try_get_bid_ask_from_api():
     def _try_get_bid_ask_from_api(symbol: str, side: str = "", source: str = "final_entry_safety_guard") -> tuple[float, float, float, float]:
         _force_disable_direct_rest_if_needed()
+        side, source = _infer_context_side_source(side, source)
         try:
             from utils_common import get_latest_bid_ask
             try:
@@ -188,12 +226,12 @@ def _make_try_get_bid_ask_from_api():
                 res = get_latest_bid_ask(symbol)
             bid, ask, bid_qty, ask_qty = _extract_board_values(res)
             if bid > 0 and ask > 0:
-                logger.warning("[FINAL ENTRY BOARD REST DIRECT] PUSH_BOARD_OK symbol=%s bid=%.4f ask=%.4f version=%s", _norm_symbol(symbol), bid, ask, VERSION)
+                logger.warning("[FINAL ENTRY BOARD REST DIRECT] PUSH_BOARD_OK symbol=%s side=%s bid=%.4f ask=%.4f version=%s", _norm_symbol(symbol), side, bid, ask, VERSION)
                 return bid, ask, bid_qty, ask_qty
         except Exception:
-            logger.debug("[FINAL ENTRY BOARD REST DIRECT] push board lookup failed symbol=%s", symbol, exc_info=True)
+            logger.debug("[FINAL ENTRY BOARD REST DIRECT] push board lookup failed symbol=%s side=%s", symbol, side, exc_info=True)
 
-        # 通常はここでRESTを叩かず、0を返して fail-open/hard-block 側に判断させる。
+        # 通常はここでRESTを叩かず、0を返して hard-block/pending 側に判断させる。
         bid, ask, bid_qty, ask_qty = _call_board_rest_via_client(symbol)
         if bid <= 0 or ask <= 0:
             logger.warning(
@@ -207,6 +245,7 @@ def _make_try_get_bid_ask_from_api():
             )
         return bid, ask, bid_qty, ask_qty
 
+    _try_get_bid_ask_from_api._final_entry_board_rest_direct_v31 = True  # type: ignore[attr-defined]
     _try_get_bid_ask_from_api._final_entry_board_rest_direct_v3 = True  # type: ignore[attr-defined]
     _try_get_bid_ask_from_api._final_entry_board_rest_direct_v2 = True  # type: ignore[attr-defined]
     _try_get_bid_ask_from_api._final_entry_board_rest_direct_v1 = True  # type: ignore[attr-defined]
@@ -218,11 +257,15 @@ def _install_once(log_patch: bool = True) -> bool:
     try:
         _force_disable_direct_rest_if_needed()
         import core.startup.final_entry_safety_guard_patch as fsg
+        cur = getattr(fsg, "_try_get_bid_ask_from_api", None)
+        if getattr(cur, "_final_entry_board_rest_direct_v31", False):
+            _INSTALLED = True
+            return True
         fsg._try_get_bid_ask_from_api = _make_try_get_bid_ask_from_api()
         _INSTALLED = True
         if log_patch:
             logger.warning(
-                "[FINAL ENTRY BOARD REST DIRECT] installed v3 direct_enabled=%s force=%s hard_block=%s allow_without_board=%s version=%s",
+                "[FINAL ENTRY BOARD REST DIRECT] installed v3.1 direct_enabled=%s force=%s hard_block=%s allow_without_board=%s version=%s",
                 _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", False),
                 _env_bool("ENTRY_BOARD_REST_DIRECT_FORCE", False),
                 _env_bool("ENTRY_BOARD_MISSING_HARD_BLOCK", True),
@@ -258,6 +301,3 @@ try:
     install()
 except Exception:
     logger.exception("[FINAL ENTRY BOARD REST DIRECT] auto install failed")
-
-
-__all__ = ["install", "VERSION"]
