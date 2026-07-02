@@ -1,19 +1,20 @@
 # ============================================================
 # File   : trading/entry/summary_ai/executor.py
-# Version: REV6-NO-ORDER-ROLLING-RETRY
+# Version: REV7-ROLLING-RETRY-BYPASS-RUNTIME-LOWMOVE-PREFILTER
 # ------------------------------------------------------------
 # AI_OK rows -> approved_rows -> entry_pipeline.
 #
-# REV6:
-#   - approved候補が entry_pipeline 側の厳密ガード
-#     blowoff / low-move / liquidity 等で全滅した場合、
-#     ガードは緩めず、未試行のAI_OK次候補を少数だけ繰り上げて再投入する。
-#   - 実発注成功判定はREV5同様、order_id / sent_orders / executed=True 等の
-#     実注文証跡だけを成功扱いにする。
+# REV7:
+#   - rolling retry の候補プール作成では runtime patch で置換され得る
+#     _filter_blocked_ai_ok_items を使わず、executor 本体の価格/出来高/日次リスク等の
+#     基本フィルタ _base_filter_blocked_ai_ok_items を直接使う。
+#   - これにより、外側の SUMMARY_AI LOW MOVE PREFILTER が range_pct=0 と誤判定して
+#     AI_OK 8件を1件だけに絞るケースでも、executor 側で未試行候補を繰り上げられる。
+#   - low-move / blowoff / liquidity ガード自体は entry_pipeline 側で従来通り効かせる。
 #
-# REV5:
-#   - entry_pipeline_no_order / snapshot_no_order / entry_controller_no_order 時は
-#     SUMMARY_AI pending を安全に掃除し、次回エントリーを詰まらせない。
+# REV6:
+#   - approved候補が entry_pipeline 側の厳密ガードで全滅した場合、
+#     ガードは緩めず、未試行のAI_OK次候補を少数だけ繰り上げて再投入する。
 # ============================================================
 from __future__ import annotations
 
@@ -32,6 +33,7 @@ DEFAULT_MAX_ENTRIES = 3
 DEFAULT_MIN_BUY_APPROVED = 0
 DEFAULT_MAX_PRICE_FOR_100_SHARE_ENTRY = 7000.0
 DEFAULT_MIN_PRICE_FOR_ENTRY = 3000.0
+VERSION = "REV7-ROLLING-RETRY-BYPASS-RUNTIME-LOWMOVE-PREFILTER"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -98,14 +100,8 @@ def _pick_side(item: Dict[str, Any]) -> str:
     ai_row = _as_dict(item.get("ai_row"))
     src = _as_dict(item.get("source_row"))
     return _norm_side(
-        item.get("side")
-        or item.get("ai_side")
-        or ai_row.get("side")
-        or ai_row.get("ai_side")
-        or ai_row.get("entry_decision")
-        or src.get("side")
-        or src.get("ai_side")
-        or src.get("entry_decision"),
+        item.get("side") or item.get("ai_side") or ai_row.get("side") or ai_row.get("ai_side")
+        or ai_row.get("entry_decision") or src.get("side") or src.get("ai_side") or src.get("entry_decision"),
         "BUY",
     )
 
@@ -162,11 +158,7 @@ def _row_score_for_side(item: Dict[str, Any]) -> float:
 
 def _sort_key(item: Dict[str, Any]) -> tuple[float, float, float]:
     side = _pick_side(item)
-    return (
-        safe_float(item.get("confidence")),
-        _score_for_side(item),
-        safe_float(item.get("sell_score")) if side == "SELL" else safe_float(item.get("buy_score")),
-    )
+    return (safe_float(item.get("confidence")), _score_for_side(item), safe_float(item.get("sell_score")) if side == "SELL" else safe_float(item.get("buy_score")))
 
 
 def _price_bounds() -> tuple[float, float, dict[str, Any]]:
@@ -236,9 +228,7 @@ def _daily_risk_block_reason(symbol: str, side: str) -> tuple[bool, str, Dict[st
         if callable(fn):
             blocked, reason, detail = fn(_norm_symbol(symbol), _norm_side(side, "BUY"))
             if blocked:
-                if not isinstance(detail, dict):
-                    detail = {"detail": str(detail)}
-                return True, str(reason or "DAILY_RISK_BLOCK"), dict(detail)
+                return True, str(reason or "DAILY_RISK_BLOCK"), dict(detail) if isinstance(detail, dict) else {"detail": str(detail)}
     except Exception:
         logger.debug("[SUMMARY AI EXECUTOR] daily risk compatibility check failed; fail-open", exc_info=True)
     return False, "", {}
@@ -289,6 +279,7 @@ def _base_filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dic
 
 
 def _filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Compatibility hook for runtime patches. Core rolling pool intentionally bypasses this hook."""
     return _base_filter_blocked_ai_ok_items(ok_items)
 
 
@@ -302,7 +293,9 @@ def _effective_max_entries(max_entries: int) -> int:
 
 
 def _selected_pool(ok_items: List[Dict[str, Any]], *, max_entries: int) -> List[Dict[str, Any]]:
-    kept = _filter_blocked_ai_ok_items(ok_items)
+    # Important: bypass _filter_blocked_ai_ok_items because runtime low-move prefilter may replace it
+    # and collapse AI_OK candidates to one safety-rescued row before rolling retry can work.
+    kept = _base_filter_blocked_ai_ok_items(ok_items)
     if not kept:
         return []
     hard_cap = _effective_max_entries(max_entries)
@@ -314,15 +307,7 @@ def _selected_pool(ok_items: List[Dict[str, Any]], *, max_entries: int) -> List[
 def _select_ai_ok_items(ok_items: List[Dict[str, Any]], *, max_entries: int) -> List[Dict[str, Any]]:
     pool = _selected_pool(ok_items, max_entries=max_entries)
     selected = pool[:_effective_max_entries(max_entries)]
-    logger.warning(
-        "[SUMMARY AI EXECUTOR] top selection requested=%s cap=%s pool=%s ok_total=%s selected=%s version=%s",
-        max_entries,
-        _effective_max_entries(max_entries),
-        len(pool),
-        len(ok_items or []),
-        [{"symbol": _pick_symbol(x), "side": _pick_side(x), "price": _pick_price(x), "conf": round(safe_float(x.get("confidence")), 3), "score": round(_score_for_side(x), 3)} for x in selected],
-        "REV6",
-    )
+    logger.warning("[SUMMARY AI EXECUTOR] top selection requested=%s cap=%s pool=%s ok_total=%s selected=%s version=%s", max_entries, _effective_max_entries(max_entries), len(pool), len(ok_items or []), [{"symbol": _pick_symbol(x), "side": _pick_side(x), "price": _pick_price(x), "conf": round(safe_float(x.get("confidence")), 3), "score": round(_score_for_side(x), 3)} for x in selected], VERSION)
     return selected
 
 
@@ -398,14 +383,12 @@ def _cleanup_pending_after_no_order(result: Any, approved_rows: Sequence[Dict[st
         return 0
     try:
         from trading.entry.pending_manager import prune_entries, snapshot_root
-
         def _predicate(sym: str, entry: Dict[str, Any]) -> bool:
             if _norm_symbol(sym) not in symbols:
                 return False
             source = str(entry.get("source") or "").strip().upper()
             entry_type = str(entry.get("entry_type") or "").strip().upper()
             return entry_type == "SUMMARY_AI" or source in {"SUMMARY", "SUMMARY_AI", "PUSH", "PUSH_SUMMARY"}
-
         removed = int(prune_entries(_predicate, reason=f"SUMMARY_AI_NO_ORDER:{reason}"))
         logger.warning("[SUMMARY AI EXECUTOR] pending cleanup after no-order reason=%s symbols=%s removed=%s root=%s result=%s", reason, sorted(symbols), removed, snapshot_root(), _summarize_no_order_result(result))
         return removed
@@ -459,38 +442,7 @@ def build_approved_row(ai_ok_item: Dict[str, Any]) -> Dict[str, Any]:
     score_total = ai_row.get("score_total", ai_ok_item.get("score_total"))
     final_score = ai_row.get("final_score", ai_ok_item.get("final_score"))
     row = dict(src)
-    row.update({
-        "symbol": ai_ok_item.get("symbol") or ai_row.get("symbol") or src.get("symbol"),
-        "symbolname": ai_ok_item.get("symbolname") or ai_row.get("symbolname") or src.get("symbolname"),
-        "side": side,
-        "ai_side": side,
-        "entry_decision": side,
-        "source": ai_row.get("source", src.get("source", "SUMMARY")),
-        "interval": ai_row.get("interval", src.get("interval", 1)),
-        "price": price,
-        "close_price": price,
-        "close": price,
-        "confidence": ai_ok_item.get("confidence", 0.0),
-        "ai_confidence": ai_ok_item.get("confidence", 0.0),
-        "lot_multiplier": ai_ok_item.get("lot_multiplier", 1.0),
-        "ai_reason": ai_ok_item.get("reason", ""),
-        "reason": ai_ok_item.get("reason", ""),
-        "model_used": ai_ok_item.get("model_used", ""),
-        "score_total": score_total,
-        "total_score": score_total,
-        "score": score_total,
-        "buy_score": buy_score,
-        "sell_score": sell_score,
-        "score_buy": buy_score,
-        "score_sell": sell_score,
-        "final_score": final_score,
-        "display_score": final_score,
-        "turnover": ai_row.get("turnover", src.get("turnover") or src.get("trading_value")),
-        "volume": ai_row.get("volume", src.get("volume")),
-        "datetime": ai_row.get("datetime", src.get("datetime")),
-        "entry_type": ai_row.get("entry_type") or src.get("entry_type") or "SUMMARY_AI",
-        "ai_gate_allow": True,
-    })
+    row.update({"symbol": ai_ok_item.get("symbol") or ai_row.get("symbol") or src.get("symbol"), "symbolname": ai_ok_item.get("symbolname") or ai_row.get("symbolname") or src.get("symbolname"), "side": side, "ai_side": side, "entry_decision": side, "source": ai_row.get("source", src.get("source", "SUMMARY")), "interval": ai_row.get("interval", src.get("interval", 1)), "price": price, "close_price": price, "close": price, "confidence": ai_ok_item.get("confidence", 0.0), "ai_confidence": ai_ok_item.get("confidence", 0.0), "lot_multiplier": ai_ok_item.get("lot_multiplier", 1.0), "ai_reason": ai_ok_item.get("reason", ""), "reason": ai_ok_item.get("reason", ""), "model_used": ai_ok_item.get("model_used", ""), "score_total": score_total, "total_score": score_total, "score": score_total, "buy_score": buy_score, "sell_score": sell_score, "score_buy": buy_score, "score_sell": sell_score, "final_score": final_score, "display_score": final_score, "turnover": ai_row.get("turnover", src.get("turnover") or src.get("trading_value")), "volume": ai_row.get("volume", src.get("volume")), "datetime": ai_row.get("datetime", src.get("datetime")), "entry_type": ai_row.get("entry_type") or src.get("entry_type") or "SUMMARY_AI", "ai_gate_allow": True})
     logger.info("[SUMMARY AI EXECUTOR] approved row built symbol=%s side=%s conf=%.3f total=%.3f close=%s", row.get("symbol"), side, safe_float(row.get("ai_confidence")), safe_float(row.get("score_total")), row.get("close_price"))
     return row
 
@@ -526,20 +478,11 @@ def _approved_batches(ai_results: Sequence[Dict[str, Any]], *, max_entries: int)
         if not batch_items:
             break
         round_no += 1
-        logger.warning("[SUMMARY AI EXECUTOR] rolling batch round=%s/%s cap=%s symbols=%s", round_no, max_rounds, cap, [_pick_symbol(x) for x in batch_items])
+        logger.warning("[SUMMARY AI EXECUTOR] rolling batch round=%s/%s cap=%s symbols=%s version=%s", round_no, max_rounds, cap, [_pick_symbol(x) for x in batch_items], VERSION)
         yield [build_approved_row(x) for x in batch_items]
 
 
-def execute_ai_ok_entries_bulk(
-    ai_results: Sequence[Dict[str, Any]],
-    *,
-    df_summary: pd.DataFrame,
-    interval: int | str = 1,
-    max_entries: int = DEFAULT_MAX_ENTRIES,
-    dry_run: bool = True,
-    require_market_open: bool = True,
-    entry_pipeline: Optional[Callable[..., Any]] = None,
-) -> Dict[str, Any]:
+def execute_ai_ok_entries_bulk(ai_results: Sequence[Dict[str, Any]], *, df_summary: pd.DataFrame, interval: int | str = 1, max_entries: int = DEFAULT_MAX_ENTRIES, dry_run: bool = True, require_market_open: bool = True, entry_pipeline: Optional[Callable[..., Any]] = None) -> Dict[str, Any]:
     if require_market_open and not is_market_open():
         approved_rows = build_ai_ok_approved_rows(ai_results, max_entries=max_entries)
         return {"executed": False, "dry_run": dry_run, "approved_rows": approved_rows, "result": None, "skip_reason": "market_closed"}
@@ -553,33 +496,29 @@ def execute_ai_ok_entries_bulk(
     last_result: Any = None
     last_removed = 0
     last_skip = "no_ai_ok"
-
     try:
         batches = list(_approved_batches(ai_results, max_entries=max_entries)) if _env_bool("SUMMARY_AI_ROLLING_RETRY_ON_FILTERED_NO_ORDER", True) else [build_ai_ok_approved_rows(ai_results, max_entries=max_entries)]
         if not batches or not batches[0]:
             return {"executed": False, "dry_run": dry_run, "approved_rows": [], "result": None, "skip_reason": "no_ai_ok"}
-
         for idx, approved_rows in enumerate(batches, start=1):
             all_approved.extend(approved_rows)
             if dry_run:
                 return {"executed": False, "dry_run": True, "approved_rows": approved_rows, "result": None, "skip_reason": "dry_run"}
-            logger.info("[SUMMARY AI EXECUTOR] REAL bulk entry start approved=%s interval=%s symbols=%s round=%s/%s", len(approved_rows), interval, [str(x.get("symbol")) for x in approved_rows], idx, len(batches))
+            logger.info("[SUMMARY AI EXECUTOR] REAL bulk entry start approved=%s interval=%s symbols=%s round=%s/%s version=%s", len(approved_rows), interval, [str(x.get("symbol")) for x in approved_rows], idx, len(batches), VERSION)
             result = entry_pipeline(approved_rows, df_summary, interval)
             executed = _positive_result(result)
             last_result = result
             if executed:
                 logger.info("[SUMMARY AI EXECUTOR] REAL bulk entry done approved=%s executed=True round=%s result=%s", len(approved_rows), idx, result)
                 return {"executed": True, "dry_run": False, "approved_rows": approved_rows, "all_approved_rows": all_approved, "result": result, "skip_reason": None, "pending_removed": 0, "rolling_retry_round": idx}
-
             last_skip = "entry_pipeline_no_order"
             if _retryable_no_tradable(result) and idx < len(batches):
                 _cleanup_pending_after_no_order(result, approved_rows, reason="entry_pipeline_no_order_retry")
-                logger.warning("[SUMMARY AI EXECUTOR] no tradable rows -> retry next AI_OK batch round=%s/%s symbols=%s detail=%s", idx, len(batches), [str(x.get("symbol")) for x in approved_rows], _summarize_no_order_result(result))
+                logger.warning("[SUMMARY AI EXECUTOR] no tradable rows -> retry next AI_OK batch round=%s/%s symbols=%s detail=%s version=%s", idx, len(batches), [str(x.get("symbol")) for x in approved_rows], _summarize_no_order_result(result), VERSION)
                 continue
             last_removed = _cleanup_pending_after_no_order(result, approved_rows, reason=last_skip)
             logger.warning("[SUMMARY AI EXECUTOR] NO REAL ORDER DETAIL approved=%s interval=%s symbols=%s skip=%s pending_removed=%s detail=%s", len(approved_rows), interval, [str(x.get("symbol")) for x in approved_rows], last_skip, last_removed, _summarize_no_order_result(result))
             break
-
         logger.info("[SUMMARY AI EXECUTOR] REAL bulk entry done approved=%s executed=False pending_removed=%s result=%s", len(all_approved), last_removed, last_result)
         return {"executed": False, "dry_run": False, "approved_rows": all_approved, "result": last_result, "skip_reason": last_skip, "pending_removed": last_removed, "rolling_retry_attempted": len(batches)}
     except Exception:
@@ -588,24 +527,4 @@ def execute_ai_ok_entries_bulk(
         return {"executed": False, "dry_run": False, "approved_rows": all_approved, "result": last_result, "skip_reason": "entry_exception"}
 
 
-__all__ = [
-    "DEFAULT_MAX_ENTRIES",
-    "DEFAULT_MIN_BUY_APPROVED",
-    "DEFAULT_MAX_PRICE_FOR_100_SHARE_ENTRY",
-    "DEFAULT_MIN_PRICE_FOR_ENTRY",
-    "build_approved_row",
-    "build_ai_ok_approved_rows",
-    "execute_ai_ok_entries_bulk",
-    "_select_ai_ok_items",
-    "_filter_blocked_ai_ok_items",
-    "_effective_max_entries",
-    "_pick_symbol",
-    "_pick_side",
-    "_row_side",
-    "_row_score_for_side",
-    "_score_for_side",
-    "_sort_key",
-    "_price_bounds",
-    "_entry_price_bounds",
-    "_positive_result",
-]
+__all__ = ["DEFAULT_MAX_ENTRIES", "DEFAULT_MIN_BUY_APPROVED", "DEFAULT_MAX_PRICE_FOR_100_SHARE_ENTRY", "DEFAULT_MIN_PRICE_FOR_ENTRY", "build_approved_row", "build_ai_ok_approved_rows", "execute_ai_ok_entries_bulk", "_select_ai_ok_items", "_filter_blocked_ai_ok_items", "_effective_max_entries", "_pick_symbol", "_pick_side", "_row_side", "_row_score_for_side", "_score_for_side", "_sort_key", "_price_bounds", "_entry_price_bounds", "_positive_result"]
