@@ -1,17 +1,16 @@
 # ============================================================
 # File   : core/startup/final_entry_board_guard_signature_runtime_patch.py
-# Version: V2-SUMMARY-AI-BOARD-DELEGATE
+# Version: V3-SUMMARY-AI-BOARD-DELEGATE-STABLE-WATCHER
 # ------------------------------------------------------------
 # 目的:
-#   final_entry_safety_guard_patch._board_guard が別runtime patchにより
-#   3引数版へ差し替わった後でも、4引数呼び出しで TypeError にならないようにする。
+#   final_entry_safety_guard_patch._board_guard / _call_board_guard が
+#   他runtime patchにより差し替わっても、4引数呼び出しで TypeError にしない。
 #
-# V2:
-#   - SUMMARY_AI候補だけ、final guard の板未取得で即 no_order にしない。
-#   - 時間/流動性/逆行ガード通過後は、板リトライとfallback可否を
-#     entry_order_builder 側へ委譲する。
-#   - stale判定は緩和しない。
-#   - snapshot_no_order / entry_controller_no_order の発注直前停止を救済。
+# V3:
+#   - SUMMARY_AI候補は板未取得で即 no_order にせず order_builder 側へ委譲。
+#   - 同じ関数を1秒ごとに何度もwrapし直さない。
+#   - watcherは差し替え検知時だけ再wrapし、安定後は早期終了。
+#   - side/symbolの抽出を強化。
 # ============================================================
 from __future__ import annotations
 
@@ -23,9 +22,11 @@ from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V2-SUMMARY-AI-BOARD-DELEGATE"
+VERSION = "V3-SUMMARY-AI-BOARD-DELEGATE-STABLE-WATCHER"
 _INSTALLED = False
 _WATCHER_STARTED = False
+_LAST_BOARD_GUARD_ID: int | None = None
+_LAST_CALL_GUARD_ID: int | None = None
 _TRUE_VALUES = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 _FALSE_VALUES = {"0", "false", "no", "n", "off", "ng", "disable", "disabled", ""}
 
@@ -85,6 +86,51 @@ def _norm(v: Any) -> str:
         return str(v or "").strip().upper()
     except Exception:
         return ""
+
+
+def _norm_side(v: Any) -> str:
+    s = _norm(v)
+    if s in {"BUY", "LONG", "2", "買", "買い"}:
+        return "BUY"
+    if s in {"SELL", "SHORT", "1", "売", "売り"}:
+        return "SELL"
+    return s
+
+
+def _extract_item_dict(item: Any) -> dict:
+    return item if isinstance(item, dict) else {}
+
+
+def _extract_side(row: dict, item: dict, side: Any = None) -> str:
+    entry = item.get("entry") if isinstance(item.get("entry"), dict) else {}
+    ai = item.get("ai") if isinstance(item.get("ai"), dict) else {}
+    for v in (
+        side,
+        item.get("side"),
+        row.get("side"),
+        row.get("entry_decision"),
+        row.get("ai_side"),
+        entry.get("side"),
+        entry.get("entry_decision"),
+        ai.get("side"),
+        ai.get("entry_decision"),
+    ):
+        s = _norm_side(v)
+        if s in {"BUY", "SELL"}:
+            return s
+    return _norm_side(side)
+
+
+def _extract_symbol(row: dict, item: dict, symbol: Any = None) -> str:
+    entry = item.get("entry") if isinstance(item.get("entry"), dict) else {}
+    ai = item.get("ai") if isinstance(item.get("ai"), dict) else {}
+    for v in (symbol, item.get("symbol"), row.get("symbol"), row.get("Symbol"), row.get("code"), entry.get("symbol"), ai.get("symbol")):
+        s = str(v or "").strip()
+        if s:
+            if s.endswith(".0") and s[:-2].isdigit():
+                s = s[:-2]
+            return s
+    return ""
 
 
 def _is_summary_ai_item(row: dict, item: dict) -> bool:
@@ -161,50 +207,36 @@ def _summary_ai_delegate_ok(row: dict, item: dict, symbol: str, side: str, reaso
 
 
 def _call_flexible(fn: Callable[..., Any], row: dict, item: dict, symbol: str, side: str) -> bool:
-    """Call board guard with the signature it actually supports."""
     try:
         return bool(fn(row, item, symbol, side))
     except TypeError as e4:
-        msg = str(e4)
         try:
-            logger.warning(
-                "[FINAL BOARD GUARD SIGNATURE] fallback 4args->3args symbol=%s side=%s err=%s version=%s",
-                symbol,
-                side,
-                msg,
-                VERSION,
-            )
             return bool(fn(row, symbol, side))
-        except TypeError as e3:
+        except TypeError:
             try:
-                logger.warning(
-                    "[FINAL BOARD GUARD SIGNATURE] fallback 3args->kwargs symbol=%s side=%s err3=%s version=%s",
-                    symbol,
-                    side,
-                    e3,
-                    VERSION,
-                )
                 return bool(fn(row=row, item=item, symbol=symbol, side=side))
             except Exception:
                 raise e4
-    except Exception:
-        raise
 
 
 def _wrap_board_guard(target: Any) -> bool:
+    global _LAST_BOARD_GUARD_ID
     cur = getattr(target, "_board_guard", None)
     if not callable(cur):
         return False
-    if getattr(cur, "_final_board_guard_signature_compat_v2", False):
+    if getattr(cur, "_final_board_guard_signature_compat_v3", False):
+        _LAST_BOARD_GUARD_ID = id(cur)
+        return True
+    if _LAST_BOARD_GUARD_ID == id(cur):
         return True
 
     original = cur
 
     def _compat_board_guard(row: dict, item: dict | None = None, symbol: str | None = None, side: str | None = None, *args, **kwargs) -> bool:
         row_d = _row_to_dict(row)
-        item_d = item if isinstance(item, dict) else {}
-        sym = str(symbol or _first(row_d, ("symbol", "Symbol", "code", "銘柄コード"), ""))
-        sd = str(side or _first(row_d, ("side", "entry_decision", "ai_side"), "")).upper()
+        item_d = _extract_item_dict(item)
+        sym = _extract_symbol(row_d, item_d, symbol)
+        sd = _extract_side(row_d, item_d, side)
         try:
             ok = _call_flexible(original, row_d, item_d, sym, sd)
             if ok:
@@ -213,13 +245,7 @@ def _wrap_board_guard(target: Any) -> bool:
                 return True
             return False
         except Exception as e:
-            logger.warning(
-                "[FINAL BOARD GUARD SIGNATURE] BOARD_GUARD_ERROR_COMPAT symbol=%s side=%s error=%s version=%s",
-                sym,
-                sd,
-                e,
-                VERSION,
-            )
+            logger.warning("[FINAL BOARD GUARD SIGNATURE] BOARD_GUARD_ERROR_COMPAT symbol=%s side=%s error=%s version=%s", sym, sd, e, VERSION)
             if _summary_ai_delegate_ok(row_d, item_d, sym, sd, "board_guard_exception"):
                 return True
             try:
@@ -232,48 +258,40 @@ def _wrap_board_guard(target: Any) -> bool:
 
     _compat_board_guard._final_board_guard_signature_compat_v1 = True  # type: ignore[attr-defined]
     _compat_board_guard._final_board_guard_signature_compat_v2 = True  # type: ignore[attr-defined]
+    _compat_board_guard._final_board_guard_signature_compat_v3 = True  # type: ignore[attr-defined]
     _compat_board_guard._original = original  # type: ignore[attr-defined]
     target._board_guard = _compat_board_guard
-    logger.warning(
-        "[FINAL BOARD GUARD SIGNATURE] wrapped _board_guard original=%s version=%s summary_ai_delegate=%s",
-        getattr(original, "__name__", type(original).__name__),
-        VERSION,
-        _env_bool("ENTRY_SUMMARY_AI_DELEGATE_BOARD_TO_ORDER_BUILDER", True),
-    )
+    _LAST_BOARD_GUARD_ID = id(_compat_board_guard)
+    logger.warning("[FINAL BOARD GUARD SIGNATURE] wrapped _board_guard original=%s version=%s summary_ai_delegate=%s", getattr(original, "__name__", type(original).__name__), VERSION, _env_bool("ENTRY_SUMMARY_AI_DELEGATE_BOARD_TO_ORDER_BUILDER", True))
     return True
 
 
 def _wrap_call_board_guard(target: Any) -> bool:
+    global _LAST_CALL_GUARD_ID
     cur = getattr(target, "_call_board_guard", None)
     if not callable(cur):
         return False
-    if getattr(cur, "_final_board_guard_signature_call_v2", False):
+    if getattr(cur, "_final_board_guard_signature_call_v3", False):
+        _LAST_CALL_GUARD_ID = id(cur)
+        return True
+    if _LAST_CALL_GUARD_ID == id(cur):
         return True
 
     def _compat_call_board_guard(row: dict, item: dict, symbol: str, side: str) -> bool:
         row_d = _row_to_dict(row)
-        item_d = item if isinstance(item, dict) else {}
-        sym = str(symbol or _first(row_d, ("symbol", "Symbol", "code", "銘柄コード"), ""))
-        sd = str(side or _first(row_d, ("side", "entry_decision", "ai_side"), "")).upper()
+        item_d = _extract_item_dict(item)
+        sym = _extract_symbol(row_d, item_d, symbol)
+        sd = _extract_side(row_d, item_d, side)
         try:
             bg = getattr(target, "_board_guard", None)
-            if callable(bg):
-                ok = _call_flexible(bg, row_d, item_d, sym, sd)
-            else:
-                ok = bool(cur(row_d, item_d, sym, sd))
+            ok = _call_flexible(bg, row_d, item_d, sym, sd) if callable(bg) else bool(cur(row_d, item_d, sym, sd))
             if ok:
                 return True
             if _summary_ai_delegate_ok(row_d, item_d, sym, sd, "call_board_guard_false"):
                 return True
             return False
         except Exception as e:
-            logger.warning(
-                "[FINAL BOARD GUARD SIGNATURE] BOARD_GUARD_ERROR_COMPAT symbol=%s side=%s error=%s version=%s",
-                sym,
-                sd,
-                e,
-                VERSION,
-            )
+            logger.warning("[FINAL BOARD GUARD SIGNATURE] BOARD_GUARD_ERROR_COMPAT symbol=%s side=%s error=%s version=%s", sym, sd, e, VERSION)
             if _summary_ai_delegate_ok(row_d, item_d, sym, sd, "call_board_guard_exception"):
                 return True
             try:
@@ -286,8 +304,10 @@ def _wrap_call_board_guard(target: Any) -> bool:
 
     _compat_call_board_guard._final_board_guard_signature_call_v1 = True  # type: ignore[attr-defined]
     _compat_call_board_guard._final_board_guard_signature_call_v2 = True  # type: ignore[attr-defined]
+    _compat_call_board_guard._final_board_guard_signature_call_v3 = True  # type: ignore[attr-defined]
     _compat_call_board_guard._original = cur  # type: ignore[attr-defined]
     target._call_board_guard = _compat_call_board_guard
+    _LAST_CALL_GUARD_ID = id(_compat_call_board_guard)
     logger.warning("[FINAL BOARD GUARD SIGNATURE] wrapped _call_board_guard version=%s summary_ai_delegate=%s", VERSION, _env_bool("ENTRY_SUMMARY_AI_DELEGATE_BOARD_TO_ORDER_BUILDER", True))
     return True
 
@@ -305,11 +325,20 @@ def _patch_once() -> bool:
 
 
 def _watch() -> None:
-    for i in range(60):
+    stable = 0
+    last_pair: tuple[int | None, int | None] | None = None
+    for i in range(20):
         ok = _patch_once()
-        if i in (0, 10, 30, 59):
-            logger.warning("[FINAL BOARD GUARD SIGNATURE] enforce i=%s/60 ok=%s version=%s", i, ok, VERSION)
+        pair = (_LAST_BOARD_GUARD_ID, _LAST_CALL_GUARD_ID)
+        stable = stable + 1 if ok and pair == last_pair else 0
+        last_pair = pair
+        if i in (0, 5, 10, 19):
+            logger.warning("[FINAL BOARD GUARD SIGNATURE] enforce i=%s/20 ok=%s stable=%s version=%s", i, ok, stable, VERSION)
+        if stable >= 3:
+            logger.warning("[FINAL BOARD GUARD SIGNATURE] watcher stable exit i=%s version=%s", i, VERSION)
+            return
         time.sleep(1.0)
+    logger.warning("[FINAL BOARD GUARD SIGNATURE] watcher done version=%s", VERSION)
 
 
 def install() -> bool:
