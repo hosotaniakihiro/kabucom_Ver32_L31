@@ -1,22 +1,24 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/final_board_guard_signature_compat_patch.py
-# Version: V3-MARK-NATIVE-GUARD-AND-SUMMARY-AI-REFILL
+# Version: V4-SUMMARY-AI-CURRENT-DF-FRESHNESS
 # ------------------------------------------------------------
 # Purpose:
 #   final_entry_safety_guard_patch Ver12 以降は _board_guard 自体が
 #   4引数対応済みのため、ここで再wrapしない。
 #
-# V3:
+# V4:
 #   - 古い V1 watcher が _board_guard を1秒ごとに再wrapする問題を停止。
 #   - summary_ai_entry_hook_dataframe_truth_patch 側の旧compat watcherが
 #     再wrapしないよう、現在の native guard に signature marker を付与。
-#   - 既に旧compat wrapper が挟まっている場合は _original / compat_original を剥がして戻す。
 #   - SUMMARY_AIの上位3件が blowoff で全落ちするケースに備え、候補選択プールだけ広げる。
 #   - 実発注直前の df_exec は最大3件にcapし、同時発注数は増やしすぎない。
+#   - SUMMARY_AI安全鮮度チェックが、現在AIへ渡された最新DFではなく古い
+#     global_data.push_df / raw fallback を見て stale_push_1m になる問題を修正。
 # ============================================================
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import os
 import threading
@@ -25,12 +27,14 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V3-MARK-NATIVE-GUARD-AND-SUMMARY-AI-REFILL"
+VERSION = "V4-SUMMARY-AI-CURRENT-DF-FRESHNESS"
 _WATCHER_STARTED = False
 _INSTALLED = False
 _LAST_TARGET_ID: int | None = None
 _SELECTION_PATCHED = False
 _EXEC_CAP_PATCHED = False
+_CURRENT_DF_PATCHED = False
+_CURRENT_AI_INPUT = threading.local()
 
 
 def _env_int(name: str, default: int) -> int:
@@ -41,6 +45,16 @@ def _env_int(name: str, default: int) -> int:
         return int(float(str(v).replace(",", "")))
     except Exception:
         return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
 
 
 def _is_legacy_wrapper(fn: Any) -> bool:
@@ -114,6 +128,106 @@ def _apply(reason: str = "install") -> bool:
         return True
     except Exception:
         logger.exception("[FINAL BOARD GUARD SIG COMPAT] apply failed reason=%s version=%s", reason, VERSION)
+        return False
+
+
+def _latest_age_sec(df: Any) -> tuple[bool, float | None, Any, int, int]:
+    try:
+        import pandas as pd
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return False, None, None, 0, 0
+        dt_col = None
+        for c in ("datetime", "end_time", "last_update", "updated_at", "inserted_at"):
+            if c in df.columns:
+                dt_col = c
+                break
+        if not dt_col:
+            return False, None, None, len(df), 0
+        latest = pd.to_datetime(df[dt_col], errors="coerce").max()
+        if pd.isna(latest):
+            return False, None, None, len(df), 0
+        try:
+            latest_py = latest.to_pydatetime().replace(tzinfo=None)
+        except Exception:
+            latest_py = latest
+        age = (dt.datetime.now().replace(tzinfo=None) - latest_py).total_seconds()
+        score_nonzero = 0
+        for c in ("score", "score_total", "final_score", "display_score", "score_buy", "score_sell", "buy_score", "sell_score"):
+            if c in df.columns:
+                try:
+                    score_nonzero = max(score_nonzero, int((pd.to_numeric(df[c], errors="coerce").fillna(0).abs() > 0).sum()))
+                except Exception:
+                    pass
+        return True, float(age), latest_py, len(df), score_nonzero
+    except Exception:
+        return False, None, None, 0, 0
+
+
+def _install_current_df_freshness_patch() -> bool:
+    """Let SUMMARY_AI safety guard trust the current scored df passed into the runner."""
+    global _CURRENT_DF_PATCHED
+    if _CURRENT_DF_PATCHED:
+        return True
+    try:
+        import trading.entry.summary_ai.runner as runner
+        import core.startup.summary_ai_candidate_refill_patch as guard
+
+        cur_run = getattr(runner, "run_summary_ai_entry_from_df", None)
+        cur_reason = getattr(guard, "_summary_ai_entry_unsafe_reason", None)
+        if not callable(cur_run) or not callable(cur_reason):
+            return False
+        if getattr(cur_run, "_summary_ai_current_df_freshness_v1", False) and getattr(cur_reason, "_summary_ai_current_df_freshness_v1", False):
+            _CURRENT_DF_PATCHED = True
+            return True
+
+        orig_run = cur_run
+        orig_reason = cur_reason
+
+        def _extract_df(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+            if args:
+                return args[0]
+            for key in ("summary_df", "df", "source_df", "base_df"):
+                if key in kwargs:
+                    return kwargs.get(key)
+            return None
+
+        def _patched_unsafe_reason():
+            df = getattr(_CURRENT_AI_INPUT, "df", None)
+            ok, age, latest, rows, score_nonzero = _latest_age_sec(df)
+            max_age = _env_float("SUMMARY_AI_MAX_PUSH_1M_AGE_SEC", 120.0)
+            # 現在AIへ渡されたDFが新鮮で、かつスコア付きなら、このDFを優先する。
+            if ok and age is not None and age <= max_age and rows > 0 and score_nonzero > 0:
+                logger.warning(
+                    "[SUMMARY AI SAFETY GUARD] current AI df freshness OK rows=%s latest=%s age=%.1f max=%.1f score_nonzero=%s version=%s",
+                    rows,
+                    latest,
+                    age,
+                    max_age,
+                    score_nonzero,
+                    VERSION,
+                )
+                return None
+            return orig_reason()
+
+        def _patched_run_summary_ai_entry_from_df(*args: Any, **kwargs: Any):
+            old = getattr(_CURRENT_AI_INPUT, "df", None)
+            _CURRENT_AI_INPUT.df = _extract_df(args, kwargs)
+            try:
+                return orig_run(*args, **kwargs)
+            finally:
+                _CURRENT_AI_INPUT.df = old
+
+        _patched_unsafe_reason._summary_ai_current_df_freshness_v1 = True  # type: ignore[attr-defined]
+        _patched_unsafe_reason._original = orig_reason  # type: ignore[attr-defined]
+        _patched_run_summary_ai_entry_from_df._summary_ai_current_df_freshness_v1 = True  # type: ignore[attr-defined]
+        _patched_run_summary_ai_entry_from_df._original = orig_run  # type: ignore[attr-defined]
+        guard._summary_ai_entry_unsafe_reason = _patched_unsafe_reason
+        runner.run_summary_ai_entry_from_df = _patched_run_summary_ai_entry_from_df
+        _CURRENT_DF_PATCHED = True
+        logger.warning("[SUMMARY AI SAFETY GUARD] current df freshness patch installed version=%s", VERSION)
+        return True
+    except Exception:
+        logger.debug("[SUMMARY AI SAFETY GUARD] current df freshness patch not ready", exc_info=True)
         return False
 
 
@@ -214,9 +328,10 @@ def _install_entry_pipeline_exec_cap_patch() -> bool:
 
 
 def _install_candidate_refill_patches() -> bool:
+    ok0 = _install_current_df_freshness_patch()
     ok1 = _install_summary_ai_selection_pool_patch()
     ok2 = _install_entry_pipeline_exec_cap_patch()
-    return bool(ok1 or ok2)
+    return bool(ok0 or ok1 or ok2)
 
 
 def _watcher() -> None:
@@ -228,12 +343,12 @@ def _watcher() -> None:
             ok = _apply(reason=f"watcher:{i + 1}")
             _install_candidate_refill_patches()
             cur_id = _LAST_TARGET_ID
-            stable = stable + 1 if ok and cur_id == last_id and _SELECTION_PATCHED and _EXEC_CAP_PATCHED else 0
+            stable = stable + 1 if ok and cur_id == last_id and _SELECTION_PATCHED and _EXEC_CAP_PATCHED and _CURRENT_DF_PATCHED else 0
             last_id = cur_id
             if stable >= 3:
                 logger.warning("[FINAL BOARD GUARD SIG COMPAT] watcher stable exit i=%s version=%s", i + 1, VERSION)
                 return
-        logger.warning("[FINAL BOARD GUARD SIG COMPAT] watcher done version=%s selection_patch=%s exec_cap=%s", VERSION, _SELECTION_PATCHED, _EXEC_CAP_PATCHED)
+        logger.warning("[FINAL BOARD GUARD SIG COMPAT] watcher done version=%s selection_patch=%s exec_cap=%s current_df=%s", VERSION, _SELECTION_PATCHED, _EXEC_CAP_PATCHED, _CURRENT_DF_PATCHED)
     except Exception:
         logger.exception("[FINAL BOARD GUARD SIG COMPAT] watcher failed version=%s", VERSION)
 
@@ -253,7 +368,7 @@ def install() -> bool:
     _install_candidate_refill_patches()
     _start_watcher()
     _INSTALLED = bool(ok)
-    logger.warning("[FINAL BOARD GUARD SIG COMPAT] installed=%s version=%s selection_patch=%s exec_cap=%s", _INSTALLED, VERSION, _SELECTION_PATCHED, _EXEC_CAP_PATCHED)
+    logger.warning("[FINAL BOARD GUARD SIG COMPAT] installed=%s version=%s selection_patch=%s exec_cap=%s current_df=%s", _INSTALLED, VERSION, _SELECTION_PATCHED, _EXEC_CAP_PATCHED, _CURRENT_DF_PATCHED)
     return _INSTALLED
 
 
