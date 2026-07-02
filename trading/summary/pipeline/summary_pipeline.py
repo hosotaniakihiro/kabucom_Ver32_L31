@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/summary/pipeline/summary_pipeline.py
-# Version: Ver32_L07-SPLIT-PUSH-SUMMARY-PIPELINE-EMPTY-PUSH-REUSE-SUMMARY
+# Version: Ver32_L08-SIGNAL-OUTPUT-TODAY-GUARD
 # ------------------------------------------------------------
 # Purpose:
 #   PUSH/Yahoo由来 stock_summary 用 pipeline 入口。
@@ -13,6 +13,8 @@
 #   - main.py で summary/push が両方空の場合は legacy candidate を呼ばず空DFを返す
 #     （NAS SQLite/cache fallback 経由の Windows 0xC0000006 を避ける）
 #   - push_df が空で summary_df がある場合は、空DFで既存PUSHサマリーを上書きしない
+#   - 前日 summary は MA/ATR/RSI 等の履歴計算には使うが、entry/AI/表示用の
+#     signal output には当日行だけを渡す
 # ============================================================
 
 from __future__ import annotations
@@ -99,6 +101,110 @@ def _reuse_summary_when_push_empty() -> bool:
     return _env_bool("AUTOSTOCK_REUSE_SUMMARY_ON_EMPTY_PUSH", True)
 
 
+def _signal_output_today_only() -> bool:
+    """
+    entry / AI / Discord表示に使う signal output だけを当日行へ制限する。
+
+    前日 summary は MA/ATR/RSI などの履歴計算に必要なので、indicator enrich 前には
+    落とさない。計算後、evaluate_signals=True の出口だけで当日行へ絞る。
+    """
+    return _env_bool("AUTOSTOCK_SIGNAL_OUTPUT_TODAY_ONLY", True)
+
+
+def _resolve_trade_date():
+    """当日判定に使う trade_date。通常はローカル日付。テスト時のみ env で固定可。"""
+    raw = os.environ.get("AUTOSTOCK_TRADE_DATE") or os.environ.get("TRADE_DATE")
+    if raw:
+        try:
+            return pd.Timestamp(str(raw).strip()).date()
+        except Exception:
+            pass
+    try:
+        return pd.Timestamp.now().date()
+    except Exception:
+        return None
+
+
+def _primary_datetime_col(df: pd.DataFrame) -> str | None:
+    for c in ("datetime", "dt", "timestamp", "end_time", "snapshot_time", "received_at"):
+        if c in df.columns:
+            return c
+    return None
+
+
+def _filter_today_for_signal_output(
+    df: pd.DataFrame,
+    *,
+    interval: int,
+    evaluate_signals: bool,
+) -> pd.DataFrame:
+    """履歴計算後、entry/AI/表示用の出力から前日行を除外する。"""
+    out = ensure_dataframe(df, "signal_output_today_filter")
+    if out.empty:
+        return out
+    if not evaluate_signals or not _signal_output_today_only():
+        return out
+
+    trade_date = _resolve_trade_date()
+    if trade_date is None:
+        return out
+
+    out = coerce_datetime_columns(out)
+    dt_col = _primary_datetime_col(out)
+    if not dt_col:
+        logger.warning(
+            "[summary_pipeline] signal today guard skipped no datetime column interval=%s rows=%s cols=%s",
+            interval,
+            len(out),
+            list(out.columns)[:20],
+        )
+        return out
+
+    try:
+        dt = pd.to_datetime(out[dt_col], errors="coerce")
+        mask = dt.dt.date == trade_date
+    except Exception as e:
+        logger.warning(
+            "[summary_pipeline] signal today guard failed interval=%s err=%s: %s",
+            interval,
+            type(e).__name__,
+            str(e)[:200],
+            exc_info=False,
+        )
+        return out
+
+    before = len(out)
+    before_symbols = safe_symbols(out)
+    before_latest = safe_latest_dt(out)
+    kept = out.loc[mask].copy()
+
+    if before != len(kept):
+        logger.warning(
+            "[summary_pipeline] signal today guard interval=%s trade_date=%s before=%s after=%s "
+            "symbols_before=%s symbols_after=%s latest_before=%s latest_after=%s evaluate_signals=%s",
+            interval,
+            trade_date,
+            before,
+            len(kept),
+            before_symbols,
+            safe_symbols(kept),
+            before_latest,
+            safe_latest_dt(kept),
+            evaluate_signals,
+        )
+
+    if kept.empty:
+        logger.warning(
+            "[summary_pipeline] signal today guard empty interval=%s trade_date=%s latest_before=%s. "
+            "Previous-day summary remains usable only as indicator history, not as entry/AI/display output.",
+            interval,
+            trade_date,
+            before_latest,
+        )
+
+    return kept.reset_index(drop=True)
+
+
 def _guard_get_depth() -> int:
     try:
         return int(getattr(_PIPELINE_GUARD, "depth", 0))
@@ -123,6 +229,7 @@ def _postprocess_output(
     *,
     interval: int,
     latest_only: bool,
+    evaluate_signals: bool = True,
 ) -> pd.DataFrame:
     out = ensure_dataframe(df, "postprocess")
     if out.empty:
@@ -131,12 +238,13 @@ def _postprocess_output(
     out = coerce_datetime_columns(out)
 
     logger.info(
-        "[summary_pipeline] postprocess pre latest_only=%s interval=%s rows=%s symbols=%s latest_dt=%s",
+        "[summary_pipeline] postprocess pre latest_only=%s interval=%s rows=%s symbols=%s latest_dt=%s evaluate_signals=%s",
         latest_only,
         interval,
         len(out),
         safe_symbols(out),
         safe_latest_dt(out),
+        evaluate_signals,
     )
 
     out = apply_pipeline_common_trade_universe_filter(
@@ -173,6 +281,18 @@ def _postprocess_output(
             "[summary_pipeline] postprocess empty after indicator price filter interval=%s",
             interval,
         )
+        return out
+
+    # 重要:
+    #   ここまでは前日 summary を含めてよい。MA/ATR/RSI 等の履歴計算に必要。
+    #   ただし entry / AI / Discord表示に渡す signal output は当日行のみ。
+    out = _filter_today_for_signal_output(
+        out,
+        interval=interval,
+        evaluate_signals=evaluate_signals,
+    )
+
+    if out.empty:
         return out
 
     log_indicator_profile(f"POST-BEFORE-LATEST-{interval}m", out)
@@ -214,18 +334,25 @@ def _reuse_existing_summary_output(
     *,
     interval: int,
     latest_only: bool,
+    evaluate_signals: bool,
     reason: str,
 ) -> pd.DataFrame:
     logger.warning(
-        "[summary_pipeline] reuse existing summary interval=%s reason=%s rows=%s symbols=%s latest_dt=%s latest_only=%s",
+        "[summary_pipeline] reuse existing summary interval=%s reason=%s rows=%s symbols=%s latest_dt=%s latest_only=%s evaluate_signals=%s",
         interval,
         reason,
         len(summary_df),
         safe_symbols(summary_df),
         safe_latest_dt(summary_df),
         latest_only,
+        evaluate_signals,
     )
-    return _postprocess_output(summary_df, interval=interval, latest_only=latest_only)
+    return _postprocess_output(
+        summary_df,
+        interval=interval,
+        latest_only=latest_only,
+        evaluate_signals=evaluate_signals,
+    )
 
 
 def run_summary_pipeline(
@@ -285,6 +412,7 @@ def run_summary_pipeline(
                 summary_df2,
                 interval=interval_n,
                 latest_only=latest_only,
+                evaluate_signals=evaluate_signals,
                 reason="push_df_empty",
             )
 
@@ -318,6 +446,7 @@ def run_summary_pipeline(
                             summary_df2,
                             interval=interval_n,
                             latest_only=latest_only,
+                            evaluate_signals=evaluate_signals,
                             reason=f"candidate_empty:{getattr(fn, '__name__', '?')}",
                         )
 
@@ -325,6 +454,7 @@ def run_summary_pipeline(
                         out,
                         interval=interval_n,
                         latest_only=latest_only,
+                        evaluate_signals=evaluate_signals,
                     )
 
                     logger.info(
@@ -339,11 +469,12 @@ def run_summary_pipeline(
 
                     if len(post) == 0 and len(out) > 0:
                         logger.warning(
-                            "[summary_pipeline] output became empty after postprocess fn=%s interval=%s raw_rows=%s latest_only=%s",
+                            "[summary_pipeline] output became empty after postprocess fn=%s interval=%s raw_rows=%s latest_only=%s evaluate_signals=%s",
                             getattr(fn, "__name__", "?"),
                             interval_n,
                             len(out),
                             latest_only,
+                            evaluate_signals,
                         )
 
                     return post
@@ -379,6 +510,7 @@ def run_summary_pipeline(
                 summary_df2,
                 interval=interval_n,
                 latest_only=latest_only,
+                evaluate_signals=evaluate_signals,
                 reason="no_candidate_succeeded",
             )
 
