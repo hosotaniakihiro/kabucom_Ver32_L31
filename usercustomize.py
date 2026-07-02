@@ -75,6 +75,23 @@ def _is_main_py() -> bool:
         return False
 
 
+def _patch_entry_order_builder_logger() -> bool:
+    """Prevent NameError('logger') inside entry_order_builder during order build."""
+    try:
+        from trading.handlers import entry_order_builder as eob
+
+        cur = getattr(eob, "logger", None)
+        if cur is None or not hasattr(cur, "warning") or not hasattr(cur, "info"):
+            eob.logger = logging.getLogger("trading.handlers.entry_order_builder")
+            logger.warning("[USERCUSTOMIZE] entry_order_builder.logger patched version=V1-LOGGER-HOTFIX")
+            return True
+        logger.warning("[USERCUSTOMIZE] entry_order_builder.logger already ok version=V1-LOGGER-HOTFIX")
+        return True
+    except Exception:
+        logger.exception("[USERCUSTOMIZE] entry_order_builder.logger patch failed version=V1-LOGGER-HOTFIX")
+        return False
+
+
 def _install_runtime_defaults() -> bool:
     """Install centralized default env values without overriding user-provided env."""
     try:
@@ -113,6 +130,7 @@ def _install_summary_mtf_duplicate_datetime_guard() -> bool:
 
 
 _install_runtime_defaults()
+_patch_entry_order_builder_logger()
 _install_summary_pending_age_relax()
 _install_summary_mtf_duplicate_datetime_guard()
 
@@ -387,12 +405,14 @@ def _uc_delayed_watchlist_patch_loop() -> None:
     for _ in range(10):
         try:
             _uc_patch_watchlist_recent_liq_rotation_failopen()
+            _patch_entry_order_builder_logger()
         except Exception:
             logger.exception("[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] delayed retry failed")
         time.sleep(1.0)
 
 
 if _is_main_py():
+    _patch_entry_order_builder_logger()
     _uc_patch_tonosama_recent_volume_display()
     _uc_patch_watchlist_recent_liq_rotation_failopen()
     threading.Thread(
