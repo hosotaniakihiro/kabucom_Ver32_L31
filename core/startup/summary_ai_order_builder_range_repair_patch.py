@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_ai_order_builder_range_repair_patch.py
-# Version: V4-SUMMARY-AI-ENTRY-CONTROLLER-AND-ORDER-BUILDER-ATR-REPAIR
+# Version: V5-SUMMARY-AI-ATR-REPAIR-MULTI-SOURCE-HISTORY
 # ------------------------------------------------------------
 # SUMMARY_AI の直接スナップショット経路で row が
 # high == low == close / atr == 0 のまま entry_controller と
@@ -12,6 +12,10 @@
 #   - 閾値は緩和しない。
 #   - fail-open しない。
 #   - day_high/day_low または global_context の履歴でレンジが確認できる時だけ補完する。
+#
+# V5:
+#   - global_context の push だけでなく summary / legacy / ranking / push-cache も検索。
+#   - 1分履歴が複数本ある場合は ATR(14) を計算して atr_1m を補完。
 # ============================================================
 from __future__ import annotations
 
@@ -20,9 +24,11 @@ import math
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V4-SUMMARY-AI-ENTRY-CONTROLLER-AND-ORDER-BUILDER-ATR-REPAIR"
+VERSION = "V5-SUMMARY-AI-ATR-REPAIR-MULTI-SOURCE-HISTORY"
 _INSTALLED = False
 _ORIGINAL_LOW_MOVE = None
+
+_HISTORY_SOURCES = ("push", "summary", "legacy", "ranking", "push-cache")
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -97,15 +103,25 @@ def _best_from_row(row: dict[str, Any]) -> tuple[float, float, float, float, str
     return best
 
 
+def _normalize_symbol(s: Any) -> str:
+    try:
+        x = str(s or "").strip()
+        if x.endswith(".0") and x[:-2].isdigit():
+            return x[:-2]
+        return x
+    except Exception:
+        return ""
+
+
 def _latest_symbol_row_from_df(df: Any, symbol: str) -> dict[str, Any]:
     try:
         import pandas as pd
         if df is None or not isinstance(df, pd.DataFrame) or df.empty or "symbol" not in df.columns:
             return {}
-        s = df[df["symbol"].astype(str) == str(symbol)]
+        s = df[df["symbol"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip() == str(symbol)]
         if s.empty:
             return {}
-        for col in ("datetime", "end_time", "updated_at", "last_update"):
+        for col in ("datetime", "end_time", "updated_at", "last_update", "time"):
             if col in s.columns:
                 try:
                     s = s.assign(_dt=pd.to_datetime(s[col], errors="coerce")).sort_values("_dt")
@@ -117,33 +133,102 @@ def _latest_symbol_row_from_df(df: Any, symbol: str) -> dict[str, Any]:
         return {}
 
 
-def _best_from_global_context(symbol: str) -> tuple[float, float, float, float, str]:
+def _atr14_from_symbol_history(df: Any, symbol: str) -> tuple[float, int, str]:
+    try:
+        import pandas as pd
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty or "symbol" not in df.columns:
+            return 0.0, 0, "not_df"
+        s = df[df["symbol"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip() == str(symbol)].copy()
+        if s.empty:
+            return 0.0, 0, "symbol_missing"
+        aliases = {
+            "high_price": ("high_price", "high", "High", "h"),
+            "low_price": ("low_price", "low", "Low", "l"),
+            "close_price": ("close_price", "close", "Close", "price", "current_price", "c"),
+        }
+        for dst, keys in aliases.items():
+            if dst in s.columns:
+                continue
+            for k in keys:
+                if k in s.columns:
+                    s[dst] = s[k]
+                    break
+        if not {"high_price", "low_price", "close_price"}.issubset(set(s.columns)):
+            return 0.0, len(s), "ohlc_missing"
+        for col in ("high_price", "low_price", "close_price"):
+            s[col] = pd.to_numeric(s[col], errors="coerce")
+        for col in ("datetime", "end_time", "updated_at", "last_update", "time"):
+            if col in s.columns:
+                try:
+                    s = s.assign(_dt=pd.to_datetime(s[col], errors="coerce")).sort_values("_dt")
+                    s = s.drop_duplicates(subset=["_dt"], keep="last")
+                    break
+                except Exception:
+                    pass
+        s = s.dropna(subset=["high_price", "low_price", "close_price"])
+        s = s[(s["high_price"] > 0) & (s["low_price"] > 0) & (s["close_price"] > 0)]
+        bars = len(s)
+        if bars < 15:
+            return 0.0, bars, "bars_insufficient"
+        highs = s["high_price"].to_list()
+        lows = s["low_price"].to_list()
+        closes = s["close_price"].to_list()
+        tr: list[float] = []
+        for i in range(1, bars):
+            tr.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
+        if len(tr) < 14:
+            return 0.0, bars, "tr_insufficient"
+        return float(sum(tr[-14:]) / 14.0), bars, "atr14"
+    except Exception:
+        logger.debug("[SUMMARY AI RANGE REPAIR] atr14 calc failed symbol=%s", symbol, exc_info=True)
+        return 0.0, 0, "exception"
+
+
+def _history_frames_from_global_context(tf: int = 1) -> list[tuple[str, Any]]:
+    frames: list[tuple[str, Any]] = []
     try:
         from core.global_context.context import global_context
     except Exception:
         try:
             from core.global_context import global_context  # type: ignore
         except Exception:
-            return 0.0, 0.0, 0.0, 0.0, "gc_import_failed"
+            return frames
+
+    for getter_name, label in (("get_summary_history", "summary_history"), ("get_merged_summary", "merged_summary")):
+        getter = getattr(global_context, getter_name, None)
+        if not callable(getter):
+            continue
+        for src in _HISTORY_SOURCES:
+            try:
+                df = getter(tf, source=src)
+                if getattr(df, "empty", True) is False:
+                    frames.append((f"{label}:{src}", df))
+            except Exception:
+                logger.debug("[SUMMARY AI RANGE REPAIR] global lookup failed getter=%s source=%s", getter_name, src, exc_info=True)
+    return frames
+
+
+def _best_from_global_context(symbol: str) -> tuple[float, float, float, float, str]:
+    symbol = _normalize_symbol(symbol)
+    if not symbol:
+        return 0.0, 0.0, 0.0, 0.0, "symbol_missing"
 
     best = (0.0, 0.0, 0.0, 0.0, "gc_missing")
     best_ratio = 0.0
-    for getter_name, label in (("get_summary_history", "summary_history_1m"), ("get_merged_summary", "merged_summary_1m")):
+    for label, df in _history_frames_from_global_context(1):
         try:
-            getter = getattr(global_context, getter_name, None)
-            if not callable(getter):
-                continue
-            df = getter(1, source="push")
             d = _latest_symbol_row_from_df(df, symbol)
             if not d:
                 continue
             c, h, l, atr, method = _best_from_row(d)
+            atr14, bars, atr_method = _atr14_from_symbol_history(df, symbol)
+            atr = max(float(atr or 0.0), float(atr14 or 0.0))
             ratio = _range_ratio(c, h, l)
             if ratio > best_ratio or (ratio == best_ratio and atr > best[3]):
-                best = (c, h, l, atr, f"{label}:{method}")
+                best = (c, h, l, atr, f"{label}:{method}:{atr_method}:bars={bars}")
                 best_ratio = ratio
         except Exception:
-            logger.debug("[SUMMARY AI RANGE REPAIR] global lookup failed getter=%s symbol=%s", getter_name, symbol, exc_info=True)
+            logger.debug("[SUMMARY AI RANGE REPAIR] global source failed label=%s symbol=%s", label, symbol, exc_info=True)
     return best
 
 
@@ -165,6 +250,7 @@ def _entry_min_atr_ratio() -> float:
 
 def _repair_row(entry_row: Any, *, symbol: str, source: str) -> tuple[dict[str, Any], dict[str, Any]]:
     row = _row_dict(entry_row)
+    symbol = _normalize_symbol(symbol or row.get("symbol"))
     close0, high0, low0, atr0, method0 = _best_from_row(row)
     old_ratio = _range_ratio(close0, high0, low0)
     best = (close0, high0, low0, atr0, method0)
@@ -204,6 +290,7 @@ def _repair_row(entry_row: Any, *, symbol: str, source: str) -> tuple[dict[str, 
         "method": method,
         "repaired": False,
         "atr_repaired": False,
+        "version": VERSION,
     }
 
     if c > 0 and h > 0 and l > 0 and h >= l and best_ratio > old_ratio:
@@ -263,8 +350,8 @@ def _install_entry_controller_filter_repair() -> bool:
         import trading.filters.volatility_filter as vf
         import trading.handlers.entry_controller as ec
 
-        if not getattr(vf.atr_1m_filter, "_summary_ai_entry_controller_repair_v4", False):
-            orig_atr = vf.atr_1m_filter
+        if not getattr(vf.atr_1m_filter, "_summary_ai_entry_controller_repair_v5", False):
+            orig_atr = getattr(vf.atr_1m_filter, "_original", vf.atr_1m_filter)
 
             def _patched_atr_1m_filter(entry_row, *args, **kwargs):
                 row = _row_dict(entry_row)
@@ -278,12 +365,13 @@ def _install_entry_controller_filter_repair() -> bool:
                 return orig_atr(entry_row, *args, **kwargs)
 
             _patched_atr_1m_filter._summary_ai_entry_controller_repair_v4 = True  # type: ignore[attr-defined]
+            _patched_atr_1m_filter._summary_ai_entry_controller_repair_v5 = True  # type: ignore[attr-defined]
             _patched_atr_1m_filter._original = orig_atr  # type: ignore[attr-defined]
             vf.atr_1m_filter = _patched_atr_1m_filter
             ec.atr_1m_filter = _patched_atr_1m_filter
 
-        if not getattr(vf.range_5m_filter, "_summary_ai_entry_controller_repair_v4", False):
-            orig_range = vf.range_5m_filter
+        if not getattr(vf.range_5m_filter, "_summary_ai_entry_controller_repair_v5", False):
+            orig_range = getattr(vf.range_5m_filter, "_original", vf.range_5m_filter)
 
             def _patched_range_5m_filter(entry_row, *args, **kwargs):
                 row = _row_dict(entry_row)
@@ -297,6 +385,7 @@ def _install_entry_controller_filter_repair() -> bool:
                 return orig_range(entry_row, *args, **kwargs)
 
             _patched_range_5m_filter._summary_ai_entry_controller_repair_v4 = True  # type: ignore[attr-defined]
+            _patched_range_5m_filter._summary_ai_entry_controller_repair_v5 = True  # type: ignore[attr-defined]
             _patched_range_5m_filter._original = orig_range  # type: ignore[attr-defined]
             vf.range_5m_filter = _patched_range_5m_filter
             ec.range_5m_filter = _patched_range_5m_filter
@@ -319,7 +408,7 @@ def install() -> bool:
         if not callable(cur):
             logger.warning("[SUMMARY AI ORDER RANGE REPAIR] target missing version=%s", VERSION)
             return bool(ctrl_ok)
-        if getattr(cur, "_summary_ai_order_range_repair_v4", False):
+        if getattr(cur, "_summary_ai_order_range_repair_v5", False):
             _INSTALLED = True
             return True
 
@@ -340,6 +429,7 @@ def install() -> bool:
         _patched_low_move_hard_block._summary_ai_order_range_repair_v2 = True  # type: ignore[attr-defined]
         _patched_low_move_hard_block._summary_ai_order_range_repair_v3 = True  # type: ignore[attr-defined]
         _patched_low_move_hard_block._summary_ai_order_range_repair_v4 = True  # type: ignore[attr-defined]
+        _patched_low_move_hard_block._summary_ai_order_range_repair_v5 = True  # type: ignore[attr-defined]
         _patched_low_move_hard_block._original = _ORIGINAL_LOW_MOVE  # type: ignore[attr-defined]
         eob._low_move_hard_block = _patched_low_move_hard_block
         _INSTALLED = True
