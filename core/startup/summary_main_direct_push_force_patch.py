@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_main_direct_push_force_patch.py
-# Version: V2-FORCE-MAIN-DIRECT-PUSH-1M-ROBUST-MEMORY
+# Version: V3-FORCE-MAIN-DIRECT-PUSH-1M-HISTORY
 # ------------------------------------------------------------
 # Force main.py 1m summary tick to avoid heavy runner paths.
-# V2 uses summary_main_memory_latest_1m_patch._build_memory_1m_summary first.
-# If PUSH memory exists but direct build is empty, do not fall back to heavy
-# original paths by default.
+# V3 uses summary_main_memory_latest_1m_patch._build_memory_1m_summary first
+# and stores both latest/merged and summary_history(tf=1).
+#
+# Fix:
+#   - V2 stored set_push_summary / set_merged_summary only.
+#   - When this forced path bypassed summary_main_memory_latest_1m_patch._publish_latest,
+#     SUMMARY HISTORY GET tf=1 source=push stayed rows=0.
+#   - V3 explicitly calls set_summary_history(tf=1, df=history/latest df, source="push").
 # ============================================================
 from __future__ import annotations
 
@@ -22,7 +27,7 @@ from typing import Any, Optional
 import pandas as pd
 
 logger = logging.getLogger(__name__)
-VERSION = "V2-FORCE-MAIN-DIRECT-PUSH-1M-ROBUST-MEMORY"
+VERSION = "V3-FORCE-MAIN-DIRECT-PUSH-1M-HISTORY"
 _PATCHED = False
 _WATCHER_STARTED = False
 _AI_EXECUTOR: ThreadPoolExecutor | None = None
@@ -104,35 +109,128 @@ def _build_direct(now: dt.datetime) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def _normalize_1m_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    try:
+        out = df.copy()
+        out = out.loc[:, ~pd.Index(out.columns).duplicated()].copy()
+        if "symbol" in out.columns:
+            out["symbol"] = out["symbol"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+        if "datetime" in out.columns:
+            out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+            out = out.dropna(subset=["datetime"])
+        if "close" not in out.columns:
+            for c in ("close_price", "current_price", "price"):
+                if c in out.columns:
+                    out["close"] = out[c]
+                    break
+        if "close" not in out.columns:
+            return pd.DataFrame()
+        for c in ("open", "high", "low"):
+            if c not in out.columns:
+                out[c] = out["close"]
+        if "volume" not in out.columns:
+            for c in ("trading_volume", "vol", "Volume", "出来高"):
+                if c in out.columns:
+                    out["volume"] = out[c]
+                    break
+        if "volume" not in out.columns:
+            out["volume"] = 0.0
+        for c in ("open", "high", "low", "close", "volume"):
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+        out = out.dropna(subset=["symbol", "datetime", "close"])
+        out["interval"] = 1
+        return out.reset_index(drop=True)
+    except Exception:
+        logger.debug("[SUMMARY FORCE DIRECT 1M] normalize 1m df failed", exc_info=True)
+        return pd.DataFrame()
+
+
+def _call_context_method(obj: Any, fn_name: str, df: pd.DataFrame) -> bool:
+    fn = getattr(obj, fn_name, None)
+    if not callable(fn):
+        return False
+    for call in (
+        lambda: fn(tf=1, df=df.copy(), source="push"),
+        lambda: fn(1, df.copy(), source="push"),
+        lambda: fn(1, df.copy()),
+        lambda: fn(1, df.copy(), "push"),
+    ):
+        try:
+            call()
+            return True
+        except TypeError:
+            continue
+        except Exception:
+            logger.debug("[SUMMARY FORCE DIRECT 1M] context method failed fn=%s", fn_name, exc_info=True)
+            return False
+    return False
+
+
 def _store(df: pd.DataFrame) -> None:
     if df is None or df.empty:
         return
+    hist = _normalize_1m_df(df)
+    if hist.empty:
+        return
+    try:
+        latest = hist.sort_values(["symbol", "datetime"], kind="stable").groupby("symbol", as_index=False).tail(1).reset_index(drop=True)
+    except Exception:
+        latest = hist.copy()
+
     try:
         from global_state import global_data
-        for name in ("push_summary_1", "push_summary_1min", "push_merged_summary_1", "push_merged_summary_1min", "merged_summary_1", "merged_summary_1min"):
+        for name, value in (
+            ("summary_1m_df", hist.copy()),
+            ("latest_summary_1m_df", latest.copy()),
+            ("summary_1m_latest_df", latest.copy()),
+            ("push_summary_1", latest.copy()),
+            ("push_summary_1min", latest.copy()),
+            ("push_summary_1m_df", hist.copy()),
+            ("push_merged_summary_1", latest.copy()),
+            ("push_merged_summary_1min", latest.copy()),
+            ("push_merged_summary_1m_df", latest.copy()),
+            ("merged_summary_1", latest.copy()),
+            ("merged_summary_1min", latest.copy()),
+        ):
             try:
-                setattr(global_data, name, df)
+                setattr(global_data, name, value)
             except Exception:
                 pass
+        # global_state 側にもメソッドがある場合はhistoryを明示保存。
+        for fn_name, value in (
+            ("set_summary_history", hist.copy()),
+            ("set_push_summary", latest.copy()),
+            ("set_merged_summary", latest.copy()),
+            ("set_push_merged_summary", latest.copy()),
+            ("set_latest_summary", latest.copy()),
+        ):
+            _call_context_method(global_data, fn_name, value)
     except Exception:
         pass
+
     try:
         from core.global_context.context import global_data as GD
-        for fn_name in ("set_push_summary", "set_merged_summary", "set_push_merged_summary"):
-            fn = getattr(GD, fn_name, None)
-            if callable(fn):
-                try:
-                    if "merged" in fn_name:
-                        fn(1, df, source="push")
-                    else:
-                        fn(1, df)
-                except TypeError:
-                    try:
-                        fn(tf=1, df=df, source="push")
-                    except Exception:
-                        pass
+        stored = {}
+        for fn_name, value in (
+            ("set_summary_history", hist.copy()),
+            ("set_push_summary", latest.copy()),
+            ("set_merged_summary", latest.copy()),
+            ("set_push_merged_summary", latest.copy()),
+            ("set_latest_summary", latest.copy()),
+        ):
+            stored[fn_name] = _call_context_method(GD, fn_name, value)
+        logger.warning(
+            "[SUMMARY FORCE DIRECT 1M] stored latest/history tf=1 hist_rows=%s latest_rows=%s latest_dt=%s stored=%s version=%s",
+            len(hist),
+            len(latest),
+            hist["datetime"].max() if "datetime" in hist.columns else None,
+            stored,
+            VERSION,
+        )
     except Exception:
-        pass
+        logger.debug("[SUMMARY FORCE DIRECT 1M] context store skipped", exc_info=True)
 
 
 def _submit_ai(df: pd.DataFrame, now: dt.datetime, run_entry: bool) -> None:
@@ -170,7 +268,7 @@ def _patch_once(reason: str = "install") -> bool:
     try:
         import scheduler_jobs.summary.runner_core as rc
         current = getattr(rc, "job_summary", None)
-        if getattr(current, "_summary_force_direct_v2", False):
+        if getattr(current, "_summary_force_direct_v3", False):
             return True
         if _ORIGINAL_JOB_SUMMARY is None and callable(current):
             _ORIGINAL_JOB_SUMMARY = current
@@ -186,7 +284,7 @@ def _patch_once(reason: str = "install") -> bool:
             if df is not None and not df.empty:
                 _store(df)
                 _submit_ai(df, now_i, run_entry)
-                logger.warning("[SUMMARY FORCE DIRECT 1M] return interval=1 rows=%s elapsed=%.3fs mode=forced_direct_v2", len(df), time.perf_counter() - t0)
+                logger.warning("[SUMMARY FORCE DIRECT 1M] return interval=1 rows=%s elapsed=%.3fs mode=forced_direct_v3", len(df), time.perf_counter() - t0)
                 return df
             raw_rows = _raw_memory_rows()
             if _env_bool("SUMMARY_FORCE_DIRECT_NO_ORIGINAL_FALLBACK_WHEN_RAW_EXISTS", True) and raw_rows > 0:
@@ -201,6 +299,7 @@ def _patch_once(reason: str = "install") -> bool:
 
         job_summary_force._summary_force_direct_v1 = True  # type: ignore[attr-defined]
         job_summary_force._summary_force_direct_v2 = True  # type: ignore[attr-defined]
+        job_summary_force._summary_force_direct_v3 = True  # type: ignore[attr-defined]
         job_summary_force._original = orig  # type: ignore[attr-defined]
         rc.job_summary = job_summary_force
         rc.run_push_summary_job = lambda interval=1, display=True, now=None, run_entry=True, **kwargs: job_summary_force(int(interval), display=display, now=now, run_entry=run_entry, **kwargs)
