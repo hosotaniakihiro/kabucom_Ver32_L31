@@ -1,26 +1,20 @@
 # ============================================================
 # File   : trading/entry/summary_ai/candidates.py
-# Version: PRODUCTION-STABLE-REV2.5-SUMMARY-1M-MOVEMENT-SCORE-BRIDGE
+# Version: PRODUCTION-STABLE-REV2.6-SUMMARY-1M-MOVEMENT-SCORE-BRIDGE-STRONG
 # ------------------------------------------------------------
 # Purpose:
 #   - SUMMARY / RANKING SUMMARY の DataFrame からAI gate候補を作る。
 #   - build_summary_ai_entry_candidates() で BUY TOP と SELL TOP を同時に返す。
 #   - 各行に ai_side / side = BUY or SELL を付与し、AI gate側で行ごとに判定する。
 #
-# REV2.5:
-#   - main.py のPUSH 1m memory summaryでは score_buy / score_sell が全0のまま
-#     になるケースがある。
-#   - その場合だけ、既存の厳密ガードは緩めず、1分足の実値動き
-#     open/high/low/close/range_pct/atr/slope/macd/volume から候補選定用スコアを
-#     再生成する。
-#   - 低出来高・低変動の最終除外は後段の liquidity / low-move / board / order_builder
-#     に委ねる。候補生成段階で BUY_SELL combined empty になるのを防ぐ。
-#
-# REV2.4:
-#   - 既存summary側に score_buy / score_sell / score_total / final_score / display_score
-#     があるのに、候補生成側の ai_disp_* / config_* が0扱いになる事故を本体で防ぐ。
+# REV2.6:
+#   - PUSH 1m memory summary の score/slope/mtf が全0の場合でも、
+#     open/high/low/close/range_pct/atr/macd/volume から候補生成専用スコアを作る。
+#   - REV2.5 の movement score は倍率が弱く、MIN_ENTRY_SCORE=3.0 環境で
+#     BUY/SELL候補が0件になりやすかったため、候補化できる強度へ補正。
+#   - ガード緩和ではない。低出来高・低変動・blowoff・板・order_builder の
+#     最終除外は後段に残す。
 # ============================================================
-
 from __future__ import annotations
 
 import logging
@@ -47,6 +41,7 @@ DEFAULT_MIN_VOLUME = 1.0
 DEFAULT_MIN_PRICE = 200.0
 DEFAULT_MIN_BUY_SLOPE = 0.01
 DEFAULT_MAX_SELL_SLOPE = -0.01
+VERSION = "REV2.6-SUMMARY-1M-MOVEMENT-SCORE-BRIDGE-STRONG"
 
 
 def _env_float(name: str, default: float) -> float:
@@ -114,7 +109,12 @@ def _entry_max_sell_slope() -> float:
 
 
 def _summary_ai_max_candidate_age_sec(default: float = 900.0) -> float:
-    for name in ("SUMMARY_AI_MAX_CANDIDATE_AGE_SEC", "SUMMARY_ENTRY_PENDING_MAX_AGE_SEC", "SUMMARY_AI_PENDING_MAX_AGE_SEC", "ENTRY_CANDIDATE_MAX_AGE_SEC"):
+    for name in (
+        "SUMMARY_AI_MAX_CANDIDATE_AGE_SEC",
+        "SUMMARY_ENTRY_PENDING_MAX_AGE_SEC",
+        "SUMMARY_AI_PENDING_MAX_AGE_SEC",
+        "ENTRY_CANDIDATE_MAX_AGE_SEC",
+    ):
         v = os.getenv(name)
         if v is not None and str(v).strip() != "":
             return _env_float(name, default)
@@ -138,8 +138,7 @@ def _truthy(v: Any) -> bool:
             return bool(v)
         if isinstance(v, (int, float)):
             return float(v) != 0.0
-        s = str(v).strip().lower()
-        return s in {"1", "true", "t", "yes", "y", "on", "ok"}
+        return str(v).strip().lower() in {"1", "true", "t", "yes", "y", "on", "ok"}
     except Exception:
         return False
 
@@ -227,7 +226,7 @@ def _score_flags_for_row(row: pd.Series, table: dict[str, int]) -> tuple[float, 
 
 
 def _movement_score_fallback(out: pd.DataFrame, final_buy: pd.Series, final_sell: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
-    """When all explicit score columns are zero, derive candidate-only scores from real 1m movement."""
+    """When explicit score columns are all zero, derive candidate-only scores from real 1m movement."""
     if not _env_bool("SUMMARY_AI_DERIVE_SCORE_FROM_1M_MOVEMENT", True):
         return final_buy, final_sell, pd.Series(False, index=out.index), pd.Series(0.0, index=out.index), pd.Series(0.0, index=out.index)
     try:
@@ -257,28 +256,46 @@ def _movement_score_fallback(out: pd.DataFrame, final_buy: pd.Series, final_sell
         min_range = _env_float("SUMMARY_AI_MOVEMENT_SCORE_MIN_RANGE_PCT", 0.0015)
         min_turnover = _env_float("SUMMARY_AI_MOVEMENT_SCORE_MIN_TURNOVER", 1_000_000.0)
         min_volume = _env_float("SUMMARY_AI_MOVEMENT_SCORE_MIN_VOLUME", 3_000.0)
-        min_score = _env_float("SUMMARY_AI_MOVEMENT_SCORE_MIN_SCORE", 0.20)
-        max_score = _env_float("SUMMARY_AI_MOVEMENT_SCORE_MAX_SCORE", 4.0)
+        min_raw_strength = _env_float("SUMMARY_AI_MOVEMENT_SCORE_MIN_SCORE", 0.20)
+        candidate_floor = _env_float("SUMMARY_AI_MOVEMENT_SCORE_CANDIDATE_FLOOR", _env_float("MIN_ENTRY_SCORE", 3.0))
+        max_score = _env_float("SUMMARY_AI_MOVEMENT_SCORE_MAX_SCORE", 6.0)
 
-        movement_strength = _max_series(range_pct * 350.0, atr_pct * 500.0, co_pct.abs() * 300.0, slope.abs() * 200.0, macd_diff.abs() * 200.0)
-        movement_strength = movement_strength.clip(lower=0.0, upper=max_score)
-        movement_ok = (close > 0) & (movement_strength >= min_score) & ((range_pct >= min_range) | (atr_pct >= min_range) | (co_pct.abs() >= min_range))
+        raw_strength = _max_series(
+            range_pct * 2500.0,
+            atr_pct * 2200.0,
+            co_pct.abs() * 2200.0,
+            slope.abs() * 600.0,
+            macd_diff.abs() * 600.0,
+        ).clip(lower=0.0, upper=max_score)
+        movement_ok = (close > 0) & (raw_strength >= min_raw_strength) & ((range_pct >= min_range) | (atr_pct >= min_range) | (co_pct.abs() >= min_range))
         movement_ok = movement_ok & ((volume >= min_volume) | (turnover >= min_turnover))
 
-        direction = co_pct + slope + macd_diff
-        # If direction is neutral, use the candle close position inside the bar/day range.
         close_pos = ((close - low) / (high - low).where((high - low) > 0, 1.0)).fillna(0.5)
+        direction = co_pct + slope + macd_diff
         buy_dir = (direction > 0) | ((direction.abs() <= 1e-12) & (close_pos >= 0.5))
         sell_dir = (direction < 0) | ((direction.abs() <= 1e-12) & (close_pos < 0.5))
 
-        fb = final_buy.copy()
-        fs = final_sell.copy()
-        fb = fb.mask(movement_ok & buy_dir, movement_strength)
-        fs = fs.mask(movement_ok & sell_dir, movement_strength)
+        movement_strength = raw_strength.where(~movement_ok, raw_strength.clip(lower=candidate_floor, upper=max_score))
+        fb = final_buy.copy().mask(movement_ok & buy_dir, movement_strength)
+        fs = final_sell.copy().mask(movement_ok & sell_dir, movement_strength)
+
+        derived_slope = direction.where(direction.abs() > 1e-12, (close_pos - 0.5) * range_pct).fillna(0.0)
+        if float(_num(out, ("ai_disp_slope", "slope", "slope_atr_scaled", "score_slope"), 0.0).abs().sum()) == 0.0:
+            out["ai_disp_slope"] = derived_slope
+            out["slope"] = derived_slope
+            out["slope_atr_scaled"] = derived_slope
+            out["score_slope"] = derived_slope
+        if float(_num(out, ("ai_disp_mtf", "mtf", "score_mtf", "mtf_score"), 0.0).abs().sum()) == 0.0:
+            mtf = movement_strength.where(movement_ok, 0.0)
+            out["ai_disp_mtf"] = mtf
+            out["mtf"] = mtf
+            out["score_mtf"] = mtf
+            out["mtf_score"] = mtf
+
         logger.warning(
-            "[SUMMARY AI MOVEMENT SCORE BRIDGE] derived rows=%s buy_positive=%s sell_positive=%s min_range=%.6f min_volume=%.0f min_turnover=%.0f buy_max=%.3f sell_max=%.3f",
-            int(movement_ok.sum()), int((fb > 0).sum()), int((fs > 0).sum()), min_range, min_volume, min_turnover,
-            float(fb.max()) if len(fb) else 0.0, float(fs.max()) if len(fs) else 0.0,
+            "[SUMMARY AI MOVEMENT SCORE BRIDGE] derived rows=%s buy_positive=%s sell_positive=%s min_range=%.6f min_volume=%.0f min_turnover=%.0f floor=%.2f buy_max=%.3f sell_max=%.3f version=%s",
+            int(movement_ok.sum()), int((fb > 0).sum()), int((fs > 0).sum()), min_range, min_volume, min_turnover, candidate_floor,
+            float(fb.max()) if len(fb) else 0.0, float(fs.max()) if len(fs) else 0.0, VERSION,
         )
         return fb, fs, movement_ok, range_pct, movement_strength
     except Exception:
@@ -361,16 +378,10 @@ def _apply_score_config_flags(df: pd.DataFrame) -> pd.DataFrame:
 
     try:
         logger.warning(
-            "[SUMMARY AI SCORE BRIDGE CORE] applied rows=%s buy_positive=%s sell_positive=%s buy_max=%.2f sell_max=%.2f src_buy_pos=%s src_sell_pos=%s src_total_pos=%s src_total_neg=%s version=REV2.5",
+            "[SUMMARY AI SCORE BRIDGE CORE] applied rows=%s buy_positive=%s sell_positive=%s buy_max=%.2f sell_max=%.2f src_buy_pos=%s src_sell_pos=%s src_total_pos=%s src_total_neg=%s version=%s",
             len(out), int((final_buy > 0).sum()), int((final_sell > 0).sum()),
             float(final_buy.max()) if len(final_buy) else 0.0, float(final_sell.max()) if len(final_sell) else 0.0,
-            int((src_buy > 0).sum()), int((src_sell > 0).sum()), int((src_total > 0).sum()), int((src_total < 0).sum()),
-        )
-        logger.warning(
-            "[SUMMARY AI CANDIDATES] score_config applied rows=%s buy_positive=%s sell_positive=%s buy_max=%.2f sell_max=%.2f",
-            len(out), int((out["config_buy_score"] > 0).sum()), int((out["config_sell_score"] > 0).sum()),
-            float(pd.to_numeric(out["config_buy_score"], errors="coerce").fillna(0.0).max()),
-            float(pd.to_numeric(out["config_sell_score"], errors="coerce").fillna(0.0).max()),
+            int((src_buy > 0).sum()), int((src_sell > 0).sum()), int((src_total > 0).sum()), int((src_total < 0).sum()), VERSION,
         )
     except Exception:
         pass
