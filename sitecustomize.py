@@ -1,11 +1,16 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver57-FINAL-BOARD-GUARD-SIGNATURE-COMPAT
+# Version: Ver58-SUMMARY-AI-BLOWOFF-PREFILTER
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # main.py は軽量同期 + background install。
 # DB/data collector系はDB専用の最小同期パッチだけにして起動を軽くする。
 # 救済/fail-open系はデフォルトOFFにして、本体判定を優先する。
+#
+# V58:
+#   - Summary-AI の Top3 選定前に blowoff top 候補を除外する
+#     SUMMARY_AI_BLOWOFF_PREFILTER を同期パッチへ追加。
+#     blowoff ガードは緩和せず、Top3全滅だけを防ぐ。
 #
 # V57:
 #   - final_entry_safety_guard_patch._board_guard が3引数版へ差し替わっても
@@ -254,6 +259,7 @@ SYNC_MAIN_PATCHES = [
     ("core.startup.entry_controller_pipeline_lock_wait_patch", "ENTRY_CONTROLLER_LOCK_WAIT", "DISABLE_ENTRY_CONTROLLER_LOCK_WAIT_PATCH"),
     ("core.startup.entry_controller_source_prefilter_patch", "ENTRY_CONTROLLER_SOURCE_PREFILTER", "DISABLE_ENTRY_CONTROLLER_SOURCE_PREFILTER_PATCH"),
     ("core.startup.entry_execute_timeout_guard_patch", "ENTRY_EXECUTE_TIMEOUT_GUARD", "DISABLE_ENTRY_EXECUTE_TIMEOUT_GUARD_PATCH"),
+    ("core.startup.summary_ai_blowoff_prefilter_patch", "SUMMARY_AI_BLOWOFF_PREFILTER", "DISABLE_SUMMARY_AI_BLOWOFF_PREFILTER_PATCH"),
     ("core.startup.summary_main_direct_push_force_patch", "SUMMARY_FORCE_DIRECT_1M_SYNC", "DISABLE_SUMMARY_FORCE_DIRECT_1M_PATCH"),
 ]
 
