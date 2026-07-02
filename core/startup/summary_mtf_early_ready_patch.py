@@ -1,17 +1,23 @@
 # ============================================================
 # File   : core/startup/summary_mtf_early_ready_patch.py
-# Version: V1.3-SUMMARY-MTF-EARLY-READY-CHAIN-PUSH-RAW-FALLBACK
+# Version: V1.4-SUMMARY-MTF-EARLY-READY-CHAIN-ORDER-RANGE-REPAIR
 # ------------------------------------------------------------
 # 【目的】
 #   SUMMARY 3m/5m の AI entry が
 #     summary_mtf_not_ready:hist_short:<14
 #   で全落ちし、5MAを超えた初動を拾えない問題を緩和する。
 #
+# 【V1.4追加】
+#   - SUMMARY_AI direct snapshot 経路で entry_order_builder に渡る row が
+#     high == low == close のままになり、LOW_MOVE_RANGE_TOO_SMALL で
+#     実発注直前に落ちる問題を防ぐため、
+#     summary_ai_order_builder_range_repair_patch を連鎖installする。
+#   - 低変動ガードは緩和しない。履歴summaryの day_high/day_low 等で
+#     レンジを補完してから従来の strict guard を再実行する。
+#
 # 【V1.3追加】
 #   - main.py memory_only 運用で 3m/5m PUSH summary が空になる場合に備え、
 #     summary_mtf_push_raw_fallback_patch を連鎖installする。
-#   - global_data.push_df など raw PUSH から3m/5mを軽量生成するため、
-#     MERGED GET tf=3 source=push rows=0 の起動直後問題を緩和する。
 # ============================================================
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ _ORIGINAL_SUMMARY_MTF_STATUS = None
 _CONTROLLER_CACHE_PATCHED = False
 _NEUTRAL_SCORE_GUARD_INSTALLED = False
 _PUSH_RAW_FALLBACK_INSTALLED = False
+_ORDER_RANGE_REPAIR_INSTALLED = False
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -185,6 +192,21 @@ def _install_push_raw_fallback() -> bool:
         return False
 
 
+def _install_order_builder_range_repair() -> bool:
+    global _ORDER_RANGE_REPAIR_INSTALLED
+    if _ORDER_RANGE_REPAIR_INSTALLED:
+        return True
+    try:
+        from core.startup import summary_ai_order_builder_range_repair_patch as order_range_repair
+        ok = bool(order_range_repair.install())
+        _ORDER_RANGE_REPAIR_INSTALLED = ok
+        logger.warning("[SUMMARY MTF EARLY READY PATCH] summary_ai order builder range repair installed=%s", ok)
+        return ok
+    except Exception:
+        logger.exception("[SUMMARY MTF EARLY READY PATCH] summary_ai order builder range repair install failed")
+        return False
+
+
 def _install_controller_cache_history_payload_patch() -> bool:
     """3m/5m merged cache が latest-only になるのを防ぐ。"""
     global _CONTROLLER_CACHE_PATCHED
@@ -250,9 +272,10 @@ def install() -> bool:
     neutral_ok = _install_neutral_score_guard()
     controller_ok = _install_controller_cache_history_payload_patch()
     raw_fallback_ok = _install_push_raw_fallback()
+    order_range_ok = _install_order_builder_range_repair()
 
     if _PATCHED:
-        return bool(controller_ok or neutral_ok or raw_fallback_ok)
+        return bool(controller_ok or neutral_ok or raw_fallback_ok or order_range_ok)
 
     try:
         import AI.entry_gate as target
@@ -260,10 +283,10 @@ def install() -> bool:
         cur = getattr(target, "_summary_mtf_status", None)
         if not callable(cur):
             logger.warning("[SUMMARY MTF EARLY READY PATCH] target _summary_mtf_status not callable")
-            return bool(controller_ok or neutral_ok or raw_fallback_ok)
+            return bool(controller_ok or neutral_ok or raw_fallback_ok or order_range_ok)
         if getattr(cur, "_summary_mtf_early_ready_patch", False):
             _PATCHED = True
-            return bool(controller_ok or neutral_ok or raw_fallback_ok)
+            return bool(controller_ok or neutral_ok or raw_fallback_ok or order_range_ok)
 
         _ORIGINAL_SUMMARY_MTF_STATUS = cur
 
@@ -290,15 +313,16 @@ def install() -> bool:
         target._summary_mtf_status = _patched_summary_mtf_status
         _PATCHED = True
         logger.warning(
-            "[SUMMARY MTF EARLY READY PATCH] installed controller_cache_history_payload=%s neutral_score_guard=%s push_raw_fallback=%s",
+            "[SUMMARY MTF EARLY READY PATCH] installed controller_cache_history_payload=%s neutral_score_guard=%s push_raw_fallback=%s order_range_repair=%s",
             controller_ok,
             neutral_ok,
             raw_fallback_ok,
+            order_range_ok,
         )
         return True
     except Exception:
         logger.exception("[SUMMARY MTF EARLY READY PATCH] install failed")
-        return bool(controller_ok or neutral_ok or raw_fallback_ok)
+        return bool(controller_ok or neutral_ok or raw_fallback_ok or order_range_ok)
 
 
 __all__ = ["install"]
