@@ -1,18 +1,17 @@
 # ============================================================
 # File   : core/startup/final_entry_board_rest_direct_patch.py
-# Version: V3.1-SIDE-CONTEXT-PRESERVED
+# Version: V4-LIMITED-REST-BOARD-FALLBACK
 # ------------------------------------------------------------
 # 目的:
 #   SUMMARY_AI / TONOSAMA の発注直前に PUSH 板が無い場合、
-#   REST /board を候補ごとに連打して 429(API実行回数エラー) / 4002006(レジスト数エラー)
-#   を起こす経路を止める。
+#   必要最小限だけ REST /board を使って best bid/ask を補完する。
 #
-# V3.1:
-#   - final_entry_safety_guard_patch._native_board_guard が
-#     _try_get_bid_ask_from_api(symbol) の1引数で呼んでも、呼び出し元frameから
-#     side/source を復元して get_latest_bid_ask(symbol, source=..., side=...) へ渡す。
-#   - ログの `side=` 空欄を防ぎ、PUSH板取得・診断の方向情報を落とさない。
-#   - REST直叩きは引き続き ENTRY_BOARD_REST_DIRECT_FORCE=1 の時だけ。
+# V4:
+#   - V3/V3.1 の「FORCE指定が無い限りREST板を常時OFF」をやめる。
+#   - ENTRY_BOARD_REST_DIRECT_ENABLED は既定ON。
+#   - side/source 推定は V3.1 の仕組みを維持。
+#   - 1銘柄ごとに board_client.fetch_board_snapshot(timeout短め, levels=5) で補完。
+#   - RESTが取れない場合だけ従来どおり board_missing / fail-open 側へ流す。
 # ============================================================
 
 from __future__ import annotations
@@ -26,7 +25,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V3.1-SIDE-CONTEXT-PRESERVED"
+VERSION = "V4-LIMITED-REST-BOARD-FALLBACK"
 _INSTALLED = False
 _WATCHER_STARTED = False
 
@@ -97,14 +96,12 @@ def _norm_side(v: Any) -> str:
 
 
 def _infer_context_side_source(side: str = "", source: str = "") -> tuple[str, str]:
-    """Recover side/source when caller used legacy _try_get_bid_ask_from_api(symbol)."""
     side_s = _norm_side(side)
     source_s = str(source or "").strip() or "final_entry_safety_guard"
     if side_s:
         return side_s, source_s
     try:
         frame = inspect.currentframe()
-        # current -> _infer_context_side_source -> _try_get_bid_ask_from_api -> caller
         for _ in range(6):
             frame = frame.f_back if frame is not None else None
             if frame is None:
@@ -131,36 +128,22 @@ def _extract_board_values(board: Any) -> tuple[float, float, float, float]:
     sell1 = board.get("Sell1") if isinstance(board.get("Sell1"), dict) else {}
 
     bid = _safe_float(
-        board.get("bid")
-        or board.get("best_bid")
-        or board.get("BidPrice")
-        or board.get("bid_price")
-        or board.get("BestBid")
-        or buy1.get("Price"),
+        board.get("bid") or board.get("best_bid") or board.get("BidPrice") or board.get("bid_price")
+        or board.get("BestBid") or buy1.get("Price"),
         0.0,
     )
     ask = _safe_float(
-        board.get("ask")
-        or board.get("best_ask")
-        or board.get("AskPrice")
-        or board.get("ask_price")
-        or board.get("BestAsk")
-        or sell1.get("Price"),
+        board.get("ask") or board.get("best_ask") or board.get("AskPrice") or board.get("ask_price")
+        or board.get("BestAsk") or sell1.get("Price"),
         0.0,
     )
     bid_qty = _safe_float(
-        board.get("bid_qty")
-        or board.get("BidQty")
-        or board.get("bid_volume")
-        or board.get("BestBidQty")
+        board.get("bid_qty") or board.get("BidQty") or board.get("bid_volume") or board.get("BestBidQty")
         or buy1.get("Qty"),
         0.0,
     )
     ask_qty = _safe_float(
-        board.get("ask_qty")
-        or board.get("AskQty")
-        or board.get("ask_volume")
-        or board.get("BestAskQty")
+        board.get("ask_qty") or board.get("AskQty") or board.get("ask_volume") or board.get("BestAskQty")
         or sell1.get("Qty"),
         0.0,
     )
@@ -170,16 +153,16 @@ def _extract_board_values(board: Any) -> tuple[float, float, float, float]:
     return bid, ask, bid_qty, ask_qty
 
 
-def _force_disable_direct_rest_if_needed() -> None:
-    # board_retry_patch が setdefault("ENTRY_BOARD_REST_DIRECT_ENABLED", "1") しても、
-    # FORCE指定が無い通常運用では必ず0へ戻す。
-    if not _env_bool("ENTRY_BOARD_REST_DIRECT_FORCE", False):
-        os.environ["ENTRY_BOARD_REST_DIRECT_ENABLED"] = "0"
+def _set_default_env() -> None:
+    os.environ.setdefault("ENTRY_BOARD_REST_DIRECT_ENABLED", "1")
+    os.environ.setdefault("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", "0.6")
+    os.environ.setdefault("ENTRY_BOARD_REST_EXCHANGES", "1")
+    os.environ.setdefault("ENTRY_BOARD_REST_DIRECT_LEVELS", "5")
 
 
-def _call_board_rest_via_client(symbol: str) -> tuple[float, float, float, float]:
-    _force_disable_direct_rest_if_needed()
-    if not (_env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", False) and _env_bool("ENTRY_BOARD_REST_DIRECT_FORCE", False)):
+def _call_board_rest_via_client(symbol: str, *, side: str = "", source: str = "final_entry_safety_guard") -> tuple[float, float, float, float]:
+    _set_default_env()
+    if not _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", True):
         return 0.0, 0.0, 0.0, 0.0
 
     sym = _norm_symbol(symbol)
@@ -192,21 +175,18 @@ def _call_board_rest_via_client(symbol: str) -> tuple[float, float, float, float
         logger.debug("[FINAL ENTRY BOARD REST DIRECT] board_client import failed symbol=%s", sym, exc_info=True)
         return 0.0, 0.0, 0.0, 0.0
 
-    timeout = max(0.3, _env_float("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", 0.6))
+    timeout = max(0.25, _env_float("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", 0.6))
+    levels = max(1, _env_int("ENTRY_BOARD_REST_DIRECT_LEVELS", 5))
     exchanges = [x.strip() for x in str(os.getenv("ENTRY_BOARD_REST_EXCHANGES", "1")).split(",") if x.strip()] or ["1"]
     for ex in exchanges:
         try:
-            snap = fetch_board_snapshot(sym, exchange=int(ex), timeout=timeout, levels=5)
+            snap = fetch_board_snapshot(sym, exchange=int(ex), timeout=timeout, levels=levels)
             bid, ask, bid_qty, ask_qty = _extract_board_values(snap)
             if bid > 0 and ask > 0:
                 logger.warning(
-                    "[FINAL ENTRY BOARD REST DIRECT] BOARD_CLIENT_OK symbol=%s exchange=%s bid=%.4f ask=%.4f cache=%s version=%s",
-                    sym,
-                    ex,
-                    bid,
-                    ask,
-                    bool(isinstance(snap, dict) and snap.get("cache_hit")),
-                    VERSION,
+                    "[FINAL ENTRY BOARD REST DIRECT] BOARD_CLIENT_OK symbol=%s side=%s source=%s exchange=%s bid=%.4f ask=%.4f bid_qty=%.0f ask_qty=%.0f cache=%s version=%s",
+                    sym, side, source, ex, bid, ask, bid_qty, ask_qty,
+                    bool(isinstance(snap, dict) and snap.get("cache_hit")), VERSION,
                 )
                 return bid, ask, bid_qty, ask_qty
         except Exception:
@@ -216,7 +196,7 @@ def _call_board_rest_via_client(symbol: str) -> tuple[float, float, float, float
 
 def _make_try_get_bid_ask_from_api():
     def _try_get_bid_ask_from_api(symbol: str, side: str = "", source: str = "final_entry_safety_guard") -> tuple[float, float, float, float]:
-        _force_disable_direct_rest_if_needed()
+        _set_default_env()
         side, source = _infer_context_side_source(side, source)
         try:
             from utils_common import get_latest_bid_ask
@@ -231,20 +211,18 @@ def _make_try_get_bid_ask_from_api():
         except Exception:
             logger.debug("[FINAL ENTRY BOARD REST DIRECT] push board lookup failed symbol=%s side=%s", symbol, side, exc_info=True)
 
-        # 通常はここでRESTを叩かず、0を返して hard-block/pending 側に判断させる。
-        bid, ask, bid_qty, ask_qty = _call_board_rest_via_client(symbol)
+        bid, ask, bid_qty, ask_qty = _call_board_rest_via_client(symbol, side=side, source=source)
         if bid <= 0 or ask <= 0:
             logger.warning(
-                "[FINAL ENTRY BOARD REST DIRECT] REST_DISABLED_OR_EMPTY symbol=%s side=%s source=%s direct_enabled=%s force=%s version=%s",
-                _norm_symbol(symbol),
-                side,
-                source,
-                _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", False),
-                _env_bool("ENTRY_BOARD_REST_DIRECT_FORCE", False),
+                "[FINAL ENTRY BOARD REST DIRECT] REST_EMPTY symbol=%s side=%s source=%s direct_enabled=%s timeout=%.3f version=%s",
+                _norm_symbol(symbol), side, source,
+                _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", True),
+                _env_float("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", 0.6),
                 VERSION,
             )
         return bid, ask, bid_qty, ask_qty
 
+    _try_get_bid_ask_from_api._final_entry_board_rest_direct_v4 = True  # type: ignore[attr-defined]
     _try_get_bid_ask_from_api._final_entry_board_rest_direct_v31 = True  # type: ignore[attr-defined]
     _try_get_bid_ask_from_api._final_entry_board_rest_direct_v3 = True  # type: ignore[attr-defined]
     _try_get_bid_ask_from_api._final_entry_board_rest_direct_v2 = True  # type: ignore[attr-defined]
@@ -255,19 +233,19 @@ def _make_try_get_bid_ask_from_api():
 def _install_once(log_patch: bool = True) -> bool:
     global _INSTALLED
     try:
-        _force_disable_direct_rest_if_needed()
+        _set_default_env()
         import core.startup.final_entry_safety_guard_patch as fsg
         cur = getattr(fsg, "_try_get_bid_ask_from_api", None)
-        if getattr(cur, "_final_entry_board_rest_direct_v31", False):
+        if getattr(cur, "_final_entry_board_rest_direct_v4", False):
             _INSTALLED = True
             return True
         fsg._try_get_bid_ask_from_api = _make_try_get_bid_ask_from_api()
         _INSTALLED = True
         if log_patch:
             logger.warning(
-                "[FINAL ENTRY BOARD REST DIRECT] installed v3.1 direct_enabled=%s force=%s hard_block=%s allow_without_board=%s version=%s",
-                _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", False),
-                _env_bool("ENTRY_BOARD_REST_DIRECT_FORCE", False),
+                "[FINAL ENTRY BOARD REST DIRECT] installed v4 direct_enabled=%s timeout=%.3f hard_block=%s allow_without_board=%s version=%s",
+                _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", True),
+                _env_float("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", 0.6),
                 _env_bool("ENTRY_BOARD_MISSING_HARD_BLOCK", True),
                 _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", False),
                 VERSION,
@@ -279,7 +257,7 @@ def _install_once(log_patch: bool = True) -> bool:
 
 
 def _watcher() -> None:
-    loops = max(1, _env_int("ENTRY_BOARD_REST_DIRECT_WATCH_LOOPS", 20))
+    loops = max(1, _env_int("ENTRY_BOARD_REST_DIRECT_WATCH_LOOPS", 30))
     sleep_sec = max(0.5, _env_float("ENTRY_BOARD_REST_DIRECT_WATCH_SLEEP_SEC", 1.0))
     for i in range(loops):
         ok = _install_once(log_patch=False)
@@ -301,3 +279,6 @@ try:
     install()
 except Exception:
     logger.exception("[FINAL ENTRY BOARD REST DIRECT] auto install failed")
+
+
+__all__ = ["install", "VERSION"]
