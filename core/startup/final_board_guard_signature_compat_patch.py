@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/final_board_guard_signature_compat_patch.py
-# Version: V1-FINAL-BOARD-GUARD-SIGNATURE-COMPAT
+# Version: V2-MARK-NATIVE-GUARD-NO-REWRAP
 # ------------------------------------------------------------
 # Purpose:
-#   - final_entry_safety_guard_patch._call_board_guard(row,item,symbol,side)
-#     が4引数で呼ぶ一方、後段patchが3引数版 _patched_board_guard に戻して
-#     TypeError: takes 3 positional arguments but 4 were given になる問題を防ぐ。
-#   - 後段patchの再ラップにも負けないよう watcher で再適用する。
-#   - board_missing 自体は従来通り retryable pending keep。板なし発注は有効化しない。
+#   final_entry_safety_guard_patch Ver12 以降は _board_guard 自体が
+#   4引数対応済みのため、ここで再wrapしない。
+#
+# V2:
+#   - 古い V1 watcher が _board_guard を1秒ごとに再wrapする問題を停止。
+#   - summary_ai_entry_hook_dataframe_truth_patch 側の旧compat watcherが
+#     再wrapしないよう、現在の native guard に signature marker を付与。
+#   - 既に旧compat wrapper が挟まっている場合は _original / compat_original を剥がして戻す。
 # ============================================================
 from __future__ import annotations
 
@@ -19,130 +22,102 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V1-FINAL-BOARD-GUARD-SIGNATURE-COMPAT"
+VERSION = "V2-MARK-NATIVE-GUARD-NO-REWRAP"
 _WATCHER_STARTED = False
 _INSTALLED = False
+_LAST_TARGET_ID: int | None = None
 
 
-def _norm_symbol(v: Any) -> str:
+def _is_legacy_wrapper(fn: Any) -> bool:
+    return bool(
+        getattr(fn, "_final_board_guard_signature_compat_v1", False)
+        or getattr(fn, "_final_entry_board_guard_compat", False)
+        or getattr(fn, "_final_entry_board_guard_compat_v15", False)
+        or getattr(fn, "_final_entry_board_guard_compat_v16", False)
+    )
+
+
+def _unwrap(fn: Any) -> Any:
+    seen: set[int] = set()
+    cur = fn
+    while callable(cur) and id(cur) not in seen:
+        seen.add(id(cur))
+        nxt = (
+            getattr(cur, "_final_entry_board_guard_compat_original", None)
+            or getattr(cur, "_original", None)
+            or getattr(cur, "_original_board_guard", None)
+        )
+        if callable(nxt) and nxt is not cur:
+            cur = nxt
+            continue
+        break
+    return cur
+
+
+def _mark_signature_safe(fn: Any) -> Any:
     try:
-        s = str(v or "").strip()
-        if s.endswith(".0") and s[:-2].isdigit():
-            return s[:-2]
-        return s
-    except Exception:
-        return ""
-
-
-def _norm_side(v: Any) -> str:
-    try:
-        s = str(v or "").strip().upper()
-        if s in {"BUY", "LONG", "2", "買", "買い"}:
-            return "BUY"
-        if s in {"SELL", "SHORT", "1", "売", "売り"}:
-            return "SELL"
-        return s
-    except Exception:
-        return ""
-
-
-def _row_to_dict(row: Any) -> dict:
-    try:
-        if isinstance(row, dict):
-            return row
-        if hasattr(row, "to_dict"):
-            d = row.to_dict()
-            return d if isinstance(d, dict) else {}
+        setattr(fn, "_final_board_guard_signature_v2", True)
+        setattr(fn, "_final_board_guard_signature_runtime", True)
+        setattr(fn, "_final_board_guard_signature_compat_v2", True)
     except Exception:
         pass
-    return {}
-
-
-def _first(row: dict, keys: tuple[str, ...], default: Any = "") -> Any:
-    for k in keys:
-        try:
-            v = row.get(k)
-            if v is not None and str(v).strip() != "":
-                return v
-        except Exception:
-            pass
-    return default
-
-
-def _as_4arg_board_guard(fn):
-    def _compat(row: Any, item: dict | None = None, symbol: str | None = None, side: str | None = None, *args: Any, **kwargs: Any) -> bool:
-        row_d = _row_to_dict(row)
-        item_d = item if isinstance(item, dict) else {}
-        symbol_s = _norm_symbol(symbol or _first(row_d, ("symbol", "Symbol", "code", "銘柄コード"), ""))
-        side_s = _norm_side(side or _first(row_d, ("side", "entry_decision", "ai_side"), ""))
-        try:
-            return bool(fn(row_d, item_d, symbol_s, side_s, *args, **kwargs))
-        except TypeError as e4:
-            # 3引数版 board_guard(row, symbol, side) への互換fallback。
-            try:
-                logger.warning(
-                    "[FINAL BOARD GUARD SIG COMPAT] fallback 4args->3args symbol=%s side=%s err=%s version=%s",
-                    symbol_s,
-                    side_s,
-                    e4,
-                    VERSION,
-                )
-                return bool(fn(row_d, symbol_s, side_s))
-            except TypeError as e3:
-                # 2引数/kwargs型なども最後に試す。
-                try:
-                    logger.warning(
-                        "[FINAL BOARD GUARD SIG COMPAT] fallback 3args->kwargs symbol=%s side=%s err=%s version=%s",
-                        symbol_s,
-                        side_s,
-                        e3,
-                        VERSION,
-                    )
-                    return bool(fn(row_d, item=item_d, symbol=symbol_s, side=side_s))
-                except Exception:
-                    logger.exception(
-                        "[FINAL BOARD GUARD SIG COMPAT] incompatible board_guard signature symbol=%s side=%s version=%s",
-                        symbol_s,
-                        side_s,
-                        VERSION,
-                    )
-                    return False
-        except Exception:
-            logger.exception("[FINAL BOARD GUARD SIG COMPAT] board_guard failed symbol=%s side=%s version=%s", symbol_s, side_s, VERSION)
-            return False
-
-    _compat._final_board_guard_signature_compat_v1 = True  # type: ignore[attr-defined]
-    _compat._original = fn  # type: ignore[attr-defined]
-    return _compat
+    return fn
 
 
 def _apply(reason: str = "install") -> bool:
+    global _LAST_TARGET_ID
     try:
         import core.startup.final_entry_safety_guard_patch as fsg
+
         cur = getattr(fsg, "_board_guard", None)
         if not callable(cur):
-            logger.warning("[FINAL BOARD GUARD SIG COMPAT] target _board_guard missing reason=%s", reason)
+            logger.warning("[FINAL BOARD GUARD SIG COMPAT] target _board_guard missing reason=%s version=%s", reason, VERSION)
             return False
-        if getattr(cur, "_final_board_guard_signature_compat_v1", False):
-            return True
-        wrapped = _as_4arg_board_guard(cur)
-        fsg._board_guard = wrapped
-        fsg._patched_board_guard = wrapped
-        logger.warning("[FINAL BOARD GUARD SIG COMPAT] applied reason=%s version=%s", reason, VERSION)
+
+        base = _unwrap(cur)
+        if not callable(base):
+            base = cur
+
+        _mark_signature_safe(base)
+        try:
+            fsg._board_guard = base
+            fsg._patched_board_guard = base
+        except Exception:
+            pass
+
+        cur_id = id(base)
+        if _LAST_TARGET_ID != cur_id or _is_legacy_wrapper(cur):
+            logger.warning(
+                "[FINAL BOARD GUARD SIG COMPAT] native guard marked reason=%s unwrapped=%s cur=%s base=%s version=%s",
+                reason,
+                _is_legacy_wrapper(cur),
+                getattr(cur, "__name__", type(cur).__name__),
+                getattr(base, "__name__", type(base).__name__),
+                VERSION,
+            )
+        _LAST_TARGET_ID = cur_id
         return True
     except Exception:
-        logger.exception("[FINAL BOARD GUARD SIG COMPAT] apply failed reason=%s", reason)
+        logger.exception("[FINAL BOARD GUARD SIG COMPAT] apply failed reason=%s version=%s", reason, VERSION)
         return False
 
 
 def _watcher() -> None:
     try:
-        for i in range(90):
+        stable = 0
+        last_id = None
+        for i in range(20):
             time.sleep(1.0)
-            _apply(reason=f"watcher:{i + 1}")
+            ok = _apply(reason=f"watcher:{i + 1}")
+            cur_id = _LAST_TARGET_ID
+            stable = stable + 1 if ok and cur_id == last_id else 0
+            last_id = cur_id
+            if stable >= 3:
+                logger.warning("[FINAL BOARD GUARD SIG COMPAT] watcher stable exit i=%s version=%s", i + 1, VERSION)
+                return
         logger.warning("[FINAL BOARD GUARD SIG COMPAT] watcher done version=%s", VERSION)
     except Exception:
-        logger.exception("[FINAL BOARD GUARD SIG COMPAT] watcher failed")
+        logger.exception("[FINAL BOARD GUARD SIG COMPAT] watcher failed version=%s", VERSION)
 
 
 def _start_watcher() -> None:
