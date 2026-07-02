@@ -1,10 +1,16 @@
 # ============================================================
 # File   : core/startup/summary_ai_more_candidates_patch.py
-# Version: Ver1.5-SUMMARY-AI-STRICT-MIN3-CANDIDATE-REFILL
+# Version: Ver1.6-SUMMARY-AI-LOWMOVE-POOL-REFILL
 # ------------------------------------------------------------
 # Purpose:
 #   AIに「もっとエントリーできるか」を確認させるため、
 #   SUMMARY_AI runner へ渡す候補数を起動時に拡張する。
+#
+# Ver1.6:
+#   - SUMMARY AI LOW MOVE PREFILTER が全候補を LOW_MOVE と見て
+#     safety rescue で1件だけ残し、その1件が blowoff/後段NGで終わる問題を補正。
+#   - pre-approval の候補プールだけ複数件へ戻す。
+#   - 低出来高・低変動・blowoff・板ガードは緩めない。後段 entry_pipeline/final guard は従来通り通す。
 #
 # Ver1.5:
 #   - strict default は 3.00 なのに、後段 runner が min_buy=4.00 で動き、
@@ -22,12 +28,17 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import threading
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
+VERSION = "Ver1.6-SUMMARY-AI-LOWMOVE-POOL-REFILL"
 _INSTALLED = False
 _SELL_SHORT_OK_FILTER_INSTALLED = False
+_LOW_MOVE_POOL_PATCHED = False
+_LOW_MOVE_POOL_WATCHER_STARTED = False
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -35,7 +46,12 @@ def _env_bool(name: str, default: bool = False) -> bool:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
             return bool(default)
-        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok"}
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
+            return False
+        return bool(default)
     except Exception:
         return bool(default)
 
@@ -69,13 +85,64 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return float(default)
 
 
-def _safe_symbol_list(df: Any, n: int = 20) -> list[str]:
+def _row_dict(x: Any) -> dict[str, Any]:
     try:
-        if df is not None and not df.empty and "symbol" in df.columns:
-            return list(df["symbol"].astype(str).head(n))
+        if isinstance(x, dict):
+            return x
+        if hasattr(x, "to_dict"):
+            d = x.to_dict()
+            if isinstance(d, dict):
+                return d
     except Exception:
         pass
-    return []
+    return {}
+
+
+def _pick_symbol(x: Any) -> str:
+    d = _row_dict(x)
+    return str(d.get("symbol") or d.get("Symbol") or getattr(x, "symbol", "") or "").strip()
+
+
+def _safe_symbol_list(obj: Any, n: int = 20) -> list[str]:
+    try:
+        if obj is not None and hasattr(obj, "empty") and not obj.empty and "symbol" in obj.columns:
+            return list(obj["symbol"].astype(str).head(n))
+    except Exception:
+        pass
+    try:
+        return [_pick_symbol(x) for x in list(obj or [])[:n] if _pick_symbol(x)]
+    except Exception:
+        return []
+
+
+def _score_for_side_local(x: Any) -> float:
+    d = _row_dict(x)
+    side = str(d.get("side") or d.get("ai_side") or d.get("entry_side") or d.get("entry_decision") or "").upper()
+    if side == "SELL":
+        return max(
+            _safe_float(d.get("score_sell"), 0.0),
+            _safe_float(d.get("sell_score"), 0.0),
+            abs(_safe_float(d.get("score_total"), 0.0)) if _safe_float(d.get("score_total"), 0.0) < 0 else 0.0,
+            abs(_safe_float(d.get("final_score"), 0.0)) if _safe_float(d.get("final_score"), 0.0) < 0 else 0.0,
+        )
+    return max(
+        _safe_float(d.get("score_buy"), 0.0),
+        _safe_float(d.get("buy_score"), 0.0),
+        _safe_float(d.get("score_total"), 0.0),
+        _safe_float(d.get("final_score"), 0.0),
+        _safe_float(d.get("score"), 0.0),
+    )
+
+
+def _sort_candidates_local(items: list[Any]) -> list[Any]:
+    try:
+        import trading.entry.summary_ai.executor as ex
+        sort_key = getattr(ex, "_sort_key", None)
+        if callable(sort_key):
+            return sorted(items, key=sort_key, reverse=True)
+    except Exception:
+        pass
+    return sorted(items, key=_score_for_side_local, reverse=True)
 
 
 def _install_controller_enrich_patch() -> bool:
@@ -178,6 +245,95 @@ def _install_sell_short_ok_filter_patch() -> bool:
         return False
 
 
+def _install_low_move_pool_refill_patch(reason: str = "install") -> bool:
+    """Keep more candidates when the pre-approval low-move wrapper rescues only one row.
+
+    This does not submit orders directly and does not bypass final guards. It only prevents
+    a single rescued blowoff/low-liquidity row from starving the candidate pool.
+    """
+    global _LOW_MOVE_POOL_PATCHED
+    if not _env_bool("SUMMARY_AI_LOW_MOVE_POOL_REFILL", True):
+        return False
+    try:
+        import trading.entry.summary_ai.executor as ex
+        cur = getattr(ex, "_filter_blocked_ai_ok_items", None)
+        if not callable(cur):
+            return False
+        if getattr(cur, "_summary_ai_low_move_pool_refill_v16", False):
+            _LOW_MOVE_POOL_PATCHED = True
+            return True
+
+        original = cur
+
+        @functools.wraps(original)
+        def _filter_blocked_ai_ok_items_pool_refill(ok_items):
+            out = original(ok_items)
+            try:
+                raw_items = list(ok_items or [])
+                out_items = list(out or [])
+                min_before = _env_int("SUMMARY_AI_LOW_MOVE_POOL_REFILL_MIN_BEFORE", 4)
+                trigger_after = _env_int("SUMMARY_AI_LOW_MOVE_POOL_REFILL_TRIGGER_AFTER", 1)
+                pool_n = max(1, _env_int("SUMMARY_AI_LOW_MOVE_POOL_REFILL_SIZE", _env_int("SUMMARY_AI_EXECUTOR_SELECTION_POOL", 12)))
+                if len(raw_items) >= min_before and len(out_items) <= trigger_after:
+                    ordered = _sort_candidates_local(raw_items)
+                    refill = ordered[:min(pool_n, len(ordered))]
+                    # 既存フィルタ結果を先頭に残し、重複symbolを避けて補充。
+                    seen = set(_safe_symbol_list(out_items, 100))
+                    merged = list(out_items)
+                    for x in refill:
+                        sym = _pick_symbol(x)
+                        if sym and sym in seen:
+                            continue
+                        merged.append(x)
+                        if sym:
+                            seen.add(sym)
+                        if len(merged) >= pool_n:
+                            break
+                    logger.warning(
+                        "[SUMMARY AI LOW MOVE POOL REFILL] applied reason=%s before=%s after_original=%s after_refill=%s original_symbols=%s refill_symbols=%s version=%s",
+                        reason,
+                        len(raw_items),
+                        len(out_items),
+                        len(merged),
+                        _safe_symbol_list(out_items, 20),
+                        _safe_symbol_list(merged, 20),
+                        VERSION,
+                    )
+                    return merged
+            except Exception:
+                logger.exception("[SUMMARY AI LOW MOVE POOL REFILL] failed; use original filtered output")
+            return out
+
+        _filter_blocked_ai_ok_items_pool_refill._summary_ai_low_move_pool_refill_v16 = True  # type: ignore[attr-defined]
+        _filter_blocked_ai_ok_items_pool_refill._original = original  # type: ignore[attr-defined]
+        ex._filter_blocked_ai_ok_items = _filter_blocked_ai_ok_items_pool_refill
+        _LOW_MOVE_POOL_PATCHED = True
+        logger.warning("[SUMMARY AI LOW MOVE POOL REFILL] installed reason=%s version=%s", reason, VERSION)
+        return True
+    except Exception:
+        logger.debug("[SUMMARY AI LOW MOVE POOL REFILL] install not ready reason=%s", reason, exc_info=True)
+        return False
+
+
+def _start_low_move_pool_watcher() -> None:
+    global _LOW_MOVE_POOL_WATCHER_STARTED
+    if _LOW_MOVE_POOL_WATCHER_STARTED:
+        return
+    _LOW_MOVE_POOL_WATCHER_STARTED = True
+
+    def _watch() -> None:
+        loops = max(1, _env_int("SUMMARY_AI_LOW_MOVE_POOL_REFILL_WATCH_LOOPS", 20))
+        sleep_sec = max(0.5, _env_float("SUMMARY_AI_LOW_MOVE_POOL_REFILL_WATCH_SLEEP", 1.0))
+        for i in range(loops):
+            ok = _install_low_move_pool_refill_patch(reason=f"watcher:{i}")
+            if i in (0, loops - 1):
+                logger.warning("[SUMMARY AI LOW MOVE POOL REFILL] enforce i=%s/%s ok=%s version=%s", i, loops, ok, VERSION)
+            time.sleep(sleep_sec)
+
+    threading.Thread(target=_watch, name="summary-ai-low-move-pool-refill", daemon=True).start()
+    logger.warning("[SUMMARY AI LOW MOVE POOL REFILL] watcher started version=%s", VERSION)
+
+
 def _strict_score_floor() -> float:
     return max(
         0.01,
@@ -211,6 +367,8 @@ def install() -> bool:
     _install_final_gate_relax_patch()
     _install_direct_dispatch_patch()
     _install_sell_short_ok_filter_patch()
+    _install_low_move_pool_refill_patch()
+    _start_low_move_pool_watcher()
 
     if _INSTALLED:
         logger.warning("[SUMMARY AI MORE CANDIDATES PATCH] already installed")
@@ -244,12 +402,13 @@ def install() -> bool:
             logger.error("[SUMMARY AI MORE CANDIDATES PATCH] runner.run_summary_ai_entry_from_df not callable")
             return False
 
-        if getattr(original, "_summary_ai_more_candidates_v15", False):
+        if getattr(original, "_summary_ai_more_candidates_v16", False):
             _INSTALLED = True
             return True
 
         @functools.wraps(original)
         def _wrapped_run_summary_ai_entry_from_df(*args: Any, **kwargs: Any):
+            _install_low_move_pool_refill_patch(reason="before_run")
             explicit_top_n = any(k in kwargs for k in ("top_n", "max_candidates", "candidate_limit"))
             if not explicit_top_n:
                 kwargs["top_n"] = top_n
@@ -270,7 +429,7 @@ def install() -> bool:
 
             score_changes = _clamp_summary_ai_scores(kwargs)
             logger.warning(
-                "[SUMMARY AI MORE CANDIDATES PATCH] run source=%s interval=%s top_n=%s max_candidates=%s candidate_limit=%s tonosama_max=%s bypass_slope=%s explicit_top_n=%s score_changes=%s sell_short_ok_prefilter=True version=Ver1.5-SUMMARY-AI-STRICT-MIN3-CANDIDATE-REFILL",
+                "[SUMMARY AI MORE CANDIDATES PATCH] run source=%s interval=%s top_n=%s max_candidates=%s candidate_limit=%s tonosama_max=%s bypass_slope=%s explicit_top_n=%s score_changes=%s sell_short_ok_prefilter=True low_move_pool_refill=%s version=%s",
                 kwargs.get("source", "SUMMARY"),
                 kwargs.get("interval", 1),
                 kwargs.get("top_n"),
@@ -280,6 +439,8 @@ def install() -> bool:
                 bypass_slope,
                 explicit_top_n,
                 score_changes,
+                _LOW_MOVE_POOL_PATCHED,
+                VERSION,
             )
             return original(*args, **kwargs)
 
@@ -288,16 +449,18 @@ def install() -> bool:
         _wrapped_run_summary_ai_entry_from_df._summary_ai_more_candidates_v13 = True  # type: ignore[attr-defined]
         _wrapped_run_summary_ai_entry_from_df._summary_ai_more_candidates_v14 = True  # type: ignore[attr-defined]
         _wrapped_run_summary_ai_entry_from_df._summary_ai_more_candidates_v15 = True  # type: ignore[attr-defined]
+        _wrapped_run_summary_ai_entry_from_df._summary_ai_more_candidates_v16 = True  # type: ignore[attr-defined]
         _wrapped_run_summary_ai_entry_from_df._original = original  # type: ignore[attr-defined]
         runner.run_summary_ai_entry_from_df = _wrapped_run_summary_ai_entry_from_df
 
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY AI MORE CANDIDATES PATCH] installed top_n=%s tonosama_max=%s bypass_slope=%s strict_min=%.2f final_gate_relax=True direct_dispatch=True sell_short_ok_prefilter=True version=Ver1.5-SUMMARY-AI-STRICT-MIN3-CANDIDATE-REFILL",
+            "[SUMMARY AI MORE CANDIDATES PATCH] installed top_n=%s tonosama_max=%s bypass_slope=%s strict_min=%.2f final_gate_relax=True direct_dispatch=True sell_short_ok_prefilter=True low_move_pool_refill=True version=%s",
             top_n,
             tonosama_max,
             bypass_slope,
             _strict_score_floor(),
+            VERSION,
         )
         return True
     except Exception:
@@ -305,4 +468,4 @@ def install() -> bool:
         return False
 
 
-__all__ = ["install"]
+__all__ = ["install", "VERSION"]
