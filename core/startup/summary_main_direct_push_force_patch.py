@@ -1,17 +1,16 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_main_direct_push_force_patch.py
-# Version: V3-FORCE-MAIN-DIRECT-PUSH-1M-HISTORY
+# Version: V4-FORCE-MAIN-DIRECT-PUSH-1M-ASYNC-STORE
 # ------------------------------------------------------------
 # Force main.py 1m summary tick to avoid heavy runner paths.
-# V3 uses summary_main_memory_latest_1m_patch._build_memory_1m_summary first
-# and stores both latest/merged and summary_history(tf=1).
 #
-# Fix:
-#   - V2 stored set_push_summary / set_merged_summary only.
-#   - When this forced path bypassed summary_main_memory_latest_1m_patch._publish_latest,
-#     SUMMARY HISTORY GET tf=1 source=push stayed rows=0.
-#   - V3 explicitly calls set_summary_history(tf=1, df=history/latest df, source="push").
+# V4 fix:
+#   - In main.py, 1m rows were built in 1-3 seconds, but _store() could block
+#     before async Summary-AI submission.  The parent tick then waited ~25s and
+#     SUMMARY AI never started in the current minute.
+#   - Publish lightweight attrs synchronously, submit Summary-AI immediately,
+#     and run expensive context setter calls in a daemon executor.
 # ============================================================
 from __future__ import annotations
 
@@ -27,10 +26,11 @@ from typing import Any, Optional
 import pandas as pd
 
 logger = logging.getLogger(__name__)
-VERSION = "V3-FORCE-MAIN-DIRECT-PUSH-1M-HISTORY"
+VERSION = "V4-FORCE-MAIN-DIRECT-PUSH-1M-ASYNC-STORE"
 _PATCHED = False
 _WATCHER_STARTED = False
 _AI_EXECUTOR: ThreadPoolExecutor | None = None
+_STORE_EXECUTOR: ThreadPoolExecutor | None = None
 _AI_LOCK = threading.RLock()
 _AI_RUNNING: set[str] = set()
 _ORIGINAL_JOB_SUMMARY = None
@@ -74,6 +74,13 @@ def _executor() -> ThreadPoolExecutor:
     if _AI_EXECUTOR is None:
         _AI_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, _env_int("SUMMARY_FORCE_DIRECT_AI_WORKERS", 1)), thread_name_prefix="summary-force-direct-ai")
     return _AI_EXECUTOR
+
+
+def _store_executor() -> ThreadPoolExecutor:
+    global _STORE_EXECUTOR
+    if _STORE_EXECUTOR is None:
+        _STORE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="summary-force-direct-store")
+    return _STORE_EXECUTOR
 
 
 def _dt_key(now: Any) -> str:
@@ -168,6 +175,68 @@ def _call_context_method(obj: Any, fn_name: str, df: pd.DataFrame) -> bool:
     return False
 
 
+def _assign_attrs(obj: Any, hist: pd.DataFrame, latest: pd.DataFrame) -> None:
+    for name, value in (
+        ("summary_1m_df", hist),
+        ("latest_summary_1m_df", latest),
+        ("summary_1m_latest_df", latest),
+        ("push_summary_1", latest),
+        ("push_summary_1min", latest),
+        ("push_summary_1m_df", hist),
+        ("push_merged_summary_1", latest),
+        ("push_merged_summary_1min", latest),
+        ("push_merged_summary_1m_df", latest),
+        ("merged_summary_1", latest),
+        ("merged_summary_1min", latest),
+    ):
+        try:
+            setattr(obj, name, value.copy(deep=False))
+        except Exception:
+            pass
+
+
+def _context_store(hist: pd.DataFrame, latest: pd.DataFrame, *, t0: float) -> None:
+    stored: dict[str, Any] = {}
+    try:
+        from global_state import global_data
+        for fn_name, value in (
+            ("set_summary_history", hist),
+            ("set_push_summary", latest),
+            ("set_merged_summary", latest),
+            ("set_push_merged_summary", latest),
+            ("set_latest_summary", latest),
+        ):
+            stored[f"global_state.{fn_name}"] = _call_context_method(global_data, fn_name, value)
+    except Exception:
+        logger.debug("[SUMMARY FORCE DIRECT 1M] global_state context store skipped", exc_info=True)
+
+    try:
+        from core.global_context.context import global_data as GD
+        for fn_name, value in (
+            ("set_summary_history", hist),
+            ("set_push_summary", latest),
+            ("set_merged_summary", latest),
+            ("set_push_merged_summary", latest),
+            ("set_latest_summary", latest),
+        ):
+            stored[f"core_context.{fn_name}"] = _call_context_method(GD, fn_name, value)
+    except Exception:
+        logger.debug("[SUMMARY FORCE DIRECT 1M] core context store skipped", exc_info=True)
+
+    try:
+        logger.warning(
+            "[SUMMARY FORCE DIRECT 1M] context store done hist_rows=%s latest_rows=%s latest_dt=%s stored=%s elapsed=%.3fs version=%s",
+            len(hist),
+            len(latest),
+            hist["datetime"].max() if "datetime" in hist.columns else None,
+            stored,
+            time.perf_counter() - t0,
+            VERSION,
+        )
+    except Exception:
+        pass
+
+
 def _store(df: pd.DataFrame) -> None:
     if df is None or df.empty:
         return
@@ -179,58 +248,36 @@ def _store(df: pd.DataFrame) -> None:
     except Exception:
         latest = hist.copy()
 
+    t0 = time.perf_counter()
     try:
         from global_state import global_data
-        for name, value in (
-            ("summary_1m_df", hist.copy()),
-            ("latest_summary_1m_df", latest.copy()),
-            ("summary_1m_latest_df", latest.copy()),
-            ("push_summary_1", latest.copy()),
-            ("push_summary_1min", latest.copy()),
-            ("push_summary_1m_df", hist.copy()),
-            ("push_merged_summary_1", latest.copy()),
-            ("push_merged_summary_1min", latest.copy()),
-            ("push_merged_summary_1m_df", latest.copy()),
-            ("merged_summary_1", latest.copy()),
-            ("merged_summary_1min", latest.copy()),
-        ):
-            try:
-                setattr(global_data, name, value)
-            except Exception:
-                pass
-        # global_state 側にもメソッドがある場合はhistoryを明示保存。
-        for fn_name, value in (
-            ("set_summary_history", hist.copy()),
-            ("set_push_summary", latest.copy()),
-            ("set_merged_summary", latest.copy()),
-            ("set_push_merged_summary", latest.copy()),
-            ("set_latest_summary", latest.copy()),
-        ):
-            _call_context_method(global_data, fn_name, value)
+        _assign_attrs(global_data, hist, latest)
+    except Exception:
+        pass
+    try:
+        from core.global_context.context import global_data as GD
+        _assign_attrs(GD, hist, latest)
     except Exception:
         pass
 
-    try:
-        from core.global_context.context import global_data as GD
-        stored = {}
-        for fn_name, value in (
-            ("set_summary_history", hist.copy()),
-            ("set_push_summary", latest.copy()),
-            ("set_merged_summary", latest.copy()),
-            ("set_push_merged_summary", latest.copy()),
-            ("set_latest_summary", latest.copy()),
-        ):
-            stored[fn_name] = _call_context_method(GD, fn_name, value)
-        logger.warning(
-            "[SUMMARY FORCE DIRECT 1M] stored latest/history tf=1 hist_rows=%s latest_rows=%s latest_dt=%s stored=%s version=%s",
-            len(hist),
-            len(latest),
-            hist["datetime"].max() if "datetime" in hist.columns else None,
-            stored,
-            VERSION,
-        )
-    except Exception:
-        logger.debug("[SUMMARY FORCE DIRECT 1M] context store skipped", exc_info=True)
+    async_context = _env_bool("SUMMARY_FORCE_DIRECT_ASYNC_CONTEXT_STORE", True)
+    if async_context:
+        try:
+            _store_executor().submit(_context_store, hist.copy(deep=False), latest.copy(deep=False), t0=t0)
+        except Exception:
+            logger.debug("[SUMMARY FORCE DIRECT 1M] async context store submit failed", exc_info=True)
+    else:
+        _context_store(hist, latest, t0=t0)
+
+    logger.warning(
+        "[SUMMARY FORCE DIRECT 1M] fast stored latest/history attrs tf=1 hist_rows=%s latest_rows=%s latest_dt=%s context_async=%s elapsed=%.3fs version=%s",
+        len(hist),
+        len(latest),
+        hist["datetime"].max() if "datetime" in hist.columns else None,
+        async_context,
+        time.perf_counter() - t0,
+        VERSION,
+    )
 
 
 def _submit_ai(df: pd.DataFrame, now: dt.datetime, run_entry: bool) -> None:
@@ -268,10 +315,10 @@ def _patch_once(reason: str = "install") -> bool:
     try:
         import scheduler_jobs.summary.runner_core as rc
         current = getattr(rc, "job_summary", None)
-        if getattr(current, "_summary_force_direct_v3", False):
+        if getattr(current, "_summary_force_direct_v4", False):
             return True
         if _ORIGINAL_JOB_SUMMARY is None and callable(current):
-            _ORIGINAL_JOB_SUMMARY = current
+            _ORIGINAL_JOB_SUMMARY = getattr(current, "_original", current)
         orig = _ORIGINAL_JOB_SUMMARY if callable(_ORIGINAL_JOB_SUMMARY) else current
 
         def job_summary_force(interval: int, display: bool = True, now: Optional[dt.datetime] = None, run_entry: bool = True, **kwargs) -> pd.DataFrame:
@@ -284,7 +331,7 @@ def _patch_once(reason: str = "install") -> bool:
             if df is not None and not df.empty:
                 _store(df)
                 _submit_ai(df, now_i, run_entry)
-                logger.warning("[SUMMARY FORCE DIRECT 1M] return interval=1 rows=%s elapsed=%.3fs mode=forced_direct_v3", len(df), time.perf_counter() - t0)
+                logger.warning("[SUMMARY FORCE DIRECT 1M] return interval=1 rows=%s elapsed=%.3fs mode=forced_direct_v4", len(df), time.perf_counter() - t0)
                 return df
             raw_rows = _raw_memory_rows()
             if _env_bool("SUMMARY_FORCE_DIRECT_NO_ORIGINAL_FALLBACK_WHEN_RAW_EXISTS", True) and raw_rows > 0:
@@ -300,6 +347,7 @@ def _patch_once(reason: str = "install") -> bool:
         job_summary_force._summary_force_direct_v1 = True  # type: ignore[attr-defined]
         job_summary_force._summary_force_direct_v2 = True  # type: ignore[attr-defined]
         job_summary_force._summary_force_direct_v3 = True  # type: ignore[attr-defined]
+        job_summary_force._summary_force_direct_v4 = True  # type: ignore[attr-defined]
         job_summary_force._original = orig  # type: ignore[attr-defined]
         rc.job_summary = job_summary_force
         rc.run_push_summary_job = lambda interval=1, display=True, now=None, run_entry=True, **kwargs: job_summary_force(int(interval), display=display, now=now, run_entry=run_entry, **kwargs)
@@ -327,6 +375,7 @@ def _watcher() -> None:
 def install() -> bool:
     global _PATCHED, _WATCHER_STARTED
     os.environ.setdefault("SUMMARY_FORCE_DIRECT_NO_ORIGINAL_FALLBACK_WHEN_RAW_EXISTS", "1")
+    os.environ.setdefault("SUMMARY_FORCE_DIRECT_ASYNC_CONTEXT_STORE", "1")
     ok = _patch_once(reason="install")
     if ok and not _WATCHER_STARTED and _env_bool("SUMMARY_FORCE_DIRECT_WATCHER", True):
         _WATCHER_STARTED = True
