@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/summary/engine/push_summary_engine.py
-# Version: Ver1.2-PUSH-EMPTY-NO-PREVIOUS-REUSE
+# Version: Ver1.2.1-PUSH-EMPTY-NO-PREVIOUS-REUSE
 #          -PUSH-ONLY
 #          -PIPELINE-FIRST
 #          -IMPORT-COMPAT
@@ -37,10 +37,6 @@ except Exception:
     run_data_quality_checks = None
 
 
-# ============================================================
-# basic helpers
-# ============================================================
-
 def _resolve_callable(candidates: list[tuple[str, str]]) -> Optional[Callable]:
     for module_name, func_name in candidates:
         try:
@@ -51,13 +47,7 @@ def _resolve_callable(candidates: list[tuple[str, str]]) -> Optional[Callable]:
                 return fn
             logger.warning("[PUSH SUMMARY ENGINE] candidate attribute missing: %s.%s", module_name, func_name)
         except Exception as e:
-            logger.warning(
-                "[PUSH SUMMARY ENGINE] candidate import failed: %s.%s: %s: %s",
-                module_name,
-                func_name,
-                type(e).__name__,
-                e,
-            )
+            logger.warning("[PUSH SUMMARY ENGINE] candidate import failed: %s.%s: %s: %s", module_name, func_name, type(e).__name__, e)
     return None
 
 
@@ -83,16 +73,7 @@ def _safe_copy_df(value: Any) -> pd.DataFrame:
     if isinstance(value, tuple) and len(value) >= 1 and isinstance(value[0], pd.DataFrame):
         return value[0].copy()
     if isinstance(value, dict):
-        for key in (
-            "result_df",
-            "merged_df",
-            "df",
-            "summary_df",
-            "output_df",
-            "display_df",
-            "latest_df",
-            "latest_summary_df",
-        ):
+        for key in ("result_df", "merged_df", "df", "summary_df", "output_df", "display_df", "latest_df", "latest_summary_df"):
             v = value.get(key)
             if isinstance(v, pd.DataFrame):
                 return v.copy()
@@ -215,10 +196,7 @@ def _normalize_push_source_df(df: pd.DataFrame) -> pd.DataFrame:
         return out
     out = _ensure_symbol(out)
     out = _ensure_datetime(out)
-    out = _coalesce_numeric_columns(out, "close", [
-        "close", "close_price", "price", "Price", "current_price", "CurrentPrice",
-        "last_price", "LastPrice", "Close", "ClosePrice",
-    ])
+    out = _coalesce_numeric_columns(out, "close", ["close", "close_price", "price", "Price", "current_price", "CurrentPrice", "last_price", "LastPrice", "Close", "ClosePrice"])
     out = _coalesce_numeric_columns(out, "open", ["open", "open_price", "Open", "OpenPrice"])
     out = _coalesce_numeric_columns(out, "high", ["high", "high_price", "High", "HighPrice"])
     out = _coalesce_numeric_columns(out, "low", ["low", "low_price", "Low", "LowPrice"])
@@ -231,9 +209,12 @@ def _normalize_push_source_df(df: pd.DataFrame) -> pd.DataFrame:
                     out[c] = pd.to_numeric(out[c], errors="coerce").combine_first(pd.to_numeric(out["close"], errors="coerce"))
                 except Exception:
                     pass
-        out.setdefault("close_price", out["close"])
-        out.setdefault("price", out["close"])
-        out.setdefault("current_price", out["close"])
+        if "close_price" not in out.columns:
+            out["close_price"] = out["close"]
+        if "price" not in out.columns:
+            out["price"] = out["close"]
+        if "current_price" not in out.columns:
+            out["current_price"] = out["close"]
     if "open" in out.columns and "open_price" not in out.columns:
         out["open_price"] = out["open"]
     if "high" in out.columns and "high_price" not in out.columns:
@@ -341,15 +322,7 @@ def _resolve_push_source_df() -> pd.DataFrame:
 
 def _resolve_summary_source_df(interval: int, *, push_df: pd.DataFrame) -> pd.DataFrame:
     tf = int(interval)
-    df = _get_from_global_data([
-        f"push_summary_{tf}min",
-        f"push_summary_{tf}",
-        f"summary_{tf}min_df",
-        f"summary_df_{tf}min",
-        f"latest_summary_{tf}min",
-        f"push_merged_summary_{tf}min",
-        f"push_merged_summary_{tf}",
-    ])
+    df = _get_from_global_data([f"push_summary_{tf}min", f"push_summary_{tf}", f"summary_{tf}min_df", f"summary_df_{tf}min", f"latest_summary_{tf}min", f"push_merged_summary_{tf}min", f"push_merged_summary_{tf}"])
     if (not isinstance(df, pd.DataFrame)) or df.empty:
         getter = _safe_attr(global_data, "get_push_summary", None)
         if callable(getter):
@@ -378,10 +351,6 @@ def _resolve_summary_source_df(interval: int, *, push_df: pd.DataFrame) -> pd.Da
     _log_df_stats(f"resolved push summary source interval={tf}", out)
     return out
 
-
-# ============================================================
-# maturity / latest-only probes
-# ============================================================
 
 def _is_latest_only_frame(df: pd.DataFrame) -> tuple[bool, float, int, int]:
     if not isinstance(df, pd.DataFrame) or df.empty or "symbol" not in df.columns:
@@ -427,16 +396,9 @@ def _maturity_profile(df: pd.DataFrame) -> dict:
 
 def _looks_immature(df: pd.DataFrame) -> tuple[bool, dict]:
     prof = _maturity_profile(df)
-    immature = prof["rows"] > 0 and (
-        (prof["technical_ready_rows"] == 0 and prof["hist_ge3"] == 0 and prof["hist_max"] <= 2.0)
-        or (prof["score_nonzero"] == 0 and prof["score_buy_nonzero"] == 0 and prof["score_sell_nonzero"] == 0)
-    )
+    immature = prof["rows"] > 0 and ((prof["technical_ready_rows"] == 0 and prof["hist_ge3"] == 0 and prof["hist_max"] <= 2.0) or (prof["score_nonzero"] == 0 and prof["score_buy_nonzero"] == 0 and prof["score_sell_nonzero"] == 0))
     return immature, prof
 
-
-# ============================================================
-# direct PUSH OHLC fallback
-# ============================================================
 
 def _calc_rsi_direct(close: pd.Series, period: int = 14) -> pd.Series:
     try:
@@ -479,28 +441,23 @@ def _build_direct_ohlc_from_push_source(push_df: pd.DataFrame, *, interval: int)
         except Exception:
             return ""
 
-    bars = (
-        ticks.groupby(["symbol", "_slot"], as_index=False)
-        .agg(
-            symbolname=("symbolname", _last_nonempty),
-            open=("close", "first"),
-            high=("high", "max"),
-            low=("low", "min"),
-            close=("close", "last"),
-            volume=("volume", "max"),
-            tick_count=("close", "count"),
-            first_tick_at=("datetime", "min"),
-            last_tick_at=("datetime", "max"),
-        )
-        .rename(columns={"_slot": "datetime"})
-    )
+    bars = ticks.groupby(["symbol", "_slot"], as_index=False).agg(
+        symbolname=("symbolname", _last_nonempty),
+        open=("close", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "max"),
+        tick_count=("close", "count"),
+        first_tick_at=("datetime", "min"),
+        last_tick_at=("datetime", "max"),
+    ).rename(columns={"_slot": "datetime"})
     for c in ("open", "high", "low", "close", "volume"):
         if c in bars.columns:
             bars[c] = pd.to_numeric(bars[c], errors="coerce")
     bars = bars.dropna(subset=["symbol", "datetime", "close"]).copy()
     if bars.empty:
         return pd.DataFrame()
-
     parts = []
     for _sym, one in bars.groupby("symbol", sort=False):
         one = one.copy().sort_values("datetime", kind="stable")
@@ -540,16 +497,8 @@ def _build_direct_ohlc_from_push_source(push_df: pd.DataFrame, *, interval: int)
     return out.reset_index(drop=True)
 
 
-# ============================================================
-# push runner
-# ============================================================
-
 def _call_summary_fn(fn: Callable, *, interval: int, label: str) -> pd.DataFrame:
-    for call in (
-        lambda: fn(interval=interval),
-        lambda: fn(interval),
-        lambda: fn(),
-    ):
+    for call in (lambda: fn(interval=interval), lambda: fn(interval), lambda: fn()):
         try:
             return _safe_copy_df(call())
         except TypeError:
@@ -565,38 +514,15 @@ def _run_push_summary(interval: int, *, summary_df: pd.DataFrame, push_df: pd.Da
     if fn is None:
         logger.warning("[PUSH SUMMARY ENGINE] build_incremental_summary unavailable")
         return pd.DataFrame()
-
     module_name = getattr(fn, "__module__", "")
     func_name = getattr(fn, "__name__", "")
-
     if module_name == "trading.summary.pipeline.summary_pipeline" and func_name == "run_summary_pipeline":
         try:
-            out = fn(
-                summary_df=summary_df,
-                push_df=push_df,
-                interval=interval,
-                evaluate_signals=True,
-                latest_only=False,
-                recent_bars_per_symbol=120,
-            )
+            out = fn(summary_df=summary_df, push_df=push_df, interval=interval, evaluate_signals=True, latest_only=False, recent_bars_per_symbol=120)
             out = _safe_copy_df(out)
             latest_only, ratio, one_bar, total = _is_latest_only_frame(out)
             immature, prof = _looks_immature(out)
-            logger.info(
-                "[PUSH SUMMARY ENGINE] pipeline interval=%s summary_rows=%s push_rows=%s out_rows=%s latest_only=%s ratio=%.4f one_bar=%s total=%s immature=%s hist_max=%s ready_rows=%s score_nonzero=%s",
-                interval,
-                len(summary_df),
-                len(push_df),
-                len(out),
-                latest_only,
-                ratio,
-                one_bar,
-                total,
-                immature,
-                prof.get("hist_max", 0.0),
-                prof.get("technical_ready_rows", 0),
-                prof.get("score_nonzero", 0),
-            )
+            logger.info("[PUSH SUMMARY ENGINE] pipeline interval=%s summary_rows=%s push_rows=%s out_rows=%s latest_only=%s ratio=%.4f one_bar=%s total=%s immature=%s hist_max=%s ready_rows=%s score_nonzero=%s", interval, len(summary_df), len(push_df), len(out), latest_only, ratio, one_bar, total, immature, prof.get("hist_max", 0.0), prof.get("technical_ready_rows", 0), prof.get("score_nonzero", 0))
             if out.empty and not push_df.empty:
                 logger.warning("[PUSH SUMMARY ENGINE] pipeline returned empty interval=%s push_rows=%s -> direct OHLC fallback", interval, len(push_df))
                 out = _build_direct_ohlc_from_push_source(push_df, interval=interval)
@@ -605,15 +531,10 @@ def _run_push_summary(interval: int, *, summary_df: pd.DataFrame, push_df: pd.Da
         except Exception:
             logger.exception("[PUSH SUMMARY ENGINE] run_summary_pipeline failed interval=%s", interval)
             return pd.DataFrame()
-
     df = _call_summary_fn(fn, interval=interval, label="push summary")
     logger.info("[PUSH SUMMARY TRACE] interval=%s runner_result_rows=%s latest_dt=%s", interval, len(df), _safe_latest_dt(df))
     return df
 
-
-# ============================================================
-# quality / store
-# ============================================================
 
 def _normalize_for_source(df: pd.DataFrame, source_name: str) -> pd.DataFrame:
     out = _normalize_summary_df(df)
@@ -656,21 +577,7 @@ def _should_store_push_summary(df: pd.DataFrame, interval: int) -> bool:
         return False
     latest_only, ratio, one_bar, total = _is_latest_only_frame(df)
     immature, prof = _looks_immature(df)
-    logger.info(
-        "[PUSH SUMMARY ENGINE] store probe interval=%s latest_only=%s ratio=%.4f one_bar=%s total=%s immature=%s rows=%s symbols=%s ready_rows=%s hist_ge3=%s hist_max=%s score_nonzero=%s",
-        interval,
-        latest_only,
-        ratio,
-        one_bar,
-        total,
-        immature,
-        prof.get("rows", 0),
-        prof.get("symbols", 0),
-        prof.get("technical_ready_rows", 0),
-        prof.get("hist_ge3", 0),
-        prof.get("hist_max", 0.0),
-        prof.get("score_nonzero", 0),
-    )
+    logger.info("[PUSH SUMMARY ENGINE] store probe interval=%s latest_only=%s ratio=%.4f one_bar=%s total=%s immature=%s rows=%s symbols=%s ready_rows=%s hist_ge3=%s hist_max=%s score_nonzero=%s", interval, latest_only, ratio, one_bar, total, immature, prof.get("rows", 0), prof.get("symbols", 0), prof.get("technical_ready_rows", 0), prof.get("hist_ge3", 0), prof.get("hist_max", 0.0), prof.get("score_nonzero", 0))
     if latest_only and total <= max(3, prof.get("symbols", 0)):
         return False
     if immature and prof.get("rows", 0) <= max(5, prof.get("symbols", 0) + 2):
@@ -713,21 +620,16 @@ def _store_push_frame(interval: int, push_df: pd.DataFrame) -> None:
             logger.exception("[PUSH SUMMARY ENGINE] set_push_summary failed interval=%s", interval)
 
 
-# ============================================================
-# public
-# ============================================================
-
 def build_summary(interval: int = 1) -> pd.DataFrame:
     """
     PUSH専用 summary engine。
     ranking へは絶対にフォールバックしない。
 
-    Ver1.2:
+    Ver1.2.1:
     push_rows=0 のとき、前回/前日の push_merged_summary を再保存しない。
     これにより、前日巨大キャッシュを毎分 pipeline に渡して timeout する問題を防ぐ。
     """
     logger.info("🚀 push_summary_engine START interval=%s", interval)
-
     push_source_df = _resolve_push_source_df()
     if push_source_df.empty:
         empty = pd.DataFrame()
@@ -735,16 +637,13 @@ def build_summary(interval: int = 1) -> pd.DataFrame:
         logger.warning("[PUSH SUMMARY ENGINE] push source empty -> no previous merged reuse interval=%s", interval)
         logger.info("✅ push_summary_engine END interval=%s push_rows=0 stored_new_push=False latest_dt=None", interval)
         return empty
-
     summary_df = _resolve_summary_source_df(interval, push_df=push_source_df)
     push_df = _run_push_summary(interval=interval, summary_df=summary_df, push_df=push_source_df)
     push_df = _normalize_for_source(push_df, "push")
     push_df = _filter_same_day(push_df, ref_df=push_source_df, today_only=True)
     push_df = _run_quality_engine(push_df, interval=interval)
-
     _log_df_stats("push summary", push_df)
     _store_push_frame(interval=interval, push_df=push_df)
-
     push_rows = len(push_df) if isinstance(push_df, pd.DataFrame) else 0
     stored_new_push = False
     if push_rows > 0 and _should_store_push_summary(push_df, interval=interval):
@@ -754,7 +653,6 @@ def build_summary(interval: int = 1) -> pd.DataFrame:
         logger.warning("[PUSH SUMMARY ENGINE] overwrite skipped by maturity/latest-only guard interval=%s push_rows=%s", interval, push_rows)
     else:
         logger.warning("[PUSH SUMMARY ENGINE] skip PUSH merged_summary overwrite because push_rows=0 interval=%s", interval)
-
     logger.info("✅ push_summary_engine END interval=%s push_rows=%d stored_new_push=%s latest_dt=%s", interval, push_rows, stored_new_push, _safe_latest_dt(push_df))
     return push_df if isinstance(push_df, pd.DataFrame) else pd.DataFrame()
 
