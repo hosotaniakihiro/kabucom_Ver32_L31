@@ -1,11 +1,18 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/final_board_guard_signature_compat_patch.py
-# Version: V5-SUMMARY-AI-LOW-MOVE-PREFILTER
+# Version: V6-SUMMARY-AI-LOW-MOVE-DAY-RANGE-REPAIR
 # ------------------------------------------------------------
 # Purpose:
 #   final_entry_safety_guard_patch Ver12 以降は _board_guard 自体が
 #   4引数対応済みのため、ここで再wrapしない。
+#
+# V6:
+#   - SUMMARY_AI low-move prefilter で high == low == close の最新1本だけを見て
+#     range_pct=0 と誤判定する問題を修正。
+#   - day_high/day_low, high_price/low_price, opening_price/current_price 等を使い、
+#     実際の当日レンジがある場合は range_pct を補完する。
+#   - 低変動ガード自体は緩和しない。補完後も min_range 未満なら従来通り除外。
 #
 # V5:
 #   - 古い V1 watcher が _board_guard を1秒ごとに再wrapする問題を停止。
@@ -29,7 +36,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V5-SUMMARY-AI-LOW-MOVE-PREFILTER"
+VERSION = "V6-SUMMARY-AI-LOW-MOVE-DAY-RANGE-REPAIR"
 _WATCHER_STARTED = False
 _INSTALLED = False
 _LAST_TARGET_ID: int | None = None
@@ -186,7 +193,6 @@ def _latest_age_sec(df: Any) -> tuple[bool, float | None, Any, int, int]:
 
 
 def _install_current_df_freshness_patch() -> bool:
-    """Let SUMMARY_AI safety guard trust the current scored df passed into the runner."""
     global _CURRENT_DF_PATCHED
     if _CURRENT_DF_PATCHED:
         return True
@@ -248,7 +254,6 @@ def _install_current_df_freshness_patch() -> bool:
 
 
 def _install_summary_ai_selection_pool_patch() -> bool:
-    """Keep hard order cap, but let filters choose from more than the top 3."""
     global _SELECTION_PATCHED
     if _SELECTION_PATCHED:
         return True
@@ -277,12 +282,7 @@ def _install_summary_ai_selection_pool_patch() -> bool:
                 pool_n,
                 len(kept),
                 [
-                    {
-                        "symbol": ex._pick_symbol(x),
-                        "side": ex._pick_side(x),
-                        "price": ex._pick_price(x),
-                        "score": round(ex._score_for_side(x), 3),
-                    }
+                    {"symbol": ex._pick_symbol(x), "side": ex._pick_side(x), "price": ex._pick_price(x), "score": round(ex._score_for_side(x), 3)}
                     for x in selected[:10]
                 ],
                 VERSION,
@@ -311,24 +311,56 @@ def _summary_ai_like_row(row: Any) -> bool:
         return False
 
 
-def _range_pct_from_row(row: Any) -> tuple[float, float, float, float, str]:
+def _pick_first_float(d: dict, keys: tuple[str, ...], default: float = 0.0) -> float:
+    for k in keys:
+        v = d.get(k)
+        x = _safe_float(v, 0.0)
+        if x > 0:
+            return x
+    return default
+
+
+def _range_pct_from_row(row: Any) -> tuple[float, float, float, float, str, str]:
     try:
         d = row if isinstance(row, dict) else row.to_dict() if hasattr(row, "to_dict") else {}
-        close = _safe_float(d.get("close") or d.get("close_price") or d.get("price") or d.get("current_price"), 0.0)
-        high = _safe_float(d.get("high") or d.get("high_price") or d.get("day_high"), 0.0)
-        low = _safe_float(d.get("low") or d.get("low_price") or d.get("day_low"), 0.0)
+        close = _pick_first_float(d, ("close", "close_price", "current_price", "price", "last_price"), 0.0)
         symbol = str(d.get("symbol") or d.get("Symbol") or "")
+
+        high = _pick_first_float(d, ("high", "high_price"), 0.0)
+        low = _pick_first_float(d, ("low", "low_price"), 0.0)
+        method = "row_high_low"
+
         if close <= 0:
             close = max(high, low, 1.0)
-        if high <= 0 or low <= 0 or high < low:
-            return 0.0, close, high, low, symbol
-        return float((high - low) / close), close, high, low, symbol
+
+        row_range = ((high - low) / close) if close > 0 and high > 0 and low > 0 and high >= low else 0.0
+        if row_range <= 1e-9:
+            dh = _pick_first_float(d, ("day_high", "today_high", "intraday_high", "session_high", "high_price_day", "range_high"), 0.0)
+            dl = _pick_first_float(d, ("day_low", "today_low", "intraday_low", "session_low", "low_price_day", "range_low"), 0.0)
+            if dh > 0 and dl > 0 and dh >= dl and ((dh - dl) / max(close, 1.0)) > row_range:
+                high, low, method = dh, dl, "day_high_low"
+                row_range = (high - low) / max(close, 1.0)
+
+        if row_range <= 1e-9:
+            oh = _pick_first_float(d, ("opening_price", "open_price", "open", "day_open"), 0.0)
+            if oh > 0 and close > 0 and abs(close - oh) > 0:
+                high, low, method = max(close, oh), min(close, oh), "open_close"
+                row_range = (high - low) / max(close, 1.0)
+
+        rp = _safe_float(d.get("range_pct") or d.get("intraday_range_pct") or d.get("day_range_pct"), 0.0)
+        if rp > 1.0:
+            rp = rp / 100.0
+        if rp > row_range:
+            base_high = max(high, close)
+            base_low = max(0.01, close * (1.0 - rp))
+            high, low, method, row_range = base_high, base_low, "range_pct_col", rp
+
+        return float(max(row_range, 0.0)), close, high, low, symbol, method
     except Exception:
-        return 0.0, 0.0, 0.0, 0.0, ""
+        return 0.0, 0.0, 0.0, 0.0, "", "error"
 
 
 def _install_summary_ai_low_move_prefilter_patch() -> bool:
-    """Reject LOW_MOVE_RANGE_TOO_SMALL before the final 3-row cap so next candidates can fill the slots."""
     global _LOW_MOVE_PREFILTER_PATCHED
     if _LOW_MOVE_PREFILTER_PATCHED:
         return True
@@ -337,7 +369,7 @@ def _install_summary_ai_low_move_prefilter_patch() -> bool:
         cur = getattr(ep, "_allow_summary_ai_liquidity", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_summary_ai_low_move_prefilter_v1", False):
+        if getattr(cur, "_summary_ai_low_move_prefilter_v6", False):
             _LOW_MOVE_PREFILTER_PATCHED = True
             return True
 
@@ -349,12 +381,11 @@ def _install_summary_ai_low_move_prefilter_patch() -> bool:
                 return True
             if not _summary_ai_like_row(row):
                 return True
-            range_pct, close, high, low, sym = _range_pct_from_row(row)
+            range_pct, close, high, low, sym, method = _range_pct_from_row(row)
             min_range = _env_float("ENTRY_ORDER_MIN_RANGE_PCT", _env_float("SUMMARY_AI_MIN_RANGE_PCT", 0.005))
-            # Missing high/low is not fail-open for SUMMARY_AI here; the order builder would reject it anyway.
             if high <= 0 or low <= 0 or range_pct < min_range:
                 logger.warning(
-                    "[entry_pipeline] SUMMARY_AI low-move prefilter skip symbol=%s interval=%s close=%.2f high=%.2f low=%.2f range_pct=%.6f min=%.6f version=%s",
+                    "[entry_pipeline] SUMMARY_AI low-move prefilter skip symbol=%s interval=%s close=%.2f high=%.2f low=%.2f range_pct=%.6f min=%.6f method=%s version=%s",
                     sym or symbol,
                     interval,
                     close,
@@ -362,12 +393,27 @@ def _install_summary_ai_low_move_prefilter_patch() -> bool:
                     low,
                     range_pct,
                     min_range,
+                    method,
                     VERSION,
                 )
                 return False
+            if method != "row_high_low":
+                logger.warning(
+                    "[entry_pipeline] SUMMARY_AI low-move range repaired symbol=%s interval=%s close=%.2f high=%.2f low=%.2f range_pct=%.6f min=%.6f method=%s version=%s",
+                    sym or symbol,
+                    interval,
+                    close,
+                    high,
+                    low,
+                    range_pct,
+                    min_range,
+                    method,
+                    VERSION,
+                )
             return True
 
         _allow_summary_ai_liquidity_low_move._summary_ai_low_move_prefilter_v1 = True  # type: ignore[attr-defined]
+        _allow_summary_ai_liquidity_low_move._summary_ai_low_move_prefilter_v6 = True  # type: ignore[attr-defined]
         _allow_summary_ai_liquidity_low_move._original = cur  # type: ignore[attr-defined]
         ep._allow_summary_ai_liquidity = _allow_summary_ai_liquidity_low_move
         _LOW_MOVE_PREFILTER_PATCHED = True
@@ -379,7 +425,6 @@ def _install_summary_ai_low_move_prefilter_patch() -> bool:
 
 
 def _install_entry_pipeline_exec_cap_patch() -> bool:
-    """Cap actual df_exec rows after all filters. This keeps simultaneous orders <= 3."""
     global _EXEC_CAP_PATCHED
     if _EXEC_CAP_PATCHED:
         return True
