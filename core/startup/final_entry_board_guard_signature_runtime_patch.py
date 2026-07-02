@@ -1,17 +1,18 @@
 # ============================================================
 # File   : core/startup/final_entry_board_guard_signature_runtime_patch.py
-# Version: V4-SUMMARY-AI-BOARD-DELEGATE-ORDER-BUILDER
+# Version: V4.1-SUMMARY-AI-BOARD-DELEGATE-ORDER-BUILDER-STABLE-MARKERS
 # ------------------------------------------------------------
 # 目的:
 #   final_entry_safety_guard_patch._board_guard / _call_board_guard が
 #   他runtime patchにより差し替わっても、4引数呼び出しで TypeError にしない。
 #
-# V4:
+# V4.1:
 #   - SUMMARY_AI候補は板未取得で即 no_order にしない。
 #   - final_entry_safety_guard_patch の内側 wrapper が再度 board_missing を出しても、
 #     protected fallback を通して entry_order_builder 側へ委譲する。
 #   - 成行緩和ではない。entry_order_builder 側の board retry + close/vwap 指値 fallback に進ませる。
-#   - 同じ関数を1秒ごとに何度もwrapし直さない。
+#   - 旧 summary_ai_entry_hook_dataframe_truth_patch watcher が再ラップしないよう、
+#     _final_board_guard_signature_runtime / _final_board_guard_signature_v2 marker を付与する。
 # ============================================================
 from __future__ import annotations
 
@@ -23,7 +24,7 @@ from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V4-SUMMARY-AI-BOARD-DELEGATE-ORDER-BUILDER"
+VERSION = "V4.1-SUMMARY-AI-BOARD-DELEGATE-ORDER-BUILDER-STABLE-MARKERS"
 _INSTALLED = False
 _WATCHER_STARTED = False
 _LAST_BOARD_GUARD_ID: int | None = None
@@ -238,6 +239,8 @@ def _patch_final_safety_fallback(target: Any) -> None:
             return False
 
         _board_missing_fallback_ok_patched._summary_ai_delegate_fallback_v4 = True  # type: ignore[attr-defined]
+        _board_missing_fallback_ok_patched._final_board_guard_signature_runtime = True  # type: ignore[attr-defined]
+        _board_missing_fallback_ok_patched._final_board_guard_signature_v2 = True  # type: ignore[attr-defined]
         _board_missing_fallback_ok_patched._original = old_fallback  # type: ignore[attr-defined]
         target._board_missing_fallback_ok = _board_missing_fallback_ok_patched
         logger.warning("[FINAL BOARD GUARD SIGNATURE] patched _board_missing_fallback_ok version=%s", VERSION)
@@ -258,15 +261,26 @@ def _call_flexible(fn: Callable[..., Any], row: dict, item: dict, symbol: str, s
                 raise e4
 
 
+def _is_signature_runtime(fn: Any) -> bool:
+    return bool(
+        getattr(fn, "_final_board_guard_signature_runtime", False)
+        or getattr(fn, "_final_board_guard_signature_v2", False)
+        or getattr(fn, "_final_board_guard_signature_compat_v4", False)
+    )
+
+
 def _wrap_board_guard(target: Any) -> bool:
     global _LAST_BOARD_GUARD_ID
     cur = getattr(target, "_board_guard", None)
     if not callable(cur):
         return False
     if getattr(cur, "_final_board_guard_signature_compat_v4", False):
+        # 旧 watcher が安全な signature runtime と認識できるように毎回補強する。
+        cur._final_board_guard_signature_runtime = True  # type: ignore[attr-defined]
+        cur._final_board_guard_signature_v2 = True  # type: ignore[attr-defined]
         _LAST_BOARD_GUARD_ID = id(cur)
         return True
-    if _LAST_BOARD_GUARD_ID == id(cur):
+    if _LAST_BOARD_GUARD_ID == id(cur) and _is_signature_runtime(cur):
         return True
 
     original = cur
@@ -293,10 +307,12 @@ def _wrap_board_guard(target: Any) -> bool:
     _compat_board_guard._final_board_guard_signature_compat_v2 = True  # type: ignore[attr-defined]
     _compat_board_guard._final_board_guard_signature_compat_v3 = True  # type: ignore[attr-defined]
     _compat_board_guard._final_board_guard_signature_compat_v4 = True  # type: ignore[attr-defined]
+    _compat_board_guard._final_board_guard_signature_runtime = True  # type: ignore[attr-defined]
+    _compat_board_guard._final_board_guard_signature_v2 = True  # type: ignore[attr-defined]
     _compat_board_guard._original = original  # type: ignore[attr-defined]
     target._board_guard = _compat_board_guard
     _LAST_BOARD_GUARD_ID = id(_compat_board_guard)
-    logger.warning("[FINAL BOARD GUARD SIGNATURE] wrapped _board_guard original=%s version=%s summary_ai_delegate=%s", getattr(original, "__name__", type(original).__name__), VERSION, _env_bool("ENTRY_SUMMARY_AI_DELEGATE_BOARD_TO_ORDER_BUILDER", True))
+    logger.warning("[FINAL BOARD GUARD SIGNATURE] wrapped _board_guard original=%s version=%s summary_ai_delegate=%s signature_runtime_marker=True", getattr(original, "__name__", type(original).__name__), VERSION, _env_bool("ENTRY_SUMMARY_AI_DELEGATE_BOARD_TO_ORDER_BUILDER", True))
     return True
 
 
@@ -306,9 +322,11 @@ def _wrap_call_board_guard(target: Any) -> bool:
     if not callable(cur):
         return False
     if getattr(cur, "_final_board_guard_signature_call_v4", False):
+        cur._final_board_guard_signature_runtime = True  # type: ignore[attr-defined]
+        cur._final_board_guard_signature_v2 = True  # type: ignore[attr-defined]
         _LAST_CALL_GUARD_ID = id(cur)
         return True
-    if _LAST_CALL_GUARD_ID == id(cur):
+    if _LAST_CALL_GUARD_ID == id(cur) and _is_signature_runtime(cur):
         return True
 
     def _compat_call_board_guard(row: dict, item: dict, symbol: str, side: str) -> bool:
@@ -334,10 +352,12 @@ def _wrap_call_board_guard(target: Any) -> bool:
     _compat_call_board_guard._final_board_guard_signature_call_v2 = True  # type: ignore[attr-defined]
     _compat_call_board_guard._final_board_guard_signature_call_v3 = True  # type: ignore[attr-defined]
     _compat_call_board_guard._final_board_guard_signature_call_v4 = True  # type: ignore[attr-defined]
+    _compat_call_board_guard._final_board_guard_signature_runtime = True  # type: ignore[attr-defined]
+    _compat_call_board_guard._final_board_guard_signature_v2 = True  # type: ignore[attr-defined]
     _compat_call_board_guard._original = cur  # type: ignore[attr-defined]
     target._call_board_guard = _compat_call_board_guard
     _LAST_CALL_GUARD_ID = id(_compat_call_board_guard)
-    logger.warning("[FINAL BOARD GUARD SIGNATURE] wrapped _call_board_guard version=%s summary_ai_delegate=%s", VERSION, _env_bool("ENTRY_SUMMARY_AI_DELEGATE_BOARD_TO_ORDER_BUILDER", True))
+    logger.warning("[FINAL BOARD GUARD SIGNATURE] wrapped _call_board_guard version=%s summary_ai_delegate=%s signature_runtime_marker=True", VERSION, _env_bool("ENTRY_SUMMARY_AI_DELEGATE_BOARD_TO_ORDER_BUILDER", True))
     return True
 
 
@@ -363,14 +383,14 @@ def _patch_once() -> bool:
 def _watch() -> None:
     stable = 0
     last_pair: tuple[int | None, int | None] | None = None
-    for i in range(30):
+    for i in range(45):
         ok = _patch_once()
         pair = (_LAST_BOARD_GUARD_ID, _LAST_CALL_GUARD_ID)
         stable = stable + 1 if ok and pair == last_pair else 0
         last_pair = pair
-        if i in (0, 5, 10, 20, 29):
-            logger.warning("[FINAL BOARD GUARD SIGNATURE] enforce i=%s/30 ok=%s stable=%s version=%s", i, ok, stable, VERSION)
-        if stable >= 3:
+        if i in (0, 5, 10, 20, 30, 44):
+            logger.warning("[FINAL BOARD GUARD SIGNATURE] enforce i=%s/45 ok=%s stable=%s version=%s", i, ok, stable, VERSION)
+        if stable >= 5:
             logger.warning("[FINAL BOARD GUARD SIGNATURE] watcher stable exit i=%s version=%s", i, VERSION)
             return
         time.sleep(1.0)
