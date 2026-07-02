@@ -1,26 +1,26 @@
 # ============================================================
 # File   : trading/entry/summary_ai/executor.py
-# Version: REV7-ROLLING-RETRY-BYPASS-RUNTIME-LOWMOVE-PREFILTER
+# Version: REV8-PROTECT-CORE-FILTER-AND-ROLLING-RETRY
 # ------------------------------------------------------------
 # AI_OK rows -> approved_rows -> entry_pipeline.
 #
-# REV7:
-#   - rolling retry の候補プール作成では runtime patch で置換され得る
-#     _filter_blocked_ai_ok_items を使わず、executor 本体の価格/出来高/日次リスク等の
-#     基本フィルタ _base_filter_blocked_ai_ok_items を直接使う。
-#   - これにより、外側の SUMMARY_AI LOW MOVE PREFILTER が range_pct=0 と誤判定して
-#     AI_OK 8件を1件だけに絞るケースでも、executor 側で未試行候補を繰り上げられる。
-#   - low-move / blowoff / liquidity ガード自体は entry_pipeline 側で従来通り効かせる。
+# REV8:
+#   - Runtime patches may replace _filter_blocked_ai_ok_items with a low-move prefilter.
+#     That can erase AI_OK rows before rolling retry, producing approved=0/no_ai_ok.
+#   - Keep the compatibility hook, but protect it with a short watcher that restores the
+#     executor's core price/liquidity/risk filter. Strict low-move/blowoff/liquidity gates
+#     still run later in entry_pipeline/order_builder.
 #
-# REV6:
-#   - approved候補が entry_pipeline 側の厳密ガードで全滅した場合、
-#     ガードは緩めず、未試行のAI_OK次候補を少数だけ繰り上げて再投入する。
+# REV7:
+#   - rolling retry pool uses _base_filter_blocked_ai_ok_items directly.
 # ============================================================
 from __future__ import annotations
 
 import datetime as dt
 import logging
 import os
+import threading
+import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set
 
 import pandas as pd
@@ -33,7 +33,8 @@ DEFAULT_MAX_ENTRIES = 3
 DEFAULT_MIN_BUY_APPROVED = 0
 DEFAULT_MAX_PRICE_FOR_100_SHARE_ENTRY = 7000.0
 DEFAULT_MIN_PRICE_FOR_ENTRY = 3000.0
-VERSION = "REV7-ROLLING-RETRY-BYPASS-RUNTIME-LOWMOVE-PREFILTER"
+VERSION = "REV8-PROTECT-CORE-FILTER-AND-ROLLING-RETRY"
+_FILTER_WATCHER_STARTED = False
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -279,8 +280,45 @@ def _base_filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dic
 
 
 def _filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Compatibility hook for runtime patches. Core rolling pool intentionally bypasses this hook."""
+    """Compatibility hook. Keep this as the executor core filter; low-move is enforced later."""
     return _base_filter_blocked_ai_ok_items(ok_items)
+
+
+_CORE_FILTER_FUNC = _filter_blocked_ai_ok_items
+try:
+    setattr(_CORE_FILTER_FUNC, "_summary_ai_executor_core_filter_rev8", True)
+except Exception:
+    pass
+
+
+def _ensure_core_filter(reason: str = "manual") -> bool:
+    cur = globals().get("_filter_blocked_ai_ok_items")
+    if cur is _CORE_FILTER_FUNC or getattr(cur, "_summary_ai_executor_core_filter_rev8", False):
+        return True
+    globals()["_filter_blocked_ai_ok_items"] = _CORE_FILTER_FUNC
+    logger.warning("[SUMMARY AI EXECUTOR] restored core filter reason=%s old=%s version=%s", reason, getattr(cur, "__name__", type(cur).__name__), VERSION)
+    return True
+
+
+def _start_filter_watcher() -> None:
+    global _FILTER_WATCHER_STARTED
+    if _FILTER_WATCHER_STARTED or not _env_bool("SUMMARY_AI_PROTECT_CORE_FILTER", True):
+        return
+    _FILTER_WATCHER_STARTED = True
+
+    def _loop() -> None:
+        for i in range(180):
+            try:
+                _ensure_core_filter(reason=f"watcher:{i}")
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+    try:
+        threading.Thread(target=_loop, name="summary-ai-core-filter-watch", daemon=True).start()
+        logger.warning("[SUMMARY AI EXECUTOR] core filter watcher started version=%s", VERSION)
+    except Exception:
+        logger.debug("[SUMMARY AI EXECUTOR] core filter watcher start failed", exc_info=True)
 
 
 def _effective_max_entries(max_entries: int) -> int:
@@ -293,8 +331,6 @@ def _effective_max_entries(max_entries: int) -> int:
 
 
 def _selected_pool(ok_items: List[Dict[str, Any]], *, max_entries: int) -> List[Dict[str, Any]]:
-    # Important: bypass _filter_blocked_ai_ok_items because runtime low-move prefilter may replace it
-    # and collapse AI_OK candidates to one safety-rescued row before rolling retry can work.
     kept = _base_filter_blocked_ai_ok_items(ok_items)
     if not kept:
         return []
@@ -305,6 +341,7 @@ def _selected_pool(ok_items: List[Dict[str, Any]], *, max_entries: int) -> List[
 
 
 def _select_ai_ok_items(ok_items: List[Dict[str, Any]], *, max_entries: int) -> List[Dict[str, Any]]:
+    _ensure_core_filter(reason="select")
     pool = _selected_pool(ok_items, max_entries=max_entries)
     selected = pool[:_effective_max_entries(max_entries)]
     logger.warning("[SUMMARY AI EXECUTOR] top selection requested=%s cap=%s pool=%s ok_total=%s selected=%s version=%s", max_entries, _effective_max_entries(max_entries), len(pool), len(ok_items or []), [{"symbol": _pick_symbol(x), "side": _pick_side(x), "price": _pick_price(x), "conf": round(safe_float(x.get("confidence")), 3), "score": round(_score_for_side(x), 3)} for x in selected], VERSION)
@@ -448,13 +485,15 @@ def build_approved_row(ai_ok_item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_ai_ok_approved_rows(ai_results: Sequence[Dict[str, Any]], *, max_entries: int = DEFAULT_MAX_ENTRIES) -> List[Dict[str, Any]]:
+    _ensure_core_filter(reason="approved_build")
     ok_items = [x for x in ai_results if isinstance(x, dict) and bool(x.get("allow"))]
     approved = [build_approved_row(x) for x in _select_ai_ok_items(ok_items, max_entries=max_entries)]
-    logger.info("[SUMMARY AI EXECUTOR] approved selection max_entries=%s rows=%s", max_entries, len(approved))
+    logger.info("[SUMMARY AI EXECUTOR] approved selection max_entries=%s rows=%s version=%s", max_entries, len(approved), VERSION)
     return approved
 
 
 def _approved_batches(ai_results: Sequence[Dict[str, Any]], *, max_entries: int) -> Iterable[List[Dict[str, Any]]]:
+    _ensure_core_filter(reason="approved_batches")
     ok_items = [x for x in ai_results if isinstance(x, dict) and bool(x.get("allow"))]
     pool = _selected_pool(ok_items, max_entries=max_entries)
     cap = _effective_max_entries(max_entries)
@@ -483,6 +522,7 @@ def _approved_batches(ai_results: Sequence[Dict[str, Any]], *, max_entries: int)
 
 
 def execute_ai_ok_entries_bulk(ai_results: Sequence[Dict[str, Any]], *, df_summary: pd.DataFrame, interval: int | str = 1, max_entries: int = DEFAULT_MAX_ENTRIES, dry_run: bool = True, require_market_open: bool = True, entry_pipeline: Optional[Callable[..., Any]] = None) -> Dict[str, Any]:
+    _ensure_core_filter(reason="execute_start")
     if require_market_open and not is_market_open():
         approved_rows = build_ai_ok_approved_rows(ai_results, max_entries=max_entries)
         return {"executed": False, "dry_run": dry_run, "approved_rows": approved_rows, "result": None, "skip_reason": "market_closed"}
@@ -526,5 +566,7 @@ def execute_ai_ok_entries_bulk(ai_results: Sequence[Dict[str, Any]], *, df_summa
         _cleanup_pending_after_no_order(last_result, all_approved, reason="entry_exception")
         return {"executed": False, "dry_run": False, "approved_rows": all_approved, "result": last_result, "skip_reason": "entry_exception"}
 
+
+_start_filter_watcher()
 
 __all__ = ["DEFAULT_MAX_ENTRIES", "DEFAULT_MIN_BUY_APPROVED", "DEFAULT_MAX_PRICE_FOR_100_SHARE_ENTRY", "DEFAULT_MIN_PRICE_FOR_ENTRY", "build_approved_row", "build_ai_ok_approved_rows", "execute_ai_ok_entries_bulk", "_select_ai_ok_items", "_filter_blocked_ai_ok_items", "_effective_max_entries", "_pick_symbol", "_pick_side", "_row_side", "_row_score_for_side", "_score_for_side", "_sort_key", "_price_bounds", "_entry_price_bounds", "_positive_result"]
