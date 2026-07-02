@@ -1,17 +1,18 @@
 # ============================================================
 # File   : core/startup/ranking_entry_filter_rescue_patch.py
-# Version: V1.6-EARLY-SESSION-TURNOVER-RELAX
+# Version: V1.7-PERIOD-VOLUME-GUARD
 # ------------------------------------------------------------
 # 目的:
 #   スコア上位母数を80位まで広げた後も、
 #   FLAT_PRICE_FILTER_RECURSION救済側だけ max_rank=10 のままで、
 #   rank 11〜30 の高流動性候補が rank_low で落ちる問題を修正。
 #
-# V1.6:
-#   - 09時台のランキング強候補が TURNOVER_NG turnover=3,000〜5,000万で
-#     全落ちしないよう、救済側の既定 min_turnover を 1億 -> 3,000万へ緩和。
-#   - 低出来高は引き続き min_volume=3万でブロック。
-#   - 方向一致 BUY day>=0 / SELL day<=0、価格範囲 300〜7000円は維持。
+# V1.7:
+#   - ランキング由来/殿様イナゴで使う 1分/3分/5分の出来高が、
+#     当日累計出来高の max にならないよう runtime guard を追加。
+#   - PUSH/Ranking の累計出来高は symbol + 当日単位で diff し、
+#     1分/3分/5分足は対象期間内の差分出来高 sum を volume にする。
+#   - 既存のランキング救済条件は V1.6 のまま維持。
 # ============================================================
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 _INSTALLED = False
 _ORIG: Callable[..., tuple[bool, str]] | None = None
 _IN_FILTER = False
+_VOLUME_GUARD_INSTALLED = False
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -193,6 +195,154 @@ def _patched_passes_ranking_only_filters(row, side, prev_h, score, parts):
         _IN_FILTER = False
 
 
+def _period_volume_from_cumulative(df, *, volume_col: str = "volume", datetime_col: str = "datetime"):
+    """累計出来高を symbol + 当日単位で差分化し、対象足出来高へ変換する。"""
+    import pandas as pd
+    import numpy as np
+
+    if df is None or getattr(df, "empty", True) or volume_col not in df.columns:
+        return df
+    out = df.copy()
+    raw = pd.to_numeric(out[volume_col], errors="coerce").fillna(0.0)
+    out["_raw_cumulative_volume"] = raw
+    if "symbol" not in out.columns or datetime_col not in out.columns:
+        out["_period_volume"] = raw.clip(lower=0.0)
+        return out
+    dt_s = pd.to_datetime(out[datetime_col], errors="coerce")
+    out["_trade_date_for_volume"] = dt_s.dt.date
+    out["_volume_order"] = range(len(out))
+    out = out.sort_values(["symbol", "_trade_date_for_volume", datetime_col, "_volume_order"], kind="stable")
+    prev = out.groupby(["symbol", "_trade_date_for_volume"], sort=False)["_raw_cumulative_volume"].shift(1)
+    diff = out["_raw_cumulative_volume"] - prev
+    # 初回行は直前累計が不明なので0扱い。累計リセット/異常なマイナスも0にする。
+    period = diff.where(prev.notna(), 0.0)
+    period = period.where(period >= 0, 0.0).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    out["_period_volume"] = period
+    out = out.sort_values("_volume_order", kind="stable").drop(columns=["_volume_order", "_trade_date_for_volume"], errors="ignore")
+    return out
+
+
+def _install_period_volume_guards() -> bool:
+    """
+    ランキング由来/殿様イナゴの足出来高を、当日累計ではなく期間出来高にする。
+
+    - summary_incremental_engine: PUSH累計出来高をdiffし、1/3/5分足はsum。
+    - ranking_technical_store: ランキング履歴の累計出来高をdiffしてテクニカル計算に使う。
+    """
+    global _VOLUME_GUARD_INSTALLED
+    if _VOLUME_GUARD_INSTALLED:
+        return True
+    ok_any = False
+
+    try:
+        import pandas as pd
+        import trading.summary.engine.summary_incremental_engine as sie
+
+        cur_build = getattr(sie, "_build_bars", None)
+        if callable(cur_build) and not getattr(cur_build, "_period_volume_guard_v17", False):
+            def _patched_build_bars(push_df, interval: int):
+                ticks = sie._normalize_push_df(push_df)
+                if ticks.empty:
+                    return pd.DataFrame()
+
+                interval_n = int(interval)
+                freq = f"{interval_n}min"
+                work = ticks.copy()
+                work["datetime"] = pd.to_datetime(work["datetime"], errors="coerce")
+                work = work.dropna(subset=["datetime"]).copy()
+                work = work.sort_values(["symbol", "datetime"], kind="stable")
+                work = _period_volume_from_cumulative(work, volume_col="volume", datetime_col="datetime")
+                work["_slot"] = work["datetime"].dt.floor(freq)
+                work = work.dropna(subset=["_slot"]).copy()
+
+                def _last_text(s):
+                    x = s.dropna().astype(str)
+                    return x.iloc[-1] if not x.empty else ""
+
+                bars = (
+                    work.groupby(["symbol", "_slot"], as_index=False)
+                    .agg(
+                        symbolname=("symbolname", _last_text),
+                        open=("close", "first"),
+                        high=("high", "max"),
+                        low=("low", "min"),
+                        close=("close", "last"),
+                        volume=("_period_volume", "sum"),
+                        cumulative_volume=("_raw_cumulative_volume", "max"),
+                        tick_count=("close", "count"),
+                        first_tick_at=("datetime", "min"),
+                        last_tick_at=("datetime", "max"),
+                    )
+                    .rename(columns={"_slot": "datetime"})
+                )
+
+                for c in ("open", "high", "low", "close", "volume", "cumulative_volume"):
+                    if c in bars.columns:
+                        bars[c] = pd.to_numeric(bars[c], errors="coerce")
+
+                bars["open_price"] = bars["open"]
+                bars["high_price"] = bars["high"]
+                bars["low_price"] = bars["low"]
+                bars["close_price"] = bars["close"]
+                bars["price"] = bars["close"]
+                bars["current_price"] = bars["close"]
+                bars["date"] = pd.to_datetime(bars["datetime"], errors="coerce").dt.strftime("%Y-%m-%d")
+                bars["time"] = pd.to_datetime(bars["datetime"], errors="coerce").dt.strftime("%H:%M:%S")
+                bars["start_time"] = bars["time"]
+                bars["end_time"] = bars["time"]
+                bars["time_range"] = pd.to_datetime(bars["datetime"], errors="coerce").dt.strftime("%H:%M")
+                bars = bars.dropna(subset=["symbol", "datetime", "close"]).copy()
+                bars = bars.sort_values(["symbol", "datetime"], kind="stable").reset_index(drop=True)
+
+                out = sie._add_indicators(bars, interval_n)
+                sie._log_df_state("built_bars_period_volume_guard", out, interval_n)
+                return out
+
+            _patched_build_bars._period_volume_guard_v17 = True  # type: ignore[attr-defined]
+            _patched_build_bars._original = cur_build  # type: ignore[attr-defined]
+            sie._build_bars = _patched_build_bars
+            ok_any = True
+            logger.warning("[PERIOD VOLUME GUARD] patched summary_incremental_engine._build_bars volume=sum(diff(cumulative))")
+    except Exception:
+        logger.exception("[PERIOD VOLUME GUARD] summary incremental patch failed")
+
+    try:
+        import pandas as pd
+        import trading.ranking.ranking_technical_store as rts
+
+        cur_calc = getattr(rts, "_calculate_technicals", None)
+        if callable(cur_calc) and not getattr(cur_calc, "_period_volume_guard_v17", False):
+            def _patched_calculate_technicals(history):
+                h = history.copy() if isinstance(history, pd.DataFrame) else pd.DataFrame()
+                if h.empty:
+                    return cur_calc(history)
+                if "datetime" in h.columns:
+                    h["datetime"] = pd.to_datetime(h["datetime"], errors="coerce")
+                    h = h.dropna(subset=["datetime"]).copy()
+                if "volume" in h.columns:
+                    h = _period_volume_from_cumulative(h, volume_col="volume", datetime_col="datetime")
+                    h["cumulative_volume"] = h.get("_raw_cumulative_volume", h["volume"])
+                    h["volume"] = h["_period_volume"]
+                if "turnover" in h.columns:
+                    # 売買代金も累計の可能性が高い。volume差分×closeを優先して期間代金にする。
+                    close = pd.to_numeric(h.get("close", 0), errors="coerce").fillna(0.0)
+                    vol = pd.to_numeric(h.get("volume", 0), errors="coerce").fillna(0.0)
+                    h["cumulative_turnover"] = pd.to_numeric(h["turnover"], errors="coerce").fillna(0.0)
+                    h["turnover"] = close * vol
+                return cur_calc(h)
+
+            _patched_calculate_technicals._period_volume_guard_v17 = True  # type: ignore[attr-defined]
+            _patched_calculate_technicals._original = cur_calc  # type: ignore[attr-defined]
+            rts._calculate_technicals = _patched_calculate_technicals
+            ok_any = True
+            logger.warning("[PERIOD VOLUME GUARD] patched ranking_technical_store._calculate_technicals volume=diff(cumulative)")
+    except Exception:
+        logger.exception("[PERIOD VOLUME GUARD] ranking technical patch failed")
+
+    _VOLUME_GUARD_INSTALLED = bool(ok_any)
+    return bool(ok_any)
+
+
 def install() -> bool:
     global _INSTALLED, _ORIG
     if _INSTALLED:
@@ -202,11 +352,12 @@ def install() -> bool:
         os.environ.setdefault("RANKING_ENTRY_RESCUE_MAX_RANK", "30")
         os.environ.setdefault("RANKING_ENTRY_RESCUE_MIN_TURNOVER", "30000000")
         os.environ.setdefault("RANKING_ENTRY_RESCUE_RECURSION_MIN_TURNOVER", "30000000")
+        volume_guard_ok = _install_period_volume_guards()
         import trading.ranking.entry_from_ranking as efr
         cur = getattr(efr, "_passes_ranking_only_filters", None)
         if not callable(cur):
-            logger.warning("[RANKING FILTER RESCUE] target unavailable")
-            return False
+            logger.warning("[RANKING FILTER RESCUE] target unavailable volume_guard_ok=%s", volume_guard_ok)
+            return bool(volume_guard_ok)
         if getattr(cur, "_ranking_filter_rescue_v16", False):
             _INSTALLED = True
             return True
@@ -215,7 +366,7 @@ def install() -> bool:
         _patched_passes_ranking_only_filters._original = cur  # type: ignore[attr-defined]
         efr._passes_ranking_only_filters = _patched_passes_ranking_only_filters
         _INSTALLED = True
-        logger.warning("[RANKING FILTER RESCUE] installed v1.6 enabled=%s min_score=%.1f recursion_min_score=%.1f max_rank=%s recursion_max_rank=%s min_turnover=%.0f recursion_min_turnover=%.0f", _env_bool("RANKING_ENTRY_STRONG_TECH_RESCUE_ENABLED", True), _env_float("RANKING_ENTRY_RESCUE_MIN_SCORE", 60.0), _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_SCORE", 55.0), _env_int("RANKING_ENTRY_RESCUE_MAX_RANK", 30), _env_int("RANKING_ENTRY_RESCUE_RECURSION_MAX_RANK", 30), _env_float("RANKING_ENTRY_RESCUE_MIN_TURNOVER", 30000000.0), _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_TURNOVER", 30000000.0))
+        logger.warning("[RANKING FILTER RESCUE] installed v1.7 enabled=%s volume_guard_ok=%s min_score=%.1f recursion_min_score=%.1f max_rank=%s recursion_max_rank=%s min_turnover=%.0f recursion_min_turnover=%.0f", _env_bool("RANKING_ENTRY_STRONG_TECH_RESCUE_ENABLED", True), volume_guard_ok, _env_float("RANKING_ENTRY_RESCUE_MIN_SCORE", 60.0), _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_SCORE", 55.0), _env_int("RANKING_ENTRY_RESCUE_MAX_RANK", 30), _env_int("RANKING_ENTRY_RESCUE_RECURSION_MAX_RANK", 30), _env_float("RANKING_ENTRY_RESCUE_MIN_TURNOVER", 30000000.0), _env_float("RANKING_ENTRY_RESCUE_RECURSION_MIN_TURNOVER", 30000000.0))
         return True
     except Exception:
         logger.exception("[RANKING FILTER RESCUE] install failed")
