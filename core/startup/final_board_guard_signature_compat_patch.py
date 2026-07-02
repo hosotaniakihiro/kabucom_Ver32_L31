@@ -1,29 +1,18 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/final_board_guard_signature_compat_patch.py
-# Version: V6-SUMMARY-AI-LOW-MOVE-DAY-RANGE-REPAIR
+# Version: V7-SUMMARY-AI-LOW-MOVE-CURRENT-DF-RANGE-REPAIR
 # ------------------------------------------------------------
 # Purpose:
 #   final_entry_safety_guard_patch Ver12 以降は _board_guard 自体が
 #   4引数対応済みのため、ここで再wrapしない。
 #
-# V6:
-#   - SUMMARY_AI low-move prefilter で high == low == close の最新1本だけを見て
-#     range_pct=0 と誤判定する問題を修正。
-#   - day_high/day_low, high_price/low_price, opening_price/current_price 等を使い、
-#     実際の当日レンジがある場合は range_pct を補完する。
-#   - 低変動ガード自体は緩和しない。補完後も min_range 未満なら従来通り除外。
-#
-# V5:
-#   - 古い V1 watcher が _board_guard を1秒ごとに再wrapする問題を停止。
-#   - summary_ai_entry_hook_dataframe_truth_patch 側の旧compat watcherが
-#     再wrapしないよう、現在の native guard に signature marker を付与。
-#   - SUMMARY_AIの上位3件が blowoff で全落ちするケースに備え、候補選択プールだけ広げる。
-#   - 実発注直前の df_exec は最大3件にcapし、同時発注数は増やしすぎない。
-#   - SUMMARY_AI安全鮮度チェックが、現在AIへ渡された最新DFではなく古い
-#     global_data.push_df / raw fallback を見て stale_push_1m になる問題を修正。
-#   - ORDER_BUILD_NG: LOW_MOVE_RANGE_TOO_SMALL を entry_pipeline の3件cap前に除外し、
-#     3枠すべてを低値幅銘柄で浪費しない。
+# V7:
+#   - V6 の day/open/range_pct 補完に加え、現在 SUMMARY_AI へ渡された fresh df から
+#     同一symbolの high_price/low_price/day_high/day_low を補完する。
+#   - entry_pipeline 行が high == low == close に潰れても、AI入力元に当日レンジがあれば
+#     SUMMARY_AI low-move prefilter で誤って range_pct=0 と判定しない。
+#   - 低変動ガード自体は緩めない。補完後も min_range 未満なら従来通り除外。
 # ============================================================
 from __future__ import annotations
 
@@ -36,7 +25,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V6-SUMMARY-AI-LOW-MOVE-DAY-RANGE-REPAIR"
+VERSION = "V7-SUMMARY-AI-LOW-MOVE-CURRENT-DF-RANGE-REPAIR"
 _WATCHER_STARTED = False
 _INSTALLED = False
 _LAST_TARGET_ID: int | None = None
@@ -126,32 +115,24 @@ def _apply(reason: str = "install") -> bool:
     global _LAST_TARGET_ID
     try:
         import core.startup.final_entry_safety_guard_patch as fsg
-
         cur = getattr(fsg, "_board_guard", None)
         if not callable(cur):
             logger.warning("[FINAL BOARD GUARD SIG COMPAT] target _board_guard missing reason=%s version=%s", reason, VERSION)
             return False
-
         base = _unwrap(cur)
         if not callable(base):
             base = cur
-
         _mark_signature_safe(base)
         try:
             fsg._board_guard = base
             fsg._patched_board_guard = base
         except Exception:
             pass
-
         cur_id = id(base)
         if _LAST_TARGET_ID != cur_id or _is_legacy_wrapper(cur):
             logger.warning(
                 "[FINAL BOARD GUARD SIG COMPAT] native guard marked reason=%s unwrapped=%s cur=%s base=%s version=%s",
-                reason,
-                _is_legacy_wrapper(cur),
-                getattr(cur, "__name__", type(cur).__name__),
-                getattr(base, "__name__", type(base).__name__),
-                VERSION,
+                reason, _is_legacy_wrapper(cur), getattr(cur, "__name__", type(cur).__name__), getattr(base, "__name__", type(base).__name__), VERSION,
             )
         _LAST_TARGET_ID = cur_id
         return True
@@ -199,15 +180,13 @@ def _install_current_df_freshness_patch() -> bool:
     try:
         import trading.entry.summary_ai.runner as runner
         import core.startup.summary_ai_candidate_refill_patch as guard
-
         cur_run = getattr(runner, "run_summary_ai_entry_from_df", None)
         cur_reason = getattr(guard, "_summary_ai_entry_unsafe_reason", None)
         if not callable(cur_run) or not callable(cur_reason):
             return False
-        if getattr(cur_run, "_summary_ai_current_df_freshness_v1", False) and getattr(cur_reason, "_summary_ai_current_df_freshness_v1", False):
+        if getattr(cur_run, "_summary_ai_current_df_freshness_v7", False) and getattr(cur_reason, "_summary_ai_current_df_freshness_v7", False):
             _CURRENT_DF_PATCHED = True
             return True
-
         orig_run = cur_run
         orig_reason = cur_reason
 
@@ -239,8 +218,10 @@ def _install_current_df_freshness_patch() -> bool:
             finally:
                 _CURRENT_AI_INPUT.df = old
 
+        _patched_unsafe_reason._summary_ai_current_df_freshness_v7 = True  # type: ignore[attr-defined]
         _patched_unsafe_reason._summary_ai_current_df_freshness_v1 = True  # type: ignore[attr-defined]
         _patched_unsafe_reason._original = orig_reason  # type: ignore[attr-defined]
+        _patched_run_summary_ai_entry_from_df._summary_ai_current_df_freshness_v7 = True  # type: ignore[attr-defined]
         _patched_run_summary_ai_entry_from_df._summary_ai_current_df_freshness_v1 = True  # type: ignore[attr-defined]
         _patched_run_summary_ai_entry_from_df._original = orig_run  # type: ignore[attr-defined]
         guard._summary_ai_entry_unsafe_reason = _patched_unsafe_reason
@@ -259,11 +240,10 @@ def _install_summary_ai_selection_pool_patch() -> bool:
         return True
     try:
         import trading.entry.summary_ai.executor as ex
-
         cur = getattr(ex, "_select_ai_ok_items", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_summary_ai_selection_pool_v1", False):
+        if getattr(cur, "_summary_ai_selection_pool_v7", False):
             _SELECTION_PATCHED = True
             return True
 
@@ -277,18 +257,13 @@ def _install_summary_ai_selection_pool_patch() -> bool:
             selected = sorted(kept, key=ex._sort_key, reverse=True)[:pool_n]
             logger.warning(
                 "[SUMMARY AI EXECUTOR] selection pool requested=%s hard_cap=%s pool=%s ok_total=%s selected_head=%s version=%s",
-                max_entries,
-                hard_cap,
-                pool_n,
-                len(kept),
-                [
-                    {"symbol": ex._pick_symbol(x), "side": ex._pick_side(x), "price": ex._pick_price(x), "score": round(ex._score_for_side(x), 3)}
-                    for x in selected[:10]
-                ],
+                max_entries, hard_cap, pool_n, len(kept),
+                [{"symbol": ex._pick_symbol(x), "side": ex._pick_side(x), "price": ex._pick_price(x), "score": round(ex._score_for_side(x), 3)} for x in selected[:10]],
                 VERSION,
             )
             return selected
 
+        _select_ai_ok_items_pool._summary_ai_selection_pool_v7 = True  # type: ignore[attr-defined]
         _select_ai_ok_items_pool._summary_ai_selection_pool_v1 = True  # type: ignore[attr-defined]
         _select_ai_ok_items_pool._original = cur  # type: ignore[attr-defined]
         ex._select_ai_ok_items = _select_ai_ok_items_pool
@@ -313,27 +288,54 @@ def _summary_ai_like_row(row: Any) -> bool:
 
 def _pick_first_float(d: dict, keys: tuple[str, ...], default: float = 0.0) -> float:
     for k in keys:
-        v = d.get(k)
-        x = _safe_float(v, 0.0)
+        x = _safe_float(d.get(k), 0.0)
         if x > 0:
             return x
     return default
 
 
+def _current_df_symbol_range(symbol: str) -> tuple[float, float, float, str]:
+    try:
+        import pandas as pd
+        df = getattr(_CURRENT_AI_INPUT, "df", None)
+        if not isinstance(df, pd.DataFrame) or df.empty or not symbol or "symbol" not in df.columns:
+            return 0.0, 0.0, 0.0, "none"
+        s = df[df["symbol"].astype(str) == str(symbol)]
+        if s.empty:
+            return 0.0, 0.0, 0.0, "none"
+        if "datetime" in s.columns:
+            try:
+                s = s.assign(_dt=pd.to_datetime(s["datetime"], errors="coerce")).sort_values("_dt")
+            except Exception:
+                pass
+        d = s.iloc[-1].to_dict()
+        close = _pick_first_float(d, ("close", "close_price", "current_price", "price", "last_price"), 0.0)
+        high = _pick_first_float(d, ("high", "high_price", "day_high", "today_high", "intraday_high", "session_high", "opening_price", "open_price", "open", "day_open"), 0.0)
+        low = _pick_first_float(d, ("low", "low_price", "day_low", "today_low", "intraday_low", "session_low", "opening_price", "open_price", "open", "day_open"), 0.0)
+        # If opening price was used as one side, combine it with close to form a real observed move.
+        op = _pick_first_float(d, ("opening_price", "open_price", "open", "day_open"), 0.0)
+        if op > 0 and close > 0:
+            high = max(high, close, op)
+            low = min(low if low > 0 else op, close, op)
+        if close > 0 and high > 0 and low > 0 and high >= low and high > low:
+            return close, high, low, "current_ai_input"
+    except Exception:
+        logger.debug("[entry_pipeline] current AI df range lookup failed symbol=%s", symbol, exc_info=True)
+    return 0.0, 0.0, 0.0, "none"
+
+
 def _range_pct_from_row(row: Any) -> tuple[float, float, float, float, str, str]:
     try:
         d = row if isinstance(row, dict) else row.to_dict() if hasattr(row, "to_dict") else {}
-        close = _pick_first_float(d, ("close", "close_price", "current_price", "price", "last_price"), 0.0)
         symbol = str(d.get("symbol") or d.get("Symbol") or "")
-
+        close = _pick_first_float(d, ("close", "close_price", "current_price", "price", "last_price"), 0.0)
         high = _pick_first_float(d, ("high", "high_price"), 0.0)
         low = _pick_first_float(d, ("low", "low_price"), 0.0)
         method = "row_high_low"
-
         if close <= 0:
             close = max(high, low, 1.0)
-
         row_range = ((high - low) / close) if close > 0 and high > 0 and low > 0 and high >= low else 0.0
+
         if row_range <= 1e-9:
             dh = _pick_first_float(d, ("day_high", "today_high", "intraday_high", "session_high", "high_price_day", "range_high"), 0.0)
             dl = _pick_first_float(d, ("day_low", "today_low", "intraday_low", "session_low", "low_price_day", "range_low"), 0.0)
@@ -347,14 +349,22 @@ def _range_pct_from_row(row: Any) -> tuple[float, float, float, float, str, str]
                 high, low, method = max(close, oh), min(close, oh), "open_close"
                 row_range = (high - low) / max(close, 1.0)
 
+        if row_range <= 1e-9 and _env_bool("SUMMARY_AI_LOW_MOVE_RANGE_REPAIR_FROM_CURRENT_DF", True):
+            c2, h2, l2, m2 = _current_df_symbol_range(symbol)
+            if c2 > 0 and h2 > 0 and l2 > 0 and h2 >= l2 and h2 > l2:
+                old_close, old_high, old_low = close, high, low
+                close, high, low, method = c2, h2, l2, m2
+                row_range = (high - low) / max(close, 1.0)
+                logger.warning(
+                    "[entry_pipeline] SUMMARY_AI range repaired from current df symbol=%s old_close=%.2f old_high=%.2f old_low=%.2f new_close=%.2f new_high=%.2f new_low=%.2f range_pct=%.6f version=%s",
+                    symbol, old_close, old_high, old_low, close, high, low, row_range, VERSION,
+                )
+
         rp = _safe_float(d.get("range_pct") or d.get("intraday_range_pct") or d.get("day_range_pct"), 0.0)
         if rp > 1.0:
             rp = rp / 100.0
         if rp > row_range:
-            base_high = max(high, close)
-            base_low = max(0.01, close * (1.0 - rp))
-            high, low, method, row_range = base_high, base_low, "range_pct_col", rp
-
+            high, low, method, row_range = max(high, close), max(0.01, close * (1.0 - rp)), "range_pct_col", rp
         return float(max(row_range, 0.0)), close, high, low, symbol, method
     except Exception:
         return 0.0, 0.0, 0.0, 0.0, "", "error"
@@ -369,7 +379,7 @@ def _install_summary_ai_low_move_prefilter_patch() -> bool:
         cur = getattr(ep, "_allow_summary_ai_liquidity", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_summary_ai_low_move_prefilter_v6", False):
+        if getattr(cur, "_summary_ai_low_move_prefilter_v7", False):
             _LOW_MOVE_PREFILTER_PATCHED = True
             return True
 
@@ -386,34 +396,18 @@ def _install_summary_ai_low_move_prefilter_patch() -> bool:
             if high <= 0 or low <= 0 or range_pct < min_range:
                 logger.warning(
                     "[entry_pipeline] SUMMARY_AI low-move prefilter skip symbol=%s interval=%s close=%.2f high=%.2f low=%.2f range_pct=%.6f min=%.6f method=%s version=%s",
-                    sym or symbol,
-                    interval,
-                    close,
-                    high,
-                    low,
-                    range_pct,
-                    min_range,
-                    method,
-                    VERSION,
+                    sym or symbol, interval, close, high, low, range_pct, min_range, method, VERSION,
                 )
                 return False
-            if method != "row_high_low":
-                logger.warning(
-                    "[entry_pipeline] SUMMARY_AI low-move range repaired symbol=%s interval=%s close=%.2f high=%.2f low=%.2f range_pct=%.6f min=%.6f method=%s version=%s",
-                    sym or symbol,
-                    interval,
-                    close,
-                    high,
-                    low,
-                    range_pct,
-                    min_range,
-                    method,
-                    VERSION,
-                )
+            logger.warning(
+                "[entry_pipeline] SUMMARY_AI low-move prefilter pass symbol=%s interval=%s close=%.2f high=%.2f low=%.2f range_pct=%.6f min=%.6f method=%s version=%s",
+                sym or symbol, interval, close, high, low, range_pct, min_range, method, VERSION,
+            )
             return True
 
-        _allow_summary_ai_liquidity_low_move._summary_ai_low_move_prefilter_v1 = True  # type: ignore[attr-defined]
+        _allow_summary_ai_liquidity_low_move._summary_ai_low_move_prefilter_v7 = True  # type: ignore[attr-defined]
         _allow_summary_ai_liquidity_low_move._summary_ai_low_move_prefilter_v6 = True  # type: ignore[attr-defined]
+        _allow_summary_ai_liquidity_low_move._summary_ai_low_move_prefilter_v1 = True  # type: ignore[attr-defined]
         _allow_summary_ai_liquidity_low_move._original = cur  # type: ignore[attr-defined]
         ep._allow_summary_ai_liquidity = _allow_summary_ai_liquidity_low_move
         _LOW_MOVE_PREFILTER_PATCHED = True
@@ -431,11 +425,10 @@ def _install_entry_pipeline_exec_cap_patch() -> bool:
     try:
         import pandas as pd
         import trading.summary.pipeline.entry_pipeline as ep
-
         cur = getattr(ep, "_build_exec_dataframe", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_summary_ai_exec_cap_v1", False):
+        if getattr(cur, "_summary_ai_exec_cap_v7", False):
             _EXEC_CAP_PATCHED = True
             return True
 
@@ -455,6 +448,7 @@ def _install_entry_pipeline_exec_cap_patch() -> bool:
                 logger.exception("[entry_pipeline] executable cap failed; use uncapped df")
             return df
 
+        _build_exec_dataframe_capped._summary_ai_exec_cap_v7 = True  # type: ignore[attr-defined]
         _build_exec_dataframe_capped._summary_ai_exec_cap_v1 = True  # type: ignore[attr-defined]
         _build_exec_dataframe_capped._original = cur  # type: ignore[attr-defined]
         ep._build_exec_dataframe = _build_exec_dataframe_capped
