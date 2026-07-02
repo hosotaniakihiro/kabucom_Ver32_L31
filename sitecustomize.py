@@ -1,21 +1,22 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver59-MAIN-PUSH-DB-REFRESH
+# Version: Ver60-SUMMARY-AI-RUNTIME-CONSISTENCY
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # main.py は軽量同期 + background install。
 # DB/data collector系はDB専用の最小同期パッチだけにして起動を軽くする。
 # 救済/fail-open系はデフォルトOFFにして、本体判定を優先する。
 #
+# V60:
+#   - Summary-AI 実行時に渡された最新1m dfをfresh判定へ優先使用し、
+#     古いglobal historyだけを見て stale_push_1m で止まる症状を防ぐ。
+#   - executor selection を保護し、外側runtime patchがAI_OK候補を1件へ
+#     潰してrolling retryを妨げる状態を防ぐ。
+#
 # V59:
 #   - main.py のPUSHメモリが起動時スナップショットのまま stale になる場合、
 #     main_database.py が更新している pushYYYYMMDD.db から読み直して
 #     1分SUMMARYを作る SUMMARY_MAIN_PUSH_DB_REFRESH を同期パッチへ追加。
-#
-# V58:
-#   - Summary-AI の Top3 選定前に blowoff top 候補を除外する
-#     SUMMARY_AI_BLOWOFF_PREFILTER を同期パッチへ追加。
-#     blowoff ガードは緩和せず、Top3全滅だけを防ぐ。
 # ============================================================
 from __future__ import annotations
 
@@ -257,6 +258,7 @@ SYNC_MAIN_PATCHES = [
     ("core.startup.entry_controller_source_prefilter_patch", "ENTRY_CONTROLLER_SOURCE_PREFILTER", "DISABLE_ENTRY_CONTROLLER_SOURCE_PREFILTER_PATCH"),
     ("core.startup.entry_execute_timeout_guard_patch", "ENTRY_EXECUTE_TIMEOUT_GUARD", "DISABLE_ENTRY_EXECUTE_TIMEOUT_GUARD_PATCH"),
     ("core.startup.summary_ai_blowoff_prefilter_patch", "SUMMARY_AI_BLOWOFF_PREFILTER", "DISABLE_SUMMARY_AI_BLOWOFF_PREFILTER_PATCH"),
+    ("core.startup.summary_ai_runtime_consistency_patch", "SUMMARY_AI_RUNTIME_CONSISTENCY", "DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH"),
     ("core.startup.summary_main_push_db_refresh_patch", "SUMMARY_MAIN_PUSH_DB_REFRESH", "DISABLE_SUMMARY_MAIN_PUSH_DB_REFRESH_PATCH"),
     ("core.startup.summary_main_direct_push_force_patch", "SUMMARY_FORCE_DIRECT_1M_SYNC", "DISABLE_SUMMARY_FORCE_DIRECT_1M_PATCH"),
 ]
@@ -281,6 +283,7 @@ BACKGROUND_MAIN_PATCHES = [
     ("core.startup.tonosama_fresh_summary_wait_fix_patch", "TONOSAMA_FRESH_SUMMARY_WAIT_FIX", "DISABLE_TONOSAMA_FRESH_SUMMARY_WAIT_FIX_PATCH"),
     ("core.startup.summary_ai_entry_hook_dataframe_truth_patch", "SUMMARY_AI_DF_TRUTH_PATCH", "DISABLE_SUMMARY_AI_DF_TRUTH_PATCH"),
     ("core.startup.summary_ai_candidate_refill_patch", "SUMMARY_AI_CANDIDATE_REFILL", "DISABLE_SUMMARY_AI_CANDIDATE_REFILL_PATCH"),
+    ("core.startup.summary_ai_runtime_consistency_patch", "SUMMARY_AI_RUNTIME_CONSISTENCY_BG", "DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH"),
     ("core.startup.summary_ai_low_move_softpass_patch", "SUMMARY_AI_LOW_MOVE_SOFTPASS", "DISABLE_SUMMARY_AI_LOW_MOVE_SOFTPASS_PATCH"),
     ("core.startup.summary_mtf_early_ready_patch", "SUMMARY_MTF_EARLY_READY", "DISABLE_SUMMARY_MTF_EARLY_READY_PATCH"),
     ("trading.audit_logging.install_audit_logging", "AUDIT_LOGGING", "DISABLE_AUDIT_LOGGING"),
@@ -342,6 +345,8 @@ def _background_main_patch_loop() -> None:
     _install_module("core.startup.summary_main_direct_push_force_patch", "SUMMARY_FORCE_DIRECT_1M_BG_LAST", disabled_env="DISABLE_SUMMARY_FORCE_DIRECT_1M_PATCH")
     # Final board signature re-apply after all background patches because some entry guards replace _board_guard.
     _install_module("core.startup.final_entry_board_guard_signature_runtime_patch", "FINAL_BOARD_GUARD_SIGNATURE_LAST", disabled_env="DISABLE_FINAL_BOARD_GUARD_SIGNATURE_PATCH")
+    # Last Summary-AI consistency pass must run after board/signature and candidate-refill patches.
+    _install_module("core.startup.summary_ai_runtime_consistency_patch", "SUMMARY_AI_RUNTIME_CONSISTENCY_LAST", disabled_env="DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH")
     logger.warning("[SITECUSTOMIZE] main background patches done")
 
 
