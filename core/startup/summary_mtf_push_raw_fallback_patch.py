@@ -1,17 +1,15 @@
 # ============================================================
 # File   : core/startup/summary_mtf_push_raw_fallback_patch.py
-# Version: V1-MAIN-PUSH-RAW-MTF-FALLBACK
+# Version: V2-MAIN-NO-MTF-BOOTSTRAP-BY-DEFAULT
 # ------------------------------------------------------------
 # main.py は split 運用で NAS SQLite 直読みの3m/5m差分更新を避ける。
-# その際、summary_1m cache がまだ空だと既存の
-# summary_mtf_diff_from_1m_patch でも 3m/5m を生成できず、
-#   MERGED GET tf=3 source=push rows=0
-#   summary db fallback stale interval=3
-# が残る。
 #
-# このパッチは global_data.push_df などの raw PUSH メモリを1m相当の履歴として
-# 既存 summary_mtf_diff_from_1m_patch に追加供給し、main.py 側だけで軽量に
-# 3分/5分PUSH summaryを作れるようにする。DB保存はしない。
+# V2 Fix:
+#   - main.py 起動直後の bootstrap worker による 3m/5m resample を既定停止。
+#   - run_entry=True の summary parent tick と同時に3m/5m indicator計算が走り、
+#     PUSH-1m / unified-parent timeout になる問題を避ける。
+#   - raw PUSH fallback loader 自体は残す。必要になった時だけ読む。
+#   - 3m/5m bootstrap が必要な検証時だけ SUMMARY_MTF_PUSH_RAW_BOOTSTRAP_ENABLED=1。
 # ============================================================
 
 from __future__ import annotations
@@ -30,6 +28,7 @@ logger = logging.getLogger(__name__)
 _INSTALLED = False
 _ORIG_CACHED_1M = None
 _BOOTSTRAP_STARTED = False
+VERSION = "V2-MAIN-NO-MTF-BOOTSTRAP-BY-DEFAULT"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -60,6 +59,16 @@ def _env_float(name: str, default: float) -> float:
         return float(str(v).strip())
     except Exception:
         return float(default)
+
+
+def _setdefault_env(name: str, value: str) -> None:
+    try:
+        cur = os.getenv(name)
+        if cur is None or str(cur).strip() == "":
+            os.environ[name] = str(value)
+            logger.warning("[SUMMARY MTF PUSH RAW FALLBACK] env default set %s=%s version=%s", name, value, VERSION)
+    except Exception:
+        pass
 
 
 def _is_main_py() -> bool:
@@ -180,10 +189,11 @@ def _raw_push_history_from_global() -> pd.DataFrame:
         out = out.drop_duplicates(subset=["symbol", "datetime"], keep="last")
         out = out.sort_values(["symbol", "datetime"], kind="stable")
         logger.warning(
-            "[SUMMARY MTF PUSH RAW FALLBACK] raw push history rows=%s symbols=%s latest_dt=%s",
+            "[SUMMARY MTF PUSH RAW FALLBACK] raw push history rows=%s symbols=%s latest_dt=%s version=%s",
             len(out),
             int(out["symbol"].nunique()) if "symbol" in out.columns else 0,
             out["datetime"].max() if "datetime" in out.columns and not out.empty else None,
+            VERSION,
         )
         return out.reset_index(drop=True)
     except Exception:
@@ -199,7 +209,7 @@ def _patch_cached_1m_loader() -> bool:
         if not callable(orig):
             logger.warning("[SUMMARY MTF PUSH RAW FALLBACK] base cached 1m loader unavailable")
             return False
-        if getattr(orig, "_push_raw_fallback_patched", False):
+        if getattr(orig, "_push_raw_fallback_patched_v2", False):
             return True
         _ORIG_CACHED_1M = orig
 
@@ -228,6 +238,7 @@ def _patch_cached_1m_loader() -> bool:
             return out.reset_index(drop=True)
 
         _cached_1m_with_raw_push._push_raw_fallback_patched = True  # type: ignore[attr-defined]
+        _cached_1m_with_raw_push._push_raw_fallback_patched_v2 = True  # type: ignore[attr-defined]
         setattr(base, "_cached_1m_history_from_global", _cached_1m_with_raw_push)
         return True
     except Exception:
@@ -235,14 +246,22 @@ def _patch_cached_1m_loader() -> bool:
         return False
 
 
+def _bootstrap_enabled() -> bool:
+    # V2: main.py の tick timeout を防ぐため、3m/5m bootstrap resample は既定停止。
+    return _env_bool("SUMMARY_MTF_PUSH_RAW_BOOTSTRAP_ENABLED", False)
+
+
 def _bootstrap_worker() -> None:
     try:
+        if not _bootstrap_enabled():
+            logger.warning("[SUMMARY MTF PUSH RAW FALLBACK] bootstrap disabled version=%s", VERSION)
+            return
         if not _is_main_py() and not _env_bool("SUMMARY_MTF_PUSH_RAW_BOOTSTRAP_FORCE", False):
             return
         import core.startup.summary_mtf_diff_from_1m_patch as base
-        repeats = max(1, _env_int("SUMMARY_MTF_PUSH_RAW_BOOTSTRAP_REPEATS", 4))
-        delay = max(0.5, _env_float("SUMMARY_MTF_PUSH_RAW_BOOTSTRAP_DELAY_SEC", 4.0))
-        gap = max(2.0, _env_float("SUMMARY_MTF_PUSH_RAW_BOOTSTRAP_GAP_SEC", 8.0))
+        repeats = max(1, _env_int("SUMMARY_MTF_PUSH_RAW_BOOTSTRAP_REPEATS", 1))
+        delay = max(2.0, _env_float("SUMMARY_MTF_PUSH_RAW_BOOTSTRAP_DELAY_SEC", 15.0))
+        gap = max(10.0, _env_float("SUMMARY_MTF_PUSH_RAW_BOOTSTRAP_GAP_SEC", 30.0))
         for i in range(repeats):
             time.sleep(delay if i == 0 else gap)
             for interval in (3, 5):
@@ -250,11 +269,12 @@ def _bootstrap_worker() -> None:
                     fn = getattr(base, "_resample_cached_1m_to_mtf", None)
                     df = fn(interval) if callable(fn) else pd.DataFrame()
                     logger.warning(
-                        "[SUMMARY MTF PUSH RAW FALLBACK] bootstrap resample interval=%s rows=%s i=%s/%s",
+                        "[SUMMARY MTF PUSH RAW FALLBACK] bootstrap resample interval=%s rows=%s i=%s/%s version=%s",
                         interval,
                         len(df) if isinstance(df, pd.DataFrame) else 0,
                         i + 1,
                         repeats,
+                        VERSION,
                     )
                 except Exception:
                     logger.debug("[SUMMARY MTF PUSH RAW FALLBACK] bootstrap resample failed interval=%s", interval, exc_info=True)
@@ -266,25 +286,35 @@ def _start_bootstrap() -> None:
     global _BOOTSTRAP_STARTED
     if _BOOTSTRAP_STARTED:
         return
+    if not _bootstrap_enabled():
+        logger.warning("[SUMMARY MTF PUSH RAW FALLBACK] bootstrap not started disabled version=%s", VERSION)
+        return
     _BOOTSTRAP_STARTED = True
     threading.Thread(target=_bootstrap_worker, name="SummaryMtfPushRawFallbackBootstrap", daemon=True).start()
 
 
 def install() -> bool:
     global _INSTALLED
+    _setdefault_env("SUMMARY_MTF_PUSH_RAW_BOOTSTRAP_ENABLED", "0")
+    _setdefault_env("SUMMARY_MTF_PUSH_RAW_BOOTSTRAP_REPEATS", "1")
+    _setdefault_env("SUMMARY_MTF_PUSH_RAW_BOOTSTRAP_DELAY_SEC", "15")
+    _setdefault_env("SUMMARY_MTF_PUSH_RAW_BOOTSTRAP_GAP_SEC", "30")
+
     if _INSTALLED:
         return True
     if not _env_bool("SUMMARY_MTF_PUSH_RAW_FALLBACK_ENABLED", True):
-        logger.warning("[SUMMARY MTF PUSH RAW FALLBACK] disabled by env")
+        logger.warning("[SUMMARY MTF PUSH RAW FALLBACK] disabled by env version=%s", VERSION)
         return False
     ok = _patch_cached_1m_loader()
     if ok:
         _INSTALLED = True
         _start_bootstrap()
     logger.warning(
-        "[SUMMARY MTF PUSH RAW FALLBACK] installed ok=%s main_py=%s version=V1",
+        "[SUMMARY MTF PUSH RAW FALLBACK] installed ok=%s main_py=%s bootstrap=%s version=%s",
         ok,
         _is_main_py(),
+        _bootstrap_enabled(),
+        VERSION,
     )
     return ok
 
