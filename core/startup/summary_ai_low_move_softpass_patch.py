@@ -1,30 +1,35 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_ai_low_move_softpass_patch.py
-# Version: V3.3-STRICT-RANGE-REPAIR-EXECUTOR-ROLLING-RETRY
+# Version: V3.4-STRICT-RANGE-REPAIR-ROLLING-AND-1M-BRIDGE
 # ------------------------------------------------------------
 # Purpose:
 #   SUMMARY_AI の低ATR/低レンジ soft-pass は既定で無効のまま維持する。
 #
 # Important:
 #   - 低出来高・低変動銘柄を緩和せず排除する運用では、soft-pass は不要。
-#   - ただし main 1m の最新行だけで entry_order_builder に渡ると、
-#     high == low == close になり、実際には日中レンジがある銘柄まで
-#     LOW_MOVE_RANGE_TOO_SMALL で落ちることがある。
+#   - ただし main 1m の最新行だけで entry_order_builder / volatility_filter に渡ると、
+#     high == low == close や 5m未成熟のため、実際にはランキング/当日変動がある銘柄まで
+#     LOW_MOVE_RANGE_TOO_SMALL / liquidity で落ちることがある。
 #   - また、承認済み候補が7件以上あっても、先頭Top3が最終ガードNGだと
 #     executor がそこで no-order 終了して次候補へ進まない。
-#   - この V3.3 はガードを緩和しない。低変動NGは維持し、Top3全滅時だけ
-#     次の承認候補バッチへ繰り上げる。
+#   - この V3.4 はガードを緩和しない。低変動NGは維持し、Top3全滅時だけ
+#     次の承認候補バッチへ繰り上げる。さらに、SUMMARY_AI 1分即時候補で
+#     entry_row_range_ok=True かつ ranking_snapshot の実変動が十分な場合だけ、
+#     5m代替レンジの二重ブロックを避ける。
+#
+# V3.4:
+#   - trading.filters.volatility_filter._range_5m_filter_from_entry_row をラップ。
+#   - SUMMARY_AI/SUMMARY/PUSH 由来で entry_row の高安幅が最低条件を満たし、
+#     ranking rescue も通る場合だけ allow。
+#   - その他の低変動NGは従来通り fail-close。
 #
 # V3.3:
 #   - entry_order_builder._low_move_hard_block をラップ。
-#   - SUMMARY_AI の high/low が flat の場合だけ、day_high/day_low,
-#     intraday_high/intraday_low, range_high/range_low 等で補完。
-#   - 補完できない場合は従来通り LOW_MOVE_RANGE_TOO_SMALL を維持。
+#   - SUMMARY_AI の high/low が flat の場合だけ day_high/day_low 等で補完。
 #   - summary_ai.executor.execute_ai_ok_entries_bulk をラップし、Top3 no-order 時に
 #     次の承認済み候補へ進む。
-#   - ENTRY_EXECUTE_ORIG_TIMEOUT_SEC は 8秒だと board retry + order build で
-#     誤timeoutになりやすいため、既定だけ 15秒へ引き上げる。
+#   - ENTRY_EXECUTE_ORIG_TIMEOUT_SEC 既定を15秒へ引き上げ。
 # ============================================================
 from __future__ import annotations
 
@@ -35,12 +40,14 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V3.3-STRICT-RANGE-REPAIR-EXECUTOR-ROLLING-RETRY"
+VERSION = "V3.4-STRICT-RANGE-REPAIR-ROLLING-AND-1M-BRIDGE"
 _INSTALLED = False
 _ORDER_BUILDER_PATCHED = False
 _EXECUTOR_PATCHED = False
+_VOL_FILTER_PATCHED = False
 _ORIGINAL_LOW_MOVE_HARD_BLOCK = None
 _ORIGINAL_EXECUTE_AI_OK_ENTRIES_BULK = None
+_ORIGINAL_RANGE_5M_ENTRY_ROW = None
 
 _TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 
@@ -88,9 +95,22 @@ def _first(row: dict, keys: tuple[str, ...], default: Any = None) -> Any:
     return default
 
 
+def _row_dict(entry_row: Any) -> dict:
+    try:
+        if isinstance(entry_row, dict):
+            return dict(entry_row)
+        if hasattr(entry_row, "to_dict"):
+            d = entry_row.to_dict()
+            return dict(d) if isinstance(d, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
 def _source_is_summary_ai(source: Any, row: dict) -> bool:
-    src = str(source or row.get("source") or row.get("entry_type") or "").strip().upper()
-    return src in {"SUMMARY_AI", "SUMMARY", "PUSH", "PUSH_SUMMARY"} or "SUMMARY_AI" in src
+    src = str(source or row.get("source") or row.get("entry_type") or row.get("pipeline_source") or "").strip().upper()
+    text = " ".join(str(row.get(k) or "") for k in ("entry_type", "source", "reason", "ai_reason", "model_used")).upper()
+    return src in {"SUMMARY_AI", "SUMMARY", "PUSH", "PUSH_SUMMARY"} or "SUMMARY_AI" in src or "SRC=SUMMARY" in text or "SUMMARY_AI" in text
 
 
 def _is_flat_range(close: float, high: float, low: float) -> bool:
@@ -123,24 +143,8 @@ def _repair_flat_range(row: dict, *, symbol: str, source: str) -> tuple[dict, di
     if close <= 0 or not _is_flat_range(close, high, low):
         return out, diag
 
-    high_keys = (
-        "day_high",
-        "intraday_high",
-        "session_high",
-        "today_high",
-        "range_high",
-        "high_1m_max",
-        "recent_high",
-    )
-    low_keys = (
-        "day_low",
-        "intraday_low",
-        "session_low",
-        "today_low",
-        "range_low",
-        "low_1m_min",
-        "recent_low",
-    )
+    high_keys = ("day_high", "intraday_high", "session_high", "today_high", "range_high", "high_1m_max", "recent_high")
+    low_keys = ("day_low", "intraday_low", "session_low", "today_low", "range_low", "low_1m_min", "recent_low")
     h2 = _safe_float(_first(out, high_keys, 0.0), 0.0)
     l2 = _safe_float(_first(out, low_keys, 0.0), 0.0)
     if h2 > 0 and l2 > 0 and h2 >= l2 and h2 > l2:
@@ -182,7 +186,7 @@ def _install_entry_order_range_repair() -> bool:
         if not callable(cur):
             logger.warning("[LOW MOVE GUARD] entry_order_builder._low_move_hard_block not callable version=%s", VERSION)
             return False
-        if getattr(cur, "_summary_ai_flat_range_repair_v32", False) or getattr(cur, "_summary_ai_flat_range_repair_v33", False):
+        if getattr(cur, "_summary_ai_flat_range_repair_v34", False):
             _ORDER_BUILDER_PATCHED = True
             return True
 
@@ -195,11 +199,7 @@ def _install_entry_order_range_repair() -> bool:
 
             repaired, diag = _repair_flat_range(row, symbol=str(symbol or ""), source=str(source or ""))
             if diag.get("repaired"):
-                logger.warning(
-                    "[LOW MOVE GUARD] SUMMARY_AI flat range repaired before strict guard detail=%s version=%s",
-                    diag,
-                    VERSION,
-                )
+                logger.warning("[LOW MOVE GUARD] SUMMARY_AI flat range repaired before strict guard detail=%s version=%s", diag, VERSION)
                 try:
                     if isinstance(entry_row, dict):
                         entry_row.update({k: repaired[k] for k in ("high", "low", "high_price", "low_price") if k in repaired})
@@ -211,6 +211,7 @@ def _install_entry_order_range_repair() -> bool:
 
         _patched_low_move_hard_block._summary_ai_flat_range_repair_v32 = True  # type: ignore[attr-defined]
         _patched_low_move_hard_block._summary_ai_flat_range_repair_v33 = True  # type: ignore[attr-defined]
+        _patched_low_move_hard_block._summary_ai_flat_range_repair_v34 = True  # type: ignore[attr-defined]
         _patched_low_move_hard_block._original = cur  # type: ignore[attr-defined]
         eob._low_move_hard_block = _patched_low_move_hard_block
         _ORDER_BUILDER_PATCHED = True
@@ -218,6 +219,76 @@ def _install_entry_order_range_repair() -> bool:
         return True
     except Exception:
         logger.exception("[LOW MOVE GUARD] SUMMARY_AI flat range repair install failed version=%s", VERSION)
+        return False
+
+
+def _entry_row_min_range_ok(vf: Any, entry_row: Any) -> tuple[bool, dict]:
+    try:
+        row = _row_dict(entry_row)
+        symbol = str(row.get("symbol") or row.get("Symbol") or "")
+        close = _safe_float(_first(row, ("close_price", "close", "price", "current_price"), 0.0), 0.0)
+        high = _safe_float(_first(row, ("high_price", "high"), 0.0), 0.0)
+        low = _safe_float(_first(row, ("low_price", "low"), 0.0), 0.0)
+        min_pct = _safe_float(getattr(vf, "DEFAULT_ENTRY_ROW_RANGE_MIN_PCT", 0.006), 0.006)
+        ratio = ((high - low) / close) if close > 0 and high >= low and high > 0 and low > 0 else 0.0
+        return bool(ratio >= min_pct), {"symbol": symbol, "close": close, "high": high, "low": low, "ratio": ratio, "min_pct": min_pct}
+    except Exception:
+        return False, {"error": "entry_row_min_range_check_failed"}
+
+
+def _install_summary_ai_entry_row_range_filter_patch() -> bool:
+    global _VOL_FILTER_PATCHED, _ORIGINAL_RANGE_5M_ENTRY_ROW
+    if _VOL_FILTER_PATCHED:
+        return True
+    try:
+        from trading.filters import volatility_filter as vf
+
+        cur = getattr(vf, "_range_5m_filter_from_entry_row", None)
+        if not callable(cur):
+            logger.warning("[LOW MOVE GUARD] volatility_filter._range_5m_filter_from_entry_row not callable version=%s", VERSION)
+            return False
+        if getattr(cur, "_summary_ai_1m_range_bridge_v34", False):
+            _VOL_FILTER_PATCHED = True
+            return True
+
+        _ORIGINAL_RANGE_5M_ENTRY_ROW = cur
+
+        def _patched_range_5m_filter_from_entry_row(entry_row: Any, min_pct: float = None):
+            row = _row_dict(entry_row)
+            src = str(row.get("source") or row.get("entry_type") or row.get("pipeline_source") or "")
+            try:
+                if _source_is_summary_ai(src, row):
+                    min_ok, diag = _entry_row_min_range_ok(vf, entry_row)
+                    rescue_ok = False
+                    try:
+                        rescue_min = _safe_float(getattr(vf, "DEFAULT_RANKING_RESCUE_MIN_PCT", 0.008), 0.008)
+                        rescue_ok = bool(vf._ranking_move_rescue(entry_row, min_pct=rescue_min, label="summary_ai_1m_range_bridge"))
+                    except Exception:
+                        rescue_ok = False
+                    if min_ok and rescue_ok:
+                        logger.warning(
+                            "[LOW MOVE GUARD] SUMMARY_AI 1m range bridge allow symbol=%s ratio=%.6f min_pct=%.6f rescue_ok=%s version=%s",
+                            diag.get("symbol"),
+                            float(diag.get("ratio") or 0.0),
+                            float(diag.get("min_pct") or 0.0),
+                            rescue_ok,
+                            VERSION,
+                        )
+                        return True
+            except Exception:
+                logger.debug("[LOW MOVE GUARD] SUMMARY_AI range bridge precheck failed", exc_info=True)
+            if min_pct is None:
+                return _ORIGINAL_RANGE_5M_ENTRY_ROW(entry_row)
+            return _ORIGINAL_RANGE_5M_ENTRY_ROW(entry_row, min_pct=min_pct)
+
+        _patched_range_5m_filter_from_entry_row._summary_ai_1m_range_bridge_v34 = True  # type: ignore[attr-defined]
+        _patched_range_5m_filter_from_entry_row._original = cur  # type: ignore[attr-defined]
+        vf._range_5m_filter_from_entry_row = _patched_range_5m_filter_from_entry_row
+        _VOL_FILTER_PATCHED = True
+        logger.warning("[LOW MOVE GUARD] SUMMARY_AI 1m volatility range bridge installed version=%s", VERSION)
+        return True
+    except Exception:
+        logger.exception("[LOW MOVE GUARD] SUMMARY_AI 1m volatility range bridge install failed version=%s", VERSION)
         return False
 
 
@@ -236,7 +307,7 @@ def _install_summary_ai_executor_rolling_retry() -> bool:
         if not callable(cur):
             logger.warning("[SUMMARY AI EXECUTOR ROLLING] target not callable version=%s", VERSION)
             return False
-        if getattr(cur, "_summary_ai_executor_rolling_retry_v33", False):
+        if getattr(cur, "_summary_ai_executor_rolling_retry_v34", False):
             _EXECUTOR_PATCHED = True
             return True
 
@@ -283,47 +354,21 @@ def _install_summary_ai_executor_rolling_retry() -> bool:
                 ordered = sorted(kept, key=exec_mod._sort_key, reverse=True)[:scan_limit]
                 all_rows = []
                 attempts = []
-                logger.warning(
-                    "[SUMMARY AI EXECUTOR ROLLING] start ok_total=%s kept=%s scan=%s batch=%s interval=%s version=%s",
-                    len(ok_items),
-                    len(kept),
-                    len(ordered),
-                    batch_n,
-                    interval,
-                    VERSION,
-                )
+                logger.warning("[SUMMARY AI EXECUTOR ROLLING] start ok_total=%s kept=%s scan=%s batch=%s interval=%s version=%s", len(ok_items), len(kept), len(ordered), batch_n, interval, VERSION)
 
                 for start in range(0, len(ordered), batch_n):
                     batch_items = ordered[start:start + batch_n]
                     approved_rows = [exec_mod.build_approved_row(x) for x in batch_items]
                     all_rows.extend(approved_rows)
                     symbols = [str(x.get("symbol")) for x in approved_rows]
-                    logger.warning(
-                        "[SUMMARY AI EXECUTOR ROLLING] batch start offset=%s size=%s symbols=%s",
-                        start,
-                        len(approved_rows),
-                        symbols,
-                    )
+                    logger.warning("[SUMMARY AI EXECUTOR ROLLING] batch start offset=%s size=%s symbols=%s", start, len(approved_rows), symbols)
                     result = entry_pipeline(approved_rows, df_summary, interval)
                     executed = exec_mod._positive_result(result)
                     attempts.append({"offset": start, "symbols": symbols, "executed": executed, "result": exec_mod._summarize_no_order_result(result)})
                     if executed:
                         logger.warning("[SUMMARY AI EXECUTOR ROLLING] executed offset=%s symbols=%s result=%s", start, symbols, result)
-                        return {
-                            "executed": True,
-                            "dry_run": False,
-                            "approved_rows": all_rows,
-                            "result": result,
-                            "skip_reason": None,
-                            "attempts": attempts,
-                            "rolling_retry": True,
-                        }
-                    logger.warning(
-                        "[SUMMARY AI EXECUTOR ROLLING] batch no-order offset=%s symbols=%s detail=%s",
-                        start,
-                        symbols,
-                        exec_mod._summarize_no_order_result(result),
-                    )
+                        return {"executed": True, "dry_run": False, "approved_rows": all_rows, "result": result, "skip_reason": None, "attempts": attempts, "rolling_retry": True}
+                    logger.warning("[SUMMARY AI EXECUTOR ROLLING] batch no-order offset=%s symbols=%s detail=%s", start, symbols, exec_mod._summarize_no_order_result(result))
 
                 removed_pending = 0
                 if all_rows:
@@ -331,16 +376,7 @@ def _install_summary_ai_executor_rolling_retry() -> bool:
                         removed_pending = exec_mod._cleanup_pending_after_no_order(attempts[-1].get("result") if attempts else None, all_rows, reason="entry_pipeline_no_order_all_batches")
                     except Exception:
                         logger.exception("[SUMMARY AI EXECUTOR ROLLING] final pending cleanup failed")
-                return {
-                    "executed": False,
-                    "dry_run": False,
-                    "approved_rows": all_rows,
-                    "result": attempts[-1].get("result") if attempts else None,
-                    "skip_reason": "entry_pipeline_no_order_all_batches",
-                    "attempts": attempts,
-                    "pending_removed": removed_pending,
-                    "rolling_retry": True,
-                }
+                return {"executed": False, "dry_run": False, "approved_rows": all_rows, "result": attempts[-1].get("result") if attempts else None, "skip_reason": "entry_pipeline_no_order_all_batches", "attempts": attempts, "pending_removed": removed_pending, "rolling_retry": True}
             except Exception:
                 logger.exception("[SUMMARY AI EXECUTOR ROLLING] patched executor failed; fallback original version=%s", VERSION)
                 return _ORIGINAL_EXECUTE_AI_OK_ENTRIES_BULK(
@@ -354,6 +390,7 @@ def _install_summary_ai_executor_rolling_retry() -> bool:
                 )
 
         _patched_execute_ai_ok_entries_bulk._summary_ai_executor_rolling_retry_v33 = True  # type: ignore[attr-defined]
+        _patched_execute_ai_ok_entries_bulk._summary_ai_executor_rolling_retry_v34 = True  # type: ignore[attr-defined]
         _patched_execute_ai_ok_entries_bulk._original = cur  # type: ignore[attr-defined]
         exec_mod.execute_ai_ok_entries_bulk = _patched_execute_ai_ok_entries_bulk
         _EXECUTOR_PATCHED = True
@@ -376,8 +413,6 @@ def _install_blowoff_prefilter() -> bool:
 
 
 def _set_timeout_defaults() -> None:
-    # 8秒だと board retry + order build の途中で execute_orig_timeout になりやすい。
-    # ユーザーの stale/低変動ガードは緩めず、発注処理の待ち時間だけ既定値を安全側にする。
     os.environ.setdefault("ENTRY_EXECUTE_ORIG_TIMEOUT_SEC", "15")
     os.environ.setdefault("SUMMARY_AI_EXECUTOR_ROLLING_RETRY", "1")
     os.environ.setdefault("SUMMARY_AI_EXECUTOR_CANDIDATE_SCAN_LIMIT", "12")
@@ -385,14 +420,6 @@ def _set_timeout_defaults() -> None:
 
 
 def install() -> bool:
-    """
-    Strict mode:
-      - デフォルトでは SUMMARY_AI 低変動 soft-pass を一切入れない。
-      - watcher も起動しない。
-      - low-move 判定そのものは維持する。
-      - high/low が latest 1本で flat になった場合だけ、既存の day range 情報で補正する。
-      - Top3 全滅時は、承認済み次候補へ繰り上げる。
-    """
     global _INSTALLED
 
     os.environ.setdefault("SUMMARY_AI_LOW_MOVE_SOFTPASS", "0")
@@ -402,33 +429,35 @@ def install() -> bool:
 
     blowoff_ok = _install_blowoff_prefilter()
     range_repair_ok = _install_entry_order_range_repair()
+    vf_bridge_ok = _install_summary_ai_entry_row_range_filter_patch()
     rolling_ok = _install_summary_ai_executor_rolling_retry()
 
     if not _env_bool("SUMMARY_AI_LOW_MOVE_SOFTPASS", False):
-        _INSTALLED = bool(blowoff_ok and range_repair_ok and rolling_ok)
+        _INSTALLED = bool(blowoff_ok and range_repair_ok and vf_bridge_ok and rolling_ok)
         logger.warning(
-            "[LOW MOVE GUARD] SUMMARY_AI low move softpass disabled strict mode version=%s "
-            "SUMMARY_AI_LOW_MOVE_SOFTPASS=%s watcher=%s blowoff_prefilter=%s range_repair=%s rolling_retry=%s timeout=%s",
+            "[LOW MOVE GUARD] SUMMARY_AI low move softpass disabled strict mode version=%s SUMMARY_AI_LOW_MOVE_SOFTPASS=%s watcher=%s blowoff_prefilter=%s range_repair=%s vf_bridge=%s rolling_retry=%s timeout=%s",
             VERSION,
             os.getenv("SUMMARY_AI_LOW_MOVE_SOFTPASS"),
             os.getenv("SUMMARY_AI_LOW_MOVE_SOFTPASS_WATCHER"),
             blowoff_ok,
             range_repair_ok,
+            vf_bridge_ok,
             rolling_ok,
             os.getenv("ENTRY_EXECUTE_ORIG_TIMEOUT_SEC"),
         )
-        return bool(blowoff_ok and range_repair_ok and rolling_ok)
+        return bool(blowoff_ok and range_repair_ok and vf_bridge_ok and rolling_ok)
 
-    _INSTALLED = bool(blowoff_ok and range_repair_ok and rolling_ok)
+    _INSTALLED = bool(blowoff_ok and range_repair_ok and vf_bridge_ok and rolling_ok)
     logger.warning(
-        "[LOW MOVE GUARD] SUMMARY_AI low move softpass requested but implementation is disabled in strict build version=%s blowoff_prefilter=%s range_repair=%s rolling_retry=%s timeout=%s",
+        "[LOW MOVE GUARD] SUMMARY_AI low move softpass requested but implementation is disabled in strict build version=%s blowoff_prefilter=%s range_repair=%s vf_bridge=%s rolling_retry=%s timeout=%s",
         VERSION,
         blowoff_ok,
         range_repair_ok,
+        vf_bridge_ok,
         rolling_ok,
         os.getenv("ENTRY_EXECUTE_ORIG_TIMEOUT_SEC"),
     )
-    return bool(blowoff_ok and range_repair_ok and rolling_ok)
+    return bool(blowoff_ok and range_repair_ok and vf_bridge_ok and rolling_ok)
 
 
 try:
