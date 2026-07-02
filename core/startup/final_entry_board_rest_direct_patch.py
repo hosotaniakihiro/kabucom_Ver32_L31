@@ -1,17 +1,21 @@
 # ============================================================
 # File   : core/startup/final_entry_board_rest_direct_patch.py
-# Version: V4-LIMITED-REST-BOARD-FALLBACK
+# Version: V4.1-FORCE-ENABLE-LIMITED-REST-BOARD-FALLBACK
 # ------------------------------------------------------------
 # 目的:
 #   SUMMARY_AI / TONOSAMA の発注直前に PUSH 板が無い場合、
 #   必要最小限だけ REST /board を使って best bid/ask を補完する。
 #
+# V4.1:
+#   - 旧V3/V3.1が起動時に ENTRY_BOARD_REST_DIRECT_ENABLED=0 を残していても、
+#     このパッチが有効な限り 1 に戻す。
+#   - 明示的に止める場合は DISABLE_ENTRY_BOARD_REST_DIRECT_PATCH=1 を使う。
+#   - これにより installed v4 direct_enabled=False で板補完が動かない状態を防ぐ。
+#
 # V4:
 #   - V3/V3.1 の「FORCE指定が無い限りREST板を常時OFF」をやめる。
-#   - ENTRY_BOARD_REST_DIRECT_ENABLED は既定ON。
 #   - side/source 推定は V3.1 の仕組みを維持。
 #   - 1銘柄ごとに board_client.fetch_board_snapshot(timeout短め, levels=5) で補完。
-#   - RESTが取れない場合だけ従来どおり board_missing / fail-open 側へ流す。
 # ============================================================
 
 from __future__ import annotations
@@ -25,7 +29,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V4-LIMITED-REST-BOARD-FALLBACK"
+VERSION = "V4.1-FORCE-ENABLE-LIMITED-REST-BOARD-FALLBACK"
 _INSTALLED = False
 _WATCHER_STARTED = False
 
@@ -153,8 +157,15 @@ def _extract_board_values(board: Any) -> tuple[float, float, float, float]:
     return bid, ask, bid_qty, ask_qty
 
 
+def _patch_disabled() -> bool:
+    return os.getenv("DISABLE_ENTRY_BOARD_REST_DIRECT_PATCH", "").strip() == "1"
+
+
 def _set_default_env() -> None:
-    os.environ.setdefault("ENTRY_BOARD_REST_DIRECT_ENABLED", "1")
+    if _patch_disabled():
+        return
+    # 旧V3が残した 0 を上書きする。明示停止は DISABLE_ENTRY_BOARD_REST_DIRECT_PATCH=1 に統一。
+    os.environ["ENTRY_BOARD_REST_DIRECT_ENABLED"] = "1"
     os.environ.setdefault("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", "0.6")
     os.environ.setdefault("ENTRY_BOARD_REST_EXCHANGES", "1")
     os.environ.setdefault("ENTRY_BOARD_REST_DIRECT_LEVELS", "5")
@@ -162,7 +173,7 @@ def _set_default_env() -> None:
 
 def _call_board_rest_via_client(symbol: str, *, side: str = "", source: str = "final_entry_safety_guard") -> tuple[float, float, float, float]:
     _set_default_env()
-    if not _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", True):
+    if _patch_disabled() or not _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", True):
         return 0.0, 0.0, 0.0, 0.0
 
     sym = _norm_symbol(symbol)
@@ -214,14 +225,16 @@ def _make_try_get_bid_ask_from_api():
         bid, ask, bid_qty, ask_qty = _call_board_rest_via_client(symbol, side=side, source=source)
         if bid <= 0 or ask <= 0:
             logger.warning(
-                "[FINAL ENTRY BOARD REST DIRECT] REST_EMPTY symbol=%s side=%s source=%s direct_enabled=%s timeout=%.3f version=%s",
+                "[FINAL ENTRY BOARD REST DIRECT] REST_EMPTY symbol=%s side=%s source=%s direct_enabled=%s disabled=%s timeout=%.3f version=%s",
                 _norm_symbol(symbol), side, source,
                 _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", True),
+                _patch_disabled(),
                 _env_float("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", 0.6),
                 VERSION,
             )
         return bid, ask, bid_qty, ask_qty
 
+    _try_get_bid_ask_from_api._final_entry_board_rest_direct_v41 = True  # type: ignore[attr-defined]
     _try_get_bid_ask_from_api._final_entry_board_rest_direct_v4 = True  # type: ignore[attr-defined]
     _try_get_bid_ask_from_api._final_entry_board_rest_direct_v31 = True  # type: ignore[attr-defined]
     _try_get_bid_ask_from_api._final_entry_board_rest_direct_v3 = True  # type: ignore[attr-defined]
@@ -236,15 +249,16 @@ def _install_once(log_patch: bool = True) -> bool:
         _set_default_env()
         import core.startup.final_entry_safety_guard_patch as fsg
         cur = getattr(fsg, "_try_get_bid_ask_from_api", None)
-        if getattr(cur, "_final_entry_board_rest_direct_v4", False):
+        if getattr(cur, "_final_entry_board_rest_direct_v41", False):
             _INSTALLED = True
             return True
         fsg._try_get_bid_ask_from_api = _make_try_get_bid_ask_from_api()
         _INSTALLED = True
         if log_patch:
             logger.warning(
-                "[FINAL ENTRY BOARD REST DIRECT] installed v4 direct_enabled=%s timeout=%.3f hard_block=%s allow_without_board=%s version=%s",
+                "[FINAL ENTRY BOARD REST DIRECT] installed v4.1 direct_enabled=%s disabled=%s timeout=%.3f hard_block=%s allow_without_board=%s version=%s",
                 _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", True),
+                _patch_disabled(),
                 _env_float("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", 0.6),
                 _env_bool("ENTRY_BOARD_MISSING_HARD_BLOCK", True),
                 _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", False),
