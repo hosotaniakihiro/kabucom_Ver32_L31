@@ -1,9 +1,17 @@
 # ============================================================
 # File   : core/startup/entry_execute_timeout_guard_patch.py
-# Version: V4-TRUE-ORIGINAL-REENTRANT-SAFE
+# Version: V5-TRUE-ORIGINAL-PINNED
 # ------------------------------------------------------------
-# _execute_best_candidate の timeout guard。
-# 複数 runtime patch が混在しても wrapper を再帰呼び出ししない。
+# _execute_best_candidate timeout guard.
+#
+# V5:
+#   - trading.handlers.entry_controller._BASE_EXECUTE_BEST_CANDIDATE に
+#     発注本体を明示保存する。
+#   - final_entry_safety_guard / timeout guard / bridge patch が再wrapしても、
+#     wrapperではなく必ず発注本体へ戻す。
+#   - ログ上の CALL_ORIG_START orig=patched_execute_best_candidate のような
+#     wrapper呼び出しループを防ぐ。
+#   - stale 判定は緩和しない。
 # ============================================================
 from __future__ import annotations
 
@@ -17,6 +25,7 @@ from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
+VERSION = "V5-TRUE-ORIGINAL-PINNED"
 _PATCHED = False
 _WATCHER_STARTED = False
 _INFLIGHT: dict[tuple[str, str], dict[str, Any]] = {}
@@ -29,14 +38,33 @@ _ORIGINAL_ATTRS = (
     "_entry_execute_timeout_guard_original",
     "_final_entry_safety_guard_original",
     "_original_execute_best_candidate",
+    "_summary_ai_entry_bridge_original",
+    "_summary_ai_entry_controller_bridge_original",
     "_original",
+    "__wrapped__",
 )
+
 _PATCH_FLAGS = (
+    "_entry_execute_timeout_guard_v5",
     "_entry_execute_timeout_guard_v4",
     "_entry_execute_timeout_guard_v3",
     "_entry_execute_timeout_guard_v2",
     "_entry_execute_timeout_guard_v1",
+    "_final_entry_safety_guard",
+    "_final_entry_safety_guard_v10",
+    "_final_entry_safety_guard_v11",
+    "_final_entry_safety_guard_v12",
+    "_summary_ai_entry_bridge_patch",
+    "_summary_ai_entry_controller_bridge_patch",
 )
+
+_WRAPPER_NAMES = {
+    "wrapped",
+    "patched",
+    "patched_execute_best_candidate",
+    "_patched_execute_best_candidate",
+    "_compat_execute_best_candidate",
+}
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -129,6 +157,115 @@ def _first_dt(*values: Any) -> dt.datetime | None:
     return None
 
 
+def _is_known_wrapper(fn: Any) -> bool:
+    try:
+        if not callable(fn):
+            return False
+        name = str(getattr(fn, "__name__", ""))
+        if name in _WRAPPER_NAMES:
+            return True
+        if name.startswith("_patched") or name.startswith("patched") or name.startswith("_compat"):
+            return True
+        return any(bool(getattr(fn, f, False)) for f in _PATCH_FLAGS)
+    except Exception:
+        return False
+
+
+def _looks_like_base(fn: Any) -> bool:
+    try:
+        return callable(fn) and str(getattr(fn, "__name__", "")) == "_execute_best_candidate" and not _is_known_wrapper(fn)
+    except Exception:
+        return False
+
+
+def _walk_original_chain(fn: Callable[..., Any]) -> list[Callable[..., Any]]:
+    out: list[Callable[..., Any]] = []
+    seen: set[int] = set()
+    cur: Any = fn
+    while callable(cur) and id(cur) not in seen:
+        seen.add(id(cur))
+        out.append(cur)
+        nxt = None
+        for attr in _ORIGINAL_ATTRS:
+            cand = getattr(cur, attr, None)
+            if callable(cand) and cand is not cur:
+                nxt = cand
+                break
+        if nxt is None:
+            break
+        cur = nxt
+    return out
+
+
+def _pin_base_original(ec: Any, cur: Callable[..., Any] | None = None, *, reason: str = "install") -> Callable[..., Any] | None:
+    """Store the real, non-wrapper entry execution function on entry_controller."""
+    try:
+        existing = getattr(ec, "_BASE_EXECUTE_BEST_CANDIDATE", None)
+        if _looks_like_base(existing):
+            return existing
+        if cur is None:
+            cur = getattr(ec, "_execute_best_candidate", None)
+        if not callable(cur):
+            return None
+
+        candidates = _walk_original_chain(cur)
+        base = None
+        for cand in candidates:
+            if _looks_like_base(cand):
+                base = cand
+                break
+        if base is None and not _is_known_wrapper(cur):
+            # At early startup this is the module's original function.
+            base = cur
+
+        if callable(base):
+            setattr(ec, "_BASE_EXECUTE_BEST_CANDIDATE", base)
+            logger.warning(
+                "[ENTRY EXEC TRUE ORIGINAL] pinned base reason=%s base=%s chain=%s version=%s",
+                reason,
+                getattr(base, "__name__", repr(base)),
+                [getattr(x, "__name__", type(x).__name__) for x in candidates[:8]],
+                VERSION,
+            )
+            return base
+        logger.warning(
+            "[ENTRY EXEC TRUE ORIGINAL] base not found reason=%s cur=%s chain=%s version=%s",
+            reason,
+            getattr(cur, "__name__", repr(cur)),
+            [getattr(x, "__name__", type(x).__name__) for x in candidates[:8]],
+            VERSION,
+        )
+    except Exception:
+        logger.exception("[ENTRY EXEC TRUE ORIGINAL] pin failed reason=%s", reason)
+    return None
+
+
+def _get_pinned_base() -> Callable[..., Any] | None:
+    try:
+        import trading.handlers.entry_controller as ec
+        base = getattr(ec, "_BASE_EXECUTE_BEST_CANDIDATE", None)
+        if _looks_like_base(base):
+            return base
+        return _pin_base_original(ec, getattr(ec, "_execute_best_candidate", None), reason="lazy")
+    except Exception:
+        return None
+
+
+def _unwrap_true_original(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Return the real order-dispatch function, never another runtime wrapper when avoidable."""
+    base = _get_pinned_base()
+    if callable(base):
+        return base
+    candidates = _walk_original_chain(fn)
+    for cand in candidates:
+        if _looks_like_base(cand):
+            return cand
+    for cand in reversed(candidates):
+        if callable(cand) and not _is_known_wrapper(cand):
+            return cand
+    return fn
+
+
 def _is_summary_ai_candidate(item: dict[str, Any], row: dict[str, Any]) -> bool:
     try:
         ai = item.get("ai") if isinstance(item.get("ai"), dict) else {}
@@ -163,24 +300,6 @@ def _extract_symbol_side(item: dict[str, Any]) -> tuple[str, str, dict[str, Any]
     symbol = _norm_symbol(item.get("symbol") or row.get("symbol") or ai.get("symbol"))
     side = _norm_side(item.get("side") or row.get("side") or row.get("entry_decision") or row.get("ai_side") or ai.get("side") or ai.get("entry_decision") or ai.get("ai_side"))
     return symbol, side, row
-
-
-def _unwrap_true_original(fn: Callable[..., Any]) -> Callable[..., Any]:
-    """既存patchが持つ original 属性をたどり、wrapperではない発注本体を取得する。"""
-    seen: set[int] = set()
-    cur: Any = fn
-    while callable(cur) and id(cur) not in seen:
-        seen.add(id(cur))
-        nxt = None
-        for attr in _ORIGINAL_ATTRS:
-            cand = getattr(cur, attr, None)
-            if callable(cand) and cand is not cur:
-                nxt = cand
-                break
-        if nxt is None:
-            break
-        cur = nxt
-    return cur if callable(cur) else fn
 
 
 def _prune_pending_for_symbol(symbol: str, side: str, reason: str) -> int:
@@ -233,7 +352,7 @@ def _cleanup_inflight() -> None:
 def _call_direct(orig: Callable[..., Any], item: dict[str, Any], boost_active: bool, symbol: str, side: str, reason: str) -> bool:
     true_orig = _unwrap_true_original(orig)
     try:
-        logger.warning("[ENTRY EXEC TIMEOUT GUARD] REENTRANT_BYPASS_TO_TRUE_ORIGINAL symbol=%s side=%s reason=%s orig=%s", symbol, side, reason, getattr(true_orig, "__name__", repr(true_orig)))
+        logger.warning("[ENTRY EXEC TIMEOUT GUARD] REENTRANT_BYPASS_TO_TRUE_ORIGINAL symbol=%s side=%s reason=%s orig=%s version=%s", symbol, side, reason, getattr(true_orig, "__name__", repr(true_orig)), VERSION)
         return bool(true_orig(item, boost_active))
     except Exception as exc:
         logger.warning("[ENTRY EXEC TIMEOUT GUARD] TRUE_ORIG_ERROR_RETURN_FALSE symbol=%s side=%s error=%r", symbol, side, exc)
@@ -280,11 +399,12 @@ def _call_with_timeout(orig: Callable[..., Any], item: dict[str, Any], boost_act
     with _INFLIGHT_LOCK:
         if key in _INFLIGHT:
             _INFLIGHT[key]["thread"] = th.name
+    logger.warning("[ENTRY EXEC TIMEOUT GUARD] CALL_TRUE_ORIG_START symbol=%s side=%s orig=%s timeout=%.1fs version=%s", symbol, side, getattr(true_orig, "__name__", repr(true_orig)), timeout, VERSION)
     th.start()
     th.join(timeout)
     if th.is_alive():
         removed = _prune_pending_for_symbol(symbol, side, "execute_orig_timeout")
-        logger.warning("[ENTRY EXEC TIMEOUT GUARD] ORIG_TIMEOUT_RETURN_FALSE symbol=%s side=%s timeout=%.1fs pruned=%s thread=%s", symbol, side, timeout, removed, th.name)
+        logger.warning("[ENTRY EXEC TIMEOUT GUARD] ORIG_TIMEOUT_RETURN_FALSE symbol=%s side=%s timeout=%.1fs pruned=%s thread=%s orig=%s", symbol, side, timeout, removed, th.name, getattr(true_orig, "__name__", repr(true_orig)))
         return False
     try:
         status, value = q.get_nowait()
@@ -306,10 +426,14 @@ def _wrap_current() -> bool:
         cur = getattr(ec, "_execute_best_candidate", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_entry_execute_timeout_guard_v4", False):
+        base = _pin_base_original(ec, cur, reason="wrap_current")
+        if getattr(cur, "_entry_execute_timeout_guard_v5", False):
+            # Keep original pointer repaired even when already wrapped.
+            if callable(base):
+                cur._entry_execute_timeout_guard_original = base  # type: ignore[attr-defined]
             return True
 
-        orig = _unwrap_true_original(cur) if any(bool(getattr(cur, f, False)) for f in _PATCH_FLAGS) else cur
+        orig = base or _unwrap_true_original(cur)
 
         def wrapped(item: dict, boost_active: bool) -> bool:
             try:
@@ -332,18 +456,22 @@ def _wrap_current() -> bool:
                 logger.exception("[ENTRY EXEC TIMEOUT GUARD] wrapper failed")
                 return False
 
+        wrapped._entry_execute_timeout_guard_v5 = True  # type: ignore[attr-defined]
         wrapped._entry_execute_timeout_guard_v4 = True  # type: ignore[attr-defined]
         wrapped._entry_execute_timeout_guard_v3 = True  # type: ignore[attr-defined]
         wrapped._entry_execute_timeout_guard_v2 = True  # type: ignore[attr-defined]
         wrapped._entry_execute_timeout_guard_v1 = True  # type: ignore[attr-defined]
-        wrapped._entry_execute_timeout_guard_original = _unwrap_true_original(orig)  # type: ignore[attr-defined]
+        wrapped._entry_execute_timeout_guard_original = orig  # type: ignore[attr-defined]
+        wrapped._original_execute_best_candidate = orig  # type: ignore[attr-defined]
         ec._execute_best_candidate = wrapped
         logger.warning(
-            "[ENTRY EXEC TIMEOUT GUARD] wrapped target=%s timeout=%.1fs stale_created=%.1fs stale_bar=%.1fs true_original_safe=True",
-            getattr(wrapped._entry_execute_timeout_guard_original, "__name__", repr(wrapped._entry_execute_timeout_guard_original)),
+            "[ENTRY EXEC TIMEOUT GUARD] wrapped target=%s timeout=%.1fs stale_created=%.1fs stale_bar=%.1fs true_original_pinned=%s version=%s",
+            getattr(orig, "__name__", repr(orig)),
             _env_float("ENTRY_EXECUTE_ORIG_TIMEOUT_SEC", 8.0),
             _env_float("ENTRY_EXECUTE_MAX_CANDIDATE_AGE_SEC", 90.0),
             _env_float("ENTRY_EXECUTE_MAX_BAR_AGE_SEC", 180.0),
+            callable(base),
+            VERSION,
         )
         return True
     except Exception:
@@ -375,7 +503,7 @@ def install() -> bool:
         _WATCHER_STARTED = True
         threading.Thread(target=_watcher_loop, name="entry-execute-timeout-guard-watcher", daemon=True).start()
         logger.warning("[ENTRY EXEC TIMEOUT GUARD] watcher started")
-    logger.warning("[ENTRY EXEC TIMEOUT GUARD] installed V4 ok=%s", ok)
+    logger.warning("[ENTRY EXEC TIMEOUT GUARD] installed V5 ok=%s version=%s", ok, VERSION)
     return bool(ok)
 
 
@@ -384,4 +512,5 @@ try:
 except Exception:
     logger.exception("[ENTRY EXEC TIMEOUT GUARD] auto install failed")
 
-__all__ = ["install"]
+
+__all__ = ["install", "VERSION", "_unwrap_true_original"]
