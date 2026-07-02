@@ -1,15 +1,15 @@
 # ============================================================
 # File   : trading/push/push_stream/__init__.py
-# Version: Ver2.1-MAIN-WS-HARD-SKIP-SPLIT-MODE
+# Version: Ver2.2-MAIN-STALE-MEMORY-WS-FALLBACK-WATCHER
 # ------------------------------------------------------------
 # ✔ 旧 trading.push.push_stream 公開API互換
 # ✔ 分割後モジュールの再エクスポート
 # ✔ transport / rotation_core / runner / dataframe の公開窓口
 # ✔ main_database.py 分離運用時、main.py側の重複PUSH WSをno-op化
 # ✔ emergency時のみ AUTOSTOCK_MAIN_PUSH_WS_ENABLED=1 で main.py側WSを許可
-# ✔ optional fallback は AUTOSTOCK_MAIN_PUSH_WS_AUTO_FALLBACK=1 の明示時だけ許可
-# ✔ PUSH rotation stability patch / liquidity keep100 patch を自動適用
-# ✔ runner module 直呼び経路も同じguardへ寄せるが、再帰は防ぐ
+# ✔ Ver2.2: main_database側PUSH/summaryがstale化した時だけ、main.py側で
+#           DB保存なし・登録ローテなしの memory-only fallback WS を起動する監視を追加
+# ✔ PUSH DB重複保存はしない
 # ============================================================
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import threading
 import time
 from typing import Any
 
@@ -62,6 +63,9 @@ get_status = _runner_mod.get_status
 
 _TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 _FALSE = {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}
+_WATCHER_STARTED = False
+_FALLBACK_STARTED = False
+_FALLBACK_LOCK = threading.Lock()
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -127,7 +131,6 @@ def _latest_summary_age_sec() -> float | None:
         except Exception:
             pass
 
-    # DataFrame系から最新datetimeを見る。import pandasは避け、属性だけで軽く見る。
     for attr in ("push_merged_summary", "merged_summary_1min", "merged_summary_1m", "summary_1m", "push_summary_1m"):
         try:
             df = getattr(global_data, attr, None)
@@ -154,28 +157,49 @@ def _latest_summary_age_sec() -> float | None:
     return best_age
 
 
+def _split_mode_main() -> bool:
+    try:
+        from data_collectors.split_mode import (
+            is_data_collector_process,
+            should_skip_data_collector_work_in_main,
+            external_data_collectors_enabled,
+        )
+        if bool(is_data_collector_process()):
+            return False
+        return bool(external_data_collectors_enabled()) and bool(should_skip_data_collector_work_in_main())
+    except Exception:
+        logger.debug("[push_stream] split mode check failed", exc_info=True)
+        return False
+
+
+def _main_ws_fallback_enabled() -> bool:
+    # Ver2.2: 明示OFFされない限り、stale時のmemory-only fallback watcherは有効。
+    return _env_bool("AUTOSTOCK_MAIN_PUSH_WS_AUTO_FALLBACK", _env_bool("AUTOSTOCK_MAIN_PUSH_WS_STALE_FALLBACK", True))
+
+
 def _main_ws_fallback_allowed_due_to_stale_summary() -> bool:
     """
     split mode の main.py 側 memory-only PUSH WS fallback。
 
-    以前はデフォルト True だったため、起動直後に summary がまだ見えないだけで
-    main.py 側にも PUSH WebSocket が立ち上がり、main_database.py 側と二重接続になった。
-    通常運用では main_database.py / data_collectors_runner が PUSH受信・保存を担当するため、
-    fallback は明示的に AUTOSTOCK_MAIN_PUSH_WS_AUTO_FALLBACK=1 を指定した場合だけ許可する。
+    通常は main_database.py / data_collectors_runner が PUSH受信・保存を担当する。
+    Ver2.2 では、summary が stale になった時だけ main.py 側 memory-only WS を許可する。
+    DB保存と登録ローテは必ずOFFにするため、PUSH DBの重複保存は起きない。
     """
-    if not _env_bool("AUTOSTOCK_MAIN_PUSH_WS_AUTO_FALLBACK", False):
+    if not _main_ws_fallback_enabled():
         return False
     stale_sec = max(30.0, _env_float("AUTOSTOCK_MAIN_PUSH_WS_FALLBACK_STALE_SEC", 180.0))
     age = _latest_summary_age_sec()
     if age is None:
-        logger.warning(
-            "[push_stream] main WS fallback allowed by explicit env: no fresh summary visible yet stale_sec=%.1f",
-            stale_sec,
+        # 起動直後の二重WSを避けるため、no-summaryだけでは即許可しない。
+        no_summary_grace = max(60.0, _env_float("AUTOSTOCK_MAIN_PUSH_WS_NO_SUMMARY_GRACE_SEC", 300.0))
+        logger.info(
+            "[push_stream] main WS fallback not yet allowed: no summary visible grace=%.1fs",
+            no_summary_grace,
         )
-        return True
+        return False
     if age > stale_sec:
         logger.warning(
-            "[push_stream] main WS fallback allowed by explicit env: summary stale age=%.1fs stale_sec=%.1f",
+            "[push_stream] main WS fallback allowed: summary stale age=%.1fs stale_sec=%.1f memory_only=True db_write=False rotation=False",
             age,
             stale_sec,
         )
@@ -195,27 +219,19 @@ def _should_skip_push_stream_start_in_main() -> bool:
     例外:
       - data_collector / push_receiver プロセス自身
       - AUTOSTOCK_MAIN_PUSH_WS_ENABLED=1 の emergency standalone
-      - AUTOSTOCK_MAIN_PUSH_WS_AUTO_FALLBACK=1 を明示し、summary stale の時だけ memory-only fallback
+      - summary stale の時だけ memory-only fallback
     """
     if _env_bool("AUTOSTOCK_MAIN_PUSH_WS_ENABLED", False):
         logger.warning("[push_stream] main WS explicitly enabled by AUTOSTOCK_MAIN_PUSH_WS_ENABLED=1")
         return False
     try:
-        from data_collectors.split_mode import (
-            is_data_collector_process,
-            should_skip_data_collector_work_in_main,
-            external_data_collectors_enabled,
-        )
-        if bool(is_data_collector_process()):
-            return False
-        is_main_split = bool(external_data_collectors_enabled()) and bool(should_skip_data_collector_work_in_main())
-        if not is_main_split:
+        if not _split_mode_main():
             return False
         if _main_ws_fallback_allowed_due_to_stale_summary():
             return False
+        _start_main_stale_fallback_watcher()
         return True
     except Exception:
-        # split判定に失敗した場合は従来互換で起動を許可する。
         logger.debug("[push_stream] split mode check failed; allow start for compatibility", exc_info=True)
         return False
 
@@ -244,14 +260,69 @@ def _prepare_main_memory_only_ws() -> None:
         pass
 
 
+def _start_memory_only_fallback_ws(reason: str) -> bool:
+    global _FALLBACK_STARTED
+    with _FALLBACK_LOCK:
+        if _FALLBACK_STARTED:
+            return True
+        try:
+            _prepare_main_memory_only_ws()
+            logger.warning(
+                "[push_stream] starting main memory-only fallback WS reason=%s db_write=%s rotation=%s version=Ver2.2-MAIN-STALE-MEMORY-WS-FALLBACK-WATCHER",
+                reason,
+                os.environ.get("PUSH_DB_WRITE_ENABLED"),
+                os.environ.get("PUSH_ROTATION_ENABLED"),
+            )
+            ret = _TRUE_RUNNER_START_PUSH_STREAM()
+            _FALLBACK_STARTED = True
+            logger.warning("[push_stream] main memory-only fallback WS started reason=%s ret=%s", reason, ret)
+            return True
+        except Exception:
+            logger.exception("[push_stream] main memory-only fallback WS start failed reason=%s", reason)
+            return False
+
+
+def _start_main_stale_fallback_watcher() -> None:
+    global _WATCHER_STARTED
+    if _WATCHER_STARTED:
+        return
+    if not _main_ws_fallback_enabled():
+        return
+    if not _split_mode_main():
+        return
+    _WATCHER_STARTED = True
+
+    def _watch() -> None:
+        interval = max(5.0, _env_float("AUTOSTOCK_MAIN_PUSH_WS_FALLBACK_CHECK_SEC", 15.0))
+        stale_sec = max(30.0, _env_float("AUTOSTOCK_MAIN_PUSH_WS_FALLBACK_STALE_SEC", 180.0))
+        logger.warning(
+            "[push_stream] main stale fallback watcher started interval=%.1fs stale_sec=%.1fs memory_only=True db_write=False rotation=False version=Ver2.2-MAIN-STALE-MEMORY-WS-FALLBACK-WATCHER",
+            interval,
+            stale_sec,
+        )
+        while True:
+            try:
+                if _FALLBACK_STARTED:
+                    return
+                age = _latest_summary_age_sec()
+                if age is not None and age > stale_sec:
+                    _start_memory_only_fallback_ws(reason=f"summary_stale_age={age:.1f}s")
+                    return
+                logger.info("[push_stream] main stale fallback watcher heartbeat age=%s stale_sec=%.1f", f"{age:.1f}" if age is not None else None, stale_sec)
+            except Exception:
+                logger.exception("[push_stream] main stale fallback watcher loop failed")
+            time.sleep(interval)
+
+    threading.Thread(target=_watch, name="main-push-memory-fallback-watch", daemon=True).start()
+
+
 def start_push_stream(*args, **kwargs):
     if _should_skip_push_stream_start_in_main():
         _mark_main_ws_skipped()
         logger.warning(
             "[push_stream] WS start skipped in main process; "
             "main_database.py handles PUSH WebSocket/registration/storage. "
-            "Set AUTOSTOCK_MAIN_PUSH_WS_ENABLED=1 only for emergency standalone mode, "
-            "or AUTOSTOCK_MAIN_PUSH_WS_AUTO_FALLBACK=1 for explicit memory-only fallback."
+            "memory-only stale fallback watcher is active when enabled."
         )
         return None
 
@@ -272,7 +343,8 @@ def _runner_start_push_stream_guarded(*args, **kwargs):
         _mark_main_ws_skipped()
         logger.warning(
             "[push_stream] runner WS start skipped in main process; "
-            "main_database.py handles PUSH WebSocket/registration/storage."
+            "main_database.py handles PUSH WebSocket/registration/storage. "
+            "memory-only stale fallback watcher is active when enabled."
         )
         return None
     _prepare_main_memory_only_ws()
