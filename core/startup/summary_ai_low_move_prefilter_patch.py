@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/summary_ai_low_move_prefilter_patch.py
-# Version: V1-LOW-MOVE-BEFORE-APPROVED
+# Version: V2-LOW-MOVE-BEFORE-APPROVED-NONZERO-GUARD
 # ------------------------------------------------------------
 # 【目的】
 #   SUMMARY_AI の AI_OK / Top3 / approved 後に、発注直前の order_builder で
@@ -11,6 +11,9 @@
 #   - order_builder と同等の range_pct 閾値を SUMMARY_AI 選定段階で適用する。
 #   - low-move 候補は pending/entry_controller/order_builder まで進ませない。
 #   - range 情報が完全に欠損している行は誤除外を避け、後段の既存ガードに任せる。
+#   - V2: prefilter だけで approved=0 になり続けると、AI_OK があるのに
+#         no_ai_ok で完全停止する。安全弁として top候補を最小限残し、
+#         最終 order_builder / low move guard / board guard で止める。
 # ============================================================
 from __future__ import annotations
 
@@ -22,7 +25,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V1-LOW-MOVE-BEFORE-APPROVED"
+VERSION = "V2-LOW-MOVE-BEFORE-APPROVED-NONZERO-GUARD"
 _INSTALLED = False
 _ORIG_SELECT_AI_OK_ITEMS: Callable[..., Any] | None = None
 _ORIG_BUILD_AI_OK_APPROVED_ROWS: Callable[..., Any] | None = None
@@ -54,6 +57,16 @@ def _env_float(name: str, default: float) -> float:
     except Exception:
         pass
     return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        raw = os.getenv(name)
+        if raw is not None and str(raw).strip() != "":
+            return int(float(str(raw).replace(",", "")))
+    except Exception:
+        pass
+    return int(default)
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -109,7 +122,6 @@ def _first(d: dict[str, Any], keys: tuple[str, ...], default: Any = None) -> Any
 def _merged_row(item: Any) -> dict[str, Any]:
     base = _as_dict(item)
     out: dict[str, Any] = {}
-    # source_row -> ai_row -> item の順で重ねる。item側の明示値を優先。
     for root in (base.get("source_row"), base.get("ai_row"), base):
         d = _as_dict(root)
         for k, v in d.items():
@@ -138,8 +150,22 @@ def _pick_side(row: dict[str, Any]) -> str:
     return "SELL" if score < 0 else "BUY" if score > 0 else ""
 
 
+def _score(row: dict[str, Any]) -> float:
+    side = _pick_side(row)
+    if side == "BUY":
+        return max(
+            _safe_float(_first(row, ("score_buy", "buy_score"), 0.0), 0.0),
+            _safe_float(_first(row, ("score", "score_total", "final_score", "display_score"), 0.0), 0.0),
+        )
+    if side == "SELL":
+        return max(
+            _safe_float(_first(row, ("score_sell", "sell_score"), 0.0), 0.0),
+            abs(_safe_float(_first(row, ("score", "score_total", "final_score", "display_score"), 0.0), 0.0)),
+        )
+    return abs(_safe_float(_first(row, ("score", "score_total", "final_score", "display_score"), 0.0), 0.0))
+
+
 def _range_pct(row: dict[str, Any]) -> tuple[float | None, dict[str, Any]]:
-    # 既に range_pct 系があればそれを優先。order_builder と同じ単位の値を想定する。
     for k in (
         "range_pct",
         "range_5m_pct",
@@ -156,7 +182,6 @@ def _range_pct(row: dict[str, Any]) -> tuple[float | None, dict[str, Any]]:
     high = _safe_float(_first(row, ("high", "high_price", "HighPrice", "day_high"), 0.0), 0.0)
     low = _safe_float(_first(row, ("low", "low_price", "LowPrice", "day_low"), 0.0), 0.0)
     if close > 0 and high > 0 and low > 0 and high >= low:
-        # 既存ログの min_range_pct=0.005 に合わせ、百分率ではなく比率で返す。
         v = (high - low) / close
         return v, {"source": "high_low_close_ratio", "range_pct": v, "high": high, "low": low, "close": close}
     return None, {"source": "missing", "close": close, "high": high, "low": low}
@@ -171,7 +196,7 @@ def _is_low_move_ng(item: Any) -> tuple[bool, dict[str, Any]]:
     reject_missing = _env_bool("SUMMARY_AI_PREFILTER_REJECT_MISSING_RANGE", False)
 
     detail = dict(detail)
-    detail.update({"symbol": symbol, "side": side, "min_range_pct": min_range})
+    detail.update({"symbol": symbol, "side": side, "min_range_pct": min_range, "score": _score(row)})
 
     if rp is None:
         detail["reason"] = "range_missing"
@@ -179,6 +204,31 @@ def _is_low_move_ng(item: Any) -> tuple[bool, dict[str, Any]]:
 
     detail["reason"] = "LOW_MOVE_RANGE_TOO_SMALL" if rp < min_range else "ok"
     return bool(rp < min_range), detail
+
+
+def _best_rescue_items(items: list[dict[str, Any]], skipped: list[dict[str, Any]], *, stage: str) -> list[dict[str, Any]]:
+    if not items:
+        return []
+    if not _env_bool("SUMMARY_AI_PREFILTER_KEEP_MIN_IF_ALL_SKIPPED", True):
+        return []
+    keep_n = max(1, _env_int("SUMMARY_AI_PREFILTER_KEEP_MIN_COUNT", 1))
+    # 全落ち回避。LOW_MOVE自体を緩和するのではなく、最終 order_builder で再判定させる。
+    ranked = []
+    for item in items:
+        row = _merged_row(item)
+        ranked.append((_score(row), _pick_symbol(row), item))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    rescued = [x[2] for x in ranked[:keep_n]]
+    logger.warning(
+        "[SUMMARY AI LOW MOVE PREFILTER] all skipped safety rescue stage=%s keep=%s skipped_count=%s rescued=%s skipped_head=%s version=%s",
+        stage,
+        len(rescued),
+        len(skipped),
+        [{"symbol": x[1], "score": x[0]} for x in ranked[:keep_n]],
+        skipped[:20],
+        VERSION,
+    )
+    return rescued
 
 
 def _filter_low_move_items(items: list[dict[str, Any]], *, stage: str) -> list[dict[str, Any]]:
@@ -199,6 +249,8 @@ def _filter_low_move_items(items: list[dict[str, Any]], *, stage: str) -> list[d
         except Exception:
             logger.debug("[SUMMARY AI LOW MOVE PREFILTER] item check failed stage=%s", stage, exc_info=True)
             kept.append(item)
+    if not kept and items:
+        kept = _best_rescue_items(items, skipped, stage=stage)
     if skipped or missing:
         logger.warning(
             "[SUMMARY AI LOW MOVE PREFILTER] stage=%s before=%s after=%s skipped=%s missing=%s version=%s",
@@ -220,41 +272,53 @@ def _install_executor_prefilter() -> bool:
         changed = []
 
         cur_select = getattr(ex, "_select_ai_ok_items", None)
-        if callable(cur_select) and not getattr(cur_select, "_summary_ai_low_move_prefilter_v1", False):
-            _ORIG_SELECT_AI_OK_ITEMS = cur_select
+        if callable(cur_select) and not getattr(cur_select, "_summary_ai_low_move_prefilter_v2", False):
+            _ORIG_SELECT_AI_OK_ITEMS = getattr(cur_select, "_original", cur_select)
 
             def _patched_select_ai_ok_items(ok_items, *, max_entries: int):
                 try:
                     filtered_items = _filter_low_move_items(list(ok_items or []), stage="before_top_selection")
-                    return _ORIG_SELECT_AI_OK_ITEMS(filtered_items, max_entries=max_entries)
+                    selected = _ORIG_SELECT_AI_OK_ITEMS(filtered_items, max_entries=max_entries)
+                    if not selected and ok_items and _env_bool("SUMMARY_AI_PREFILTER_KEEP_MIN_IF_ALL_SKIPPED", True):
+                        logger.warning("[SUMMARY AI LOW MOVE PREFILTER] original selected=0 -> retry with top rescue items")
+                        rescue = _best_rescue_items(list(ok_items or []), [], stage="select_retry")
+                        return _ORIG_SELECT_AI_OK_ITEMS(rescue, max_entries=max_entries)
+                    return selected
                 except Exception:
                     logger.exception("[SUMMARY AI LOW MOVE PREFILTER] _select_ai_ok_items patch failed -> original")
                     return _ORIG_SELECT_AI_OK_ITEMS(ok_items, max_entries=max_entries)
 
+            _patched_select_ai_ok_items._summary_ai_low_move_prefilter_v2 = True  # type: ignore[attr-defined]
             _patched_select_ai_ok_items._summary_ai_low_move_prefilter_v1 = True  # type: ignore[attr-defined]
-            _patched_select_ai_ok_items._original = cur_select  # type: ignore[attr-defined]
+            _patched_select_ai_ok_items._original = _ORIG_SELECT_AI_OK_ITEMS  # type: ignore[attr-defined]
             ex._select_ai_ok_items = _patched_select_ai_ok_items
             changed.append("_select_ai_ok_items")
 
         cur_build = getattr(ex, "build_ai_ok_approved_rows", None)
-        if callable(cur_build) and not getattr(cur_build, "_summary_ai_low_move_prefilter_v1", False):
-            _ORIG_BUILD_AI_OK_APPROVED_ROWS = cur_build
+        if callable(cur_build) and not getattr(cur_build, "_summary_ai_low_move_prefilter_v2", False):
+            _ORIG_BUILD_AI_OK_APPROVED_ROWS = getattr(cur_build, "_original", cur_build)
 
             def _patched_build_ai_ok_approved_rows(ai_results, *, max_entries: int = 3):
                 rows = _ORIG_BUILD_AI_OK_APPROVED_ROWS(ai_results, max_entries=max_entries)
                 if not isinstance(rows, list):
                     return rows
-                return _filter_low_move_items(rows, stage="after_approved_build")
+                filtered = _filter_low_move_items(rows, stage="after_approved_build")
+                if not filtered and rows and _env_bool("SUMMARY_AI_PREFILTER_KEEP_MIN_IF_ALL_SKIPPED", True):
+                    return _best_rescue_items(rows, [], stage="after_approved_rescue")
+                return filtered
 
+            _patched_build_ai_ok_approved_rows._summary_ai_low_move_prefilter_v2 = True  # type: ignore[attr-defined]
             _patched_build_ai_ok_approved_rows._summary_ai_low_move_prefilter_v1 = True  # type: ignore[attr-defined]
-            _patched_build_ai_ok_approved_rows._original = cur_build  # type: ignore[attr-defined]
+            _patched_build_ai_ok_approved_rows._original = _ORIG_BUILD_AI_OK_APPROVED_ROWS  # type: ignore[attr-defined]
             ex.build_ai_ok_approved_rows = _patched_build_ai_ok_approved_rows
             changed.append("build_ai_ok_approved_rows")
 
         logger.warning(
-            "[SUMMARY AI LOW MOVE PREFILTER] installed changed=%s min_range_pct=%s reject_missing=%s version=%s",
+            "[SUMMARY AI LOW MOVE PREFILTER] installed changed=%s min_range_pct=%s keep_min_if_all_skipped=%s keep_min_count=%s reject_missing=%s version=%s",
             changed,
             _env_float("SUMMARY_AI_PREFILTER_MIN_RANGE_PCT", _env_float("ENTRY_ORDER_MIN_RANGE_PCT", 0.005)),
+            _env_bool("SUMMARY_AI_PREFILTER_KEEP_MIN_IF_ALL_SKIPPED", True),
+            _env_int("SUMMARY_AI_PREFILTER_KEEP_MIN_COUNT", 1),
             _env_bool("SUMMARY_AI_PREFILTER_REJECT_MISSING_RANGE", False),
             VERSION,
         )
@@ -272,6 +336,8 @@ def install() -> bool:
         os.environ.setdefault("SUMMARY_AI_LOW_MOVE_PREFILTER_ENABLED", "1")
         os.environ.setdefault("SUMMARY_AI_PREFILTER_MIN_RANGE_PCT", "0.005")
         os.environ.setdefault("SUMMARY_AI_PREFILTER_REJECT_MISSING_RANGE", "0")
+        os.environ.setdefault("SUMMARY_AI_PREFILTER_KEEP_MIN_IF_ALL_SKIPPED", "1")
+        os.environ.setdefault("SUMMARY_AI_PREFILTER_KEEP_MIN_COUNT", "1")
         ok = _install_executor_prefilter()
         _INSTALLED = bool(ok)
         return bool(ok)
