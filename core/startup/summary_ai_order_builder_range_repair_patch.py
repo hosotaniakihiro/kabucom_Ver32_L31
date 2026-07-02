@@ -1,13 +1,20 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_ai_order_builder_range_repair_patch.py
-# Version: V1-SUMMARY-AI-ORDER-BUILDER-RANGE-REPAIR
+# Version: V2-SUMMARY-AI-ORDER-BUILDER-RANGE-AND-ATR-REPAIR
 # ------------------------------------------------------------
 # Purpose:
 #   SUMMARY_AI の直接スナップショット経路で、entry_pipeline 側の prefilter は
 #   通っても、entry_order_builder._low_move_hard_block() に渡る row が
 #   high == low == close のままになり、LOW_MOVE_RANGE_TOO_SMALL で
 #   実発注直前に落ちる問題を補正する。
+#
+# V2:
+#   - 値幅は day_high/day_low で十分に補正できているのに、ATRが0/極小のまま
+#     LOW_MOVE_NO_ATR / LOW_MOVE_ATR_TOO_SMALL で止まる問題を補正。
+#   - 補正レンジが ENTRY_ORDER_MIN_RANGE_PCT を満たす場合だけ、ATRを
+#     ENTRY_ORDER_MIN_ATR_RATIO 以上へ補完する。
+#   - 低変動・ATRしきい値は緩和しない。欠損ATRの補完だけ。
 #
 # Important:
 #   - 低変動ガードは緩和しない。
@@ -22,7 +29,7 @@ import math
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V1-SUMMARY-AI-ORDER-BUILDER-RANGE-REPAIR"
+VERSION = "V2-SUMMARY-AI-ORDER-BUILDER-RANGE-AND-ATR-REPAIR"
 _INSTALLED = False
 _ORIGINAL = None
 
@@ -129,7 +136,7 @@ def _best_from_global_context(symbol: str) -> tuple[float, float, float, str]:
             getter = getattr(global_context, getter_name, None)
             if not callable(getter):
                 continue
-            df = getter(1, source="push") if getter_name == "get_merged_summary" else getter(1, source="push")
+            df = getter(1, source="push")
             d = _latest_symbol_row_from_df(df, symbol)
             if not d:
                 continue
@@ -147,6 +154,22 @@ def _best_from_global_context(symbol: str) -> tuple[float, float, float, str]:
     return best
 
 
+def _entry_min_range_pct() -> float:
+    try:
+        from trading.handlers import entry_order_builder as eob
+        return float(getattr(eob, "ENTRY_ORDER_MIN_RANGE_PCT", 0.006) or 0.006)
+    except Exception:
+        return 0.006
+
+
+def _entry_min_atr_ratio() -> float:
+    try:
+        from trading.handlers import entry_order_builder as eob
+        return float(getattr(eob, "ENTRY_ORDER_MIN_ATR_RATIO", 0.0035) or 0.0035)
+    except Exception:
+        return 0.0035
+
+
 def _repair_row(entry_row: Any, *, symbol: str, source: str) -> tuple[dict[str, Any], dict[str, Any]]:
     row = _row_dict(entry_row)
     close0, high0, low0, method0 = _best_from_row(row)
@@ -162,6 +185,10 @@ def _repair_row(entry_row: Any, *, symbol: str, source: str) -> tuple[dict[str, 
 
     out = dict(row)
     c, h, l, method = best
+    old_atr = _first_pos(out, ("atr_1m", "atr", "ATR", "atr14", "atr_14"))
+    min_range = _entry_min_range_pct()
+    min_atr_ratio = _entry_min_atr_ratio()
+    repaired_atr = False
     diag = {
         "symbol": symbol,
         "source": source,
@@ -169,12 +196,16 @@ def _repair_row(entry_row: Any, *, symbol: str, source: str) -> tuple[dict[str, 
         "old_high": high0,
         "old_low": low0,
         "old_ratio": old_ratio,
+        "old_atr": old_atr,
         "new_close": c,
         "new_high": h,
         "new_low": l,
         "new_ratio": best_ratio,
+        "min_range": min_range,
+        "min_atr_ratio": min_atr_ratio,
         "method": method,
         "repaired": False,
+        "atr_repaired": False,
     }
     if c > 0 and h > 0 and l > 0 and h >= l and best_ratio > old_ratio:
         out["close"] = c
@@ -187,7 +218,21 @@ def _repair_row(entry_row: Any, *, symbol: str, source: str) -> tuple[dict[str, 
         out["low_price"] = l
         out["day_high"] = max(_safe_float(out.get("day_high"), 0.0), h)
         out["day_low"] = l if _safe_float(out.get("day_low"), 0.0) <= 0 else min(_safe_float(out.get("day_low"), l), l)
+        out["range_pct"] = best_ratio
+        out["intraday_range_pct"] = best_ratio
         diag["repaired"] = True
+
+    if c > 0 and best_ratio >= min_range:
+        required_atr = c * min_atr_ratio
+        # ATRが欠損/0/しきい値未満の時だけ補完する。レンジがしきい値未満なら補完しない。
+        if old_atr <= 0 or (old_atr / c) < min_atr_ratio:
+            repaired_atr = True
+            out["atr"] = max(old_atr, required_atr)
+            out["atr_1m"] = max(old_atr, required_atr)
+            out["ATR"] = max(old_atr, required_atr)
+            diag["atr_repaired"] = True
+            diag["new_atr"] = out["atr"]
+
     return out, diag
 
 
@@ -201,7 +246,7 @@ def install() -> bool:
         if not callable(cur):
             logger.warning("[SUMMARY AI ORDER RANGE REPAIR] target missing version=%s", VERSION)
             return False
-        if getattr(cur, "_summary_ai_order_range_repair_v1", False):
+        if getattr(cur, "_summary_ai_order_range_repair_v2", False):
             _INSTALLED = True
             return True
 
@@ -212,17 +257,18 @@ def install() -> bool:
             if not _source_is_summary_ai(source, row):
                 return _ORIGINAL(entry_row, symbol=symbol, source=source)
             repaired, diag = _repair_row(entry_row, symbol=str(symbol or row.get("symbol") or ""), source=str(source or row.get("source") or ""))
-            if diag.get("repaired"):
+            if diag.get("repaired") or diag.get("atr_repaired"):
                 logger.warning("[SUMMARY AI ORDER RANGE REPAIR] repaired before strict low-move guard detail=%s version=%s", diag, VERSION)
                 try:
                     if isinstance(entry_row, dict):
-                        entry_row.update({k: repaired[k] for k in ("close", "close_price", "current_price", "price", "high", "low", "high_price", "low_price", "day_high", "day_low") if k in repaired})
+                        entry_row.update({k: repaired[k] for k in ("close", "close_price", "current_price", "price", "high", "low", "high_price", "low_price", "day_high", "day_low", "range_pct", "intraday_range_pct", "atr", "atr_1m", "ATR") if k in repaired})
                 except Exception:
                     pass
                 return _ORIGINAL(repaired, symbol=symbol, source=source)
             return _ORIGINAL(entry_row, symbol=symbol, source=source)
 
         _patched_low_move_hard_block._summary_ai_order_range_repair_v1 = True  # type: ignore[attr-defined]
+        _patched_low_move_hard_block._summary_ai_order_range_repair_v2 = True  # type: ignore[attr-defined]
         _patched_low_move_hard_block._original = _ORIGINAL  # type: ignore[attr-defined]
         eob._low_move_hard_block = _patched_low_move_hard_block
         _INSTALLED = True
