@@ -1,20 +1,22 @@
 # ============================================================
 # File   : core/startup/tonosama_fast_score_prefilter_patch.py
-# Version: V5-TONOSAMA-AI-SLOPE-ZERO-PRICE-BODY-FALLBACK
+# Version: V5.1-TONOSAMA-SLOPE-REPAIR-SELL-CLOSE-POSITION-GUARD
 # ------------------------------------------------------------
 # Purpose:
 #   Speed up Tonosama feature building and avoid losing strong candidates
-#   when 3m/5m surge history or computed slope is unavailable while
-#   price/body/range/volume evidence is already strong.
+#   when 3m/5m surge history is missing or price_change is 0.00 while
+#   range/volume/slope evidence is strong.
 #
-# Fix V5:
-#   - Latest logs show candidates reach Tonosama AI but are rejected by:
-#       AI fallback NG: slope low ... slope=0.000000
-#     even though price_chg/body indicate a clear move.
-#   - This keeps climax/reversal guards intact, but treats zero/missing
-#     slope as data-missing and uses price_chg/body as the fallback movement
-#     signal for the soft-rescue path only.
+# Fix V5.1:
+#   - Candidates can reach Tonosama AI but be rejected by:
+#       slope low side=SELL abs=0.0000 < 0.0010
+#     even though price/body/range evidence exists.
+#   - Treat zero/missing slope as data-missing only in the soft-rescue path.
+#   - Do not rescue SELL candidates that close near the top of the bar
+#     (close_position too high), because shorting strength into the high is unsafe.
+#   - Climax/reverse/actual opposite movement remain blocked.
 # ============================================================
+
 from __future__ import annotations
 
 import logging
@@ -25,7 +27,7 @@ from typing import Any
 import pandas as pd
 
 logger = logging.getLogger(__name__)
-VERSION = "V5-TONOSAMA-AI-SLOPE-ZERO-PRICE-BODY-FALLBACK"
+VERSION = "V5.1-TONOSAMA-SLOPE-REPAIR-SELL-CLOSE-POSITION-GUARD"
 _PATCHED = False
 _ORIG_BUILD_FEATURE_DF_WITH_5SEC = None
 _ORIG_AI_CHECK = None
@@ -63,6 +65,15 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return float(s)
     except Exception:
         return float(default)
+
+
+def _get(row: Any, key: str, default: Any = None) -> Any:
+    try:
+        if hasattr(row, "get"):
+            return row.get(key, default)
+        return getattr(row, key, default)
+    except Exception:
+        return default
 
 
 def _num(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
@@ -258,14 +269,13 @@ def _patched_build_feature_df_with_5sec() -> pd.DataFrame:
 
 
 def _movement_values(row: Any) -> tuple[float, float, float, float, str]:
-    price_chg = _safe_float(row.get("_max_price_change_pct"), 0.0) if hasattr(row, "get") else 0.0
-    body = _safe_float(row.get("_signed_body_change_pct"), 0.0) if hasattr(row, "get") else 0.0
-    slope = _safe_float(row.get("_slope"), 0.0) if hasattr(row, "get") else 0.0
+    price_chg = _safe_float(_get(row, "_max_price_change_pct"), 0.0)
+    body = _safe_float(_get(row, "_signed_body_change_pct"), 0.0)
+    slope = _safe_float(_get(row, "_slope"), 0.0)
     effective_slope = slope
     source = "slope"
     if abs(effective_slope) <= 1e-12:
         # Convert pct-style movement into a small slope-like value only for rescue diagnostics.
-        # Example: -1.13% -> -0.00113. This does not overwrite the row or loosen hard guards.
         if abs(price_chg) > 0:
             effective_slope = price_chg / 1000.0
             source = "price_chg_proxy"
@@ -282,6 +292,17 @@ def _infer_side(row: Any) -> str:
     return "BUY"
 
 
+def _sell_close_position_block(row: Any) -> tuple[bool, str]:
+    side = _infer_side(row)
+    if side != "SELL":
+        return False, "not_sell"
+    close_pos = _safe_float(_get(row, "_close_position_pct"), 50.0)
+    max_close_pos = _env_float("TONOSAMA_AI_SELL_MAX_CLOSE_POSITION_PCT", 65.0)
+    if close_pos > max_close_pos:
+        return True, f"sell_close_position_high close_position={close_pos:.2f} max={max_close_pos:.2f}"
+    return False, "ok"
+
+
 def _soft_rescue_ai_ng(row: Any, reason: str) -> tuple[bool, str]:
     if not _env_bool("TONOSAMA_AI_SOFT_RESCUE", True):
         return False, "disabled"
@@ -296,17 +317,18 @@ def _soft_rescue_ai_ng(row: Any, reason: str) -> tuple[bool, str]:
     if not ("price change low" in r or "slope low" in r or "range_rescue_direction_ng" in r):
         return False, "not_soft_reason"
 
-    volume = _safe_float(row.get("_latest_volume"), 0.0) if hasattr(row, "get") else 0.0
-    rng = _safe_float(row.get("_intrabar_range_pct"), 0.0) if hasattr(row, "get") else 0.0
-    surge = _safe_float(row.get("_max_volume_surge_ratio"), 0.0) if hasattr(row, "get") else 0.0
+    block, block_reason = _sell_close_position_block(row)
+    if block:
+        return False, block_reason
+
+    volume = _safe_float(_get(row, "_latest_volume"), 0.0)
+    rng = _safe_float(_get(row, "_intrabar_range_pct"), 0.0)
+    surge = _safe_float(_get(row, "_max_volume_surge_ratio"), 0.0)
     price_chg, body, slope, effective_slope, slope_source = _movement_values(row)
     side = _infer_side(row)
 
     min_vol = _env_float("TONOSAMA_AI_RESCUE_MIN_VOLUME", 500000.0)
     min_range = _env_float("TONOSAMA_AI_RESCUE_MIN_RANGE_PCT", 4.0)
-    # V5: when computed slope is missing/zero but price/body already prove movement,
-    # use a separate minimum range. It defaults to the actual final order range guard
-    # idea rather than the old 4% rescue-only threshold.
     min_price_body_range = _env_float("TONOSAMA_AI_RESCUE_PRICE_BODY_MIN_RANGE_PCT", 1.0)
     min_surge = _env_float("TONOSAMA_AI_RESCUE_MIN_SURGE", 3.0)
     min_chg = _env_float("TONOSAMA_AI_RESCUE_MIN_PRICE_CHANGE_PCT", 0.08)
@@ -352,10 +374,10 @@ def _patched_ai_check_tonosama_entry(row: Any):
     if _env_bool("TONOSAMA_FAST_SCORE_AI_SHORT_CIRCUIT", True):
         try:
             import trading.entry.tonosama.runner as runner
-            raw_score = _safe_float(row.get("_tonosama_score"), 0.0) if hasattr(row, "get") else 0.0
+            raw_score = _safe_float(_get(row, "_tonosama_score"), 0.0)
             th = _threshold(runner)
             if raw_score < th:
-                symbol = row.get("symbol", "") if hasattr(row, "get") else ""
+                symbol = _get(row, "symbol", "")
                 logger.info(
                     "[TONOSAMA FAST SCORE PREFILTER] AI short-circuit symbol=%s raw_score=%.4f threshold=%.4f reason=final_score_low_pre_ai",
                     symbol, raw_score, th,
@@ -366,10 +388,20 @@ def _patched_ai_check_tonosama_entry(row: Any):
 
     ok, prob, reason = _ORIG_AI_CHECK(row)
     if ok:
+        block, block_reason = _sell_close_position_block(row)
+        if block:
+            symbol = _get(row, "symbol", "")
+            logger.warning(
+                "[TONOSAMA AI SELL CLOSE POSITION GUARD] block symbol=%s reason=%s version=%s",
+                symbol,
+                block_reason,
+                VERSION,
+            )
+            return False, prob, block_reason
         return ok, prob, reason
 
     try:
-        symbol = row.get("symbol", "") if hasattr(row, "get") else ""
+        symbol = _get(row, "symbol", "")
         rescue, detail = _soft_rescue_ai_ng(row, str(reason or ""))
         if rescue:
             logger.warning(
@@ -396,19 +428,21 @@ def install() -> bool:
 
         patched = []
         cur_build = getattr(runner, "build_feature_df_with_5sec", None)
-        if callable(cur_build) and not getattr(cur_build, "_tonosama_fast_score_prefilter_v5", False):
+        if callable(cur_build) and not getattr(cur_build, "_tonosama_fast_score_prefilter_v51", False):
             _ORIG_BUILD_FEATURE_DF_WITH_5SEC = getattr(cur_build, "_original", cur_build)
             _patched_build_feature_df_with_5sec._tonosama_fast_score_prefilter_v4 = True  # type: ignore[attr-defined]
             _patched_build_feature_df_with_5sec._tonosama_fast_score_prefilter_v5 = True  # type: ignore[attr-defined]
+            _patched_build_feature_df_with_5sec._tonosama_fast_score_prefilter_v51 = True  # type: ignore[attr-defined]
             _patched_build_feature_df_with_5sec._original = _ORIG_BUILD_FEATURE_DF_WITH_5SEC  # type: ignore[attr-defined]
             runner.build_feature_df_with_5sec = _patched_build_feature_df_with_5sec
             patched.append("runner.build_feature_df_with_5sec")
 
         cur_ai = getattr(runner, "ai_check_tonosama_entry", None)
-        if callable(cur_ai) and not getattr(cur_ai, "_tonosama_fast_score_prefilter_v5", False):
+        if callable(cur_ai) and not getattr(cur_ai, "_tonosama_fast_score_prefilter_v51", False):
             _ORIG_AI_CHECK = getattr(cur_ai, "_original", cur_ai)
             _patched_ai_check_tonosama_entry._tonosama_fast_score_prefilter_v4 = True  # type: ignore[attr-defined]
             _patched_ai_check_tonosama_entry._tonosama_fast_score_prefilter_v5 = True  # type: ignore[attr-defined]
+            _patched_ai_check_tonosama_entry._tonosama_fast_score_prefilter_v51 = True  # type: ignore[attr-defined]
             _patched_ai_check_tonosama_entry._original = _ORIG_AI_CHECK  # type: ignore[attr-defined]
             runner.ai_check_tonosama_entry = _patched_ai_check_tonosama_entry
             ai_gate.ai_check_tonosama_entry = _patched_ai_check_tonosama_entry
@@ -416,7 +450,7 @@ def install() -> bool:
 
         _PATCHED = True
         logger.warning(
-            "[TONOSAMA FAST SCORE PREFILTER] installed v5 patched=%s enabled=%s ratio=%.2f ai_short=%s soft_rescue=%s zero_surge_score_rescue=%s zero_price_slope_min=%.6f rescue_min_vol=%.0f rescue_min_range=%.2f price_body_min_range=%.2f rescue_min_chg=%.3f version=%s",
+            "[TONOSAMA FAST SCORE PREFILTER] installed v5.1 patched=%s enabled=%s ratio=%.2f ai_short=%s soft_rescue=%s zero_surge_score_rescue=%s zero_price_slope_min=%.6f sell_max_close_pos=%.2f rescue_min_vol=%.0f rescue_min_range=%.2f price_body_min_range=%.2f rescue_min_chg=%.3f version=%s",
             patched,
             _env_bool("TONOSAMA_FAST_SCORE_PREFILTER", True),
             _env_float("TONOSAMA_FAST_SCORE_PREFILTER_RATIO", 1.0),
@@ -424,6 +458,7 @@ def install() -> bool:
             _env_bool("TONOSAMA_AI_SOFT_RESCUE", True),
             _env_bool("TONOSAMA_ZERO_SURGE_PREFILTER_SCORE_RESCUE", True),
             _env_float("TONOSAMA_AI_RESCUE_ZERO_PRICE_MIN_SLOPE_ABS", _env_float("TONOSAMA_AI_RESCUE_MIN_SLOPE_ABS", 0.0003)),
+            _env_float("TONOSAMA_AI_SELL_MAX_CLOSE_POSITION_PCT", 65.0),
             _env_float("TONOSAMA_AI_RESCUE_MIN_VOLUME", 500000.0),
             _env_float("TONOSAMA_AI_RESCUE_MIN_RANGE_PCT", 4.0),
             _env_float("TONOSAMA_AI_RESCUE_PRICE_BODY_MIN_RANGE_PCT", 1.0),
