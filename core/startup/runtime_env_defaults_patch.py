@@ -2,6 +2,8 @@
 """
 Compatibility installer for centralized runtime environment defaults.
 
+REV27:
+  - force install strict Tonosama history fail-close and Summary-AI threshold defaults.
 REV26:
   - install PUSH summary DB latest source patch in DB/data collector contexts so
     summary_database can read fresh PUSH rows from pushYYYYMMDD.db instead of stale
@@ -30,7 +32,7 @@ from .runtime_settings_ini_loader import load_settings_ini
 from . import runtime_env_defaults as _defaults
 
 logger = logging.getLogger(__name__)
-VERSION = "REV26-RUNTIME-ENV-DEFAULTS-PUSH-SUMMARY-DB-SOURCE"
+VERSION = "REV27-RUNTIME-ENV-DEFAULTS-STRICT-ENTRY-GUARDS"
 DEFAULTS_VERSION = getattr(_defaults, "VERSION", "unknown")
 env_bool = getattr(_defaults, "env_bool")
 _INSTALLED = False
@@ -136,6 +138,23 @@ def _apply_ranking_api_spacing_default(context: str) -> Dict[str, str]:
     except Exception:
         logger.exception("[RUNTIME ENV DEFAULTS PATCH] ranking api spacing default failed context=%s", context)
     return applied
+
+
+def _install_strict_entry_defaults(context: str) -> bool:
+    """Always-loaded strict guard for no-relax operation."""
+    try:
+        if context not in TRADING_CONTEXTS:
+            return False
+        if os.environ.get("DISABLE_STRICT_ENTRY_DEFAULTS_PATCH", "").strip() == "1":
+            logger.warning("[RUNTIME ENV DEFAULTS PATCH] strict entry defaults disabled by env")
+            return False
+        from . import tonosama_history_failclose_strict_patch
+        ok = bool(tonosama_history_failclose_strict_patch.install())
+        logger.warning("[RUNTIME ENV DEFAULTS PATCH] strict entry defaults installed ok=%s context=%s", ok, context)
+        return ok
+    except Exception:
+        logger.exception("[RUNTIME ENV DEFAULTS PATCH] strict entry defaults install failed")
+        return False
 
 
 def _force_install_summary_ai_safety_guard(context: str) -> bool:
@@ -280,6 +299,9 @@ def install() -> bool:
         ranking_spacing_applied = _apply_ranking_api_spacing_default(context)
         applied.update(ranking_spacing_applied)
 
+        # strict は rescue/safety より前に入れ、後続patchの setdefault に負けないようにする。
+        strict_entry_defaults_ok = _install_strict_entry_defaults(context)
+
         intraday_load_guard_ok = _install_intraday_load_guard(context)
         yahoo_parallel_empty_ok = _install_yahoo_parallel_empty_cooldown(context)
         ranking_legacy_inline_ok = _install_ranking_legacy_inline_flush(context)
@@ -302,7 +324,7 @@ def install() -> bool:
         daytrade_credit_ok = _install_daytrade_credit_force_close(context)
         _INSTALLED = True
         logger.warning(
-            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s ranking_api_sleep=%s ranking_spacing_applied=%s intraday_load_guard=%s yahoo_parallel_empty=%s ranking_legacy_inline=%s summary_lock_pressure=%s push_summary_db_source=%s summary_db_realtime=%s database_owner=%s full_pipeline=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s summary_ai_safety=%s summary_pending_stale=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s tonosama_exit_infer=%s tonosama_pending_audit=%s daytrade_credit=%s verbose=%s",
+            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s ranking_api_sleep=%s ranking_spacing_applied=%s strict_entry_defaults=%s intraday_load_guard=%s yahoo_parallel_empty=%s ranking_legacy_inline=%s summary_lock_pressure=%s push_summary_db_source=%s summary_db_realtime=%s database_owner=%s full_pipeline=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s summary_ai_safety=%s summary_pending_stale=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s tonosama_exit_infer=%s tonosama_pending_audit=%s daytrade_credit=%s verbose=%s",
             VERSION,
             DEFAULTS_VERSION,
             REGISTRY_VERSION,
@@ -314,6 +336,7 @@ def install() -> bool:
             ",".join(USER_GROUP_ORDER),
             os.environ.get("RANKING_API_CALL_SLEEP_SEC"),
             ranking_spacing_applied,
+            strict_entry_defaults_ok,
             intraday_load_guard_ok,
             yahoo_parallel_empty_ok,
             ranking_legacy_inline_ok,
