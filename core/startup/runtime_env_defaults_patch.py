@@ -2,6 +2,9 @@
 """
 Compatibility installer for centralized runtime environment defaults.
 
+REV29:
+  - force install SUMMARY AI ATR 1m filter repair so ATR_1M_FILTER_NG caused by
+    missing/flat approved rows is repaired from existing 1m history/range data.
 REV28:
   - force install SUMMARY AI direct timeout continuation so rolling dispatch
     proceeds to the next AI_OK batch when one direct snapshot batch times out.
@@ -35,7 +38,7 @@ from .runtime_settings_ini_loader import load_settings_ini
 from . import runtime_env_defaults as _defaults
 
 logger = logging.getLogger(__name__)
-VERSION = "REV28-RUNTIME-ENV-DEFAULTS-SUMMARY-AI-TIMEOUT-CONTINUE"
+VERSION = "REV29-RUNTIME-ENV-DEFAULTS-SUMMARY-AI-ATR-1M-REPAIR"
 DEFAULTS_VERSION = getattr(_defaults, "VERSION", "unknown")
 env_bool = getattr(_defaults, "env_bool")
 _INSTALLED = False
@@ -193,6 +196,16 @@ def _install_summary_ai_direct_timeout_continue(context: str) -> bool:
     )
 
 
+def _install_summary_ai_atr_1m_filter_repair(context: str) -> bool:
+    return _safe_install(
+        "summary AI ATR 1m filter repair",
+        context,
+        TRADING_CONTEXTS,
+        "DISABLE_SUMMARY_AI_ATR_1M_FILTER_REPAIR_PATCH",
+        "summary_ai_atr_1m_filter_repair_patch",
+    )
+
+
 def _install_entry_fire_rescue(context: str) -> bool:
     return _safe_install("entry fire rescue", context, TRADING_CONTEXTS, "DISABLE_ENTRY_FIRE_RESCUE_PATCH", "entry_fire_rescue_runtime_patch")
 
@@ -326,6 +339,7 @@ def install() -> bool:
         entry_count_unblock_ok = _install_entry_count_unblock(context)
         summary_ai_safety_ok = _force_install_summary_ai_safety_guard(context)
         summary_ai_direct_timeout_continue_ok = _install_summary_ai_direct_timeout_continue(context)
+        summary_ai_atr_1m_repair_ok = _install_summary_ai_atr_1m_filter_repair(context)
         summary_pending_stale_ok = _install_summary_pending_stale_guard(context)
         entry_fire_rescue_ok = _install_entry_fire_rescue(context)
         ranking_entry_rescue_ok = _install_ranking_entry_runtime_rescue(context)
@@ -338,7 +352,7 @@ def install() -> bool:
         daytrade_credit_ok = _install_daytrade_credit_force_close(context)
         _INSTALLED = True
         logger.warning(
-            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s ranking_api_sleep=%s ranking_spacing_applied=%s strict_entry_defaults=%s intraday_load_guard=%s yahoo_parallel_empty=%s ranking_legacy_inline=%s summary_lock_pressure=%s push_summary_db_source=%s summary_db_realtime=%s database_owner=%s full_pipeline=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s summary_ai_safety=%s summary_ai_direct_timeout_continue=%s summary_pending_stale=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s tonosama_exit_infer=%s tonosama_pending_audit=%s daytrade_credit=%s verbose=%s",
+            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s ranking_api_sleep=%s ranking_spacing_applied=%s strict_entry_defaults=%s intraday_load_guard=%s yahoo_parallel_empty=%s ranking_legacy_inline=%s summary_lock_pressure=%s push_summary_db_source=%s summary_db_realtime=%s database_owner=%s full_pipeline=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s summary_ai_safety=%s summary_ai_direct_timeout_continue=%s summary_ai_atr_1m_repair=%s summary_pending_stale=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s tonosama_exit_infer=%s tonosama_pending_audit=%s daytrade_credit=%s verbose=%s",
             VERSION,
             DEFAULTS_VERSION,
             REGISTRY_VERSION,
@@ -365,6 +379,7 @@ def install() -> bool:
             entry_count_unblock_ok,
             summary_ai_safety_ok,
             summary_ai_direct_timeout_continue_ok,
+            summary_ai_atr_1m_repair_ok,
             summary_pending_stale_ok,
             entry_fire_rescue_ok,
             ranking_entry_rescue_ok,
