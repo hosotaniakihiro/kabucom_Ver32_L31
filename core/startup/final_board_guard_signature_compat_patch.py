@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/final_board_guard_signature_compat_patch.py
-# Version: V4-SUMMARY-AI-CURRENT-DF-FRESHNESS
+# Version: V5-SUMMARY-AI-LOW-MOVE-PREFILTER
 # ------------------------------------------------------------
 # Purpose:
 #   final_entry_safety_guard_patch Ver12 以降は _board_guard 自体が
 #   4引数対応済みのため、ここで再wrapしない。
 #
-# V4:
+# V5:
 #   - 古い V1 watcher が _board_guard を1秒ごとに再wrapする問題を停止。
 #   - summary_ai_entry_hook_dataframe_truth_patch 側の旧compat watcherが
 #     再wrapしないよう、現在の native guard に signature marker を付与。
@@ -15,6 +15,8 @@
 #   - 実発注直前の df_exec は最大3件にcapし、同時発注数は増やしすぎない。
 #   - SUMMARY_AI安全鮮度チェックが、現在AIへ渡された最新DFではなく古い
 #     global_data.push_df / raw fallback を見て stale_push_1m になる問題を修正。
+#   - ORDER_BUILD_NG: LOW_MOVE_RANGE_TOO_SMALL を entry_pipeline の3件cap前に除外し、
+#     3枠すべてを低値幅銘柄で浪費しない。
 # ============================================================
 from __future__ import annotations
 
@@ -27,14 +29,25 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V4-SUMMARY-AI-CURRENT-DF-FRESHNESS"
+VERSION = "V5-SUMMARY-AI-LOW-MOVE-PREFILTER"
 _WATCHER_STARTED = False
 _INSTALLED = False
 _LAST_TARGET_ID: int | None = None
 _SELECTION_PATCHED = False
 _EXEC_CAP_PATCHED = False
 _CURRENT_DF_PATCHED = False
+_LOW_MOVE_PREFILTER_PATCHED = False
 _CURRENT_AI_INPUT = threading.local()
+
+
+def _env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -50,6 +63,15 @@ def _env_int(name: str, default: int) -> int:
 def _env_float(name: str, default: float) -> float:
     try:
         v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
+
+
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
         if v is None or str(v).strip() == "":
             return float(default)
         return float(str(v).replace(",", ""))
@@ -195,16 +217,10 @@ def _install_current_df_freshness_patch() -> bool:
             df = getattr(_CURRENT_AI_INPUT, "df", None)
             ok, age, latest, rows, score_nonzero = _latest_age_sec(df)
             max_age = _env_float("SUMMARY_AI_MAX_PUSH_1M_AGE_SEC", 120.0)
-            # 現在AIへ渡されたDFが新鮮で、かつスコア付きなら、このDFを優先する。
             if ok and age is not None and age <= max_age and rows > 0 and score_nonzero > 0:
                 logger.warning(
                     "[SUMMARY AI SAFETY GUARD] current AI df freshness OK rows=%s latest=%s age=%.1f max=%.1f score_nonzero=%s version=%s",
-                    rows,
-                    latest,
-                    age,
-                    max_age,
-                    score_nonzero,
-                    VERSION,
+                    rows, latest, age, max_age, score_nonzero, VERSION,
                 )
                 return None
             return orig_reason()
@@ -284,6 +300,84 @@ def _install_summary_ai_selection_pool_patch() -> bool:
         return False
 
 
+def _summary_ai_like_row(row: Any) -> bool:
+    try:
+        d = row if isinstance(row, dict) else row.to_dict() if hasattr(row, "to_dict") else {}
+        source = str(d.get("source") or "").upper()
+        entry_type = str(d.get("entry_type") or "").upper()
+        reason = str(d.get("reason") or d.get("ai_reason") or "").upper()
+        return source in {"SUMMARY", "SUMMARY_AI", "PUSH", "PUSH_SUMMARY"} or entry_type == "SUMMARY_AI" or "SRC=SUMMARY" in reason
+    except Exception:
+        return False
+
+
+def _range_pct_from_row(row: Any) -> tuple[float, float, float, float, str]:
+    try:
+        d = row if isinstance(row, dict) else row.to_dict() if hasattr(row, "to_dict") else {}
+        close = _safe_float(d.get("close") or d.get("close_price") or d.get("price") or d.get("current_price"), 0.0)
+        high = _safe_float(d.get("high") or d.get("high_price") or d.get("day_high"), 0.0)
+        low = _safe_float(d.get("low") or d.get("low_price") or d.get("day_low"), 0.0)
+        symbol = str(d.get("symbol") or d.get("Symbol") or "")
+        if close <= 0:
+            close = max(high, low, 1.0)
+        if high <= 0 or low <= 0 or high < low:
+            return 0.0, close, high, low, symbol
+        return float((high - low) / close), close, high, low, symbol
+    except Exception:
+        return 0.0, 0.0, 0.0, 0.0, ""
+
+
+def _install_summary_ai_low_move_prefilter_patch() -> bool:
+    """Reject LOW_MOVE_RANGE_TOO_SMALL before the final 3-row cap so next candidates can fill the slots."""
+    global _LOW_MOVE_PREFILTER_PATCHED
+    if _LOW_MOVE_PREFILTER_PATCHED:
+        return True
+    try:
+        import trading.summary.pipeline.entry_pipeline as ep
+        cur = getattr(ep, "_allow_summary_ai_liquidity", None)
+        if not callable(cur):
+            return False
+        if getattr(cur, "_summary_ai_low_move_prefilter_v1", False):
+            _LOW_MOVE_PREFILTER_PATCHED = True
+            return True
+
+        def _allow_summary_ai_liquidity_low_move(row: dict, *, symbol: str, interval: int) -> bool:
+            ok = bool(cur(row, symbol=symbol, interval=interval))
+            if not ok:
+                return False
+            if not _env_bool("SUMMARY_AI_LOW_MOVE_PREFILTER_ENABLED", True):
+                return True
+            if not _summary_ai_like_row(row):
+                return True
+            range_pct, close, high, low, sym = _range_pct_from_row(row)
+            min_range = _env_float("ENTRY_ORDER_MIN_RANGE_PCT", _env_float("SUMMARY_AI_MIN_RANGE_PCT", 0.005))
+            # Missing high/low is not fail-open for SUMMARY_AI here; the order builder would reject it anyway.
+            if high <= 0 or low <= 0 or range_pct < min_range:
+                logger.warning(
+                    "[entry_pipeline] SUMMARY_AI low-move prefilter skip symbol=%s interval=%s close=%.2f high=%.2f low=%.2f range_pct=%.6f min=%.6f version=%s",
+                    sym or symbol,
+                    interval,
+                    close,
+                    high,
+                    low,
+                    range_pct,
+                    min_range,
+                    VERSION,
+                )
+                return False
+            return True
+
+        _allow_summary_ai_liquidity_low_move._summary_ai_low_move_prefilter_v1 = True  # type: ignore[attr-defined]
+        _allow_summary_ai_liquidity_low_move._original = cur  # type: ignore[attr-defined]
+        ep._allow_summary_ai_liquidity = _allow_summary_ai_liquidity_low_move
+        _LOW_MOVE_PREFILTER_PATCHED = True
+        logger.warning("[entry_pipeline] SUMMARY_AI low-move prefilter patch installed min_range=%s version=%s", _env_float("ENTRY_ORDER_MIN_RANGE_PCT", 0.005), VERSION)
+        return True
+    except Exception:
+        logger.debug("[entry_pipeline] SUMMARY_AI low-move prefilter patch not ready", exc_info=True)
+        return False
+
+
 def _install_entry_pipeline_exec_cap_patch() -> bool:
     """Cap actual df_exec rows after all filters. This keeps simultaneous orders <= 3."""
     global _EXEC_CAP_PATCHED
@@ -330,8 +424,9 @@ def _install_entry_pipeline_exec_cap_patch() -> bool:
 def _install_candidate_refill_patches() -> bool:
     ok0 = _install_current_df_freshness_patch()
     ok1 = _install_summary_ai_selection_pool_patch()
-    ok2 = _install_entry_pipeline_exec_cap_patch()
-    return bool(ok0 or ok1 or ok2)
+    ok2 = _install_summary_ai_low_move_prefilter_patch()
+    ok3 = _install_entry_pipeline_exec_cap_patch()
+    return bool(ok0 or ok1 or ok2 or ok3)
 
 
 def _watcher() -> None:
@@ -343,12 +438,12 @@ def _watcher() -> None:
             ok = _apply(reason=f"watcher:{i + 1}")
             _install_candidate_refill_patches()
             cur_id = _LAST_TARGET_ID
-            stable = stable + 1 if ok and cur_id == last_id and _SELECTION_PATCHED and _EXEC_CAP_PATCHED and _CURRENT_DF_PATCHED else 0
+            stable = stable + 1 if ok and cur_id == last_id and _SELECTION_PATCHED and _EXEC_CAP_PATCHED and _CURRENT_DF_PATCHED and _LOW_MOVE_PREFILTER_PATCHED else 0
             last_id = cur_id
             if stable >= 3:
                 logger.warning("[FINAL BOARD GUARD SIG COMPAT] watcher stable exit i=%s version=%s", i + 1, VERSION)
                 return
-        logger.warning("[FINAL BOARD GUARD SIG COMPAT] watcher done version=%s selection_patch=%s exec_cap=%s current_df=%s", VERSION, _SELECTION_PATCHED, _EXEC_CAP_PATCHED, _CURRENT_DF_PATCHED)
+        logger.warning("[FINAL BOARD GUARD SIG COMPAT] watcher done version=%s selection_patch=%s exec_cap=%s current_df=%s low_move=%s", VERSION, _SELECTION_PATCHED, _EXEC_CAP_PATCHED, _CURRENT_DF_PATCHED, _LOW_MOVE_PREFILTER_PATCHED)
     except Exception:
         logger.exception("[FINAL BOARD GUARD SIG COMPAT] watcher failed version=%s", VERSION)
 
@@ -368,7 +463,7 @@ def install() -> bool:
     _install_candidate_refill_patches()
     _start_watcher()
     _INSTALLED = bool(ok)
-    logger.warning("[FINAL BOARD GUARD SIG COMPAT] installed=%s version=%s selection_patch=%s exec_cap=%s current_df=%s", _INSTALLED, VERSION, _SELECTION_PATCHED, _EXEC_CAP_PATCHED, _CURRENT_DF_PATCHED)
+    logger.warning("[FINAL BOARD GUARD SIG COMPAT] installed=%s version=%s selection_patch=%s exec_cap=%s current_df=%s low_move=%s", _INSTALLED, VERSION, _SELECTION_PATCHED, _EXEC_CAP_PATCHED, _CURRENT_DF_PATCHED, _LOW_MOVE_PREFILTER_PATCHED)
     return _INSTALLED
 
 
