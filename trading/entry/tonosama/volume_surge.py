@@ -1,16 +1,14 @@
 # ============================================================
 # File   : trading/entry/tonosama/volume_surge.py
-# Version: Ver2.7-CONTROLLED-FAILOPEN-DEFAULT
+# Version: Ver2.8-STRICT-FAILCLOSE-DEFAULT
 # ------------------------------------------------------------
 # 目的:
 #   殿様エントリー用の出来高急増・価格変化特徴量を作る。
 #
-# Ver2.7:
-#   - 1分足が新鮮なのに3m/5m履歴だけが stale/empty の場合、
-#     candidates=0 で毎回止まる問題を防ぐ。
-#   - TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY / 
-#     TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING の既定を True に変更。
-#   - ただし base 1m が stale/empty の場合は従来通り停止。
+# Ver2.8:
+#   - ユーザー運用方針「緩和しない」に合わせ、3m/5m 出来高急増履歴が
+#     無い場合の controlled fail-open をデフォルト禁止。
+#   - fail-open は TONOSAMA_FORCE_SURGE_FAILOPEN=1 を明示した場合だけ許可。
 # ============================================================
 
 from __future__ import annotations
@@ -275,23 +273,19 @@ def _fallback_price_change_from_1m(out: pd.DataFrame) -> pd.Series:
 
 
 def _force_failopen_enabled() -> bool:
-    # Ver2.7: 1mが新鮮でここまで来ているなら、3m/5m履歴不足だけで候補0にしない。
-    return (
-        _env_bool("TONOSAMA_FORCE_SURGE_FAILOPEN", False)
-        or _env_bool("TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY", True)
-        or _env_bool("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING", True)
-        or _env_bool("TONOSAMA_ALLOW_EARLY_SURGE_FAILOPEN", False)
-    )
+    # Strict default: history missing must not become an entry candidate.
+    # Emergency override is allowed only with explicit force env.
+    return _env_bool("TONOSAMA_FORCE_SURGE_FAILOPEN", False)
 
 
 def _failopen_reason() -> str:
-    force_old = _env_bool("TONOSAMA_FORCE_SURGE_FAILOPEN", False)
-    early_old = _env_bool("TONOSAMA_ALLOW_EARLY_SURGE_FAILOPEN", False)
-    legacy_failopen = _env_bool("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING", True)
-    legacy_allow = _env_bool("TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY", True)
+    force = _env_bool("TONOSAMA_FORCE_SURGE_FAILOPEN", False)
+    early = _env_bool("TONOSAMA_ALLOW_EARLY_SURGE_FAILOPEN", False)
+    legacy_failopen = _env_bool("TONOSAMA_VOLUME_SURGE_FAILOPEN_IF_HISTORY_MISSING", False)
+    legacy_allow = _env_bool("TONOSAMA_ALLOW_ENTRY_WITHOUT_SURGE_HISTORY", False)
     if _force_failopen_enabled():
-        return f"controlled_failopen force={force_old} early={early_old} legacy_failopen={legacy_failopen} allow_without_history={legacy_allow}"
-    return f"disabled force={force_old} early={early_old} legacy_failopen={legacy_failopen} allow_without_history={legacy_allow}"
+        return f"explicit_force_failopen force={force} early={early} legacy_failopen={legacy_failopen} allow_without_history={legacy_allow}"
+    return f"strict_disabled force={force} early={early} legacy_failopen={legacy_failopen} allow_without_history={legacy_allow}"
 
 
 def _apply_history_unavailable_policy(out: pd.DataFrame) -> pd.DataFrame:
@@ -305,19 +299,19 @@ def _apply_history_unavailable_policy(out: pd.DataFrame) -> pd.DataFrame:
     if ratio_cols:
         ratio_missing_all = x[ratio_cols].isna().all(axis=1)
         if bool(ratio_missing_all.any()):
+            x.loc[ratio_missing_all, "_volume_surge_history_missing"] = True
             if _force_failopen_enabled():
                 val = _env_float("TONOSAMA_VOLUME_SURGE_FAILOPEN_VALUE", 3.0)
-                x.loc[ratio_missing_all, "_volume_surge_history_missing"] = True
                 x.loc[ratio_missing_all, "_volume_surge_failopen"] = True
                 for c in ratio_cols:
                     x.loc[ratio_missing_all, c] = val
-                logger.warning("[TONOSAMA SURGE] volume_surge history missing -> controlled fail-open rows=%s ratio_cols=%s value=%.3f reason=%s", int(ratio_missing_all.sum()), ratio_cols, val, _failopen_reason())
+                logger.warning("[TONOSAMA SURGE] volume_surge history missing -> explicit fail-open rows=%s ratio_cols=%s value=%.3f reason=%s", int(ratio_missing_all.sum()), ratio_cols, val, _failopen_reason())
             else:
-                x.loc[ratio_missing_all, "_volume_surge_history_missing"] = True
-                x.loc[ratio_missing_all, "_volume_surge_failopen"] = False
-                for c in ratio_cols:
-                    x.loc[ratio_missing_all, c] = 0.0
-                logger.warning("[TONOSAMA SURGE] volume_surge history missing -> fail-closed rows=%s ratio_cols=%s value=0.0 reason=%s", int(ratio_missing_all.sum()), ratio_cols, _failopen_reason())
+                # Strict: history missing rows are marked and removed immediately.
+                logger.warning("[TONOSAMA SURGE] volume_surge history missing -> strict drop rows=%s ratio_cols=%s reason=%s", int(ratio_missing_all.sum()), ratio_cols, _failopen_reason())
+                x = x.loc[~ratio_missing_all].copy()
+    if x.empty:
+        return x
     if price_cols:
         price_missing_all = x[price_cols].isna().all(axis=1)
         if bool(price_missing_all.any()):
@@ -355,7 +349,7 @@ def build_scalping_feature_df() -> pd.DataFrame:
         logger.warning("[TONOSAMA SURGE] no usable 3m/5m volume surge history after recent filter -> return empty base_rows=%s df3=%s df5=%s failopen_reason=%s raw1_latest=%s raw1_age_min=%s raw1_market_age_min=%s", len(df1), len(df3) if isinstance(df3, pd.DataFrame) else 0, len(df5) if isinstance(df5, pd.DataFrame) else 0, _failopen_reason(), raw1_info.get("latest_dt"), raw1_info.get("age_min"), raw1_info.get("market_age_min"))
         return pd.DataFrame()
     if missing_history and _force_failopen_enabled():
-        logger.warning("[TONOSAMA SURGE] no usable 3m/5m volume surge history -> continue controlled fail-open base_rows=%s df3=%s df5=%s reason=%s raw1_latest=%s raw1_age_min=%s raw1_market_age_min=%s", len(df1), len(df3) if isinstance(df3, pd.DataFrame) else 0, len(df5) if isinstance(df5, pd.DataFrame) else 0, _failopen_reason(), raw1_info.get("latest_dt"), raw1_info.get("age_min"), raw1_info.get("market_age_min"))
+        logger.warning("[TONOSAMA SURGE] no usable 3m/5m volume surge history -> continue explicit fail-open base_rows=%s df3=%s df5=%s reason=%s raw1_latest=%s raw1_age_min=%s raw1_market_age_min=%s", len(df1), len(df3) if isinstance(df3, pd.DataFrame) else 0, len(df5) if isinstance(df5, pd.DataFrame) else 0, _failopen_reason(), raw1_info.get("latest_dt"), raw1_info.get("age_min"), raw1_info.get("market_age_min"))
     out = df1.dropna(subset=["datetime"]).sort_values(["symbol", "datetime"]).groupby("symbol", group_keys=False).tail(1).copy()
     if out.empty:
         return pd.DataFrame()
