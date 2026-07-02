@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/board_wall_stall_exit_patch.py
-# Version: Ver03-TEMP-EXIT-STOP
+# Version: Ver04-EXIT-ACTIVE-BY-DEFAULT
 # ------------------------------------------------------------
 # 板情報を実運用に接続する runtime patch。
 #
@@ -9,11 +9,9 @@
 #     スプレッド/最良気配チェック後に複数段板の偏りを確認する。
 #
 # EXIT:
-#   - AUTOSTOCK_TEMP_DISABLE_EXIT=1 の間は EXIT pipeline 自体を停止する。
-#   - 停止解除後は、板崩壊/壁食われ失速の早期EXITを既存どおり維持する。
-#
-# 一時停止解除:
-#   AUTOSTOCK_TEMP_DISABLE_EXIT=0
+#   - EXIT pipeline はデフォルトで止めない。
+#   - 明示的に AUTOSTOCK_TEMP_DISABLE_EXIT=1 または EXIT_TEMP_STOP=1 の時だけ停止する。
+#   - 停止していない時は、板崩壊/壁食われ失速の早期EXITを既存どおり維持する。
 # ============================================================
 
 from __future__ import annotations
@@ -25,6 +23,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+VERSION = "Ver04-EXIT-ACTIVE-BY-DEFAULT"
 _INSTALLED = False
 _ENTRY_INSTALLED = False
 _EXIT_PIPELINE_STOP_INSTALLED = False
@@ -41,9 +40,9 @@ def _env_bool(name: str, default: bool = True) -> bool:
         if v is None:
             return bool(default)
         s = str(v).strip().lower()
-        if s in {"1", "true", "yes", "y", "on"}:
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
             return True
-        if s in {"0", "false", "no", "n", "off", ""}:
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled", ""}:
             return False
         return bool(default)
     except Exception:
@@ -61,8 +60,8 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _exit_temp_disabled() -> bool:
-    # 今回の運用要望: EXITを一時停止。解除したい時だけ AUTOSTOCK_TEMP_DISABLE_EXIT=0 を指定する。
-    return _env_bool("AUTOSTOCK_TEMP_DISABLE_EXIT", True) or _env_bool("EXIT_TEMP_STOP", False)
+    # 重要: デフォルトでは EXIT を止めない。明示指定の時だけ停止する。
+    return _env_bool("AUTOSTOCK_TEMP_DISABLE_EXIT", False) or _env_bool("EXIT_TEMP_STOP", False)
 
 
 def _get(obj: Any, name: str, default=None):
@@ -96,10 +95,37 @@ def _patched_run_exit_pipeline(*args, **kwargs):
     return None
 
 
+def _restore_exit_pipeline_if_needed() -> bool:
+    """過去の temp stop wrapper が残っていれば、明示停止OFF時に元関数へ戻す。"""
+    restored = False
+    try:
+        import trading.handlers.exit_handler as eh
+
+        cur = getattr(eh, "run_exit_pipeline", None)
+        original = getattr(cur, "_original", None)
+        if callable(cur) and getattr(cur, "_exit_temp_stop_patch", False) and callable(original):
+            eh.run_exit_pipeline = original
+            restored = True
+
+        main_mod = sys.modules.get("__main__")
+        if main_mod is not None:
+            main_cur = getattr(main_mod, "run_exit_pipeline", None)
+            main_original = getattr(main_cur, "_original", None)
+            if callable(main_cur) and getattr(main_cur, "_exit_temp_stop_patch", False) and callable(main_original):
+                setattr(main_mod, "run_exit_pipeline", main_original)
+                restored = True
+    except Exception:
+        logger.debug("[EXIT TEMP STOP] restore skipped", exc_info=True)
+    if restored:
+        logger.warning("[EXIT TEMP STOP] restored previous wrapper -> EXIT pipeline active version=%s", VERSION)
+    return restored
+
+
 def _install_exit_pipeline_temp_stop() -> bool:
     global _EXIT_PIPELINE_STOP_INSTALLED, _ORIG_RUN_EXIT_PIPELINE, _ORIG_MAIN_RUN_EXIT_PIPELINE
     if not _exit_temp_disabled():
-        logger.warning("[EXIT TEMP STOP] disabled by env -> EXIT pipeline remains active")
+        _restore_exit_pipeline_if_needed()
+        logger.warning("[EXIT TEMP STOP] disabled by default/env -> EXIT pipeline remains active version=%s", VERSION)
         return False
     try:
         import trading.handlers.exit_handler as eh
@@ -111,17 +137,16 @@ def _install_exit_pipeline_temp_stop() -> bool:
             _patched_run_exit_pipeline._original = cur  # type: ignore[attr-defined]
             eh.run_exit_pipeline = _patched_run_exit_pipeline
 
-        # main.py は `from trading.handlers.exit_handler import run_exit_pipeline` 済みなので、
-        # __main__ 側のグローバル参照も差し替える。
         main_mod = sys.modules.get("__main__")
         if main_mod is not None:
             main_cur = getattr(main_mod, "run_exit_pipeline", None)
             if callable(main_cur) and not getattr(main_cur, "_exit_temp_stop_patch", False):
                 _ORIG_MAIN_RUN_EXIT_PIPELINE = main_cur
+                _patched_run_exit_pipeline._original = main_cur  # type: ignore[attr-defined]
                 setattr(main_mod, "run_exit_pipeline", _patched_run_exit_pipeline)
 
         _EXIT_PIPELINE_STOP_INSTALLED = True
-        logger.warning("[EXIT TEMP STOP] installed: EXIT pipeline is temporarily stopped")
+        logger.warning("[EXIT TEMP STOP] installed by explicit env: EXIT pipeline is temporarily stopped version=%s", VERSION)
         return True
     except Exception:
         logger.exception("[EXIT TEMP STOP] install failed")
@@ -312,7 +337,7 @@ def install() -> bool:
 
         _INSTALLED = True
         logger.warning(
-            "[BOARD FAST EXIT PATCH] installed collapse=%s collapse_lookback=%s drop_ratio=%s wall_stall=%s wall_lookback=%s eaten_ratio=%s min_qty=%s max_move_pct=%s near_levels=%s exchange=%s entry_guard=%s",
+            "[BOARD FAST EXIT PATCH] installed collapse=%s collapse_lookback=%s drop_ratio=%s wall_stall=%s wall_lookback=%s eaten_ratio=%s min_qty=%s max_move_pct=%s near_levels=%s exchange=%s entry_guard=%s version=%s",
             _env_bool("EXIT_BOARD_COLLAPSE_ENABLED", True),
             os.getenv("EXIT_BOARD_COLLAPSE_LOOKBACK_SEC", "6"),
             os.getenv("EXIT_BOARD_COLLAPSE_SUPPORT_DROP_RATIO", "0.45"),
@@ -324,6 +349,7 @@ def install() -> bool:
             os.getenv("EXIT_BOARD_WALL_NEAR_LEVELS", "3"),
             os.getenv("EXIT_BOARD_WALL_EXCHANGE", "1"),
             ok_entry,
+            VERSION,
         )
         return True
     except Exception:
