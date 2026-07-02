@@ -1,21 +1,17 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_ai_order_builder_range_repair_patch.py
-# Version: V3-SUMMARY-AI-ORDER-BUILDER-RANGE-AND-HISTORY-ATR-REPAIR
+# Version: V4-SUMMARY-AI-ENTRY-CONTROLLER-AND-ORDER-BUILDER-ATR-REPAIR
 # ------------------------------------------------------------
-# Purpose:
-#   SUMMARY_AI の直接スナップショット経路で、entry_pipeline 側の prefilter は
-#   通っても、entry_order_builder._low_move_hard_block() に渡る row が
-#   high == low == close / atr == 0 のままになり、
-#   LOW_MOVE_RANGE_TOO_SMALL / LOW_MOVE_NO_ATR / LOW_MOVE_ATR_TOO_SMALL で
-#   実発注直前に落ちる問題を補正する。
+# SUMMARY_AI の直接スナップショット経路で row が
+# high == low == close / atr == 0 のまま entry_controller と
+# entry_order_builder に渡り、ATR_1M_FILTER_NG / LOW_MOVE_RANGE_TOO_SMALL /
+# LOW_MOVE_NO_ATR / LOW_MOVE_ATR_TOO_SMALL で落ちる問題を補正する。
 #
-# V3:
-#   - まず row / summary_history_1m / merged_summary_1m の実ATRを採用する。
-#   - 実ATRが無い、または極小で、かつ day_high/day_low 等の補正レンジが
-#     ENTRY_ORDER_MIN_RANGE_PCT を満たす場合だけ、レンジ由来ATR proxyを入れる。
-#   - 低変動ガードは緩和しない。補完後も元の strict guard を再実行する。
-#   - proxy を入れた場合は detail に atr_method=range_proxy を残す。
+# 重要:
+#   - 閾値は緩和しない。
+#   - fail-open しない。
+#   - day_high/day_low または global_context の履歴でレンジが確認できる時だけ補完する。
 # ============================================================
 from __future__ import annotations
 
@@ -24,9 +20,9 @@ import math
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V3-SUMMARY-AI-ORDER-BUILDER-RANGE-AND-HISTORY-ATR-REPAIR"
+VERSION = "V4-SUMMARY-AI-ENTRY-CONTROLLER-AND-ORDER-BUILDER-ATR-REPAIR"
 _INSTALLED = False
-_ORIGINAL = None
+_ORIGINAL_LOW_MOVE = None
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -130,7 +126,8 @@ def _best_from_global_context(symbol: str) -> tuple[float, float, float, float, 
         except Exception:
             return 0.0, 0.0, 0.0, 0.0, "gc_import_failed"
 
-    candidates: list[tuple[float, float, float, float, str]] = []
+    best = (0.0, 0.0, 0.0, 0.0, "gc_missing")
+    best_ratio = 0.0
     for getter_name, label in (("get_summary_history", "summary_history_1m"), ("get_merged_summary", "merged_summary_1m")):
         try:
             getter = getattr(global_context, getter_name, None)
@@ -141,18 +138,12 @@ def _best_from_global_context(symbol: str) -> tuple[float, float, float, float, 
             if not d:
                 continue
             c, h, l, atr, method = _best_from_row(d)
-            candidates.append((c, h, l, atr, f"{label}:{method}"))
+            ratio = _range_ratio(c, h, l)
+            if ratio > best_ratio or (ratio == best_ratio and atr > best[3]):
+                best = (c, h, l, atr, f"{label}:{method}")
+                best_ratio = ratio
         except Exception:
-            logger.debug("[SUMMARY AI ORDER RANGE REPAIR] global lookup failed getter=%s symbol=%s", getter_name, symbol, exc_info=True)
-    best = (0.0, 0.0, 0.0, 0.0, "gc_missing")
-    best_ratio = 0.0
-    for c, h, l, atr, label in candidates:
-        ratio = _range_ratio(c, h, l)
-        if ratio > best_ratio:
-            best = (c, h, l, atr, label)
-            best_ratio = ratio
-        elif ratio == best_ratio and atr > best[3]:
-            best = (c, h, l, atr, label)
+            logger.debug("[SUMMARY AI RANGE REPAIR] global lookup failed getter=%s symbol=%s", getter_name, symbol, exc_info=True)
     return best
 
 
@@ -181,11 +172,9 @@ def _repair_row(entry_row: Any, *, symbol: str, source: str) -> tuple[dict[str, 
 
     c2, h2, l2, atr2, method2 = _best_from_global_context(symbol)
     ratio2 = _range_ratio(c2, h2, l2)
-    if ratio2 > best_ratio:
+    if ratio2 > best_ratio or (ratio2 == best_ratio and atr2 > best[3]):
         best = (c2, h2, l2, atr2, method2)
         best_ratio = ratio2
-    elif ratio2 == best_ratio and atr2 > best[3]:
-        best = (c2, h2, l2, atr2, method2)
 
     out = dict(row)
     c, h, l, history_atr, method = best
@@ -195,7 +184,6 @@ def _repair_row(entry_row: Any, *, symbol: str, source: str) -> tuple[dict[str, 
     required_atr = c * min_atr_ratio if c > 0 else 0.0
     range_atr_proxy = max(0.0, h - l) if c > 0 and h >= l else 0.0
     effective_atr = max(old_atr, history_atr)
-    atr_method = "row_or_history" if effective_atr > 0 else "missing"
 
     diag = {
         "symbol": symbol,
@@ -213,98 +201,153 @@ def _repair_row(entry_row: Any, *, symbol: str, source: str) -> tuple[dict[str, 
         "min_range": min_range,
         "min_atr_ratio": min_atr_ratio,
         "required_atr": required_atr,
-        "range_atr_proxy": range_atr_proxy,
         "method": method,
-        "atr_method": atr_method,
         "repaired": False,
         "atr_repaired": False,
     }
 
     if c > 0 and h > 0 and l > 0 and h >= l and best_ratio > old_ratio:
-        out["close"] = c
-        out["close_price"] = c
-        out["current_price"] = c
-        out["price"] = c
-        out["high"] = h
-        out["low"] = l
-        out["high_price"] = h
-        out["low_price"] = l
-        out["day_high"] = max(_safe_float(out.get("day_high"), 0.0), h)
-        out["day_low"] = l if _safe_float(out.get("day_low"), 0.0) <= 0 else min(_safe_float(out.get("day_low"), l), l)
-        out["range_pct"] = best_ratio
-        out["intraday_range_pct"] = best_ratio
+        out.update({
+            "close": c,
+            "close_price": c,
+            "current_price": c,
+            "price": c,
+            "high": h,
+            "low": l,
+            "high_price": h,
+            "low_price": l,
+            "day_high": max(_safe_float(out.get("day_high"), 0.0), h),
+            "day_low": l if _safe_float(out.get("day_low"), 0.0) <= 0 else min(_safe_float(out.get("day_low"), l), l),
+            "range_pct": best_ratio,
+            "intraday_range_pct": best_ratio,
+        })
         diag["repaired"] = True
 
-    # ATR補完は「補正後レンジが十分ある」場合だけ。レンジが足りない銘柄は従来通り止める。
+    # ATR補完は「補正後レンジが十分ある」場合だけ。レンジ不足銘柄は従来通り止める。
     if c > 0 and best_ratio >= min_range:
         if effective_atr > 0 and (effective_atr / c) >= min_atr_ratio:
-            out["atr"] = effective_atr
-            out["atr_1m"] = effective_atr
-            out["ATR"] = effective_atr
-            diag["atr_repaired"] = effective_atr > old_atr
-            diag["new_atr"] = effective_atr
-            diag["atr_method"] = "history_atr" if history_atr >= effective_atr and history_atr > old_atr else "row_atr"
+            new_atr = effective_atr
+            method_atr = "row_or_history"
         elif range_atr_proxy >= required_atr > 0:
-            # history ATR が無い/極小だが、実レンジが十分ある場合のみ、実レンジ由来でATR欠損を補う。
-            out["atr"] = range_atr_proxy
-            out["atr_1m"] = range_atr_proxy
-            out["ATR"] = range_atr_proxy
-            diag["atr_repaired"] = True
-            diag["new_atr"] = range_atr_proxy
-            diag["atr_method"] = "range_proxy"
+            new_atr = range_atr_proxy
+            method_atr = "range_proxy"
         elif effective_atr > old_atr:
-            out["atr"] = effective_atr
-            out["atr_1m"] = effective_atr
-            out["ATR"] = effective_atr
-            diag["atr_repaired"] = True
-            diag["new_atr"] = effective_atr
-            diag["atr_method"] = "history_atr_below_threshold"
+            new_atr = effective_atr
+            method_atr = "history_atr_below_threshold"
+        else:
+            new_atr = 0.0
+            method_atr = "missing"
+        if new_atr > 0:
+            out["atr"] = new_atr
+            out["atr_1m"] = new_atr
+            out["ATR"] = new_atr
+            diag["atr_repaired"] = new_atr > old_atr or old_atr <= 0
+            diag["new_atr"] = new_atr
+            diag["atr_method"] = method_atr
 
     return out, diag
 
 
-def install() -> bool:
-    global _INSTALLED, _ORIGINAL
-    if _INSTALLED:
+def _update_original_row(entry_row: Any, repaired: dict[str, Any]) -> None:
+    try:
+        if isinstance(entry_row, dict):
+            for k in ("close", "close_price", "current_price", "price", "high", "low", "high_price", "low_price", "day_high", "day_low", "range_pct", "intraday_range_pct", "atr", "atr_1m", "ATR"):
+                if k in repaired:
+                    entry_row[k] = repaired[k]
+    except Exception:
+        pass
+
+
+def _install_entry_controller_filter_repair() -> bool:
+    try:
+        import trading.filters.volatility_filter as vf
+        import trading.handlers.entry_controller as ec
+
+        if not getattr(vf.atr_1m_filter, "_summary_ai_entry_controller_repair_v4", False):
+            orig_atr = vf.atr_1m_filter
+
+            def _patched_atr_1m_filter(entry_row, *args, **kwargs):
+                row = _row_dict(entry_row)
+                if _source_is_summary_ai(row.get("source"), row):
+                    symbol = str(row.get("symbol") or "")
+                    repaired, diag = _repair_row(entry_row, symbol=symbol, source=str(row.get("source") or "SUMMARY"))
+                    if diag.get("repaired") or diag.get("atr_repaired"):
+                        logger.warning("[SUMMARY AI ENTRY CTRL ATR REPAIR] repaired before atr_1m_filter detail=%s version=%s", diag, VERSION)
+                        _update_original_row(entry_row, repaired)
+                        return orig_atr(repaired, *args, **kwargs)
+                return orig_atr(entry_row, *args, **kwargs)
+
+            _patched_atr_1m_filter._summary_ai_entry_controller_repair_v4 = True  # type: ignore[attr-defined]
+            _patched_atr_1m_filter._original = orig_atr  # type: ignore[attr-defined]
+            vf.atr_1m_filter = _patched_atr_1m_filter
+            ec.atr_1m_filter = _patched_atr_1m_filter
+
+        if not getattr(vf.range_5m_filter, "_summary_ai_entry_controller_repair_v4", False):
+            orig_range = vf.range_5m_filter
+
+            def _patched_range_5m_filter(entry_row, *args, **kwargs):
+                row = _row_dict(entry_row)
+                if _source_is_summary_ai(row.get("source"), row):
+                    symbol = str(row.get("symbol") or "")
+                    repaired, diag = _repair_row(entry_row, symbol=symbol, source=str(row.get("source") or "SUMMARY"))
+                    if diag.get("repaired") or diag.get("atr_repaired"):
+                        logger.warning("[SUMMARY AI ENTRY CTRL ATR REPAIR] repaired before range_5m_filter detail=%s version=%s", diag, VERSION)
+                        _update_original_row(entry_row, repaired)
+                        return orig_range(repaired, *args, **kwargs)
+                return orig_range(entry_row, *args, **kwargs)
+
+            _patched_range_5m_filter._summary_ai_entry_controller_repair_v4 = True  # type: ignore[attr-defined]
+            _patched_range_5m_filter._original = orig_range  # type: ignore[attr-defined]
+            vf.range_5m_filter = _patched_range_5m_filter
+            ec.range_5m_filter = _patched_range_5m_filter
+
+        logger.warning("[SUMMARY AI ENTRY CTRL ATR REPAIR] installed version=%s", VERSION)
         return True
+    except Exception:
+        logger.exception("[SUMMARY AI ENTRY CTRL ATR REPAIR] install failed version=%s", VERSION)
+        return False
+
+
+def install() -> bool:
+    global _INSTALLED, _ORIGINAL_LOW_MOVE
+    ctrl_ok = _install_entry_controller_filter_repair()
+    if _INSTALLED:
+        return True or ctrl_ok
     try:
         from trading.handlers import entry_order_builder as eob
         cur = getattr(eob, "_low_move_hard_block", None)
         if not callable(cur):
             logger.warning("[SUMMARY AI ORDER RANGE REPAIR] target missing version=%s", VERSION)
-            return False
-        if getattr(cur, "_summary_ai_order_range_repair_v3", False):
+            return bool(ctrl_ok)
+        if getattr(cur, "_summary_ai_order_range_repair_v4", False):
             _INSTALLED = True
             return True
 
-        _ORIGINAL = getattr(cur, "_original", cur)
+        _ORIGINAL_LOW_MOVE = getattr(cur, "_original", cur)
 
         def _patched_low_move_hard_block(entry_row, *, symbol: str, source: str):
             row = _row_dict(entry_row)
             if not _source_is_summary_ai(source, row):
-                return _ORIGINAL(entry_row, symbol=symbol, source=source)
+                return _ORIGINAL_LOW_MOVE(entry_row, symbol=symbol, source=source)
             repaired, diag = _repair_row(entry_row, symbol=str(symbol or row.get("symbol") or ""), source=str(source or row.get("source") or ""))
             if diag.get("repaired") or diag.get("atr_repaired"):
                 logger.warning("[SUMMARY AI ORDER RANGE REPAIR] repaired before strict low-move guard detail=%s version=%s", diag, VERSION)
-                try:
-                    if isinstance(entry_row, dict):
-                        entry_row.update({k: repaired[k] for k in ("close", "close_price", "current_price", "price", "high", "low", "high_price", "low_price", "day_high", "day_low", "range_pct", "intraday_range_pct", "atr", "atr_1m", "ATR") if k in repaired})
-                except Exception:
-                    pass
-                return _ORIGINAL(repaired, symbol=symbol, source=source)
-            return _ORIGINAL(entry_row, symbol=symbol, source=source)
+                _update_original_row(entry_row, repaired)
+                return _ORIGINAL_LOW_MOVE(repaired, symbol=symbol, source=source)
+            return _ORIGINAL_LOW_MOVE(entry_row, symbol=symbol, source=source)
 
         _patched_low_move_hard_block._summary_ai_order_range_repair_v1 = True  # type: ignore[attr-defined]
         _patched_low_move_hard_block._summary_ai_order_range_repair_v2 = True  # type: ignore[attr-defined]
         _patched_low_move_hard_block._summary_ai_order_range_repair_v3 = True  # type: ignore[attr-defined]
-        _patched_low_move_hard_block._original = _ORIGINAL  # type: ignore[attr-defined]
+        _patched_low_move_hard_block._summary_ai_order_range_repair_v4 = True  # type: ignore[attr-defined]
+        _patched_low_move_hard_block._original = _ORIGINAL_LOW_MOVE  # type: ignore[attr-defined]
         eob._low_move_hard_block = _patched_low_move_hard_block
         _INSTALLED = True
         logger.warning("[SUMMARY AI ORDER RANGE REPAIR] installed version=%s", VERSION)
         return True
     except Exception:
         logger.exception("[SUMMARY AI ORDER RANGE REPAIR] install failed version=%s", VERSION)
-        return False
+        return bool(ctrl_ok)
 
 
 try:
