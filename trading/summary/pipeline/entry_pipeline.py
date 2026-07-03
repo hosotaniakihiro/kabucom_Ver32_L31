@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/summary/pipeline/entry_pipeline.py
-# Version: Ver2.9-STRICT-SUMMARY-LIQUIDITY
+# Version: Ver3.0-SUMMARY-AI-BLOWOFF-ALLOW
 # ------------------------------------------------------------
 # ✔ AI approved rows → entry execution
 # ✔ SUMMARY AI通常エントリーとイナゴ liquidity_shock 条件を分離
@@ -8,6 +8,7 @@
 # ✔ Ver2.8: Summary AI承認済み候補が liquidity だけで全落ちする問題を救済
 # ✔ Ver2.9: 低流動性銘柄へのエントリーを防ぐため、rescueでも
 #            出来高3万株・売買代金1000万円を必須化
+# ✔ Ver3.0: SUMMARY/PUSH/AI_OK 候補は blowoff top だけで全落ちさせない
 # ============================================================
 
 from __future__ import annotations
@@ -282,6 +283,28 @@ def _is_inago_source(row: dict) -> bool:
     return ("INAGO" in source or "TONOSAMA" in source or "LIQUIDITY_SHOCK" in source or "INAGO" in strategy or "TONOSAMA" in strategy or "LIQUIDITY_SHOCK" in strategy or "LIQUIDITY" in reason and "SHOCK" in reason)
 
 
+def _is_summary_ai_source(row: dict) -> bool:
+    try:
+        if _is_inago_source(row):
+            return False
+        source = str(row.get("source") or "").strip().upper()
+        entry_type = str(row.get("entry_type") or row.get("type") or "").strip().upper()
+        strategy = str(row.get("strategy") or row.get("entry_strategy") or "").strip().upper()
+        reason = str(row.get("reason") or row.get("ai_reason") or "").strip().upper()
+        decision = str(row.get("decision") or row.get("entry_decision") or row.get("ai_decision") or "").strip().upper()
+        return (
+            source in {"SUMMARY", "SUMMARY_AI", "PUSH"}
+            or entry_type == "SUMMARY_AI"
+            or strategy == "SUMMARY_AI"
+            or "SUMMARY_AI" in reason
+            or "SRC=SUMMARY" in reason
+            or decision == "AI_OK"
+            or bool(row.get("ai_ok"))
+        )
+    except Exception:
+        return False
+
+
 def _range_pct(row: dict, close: float) -> float:
     high = _safe_float(_first(row, ["high", "high_price"], 0.0), 0.0)
     low = _safe_float(_first(row, ["low", "low_price"], 0.0), 0.0)
@@ -385,11 +408,24 @@ def _filter_blowoff(rows: List[Any], df_summary: pd.DataFrame | None) -> List[An
         if tops is None or tops.empty or "symbol" not in tops.columns:
             return rows
         top_symbols = set(tops["symbol"].astype(str))
+        allow_summary_ai_blowoff = _env_bool("SUMMARY_AI_ALLOW_BLOWOFF_TOP", True)
         filtered = []
         for r in rows:
             symbol = _get_symbol(r)
             if symbol in top_symbols:
-                logger.info("[entry_pipeline] skip blowoff top symbol=%s", symbol)
+                row_dict = _clean_nan_dict(_row_to_dict(r))
+                side = _resolve_side_from_row(row_dict)
+                if allow_summary_ai_blowoff and _is_summary_ai_source(row_dict):
+                    logger.warning(
+                        "[entry_pipeline] blowoff top detected but SUMMARY_AI/PUSH allowed symbol=%s side=%s source=%s entry_type=%s",
+                        symbol,
+                        side,
+                        row_dict.get("source"),
+                        row_dict.get("entry_type"),
+                    )
+                    filtered.append(r)
+                    continue
+                logger.info("[entry_pipeline] skip blowoff top symbol=%s side=%s source=%s", symbol, side, row_dict.get("source"))
                 continue
             filtered.append(r)
         return filtered
