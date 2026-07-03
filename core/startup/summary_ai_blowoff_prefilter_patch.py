@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/summary_ai_blowoff_prefilter_patch.py
-# Version: V6-LATEST-ROW-SIDE-AWARE-BLOWOFF-ONLY
+# Version: V7-ENTRY-PIPELINE-COMPAT-BLOWOFF-REFILL
 # ------------------------------------------------------------
 # Summary-AI の Top3 選定前に危険候補を除外する。
 #
@@ -8,7 +8,8 @@
 #   - blowoff ガード自体は緩和しない。
 #   - Top3前では blowoff だけを除外する。
 #   - low-move は entry_pipeline / order_builder 側の厳密ガードへ一本化する。
-#   - blowoff 判定は symbol ごとの最新行だけで実行する。
+#   - entry_pipeline と同じ detect_blowoff_top(df_summary) で判定し、
+#     「前段は通過したが後段で blowoff 全落ち」を防ぐ。
 #   - blowoff 除外は既定では BUY のみ。SELL は過熱後の売り候補になり得るため、
 #     SUMMARY_AI_BLOWOFF_BLOCK_SELL=1 の場合だけ SELL も除外する。
 # ============================================================
@@ -26,7 +27,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V6-LATEST-ROW-SIDE-AWARE-BLOWOFF-ONLY"
+VERSION = "V7-ENTRY-PIPELINE-COMPAT-BLOWOFF-REFILL"
 _INSTALLED = False
 _WATCHER_STARTED = False
 _TRUE_VALUES = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
@@ -137,7 +138,25 @@ def _latest_rows_per_symbol(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
 
+def _extract_symbols_from_tops(tops: Any) -> set[str]:
+    try:
+        if tops is None or not isinstance(tops, pd.DataFrame) or tops.empty or "symbol" not in tops.columns:
+            return set()
+        return {_norm_symbol(x) for x in tops["symbol"].dropna().astype(str).tolist() if _norm_symbol(x)}
+    except Exception:
+        return set()
+
+
 def _detect_blowoff_symbols(df_summary: Any) -> tuple[set[str], int, int]:
+    """Detect blowoff symbols with the same input shape as entry_pipeline.
+
+    V6 used latest-row-only detection.  However entry_pipeline calls
+    detect_blowoff_top(df_summary) directly on the full summary frame.  When
+    those two inputs disagree, Summary-AI can approve Top3, then entry_pipeline
+    drops all of them as blowoff and no lower-ranked AI_OK candidate is tried.
+    V7 therefore uses the full df first, matching entry_pipeline, and only
+    falls back to latest rows if the full-frame detector fails open.
+    """
     try:
         if df_summary is None or not isinstance(df_summary, pd.DataFrame) or df_summary.empty:
             return set(), 0, 0
@@ -146,10 +165,15 @@ def _detect_blowoff_symbols(df_summary: Any) -> tuple[set[str], int, int]:
         source_rows = len(df_summary)
         latest_df = _latest_rows_per_symbol(df_summary)
         latest_rows = len(latest_df) if isinstance(latest_df, pd.DataFrame) else 0
-        tops = detect_blowoff_top(latest_df)
-        if tops is None or not isinstance(tops, pd.DataFrame) or tops.empty or "symbol" not in tops.columns:
-            return set(), source_rows, latest_rows
-        return ({_norm_symbol(x) for x in tops["symbol"].dropna().astype(str).tolist() if _norm_symbol(x)}, source_rows, latest_rows)
+
+        # Match trading.summary.pipeline.entry_pipeline._filter_blowoff.
+        top_symbols = _extract_symbols_from_tops(detect_blowoff_top(df_summary))
+        if top_symbols:
+            return top_symbols, source_rows, latest_rows
+
+        # Defensive fallback for unusual detector failures / empty returns.
+        fallback_symbols = _extract_symbols_from_tops(detect_blowoff_top(latest_df))
+        return fallback_symbols, source_rows, latest_rows
     except Exception:
         logger.exception("[SUMMARY AI PREFILTER] blowoff detect failed; fail-open")
         return set(), 0, 0
@@ -196,7 +220,7 @@ def _patch_once(reason: str = "install") -> bool:
         if not callable(cur):
             logger.warning("[SUMMARY AI PREFILTER] target missing reason=%s", reason)
             return False
-        if getattr(cur, "_summary_ai_blowoff_prefilter_v6", False):
+        if getattr(cur, "_summary_ai_blowoff_prefilter_v7", False):
             return True
 
         original = getattr(cur, "_original", cur)
@@ -241,6 +265,7 @@ def _patch_once(reason: str = "install") -> bool:
         patched._summary_ai_blowoff_prefilter_v4 = True  # type: ignore[attr-defined]
         patched._summary_ai_blowoff_prefilter_v5 = True  # type: ignore[attr-defined]
         patched._summary_ai_blowoff_prefilter_v6 = True  # type: ignore[attr-defined]
+        patched._summary_ai_blowoff_prefilter_v7 = True  # type: ignore[attr-defined]
         patched._original = original  # type: ignore[attr-defined]
         ex.execute_ai_ok_entries_bulk = patched
         logger.warning("[SUMMARY AI PREFILTER] installed reason=%s version=%s block_sell=%s", reason, VERSION, _env_bool("SUMMARY_AI_BLOWOFF_BLOCK_SELL", False))
