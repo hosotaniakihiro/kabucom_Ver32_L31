@@ -1,16 +1,18 @@
 # ============================================================
 # File   : core/startup/board_retry_patch.py
-# Version: V1.8-SIDE-CONTEXT-PRESERVED
+# Version: V1.9-SUMMARY-AI-REST-COOLDOWN-SHORT
 # ------------------------------------------------------------
 # 板取得リトライを軽量化する。
 # 429/API実行回数エラー・レジスト数エラー発生時は cooldown し、
 # final_entry_safety_guard から候補ごとにRESTを連打しない。
 #
-# V1.8:
-#   - final_entry_safety_guard が legacy 1引数で
-#     _try_get_bid_ask_from_api(symbol) を呼んでも、caller frameから side/source を復元。
-#   - [BOARD RETRY] / [FINAL ENTRY BOARD REST DIRECT] の side= 空欄を防ぐ。
-#   - REST直叩きは引き続き明示設定時のみ。
+# V1.9:
+#   - SUMMARY_AI の PUSHローテーション補完REST確認では、全銘柄共通60秒
+#     cooldownが長すぎて10.5秒リトライを無効化していた。
+#   - SUMMARY_AI/ORDER_BUILDER系だけ cooldown を短縮し、各候補で最低限
+#     REST /board を再確認できるようにする。
+#   - cooldown中でもキャッシュに有効板があれば返す。
+#   - 板なし発注はしない。RESTでも板が無ければ従来通り hard block。
 # ============================================================
 from __future__ import annotations
 
@@ -77,37 +79,44 @@ def _norm_side(v: Any) -> str:
     return s
 
 
+def _summary_ai_source(source: Any) -> bool:
+    s = str(source or "").strip().upper()
+    return s in {"SUMMARY_AI", "SUMMARY", "PUSH", "PUSH_SUMMARY", "SUMMARY_AI_ORDER_BUILDER", "SUMMARY_AI_REST_BOARD_CHECK"} or "SUMMARY_AI" in s
+
+
 def _infer_context_side_source(side: str = "", source: str = "") -> tuple[str, str]:
     side_s = _norm_side(side)
     source_s = str(source or "").strip() or "final_entry_safety_guard"
-    if side_s:
+    if side_s and source_s:
         return side_s, source_s
     try:
         frame = inspect.currentframe()
-        for _ in range(8):
+        for _ in range(10):
             frame = frame.f_back if frame is not None else None
             if frame is None:
                 break
             loc = frame.f_locals
             cand = _norm_side(loc.get("side") or loc.get("entry_side") or loc.get("ai_side") or loc.get("sd"))
-            if not cand:
-                row = loc.get("row") or loc.get("row_d")
-                if isinstance(row, dict):
-                    cand = _norm_side(row.get("side") or row.get("entry_decision") or row.get("ai_side"))
-            if not cand:
-                item = loc.get("item") or loc.get("item_d")
-                if isinstance(item, dict):
-                    cand = _norm_side(item.get("side"))
-                    if not cand and isinstance(item.get("entry"), dict):
-                        cand = _norm_side(item["entry"].get("side") or item["entry"].get("entry_decision"))
-                    if not cand and isinstance(item.get("ai"), dict):
-                        cand = _norm_side(item["ai"].get("side") or item["ai"].get("entry_decision"))
+            row = loc.get("row") or loc.get("row_d") or loc.get("entry_row")
+            item = loc.get("item") or loc.get("item_d")
+            if not cand and isinstance(row, dict):
+                cand = _norm_side(row.get("side") or row.get("entry_decision") or row.get("ai_side"))
+            if not cand and isinstance(item, dict):
+                cand = _norm_side(item.get("side"))
+                if not cand and isinstance(item.get("entry"), dict):
+                    cand = _norm_side(item["entry"].get("side") or item["entry"].get("entry_decision"))
+                if not cand and isinstance(item.get("ai"), dict):
+                    cand = _norm_side(item["ai"].get("side") or item["ai"].get("entry_decision"))
             if cand:
                 side_s = cand
-            src = loc.get("source") or loc.get("entry_source")
+            src = loc.get("source") or loc.get("entry_source") or loc.get("pipeline_source")
+            if not src and isinstance(row, dict):
+                src = row.get("source") or row.get("entry_source") or row.get("entry_type")
+            if not src and isinstance(item, dict):
+                src = item.get("source") or item.get("entry_source") or item.get("entry_type")
             if src:
                 source_s = str(src)
-            if side_s:
+            if side_s and source_s:
                 break
     except Exception:
         pass
@@ -167,11 +176,17 @@ def _board_dict(symbol: str, bid: float, ask: float, bid_qty: float = 0.0, ask_q
     }
 
 
-def _set_rest_cooldown(reason: str) -> None:
+def _cooldown_sec_for_source(source: str) -> float:
+    if _summary_ai_source(source):
+        return max(1.0, _env_float("SUMMARY_AI_BOARD_REST_ERROR_COOLDOWN_SEC", 2.0))
+    return max(10.0, _env_float("ENTRY_BOARD_REST_ERROR_COOLDOWN_SEC", 60.0))
+
+
+def _set_rest_cooldown(reason: str, source: str = "") -> None:
     global _REST_COOLDOWN_UNTIL
-    sec = max(10.0, _env_float("ENTRY_BOARD_REST_ERROR_COOLDOWN_SEC", 60.0))
+    sec = _cooldown_sec_for_source(source)
     _REST_COOLDOWN_UNTIL = time.time() + sec
-    logger.warning("[BOARD RETRY REST] COOLDOWN_SET reason=%s sec=%.1f until=%.1f", reason, sec, _REST_COOLDOWN_UNTIL)
+    logger.warning("[BOARD RETRY REST] COOLDOWN_SET reason=%s source=%s sec=%.1f until=%.1f", reason, source, sec, _REST_COOLDOWN_UNTIL)
 
 
 def _get_token() -> str:
@@ -194,16 +209,21 @@ def _fetch_board_rest(symbol: str, side: str = "", source: str = "") -> dict[str
     if not _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", False):
         return None
     now = time.time()
-    if now < _REST_COOLDOWN_UNTIL:
-        logger.warning("[BOARD RETRY REST] COOLDOWN_SKIP symbol=%s side=%s source=%s remaining=%.1fs", symbol, side, source, _REST_COOLDOWN_UNTIL - now)
-        return None
     sym = _norm_symbol(symbol)
     if not sym:
         return None
     cached = _BOARD_CACHE.get(sym)
     ttl = max(0.1, _env_float("ENTRY_BOARD_REST_CACHE_TTL_SEC", 2.0))
-    if cached and now - cached[0] <= ttl:
+    if cached and now - cached[0] <= ttl and _is_valid_board(cached[1]):
         return cached[1]
+    if now < _REST_COOLDOWN_UNTIL:
+        remaining = _REST_COOLDOWN_UNTIL - now
+        if _summary_ai_source(source) and remaining > _env_float("SUMMARY_AI_BOARD_REST_MAX_COOLDOWN_SKIP_SEC", 2.5):
+            logger.warning("[BOARD RETRY REST] COOLDOWN_TRIM source=%s old_remaining=%.1fs new_remaining=0.0s symbol=%s side=%s", source, remaining, sym, side)
+            globals()["_REST_COOLDOWN_UNTIL"] = 0.0
+        else:
+            logger.warning("[BOARD RETRY REST] COOLDOWN_SKIP symbol=%s side=%s source=%s remaining=%.1fs", sym, side, source, remaining)
+            return None
     token = _get_token()
     if not token:
         return None
@@ -221,7 +241,7 @@ def _fetch_board_rest(symbol: str, side: str = "", source: str = "") -> dict[str
             if status != 200:
                 logger.warning("[BOARD RETRY REST] REST_NG symbol=%s side=%s source=%s exchange=%s status=%s", sym, side, source, ex, status)
                 if status in (400, 429):
-                    _set_rest_cooldown(f"status_{status}")
+                    _set_rest_cooldown(f"status_{status}", source)
                 return None
             data = res.json()
             bid, ask, bid_qty, ask_qty = _extract_bid_ask(data)
@@ -233,7 +253,7 @@ def _fetch_board_rest(symbol: str, side: str = "", source: str = "") -> dict[str
             msg = repr(exc)
             logger.warning("[BOARD RETRY REST] REST_ERROR symbol=%s side=%s source=%s exchange=%s error=%s", sym, side, source, ex, msg)
             if "429" in msg or "4001006" in msg or "4002006" in msg or "API実行回数" in msg or "レジスト数" in msg:
-                _set_rest_cooldown("exception_rate_or_register")
+                _set_rest_cooldown("exception_rate_or_register", source)
             return None
     return None
 
@@ -275,12 +295,13 @@ def _retry_fetch_board(original, symbol: Any, *args, source: str = "", side: str
 
 def _wrap_get_latest_bid_ask(original):
     original = _unwrap_original(original)
-    if getattr(original, "_board_retry_v18", False):
+    if getattr(original, "_board_retry_v19", False):
         return original
 
     def _get_latest_bid_ask_retry(symbol: Any, *args, **kwargs):
         return _retry_fetch_board(original, symbol, *args, **kwargs)
 
+    _get_latest_bid_ask_retry._board_retry_v19 = True  # type: ignore[attr-defined]
     _get_latest_bid_ask_retry._board_retry_v18 = True  # type: ignore[attr-defined]
     _get_latest_bid_ask_retry._board_retry_v17 = True  # type: ignore[attr-defined]
     _get_latest_bid_ask_retry._board_retry_v16 = True  # type: ignore[attr-defined]
@@ -293,30 +314,35 @@ def _install_final_safety_side_aware_board() -> bool:
     if _SIDE_PATCHED:
         return True
     try:
-        import core.startup.final_entry_safety_guard_patch as fsg
+        import core.startup.final_entry_safety_guard_patch as fg
+        fn = getattr(fg, "_try_get_bid_ask_from_api", None)
+        if callable(fn) and not getattr(fn, "_board_retry_side_v19", False):
+            orig = _unwrap_original(fn)
 
-        def _try_get_bid_ask_from_api_side(symbol: str, side: str = "", source: str = "final_entry_safety_guard"):
-            side, source = _infer_context_side_source(side, source)
-            try:
-                from utils_common import get_latest_bid_ask
+            def wrapped(symbol: str, *args, **kwargs):
+                side = kwargs.pop("side", "") if "side" in kwargs else ""
+                source = kwargs.pop("source", "") if "source" in kwargs else ""
+                side, source = _infer_context_side_source(side, source)
                 try:
-                    res = get_latest_bid_ask(symbol, source=source, side=side)
+                    out = orig(symbol, *args, side=side, source=source, **kwargs)
                 except TypeError:
-                    res = get_latest_bid_ask(symbol)
-                bid, ask, bid_qty, ask_qty = _extract_bid_ask(res)
-                if bid > 0 and ask > 0:
-                    return bid, ask, bid_qty, ask_qty
-            except Exception:
-                logger.debug("[BOARD RETRY] final guard get_latest_bid_ask failed symbol=%s side=%s", symbol, side, exc_info=True)
-            rest = _fetch_board_rest(symbol, side=side, source=source)
-            return _extract_bid_ask(rest)
+                    try:
+                        out = orig(symbol, side=side, source=source)
+                    except TypeError:
+                        out = orig(symbol)
+                if _is_valid_board(out):
+                    return out
+                return _fetch_board_rest(symbol, side=side, source=source) or out
 
-        fsg._try_get_bid_ask_from_api = _try_get_bid_ask_from_api_side
-        _SIDE_PATCHED = True
-        logger.warning("[BOARD RETRY] patched final_entry_safety_guard board fetch v18 rest_direct=%s cooldown_until=%.1f", _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", False), _REST_COOLDOWN_UNTIL)
+            wrapped._board_retry_side_v19 = True  # type: ignore[attr-defined]
+            wrapped._board_retry_side_v18 = True  # type: ignore[attr-defined]
+            wrapped._original = orig  # type: ignore[attr-defined]
+            fg._try_get_bid_ask_from_api = wrapped
+            _SIDE_PATCHED = True
+            logger.warning("[BOARD RETRY] patched final_entry_safety_guard _try_get_bid_ask_from_api side-aware v19")
         return True
     except Exception:
-        logger.exception("[BOARD RETRY] final_entry_safety_guard side-aware board patch failed")
+        logger.exception("[BOARD RETRY] patch final_entry_safety_guard side-aware failed")
         return False
 
 
@@ -337,19 +363,21 @@ def install() -> bool:
     os.environ.setdefault("ENTRY_BOARD_REST_DIRECT_ENABLED", "0")
     os.environ.setdefault("ENTRY_BOARD_RETRY_COUNT", "1")
     os.environ.setdefault("ENTRY_BOARD_RETRY_WAIT_SEC", "0.2")
+    os.environ.setdefault("SUMMARY_AI_BOARD_REST_ERROR_COOLDOWN_SEC", "2.0")
+    os.environ.setdefault("SUMMARY_AI_BOARD_REST_MAX_COOLDOWN_SKIP_SEC", "2.5")
     try:
         import utils_common
         old = getattr(utils_common, "get_latest_bid_ask", None)
-        if callable(old) and not getattr(old, "_board_retry_v18", False):
+        if callable(old) and not getattr(old, "_board_retry_v19", False):
             utils_common.get_latest_bid_ask = _wrap_get_latest_bid_ask(old)
             _PATCHED = True
-            logger.warning("[BOARD RETRY] patched utils_common.get_latest_bid_ask v18")
+            logger.warning("[BOARD RETRY] patched utils_common.get_latest_bid_ask v19")
     except Exception:
         logger.exception("[BOARD RETRY] patch utils_common.get_latest_bid_ask failed")
     _install_final_safety_side_aware_board()
     _install_ma5_opening_relax()
     _install_daily_src_duplicate_cleanup()
-    logger.warning("[BOARD RETRY] installed v18 patched=%s rest_direct=%s", _PATCHED, _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", False))
+    logger.warning("[BOARD RETRY] installed v19 patched=%s rest_direct=%s summary_ai_cooldown=%s", _PATCHED, _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", False), os.getenv("SUMMARY_AI_BOARD_REST_ERROR_COOLDOWN_SEC"))
     return True
 
 
@@ -358,4 +386,5 @@ try:
 except Exception:
     logger.exception("[BOARD RETRY] auto install failed")
 
-__all__ = ["install"]
+
+__all__ = ["install", "_fetch_board_rest"]
