@@ -1,6 +1,6 @@
 # ==========================================================
 # trading/handlers/entry_order_builder.py
-# Ver2.1.0-BOARD-RETRY-FOR-ROTATION
+# Ver2.1.1-FIX-MISSING-LOGGER
 # ----------------------------------------------------------
 # ✔ 注文条件（price / order_type / qty）を決定するだけ
 # ✔ 副作用ゼロ（発注・global_state 操作なし）
@@ -14,6 +14,8 @@
 # ✔ SUMMARY_AI 発注直前にMTF/傾きの逆方向をブロック
 # ✔ スプレッド上限を環境変数化し、既定0.15%へ厳格化
 # ✔ SELL信用新規で base_price より下のLIMITを作らない
+# ✔ Ver2.1.1: board retry logging で logger 未定義になり、
+#              _execute_best_candidate が NameError で False になる問題を修正
 #
 # 【Ver2.0 追加】
 # ✔ 低変動ガードを SUMMARY_AI 限定から RANKING / TONOSAMA にも拡張
@@ -28,6 +30,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import math
 import os
 import time
@@ -40,6 +43,8 @@ from utils_common import (
     calculate_qty_by_budget,
     get_tick_size,
 )
+
+logger = logging.getLogger(__name__)
 
 ALLOW_MARKET_IF_BAD_BOARD = str(os.getenv("ALLOW_MARKET_IF_BAD_BOARD", "1")).lower() not in {
     "0", "false", "no", "off",
