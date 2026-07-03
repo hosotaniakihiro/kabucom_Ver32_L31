@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/summary_ai_score_env_patch.py
-# Version: REV4-SUMMARY-AI-ENTRY-BUY-THRESHOLD-PATCH-RANGE-BRIDGE
+# Version: REV5-SUMMARY-AI-ENTRY-BUY-THRESHOLD-PATCH-BOARD-FALLBACK
 # ------------------------------------------------------------
 # Purpose:
 #   - AI.entry_gate の SUMMARY score threshold は MIN_ENTRY_SCORE を参照する。
@@ -12,6 +12,8 @@
 #           既存 score_buy/score_sell/score_mtf/score_slope から前段フィルタを補完する。
 #   - REV4: SUMMARY_AI final volatility filter で range_pct/day_high/day_low を使い、
 #           補完済みレンジが entry_row high/low だけで失われる問題を防ぐ。
+#   - REV5: SUMMARY_AI が板取得失敗だけで STRICT_BOARD_MISSING になった場合、
+#           成行ではなく close/current_price/vwap の保守的LIMIT fallbackを再試行する。
 # ============================================================
 
 from __future__ import annotations
@@ -102,6 +104,19 @@ def _install_final_volatility_range_bridge() -> dict[str, object]:
         return result
 
 
+def _install_board_missing_limit_fallback() -> dict[str, object]:
+    result: dict[str, object] = {"installed": False}
+    try:
+        from core.startup.summary_ai_board_missing_limit_fallback_patch import install, VERSION
+        ok = bool(install())
+        result.update({"installed": ok, "version": VERSION})
+        return result
+    except Exception as e:
+        logger.exception("[SUMMARY AI SCORE ENV PATCH] board missing limit fallback install failed")
+        result.update({"error": repr(e)})
+        return result
+
+
 def install_summary_ai_score_env_patch() -> None:
     global _INSTALLED
     if _INSTALLED:
@@ -118,15 +133,17 @@ def install_summary_ai_score_env_patch() -> None:
     controller_patch = _patch_entry_controller_thresholds()
     ranking_prefilter = _install_ranking_prefilter_score_fallback()
     final_vol_range = _install_final_volatility_range_bridge()
+    board_fallback = _install_board_missing_limit_fallback()
 
     _INSTALLED = True
     logger.warning(
-        "[SUMMARY AI SCORE ENV PATCH] installed applied=%s kept=%s entry_controller=%s ranking_prefilter=%s final_vol_range=%s",
+        "[SUMMARY AI SCORE ENV PATCH] installed applied=%s kept=%s entry_controller=%s ranking_prefilter=%s final_vol_range=%s board_fallback=%s",
         applied,
         kept,
         controller_patch,
         ranking_prefilter,
         final_vol_range,
+        board_fallback,
     )
 
 
