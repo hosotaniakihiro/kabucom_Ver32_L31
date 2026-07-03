@@ -7,7 +7,7 @@ import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V3.8-SUMMARY-AI-PUSH-ROTATION-BOARD-RETRY-5S"
+VERSION = "V3.9-SUMMARY-AI-PUSH-ROTATION-BOARD-RETRY-2TURNS"
 _INSTALLED = False
 _ORIGINAL_BUILD_ENTRY_ORDER = None
 
@@ -252,10 +252,13 @@ def install() -> bool:
         return True
     try:
         # PUSH登録はA/Bローテーションなので、候補銘柄が一時的に反対側へいて板が取れないことがある。
-        # そのためSUMMARY_AIは最大5秒だけ待って再取得する。5秒後も板なしなら従来どおり hard block。
-        os.environ["ENTRY_ORDER_BOARD_RETRY_SEC"] = "5.0"
+        # A/B各4.8秒+解除0.2秒の想定では5秒は境界なので、SUMMARY_AIは約2ローテ分だけ待つ。
+        # それでも板なしなら従来どおり hard block。板なしエントリーには緩めない。
+        retry_sec = _safe_float(os.getenv("SUMMARY_AI_PUSH_ROTATION_BOARD_RETRY_SEC", "10.5"), 10.5)
+        retry_sec = max(5.0, min(retry_sec, 12.0))
+        os.environ["ENTRY_ORDER_BOARD_RETRY_SEC"] = str(retry_sec)
         os.environ.setdefault("ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", "0.2")
-        os.environ["SUMMARY_AI_BOARD_RETRY_REASON"] = "push_rotation_wait_5s"
+        os.environ["SUMMARY_AI_BOARD_RETRY_REASON"] = "push_rotation_wait_2turns"
         # Board missing is still a hard block by policy. Do not convert it to close/vwap fallback.
         os.environ["ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY"] = "1"
         os.environ["ENTRY_BOARD_MISSING_HARD_BLOCK"] = "1"
@@ -269,10 +272,10 @@ def install() -> bool:
         logger_patched = _ensure_entry_order_builder_logger(eob)
         range_consistency = _install_range_consistency_chain()
         board_policy = _install_strict_board_rest_chain()
-        old_retry, new_retry = _set_exact(eob, "ENTRY_ORDER_BOARD_RETRY_SEC", _safe_float(os.environ.get("ENTRY_ORDER_BOARD_RETRY_SEC"), 5.0))
+        old_retry, new_retry = _set_exact(eob, "ENTRY_ORDER_BOARD_RETRY_SEC", _safe_float(os.environ.get("ENTRY_ORDER_BOARD_RETRY_SEC"), retry_sec))
         old_interval, new_interval = _set_exact(eob, "ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", _safe_float(os.environ.get("ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC"), 0.2))
         cur = getattr(eob, "build_entry_order", None)
-        if callable(cur) and not getattr(cur, "_summary_ai_fast_order_builder_v38", False):
+        if callable(cur) and not getattr(cur, "_summary_ai_fast_order_builder_v39", False):
             _ORIGINAL_BUILD_ENTRY_ORDER = getattr(cur, "_original", cur)
 
             def _patched_build_entry_order(*args, **kwargs):
@@ -280,7 +283,7 @@ def install() -> bool:
                 symbol = kwargs.get("symbol")
                 side = kwargs.get("side")
                 if summary_like:
-                    logger.info("[SUMMARY AI FAST ORDER BUILDER] start symbol=%s side=%s source=%s retry_sec=%s retry_interval=%s reason=push_rotation_wait_5s version=%s", symbol, side, kwargs.get("source"), getattr(eob, "ENTRY_ORDER_BOARD_RETRY_SEC", None), getattr(eob, "ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", None), VERSION)
+                    logger.info("[SUMMARY AI FAST ORDER BUILDER] start symbol=%s side=%s source=%s retry_sec=%s retry_interval=%s reason=push_rotation_wait_2turns version=%s", symbol, side, kwargs.get("source"), getattr(eob, "ENTRY_ORDER_BOARD_RETRY_SEC", None), getattr(eob, "ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", None), VERSION)
                     _coerce_summary_ai_snapshot_order(kwargs)
                     _repair_summary_ai_low_move_range(kwargs, eob)
                 try:
@@ -298,7 +301,7 @@ def install() -> bool:
                     logger.warning("[SUMMARY AI FAST ORDER BUILDER] done symbol=%s side=%s ok=%s reason=%s detail=%s version=%s", symbol, side, isinstance(result, dict) and result.get("ok"), result.get("reason") if isinstance(result, dict) else type(result).__name__, result.get("detail") if isinstance(result, dict) else None, VERSION)
                 return result
 
-            for marker in ("_summary_ai_fast_order_builder_v1", "_summary_ai_fast_order_builder_v2", "_summary_ai_fast_order_builder_v3", "_summary_ai_fast_order_builder_v31", "_summary_ai_fast_order_builder_v32", "_summary_ai_fast_order_builder_v33", "_summary_ai_fast_order_builder_v34", "_summary_ai_fast_order_builder_v35", "_summary_ai_fast_order_builder_v36", "_summary_ai_fast_order_builder_v37", "_summary_ai_fast_order_builder_v38"):
+            for marker in ("_summary_ai_fast_order_builder_v1", "_summary_ai_fast_order_builder_v2", "_summary_ai_fast_order_builder_v3", "_summary_ai_fast_order_builder_v31", "_summary_ai_fast_order_builder_v32", "_summary_ai_fast_order_builder_v33", "_summary_ai_fast_order_builder_v34", "_summary_ai_fast_order_builder_v35", "_summary_ai_fast_order_builder_v36", "_summary_ai_fast_order_builder_v37", "_summary_ai_fast_order_builder_v38", "_summary_ai_fast_order_builder_v39"):
                 setattr(_patched_build_entry_order, marker, True)
             _patched_build_entry_order._original = _ORIGINAL_BUILD_ENTRY_ORDER  # type: ignore[attr-defined]
             eob.build_entry_order = _patched_build_entry_order
@@ -308,7 +311,7 @@ def install() -> bool:
             except Exception:
                 logger.debug("[SUMMARY AI FAST ORDER BUILDER] entry_controller alias patch skipped", exc_info=True)
         _INSTALLED = True
-        logger.warning("[SUMMARY AI FAST ORDER BUILDER] installed version=%s retry_sec %s->%s interval %s->%s logger_patched=%s range_repair=True source_detect=True snapshot_no_order_fallback=True ranking_range_rescue=True range_consistency=%s board_policy=%s strict_board_limit_fallback=False push_rotation_wait=5s", VERSION, old_retry, new_retry, old_interval, new_interval, logger_patched, range_consistency, board_policy)
+        logger.warning("[SUMMARY AI FAST ORDER BUILDER] installed version=%s retry_sec %s->%s interval %s->%s logger_patched=%s range_repair=True source_detect=True snapshot_no_order_fallback=True ranking_range_rescue=True range_consistency=%s board_policy=%s strict_board_limit_fallback=False push_rotation_wait_2turns=%.1fs", VERSION, old_retry, new_retry, old_interval, new_interval, logger_patched, range_consistency, board_policy, retry_sec)
         return True
     except Exception:
         logger.exception("[SUMMARY AI FAST ORDER BUILDER] install failed version=%s", VERSION)
