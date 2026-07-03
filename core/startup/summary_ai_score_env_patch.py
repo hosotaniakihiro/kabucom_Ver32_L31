@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/summary_ai_score_env_patch.py
-# Version: PRODUCTION-STABLE-REV2-SUMMARY-AI-ENTRY-BUY-THRESHOLD-PATCH
+# Version: PRODUCTION-STABLE-REV3-SUMMARY-AI-EXECUTOR-DIAGNOSTICS
 # ------------------------------------------------------------
 # Purpose:
 #   - AI.entry_gate の SUMMARY score threshold は MIN_ENTRY_SCORE を参照する。
@@ -8,10 +8,12 @@
 #   - entry_controller.py 側の最終BUY閾値が 5.0 のままだと、
 #     BUY候補がAI_OKでも BUY_SCORE_LOW / BUY_COMPOSITE_LOW で落ちる。
 #   - 起動時に MIN_ENTRY_SCORE と entry_controller BUY閾値を実運用値へ合わせる。
+#   - AI_OK後に executor / entry_pipeline へ何件流れ、どの理由で止まったかを診断ログへ出す。
 #
 # Expected:
 #   - BUY score=4.0 の候補が entry_controller 最終AI gate を通過する
 #   - SELL候補の score_low:<4.000 も減る
+#   - AI_OK後の approved / order_result / reason_counts がログで追える
 # ============================================================
 
 from __future__ import annotations
@@ -90,6 +92,19 @@ def _patch_entry_controller_thresholds() -> dict[str, object]:
     return result
 
 
+def _install_executor_diagnostics() -> dict[str, object]:
+    result: dict[str, object] = {"installed": False}
+    try:
+        from core.startup.summary_ai_executor_diagnostics_patch import install as _install_diag
+
+        ok = bool(_install_diag())
+        result.update({"installed": ok})
+    except Exception as e:
+        logger.exception("[SUMMARY AI SCORE ENV PATCH] executor diagnostics install failed")
+        result.update({"error": repr(e)})
+    return result
+
+
 def install_summary_ai_score_env_patch() -> None:
     global _INSTALLED
     if _INSTALLED:
@@ -102,15 +117,18 @@ def install_summary_ai_score_env_patch() -> None:
     _set_env_default("ENTRY_CONTROLLER_MIN_SUMMARY_SCORE_BUY", "3.0", applied, kept)
     _set_env_default("ENTRY_CONTROLLER_MIN_COMPOSITE_SCORE_BUY", "3.0", applied, kept)
     _set_env_default("ENTRY_CONTROLLER_MIN_AI_CONFIDENCE_BUY", "0.60", applied, kept)
+    _set_env_default("SUMMARY_AI_EXECUTOR_DIAGNOSTICS_ENABLED", "1", applied, kept)
 
     controller_patch = _patch_entry_controller_thresholds()
+    executor_diagnostics = _install_executor_diagnostics()
 
     _INSTALLED = True
     logger.warning(
-        "[SUMMARY AI SCORE ENV PATCH] installed applied=%s kept=%s entry_controller=%s",
+        "[SUMMARY AI SCORE ENV PATCH] installed applied=%s kept=%s entry_controller=%s executor_diagnostics=%s",
         applied,
         kept,
         controller_patch,
+        executor_diagnostics,
     )
 
 
