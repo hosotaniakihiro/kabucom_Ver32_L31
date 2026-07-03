@@ -8,14 +8,20 @@ Even if RANKING / SUMMARY AI / TONOSAMA candidate filters are relaxed or a
 rescue patch keeps a symbol alive, the actual order-dispatch layer must be
 fail-closed for thin names.
 
+V4:
+- Prefer fresh in-memory merged PUSH summary when summaryYYYYMMDD.db returns a
+  stale/latest-missing row. This fixes ORDER_BUILD_OK / ENTRY_DISPATCH being
+  blocked by STRICT_FINAL_LIQ_STALE even though the current Summary-AI row and
+  PUSH memory are fresh.
+- The fallback is still strict: it requires positive latest volume, average
+  volume, turnover, and a parseable recent datetime within max_age_sec.
+- Pending-entry fallback remains as a second fallback.
+- Board-missing hard block and boardless-order prohibition are unchanged.
+
 V3:
 - If summaryYYYYMMDD.db is stale, validate fresh in-memory merged summary first
   (push -> ranking -> unspecified completed fallback -> push-cache -> legacy),
   then fresh pending entries.
-- This fixes the case where ORDER_BUILD_OK/ENTRY_DISPATCH are reached, but final
-  send is blocked because entry_handler reads an old summary DB row while
-  main.py already has fresh PUSH/ranking summary in global_context.
-- Missing/low/stale liquidity still blocks. This is not a fail-open.
 """
 from __future__ import annotations
 
@@ -25,7 +31,7 @@ import os
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
-VERSION = "V3-GLOBAL-CONTEXT-FRESH-FALLBACK-ON-STALE-SUMMARY-DB"
+VERSION = "V4-FRESH-MERGED-PUSH-FIRST-ON-STALE-SUMMARY-DB"
 _INSTALLED = False
 _ORIGINAL = None
 
@@ -79,6 +85,8 @@ def _norm_symbol(v: Any) -> str:
             ss = s[:-2]
             if ss.isdigit():
                 return ss
+        if s.endswith(".T"):
+            return s[:-2]
         return s
     except Exception:
         return ""
@@ -119,8 +127,6 @@ def _parse_dt(value: Any) -> Optional[dt.datetime]:
 
 
 def _entry_timestamp(entry: dict[str, Any]) -> Optional[dt.datetime]:
-    # created_at/updated_at represents when this candidate was built from the fresh
-    # in-memory/PUSH path. Prefer it over the bar datetime if the summary DB is stale.
     for key in ("updated_at", "created_at", "entry_created_at", "received_at", "recv_time", "timestamp", "datetime"):
         x = _parse_dt(entry.get(key))
         if x is not None:
@@ -128,122 +134,49 @@ def _entry_timestamp(entry: dict[str, Any]) -> Optional[dt.datetime]:
     return None
 
 
-def _safe_col(row: Any, names: tuple[str, ...], default: Any = None) -> Any:
-    try:
-        for name in names:
-            if isinstance(row, dict):
-                v = row.get(name)
-            else:
-                v = row.get(name) if hasattr(row, "get") else None
-            if v is not None and str(v).strip() != "":
+def _row_value(row: Any, *keys: str, default: Any = None) -> Any:
+    for key in keys:
+        try:
+            v = row.get(key, None) if hasattr(row, "get") else row[key]
+            if v is not None and str(v).strip().lower() not in {"", "nan", "none", "nat"}:
                 return v
-    except Exception:
-        pass
+        except Exception:
+            pass
     return default
 
 
-def _one_row_liquidity_values(row: Any, *, source: str) -> dict[str, Any]:
-    volume = _f(_safe_col(row, ("volume", "latest_volume", "display_volume", "vol"), 0.0), 0.0)
-    price = _f(_safe_col(row, ("close_price", "price", "current_price", "close", "last_price"), 0.0), 0.0)
-    turnover = _f(_safe_col(row, ("turnover", "trading_value", "display_turnover", "sales_value"), 0.0), 0.0)
-    if turnover <= 0 and price > 0 and volume > 0:
-        turnover = price * volume
-    latest_dt = _parse_dt(_safe_col(row, ("updated_at", "created_at", "entry_created_at", "received_at", "recv_time", "timestamp", "datetime", "end_time", "time"), None))
-    if volume <= 0 or turnover <= 0:
-        return {"ok_read": False, "reason": "row_no_positive_liquidity", "source": source, "latest_volume": volume, "latest_turnover": turnover}
+def _liquidity_values_from_rows(rows: list[dict[str, Any]], *, source: str) -> dict[str, Any]:
+    good: list[dict[str, Any]] = []
+    for e in rows:
+        volume = _f(_row_value(e, "volume", "latest_volume", "display_volume", "vol"), 0.0)
+        price = _f(_row_value(e, "close_price", "price", "current_price", "close", "last_price"), 0.0)
+        turnover = _f(_row_value(e, "turnover", "trading_value", "display_turnover", "trading_value_yen", "sales_value"), 0.0)
+        if turnover <= 0 and price > 0 and volume > 0:
+            turnover = price * volume
+        t = _entry_timestamp(e)
+        if volume > 0 and turnover > 0:
+            good.append({"volume": volume, "price": price, "turnover": turnover, "dt": t, "entry_type": e.get("entry_type"), "entry_source": e.get("source")})
+    if not good:
+        return {"ok_read": False, "reason": "no_positive_liquidity", "source": source, "input_rows": len(rows)}
+    latest = good[-1]
+    latest_dt = latest.get("dt")
     return {
         "ok_read": True,
-        "rows": 1,
+        "rows": len(good),
         "source": source,
+        "input_rows": len(rows),
         "latest_dt": latest_dt.isoformat(sep=" ") if isinstance(latest_dt, dt.datetime) else None,
-        "latest_close": price,
-        "latest_volume": volume,
-        "latest_turnover": turnover,
-        "volume_sum": float(volume),
-        "turnover_sum": float(turnover),
+        "latest_close": latest.get("price"),
+        "latest_volume": latest.get("volume"),
+        "latest_turnover": latest.get("turnover"),
+        "volume_sum": float(sum(r["volume"] for r in good)),
+        "turnover_sum": float(sum(r["turnover"] for r in good)),
+        "entry_type": latest.get("entry_type"),
+        "entry_source": latest.get("entry_source"),
     }
 
 
-def _global_context_liquidity_values(symbol: str, bars: int) -> dict[str, Any]:
-    """Read latest liquidity from main.py in-memory summaries.
-
-    This is used only when entry_handler's DB-backed summary row is stale. It is
-    fail-closed: it returns ok_read=True only for a matching symbol with positive
-    volume and turnover, and the caller still applies age/volume/turnover checks.
-    """
-    sym = _norm_symbol(symbol)
-    if not sym:
-        return {"ok_read": False, "reason": "gc_symbol_missing", "source": "global_context"}
-    try:
-        from core.global_context import context as gc
-    except Exception as e:
-        return {"ok_read": False, "reason": "gc_import_exception", "error": str(e), "source": "global_context"}
-
-    errors: list[str] = []
-    # Prefer in-memory PUSH, then ranking, then GlobalContext's completed fallback.
-    candidates = [
-        ("global_context_merged_push", lambda: gc.get_merged_summary(tf=1, source="push")),
-        ("global_context_merged_ranking", lambda: gc.get_merged_summary(tf=1, source="ranking")),
-        ("global_context_merged_fallback", lambda: gc.get_merged_summary(tf=1, source=None)),
-        ("global_context_merged_push_cache", lambda: gc.get_merged_summary(tf=1, source="push-cache")),
-        ("global_context_merged_legacy", lambda: gc.get_merged_summary(tf=1, source="legacy")),
-        ("global_context_push_df", lambda: gc.get_push_df()),
-    ]
-    for label, loader in candidates:
-        try:
-            df = loader()
-            if df is None or not hasattr(df, "empty") or df.empty or "symbol" not in df.columns:
-                continue
-            work = df.copy()
-            try:
-                ss = work["symbol"].map(_norm_symbol)
-            except Exception:
-                ss = work["symbol"].astype(str).str.strip()
-            rows = work.loc[ss == sym].copy()
-            if rows.empty:
-                continue
-            time_col = None
-            for c in ("updated_at", "created_at", "datetime", "end_time", "time"):
-                if c in rows.columns:
-                    time_col = c
-                    break
-            if time_col is not None:
-                try:
-                    rows["__liq_dt"] = rows[time_col].map(_parse_dt)
-                    rows = rows.sort_values("__liq_dt", ascending=False, na_position="last")
-                except Exception:
-                    pass
-            # Use up to bars latest rows when available, but most merged summaries
-            # are already one latest row per symbol.
-            picked = rows.head(max(1, int(bars)))
-            values = []
-            for _, r in picked.iterrows():
-                v = _one_row_liquidity_values(r, source=label)
-                if v.get("ok_read"):
-                    values.append(v)
-            if not values:
-                continue
-            latest = values[0]
-            volume_sum = float(sum(_f(v.get("latest_volume"), 0.0) for v in values))
-            turnover_sum = float(sum(_f(v.get("latest_turnover"), 0.0) for v in values))
-            return {
-                "ok_read": True,
-                "rows": len(values),
-                "source": label,
-                "latest_dt": latest.get("latest_dt"),
-                "latest_close": latest.get("latest_close"),
-                "latest_volume": latest.get("latest_volume"),
-                "latest_turnover": latest.get("latest_turnover"),
-                "volume_sum": volume_sum,
-                "turnover_sum": turnover_sum,
-            }
-        except Exception as e:
-            errors.append(f"{label}:{e}")
-    return {"ok_read": False, "reason": "gc_no_matching_fresh_rows", "source": "global_context", "errors": errors[:5]}
-
-
 def _pending_entry_liquidity_values(symbol: str, bars: int) -> dict[str, Any]:
-    """Validate liquidity from fresh pending rows when summary DB is stale."""
     sym = _norm_symbol(symbol)
     if not sym:
         return {"ok_read": False, "reason": "pending_symbol_missing", "source": "pending_entries"}
@@ -258,35 +191,64 @@ def _pending_entry_liquidity_values(symbol: str, bars: int) -> dict[str, Any]:
         return {"ok_read": False, "reason": "pending_read_exception", "error": str(e), "source": "pending_entries"}
     if not entries:
         return {"ok_read": False, "reason": "pending_no_rows", "source": "pending_entries"}
+    values = _liquidity_values_from_rows(entries[-max(1, int(bars)):], source="pending_entries_fresh")
+    values["pending_rows"] = len(entries)
+    return values
 
-    rows = []
-    for e in entries[-max(1, int(bars)):]:
-        volume = _f(e.get("volume") or e.get("latest_volume") or e.get("display_volume") or e.get("vol"), 0.0)
-        price = _f(e.get("close_price") or e.get("price") or e.get("current_price") or e.get("close"), 0.0)
-        turnover = _f(e.get("turnover") or e.get("trading_value") or e.get("display_turnover"), 0.0)
-        if turnover <= 0 and price > 0 and volume > 0:
-            turnover = price * volume
-        t = _entry_timestamp(e)
-        if volume > 0 and turnover > 0:
-            rows.append({"volume": volume, "price": price, "turnover": turnover, "dt": t, "entry_type": e.get("entry_type"), "source": e.get("source")})
-    if not rows:
-        return {"ok_read": False, "reason": "pending_no_positive_liquidity", "source": "pending_entries", "pending_rows": len(entries)}
-    latest = rows[-1]
-    latest_dt = latest.get("dt")
-    return {
-        "ok_read": True,
-        "rows": len(rows),
-        "source": "pending_entries_fresh",
-        "pending_rows": len(entries),
-        "latest_dt": latest_dt.isoformat(sep=" ") if isinstance(latest_dt, dt.datetime) else None,
-        "latest_close": latest.get("price"),
-        "latest_volume": latest.get("volume"),
-        "latest_turnover": latest.get("turnover"),
-        "volume_sum": float(sum(r["volume"] for r in rows)),
-        "turnover_sum": float(sum(r["turnover"] for r in rows)),
-        "entry_type": latest.get("entry_type"),
-        "entry_source": latest.get("source"),
-    }
+
+def _merged_push_liquidity_values(symbol: str, bars: int) -> dict[str, Any]:
+    sym = _norm_symbol(symbol)
+    if not sym:
+        return {"ok_read": False, "reason": "memory_symbol_missing", "source": "merged_push"}
+    try:
+        import pandas as pd  # type: ignore
+        from core.global_context import context as gc
+    except Exception as e:
+        return {"ok_read": False, "reason": "memory_import_exception", "error": str(e), "source": "merged_push"}
+
+    last_error = None
+    for src in ("push", "push-cache", None, "ranking", "legacy"):
+        try:
+            df = gc.get_merged_summary(tf=1, source=src) if src is not None else gc.get_merged_summary(tf=1)
+            if df is None or not hasattr(df, "empty") or df.empty or "symbol" not in df.columns:
+                continue
+            work = df.copy()
+            work["_sym_norm"] = work["symbol"].map(_norm_symbol)
+            work = work[work["_sym_norm"] == sym].copy()
+            if work.empty:
+                continue
+            time_col = None
+            for c in ("datetime", "end_time", "timestamp", "updated_at", "created_at", "time"):
+                if c in work.columns:
+                    time_col = c
+                    break
+            if time_col:
+                try:
+                    work["_dt"] = pd.to_datetime(work[time_col], errors="coerce")
+                    try:
+                        work["_dt"] = work["_dt"].dt.tz_localize(None)
+                    except Exception:
+                        pass
+                    work = work.sort_values("_dt", ascending=True, na_position="first")
+                except Exception:
+                    pass
+            work = work.tail(max(1, int(bars)))
+            rows: list[dict[str, Any]] = []
+            for _, row in work.iterrows():
+                d = dict(row)
+                if time_col and "datetime" not in d:
+                    d["datetime"] = d.get(time_col)
+                rows.append(d)
+            values = _liquidity_values_from_rows(rows, source=f"merged_summary_{src or 'auto'}")
+            if bool(values.get("ok_read")):
+                values["merged_source"] = src or "auto"
+                values["memory_rows"] = int(len(work))
+                return values
+            last_error = values.get("reason")
+        except Exception as e:
+            last_error = str(e)
+            continue
+    return {"ok_read": False, "reason": f"memory_no_fresh_rows:{last_error or 'none'}", "source": "merged_push"}
 
 
 def _strict_final_recent_liquidity_ok(symbol: str, side: str):
@@ -298,18 +260,9 @@ def _strict_final_recent_liquidity_ok(symbol: str, side: str):
         return True, "STRICT_FINAL_LIQ_DISABLED", {}
 
     bars = max(1, _env_int("ENTRY_HANDLER_RECENT_LIQ_BARS", 5))
-    min_latest_volume = _env_float(
-        "ENTRY_HANDLER_STRICT_MIN_LATEST_VOLUME",
-        _env_float("WATCHLIST_RECENT_LIQ_MIN_LATEST_VOLUME", 3000.0),
-    )
-    min_avg_volume = _env_float(
-        "ENTRY_HANDLER_STRICT_MIN_AVG_VOLUME",
-        _env_float("WATCHLIST_RECENT_LIQ_MIN_AVG_VOLUME", 3000.0),
-    )
-    min_turnover = _env_float(
-        "ENTRY_HANDLER_STRICT_MIN_TURNOVER_YEN",
-        _env_float("WATCHLIST_RECENT_LIQ_MIN_TURNOVER_YEN", 1000000.0),
-    )
+    min_latest_volume = _env_float("ENTRY_HANDLER_STRICT_MIN_LATEST_VOLUME", _env_float("WATCHLIST_RECENT_LIQ_MIN_LATEST_VOLUME", 3000.0))
+    min_avg_volume = _env_float("ENTRY_HANDLER_STRICT_MIN_AVG_VOLUME", _env_float("WATCHLIST_RECENT_LIQ_MIN_AVG_VOLUME", 3000.0))
+    min_turnover = _env_float("ENTRY_HANDLER_STRICT_MIN_TURNOVER_YEN", _env_float("WATCHLIST_RECENT_LIQ_MIN_TURNOVER_YEN", 1000000.0))
     max_age_sec = _env_float("ENTRY_HANDLER_STRICT_MAX_AGE_SEC", 180.0)
     require_data = _env_bool("ENTRY_HANDLER_RECENT_LIQ_REQUIRE_DATA", True)
 
@@ -349,83 +302,76 @@ def _strict_final_recent_liquidity_ok(symbol: str, side: str):
             out["original_detail"] = original_detail
         return out
 
-    def _passes_liquidity(d: dict[str, Any]) -> tuple[bool, str]:
+    def _passes_strict_liq(d: dict[str, Any]) -> tuple[bool, str]:
+        rows = int(d.get("rows") or 0)
         age = d.get("age_sec")
+        latest_volume = _f(d.get("latest_volume"), 0.0)
+        avg_volume = _f(d.get("avg_volume"), 0.0)
+        turnover = _f(d.get("turnover_sum"), 0.0)
+        if rows <= 0:
+            return False, "NO_ROWS"
         if age is None:
             return False, "DATETIME_PARSE_NG"
         if float(age) > max_age_sec:
             return False, f"STALE:{float(age):.0f}>{max_age_sec:.0f}"
-        if _f(d.get("latest_volume"), 0.0) < min_latest_volume:
-            return False, f"LATEST_VOLUME_LOW:{_f(d.get('latest_volume'), 0.0):.0f}<{min_latest_volume:.0f}"
-        if _f(d.get("avg_volume"), 0.0) < min_avg_volume:
-            return False, f"AVG_VOLUME_LOW:{_f(d.get('avg_volume'), 0.0):.0f}<{min_avg_volume:.0f}"
-        if _f(d.get("turnover_sum"), 0.0) < min_turnover:
-            return False, f"TURNOVER_LOW:{_f(d.get('turnover_sum'), 0.0):.0f}<{min_turnover:.0f}"
+        if latest_volume < min_latest_volume:
+            return False, f"LATEST_VOLUME_LOW:{latest_volume:.0f}<{min_latest_volume:.0f}"
+        if avg_volume < min_avg_volume:
+            return False, f"AVG_VOLUME_LOW:{avg_volume:.0f}<{min_avg_volume:.0f}"
+        if turnover < min_turnover:
+            return False, f"TURNOVER_LOW:{turnover:.0f}<{min_turnover:.0f}"
         return True, "OK"
+
+    def _try_fresh_fallback(original_detail: dict[str, Any], *, reason_prefix: str):
+        memory_v = _merged_push_liquidity_values(symbol, bars)
+        memory_detail = _detail_from(memory_v, fallback=True, original_detail=original_detail)
+        if isinstance(memory_v, dict) and bool(memory_v.get("ok_read")):
+            ok, why = _passes_strict_liq(memory_detail)
+            if ok:
+                logger.warning(
+                    "[ENTRY FINAL LIQ GUARD] stale/read-ng summary DB bypassed by fresh merged PUSH liquidity symbol=%s side=%s source=%s age=%.1f original_age=%s version=%s",
+                    symbol, side, memory_detail.get("source"), float(memory_detail.get("age_sec") or -1), original_detail.get("age_sec"), VERSION,
+                )
+                return True, "STRICT_FINAL_LIQ_OK_MERGED_PUSH_FRESH", memory_detail
+            memory_detail["fresh_fallback_reject"] = why
+
+        pending_v = _pending_entry_liquidity_values(symbol, bars)
+        pending_detail = _detail_from(pending_v, fallback=True, original_detail=original_detail)
+        if isinstance(pending_v, dict) and bool(pending_v.get("ok_read")):
+            ok, why = _passes_strict_liq(pending_detail)
+            if ok:
+                logger.warning(
+                    "[ENTRY FINAL LIQ GUARD] stale/read-ng summary DB bypassed by fresh pending liquidity symbol=%s side=%s pending_age=%.1f original_age=%s version=%s",
+                    symbol, side, float(pending_detail.get("age_sec") or -1), original_detail.get("age_sec"), VERSION,
+                )
+                return True, "STRICT_FINAL_LIQ_OK_PENDING_FRESH", pending_detail
+            pending_detail["fresh_fallback_reject"] = why
+
+        merged = dict(original_detail)
+        merged["merged_push_fallback"] = memory_detail
+        merged["pending_fallback"] = pending_detail
+        return False, reason_prefix, merged
 
     detail = _detail_from(v)
 
     if not isinstance(v, dict) or not bool(v.get("ok_read")):
-        return (False, f"STRICT_FINAL_LIQ_READ_NG:{detail.get('reason')}", detail) if require_data else (True, "STRICT_FINAL_LIQ_READ_FAIL_OPEN", detail)
+        ok, reason, fb_detail = _try_fresh_fallback(detail, reason_prefix=f"STRICT_FINAL_LIQ_READ_NG:{detail.get('reason')}")
+        if ok:
+            return ok, reason, fb_detail
+        return (False, reason, fb_detail) if require_data else (True, "STRICT_FINAL_LIQ_READ_FAIL_OPEN", fb_detail)
     if int(detail.get("rows") or 0) <= 0:
         return False, "STRICT_FINAL_LIQ_NO_RECENT_ROWS", detail
     if _parse_dt(v.get("latest_dt")) is None:
-        return False, "STRICT_FINAL_LIQ_DATETIME_PARSE_NG", detail
+        ok, reason, fb_detail = _try_fresh_fallback(detail, reason_prefix="STRICT_FINAL_LIQ_DATETIME_PARSE_NG")
+        if ok:
+            return ok, reason, fb_detail
+        return False, reason, fb_detail
 
     if detail.get("age_sec") is not None and float(detail["age_sec"]) > max_age_sec:
-        # 1) Prefer fresh in-memory merged summary. This avoids false stale blocks
-        # when the DB-backed recent-liquidity read is behind main.py memory state.
-        gc_v = _global_context_liquidity_values(symbol, bars)
-        gc_detail = _detail_from(gc_v, fallback=True, original_detail=detail)
-        if isinstance(gc_v, dict) and bool(gc_v.get("ok_read")):
-            ok_gc, reason_gc = _passes_liquidity(gc_detail)
-            if ok_gc:
-                logger.warning(
-                    "[ENTRY FINAL LIQ GUARD] stale summary DB bypassed by fresh global_context liquidity symbol=%s side=%s gc_source=%s gc_age=%.1f summary_age=%.1f version=%s",
-                    symbol,
-                    side,
-                    gc_detail.get("source"),
-                    float(gc_detail.get("age_sec") or -1),
-                    float(detail.get("age_sec") or -1),
-                    VERSION,
-                )
-                return True, "STRICT_FINAL_LIQ_OK_GLOBAL_CONTEXT_FRESH", gc_detail
-            logger.warning(
-                "[ENTRY FINAL LIQ GUARD] global_context fallback rejected symbol=%s side=%s reason=%s detail=%s version=%s",
-                symbol,
-                side,
-                reason_gc,
-                {k: gc_detail.get(k) for k in ("source", "latest_dt", "age_sec", "latest_volume", "avg_volume", "turnover_sum")},
-                VERSION,
-            )
-
-        # 2) Then try the fresh pending entry row itself.
-        pending_v = _pending_entry_liquidity_values(symbol, bars)
-        pending_detail = _detail_from(pending_v, fallback=True, original_detail=detail)
-        if isinstance(pending_v, dict) and bool(pending_v.get("ok_read")):
-            ok_pending, reason_pending = _passes_liquidity(pending_detail)
-            if ok_pending:
-                logger.warning(
-                    "[ENTRY FINAL LIQ GUARD] stale summary DB bypassed by fresh pending liquidity symbol=%s side=%s pending_age=%.1f summary_age=%.1f version=%s",
-                    symbol,
-                    side,
-                    float(pending_detail.get("age_sec") or -1),
-                    float(detail.get("age_sec") or -1),
-                    VERSION,
-                )
-                return True, "STRICT_FINAL_LIQ_OK_PENDING_FRESH", pending_detail
-            logger.warning(
-                "[ENTRY FINAL LIQ GUARD] pending fallback rejected symbol=%s side=%s reason=%s detail=%s version=%s",
-                symbol,
-                side,
-                reason_pending,
-                {k: pending_detail.get(k) for k in ("source", "latest_dt", "age_sec", "latest_volume", "avg_volume", "turnover_sum")},
-                VERSION,
-            )
-        stale_detail = dict(detail)
-        stale_detail["global_context_fallback"] = gc_detail
-        stale_detail["pending_fallback"] = pending_detail
-        return False, f"STRICT_FINAL_LIQ_STALE:{float(detail.get('age_sec') or 0):.0f}>{max_age_sec:.0f}", stale_detail
+        ok, reason, fb_detail = _try_fresh_fallback(detail, reason_prefix=f"STRICT_FINAL_LIQ_STALE:{float(detail.get('age_sec') or 0):.0f}>{max_age_sec:.0f}")
+        if ok:
+            return ok, reason, fb_detail
+        return False, reason, fb_detail
 
     if _f(detail.get("latest_volume"), 0.0) < min_latest_volume:
         return False, f"STRICT_FINAL_LIQ_LATEST_VOLUME_LOW:{_f(detail.get('latest_volume'), 0.0):.0f}<{min_latest_volume:.0f}", detail
@@ -467,11 +413,12 @@ def install() -> bool:
         if current is _strict_final_recent_liquidity_ok:
             _INSTALLED = True
             return True
-        _ORIGINAL = current
+        _ORIGINAL = getattr(current, "_original", current)
         eh._final_recent_liquidity_ok = _strict_final_recent_liquidity_ok
+        _strict_final_recent_liquidity_ok._original = _ORIGINAL  # type: ignore[attr-defined]
         _INSTALLED = True
         logger.warning(
-            "[ENTRY HANDLER STRICT LIQ] installed version=%s latest_vol>=%s avg_vol>=%s turnover>=%s max_age=%s global_context_fallback=1 pending_fallback=1",
+            "[ENTRY HANDLER STRICT LIQ] installed version=%s latest_vol>=%s avg_vol>=%s turnover>=%s max_age=%s merged_push_fallback=1 pending_fallback=1",
             VERSION,
             os.environ.get("ENTRY_HANDLER_STRICT_MIN_LATEST_VOLUME"),
             os.environ.get("ENTRY_HANDLER_STRICT_MIN_AVG_VOLUME"),
