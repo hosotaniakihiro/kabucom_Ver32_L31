@@ -5,7 +5,7 @@ Intraday credit control and end-of-day repayment guard.
 Purpose
 -------
 - Before the cutoff, new credit entries use day-trade margin.
-- After the cutoff, new entries must not use day-trade margin; if an entry is still
+- At/after the cutoff, new entries must not use day-trade margin; if an entry is still
   placed, it is automatically switched to system margin.
 - Open day-trade credit positions are repaid by market order near the close.
 
@@ -15,6 +15,7 @@ Default behavior
   (一般信用デイトレード / day-trade credit)
 - New credit at/after ENTRY_DAYTRADE_CUTOFF_TIME: MarginTradeType=1
   (制度信用 / system margin)
+- ENTRY_DAYTRADE_CUTOFF_TIME default: 15:00:00 JST.
 - New credit CashMargin: 2
 - Close credit CashMargin: 3
 - Close order: market order, FrontOrderType=10, Price=0
@@ -34,7 +35,7 @@ import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "DAYTRADE-CREDIT-FORCE-CLOSE-V2-CUTOFF-SYSTEM-MARGIN"
+VERSION = "DAYTRADE-CREDIT-FORCE-CLOSE-V3-CUTOFF-1500-SYSTEM-MARGIN"
 _INSTALLED = False
 _THREAD_STARTED = False
 _FORCE_CLOSE_DONE_DATE: str | None = None
@@ -110,8 +111,8 @@ def _time_today(value: str, default: str) -> dt.datetime:
 def _after_or_at_daytrade_cutoff(now: dt.datetime | None = None) -> bool:
     try:
         now = now or dt.datetime.now()
-        cutoff_text = os.environ.get("ENTRY_DAYTRADE_CUTOFF_TIME", "15:15:00")
-        cutoff = _time_today(cutoff_text, "15:15:00")
+        cutoff_text = os.environ.get("ENTRY_DAYTRADE_CUTOFF_TIME", "15:00:00")
+        cutoff = _time_today(cutoff_text, "15:00:00")
         return now >= cutoff
     except Exception:
         # Fail safe: after parse errors, do not force day-trade margin late in the day.
@@ -136,7 +137,8 @@ def _entry_margin_type_for_now(explicit_margin_type: Any = None) -> tuple[int, s
 def _set_daytrade_env_defaults() -> None:
     os.environ.setdefault("KABU_DAYTRADE_MARGIN_TYPE", "3")
     os.environ.setdefault("KABU_SYSTEM_MARGIN_TYPE", "1")
-    os.environ.setdefault("ENTRY_DAYTRADE_CUTOFF_TIME", "15:15:00")
+    # 15:00以降の新規エントリーはデイトレ信用ではなく制度信用に切替。
+    os.environ.setdefault("ENTRY_DAYTRADE_CUTOFF_TIME", "15:00:00")
     os.environ.setdefault("ENTRY_AFTER_CUTOFF_FORCE_SYSTEM_MARGIN", "1")
     # Keep the legacy envs as day-trade defaults. The payload wrapper will override late entries.
     os.environ.setdefault("ENTRY_ORDER_MARGIN_TRADE_TYPE", os.environ.get("KABU_DAYTRADE_MARGIN_TYPE", "3"))
@@ -157,7 +159,7 @@ def _patch_buy_sell_entry_payload() -> bool:
     global _ORIG_BSE_MAKE_PAYLOAD
     try:
         import kabu_api.buy_sell_entry as bse
-        if getattr(bse, "_daytrade_credit_payload_patched_v2", False):
+        if getattr(bse, "_daytrade_credit_payload_patched_v3", False):
             return True
         orig = getattr(bse, "_make_payload", None)
         if not callable(orig):
@@ -192,7 +194,7 @@ def _patch_buy_sell_entry_payload() -> bool:
                 payload.get("CashMargin"),
                 payload.get("MarginTradeType"),
                 mode,
-                os.environ.get("ENTRY_DAYTRADE_CUTOFF_TIME", "15:15:00"),
+                os.environ.get("ENTRY_DAYTRADE_CUTOFF_TIME", "15:00:00"),
                 payload.get("FrontOrderType"),
             )
             return payload
@@ -200,6 +202,7 @@ def _patch_buy_sell_entry_payload() -> bool:
         bse._make_payload = _make_payload_daytrade_cutoff
         bse._daytrade_credit_payload_patched = True
         bse._daytrade_credit_payload_patched_v2 = True
+        bse._daytrade_credit_payload_patched_v3 = True
         return True
     except Exception:
         logger.exception("[DAYTRADE CREDIT] buy_sell_entry payload patch failed")
@@ -211,10 +214,10 @@ def _patch_close_defaults() -> bool:
     global _ORIG_CLOSE_SEND_CREDIT_CLOSE_ORDER, _ORIG_CLOSE_PROCESS_EXIT
     try:
         import kabu_api.close as close_mod
-        if getattr(close_mod, "_daytrade_credit_close_patched_v2", False):
+        if getattr(close_mod, "_daytrade_credit_close_patched_v3", False):
             return True
 
-        # If V1 was already installed, bypass its wrapper and call the true original when available.
+        # If V1/V2 was already installed, bypass its wrapper and call the true original when available.
         base_orig = None
         try:
             from core.startup import daytrade_credit_force_close_patch as self_mod
@@ -257,6 +260,7 @@ def _patch_close_defaults() -> bool:
         close_mod.process_exit = process_exit_respect_margin
         close_mod._daytrade_credit_close_patched = True
         close_mod._daytrade_credit_close_patched_v2 = True
+        close_mod._daytrade_credit_close_patched_v3 = True
         return True
     except Exception:
         logger.exception("[DAYTRADE CREDIT] close defaults patch failed")
