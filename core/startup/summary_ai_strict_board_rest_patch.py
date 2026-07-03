@@ -8,7 +8,7 @@ from functools import wraps
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V10-SUMMARY-AI-REST-BOARD-CHECK-URGENT-PUSH-HARD-BLOCK"
+VERSION = "V11-SUMMARY-AI-REST-BOARD-ATR-LIQ-BRIDGE-HARD-BLOCK"
 _INSTALLED = False
 _ORIG_GET_LATEST_BID_ASK = None
 _ORIG_GET_BOARD_WITH_RETRY = None
@@ -86,7 +86,6 @@ def _apply_hard_board_policy() -> None:
     os.environ["ENTRY_BOARD_MISSING_HARD_BLOCK"] = "1"
     os.environ["ENTRY_LIMIT_ALLOW_WITHOUT_BOARD"] = "0"
     os.environ["ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"] = "0"
-    # Disable price/close fallback. REST board verification is still allowed.
     os.environ["SUMMARY_AI_ALLOW_BOARD_REST_RESCUE"] = "0"
     os.environ["SUMMARY_AI_CLOSE_LIMIT_FALLBACK_ON_BOARD_MISSING"] = "0"
     os.environ["SUMMARY_AI_BOARD_MISSING_LIMIT_FALLBACK"] = "0"
@@ -190,7 +189,7 @@ def _install_board_wrappers() -> bool:
         from trading.handlers import entry_order_builder as eob
 
         cur_get = getattr(eob, "get_latest_bid_ask", None)
-        if callable(cur_get) and not getattr(cur_get, "_summary_ai_rest_board_check_v10", False):
+        if callable(cur_get) and not getattr(cur_get, "_summary_ai_rest_board_check_v11", False):
             _ORIG_GET_LATEST_BID_ASK = _unwrap_original(cur_get)
 
             @wraps(_ORIG_GET_LATEST_BID_ASK)
@@ -209,13 +208,14 @@ def _install_board_wrappers() -> bool:
                     board = _ORIG_GET_LATEST_BID_ASK(symbol)
                 return _board_or_rest_check(board, symbol, side=side, source=source, inferred=inferred)
 
+            _patched_get_latest_bid_ask._summary_ai_rest_board_check_v11 = True  # type: ignore[attr-defined]
             _patched_get_latest_bid_ask._summary_ai_rest_board_check_v10 = True  # type: ignore[attr-defined]
             _patched_get_latest_bid_ask._summary_ai_rest_board_check_v9 = True  # type: ignore[attr-defined]
             _patched_get_latest_bid_ask._original = _ORIG_GET_LATEST_BID_ASK  # type: ignore[attr-defined]
             eob.get_latest_bid_ask = _patched_get_latest_bid_ask
 
         cur_retry = getattr(eob, "_get_board_with_retry", None)
-        if callable(cur_retry) and not getattr(cur_retry, "_summary_ai_board_retry_rest_check_v10", False):
+        if callable(cur_retry) and not getattr(cur_retry, "_summary_ai_board_retry_rest_check_v11", False):
             _ORIG_GET_BOARD_WITH_RETRY = _unwrap_original(cur_retry)
 
             @wraps(_ORIG_GET_BOARD_WITH_RETRY)
@@ -228,6 +228,7 @@ def _install_board_wrappers() -> bool:
                     board = _ORIG_GET_BOARD_WITH_RETRY(symbol)
                 return _board_or_rest_check(board, symbol, side=side, source=source, inferred="_get_board_with_retry")
 
+            _patched_get_board_with_retry._summary_ai_board_retry_rest_check_v11 = True  # type: ignore[attr-defined]
             _patched_get_board_with_retry._summary_ai_board_retry_rest_check_v10 = True  # type: ignore[attr-defined]
             _patched_get_board_with_retry._summary_ai_board_retry_rest_check_v9 = True  # type: ignore[attr-defined]
             _patched_get_board_with_retry._original = _ORIG_GET_BOARD_WITH_RETRY  # type: ignore[attr-defined]
@@ -248,11 +249,13 @@ def install() -> bool:
       - Never rescue with close/current/vwap price when board is unavailable.
       - Summary-AI AI_OK symbols are temporarily promoted into PUSH rotation, but still
         require a real board before ordering.
+      - Summary-AI ATR shortage can be bridged only when liquidity and observed range are enough.
     """
     global _INSTALLED
     if _INSTALLED:
         _apply_hard_board_policy()
         _safe_install("core.startup.summary_ai_urgent_push_registration_patch", "urgent_push")
+        _safe_install("core.startup.summary_ai_atr_liquidity_bridge_patch", "atr_liquidity_bridge")
         return True
     try:
         ranking_prefilter = _safe_install("core.startup.summary_ai_ranking_prefilter_score_fallback_patch", "ranking_prefilter_score_fallback")
@@ -260,16 +263,18 @@ def install() -> bool:
         fast_entry = _safe_install("core.startup.ranking_summary_fast_entry_patch", "ranking_summary_fast_entry")
         board_defer = _safe_install("core.startup.summary_ai_board_missing_defer_patch", "board_missing_defer")
         urgent_push = _safe_install("core.startup.summary_ai_urgent_push_registration_patch", "urgent_push")
+        atr_liq_bridge = _safe_install("core.startup.summary_ai_atr_liquidity_bridge_patch", "atr_liquidity_bridge")
         _apply_hard_board_policy()
         board_wrappers = _install_board_wrappers()
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY AI STRICT BOARD REST] installed REST board check for push-rotation missing; hard block remains ranking_prefilter=%s best_rank_bridge=%s fast_entry=%s board_defer=%s urgent_push=%s board_wrappers=%s close_limit_fallback=0 version=%s",
+            "[SUMMARY AI STRICT BOARD REST] installed REST board check for push-rotation missing; hard block remains ranking_prefilter=%s best_rank_bridge=%s fast_entry=%s board_defer=%s urgent_push=%s atr_liq_bridge=%s board_wrappers=%s close_limit_fallback=0 version=%s",
             ranking_prefilter,
             best_rank_bridge,
             fast_entry,
             board_defer,
             urgent_push,
+            atr_liq_bridge,
             board_wrappers,
             VERSION,
         )
