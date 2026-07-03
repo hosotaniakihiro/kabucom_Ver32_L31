@@ -6,7 +6,7 @@ import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V7-SUMMARY-AI-BOARD-HARD-BLOCK-RANKING-BRIDGES"
+VERSION = "V8-SUMMARY-AI-BOARD-HARD-BLOCK-DEFER-RANKING-BRIDGES"
 _INSTALLED = False
 
 
@@ -57,11 +57,11 @@ def _apply_hard_board_policy() -> None:
 
 
 def install() -> bool:
-    """Keep SUMMARY_AI board-missing behavior strict and chain ranking bridges.
+    """Keep SUMMARY_AI board-missing behavior strict and chain retry/defer bridges.
 
-    Board missing remains a hard block because it is treated as likely low liquidity.
-    V7 also installs the ranking prefilter bridges and fast ranking summary route
-    from this confirmed startup path.
+    Board missing remains a hard block because it may be low liquidity.
+    V8 also marks board-missing snapshots retryable/deferred for short PUSH
+    rotation gaps. It never allows a boardless order.
     """
     global _INSTALLED
     if _INSTALLED:
@@ -71,23 +71,26 @@ def install() -> bool:
         ranking_prefilter = _safe_install("core.startup.summary_ai_ranking_prefilter_score_fallback_patch", "ranking_prefilter_score_fallback")
         best_rank_bridge = _safe_install("core.startup.summary_ai_ranking_best_rank_bridge_patch", "best_rank_bridge")
         fast_entry = _safe_install("core.startup.ranking_summary_fast_entry_patch", "ranking_summary_fast_entry")
+        board_defer = _safe_install("core.startup.summary_ai_board_missing_defer_patch", "board_missing_defer")
         _apply_hard_board_policy()
         if not _env_bool("SUMMARY_AI_ALLOW_BOARD_REST_RESCUE", False):
             _INSTALLED = True
             logger.warning(
-                "[SUMMARY AI STRICT BOARD REST] disabled by policy; board missing remains hard block ranking_prefilter=%s best_rank_bridge=%s fast_entry=%s close_limit_fallback=0 version=%s",
+                "[SUMMARY AI STRICT BOARD REST] disabled by policy; board missing remains hard block ranking_prefilter=%s best_rank_bridge=%s fast_entry=%s board_defer=%s close_limit_fallback=0 version=%s",
                 ranking_prefilter,
                 best_rank_bridge,
                 fast_entry,
+                board_defer,
                 VERSION,
             )
             return True
 
         logger.warning(
-            "[SUMMARY AI STRICT BOARD REST] rescue requested but policy keeps hard block ranking_prefilter=%s best_rank_bridge=%s fast_entry=%s close_limit_fallback=0 version=%s",
+            "[SUMMARY AI STRICT BOARD REST] rescue requested but policy keeps hard block ranking_prefilter=%s best_rank_bridge=%s fast_entry=%s board_defer=%s close_limit_fallback=0 version=%s",
             ranking_prefilter,
             best_rank_bridge,
             fast_entry,
+            board_defer,
             VERSION,
         )
         _INSTALLED = True
