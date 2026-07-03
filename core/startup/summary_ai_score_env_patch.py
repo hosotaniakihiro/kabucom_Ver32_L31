@@ -1,17 +1,15 @@
 # ============================================================
 # File   : core/startup/summary_ai_score_env_patch.py
-# Version: PRODUCTION-STABLE-REV2-SUMMARY-AI-ENTRY-BUY-THRESHOLD-PATCH
+# Version: REV3-SUMMARY-AI-ENTRY-BUY-THRESHOLD-PATCH-RANKING-PREFILTER
 # ------------------------------------------------------------
 # Purpose:
 #   - AI.entry_gate の SUMMARY score threshold は MIN_ENTRY_SCORE を参照する。
-#   - BUY候補は runner/candidates 側で min_buy=4.0 に絞られている。
-#   - entry_controller.py 側の最終BUY閾値が 5.0 のままだと、
+#   - BUY候補は runner/candidates 側で min_buy に絞られている。
+#   - entry_controller.py 側の最終BUY閾値が高いままだと、
 #     BUY候補がAI_OKでも BUY_SCORE_LOW / BUY_COMPOSITE_LOW で落ちる。
 #   - 起動時に MIN_ENTRY_SCORE と entry_controller BUY閾値を実運用値へ合わせる。
-#
-# Expected:
-#   - BUY score=4.0 の候補が entry_controller 最終AI gate を通過する
-#   - SELL候補の score_low:<4.000 も減る
+#   - REV3: RANKING summary の ranking_score/ranking_momentum が全0でも、
+#           既存 score_buy/score_sell/score_mtf/score_slope から前段フィルタを補完する。
 # ============================================================
 
 from __future__ import annotations
@@ -90,6 +88,20 @@ def _patch_entry_controller_thresholds() -> dict[str, object]:
     return result
 
 
+def _install_ranking_prefilter_score_fallback() -> dict[str, object]:
+    result: dict[str, object] = {"installed": False}
+    try:
+        from core.startup.summary_ai_ranking_prefilter_score_fallback_patch import install, VERSION
+
+        ok = bool(install())
+        result.update({"installed": ok, "version": VERSION})
+        return result
+    except Exception as e:
+        logger.exception("[SUMMARY AI SCORE ENV PATCH] ranking prefilter score fallback install failed")
+        result.update({"error": repr(e)})
+        return result
+
+
 def install_summary_ai_score_env_patch() -> None:
     global _INSTALLED
     if _INSTALLED:
@@ -104,13 +116,15 @@ def install_summary_ai_score_env_patch() -> None:
     _set_env_default("ENTRY_CONTROLLER_MIN_AI_CONFIDENCE_BUY", "0.60", applied, kept)
 
     controller_patch = _patch_entry_controller_thresholds()
+    ranking_prefilter = _install_ranking_prefilter_score_fallback()
 
     _INSTALLED = True
     logger.warning(
-        "[SUMMARY AI SCORE ENV PATCH] installed applied=%s kept=%s entry_controller=%s",
+        "[SUMMARY AI SCORE ENV PATCH] installed applied=%s kept=%s entry_controller=%s ranking_prefilter=%s",
         applied,
         kept,
         controller_patch,
+        ranking_prefilter,
     )
 
 
