@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
-"""Align normal EXIT thresholds with Tonosama/Inago scalping policy.
+"""Keep normal stop-loss scalped, but restore normal take-profit behavior.
+
+User policy:
+- Stop loss should remain quick: -0.30%.
+- Take-profit logic should be restored to the previous normal behavior:
+  +0.80% fixed take profit, +0.60% trailing start, -0.30% trailing gap,
+  and 300 seconds max hold.
 
 This keeps the existing exit pipeline and only changes NORMAL_* constants.
-Normal positions still use check_normal_exit, but the thresholds become:
-- stop loss: -0.30%
-- take profit trigger: +0.20%
-- trailing start: +0.20%
-- trailing gap: -0.20% from max profit
-- max hold: 60 seconds
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import logging
 import os
 
 logger = logging.getLogger(__name__)
-VERSION = "V1-NORMAL-EXIT-SCALP-ALIGN-TONOSAMA"
+VERSION = "V2-NORMAL-STOP-SCALP-PROFIT-ORIGINAL"
 _INSTALLED = False
 
 
@@ -47,11 +47,12 @@ def install() -> bool:
             "NORMAL_MAX_HOLD_SEC": getattr(eh, "NORMAL_MAX_HOLD_SEC", None),
         }
 
-        stop = -abs(_env_float("NORMAL_EXIT_STOP_LOSS_PCT", _env_float("TONOSAMA_EXIT_STOP_LOSS_PCT", 0.0030)))
-        take = abs(_env_float("NORMAL_EXIT_TAKE_PROFIT_PCT", _env_float("TONOSAMA_EXIT_TAKE_PROFIT_PCT", 0.0020)))
-        trail_gap = abs(_env_float("NORMAL_EXIT_TRAIL_GAP_PCT", _env_float("TONOSAMA_EXIT_TRAIL_GAP_PCT", 0.0020)))
-        trail_start = abs(_env_float("NORMAL_EXIT_TRAIL_START_PCT", take))
-        max_hold = int(_env_float("NORMAL_EXIT_MAX_HOLD_SEC", _env_float("TONOSAMA_EXIT_MAX_HOLD_SEC", 60.0)))
+        # Keep the requested quick stop-loss, but restore the normal profit side.
+        stop = -abs(_env_float("NORMAL_EXIT_STOP_LOSS_PCT", 0.0030))
+        take = abs(_env_float("NORMAL_EXIT_TAKE_PROFIT_PCT", 0.0080))
+        trail_start = abs(_env_float("NORMAL_EXIT_TRAIL_START_PCT", 0.0060))
+        trail_gap = abs(_env_float("NORMAL_EXIT_TRAIL_GAP_PCT", 0.0030))
+        max_hold = int(_env_float("NORMAL_EXIT_MAX_HOLD_SEC", 300.0))
 
         eh.NORMAL_STOP_LOSS = stop
         eh.NORMAL_TAKE_PROFIT = take
@@ -61,7 +62,7 @@ def install() -> bool:
 
         _INSTALLED = True
         logger.warning(
-            "[NORMAL EXIT SCALP ALIGN] installed version=%s stop %.4f->%.4f take %.4f->%.4f trail_start %.4f->%.4f trail_gap %.4f->%.4f max_hold %s->%s",
+            "[NORMAL EXIT SCALP ALIGN] installed version=%s stop %.4f->%.4f take %.4f->%.4f trail_start %.4f->%.4f trail_gap %.4f->%.4f max_hold %s->%s policy=profit_original_stop_scalp",
             VERSION,
             old["NORMAL_STOP_LOSS"] if old["NORMAL_STOP_LOSS"] is not None else 0.0,
             eh.NORMAL_STOP_LOSS,
