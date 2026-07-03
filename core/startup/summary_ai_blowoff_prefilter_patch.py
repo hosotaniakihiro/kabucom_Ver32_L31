@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/summary_ai_blowoff_prefilter_patch.py
-# Version: V8-STRICT-DANGER-BLOWOFF
+# Version: V9-REENTRANT-SAFE-BLOWOFF-PREFILTER
 # ------------------------------------------------------------
 # Summary-AI の Top3 選定前と entry_pipeline 発注直前の blowoff 過剰除外を抑制する。
 #
@@ -10,8 +10,8 @@
 #   - RSI過熱 + 大きい値幅 + 高値圏/終値位置 + 方向の複合条件で、
 #     本当に危険な天井候補だけ除外する。
 #   - Summary-AI の SELL は既定では blowoff 除外しない。
-#   - entry_pipeline 側の _filter_blowoff も同じ基準に差し替え、
-#     AI_OK/approved 後に blowoff だけで全落ちする事故を防ぐ。
+#   - async/direct_dispatch など他パッチとのラップ順が変わっても、
+#     同じ prefilter を二重・多重に掛けず、再帰ループを作らない。
 # ============================================================
 from __future__ import annotations
 
@@ -27,11 +27,13 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V8-STRICT-DANGER-BLOWOFF"
+VERSION = "V9-REENTRANT-SAFE-BLOWOFF-PREFILTER"
 _INSTALLED = False
 _WATCHER_STARTED = False
 _TRUE_VALUES = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 _FALSE_VALUES = {"0", "false", "no", "n", "off", "ng", "disable", "disabled", ""}
+_BLOWOFF_MARKERS = tuple(f"_summary_ai_blowoff_prefilter_v{i}" for i in range(1, 10))
+_ENTRY_PIPELINE_MARKERS = tuple(f"_summary_ai_blowoff_entry_pipeline_v{i}" for i in range(1, 10))
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -186,7 +188,6 @@ def _range_pct_value(row: dict[str, Any], *, close: float, high: float, low: flo
         if raw > 0:
             break
     if raw > 0:
-        # 0.012 のような比率列と、1.2 のような%列の両方に対応する。
         return raw * 100.0 if raw <= 0.5 else raw
     base = close if close > 0 else max(high, low, 1.0)
     if high > 0 and low > 0 and high > low and base > 0:
@@ -201,11 +202,6 @@ def _close_position(row: dict[str, Any], *, close: float, high: float, low: floa
 
 
 def _is_dangerous_blowoff_row(row: dict[str, Any], *, side: str) -> tuple[bool, dict[str, Any]]:
-    """Return True only for a strong overheat/top-risk setup.
-
-    detect_blowoff_top() は対象を広く拾うため、symbol 一致だけで Summary-AI を止めない。
-    BUY は高値圏の過熱だけ止める。SELL は既定では呼び出し側でブロックしない。
-    """
     close = _safe_float(row.get("close") or row.get("close_price") or row.get("price") or row.get("current_price"), 0.0)
     high = _safe_float(row.get("high") or row.get("high_price") or row.get("day_high"), 0.0)
     low = _safe_float(row.get("low") or row.get("low_price") or row.get("day_low"), 0.0)
@@ -221,7 +217,6 @@ def _is_dangerous_blowoff_row(row: dict[str, Any], *, side: str) -> tuple[bool, 
     if side == "BUY":
         ok = rsi >= min_rsi and range_pct >= min_range and slope > 0 and close_pos >= min_close_pos
     else:
-        # SELL を明示的にブロックする場合でも、下げ過熱の安値追いだけを危険扱いする。
         ok = rsi <= (100.0 - min_rsi) and range_pct >= min_range and slope < 0 and close_pos <= (1.0 - min_close_pos)
     return bool(ok), {
         "side": side,
@@ -249,13 +244,13 @@ def _detect_blowoff_symbols(df_summary: Any) -> tuple[set[str], int, int, dict[s
         latest_rows = len(latest_df) if isinstance(latest_df, pd.DataFrame) else 0
         latest_map = _latest_row_map(latest_df)
 
-        # entry_pipeline と同じ full-frame 判定を優先し、ログ互換性を維持する。
         top_symbols = _extract_symbols_from_tops(detect_blowoff_top(df_summary))
         if not top_symbols:
             top_symbols = _extract_symbols_from_tops(detect_blowoff_top(latest_df))
         return top_symbols, source_rows, latest_rows, latest_map
-    except Exception:
-        logger.exception("[SUMMARY AI PREFILTER] blowoff detect failed; fail-open")
+    except Exception as e:
+        # 再帰エラー時に logger.exception の traceback 整形でさらに再帰するのを避ける。
+        logger.error("[SUMMARY AI PREFILTER] blowoff detect failed; fail-open err=%s", e)
         return set(), 0, 0, {}
 
 
@@ -286,19 +281,51 @@ def _filter_ai_results(ai_results: Sequence[dict[str, Any]] | Iterable[Any], df_
 
     logger.warning(
         "[SUMMARY AI PREFILTER] applied before Top3 before=%s after=%s blowoff=%s low_move=%s top_symbols_count=%s source_rows=%s latest_rows=%s block_sell=%s side_counts=%s checked=%s version=%s",
-        len(items),
-        len(kept),
-        sorted(set(skipped["blowoff"])),
-        sorted(set(skipped["low_move"])),
-        len(top_symbols),
-        source_rows,
-        latest_rows,
-        block_sell,
-        side_counts,
-        checked[:10],
-        VERSION,
+        len(items), len(kept), sorted(set(skipped["blowoff"])), sorted(set(skipped["low_move"])),
+        len(top_symbols), source_rows, latest_rows, block_sell, side_counts, checked[:10], VERSION,
     )
     return kept, skipped, top_symbols, {"source_rows": source_rows, "latest_rows": latest_rows, "block_sell": block_sell, "side_counts": side_counts, "checked": checked[:20]}
+
+
+def _has_any_marker(fn: Any, markers: Sequence[str]) -> bool:
+    return any(bool(getattr(fn, m, False)) for m in markers)
+
+
+def _iter_wrapper_chain(fn: Any, *, limit: int = 32):
+    seen: set[int] = set()
+    cur = fn
+    for _ in range(limit):
+        if not callable(cur):
+            return
+        ident = id(cur)
+        if ident in seen:
+            return
+        seen.add(ident)
+        yield cur
+        nxt = getattr(cur, "_original", None)
+        if not callable(nxt):
+            return
+        cur = nxt
+
+
+def _chain_has_marker(fn: Any, markers: Sequence[str]) -> bool:
+    return any(_has_any_marker(x, markers) for x in _iter_wrapper_chain(fn))
+
+
+def _unwrap_own_wrapper(fn: Any) -> Any:
+    cur = fn
+    seen: set[int] = set()
+    for _ in range(32):
+        if not callable(cur) or id(cur) in seen:
+            return fn
+        seen.add(id(cur))
+        if not _has_any_marker(cur, _BLOWOFF_MARKERS):
+            return cur
+        nxt = getattr(cur, "_original", None)
+        if not callable(nxt):
+            return cur
+        cur = nxt
+    return fn
 
 
 def _patch_entry_pipeline_filter(reason: str = "install") -> bool:
@@ -310,7 +337,7 @@ def _patch_entry_pipeline_filter(reason: str = "install") -> bool:
         cur = getattr(ep, "_filter_blowoff", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_summary_ai_blowoff_entry_pipeline_v8", False):
+        if _chain_has_marker(cur, _ENTRY_PIPELINE_MARKERS):
             return True
 
         def patched_filter_blowoff(rows: list[Any], df_summary: pd.DataFrame | None) -> list[Any]:
@@ -345,11 +372,12 @@ def _patch_entry_pipeline_filter(reason: str = "install") -> bool:
                         len(rows or []), len(filtered), skipped[:20], allowed_detected[:20], len(top_symbols), source_rows, latest_rows, VERSION,
                     )
                 return filtered
-            except Exception:
-                logger.exception("[entry_pipeline] patched blowoff filter failed; fail-open version=%s", VERSION)
+            except Exception as e:
+                logger.error("[entry_pipeline] patched blowoff filter failed; fail-open version=%s err=%s", VERSION, e)
                 return rows
 
-        patched_filter_blowoff._summary_ai_blowoff_entry_pipeline_v8 = True  # type: ignore[attr-defined]
+        for marker in _ENTRY_PIPELINE_MARKERS:
+            setattr(patched_filter_blowoff, marker, True)
         patched_filter_blowoff._original = cur  # type: ignore[attr-defined]
         ep._filter_blowoff = patched_filter_blowoff
         logger.warning("[SUMMARY AI PREFILTER] patched entry_pipeline._filter_blowoff reason=%s version=%s", reason, VERSION)
@@ -362,16 +390,24 @@ def _patch_entry_pipeline_filter(reason: str = "install") -> bool:
 def _patch_once(reason: str = "install") -> bool:
     try:
         import trading.entry.summary_ai.executor as ex
+        try:
+            from trading.entry.summary_ai import runner as runner_mod
+        except Exception:
+            runner_mod = None
 
         cur = getattr(ex, "execute_ai_ok_entries_bulk", None)
         if not callable(cur):
             logger.warning("[SUMMARY AI PREFILTER] target missing reason=%s", reason)
             return False
         entry_pipeline_ok = _patch_entry_pipeline_filter(reason=reason)
-        if getattr(cur, "_summary_ai_blowoff_prefilter_v8", False):
+
+        # 重要: top だけでなく _original チェーン全体を見て、既に blowoff prefilter が
+        # 入っていれば再ラップしない。direct_dispatch/async_entry の watcher と競合して
+        # blowoff -> async -> direct -> blowoff の輪を作る事故を防ぐ。
+        if _chain_has_marker(cur, _BLOWOFF_MARKERS):
             return bool(entry_pipeline_ok)
 
-        original = getattr(cur, "_original", cur)
+        original = _unwrap_own_wrapper(cur)
 
         @wraps(original)
         def patched(ai_results, *args, **kwargs):
@@ -408,17 +444,19 @@ def _patch_once(reason: str = "install") -> bool:
                 pass
             return result
 
-        patched._summary_ai_blowoff_prefilter_v1 = True  # type: ignore[attr-defined]
-        patched._summary_ai_blowoff_prefilter_v2 = True  # type: ignore[attr-defined]
-        patched._summary_ai_blowoff_prefilter_v3 = True  # type: ignore[attr-defined]
-        patched._summary_ai_blowoff_prefilter_v4 = True  # type: ignore[attr-defined]
-        patched._summary_ai_blowoff_prefilter_v5 = True  # type: ignore[attr-defined]
-        patched._summary_ai_blowoff_prefilter_v6 = True  # type: ignore[attr-defined]
-        patched._summary_ai_blowoff_prefilter_v7 = True  # type: ignore[attr-defined]
-        patched._summary_ai_blowoff_prefilter_v8 = True  # type: ignore[attr-defined]
+        for marker in _BLOWOFF_MARKERS:
+            setattr(patched, marker, True)
         patched._original = original  # type: ignore[attr-defined]
         ex.execute_ai_ok_entries_bulk = patched
-        logger.warning("[SUMMARY AI PREFILTER] installed reason=%s version=%s block_sell=%s entry_pipeline_ok=%s", reason, VERSION, _env_bool("SUMMARY_AI_BLOWOFF_BLOCK_SELL", False), entry_pipeline_ok)
+        if runner_mod is not None:
+            try:
+                runner_mod.execute_ai_ok_entries_bulk = patched
+            except Exception:
+                pass
+        logger.warning(
+            "[SUMMARY AI PREFILTER] installed reason=%s version=%s block_sell=%s entry_pipeline_ok=%s original=%s",
+            reason, VERSION, _env_bool("SUMMARY_AI_BLOWOFF_BLOCK_SELL", False), entry_pipeline_ok, getattr(original, "__name__", type(original).__name__),
+        )
         return True
     except Exception:
         logger.exception("[SUMMARY AI PREFILTER] install failed reason=%s", reason)
@@ -426,7 +464,8 @@ def _patch_once(reason: str = "install") -> bool:
 
 
 def _watcher() -> None:
-    for i in range(60):
+    loops = 60
+    for i in range(loops):
         try:
             _patch_once(reason=f"watcher:{i}")
         except Exception:
