@@ -1,18 +1,16 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_ai_runtime_consistency_patch.py
-# Version: V6-BREAK-ASYNC-DIRECT-RECURSION
+# Version: V7-STABLE-ASYNC-DIRECT-REPAIR
 # ------------------------------------------------------------
 # Purpose:
 #   1) Summary-AI safety guard must not block a fresh direct 1m df just because
 #      an older global_context summary_history remains cached.
-#   2) Runtime final-board compatibility patches must not replace executor
-#      selection with a pool that collapses AI_OK rows before rolling retry.
-#   3) Ensure blowoff protection is installed without repeatedly re-wrapping or
-#      logging every watcher tick.
-#   4) Ensure SUMMARY_AI fast order builder is loaded from sitecustomize path,
-#      even when usercustomize.py is not imported by this Python environment.
-#   5) Break async_entry <-> direct_dispatch _original cycles.
+#   2) Keep executor selection compatible with rolling retry.
+#   3) Ensure blowoff protection is installed without repeatedly re-wrapping.
+#   4) Ensure SUMMARY_AI fast order builder is loaded.
+#   5) Break async_entry <-> direct_dispatch _original cycles without fighting
+#      the blowoff wrapper for the top executor.
 #
 # This does not relax low-move / blowoff / liquidity / board guards. It only
 # keeps the runtime hook chain consistent and idempotent.
@@ -28,15 +26,17 @@ from functools import wraps
 from typing import Any, Sequence
 
 logger = logging.getLogger(__name__)
-VERSION = "V6-BREAK-ASYNC-DIRECT-RECURSION"
+VERSION = "V7-STABLE-ASYNC-DIRECT-REPAIR"
 _INSTALLED = False
 _WATCHER_STARTED = False
+_FAST_ORDER_ENSURED = False
 _TLS = threading.local()
 _LAST_DIRECT_DF: Any = None
 _LAST_DIRECT_AT: float = 0.0
 _BLOWOFF_MARKERS = tuple(f"_summary_ai_blowoff_prefilter_v{i}" for i in range(1, 10))
 _ASYNC_MARKERS = tuple(f"_summary_ai_async_entry_patch_v{i}" for i in range(1, 13))
 _DIRECT_MARKERS = tuple(f"_summary_ai_direct_dispatch_v{i}" for i in range(1, 12))
+_RUNTIME_WRAPPER_MARKERS = _ASYNC_MARKERS + _DIRECT_MARKERS + _BLOWOFF_MARKERS
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -159,7 +159,7 @@ def _has_any_marker(fn: Any, markers: Sequence[str]) -> bool:
     return any(bool(getattr(fn, m, False)) for m in markers)
 
 
-def _iter_wrapper_chain(fn: Any, *, limit: int = 32):
+def _iter_wrapper_chain(fn: Any, *, limit: int = 48):
     seen: set[int] = set()
     cur = fn
     for _ in range(limit):
@@ -184,13 +184,17 @@ def _is_async_or_direct(fn: Any) -> bool:
     return _has_any_marker(fn, _ASYNC_MARKERS) or _has_any_marker(fn, _DIRECT_MARKERS)
 
 
-def _find_non_async_direct_base(*roots: Any) -> Any:
-    """Find a callable base that is not async_entry/direct_dispatch.
+def _is_runtime_wrapper(fn: Any) -> bool:
+    return _has_any_marker(fn, _RUNTIME_WRAPPER_MARKERS)
 
-    The previous runtime could build this cycle:
-      async_entry._ORIG_EXECUTE -> direct_dispatch wrapper
-      direct_dispatch._ORIG      -> async_entry wrapper
-    Traversing with a seen set avoids hanging while looking for a safe base.
+
+def _find_stable_base(*roots: Any) -> Any:
+    """Find the native executor below async/direct/blowoff wrappers.
+
+    V6 sometimes selected the blowoff wrapper as the base, then forced direct
+    dispatch back to the top. Blowoff then wrapped it again, causing repeated
+    repair logs. V7 only repairs stored _ORIG references and does not fight for
+    top-wrapper ownership.
     """
     seen: set[int] = set()
     stack = [x for x in roots if callable(x)]
@@ -202,7 +206,7 @@ def _find_non_async_direct_base(*roots: Any) -> Any:
         if ident in seen:
             continue
         seen.add(ident)
-        if not _is_async_or_direct(cur):
+        if not _is_runtime_wrapper(cur):
             return cur
         nxt = getattr(cur, "_original", None)
         if callable(nxt):
@@ -211,15 +215,11 @@ def _find_non_async_direct_base(*roots: Any) -> Any:
 
 
 def _break_async_direct_cycle() -> bool:
-    """Repair async_entry/direct_dispatch wrappers if they point to each other."""
+    """Repair async_entry/direct_dispatch _ORIG references once, without top-wrapper churn."""
     if not _env_bool("SUMMARY_AI_BREAK_ASYNC_DIRECT_RECURSION", True):
         return False
     try:
         from trading.entry.summary_ai import executor as exec_mod
-        try:
-            from trading.entry.summary_ai import runner as runner_mod
-        except Exception:
-            runner_mod = None
         try:
             from core.startup import summary_ai_async_entry_patch as async_patch
         except Exception:
@@ -232,34 +232,30 @@ def _break_async_direct_cycle() -> bool:
         current = getattr(exec_mod, "execute_ai_ok_entries_bulk", None)
         async_orig = getattr(async_patch, "_ORIG_EXECUTE", None) if async_patch is not None else None
         direct_orig = getattr(direct_patch, "_ORIG", None) if direct_patch is not None else None
-        base = _find_non_async_direct_base(current, async_orig, direct_orig)
+        base = _find_stable_base(async_orig, direct_orig, current)
         if not callable(base):
             return False
 
         changed = False
-        if async_patch is not None:
-            if callable(async_orig) and _is_async_or_direct(async_orig):
-                async_patch._ORIG_EXECUTE = base
-                changed = True
+        if async_patch is not None and callable(async_orig) and _is_async_or_direct(async_orig) and async_orig is not base:
+            async_patch._ORIG_EXECUTE = base
+            changed = True
+        if direct_patch is not None and callable(direct_orig) and _is_async_or_direct(direct_orig) and direct_orig is not base:
+            direct_patch._ORIG = base
+            changed = True
+
+        # Keep metadata on the direct wrapper honest, but do not force it to the
+        # top if blowoff currently owns the top wrapper. This prevents the
+        # V6 direct_dispatch <-> blowoff top-wrapper tug-of-war.
         if direct_patch is not None:
-            if callable(direct_orig) and _is_async_or_direct(direct_orig):
-                direct_patch._ORIG = base
-                changed = True
             direct_wrapper = getattr(direct_patch, "_patched_execute_ai_ok_entries_bulk", None)
-            if callable(direct_wrapper) and current is not direct_wrapper:
-                # Prefer direct_dispatch as the top executor. Its _ORIG is now the safe base,
-                # so it can run fallback dispatch without calling async_entry again.
+            if callable(direct_wrapper) and getattr(direct_wrapper, "_original", None) is not base:
                 setattr(direct_wrapper, "_original", base)
-                exec_mod.execute_ai_ok_entries_bulk = direct_wrapper
-                if runner_mod is not None:
-                    try:
-                        runner_mod.execute_ai_ok_entries_bulk = direct_wrapper
-                    except Exception:
-                        pass
                 changed = True
+
         if changed:
             logger.warning(
-                "[SUMMARY AI RUNTIME CONSISTENCY] broke async/direct executor recursion base=%s current=%s async_orig=%s direct_orig=%s version=%s",
+                "[SUMMARY AI RUNTIME CONSISTENCY] repaired async/direct originals base=%s current=%s async_orig=%s direct_orig=%s version=%s",
                 getattr(base, "__name__", type(base).__name__),
                 getattr(current, "__name__", type(current).__name__),
                 getattr(async_orig, "__name__", type(async_orig).__name__),
@@ -273,15 +269,12 @@ def _break_async_direct_cycle() -> bool:
 
 
 def _patch_hook_direct_context() -> bool:
-    """Return True only when this call changed runtime state."""
     if not _env_bool("SUMMARY_AI_DIRECT_INPUT_FRESH_CHECK", True):
         return False
     try:
         import scheduler_jobs.summary.summary_ai_entry_hook_v20 as hook
         cur = getattr(hook, "run_summary_ai_entry_safe", None)
-        if not callable(cur):
-            return False
-        if getattr(cur, "_summary_ai_hook_direct_input_v3", False):
+        if not callable(cur) or getattr(cur, "_summary_ai_hook_direct_input_v3", False):
             return False
 
         @wraps(cur)
@@ -309,7 +302,6 @@ def _patch_hook_direct_context() -> bool:
 
 
 def _patch_safety_guard_context() -> bool:
-    """Return True only when this call changed runtime state."""
     if not _env_bool("SUMMARY_AI_DIRECT_INPUT_FRESH_CHECK", True):
         return False
     changed = False
@@ -362,7 +354,6 @@ def _patch_safety_guard_context() -> bool:
 
 
 def _patch_executor_selection() -> bool:
-    """Return True only when this call changed runtime state."""
     if not _env_bool("SUMMARY_AI_PROTECT_EXECUTOR_SELECTION", True):
         return False
     try:
@@ -378,10 +369,7 @@ def _patch_executor_selection() -> bool:
                 selected = list(pool[:cap])
                 logger.warning(
                     "[SUMMARY AI EXECUTOR] protected selection requested=%s cap=%s pool=%s ok_total=%s selected=%s version=%s",
-                    max_entries,
-                    cap,
-                    len(pool),
-                    len(ok_items or []),
+                    max_entries, cap, len(pool), len(ok_items or []),
                     [{"symbol": ex._pick_symbol(x), "side": ex._pick_side(x), "price": ex._pick_price(x), "score": round(ex._score_for_side(x), 3)} for x in selected],
                     VERSION,
                 )
@@ -406,7 +394,6 @@ def _patch_executor_selection() -> bool:
 
 
 def _install_blowoff_prefilter() -> bool:
-    """Install the reentrant-safe blowoff prefilter once."""
     if not _env_bool("SUMMARY_AI_EXECUTOR_BLOWOFF_PREFILTER", True):
         return False
     try:
@@ -432,8 +419,8 @@ def _install_blowoff_prefilter() -> bool:
 
 
 def _install_fast_order_builder() -> bool:
-    """Install Summary-AI order-builder fast path even when usercustomize is not loaded."""
-    if not _env_bool("SUMMARY_AI_FAST_ORDER_BUILDER_ENABLED", True):
+    global _FAST_ORDER_ENSURED
+    if _FAST_ORDER_ENSURED or not _env_bool("SUMMARY_AI_FAST_ORDER_BUILDER_ENABLED", True):
         return False
     try:
         os.environ.setdefault("ENTRY_ORDER_BOARD_RETRY_SEC", "0.8")
@@ -441,6 +428,7 @@ def _install_fast_order_builder() -> bool:
         from core.startup import summary_ai_fast_order_builder_patch as fp
         fn = getattr(fp, "install", None)
         ok = bool(fn()) if callable(fn) else False
+        _FAST_ORDER_ENSURED = bool(ok)
         if ok:
             logger.warning("[SUMMARY AI RUNTIME CONSISTENCY] fast order builder ensured via=%s version=%s", getattr(fp, "VERSION", "unknown"), VERSION)
         return bool(ok)
@@ -456,21 +444,12 @@ def _enforce(reason: str = "install") -> bool:
     changed_selection = _patch_executor_selection()
     changed_blowoff = _install_blowoff_prefilter()
     changed_fast_order = _install_fast_order_builder()
-    # Run once more after possible imports because direct_dispatch/async_entry can be imported by hooks above.
     changed_cycle_late = _break_async_direct_cycle()
     changed = bool(changed_cycle or changed_cycle_late or changed_hook or changed_direct or changed_selection or changed_blowoff or changed_fast_order)
     if changed:
         logger.warning(
             "[SUMMARY AI RUNTIME CONSISTENCY] enforce reason=%s cycle=%s/%s hook=%s direct_input=%s selection=%s blowoff_prefilter=%s fast_order=%s version=%s",
-            reason,
-            changed_cycle,
-            changed_cycle_late,
-            changed_hook,
-            changed_direct,
-            changed_selection,
-            changed_blowoff,
-            changed_fast_order,
-            VERSION,
+            reason, changed_cycle, changed_cycle_late, changed_hook, changed_direct, changed_selection, changed_blowoff, changed_fast_order, VERSION,
         )
     return changed
 
