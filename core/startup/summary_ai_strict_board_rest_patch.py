@@ -1,0 +1,92 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any
+
+logger = logging.getLogger(__name__)
+VERSION = "V1-SUMMARY-AI-STRICT-REST-BOARD-FALLBACK"
+_INSTALLED = False
+_ORIG_GET_LATEST_BID_ASK = None
+
+
+def _valid_board(board: Any) -> bool:
+    try:
+        if not isinstance(board, dict):
+            return False
+        bid = float(board.get("bid_price") or board.get("bid") or board.get("best_bid") or 0)
+        ask = float(board.get("ask_price") or board.get("ask") or board.get("best_ask") or 0)
+        return bid > 0 and ask > 0
+    except Exception:
+        return False
+
+
+def _summary_like(source: str) -> bool:
+    s = str(source or "").strip().upper()
+    return s in {"SUMMARY_AI", "SUMMARY", "PUSH_SUMMARY", "STOCK_SUMMARY", "PUSH"}
+
+
+def install() -> bool:
+    global _INSTALLED, _ORIG_GET_LATEST_BID_ASK
+    if _INSTALLED:
+        return True
+    try:
+        from trading.handlers import entry_order_builder as eob
+        cur = getattr(eob, "get_latest_bid_ask", None)
+        if not callable(cur):
+            return False
+        if getattr(cur, "_summary_ai_strict_board_rest_v1", False):
+            _INSTALLED = True
+            return True
+        _ORIG_GET_LATEST_BID_ASK = getattr(cur, "_original", cur)
+
+        def _patched_get_latest_bid_ask(symbol: Any, *args: Any, **kwargs: Any):
+            source = str(kwargs.get("source") or "").strip().upper()
+            side = str(kwargs.get("side") or "").strip().upper()
+            try:
+                board = _ORIG_GET_LATEST_BID_ASK(symbol)
+            except TypeError:
+                board = _ORIG_GET_LATEST_BID_ASK(symbol, *args, **kwargs)
+            if _valid_board(board):
+                return board
+            if not _summary_like(source):
+                return board
+            try:
+                from core.startup import board_retry_patch as brp
+                old = os.environ.get("ENTRY_BOARD_REST_DIRECT_ENABLED")
+                os.environ["ENTRY_BOARD_REST_DIRECT_ENABLED"] = "1"
+                try:
+                    rest = brp._fetch_board_rest(str(symbol), side=side, source=source or "SUMMARY_AI_ORDER_BUILDER")
+                finally:
+                    if old is None:
+                        os.environ.pop("ENTRY_BOARD_REST_DIRECT_ENABLED", None)
+                    else:
+                        os.environ["ENTRY_BOARD_REST_DIRECT_ENABLED"] = old
+                if _valid_board(rest):
+                    logger.warning("[SUMMARY AI STRICT BOARD REST] board recovered symbol=%s side=%s source=%s version=%s", symbol, side, source, VERSION)
+                    return rest
+                logger.warning("[SUMMARY AI STRICT BOARD REST] board still missing symbol=%s side=%s source=%s version=%s", symbol, side, source, VERSION)
+                return board
+            except Exception:
+                logger.exception("[SUMMARY AI STRICT BOARD REST] failed symbol=%s side=%s source=%s version=%s", symbol, side, source, VERSION)
+                return board
+
+        _patched_get_latest_bid_ask._summary_ai_strict_board_rest_v1 = True  # type: ignore[attr-defined]
+        _patched_get_latest_bid_ask._original = _ORIG_GET_LATEST_BID_ASK  # type: ignore[attr-defined]
+        eob.get_latest_bid_ask = _patched_get_latest_bid_ask
+        _INSTALLED = True
+        logger.warning("[SUMMARY AI STRICT BOARD REST] installed version=%s", VERSION)
+        return True
+    except Exception:
+        logger.exception("[SUMMARY AI STRICT BOARD REST] install failed version=%s", VERSION)
+        return False
+
+
+try:
+    install()
+except Exception:
+    logger.exception("[SUMMARY AI STRICT BOARD REST] auto install failed")
+
+
+__all__ = ["install", "VERSION"]
