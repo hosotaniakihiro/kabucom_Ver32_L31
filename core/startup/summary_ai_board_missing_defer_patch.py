@@ -8,7 +8,7 @@ from functools import wraps
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V5-BOARD-MISSING-DEFER-REST-TIMEOUT-RELIEF"
+VERSION = "V6-BOARD-MISSING-DEFER-NO-REENTRANT-LOCK"
 _INSTALLED = False
 _DEFERRED: dict[tuple[str, str], float] = {}
 
@@ -56,6 +56,33 @@ def _mark_deferred(symbol: str, side: str) -> int:
     return int(sum(1 for exp in _DEFERRED.values() if exp > now))
 
 
+def _apply_async_lock_policy() -> bool:
+    try:
+        old_reentrant = os.environ.get("SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK")
+        old_retry = os.environ.get("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX")
+        old_stale = os.environ.get("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC")
+        # Reentrant execution while entry_controller._pipeline_lock is held can stall the
+        # direct snapshot path before ORDER_BUILD_OK. Treat busy lock as retryable instead.
+        os.environ["SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK"] = "0"
+        os.environ["SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY"] = "1"
+        os.environ["SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX"] = str(max(5, _env_int("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX", 5)))
+        os.environ["SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_SLEEP_SEC"] = str(max(0.5, min(_env_float("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_SLEEP_SEC", 0.8), 1.5)))
+        os.environ["SUMMARY_AI_ASYNC_ENTRY_STALE_SEC"] = str(max(35.0, _env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 35.0)))
+        logger.warning(
+            "[SUMMARY AI BOARD MISSING DEFER] async lock policy applied reentrant %s->0 retry_max %s->%s stale %s->%s version=%s",
+            old_reentrant,
+            old_retry,
+            os.environ.get("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX"),
+            old_stale,
+            os.environ.get("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC"),
+            VERSION,
+        )
+        return True
+    except Exception:
+        logger.exception("[SUMMARY AI BOARD MISSING DEFER] async lock policy failed version=%s", VERSION)
+        return False
+
+
 def _apply_rest_timeout_relief() -> bool:
     try:
         timeout = max(1.2, min(_env_float("SUMMARY_AI_REST_BOARD_TIMEOUT_SEC", 1.5), 3.0))
@@ -93,6 +120,7 @@ def _apply_full_rotation_retry() -> bool:
         os.environ["ENTRY_LIMIT_ALLOW_WITHOUT_BOARD"] = "0"
         os.environ["ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"] = "0"
         _apply_rest_timeout_relief()
+        _apply_async_lock_policy()
         try:
             from trading.handlers import entry_order_builder as eob
             old_retry = getattr(eob, "ENTRY_ORDER_BOARD_RETRY_SEC", None)
@@ -147,7 +175,7 @@ def _install_async_snapshot_patch() -> bool:
         cur = getattr(ap, "_summary_ai_direct_snapshot_execute", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_board_missing_defer_v5", False):
+        if getattr(cur, "_board_missing_defer_v6", False):
             return True
 
         @wraps(cur)
@@ -155,6 +183,12 @@ def _install_async_snapshot_patch() -> bool:
             result = cur(entries, *args, **kwargs)
             try:
                 if isinstance(result, dict) and not bool(result.get("executed")):
+                    if str(result.get("skip_reason") or "") == "entry_controller_lock_timeout":
+                        result = dict(result)
+                        result["retryable"] = True
+                        result["skip_reason"] = "entry_controller_lock_busy_deferred"
+                        logger.warning("[SUMMARY AI BOARD MISSING DEFER] snapshot lock busy deferred version=%s", VERSION)
+                        return result
                     order_results = result.get("result") or []
                     if isinstance(order_results, list):
                         deferred = 0
@@ -176,6 +210,7 @@ def _install_async_snapshot_patch() -> bool:
         wrapped._board_missing_defer_v3 = True  # type: ignore[attr-defined]
         wrapped._board_missing_defer_v4 = True  # type: ignore[attr-defined]
         wrapped._board_missing_defer_v5 = True  # type: ignore[attr-defined]
+        wrapped._board_missing_defer_v6 = True  # type: ignore[attr-defined]
         wrapped._original = cur  # type: ignore[attr-defined]
         ap._summary_ai_direct_snapshot_execute = wrapped
         logger.warning("[SUMMARY AI BOARD MISSING DEFER] async snapshot patched version=%s", VERSION)
@@ -205,7 +240,7 @@ def install() -> bool:
         return True
     try:
         os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY", "1")
-        os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX", "3")
+        os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX", "5")
         os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", "35")
         ok0 = _apply_full_rotation_retry()
         ok1 = _install_async_snapshot_patch()
@@ -214,7 +249,7 @@ def install() -> bool:
         ok4 = _install_memory_liq_patch()
         _INSTALLED = bool(ok0 or ok1 or ok2 or ok3 or ok4)
         logger.warning(
-            "[SUMMARY AI BOARD MISSING DEFER] installed ok=%s full_rotation=%s async=%s builder=%s pending_liq=%s memory_liq=%s retry_sec=%s rest_timeout=%s ttl=%s version=%s",
+            "[SUMMARY AI BOARD MISSING DEFER] installed ok=%s full_rotation=%s async=%s builder=%s pending_liq=%s memory_liq=%s retry_sec=%s rest_timeout=%s reentrant=%s retry_max=%s ttl=%s version=%s",
             _INSTALLED,
             ok0,
             ok1,
@@ -223,6 +258,8 @@ def install() -> bool:
             ok4,
             os.getenv("ENTRY_ORDER_BOARD_RETRY_SEC"),
             os.getenv("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC"),
+            os.getenv("SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK"),
+            os.getenv("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX"),
             os.getenv("SUMMARY_AI_BOARD_MISSING_DEFER_TTL_SEC"),
             VERSION,
         )
