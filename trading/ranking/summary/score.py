@@ -1,13 +1,14 @@
 # ============================================================
 # File   : trading/ranking/summary/score.py
-# Version: Ver1.4-PRODUCTION-RANKING-SUMMARY-RANK-DERIVED-SCORE
+# Version: Ver1.5-PRODUCTION-RANKING-SUMMARY-BEST-RANK-REPAIR
 # ------------------------------------------------------------
 # ranking summary 用 score column 補完モジュール
 # ------------------------------------------------------------
 # ✔ score / score_total / final_score / display_score を保証
 # ✔ score_buy / score_sell を保証
 # ✔ ranking_score / rank_score 等から base score を復元
-# ✔ 補修元score列が無い場合は No / Rank / ranking_rank など順位列から score を生成
+# ✔ 補修元score列が無い場合は No / Rank / ranking_rank / best_rank など順位列から score を生成
+# ✔ RANKING_PRE_FILTER が見る ranking_score / ranking_momentum も0埋めから復元
 # ✔ 値下がり/下降系 ranking type は SELL score として生成
 # ✔ 文字列数値 / カンマ / 空文字 / <NA> を安全処理
 # ✔ 重複列 DataFrame 化にも対応
@@ -22,6 +23,7 @@ import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+VERSION = "Ver1.5-PRODUCTION-RANKING-SUMMARY-BEST-RANK-REPAIR"
 
 
 SCORE_COLUMNS = [
@@ -63,12 +65,19 @@ RANKING_REPAIR_CANDIDATES = [
 ]
 
 RANK_COLUMNS = [
-    "rank",
-    "Rank",
+    "best_rank",
+    "best_rank_position",
+    "best_rank_agg",
+    "rank_position",
+    "ranking_position",
     "ranking_rank",
     "disp_ranking_rank",
+    "rank",
+    "Rank",
     "No",
     "no",
+    "rank_no",
+    "ranking_no",
     "順位",
     "AverageRanking",
 ]
@@ -82,6 +91,7 @@ TYPE_COLUMNS = [
     "CategoryName",
     "category_name",
     "name_type",
+    "category",
 ]
 
 
@@ -225,16 +235,45 @@ def _rank_derived_score(df: pd.DataFrame) -> pd.Series:
 
     try:
         logger.info(
-            "[RANKING SUMMARY SCORE] rank-derived repair rank_col=%s rows=%d nonzero=%d sell_like=%d buy_like=%d",
+            "[RANKING SUMMARY SCORE] rank-derived repair rank_col=%s rows=%d nonzero=%d sell_like=%d buy_like=%d version=%s",
             used_col,
             len(df),
             _nonzero_count(signed),
             int(sell_mask.sum()),
             int(buy_mask.sum()),
+            VERSION,
         )
     except Exception:
         pass
     return signed.astype("float64")
+
+
+def _ensure_prefilter_columns(x: pd.DataFrame, final_s: pd.Series, rank_score: pd.Series) -> pd.DataFrame:
+    """Summary-AI RANKING_PRE_FILTER が直接見る列も0のままにしない。"""
+    try:
+        final_abs = pd.to_numeric(final_s, errors="coerce").fillna(0.0).abs().astype("float64")
+        rank_abs = pd.to_numeric(rank_score, errors="coerce").fillna(0.0).abs().astype("float64")
+        repair_abs = final_abs.where(final_abs.ne(0.0), rank_abs)
+        if "ranking_score" in x.columns:
+            x["ranking_score"] = _safe_numeric_series(x, "ranking_score", default=0.0, fill=True)
+            x["ranking_score"] = _repair_zero_series(x["ranking_score"], repair_abs)
+        else:
+            x["ranking_score"] = repair_abs
+        if "ranking_momentum" in x.columns:
+            x["ranking_momentum"] = _safe_numeric_series(x, "ranking_momentum", default=0.0, fill=True)
+            x["ranking_momentum"] = _repair_zero_series(x["ranking_momentum"], repair_abs)
+        else:
+            x["ranking_momentum"] = repair_abs
+        # 既存pre-filterが price_delta_pct/rank_improve/volume_delta のいずれかも見る場合に備え、
+        # 明示的な変化量が全欠損でも順位由来の rank_improve だけは0から補修する。
+        if "rank_improve" in x.columns:
+            x["rank_improve"] = _safe_numeric_series(x, "rank_improve", default=0.0, fill=True)
+            x["rank_improve"] = _repair_zero_series(x["rank_improve"], repair_abs.clip(upper=50.0))
+        else:
+            x["rank_improve"] = repair_abs.clip(upper=50.0)
+    except Exception:
+        logger.exception("[RANKING SUMMARY SCORE] prefilter column repair failed version=%s", VERSION)
+    return x
 
 
 def ensure_score_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -303,6 +342,8 @@ def ensure_score_columns(df: pd.DataFrame) -> pd.DataFrame:
     else:
         x["score_mtf"] = _zero_float_series(x.index)
 
+    x = _ensure_prefilter_columns(x, final_s, rank_score)
+
     for col in SCORE_COLUMNS:
         try:
             x[col] = pd.to_numeric(x[col], errors="coerce").fillna(0.0).astype("float64")
@@ -312,7 +353,7 @@ def ensure_score_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     try:
         logger.info(
-            "[RANKING SUMMARY SCORE] ensured rows=%d score_nonnull=%d score_nonzero=%d final_nonnull=%d buy_nonzero=%d sell_nonzero=%d repair_nonzero=%d rank_repair_nonzero=%d",
+            "[RANKING SUMMARY SCORE] ensured rows=%d score_nonnull=%d score_nonzero=%d final_nonnull=%d buy_nonzero=%d sell_nonzero=%d repair_nonzero=%d rank_repair_nonzero=%d ranking_score_nonzero=%d ranking_momentum_nonzero=%d version=%s",
             len(x),
             int(pd.to_numeric(x["score"], errors="coerce").notna().sum()),
             int(pd.to_numeric(x["score"], errors="coerce").fillna(0.0).ne(0).sum()),
@@ -321,6 +362,9 @@ def ensure_score_columns(df: pd.DataFrame) -> pd.DataFrame:
             int(pd.to_numeric(x["score_sell"], errors="coerce").fillna(0.0).ne(0).sum()),
             _nonzero_count(repair_score),
             _nonzero_count(rank_score),
+            _nonzero_count(x.get("ranking_score", _zero_float_series(x.index))),
+            _nonzero_count(x.get("ranking_momentum", _zero_float_series(x.index))),
+            VERSION,
         )
     except Exception:
         logger.exception("[RANKING SUMMARY SCORE] ensure score log failed")
