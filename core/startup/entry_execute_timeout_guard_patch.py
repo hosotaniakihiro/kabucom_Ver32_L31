@@ -1,17 +1,15 @@
 # ============================================================
 # File   : core/startup/entry_execute_timeout_guard_patch.py
-# Version: V5-TRUE-ORIGINAL-PINNED
+# Version: V6-TRUE-ORIGINAL-LOGGER-GLOBALS-REPAIR
 # ------------------------------------------------------------
 # _execute_best_candidate timeout guard.
 #
-# V5:
-#   - trading.handlers.entry_controller._BASE_EXECUTE_BEST_CANDIDATE に
-#     発注本体を明示保存する。
-#   - final_entry_safety_guard / timeout guard / bridge patch が再wrapしても、
-#     wrapperではなく必ず発注本体へ戻す。
-#   - ログ上の CALL_ORIG_START orig=patched_execute_best_candidate のような
-#     wrapper呼び出しループを防ぐ。
-#   - stale 判定は緩和しない。
+# V6:
+#   - 発注本体 / wrapper の __globals__ に logger/logging が無い場合、
+#     呼び出し直前に安全補修する。
+#   - ログの ORIG_ERROR_RETURN_FALSE ... NameError("name 'logger' is not defined")
+#     で注文送信直前に False 終了する問題を防ぐ。
+#   - wrapper ループ回避、timeout、stale候補スキップは維持する。
 # ============================================================
 from __future__ import annotations
 
@@ -25,7 +23,7 @@ from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V5-TRUE-ORIGINAL-PINNED"
+VERSION = "V6-TRUE-ORIGINAL-LOGGER-GLOBALS-REPAIR"
 _PATCHED = False
 _WATCHER_STARTED = False
 _INFLIGHT: dict[tuple[str, str], dict[str, Any]] = {}
@@ -45,6 +43,7 @@ _ORIGINAL_ATTRS = (
 )
 
 _PATCH_FLAGS = (
+    "_entry_execute_timeout_guard_v6",
     "_entry_execute_timeout_guard_v5",
     "_entry_execute_timeout_guard_v4",
     "_entry_execute_timeout_guard_v3",
@@ -157,6 +156,32 @@ def _first_dt(*values: Any) -> dt.datetime | None:
     return None
 
 
+def _ensure_logger_globals(fn: Any) -> None:
+    """
+    Runtime wrappers may preserve a function object whose globals do not contain
+    logger/logging.  A NameError here aborts the real order dispatch before
+    place_entry_buy/place_entry_sell is reached, so repair it defensively.
+    """
+    try:
+        g = getattr(fn, "__globals__", None)
+        if not isinstance(g, dict):
+            return
+        if g.get("logging") is None:
+            g["logging"] = logging
+        lg = g.get("logger")
+        if lg is None or not hasattr(lg, "warning"):
+            mod_name = str(g.get("__name__") or getattr(fn, "__module__", "") or __name__)
+            g["logger"] = logging.getLogger(mod_name)
+            logger.warning(
+                "[ENTRY EXEC LOGGER REPAIR] injected logger into fn=%s module=%s version=%s",
+                getattr(fn, "__name__", repr(fn)),
+                mod_name,
+                VERSION,
+            )
+    except Exception:
+        logger.exception("[ENTRY EXEC LOGGER REPAIR] failed fn=%s", getattr(fn, "__name__", repr(fn)))
+
+
 def _is_known_wrapper(fn: Any) -> bool:
     try:
         if not callable(fn):
@@ -185,6 +210,7 @@ def _walk_original_chain(fn: Callable[..., Any]) -> list[Callable[..., Any]]:
     while callable(cur) and id(cur) not in seen:
         seen.add(id(cur))
         out.append(cur)
+        _ensure_logger_globals(cur)
         nxt = None
         for attr in _ORIGINAL_ATTRS:
             cand = getattr(cur, attr, None)
@@ -198,10 +224,10 @@ def _walk_original_chain(fn: Callable[..., Any]) -> list[Callable[..., Any]]:
 
 
 def _pin_base_original(ec: Any, cur: Callable[..., Any] | None = None, *, reason: str = "install") -> Callable[..., Any] | None:
-    """Store the real, non-wrapper entry execution function on entry_controller."""
     try:
         existing = getattr(ec, "_BASE_EXECUTE_BEST_CANDIDATE", None)
         if _looks_like_base(existing):
+            _ensure_logger_globals(existing)
             return existing
         if cur is None:
             cur = getattr(ec, "_execute_best_candidate", None)
@@ -215,10 +241,10 @@ def _pin_base_original(ec: Any, cur: Callable[..., Any] | None = None, *, reason
                 base = cand
                 break
         if base is None and not _is_known_wrapper(cur):
-            # At early startup this is the module's original function.
             base = cur
 
         if callable(base):
+            _ensure_logger_globals(base)
             setattr(ec, "_BASE_EXECUTE_BEST_CANDIDATE", base)
             logger.warning(
                 "[ENTRY EXEC TRUE ORIGINAL] pinned base reason=%s base=%s chain=%s version=%s",
@@ -245,6 +271,7 @@ def _get_pinned_base() -> Callable[..., Any] | None:
         import trading.handlers.entry_controller as ec
         base = getattr(ec, "_BASE_EXECUTE_BEST_CANDIDATE", None)
         if _looks_like_base(base):
+            _ensure_logger_globals(base)
             return base
         return _pin_base_original(ec, getattr(ec, "_execute_best_candidate", None), reason="lazy")
     except Exception:
@@ -252,17 +279,20 @@ def _get_pinned_base() -> Callable[..., Any] | None:
 
 
 def _unwrap_true_original(fn: Callable[..., Any]) -> Callable[..., Any]:
-    """Return the real order-dispatch function, never another runtime wrapper when avoidable."""
     base = _get_pinned_base()
     if callable(base):
+        _ensure_logger_globals(base)
         return base
     candidates = _walk_original_chain(fn)
     for cand in candidates:
         if _looks_like_base(cand):
+            _ensure_logger_globals(cand)
             return cand
     for cand in reversed(candidates):
         if callable(cand) and not _is_known_wrapper(cand):
+            _ensure_logger_globals(cand)
             return cand
+    _ensure_logger_globals(fn)
     return fn
 
 
@@ -351,6 +381,7 @@ def _cleanup_inflight() -> None:
 
 def _call_direct(orig: Callable[..., Any], item: dict[str, Any], boost_active: bool, symbol: str, side: str, reason: str) -> bool:
     true_orig = _unwrap_true_original(orig)
+    _ensure_logger_globals(true_orig)
     try:
         logger.warning("[ENTRY EXEC TIMEOUT GUARD] REENTRANT_BYPASS_TO_TRUE_ORIGINAL symbol=%s side=%s reason=%s orig=%s version=%s", symbol, side, reason, getattr(true_orig, "__name__", repr(true_orig)), VERSION)
         return bool(true_orig(item, boost_active))
@@ -364,11 +395,13 @@ def _call_with_timeout(orig: Callable[..., Any], item: dict[str, Any], boost_act
     q: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
     key = (symbol, side)
     true_orig = _unwrap_true_original(orig)
+    _ensure_logger_globals(true_orig)
 
     def runner() -> None:
         prev = bool(getattr(_LOCAL, "inside_timeout_runner", False))
         _LOCAL.inside_timeout_runner = True
         try:
+            _ensure_logger_globals(true_orig)
             q.put_nowait(("ok", bool(true_orig(item, boost_active))))
         except Exception as exc:
             try:
@@ -427,13 +460,14 @@ def _wrap_current() -> bool:
         if not callable(cur):
             return False
         base = _pin_base_original(ec, cur, reason="wrap_current")
-        if getattr(cur, "_entry_execute_timeout_guard_v5", False):
-            # Keep original pointer repaired even when already wrapped.
+        if getattr(cur, "_entry_execute_timeout_guard_v6", False):
             if callable(base):
+                _ensure_logger_globals(base)
                 cur._entry_execute_timeout_guard_original = base  # type: ignore[attr-defined]
             return True
 
         orig = base or _unwrap_true_original(cur)
+        _ensure_logger_globals(orig)
 
         def wrapped(item: dict, boost_active: bool) -> bool:
             try:
@@ -456,6 +490,7 @@ def _wrap_current() -> bool:
                 logger.exception("[ENTRY EXEC TIMEOUT GUARD] wrapper failed")
                 return False
 
+        wrapped._entry_execute_timeout_guard_v6 = True  # type: ignore[attr-defined]
         wrapped._entry_execute_timeout_guard_v5 = True  # type: ignore[attr-defined]
         wrapped._entry_execute_timeout_guard_v4 = True  # type: ignore[attr-defined]
         wrapped._entry_execute_timeout_guard_v3 = True  # type: ignore[attr-defined]
@@ -465,12 +500,11 @@ def _wrap_current() -> bool:
         wrapped._original_execute_best_candidate = orig  # type: ignore[attr-defined]
         ec._execute_best_candidate = wrapped
         logger.warning(
-            "[ENTRY EXEC TIMEOUT GUARD] wrapped target=%s timeout=%.1fs stale_created=%.1fs stale_bar=%.1fs true_original_pinned=%s version=%s",
+            "[ENTRY EXEC TIMEOUT GUARD] wrapped target=%s timeout=%.1fs stale_created=%.1fs stale_bar=%.1fs logger_repair=True version=%s",
             getattr(orig, "__name__", repr(orig)),
             _env_float("ENTRY_EXECUTE_ORIG_TIMEOUT_SEC", 8.0),
             _env_float("ENTRY_EXECUTE_MAX_CANDIDATE_AGE_SEC", 90.0),
             _env_float("ENTRY_EXECUTE_MAX_BAR_AGE_SEC", 180.0),
-            callable(base),
             VERSION,
         )
         return True
@@ -503,7 +537,7 @@ def install() -> bool:
         _WATCHER_STARTED = True
         threading.Thread(target=_watcher_loop, name="entry-execute-timeout-guard-watcher", daemon=True).start()
         logger.warning("[ENTRY EXEC TIMEOUT GUARD] watcher started")
-    logger.warning("[ENTRY EXEC TIMEOUT GUARD] installed V5 ok=%s version=%s", ok, VERSION)
+    logger.warning("[ENTRY EXEC TIMEOUT GUARD] installed V6 ok=%s version=%s", ok, VERSION)
     return bool(ok)
 
 
