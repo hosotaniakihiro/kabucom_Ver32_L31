@@ -1,23 +1,18 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_ai_runtime_consistency_patch.py
-# Version: V2-HOOK-DIRECT-INPUT-AND-SELECTION-PROTECT
+# Version: V3-HOOK-DIRECT-INPUT-SELECTION-AND-BLOWOFF-PROTECT
 # ------------------------------------------------------------
 # Purpose:
 #   1) Summary-AI safety guard must not block a fresh direct 1m df just because
 #      an older global_context summary_history remains cached.
 #   2) Runtime final-board compatibility patches must not replace executor
 #      selection with a pool that collapses AI_OK rows before rolling retry.
-#
-# V2:
-#   - Also wrap scheduler_jobs.summary.summary_ai_entry_hook_v20.run_summary_ai_entry_safe.
-#     The hook caches the runner callable, so wrapping only runner.py can miss the
-#     actual call path.  The hook wrapper stores the incoming df in thread-local
-#     context before candidate_refill safety guard runs.
+#   3) Executor should not waste approved slots on rows that the downstream
+#      entry_pipeline will immediately reject as blowoff.
 #
 # This does not relax low-move / blowoff / liquidity / board guards.  It only
-# makes the safety guard and candidate selection use the current fresh input and
-# executor-native filtering consistently.
+# applies existing strict checks earlier, before approved slots are consumed.
 # ============================================================
 from __future__ import annotations
 
@@ -30,7 +25,7 @@ from functools import wraps
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V2-HOOK-DIRECT-INPUT-AND-SELECTION-PROTECT"
+VERSION = "V3-HOOK-DIRECT-INPUT-SELECTION-AND-BLOWOFF-PROTECT"
 _INSTALLED = False
 _WATCHER_STARTED = False
 _TLS = threading.local()
@@ -81,7 +76,6 @@ def _extract_df(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
         for k in ("summary_df", "df", "source_df", "base_df"):
             if _is_df(kwargs.get(k)):
                 return kwargs.get(k)
-        # hook signature: run_summary_ai_entry_safe(interval, now, df=None, *, source=...)
         for x in args:
             if _is_df(x):
                 return x
@@ -161,7 +155,7 @@ def _patch_hook_direct_context() -> bool:
     try:
         import scheduler_jobs.summary.summary_ai_entry_hook_v20 as hook
         cur = getattr(hook, "run_summary_ai_entry_safe", None)
-        if not callable(cur) or getattr(cur, "_summary_ai_hook_direct_input_v2", False):
+        if not callable(cur) or getattr(cur, "_summary_ai_hook_direct_input_v3", False):
             return callable(cur)
 
         @wraps(cur)
@@ -170,15 +164,13 @@ def _patch_hook_direct_context() -> bool:
             prev, set_ok = _set_direct_context(df)
             if set_ok:
                 ok, age, latest, rows = _df_age(df)
-                logger.warning(
-                    "[SUMMARY AI DIRECT INPUT GUARD] hook context set rows=%s latest=%s age=%.1f version=%s",
-                    rows, latest, float(age or 0.0), VERSION,
-                )
+                logger.warning("[SUMMARY AI DIRECT INPUT GUARD] hook context set rows=%s latest=%s age=%.1f version=%s", rows, latest, float(age or 0.0), VERSION)
             try:
                 return cur(*args, **kwargs)
             finally:
                 _restore_direct_context(prev)
 
+        _run_summary_ai_entry_safe_with_direct_df._summary_ai_hook_direct_input_v3 = True  # type: ignore[attr-defined]
         _run_summary_ai_entry_safe_with_direct_df._summary_ai_hook_direct_input_v2 = True  # type: ignore[attr-defined]
         _run_summary_ai_entry_safe_with_direct_df._summary_ai_hook_direct_input_v1 = True  # type: ignore[attr-defined]
         _run_summary_ai_entry_safe_with_direct_df._original = cur  # type: ignore[attr-defined]
@@ -191,41 +183,33 @@ def _patch_hook_direct_context() -> bool:
 
 
 def _patch_safety_guard_context() -> bool:
-    """Patch candidate_refill fresh check to prefer the current direct runner df."""
     if not _env_bool("SUMMARY_AI_DIRECT_INPUT_FRESH_CHECK", True):
         return False
     try:
         import core.startup.summary_ai_candidate_refill_patch as crp
         import trading.entry.summary_ai.runner as runner
-
         old_get = getattr(crp, "_get_push_1m_context", None)
-        if callable(old_get) and not getattr(old_get, "_summary_ai_direct_input_v2", False):
+        if callable(old_get) and not getattr(old_get, "_summary_ai_direct_input_v3", False):
             @wraps(old_get)
             def _get_push_1m_context_direct_first(*args: Any, **kwargs: Any):
                 direct = getattr(_TLS, "direct_df", None)
                 if _fresh_direct_df(direct):
                     ok, age, latest, rows = _df_age(direct)
-                    logger.warning(
-                        "[SUMMARY AI DIRECT INPUT GUARD] fresh-check source=direct_runner_input rows=%s latest=%s age=%.1f version=%s",
-                        rows, latest, float(age or 0.0), VERSION,
-                    )
+                    logger.warning("[SUMMARY AI DIRECT INPUT GUARD] fresh-check source=direct_runner_input rows=%s latest=%s age=%.1f version=%s", rows, latest, float(age or 0.0), VERSION)
                     return direct
                 if _fresh_direct_df(_LAST_DIRECT_DF):
                     ok, age, latest, rows = _df_age(_LAST_DIRECT_DF)
-                    logger.warning(
-                        "[SUMMARY AI DIRECT INPUT GUARD] fresh-check source=last_direct_input rows=%s latest=%s age=%.1f version=%s",
-                        rows, latest, float(age or 0.0), VERSION,
-                    )
+                    logger.warning("[SUMMARY AI DIRECT INPUT GUARD] fresh-check source=last_direct_input rows=%s latest=%s age=%.1f version=%s", rows, latest, float(age or 0.0), VERSION)
                     return _LAST_DIRECT_DF
                 return old_get(*args, **kwargs)
-
+            _get_push_1m_context_direct_first._summary_ai_direct_input_v3 = True  # type: ignore[attr-defined]
             _get_push_1m_context_direct_first._summary_ai_direct_input_v2 = True  # type: ignore[attr-defined]
             _get_push_1m_context_direct_first._summary_ai_direct_input_v1 = True  # type: ignore[attr-defined]
             _get_push_1m_context_direct_first._original = old_get  # type: ignore[attr-defined]
             crp._get_push_1m_context = _get_push_1m_context_direct_first
 
         cur = getattr(runner, "run_summary_ai_entry_from_df", None)
-        if callable(cur) and not getattr(cur, "_summary_ai_direct_input_v2", False):
+        if callable(cur) and not getattr(cur, "_summary_ai_direct_input_v3", False):
             @wraps(cur)
             def _run_with_direct_df_context(*args: Any, **kwargs: Any):
                 df = _extract_df(args, kwargs)
@@ -234,12 +218,11 @@ def _patch_safety_guard_context() -> bool:
                     return cur(*args, **kwargs)
                 finally:
                     _restore_direct_context(prev)
-
+            _run_with_direct_df_context._summary_ai_direct_input_v3 = True  # type: ignore[attr-defined]
             _run_with_direct_df_context._summary_ai_direct_input_v2 = True  # type: ignore[attr-defined]
             _run_with_direct_df_context._summary_ai_direct_input_v1 = True  # type: ignore[attr-defined]
             _run_with_direct_df_context._original = cur  # type: ignore[attr-defined]
             runner.run_summary_ai_entry_from_df = _run_with_direct_df_context
-
         logger.warning("[SUMMARY AI DIRECT INPUT GUARD] installed version=%s", VERSION)
         return True
     except Exception:
@@ -248,30 +231,19 @@ def _patch_safety_guard_context() -> bool:
 
 
 def _patch_executor_selection() -> bool:
-    """Restore executor-native AI_OK selection if outer patches replaced it."""
     if not _env_bool("SUMMARY_AI_PROTECT_EXECUTOR_SELECTION", True):
         return False
     try:
         import trading.entry.summary_ai.executor as ex
-
         cur = getattr(ex, "_select_ai_ok_items", None)
-        if callable(cur) and getattr(cur, "_summary_ai_executor_selection_protect_v2", False):
+        if callable(cur) and getattr(cur, "_summary_ai_executor_selection_protect_v3", False):
             return True
-
         def _select_ai_ok_items_protected(ok_items, *, max_entries: int):
             try:
                 pool = ex._selected_pool(ok_items, max_entries=max_entries)
                 cap = ex._effective_max_entries(max_entries)
                 selected = list(pool[:cap])
-                logger.warning(
-                    "[SUMMARY AI EXECUTOR] protected selection requested=%s cap=%s pool=%s ok_total=%s selected=%s version=%s",
-                    max_entries,
-                    cap,
-                    len(pool),
-                    len(ok_items or []),
-                    [{"symbol": ex._pick_symbol(x), "side": ex._pick_side(x), "price": ex._pick_price(x), "score": round(ex._score_for_side(x), 3)} for x in selected],
-                    VERSION,
-                )
+                logger.warning("[SUMMARY AI EXECUTOR] protected selection requested=%s cap=%s pool=%s ok_total=%s selected=%s version=%s", max_entries, cap, len(pool), len(ok_items or []), [{"symbol": ex._pick_symbol(x), "side": ex._pick_side(x), "price": ex._pick_price(x), "score": round(ex._score_for_side(x), 3)} for x in selected], VERSION)
                 return selected
             except Exception:
                 logger.exception("[SUMMARY AI EXECUTOR] protected selection failed; fallback current")
@@ -279,7 +251,7 @@ def _patch_executor_selection() -> bool:
                     return cur(ok_items, max_entries=max_entries) if callable(cur) else []
                 except Exception:
                     return []
-
+        _select_ai_ok_items_protected._summary_ai_executor_selection_protect_v3 = True  # type: ignore[attr-defined]
         _select_ai_ok_items_protected._summary_ai_executor_selection_protect_v2 = True  # type: ignore[attr-defined]
         _select_ai_ok_items_protected._summary_ai_executor_selection_protect_v1 = True  # type: ignore[attr-defined]
         _select_ai_ok_items_protected._original = cur  # type: ignore[attr-defined]
@@ -291,13 +263,29 @@ def _patch_executor_selection() -> bool:
         return False
 
 
+def _install_blowoff_prefilter() -> bool:
+    if not _env_bool("SUMMARY_AI_EXECUTOR_BLOWOFF_PREFILTER", True):
+        return False
+    try:
+        from core.startup import summary_ai_executor_blowoff_prefilter_patch as bp
+        fn = getattr(bp, "install", None)
+        ok = bool(fn()) if callable(fn) else False
+        if ok:
+            logger.warning("[SUMMARY AI RUNTIME CONSISTENCY] blowoff prefilter installed via=%s version=%s", getattr(bp, "VERSION", "unknown"), VERSION)
+        return ok
+    except Exception:
+        logger.debug("[SUMMARY AI RUNTIME CONSISTENCY] blowoff prefilter install not ready", exc_info=True)
+        return False
+
+
 def _enforce(reason: str = "install") -> bool:
     ok_hook = _patch_hook_direct_context()
     ok1 = _patch_safety_guard_context()
     ok2 = _patch_executor_selection()
-    if ok_hook or ok1 or ok2:
-        logger.warning("[SUMMARY AI RUNTIME CONSISTENCY] enforce reason=%s hook=%s direct_input=%s selection=%s version=%s", reason, ok_hook, ok1, ok2, VERSION)
-    return bool(ok_hook or ok1 or ok2)
+    ok3 = _install_blowoff_prefilter()
+    if ok_hook or ok1 or ok2 or ok3:
+        logger.warning("[SUMMARY AI RUNTIME CONSISTENCY] enforce reason=%s hook=%s direct_input=%s selection=%s blowoff_prefilter=%s version=%s", reason, ok_hook, ok1, ok2, ok3, VERSION)
+    return bool(ok_hook or ok1 or ok2 or ok3)
 
 
 def _watcher() -> None:
