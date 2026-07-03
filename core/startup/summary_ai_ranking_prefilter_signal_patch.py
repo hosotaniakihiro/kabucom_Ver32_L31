@@ -19,7 +19,7 @@ from functools import wraps
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V3-RANKING-PREFILTER-SIGNAL-FAST-ENTRY"
+VERSION = "V4-RANKING-PREFILTER-SIGNAL-FAST-ENTRY-EXIT-STAGNATION"
 _INSTALLED = False
 _WATCHER_STARTED = False
 _ORIG_APPLY_RANKING_PRE_FILTER = None
@@ -208,6 +208,17 @@ def _install_fast_ranking_summary() -> bool:
         return False
 
 
+def _install_exit_stagnation() -> bool:
+    try:
+        from core.startup.exit_stagnation_favorable_then_market_patch import install as _install_exit_stagnation
+        ok = bool(_install_exit_stagnation())
+        logger.warning("[SUMMARY AI RANKING PREFILTER SIGNAL] exit stagnation patch ok=%s version=%s", ok, VERSION)
+        return ok
+    except Exception:
+        logger.exception("[SUMMARY AI RANKING PREFILTER SIGNAL] exit stagnation patch failed version=%s", VERSION)
+        return False
+
+
 def _apply_patch_once(reason: str = "install") -> bool:
     global _ORIG_APPLY_RANKING_PRE_FILTER
     try:
@@ -216,13 +227,14 @@ def _apply_patch_once(reason: str = "install") -> bool:
         if not callable(cur):
             logger.warning("[SUMMARY AI RANKING PREFILTER SIGNAL] target missing reason=%s version=%s", reason, VERSION)
             return False
-        if getattr(cur, "_summary_ai_ranking_prefilter_signal_v3", False):
+        if getattr(cur, "_summary_ai_ranking_prefilter_signal_v4", False):
             return True
         _ORIG_APPLY_RANKING_PRE_FILTER = getattr(cur, "_original", cur)
         wrapped = wraps(_ORIG_APPLY_RANKING_PRE_FILTER)(_patched_apply_ranking_pre_filter)
         wrapped._summary_ai_ranking_prefilter_signal_v1 = True  # type: ignore[attr-defined]
         wrapped._summary_ai_ranking_prefilter_signal_v2 = True  # type: ignore[attr-defined]
         wrapped._summary_ai_ranking_prefilter_signal_v3 = True  # type: ignore[attr-defined]
+        wrapped._summary_ai_ranking_prefilter_signal_v4 = True  # type: ignore[attr-defined]
         wrapped._original = _ORIG_APPLY_RANKING_PRE_FILTER  # type: ignore[attr-defined]
         runner._apply_ranking_pre_filter = wrapped
         logger.warning("[SUMMARY AI RANKING PREFILTER SIGNAL] patched reason=%s version=%s original=%s", reason, VERSION, getattr(_ORIG_APPLY_RANKING_PRE_FILTER, "__name__", type(_ORIG_APPLY_RANKING_PRE_FILTER).__name__))
@@ -238,6 +250,7 @@ def _watcher() -> None:
     for i in range(loops):
         try:
             _install_fast_ranking_summary()
+            _install_exit_stagnation()
             _apply_patch_once(reason=f"watcher:{i + 1}")
         except Exception:
             logger.debug("[SUMMARY AI RANKING PREFILTER SIGNAL] watcher loop failed", exc_info=True)
@@ -248,16 +261,17 @@ def _watcher() -> None:
 def install() -> bool:
     global _INSTALLED, _WATCHER_STARTED
     fast_ok = _install_fast_ranking_summary()
+    exit_ok = _install_exit_stagnation()
     ok = _apply_patch_once(reason="install")
-    _INSTALLED = bool(ok or fast_ok)
-    if (ok or fast_ok) and not _WATCHER_STARTED:
+    _INSTALLED = bool(ok or fast_ok or exit_ok)
+    if (ok or fast_ok or exit_ok) and not _WATCHER_STARTED:
         _WATCHER_STARTED = True
         try:
             threading.Thread(target=_watcher, name="summary-ai-ranking-prefilter-signal-watch", daemon=True).start()
             logger.warning("[SUMMARY AI RANKING PREFILTER SIGNAL] watcher started version=%s", VERSION)
         except Exception:
             logger.exception("[SUMMARY AI RANKING PREFILTER SIGNAL] watcher start failed version=%s", VERSION)
-    return bool(ok or fast_ok)
+    return bool(ok or fast_ok or exit_ok)
 
 
 try:
