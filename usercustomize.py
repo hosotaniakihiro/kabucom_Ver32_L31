@@ -95,6 +95,17 @@ def _install_summary_ai_ranking_prefilter_signal() -> bool:
         return False
 
 
+def _install_summary_ai_no_ranking_rescue_scan() -> bool:
+    try:
+        from core.startup.summary_ai_no_ranking_rescue_scan_patch import install as _install_no_scan
+        ok = bool(_install_no_scan())
+        logger.warning("[USERCUSTOMIZE] summary AI no ranking rescue scan ok=%s", ok)
+        return ok
+    except Exception:
+        logger.exception("[USERCUSTOMIZE] summary AI no ranking rescue scan failed")
+        return False
+
+
 def _install_summary_ai_board_rest_cooldown() -> bool:
     try:
         from core.startup.summary_ai_board_rest_cooldown_patch import install as _install_cooldown
@@ -143,6 +154,7 @@ _install_runtime_defaults()
 _patch_entry_order_builder_logger()
 _install_summary_ai_fast_order_builder()
 _install_summary_ai_ranking_prefilter_signal()
+_install_summary_ai_no_ranking_rescue_scan()
 _install_summary_ai_board_rest_cooldown()
 _install_summary_pending_age_relax()
 _install_summary_mtf_duplicate_datetime_guard()
@@ -377,6 +389,7 @@ def _uc_delayed_watchlist_patch_loop() -> None:
             _patch_entry_order_builder_logger()
             _install_summary_ai_fast_order_builder()
             _install_summary_ai_ranking_prefilter_signal()
+            _install_summary_ai_no_ranking_rescue_scan()
             _install_summary_ai_board_rest_cooldown()
         except Exception:
             logger.exception("[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] delayed retry failed")
@@ -387,6 +400,7 @@ if _is_main_py():
     _patch_entry_order_builder_logger()
     _install_summary_ai_fast_order_builder()
     _install_summary_ai_ranking_prefilter_signal()
+    _install_summary_ai_no_ranking_rescue_scan()
     _install_summary_ai_board_rest_cooldown()
     _uc_patch_tonosama_recent_volume_display()
     _uc_patch_watchlist_recent_liq_rotation_failopen()
