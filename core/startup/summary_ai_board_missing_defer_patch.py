@@ -8,7 +8,7 @@ from functools import wraps
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V1-BOARD-MISSING-DEFER-NO-BOARDLESS-ORDER"
+VERSION = "V2-BOARD-MISSING-DEFER-FULL-PUSH-ROTATION-NO-BOARDLESS-ORDER"
 _INSTALLED = False
 _DEFERRED: dict[tuple[str, str], float] = {}
 
@@ -50,10 +50,54 @@ def _is_board_missing_result(v: Any) -> bool:
 
 def _mark_deferred(symbol: str, side: str) -> int:
     now = time.time()
-    ttl = max(1.0, _env_float("SUMMARY_AI_BOARD_MISSING_DEFER_TTL_SEC", 8.0))
+    ttl = max(1.0, _env_float("SUMMARY_AI_BOARD_MISSING_DEFER_TTL_SEC", 12.0))
     key = (_norm_symbol(symbol), str(side or "").upper())
     _DEFERRED[key] = now + ttl
     return int(sum(1 for exp in _DEFERRED.values() if exp > now))
+
+
+def _apply_full_rotation_retry() -> bool:
+    """Wait long enough to observe both A/B PUSH batches before hard-blocking.
+
+    A/B rotation is roughly A 4.8s + clear 0.2s + B 4.8s + clear 0.2s = 10s.
+    A 5s retry can still miss the opposite batch. Use 10.5s while keeping
+    hard-block behavior when board remains unavailable.
+    """
+    try:
+        retry_sec = max(10.0, _env_float("SUMMARY_AI_BOARD_FULL_ROTATION_RETRY_SEC", 10.5))
+        interval_sec = max(0.1, min(_env_float("SUMMARY_AI_BOARD_FULL_ROTATION_RETRY_INTERVAL_SEC", 0.2), 1.0))
+        os.environ["ENTRY_ORDER_BOARD_RETRY_SEC"] = str(retry_sec)
+        os.environ["ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC"] = str(interval_sec)
+        os.environ["SUMMARY_AI_BOARD_RETRY_REASON"] = "push_rotation_full_cycle_wait"
+        os.environ["SUMMARY_AI_BOARD_MISSING_DEFER_TTL_SEC"] = str(max(12.0, retry_sec + 2.0))
+        os.environ["ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY"] = "1"
+        os.environ["ENTRY_BOARD_MISSING_HARD_BLOCK"] = "1"
+        os.environ["ENTRY_LIMIT_ALLOW_WITHOUT_BOARD"] = "0"
+        os.environ["ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"] = "0"
+        try:
+            from trading.handlers import entry_order_builder as eob
+            old_retry = getattr(eob, "ENTRY_ORDER_BOARD_RETRY_SEC", None)
+            old_interval = getattr(eob, "ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", None)
+            setattr(eob, "ENTRY_ORDER_BOARD_RETRY_SEC", retry_sec)
+            setattr(eob, "ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", interval_sec)
+            try:
+                setattr(eob, "ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY", True)
+            except Exception:
+                pass
+            logger.warning(
+                "[SUMMARY AI BOARD MISSING DEFER] full rotation retry applied retry_sec %s->%s interval %s->%s hard_block=True version=%s",
+                old_retry,
+                retry_sec,
+                old_interval,
+                interval_sec,
+                VERSION,
+            )
+        except Exception:
+            logger.debug("[SUMMARY AI BOARD MISSING DEFER] eob full rotation retry skipped", exc_info=True)
+        return True
+    except Exception:
+        logger.exception("[SUMMARY AI BOARD MISSING DEFER] full rotation retry apply failed version=%s", VERSION)
+        return False
 
 
 def _install_async_snapshot_patch() -> bool:
@@ -62,7 +106,7 @@ def _install_async_snapshot_patch() -> bool:
         cur = getattr(ap, "_summary_ai_direct_snapshot_execute", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_board_missing_defer_v1", False):
+        if getattr(cur, "_board_missing_defer_v2", False):
             return True
 
         @wraps(cur)
@@ -87,6 +131,7 @@ def _install_async_snapshot_patch() -> bool:
             return result
 
         wrapped._board_missing_defer_v1 = True  # type: ignore[attr-defined]
+        wrapped._board_missing_defer_v2 = True  # type: ignore[attr-defined]
         wrapped._original = cur  # type: ignore[attr-defined]
         ap._summary_ai_direct_snapshot_execute = wrapped
         logger.warning("[SUMMARY AI BOARD MISSING DEFER] async snapshot patched version=%s", VERSION)
@@ -112,16 +157,26 @@ def _install_fast_builder_log_patch() -> bool:
 def install() -> bool:
     global _INSTALLED
     if _INSTALLED:
+        _apply_full_rotation_retry()
         return True
     try:
-        os.environ.setdefault("SUMMARY_AI_BOARD_MISSING_DEFER_TTL_SEC", "8")
         os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY", "1")
         os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX", "3")
-        os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", "30")
+        os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", "35")
+        ok0 = _apply_full_rotation_retry()
         ok1 = _install_async_snapshot_patch()
         ok2 = _install_fast_builder_log_patch()
-        _INSTALLED = bool(ok1 or ok2)
-        logger.warning("[SUMMARY AI BOARD MISSING DEFER] installed ok=%s async=%s builder=%s ttl=%s version=%s", _INSTALLED, ok1, ok2, os.getenv("SUMMARY_AI_BOARD_MISSING_DEFER_TTL_SEC"), VERSION)
+        _INSTALLED = bool(ok0 or ok1 or ok2)
+        logger.warning(
+            "[SUMMARY AI BOARD MISSING DEFER] installed ok=%s full_rotation=%s async=%s builder=%s retry_sec=%s ttl=%s version=%s",
+            _INSTALLED,
+            ok0,
+            ok1,
+            ok2,
+            os.getenv("ENTRY_ORDER_BOARD_RETRY_SEC"),
+            os.getenv("SUMMARY_AI_BOARD_MISSING_DEFER_TTL_SEC"),
+            VERSION,
+        )
         return _INSTALLED
     except Exception:
         logger.exception("[SUMMARY AI BOARD MISSING DEFER] install failed version=%s", VERSION)
