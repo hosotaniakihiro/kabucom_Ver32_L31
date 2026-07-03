@@ -92,6 +92,26 @@ def _patch_entry_order_builder_logger() -> bool:
         return False
 
 
+def _install_summary_ai_fast_order_builder() -> bool:
+    """Shorten SUMMARY_AI board retry so order build finishes before snapshot_no_order."""
+    try:
+        os.environ.setdefault("ENTRY_ORDER_BOARD_RETRY_SEC", "0.8")
+        os.environ.setdefault("ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", "0.2")
+        from core.startup.summary_ai_fast_order_builder_patch import install as _install_fast_order
+
+        ok = bool(_install_fast_order())
+        logger.warning(
+            "[USERCUSTOMIZE] summary AI fast order builder ok=%s retry_sec=%s retry_interval=%s",
+            ok,
+            os.getenv("ENTRY_ORDER_BOARD_RETRY_SEC"),
+            os.getenv("ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC"),
+        )
+        return ok
+    except Exception:
+        logger.exception("[USERCUSTOMIZE] summary AI fast order builder failed")
+        return False
+
+
 def _install_runtime_defaults() -> bool:
     """Install centralized default env values without overriding user-provided env."""
     try:
@@ -131,6 +151,7 @@ def _install_summary_mtf_duplicate_datetime_guard() -> bool:
 
 _install_runtime_defaults()
 _patch_entry_order_builder_logger()
+_install_summary_ai_fast_order_builder()
 _install_summary_pending_age_relax()
 _install_summary_mtf_duplicate_datetime_guard()
 
@@ -406,6 +427,7 @@ def _uc_delayed_watchlist_patch_loop() -> None:
         try:
             _uc_patch_watchlist_recent_liq_rotation_failopen()
             _patch_entry_order_builder_logger()
+            _install_summary_ai_fast_order_builder()
         except Exception:
             logger.exception("[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] delayed retry failed")
         time.sleep(1.0)
@@ -413,6 +435,7 @@ def _uc_delayed_watchlist_patch_loop() -> None:
 
 if _is_main_py():
     _patch_entry_order_builder_logger()
+    _install_summary_ai_fast_order_builder()
     _uc_patch_tonosama_recent_volume_display()
     _uc_patch_watchlist_recent_liq_rotation_failopen()
     threading.Thread(
