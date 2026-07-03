@@ -6,7 +6,7 @@ import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V6-SUMMARY-AI-BOARD-MISSING-HARD-BLOCK-NO-LIMIT-FALLBACK"
+VERSION = "V7-SUMMARY-AI-BOARD-HARD-BLOCK-RANKING-BRIDGES"
 _INSTALLED = False
 
 
@@ -20,22 +20,19 @@ def _env_bool(name: str, default: bool = False) -> bool:
         return bool(default)
 
 
-def _install_ranking_prefilter_score_fallback() -> bool:
+def _safe_install(module_name: str, label: str) -> bool:
     try:
-        from core.startup.summary_ai_ranking_prefilter_score_fallback_patch import install as _install_ranking_prefilter
-        return bool(_install_ranking_prefilter())
+        mod = __import__(module_name, fromlist=["install"])
+        fn = getattr(mod, "install", None)
+        ok = bool(fn()) if callable(fn) else False
+        logger.warning("[SUMMARY AI STRICT BOARD REST] chained %s ok=%s version=%s", label, ok, VERSION)
+        return ok
     except Exception:
-        logger.exception("[SUMMARY AI STRICT BOARD REST] ranking prefilter fallback chain install failed version=%s", VERSION)
+        logger.exception("[SUMMARY AI STRICT BOARD REST] chained %s failed version=%s", label, VERSION)
         return False
 
 
 def _apply_hard_board_policy() -> None:
-    """Board missing must remain an entry block.
-
-    This also disables older V3.6 fast-order-builder close/LIMIT fallback by env,
-    so even if an old wrapper is still imported locally it cannot convert
-    STRICT_BOARD_MISSING into an order.
-    """
     os.environ["ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY"] = "1"
     os.environ["ENTRY_BOARD_MISSING_HARD_BLOCK"] = "1"
     os.environ["ENTRY_LIMIT_ALLOW_WITHOUT_BOARD"] = "0"
@@ -60,37 +57,37 @@ def _apply_hard_board_policy() -> None:
 
 
 def install() -> bool:
-    """Keep SUMMARY_AI board-missing behavior strict by default.
+    """Keep SUMMARY_AI board-missing behavior strict and chain ranking bridges.
 
-    User policy:
-      If board data cannot be obtained, the symbol is likely low-liquidity or
-      unsafe to enter. Do not rescue it with REST/close/LIMIT fallback.
-
-    V6:
-      - Force disables SUMMARY_AI_CLOSE_LIMIT_FALLBACK_ON_BOARD_MISSING so older
-        V3.6 fast-order wrappers cannot convert STRICT_BOARD_MISSING into LIMIT.
-      - Keeps the RANKING prefilter score bridge installed.
+    Board missing remains a hard block because it is treated as likely low liquidity.
+    V7 also installs the ranking prefilter bridges and fast ranking summary route
+    from this confirmed startup path.
     """
     global _INSTALLED
     if _INSTALLED:
         _apply_hard_board_policy()
         return True
     try:
-        ranking_prefilter = _install_ranking_prefilter_score_fallback()
+        ranking_prefilter = _safe_install("core.startup.summary_ai_ranking_prefilter_score_fallback_patch", "ranking_prefilter_score_fallback")
+        best_rank_bridge = _safe_install("core.startup.summary_ai_ranking_best_rank_bridge_patch", "best_rank_bridge")
+        fast_entry = _safe_install("core.startup.ranking_summary_fast_entry_patch", "ranking_summary_fast_entry")
         _apply_hard_board_policy()
         if not _env_bool("SUMMARY_AI_ALLOW_BOARD_REST_RESCUE", False):
             _INSTALLED = True
             logger.warning(
-                "[SUMMARY AI STRICT BOARD REST] disabled by policy; board missing remains hard block ranking_prefilter=%s close_limit_fallback=0 version=%s",
+                "[SUMMARY AI STRICT BOARD REST] disabled by policy; board missing remains hard block ranking_prefilter=%s best_rank_bridge=%s fast_entry=%s close_limit_fallback=0 version=%s",
                 ranking_prefilter,
+                best_rank_bridge,
+                fast_entry,
                 VERSION,
             )
             return True
 
-        # Debug-only escape hatch is intentionally ignored. Board-missing entries are unsafe.
         logger.warning(
-            "[SUMMARY AI STRICT BOARD REST] rescue requested but policy keeps hard block ranking_prefilter=%s close_limit_fallback=0 version=%s",
+            "[SUMMARY AI STRICT BOARD REST] rescue requested but policy keeps hard block ranking_prefilter=%s best_rank_bridge=%s fast_entry=%s close_limit_fallback=0 version=%s",
             ranking_prefilter,
+            best_rank_bridge,
+            fast_entry,
             VERSION,
         )
         _INSTALLED = True
