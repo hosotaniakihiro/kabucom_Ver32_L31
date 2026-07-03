@@ -2,6 +2,11 @@
 """
 Compatibility installer for centralized runtime environment defaults.
 
+REV30:
+  - install summary parallel executor reset so timed-out main.py summary futures do
+    not remain queued behind a single ThreadPoolExecutor worker.
+  - install Tonosama orphan timeout prune so a stale timeout daemon thread does not
+    permanently block later Tonosama schedule cycles.
 REV29:
   - force install SUMMARY AI ATR 1m filter repair so ATR_1M_FILTER_NG caused by
     missing/flat approved rows is repaired from existing 1m history/range data.
@@ -14,15 +19,6 @@ REV26:
   - install PUSH summary DB latest source patch in DB/data collector contexts so
     summary_database can read fresh PUSH rows from pushYYYYMMDD.db instead of stale
     process-local global_data.push_df.
-REV25:
-  - set default RANKING_API_CALL_SLEEP_SEC=0.5 for ranking collector contexts.
-REV24:
-  - force install SUMMARY AI safety guard from this always-loaded module.
-REV23:
-  - classify child runners explicitly instead of treating every script as helper.
-  - prevent db_prepare/yahoo/summary/ranking/push collector children from starting
-    trading/entry/daytrade patches.
-  - keep DB/data patches in database collector processes.
 """
 from __future__ import annotations
 
@@ -38,7 +34,7 @@ from .runtime_settings_ini_loader import load_settings_ini
 from . import runtime_env_defaults as _defaults
 
 logger = logging.getLogger(__name__)
-VERSION = "REV29-RUNTIME-ENV-DEFAULTS-SUMMARY-AI-ATR-1M-REPAIR"
+VERSION = "REV30-RUNTIME-ENV-DEFAULTS-SUMMARY-EXECUTOR-RESET-TONOSAMA-ORPHAN-PRUNE"
 DEFAULTS_VERSION = getattr(_defaults, "VERSION", "unknown")
 env_bool = getattr(_defaults, "env_bool")
 _INSTALLED = False
@@ -124,14 +120,15 @@ def _safe_install(label: str, context: str, allowed: set[str], env_disable: str,
             return False
         mod = __import__(f"core.startup.{module_name}", fromlist=["install"])
         fn = getattr(mod, "install", None)
-        return bool(fn()) if callable(fn) else False
+        ok = bool(fn()) if callable(fn) else False
+        logger.warning("[RUNTIME ENV DEFAULTS PATCH] %s install ok=%s context=%s", label, ok, context)
+        return ok
     except Exception:
         logger.exception("[RUNTIME ENV DEFAULTS PATCH] %s install failed", label)
         return False
 
 
 def _apply_ranking_api_spacing_default(context: str) -> Dict[str, str]:
-    """Default ranking API interval to 0.5s unless settings.ini/env overrides it."""
     applied: Dict[str, str] = {}
     try:
         if context in {"main_database", "ranking_collector"}:
@@ -147,7 +144,6 @@ def _apply_ranking_api_spacing_default(context: str) -> Dict[str, str]:
 
 
 def _install_strict_entry_defaults(context: str) -> bool:
-    """Always-loaded strict guard for no-relax operation."""
     try:
         if context not in TRADING_CONTEXTS:
             return False
@@ -164,7 +160,6 @@ def _install_strict_entry_defaults(context: str) -> bool:
 
 
 def _force_install_summary_ai_safety_guard(context: str) -> bool:
-    """Install this from runtime defaults because usercustomize/sitecustomize definitely import this module."""
     try:
         if context not in TRADING_CONTEXTS:
             return False
@@ -187,23 +182,19 @@ def _force_install_summary_ai_safety_guard(context: str) -> bool:
 
 
 def _install_summary_ai_direct_timeout_continue(context: str) -> bool:
-    return _safe_install(
-        "summary AI direct timeout continue",
-        context,
-        TRADING_CONTEXTS,
-        "DISABLE_SUMMARY_AI_DIRECT_TIMEOUT_CONTINUE_PATCH",
-        "summary_ai_direct_timeout_continue_patch",
-    )
+    return _safe_install("summary AI direct timeout continue", context, TRADING_CONTEXTS, "DISABLE_SUMMARY_AI_DIRECT_TIMEOUT_CONTINUE_PATCH", "summary_ai_direct_timeout_continue_patch")
 
 
 def _install_summary_ai_atr_1m_filter_repair(context: str) -> bool:
-    return _safe_install(
-        "summary AI ATR 1m filter repair",
-        context,
-        TRADING_CONTEXTS,
-        "DISABLE_SUMMARY_AI_ATR_1M_FILTER_REPAIR_PATCH",
-        "summary_ai_atr_1m_filter_repair_patch",
-    )
+    return _safe_install("summary AI ATR 1m filter repair", context, TRADING_CONTEXTS, "DISABLE_SUMMARY_AI_ATR_1M_FILTER_REPAIR_PATCH", "summary_ai_atr_1m_filter_repair_patch")
+
+
+def _install_summary_parallel_executor_reset(context: str) -> bool:
+    return _safe_install("summary parallel executor reset", context, TRADING_CONTEXTS, "DISABLE_SUMMARY_PARALLEL_EXECUTOR_RESET_PATCH", "summary_parallel_executor_reset_patch")
+
+
+def _install_tonosama_orphan_timeout_prune(context: str) -> bool:
+    return _safe_install("tonosama orphan timeout prune", context, TRADING_CONTEXTS, "DISABLE_TONOSAMA_ORPHAN_TIMEOUT_PRUNE_PATCH", "tonosama_orphan_timeout_prune_patch")
 
 
 def _install_entry_fire_rescue(context: str) -> bool:
@@ -325,9 +316,7 @@ def install() -> bool:
         ranking_spacing_applied = _apply_ranking_api_spacing_default(context)
         applied.update(ranking_spacing_applied)
 
-        # strict は rescue/safety より前に入れ、後続patchの setdefault に負けないようにする。
         strict_entry_defaults_ok = _install_strict_entry_defaults(context)
-
         intraday_load_guard_ok = _install_intraday_load_guard(context)
         yahoo_parallel_empty_ok = _install_yahoo_parallel_empty_cooldown(context)
         ranking_legacy_inline_ok = _install_ranking_legacy_inline_flush(context)
@@ -340,6 +329,8 @@ def install() -> bool:
         summary_ai_safety_ok = _force_install_summary_ai_safety_guard(context)
         summary_ai_direct_timeout_continue_ok = _install_summary_ai_direct_timeout_continue(context)
         summary_ai_atr_1m_repair_ok = _install_summary_ai_atr_1m_filter_repair(context)
+        summary_parallel_reset_ok = _install_summary_parallel_executor_reset(context)
+        tonosama_orphan_prune_ok = _install_tonosama_orphan_timeout_prune(context)
         summary_pending_stale_ok = _install_summary_pending_stale_guard(context)
         entry_fire_rescue_ok = _install_entry_fire_rescue(context)
         ranking_entry_rescue_ok = _install_ranking_entry_runtime_rescue(context)
@@ -352,45 +343,16 @@ def install() -> bool:
         daytrade_credit_ok = _install_daytrade_credit_force_close(context)
         _INSTALLED = True
         logger.warning(
-            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s ranking_api_sleep=%s ranking_spacing_applied=%s strict_entry_defaults=%s intraday_load_guard=%s yahoo_parallel_empty=%s ranking_legacy_inline=%s summary_lock_pressure=%s push_summary_db_source=%s summary_db_realtime=%s database_owner=%s full_pipeline=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s summary_ai_safety=%s summary_ai_direct_timeout_continue=%s summary_ai_atr_1m_repair=%s summary_pending_stale=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s tonosama_exit_infer=%s tonosama_pending_audit=%s daytrade_credit=%s verbose=%s",
-            VERSION,
-            DEFAULTS_VERSION,
-            REGISTRY_VERSION,
-            SETTINGS_INI_VERSION,
-            len(settings_applied),
-            len(applied),
-            context,
-            ",".join(SITE_GROUP_ORDER),
-            ",".join(USER_GROUP_ORDER),
-            os.environ.get("RANKING_API_CALL_SLEEP_SEC"),
-            ranking_spacing_applied,
-            strict_entry_defaults_ok,
-            intraday_load_guard_ok,
-            yahoo_parallel_empty_ok,
-            ranking_legacy_inline_ok,
-            summary_lock_pressure_ok,
-            push_summary_db_source_ok,
-            summary_db_realtime_ok,
-            database_owner_ok,
-            full_pipeline_ok,
-            os.environ.get("SITECUSTOMIZE_ENABLE_RESCUE_PATCHES"),
-            os.environ.get("USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES"),
-            os.environ.get("USERCUSTOMIZE_ENABLE_TONOSAMA_RESCUE_PATCHES"),
-            entry_count_unblock_ok,
-            summary_ai_safety_ok,
-            summary_ai_direct_timeout_continue_ok,
-            summary_ai_atr_1m_repair_ok,
-            summary_pending_stale_ok,
-            entry_fire_rescue_ok,
-            ranking_entry_rescue_ok,
-            low_vol_guard_ok,
-            push_register_recovery_ok,
-            day_position_guard_ok,
-            strict_final_liq_ok,
-            tonosama_exit_infer_ok,
-            tonosama_pending_audit_ok,
-            daytrade_credit_ok,
-            env_bool("RUNTIME_ENV_DEFAULTS_VERBOSE", False),
+            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s ranking_api_sleep=%s ranking_spacing_applied=%s strict_entry_defaults=%s intraday_load_guard=%s yahoo_parallel_empty=%s ranking_legacy_inline=%s summary_lock_pressure=%s push_summary_db_source=%s summary_db_realtime=%s database_owner=%s full_pipeline=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s summary_ai_safety=%s summary_ai_direct_timeout_continue=%s summary_ai_atr_1m_repair=%s summary_parallel_reset=%s tonosama_orphan_prune=%s summary_pending_stale=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s tonosama_exit_infer=%s tonosama_pending_audit=%s daytrade_credit=%s verbose=%s",
+            VERSION, DEFAULTS_VERSION, REGISTRY_VERSION, SETTINGS_INI_VERSION, len(settings_applied), len(applied), context,
+            ",".join(SITE_GROUP_ORDER), ",".join(USER_GROUP_ORDER), os.environ.get("RANKING_API_CALL_SLEEP_SEC"), ranking_spacing_applied,
+            strict_entry_defaults_ok, intraday_load_guard_ok, yahoo_parallel_empty_ok, ranking_legacy_inline_ok, summary_lock_pressure_ok,
+            push_summary_db_source_ok, summary_db_realtime_ok, database_owner_ok, full_pipeline_ok, os.environ.get("SITECUSTOMIZE_ENABLE_RESCUE_PATCHES"),
+            os.environ.get("USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES"), os.environ.get("USERCUSTOMIZE_ENABLE_TONOSAMA_RESCUE_PATCHES"),
+            entry_count_unblock_ok, summary_ai_safety_ok, summary_ai_direct_timeout_continue_ok, summary_ai_atr_1m_repair_ok,
+            summary_parallel_reset_ok, tonosama_orphan_prune_ok, summary_pending_stale_ok, entry_fire_rescue_ok, ranking_entry_rescue_ok,
+            low_vol_guard_ok, push_register_recovery_ok, day_position_guard_ok, strict_final_liq_ok, tonosama_exit_infer_ok,
+            tonosama_pending_audit_ok, daytrade_credit_ok, env_bool("RUNTIME_ENV_DEFAULTS_VERBOSE", False),
         )
         return True
     except Exception:
