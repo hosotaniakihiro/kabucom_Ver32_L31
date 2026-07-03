@@ -7,7 +7,7 @@ import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V2-SUMMARY-AI-STRICT-REST-BOARD-FALLBACK-SOURCE-INFER"
+VERSION = "V3-SUMMARY-AI-STRICT-REST-BOARD-FALLBACK-RANKING-PREFILTER"
 _INSTALLED = False
 _ORIG_GET_LATEST_BID_ASK = None
 
@@ -44,16 +44,26 @@ def _infer_source_from_stack() -> str:
     return ""
 
 
+def _install_ranking_prefilter_score_fallback() -> bool:
+    try:
+        from core.startup.summary_ai_ranking_prefilter_score_fallback_patch import install as _install_ranking_prefilter
+        return bool(_install_ranking_prefilter())
+    except Exception:
+        logger.exception("[SUMMARY AI STRICT BOARD REST] ranking prefilter fallback chain install failed version=%s", VERSION)
+        return False
+
+
 def install() -> bool:
     global _INSTALLED, _ORIG_GET_LATEST_BID_ASK
     if _INSTALLED:
         return True
     try:
+        ranking_prefilter = _install_ranking_prefilter_score_fallback()
         from trading.handlers import entry_order_builder as eob
         cur = getattr(eob, "get_latest_bid_ask", None)
         if not callable(cur):
-            return False
-        if getattr(cur, "_summary_ai_strict_board_rest_v2", False):
+            return ranking_prefilter
+        if getattr(cur, "_summary_ai_strict_board_rest_v3", False):
             _INSTALLED = True
             return True
         _ORIG_GET_LATEST_BID_ASK = getattr(cur, "_original", cur)
@@ -91,8 +101,8 @@ def install() -> bool:
                     )
                     return rest
                 logger.warning(
-                    "[SUMMARY AI STRICT BOARD REST] board still missing symbol=%s side=%s source=%s inferred=%s version=%s",
-                    symbol, side, source, inferred, VERSION,
+                    "[SUMMARY AI STRICT BOARD REST] board still missing symbol=%s side=%s source=%s inferred=%s ranking_prefilter=%s version=%s",
+                    symbol, side, source, inferred, ranking_prefilter, VERSION,
                 )
                 return board
             except Exception:
@@ -101,10 +111,11 @@ def install() -> bool:
 
         _patched_get_latest_bid_ask._summary_ai_strict_board_rest_v1 = True  # type: ignore[attr-defined]
         _patched_get_latest_bid_ask._summary_ai_strict_board_rest_v2 = True  # type: ignore[attr-defined]
+        _patched_get_latest_bid_ask._summary_ai_strict_board_rest_v3 = True  # type: ignore[attr-defined]
         _patched_get_latest_bid_ask._original = _ORIG_GET_LATEST_BID_ASK  # type: ignore[attr-defined]
         eob.get_latest_bid_ask = _patched_get_latest_bid_ask
         _INSTALLED = True
-        logger.warning("[SUMMARY AI STRICT BOARD REST] installed version=%s", VERSION)
+        logger.warning("[SUMMARY AI STRICT BOARD REST] installed version=%s ranking_prefilter=%s", VERSION, ranking_prefilter)
         return True
     except Exception:
         logger.exception("[SUMMARY AI STRICT BOARD REST] install failed version=%s", VERSION)
