@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_ai_runtime_consistency_patch.py
-# Version: V4-IDEMPOTENT-RUNTIME-CONSISTENCY
+# Version: V5-IDEMPOTENT-CONSISTENCY-FAST-ORDER
 # ------------------------------------------------------------
 # Purpose:
 #   1) Summary-AI safety guard must not block a fresh direct 1m df just because
@@ -10,6 +10,8 @@
 #      selection with a pool that collapses AI_OK rows before rolling retry.
 #   3) Ensure blowoff protection is installed without repeatedly re-wrapping or
 #      logging every watcher tick.
+#   4) Ensure SUMMARY_AI fast order builder is loaded from sitecustomize path,
+#      even when usercustomize.py is not imported by this Python environment.
 #
 # This does not relax low-move / blowoff / liquidity / board guards. It only
 # keeps the runtime hook chain consistent and idempotent.
@@ -25,7 +27,7 @@ from functools import wraps
 from typing import Any, Sequence
 
 logger = logging.getLogger(__name__)
-VERSION = "V4-IDEMPOTENT-RUNTIME-CONSISTENCY"
+VERSION = "V5-IDEMPOTENT-CONSISTENCY-FAST-ORDER"
 _INSTALLED = False
 _WATCHER_STARTED = False
 _TLS = threading.local()
@@ -125,7 +127,7 @@ def _df_age(df: Any) -> tuple[bool, float | None, dt.datetime | None, int]:
 
 
 def _fresh_direct_df(df: Any) -> bool:
-    ok, age, latest, rows = _df_age(df)
+    ok, age, _latest, _rows = _df_age(df)
     if not ok or age is None:
         return False
     max_age = _env_float("SUMMARY_AI_DIRECT_INPUT_MAX_AGE_SEC", _env_float("SUMMARY_AI_MAX_PUSH_1M_AGE_SEC", 120.0))
@@ -273,12 +275,21 @@ def _patch_executor_selection() -> bool:
         cur = getattr(ex, "_select_ai_ok_items", None)
         if callable(cur) and getattr(cur, "_summary_ai_executor_selection_protect_v3", False):
             return False
+
         def _select_ai_ok_items_protected(ok_items, *, max_entries: int):
             try:
                 pool = ex._selected_pool(ok_items, max_entries=max_entries)
                 cap = ex._effective_max_entries(max_entries)
                 selected = list(pool[:cap])
-                logger.warning("[SUMMARY AI EXECUTOR] protected selection requested=%s cap=%s pool=%s ok_total=%s selected=%s version=%s", max_entries, cap, len(pool), len(ok_items or []), [{"symbol": ex._pick_symbol(x), "side": ex._pick_side(x), "price": ex._pick_price(x), "score": round(ex._score_for_side(x), 3)} for x in selected], VERSION)
+                logger.warning(
+                    "[SUMMARY AI EXECUTOR] protected selection requested=%s cap=%s pool=%s ok_total=%s selected=%s version=%s",
+                    max_entries,
+                    cap,
+                    len(pool),
+                    len(ok_items or []),
+                    [{"symbol": ex._pick_symbol(x), "side": ex._pick_side(x), "price": ex._pick_price(x), "score": round(ex._score_for_side(x), 3)} for x in selected],
+                    VERSION,
+                )
                 return selected
             except Exception:
                 logger.exception("[SUMMARY AI EXECUTOR] protected selection failed; fallback current")
@@ -286,6 +297,7 @@ def _patch_executor_selection() -> bool:
                     return cur(ok_items, max_entries=max_entries) if callable(cur) else []
                 except Exception:
                     return []
+
         _select_ai_ok_items_protected._summary_ai_executor_selection_protect_v3 = True  # type: ignore[attr-defined]
         _select_ai_ok_items_protected._summary_ai_executor_selection_protect_v2 = True  # type: ignore[attr-defined]
         _select_ai_ok_items_protected._summary_ai_executor_selection_protect_v1 = True  # type: ignore[attr-defined]
@@ -299,12 +311,7 @@ def _patch_executor_selection() -> bool:
 
 
 def _install_blowoff_prefilter() -> bool:
-    """Install the reentrant-safe blowoff prefilter once.
-
-    Older V1 executor-base-filter prefilter caused noisy watcher logs and could
-    coexist with the newer executor wrapper.  Prefer the V9 reentrant-safe module
-    and do not report a change when it is already present anywhere in the chain.
-    """
+    """Install the reentrant-safe blowoff prefilter once."""
     if not _env_bool("SUMMARY_AI_EXECUTOR_BLOWOFF_PREFILTER", True):
         return False
     try:
@@ -329,16 +336,42 @@ def _install_blowoff_prefilter() -> bool:
         return False
 
 
+def _install_fast_order_builder() -> bool:
+    """Install Summary-AI order-builder fast path even when usercustomize is not loaded."""
+    if not _env_bool("SUMMARY_AI_FAST_ORDER_BUILDER_ENABLED", True):
+        return False
+    try:
+        os.environ.setdefault("ENTRY_ORDER_BOARD_RETRY_SEC", "0.8")
+        os.environ.setdefault("ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", "0.2")
+        from core.startup import summary_ai_fast_order_builder_patch as fp
+        fn = getattr(fp, "install", None)
+        ok = bool(fn()) if callable(fn) else False
+        # Return True only on first installation; the module itself is idempotent.
+        if ok:
+            logger.warning("[SUMMARY AI RUNTIME CONSISTENCY] fast order builder ensured via=%s version=%s", getattr(fp, "VERSION", "unknown"), VERSION)
+        return bool(ok)
+    except Exception:
+        logger.debug("[SUMMARY AI RUNTIME CONSISTENCY] fast order builder install not ready", exc_info=True)
+        return False
+
+
 def _enforce(reason: str = "install") -> bool:
     changed_hook = _patch_hook_direct_context()
     changed_direct = _patch_safety_guard_context()
     changed_selection = _patch_executor_selection()
     changed_blowoff = _install_blowoff_prefilter()
-    changed = bool(changed_hook or changed_direct or changed_selection or changed_blowoff)
+    changed_fast_order = _install_fast_order_builder()
+    changed = bool(changed_hook or changed_direct or changed_selection or changed_blowoff or changed_fast_order)
     if changed:
         logger.warning(
-            "[SUMMARY AI RUNTIME CONSISTENCY] enforce reason=%s hook=%s direct_input=%s selection=%s blowoff_prefilter=%s version=%s",
-            reason, changed_hook, changed_direct, changed_selection, changed_blowoff, VERSION,
+            "[SUMMARY AI RUNTIME CONSISTENCY] enforce reason=%s hook=%s direct_input=%s selection=%s blowoff_prefilter=%s fast_order=%s version=%s",
+            reason,
+            changed_hook,
+            changed_direct,
+            changed_selection,
+            changed_blowoff,
+            changed_fast_order,
+            VERSION,
         )
     return changed
 
@@ -374,5 +407,6 @@ try:
     install()
 except Exception:
     logger.exception("[SUMMARY AI RUNTIME CONSISTENCY] auto install failed")
+
 
 __all__ = ["VERSION", "install"]
