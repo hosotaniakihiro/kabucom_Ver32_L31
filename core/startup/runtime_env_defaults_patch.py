@@ -2,6 +2,9 @@
 """
 Compatibility installer for centralized runtime environment defaults.
 
+REV33:
+  - install volatility_filter ranking rescue timebox so SUMMARY_AI direct snapshot
+    does not hang while scanning stale ranking DB files on NAS.
 REV32:
   - install normal EXIT scalp alignment so SUMMARY_AI / RANKING normal exits use
     the same quick take/trailing/timeout parameters as Tonosama/Inago exits.
@@ -29,7 +32,7 @@ from .runtime_settings_ini_loader import load_settings_ini
 from . import runtime_env_defaults as _defaults
 
 logger = logging.getLogger(__name__)
-VERSION = "REV32-RUNTIME-ENV-DEFAULTS-NORMAL-EXIT-SCALP-ALIGN"
+VERSION = "REV33-RUNTIME-ENV-DEFAULTS-VOL-FILTER-RESCUE-TIMEBOX"
 DEFAULTS_VERSION = getattr(_defaults, "VERSION", "unknown")
 env_bool = getattr(_defaults, "env_bool")
 _INSTALLED = False
@@ -245,6 +248,10 @@ def _install_low_volatility_entry_guard(context: str) -> bool:
         return False
 
 
+def _install_vol_filter_ranking_rescue_timebox(context: str) -> bool:
+    return _safe_install("volatility ranking rescue timebox", context, TRADING_CONTEXTS, "DISABLE_VOL_FILTER_RANKING_RESCUE_TIMEBOX_PATCH", "volatility_filter_ranking_rescue_timebox_patch")
+
+
 def _install_push_registration_recovery(context: str) -> bool:
     return _safe_install("push register recovery", context, {"main", "main_database", "push_receiver"}, "DISABLE_PUSH_REGISTER_RECOVERY_PATCH", "push_registration_recovery_patch")
 
@@ -337,6 +344,7 @@ def install() -> bool:
         entry_fire_rescue_ok = _install_entry_fire_rescue(context)
         ranking_entry_rescue_ok = _install_ranking_entry_runtime_rescue(context)
         low_vol_guard_ok = _install_low_volatility_entry_guard(context)
+        vol_filter_rescue_timebox_ok = _install_vol_filter_ranking_rescue_timebox(context)
         push_register_recovery_ok = _install_push_registration_recovery(context)
         day_position_guard_ok = _install_common_day_position_guard(context)
         strict_final_liq_ok = _install_strict_final_liquidity_guard(context)
@@ -347,7 +355,7 @@ def install() -> bool:
         daytrade_credit_ok = _install_daytrade_credit_force_close(context)
         _INSTALLED = True
         logger.warning(
-            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s ranking_api_sleep=%s ranking_spacing_applied=%s strict_entry_defaults=%s intraday_load_guard=%s yahoo_parallel_empty=%s ranking_legacy_inline=%s summary_lock_pressure=%s push_summary_db_source=%s summary_db_realtime=%s database_owner=%s full_pipeline=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s summary_ai_safety=%s summary_ai_direct_timeout_continue=%s summary_ai_atr_1m_repair=%s summary_parallel_reset=%s tonosama_orphan_prune=%s summary_pending_stale=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s strict_final_liq_pushdb=%s tonosama_exit_infer=%s normal_exit_scalp=%s tonosama_pending_audit=%s daytrade_credit=%s verbose=%s",
+            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s ranking_api_sleep=%s ranking_spacing_applied=%s strict_entry_defaults=%s intraday_load_guard=%s yahoo_parallel_empty=%s ranking_legacy_inline=%s summary_lock_pressure=%s push_summary_db_source=%s summary_db_realtime=%s database_owner=%s full_pipeline=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s summary_ai_safety=%s summary_ai_direct_timeout_continue=%s summary_ai_atr_1m_repair=%s summary_parallel_reset=%s tonosama_orphan_prune=%s summary_pending_stale=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s vol_filter_rescue_timebox=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s strict_final_liq_pushdb=%s tonosama_exit_infer=%s normal_exit_scalp=%s tonosama_pending_audit=%s daytrade_credit=%s verbose=%s",
             VERSION, DEFAULTS_VERSION, REGISTRY_VERSION, SETTINGS_INI_VERSION, len(settings_applied), len(applied), context,
             ",".join(SITE_GROUP_ORDER), ",".join(USER_GROUP_ORDER), os.environ.get("RANKING_API_CALL_SLEEP_SEC"), ranking_spacing_applied,
             strict_entry_defaults_ok, intraday_load_guard_ok, yahoo_parallel_empty_ok, ranking_legacy_inline_ok, summary_lock_pressure_ok,
@@ -355,7 +363,7 @@ def install() -> bool:
             os.environ.get("USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES"), os.environ.get("USERCUSTOMIZE_ENABLE_TONOSAMA_RESCUE_PATCHES"),
             entry_count_unblock_ok, summary_ai_safety_ok, summary_ai_direct_timeout_continue_ok, summary_ai_atr_1m_repair_ok,
             summary_parallel_reset_ok, tonosama_orphan_prune_ok, summary_pending_stale_ok, entry_fire_rescue_ok, ranking_entry_rescue_ok,
-            low_vol_guard_ok, push_register_recovery_ok, day_position_guard_ok, strict_final_liq_ok, strict_final_liq_pushdb_ok,
+            low_vol_guard_ok, vol_filter_rescue_timebox_ok, push_register_recovery_ok, day_position_guard_ok, strict_final_liq_ok, strict_final_liq_pushdb_ok,
             tonosama_exit_infer_ok, normal_exit_scalp_ok, tonosama_pending_audit_ok, daytrade_credit_ok, env_bool("RUNTIME_ENV_DEFAULTS_VERBOSE", False),
         )
         return True
