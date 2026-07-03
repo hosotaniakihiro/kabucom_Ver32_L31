@@ -1,10 +1,16 @@
 # ============================================================
 # File   : core/startup/tonosama_orphan_timeout_prune_patch.py
-# Version: V1-PRUNE-STALE-TIMEOUT-ORPHAN
+# Version: V2-FAST-PRUNE-STALE-TIMEOUT-ORPHAN
 # ------------------------------------------------------------
 # Tonosama pending build が timeout した後、古い daemon thread が
 # is_alive=True のまま残り続けて次回スケジュールを永続skipする症状を防ぐ。
 # 一定時間を超えた timeout orphan は切り離し、次サイクルを許可する。
+#
+# V2:
+#   - default max orphan alive age を 65s -> 20s に短縮。
+#   - 30秒周期の次回Tononsama実行で stale orphan を解除しやすくする。
+#   - cooldown / running flags も同時に解除して previous_timeout_thread_still_alive
+#     の連発を止める。
 # ============================================================
 from __future__ import annotations
 
@@ -15,7 +21,7 @@ import time
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
-VERSION = "V1-PRUNE-STALE-TIMEOUT-ORPHAN"
+VERSION = "V2-FAST-PRUNE-STALE-TIMEOUT-ORPHAN"
 _INSTALLED = False
 _WATCHER_STARTED = False
 _ORPHAN_FIRST_SEEN: dict[int, float] = {}
@@ -60,34 +66,45 @@ def _thread_key(th: threading.Thread) -> int:
         return id(th)
 
 
+def _clear_tonosama_blocking_state(tasks: Any) -> None:
+    for name, value in (
+        ("_TONOSAMA_ENTRY_ORPHAN_THREAD", None),
+        ("_TONOSAMA_ENTRY_RUNNING", False),
+        ("_TONOSAMA_ENTRY_STARTED_AT", None),
+        ("_TONOSAMA_ENTRY_COOLDOWN_UNTIL", None),
+        ("_TONOSAMA_ENTRY_TIMEOUT_STREAK", 0),
+    ):
+        try:
+            setattr(tasks, name, value)
+        except Exception:
+            pass
+
+
 def _prune_if_stale(tasks: Any, *, reason: str) -> bool:
     try:
         th = getattr(tasks, "_TONOSAMA_ENTRY_ORPHAN_THREAD", None)
         if th is None:
             return False
         if not getattr(th, "is_alive", lambda: False)():
-            setattr(tasks, "_TONOSAMA_ENTRY_ORPHAN_THREAD", None)
+            _clear_tonosama_blocking_state(tasks)
             logger.warning("[TONOSAMA ORPHAN PRUNE] cleared dead orphan reason=%s thread=%s version=%s", reason, getattr(th, "name", None), VERSION)
             return True
         key = _thread_key(th)
         now = time.monotonic()
         first = _ORPHAN_FIRST_SEEN.setdefault(key, now)
         age = now - first
-        max_age = max(5.0, _env_float("TONOSAMA_ORPHAN_THREAD_MAX_ALIVE_SEC", 65.0))
+        # 30秒周期の次回実行で解除できるよう、既定は20秒にする。
+        max_age = max(5.0, _env_float("TONOSAMA_ORPHAN_THREAD_MAX_ALIVE_SEC", 20.0))
         if age < max_age:
-            logger.warning("[TONOSAMA ORPHAN PRUNE] keep live orphan reason=%s thread=%s orphan_age=%.1fs max_age=%.1fs", reason, getattr(th, "name", None), age, max_age)
+            logger.warning("[TONOSAMA ORPHAN PRUNE] keep live orphan reason=%s thread=%s orphan_age=%.1fs max_age=%.1fs version=%s", reason, getattr(th, "name", None), age, max_age, VERSION)
             return False
-        # Python thread cannot be killed safely.  Treat it as detached work so scheduler can evaluate fresh data.
-        setattr(tasks, "_TONOSAMA_ENTRY_ORPHAN_THREAD", None)
+        # Python thread は安全に kill できない。daemon orphan として切り離し、次サイクルを許可する。
+        _clear_tonosama_blocking_state(tasks)
         try:
-            setattr(tasks, "_TONOSAMA_ENTRY_COOLDOWN_UNTIL", None)
+            _ORPHAN_FIRST_SEEN.pop(key, None)
         except Exception:
             pass
-        try:
-            setattr(tasks, "_TONOSAMA_ENTRY_TIMEOUT_STREAK", 0)
-        except Exception:
-            pass
-        logger.warning("[TONOSAMA ORPHAN PRUNE] detached stale live orphan reason=%s thread=%s orphan_age=%.1fs max_age=%.1fs version=%s", reason, getattr(th, "name", None), age, max_age, VERSION)
+        logger.warning("[TONOSAMA ORPHAN PRUNE] detached stale live orphan reason=%s thread=%s orphan_age=%.1fs max_age=%.1fs -> next cycle allowed version=%s", reason, getattr(th, "name", None), age, max_age, VERSION)
         return True
     except Exception:
         logger.exception("[TONOSAMA ORPHAN PRUNE] prune failed reason=%s", reason)
@@ -95,7 +112,7 @@ def _prune_if_stale(tasks: Any, *, reason: str) -> bool:
 
 
 def _wrap_run(fn: Callable[..., Any]) -> Callable[..., Any]:
-    if getattr(fn, "_tonosama_orphan_prune_v1", False):
+    if getattr(fn, "_tonosama_orphan_prune_v2", False):
         return fn
 
     def wrapped(*args: Any, **kwargs: Any) -> Any:
@@ -103,8 +120,9 @@ def _wrap_run(fn: Callable[..., Any]) -> Callable[..., Any]:
         _prune_if_stale(tasks, reason="before_run")
         return fn(*args, **kwargs)
 
+    wrapped._tonosama_orphan_prune_v2 = True  # type: ignore[attr-defined]
     wrapped._tonosama_orphan_prune_v1 = True  # type: ignore[attr-defined]
-    wrapped._original = fn  # type: ignore[attr-defined]
+    wrapped._original = getattr(fn, "_original", fn)  # type: ignore[attr-defined]
     return wrapped
 
 
@@ -115,12 +133,13 @@ def _apply_once(reason: str) -> bool:
         if not callable(cur):
             logger.warning("[TONOSAMA ORPHAN PRUNE] target missing reason=%s", reason)
             return False
-        if getattr(cur, "_tonosama_orphan_prune_v1", False):
+        if getattr(cur, "_tonosama_orphan_prune_v2", False):
             _prune_if_stale(tasks, reason=f"already:{reason}")
             return True
+        # V1 wrapper が既に入っていても、V2 wrapper で外側から再wrapする。
         tasks._run_tonosama_entry_safe = _wrap_run(cur)
         _prune_if_stale(tasks, reason=reason)
-        logger.warning("[TONOSAMA ORPHAN PRUNE] applied reason=%s version=%s", reason, VERSION)
+        logger.warning("[TONOSAMA ORPHAN PRUNE] applied reason=%s version=%s max_alive=%s", reason, VERSION, os.getenv("TONOSAMA_ORPHAN_THREAD_MAX_ALIVE_SEC", "20"))
         return True
     except Exception:
         logger.exception("[TONOSAMA ORPHAN PRUNE] apply failed reason=%s", reason)
