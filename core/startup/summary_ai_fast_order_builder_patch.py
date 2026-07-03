@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_ai_fast_order_builder_patch.py
-# Version: V1-SUMMARY-AI-FAST-ORDER-BUILDER
+# Version: V2-SUMMARY-AI-FAST-ORDER-BUILDER-LOGGER
 # ------------------------------------------------------------
 # SUMMARY_AI が AI_OK → qty算出まで進んだあと、発注直前の
 # board retry で entry_controller 側の snapshot 判定より遅くなり、
@@ -12,6 +12,7 @@
 #   - 板が無い時は既存 entry_order_builder の close 指値 fallback を使う。
 #   - board retry の初期待ち時間だけ短縮して、ORDER_BUILD_OK / ENTRY_DISPATCH
 #     まで 1 サイクル内に進める。
+#   - entry_order_builder 側の logger 未定義もここで必ず補正する。
 # ============================================================
 from __future__ import annotations
 
@@ -20,7 +21,7 @@ import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V1-SUMMARY-AI-FAST-ORDER-BUILDER"
+VERSION = "V2-SUMMARY-AI-FAST-ORDER-BUILDER-LOGGER"
 _INSTALLED = False
 _ORIGINAL_BUILD_ENTRY_ORDER = None
 
@@ -48,6 +49,17 @@ def _set_cap(obj: Any, name: str, cap: float) -> tuple[float | None, float]:
     return old, new
 
 
+def _ensure_entry_order_builder_logger(eob: Any) -> bool:
+    try:
+        cur = getattr(eob, "logger", None)
+        if cur is None or not hasattr(cur, "info") or not hasattr(cur, "warning"):
+            eob.logger = logging.getLogger("trading.handlers.entry_order_builder")
+            return True
+        return False
+    except Exception:
+        return False
+
+
 def install() -> bool:
     global _INSTALLED, _ORIGINAL_BUILD_ENTRY_ORDER
     if _INSTALLED:
@@ -59,11 +71,12 @@ def install() -> bool:
 
         from trading.handlers import entry_order_builder as eob
 
+        logger_patched = _ensure_entry_order_builder_logger(eob)
         old_retry, new_retry = _set_cap(eob, "ENTRY_ORDER_BOARD_RETRY_SEC", _safe_float(os.environ.get("ENTRY_ORDER_BOARD_RETRY_SEC"), 0.8))
         old_interval, new_interval = _set_cap(eob, "ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", _safe_float(os.environ.get("ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC"), 0.2))
 
         cur = getattr(eob, "build_entry_order", None)
-        if callable(cur) and not getattr(cur, "_summary_ai_fast_order_builder_v1", False):
+        if callable(cur) and not getattr(cur, "_summary_ai_fast_order_builder_v2", False):
             _ORIGINAL_BUILD_ENTRY_ORDER = getattr(cur, "_original", cur)
 
             def _patched_build_entry_order(*args, **kwargs):
@@ -79,7 +92,21 @@ def install() -> bool:
                         getattr(eob, "ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", None),
                         VERSION,
                     )
-                result = _ORIGINAL_BUILD_ENTRY_ORDER(*args, **kwargs)
+                try:
+                    result = _ORIGINAL_BUILD_ENTRY_ORDER(*args, **kwargs)
+                except NameError as exc:
+                    # 旧 entry_order_builder が logger 未定義のまま _get_board_with_retry へ入る場合の最終保険。
+                    if "logger" in str(exc):
+                        _ensure_entry_order_builder_logger(eob)
+                        logger.warning(
+                            "[SUMMARY AI FAST ORDER BUILDER] recovered missing eob.logger symbol=%s side=%s version=%s",
+                            symbol,
+                            side,
+                            VERSION,
+                        )
+                        result = _ORIGINAL_BUILD_ENTRY_ORDER(*args, **kwargs)
+                    else:
+                        raise
                 if source == "SUMMARY_AI":
                     logger.info(
                         "[SUMMARY AI FAST ORDER BUILDER] done symbol=%s side=%s ok=%s reason=%s detail=%s version=%s",
@@ -93,6 +120,7 @@ def install() -> bool:
                 return result
 
             _patched_build_entry_order._summary_ai_fast_order_builder_v1 = True  # type: ignore[attr-defined]
+            _patched_build_entry_order._summary_ai_fast_order_builder_v2 = True  # type: ignore[attr-defined]
             _patched_build_entry_order._original = _ORIGINAL_BUILD_ENTRY_ORDER  # type: ignore[attr-defined]
             eob.build_entry_order = _patched_build_entry_order
 
@@ -104,12 +132,13 @@ def install() -> bool:
 
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY AI FAST ORDER BUILDER] installed version=%s retry_sec %s->%s interval %s->%s",
+            "[SUMMARY AI FAST ORDER BUILDER] installed version=%s retry_sec %s->%s interval %s->%s logger_patched=%s",
             VERSION,
             old_retry,
             new_retry,
             old_interval,
             new_interval,
+            logger_patched,
         )
         return True
     except Exception:
