@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/position/kabu_position_reader.py
-# Version: V1.5-KABU-CREDIT-POSITION-READER-401-RETRY
+# Version: V1.6-KABU-CREDIT-POSITION-READER-VALUATION-QTY-FALLBACK
 # ------------------------------------------------------------
 # kabu Station の建玉一覧から「信用建玉だけ」を読み、
 # symbol -> position dict に正規化する。
@@ -10,15 +10,12 @@
 #   product=2 を優先して信用建玉だけ取得する。
 #   API正常応答0件とAPI失敗を区別するため LAST_READ_OK を公開する。
 #
-# V1.4:
-#   - 数量/価格パースを強化。カンマ、全角数字、空白、文字混在を吸収。
-#   - HoldQty/LeavesQty が文字列 "1,000" 等の場合に 0 扱いされる問題を防ぐ。
-#   - 全信用候補が skipped_qty の場合に qty_samples を status/log へ出す。
-#
-# V1.5:
-#   - /positions?product=2 が 401 を返した場合、token_manager.refresh_token()
-#     でAPIキーを再取得し、global_data / kabu_api.global_data / register_opsへ同期して1回だけ再試行する。
-#   - それでも401の場合はERROR tracebackではなくWARNINGで空dictを返す。
+# V1.6:
+#   - kabu Station の /positions?product=2 が信用候補を返すが HoldQty/LeavesQty
+#     だけ 0 になる環境向けに、Valuation / CurrentPrice から数量を復元する。
+#   - 復元は「信用候補」「評価額>0」「価格>0」の場合のみ。現物は対象外。
+#   - これにより、画面上は建玉が残っているのに EXIT が credit_open=0 と
+#     判断して損切りに到達しない問題を防ぐ。
 # ============================================================
 
 from __future__ import annotations
@@ -63,6 +60,11 @@ CURRENT_PRICE_KEYS: tuple[str, ...] = (
     "CurrentPrice", "ValuationPrice", "MarketPrice", "price", "current_price", "valuation_price", "market_price",
 )
 
+VALUATION_KEYS: tuple[str, ...] = (
+    "Valuation", "valuation", "ValuationAmount", "valuation_amount", "MarketValue", "market_value",
+    "PositionValue", "position_value", "CurrentValue", "current_value", "評価額",
+)
+
 
 def _normalize_symbol(v: Any) -> str:
     try:
@@ -83,7 +85,6 @@ def _number_text(v: Any) -> str:
         s = unicodedata.normalize("NFKC", str(v)).strip()
         s = s.replace(",", "").replace("株", "").replace("円", "")
         s = s.replace("＋", "+").replace("−", "-").replace("－", "-")
-        # "100株(内...)" のような文字混在を救う。
         m = re.search(r"[-+]?\d+(?:\.\d+)?", s)
         return m.group(0) if m else ""
     except Exception:
@@ -143,7 +144,7 @@ def _iter_key_values(d: Any) -> Iterable[tuple[str, Any]]:
 
 def _qty_debug_sample(d: dict) -> dict:
     out = {}
-    wanted = {str(k).lower() for k in QTY_KEYS}
+    wanted = {str(k).lower() for k in QTY_KEYS} | {str(k).lower() for k in VALUATION_KEYS} | {str(k).lower() for k in CURRENT_PRICE_KEYS}
     for k, v in _iter_key_values(d):
         if str(k).lower() in wanted:
             out[str(k)] = v
@@ -172,6 +173,34 @@ def _pick_positive_float(d: dict, keys: Sequence[str], default: float = 0.0) -> 
         if f > 0:
             return f
     return float(default)
+
+
+def _recover_qty_from_valuation(d: dict, *, price: float) -> tuple[int, dict[str, Any]]:
+    """Recover quantity from valuation amount when quantity fields are all zero.
+
+    This is intentionally conservative: it only uses positive valuation and price.
+    The computed quantity is rounded to the nearest integer and then rounded down to
+    a 100-share lot only when it is very close to that lot size. This avoids
+    creating a position from random metadata.
+    """
+    valuation = _pick_positive_float(d, VALUATION_KEYS, 0.0)
+    px = float(price or 0.0)
+    detail = {"valuation": valuation, "price_for_qty": px, "method": "valuation_div_price"}
+    if valuation <= 0 or px <= 0:
+        return 0, detail
+    raw_qty = valuation / px
+    rounded = int(round(raw_qty))
+    detail["raw_qty"] = raw_qty
+    detail["rounded_qty"] = rounded
+    if rounded <= 0:
+        return 0, detail
+    # Japanese listed stocks are commonly traded in 100-share lots. If the
+    # valuation division lands close to a 100-lot, use that normalized quantity.
+    lot100 = int(round(raw_qty / 100.0) * 100)
+    if lot100 > 0 and abs(raw_qty - lot100) <= max(2.0, lot100 * 0.02):
+        detail["lot100_qty"] = lot100
+        return lot100, detail
+    return rounded, detail
 
 
 def _sync_token(token: str | None) -> None:
@@ -368,18 +397,33 @@ def read_kabu_open_positions() -> Dict[str, Dict[str, Any]]:
         if not symbol:
             continue
 
-        qty = _pick_positive_int(x, QTY_KEYS, 0)
-        if qty <= 0:
-            skipped_qty += 1
-            if len(LAST_QTY_SAMPLES) < 5:
-                LAST_QTY_SAMPLES.append({"symbol": symbol, "side": _pick(x, "Side", "side"), "qty_values": _qty_debug_sample(x)})
-            continue
-
         avg_price = _pick_positive_float(x, AVG_PRICE_KEYS, 0.0)
         current_price = _pick_positive_float(x, CURRENT_PRICE_KEYS, 0.0)
         entry_price = avg_price if avg_price > 0 else current_price
         if entry_price <= 0:
             skipped_price += 1
+            continue
+
+        qty_source = "qty_field"
+        qty_detail: dict[str, Any] = {}
+        qty = _pick_positive_int(x, QTY_KEYS, 0)
+        if qty <= 0:
+            recovered_qty, qty_detail = _recover_qty_from_valuation(x, price=current_price or entry_price)
+            if recovered_qty > 0:
+                qty = recovered_qty
+                qty_source = "valuation_fallback"
+                logger.warning(
+                    "[KABU POSITION READER] qty recovered from valuation symbol=%s side=%s qty=%s detail=%s",
+                    symbol,
+                    _pick(x, "Side", "side"),
+                    qty,
+                    qty_detail,
+                )
+
+        if qty <= 0:
+            skipped_qty += 1
+            if len(LAST_QTY_SAMPLES) < 5:
+                LAST_QTY_SAMPLES.append({"symbol": symbol, "side": _pick(x, "Side", "side"), "qty_values": _qty_debug_sample(x)})
             continue
 
         out[symbol] = {
@@ -399,6 +443,9 @@ def read_kabu_open_positions() -> Dict[str, Dict[str, Any]]:
             "account_type": _pick(x, "AccountType", "account_type"),
             "hold_id": _pick(x, "HoldID", "hold_id"),
             "execution_id": _pick(x, "ExecutionID", "execution_id"),
+            "valuation": _pick_positive_float(x, VALUATION_KEYS, 0.0),
+            "_qty_source": qty_source,
+            "_qty_detail": qty_detail,
             "_position_source": "KABU.positions.credit_only",
         }
 
