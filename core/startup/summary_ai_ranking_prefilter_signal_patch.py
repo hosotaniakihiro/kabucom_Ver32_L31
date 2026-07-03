@@ -7,12 +7,6 @@ This is not a fail-open rescue. It only uses already-existing ranking signal
 columns such as display_score/score_buy/score_sell/best_rank/rank_type and
 ranking movement columns when present. If no ranking signal exists, candidates
 still stay blocked.
-
-V2:
-  - Add watcher re-apply because several runtime patches can import/rebind
-    trading.entry.summary_ai.runner after usercustomize installed this patch.
-  - Repair explicit ranking_score / ranking_momentum columns before returning,
-    so downstream logs and candidate builders can see the restored signal.
 """
 from __future__ import annotations
 
@@ -25,7 +19,7 @@ from functools import wraps
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V2-RANKING-PREFILTER-SIGNAL-WATCHER"
+VERSION = "V3-RANKING-PREFILTER-SIGNAL-FAST-ENTRY"
 _INSTALLED = False
 _WATCHER_STARTED = False
 _ORIG_APPLY_RANKING_PRE_FILTER = None
@@ -144,7 +138,7 @@ def _patched_apply_ranking_pre_filter(
             present_score_cols.append(col)
             score_signal = _max_series(score_signal, _num_series(out, col).abs())
 
-    rank_cols = ("best_rank", "rank", "ranking_rank", "rank_no", "display_rank", "順位")
+    rank_cols = ("best_rank", "best_rank_position", "rank_position", "rank", "ranking_rank", "rank_no", "display_rank", "順位")
     rank_value = _num_first(out, rank_cols)
     present_rank_cols = [c for c in rank_cols if c in out.columns]
     max_rank = int(max(1, _env_float("RANKING_AI_PREFILTER_MAX_BEST_RANK", 50.0)))
@@ -170,7 +164,6 @@ def _patched_apply_ranking_pre_filter(
         if col in out.columns:
             volume_signal = volume_signal | (_num_series(out, col) >= _env_float("RANKING_AI_PREFILTER_MIN_SURGE_RATIO", 1.2))
 
-    # Make the repaired signals visible to the native runner logs and downstream builders.
     out["ranking_score"] = _max_series(ranking_score, score_signal, rank_score_signal)
     out["ranking_momentum"] = _max_series(ranking_momentum, price_delta_pct, change_signal.clip(lower=0.0))
     out["price_delta_pct"] = _max_series(price_delta_pct, change_signal)
@@ -192,7 +185,7 @@ def _patched_apply_ranking_pre_filter(
     out = out.loc[mask].copy()
 
     try:
-        skipped_head = skipped_df[[c for c in ("symbol", "ranking_score", "ranking_momentum", "display_score", "score_buy", "score_sell", "best_rank", "rank", "rank_type", "range_pct") if c in skipped_df.columns]].head(20).to_dict(orient="records")
+        skipped_head = skipped_df[[c for c in ("symbol", "ranking_score", "ranking_momentum", "display_score", "score_buy", "score_sell", "best_rank", "best_rank_position", "rank_position", "rank", "rank_type", "range_pct") if c in skipped_df.columns]].head(20).to_dict(orient="records")
     except Exception:
         skipped_head = []
 
@@ -204,6 +197,17 @@ def _patched_apply_ranking_pre_filter(
     return out
 
 
+def _install_fast_ranking_summary() -> bool:
+    try:
+        from core.startup.ranking_summary_fast_entry_patch import install as _install_fast
+        ok = bool(_install_fast())
+        logger.warning("[SUMMARY AI RANKING PREFILTER SIGNAL] fast ranking summary patch ok=%s version=%s", ok, VERSION)
+        return ok
+    except Exception:
+        logger.exception("[SUMMARY AI RANKING PREFILTER SIGNAL] fast ranking summary patch failed version=%s", VERSION)
+        return False
+
+
 def _apply_patch_once(reason: str = "install") -> bool:
     global _ORIG_APPLY_RANKING_PRE_FILTER
     try:
@@ -212,12 +216,13 @@ def _apply_patch_once(reason: str = "install") -> bool:
         if not callable(cur):
             logger.warning("[SUMMARY AI RANKING PREFILTER SIGNAL] target missing reason=%s version=%s", reason, VERSION)
             return False
-        if getattr(cur, "_summary_ai_ranking_prefilter_signal_v2", False):
+        if getattr(cur, "_summary_ai_ranking_prefilter_signal_v3", False):
             return True
         _ORIG_APPLY_RANKING_PRE_FILTER = getattr(cur, "_original", cur)
         wrapped = wraps(_ORIG_APPLY_RANKING_PRE_FILTER)(_patched_apply_ranking_pre_filter)
         wrapped._summary_ai_ranking_prefilter_signal_v1 = True  # type: ignore[attr-defined]
         wrapped._summary_ai_ranking_prefilter_signal_v2 = True  # type: ignore[attr-defined]
+        wrapped._summary_ai_ranking_prefilter_signal_v3 = True  # type: ignore[attr-defined]
         wrapped._original = _ORIG_APPLY_RANKING_PRE_FILTER  # type: ignore[attr-defined]
         runner._apply_ranking_pre_filter = wrapped
         logger.warning("[SUMMARY AI RANKING PREFILTER SIGNAL] patched reason=%s version=%s original=%s", reason, VERSION, getattr(_ORIG_APPLY_RANKING_PRE_FILTER, "__name__", type(_ORIG_APPLY_RANKING_PRE_FILTER).__name__))
@@ -232,6 +237,7 @@ def _watcher() -> None:
     sleep_sec = max(0.5, _env_float("SUMMARY_AI_RANKING_PREFILTER_WATCHER_SLEEP", 1.0))
     for i in range(loops):
         try:
+            _install_fast_ranking_summary()
             _apply_patch_once(reason=f"watcher:{i + 1}")
         except Exception:
             logger.debug("[SUMMARY AI RANKING PREFILTER SIGNAL] watcher loop failed", exc_info=True)
@@ -241,22 +247,20 @@ def _watcher() -> None:
 
 def install() -> bool:
     global _INSTALLED, _WATCHER_STARTED
+    fast_ok = _install_fast_ranking_summary()
     ok = _apply_patch_once(reason="install")
-    _INSTALLED = bool(ok)
-    if ok and not _WATCHER_STARTED:
+    _INSTALLED = bool(ok or fast_ok)
+    if (ok or fast_ok) and not _WATCHER_STARTED:
         _WATCHER_STARTED = True
         try:
             threading.Thread(target=_watcher, name="summary-ai-ranking-prefilter-signal-watch", daemon=True).start()
             logger.warning("[SUMMARY AI RANKING PREFILTER SIGNAL] watcher started version=%s", VERSION)
         except Exception:
             logger.exception("[SUMMARY AI RANKING PREFILTER SIGNAL] watcher start failed version=%s", VERSION)
-    return bool(ok)
+    return bool(ok or fast_ok)
 
 
 try:
     install()
 except Exception:
     logger.exception("[SUMMARY AI RANKING PREFILTER SIGNAL] auto install failed")
-
-
-__all__ = ["install", "VERSION"]
