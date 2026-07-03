@@ -1,24 +1,15 @@
 # ============================================================
 # File   : trading/entry/summary_ai/executor.py
-# Version: REV9-STRICT-PREFILTER-LOW-MOVE-NO-RESCUE
+# Version: REV10-CLEAN-ALL-APPROVED-PENDING-NO-ORDER
 # ------------------------------------------------------------
 # AI_OK rows -> approved_rows -> entry_pipeline.
 #
-# REV9:
-#   - Apply strict low-move/range prefilter before approved selection and
-#     before rolling retry batches. Do not rescue one candidate when every
-#     candidate is low-move; strict mode must return no approved rows.
-#   - Keep the core price/liquidity/risk filter protected from runtime
-#     monkey-patches, but add a native candidate-quality filter to avoid
-#     wasting approved slots on rows that entry_pipeline will immediately
-#     reject as low-move/blowoff-style flat rows.
-#
-# REV8:
-#   - Runtime patches may replace _filter_blocked_ai_ok_items with a low-move
-#     prefilter. That can erase AI_OK rows before rolling retry, producing
-#     approved=0/no_ai_ok.
-#   - Keep the compatibility hook, but protect it with a short watcher that
-#     restores the executor's core price/liquidity/risk filter.
+# REV10:
+#   - no-order cleanup now always includes every approved row symbol, even when
+#     result contains one attempted symbol. Rolling retry used to prune only the
+#     final attempted symbol, leaving prior STRICT_BOARD_MISSING / ATR_NG
+#     SUMMARY_AI pending rows in global_data.pending_entries.
+#   - Board-missing remains fail-close; this only prevents stale pending buildup.
 # ============================================================
 from __future__ import annotations
 
@@ -39,7 +30,7 @@ DEFAULT_MAX_ENTRIES = 3
 DEFAULT_MIN_BUY_APPROVED = 0
 DEFAULT_MAX_PRICE_FOR_100_SHARE_ENTRY = 7000.0
 DEFAULT_MIN_PRICE_FOR_ENTRY = 3000.0
-VERSION = "REV9-STRICT-PREFILTER-LOW-MOVE-NO-RESCUE"
+VERSION = "REV10-CLEAN-ALL-APPROVED-PENDING-NO-ORDER"
 _FILTER_WATCHER_STARTED = False
 
 
@@ -160,12 +151,6 @@ def _pick_turnover(item: Dict[str, Any]) -> float:
 
 
 def _pick_range_pct(item: Dict[str, Any]) -> float:
-    """Return intrabar range ratio. Existing range_pct wins if positive; otherwise derive from high/low/close.
-
-    Strict entry policy intentionally treats missing or high==low rows as low-move.  We do not
-    rescue them here because they were repeatedly selected and then rejected later by the
-    entry pipeline, wasting approved slots.
-    """
     for d in _dict_sources(item):
         for k in ("range_pct", "intrabar_range_pct", "_intrabar_range_pct"):
             x = safe_float(d.get(k), 0.0)
@@ -316,47 +301,37 @@ def _base_filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dic
         if turnover > 0 and turnover < min_turnover:
             skipped.append({"symbol": symbol, "side": side, "reason": "low_turnover", "turnover": turnover, "min_turnover": min_turnover})
             continue
-        quality_ok, quality_diag = _passes_strict_candidate_quality(item)
-        if not quality_ok:
-            skipped.append(quality_diag)
-            continue
-        daily_blocked, daily_reason, daily_detail = _daily_risk_block_reason(symbol, side)
-        if daily_blocked:
-            skipped.append({"symbol": symbol, "side": side, "reason": daily_reason, "detail": daily_detail})
-            continue
         restricted, until = _is_trade_restricted_symbol(symbol)
         if restricted:
             skipped.append({"symbol": symbol, "side": side, "reason": "trade_restricted", "until": str(until)})
             continue
-        sell_rejected, reject_reason = _is_sell_reject_cached(symbol, side)
-        if sell_rejected:
-            skipped.append({"symbol": symbol, "side": side, "reason": "sell_reject_cache", "detail": str(reject_reason)})
+        sell_cached, sell_reason = _is_sell_reject_cached(symbol, side)
+        if sell_cached:
+            skipped.append({"symbol": symbol, "side": side, "reason": "sell_reject_cached", "detail": str(sell_reason)})
+            continue
+        risk_blocked, risk_reason, risk_detail = _daily_risk_block_reason(symbol, side)
+        if risk_blocked:
+            skipped.append({"symbol": symbol, "side": side, "reason": risk_reason, "detail": risk_detail})
+            continue
+        quality_ok, quality_detail = _passes_strict_candidate_quality(item)
+        if not quality_ok:
+            skipped.append(quality_detail)
             continue
         kept.append(item)
     if skipped:
-        logger.warning("[SUMMARY AI EXECUTOR] strict prefilter before=%s after=%s price_diag=%s skipped=%s version=%s", len(ok_items), len(kept), diag, skipped[:50], VERSION)
+        logger.warning("[SUMMARY AI EXECUTOR] strict prefilter skipped=%s kept=%s diag=%s sample=%s version=%s", len(skipped), len(kept), diag, skipped[:10], VERSION)
     return kept
 
 
-def _filter_blocked_ai_ok_items(ok_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Compatibility hook. Keep this as the executor core filter with native strict quality checks."""
-    return _base_filter_blocked_ai_ok_items(ok_items)
+_ORIGINAL_FILTER_BLOCKED_AI_OK_ITEMS = _base_filter_blocked_ai_ok_items
+_filter_blocked_ai_ok_items = _base_filter_blocked_ai_ok_items
 
 
-_CORE_FILTER_FUNC = _filter_blocked_ai_ok_items
-try:
-    setattr(_CORE_FILTER_FUNC, "_summary_ai_executor_core_filter_rev9", True)
-    setattr(_CORE_FILTER_FUNC, "_summary_ai_executor_core_filter_rev8", True)
-except Exception:
-    pass
-
-
-def _ensure_core_filter(reason: str = "manual") -> bool:
-    cur = globals().get("_filter_blocked_ai_ok_items")
-    if cur is _CORE_FILTER_FUNC or getattr(cur, "_summary_ai_executor_core_filter_rev9", False) or getattr(cur, "_summary_ai_executor_core_filter_rev8", False):
-        return True
-    globals()["_filter_blocked_ai_ok_items"] = _CORE_FILTER_FUNC
-    logger.warning("[SUMMARY AI EXECUTOR] restored core filter reason=%s old=%s version=%s", reason, getattr(cur, "__name__", type(cur).__name__), VERSION)
+def _ensure_core_filter(reason: str = "") -> bool:
+    global _filter_blocked_ai_ok_items
+    if _filter_blocked_ai_ok_items is not _ORIGINAL_FILTER_BLOCKED_AI_OK_ITEMS:
+        _filter_blocked_ai_ok_items = _ORIGINAL_FILTER_BLOCKED_AI_OK_ITEMS
+        logger.warning("[SUMMARY AI EXECUTOR] core filter restored reason=%s version=%s", reason, VERSION)
     return True
 
 
@@ -464,12 +439,14 @@ def _collect_symbols_for_pending_cleanup(result: Any, approved_rows: Sequence[Di
                         symbols.add(ss)
     except Exception:
         logger.debug("[SUMMARY AI EXECUTOR] collect cleanup symbols from result failed", exc_info=True)
-    if not symbols:
-        for row in approved_rows or []:
-            if isinstance(row, dict):
-                sym = _norm_symbol(row.get("symbol") or row.get("Symbol"))
-                if sym:
-                    symbols.add(sym)
+    # REV10: always include all approved symbols. Before REV10 this ran only
+    # when result had no symbol, so rolling retry pruned only the final attempted
+    # symbol and left prior STRICT_BOARD_MISSING pending rows behind.
+    for row in approved_rows or []:
+        if isinstance(row, dict):
+            sym = _norm_symbol(row.get("symbol") or row.get("Symbol"))
+            if sym:
+                symbols.add(sym)
     return symbols
 
 
@@ -488,7 +465,7 @@ def _cleanup_pending_after_no_order(result: Any, approved_rows: Sequence[Dict[st
             entry_type = str(entry.get("entry_type") or "").strip().upper()
             return entry_type == "SUMMARY_AI" or source in {"SUMMARY", "SUMMARY_AI", "PUSH", "PUSH_SUMMARY"}
         removed = int(prune_entries(_predicate, reason=f"SUMMARY_AI_NO_ORDER:{reason}"))
-        logger.warning("[SUMMARY AI EXECUTOR] pending cleanup after no-order reason=%s symbols=%s removed=%s root=%s result=%s", reason, sorted(symbols), removed, snapshot_root(), _summarize_no_order_result(result))
+        logger.warning("[SUMMARY AI EXECUTOR] pending cleanup after no-order reason=%s symbols=%s removed=%s root=%s result=%s version=%s", reason, sorted(symbols), removed, snapshot_root(), _summarize_no_order_result(result), VERSION)
         return removed
     except Exception:
         logger.exception("[SUMMARY AI EXECUTOR] pending cleanup after no-order failed reason=%s symbols=%s", reason, sorted(symbols))
@@ -651,6 +628,9 @@ def execute_ai_ok_entries_bulk(ai_results: Sequence[Dict[str, Any]], *, df_summa
             last_removed = _cleanup_pending_after_no_order(result, approved_rows, reason=last_skip)
             logger.warning("[SUMMARY AI EXECUTOR] NO REAL ORDER DETAIL approved=%s interval=%s symbols=%s skip=%s pending_removed=%s detail=%s", len(approved_rows), interval, [str(x.get("symbol")) for x in approved_rows], last_skip, last_removed, _summarize_no_order_result(result))
             break
+        # REV10: also clean all rows selected across the rolling run, because wrapper patches may return only the final attempted result.
+        if all_approved:
+            last_removed = max(last_removed, _cleanup_pending_after_no_order(last_result, all_approved, reason=f"{last_skip}_all_approved"))
         logger.info("[SUMMARY AI EXECUTOR] REAL bulk entry done approved=%s executed=False pending_removed=%s result=%s", len(all_approved), last_removed, last_result)
         return {"executed": False, "dry_run": False, "approved_rows": all_approved, "result": last_result, "skip_reason": last_skip, "pending_removed": last_removed, "rolling_retry_attempted": len(batches)}
     except Exception:
