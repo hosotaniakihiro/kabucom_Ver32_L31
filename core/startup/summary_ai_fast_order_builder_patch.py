@@ -1,18 +1,4 @@
 # -*- coding: utf-8 -*-
-# ============================================================
-# File   : core/startup/summary_ai_fast_order_builder_patch.py
-# Version: V3.4-SUMMARY-AI-RANKING-RANGE-RESCUE-TO-ORDER
-# ------------------------------------------------------------
-# SUMMARY/SUMMARY_AI/PUSH 由来で AI_OK 済みの候補が、発注直前で
-# source=SUMMARY のまま通常ルートへ入り snapshot_no_order になる問題を補修する。
-#
-# V3.4:
-#   - volatility_filter 側で RANKING_MOVE_RESCUE ok=True になった候補が、
-#     entry_order_builder の LOW_MOVE_RANGE_TOO_SMALL で再ブロックされる問題を修正。
-#   - ranking snapshot の新鮮な変動率で既に通過した場合だけ、注文ビルダー用の
-#     high/low/atr を合成して最終 low-move 判定と整合させる。
-#   - 低出来高・低変動ガード自体は無効化しない。
-# ============================================================
 from __future__ import annotations
 
 import logging
@@ -21,7 +7,7 @@ import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V3.4-SUMMARY-AI-RANKING-RANGE-RESCUE-TO-ORDER"
+VERSION = "V3.5-SUMMARY-AI-STRICT-BOARD-REST"
 _INSTALLED = False
 _ORIGINAL_BUILD_ENTRY_ORDER = None
 
@@ -145,10 +131,7 @@ def _coerce_summary_ai_snapshot_order(kwargs: dict[str, Any]) -> bool:
                 vol = turnover / price_f
         if vol > 0:
             row.setdefault("volume", vol)
-        logger.warning(
-            "[SUMMARY AI FAST ORDER BUILDER] snapshot normalized symbol=%s side=%s source %s->SUMMARY_AI price=%s volume=%s version=%s",
-            symbol, side, old_source, row.get("close_price") or row.get("price") or row.get("current_price") or row.get("close"), row.get("volume"), VERSION,
-        )
+        logger.warning("[SUMMARY AI FAST ORDER BUILDER] snapshot normalized symbol=%s side=%s source %s->SUMMARY_AI price=%s volume=%s version=%s", symbol, side, old_source, row.get("close_price") or row.get("price") or row.get("current_price") or row.get("close"), row.get("volume"), VERSION)
         return True
     except Exception:
         logger.exception("[SUMMARY AI FAST ORDER BUILDER] snapshot normalize failed version=%s", VERSION)
@@ -165,7 +148,6 @@ def _range_pct(high: float, low: float, close: float) -> float:
 
 
 def _ranking_move_rescue_ok(row: dict[str, Any], *, min_range_pct: float) -> tuple[bool, str]:
-    """Use the same ranking snapshot rescue that already allowed volatility_filter."""
     try:
         from trading.filters import volatility_filter as vf
         fn = getattr(vf, "_ranking_move_rescue", None)
@@ -183,19 +165,8 @@ def _apply_synthetic_range(row: dict[str, Any], *, close: float, min_range_pct: 
     high = close + width / 2.0
     low = max(0.01, close - width / 2.0)
     pct = _range_pct(high, low, close)
-    atr_proxy = max(
-        _safe_float(_first(row, ("atr_1m", "atr", "ATR", "atr14", "atr_14"), 0.0), 0.0),
-        max(0.0, high - low),
-    )
-    row["high_price"] = high
-    row["low_price"] = low
-    row["high"] = high
-    row["low"] = low
-    row["range_pct"] = pct
-    row["intraday_range_pct"] = pct
-    row["summary_ai_range_repaired"] = True
-    row["summary_ai_range_repair_reason"] = reason
-    row["summary_ai_range_repair_pct"] = pct
+    atr_proxy = max(_safe_float(_first(row, ("atr_1m", "atr", "ATR", "atr14", "atr_14"), 0.0), 0.0), max(0.0, high - low))
+    row.update({"high_price": high, "low_price": low, "high": high, "low": low, "range_pct": pct, "intraday_range_pct": pct, "summary_ai_range_repaired": True, "summary_ai_range_repair_reason": reason, "summary_ai_range_repair_pct": pct})
     if atr_proxy > 0:
         row["atr"] = atr_proxy
         row["atr_1m"] = atr_proxy
@@ -218,19 +189,13 @@ def _repair_summary_ai_low_move_range(kwargs: dict[str, Any], eob: Any) -> bool:
         cur_low = _safe_float(_first(row, ("low_price", "low"), 0.0), 0.0)
         if _range_pct(cur_high, cur_low, close) >= min_range_pct:
             return False
-
         candidates: list[tuple[str, float, float, float]] = []
-        pairs = [
-            ("row_day", row),
-            ("conditions_day", cond),
-        ]
-        for label, src in pairs:
+        for label, src in (("row_day", row), ("conditions_day", cond)):
             hi = _safe_float(_first(src, ("day_high", "today_high", "session_high", "intraday_high", "HighPrice", "high_3m", "high_5m"), 0.0), 0.0)
             lo = _safe_float(_first(src, ("day_low", "today_low", "session_low", "intraday_low", "LowPrice", "low_3m", "low_5m"), 0.0), 0.0)
             if hi > 0 and lo > 0:
                 h, l = max(hi, lo), min(hi, lo)
                 candidates.append((label, h, l, _range_pct(h, l, close)))
-
         for src_label, src in (("row", row), ("conditions", cond)):
             rp = _safe_float(_first(src, ("range_pct", "intraday_range_pct", "day_range_pct", "summary_ai_range_repair_pct", "_intrabar_range_pct", "_max_price_change_pct"), 0.0), 0.0)
             if rp > 1.0:
@@ -238,39 +203,25 @@ def _repair_summary_ai_low_move_range(kwargs: dict[str, Any], eob: Any) -> bool:
             if rp > 0:
                 width = close * rp
                 candidates.append((f"{src_label}_range_pct", close + width / 2.0, max(0.01, close - width / 2.0), rp))
-
         best = None
         for cand in candidates:
             if cand[3] >= min_range_pct and (best is None or cand[3] > best[3]):
                 best = cand
-
         if best is None:
             rescue_ok, rescue_reason = _ranking_move_rescue_ok(row, min_range_pct=min_range_pct)
             if rescue_ok:
                 _apply_synthetic_range(row, close=close, min_range_pct=min_range_pct, reason=rescue_reason)
-                logger.warning(
-                    "[SUMMARY AI FAST ORDER BUILDER] range/atr repaired by ranking rescue symbol=%s side=%s close=%.2f min_range_pct=%.6f high=%.2f low=%.2f atr=%.4f version=%s",
-                    kwargs.get("symbol"), kwargs.get("side"), close, min_range_pct, row.get("high"), row.get("low"), row.get("atr"), VERSION,
-                )
+                logger.warning("[SUMMARY AI FAST ORDER BUILDER] range/atr repaired by ranking rescue symbol=%s side=%s close=%.2f min_range_pct=%.6f high=%.2f low=%.2f atr=%.4f version=%s", kwargs.get("symbol"), kwargs.get("side"), close, min_range_pct, row.get("high"), row.get("low"), row.get("atr"), VERSION)
                 return True
             logger.info("[SUMMARY AI FAST ORDER BUILDER] range repair not enough symbol=%s side=%s candidates=%s rescue=%s version=%s", kwargs.get("symbol"), kwargs.get("side"), candidates, rescue_reason, VERSION)
             return False
-
         reason, high, low, pct = best
         atr_proxy = max(_safe_float(_first(row, ("atr_1m", "atr", "ATR", "atr14", "atr_14"), 0.0), 0.0), max(0.0, high - low))
-        row["high_price"] = high
-        row["low_price"] = low
-        row["high"] = high
-        row["low"] = low
-        row["range_pct"] = pct
-        row["intraday_range_pct"] = pct
+        row.update({"high_price": high, "low_price": low, "high": high, "low": low, "range_pct": pct, "intraday_range_pct": pct, "summary_ai_range_repaired": True, "summary_ai_range_repair_reason": reason, "summary_ai_range_repair_pct": pct})
         if atr_proxy > 0:
             row["atr"] = atr_proxy
             row["atr_1m"] = atr_proxy
             row["ATR"] = atr_proxy
-        row["summary_ai_range_repaired"] = True
-        row["summary_ai_range_repair_reason"] = reason
-        row["summary_ai_range_repair_pct"] = pct
         logger.warning("[SUMMARY AI FAST ORDER BUILDER] range/atr repaired symbol=%s side=%s reason=%s high=%.2f low=%.2f range_pct=%.6f atr=%.4f version=%s", kwargs.get("symbol"), kwargs.get("side"), reason, high, low, pct, atr_proxy, VERSION)
         return True
     except Exception:
@@ -287,6 +238,15 @@ def _install_range_consistency_chain() -> bool:
         return False
 
 
+def _install_strict_board_rest_chain() -> bool:
+    try:
+        from core.startup.summary_ai_strict_board_rest_patch import install as _install_board_rest
+        return bool(_install_board_rest())
+    except Exception:
+        logger.exception("[SUMMARY AI FAST ORDER BUILDER] strict board REST chain install failed version=%s", VERSION)
+        return False
+
+
 def install() -> bool:
     global _INSTALLED, _ORIGINAL_BUILD_ENTRY_ORDER
     if _INSTALLED:
@@ -297,10 +257,11 @@ def install() -> bool:
         from trading.handlers import entry_order_builder as eob
         logger_patched = _ensure_entry_order_builder_logger(eob)
         range_consistency = _install_range_consistency_chain()
+        strict_board_rest = _install_strict_board_rest_chain()
         old_retry, new_retry = _set_cap(eob, "ENTRY_ORDER_BOARD_RETRY_SEC", _safe_float(os.environ.get("ENTRY_ORDER_BOARD_RETRY_SEC"), 0.8))
         old_interval, new_interval = _set_cap(eob, "ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", _safe_float(os.environ.get("ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC"), 0.2))
         cur = getattr(eob, "build_entry_order", None)
-        if callable(cur) and not getattr(cur, "_summary_ai_fast_order_builder_v34", False):
+        if callable(cur) and not getattr(cur, "_summary_ai_fast_order_builder_v35", False):
             _ORIGINAL_BUILD_ENTRY_ORDER = getattr(cur, "_original", cur)
             def _patched_build_entry_order(*args, **kwargs):
                 summary_like = _is_summary_ai_order(kwargs)
@@ -322,13 +283,8 @@ def install() -> bool:
                 if summary_like:
                     logger.warning("[SUMMARY AI FAST ORDER BUILDER] done symbol=%s side=%s ok=%s reason=%s detail=%s version=%s", symbol, side, isinstance(result, dict) and result.get("ok"), result.get("reason") if isinstance(result, dict) else type(result).__name__, result.get("detail") if isinstance(result, dict) else None, VERSION)
                 return result
-            _patched_build_entry_order._summary_ai_fast_order_builder_v1 = True  # type: ignore[attr-defined]
-            _patched_build_entry_order._summary_ai_fast_order_builder_v2 = True  # type: ignore[attr-defined]
-            _patched_build_entry_order._summary_ai_fast_order_builder_v3 = True  # type: ignore[attr-defined]
-            _patched_build_entry_order._summary_ai_fast_order_builder_v31 = True  # type: ignore[attr-defined]
-            _patched_build_entry_order._summary_ai_fast_order_builder_v32 = True  # type: ignore[attr-defined]
-            _patched_build_entry_order._summary_ai_fast_order_builder_v33 = True  # type: ignore[attr-defined]
-            _patched_build_entry_order._summary_ai_fast_order_builder_v34 = True  # type: ignore[attr-defined]
+            for marker in ("_summary_ai_fast_order_builder_v1", "_summary_ai_fast_order_builder_v2", "_summary_ai_fast_order_builder_v3", "_summary_ai_fast_order_builder_v31", "_summary_ai_fast_order_builder_v32", "_summary_ai_fast_order_builder_v33", "_summary_ai_fast_order_builder_v34", "_summary_ai_fast_order_builder_v35"):
+                setattr(_patched_build_entry_order, marker, True)
             _patched_build_entry_order._original = _ORIGINAL_BUILD_ENTRY_ORDER  # type: ignore[attr-defined]
             eob.build_entry_order = _patched_build_entry_order
             try:
@@ -337,7 +293,7 @@ def install() -> bool:
             except Exception:
                 logger.debug("[SUMMARY AI FAST ORDER BUILDER] entry_controller alias patch skipped", exc_info=True)
         _INSTALLED = True
-        logger.warning("[SUMMARY AI FAST ORDER BUILDER] installed version=%s retry_sec %s->%s interval %s->%s logger_patched=%s range_repair=True source_detect=True snapshot_no_order_fallback=True ranking_range_rescue=True range_consistency=%s", VERSION, old_retry, new_retry, old_interval, new_interval, logger_patched, range_consistency)
+        logger.warning("[SUMMARY AI FAST ORDER BUILDER] installed version=%s retry_sec %s->%s interval %s->%s logger_patched=%s range_repair=True source_detect=True snapshot_no_order_fallback=True ranking_range_rescue=True range_consistency=%s strict_board_rest=%s", VERSION, old_retry, new_retry, old_interval, new_interval, logger_patched, range_consistency, strict_board_rest)
         return True
     except Exception:
         logger.exception("[SUMMARY AI FAST ORDER BUILDER] install failed version=%s", VERSION)
