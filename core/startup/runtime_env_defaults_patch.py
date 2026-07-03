@@ -2,23 +2,15 @@
 """
 Compatibility installer for centralized runtime environment defaults.
 
+REV31:
+  - install final-liquidity PUSH DB fallback after strict recent-liquidity guard,
+    so stale summary DB rows do not block entries when fresh PUSH raw data proves
+    recent liquidity.
 REV30:
   - install summary parallel executor reset so timed-out main.py summary futures do
     not remain queued behind a single ThreadPoolExecutor worker.
   - install Tonosama orphan timeout prune so a stale timeout daemon thread does not
     permanently block later Tonosama schedule cycles.
-REV29:
-  - force install SUMMARY AI ATR 1m filter repair so ATR_1M_FILTER_NG caused by
-    missing/flat approved rows is repaired from existing 1m history/range data.
-REV28:
-  - force install SUMMARY AI direct timeout continuation so rolling dispatch
-    proceeds to the next AI_OK batch when one direct snapshot batch times out.
-REV27:
-  - force install strict Tonosama history fail-close and Summary-AI threshold defaults.
-REV26:
-  - install PUSH summary DB latest source patch in DB/data collector contexts so
-    summary_database can read fresh PUSH rows from pushYYYYMMDD.db instead of stale
-    process-local global_data.push_df.
 """
 from __future__ import annotations
 
@@ -34,7 +26,7 @@ from .runtime_settings_ini_loader import load_settings_ini
 from . import runtime_env_defaults as _defaults
 
 logger = logging.getLogger(__name__)
-VERSION = "REV30-RUNTIME-ENV-DEFAULTS-SUMMARY-EXECUTOR-RESET-TONOSAMA-ORPHAN-PRUNE"
+VERSION = "REV31-RUNTIME-ENV-DEFAULTS-FINAL-LIQ-PUSHDB-FALLBACK"
 DEFAULTS_VERSION = getattr(_defaults, "VERSION", "unknown")
 env_bool = getattr(_defaults, "env_bool")
 _INSTALLED = False
@@ -52,7 +44,6 @@ _GROUP_APPLIERS: dict[str, Callable[..., Dict[str, str]]] = {
 }
 
 DB_CONTEXTS = {"main_database", "db_prepare", "push_receiver", "summary_database", "ranking_collector", "yahoo_complement"}
-DATA_COLLECTOR_CONTEXTS = {"push_receiver", "summary_database", "ranking_collector", "yahoo_complement"}
 TRADING_CONTEXTS = {"main"}
 GENERIC_HELPER_CONTEXTS = {"helper"}
 
@@ -263,6 +254,10 @@ def _install_strict_final_liquidity_guard(context: str) -> bool:
     return _safe_install("strict final liquidity guard", context, TRADING_CONTEXTS, "DISABLE_ENTRY_HANDLER_STRICT_RECENT_LIQ_PATCH", "entry_handler_strict_recent_liquidity_patch")
 
 
+def _install_strict_final_liq_pushdb_fallback(context: str) -> bool:
+    return _safe_install("strict final liquidity pushdb fallback", context, TRADING_CONTEXTS, "DISABLE_ENTRY_HANDLER_STRICT_RECENT_LIQ_PUSHDB_FALLBACK_PATCH", "entry_handler_strict_recent_liquidity_pushdb_fallback_patch")
+
+
 def _install_tonosama_exit_source_infer(context: str) -> bool:
     return _safe_install("tonosama exit infer", context, TRADING_CONTEXTS, "DISABLE_TONOSAMA_EXIT_SOURCE_INFER_PATCH", "tonosama_exit_source_infer_patch")
 
@@ -338,12 +333,13 @@ def install() -> bool:
         push_register_recovery_ok = _install_push_registration_recovery(context)
         day_position_guard_ok = _install_common_day_position_guard(context)
         strict_final_liq_ok = _install_strict_final_liquidity_guard(context)
+        strict_final_liq_pushdb_ok = _install_strict_final_liq_pushdb_fallback(context)
         tonosama_exit_infer_ok = _install_tonosama_exit_source_infer(context)
         tonosama_pending_audit_ok = _install_tonosama_pending_candidate_audit(context)
         daytrade_credit_ok = _install_daytrade_credit_force_close(context)
         _INSTALLED = True
         logger.warning(
-            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s ranking_api_sleep=%s ranking_spacing_applied=%s strict_entry_defaults=%s intraday_load_guard=%s yahoo_parallel_empty=%s ranking_legacy_inline=%s summary_lock_pressure=%s push_summary_db_source=%s summary_db_realtime=%s database_owner=%s full_pipeline=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s summary_ai_safety=%s summary_ai_direct_timeout_continue=%s summary_ai_atr_1m_repair=%s summary_parallel_reset=%s tonosama_orphan_prune=%s summary_pending_stale=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s tonosama_exit_infer=%s tonosama_pending_audit=%s daytrade_credit=%s verbose=%s",
+            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s ranking_api_sleep=%s ranking_spacing_applied=%s strict_entry_defaults=%s intraday_load_guard=%s yahoo_parallel_empty=%s ranking_legacy_inline=%s summary_lock_pressure=%s push_summary_db_source=%s summary_db_realtime=%s database_owner=%s full_pipeline=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s summary_ai_safety=%s summary_ai_direct_timeout_continue=%s summary_ai_atr_1m_repair=%s summary_parallel_reset=%s tonosama_orphan_prune=%s summary_pending_stale=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s strict_final_liq_pushdb=%s tonosama_exit_infer=%s tonosama_pending_audit=%s daytrade_credit=%s verbose=%s",
             VERSION, DEFAULTS_VERSION, REGISTRY_VERSION, SETTINGS_INI_VERSION, len(settings_applied), len(applied), context,
             ",".join(SITE_GROUP_ORDER), ",".join(USER_GROUP_ORDER), os.environ.get("RANKING_API_CALL_SLEEP_SEC"), ranking_spacing_applied,
             strict_entry_defaults_ok, intraday_load_guard_ok, yahoo_parallel_empty_ok, ranking_legacy_inline_ok, summary_lock_pressure_ok,
@@ -351,8 +347,8 @@ def install() -> bool:
             os.environ.get("USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES"), os.environ.get("USERCUSTOMIZE_ENABLE_TONOSAMA_RESCUE_PATCHES"),
             entry_count_unblock_ok, summary_ai_safety_ok, summary_ai_direct_timeout_continue_ok, summary_ai_atr_1m_repair_ok,
             summary_parallel_reset_ok, tonosama_orphan_prune_ok, summary_pending_stale_ok, entry_fire_rescue_ok, ranking_entry_rescue_ok,
-            low_vol_guard_ok, push_register_recovery_ok, day_position_guard_ok, strict_final_liq_ok, tonosama_exit_infer_ok,
-            tonosama_pending_audit_ok, daytrade_credit_ok, env_bool("RUNTIME_ENV_DEFAULTS_VERBOSE", False),
+            low_vol_guard_ok, push_register_recovery_ok, day_position_guard_ok, strict_final_liq_ok, strict_final_liq_pushdb_ok,
+            tonosama_exit_infer_ok, tonosama_pending_audit_ok, daytrade_credit_ok, env_bool("RUNTIME_ENV_DEFAULTS_VERBOSE", False),
         )
         return True
     except Exception:
@@ -360,4 +356,6 @@ def install() -> bool:
         return False
 
 
-__all__ = ["VERSION", "install", "apply_site_defaults", "apply_user_defaults"]
+__all__ = [
+    "VERSION", "install", "apply_site_defaults", "apply_user_defaults",
+]
