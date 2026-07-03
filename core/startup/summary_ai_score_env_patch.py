@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/summary_ai_score_env_patch.py
-# Version: REV3-SUMMARY-AI-ENTRY-BUY-THRESHOLD-PATCH-RANKING-PREFILTER
+# Version: REV4-SUMMARY-AI-ENTRY-BUY-THRESHOLD-PATCH-RANGE-BRIDGE
 # ------------------------------------------------------------
 # Purpose:
 #   - AI.entry_gate の SUMMARY score threshold は MIN_ENTRY_SCORE を参照する。
@@ -10,6 +10,8 @@
 #   - 起動時に MIN_ENTRY_SCORE と entry_controller BUY閾値を実運用値へ合わせる。
 #   - REV3: RANKING summary の ranking_score/ranking_momentum が全0でも、
 #           既存 score_buy/score_sell/score_mtf/score_slope から前段フィルタを補完する。
+#   - REV4: SUMMARY_AI final volatility filter で range_pct/day_high/day_low を使い、
+#           補完済みレンジが entry_row high/low だけで失われる問題を防ぐ。
 # ============================================================
 
 from __future__ import annotations
@@ -49,10 +51,6 @@ def _set_env_default(key: str, value: str, applied: dict[str, str], kept: dict[s
 
 
 def _patch_entry_controller_thresholds() -> dict[str, object]:
-    """
-    entry_controller は起動時点で import 済みのことが多いので、
-    os.environ だけでなくモジュール定数も直接上書きする。
-    """
     result: dict[str, object] = {"patched": False}
     try:
         import trading.handlers.entry_controller as ec
@@ -71,17 +69,7 @@ def _patch_entry_controller_thresholds() -> dict[str, object]:
         ec.MIN_COMPOSITE_SCORE_BUY = float(min_buy_comp)
         ec.MIN_AI_CONFIDENCE_BUY = float(min_buy_conf)
 
-        result.update(
-            {
-                "patched": True,
-                "old": old,
-                "new": {
-                    "MIN_SUMMARY_SCORE_BUY": ec.MIN_SUMMARY_SCORE_BUY,
-                    "MIN_COMPOSITE_SCORE_BUY": ec.MIN_COMPOSITE_SCORE_BUY,
-                    "MIN_AI_CONFIDENCE_BUY": ec.MIN_AI_CONFIDENCE_BUY,
-                },
-            }
-        )
+        result.update({"patched": True, "old": old, "new": {"MIN_SUMMARY_SCORE_BUY": ec.MIN_SUMMARY_SCORE_BUY, "MIN_COMPOSITE_SCORE_BUY": ec.MIN_COMPOSITE_SCORE_BUY, "MIN_AI_CONFIDENCE_BUY": ec.MIN_AI_CONFIDENCE_BUY}})
     except Exception as e:
         logger.exception("[SUMMARY AI SCORE ENV PATCH] entry_controller threshold patch failed")
         result.update({"error": repr(e)})
@@ -92,12 +80,24 @@ def _install_ranking_prefilter_score_fallback() -> dict[str, object]:
     result: dict[str, object] = {"installed": False}
     try:
         from core.startup.summary_ai_ranking_prefilter_score_fallback_patch import install, VERSION
-
         ok = bool(install())
         result.update({"installed": ok, "version": VERSION})
         return result
     except Exception as e:
         logger.exception("[SUMMARY AI SCORE ENV PATCH] ranking prefilter score fallback install failed")
+        result.update({"error": repr(e)})
+        return result
+
+
+def _install_final_volatility_range_bridge() -> dict[str, object]:
+    result: dict[str, object] = {"installed": False}
+    try:
+        from core.startup.summary_ai_final_volatility_range_bridge_patch import install, VERSION
+        ok = bool(install())
+        result.update({"installed": ok, "version": VERSION})
+        return result
+    except Exception as e:
+        logger.exception("[SUMMARY AI SCORE ENV PATCH] final volatility range bridge install failed")
         result.update({"error": repr(e)})
         return result
 
@@ -117,14 +117,16 @@ def install_summary_ai_score_env_patch() -> None:
 
     controller_patch = _patch_entry_controller_thresholds()
     ranking_prefilter = _install_ranking_prefilter_score_fallback()
+    final_vol_range = _install_final_volatility_range_bridge()
 
     _INSTALLED = True
     logger.warning(
-        "[SUMMARY AI SCORE ENV PATCH] installed applied=%s kept=%s entry_controller=%s ranking_prefilter=%s",
+        "[SUMMARY AI SCORE ENV PATCH] installed applied=%s kept=%s entry_controller=%s ranking_prefilter=%s final_vol_range=%s",
         applied,
         kept,
         controller_patch,
         ranking_prefilter,
+        final_vol_range,
     )
 
 
