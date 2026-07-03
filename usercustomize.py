@@ -95,6 +95,17 @@ def _install_summary_ai_ranking_prefilter_signal() -> bool:
         return False
 
 
+def _install_summary_ai_board_rest_cooldown() -> bool:
+    try:
+        from core.startup.summary_ai_board_rest_cooldown_patch import install as _install_cooldown
+        ok = bool(_install_cooldown())
+        logger.warning("[USERCUSTOMIZE] summary AI board REST cooldown bypass ok=%s", ok)
+        return ok
+    except Exception:
+        logger.exception("[USERCUSTOMIZE] summary AI board REST cooldown bypass failed")
+        return False
+
+
 def _install_runtime_defaults() -> bool:
     try:
         from core.startup.runtime_env_defaults_patch import install as _install_defaults
@@ -132,6 +143,7 @@ _install_runtime_defaults()
 _patch_entry_order_builder_logger()
 _install_summary_ai_fast_order_builder()
 _install_summary_ai_ranking_prefilter_signal()
+_install_summary_ai_board_rest_cooldown()
 _install_summary_pending_age_relax()
 _install_summary_mtf_duplicate_datetime_guard()
 
@@ -365,6 +377,7 @@ def _uc_delayed_watchlist_patch_loop() -> None:
             _patch_entry_order_builder_logger()
             _install_summary_ai_fast_order_builder()
             _install_summary_ai_ranking_prefilter_signal()
+            _install_summary_ai_board_rest_cooldown()
         except Exception:
             logger.exception("[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] delayed retry failed")
         time.sleep(1.0)
@@ -374,6 +387,7 @@ if _is_main_py():
     _patch_entry_order_builder_logger()
     _install_summary_ai_fast_order_builder()
     _install_summary_ai_ranking_prefilter_signal()
+    _install_summary_ai_board_rest_cooldown()
     _uc_patch_tonosama_recent_volume_display()
     _uc_patch_watchlist_recent_liq_rotation_failopen()
     threading.Thread(target=_uc_delayed_watchlist_patch_loop, name="usercustomize-push-rotation-liq-failopen", daemon=True).start()
