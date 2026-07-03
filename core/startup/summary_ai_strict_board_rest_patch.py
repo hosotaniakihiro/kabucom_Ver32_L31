@@ -8,7 +8,7 @@ from functools import wraps
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V9-SUMMARY-AI-REST-BOARD-CHECK-PUSH-ROTATION-HARD-BLOCK"
+VERSION = "V10-SUMMARY-AI-FORCE-REST-BOARD-CHECK-ON-MISSING"
 _INSTALLED = False
 _ORIG_GET_LATEST_BID_ASK = None
 _ORIG_GET_BOARD_WITH_RETRY = None
@@ -22,6 +22,16 @@ def _env_bool(name: str, default: bool = False) -> bool:
         return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
     except Exception:
         return bool(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -69,6 +79,27 @@ def _norm_side(v: Any) -> str:
     return s
 
 
+def _row_summary_like(row: Any) -> bool:
+    if not isinstance(row, dict):
+        return False
+    joined = "|".join(
+        str(row.get(k) or "").upper()
+        for k in ("source", "entry_source", "entry_type", "pipeline_source", "reason", "ai_reason", "model_used")
+    )
+    if "SUMMARY_AI" in joined or "SRC=SUMMARY" in joined:
+        return True
+    if str(row.get("source") or "").strip().upper() in {"SUMMARY", "SUMMARY_AI", "PUSH_SUMMARY", "PUSH"}:
+        return True
+    if str(row.get("entry_type") or "").strip().upper() == "SUMMARY_AI":
+        return True
+    try:
+        if bool(row.get("ai_gate_allow") or row.get("preapproved") or row.get("summary_ai_ok")):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _safe_install(module_name: str, label: str) -> bool:
     try:
         mod = __import__(module_name, fromlist=["install"])
@@ -91,6 +122,7 @@ def _apply_hard_board_policy() -> None:
     os.environ["SUMMARY_AI_CLOSE_LIMIT_FALLBACK_ON_BOARD_MISSING"] = "0"
     os.environ["SUMMARY_AI_BOARD_MISSING_LIMIT_FALLBACK"] = "0"
     os.environ.setdefault("SUMMARY_AI_REST_BOARD_CHECK_ON_MISSING", "1")
+    os.environ.setdefault("SUMMARY_AI_REST_BOARD_TIMEOUT_SEC", "2.0")
     try:
         from trading.handlers import entry_order_builder as eob
         for name, value in (
@@ -110,12 +142,22 @@ def _apply_hard_board_policy() -> None:
 def _infer_source_from_stack() -> tuple[str, str]:
     source = ""
     side = ""
+    summary_stack = False
     try:
-        for frame in inspect.stack(context=0)[:14]:
+        for frame in inspect.stack(context=0)[:18]:
             fn = str(getattr(frame, "function", ""))
             filename = str(getattr(frame, "filename", "")).replace("\\", "/").lower()
             loc = getattr(frame, "frame", None).f_locals if getattr(frame, "frame", None) is not None else {}
+            row = loc.get("entry_row") or loc.get("row") or loc.get("row_d")
+            item = loc.get("item") or loc.get("item_d")
+            if isinstance(item, dict) and not isinstance(row, dict):
+                row = item.get("entry") if isinstance(item.get("entry"), dict) else item
+            if _row_summary_like(row):
+                summary_stack = True
+                source = str(loc.get("source") or loc.get("entry_source") or (row.get("source") if isinstance(row, dict) else "") or source or "SUMMARY_AI")
+                side = _norm_side(loc.get("side") or loc.get("entry_side") or (row.get("side") if isinstance(row, dict) else "") or (row.get("entry_decision") if isinstance(row, dict) else "") or side)
             if filename.endswith("trading/handlers/entry_order_builder.py") and fn in {"_get_board_with_retry", "build_entry_order"}:
+                summary_stack = True
                 source = str(loc.get("source") or loc.get("entry_source") or source or "SUMMARY_AI_ORDER_BUILDER")
                 side = _norm_side(loc.get("side") or loc.get("entry_side") or side)
                 break
@@ -125,21 +167,39 @@ def _infer_source_from_stack() -> tuple[str, str]:
                 source = str(loc.get("source") or loc.get("entry_source") or "")
     except Exception:
         pass
+    if summary_stack and not _summary_like(source):
+        source = "SUMMARY_AI_ORDER_BUILDER"
     return source or "", side or ""
 
 
 def _fetch_rest_board(symbol: Any, *, side: str = "", source: str = "") -> Any:
     try:
         from core.startup import board_retry_patch as brp
-        old = os.environ.get("ENTRY_BOARD_REST_DIRECT_ENABLED")
+        old_enabled = os.environ.get("ENTRY_BOARD_REST_DIRECT_ENABLED")
+        old_timeout = os.environ.get("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC")
+        desired_timeout = max(1.0, _env_float("SUMMARY_AI_REST_BOARD_TIMEOUT_SEC", 2.0))
         os.environ["ENTRY_BOARD_REST_DIRECT_ENABLED"] = "1"
+        if _env_float("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", 0.0) < desired_timeout:
+            os.environ["ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC"] = str(desired_timeout)
         try:
+            logger.warning(
+                "[SUMMARY AI STRICT BOARD REST] REST board check start symbol=%s side=%s source=%s timeout=%.2fs version=%s",
+                symbol,
+                side,
+                source,
+                _env_float("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", desired_timeout),
+                VERSION,
+            )
             return brp._fetch_board_rest(str(symbol), side=side, source=source or "SUMMARY_AI_REST_BOARD_CHECK")
         finally:
-            if old is None:
+            if old_enabled is None:
                 os.environ.pop("ENTRY_BOARD_REST_DIRECT_ENABLED", None)
             else:
-                os.environ["ENTRY_BOARD_REST_DIRECT_ENABLED"] = old
+                os.environ["ENTRY_BOARD_REST_DIRECT_ENABLED"] = old_enabled
+            if old_timeout is None:
+                os.environ.pop("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", None)
+            else:
+                os.environ["ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC"] = old_timeout
     except Exception:
         logger.exception("[SUMMARY AI STRICT BOARD REST] REST board check failed symbol=%s side=%s source=%s version=%s", symbol, side, source, VERSION)
         return None
@@ -150,12 +210,24 @@ def _board_or_rest_check(board: Any, symbol: Any, *, side: str = "", source: str
         return board
     if not _env_bool("SUMMARY_AI_REST_BOARD_CHECK_ON_MISSING", True):
         return board
-    if not source:
-        stack_source, stack_side = _infer_source_from_stack()
-        source = stack_source or inferred
-        side = side or stack_side
+    stack_source, stack_side = _infer_source_from_stack()
+    if not source or not _summary_like(source):
+        source = stack_source or source
+    side = side or stack_side
+    if not source and str(inferred or "") in {"_get_board_with_retry", "get_latest_bid_ask"}:
+        # _get_board_with_retry often receives no source kwarg. When it is reached from the
+        # Summary-AI order builder, keep the strict policy but still verify via REST /board.
+        source = "SUMMARY_AI_ORDER_BUILDER"
     source_u = str(source or "").strip().upper()
     if not _summary_like(source_u):
+        logger.debug(
+            "[SUMMARY AI STRICT BOARD REST] REST board check skipped non-summary source symbol=%s side=%s source=%s inferred=%s version=%s",
+            symbol,
+            side,
+            source_u,
+            inferred,
+            VERSION,
+        )
         return board
     rest = _fetch_rest_board(symbol, side=side, source=source_u or "SUMMARY_AI_REST_BOARD_CHECK")
     if _valid_board(rest):
@@ -190,17 +262,17 @@ def _install_board_wrappers() -> bool:
         from trading.handlers import entry_order_builder as eob
 
         cur_get = getattr(eob, "get_latest_bid_ask", None)
-        if callable(cur_get) and not getattr(cur_get, "_summary_ai_rest_board_check_v9", False):
+        if callable(cur_get) and not getattr(cur_get, "_summary_ai_rest_board_check_v10", False):
             _ORIG_GET_LATEST_BID_ASK = _unwrap_original(cur_get)
 
             @wraps(_ORIG_GET_LATEST_BID_ASK)
             def _patched_get_latest_bid_ask(symbol: Any, *args: Any, **kwargs: Any):
                 source = str(kwargs.get("source") or "").strip().upper()
                 side = _norm_side(kwargs.get("side"))
-                inferred = ""
+                inferred = "get_latest_bid_ask"
                 if not source:
                     inferred_source, inferred_side = _infer_source_from_stack()
-                    inferred = inferred_source
+                    inferred = inferred_source or inferred
                     source = inferred_source
                     side = side or inferred_side
                 try:
@@ -209,24 +281,30 @@ def _install_board_wrappers() -> bool:
                     board = _ORIG_GET_LATEST_BID_ASK(symbol)
                 return _board_or_rest_check(board, symbol, side=side, source=source, inferred=inferred)
 
+            _patched_get_latest_bid_ask._summary_ai_rest_board_check_v10 = True  # type: ignore[attr-defined]
             _patched_get_latest_bid_ask._summary_ai_rest_board_check_v9 = True  # type: ignore[attr-defined]
             _patched_get_latest_bid_ask._original = _ORIG_GET_LATEST_BID_ASK  # type: ignore[attr-defined]
             eob.get_latest_bid_ask = _patched_get_latest_bid_ask
 
         cur_retry = getattr(eob, "_get_board_with_retry", None)
-        if callable(cur_retry) and not getattr(cur_retry, "_summary_ai_board_retry_rest_check_v9", False):
+        if callable(cur_retry) and not getattr(cur_retry, "_summary_ai_board_retry_rest_check_v10", False):
             _ORIG_GET_BOARD_WITH_RETRY = _unwrap_original(cur_retry)
 
             @wraps(_ORIG_GET_BOARD_WITH_RETRY)
             def _patched_get_board_with_retry(symbol: Any, *args: Any, **kwargs: Any):
                 source = str(kwargs.get("source") or "").strip().upper()
                 side = _norm_side(kwargs.get("side"))
+                if not source:
+                    inferred_source, inferred_side = _infer_source_from_stack()
+                    source = inferred_source
+                    side = side or inferred_side
                 try:
                     board = _ORIG_GET_BOARD_WITH_RETRY(symbol, *args, **kwargs)
                 except TypeError:
                     board = _ORIG_GET_BOARD_WITH_RETRY(symbol)
                 return _board_or_rest_check(board, symbol, side=side, source=source, inferred="_get_board_with_retry")
 
+            _patched_get_board_with_retry._summary_ai_board_retry_rest_check_v10 = True  # type: ignore[attr-defined]
             _patched_get_board_with_retry._summary_ai_board_retry_rest_check_v9 = True  # type: ignore[attr-defined]
             _patched_get_board_with_retry._original = _ORIG_GET_BOARD_WITH_RETRY  # type: ignore[attr-defined]
             eob._get_board_with_retry = _patched_get_board_with_retry
@@ -248,6 +326,7 @@ def install() -> bool:
     global _INSTALLED
     if _INSTALLED:
         _apply_hard_board_policy()
+        _install_board_wrappers()
         return True
     try:
         ranking_prefilter = _safe_install("core.startup.summary_ai_ranking_prefilter_score_fallback_patch", "ranking_prefilter_score_fallback")
