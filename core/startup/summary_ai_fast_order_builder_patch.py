@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_ai_fast_order_builder_patch.py
-# Version: V3-SUMMARY-AI-RANGE-REPAIR-BEFORE-ORDER-BUILD
+# Version: V3.1-SUMMARY-AI-RANGE-REPAIR-SOURCE-DETECT
 # ------------------------------------------------------------
 # SUMMARY_AI が AI_OK → qty算出まで進んだあと、発注直前で
 # LOW_MOVE_RANGE_TOO_SMALL になるケースを、閾値を緩めずに補修する。
@@ -13,6 +13,8 @@
 #     実レンジを再構成する。
 #   - 補完レンジが閾値以上の時だけ high_price/low_price を差し替える。
 #   - 補完できなければ従来通り LOW_MOVE_RANGE_TOO_SMALL で止める。
+#   - source が SUMMARY_AI 固定で渡らない場合に備え、entry_row の
+#     entry_type/source/reason/ai_gate_allow/preapproved でも対象判定する。
 #   - board retry は短縮し、logger 未定義も補正する。
 # ============================================================
 from __future__ import annotations
@@ -23,7 +25,7 @@ import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V3-SUMMARY-AI-RANGE-REPAIR-BEFORE-ORDER-BUILD"
+VERSION = "V3.1-SUMMARY-AI-RANGE-REPAIR-SOURCE-DETECT"
 _INSTALLED = False
 _ORIGINAL_BUILD_ENTRY_ORDER = None
 
@@ -76,6 +78,39 @@ def _first(row: dict[str, Any], names: tuple[str, ...], default: Any = None) -> 
     return default
 
 
+def _truthy(v: Any) -> bool:
+    try:
+        if isinstance(v, bool):
+            return v
+        return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on", "ok", "allow", "allowed"}
+    except Exception:
+        return False
+
+
+def _is_summary_ai_order(kwargs: dict[str, Any]) -> bool:
+    try:
+        source = str(kwargs.get("source") or "").upper()
+        row = kwargs.get("entry_row") if isinstance(kwargs.get("entry_row"), dict) else {}
+        joined = "|".join(
+            str(x or "").upper()
+            for x in (
+                source,
+                row.get("source"),
+                row.get("entry_type"),
+                row.get("reason"),
+                row.get("ai_reason"),
+                row.get("pipeline_source"),
+            )
+        )
+        if "SUMMARY_AI" in joined or "SRC=SUMMARY" in joined or source in {"SUMMARY", "PUSH_SUMMARY", "STOCK_SUMMARY"}:
+            return True
+        if _truthy(row.get("ai_gate_allow")) or _truthy(row.get("preapproved")) or _truthy(row.get("summary_ai_ok")):
+            return True
+        return False
+    except Exception:
+        return False
+
+
 def _range_pct(high: float, low: float, close: float) -> float:
     try:
         if close <= 0 or high <= 0 or low <= 0 or high < low:
@@ -88,8 +123,7 @@ def _range_pct(high: float, low: float, close: float) -> float:
 def _repair_summary_ai_low_move_range(kwargs: dict[str, Any], eob: Any) -> bool:
     """Repair collapsed SUMMARY_AI high/low using only already-provided row data."""
     try:
-        source = str(kwargs.get("source") or "").upper()
-        if source != "SUMMARY_AI":
+        if not _is_summary_ai_order(kwargs):
             return False
         row = kwargs.get("entry_row")
         if not isinstance(row, dict):
@@ -113,11 +147,13 @@ def _repair_summary_ai_low_move_range(kwargs: dict[str, Any], eob: Any) -> bool:
             "day_high", "today_high", "session_high", "high_day", "high_today",
             "summary_high_day", "summary_day_high", "push_day_high", "latest_day_high",
             "max_price", "highest_price", "HighPrice", "high_3m", "high_5m",
+            "display_high", "calc_high", "source_high",
         )
         low_names = (
             "day_low", "today_low", "session_low", "low_day", "low_today",
             "summary_low_day", "summary_day_low", "push_day_low", "latest_day_low",
             "min_price", "lowest_price", "LowPrice", "low_3m", "low_5m",
+            "display_low", "calc_low", "source_low",
         )
         open_names = ("open_price", "open", "Open", "day_open", "today_open", "session_open")
 
@@ -125,7 +161,8 @@ def _repair_summary_ai_low_move_range(kwargs: dict[str, Any], eob: Any) -> bool:
         alt_high = _safe_float(_first(row, high_names, 0.0), 0.0)
         alt_low = _safe_float(_first(row, low_names, 0.0), 0.0)
         if alt_high > 0 and alt_low > 0:
-            candidates.append(("day_high_low", max(alt_high, alt_low), min(alt_high, alt_low), _range_pct(max(alt_high, alt_low), min(alt_high, alt_low), close)))
+            h, l = max(alt_high, alt_low), min(alt_high, alt_low)
+            candidates.append(("day_high_low", h, l, _range_pct(h, l, close)))
 
         op = _safe_float(_first(row, open_names, 0.0), 0.0)
         if op > 0:
@@ -133,7 +170,14 @@ def _repair_summary_ai_low_move_range(kwargs: dict[str, Any], eob: Any) -> bool:
             l = min(op, close, cur_low if cur_low > 0 else close)
             candidates.append(("open_close", h, l, _range_pct(h, l, close)))
 
-        # If 3m/5m range is available but high/low columns were collapsed, use the widest strict candidate.
+        # Existing row may contain explicit range metrics even when high/low are collapsed.
+        for name in ("range_value", "day_range_value", "price_range", "intraday_range"):
+            rv = _safe_float(row.get(name), 0.0)
+            if rv > 0:
+                h = max(cur_high, close + rv / 2.0, close)
+                l = min(cur_low if cur_low > 0 else close, close - rv / 2.0, close)
+                candidates.append((name, h, l, _range_pct(h, l, close)))
+
         best = None
         for cand in candidates:
             if cand[3] >= min_range_pct and (best is None or cand[3] > best[3]):
@@ -178,17 +222,17 @@ def install() -> bool:
         old_interval, new_interval = _set_cap(eob, "ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", _safe_float(os.environ.get("ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC"), 0.2))
 
         cur = getattr(eob, "build_entry_order", None)
-        if callable(cur) and not getattr(cur, "_summary_ai_fast_order_builder_v3", False):
+        if callable(cur) and not getattr(cur, "_summary_ai_fast_order_builder_v31", False):
             _ORIGINAL_BUILD_ENTRY_ORDER = getattr(cur, "_original", cur)
 
             def _patched_build_entry_order(*args, **kwargs):
-                source = str(kwargs.get("source") or "").upper()
+                summary_like = _is_summary_ai_order(kwargs)
                 symbol = kwargs.get("symbol")
                 side = kwargs.get("side")
-                if source == "SUMMARY_AI":
+                if summary_like:
                     logger.info(
-                        "[SUMMARY AI FAST ORDER BUILDER] start symbol=%s side=%s retry_sec=%s retry_interval=%s version=%s",
-                        symbol, side, getattr(eob, "ENTRY_ORDER_BOARD_RETRY_SEC", None), getattr(eob, "ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", None), VERSION,
+                        "[SUMMARY AI FAST ORDER BUILDER] start symbol=%s side=%s source=%s retry_sec=%s retry_interval=%s version=%s",
+                        symbol, side, kwargs.get("source"), getattr(eob, "ENTRY_ORDER_BOARD_RETRY_SEC", None), getattr(eob, "ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", None), VERSION,
                     )
                     _repair_summary_ai_low_move_range(kwargs, eob)
                 try:
@@ -203,7 +247,7 @@ def install() -> bool:
                         result = _ORIGINAL_BUILD_ENTRY_ORDER(*args, **kwargs)
                     else:
                         raise
-                if source == "SUMMARY_AI":
+                if summary_like:
                     logger.info(
                         "[SUMMARY AI FAST ORDER BUILDER] done symbol=%s side=%s ok=%s reason=%s detail=%s version=%s",
                         symbol,
@@ -218,6 +262,7 @@ def install() -> bool:
             _patched_build_entry_order._summary_ai_fast_order_builder_v1 = True  # type: ignore[attr-defined]
             _patched_build_entry_order._summary_ai_fast_order_builder_v2 = True  # type: ignore[attr-defined]
             _patched_build_entry_order._summary_ai_fast_order_builder_v3 = True  # type: ignore[attr-defined]
+            _patched_build_entry_order._summary_ai_fast_order_builder_v31 = True  # type: ignore[attr-defined]
             _patched_build_entry_order._original = _ORIGINAL_BUILD_ENTRY_ORDER  # type: ignore[attr-defined]
             eob.build_entry_order = _patched_build_entry_order
 
@@ -229,7 +274,7 @@ def install() -> bool:
 
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY AI FAST ORDER BUILDER] installed version=%s retry_sec %s->%s interval %s->%s logger_patched=%s range_repair=True",
+            "[SUMMARY AI FAST ORDER BUILDER] installed version=%s retry_sec %s->%s interval %s->%s logger_patched=%s range_repair=True source_detect=True",
             VERSION,
             old_retry,
             new_retry,
