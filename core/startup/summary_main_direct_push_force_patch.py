@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_main_direct_push_force_patch.py
-# Version: V7-FORCE-DIRECT-1M-NO-HEAVY-CONTEXT-SETTERS
+# Version: V8-FORCE-DIRECT-1M-NO-RAW-COUNT-BLOCKING
 # ------------------------------------------------------------
 # main.py の1分PUSH summary tickを軽量経路に固定する。
 #
-# V7:
-#   - V6で async AI start は復旧したが、context store が48秒かかり、
-#     次分の 1m build timeout を誘発していた。
-#   - main.py ではDB保存・重いcontext setterを使わず、軽量attrsだけを同期更新する。
-#   - Summary-AIは分ごとのdaemon threadで即起動する。
+# V8:
+#   - V7でも、1m build timeout 後に _raw_memory_rows() がDB/RAW読みに入り、
+#     elapsed=30〜196秒まで親tickをブロックしていた。
+#   - timeout/empty時は raw memory count や original fallback を呼ばず即returnする。
+#   - さらに robust builder が詰まった場合に備え、process内のPUSHメモリから
+#     最低限の1分足を作る軽量fallbackを追加する。
 #   - ガード/発注条件は緩和しない。
 # ============================================================
 from __future__ import annotations
@@ -20,17 +21,14 @@ import os
 import sys
 import threading
 import time
-from functools import wraps
 from typing import Any, Optional
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
-
-VERSION = "V7-FORCE-DIRECT-1M-NO-HEAVY-CONTEXT-SETTERS"
+VERSION = "V8-FORCE-DIRECT-1M-NO-RAW-COUNT-BLOCKING"
 _PATCHED = False
 _WATCHER_STARTED = False
-_MONOTONIC_PATCHED = False
 _AI_LOCK = threading.RLock()
 _AI_RUNNING: dict[str, float] = {}
 _ORIGINAL_JOB_SUMMARY = None
@@ -84,174 +82,149 @@ def _dt_key(now: Any) -> str:
     return now.strftime("%Y%m%d%H%M%S") if isinstance(now, dt.datetime) else str(now)
 
 
-def _latest_dt(df: Any) -> pd.Timestamp | None:
-    try:
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            return None
-        for c in ("datetime", "end_time", "last_update", "updated_at", "inserted_at", "time"):
-            if c in df.columns:
-                s = pd.to_datetime(df[c], errors="coerce")
-                try:
-                    s = s.dt.tz_localize(None)
-                except Exception:
-                    pass
-                mx = s.max()
-                if pd.notna(mx):
-                    ts = pd.Timestamp(mx)
-                    return ts.tz_localize(None) if getattr(ts, "tzinfo", None) else ts
-    except Exception:
-        pass
-    return None
-
-
-def _extract_interval_from_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> int | None:
-    try:
-        for k in ("tf", "interval"):
-            if k in kwargs and kwargs.get(k) is not None:
-                return int(kwargs.get(k))
-        for x in args:
-            if isinstance(x, int):
-                return int(x)
-            if isinstance(x, str) and x.strip().isdigit():
-                return int(x)
-    except Exception:
-        pass
-    return None
-
-
-def _extract_source_from_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
-    try:
-        if "source" in kwargs and kwargs.get("source") is not None:
-            return str(kwargs.get("source") or "").strip().lower()
-        for x in reversed(args):
-            if isinstance(x, str) and x.strip().lower() in {"push", "push-cache", "summary", "legacy", "ranking"}:
-                return x.strip().lower()
-    except Exception:
-        pass
-    return "push"
-
-
-def _extract_df_from_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> pd.DataFrame | None:
-    try:
-        for k in ("df", "summary_df"):
-            if isinstance(kwargs.get(k), pd.DataFrame):
-                return kwargs.get(k)
-        for x in args:
-            if isinstance(x, pd.DataFrame):
-                return x
-    except Exception:
-        pass
-    return None
-
-
-def _get_existing_for_setter(obj: Any, setter_name: str, interval: int, source: str) -> pd.DataFrame:
-    getters = ["get_merged_summary", "get_push_merged_summary", "get_push_summary", "get_summary_history"]
-    for name in getters:
-        fn = getattr(obj, name, None)
-        if not callable(fn):
-            continue
-        for call in (
-            lambda fn=fn: fn(tf=interval, source=source),
-            lambda fn=fn: fn(interval, source=source),
-            lambda fn=fn: fn(interval),
-        ):
-            try:
-                v = call()
-                if isinstance(v, pd.DataFrame) and not v.empty:
-                    return v
-            except TypeError:
-                continue
-            except Exception:
-                break
-    return pd.DataFrame()
-
-
-def _maybe_skip_stale_overwrite(obj: Any, setter_name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> pd.DataFrame | None:
-    if not _env_bool("SUMMARY_PUSH_MONOTONIC_CACHE_GUARD", True):
-        return None
-    try:
-        interval = _extract_interval_from_call(args, kwargs)
-        if interval != 1:
-            return None
-        source = _extract_source_from_call(args, kwargs)
-        if source not in {"push", "push-cache", "summary"}:
-            return None
-        incoming = _extract_df_from_call(args, kwargs)
-        if not isinstance(incoming, pd.DataFrame) or incoming.empty:
-            return None
-        incoming_latest = _latest_dt(incoming)
-        if incoming_latest is None:
-            return None
-        existing = _get_existing_for_setter(obj, setter_name, 1, "push")
-        existing_latest = _latest_dt(existing)
-        if existing_latest is None:
-            return None
-        lag = (existing_latest - incoming_latest).total_seconds()
-        if lag > _env_float("SUMMARY_PUSH_MONOTONIC_TOLERANCE_SEC", 5.0):
-            logger.warning(
-                "[SUMMARY PUSH MONOTONIC GUARD] skip stale overwrite setter=%s source=%s incoming_latest=%s existing_latest=%s lag=%.1fs incoming_rows=%s existing_rows=%s version=%s",
-                setter_name, source, incoming_latest, existing_latest, lag, len(incoming), len(existing), VERSION,
-            )
-            return existing.copy(deep=False)
-    except Exception:
-        logger.debug("[SUMMARY PUSH MONOTONIC GUARD] check failed setter=%s", setter_name, exc_info=True)
-    return None
-
-
-def _install_monotonic_guard() -> bool:
-    global _MONOTONIC_PATCHED
-    if _MONOTONIC_PATCHED or not _env_bool("SUMMARY_PUSH_MONOTONIC_CACHE_GUARD", True):
-        return bool(_MONOTONIC_PATCHED)
-    patched = 0
-    targets: list[Any] = []
+def _candidate_push_frames() -> list[tuple[str, pd.DataFrame]]:
+    frames: list[tuple[str, pd.DataFrame]] = []
+    attr_names = (
+        "push_df", "push_memory_df", "push_stream_df", "stream_data_df", "stream_data_raw",
+        "raw_push_df", "push_history_df", "push_data_df", "latest_push_df", "realtime_push_df",
+        "summary_1m_df", "push_summary_1m_df",
+    )
+    targets: list[tuple[str, Any]] = []
     try:
         from global_state import global_data
-        targets.append(global_data)
+        targets.append(("global_data", global_data))
     except Exception:
         pass
     try:
         from core.global_context.context import global_context
-        targets.append(global_context)
+        targets.append(("global_context", global_context))
     except Exception:
         pass
+
     seen: set[int] = set()
-    for obj in targets:
-        if obj is None or id(obj) in seen:
+    for prefix, obj in targets:
+        if obj is None:
             continue
-        seen.add(id(obj))
-        for name in ("set_summary_history", "set_merged_summary", "set_push_summary", "set_push_merged_summary", "set_latest_summary"):
-            old = getattr(obj, name, None)
-            if not callable(old) or getattr(old, "_summary_push_monotonic_guard_v7", False):
-                continue
-
-            @wraps(old)
-            def _wrapped(*args: Any, __old=old, __obj=obj, __name=name, **kwargs: Any):
-                existing = _maybe_skip_stale_overwrite(__obj, __name, args, kwargs)
-                if isinstance(existing, pd.DataFrame) and not existing.empty:
-                    return existing
-                return __old(*args, **kwargs)
-
-            _wrapped._summary_push_monotonic_guard_v7 = True  # type: ignore[attr-defined]
-            _wrapped._summary_push_monotonic_guard_v6 = True  # type: ignore[attr-defined]
-            _wrapped._summary_push_monotonic_guard_v5 = True  # type: ignore[attr-defined]
-            _wrapped._original = old  # type: ignore[attr-defined]
+        for name in attr_names:
             try:
-                setattr(obj, name, _wrapped)
-                patched += 1
+                v = getattr(obj, name, None)
             except Exception:
-                pass
-    _MONOTONIC_PATCHED = patched > 0
-    logger.warning("[SUMMARY PUSH MONOTONIC GUARD] installed patched=%s version=%s", patched, VERSION)
-    return patched > 0
+                continue
+            if isinstance(v, pd.DataFrame) and not v.empty and id(v) not in seen:
+                seen.add(id(v))
+                frames.append((f"{prefix}.{name}", v))
+        for meth in ("get_push_df", "get_push_memory_df", "get_stream_data_df", "get_push_summary", "get_push_merged_summary", "get_merged_summary"):
+            fn = getattr(obj, meth, None)
+            if not callable(fn):
+                continue
+            for call in (
+                lambda fn=fn: fn(tf=1, source="push"),
+                lambda fn=fn: fn(1, source="push"),
+                lambda fn=fn: fn(1),
+                lambda fn=fn: fn(),
+            ):
+                try:
+                    v = call()
+                    if isinstance(v, pd.DataFrame) and not v.empty and id(v) not in seen:
+                        seen.add(id(v))
+                        frames.append((f"{prefix}.{meth}", v))
+                        break
+                except TypeError:
+                    continue
+                except Exception:
+                    break
+    return frames
 
 
-def _raw_memory_rows() -> int:
+def _normalize_push_ticks(df: pd.DataFrame, now: dt.datetime, *, source_name: str) -> pd.DataFrame:
     try:
-        from core.startup.summary_main_memory_latest_1m_patch import _load_push_memory_df
-        df = _load_push_memory_df()
-        return len(df) if isinstance(df, pd.DataFrame) else 0
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return pd.DataFrame()
+        x = df.copy(deep=False)
+        x = x.loc[:, ~pd.Index(x.columns).duplicated()].copy()
+        sym_col = next((c for c in ("symbol", "Symbol", "code", "銘柄コード", "stock_code") if c in x.columns), None)
+        price_col = next((c for c in ("price", "current_price", "close", "close_price", "CurrentPrice", "現在値") if c in x.columns), None)
+        dt_col = next((c for c in ("datetime", "received_at", "event_time", "time", "timestamp", "created_at", "updated_at", "inserted_at") if c in x.columns), None)
+        vol_col = next((c for c in ("volume", "trading_volume", "vol", "Volume", "出来高") if c in x.columns), None)
+        if sym_col is None or price_col is None:
+            return pd.DataFrame()
+        out = pd.DataFrame()
+        out["symbol"] = x[sym_col].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+        out["price"] = pd.to_numeric(x[price_col], errors="coerce")
+        if dt_col is not None:
+            out["datetime"] = pd.to_datetime(x[dt_col], errors="coerce")
+        else:
+            out["datetime"] = pd.Timestamp(now)
+        try:
+            out["datetime"] = out["datetime"].dt.tz_localize(None)
+        except Exception:
+            pass
+        if vol_col is not None:
+            out["volume"] = pd.to_numeric(x[vol_col], errors="coerce").fillna(0.0)
+        else:
+            out["volume"] = 0.0
+        out = out.dropna(subset=["symbol", "price", "datetime"])
+        out = out[(out["symbol"] != "") & (out["price"] > 0)]
+        if out.empty:
+            return pd.DataFrame()
+        # 直近3分だけを見る。古いsummary属性を拾っても発注判断に使わない。
+        min_dt = pd.Timestamp(now) - pd.Timedelta(seconds=max(90, _env_int("SUMMARY_FORCE_DIRECT_MEMORY_LOOKBACK_SEC", 180)))
+        out = out[out["datetime"] >= min_dt]
+        if out.empty:
+            return pd.DataFrame()
+        out["minute"] = out["datetime"].dt.floor("min")
+        return out.reset_index(drop=True)
     except Exception:
-        return 0
+        logger.debug("[SUMMARY FORCE DIRECT 1M] normalize push ticks failed source=%s", source_name, exc_info=True)
+        return pd.DataFrame()
+
+
+def _build_from_process_memory(now: dt.datetime) -> pd.DataFrame:
+    t0 = time.perf_counter()
+    best_name = ""
+    best_ticks = pd.DataFrame()
+    try:
+        for name, df in _candidate_push_frames():
+            ticks = _normalize_push_ticks(df, now, source_name=name)
+            if len(ticks) > len(best_ticks):
+                best_name = name
+                best_ticks = ticks
+        if best_ticks.empty:
+            return pd.DataFrame()
+        rows = []
+        for (sym, minute), g in best_ticks.sort_values("datetime").groupby(["symbol", "minute"], sort=False):
+            prices = pd.to_numeric(g["price"], errors="coerce").dropna()
+            if prices.empty:
+                continue
+            vol = float(pd.to_numeric(g.get("volume", 0.0), errors="coerce").fillna(0.0).sum()) if "volume" in g.columns else 0.0
+            rows.append({
+                "symbol": str(sym),
+                "datetime": pd.Timestamp(minute).to_pydatetime().replace(tzinfo=None),
+                "interval": 1,
+                "open": float(prices.iloc[0]),
+                "high": float(prices.max()),
+                "low": float(prices.min()),
+                "close": float(prices.iloc[-1]),
+                "price": float(prices.iloc[-1]),
+                "current_price": float(prices.iloc[-1]),
+                "close_price": float(prices.iloc[-1]),
+                "volume": vol,
+                "turnover": vol * float(prices.iloc[-1]) if vol > 0 else 0.0,
+                "source": "SUMMARY",
+            })
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return pd.DataFrame()
+        latest = df.sort_values(["symbol", "datetime"]).groupby("symbol", as_index=False).tail(1).reset_index(drop=True)
+        logger.warning(
+            "[SUMMARY FORCE DIRECT 1M] built via process memory fallback source=%s tick_rows=%s summary_rows=%s latest_dt=%s elapsed=%.3fs version=%s",
+            best_name, len(best_ticks), len(latest), latest["datetime"].max() if "datetime" in latest.columns else None,
+            time.perf_counter() - t0, VERSION,
+        )
+        return latest
+    except Exception:
+        logger.debug("[SUMMARY FORCE DIRECT 1M] process memory fallback failed", exc_info=True)
+        return pd.DataFrame()
 
 
 def _build_direct_inner(now: dt.datetime) -> pd.DataFrame:
@@ -268,30 +241,31 @@ def _build_direct_inner(now: dt.datetime) -> pd.DataFrame:
 def _build_direct(now: dt.datetime) -> pd.DataFrame:
     t0 = time.perf_counter()
     timeout = max(0.0, _env_float("SUMMARY_FORCE_DIRECT_BUILD_TIMEOUT_SEC", 6.0))
+    df = pd.DataFrame()
     if timeout <= 0:
         df = _build_direct_inner(now)
     else:
-        box: dict[str, Any] = {"df": pd.DataFrame(), "error": None}
+        box: dict[str, Any] = {"df": pd.DataFrame()}
 
         def _target() -> None:
-            try:
-                box["df"] = _build_direct_inner(now)
-            except Exception as e:
-                box["error"] = e
+            box["df"] = _build_direct_inner(now)
 
         th = threading.Thread(target=_target, name="summary-force-direct-build", daemon=True)
         th.start()
         th.join(timeout)
         if th.is_alive():
             logger.error(
-                "[SUMMARY FORCE DIRECT 1M] build timeout timeout=%.3fs elapsed=%.3fs now=%s version=%s note=inner_thread_left_daemon",
+                "[SUMMARY FORCE DIRECT 1M] build timeout timeout=%.3fs elapsed=%.3fs now=%s version=%s note=skip_raw_count_and_try_process_memory",
                 timeout, time.perf_counter() - t0, now, VERSION,
             )
-            return pd.DataFrame()
-        df = box.get("df")
+            df = pd.DataFrame()
+        else:
+            df = box.get("df")
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        df = _build_from_process_memory(now)
     if isinstance(df, pd.DataFrame) and not df.empty:
         logger.warning(
-            "[SUMMARY FORCE DIRECT 1M] built via robust memory rows=%s symbols=%s latest_dt=%s elapsed=%.3fs timeout=%.3fs version=%s",
+            "[SUMMARY FORCE DIRECT 1M] built via robust/process memory rows=%s symbols=%s latest_dt=%s elapsed=%.3fs timeout=%.3fs version=%s",
             len(df), int(df["symbol"].nunique()) if "symbol" in df.columns else 0,
             df["datetime"].max() if "datetime" in df.columns else None,
             time.perf_counter() - t0, timeout, VERSION,
@@ -344,17 +318,10 @@ def _normalize_1m_df(df: pd.DataFrame) -> pd.DataFrame:
 
 def _assign_attrs(obj: Any, hist: pd.DataFrame, latest: pd.DataFrame) -> None:
     for name, value in (
-        ("summary_1m_df", hist),
-        ("latest_summary_1m_df", latest),
-        ("summary_1m_latest_df", latest),
-        ("push_summary_1", latest),
-        ("push_summary_1min", latest),
-        ("push_summary_1m_df", hist),
-        ("push_merged_summary_1", latest),
-        ("push_merged_summary_1min", latest),
-        ("push_merged_summary_1m_df", latest),
-        ("merged_summary_1", latest),
-        ("merged_summary_1min", latest),
+        ("summary_1m_df", hist), ("latest_summary_1m_df", latest), ("summary_1m_latest_df", latest),
+        ("push_summary_1", latest), ("push_summary_1min", latest), ("push_summary_1m_df", hist),
+        ("push_merged_summary_1", latest), ("push_merged_summary_1min", latest), ("push_merged_summary_1m_df", latest),
+        ("merged_summary_1", latest), ("merged_summary_1min", latest),
     ):
         try:
             setattr(obj, name, value.copy(deep=False))
@@ -363,8 +330,6 @@ def _assign_attrs(obj: Any, hist: pd.DataFrame, latest: pd.DataFrame) -> None:
 
 
 def _store(df: pd.DataFrame) -> None:
-    if df is None or df.empty:
-        return
     hist = _normalize_1m_df(df)
     if hist.empty:
         return
@@ -383,11 +348,6 @@ def _store(df: pd.DataFrame) -> None:
         _assign_attrs(GC, hist, latest)
     except Exception:
         pass
-
-    # V7: main.pyでは重い setter は呼ばない。必要なら明示的に有効化する。
-    if _env_bool("SUMMARY_FORCE_DIRECT_HEAVY_CONTEXT_SETTERS", False):
-        logger.warning("[SUMMARY FORCE DIRECT 1M] heavy context setters requested but disabled in V7 safe path")
-
     logger.warning(
         "[SUMMARY FORCE DIRECT 1M] fast attrs only tf=1 hist_rows=%s latest_rows=%s latest_dt=%s elapsed=%.3fs version=%s",
         len(hist), len(latest), hist["datetime"].max() if "datetime" in hist.columns else None, time.perf_counter() - t0, VERSION,
@@ -396,14 +356,11 @@ def _store(df: pd.DataFrame) -> None:
 
 def _cleanup_ai_running(now_ts: float) -> None:
     max_age = max(30.0, _env_float("SUMMARY_FORCE_DIRECT_AI_RUNNING_MAX_AGE_SEC", 90.0))
-    stale: list[tuple[str, float]] = []
     for k, ts in list(_AI_RUNNING.items()):
         age = now_ts - float(ts or 0.0)
         if age > max_age:
-            stale.append((k, age))
-    for k, age in stale:
-        _AI_RUNNING.pop(k, None)
-        logger.warning("[SUMMARY FORCE DIRECT 1M] async AI stale running key cleared key=%s age_sec=%.1f version=%s", k, age, VERSION)
+            _AI_RUNNING.pop(k, None)
+            logger.warning("[SUMMARY FORCE DIRECT 1M] async AI stale running key cleared key=%s age_sec=%.1f version=%s", k, age, VERSION)
 
 
 def _submit_ai(df: pd.DataFrame, now: dt.datetime, run_entry: bool) -> None:
@@ -449,13 +406,12 @@ def _submit_ai(df: pd.DataFrame, now: dt.datetime, run_entry: bool) -> None:
 
 def _patch_once(reason: str = "install") -> bool:
     global _ORIGINAL_JOB_SUMMARY
-    _install_monotonic_guard()
     if not _is_main_py() or not _env_bool("SUMMARY_FORCE_DIRECT_PATCH_ENABLED", True):
         return False
     try:
         import scheduler_jobs.summary.runner_core as rc
         current = getattr(rc, "job_summary", None)
-        if getattr(current, "_summary_force_direct_v7", False):
+        if getattr(current, "_summary_force_direct_v8", False):
             return True
         if _ORIGINAL_JOB_SUMMARY is None and callable(current):
             _ORIGINAL_JOB_SUMMARY = getattr(current, "_original", current)
@@ -471,19 +427,12 @@ def _patch_once(reason: str = "install") -> bool:
             if df is not None and not df.empty:
                 _store(df)
                 _submit_ai(df, now_i, run_entry)
-                logger.warning("[SUMMARY FORCE DIRECT 1M] return interval=1 rows=%s elapsed=%.3fs mode=forced_direct_v7", len(df), time.perf_counter() - t0)
+                logger.warning("[SUMMARY FORCE DIRECT 1M] return interval=1 rows=%s elapsed=%.3fs mode=forced_direct_v8", len(df), time.perf_counter() - t0)
                 return df
-            raw_rows = _raw_memory_rows()
-            if _env_bool("SUMMARY_FORCE_DIRECT_NO_ORIGINAL_FALLBACK_WHEN_RAW_EXISTS", True) and raw_rows > 0:
-                logger.warning(
-                    "[SUMMARY FORCE DIRECT 1M] direct empty/timeout but raw memory exists -> skip original heavy fallback interval=1 raw_rows=%s elapsed=%.3fs",
-                    raw_rows, time.perf_counter() - t0,
-                )
-                return pd.DataFrame()
-            logger.warning("[SUMMARY FORCE DIRECT 1M] direct empty -> original fallback interval=1 raw_rows=%s", raw_rows)
-            return orig(interval_i, display=display, now=now_i, run_entry=run_entry, **kwargs)
+            logger.warning("[SUMMARY FORCE DIRECT 1M] direct empty/timeout -> skip raw-count/original fallback interval=1 elapsed=%.3fs version=%s", time.perf_counter() - t0, VERSION)
+            return pd.DataFrame()
 
-        for attr in ("_summary_force_direct_v1", "_summary_force_direct_v2", "_summary_force_direct_v3", "_summary_force_direct_v4", "_summary_force_direct_v5", "_summary_force_direct_v6", "_summary_force_direct_v7"):
+        for attr in ("_summary_force_direct_v1", "_summary_force_direct_v2", "_summary_force_direct_v3", "_summary_force_direct_v4", "_summary_force_direct_v5", "_summary_force_direct_v6", "_summary_force_direct_v7", "_summary_force_direct_v8"):
             setattr(job_summary_force, attr, True)
         job_summary_force._original = orig  # type: ignore[attr-defined]
         rc.job_summary = job_summary_force
@@ -511,11 +460,10 @@ def _watcher() -> None:
 
 def install() -> bool:
     global _PATCHED, _WATCHER_STARTED
-    os.environ.setdefault("SUMMARY_FORCE_DIRECT_NO_ORIGINAL_FALLBACK_WHEN_RAW_EXISTS", "1")
-    os.environ.setdefault("SUMMARY_PUSH_MONOTONIC_CACHE_GUARD", "1")
     os.environ.setdefault("SUMMARY_FORCE_DIRECT_BUILD_TIMEOUT_SEC", "6")
     os.environ.setdefault("SUMMARY_FORCE_DIRECT_AI_MAX_ACTIVE", "3")
-    os.environ.setdefault("SUMMARY_FORCE_DIRECT_HEAVY_CONTEXT_SETTERS", "0")
+    os.environ.setdefault("SUMMARY_FORCE_DIRECT_MEMORY_LOOKBACK_SEC", "180")
+    os.environ.setdefault("SUMMARY_FORCE_DIRECT_NO_ORIGINAL_FALLBACK_WHEN_RAW_EXISTS", "1")
     ok = _patch_once(reason="install")
     if ok and not _WATCHER_STARTED and _env_bool("SUMMARY_FORCE_DIRECT_WATCHER", True):
         _WATCHER_STARTED = True
