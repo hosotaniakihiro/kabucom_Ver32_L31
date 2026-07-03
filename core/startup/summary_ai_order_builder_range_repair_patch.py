@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_ai_order_builder_range_repair_patch.py
-# Version: V5-SUMMARY-AI-ATR-REPAIR-MULTI-SOURCE-HISTORY
+# Version: V6-SUMMARY-AI-ATR-REPAIR-LOGGER-GLOBAL-FIX
 # ------------------------------------------------------------
 # SUMMARY_AI の直接スナップショット経路で row が
 # high == low == close / atr == 0 のまま entry_controller と
@@ -12,21 +12,19 @@
 #   - 閾値は緩和しない。
 #   - fail-open しない。
 #   - day_high/day_low または global_context の履歴でレンジが確認できる時だけ補完する。
-#
-# V5:
-#   - global_context の push だけでなく summary / legacy / ranking / push-cache も検索。
-#   - 1分履歴が複数本ある場合は ATR(14) を計算して atr_1m を補完。
+#   - V6: wrapper 連鎖内の古い関数 globals に logger が無い場合に注入し、
+#         NameError("name 'logger' is not defined") で発注直前に落ちる問題を防ぐ。
 # ============================================================
 from __future__ import annotations
 
 import logging
 import math
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
-VERSION = "V5-SUMMARY-AI-ATR-REPAIR-MULTI-SOURCE-HISTORY"
+VERSION = "V6-SUMMARY-AI-ATR-REPAIR-LOGGER-GLOBAL-FIX"
 _INSTALLED = False
-_ORIGINAL_LOW_MOVE = None
+_ORIGINAL_LOW_MOVE: Callable[..., Any] | None = None
 
 _HISTORY_SOURCES = ("push", "summary", "legacy", "ranking", "push-cache")
 
@@ -61,6 +59,16 @@ def _first_pos(d: dict[str, Any], keys: tuple[str, ...]) -> float:
         if v > 0:
             return v
     return 0.0
+
+
+def _normalize_symbol(s: Any) -> str:
+    try:
+        x = str(s or "").strip()
+        if x.endswith(".0") and x[:-2].isdigit():
+            return x[:-2]
+        return x
+    except Exception:
+        return ""
 
 
 def _source_is_summary_ai(source: Any, row: dict[str, Any]) -> bool:
@@ -101,16 +109,6 @@ def _best_from_row(row: dict[str, Any]) -> tuple[float, float, float, float, str
             best = (close, h, l, atr, label)
             best_ratio = ratio
     return best
-
-
-def _normalize_symbol(s: Any) -> str:
-    try:
-        x = str(s or "").strip()
-        if x.endswith(".0") and x[:-2].isdigit():
-            return x[:-2]
-        return x
-    except Exception:
-        return ""
 
 
 def _latest_symbol_row_from_df(df: Any, symbol: str) -> dict[str, Any]:
@@ -193,7 +191,6 @@ def _history_frames_from_global_context(tf: int = 1) -> list[tuple[str, Any]]:
             from core.global_context import global_context  # type: ignore
         except Exception:
             return frames
-
     for getter_name, label in (("get_summary_history", "summary_history"), ("get_merged_summary", "merged_summary")):
         getter = getattr(global_context, getter_name, None)
         if not callable(getter):
@@ -212,7 +209,6 @@ def _best_from_global_context(symbol: str) -> tuple[float, float, float, float, 
     symbol = _normalize_symbol(symbol)
     if not symbol:
         return 0.0, 0.0, 0.0, 0.0, "symbol_missing"
-
     best = (0.0, 0.0, 0.0, 0.0, "gc_missing")
     best_ratio = 0.0
     for label, df in _history_frames_from_global_context(1):
@@ -251,14 +247,13 @@ def _entry_min_atr_ratio() -> float:
 def _repair_row(entry_row: Any, *, symbol: str, source: str) -> tuple[dict[str, Any], dict[str, Any]]:
     row = _row_dict(entry_row)
     symbol = _normalize_symbol(symbol or row.get("symbol"))
-    close0, high0, low0, atr0, method0 = _best_from_row(row)
+    close0, high0, low0, atr0, _ = _best_from_row(row)
     old_ratio = _range_ratio(close0, high0, low0)
-    best = (close0, high0, low0, atr0, method0)
-    best_ratio = old_ratio
-
     c2, h2, l2, atr2, method2 = _best_from_global_context(symbol)
     ratio2 = _range_ratio(c2, h2, l2)
-    if ratio2 > best_ratio or (ratio2 == best_ratio and atr2 > best[3]):
+    best = (close0, high0, low0, atr0, "row")
+    best_ratio = old_ratio
+    if ratio2 > best_ratio or (ratio2 == best_ratio and atr2 > atr0):
         best = (c2, h2, l2, atr2, method2)
         best_ratio = ratio2
 
@@ -270,7 +265,6 @@ def _repair_row(entry_row: Any, *, symbol: str, source: str) -> tuple[dict[str, 
     required_atr = c * min_atr_ratio if c > 0 else 0.0
     range_atr_proxy = max(0.0, h - l) if c > 0 and h >= l else 0.0
     effective_atr = max(old_atr, history_atr)
-
     diag = {
         "symbol": symbol,
         "source": source,
@@ -292,7 +286,6 @@ def _repair_row(entry_row: Any, *, symbol: str, source: str) -> tuple[dict[str, 
         "atr_repaired": False,
         "version": VERSION,
     }
-
     if c > 0 and h > 0 and l > 0 and h >= l and best_ratio > old_ratio:
         out.update({
             "close": c,
@@ -309,8 +302,6 @@ def _repair_row(entry_row: Any, *, symbol: str, source: str) -> tuple[dict[str, 
             "intraday_range_pct": best_ratio,
         })
         diag["repaired"] = True
-
-    # ATR補完は「補正後レンジが十分ある」場合だけ。レンジ不足銘柄は従来通り止める。
     if c > 0 and best_ratio >= min_range:
         if effective_atr > 0 and (effective_atr / c) >= min_atr_ratio:
             new_atr = effective_atr
@@ -331,7 +322,6 @@ def _repair_row(entry_row: Any, *, symbol: str, source: str) -> tuple[dict[str, 
             diag["atr_repaired"] = new_atr > old_atr or old_atr <= 0
             diag["new_atr"] = new_atr
             diag["atr_method"] = method_atr
-
     return out, diag
 
 
@@ -345,13 +335,48 @@ def _update_original_row(entry_row: Any, repaired: dict[str, Any]) -> None:
         pass
 
 
+def _inject_logger_global(fn: Any) -> None:
+    try:
+        cur = fn
+        seen: set[int] = set()
+        for _ in range(12):
+            if not callable(cur) or id(cur) in seen:
+                break
+            seen.add(id(cur))
+            g = getattr(cur, "__globals__", None)
+            if isinstance(g, dict):
+                g.setdefault("logging", logging)
+                g.setdefault("logger", logger)
+            nxt = None
+            for attr in ("_original", "__wrapped__", "_entry_execute_timeout_guard_original", "_final_entry_safety_guard_original", "_original_execute_best_candidate"):
+                cand = getattr(cur, attr, None)
+                if callable(cand) and cand is not cur:
+                    nxt = cand
+                    break
+            cur = nxt
+    except Exception:
+        logger.debug("[SUMMARY AI ORDER RANGE REPAIR] logger inject failed", exc_info=True)
+
+
+def _call_original_low_move(fn: Callable[..., Any], entry_row: Any, *, symbol: str, source: str) -> Any:
+    _inject_logger_global(fn)
+    try:
+        return fn(entry_row, symbol=symbol, source=source)
+    except NameError as exc:
+        if "logger" not in str(exc):
+            raise
+        _inject_logger_global(fn)
+        logger.warning("[SUMMARY AI ORDER RANGE REPAIR] recovered missing logger global symbol=%s source=%s version=%s", symbol, source, VERSION)
+        return fn(entry_row, symbol=symbol, source=source)
+
+
 def _install_entry_controller_filter_repair() -> bool:
     try:
         import trading.filters.volatility_filter as vf
         import trading.handlers.entry_controller as ec
-
-        if not getattr(vf.atr_1m_filter, "_summary_ai_entry_controller_repair_v5", False):
+        if not getattr(vf.atr_1m_filter, "_summary_ai_entry_controller_repair_v6", False):
             orig_atr = getattr(vf.atr_1m_filter, "_original", vf.atr_1m_filter)
+            _inject_logger_global(orig_atr)
 
             def _patched_atr_1m_filter(entry_row, *args, **kwargs):
                 row = _row_dict(entry_row)
@@ -361,17 +386,18 @@ def _install_entry_controller_filter_repair() -> bool:
                     if diag.get("repaired") or diag.get("atr_repaired"):
                         logger.warning("[SUMMARY AI ENTRY CTRL ATR REPAIR] repaired before atr_1m_filter detail=%s version=%s", diag, VERSION)
                         _update_original_row(entry_row, repaired)
+                        _inject_logger_global(orig_atr)
                         return orig_atr(repaired, *args, **kwargs)
+                _inject_logger_global(orig_atr)
                 return orig_atr(entry_row, *args, **kwargs)
 
-            _patched_atr_1m_filter._summary_ai_entry_controller_repair_v4 = True  # type: ignore[attr-defined]
-            _patched_atr_1m_filter._summary_ai_entry_controller_repair_v5 = True  # type: ignore[attr-defined]
+            _patched_atr_1m_filter._summary_ai_entry_controller_repair_v6 = True  # type: ignore[attr-defined]
             _patched_atr_1m_filter._original = orig_atr  # type: ignore[attr-defined]
             vf.atr_1m_filter = _patched_atr_1m_filter
             ec.atr_1m_filter = _patched_atr_1m_filter
-
-        if not getattr(vf.range_5m_filter, "_summary_ai_entry_controller_repair_v5", False):
+        if not getattr(vf.range_5m_filter, "_summary_ai_entry_controller_repair_v6", False):
             orig_range = getattr(vf.range_5m_filter, "_original", vf.range_5m_filter)
+            _inject_logger_global(orig_range)
 
             def _patched_range_5m_filter(entry_row, *args, **kwargs):
                 row = _row_dict(entry_row)
@@ -381,15 +407,15 @@ def _install_entry_controller_filter_repair() -> bool:
                     if diag.get("repaired") or diag.get("atr_repaired"):
                         logger.warning("[SUMMARY AI ENTRY CTRL ATR REPAIR] repaired before range_5m_filter detail=%s version=%s", diag, VERSION)
                         _update_original_row(entry_row, repaired)
+                        _inject_logger_global(orig_range)
                         return orig_range(repaired, *args, **kwargs)
+                _inject_logger_global(orig_range)
                 return orig_range(entry_row, *args, **kwargs)
 
-            _patched_range_5m_filter._summary_ai_entry_controller_repair_v4 = True  # type: ignore[attr-defined]
-            _patched_range_5m_filter._summary_ai_entry_controller_repair_v5 = True  # type: ignore[attr-defined]
+            _patched_range_5m_filter._summary_ai_entry_controller_repair_v6 = True  # type: ignore[attr-defined]
             _patched_range_5m_filter._original = orig_range  # type: ignore[attr-defined]
             vf.range_5m_filter = _patched_range_5m_filter
             ec.range_5m_filter = _patched_range_5m_filter
-
         logger.warning("[SUMMARY AI ENTRY CTRL ATR REPAIR] installed version=%s", VERSION)
         return True
     except Exception:
@@ -408,27 +434,24 @@ def install() -> bool:
         if not callable(cur):
             logger.warning("[SUMMARY AI ORDER RANGE REPAIR] target missing version=%s", VERSION)
             return bool(ctrl_ok)
-        if getattr(cur, "_summary_ai_order_range_repair_v5", False):
+        if getattr(cur, "_summary_ai_order_range_repair_v6", False):
             _INSTALLED = True
             return True
-
         _ORIGINAL_LOW_MOVE = getattr(cur, "_original", cur)
+        _inject_logger_global(_ORIGINAL_LOW_MOVE)
 
         def _patched_low_move_hard_block(entry_row, *, symbol: str, source: str):
             row = _row_dict(entry_row)
             if not _source_is_summary_ai(source, row):
-                return _ORIGINAL_LOW_MOVE(entry_row, symbol=symbol, source=source)
+                return _call_original_low_move(_ORIGINAL_LOW_MOVE, entry_row, symbol=symbol, source=source)  # type: ignore[arg-type]
             repaired, diag = _repair_row(entry_row, symbol=str(symbol or row.get("symbol") or ""), source=str(source or row.get("source") or ""))
             if diag.get("repaired") or diag.get("atr_repaired"):
                 logger.warning("[SUMMARY AI ORDER RANGE REPAIR] repaired before strict low-move guard detail=%s version=%s", diag, VERSION)
                 _update_original_row(entry_row, repaired)
-                return _ORIGINAL_LOW_MOVE(repaired, symbol=symbol, source=source)
-            return _ORIGINAL_LOW_MOVE(entry_row, symbol=symbol, source=source)
+                return _call_original_low_move(_ORIGINAL_LOW_MOVE, repaired, symbol=symbol, source=source)  # type: ignore[arg-type]
+            return _call_original_low_move(_ORIGINAL_LOW_MOVE, entry_row, symbol=symbol, source=source)  # type: ignore[arg-type]
 
-        _patched_low_move_hard_block._summary_ai_order_range_repair_v1 = True  # type: ignore[attr-defined]
-        _patched_low_move_hard_block._summary_ai_order_range_repair_v2 = True  # type: ignore[attr-defined]
-        _patched_low_move_hard_block._summary_ai_order_range_repair_v3 = True  # type: ignore[attr-defined]
-        _patched_low_move_hard_block._summary_ai_order_range_repair_v4 = True  # type: ignore[attr-defined]
+        _patched_low_move_hard_block._summary_ai_order_range_repair_v6 = True  # type: ignore[attr-defined]
         _patched_low_move_hard_block._summary_ai_order_range_repair_v5 = True  # type: ignore[attr-defined]
         _patched_low_move_hard_block._original = _ORIGINAL_LOW_MOVE  # type: ignore[attr-defined]
         eob._low_move_hard_block = _patched_low_move_hard_block
