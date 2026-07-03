@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/summary/pipeline/entry_pipeline.py
-# Version: Ver2.9-STRICT-SUMMARY-LIQUIDITY
+# Version: Ver3.0-SUMMARY-AI-BUY-BLOWOFF-GATE
 # ------------------------------------------------------------
 # ✔ AI approved rows → entry execution
 # ✔ SUMMARY AI通常エントリーとイナゴ liquidity_shock 条件を分離
@@ -8,6 +8,8 @@
 # ✔ Ver2.8: Summary AI承認済み候補が liquidity だけで全落ちする問題を救済
 # ✔ Ver2.9: 低流動性銘柄へのエントリーを防ぐため、rescueでも
 #            出来高3万株・売買代金1000万円を必須化
+# ✔ Ver3.0: SUMMARY AI の BUY は blowoff_top を無条件除外せず、
+#            score/出来高/売買代金/高値乖離を満たす場合だけ通す
 # ============================================================
 
 from __future__ import annotations
@@ -279,7 +281,28 @@ def _is_inago_source(row: dict) -> bool:
     source = str(row.get("source") or "").upper()
     strategy = str(row.get("strategy") or row.get("entry_strategy") or "").upper()
     reason = str(row.get("reason") or row.get("ai_reason") or "").upper()
-    return ("INAGO" in source or "TONOSAMA" in source or "LIQUIDITY_SHOCK" in source or "INAGO" in strategy or "TONOSAMA" in strategy or "LIQUIDITY_SHOCK" in strategy or "LIQUIDITY" in reason and "SHOCK" in reason)
+    return (
+        "INAGO" in source
+        or "TONOSAMA" in source
+        or "LIQUIDITY_SHOCK" in source
+        or "INAGO" in strategy
+        or "TONOSAMA" in strategy
+        or "LIQUIDITY_SHOCK" in strategy
+        or ("LIQUIDITY" in reason and "SHOCK" in reason)
+    )
+
+
+def _is_summary_ai_source(row: dict) -> bool:
+    source = str(row.get("source") or "").upper()
+    entry_type = str(row.get("entry_type") or "").upper()
+    strategy = str(row.get("strategy") or row.get("entry_strategy") or "").upper()
+    reason = str(row.get("reason") or row.get("ai_reason") or "").upper()
+    return (
+        source in {"SUMMARY", "SUMMARY_AI", "PUSH"}
+        or entry_type == "SUMMARY_AI"
+        or "SUMMARY_AI" in strategy
+        or "SRC=SUMMARY" in reason
+    )
 
 
 def _range_pct(row: dict, close: float) -> float:
@@ -291,14 +314,37 @@ def _range_pct(row: dict, close: float) -> float:
     return 0.0
 
 
+def _score_context(row: dict) -> tuple[float, float, float, float, str]:
+    raw_score = _safe_float(_first(row, ["score", "score_total", "final_score", "display_score"], 0.0), 0.0)
+    buy_score = _safe_float(_first(row, ["buy_score", "score_buy"], 0.0), 0.0)
+    sell_score = _safe_float(_first(row, ["sell_score", "score_sell"], 0.0), 0.0)
+    effective_score = max(abs(raw_score), buy_score, sell_score)
+    side = _resolve_side(row, buy_score=buy_score, sell_score=sell_score, raw_score=raw_score)
+    return raw_score, buy_score, sell_score, effective_score, side
+
+
+def _market_context(row: dict) -> tuple[float, float, float, float, float, float]:
+    close = _safe_float(_first(row, ["close", "close_price", "price", "current_price"], 0.0), 0.0)
+    volume = _safe_float(_first(row, ["volume", "trading_volume", "出来高"], 0.0), 0.0)
+    turnover = _safe_float(_first(row, ["turnover", "trading_value", "売買代金"], 0.0), 0.0)
+    if turnover <= 0 and close > 0 and volume > 0:
+        turnover = close * volume
+    high = _safe_float(_first(row, ["high", "high_price", "day_high"], 0.0), 0.0)
+    low = _safe_float(_first(row, ["low", "low_price", "day_low"], 0.0), 0.0)
+    range_pct = _range_pct(row, close)
+    return close, volume, turnover, high, low, range_pct
+
+
+def _pullback_from_high_pct(close: float, high: float) -> float:
+    if close <= 0 or high <= 0 or close > high:
+        return 0.0
+    return (high - close) / close * 100.0
+
+
 def _summary_ai_liquidity_rescue(row: dict, *, symbol: str, side: str, close: float, volume: float, turnover: float, effective_score: float) -> bool:
     if not _env_bool("SUMMARY_AI_ENTRY_LIQUIDITY_RESCUE_ENABLED", True):
         return False
-    source = str(row.get("source") or "").upper()
-    entry_type = str(row.get("entry_type") or "").upper()
-    reason = str(row.get("reason") or row.get("ai_reason") or "")
-    is_summary_ai = source in {"SUMMARY", "SUMMARY_AI", "PUSH"} or entry_type == "SUMMARY_AI" or "src=SUMMARY" in reason
-    if not is_summary_ai:
+    if not _is_summary_ai_source(row):
         return False
     range_pct = _range_pct(row, close)
     mtf = max(
@@ -327,17 +373,8 @@ def _summary_ai_liquidity_rescue(row: dict, *, symbol: str, side: str, close: fl
 
 
 def _allow_summary_ai_liquidity(row: dict, *, symbol: str, interval: int) -> bool:
-    close = _safe_float(_first(row, ["close", "close_price", "price", "current_price"], 0.0), 0.0)
-    volume = _safe_float(_first(row, ["volume", "trading_volume", "出来高"], 0.0), 0.0)
-    turnover = _safe_float(_first(row, ["turnover", "trading_value", "売買代金"], 0.0), 0.0)
-    if turnover <= 0 and close > 0 and volume > 0:
-        turnover = close * volume
-    raw_score = _safe_float(_first(row, ["score", "score_total", "final_score", "display_score"], 0.0), 0.0)
-    score = abs(raw_score)
-    buy_score = _safe_float(_first(row, ["buy_score", "score_buy"], 0.0), 0.0)
-    sell_score = _safe_float(_first(row, ["sell_score", "score_sell"], 0.0), 0.0)
-    effective_score = max(score, buy_score, sell_score)
-    side = _resolve_side(row, buy_score=buy_score, sell_score=sell_score, raw_score=raw_score)
+    close, volume, turnover, _, _, _ = _market_context(row)
+    _, _, _, effective_score, side = _score_context(row)
     min_price = _env_float("SUMMARY_ENTRY_MIN_PRICE", _env_float("ENTRY_MIN_PRICE", 200.0))
     min_volume = _env_float("SUMMARY_ENTRY_MIN_VOLUME", _env_float("ENTRY_MIN_VOLUME", _env_float("ENTRY_STRICT_MIN_VOLUME", 30000.0)))
     min_turnover = _env_float("SUMMARY_ENTRY_MIN_TURNOVER", _env_float("ENTRY_MIN_TURNOVER", _env_float("ENTRY_STRICT_MIN_TURNOVER", 10_000_000.0)))
@@ -377,6 +414,54 @@ def _allow_sell_credit_before_pending(row: dict, *, symbol: str, interval: int) 
     return False
 
 
+def _allow_summary_ai_buy_blowoff(row: dict, *, symbol: str) -> bool:
+    """Allow only strong SUMMARY_AI BUY rows to pass the blowoff guard.
+
+    This keeps the blowoff guard active for SELL / Tonosama / weak rows, but avoids
+    the failure pattern where AI_OK BUY candidates are all removed after approval.
+    """
+    if not _env_bool("SUMMARY_AI_BUY_BLOWOFF_BYPASS_ENABLED", True):
+        return False
+    if _is_inago_source(row) or not _is_summary_ai_source(row):
+        return False
+
+    raw_score, buy_score, sell_score, effective_score, side = _score_context(row)
+    if side != "BUY":
+        return False
+
+    close, volume, turnover, high, low, range_pct = _market_context(row)
+    pullback_high_pct = _pullback_from_high_pct(close, high)
+    min_price = _env_float("SUMMARY_AI_BUY_BLOWOFF_MIN_PRICE", _env_float("SUMMARY_ENTRY_MIN_PRICE", _env_float("ENTRY_MIN_PRICE", 200.0)))
+    min_score = _env_float("SUMMARY_AI_BUY_BLOWOFF_MIN_SCORE", _env_float("SUMMARY_ENTRY_MIN_SCORE_BUY", 3.0))
+    min_volume = _env_float("SUMMARY_AI_BUY_BLOWOFF_MIN_VOLUME", _env_float("SUMMARY_ENTRY_MIN_VOLUME", _env_float("ENTRY_STRICT_MIN_VOLUME", 30000.0)))
+    min_turnover = _env_float("SUMMARY_AI_BUY_BLOWOFF_MIN_TURNOVER", _env_float("SUMMARY_ENTRY_MIN_TURNOVER", _env_float("ENTRY_STRICT_MIN_TURNOVER", 10_000_000.0)))
+    min_range = _env_float("SUMMARY_AI_BUY_BLOWOFF_MIN_RANGE_PCT", 0.20)
+    max_range = _env_float("SUMMARY_AI_BUY_BLOWOFF_MAX_RANGE_PCT", 8.00)
+    max_pullback = _env_float("SUMMARY_AI_BUY_BLOWOFF_MAX_PULLBACK_FROM_HIGH_PCT", 0.80)
+
+    ok = (
+        close >= min_price
+        and effective_score >= min_score
+        and volume >= min_volume
+        and turnover >= min_turnover
+        and range_pct >= min_range
+        and range_pct <= max_range
+        and pullback_high_pct <= max_pullback
+    )
+    if ok:
+        logger.warning(
+            "[entry_pipeline] allow SUMMARY_AI BUY despite blowoff symbol=%s close=%.2f high=%.2f low=%.2f score=%.3f buy_score=%.3f sell_score=%.3f volume=%.0f turnover=%.0f range_pct=%.3f pullback_high_pct=%.3f limits(score>=%.2f volume>=%.0f turnover>=%.0f range=%.2f..%.2f pullback<=%.2f)",
+            symbol, close, high, low, effective_score, buy_score, sell_score, volume, turnover, range_pct, pullback_high_pct, min_score, min_volume, min_turnover, min_range, max_range, max_pullback,
+        )
+        return True
+
+    logger.info(
+        "[entry_pipeline] skip blowoff top symbol=%s side=%s source=%s close=%.2f high=%.2f low=%.2f score=%.3f raw_score=%.3f buy_score=%.3f sell_score=%.3f volume=%.0f turnover=%.0f range_pct=%.3f pullback_high_pct=%.3f need_price=%.1f need_score=%.2f need_volume=%.0f need_turnover=%.0f need_range=%.2f..%.2f need_pullback<=%.2f",
+        symbol, side, row.get("source"), close, high, low, effective_score, raw_score, buy_score, sell_score, volume, turnover, range_pct, pullback_high_pct, min_price, min_score, min_volume, min_turnover, min_range, max_range, max_pullback,
+    )
+    return False
+
+
 def _filter_blowoff(rows: List[Any], df_summary: pd.DataFrame | None) -> List[Any]:
     try:
         if df_summary is None or not isinstance(df_summary, pd.DataFrame) or df_summary.empty:
@@ -384,14 +469,20 @@ def _filter_blowoff(rows: List[Any], df_summary: pd.DataFrame | None) -> List[An
         tops = detect_blowoff_top(df_summary)
         if tops is None or tops.empty or "symbol" not in tops.columns:
             return rows
-        top_symbols = set(tops["symbol"].astype(str))
+        top_symbols = set(tops["symbol"].astype(str).str.replace(r"\.0$", "", regex=True))
         filtered = []
         for r in rows:
-            symbol = _get_symbol(r)
+            row = _clean_nan_dict(_row_to_dict(r))
+            symbol = _normalize_symbol(row.get("symbol", _get_symbol(r)))
             if symbol in top_symbols:
-                logger.info("[entry_pipeline] skip blowoff top symbol=%s", symbol)
+                if _allow_summary_ai_buy_blowoff(row, symbol=symbol):
+                    filtered.append(row)
+                    continue
+                # _allow_summary_ai_buy_blowoff already logs detailed metrics for SUMMARY_AI rows.
+                if not _is_summary_ai_source(row):
+                    logger.info("[entry_pipeline] skip blowoff top symbol=%s source=%s", symbol, row.get("source"))
                 continue
-            filtered.append(r)
+            filtered.append(row if row else r)
         return filtered
     except Exception:
         logger.exception("[entry_pipeline] blowoff filter failed")
