@@ -8,7 +8,7 @@ from functools import wraps
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V3-BOARD-MISSING-DEFER-FULL-ROTATION-PENDING-LIQ-FALLBACK"
+VERSION = "V4-BOARD-MISSING-DEFER-FULL-ROTATION-MEMORY-LIQ"
 _INSTALLED = False
 _DEFERRED: dict[tuple[str, str], float] = {}
 
@@ -106,13 +106,24 @@ def _install_pending_liq_patch() -> bool:
         return False
 
 
+def _install_memory_liq_patch() -> bool:
+    try:
+        from core.startup.entry_handler_strict_recent_liquidity_memory_patch import install as _install
+        ok = bool(_install())
+        logger.warning("[SUMMARY AI BOARD MISSING DEFER] chained memory_liq_fallback ok=%s version=%s", ok, VERSION)
+        return ok
+    except Exception:
+        logger.exception("[SUMMARY AI BOARD MISSING DEFER] chained memory_liq_fallback failed version=%s", VERSION)
+        return False
+
+
 def _install_async_snapshot_patch() -> bool:
     try:
         import core.startup.summary_ai_async_entry_patch as ap
         cur = getattr(ap, "_summary_ai_direct_snapshot_execute", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_board_missing_defer_v3", False):
+        if getattr(cur, "_board_missing_defer_v4", False):
             return True
 
         @wraps(cur)
@@ -139,6 +150,7 @@ def _install_async_snapshot_patch() -> bool:
         wrapped._board_missing_defer_v1 = True  # type: ignore[attr-defined]
         wrapped._board_missing_defer_v2 = True  # type: ignore[attr-defined]
         wrapped._board_missing_defer_v3 = True  # type: ignore[attr-defined]
+        wrapped._board_missing_defer_v4 = True  # type: ignore[attr-defined]
         wrapped._original = cur  # type: ignore[attr-defined]
         ap._summary_ai_direct_snapshot_execute = wrapped
         logger.warning("[SUMMARY AI BOARD MISSING DEFER] async snapshot patched version=%s", VERSION)
@@ -164,6 +176,7 @@ def install() -> bool:
     if _INSTALLED:
         _apply_full_rotation_retry()
         _install_pending_liq_patch()
+        _install_memory_liq_patch()
         return True
     try:
         os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY", "1")
@@ -173,14 +186,16 @@ def install() -> bool:
         ok1 = _install_async_snapshot_patch()
         ok2 = _install_fast_builder_log_patch()
         ok3 = _install_pending_liq_patch()
-        _INSTALLED = bool(ok0 or ok1 or ok2 or ok3)
+        ok4 = _install_memory_liq_patch()
+        _INSTALLED = bool(ok0 or ok1 or ok2 or ok3 or ok4)
         logger.warning(
-            "[SUMMARY AI BOARD MISSING DEFER] installed ok=%s full_rotation=%s async=%s builder=%s pending_liq=%s retry_sec=%s ttl=%s version=%s",
+            "[SUMMARY AI BOARD MISSING DEFER] installed ok=%s full_rotation=%s async=%s builder=%s pending_liq=%s memory_liq=%s retry_sec=%s ttl=%s version=%s",
             _INSTALLED,
             ok0,
             ok1,
             ok2,
             ok3,
+            ok4,
             os.getenv("ENTRY_ORDER_BOARD_RETRY_SEC"),
             os.getenv("SUMMARY_AI_BOARD_MISSING_DEFER_TTL_SEC"),
             VERSION,
