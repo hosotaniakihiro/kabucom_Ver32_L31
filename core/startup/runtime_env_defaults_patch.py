@@ -2,6 +2,9 @@
 """
 Compatibility installer for centralized runtime environment defaults.
 
+REV32:
+  - install normal EXIT scalp alignment so SUMMARY_AI / RANKING normal exits use
+    the same quick take/trailing/timeout parameters as Tonosama/Inago exits.
 REV31:
   - install final-liquidity PUSH DB fallback after strict recent-liquidity guard,
     so stale summary DB rows do not block entries when fresh PUSH raw data proves
@@ -26,7 +29,7 @@ from .runtime_settings_ini_loader import load_settings_ini
 from . import runtime_env_defaults as _defaults
 
 logger = logging.getLogger(__name__)
-VERSION = "REV31-RUNTIME-ENV-DEFAULTS-FINAL-LIQ-PUSHDB-FALLBACK"
+VERSION = "REV32-RUNTIME-ENV-DEFAULTS-NORMAL-EXIT-SCALP-ALIGN"
 DEFAULTS_VERSION = getattr(_defaults, "VERSION", "unknown")
 env_bool = getattr(_defaults, "env_bool")
 _INSTALLED = False
@@ -262,6 +265,10 @@ def _install_tonosama_exit_source_infer(context: str) -> bool:
     return _safe_install("tonosama exit infer", context, TRADING_CONTEXTS, "DISABLE_TONOSAMA_EXIT_SOURCE_INFER_PATCH", "tonosama_exit_source_infer_patch")
 
 
+def _install_normal_exit_scalp_align(context: str) -> bool:
+    return _safe_install("normal exit scalp align", context, TRADING_CONTEXTS, "DISABLE_NORMAL_EXIT_SCALP_ALIGN_PATCH", "normal_exit_scalp_align_patch")
+
+
 def _install_tonosama_pending_candidate_audit(context: str) -> bool:
     return _safe_install("tonosama pending candidate audit", context, TRADING_CONTEXTS, "DISABLE_TONOSAMA_PENDING_CANDIDATE_AUDIT_PATCH", "tonosama_pending_candidate_audit_patch")
 
@@ -335,11 +342,12 @@ def install() -> bool:
         strict_final_liq_ok = _install_strict_final_liquidity_guard(context)
         strict_final_liq_pushdb_ok = _install_strict_final_liq_pushdb_fallback(context)
         tonosama_exit_infer_ok = _install_tonosama_exit_source_infer(context)
+        normal_exit_scalp_ok = _install_normal_exit_scalp_align(context)
         tonosama_pending_audit_ok = _install_tonosama_pending_candidate_audit(context)
         daytrade_credit_ok = _install_daytrade_credit_force_close(context)
         _INSTALLED = True
         logger.warning(
-            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s ranking_api_sleep=%s ranking_spacing_applied=%s strict_entry_defaults=%s intraday_load_guard=%s yahoo_parallel_empty=%s ranking_legacy_inline=%s summary_lock_pressure=%s push_summary_db_source=%s summary_db_realtime=%s database_owner=%s full_pipeline=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s summary_ai_safety=%s summary_ai_direct_timeout_continue=%s summary_ai_atr_1m_repair=%s summary_parallel_reset=%s tonosama_orphan_prune=%s summary_pending_stale=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s strict_final_liq_pushdb=%s tonosama_exit_infer=%s tonosama_pending_audit=%s daytrade_credit=%s verbose=%s",
+            "[RUNTIME ENV DEFAULTS PATCH] installed version=%s defaults=%s registry=%s settings_ini=%s settings_applied=%s builtins_applied=%s context=%s site_groups=%s user_groups=%s ranking_api_sleep=%s ranking_spacing_applied=%s strict_entry_defaults=%s intraday_load_guard=%s yahoo_parallel_empty=%s ranking_legacy_inline=%s summary_lock_pressure=%s push_summary_db_source=%s summary_db_realtime=%s database_owner=%s full_pipeline=%s rescue=%s ranking_rescue=%s tonosama_rescue=%s entry_count_unblock=%s summary_ai_safety=%s summary_ai_direct_timeout_continue=%s summary_ai_atr_1m_repair=%s summary_parallel_reset=%s tonosama_orphan_prune=%s summary_pending_stale=%s entry_fire_rescue=%s ranking_entry_rescue=%s low_vol_guard=%s push_register_recovery=%s day_position_guard=%s strict_final_liq=%s strict_final_liq_pushdb=%s tonosama_exit_infer=%s normal_exit_scalp=%s tonosama_pending_audit=%s daytrade_credit=%s verbose=%s",
             VERSION, DEFAULTS_VERSION, REGISTRY_VERSION, SETTINGS_INI_VERSION, len(settings_applied), len(applied), context,
             ",".join(SITE_GROUP_ORDER), ",".join(USER_GROUP_ORDER), os.environ.get("RANKING_API_CALL_SLEEP_SEC"), ranking_spacing_applied,
             strict_entry_defaults_ok, intraday_load_guard_ok, yahoo_parallel_empty_ok, ranking_legacy_inline_ok, summary_lock_pressure_ok,
@@ -348,7 +356,7 @@ def install() -> bool:
             entry_count_unblock_ok, summary_ai_safety_ok, summary_ai_direct_timeout_continue_ok, summary_ai_atr_1m_repair_ok,
             summary_parallel_reset_ok, tonosama_orphan_prune_ok, summary_pending_stale_ok, entry_fire_rescue_ok, ranking_entry_rescue_ok,
             low_vol_guard_ok, push_register_recovery_ok, day_position_guard_ok, strict_final_liq_ok, strict_final_liq_pushdb_ok,
-            tonosama_exit_infer_ok, tonosama_pending_audit_ok, daytrade_credit_ok, env_bool("RUNTIME_ENV_DEFAULTS_VERBOSE", False),
+            tonosama_exit_infer_ok, normal_exit_scalp_ok, tonosama_pending_audit_ok, daytrade_credit_ok, env_bool("RUNTIME_ENV_DEFAULTS_VERBOSE", False),
         )
         return True
     except Exception:
