@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_ai_runtime_consistency_patch.py
-# Version: V3-HOOK-DIRECT-INPUT-SELECTION-AND-BLOWOFF-PROTECT
+# Version: V4-IDEMPOTENT-RUNTIME-CONSISTENCY
 # ------------------------------------------------------------
 # Purpose:
 #   1) Summary-AI safety guard must not block a fresh direct 1m df just because
 #      an older global_context summary_history remains cached.
 #   2) Runtime final-board compatibility patches must not replace executor
 #      selection with a pool that collapses AI_OK rows before rolling retry.
-#   3) Executor should not waste approved slots on rows that the downstream
-#      entry_pipeline will immediately reject as blowoff.
+#   3) Ensure blowoff protection is installed without repeatedly re-wrapping or
+#      logging every watcher tick.
 #
-# This does not relax low-move / blowoff / liquidity / board guards.  It only
-# applies existing strict checks earlier, before approved slots are consumed.
+# This does not relax low-move / blowoff / liquidity / board guards. It only
+# keeps the runtime hook chain consistent and idempotent.
 # ============================================================
 from __future__ import annotations
 
@@ -22,15 +22,16 @@ import os
 import threading
 import time
 from functools import wraps
-from typing import Any
+from typing import Any, Sequence
 
 logger = logging.getLogger(__name__)
-VERSION = "V3-HOOK-DIRECT-INPUT-SELECTION-AND-BLOWOFF-PROTECT"
+VERSION = "V4-IDEMPOTENT-RUNTIME-CONSISTENCY"
 _INSTALLED = False
 _WATCHER_STARTED = False
 _TLS = threading.local()
 _LAST_DIRECT_DF: Any = None
 _LAST_DIRECT_AT: float = 0.0
+_BLOWOFF_MARKERS = tuple(f"_summary_ai_blowoff_prefilter_v{i}" for i in range(1, 10))
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -149,14 +150,42 @@ def _restore_direct_context(prev: Any) -> None:
         pass
 
 
+def _has_any_marker(fn: Any, markers: Sequence[str]) -> bool:
+    return any(bool(getattr(fn, m, False)) for m in markers)
+
+
+def _iter_wrapper_chain(fn: Any, *, limit: int = 32):
+    seen: set[int] = set()
+    cur = fn
+    for _ in range(limit):
+        if not callable(cur):
+            return
+        ident = id(cur)
+        if ident in seen:
+            return
+        seen.add(ident)
+        yield cur
+        nxt = getattr(cur, "_original", None)
+        if not callable(nxt):
+            return
+        cur = nxt
+
+
+def _chain_has_marker(fn: Any, markers: Sequence[str]) -> bool:
+    return any(_has_any_marker(x, markers) for x in _iter_wrapper_chain(fn))
+
+
 def _patch_hook_direct_context() -> bool:
+    """Return True only when this call changed runtime state."""
     if not _env_bool("SUMMARY_AI_DIRECT_INPUT_FRESH_CHECK", True):
         return False
     try:
         import scheduler_jobs.summary.summary_ai_entry_hook_v20 as hook
         cur = getattr(hook, "run_summary_ai_entry_safe", None)
-        if not callable(cur) or getattr(cur, "_summary_ai_hook_direct_input_v3", False):
-            return callable(cur)
+        if not callable(cur):
+            return False
+        if getattr(cur, "_summary_ai_hook_direct_input_v3", False):
+            return False
 
         @wraps(cur)
         def _run_summary_ai_entry_safe_with_direct_df(*args: Any, **kwargs: Any):
@@ -183,8 +212,10 @@ def _patch_hook_direct_context() -> bool:
 
 
 def _patch_safety_guard_context() -> bool:
+    """Return True only when this call changed runtime state."""
     if not _env_bool("SUMMARY_AI_DIRECT_INPUT_FRESH_CHECK", True):
         return False
+    changed = False
     try:
         import core.startup.summary_ai_candidate_refill_patch as crp
         import trading.entry.summary_ai.runner as runner
@@ -207,6 +238,7 @@ def _patch_safety_guard_context() -> bool:
             _get_push_1m_context_direct_first._summary_ai_direct_input_v1 = True  # type: ignore[attr-defined]
             _get_push_1m_context_direct_first._original = old_get  # type: ignore[attr-defined]
             crp._get_push_1m_context = _get_push_1m_context_direct_first
+            changed = True
 
         cur = getattr(runner, "run_summary_ai_entry_from_df", None)
         if callable(cur) and not getattr(cur, "_summary_ai_direct_input_v3", False):
@@ -223,21 +255,24 @@ def _patch_safety_guard_context() -> bool:
             _run_with_direct_df_context._summary_ai_direct_input_v1 = True  # type: ignore[attr-defined]
             _run_with_direct_df_context._original = cur  # type: ignore[attr-defined]
             runner.run_summary_ai_entry_from_df = _run_with_direct_df_context
-        logger.warning("[SUMMARY AI DIRECT INPUT GUARD] installed version=%s", VERSION)
-        return True
+            changed = True
+        if changed:
+            logger.warning("[SUMMARY AI DIRECT INPUT GUARD] installed version=%s", VERSION)
+        return changed
     except Exception:
         logger.debug("[SUMMARY AI DIRECT INPUT GUARD] install not ready", exc_info=True)
         return False
 
 
 def _patch_executor_selection() -> bool:
+    """Return True only when this call changed runtime state."""
     if not _env_bool("SUMMARY_AI_PROTECT_EXECUTOR_SELECTION", True):
         return False
     try:
         import trading.entry.summary_ai.executor as ex
         cur = getattr(ex, "_select_ai_ok_items", None)
         if callable(cur) and getattr(cur, "_summary_ai_executor_selection_protect_v3", False):
-            return True
+            return False
         def _select_ai_ok_items_protected(ok_items, *, max_entries: int):
             try:
                 pool = ex._selected_pool(ok_items, max_entries=max_entries)
@@ -264,28 +299,48 @@ def _patch_executor_selection() -> bool:
 
 
 def _install_blowoff_prefilter() -> bool:
+    """Install the reentrant-safe blowoff prefilter once.
+
+    Older V1 executor-base-filter prefilter caused noisy watcher logs and could
+    coexist with the newer executor wrapper.  Prefer the V9 reentrant-safe module
+    and do not report a change when it is already present anywhere in the chain.
+    """
     if not _env_bool("SUMMARY_AI_EXECUTOR_BLOWOFF_PREFILTER", True):
         return False
     try:
-        from core.startup import summary_ai_executor_blowoff_prefilter_patch as bp
+        import trading.entry.summary_ai.executor as ex
+        cur = getattr(ex, "execute_ai_ok_entries_bulk", None)
+        if callable(cur) and _chain_has_marker(cur, _BLOWOFF_MARKERS):
+            return False
+
+        from core.startup import summary_ai_blowoff_prefilter_patch as bp
         fn = getattr(bp, "install", None)
-        ok = bool(fn()) if callable(fn) else False
+        if not callable(fn):
+            return False
+        try:
+            ok = bool(fn(reason="runtime_consistency"))
+        except TypeError:
+            ok = bool(fn())
         if ok:
             logger.warning("[SUMMARY AI RUNTIME CONSISTENCY] blowoff prefilter installed via=%s version=%s", getattr(bp, "VERSION", "unknown"), VERSION)
-        return ok
+        return bool(ok)
     except Exception:
         logger.debug("[SUMMARY AI RUNTIME CONSISTENCY] blowoff prefilter install not ready", exc_info=True)
         return False
 
 
 def _enforce(reason: str = "install") -> bool:
-    ok_hook = _patch_hook_direct_context()
-    ok1 = _patch_safety_guard_context()
-    ok2 = _patch_executor_selection()
-    ok3 = _install_blowoff_prefilter()
-    if ok_hook or ok1 or ok2 or ok3:
-        logger.warning("[SUMMARY AI RUNTIME CONSISTENCY] enforce reason=%s hook=%s direct_input=%s selection=%s blowoff_prefilter=%s version=%s", reason, ok_hook, ok1, ok2, ok3, VERSION)
-    return bool(ok_hook or ok1 or ok2 or ok3)
+    changed_hook = _patch_hook_direct_context()
+    changed_direct = _patch_safety_guard_context()
+    changed_selection = _patch_executor_selection()
+    changed_blowoff = _install_blowoff_prefilter()
+    changed = bool(changed_hook or changed_direct or changed_selection or changed_blowoff)
+    if changed:
+        logger.warning(
+            "[SUMMARY AI RUNTIME CONSISTENCY] enforce reason=%s hook=%s direct_input=%s selection=%s blowoff_prefilter=%s version=%s",
+            reason, changed_hook, changed_direct, changed_selection, changed_blowoff, VERSION,
+        )
+    return changed
 
 
 def _watcher() -> None:
@@ -305,13 +360,13 @@ def install() -> bool:
     if not _env_bool("SUMMARY_AI_RUNTIME_CONSISTENCY_ENABLED", True):
         logger.warning("[SUMMARY AI RUNTIME CONSISTENCY] disabled by env")
         return False
-    ok = _enforce(reason="install")
+    changed = _enforce(reason="install")
     if not _WATCHER_STARTED and _env_bool("SUMMARY_AI_RUNTIME_CONSISTENCY_WATCHER", True):
         _WATCHER_STARTED = True
         threading.Thread(target=_watcher, name="summary-ai-runtime-consistency-watch", daemon=True).start()
         logger.warning("[SUMMARY AI RUNTIME CONSISTENCY] watcher started version=%s", VERSION)
-    _INSTALLED = bool(ok or _WATCHER_STARTED)
-    logger.warning("[SUMMARY AI RUNTIME CONSISTENCY] installed ok=%s version=%s", _INSTALLED, VERSION)
+    _INSTALLED = bool(changed or _WATCHER_STARTED)
+    logger.warning("[SUMMARY AI RUNTIME CONSISTENCY] installed ok=%s changed=%s version=%s", _INSTALLED, changed, VERSION)
     return _INSTALLED
 
 
