@@ -1,16 +1,21 @@
 # ============================================================
 # File   : core/startup/summary_entry_pending_duplicate_registered_patch.py
-# Version: V2-DIRECT-PENDING-REGISTER-NO-BLOCK
+# Version: V3-DIRECT-PENDING-REGISTER-TIMEBOX
 # ------------------------------------------------------------
 # 目的:
 #   SUMMARY AI direct dispatch が approved rows を持っていても、
-#   pending_manager.add_pending() の wrapper chain が詰まると、
+#   pending_manager.add_pending() / pending root 周辺の wrapper chain が詰まると、
 #   pending登録完了ログまで戻らず発注パイプラインが止まる。
 #
 # 対策:
 #   SUMMARY_ENTRY 用の pending 登録は、この patch 内で pending root へ
-#   直接・短時間で登録する。既存 identity は duplicate registered 扱い。
-#   BUY/SELL 混在は引き続き reject し、板なし hard block 等の後段安全ガードは維持する。
+#   直接・短時間で登録する。さらに direct 登録自体も timebox し、
+#   1銘柄の pending 登録で詰まっても次の銘柄へ進める。
+#
+# 方針:
+#   - BUY/SELL 混在は引き続き reject。
+#   - 板なし hard block 等の後段安全ガードは維持。
+#   - pending 登録が詰まった銘柄は registered=0/rejected として明示ログを出す。
 # ============================================================
 
 from __future__ import annotations
@@ -18,10 +23,13 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import queue
+import threading
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V2-DIRECT-PENDING-REGISTER-NO-BLOCK"
+VERSION = "V3-DIRECT-PENDING-REGISTER-TIMEBOX"
 
 _INSTALLED = False
 _ORIG_REGISTER_PENDING_ENTRIES = None
@@ -36,6 +44,19 @@ def _env_bool(name: str, default: bool = True) -> bool:
         return str(v).strip().lower() in _TRUE_SET
     except Exception:
         return bool(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        x = float(str(v).strip())
+        if x <= 0:
+            return float(default)
+        return x
+    except Exception:
+        return float(default)
 
 
 def _safe_symbol(row: dict[str, Any]) -> str:
@@ -194,6 +215,50 @@ def _direct_add_pending(entry: dict[str, Any]) -> tuple[bool, bool, str]:
     return True, False, "direct_added"
 
 
+def _direct_add_pending_timeboxed(entry: dict[str, Any], *, timeout_sec: float) -> tuple[bool, bool, str]:
+    """Run direct pending add in a daemon thread so one stuck symbol cannot stall dispatch."""
+    if timeout_sec <= 0:
+        return _direct_add_pending(entry)
+
+    symbol = _safe_symbol(entry)
+    result_q: queue.Queue[tuple[bool, bool, str] | BaseException] = queue.Queue(maxsize=1)
+    started = time.monotonic()
+
+    def _worker() -> None:
+        try:
+            result_q.put(_direct_add_pending(entry), block=False)
+        except BaseException as exc:  # noqa: BLE001 - keep patch robust at startup
+            try:
+                result_q.put(exc, block=False)
+            except Exception:
+                pass
+
+    th = threading.Thread(target=_worker, name=f"summary-pending-add-{symbol or 'unknown'}", daemon=True)
+    th.start()
+    try:
+        res = result_q.get(timeout=timeout_sec)
+    except queue.Empty:
+        elapsed = time.monotonic() - started
+        logger.error(
+            "[SUMMARY ENTRY DUP REGISTER PATCH] pending add timeout symbol=%s timeout=%.3fs elapsed=%.3fs version=%s -> skip this symbol",
+            symbol,
+            timeout_sec,
+            elapsed,
+            VERSION,
+        )
+        return False, False, f"pending_add_timeout:{timeout_sec:.3f}s"
+
+    if isinstance(res, BaseException):
+        logger.exception(
+            "[SUMMARY ENTRY DUP REGISTER PATCH] pending add worker exception symbol=%s version=%s",
+            symbol,
+            VERSION,
+            exc_info=(type(res), res, res.__traceback__),
+        )
+        return False, False, f"pending_add_error:{res}"
+    return res
+
+
 def _snapshot_root_safe() -> dict[str, int]:
     try:
         root = _ensure_root()
@@ -202,13 +267,27 @@ def _snapshot_root_safe() -> dict[str, int]:
         return {}
 
 
+def _snapshot_root_summary() -> str:
+    try:
+        snap = _snapshot_root_safe()
+        if not snap:
+            return "{}"
+        items = list(snap.items())[:20]
+        suffix = "" if len(snap) <= 20 else f"...+{len(snap) - 20}"
+        return "{" + ",".join(f"{k}:{v}" for k, v in items) + "}" + suffix
+    except Exception:
+        return "{}"
+
+
 def _patched_register_pending_entries(entries):
+    timeout_sec = _env_float("SUMMARY_ENTRY_PENDING_ADD_TIMEOUT_SEC", 2.5)
     try:
         import trading.summary.summary_entry as se
 
         registered = 0
         rejected = 0
         duplicate_existing = 0
+        timed_out = 0
 
         if not entries:
             logger.info("[SUMMARY ENTRY DUP REGISTER PATCH] skipped reason=no_entries version=%s", VERSION)
@@ -243,11 +322,11 @@ def _patched_register_pending_entries(entries):
                     pass
 
                 logger.info(
-                    "[SUMMARY ENTRY DUP REGISTER PATCH] pending add request symbol=%s side=%s entry_type=%s source=%s interval=%s version=%s",
-                    entry.get("symbol"), entry.get("side"), entry.get("entry_type"), entry.get("source"), entry.get("interval"), VERSION,
+                    "[SUMMARY ENTRY DUP REGISTER PATCH] pending add request symbol=%s side=%s entry_type=%s source=%s interval=%s timeout=%.3fs version=%s",
+                    entry.get("symbol"), entry.get("side"), entry.get("entry_type"), entry.get("source"), entry.get("interval"), timeout_sec, VERSION,
                 )
 
-                ok, dup, reason = _direct_add_pending(entry)
+                ok, dup, reason = _direct_add_pending_timeboxed(entry, timeout_sec=timeout_sec)
                 if ok:
                     registered += 1
                     if dup:
@@ -256,23 +335,24 @@ def _patched_register_pending_entries(entries):
                     continue
 
                 rejected += 1
+                if str(reason).startswith("pending_add_timeout"):
+                    timed_out += 1
                 logger.warning(
                     "[SUMMARY ENTRY DUP REGISTER PATCH] pending rejected symbol=%s side=%s reason=%s root=%s version=%s",
-                    symbol, side, reason, _snapshot_root_safe(), VERSION,
+                    symbol, side, reason, _snapshot_root_summary(), VERSION,
                 )
             except Exception:
                 rejected += 1
                 logger.exception("[SUMMARY ENTRY DUP REGISTER PATCH] pending add failed entry=%s version=%s", entry, VERSION)
 
         logger.warning(
-            "[SUMMARY ENTRY DUP REGISTER PATCH] pending registration done entries=%s registered=%s duplicate_existing=%s rejected=%s root=%s version=%s",
-            len(entries or []), registered, duplicate_existing, rejected, _snapshot_root_safe(), VERSION,
+            "[SUMMARY ENTRY DUP REGISTER PATCH] pending registration done entries=%s registered=%s duplicate_existing=%s rejected=%s timed_out=%s root=%s version=%s",
+            len(entries or []), registered, duplicate_existing, rejected, timed_out, _snapshot_root_summary(), VERSION,
         )
         return registered
     except Exception:
-        logger.exception("[SUMMARY ENTRY DUP REGISTER PATCH] patched register failed version=%s", VERSION)
-        if callable(_ORIG_REGISTER_PENDING_ENTRIES):
-            return _ORIG_REGISTER_PENDING_ENTRIES(entries)
+        # Do not fall back to the original register path here: the original path is the one that can block.
+        logger.exception("[SUMMARY ENTRY DUP REGISTER PATCH] patched register failed no_fallback version=%s", VERSION)
         return 0
 
 
@@ -286,16 +366,21 @@ def install() -> bool:
         if not callable(cur):
             logger.warning("[SUMMARY ENTRY DUP REGISTER PATCH] target missing version=%s", VERSION)
             return False
-        if getattr(cur, "_summary_entry_dup_registered_v2", False):
+        if getattr(cur, "_summary_entry_dup_registered_v3", False):
             _INSTALLED = True
             return True
         _ORIG_REGISTER_PENDING_ENTRIES = getattr(cur, "_original", cur)
         _patched_register_pending_entries._summary_entry_dup_registered_v1 = True  # type: ignore[attr-defined]
         _patched_register_pending_entries._summary_entry_dup_registered_v2 = True  # type: ignore[attr-defined]
+        _patched_register_pending_entries._summary_entry_dup_registered_v3 = True  # type: ignore[attr-defined]
         _patched_register_pending_entries._original = _ORIG_REGISTER_PENDING_ENTRIES  # type: ignore[attr-defined]
         se.register_pending_entries = _patched_register_pending_entries
         _INSTALLED = True
-        logger.warning("[SUMMARY ENTRY DUP REGISTER PATCH] installed version=%s direct_pending_register=True", VERSION)
+        logger.warning(
+            "[SUMMARY ENTRY DUP REGISTER PATCH] installed version=%s direct_pending_register=True timebox=True timeout=%.3fs no_fallback=True",
+            VERSION,
+            _env_float("SUMMARY_ENTRY_PENDING_ADD_TIMEOUT_SEC", 2.5),
+        )
         return True
     except Exception:
         logger.exception("[SUMMARY ENTRY DUP REGISTER PATCH] install failed version=%s", VERSION)
