@@ -7,7 +7,7 @@ import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V3.6-SUMMARY-AI-STRICT-BOARD-LIMIT-FALLBACK"
+VERSION = "V3.7-SUMMARY-AI-BOARD-MISSING-HARD-BLOCK"
 _INSTALLED = False
 _ORIGINAL_BUILD_ENTRY_ORDER = None
 
@@ -15,7 +15,7 @@ _TRUE_SET = {"1", "true", "yes", "y", "on", "ok", "allow", "allowed", "enable", 
 _SUMMARY_SOURCE_SET = {"SUMMARY", "SUMMARY_AI", "PUSH", "PUSH_SUMMARY", "STOCK_SUMMARY"}
 
 
-def _safe_float(v: Any, default: float) -> float:
+def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
         if v is None or str(v).strip() == "":
             return float(default)
@@ -240,46 +240,11 @@ def _install_range_consistency_chain() -> bool:
 
 def _install_strict_board_rest_chain() -> bool:
     try:
-        from core.startup.summary_ai_strict_board_rest_patch import install as _install_board_rest
-        return bool(_install_board_rest())
+        from core.startup.summary_ai_strict_board_rest_patch import install as _install_board_policy
+        return bool(_install_board_policy())
     except Exception:
-        logger.exception("[SUMMARY AI FAST ORDER BUILDER] strict board REST chain install failed version=%s", VERSION)
+        logger.exception("[SUMMARY AI FAST ORDER BUILDER] strict board policy chain install failed version=%s", VERSION)
         return False
-
-
-def _retry_strict_board_missing_with_limit(base, eob: Any, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any):
-    try:
-        if not isinstance(result, dict) or result.get("reason") != "STRICT_BOARD_MISSING":
-            return result
-        if not _is_summary_ai_order(kwargs):
-            return result
-        row = kwargs.get("entry_row") if isinstance(kwargs.get("entry_row"), dict) else {}
-        price = _safe_float(_first(row, ("close_price", "price", "current_price", "close", "vwap", "last_price"), 0.0), 0.0)
-        if price <= 0:
-            logger.warning("[SUMMARY AI FAST ORDER BUILDER] strict board fallback skipped no price symbol=%s side=%s version=%s", kwargs.get("symbol"), kwargs.get("side"), VERSION)
-            return result
-        old_require = getattr(eob, "ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY", None)
-        try:
-            setattr(eob, "ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY", False)
-            retry = base(*args, **kwargs)
-        finally:
-            try:
-                if old_require is not None:
-                    setattr(eob, "ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY", old_require)
-            except Exception:
-                pass
-        if isinstance(retry, dict) and retry.get("ok"):
-            detail = retry.setdefault("detail", {})
-            if isinstance(detail, dict):
-                detail["strict_board_missing_limit_fallback"] = True
-                detail["fallback_price_source"] = "summary_close_current_vwap"
-            logger.warning("[SUMMARY AI FAST ORDER BUILDER] STRICT_BOARD_MISSING converted to safe LIMIT fallback symbol=%s side=%s detail=%s version=%s", kwargs.get("symbol"), kwargs.get("side"), detail, VERSION)
-            return retry
-        logger.warning("[SUMMARY AI FAST ORDER BUILDER] strict board fallback retry NG symbol=%s side=%s retry_reason=%s version=%s", kwargs.get("symbol"), kwargs.get("side"), retry.get("reason") if isinstance(retry, dict) else type(retry).__name__, VERSION)
-        return result
-    except Exception:
-        logger.exception("[SUMMARY AI FAST ORDER BUILDER] strict board fallback failed symbol=%s side=%s version=%s", kwargs.get("symbol"), kwargs.get("side"), VERSION)
-        return result
 
 
 def install() -> bool:
@@ -289,15 +254,25 @@ def install() -> bool:
     try:
         os.environ.setdefault("ENTRY_ORDER_BOARD_RETRY_SEC", "0.8")
         os.environ.setdefault("ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", "0.2")
+        # Board missing is a hard block by policy. Do not convert it to close/vwap fallback.
+        os.environ["ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY"] = "1"
+        os.environ["ENTRY_BOARD_MISSING_HARD_BLOCK"] = "1"
+        os.environ["ENTRY_LIMIT_ALLOW_WITHOUT_BOARD"] = "0"
+
         from trading.handlers import entry_order_builder as eob
+        try:
+            setattr(eob, "ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY", True)
+        except Exception:
+            pass
         logger_patched = _ensure_entry_order_builder_logger(eob)
         range_consistency = _install_range_consistency_chain()
-        strict_board_rest = _install_strict_board_rest_chain()
+        board_policy = _install_strict_board_rest_chain()
         old_retry, new_retry = _set_cap(eob, "ENTRY_ORDER_BOARD_RETRY_SEC", _safe_float(os.environ.get("ENTRY_ORDER_BOARD_RETRY_SEC"), 0.8))
         old_interval, new_interval = _set_cap(eob, "ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", _safe_float(os.environ.get("ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC"), 0.2))
         cur = getattr(eob, "build_entry_order", None)
-        if callable(cur) and not getattr(cur, "_summary_ai_fast_order_builder_v36", False):
+        if callable(cur) and not getattr(cur, "_summary_ai_fast_order_builder_v37", False):
             _ORIGINAL_BUILD_ENTRY_ORDER = getattr(cur, "_original", cur)
+
             def _patched_build_entry_order(*args, **kwargs):
                 summary_like = _is_summary_ai_order(kwargs)
                 symbol = kwargs.get("symbol")
@@ -316,10 +291,13 @@ def install() -> bool:
                     else:
                         raise
                 if summary_like:
-                    result = _retry_strict_board_missing_with_limit(_ORIGINAL_BUILD_ENTRY_ORDER, eob, args, kwargs, result)
+                    # Important: keep STRICT_BOARD_MISSING as NG. Board missing implies low liquidity / unsafe entry.
+                    if isinstance(result, dict) and result.get("reason") == "STRICT_BOARD_MISSING":
+                        logger.warning("[SUMMARY AI FAST ORDER BUILDER] board missing hard block kept symbol=%s side=%s detail=%s version=%s", symbol, side, result.get("detail"), VERSION)
                     logger.warning("[SUMMARY AI FAST ORDER BUILDER] done symbol=%s side=%s ok=%s reason=%s detail=%s version=%s", symbol, side, isinstance(result, dict) and result.get("ok"), result.get("reason") if isinstance(result, dict) else type(result).__name__, result.get("detail") if isinstance(result, dict) else None, VERSION)
                 return result
-            for marker in ("_summary_ai_fast_order_builder_v1", "_summary_ai_fast_order_builder_v2", "_summary_ai_fast_order_builder_v3", "_summary_ai_fast_order_builder_v31", "_summary_ai_fast_order_builder_v32", "_summary_ai_fast_order_builder_v33", "_summary_ai_fast_order_builder_v34", "_summary_ai_fast_order_builder_v35", "_summary_ai_fast_order_builder_v36"):
+
+            for marker in ("_summary_ai_fast_order_builder_v1", "_summary_ai_fast_order_builder_v2", "_summary_ai_fast_order_builder_v3", "_summary_ai_fast_order_builder_v31", "_summary_ai_fast_order_builder_v32", "_summary_ai_fast_order_builder_v33", "_summary_ai_fast_order_builder_v34", "_summary_ai_fast_order_builder_v35", "_summary_ai_fast_order_builder_v36", "_summary_ai_fast_order_builder_v37"):
                 setattr(_patched_build_entry_order, marker, True)
             _patched_build_entry_order._original = _ORIGINAL_BUILD_ENTRY_ORDER  # type: ignore[attr-defined]
             eob.build_entry_order = _patched_build_entry_order
@@ -329,7 +307,7 @@ def install() -> bool:
             except Exception:
                 logger.debug("[SUMMARY AI FAST ORDER BUILDER] entry_controller alias patch skipped", exc_info=True)
         _INSTALLED = True
-        logger.warning("[SUMMARY AI FAST ORDER BUILDER] installed version=%s retry_sec %s->%s interval %s->%s logger_patched=%s range_repair=True source_detect=True snapshot_no_order_fallback=True ranking_range_rescue=True range_consistency=%s strict_board_rest=%s strict_board_limit_fallback=True", VERSION, old_retry, new_retry, old_interval, new_interval, logger_patched, range_consistency, strict_board_rest)
+        logger.warning("[SUMMARY AI FAST ORDER BUILDER] installed version=%s retry_sec %s->%s interval %s->%s logger_patched=%s range_repair=True source_detect=True snapshot_no_order_fallback=True ranking_range_rescue=True range_consistency=%s board_policy=%s strict_board_limit_fallback=False", VERSION, old_retry, new_retry, old_interval, new_interval, logger_patched, range_consistency, board_policy)
         return True
     except Exception:
         logger.exception("[SUMMARY AI FAST ORDER BUILDER] install failed version=%s", VERSION)
