@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/summary/pipeline/entry_pipeline.py
-# Version: Ver3.0-SUMMARY-AI-BLOWOFF-ALLOW
+# Version: Ver3.0-SUMMARY-AI-BLOWOFF-RESCUE
 # ------------------------------------------------------------
 # ✔ AI approved rows → entry execution
 # ✔ SUMMARY AI通常エントリーとイナゴ liquidity_shock 条件を分離
@@ -8,7 +8,8 @@
 # ✔ Ver2.8: Summary AI承認済み候補が liquidity だけで全落ちする問題を救済
 # ✔ Ver2.9: 低流動性銘柄へのエントリーを防ぐため、rescueでも
 #            出来高3万株・売買代金1000万円を必須化
-# ✔ Ver3.0: SUMMARY/PUSH/AI_OK 候補は blowoff top だけで全落ちさせない
+# ✔ Ver3.0: Summary-AI承認済みの強いBUYを entry_pipeline 側の
+#            blowoff二重判定で全落ちさせない救済を追加
 # ============================================================
 
 from __future__ import annotations
@@ -110,6 +111,19 @@ def _env_bool(name: str, default: bool = True) -> bool:
         return bool(default)
 
 
+def _truthy(v: Any) -> bool:
+    try:
+        if isinstance(v, bool):
+            return v
+        if v is None:
+            return False
+        if isinstance(v, (int, float)):
+            return bool(v)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "approved", "ai_ok", "buy", "sell"}
+    except Exception:
+        return False
+
+
 def _clean_nan_dict(d: dict) -> dict:
     out = {}
     try:
@@ -168,6 +182,32 @@ def _resolve_side_from_row(row: dict) -> str:
     buy_score = _safe_float(_first(row, ["buy_score", "score_buy"], 0.0), 0.0)
     sell_score = _safe_float(_first(row, ["sell_score", "score_sell"], 0.0), 0.0)
     return _resolve_side(row, buy_score=buy_score, sell_score=sell_score, raw_score=raw_score)
+
+
+def _effective_score_from_row(row: dict) -> float:
+    raw_score = abs(_safe_float(_first(row, ["score", "score_total", "final_score", "display_score"], 0.0), 0.0))
+    buy_score = _safe_float(_first(row, ["buy_score", "score_buy"], 0.0), 0.0)
+    sell_score = _safe_float(_first(row, ["sell_score", "score_sell"], 0.0), 0.0)
+    return max(raw_score, buy_score, sell_score)
+
+
+def _confidence_from_row(row: dict) -> float:
+    return _safe_float(_first(row, ["confidence", "conf", "ai_conf", "ai_confidence", "approval_confidence"], 0.0), 0.0)
+
+
+def _is_summary_ai_source(row: dict) -> bool:
+    source = str(row.get("source") or "").upper()
+    entry_type = str(row.get("entry_type") or "").upper()
+    strategy = str(row.get("strategy") or row.get("entry_strategy") or "").upper()
+    reason = str(row.get("reason") or row.get("ai_reason") or "")
+    reason_u = reason.upper()
+    return (
+        source in {"SUMMARY", "SUMMARY_AI", "PUSH"}
+        or entry_type == "SUMMARY_AI"
+        or "SUMMARY_AI" in strategy
+        or "SUMMARY AI" in reason_u
+        or "SRC=SUMMARY" in reason_u
+    )
 
 
 def _resolve_summary_liquidity_min_score(row: dict, *, side: str) -> float:
@@ -283,28 +323,6 @@ def _is_inago_source(row: dict) -> bool:
     return ("INAGO" in source or "TONOSAMA" in source or "LIQUIDITY_SHOCK" in source or "INAGO" in strategy or "TONOSAMA" in strategy or "LIQUIDITY_SHOCK" in strategy or "LIQUIDITY" in reason and "SHOCK" in reason)
 
 
-def _is_summary_ai_source(row: dict) -> bool:
-    try:
-        if _is_inago_source(row):
-            return False
-        source = str(row.get("source") or "").strip().upper()
-        entry_type = str(row.get("entry_type") or row.get("type") or "").strip().upper()
-        strategy = str(row.get("strategy") or row.get("entry_strategy") or "").strip().upper()
-        reason = str(row.get("reason") or row.get("ai_reason") or "").strip().upper()
-        decision = str(row.get("decision") or row.get("entry_decision") or row.get("ai_decision") or "").strip().upper()
-        return (
-            source in {"SUMMARY", "SUMMARY_AI", "PUSH"}
-            or entry_type == "SUMMARY_AI"
-            or strategy == "SUMMARY_AI"
-            or "SUMMARY_AI" in reason
-            or "SRC=SUMMARY" in reason
-            or decision == "AI_OK"
-            or bool(row.get("ai_ok"))
-        )
-    except Exception:
-        return False
-
-
 def _range_pct(row: dict, close: float) -> float:
     high = _safe_float(_first(row, ["high", "high_price"], 0.0), 0.0)
     low = _safe_float(_first(row, ["low", "low_price"], 0.0), 0.0)
@@ -400,6 +418,52 @@ def _allow_sell_credit_before_pending(row: dict, *, symbol: str, interval: int) 
     return False
 
 
+def _allow_summary_ai_blowoff_rescue(row: dict, *, symbol: str) -> bool:
+    """Allow only strong Summary-AI BUY approvals to pass duplicate blowoff filtering.
+
+    Summary-AI has its own side-aware blowoff prefilter. The final entry pipeline still
+    runs a generic blowoff detector and can otherwise drop every AI-approved BUY row,
+    as seen by skip_reason=no_tradable_rows_after_filters with blowoff=N.
+    """
+    if not _env_bool("SUMMARY_AI_BLOWOFF_RESCUE_ENABLED", True):
+        return False
+    if not _is_summary_ai_source(row):
+        return False
+
+    side = _resolve_side_from_row(row)
+    if side != "BUY":
+        return False
+
+    effective_score = _effective_score_from_row(row)
+    confidence = _confidence_from_row(row)
+    min_score = _env_float("SUMMARY_AI_BLOWOFF_RESCUE_MIN_SCORE", _env_float("SUMMARY_ENTRY_MIN_SCORE_BUY", 3.0))
+    min_conf = _env_float("SUMMARY_AI_BLOWOFF_RESCUE_MIN_CONF", 0.85)
+
+    approved_like = any(
+        _truthy(row.get(k))
+        for k in ("ai_ok", "ai_approved", "approved", "is_ai_ok", "ai_passed")
+    )
+    reason = str(row.get("reason") or row.get("ai_reason") or "").upper()
+    if "AI_OK" in reason or "AI OK" in reason:
+        approved_like = True
+
+    # Approved rows from Summary-AI may not always carry ai_ok=True after dataframe
+    # conversion. Keep the rescue strict by requiring BUY score and confidence.
+    ok = effective_score >= min_score and (confidence >= min_conf or approved_like)
+    if ok:
+        logger.warning(
+            "[entry_pipeline] SUMMARY AI blowoff rescue allow symbol=%s side=%s score=%.3f conf=%.3f approved_like=%s min_score=%.2f min_conf=%.2f",
+            symbol, side, effective_score, confidence, approved_like, min_score, min_conf,
+        )
+        return True
+
+    logger.info(
+        "[entry_pipeline] SUMMARY AI blowoff rescue deny symbol=%s side=%s score=%.3f conf=%.3f approved_like=%s min_score=%.2f min_conf=%.2f",
+        symbol, side, effective_score, confidence, approved_like, min_score, min_conf,
+    )
+    return False
+
+
 def _filter_blowoff(rows: List[Any], df_summary: pd.DataFrame | None) -> List[Any]:
     try:
         if df_summary is None or not isinstance(df_summary, pd.DataFrame) or df_summary.empty:
@@ -408,26 +472,26 @@ def _filter_blowoff(rows: List[Any], df_summary: pd.DataFrame | None) -> List[An
         if tops is None or tops.empty or "symbol" not in tops.columns:
             return rows
         top_symbols = set(tops["symbol"].astype(str))
-        allow_summary_ai_blowoff = _env_bool("SUMMARY_AI_ALLOW_BLOWOFF_TOP", True)
         filtered = []
+        skipped_symbols = []
+        rescued_symbols = []
         for r in rows:
             symbol = _get_symbol(r)
             if symbol in top_symbols:
                 row_dict = _clean_nan_dict(_row_to_dict(r))
-                side = _resolve_side_from_row(row_dict)
-                if allow_summary_ai_blowoff and _is_summary_ai_source(row_dict):
-                    logger.warning(
-                        "[entry_pipeline] blowoff top detected but SUMMARY_AI/PUSH allowed symbol=%s side=%s source=%s entry_type=%s",
-                        symbol,
-                        side,
-                        row_dict.get("source"),
-                        row_dict.get("entry_type"),
-                    )
+                if _allow_summary_ai_blowoff_rescue(row_dict, symbol=symbol):
+                    rescued_symbols.append(symbol)
                     filtered.append(r)
                     continue
-                logger.info("[entry_pipeline] skip blowoff top symbol=%s side=%s source=%s", symbol, side, row_dict.get("source"))
+                skipped_symbols.append(symbol)
+                logger.info("[entry_pipeline] skip blowoff top symbol=%s", symbol)
                 continue
             filtered.append(r)
+        if skipped_symbols or rescued_symbols:
+            logger.warning(
+                "[entry_pipeline] blowoff filter result input=%s skipped=%s rescued=%s skipped_symbols=%s rescued_symbols=%s",
+                len(rows), len(skipped_symbols), len(rescued_symbols), skipped_symbols[:10], rescued_symbols[:10],
+            )
         return filtered
     except Exception:
         logger.exception("[entry_pipeline] blowoff filter failed")
