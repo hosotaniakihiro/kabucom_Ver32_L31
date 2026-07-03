@@ -8,7 +8,7 @@ from functools import wraps
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V2-BOARD-MISSING-DEFER-FULL-PUSH-ROTATION-NO-BOARDLESS-ORDER"
+VERSION = "V3-BOARD-MISSING-DEFER-FULL-ROTATION-PENDING-LIQ-FALLBACK"
 _INSTALLED = False
 _DEFERRED: dict[tuple[str, str], float] = {}
 
@@ -57,12 +57,7 @@ def _mark_deferred(symbol: str, side: str) -> int:
 
 
 def _apply_full_rotation_retry() -> bool:
-    """Wait long enough to observe both A/B PUSH batches before hard-blocking.
-
-    A/B rotation is roughly A 4.8s + clear 0.2s + B 4.8s + clear 0.2s = 10s.
-    A 5s retry can still miss the opposite batch. Use 10.5s while keeping
-    hard-block behavior when board remains unavailable.
-    """
+    """Wait long enough to observe both A/B PUSH batches before hard-blocking."""
     try:
         retry_sec = max(10.0, _env_float("SUMMARY_AI_BOARD_FULL_ROTATION_RETRY_SEC", 10.5))
         interval_sec = max(0.1, min(_env_float("SUMMARY_AI_BOARD_FULL_ROTATION_RETRY_INTERVAL_SEC", 0.2), 1.0))
@@ -100,13 +95,24 @@ def _apply_full_rotation_retry() -> bool:
         return False
 
 
+def _install_pending_liq_patch() -> bool:
+    try:
+        from core.startup.entry_handler_recent_liq_pending_fallback_patch import install as _install
+        ok = bool(_install())
+        logger.warning("[SUMMARY AI BOARD MISSING DEFER] chained pending_liq_fallback ok=%s version=%s", ok, VERSION)
+        return ok
+    except Exception:
+        logger.exception("[SUMMARY AI BOARD MISSING DEFER] chained pending_liq_fallback failed version=%s", VERSION)
+        return False
+
+
 def _install_async_snapshot_patch() -> bool:
     try:
         import core.startup.summary_ai_async_entry_patch as ap
         cur = getattr(ap, "_summary_ai_direct_snapshot_execute", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_board_missing_defer_v2", False):
+        if getattr(cur, "_board_missing_defer_v3", False):
             return True
 
         @wraps(cur)
@@ -132,6 +138,7 @@ def _install_async_snapshot_patch() -> bool:
 
         wrapped._board_missing_defer_v1 = True  # type: ignore[attr-defined]
         wrapped._board_missing_defer_v2 = True  # type: ignore[attr-defined]
+        wrapped._board_missing_defer_v3 = True  # type: ignore[attr-defined]
         wrapped._original = cur  # type: ignore[attr-defined]
         ap._summary_ai_direct_snapshot_execute = wrapped
         logger.warning("[SUMMARY AI BOARD MISSING DEFER] async snapshot patched version=%s", VERSION)
@@ -144,8 +151,6 @@ def _install_async_snapshot_patch() -> bool:
 def _install_fast_builder_log_patch() -> bool:
     try:
         import core.startup.summary_ai_fast_order_builder_patch as fb
-        # Keep this patch intentionally light. The builder must still return NG.
-        # We only make the reason explicit for log/search purposes.
         setattr(fb, "SUMMARY_AI_BOARD_MISSING_DEFER_ENABLED", True)
         logger.warning("[SUMMARY AI BOARD MISSING DEFER] fast builder marker set version=%s", VERSION)
         return True
@@ -158,6 +163,7 @@ def install() -> bool:
     global _INSTALLED
     if _INSTALLED:
         _apply_full_rotation_retry()
+        _install_pending_liq_patch()
         return True
     try:
         os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY", "1")
@@ -166,13 +172,15 @@ def install() -> bool:
         ok0 = _apply_full_rotation_retry()
         ok1 = _install_async_snapshot_patch()
         ok2 = _install_fast_builder_log_patch()
-        _INSTALLED = bool(ok0 or ok1 or ok2)
+        ok3 = _install_pending_liq_patch()
+        _INSTALLED = bool(ok0 or ok1 or ok2 or ok3)
         logger.warning(
-            "[SUMMARY AI BOARD MISSING DEFER] installed ok=%s full_rotation=%s async=%s builder=%s retry_sec=%s ttl=%s version=%s",
+            "[SUMMARY AI BOARD MISSING DEFER] installed ok=%s full_rotation=%s async=%s builder=%s pending_liq=%s retry_sec=%s ttl=%s version=%s",
             _INSTALLED,
             ok0,
             ok1,
             ok2,
+            ok3,
             os.getenv("ENTRY_ORDER_BOARD_RETRY_SEC"),
             os.getenv("SUMMARY_AI_BOARD_MISSING_DEFER_TTL_SEC"),
             VERSION,
