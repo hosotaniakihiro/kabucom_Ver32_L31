@@ -1,21 +1,20 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_ai_fast_order_builder_patch.py
-# Version: V3.1-SUMMARY-AI-RANGE-REPAIR-SOURCE-DETECT
+# Version: V3.2-SUMMARY-AI-SNAPSHOT-NO-ORDER-FALLBACK
 # ------------------------------------------------------------
-# SUMMARY_AI が AI_OK → qty算出まで進んだあと、発注直前で
-# LOW_MOVE_RANGE_TOO_SMALL になるケースを、閾値を緩めずに補修する。
+# SUMMARY_AI が AI_OK/pending 登録まで進んだ後、entry_controller 側で
+# source/entry_type が SUMMARY に寄って注文ビルダーが SUMMARY_AI ルートへ
+# 入らず、snapshot_no_order / entry_controller_no_order で止まる症状を補修する。
 #
 # 方針:
-#   - ENTRY_ORDER_MIN_RANGE_PCT は緩和しない。
-#   - 1分足の high/low が close 付近に潰れている時だけ、entry_row 内の
-#     day_high/day_low, session_high/session_low, open/current など既存情報から
-#     実レンジを再構成する。
-#   - 補完レンジが閾値以上の時だけ high_price/low_price を差し替える。
-#   - 補完できなければ従来通り LOW_MOVE_RANGE_TOO_SMALL で止める。
-#   - source が SUMMARY_AI 固定で渡らない場合に備え、entry_row の
-#     entry_type/source/reason/ai_gate_allow/preapproved でも対象判定する。
-#   - board retry は短縮し、logger 未定義も補正する。
+#   - ENTRY_ORDER_MIN_RANGE_PCT などの厳格条件は緩めない。
+#   - SUMMARY/SUMMARY_AI/PUSH 由来で AI_OK 済みの候補だけ、注文ビルダー呼び出し
+#     直前に source=SUMMARY_AI / entry_type=SUMMARY_AI へ正規化する。
+#   - ランキング/殿様は従来通り 5秒足 breakout ルートを維持する。
+#   - 板が無い場合でも、既存 row の close/price/current_price/vwap から
+#     SUMMARY_AI の安全な LIMIT fallback を使えるようにする。
+#   - 1分足 high/low が潰れている場合だけ、既存 row 情報からレンジを補修する。
 # ============================================================
 from __future__ import annotations
 
@@ -25,9 +24,13 @@ import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V3.1-SUMMARY-AI-RANGE-REPAIR-SOURCE-DETECT"
+VERSION = "V3.2-SUMMARY-AI-SNAPSHOT-NO-ORDER-FALLBACK"
 _INSTALLED = False
 _ORIGINAL_BUILD_ENTRY_ORDER = None
+
+
+_TRUE_SET = {"1", "true", "yes", "y", "on", "ok", "allow", "allowed", "enable", "enabled"}
+_SUMMARY_SOURCE_SET = {"SUMMARY", "SUMMARY_AI", "PUSH", "PUSH_SUMMARY", "STOCK_SUMMARY"}
 
 
 def _safe_float(v: Any, default: float) -> float:
@@ -82,32 +85,113 @@ def _truthy(v: Any) -> bool:
     try:
         if isinstance(v, bool):
             return v
-        return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on", "ok", "allow", "allowed"}
+        return str(v or "").strip().lower() in _TRUE_SET
     except Exception:
         return False
 
 
+def _row_from_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    row = kwargs.get("entry_row")
+    if isinstance(row, dict):
+        return row
+    row = {}
+    kwargs["entry_row"] = row
+    return row
+
+
 def _is_summary_ai_order(kwargs: dict[str, Any]) -> bool:
     try:
-        source = str(kwargs.get("source") or "").upper()
+        source = str(kwargs.get("source") or "").strip().upper()
         row = kwargs.get("entry_row") if isinstance(kwargs.get("entry_row"), dict) else {}
+        row_source = str(row.get("source") or "").strip().upper()
+        entry_type = str(row.get("entry_type") or kwargs.get("entry_type") or "").strip().upper()
+        pipeline_source = str(row.get("pipeline_source") or "").strip().upper()
         joined = "|".join(
             str(x or "").upper()
             for x in (
                 source,
-                row.get("source"),
-                row.get("entry_type"),
+                row_source,
+                entry_type,
+                pipeline_source,
                 row.get("reason"),
                 row.get("ai_reason"),
-                row.get("pipeline_source"),
+                row.get("skip_reason"),
             )
         )
-        if "SUMMARY_AI" in joined or "SRC=SUMMARY" in joined or source in {"SUMMARY", "PUSH_SUMMARY", "STOCK_SUMMARY"}:
+        if source in _SUMMARY_SOURCE_SET or row_source in _SUMMARY_SOURCE_SET or pipeline_source == "SUMMARY":
+            return True
+        if "SUMMARY_AI" in joined or "SRC=SUMMARY" in joined:
             return True
         if _truthy(row.get("ai_gate_allow")) or _truthy(row.get("preapproved")) or _truthy(row.get("summary_ai_ok")):
             return True
         return False
     except Exception:
+        return False
+
+
+def _coerce_summary_ai_snapshot_order(kwargs: dict[str, Any]) -> bool:
+    """Make SUMMARY/SUMMARY_AI candidates use the SUMMARY_AI order-builder route."""
+    try:
+        if not _is_summary_ai_order(kwargs):
+            return False
+        row = _row_from_kwargs(kwargs)
+        symbol = kwargs.get("symbol") or row.get("symbol")
+        side = str(kwargs.get("side") or row.get("side") or row.get("entry_decision") or row.get("ai_side") or "").strip().upper()
+        old_source = str(kwargs.get("source") or row.get("source") or "").strip().upper()
+
+        if old_source and old_source != "SUMMARY_AI":
+            row.setdefault("original_source", old_source)
+        kwargs["source"] = "SUMMARY_AI"
+        row["source"] = "SUMMARY_AI"
+        row["entry_type"] = "SUMMARY_AI"
+        if side in {"BUY", "SELL"}:
+            kwargs["side"] = side
+            row.setdefault("side", side)
+            row.setdefault("entry_decision", side)
+            row.setdefault("ai_side", side)
+
+        price = _first(
+            row,
+            (
+                "close_price",
+                "price",
+                "current_price",
+                "close",
+                "last_price",
+                "vwap",
+                "base_price",
+                "display_price",
+            ),
+            None,
+        )
+        price_f = _safe_float(price, 0.0)
+        if price_f > 0:
+            row.setdefault("close_price", price_f)
+            row.setdefault("price", price_f)
+            row.setdefault("current_price", price_f)
+            row.setdefault("close", price_f)
+
+        # Keep order-builder liquidity guard effective even when turnover exists but volume alias is missing.
+        vol = _safe_float(_first(row, ("volume", "vol", "latest_volume", "display_volume", "_latest_volume"), 0.0), 0.0)
+        if vol <= 0:
+            turnover = _safe_float(_first(row, ("turnover", "trading_value", "sales_value", "display_turnover"), 0.0), 0.0)
+            if turnover > 0 and price_f > 0:
+                vol = turnover / price_f
+        if vol > 0:
+            row.setdefault("volume", vol)
+
+        logger.warning(
+            "[SUMMARY AI FAST ORDER BUILDER] snapshot order fallback normalized symbol=%s side=%s source %s->SUMMARY_AI price=%s volume=%s version=%s",
+            symbol,
+            side,
+            old_source,
+            row.get("close_price") or row.get("price") or row.get("current_price") or row.get("close"),
+            row.get("volume"),
+            VERSION,
+        )
+        return True
+    except Exception:
+        logger.exception("[SUMMARY AI FAST ORDER BUILDER] snapshot order fallback normalize failed kwargs_keys=%s version=%s", list(kwargs.keys()), VERSION)
         return False
 
 
@@ -170,7 +254,6 @@ def _repair_summary_ai_low_move_range(kwargs: dict[str, Any], eob: Any) -> bool:
             l = min(op, close, cur_low if cur_low > 0 else close)
             candidates.append(("open_close", h, l, _range_pct(h, l, close)))
 
-        # Existing row may contain explicit range metrics even when high/low are collapsed.
         for name in ("range_value", "day_range_value", "price_range", "intraday_range"):
             rv = _safe_float(row.get(name), 0.0)
             if rv > 0:
@@ -222,7 +305,7 @@ def install() -> bool:
         old_interval, new_interval = _set_cap(eob, "ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", _safe_float(os.environ.get("ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC"), 0.2))
 
         cur = getattr(eob, "build_entry_order", None)
-        if callable(cur) and not getattr(cur, "_summary_ai_fast_order_builder_v31", False):
+        if callable(cur) and not getattr(cur, "_summary_ai_fast_order_builder_v32", False):
             _ORIGINAL_BUILD_ENTRY_ORDER = getattr(cur, "_original", cur)
 
             def _patched_build_entry_order(*args, **kwargs):
@@ -234,6 +317,7 @@ def install() -> bool:
                         "[SUMMARY AI FAST ORDER BUILDER] start symbol=%s side=%s source=%s retry_sec=%s retry_interval=%s version=%s",
                         symbol, side, kwargs.get("source"), getattr(eob, "ENTRY_ORDER_BOARD_RETRY_SEC", None), getattr(eob, "ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", None), VERSION,
                     )
+                    _coerce_summary_ai_snapshot_order(kwargs)
                     _repair_summary_ai_low_move_range(kwargs, eob)
                 try:
                     result = _ORIGINAL_BUILD_ENTRY_ORDER(*args, **kwargs)
@@ -248,7 +332,7 @@ def install() -> bool:
                     else:
                         raise
                 if summary_like:
-                    logger.info(
+                    logger.warning(
                         "[SUMMARY AI FAST ORDER BUILDER] done symbol=%s side=%s ok=%s reason=%s detail=%s version=%s",
                         symbol,
                         side,
@@ -263,6 +347,7 @@ def install() -> bool:
             _patched_build_entry_order._summary_ai_fast_order_builder_v2 = True  # type: ignore[attr-defined]
             _patched_build_entry_order._summary_ai_fast_order_builder_v3 = True  # type: ignore[attr-defined]
             _patched_build_entry_order._summary_ai_fast_order_builder_v31 = True  # type: ignore[attr-defined]
+            _patched_build_entry_order._summary_ai_fast_order_builder_v32 = True  # type: ignore[attr-defined]
             _patched_build_entry_order._original = _ORIGINAL_BUILD_ENTRY_ORDER  # type: ignore[attr-defined]
             eob.build_entry_order = _patched_build_entry_order
 
@@ -274,7 +359,7 @@ def install() -> bool:
 
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY AI FAST ORDER BUILDER] installed version=%s retry_sec %s->%s interval %s->%s logger_patched=%s range_repair=True source_detect=True",
+            "[SUMMARY AI FAST ORDER BUILDER] installed version=%s retry_sec %s->%s interval %s->%s logger_patched=%s range_repair=True source_detect=True snapshot_no_order_fallback=True",
             VERSION,
             old_retry,
             new_retry,
