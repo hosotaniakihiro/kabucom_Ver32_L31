@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V1-SUMMARY-AI-STRICT-REST-BOARD-FALLBACK"
+VERSION = "V2-SUMMARY-AI-STRICT-REST-BOARD-FALLBACK-SOURCE-INFER"
 _INSTALLED = False
 _ORIG_GET_LATEST_BID_ASK = None
 
@@ -24,7 +25,23 @@ def _valid_board(board: Any) -> bool:
 
 def _summary_like(source: str) -> bool:
     s = str(source or "").strip().upper()
-    return s in {"SUMMARY_AI", "SUMMARY", "PUSH_SUMMARY", "STOCK_SUMMARY", "PUSH"}
+    return s in {"SUMMARY_AI", "SUMMARY", "PUSH_SUMMARY", "STOCK_SUMMARY", "PUSH", "SUMMARY_AI_ORDER_BUILDER"}
+
+
+def _infer_source_from_stack() -> str:
+    """entry_order_builder._get_board_with_retry calls get_latest_bid_ask(symbol)
+    without passing source/side, so infer SUMMARY_AI when the call comes from
+    the order-builder retry path.
+    """
+    try:
+        for frame in inspect.stack(context=0)[:8]:
+            fn = str(getattr(frame, "function", ""))
+            filename = str(getattr(frame, "filename", "")).replace("\\", "/").lower()
+            if fn == "_get_board_with_retry" and filename.endswith("trading/handlers/entry_order_builder.py"):
+                return "SUMMARY_AI_ORDER_BUILDER"
+    except Exception:
+        pass
+    return ""
 
 
 def install() -> bool:
@@ -36,7 +53,7 @@ def install() -> bool:
         cur = getattr(eob, "get_latest_bid_ask", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_summary_ai_strict_board_rest_v1", False):
+        if getattr(cur, "_summary_ai_strict_board_rest_v2", False):
             _INSTALLED = True
             return True
         _ORIG_GET_LATEST_BID_ASK = getattr(cur, "_original", cur)
@@ -44,12 +61,16 @@ def install() -> bool:
         def _patched_get_latest_bid_ask(symbol: Any, *args: Any, **kwargs: Any):
             source = str(kwargs.get("source") or "").strip().upper()
             side = str(kwargs.get("side") or "").strip().upper()
+            inferred = ""
             try:
                 board = _ORIG_GET_LATEST_BID_ASK(symbol)
             except TypeError:
                 board = _ORIG_GET_LATEST_BID_ASK(symbol, *args, **kwargs)
             if _valid_board(board):
                 return board
+            if not source:
+                inferred = _infer_source_from_stack()
+                source = inferred
             if not _summary_like(source):
                 return board
             try:
@@ -64,15 +85,22 @@ def install() -> bool:
                     else:
                         os.environ["ENTRY_BOARD_REST_DIRECT_ENABLED"] = old
                 if _valid_board(rest):
-                    logger.warning("[SUMMARY AI STRICT BOARD REST] board recovered symbol=%s side=%s source=%s version=%s", symbol, side, source, VERSION)
+                    logger.warning(
+                        "[SUMMARY AI STRICT BOARD REST] board recovered symbol=%s side=%s source=%s inferred=%s version=%s",
+                        symbol, side, source, inferred, VERSION,
+                    )
                     return rest
-                logger.warning("[SUMMARY AI STRICT BOARD REST] board still missing symbol=%s side=%s source=%s version=%s", symbol, side, source, VERSION)
+                logger.warning(
+                    "[SUMMARY AI STRICT BOARD REST] board still missing symbol=%s side=%s source=%s inferred=%s version=%s",
+                    symbol, side, source, inferred, VERSION,
+                )
                 return board
             except Exception:
-                logger.exception("[SUMMARY AI STRICT BOARD REST] failed symbol=%s side=%s source=%s version=%s", symbol, side, source, VERSION)
+                logger.exception("[SUMMARY AI STRICT BOARD REST] failed symbol=%s side=%s source=%s inferred=%s version=%s", symbol, side, source, inferred, VERSION)
                 return board
 
         _patched_get_latest_bid_ask._summary_ai_strict_board_rest_v1 = True  # type: ignore[attr-defined]
+        _patched_get_latest_bid_ask._summary_ai_strict_board_rest_v2 = True  # type: ignore[attr-defined]
         _patched_get_latest_bid_ask._original = _ORIG_GET_LATEST_BID_ASK  # type: ignore[attr-defined]
         eob.get_latest_bid_ask = _patched_get_latest_bid_ask
         _INSTALLED = True
