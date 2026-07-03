@@ -8,7 +8,7 @@ from functools import wraps
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V4-BOARD-MISSING-DEFER-FULL-ROTATION-MEMORY-LIQ"
+VERSION = "V5-BOARD-MISSING-DEFER-REST-TIMEOUT-RELIEF"
 _INSTALLED = False
 _DEFERRED: dict[tuple[str, str], float] = {}
 
@@ -56,6 +56,29 @@ def _mark_deferred(symbol: str, side: str) -> int:
     return int(sum(1 for exp in _DEFERRED.values() if exp > now))
 
 
+def _apply_rest_timeout_relief() -> bool:
+    try:
+        timeout = max(1.2, min(_env_float("SUMMARY_AI_REST_BOARD_TIMEOUT_SEC", 1.5), 3.0))
+        cache_ttl = max(0.2, min(_env_float("SUMMARY_AI_REST_BOARD_CACHE_TTL_SEC", 1.0), 3.0))
+        old_timeout = os.environ.get("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC")
+        old_cache = os.environ.get("ENTRY_BOARD_REST_CACHE_TTL_SEC")
+        os.environ["SUMMARY_AI_REST_BOARD_TIMEOUT_SEC"] = str(timeout)
+        os.environ["ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC"] = str(timeout)
+        os.environ["ENTRY_BOARD_REST_CACHE_TTL_SEC"] = str(cache_ttl)
+        logger.warning(
+            "[SUMMARY AI BOARD MISSING DEFER] REST timeout relief applied timeout %s->%s cache_ttl %s->%s hard_block=True version=%s",
+            old_timeout,
+            timeout,
+            old_cache,
+            cache_ttl,
+            VERSION,
+        )
+        return True
+    except Exception:
+        logger.exception("[SUMMARY AI BOARD MISSING DEFER] REST timeout relief failed version=%s", VERSION)
+        return False
+
+
 def _apply_full_rotation_retry() -> bool:
     """Wait long enough to observe both A/B PUSH batches before hard-blocking."""
     try:
@@ -69,6 +92,7 @@ def _apply_full_rotation_retry() -> bool:
         os.environ["ENTRY_BOARD_MISSING_HARD_BLOCK"] = "1"
         os.environ["ENTRY_LIMIT_ALLOW_WITHOUT_BOARD"] = "0"
         os.environ["ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"] = "0"
+        _apply_rest_timeout_relief()
         try:
             from trading.handlers import entry_order_builder as eob
             old_retry = getattr(eob, "ENTRY_ORDER_BOARD_RETRY_SEC", None)
@@ -123,7 +147,7 @@ def _install_async_snapshot_patch() -> bool:
         cur = getattr(ap, "_summary_ai_direct_snapshot_execute", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_board_missing_defer_v4", False):
+        if getattr(cur, "_board_missing_defer_v5", False):
             return True
 
         @wraps(cur)
@@ -151,6 +175,7 @@ def _install_async_snapshot_patch() -> bool:
         wrapped._board_missing_defer_v2 = True  # type: ignore[attr-defined]
         wrapped._board_missing_defer_v3 = True  # type: ignore[attr-defined]
         wrapped._board_missing_defer_v4 = True  # type: ignore[attr-defined]
+        wrapped._board_missing_defer_v5 = True  # type: ignore[attr-defined]
         wrapped._original = cur  # type: ignore[attr-defined]
         ap._summary_ai_direct_snapshot_execute = wrapped
         logger.warning("[SUMMARY AI BOARD MISSING DEFER] async snapshot patched version=%s", VERSION)
@@ -189,7 +214,7 @@ def install() -> bool:
         ok4 = _install_memory_liq_patch()
         _INSTALLED = bool(ok0 or ok1 or ok2 or ok3 or ok4)
         logger.warning(
-            "[SUMMARY AI BOARD MISSING DEFER] installed ok=%s full_rotation=%s async=%s builder=%s pending_liq=%s memory_liq=%s retry_sec=%s ttl=%s version=%s",
+            "[SUMMARY AI BOARD MISSING DEFER] installed ok=%s full_rotation=%s async=%s builder=%s pending_liq=%s memory_liq=%s retry_sec=%s rest_timeout=%s ttl=%s version=%s",
             _INSTALLED,
             ok0,
             ok1,
@@ -197,6 +222,7 @@ def install() -> bool:
             ok3,
             ok4,
             os.getenv("ENTRY_ORDER_BOARD_RETRY_SEC"),
+            os.getenv("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC"),
             os.getenv("SUMMARY_AI_BOARD_MISSING_DEFER_TTL_SEC"),
             VERSION,
         )
