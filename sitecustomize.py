@@ -1,22 +1,21 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver60-SUMMARY-AI-RUNTIME-CONSISTENCY
+# Version: Ver61-RANKING-LOGGER-CSV-GUARD
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # main.py は軽量同期 + background install。
 # DB/data collector系はDB専用の最小同期パッチだけにして起動を軽くする。
 # 救済/fail-open系はデフォルトOFFにして、本体判定を優先する。
 #
+# V61:
+#   - ranking_logger CSV保存で logs/ranking が WinError 433 になる場合に、
+#     CSV保存だけ安全にスキップ/フォールバックして子プロセスログを汚さない。
+#
 # V60:
 #   - Summary-AI 実行時に渡された最新1m dfをfresh判定へ優先使用し、
 #     古いglobal historyだけを見て stale_push_1m で止まる症状を防ぐ。
 #   - executor selection を保護し、外側runtime patchがAI_OK候補を1件へ
 #     潰してrolling retryを妨げる状態を防ぐ。
-#
-# V59:
-#   - main.py のPUSHメモリが起動時スナップショットのまま stale になる場合、
-#     main_database.py が更新している pushYYYYMMDD.db から読み直して
-#     1分SUMMARYを作る SUMMARY_MAIN_PUSH_DB_REFRESH を同期パッチへ追加。
 # ============================================================
 from __future__ import annotations
 
@@ -237,6 +236,7 @@ def _install_summary_mtf_catchup_safely() -> None:
 
 
 DB_SYNC_PATCHES = [
+    ("core.startup.ranking_logger_csv_guard_patch", "RANKING_LOGGER_CSV_GUARD", "DISABLE_RANKING_LOGGER_CSV_GUARD_PATCH"),
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
     ("core.startup.yahoo_summary_direct_upsert_conflict_patch", "YAHOO_DIRECT_UPSERT_CONFLICT", "DISABLE_YAHOO_DIRECT_UPSERT_CONFLICT_PATCH"),
     ("core.startup.summary_stale_guard_patch", "SUMMARY_STALE_GUARD", "DISABLE_SUMMARY_STALE_GUARD_PATCH"),
@@ -246,6 +246,7 @@ DB_SYNC_PATCHES = [
 ]
 
 SYNC_MAIN_PATCHES = [
+    ("core.startup.ranking_logger_csv_guard_patch", "RANKING_LOGGER_CSV_GUARD", "DISABLE_RANKING_LOGGER_CSV_GUARD_PATCH"),
     ("core.startup.indicator_short_history_nan_profile_guard_patch", "IND_SHORT_PROFILE_GUARD", "DISABLE_IND_SHORT_PROFILE_GUARD_PATCH"),
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
     ("core.startup.yahoo_summary_direct_upsert_conflict_patch", "YAHOO_DIRECT_UPSERT_CONFLICT", "DISABLE_YAHOO_DIRECT_UPSERT_CONFLICT_PATCH"),
@@ -340,12 +341,9 @@ def _background_main_patch_loop() -> None:
     _install_optional_rescue_patches()
     _install_liq_empty_fallback_only_if_enabled()
     _install_summary_mtf_catchup_safely()
-    # Final re-apply after all background patches because several summary/controller patches re-wrap runner_core.job_summary.
     _install_module("core.startup.summary_main_push_db_refresh_patch", "SUMMARY_MAIN_PUSH_DB_REFRESH_BG_LAST", disabled_env="DISABLE_SUMMARY_MAIN_PUSH_DB_REFRESH_PATCH")
     _install_module("core.startup.summary_main_direct_push_force_patch", "SUMMARY_FORCE_DIRECT_1M_BG_LAST", disabled_env="DISABLE_SUMMARY_FORCE_DIRECT_1M_PATCH")
-    # Final board signature re-apply after all background patches because some entry guards replace _board_guard.
     _install_module("core.startup.final_entry_board_guard_signature_runtime_patch", "FINAL_BOARD_GUARD_SIGNATURE_LAST", disabled_env="DISABLE_FINAL_BOARD_GUARD_SIGNATURE_PATCH")
-    # Last Summary-AI consistency pass must run after board/signature and candidate-refill patches.
     _install_module("core.startup.summary_ai_runtime_consistency_patch", "SUMMARY_AI_RUNTIME_CONSISTENCY_LAST", disabled_env="DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH")
     logger.warning("[SITECUSTOMIZE] main background patches done")
 
@@ -379,5 +377,3 @@ elif _env_on("SITECUSTOMIZE_ENABLE_FULL_NONMAIN", False):
     _install_summary_mtf_catchup_safely()
 else:
     _install_nonmain_minimal()
-
-_write_boot_evidence("SITECUSTOMIZE_DONE")
