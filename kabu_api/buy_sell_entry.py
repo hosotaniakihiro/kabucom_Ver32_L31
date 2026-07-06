@@ -1,8 +1,8 @@
 # ============================================================
 # File   : kabu_api/buy_sell_entry.py
-# Version: Ver27-PRODUCTION-MARKET-REFERENCE-PRICE-700K
+# Version: Ver28-PRODUCTION-SOR-EXCHANGE9
 # ------------------------------------------------------------
-# ✔ Ver26 完全互換ベース
+# ✔ Ver27 完全互換ベース
 # ✔ 機能削除ゼロ
 # ✔ 上位レイヤ計算 qty を優先使用
 # ✔ qty=None のときのみ固定100株互換
@@ -14,10 +14,12 @@
 # ✔ kabu API レスポンス完全可視化
 # ✔ None発生原因完全特定
 # ✔ MARKET注文で板が取れない場合も reference_price があれば数量防衛して発注継続
+# ✔ Ver28: 新規エントリー注文の Exchange を既定で SOR=9 に統一
 # ============================================================
 
 import logging
 import configparser
+import os
 from typing import Optional
 
 from utils_common import (
@@ -35,6 +37,11 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_FALLBACK_QTY = 100
 MAX_ONESHOT = 700_000
+
+# kabuステーションAPIのSOR指定は Exchange=9。
+# ユーザー方針: 新規エントリーはSORへ統一。
+ENTRY_EXCHANGE = int(float(os.getenv("ENTRY_EXCHANGE", os.getenv("KABU_ENTRY_EXCHANGE", "9"))))
+FORCE_ENTRY_SOR = str(os.getenv("ENTRY_FORCE_SOR", "1")).strip().lower() not in {"0", "false", "no", "off", "disable", "disabled"}
 
 # ============================================================
 # settings.ini
@@ -65,6 +72,23 @@ def _safe_float(v, default: float = 0.0) -> float:
         return float(v)
     except Exception:
         return default
+
+
+def _resolve_entry_exchange(exchange=None) -> int:
+    """Resolve exchange for new entry orders.
+
+    FORCE_ENTRY_SOR=1 makes all entry payloads use Exchange=9.
+    This does not change exit/cancel code paths outside this module.
+    """
+    try:
+        if FORCE_ENTRY_SOR:
+            return 9
+        x = _safe_int(exchange, 0)
+        if x > 0:
+            return x
+        return _safe_int(ENTRY_EXCHANGE, 9) or 9
+    except Exception:
+        return 9
 
 
 def _resolve_requested_qty(qty) -> int:
@@ -222,18 +246,19 @@ def _make_payload(
     qty,
     price,
     *,
-    exchange=1,
+    exchange=None,
     margin_type=1,
     cash_margin=2,
     front_order_type=20,
     stop_price=None,
 ):
     qty = int(qty)
+    resolved_exchange = _resolve_entry_exchange(exchange)
 
     payload = {
         "Password": Password,
         "Symbol": str(symbol),
-        "Exchange": int(exchange),
+        "Exchange": int(resolved_exchange),
         "SecurityType": 1,
         "Side": int(side),
         "CashMargin": int(cash_margin),
@@ -253,6 +278,17 @@ def _make_payload(
         payload["StopPrice"] = int(float(stop_price))
         payload["Price"] = 0
 
+    logger.warning(
+        "[ENTRY ORDER PAYLOAD BUILD] symbol=%s side=%s qty=%s price=%s front_order_type=%s exchange=%s sor=%s force_sor=%s",
+        symbol,
+        side,
+        qty,
+        payload.get("Price"),
+        front_order_type,
+        payload.get("Exchange"),
+        payload.get("Exchange") == 9,
+        FORCE_ENTRY_SOR,
+    )
     return payload
 
 
@@ -263,8 +299,10 @@ def _make_payload(
 def _send_order(payload, symbol):
     try:
         logger.info(
-            "[KABU PAYLOAD] symbol=%s payload=%s",
+            "[KABU PAYLOAD] symbol=%s exchange=%s sor=%s payload=%s",
             symbol,
+            payload.get("Exchange") if isinstance(payload, dict) else None,
+            bool(isinstance(payload, dict) and payload.get("Exchange") == 9),
             payload,
         )
 
@@ -342,7 +380,7 @@ def _resolve_actual_qty(symbol, price, requested_qty) -> int:
 # BUY（最良ASK指値）
 # ============================================================
 
-def execute_buy_at_best_ask(symbol, qty=None, lot_yen=700000, exchange=1):
+def execute_buy_at_best_ask(symbol, qty=None, lot_yen=700000, exchange=None):
     try:
         quotes = get_latest_bid_ask(symbol)
 
@@ -388,7 +426,7 @@ def execute_buy_at_best_ask(symbol, qty=None, lot_yen=700000, exchange=1):
 # SELL（最良BID指値）
 # ============================================================
 
-def execute_short_at_best_bid(symbol, qty=None, lot_yen=700000, exchange=1):
+def execute_short_at_best_bid(symbol, qty=None, lot_yen=700000, exchange=None):
     try:
         quotes = get_latest_bid_ask(symbol)
 
@@ -434,7 +472,7 @@ def execute_short_at_best_bid(symbol, qty=None, lot_yen=700000, exchange=1):
 # BUY（成行）
 # ============================================================
 
-def execute_buy_market(symbol, qty=None, reference_price=None, exchange=1):
+def execute_buy_market(symbol, qty=None, reference_price=None, exchange=None):
     try:
         quotes = get_latest_bid_ask(symbol)
         price_for_guard = _resolve_market_reference_price(
@@ -486,7 +524,7 @@ def execute_buy_market(symbol, qty=None, reference_price=None, exchange=1):
 # SELL（成行）
 # ============================================================
 
-def execute_sell_market(symbol, qty=None, reference_price=None, exchange=1):
+def execute_sell_market(symbol, qty=None, reference_price=None, exchange=None):
     try:
         quotes = get_latest_bid_ask(symbol)
         price_for_guard = _resolve_market_reference_price(
@@ -538,7 +576,7 @@ def execute_sell_market(symbol, qty=None, reference_price=None, exchange=1):
 # STOP BUY
 # ============================================================
 
-def execute_buy_stop(symbol: str, qty=None, stop_price: float = None, exchange=1):
+def execute_buy_stop(symbol: str, qty=None, stop_price: float = None, exchange=None):
     try:
         if stop_price is None:
             logger.warning("⚠ STOP BUY stop_price=None symbol=%s", symbol)
@@ -576,7 +614,7 @@ def execute_buy_stop(symbol: str, qty=None, stop_price: float = None, exchange=1
 # STOP SELL
 # ============================================================
 
-def execute_short_stop(symbol: str, qty=None, stop_price: float = None, exchange=1):
+def execute_short_stop(symbol: str, qty=None, stop_price: float = None, exchange=None):
     try:
         if stop_price is None:
             logger.warning("⚠ STOP SELL stop_price=None symbol=%s", symbol)
