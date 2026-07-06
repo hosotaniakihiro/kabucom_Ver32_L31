@@ -1,11 +1,16 @@
 # ============================================================
 # File   : sitecustomize.py
-# Version: Ver60-SUMMARY-AI-RUNTIME-CONSISTENCY
+# Version: Ver61-PREVDAY-INDICATOR-WARMUP-AUTO-INSTALL
 # ------------------------------------------------------------
 # Python起動時に重要runtime patchを自動installする。
 # main.py は軽量同期 + background install。
 # DB/data collector系はDB専用の最小同期パッチだけにして起動を軽くする。
 # 救済/fail-open系はデフォルトOFFにして、本体判定を優先する。
+#
+# V61:
+#   - 前営業日分足を保存せず、indicator_calculator の計算時だけ
+#     メモリ上でウォームアップ連結する IND_PREVDAY_WARMUP を
+#     main.py / main_database.py の両方で同期installする。
 #
 # V60:
 #   - Summary-AI 実行時に渡された最新1m dfをfresh判定へ優先使用し、
@@ -237,6 +242,7 @@ def _install_summary_mtf_catchup_safely() -> None:
 
 
 DB_SYNC_PATCHES = [
+    ("core.startup.indicator_fragmentation_runtime_patch", "IND_PREVDAY_WARMUP", "DISABLE_IND_PREVDAY_WARMUP_PATCH"),
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
     ("core.startup.yahoo_summary_direct_upsert_conflict_patch", "YAHOO_DIRECT_UPSERT_CONFLICT", "DISABLE_YAHOO_DIRECT_UPSERT_CONFLICT_PATCH"),
     ("core.startup.summary_stale_guard_patch", "SUMMARY_STALE_GUARD", "DISABLE_SUMMARY_STALE_GUARD_PATCH"),
@@ -246,6 +252,7 @@ DB_SYNC_PATCHES = [
 ]
 
 SYNC_MAIN_PATCHES = [
+    ("core.startup.indicator_fragmentation_runtime_patch", "IND_PREVDAY_WARMUP", "DISABLE_IND_PREVDAY_WARMUP_PATCH"),
     ("core.startup.indicator_short_history_nan_profile_guard_patch", "IND_SHORT_PROFILE_GUARD", "DISABLE_IND_SHORT_PROFILE_GUARD_PATCH"),
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
     ("core.startup.yahoo_summary_direct_upsert_conflict_patch", "YAHOO_DIRECT_UPSERT_CONFLICT", "DISABLE_YAHOO_DIRECT_UPSERT_CONFLICT_PATCH"),
