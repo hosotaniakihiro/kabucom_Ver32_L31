@@ -7,9 +7,10 @@ import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V1-SUMMARY-AI-BOARD-REST-COOLDOWN-BYPASS"
+VERSION = "V2-SUMMARY-AI-BOARD-REST-COOLDOWN-BYPASS-STRATEGY-MODE"
 _INSTALLED = False
 _ORIG_FETCH = None
+_STRATEGY_INSTALLED = False
 
 
 def _summary_source(source: Any) -> bool:
@@ -32,6 +33,7 @@ def _valid_board(board: Any) -> bool:
         return False
     buy1 = board.get("Buy1") if isinstance(board.get("Buy1"), dict) else {}
     sell1 = board.get("Sell1") if isinstance(board.get("Sell1"), dict) else {}
+
     def f(v: Any) -> float:
         try:
             if v is None or str(v).strip() == "":
@@ -39,22 +41,41 @@ def _valid_board(board: Any) -> bool:
             return float(str(v).replace(",", ""))
         except Exception:
             return 0.0
+
     bid = f(board.get("bid_price") or board.get("bid") or board.get("best_bid") or board.get("BidPrice") or board.get("BestBid") or buy1.get("Price"))
     ask = f(board.get("ask_price") or board.get("ask") or board.get("best_ask") or board.get("AskPrice") or board.get("BestAsk") or sell1.get("Price"))
     return bid > 0 and ask > 0
 
 
+def _install_strategy_mode() -> bool:
+    global _STRATEGY_INSTALLED
+    if _STRATEGY_INSTALLED:
+        return True
+    try:
+        from core.startup.summary_ai_strategy_mode_patch import install as _install
+
+        ok = bool(_install())
+        _STRATEGY_INSTALLED = bool(ok)
+        logger.warning("[SUMMARY AI BOARD REST COOLDOWN] chained strategy mode ok=%s version=%s", ok, VERSION)
+        return bool(ok)
+    except Exception:
+        logger.exception("[SUMMARY AI BOARD REST COOLDOWN] chained strategy mode install failed version=%s", VERSION)
+        return False
+
+
 def install() -> bool:
     global _INSTALLED, _ORIG_FETCH
+    strategy_ok = _install_strategy_mode()
     if _INSTALLED:
         return True
     try:
         from core.startup import board_retry_patch as brp
+
         cur = getattr(brp, "_fetch_board_rest", None)
         if not callable(cur):
-            logger.warning("[SUMMARY AI BOARD REST COOLDOWN] fetch unavailable version=%s", VERSION)
+            logger.warning("[SUMMARY AI BOARD REST COOLDOWN] fetch unavailable version=%s strategy=%s", VERSION, strategy_ok)
             return False
-        if getattr(cur, "_summary_ai_cooldown_bypass_v1", False):
+        if getattr(cur, "_summary_ai_cooldown_bypass_v2", False) or getattr(cur, "_summary_ai_cooldown_bypass_v1", False):
             _INSTALLED = True
             return True
         _ORIG_FETCH = cur
@@ -74,7 +95,11 @@ def install() -> bool:
                     setattr(brp, "_REST_COOLDOWN_UNTIL", 0.0)
                     logger.warning(
                         "[SUMMARY AI BOARD REST COOLDOWN] cleared cooldown before REST symbol=%s side=%s source=%s remaining=%.1fs version=%s",
-                        symbol, side, source, remaining, VERSION,
+                        symbol,
+                        side,
+                        source,
+                        remaining,
+                        VERSION,
                     )
                 desired_timeout = max(2.0, _env_float("SUMMARY_AI_REST_BOARD_TIMEOUT_SEC", 2.0))
                 if _env_float("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", 0.0) < desired_timeout:
@@ -92,7 +117,10 @@ def install() -> bool:
                         setattr(brp, "_REST_COOLDOWN_UNTIL", 0.0)
                         logger.warning(
                             "[SUMMARY AI BOARD REST COOLDOWN] cleared cooldown after REST symbol=%s side=%s source=%s version=%s",
-                            symbol, side, source, VERSION,
+                            symbol,
+                            side,
+                            source,
+                            VERSION,
                         )
                     if old_timeout is None:
                         os.environ.pop("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", None)
@@ -101,15 +129,20 @@ def install() -> bool:
             if is_summary:
                 logger.warning(
                     "[SUMMARY AI BOARD REST COOLDOWN] REST result symbol=%s side=%s source=%s valid=%s version=%s",
-                    symbol, side, source, _valid_board(board), VERSION,
+                    symbol,
+                    side,
+                    source,
+                    _valid_board(board),
+                    VERSION,
                 )
             return board
 
+        _patched_fetch_board_rest._summary_ai_cooldown_bypass_v2 = True  # type: ignore[attr-defined]
         _patched_fetch_board_rest._summary_ai_cooldown_bypass_v1 = True  # type: ignore[attr-defined]
         _patched_fetch_board_rest._original = _ORIG_FETCH  # type: ignore[attr-defined]
         brp._fetch_board_rest = _patched_fetch_board_rest
         _INSTALLED = True
-        logger.warning("[SUMMARY AI BOARD REST COOLDOWN] installed version=%s", VERSION)
+        logger.warning("[SUMMARY AI BOARD REST COOLDOWN] installed version=%s strategy=%s", VERSION, strategy_ok)
         return True
     except Exception:
         logger.exception("[SUMMARY AI BOARD REST COOLDOWN] install failed version=%s", VERSION)
