@@ -1,0 +1,280 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import datetime as dt
+import logging
+import os
+import sqlite3
+import threading
+import time
+from functools import wraps
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
+VERSION = "V1-SUMMARY-AI-EMP-PROB-GATE-5M"
+_INSTALLED = False
+_WATCHER_STARTED = False
+_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+
+
+def _env_bool(k: str, d: bool = True) -> bool:
+    v = os.environ.get(k)
+    if v is None or str(v).strip() == "":
+        return d
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enabled"}
+
+
+def _env_float(k: str, d: float) -> float:
+    try:
+        v = os.environ.get(k)
+        return d if v is None or str(v).strip() == "" else float(str(v).replace(",", ""))
+    except Exception:
+        return d
+
+
+def _env_int(k: str, d: int) -> int:
+    try:
+        v = os.environ.get(k)
+        return d if v is None or str(v).strip() == "" else int(float(str(v).replace(",", "")))
+    except Exception:
+        return d
+
+
+def _f(v: Any, d: float = 0.0) -> float:
+    try:
+        if v is None or str(v).strip() == "":
+            return d
+        x = float(str(v).replace(",", ""))
+        return d if x != x else x
+    except Exception:
+        return d
+
+
+def _sym(v: Any) -> str:
+    s = str(v or "").strip()
+    return s[:-2] if s.endswith(".0") and s[:-2].isdigit() else s
+
+
+def _side(v: Any) -> str:
+    s = str(v or "BUY").strip().upper()
+    return s if s in {"BUY", "SELL"} else "BUY"
+
+
+def _db_path() -> str:
+    base = os.environ.get("SUMMARY_DB_DIR", r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary")
+    return os.environ.get("SUMMARY_DB_PATH", str(Path(base) / f"summary{dt.datetime.now().strftime('%Y%m%d')}.db"))
+
+
+def _col(cols: set[str], names: tuple[str, ...]) -> str:
+    return next((x for x in names if x in cols), "")
+
+
+def _load_rows(symbol: str, limit: int) -> list[dict[str, float]]:
+    path = _db_path()
+    table = os.environ.get("SUMMARY_AI_EMP_PROB_TABLE", "stock_summary_1min")
+    if not symbol or not Path(path).exists():
+        return []
+    try:
+        with sqlite3.connect(path, timeout=1.0) as con:
+            con.execute("PRAGMA busy_timeout=1000")
+            cols = {str(r[1]) for r in con.execute(f'PRAGMA table_info("{table}")').fetchall()}
+            c_sym = _col(cols, ("symbol", "code", "stock_code"))
+            c_dt = _col(cols, ("datetime", "dt", "timestamp", "time"))
+            c_cl = _col(cols, ("close", "close_price", "price", "current_price"))
+            c_hi = _col(cols, ("high", "high_price")) or c_cl
+            c_lo = _col(cols, ("low", "low_price")) or c_cl
+            c_vo = _col(cols, ("volume", "vol", "trading_volume"))
+            if not c_sym or not c_dt or not c_cl:
+                return []
+            vol_expr = c_vo if c_vo else "0"
+            rows = con.execute(
+                f'SELECT {c_dt},{c_cl},{c_hi},{c_lo},{vol_expr} FROM "{table}" WHERE CAST({c_sym} AS TEXT)=? ORDER BY {c_dt} DESC LIMIT ?',
+                (symbol, max(30, limit)),
+            ).fetchall()
+        out = []
+        for r in reversed(rows):
+            close = _f(r[1])
+            if close > 0:
+                out.append({"close": close, "high": _f(r[2], close), "low": _f(r[3], close), "volume": _f(r[4])})
+        return out
+    except Exception:
+        logger.debug("[SUMMARY AI EMP PROB] load failed symbol=%s", symbol, exc_info=True)
+        return []
+
+
+def _current(item: dict[str, Any]) -> tuple[str, str, float]:
+    merged: dict[str, Any] = {}
+    if isinstance(item.get("source_row"), dict):
+        merged.update(item["source_row"])
+    if isinstance(item.get("ai_row"), dict):
+        merged.update(item["ai_row"])
+    merged.update(item)
+    symbol = _sym(merged.get("symbol") or merged.get("Symbol") or merged.get("code"))
+    side = _side(merged.get("side") or merged.get("ai_side") or merged.get("entry_decision"))
+    volume = _f(merged.get("volume") or merged.get("ai_disp_volume") or merged.get("trading_volume"))
+    return symbol, side, volume
+
+
+def _stats(item: dict[str, Any]) -> dict[str, Any]:
+    symbol, side, cur_volume = _current(item)
+    window = max(1, _env_int("SUMMARY_AI_EMP_PROB_WINDOW_BARS", 5))
+    lookback = max(window + 20, _env_int("SUMMARY_AI_EMP_PROB_LOOKBACK_BARS", 180))
+    key = (symbol, side)
+    now = time.time()
+    cached = _CACHE.get(key)
+    if cached and now - cached[0] <= _env_float("SUMMARY_AI_EMP_PROB_CACHE_TTL_SEC", 5.0):
+        return dict(cached[1])
+    rows = _load_rows(symbol, lookback)
+    target_pct = abs(_env_float("SUMMARY_AI_EMP_PROB_TARGET_PCT", _env_float("EXIT_TAKE_PROFIT_PCT", 0.0020)))
+    risk_pct = abs(_env_float("SUMMARY_AI_EMP_PROB_RISK_PCT", _env_float("EXIT_STOP_LOSS_PCT", 0.0030)))
+    samples = target_first = risk_first = neither = 0
+    for i in range(0, max(0, len(rows) - window - 1)):
+        entry = _f(rows[i].get("close"))
+        if entry <= 0:
+            continue
+        pv = _f(rows[i].get("volume"))
+        if cur_volume > 0 and pv > 0:
+            ratio = pv / cur_volume
+            if ratio < _env_float("SUMMARY_AI_EMP_PROB_MIN_VOLUME_RATIO", 0.25) or ratio > _env_float("SUMMARY_AI_EMP_PROB_MAX_VOLUME_RATIO", 4.0):
+                continue
+        fut = rows[i + 1:i + 1 + window]
+        if len(fut) < window:
+            continue
+        samples += 1
+        t_i = r_i = 999
+        for j, fr in enumerate(fut, start=1):
+            hi = _f(fr.get("high")); lo = _f(fr.get("low"))
+            if side == "BUY":
+                if t_i == 999 and hi >= entry * (1.0 + target_pct):
+                    t_i = j
+                if r_i == 999 and lo <= entry * (1.0 - risk_pct):
+                    r_i = j
+            else:
+                if t_i == 999 and lo <= entry * (1.0 - target_pct):
+                    t_i = j
+                if r_i == 999 and hi >= entry * (1.0 + risk_pct):
+                    r_i = j
+        if t_i != 999 and t_i <= r_i:
+            target_first += 1
+        elif r_i != 999:
+            risk_first += 1
+        else:
+            neither += 1
+    p_target = target_first / samples if samples else 0.0
+    p_risk = risk_first / samples if samples else 0.0
+    ev = p_target * target_pct - p_risk * risk_pct
+    out = {"symbol": symbol, "side": side, "samples": samples, "p_target_5m": p_target, "p_risk_5m": p_risk, "expected_value": ev, "target_pct": target_pct, "risk_pct": risk_pct, "window_bars": window, "neither": neither, "rows": len(rows)}
+    _CACHE[key] = (now, dict(out))
+    return out
+
+
+def _add_reason(base: Any, extra: str) -> str:
+    b = str(base or "").strip()
+    return extra if not b else f"{b}|{extra}"
+
+
+def _check(item: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+    st = _stats(item)
+    samples = int(st.get("samples") or 0)
+    min_samples = _env_int("SUMMARY_AI_EMP_PROB_MIN_SAMPLES", 12)
+    if samples < min_samples:
+        reason = f"emp_prob_sample_low:{samples}<{min_samples}"
+        if _env_bool("SUMMARY_AI_EMP_PROB_REQUIRE_MIN_SAMPLES", False):
+            return False, reason, st
+        return True, reason + ":fail_open", st
+    min_p = _env_float("SUMMARY_AI_EMP_PROB_MIN_TARGET_PROB", 0.55)
+    max_r = _env_float("SUMMARY_AI_EMP_PROB_MAX_RISK_PROB", 0.40)
+    min_ev = _env_float("SUMMARY_AI_EMP_PROB_MIN_EXPECTED_VALUE", 0.0)
+    p = _f(st.get("p_target_5m")); r = _f(st.get("p_risk_5m")); ev = _f(st.get("expected_value"))
+    if p < min_p:
+        return False, f"emp_prob_target_low:{p:.3f}<{min_p:.3f}", st
+    if r > max_r:
+        return False, f"emp_prob_risk_high:{r:.3f}>{max_r:.3f}", st
+    if ev <= min_ev:
+        return False, f"emp_prob_ev_low:{ev:.5f}<={min_ev:.5f}", st
+    return True, f"emp_prob_ok:p={p:.3f} risk={r:.3f} ev={ev:.5f} n={samples}", st
+
+
+def _patch() -> bool:
+    try:
+        from trading.entry.summary_ai import ai_gate_runner as agr
+        cur = getattr(agr, "run_ai_gate_for_candidates", None)
+        if not callable(cur):
+            return False
+        if getattr(cur, "_summary_ai_emp_prob_gate_v1", False):
+            return True
+        @wraps(cur)
+        def wrapped(*args: Any, **kwargs: Any):
+            res = cur(*args, **kwargs)
+            if not isinstance(res, list) or not _env_bool("SUMMARY_AI_EMP_PROB_GATE_ENABLED", True):
+                return res
+            out = []
+            blocked = passed = fail_open = 0
+            for item in res:
+                if not isinstance(item, dict) or not bool(item.get("allow")):
+                    out.append(item); continue
+                ok, reason, st = _check(item)
+                x = dict(item)
+                x["emp_prob"] = st
+                x["p_target_5m"] = st.get("p_target_5m")
+                x["p_risk_5m"] = st.get("p_risk_5m")
+                x["emp_expected_value"] = st.get("expected_value")
+                x["reason"] = _add_reason(x.get("reason"), reason)
+                if ok:
+                    passed += 1
+                    if "fail_open" in reason:
+                        fail_open += 1
+                else:
+                    x["allow"] = False
+                    blocked += 1
+                    logger.warning("[SUMMARY AI EMP PROB] AI_OK->NG symbol=%s side=%s reason=%s stats=%s", x.get("symbol"), x.get("side"), reason, st)
+                out.append(x)
+            logger.warning("[SUMMARY AI EMP PROB] result total=%s passed=%s blocked=%s fail_open=%s version=%s", len(res), passed, blocked, fail_open, VERSION)
+            return out
+        wrapped._summary_ai_emp_prob_gate_v1 = True  # type: ignore[attr-defined]
+        wrapped._original = cur  # type: ignore[attr-defined]
+        agr.run_ai_gate_for_candidates = wrapped
+        logger.warning("[SUMMARY AI EMP PROB] patched version=%s", VERSION)
+        return True
+    except Exception:
+        logger.exception("[SUMMARY AI EMP PROB] patch failed")
+        return False
+
+
+def _defaults() -> None:
+    os.environ.setdefault("SUMMARY_AI_EMP_PROB_GATE_ENABLED", "1")
+    os.environ.setdefault("SUMMARY_AI_EMP_PROB_WINDOW_BARS", "5")
+    os.environ.setdefault("SUMMARY_AI_EMP_PROB_LOOKBACK_BARS", "180")
+    os.environ.setdefault("SUMMARY_AI_EMP_PROB_MIN_SAMPLES", "12")
+    os.environ.setdefault("SUMMARY_AI_EMP_PROB_REQUIRE_MIN_SAMPLES", "0")
+    os.environ.setdefault("SUMMARY_AI_EMP_PROB_MIN_TARGET_PROB", "0.55")
+    os.environ.setdefault("SUMMARY_AI_EMP_PROB_MAX_RISK_PROB", "0.40")
+    os.environ.setdefault("SUMMARY_AI_EMP_PROB_MIN_EXPECTED_VALUE", "0.0")
+
+
+def _watch() -> None:
+    for _ in range(max(1, _env_int("SUMMARY_AI_EMP_PROB_WATCH_LOOPS", 120))):
+        _patch(); time.sleep(max(0.5, _env_float("SUMMARY_AI_EMP_PROB_WATCH_INTERVAL", 1.0)))
+
+
+def install() -> bool:
+    global _INSTALLED, _WATCHER_STARTED
+    if os.environ.get("DISABLE_SUMMARY_AI_EMP_PROB_GATE_PATCH", "").strip() == "1":
+        return False
+    _defaults()
+    ok = _patch()
+    if not _WATCHER_STARTED and _env_bool("SUMMARY_AI_EMP_PROB_WATCHER", True):
+        _WATCHER_STARTED = True
+        threading.Thread(target=_watch, name="summary-ai-emp-prob-watch", daemon=True).start()
+    _INSTALLED = bool(ok or _WATCHER_STARTED)
+    logger.warning("[SUMMARY AI EMP PROB] installed ok=%s enabled=%s min_p=%s max_risk=%s samples=%s version=%s", _INSTALLED, os.environ.get("SUMMARY_AI_EMP_PROB_GATE_ENABLED"), os.environ.get("SUMMARY_AI_EMP_PROB_MIN_TARGET_PROB"), os.environ.get("SUMMARY_AI_EMP_PROB_MAX_RISK_PROB"), os.environ.get("SUMMARY_AI_EMP_PROB_MIN_SAMPLES"), VERSION)
+    return _INSTALLED
+
+
+try:
+    install()
+except Exception:
+    logger.exception("[SUMMARY AI EMP PROB] auto install failed")
+
+__all__ = ["VERSION", "install"]
