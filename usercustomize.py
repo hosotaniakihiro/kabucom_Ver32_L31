@@ -1,3 +1,24 @@
+# -*- coding: utf-8 -*-
+# ============================================================
+# File   : usercustomize.py
+# 機能   :
+#   Python起動時に自動実行されるユーザー起動パッチ。
+#
+#   主な役割:
+#   1. main.py 起動時の runtime defaults を復元する
+#   2. Summary-AI / Ranking / Tonosama / PUSH rotation 関連の補助パッチを自動installする
+#   3. 板なしエントリーを禁止する安全設定を固定する
+#   4. Tonosama通知の直近出来高表示を補正する
+#   5. PUSHローテーション時の監視銘柄除外を防ぐ
+#   6. Summary-AI の AI_OK 後に、5分以内の利確到達確率・損切到達確率・期待値を確認する
+#      実績確率ゲート summary_ai_emp_prob_gate_patch を自動installする
+#
+# 注意:
+#   - 板なしエントリーは許可しない
+#   - 実績確率ゲートは AI が出した confidence を確率として扱わず、
+#     summary DB の1分足履歴から実測ベースで判定する
+# ============================================================
+
 from __future__ import annotations
 
 import logging
@@ -41,9 +62,28 @@ def _env_int(name: str, default: int) -> int:
 def _is_database_collector_context() -> bool:
     try:
         argv = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
-        if any(x in argv for x in ("main_database.py", "db_prepare_runner.py", "ranking_collector_runner.py", "push_receiver_runner.py", "yahoo_complement_runner.py", "summary_database_runner.py", "data_collectors_runner.py")):
+        if any(
+            x in argv
+            for x in (
+                "main_database.py",
+                "db_prepare_runner.py",
+                "ranking_collector_runner.py",
+                "push_receiver_runner.py",
+                "yahoo_complement_runner.py",
+                "summary_database_runner.py",
+                "data_collectors_runner.py",
+            )
+        ):
             return True
-        return any(os.getenv(k) == "1" for k in ("AUTOSTOCK_DATA_COLLECTORS_PROCESS", "AUTOSTOCK_MAIN_DATABASE_PROCESS", "AUTOSTOCK_SUMMARY_DB_WRITER", "AUTOSTOCK_RANKING_COLLECTOR_PROCESS"))
+        return any(
+            os.getenv(k) == "1"
+            for k in (
+                "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+                "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+                "AUTOSTOCK_SUMMARY_DB_WRITER",
+                "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
+            )
+        )
     except Exception:
         return False
 
@@ -59,11 +99,13 @@ def _is_main_py() -> bool:
 def _patch_entry_order_builder_logger() -> bool:
     try:
         from trading.handlers import entry_order_builder as eob
+
         cur = getattr(eob, "logger", None)
         if cur is None or not hasattr(cur, "warning") or not hasattr(cur, "info"):
             eob.logger = logging.getLogger("trading.handlers.entry_order_builder")
             logger.warning("[USERCUSTOMIZE] entry_order_builder.logger patched version=V1-LOGGER-HOTFIX")
             return True
+
         logger.warning("[USERCUSTOMIZE] entry_order_builder.logger already ok version=V1-LOGGER-HOTFIX")
         return True
     except Exception:
@@ -75,9 +117,16 @@ def _install_summary_ai_fast_order_builder() -> bool:
     try:
         os.environ.setdefault("ENTRY_ORDER_BOARD_RETRY_SEC", "0.8")
         os.environ.setdefault("ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", "0.2")
+
         from core.startup.summary_ai_fast_order_builder_patch import install as _install_fast_order
+
         ok = bool(_install_fast_order())
-        logger.warning("[USERCUSTOMIZE] summary AI fast order builder ok=%s retry_sec=%s retry_interval=%s", ok, os.getenv("ENTRY_ORDER_BOARD_RETRY_SEC"), os.getenv("ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC"))
+        logger.warning(
+            "[USERCUSTOMIZE] summary AI fast order builder ok=%s retry_sec=%s retry_interval=%s",
+            ok,
+            os.getenv("ENTRY_ORDER_BOARD_RETRY_SEC"),
+            os.getenv("ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC"),
+        )
         return ok
     except Exception:
         logger.exception("[USERCUSTOMIZE] summary AI fast order builder failed")
@@ -87,6 +136,7 @@ def _install_summary_ai_fast_order_builder() -> bool:
 def _install_summary_ai_ranking_prefilter_signal() -> bool:
     try:
         from core.startup.summary_ai_ranking_prefilter_signal_patch import install as _install_prefilter
+
         ok = bool(_install_prefilter())
         logger.warning("[USERCUSTOMIZE] summary AI ranking prefilter signal ok=%s", ok)
         return ok
@@ -98,6 +148,7 @@ def _install_summary_ai_ranking_prefilter_signal() -> bool:
 def _install_summary_ai_no_ranking_rescue_scan() -> bool:
     try:
         from core.startup.summary_ai_no_ranking_rescue_scan_patch import install as _install_no_scan
+
         ok = bool(_install_no_scan())
         logger.warning("[USERCUSTOMIZE] summary AI no ranking rescue scan ok=%s", ok)
         return ok
@@ -109,6 +160,7 @@ def _install_summary_ai_no_ranking_rescue_scan() -> bool:
 def _install_summary_ai_board_rest_cooldown() -> bool:
     try:
         from core.startup.summary_ai_board_rest_cooldown_patch import install as _install_cooldown
+
         ok = bool(_install_cooldown())
         logger.warning("[USERCUSTOMIZE] summary AI board REST cooldown bypass ok=%s", ok)
         return ok
@@ -117,9 +169,42 @@ def _install_summary_ai_board_rest_cooldown() -> bool:
         return False
 
 
+def _install_summary_ai_emp_prob_gate() -> bool:
+    """
+    Summary-AI 実績確率ゲートをinstallする。
+
+    AIが allow=True を出した後に、
+    summary DB の1分足履歴から以下を確認する。
+
+    - 5分以内に利確方向へ先に到達した確率
+    - 5分以内に損切方向へ先に到達した確率
+    - 期待値
+
+    これにより、AI confidence を「上がる確率」と誤解せず、
+    実測ベースの確率で AI_OK を最終確認する。
+    """
+    try:
+        from core.startup.summary_ai_emp_prob_gate_patch import install as _install_emp_prob_gate
+
+        ok = bool(_install_emp_prob_gate())
+        logger.warning(
+            "[USERCUSTOMIZE] summary AI empirical probability gate ok=%s enabled=%s min_p=%s max_risk=%s samples=%s",
+            ok,
+            os.getenv("SUMMARY_AI_EMP_PROB_GATE_ENABLED"),
+            os.getenv("SUMMARY_AI_EMP_PROB_MIN_TARGET_PROB"),
+            os.getenv("SUMMARY_AI_EMP_PROB_MAX_RISK_PROB"),
+            os.getenv("SUMMARY_AI_EMP_PROB_MIN_SAMPLES"),
+        )
+        return ok
+    except Exception:
+        logger.exception("[USERCUSTOMIZE] summary AI empirical probability gate failed")
+        return False
+
+
 def _install_runtime_defaults() -> bool:
     try:
         from core.startup.runtime_env_defaults_patch import install as _install_defaults
+
         ok = bool(_install_defaults())
         logger.warning("[USERCUSTOMIZE] centralized runtime defaults ok=%s", ok)
         return ok
@@ -131,6 +216,7 @@ def _install_runtime_defaults() -> bool:
 def _install_summary_pending_age_relax() -> bool:
     try:
         from core.startup.summary_entry_pending_age_relax_patch import install as _install_age_relax
+
         ok = bool(_install_age_relax())
         logger.warning("[USERCUSTOMIZE] summary pending age relax ok=%s max_age=%s", ok, os.getenv("SUMMARY_ENTRY_PENDING_MAX_AGE_SEC"))
         return ok
@@ -142,6 +228,7 @@ def _install_summary_pending_age_relax() -> bool:
 def _install_summary_mtf_duplicate_datetime_guard() -> bool:
     try:
         from core.startup.summary_mtf_duplicate_datetime_guard_patch import install as _install_guard
+
         ok = bool(_install_guard())
         logger.warning("[USERCUSTOMIZE] summary MTF duplicate datetime guard ok=%s", ok)
         return ok
@@ -156,8 +243,10 @@ _install_summary_ai_fast_order_builder()
 _install_summary_ai_ranking_prefilter_signal()
 _install_summary_ai_no_ranking_rescue_scan()
 _install_summary_ai_board_rest_cooldown()
+_install_summary_ai_emp_prob_gate()
 _install_summary_pending_age_relax()
 _install_summary_mtf_duplicate_datetime_guard()
+
 
 if _is_main_py():
     for k, v in {
@@ -182,7 +271,19 @@ if _is_main_py():
         "FORCE_ENABLE_MAIN_SUMMARY_PARENT_TICK": "1",
     }.items():
         _env_default(k, v)
-    logger.warning("[USERCUSTOMIZE] main restore defaults mode=%s exit=%s ranking=%s tonosama=%s summary_ai=%s summary_parent=%s summary_db_save_skip=%s yahoo_skip=%s", os.getenv("AUTOSTOCK_MAIN_OPERATION_MODE"), os.getenv("AUTOSTOCK_MAIN_ENABLE_EXIT_LOOP"), os.getenv("AUTOSTOCK_MAIN_ENABLE_RANKING_ENTRY"), os.getenv("AUTOSTOCK_MAIN_ENABLE_TONOSAMA_ENTRY"), os.getenv("AUTOSTOCK_MAIN_ENABLE_SUMMARY_AI_ENTRY"), os.getenv("AUTOSTOCK_MAIN_ENABLE_SUMMARY_PARENT_TICK"), os.getenv("AUTOSTOCK_MAIN_SKIP_SUMMARY_DB_SAVE"), os.getenv("AUTOSTOCK_MAIN_SKIP_YAHOO_COMPLEMENT"))
+
+    logger.warning(
+        "[USERCUSTOMIZE] main restore defaults mode=%s exit=%s ranking=%s tonosama=%s summary_ai=%s summary_parent=%s summary_db_save_skip=%s yahoo_skip=%s",
+        os.getenv("AUTOSTOCK_MAIN_OPERATION_MODE"),
+        os.getenv("AUTOSTOCK_MAIN_ENABLE_EXIT_LOOP"),
+        os.getenv("AUTOSTOCK_MAIN_ENABLE_RANKING_ENTRY"),
+        os.getenv("AUTOSTOCK_MAIN_ENABLE_TONOSAMA_ENTRY"),
+        os.getenv("AUTOSTOCK_MAIN_ENABLE_SUMMARY_AI_ENTRY"),
+        os.getenv("AUTOSTOCK_MAIN_ENABLE_SUMMARY_PARENT_TICK"),
+        os.getenv("AUTOSTOCK_MAIN_SKIP_SUMMARY_DB_SAVE"),
+        os.getenv("AUTOSTOCK_MAIN_SKIP_YAHOO_COMPLEMENT"),
+    )
+
 
 # 板なしは流動性不足扱い。ここではエントリー許可へ緩めない。
 os.environ.setdefault("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", "0")
@@ -201,6 +302,7 @@ def _uc_float(v, default: float = 0.0) -> float:
 def _uc_patch_tonosama_recent_volume_display() -> bool:
     if not _is_main_py():
         return False
+
     try:
         import re
         import pandas as pd
@@ -211,44 +313,81 @@ def _uc_patch_tonosama_recent_volume_display() -> bool:
             return s.astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
 
         orig_build = getattr(vs.build_scalping_feature_df, "_original", vs.build_scalping_feature_df)
+
         if not getattr(vs.build_scalping_feature_df, "_uc_recent_volume_display_v1", False):
+
             def _patched_build_scalping_feature_df():
                 out = orig_build()
                 try:
                     if out is None or out.empty or "symbol" not in out.columns:
                         return out
+
                     raw1 = vs.normalize_summary_base(vs.load_merged_summary(1), interval=1)
                     if raw1 is None or raw1.empty or "symbol" not in raw1.columns or "volume" not in raw1.columns:
                         return out
+
                     raw1 = raw1.copy()
                     raw1["symbol"] = _norm_symbol_series(raw1["symbol"])
                     raw1["volume"] = pd.to_numeric(raw1["volume"], errors="coerce").fillna(0.0)
+
                     if "datetime" in raw1.columns:
                         raw1["datetime"] = pd.to_datetime(raw1["datetime"], errors="coerce")
                         raw1 = raw1.dropna(subset=["datetime"]).sort_values(["symbol", "datetime"])
+
                     rows = []
                     for sym, g in raw1.groupby("symbol", sort=False):
                         gv = g.tail(5)["volume"]
-                        rows.append({"symbol": str(sym), "recent_volume_1m": float(gv.tail(1).sum()), "recent_volume_3m": float(gv.tail(3).sum()), "recent_volume_5m": float(gv.tail(5).sum())})
+                        rows.append(
+                            {
+                                "symbol": str(sym),
+                                "recent_volume_1m": float(gv.tail(1).sum()),
+                                "recent_volume_3m": float(gv.tail(3).sum()),
+                                "recent_volume_5m": float(gv.tail(5).sum()),
+                            }
+                        )
+
                     if not rows:
                         return out
+
                     recent = pd.DataFrame(rows)
                     x = out.copy()
                     x["symbol"] = _norm_symbol_series(x["symbol"])
                     x = x.merge(recent, on="symbol", how="left")
+
                     for c in ("recent_volume_1m", "recent_volume_3m", "recent_volume_5m"):
                         x[c] = pd.to_numeric(x.get(c, 0.0), errors="coerce").fillna(0.0)
-                    logger.warning("[USERCUSTOMIZE][TONOSAMA RECENT VOLUME DISPLAY] attached rows=%s sample=%s", len(x), x[[c for c in ["symbol", "recent_volume_1m", "recent_volume_3m", "recent_volume_5m"] if c in x.columns]].head(10).to_dict("records"))
+
+                    logger.warning(
+                        "[USERCUSTOMIZE][TONOSAMA RECENT VOLUME DISPLAY] attached rows=%s sample=%s",
+                        len(x),
+                        x[
+                            [
+                                c
+                                for c in [
+                                    "symbol",
+                                    "recent_volume_1m",
+                                    "recent_volume_3m",
+                                    "recent_volume_5m",
+                                ]
+                                if c in x.columns
+                            ]
+                        ]
+                        .head(10)
+                        .to_dict("records"),
+                    )
                     return x
                 except Exception:
                     logger.exception("[USERCUSTOMIZE][TONOSAMA RECENT VOLUME DISPLAY] attach failed")
                     return out
+
             _patched_build_scalping_feature_df._uc_recent_volume_display_v1 = True  # type: ignore[attr-defined]
             _patched_build_scalping_feature_df._original = orig_build  # type: ignore[attr-defined]
             vs.build_scalping_feature_df = _patched_build_scalping_feature_df
 
         orig_conditions = getattr(pw._entry_conditions_from_row, "_original", pw._entry_conditions_from_row)
+
         if not getattr(pw._entry_conditions_from_row, "_uc_recent_volume_display_v1", False):
+
             def _row_vol(row, names, default=0.0):
                 for name in names:
                     try:
@@ -272,6 +411,7 @@ def _uc_patch_tonosama_recent_volume_display() -> bool:
                     v1 = _row_vol(row, ["recent_volume_1m", "volume_1m", "latest_volume_1m", "volume", "_latest_volume"])
                     v3 = _row_vol(row, ["recent_volume_3m", "volume_last_3m", "rolling_volume_3m", "volume_3m_display", "volume_3m"], v1)
                     v5 = _row_vol(row, ["recent_volume_5m", "volume_last_5m", "rolling_volume_5m", "volume_5m_display", "volume_5m"], v3)
+
                     if isinstance(cond, dict):
                         cond["display_volume_1m"] = v1
                         cond["display_volume_3m"] = v3
@@ -280,13 +420,23 @@ def _uc_patch_tonosama_recent_volume_display() -> bool:
                         cond["recent_volume_3m"] = v3
                         cond["recent_volume_5m"] = v5
                         cond["reason"] = _replace_volume_text(str(cond.get("reason") or ""), v1, v3, v5)
-                    logger.warning("[USERCUSTOMIZE][TONOSAMA RECENT VOLUME DISPLAY] reason fixed symbol=%s side=%s v1=%.0f v3=%.0f v5=%.0f", row.get("symbol") if hasattr(row, "get") else None, side, v1, v3, v5)
+
+                    logger.warning(
+                        "[USERCUSTOMIZE][TONOSAMA RECENT VOLUME DISPLAY] reason fixed symbol=%s side=%s v1=%.0f v3=%.0f v5=%.0f",
+                        row.get("symbol") if hasattr(row, "get") else None,
+                        side,
+                        v1,
+                        v3,
+                        v5,
+                    )
                 except Exception:
                     logger.exception("[USERCUSTOMIZE][TONOSAMA RECENT VOLUME DISPLAY] reason patch failed")
                 return cond
+
             _patched_entry_conditions_from_row._uc_recent_volume_display_v1 = True  # type: ignore[attr-defined]
             _patched_entry_conditions_from_row._original = orig_conditions  # type: ignore[attr-defined]
             pw._entry_conditions_from_row = _patched_entry_conditions_from_row
+
         logger.warning("[USERCUSTOMIZE] TONOSAMA recent volume display patch installed")
         return True
     except Exception:
@@ -306,12 +456,14 @@ def _uc_norm_symbol(v: Any) -> str:
 def _uc_dedupe_symbols(values: Iterable[Any]) -> list[str]:
     out = []
     seen = set()
+
     for x in values or []:
         s = _uc_norm_symbol(x)
         if not s or s in seen:
             continue
         seen.add(s)
         out.append(s)
+
     return out
 
 
@@ -323,17 +475,22 @@ def _uc_is_push_rotation_context(context: str) -> bool:
 def _uc_patch_watchlist_recent_liq_rotation_failopen() -> bool:
     if not _is_main_py():
         return False
+
     try:
         try:
             from core.startup.watchlist_recent_liquidity_bulk_patch import install as _bulk_install
+
             _bulk_install()
         except Exception:
             logger.exception("[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] bulk install before wrap failed")
+
         import core.startup.watchlist_recent_liquidity_guard_patch as base
+
         orig_filter = getattr(base, "_filter_symbols", None)
         if not callable(orig_filter):
             logger.warning("[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] base _filter_symbols missing")
             return False
+
         if getattr(orig_filter, "_uc_push_rotation_failopen_v1", False):
             return True
 
@@ -341,42 +498,70 @@ def _uc_patch_watchlist_recent_liq_rotation_failopen() -> bool:
             items = _uc_dedupe_symbols(symbols)
             out = orig_filter(items, context=context)
             out_items = _uc_dedupe_symbols(out)
+
             if _uc_is_push_rotation_context(context) and items:
                 min_keep = max(1, min(len(items), _env_int("UC_PUSH_ROTATION_LIQ_FAILOPEN_MIN_KEEP", 50)))
                 if len(out_items) < min_keep:
-                    logger.warning("[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] context=%s before=%s after=%s min_keep=%s -> keep original targets", context, len(items), len(out_items), min_keep)
+                    logger.warning(
+                        "[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] context=%s before=%s after=%s min_keep=%s -> keep original targets",
+                        context,
+                        len(items),
+                        len(out_items),
+                        min_keep,
+                    )
                     return items
+
             return out_items
 
         _patched_filter_symbols._uc_push_rotation_failopen_v1 = True  # type: ignore[attr-defined]
         _patched_filter_symbols._original = orig_filter  # type: ignore[attr-defined]
         base._filter_symbols = _patched_filter_symbols
+
         try:
             import trading.push.push_stream.rotation_symbols as rot_sym
+
             old_apply = getattr(rot_sym, "apply_register_liquidity_guard", None)
+
             if callable(old_apply) and not getattr(old_apply, "_uc_push_rotation_apply_failopen_v1", False):
+
                 def _patched_apply_register_liquidity_guard(targets):
                     items = _uc_dedupe_symbols(targets)
                     out = old_apply(targets)
                     out_items = _uc_dedupe_symbols(out)
+
                     if items:
                         min_keep = max(1, min(len(items), _env_int("UC_PUSH_ROTATION_LIQ_FAILOPEN_MIN_KEEP", 50)))
                         if len(out_items) < min_keep:
-                            logger.warning("[USERCUSTOMIZE][PUSH ROTATION APPLY FAILOPEN] before=%s after=%s min_keep=%s -> keep original targets", len(items), len(out_items), min_keep)
+                            logger.warning(
+                                "[USERCUSTOMIZE][PUSH ROTATION APPLY FAILOPEN] before=%s after=%s min_keep=%s -> keep original targets",
+                                len(items),
+                                len(out_items),
+                                min_keep,
+                            )
                             return items
+
                     return out_items
+
                 _patched_apply_register_liquidity_guard._uc_push_rotation_apply_failopen_v1 = True  # type: ignore[attr-defined]
                 _patched_apply_register_liquidity_guard._original = old_apply  # type: ignore[attr-defined]
                 rot_sym.apply_register_liquidity_guard = _patched_apply_register_liquidity_guard
+
                 try:
                     import trading.push.push_stream.rotation as rot
+
                     rot._apply_register_liquidity_guard = _patched_apply_register_liquidity_guard
                 except Exception:
                     pass
+
         except Exception:
             logger.exception("[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] rotation apply wrap failed")
-        logger.warning("[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] installed min_keep=%s", os.getenv("UC_PUSH_ROTATION_LIQ_FAILOPEN_MIN_KEEP", "50"))
+
+        logger.warning(
+            "[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] installed min_keep=%s",
+            os.getenv("UC_PUSH_ROTATION_LIQ_FAILOPEN_MIN_KEEP", "50"),
+        )
         return True
+
     except Exception:
         logger.exception("[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] install failed")
         return False
@@ -391,8 +576,10 @@ def _uc_delayed_watchlist_patch_loop() -> None:
             _install_summary_ai_ranking_prefilter_signal()
             _install_summary_ai_no_ranking_rescue_scan()
             _install_summary_ai_board_rest_cooldown()
+            _install_summary_ai_emp_prob_gate()
         except Exception:
             logger.exception("[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] delayed retry failed")
+
         time.sleep(1.0)
 
 
@@ -402,6 +589,12 @@ if _is_main_py():
     _install_summary_ai_ranking_prefilter_signal()
     _install_summary_ai_no_ranking_rescue_scan()
     _install_summary_ai_board_rest_cooldown()
+    _install_summary_ai_emp_prob_gate()
     _uc_patch_tonosama_recent_volume_display()
     _uc_patch_watchlist_recent_liq_rotation_failopen()
-    threading.Thread(target=_uc_delayed_watchlist_patch_loop, name="usercustomize-push-rotation-liq-failopen", daemon=True).start()
+
+    threading.Thread(
+        target=_uc_delayed_watchlist_patch_loop,
+        name="usercustomize-push-rotation-liq-failopen",
+        daemon=True,
+    ).start()
