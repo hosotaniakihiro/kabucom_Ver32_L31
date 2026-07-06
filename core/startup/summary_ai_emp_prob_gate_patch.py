@@ -12,11 +12,12 @@ from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V2-SUMMARY-AI-EMP-PROB-AND-HIGHLOW-UPDATE-GATE"
+VERSION = "V3-SUMMARY-AI-EMP-HIGHLOW-MA-VWAP-GATE"
 _INSTALLED = False
 _WATCHER_STARTED = False
 _CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 _HL_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+_EXT_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 
 
 def _env_bool(k: str, d: bool = True) -> bool:
@@ -122,20 +123,24 @@ def _load_tf_rows(symbol: str, interval: int, limit: int) -> list[dict[str, floa
             c_cl = _col(cols, ("close", "close_price", "price", "current_price"))
             c_hi = _col(cols, ("high", "high_price")) or c_cl
             c_lo = _col(cols, ("low", "low_price")) or c_cl
+            c_ma5 = _col(cols, ("ma5", "MA5", "sma5", "moving_average_5"))
+            c_vwap = _col(cols, ("vwap", "VWAP"))
             if not c_sym or not c_dt or not c_cl:
                 return []
+            ma5_expr = c_ma5 if c_ma5 else "0"
+            vwap_expr = c_vwap if c_vwap else "0"
             rows = con.execute(
-                f'SELECT {c_dt},{c_cl},{c_hi},{c_lo} FROM "{table}" WHERE CAST({c_sym} AS TEXT)=? ORDER BY {c_dt} DESC LIMIT ?',
+                f'SELECT {c_dt},{c_cl},{c_hi},{c_lo},{ma5_expr},{vwap_expr} FROM "{table}" WHERE CAST({c_sym} AS TEXT)=? ORDER BY {c_dt} DESC LIMIT ?',
                 (symbol, max(10, limit)),
             ).fetchall()
         out = []
         for r in reversed(rows):
             close = _f(r[1])
             if close > 0:
-                out.append({"close": close, "high": _f(r[2], close), "low": _f(r[3], close)})
+                out.append({"close": close, "high": _f(r[2], close), "low": _f(r[3], close), "ma5": _f(r[4]), "vwap": _f(r[5])})
         return out
     except Exception:
-        logger.debug("[SUMMARY AI HIGHLOW UPDATE] load failed symbol=%s interval=%s", symbol, interval, exc_info=True)
+        logger.debug("[SUMMARY AI TF] load failed symbol=%s interval=%s", symbol, interval, exc_info=True)
         return []
 
 
@@ -259,6 +264,44 @@ def _highlow_stats(item: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _dev_pct(price: float, base: float) -> float:
+    return 0.0 if price <= 0 or base <= 0 else (price - base) / base
+
+
+def _latest_dev(rows: list[dict[str, float]], interval: int) -> dict[str, Any]:
+    if not rows:
+        return {"interval": interval, "missing": True, "rows": 0}
+    r = rows[-1]
+    price = _f(r.get("close"))
+    ma5 = _f(r.get("ma5"))
+    vwap = _f(r.get("vwap"))
+    return {
+        "interval": interval,
+        "missing": price <= 0 or (ma5 <= 0 and vwap <= 0),
+        "rows": len(rows),
+        "price": price,
+        "ma5": ma5,
+        "vwap": vwap,
+        "ma5_dev": _dev_pct(price, ma5),
+        "vwap_dev": _dev_pct(price, vwap),
+    }
+
+
+def _extension_stats(item: dict[str, Any]) -> dict[str, Any]:
+    symbol, side, _ = _current(item)
+    now = time.time()
+    key = (symbol, side)
+    cached = _EXT_CACHE.get(key)
+    if cached and now - cached[0] <= _env_float("SUMMARY_AI_EXTENSION_CACHE_TTL_SEC", 5.0):
+        return dict(cached[1])
+    limit = max(10, _env_int("SUMMARY_AI_EXTENSION_LOOKBACK_BARS", 20))
+    st3 = _latest_dev(_load_tf_rows(symbol, 3, limit), 3)
+    st5 = _latest_dev(_load_tf_rows(symbol, 5, limit), 5)
+    out = {"symbol": symbol, "side": side, "tf3": st3, "tf5": st5}
+    _EXT_CACHE[key] = (now, dict(out))
+    return out
+
+
 def _add_reason(base: Any, extra: str) -> str:
     b = str(base or "").strip()
     return extra if not b else f"{b}|{extra}"
@@ -321,13 +364,48 @@ def _check_highlow(item: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
     return True, f"low_update_ok:3m={int(tf3.get('low_updates') or 0)} 5m={int(tf5.get('low_updates') or 0)} recent3m={int(tf3.get('recent_low_updates') or 0)} recent5m={int(tf5.get('recent_low_updates') or 0)}", st
 
 
+def _check_extension(item: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+    if not _env_bool("SUMMARY_AI_EXTENSION_GUARD_ENABLED", True):
+        return True, "extension_guard_disabled", {}
+    st = _extension_stats(item)
+    side = str(st.get("side") or "BUY").upper()
+    tf3 = st.get("tf3") if isinstance(st.get("tf3"), dict) else {}
+    tf5 = st.get("tf5") if isinstance(st.get("tf5"), dict) else {}
+    if bool(tf3.get("missing")) and bool(tf5.get("missing")):
+        reason = "extension_no_ma5_vwap_data"
+        if _env_bool("SUMMARY_AI_EXTENSION_REQUIRE_DATA", False):
+            return False, reason, st
+        return True, reason + ":fail_open", st
+    max_ma5_3 = _env_float("SUMMARY_AI_MAX_MA5_EXTENSION_3M", 0.0040)
+    max_ma5_5 = _env_float("SUMMARY_AI_MAX_MA5_EXTENSION_5M", 0.0050)
+    max_vwap = _env_float("SUMMARY_AI_MAX_VWAP_EXTENSION", 0.0060)
+    checks = []
+    for label, tf, ma_lim in (("3m", tf3, max_ma5_3), ("5m", tf5, max_ma5_5)):
+        if not isinstance(tf, dict) or bool(tf.get("missing")):
+            continue
+        ma_dev = _f(tf.get("ma5_dev"))
+        vw_dev = _f(tf.get("vwap_dev"))
+        if side == "BUY":
+            if _f(tf.get("ma5")) > 0 and ma_dev >= ma_lim:
+                return False, f"ma5_extension_buy_{label}:{ma_dev:.4f}>={ma_lim:.4f}", st
+            if _f(tf.get("vwap")) > 0 and vw_dev >= max_vwap:
+                return False, f"vwap_extension_buy_{label}:{vw_dev:.4f}>={max_vwap:.4f}", st
+        else:
+            if _f(tf.get("ma5")) > 0 and ma_dev <= -ma_lim:
+                return False, f"ma5_extension_sell_{label}:{ma_dev:.4f}<=-{ma_lim:.4f}", st
+            if _f(tf.get("vwap")) > 0 and vw_dev <= -max_vwap:
+                return False, f"vwap_extension_sell_{label}:{vw_dev:.4f}<=-{max_vwap:.4f}", st
+        checks.append(f"{label}:ma5={ma_dev:.4f} vwap={vw_dev:.4f}")
+    return True, "extension_ok:" + ",".join(checks), st
+
+
 def _patch() -> bool:
     try:
         from trading.entry.summary_ai import ai_gate_runner as agr
         cur = getattr(agr, "run_ai_gate_for_candidates", None)
         if not callable(cur):
             return False
-        if getattr(cur, "_summary_ai_emp_prob_gate_v2", False):
+        if getattr(cur, "_summary_ai_emp_prob_gate_v3", False):
             return True
 
         @wraps(cur)
@@ -335,10 +413,10 @@ def _patch() -> bool:
             res = cur(*args, **kwargs)
             if not isinstance(res, list):
                 return res
-            if not _env_bool("SUMMARY_AI_EMP_PROB_GATE_ENABLED", True) and not _env_bool("SUMMARY_AI_HIGHLOW_UPDATE_GUARD_ENABLED", True):
+            if not any(_env_bool(k, True) for k in ("SUMMARY_AI_EMP_PROB_GATE_ENABLED", "SUMMARY_AI_HIGHLOW_UPDATE_GUARD_ENABLED", "SUMMARY_AI_EXTENSION_GUARD_ENABLED")):
                 return res
             out = []
-            blocked = passed = fail_open = highlow_blocked = 0
+            blocked = passed = fail_open = highlow_blocked = extension_blocked = 0
             for item in res:
                 if not isinstance(item, dict) or not bool(item.get("allow")):
                     out.append(item)
@@ -365,24 +443,35 @@ def _patch() -> bool:
                         highlow_blocked += 1
                     ok = bool(hl_ok)
                     reason = hl_reason
+                if ok and _env_bool("SUMMARY_AI_EXTENSION_GUARD_ENABLED", True):
+                    ex_ok, ex_reason, ex_st = _check_extension(x)
+                    x["extension_guard"] = ex_st
+                    x["reason"] = _add_reason(x.get("reason"), ex_reason)
+                    if "fail_open" in ex_reason:
+                        fail_open += 1
+                    if not ex_ok:
+                        extension_blocked += 1
+                    ok = bool(ex_ok)
+                    reason = ex_reason
                 if ok:
                     passed += 1
                 else:
                     x["allow"] = False
                     blocked += 1
-                    logger.warning("[SUMMARY AI EMP/HIGHLOW] AI_OK->NG symbol=%s side=%s reason=%s emp=%s highlow=%s", x.get("symbol"), x.get("side"), reason, x.get("emp_prob"), x.get("highlow_update"))
+                    logger.warning("[SUMMARY AI EMP/HIGHLOW/EXT] AI_OK->NG symbol=%s side=%s reason=%s emp=%s highlow=%s extension=%s", x.get("symbol"), x.get("side"), reason, x.get("emp_prob"), x.get("highlow_update"), x.get("extension_guard"))
                 out.append(x)
-            logger.warning("[SUMMARY AI EMP/HIGHLOW] result total=%s passed=%s blocked=%s highlow_blocked=%s fail_open=%s version=%s", len(res), passed, blocked, highlow_blocked, fail_open, VERSION)
+            logger.warning("[SUMMARY AI EMP/HIGHLOW/EXT] result total=%s passed=%s blocked=%s highlow_blocked=%s extension_blocked=%s fail_open=%s version=%s", len(res), passed, blocked, highlow_blocked, extension_blocked, fail_open, VERSION)
             return out
 
+        wrapped._summary_ai_emp_prob_gate_v3 = True  # type: ignore[attr-defined]
         wrapped._summary_ai_emp_prob_gate_v2 = True  # type: ignore[attr-defined]
         wrapped._summary_ai_emp_prob_gate_v1 = True  # type: ignore[attr-defined]
         wrapped._original = cur  # type: ignore[attr-defined]
         agr.run_ai_gate_for_candidates = wrapped
-        logger.warning("[SUMMARY AI EMP/HIGHLOW] patched version=%s", VERSION)
+        logger.warning("[SUMMARY AI EMP/HIGHLOW/EXT] patched version=%s", VERSION)
         return True
     except Exception:
-        logger.exception("[SUMMARY AI EMP/HIGHLOW] patch failed")
+        logger.exception("[SUMMARY AI EMP/HIGHLOW/EXT] patch failed")
         return False
 
 
@@ -405,6 +494,12 @@ def _defaults() -> None:
     os.environ.setdefault("SUMMARY_AI_SELL_MAX_DAY_LOW_UPDATES_3M", "4")
     os.environ.setdefault("SUMMARY_AI_SELL_MAX_DAY_LOW_UPDATES_5M", "3")
     os.environ.setdefault("SUMMARY_AI_SELL_MAX_RECENT_LOW_UPDATES", "2")
+    os.environ.setdefault("SUMMARY_AI_EXTENSION_GUARD_ENABLED", "1")
+    os.environ.setdefault("SUMMARY_AI_EXTENSION_REQUIRE_DATA", "0")
+    os.environ.setdefault("SUMMARY_AI_EXTENSION_LOOKBACK_BARS", "20")
+    os.environ.setdefault("SUMMARY_AI_MAX_MA5_EXTENSION_3M", "0.0040")
+    os.environ.setdefault("SUMMARY_AI_MAX_MA5_EXTENSION_5M", "0.0050")
+    os.environ.setdefault("SUMMARY_AI_MAX_VWAP_EXTENSION", "0.0060")
 
 
 def _watch() -> None:
@@ -421,16 +516,16 @@ def install() -> bool:
     ok = _patch()
     if not _WATCHER_STARTED and _env_bool("SUMMARY_AI_EMP_PROB_WATCHER", True):
         _WATCHER_STARTED = True
-        threading.Thread(target=_watch, name="summary-ai-emp-highlow-watch", daemon=True).start()
+        threading.Thread(target=_watch, name="summary-ai-emp-highlow-ext-watch", daemon=True).start()
     _INSTALLED = bool(ok or _WATCHER_STARTED)
-    logger.warning("[SUMMARY AI EMP/HIGHLOW] installed ok=%s enabled=%s highlow=%s min_p=%s max_risk=%s samples=%s buy_high_3m=%s buy_high_5m=%s sell_low_3m=%s sell_low_5m=%s version=%s", _INSTALLED, os.environ.get("SUMMARY_AI_EMP_PROB_GATE_ENABLED"), os.environ.get("SUMMARY_AI_HIGHLOW_UPDATE_GUARD_ENABLED"), os.environ.get("SUMMARY_AI_EMP_PROB_MIN_TARGET_PROB"), os.environ.get("SUMMARY_AI_EMP_PROB_MAX_RISK_PROB"), os.environ.get("SUMMARY_AI_EMP_PROB_MIN_SAMPLES"), os.environ.get("SUMMARY_AI_BUY_MAX_DAY_HIGH_UPDATES_3M"), os.environ.get("SUMMARY_AI_BUY_MAX_DAY_HIGH_UPDATES_5M"), os.environ.get("SUMMARY_AI_SELL_MAX_DAY_LOW_UPDATES_3M"), os.environ.get("SUMMARY_AI_SELL_MAX_DAY_LOW_UPDATES_5M"), VERSION)
+    logger.warning("[SUMMARY AI EMP/HIGHLOW/EXT] installed ok=%s enabled=%s highlow=%s extension=%s min_p=%s max_risk=%s samples=%s buy_high_3m=%s buy_high_5m=%s max_ma5_3m=%s max_ma5_5m=%s max_vwap=%s version=%s", _INSTALLED, os.environ.get("SUMMARY_AI_EMP_PROB_GATE_ENABLED"), os.environ.get("SUMMARY_AI_HIGHLOW_UPDATE_GUARD_ENABLED"), os.environ.get("SUMMARY_AI_EXTENSION_GUARD_ENABLED"), os.environ.get("SUMMARY_AI_EMP_PROB_MIN_TARGET_PROB"), os.environ.get("SUMMARY_AI_EMP_PROB_MAX_RISK_PROB"), os.environ.get("SUMMARY_AI_EMP_PROB_MIN_SAMPLES"), os.environ.get("SUMMARY_AI_BUY_MAX_DAY_HIGH_UPDATES_3M"), os.environ.get("SUMMARY_AI_BUY_MAX_DAY_HIGH_UPDATES_5M"), os.environ.get("SUMMARY_AI_MAX_MA5_EXTENSION_3M"), os.environ.get("SUMMARY_AI_MAX_MA5_EXTENSION_5M"), os.environ.get("SUMMARY_AI_MAX_VWAP_EXTENSION"), VERSION)
     return _INSTALLED
 
 
 try:
     install()
 except Exception:
-    logger.exception("[SUMMARY AI EMP/HIGHLOW] auto install failed")
+    logger.exception("[SUMMARY AI EMP/HIGHLOW/EXT] auto install failed")
 
 
 __all__ = ["VERSION", "install"]
