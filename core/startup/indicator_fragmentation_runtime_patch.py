@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/indicator_fragmentation_runtime_patch.py
-# Version: V2.0-INDICATOR-PREVDAY-INMEMORY-WARMUP
+# Version: V2.1-INDICATOR-PREVDAY-WARMUP-MA12
 # ------------------------------------------------------------
 # 目的:
 #   trading.summary.indicators.indicator_calculator で、昼休みなどに
@@ -9,6 +9,11 @@
 #   さらに、寄り付き直後に当日分足だけでは ma25/ma75/RSI/MACD/ATR が
 #   未成熟になる問題を避けるため、前営業日の summary DB から最後N本を
 #   「計算用にだけ」一時連結する。
+#
+# V2.1:
+#   - 1m/3m/5m summary 出力に ma12 / ma12_slope / MA12位置関係を追加。
+#   - MA12は短期スキャル用の補助線。強制エントリー禁止ではなく、後段の
+#     Summary-AI / Ranking / Tonosama がスコア補正に使える列として保存する。
 #
 # 方針:
 #   - 前営業日行は __prevday_indicator_warmup=1 を付けてメモリ上で連結する。
@@ -37,7 +42,7 @@ except Exception:  # pragma: no cover
     PerformanceWarning = Warning  # type: ignore
 
 logger = logging.getLogger(__name__)
-VERSION = "V2.0-INDICATOR-PREVDAY-INMEMORY-WARMUP"
+VERSION = "V2.1-INDICATOR-PREVDAY-WARMUP-MA12"
 _INSTALLED = False
 _WARMUP_COL = "__prevday_indicator_warmup"
 _TRUE = {"1", "true", "yes", "y", "on", "enable", "enabled"}
@@ -327,6 +332,59 @@ def _drop_warmup_rows(out: Any) -> Any:
     return out
 
 
+def _add_ma12_features(out: Any) -> Any:
+    try:
+        if not _env_bool("SUMMARY_MA12_FEATURES_ENABLED", True):
+            return out
+        if not isinstance(out, pd.DataFrame) or out.empty:
+            return out
+        sym_col = _symbol_col(out)
+        if not sym_col:
+            return out
+        price_col = None
+        for c in ("close", "close_price", "price", "current_price"):
+            if c in out.columns:
+                price_col = c
+                break
+        if price_col is None:
+            return out
+
+        x = out.copy()
+        x["__ma12_order"] = range(len(x))
+        if "datetime" in x.columns:
+            x["__ma12_dt"] = pd.to_datetime(x["datetime"], errors="coerce")
+            x = x.sort_values([sym_col, "__ma12_dt", "__ma12_order"], na_position="last")
+        else:
+            x = x.sort_values([sym_col, "__ma12_order"], na_position="last")
+
+        price = pd.to_numeric(x[price_col], errors="coerce")
+        ma12 = price.groupby(x[sym_col], sort=False).transform(lambda s: s.rolling(12, min_periods=1).mean())
+        x["ma12"] = ma12
+        x["ma12_slope"] = ma12.groupby(x[sym_col], sort=False).diff().fillna(0.0)
+        denom = ma12.replace(0, pd.NA)
+        x["ma12_slope_pct"] = (x["ma12_slope"] / denom).fillna(0.0)
+        x["price_above_ma12"] = (price > ma12).astype(int)
+        x["price_below_ma12"] = (price < ma12).astype(int)
+        x["ma12_up"] = (x["ma12_slope"] > 0).astype(int)
+        x["ma12_down"] = (x["ma12_slope"] < 0).astype(int)
+        if "ma5" in x.columns:
+            ma5 = pd.to_numeric(x["ma5"], errors="coerce")
+            x["ma5_above_ma12"] = (ma5 > ma12).astype(int)
+            x["ma5_below_ma12"] = (ma5 < ma12).astype(int)
+            x["ma5_ma12_gap_pct"] = ((ma5 - ma12) / denom).fillna(0.0)
+        if "ma25" in x.columns:
+            ma25 = pd.to_numeric(x["ma25"], errors="coerce")
+            x["ma12_above_ma25"] = (ma12 > ma25).astype(int)
+            x["ma12_below_ma25"] = (ma12 < ma25).astype(int)
+            x["ma12_ma25_gap_pct"] = ((ma12 - ma25) / ma25.replace(0, pd.NA)).fillna(0.0)
+        x = x.sort_values("__ma12_order").drop(columns=["__ma12_order", "__ma12_dt"], errors="ignore")
+        logger.warning("[MA12 SUMMARY] attached rows=%s symbols=%s cols=ma12,ma12_slope,ma12_slope_pct", len(x), x[sym_col].nunique())
+        return x
+    except Exception:
+        logger.exception("[MA12 SUMMARY] attach failed")
+        return out
+
+
 def _wrap_indicator_func(fn: Callable[..., Any], *, name: str) -> Callable[..., Any]:
     if getattr(fn, "_indicator_fragmentation_runtime_patch", False):
         return fn
@@ -354,6 +412,7 @@ def _wrap_indicator_func(fn: Callable[..., Any], *, name: str) -> Callable[..., 
             )
             out = fn(*args2, **kwargs)
         out = _drop_warmup_rows(out)
+        out = _add_ma12_features(out)
         try:
             if isinstance(out, pd.DataFrame) and not out.empty:
                 return out.copy()
@@ -365,6 +424,7 @@ def _wrap_indicator_func(fn: Callable[..., Any], *, name: str) -> Callable[..., 
     _wrapped.__doc__ = getattr(fn, "__doc__", None)
     _wrapped._indicator_fragmentation_runtime_patch = True  # type: ignore[attr-defined]
     _wrapped._indicator_prevd_warmup_v2 = True  # type: ignore[attr-defined]
+    _wrapped._indicator_ma12_features_v21 = True  # type: ignore[attr-defined]
     _wrapped._original = fn  # type: ignore[attr-defined]
     return _wrapped
 
@@ -376,6 +436,7 @@ def install() -> bool:
     try:
         os.environ.setdefault("PREVDAY_INDICATOR_WARMUP_ENABLED", "1")
         os.environ.setdefault("PREVDAY_INDICATOR_WARMUP_BARS", "120")
+        os.environ.setdefault("SUMMARY_MA12_FEATURES_ENABLED", "1")
         import trading.summary.indicators.indicator_calculator as mod
 
         patched = []
@@ -394,11 +455,12 @@ def install() -> bool:
 
         _INSTALLED = True
         logger.warning(
-            "[IND FRAGMENTATION PATCH] installed version=%s patched=%s prevday_warmup=%s bars=%s save=0",
+            "[IND FRAGMENTATION PATCH] installed version=%s patched=%s prevday_warmup=%s bars=%s ma12=%s save=0",
             VERSION,
             patched,
             _env_bool("PREVDAY_INDICATOR_WARMUP_ENABLED", True),
             _env_int("PREVDAY_INDICATOR_WARMUP_BARS", 120),
+            _env_bool("SUMMARY_MA12_FEATURES_ENABLED", True),
         )
         return True
     except Exception:
