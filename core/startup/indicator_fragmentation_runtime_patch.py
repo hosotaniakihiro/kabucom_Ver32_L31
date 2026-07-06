@@ -1,28 +1,33 @@
 # ============================================================
 # File   : core/startup/indicator_fragmentation_runtime_patch.py
-# Version: V1.0-INDICATOR-FRAGMENTATION-WARNING-GUARD
+# Version: V2.0-INDICATOR-PREVDAY-INMEMORY-WARMUP
 # ------------------------------------------------------------
 # 目的:
 #   trading.summary.indicators.indicator_calculator で、昼休みなどに
-#   3000銘柄超へ指標計算した際の
-#     PerformanceWarning: DataFrame is highly fragmented
-#   大量出力を抑える。
+#   3000銘柄超へ指標計算した際の PerformanceWarning を抑える。
+#
+#   さらに、寄り付き直後に当日分足だけでは ma25/ma75/RSI/MACD/ATR が
+#   未成熟になる問題を避けるため、前営業日の summary DB から最後N本を
+#   「計算用にだけ」一時連結する。
 #
 # 方針:
-#   - pandas PerformanceWarning を indicator_calculator.py 由来に限定して抑制
-#   - add_all_indicators / calculate_indicators / add_indicators の戻り値を copy() し、
-#     後続処理に断片化DataFrameを渡さない
-#
-# 注意:
-#   - 根本的な列追加高速化は indicator_calculator.py 本体で別途実施可能
-#   - まずログ汚染と後続遅延を止める runtime patch
+#   - 前営業日行は __prevday_indicator_warmup=1 を付けてメモリ上で連結する。
+#   - indicator_calculator の戻り値から warmup 行を必ず削除する。
+#   - DB保存、Discord表示、ENTRY判定へ渡るのは当日入力行だけ。
+#   - 現物/建玉/発注ロジックには触らない。
 # ============================================================
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
+import os
+import re
+import sqlite3
 import warnings
-from typing import Any, Callable
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Callable, Iterable
 
 import pandas as pd
 
@@ -32,7 +37,294 @@ except Exception:  # pragma: no cover
     PerformanceWarning = Warning  # type: ignore
 
 logger = logging.getLogger(__name__)
+VERSION = "V2.0-INDICATOR-PREVDAY-INMEMORY-WARMUP"
 _INSTALLED = False
+_WARMUP_COL = "__prevday_indicator_warmup"
+_TRUE = {"1", "true", "yes", "y", "on", "enable", "enabled"}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in _TRUE
+    except Exception:
+        return bool(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
+def _normalize_interval(interval: Any) -> str:
+    try:
+        s = str(interval or "1min").strip().lower()
+        if s in {"1", "1m", "1min", "1minute"}:
+            return "1min"
+        if s in {"3", "3m", "3min", "3minute"}:
+            return "3min"
+        if s in {"5", "5m", "5min", "5minute"}:
+            return "5min"
+        return s
+    except Exception:
+        return "1min"
+
+
+def _table_for_interval(interval: Any) -> str:
+    s = _normalize_interval(interval)
+    if s == "3min":
+        return "stock_summary_3min"
+    if s == "5min":
+        return "stock_summary_5min"
+    return "stock_summary_1min"
+
+
+def _summary_base_dirs() -> list[Path]:
+    vals = [
+        os.getenv("SUMMARY_DB_DIR"),
+        os.getenv("AUTO_STOCK_DB_DIR"),
+        os.getenv("AUTO_STOCK_BUY_SELL_DIR"),
+        os.getenv("AUTOSTOCK_DB_DIR"),
+        r"\\192.168.0.22\AutoStockBuyAndSell",
+    ]
+    out: list[Path] = []
+    seen: set[str] = set()
+    for v in vals:
+        if not v:
+            continue
+        try:
+            p = Path(str(v))
+            key = str(p).lower()
+            if key not in seen:
+                out.append(p)
+                seen.add(key)
+        except Exception:
+            pass
+    return out
+
+
+def _target_date_yyyymmdd(df: pd.DataFrame) -> str:
+    try:
+        if "datetime" not in df.columns:
+            return dt.date.today().strftime("%Y%m%d")
+        s = pd.to_datetime(df["datetime"], errors="coerce").dropna()
+        if s.empty:
+            return dt.date.today().strftime("%Y%m%d")
+        return s.max().date().strftime("%Y%m%d")
+    except Exception:
+        return dt.date.today().strftime("%Y%m%d")
+
+
+def _find_prev_summary_db(target_yyyymmdd: str) -> str:
+    try:
+        explicit = os.getenv("PREVDAY_INDICATOR_WARMUP_DB_PATH", "").strip()
+        if explicit and Path(explicit).exists():
+            return explicit
+    except Exception:
+        pass
+
+    best_date = ""
+    best_path = ""
+    pattern = re.compile(r"summary(\d{8})\.db$", re.IGNORECASE)
+    for base in _summary_base_dirs():
+        try:
+            if not base.exists():
+                continue
+            for p in base.glob("summary*.db"):
+                m = pattern.search(p.name)
+                if not m:
+                    continue
+                ymd = m.group(1)
+                if ymd < target_yyyymmdd and ymd > best_date:
+                    best_date = ymd
+                    best_path = str(p)
+        except Exception:
+            continue
+    return best_path
+
+
+def _symbol_col(df: pd.DataFrame) -> str | None:
+    for c in ("symbol", "Symbol", "code", "Code", "stock_code", "銘柄コード"):
+        if c in df.columns:
+            return c
+    return None
+
+
+def _symbols_from_df(df: pd.DataFrame) -> tuple[str, ...]:
+    try:
+        c = _symbol_col(df)
+        if not c:
+            return tuple()
+        syms = (
+            df[c]
+            .astype(str)
+            .str.strip()
+            .str.replace(r"\.0$", "", regex=True)
+            .str.replace(r"\.T$", "", regex=True)
+        )
+        return tuple(sorted(x for x in syms.unique().tolist() if x and x.lower() != "nan"))
+    except Exception:
+        return tuple()
+
+
+def _chunks(xs: Iterable[str], n: int) -> Iterable[list[str]]:
+    buf: list[str] = []
+    for x in xs:
+        buf.append(x)
+        if len(buf) >= n:
+            yield buf
+            buf = []
+    if buf:
+        yield buf
+
+
+@lru_cache(maxsize=64)
+def _load_prevday_warmup_cached(db_path: str, table: str, symbols: tuple[str, ...], rows_per_symbol: int) -> pd.DataFrame:
+    if not db_path or not symbols:
+        return pd.DataFrame()
+    if rows_per_symbol <= 0:
+        return pd.DataFrame()
+    try:
+        path = Path(db_path)
+        if not path.exists():
+            return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+    frames: list[pd.DataFrame] = []
+    try:
+        with sqlite3.connect(str(db_path), timeout=2.0) as conn:
+            conn.execute("PRAGMA busy_timeout=2000;")
+            try:
+                cols = [str(r[1]) for r in conn.execute(f'PRAGMA table_info("{table}")').fetchall()]
+            except Exception:
+                cols = []
+            if not cols:
+                return pd.DataFrame()
+            sym_col = "symbol" if "symbol" in cols else ("Symbol" if "Symbol" in cols else None)
+            dt_col = "datetime" if "datetime" in cols else ("time" if "time" in cols else None)
+            if not sym_col or not dt_col:
+                return pd.DataFrame()
+
+            for part in _chunks(symbols, 300):
+                placeholders = ",".join(["?"] * len(part))
+                params: list[Any] = list(part) + [int(rows_per_symbol)]
+                sql = f'''
+                    SELECT * FROM (
+                        SELECT *, ROW_NUMBER() OVER(PARTITION BY "{sym_col}" ORDER BY "{dt_col}" DESC) AS __rn
+                        FROM "{table}"
+                        WHERE CAST("{sym_col}" AS TEXT) IN ({placeholders})
+                    )
+                    WHERE __rn <= ?
+                    ORDER BY "{sym_col}", "{dt_col}"
+                '''
+                try:
+                    d = pd.read_sql_query(sql, conn, params=params)
+                except Exception:
+                    # Fallback for old SQLite without window functions.
+                    limit = max(int(rows_per_symbol) * max(1, len(part)) * 3, int(rows_per_symbol))
+                    sql2 = f'''
+                        SELECT * FROM "{table}"
+                        WHERE CAST("{sym_col}" AS TEXT) IN ({placeholders})
+                        ORDER BY "{dt_col}" DESC
+                        LIMIT ?
+                    '''
+                    d = pd.read_sql_query(sql2, conn, params=list(part) + [limit])
+                    if not d.empty:
+                        d[dt_col] = pd.to_datetime(d[dt_col], errors="coerce")
+                        d = d.dropna(subset=[dt_col]).sort_values([sym_col, dt_col])
+                        d = d.groupby(sym_col, as_index=False).tail(int(rows_per_symbol))
+                if not d.empty:
+                    frames.append(d)
+    except Exception:
+        logger.debug("[IND PREVDAY WARMUP] DB read failed db=%s table=%s", db_path, table, exc_info=True)
+        return pd.DataFrame()
+
+    if not frames:
+        return pd.DataFrame()
+    try:
+        out = pd.concat(frames, ignore_index=True, sort=False)
+        out = out.loc[:, ~pd.Index(out.columns).duplicated()].copy()
+        if "__rn" in out.columns:
+            out = out.drop(columns=["__rn"], errors="ignore")
+        return out
+    except Exception:
+        return pd.DataFrame()
+
+
+def _with_prevday_warmup(df: pd.DataFrame, *, interval: Any) -> pd.DataFrame:
+    if not _env_bool("PREVDAY_INDICATOR_WARMUP_ENABLED", True):
+        return df
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    if _WARMUP_COL in df.columns:
+        return df
+    if "datetime" not in df.columns:
+        return df
+    symbols = _symbols_from_df(df)
+    if not symbols:
+        return df
+    rows_per_symbol = max(0, _env_int("PREVDAY_INDICATOR_WARMUP_BARS", 120))
+    if rows_per_symbol <= 0:
+        return df
+    target_ymd = _target_date_yyyymmdd(df)
+    db_path = _find_prev_summary_db(target_ymd)
+    if not db_path:
+        return df
+    table = _table_for_interval(interval)
+    warm = _load_prevday_warmup_cached(db_path, table, symbols, rows_per_symbol)
+    if warm.empty:
+        return df
+    try:
+        cur = df.copy()
+        cur[_WARMUP_COL] = False
+        warm = warm.copy()
+        warm[_WARMUP_COL] = True
+        # Keep only warmup rows older than today's earliest input row per symbol/date.
+        warm["datetime"] = pd.to_datetime(warm["datetime"], errors="coerce")
+        cur["datetime"] = pd.to_datetime(cur["datetime"], errors="coerce")
+        warm = warm.dropna(subset=["datetime"])
+        cur = cur.dropna(subset=["datetime"])
+        if warm.empty or cur.empty:
+            return df
+        out = pd.concat([warm, cur], ignore_index=True, sort=False)
+        logger.warning(
+            "[IND PREVDAY WARMUP] applied interval=%s db=%s table=%s symbols=%s warm_rows=%s current_rows=%s bars=%s save=0",
+            _normalize_interval(interval),
+            db_path,
+            table,
+            len(symbols),
+            len(warm),
+            len(cur),
+            rows_per_symbol,
+        )
+        return out
+    except Exception:
+        logger.debug("[IND PREVDAY WARMUP] concat failed interval=%s", interval, exc_info=True)
+        return df
+
+
+def _drop_warmup_rows(out: Any) -> Any:
+    try:
+        if isinstance(out, pd.DataFrame) and _WARMUP_COL in out.columns:
+            before = len(out)
+            keep = ~out[_WARMUP_COL].fillna(False).astype(bool)
+            out = out.loc[keep].copy()
+            out = out.drop(columns=[_WARMUP_COL], errors="ignore")
+            dropped = before - len(out)
+            if dropped > 0:
+                logger.warning("[IND PREVDAY WARMUP] dropped warmup rows after calculation dropped=%s output_rows=%s save=0", dropped, len(out))
+            return out
+    except Exception:
+        logger.debug("[IND PREVDAY WARMUP] drop warmup rows failed", exc_info=True)
+    return out
 
 
 def _wrap_indicator_func(fn: Callable[..., Any], *, name: str) -> Callable[..., Any]:
@@ -40,13 +332,28 @@ def _wrap_indicator_func(fn: Callable[..., Any], *, name: str) -> Callable[..., 
         return fn
 
     def _wrapped(*args: Any, **kwargs: Any) -> Any:
+        interval = kwargs.get("interval", "1min")
+        args2 = args
+        try:
+            if args and isinstance(args[0], pd.DataFrame):
+                first = _with_prevday_warmup(args[0], interval=interval)
+                if first is not args[0]:
+                    args2 = (first, *args[1:])
+            elif isinstance(kwargs.get("df"), pd.DataFrame):
+                kwargs = dict(kwargs)
+                kwargs["df"] = _with_prevday_warmup(kwargs["df"], interval=interval)
+        except Exception:
+            logger.debug("[IND PREVDAY WARMUP] pre-wrap failed func=%s", name, exc_info=True)
+            args2 = args
+
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore",
                 category=PerformanceWarning,
                 message=".*DataFrame is highly fragmented.*",
             )
-            out = fn(*args, **kwargs)
+            out = fn(*args2, **kwargs)
+        out = _drop_warmup_rows(out)
         try:
             if isinstance(out, pd.DataFrame) and not out.empty:
                 return out.copy()
@@ -57,6 +364,7 @@ def _wrap_indicator_func(fn: Callable[..., Any], *, name: str) -> Callable[..., 
     _wrapped.__name__ = getattr(fn, "__name__", name)
     _wrapped.__doc__ = getattr(fn, "__doc__", None)
     _wrapped._indicator_fragmentation_runtime_patch = True  # type: ignore[attr-defined]
+    _wrapped._indicator_prevd_warmup_v2 = True  # type: ignore[attr-defined]
     _wrapped._original = fn  # type: ignore[attr-defined]
     return _wrapped
 
@@ -66,6 +374,8 @@ def install() -> bool:
     if _INSTALLED:
         return True
     try:
+        os.environ.setdefault("PREVDAY_INDICATOR_WARMUP_ENABLED", "1")
+        os.environ.setdefault("PREVDAY_INDICATOR_WARMUP_BARS", "120")
         import trading.summary.indicators.indicator_calculator as mod
 
         patched = []
@@ -83,10 +393,16 @@ def install() -> bool:
         )
 
         _INSTALLED = True
-        logger.warning("[IND FRAGMENTATION PATCH] installed patched=%s", patched)
+        logger.warning(
+            "[IND FRAGMENTATION PATCH] installed version=%s patched=%s prevday_warmup=%s bars=%s save=0",
+            VERSION,
+            patched,
+            _env_bool("PREVDAY_INDICATOR_WARMUP_ENABLED", True),
+            _env_int("PREVDAY_INDICATOR_WARMUP_BARS", 120),
+        )
         return True
     except Exception:
-        logger.exception("[IND FRAGMENTATION PATCH] install failed")
+        logger.exception("[IND FRAGMENTATION PATCH] install failed version=%s", VERSION)
         return False
 
 
