@@ -7,7 +7,7 @@ import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
-VERSION = "V2-SUMMARY-AI-BOARD-REST-COOLDOWN-BYPASS-STRATEGY-MODE"
+VERSION = "V3-SUMMARY-AI-BOARD-REST-COOLDOWN-BYPASS-STRATEGY-FIB-EV"
 _INSTALLED = False
 _ORIG_FETCH = None
 _STRATEGY_INSTALLED = False
@@ -52,15 +52,20 @@ def _install_strategy_mode() -> bool:
     if _STRATEGY_INSTALLED:
         return True
     try:
-        from core.startup.summary_ai_strategy_mode_patch import install as _install
-
-        ok = bool(_install())
-        _STRATEGY_INSTALLED = bool(ok)
-        logger.warning("[SUMMARY AI BOARD REST COOLDOWN] chained strategy mode ok=%s version=%s", ok, VERSION)
-        return bool(ok)
+        from core.startup.summary_ai_strategy_mode_patch import install as _install_strategy
+        strategy_ok = bool(_install_strategy())
     except Exception:
+        strategy_ok = False
         logger.exception("[SUMMARY AI BOARD REST COOLDOWN] chained strategy mode install failed version=%s", VERSION)
-        return False
+    try:
+        from core.startup.summary_ai_fibonacci_ev_strategy_patch import install as _install_fib_ev
+        fib_ok = bool(_install_fib_ev())
+    except Exception:
+        fib_ok = False
+        logger.exception("[SUMMARY AI BOARD REST COOLDOWN] chained fibonacci EV overlay install failed version=%s", VERSION)
+    _STRATEGY_INSTALLED = bool(strategy_ok or fib_ok)
+    logger.warning("[SUMMARY AI BOARD REST COOLDOWN] chained strategy mode ok=%s fib_ev=%s version=%s", strategy_ok, fib_ok, VERSION)
+    return _STRATEGY_INSTALLED
 
 
 def install() -> bool:
@@ -75,7 +80,7 @@ def install() -> bool:
         if not callable(cur):
             logger.warning("[SUMMARY AI BOARD REST COOLDOWN] fetch unavailable version=%s strategy=%s", VERSION, strategy_ok)
             return False
-        if getattr(cur, "_summary_ai_cooldown_bypass_v2", False) or getattr(cur, "_summary_ai_cooldown_bypass_v1", False):
+        if getattr(cur, "_summary_ai_cooldown_bypass_v3", False) or getattr(cur, "_summary_ai_cooldown_bypass_v2", False) or getattr(cur, "_summary_ai_cooldown_bypass_v1", False):
             _INSTALLED = True
             return True
         _ORIG_FETCH = cur
@@ -137,6 +142,7 @@ def install() -> bool:
                 )
             return board
 
+        _patched_fetch_board_rest._summary_ai_cooldown_bypass_v3 = True  # type: ignore[attr-defined]
         _patched_fetch_board_rest._summary_ai_cooldown_bypass_v2 = True  # type: ignore[attr-defined]
         _patched_fetch_board_rest._summary_ai_cooldown_bypass_v1 = True  # type: ignore[attr-defined]
         _patched_fetch_board_rest._original = _ORIG_FETCH  # type: ignore[attr-defined]
