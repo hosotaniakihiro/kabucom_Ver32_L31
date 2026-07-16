@@ -626,6 +626,11 @@ class GlobalContext:
         self._push_df = pd.DataFrame()
         self._ranking_df = pd.DataFrame()
         self.runtime: Dict[str, Any] = {}
+        # pending_entries も allow_orders と同様、属性未初期化のまま
+        # global_data.pending_entries に直接アクセスされると AttributeError になる。
+        # 実体の一元管理は trading/entry/pending_manager.py の _ensure_root() だが、
+        # それが呼ばれる前でも安全な dict を返せるよう、ここでも空 dict を保証する。
+        self.pending_entries: Dict[str, list] = {}
         # allow_orders 未設定のまま position_filter 等が getattr(..., False) で
         # 全件 ENTRY禁止と誤判定するのを防ぐため、起動時パッチが走る前から
         # env ベースの妥当な初期値を持たせる。
