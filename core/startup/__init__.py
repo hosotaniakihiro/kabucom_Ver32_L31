@@ -21,13 +21,6 @@ import logging
 logger = logging.getLogger(__name__)
 
 try:
-    from .schedule_loop_stale_patch import install_schedule_loop_stale_patch
-
-    install_schedule_loop_stale_patch()
-except Exception:
-    logger.exception("[core.startup] schedule loop stale patch install failed")
-
-try:
     from .summary_scheduler_unified_stale_guard_patch import install as install_summary_scheduler_unified_stale_guard_patch
 
     install_summary_scheduler_unified_stale_guard_patch()

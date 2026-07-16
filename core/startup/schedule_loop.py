@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 import threading
 import time
 from typing import Any, Optional
@@ -321,6 +322,57 @@ def _is_job_running(key: str) -> bool:
         return key in _RUNNING_JOBS
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _is_ranking_summary_key(key: str) -> bool:
+    s = str(key or "")
+    return "ranking_summary_all" in s or "_run_ranking_summary_all_job_safe" in s
+
+
+def _clear_if_stale(key: str) -> bool:
+    """
+    running とマークされた job が長時間残っている場合に強制解除する。
+
+    ranking_summary_all が300秒以上 previous still running になり、
+    次のランキングサマリー/AI判定を止め続けるケースを防ぐための保護。
+    """
+    stale_sec_default = _env_float("SCHEDULE_LOOP_STALE_JOB_SEC", 240.0)
+    ranking_stale_sec = _env_float("RANKING_SUMMARY_STALE_JOB_SEC", 180.0)
+    max_sec = ranking_stale_sec if _is_ranking_summary_key(key) else stale_sec_default
+
+    try:
+        with _RUNNING_JOBS_LOCK:
+            meta = _RUNNING_JOBS.get(key)
+            if not meta:
+                return False
+            started_at = meta.get("started_at")
+            if not isinstance(started_at, dt.datetime):
+                return False
+            elapsed = max(0.0, (dt.datetime.now() - started_at).total_seconds())
+            if elapsed < max_sec:
+                return False
+            _RUNNING_JOBS.pop(key, None)
+
+        logger.warning(
+            "[startup.schedule_loop] cleared stale running job key=%s elapsed=%.1fs max=%.1fs",
+            key,
+            elapsed,
+            max_sec,
+        )
+        return True
+    except Exception:
+        logger.debug("[startup.schedule_loop] stale clear failed key=%s", key, exc_info=True)
+        return False
+
+
 def _safe_schedule_next_run(job: Any) -> None:
     """
     job が実行中で skip された場合などに next_run を進める。
@@ -461,6 +513,7 @@ def _run_job_thread(job: Any, key: str) -> None:
 
 def _dispatch_due_job(job: Any, *, skip_if_running: bool = True) -> bool:
     key = _job_key(job)
+    _clear_if_stale(key)
 
     if skip_if_running and _is_job_running(key):
         _stats_inc(key, "skip_running_count", 1)
