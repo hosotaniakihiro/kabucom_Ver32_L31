@@ -84,22 +84,56 @@ def _hist_max(df: pd.DataFrame) -> int:
         return 0
 
 
+def _bool_sum(value: Any, index: Any) -> int:
+    try:
+        if isinstance(value, pd.Series):
+            return int(value.reindex(index).fillna(False).astype(bool).sum())
+        return int(pd.Series(value, index=index).fillna(False).astype(bool).sum())
+    except Exception:
+        return 0
+
+
 def _profile(df: pd.DataFrame) -> dict[str, int]:
-    return {
-        "rows": int(len(df)) if isinstance(df, pd.DataFrame) else 0,
-        "symbols": int(df["symbol"].astype(str).nunique()) if isinstance(df, pd.DataFrame) and not df.empty and "symbol" in df.columns else 0,
-        "hist_max": _hist_max(df),
-        "technical_ready": int(pd.Series(df.get("technical_ready", False)).fillna(False).astype(bool).sum()) if isinstance(df, pd.DataFrame) and not df.empty else 0,
-        "usable_ready": int(pd.Series(df.get("usable_technical_ready", False)).fillna(False).astype(bool).sum()) if isinstance(df, pd.DataFrame) and not df.empty else 0,
-        "slope_nonnull": _nonnull(df, "slope"),
-        "slope_nonzero": _nonzero(df, "slope"),
-        "score_slope_nonzero": _nonzero(df, "score_slope"),
-        "atr_nonnull": _nonnull(df, "atr"),
-        "rsi_nonnull": _nonnull(df, "rsi"),
-        "macd_nonnull": _nonnull(df, "macd"),
-        "macd_nonzero": _nonzero(df, "macd"),
-        "signal_nonnull": _nonnull(df, "signal"),
-    }
+    """
+    symbol_hist_len が全NaNの短履歴DF (起動直後のPUSH raw DB fallback等) でも
+    int(NaN) で落ちないように防御的に集計する。
+    """
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return {
+                "rows": 0,
+                "symbols": 0,
+                "hist_max": 0,
+                "technical_ready": 0,
+                "usable_ready": 0,
+                "slope_nonnull": 0,
+                "slope_nonzero": 0,
+                "score_slope_nonzero": 0,
+                "atr_nonnull": 0,
+                "rsi_nonnull": 0,
+                "macd_nonnull": 0,
+                "macd_nonzero": 0,
+                "signal_nonnull": 0,
+            }
+        idx = df.index
+        return {
+            "rows": int(len(df)),
+            "symbols": int(df["symbol"].astype(str).nunique()) if "symbol" in df.columns else 0,
+            "hist_max": _hist_max(df),
+            "technical_ready": _bool_sum(df.get("technical_ready", False), idx),
+            "usable_ready": _bool_sum(df.get("usable_technical_ready", False), idx),
+            "slope_nonnull": _nonnull(df, "slope"),
+            "slope_nonzero": _nonzero(df, "slope"),
+            "score_slope_nonzero": _nonzero(df, "score_slope"),
+            "atr_nonnull": _nonnull(df, "atr"),
+            "rsi_nonnull": _nonnull(df, "rsi"),
+            "macd_nonnull": _nonnull(df, "macd"),
+            "macd_nonzero": _nonzero(df, "macd"),
+            "signal_nonnull": _nonnull(df, "signal"),
+        }
+    except Exception:
+        logger.debug("[indicator_short_history_patch] profile fallback failed", exc_info=True)
+        return {"rows": int(len(df)) if isinstance(df, pd.DataFrame) else 0, "symbols": 0, "hist_max": 0}
 
 
 def _ensure_sorted(df: pd.DataFrame) -> pd.DataFrame:

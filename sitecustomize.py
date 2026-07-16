@@ -253,7 +253,6 @@ DB_SYNC_PATCHES = [
 
 SYNC_MAIN_PATCHES = [
     ("core.startup.indicator_fragmentation_runtime_patch", "IND_PREVDAY_WARMUP", "DISABLE_IND_PREVDAY_WARMUP_PATCH"),
-    ("core.startup.indicator_short_history_nan_profile_guard_patch", "IND_SHORT_PROFILE_GUARD", "DISABLE_IND_SHORT_PROFILE_GUARD_PATCH"),
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
     ("core.startup.yahoo_summary_direct_upsert_conflict_patch", "YAHOO_DIRECT_UPSERT_CONFLICT", "DISABLE_YAHOO_DIRECT_UPSERT_CONFLICT_PATCH"),
     ("core.startup.summary_controller_latest_enrich_patch", "SUMMARY_CONTROLLER_LATEST_ENRICH", "DISABLE_SUMMARY_CONTROLLER_LATEST_ENRICH_PATCH"),
