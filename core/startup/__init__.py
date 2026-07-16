@@ -28,13 +28,6 @@ except Exception:
     logger.exception("[core.startup] schedule loop stale patch install failed")
 
 try:
-    from .summary_scheduler_timeout_patch import install_summary_scheduler_timeout_patch
-
-    install_summary_scheduler_timeout_patch()
-except Exception:
-    logger.exception("[core.startup] summary scheduler timeout patch install failed")
-
-try:
     from .summary_scheduler_unified_stale_guard_patch import install as install_summary_scheduler_unified_stale_guard_patch
 
     install_summary_scheduler_unified_stale_guard_patch()

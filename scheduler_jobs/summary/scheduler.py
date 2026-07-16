@@ -141,11 +141,14 @@ def _push_fallback_when_blocked_enabled() -> bool:
 
 
 def _parent_timeout_sec() -> float:
-    return _env_float("SUMMARY_PARENT_TICK_TIMEOUT_SEC", default=45.0)
+    # PUSH 1m summary が 35秒 timeout で CALL timeout になり、entry 実行前に
+    # scheduler 側で失敗扱いになる問題を緩和するため 45 -> 120 に緩和
+    # (旧 core/startup/summary_scheduler_timeout_patch.py から移設)。
+    return _env_float("SUMMARY_PARENT_TICK_TIMEOUT_SEC", default=120.0)
 
 
 def _child_timeout_sec() -> float:
-    return _env_float("SUMMARY_CHILD_JOB_TIMEOUT_SEC", default=35.0)
+    return _env_float("SUMMARY_CHILD_JOB_TIMEOUT_SEC", default=90.0)
 
 
 def _push_fallback_stale_sec() -> float:
@@ -154,9 +157,10 @@ def _push_fallback_stale_sec() -> float:
 
     fallback 内部では 1m/3m/5m の子job timeout があるため、
     通常は 35秒 x 3 = 105秒程度以内に戻る想定。
-    余裕を見てデフォルト180秒。
+    余裕を見てデフォルト300秒
+    (旧 core/startup/summary_scheduler_timeout_patch.py から移設)。
     """
-    return _env_float("SUMMARY_PUSH_FALLBACK_STALE_SEC", default=180.0)
+    return _env_float("SUMMARY_PUSH_FALLBACK_STALE_SEC", default=300.0)
 
 
 def _push_fallback_async_enabled() -> bool:
