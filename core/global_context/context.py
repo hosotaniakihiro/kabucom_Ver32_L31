@@ -38,6 +38,40 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+_ALLOW_ORDERS_TRUE_VALUES = {"1", "true", "yes", "on", "y", "live", "real"}
+_ALLOW_ORDERS_FALSE_VALUES = {"0", "false", "no", "off", "n", "dry", "dryrun", "paper"}
+
+
+def _env_bool_tri(name: str) -> Optional[bool]:
+    v = os.environ.get(name)
+    if v is None or str(v).strip() == "":
+        return None
+    s = str(v).strip().lower()
+    if s in _ALLOW_ORDERS_TRUE_VALUES:
+        return True
+    if s in _ALLOW_ORDERS_FALSE_VALUES:
+        return False
+    return None
+
+
+def _resolve_allow_orders() -> tuple[bool, str]:
+    """Resolve initial allow_orders from ALLOW_ORDERS / DRY_RUN style env vars.
+
+    Defaults to True (live) when nothing is set, matching production operation.
+    """
+    for key in ("DRY_RUN", "ENTRY_DRY_RUN", "ORDER_DRY_RUN", "KABU_DRY_RUN", "SUMMARY_ENTRY_DRY_RUN", "PAPER_TRADE"):
+        if _env_bool_tri(key) is True:
+            return False, f"{key}=true"
+
+    for key in ("ALLOW_ORDERS", "ENTRY_ALLOW_ORDERS", "KABU_ALLOW_ORDERS", "LIVE_ORDERS", "ORDER_LIVE"):
+        v = _env_bool_tri(key)
+        if v is True:
+            return True, f"{key}=true"
+        if v is False:
+            return False, f"{key}=false"
+
+    return True, "default_live_true"
+
 SUMMARY_REQUIRED_COLS = (
     "symbol",
     "score",
@@ -592,6 +626,15 @@ class GlobalContext:
         self._push_df = pd.DataFrame()
         self._ranking_df = pd.DataFrame()
         self.runtime: Dict[str, Any] = {}
+        # allow_orders 未設定のまま position_filter 等が getattr(..., False) で
+        # 全件 ENTRY禁止と誤判定するのを防ぐため、起動時パッチが走る前から
+        # env ベースの妥当な初期値を持たせる。
+        self.allow_orders, self._allow_orders_init_reason = _resolve_allow_orders()
+        logger.info(
+            "[GlobalContext] allow_orders initial=%s reason=%s",
+            self.allow_orders,
+            self._allow_orders_init_reason,
+        )
 
     def set_symbol_name_map(self, mp: Dict[str, str]) -> None:
         with self._lock:
