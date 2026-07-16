@@ -19,7 +19,10 @@ import datetime as dt
 import json
 import logging
 import os
+import sqlite3
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -182,6 +185,96 @@ def _install_summary_sqlite_lock_tolerance() -> None:
         logger.exception("[MAIN DATABASE] summary sqlite lock tolerance install failed; continue")
 
 
+# summary WAL checkpoint loop. 旧 core/startup/summary_wal_checkpoint_patch.py から移設。
+_WAL_CHECKPOINT_TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+_WAL_CHECKPOINT_FALSE = {"0", "false", "no", "n", "off", "disable", "disabled"}
+_WAL_CHECKPOINT_MODES = {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}
+_WAL_CHECKPOINT_INSTALLED = False
+_WAL_CHECKPOINT_THREAD: threading.Thread | None = None
+
+
+def _wal_checkpoint_env_bool(name: str, default: bool) -> bool:
+    raw = str(os.getenv(name, "")).strip().lower()
+    if raw in _WAL_CHECKPOINT_TRUE:
+        return True
+    if raw in _WAL_CHECKPOINT_FALSE:
+        return False
+    return bool(default)
+
+
+def _wal_checkpoint_env_float(name: str, default: float) -> float:
+    try:
+        raw = str(os.getenv(name, "")).strip()
+        return float(raw) if raw else float(default)
+    except Exception:
+        return float(default)
+
+
+def _wal_checkpoint_env_int(name: str, default: int) -> int:
+    try:
+        raw = str(os.getenv(name, "")).strip()
+        return int(float(raw)) if raw else int(default)
+    except Exception:
+        return int(default)
+
+
+def _wal_checkpoint_mode() -> str:
+    mode = str(os.getenv("SUMMARY_WAL_CHECKPOINT_MODE", "PASSIVE")).strip().upper()
+    return mode if mode in _WAL_CHECKPOINT_MODES else "PASSIVE"
+
+
+def _wal_checkpoint_summary_db_path() -> Path:
+    from data_collectors.config import summary_db_path
+    return Path(summary_db_path())
+
+
+def _wal_checkpoint_once() -> bool:
+    db_path = _wal_checkpoint_summary_db_path()
+    if not db_path.exists():
+        logger.debug("[SUMMARY WAL CHECKPOINT] skip db missing path=%s", db_path)
+        return False
+
+    mode = _wal_checkpoint_mode()
+    busy_timeout_ms = max(1000, _wal_checkpoint_env_int("SUMMARY_WAL_CHECKPOINT_BUSY_TIMEOUT_MS", 5000))
+    wal_path = Path(str(db_path) + "-wal")
+    try:
+        wal_size = wal_path.stat().st_size if wal_path.exists() else 0
+    except Exception:
+        wal_size = 0
+
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=max(1.0, busy_timeout_ms / 1000.0))
+        try:
+            conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+            conn.execute("PRAGMA journal_mode=WAL")
+            result = conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
+            conn.commit()
+        finally:
+            conn.close()
+        logger.info(
+            "[SUMMARY WAL CHECKPOINT] done mode=%s db=%s wal_size=%s result=%s",
+            mode, db_path, wal_size, result,
+        )
+        return True
+    except sqlite3.OperationalError as exc:
+        logger.warning("[SUMMARY WAL CHECKPOINT] skip busy mode=%s db=%s err=%s", mode, db_path, exc)
+        return False
+    except Exception:
+        logger.exception("[SUMMARY WAL CHECKPOINT] failed db=%s", db_path)
+        return False
+
+
+def _wal_checkpoint_loop() -> None:
+    initial_delay = max(0.0, _wal_checkpoint_env_float("SUMMARY_WAL_CHECKPOINT_INITIAL_DELAY_SEC", 20.0))
+    interval = max(10.0, _wal_checkpoint_env_float("SUMMARY_WAL_CHECKPOINT_INTERVAL_SEC", 60.0))
+    if initial_delay:
+        time.sleep(initial_delay)
+    while True:
+        if _wal_checkpoint_env_bool("SUMMARY_WAL_CHECKPOINT_ENABLED", True):
+            _wal_checkpoint_once()
+        time.sleep(interval)
+
+
 def _install_summary_wal_checkpoint() -> None:
     """Install a 1-minute WAL checkpoint loop for summaryYYYYMMDD.db.
 
@@ -189,13 +282,27 @@ def _install_summary_wal_checkpoint() -> None:
     without changing the writer logic.  PASSIVE mode is the default to avoid
     increasing writer/reader lock contention on NAS SQLite.
     """
+    global _WAL_CHECKPOINT_INSTALLED, _WAL_CHECKPOINT_THREAD
     try:
         os.environ.setdefault("SUMMARY_WAL_CHECKPOINT_ENABLED", "1")
         os.environ.setdefault("SUMMARY_WAL_CHECKPOINT_INTERVAL_SEC", "60")
         os.environ.setdefault("SUMMARY_WAL_CHECKPOINT_MODE", "PASSIVE")
         os.environ.setdefault("SUMMARY_WAL_CHECKPOINT_BUSY_TIMEOUT_MS", "5000")
-        from core.startup.summary_wal_checkpoint_patch import install
-        ok = install()
+        os.environ.setdefault("SUMMARY_WAL_CHECKPOINT_INITIAL_DELAY_SEC", "20")
+
+        if _WAL_CHECKPOINT_INSTALLED:
+            ok = True
+        elif not _wal_checkpoint_env_bool("SUMMARY_WAL_CHECKPOINT_ENABLED", True):
+            logger.warning("[SUMMARY WAL CHECKPOINT] disabled by env")
+            ok = False
+        else:
+            _WAL_CHECKPOINT_THREAD = threading.Thread(
+                target=_wal_checkpoint_loop, name="summary-wal-checkpoint-loop", daemon=True
+            )
+            _WAL_CHECKPOINT_THREAD.start()
+            _WAL_CHECKPOINT_INSTALLED = True
+            ok = True
+
         logger.warning("[MAIN DATABASE] summary wal checkpoint installed ok=%s", ok)
     except Exception:
         logger.exception("[MAIN DATABASE] summary wal checkpoint install failed; continue")
