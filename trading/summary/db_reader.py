@@ -48,8 +48,7 @@ def _to_df(rows) -> pd.DataFrame:
 
     if "datetime" in df.columns:
         df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
-
-    df = df.dropna(subset=["datetime"], errors="ignore")
+        df = df.dropna(subset=["datetime"])
     df = _safe_clean(df)
 
     return df

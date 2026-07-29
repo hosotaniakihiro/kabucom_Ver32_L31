@@ -1,0 +1,49 @@
+numpy
+pandas
+scikit-learn
+lightgbm
+optuna
+shap
+numba
+joblib
+torch
+matplotlib
+
+# データ取得・市場カレンダー
+yfinance
+yahoo_finance_api2
+pandas_market_calendars
+holidays
+jpholiday
+
+# DB / ORM
+duckdb
+SQLAlchemy
+
+# スクレイピング・ブラウザ操作
+selenium
+webdriver-manager
+beautifulsoup4
+requests
+
+# 通信・スケジューリング・表示
+websocket-client
+schedule
+colorama
+
+# テクニカル指標
+ta
+
+# 生成AI (Gemini)
+google-generativeai
+
+# テスト
+pytest
+
+# 任意: TA-Lib（RSI等の高速計算に使用。無くてもフォールバックで動作する）
+# Windowsではソースからのpipインストールが失敗しやすいため、
+# 必要な場合は以下のいずれかを利用してください。
+#   conda install -c conda-forge ta-lib
+#   もしくは https://github.com/cgohlke/talib-build/releases から
+#   お使いのPython/OSに合った .whl をダウンロードして pip install
+# talib

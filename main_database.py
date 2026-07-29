@@ -1,6 +1,7 @@
+
 # ============================================================
 # File   : main_database.py
-# Version: DATA-COLLECTORS-MAIN-DATABASE-ENTRY-V9-STRICT-LIVE-SUMMARY
+# Version: DATA-COLLECTORS-MAIN-DATABASE-ENTRY-V11-INLINE-PUSH-SUMMARY-AND-SQLITE-PRAGMAS
 # ------------------------------------------------------------
 # Purpose:
 #   - DB作成 / ランキング取得 / PUSH銘柄登録 / PUSH受信 を起動する入口
@@ -11,6 +12,29 @@
 #   - summary DB の WAL を1分ごとに checkpoint して .db 本体へ反映する
 #   - /token 取得直後に実APIで token preflight を行い、認証NGなら子プロセスを起動しない
 #   - 前日PUSH summary の global-lag/min_keep fallback を子プロセス既定で無効化する
+#
+# V11:
+#   - core/startup/push_summary_fallback_and_active_price_patch.py (REV5) を
+#     trading/ranking/active_symbols/liquidity.py と
+#     scheduler_jobs/summary/fallback_loader.py の本文へ完全インライン化し、
+#     パッチファイル自体・sitecustomize.py の登録・本ファイルの install() 呼び出しを削除。
+#   - core/startup/sqlite_memory_pragmas_patch.py は main.py / data_collectors_runner.py /
+#     db_prepare_runner.py / push_receiver_runner.py / yahoo_complement_runner.py /
+#     summary_database_runner.py の計7プロセス共通基盤のため元ファイル・
+#     sitecustomize.py 側の登録はそのまま残しつつ、main_database.py には
+#     ロジック全体を _sqlite_pragmas_* として複製・本文化した（二重管理は承知の上）。
+#     sqlite3.connect の二重ラップを避けるため、sitecustomize側で既に
+#     wrap済みの場合は自前のwrapをスキップするガードを入れている。
+#
+# V10:
+#   - sitecustomize.py の DB_SYNC_PATCHES (argv判定による暗黙適用) のうち、
+#     main_database.py 本文へ未移設だった5パッチを明示的にインライン化。
+#     (indicator prevday warmup / yahoo direct upsert conflict /
+#      push summary realtime / summary controller latest enrich /
+#      active symbol target fill)
+#   - db startup scope defaults (schema repair disable / mtf catchup disable)
+#     も同様に明示化。sitecustomize.py 側のリストはフォールバックとして維持し、
+#     他の子プロセス (data_collectors_runner.py 等) への適用は変更しない。
 # ============================================================
 
 from __future__ import annotations
@@ -159,7 +183,6 @@ def _install_cpu_guard_env() -> None:
             os.environ[key] = value
 
         try:
-            from core.startup.sqlite_memory_pragmas_patch import install as _install_sqlite_memory_pragmas
             _install_sqlite_memory_pragmas()
         except Exception:
             pass
@@ -169,20 +192,426 @@ def _install_cpu_guard_env() -> None:
         logger.exception("[MAIN DATABASE] cpu guard env install failed; continue")
 
 
-def _install_summary_sqlite_lock_tolerance() -> None:
-    """Install summary DB lock tolerance before spawning child collectors.
+# ============================================================
+# sqlite memory pragmas (main_database.py 専用コピー)
+# 旧 core/startup/sqlite_memory_pragmas_patch.py から丸ごとコピーして本文化した。
+#
+# NOTE: この patch は main.py / data_collectors_runner.py / db_prepare_runner.py /
+# push_receiver_runner.py / yahoo_complement_runner.py / summary_database_runner.py の
+# 計7プロセス共通基盤であり、他の6プロセスは引き続き sitecustomize.py の
+# DB_SYNC_PATCHES / SYNC_MAIN_PATCHES 経由で core/startup 側のファイルに依存する
+# （そちらは変更していない）。main_database.py だけ本文に複製したため、
+# 元ファイルとロジックが乖離しないよう変更時は両方に反映すること。
+#
+# sitecustomize.py は Python 起動時に main_database.py よりも先に実行され、
+# 通常は既に core.startup.sqlite_memory_pragmas_patch 側の sqlite3.connect ラップが
+# 適用済みになっている。ここでの二重ラップ（性能劣化・PRAGMA二重適用）を避けるため、
+# sqlite3.connect が既に同モジュールでラップ済みかどうかを __module__ で判定し、
+# 済みならこちらのラップはスキップする。
+# ============================================================
+_SQLITE_PRAGMAS_ORIG_CONNECT = sqlite3.connect
+_SQLITE_PRAGMAS_INSTALLED = False
+_SQLITE_PRAGMAS_SPOOL_FLUSH_PATCHED = False
+_SQLITE_PRAGMAS_TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+_SQLITE_PRAGMAS_FALSE = {"0", "false", "no", "n", "off", "disable", "disabled"}
 
-    The actual summary/Yahoo/MTF work runs in child processes. Installing this
-    patch here is still useful because it sets environment defaults that are
-    inherited by those child processes. The sqlite3.connect monkey patch also
-    protects any summary DB access done directly in main_database.py.
-    """
+_SQLITE_PRAGMAS_SUMMARY_RANKING_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("rank", "REAL"),
+    ("rank_no", "REAL"),
+    ("best_rank", "REAL"),
+    ("avg_rank", "REAL"),
+    ("rank_types_count", "INTEGER"),
+    ("ranking_score", "REAL"),
+    ("ranking_score_total", "REAL"),
+    ("ranking_type", "TEXT"),
+    ("rank_types", "TEXT"),
+    ("type", "TEXT"),
+    ("ranking", "TEXT"),
+    ("market", "TEXT"),
+    ("current_price", "REAL"),
+    ("change_rate", "REAL"),
+    ("chg", "REAL"),
+    ("trading_volume", "REAL"),
+    ("trading_value", "REAL"),
+    ("turnover", "REAL"),
+    ("turn", "REAL"),
+)
+
+_SQLITE_PRAGMAS_SUMMARY_TABLES: tuple[str, ...] = (
+    "stock_summary_1min",
+    "stock_summary_3min",
+    "stock_summary_5min",
+)
+
+
+def _sqlite_pragmas_env_bool(name: str, default: bool = False) -> bool:
     try:
-        from core.startup.summary_sqlite_lock_tolerance_patch import install
-        ok = install()
-        logger.warning("[MAIN DATABASE] summary sqlite lock tolerance installed ok=%s", ok)
+        raw = str(os.getenv(name, "")).strip().lower()
+        if raw in _SQLITE_PRAGMAS_TRUE:
+            return True
+        if raw in _SQLITE_PRAGMAS_FALSE:
+            return False
     except Exception:
-        logger.exception("[MAIN DATABASE] summary sqlite lock tolerance install failed; continue")
+        pass
+    return bool(default)
+
+
+def _sqlite_pragmas_env_int(name: str, default: int) -> int:
+    try:
+        return int(float(str(os.getenv(name, str(default))).strip()))
+    except Exception:
+        return int(default)
+
+
+def _sqlite_pragmas_env_float(name: str, default: float) -> float:
+    try:
+        return float(str(os.getenv(name, str(default))).strip())
+    except Exception:
+        return float(default)
+
+
+def _sqlite_pragmas_setdefault_env(name: str, value: str) -> None:
+    try:
+        if not str(os.getenv(name, "")).strip():
+            os.environ[name] = value
+    except Exception:
+        pass
+
+
+def _sqlite_pragmas_classify_db(database: Any) -> str:
+    try:
+        p = str(database).replace("\\", "/").lower()
+    except Exception:
+        return "default"
+    if not p or p in {":memory:", "file::memory:"}:
+        return "memory"
+    name = Path(p).name.lower()
+    if "ranking" in name or "/ranking/" in p:
+        return "ranking"
+    if "summary" in name or "/summary/" in p:
+        return "summary"
+    if "push" in name or "/push/" in p:
+        return "push"
+    if "yahoo" in name or "/yahoo/" in p:
+        return "yahoo"
+    return "default"
+
+
+def _sqlite_pragmas_looks_like_summary_db_file(database: Any) -> bool:
+    try:
+        name = Path(str(database or "")).name.lower()
+        return name.startswith("summary") and name.endswith(".db")
+    except Exception:
+        return False
+
+
+def _sqlite_pragmas_quote_ident_fallback(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _sqlite_pragmas_quote_ident(name: str) -> str:
+    try:
+        from database.sqlite import quote_ident
+        return quote_ident(str(name))
+    except Exception:
+        return _sqlite_pragmas_quote_ident_fallback(str(name))
+
+
+def _sqlite_pragmas_cache_kb_for(kind: str) -> int:
+    names = []
+    if kind == "ranking":
+        names.append("RANKING_SQLITE_CACHE_KB")
+    elif kind == "summary":
+        names.append("SUMMARY_SQLITE_CACHE_KB")
+    elif kind == "push":
+        names.append("PUSH_SQLITE_CACHE_KB")
+    elif kind == "yahoo":
+        names.append("YAHOO_SQLITE_CACHE_KB")
+    names.append("SQLITE_MEMORY_CACHE_KB")
+
+    for name in names:
+        raw = os.getenv(name)
+        if raw not in (None, ""):
+            return _sqlite_pragmas_env_int(name, -65536)
+    return -65536
+
+
+def _sqlite_pragmas_temp_store_for(kind: str) -> str:
+    names = []
+    if kind == "ranking":
+        names.append("RANKING_SQLITE_TEMP_STORE")
+    elif kind == "summary":
+        names.append("SUMMARY_SQLITE_TEMP_STORE")
+    elif kind == "push":
+        names.append("PUSH_SQLITE_TEMP_STORE")
+    elif kind == "yahoo":
+        names.append("YAHOO_SQLITE_TEMP_STORE")
+    names.append("SQLITE_MEMORY_TEMP_STORE")
+
+    for name in names:
+        raw = os.getenv(name)
+        if raw not in (None, ""):
+            return str(raw).strip().upper()
+    return "MEMORY"
+
+
+def _sqlite_pragmas_table_exists(cur: Any, table: str) -> bool:
+    try:
+        row = cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (str(table),),
+        ).fetchone()
+        return row is not None
+    except Exception:
+        return False
+
+
+def _sqlite_pragmas_ensure_columns_with_cursor(cur: Any, table: str, columns: tuple[tuple[str, str], ...], label: str) -> list[str]:
+    q = _sqlite_pragmas_quote_ident(table)
+    try:
+        cur.execute(f"PRAGMA table_info({q})")
+        existing = {str(row[1]) for row in cur.fetchall()}
+    except Exception:
+        logger.debug("[%s] table_info failed table=%s", label, table, exc_info=True)
+        return []
+
+    added: list[str] = []
+    for col, decl in columns:
+        if col in existing:
+            continue
+        try:
+            cur.execute(f"ALTER TABLE {q} ADD COLUMN {_sqlite_pragmas_quote_ident(col)} {decl}")
+            added.append(col)
+            existing.add(col)
+        except sqlite3.OperationalError as e:
+            msg = str(e).lower()
+            if "duplicate column" in msg or "already exists" in msg:
+                existing.add(col)
+                continue
+            raise
+    if added:
+        logger.warning("[%s] table=%s added_columns=%s", label, table, added)
+    return added
+
+
+def _sqlite_pragmas_ensure_summary_ranking_columns_on_connection(conn: sqlite3.Connection, database: Any) -> None:
+    if _sqlite_pragmas_env_bool("DISABLE_SUMMARY_RANKING_SCHEMA_REPAIR_PATCH", False):
+        return
+    if _sqlite_pragmas_classify_db(database) != "summary":
+        return
+    try:
+        cur = conn.cursor()
+        for table in _SQLITE_PRAGMAS_SUMMARY_TABLES:
+            if not _sqlite_pragmas_table_exists(cur, table):
+                continue
+            _sqlite_pragmas_ensure_columns_with_cursor(cur, table, _SQLITE_PRAGMAS_SUMMARY_RANKING_COLUMNS, "SUMMARY RANKING SCHEMA REPAIR")
+        try:
+            conn.commit()
+        except Exception:
+            pass
+    except Exception:
+        logger.debug("[SUMMARY RANKING SCHEMA REPAIR] connection repair failed database=%s", database, exc_info=True)
+
+
+def _sqlite_pragmas_force_summary_lock_env() -> None:
+    _sqlite_pragmas_setdefault_env("SUMMARY_SQLITE_BUSY_TIMEOUT_MS", "60000")
+    _sqlite_pragmas_setdefault_env("SUMMARY_SQLITE_TIMEOUT", "60")
+    _sqlite_pragmas_setdefault_env("SUMMARY_SQLITE_CACHE_KB", "-131072")
+    _sqlite_pragmas_setdefault_env("SUMMARY_SQLITE_TEMP_STORE", "MEMORY")
+
+    _sqlite_pragmas_setdefault_env("SUMMARY_MTF_INDICATOR_SQLITE_TIMEOUT", "60")
+    _sqlite_pragmas_setdefault_env("SUMMARY_MTF_INDICATOR_BUSY_TIMEOUT_MS", "60000")
+    _sqlite_pragmas_setdefault_env("SUMMARY_MTF_INDICATOR_UPDATE_CHUNK_SIZE", "50")
+    _sqlite_pragmas_setdefault_env("SUMMARY_MTF_INDICATOR_LOCK_RETRIES", "20")
+    _sqlite_pragmas_setdefault_env("SUMMARY_MTF_INDICATOR_LOCK_SLEEP_BASE", "0.50")
+    _sqlite_pragmas_setdefault_env("SUMMARY_MTF_INDICATOR_SKIP_IF_BUSY", "1")
+
+    _sqlite_pragmas_setdefault_env("SUMMARY_MTF_CATCHUP_SQLITE_TIMEOUT", "60")
+    _sqlite_pragmas_setdefault_env("SUMMARY_MTF_CATCHUP_BUSY_TIMEOUT_MS", "60000")
+    _sqlite_pragmas_setdefault_env("SUMMARY_MTF_CATCHUP_LOCK_RETRIES", "20")
+    _sqlite_pragmas_setdefault_env("SUMMARY_MTF_CATCHUP_RETRIES", "20")
+    _sqlite_pragmas_setdefault_env("SUMMARY_MTF_CATCHUP_UPSERT_RETRIES", "20")
+    _sqlite_pragmas_setdefault_env("SUMMARY_MTF_CATCHUP_BUSY_RETRIES", "20")
+    _sqlite_pragmas_setdefault_env("SUMMARY_MTF_CATCHUP_LOCK_SLEEP_BASE", "0.50")
+    _sqlite_pragmas_setdefault_env("SUMMARY_MTF_CATCHUP_CHUNK_SIZE", "100")
+    _sqlite_pragmas_setdefault_env("SUMMARY_MTF_CATCHUP_UPSERT_CHUNK_SIZE", "100")
+
+
+def _sqlite_pragmas_configure_summary_connection_extra(conn: sqlite3.Connection) -> None:
+    busy_ms = max(60000, _sqlite_pragmas_env_int("SUMMARY_SQLITE_BUSY_TIMEOUT_MS", 60000))
+    pragmas = [
+        f"PRAGMA busy_timeout={busy_ms}",
+        "PRAGMA journal_mode=WAL",
+        "PRAGMA synchronous=NORMAL",
+        "PRAGMA wal_autocheckpoint=1000",
+    ]
+    for sql in pragmas:
+        try:
+            conn.execute(sql)
+        except Exception:
+            pass
+
+
+def _sqlite_pragmas_apply_pragmas(conn: sqlite3.Connection, database: Any) -> None:
+    if not _sqlite_pragmas_env_bool("SQLITE_MEMORY_PRAGMAS_ENABLED", True):
+        return
+
+    kind = _sqlite_pragmas_classify_db(database)
+    if kind == "memory":
+        return
+
+    try:
+        timeout_ms = max(0, _sqlite_pragmas_env_int("SQLITE_BUSY_TIMEOUT_MS", 5000))
+        if timeout_ms:
+            conn.execute(f"PRAGMA busy_timeout={timeout_ms}")
+    except Exception:
+        pass
+
+    try:
+        temp_store = _sqlite_pragmas_temp_store_for(kind)
+        if temp_store in {"MEMORY", "2"}:
+            conn.execute("PRAGMA temp_store=MEMORY")
+        elif temp_store in {"FILE", "1"}:
+            conn.execute("PRAGMA temp_store=FILE")
+    except Exception:
+        pass
+
+    try:
+        cache_kb = _sqlite_pragmas_cache_kb_for(kind)
+        if cache_kb:
+            conn.execute(f"PRAGMA cache_size={int(cache_kb)}")
+    except Exception:
+        pass
+
+    try:
+        mmap_bytes = max(0, _sqlite_pragmas_env_int("SQLITE_MMAP_SIZE_BYTES", 268435456))
+        if mmap_bytes:
+            conn.execute(f"PRAGMA mmap_size={mmap_bytes}")
+    except Exception:
+        pass
+
+    try:
+        if _sqlite_pragmas_env_bool("SQLITE_CACHE_SPILL_OFF", True):
+            conn.execute("PRAGMA cache_spill=OFF")
+    except Exception:
+        pass
+
+    if _sqlite_pragmas_looks_like_summary_db_file(database):
+        try:
+            _sqlite_pragmas_configure_summary_connection_extra(conn)
+        except Exception:
+            pass
+
+    try:
+        _sqlite_pragmas_ensure_summary_ranking_columns_on_connection(conn, database)
+    except Exception:
+        pass
+
+
+def _sqlite_pragmas_patched_connect(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+    if _sqlite_pragmas_looks_like_summary_db_file(database):
+        try:
+            current_timeout = float(kwargs.get("timeout", 0) or 0)
+        except Exception:
+            current_timeout = 0.0
+        kwargs["timeout"] = max(current_timeout, max(60.0, _sqlite_pragmas_env_float("SUMMARY_SQLITE_TIMEOUT", 60.0)))
+
+    conn = _SQLITE_PRAGMAS_ORIG_CONNECT(database, *args, **kwargs)
+    try:
+        _sqlite_pragmas_apply_pragmas(conn, database)
+    except Exception:
+        try:
+            logger.debug("[SQLITE MEMORY PRAGMAS] apply failed database=%s", database, exc_info=True)
+        except Exception:
+            pass
+    return conn
+
+
+def _sqlite_pragmas_install_summary_spool_flush_patch() -> bool:
+    global _SQLITE_PRAGMAS_SPOOL_FLUSH_PATCHED
+    if _SQLITE_PRAGMAS_SPOOL_FLUSH_PATCHED:
+        return True
+    if _sqlite_pragmas_env_bool("DISABLE_SUMMARY_SPOOL_FLUSH_BULK_PATCH", False):
+        return False
+
+    try:
+        import trading.summary.persistence.summary_save_spool as spool
+        import trading.summary.persistence.summary_saver_bulk as saver
+
+        old = getattr(spool, "_save_direct", None)
+        if not callable(old):
+            return False
+        if getattr(old, "_summary_spool_flush_bulk_patch", False):
+            _SQLITE_PRAGMAS_SPOOL_FLUSH_PATCHED = True
+            return True
+
+        def _patched_save_direct(df: Any, *, interval: int, source: str, date_yyyymmdd: str) -> int:
+            try:
+                saved = saver.bulk_upsert_summary(
+                    df,
+                    interval=int(interval),
+                    lock_timeout_sec=float(os.getenv("SUMMARY_SPOOL_FLUSH_LOCK_TIMEOUT_SEC", "8.0")),
+                    skip_if_busy=True,
+                    latest_only=True,
+                    save_reason="spool_recovery_flush",
+                )
+                if int(saved or 0) > 0:
+                    return int(saved)
+            except Exception:
+                logger.exception(
+                    "[SUMMARY SAVE SPOOL PATCH] bulk flush failed interval=%s source=%s date=%s -> fallback direct",
+                    interval,
+                    source,
+                    date_yyyymmdd,
+                )
+            return int(old(df, interval=interval, source=source, date_yyyymmdd=date_yyyymmdd) or 0)
+
+        _patched_save_direct._summary_spool_flush_bulk_patch = True  # type: ignore[attr-defined]
+        _patched_save_direct._original = old  # type: ignore[attr-defined]
+        spool._save_direct = _patched_save_direct
+        _SQLITE_PRAGMAS_SPOOL_FLUSH_PATCHED = True
+        logger.warning("[SUMMARY SAVE SPOOL PATCH] installed bulk_flush=True (main_database.py own copy)")
+        return True
+    except Exception:
+        logger.exception("[SUMMARY SAVE SPOOL PATCH] install failed (main_database.py own copy)")
+        return False
+
+
+def _install_sqlite_memory_pragmas() -> bool:
+    global _SQLITE_PRAGMAS_INSTALLED
+
+    _sqlite_pragmas_force_summary_lock_env()
+    spool_ok = _sqlite_pragmas_install_summary_spool_flush_patch()
+
+    if _SQLITE_PRAGMAS_INSTALLED:
+        return True
+    if not _sqlite_pragmas_env_bool("SQLITE_MEMORY_PRAGMAS_ENABLED", True):
+        return bool(spool_ok)
+
+    if getattr(sqlite3.connect, "__module__", "") == "core.startup.sqlite_memory_pragmas_patch":
+        _SQLITE_PRAGMAS_INSTALLED = True
+        logger.warning(
+            "[SQLITE MEMORY PRAGMAS] skip own wrap: sqlite3.connect already wrapped by "
+            "sitecustomize's core.startup.sqlite_memory_pragmas_patch"
+        )
+        return True
+
+    try:
+        sqlite3.connect = _sqlite_pragmas_patched_connect  # type: ignore[assignment]
+        _SQLITE_PRAGMAS_INSTALLED = True
+        logger.warning(
+            "[SQLITE MEMORY PRAGMAS] installed (main_database.py own copy) temp_store=%s cache_kb=%s mmap=%s spill_off=%s summary_busy_ms=%s spool_bulk=%s",
+            os.getenv("SQLITE_MEMORY_TEMP_STORE", "MEMORY"),
+            os.getenv("SQLITE_MEMORY_CACHE_KB", "-65536"),
+            os.getenv("SQLITE_MMAP_SIZE_BYTES", "268435456"),
+            os.getenv("SQLITE_CACHE_SPILL_OFF", "1"),
+            os.getenv("SUMMARY_SQLITE_BUSY_TIMEOUT_MS", "60000"),
+            spool_ok,
+        )
+        return True
+    except Exception:
+        logger.exception("[SQLITE MEMORY PRAGMAS] install failed (main_database.py own copy)")
+        return bool(spool_ok)
 
 
 # summary WAL checkpoint loop. 旧 core/startup/summary_wal_checkpoint_patch.py から移設。
@@ -346,17 +775,68 @@ def _install_summary_stale_guard() -> None:
         for key, value in defaults.items():
             os.environ.setdefault(key, value)
 
-        from core.startup.summary_stale_guard_patch import install
-        ok = install()
+        # drop_stale_summary_rows 本体は core/global_context/context.py へ移設済みのため、
+        # ここでは呼び出し先プロセス全体で読まれる環境変数デフォルトの設定だけを行う。
         logger.warning(
-            "[MAIN DATABASE] summary stale guard installed ok=%s strict_today=%s global_lag_keep=%s liquidity_min_turnover=%s",
-            ok,
+            "[MAIN DATABASE] summary stale guard env defaults set strict_today=%s global_lag_keep=%s liquidity_min_turnover=%s",
             os.getenv("SUMMARY_STALE_STRICT_TODAY_ONLY"),
             os.getenv("SUMMARY_STALE_KEEP_LATEST_PER_SYMBOL_ON_GLOBAL_LAG"),
             os.getenv("LIQUIDITY_MIN_TURNOVER"),
         )
     except Exception:
-        logger.exception("[MAIN DATABASE] summary stale guard install failed; continue")
+        logger.exception("[MAIN DATABASE] summary stale guard env defaults setup failed; continue")
+
+
+def _install_db_startup_scope_defaults() -> None:
+    """Set the main_database.py-side resolution of sitecustomize's DB startup scope.
+
+    Moved-in equivalent of sitecustomize.py's _configure_db_startup_scope_defaults()
+    for the non-db_prepare branch (main_database.py is never db_prepare_runner.py,
+    so that branch can never apply here). sitecustomize.py already sets these via
+    setdefault before main_database.py's own code runs; this call makes the same
+    resolution explicit and independent of sys.argv sniffing.
+    """
+    try:
+        os.environ.setdefault("DISABLE_SUMMARY_RANKING_SCHEMA_REPAIR_PATCH", "1")
+        os.environ.setdefault("SUMMARY_RANKING_SCHEMA_REPAIR_SCOPE", "db_prepare_only")
+        os.environ.setdefault("DISABLE_SUMMARY_MTF_CATCHUP", "1")
+        logger.warning(
+            "[MAIN DATABASE] db startup scope defaults installed schema_repair_disabled=%s mtf_catchup_disabled=%s",
+            os.getenv("DISABLE_SUMMARY_RANKING_SCHEMA_REPAIR_PATCH"),
+            os.getenv("DISABLE_SUMMARY_MTF_CATCHUP"),
+        )
+    except Exception:
+        logger.exception("[MAIN DATABASE] db startup scope defaults install failed; continue")
+
+
+def _install_push_summary_realtime() -> None:
+    """Force PUSH DB writer env, start the writer singleton, and schedule a bootstrap rebuild.
+
+    The function-wrap parts of the old core/startup/push_summary_realtime_patch.py
+    (StreamDBWriter.flush trigger, start_push_stream forced writer injection, 401
+    refresh suppression) are now baked directly into their real target modules
+    (trading/push/push_db_writer.py, trading/push/push_stream/__init__.py,
+    force_cancel_loop.py, trading/position/kabu_position_reader.py,
+    kabu_api/positions.py), gated at call time by
+    data_collectors.split_mode.is_data_collector_process(). Only the startup-time
+    side effects (not tied to any single function) remain here.
+    """
+    try:
+        from trading.push.push_stream import (
+            _force_push_writer_env_if_database_process,
+            _ensure_stream_writer_singleton_started,
+        )
+        _force_push_writer_env_if_database_process()
+        writer = _ensure_stream_writer_singleton_started()
+        logger.warning("[MAIN DATABASE] push db writer singleton ensured ok=%s", writer is not None)
+    except Exception:
+        logger.exception("[MAIN DATABASE] push db writer singleton ensure failed; continue")
+
+    try:
+        from trading.push.push_summary_rebuild_trigger import schedule_bootstrap_rebuild
+        schedule_bootstrap_rebuild()
+    except Exception:
+        logger.exception("[MAIN DATABASE] push summary bootstrap rebuild schedule failed; continue")
 
 
 def _read_api_password_from_settings() -> str:
@@ -575,10 +1055,11 @@ def main() -> int:
     logger.info("[MAIN DATABASE] PROJECT_ROOT=%s", PROJECT_ROOT)
     logger.info("[MAIN DATABASE] cwd=%s", os.getcwd())
 
+    _install_db_startup_scope_defaults()
     _install_cpu_guard_env()
-    _install_summary_sqlite_lock_tolerance()
     _install_summary_wal_checkpoint()
     _install_summary_stale_guard()
+    _install_push_summary_realtime()
 
     try:
         from data_collectors.split_mode import mark_as_data_collector_process

@@ -242,21 +242,16 @@ def _install_summary_mtf_catchup_safely() -> None:
 
 
 DB_SYNC_PATCHES = [
-    ("core.startup.indicator_fragmentation_runtime_patch", "IND_PREVDAY_WARMUP", "DISABLE_IND_PREVDAY_WARMUP_PATCH"),
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
-    ("core.startup.yahoo_summary_direct_upsert_conflict_patch", "YAHOO_DIRECT_UPSERT_CONFLICT", "DISABLE_YAHOO_DIRECT_UPSERT_CONFLICT_PATCH"),
-    ("core.startup.summary_stale_guard_patch", "SUMMARY_STALE_GUARD", "DISABLE_SUMMARY_STALE_GUARD_PATCH"),
-    ("core.startup.push_summary_realtime_patch", "PUSH_SUMMARY_REALTIME", "DISABLE_PUSH_SUMMARY_REALTIME_PATCH"),
-    ("core.startup.summary_controller_latest_enrich_patch", "SUMMARY_CONTROLLER_LATEST_ENRICH", "DISABLE_SUMMARY_CONTROLLER_LATEST_ENRICH_PATCH"),
-    ("core.startup.active_symbol_target_fill_patch", "ACTIVE_SYMBOL_TARGET_FILL", "DISABLE_ACTIVE_SYMBOL_TARGET_FILL_PATCH"),
 ]
 
+# push_summary_fallback_and_active_price_patch (REV5) はインライン化済み。
+# trading/ranking/active_symbols/liquidity.py と
+# scheduler_jobs/summary/fallback_loader.py の本文に統合されているため、
+# ここでの install() は不要。
+
 SYNC_MAIN_PATCHES = [
-    ("core.startup.indicator_fragmentation_runtime_patch", "IND_PREVDAY_WARMUP", "DISABLE_IND_PREVDAY_WARMUP_PATCH"),
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
-    ("core.startup.yahoo_summary_direct_upsert_conflict_patch", "YAHOO_DIRECT_UPSERT_CONFLICT", "DISABLE_YAHOO_DIRECT_UPSERT_CONFLICT_PATCH"),
-    ("core.startup.summary_controller_latest_enrich_patch", "SUMMARY_CONTROLLER_LATEST_ENRICH", "DISABLE_SUMMARY_CONTROLLER_LATEST_ENRICH_PATCH"),
-    ("core.startup.active_symbol_target_fill_patch", "ACTIVE_SYMBOL_TARGET_FILL", "DISABLE_ACTIVE_SYMBOL_TARGET_FILL_PATCH"),
     ("core.startup.ranking_entry_market_hours_skip_patch", "RANKING_ENTRY_WATCHDOG", "DISABLE_RANKING_ENTRY_WATCHDOG_PATCH"),
     ("core.startup.ranking_entry_snapshot_technical_alias_patch", "RANKING_SNAPSHOT_TECH_ALIAS", "DISABLE_RANKING_SNAPSHOT_TECH_ALIAS_PATCH"),
     ("core.startup.entry_log_skip_reason_collision_patch", "ENTRY_LOG_SKIP_GUARD", "DISABLE_ENTRY_LOG_SKIP_GUARD"),

@@ -215,6 +215,17 @@ def _patch_loader_once() -> bool:
         if getattr(cur, "_summary_main_no_raw_db_watchdog", False):
             return True
 
+        # main 1m raw/DB fallback guard is now baked directly into
+        # scheduler_jobs/summary/fallback_loader.py (_main_1m_raw_db_fallback_blocked),
+        # so this watchdog's own (cruder) replacement is no longer needed and would
+        # only downgrade candidate selection. Skip wrapping once the inlined guard exists.
+        if getattr(fl, "_main_1m_raw_db_fallback_blocked", None) is not None:
+            logger.warning(
+                "[SUMMARY MAIN NO RAW DB FALLBACK] skipped: guard already inlined in fallback_loader.py version=%s",
+                VERSION,
+            )
+            return True
+
         def _fallback_push_summary_df_no_raw(interval: int, *, now=None) -> pd.DataFrame:
             interval_i = int(interval)
             if not (_is_main_context() and interval_i == 1 and _env_bool("SUMMARY_MAIN_DISABLE_RAW_DB_FALLBACK", True)):
@@ -249,20 +260,9 @@ def _patch_loader_once() -> bool:
         except Exception:
             pass
 
-        # REV4 patch itself may call its private raw loader. Replace it too when loaded.
-        try:
-            import core.startup.push_summary_fallback_and_active_price_patch as rev4
-            def _blocked_raw_loader(interval_i: int, *, now_i=None):
-                if _is_main_context() and int(interval_i) == 1 and _env_bool("SUMMARY_MAIN_DISABLE_RAW_DB_FALLBACK", True):
-                    logger.warning(
-                        "[SUMMARY MAIN NO RAW DB FALLBACK] blocked REV4 raw DB loader interval=1 version=%s",
-                        VERSION,
-                    )
-                    return pd.DataFrame()
-                return pd.DataFrame()
-            rev4._load_recent_push_raw_summary = _blocked_raw_loader
-        except Exception:
-            pass
+        # NOTE: the old REV4 patch module (core/startup/push_summary_fallback_and_active_price_patch.py)
+        # has been removed; its raw-loader logic is now inlined and guarded directly in
+        # scheduler_jobs/summary/fallback_loader.py, so there is nothing left to re-wrap here.
 
         logger.warning("[SUMMARY MAIN NO RAW DB FALLBACK] patched fallback loader version=%s", VERSION)
         return True

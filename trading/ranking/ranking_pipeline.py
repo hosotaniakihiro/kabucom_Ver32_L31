@@ -144,7 +144,7 @@ def _ensure_momentum(df: pd.DataFrame) -> pd.DataFrame:
                 work = work.sort_values(["symbol"], kind="mergesort")
 
             price_s = pd.to_numeric(work[price_col], errors="coerce")
-            work["_tmp_price_for_mom"] = price_s.fillna(method="ffill")
+            work["_tmp_price_for_mom"] = price_s.ffill()
 
             work["mom"] = (
                 work.groupby("symbol", sort=False)["_tmp_price_for_mom"]
@@ -328,11 +328,12 @@ def run_ranking_pipeline(df: pd.DataFrame, interval: int, *, regime: str | None 
             prefix="[ranking_pipeline][pre-latest]",
         )
 
-        df = select_latest_rows(df)
-        if df.empty:
-            logger.warning("[ranking_pipeline] empty after select_latest_rows")
-            return df
-
+        # NOTE: mom/trend/velocity/score はいずれも symbol 単位の .diff() / .pct_change() /
+        # .rolling() に依存する時系列特徴量のため、select_latest_rows() (symbol あたり最新1行に
+        # 圧縮) より前、履歴が複数行残っている間に計算する必要がある。
+        # 以前は select_latest_rows() を先に呼んでいたため、diff/rolling が構造的に常に
+        # 0（またはrolling(min_periods=1)由来の定数）になり、mom/trend/_score_velocity が
+        # 常時ゼロ、score が銘柄によらず一律の値になる不具合があった。
         df = ensure_slope(df)
         df = build_mtf_score(df)
 
@@ -341,6 +342,13 @@ def run_ranking_pipeline(df: pd.DataFrame, interval: int, *, regime: str | None 
 
         df["mom"] = np.tanh(_safe_numeric(df, "mom") * 2)
         df["trend"] = np.tanh(_safe_numeric(df, "trend") * 3)
+
+        df = build_ranking_score(df, regime=regime)
+
+        df = select_latest_rows(df)
+        if df.empty:
+            logger.warning("[ranking_pipeline] empty after select_latest_rows")
+            return df
 
         # 最新行選択後の列診断
         _log_column_profile(
@@ -354,8 +362,6 @@ def run_ranking_pipeline(df: pd.DataFrame, interval: int, *, regime: str | None 
             ],
             prefix="[ranking_pipeline][post-latest]",
         )
-
-        df = build_ranking_score(df, regime=regime)
 
         # ----------------------------------------------------
         # 表示用の寄与列を明示的に作る（NEW）

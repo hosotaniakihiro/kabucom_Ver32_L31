@@ -55,12 +55,14 @@ def _convert_object_to_numeric(df: pd.DataFrame) -> pd.DataFrame:
 
         for col in df.columns:
 
-            if df[col].dtype == "object":
+            # pandas 3.x では文字列列の既定dtypeが "object" ではなく "str" になるため、
+            # is_string_dtype で判定する（object dtype の文字列も引き続き対象に含む）。
+            if pd.api.types.is_string_dtype(df[col]):
 
-                converted = pd.to_numeric(
-                    df[col],
-                    errors="ignore"
-                )
+                try:
+                    converted = pd.to_numeric(df[col], errors="raise")
+                except (ValueError, TypeError):
+                    converted = df[col]
 
                 df[col] = converted
 

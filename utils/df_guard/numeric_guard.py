@@ -68,15 +68,15 @@ def force_numeric(df: pd.DataFrame) -> pd.DataFrame:
 
         for col in df.columns:
 
-            if df[col].dtype == object:
+            if pd.api.types.is_string_dtype(df[col]):
 
                 # 数値に変換できるものだけ変換
-                converted = pd.to_numeric(
-                    df[col],
-                    errors="ignore"
-                )
+                try:
+                    converted = pd.to_numeric(df[col], errors="raise")
+                except (ValueError, TypeError):
+                    converted = None
 
-                if converted.dtype != object:
+                if converted is not None and converted.dtype != object:
 
                     df[col] = converted
 

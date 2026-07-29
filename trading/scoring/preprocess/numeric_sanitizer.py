@@ -37,12 +37,12 @@ def _repair_object_numeric(df: pd.DataFrame) -> pd.DataFrame:
 
             try:
 
-                series = pd.to_numeric(
-                    df[c],
-                    errors="ignore"
-                )
+                try:
+                    series = pd.to_numeric(df[c], errors="raise")
+                except (ValueError, TypeError):
+                    series = None
 
-                if pd.api.types.is_numeric_dtype(series):
+                if series is not None and pd.api.types.is_numeric_dtype(series):
 
                     df[c] = series
 

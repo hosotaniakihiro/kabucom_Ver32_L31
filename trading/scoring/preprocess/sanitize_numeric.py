@@ -36,15 +36,15 @@ def sanitize_numeric(df: pd.DataFrame) -> pd.DataFrame:
             try:
 
                 # object → numeric attempt
-                if df_out[col].dtype == "object":
+                if pd.api.types.is_string_dtype(df_out[col]):
 
-                    df_out[col] = pd.to_numeric(
-                        df_out[col],
-                        errors="ignore"
-                    )
+                    try:
+                        df_out[col] = pd.to_numeric(df_out[col], errors="raise")
+                    except (ValueError, TypeError):
+                        pass
 
                 # numeric sanitize
-                if np.issubdtype(df_out[col].dtype, np.number):
+                if pd.api.types.is_numeric_dtype(df_out[col]):
 
                     df_out[col] = (
                         df_out[col]

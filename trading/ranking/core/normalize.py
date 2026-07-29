@@ -150,13 +150,13 @@ def normalize_numeric_dtype(df: pd.DataFrame) -> pd.DataFrame:
 
         for col in df.columns:
 
-            if df[col].dtype == "object":
+            if pd.api.types.is_string_dtype(df[col]):
 
                 # 数値変換可能なら変換
-                converted = pd.to_numeric(
-                    df[col],
-                    errors="ignore"
-                )
+                try:
+                    converted = pd.to_numeric(df[col], errors="raise")
+                except (ValueError, TypeError):
+                    converted = df[col]
 
                 df[col] = converted
 

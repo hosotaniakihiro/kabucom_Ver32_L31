@@ -1,11 +1,17 @@
 # ============================================================
 # File   : trading/ranking/active_symbols/liquidity.py
-# Version: Ver1.7-FAILOPEN-ALL-REMOVED-ACTIVE-LIQUIDITY
+# Version: Ver1.8-INLINE-REV5-PRICE-FALLBACK
 # ------------------------------------------------------------
 # Purpose:
 #   - PUSH登録候補の流動性/価格フィルタ
 #   - 低位株や極端に流動性が低い銘柄を除外する
 #   - 監視銘柄を価格条件内に制限する
+#
+# Ver1.8:
+#   - 旧 core/startup/push_summary_fallback_and_active_price_patch.py (REV5) を
+#     本文へインライン化。_summary_price_fallback_map に当日日付フィルタを追加し、
+#     _allow_unknown_price の premarket時デフォルトを True に変更した
+#     （既にパッチが常時適用されていたため実挙動の変化はない）。
 #
 # Ver1.7:
 #   - 2026-06-29 15:02 ログで today_ranking before=98 after=0、
@@ -45,7 +51,7 @@ from .normalize import dedupe_keep_order, normalize_symbol, to_float
 from .ranking_source import build_liquidity_map
 
 logger = logging.getLogger(__name__)
-VERSION = "Ver1.7-FAILOPEN-ALL-REMOVED-ACTIVE-LIQUIDITY"
+VERSION = "Ver1.8-INLINE-REV5-PRICE-FALLBACK"
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -135,6 +141,7 @@ def _summary_price_fallback_map(symbols: Iterable[str]) -> Dict[str, Dict[str, f
     busy_ms = int(max(50.0, _env_float("ACTIVE_SUMMARY_PRICE_FALLBACK_BUSY_TIMEOUT_MS", 300.0)))
     t0 = time.monotonic()
     out: Dict[str, Dict[str, float]] = {}
+    today_s = dt.datetime.now().strftime("%Y-%m-%d")
     try:
         with sqlite3.connect(path, timeout=timeout_sec) as conn:
             conn.execute(f"PRAGMA busy_timeout={busy_ms};")
@@ -150,9 +157,13 @@ def _summary_price_fallback_map(symbols: Iterable[str]) -> Dict[str, Dict[str, f
                 if "datetime" in cols:
                     dt_expr = _qident("datetime")
                     dt_expr_t2 = f"t2.{_qident('datetime')}"
+                    today_clause = f"AND substr({dt_expr}, 1, 10) = ?"
+                    today_clause_t2 = f"AND substr({dt_expr_t2}, 1, 10) = ?"
                 elif "date" in cols and "time" in cols:
                     dt_expr = f"({_qident('date')} || ' ' || {_qident('time')})"
                     dt_expr_t2 = f"(t2.{_qident('date')} || ' ' || t2.{_qident('time')})"
+                    today_clause = f"AND {_qident('date')} = ?"
+                    today_clause_t2 = f"AND t2.{_qident('date')} = ?"
                 else:
                     continue
 
@@ -176,14 +187,16 @@ def _summary_price_fallback_map(symbols: Iterable[str]) -> Dict[str, Dict[str, f
                            {dt_expr} AS dtv
                     FROM {table_q}
                     WHERE CAST({symbol_q} AS TEXT) IN ({placeholders})
+                      {today_clause}
                       AND {dt_expr} = (
                           SELECT MAX({dt_expr_t2})
                           FROM {table_q} t2
                           WHERE CAST(t2.{symbol_q} AS TEXT) = CAST({table_q}.{symbol_q} AS TEXT)
+                          {today_clause_t2}
                       )
                 """
                 try:
-                    rows = conn.execute(sql, remain).fetchall()
+                    rows = conn.execute(sql, [*remain, today_s, today_s]).fetchall()
                 except Exception as e:
                     logger.warning("[ACTIVE SUMMARY PRICE FALLBACK] bulk select skipped table=%s err=%s", table, e, exc_info=False)
                     continue
@@ -193,7 +206,15 @@ def _summary_price_fallback_map(symbols: Iterable[str]) -> Dict[str, Dict[str, f
                     price = to_float(row[1], 0.0)
                     if sym and price > 0 and sym not in out:
                         out[sym] = {"current_price": price, "price": price, "close": price, "summary_price_table": table}
-        logger.warning("[ACTIVE SUMMARY PRICE FALLBACK] loaded symbols=%d hit=%d missing=%d elapsed=%.3fs path=%s", len(cleaned), len(out), max(0, len(cleaned) - len(out)), time.monotonic() - t0, path)
+        logger.warning(
+            "[ACTIVE SUMMARY PRICE FALLBACK] loaded symbols=%d hit=%d missing=%d date=%s elapsed=%.3fs path=%s",
+            len(cleaned),
+            len(out),
+            max(0, len(cleaned) - len(out)),
+            today_s,
+            time.monotonic() - t0,
+            path,
+        )
         return out
     except sqlite3.OperationalError as e:
         logger.warning("[ACTIVE SUMMARY PRICE FALLBACK] sqlite skipped path=%s symbols=%d err=%s", path, len(cleaned), e, exc_info=False)
@@ -358,11 +379,14 @@ def filter_liquid_symbols(symbols: Iterable[Any], *, protected: Optional[Set[str
 
 
 def _allow_unknown_price(*, premarket_mode: bool) -> bool:
-    if _env_bool("ACTIVE_FINAL_PRICE_GUARD_ALLOW_UNKNOWN_PRICE", False):
-        return True
-    if premarket_mode and _env_bool("ACTIVE_PREMARKET_ALLOW_NO_PRICE", False):
-        return True
-    return False
+    try:
+        if _env_bool("ACTIVE_FINAL_PRICE_GUARD_ALLOW_UNKNOWN_PRICE", False):
+            return True
+        if premarket_mode and _env_bool("ACTIVE_PREMARKET_ALLOW_NO_PRICE", True):
+            return True
+        return False
+    except Exception:
+        return bool(premarket_mode)
 
 
 def final_guard_min_price(symbols: Iterable[str], *, protected: Set[str], liquidity_map: Dict[str, Dict[str, float]], premarket_mode: bool) -> List[str]:

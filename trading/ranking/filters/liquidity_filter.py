@@ -100,8 +100,11 @@ def _sanitize_numeric(df: pd.DataFrame) -> pd.DataFrame:
     try:
         for col in list(df.columns):
             try:
-                if df[col].dtype == "object" and col not in {"symbol", "symbolname", "name", "source", "ranking_type", "rank_types", "type", "market", "date", "time", "datetime", "start_time", "end_time", "time_range"}:
-                    df[col] = pd.to_numeric(df[col], errors="ignore")
+                if pd.api.types.is_string_dtype(df[col]) and col not in {"symbol", "symbolname", "name", "source", "ranking_type", "rank_types", "type", "market", "date", "time", "datetime", "start_time", "end_time", "time_range"}:
+                    try:
+                        df[col] = pd.to_numeric(df[col], errors="raise")
+                    except (ValueError, TypeError):
+                        pass
             except Exception:
                 pass
 

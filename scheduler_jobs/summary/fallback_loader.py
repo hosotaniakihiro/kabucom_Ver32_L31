@@ -4,7 +4,7 @@
 #====================================================================================================
 # ============================================================
 # File   : scheduler_jobs/summary/fallback_loader.py
-# Ver    : PRODUCTION-STABLE-SUMMARY-FALLBACK-LOADER-V2.3-MAIN-FAST-1M
+# Ver    : PRODUCTION-STABLE-SUMMARY-FALLBACK-LOADER-V2.4-INLINE-REV5-PUSH-FALLBACK
 #          -NO-RECOVERY-FALLBACK-FOR-1M-PUSH
 #          -EXPECTED-SLOT-AWARE
 #          -NOW-PASSTHROUGH
@@ -19,6 +19,15 @@
 # ✔ 古い fallback を安易に採用しない
 # ✔ 1分 PUSH fallback では市場中の stale を抑制
 # ✔ main.py の 1m PUSH fallback はメモリ/前回mergedを優先し、NAS DBを既定で読まない
+#
+# V2.4:
+#   - 旧 core/startup/push_summary_fallback_and_active_price_patch.py (REV5) を
+#     本文へインライン化。同日ガード (_same_day_push_rows/_latest_is_today)、
+#     raw PUSH DB優先読み込み (_load_recent_push_raw_summary)、
+#     main.py 1分足のraw/DB fallback禁止 (_main_1m_raw_db_fallback_blocked) を
+#     filter_push_like_rows / fallback_push_summary_df 本体に統合。
+#     旧来ロジックは _base_fallback_push_summary_df として維持し、
+#     fallback_push_summary_df から内部的に呼び出す構成にした。
 # ============================================================
 
 from __future__ import annotations
@@ -82,11 +91,35 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return bool(default)
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+# main_database.py がPUSH DB保存を担当する前提の raw/NAS DB fallback 既定値。
+# 旧 core/startup/push_summary_fallback_and_active_price_patch.py の install() から移設。
+os.environ.setdefault("SUMMARY_MAIN_DISABLE_RAW_DB_FALLBACK", "1")
+os.environ.setdefault("PUSH_SUMMARY_RAW_DB_FALLBACK_RUN_IN_MAIN", "0")
+
+
 def _argv_text() -> str:
     try:
         return " ".join(str(x).replace("\\", "/").lower() for x in (sys.argv or []))
     except Exception:
         return ""
+
+
+def _is_main_py_process() -> bool:
+    try:
+        argv = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        return any(x.endswith("/main.py") or x == "main.py" for x in argv)
+    except Exception:
+        return False
 
 
 def _is_main_entry_context() -> bool:
@@ -388,25 +421,343 @@ def load_latest_summary_from_db(
     return df
 
 
-def filter_push_like_rows(df: pd.DataFrame) -> pd.DataFrame:
-    df = normalize_df(df)
-    if df.empty or "source" not in df.columns:
-        return df
+def _push_db_path() -> str:
+    base = os.getenv(
+        "PUSH_DB_DIR",
+        os.getenv(
+            "RAW_PUSH_DIR",
+            r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\push",
+        ),
+    )
+    today_s = dt.datetime.now().strftime("%Y%m%d")
+    return os.getenv("PUSH_DB_PATH", str(Path(base) / f"push{today_s}.db"))
+
+
+def _qident(name: Any) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     try:
-        src = df["source"].astype(str)
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone() is not None
+    except Exception:
+        return False
+
+
+def _table_cols(conn: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        return {str(r[1]) for r in conn.execute(f"PRAGMA table_info({_qident(table)})").fetchall()}
+    except Exception:
+        return set()
+
+
+def _normalize_dt_series(s: Any) -> pd.Series:
+    """Normalize datetime to tz-naive local/JST wall-clock without shifting naive rows."""
+    def _one(v: Any) -> Any:
+        try:
+            x = pd.to_datetime(v, errors="coerce")
+            if pd.isna(x):
+                return pd.NaT
+            if getattr(x, "tzinfo", None) is not None:
+                try:
+                    return x.tz_convert("Asia/Tokyo").tz_localize(None)
+                except Exception:
+                    try:
+                        return x.tz_localize(None)
+                    except Exception:
+                        return pd.NaT
+            return x
+        except Exception:
+            return pd.NaT
+
+    try:
+        if isinstance(s, pd.Series):
+            return pd.to_datetime(s.map(_one), errors="coerce")
+        return pd.to_datetime(pd.Series(s).map(_one), errors="coerce")
+    except Exception:
+        try:
+            return pd.to_datetime(s, errors="coerce")
+        except Exception:
+            return pd.Series(pd.NaT, index=getattr(s, "index", None))
+
+
+def _same_day_push_rows(df: pd.DataFrame, *, now_i: dt.datetime, label: str = "") -> pd.DataFrame:
+    """Drop previous-day/future-day PUSH-like fallback rows before freshness/candidate selection."""
+    if df is None or df.empty or "datetime" not in df.columns:
+        return pd.DataFrame() if df is None else df
+    try:
+        x = df.copy()
+        x["datetime"] = _normalize_dt_series(x["datetime"])
+        before = len(x)
+        day = today_date(now=now_i)
+        x = x.dropna(subset=["datetime"])
+        x = x[x["datetime"].dt.date == day].copy()
+        if len(x) != before:
+            logger.warning(
+                "[PUSH FALLBACK SAME-DAY GUARD] dropped old rows label=%s before=%s after=%s today=%s latest_before=%s latest_after=%s",
+                label,
+                before,
+                len(x),
+                day,
+                df["datetime"].max() if "datetime" in df.columns and not df.empty else None,
+                x["datetime"].max() if not x.empty else None,
+            )
+        return x.reset_index(drop=True)
+    except Exception:
+        logger.exception("[PUSH FALLBACK SAME-DAY GUARD] failed label=%s", label)
+        return pd.DataFrame()
+
+
+def _latest_is_today(df: pd.DataFrame, *, now_i: dt.datetime, label: str = "") -> bool:
+    try:
+        if df is None or df.empty or "datetime" not in df.columns:
+            return False
+        dtv = _normalize_dt_series(df["datetime"])
+        dtv = dtv.dropna()
+        if dtv.empty:
+            return False
+        latest = dtv.max()
+        ok = latest.date() == today_date(now=now_i)
+        if not ok:
+            logger.warning(
+                "[PUSH FALLBACK SAME-DAY GUARD] reject candidate label=%s latest_dt=%s today=%s rows=%s",
+                label,
+                latest,
+                today_date(now=now_i),
+                len(df),
+            )
+        return bool(ok)
+    except Exception:
+        return False
+
+
+def _safe_to_num(s):
+    return pd.to_numeric(s, errors="coerce")
+
+
+def _main_1m_raw_db_fallback_blocked(interval_i: int) -> bool:
+    """main.pyの1分足ではraw/NAS DB fallbackを使わない。
+
+    main_database.py がPUSH DB保存と重いsummary復元を担当するため、main.py側で
+    pushYYYYMMDD.dbを読むとエントリー遅延になる。必要な場合だけ
+    PUSH_SUMMARY_RAW_DB_FALLBACK_RUN_IN_MAIN=1 で戻せる。
+    """
+    try:
+        if int(interval_i) != 1:
+            return False
+        if not _is_main_py_process():
+            return False
+        if _env_bool("PUSH_SUMMARY_RAW_DB_FALLBACK_RUN_IN_MAIN", False):
+            return False
+        if not _env_bool("SUMMARY_MAIN_DISABLE_RAW_DB_FALLBACK", True):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _load_recent_push_raw_summary(interval_i: int, *, now_i: dt.datetime) -> pd.DataFrame:
+    if _main_1m_raw_db_fallback_blocked(interval_i):
+        logger.warning(
+            "[PUSH RAW DB FALLBACK] blocked in main.py interval=%s reason=main_1m_no_raw_db",
+            interval_i,
+        )
+        return pd.DataFrame()
+    if not _env_bool("PUSH_SUMMARY_RAW_DB_FALLBACK_ENABLED", True):
+        return pd.DataFrame()
+    path = _push_db_path()
+    p = Path(path)
+    if not p.exists():
+        logger.warning("[PUSH RAW DB FALLBACK] db not found path=%s", path)
+        return pd.DataFrame()
+
+    lookback_min = int(max(2, _env_float("PUSH_SUMMARY_RAW_DB_FALLBACK_LOOKBACK_MIN", 10.0)))
+    limit = int(max(100, _env_float("PUSH_SUMMARY_RAW_DB_FALLBACK_LIMIT", 50000.0)))
+    timeout_sec = max(0.05, _env_float("PUSH_SUMMARY_RAW_DB_FALLBACK_TIMEOUT_SEC", 0.8))
+    busy_ms = int(max(50, _env_float("PUSH_SUMMARY_RAW_DB_FALLBACK_BUSY_TIMEOUT_MS", 500.0)))
+    since = now_i - dt.timedelta(minutes=lookback_min)
+
+    try:
+        with sqlite3.connect(str(p), timeout=timeout_sec) as conn:
+            conn.execute(f"PRAGMA busy_timeout={busy_ms};")
+            table = "stream_data_raw" if _table_exists(conn, "stream_data_raw") else "stream_data"
+            cols = _table_cols(conn, table)
+            if not {"symbol", "datetime", "price"}.issubset(cols):
+                logger.warning("[PUSH RAW DB FALLBACK] required cols missing table=%s cols=%s path=%s", table, sorted(cols), path)
+                return pd.DataFrame()
+            wanted = [
+                "symbol", "symbolname", "datetime", "date", "time", "price", "volume",
+                "trading_value", "vwap", "opening_price", "high_price", "low_price",
+            ]
+            if "received_at" in cols:
+                wanted.append("received_at")
+            select_cols = [c for c in wanted if c in cols]
+            date_filter = now_i.strftime("%Y-%m-%d")
+            where_parts = []
+            params: list[Any] = []
+            if "date" in cols:
+                where_parts.append("date = ?")
+                params.append(date_filter)
+            else:
+                where_parts.append("substr(datetime, 1, 10) = ?")
+                params.append(date_filter)
+            if "received_at" in cols:
+                where_parts.append("received_at >= ?")
+                params.append(since.isoformat())
+            else:
+                where_parts.append("datetime >= ?")
+                params.append(since.isoformat())
+            where = " AND ".join(where_parts) if where_parts else "1=1"
+            sql = f"SELECT {','.join(_qident(c) for c in select_cols)} FROM {_qident(table)} WHERE {where} ORDER BY datetime DESC LIMIT ?"
+            params.append(limit)
+            df = pd.read_sql_query(sql, conn, params=params)
+    except Exception:
+        logger.debug("[PUSH RAW DB FALLBACK] load failed path=%s interval=%s", path, interval_i, exc_info=True)
+        return pd.DataFrame()
+
+    if df.empty:
+        logger.warning("[PUSH RAW DB FALLBACK] empty path=%s interval=%s since=%s", path, interval_i, since)
+        return df
+
+    try:
+        df["datetime"] = _normalize_dt_series(df["datetime"])
+        df = _same_day_push_rows(df, now_i=now_i, label=f"raw_db.interval{interval_i}")
+        df = df.dropna(subset=["datetime", "symbol"])
+        df["price"] = _safe_to_num(df["price"])
+        df = df.dropna(subset=["price"])
+        df = df[df["price"] > 0].copy()
+        if df.empty:
+            return pd.DataFrame()
+        df["symbol"] = df["symbol"].astype(str).str.strip()
+        df = df[df["symbol"] != ""].copy()
+        try:
+            df["slot"] = df["datetime"].dt.floor(f"{int(interval_i)}min")
+        except Exception:
+            df["slot"] = df["datetime"]
+        latest_slot = df["slot"].max()
+        if pd.isna(latest_slot) or latest_slot.date() != today_date(now=now_i):
+            logger.warning("[PUSH RAW DB FALLBACK] reject old latest_slot interval=%s latest_slot=%s today=%s", interval_i, latest_slot, today_date(now=now_i))
+            return pd.DataFrame()
+        df = df[df["slot"] == latest_slot].copy()
+        df = df.sort_values(["symbol", "datetime"])
+        if "volume" in df.columns:
+            df["volume"] = _safe_to_num(df["volume"]).fillna(0.0)
+        else:
+            df["volume"] = 0.0
+        if "trading_value" in df.columns:
+            df["trading_value"] = _safe_to_num(df["trading_value"]).fillna(0.0)
+        else:
+            df["trading_value"] = 0.0
+        if "symbolname" not in df.columns:
+            df["symbolname"] = ""
+
+        grouped = df.groupby("symbol", sort=False)
+        out = pd.DataFrame({
+            "symbol": grouped["symbol"].last(),
+            "symbolname": grouped["symbolname"].last(),
+            "datetime": grouped["slot"].last(),
+            "open": grouped["price"].first(),
+            "high": grouped["price"].max(),
+            "low": grouped["price"].min(),
+            "close": grouped["price"].last(),
+            "volume": grouped["volume"].max(),
+            "trading_value": grouped["trading_value"].max(),
+        }).reset_index(drop=True)
+        out = _same_day_push_rows(out, now_i=now_i, label=f"raw_db.out.interval{interval_i}")
+        if out.empty or not _latest_is_today(out, now_i=now_i, label=f"raw_db.out.interval{interval_i}"):
+            return pd.DataFrame()
+        out["price"] = out["close"]
+        out["current_price"] = out["close"]
+        out["open_price"] = out["open"]
+        out["high_price"] = out["high"]
+        out["low_price"] = out["low"]
+        out["close_price"] = out["close"]
+        out["interval"] = int(interval_i)
+        out["source"] = "push_stream_raw_db"
+        out["date"] = pd.to_datetime(out["datetime"], errors="coerce").dt.strftime("%Y-%m-%d")
+        out["time"] = pd.to_datetime(out["datetime"], errors="coerce").dt.strftime("%H:%M:%S")
+        out["start_time"] = out["time"]
+        out["end_time"] = out["time"]
+        logger.warning(
+            "[PUSH RAW DB FALLBACK] loaded interval=%s rows=%s symbols=%s latest_dt=%s path=%s",
+            interval_i,
+            len(out),
+            out["symbol"].nunique() if "symbol" in out.columns else 0,
+            out["datetime"].max() if "datetime" in out.columns and not out.empty else None,
+            path,
+        )
+        return out
+    except Exception:
+        logger.exception("[PUSH RAW DB FALLBACK] transform failed path=%s interval=%s", path, interval_i)
+        return pd.DataFrame()
+
+
+def _is_fresh_enough(df: pd.DataFrame, interval_i: int, now_i: dt.datetime, *, label: str = "") -> bool:
+    try:
+        if not _latest_is_today(df, now_i=now_i, label=label):
+            return False
+        ts = extract_latest_timestamp(df)
+        if ts is None:
+            return False
+        return bool(is_fresh_timestamp(ts, interval_i, for_ranking=False, now=now_i))
+    except Exception:
+        return False
+
+
+def _prepare_candidate(df: pd.DataFrame, interval_i: int, now_i: dt.datetime, label: str) -> pd.DataFrame:
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return pd.DataFrame()
+        x = normalize_df(df)
+        x = filter_push_like_rows(x)
+        x = _same_day_push_rows(x, now_i=now_i, label=label)
+        if x.empty:
+            return pd.DataFrame()
+        x = _slot_aligned_latest_rows(x, interval=interval_i, now=now_i)
+        x = _same_day_push_rows(x, now_i=now_i, label=f"{label}.slot")
+        if not _is_fresh_enough(x, interval_i, now_i, label=label):
+            return pd.DataFrame()
+        return x.reset_index(drop=True)
+    except Exception:
+        logger.debug("[summary.fallback_loader] prepare candidate failed interval=%s label=%s", interval_i, label, exc_info=True)
+        return pd.DataFrame()
+
+
+def filter_push_like_rows(df: pd.DataFrame) -> pd.DataFrame:
+    x = normalize_df(df)
+    if x.empty or "source" not in x.columns:
+        return x
+    try:
+        now_i = now_naive().replace(tzinfo=None, microsecond=0)
+        if "datetime" in x.columns:
+            x = _same_day_push_rows(x, now_i=now_i, label="filter_push_like_rows.input")
+            if x.empty:
+                return x
+        src = x["source"].astype(str)
+        src_l = src.str.lower().str.strip()
         mask = (
-            src.str.contains("push_stream", case=False, na=False)
+            src_l.isin({"push", "summary", "push_summary", "summary_push", "push_stream_raw_db"})
+            | src.str.contains("push_stream", case=False, na=False)
             | src.str.contains("yahoo_pipeline", case=False, na=False)
             | src.str.contains("incremental", case=False, na=False)
             | src.str.contains("summary_recovery", case=False, na=False)
             | src.str.contains("resample", case=False, na=False)
         )
-        out = df.loc[mask].copy()
-        logger.info("[summary.fallback_loader] push-like filter rows=%s -> %s source_dist=%s", len(df), len(out), {} if out.empty else out["source"].astype(str).value_counts().head(10).to_dict())
+        out = x.loc[mask].copy()
+        out = _same_day_push_rows(out, now_i=now_i, label="filter_push_like_rows.output")
+        logger.info(
+            "[summary.fallback_loader] push-like filter rows=%s -> %s source_dist=%s",
+            len(x),
+            len(out),
+            {} if out.empty else out["source"].astype(str).value_counts().head(10).to_dict(),
+        )
         return out.reset_index(drop=True)
     except Exception:
         logger.exception("[summary.fallback_loader] push-like filter failed")
-        return df
+        return x
 
 
 def _memory_push_fallback_candidates(interval: int, *, now: Optional[dt.datetime]) -> list[tuple[str, pd.DataFrame]]:
@@ -456,7 +807,7 @@ def _memory_push_fallback_candidates(interval: int, *, now: Optional[dt.datetime
     return normalized
 
 
-def fallback_push_summary_df(interval: int, *, now: Optional[dt.datetime] = None) -> pd.DataFrame:
+def _base_fallback_push_summary_df(interval: int, *, now: Optional[dt.datetime] = None) -> pd.DataFrame:
     interval = int(interval)
     now = (now or now_naive()).replace(tzinfo=None, microsecond=0)
     t0 = time.perf_counter()
@@ -527,6 +878,91 @@ def fallback_push_summary_df(interval: int, *, now: Optional[dt.datetime] = None
         return df
 
     logger.warning("[summary.fallback_loader] fallback push summary empty interval=%s now=%s", interval, now)
+    return pd.DataFrame()
+
+
+def fallback_push_summary_df(interval: int, *, now: Optional[dt.datetime] = None) -> pd.DataFrame:
+    interval_i = int(interval)
+    now_i = (now or now_naive()).replace(tzinfo=None, microsecond=0)
+
+    if _main_1m_raw_db_fallback_blocked(interval_i):
+        logger.warning(
+            "[summary.fallback_loader] main 1m raw/db fallback disabled interval=%s",
+            interval_i,
+        )
+        try:
+            df0 = _base_fallback_push_summary_df(interval_i, now=now_i)
+            df0 = _prepare_candidate(df0, interval_i, now_i, f"orig_fallback.main_no_raw.interval{interval_i}")
+            if isinstance(df0, pd.DataFrame) and not df0.empty:
+                logger.warning(
+                    "[summary.fallback_loader] selected original memory fallback interval=%s rows=%s symbols=%s latest_dt=%s",
+                    interval_i,
+                    len(df0),
+                    symbols_count(df0),
+                    latest_dt_str(df0),
+                )
+                return df0.reset_index(drop=True)
+        except Exception:
+            logger.debug("[summary.fallback_loader] original memory fallback failed interval=%s", interval_i, exc_info=True)
+        logger.warning(
+            "[summary.fallback_loader] main 1m fallback empty without raw/db interval=%s now=%s",
+            interval_i,
+            now_i,
+        )
+        return pd.DataFrame()
+
+    raw_df = _load_recent_push_raw_summary(interval_i, now_i=now_i)
+    raw_df = _prepare_candidate(raw_df, interval_i, now_i, f"raw_db.interval{interval_i}")
+    if isinstance(raw_df, pd.DataFrame) and not raw_df.empty:
+        logger.warning(
+            "[summary.fallback_loader] selected fresh push raw DB fallback interval=%s rows=%s symbols=%s latest_dt=%s",
+            interval_i,
+            len(raw_df),
+            symbols_count(raw_df),
+            latest_dt_str(raw_df),
+        )
+        return raw_df.reset_index(drop=True)
+
+    try:
+        df0 = _base_fallback_push_summary_df(interval_i, now=now_i)
+        df0 = _prepare_candidate(df0, interval_i, now_i, f"orig_fallback.interval{interval_i}")
+        if isinstance(df0, pd.DataFrame) and not df0.empty:
+            logger.warning(
+                "[summary.fallback_loader] selected original same-day fallback interval=%s rows=%s symbols=%s latest_dt=%s",
+                interval_i,
+                len(df0),
+                symbols_count(df0),
+                latest_dt_str(df0),
+            )
+            return df0.reset_index(drop=True)
+    except Exception:
+        logger.debug("[summary.fallback_loader] original push fallback failed interval=%s", interval_i, exc_info=True)
+
+    candidates: list[tuple[str, pd.DataFrame]] = []
+    if isinstance(raw_df, pd.DataFrame) and not raw_df.empty:
+        candidates.append((f"db.push_raw[{interval_i}].patched", raw_df))
+    for src in ("push", "SUMMARY", "summary", None):
+        try:
+            df = load_latest_summary_from_db(interval_i, source_filter=src, now=now_i)
+            df = _prepare_candidate(df, interval_i, now_i, f"db.stock_summary_{interval_i}min[{src or '*'}]")
+            if not df.empty:
+                candidates.append((f"db.stock_summary_{interval_i}min[{src or '*'}].patched", df))
+        except Exception:
+            logger.debug("[summary.fallback_loader] patched push fallback source failed interval=%s src=%s", interval_i, src, exc_info=True)
+
+    df = select_best_candidate(candidates, interval=interval_i, for_ranking=False, now=now_i)
+    df = _same_day_push_rows(df, now_i=now_i, label=f"select_best.interval{interval_i}")
+    if not df.empty and _is_fresh_enough(df, interval_i, now_i, label=f"select_best.interval{interval_i}"):
+        logger.warning(
+            "[summary.fallback_loader] patched push fallback selected interval=%s rows=%s symbols=%s latest_dt=%s",
+            interval_i,
+            len(df),
+            symbols_count(df),
+            latest_dt_str(df),
+        )
+        return df.reset_index(drop=True)
+
+    logger.warning("[summary.fallback_loader] patched fallback push summary empty interval=%s now=%s", interval_i, now_i)
     return pd.DataFrame()
 
 

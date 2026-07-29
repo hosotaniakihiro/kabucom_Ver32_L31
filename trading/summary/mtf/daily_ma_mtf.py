@@ -278,6 +278,14 @@ def attach_daily_ma_mtf_to_summary(
         .drop_duplicates(subset=["symbol"], keep="last")
     )
 
+    # summary_df が既に一度この関数を通過済み（daily_* 列を保持したまま再度渡された）場合、
+    # merge の suffixes 適用で "xxx_daily_src" が二重に生じて MergeError になるのを防ぐ。
+    merge_cols = [c for c in keep_cols if c != "symbol"]
+    stale_cols = [c for c in merge_cols if c in out.columns]
+    stale_cols += [f"{c}_daily_src" for c in merge_cols if f"{c}_daily_src" in out.columns]
+    if stale_cols:
+        out = out.drop(columns=stale_cols)
+
     out = out.merge(daily, on="symbol", how="left", suffixes=("", "_daily_src"))
     out = _ensure_daily_columns(out, overwrite_score_mtf=False)
 
