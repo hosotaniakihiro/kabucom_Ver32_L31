@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/sqlite_memory_pragmas_patch.py
-# Version: SQLITE-MEMORY-PRAGMAS-PATCH-V3-SUMMARY-RANKING-SPOOL
+# Version: SQLITE-MEMORY-PRAGMAS-PATCH-V5-UNIFIED-CONNECT
 # ------------------------------------------------------------
 # Purpose:
 #   main_database.py / data collector 子プロセスの SQLite 接続に対して、
@@ -16,6 +16,24 @@
 #     summary_saver_bulk が rank/ranking_score/ranking_type を drop する問題を防止。
 #   - SUMMARY SAVE SPOOL の flush を summary_saver_bulk 経由にして、列不一致や型差分で
 #     failed_files が残り続ける問題を緩和する。
+#
+#   V4:
+#   - ranking legacy table 補修は trading/ranking/ranking_db_writer.py の
+#     _ensure_legacy_table 本体へ移設。
+#   - summary ranking schema 補修は trading/summary/persistence/summary_saver_bulk.py の
+#     _get_table_columns_from_engine 本体へ移設。
+#   - sqlite3.connect 経由の PRAGMA / summary schema 補修 (下記 _apply_pragmas) は
+#     stdlib 全体への上書きのため、このファイルに残す。
+#
+#   V5:
+#   - 旧 core/startup/summary_sqlite_lock_tolerance_patch.py を統合。
+#     summary*.db への sqlite3.connect が二重に monkeypatch されていたのを
+#     この1本の _patched_connect にまとめた。
+#   - バグ修正: 旧 summary_sqlite_lock_tolerance_patch は summary専用のつもりの
+#     busy_timeout(60秒)を共通環境変数 SQLITE_BUSY_TIMEOUT_MS に書き込んでいたため、
+#     summary以外の全DB接続にも60秒busy_timeoutが漏れていた。
+#     統合後は summary専用の busy_timeout は SUMMARY_SQLITE_BUSY_TIMEOUT_MS だけに
+#     設定し、共通の SQLITE_BUSY_TIMEOUT_MS (既定5秒) には触れない。
 #
 # Notes:
 #   - 既存コードの sqlite3.connect 呼び出しを横取りし、接続直後に軽量PRAGMAを適用する。
@@ -35,26 +53,9 @@ logger = logging.getLogger(__name__)
 
 _ORIG_CONNECT = sqlite3.connect
 _INSTALLED = False
-_RANKING_LEGACY_SCHEMA_PATCHED = False
-_SUMMARY_RANKING_SCHEMA_PATCHED = False
 _SUMMARY_SPOOL_FLUSH_PATCHED = False
 _TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 _FALSE = {"0", "false", "no", "n", "off", "disable", "disabled"}
-
-
-LEGACY_RANKING_COLUMNS: tuple[tuple[str, str], ...] = (
-    ("symbol", "TEXT"),
-    ("symbolname", "TEXT"),
-    ("current_price", "REAL"),
-    ("change_percentage", "REAL"),
-    ("change_ratio", "REAL"),
-    ("trading_volume", "REAL"),
-    ("trading_value", "REAL"),
-    ("turnover", "REAL"),
-    ("tick_count", "INTEGER"),
-    ("inserted_at", "TEXT"),
-    ("rank", "INTEGER"),
-)
 
 
 SUMMARY_RANKING_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -106,6 +107,21 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(str(os.getenv(name, str(default))).strip())
+    except Exception:
+        return float(default)
+
+
+def _setdefault_env(name: str, value: str) -> None:
+    try:
+        if not str(os.getenv(name, "")).strip():
+            os.environ[name] = value
+    except Exception:
+        pass
+
+
 def _classify_db(database: Any) -> str:
     try:
         p = str(database).replace("\\", "/").lower()
@@ -123,6 +139,20 @@ def _classify_db(database: Any) -> str:
     if "yahoo" in name or "/yahoo/" in p:
         return "yahoo"
     return "default"
+
+
+def _looks_like_summary_db_file(database: Any) -> bool:
+    """summaryYYYYMMDD.db のような実ファイル名だけを狭く判定する。
+
+    _classify_db() は "summary" を含むパス全般を緩く拾うが、接続timeoutの
+    底上げ・WAL/synchronous等の追加PRAGMAは実際のsummary DB本体だけに限定する
+    (旧 core/startup/summary_sqlite_lock_tolerance_patch.py の判定基準を踏襲)。
+    """
+    try:
+        name = Path(str(database or "")).name.lower()
+        return name.startswith("summary") and name.endswith(".db")
+    except Exception:
+        return False
 
 
 def _quote_ident_fallback(name: str) -> str:
@@ -233,6 +263,60 @@ def _ensure_summary_ranking_columns_on_connection(conn: sqlite3.Connection, data
         logger.debug("[SUMMARY RANKING SCHEMA REPAIR] connection repair failed database=%s", database, exc_info=True)
 
 
+def _force_summary_lock_env() -> None:
+    """summary DB向けのロック耐性ENVデフォルトを設定する。
+
+    旧 core/startup/summary_sqlite_lock_tolerance_patch.py から移設。
+    NOTE: SQLITE_BUSY_TIMEOUT_MS はDB種別を問わない共通デフォルト値のため、
+    ここでは書き換えない。summary専用の値は SUMMARY_SQLITE_BUSY_TIMEOUT_MS だけに
+    設定する (旧バージョンでの全DBへの漏れを修正)。
+    """
+    _setdefault_env("SUMMARY_SQLITE_BUSY_TIMEOUT_MS", "60000")
+    _setdefault_env("SUMMARY_SQLITE_TIMEOUT", "60")
+    _setdefault_env("SUMMARY_SQLITE_CACHE_KB", "-131072")
+    _setdefault_env("SUMMARY_SQLITE_TEMP_STORE", "MEMORY")
+
+    # MTF indicator fill。大きいchunkがロックを長く持つため小分け、retryは長め。
+    _setdefault_env("SUMMARY_MTF_INDICATOR_SQLITE_TIMEOUT", "60")
+    _setdefault_env("SUMMARY_MTF_INDICATOR_BUSY_TIMEOUT_MS", "60000")
+    _setdefault_env("SUMMARY_MTF_INDICATOR_UPDATE_CHUNK_SIZE", "50")
+    _setdefault_env("SUMMARY_MTF_INDICATOR_LOCK_RETRIES", "20")
+    _setdefault_env("SUMMARY_MTF_INDICATOR_LOCK_SLEEP_BASE", "0.50")
+    _setdefault_env("SUMMARY_MTF_INDICATOR_SKIP_IF_BUSY", "1")
+
+    # MTF catchup 側で使われる可能性のある名称をまとめて安全側に寄せる。
+    # 未使用ENVは無害。
+    _setdefault_env("SUMMARY_MTF_CATCHUP_SQLITE_TIMEOUT", "60")
+    _setdefault_env("SUMMARY_MTF_CATCHUP_BUSY_TIMEOUT_MS", "60000")
+    _setdefault_env("SUMMARY_MTF_CATCHUP_LOCK_RETRIES", "20")
+    _setdefault_env("SUMMARY_MTF_CATCHUP_RETRIES", "20")
+    _setdefault_env("SUMMARY_MTF_CATCHUP_UPSERT_RETRIES", "20")
+    _setdefault_env("SUMMARY_MTF_CATCHUP_BUSY_RETRIES", "20")
+    _setdefault_env("SUMMARY_MTF_CATCHUP_LOCK_SLEEP_BASE", "0.50")
+    _setdefault_env("SUMMARY_MTF_CATCHUP_CHUNK_SIZE", "100")
+    _setdefault_env("SUMMARY_MTF_CATCHUP_UPSERT_CHUNK_SIZE", "100")
+
+
+def _configure_summary_connection_extra(conn: sqlite3.Connection) -> None:
+    """summary DB本体だけに追加で効かせるPRAGMA (busy_timeout底上げ・WAL・synchronous)。
+
+    旧 core/startup/summary_sqlite_lock_tolerance_patch.py から移設。
+    """
+    busy_ms = max(60000, _env_int("SUMMARY_SQLITE_BUSY_TIMEOUT_MS", 60000))
+    pragmas = [
+        f"PRAGMA busy_timeout={busy_ms}",
+        "PRAGMA journal_mode=WAL",
+        "PRAGMA synchronous=NORMAL",
+        "PRAGMA wal_autocheckpoint=1000",
+    ]
+    for sql in pragmas:
+        try:
+            conn.execute(sql)
+        except Exception:
+            # journal_modeなどはタイミングにより失敗しても致命傷にしない。
+            pass
+
+
 def _apply_pragmas(conn: sqlite3.Connection, database: Any) -> None:
     if not _env_bool("SQLITE_MEMORY_PRAGMAS_ENABLED", True):
         return
@@ -278,6 +362,12 @@ def _apply_pragmas(conn: sqlite3.Connection, database: Any) -> None:
     except Exception:
         pass
 
+    if _looks_like_summary_db_file(database):
+        try:
+            _configure_summary_connection_extra(conn)
+        except Exception:
+            pass
+
     try:
         _ensure_summary_ranking_columns_on_connection(conn, database)
     except Exception:
@@ -285,6 +375,13 @@ def _apply_pragmas(conn: sqlite3.Connection, database: Any) -> None:
 
 
 def _patched_connect(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+    if _looks_like_summary_db_file(database):
+        try:
+            current_timeout = float(kwargs.get("timeout", 0) or 0)
+        except Exception:
+            current_timeout = 0.0
+        kwargs["timeout"] = max(current_timeout, max(60.0, _env_float("SUMMARY_SQLITE_TIMEOUT", 60.0)))
+
     conn = _ORIG_CONNECT(database, *args, **kwargs)
     try:
         _apply_pragmas(conn, database)
@@ -294,120 +391,6 @@ def _patched_connect(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connec
         except Exception:
             pass
     return conn
-
-
-def _install_ranking_legacy_schema_patch() -> bool:
-    """Patch RankingDBWriter legacy table ensure for existing old DB files.
-
-    ranking_db_writer.py の CREATE TABLE IF NOT EXISTS は既存テーブルの列不足を
-    補修しないため、古い ranking DB では INSERT rank で落ちる。
-    ここで _ensure_legacy_table を包み、CREATE 後に PRAGMA table_info -> ALTER TABLE
-    を実行して不足列を自動追加する。
-    """
-    global _RANKING_LEGACY_SCHEMA_PATCHED
-    if _RANKING_LEGACY_SCHEMA_PATCHED:
-        return True
-    if _env_bool("DISABLE_RANKING_LEGACY_SCHEMA_REPAIR_PATCH", False):
-        return False
-
-    try:
-        import trading.ranking.ranking_db_writer as writer_mod
-
-        cls = getattr(writer_mod, "RankingDBWriter", None)
-        old = getattr(cls, "_ensure_legacy_table", None) if cls is not None else None
-        if cls is None or not callable(old):
-            return False
-        if getattr(old, "_ranking_legacy_schema_repair_patch", False):
-            _RANKING_LEGACY_SCHEMA_PATCHED = True
-            return True
-
-        def _patched_ensure_legacy_table(self: Any, table: str) -> None:
-            old(self, table)
-            cur = getattr(self, "cursor", None)
-            if cur is None:
-                return
-            _ensure_columns_with_cursor(cur, table, LEGACY_RANKING_COLUMNS, "RANKING LEGACY SCHEMA REPAIR")
-
-        _patched_ensure_legacy_table._ranking_legacy_schema_repair_patch = True  # type: ignore[attr-defined]
-        _patched_ensure_legacy_table._original = old  # type: ignore[attr-defined]
-        cls._ensure_legacy_table = _patched_ensure_legacy_table
-        _RANKING_LEGACY_SCHEMA_PATCHED = True
-        logger.warning("[RANKING LEGACY SCHEMA REPAIR] installed")
-        return True
-    except Exception:
-        logger.exception("[RANKING LEGACY SCHEMA REPAIR] install failed")
-        return False
-
-
-def _install_summary_ranking_schema_patch() -> bool:
-    """Patch summary_saver_bulk table column discovery so ranking columns are not dropped.
-
-    summary_saver_bulk aligns DataFrame columns to the physical SQLite table.  When old
-    summary DB files do not yet have ranking columns, rank/ranking_score/ranking_type are
-    dropped before upsert.  This wrapper repairs the table before column discovery returns.
-    """
-    global _SUMMARY_RANKING_SCHEMA_PATCHED
-    if _SUMMARY_RANKING_SCHEMA_PATCHED:
-        return True
-    if _env_bool("DISABLE_SUMMARY_RANKING_SCHEMA_REPAIR_PATCH", False):
-        return False
-
-    try:
-        import trading.summary.persistence.summary_saver_bulk as saver
-
-        old = getattr(saver, "_get_table_columns_from_engine", None)
-        if not callable(old):
-            return False
-        if getattr(old, "_summary_ranking_schema_repair_patch", False):
-            _SUMMARY_RANKING_SCHEMA_PATCHED = True
-            return True
-
-        def _patched_get_table_columns_from_engine(engine: Any, table_name: str):
-            if engine is not None and str(table_name) in SUMMARY_TABLES:
-                try:
-                    with engine.begin() as conn:
-                        rows = conn.exec_driver_sql(f"PRAGMA table_info({_quote_ident(str(table_name))})").fetchall()
-                        if rows:
-                            existing = {
-                                str(r[1]).strip()
-                                for r in rows
-                                if len(r) > 1 and r[1] is not None and str(r[1]).strip()
-                            }
-                            added: list[str] = []
-                            for col, decl in SUMMARY_RANKING_COLUMNS:
-                                if col in existing:
-                                    continue
-                                try:
-                                    conn.exec_driver_sql(
-                                        f"ALTER TABLE {_quote_ident(str(table_name))} ADD COLUMN {_quote_ident(col)} {decl}"
-                                    )
-                                    existing.add(col)
-                                    added.append(col)
-                                except Exception as e:
-                                    msg = str(e).lower()
-                                    if "duplicate column" in msg or "already exists" in msg:
-                                        existing.add(col)
-                                        continue
-                                    raise
-                            if added:
-                                logger.warning(
-                                    "[SUMMARY RANKING SCHEMA REPAIR] table=%s added_columns=%s",
-                                    table_name,
-                                    added,
-                                )
-                except Exception:
-                    logger.debug("[SUMMARY RANKING SCHEMA REPAIR] engine repair failed table=%s", table_name, exc_info=True)
-            return old(engine, table_name)
-
-        _patched_get_table_columns_from_engine._summary_ranking_schema_repair_patch = True  # type: ignore[attr-defined]
-        _patched_get_table_columns_from_engine._original = old  # type: ignore[attr-defined]
-        saver._get_table_columns_from_engine = _patched_get_table_columns_from_engine
-        _SUMMARY_RANKING_SCHEMA_PATCHED = True
-        logger.warning("[SUMMARY RANKING SCHEMA REPAIR] installed")
-        return True
-    except Exception:
-        logger.exception("[SUMMARY RANKING SCHEMA REPAIR] install failed")
-        return False
 
 
 def _install_summary_spool_flush_patch() -> bool:
@@ -436,8 +419,8 @@ def _install_summary_spool_flush_patch() -> bool:
 
         def _patched_save_direct(df: Any, *, interval: int, source: str, date_yyyymmdd: str) -> int:
             try:
-                # Ensure summary tables have ranking columns before bulk alignment.
-                _install_summary_ranking_schema_patch()
+                # Ranking column repair now runs unconditionally inside
+                # summary_saver_bulk._get_table_columns_from_engine itself.
                 saved = saver.bulk_upsert_summary(
                     df,
                     interval=int(interval),
@@ -471,28 +454,26 @@ def _install_summary_spool_flush_patch() -> bool:
 def install() -> bool:
     global _INSTALLED
 
-    ranking_schema_ok = _install_ranking_legacy_schema_patch()
-    summary_schema_ok = _install_summary_ranking_schema_patch()
+    _force_summary_lock_env()
     spool_ok = _install_summary_spool_flush_patch()
 
     if _INSTALLED:
         return True
     if not _env_bool("SQLITE_MEMORY_PRAGMAS_ENABLED", True):
-        return bool(ranking_schema_ok or summary_schema_ok or spool_ok)
+        return bool(spool_ok)
     try:
         sqlite3.connect = _patched_connect  # type: ignore[assignment]
         _INSTALLED = True
         logger.warning(
-            "[SQLITE MEMORY PRAGMAS] installed temp_store=%s cache_kb=%s mmap=%s spill_off=%s ranking_legacy_schema=%s summary_ranking_schema=%s spool_bulk=%s",
+            "[SQLITE MEMORY PRAGMAS] installed temp_store=%s cache_kb=%s mmap=%s spill_off=%s summary_busy_ms=%s spool_bulk=%s",
             os.getenv("SQLITE_MEMORY_TEMP_STORE", "MEMORY"),
             os.getenv("SQLITE_MEMORY_CACHE_KB", "-65536"),
             os.getenv("SQLITE_MMAP_SIZE_BYTES", "268435456"),
             os.getenv("SQLITE_CACHE_SPILL_OFF", "1"),
-            ranking_schema_ok,
-            summary_schema_ok,
+            os.getenv("SUMMARY_SQLITE_BUSY_TIMEOUT_MS", "60000"),
             spool_ok,
         )
         return True
     except Exception:
         logger.exception("[SQLITE MEMORY PRAGMAS] install failed")
-        return bool(ranking_schema_ok or summary_schema_ok or spool_ok)
+        return bool(spool_ok)

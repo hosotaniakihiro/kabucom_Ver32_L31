@@ -21,6 +21,8 @@ import threading
 import time
 from typing import Any
 
+from data_collectors.split_mode import is_data_collector_process
+
 logger = logging.getLogger(__name__)
 
 # rotation系が import 時に os.environ を読む前に、必ず先に読み込む。
@@ -316,6 +318,47 @@ def _start_main_stale_fallback_watcher() -> None:
     threading.Thread(target=_watch, name="main-push-memory-fallback-watch", daemon=True).start()
 
 
+def _force_push_writer_env_if_database_process() -> None:
+    """DB/data-collector側では PUSH DB writer を必ず有効にする。
+
+    旧 core/startup/push_summary_realtime_patch.py から移設。
+    """
+    if not is_data_collector_process():
+        return
+    os.environ["AUTOSTOCK_DATA_COLLECTORS_PROCESS"] = "1"
+    os.environ["AUTOSTOCK_MAIN_MEMORY_ONLY"] = "0"
+    os.environ["AUTOSTOCK_SKIP_DATA_COLLECTOR_WORK_IN_MAIN"] = "0"
+    os.environ["PUSH_STREAM_DB_WRITE"] = "1"
+    os.environ.setdefault("PUSH_STREAM_ORDER_BOOK_WRITE", "1")
+
+
+def _ensure_stream_writer_singleton_started() -> Any:
+    """PUSH保存用 singleton を開始して返す。失敗時は None。
+
+    旧 core/startup/push_summary_realtime_patch.py から移設。
+    """
+    try:
+        _force_push_writer_env_if_database_process()
+        import trading.push.push_db_writer as writer_mod
+        writer = getattr(writer_mod, "stream_writer", None)
+        if writer is None:
+            cls = getattr(writer_mod, "StreamDBWriter", None)
+            writer = cls(enable_raw_save=True) if callable(cls) else None
+            if writer is not None:
+                setattr(writer_mod, "stream_writer", writer)
+        if writer is not None:
+            try:
+                start = getattr(writer, "start", None)
+                if callable(start):
+                    start()
+            except Exception:
+                logger.debug("[push_stream] stream_writer.start skipped/failed", exc_info=True)
+        return writer
+    except Exception:
+        logger.exception("[push_stream] ensure stream_writer singleton failed")
+        return None
+
+
 def start_push_stream(*args, **kwargs):
     if _should_skip_push_stream_start_in_main():
         _mark_main_ws_skipped()
@@ -327,7 +370,22 @@ def start_push_stream(*args, **kwargs):
         return None
 
     _prepare_main_memory_only_ws()
-    return _runner_start_push_stream(*args, **kwargs)
+
+    # DB/data-collector側では stream_writer を明示注入する。
+    # 旧 core/startup/push_summary_realtime_patch.py から移設。
+    if is_data_collector_process():
+        _force_push_writer_env_if_database_process()
+        if kwargs.get("stream_writer", None) is None or kwargs.get("stream_writer") is False:
+            writer = _ensure_stream_writer_singleton_started()
+            if writer is not None:
+                kwargs["stream_writer"] = writer
+        logger.warning(
+            "[push_stream] start_push_stream forced writer process_db=True writer_injected=%s db_write_env=%s",
+            kwargs.get("stream_writer") is not None and kwargs.get("stream_writer") is not False,
+            os.getenv("PUSH_STREAM_DB_WRITE"),
+        )
+
+    return _TRUE_RUNNER_START_PUSH_STREAM(*args, **kwargs)
 
 
 def start(*args, **kwargs):

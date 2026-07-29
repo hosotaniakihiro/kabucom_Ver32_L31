@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from config.paths import get_path
+from trading.push.push_summary_rebuild_trigger import trigger_summary_rebuild
 
 try:
     from core.global_context.context import global_data  # type: ignore
@@ -54,6 +55,43 @@ except Exception:
     from global_state import global_data  # type: ignore
 
 logger = logging.getLogger(__name__)
+
+_OWNER_GUARD_LAST_LOG_TS = 0.0
+
+
+def _should_skip_push_db_writer_here() -> bool:
+    """main.py側からのPUSH DB直接書き込みを止める。main_database.pyがDB保存を担当する。
+
+    旧 core/startup/push_db_writer_owner_guard_patch.py から移設。
+    """
+    try:
+        from data_collectors.split_mode import should_skip_data_collector_work_in_main
+        return bool(should_skip_data_collector_work_in_main())
+    except Exception:
+        return False
+
+
+def _log_owner_guard_skip_once(action: str, extra: dict[str, Any] | None = None) -> None:
+    global _OWNER_GUARD_LAST_LOG_TS
+    now = time.time()
+    if now - _OWNER_GUARD_LAST_LOG_TS < 10.0:
+        return
+    _OWNER_GUARD_LAST_LOG_TS = now
+    try:
+        from data_collectors.split_mode import is_data_collector_process, external_data_collectors_enabled
+        logger.warning(
+            "[PUSH DB WRITER OWNER GUARD] skip action=%s is_data_collector=%s external_collectors=%s reason=main_database_handles_push_storage extra=%s",
+            action,
+            bool(is_data_collector_process()),
+            bool(external_data_collectors_enabled()),
+            extra or {},
+        )
+    except Exception:
+        logger.warning(
+            "[PUSH DB WRITER OWNER GUARD] skip action=%s reason=main_database_handles_push_storage extra=%s",
+            action,
+            extra or {},
+        )
 
 
 class StreamDBWriter:
@@ -669,6 +707,10 @@ class StreamDBWriter:
     # ========================================================
 
     def add_push_row(self, row: dict) -> None:
+        if _should_skip_push_db_writer_here():
+            _log_owner_guard_skip_once("add_push_row", {"symbol": (row or {}).get("symbol") if isinstance(row, dict) else None})
+            return
+
         if not isinstance(row, dict):
             logger.error("[PUSH DB WRITER] add_push_row skipped: row is not dict")
             return
@@ -794,6 +836,10 @@ class StreamDBWriter:
     # ========================================================
 
     def add_latest_push(self) -> None:
+        if _should_skip_push_db_writer_here():
+            _log_owner_guard_skip_once("add_latest_push")
+            return
+
         try:
             df = global_data.get_push_df()
         except Exception:
@@ -822,6 +868,30 @@ class StreamDBWriter:
     # ========================================================
 
     def flush(self) -> bool:
+        if _should_skip_push_db_writer_here():
+            try:
+                with self.lock:
+                    if self.buffer:
+                        self.buffer.clear()
+            except Exception:
+                pass
+            _log_owner_guard_skip_once("flush")
+            return True
+
+        ok = self._flush_impl()
+        try:
+            if bool(ok):
+                delta = int(getattr(global_data, "last_flush_delta", 0) or 0)
+                rows = int(getattr(global_data, "last_flush_rows", 0) or 0)
+                if delta > 0 or rows > 0:
+                    trigger_summary_rebuild(reason=f"push_flush rows={rows} delta={delta}")
+                else:
+                    logger.debug("[PUSH DB WRITER] flush ok but no row delta rows=%s delta=%s", rows, delta)
+        except Exception:
+            logger.debug("[PUSH DB WRITER] flush post-trigger failed", exc_info=True)
+        return ok
+
+    def _flush_impl(self) -> bool:
         with self.lock:
             if not self.buffer:
                 logger.debug("[PUSH DB WRITER] flush skipped: buffer empty")
@@ -1112,6 +1182,14 @@ class StreamDBWriter:
     # ========================================================
 
     def start(self) -> None:
+        if _should_skip_push_db_writer_here():
+            try:
+                self._started = False
+            except Exception:
+                pass
+            _log_owner_guard_skip_once("start")
+            return
+
         with self.lock:
             if self._started and self._thread and self._thread.is_alive():
                 logger.info("[PUSH DB WRITER] start skipped: already running")

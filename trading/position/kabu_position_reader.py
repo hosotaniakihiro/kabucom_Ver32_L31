@@ -235,36 +235,11 @@ def _sync_token(token: str | None) -> None:
 
 
 def _refresh_token_after_401() -> str:
-    try:
-        import token_manager
-        token = token_manager.refresh_token()
-        if token:
-            token = str(token).strip()
-            _sync_token(token)
-            logger.warning("[KABU POSITION READER] token refreshed after 401 token_len=%s", len(token))
-            return token
-    except TypeError:
-        pass
-    except Exception as e:
-        logger.warning("[KABU POSITION READER] refresh_token() failed after 401 err=%s", e)
-    try:
-        from pathlib import Path
-        from configparser import ConfigParser
-        import token_manager
-        root = Path(__file__).resolve().parents[2]
-        conf = ConfigParser()
-        conf.read(str(root / "settings.ini"), encoding="utf-8")
-        section = "aukabu" if conf.has_section("aukabu") else "kabusapi"
-        api_password = conf.get(section, "apipassword", fallback="")
-        if api_password:
-            token = token_manager.refresh_token(api_password)
-            if token:
-                token = str(token).strip()
-                _sync_token(token)
-                logger.warning("[KABU POSITION READER] token refreshed with settings after 401 token_len=%s", len(token))
-                return token
-    except Exception as e:
-        logger.warning("[KABU POSITION READER] refresh_token(settings) failed after 401 err=%s", e)
+    """401時に runtime refresh を呼ばず、このcycleをskipする。
+
+    旧 core/startup/push_summary_realtime_patch.py から移設。
+    """
+    logger.warning("[KABU POSITION READER] 401 received; runtime refresh disabled -> skip this cycle")
     return ""
 
 

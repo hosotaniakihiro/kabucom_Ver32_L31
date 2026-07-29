@@ -555,7 +555,318 @@ def _log_df_profile(prefix: str, tf: Any, source: Optional[str], df: pd.DataFram
         logger.exception("[GlobalContext] _log_df_profile failed prefix=%s tf=%s source=%s", prefix, tf, source)
 
 
+# ============================================================
+# STALE SUMMARY ROW GUARD
+# (旧 core/startup/summary_stale_guard_patch.py から移設)
+#
+# PUSH / ranking summary が古いまま merged summary に残り、古い価格・
+# 古い slope・古い RSI/MACD で表示・AI・発注候補になる問題を防ぐ。
+# 同日データでも soft-keep を無制限にせず、1分足は既定300秒/3分足480秒/
+# 5分足900秒を下限として扱う。latest_dt が max_age+grace を超えたら
+# 同日でも hard-drop する。
+# ============================================================
+
+_STALE_GUARD_VERSION = "REV9-SUMMARY-STALE-GUARD-BOUNDED-SAME-DAY"
+
+
+def _stale_env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(str(v).strip()))
+    except Exception:
+        return int(default)
+
+
+def _stale_normalize_source(source: Any) -> str:
+    try:
+        return str(source or "push").strip().lower()
+    except Exception:
+        return "push"
+
+
+def _stale_normalize_tf(tf: Any) -> Any:
+    try:
+        if tf in ("1", "1m", "1min"):
+            return 1
+        if tf in ("3", "3m", "3min"):
+            return 3
+        if tf in ("5", "5m", "5min"):
+            return 5
+        if tf in ("10", "10m", "10min"):
+            return 10
+        if tf in ("15", "15m", "15min"):
+            return 15
+        if tf in ("30", "30m", "30min"):
+            return 30
+        if tf in ("60", "60m", "60min"):
+            return 60
+        if tf in ("d", "1d", "day", "daily"):
+            return "daily"
+        return int(tf)
+    except Exception:
+        return tf
+
+
+def _stale_is_intraday_live_source(source: Any) -> bool:
+    src = _stale_normalize_source(source)
+    return src.startswith("push") or src.startswith("ranking") or src in {"legacy", "summary"}
+
+
+def _stale_bounded_env_int(name: str, default: int, *, min_value: Optional[int] = None) -> int:
+    value = _stale_env_int(name, default)
+    if min_value is not None:
+        value = max(int(value), int(min_value))
+    return int(value)
+
+
+def _stale_max_age_sec(source: Any, tf: Any) -> Optional[int]:
+    source = _stale_normalize_source(source)
+    tf = _stale_normalize_tf(tf)
+
+    if not _env_bool("SUMMARY_STALE_GUARD_ENABLED", True):
+        return None
+    if tf == "daily":
+        return None
+
+    if source.startswith("push"):
+        defaults = {1: 300, 3: 480, 5: 900, 10: 1200, 15: 1500, 30: 2400, 60: 4800}
+        default = int(defaults.get(tf, 600))
+        return _stale_bounded_env_int(f"PUSH_SUMMARY_{tf}MIN_MAX_AGE_SEC", default, min_value=default)
+
+    if source.startswith("ranking"):
+        defaults = {1: 300, 3: 480, 5: 900, 10: 1500, 15: 1800, 30: 3600, 60: 7200}
+        default = int(defaults.get(tf, 900))
+        return _stale_bounded_env_int(f"RANKING_SUMMARY_{tf}MIN_MAX_AGE_SEC", default, min_value=default)
+
+    if source == "legacy" or source == "summary":
+        default = 300 if tf == 1 else 900
+        return _stale_bounded_env_int(f"LEGACY_SUMMARY_{tf}MIN_MAX_AGE_SEC", default, min_value=default)
+
+    return None
+
+
+def _stale_relative_lag_sec(source: Any, tf: Any) -> Optional[int]:
+    source = _stale_normalize_source(source)
+    tf = _stale_normalize_tf(tf)
+
+    if not _env_bool("SUMMARY_STALE_RELATIVE_GUARD_ENABLED", True):
+        return None
+    if tf == "daily":
+        return None
+
+    try:
+        tf_int = int(tf)
+    except Exception:
+        tf_int = 1
+
+    defaults = {1: 300, 3: 720, 5: 1200}
+    default = int(defaults.get(tf_int, max(300, tf_int * 180 + 300)))
+
+    if source.startswith("push"):
+        return _stale_bounded_env_int(f"PUSH_SUMMARY_{tf_int}MIN_RELATIVE_LAG_SEC", default, min_value=default)
+    if source.startswith("ranking"):
+        return _stale_bounded_env_int(f"RANKING_SUMMARY_{tf_int}MIN_RELATIVE_LAG_SEC", default, min_value=default)
+    if source in {"legacy", "summary"}:
+        return _stale_bounded_env_int(f"LEGACY_SUMMARY_{tf_int}MIN_RELATIVE_LAG_SEC", default, min_value=default)
+    return None
+
+
+def _stale_min_keep_rows(source: Any, tf: Any) -> int:
+    tf_n = _stale_normalize_tf(tf)
+    if tf_n == "daily":
+        return 0
+    try:
+        tf_int = int(tf_n)
+    except Exception:
+        tf_int = 1
+    src = _stale_normalize_source(source).upper()
+    return _stale_env_int(f"{src}_SUMMARY_{tf_int}MIN_KEEP_ROWS", _stale_env_int(f"SUMMARY_{tf_int}MIN_KEEP_ROWS", 0))
+
+
+def _stale_future_allow_sec(source: Any, tf: Any) -> int:
+    try:
+        tf_n = _stale_normalize_tf(tf)
+        tf_int = int(tf_n) if tf_n != "daily" else 1
+    except Exception:
+        tf_int = 1
+    default = max(10, min(60, tf_int * 12))
+    src = _stale_normalize_source(source).upper()
+    return _stale_env_int(f"{src}_SUMMARY_{tf_int}MIN_FUTURE_ALLOW_SEC", _stale_env_int("SUMMARY_FUTURE_ALLOW_SEC", default))
+
+
+def _stale_latest_fallback_rows(out: pd.DataFrame, *, time_col: str, min_keep: int) -> pd.DataFrame:
+    if min_keep <= 0 or out.empty:
+        return out.iloc[0:0].copy()
+    try:
+        work = out[out[time_col].notna()].copy()
+        if work.empty:
+            return out.iloc[0:0].copy()
+        work = work.sort_values(time_col, ascending=False)
+        if "symbol" in work.columns:
+            work = work.drop_duplicates(subset=["symbol"], keep="first")
+        return work.head(int(min_keep)).copy().reset_index(drop=True)
+    except Exception:
+        logger.debug("[SUMMARY STALE DROP] latest fallback failed", exc_info=True)
+        return out.iloc[0:0].copy()
+
+
+def _stale_to_naive_datetime_series(s: pd.Series) -> pd.Series:
+    out = pd.to_datetime(s, errors="coerce")
+    try:
+        return out.dt.tz_localize(None)
+    except Exception:
+        return out
+
+
+def drop_stale_summary_rows(df: Any, *, source: Any, tf: Any, label: str = "sanitize") -> pd.DataFrame:
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return pd.DataFrame() if df is None else df
+
+        max_age = _stale_max_age_sec(source, tf)
+        relative_lag = _stale_relative_lag_sec(source, tf)
+        min_keep = _stale_min_keep_rows(source, tf)
+        if (max_age is None or max_age <= 0) and (relative_lag is None or relative_lag <= 0):
+            return df
+
+        time_col = _best_time_col(df)
+        if not time_col:
+            logger.warning(
+                "[SUMMARY STALE DROP] source=%s tf=%s label=%s before=%s after=0 reason=time_col_missing max_age_sec=%s relative_lag_sec=%s version=%s",
+                source, tf, label, len(df), max_age, relative_lag, _STALE_GUARD_VERSION,
+            )
+            return df.iloc[0:0].copy()
+
+        out = df.copy()
+        out[time_col] = _stale_to_naive_datetime_series(out[time_col])
+        now = pd.Timestamp.now().tz_localize(None)
+        before_original = int(len(out))
+
+        today_str = now.strftime("%Y-%m-%d")
+        strict_today = _env_bool("SUMMARY_STALE_STRICT_TODAY_ONLY", True)
+        if strict_today and _stale_is_intraday_live_source(source) and _stale_normalize_tf(tf) != "daily":
+            dt_str = out[time_col].dt.strftime("%Y-%m-%d")
+            non_today_mask = out[time_col].notna() & dt_str.ne(today_str)
+            non_today_count = int(non_today_mask.sum()) if len(out) else 0
+            if non_today_count > 0:
+                non_today_latest = None
+                try:
+                    non_today_latest = out.loc[non_today_mask, time_col].max()
+                except Exception:
+                    non_today_latest = None
+                out = out.loc[~non_today_mask].copy().reset_index(drop=True)
+                logger.warning(
+                    "[SUMMARY NON-TODAY DROP] source=%s tf=%s label=%s before=%s non_today_removed=%s after=%s today=%s non_today_latest=%s version=%s",
+                    source, tf, label, before_original, non_today_count, len(out), today_str, non_today_latest, _STALE_GUARD_VERSION,
+                )
+                if out.empty:
+                    return out
+
+        allow_sec = _stale_future_allow_sec(source, tf)
+        future_cutoff = now + pd.Timedelta(seconds=float(allow_sec))
+        dt_series0 = out[time_col]
+        future_mask = dt_series0.notna() & dt_series0.gt(future_cutoff)
+        future_count = int(future_mask.sum()) if len(out) else 0
+        if future_count > 0:
+            future_latest = None
+            try:
+                future_latest = dt_series0.loc[future_mask].max()
+            except Exception:
+                future_latest = None
+            out = out.loc[~future_mask].copy().reset_index(drop=True)
+            logger.warning(
+                "[SUMMARY FUTURE DROP] source=%s tf=%s label=%s before=%s future_removed=%s after=%s now=%s allow_sec=%s future_latest=%s version=%s",
+                source, tf, label, before_original, future_count, len(out), now, allow_sec, future_latest, _STALE_GUARD_VERSION,
+            )
+            if out.empty:
+                return out
+
+        dt_series = out[time_col]
+        age_sec = (now - dt_series).dt.total_seconds()
+        before = int(len(out))
+        valid_mask = dt_series.notna() & age_sec.ge(0)
+
+        latest_dt = None
+        latest_age_sec = None
+        try:
+            latest_dt = dt_series.max()
+            if pd.notna(latest_dt):
+                latest_age_sec = float((now - latest_dt).total_seconds())
+        except Exception:
+            latest_dt = None
+            latest_age_sec = None
+
+        # REV9: same-day soft keep is bounded. 10:25時点で10:11を残すような
+        # 無制限soft-keepはライブ候補に古いPUSHを混ぜるため禁止する。
+        global_lag_enabled = _env_bool("SUMMARY_STALE_KEEP_LATEST_PER_SYMBOL_ON_GLOBAL_LAG", False)
+        global_lag_grace = _stale_env_int("SUMMARY_STALE_GLOBAL_LAG_GRACE_SEC", 60)
+        if (
+            not global_lag_enabled
+            and max_age is not None
+            and max_age > 0
+            and latest_age_sec is not None
+            and latest_age_sec > float(max_age + global_lag_grace)
+        ):
+            logger.warning(
+                "[SUMMARY STALE DROP] global lag hard-drop bounded source=%s tf=%s label=%s before=%s after=0 max_age_sec=%s grace_sec=%s latest_age_sec=%.1f latest_dt=%s now=%s version=%s",
+                source, tf, label, before, max_age, global_lag_grace, latest_age_sec, latest_dt, now, _STALE_GUARD_VERSION,
+            )
+            return out.iloc[0:0].copy()
+
+        absolute_mask = pd.Series(False, index=out.index)
+        if max_age is not None and max_age > 0:
+            absolute_mask = age_sec.le(float(max_age))
+
+        relative_mask = pd.Series(False, index=out.index)
+        if relative_lag is not None and relative_lag > 0:
+            try:
+                if pd.notna(latest_dt):
+                    cutoff = latest_dt - pd.Timedelta(seconds=float(relative_lag))
+                    relative_mask = dt_series.ge(cutoff)
+            except Exception:
+                latest_dt = None
+
+        valid_mask = valid_mask & (absolute_mask | relative_mask)
+        out2 = out.loc[valid_mask].copy().reset_index(drop=True)
+        after = int(len(out2))
+
+        if min_keep > 0 and before >= min_keep and after < min_keep:
+            fallback = _stale_latest_fallback_rows(out, time_col=time_col, min_keep=min_keep)
+            if len(fallback) > after:
+                logger.warning(
+                    "[SUMMARY STALE DROP] min_keep fallback source=%s tf=%s label=%s before=%s stale_after=%s fallback_after=%s min_keep=%s latest_dt=%s now=%s version=%s",
+                    source, tf, label, before, after, len(fallback), min_keep, latest_dt, now, _STALE_GUARD_VERSION,
+                )
+                out2 = fallback
+                after = int(len(out2))
+
+        if after != before or future_count > 0 or before_original != before:
+            oldest_kept = None
+            newest_kept = None
+            try:
+                oldest_kept = out2[time_col].min() if after else None
+                newest_kept = out2[time_col].max() if after else None
+            except Exception:
+                pass
+            logger.warning(
+                "[SUMMARY STALE DROP] source=%s tf=%s label=%s before=%s after=%s max_age_sec=%s relative_lag_sec=%s min_keep=%s latest_dt=%s oldest_kept=%s newest_kept=%s now=%s future_removed=%s version=%s",
+                source, tf, label, before_original, after, max_age, relative_lag, min_keep, latest_dt, oldest_kept, newest_kept, now, future_count, _STALE_GUARD_VERSION,
+            )
+
+        return out2
+    except Exception:
+        logger.exception("[SUMMARY STALE DROP] failed source=%s tf=%s label=%s", source, tf, label)
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+
 def _sanitize_summary_df(df: Any, tf: Any, source: str, symbol_name_map: Optional[Dict[str, str]] = None) -> pd.DataFrame:
+    out = _sanitize_summary_df_impl(df, tf, source, symbol_name_map)
+    return drop_stale_summary_rows(out, source=source, tf=tf, label="merged_sanitize")
+
+
+def _sanitize_summary_df_impl(df: Any, tf: Any, source: str, symbol_name_map: Optional[Dict[str, str]] = None) -> pd.DataFrame:
     try:
         out = _safe_df(df)
         if out.empty:
@@ -712,6 +1023,14 @@ class GlobalContext:
             return out
 
     def get_merged_summary(self, tf: Any, source: Optional[str] = None) -> pd.DataFrame:
+        # stale-guard は旧 core/startup/summary_stale_guard_patch.py から移設。
+        # ロック保持時間を変えないため、_get_merged_summary_impl の外側で
+        # 適用する (元のmonkeypatchと同じ位置関係)。
+        df = self._get_merged_summary_impl(tf, source=source)
+        src = source if source is not None else "push"
+        return drop_stale_summary_rows(df, source=src, tf=tf, label="merged_get")
+
+    def _get_merged_summary_impl(self, tf: Any, source: Optional[str] = None) -> pd.DataFrame:
         with self._lock:
             if source is not None:
                 src = str(source or "legacy").lower()

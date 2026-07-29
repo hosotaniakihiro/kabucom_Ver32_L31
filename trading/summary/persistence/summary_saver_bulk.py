@@ -38,6 +38,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 import warnings
@@ -305,12 +306,111 @@ def _resolve_summary_engine():
     return None
 
 
+# ============================================================
+# summary ranking schema repair
+# (旧 core/startup/sqlite_memory_pragmas_patch.py の
+#  _install_summary_ranking_schema_patch から移設)
+#
+# summary_saver_bulk は DataFrame の列を実テーブルへ整形するため、
+# 古い summary DB に rank/ranking_score/ranking_type 列が無いと
+# UPSERT前にこれらを drop してしまう。列読み取りと同じ接続内で
+# 不足列を補修してから読み取る。
+# ============================================================
+
+SUMMARY_TABLES: tuple[str, ...] = (
+    "stock_summary_1min",
+    "stock_summary_3min",
+    "stock_summary_5min",
+)
+
+SUMMARY_RANKING_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("rank", "REAL"),
+    ("rank_no", "REAL"),
+    ("best_rank", "REAL"),
+    ("avg_rank", "REAL"),
+    ("rank_types_count", "INTEGER"),
+    ("ranking_score", "REAL"),
+    ("ranking_score_total", "REAL"),
+    ("ranking_type", "TEXT"),
+    ("rank_types", "TEXT"),
+    ("type", "TEXT"),
+    ("ranking", "TEXT"),
+    ("market", "TEXT"),
+    ("current_price", "REAL"),
+    ("change_rate", "REAL"),
+    ("chg", "REAL"),
+    ("trading_volume", "REAL"),
+    ("trading_value", "REAL"),
+    ("turnover", "REAL"),
+    ("turn", "REAL"),
+)
+
+
+def _quote_ident(name: str) -> str:
+    try:
+        from database.sqlite import quote_ident
+        return quote_ident(str(name))
+    except Exception:
+        return '"' + str(name).replace('"', '""') + '"'
+
+
+def _schema_repair_env_bool(name: str, default: bool) -> bool:
+    try:
+        raw = str(os.getenv(name, "")).strip().lower()
+        if raw in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if raw in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+            return False
+    except Exception:
+        pass
+    return bool(default)
+
+
+def _ensure_summary_ranking_columns(conn, table_name: str) -> None:
+    if _schema_repair_env_bool("DISABLE_SUMMARY_RANKING_SCHEMA_REPAIR_PATCH", False):
+        return
+    try:
+        q = _quote_ident(table_name)
+        rows = conn.exec_driver_sql(f"PRAGMA table_info({q})").fetchall()
+        if not rows:
+            return
+        existing = {
+            str(r[1]).strip()
+            for r in rows
+            if len(r) > 1 and r[1] is not None and str(r[1]).strip()
+        }
+        added: list[str] = []
+        for col, decl in SUMMARY_RANKING_COLUMNS:
+            if col in existing:
+                continue
+            try:
+                conn.exec_driver_sql(f"ALTER TABLE {q} ADD COLUMN {_quote_ident(col)} {decl}")
+                existing.add(col)
+                added.append(col)
+            except Exception as e:
+                msg = str(e).lower()
+                if "duplicate column" in msg or "already exists" in msg:
+                    existing.add(col)
+                    continue
+                raise
+        if added:
+            logger.warning(
+                "[SUMMARY RANKING SCHEMA REPAIR] table=%s added_columns=%s",
+                table_name,
+                added,
+            )
+    except Exception:
+        logger.debug("[SUMMARY RANKING SCHEMA REPAIR] engine repair failed table=%s", table_name, exc_info=True)
+
+
 def _get_table_columns_from_engine(engine, table_name: str) -> Optional[set[str]]:
     if engine is None:
         return None
 
     try:
-        with engine.connect() as conn:
+        with engine.begin() as conn:
+            if str(table_name) in SUMMARY_TABLES:
+                _ensure_summary_ranking_columns(conn, str(table_name))
             rows = conn.exec_driver_sql(f'PRAGMA table_info("{table_name}")').fetchall()
             cols = {
                 str(r[1]).strip()

@@ -290,15 +290,59 @@ def _count_existing_rows_for_keys(df: pd.DataFrame, *, interval: int, db_path: s
                 pass
 
 
+def _quote_ident(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _unique_index_column_sets(con: sqlite3.Connection, table: str) -> list[list[str]]:
+    indexes: list[list[str]] = []
+    try:
+        for row in con.execute(f"PRAGMA index_list({_quote_ident(table)})").fetchall():
+            # row: seq, name, unique, origin, partial
+            if len(row) < 3 or int(row[2] or 0) != 1:
+                continue
+            idx_name = str(row[1])
+            cols = [str(r[2]) for r in con.execute(f"PRAGMA index_info({_quote_ident(idx_name)})").fetchall() if len(r) >= 3 and r[2] is not None]
+            if cols:
+                indexes.append(cols)
+    except Exception:
+        logger.debug("[YAHOO SAVE][DIRECT] unique index inspect failed table=%s", table, exc_info=True)
+    return indexes
+
+
+def _choose_conflict_columns(con: sqlite3.Connection, table: str, work: pd.DataFrame, table_cols: list[str], interval: int) -> list[str]:
+    work_cols = set(map(str, work.columns))
+    table_col_set = set(map(str, table_cols))
+
+    # 実DBのUNIQUE indexがあれば最優先で使う。
+    preferred = [["symbol", "datetime"], ["symbol", "date", "time_range"], ["symbol", "date", "time"]]
+    unique_indexes = _unique_index_column_sets(con, table)
+    for wanted in preferred:
+        for idx_cols in unique_indexes:
+            if idx_cols == wanted and set(idx_cols).issubset(work_cols) and set(idx_cols).issubset(table_col_set):
+                return idx_cols
+    for idx_cols in unique_indexes:
+        if set(idx_cols).issubset(work_cols) and set(idx_cols).issubset(table_col_set):
+            return idx_cols
+
+    # UNIQUE indexが取れない場合は論理キー選定にフォールバック。
+    return _key_columns_for_table(work, interval=interval, table_cols=table_cols)
+
+
 def _direct_sqlite_upsert_summary_df(df: pd.DataFrame, *, interval: int, db_path: Optional[str] = None) -> int:
     """
     summary_saver_bulk / recovery.persistence が使えない、または保存確認できない場合の最終保険。
 
     設計:
       - 既存summary DBの実カラムだけに絞る
-      - 1min は symbol+datetime、3min/5min は symbol+date+time_range を優先キーにする
-      - DELETE → INSERT なので、既存PUSH行をYahoo source行で確実に置き換える
+      - 実DBのUNIQUE index (無ければ1min symbol+datetime、3min/5min symbol+date+time_range 等の
+        論理キー) を conflict key として INSERT ... ON CONFLICT DO UPDATE する
+      - DELETE→INSERTではなくUPSERTなので、実UNIQUE indexが論理キーと異なる場合でも
+        UNIQUE constraint failed で失敗しない
       - source は呼び出し元で summary_recovery_yahoo_* が入っている前提
+
+    旧 core/startup/yahoo_summary_direct_upsert_conflict_patch.py /
+    core/startup/yahoo_direct_summary_upsert_conflict_patch.py (重複パッチ) から移設・統合。
     """
     out = safe_df(df)
     if out.empty:
@@ -330,7 +374,7 @@ def _direct_sqlite_upsert_summary_df(df: pd.DataFrame, *, interval: int, db_path
             logger.error("[YAHOO SAVE][DIRECT] summary table not found interval=%s table=%s db=%s", interval, table, db_path)
             return 0
 
-        table_cols = [str(r[1]) for r in con.execute(f"PRAGMA table_info({table})").fetchall()]
+        table_cols = [str(r[1]) for r in con.execute(f"PRAGMA table_info({_quote_ident(table)})").fetchall()]
         if not table_cols:
             logger.error("[YAHOO SAVE][DIRECT] no table columns interval=%s table=%s db=%s", interval, table, db_path)
             return 0
@@ -348,27 +392,33 @@ def _direct_sqlite_upsert_summary_df(df: pd.DataFrame, *, interval: int, db_path
             logger.error("[YAHOO SAVE][DIRECT] no matching columns interval=%s table=%s df_cols=%s", interval, table, list(work.columns))
             return 0
 
-        key_cols = _key_columns_for_table(work, interval=interval, table_cols=table_cols)
-        if not key_cols:
+        conflict_cols = _choose_conflict_columns(con, table, work, table_cols, int(interval))
+        if not conflict_cols:
             logger.error("[YAHOO SAVE][DIRECT] no usable key columns interval=%s table=%s df_cols=%s table_cols=%s", interval, table, list(work.columns), table_cols)
             return 0
 
-        work = work.dropna(subset=key_cols).drop_duplicates(subset=key_cols, keep="last").reset_index(drop=True)
+        before = len(work)
+        work = work.dropna(subset=conflict_cols).drop_duplicates(subset=conflict_cols, keep="last").reset_index(drop=True)
         if work.empty:
-            logger.warning("[YAHOO SAVE][DIRECT] no rows after key cleanup interval=%s table=%s key=%s", interval, table, key_cols)
+            logger.warning("[YAHOO SAVE][DIRECT] no rows after conflict key cleanup interval=%s table=%s key=%s", interval, table, conflict_cols)
             return 0
 
-        # 既存行削除。PUSH由来行もYahoo由来行で置き換える。
-        delete_sql = f"DELETE FROM {table} WHERE " + " AND ".join([f"{c}=?" for c in key_cols])
-        delete_params = [
-            tuple(_to_sqlite_value(row[c]) for c in key_cols)
-            for _, row in work[key_cols].iterrows()
-        ]
-        con.executemany(delete_sql, delete_params)
-
         placeholders = ",".join(["?"] * len(cols))
-        col_sql = ",".join(cols)
-        insert_sql = f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders})"
+        col_sql = ",".join(_quote_ident(c) for c in cols)
+        conflict_sql = ",".join(_quote_ident(c) for c in conflict_cols)
+        update_cols = [c for c in cols if c not in conflict_cols]
+        if update_cols:
+            update_sql = ",".join(f"{_quote_ident(c)}=excluded.{_quote_ident(c)}" for c in update_cols)
+            insert_sql = (
+                f"INSERT INTO {_quote_ident(table)} ({col_sql}) VALUES ({placeholders}) "
+                f"ON CONFLICT({conflict_sql}) DO UPDATE SET {update_sql}"
+            )
+        else:
+            insert_sql = (
+                f"INSERT INTO {_quote_ident(table)} ({col_sql}) VALUES ({placeholders}) "
+                f"ON CONFLICT({conflict_sql}) DO NOTHING"
+            )
+
         records = [
             tuple(_to_sqlite_value(row.get(c)) for c in cols)
             for _, row in work[cols].iterrows()
@@ -377,11 +427,13 @@ def _direct_sqlite_upsert_summary_df(df: pd.DataFrame, *, interval: int, db_path
         con.commit()
 
         logger.info(
-            "[YAHOO SAVE][DIRECT] summary sqlite upsert done interval=%s table=%s rows=%s keys=%s db=%s source=%s latest=%s cols=%s",
+            "[YAHOO SAVE][DIRECT] summary sqlite upsert done interval=%s table=%s rows=%s before=%s dropped_dup=%s conflict=%s db=%s source=%s latest=%s cols=%s",
             interval,
             table,
             len(records),
-            key_cols,
+            before,
+            before - len(work),
+            conflict_cols,
             db_path,
             (work["source"].iloc[0] if "source" in work.columns and not work.empty else None),
             (work["datetime"].max() if "datetime" in work.columns and not work.empty else None),

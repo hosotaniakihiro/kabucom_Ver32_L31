@@ -385,6 +385,59 @@ def _normalize_for_legacy(row: dict, now_dt: Any = None) -> dict:
 
 
 # ============================================================
+# legacy table schema repair
+# (旧 core/startup/sqlite_memory_pragmas_patch.py の
+#  _install_ranking_legacy_schema_patch から移設)
+#
+# CREATE TABLE IF NOT EXISTS は既存テーブルの列不足を補修しないため、
+# 古い ranking DB では INSERT rank で落ちる。CREATE 直後に不足列を
+# ALTER TABLE で補う。
+# ============================================================
+
+LEGACY_RANKING_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("symbol", "TEXT"),
+    ("symbolname", "TEXT"),
+    ("current_price", "REAL"),
+    ("change_percentage", "REAL"),
+    ("change_ratio", "REAL"),
+    ("trading_volume", "REAL"),
+    ("trading_value", "REAL"),
+    ("turnover", "REAL"),
+    ("tick_count", "INTEGER"),
+    ("inserted_at", "TEXT"),
+    ("rank", "INTEGER"),
+)
+
+
+def _ensure_columns_with_cursor(cur: Any, table: str, columns: tuple[tuple[str, str], ...], label: str) -> list[str]:
+    q = quote_ident(table)
+    try:
+        cur.execute(f"PRAGMA table_info({q})")
+        existing = {str(row[1]) for row in cur.fetchall()}
+    except Exception:
+        logger.debug("[%s] table_info failed table=%s", label, table, exc_info=True)
+        return []
+
+    added: list[str] = []
+    for col, decl in columns:
+        if col in existing:
+            continue
+        try:
+            cur.execute(f"ALTER TABLE {q} ADD COLUMN {quote_ident(col)} {decl}")
+            added.append(col)
+            existing.add(col)
+        except sqlite3.OperationalError as e:
+            msg = str(e).lower()
+            if "duplicate column" in msg or "already exists" in msg:
+                existing.add(col)
+                continue
+            raise
+    if added:
+        logger.warning("[%s] table=%s added_columns=%s", label, table, added)
+    return added
+
+
+# ============================================================
 # writer
 # ============================================================
 
@@ -571,6 +624,9 @@ class RankingDBWriter:
             f"CREATE INDEX IF NOT EXISTS {quote_ident('idx_' + table + '_symbol_inserted_at')} "
             f"ON {q}(symbol, inserted_at)"
         )
+
+        if not _env_bool("DISABLE_RANKING_LEGACY_SCHEMA_REPAIR_PATCH", False):
+            _ensure_columns_with_cursor(self.cursor, table, LEGACY_RANKING_COLUMNS, "RANKING LEGACY SCHEMA REPAIR")
 
     # ========================================================
     # lifecycle

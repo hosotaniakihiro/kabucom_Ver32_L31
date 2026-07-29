@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 import sqlite3
 from typing import Iterable, List, Set, Tuple
 
+from data_collectors.split_mode import is_data_collector_process
 from global_state import global_data
 from .config import (
     ACTIVE_REQUIRE_SYMBOL_FLAGS,
@@ -53,6 +55,13 @@ from .symbol_flags import filter_by_symbol_flags, load_symbol_flags_eligible_sym
 logger = logging.getLogger(__name__)
 
 
+def _env_bool(name: str, default: bool = True) -> bool:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return bool(default)
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+
+
 def _publish_symbol_flags_cache(eligible_symbols: Set[str], flag_info: dict) -> None:
     """
     起動時 / active symbol 更新時に読み込んだ symbol_flags 情報を
@@ -71,7 +80,7 @@ def _publish_symbol_flags_cache(eligible_symbols: Set[str], flag_info: dict) -> 
         logger.exception("[ACTIVE FLAGS] global cache publish failed")
 
 
-def _build_today_ranking_candidates(
+def _build_today_ranking_candidates_impl(
     *,
     now: dt.datetime,
     eligible_symbols: Set[str],
@@ -90,6 +99,68 @@ def _build_today_ranking_candidates(
         require_info=True,
     )
     return candidates, universe, "today_ranking"
+
+
+def _load_today_ranking_db_fallback_symbols(target: int) -> List[str]:
+    try:
+        from trading.ranking.active_symbols import db_ranking_fallback_patch as dbfb
+
+        return list(dbfb._load_symbols_from_ranking_db(max_rows=max(int(target) * 3, 300)) or [])[: int(target)]
+    except Exception:
+        logger.debug("[ACTIVE SOURCE] today_ranking db fallback loader failed", exc_info=True)
+        return []
+
+
+def _build_today_ranking_candidates(
+    *,
+    now: dt.datetime,
+    eligible_symbols: Set[str],
+    protected: Set[str],
+    liquidity_map: dict[str, dict[str, float]],
+) -> Tuple[List[str], Set[str], str]:
+    """
+    通常時間帯(場中)の候補構築。
+
+    在メモリの today_ranking が空でも、DB収集系プロセス
+    (main_database.py / data_collectors 系) では ranking DB から直接
+    候補を読み直すフォールバックを行う (旧
+    core/startup/active_symbols_empty_universe_supplement_patch.py の
+    _build_today_ranking_candidates 差し替えから移設)。
+    """
+    candidates, universe, source_name = _build_today_ranking_candidates_impl(
+        now=now,
+        eligible_symbols=eligible_symbols,
+        protected=protected,
+        liquidity_map=liquidity_map,
+    )
+    if candidates or universe or not is_data_collector_process():
+        return candidates, universe, source_name
+
+    target = max(int(TARGET_ACTIVE_SYMBOLS or 100), 100)
+    raw = _load_today_ranking_db_fallback_symbols(target=max(target * 3, 300))
+    fallback: List[str] = []
+    skipped_flags = 0
+    for sym in raw:
+        ns = normalize_symbol(sym)
+        if not ns:
+            continue
+        if ACTIVE_REQUIRE_SYMBOL_FLAGS and ns not in eligible_symbols and ns not in protected:
+            skipped_flags += 1
+            continue
+        if ns not in fallback:
+            fallback.append(ns)
+        if len(fallback) >= target:
+            break
+
+    if fallback:
+        logger.warning(
+            "[ACTIVE SOURCE] direct today_ranking db fallback candidates=%s target=%s skipped_flags=%s head=%s",
+            len(fallback), target, skipped_flags, fallback[:20],
+        )
+        return fallback, set(fallback), "today_ranking_db_direct_fallback"
+
+    logger.warning("[ACTIVE SOURCE] direct today_ranking db fallback empty skipped_flags=%s raw=%s", skipped_flags, len(raw))
+    return candidates, universe, source_name
 
 
 def _build_premarket_candidates(
@@ -325,7 +396,7 @@ def _iter_target_supplement_sources(
         yield str(s)
 
 
-def _supplement_active_to_target(
+def _supplement_active_to_target_normal(
     active: Set[str],
     *,
     target: int,
@@ -355,17 +426,6 @@ def _supplement_active_to_target(
     skipped_flags = 0
     skipped_universe = 0
     skipped_liquidity = 0
-
-    if before >= target:
-        return active, {
-            "before": before,
-            "after": before,
-            "added": [],
-            "skipped_existing": 0,
-            "skipped_flags": 0,
-            "skipped_universe": 0,
-            "skipped_liquidity": 0,
-        }
 
     for sym in _iter_target_supplement_sources(
         prev_active=prev_active,
@@ -440,6 +500,265 @@ def _supplement_active_to_target(
         )
 
     return active, diag
+
+
+def _supplement_active_to_target_empty_universe_relaxed(
+    active: Set[str],
+    *,
+    target: int,
+    premarket_mode: bool,
+    eligible_symbols: Set[str],
+    flag_info: dict,
+    protected: Set[str],
+    liquidity_map: dict[str, dict[str, float]],
+    prev_active: Iterable[str],
+    hot_symbols: Iterable[str],
+    primary_candidates: Iterable[str],
+) -> tuple[Set[str], dict]:
+    """
+    allowed_universe が空 (このプロセスにin-memory ranking snapshotが無い) の場合の緩和補充。
+
+    DB収集系プロセス限定 (呼び出し元の _supplement_active_to_target が
+    is_data_collector_process() で分岐する)。universe チェックを外し、
+    liquidity_map に情報がある銘柄だけ流動性を検証する。
+    旧 core/startup/active_symbols_empty_universe_supplement_patch.py から移設。
+    """
+    before = len(active)
+    added: list[str] = []
+    skipped_existing = 0
+    skipped_flags = 0
+    skipped_liquidity = 0
+
+    try:
+        sources = _iter_target_supplement_sources(
+            prev_active=prev_active,
+            hot_symbols=hot_symbols,
+            primary_candidates=primary_candidates,
+            allowed_universe=set(),
+            eligible_symbols=eligible_symbols,
+            protected=protected,
+            liquidity_map=liquidity_map,
+            flag_info=flag_info,
+        )
+    except Exception:
+        logger.exception("[ACTIVE SUPPLEMENT] empty-universe relaxed source iterator failed")
+        return _supplement_active_to_target_normal(
+            active,
+            target=target,
+            premarket_mode=premarket_mode,
+            allowed_universe=set(),
+            eligible_symbols=eligible_symbols,
+            flag_info=flag_info,
+            protected=protected,
+            liquidity_map=liquidity_map,
+            prev_active=prev_active,
+            hot_symbols=hot_symbols,
+            primary_candidates=primary_candidates,
+        )
+
+    for sym in sources:
+        ns = normalize_symbol(sym)
+        if not ns:
+            continue
+        if ns in active:
+            skipped_existing += 1
+            continue
+        if ACTIVE_REQUIRE_SYMBOL_FLAGS and ns not in eligible_symbols and ns not in protected:
+            skipped_flags += 1
+            continue
+
+        # allowed_universe はこのプロセスにin-memory ranking snapshotが無いため空。
+        # skipped_universe にはカウントしない。liquidity情報があれば検証し、
+        # 無ければ後段の final_guard_min_price の price fallback に委ねる。
+        info = (liquidity_map or {}).get(ns)
+        if info:
+            try:
+                if not is_liquid_symbol(ns, liquidity_map=liquidity_map, protected=protected, require_info=False):
+                    skipped_liquidity += 1
+                    continue
+            except Exception:
+                logger.debug("[ACTIVE SUPPLEMENT] empty-universe relaxed liquidity check failed sym=%s", ns, exc_info=True)
+
+        active.add(ns)
+        added.append(ns)
+        if len(active) >= target:
+            break
+
+    diag = {
+        "before": before,
+        "after": len(active),
+        "added": added,
+        "skipped_existing": skipped_existing,
+        "skipped_flags": skipped_flags,
+        "skipped_universe": 0,
+        "skipped_liquidity": skipped_liquidity,
+        "premarket_mode": premarket_mode,
+        "target": target,
+        "allowed_universe_empty_relaxed": True,
+    }
+    logger.warning(
+        "[ACTIVE SUPPLEMENT] empty-universe relaxed before=%s after=%s target=%s added=%s skipped_existing=%s skipped_flags=%s skipped_liquidity=%s",
+        before, len(active), target, added[:30], skipped_existing, skipped_flags, skipped_liquidity,
+    )
+    return active, diag
+
+
+def _active_symbol_target_fill_score(sym: str, liquidity_map: dict, flag_info: dict, protected: Set[str]) -> tuple:
+    info = liquidity_map.get(sym, {}) or {}
+    flags = flag_info.get(sym, {}) if isinstance(flag_info, dict) else {}
+    if not isinstance(flags, dict):
+        flags = {}
+
+    def _fval(v) -> float:
+        try:
+            if v is None:
+                return 0.0
+            if isinstance(v, str):
+                v = v.replace(",", "").strip()
+                if not v:
+                    return 0.0
+            return float(v)
+        except Exception:
+            return 0.0
+
+    def _fok(v) -> bool:
+        try:
+            if isinstance(v, bool):
+                return bool(v)
+            return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on", "ok", "可能", "可"}
+        except Exception:
+            return False
+
+    value = _fval(info.get("trading_value") or info.get("turnover"))
+    volume = _fval(info.get("trading_volume") or info.get("volume"))
+    tick = _fval(info.get("tick_count"))
+    price = _fval(info.get("current_price") or info.get("price") or info.get("close"))
+    quality = int(_fok(flags.get("ats_ok"))) + int(_fok(flags.get("buy_target"))) + int(_fok(flags.get("sell_target"))) + int(_fok(flags.get("short_ok")))
+    return (1 if sym in protected else 0, value, volume, tick, price, quality, sym)
+
+
+def _apply_active_symbol_target_fill(
+    active: Set[str],
+    diag: dict,
+    *,
+    target: int,
+    premarket_mode: bool,
+    allowed_universe: Set[str],
+    eligible_symbols: Set[str],
+    flag_info: dict,
+    protected: Set[str],
+    liquidity_map: dict[str, dict[str, float]],
+    prev_active: Iterable[str],
+    hot_symbols: Iterable[str],
+    primary_candidates: Iterable[str],
+) -> tuple[Set[str], dict]:
+    """
+    _supplement_active_to_target_normal / _empty_universe_relaxed のどちらでも
+    まだ target 未満なら、universe/liquidityチェックを外した二段目の補充を行う。
+    旧 core/startup/active_symbol_target_fill_patch.py から移設。
+    """
+    try:
+        if len(active) >= int(target) or not _env_bool("ACTIVE_SYMBOL_TARGET_FILL_ENABLED", True):
+            return active, diag
+        if premarket_mode and not _env_bool("ACTIVE_SYMBOL_TARGET_FILL_PREMARKET", False):
+            return active, diag
+
+        candidates: list[str] = []
+        for seq in (prev_active, hot_symbols, primary_candidates, allowed_universe, eligible_symbols):
+            candidates.extend(dedupe_keep_order(seq))
+        rows = []
+        for sym in dedupe_keep_order(candidates):
+            if sym in active:
+                continue
+            if sym not in eligible_symbols and sym not in protected:
+                continue
+            rows.append(sym)
+        rows.sort(key=lambda s: _active_symbol_target_fill_score(s, liquidity_map or {}, flag_info or {}, set(protected or set())), reverse=True)
+
+        added = []
+        for sym in rows:
+            active.add(sym)
+            added.append(sym)
+            if len(active) >= int(target):
+                break
+        if added:
+            diag = dict(diag or {})
+            diag["target_fill_added"] = added
+            diag["after"] = len(active)
+            logger.warning("[ACTIVE SYMBOL TARGET FILL] before=%s after=%s target=%s added=%s", len(active) - len(added), len(active), target, added[:20])
+    except Exception:
+        logger.debug("[ACTIVE SYMBOL TARGET FILL] skipped", exc_info=True)
+    return active, diag
+
+
+def _supplement_active_to_target(
+    active: Set[str],
+    *,
+    target: int,
+    premarket_mode: bool,
+    allowed_universe: Set[str],
+    eligible_symbols: Set[str],
+    flag_info: dict,
+    protected: Set[str],
+    liquidity_map: dict[str, dict[str, float]],
+    prev_active: Iterable[str],
+    hot_symbols: Iterable[str],
+    primary_candidates: Iterable[str],
+) -> tuple[Set[str], dict]:
+    if len(active) >= target:
+        return active, {
+            "before": len(active),
+            "after": len(active),
+            "added": [],
+            "skipped_existing": 0,
+            "skipped_flags": 0,
+            "skipped_universe": 0,
+            "skipped_liquidity": 0,
+        }
+
+    universe_empty = not bool(allowed_universe)
+    if not premarket_mode and universe_empty and is_data_collector_process():
+        active, diag = _supplement_active_to_target_empty_universe_relaxed(
+            active,
+            target=target,
+            premarket_mode=premarket_mode,
+            eligible_symbols=eligible_symbols,
+            flag_info=flag_info,
+            protected=protected,
+            liquidity_map=liquidity_map,
+            prev_active=prev_active,
+            hot_symbols=hot_symbols,
+            primary_candidates=primary_candidates,
+        )
+    else:
+        active, diag = _supplement_active_to_target_normal(
+            active,
+            target=target,
+            premarket_mode=premarket_mode,
+            allowed_universe=allowed_universe,
+            eligible_symbols=eligible_symbols,
+            flag_info=flag_info,
+            protected=protected,
+            liquidity_map=liquidity_map,
+            prev_active=prev_active,
+            hot_symbols=hot_symbols,
+            primary_candidates=primary_candidates,
+        )
+
+    return _apply_active_symbol_target_fill(
+        active,
+        diag,
+        target=target,
+        premarket_mode=premarket_mode,
+        allowed_universe=allowed_universe,
+        eligible_symbols=eligible_symbols,
+        flag_info=flag_info,
+        protected=protected,
+        liquidity_map=liquidity_map,
+        prev_active=prev_active,
+        hot_symbols=hot_symbols,
+        primary_candidates=primary_candidates,
+    )
 
 
 def _trim_to_max(

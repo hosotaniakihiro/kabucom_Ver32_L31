@@ -29,29 +29,6 @@ logger = logging.getLogger(__name__)
 
 _storage_lock = threading.RLock()
 _stream_writer_instance: Optional[Any] = None
-_OWNER_GUARD_INSTALLED = False
-
-
-def _install_push_db_writer_owner_guard() -> bool:
-    """
-    main.py側でpush_storage_bootstrapがimportされた時点で、
-    push_db_writer本体にもowner guardを入れる。
-
-    start_push_storage()だけをskipしても、別経路から
-    stream_writer.start()/add_push_row()/flush() が呼ばれる可能性があるため。
-    """
-    global _OWNER_GUARD_INSTALLED
-    if _OWNER_GUARD_INSTALLED:
-        return True
-    try:
-        from core.startup.push_db_writer_owner_guard_patch import install
-        ok = bool(install())
-        _OWNER_GUARD_INSTALLED = ok
-        logger.warning("[PushStorage] push_db_writer_owner_guard installed=%s", ok)
-        return ok
-    except Exception:
-        logger.exception("[PushStorage] push_db_writer_owner_guard install failed")
-        return False
 
 
 def _should_skip_push_storage_start_in_main() -> bool:
@@ -69,8 +46,6 @@ def _resolve_stream_writer(buffer_size: int = 100):
     push_db_writer.py 末尾に stream_writer = StreamDBWriter() があるため、
     原則それを使う。
     """
-    _install_push_db_writer_owner_guard()
-
     try:
         from trading.push import push_db_writer as mod
 
@@ -109,8 +84,6 @@ def start_push_storage(buffer_size: int = 100) -> None:
       [StreamDB] writer loop started
     """
     global _stream_writer_instance
-
-    _install_push_db_writer_owner_guard()
 
     if _should_skip_push_storage_start_in_main():
         logger.warning(
@@ -187,12 +160,6 @@ def stop_push_storage() -> None:
         except Exception:
             logger.exception("[PushStorage] stop failed")
 
-
-# import時にも先にguardだけ入れておく。
-try:
-    _install_push_db_writer_owner_guard()
-except Exception:
-    logger.exception("[PushStorage] owner guard auto install failed")
 
 
 __all__ = [

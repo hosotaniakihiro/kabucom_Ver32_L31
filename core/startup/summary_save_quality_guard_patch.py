@@ -53,17 +53,6 @@ def _env_bool(name: str, default: bool = True) -> bool:
         return bool(default)
 
 
-def _install_yahoo_conflict_patch() -> bool:
-    try:
-        from core.startup import yahoo_direct_summary_upsert_conflict_patch as p
-        ok = bool(p.install())
-        logger.warning("[SUMMARY SAVE QUALITY GUARD] yahoo direct conflict patch installed=%s", ok)
-        return ok
-    except Exception:
-        logger.exception("[SUMMARY SAVE QUALITY GUARD] yahoo direct conflict patch install failed")
-        return False
-
-
 def _is_maintenance_reason(reason: str) -> bool:
     r = str(reason or "").strip().lower()
     return any(w in r for w in _MAINT_WORDS)
@@ -162,11 +151,8 @@ def _guarded_call(orig, df: pd.DataFrame, interval: int, *args: Any, **kwargs: A
 def install() -> bool:
     global _INSTALLED, _ORIG_BULK, _ORIG_SAVE_BULK, _ORIG_SAVE_DF
     if _INSTALLED:
-        _install_yahoo_conflict_patch()
         return True
     try:
-        _install_yahoo_conflict_patch()
-
         import trading.summary.persistence.summary_saver_bulk as mod
 
         _ORIG_BULK = getattr(mod, "bulk_upsert_summary", None)

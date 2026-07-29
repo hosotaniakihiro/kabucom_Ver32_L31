@@ -35,6 +35,20 @@ _POS_CACHE_TTL = 5.0   # 秒（429対策の要）
 # ============================================================
 def get_positions():
     """
+    kabuステーション /positions を安全に取得する。
+
+    例外時は長いtracebackを出さず _POS_CACHE へフォールバックする
+    (旧 core/startup/push_summary_realtime_patch.py から移設)。
+    """
+    try:
+        return _get_positions_impl()
+    except Exception as e:
+        logger.warning("[kabu_api.positions] positions read skipped err=%s", e)
+        return _POS_CACHE or []
+
+
+def _get_positions_impl():
+    """
     kabuステーション /positions を安全に取得する
     ・5秒キャッシュ
     ・timeout 10秒

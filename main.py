@@ -195,7 +195,6 @@ def _install_main_runtime_patches():
     patches = [
         ("core.startup.summary_scheduler_shutdown_guard_patch", "install"),
         ("core.startup.nas_sqlite_io_guard_patch", "install"),
-        ("core.startup.indicator_fragmentation_runtime_patch", "install"),
         ("core.startup.entry_controller_runtime_reject_patch", "install"),
         ("core.startup.fast_startup_runtime_patch", "install"),
         ("core.startup.summary_main_memory_latest_1m_patch", "install"),

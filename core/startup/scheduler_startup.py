@@ -40,19 +40,6 @@ logger = logging.getLogger(__name__)
 VERSION = "FINAL-PRODUCTION-REV24.1-THIN-SCHEDULER-STARTUP"
 
 
-def install_push_summary_realtime_patch_safe() -> bool:
-    """PUSH保存後に1分足summaryを即時更新する補助パッチを安全に入れる。"""
-    try:
-        from core.startup.push_summary_realtime_patch import install
-
-        ok = bool(install())
-        logger.warning("[scheduler_startup] push summary realtime patch installed ok=%s", ok)
-        return ok
-    except Exception:
-        logger.exception("[scheduler_startup] push summary realtime patch install failed")
-        return False
-
-
 def register_scheduler_early_safe() -> bool:
     logger.info("🕒 scheduler bootstrap early start before startup_summary_restore")
     log_scheduler_snapshot("before early scheduler bootstrap")
@@ -130,7 +117,6 @@ def ensure_schedule_loop_running_safe() -> bool:
 
 
 def start_scheduler_stack_before_restore() -> None:
-    install_push_summary_realtime_patch_safe()
     register_scheduler_early_safe()
     install_exit_order_sender_safe()
     register_exit_loop_safe()
@@ -148,7 +134,6 @@ __all__ = [
     "install_exit_order_sender_safe", "run_exit_loop_market_guarded", "register_exit_loop_safe",
     "run_tonosama_entry_market_guarded", "register_tonosama_entry_scheduler_safe",
     "start_ranking_db_writer_safe",
-    "install_push_summary_realtime_patch_safe",
     "register_scheduler_early_safe", "register_scheduler_fallback_safe",
     "start_schedule_loop_early_safe", "ensure_schedule_loop_running_safe",
     "run_summary_tick_once_debug_safe",

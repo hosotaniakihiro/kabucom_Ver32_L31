@@ -88,8 +88,6 @@ _LAST_GET_ORDERS_MONO = 0.0
 # ------------------------------------------------------------
 CANCELABLE_STATES = {1, 2, 3, 4}
 _LAST_TOKEN_WARN_AT = 0.0
-_LAST_401_REFRESH_AT = 0.0
-_LAST_REFRESH_ERROR_WARN_AT = 0.0
 _LAST_429_WARN_AT = 0.0
 
 
@@ -215,29 +213,13 @@ def _direct_token_fallback(context: str = "unknown"):
 
 
 def _refresh_headers_after_401(context: str):
-    """401時に token を再取得し、global_data/api_common へ同期する。"""
-    global _LAST_401_REFRESH_AT, _LAST_REFRESH_ERROR_WARN_AT
-    now = time.time()
+    """401時に runtime refresh を呼ばず、既存/settings token再利用に統一する。
 
-    if now - _LAST_401_REFRESH_AT < _TOKEN_REFRESH_MIN_INTERVAL_SEC:
-        logger.warning("[FORCE_CANCEL] 401 refresh throttled context=%s", context)
-        return _direct_token_fallback(context)
-    _LAST_401_REFRESH_AT = now
-
-    # 401を返したtokenは stale の可能性が高いので、既存token再利用より refresh を優先する。
-    try:
-        import token_manager
-        token = token_manager.refresh_token()
-        if token:
-            token = str(token)
-            _sync_global_token(token)
-            logger.warning("[FORCE_CANCEL] API TOKEN refreshed after 401 context=%s", context)
-            return {"X-API-KEY": token, "Content-Type": "application/json"}
-    except Exception as e:
-        # API ini未配置/一時失敗は想定内。ERROR tracebackを連発せず、既存token fallbackへ落とす。
-        if now - _LAST_REFRESH_ERROR_WARN_AT >= 30.0:
-            logger.warning("[FORCE_CANCEL] token refresh after 401 unavailable context=%s err=%s", context, e)
-            _LAST_REFRESH_ERROR_WARN_AT = now
+    旧 core/startup/push_summary_realtime_patch.py から移設。この関数は
+    settings.ini必須エラーが出るrefresh_token()呼び出しを避けるため、
+    runtime refresh (token_manager.refresh_token()) は行わない。
+    """
+    logger.warning("[FORCE_CANCEL] 401 received; runtime refresh disabled context=%s -> reuse settings/runtime token only", context)
     return _direct_token_fallback(context)
 
 

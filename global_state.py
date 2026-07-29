@@ -313,6 +313,16 @@ class GlobalDataCompat(_LegacyGlobalData):
             return None
 
     def set_merged_summary(self, interval, df, source=None):
+        # 旧 core/startup/summary_controller_latest_enrich_patch.py の
+        # _patch_global_data_setters から移設 (interval==1のenrich + 3/5mのMTF逆流refresh)。
+        is_df = isinstance(df, pd.DataFrame) and not df.empty
+        if is_df and interval == 1:
+            try:
+                import trading.summary.summary_controller as sc
+                if not sc._LATEST_ENRICH_REFRESHING_1M:
+                    df = sc._enrich(df, interval=1, context="global-set_merged_summary")
+            except Exception:
+                pass
 
         try:
             try:
@@ -321,6 +331,13 @@ class GlobalDataCompat(_LegacyGlobalData):
                 GC.set_merged_summary(interval, df)
         except Exception:
             pass
+
+        if is_df and interval in (3, 5):
+            try:
+                import trading.summary.summary_controller as sc
+                sc._refresh_1m_mtf_from_global(f"global-set_merged_summary-{interval}m")
+            except Exception:
+                pass
 
     def get_merged_summary(self, interval, source=None):
 
@@ -337,6 +354,16 @@ class GlobalDataCompat(_LegacyGlobalData):
     # ------------------------------------------------------------
 
     def set_push_merged_summary(self, interval, df):
+        # 旧 core/startup/summary_controller_latest_enrich_patch.py の
+        # _patch_global_data_setters から移設 (interval==1のenrich + 3/5mのMTF逆流refresh)。
+        is_df = isinstance(df, pd.DataFrame) and not df.empty
+        if is_df and interval == 1:
+            try:
+                import trading.summary.summary_controller as sc
+                if not sc._LATEST_ENRICH_REFRESHING_1M:
+                    df = sc._enrich(df, interval=1, context="global-set_push_merged_summary")
+            except Exception:
+                pass
 
         try:
             if hasattr(GC, "set_push_merged_summary"):
@@ -346,6 +373,13 @@ class GlobalDataCompat(_LegacyGlobalData):
         except Exception:
             pass
 
+        if is_df and interval in (3, 5):
+            try:
+                import trading.summary.summary_controller as sc
+                sc._refresh_1m_mtf_from_global(f"global-set_push_merged_summary-{interval}m")
+            except Exception:
+                pass
+
     def get_push_merged_summary(self, interval):
 
         try:
@@ -354,6 +388,32 @@ class GlobalDataCompat(_LegacyGlobalData):
             return self.get_merged_summary(interval, source="push")
         except Exception:
             return None
+
+    def set_summary_history(self, tf, df, source="legacy", caller=None):
+        # 旧 core/startup/summary_controller_latest_enrich_patch.py の
+        # _patch_global_data_setters から移設。GlobalContext.set_summary_history 本体や
+        # モジュール関数 core.global_context.context.set_summary_history 経由の直呼び出しには
+        # 影響させず、global_data 経由の呼び出しだけをここで明示的に処理する。
+        is_df = isinstance(df, pd.DataFrame) and not df.empty
+        if is_df and tf == 1:
+            try:
+                import trading.summary.summary_controller as sc
+                if not sc._LATEST_ENRICH_REFRESHING_1M:
+                    df = sc._enrich(df, interval=1, context="global-set_summary_history")
+            except Exception:
+                pass
+
+        try:
+            GC.set_summary_history(tf, df, source=source, caller=caller)
+        except Exception:
+            pass
+
+        if is_df and tf in (3, 5):
+            try:
+                import trading.summary.summary_controller as sc
+                sc._refresh_1m_mtf_from_global(f"global-set_summary_history-{tf}m")
+            except Exception:
+                pass
 
     def set_ranking_merged_summary(self, interval, df):
 
