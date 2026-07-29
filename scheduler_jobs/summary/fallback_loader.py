@@ -4,7 +4,7 @@
 #====================================================================================================
 # ============================================================
 # File   : scheduler_jobs/summary/fallback_loader.py
-# Ver    : PRODUCTION-STABLE-SUMMARY-FALLBACK-LOADER-V2.4-INLINE-REV5-PUSH-FALLBACK
+# Ver    : PRODUCTION-STABLE-SUMMARY-FALLBACK-LOADER-V2.5-INLINE-REAL-PUSH-PRIORITY
 #          -NO-RECOVERY-FALLBACK-FOR-1M-PUSH
 #          -EXPECTED-SLOT-AWARE
 #          -NOW-PASSTHROUGH
@@ -28,6 +28,11 @@
 #     filter_push_like_rows / fallback_push_summary_df 本体に統合。
 #     旧来ロジックは _base_fallback_push_summary_df として維持し、
 #     fallback_push_summary_df から内部的に呼び出す構成にした。
+#
+# V2.5:
+#   - 旧 core/startup/ranking_stuck_pending_prune_patch.py が filter_push_like_rows を
+#     再ラップして追加していた real-push priority (summary_recovery_yahoo由来より
+#     実際のpush系ソースを優先する) を本体へ統合。
 # ============================================================
 
 from __future__ import annotations
@@ -738,6 +743,29 @@ def filter_push_like_rows(df: pd.DataFrame) -> pd.DataFrame:
                 return x
         src = x["source"].astype(str)
         src_l = src.str.lower().str.strip()
+
+        # 旧 core/startup/ranking_stuck_pending_prune_patch.py の
+        # _patch_summary_fallback_loader (real-push priority)をインライン化。
+        # summary_recovery_yahoo (再構成データ) より、実際にpush経由で入ってきた行を優先する。
+        real_push_mask = (
+            src_l.eq("push")
+            | src.str.contains("push_stream", case=False, na=False)
+            | src.str.contains("incremental", case=False, na=False)
+            | src.str.contains("summary_recovery_push", case=False, na=False)
+            | src.str.contains("resample", case=False, na=False)
+        ) & ~src.str.contains("summary_recovery_yahoo", case=False, na=False)
+        real_push = x.loc[real_push_mask].copy()
+        if not real_push.empty:
+            real_push = _same_day_push_rows(real_push, now_i=now_i, label="filter_push_like_rows.real_push")
+            if not real_push.empty:
+                logger.info(
+                    "[summary.fallback_loader] real-push priority rows=%s -> %s source_dist=%s",
+                    len(x),
+                    len(real_push),
+                    real_push["source"].astype(str).value_counts().head(10).to_dict(),
+                )
+                return real_push.reset_index(drop=True)
+
         mask = (
             src_l.isin({"push", "summary", "push_summary", "summary_push", "push_stream_raw_db"})
             | src.str.contains("push_stream", case=False, na=False)

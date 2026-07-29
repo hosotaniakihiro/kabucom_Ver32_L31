@@ -249,10 +249,14 @@ DB_SYNC_PATCHES = [
 # trading/ranking/active_symbols/liquidity.py と
 # scheduler_jobs/summary/fallback_loader.py の本文に統合されているため、
 # ここでの install() は不要。
+#
+# ranking_entry_market_hours_skip_patch / ranking_entry_hard_timeout_patch /
+# ranking_stuck_pending_prune_patch / ranking_entry_controller_timeout_patch
+# (main.py側) は、trading/entry_exit/tasks.py の _run_ranking_entry_safe と
+# core/startup/schedule_loop.py の _is_job_running へ本文化済みのため削除した。
 
 SYNC_MAIN_PATCHES = [
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
-    ("core.startup.ranking_entry_market_hours_skip_patch", "RANKING_ENTRY_WATCHDOG", "DISABLE_RANKING_ENTRY_WATCHDOG_PATCH"),
     ("core.startup.ranking_entry_snapshot_technical_alias_patch", "RANKING_SNAPSHOT_TECH_ALIAS", "DISABLE_RANKING_SNAPSHOT_TECH_ALIAS_PATCH"),
     ("core.startup.entry_log_skip_reason_collision_patch", "ENTRY_LOG_SKIP_GUARD", "DISABLE_ENTRY_LOG_SKIP_GUARD"),
     ("core.startup.entry_controller_pipeline_lock_wait_patch", "ENTRY_CONTROLLER_LOCK_WAIT", "DISABLE_ENTRY_CONTROLLER_LOCK_WAIT_PATCH"),
@@ -273,8 +277,6 @@ BACKGROUND_MAIN_PATCHES = [
     ("core.startup.ranking_entry_flat_price_guard_patch", "RANKING_FLAT_PRICE_DB_FALLBACK", "DISABLE_RANKING_FLAT_PRICE_PATCH"),
     ("core.startup.ranking_entry_source_db_fallback_patch", "RANKING_ENTRY_SOURCE_DB_FALLBACK", "DISABLE_RANKING_ENTRY_SOURCE_DB_FALLBACK_PATCH"),
     ("core.startup.ranking_entry_high_low_from_snapshot_patch", "RANKING_ENTRY_HIGH_LOW_SNAPSHOT", "DISABLE_RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH"),
-    ("core.startup.ranking_stuck_pending_prune_patch", "RANKING_STUCK_PENDING_PRUNE", "DISABLE_RANKING_STUCK_PENDING_PRUNE_PATCH"),
-    ("core.startup.ranking_entry_hard_timeout_patch", "RANKING_ENTRY_HARD_TIMEOUT", "DISABLE_RANKING_ENTRY_HARD_TIMEOUT_PATCH"),
     ("core.startup.yahoo_complement_db_warmup_patch", "YAHOO_COMPLEMENT_DB_WARMUP", "DISABLE_YAHOO_COMPLEMENT_DB_WARMUP_PATCH"),
     ("core.startup.entry_mtf_short_required_daily_optional_patch", "SHORT_MTF_2OF3_GUARD", "DISABLE_SHORT_MTF_2OF3_GUARD_PATCH"),
     ("core.startup.entry_controller_tonosama_ai_bridge_patch", "TONOSAMA_AI_BRIDGE", "DISABLE_TONOSAMA_AI_BRIDGE_PATCH"),

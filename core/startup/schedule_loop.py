@@ -1,9 +1,13 @@
 # ============================================================
 # File   : core/startup/schedule_loop.py
-# Version: PRODUCTION-STABLE-REV2.0-SCHEDULE-ASYNC-DISPATCH-LOOP
+# Version: PRODUCTION-STABLE-REV2.1-INLINE-STALE-RUNNING-CLEAR
 # ------------------------------------------------------------
 # 【概要】
 #   schedule ライブラリの登録済み job を常駐実行する専用モジュール
+#
+# 【REV2.1】
+#   - 旧 core/startup/ranking_entry_market_hours_skip_patch.py が
+#     _is_job_running を差し替えていたstale-running-clearロジックを本文へ統合。
 #
 # 【REV1.0】
 #   - schedule.run_pending() を常駐実行
@@ -317,7 +321,56 @@ def _mark_job_done(key: str) -> None:
         _RUNNING_JOBS.pop(key, None)
 
 
+def _entry_stale_timeout_for_key(key: str) -> float:
+    """旧 core/startup/ranking_entry_market_hours_skip_patch.py の_entry_stale_timeout_for_key。
+
+    旧パッチの install() が os.environ.setdefault で確立していた実効デフォルト値
+    (tonosama=60s, ranking=30s) をそのままこの関数の既定値として直接持たせる。
+    """
+    base = _env_float("ENTRY_SCHEDULER_STALE_RUNNING_CLEAR_SEC", 90.0)
+    if "tonosama_entry" in key:
+        return _env_float("TONOSAMA_ENTRY_SCHEDULER_STALE_SEC", 60.0)
+    if "ranking_entry" in key:
+        return _env_float("RANKING_ENTRY_SCHEDULER_STALE_SEC", 30.0)
+    if "entry" in key:
+        return base
+    return 0.0
+
+
 def _is_job_running(key: str) -> bool:
+    """running中判定。旧 core/startup/ranking_entry_market_hours_skip_patch.py の
+    _install_scheduler_stale_running_clear が差し替えていたstale-clearロジックを統合。
+
+    entry/tonosama_entry/ranking_entry系のjobがタイムアウトを超えて running のまま
+    残っている場合は、ここで自動的に _RUNNING_JOBS から取り除いて False (未実行中) を返す。
+    """
+    if not _env_bool("ENTRY_SCHEDULER_STALE_RUNNING_CLEAR_ENABLED", True):
+        with _RUNNING_JOBS_LOCK:
+            return key in _RUNNING_JOBS
+
+    try:
+        key_s = str(key)
+        timeout_sec = _entry_stale_timeout_for_key(key_s)
+        if timeout_sec > 0:
+            with _RUNNING_JOBS_LOCK:
+                meta = _RUNNING_JOBS.get(key_s)
+                started_at = meta.get("started_at") if isinstance(meta, dict) else None
+                elapsed = 0.0
+                if isinstance(started_at, dt.datetime):
+                    elapsed = max(0.0, (dt.datetime.now() - started_at).total_seconds())
+                if meta and elapsed >= timeout_sec:
+                    _RUNNING_JOBS.pop(key_s, None)
+                    logger.warning(
+                        "[SCHEDULE LOOP] cleared stale running key=%s elapsed=%.3fs timeout=%.3fs meta=%s",
+                        key_s,
+                        elapsed,
+                        timeout_sec,
+                        meta,
+                    )
+                    return False
+    except Exception:
+        logger.exception("[SCHEDULE LOOP] stale running check failed key=%s", key)
+
     with _RUNNING_JOBS_LOCK:
         return key in _RUNNING_JOBS
 
@@ -330,6 +383,16 @@ def _env_float(name: str, default: float) -> float:
         return float(v)
     except Exception:
         return float(default)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
 
 
 def _is_ranking_summary_key(key: str) -> bool:

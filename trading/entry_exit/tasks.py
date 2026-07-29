@@ -1,9 +1,20 @@
 # ============================================================
 # File   : trading/entry_exit/tasks.py
-# Version: Ver2.4-TONOSAMA-FRESH-SUMMARY-FALLBACK
+# Version: Ver2.5-INLINE-RANKING-ENTRY-SAFE-CHAIN
 # ------------------------------------------------------------
 # 【目的】
 #   entry/exit scheduler tasks.
+#
+# Ver2.5:
+#   - core/startup/ranking_entry_controller_timeout_patch.py (V1.9) /
+#     ranking_entry_hard_timeout_patch.py (V3) /
+#     ranking_entry_market_hours_skip_patch.py (V1.4) /
+#     ranking_stuck_pending_prune_patch.py (V7) が同じ
+#     _run_ranking_entry_safe を非決定的な順序で奪い合っていた連鎖を、
+#     本文へ1つの決定論的な関数として統合した。
+#   - タイムアウト方針は V3/V7 が独立に文書化した緩和値
+#     (build/controller<=30s, runtime budget 25s, 外側ハード35-55s) を採用し、
+#     V1.9 の18/12/15秒ハードキャップ (created=0 障害の原因) は撤去した。
 #
 # Ver2.4 Fix:
 #   - TONOSAMA実行前の fresh push summary wait が get_push_merged_summary(1)
@@ -21,8 +32,10 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import schedule
@@ -46,6 +59,14 @@ _RANKING_ENTRY_COOLDOWN_UNTIL: Optional[dt.datetime] = None
 _RANKING_ENTRY_TIMEOUT_STREAK = 0
 _RANKING_ENTRY_LOCK = threading.RLock()
 
+# 旧 core/startup/ranking_stuck_pending_prune_patch.py の overlap-guard 用ロック。
+# _RANKING_ENTRY_LOCK (cooldown/running flag の短時間保護用) とは別に、
+# ビルド〜controller dispatchまでの「重い一連の処理」全体の多重実行を防ぐ。
+_RANKING_ENTRY_RUN_LOCK = threading.Lock()
+_RANKING_ENTRY_RUN_STARTED_AT = 0.0
+_RANKING_ENTRY_RUN_SEQ = 0
+_RANKING_ENTRY_COMPANION_PATCHED = False
+
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -67,12 +88,33 @@ def _env_bool(name: str, default: bool) -> bool:
         return bool(default)
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
 TONOSAMA_ENTRY_TIMEOUT_SEC = max(30.0, _env_float("TONOSAMA_ENTRY_TIMEOUT_SEC", 30.0))
 TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC = max(8.0, _env_float("TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC", 8.0))
 TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_SEC = _env_float("TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_SEC", 45.0)
 TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC = _env_float("TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC", 180.0)
-RANKING_ENTRY_BUILD_TIMEOUT_SEC = _env_float("RANKING_ENTRY_BUILD_TIMEOUT_SEC", 90.0)
-RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC = _env_float("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", 20.0)
+
+# NOTE: build/controller timeoutの既定値は 30.0/30.0秒 (旧 90.0/20.0秒から変更)。
+# 旧 core/startup/ranking_entry_controller_timeout_patch.py (V1.9) は18/12/15秒まで
+# 締め付けていたが、旧 ranking_entry_hard_timeout_patch.py (V3) / ranking_stuck_pending_prune_patch.py (V7)
+# の両方が独立に「締めすぎて候補はあるのにpending追加がタイムアウトで弾かれ created=0 になる」障害を
+# 報告し、25-30秒への緩和で修正していた。本文化にあたり、その緩和値を正として採用する。
+RANKING_ENTRY_BUILD_TIMEOUT_SEC = _env_float("RANKING_ENTRY_BUILD_TIMEOUT_SEC", 30.0)
+RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC = _env_float("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", 30.0)
+RANKING_ENTRY_RUNTIME_BUDGET_SEC = _env_float("RANKING_ENTRY_RUNTIME_BUDGET_SEC", 25.0)
+# 外側のハード安全弁。ビルド+controller dispatchの合計がここを超えたら、workerはdaemonのまま
+# 走らせ続け、schedulerには一旦0を返してスロットを解放する。
+RANKING_ENTRY_HARD_TIMEOUT_SEC = max(1.0, min(_env_float("RANKING_ENTRY_HARD_TIMEOUT_SEC", 35.0), 55.0))
+RANKING_ENTRY_MAX_PENDING_PER_RUN = max(1, _env_int("RANKING_ENTRY_MAX_PENDING_PER_RUN", 4))
 RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC = _env_float("RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC", 90.0)
 RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC = _env_float("RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC", 300.0)
 
@@ -135,6 +177,257 @@ def _pending_count_for_source(source: str) -> int:
         return int(total)
     except Exception:
         return int(total)
+
+
+def _pending_symbols_for_source(source: str) -> list[str]:
+    source_u = str(source or "").upper()
+    symbols: list[str] = []
+    try:
+        import trading.entry.pending_manager as pm
+        iter_entries = getattr(pm, "iter_entries", None)
+        if callable(iter_entries):
+            for sym, entry in list(iter_entries()):
+                if source_u in _entry_source(entry):
+                    symbols.append(str(sym))
+    except Exception:
+        pass
+    return sorted(set(symbols))
+
+
+def _entry_first_seen_ts(entry: Any) -> float:
+    try:
+        if isinstance(entry, dict):
+            for key in ("_ranking_pending_first_seen_ts", "created_ts", "created_at_ts", "pending_created_ts", "first_seen_ts", "ts"):
+                v = entry.get(key)
+                if v:
+                    return float(v)
+            now = time.time()
+            entry["_ranking_pending_first_seen_ts"] = now
+            return now
+    except Exception:
+        pass
+    return time.time()
+
+
+def _prune_pending_for_source(source: str, reason: str) -> int:
+    if not _env_bool("RANKING_ENTRY_PRUNE_STALE_PENDING_AFTER_DISPATCH", True):
+        return 0
+    min_age_sec = max(3.0, _env_float("RANKING_ENTRY_STALE_PENDING_MIN_AGE_SEC", 10.0))
+    source_u = str(source or "").upper()
+    now = time.time()
+    try:
+        import trading.entry.pending_manager as pm
+        prune_entries = getattr(pm, "prune_entries", None)
+        if callable(prune_entries):
+            def pred(_sym, entry):
+                if source_u not in _entry_source(entry):
+                    return False
+                age = now - _entry_first_seen_ts(entry)
+                if age < min_age_sec:
+                    logger.warning("[RANKING ENTRY SCHEDULE] stale prune skipped young pending symbol=%s age=%.1fs min_age=%.1fs reason=%s", _sym, age, min_age_sec, reason)
+                    return False
+                return True
+            return int(prune_entries(pred, reason=reason) or 0)
+    except Exception:
+        logger.warning("[RANKING ENTRY SCHEDULE] pending prune failed source=%s reason=%s", source_u, reason, exc_info=True)
+    return 0
+
+
+def _dispatch_and_cleanup_ranking(*, timeout_sec: float, cleanup_reason: str) -> bool:
+    before_symbols = _pending_symbols_for_source("RANKING")
+    ok = _dispatch_entry_controller(pipeline_source="RANKING", interval=1, timeout_sec=timeout_sec, reason="RANKING ENTRY SCHEDULE")
+    time.sleep(max(0.0, _env_float("RANKING_ENTRY_POST_DISPATCH_GRACE_SEC", 0.1)))
+    after_count = _pending_count_for_source("RANKING")
+    if after_count > 0:
+        removed = _prune_pending_for_source("RANKING", cleanup_reason)
+        logger.warning("[RANKING ENTRY SCHEDULE] ranking pending after controller controller_ok=%s before_symbols=%s after_count=%s removed=%s reason=%s", ok, before_symbols, after_count, removed, cleanup_reason)
+    return ok
+
+
+def _ranking_entry_pending_score(entry: Any) -> float:
+    try:
+        if isinstance(entry, dict):
+            return float(entry.get("score") or entry.get("ranking_score") or entry.get("pending_score") or 0.0)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _mark_and_prune_stuck_ranking_pending(reason: str = "RANKING_STUCK_PENDING_RETRY_OR_AGE") -> int:
+    """旧 core/startup/ranking_stuck_pending_prune_patch.py (V7) のstuck pending判定・prune。"""
+    max_retry = max(1, _env_int("RANKING_STUCK_PENDING_MAX_CONTROLLER_RETRY", 3))
+    min_age_sec = max(5.0, _env_float("RANKING_STUCK_PENDING_MIN_AGE_SEC", 30.0))
+    max_age_sec = max(min_age_sec, _env_float("RANKING_STUCK_PENDING_MAX_AGE_SEC", 120.0))
+    now = time.time()
+
+    try:
+        import trading.entry.pending_manager as pm
+        it = getattr(pm, "iter_entries", None)
+        prune = getattr(pm, "prune_entries", None)
+        if not callable(it) or not callable(prune):
+            return 0
+
+        for sym, entry in list(it()):
+            if not isinstance(entry, dict) or "RANKING" not in _entry_source(entry):
+                continue
+            first = entry.get("_ranking_pending_first_seen_ts")
+            if not first:
+                entry["_ranking_pending_first_seen_ts"] = now
+                first = now
+            entry["_ranking_controller_retry_count"] = int(float(entry.get("_ranking_controller_retry_count") or 0)) + 1
+            entry["_ranking_last_controller_retry_ts"] = now
+            logger.info(
+                "[RANKING ENTRY SCHEDULE] stuck pending mark symbol=%s retry=%s age=%.1fs score=%.4f min_age=%.1fs max_age=%.1fs",
+                sym,
+                entry.get("_ranking_controller_retry_count"),
+                now - float(first),
+                _ranking_entry_pending_score(entry),
+                min_age_sec,
+                max_age_sec,
+            )
+
+        def pred(sym: str, entry: dict) -> bool:
+            if not isinstance(entry, dict) or "RANKING" not in _entry_source(entry):
+                return False
+            retry = int(float(entry.get("_ranking_controller_retry_count") or 0))
+            first = float(entry.get("_ranking_pending_first_seen_ts") or now)
+            age = now - first
+            if age < min_age_sec:
+                return False
+            if age >= max_age_sec:
+                return True
+            if retry >= max_retry:
+                return True
+            return False
+
+        removed = int(prune(pred, reason=reason))
+        if removed:
+            logger.warning(
+                "[RANKING ENTRY SCHEDULE] stuck pending pruned removed=%s reason=%s max_retry=%s min_age=%.1fs max_age=%.1fs",
+                removed,
+                reason,
+                max_retry,
+                min_age_sec,
+                max_age_sec,
+            )
+        return removed
+    except Exception:
+        logger.exception("[RANKING ENTRY SCHEDULE] stuck pending prune failed")
+        return 0
+
+
+def _clear_ranking_runtime_overlap_if_stale() -> bool:
+    """旧 ranking_stuck_pending_prune_patch.py の_clear_runtime_overlap_if_stale。
+
+    scheduler の previous_still_running 化を避けるため、_RANKING_ENTRY_RUN_LOCK を
+    握ったまま古くなった実行を検知したら、次サイクルを止める代わりにstuck pendingを掃除する。
+    """
+    global _RANKING_ENTRY_RUN_STARTED_AT
+    if not _RANKING_ENTRY_RUN_LOCK.locked():
+        return False
+    stale_sec = max(20.0, _env_float("RANKING_ENTRY_RUNTIME_STALE_SEC", 35.0))
+    age = time.time() - float(_RANKING_ENTRY_RUN_STARTED_AT or 0.0)
+    if age < stale_sec:
+        return False
+    logger.warning(
+        "[RANKING ENTRY SCHEDULE] previous ranking run still active age=%.1fs >= %.1fs; "
+        "skip this cycle and prune stale pending instead of starting another heavy run",
+        age,
+        stale_sec,
+    )
+    _mark_and_prune_stuck_ranking_pending(reason="RANKING_ENTRY_RUNTIME_STALE_SKIP")
+    return True
+
+
+def _ranking_entry_in_session(now: Optional[dt.datetime] = None) -> bool:
+    """旧 ranking_entry_market_hours_skip_patch.py の_in_session。"""
+    now = now or dt.datetime.now()
+    t = now.time()
+    return (dt.time(9, 0) <= t <= dt.time(11, 30)) or (dt.time(12, 30) <= t <= dt.time(15, 30))
+
+
+def _clear_ranking_task_running_if_stale(*, force: bool = False) -> bool:
+    """旧 ranking_entry_market_hours_skip_patch.py の_clear_task_running_if_stale (RANKING専用)。"""
+    global _RANKING_ENTRY_RUNNING, _RANKING_ENTRY_STARTED_AT, _RANKING_ENTRY_COOLDOWN_UNTIL
+    timeout = _env_float("RANKING_ENTRY_TASK_STALE_SEC", _env_float("RANKING_ENTRY_SCHEDULER_STALE_SEC", 30.0))
+    try:
+        with _RANKING_ENTRY_LOCK:
+            running = bool(_RANKING_ENTRY_RUNNING)
+            started_at = _RANKING_ENTRY_STARTED_AT
+            elapsed = None
+            if isinstance(started_at, dt.datetime):
+                elapsed = max(0.0, (dt.datetime.now() - started_at).total_seconds())
+            should_clear = bool(force)
+            if running and elapsed is not None and elapsed >= timeout:
+                should_clear = True
+            if not should_clear:
+                return False
+            _RANKING_ENTRY_RUNNING = False
+            _RANKING_ENTRY_STARTED_AT = None
+            _RANKING_ENTRY_COOLDOWN_UNTIL = None
+            logger.warning(
+                "[RANKING ENTRY SCHEDULE] cleared stale task-running flag elapsed=%s timeout=%.3fs force=%s",
+                None if elapsed is None else round(float(elapsed), 3),
+                timeout,
+                force,
+            )
+            return True
+    except Exception:
+        logger.exception("[RANKING ENTRY SCHEDULE] task stale clear failed")
+        return False
+
+
+def _ranking_entry_operation_mode() -> str:
+    try:
+        return str(os.getenv("AUTOSTOCK_MAIN_OPERATION_MODE", "full") or "full").strip().lower()
+    except Exception:
+        return "full"
+
+
+def _is_main_py_process() -> bool:
+    try:
+        return Path(sys.argv[0]).name.lower() == "main.py"
+    except Exception:
+        return False
+
+
+def _main_skip_ranking_entry() -> bool:
+    """旧 ranking_stuck_pending_prune_patch.py の_main_skip_ranking_entry。
+
+    entry_only 安全モード時だけ main.py の ranking entry を止める。
+    """
+    if not _is_main_py_process():
+        return False
+    if os.getenv("AUTOSTOCK_MAIN_SKIP_RANKING_ENTRY") is not None:
+        return _env_bool("AUTOSTOCK_MAIN_SKIP_RANKING_ENTRY", False)
+    return _ranking_entry_operation_mode() not in {"full", "all"} and not _env_bool("AUTOSTOCK_MAIN_ENABLE_RANKING_ENTRY", False)
+
+
+def _install_ranking_entry_companion_patches() -> bool:
+    """旧 ranking_entry_market_hours_skip_patch.py / ranking_stuck_pending_prune_patch.py が
+    連鎖installしていたcompanion patchを1回だけ呼ぶ。これらは本文化された_run_ranking_entry_safe
+    には依存しない独立の機能のため、本体削除後もinstallされ続けるようここへ移設する。
+    """
+    global _RANKING_ENTRY_COMPANION_PATCHED
+    if _RANKING_ENTRY_COMPANION_PATCHED:
+        return True
+    ok_any = False
+    for module_name in (
+        "core.startup.kabu_api_token_runtime_patch",
+        "core.startup.ranking_entry_push_fallback_patch",
+        "core.startup.ranking_entry_min_pending_on_timeout_patch",
+    ):
+        try:
+            import importlib
+            mod = importlib.import_module(module_name)
+            fn = getattr(mod, "install", None)
+            ok = bool(fn()) if callable(fn) else False
+            ok_any = ok_any or ok
+            logger.info("[RANKING ENTRY SCHEDULE] companion patch %s installed=%s", module_name, ok)
+        except Exception:
+            logger.debug("[RANKING ENTRY SCHEDULE] companion patch %s skipped", module_name, exc_info=True)
+    _RANKING_ENTRY_COMPANION_PATCHED = True
+    return ok_any
 
 
 def _clear_tag(tag: str) -> None:
@@ -432,7 +725,11 @@ def _ranking_entry_cooldown_seconds() -> float:
         return 90.0
 
 
-def _run_ranking_entry_safe() -> int:
+def _run_ranking_entry_safe_body(seq: int) -> int:
+    """実際のビルド〜controller dispatchロジック本体。
+
+    _RANKING_ENTRY_RUN_LOCK 取得後、ハードタイムアウトのworkerスレッド内で呼ばれる。
+    """
     global _RANKING_ENTRY_RUNNING, _RANKING_ENTRY_STARTED_AT, _RANKING_ENTRY_COOLDOWN_UNTIL, _RANKING_ENTRY_TIMEOUT_STREAK
     started_dt = dt.datetime.now()
     started = time.perf_counter()
@@ -443,41 +740,149 @@ def _run_ranking_entry_safe() -> int:
             return 0
         if _RANKING_ENTRY_RUNNING:
             elapsed = (dt.datetime.now() - _RANKING_ENTRY_STARTED_AT).total_seconds() if _RANKING_ENTRY_STARTED_AT else None
-            logger.warning("[RANKING ENTRY SCHEDULE] skipped reason=previous_still_running started_at=%s elapsed=%s", _RANKING_ENTRY_STARTED_AT, elapsed)
-            return 0
+            stale_sec = _env_float("RANKING_ENTRY_RUNNING_STALE_RESET_SEC", 45.0)
+            if elapsed is not None and elapsed > stale_sec:
+                logger.warning("[RANKING ENTRY SCHEDULE] stale running flag reset elapsed=%.1fs stale_sec=%.1fs started_at=%s", elapsed, stale_sec, _RANKING_ENTRY_STARTED_AT)
+                _RANKING_ENTRY_RUNNING = False
+                _RANKING_ENTRY_STARTED_AT = None
+            else:
+                logger.warning("[RANKING ENTRY SCHEDULE] skipped reason=previous_still_running started_at=%s elapsed=%s", _RANKING_ENTRY_STARTED_AT, elapsed)
+                return 0
         _RANKING_ENTRY_RUNNING = True
         _RANKING_ENTRY_STARTED_AT = started_dt
     try:
-        logger.info("[RANKING ENTRY SCHEDULE] fire at=%s", started_dt.strftime("%Y-%m-%d %H:%M:%S"))
+        logger.info("[RANKING ENTRY SCHEDULE] fire at=%s seq=%s", started_dt.strftime("%Y-%m-%d %H:%M:%S"), seq)
+
+        before_pending = _pending_count_for_source("RANKING")
+        if before_pending > 0:
+            pruned = _mark_and_prune_stuck_ranking_pending()
+            if pruned:
+                logger.warning("[RANKING ENTRY SCHEDULE] pre-build pruned=%s before=%s after=%s", pruned, before_pending, _pending_count_for_source("RANKING"))
+            before_pending = _pending_count_for_source("RANKING")
+
+        if before_pending > 0:
+            logger.warning("[RANKING ENTRY SCHEDULE] existing ranking pending detected before build count=%s symbols=%s", before_pending, _pending_symbols_for_source("RANKING"))
+            # 先に既存pendingを捌く。ビルドを重ねて詰まらせない。
+            _dispatch_and_cleanup_ranking(timeout_sec=RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC, cleanup_reason="RANKING_EXISTING_PENDING_FIRST")
+            if _pending_count_for_source("RANKING") >= RANKING_ENTRY_MAX_PENDING_PER_RUN:
+                logger.warning("[RANKING ENTRY SCHEDULE] build skipped because pending remains count=%s", _pending_count_for_source("RANKING"))
+                return 0
+
         build_fn = _resolve_callable("trading.ranking.entry_from_ranking", "run_ranking_entry_pipeline")
         if not callable(build_fn):
             logger.warning("[RANKING ENTRY SCHEDULE] skipped reason=ranking_entry_pipeline_unavailable")
             return 0
         completed, created_ret = _run_callable_with_timeout(build_fn, timeout_sec=RANKING_ENTRY_BUILD_TIMEOUT_SEC, name="RANKING ENTRY BUILD")
+        after_pending = _pending_count_for_source("RANKING")
         if not completed:
+            created_by_pending = max(0, after_pending - before_pending)
+            logger.warning("[RANKING ENTRY SCHEDULE] build timeout but pending check before=%s after=%s created_by_pending=%s timeout_sec=%.3f elapsed=%.3fs", before_pending, after_pending, created_by_pending, RANKING_ENTRY_BUILD_TIMEOUT_SEC, time.perf_counter() - started)
+            if created_by_pending > 0 or after_pending > 0:
+                logger.warning("[RANKING ENTRY SCHEDULE] dispatch controller despite build timeout because pending exists count=%s", after_pending)
+                _dispatch_and_cleanup_ranking(timeout_sec=RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC, cleanup_reason="RANKING_BUILD_TIMEOUT_OR_FILTER_NG_STALE")
+                with _RANKING_ENTRY_LOCK:
+                    _RANKING_ENTRY_TIMEOUT_STREAK = 0
+                    _RANKING_ENTRY_COOLDOWN_UNTIL = None
+                return int(after_pending)
             with _RANKING_ENTRY_LOCK:
                 _RANKING_ENTRY_TIMEOUT_STREAK += 1
                 cool_sec = _ranking_entry_cooldown_seconds()
                 _RANKING_ENTRY_COOLDOWN_UNTIL = dt.datetime.now() + dt.timedelta(seconds=cool_sec)
             logger.warning("[RANKING ENTRY SCHEDULE] build timeout -> cooldown timeout_sec=%.3f elapsed=%.3fs timeout_streak=%s cooldown_sec=%.1f until=%s", RANKING_ENTRY_BUILD_TIMEOUT_SEC, time.perf_counter() - started, _RANKING_ENTRY_TIMEOUT_STREAK, cool_sec, _RANKING_ENTRY_COOLDOWN_UNTIL)
             return 0
-        _RANKING_ENTRY_TIMEOUT_STREAK = 0
-        _RANKING_ENTRY_COOLDOWN_UNTIL = None
+
+        with _RANKING_ENTRY_LOCK:
+            _RANKING_ENTRY_TIMEOUT_STREAK = 0
+            _RANKING_ENTRY_COOLDOWN_UNTIL = None
         created = int(created_ret or 0)
-        logger.info("[RANKING ENTRY SCHEDULE] pending build done created=%s", created)
-        if created > 0:
-            _dispatch_entry_controller(pipeline_source="RANKING", interval=1, timeout_sec=RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC, reason="RANKING ENTRY SCHEDULE")
+        logger.info("[RANKING ENTRY SCHEDULE] pending build done created=%s before_pending=%s after_pending=%s", created, before_pending, after_pending)
+        if created > 0 or after_pending > before_pending or after_pending > 0:
+            if created <= 0 and after_pending > 0:
+                logger.warning("[RANKING ENTRY SCHEDULE] dispatch existing ranking pending created=0 count=%s symbols=%s", after_pending, _pending_symbols_for_source("RANKING"))
+            _dispatch_and_cleanup_ranking(timeout_sec=RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC, cleanup_reason="RANKING_CONTROLLER_RETURNED_STALE_PENDING")
         else:
-            logger.info("[RANKING ENTRY SCHEDULE] no pending created -> controller dispatch skipped")
-        logger.info("[RANKING ENTRY SCHEDULE] done created=%s elapsed=%.3fs", created, time.perf_counter() - started)
+            logger.info("[RANKING ENTRY SCHEDULE] no pending created and no ranking pending remains -> controller dispatch skipped")
+        final_pending = _pending_count_for_source("RANKING")
+        logger.info("[RANKING ENTRY SCHEDULE] done created=%s pending_count=%s final_pending=%s elapsed=%.3fs seq=%s", created, after_pending, final_pending, time.perf_counter() - started, seq)
         return created
     except Exception:
-        logger.exception("[RANKING ENTRY SCHEDULE] failed")
+        logger.exception("[RANKING ENTRY SCHEDULE] failed seq=%s", seq)
         return 0
     finally:
         with _RANKING_ENTRY_LOCK:
             _RANKING_ENTRY_RUNNING = False
             _RANKING_ENTRY_STARTED_AT = None
+
+
+def _run_ranking_entry_safe() -> int:
+    """RANKING entryのスケジュールタスク本体（本文化統合版）。
+
+    外側から内側への処理順序:
+      1. 市場時間外スキップ (旧 ranking_entry_market_hours_skip_patch.py)
+      2. RANKING task-levelのstale running clear (同上)
+      3. main.py entry_onlyモードでのskipゲート (旧 ranking_stuck_pending_prune_patch.py)
+      4. companion patchのインストール (kabu_api_token_runtime_patch 等、1回だけ)
+      5. _RANKING_ENTRY_RUN_LOCK (非ブロッキング) + stale-overlap時のprune (旧 ranking_stuck_pending_prune_patch.py)
+      6. 外側ハードタイムアウト (旧 ranking_entry_hard_timeout_patch.py, 35-55秒) でworkerスレッドを被せる
+      7. worker内部: cooldown/実行中チェック -> 既存pending dispatch+cleanup -> stuck pending prune
+         -> build (floor 30秒) -> controller dispatch+cleanup -> cooldown/streak更新
+
+    タイムアウト方針は旧 ranking_entry_hard_timeout_patch.py (V3) / ranking_stuck_pending_prune_patch.py (V7)
+    が独立に文書化した緩和値 (build/controller<=30s, runtime budget 25s, 外側35-55s) を正として採用する。
+    旧 ranking_entry_controller_timeout_patch.py (V1.9) の18/12/15秒ハードキャップは、
+    上記2パッチが対処した「created=0になる」障害の原因だったため採用しない。
+    """
+    global _RANKING_ENTRY_RUN_STARTED_AT, _RANKING_ENTRY_RUN_SEQ
+
+    now = dt.datetime.now()
+    if not _ranking_entry_in_session(now):
+        logger.warning("[RANKING ENTRY SCHEDULE] skip outside session now=%s", now.strftime("%Y-%m-%d %H:%M:%S"))
+        return 0
+
+    _clear_ranking_task_running_if_stale()
+
+    if _main_skip_ranking_entry():
+        logger.warning(
+            "[RANKING ENTRY SCHEDULE] main.py skip ranking entry job mode=%s. "
+            "Set AUTOSTOCK_MAIN_OPERATION_MODE=full or AUTOSTOCK_MAIN_SKIP_RANKING_ENTRY=0 to restore.",
+            _ranking_entry_operation_mode(),
+        )
+        return 0
+
+    _install_ranking_entry_companion_patches()
+
+    if not _RANKING_ENTRY_RUN_LOCK.acquire(blocking=False):
+        _clear_ranking_runtime_overlap_if_stale()
+        return 0
+
+    _RANKING_ENTRY_RUN_SEQ += 1
+    seq = _RANKING_ENTRY_RUN_SEQ
+    _RANKING_ENTRY_RUN_STARTED_AT = time.time()
+
+    def _inner() -> int:
+        global _RANKING_ENTRY_RUN_STARTED_AT
+        try:
+            return _run_ranking_entry_safe_body(seq)
+        finally:
+            _RANKING_ENTRY_RUN_STARTED_AT = 0.0
+            try:
+                _RANKING_ENTRY_RUN_LOCK.release()
+            except RuntimeError:
+                pass
+
+    completed, ret = _run_callable_with_timeout(_inner, timeout_sec=RANKING_ENTRY_HARD_TIMEOUT_SEC, name="RANKING ENTRY HARD TIMEOUT")
+    if not completed:
+        logger.warning(
+            "[RANKING ENTRY SCHEDULE] hard timeout seq=%s timeout_sec=%.1fs; return 0 to release scheduler slot, worker continues in daemon thread",
+            seq,
+            RANKING_ENTRY_HARD_TIMEOUT_SEC,
+        )
+        try:
+            _mark_and_prune_stuck_ranking_pending(reason="RANKING_ENTRY_HARD_TIMEOUT")
+        except Exception:
+            logger.debug("[RANKING ENTRY SCHEDULE] prune on hard timeout failed", exc_info=True)
+        return 0
+    return int(ret or 0)
 
 
 def _resolve_tonosama_interval_sec() -> int:

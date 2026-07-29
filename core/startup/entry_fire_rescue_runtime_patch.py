@@ -462,47 +462,12 @@ def _patch_sell_credit_prefilter() -> bool:
 
 
 def _patch_ranking_timeout_controller() -> bool:
-    try:
-        import core.startup.ranking_entry_controller_timeout_patch as p
-
-        if getattr(p, "_entry_fire_rescue_relaxed_v4", False):
-            return True
-
-        def relaxed_force_runtime_timeouts(tasks) -> None:
-            try:
-                build_cap = p._cap_env_float("RANKING_ENTRY_BUILD_TIMEOUT_SEC", default=30.0, lower=10.0, upper=30.0, force=True)
-                controller_cap = p._cap_env_float("RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC", default=18.0, lower=8.0, upper=20.0, force=True)
-                runtime_cap = p._cap_env_float("RANKING_ENTRY_RUNTIME_BUDGET_SEC", default=30.0, lower=10.0, upper=30.0, force=True)
-                max_pending = p._cap_env_int("RANKING_ENTRY_MAX_PENDING_PER_RUN", default=3, lower=1, upper=3, force=True)
-                os.environ["RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS"] = str(p._cap_env_int("RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS", default=30, lower=8, upper=30, force=True))
-                os.environ["RANKING_ENTRY_FAST_MAX_SYMBOLS"] = str(p._cap_env_int("RANKING_ENTRY_FAST_MAX_SYMBOLS", default=30, lower=8, upper=30, force=True))
-                os.environ["RANKING_ENTRY_FAST_MAX_PER_SIDE"] = str(p._cap_env_int("RANKING_ENTRY_FAST_MAX_PER_SIDE", default=15, lower=3, upper=15, force=True))
-                os.environ["RANKING_ENTRY_FAST_MAX_PER_TYPE"] = str(p._cap_env_int("RANKING_ENTRY_FAST_MAX_PER_TYPE", default=8, lower=2, upper=8, force=True))
-                os.environ["RANKING_ENTRY_ULTRA_MAX_SOURCE_ROWS"] = str(p._cap_env_int("RANKING_ENTRY_ULTRA_MAX_SOURCE_ROWS", default=200, lower=80, upper=200, force=True))
-                tasks.RANKING_ENTRY_BUILD_TIMEOUT_SEC = build_cap
-                tasks.RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC = controller_cap
-                try:
-                    tasks.RANKING_ENTRY_MAX_PENDING_PER_RUN = max_pending
-                except Exception:
-                    pass
-                logger.warning(
-                    "[ENTRY FIRE RESCUE] relaxed ranking caps build=%.1fs controller=%.1fs runtime=%.1fs max_pending=%s",
-                    build_cap,
-                    controller_cap,
-                    runtime_cap,
-                    max_pending,
-                )
-            except Exception:
-                logger.debug("[ENTRY FIRE RESCUE] relaxed ranking caps failed", exc_info=True)
-
-        p._force_runtime_timeouts = relaxed_force_runtime_timeouts
-        p._entry_fire_rescue_relaxed_v4 = True
-        p._entry_fire_rescue_relaxed_v3 = True
-        p._entry_fire_rescue_relaxed_v2 = True
-        return True
-    except Exception:
-        logger.debug("[ENTRY FIRE RESCUE] ranking timeout patch skipped", exc_info=True)
-        return False
+    """旧 core/startup/ranking_entry_controller_timeout_patch.py の18/12/15秒ハードキャップを
+    ここで30/18-20/30秒へ緩和していたが、対象の本体は
+    trading/entry_exit/tasks.py への本文化（Ver2.5, floor 30/30/25秒採用）に伴い削除済み。
+    緩和先の値は既に本文側のデフォルトに含まれているため、ここでは何もしない。
+    """
+    return True
 
 
 def _patch_once() -> dict[str, bool]:

@@ -476,9 +476,44 @@ def _check_ranking_ready() -> Dict[str, Any]:
                 pass
 
 
+def _env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _ranking_pending_count() -> int:
+    try:
+        import trading.entry_exit.tasks as tasks
+        return int(tasks._pending_count_for_source("RANKING") or 0)
+    except Exception:
+        logger.debug("[RANKING PRECHECK BYPASS] pending count failed", exc_info=True)
+        return 0
+
+
 def precheck_ranking_entry() -> Dict[str, Any]:
     result = _check_ranking_ready()
     if not result["is_ready"]:
+        # 旧 core/startup/ranking_entry_controller_timeout_patch.py (V1.9) の
+        # precheck bypass-when-pending をインライン化。
+        # snapshotが古い/未整備でも、既にRANKING pendingが存在するなら
+        # entry_controller側の処理は進めさせる (詰まったpendingを掃除する機会を潰さない)。
+        if _env_bool("RANKING_ENTRY_BYPASS_PRECHECK_WHEN_PENDING", True):
+            cnt = _ranking_pending_count()
+            if cnt > 0:
+                bypassed = dict(result)
+                bypassed["is_ready"] = True
+                bypassed["explicit_ready"] = True
+                bypassed["derived_ready"] = True
+                bypassed["bypass_reason"] = "RANKING_PENDING_EXISTS"
+                bypassed["pending_count"] = cnt
+                bypassed["original_detail_reason"] = result.get("detail_reason") or result.get("reason")
+                logger.warning("[RANKING PRECHECK BYPASS] pending exists -> allow entry_controller pending_count=%s original=%s", cnt, result)
+                return bypassed
         logger.warning("[RANKING PRECHECK NG] %s", result)
     return result
 
