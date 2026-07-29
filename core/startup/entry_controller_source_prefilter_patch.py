@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/entry_controller_source_prefilter_patch.py
-# Version: V4-SUMMARY-AI-SUMMARY-COMPAT-VOL-RESCUE-SLOPE-RELAX
+# Version: V5-ENTRY-MATCHES-PIPELINE-INLINED
 # ------------------------------------------------------------
 # 目的:
 #   entry_controller._build_scored_candidates() は entries[:MAX_CANDIDATES_PER_SYMBOL]
@@ -9,6 +9,12 @@
 #   pending_root に SUMMARY/RANKING/TONOSAMA が混在していると、実行元と違う候補が
 #   先頭10件を占有し、PIPELINE_FILTER_MISMATCH を大量に出したり、正しい候補が
 #   後ろにあるのに評価されない。
+#
+# V5:
+#   - SUMMARY_AI/SUMMARY/PUSH 互換判定は trading/handlers/entry_controller.py の
+#     _entry_matches_pipeline 本体へインライン化したため、この patch は
+#     _build_scored_candidates の差し替えのみを行う（_entry_matches_pipeline 自体は
+#     もう差し替えない。本体側の関数をそのまま呼び出す）。
 #
 # V4:
 #   - V3の SUMMARY_AI/SUMMARY 互換と vol rescue install を維持。
@@ -28,7 +34,6 @@ logger = logging.getLogger(__name__)
 
 _INSTALLED = False
 _ORIGINAL_BUILD = None
-_ORIGINAL_MATCHES = None
 _TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 _FALSE = {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}
 
@@ -62,35 +67,6 @@ def _norm_interval(v: Any) -> int | None:
         return int(float(v))
     except Exception:
         return None
-
-
-def _source_compatible(entry_source: Any, pipeline_source: str | None) -> bool:
-    ps = _norm_source(pipeline_source)
-    es = _norm_source(entry_source)
-    if not ps:
-        return True
-    if es == ps:
-        return True
-    if ps == "SUMMARY_AI" and es in {"SUMMARY", "PUSH", ""}:
-        return True
-    if ps == "SUMMARY" and es == "SUMMARY_AI":
-        return True
-    return False
-
-
-def _matches(entry: Any, pipeline_source: str | None, interval: int | None) -> bool:
-    try:
-        if not isinstance(entry, dict):
-            return False
-        if pipeline_source and not _source_compatible(entry.get("source"), pipeline_source):
-            return False
-        if interval is not None:
-            ent_i = _norm_interval(entry.get("interval"))
-            if ent_i is not None and ent_i != int(interval):
-                return False
-        return True
-    except Exception:
-        return False
 
 
 def _normalize_entry_for_pipeline(entry: Any, pipeline_source: str | None) -> Any:
@@ -128,21 +104,13 @@ def _describe(e: Any) -> dict[str, Any]:
     }
 
 
-def _patched_entry_matches_pipeline(entry: dict, pipeline_source: str | None, interval: int | None) -> bool:
-    try:
-        return _matches(entry, pipeline_source, _norm_interval(interval))
-    except Exception:
-        logger.exception("[ENTRY SOURCE PREFILTER] patched _entry_matches_pipeline failed")
-        if callable(_ORIGINAL_MATCHES):
-            return bool(_ORIGINAL_MATCHES(entry, pipeline_source, interval))
-        return False
-
-
 def _patched_build_scored_candidates(*args, **kwargs):
     if not _env_bool("ENTRY_CONTROLLER_SOURCE_PREFILTER_ENABLED", True):
         return _ORIGINAL_BUILD(*args, **kwargs)
 
     try:
+        import trading.handlers.entry_controller as ec
+
         entries = kwargs.get("entries")
         pipeline_source = kwargs.get("pipeline_source")
         interval = _norm_interval(kwargs.get("interval"))
@@ -152,10 +120,13 @@ def _patched_build_scored_candidates(*args, **kwargs):
             entries = args[1]
 
         if isinstance(entries, list) and (pipeline_source or interval is not None):
-            filtered = [e for e in entries if _matches(e, pipeline_source, interval)]
+            # SUMMARY_AI/SUMMARY/PUSH 互換判定は entry_controller._entry_matches_pipeline
+            # 本体に統合済み（旧 core/startup/entry_controller_source_prefilter_patch.py の
+            # _entry_matches_pipeline 差し替えは撤去し、こちらから直接呼ぶ）。
+            filtered = [e for e in entries if ec._entry_matches_pipeline(e, pipeline_source, interval)]
             normalized = [_normalize_entry_for_pipeline(e, pipeline_source) for e in filtered]
             if len(filtered) != len(entries):
-                skipped = [_describe(e) for e in entries if not _matches(e, pipeline_source, interval)][:20]
+                skipped = [_describe(e) for e in entries if not ec._entry_matches_pipeline(e, pipeline_source, interval)][:20]
                 logger.warning(
                     "[ENTRY SOURCE PREFILTER] symbol=%s source=%s interval=%s before=%s after=%s skipped=%s compat=summary_ai_summary",
                     symbol,
@@ -213,7 +184,7 @@ def _install_summary_ai_vol_rescue() -> bool:
 
 
 def install() -> bool:
-    global _INSTALLED, _ORIGINAL_BUILD, _ORIGINAL_MATCHES
+    global _INSTALLED, _ORIGINAL_BUILD
     try:
         import trading.handlers.entry_controller as ec
 
@@ -233,19 +204,10 @@ def install() -> bool:
             _patched_build_scored_candidates._original = base  # type: ignore[attr-defined]
             ec._build_scored_candidates = _patched_build_scored_candidates
 
-        match_cur = getattr(ec, "_entry_matches_pipeline", None)
-        if callable(match_cur) and not getattr(match_cur, "_entry_source_prefilter_match_v4", False):
-            _ORIGINAL_MATCHES = getattr(match_cur, "_original", match_cur)
-            _patched_entry_matches_pipeline._entry_source_prefilter_match_v2 = True  # type: ignore[attr-defined]
-            _patched_entry_matches_pipeline._entry_source_prefilter_match_v3 = True  # type: ignore[attr-defined]
-            _patched_entry_matches_pipeline._entry_source_prefilter_match_v4 = True  # type: ignore[attr-defined]
-            _patched_entry_matches_pipeline._original = _ORIGINAL_MATCHES  # type: ignore[attr-defined]
-            ec._entry_matches_pipeline = _patched_entry_matches_pipeline
-
         vol_ok = _install_summary_ai_vol_rescue()
         _INSTALLED = True
         logger.warning(
-            "[ENTRY SOURCE PREFILTER] installed v4 enabled=%s summary_ai_accepts_summary=True patched_match=True vol_rescue=%s min_abs_slope=%s",
+            "[ENTRY SOURCE PREFILTER] installed v5 enabled=%s summary_ai_accepts_summary=True (inlined) vol_rescue=%s min_abs_slope=%s",
             _env_bool("ENTRY_CONTROLLER_SOURCE_PREFILTER_ENABLED", True),
             vol_ok,
             os.getenv("SUMMARY_AI_VOL_RESCUE_MIN_ABS_SLOPE"),

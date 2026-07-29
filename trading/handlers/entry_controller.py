@@ -7,7 +7,12 @@
 #   - market / risk / AI health / index shock / credit / volatility
 #     などの各種ガードを通過した銘柄のみエントリーする
 # ------------------------------------------------------------
-# Version: Ver2.5-PRODUCTION-ORDER-ID-EMPTY-NO-LONG-RESTRICT
+# Version: Ver2.6-INLINE-ENTRY-MATCHES-PIPELINE-SUMMARY-AI-COMPAT
+# ------------------------------------------------------------
+# Ver2.6:
+#   - 旧 core/startup/entry_controller_source_prefilter_patch.py が単独で
+#     差し替えていた _entry_matches_pipeline の SUMMARY_AI/SUMMARY/PUSH 互換判定を
+#     本文へインライン化。
 # ------------------------------------------------------------
 # ✔ TOP候補を全件AI確認
 # ✔ AI allow / confidence / summary score で最終判定
@@ -389,9 +394,16 @@ def _entry_matches_pipeline(entry: dict, pipeline_source: str | None, interval: 
             return False
 
         if pipeline_source:
-            src = _normalize_source(entry.get("source"))
-            if src != _normalize_source(pipeline_source):
-                return False
+            ps = _normalize_source(pipeline_source)
+            es = _normalize_source(entry.get("source"))
+            if es != ps:
+                # SUMMARY_AI のpipelineはSUMMARY/PUSH(未設定含む)由来の候補も互換として受け付ける。
+                # 旧 core/startup/entry_controller_source_prefilter_patch.py の判定をインライン化。
+                if not (
+                    (ps == "SUMMARY_AI" and es in {"SUMMARY", "PUSH", ""})
+                    or (ps == "SUMMARY" and es == "SUMMARY_AI")
+                ):
+                    return False
 
         if interval is not None:
             ent_interval = _normalize_interval(entry.get("interval"))
