@@ -1,8 +1,14 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_ai_low_move_softpass_patch.py
-# Version: V3.4-STRICT-RANGE-REPAIR-ROLLING-AND-1M-BRIDGE
+# Version: V3.5-EXECUTOR-ROLLING-RETRY-INLINED
 # ------------------------------------------------------------
+# V3.5:
+#   - execute_ai_ok_entries_bulk のrolling-retry部分は
+#     trading/entry/summary_ai/executor.py 本体 (REV11) へインライン化済みのため、
+#     ここでの差し替えは撤去した（entry_order_builder._low_move_hard_block と
+#     volatility_filter._range_5m_filter_from_entry_row のラップは維持）。
+#
 # Purpose:
 #   SUMMARY_AI の低ATR/低レンジ soft-pass は既定で無効のまま維持する。
 #
@@ -46,7 +52,6 @@ _ORDER_BUILDER_PATCHED = False
 _EXECUTOR_PATCHED = False
 _VOL_FILTER_PATCHED = False
 _ORIGINAL_LOW_MOVE_HARD_BLOCK = None
-_ORIGINAL_EXECUTE_AI_OK_ENTRIES_BULK = None
 _ORIGINAL_RANGE_5M_ENTRY_ROW = None
 
 _TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
@@ -292,113 +297,16 @@ def _install_summary_ai_entry_row_range_filter_patch() -> bool:
         return False
 
 
-def _batch_size(default: int = 3) -> int:
-    return max(1, min(_env_int("SUMMARY_AI_EXECUTOR_BATCH_SIZE", default), 3))
+# execute_ai_ok_entries_bulk のrolling-retry(旧_patched_execute_ai_ok_entries_bulk)は
+# trading/entry/summary_ai/executor.py 本体 (REV11) へインライン化済み。
+# その際、rolling-retryが blowoff_prefilter の ai_results フィルタを一切呼ばずに
+# バイパスしていた不具合も修正した（blowoffフィルタを常に先に通すよう修正）。
 
 
 def _install_summary_ai_executor_rolling_retry() -> bool:
-    global _EXECUTOR_PATCHED, _ORIGINAL_EXECUTE_AI_OK_ENTRIES_BULK
-    if _EXECUTOR_PATCHED:
-        return True
-    try:
-        import trading.entry.summary_ai.executor as exec_mod
-
-        cur = getattr(exec_mod, "execute_ai_ok_entries_bulk", None)
-        if not callable(cur):
-            logger.warning("[SUMMARY AI EXECUTOR ROLLING] target not callable version=%s", VERSION)
-            return False
-        if getattr(cur, "_summary_ai_executor_rolling_retry_v34", False):
-            _EXECUTOR_PATCHED = True
-            return True
-
-        _ORIGINAL_EXECUTE_AI_OK_ENTRIES_BULK = cur
-
-        def _patched_execute_ai_ok_entries_bulk(
-            ai_results,
-            *,
-            df_summary,
-            interval=1,
-            max_entries=3,
-            dry_run=True,
-            require_market_open=True,
-            entry_pipeline=None,
-        ):
-            if not _env_bool("SUMMARY_AI_EXECUTOR_ROLLING_RETRY", True):
-                return _ORIGINAL_EXECUTE_AI_OK_ENTRIES_BULK(
-                    ai_results,
-                    df_summary=df_summary,
-                    interval=interval,
-                    max_entries=max_entries,
-                    dry_run=dry_run,
-                    require_market_open=require_market_open,
-                    entry_pipeline=entry_pipeline,
-                )
-            try:
-                ok_items = [x for x in ai_results if isinstance(x, dict) and bool(x.get("allow"))]
-                kept = exec_mod._filter_blocked_ai_ok_items(ok_items)
-                if not kept:
-                    return {"executed": False, "dry_run": dry_run, "approved_rows": [], "result": None, "skip_reason": "no_ai_ok"}
-                if require_market_open and not exec_mod.is_market_open():
-                    approved_preview = [exec_mod.build_approved_row(x) for x in sorted(kept, key=exec_mod._sort_key, reverse=True)[:_batch_size(max_entries)]]
-                    return {"executed": False, "dry_run": dry_run, "approved_rows": approved_preview, "result": None, "skip_reason": "market_closed"}
-                if dry_run:
-                    approved_preview = [exec_mod.build_approved_row(x) for x in sorted(kept, key=exec_mod._sort_key, reverse=True)[:_batch_size(max_entries)]]
-                    return {"executed": False, "dry_run": True, "approved_rows": approved_preview, "result": None, "skip_reason": "dry_run"}
-                if entry_pipeline is None:
-                    entry_pipeline = exec_mod.get_bulk_entry_pipeline()
-                if entry_pipeline is None:
-                    return {"executed": False, "dry_run": False, "approved_rows": [], "result": None, "skip_reason": "entry_pipeline_not_found"}
-
-                batch_n = _batch_size(max_entries)
-                scan_limit = max(batch_n, _env_int("SUMMARY_AI_EXECUTOR_CANDIDATE_SCAN_LIMIT", 12))
-                ordered = sorted(kept, key=exec_mod._sort_key, reverse=True)[:scan_limit]
-                all_rows = []
-                attempts = []
-                logger.warning("[SUMMARY AI EXECUTOR ROLLING] start ok_total=%s kept=%s scan=%s batch=%s interval=%s version=%s", len(ok_items), len(kept), len(ordered), batch_n, interval, VERSION)
-
-                for start in range(0, len(ordered), batch_n):
-                    batch_items = ordered[start:start + batch_n]
-                    approved_rows = [exec_mod.build_approved_row(x) for x in batch_items]
-                    all_rows.extend(approved_rows)
-                    symbols = [str(x.get("symbol")) for x in approved_rows]
-                    logger.warning("[SUMMARY AI EXECUTOR ROLLING] batch start offset=%s size=%s symbols=%s", start, len(approved_rows), symbols)
-                    result = entry_pipeline(approved_rows, df_summary, interval)
-                    executed = exec_mod._positive_result(result)
-                    attempts.append({"offset": start, "symbols": symbols, "executed": executed, "result": exec_mod._summarize_no_order_result(result)})
-                    if executed:
-                        logger.warning("[SUMMARY AI EXECUTOR ROLLING] executed offset=%s symbols=%s result=%s", start, symbols, result)
-                        return {"executed": True, "dry_run": False, "approved_rows": all_rows, "result": result, "skip_reason": None, "attempts": attempts, "rolling_retry": True}
-                    logger.warning("[SUMMARY AI EXECUTOR ROLLING] batch no-order offset=%s symbols=%s detail=%s", start, symbols, exec_mod._summarize_no_order_result(result))
-
-                removed_pending = 0
-                if all_rows:
-                    try:
-                        removed_pending = exec_mod._cleanup_pending_after_no_order(attempts[-1].get("result") if attempts else None, all_rows, reason="entry_pipeline_no_order_all_batches")
-                    except Exception:
-                        logger.exception("[SUMMARY AI EXECUTOR ROLLING] final pending cleanup failed")
-                return {"executed": False, "dry_run": False, "approved_rows": all_rows, "result": attempts[-1].get("result") if attempts else None, "skip_reason": "entry_pipeline_no_order_all_batches", "attempts": attempts, "pending_removed": removed_pending, "rolling_retry": True}
-            except Exception:
-                logger.exception("[SUMMARY AI EXECUTOR ROLLING] patched executor failed; fallback original version=%s", VERSION)
-                return _ORIGINAL_EXECUTE_AI_OK_ENTRIES_BULK(
-                    ai_results,
-                    df_summary=df_summary,
-                    interval=interval,
-                    max_entries=max_entries,
-                    dry_run=dry_run,
-                    require_market_open=require_market_open,
-                    entry_pipeline=entry_pipeline,
-                )
-
-        _patched_execute_ai_ok_entries_bulk._summary_ai_executor_rolling_retry_v33 = True  # type: ignore[attr-defined]
-        _patched_execute_ai_ok_entries_bulk._summary_ai_executor_rolling_retry_v34 = True  # type: ignore[attr-defined]
-        _patched_execute_ai_ok_entries_bulk._original = cur  # type: ignore[attr-defined]
-        exec_mod.execute_ai_ok_entries_bulk = _patched_execute_ai_ok_entries_bulk
-        _EXECUTOR_PATCHED = True
-        logger.warning("[SUMMARY AI EXECUTOR ROLLING] installed version=%s", VERSION)
-        return True
-    except Exception:
-        logger.exception("[SUMMARY AI EXECUTOR ROLLING] install failed version=%s", VERSION)
-        return False
+    global _EXECUTOR_PATCHED
+    _EXECUTOR_PATCHED = True
+    return True
 
 
 def _install_blowoff_prefilter() -> bool:

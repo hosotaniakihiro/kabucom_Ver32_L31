@@ -1,9 +1,15 @@
 # ============================================================
 # File   : core/startup/summary_ai_async_entry_patch.py
-# Version: Ver12-LOCK-TIMEOUT-RETRY-AND-DIRECT-SNAPSHOT
+# Version: Ver13-EXECUTOR-QUEUE-INLINED
 # ------------------------------------------------------------
 # SUMMARY AI の実発注を非同期化し、entry_controller の lock 競合時も
 # retryable として扱う runtime patch。
+#
+# Ver13:
+#   - execute_ai_ok_entries_bulk の sync/queue+worker ディスパッチ部分は
+#     trading/entry/summary_ai/executor.py 本体 (REV11) へインライン化したため、
+#     ここでの差し替えと専用queue/workerスレッドは撤去した
+#     (execute_entry_pipeline の direct snapshot 差し替えは維持)。
 #
 # Ver12:
 #   - reason_chain に entry_controller_lock_timeout が含まれる場合は、
@@ -19,20 +25,14 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
-import threading
 import time
-from collections import defaultdict, deque
+from collections import defaultdict
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 _INSTALLED = False
-_ORIG_EXECUTE = None
 _ORIG_SUMMARY_ENTRY_PIPELINE = None
-_ASYNC_LOCK = threading.Lock()
-_QUEUE: deque[dict[str, Any]] = deque()
-_WORKER_RUNNING = False
-_SEQ = 0
 
 os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY", "1")
 os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC", "0")
@@ -83,13 +83,6 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
-def _safe_len(v: Any) -> int:
-    try:
-        return len(v) if v is not None else 0
-    except Exception:
-        return 0
-
-
 def _norm_symbol(v: Any) -> str:
     try:
         s = str(v or "").strip()
@@ -113,142 +106,6 @@ def _symbols(rows: Any, limit: int = 20) -> list[str]:
     except Exception:
         pass
     return out
-
-
-def _unwrap_result(result: Any) -> Any:
-    cur = result
-    try:
-        for _ in range(12):
-            if isinstance(cur, dict) and isinstance(cur.get("result"), dict):
-                cur = cur.get("result")
-                continue
-            if isinstance(cur, dict) and isinstance(cur.get("pipeline_result"), dict):
-                cur = cur.get("pipeline_result")
-                continue
-            break
-    except Exception:
-        return result
-    return cur
-
-
-def _skip_reason(result: Any) -> str:
-    reasons: list[str] = []
-    try:
-        cur = result
-        for _ in range(16):
-            if not isinstance(cur, dict):
-                break
-            for k in ("skip_reason", "lock_wait_reason", "reason", "status"):
-                r = cur.get(k)
-                if r:
-                    reasons.append(str(r))
-            nxt = cur.get("result") or cur.get("pipeline_result")
-            if not isinstance(nxt, dict):
-                break
-            cur = nxt
-    except Exception:
-        pass
-    return "|".join(reasons)
-
-
-def _pending_counts(result: Any) -> tuple[int, int]:
-    try:
-        cur = result
-        for _ in range(12):
-            if isinstance(cur, dict):
-                before = cur.get("pending_count_before")
-                after = cur.get("pending_count_after")
-                if before is not None or after is not None:
-                    return int(before or 0), int(after or 0)
-                root = cur.get("pending_root")
-                if isinstance(root, dict) and root:
-                    return 0, sum(int(v or 0) for v in root.values() if isinstance(v, int) or str(v).isdigit())
-                cur = cur.get("result") or cur.get("pipeline_result")
-                continue
-            break
-    except Exception:
-        pass
-    return 0, 0
-
-
-def _is_retryable_controller_busy(result: Any) -> bool:
-    """lock_timeout を最優先で retryable 扱いにする。
-
-    旧版は reason_chain に entry_controller_lock_timeout があっても、
-    上位に entry_pipeline_no_order / summary_entry_executor_no_order があると
-    hard_no_retry で止めていた。これが実発注再試行されない主因。
-    """
-    try:
-        text = _skip_reason(result).lower()
-        unwrapped = _unwrap_result(result)
-        retryable = bool(unwrapped.get("retryable")) if isinstance(unwrapped, dict) else False
-        retry_markers = (
-            "entry_controller_lock_timeout",
-            "lock_timeout",
-            "pipeline_busy",
-            "already_running",
-            "queued_async",
-            "pending_moved_without_order",
-            "order_id_empty_retryable",
-        )
-        if retryable or any(x in text for x in retry_markers):
-            return True
-        hard_no_retry = (
-            "snapshot_no_ai_approved_candidates",
-            "no_tradable_rows_after_filters",
-            "market_closed",
-            "risk_guard_ng",
-            "ai_health_ng",
-            "index_shock",
-        )
-        if any(x in text for x in hard_no_retry):
-            return False
-        before, after = _pending_counts(result)
-        if isinstance(result, dict) and not bool(result.get("executed")) and (before > 0 or after > 0):
-            return True
-    except Exception:
-        return False
-    return False
-
-
-def _summarize_result(result: Any) -> dict[str, Any]:
-    try:
-        if isinstance(result, dict):
-            return {
-                "executed": bool(result.get("executed")),
-                "submitted_async": bool(result.get("submitted_async")),
-                "skip_reason": result.get("skip_reason"),
-                "approved": _safe_len(result.get("approved_rows")),
-                "retryable_controller_busy": _is_retryable_controller_busy(result),
-                "reason_chain": _skip_reason(result),
-                "result_type": type(result.get("result")).__name__,
-                "result": result.get("result"),
-            }
-        return {"result_type": type(result).__name__, "result": result}
-    except Exception as e:
-        return {"summary_error": str(e), "result_type": type(result).__name__}
-
-
-def _market_open_now() -> bool:
-    try:
-        from trading.entry.summary_ai import executor as exec_mod
-        is_open = getattr(exec_mod, "is_market_open", None)
-        if callable(is_open):
-            return bool(is_open())
-    except Exception:
-        logger.debug("[SUMMARY AI ASYNC ENTRY] market open check failed", exc_info=True)
-    return True
-
-
-def _build_approved_rows(ai_results: Any, max_entries: int) -> list[Any]:
-    try:
-        from trading.entry.summary_ai import executor as exec_mod
-        fn = getattr(exec_mod, "build_ai_ok_approved_rows", None)
-        if callable(fn):
-            return list(fn(ai_results, max_entries=max_entries) or [])
-    except Exception:
-        logger.exception("[SUMMARY AI ASYNC ENTRY] build approved rows failed")
-    return []
 
 
 def _entries_to_list(entries: Any) -> list[dict[str, Any]]:
@@ -443,103 +300,13 @@ def _install_summary_entry_snapshot_patch() -> bool:
         return False
 
 
-def _execute_original(item: dict[str, Any]) -> Any:
-    return _ORIG_EXECUTE(item["ai_results"], df_summary=item["df_summary"], interval=item["interval"], max_entries=item["max_entries"], dry_run=False, require_market_open=item["require_market_open"], entry_pipeline=item["entry_pipeline"])
-
-
-def _run_worker_loop() -> None:
-    global _WORKER_RUNNING
-    while True:
-        with _ASYNC_LOCK:
-            if not _QUEUE:
-                _WORKER_RUNNING = False
-                logger.info("[SUMMARY AI ASYNC ENTRY] queue worker idle")
-                return
-            item = _QUEUE.popleft()
-            q_left = len(_QUEUE)
-        seq = item["seq"]
-        interval = item["interval"]
-        approved_rows = item.get("approved_rows") or []
-        started = time.time()
-        queued_at = float(item.get("queued_at") or started)
-        stale_sec = _env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 20.0)
-        try:
-            if stale_sec > 0 and time.time() - queued_at > stale_sec:
-                logger.warning("[SUMMARY AI ASYNC ENTRY] worker skip stale seq=%s interval=%s approved=%s symbols=%s", seq, interval, len(approved_rows), _symbols(approved_rows))
-                continue
-            if bool(item.get("require_market_open")) and not _market_open_now():
-                logger.warning("[SUMMARY AI ASYNC ENTRY] worker skip market_closed seq=%s interval=%s approved=%s symbols=%s", seq, interval, len(approved_rows), _symbols(approved_rows))
-                continue
-            if not callable(_ORIG_EXECUTE):
-                logger.warning("[SUMMARY AI ASYNC ENTRY] worker original executor missing seq=%s", seq)
-                continue
-            retry_enabled = _env_bool("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY", True)
-            retry_max = max(1, _env_int("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX", 3))
-            retry_sleep = max(0.2, _env_float("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_SLEEP_SEC", 1.0))
-            result: Any = None
-            for attempt in range(1, retry_max + 1):
-                attempt_started = time.time()
-                logger.warning("[SUMMARY AI ASYNC ENTRY] worker start seq=%s interval=%s attempt=%s/%s approved=%s symbols=%s queue_left=%s", seq, interval, attempt, retry_max, len(approved_rows), _symbols(approved_rows), q_left)
-                result = _execute_original(item)
-                summary = _summarize_result(result)
-                logger.warning("[SUMMARY AI ASYNC ENTRY] worker attempt done seq=%s interval=%s attempt=%s/%s elapsed=%.3fs summary=%s", seq, interval, attempt, retry_max, time.time() - attempt_started, summary)
-                if bool(summary.get("executed")):
-                    break
-                if not retry_enabled or not _is_retryable_controller_busy(result):
-                    break
-                if stale_sec > 0 and time.time() - queued_at + retry_sleep > stale_sec:
-                    logger.warning("[SUMMARY AI ASYNC ENTRY] retry stop stale risk seq=%s attempt=%s", seq, attempt)
-                    break
-                if attempt < retry_max:
-                    logger.warning("[SUMMARY AI ASYNC ENTRY] retry because controller busy seq=%s next_attempt=%s sleep=%.2fs symbols=%s reason_chain=%s", seq, attempt + 1, retry_sleep, _symbols(approved_rows), summary.get("reason_chain"))
-                    time.sleep(retry_sleep)
-            logger.warning("[SUMMARY AI ASYNC ENTRY] worker done seq=%s interval=%s elapsed=%.3fs final_summary=%s", seq, interval, time.time() - started, _summarize_result(result))
-        except Exception as e:
-            logger.exception("[SUMMARY AI ASYNC ENTRY] worker failed seq=%s err=%s", seq, e)
-
-
-def _ensure_worker_started() -> None:
-    global _WORKER_RUNNING
-    with _ASYNC_LOCK:
-        if _WORKER_RUNNING:
-            return
-        _WORKER_RUNNING = True
-    threading.Thread(target=_run_worker_loop, name="SummaryAiAsyncEntry", daemon=True).start()
-
-
-def _patched_execute_ai_ok_entries_bulk(ai_results, *, df_summary=None, interval=1, max_entries=3, dry_run=False, require_market_open=True, entry_pipeline=None):
-    global _SEQ
-    if dry_run or not _env_bool("SUMMARY_AI_ASYNC_ENTRY", True):
-        if callable(_ORIG_EXECUTE):
-            return _ORIG_EXECUTE(ai_results, df_summary=df_summary, interval=interval, max_entries=max_entries, dry_run=dry_run, require_market_open=require_market_open, entry_pipeline=entry_pipeline)
-        return {"executed": False, "submitted_async": False, "skip_reason": "original_executor_missing", "approved_rows": [], "result": None}
-
-    approved_rows = _build_approved_rows(ai_results, max_entries=max_entries)
-    if not approved_rows:
-        return {"executed": False, "submitted_async": False, "dry_run": False, "approved_rows": [], "result": None, "skip_reason": "no_ai_ok"}
-    if require_market_open and not _market_open_now():
-        return {"executed": False, "submitted_async": False, "dry_run": False, "approved_rows": approved_rows, "result": None, "skip_reason": "market_closed"}
-    if _env_bool("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC", False):
-        return _ORIG_EXECUTE(ai_results, df_summary=df_summary, interval=interval, max_entries=max_entries, dry_run=False, require_market_open=require_market_open, entry_pipeline=entry_pipeline)
-
-    queue_max = max(1, min(_env_int("SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX", 1), 3))
-    with _ASYNC_LOCK:
-        dropped = 0
-        while len(_QUEUE) >= queue_max:
-            _QUEUE.popleft(); dropped += 1
-        _SEQ += 1
-        seq = _SEQ
-        _QUEUE.append({"seq": seq, "queued_at": time.time(), "ai_results": ai_results, "df_summary": df_summary, "interval": interval, "max_entries": max_entries, "require_market_open": require_market_open, "entry_pipeline": entry_pipeline, "approved_rows": approved_rows})
-        q_size = len(_QUEUE)
-    _ensure_worker_started()
-    if dropped:
-        logger.warning("[SUMMARY AI ASYNC ENTRY] queued latest and dropped old count=%s seq=%s interval=%s", dropped, seq, interval)
-    logger.warning("[SUMMARY AI ASYNC ENTRY] queued seq=%s interval=%s approved=%s symbols=%s queue_size=%s stale_sec=%.3f direct_sync=False executed=False submitted_async=True retry_busy=%s retry_max=%s retry_sleep=%.2f snapshot_direct=%s", seq, interval, len(approved_rows), _symbols(approved_rows), q_size, _env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 20.0), _env_bool("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY", True), _env_int("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX", 3), _env_float("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_SLEEP_SEC", 1.0), _env_bool("SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT", True))
-    return {"executed": False, "submitted_async": True, "queued_async": True, "async_seq": seq, "queue_size": q_size, "dry_run": False, "approved_rows": approved_rows, "result": {"status": "queued_async", "seq": seq, "queue_size": q_size}, "skip_reason": "queued_async"}
+# execute_ai_ok_entries_bulk の sync/queue+worker ディスパッチ
+# (旧 _patched_execute_ai_ok_entries_bulk / _run_worker_loop) は
+# trading/entry/summary_ai/executor.py 本体 (REV11) へインライン化済み。
 
 
 def install() -> bool:
-    global _INSTALLED, _ORIG_EXECUTE
+    global _INSTALLED
     if _INSTALLED:
         return True
     try:
@@ -549,22 +316,8 @@ def install() -> bool:
         if _env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 20.0) > 20:
             os.environ["SUMMARY_AI_ASYNC_ENTRY_STALE_SEC"] = "20"
         _install_summary_entry_snapshot_patch()
-        from trading.entry.summary_ai import executor as exec_mod
-        from trading.entry.summary_ai import runner as runner_mod
-        current = getattr(exec_mod, "execute_ai_ok_entries_bulk", None)
-        if getattr(current, "_summary_ai_async_entry_patch_v12", False):
-            _INSTALLED = True
-            return True
-        _ORIG_EXECUTE = getattr(current, "_original", None) if getattr(current, "_summary_ai_async_entry_patch_v8", False) else current
-        if not callable(_ORIG_EXECUTE):
-            _ORIG_EXECUTE = current
-        _patched_execute_ai_ok_entries_bulk._summary_ai_async_entry_patch_v12 = True  # type: ignore[attr-defined]
-        _patched_execute_ai_ok_entries_bulk._summary_ai_async_entry_patch_v11 = True  # type: ignore[attr-defined]
-        _patched_execute_ai_ok_entries_bulk._original = _ORIG_EXECUTE  # type: ignore[attr-defined]
-        exec_mod.execute_ai_ok_entries_bulk = _patched_execute_ai_ok_entries_bulk
-        runner_mod.execute_ai_ok_entries_bulk = _patched_execute_ai_ok_entries_bulk
         _INSTALLED = True
-        logger.warning("[SUMMARY AI ASYNC ENTRY] installed v12 enabled=%s direct_sync=%s queue_max=%s stale_sec=%.3f retry_busy=%s retry_max=%s retry_sleep=%.2f snapshot_direct=%s reentrant_lock=%s", _env_bool("SUMMARY_AI_ASYNC_ENTRY", True), _env_bool("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC", False), _env_int("SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX", 1), _env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 20.0), _env_bool("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY", True), _env_int("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX", 3), _env_float("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_SLEEP_SEC", 1.0), _env_bool("SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT", True), _env_bool("SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK", True))
+        logger.warning("[SUMMARY AI ASYNC ENTRY] installed v13 (executor dispatch inlined) direct_sync=%s snapshot_direct=%s reentrant_lock=%s", _env_bool("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC", False), _env_bool("SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT", True), _env_bool("SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK", True))
         return True
     except Exception:
         logger.exception("[SUMMARY AI ASYNC ENTRY] install failed")
