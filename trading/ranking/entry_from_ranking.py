@@ -1,9 +1,14 @@
 # ============================================================
 # File   : trading/ranking/entry_from_ranking.py
-# Ver    : RANKING-ONLY-ENTRY-v5.2.0-FAST-PREFILTER
+# Ver    : RANKING-ONLY-ENTRY-v5.3.0-MIN-PENDING-ON-TIMEOUT-INLINE
 # ------------------------------------------------------------
 # ✔ ranking_snapshot / ranking_raw → pending 生成の唯一の入口
 # ✔ ランキング表示情報と、そこから算出できる数値だけで ENTRY 判定
+# ✔ Ver5.3.0:
+#     - core/startup/ranking_entry_min_pending_on_timeout_patch.py の
+#       budget/grace deadline ロジックを本体へインライン化。
+#       スコアリング・pending追加の両ループにタイムアウト予算を設け、
+#       強い候補が見つかっているのに created=0 で終わる事象を防止する。
 # ✔ Ver5.2.0:
 #     - latest_ranking_df が 1000件超の時、全件にテクニカル保存/attachを走らせて
 #       20秒timeoutしていた問題を修正
@@ -17,6 +22,7 @@ from __future__ import annotations
 import logging
 import datetime as dt
 import os
+import time
 from collections import Counter
 from typing import Dict, Any, Optional, Tuple, List
 
@@ -89,6 +95,16 @@ def _env_bool(name: str, default: bool) -> bool:
         return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
     except Exception:
         return bool(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
 
 
 def _now() -> dt.datetime:
@@ -297,8 +313,36 @@ def _infer_side(row: Dict[str, Any]) -> str:
     return "SELL" if day_change < 0 else "BUY"
 
 
+def _prefilter_rank_type_weight(rt: str) -> float:
+    s = str(rt or "")
+    if "値上" in s or "値下" in s:
+        return 1.20
+    if "売買代金" in s:
+        return 1.10
+    if "TICK" in s.upper() or "ティック" in s:
+        return 1.00
+    if "出来高" in s or "売買高" in s:
+        return 0.95
+    return 0.80
+
+
+def _prefilter_row_priority(row: Dict[str, Any]) -> tuple:
+    rank = _safe_int(row.get("rank_position") or row.get("rank"), 999999)
+    turnover = _safe_float(row.get("turnover") or row.get("trading_value"), 0.0)
+    volume = _safe_float(row.get("volume") or row.get("trading_volume"), 0.0)
+    day_abs = abs(_safe_float(row.get("day_change_pct"), 0.0))
+    rt_w = _prefilter_rank_type_weight(str(row.get("rank_type") or ""))
+    return (rank, -rt_w, -turnover, -volume, -day_abs)
+
+
 def _light_prefilter_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """重いtechnical保存/attach前に、明らかに対象外の行を削る。"""
+    """重いtechnical保存/attach前に、明らかに対象外の行を削る。
+
+    旧 core/startup/ranking_entry_fast_runtime_patch.py (V5) の_ultra_prefilter_rowsを
+    インライン化した高速版。latest_ranking_df が1000件超の時に元の(全件ソート+全件走査の)
+    実装が20秒以上timeoutしていたため、走査自体をRANKING_ENTRY_ULTRA_MAX_SOURCE_ROWS件で
+    打ち切り、必要数(RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS)集まった時点で止める。
+    """
     if not _env_bool("RANKING_ENTRY_PREFILTER_ENABLED", True):
         return rows
 
@@ -307,16 +351,20 @@ def _light_prefilter_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     cfg_price = RANKING_ENTRY_CONFIG["PRICE"]
     cfg_move = RANKING_ENTRY_CONFIG["PRICE_MOVE"]
 
+    max_source = max(100, _env_int("RANKING_ENTRY_ULTRA_MAX_SOURCE_ROWS", 600))
+    max_rows = max(5, _env_int("RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS", 40))
     max_rank = _env_int("RANKING_ENTRY_PREFILTER_MAX_RANK", int(cfg_rank.get("MAX_RANK_POSITION", 30)))
-    max_rows = _env_int("RANKING_ENTRY_PREFILTER_MAX_ROWS", 240)
-    max_per_type = _env_int("RANKING_ENTRY_PREFILTER_MAX_PER_TYPE", 40)
-    max_per_side = _env_int("RANKING_ENTRY_PREFILTER_MAX_PER_SIDE", 160)
+    max_per_type = max(3, _env_int("RANKING_ENTRY_FAST_MAX_PER_TYPE", 10))
+    max_per_side = max(3, _env_int("RANKING_ENTRY_FAST_MAX_PER_SIDE", 22))
     min_price = _safe_float(cfg_price.get("MIN", 300), 300)
     max_price = _safe_float(cfg_price.get("MAX", 7000), 7000)
     min_volume = _safe_float(cfg_vol.get("MIN_VOLUME", 30000), 30000)
     min_turnover = _safe_float(cfg_vol.get("MIN_TURNOVER", 10000000), 10000000)
     max_day = abs(_safe_float(cfg_move.get("MAX_DAY_CHANGE_PCT", 10.0), 10.0))
+    buy_min_day = _safe_float(cfg_move.get("BUY_MIN_DAY_CHANGE_PCT", 0.0), 0.0)
+    sell_max_day = _safe_float(cfg_move.get("SELL_MAX_DAY_CHANGE_PCT", 0.0), 0.0)
 
+    ordered = sorted([dict(r) for r in rows[:max_source]], key=_prefilter_row_priority)
     kept: List[Dict[str, Any]] = []
     rejects = Counter()
     samples: List[Dict[str, Any]] = []
@@ -326,27 +374,17 @@ def _light_prefilter_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
     def _sample_reject(reason: str, row: Dict[str, Any]) -> None:
         rejects[reason] += 1
-        if len(samples) < 20:
+        if len(samples) < 10:
             samples.append({
                 "symbol": row.get("symbol"),
                 "rank_type": row.get("rank_type"),
                 "rank": row.get("rank_position"),
-                "price": row.get("price"),
+                "price": row.get("price") or row.get("current_price"),
                 "volume": row.get("volume"),
                 "turnover": row.get("turnover"),
                 "day_change_pct": row.get("day_change_pct"),
                 "reason": reason,
             })
-
-    # rankの良い順、出来高/代金の大きい順を優先。
-    ordered = sorted(
-        rows,
-        key=lambda r: (
-            _safe_int(r.get("rank_position"), 999999),
-            -_safe_float(r.get("turnover"), 0.0),
-            -_safe_float(r.get("volume"), 0.0),
-        ),
-    )
 
     for row in ordered:
         symbol = str(row.get("symbol") or "").strip()
@@ -354,6 +392,9 @@ def _light_prefilter_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         side = _infer_side(row)
         row["side"] = side
         key = (symbol, side, rank_type)
+        if not symbol:
+            _sample_reject("NO_SYMBOL", row)
+            continue
         if key in seen:
             _sample_reject("DUP_SYMBOL_SIDE_TYPE", row)
             continue
@@ -380,10 +421,10 @@ def _light_prefilter_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if abs(day) > max_day:
             _sample_reject("PREFILTER_DAY_TOO_LARGE", row)
             continue
-        if side == "BUY" and day <= _safe_float(cfg_move.get("BUY_MIN_DAY_CHANGE_PCT", 0.0), 0.0):
+        if side == "BUY" and day <= buy_min_day:
             _sample_reject("PREFILTER_BUY_DAY", row)
             continue
-        if side == "SELL" and day >= _safe_float(cfg_move.get("SELL_MAX_DAY_CHANGE_PCT", 0.0), 0.0):
+        if side == "SELL" and day >= sell_max_day:
             _sample_reject("PREFILTER_SELL_DAY", row)
             continue
         if rank_type not in PREFILTER_PRIORITY_TYPES:
@@ -403,8 +444,8 @@ def _light_prefilter_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             break
 
     logger.warning(
-        "[RANKING ENTRY PREFILTER] before=%s after=%s max_rows=%s max_rank=%s per_type=%s per_side=%s rejects=%s samples=%s",
-        len(rows), len(kept), max_rows, max_rank, dict(per_type), dict(per_side), dict(rejects), samples,
+        "[RANKING ENTRY PREFILTER] before=%s scanned=%s after=%s max_rows=%s max_rank=%s per_type=%s per_side=%s rejects=%s samples=%s",
+        len(rows), min(len(rows), max_source), len(kept), max_rows, max_rank, dict(per_type), dict(per_side), dict(rejects), samples,
     )
     return kept
 
@@ -574,7 +615,18 @@ def _passes_ranking_only_filters(row: Dict[str, Any], side: str, prev_h: Dict[st
 
 def entry_from_ranking():
     started = dt.datetime.now()
-    logger.info("[RANKING ENTRY LOOP] start at=%s mode=RANKING_ONLY", started.strftime("%Y-%m-%d %H:%M:%S"))
+    started_perf = time.perf_counter()
+    budget_sec = max(5.0, _env_float("RANKING_ENTRY_RUNTIME_BUDGET_SEC", 18.0))
+    add_grace = max(0.0, min(_env_float("RANKING_ENTRY_MIN_PENDING_GRACE_SEC", 8.0), 15.0))
+    deadline = started_perf + budget_sec
+    add_deadline = deadline + add_grace
+    max_pending = max(1, _env_int("RANKING_ENTRY_MAX_PENDING_PER_RUN", 5))
+    min_force_score = _env_float("RANKING_ENTRY_MIN_PENDING_FORCE_SCORE", 70.0)
+
+    logger.info(
+        "[RANKING ENTRY LOOP] start at=%s mode=RANKING_ONLY budget_sec=%.1f add_grace=%.1f max_pending=%s",
+        started.strftime("%Y-%m-%d %H:%M:%S"), budget_sec, add_grace, max_pending,
+    )
     if not is_time_allowed(started):
         logger.info("[RANKING ENTRY LOOP] skip reason=TIME_GUARD now=%s", started.strftime("%H:%M:%S"))
         return 0
@@ -595,7 +647,11 @@ def entry_from_ranking():
     tech_map: Dict[str, Dict[str, Any]] = {}
     cfg_tech = RANKING_ENTRY_CONFIG.get("TECHNICAL", {}) or {}
     if bool(cfg_tech.get("ENABLED", True)) and callable(save_ranking_pseudo_technicals):
-        tech_map = save_ranking_pseudo_technicals(rows)
+        try:
+            tech_map = save_ranking_pseudo_technicals(rows)
+        except Exception:
+            logger.exception("[RANKING ENTRY LOOP] technical attach failed -> continue without tech")
+            tech_map = {}
         logger.info("[RANKING ENTRY LOOP] ranking_technical attached symbols=%s prefiltered_rows=%s raw_rows=%s", len(tech_map), len(rows), len(rows_all))
 
     created = 0
@@ -608,9 +664,23 @@ def entry_from_ranking():
     best_by_symbol_side: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
     for row in rows:
+        if time.perf_counter() >= deadline and best_by_symbol_side:
+            logger.warning(
+                "[RANKING ENTRY LOOP] stop scoring with candidates elapsed=%.3fs candidates=%s",
+                time.perf_counter() - started_perf, len(best_by_symbol_side),
+            )
+            break
+        if time.perf_counter() >= add_deadline:
+            logger.warning(
+                "[RANKING ENTRY LOOP] hard stop scoring elapsed=%.3fs candidates=%s",
+                time.perf_counter() - started_perf, len(best_by_symbol_side),
+            )
+            break
         if callable(attach_ranking_technicals):
             row = attach_ranking_technicals(row, tech_map)
         symbol = str(row.get("symbol") or "").strip()
+        if not symbol:
+            continue
         side = _infer_side(row)
         row["side"] = side
         current_keys.add(_history_key(symbol, side))
@@ -647,13 +717,31 @@ def entry_from_ranking():
 
     _reset_missing_histories(current_keys)
 
-    for (symbol, side), pack in best_by_symbol_side.items():
+    packs = list(best_by_symbol_side.items())
+    packs.sort(key=lambda kv: _safe_float(kv[1]["row"].get("score_total"), 0.0), reverse=True)
+
+    for (symbol, side), pack in packs:
+        if created >= max_pending:
+            break
+        final_score = _safe_float(pack["row"].get("score_total"), 0.0)
+        if time.perf_counter() >= deadline and created > 0:
+            logger.warning(
+                "[RANKING ENTRY LOOP] stop pending_add after created elapsed=%.3fs created=%s",
+                time.perf_counter() - started_perf, created,
+            )
+            break
+        if time.perf_counter() >= add_deadline and final_score < min_force_score:
+            logger.warning(
+                "[RANKING ENTRY LOOP] hard stop pending_add elapsed=%.3fs created=%s score=%.2f",
+                time.perf_counter() - started_perf, created, final_score,
+            )
+            break
+
         row = pack["row"]
         parts = pack["parts"]
         prev_price = pack["prev_price"]
         prev_rank = pack["prev_rank"]
         consecutive = pack["consecutive"]
-        final_score = _safe_float(row.get("score_total"), 0.0)
         entry_row = build_entry_row(row)
         if not entry_row:
             build_reject += 1
@@ -673,6 +761,7 @@ def entry_from_ranking():
         entry_row["ranking_step_pct"] = parts.get("step_pct")
         entry_row["ranking_rank_improve"] = parts.get("rank_improve")
         entry_row["ranking_score_parts"] = parts
+        entry_row["ranking_min_pending_timeout_rescue"] = bool(time.perf_counter() >= deadline)
         for k in ("ma5", "ma25", "ma75", "rsi", "macd", "signal", "macd_hist", "atr", "slope", "slope_atr_scaled", "vwap", "ranking_tech_score", "ranking_tech_ready", "ranking_tech_reason", "ranking_tech_datetime", "ranking_tech_db"):
             if k in row:
                 entry_row[k] = row.get(k)
@@ -688,23 +777,24 @@ def entry_from_ranking():
         if add_pending(pending_entry):
             created += 1
             logger.info(
-                "[RANKING PENDING ADD] mode=RANKING_ONLY_WITH_TECH symbol=%s side=%s rank_type=%s rank=%s price=%.2f prev_price=%.2f step=%.3f%% day=%.3f%% volume=%.0f turnover=%.0f consecutive=%s rank_improve=%.1f score=%.2f tech=%.2f ma5=%.2f ma25=%.2f rsi=%.2f slope=%.6f",
+                "[RANKING PENDING ADD] mode=RANKING_ONLY_WITH_TECH symbol=%s side=%s rank_type=%s rank=%s price=%.2f prev_price=%.2f step=%.3f%% day=%.3f%% volume=%.0f turnover=%.0f consecutive=%s rank_improve=%.1f score=%.2f tech=%.2f ma5=%.2f ma25=%.2f rsi=%.2f slope=%.6f timeout_rescue=%s",
                 symbol, side, row.get("rank_type"), row.get("rank_position"),
                 _safe_float(row.get("price") or row.get("current_price"), 0.0), prev_price,
                 _safe_float(parts.get("step_pct"), 0.0), _safe_float(row.get("day_change_pct"), 0.0),
                 _safe_float(row.get("volume"), 0.0), _safe_float(row.get("turnover"), 0.0), consecutive,
                 _safe_float(parts.get("rank_improve"), 0.0), final_score, _safe_float(row.get("ranking_tech_score"), 0.0),
                 _safe_float(row.get("ma5"), 0.0), _safe_float(row.get("ma25"), 0.0), _safe_float(row.get("rsi"), 0.0), _safe_float(row.get("slope"), 0.0),
+                entry_row.get("ranking_min_pending_timeout_rescue"),
             )
         else:
             pending_reject += 1
 
-    elapsed = (dt.datetime.now() - started).total_seconds()
+    elapsed = time.perf_counter() - started_perf
     if reject_samples:
         logger.warning("[RANKING ENTRY LOOP] ranking_only_reject_counts=%s samples=%s", dict(reject_counts), reject_samples)
     logger.info(
-        "[RANKING ENTRY LOOP] done mode=RANKING_ONLY_WITH_TECH created=%s raw_total=%s prefiltered=%s candidates=%s filter_reject=%s build_reject=%s pending_reject=%s elapsed=%.3fs",
-        created, len(rows_all), len(rows), len(best_by_symbol_side), filter_reject, build_reject, pending_reject, elapsed,
+        "[RANKING ENTRY LOOP] done mode=RANKING_ONLY_WITH_TECH created=%s raw_total=%s prefiltered=%s candidates=%s filter_reject=%s build_reject=%s pending_reject=%s budget_sec=%.1f add_grace=%.1f elapsed=%.3fs",
+        created, len(rows_all), len(rows), len(best_by_symbol_side), filter_reject, build_reject, pending_reject, budget_sec, add_grace, elapsed,
     )
     return created
 

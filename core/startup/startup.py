@@ -218,12 +218,9 @@ def _install_entrypoint_runtime_patches() -> None:
     except Exception:
         logger.exception("[startup.entrypoint] entry volume direction guard install failed")
 
-    try:
-        from core.startup.ranking_entry_fast_runtime_patch import install as install_ranking_entry_fast_patch
-
-        install_ranking_entry_fast_patch()
-    except Exception:
-        logger.exception("[startup.entrypoint] ranking entry fast patch install failed")
+    # ranking_entry_fast_runtime_patch は trading/ranking/entry_from_ranking.py
+    # (_light_prefilter_rows) と trading/ranking/ranking_technical_store.py
+    # (readonly/memory-cache 版 attach/save) へ本文化済みのため install 呼び出しを削除した。
 
     try:
         from core.startup.tonosama_fast_score_prefilter_patch import install as install_tonosama_fast_score_prefilter

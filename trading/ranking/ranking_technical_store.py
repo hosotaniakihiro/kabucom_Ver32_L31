@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/ranking/ranking_technical_store.py
-# Ver    : RANKING-TECH-STORE-v1.0.0
+# Ver    : RANKING-TECH-STORE-v2.0.0-INLINE-FAST-READONLY-AND-ALIAS
 # ------------------------------------------------------------
 # Purpose:
 #   ランキング由来の現在値を疑似終値として扱い、サマリー本体とは別に
@@ -19,6 +19,15 @@
 #   - volume / turnover / rank 情報も保存
 #   - ma5/ma25/ma75/rsi/macd/signal/hist/atr/slope/vwap 等を計算
 #   - entry_from_ranking.py から呼ばれ、最新テクニカルを row に戻す
+#
+# v2.0.0:
+#   - 旧 core/startup/ranking_entry_fast_runtime_patch.py の
+#     readonly/メモリキャッシュ付き技術lookup (_patched_save_ranking_pseudo_technicals)
+#     とバッチ_load_historyを本文へインライン化。既定でDB書き込み計算をせず、
+#     既存テーブルの直近値を読むだけの高速パスを使う
+#     (RANKING_ENTRY_SKIP_TECH_SAVE=0で従来の書き込みモードに戻せる)。
+#   - 旧 core/startup/ranking_entry_snapshot_technical_alias_patch.py の
+#     snapshot技術列エイリアスコピーを attach_ranking_technicals へインライン化。
 # ============================================================
 
 from __future__ import annotations
@@ -89,6 +98,251 @@ def _safe_int(v: Any, default: int = 0) -> int:
         return int(float(str(v).replace(",", "")))
     except Exception:
         return default
+
+
+def _env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+# ============================================================
+# readonly/cached technical lookup (旧 ranking_entry_fast_runtime_patch.py インライン化)
+# ============================================================
+# entry_from_ranking の1回の実行が数秒のtimeout budget制約下で動くため、
+# 既定では save_ranking_pseudo_technicals は疑似足のDB書き込み計算をせず、
+# 既存のranking_technical_1minテーブルから直近値を読むだけ(readonly)にする。
+# RANKING_ENTRY_SKIP_TECH_SAVE=0 にすると従来の書き込みモードへ戻せる。
+
+os.environ.setdefault("RANKING_ENTRY_SKIP_TECH_SAVE", "1")
+os.environ.setdefault("RANKING_ENTRY_TECH_READONLY", "1")
+os.environ.setdefault("RANKING_ENTRY_TECH_MEMORY_CACHE", "1")
+os.environ.setdefault("RANKING_ENTRY_TECH_CACHE_TTL_SEC", "90")
+os.environ.setdefault("RANKING_ENTRY_TECH_READ_BATCH_SIZE", "40")
+os.environ.setdefault("RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS", "40")
+os.environ.setdefault("RANKING_ENTRY_FAST_MAX_SYMBOLS", "40")
+os.environ.setdefault("RANKING_ENTRY_FAST_MAX_PER_SIDE", "22")
+os.environ.setdefault("RANKING_ENTRY_FAST_MAX_PER_TYPE", "10")
+
+_TECH_MEMORY_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _readonly_side(row: Dict[str, Any]) -> str:
+    s = str(row.get("side") or row.get("entry_decision") or "").upper().strip()
+    if s in {"BUY", "SELL"}:
+        return s
+    rt = str(row.get("rank_type") or "")
+    if "値下" in rt or "下落" in rt:
+        return "SELL"
+    day = _safe_float(row.get("day_change_pct"), 0.0)
+    return "SELL" if day < 0 else "BUY"
+
+
+def _readonly_row_priority(row: Dict[str, Any]) -> tuple:
+    rank = _safe_int(row.get("rank_position") or row.get("rank"), 999999)
+    turnover = _safe_float(row.get("turnover") or row.get("trading_value"), 0.0)
+    volume = _safe_float(row.get("volume") or row.get("trading_volume"), 0.0)
+    day_abs = abs(_safe_float(row.get("day_change_pct"), 0.0))
+    return (rank, -turnover, -volume, -day_abs)
+
+
+def _cap_rows_for_readonly_lookup(rows: List[Dict[str, Any]], *, context: str) -> List[Dict[str, Any]]:
+    max_rows = max(5, _env_int("RANKING_ENTRY_FAST_MAX_PREFILTER_ROWS", 40))
+    max_symbols = max(5, _env_int("RANKING_ENTRY_FAST_MAX_SYMBOLS", 40))
+    max_per_side = max(3, _env_int("RANKING_ENTRY_FAST_MAX_PER_SIDE", 22))
+    if len(rows) <= max_rows:
+        return rows
+    ordered = sorted([dict(r) for r in rows], key=_readonly_row_priority)
+    kept: List[Dict[str, Any]] = []
+    seen_symbols: set = set()
+    seen_symbol_side: set = set()
+    per_side: Dict[str, int] = {}
+    for row in ordered:
+        symbol = str(row.get("symbol") or "").strip()
+        side = _readonly_side(row)
+        if not symbol:
+            continue
+        if (symbol, side) in seen_symbol_side:
+            continue
+        if len(seen_symbols) >= max_symbols and symbol not in seen_symbols:
+            continue
+        if per_side.get(side, 0) >= max_per_side:
+            continue
+        kept.append(row)
+        seen_symbols.add(symbol)
+        seen_symbol_side.add((symbol, side))
+        per_side[side] = per_side.get(side, 0) + 1
+        if len(kept) >= max_rows:
+            break
+    logger.info("[RANKING TECH] readonly lookup row cap context=%s before=%s after=%s", context, len(rows), len(kept))
+    return kept
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    try:
+        r = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+        return bool(r)
+    except Exception:
+        return False
+
+
+def _db_mtime(path: str) -> float:
+    try:
+        return float(os.path.getmtime(path))
+    except Exception:
+        return 0.0
+
+
+def _tech_cache_get(db: str, symbols: List[str]) -> tuple:
+    if not _env_bool("RANKING_ENTRY_TECH_MEMORY_CACHE", True):
+        return {}, symbols, "disabled"
+    now = dt.datetime.now().timestamp()
+    ttl = _env_float("RANKING_ENTRY_TECH_CACHE_TTL_SEC", 90.0)
+    mtime = _db_mtime(db)
+    cache = _TECH_MEMORY_CACHE.get(db)
+    if not cache:
+        return {}, symbols, "empty"
+    if now - float(cache.get("ts") or 0.0) > ttl:
+        return {}, symbols, "ttl_expired"
+    if float(cache.get("mtime") or 0.0) != mtime:
+        return {}, symbols, "db_mtime_changed"
+    items = cache.get("items") or {}
+    if not isinstance(items, dict):
+        return {}, symbols, "invalid"
+    hits = {s: dict(items[s]) for s in symbols if s in items}
+    missing = [s for s in symbols if s not in hits]
+    return hits, missing, "hit" if not missing else "partial"
+
+
+def _tech_cache_put(db: str, items: Dict[str, Dict[str, Any]]) -> None:
+    if not _env_bool("RANKING_ENTRY_TECH_MEMORY_CACHE", True):
+        return
+    try:
+        now = dt.datetime.now().timestamp()
+        mtime = _db_mtime(db)
+        cur = _TECH_MEMORY_CACHE.get(db)
+        if not cur or float(cur.get("mtime") or 0.0) != mtime:
+            cur = {"ts": now, "mtime": mtime, "items": {}}
+        cur_items = cur.setdefault("items", {})
+        if isinstance(cur_items, dict):
+            cur_items.update({str(k): dict(v) for k, v in (items or {}).items()})
+        cur["ts"] = now
+        cur["mtime"] = mtime
+        _TECH_MEMORY_CACHE[db] = cur
+    except Exception:
+        logger.debug("[RANKING TECH] cache put failed", exc_info=True)
+
+
+def _rows_to_tech_map(df: pd.DataFrame, db: str) -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
+    if df is None or df.empty:
+        return result
+    if "datetime" in df.columns:
+        df = df.copy()
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+        df = df.sort_values(["symbol", "datetime"], kind="stable").groupby("symbol", as_index=False).tail(1)
+    for _, r in df.iterrows():
+        sym = str(r.get("symbol") or "").strip()
+        if not sym:
+            continue
+        item = {c: r.get(c) for c in TECH_COLUMNS if c in r.index}
+        item["ranking_tech_datetime"] = r.get("datetime")
+        item["ranking_tech_db"] = db
+        item["ranking_tech_readonly"] = True
+        item["ranking_tech_cacheable"] = True
+        result[sym] = item
+    return result
+
+
+def _read_latest_tech_from_db(db: str, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+    if not symbols:
+        return {}
+    batch_size = max(10, _env_int("RANKING_ENTRY_TECH_READ_BATCH_SIZE", 40))
+    chunks = []
+    with sqlite3.connect(db, timeout=1.5) as conn:
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA busy_timeout=1200")
+        if not _table_exists(conn, TABLE_NAME):
+            logger.warning("[RANKING TECH] readonly tech skipped reason=table_missing db=%s table=%s", db, TABLE_NAME)
+            return {}
+        for i in range(0, len(symbols), batch_size):
+            batch = symbols[i:i + batch_size]
+            placeholders = ",".join(["?"] * len(batch))
+            q = f"""
+                SELECT t.*
+                FROM {TABLE_NAME} t
+                JOIN (
+                    SELECT symbol, MAX(datetime) AS max_dt
+                    FROM {TABLE_NAME}
+                    WHERE symbol IN ({placeholders})
+                    GROUP BY symbol
+                ) m
+                  ON t.symbol = m.symbol
+                 AND t.datetime = m.max_dt
+                WHERE t.symbol IN ({placeholders})
+            """
+            params = tuple(batch) + tuple(batch)
+            part = pd.read_sql_query(q, conn, params=params)
+            if not part.empty:
+                chunks.append(part)
+    if not chunks:
+        return {}
+    return _rows_to_tech_map(pd.concat(chunks, ignore_index=True), db)
+
+
+def _latest_existing_technicals(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    try:
+        rows = _cap_rows_for_readonly_lookup(rows, context="before_readonly_tech")
+        symbols = [str(r.get("symbol") or "").strip() for r in rows]
+        symbols = [s for s in dict.fromkeys(symbols) if s]
+        if not symbols:
+            return {}
+        db = _db_path()
+        if not db or not os.path.exists(db):
+            logger.warning("[RANKING TECH] readonly tech skipped reason=db_missing db=%s symbols=%s", db, len(symbols))
+            return {}
+        t0 = dt.datetime.now().timestamp()
+        cached, missing, cache_state = _tech_cache_get(db, symbols)
+        if cached and not missing:
+            logger.info("[RANKING TECH] readonly tech cache hit symbols=%s hit=%s db=%s", len(symbols), len(cached), db)
+            return cached
+        db_items = _read_latest_tech_from_db(db, missing if cached else symbols)
+        if db_items:
+            _tech_cache_put(db, db_items)
+        result = dict(cached)
+        result.update(db_items)
+        logger.info(
+            "[RANKING TECH] readonly tech loaded symbols=%s hit=%s cache=%s db_read=%s db=%s elapsed=%.3fs",
+            len(symbols), len(result), cache_state, len(db_items), db, dt.datetime.now().timestamp() - t0,
+        )
+        return result
+    except Exception:
+        logger.exception("[RANKING TECH] readonly tech load failed")
+        return {}
 
 
 def _first(row: Dict[str, Any], keys: Iterable[str], default: Any = None) -> Any:
@@ -284,24 +538,34 @@ def _upsert_basic_bars(conn: sqlite3.Connection, bars: pd.DataFrame) -> None:
 
 
 def _load_history(conn: sqlite3.Connection, symbols: List[str], lookback_rows: int = 120) -> pd.DataFrame:
-    if not symbols:
+    """symbolごとに1クエリではなく、バッチIN句でまとめて読む高速版。
+
+    旧 core/startup/ranking_entry_fast_runtime_patch.py の_patched_load_historyを
+    インライン化。symbol数が多いとsymbolごとの逐次クエリが遅くなるため、
+    RANKING_ENTRY_FAST_HISTORY_BATCH_SIZE件ずつIN句でまとめて読む。
+    """
+    try:
+        symbols = [str(s) for s in dict.fromkeys(symbols or []) if str(s).strip()]
+        if not symbols:
+            return pd.DataFrame()
+        batch_size = max(10, _env_int("RANKING_ENTRY_FAST_HISTORY_BATCH_SIZE", 40))
+        lookback_rows = min(int(lookback_rows or 30), _env_int("RANKING_ENTRY_FAST_TECH_LOOKBACK_ROWS", 30))
+        chunks = []
+        for i in range(0, len(symbols), batch_size):
+            batch = symbols[i:i + batch_size]
+            placeholders = ",".join(["?"] * len(batch))
+            q = f"SELECT * FROM {TABLE_NAME} WHERE symbol IN ({placeholders}) ORDER BY symbol ASC, datetime DESC"
+            part = pd.read_sql_query(q, conn, params=tuple(batch))
+            if not part.empty:
+                chunks.append(part.groupby("symbol", group_keys=False).head(int(lookback_rows)))
+        if not chunks:
+            return pd.DataFrame()
+        df = pd.concat(chunks, ignore_index=True)
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+        return df.dropna(subset=["datetime"]).sort_values(["symbol", "datetime"], kind="stable")
+    except Exception:
+        logger.exception("[RANKING TECH] batch load_history failed")
         return pd.DataFrame()
-    chunks = []
-    for symbol in symbols:
-        q = f"""
-            SELECT * FROM {TABLE_NAME}
-            WHERE symbol = ?
-            ORDER BY datetime DESC
-            LIMIT ?
-        """
-        part = pd.read_sql_query(q, conn, params=(symbol, int(lookback_rows)))
-        if not part.empty:
-            chunks.append(part)
-    if not chunks:
-        return pd.DataFrame()
-    df = pd.concat(chunks, ignore_index=True)
-    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
-    return df.dropna(subset=["datetime"]).sort_values(["symbol", "datetime"], kind="stable")
 
 
 def _calc_one_symbol(g: pd.DataFrame) -> pd.DataFrame:
@@ -467,7 +731,18 @@ def save_ranking_pseudo_technicals(rows: List[Dict[str, Any]], lookback_rows: in
     """
     ランキング rows から疑似終値テクニカルを計算・保存し、最新値を symbol map で返す。
     失敗してもエントリー本体を止めない。
+
+    旧 core/startup/ranking_entry_fast_runtime_patch.py の
+    _patched_save_ranking_pseudo_technicals をインライン化。entry_from_ranking の
+    1回の実行がtimeout budget制約下で動くため、既定(RANKING_ENTRY_SKIP_TECH_SAVE=1)では
+    DB書き込み計算をせず、既存テーブルから直近値を読むだけ(readonly, メモリキャッシュ付き)にする。
     """
+    rows = _cap_rows_for_readonly_lookup(rows, context="before_save_technical")
+    if _env_bool("RANKING_ENTRY_SKIP_TECH_SAVE", True):
+        t0 = dt.datetime.now().timestamp()
+        ret = _latest_existing_technicals(rows) if _env_bool("RANKING_ENTRY_TECH_READONLY", True) else {}
+        logger.info("[RANKING TECH] technical save skipped rows=%s readonly_hit=%s elapsed=%.3fs", len(rows), len(ret or {}), dt.datetime.now().timestamp() - t0)
+        return ret
     try:
         bars = _rows_to_bars(rows)
         if bars.empty:
@@ -511,6 +786,79 @@ def save_ranking_pseudo_technicals(rows: List[Dict[str, Any]], lookback_rows: in
         return {}
 
 
+_SNAPSHOT_ALIAS_MAP = {
+    "ma5": ("ma5_1m", "disp_ma5", "display_ma5"),
+    "ma25": ("ma25_1m", "disp_ma25", "display_ma25"),
+    "ma75": ("ma75_1m", "disp_ma75", "display_ma75"),
+    "rsi": ("rsi_1m", "disp_rsi"),
+    "macd": ("macd_1m", "disp_macd"),
+    "signal": ("signal_1m", "macd_signal_1m", "disp_signal"),
+    "macd_hist": ("macd_hist_1m", "hist_1m", "disp_macd_hist"),
+    "atr": ("atr_1m", "disp_atr"),
+    "slope": ("slope_1m", "ma5_slope_1m", "slope_pct_1m", "disp_slope"),
+    "slope_atr_scaled": ("slope_atr_scaled_1m", "disp_slope_atr_scaled"),
+    "vwap": ("vwap_1m", "disp_vwap"),
+    "price_change_pct": ("price_change_pct_1m", "change_percentage", "change_rate"),
+    "volume_ratio5": ("volume_ratio5_1m",),
+}
+
+
+def _snapshot_alias_is_blank(v: Any) -> bool:
+    try:
+        if v is None:
+            return True
+        s = str(v).strip()
+        return s == "" or s.lower() in {"nan", "none", "nat", "<na>"}
+    except Exception:
+        return True
+
+
+def _copy_snapshot_technical_aliases(row: Dict[str, Any]) -> Dict[str, Any]:
+    """旧 core/startup/ranking_entry_snapshot_technical_alias_patch.py をインライン化。
+
+    ranking_technical_1min テーブルが無い/未整備な日でも、ranking_snapshot_1min 側に
+    既に ma5_1m/ma25_1m/macd_1m/slope_1m 等の技術列があれば、それを entry_controller の
+    ガードが参照する無サフィックス名 (ma5/ma25/...) へエイリアスコピーする。
+    """
+    out = dict(row or {})
+    for dst, srcs in _SNAPSHOT_ALIAS_MAP.items():
+        cur = out.get(dst)
+        if not _snapshot_alias_is_blank(cur) and _safe_float(cur, 0.0) != 0.0:
+            continue
+        for src in srcs:
+            if src in out and not _snapshot_alias_is_blank(out.get(src)):
+                out[dst] = out.get(src)
+                break
+
+    close = _safe_float(out.get("close") or out.get("close_price") or out.get("current_price") or out.get("price"), 0.0)
+    ma5 = _safe_float(out.get("ma5"), 0.0)
+    ma25 = _safe_float(out.get("ma25"), 0.0)
+    slope = _safe_float(out.get("slope"), 0.0)
+    macd = _safe_float(out.get("macd"), 0.0)
+    signal = _safe_float(out.get("signal"), 0.0)
+    atr = _safe_float(out.get("atr"), 0.0)
+    rsi = _safe_float(out.get("rsi"), 50.0)
+
+    ready = int(close > 0 and (ma5 > 0 or ma25 > 0 or abs(slope) > 0 or abs(macd) > 0 or atr > 0))
+    if ready:
+        out["ranking_tech_ready"] = 1
+        out["ranking_tech_reason"] = "snapshot_alias"
+        score = 0.0
+        if close > 0 and ma5 > 0:
+            score += min(20.0, abs(close - ma5) / close * 1000.0)
+        if ma5 > 0 and ma25 > 0:
+            score += min(20.0, abs(ma5 - ma25) / close * 1000.0 if close > 0 else 0.0)
+        score += min(25.0, abs(slope) * 10000.0)
+        score += min(15.0, abs(macd - signal) * 10.0)
+        score += min(10.0, atr / close * 1000.0 if close > 0 else 0.0)
+        if rsi != 50.0:
+            score += min(10.0, abs(rsi - 50.0) / 5.0)
+        out["ranking_tech_score"] = max(_safe_float(out.get("ranking_tech_score"), 0.0), round(score, 4))
+        out["ranking_tech_source"] = "ranking_snapshot_alias"
+
+    return out
+
+
 def attach_ranking_technicals(row: Dict[str, Any], tech_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     try:
         symbol = str(row.get("symbol") or "").strip()
@@ -518,10 +866,10 @@ def attach_ranking_technicals(row: Dict[str, Any], tech_map: Dict[str, Dict[str,
         if not isinstance(tech, dict):
             row["ranking_tech_ready"] = 0
             row["ranking_tech_reason"] = "NO_TECH"
-            return row
+            return _copy_snapshot_technical_aliases(row)
         for k, v in tech.items():
             row[k] = v
-        return row
+        return _copy_snapshot_technical_aliases(row)
     except Exception:
         return row
 

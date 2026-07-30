@@ -415,7 +415,6 @@ def _install_ranking_entry_companion_patches() -> bool:
     for module_name in (
         "core.startup.kabu_api_token_runtime_patch",
         "core.startup.ranking_entry_push_fallback_patch",
-        "core.startup.ranking_entry_min_pending_on_timeout_patch",
     ):
         try:
             import importlib

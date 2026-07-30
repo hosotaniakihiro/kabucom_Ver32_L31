@@ -254,10 +254,13 @@ DB_SYNC_PATCHES = [
 # ranking_stuck_pending_prune_patch / ranking_entry_controller_timeout_patch
 # (main.py側) は、trading/entry_exit/tasks.py の _run_ranking_entry_safe と
 # core/startup/schedule_loop.py の _is_job_running へ本文化済みのため削除した。
+#
+# ranking_entry_snapshot_technical_alias_patch は
+# trading/ranking/ranking_technical_store.py の attach_ranking_technicals
+# (_copy_snapshot_technical_aliases) へ本文化済みのため削除した。
 
 SYNC_MAIN_PATCHES = [
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
-    ("core.startup.ranking_entry_snapshot_technical_alias_patch", "RANKING_SNAPSHOT_TECH_ALIAS", "DISABLE_RANKING_SNAPSHOT_TECH_ALIAS_PATCH"),
     ("core.startup.entry_log_skip_reason_collision_patch", "ENTRY_LOG_SKIP_GUARD", "DISABLE_ENTRY_LOG_SKIP_GUARD"),
     ("core.startup.entry_controller_pipeline_lock_wait_patch", "ENTRY_CONTROLLER_LOCK_WAIT", "DISABLE_ENTRY_CONTROLLER_LOCK_WAIT_PATCH"),
     ("core.startup.entry_controller_source_prefilter_patch", "ENTRY_CONTROLLER_SOURCE_PREFILTER", "DISABLE_ENTRY_CONTROLLER_SOURCE_PREFILTER_PATCH"),
