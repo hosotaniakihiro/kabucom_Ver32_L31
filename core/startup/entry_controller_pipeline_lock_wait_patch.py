@@ -18,6 +18,14 @@
 #   - timeout 時、entry_execute_timeout_guard の inflight が空なら stale lock と判定。
 #   - stale lock 判定時は ec._pipeline_lock を安全側で再生成し、元 pipeline を1回だけ実行。
 #   - 古すぎる SUMMARY pending だけ prune。fresh pending は残す。
+#
+# V6:
+#   - _safe_log_skip / _install_log_skip_final_guard を撤去。これは
+#     run_entry_pipeline 呼び出しの度に ec._log_skip を「元を一切呼ばない
+#     ログのみ版」へ強制上書きしており、entry_log_skip_reason_collision_patch の
+#     ランキングpending prune と entry_controller_audit_patch の監査DB記録が
+#     恒久的に無効化されていた。両機能は entry_controller._log_skip 本体
+#     (Ver2.7) へ直接統合されたため、このガードは不要かつ有害だった。
 # ============================================================
 
 from __future__ import annotations
@@ -33,8 +41,12 @@ logger = logging.getLogger(__name__)
 
 _INSTALLED = False
 _ORIGINAL_RUN = None
-_ORIGINAL_LOG_SKIP = None
 _LAST_STALE_RESET_AT = 0.0
+
+# _log_skip を "元を一切呼ばずログのみ" の _safe_log_skip へ恒久的に強制上書きしていた
+# _install_log_skip_final_guard は撤去済み。entry_controller._log_skip 本体 (Ver2.7) が
+# reason衝突回避 + 監査ログ記録 + ランキングpending pruneを直接行うため、このガードは
+# 逆にそれらの機能を無効化する副作用しかなかった。
 
 _TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 _FALSE = {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}
@@ -237,44 +249,6 @@ def _poll_sec() -> float:
     return max(0.05, _env_float("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_POLL_SEC", 0.20))
 
 
-def _safe_log_skip(symbol: Any, skip_reason: Any = None, *args, **kwargs):
-    """_log_skip(symbol, reason, **detail) の reason キー衝突を完全吸収する。"""
-    try:
-        if "reason" in kwargs:
-            kwargs.setdefault("detail_reason", kwargs.pop("reason"))
-        if args:
-            kwargs.setdefault("extra_args", args)
-        try:
-            import trading.handlers.entry_controller as ec
-            lg = getattr(ec, "logger", logger)
-        except Exception:
-            lg = logger
-        lg.info("⛔ ENTRY_SKIP %s reason=%s detail=%s", symbol, skip_reason, kwargs)
-    except Exception:
-        logger.debug("[ENTRY CONTROLLER LOCK WAIT] safe_log_skip failed", exc_info=True)
-    return None
-
-
-def _install_log_skip_final_guard() -> bool:
-    global _ORIGINAL_LOG_SKIP
-    try:
-        import trading.handlers.entry_controller as ec
-        cur = getattr(ec, "_log_skip", None)
-        if getattr(cur, "_entry_log_skip_final_guard_v5", False):
-            return True
-        if callable(cur) and _ORIGINAL_LOG_SKIP is None:
-            _ORIGINAL_LOG_SKIP = cur
-        _safe_log_skip._entry_log_skip_final_guard_v5 = True  # type: ignore[attr-defined]
-        _safe_log_skip._entry_log_skip_final_guard_v4 = True  # type: ignore[attr-defined]
-        _safe_log_skip._entry_log_skip_final_guard_v3 = True  # type: ignore[attr-defined]
-        _safe_log_skip._original = cur  # type: ignore[attr-defined]
-        ec._log_skip = _safe_log_skip
-        return True
-    except Exception:
-        logger.debug("[ENTRY CONTROLLER LOCK WAIT] install log_skip final guard failed", exc_info=True)
-        return False
-
-
 def _wait_until_entry_lock_free(ec: Any, *, source: str) -> tuple[bool, float, str]:
     source_u = _normalize_source(source)
     if not _wait_enabled_for_source(source_u):
@@ -416,7 +390,6 @@ def _patched_run_entry_pipeline(*args, **kwargs):
     source_u = _normalize_source(source)
 
     try:
-        _install_log_skip_final_guard()
         if _wait_enabled_for_source(source_u):
             import trading.handlers.entry_controller as ec
             before = _pending_count_for_source(source_u)
@@ -437,11 +410,9 @@ def _patched_run_entry_pipeline(*args, **kwargs):
                         _pending_count_for_source(source_u),
                         _pending_snapshot_for_source(source_u),
                     )
-                    _install_log_skip_final_guard()
                     return _ORIGINAL_RUN(*args, **kwargs)
                 if _env_bool("ENTRY_CONTROLLER_LOCK_WAIT_TIMEOUT_SKIP_ORIGINAL", True):
                     return _timeout_result(source_u, waited, reason, stale_reset=True)
-        _install_log_skip_final_guard()
         return _ORIGINAL_RUN(*args, **kwargs)
     except TypeError as e:
         if "multiple values for argument 'reason'" in str(e):
@@ -451,7 +422,6 @@ def _patched_run_entry_pipeline(*args, **kwargs):
                 _pending_count_for_source(source_u),
                 _pending_snapshot_for_source(source_u),
             )
-            _install_log_skip_final_guard()
             return {
                 "executed": False,
                 "approved_count": 0,
@@ -475,7 +445,6 @@ def install() -> bool:
     global _INSTALLED, _ORIGINAL_RUN
     try:
         import trading.handlers.entry_controller as ec
-        _install_log_skip_final_guard()
         cur = getattr(ec, "run_entry_pipeline", None)
         if not callable(cur):
             logger.warning("[ENTRY CONTROLLER LOCK WAIT] target missing")

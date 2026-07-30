@@ -7,8 +7,20 @@
 #   - market / risk / AI health / index shock / credit / volatility
 #     などの各種ガードを通過した銘柄のみエントリーする
 # ------------------------------------------------------------
-# Version: Ver2.6-INLINE-ENTRY-MATCHES-PIPELINE-SUMMARY-AI-COMPAT
+# Version: Ver2.7-INLINE-LOG-SKIP-AUDIT-AND-RANKING-PRUNE
 # ------------------------------------------------------------
+# Ver2.7:
+#   - _log_skip() に3本の monkeypatch を統合本文化:
+#     (1) core/startup/entry_log_skip_reason_collision_patch.py の
+#         reason kwargs 衝突回避 + HARD_PRUNE_REASONS 該当時のランキングpending即prune
+#     (2) trading/audit_logging/entry_controller_audit_patch.py の
+#         ENTRY_SKIP 監査DB記録 (audit_entry_skip)
+#     (3) core/startup/entry_controller_pipeline_lock_wait_patch.py の
+#         _safe_log_skip が run_entry_pipeline 呼び出しの度に _log_skip を
+#         「元を一切呼ばない版」へ強制上書きしていたため、(1)(2)の機能が
+#         本番で恒久的に無効化されていた不具合を修正 (両機能を実際に動かす)。
+#   - 引数名を reason -> skip_reason に変更し、precheck_ranking_entry() の
+#     戻り値など **detail 経由で "reason" キーが来ても衝突しないようにした。
 # Ver2.6:
 #   - 旧 core/startup/entry_controller_source_prefilter_patch.py が単独で
 #     差し替えていた _entry_matches_pipeline の SUMMARY_AI/SUMMARY/PUSH 互換判定を
@@ -240,13 +252,111 @@ def _resolve_price(entry_row: dict) -> float:
     )
 
 
-def _log_skip(symbol: str, reason: str, **detail):
+_LOG_SKIP_HARD_PRUNE_REASONS = {
+    "RANGE_5M_FILTER_NG",
+    "ATR_1M_FILTER_NG",
+    "ATR_FILTER_NG",
+    "ENTRY_ROW_RANGE_NG",
+    "DIRECTION_FILTER_NG",
+    "FINAL_ENTRY_SAFETY_NG",
+    "BOARD_GUARD_NG",
+    "FRESH_QUOTE_NG",
+    "SELL_CREDIT_GUARD_NG",
+    "POSITION_FILTER_NG",
+}
+
+
+def _log_skip_norm_symbol(v: Any) -> str:
+    try:
+        s = str(v or "").strip()
+        if s.endswith(".0") and s[:-2].isdigit():
+            return s[:-2]
+        return s
+    except Exception:
+        return ""
+
+
+def _log_skip_is_ranking_entry(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    src = _normalize_source(entry.get("source"))
+    et = _normalize_source(entry.get("entry_type"))
+    mode = _normalize_source(entry.get("ranking_entry_mode"))
+    return src == "RANKING" or et == "RANKING" or mode.startswith("RANKING")
+
+
+def _log_skip_entry_side(entry: Any) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    side = _normalize_source(entry.get("side") or entry.get("entry_decision") or entry.get("ai_side"))
+    if side in {"BUY", "LONG", "2", "買", "買い"}:
+        return "BUY"
+    if side in {"SELL", "SHORT", "1", "売", "売り"}:
+        return "SELL"
+    return side
+
+
+def _prune_ranking_pending_on_hard_reason(symbol: Any, reason: str, *, side: Any = None) -> int:
+    if not _env_bool("RANKING_PENDING_PRUNE_ON_FILTER_NG", True):
+        return 0
+    sym = _log_skip_norm_symbol(symbol)
+    side_n = _normalize_source(side)
+    try:
+        from trading.entry.pending_manager import prune_entries, snapshot_root
+
+        def _pred(s: str, entry: dict) -> bool:
+            if sym and _log_skip_norm_symbol(s) != sym:
+                return False
+            if not _log_skip_is_ranking_entry(entry):
+                return False
+            if side_n and _log_skip_entry_side(entry) != side_n:
+                return False
+            return True
+
+        removed = prune_entries(_pred, reason=f"RANKING_FINAL_NG:{reason}")
+        if removed:
+            logger.warning(
+                "[RANKING PENDING CLEANUP] removed=%s symbol=%s side=%s reason=%s root=%s",
+                removed,
+                sym,
+                side_n,
+                reason,
+                snapshot_root(),
+            )
+        return int(removed or 0)
+    except Exception:
+        logger.exception("[RANKING PENDING CLEANUP] failed symbol=%s side=%s reason=%s", sym, side_n, reason)
+        return 0
+
+
+def _log_skip(symbol: str, skip_reason: str = None, **detail):
+    # skip_reason という引数名にしているのは、呼び出し元が **detail 経由で
+    # "reason" キーを渡すケース（precheck_ranking_entry()の戻り値など）と
+    # 衝突して TypeError: multiple values for argument 'reason' になるのを防ぐため。
+    if "reason" in detail:
+        detail.setdefault("detail_reason", detail.pop("reason"))
+
     logger.info(
         "⛔ ENTRY_SKIP %s reason=%s detail=%s",
         symbol,
-        reason,
+        skip_reason,
         detail,
     )
+
+    try:
+        from trading.audit_logging.entry_audit import audit_entry_skip
+        audit_entry_skip(symbol=symbol, reason=skip_reason, detail=detail)
+    except Exception:
+        pass
+
+    try:
+        reason_key = str(skip_reason or "").split()[0].strip()
+        if reason_key in _LOG_SKIP_HARD_PRUNE_REASONS:
+            # 最終評価で落ちたランキング候補は、再評価しても同じ理由で詰まりやすい。
+            # max_pending=1 のため即削除して次のランキング候補へ回す。
+            _prune_ranking_pending_on_hard_reason(symbol, reason_key, side=detail.get("side"))
+    except Exception:
+        logger.exception("[RANKING PENDING CLEANUP] _log_skip hook failed symbol=%s reason=%s", symbol, skip_reason)
 
 
 def _is_tonosama_entry(entry_type: Any, source: Any) -> bool:

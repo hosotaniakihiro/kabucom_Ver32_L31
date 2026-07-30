@@ -13,8 +13,11 @@ import logging
 logger = logging.getLogger(__name__)
 
 _INSTALLED = False
-_ORIGINAL_LOG_SKIP = None
 _ORIGINAL_EXECUTE_BEST_CANDIDATE = None
+
+# ENTRY_SKIP の監査ログ記録 (旧 patched_log_skip) は
+# trading/handlers/entry_controller.py の _log_skip 本体 (Ver2.7) へ
+# audit_entry_skip 呼び出しとしてインライン化済み。
 
 
 def install() -> bool:
@@ -28,7 +31,7 @@ def install() -> bool:
 
     監査ログ側で例外が出ても、発注処理は止めない。
     """
-    global _INSTALLED, _ORIGINAL_LOG_SKIP, _ORIGINAL_EXECUTE_BEST_CANDIDATE
+    global _INSTALLED, _ORIGINAL_EXECUTE_BEST_CANDIDATE
 
     if _INSTALLED:
         return True
@@ -36,7 +39,6 @@ def install() -> bool:
     try:
         from trading.handlers import entry_controller as ec
         from trading.audit_logging.entry_audit import (
-            audit_entry_skip,
             audit_candidate_ok,
             audit_order,
             _build_entry_id,
@@ -49,15 +51,7 @@ def install() -> bool:
         _INSTALLED = True
         return True
 
-    _ORIGINAL_LOG_SKIP = ec._log_skip
     _ORIGINAL_EXECUTE_BEST_CANDIDATE = ec._execute_best_candidate
-
-    def patched_log_skip(symbol: str, reason: str, **detail):
-        try:
-            audit_entry_skip(symbol=symbol, reason=reason, detail=detail)
-        except Exception:
-            pass
-        return _ORIGINAL_LOG_SKIP(symbol, reason, **detail)
 
     def patched_execute_best_candidate(item: dict, boost_active: bool) -> bool:
         entry_id = ''
@@ -131,7 +125,6 @@ def install() -> bool:
 
         return ok
 
-    ec._log_skip = patched_log_skip
     ec._execute_best_candidate = patched_execute_best_candidate
     ec._AUDIT_LOGGING_PATCH_INSTALLED = True
     _INSTALLED = True
