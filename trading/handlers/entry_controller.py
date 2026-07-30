@@ -37,6 +37,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import datetime as dt
 from threading import Lock
 from copy import deepcopy
@@ -417,6 +418,340 @@ def _entry_matches_pipeline(entry: dict, pipeline_source: str | None, interval: 
         return False
 
 
+def _env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _normalize_entry_for_pipeline(entry: Any, pipeline_source: str | None) -> Any:
+    """旧 core/startup/entry_controller_source_prefilter_patch.py の_normalize_entry_for_pipeline。
+
+    SUMMARY_AI 向けpipelineでは、SUMMARY/PUSH(未設定含む)由来のentryのsource/entry_typeを
+    SUMMARY_AIへ書き換えて、以降の処理でSUMMARY_AI起因として扱えるようにする。
+    """
+    if not isinstance(entry, dict):
+        return entry
+    ps = _normalize_source(pipeline_source)
+    if ps != "SUMMARY_AI":
+        return entry
+    es = _normalize_source(entry.get("source"))
+    et = _normalize_source(entry.get("entry_type"))
+    if es in {"SUMMARY", "PUSH", ""} or et in {"SUMMARY", "PUSH", ""}:
+        e = deepcopy(entry)
+        e["source"] = "SUMMARY_AI"
+        e["entry_type"] = "SUMMARY_AI"
+        try:
+            row = e.get("entry_row")
+            if isinstance(row, dict):
+                row["source"] = "SUMMARY_AI"
+                row["entry_type"] = "SUMMARY_AI"
+        except Exception:
+            pass
+        return e
+    return entry
+
+
+def _describe_prefilter_entry(e: Any) -> dict[str, Any]:
+    if not isinstance(e, dict):
+        return {"type": type(e).__name__}
+    return {
+        "source": e.get("source"),
+        "entry_type": e.get("entry_type"),
+        "side": e.get("side"),
+        "interval": e.get("interval"),
+        "score": e.get("score"),
+    }
+
+
+def _prefilter_entries_for_pipeline(symbol: str, entries: list[dict], *, pipeline_source: str | None, interval: int | None) -> list[dict]:
+    """旧 core/startup/entry_controller_source_prefilter_patch.py の_patched_build_scored_candidatesを
+    インライン化。entries[:MAX_CANDIDATES_PER_SYMBOL] で切り詰める前に pipeline_source/interval で
+    事前フィルタし、SUMMARY_AI向けにsource/entry_typeを正規化する。
+
+    切り詰め前にこれをしないと、pending_rootにSUMMARY/RANKING/TONOSAMAが混在している場合、
+    実行元と違う候補が先頭を占有し、正しい候補が後ろにあるのに評価されないことがある。
+    """
+    if not _env_bool("ENTRY_CONTROLLER_SOURCE_PREFILTER_ENABLED", True):
+        return entries
+    if not (pipeline_source or interval is not None):
+        return entries
+    try:
+        filtered = [e for e in entries if _entry_matches_pipeline(e, pipeline_source, interval)]
+        normalized = [_normalize_entry_for_pipeline(e, pipeline_source) for e in filtered]
+        if len(filtered) != len(entries):
+            skipped = [_describe_prefilter_entry(e) for e in entries if not _entry_matches_pipeline(e, pipeline_source, interval)][:20]
+            logger.warning(
+                "[ENTRY SOURCE PREFILTER] symbol=%s source=%s interval=%s before=%s after=%s skipped=%s",
+                symbol,
+                pipeline_source,
+                interval,
+                len(entries),
+                len(filtered),
+                skipped,
+            )
+        return normalized
+    except Exception:
+        logger.exception("[ENTRY SOURCE PREFILTER] failed symbol=%s -> use original entries", symbol)
+        return entries
+
+
+def _ma5_third_bar_tfs() -> list[int]:
+    raw = os.getenv("ENTRY_MA5_THIRD_BAR_REQUIRED_TFS", "3,5")
+    out: list[int] = []
+    for x in str(raw).replace(";", ",").split(","):
+        try:
+            n = int(float(x.strip()))
+            if n in (3, 5) and n not in out:
+                out.append(n)
+        except Exception:
+            pass
+    return out or [3, 5]
+
+
+def _ma5_third_bar_row_sources(item: dict[str, Any]):
+    try:
+        for src in (item, item.get("entry_row"), item.get("entry"), item.get("row"), item.get("raw"), item.get("_raw")):
+            if isinstance(src, dict):
+                yield src
+    except Exception:
+        return
+
+
+def _ma5_third_bar_symbol_from_item(item: dict[str, Any]) -> str:
+    try:
+        for src in _ma5_third_bar_row_sources(item):
+            s = str(src.get("symbol") or "").strip()
+            if s.endswith(".0"):
+                s = s[:-2]
+            if s:
+                return s
+    except Exception:
+        pass
+    return ""
+
+
+def _ma5_third_bar_side_from_item(item: dict[str, Any]) -> str:
+    try:
+        for src in _ma5_third_bar_row_sources(item):
+            s = str(src.get("side") or src.get("entry_decision") or src.get("resolved_side") or "").strip().upper()
+            if s in {"BUY", "SELL"}:
+                return s
+    except Exception:
+        pass
+    return ""
+
+
+def _ma5_third_bar_source_from_item(item: dict[str, Any]) -> str:
+    keys = ("source", "entry_source", "entry_type", "pipeline_source", "ranking_entry_mode", "ranking_source")
+    try:
+        vals = []
+        for src in _ma5_third_bar_row_sources(item):
+            for k in keys:
+                v = src.get(k)
+                if v:
+                    vals.append(str(v).strip().upper())
+        return ",".join(vals)
+    except Exception:
+        pass
+    return ""
+
+
+def _ma5_third_bar_score_from_item(item: dict[str, Any]) -> float:
+    keys = (
+        "priority",
+        "pending_score",
+        "score",
+        "final_score",
+        "display_score",
+        "score_total",
+        "total_score",
+        "ranking_only_score",
+        "ranking_strength",
+        "snapshot_score",
+    )
+    try:
+        vals = []
+        for src in _ma5_third_bar_row_sources(item):
+            for k in keys:
+                if k in src:
+                    vals.append(abs(_safe_float(src.get(k), 0.0)))
+        return max(vals, default=0.0)
+    except Exception:
+        return 0.0
+
+
+def _ma5_third_bar_strong_failopen_ok(item: dict[str, Any], diag: dict[str, Any]) -> bool:
+    if not _env_bool("ENTRY_MA5_THIRD_BAR_STRONG_SCORE_FAILOPEN", True):
+        return False
+
+    source = _ma5_third_bar_source_from_item(item)
+    score = _ma5_third_bar_score_from_item(item)
+    min_score = _env_float(
+        "ENTRY_MA5_THIRD_BAR_STRONG_FAILOPEN_MIN_SCORE",
+        _env_float("ENTRY_MA5_THIRD_BAR_RANKING_FAILOPEN_MIN_SCORE", 75.0),
+    )
+    if score < min_score:
+        return False
+
+    # 明示的にRANKINGなら通す。sourceが欠落していても high score は通す。
+    allow_unknown_source = _env_bool("ENTRY_MA5_THIRD_BAR_STRONG_FAILOPEN_ALLOW_UNKNOWN_SOURCE", True)
+    if source and "RANKING" not in source and not _env_bool("ENTRY_MA5_THIRD_BAR_STRONG_FAILOPEN_ALL_SOURCES", False):
+        return False
+    if not source and not allow_unknown_source:
+        return False
+
+    max_bad_slope_abs = _env_float("ENTRY_MA5_THIRD_BAR_RANKING_MAX_BAD_SLOPE_ABS", 999999.0)
+    try:
+        bad_slopes = []
+        for c in diag.get("checks", []) or []:
+            if isinstance(c, dict) and c.get("ok") is False:
+                bad_slopes.append(abs(_safe_float(c.get("ma5_slope"), 0.0)))
+        if bad_slopes and max(bad_slopes) > max_bad_slope_abs:
+            return False
+    except Exception:
+        pass
+
+    logger.warning(
+        "[ENTRY MA5 THIRD BAR GUARD] STRONG_SCORE_FAILOPEN symbol=%s side=%s source=%s score=%.3f min_score=%.3f diag=%s",
+        diag.get("symbol"),
+        diag.get("side"),
+        source or "UNKNOWN",
+        score,
+        min_score,
+        diag,
+    )
+    return True
+
+
+def _ma5_third_bar_ranking_strong_failopen_ok(item: dict[str, Any], diag: dict[str, Any]) -> bool:
+    if not _env_bool("ENTRY_MA5_THIRD_BAR_RANKING_STRONG_FAILOPEN", True):
+        return False
+    return _ma5_third_bar_strong_failopen_ok(item, diag)
+
+
+def _ma5_third_bar_latest_rows_for_symbol(tf: int, symbol: str):
+    try:
+        import pandas as pd
+        getter = getattr(global_data, "get_summary_history", None)
+        df = getter(tf, source="push") if callable(getter) else None
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty or "symbol" not in df.columns:
+            return None
+        d = df.copy()
+        s = d["symbol"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+        d = d[s == str(symbol).strip()]
+        if d.empty:
+            return None
+        time_col = next((c for c in ("datetime", "end_time", "time", "start_time") if c in d.columns), None)
+        if time_col:
+            d["__dt"] = pd.to_datetime(d[time_col], errors="coerce")
+            d = d.sort_values("__dt")
+        return d.tail(max(3, _env_int("ENTRY_MA5_THIRD_BAR_MIN_BARS", 3)))
+    except Exception:
+        logger.exception("[ENTRY MA5 THIRD BAR GUARD] get rows failed tf=%s symbol=%s", tf, symbol)
+        return None
+
+
+def _ma5_third_bar_check_tf(tf: int, symbol: str, side: str) -> tuple[bool | None, dict[str, Any]]:
+    rows = _ma5_third_bar_latest_rows_for_symbol(tf, symbol)
+    if rows is None or getattr(rows, "empty", True):
+        return None, {"tf": tf, "reason": "no_history"}
+    min_bars = max(3, _env_int("ENTRY_MA5_THIRD_BAR_MIN_BARS", 3))
+    if len(rows) < min_bars:
+        return None, {"tf": tf, "reason": "not_enough_bars", "rows": len(rows), "need": min_bars}
+    if "ma5" not in rows.columns:
+        return None, {"tf": tf, "reason": "ma5_missing"}
+    price_col = next((c for c in ("close", "close_price", "price", "current_price") if c in rows.columns), "close")
+    last3 = rows.tail(3)
+    closes = [_safe_float(x, 0.0) for x in list(last3[price_col])]
+    ma5s = [_safe_float(x, 0.0) for x in list(last3["ma5"])]
+    if any(x <= 0 for x in closes) or any(x <= 0 for x in ma5s):
+        return None, {"tf": tf, "reason": "bad_close_or_ma5", "closes": closes, "ma5s": ma5s}
+    slope = ma5s[-1] - ma5s[-2]
+    if side == "BUY":
+        ok = all(c > m for c, m in zip(closes, ma5s)) and slope > 0
+    else:
+        ok = all(c < m for c, m in zip(closes, ma5s)) and slope < 0
+    return bool(ok), {"tf": tf, "side": side, "closes": [round(x, 4) for x in closes], "ma5s": [round(x, 4) for x in ma5s], "ma5_slope": round(float(slope), 6), "ok": bool(ok)}
+
+
+def _ma5_third_bar_passes_guard(item: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    symbol = _ma5_third_bar_symbol_from_item(item)
+    side = _ma5_third_bar_side_from_item(item)
+    if not symbol or side not in {"BUY", "SELL"}:
+        return True, {"reason": "no_symbol_or_side", "symbol": symbol, "side": side}
+    checks = []
+    seen = 0
+    for tf in _ma5_third_bar_tfs():
+        ok, diag = _ma5_third_bar_check_tf(tf, symbol, side)
+        checks.append(diag)
+        if ok is None:
+            continue
+        seen += 1
+        if not ok:
+            out = {"symbol": symbol, "side": side, "checks": checks, "reason": "ma5_third_bar_slope_ng"}
+            if _ma5_third_bar_ranking_strong_failopen_ok(item, out):
+                out["reason"] = "ma5_third_bar_strong_score_failopen"
+                return True, out
+            return False, out
+    if seen <= 0:
+        if _env_bool("ENTRY_MA5_THIRD_BAR_FAIL_OPEN", True):
+            return True, {"symbol": symbol, "side": side, "checks": checks, "reason": "no_tf_data_fail_open"}
+        return False, {"symbol": symbol, "side": side, "checks": checks, "reason": "no_tf_data"}
+    return True, {"symbol": symbol, "side": side, "checks": checks, "reason": "ma5_third_bar_slope_ok"}
+
+
+def _apply_ma5_third_bar_slope_guard(symbol: str, scored_candidates: list[dict]) -> list[dict]:
+    """旧 core/startup/entry_ma5_third_bar_slope_guard_patch.py の_patched_build_scored_candidatesを
+    インライン化。3分足・5分足でMA5を超えて(下抜けて)1〜2本目では入らず、3本目でMA5傾きが
+    順行している時だけ許可する。strong scoreの候補はsourceが取れなくても単独では落とさない。
+    """
+    if not _env_bool("ENTRY_MA5_THIRD_BAR_SLOPE_GUARD_ENABLED", True):
+        return scored_candidates
+    try:
+        kept = []
+        skipped = []
+        for item in list(scored_candidates or []):
+            if not isinstance(item, dict):
+                kept.append(item)
+                continue
+            ok, diag = _ma5_third_bar_passes_guard(item)
+            if ok:
+                kept.append(item)
+            else:
+                skipped.append(diag)
+        if skipped:
+            logger.warning("[ENTRY MA5 THIRD BAR GUARD] filtered symbol=%s before=%s after=%s skipped=%s", symbol, len(list(scored_candidates or [])), len(kept), skipped[:30])
+        return kept
+    except Exception:
+        logger.exception("[ENTRY MA5 THIRD BAR GUARD] failed; fail-open symbol=%s", symbol)
+        return scored_candidates
+
+
 def _build_scored_candidates(
     symbol: str,
     entries: list[dict],
@@ -425,6 +760,8 @@ def _build_scored_candidates(
     pipeline_source: str | None = None,
     interval: int | None = None,
 ) -> list[dict]:
+    entries = _prefilter_entries_for_pipeline(symbol, entries, pipeline_source=pipeline_source, interval=interval)
+
     scored_candidates: list[dict] = []
 
     for entry in entries[:MAX_CANDIDATES_PER_SYMBOL]:
@@ -582,6 +919,8 @@ def _build_scored_candidates(
         ),
         reverse=True,
     )
+
+    scored_candidates = _apply_ma5_third_bar_slope_guard(symbol, scored_candidates)
 
     return scored_candidates
 

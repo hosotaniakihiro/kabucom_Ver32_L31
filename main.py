@@ -205,7 +205,8 @@ def _install_main_runtime_patches():
         ("core.startup.oneshot_limit_700k_patch", "install"),
         ("core.startup.entry_limit_passive_runtime_patch", "install"),
         ("core.startup.final_entry_safety_guard_patch", "install"),
-        ("core.startup.entry_ma5_third_bar_slope_guard_patch", "install"),
+        # entry_ma5_third_bar_slope_guard_patch は entry_controller._build_scored_candidates
+        # 本体へインライン化済みのため削除。
         ("core.startup.final_entry_liquidity_movement_hard_guard_patch", "install"),
         ("core.startup.summary_ai_more_candidates_patch", "install"),
         ("core.startup.summary_ai_async_entry_patch", "install"),
