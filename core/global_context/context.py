@@ -18,6 +18,20 @@
 #   - push_df / ranking_df 管理
 #   - runtime flags 管理
 #
+# 【REV11 修正】
+#   - core/startup/summary_main_push_db_refresh_patch.py (class属性への
+#     monkeypatch) と core/startup/global_context_summary_repair_patch.py
+#     (シングルトンinstance属性へのMethodType monkeypatch) が、どちらも
+#     set_merged_summary を差し替えていた。Pythonの属性解決順序上instance属性が
+#     class属性を覆い隠すため、instance側パッチが先に自分自身のset_merged_summaryを
+#     捕捉してしまうと、class側の stale-overwrite ガードが永久にシャドウされ
+#     二度と効かなくなる、起動順序に依存する不具合があった。
+#     両パッチの機能 (stale-overwrite guard + push技術指標の履歴補完) を
+#     set_summary_history/set_merged_summary 本体へ直接統合し、
+#     class/instance の二重差し替え自体を解消した。
+#   - get_merged_summary 側の古いPUSH行除外 (旧 repair patch) は、既存の
+#     drop_stale_summary_rows (REV9) がより厳密な基準で同じ役割を
+#     既に果たしているため、重複として統合対象から除外した。
 # 【REV10.3 修正】
 #   - SUMMARY HISTORY GET/SET / MERGED GET/SET の詳細表ログを通常OFF化。
 #   - 1分PUSHサマリー更新中に20行テーブルを大量出力し、PUSH-1m / unified-parent
@@ -928,6 +942,217 @@ def _sanitize_summary_history_df(df: Any, tf: Any, source: str = "history", symb
         return _safe_df(df)
 
 
+# ============================================================
+# stale-overwrite guard (ported from
+# core/startup/summary_main_push_db_refresh_patch.py V2)
+# ============================================================
+
+def _overwrite_guard_safe_dt_series(values: Any) -> "pd.Series":
+    try:
+        s = values if isinstance(values, pd.Series) else pd.Series(values)
+        out = pd.to_datetime(s, errors="coerce")
+        try:
+            if getattr(out.dt, "tz", None) is not None:
+                out = out.dt.tz_convert("Asia/Tokyo").dt.tz_localize(None)
+        except Exception:
+            try:
+                out = out.dt.tz_localize(None)
+            except Exception:
+                pass
+        return out
+    except Exception:
+        return pd.Series(pd.NaT, index=getattr(values, "index", None))
+
+
+def _overwrite_guard_latest_dt(df: Any) -> Any:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+    for c in ("datetime", "received_at", "time", "current_price_time", "PriceTime", "updated_at", "created_at"):
+        if c in df.columns:
+            try:
+                x = _overwrite_guard_safe_dt_series(df[c]).max()
+                if pd.notna(x):
+                    return pd.Timestamp(x).tz_localize(None)
+            except Exception:
+                continue
+    return None
+
+
+def _is_push_source(source: Any) -> bool:
+    try:
+        return str(source or "").strip().lower() in {"push", "push-cache", "push_summary", "push-summary"}
+    except Exception:
+        return False
+
+
+def _is_overwrite_guarded_tf(tf: Any) -> bool:
+    try:
+        s = str(tf).strip().lower().replace("min", "").replace("m", "")
+        return s in {"1", "1.0"}
+    except Exception:
+        return False
+
+
+def _latest_existing_from_store(store: Any, tf: Any, source: Any) -> tuple[Any, pd.DataFrame]:
+    try:
+        src = str(source or "legacy").lower()
+        if not isinstance(store, dict):
+            return None, pd.DataFrame()
+        df = store.get(tf, {}).get(src)
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return None, pd.DataFrame()
+        return _overwrite_guard_latest_dt(df), df.copy()
+    except Exception:
+        return None, pd.DataFrame()
+
+
+def _should_block_stale_overwrite(*, kind: str, store: Any, tf: Any, source: Any, new_df: Any) -> tuple[bool, pd.DataFrame, Any, Any]:
+    """Reject a set_summary_history/set_merged_summary write that would move
+    tf=1/source=push's latest timestamp backwards (a fresh in-memory summary
+    getting overwritten by a stale one, e.g. a delayed background refresh).
+    """
+    try:
+        if not _env_bool("SUMMARY_PUSH_STALE_OVERWRITE_GUARD", True):
+            return False, pd.DataFrame(), None, None
+        if not (_is_overwrite_guarded_tf(tf) and _is_push_source(source)):
+            return False, pd.DataFrame(), None, None
+        new_latest = _overwrite_guard_latest_dt(new_df)
+        if new_latest is None or pd.isna(new_latest):
+            return False, pd.DataFrame(), None, None
+        old_latest, old_df = _latest_existing_from_store(store, tf, source)
+        if old_latest is None or pd.isna(old_latest):
+            return False, pd.DataFrame(), old_latest, new_latest
+        try:
+            max_back_sec = max(0.0, float(os.getenv("SUMMARY_PUSH_STALE_OVERWRITE_MAX_BACK_SEC", "0.0")))
+        except Exception:
+            max_back_sec = 0.0
+        delta = (pd.Timestamp(old_latest).tz_localize(None) - pd.Timestamp(new_latest).tz_localize(None)).total_seconds()
+        if delta > max_back_sec:
+            return True, old_df, old_latest, new_latest
+        return False, pd.DataFrame(), old_latest, new_latest
+    except Exception:
+        logger.debug("[SUMMARY PUSH STALE GUARD] compare failed kind=%s tf=%s source=%s", kind, tf, source, exc_info=True)
+        return False, pd.DataFrame(), None, None
+
+
+# ============================================================
+# push technical-field history repair (ported from
+# core/startup/global_context_summary_repair_patch.py V1.2)
+# ============================================================
+
+_MERGED_REPAIR_FILL_COLS = (
+    "macd", "signal", "hist", "rsi",
+    "slope", "slope_atr_scaled", "score_slope",
+    "mtf", "score_mtf", "mtf_score", "mtf_tf_count",
+    "technical_ready", "symbol_hist_len",
+)
+
+
+def _merged_repair_zero_like(v: Any) -> bool:
+    try:
+        if pd.isna(v):
+            return True
+    except Exception:
+        pass
+    try:
+        return float(v) == 0.0
+    except Exception:
+        return str(v).strip() in {"", "0", "0.0", "False", "false", "None", "nan", "NaN"}
+
+
+def _merged_repair_best_map_from_history(hist: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+    h = _safe_df(hist)
+    if h.empty or "symbol" not in h.columns:
+        return {}
+    time_col = _best_time_col(h)
+    if "symbol" in h.columns and time_col:
+        h = h.sort_values(["symbol", time_col], kind="stable")
+    result: Dict[str, Dict[str, Any]] = {}
+    for sym, g in h.groupby("symbol", sort=False):
+        sym_s = str(sym).strip()
+        if not sym_s:
+            continue
+        d: Dict[str, Any] = {}
+        for col in _MERGED_REPAIR_FILL_COLS:
+            if col not in g.columns:
+                continue
+            val = None
+            for v in reversed(list(g[col].values)):
+                if not _merged_repair_zero_like(v):
+                    val = v
+                    break
+            if val is None:
+                last = g.iloc[-1].get(col)
+                if not _merged_repair_zero_like(last):
+                    val = last
+            if val is not None:
+                d[col] = val
+        result[sym_s] = d
+    return result
+
+
+def _repair_merged_summary_from_history(gc: "GlobalContext", tf: Any, df: Any, source: str) -> pd.DataFrame:
+    """When a fresh push-source merged summary row has macd/signal/mtf reset
+    to zero (e.g. mid-recompute), backfill those fields from the most recent
+    non-zero value for that symbol in the tf=push summary history, so a
+    momentary recompute gap doesn't blank out otherwise-valid technicals.
+    """
+    out = _safe_df(df)
+    if out.empty or source != "push" or "symbol" not in out.columns:
+        return _safe_df(df)
+
+    try:
+        hist = gc.get_summary_history(tf, source="push")
+    except Exception:
+        hist = pd.DataFrame()
+    best = _merged_repair_best_map_from_history(hist)
+    if not best:
+        return out
+
+    hits = fills = macd_fill = signal_fill = mtf_fill = 0
+    for idx, row in out.iterrows():
+        sym = str(row.get("symbol", "")).strip()
+        vals = best.get(sym)
+        if not vals:
+            continue
+        hits += 1
+        for col, val in vals.items():
+            if col not in out.columns:
+                out[col] = pd.NA
+            cur = out.at[idx, col]
+            if _merged_repair_zero_like(cur) and not _merged_repair_zero_like(val):
+                out.at[idx, col] = val
+                fills += 1
+                if col == "macd":
+                    macd_fill += 1
+                elif col == "signal":
+                    signal_fill += 1
+                elif col in {"mtf", "score_mtf", "mtf_score"}:
+                    mtf_fill += 1
+
+    try:
+        if "technical_ready" not in out.columns:
+            out["technical_ready"] = False
+        ready = pd.Series(False, index=out.index)
+        for col in ("macd", "signal", "rsi", "mtf", "score_mtf"):
+            if col in out.columns:
+                ready = ready | (pd.to_numeric(out[col], errors="coerce").fillna(0) != 0)
+        out.loc[ready, "technical_ready"] = True
+        if "symbol_hist_len" not in out.columns:
+            out["symbol_hist_len"] = pd.NA
+        out.loc[ready & out["symbol_hist_len"].isna(), "symbol_hist_len"] = 3
+    except Exception:
+        logger.exception("[GC SUMMARY REPAIR] technical_ready repair failed tf=%s", tf)
+
+    if fills:
+        logger.warning(
+            "[GC SUMMARY REPAIR] tf=%s source=%s rows=%s hits=%s fills=%s macd_fill=%s signal_fill=%s mtf_fill=%s macd=%s signal=%s mtf=%s ready=%s",
+            tf, source, len(out), hits, fills, macd_fill, signal_fill, mtf_fill,
+            _nonzero_count(out, "macd"), _nonzero_count(out, "signal"), _nonzero_count(out, "mtf"), _nonzero_count(out, "technical_ready"),
+        )
+    return out
+
+
 class GlobalContext:
     def __init__(self):
         self._lock = threading.RLock()
@@ -985,6 +1210,13 @@ class GlobalContext:
     def set_summary_history(self, tf: Any, df: Any, source: str = "legacy", caller: Optional[str] = None) -> pd.DataFrame:
         with self._lock:
             src = str(source or "legacy").lower()
+            block, old_df, old_latest, new_latest = _should_block_stale_overwrite(kind="history", store=self._summary_history, tf=tf, source=src, new_df=df)
+            if block:
+                logger.warning(
+                    "[SUMMARY PUSH STALE GUARD] blocked history stale overwrite tf=%s source=%s old_latest=%s new_latest=%s old_rows=%s new_rows=%s caller=%s",
+                    tf, src, old_latest, new_latest, len(old_df) if isinstance(old_df, pd.DataFrame) else 0, len(df) if isinstance(df, pd.DataFrame) else 0, caller or _caller_name(2),
+                )
+                return old_df
             out = _sanitize_summary_history_df(df, tf=tf, source=src, symbol_name_map=self.symbol_name_map)
             self._summary_history.setdefault(tf, {})[src] = out
             latest = None
@@ -1010,7 +1242,19 @@ class GlobalContext:
     def set_merged_summary(self, tf: Any, df: Any, source: str = "legacy", caller: Optional[str] = None) -> pd.DataFrame:
         with self._lock:
             src = str(source or "legacy").lower()
-            out = _sanitize_summary_df(df, tf=tf, source=src, symbol_name_map=self.symbol_name_map)
+            block, old_df, old_latest, new_latest = _should_block_stale_overwrite(kind="merged", store=self._merged_summary, tf=tf, source=src, new_df=df)
+            if block:
+                logger.warning(
+                    "[SUMMARY PUSH STALE GUARD] blocked merged stale overwrite tf=%s source=%s old_latest=%s new_latest=%s old_rows=%s new_rows=%s caller=%s",
+                    tf, src, old_latest, new_latest, len(old_df) if isinstance(old_df, pd.DataFrame) else 0, len(df) if isinstance(df, pd.DataFrame) else 0, caller or _caller_name(2),
+                )
+                return old_df
+            try:
+                fixed = _repair_merged_summary_from_history(self, tf, df, src) if src == "push" else df
+            except Exception:
+                logger.exception("[GC SUMMARY REPAIR] repair failed tf=%s source=%s", tf, src)
+                fixed = df
+            out = _sanitize_summary_df(fixed, tf=tf, source=src, symbol_name_map=self.symbol_name_map)
             self._merged_summary.setdefault(tf, {})[src] = out
             latest = None
             try:
