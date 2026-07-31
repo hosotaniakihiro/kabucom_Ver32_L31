@@ -1,11 +1,16 @@
 # ============================================================
 # File   : core/startup/volatility_filter_tonosama_entryrow_rescue_patch.py
-# Version: V1.2-SIGNATURE-SAFE-WRAPPERS
+# Version: V2-RANGE-5M-FILTER-INLINED
 # ------------------------------------------------------------
 # 目的:
 #   TONOSAMA entry_row / pending の値幅で volatility filter を救済する。
 #
-# V1.2:
+# V2:
+#   - range_5m_filter の wrap (pending参照 + entry_row比率救済) は
+#     trading/filters/volatility_filter.py の _range_5m_filter_from_entry_row
+#     (V6) へインライン化したため撤去。atr_1m_filter への救済は維持。
+#
+# V1.2 (旧):
 #   - range_5m_filter(df_5m=..., symbol=...) 呼び出しで、旧wrapperを_ORIG_RANGEとして掴み
 #     TypeError: unexpected keyword argument 'df_5m' になる問題を防ぐ。
 #   - _original を辿って二重wrapをunwrap。
@@ -23,7 +28,6 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 _INSTALLED = False
 _ORIG_ATR = None
-_ORIG_RANGE = None
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -220,15 +224,9 @@ def _patched_atr_1m_filter(*args, **kwargs):
     return _call_original(_ORIG_ATR, *args, **kwargs)
 
 
-def _patched_range_5m_filter(*args, **kwargs):
-    if _env_bool("TONOSAMA_VOL_ENTRYROW_RESCUE_ENABLED", True):
-        row_obj = _entry_row_from_call(args, kwargs)
-        symbol = _extract_symbol(args, kwargs)
-        ok, diag = _tonosama_vol_rescue(row_obj, caller="range_5m_filter", symbol=symbol)
-        if ok:
-            logger.warning("[VOL FILTER TONOSAMA RESCUE] allow RANGE by pending/entry_row range diag=%s", diag)
-            return True
-    return _call_original(_ORIG_RANGE, *args, **kwargs)
+# range_5m_filter (TONOSAMA pending/entry_row比率救済) は
+# trading/filters/volatility_filter.py の _range_5m_filter_from_entry_row (V6)
+# へインライン化済み。
 
 
 def _patch_entry_controller_refs(vf) -> None:
@@ -236,32 +234,25 @@ def _patch_entry_controller_refs(vf) -> None:
         import trading.handlers.entry_controller as ec
         if hasattr(ec, "atr_1m_filter"):
             ec.atr_1m_filter = vf.atr_1m_filter
-        if hasattr(ec, "range_5m_filter"):
-            ec.range_5m_filter = vf.range_5m_filter
     except Exception:
         logger.debug("[VOL FILTER TONOSAMA RESCUE] entry_controller ref patch skipped", exc_info=True)
 
 
 def install() -> bool:
-    global _INSTALLED, _ORIG_ATR, _ORIG_RANGE
+    global _INSTALLED, _ORIG_ATR
     try:
         import trading.filters.volatility_filter as vf
         cur_atr = getattr(vf, "atr_1m_filter", None)
-        cur_range = getattr(vf, "range_5m_filter", None)
-        if not callable(cur_atr) or not callable(cur_range):
+        if not callable(cur_atr):
             logger.warning("[VOL FILTER TONOSAMA RESCUE] target functions unavailable")
             return False
         if getattr(cur_atr, "_tonosama_vol_rescue_v12", False):
             _INSTALLED = True
             return True
         _ORIG_ATR = getattr(cur_atr, "_original", cur_atr)
-        _ORIG_RANGE = getattr(cur_range, "_original", cur_range)
         _patched_atr_1m_filter._tonosama_vol_rescue_v12 = True  # type: ignore[attr-defined]
         _patched_atr_1m_filter._original = _ORIG_ATR  # type: ignore[attr-defined]
-        _patched_range_5m_filter._tonosama_vol_rescue_v12 = True  # type: ignore[attr-defined]
-        _patched_range_5m_filter._original = _ORIG_RANGE  # type: ignore[attr-defined]
         vf.atr_1m_filter = _patched_atr_1m_filter
-        vf.range_5m_filter = _patched_range_5m_filter
         _patch_entry_controller_refs(vf)
         _INSTALLED = True
         logger.warning(

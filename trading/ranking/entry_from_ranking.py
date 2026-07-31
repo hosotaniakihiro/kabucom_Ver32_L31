@@ -111,6 +111,66 @@ def _now() -> dt.datetime:
     return dt.datetime.now()
 
 
+def _is_ranking_pending_entry(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    src = str(entry.get("source") or "").strip().upper()
+    et = str(entry.get("entry_type") or "").strip().upper()
+    mode = str(entry.get("ranking_entry_mode") or "").strip().upper()
+    return src == "RANKING" or et == "RANKING" or mode.startswith("RANKING")
+
+
+def _ranking_pending_created_at(entry: Any) -> Optional[dt.datetime]:
+    if not isinstance(entry, dict):
+        return None
+    v = entry.get("created_at") or entry.get("created") or entry.get("timestamp")
+    if isinstance(v, dt.datetime):
+        return v
+    if isinstance(v, str) and v.strip():
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+            try:
+                return dt.datetime.strptime(v.strip(), fmt)
+            except Exception:
+                pass
+        try:
+            return dt.datetime.fromisoformat(v.strip())
+        except Exception:
+            return None
+    return None
+
+
+def _cleanup_stale_ranking_pending(reason: str = "TTL") -> int:
+    """古いRANKING pendingが残留してrolling-retryの枠を食い潰さないよう、
+    起動時に一度だけ TTL 超過分を掃除する
+    (旧 core/startup/entry_log_skip_reason_collision_patch.py)。
+    """
+    ttl = _env_float("RANKING_PENDING_TTL_SEC", 20.0)
+    if ttl <= 0:
+        return 0
+    now = dt.datetime.now()
+    try:
+        from trading.entry.pending_manager import prune_entries, snapshot_root
+
+        def _pred(_symbol: str, entry: Dict[str, Any]) -> bool:
+            if not _is_ranking_pending_entry(entry):
+                return False
+            created = _ranking_pending_created_at(entry)
+            if created is None:
+                return False
+            return (now - created).total_seconds() >= ttl
+
+        removed = prune_entries(_pred, reason=f"RANKING_STALE:{reason}")
+        if removed:
+            logger.warning(
+                "[RANKING PENDING STALE CLEANUP] removed=%s ttl=%.1fs reason=%s root=%s",
+                removed, ttl, reason, snapshot_root(),
+            )
+        return int(removed or 0)
+    except Exception:
+        logger.exception("[RANKING PENDING STALE CLEANUP] failed reason=%s", reason)
+        return 0
+
+
 def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
         if v is None:
@@ -614,6 +674,7 @@ def _passes_ranking_only_filters(row: Dict[str, Any], side: str, prev_h: Dict[st
 
 
 def entry_from_ranking():
+    _cleanup_stale_ranking_pending("before_ranking_entry")
     started = dt.datetime.now()
     started_perf = time.perf_counter()
     budget_sec = max(5.0, _env_float("RANKING_ENTRY_RUNTIME_BUDGET_SEC", 18.0))

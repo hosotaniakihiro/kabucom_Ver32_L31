@@ -570,6 +570,10 @@ def _apply_all_entry_guards(entry_row: Any) -> bool:
 
 
 def _patched_range_5m_filter(entry_row: Any = None, *args, **kwargs):
+    # TONOSAMA一律無視 + RANKING momentum救済は
+    # trading/filters/volatility_filter.py の _range_5m_filter_from_entry_row (V6)
+    # へインライン化済み。ここでは _ORIG_RANGE_FILTER (=その本体) の結果をそのまま使い、
+    # 通過後に _apply_all_entry_guards への橋渡しだけを行う。
     try:
         allow = True
         if callable(_ORIG_RANGE_FILTER):
@@ -577,22 +581,7 @@ def _patched_range_5m_filter(entry_row: Any = None, *args, **kwargs):
         if isinstance(allow, tuple):
             return allow
         if not bool(allow):
-            if _is_tonosama_entry(entry_row) and _env_bool("LOW_MOVE_TONOSAMA_IGNORE_ORIG_RANGE_NG", True):
-                logger.warning(
-                    "[LOW MOVE GUARD] original range_5m_filter NG ignored for TONOSAMA; recheck low movement guard. symbol=%s",
-                    _norm_symbol(_first(_row_to_dict(entry_row), ("symbol", "code", "stock_code"), "")),
-                )
-            elif _is_ranking_entry(entry_row) and _ranking_momentum_ok(
-                _row_to_dict(entry_row),
-                close=_safe_float(_first(_row_to_dict(entry_row), ("close_price", "close", "price", "current_price"), 0.0), 0.0),
-                symbol=_norm_symbol(_first(_row_to_dict(entry_row), ("symbol", "code", "stock_code"), "")),
-                high=_safe_float(_first(_row_to_dict(entry_row), ("high_price", "high"), 0.0), 0.0),
-                low=_safe_float(_first(_row_to_dict(entry_row), ("low_price", "low"), 0.0), 0.0),
-                range_pct=_range_pct_from_row(_row_to_dict(entry_row)),
-            ):
-                logger.warning("[LOW MOVE GUARD] original range_5m_filter NG ignored for strong RANKING")
-            else:
-                return False
+            return False
         return _apply_all_entry_guards(entry_row)
     except RecursionError:
         logger.error("[LOW MOVE GUARD] recursion detected in patched range filter. fail-safe NG. Check duplicate wrappers.", exc_info=False)

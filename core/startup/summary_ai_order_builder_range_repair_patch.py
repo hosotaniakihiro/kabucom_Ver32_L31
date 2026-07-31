@@ -370,25 +370,11 @@ def _install_entry_controller_filter_repair() -> bool:
             vf.atr_1m_filter = _patched_atr_1m_filter
             ec.atr_1m_filter = _patched_atr_1m_filter
 
-        if not getattr(vf.range_5m_filter, "_summary_ai_entry_controller_repair_v5", False):
-            orig_range = getattr(vf.range_5m_filter, "_original", vf.range_5m_filter)
-
-            def _patched_range_5m_filter(entry_row, *args, **kwargs):
-                row = _row_dict(entry_row)
-                if _source_is_summary_ai(row.get("source"), row):
-                    symbol = str(row.get("symbol") or "")
-                    repaired, diag = _repair_row(entry_row, symbol=symbol, source=str(row.get("source") or "SUMMARY"))
-                    if diag.get("repaired") or diag.get("atr_repaired"):
-                        logger.warning("[SUMMARY AI ENTRY CTRL ATR REPAIR] repaired before range_5m_filter detail=%s version=%s", diag, VERSION)
-                        _update_original_row(entry_row, repaired)
-                        return orig_range(repaired, *args, **kwargs)
-                return orig_range(entry_row, *args, **kwargs)
-
-            _patched_range_5m_filter._summary_ai_entry_controller_repair_v4 = True  # type: ignore[attr-defined]
-            _patched_range_5m_filter._summary_ai_entry_controller_repair_v5 = True  # type: ignore[attr-defined]
-            _patched_range_5m_filter._original = orig_range  # type: ignore[attr-defined]
-            vf.range_5m_filter = _patched_range_5m_filter
-            ec.range_5m_filter = _patched_range_5m_filter
+        # range_5m_filter向けのSUMMARY_AI履歴補完(_repair_row呼び出し)は
+        # trading/filters/volatility_filter.py の _range5m_repair_summary_ai_row
+        # (_range_5m_filter_from_entry_row 本体、V6) へインライン化済み。
+        # _repair_row 自体は entry_final_filter_failopen_patch.py も外部から
+        # 呼び出す共有ライブラリのためここに残置する。
 
         logger.warning("[SUMMARY AI ENTRY CTRL ATR REPAIR] installed version=%s", VERSION)
         return True

@@ -289,55 +289,9 @@ def _patch_entry_controller() -> bool:
     except Exception:
         logger.exception("[RANKING FINAL RESCUE] atr patch failed")
 
-    try:
-        cur = getattr(ec, "range_5m_filter", None)
-        if callable(cur) and not getattr(cur, "_ranking_final_rescue_range_v14", False):
-            orig = getattr(cur, "_original_range_5m_filter", cur)
-
-            def patched_range(entry_row: Any = None, *args, **kwargs):
-                try:
-                    ret = orig(entry_row, *args, **kwargs)
-                    if bool(ret):
-                        return ret
-                    if _env_bool("RANKING_FINAL_RESCUE_RANGE_SOFTPASS", True) and _ranking_low_move_soft_ok(entry_row):
-                        high, low, close = _high_low_close(entry_row)
-                        logger.warning(
-                            "[RANKING FINAL RESCUE] RANGE soft-pass symbol=%s score=%.3f high=%.3f low=%.3f close=%.3f range_pct=%.6f turnover=%.0f day=%.3f",
-                            _row_dict(entry_row).get("symbol"), _score(entry_row), high, low, close, _range_pct(entry_row), _turnover(entry_row), _day_pct(entry_row),
-                        )
-                        return True
-                    return ret
-                except TypeError as e:
-                    text = str(e)
-                    if "unexpected keyword argument" in text:
-                        try:
-                            ret = orig(entry_row)
-                            if bool(ret):
-                                return ret
-                            if _env_bool("RANKING_FINAL_RESCUE_RANGE_SOFTPASS", True) and _ranking_low_move_soft_ok(entry_row):
-                                logger.warning(
-                                    "[RANKING FINAL RESCUE] RANGE soft-pass after TypeError symbol=%s score=%.3f turnover=%.0f day=%.3f",
-                                    _row_dict(entry_row).get("symbol"), _score(entry_row), _turnover(entry_row), _day_pct(entry_row),
-                                )
-                                return True
-                            return ret
-                        except Exception:
-                            pass
-                    allow = _env_bool("RANKING_FINAL_RESCUE_RANGE_ERROR_FAILOPEN", True)
-                    logger.warning("[RANKING FINAL RESCUE] range_5m_filter TypeError fail_open=%s err=%s", allow, e)
-                    return bool(allow)
-                except Exception as e:
-                    allow = _env_bool("RANKING_FINAL_RESCUE_RANGE_ERROR_FAILOPEN", True)
-                    logger.warning("[RANKING FINAL RESCUE] range_5m_filter error fail_open=%s err=%s", allow, e)
-                    return bool(allow)
-
-            patched_range._ranking_final_rescue_range_v14 = True  # type: ignore[attr-defined]
-            patched_range._original_range_5m_filter = orig  # type: ignore[attr-defined]
-            ec.range_5m_filter = patched_range
-            ok_any = True
-            logger.warning("[RANKING FINAL RESCUE] patched entry_controller.range_5m_filter v1.4")
-    except Exception:
-        logger.exception("[RANKING FINAL RESCUE] range patch failed")
+    # entry_controller.range_5m_filter (RANKING softpass救済) は
+    # trading/filters/volatility_filter.py の _range_5m_filter_from_entry_row (V6)
+    # へインライン化済み。
 
     try:
         cur = getattr(ec, "ai_final_entry_check", None)

@@ -1,6 +1,6 @@
 # ==========================================================
 # File   : trading/filters/volatility_filter.py
-# Version: PRODUCTION-STABLE-VOLATILITY-FILTER-V5-RANKING-STARTUP-RESCUE
+# Version: PRODUCTION-STABLE-VOLATILITY-FILTER-V6-RANGE-5M-RESCUE-CHAIN-INLINED
 # ----------------------------------------------------------
 # ✔ ENTRY前専用・副作用ゼロ
 # ✔ ATR(1m) + 直近5分値幅 + entry_row高安幅で「動く銘柄だけ」通す
@@ -12,6 +12,26 @@
 # ✔ entry_row経由では本数不足/未生成/列不足/ATRなし/5mなしを fail-close
 # ✔ V5: 起動直後にsummaryが1本だけで high=low=close の場合でも、
 #       ranking_snapshot_1min の新鮮な変動率が十分なら RANKING 由来だけ救済する
+#
+# V6:
+#   - entry_controller.range_5m_filter (= trading.filters.volatility_filter.
+#     range_5m_filter への別名参照。from-import のため片方だけ monkeypatch
+#     すると分岐する) を差し替えていた6本の core/startup/*.py パッチを
+#     _range_5m_filter_from_entry_row 本体へ統合した:
+#       entry_log_skip_reason_collision_patch.py (RANKING min_pct緩和),
+#       low_movement_entry_guard_patch.py (TONOSAMA一律無視 +
+#         RANKING no-highlow momentum救済; _apply_all_entry_guards への
+#         ゲートウェイ部分はそのファイル側に残置),
+#       low_movement_tonosama_no_highlow_patch.py (TONOSAMA
+#         score/volume/range信号フォールバック),
+#       ranking_entry_final_rescue_patch.py (RANKING最終softpass),
+#       summary_ai_order_builder_range_repair_patch.py (SUMMARY_AI
+#         履歴補完; _repair_row 自体は他パッチとの共有のため元ファイルに残置),
+#       volatility_filter_tonosama_entryrow_rescue_patch.py (TONOSAMA
+#         pending参照 + entry_row比率救済)。
+#   - NG時の救済順序: TONOSAMA一律無視 -> TONOSAMA no-highlowフォールバック
+#     -> TONOSAMA pending/entry_row比率救済 -> RANKING最終softpass
+#     -> RANKING no-highlow momentum救済。
 # ==========================================================
 
 from __future__ import annotations
@@ -610,6 +630,236 @@ def _atr_1m_filter_from_entry_row(entry_row: Any, min_ratio: float = DEFAULT_ATR
     return False
 
 
+# ============================================================
+# entry_row-mode range_5m_filter の前処理・救済チェーン
+# (旧 core/startup/*.py の6本の monkeypatch をインライン化)
+# ============================================================
+
+def _is_tonosama_entry_row(entry_row: Any) -> bool:
+    row = _row_to_dict(entry_row)
+    src = str(_first(row, ("source", "pipeline_source"), "") or "").strip().upper()
+    et = str(_first(row, ("entry_type", "type"), "") or "").strip().upper()
+    return src == "TONOSAMA" or et == "TONOSAMA"
+
+
+def _range5m_repair_summary_ai_row(entry_row: Any) -> Any:
+    """SUMMARY_AI由来のentry_rowでhigh/low/atrが0の場合、履歴から補完する
+    (旧 core/startup/summary_ai_order_builder_range_repair_patch.py)。
+    その他の SUMMARY_AI 補完呼び出し (entry_final_filter_failopen_patch.py 等) と
+    共有するため、_repair_row 自体はそのモジュールに残置してある。
+    """
+    try:
+        row = _row_to_dict(entry_row)
+        source = str(row.get("source") or "").strip().upper()
+        if source != "SUMMARY_AI" and source != "SUMMARY":
+            return entry_row
+        from core.startup import summary_ai_order_builder_range_repair_patch as repair_mod
+        repair_fn = getattr(repair_mod, "_repair_row", None)
+        update_fn = getattr(repair_mod, "_update_original_row", None)
+        if not callable(repair_fn):
+            return entry_row
+        symbol = str(row.get("symbol") or "")
+        repaired, diag = repair_fn(entry_row, symbol=symbol, source=str(row.get("source") or "SUMMARY"))
+        if isinstance(repaired, dict) and (diag.get("repaired") or diag.get("atr_repaired")):
+            logger.warning("[VOL FILTER] SUMMARY_AI range/atr repaired before range_5m_filter detail=%s", diag)
+            if callable(update_fn) and isinstance(entry_row, dict):
+                update_fn(entry_row, repaired)
+            return repaired
+    except Exception:
+        logger.debug("[VOL FILTER] SUMMARY_AI range repair skipped", exc_info=True)
+    return entry_row
+
+
+def _tonosama_no_highlow_rescue(entry_row: Any) -> bool:
+    """TONOSAMAでhigh/lowが欠けている場合、score/volume/直接range信号で救済する
+    (旧 core/startup/low_movement_tonosama_no_highlow_patch.py)。
+    """
+    if not _is_tonosama_entry_row(entry_row):
+        return False
+    row = _row_to_dict(entry_row)
+    symbol, close, _, _, _ = _extract_basic_prices(entry_row)
+
+    range_pct = safe_float(_first(row, ("_intrabar_range_pct", "intrabar_range_pct", "range_pct", "row_range_pct", "range_1m_pct", "range_3m_pct", "range_5m_pct"), 0.0), 0.0)
+    if range_pct > 1.0:
+        range_pct = range_pct / 100.0
+    if range_pct > 0:
+        logger.warning("[VOL FILTER] TONOSAMA no-highlow fallback use nested range_pct=%.4f symbol=%s", range_pct, symbol)
+        return True
+
+    score = safe_float(_first(row, ("_tonosama_score", "pending_score", "score", "score_total", "final_score", "display_score", "score_buy", "score_sell", "score_raw"), 0.0), 0.0)
+    volume_signal = safe_float(_first(row, ("_max_volume_surge_ratio", "max_volume_surge_ratio", "volume_surge_ratio", "volume_speed", "dominant_ratio", "volume_surge_ratio_5s"), 0.0), 0.0)
+    if volume_signal <= 0:
+        volume = safe_float(_first(row, ("volume", "latest_volume", "_latest_volume", "volume_1m", "volume_3m", "volume_5m", "latest_5sec_volume", "volume_raw"), 0.0), 0.0)
+        turnover = safe_float(_first(row, ("turnover", "turnover_raw", "trading_value", "trading_value_raw", "売買代金"), 0.0), 0.0)
+        min_vol = _env_float("LOW_MOVE_TONOSAMA_NO_HIGHLOW_MIN_ABS_VOLUME", _env_float("TONOSAMA_ALERT_MIN_LATEST_VOLUME", 30000.0))
+        min_turnover = _env_float("LOW_MOVE_TONOSAMA_NO_HIGHLOW_MIN_TURNOVER", _env_float("TONOSAMA_ALERT_MIN_TURNOVER", 10000000.0))
+        if volume >= min_vol or turnover >= min_turnover:
+            volume_signal = _env_float("LOW_MOVE_TONOSAMA_NO_HIGHLOW_INFERRED_VOLUME_SIGNAL", 1.0)
+
+    min_score = _env_float("LOW_MOVE_TONOSAMA_NO_HIGHLOW_MIN_SCORE", 0.01)
+    min_vol_sig = _env_float("LOW_MOVE_TONOSAMA_NO_HIGHLOW_MIN_VOLUME_SIGNAL", 1.0)
+    strong_score_min = _env_float("LOW_MOVE_TONOSAMA_NO_HIGHLOW_STRONG_SCORE_MIN", 2.0)
+    ok_by_volume = score >= min_score and volume_signal >= min_vol_sig
+    ok_by_strong_score = _env_bool("LOW_MOVE_TONOSAMA_NO_HIGHLOW_ALLOW_STRONG_SCORE", True) and score >= strong_score_min
+    if ok_by_volume or ok_by_strong_score:
+        logger.warning("[VOL FILTER] TONOSAMA no-highlow fallback score=%.4f volume_signal=%.4f symbol=%s", score, volume_signal, symbol)
+        return True
+    logger.info("[VOL FILTER] TONOSAMA no-highlow fallback denied score=%.4f volume_signal=%.4f symbol=%s", score, volume_signal, symbol)
+    return False
+
+
+def _tonosama_pending_entry_for_symbol(symbol: str) -> dict[str, Any]:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        return {}
+    try:
+        from global_state import global_data
+        root = getattr(global_data, "pending_entries", None)
+        if isinstance(root, dict):
+            bucket = root.get(sym) or root.get(str(sym))
+            entries = bucket if isinstance(bucket, (list, tuple, set)) else ([bucket] if bucket is not None else [])
+            for e in entries:
+                d = _row_to_dict(e)
+                if d and _is_tonosama_entry_row(d):
+                    return d
+    except Exception:
+        pass
+    try:
+        import trading.entry.pending_manager as pm
+        iter_entries = getattr(pm, "iter_entries", None)
+        if callable(iter_entries):
+            for s, e in list(iter_entries()):
+                if _normalize_symbol(s) == sym:
+                    d = _row_to_dict(e)
+                    if d and _is_tonosama_entry_row(d):
+                        return d
+    except Exception:
+        pass
+    return {}
+
+
+def _tonosama_entryrow_pending_rescue(entry_row: Any) -> bool:
+    """TONOSAMAのpending登録内容、またはentry_row自身のhigh/low比率・intrabar_pctで
+    救済する (旧 core/startup/volatility_filter_tonosama_entryrow_rescue_patch.py)。
+    """
+    if not _env_bool("TONOSAMA_VOL_ENTRYROW_RESCUE_ENABLED", True):
+        return False
+    row = _row_to_dict(entry_row)
+    symbol, close, high, low, _ = _extract_basic_prices(entry_row)
+    if not row and symbol:
+        row = _tonosama_pending_entry_for_symbol(symbol)
+        close = safe_float(_first(row, ("close_price", "close", "price", "current_price"), 0.0), 0.0)
+        high = safe_float(_first(row, ("high_price", "high", "High"), 0.0), 0.0)
+        low = safe_float(_first(row, ("low_price", "low", "Low"), 0.0), 0.0)
+    if not row or not _is_tonosama_entry_row(row):
+        return False
+
+    intrabar_pct = safe_float(_first(row, ("_intrabar_range_pct", "intrabar_range_pct", "range_pct", "row_range_pct"), 0.0), 0.0)
+    ratio_from_ohlc = ((high - low) / close) if high > 0 and low > 0 and close > 0 and high >= low else 0.0
+    ratio_from_pct = intrabar_pct / 100.0 if intrabar_pct > 0 else 0.0
+    ratio = max(ratio_from_ohlc, ratio_from_pct)
+
+    min_ratio = _env_float("TONOSAMA_VOL_ENTRYROW_RESCUE_MIN_RANGE_RATIO", 0.006)
+    min_pct = _env_float("TONOSAMA_VOL_ENTRYROW_RESCUE_MIN_INTRABAR_PCT", 0.6)
+    ok = ratio >= min_ratio or intrabar_pct >= min_pct
+    if ok:
+        logger.warning("[VOL FILTER] TONOSAMA entryrow/pending rescue allow symbol=%s ratio=%.6f intrabar_pct=%.4f", symbol, ratio, intrabar_pct)
+    return bool(ok)
+
+
+def _ranking_final_softpass_ok(entry_row: Any) -> bool:
+    """RANKING由来でscore/volumeが十分ならレンジ不足を最終救済する
+    (旧 core/startup/ranking_entry_final_rescue_patch.py)。
+    """
+    if not _looks_ranking_entry(entry_row):
+        return False
+    row = _row_to_dict(entry_row)
+    symbol, close, high, low, atr = _extract_basic_prices(entry_row)
+
+    score = safe_float(_first(row, ("pending_score", "score", "score_buy", "score_sell", "ranking_score", "final_score", "display_score", "score_total"), 0.0), 0.0)
+    volume = safe_float(_first(row, ("volume", "Volume", "trading_volume"), 0.0), 0.0)
+    min_score = _env_float("RANKING_FINAL_RESCUE_MIN_SCORE", 50.0)
+    min_volume = _env_float("RANKING_FINAL_RESCUE_MIN_VOLUME", 30000.0)
+    if close <= 0 or score < min_score or (min_volume > 0 and volume < min_volume):
+        return False
+
+    turnover = safe_float(_first(row, ("turnover", "turnover_raw", "trading_value", "trading_amount", "turnover_value", "amount"), 0.0), 0.0)
+    if turnover <= 0 and close > 0 and volume > 0:
+        turnover = close * volume
+    day_abs = abs(safe_float(_first(row, ("day_change_pct", "change_pct", "change_percentage", "change_rate", "day", "day_pct"), 0.0), 0.0))
+    min_turnover = _env_float("RANKING_FINAL_RESCUE_MIN_TURNOVER", 30000000.0)
+    min_day_abs = _env_float("RANKING_FINAL_RESCUE_MIN_DAY_ABS_PCT", 0.0)
+    if min_turnover > 0 and turnover < min_turnover:
+        return False
+    if min_day_abs > 0 and day_abs < min_day_abs:
+        return False
+
+    if atr <= 0:
+        logger.warning("[VOL FILTER] RANKING final soft-pass (zero atr) symbol=%s score=%.3f turnover=%.0f day=%.3f", symbol, score, turnover, day_abs)
+        return True
+    if not (high > 0 and low > 0 and close > 0 and high > low):
+        logger.warning("[VOL FILTER] RANKING final soft-pass (no high/low) symbol=%s score=%.3f turnover=%.0f day=%.3f", symbol, score, turnover, day_abs)
+        return True
+    max_range = _env_float("RANKING_FINAL_RESCUE_SOFTPASS_MAX_RANGE_PCT", 0.0025)
+    range_pct = (high - low) / close
+    ok = range_pct <= max_range
+    if ok:
+        logger.warning("[VOL FILTER] RANKING final soft-pass (tiny range) symbol=%s range_pct=%.6f score=%.3f turnover=%.0f day=%.3f", symbol, range_pct, score, turnover, day_abs)
+    return ok
+
+
+def _ranking_momentum_rescue_ok(entry_row: Any) -> bool:
+    """RANKINGでhigh/lowが無くても、ATR比率/傾き/スコア/MACDが揃えば救済する
+    (旧 core/startup/low_movement_entry_guard_patch.py の range_5m_filter 分)。
+    """
+    if not _env_bool("LOW_MOVE_RANKING_ALLOW_NO_HIGHLOW_MOMENTUM", True):
+        return False
+    if not _looks_ranking_entry(entry_row):
+        return False
+    row = _row_to_dict(entry_row)
+    symbol, close, high, low, atr_price = _extract_basic_prices(entry_row)
+
+    atr = safe_float(_first(row, ("atr", "atr_1m", "atr_5m"), 0.0), 0.0)
+    atr_ratio = atr / close if close > 0 else 0.0
+    min_atr_ratio = _env_float("LOW_MOVE_RANKING_MIN_ATR_RATIO", 0.0035)
+
+    slope_values = [safe_float(row.get(k), 0.0) for k in ("slope_atr_scaled", "slope", "score_slope", "disp_slope", "_slope") if k in row]
+    max_abs_slope = max([abs(x) for x in slope_values], default=0.0)
+    min_abs_slope = _env_float("LOW_MOVE_RANKING_MIN_ABS_SLOPE", 0.001)
+
+    macd = safe_float(row.get("macd"), 0.0)
+    signal = safe_float(row.get("signal"), 0.0)
+    macd_gap = abs(macd - signal)
+    min_macd_gap = _env_float("LOW_MOVE_RANKING_MIN_MACD_GAP", 0.0)
+
+    score = safe_float(_first(row, ("pending_score", "score", "final_score", "display_score", "score_total"), 0.0), 0.0)
+    min_score = _env_float("LOW_MOVE_RANKING_MIN_SCORE_FOR_NO_HIGHLOW", 70.0)
+
+    ok = atr_ratio >= min_atr_ratio and max_abs_slope >= min_abs_slope and score >= min_score and macd_gap >= min_macd_gap
+    if ok:
+        logger.warning(
+            "[VOL FILTER] RANKING no-highlow momentum rescue symbol=%s atr_ratio=%.5f min_atr=%.5f max_abs_slope=%.6f min_slope=%.6f macd_gap=%.4f score=%.2f min_score=%.2f",
+            symbol, atr_ratio, min_atr_ratio, max_abs_slope, min_abs_slope, macd_gap, score, min_score,
+        )
+    return bool(ok)
+
+
+def _range_5m_tonosama_and_ranking_rescue_chain(entry_row: Any, *, min_pct: float) -> bool:
+    symbol, _, _, _, _ = _extract_basic_prices(entry_row)
+    if _is_tonosama_entry_row(entry_row) and _env_bool("LOW_MOVE_TONOSAMA_IGNORE_ORIG_RANGE_NG", True):
+        logger.warning("[VOL FILTER] RANGE NG ignored for TONOSAMA (blanket) symbol=%s", symbol)
+        return True
+    if _tonosama_no_highlow_rescue(entry_row):
+        return True
+    if _tonosama_entryrow_pending_rescue(entry_row):
+        return True
+    if _env_bool("RANKING_FINAL_RESCUE_RANGE_SOFTPASS", True) and _ranking_final_softpass_ok(entry_row):
+        return True
+    if _ranking_momentum_rescue_ok(entry_row):
+        return True
+    return False
+
+
 def _range_5m_filter_from_entry_row(entry_row: Any, min_pct: float = DEFAULT_RANGE_5M_MIN_PCT) -> bool:
     """
     entry_controller.py 互換用。
@@ -623,6 +873,16 @@ def _range_5m_filter_from_entry_row(entry_row: Any, min_pct: float = DEFAULT_RAN
     5m値幅が確認できない場合は止める。
     ただしランキング由来でranking_snapshotの新鮮な変動率が十分なら起動直後のみ救済する。
     """
+    entry_row = _range5m_repair_summary_ai_row(entry_row)
+    if min_pct == DEFAULT_RANGE_5M_MIN_PCT and _looks_ranking_entry(entry_row):
+        min_pct = _env_float("RANKING_ENTRY_RANGE_5M_MIN_PCT", 0.006)
+
+    if _range_5m_filter_from_entry_row_core(entry_row, min_pct=min_pct):
+        return True
+    return _range_5m_tonosama_and_ranking_rescue_chain(entry_row, min_pct=min_pct)
+
+
+def _range_5m_filter_from_entry_row_core(entry_row: Any, min_pct: float = DEFAULT_RANGE_5M_MIN_PCT) -> bool:
     symbol, close, high, low, _ = _extract_basic_prices(entry_row)
 
     # まず summary行そのものの高安幅を確認する。

@@ -1,18 +1,23 @@
 # ============================================================
 # File   : core/startup/low_movement_tonosama_no_highlow_patch.py
-# Version: V4-TONOSAMA-VOLATILITY-RANGE-FILTER-RESCUE
+# Version: V5-RANGE-5M-FILTER-INLINED
 # ------------------------------------------------------------
 # 目的:
 #   TONOSAMA pending が entry_controller に渡る時、top-level high/low が
 #   欠けるため、LOW MOVE GUARD や volatility_filter.range_5m_filter で
 #   RANGE_5M_FILTER_NG になる問題を防ぐ。
 #
-# V4:
+# V5:
+#   - trading.filters.volatility_filter.range_5m_filter(entry_row) の
+#     wrap (score/volume/range信号によるTONOSAMA救済) は
+#     _range_5m_filter_from_entry_row 本体 (V6) へインライン化したため撤去。
+#     low_movement_entry_guard_patch._range_pct_from_row への救済は維持。
+#
+# V4 (旧):
 #   - 従来の low_movement_entry_guard_patch._range_pct_from_row 救済に加え、
 #     trading.filters.volatility_filter.range_5m_filter(entry_row) もwrap。
 #   - TONOSAMA限定で、nested/raw の _intrabar_range_pct / score / volume / surge
 #     を使って 5分レンジ判定の欠損を救済する。
-#   - final_entry_safety_guard / board / order guard は後段で維持。
 # ============================================================
 
 from __future__ import annotations
@@ -25,7 +30,6 @@ logger = logging.getLogger(__name__)
 
 _INSTALLED = False
 _ORIG_RANGE_FN = None
-_ORIG_VOL_RANGE_5M = None
 
 
 def _env_float(name: str, default: float) -> float:
@@ -187,45 +191,13 @@ def _patched_range_pct_from_row(row: dict) -> float:
         return _ORIG_RANGE_FN(row) if callable(_ORIG_RANGE_FN) else 0.0
 
 
-def _range5_rescue_ok(row: Any) -> tuple[bool, dict[str, Any]]:
-    score = _score(row)
-    rng = _direct_range_signal(row)
-    vol_sig = _volume_signal(row)
-    min_score = _env_float("TONOSAMA_VOL_RANGE_RESCUE_MIN_SCORE", 2.0)
-    min_range = _env_float("TONOSAMA_VOL_RANGE_RESCUE_MIN_RANGE_PCT", 0.006)
-    min_vol_sig = _env_float("TONOSAMA_VOL_RANGE_RESCUE_MIN_VOLUME_SIGNAL", 1.0)
-    diag = {"symbol": _symbol(row), "score": round(score, 4), "range_pct": round(rng, 6), "volume_signal": round(vol_sig, 4), "min_score": min_score, "min_range": min_range, "min_volume_signal": min_vol_sig}
-    if not _is_tonosama(row):
-        return False, {**diag, "ng": "not_tonosama"}
-    if score < min_score:
-        return False, {**diag, "ng": "score_low"}
-    if rng >= min_range:
-        return True, {**diag, "rescue": "range"}
-    if vol_sig >= min_vol_sig:
-        return True, {**diag, "rescue": "volume_signal"}
-    return False, {**diag, "ng": "range_volume_low"}
-
-
-def _patched_volatility_range_5m_filter(entry_row: Any = None, *, df_5m=None, symbol=None, min_pct=None):
-    try:
-        if callable(_ORIG_VOL_RANGE_5M):
-            ret = _ORIG_VOL_RANGE_5M(entry_row, df_5m=df_5m, symbol=symbol, min_pct=min_pct) if min_pct is not None else _ORIG_VOL_RANGE_5M(entry_row, df_5m=df_5m, symbol=symbol)
-        else:
-            ret = False
-        if entry_row is not None and df_5m is None and symbol is None and ret is False and _env_on("TONOSAMA_VOL_RANGE_RESCUE_ENABLED", True):
-            ok, diag = _range5_rescue_ok(entry_row)
-            if ok:
-                logger.warning("[TONOSAMA VOL RANGE RESCUE] allow range_5m_filter diag=%s", diag)
-                return True
-            logger.info("[TONOSAMA VOL RANGE RESCUE] reject diag=%s", diag)
-        return ret
-    except Exception:
-        logger.exception("[TONOSAMA VOL RANGE RESCUE] patched range_5m_filter failed")
-        return False
+# range_5m_filter (TONOSAMA score/volume/range信号救済) は
+# trading/filters/volatility_filter.py の _range_5m_filter_from_entry_row (V6)
+# へインライン化済み。
 
 
 def install() -> bool:
-    global _INSTALLED, _ORIG_RANGE_FN, _ORIG_VOL_RANGE_5M
+    global _INSTALLED, _ORIG_RANGE_FN
     if _INSTALLED:
         return True
     try:
@@ -247,17 +219,6 @@ def install() -> bool:
             _patched_range_pct_from_row._tonosama_no_highlow_fallback_patch_v4 = True  # type: ignore[attr-defined]
             _patched_range_pct_from_row._original = _ORIG_RANGE_FN  # type: ignore[attr-defined]
             lm._range_pct_from_row = _patched_range_pct_from_row
-
-        try:
-            import trading.filters.volatility_filter as vf
-            cur_v = getattr(vf, "range_5m_filter", None)
-            if callable(cur_v) and not getattr(cur_v, "_tonosama_vol_range_rescue_v1", False):
-                _ORIG_VOL_RANGE_5M = getattr(cur_v, "_original", cur_v)
-                _patched_volatility_range_5m_filter._tonosama_vol_range_rescue_v1 = True  # type: ignore[attr-defined]
-                _patched_volatility_range_5m_filter._original = _ORIG_VOL_RANGE_5M  # type: ignore[attr-defined]
-                vf.range_5m_filter = _patched_volatility_range_5m_filter
-        except Exception:
-            logger.exception("[TONOSAMA VOL RANGE RESCUE] volatility_filter patch failed")
 
         _INSTALLED = True
         logger.warning(
