@@ -405,6 +405,17 @@ def record_exit(symbol: Any, pnl: float = 0.0, reason: str = "") -> None:
         logger.exception("[TRADE GUARD] record_exit failed symbol=%s", sym)
 
 
+def _record_daily_risk_actual_trade(symbol: Any, pnl: float) -> None:
+    """旧 core/startup/entry_daily_risk_runtime_patch.py が record_exit_event に
+    重ねていた実現損益/勝敗の記録 (日次リスクガードの入力) を呼ぶ。
+    entry_controller.py 側にインライン化済みの _daily_risk_record_actual_trade へ委譲する。"""
+    try:
+        from trading.handlers.entry_controller import _daily_risk_record_actual_trade
+        _daily_risk_record_actual_trade(symbol, float(pnl or 0.0))
+    except Exception:
+        logger.exception("[TRADE GUARD] daily risk actual_trade record failed symbol=%s", symbol)
+
+
 def record_exit_event(symbol: Any = None, pnl: float = 0.0, reason: str = "", *args: Any, **kwargs: Any) -> None:
     """
     旧互換API。
@@ -436,6 +447,8 @@ def record_exit_event(symbol: Any = None, pnl: float = 0.0, reason: str = "", *a
         record_exit(symbol, pnl=float(pnl or 0.0), reason=str(reason or ""))
     except Exception:
         logger.exception("[TRADE GUARD] record_exit_event failed symbol=%s", symbol)
+    finally:
+        _record_daily_risk_actual_trade(symbol, pnl)
 
 
 def record_entry(symbol: Any) -> None:

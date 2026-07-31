@@ -74,8 +74,11 @@ from __future__ import annotations
 import logging
 import os
 import datetime as dt
+import queue
+import sqlite3
 import threading
 import time
+from pathlib import Path
 from threading import Lock
 from copy import deepcopy
 from typing import Any
@@ -1144,12 +1147,1046 @@ def _build_scored_candidates(
     return scored_candidates
 
 
-def _execute_best_candidate(item: dict, boost_active: bool) -> bool:
+# ==========================================================
+# _execute_best_candidate: 9本の monkeypatch を統合本文化
+# (旧 core/startup/entry_controller_runtime_reject_patch.py [kabu APIエラー診断] +
+#  core/startup/entry_daily_risk_runtime_patch.py [日次リスクガード] +
+#  core/startup/final_entry_safety_guard_patch.py [時間帯/流動性/反転/板ガード] +
+#  core/startup/final_entry_liquidity_movement_hard_guard_patch.py [出来高/値動きハードガード] +
+#  core/startup/entry_liquidity_runtime_patch.py [直近summary DB流動性ガード] +
+#  core/startup/final_entry_duplicate_cooldown_patch.py [重複発注クールダウン] +
+#  core/startup/entry_execute_timeout_guard_patch.py [経過候補ガード+タイムアウト実行] +
+#  trading/audit_logging/entry_controller_audit_patch.py [監査ログ] +
+#  core/startup/entry_summary_retry_rotation_runtime_patch.py [未約定キャンセル後の再queue用item記憶])
+#
+# 発見した不具合と対応:
+#   - entry_daily_risk_runtime_patch は final_entry_safety_guard_patch の
+#     _unwrap_true_original が汎用の "_original" 属性を無条件に辿って
+#     しまうバグにより、両パッチとも main.py の起動順で毎回確実に
+#     日次リスクガードだけが読み飛ばされ、一度も機能していなかった
+#     (銘柄別上限・日次損失上限・連敗停止が常に無効)。本文化で修復し有効化する。
+#   - final_entry_duplicate_cooldown_patch はどこからも import されておらず
+#     完全なデッドコードだった。本文化して実際に機能させる。
+#   - entry_summary_retry_rotation_runtime_patch は対象の item を
+#     threading.local() 経由で受け渡していたが、entry_execute_timeout_guard_patch
+#     が別スレッドで発注本体を実行するため、そのスレッドからは空に見え
+#     再queue用の記憶が機能しないケースがあった。本文化で item を直接渡す形にして解消。
+# ==========================================================
+
+# ---- 共有ヘルパー ----
+
+
+def _guard_row_to_dict(v: Any) -> dict:
+    try:
+        if v is None:
+            return {}
+        if isinstance(v, dict):
+            return v
+        if hasattr(v, "to_dict"):
+            d = v.to_dict()
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    return {}
+
+
+def _guard_norm_side(v: Any) -> str:
+    s = str(v or "").strip().upper()
+    if s in {"BUY", "LONG", "2", "買", "買い"}:
+        return "BUY"
+    if s in {"SELL", "SHORT", "1", "売", "売り"}:
+        return "SELL"
+    return s
+
+
+def _guard_first(row: dict, keys: tuple[str, ...], default=None):
+    for k in keys:
+        try:
+            v = row.get(k)
+            if v is not None and str(v).strip() != "":
+                return v
+        except Exception:
+            pass
+    return default
+
+
+# ---- 日次リスクガード (旧 entry_daily_risk_runtime_patch.py V1.7) ----
+
+_DAILY_RISK_DB_SCHEMA_READY: set[str] = set()
+
+
+def _daily_risk_today() -> str:
+    return dt.datetime.now().strftime("%Y%m%d")
+
+
+def _daily_risk_now_iso() -> str:
+    return dt.datetime.now().replace(microsecond=0).isoformat(sep=" ")
+
+
+def _daily_risk_db_path() -> str:
+    base = os.getenv(
+        "TRADE_GUARD_DB_DIR",
+        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\trade_guard",
+    )
+    return os.getenv("TRADE_GUARD_DB_PATH", str(Path(base) / f"trade_guard{_daily_risk_today()}.db"))
+
+
+def _daily_risk_ensure_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS symbol_daily_entry_risk (
+            trade_date TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            entry_count INTEGER NOT NULL DEFAULT 0,
+            entry_sent_count INTEGER NOT NULL DEFAULT 0,
+            daily_pnl REAL NOT NULL DEFAULT 0,
+            win_count INTEGER NOT NULL DEFAULT 0,
+            loss_count INTEGER NOT NULL DEFAULT 0,
+            last_entry_time TEXT DEFAULT '',
+            last_exit_time TEXT DEFAULT '',
+            updated_at TEXT DEFAULT '',
+            PRIMARY KEY (trade_date, symbol)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS global_daily_entry_risk (
+            trade_date TEXT PRIMARY KEY,
+            trade_count INTEGER NOT NULL DEFAULT 0,
+            entry_sent_count INTEGER NOT NULL DEFAULT 0,
+            daily_pnl REAL NOT NULL DEFAULT 0,
+            win_count INTEGER NOT NULL DEFAULT 0,
+            loss_count INTEGER NOT NULL DEFAULT 0,
+            consecutive_losses INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT DEFAULT ''
+        )
+        """
+    )
+    for ddl in (
+        "ALTER TABLE symbol_daily_entry_risk ADD COLUMN win_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE symbol_daily_entry_risk ADD COLUMN loss_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE symbol_daily_entry_risk ADD COLUMN entry_sent_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE global_daily_entry_risk ADD COLUMN entry_sent_count INTEGER NOT NULL DEFAULT 0",
+    ):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass
+    conn.commit()
+
+
+def _daily_risk_connect() -> sqlite3.Connection:
+    path = _daily_risk_db_path()
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    conn = sqlite3.connect(path, timeout=3.0)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=3000")
+    if path not in _DAILY_RISK_DB_SCHEMA_READY:
+        _daily_risk_ensure_schema(conn)
+        _DAILY_RISK_DB_SCHEMA_READY.add(path)
+    return conn
+
+
+def _daily_risk_get_symbol_row(symbol: str) -> dict[str, Any]:
+    symbol = normalize_symbol(symbol)
+    with _daily_risk_connect() as conn:
+        cur = conn.execute(
+            """
+            SELECT entry_count, entry_sent_count, daily_pnl, win_count, loss_count, last_entry_time, last_exit_time
+            FROM symbol_daily_entry_risk
+            WHERE trade_date=? AND symbol=?
+            """,
+            (_daily_risk_today(), symbol),
+        )
+        row = cur.fetchone()
+        if row:
+            return {
+                "entry_count": int(row[0] or 0),
+                "entry_sent_count": int(row[1] or 0),
+                "daily_pnl": float(row[2] or 0.0),
+                "win_count": int(row[3] or 0),
+                "loss_count": int(row[4] or 0),
+                "last_entry_time": row[5] or "",
+                "last_exit_time": row[6] or "",
+            }
+    return {"entry_count": 0, "entry_sent_count": 0, "daily_pnl": 0.0, "win_count": 0, "loss_count": 0, "last_entry_time": "", "last_exit_time": ""}
+
+
+def _daily_risk_get_global_row() -> dict[str, Any]:
+    with _daily_risk_connect() as conn:
+        cur = conn.execute(
+            """
+            SELECT trade_count, entry_sent_count, daily_pnl, win_count, loss_count, consecutive_losses, updated_at
+            FROM global_daily_entry_risk
+            WHERE trade_date=?
+            """,
+            (_daily_risk_today(),),
+        )
+        row = cur.fetchone()
+        if row:
+            return {
+                "trade_count": int(row[0] or 0),
+                "entry_sent_count": int(row[1] or 0),
+                "daily_pnl": float(row[2] or 0.0),
+                "win_count": int(row[3] or 0),
+                "loss_count": int(row[4] or 0),
+                "consecutive_losses": int(row[5] or 0),
+                "updated_at": row[6] or "",
+            }
+    return {"trade_count": 0, "entry_sent_count": 0, "daily_pnl": 0.0, "win_count": 0, "loss_count": 0, "consecutive_losses": 0, "updated_at": ""}
+
+
+def _daily_risk_record_entry_sent(symbol: str) -> None:
+    """発注成功時点で、同一銘柄の当日再エントリー抑止用カウントを増やす。"""
+    symbol = normalize_symbol(symbol)
+    if not symbol:
+        return
+    with _daily_risk_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO symbol_daily_entry_risk
+                (trade_date, symbol, entry_count, entry_sent_count, daily_pnl, win_count, loss_count, last_entry_time, updated_at)
+            VALUES (?, ?, 0, 1, 0, 0, 0, ?, ?)
+            ON CONFLICT(trade_date, symbol) DO UPDATE SET
+                entry_sent_count = entry_sent_count + 1,
+                last_entry_time = excluded.last_entry_time,
+                updated_at = excluded.updated_at
+            """,
+            (_daily_risk_today(), symbol, _daily_risk_now_iso(), _daily_risk_now_iso()),
+        )
+        conn.execute(
+            """
+            INSERT INTO global_daily_entry_risk
+                (trade_date, trade_count, entry_sent_count, daily_pnl, win_count, loss_count, consecutive_losses, updated_at)
+            VALUES (?, 0, 1, 0, 0, 0, 0, ?)
+            ON CONFLICT(trade_date) DO UPDATE SET
+                entry_sent_count = entry_sent_count + 1,
+                updated_at = excluded.updated_at
+            """,
+            (_daily_risk_today(), _daily_risk_now_iso()),
+        )
+        conn.commit()
+    logger.info("[ENTRY DAILY RISK] entry_sent recorded symbol=%s", symbol)
+
+
+def _daily_risk_record_actual_trade(symbol: str, pnl: float) -> None:
+    """実際に約定して返済された時、当日実現損益/勝敗を更新する。trading/exit/symbol_trade_guard.py の
+    record_exit_event から呼ばれる。"""
+    symbol = normalize_symbol(symbol)
+    if not symbol:
+        return
+    pnl_f = float(pnl or 0.0)
+    is_win = 1 if pnl_f > 0 else 0
+    is_loss = 1 if pnl_f < 0 else 0
+    new_consecutive_losses_expr = "consecutive_losses + 1" if is_loss else "0"
+    with _daily_risk_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO symbol_daily_entry_risk
+                (trade_date, symbol, entry_count, entry_sent_count, daily_pnl, win_count, loss_count, last_entry_time, last_exit_time, updated_at)
+            VALUES (?, ?, 1, 0, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(trade_date, symbol) DO UPDATE SET
+                entry_count = entry_count + 1,
+                daily_pnl = daily_pnl + excluded.daily_pnl,
+                win_count = win_count + excluded.win_count,
+                loss_count = loss_count + excluded.loss_count,
+                last_exit_time = excluded.last_exit_time,
+                updated_at = excluded.updated_at
+            """,
+            (_daily_risk_today(), symbol, pnl_f, is_win, is_loss, _daily_risk_now_iso(), _daily_risk_now_iso(), _daily_risk_now_iso()),
+        )
+        conn.execute(
+            """
+            INSERT INTO global_daily_entry_risk
+                (trade_date, trade_count, entry_sent_count, daily_pnl, win_count, loss_count, consecutive_losses, updated_at)
+            VALUES (?, 1, 0, ?, ?, ?, ?, ?)
+            ON CONFLICT(trade_date) DO UPDATE SET
+                trade_count = trade_count + 1,
+                daily_pnl = daily_pnl + excluded.daily_pnl,
+                win_count = win_count + excluded.win_count,
+                loss_count = loss_count + excluded.loss_count,
+                consecutive_losses = """ + new_consecutive_losses_expr + """,
+                updated_at = excluded.updated_at
+            """,
+            (_daily_risk_today(), pnl_f, is_win, is_loss, 1 if is_loss else 0, _daily_risk_now_iso()),
+        )
+        conn.commit()
+    logger.info("[ENTRY DAILY RISK] actual_trade recorded symbol=%s pnl=%s", symbol, pnl_f)
+
+
+def _daily_risk_is_winning_symbol(srow: dict[str, Any]) -> bool:
+    if not _env_bool("ENTRY_WINNING_SYMBOL_REENTRY_ENABLED", True):
+        return False
+    win_count = int(srow.get("win_count") or 0)
+    loss_count = int(srow.get("loss_count") or 0)
+    daily_pnl = float(srow.get("daily_pnl") or 0.0)
+    min_pnl = _env_float("ENTRY_WINNING_SYMBOL_MIN_DAILY_PNL", 1.0)
+    if daily_pnl < min_pnl:
+        return False
+    if _env_bool("ENTRY_WINNING_SYMBOL_REQUIRE_WIN_GT_LOSS", True):
+        return win_count > loss_count
+    return win_count >= 1
+
+
+def _daily_risk_block_reason(symbol: str, side: str) -> tuple[bool, str, dict[str, Any]]:
+    if not _env_bool("ENTRY_DAILY_RISK_GUARD_ENABLED", True):
+        return False, "", {}
+    symbol = normalize_symbol(symbol)
+    side_u = str(side or "").upper()
+    if side_u == "BUY" and not _env_bool("ENTRY_BUY_ENABLED", True):
+        return True, "BUY_DISABLED_BY_DAILY_RISK_PATCH", {"symbol": symbol, "side": side_u}
+
+    try:
+        srow = _daily_risk_get_symbol_row(symbol)
+        grow = _daily_risk_get_global_row()
+    except Exception:
+        logger.exception("[ENTRY DAILY RISK] db read failed symbol=%s -> fail-open", symbol)
+        return False, "", {}
+
+    max_entries = _env_int("ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL", 2)
+    winning_max_entries = _env_int("ENTRY_WINNING_SYMBOL_MAX_DAILY_ENTRIES", 4)
+    symbol_max_loss = _env_float("ENTRY_SYMBOL_MAX_DAILY_LOSS_YEN", -1500.0)
+    stop_after_first_loss = _env_bool("ENTRY_STOP_SYMBOL_AFTER_FIRST_LOSS", True)
+    stop_after_first_loss_only_net_negative = _env_bool("ENTRY_STOP_AFTER_FIRST_LOSS_ONLY_IF_NET_NEGATIVE", True)
+    global_max_loss = _env_float("ENTRY_GLOBAL_MAX_DAILY_LOSS_YEN", -50000.0)
+    global_max_trades = _env_int("ENTRY_GLOBAL_MAX_DAILY_TRADES", 30)
+    global_max_consec_losses = _env_int("ENTRY_GLOBAL_MAX_CONSECUTIVE_LOSSES", 20)
+
+    entry_count = int(srow.get("entry_count") or 0)
+    entry_sent_count = int(srow.get("entry_sent_count") or 0)
+    loss_count = int(srow.get("loss_count") or 0)
+    daily_pnl = float(srow.get("daily_pnl") or 0.0)
+    winning_symbol = _daily_risk_is_winning_symbol(srow)
+
+    if winning_symbol and _env_bool("ENTRY_WINNING_SYMBOL_IGNORE_SENT_ONLY", True):
+        symbol_seen_entries = entry_count
+    else:
+        symbol_seen_entries = max(entry_count, entry_sent_count)
+
+    effective_max_entries = max_entries
+    if winning_symbol:
+        effective_max_entries = max(max_entries, winning_max_entries)
+
+    if global_max_trades > 0 and int(grow.get("trade_count") or 0) >= global_max_trades:
+        return True, "GLOBAL_DAILY_TRADE_LIMIT", {"symbol": symbol, "side": side_u, "max_trades": global_max_trades, **grow}
+
+    if float(grow.get("daily_pnl") or 0.0) <= global_max_loss:
+        return True, "GLOBAL_DAILY_LOSS_LIMIT", {"symbol": symbol, "side": side_u, "max_loss": global_max_loss, **grow}
+
+    if global_max_consec_losses > 0 and int(grow.get("consecutive_losses") or 0) >= global_max_consec_losses:
+        return True, "GLOBAL_CONSECUTIVE_LOSS_LIMIT", {"symbol": symbol, "side": side_u, "max_consecutive_losses": global_max_consec_losses, **grow}
+
+    if stop_after_first_loss and loss_count >= 1:
+        if not (stop_after_first_loss_only_net_negative and winning_symbol and daily_pnl > 0):
+            return True, "SYMBOL_STOP_AFTER_FIRST_LOSS", {"symbol": symbol, "side": side_u, "winning_symbol": winning_symbol, **srow}
+
+    if float(srow.get("daily_pnl") or 0.0) <= symbol_max_loss:
+        return True, "SYMBOL_DAILY_LOSS_LIMIT", {"symbol": symbol, "side": side_u, "max_loss": symbol_max_loss, **srow}
+
+    if effective_max_entries > 0 and symbol_seen_entries >= effective_max_entries:
+        return True, "SYMBOL_DAILY_ENTRY_LIMIT", {
+            "symbol": symbol,
+            "side": side_u,
+            "max_entries": effective_max_entries,
+            "winning_symbol": winning_symbol,
+            "symbol_seen_entries": symbol_seen_entries,
+            **srow,
+        }
+
+    return False, "", {}
+
+
+# ---- 時間帯/流動性/反転/板ガード (旧 final_entry_safety_guard_patch.py V12) ----
+
+_FINAL_GUARD_BOARD_COOLDOWN_UNTIL = 0.0
+_FINAL_GUARD_BOARD_CACHE: dict[str, tuple[float, tuple[float, float, float, float]]] = {}
+
+
+def _final_guard_parse_hhmm(s: str, default_h: int, default_m: int) -> tuple[int, int]:
+    try:
+        hh, mm = str(s).strip().split(":", 1)
+        return int(hh), int(mm)
+    except Exception:
+        return default_h, default_m
+
+
+def _final_guard_entry_time_ok(symbol: str, side: str) -> bool:
+    if not _env_bool("ENTRY_TIME_GUARD_ENABLED", True):
+        return True
+    now = dt.datetime.now().time()
+    bh, bm = _final_guard_parse_hhmm(os.getenv("ENTRY_NO_NEW_BEFORE", "09:05"), 9, 5)
+    ah, am = _final_guard_parse_hhmm(os.getenv("ENTRY_NO_NEW_AFTER", "15:20"), 15, 20)
+    if now < dt.time(bh, bm) or now >= dt.time(ah, am):
+        return False
+    if _env_bool("ENTRY_LUNCH_GUARD_ENABLED", True):
+        sh, sm = _final_guard_parse_hhmm(os.getenv("ENTRY_LUNCH_BLOCK_START", "11:30"), 11, 30)
+        eh, em = _final_guard_parse_hhmm(os.getenv("ENTRY_LUNCH_BLOCK_END", "12:30"), 12, 30)
+        if dt.time(sh, sm) <= now < dt.time(eh, em):
+            return False
+    return True
+
+
+def _final_guard_liquidity_ok(row: dict, symbol: str, side: str) -> bool:
+    if not _env_bool("ENTRY_FINAL_LIQUIDITY_GUARD_ENABLED", True):
+        return True
+    close = _safe_float(_guard_first(row, ("close", "close_price", "price", "current_price"), 0.0), 0.0)
+    volume = _safe_float(_guard_first(row, ("volume", "Volume", "出来高"), 0.0), 0.0)
+    turnover = _safe_float(_guard_first(row, ("turnover", "trading_value", "売買代金"), 0.0), 0.0)
+    if turnover <= 0 and close > 0 and volume > 0:
+        turnover = close * volume
+    min_volume = _env_float("ENTRY_MIN_VOLUME", 30000.0)
+    min_turnover = _env_float("ENTRY_MIN_TURNOVER", 10000000.0)
+    if volume <= 0 or volume < min_volume or turnover < min_turnover:
+        return False
+    return True
+
+
+def _final_guard_recent_reverse_ok(row: dict, symbol: str, side: str) -> bool:
+    if not _env_bool("ENTRY_RECENT_REVERSE_GUARD_ENABLED", True):
+        return True
+    slope = _safe_float(_guard_first(row, ("slope_5s", "recent_slope", "slope_atr_scaled", "score_slope", "slope"), 0.0), 0.0)
+    max_bad_slope = _env_float("ENTRY_RECENT_REVERSE_MAX_BAD_SLOPE", 0.12)
+    if side == "BUY" and slope <= -max_bad_slope:
+        return False
+    if side == "SELL" and slope >= max_bad_slope:
+        return False
+    return True
+
+
+def _final_guard_extract_bid_ask(row: dict) -> tuple[float, float, float, float]:
+    bid = _safe_float(_guard_first(row, ("bid", "best_bid", "BidPrice", "bid_price"), 0.0), 0.0)
+    ask = _safe_float(_guard_first(row, ("ask", "best_ask", "AskPrice", "ask_price"), 0.0), 0.0)
+    bid_qty = _safe_float(_guard_first(row, ("bid_qty", "best_bid_qty", "BidQty", "bid_volume"), 0.0), 0.0)
+    ask_qty = _safe_float(_guard_first(row, ("ask_qty", "best_ask_qty", "AskQty", "ask_volume"), 0.0), 0.0)
+    return bid, ask, bid_qty, ask_qty
+
+
+def _final_guard_try_get_bid_ask_from_api(symbol: str) -> tuple[float, float, float, float]:
+    global _FINAL_GUARD_BOARD_COOLDOWN_UNTIL
+    if not _env_bool("ENTRY_BOARD_API_LOOKUP_ENABLED", False):
+        return 0.0, 0.0, 0.0, 0.0
+    now = time.time()
+    if now < _FINAL_GUARD_BOARD_COOLDOWN_UNTIL:
+        return 0.0, 0.0, 0.0, 0.0
+    ttl = max(0.1, _env_float("ENTRY_BOARD_API_CACHE_TTL_SEC", 2.0))
+    cached = _FINAL_GUARD_BOARD_CACHE.get(symbol)
+    if cached and now - cached[0] <= ttl:
+        return cached[1]
+    try:
+        from utils_common import get_latest_bid_ask
+
+        res = get_latest_bid_ask(symbol)
+        bid = ask = bid_qty = ask_qty = 0.0
+        if isinstance(res, dict):
+            bid = _safe_float(res.get("bid") or res.get("best_bid") or res.get("BidPrice") or res.get("bid_price"), 0.0)
+            ask = _safe_float(res.get("ask") or res.get("best_ask") or res.get("AskPrice") or res.get("ask_price"), 0.0)
+            bid_qty = _safe_float(res.get("bid_qty") or res.get("BidQty") or res.get("bid_volume"), 0.0)
+            ask_qty = _safe_float(res.get("ask_qty") or res.get("AskQty") or res.get("ask_volume"), 0.0)
+        elif isinstance(res, (list, tuple)) and len(res) >= 2:
+            bid, ask = _safe_float(res[0], 0.0), _safe_float(res[1], 0.0)
+            if len(res) >= 4:
+                bid_qty, ask_qty = _safe_float(res[2], 0.0), _safe_float(res[3], 0.0)
+        if bid > 0 and ask > 0:
+            _FINAL_GUARD_BOARD_CACHE[symbol] = (now, (bid, ask, bid_qty, ask_qty))
+            return bid, ask, bid_qty, ask_qty
+    except Exception as e:
+        msg = repr(e)
+        if "429" in msg or "4001006" in msg or "4002006" in msg or "API実行回数" in msg or "レジスト数" in msg:
+            _FINAL_GUARD_BOARD_COOLDOWN_UNTIL = time.time() + max(10.0, _env_float("ENTRY_BOARD_API_ERROR_COOLDOWN_SEC", 60.0))
+        logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_API_NG symbol=%s error=%s", symbol, msg)
+    return 0.0, 0.0, 0.0, 0.0
+
+
+def _final_guard_board_missing_fallback_ok(row: dict, symbol: str, side: str) -> bool:
+    # 緩和しない: ENTRY_ALLOW_ENTRY_WITHOUT_BOARD=1 を明示した場合だけ許可。
+    if not _env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", False):
+        return False
+    close = _safe_float(_guard_first(row, ("close", "close_price", "price", "current_price"), 0.0), 0.0)
+    volume = _safe_float(_guard_first(row, ("volume", "Volume", "出来高"), 0.0), 0.0)
+    turnover = _safe_float(_guard_first(row, ("turnover", "trading_value", "売買代金"), 0.0), 0.0)
+    if turnover <= 0 and close > 0 and volume > 0:
+        turnover = close * volume
+    score = abs(_safe_float(_guard_first(row, ("score", "score_total", "final_score", "display_score", "score_sell", "score_buy"), 0.0), 0.0))
+    if close < _env_float("ENTRY_ALLOW_WITHOUT_BOARD_MIN_PRICE", 200.0):
+        return False
+    if volume < _env_float("ENTRY_ALLOW_WITHOUT_BOARD_MIN_VOLUME", 30000.0):
+        return False
+    if turnover < _env_float("ENTRY_ALLOW_WITHOUT_BOARD_MIN_TURNOVER", 10000000.0):
+        return False
+    if score < _env_float("ENTRY_ALLOW_WITHOUT_BOARD_MIN_SCORE", 0.90):
+        return False
+    return True
+
+
+def _final_guard_board_ok(row: dict, item: dict, symbol: str, side: str) -> bool:
+    if not _env_bool("ENTRY_BOARD_GUARD_ENABLED", True):
+        return True
+    bid, ask, bid_qty, ask_qty = _final_guard_extract_bid_ask(row)
+    if bid <= 0 or ask <= 0:
+        bid2, ask2, bidq2, askq2 = _final_guard_try_get_bid_ask_from_api(symbol)
+        bid, ask, bid_qty, ask_qty = bid or bid2, ask or ask2, bid_qty or bidq2, ask_qty or askq2
+    if bid <= 0 or ask <= 0:
+        if _final_guard_board_missing_fallback_ok(row, symbol, side):
+            return True
+        logger.warning("[FINAL ENTRY SAFETY GUARD] BOARD_MISSING symbol=%s side=%s bid=%s ask=%s", symbol, side, bid, ask)
+        return False
+    mid = (bid + ask) / 2.0
+    spread_pct = ((ask - bid) / mid) * 100.0 if mid > 0 else 999.0
+    if spread_pct > _env_float("ENTRY_MAX_SPREAD_PCT", 0.20):
+        logger.warning("[FINAL ENTRY SAFETY GUARD] SPREAD_TOO_WIDE symbol=%s side=%s spread_pct=%.4f", symbol, side, spread_pct)
+        return False
+    try:
+        row.update({"bid": bid, "ask": ask, "bid_qty": bid_qty, "ask_qty": ask_qty})
+        if isinstance(item.get("entry_row"), dict):
+            item["entry_row"].update({"bid": bid, "ask": ask, "bid_qty": bid_qty, "ask_qty": ask_qty})
+    except Exception:
+        pass
+    return True
+
+
+# ---- 出来高/値動きハードガード (旧 final_entry_liquidity_movement_hard_guard_patch.py V5) ----
+
+
+def _hard_guard_copy_nested(prefix: str, src: Any, dst: dict) -> None:
+    try:
+        if hasattr(src, "to_dict"):
+            src = src.to_dict()
+        if not isinstance(src, dict):
+            return
+        for k, v in src.items():
+            if k not in dst or dst.get(k) in (None, ""):
+                dst[k] = v
+            if isinstance(v, dict):
+                _hard_guard_copy_nested(f"{prefix}_{k}", v, dst)
+    except Exception:
+        pass
+
+
+def _hard_guard_merge_item_row(item: dict) -> dict:
+    row: dict = {}
+    try:
+        row.update(_guard_row_to_dict(item.get("entry_row")))
+        _hard_guard_copy_nested("entry_alias", item.get("entry"), row)
+        _hard_guard_copy_nested("ai_alias", item.get("ai"), row)
+        for k, v in item.items():
+            if k not in row or row.get(k) in (None, ""):
+                row[k] = v
+    except Exception:
+        pass
+    return row
+
+
+def _hard_guard_range_pct(row: dict, close: float) -> float:
+    high = _safe_float(_guard_first(row, ("high", "high_price", "HighPrice"), 0.0), 0.0)
+    low = _safe_float(_guard_first(row, ("low", "low_price", "LowPrice"), 0.0), 0.0)
+    if close > 0 and high > 0 and low > 0 and high >= low:
+        return (high - low) / close
+    raw = _safe_float(_guard_first(row, ("_intrabar_range_pct", "intrabar_range_pct", "range_pct", "price_range_pct", "range_1m_pct", "range_3m_pct", "range_5m_pct", "disp_range_pct"), 0.0), 0.0)
+    if raw > 1.0:
+        raw = raw / 100.0
+    return max(0.0, raw)
+
+
+def _hard_guard_abs_score(row: dict, side: str) -> float:
+    side_u = _guard_norm_side(side)
+    if side_u == "BUY":
+        keys = ("score_buy", "buy_score", "ai_buy_score", "priority_score", "priority", "confidence")
+    elif side_u == "SELL":
+        keys = ("score_sell", "sell_score", "ai_sell_score", "priority_score", "priority", "confidence")
+    else:
+        keys = ("score", "score_total", "final_score", "display_score", "priority_score", "priority", "confidence")
+    for k in keys:
+        v = _safe_float(row.get(k), 0.0)
+        if v:
+            return abs(v)
+    return 0.0
+
+
+def _hard_guard_is_summary_ai(row: dict) -> bool:
+    text = " ".join(str(row.get(k) or "") for k in ("source", "pipeline_source", "entry_type", "strategy", "model", "model_used", "reason", "ai_reason")).upper()
+    return "SUMMARY_AI" in text or "SUMMARY" in text or "MTF" in text
+
+
+def _hard_guard_summary_ai_low_movement_rescue(row: dict, *, symbol: str, side: str, volume: float, turnover: float, close: float) -> bool:
+    if not _env_bool("ENTRY_HARD_SUMMARY_AI_LOW_MOVEMENT_RESCUE", True):
+        return False
+    if not _hard_guard_is_summary_ai(row):
+        return False
+    score = _hard_guard_abs_score(row, side)
+    min_score = _env_float("ENTRY_HARD_SUMMARY_AI_RESCUE_MIN_SCORE", 3.0)
+    min_volume = _env_float("ENTRY_HARD_SUMMARY_AI_RESCUE_MIN_VOLUME", _env_float("ENTRY_HARD_MIN_VOLUME", 30000.0))
+    min_turnover = _env_float("ENTRY_HARD_SUMMARY_AI_RESCUE_MIN_TURNOVER", _env_float("ENTRY_HARD_MIN_TURNOVER", 10000000.0))
+    if score >= min_score and volume >= min_volume and turnover >= min_turnover and close > 0:
+        logger.warning("[ENTRY HARD GUARD] SUMMARY_AI_LOW_MOVEMENT_RESCUE symbol=%s side=%s score=%.3f", symbol, side, score)
+        return True
+    return False
+
+
+def _hard_guard_ok(item: dict) -> bool:
+    if not _env_bool("ENTRY_HARD_LIQUIDITY_MOVEMENT_GUARD_ENABLED", True):
+        return True
+    row = _hard_guard_merge_item_row(item)
+    symbol = normalize_symbol(_guard_first(row, ("symbol", "Symbol", "code", "銘柄コード"), ""))
+    side = _guard_norm_side(_guard_first(row, ("side", "entry_decision", "ai_side"), ""))
+    close = _safe_float(_guard_first(row, ("close", "close_price", "price", "current_price"), 0.0), 0.0)
+
+    volume = _safe_float(_guard_first(row, ("volume", "Volume", "出来高", "day_volume", "acc_volume", "trading_volume", "_latest_volume", "latest_volume", "recent_volume", "recent_volume_1m", "recent_volume_3m", "recent_volume_5m", "display_volume_1m", "volume_1m", "volume_3m", "volume_5m"), 0.0), 0.0)
+    turnover = _safe_float(_guard_first(row, ("turnover", "trading_value", "売買代金", "day_turnover", "acc_turnover", "turnover_value"), 0.0), 0.0)
+    if turnover <= 0 and close > 0 and volume > 0:
+        turnover = close * volume
+    if volume <= 0 and close > 0 and turnover > 0:
+        volume = turnover / close
+
+    min_volume = _env_float("ENTRY_HARD_MIN_VOLUME", 30000.0)
+    min_turnover = _env_float("ENTRY_HARD_MIN_TURNOVER", 10000000.0)
+    if volume <= 0 or volume < min_volume:
+        logger.warning("[ENTRY HARD GUARD] NG symbol=%s side=%s reason=low_volume volume=%.0f min_volume=%.0f", symbol, side, volume, min_volume)
+        return False
+    if turnover < min_turnover:
+        logger.warning("[ENTRY HARD GUARD] NG symbol=%s side=%s reason=low_turnover turnover=%.0f min_turnover=%.0f", symbol, side, turnover, min_turnover)
+        return False
+
+    if not _env_bool("ENTRY_HARD_REQUIRE_MOVEMENT", True):
+        return True
+
+    range_value = _hard_guard_range_pct(row, close)
+    atr = _safe_float(_guard_first(row, ("atr", "atr_1m", "atr_3m", "atr_5m"), 0.0), 0.0)
+    atr_ratio = atr / close if close > 0 and atr > 0 else 0.0
+    slope = _safe_float(_guard_first(row, ("slope_atr_scaled", "slope", "score_slope", "disp_slope", "_slope"), 0.0), 0.0)
+
+    min_range = _env_float("ENTRY_HARD_MIN_RANGE_PCT", 0.006)
+    min_atr_ratio = _env_float("ENTRY_HARD_MIN_ATR_RATIO", 0.003)
+    min_abs_slope = _env_float("ENTRY_HARD_MIN_ABS_SLOPE", 0.001)
+
+    movement_ok = range_value >= min_range or atr_ratio >= min_atr_ratio or abs(slope) >= min_abs_slope
+    if not movement_ok:
+        if _hard_guard_summary_ai_low_movement_rescue(row, symbol=symbol, side=side, volume=volume, turnover=turnover, close=close):
+            return True
+        logger.warning("[ENTRY HARD GUARD] NG symbol=%s side=%s reason=low_movement range_pct=%.5f atr_ratio=%.5f slope=%.6f", symbol, side, range_value, atr_ratio, slope)
+        return False
+    return True
+
+
+# ---- 直近summary DB流動性ガード (旧 entry_liquidity_runtime_patch.py V1.4) ----
+
+
+def _recent_liq_calc_turnover_yen(close: float, volume: float) -> float:
+    close = _safe_float(close, 0.0)
+    volume = _safe_float(volume, 0.0)
+    if close <= 0 or volume <= 0:
+        return 0.0
+    return close * volume
+
+
+def _recent_liq_normalize_turnover_yen(turnover: float, close: float, volume: float) -> float:
+    raw = max(0.0, _safe_float(turnover, 0.0))
+    calc = _recent_liq_calc_turnover_yen(close, volume)
+    if calc > 0 and (raw <= 0 or raw < calc * 0.5):
+        return calc
+    return raw
+
+
+def _recent_liq_entry_row_values(row: dict) -> dict:
+    close = _safe_float(_guard_first(row, ("close_price", "close", "price", "current_price"), 0.0), 0.0)
+    volume = _safe_float(_guard_first(row, ("volume", "Volume", "vol", "出来高"), 0.0), 0.0)
+    high = _safe_float(_guard_first(row, ("high_price", "high"), 0.0), 0.0)
+    low = _safe_float(_guard_first(row, ("low_price", "low"), 0.0), 0.0)
+    atr = _safe_float(_guard_first(row, ("atr", "atr_1m", "atr_3m", "atr_5m"), 0.0), 0.0)
+    turnover_raw = _safe_float(_guard_first(row, ("turnover_yen", "turnover", "trading_value", "売買代金"), 0.0), 0.0)
+    turnover = _recent_liq_normalize_turnover_yen(turnover_raw, close, volume)
+    return {
+        "close": close,
+        "volume": volume,
+        "turnover": turnover,
+        "range_pct": ((high - low) / close) if close > 0 and high >= low and high > 0 and low > 0 else 0.0,
+        "atr_pct": (atr / close) if close > 0 and atr > 0 else 0.0,
+    }
+
+
+def _recent_liq_summary_db_path() -> str:
+    base = os.getenv(
+        "SUMMARY_DB_DIR",
+        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary",
+    )
+    return os.getenv("SUMMARY_DB_PATH", str(Path(base) / f"summary{_daily_risk_today()}.db"))
+
+
+def _recent_liq_col(conn: sqlite3.Connection, table: str, names: list[str]) -> str:
+    try:
+        cols = {str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for n in names:
+            if n in cols:
+                return n
+    except Exception:
+        return ""
+    return ""
+
+
+def _recent_liq_recent_values(symbol: str, bars: int) -> dict:
+    path = _recent_liq_summary_db_path()
+    table = os.getenv("ENTRY_LIQ_SUMMARY_TABLE", "stock_summary_1min")
+    if not symbol or not Path(path).exists():
+        return {}
+    try:
+        with sqlite3.connect(path, timeout=1.0) as conn:
+            conn.execute("PRAGMA busy_timeout=1000")
+            sym = _recent_liq_col(conn, table, ["symbol", "code", "stock_code"])
+            tm = _recent_liq_col(conn, table, ["datetime", "dt", "timestamp", "time"])
+            cl = _recent_liq_col(conn, table, ["close_price", "close", "price", "current_price"])
+            hi = _recent_liq_col(conn, table, ["high_price", "high"])
+            lo = _recent_liq_col(conn, table, ["low_price", "low"])
+            vo = _recent_liq_col(conn, table, ["volume", "Volume", "vol"])
+            tv = _recent_liq_col(conn, table, ["turnover_yen", "turnover", "trading_value", "売買代金"])
+            at = _recent_liq_col(conn, table, ["atr", "atr_1m", "atr_3m", "atr_5m"])
+            if not sym or not tm or not cl:
+                return {}
+            select = f"{tm}, {cl}, {hi or '0'}, {lo or '0'}, {vo or '0'}, {tv or '0'}, {at or '0'}"
+            sql = f"SELECT {select} FROM {table} WHERE CAST({sym} AS TEXT)=? ORDER BY {tm} DESC LIMIT ?"
+            rows = conn.execute(sql, (normalize_symbol(symbol), max(1, bars))).fetchall()
+            if not rows:
+                return {}
+        close = _safe_float(rows[0][1], 0.0)
+        highs = [_safe_float(r[2], 0.0) for r in rows if _safe_float(r[2], 0.0) > 0]
+        lows = [_safe_float(r[3], 0.0) for r in rows if _safe_float(r[3], 0.0) > 0]
+        volume = sum(max(0.0, _safe_float(r[4], 0.0)) for r in rows)
+        turnover_raw = sum(max(0.0, _safe_float(r[5], 0.0)) for r in rows)
+        turnover_calc_yen = sum(_recent_liq_calc_turnover_yen(_safe_float(r[1], 0.0), _safe_float(r[4], 0.0)) for r in rows)
+        turnover = _recent_liq_normalize_turnover_yen(turnover_raw, close, volume)
+        if turnover_calc_yen > 0 and turnover < turnover_calc_yen * 0.5:
+            turnover = turnover_calc_yen
+        atrs = [_safe_float(r[6], 0.0) for r in rows if _safe_float(r[6], 0.0) > 0]
+        return {
+            "close": close,
+            "volume": volume,
+            "turnover": turnover,
+            "range_pct": ((max(highs) - min(lows)) / close) if close > 0 and highs and lows else 0.0,
+            "atr_pct": ((sum(atrs) / len(atrs)) / close) if close > 0 and atrs else 0.0,
+        }
+    except Exception:
+        logger.debug("[ENTRY LIQ GUARD] recent read failed symbol=%s path=%s", symbol, path, exc_info=True)
+        return {}
+
+
+def _recent_liq_values(row: dict) -> dict:
+    if _env_bool("ENTRY_LIQ_USE_RECENT_SUMMARY", True):
+        v = _recent_liq_recent_values(normalize_symbol(row.get("symbol")), _env_int("ENTRY_LIQ_RECENT_BARS", 5))
+        if v:
+            return v
+    return _recent_liq_entry_row_values(row)
+
+
+def _recent_liq_ok(row: dict, symbol: str, side: str) -> bool:
+    if not _env_bool("ENTRY_LIQ_GUARD_ENABLED", True):
+        return True
+    v = _recent_liq_values(row)
+    close = _safe_float(v.get("close"), 0.0)
+    volume = _safe_float(v.get("volume"), 0.0)
+    turnover = _safe_float(v.get("turnover"), 0.0)
+    range_pct = _safe_float(v.get("range_pct"), 0.0)
+    atr_pct = _safe_float(v.get("atr_pct"), 0.0)
+    min_volume = _env_float("ENTRY_LIQ_MIN_VOLUME", 30000.0)
+    min_turnover = _env_float("ENTRY_LIQ_MIN_TURNOVER_YEN", 10000000.0)
+    min_range_pct = _env_float("ENTRY_LIQ_MIN_RANGE_PCT", 0.0015)
+    min_atr_pct = _env_float("ENTRY_LIQ_MIN_ATR_PCT", 0.0010)
+    if _env_bool("ENTRY_LIQ_REQUIRE_DATA", True):
+        if close <= 0 or volume <= 0:
+            logger.warning("[ENTRY LIQ GUARD] NG symbol=%s side=%s reason=no_recent_data close=%s volume=%s", symbol, side, close, volume)
+            return False
+    if volume < min_volume:
+        logger.warning("[ENTRY LIQ GUARD] NG symbol=%s side=%s reason=volume_low volume=%.0f min=%.0f", symbol, side, volume, min_volume)
+        return False
+    if turnover < min_turnover:
+        logger.warning("[ENTRY LIQ GUARD] NG symbol=%s side=%s reason=turnover_low turnover=%.0f min=%.0f", symbol, side, turnover, min_turnover)
+        return False
+    if range_pct < min_range_pct and atr_pct < min_atr_pct:
+        logger.warning("[ENTRY LIQ GUARD] NG symbol=%s side=%s reason=movement_low range_pct=%.5f atr_pct=%.5f", symbol, side, range_pct, atr_pct)
+        return False
+    return True
+
+
+# ---- 重複発注クールダウン (旧 final_entry_duplicate_cooldown_patch.py, デッドコードから復活) ----
+
+_DUP_COOLDOWN_LAST_ATTEMPT_TS: dict[tuple[str, str], float] = {}
+_DUP_COOLDOWN_INFLIGHT: set[tuple[str, str]] = set()
+_DUP_COOLDOWN_LOCK = threading.Lock()
+
+
+def _dup_cooldown_check_and_enter(symbol: str, side: str) -> bool:
+    """True=発注続行可。inflight中/cooldown中は False。呼び出し側は finally で
+    _dup_cooldown_leave() を呼ぶこと。"""
+    if not _env_bool("ENTRY_FINAL_DUPLICATE_COOLDOWN_ENABLED", True):
+        return True
+    if not symbol or side not in {"BUY", "SELL"}:
+        return True
+    key = (symbol, side)
+    now = time.time()
+    cooldown = _env_float("ENTRY_FINAL_DUPLICATE_COOLDOWN_SEC", 45.0)
+    cooldown = max(0.0, min(300.0, cooldown))
+    with _DUP_COOLDOWN_LOCK:
+        if key in _DUP_COOLDOWN_INFLIGHT:
+            logger.warning("[FINAL ENTRY DUP COOLDOWN] skip inflight symbol=%s side=%s", symbol, side)
+            return False
+        last = _DUP_COOLDOWN_LAST_ATTEMPT_TS.get(key, 0.0)
+        if cooldown > 0 and last > 0 and (now - last) < cooldown:
+            logger.warning("[FINAL ENTRY DUP COOLDOWN] skip cooldown symbol=%s side=%s elapsed=%.1fs cooldown=%.1fs", symbol, side, now - last, cooldown)
+            return False
+        _DUP_COOLDOWN_LAST_ATTEMPT_TS[key] = now
+        _DUP_COOLDOWN_INFLIGHT.add(key)
+    return True
+
+
+def _dup_cooldown_leave(symbol: str, side: str) -> None:
+    with _DUP_COOLDOWN_LOCK:
+        _DUP_COOLDOWN_INFLIGHT.discard((symbol, side))
+
+
+# ---- kabu APIエラー診断 (旧 entry_controller_runtime_reject_patch.py V5) ----
+
+KABU_CODE_CREDIT_NEW_ORDER_SUPPRESSED = "100368"
+KABU_CODE_SYMBOL_TRADE_RESTRICTED = "100033"
+
+
+def _kabu_norm_code(v: Any) -> str:
+    try:
+        if v is None:
+            return ""
+        s = str(v).strip()
+        return s[:-2] if s.endswith(".0") else s
+    except Exception:
+        return ""
+
+
+def _kabu_last_send_error() -> dict:
+    try:
+        from kabu_api.send_order import get_last_send_order_error
+        err = get_last_send_order_error()
+        return dict(err) if isinstance(err, dict) else {}
+    except Exception:
+        return {}
+
+
+def _kabu_same_order_error(err: dict, *, symbol: str, side: str) -> bool:
+    try:
+        if not err:
+            return False
+        return str(err.get("symbol") or "").strip() == str(symbol) and str(err.get("side") or "").strip().upper() == str(side).upper()
+    except Exception:
+        return False
+
+
+def _kabu_is_100368_error(err: dict) -> bool:
+    code = _kabu_norm_code(err.get("code"))
+    msg = str(err.get("message") or "")
+    return code == KABU_CODE_CREDIT_NEW_ORDER_SUPPRESSED or ("信用新規" in msg and "抑止" in msg)
+
+
+def _kabu_is_100033_error(err: dict) -> bool:
+    code = _kabu_norm_code(err.get("code"))
+    msg = str(err.get("message") or "")
+    return code == KABU_CODE_SYMBOL_TRADE_RESTRICTED or ("この銘柄" in msg and "取引" in msg and "制限" in msg)
+
+
+# ---- 未約定キャンセル後の再queue用item記憶 (旧 entry_summary_retry_rotation_runtime_patch.py) ----
+
+
+def _remember_order_for_summary_retry(order_id: str, symbol: str, side: str, entry: Any) -> None:
+    try:
+        from core.startup.entry_summary_retry_rotation_runtime_patch import remember_order_for_retry
+        remember_order_for_retry(order_id, symbol, side, entry)
+    except Exception:
+        logger.debug("[ENTRY CONTROLLER] summary retry remember failed order_id=%s symbol=%s", order_id, symbol, exc_info=True)
+
+
+# ---- 監査ログ (旧 trading/audit_logging/entry_controller_audit_patch.py V02) ----
+
+
+def _audit_candidate_ok_safe(symbol: str, side: str, entry_row: dict, ai: dict, ai_msg: str) -> str:
+    entry_id = ""
+    try:
+        from trading.audit_logging.entry_audit import audit_candidate_ok, _build_entry_id
+        entry_id = _build_entry_id(symbol, side, entry_row)
+        audit_candidate_ok(symbol=symbol, side=side, entry_row=entry_row, ai=ai, ai_msg=ai_msg)
+    except Exception:
+        pass
+    return entry_id
+
+
+def _audit_order_safe(*, symbol: str, side: str, qty: int, order_type: str, price: Any, status: str, reason: str, entry_row: dict, ai: dict, ai_msg: str, entry_id: str) -> None:
+    try:
+        from trading.audit_logging.entry_audit import audit_order
+        audit_order(
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            order_type=order_type,
+            price=price,
+            status=status,
+            reason=reason,
+            entry_row=entry_row,
+            ai=ai,
+            ai_msg=ai_msg,
+            entry_id=entry_id,
+        )
+    except Exception:
+        pass
+
+
+# ---- 経過候補ガード + タイムアウト実行 (旧 entry_execute_timeout_guard_patch.py V6) ----
+
+_EXECUTE_INFLIGHT: dict[tuple[str, str], dict[str, Any]] = {}
+_EXECUTE_INFLIGHT_LOCK = threading.RLock()
+_EXECUTE_LOCAL = threading.local()
+
+
+def _execute_first_dt(*values: Any) -> dt.datetime | None:
+    for v in values:
+        try:
+            if isinstance(v, dt.datetime):
+                return v.replace(tzinfo=None)
+            if v is None or str(v).strip() == "":
+                continue
+            s = str(v).strip()
+            try:
+                return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
+            except Exception:
+                pass
+            for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+                try:
+                    return dt.datetime.strptime(s, fmt)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return None
+
+
+def _execute_is_summary_ai_candidate(item: dict, row: dict) -> bool:
+    try:
+        ai = item.get("ai") if isinstance(item.get("ai"), dict) else {}
+        source = str(item.get("source") or row.get("source") or ai.get("source") or "").upper()
+        entry_type = str(item.get("entry_type") or row.get("entry_type") or ai.get("entry_type") or "").upper()
+        return source == "SUMMARY" or entry_type == "SUMMARY_AI"
+    except Exception:
+        return False
+
+
+def _execute_item_age_sec(item: dict, row: dict) -> tuple[float | None, str]:
+    ai = item.get("ai") if isinstance(item.get("ai"), dict) else {}
+    now = dt.datetime.now()
+    if _execute_is_summary_ai_candidate(item, row):
+        ts = _execute_first_dt(item.get("updated_at"), row.get("updated_at"), ai.get("updated_at"), item.get("created_at"), row.get("created_at"), item.get("pending_created_at"))
+        if ts is not None:
+            return max(0.0, (now - ts).total_seconds()), "created_at"
+        return 0.0, "summary_ai_now_fallback"
+    ts = _execute_first_dt(item.get("created_at"), item.get("pending_created_at"), ai.get("created_at"))
+    if ts is not None:
+        return max(0.0, (now - ts).total_seconds()), "created_at"
+    ts = _execute_first_dt(item.get("datetime"), row.get("datetime"), item.get("entry_time"), row.get("entry_time"))
+    if ts is not None:
+        return max(0.0, (now - ts).total_seconds()), "datetime"
+    return None, "missing"
+
+
+def _execute_prune_pending_for_symbol(symbol: str, side: str, reason: str) -> int:
+    try:
+        from trading.entry import pending_manager
+        side_u = _guard_norm_side(side)
+
+        def pred(sym: str, entry: dict) -> bool:
+            if normalize_symbol(sym) != symbol:
+                return False
+            e_side = _guard_norm_side(entry.get("side") or entry.get("entry_decision") or entry.get("ai_side"))
+            return not e_side or e_side == side_u
+
+        return int(pending_manager.prune_entries(pred, reason=reason))
+    except Exception:
+        logger.exception("[ENTRY EXEC TIMEOUT GUARD] pending prune failed symbol=%s side=%s reason=%s", symbol, side, reason)
+        return 0
+
+
+def _execute_candidate_stale_ok(item: dict, row: dict, symbol: str, side: str) -> bool:
+    if not _env_bool("ENTRY_EXECUTE_STALE_CANDIDATE_GUARD_ENABLED", True):
+        return True
+    age, source = _execute_item_age_sec(item, row)
+    if age is None:
+        return True
+    max_age = _env_float("ENTRY_EXECUTE_MAX_CANDIDATE_AGE_SEC", 90.0)
+    if source == "datetime":
+        max_age = _env_float("ENTRY_EXECUTE_MAX_BAR_AGE_SEC", 180.0)
+    if source == "summary_ai_now_fallback":
+        return True
+    if age <= max_age:
+        return True
+    removed = _execute_prune_pending_for_symbol(symbol, side, "execute_candidate_stale")
+    logger.warning("[ENTRY EXEC TIMEOUT GUARD] STALE_CANDIDATE_SKIP symbol=%s side=%s age=%.1fs max_age=%.1fs pruned=%s", symbol, side, age, max_age, removed)
+    return False
+
+
+def _execute_cleanup_inflight() -> None:
+    now = time.time()
+    ttl = _env_float("ENTRY_EXECUTE_INFLIGHT_TTL_SEC", 120.0)
+    with _EXECUTE_INFLIGHT_LOCK:
+        for key, info in list(_EXECUTE_INFLIGHT.items()):
+            started = float(info.get("started", now))
+            if bool(info.get("done")) or now - started > ttl:
+                _EXECUTE_INFLIGHT.pop(key, None)
+
+
+def _execute_best_candidate_core(item: dict, boost_active: bool) -> bool:
     symbol = item["symbol"]
     entry_row = item["entry_row"]
     entry_type = item["entry_type"]
     side = item["side"]
     ai = item["ai"]
+    ai_msg = item.get("ai_msg") or ""
+    entry = item.get("entry")
+
+    # 1. 日次リスクガード (銘柄別上限/日次損失上限/連敗停止/勝ち銘柄再エントリー許可)
+    blocked, reason, detail = _daily_risk_block_reason(symbol, side)
+    if blocked:
+        _log_skip(symbol, reason, side=side)
+        return False
+
+    # 2. 時間帯/流動性/反転/板ガード
+    if not _final_guard_entry_time_ok(symbol, side):
+        _log_skip(symbol, "time_guard_ng", side=side)
+        return False
+    if not _final_guard_liquidity_ok(entry_row, symbol, side):
+        _log_skip(symbol, "liquidity_guard_ng", side=side)
+        return False
+    if not _final_guard_recent_reverse_ok(entry_row, symbol, side):
+        _log_skip(symbol, "recent_reverse_guard_ng", side=side)
+        return False
+    if not _final_guard_board_ok(entry_row, item, symbol, side):
+        _log_skip(symbol, "board_missing", side=side, retryable=True)
+        return False
+
+    # 3. 出来高/値動きハードガード (SUMMARY_AI高スコア救済つき)
+    if not _hard_guard_ok(item):
+        _log_skip(symbol, "liquidity_movement_hard_guard_ng", side=side)
+        return False
+
+    # 4. 直近summary DB流動性ガード
+    if not _recent_liq_ok(entry_row, symbol, side):
+        _log_skip(symbol, "recent_liquidity_guard_ng", side=side)
+        return False
+
+    # 5. 重複発注クールダウン (同一銘柄・同一方向の連続発注を抑止)
+    if not _dup_cooldown_check_and_enter(symbol, side):
+        return False
+    try:
+        return _execute_best_candidate_dispatch(item, boost_active, symbol=symbol, entry_row=entry_row, entry_type=entry_type, side=side, ai=ai, ai_msg=ai_msg, entry=entry)
+    finally:
+        _dup_cooldown_leave(symbol, side)
+
+
+def _execute_best_candidate_dispatch(item: dict, boost_active: bool, *, symbol: str, entry_row: dict, entry_type: str, side: str, ai: dict, ai_msg: str, entry: Any) -> bool:
+    entry_id = _audit_candidate_ok_safe(symbol, side, entry_row, ai, ai_msg)
 
     price = _resolve_price(entry_row)
 
@@ -1268,14 +2305,40 @@ def _execute_best_candidate(item: dict, boost_active: bool) -> bool:
         # ここで30分 trade_restricted にすると、候補が生きていても再試行できず、
         # 「ENTRY_DISPATCH まで行くが発火しない」状態が長く続く。
         # API 429 等の明確な rate limit は send_order 側や global guard 側で別途制御する。
+        last_err = _kabu_last_send_error()
+        same_err = _kabu_same_order_error(last_err, symbol=symbol, side=side)
+
+        if same_err and _kabu_is_100368_error(last_err):
+            # 100368「信用新規の注文は抑止されております」は銘柄個別停止にしない。
+            # 今回の注文は失敗だが、次候補・次サイクルは止めない。
+            logger.warning(
+                "🚫 CREDIT_NEW_ORDER_API_REJECT_NO_LOCAL_SUPPRESS_CONFIRMED symbol=%s side=%s qty=%s order_type=%s price=%s last_error=%s",
+                symbol, side, order_qty, order_type, order_price, last_err,
+            )
+            _audit_order_safe(symbol=symbol, side=side, qty=0, order_type="ENTRY_PIPELINE", price=price, status="FAILED_OR_SKIPPED", reason="execute_best_candidate_result", entry_row=entry_row, ai=ai, ai_msg=ai_msg, entry_id=entry_id)
+            _log_skip(symbol, "CREDIT_NEW_ORDER_API_REJECT_NO_LOCAL_SUPPRESS", side=side, qty=order_qty, order_type=order_type, price=order_price, code=last_err.get("code"), message=last_err.get("message"))
+            return False
+
+        if same_err and _kabu_is_100033_error(last_err):
+            # 100033「この銘柄のお取引は制限されています」は銘柄個別制限として扱う。
+            logger.warning(
+                "🚫 SYMBOL_TRADE_RESTRICTED_BY_KABU_API_CONFIRMED symbol=%s side=%s qty=%s order_type=%s price=%s code=%s message=%s",
+                symbol, side, order_qty, order_type, order_price, last_err.get("code"), last_err.get("message"),
+            )
+            _audit_order_safe(symbol=symbol, side=side, qty=0, order_type="ENTRY_PIPELINE", price=price, status="FAILED_OR_SKIPPED", reason="execute_best_candidate_result", entry_row=entry_row, ai=ai, ai_msg=ai_msg, entry_id=entry_id)
+            _log_skip(symbol, "SYMBOL_TRADE_RESTRICTED_BY_KABU_API", side=side, qty=order_qty, order_type=order_type, price=order_price, code=last_err.get("code"), message=last_err.get("message"))
+            return False
+
         logger.warning(
-            "⚠ ORDER_ID_EMPTY_NO_LONG_RESTRICT symbol=%s side=%s qty=%s order_type=%s price=%s -> retry allowed next cycle",
+            "⚠ ORDER_ID_EMPTY_NO_LONG_RESTRICT symbol=%s side=%s qty=%s order_type=%s price=%s last_error=%s -> retry allowed next cycle",
             symbol,
             side,
             order_qty,
             order_type,
             order_price,
+            last_err,
         )
+        _audit_order_safe(symbol=symbol, side=side, qty=0, order_type="ENTRY_PIPELINE", price=price, status="FAILED_OR_SKIPPED", reason="execute_best_candidate_result", entry_row=entry_row, ai=ai, ai_msg=ai_msg, entry_id=entry_id)
         _log_skip(
             symbol,
             "ORDER_ID_EMPTY_RETRYABLE",
@@ -1287,6 +2350,12 @@ def _execute_best_candidate(item: dict, boost_active: bool) -> bool:
         return False
 
     global_data.add_entry_inflight(symbol, order_id, side)
+    try:
+        _daily_risk_record_entry_sent(symbol)
+    except Exception:
+        logger.exception("[ENTRY DAILY RISK] record entry_sent failed symbol=%s", symbol)
+    _remember_order_for_summary_retry(str(order_id), symbol, side, entry)
+    _audit_order_safe(symbol=symbol, side=side, qty=0, order_type="ENTRY_PIPELINE", price=price, status="ORDER_ACCEPTED", reason="execute_best_candidate_result", entry_row=entry_row, ai=ai, ai_msg=ai_msg, entry_id=entry_id)
 
     logger.info(
         "🚀 ENTRY_APPROVED symbol=%s side=%s qty=%s order_type=%s price=%s priority=%.4f order_id=%s",
@@ -1299,6 +2368,77 @@ def _execute_best_candidate(item: dict, boost_active: bool) -> bool:
         order_id,
     )
     return True
+
+
+def _execute_best_candidate(item: dict, boost_active: bool) -> bool:
+    if not isinstance(item, dict):
+        logger.warning("[ENTRY EXEC TIMEOUT GUARD] INVALID_ITEM type=%s", type(item))
+        return False
+    symbol = normalize_symbol(item.get("symbol"))
+    side = _guard_norm_side(item.get("side"))
+    row = _guard_row_to_dict(item.get("entry_row"))
+    if not symbol or side not in {"BUY", "SELL"}:
+        logger.warning("[ENTRY EXEC TIMEOUT GUARD] INVALID_SYMBOL_SIDE symbol=%s side=%s", symbol, side)
+        return False
+    if not _execute_candidate_stale_ok(item, row, symbol, side):
+        return False
+
+    if bool(getattr(_EXECUTE_LOCAL, "inside_timeout_runner", False)):
+        # entry_execute_timeout_guard のタイムアウト実行スレッド内から再入した場合は
+        # 二重タイムアウト・二重スレッド生成を避け、直接実行する。
+        return bool(_execute_best_candidate_core(item, boost_active))
+
+    if not _env_bool("ENTRY_EXECUTE_TIMEOUT_GUARD_ENABLED", True):
+        return bool(_execute_best_candidate_core(item, boost_active))
+
+    timeout = max(0.5, _env_float("ENTRY_EXECUTE_ORIG_TIMEOUT_SEC", 8.0))
+    q: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+    key = (symbol, side)
+
+    def runner() -> None:
+        prev = bool(getattr(_EXECUTE_LOCAL, "inside_timeout_runner", False))
+        _EXECUTE_LOCAL.inside_timeout_runner = True
+        try:
+            q.put_nowait(("ok", bool(_execute_best_candidate_core(item, boost_active))))
+        except Exception as exc:
+            try:
+                q.put_nowait(("err", exc))
+            except Exception:
+                pass
+        finally:
+            _EXECUTE_LOCAL.inside_timeout_runner = prev
+            with _EXECUTE_INFLIGHT_LOCK:
+                info = _EXECUTE_INFLIGHT.get(key)
+                if isinstance(info, dict):
+                    info["done"] = True
+
+    with _EXECUTE_INFLIGHT_LOCK:
+        _execute_cleanup_inflight()
+        existing = _EXECUTE_INFLIGHT.get(key)
+        if isinstance(existing, dict) and not bool(existing.get("done")):
+            logger.warning("[ENTRY EXEC TIMEOUT GUARD] INFLIGHT_DUPLICATE_SKIP symbol=%s side=%s", symbol, side)
+            return False
+        _EXECUTE_INFLIGHT[key] = {"started": time.time(), "done": False}
+
+    th = threading.Thread(target=runner, name=f"entry-execute-timeout-{symbol}-{side}", daemon=True)
+    th.start()
+    th.join(timeout)
+    if th.is_alive():
+        removed = _execute_prune_pending_for_symbol(symbol, side, "execute_orig_timeout")
+        logger.warning("[ENTRY EXEC TIMEOUT GUARD] ORIG_TIMEOUT_RETURN_FALSE symbol=%s side=%s timeout=%.1fs pruned=%s", symbol, side, timeout, removed)
+        return False
+    try:
+        status, value = q.get_nowait()
+    except Exception:
+        logger.warning("[ENTRY EXEC TIMEOUT GUARD] ORIG_EMPTY_RESULT symbol=%s side=%s", symbol, side)
+        return False
+    finally:
+        with _EXECUTE_INFLIGHT_LOCK:
+            _EXECUTE_INFLIGHT.pop(key, None)
+    if status == "err":
+        logger.warning("[ENTRY EXEC TIMEOUT GUARD] ORIG_ERROR_RETURN_FALSE symbol=%s side=%s error=%r", symbol, side, value)
+        return False
+    return bool(value)
 
 
 # ==========================================================

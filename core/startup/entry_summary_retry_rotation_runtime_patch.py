@@ -1,18 +1,29 @@
 # ============================================================
 # File   : core/startup/entry_summary_retry_rotation_runtime_patch.py
-# Version: V1.1-SUMMARY-AI-REST-BOARD-REPRICE-ONCE
+# Version: V2-EXECUTE-BEST-CANDIDATE-WRAP-REMOVED
 # ------------------------------------------------------------
 # SUMMARY_AIでAI_OKになった候補を、未約定2秒キャンセル後に
 # pendingへ戻す。
 #
-# V1.0:
-#   - 最大3巡まで循環。
+# V2:
+#   - _execute_best_candidate / global_data.add_entry_inflight の
+#     monkeypatchラップ (item を threading.local() 経由で受け渡す方式) を撤去。
+#     entry_execute_timeout_guard_patch が発注本体を別スレッド
+#     (threading.Thread) で実行するため、その内部から呼ばれる
+#     add_entry_inflight のラップでは _CURRENT.item が別スレッドの
+#     thread-local に見えず、記憶できないことがあるバグを内包していた。
+#   - trading/handlers/entry_controller.py の _execute_best_candidate 本体
+#     (発注成功直後) から remember_order_for_retry() を直接呼ぶ形に変更し、
+#     item を直接渡すことで解消した。
 #
 # V1.1:
 #   - RESTフル板エントリー有効時は、再queueを原則1回だけにする。
 #   - 再queue時にもう一度 build_entry_order() を通るため、REST板で
 #     価格を再計算できる。
 #   - 1回再挑戦しても約定しない場合は、同銘柄に粘らず次候補へ進む。
+#
+# V1.0:
+#   - 最大3巡まで循環。
 # ============================================================
 
 from __future__ import annotations
@@ -28,7 +39,6 @@ logger = logging.getLogger(__name__)
 _INSTALLED = False
 _LOCK = threading.RLock()
 _ORDER_ENTRY_MAP: Dict[str, Dict[str, Any]] = {}
-_CURRENT = threading.local()
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -92,13 +102,11 @@ def _set_short_cooldown(symbol: str) -> None:
         logger.exception("[SUMMARY RETRY ROTATION] cooldown failed symbol=%s", symbol)
 
 
-def _remember_order(order_id: str, symbol: str, side: str) -> None:
+def remember_order_for_retry(order_id: str, symbol: str, side: str, entry: Any) -> None:
+    """trading/handlers/entry_controller.py の _execute_best_candidate 本体から、
+    発注成功直後に item["entry"] を直接渡して呼ばれる。"""
     try:
-        item = getattr(_CURRENT, "item", None)
-        if not order_id or not isinstance(item, dict):
-            return
-        entry = item.get("entry")
-        if not isinstance(entry, dict) or not _is_summary_ai(entry):
+        if not order_id or not isinstance(entry, dict) or not _is_summary_ai(entry):
             return
         saved = copy.deepcopy(entry)
         saved["symbol"] = _sym(saved.get("symbol") or symbol)
@@ -161,41 +169,9 @@ def install() -> bool:
     global _INSTALLED
     if _INSTALLED:
         return True
-    try:
-        import trading.handlers.entry_controller as ec
-        from global_state import global_data
-    except Exception:
-        logger.exception("[SUMMARY RETRY ROTATION] import failed")
-        return False
-    old_execute = getattr(ec, "_execute_best_candidate", None)
-    old_add = getattr(global_data, "add_entry_inflight", None)
-    if not callable(old_execute) or not callable(old_add):
-        logger.warning("[SUMMARY RETRY ROTATION] required functions missing")
-        return False
-    if not getattr(old_execute, "_summary_retry_current_wrapped", False):
-        def wrapped_execute(item: dict, boost_active: bool) -> bool:
-            _CURRENT.item = item
-            try:
-                return old_execute(item, boost_active=boost_active)
-            finally:
-                try:
-                    _CURRENT.item = None
-                except Exception:
-                    pass
-        wrapped_execute._summary_retry_current_wrapped = True  # type: ignore[attr-defined]
-        wrapped_execute._original = old_execute  # type: ignore[attr-defined]
-        ec._execute_best_candidate = wrapped_execute
-    if not getattr(old_add, "_summary_retry_add_wrapped", False):
-        def wrapped_add_entry_inflight(symbol: str, order_id: str, side: str):
-            ret = old_add(symbol, order_id, side)
-            _remember_order(str(order_id), symbol, side)
-            return ret
-        wrapped_add_entry_inflight._summary_retry_add_wrapped = True  # type: ignore[attr-defined]
-        wrapped_add_entry_inflight._original = old_add  # type: ignore[attr-defined]
-        global_data.add_entry_inflight = wrapped_add_entry_inflight
     _INSTALLED = True
     logger.warning(
-        "[SUMMARY RETRY ROTATION] installed max_rounds=%s cooldown_sec=%.2f rest_reprice_once=%s",
+        "[SUMMARY RETRY ROTATION] installed (execute_best_candidate wrap removed, called directly from entry_controller) max_rounds=%s cooldown_sec=%.2f rest_reprice_once=%s",
         _env_int("ENTRY_SUMMARY_RETRY_MAX_ROUNDS", _retry_max_rounds_default()),
         _env_float("ENTRY_SUMMARY_RETRY_SYMBOL_COOLDOWN_SEC", _retry_cooldown_default()),
         _rest_board_reprice_mode(),
@@ -207,4 +183,4 @@ try:
 except Exception:
     logger.exception("[SUMMARY RETRY ROTATION] auto install failed")
 
-__all__ = ["install", "on_unfilled_order_cancelled"]
+__all__ = ["install", "on_unfilled_order_cancelled", "remember_order_for_retry"]
