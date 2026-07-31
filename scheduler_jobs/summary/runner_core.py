@@ -300,8 +300,87 @@ def job_ranking_5m(display: bool = True, now: Optional[dt.datetime] = None, run_
 # ============================================================
 # PUSH summary job
 # ============================================================
+#
+# job_summary/job_1m/run_push_summary_job は、以前は core/startup/ の3本の
+# runtime patch (summary_main_direct_push_force_patch.py /
+# summary_main_1m_light_tick_patch.py / summary_main_memory_latest_1m_patch.py)
+# がそれぞれ total-overwrite 方式で奪い合っていた ("3-way race")。
+#
+# 発見した不具合: summary_main_direct_push_force_patch.py は再適用用の
+# 永続 watcher スレッド (起動後180秒間、2秒毎) を持ち、初回だけキャッシュした
+# 古い "original" 参照を使い回していたため、他の2本が後から重ね書きしても
+# 次の watcher tick (main.py 起動シーケンス中に確実に発生する) で古い原本を
+# 土台に自分自身を再インストールし、他の2本のロジックを毎回確実に奪っていた。
+# 結果、summary_main_1m_light_tick_patch.py の「本物のPUSH summary runner
+# パイプラインを使う、より正確な高速経路」は事実上一度も選ばれなかった。
+#
+# 本文化により、tier1/tier2 として明示的に優先順位を固定した:
+#   tier1: summary_main_direct_push_force_patch.tier1_build_and_publish
+#          (memory直接ビルド + タイムアウト保護 + 保存 + AI投入のhardening)
+#   tier2: summary_main_1m_light_tick_patch.build_light_1m_summary
+#          (本物のPUSH summary runnerパイプライン、保存/表示のみスキップ)
+#   tier3: _job_summary_original_heavy (このファイルの元来の重い実装)
+# いずれも interval==1 かつ各パッチ自身の実行コンテキスト判定
+# (_is_main_py() 相当 / _is_entry_only_context()) を満たす場合のみ有効。
+
+
+def _job_summary_tier1_direct_memory(now: dt.datetime, *, run_entry: bool) -> pd.DataFrame:
+    try:
+        from core.startup.summary_main_direct_push_force_patch import (
+            _is_main_py as _tier1_is_main_py,
+            _env_bool as _tier1_env_bool,
+            tier1_build_and_publish,
+        )
+    except Exception:
+        logger.debug("[summary.runners] job_summary tier1 import failed", exc_info=True)
+        return pd.DataFrame()
+    try:
+        if not (_tier1_is_main_py() and _tier1_env_bool("SUMMARY_FORCE_DIRECT_PATCH_ENABLED", True)):
+            return pd.DataFrame()
+        return tier1_build_and_publish(now, run_entry=run_entry)
+    except Exception:
+        logger.exception("[summary.runners] job_summary tier1 failed now=%s", now)
+        return pd.DataFrame()
+
+
+def _job_summary_tier2_light_runner(interval: int, now: dt.datetime, *, display: bool, run_entry: bool, **kwargs) -> pd.DataFrame:
+    try:
+        from core.startup.summary_main_1m_light_tick_patch import (
+            _is_entry_only_context as _tier2_is_entry_only_context,
+            _env_bool as _tier2_env_bool,
+            build_light_1m_summary,
+        )
+    except Exception:
+        logger.debug("[summary.runners] job_summary tier2 import failed", exc_info=True)
+        return pd.DataFrame()
+    try:
+        if not (_tier2_is_entry_only_context() and _tier2_env_bool("SUMMARY_MAIN_EARLY_RETURN_AFTER_AI_SUBMIT", True)):
+            return pd.DataFrame()
+        return build_light_1m_summary(interval, now=now, display=display, run_entry=run_entry, **kwargs)
+    except Exception:
+        logger.exception("[summary.runners] job_summary tier2 failed now=%s", now)
+        return pd.DataFrame()
+
 
 def job_summary(interval: int, display: bool = True, now: Optional[dt.datetime] = None, run_entry: bool = True, **kwargs) -> pd.DataFrame:
+    interval_i = int(interval)
+    now_i = (now or now_naive()).replace(microsecond=0)
+
+    if interval_i == 1:
+        df = _job_summary_tier1_direct_memory(now_i, run_entry=run_entry)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            logger.info("[summary.runners] job_summary(PUSH) tier1 direct-memory hit rows=%s now=%s", len(df), now_i)
+            return df
+
+        df = _job_summary_tier2_light_runner(interval_i, now_i, display=display, run_entry=run_entry, **kwargs)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            logger.info("[summary.runners] job_summary(PUSH) tier2 light-runner hit rows=%s now=%s", len(df), now_i)
+            return df
+
+    return _job_summary_original_heavy(interval_i, display=display, now=now_i, run_entry=run_entry, **kwargs)
+
+
+def _job_summary_original_heavy(interval: int, display: bool = True, now: Optional[dt.datetime] = None, run_entry: bool = True, **kwargs) -> pd.DataFrame:
     interval = int(interval)
     now = (now or now_naive()).replace(microsecond=0)
 

@@ -1,9 +1,32 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_main_direct_push_force_patch.py
-# Version: V9-FORCE-DIRECT-1M-FRESH-RAW-PUSH-ONLY
+# Version: V10-JOB-SUMMARY-WRAP-REMOVED
 # ------------------------------------------------------------
 # main.py の1分PUSH summary tickを軽量経路に固定する。
+#
+# V10:
+#   - job_summary/run_push_summary_job/job_1m への再代入 + 180秒間2秒毎に
+#     再適用し続ける watcher スレッドを撤去した。
+#
+#   発見した不具合: _patch_once() は _ORIGINAL_JOB_SUMMARY をモジュール変数として
+#   初回成功時に1度だけキャッシュし、以降の watcher 呼び出しではそのまま
+#   古いキャッシュを使い回していた。このパッチは sitecustomize.py の
+#   SYNC_MAIN_PATCHES で最も早く (main.py 起動前に) install されるため、
+#   summary_main_1m_light_tick_patch / summary_main_memory_latest_1m_patch が
+#   後から重ね書きしても、次の watcher tick (最大2秒後、確実に main.py の
+#   起動シーケンス中に発生する) で「まだ自分の目印が付いていない」と判定し、
+#   古いキャッシュ原本を土台に自分自身を re-install していた。結果、
+#   後続2パッチの job_summary ロジックは毎回確実に奪われ、
+#   summary_main_1m_light_tick_patch の「本物のrunnerパイプラインを使う、
+#   より正確な高速経路」は事実上一度も選ばれなかった。
+#
+#   本文化にあたり、_build_direct / _store / _submit_ai 等はライブラリ関数として
+#   維持し、scheduler_jobs/summary/runner_core.py の job_summary から
+#   tier1 (memory直接+このファイルのhardening) として直接呼ぶ形にした。
+#   tier2 として summary_main_1m_light_tick_patch.build_light_1m_summary
+#   (本物のrunnerパイプライン) を明示的に重ね、tier1が空/失敗の場合だけ
+#   フォールバックするようにして、3本の奪い合いを解消した。
 #
 # V9:
 #   - V8 fallback が global_data.summary_1m_df をPUSHメモリとして拾い、
@@ -27,12 +50,10 @@ from typing import Any, Optional
 import pandas as pd
 
 logger = logging.getLogger(__name__)
-VERSION = "V9-FORCE-DIRECT-1M-FRESH-RAW-PUSH-ONLY"
+VERSION = "V10-JOB-SUMMARY-WRAP-REMOVED"
 _PATCHED = False
-_WATCHER_STARTED = False
 _AI_LOCK = threading.RLock()
 _AI_RUNNING: dict[str, float] = {}
-_ORIGINAL_JOB_SUMMARY = None
 
 _TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 _FALSE = {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}
@@ -450,75 +471,38 @@ def _submit_ai(df: pd.DataFrame, now: dt.datetime, run_entry: bool) -> None:
         logger.exception("[SUMMARY FORCE DIRECT 1M] async AI thread start failed key=%s", key)
 
 
-def _patch_once(reason: str = "install") -> bool:
-    global _ORIGINAL_JOB_SUMMARY
-    if not _is_main_py() or not _env_bool("SUMMARY_FORCE_DIRECT_PATCH_ENABLED", True):
-        return False
+def tier1_build_and_publish(now: dt.datetime, *, run_entry: bool) -> pd.DataFrame:
+    """scheduler_jobs/summary/runner_core.py の job_summary (tier1) から直接呼ばれる。
+    memory直接ビルド (_build_direct、内部で summary_main_memory_latest_1m_patch を使う) を
+    タイムアウト付きで試し、成功時のみ _store/_submit_ai を行う。呼び出し元の事前条件
+    (_is_main_py() 相当・interval==1) は runner_core.py 側で確認済みの前提。"""
+    if not _env_bool("SUMMARY_FORCE_DIRECT_PATCH_ENABLED", True):
+        return pd.DataFrame()
+    now_i = (now or dt.datetime.now()).replace(microsecond=0)
+    t0 = time.perf_counter()
     try:
-        import scheduler_jobs.summary.runner_core as rc
-        current = getattr(rc, "job_summary", None)
-        if getattr(current, "_summary_force_direct_v9", False):
-            return True
-        if _ORIGINAL_JOB_SUMMARY is None and callable(current):
-            _ORIGINAL_JOB_SUMMARY = getattr(current, "_original", current)
-        orig = _ORIGINAL_JOB_SUMMARY if callable(_ORIGINAL_JOB_SUMMARY) else current
-
-        def job_summary_force(interval: int, display: bool = True, now: Optional[dt.datetime] = None, run_entry: bool = True, **kwargs) -> pd.DataFrame:
-            interval_i = int(interval)
-            now_i = (now or rc.now_naive()).replace(microsecond=0)
-            if interval_i != 1:
-                return orig(interval_i, display=display, now=now_i, run_entry=run_entry, **kwargs)
-            t0 = time.perf_counter()
-            df = _build_direct(now_i)
-            if df is not None and not df.empty:
-                _store(df)
-                _submit_ai(df, now_i, run_entry)
-                logger.warning("[SUMMARY FORCE DIRECT 1M] return interval=1 rows=%s elapsed=%.3fs mode=forced_direct_v9", len(df), time.perf_counter() - t0)
-                return df
-            logger.warning("[SUMMARY FORCE DIRECT 1M] direct empty/timeout/stale -> skip raw-count/original fallback interval=1 elapsed=%.3fs version=%s", time.perf_counter() - t0, VERSION)
-            return pd.DataFrame()
-
-        for attr in ("_summary_force_direct_v1", "_summary_force_direct_v2", "_summary_force_direct_v3", "_summary_force_direct_v4", "_summary_force_direct_v5", "_summary_force_direct_v6", "_summary_force_direct_v7", "_summary_force_direct_v8", "_summary_force_direct_v9"):
-            setattr(job_summary_force, attr, True)
-        job_summary_force._original = orig  # type: ignore[attr-defined]
-        rc.job_summary = job_summary_force
-        rc.run_push_summary_job = lambda interval=1, display=True, now=None, run_entry=True, **kwargs: job_summary_force(int(interval), display=display, now=now, run_entry=run_entry, **kwargs)
-        rc.job_1m = lambda display=True, now=None, run_entry=True: job_summary_force(1, display=display, now=now, run_entry=run_entry)
-        logger.warning("[SUMMARY FORCE DIRECT 1M] patched reason=%s target=runner_core.job_summary version=%s", reason, VERSION)
-        return True
+        df = _build_direct(now_i)
+        if df is not None and not df.empty:
+            _store(df)
+            _submit_ai(df, now_i, run_entry)
+            logger.warning("[SUMMARY FORCE DIRECT 1M] tier1 hit rows=%s elapsed=%.3fs version=%s", len(df), time.perf_counter() - t0, VERSION)
+            return df
+        logger.warning("[SUMMARY FORCE DIRECT 1M] tier1 direct empty/timeout/stale elapsed=%.3fs version=%s", time.perf_counter() - t0, VERSION)
     except Exception:
-        logger.exception("[SUMMARY FORCE DIRECT 1M] patch failed reason=%s", reason)
-        return False
-
-
-def _watcher() -> None:
-    deadline = time.time() + max(30, _env_int("SUMMARY_FORCE_DIRECT_WATCH_SEC", 180))
-    i = 0
-    while time.time() < deadline:
-        try:
-            _patch_once(reason=f"watcher:{i}")
-        except Exception:
-            logger.debug("[SUMMARY FORCE DIRECT 1M] watcher reapply failed", exc_info=True)
-        i += 1
-        time.sleep(max(0.5, float(os.getenv("SUMMARY_FORCE_DIRECT_WATCH_INTERVAL", "2.0"))))
-    logger.warning("[SUMMARY FORCE DIRECT 1M] watcher done reapplies=%s", i)
+        logger.exception("[SUMMARY FORCE DIRECT 1M] tier1 build failed now=%s", now_i)
+    return pd.DataFrame()
 
 
 def install() -> bool:
-    global _PATCHED, _WATCHER_STARTED
+    global _PATCHED
     os.environ.setdefault("SUMMARY_FORCE_DIRECT_BUILD_TIMEOUT_SEC", "6")
     os.environ.setdefault("SUMMARY_FORCE_DIRECT_AI_MAX_ACTIVE", "3")
     os.environ.setdefault("SUMMARY_FORCE_DIRECT_MEMORY_LOOKBACK_SEC", "90")
     os.environ.setdefault("SUMMARY_FORCE_DIRECT_MAX_OUTPUT_AGE_SEC", "90")
     os.environ.setdefault("SUMMARY_FORCE_DIRECT_NO_ORIGINAL_FALLBACK_WHEN_RAW_EXISTS", "1")
-    ok = _patch_once(reason="install")
-    if ok and not _WATCHER_STARTED and _env_bool("SUMMARY_FORCE_DIRECT_WATCHER", True):
-        _WATCHER_STARTED = True
-        threading.Thread(target=_watcher, name="summary-force-direct-1m-watch", daemon=True).start()
-        logger.warning("[SUMMARY FORCE DIRECT 1M] watcher started version=%s", VERSION)
-    _PATCHED = bool(ok)
-    logger.warning("[SUMMARY FORCE DIRECT 1M] installed version=%s ok=%s main=%s", VERSION, ok, _is_main_py())
-    return bool(ok)
+    _PATCHED = True
+    logger.warning("[SUMMARY FORCE DIRECT 1M] installed version=%s main=%s (job_summary wrap removed; called as tier1 from runner_core.job_summary)", VERSION, _is_main_py())
+    return True
 
 
 try:
@@ -526,4 +510,4 @@ try:
 except Exception:
     logger.exception("[SUMMARY FORCE DIRECT 1M] auto install failed")
 
-__all__ = ["VERSION", "install"]
+__all__ = ["VERSION", "install", "tier1_build_and_publish", "_is_main_py", "_env_bool"]

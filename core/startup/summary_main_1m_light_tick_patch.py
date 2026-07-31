@@ -1,12 +1,24 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_main_1m_light_tick_patch.py
-# Version: V5-MAIN-1M-LIGHT-AI-SCORED-FRESH-GUARD
+# Version: V6-JOB-SUMMARY-WRAP-REMOVED
 # ------------------------------------------------------------
 # main.py is entry-only: do not wait for/save/display heavy summary work.
 # It only calculates PUSH 1m quickly, submits Summary-AI asynchronously, reads
 # recent 1m history from summaryYYYYMMDD.db, and blocks slow raw push DB fallback
 # from main.py 1m fallback path.
+#
+# V6:
+#   - job_summary/run_push_summary_job/job_1m への差し替えを撤去した。
+#     summary_main_direct_push_force_patch.py・summary_main_memory_latest_1m_patch.py
+#     と合わせて3本が同じ3関数を奪い合っていた (それぞれ再代入するだけの
+#     total-overwrite方式で、direct_push_force側の永続watcherがstale原本
+#     キャッシュを使って毎回再上書きしてしまうバグにより、実質的に
+#     このファイルの高速経路は本番で一度も選ばれていなかった)。
+#     ビルド本体を build_light_1m_summary() として切り出し、
+#     scheduler_jobs/summary/runner_core.py の job_summary (tier2) から
+#     直接呼ぶ形にインライン化した。_save_summary_if_owner /
+#     _run_push_ai_entry_before_display のラップは引き続きここで行う。
 #
 # V5:
 #   - Summary AI async submit直前で入力DFを検査する。
@@ -538,6 +550,48 @@ def _submit_async_ai(df: pd.DataFrame, *, interval: int, now: dt.datetime, run_e
     logger.warning("[SUMMARY MAIN LIGHT TICK] async AI submitted key=%s interval=%s rows=%s reason=%s", key, interval, rows, reason)
 
 
+def build_light_1m_summary(interval: int, *, now: dt.datetime, display: bool = True, run_entry: bool = True, **kwargs) -> pd.DataFrame:
+    """本物の push summary runner を呼ぶが、保存/表示はスキップして高速化する経路。
+    旧 job_summary_light の本体。呼び出し元 (scheduler_jobs/summary/runner_core.py の
+    job_summary tier2) が _is_entry_only_context() / interval==1 の事前条件を確認してから呼ぶ。
+    失敗時・空の場合は空の DataFrame を返すのみで、呼び出し元が基底の job_summary へ
+    フォールバックする。"""
+    import scheduler_jobs.summary.runner_core as rc
+
+    interval_i = int(interval)
+    now_i = (now or rc.now_naive()).replace(microsecond=0)
+    t0 = time.perf_counter()
+    try:
+        _install_history_patch()
+        _install_no_raw_db_watchdog()
+        runner = rc.resolve_push_summary_runner()
+        if not callable(runner):
+            raise RuntimeError("push summary runner is not available")
+        logger.warning("[SUMMARY MAIN LIGHT TICK] light job start interval=%s display=%s run_entry=%s now=%s", interval_i, display, run_entry, now_i)
+        result = rc.call_runner_with_optional_now(runner, interval=interval_i, now=now_i, **kwargs)
+        df, meta = rc.normalize_runner_output(result)
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            logger.warning("[SUMMARY MAIN LIGHT TICK] light runner empty interval=%s -> fallback", interval_i)
+            df = rc.fallback_push_summary_df(interval_i, now=now_i)
+        df = _normalize_df_light(df, now=now_i)
+        if not df.empty:
+            try:
+                rc.log_job_result("job_summary(PUSH-LIGHT)", interval_i, df, meta if isinstance(meta, dict) else {})
+            except Exception:
+                pass
+            _submit_async_ai(df, interval=interval_i, now=now_i, run_entry=run_entry, reason="early_after_runner")
+        logger.warning("[SUMMARY MAIN LIGHT TICK] light job return interval=%s rows=%s elapsed=%.3fs display_skipped=%s", interval_i, len(df) if isinstance(df, pd.DataFrame) else 0, time.perf_counter() - t0, not _env_bool("SUMMARY_MAIN_LIGHT_DISPLAY", False))
+        if _env_bool("SUMMARY_MAIN_LIGHT_DISPLAY", False):
+            try:
+                rc._display_push_sync_or_async(df, interval_i, now_i, display)
+            except Exception:
+                logger.exception("[SUMMARY MAIN LIGHT TICK] optional display submit failed interval=%s", interval_i)
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        logger.exception("[SUMMARY MAIN LIGHT TICK] light job build failed interval=%s", interval_i)
+        return pd.DataFrame()
+
+
 def install() -> bool:
     global _INSTALLED
     if _INSTALLED:
@@ -564,7 +618,6 @@ def install() -> bool:
         _install_no_raw_db_watchdog()
 
         import scheduler_jobs.summary.runner_core as rc
-        orig_job_summary = getattr(rc, "job_summary", None)
         orig_ai = getattr(rc, "_run_push_ai_entry_before_display", None)
         orig_save = getattr(rc, "_save_summary_if_owner", None)
 
@@ -586,50 +639,9 @@ def install() -> bool:
             _ai_light._original = orig_ai  # type: ignore[attr-defined]
             rc._run_push_ai_entry_before_display = _ai_light
 
-        if callable(orig_job_summary) and not getattr(orig_job_summary, "_main_light_tick_job_wrapped", False):
-            def job_summary_light(interval: int, display: bool = True, now: Optional[dt.datetime] = None, run_entry: bool = True, **kwargs) -> pd.DataFrame:
-                if not (_is_entry_only_context() and _env_bool("SUMMARY_MAIN_EARLY_RETURN_AFTER_AI_SUBMIT", True)):
-                    return orig_job_summary(interval, display=display, now=now, run_entry=run_entry, **kwargs)
-                interval_i = int(interval)
-                now_i = (now or rc.now_naive()).replace(microsecond=0)
-                if interval_i != 1:
-                    return orig_job_summary(interval_i, display=display, now=now_i, run_entry=run_entry, **kwargs)
-                t0 = time.perf_counter()
-                try:
-                    _install_history_patch()
-                    _install_no_raw_db_watchdog()
-                    runner = rc.resolve_push_summary_runner()
-                    if not callable(runner):
-                        raise RuntimeError("push summary runner is not available")
-                    logger.warning("[SUMMARY MAIN LIGHT TICK] light job start interval=%s display=%s run_entry=%s now=%s", interval_i, display, run_entry, now_i)
-                    result = rc.call_runner_with_optional_now(runner, interval=interval_i, now=now_i, **kwargs)
-                    df, meta = rc.normalize_runner_output(result)
-                    if not isinstance(df, pd.DataFrame) or df.empty:
-                        logger.warning("[SUMMARY MAIN LIGHT TICK] light runner empty interval=%s -> fallback", interval_i)
-                        df = rc.fallback_push_summary_df(interval_i, now=now_i)
-                    df = _normalize_df_light(df, now=now_i)
-                    if not df.empty:
-                        try:
-                            rc.log_job_result("job_summary(PUSH-LIGHT)", interval_i, df, meta if isinstance(meta, dict) else {})
-                        except Exception:
-                            pass
-                        _submit_async_ai(df, interval=interval_i, now=now_i, run_entry=run_entry, reason="early_after_runner")
-                    logger.warning("[SUMMARY MAIN LIGHT TICK] light job return interval=%s rows=%s elapsed=%.3fs display_skipped=%s", interval_i, len(df) if isinstance(df, pd.DataFrame) else 0, time.perf_counter() - t0, not _env_bool("SUMMARY_MAIN_LIGHT_DISPLAY", False))
-                    if _env_bool("SUMMARY_MAIN_LIGHT_DISPLAY", False):
-                        try:
-                            rc._display_push_sync_or_async(df, interval_i, now_i, display)
-                        except Exception:
-                            logger.exception("[SUMMARY MAIN LIGHT TICK] optional display submit failed interval=%s", interval_i)
-                    return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
-                except Exception:
-                    logger.exception("[SUMMARY MAIN LIGHT TICK] light job failed interval=%s -> original fallback", interval_i)
-                    return orig_job_summary(interval_i, display=display, now=now_i, run_entry=run_entry, **kwargs)
-
-            job_summary_light._main_light_tick_job_wrapped = True  # type: ignore[attr-defined]
-            job_summary_light._original = orig_job_summary  # type: ignore[attr-defined]
-            rc.job_summary = job_summary_light
-            rc.run_push_summary_job = lambda interval=1, display=True, now=None, run_entry=True, **kwargs: job_summary_light(int(interval), display=display, now=now, run_entry=run_entry, **kwargs)
-            rc.job_1m = lambda display=True, now=None, run_entry=True: job_summary_light(1, display=display, now=now, run_entry=run_entry)
+        # job_summary/run_push_summary_job/job_1m の差し替えは撤去した。
+        # scheduler_jobs/summary/runner_core.py の job_summary (tier2) が
+        # build_light_1m_summary() を直接呼ぶ形にインライン化済み。
 
         _INSTALLED = True
         logger.warning(
@@ -648,4 +660,4 @@ try:
 except Exception:
     logger.exception("[SUMMARY MAIN LIGHT TICK] auto install failed")
 
-__all__ = ["VERSION", "install"]
+__all__ = ["VERSION", "install", "build_light_1m_summary", "_is_entry_only_context", "_env_bool"]

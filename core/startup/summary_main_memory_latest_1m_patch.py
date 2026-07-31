@@ -1,10 +1,22 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/summary_main_memory_latest_1m_patch.py
-# Version: V3-MAIN-MEMORY-NO-STALE-COERCE
+# Version: V4-JOB-SUMMARY-WRAP-REMOVED
 # ------------------------------------------------------------
 # main.py は PUSH DB 保存をしない前提のまま、PUSHメモリDFから
 # 最新1分足 summary を高速生成する。
+#
+# V4:
+#   - job_summary/run_push_summary_job/job_1m への再代入、および
+#     scheduler.job_push_summary_1m のエイリアス同期を撤去した。
+#     このファイル・summary_main_1m_light_tick_patch.py・
+#     summary_main_direct_push_force_patch.py の3本が同じ3関数を
+#     total-overwrite方式で奪い合っていた「3-way race」の一部
+#     (詳細は summary_main_direct_push_force_patch.py のコメント参照)。
+#     _build_memory_1m_summary はそのままライブラリ関数として維持し、
+#     summary_main_direct_push_force_patch.py の tier1_build_and_publish
+#     経由 (旧来と同じ呼び出し方) で scheduler_jobs/summary/runner_core.py
+#     の job_summary から間接的に使われ続ける。
 #
 # V3:
 #   - 古い PUSH tick を now に付け替えて「新鮮なsummary」に見せない。
@@ -510,82 +522,6 @@ def _submit_async_ai(df: pd.DataFrame, *, now: dt.datetime, run_entry: bool) -> 
         logger.debug("[SUMMARY MAIN MEMORY 1M] async ai submit skipped", exc_info=True)
 
 
-def _wrap_runner_core() -> bool:
-    try:
-        import scheduler_jobs.summary.runner_core as rc
-    except Exception:
-        logger.exception("[SUMMARY MAIN MEMORY 1M] import runner_core failed")
-        return False
-
-    orig_job_summary = getattr(rc, "job_summary", None)
-    if not callable(orig_job_summary):
-        logger.warning("[SUMMARY MAIN MEMORY 1M] runner_core.job_summary unavailable")
-        return False
-    if getattr(orig_job_summary, "_summary_main_memory_latest_wrapped_v3", False):
-        return True
-
-    @wraps(orig_job_summary)
-    def job_summary_memory(interval: int, display: bool = True, now: Optional[dt.datetime] = None, run_entry: bool = True, **kwargs):
-        interval_i = int(interval)
-        if not (_is_entry_only_context() and interval_i == 1 and _env_bool("SUMMARY_MAIN_MEMORY_LATEST_1M_ENABLED", True)):
-            return orig_job_summary(interval_i, display=display, now=now, run_entry=run_entry, **kwargs)
-
-        now_i = now or dt.datetime.now()
-        try:
-            now_i = now_i.replace(microsecond=0)
-        except Exception:
-            now_i = dt.datetime.now().replace(microsecond=0)
-
-        t0 = time.perf_counter()
-        raw = _load_push_memory_df()
-        df = _build_memory_1m_summary(now=now_i)
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            _publish_latest(df)
-            _submit_async_ai(df, now=now_i, run_entry=bool(run_entry))
-            logger.warning(
-                "[SUMMARY MAIN MEMORY 1M] return memory summary rows=%s latest_dt=%s elapsed=%.3fs display_skipped=True version=%s",
-                len(df),
-                df["datetime"].max() if "datetime" in df.columns else None,
-                time.perf_counter() - t0,
-                VERSION,
-            )
-            return df
-
-        if _env_bool("SUMMARY_MAIN_MEMORY_NO_HEAVY_FALLBACK_WHEN_RAW_EXISTS", True) and isinstance(raw, pd.DataFrame) and not raw.empty:
-            logger.warning(
-                "[SUMMARY MAIN MEMORY 1M] memory build empty but raw exists -> skip original heavy fallback interval=%s raw_rows=%s elapsed=%.3fs version=%s",
-                interval_i,
-                len(raw),
-                time.perf_counter() - t0,
-                VERSION,
-            )
-            return pd.DataFrame()
-
-        logger.warning("[SUMMARY MAIN MEMORY 1M] memory summary empty -> original fallback interval=%s version=%s", interval_i, VERSION)
-        return orig_job_summary(interval_i, display=display, now=now_i, run_entry=run_entry, **kwargs)
-
-    job_summary_memory._summary_main_memory_latest_wrapped = True  # type: ignore[attr-defined]
-    job_summary_memory._summary_main_memory_latest_wrapped_v2 = True  # type: ignore[attr-defined]
-    job_summary_memory._summary_main_memory_latest_wrapped_v3 = True  # type: ignore[attr-defined]
-    job_summary_memory._original = orig_job_summary  # type: ignore[attr-defined]
-    rc.job_summary = job_summary_memory
-    rc.run_push_summary_job = lambda interval=1, display=True, now=None, run_entry=True, **kwargs: job_summary_memory(int(interval), display=display, now=now, run_entry=run_entry, **kwargs)
-    rc.job_1m = lambda display=True, now=None, run_entry=True: job_summary_memory(1, display=display, now=now, run_entry=run_entry)
-    logger.warning("[SUMMARY MAIN MEMORY 1M] runner_core wrapped version=%s", VERSION)
-    return True
-
-
-def _wrap_scheduler_runner_aliases() -> None:
-    try:
-        import scheduler_jobs.summary.scheduler as scheduler
-        import scheduler_jobs.summary.runner_core as rc
-        if callable(getattr(rc, "job_1m", None)):
-            scheduler.job_push_summary_1m = rc.job_1m
-            logger.warning("[SUMMARY MAIN MEMORY 1M] scheduler job_push_summary_1m alias updated")
-    except Exception:
-        logger.debug("[SUMMARY MAIN MEMORY 1M] scheduler alias update skipped", exc_info=True)
-
-
 def install() -> bool:
     global _INSTALLED
     if _INSTALLED:
@@ -600,11 +536,9 @@ def install() -> bool:
         os.environ.setdefault("SUMMARY_MAIN_MEMORY_ASYNC_AI", "1")
         os.environ.setdefault("SUMMARY_MAIN_MEMORY_NO_HEAVY_FALLBACK_WHEN_RAW_EXISTS", "1")
         os.environ.setdefault("SUMMARY_MAIN_MEMORY_COERCE_OLD_TICKS_TO_NOW", "0")
-        ok = _wrap_runner_core()
-        _wrap_scheduler_runner_aliases()
-        _INSTALLED = bool(ok)
-        logger.warning("[SUMMARY MAIN MEMORY 1M] installed=%s version=%s coerce_old=%s", ok, VERSION, _env_bool("SUMMARY_MAIN_MEMORY_COERCE_OLD_TICKS_TO_NOW", False))
-        return bool(ok)
+        _INSTALLED = True
+        logger.warning("[SUMMARY MAIN MEMORY 1M] installed=%s version=%s coerce_old=%s (job_summary wrap removed; _build_memory_1m_summary now used as a library by summary_main_direct_push_force_patch.tier1_build_and_publish)", True, VERSION, _env_bool("SUMMARY_MAIN_MEMORY_COERCE_OLD_TICKS_TO_NOW", False))
+        return True
     except Exception:
         logger.exception("[SUMMARY MAIN MEMORY 1M] install failed")
         return False
