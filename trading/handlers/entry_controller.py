@@ -7,8 +7,31 @@
 #   - market / risk / AI health / index shock / credit / volatility
 #     などの各種ガードを通過した銘柄のみエントリーする
 # ------------------------------------------------------------
-# Version: Ver2.7-INLINE-LOG-SKIP-AUDIT-AND-RANKING-PRUNE
+# Version: Ver2.8-INLINE-RUN-ENTRY-PIPELINE-LOCK-WAIT-AND-DIRECTION-GUARD
 # ------------------------------------------------------------
+# Ver2.8:
+#   - run_entry_pipeline() に2本の monkeypatch を統合本文化:
+#     (1) core/startup/entry_controller_pipeline_lock_wait_patch.py の
+#         RANKING/TONOSAMA/SUMMARY lock-wait + stale-lock-reset + 古いpending prune
+#     (2) core/startup/summary_ai_entry_controller_bridge_patch.py の
+#         run_entry_pipeline 部分 (SUMMARY専用の長め lock-wait 35秒、戻り値の
+#         厳密な実発注判定への正規化、no-order時の1回リトライ)
+#     両パッチとも from-import (summary_entry.py 等) 経由で run_entry_pipeline を
+#     直接参照するモジュールへは効かない「別名参照バイパス」問題があったが、
+#     本体へインライン化したことで解消。
+#   - _build_scored_candidates に core/startup/ranking_direction_entry_guard_patch.py
+#     の「ランキング方向逆張り禁止」ガードを統合。旧パッチは
+#     _passes_side_filter 等の存在しない関数への差し込みを想定しており、
+#     フォールバック先の run_entry_pipeline ラップも存在しない "entries" 引数を
+#     探すだけで実際には一度もガードが適用されていなかった (デッドコード)。
+#     side確定後の正しい位置に差し込み、RANKING由来候補にのみ実際に機能させた。
+#   - core/startup/entry_controller_pipeline_bucket_filter_patch.py と
+#     entry_pipeline_pending_root_prefilter_patch.py (pipeline_source/interval
+#     不一致のpendingを事前に間引く2つの重複した性能最適化) は、
+#     get_bucket() 直後の軽量フィルタへ一本化した。正しさ自体は既存の
+#     _prefilter_entries_for_pipeline (_build_scored_candidates 内) が
+#     保証しているため、ここでの絞り込みは性能目的のみ。
+#
 # Ver2.7:
 #   - _log_skip() に3本の monkeypatch を統合本文化:
 #     (1) core/startup/entry_log_skip_reason_collision_patch.py の
@@ -51,6 +74,8 @@ from __future__ import annotations
 import logging
 import os
 import datetime as dt
+import threading
+import time
 from threading import Lock
 from copy import deepcopy
 from typing import Any
@@ -862,6 +887,85 @@ def _apply_ma5_third_bar_slope_guard(symbol: str, scored_candidates: list[dict])
         return scored_candidates
 
 
+# ==========================================================
+# ランキング方向逆張り禁止ガード
+# (旧 core/startup/ranking_direction_entry_guard_patch.py)
+#
+# 元のパッチは _passes_side_filter 等の候補フィルタ関数への差し込みを想定していたが、
+# entry_controller.py にはそれらの関数が存在せず、フォールバック先の
+# run_entry_pipeline ラップも "entries" という存在しない引数を探すだけで
+# 実際には一度もガードが適用されていなかった (デッドコード)。ここで
+# _build_scored_candidates の side 確定後に正しく差し込み、実際に機能させる。
+# ==========================================================
+
+def _ranking_direction_contains_any(text: str, words: tuple[str, ...]) -> bool:
+    t = str(text or "").lower()
+    return any(w.lower() in t for w in words)
+
+
+def _infer_ranking_direction(row: dict) -> tuple[str, str]:
+    """Returns (UP|DOWN|UNKNOWN, reason)."""
+    text_keys = ("ranking_type", "rank_type", "ranking_name", "source", "entry_source", "market", "reason", "category", "ranking_category")
+    text = " ".join(str(row.get(k, "")) for k in text_keys if row.get(k) is not None)
+
+    down_words = ("下落", "値下", "値下がり", "decline", "decliner", "down", "fall", "drop", "minus", "negative", "loser", "sell", "short")
+    up_words = ("上昇", "値上", "値上がり", "rise", "riser", "up", "gain", "gainer", "plus", "positive", "buy", "long")
+
+    if _ranking_direction_contains_any(text, down_words):
+        return "DOWN", f"text_down:{text}"
+    if _ranking_direction_contains_any(text, up_words):
+        return "UP", f"text_up:{text}"
+
+    for k in ("change_rate", "change_pct", "rate", "騰落率", "price_change_rate", "ranking_change_rate"):
+        if k in row:
+            x = _safe_float(row.get(k), 0.0)
+            if x <= -0.1:
+                return "DOWN", f"{k}={x}"
+            if x >= 0.1:
+                return "UP", f"{k}={x}"
+
+    score_buy = _safe_float(row.get("score_buy"), 0.0)
+    score_sell = _safe_float(row.get("score_sell"), 0.0)
+    score_total = _safe_float(row.get("score_total", row.get("final_score", row.get("score", 0.0))), 0.0)
+
+    if score_sell >= max(1.0, score_buy + 0.5):
+        return "DOWN", f"score_sell_dominant sell={score_sell:.2f} buy={score_buy:.2f} total={score_total:.2f}"
+    if score_buy >= max(1.0, score_sell + 0.5):
+        return "UP", f"score_buy_dominant buy={score_buy:.2f} sell={score_sell:.2f} total={score_total:.2f}"
+
+    if score_total <= -1.0:
+        return "DOWN", f"score_total_negative={score_total:.2f}"
+    if score_total >= 1.0:
+        return "UP", f"score_total_positive={score_total:.2f}"
+
+    return "UNKNOWN", "no_direction_signal"
+
+
+def _ranking_direction_guard_ok(entry_row: dict, side: str) -> tuple[bool, dict]:
+    if not _env_bool("RANKING_DIRECTION_GUARD_ENABLED", True):
+        return True, {}
+    # RANKING由来の候補のみに適用する。SUMMARY_AI/TONOSAMA等の候補は
+    # score_buy/score_sell等の汎用フィールドを持つことがあり、無条件適用すると
+    # ranking以外にも direction 判定が誤爆しかねないため対象を絞る。
+    is_ranking = (
+        _normalize_source(entry_row.get("source")) == "RANKING"
+        or _normalize_source(entry_row.get("entry_type")) == "RANKING"
+        or entry_row.get("rank_type") is not None
+        or entry_row.get("ranking_type") is not None
+    )
+    if not is_ranking:
+        return True, {}
+    direction, reason = _infer_ranking_direction(entry_row)
+    detail = {"direction": direction, "reason": reason}
+    if direction == "DOWN" and side == "BUY":
+        detail["block_reason"] = "RANKING_DIRECTION_BUY_AGAINST_DOWN"
+        return False, detail
+    if direction == "UP" and side == "SELL":
+        detail["block_reason"] = "RANKING_DIRECTION_SELL_AGAINST_UP"
+        return False, detail
+    return True, detail
+
+
 def _build_scored_candidates(
     symbol: str,
     entries: list[dict],
@@ -913,6 +1017,11 @@ def _build_scored_candidates(
 
             if side not in ("BUY", "SELL"):
                 _log_skip(symbol, "SIDE_INVALID", side=side)
+                continue
+
+            direction_ok, direction_detail = _ranking_direction_guard_ok(entry_row, side)
+            if not direction_ok:
+                _log_skip(symbol, direction_detail.get("block_reason", "RANKING_DIRECTION_NG"), side=side, direction=direction_detail.get("direction"), reason=direction_detail.get("reason"))
                 continue
 
             if symbol in open_position_symbols:
@@ -1193,10 +1302,353 @@ def _execute_best_candidate(item: dict, boost_active: bool) -> bool:
 
 
 # ==========================================================
+# run_entry_pipeline: lock-wait + stale-reset + 戻り値正規化
+# (旧 core/startup/entry_controller_pipeline_lock_wait_patch.py +
+#  summary_ai_entry_controller_bridge_patch.py の run_entry_pipeline 部分をインライン化)
+# ==========================================================
+
+_LAST_STALE_PIPELINE_LOCK_RESET_AT = 0.0
+
+_PIPELINE_ORDER_KEYS = ("order_id", "OrderId", "orders", "order_ids", "sent_orders", "executed_symbols")
+_PIPELINE_EXECUTED_COUNT_KEYS = ("executed_count", "order_count", "submitted_count", "sent_count")
+
+
+def _pipeline_wait_enabled_for_source(source_u: str) -> bool:
+    if not source_u:
+        return False
+    if source_u == "RANKING" and not _env_bool("ENTRY_CONTROLLER_RANKING_LOCK_WAIT_ENABLED", True):
+        return False
+    if not _env_bool("ENTRY_CONTROLLER_LOCK_WAIT_ENABLED", True):
+        return False
+    sources = {s.strip().upper() for s in os.getenv("ENTRY_CONTROLLER_LOCK_WAIT_SOURCES", "RANKING,TONOSAMA,SUMMARY").replace(";", ",").split(",") if s.strip()}
+    return source_u in sources
+
+
+def _pipeline_lock_wait_timeout_sec(source_u: str) -> float:
+    # SUMMARY だけ大幅に長く待つ。8秒の既定では TONOSAMA controller が timeout で
+    # scheduler に戻っても thread_alive=True の間ロックを保持するケースを取りこぼしていた
+    # (旧 summary_ai_entry_controller_bridge_patch.py が 35秒へ延長した根拠)。
+    if source_u == "SUMMARY":
+        base = _env_float("ENTRY_CONTROLLER_SUMMARY_LOCK_WAIT_SEC", 35.0)
+        cap = _env_float("ENTRY_CONTROLLER_SUMMARY_LOCK_WAIT_MAX_SEC", 35.0)
+        return max(0.0, min(base, cap))
+    base = _env_float("ENTRY_CONTROLLER_LOCK_WAIT_SEC", 12.0)
+    cap = _env_float("ENTRY_CONTROLLER_LOCK_WAIT_MAX_SEC", 12.0)
+    return max(0.0, min(base, cap))
+
+
+def _pipeline_lock_wait_poll_sec() -> float:
+    return max(0.05, _env_float("ENTRY_CONTROLLER_LOCK_WAIT_POLL_SEC", 0.20))
+
+
+def _pipeline_pending_count_for_source(source_u: str) -> int:
+    total = 0
+    try:
+        root = getattr(global_data, "pending_entries", None)
+        if isinstance(root, dict):
+            for bucket in root.values():
+                entries = bucket if isinstance(bucket, (list, tuple, set)) else [bucket]
+                for entry in entries:
+                    if isinstance(entry, dict) and (not source_u or _normalize_source(entry.get("source")) == source_u):
+                        total += 1
+    except Exception:
+        pass
+    return int(total)
+
+
+def _pipeline_snapshot_pending_count() -> tuple[dict, int]:
+    # snapshot_root() returns {symbol: bucket_size}, not {symbol: [entries]}.
+    try:
+        root = snapshot_root()
+        if isinstance(root, dict):
+            total = sum(int(v or 0) for v in root.values() if isinstance(v, (int, float)))
+            return dict(root), total
+    except Exception:
+        pass
+    return {}, 0
+
+
+def _pipeline_inflight_count() -> int:
+    try:
+        import core.startup.entry_execute_timeout_guard_patch as eg
+        inflight = getattr(eg, "_INFLIGHT", {})
+        if isinstance(inflight, dict):
+            return sum(1 for info in inflight.values() if isinstance(info, dict) and not bool(info.get("done")))
+    except Exception:
+        pass
+    return 0
+
+
+def _pipeline_lock_is_held() -> bool:
+    try:
+        return bool(_pipeline_lock.locked())
+    except Exception:
+        return False
+
+
+def _wait_entry_pipeline_lock_if_needed(source_u: str, *, before_pending: int) -> tuple[bool, float]:
+    """RANKING/TONOSAMA/SUMMARY はロック使用中でも即失敗させず、一定時間待つ。"""
+    if not _pipeline_wait_enabled_for_source(source_u):
+        return True, 0.0
+    if not _pipeline_lock_is_held():
+        return True, 0.0
+
+    timeout = _pipeline_lock_wait_timeout_sec(source_u)
+    poll = _pipeline_lock_wait_poll_sec()
+    started = time.perf_counter()
+    waited = 0.0
+    logger.warning("[ENTRY CONTROLLER LOCK WAIT] dispatch start source=%s pending=%s timeout=%.3fs", source_u, before_pending, timeout)
+    while _pipeline_lock_is_held():
+        waited = time.perf_counter() - started
+        if waited >= timeout:
+            logger.warning("[ENTRY CONTROLLER LOCK WAIT] timeout source=%s waited=%.3fs pending=%s", source_u, waited, before_pending)
+            return False, waited
+        time.sleep(poll)
+    if waited > 0:
+        logger.warning("[ENTRY CONTROLLER LOCK WAIT] lock free source=%s waited=%.3fs pending=%s", source_u, waited, before_pending)
+    return True, waited
+
+
+def _pipeline_entry_age_sec(entry: dict) -> float | None:
+    if not isinstance(entry, dict):
+        return None
+    for key in ("created_at", "pending_created_at", "updated_at", "entry_time", "datetime"):
+        v = entry.get(key)
+        ts = None
+        if isinstance(v, dt.datetime):
+            ts = v.replace(tzinfo=None)
+        elif isinstance(v, str) and v.strip():
+            for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+                try:
+                    ts = dt.datetime.strptime(v.strip(), fmt)
+                    break
+                except Exception:
+                    continue
+            if ts is None:
+                try:
+                    ts = dt.datetime.fromisoformat(v.strip().replace("Z", "+00:00")).replace(tzinfo=None)
+                except Exception:
+                    ts = None
+        if ts is not None:
+            try:
+                return max(0.0, (dt.datetime.now() - ts).total_seconds())
+            except Exception:
+                return None
+    return None
+
+
+def _prune_old_pending_for_source(source_u: str, *, reason: str = "lock_timeout_old_pending") -> int:
+    max_age_sec = (
+        _env_float("ENTRY_CONTROLLER_SUMMARY_PENDING_PRUNE_AGE_SEC", 90.0)
+        if source_u == "SUMMARY"
+        else _env_float("ENTRY_CONTROLLER_PENDING_PRUNE_AGE_SEC", 120.0)
+    )
+    try:
+        from trading.entry.pending_manager import prune_entries
+
+        def pred(_sym: str, entry: dict) -> bool:
+            if not isinstance(entry, dict):
+                return False
+            if _normalize_source(entry.get("source")) != source_u:
+                return False
+            age = _pipeline_entry_age_sec(entry)
+            return age is not None and age >= max_age_sec
+
+        removed = int(prune_entries(pred, reason=reason))
+        if removed:
+            logger.warning(
+                "[ENTRY CONTROLLER LOCK WAIT] old pending pruned source=%s removed=%s max_age=%.1fs reason=%s",
+                source_u, removed, max_age_sec, reason,
+            )
+        return removed
+    except Exception:
+        logger.exception("[ENTRY CONTROLLER LOCK WAIT] old pending prune failed source=%s", source_u)
+        return 0
+
+
+def _can_reset_stale_pipeline_lock(source_u: str) -> tuple[bool, str]:
+    if source_u != "SUMMARY" and not _env_bool("ENTRY_CONTROLLER_STALE_LOCK_RESET_NON_SUMMARY", False):
+        return False, "source_not_allowed"
+    if not _env_bool("ENTRY_CONTROLLER_STALE_LOCK_RESET_ENABLED", True):
+        return False, "disabled"
+    pending = _pipeline_pending_count_for_source(source_u)
+    min_pending = int(_env_float("ENTRY_CONTROLLER_STALE_LOCK_MIN_PENDING", 1.0))
+    if pending < min_pending:
+        return False, f"pending_low:{pending}<{min_pending}"
+    if _pipeline_inflight_count() > 0:
+        return False, "entry_execute_inflight"
+    cooldown = _env_float("ENTRY_CONTROLLER_STALE_LOCK_RESET_COOLDOWN_SEC", 10.0)
+    now = time.time()
+    if now - float(_LAST_STALE_PIPELINE_LOCK_RESET_AT or 0.0) < cooldown:
+        return False, "cooldown"
+    return True, "ok"
+
+
+def _reset_pipeline_lock_if_stale(source_u: str, *, waited: float) -> bool:
+    global _LAST_STALE_PIPELINE_LOCK_RESET_AT, _pipeline_lock
+    ok, why = _can_reset_stale_pipeline_lock(source_u)
+    if not ok:
+        logger.warning("[ENTRY CONTROLLER LOCK WAIT] stale lock reset skipped source=%s reason=%s waited=%.3fs", source_u, why, waited)
+        return False
+    try:
+        old_lock = _pipeline_lock
+        _pipeline_lock = threading.RLock()
+        _LAST_STALE_PIPELINE_LOCK_RESET_AT = time.time()
+        logger.warning(
+            "[ENTRY CONTROLLER LOCK WAIT] STALE_LOCK_RESET source=%s waited=%.3fs old_lock=%r new_lock=%r",
+            source_u, waited, old_lock, _pipeline_lock,
+        )
+        return True
+    except Exception:
+        logger.exception("[ENTRY CONTROLLER LOCK WAIT] stale lock reset failed source=%s", source_u)
+        return False
+
+
+def _pipeline_result_has_payload(v: Any) -> bool:
+    if isinstance(v, (list, tuple, set, dict)):
+        return len(v) > 0
+    return bool(v)
+
+
+def _pipeline_strict_order_executed(result: Any) -> bool:
+    """実注文が確認できた場合だけ True。approved/registered/pending減少だけでは成功扱いしない。"""
+    try:
+        if result is None:
+            return False
+        if isinstance(result, bool):
+            return result
+        if isinstance(result, dict):
+            for key in _PIPELINE_EXECUTED_COUNT_KEYS:
+                try:
+                    if int(result.get(key) or 0) > 0:
+                        return True
+                except Exception:
+                    pass
+            for key in _PIPELINE_ORDER_KEYS:
+                if _pipeline_result_has_payload(result.get(key)):
+                    return True
+            for key in ("result", "pipeline_result", "order_result"):
+                child = result.get(key)
+                if child is not result and _pipeline_strict_order_executed(child):
+                    return True
+            return False
+        if isinstance(result, (list, tuple, set)):
+            return any(_pipeline_strict_order_executed(x) for x in result)
+        return False
+    except Exception:
+        return False
+
+
+def _should_retry_run_entry_pipeline_after_no_order(*, is_summary: bool, before_pending: int, before_inflight: int, result: Any) -> bool:
+    if not _env_bool("SUMMARY_AI_ENTRY_CONTROLLER_RETRY_AFTER_SKIP", True):
+        return False
+    if not is_summary or before_pending <= 0:
+        return False
+    if _pipeline_strict_order_executed(result):
+        return False
+    _, after_pending = _pipeline_snapshot_pending_count()
+    after_inflight = _pipeline_inflight_count()
+    return after_inflight <= before_inflight and after_pending > 0
+
+
+def _normalize_run_entry_pipeline_result(
+    result: Any, *, before_root: dict, before_pending: int, before_inflight: int,
+    waited_sec: float, is_summary: bool, retry_count: int,
+) -> dict:
+    after_root, after_pending = _pipeline_snapshot_pending_count()
+    after_inflight = _pipeline_inflight_count()
+    pending_decreased = after_pending < before_pending
+    inflight_increased = after_inflight > before_inflight
+    executed = bool(_pipeline_strict_order_executed(result) or inflight_increased)
+    approved_count = max(0, before_pending - after_pending, after_inflight - before_inflight)
+
+    if executed:
+        skip_reason = None
+    elif pending_decreased:
+        skip_reason = "pending_moved_without_order"
+    elif retry_count > 0:
+        skip_reason = "entry_controller_no_order_after_retry"
+    elif is_summary and waited_sec > 0:
+        skip_reason = "entry_controller_no_order_after_lock_wait"
+    else:
+        skip_reason = "entry_controller_no_order"
+
+    out = dict(result) if isinstance(result, dict) else {"result": result}
+    out.update({
+        "executed": executed,
+        "approved_count": approved_count,
+        "skip_reason": skip_reason,
+        "pending_moved_without_order": bool(pending_decreased and not executed),
+        "pending_before": before_root,
+        "pending_after": after_root,
+        "pending_count_before": before_pending,
+        "pending_count_after": after_pending,
+        "inflight_before": before_inflight,
+        "inflight_after": after_inflight,
+        "waited_sec": waited_sec,
+        "retry_count": retry_count,
+    })
+    return out
+
+
+def _pipeline_lock_timeout_result(source_u: str, waited: float, before_root: dict, before_pending: int, before_inflight: int) -> dict:
+    return {
+        "executed": False,
+        "approved_count": 0,
+        "result": None,
+        "skip_reason": "entry_controller_lock_timeout_retryable",
+        "lock_wait_source": source_u,
+        "pending_before": before_root,
+        "pending_after": before_root,
+        "pending_count_before": before_pending,
+        "pending_count_after": before_pending,
+        "inflight_before": before_inflight,
+        "inflight_after": before_inflight,
+        "waited_sec": round(float(waited), 3),
+        "retry_count": 0,
+        "retryable": True,
+        "retry_next_cycle": True,
+        "pending_kept": True,
+    }
+
+
+# ==========================================================
 # メイン
 # ==========================================================
 
-def run_entry_pipeline(
+def run_entry_pipeline(*, pipeline_source: str | None = None, interval: int | None = None):
+    source_u = _normalize_source(pipeline_source) if pipeline_source else ""
+    is_summary = source_u == "SUMMARY"
+    before_root, before_pending = _pipeline_snapshot_pending_count()
+    before_inflight = _pipeline_inflight_count()
+
+    waited_ok, waited_sec = _wait_entry_pipeline_lock_if_needed(source_u, before_pending=before_pending)
+    if not waited_ok:
+        _prune_old_pending_for_source(source_u, reason="lock_timeout_old_pending")
+        if not _reset_pipeline_lock_if_stale(source_u, waited=waited_sec):
+            if _env_bool("ENTRY_CONTROLLER_LOCK_WAIT_TIMEOUT_SKIP_ORIGINAL", True):
+                return _pipeline_lock_timeout_result(source_u, waited_sec, before_root, before_pending, before_inflight)
+
+    result = _run_entry_pipeline_core(pipeline_source=pipeline_source, interval=interval)
+    retry_count = 0
+
+    if _should_retry_run_entry_pipeline_after_no_order(is_summary=is_summary, before_pending=before_pending, before_inflight=before_inflight, result=result):
+        retry_count = 1
+        retry_ok, retry_waited = _wait_entry_pipeline_lock_if_needed(source_u or "SUMMARY", before_pending=before_pending)
+        waited_sec += retry_waited
+        if retry_ok:
+            logger.warning("[ENTRY CONTROLLER LOCK WAIT] retry run_entry_pipeline after no-order pending_before=%s waited_total=%.3fs", before_pending, waited_sec)
+            result = _run_entry_pipeline_core(pipeline_source=pipeline_source, interval=interval)
+
+    out = _normalize_run_entry_pipeline_result(
+        result, before_root=before_root, before_pending=before_pending, before_inflight=before_inflight,
+        waited_sec=waited_sec, is_summary=is_summary, retry_count=retry_count,
+    )
+    logger.info("[ENTRY CONTROLLER] run_entry_pipeline return normalized %s", out)
+    return out
+
+
+def _run_entry_pipeline_core(
     *,
     pipeline_source: str | None = None,
     interval: int | None = None,
@@ -1307,6 +1759,15 @@ def run_entry_pipeline(
                 if not bucket:
                     logger.info("📭 empty pending bucket raw_symbol=%s", raw_symbol)
                     continue
+
+                if pipeline_source or interval is not None:
+                    # 他 pipeline_source/interval 由来の候補しか無い symbol は
+                    # _build_scored_candidates を呼ぶ前にスキップする (性能最適化;
+                    # 正しさ自体は _build_scored_candidates 内の
+                    # _prefilter_entries_for_pipeline が保証する)。
+                    bucket = [e for e in bucket if _entry_matches_pipeline(e, pipeline_source, interval)]
+                    if not bucket:
+                        continue
 
                 symbol = normalize_symbol(raw_symbol)
                 if not symbol:
