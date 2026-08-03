@@ -143,7 +143,8 @@ def install() -> bool:
     _run_install("tonosama_datetime_tz_guard_patch", "core.startup.tonosama_datetime_tz_guard_patch")
 
     _run_install("main_skip_summary_push_bg_patch", "core.startup.main_skip_summary_push_bg_patch")
-    _run_install("summary_display_label_guard_patch", "core.startup.summary_display_label_guard_patch")
+    # summary_display_label_guard_patch は scheduler_jobs/summary/display.py 本体へ
+    # インライン化済みのため削除。
     _patch_summary_schema_bootstrap()
     _run_install("entry_limit_passive_runtime_patch", "core.startup.entry_limit_passive_runtime_patch")
     _run_install("entry_daily_risk_runtime_patch", "core.startup.entry_daily_risk_runtime_patch")

@@ -205,6 +205,8 @@ def _install_main_runtime_patches():
         ("core.startup.oneshot_limit_700k_patch", "install"),
         ("core.startup.entry_limit_passive_runtime_patch", "install"),
         ("core.startup.final_entry_safety_guard_patch", "install"),
+        # discord_summary_display_compact_patch / discord_summary_kwarg_safety_patch は
+        # scheduler_jobs/summary/display.py 本体へインライン化済みのため削除。
         # entry_ma5_third_bar_slope_guard_patch は entry_controller._build_scored_candidates
         # 本体へインライン化済みのため削除。
         ("core.startup.final_entry_liquidity_movement_hard_guard_patch", "install"),
@@ -214,8 +216,6 @@ def _install_main_runtime_patches():
         ("core.startup.summary_ai_async_direct_dispatch_patch", "install"),
         ("core.startup.entry_order_mtf_slope_fill_patch", "install"),
         ("core.startup.summary_ai_entry_controller_bridge_patch", "install"),
-        ("core.startup.discord_summary_display_compact_patch", "install"),
-        ("core.startup.discord_summary_kwarg_safety_patch", "install"),
         ("core.startup.ranking_entry_flat_price_guard_patch", "install"),
         ("core.startup.board_retry_patch", "install"),
         ("core.startup.board_missing_failopen_runtime_patch", "install"),
