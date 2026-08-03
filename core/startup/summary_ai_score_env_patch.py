@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/summary_ai_score_env_patch.py
-# Version: PRODUCTION-STABLE-REV2-SUMMARY-AI-ENTRY-BUY-THRESHOLD-PATCH
+# Version: PRODUCTION-STABLE-REV3-SUMMARY-AI-ENTRY-BUY-THRESHOLD-PATCH
 # ------------------------------------------------------------
 # Purpose:
 #   - AI.entry_gate の SUMMARY score threshold は MIN_ENTRY_SCORE を参照する。
@@ -8,10 +8,8 @@
 #   - entry_controller.py 側の最終BUY閾値が 5.0 のままだと、
 #     BUY候補がAI_OKでも BUY_SCORE_LOW / BUY_COMPOSITE_LOW で落ちる。
 #   - 起動時に MIN_ENTRY_SCORE と entry_controller BUY閾値を実運用値へ合わせる。
-#
-# Expected:
-#   - BUY score=4.0 の候補が entry_controller 最終AI gate を通過する
-#   - SELL候補の score_low:<4.000 も減る
+#   - REV3: SUMMARY_AI 1分足だけ LOW_MOVE_RANGE_TOO_SMALL を 1円以上かつ
+#     0.03%以上で再判定する補助パッチを同時に install する。
 # ============================================================
 
 from __future__ import annotations
@@ -90,6 +88,15 @@ def _patch_entry_controller_thresholds() -> dict[str, object]:
     return result
 
 
+def _install_summary_ai_1m_range_relax() -> bool:
+    try:
+        from core.startup.summary_ai_1m_range_relax_patch import install as _install
+        return bool(_install())
+    except Exception as e:
+        logger.exception("[SUMMARY AI SCORE ENV PATCH] SUMMARY_AI 1m range relax install failed")
+        return False
+
+
 def install_summary_ai_score_env_patch() -> None:
     global _INSTALLED
     if _INSTALLED:
@@ -102,15 +109,19 @@ def install_summary_ai_score_env_patch() -> None:
     _set_env_default("ENTRY_CONTROLLER_MIN_SUMMARY_SCORE_BUY", "3.0", applied, kept)
     _set_env_default("ENTRY_CONTROLLER_MIN_COMPOSITE_SCORE_BUY", "3.0", applied, kept)
     _set_env_default("ENTRY_CONTROLLER_MIN_AI_CONFIDENCE_BUY", "0.60", applied, kept)
+    _set_env_default("SUMMARY_AI_1M_MIN_RANGE_PCT", "0.0003", applied, kept)
+    _set_env_default("SUMMARY_AI_1M_MIN_RANGE_VALUE", "1.0", applied, kept)
 
     controller_patch = _patch_entry_controller_thresholds()
+    range_relax = _install_summary_ai_1m_range_relax()
 
     _INSTALLED = True
     logger.warning(
-        "[SUMMARY AI SCORE ENV PATCH] installed applied=%s kept=%s entry_controller=%s",
+        "[SUMMARY AI SCORE ENV PATCH] installed applied=%s kept=%s entry_controller=%s range_relax=%s",
         applied,
         kept,
         controller_patch,
+        range_relax,
     )
 
 
