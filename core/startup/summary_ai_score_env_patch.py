@@ -1,6 +1,6 @@
 # ============================================================
 # File   : core/startup/summary_ai_score_env_patch.py
-# Version: PRODUCTION-STABLE-REV2-SUMMARY-AI-ENTRY-BUY-THRESHOLD-PATCH
+# Version: PRODUCTION-STABLE-REV6-GLOBAL-CONTEXT-MTF-ENRICH
 # ------------------------------------------------------------
 # Purpose:
 #   - AI.entry_gate の SUMMARY score threshold は MIN_ENTRY_SCORE を参照する。
@@ -8,10 +8,20 @@
 #   - entry_controller.py 側の最終BUY閾値が 5.0 のままだと、
 #     BUY候補がAI_OKでも BUY_SCORE_LOW / BUY_COMPOSITE_LOW で落ちる。
 #   - 起動時に MIN_ENTRY_SCORE と entry_controller BUY閾値を実運用値へ合わせる。
+#   - REV3: SUMMARY_AI approved後の blowoff_top 過剰除外と tf=1 history 空を補修する
+#           summary_ai_entry_execution_fix_patch を同時に install する。
+#   - REV4: LOW_MOVE_RANGE_TOO_SMALL 候補を approved / Top3 前で除外し、
+#           snapshot_no_order まで進ませない。
+#   - REV5: memory 1m summary の slope/score/MTF/MACD 全0を publish 前に補正する。
+#   - REV6: GlobalContext の get/set 経路で PUSH 1分summary の MTF全0を補正する。
 #
 # Expected:
 #   - BUY score=4.0 の候補が entry_controller 最終AI gate を通過する
 #   - SELL候補の score_low:<4.000 も減る
+#   - blowoff_top は無効化せず、BUYの本当の吹き上げだけ止める
+#   - low-move 候補は発注直前ではなく SUMMARY_AI 選定段階で落ちる
+#   - PUSH memory 1m summary が rows>0 なら score/slope/MTF/MACD が全0にならない
+#   - Tonosama が get_push_merged_summary() で読む経路でも mtf=0 に戻らない
 # ============================================================
 
 from __future__ import annotations
@@ -90,6 +100,58 @@ def _patch_entry_controller_thresholds() -> dict[str, object]:
     return result
 
 
+def _install_execution_fix_patch() -> dict[str, object]:
+    result: dict[str, object] = {"installed": False}
+    try:
+        from core.startup.summary_ai_entry_execution_fix_patch import install as install_exec_fix
+
+        ok = bool(install_exec_fix())
+        result.update({"installed": ok})
+    except Exception as e:
+        logger.exception("[SUMMARY AI SCORE ENV PATCH] execution fix patch install failed")
+        result.update({"error": repr(e)})
+    return result
+
+
+def _install_low_move_prefilter_patch() -> dict[str, object]:
+    result: dict[str, object] = {"installed": False}
+    try:
+        from core.startup.summary_ai_low_move_prefilter_patch import install as install_low_move_prefilter
+
+        ok = bool(install_low_move_prefilter())
+        result.update({"installed": ok})
+    except Exception as e:
+        logger.exception("[SUMMARY AI SCORE ENV PATCH] low-move prefilter patch install failed")
+        result.update({"error": repr(e)})
+    return result
+
+
+def _install_memory_1m_enrich_patch() -> dict[str, object]:
+    result: dict[str, object] = {"installed": False}
+    try:
+        from core.startup.summary_memory_1m_enrich_patch import install as install_memory_enrich
+
+        ok = bool(install_memory_enrich())
+        result.update({"installed": ok})
+    except Exception as e:
+        logger.exception("[SUMMARY AI SCORE ENV PATCH] memory 1m enrich patch install failed")
+        result.update({"error": repr(e)})
+    return result
+
+
+def _install_global_context_mtf_enrich_patch() -> dict[str, object]:
+    result: dict[str, object] = {"installed": False}
+    try:
+        from core.startup.summary_global_context_mtf_enrich_patch import install as install_gc_mtf_enrich
+
+        ok = bool(install_gc_mtf_enrich())
+        result.update({"installed": ok})
+    except Exception as e:
+        logger.exception("[SUMMARY AI SCORE ENV PATCH] global context MTF enrich patch install failed")
+        result.update({"error": repr(e)})
+    return result
+
+
 def install_summary_ai_score_env_patch() -> None:
     global _INSTALLED
     if _INSTALLED:
@@ -103,14 +165,32 @@ def install_summary_ai_score_env_patch() -> None:
     _set_env_default("ENTRY_CONTROLLER_MIN_COMPOSITE_SCORE_BUY", "3.0", applied, kept)
     _set_env_default("ENTRY_CONTROLLER_MIN_AI_CONFIDENCE_BUY", "0.60", applied, kept)
 
+    # low-move 候補は、order_builder の LOW_MOVE_RANGE_TOO_SMALL まで進ませない。
+    _set_env_default("SUMMARY_AI_LOW_MOVE_PREFILTER_ENABLED", "1", applied, kept)
+    _set_env_default("SUMMARY_AI_PREFILTER_MIN_RANGE_PCT", "0.005", applied, kept)
+    _set_env_default("SUMMARY_AI_PREFILTER_REJECT_MISSING_RANGE", "0", applied, kept)
+    _set_env_default("SUMMARY_AI_PREFILTER_KEEP_MIN_IF_ALL_SKIPPED", "1", applied, kept)
+    _set_env_default("SUMMARY_AI_PREFILTER_KEEP_MIN_COUNT", "1", applied, kept)
+
+    # PUSH memory 1分summary が OHLCだけで score/slope/MTF/MACD 全0にならないよう補正する。
+    _set_env_default("SUMMARY_MEMORY_1M_ENRICH_ENABLED", "1", applied, kept)
+
     controller_patch = _patch_entry_controller_thresholds()
+    execution_fix_patch = _install_execution_fix_patch()
+    low_move_prefilter_patch = _install_low_move_prefilter_patch()
+    memory_1m_enrich_patch = _install_memory_1m_enrich_patch()
+    global_context_mtf_enrich_patch = _install_global_context_mtf_enrich_patch()
 
     _INSTALLED = True
     logger.warning(
-        "[SUMMARY AI SCORE ENV PATCH] installed applied=%s kept=%s entry_controller=%s",
+        "[SUMMARY AI SCORE ENV PATCH] installed applied=%s kept=%s entry_controller=%s execution_fix=%s low_move_prefilter=%s memory_1m_enrich=%s global_context_mtf_enrich=%s",
         applied,
         kept,
         controller_patch,
+        execution_fix_patch,
+        low_move_prefilter_patch,
+        memory_1m_enrich_patch,
+        global_context_mtf_enrich_patch,
     )
 
 
