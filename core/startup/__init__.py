@@ -67,12 +67,65 @@ _SKIP_ENTRY_RUNTIME_INIT_PATCHES = _core_startup_is_database_context()
 
 
 def _install_entry_runtime_init_patches() -> None:
+    # ============================================================
+    # summary scheduler stale guard の env 既定値
+    # (旧 core/startup/summary_scheduler_unified_stale_guard_patch.py V5 の install() から移設)
+    # ------------------------------------------------------------
+    # ガード本体のロジックは scheduler_jobs/summary/scheduler.py へ本文化済みだが、
+    # env 既定値の設定はこの位置に残す必要がある:
+    #   - SUMMARY_PUSH_BG_ALL_INTERVALS / SUMMARY_PUSH_BG_LONG_INTERVALS は
+    #     他の runtime patch が install 時に読むため設定タイミングが効く。
+    #   - full モードの FORCE_ENABLE_MAIN_SUMMARY_PARENT_TICK=1 は、明示的な
+    #     AUTOSTOCK_MAIN_SKIP_SUMMARY_PARENT_TICK=1 を打ち消す役割を持つ
+    #     (= 意図的に親tickを復帰させる)。省略すると挙動が変わる。
+    # ============================================================
     try:
-        from .summary_scheduler_unified_stale_guard_patch import install as install_summary_scheduler_unified_stale_guard_patch
+        def _core_stale_guard_env_flag(name: str, default: bool = False) -> bool:
+            raw = str(os.getenv(name, "")).strip().lower()
+            if raw in {"1", "true", "yes", "on", "enable", "enabled"}:
+                return True
+            if raw in {"0", "false", "no", "off", "disable", "disabled"}:
+                return False
+            return bool(default)
 
-        install_summary_scheduler_unified_stale_guard_patch()
+        def _core_stale_guard_main_entry_only() -> bool:
+            if _core_stale_guard_env_flag("AUTOSTOCK_MAIN_DATABASE_PROCESS") or _core_stale_guard_env_flag(
+                "AUTOSTOCK_DATA_COLLECTORS_PROCESS"
+            ):
+                return False
+            role = str(os.getenv("SUMMARY_DB_WRITER_ROLE") or "").strip().lower()
+            argv_main = os.path.basename(str(sys.argv[0])).lower() == "main.py"
+            return (
+                argv_main
+                or _core_stale_guard_env_flag("SUMMARY_MAIN_ENTRY_ONLY")
+                or role in ("entry_only", "main_entry_only", "read_only", "no_save")
+            )
+
+        if _core_stale_guard_main_entry_only():
+            _mode = str(os.getenv("AUTOSTOCK_MAIN_OPERATION_MODE") or "full").strip().lower()
+            # main.py では前回の unified/fallback 残りを早く解放する。
+            os.environ.setdefault("SUMMARY_MAIN_UNIFIED_BG_STALE_SEC", "20")
+            os.environ.setdefault("SUMMARY_PUSH_FALLBACK_STALE_SEC", "25")
+            if _mode not in ("full", "restore", "live", "normal"):
+                os.environ.setdefault("AUTOSTOCK_MAIN_SKIP_SUMMARY_PARENT_TICK", "1")
+                os.environ["ENABLE_PUSH_SUMMARY_FALLBACK_WHEN_UNIFIED_BLOCKED"] = "0"
+                os.environ.setdefault("SUMMARY_PUSH_BG_ALL_INTERVALS", "0")
+                os.environ.setdefault("SUMMARY_PUSH_BG_LONG_INTERVALS", "0")
+                logger.warning(
+                    "[SUMMARY SCHEDULER STALE GUARD] main entry process: parent tick/fallback guarded mode=%s",
+                    _mode,
+                )
+            else:
+                os.environ.setdefault("AUTOSTOCK_MAIN_SKIP_SUMMARY_PARENT_TICK", "0")
+                os.environ.setdefault("FORCE_ENABLE_MAIN_SUMMARY_PARENT_TICK", "1")
+                # full 運用でも previous_unified_bg_still_running からの PUSH fallback 連鎖は止める。
+                os.environ.setdefault("SUMMARY_SUPPRESS_PREVIOUS_UNIFIED_FALLBACK_IN_MAIN", "1")
+                logger.warning(
+                    "[SUMMARY SCHEDULER STALE GUARD] main full mode: parent tick restored mode=%s",
+                    _mode,
+                )
     except Exception:
-        logger.exception("[core.startup] summary scheduler unified stale guard patch install failed")
+        logger.exception("[core.startup] summary scheduler stale guard env defaults failed")
 
     try:
         from .ranking_summary_schedule_bg_patch import install as install_ranking_summary_schedule_bg_patch

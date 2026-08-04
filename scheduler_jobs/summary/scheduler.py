@@ -56,6 +56,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import sys
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -136,7 +137,14 @@ def _push_fallback_when_blocked_enabled() -> bool:
 
     最新20分はYahooではなくPUSHで埋める必要があるため、
     デフォルト True。
+
+    ただし main.py 側で親tickをskipしている / PUSH を全interval BG化している
+    構成では、legacy fallback を足しても worker が増えるだけなので抑止する
+    (旧 summary_scheduler_unified_stale_guard_patch から移設)。
     """
+    if _suppress_legacy_push_fallback() or _main_skip_parent_tick():
+        logger.info("[SUMMARY SCHEDULER STALE GUARD] legacy PUSH fallback enabled? -> False")
+        return False
     return _env_flag("ENABLE_PUSH_SUMMARY_FALLBACK_WHEN_UNIFIED_BLOCKED", default=True)
 
 
@@ -159,7 +167,13 @@ def _push_fallback_stale_sec() -> float:
     通常は 35秒 x 3 = 105秒程度以内に戻る想定。
     余裕を見てデフォルト300秒
     (旧 core/startup/summary_scheduler_timeout_patch.py から移設)。
+
+    main.py の entry プロセスだけは親tickの timeout cap が短く、残った fallback を
+    早く解放しないと連鎖するため 25秒
+    (旧 summary_scheduler_unified_stale_guard_patch の setdefault から移設)。
     """
+    if _main_entry_only():
+        return _env_float("SUMMARY_PUSH_FALLBACK_STALE_SEC", default=25.0)
     return _env_float("SUMMARY_PUSH_FALLBACK_STALE_SEC", default=300.0)
 
 
@@ -169,6 +183,153 @@ def _push_fallback_async_enabled() -> bool:
     デフォルト True。
     """
     return _env_flag("ENABLE_SUMMARY_PUSH_FALLBACK_ASYNC", default=True)
+
+
+# ============================================================
+# main.py 親tick / PUSH fallback 抑止ガード
+# (旧 core/startup/summary_scheduler_unified_stale_guard_patch.py V5 から移設)
+# ------------------------------------------------------------
+# main.py の entry プロセスでは、親tickが NAS 上の summary/push/cache を
+# 読みに行って 0xC0000006 で落ちる問題があった。また親tickが timeout した
+# 後に executor スレッドが裏に残ると previous_unified_bg_still_running →
+# PUSH fallback 連鎖で次tick以降も詰まり続ける。
+#
+# 旧パッチは core/startup/__init__.py 経由でのみ install されており
+# main.py 専用だった。本文化後も _stale_guard_enabled() で
+# DB専用子プロセスには適用しない。
+# ============================================================
+
+_STALE_GUARD_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+
+
+def _stale_guard_enabled() -> bool:
+    """このプロセスで stale guard を適用するか。
+
+    SUMMARY_SCHEDULER_STALE_GUARD_ENABLED=1/0 で明示的に上書きできる。
+    CORE_STARTUP_FORCE_FULL_INIT_PATCHES=1 のときは DB プロセスでも適用する。
+    """
+    try:
+        override = os.getenv("SUMMARY_SCHEDULER_STALE_GUARD_ENABLED")
+        if override is not None and str(override).strip() != "":
+            return _env_flag("SUMMARY_SCHEDULER_STALE_GUARD_ENABLED", default=True)
+        if _env_flag("CORE_STARTUP_FORCE_FULL_INIT_PATCHES", default=False):
+            return True
+        argv_text = " ".join(str(x) for x in sys.argv).replace("\\", "/").lower()
+        return not any(name in argv_text for name in _STALE_GUARD_DB_PROCESS_NAMES)
+    except Exception:
+        return True
+
+
+def _argv_main_py() -> bool:
+    try:
+        return os.path.basename(str(sys.argv[0])).lower() == "main.py"
+    except Exception:
+        return False
+
+
+def _operation_mode() -> str:
+    try:
+        return str(os.getenv("AUTOSTOCK_MAIN_OPERATION_MODE") or "full").strip().lower()
+    except Exception:
+        return "full"
+
+
+def _main_entry_only() -> bool:
+    """main.py の entry プロセス (= 親tickでNAS読みしたくない側) か。"""
+    try:
+        if not _stale_guard_enabled():
+            return False
+        if _env_flag("AUTOSTOCK_MAIN_DATABASE_PROCESS", default=False) or _env_flag(
+            "AUTOSTOCK_DATA_COLLECTORS_PROCESS", default=False
+        ):
+            return False
+        role = str(os.getenv("SUMMARY_DB_WRITER_ROLE") or "").strip().lower()
+        return (
+            _argv_main_py()
+            or _env_flag("SUMMARY_MAIN_ENTRY_ONLY", default=False)
+            or role in ("entry_only", "main_entry_only", "read_only", "no_save")
+        )
+    except Exception:
+        return False
+
+
+def _main_skip_parent_tick() -> bool:
+    if not _main_entry_only():
+        return False
+    if _env_flag("FORCE_ENABLE_MAIN_SUMMARY_PARENT_TICK", default=False):
+        return False
+    if _operation_mode() in ("full", "restore", "live", "normal"):
+        return _env_flag("AUTOSTOCK_MAIN_SKIP_SUMMARY_PARENT_TICK", default=False)
+    return _env_flag("AUTOSTOCK_MAIN_SKIP_SUMMARY_PARENT_TICK", default=True)
+
+
+def _push_bg_all() -> bool:
+    return _env_flag("SUMMARY_PUSH_BG_ALL_INTERVALS", default=_main_entry_only())
+
+
+def _suppress_legacy_push_fallback() -> bool:
+    if _env_flag("FORCE_ENABLE_LEGACY_PUSH_SUMMARY_FALLBACK", default=False):
+        return False
+    return _main_entry_only() and _push_bg_all() and _main_skip_parent_tick()
+
+
+def _main_unified_stale_sec() -> float:
+    """unified runner が残っていると判断する秒数。
+
+    main.py の親tickは timeout cap が短いので、それより早く running フラグを
+    解除して previous_unified_bg_still_running -> fallback 連鎖を止める。
+    executor 内の古い処理自体は強制停止できない。
+    """
+    if _main_entry_only():
+        return max(1.0, _env_float("SUMMARY_MAIN_UNIFIED_BG_STALE_SEC", default=20.0))
+    return max(1.0, _env_float("SUMMARY_UNIFIED_BG_STALE_SEC", default=60.0))
+
+
+def _reset_unified_if_stale(context: str, *, force: bool = False) -> bool:
+    """unified running フラグが stale なら解除する。"""
+    global _unified_bg_running, _unified_bg_started_at
+
+    try:
+        if not _stale_guard_enabled():
+            return False
+        if not _unified_bg_running:
+            return False
+        started = _unified_bg_started_at
+        elapsed = 999999.0 if started is None else max(0.0, time.time() - float(started))
+        stale_sec = _main_unified_stale_sec()
+        if not force and elapsed < stale_sec:
+            return False
+        with _unified_bg_lock:
+            _unified_bg_running = False
+            _unified_bg_started_at = None
+        logger.warning(
+            "[SUMMARY SCHEDULER STALE GUARD] unified reset context=%s elapsed=%.3fs stale=%.3fs force=%s",
+            context, elapsed, stale_sec, force,
+        )
+        return True
+    except Exception:
+        logger.exception("[SUMMARY SCHEDULER STALE GUARD] reset failed context=%s", context)
+        return False
+
+
+def _reset_push_fallback_state(context: str) -> None:
+    try:
+        _mark_push_fallback_done()
+        logger.warning(
+            "[SUMMARY SCHEDULER STALE GUARD] push fallback state reset context=%s via helper", context
+        )
+    except Exception:
+        logger.exception(
+            "[SUMMARY SCHEDULER STALE GUARD] push fallback state reset failed context=%s", context
+        )
 
 
 # ============================================================
@@ -630,6 +791,39 @@ def _run_push_fallback_when_unified_blocked(now: dt.datetime, *, reason: str) ->
       - 専用daemon threadでPUSH fallbackを走らせる
       - previous_push_fallback_still_running が古い場合は stale reset する
     """
+    reason = str(reason or "")
+
+    # 旧 summary_scheduler_unified_stale_guard_patch から移設。
+    if _suppress_legacy_push_fallback() or _main_skip_parent_tick():
+        _reset_push_fallback_state(f"suppressed:{reason}")
+        try:
+            hhmm = f"{now.hour:02d}:{now.minute:02d}"
+        except Exception:
+            hhmm = str(now)
+        logger.warning(
+            "[SUMMARY SCHEDULER STALE GUARD] legacy PUSH fallback suppressed reason=%s hhmm=%s "
+            "main_entry_only=%s parent_skip=%s",
+            reason, hhmm, _main_entry_only(), _main_skip_parent_tick(),
+        )
+        return
+
+    if (
+        _main_entry_only()
+        and reason == "previous_unified_bg_still_running"
+        and _env_flag("SUMMARY_SUPPRESS_PREVIOUS_UNIFIED_FALLBACK_IN_MAIN", default=True)
+    ):
+        # ここで fallback を起動すると、親tick timeout済みの古いworkerと fallback worker が
+        # 並列に増え、次tickも previous_unified_bg_still_running になりやすい。
+        # stale を超えていれば unified フラグを解除し、fallback は起動しない。
+        reset = _reset_unified_if_stale(f"fallback_suppressed:{reason}")
+        _reset_push_fallback_state(f"fallback_suppressed:{reason}")
+        logger.warning(
+            "[SUMMARY SCHEDULER STALE GUARD] previous unified fallback suppressed in main.py "
+            "reason=%s reset_unified=%s",
+            reason, reset,
+        )
+        return
+
     if not _push_fallback_when_blocked_enabled():
         logger.warning(
             "[summary.scheduler] PUSH fallback disabled reason=%s hhmm=%02d:%02d",
@@ -769,6 +963,19 @@ def _run_summary_tick(now: Optional[dt.datetime] = None) -> None:
       - fallback running が古い場合は stale reset して再投入できる。
     """
     global _unified_bg_running, _unified_bg_started_at
+
+    # 旧 summary_scheduler_unified_stale_guard_patch から移設。
+    # 前tickの unified running が残っていれば先に解除してから判定する。
+    _reset_unified_if_stale("before_parent_tick")
+    if _main_skip_parent_tick():
+        _reset_push_fallback_state("main_parent_tick_skip")
+        logger.warning(
+            "[SUMMARY SCHEDULER STALE GUARD] main.py skip summary parent tick to avoid NAS DB/cache read. "
+            "Set AUTOSTOCK_MAIN_SKIP_SUMMARY_PARENT_TICK=0 or AUTOSTOCK_MAIN_OPERATION_MODE=full to restore."
+        )
+        return
+    if _suppress_legacy_push_fallback():
+        _reset_push_fallback_state("before_parent_tick_suppress")
 
     now = _now(now)
     run_1m, run_3m, run_5m = _run_flags(now)
