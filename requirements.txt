@@ -1,5 +1,6 @@
 numpy
-pandas
+# 3.0.5はWindows Application Control Policy (WDAC)にconversion.pydをブロックされたため2.2.3に固定 (2026-08-04)
+pandas==2.2.3
 scikit-learn
 lightgbm
 optuna
