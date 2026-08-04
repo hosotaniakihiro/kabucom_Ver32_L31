@@ -592,7 +592,10 @@ def _soft_ready_num(df: pd.DataFrame, col: str) -> pd.Series:
             return pd.to_numeric(df[col], errors="coerce")
     except Exception:
         pass
-    return pd.Series(pd.NA, index=df.index, dtype="float64")
+    # 欠損カラム用の全NaN列。
+    # pd.Series(pd.NA, dtype="float64") は pandas 2.2.3 で TypeError を送出するため使わない
+    # (これを踏むと _build_soft_technical_ready_mask が例外→全False になり救済が無効化される)。
+    return pd.Series(float("nan"), index=df.index, dtype="float64")
 
 
 def _soft_ready_bool(df: pd.DataFrame, col: str, default: bool = False) -> pd.Series:
