@@ -39,6 +39,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -57,6 +58,39 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 _OWNER_GUARD_LAST_LOG_TS = 0.0
+
+
+def _received_at_datetime_env_on(name: str, default: bool = True) -> bool:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _received_at_looks_like_escaped_garbage(value: Any) -> bool:
+    """Return True for accidental repr/escaped blobs, not normal datetimes.
+
+    Guards against a bad caller passing a repr string containing thousands of
+    backslashes (e.g. a whole DataFrame repr) as received_at, which would
+    otherwise pollute stream_data.datetime and downstream logs/DB output.
+    Only real datetime-like strings should be allowed through.
+    """
+    try:
+        s = str(value)
+    except Exception:
+        return True
+    if not s:
+        return True
+    if len(s) > 80:
+        return True
+    if s.count("\\") >= 2:
+        return True
+    if any(token in s for token in ("\\\\\\\\", "['", "']", "{", "}", "<", ">")):
+        return True
+    return False
 
 
 def _should_skip_push_db_writer_here() -> bool:
@@ -326,13 +360,39 @@ class StreamDBWriter:
     def _resolve_push_datetime_value(self, row: dict) -> Any:
         """
         PUSH保存用の代表時刻を安全に決める。
-        優先順位:
+
+        PUSH_STREAM_DATA_USE_RECEIVED_AT_DATETIME (既定True) が有効な場合、
+        received_at/recv_at/received_time が妥当な日時らしい値であれば最優先で使う
+        (旧 push_stream_data_received_at_datetime_patch)。それ以外は下記の優先順位:
           1) current_price_time
           2) datetime
           3) received_at
 
         未来時刻は received_at / now へフォールバックする。
         """
+        if _received_at_datetime_env_on("PUSH_STREAM_DATA_USE_RECEIVED_AT_DATETIME", True):
+            try:
+                received_at = row.get("received_at") or row.get("recv_at") or row.get("received_time")
+                if received_at and not _received_at_looks_like_escaped_garbage(received_at):
+                    dt_obj = self._coerce_datetime_obj(received_at)
+                    if dt_obj is not None:
+                        try:
+                            now_local = self._now_local()
+                            if getattr(dt_obj, "tzinfo", None) is None:
+                                dt_obj = dt_obj.replace(tzinfo=now_local.tzinfo)
+                        except Exception:
+                            pass
+                        return dt_obj
+                elif received_at:
+                    logger.warning(
+                        "[PUSH DB WRITER] ignored suspicious received_at symbol=%s len=%s backslashes=%s",
+                        row.get("symbol"),
+                        len(str(received_at)) if received_at is not None else 0,
+                        str(received_at).count("\\") if received_at is not None else 0,
+                    )
+            except Exception:
+                logger.exception("[PUSH DB WRITER] received_at-priority datetime resolve failed; fallback to default priority")
+
         raw_candidates = [
             row.get("current_price_time"),
             row.get("datetime"),

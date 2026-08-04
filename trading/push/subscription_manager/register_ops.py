@@ -17,11 +17,13 @@ import contextlib
 import json
 import logging
 import os
+import sys
 import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Iterator, Optional, Sequence
 
 from .globals_access import safe_get_global_data, safe_getattr
@@ -239,12 +241,263 @@ def _get_ini_api_key() -> str:
     return token or ""
 
 
+# ============================================================
+# canonical token resolution (旧 core/startup/kabusapi_token_retry_register_patch.py)
+#
+# 運用方針: token は起動時に親プロセス(main_database.py/main.py)が一度だけ取得して
+# settings.ini/runtime cacheに保存する。子プロセス(push_receiver_runner.py等)は
+# /token を呼ばず、または token_manager の子プロセスガードを迂回してはならない。
+# register/unregister は常にこの canonical token を使い、4001009/APIキー不一致は
+# 実際の認証失敗としてログに残す。
+# ============================================================
+
+_KABUSAPI_TOKEN_ENV_KEYS = (
+    "KABUSAPI_TOKEN",
+    "KABU_API_TOKEN",
+    "AUKABU_TOKEN",
+    "API_TOKEN",
+    "TOKEN",
+    "KABU_TOKEN",
+    "X_API_KEY",
+    "KABU_API_KEY",
+    "KABUSAPI_API_KEY",
+)
+
+_KABUSAPI_CHILD_MARKERS = (
+    "push_receiver_runner.py",
+    "ranking_collector_runner.py",
+    "summary_database_runner.py",
+    "yahoo_complement_runner.py",
+    "db_prepare_runner.py",
+)
+
+_KABUSAPI_TOKEN_BOOTSTRAPPED = False
+_KABUSAPI_TOKEN_LOCK = threading.RLock()
+
+
+def _kabusapi_token_env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
+
+
+def _kabusapi_token_argv_text() -> str:
+    try:
+        return " ".join(str(x) for x in getattr(sys, "argv", [])).lower()
+    except Exception:
+        return ""
+
+
+def _kabusapi_token_is_child_process() -> bool:
+    txt = _kabusapi_token_argv_text()
+    if any(marker in txt for marker in _KABUSAPI_CHILD_MARKERS):
+        return True
+    for key in ("DATA_COLLECTOR_CHILD", "KABU_CHILD_PROCESS", "IS_CHILD_PROCESS"):
+        if _kabusapi_token_env_bool(key, False):
+            return True
+    return False
+
+
+def _kabusapi_token_is_parent_process() -> bool:
+    txt = _kabusapi_token_argv_text()
+    return "main_database.py" in txt or "main.py" in txt
+
+
+def _kabusapi_token_publish(token: str) -> str:
+    token = _safe_str(token)
+    if not token:
+        return ""
+    for k in _KABUSAPI_TOKEN_ENV_KEYS:
+        os.environ[k] = token
+    try:
+        import token_manager
+        token_manager.API_TOKEN = token
+    except Exception:
+        pass
+    try:
+        from core.global_context import context as gc
+        gd = getattr(gc, "global_data", None)
+        if gd is not None:
+            for name in ("kabu_api_key", "kabusapi_api_key", "api_key", "token", "kabu_token", "kabusapi_token", "X_API_KEY"):
+                try:
+                    setattr(gd, name, token)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return token
+
+
+def _kabusapi_token_settings_paths() -> list[Path]:
+    out: list[Path] = []
+    for env_name in ("SETTINGS_INI_PATH", "KABU_SETTINGS_INI"):
+        v = _safe_str(os.environ.get(env_name))
+        if v:
+            out.append(Path(v))
+    try:
+        import token_manager
+        p = _safe_str(getattr(token_manager, "_CONFIG_FILE_PATH", None))
+        if p:
+            out.append(Path(p))
+    except Exception:
+        pass
+    cwd = Path.cwd()
+    out.extend([cwd / "settings.ini", cwd / "config" / "settings.ini"])
+    try:
+        here = Path(__file__).resolve().parents[3]
+        out.extend([here / "settings.ini", here / "config" / "settings.ini"])
+    except Exception:
+        pass
+    uniq: list[Path] = []
+    seen: set[str] = set()
+    for p in out:
+        try:
+            key = str(p.resolve())
+        except Exception:
+            key = str(p)
+        if key not in seen:
+            seen.add(key)
+            uniq.append(p)
+    return uniq
+
+
+def _kabusapi_token_read_settings_ini() -> str:
+    for path in _kabusapi_token_settings_paths():
+        try:
+            if not path.exists():
+                continue
+            cp = configparser.ConfigParser()
+            cp.read(path, encoding="utf-8-sig")
+            for sec in ("aukabu", "kabusapi"):
+                if cp.has_section(sec):
+                    token = _safe_str(cp.get(sec, "token", fallback=""))
+                    if token:
+                        return _kabusapi_token_publish(token)
+        except Exception:
+            logger.debug("[SUB MANAGER] canonical token settings.ini read failed path=%s", path, exc_info=True)
+    return ""
+
+
+def _kabusapi_canonical_token() -> tuple[str, str]:
+    """Return the canonical token and source for register/unregister HTTP calls.
+
+    This intentionally ignores the api_key argument callers may hold, because older
+    recovery paths may carry stale env/global tokens.  The canonical order is:
+      1. token_manager.API_TOKEN, which should be populated by parent startup/preflight
+      2. settings.ini [aukabu]/[kabusapi] token
+      3. explicit token environment variables as last fallback
+    """
+    try:
+        import token_manager
+        token = _safe_str(getattr(token_manager, "API_TOKEN", None))
+        if token:
+            return _kabusapi_token_publish(token), "token_manager.API_TOKEN"
+    except Exception:
+        pass
+
+    token = _kabusapi_token_read_settings_ini()
+    if token:
+        return token, "settings.ini"
+
+    for key in _KABUSAPI_TOKEN_ENV_KEYS:
+        token = _safe_str(os.environ.get(key))
+        if token:
+            return _kabusapi_token_publish(token), f"env.{key}"
+    return "", "none"
+
+
+def _kabusapi_token_bootstrap_once() -> str:
+    """Acquire no token in child processes; children only read the parent-issued token.
+
+    Calling token_manager.refresh_token._original() directly here would bypass
+    token_manager's child-process guard and let a child call /token after the
+    parent preflight, which can make the token used by other child processes
+    inconsistent. Only the public refresh_token() wrapper is used, and only
+    when this is genuinely the parent process.
+    """
+    global _KABUSAPI_TOKEN_BOOTSTRAPPED
+    with _KABUSAPI_TOKEN_LOCK:
+        if _KABUSAPI_TOKEN_BOOTSTRAPPED:
+            token, _source = _kabusapi_canonical_token()
+            return token
+        _KABUSAPI_TOKEN_BOOTSTRAPPED = True
+
+        if _kabusapi_token_is_child_process() and not _kabusapi_token_env_bool("KABU_REGISTER_ALLOW_CHILD_BOOTSTRAP_TOKEN", False):
+            token, source = _kabusapi_canonical_token()
+            logger.warning(
+                "[SUB MANAGER] child process detected; /token bootstrap skipped source=%s token_len=%d argv=%s",
+                source, len(token), _kabusapi_token_argv_text(),
+            )
+            return token
+
+        if (not _kabusapi_token_is_parent_process()) and not _kabusapi_token_env_bool("KABU_REGISTER_ALLOW_NONPARENT_BOOTSTRAP_TOKEN", False):
+            token, source = _kabusapi_canonical_token()
+            logger.warning(
+                "[SUB MANAGER] non-parent process; /token bootstrap skipped source=%s token_len=%d argv=%s",
+                source, len(token), _kabusapi_token_argv_text(),
+            )
+            return token
+
+        if not _kabusapi_token_env_bool("KABU_REGISTER_BOOTSTRAP_TOKEN_ON_INSTALL", True):
+            token, source = _kabusapi_canonical_token()
+            logger.warning(
+                "[SUB MANAGER] bootstrap disabled; using existing token source=%s token_len=%d",
+                source, len(token),
+            )
+            return token
+
+        try:
+            import token_manager
+            refresh = getattr(token_manager, "refresh_token", None)
+            if callable(refresh):
+                # Deliberately call the public refresh wrapper, not _original, so the
+                # parent/child guard in token_manager cannot be bypassed.
+                token = _safe_str(refresh())
+                if token:
+                    _kabusapi_token_publish(token)
+                    os.environ["KABU_REGISTER_BOOTSTRAP_DONE"] = "1"
+                    logger.warning(
+                        "[SUB MANAGER] parent startup bootstrap token refreshed/saved before register token_len=%d",
+                        len(token),
+                    )
+                    return token
+                logger.error("[SUB MANAGER] startup bootstrap returned empty token before register")
+            else:
+                logger.error("[SUB MANAGER] token_manager.refresh_token missing; cannot bootstrap before register")
+        except Exception:
+            logger.exception("[SUB MANAGER] startup bootstrap token refresh failed before register")
+
+        token, source = _kabusapi_canonical_token()
+        logger.warning(
+            "[SUB MANAGER] fallback to existing token after bootstrap failure source=%s token_len=%d",
+            source, len(token),
+        )
+        return token
+
+
 def _resolve_api_key() -> str:
+    _kabusapi_token_bootstrap_once()
+    token, source = _kabusapi_canonical_token()
+    if token:
+        logger.info("[SUB MANAGER] resolved canonical token source=%s token_len=%d", source, len(token))
+        return token
+
     for getter in (_get_global_api_key, _get_env_api_key, _get_settings_api_key, _get_ini_api_key):
         api_key = getter()
         if api_key:
-            return api_key
+            logger.warning("[SUB MANAGER] canonical token missing; fallback original resolver token_len=%d", len(api_key))
+            return _kabusapi_token_publish(api_key)
     logger.error("[SUB MANAGER] API key unavailable")
+    logger.warning("[SUB MANAGER] no startup/settings.ini token available; runtime refresh disabled")
     return ""
 
 
@@ -374,6 +627,38 @@ def _build_request(*, url: str, method: str, payload: Optional[dict], api_key: s
 
 
 def _http_json_request(*, url: str, method: str, payload: Optional[dict], api_key: str, timeout: float = 10.0) -> tuple[bool, Any]:
+    """canonical token で api_key を上書きし、認証ミスマッチを診断ログに残す。
+
+    旧 core/startup/kabusapi_token_retry_register_patch.py の
+    _http_json_request_patched をここへ統合。実際のHTTP送受信は
+    _http_json_request_impl が担う (元の _http_json_request 本体)。
+    """
+    token, source = _kabusapi_canonical_token()
+    arg_len = len(_safe_str(api_key))
+    if not token:
+        token = _safe_str(api_key) or _resolve_api_key()
+        source = "api_key_arg_or_resolver"
+    if arg_len and _safe_str(api_key) != token:
+        logger.warning(
+            "[SUB MANAGER] overriding stale api_key arg for %s %s arg_len=%d canonical_source=%s canonical_len=%d",
+            method, url, arg_len, source, len(token),
+        )
+    else:
+        logger.info(
+            "[SUB MANAGER] using canonical token for %s %s source=%s token_len=%d",
+            method, url, source, len(token),
+        )
+    ok, content = _http_json_request_impl(url=url, method=method, payload=payload, api_key=token, timeout=timeout)
+    if ok or not _is_api_key_mismatch(content):
+        return ok, content
+    logger.error(
+        "[SUB MANAGER] API key mismatch method=%s url=%s canonical_source=%s token_len=%d arg_len=%d runtime_refresh_disabled content=%r",
+        method, url, source, len(token), arg_len, content,
+    )
+    return ok, content
+
+
+def _http_json_request_impl(*, url: str, method: str, payload: Optional[dict], api_key: str, timeout: float = 10.0) -> tuple[bool, Any]:
     url = _normalize_http_url(url)
     method = (_safe_str(method) or "PUT").upper()
     if not url:

@@ -7,7 +7,9 @@ Current production policy:
 1. Token/auth handling is owned by:
    - main_database.py parent preflight
    - token_manager.py parent-only refresh guard
-   - core.startup.kabusapi_token_retry_register_patch v5 canonical token wrapper
+   - trading/push/subscription_manager/register_ops.py's own canonical token
+     resolution (_resolve_api_key / _http_json_request; formerly a separate
+     core.startup.kabusapi_token_retry_register_patch v5 monkeypatch, now inlined)
 
 2. This patch must NOT wrap register_ops._http_json_request, must NOT sync tokens,
    and must NOT refresh/retry on 4001009 / APIキー不一致.
@@ -99,7 +101,7 @@ def _patch_register_ops() -> bool:
     ok_any = False
 
     # IMPORTANT: Do not patch ro._http_json_request here.
-    # Token handling must remain owned by kabusapi_token_retry_register_patch v5.
+    # Token handling must remain owned by register_ops.py's own canonical token resolution.
     if not getattr(ro, "_PUSH_REGISTER_RECOVERY_HTTP_DISABLED_V4", False):
         ro._PUSH_REGISTER_RECOVERY_HTTP_DISABLED_V4 = True  # type: ignore[attr-defined]
         ro._PUSH_REGISTER_RECOVERY_HTTP_PATCHED = False  # type: ignore[attr-defined]
