@@ -28,8 +28,11 @@ import datetime as dt
 import importlib
 import inspect
 import logging
+import os
+import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Optional
 
 import schedule
@@ -657,9 +660,11 @@ def _announce_ranking_summary_intervals_safe(
 # ranking summary job wrapper
 # ============================================================
 
-def _run_ranking_summary_all_job_safe():
+def _run_ranking_summary_all_job_sync():
     """
-    schedule から呼ばれるランキング由来サマリー job。
+    schedule から呼ばれるランキング由来サマリー job (同期実行版)。
+
+    BG実行が無効なプロセス (DB専用子プロセス等) ではこちらが使われる。
     """
     global _RANKING_JOB_RUNNING
     global _RANKING_JOB_STARTED_AT
@@ -761,6 +766,313 @@ def _run_ranking_summary_all_job_safe():
             _RANKING_JOB_STARTED_AT = None
             _set_global_attr("ranking_summary_job_running", False)
             _set_global_attr("ranking_summary_job_finished_at", dt.datetime.now())
+
+
+# ============================================================
+# ranking summary BG 実行 / timeout cooldown
+# (旧 core/startup/ranking_summary_schedule_bg_patch.py V5 から移設)
+# ------------------------------------------------------------
+# ranking_summary_all の schedule job が長時間 running のまま残り、
+# 毎分 bg_still_running でスキップされ続ける問題を抑える。
+#   - schedule から呼ばれたら即BGへ投入して return する
+#   - BG実行が一定秒数を超えたら timeout 扱いにして cooldown へ入れる
+#   - timeout/cooldown 中は新しいBGを投入しない
+#   - 古いBGスレッド自体は kill できないので scheduler 側だけ即復帰させる
+#
+# 旧パッチは core/startup/__init__.py 経由でのみ install されていたため
+# DB専用子プロセスでは適用されず、同期版が使われていた。本文化後も
+# _ranking_bg_scope_enabled() で同じスコープを保つ。
+# ============================================================
+
+_RANKING_BG_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_RANKING_BG_LOCK = threading.RLock()
+_RANKING_BG_RUNNING = False
+_RANKING_BG_STARTED_AT: Optional[dt.datetime] = None
+_RANKING_BG_COOLDOWN_UNTIL: Optional[dt.datetime] = None
+_RANKING_BG_TIMEOUT_STREAK = 0
+
+_RANKING_BG_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+
+
+def _ranking_bg_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return bool(default)
+        s = str(raw).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+            return False
+    except Exception:
+        pass
+    return bool(default)
+
+
+def _ranking_bg_env_float(name: str, default: float) -> float:
+    try:
+        raw = os.getenv(name)
+        if raw is not None and str(raw).strip() != "":
+            return max(1.0, float(raw))
+    except Exception:
+        pass
+    return float(default)
+
+
+def _ranking_bg_scope_enabled() -> bool:
+    """このプロセスで BG 実行経路を使うか。
+
+    RANKING_SUMMARY_BG_SCOPE_ENABLED=1/0 で明示的に上書きできる。
+    CORE_STARTUP_FORCE_FULL_INIT_PATCHES=1 のときは DB プロセスでも適用する。
+    """
+    try:
+        override = os.getenv("RANKING_SUMMARY_BG_SCOPE_ENABLED")
+        if override is not None and str(override).strip() != "":
+            return _ranking_bg_env_bool("RANKING_SUMMARY_BG_SCOPE_ENABLED", True)
+        if _ranking_bg_env_bool("CORE_STARTUP_FORCE_FULL_INIT_PATCHES", False):
+            return True
+        argv_text = " ".join(str(x) for x in sys.argv).replace("\\", "/").lower()
+        return not any(name in argv_text for name in _RANKING_BG_DB_PROCESS_NAMES)
+    except Exception:
+        return True
+
+
+def _ranking_bg_executor() -> ThreadPoolExecutor:
+    global _RANKING_BG_EXECUTOR
+    if _RANKING_BG_EXECUTOR is None:
+        _RANKING_BG_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ranking-summary-bg")
+    return _RANKING_BG_EXECUTOR
+
+
+def _ranking_bg_elapsed_sec() -> float:
+    try:
+        if _RANKING_BG_STARTED_AT is None:
+            return 0.0
+        return max(0.0, (dt.datetime.now() - _RANKING_BG_STARTED_AT).total_seconds())
+    except Exception:
+        return 0.0
+
+
+def _ranking_bg_cooldown_seconds() -> float:
+    try:
+        base = _ranking_bg_env_float("RANKING_SUMMARY_BG_COOLDOWN_SEC", 180.0)
+        max_sec = _ranking_bg_env_float("RANKING_SUMMARY_BG_COOLDOWN_MAX_SEC", 600.0)
+        streak = max(1, int(_RANKING_BG_TIMEOUT_STREAK or 1))
+        return min(max_sec, base * streak)
+    except Exception:
+        return 180.0
+
+
+def _ranking_bg_enter_cooldown(reason: str, *, elapsed: float) -> None:
+    global _RANKING_BG_RUNNING, _RANKING_BG_STARTED_AT
+    global _RANKING_BG_COOLDOWN_UNTIL, _RANKING_BG_TIMEOUT_STREAK
+    try:
+        _RANKING_BG_TIMEOUT_STREAK += 1
+        cool_sec = _ranking_bg_cooldown_seconds()
+        _RANKING_BG_COOLDOWN_UNTIL = dt.datetime.now() + dt.timedelta(seconds=cool_sec)
+        _RANKING_BG_RUNNING = False
+        _RANKING_BG_STARTED_AT = None
+        _set_ranking_job_running(False)
+        logger.warning(
+            "[RANKING SUMMARY BG] timeout cooldown reason=%s elapsed=%.3fs timeout_streak=%s cooldown_sec=%.1f until=%s",
+            reason, elapsed, _RANKING_BG_TIMEOUT_STREAK, cool_sec, _RANKING_BG_COOLDOWN_UNTIL,
+        )
+    except Exception:
+        logger.debug("[RANKING SUMMARY BG] enter cooldown failed", exc_info=True)
+
+
+def _ranking_bg_check_timeout_or_cooldown_locked() -> bool:
+    """Trueなら今回submitしない。_RANKING_BG_LOCK内から呼ぶ。"""
+    global _RANKING_BG_COOLDOWN_UNTIL
+    try:
+        now = dt.datetime.now()
+        if _RANKING_BG_COOLDOWN_UNTIL is not None and now < _RANKING_BG_COOLDOWN_UNTIL:
+            remain = (_RANKING_BG_COOLDOWN_UNTIL - now).total_seconds()
+            logger.warning(
+                "[RANKING SUMMARY BG] submit skipped reason=timeout_cooldown remain=%.1fs until=%s timeout_streak=%s",
+                remain, _RANKING_BG_COOLDOWN_UNTIL, _RANKING_BG_TIMEOUT_STREAK,
+            )
+            return True
+        if _RANKING_BG_COOLDOWN_UNTIL is not None and now >= _RANKING_BG_COOLDOWN_UNTIL:
+            logger.warning("[RANKING SUMMARY BG] cooldown expired until=%s", _RANKING_BG_COOLDOWN_UNTIL)
+            _RANKING_BG_COOLDOWN_UNTIL = None
+
+        if _RANKING_BG_RUNNING:
+            elapsed = _ranking_bg_elapsed_sec()
+            timeout_sec = _ranking_bg_env_float("RANKING_SUMMARY_BG_TIMEOUT_SEC", 55.0)
+            if elapsed >= timeout_sec:
+                _ranking_bg_enter_cooldown("bg_timeout", elapsed=elapsed)
+                return True
+            logger.warning(
+                "[RANKING SUMMARY BG] submit skipped reason=bg_still_running elapsed=%.3fs timeout=%.1fs",
+                elapsed, timeout_sec,
+            )
+            return True
+        return False
+    except Exception:
+        logger.debug("[RANKING SUMMARY BG] timeout/cooldown check failed", exc_info=True)
+        return False
+
+
+def _ranking_bg_clear_if_stale() -> bool:
+    global _RANKING_BG_RUNNING, _RANKING_BG_STARTED_AT
+    try:
+        if not _RANKING_BG_RUNNING:
+            return False
+        elapsed = _ranking_bg_elapsed_sec()
+        stale = _ranking_bg_env_float("RANKING_SUMMARY_BG_STALE_SEC", 120.0)
+        if elapsed < stale:
+            return False
+        _RANKING_BG_RUNNING = False
+        _RANKING_BG_STARTED_AT = None
+        logger.warning("[RANKING SUMMARY BG] bg stale running cleared elapsed=%.3fs stale=%.3fs", elapsed, stale)
+        return True
+    except Exception:
+        logger.debug("[RANKING SUMMARY BG] bg stale clear failed", exc_info=True)
+        return False
+
+
+def _clear_ranking_job_running_if_stale(*, force: bool = False, reason: str = "stale_check") -> bool:
+    """同期版が使う _RANKING_JOB_RUNNING が stale なら解除する。"""
+    global _RANKING_JOB_RUNNING, _RANKING_JOB_STARTED_AT
+    try:
+        if not _RANKING_JOB_RUNNING:
+            return False
+        started_at = _RANKING_JOB_STARTED_AT
+        elapsed = 999999.0
+        if isinstance(started_at, dt.datetime):
+            elapsed = max(0.0, (dt.datetime.now() - started_at).total_seconds())
+        stale = _ranking_bg_env_float("RANKING_SUMMARY_INTERNAL_STALE_SEC", 120.0)
+        if (not force) and elapsed < stale:
+            return False
+        with _RANKING_JOB_LOCK:
+            _RANKING_JOB_RUNNING = False
+            _RANKING_JOB_STARTED_AT = None
+        try:
+            _set_global_attr("ranking_summary_job_running", False)
+            _set_global_attr("ranking_summary_job_stale_cleared_at", dt.datetime.now())
+            _set_global_attr("ranking_summary_job_stale_clear_reason", reason)
+        except Exception:
+            pass
+        logger.warning(
+            "[RANKING SUMMARY BG] internal running stale cleared reason=%s started_at=%s elapsed=%.3fs stale=%.3fs force=%s",
+            reason, started_at, elapsed, stale, force,
+        )
+        return True
+    except Exception:
+        logger.debug("[RANKING SUMMARY BG] internal stale clear failed", exc_info=True)
+        return False
+
+
+def _set_ranking_job_running(value: bool, *, started_at: Optional[dt.datetime] = None) -> None:
+    global _RANKING_JOB_RUNNING, _RANKING_JOB_STARTED_AT
+    try:
+        with _RANKING_JOB_LOCK:
+            _RANKING_JOB_RUNNING = bool(value)
+            _RANKING_JOB_STARTED_AT = started_at if value else None
+        try:
+            _set_global_attr("ranking_summary_job_running", bool(value))
+            if value:
+                _set_global_attr("ranking_summary_job_started_at", started_at)
+            else:
+                _set_global_attr("ranking_summary_job_finished_at", dt.datetime.now())
+        except Exception:
+            pass
+    except Exception:
+        logger.debug("[RANKING SUMMARY BG] set ranking job running failed", exc_info=True)
+
+
+def _run_ranking_summary_core_job() -> Any:
+    """BG経路で実行するランキングサマリー本体。"""
+    started = dt.datetime.now()
+    perf_started = time.perf_counter()
+    _set_ranking_job_running(True, started_at=started)
+    try:
+        logger.warning("[RANKING SUMMARY BG] core ranking job start at=%s", started.strftime("%Y-%m-%d %H:%M:%S"))
+        fn = _resolve_attr(
+            "scheduler_jobs.summary.ranking_summary_jobs",
+            "job_ranking_summary_all",
+            quiet=False,
+        )
+        if not callable(fn):
+            logger.warning("[RANKING SUMMARY BG] core ranking job skipped function unavailable")
+            return None
+        kwargs = _build_ranking_job_kwargs(force=False)
+        result = _call_with_supported_kwargs(fn, **kwargs)
+        elapsed = time.perf_counter() - perf_started
+        try:
+            _set_global_attr("last_ranking_summary_job_at", dt.datetime.now())
+            _set_global_attr("last_ranking_summary_job_result", _summarize_result(result))
+        except Exception:
+            pass
+        logger.warning("[RANKING SUMMARY BG] core ranking job done elapsed=%.3fs result=%s", elapsed, _summarize_result(result))
+        try:
+            announce_results = _announce_ranking_summary_intervals_safe(top_n=10, use_discord=True, intervals=(1, 3, 5))
+            _set_global_attr("last_ranking_summary_announce_results", announce_results)
+            logger.warning("[RANKING SUMMARY BG] announce done results=%s", announce_results)
+        except Exception:
+            logger.exception("[RANKING SUMMARY BG] announce failed")
+        return result
+    except Exception:
+        logger.exception("[RANKING SUMMARY BG] core ranking job failed")
+        return None
+    finally:
+        _set_ranking_job_running(False)
+
+
+def _ranking_bg_task(started_at: dt.datetime) -> None:
+    global _RANKING_BG_RUNNING, _RANKING_BG_STARTED_AT, _RANKING_BG_TIMEOUT_STREAK
+    t0 = time.perf_counter()
+    try:
+        _clear_ranking_job_running_if_stale(reason="bg_task_before_core")
+        logger.warning("[RANKING SUMMARY BG] bg start started_at=%s", started_at)
+        _run_ranking_summary_core_job()
+        elapsed = time.perf_counter() - t0
+        _RANKING_BG_TIMEOUT_STREAK = 0
+        logger.warning("[RANKING SUMMARY BG] bg done elapsed=%.3fs", elapsed)
+    except Exception:
+        logger.exception("[RANKING SUMMARY BG] bg failed elapsed=%.3fs", time.perf_counter() - t0)
+    finally:
+        with _RANKING_BG_LOCK:
+            _RANKING_BG_RUNNING = False
+            _RANKING_BG_STARTED_AT = None
+
+
+def _run_ranking_summary_all_job_safe(*args: Any, **kwargs: Any):
+    """
+    schedule から呼ばれるランキング由来サマリー job の入口。
+
+    BG実行が有効なプロセス (main.py 等) では即BGへ投入して return し、
+    schedule 側を毎分ブロックさせない。無効なプロセスでは同期版を実行する。
+    """
+    global _RANKING_BG_RUNNING, _RANKING_BG_STARTED_AT
+
+    if not _ranking_bg_scope_enabled():
+        return _run_ranking_summary_all_job_sync()
+
+    _clear_ranking_job_running_if_stale(reason="direct_wrapper_entry")
+    if not _ranking_bg_env_bool("RANKING_SUMMARY_SCHEDULE_BG", True):
+        return _run_ranking_summary_core_job()
+
+    with _RANKING_BG_LOCK:
+        _ranking_bg_clear_if_stale()
+        if _ranking_bg_check_timeout_or_cooldown_locked():
+            return None
+        _RANKING_BG_RUNNING = True
+        _RANKING_BG_STARTED_AT = dt.datetime.now()
+        started = _RANKING_BG_STARTED_AT
+
+    _ranking_bg_executor().submit(_ranking_bg_task, started)
+    logger.warning("[RANKING SUMMARY BG] submitted schedule job returns immediately started_at=%s", started)
+    return None
 
 
 def register_ranking_summary_schedule_job(

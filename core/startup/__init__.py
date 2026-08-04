@@ -127,12 +127,11 @@ def _install_entry_runtime_init_patches() -> None:
     except Exception:
         logger.exception("[core.startup] summary scheduler stale guard env defaults failed")
 
-    try:
-        from .ranking_summary_schedule_bg_patch import install as install_ranking_summary_schedule_bg_patch
-
-        install_ranking_summary_schedule_bg_patch()
-    except Exception:
-        logger.exception("[core.startup] ranking summary schedule bg patch install failed")
+    # ranking_summary_schedule_bg_patch は
+    # core/startup/scheduler_bootstrap._run_ranking_summary_all_job_safe へ本文化済み
+    # (BG投入 / timeout cooldown / stale解除)。スコープは同ファイルの
+    # _ranking_bg_scope_enabled() が担う。
+    # schedule 済み job の参照書き換えは、本体側が挙動を持つため不要になった。
 
     # summary_controller_soft_technical_ready_patch は
     # trading/summary/controller_projection.rebuild_technical_ready へ本文化済み。
