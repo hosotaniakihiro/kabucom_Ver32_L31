@@ -81,12 +81,10 @@ def _install_entry_runtime_init_patches() -> None:
     except Exception:
         logger.exception("[core.startup] ranking summary schedule bg patch install failed")
 
-    try:
-        from .summary_controller_soft_technical_ready_patch import install as install_summary_controller_soft_technical_ready_patch
-
-        install_summary_controller_soft_technical_ready_patch()
-    except Exception:
-        logger.exception("[core.startup] summary controller soft technical ready patch install failed")
+    # summary_controller_soft_technical_ready_patch は
+    # trading/summary/controller_projection.rebuild_technical_ready へ本文化済み。
+    # DB専用子プロセスへ効かせないスコープは同ファイルの
+    # _soft_technical_ready_enabled() (argv判定 + SUMMARY_SOFT_TECHNICAL_READY_ENABLED) が担う。
 
     # ============================================================
     # summary runner ready-fill-before-save patch
