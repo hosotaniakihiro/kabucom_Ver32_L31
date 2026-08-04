@@ -17,8 +17,7 @@
 #     PUSH由来サマリーとマージして利用する
 #   - schedule はこのプロセス内だけで回す
 #
-# V2 Fix:
-#   ✔ 起動直後に core.startup.yahoo_complement_safety_patch.install() を実行
+# V2 Fix (現在は trading/yahoo/pipeline/complement/compute.py 本体へインライン化済み):
 #   ✔ Yahoo 3分/5分補完の pd.NA schema エラーを抑止
 #   ✔ score全ゼロフレームを slope/macd/rsi から最低限復元
 # ============================================================
@@ -53,21 +52,6 @@ _STOP = False
 def _handle_signal(signum, frame) -> None:
     global _STOP
     _STOP = True
-
-
-def _install_yahoo_complement_safety_patch() -> bool:
-    """
-    Yahoo補完計算モジュールをimportする前に安全patchを入れる。
-    ここで失敗しても runner 自体は止めない。
-    """
-    try:
-        from core.startup.yahoo_complement_safety_patch import install
-        ok = bool(install())
-        logger.warning("[YAHOO COMPLEMENT RUNNER] safety patch installed=%s", ok)
-        return ok
-    except Exception:
-        logger.exception("[YAHOO COMPLEMENT RUNNER] safety patch install failed; continue")
-        return False
 
 
 def _bootstrap_token_if_needed() -> None:
@@ -136,7 +120,6 @@ def main() -> int:
     logger.info("[YAHOO COMPLEMENT RUNNER] cwd=%s", os.getcwd())
     logger.info("=" * 80)
 
-    _install_yahoo_complement_safety_patch()
     _bootstrap_token_if_needed()
     _run_startup_once()
     _register_tasks()
