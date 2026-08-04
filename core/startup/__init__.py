@@ -708,12 +708,10 @@ def _install_entry_runtime_init_patches() -> None:
     # init_runtime_flags() (startup_config) と market mode 判定 (startup_orchestrator)
     # が上書きするため実効差が無い。
 
-    try:
-        from .exit_limit_board_touch_runtime_patch import install as install_exit_limit_board_touch_patch
-
-        install_exit_limit_board_touch_patch()
-    except Exception:
-        logger.exception("[core.startup] exit board touch limit patch install failed")
+    # exit_limit_board_touch_runtime_patch は
+    # trading/exit/executor._build_kabu_close_payload へ本文化済み
+    # (_apply_exit_limit_board_touch)。スコープは同ファイルの
+    # _exit_board_runtime_enabled() が担う。
 
     try:
         from .summary_existing_null_repair_patch import install as install_summary_existing_null_repair_patch

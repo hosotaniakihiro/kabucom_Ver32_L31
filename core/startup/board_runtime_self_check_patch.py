@@ -76,7 +76,9 @@ def _check_exit_executor() -> dict:
         out["available"] = callable(close_payload) or callable(close_db)
         if callable(close_payload):
             out["limit_board_touch_wrapped"] = (
-                _chain_has(close_payload, "_exit_limit_board_touch_wrapped_v11")
+                # 本文化済み (trading/exit/executor._apply_exit_limit_board_touch)
+                _chain_has(close_payload, "_exit_limit_board_touch_builtin")
+                or _chain_has(close_payload, "_exit_limit_board_touch_wrapped_v11")
                 or _chain_has(close_payload, "_exit_limit_board_touch_wrapped")
             )
         out["pending_close_wrapped"] = _chain_has(close_db, "_exit_limit_pending_close_wrapped") if callable(close_db) else False
