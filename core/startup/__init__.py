@@ -613,12 +613,12 @@ def _install_entry_runtime_init_patches() -> None:
     except Exception:
         logger.exception("[core.startup] ranking summary persistence lock patch install failed")
 
-    try:
-        from .allow_orders_runtime_patch import install_allow_orders_runtime_patch
-
-        install_allow_orders_runtime_patch()
-    except Exception:
-        logger.exception("[core.startup] allow orders runtime patch install failed")
+    # allow_orders_runtime_patch は削除済み (本文化不要)。
+    # 同じ env 解決ロジックが core/global_context/context.py の _resolve_allow_orders()
+    # として本体入りしており、GlobalContext.__init__ が起動時に適用する。
+    # パッチが追加でやっていた global_data.allow_orders への代入は、その後
+    # init_runtime_flags() (startup_config) と market mode 判定 (startup_orchestrator)
+    # が上書きするため実効差が無い。
 
     try:
         from .exit_limit_board_touch_runtime_patch import install as install_exit_limit_board_touch_patch
