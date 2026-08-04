@@ -184,18 +184,30 @@ def _first_existing(df: pd.DataFrame, names: list[str]) -> str | None:
     return None
 
 
+def _nan_series(index) -> pd.Series:
+    """全NaNのfloat列を返す。
+
+    pd.Series(pd.NA, index=..., dtype="float64") は pandas 2.2.3 で
+    TypeError: float() argument must be ... not 'NAType' を送出するため使わない。
+    これを踏むと except 節側の同じ構文まで再送出して呼び出し元へ伝播してしまう。
+    """
+    if index is None:
+        index = pd.Index([])
+    return pd.Series(float("nan"), index=index, dtype="float64")
+
+
 def _intrabar_price_change_pct(df: pd.DataFrame, interval: int) -> pd.Series:
     try:
         close_col = _first_existing(df, [f"close_{interval}m", "close", "close_price", "current_price", "price"])
         open_col = _first_existing(df, [f"open_{interval}m", "open", "open_price"])
         if close_col is None or open_col is None:
-            return pd.Series(pd.NA, index=df.index, dtype="float64")
+            return _nan_series(df.index)
         close = pd.to_numeric(df[close_col], errors="coerce")
         open_ = pd.to_numeric(df[open_col], errors="coerce")
         return ((close - open_) / open_.replace(0, pd.NA) * 100.0).replace([float("inf"), -float("inf")], pd.NA)
     except Exception:
         logger.debug("[TONOSAMA SURGE] intrabar price change failed interval=%s", interval, exc_info=True)
-        return pd.Series(pd.NA, index=df.index if df is not None else None, dtype="float64")
+        return _nan_series(df.index if df is not None else None)
 
 
 def _consecutive_true_counts(values: pd.Series) -> pd.Series:
@@ -269,7 +281,8 @@ def _fallback_price_change_from_1m(out: pd.DataFrame) -> pd.Series:
         x = _ensure_open_close_aliases(out)
         return _intrabar_price_change_pct(x, 1)
     except Exception:
-        return pd.Series(pd.NA, index=out.index if out is not None else None, dtype="float64")
+        logger.debug("[TONOSAMA SURGE] 1m price change fallback failed", exc_info=True)
+        return _nan_series(out.index if out is not None else None)
 
 
 def _force_failopen_enabled() -> bool:
