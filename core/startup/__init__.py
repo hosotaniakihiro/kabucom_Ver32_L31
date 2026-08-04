@@ -356,17 +356,104 @@ def _install_entry_runtime_init_patches() -> None:
     except Exception:
         logger.exception("[core.startup] summary AI MA5 early patch install failed")
 
+    # ============================================================
+    # SUMMARY AI slope env patch (未設定時のみ slope gate を緩める)
+    # ============================================================
     try:
-        from .summary_ai_slope_env_patch import install_summary_ai_slope_env_patch
+        _SLOPE_ENV_DEFAULTS = {
+            "ENTRY_MIN_BUY_SLOPE": "-999",
+            "SUMMARY_AI_MIN_BUY_SLOPE": "-999",
+            "ENTRY_MAX_SELL_SLOPE": "999",
+            "SUMMARY_AI_MAX_SELL_SLOPE": "999",
+        }
 
-        install_summary_ai_slope_env_patch()
+        def _core_env_blank(v: object) -> bool:
+            try:
+                return v is None or str(v).strip() == ""
+            except Exception:
+                return True
+
+        _slope_applied: dict[str, str] = {}
+        _slope_kept: dict[str, str] = {}
+        for _key, _value in _SLOPE_ENV_DEFAULTS.items():
+            _cur = os.environ.get(_key)
+            if _core_env_blank(_cur):
+                os.environ[_key] = _value
+                _slope_applied[_key] = _value
+            else:
+                _slope_kept[_key] = str(_cur)
+        logger.warning(
+            "[SUMMARY AI SLOPE ENV PATCH] installed applied=%s kept=%s",
+            _slope_applied, _slope_kept,
+        )
     except Exception:
         logger.exception("[core.startup] summary AI slope env patch install failed")
 
+    # ============================================================
+    # SUMMARY AI score env patch (entry_controller の BUY 閾値を実運用値へ)
+    # ============================================================
     try:
-        from .summary_ai_score_env_patch import install_summary_ai_score_env_patch
+        def _core_env_float_for_score(name: str, default: float) -> float:
+            try:
+                v = os.environ.get(name)
+                if _core_env_blank(v):
+                    return float(default)
+                return float(str(v).strip())
+            except Exception:
+                return float(default)
 
-        install_summary_ai_score_env_patch()
+        _score_applied: dict[str, str] = {}
+        _score_kept: dict[str, str] = {}
+        for _key, _value in (
+            ("MIN_ENTRY_SCORE", "3.0"),
+            ("ENTRY_CONTROLLER_MIN_SUMMARY_SCORE_BUY", "3.0"),
+            ("ENTRY_CONTROLLER_MIN_COMPOSITE_SCORE_BUY", "3.0"),
+            ("ENTRY_CONTROLLER_MIN_AI_CONFIDENCE_BUY", "0.60"),
+        ):
+            _cur = os.environ.get(_key)
+            if _core_env_blank(_cur):
+                os.environ[_key] = _value
+                _score_applied[_key] = _value
+            else:
+                _score_kept[_key] = str(_cur)
+
+        _score_controller_patch: dict[str, object] = {"patched": False}
+        try:
+            import trading.handlers.entry_controller as _ec
+
+            _min_buy_score = _core_env_float_for_score("ENTRY_CONTROLLER_MIN_SUMMARY_SCORE_BUY", 3.0)
+            _min_buy_comp = _core_env_float_for_score("ENTRY_CONTROLLER_MIN_COMPOSITE_SCORE_BUY", 3.0)
+            _min_buy_conf = _core_env_float_for_score("ENTRY_CONTROLLER_MIN_AI_CONFIDENCE_BUY", 0.60)
+
+            _score_old = {
+                "MIN_SUMMARY_SCORE_BUY": getattr(_ec, "MIN_SUMMARY_SCORE_BUY", None),
+                "MIN_COMPOSITE_SCORE_BUY": getattr(_ec, "MIN_COMPOSITE_SCORE_BUY", None),
+                "MIN_AI_CONFIDENCE_BUY": getattr(_ec, "MIN_AI_CONFIDENCE_BUY", None),
+            }
+
+            _ec.MIN_SUMMARY_SCORE_BUY = float(_min_buy_score)
+            _ec.MIN_COMPOSITE_SCORE_BUY = float(_min_buy_comp)
+            _ec.MIN_AI_CONFIDENCE_BUY = float(_min_buy_conf)
+
+            _score_controller_patch.update(
+                {
+                    "patched": True,
+                    "old": _score_old,
+                    "new": {
+                        "MIN_SUMMARY_SCORE_BUY": _ec.MIN_SUMMARY_SCORE_BUY,
+                        "MIN_COMPOSITE_SCORE_BUY": _ec.MIN_COMPOSITE_SCORE_BUY,
+                        "MIN_AI_CONFIDENCE_BUY": _ec.MIN_AI_CONFIDENCE_BUY,
+                    },
+                }
+            )
+        except Exception as _e:
+            logger.exception("[SUMMARY AI SCORE ENV PATCH] entry_controller threshold patch failed")
+            _score_controller_patch.update({"error": repr(_e)})
+
+        logger.warning(
+            "[SUMMARY AI SCORE ENV PATCH] installed applied=%s kept=%s entry_controller=%s",
+            _score_applied, _score_kept, _score_controller_patch,
+        )
     except Exception:
         logger.exception("[core.startup] summary AI score env patch install failed")
 
