@@ -464,10 +464,88 @@ def _install_entry_runtime_init_patches() -> None:
     except Exception:
         logger.exception("[core.startup] summary write gate runtime patch install failed")
 
+    # ============================================================
+    # ranking summary persistence lock patch (database is locked を warning+skip に緩和)
+    # ============================================================
     try:
-        from .ranking_summary_persistence_lock_patch import install_ranking_summary_persistence_lock_patch
+        def _core_ranking_lock_is_locked_error(exc: BaseException) -> bool:
+            s = str(exc).lower()
+            return "database is locked" in s or "database table is locked" in s or "locked" in s
 
-        install_ranking_summary_persistence_lock_patch()
+        import trading.ranking.summary.persistence as _persistence
+
+        _rlock_original_local = getattr(_persistence, "_ensure_local_ranking_summary_table", None)
+        _rlock_original_ensure = getattr(_persistence, "ensure_ranking_summary_table", None)
+        _rlock_original_save = getattr(_persistence, "save_ranking_summary", None)
+
+        if not callable(_rlock_original_local) or not callable(_rlock_original_ensure):
+            logger.warning("[RANKING SUMMARY LOCK PATCH] target functions missing")
+        else:
+            def _core_ranking_lock_patched_ensure_local(*, interval=1, date_yyyymmdd=None, db_path=None) -> bool:
+                try:
+                    return bool(_rlock_original_local(interval=interval, date_yyyymmdd=date_yyyymmdd, db_path=db_path))
+                except Exception as exc:
+                    if _core_ranking_lock_is_locked_error(exc):
+                        logger.warning(
+                            "[RANKING SUMMARY LOCK PATCH] ensure local skipped locked interval=%s db=%s err=%s",
+                            interval, db_path, exc,
+                        )
+                        return False
+                    logger.exception("[RANKING SUMMARY LOCK PATCH] ensure local failed interval=%s", interval)
+                    return False
+
+            def _core_ranking_lock_patched_ensure(interval=1, *args, **kwargs) -> bool:
+                try:
+                    return bool(_rlock_original_ensure(interval, *args, **kwargs))
+                except Exception as exc:
+                    if _core_ranking_lock_is_locked_error(exc):
+                        logger.warning(
+                            "[RANKING SUMMARY LOCK PATCH] ensure skipped locked interval=%s err=%s",
+                            interval, exc,
+                        )
+                        return False
+                    logger.exception("[RANKING SUMMARY LOCK PATCH] ensure failed interval=%s", interval)
+                    return False
+
+            def _core_ranking_lock_patched_save(df, *args, interval=1, source="ranking", **kwargs) -> int:
+                ok = _core_ranking_lock_patched_ensure(interval=interval)
+                if not ok:
+                    try:
+                        rows = 0 if df is None else len(df)
+                    except Exception:
+                        rows = 0
+                    logger.warning(
+                        "[RANKING SUMMARY LOCK PATCH] save skipped because ensure unavailable interval=%s source=%s rows=%s",
+                        interval, source, rows,
+                    )
+                    return 0
+                if not callable(_rlock_original_save):
+                    return 0
+                try:
+                    return int(_rlock_original_save(df, *args, interval=interval, source=source, **kwargs) or 0)
+                except Exception as exc:
+                    if _core_ranking_lock_is_locked_error(exc):
+                        logger.warning(
+                            "[RANKING SUMMARY LOCK PATCH] save skipped locked interval=%s source=%s err=%s",
+                            interval, source, exc,
+                        )
+                        return 0
+                    logger.exception("[RANKING SUMMARY LOCK PATCH] save failed interval=%s source=%s", interval, source)
+                    return 0
+
+            _persistence._ensure_local_ranking_summary_table = _core_ranking_lock_patched_ensure_local
+            _persistence.ensure_ranking_summary_table = _core_ranking_lock_patched_ensure
+            _persistence.ensure_table = _core_ranking_lock_patched_ensure
+            _persistence.save_ranking_summary = _core_ranking_lock_patched_save
+            _persistence.save_ranking_summary_df = _core_ranking_lock_patched_save
+            _persistence.persist_ranking_summary = _core_ranking_lock_patched_save
+            _persistence.persist_ranking_summary_df = _core_ranking_lock_patched_save
+            _persistence.save = _core_ranking_lock_patched_save
+            _persistence.save_df = _core_ranking_lock_patched_save
+
+            logger.warning(
+                "[RANKING SUMMARY LOCK PATCH] installed locked_skip=True ensure_timeout_note=original timeout; error downgraded to warning"
+            )
     except Exception:
         logger.exception("[core.startup] ranking summary persistence lock patch install failed")
 
