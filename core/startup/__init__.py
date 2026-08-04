@@ -574,12 +574,10 @@ def _install_entry_runtime_init_patches() -> None:
     except Exception:
         logger.exception("[core.startup] summary AI score env patch install failed")
 
-    try:
-        from .summary_write_gate_runtime_patch import install_summary_write_gate_runtime_patch
-
-        install_summary_write_gate_runtime_patch()
-    except Exception:
-        logger.exception("[core.startup] summary write gate runtime patch install failed")
+    # summary_write_gate_runtime_patch は
+    # trading/summary/persistence/core/upsert_executor.execute_upsert へ本文化済み。
+    # スコープ (DB専用子プロセスには適用しない) は同ファイルの
+    # _write_gate_runtime_enabled() が担う。
 
     # ============================================================
     # ranking summary persistence lock patch (database is locked を warning+skip に緩和)

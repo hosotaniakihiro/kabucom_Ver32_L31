@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from typing import Any, List, Optional
 
 from sqlalchemy.engine import Engine
@@ -62,6 +63,152 @@ _DEFAULT_CHUNK_SIZE = int(os.environ.get("SUMMARY_UPSERT_CHUNK_SIZE", "75"))
 _DEFAULT_RETRY = int(os.environ.get("SUMMARY_UPSERT_RETRY", "12"))
 _DEFAULT_SLEEP_BASE = float(os.environ.get("SUMMARY_UPSERT_SLEEP_BASE", "0.45"))
 _CHECKPOINT_AFTER_UPSERT = os.environ.get("SUMMARY_UPSERT_WAL_CHECKPOINT", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+# ============================================================
+# summary write gate runtime tuning
+# (旧 core/startup/summary_write_gate_runtime_patch.py REV3 から移設)
+# ------------------------------------------------------------
+# write gate が無制限待ちになり 1m/5m/recovery が互いに詰まる問題への対策。
+# main.py / entry-only では起動時・復旧時の巨大UPSERTを同期実行せず
+# リアルタイム発注処理を守る。main_database.py / yahoo_complement /
+# summary_database_runner 等の保存担当プロセスでは巨大UPSERTを捨てない。
+#
+# 旧パッチは core/startup/__init__.py 経由でのみ install されていたため、
+# DB専用子プロセスでは一切適用されなかった。本文化後も
+# _write_gate_runtime_enabled() で同じスコープを保つ。
+# ============================================================
+
+_WRITE_GATE_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+
+_WRITE_GATE_SAVE_OWNER_MARKERS = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "summary_database_runner.py",
+    "yahoo_complement",
+    "yahoo_complement_runner",
+    "run_night_yahoo",
+    "run_update_daily_data_from_yahoo",
+    "run_night_yahoo_full_summary",
+    "summary_recovery",
+)
+
+_WRITE_GATE_TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+_WRITE_GATE_FALSE = {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}
+
+
+def _gate_env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.environ.get(name)
+        if v is None:
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in _WRITE_GATE_TRUE:
+            return True
+        if s in _WRITE_GATE_FALSE:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
+
+
+def _gate_env_int(name: str, default: int) -> int:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(str(v).strip()))
+    except Exception:
+        return int(default)
+
+
+def _gate_env_float(name: str, default: float) -> float:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _gate_argv_text() -> str:
+    try:
+        return " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+    except Exception:
+        return ""
+
+
+def _write_gate_runtime_enabled() -> bool:
+    """このプロセスで write gate の runtime tuning を適用するか。
+
+    SUMMARY_WRITE_GATE_RUNTIME_ENABLED=1/0 で明示的に上書きできる。
+    CORE_STARTUP_FORCE_FULL_INIT_PATCHES=1 のときは DB プロセスでも適用する。
+    """
+    try:
+        override = os.environ.get("SUMMARY_WRITE_GATE_RUNTIME_ENABLED")
+        if override is not None and str(override).strip() != "":
+            return _gate_env_bool("SUMMARY_WRITE_GATE_RUNTIME_ENABLED", True)
+        if _gate_env_bool("CORE_STARTUP_FORCE_FULL_INIT_PATCHES", False):
+            return True
+        return not any(name in _gate_argv_text() for name in _WRITE_GATE_DB_PROCESS_NAMES)
+    except Exception:
+        return True
+
+
+def _is_summary_save_owner_process() -> bool:
+    """summary DB保存を担うプロセスでは巨大UPSERTを捨てない。"""
+    if any(x in _gate_argv_text() for x in _WRITE_GATE_SAVE_OWNER_MARKERS):
+        return True
+    return any(
+        _gate_env_bool(x, False)
+        for x in (
+            "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+            "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+            "AUTOSTOCK_SUMMARY_DB_WRITER",
+            "AUTOSTOCK_YAHOO_COMPLEMENT_PROCESS",
+            "SUMMARY_DB_SAVE_OWNER_PROCESS",
+        )
+    )
+
+
+def _is_entry_only_process() -> bool:
+    if _gate_env_bool("SUMMARY_MAIN_ENTRY_ONLY", False):
+        return True
+    if "main.py" in _gate_argv_text() and not _is_summary_save_owner_process():
+        return True
+    return False
+
+
+def _gate_interval_int(v: Any, default: int = 1) -> int:
+    try:
+        return int(float(str(v).replace("min", "").strip()))
+    except Exception:
+        return int(default)
+
+
+def _gate_row_count(rows: Any) -> int:
+    try:
+        return int(len(rows))
+    except Exception:
+        pass
+    try:
+        if hasattr(rows, "shape"):
+            return int(rows.shape[0])
+    except Exception:
+        pass
+    try:
+        return int(sum(1 for _ in rows))
+    except Exception:
+        return -1
 
 
 def _table_name_from_interval(interval: int) -> str:
@@ -264,6 +411,67 @@ def execute_upsert(
     既存呼び出し互換:
       execute_upsert(rows, interval, engine=None, table_name=None)
     """
+    # ----------------------------------------------------
+    # write gate runtime tuning
+    # (旧 core/startup/summary_write_gate_runtime_patch.py REV3 から移設)
+    # 行数判定は normalize_rows の前の生の行数で行う。
+    # ----------------------------------------------------
+    if _write_gate_runtime_enabled():
+        iv = _gate_interval_int(interval, 1)
+        row_count = _gate_row_count(rows)
+        table_for_log = str(table_name) if table_name else f"stock_summary_{iv}min"
+        save_owner = _is_summary_save_owner_process()
+        entry_only = _is_entry_only_process()
+
+        # 巨大 recovery / closed-market rebuild 系 UPSERT の同期実行制御。
+        # main.py はリアルタイム発注を守るため skip 可。DB保存担当は skip しない。
+        huge_skip_enabled = _gate_env_bool(
+            "SUMMARY_SKIP_HUGE_UPSERT", bool(entry_only and not save_owner)
+        )
+        huge_threshold = _gate_env_int("SUMMARY_HUGE_UPSERT_SKIP_ROWS", 50000)
+        if save_owner and _gate_env_bool("SUMMARY_SAVE_OWNER_DISABLE_HUGE_SKIP", True):
+            huge_skip_enabled = False
+
+        if huge_skip_enabled and row_count >= huge_threshold:
+            logger.error(
+                "[SUMMARY WRITE GATE] huge upsert skipped to avoid sqlite lock "
+                "interval=%s table=%s rows=%s threshold=%s save_owner=%s entry_only=%s "
+                "hint=set SUMMARY_SKIP_HUGE_UPSERT=0 to force, or run recovery/night batch separately",
+                iv, table_for_log, row_count, huge_threshold, save_owner, entry_only,
+            )
+            return 0
+
+        # 中規模以上はロックを取りに行く時間を短くする。
+        # 保存担当プロセスでは skip_if_busy を既定 False にして補完保存を落とさない。
+        medium_threshold = _gate_env_int("SUMMARY_MEDIUM_UPSERT_FAST_SKIP_ROWS", 5000)
+        if row_count >= medium_threshold:
+            if save_owner:
+                write_gate_timeout = _gate_env_float("SUMMARY_WRITE_GATE_TIMEOUT_SAVE_OWNER_HUGE", 20.0)
+                skip_if_busy = _gate_env_bool("SUMMARY_SAVE_OWNER_HUGE_SKIP_IF_BUSY", False)
+                retry = max(int(retry), _gate_env_int("SUMMARY_UPSERT_RETRY_SAVE_OWNER_HUGE_MIN", 8))
+                sleep_base = min(float(sleep_base), _gate_env_float("SUMMARY_UPSERT_SLEEP_SAVE_OWNER_HUGE_MAX", 0.20))
+            else:
+                write_gate_timeout = _gate_env_float("SUMMARY_WRITE_GATE_TIMEOUT_HUGE", 0.25)
+                skip_if_busy = True
+                retry = min(int(retry), _gate_env_int("SUMMARY_UPSERT_RETRY_HUGE_MAX", 2))
+                sleep_base = min(float(sleep_base), _gate_env_float("SUMMARY_UPSERT_SLEEP_HUGE_MAX", 0.10))
+        elif write_gate_timeout is None:
+            if iv == 1:
+                write_gate_timeout = _gate_env_float("SUMMARY_WRITE_GATE_TIMEOUT_1M", 8.0)
+                skip_if_busy = bool(skip_if_busy)
+            else:
+                write_gate_timeout = _gate_env_float("SUMMARY_WRITE_GATE_TIMEOUT_OTHER", 0.25)
+                skip_if_busy = True
+                retry = min(int(retry), _gate_env_int("SUMMARY_UPSERT_RETRY_OTHER_MAX", 2))
+                sleep_base = min(float(sleep_base), _gate_env_float("SUMMARY_UPSERT_SLEEP_OTHER_MAX", 0.15))
+
+        logger.debug(
+            "[SUMMARY WRITE GATE] execute_upsert interval=%s table=%s rows=%s timeout=%s "
+            "skip_if_busy=%s retry=%s sleep=%.3f save_owner=%s entry_only=%s",
+            iv, table_for_log, row_count, write_gate_timeout, skip_if_busy,
+            int(retry), float(sleep_base), save_owner, entry_only,
+        )
+
     work = normalize_rows(rows)
     if not work:
         logger.info("[UPSERT] no rows interval=%s", interval)
