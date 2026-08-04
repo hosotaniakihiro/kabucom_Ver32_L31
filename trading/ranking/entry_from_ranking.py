@@ -258,6 +258,242 @@ def _extract_day_change_pct(row: Dict[str, Any]) -> float:
     return 0.0
 
 
+# ============================================================
+# ランキング由来エントリーの volume / turnover 単位補正
+# (旧 core/startup/ranking_entry_volume_unit_patch.py V4.5 から移設)
+# ------------------------------------------------------------
+# ランキングの出来高/売買代金は表示単位 (千株・百万円) のまま来ることがあり、
+# そのままだと MIN_VOLUME / MIN_TURNOVER に届かず VOLUME_NG になる。
+# 同一銘柄が type x market で多数出るため、同じ入力値はキャッシュして
+# entry loop が重くならないようにする。
+#
+# 旧パッチは core/startup/__init__.py 経由でのみ install されていたため、
+# DB専用子プロセスでは適用されなかった。本文化後も
+# _ranking_unit_fix_enabled() で同じスコープを保つ。
+# ============================================================
+
+_UNIT_FIX_TRUE = {"1", "true", "yes", "y", "on", "enable", "enabled"}
+_UNIT_FIX_FALSE = {"0", "false", "no", "n", "off", "disable", "disabled"}
+
+_UNIT_FIX_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+
+_UNIT_FIX_CACHE: Dict[Tuple[str, float, float, float], Dict[str, Any]] = {}
+_UNIT_FIX_LOGGED_KEYS: set = set()
+_UNIT_FIX_CACHE_MAX = 20000
+_UNIT_FIX_LOG_FIRST_N = 0
+_UNIT_FIX_LOG_COUNT = 0
+
+
+def _unit_fix_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in _UNIT_FIX_TRUE:
+            return True
+        if s in _UNIT_FIX_FALSE:
+            return False
+    except Exception:
+        pass
+    return bool(default)
+
+
+def _unit_fix_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is not None and str(v).strip() != "":
+            return float(v)
+    except Exception:
+        pass
+    return float(default)
+
+
+def _ranking_unit_fix_enabled() -> bool:
+    """このプロセスで単位補正を適用するか。
+
+    RANKING_ENTRY_UNIT_FIX_ENABLED=1/0 で明示的に上書きできる。
+    CORE_STARTUP_FORCE_FULL_INIT_PATCHES=1 のときは DB プロセスでも適用する。
+    """
+    try:
+        override = os.getenv("RANKING_ENTRY_UNIT_FIX_ENABLED")
+        if override is not None and str(override).strip() != "":
+            return _unit_fix_env_bool("RANKING_ENTRY_UNIT_FIX_ENABLED", True)
+        if _unit_fix_env_bool("CORE_STARTUP_FORCE_FULL_INIT_PATCHES", False):
+            return True
+        import sys
+        argv_text = " ".join(str(x) for x in sys.argv).replace("\\", "/").lower()
+        return not any(name in argv_text for name in _UNIT_FIX_DB_PROCESS_NAMES)
+    except Exception:
+        return True
+
+
+def _unit_fix_flag_on(v: Any) -> bool:
+    try:
+        return str(v).strip().lower() in _UNIT_FIX_TRUE
+    except Exception:
+        return False
+
+
+def _unit_fix_key(symbol: Any, price: float, raw_volume: float, raw_turnover: float) -> Tuple[str, float, float, float]:
+    return (
+        str(symbol or "").strip(),
+        round(float(price), 4),
+        round(float(raw_volume), 4),
+        round(float(raw_turnover), 4),
+    )
+
+
+def _unit_fix_should_log_once(base_key: Tuple[str, float, float, float], kind: str) -> bool:
+    global _UNIT_FIX_LOG_COUNT
+    if _unit_fix_env_bool("RANKING_ENTRY_UNIT_FIX_LOG_EACH", False):
+        return True
+    limit = int(_unit_fix_env_float("RANKING_ENTRY_UNIT_FIX_LOG_FIRST_N", _UNIT_FIX_LOG_FIRST_N))
+    if limit <= 0:
+        return False
+    k = (base_key[0], base_key[1], base_key[2], base_key[3], kind)
+    if k in _UNIT_FIX_LOGGED_KEYS:
+        return False
+    _UNIT_FIX_LOGGED_KEYS.add(k)
+    _UNIT_FIX_LOG_COUNT += 1
+    return _UNIT_FIX_LOG_COUNT <= limit
+
+
+def _ranking_entry_volume_thresholds() -> Tuple[float, float]:
+    """MIN_VOLUME / MIN_TURNOVER を config + env から解決する。"""
+    try:
+        from config.ranking_entry_config import RANKING_ENTRY_CONFIG
+
+        vol_cfg = RANKING_ENTRY_CONFIG.get("VOLUME", {}) or {}
+    except Exception:
+        vol_cfg = {}
+    min_volume = _unit_fix_env_float("RANKING_ENTRY_MIN_VOLUME", float(vol_cfg.get("MIN_VOLUME", 30000)))
+    min_turnover = _unit_fix_env_float("RANKING_ENTRY_MIN_TURNOVER", float(vol_cfg.get("MIN_TURNOVER", 10000000)))
+    return min_volume, min_turnover
+
+
+def _normalize_ranking_entry_units(row: Dict[str, Any]) -> Dict[str, Any]:
+    if not _unit_fix_env_bool("RANKING_ENTRY_NORMALIZE_VOLUME_UNITS", True):
+        return row
+
+    min_volume, min_turnover = _ranking_entry_volume_thresholds()
+
+    try:
+        if _unit_fix_flag_on(row.get("ranking_entry_units_finalized")):
+            return row
+
+        symbol = row.get("symbol")
+        price = _safe_float(row.get("price") or row.get("current_price") or row.get("close_price") or row.get("close"), 0.0)
+        raw_volume = _safe_float(row.get("volume") if row.get("volume") is not None else row.get("trading_volume"), 0.0)
+        raw_turnover = _safe_float(row.get("turnover") if row.get("turnover") is not None else row.get("trading_value"), 0.0)
+        base_key = _unit_fix_key(symbol, price, raw_volume, raw_turnover)
+
+        cached = _UNIT_FIX_CACHE.get(base_key)
+        if cached is not None:
+            try:
+                for k, v in cached.items():
+                    row[k] = v
+            except Exception:
+                pass
+            return row
+
+        volume_multiplier = _unit_fix_env_float("RANKING_ENTRY_VOLUME_UNIT_MULTIPLIER", 1000.0)
+        turnover_multiplier = _unit_fix_env_float("RANKING_ENTRY_TURNOVER_UNIT_MULTIPLIER", 1000000.0)
+        implied_max_ratio = max(1.0, _unit_fix_env_float("RANKING_ENTRY_TURNOVER_IMPLIED_MAX_RATIO", 20.0))
+        yen_floor = _unit_fix_env_float("RANKING_ENTRY_TURNOVER_YEN_FLOOR", 100000.0)
+
+        volume = raw_volume
+        turnover = raw_turnover
+        volume_unit_fixed = False
+        turnover_unit_fixed = False
+        volume_unit_multiplier = 1.0
+        turnover_unit_multiplier = 1.0
+        zero_volume_turnover_ignored = False
+
+        if 0.0 < raw_volume < min_volume and volume_multiplier > 1:
+            candidate_volume = raw_volume * volume_multiplier
+            if candidate_volume >= min_volume:
+                volume = candidate_volume
+                volume_unit_fixed = True
+                volume_unit_multiplier = volume_multiplier
+
+        implied_turnover = price * volume if price > 0 and volume > 0 else 0.0
+        can_fix_turnover = volume > 0 and implied_turnover > 0
+
+        if can_fix_turnover:
+            if 0.0 < raw_turnover < min_turnover and raw_turnover < yen_floor and turnover_multiplier > 1:
+                candidate_turnover = raw_turnover * turnover_multiplier
+                upper = max(min_turnover, implied_turnover * implied_max_ratio)
+                if candidate_turnover >= min_turnover and candidate_turnover <= upper:
+                    turnover = candidate_turnover
+                    turnover_unit_fixed = True
+                    turnover_unit_multiplier = turnover_multiplier
+
+            if turnover <= 0:
+                turnover = implied_turnover
+            elif turnover < min_turnover <= implied_turnover:
+                turnover = implied_turnover
+            elif turnover > implied_turnover * implied_max_ratio:
+                if _unit_fix_should_log_once(base_key, "turnover_clamped"):
+                    logger.warning(
+                        "[RANKING ENTRY UNIT FIX] turnover clamped symbol=%s price=%s volume=%s turnover=%s implied=%s",
+                        symbol, price, volume, turnover, implied_turnover,
+                    )
+                turnover = implied_turnover
+        else:
+            if raw_turnover > 0:
+                zero_volume_turnover_ignored = True
+                if _unit_fix_should_log_once(base_key, "zero_volume"):
+                    logger.info(
+                        "[RANKING ENTRY UNIT FIX] zero-volume turnover ignored symbol=%s price=%s raw_volume=%.3f raw_turnover=%.3f",
+                        symbol, price, raw_volume, raw_turnover,
+                    )
+            turnover = 0.0
+
+        updates = {
+            "ranking_raw_volume": raw_volume,
+            "ranking_raw_turnover": raw_turnover,
+            "ranking_volume_unit_fixed": int(volume_unit_fixed),
+            "ranking_turnover_unit_fixed": int(turnover_unit_fixed),
+            "ranking_volume_unit_multiplier": volume_unit_multiplier,
+            "ranking_turnover_unit_multiplier": turnover_unit_multiplier,
+            "ranking_entry_units_finalized": 1,
+            "ranking_zero_volume_turnover_ignored": int(zero_volume_turnover_ignored),
+            "volume": volume,
+            "trading_volume": volume,
+            "turnover": turnover,
+            "trading_value": turnover,
+        }
+        row.update(updates)
+
+        if len(_UNIT_FIX_CACHE) >= int(_unit_fix_env_float("RANKING_ENTRY_UNIT_FIX_CACHE_MAX", _UNIT_FIX_CACHE_MAX)):
+            _UNIT_FIX_CACHE.clear()
+            _UNIT_FIX_LOGGED_KEYS.clear()
+        _UNIT_FIX_CACHE[base_key] = dict(updates)
+
+        changed = volume_unit_fixed or turnover_unit_fixed or raw_turnover != turnover or raw_volume != volume
+        if changed and _unit_fix_should_log_once(base_key, "finalized"):
+            logger.info(
+                "[RANKING ENTRY UNIT FIX] finalized symbol=%s price=%s volume %.3f->%.3f turnover %.3f->%.3f "
+                "vol_mul=%.0f turn_mul=%.0f implied=%.3f can_fix_turnover=%s zero_volume_ignored=%s",
+                symbol, price, raw_volume, volume, raw_turnover, turnover,
+                volume_unit_multiplier, turnover_unit_multiplier, implied_turnover,
+                can_fix_turnover, zero_volume_turnover_ignored,
+            )
+    except Exception:
+        logger.exception("[RANKING ENTRY UNIT FIX] normalize failed symbol=%s", row.get("symbol"))
+
+    return row
+
+
 def _normalize_ranking_row_for_entry(row: Dict[str, Any]) -> Dict[str, Any]:
     row = dict(row)
     symbol = str(_first(row, ("symbol", "Symbol", "code", "コード", "銘柄コード"), "")).strip()
@@ -300,6 +536,11 @@ def _normalize_ranking_row_for_entry(row: Dict[str, Any]) -> Dict[str, Any]:
     row["day_change_pct"] = day_change_pct
     if not row.get("datetime"):
         row["datetime"] = row.get("snapshot_time") or row.get("time") or row.get("created_at")
+
+    # 旧 ranking_entry_volume_unit_patch から移設。本体の正規化の後に単位補正をかける。
+    if _ranking_unit_fix_enabled():
+        row = _normalize_ranking_entry_units(row)
+
     return row
 
 

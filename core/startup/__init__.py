@@ -213,9 +213,46 @@ def _install_entry_runtime_init_patches() -> None:
         logger.exception("[core.startup] summary runner ready fill before save patch install failed")
 
     try:
-        from .ranking_entry_volume_unit_patch import install as install_ranking_entry_volume_unit_patch
+        # ranking_entry_volume_unit_patch V4.5 から移設。
+        # volume/turnover の単位補正そのものは
+        # trading/ranking/entry_from_ranking._normalize_ranking_row_for_entry へ本文化済み。
+        # ここに残すのは RANKING_ENTRY_CONFIG の閾値上書きと、
+        # 旧パッチが同時 install していた source prefilter の起動。
+        from config.ranking_entry_config import RANKING_ENTRY_CONFIG as _rank_cfg
 
-        install_ranking_entry_volume_unit_patch()
+        def _rank_env_float(name: str, default: float) -> float:
+            try:
+                v = os.getenv(name)
+                if v is not None and str(v).strip() != "":
+                    return float(v)
+            except Exception:
+                pass
+            return float(default)
+
+        _price_cfg = _rank_cfg.setdefault("PRICE", {})
+        _old_price_min = float(_price_cfg.get("MIN", 300))
+        _price_cfg["MIN"] = _rank_env_float("RANKING_ENTRY_PRICE_MIN", 200.0)
+
+        _vol_cfg = _rank_cfg.setdefault("VOLUME", {})
+        _vol_cfg["MIN_VOLUME"] = _rank_env_float(
+            "RANKING_ENTRY_MIN_VOLUME", float(_vol_cfg.get("MIN_VOLUME", 30000))
+        )
+        _vol_cfg["MIN_TURNOVER"] = _rank_env_float(
+            "RANKING_ENTRY_MIN_TURNOVER", float(_vol_cfg.get("MIN_TURNOVER", 10000000))
+        )
+
+        try:
+            from .ranking_entry_source_prefilter_patch_v2 import install as _install_rank_prefilter
+
+            _prefilter_ok = _install_rank_prefilter()
+        except Exception:
+            logger.exception("[RANKING ENTRY UNIT FIX] source prefilter install failed")
+            _prefilter_ok = False
+
+        logger.warning(
+            "[RANKING ENTRY UNIT FIX] config applied price_min %.1f->%.1f min_volume=%.1f min_turnover=%.1f prefilter=%s",
+            _old_price_min, _price_cfg["MIN"], _vol_cfg["MIN_VOLUME"], _vol_cfg["MIN_TURNOVER"], _prefilter_ok,
+        )
     except Exception:
         logger.exception("[core.startup] ranking entry volume unit patch install failed")
 
