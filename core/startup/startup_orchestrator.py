@@ -46,6 +46,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
 from typing import Any
 
 from config.paths import ensure_dirs
@@ -217,7 +218,7 @@ except Exception:
     _UPSERT_BOOTSTRAP_AVAILABLE = False
 
 
-def _summary_index_env_bool(name: str, default: bool = False) -> bool:
+def _startup_env_bool(name: str, default: bool = False) -> bool:
     try:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
@@ -227,7 +228,7 @@ def _summary_index_env_bool(name: str, default: bool = False) -> bool:
         return bool(default)
 
 
-def _summary_index_is_main_py_process() -> bool:
+def _startup_is_main_py_process() -> bool:
     try:
         argv = [str(x).replace("\\", "/").lower() for x in sys.argv]
         return any(x.endswith("/main.py") or x == "main.py" for x in argv)
@@ -235,9 +236,9 @@ def _summary_index_is_main_py_process() -> bool:
         return False
 
 
-def _summary_index_is_database_process() -> bool:
+def _startup_is_database_process() -> bool:
     return any(
-        _summary_index_env_bool(name, False)
+        _startup_env_bool(name, False)
         for name in (
             "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
             "AUTOSTOCK_SUMMARY_DB_WRITER",
@@ -247,13 +248,13 @@ def _summary_index_is_database_process() -> bool:
 
 
 def _summary_index_should_skip_in_main() -> bool:
-    if not _summary_index_is_main_py_process():
+    if not _startup_is_main_py_process():
         return False
-    if _summary_index_is_database_process():
+    if _startup_is_database_process():
         return False
-    if _summary_index_env_bool("SUMMARY_UNIQUE_INDEX_RUN_IN_MAIN", False):
+    if _startup_env_bool("SUMMARY_UNIQUE_INDEX_RUN_IN_MAIN", False):
         return False
-    return _summary_index_env_bool("SUMMARY_UNIQUE_INDEX_SKIP_IN_MAIN", True)
+    return _startup_env_bool("SUMMARY_UNIQUE_INDEX_SKIP_IN_MAIN", True)
 
 
 def bootstrap_summary_unique_indexes_safe() -> None:
@@ -414,16 +415,30 @@ def _bootstrap_ranking_summary_safe() -> None:
     finally:
         _safe_set_global("ranking_summary_bootstrap_started", False)
 
-def _warmup_daily_signal_cache_safe() -> None:
-    """
-    起動時に日足DB stock_analysis_latest を1回だけ読み、
-    daily_signal_cache に保持する。
+def _daily_cache_should_skip_in_main() -> bool:
+    if not _startup_is_main_py_process():
+        return False
+    if _startup_is_database_process():
+        return False
+    if _startup_env_bool("DAILY_SIGNAL_CACHE_RUN_IN_MAIN", False):
+        return False
+    if _startup_env_bool("DAILY_SIGNAL_CACHE_ASYNC_IN_MAIN", False):
+        return False
+    return _startup_env_bool("DAILY_SIGNAL_CACHE_SKIP_IN_MAIN", True)
 
-    重要:
-      - 場中の entry / AI gate / exit ではDBを読まない
-      - 失敗しても system_startup は止めない
-      - stock_analysis_history は読まない
-    """
+
+def _daily_cache_should_async_in_main() -> bool:
+    if not _startup_is_main_py_process():
+        return False
+    if _startup_is_database_process():
+        return False
+    if _startup_env_bool("DAILY_SIGNAL_CACHE_RUN_IN_MAIN", False):
+        return False
+    return _startup_env_bool("DAILY_SIGNAL_CACHE_ASYNC_IN_MAIN", False)
+
+
+def _run_daily_signal_cache_warmup() -> None:
+    """日足キャッシュ warmup の実処理 (同期/非同期の両方から呼ばれる)。"""
     try:
         logger.info("📅 [DAILY SIGNAL CACHE] startup warmup begin")
 
@@ -446,6 +461,49 @@ def _warmup_daily_signal_cache_safe() -> None:
 
     except Exception as e:
         logger.exception("❌ [DAILY SIGNAL CACHE] startup warmup failed err=%s", e)
+
+
+def _warmup_daily_signal_cache_safe() -> None:
+    """
+    起動時に日足DB stock_analysis_latest を1回だけ読み、
+    daily_signal_cache に保持する。
+
+    重要:
+      - 場中の entry / AI gate / exit ではDBを読まない
+      - 失敗しても system_startup は止めない
+      - stock_analysis_history は読まない
+
+    起動高速化ポリシー (旧 daily_signal_cache_fast_startup_patch):
+      - main.py では stock_analysis_latest 全銘柄の同期warmup(約8秒)を既定でスキップし、
+        PUSH/ENTRY/EXIT の起動を優先する。候補DFへの日足付与は daily_signal_cache 側の
+        fallback_load_if_empty で必要時にロードされる。
+      - main_database.py / data collectors 等は従来どおり実行する。
+      - main.pyで強制実行: DAILY_SIGNAL_CACHE_RUN_IN_MAIN=1
+      - main.pyで非同期実行: DAILY_SIGNAL_CACHE_ASYNC_IN_MAIN=1
+    """
+    if _daily_cache_should_skip_in_main():
+        _safe_set_global("daily_signal_cache_startup_skipped", True)
+        _safe_set_global("daily_signal_cache_startup_async", False)
+        logger.warning(
+            "[DAILY CACHE FAST STARTUP] skipped full daily cache warmup in main.py. "
+            "main_database.py handles full daily cache; set DAILY_SIGNAL_CACHE_RUN_IN_MAIN=1 to force."
+        )
+        return
+
+    if _daily_cache_should_async_in_main():
+        _safe_set_global("daily_signal_cache_startup_skipped", False)
+        _safe_set_global("daily_signal_cache_startup_async", True)
+        logger.warning("[DAILY CACHE FAST STARTUP] daily cache warmup started async in main.py")
+        threading.Thread(
+            target=_run_daily_signal_cache_warmup,
+            name="daily-signal-cache-fast-startup-async",
+            daemon=True,
+        ).start()
+        return
+
+    _run_daily_signal_cache_warmup()
+
+
 # ============================================================
 # main orchestrator
 # ============================================================

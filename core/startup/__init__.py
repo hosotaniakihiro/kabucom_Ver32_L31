@@ -636,12 +636,8 @@ def _install_entry_runtime_init_patches() -> None:
     except Exception:
         logger.exception("[core.startup] summary existing null repair patch install failed")
 
-    try:
-        from .daily_signal_cache_fast_startup_patch import install as install_daily_signal_cache_fast_startup_patch
-
-        install_daily_signal_cache_fast_startup_patch()
-    except Exception:
-        logger.exception("[core.startup] daily signal cache fast startup patch install failed")
+    # daily_signal_cache_fast_startup_patch は startup_orchestrator._warmup_daily_signal_cache_safe
+    # へ本文化済み (main.py での全銘柄同期warmupスキップ / async / 強制実行の env 判定)。
 
 
 if _SKIP_ENTRY_RUNTIME_INIT_PATCHES:
