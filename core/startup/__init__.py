@@ -88,10 +88,76 @@ def _install_entry_runtime_init_patches() -> None:
     except Exception:
         logger.exception("[core.startup] summary controller soft technical ready patch install failed")
 
+    # ============================================================
+    # summary runner ready-fill-before-save patch
+    # (PUSH由来サマリーで technical_ready=False のまま save/AI に渡る問題を補正)
+    # ============================================================
     try:
-        from .summary_runner_ready_fill_before_save_patch import install as install_summary_runner_ready_fill_before_save_patch
+        def _core_ready_fill_count(df) -> int:
+            try:
+                import pandas as _pd
+                if not isinstance(df, _pd.DataFrame) or df.empty or "technical_ready" not in df.columns:
+                    return 0
+                return int(_pd.Series(df["technical_ready"]).fillna(False).astype(bool).sum())
+            except Exception:
+                return 0
 
-        install_summary_runner_ready_fill_before_save_patch()
+        def _core_ready_fill_inplace(df, *, interval: int, source: str):
+            import pandas as _pd
+            if not isinstance(df, _pd.DataFrame) or df.empty:
+                return df
+
+            before_ready = _core_ready_fill_count(df)
+            before_cols = set(df.columns)
+
+            try:
+                from trading.summary.pipeline.indicator_short_history_patch import add_short_history_indicators
+                filled = add_short_history_indicators(df, interval=interval)
+            except Exception:
+                logger.exception("[SUMMARY RUNNER READY FILL] add_short_history_indicators failed interval=%s source=%s", interval, source)
+                return df
+
+            if not isinstance(filled, _pd.DataFrame) or filled.empty:
+                return df
+
+            try:
+                df.drop(df.index, inplace=True)
+                for c in list(df.columns):
+                    if c not in filled.columns:
+                        try:
+                            df.drop(columns=[c], inplace=True)
+                        except Exception:
+                            pass
+                for c in filled.columns:
+                    df[c] = filled[c].values
+                df.index = filled.index
+            except Exception:
+                logger.exception("[SUMMARY RUNNER READY FILL] inplace replace failed interval=%s source=%s", interval, source)
+                return filled
+
+            after_ready = _core_ready_fill_count(df)
+            logger.warning(
+                "[SUMMARY RUNNER READY FILL] applied interval=%s source=%s rows=%s technical_ready %s->%s added_cols=%s",
+                interval, source, len(df), before_ready, after_ready,
+                sorted([c for c in df.columns if c not in before_cols])[:20],
+            )
+            return df
+
+        import scheduler_jobs.summary.runner_core as _runner_core
+
+        _ready_fill_old_save = getattr(_runner_core, "_save_summary_if_owner", None)
+        if not callable(_ready_fill_old_save):
+            logger.warning("[SUMMARY RUNNER READY FILL] _save_summary_if_owner not callable")
+        else:
+            def _core_save_summary_if_owner_patched(df, interval: int, *, source: str) -> None:
+                try:
+                    _core_ready_fill_inplace(df, interval=int(interval), source=str(source))
+                except Exception:
+                    logger.exception("[SUMMARY RUNNER READY FILL] pre-save fill failed interval=%s source=%s", interval, source)
+                return _ready_fill_old_save(df, interval, source=source)
+
+            _runner_core._save_summary_if_owner = _core_save_summary_if_owner_patched
+            logger.warning("[SUMMARY RUNNER READY FILL] installed")
     except Exception:
         logger.exception("[core.startup] summary runner ready fill before save patch install failed")
 
