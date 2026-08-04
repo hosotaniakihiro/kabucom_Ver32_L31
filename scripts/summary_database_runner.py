@@ -52,12 +52,17 @@ def _install_database_summary_env() -> None:
     os.environ.setdefault("SUMMARY_SAVE_SPOOL_FLUSH", "1")
 
     # summary_database は push_receiver と別プロセスなので、PUSHメモリが空/古い場合は
-    # pushYYYYMMDD.db から最新PUSHを読む。
+    # pushYYYYMMDD.db から最新PUSHを読む (trading/summary/engine/push_summary_engine.py
+    # _resolve_push_source_df 本体に統合済み。この env はそちらのスコープ切り替え)。
     os.environ.setdefault("PUSH_SUMMARY_DB_SOURCE_FALLBACK", "1")
     os.environ.setdefault("PUSH_SUMMARY_DB_LOOKBACK_MIN", "20")
     os.environ.setdefault("PUSH_SUMMARY_DB_MAX_ROWS", "30000")
     os.environ.setdefault("PUSH_SUMMARY_DB_SOURCE_MAX_MEM_LAG_SEC", "30")
     os.environ.setdefault("PUSH_SUMMARY_DB_BUSY_TIMEOUT_MS", "5000")
+
+    # scheduler_jobs/summary/safe_io.py の空サマリーDiscord通知は、main.py の通常tickとの
+    # 重複通知を避けるため既定オフ。summary_database_runner.py だけこのプロセススコープを開ける。
+    os.environ.setdefault("SUMMARY_DISCORD_EMPTY_FALLBACK_SCOPE_ENABLED", "1")
 
     # V10:
     # 3m/5mを毎分計算すると、NAS SQLite + 404銘柄級で1tickが10分超に肥大化し、
@@ -91,20 +96,6 @@ def _install_database_summary_env() -> None:
 
 
 _install_database_summary_env()
-
-try:
-    from core.startup.summary_discord_always_notify_patch import install as _install_summary_discord_patch
-    _SUMMARY_DISCORD_PATCH_OK = bool(_install_summary_discord_patch())
-except Exception:
-    _SUMMARY_DISCORD_PATCH_OK = False
-    print("[SUMMARY DB RUNNER] summary_discord_always_notify_patch install failed", file=sys.stderr)
-
-try:
-    from core.startup.push_summary_db_source_patch import install as _install_push_summary_db_source_patch
-    _PUSH_SUMMARY_DB_SOURCE_PATCH_OK = bool(_install_push_summary_db_source_patch())
-except Exception:
-    _PUSH_SUMMARY_DB_SOURCE_PATCH_OK = False
-    print("[SUMMARY DB RUNNER] push_summary_db_source_patch install failed", file=sys.stderr)
 
 from data_collectors.logging_setup import setup_logging
 from scheduler_jobs.summary.time_locked_runner import run_time_locked_summary_jobs
@@ -221,28 +212,10 @@ def _flush_summary_save_spool(logger: logging.Logger, *, reason: str, force: boo
         return {"error": True}
 
 
-def _install_push_summary_db_source_patch_runtime(logger: logging.Logger) -> bool:
-    try:
-        from core.startup.push_summary_db_source_patch import install as _install_patch
-        ok = bool(_install_patch())
-        logger.warning("[SUMMARY DB RUNNER] push summary db source patch installed ok=%s", ok)
-        return ok
-    except Exception:
-        logger.exception("[SUMMARY DB RUNNER] push summary db source patch install failed")
-        return False
-
-
 def main() -> int:
     _install_database_summary_env()
 
-    try:
-        from core.startup.summary_discord_always_notify_patch import install as _install_summary_discord_patch
-        patch_ok = bool(_install_summary_discord_patch())
-    except Exception:
-        patch_ok = False
-
     logger = setup_logging("summary_database_runner")
-    push_db_source_patch_ok = _install_push_summary_db_source_patch_runtime(logger)
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
@@ -261,8 +234,8 @@ def main() -> int:
     logger.info("[SUMMARY DB RUNNER] SUMMARY_PUSH_DISPLAY_ALL_INTERVALS=%s", os.getenv("SUMMARY_PUSH_DISPLAY_ALL_INTERVALS"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_PARALLEL_FORCE_1_3_5=%s workers=%s bg_workers=%s", os.getenv("SUMMARY_PARALLEL_FORCE_1_3_5"), os.getenv("SUMMARY_PARALLEL_INTERVAL_WORKERS"), os.getenv("SUMMARY_PUSH_BG_INTERVAL_WORKERS"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_SAVE_SPOOL_FLUSH=%s min_interval=%s max_files=%s after_tick=%s", os.getenv("SUMMARY_SAVE_SPOOL_FLUSH"), os.getenv("SUMMARY_SAVE_SPOOL_FLUSH_MIN_INTERVAL_SEC"), os.getenv("SUMMARY_SAVE_SPOOL_FLUSH_MAX_FILES"), os.getenv("SUMMARY_SAVE_SPOOL_FLUSH_AFTER_TICK"))
-    logger.info("[SUMMARY DB RUNNER] SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY=%s patch_ok=%s", os.getenv("SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY"), patch_ok)
-    logger.info("[SUMMARY DB RUNNER] PUSH_SUMMARY_DB_SOURCE_FALLBACK=%s patch_ok=%s startup_patch_ok=%s lookback_min=%s max_rows=%s max_mem_lag_sec=%s", os.getenv("PUSH_SUMMARY_DB_SOURCE_FALLBACK"), push_db_source_patch_ok, _PUSH_SUMMARY_DB_SOURCE_PATCH_OK, os.getenv("PUSH_SUMMARY_DB_LOOKBACK_MIN"), os.getenv("PUSH_SUMMARY_DB_MAX_ROWS"), os.getenv("PUSH_SUMMARY_DB_SOURCE_MAX_MEM_LAG_SEC"))
+    logger.info("[SUMMARY DB RUNNER] SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY=%s scope_enabled=%s", os.getenv("SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY"), os.getenv("SUMMARY_DISCORD_EMPTY_FALLBACK_SCOPE_ENABLED"))
+    logger.info("[SUMMARY DB RUNNER] PUSH_SUMMARY_DB_SOURCE_FALLBACK=%s lookback_min=%s max_rows=%s max_mem_lag_sec=%s", os.getenv("PUSH_SUMMARY_DB_SOURCE_FALLBACK"), os.getenv("PUSH_SUMMARY_DB_LOOKBACK_MIN"), os.getenv("PUSH_SUMMARY_DB_MAX_ROWS"), os.getenv("PUSH_SUMMARY_DB_SOURCE_MAX_MEM_LAG_SEC"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_SKIP_DB_SAVE_IN_MAIN=%s", os.getenv("SUMMARY_SKIP_DB_SAVE_IN_MAIN"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_MAIN_ENTRY_ONLY=%s", os.getenv("SUMMARY_MAIN_ENTRY_ONLY"))
     logger.info("[SUMMARY DB RUNNER] SUMMARY_DB_WRITER_ROLE=%s", os.getenv("SUMMARY_DB_WRITER_ROLE"))

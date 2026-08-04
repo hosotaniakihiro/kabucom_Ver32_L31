@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-from typing import Iterable
+import os
+from typing import Any, Iterable
 
 import pandas as pd
 
@@ -36,6 +37,115 @@ from trading.summary.filters.liquidity_filter import (
 )
 
 logger = logging.getLogger(__name__)
+
+_SUMMARY_DISCORD_EMPTY_LAST_SENT: dict[tuple[str, int], str] = {}
+
+
+def _summary_discord_empty_env_on(name: str, default: bool) -> bool:
+    try:
+        raw = str(os.getenv(name, "")).strip().lower()
+        if raw in ("1", "true", "yes", "on", "enable", "enabled"):
+            return True
+        if raw in ("0", "false", "no", "off", "disable", "disabled"):
+            return False
+    except Exception:
+        pass
+    return bool(default)
+
+
+def _summary_discord_empty_latest_dt(df: Any) -> str:
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return ""
+        for c in ("datetime", "dt", "timestamp", "end_time", "snapshot_time"):
+            if c in df.columns:
+                s = pd.to_datetime(df[c], errors="coerce").dropna()
+                if not s.empty:
+                    return str(s.max())
+    except Exception:
+        pass
+    return ""
+
+
+def _summary_discord_empty_symbol_sample(df: Any, n: int = 10) -> str:
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty or "symbol" not in df.columns:
+            return ""
+        vals = [str(x) for x in df["symbol"].astype(str).head(n).tolist()]
+        return ",".join(vals)
+    except Exception:
+        return ""
+
+
+def _summary_discord_empty_should_notify(interval: int) -> bool:
+    try:
+        return int(interval) != 1
+    except Exception:
+        return True
+
+
+def _summary_discord_notify_on_empty(*, source: str, interval: int, now: Any, df: Any, reason: str) -> None:
+    """display_push_summary_safe / display_ranking_summary_safe が False を返す際の
+    Discord空通知 (旧 summary_discord_always_notify_patch)。
+
+    summary_database_runner.py 専用: この関数は runner_core.py 経由で main.py の
+    通常サマリーtickからも呼ばれる共有モジュールのため、main.py 側で重複通知しないよう
+    SUMMARY_DISCORD_EMPTY_FALLBACK_SCOPE_ENABLED (summary_database_runner.py が
+    自プロセスにのみ設定) でスコープを絞っている。
+    """
+    if not _summary_discord_empty_env_on("SUMMARY_DISCORD_EMPTY_FALLBACK_SCOPE_ENABLED", False):
+        return
+    if not _summary_discord_empty_env_on("SUMMARY_DISCORD_EMPTY_FALLBACK_NOTIFY", True):
+        return
+    if not _summary_discord_empty_should_notify(interval):
+        return
+
+    try:
+        minute_key = ""
+        try:
+            minute_key = (now or dt.datetime.now()).replace(second=0, microsecond=0).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            minute_key = dt.datetime.now().replace(second=0, microsecond=0).strftime("%Y-%m-%d %H:%M")
+
+        key = (str(source).upper(), int(interval))
+        if _SUMMARY_DISCORD_EMPTY_LAST_SENT.get(key) == minute_key:
+            logger.info(
+                "[SUMMARY DISCORD EMPTY] duplicate notice skipped source=%s interval=%s minute=%s",
+                source, interval, minute_key,
+            )
+            return
+        _SUMMARY_DISCORD_EMPTY_LAST_SENT[key] = minute_key
+
+        from utils.alerts_util import send_discord_message
+
+        rows = df_rows(df)
+        latest = _summary_discord_empty_latest_dt(df)
+        sample = _summary_discord_empty_symbol_sample(df)
+
+        title = f"📊 {str(source).upper()} SUMMARY {int(interval)}min"
+        lines = [
+            f"{title}",
+            "候補なし / Discord表示対象 0件",
+            f"時刻={minute_key}",
+            f"理由={reason}",
+            f"入力rows={rows}",
+        ]
+        if latest:
+            lines.append(f"latest_dt={latest}")
+        if sample:
+            lines.append(f"sample_symbols={sample}")
+        lines.append("※ 1分足は通知抑止、3分/5分のみ状態通知")
+
+        ok = send_discord_message(content="\n".join(lines))
+        logger.warning(
+            "[SUMMARY DISCORD EMPTY] sent empty notice ok=%s source=%s interval=%s rows=%s reason=%s",
+            ok, source, interval, rows, reason,
+        )
+    except Exception:
+        logger.exception(
+            "[SUMMARY DISCORD EMPTY] empty notice failed source=%s interval=%s reason=%s",
+            source, interval, reason,
+        )
 
 
 IMPORTANT_SAVE_COLUMNS = [
@@ -505,6 +615,7 @@ def display_push_summary_safe(df: pd.DataFrame, interval: int, now: dt.datetime)
     try:
         if not is_nonempty_df(df):
             logger.warning("[summary.runners] display_push_summary skipped interval=%s reason=empty_df now=%s", interval, now)
+            _summary_discord_notify_on_empty(source="PUSH", interval=interval, now=now, df=df, reason="display_push_summary_safe returned False")
             return False
 
         _, slot_dt = resolve_display_slot(interval=interval, now=now)
@@ -523,6 +634,7 @@ def display_push_summary_safe(df: pd.DataFrame, interval: int, now: dt.datetime)
                 now,
                 slot_dt,
             )
+            _summary_discord_notify_on_empty(source="PUSH", interval=interval, now=now, df=df, reason="display_push_summary_safe returned False")
             return False
 
         display_df = _prepare_summary_for_output(display_df, interval, "push", "display-push-after-liquidity")
@@ -541,6 +653,7 @@ def display_push_summary_safe(df: pd.DataFrame, interval: int, now: dt.datetime)
         return True
     except Exception:
         logger.exception("[summary.runners] display_push_summary failed interval=%s now=%s", interval, now)
+        _summary_discord_notify_on_empty(source="PUSH", interval=interval, now=now, df=df, reason="display_push_summary_safe exception")
         return False
 
 
@@ -552,6 +665,7 @@ def display_ranking_summary_safe(df: pd.DataFrame, interval: int, now: dt.dateti
     try:
         if not is_nonempty_df(df):
             logger.warning("[summary.runners] display_ranking_summary skipped interval=%s reason=empty_df now=%s", interval, now)
+            _summary_discord_notify_on_empty(source="RANKING", interval=interval, now=now, df=df, reason="display_ranking_summary_safe returned False")
             return False
 
         _, slot_dt = resolve_display_slot(interval=interval, now=now)
@@ -572,6 +686,7 @@ def display_ranking_summary_safe(df: pd.DataFrame, interval: int, now: dt.dateti
                 now,
                 slot_dt,
             )
+            _summary_discord_notify_on_empty(source="RANKING", interval=interval, now=now, df=df, reason="display_ranking_summary_safe returned False")
             return False
 
         display_df = _prepare_summary_for_output(display_df, interval, "ranking", "display-ranking-after-liquidity")
@@ -590,4 +705,5 @@ def display_ranking_summary_safe(df: pd.DataFrame, interval: int, now: dt.dateti
         return True
     except Exception:
         logger.exception("[summary.runners] display_ranking_summary failed interval=%s now=%s", interval, now)
+        _summary_discord_notify_on_empty(source="RANKING", interval=interval, now=now, df=df, reason="display_ranking_summary_safe exception")
         return False
