@@ -201,7 +201,21 @@ def _make_time_range(v: Any, interval: int) -> str:
         return "00:00:00-00:00:00"
 
 
-def _load_table(conn: sqlite3.Connection, table: str, cols: list[str], limit_rows: int):
+def _target_symbols(conn: sqlite3.Connection, table: str, cols: list[str], sym_col: str) -> list[str]:
+    """NULL を含む行が存在する銘柄の一覧。"""
+    cand = _null_candidate_cols(cols)
+    if not cand or not sym_col:
+        return []
+    where = " OR ".join(f"{c} IS NULL" for c in cand)
+    try:
+        rows = conn.execute(f"SELECT DISTINCT CAST({sym_col} AS TEXT) FROM {table} WHERE {where}").fetchall()
+        return [str(r[0]) for r in rows if r and r[0] is not None]
+    except Exception:
+        logger.warning("[SUMMARY EXISTING NULL REPAIR] target symbol scan failed table=%s", table, exc_info=True)
+        return []
+
+
+def _load_table(conn: sqlite3.Connection, table: str, cols: list[str], limit_rows: int, symbols: list[str] | None = None):
     import pandas as pd
 
     sym = _pick(cols, ["symbol", "code", "stock_code"])
@@ -218,6 +232,17 @@ def _load_table(conn: sqlite3.Connection, table: str, cols: list[str], limit_row
         return pd.DataFrame()
 
     dtexpr = dtc if dtc else f"({datec} || ' ' || {timec})"
+
+    # 補修対象の銘柄だけに絞る。全銘柄を LIMIT で頭から読むと、対象行が
+    # 範囲外になって黙って補修されない取りこぼしが起きるため。
+    where_sql = ""
+    params: list = []
+    if symbols:
+        placeholders = ",".join("?" for _ in symbols)
+        where_sql = f"WHERE CAST({sym} AS TEXT) IN ({placeholders})"
+        params.extend(symbols)
+    params.append(limit_rows)
+
     sql = f"""
         SELECT rowid AS _rowid,
                CAST({sym} AS TEXT) AS symbol,
@@ -229,10 +254,18 @@ def _load_table(conn: sqlite3.Connection, table: str, cols: list[str], limit_row
                {vol if vol else '0'} AS volume,
                {turn if turn else '0'} AS turnover
         FROM {table}
+        {where_sql}
         ORDER BY symbol, dtv
         LIMIT ?
     """
-    return pd.read_sql_query(sql, conn, params=(limit_rows,))
+    df = pd.read_sql_query(sql, conn, params=tuple(params))
+    if len(df) >= limit_rows:
+        logger.warning(
+            "[SUMMARY EXISTING NULL REPAIR] row limit hit table=%s loaded=%s limit=%s symbols=%s "
+            "-> 一部の対象行が補修されない可能性あり。SUMMARY_EXISTING_NULL_REPAIR_MAX_ROWS を上げてください",
+            table, len(df), limit_rows, len(symbols or []),
+        )
+    return df
 
 
 def _compute(df, interval: int):
@@ -317,51 +350,45 @@ def _needs_update_where(cols: list[str]) -> str:
     return " OR ".join(terms)
 
 
-def _target_rowids_with_null(conn: sqlite3.Connection, table: str, cols: list[str]) -> set[int]:
-    where = _needs_update_where(cols)
-    if not where:
-        return set()
+def _null_candidate_cols(cols: list[str]) -> list[str]:
+    candidates = [
+        "time_range", "rsi", "macd", "signal", "atr", "slope", "slope_atr_scaled",
+        "ma5", "ma25", "ma75", "score_buy", "score_sell", "score_total", "final_score", "score_mtf", "mtf",
+    ]
+    return [c for c in candidates if c in cols]
+
+
+def _target_null_map(conn: sqlite3.Connection, table: str, cols: list[str]) -> dict[int, frozenset]:
+    """NULL を含む行の rowid -> その行で NULL になっているカラム集合。
+
+    旧実装は rowid の集合だけを返し、更新時に対象20カラムを一括で上書きしていた。
+    そのため「atr だけ NULL」の行でも既に正しい rsi/macd/score_* まで
+    簡略計算の値で塗り潰していた。ここでは行ごとに NULL のカラムだけを拾う。
+    """
+    cand = _null_candidate_cols(cols)
+    if not cand:
+        return {}
+    where = " OR ".join(f"{c} IS NULL" for c in cand)
+    select_cols = ", ".join(cand)
     try:
-        rows = conn.execute(f"SELECT rowid FROM {table} WHERE {where}").fetchall()
-        return {int(r[0]) for r in rows}
+        rows = conn.execute(f"SELECT rowid, {select_cols} FROM {table} WHERE {where}").fetchall()
     except Exception:
         logger.warning("[SUMMARY EXISTING NULL REPAIR] rowid scan failed table=%s", table, exc_info=True)
-        return set()
+        return {}
+
+    out: dict[int, frozenset] = {}
+    for r in rows:
+        try:
+            null_cols = frozenset(c for c, v in zip(cand, r[1:]) if v is None)
+            if null_cols:
+                out[int(r[0])] = null_cols
+        except Exception:
+            continue
+    return out
 
 
-def _update_table(conn: sqlite3.Connection, table: str, cols: list[str], calc, target_rowids: set[int]) -> int:
-    if calc is None or calc.empty or not target_rowids:
-        return 0
-    wanted = [
-        "time_range", "rsi", "macd", "signal", "atr", "slope", "slope_atr_scaled", "score_slope",
-        "ma5", "ma25", "ma75", "score", "score_buy", "score_sell", "score_total",
-        "final_score", "display_score", "score_mtf", "mtf_score", "mtf",
-    ]
-    update_cols = [c for c in wanted if c in cols and c in calc.columns]
-    if "updated_at" in cols:
-        calc = calc.copy()
-        calc["updated_at"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        update_cols.append("updated_at")
-    if not update_cols:
-        return 0
-
-    target = calc[calc["_rowid"].astype(int).isin(target_rowids)].copy()
-    if target.empty:
-        return 0
-
-    set_sql = ", ".join([f"{c}=?" for c in update_cols])
-    sql = f"UPDATE {table} SET {set_sql} WHERE rowid=?"
-    vals = []
-    for _, r in target.iterrows():
-        rowid = int(r["_rowid"])
-        one = []
-        for c in update_cols:
-            if c == "updated_at" or c == "time_range":
-                one.append(r.get(c))
-            else:
-                one.append(float(r.get(c, 0.0) or 0.0))
-        vals.append(tuple(one) + (rowid,))
-
+def _executemany_with_retry(conn: sqlite3.Connection, table: str, sql: str, vals: list, done_so_far: int) -> tuple[int, bool]:
+    """chunk 分割 + locked retry つきの executemany。(更新件数, 継続可否) を返す。"""
     chunk_size = max(1, _env_int("SUMMARY_EXISTING_NULL_REPAIR_CHUNK_SIZE", 300))
     retries = max(0, _env_int("SUMMARY_EXISTING_NULL_REPAIR_LOCK_RETRIES", 8))
     sleep_base = max(0.05, _env_float("SUMMARY_EXISTING_NULL_REPAIR_LOCK_SLEEP_BASE", 0.35))
@@ -383,11 +410,66 @@ def _update_table(conn: sqlite3.Connection, table: str, cols: list[str], calc, t
                     raise
                 attempt += 1
                 if attempt > retries:
-                    logger.warning("[SUMMARY EXISTING NULL REPAIR] locked giveup table=%s done=%s err=%s", table, total, e)
+                    logger.warning(
+                        "[SUMMARY EXISTING NULL REPAIR] locked giveup table=%s done=%s err=%s",
+                        table, done_so_far + total, e,
+                    )
                     if skip_if_busy:
-                        return total
+                        return total, False
                     raise
                 time.sleep(sleep_base * (1.5 ** (attempt - 1)) + random.uniform(0, sleep_base))
+    return total, True
+
+
+def _update_table(conn: sqlite3.Connection, table: str, cols: list[str], calc, target_null_map: dict) -> int:
+    """NULL になっているカラムだけを補修する。
+
+    行ごとに NULL のカラム集合が違うので、同じ集合の行をまとめて
+    1本の UPDATE 文にする (集合の種類は通常ごく少数)。
+    """
+    if calc is None or calc.empty or not target_null_map:
+        return 0
+
+    writable = set(_null_candidate_cols(cols)) & set(calc.columns)
+    if not writable:
+        return 0
+
+    has_updated_at = "updated_at" in cols
+    now_str = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    target = calc[calc["_rowid"].astype(int).isin(target_null_map.keys())].copy()
+    if target.empty:
+        return 0
+
+    # NULLカラム集合ごとに行をまとめる
+    groups: dict[tuple, list] = {}
+    for _, r in target.iterrows():
+        rowid = int(r["_rowid"])
+        null_cols = target_null_map.get(rowid)
+        if not null_cols:
+            continue
+        update_cols = tuple(c for c in _null_candidate_cols(cols) if c in null_cols and c in writable)
+        if not update_cols:
+            continue
+        one = []
+        for c in update_cols:
+            if c == "time_range":
+                one.append(r.get(c))
+            else:
+                one.append(float(r.get(c, 0.0) or 0.0))
+        if has_updated_at:
+            one.append(now_str)
+        groups.setdefault(update_cols, []).append(tuple(one) + (rowid,))
+
+    total = 0
+    for update_cols, vals in groups.items():
+        set_cols = list(update_cols) + (["updated_at"] if has_updated_at else [])
+        set_sql = ", ".join(f"{c}=?" for c in set_cols)
+        sql = f"UPDATE {table} SET {set_sql} WHERE rowid=?"
+        done, keep_going = _executemany_with_retry(conn, table, sql, vals, total)
+        total += done
+        if not keep_going:
+            return total
     return total
 
 
@@ -435,22 +517,28 @@ def _run_repair_impl(*, reason: str) -> dict[str, Any]:
                     detail["error"] = "table_missing"
                     continue
                 cols = _columns(conn, table)
-                target_rowids = _target_rowids_with_null(conn, table, cols)
-                detail["null_rows"] = len(target_rowids)
-                if not target_rowids:
+                target_null_map = _target_null_map(conn, table, cols)
+                detail["null_rows"] = len(target_null_map)
+                if not target_null_map:
                     detail["updated"] = 0
                     logger.warning("[SUMMARY EXISTING NULL REPAIR] interval=%s table=%s null_rows=0", interval, table)
                     continue
-                df = _load_table(conn, table, cols, limit_rows)
+                sym_col = _pick(cols, ["symbol", "code", "stock_code"])
+                symbols = _target_symbols(conn, table, cols, sym_col)
+                detail["target_symbols"] = len(symbols)
+                df = _load_table(conn, table, cols, limit_rows, symbols=symbols)
                 detail["loaded"] = int(len(df)) if df is not None else 0
                 if df is None or df.empty:
                     detail["updated"] = 0
                     continue
                 calc = _compute(df, interval)
-                updated = _update_table(conn, table, cols, calc, target_rowids)
+                updated = _update_table(conn, table, cols, calc, target_null_map)
                 detail["updated"] = updated
                 total += updated
-                logger.warning("[SUMMARY EXISTING NULL REPAIR] interval=%s table=%s loaded=%s null_rows=%s updated=%s", interval, table, len(df), len(target_rowids), updated)
+                logger.warning(
+                    "[SUMMARY EXISTING NULL REPAIR] interval=%s table=%s symbols=%s loaded=%s null_rows=%s updated=%s",
+                    interval, table, len(symbols), len(df), len(target_null_map), updated,
+                )
         result.update({"ok": True, "updated": total, "elapsed": round(time.monotonic() - t0, 3)})
         logger.warning("[SUMMARY EXISTING NULL REPAIR] done reason=%s updated=%s elapsed=%.3fs db=%s", reason, total, time.monotonic() - t0, path)
         return result
@@ -465,6 +553,35 @@ def _run_background(reason: str) -> None:
     if delay > 0:
         time.sleep(delay)
     run_repair(reason=reason)
+
+
+def start_background_repair(reason: str = "data_collectors_startup") -> bool:
+    """DB担当プロセスから起動時のNULL補修をBGスレッドで開始する。
+
+    install() は env ベースのプロセス判定に依存しており、
+    data_collectors_runner / main_database から起動されるケースを取りこぼしていた。
+    こちらは「呼んだプロセスが補修の担当」であることを前提に明示的に開始する。
+
+    SUMMARY_EXISTING_NULL_REPAIR_ENABLED=0 で無効化できる。
+    """
+    if not _env_bool("SUMMARY_EXISTING_NULL_REPAIR_ENABLED", True):
+        logger.warning("[SUMMARY EXISTING NULL REPAIR] disabled by env reason=%s", reason)
+        return False
+    logger.warning(
+        "[SUMMARY EXISTING NULL REPAIR] background repair scheduled reason=%s intervals=%s delay=%.1fs max_rows=%s",
+        reason,
+        _parse_intervals(),
+        _env_float("SUMMARY_EXISTING_NULL_REPAIR_START_DELAY_SEC", 18.0),
+        _env_int("SUMMARY_EXISTING_NULL_REPAIR_MAX_ROWS", 300000),
+    )
+    th = threading.Thread(
+        target=_run_background,
+        args=(reason,),
+        name="summary-existing-null-repair",
+        daemon=True,
+    )
+    th.start()
+    return True
 
 
 def install() -> bool:
@@ -490,4 +607,4 @@ try:
 except Exception as e:
     logger.warning("[SUMMARY EXISTING NULL REPAIR] auto install failed err=%s", e, exc_info=False)
 
-__all__ = ["install", "run_repair"]
+__all__ = ["install", "run_repair", "start_background_repair"]

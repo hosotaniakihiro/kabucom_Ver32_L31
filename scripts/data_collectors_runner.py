@@ -320,6 +320,24 @@ def _run_db_prepare(logger: logging.Logger) -> None:
     logger.info("[DATA COLLECTORS] db_prepare done")
 
 
+def _start_summary_null_repair(logger: logging.Logger) -> None:
+    """summary DB の既存NULL項目補修をBGで開始する。
+
+    この補修は「DB担当プロセスが受け持つ」設計だが、呼び出し口が
+    core/startup/__init__.py の main.py 専用ブロックにしか無く、
+    実際にはどのプロセスでも走っていなかった。ここが本来の担当プロセス。
+
+    SUMMARY_EXISTING_NULL_REPAIR_ENABLED=0 で無効化できる。
+    """
+    try:
+        from trading.summary.existing_null_repair import start_background_repair
+
+        started = start_background_repair(reason="data_collectors_startup")
+        logger.info("[DATA COLLECTORS] summary existing-null repair scheduled=%s", started)
+    except Exception:
+        logger.exception("[DATA COLLECTORS] summary existing-null repair start failed")
+
+
 def _start_child(logger: logging.Logger, name: str, path: Path) -> subprocess.Popen:
     _check_file(path)
     cmd = [_python_exe(), str(path)]
@@ -388,6 +406,7 @@ def main() -> int:
     logger.info("=" * 80)
 
     _run_db_prepare(logger)
+    _start_summary_null_repair(logger)
     procs: Dict[str, subprocess.Popen] = {}
     try:
         for name, path in specs.items():
