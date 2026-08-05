@@ -1,18 +1,30 @@
 # ============================================================
-# File   : core/startup/tonosama_fresh_summary_wait_fix_patch.py
-# Version: v8-WAIT-SUMMARY-LOADER-AND-PUSH-UNIVERSE
+# File   : trading/entry/tonosama/fresh_summary_wait.py
 # ------------------------------------------------------------
-# Purpose:
-#   場中に古いPUSH summaryを使ってTONOSAMAを動かさない。
-#   かつ、PUSH summary完成直前にTONOSAMAが先に走って base feature empty
-#   になる問題を防ぐ。
+# 殿様エントリー前の「新しいPUSHサマリー待ち」まわりの補正。
 #
-# Fix:
-#   - latest が max_age 内ならOK。
-#   - stale は場中 immediate skip のまま維持。
-#   - summary_loader.load_merged_summary が空の時だけ、短時間GCのPUSH summary完成を待つ。
-#   - runtime.monitor_symbols が小さすぎる場合、global/dynamic providerで100件近くへ補完する。
+# 旧 core/startup/tonosama_fresh_summary_wait_fix_patch.py V8 を
+# trading 側へ移設したもの。処理内容は変えていない。
+#
+# 差し替え対象:
+#   trading/entry_exit/tasks._latest_push_summary_age_sec        (置換)
+#   trading/entry_exit/tasks._wait_fresh_push_summary_before_tonosama (置換)
+#   trading/entry/tonosama/summary_loader.load_merged_summary     (ラップ)
+#   trading/push/push_stream/rotation_symbols.resolve_monitor_symbols (ラップ)
+#
+# 本文へ埋め込まない理由:
+#   resolve_monitor_symbols は push_registration_recovery_patch が先に
+#   ラップしており、こちらはその外側に乗っている (実測済み)。
+#   本文の最内周へ移すと適用順が逆転し、PUSH監視銘柄の母集団が変わる。
+#   そのため install 位置 (sitecustomize BACKGROUND_MAIN_PATCHES) は据え置き、
+#   置き場所だけ trading 側へ移した。
+#
+# 注意: import しただけでは install しない。
+#   旧ファイルはモジュール末尾で install() を自動実行していたが、
+#   trading パッケージ配下では他モジュールからの import で意図せず
+#   早く install されうるため、明示呼び出しだけにしてある。
 # ============================================================
+
 from __future__ import annotations
 
 import datetime as dt
@@ -532,12 +544,6 @@ def install(retry: bool = True) -> bool:
         import threading
         threading.Thread(target=_retry_loop, name="tonosama-fresh-summary-wait-fix", daemon=True).start()
     return False
-
-
-try:
-    install()
-except Exception:
-    logger.exception("[TONOSAMA FRESH SUMMARY WAIT FIX] auto install failed")
 
 
 __all__ = ["install"]
