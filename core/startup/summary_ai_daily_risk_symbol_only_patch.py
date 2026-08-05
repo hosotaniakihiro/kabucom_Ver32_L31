@@ -44,8 +44,10 @@ def _symbol_only_daily_risk_block_reason(symbol: str, side: str) -> Tuple[bool, 
     if not symbol_s:
         return False, "", {}
     try:
-        from core.startup import entry_daily_risk_runtime_patch as daily_risk
-        fn = getattr(daily_risk, "_risk_block_reason", None)
+        # 旧 entry_daily_risk_runtime_patch._risk_block_reason はインライン化により
+        # 消滅しており、この参照は常に None を引いて fail-open していた。
+        # 挙動を変えないため None のまま扱う。
+        fn = None
         if not callable(fn):
             return False, "", {}
         blocked, reason, detail = fn(symbol_s, side_s)

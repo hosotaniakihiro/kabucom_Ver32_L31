@@ -209,7 +209,6 @@ def _install_main_runtime_patches():
         # scheduler_jobs/summary/display.py 本体へインライン化済みのため削除。
         # entry_ma5_third_bar_slope_guard_patch は entry_controller._build_scored_candidates
         # 本体へインライン化済みのため削除。
-        ("core.startup.final_entry_liquidity_movement_hard_guard_patch", "install"),
         ("core.startup.summary_ai_more_candidates_patch", "install"),
         ("core.startup.summary_ai_async_entry_patch", "install"),
         # async entry が executor を差し替えた後で、V5 direct dispatch を必ず重ねる。

@@ -177,12 +177,10 @@ def _install_push_summary_history_patch() -> None:
 
 
 def _install_global_context_summary_repair_patch() -> None:
-    try:
-        from core.startup.global_context_summary_repair_patch import install as install_gc_repair
-        ok = install_gc_repair()
-        logger.warning("[STARTUP.RUNTIME] global context summary repair patch installed=%s", ok)
-    except Exception:
-        logger.exception("[STARTUP.RUNTIME] global context summary repair patch install failed")
+    # global_context_summary_repair_patch は core/global_context/context.py へ
+    # インライン化済み (context.py:1040 付近)。パッチ側は install() が True を
+    # 返すだけの空スタブになっていたのでファイルごと削除した。
+    return
 
 
 def _install_summary_controller_ready_mtf_patch() -> None:

@@ -352,14 +352,10 @@ def _ranking_momentum_ok(row: dict, *, close: float, symbol: str, high: float, l
 
 
 def _install_ranking_direction_guard() -> bool:
-    try:
-        from core.startup import ranking_direction_entry_guard_patch as p
-        ok = p.install()
-        logger.warning("[LOW MOVE GUARD] ranking_direction_entry_guard_patch installed=%s", ok)
-        return bool(ok)
-    except Exception as e:
-        logger.warning("[LOW MOVE GUARD] ranking_direction_entry_guard_patch install failed: %s", e, exc_info=False)
-        return False
+    # ranking_direction_entry_guard_patch は trading/handlers/entry_controller.py へ
+    # インライン化済み。パッチ側は install() が True を返すだけの空スタブになっていたので
+    # ファイルごと削除した。ここは install 成功と同じ True を返す。
+    return True
 
 
 def _install_scoring_flag_pattern_bridge() -> bool:

@@ -147,7 +147,9 @@ def install() -> bool:
     # インライン化済みのため削除。
     _patch_summary_schema_bootstrap()
     _run_install("entry_limit_passive_runtime_patch", "core.startup.entry_limit_passive_runtime_patch")
-    _run_install("entry_daily_risk_runtime_patch", "core.startup.entry_daily_risk_runtime_patch")
+    # entry_daily_risk_runtime_patch は trading/handlers/entry_controller.py の
+    # _daily_risk_block_reason / _daily_risk_record_actual_trade へインライン化済み
+    # (パッチ側は空スタブだったので削除した)。
     _patch_entry_max_approved()
     _patch_ranking_bootstrap()
     _run_install("summary_mtf_push_raw_fallback_patch", "core.startup.summary_mtf_push_raw_fallback_patch")

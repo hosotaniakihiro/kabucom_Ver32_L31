@@ -204,12 +204,9 @@ def _install_entrypoint_runtime_patches() -> None:
     except Exception:
         logger.exception("[startup.entrypoint] push bg due interval guard install failed")
 
-    try:
-        from core.startup.entry_pipeline_pending_root_prefilter_patch import install as install_entry_pending_root_prefilter
-
-        install_entry_pending_root_prefilter()
-    except Exception:
-        logger.exception("[startup.entrypoint] entry pending root prefilter install failed")
+    # entry_pipeline_pending_root_prefilter_patch は
+    # trading/handlers/entry_controller.py へインライン化済み
+    # (パッチ側は空スタブだったので削除した)。
 
     try:
         from core.startup.entry_volume_direction_guard_patch import install as install_entry_volume_direction_guard

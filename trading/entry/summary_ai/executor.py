@@ -275,15 +275,12 @@ def _is_sell_reject_cached(symbol: str, side: str) -> tuple[bool, Any]:
 def _daily_risk_block_reason(symbol: str, side: str) -> tuple[bool, str, Dict[str, Any]]:
     if not _env_bool("SUMMARY_AI_PRE_FILTER_DAILY_RISK", True):
         return False, "", {}
-    try:
-        from core.startup import entry_daily_risk_runtime_patch as daily_risk
-        fn = getattr(daily_risk, "_risk_block_reason", None)
-        if callable(fn):
-            blocked, reason, detail = fn(_norm_symbol(symbol), _norm_side(side, "BUY"))
-            if blocked:
-                return True, str(reason or "DAILY_RISK_BLOCK"), dict(detail) if isinstance(detail, dict) else {"detail": str(detail)}
-    except Exception:
-        logger.debug("[SUMMARY AI EXECUTOR] daily risk compatibility check failed; fail-open", exc_info=True)
+    # 旧 core/startup/entry_daily_risk_runtime_patch の _risk_block_reason を
+    # getattr で探していたが、同パッチは trading/handlers/entry_controller.py の
+    # _daily_risk_block_reason へインライン化され空スタブになっており、
+    # この参照は常に None を引いて fail-open していた (= ここでは何も判定しない)。
+    # 実際の日次リスク判定は entry_controller._daily_risk_block_reason が行う。
+    # 挙動を変えないため、ここでは従来どおり fail-open のままにしている。
     return False, "", {}
 
 
