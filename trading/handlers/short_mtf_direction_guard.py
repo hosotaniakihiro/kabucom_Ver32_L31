@@ -1,25 +1,21 @@
 # ============================================================
-# File   : core/startup/entry_mtf_short_required_daily_optional_patch.py
-# Version: V1.4-SHORT-MTF-2OF3-RELAX
+# File   : trading/handlers/short_mtf_direction_guard.py
 # ------------------------------------------------------------
-# 【目的】
-#   日足MA/日足MTF 1つの逆行だけでエントリー不可になる問題を防ぐ。
+# 発注直前の短期MTF方向ガード (1分/3分/5分の 2 of 3 判定)。
 #
-# 【方針】
-#   - 発注直前の方向ガードでは、日足込みの mtf / score_mtf は必須判定に使わない
-#   - 1分・3分・5分の slope_atr_scaled_* を確認する
-#   - 日足MTFはスコア加点・参考情報として残すが、単独では発注停止しない
+# 旧 core/startup/entry_mtf_short_required_daily_optional_patch.py V1.4 が
+#   trading/handlers/entry_order_builder._summary_mtf_direction_guard
+#   core/startup/entry_limit_passive_runtime_patch._summary_ai_strict_guard
+# を差し替えて行っていた判定を本文側へ移設したもの。
 #
-# V1.4:
-#   - ENTRY_SHORT_MTF_REQUIRE_ALL=1 でも全足一致必須にしない。
-#   - 既定は 1m/3m/5m のうち 2本以上がエントリー方向ならOK。
-#   - BUY: slope > eps を「方向一致」
-#   - SELL: slope < -eps を「方向一致」
-#   - slope=0.0 は中立。方向一致にも逆行にも数えない。
-#   - 逆行足があっても、方向一致本数が ENTRY_SHORT_MTF_MIN_ALIGNED 以上なら通す。
+# 方針 (旧パッチのまま):
+#   - 発注直前の方向ガードでは日足込みの mtf / score_mtf を必須判定に使わない
+#   - 1分/3分/5分の slope_atr_scaled_* を確認し、2本以上が方向一致ならOK
+#   - slope=0.0 は中立 (方向一致にも逆行にも数えない)
+#   - 日足MTFはスコア加点・参考情報として残すが単独では発注停止しない
 #
-# V1.3:
-#   - slope=0.0 を「逆方向」扱いしない。
+# 旧パッチは sitecustomize の BACKGROUND_MAIN_PATCHES 経由 = main.py 専用
+# だったため、short_mtf_guard_enabled() で同じスコープを保つ。
 # ============================================================
 
 from __future__ import annotations
@@ -320,12 +316,34 @@ def _short_mtf_direction_guard(entry_row: Dict[str, Any], *, symbol: str, side: 
 def _strict_guard_short_mtf_only(*, symbol: str, side: str, row: dict, detail: dict) -> Optional[Dict[str, Any]]:
     return _short_mtf_direction_guard(row, symbol=symbol, side=side, source="SUMMARY_AI")
 
+# ============================================================
+# スコープ判定 + env 既定値 + 公開入口
+# ============================================================
 
-def install() -> bool:
-    global _PATCHED
-    if _PATCHED:
-        return True
+import sys  # noqa: E402
 
+_SHORT_MTF_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+
+_ENV_APPLIED = False
+
+
+def apply_env_defaults() -> None:
+    """旧 install() が設定していた env 既定値。
+
+    sitecustomize から呼ばれる install() 相当のタイミングで一度だけ適用する。
+    """
+    global _ENV_APPLIED
+    if _ENV_APPLIED:
+        return
+    _ENV_APPLIED = True
     os.environ.setdefault("ENTRY_SHORT_MTF_REQUIRED", "1")
     os.environ["ENTRY_SHORT_MTF_REQUIRE_ALL"] = os.environ.get("ENTRY_SHORT_MTF_REQUIRE_ALL", "0")
     if os.environ.get("ENTRY_SHORT_MTF_REQUIRE_ALL") == "1" and _env_bool("ENTRY_SHORT_MTF_FORCE_2OF3", True):
@@ -337,53 +355,57 @@ def install() -> bool:
     os.environ.setdefault("ENTRY_SHORT_MTF_DB_BACKFILL", "1")
     os.environ.setdefault("ENTRY_SHORT_MTF_ZERO_NEUTRAL", "1")
 
-    ok_any = False
-    try:
-        import trading.handlers.entry_order_builder as eob
-        old = getattr(eob, "_summary_mtf_direction_guard", None)
-        if callable(old) and not getattr(old, "_short_required_daily_optional_v14", False):
-            _short_mtf_direction_guard._short_required_daily_optional_v14 = True  # type: ignore[attr-defined]
-            _short_mtf_direction_guard._original = old  # type: ignore[attr-defined]
-            eob._summary_mtf_direction_guard = _short_mtf_direction_guard
-            ok_any = True
-            logger.warning("[SHORT MTF GUARD] patched entry_order_builder._summary_mtf_direction_guard v1.4")
-    except Exception:
-        logger.exception("[SHORT MTF GUARD] patch entry_order_builder failed")
 
-    try:
-        import core.startup.entry_limit_passive_runtime_patch as elp
-        old2 = getattr(elp, "_summary_ai_strict_guard", None)
-        if callable(old2) and not getattr(old2, "_short_required_daily_optional_v14", False):
-            def _patched_summary_ai_strict_guard(*, symbol: str, side: str, row: dict, detail: dict):
-                return _strict_guard_short_mtf_only(symbol=symbol, side=side, row=row, detail=detail)
-            _patched_summary_ai_strict_guard._short_required_daily_optional_v14 = True  # type: ignore[attr-defined]
-            _patched_summary_ai_strict_guard._original = old2  # type: ignore[attr-defined]
-            elp._summary_ai_strict_guard = _patched_summary_ai_strict_guard
-            ok_any = True
-            logger.warning("[SHORT MTF GUARD] patched entry_limit_passive_runtime_patch._summary_ai_strict_guard v1.4")
-    except Exception:
-        logger.exception("[SHORT MTF GUARD] patch entry_limit_passive_runtime_patch failed")
+def short_mtf_guard_enabled() -> bool:
+    """この短期MTFガードをこのプロセスで使うか。
 
-    _PATCHED = bool(ok_any)
+    旧パッチは sitecustomize の BACKGROUND_MAIN_PATCHES 経由 = main.py 専用。
+    ENTRY_SHORT_MTF_GUARD_SCOPE_ENABLED=1/0 で明示的に上書きできる。
+    """
+    try:
+        raw = os.getenv("ENTRY_SHORT_MTF_GUARD_SCOPE_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return _env_bool("ENTRY_SHORT_MTF_GUARD_SCOPE_ENABLED", True)
+        if _env_bool("CORE_STARTUP_FORCE_FULL_INIT_PATCHES", False):
+            return True
+        argv_text = " ".join(str(x) for x in sys.argv).replace("\\", "/").lower()
+        return not any(name in argv_text for name in _SHORT_MTF_DB_PROCESS_NAMES)
+    except Exception:
+        return False
+
+
+def short_mtf_direction_guard(entry_row, *, symbol: str, side: str, source: str):
+    """2 of 3 判定版の方向ガード。NG のとき dict を返す。"""
+    return _short_mtf_direction_guard(entry_row, symbol=symbol, side=side, source=source)
+
+
+def summary_ai_strict_guard(*, symbol: str, side: str, row: dict, detail: dict):
+    """SUMMARY_AI の strict guard を短期MTF判定だけで行う版。"""
+    return _strict_guard_short_mtf_only(symbol=symbol, side=side, row=row, detail=detail)
+
+
+def install() -> bool:
+    """sitecustomize から呼ばれる互換入口。env 既定値の適用だけ行う。
+
+    判定ロジック本体は entry_order_builder / entry_limit_passive_runtime_patch
+    から直接呼ばれるため monkeypatch は不要。
+    """
+    apply_env_defaults()
     logger.warning(
-        "[SHORT MTF GUARD] installed=%s required=%s require_all=%s min_aligned=%s min_available=%s eps=%s daily_optional=%s backfill_from_gc=True db_backfill=%s zero_neutral=%s force_2of3=%s",
-        _PATCHED,
-        os.getenv("ENTRY_SHORT_MTF_REQUIRED"),
-        os.getenv("ENTRY_SHORT_MTF_REQUIRE_ALL"),
-        os.getenv("ENTRY_SHORT_MTF_MIN_ALIGNED"),
-        os.getenv("ENTRY_SHORT_MTF_MIN_AVAILABLE"),
-        os.getenv("ENTRY_SHORT_MTF_SLOPE_EPS"),
-        os.getenv("ENTRY_DAILY_MTF_OPTIONAL"),
-        os.getenv("ENTRY_SHORT_MTF_DB_BACKFILL"),
-        os.getenv("ENTRY_SHORT_MTF_ZERO_NEUTRAL"),
-        os.getenv("ENTRY_SHORT_MTF_FORCE_2OF3", "1"),
+        "[SHORT MTF GUARD] env defaults applied scope=%s required=%s require_all=%s min_aligned=%s eps=%s",
+        short_mtf_guard_enabled(),
+        os.environ.get("ENTRY_SHORT_MTF_REQUIRED"),
+        os.environ.get("ENTRY_SHORT_MTF_REQUIRE_ALL"),
+        os.environ.get("ENTRY_SHORT_MTF_MIN_ALIGNED"),
+        os.environ.get("ENTRY_SHORT_MTF_SLOPE_EPS"),
     )
-    return _PATCHED
+    return True
 
 
-try:
-    install()
-except Exception:
-    logger.exception("[SHORT MTF GUARD] auto install failed")
-
-__all__ = ["install"]
+__all__ = [
+    "install",
+    "apply_env_defaults",
+    "short_mtf_guard_enabled",
+    "short_mtf_direction_guard",
+    "summary_ai_strict_guard",
+]

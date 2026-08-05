@@ -145,6 +145,21 @@ def _chain_contains(fn: Any, marker: str, *, limit: int = 20) -> bool:
 
 
 def _summary_ai_strict_guard(*, symbol: str, side: str, row: dict, detail: dict) -> Optional[Dict[str, Any]]:
+    """SUMMARY_AI 新規エントリーの strict guard。
+
+    旧 core/startup/entry_mtf_short_required_daily_optional_patch V1.4 が
+    この関数を「短期MTF方向判定だけ行う」版へ差し替えていた。
+    その実装は trading/handlers/short_mtf_direction_guard.py へ移設済みで、
+    有効なプロセスではそちらを使う。
+    """
+    from trading.handlers import short_mtf_direction_guard as _short_mtf
+
+    if _short_mtf.short_mtf_guard_enabled():
+        return _short_mtf.summary_ai_strict_guard(symbol=symbol, side=side, row=row, detail=detail)
+    return _summary_ai_strict_guard_legacy(symbol=symbol, side=side, row=row, detail=detail)
+
+
+def _summary_ai_strict_guard_legacy(*, symbol: str, side: str, row: dict, detail: dict) -> Optional[Dict[str, Any]]:
     side_u = str(side or "").upper()
 
     board_ok = bool(detail.get("board"))

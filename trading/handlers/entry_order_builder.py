@@ -331,6 +331,22 @@ def _low_move_hard_block(entry_row: Dict[str, Any], *, symbol: str, source: str)
 
 
 def _summary_mtf_direction_guard(entry_row: Dict[str, Any], *, symbol: str, side: str, source: str) -> Optional[Dict[str, Any]]:
+    """発注直前の MTF 方向ガード。
+
+    旧 core/startup/entry_mtf_short_required_daily_optional_patch V1.4 が
+    この関数を「日足MTFを必須にせず 1分/3分/5分の 2 of 3 で判定する」版へ
+    差し替えていた。その実装は
+    trading/handlers/short_mtf_direction_guard.py へ移設済みで、
+    有効なプロセスではそちらを使う。
+    """
+    from trading.handlers import short_mtf_direction_guard as _short_mtf
+
+    if _short_mtf.short_mtf_guard_enabled():
+        return _short_mtf.short_mtf_direction_guard(entry_row, symbol=symbol, side=side, source=source)
+    return _summary_mtf_direction_guard_legacy(entry_row, symbol=symbol, side=side, source=source)
+
+
+def _summary_mtf_direction_guard_legacy(entry_row: Dict[str, Any], *, symbol: str, side: str, source: str) -> Optional[Dict[str, Any]]:
     if not ENTRY_ORDER_MTF_GUARD_ENABLED:
         return None
     if str(source or "").upper() != "SUMMARY_AI":
