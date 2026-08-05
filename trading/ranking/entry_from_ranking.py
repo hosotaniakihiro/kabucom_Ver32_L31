@@ -31,7 +31,23 @@ import pandas as pd
 from global_state import global_data
 from trading.entry.pending_manager import add_pending
 from trading.ranking.side_infer import infer_side_from_rank_type
-from AI.entry_row_builder import build_entry_row
+from AI.entry_row_builder import build_entry_row as _build_entry_row_base
+from trading.ranking import ranking_entry_high_low as _ranking_hl
+
+
+def build_entry_row(row, *args, **kwargs):
+    """ランキング由来のエントリー行を組み立てる。
+
+    旧 core/startup/ranking_entry_high_low_from_snapshot_patch がこの
+    モジュールの build_entry_row エイリアスを差し替えて、high/low が欠損した
+    行を ranking_snapshot から補完していた。その処理を
+    trading/ranking/ranking_entry_high_low.py へ移設し、ここから呼ぶ。
+
+    AI.entry_row_builder.build_entry_row 自体は他モジュールからも使われるため
+    そちらは変更せず、ランキング経路だけに補完がかかる形を保っている。
+    """
+    entry_row = _build_entry_row_base(row, *args, **kwargs)
+    return _ranking_hl.fill_high_low_from_snapshot(entry_row, row)
 from config.ranking_entry_config import RANKING_ENTRY_CONFIG, is_time_allowed
 
 try:

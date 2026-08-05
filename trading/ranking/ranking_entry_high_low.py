@@ -1,17 +1,17 @@
 # ============================================================
-# File   : core/startup/ranking_entry_high_low_from_snapshot_patch.py
-# Version: Ver1.0-RANKING-ENTRY-HIGH-LOW-FROM-SNAPSHOT
+# File   : trading/ranking/ranking_entry_high_low.py
 # ------------------------------------------------------------
-# 目的:
-#   ランキング由来エントリーで high/low が 0 のため、
-#   LOW MOVE GUARD が no_high_low で落とす問題を補正する。
+# ランキング由来エントリー行の high/low を ranking_snapshot から補完する。
 #
-# 方針:
-#   - PUSH履歴は使わない。
-#   - ranking_snapshot_1min の直近価格履歴から high / low / open / close / range_pct を作る。
-#   - trading.ranking.entry_from_ranking が import 済みの build_entry_row をラップする。
-#   - entry_row に high/low が既に入っていれば上書きしない。
-#   - DBが読めない場合は何もしない。発注をfail-openさせない。
+# 旧 core/startup/ranking_entry_high_low_from_snapshot_patch.py が
+# trading/ranking/entry_from_ranking.build_entry_row (AI.entry_row_builder からの
+# import エイリアス) を差し替えて行っていた処理を本文側へ移設した。
+#
+# 補完対象は「close > 0 なのに high/low が欠損 or high < low」の行だけ。
+# 既に値が入っているカラムは上書きしない。
+#
+# 旧パッチは sitecustomize の BACKGROUND_MAIN_PATCHES 経由 = main.py 専用
+# だったため、high_low_fill_enabled() で同じスコープを保つ。
 # ============================================================
 from __future__ import annotations
 
@@ -223,65 +223,81 @@ def _needs_high_low(entry_row: dict[str, Any]) -> bool:
     return close > 0 and (high <= 0 or low <= 0 or high < low)
 
 
-def _wrap_build_entry_row(original):
-    def _wrapped(row: Any, *args, **kwargs):
-        entry_row = original(row, *args, **kwargs)
-        try:
-            if not ENABLED or not isinstance(entry_row, dict):
-                return entry_row
-            src = str(entry_row.get("source") or (row.get("source") if isinstance(row, dict) else "") or "").upper()
-            # sourceが未設定の段階でも、ranking側モジュールから呼ばれるので補完対象にする。
-            symbol = _normalize_symbol(entry_row.get("symbol") or (row.get("symbol") if isinstance(row, dict) else ""))
-            if not symbol or not _needs_high_low(entry_row):
-                return entry_row
-            hl = _calc_from_snapshot(symbol)
-            if not hl:
-                return entry_row
-            for k, v in hl.items():
-                if k in {"open", "high", "low", "close", "open_price", "high_price", "low_price", "close_price"}:
-                    if _safe_float(entry_row.get(k), 0.0) <= 0:
-                        entry_row[k] = v
-                else:
-                    entry_row[k] = v
-            entry_row["ranking_high_low_filled"] = True
-            if not entry_row.get("source") and src:
-                entry_row["source"] = src
-            return entry_row
-        except Exception:
-            logger.debug("[RANKING ENTRY HL PATCH] wrapped build_entry_row failed", exc_info=True)
-            return entry_row
-    return _wrapped
+
+# ============================================================
+# スコープ判定 + 公開入口
+# ============================================================
+
+import sys  # noqa: E402
+
+_HL_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
 
 
-def install() -> bool:
-    global _INSTALLED, _ORIGINAL_BUILD_ENTRY_ROW
-    if _INSTALLED:
-        return True
-    if not ENABLED:
-        logger.warning("[RANKING ENTRY HL PATCH] disabled by env")
-        return False
+def high_low_fill_enabled() -> bool:
+    """このプロセスで ranking_snapshot からの high/low 補完を行うか。
+
+    無効化は従来どおり RANKING_ENTRY_HIGH_LOW_SNAPSHOT_PATCH_ENABLED=0 (ENABLED)。
+    スコープは RANKING_ENTRY_HIGH_LOW_SCOPE_ENABLED で上書きできる。
+    """
     try:
-        import trading.ranking.entry_from_ranking as mod
-        original = getattr(mod, "build_entry_row", None)
-        if not callable(original):
-            logger.warning("[RANKING ENTRY HL PATCH] build_entry_row not callable")
+        if not ENABLED:
             return False
-        if getattr(original, "_ranking_hl_patch_wrapped", False):
-            _INSTALLED = True
+        raw = os.getenv("RANKING_ENTRY_HIGH_LOW_SCOPE_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return str(raw).strip().lower() in {"1", "true", "yes", "y", "on", "enable", "enabled"}
+        if str(os.getenv("CORE_STARTUP_FORCE_FULL_INIT_PATCHES", "")).strip().lower() in {
+            "1", "true", "yes", "y", "on", "enable", "enabled",
+        }:
             return True
-        wrapped = _wrap_build_entry_row(original)
-        setattr(wrapped, "_ranking_hl_patch_wrapped", True)
-        _ORIGINAL_BUILD_ENTRY_ROW = original
-        setattr(mod, "build_entry_row", wrapped)
-        _INSTALLED = True
-        logger.warning(
-            "[RANKING ENTRY HL PATCH] installed lookback_rows=%s max_age_min=%.1f cache_ttl=%.1f",
-            LOOKBACK_ROWS, MAX_AGE_MIN, CACHE_TTL_SEC,
-        )
-        return True
+        argv_text = " ".join(str(x) for x in sys.argv).replace("\\", "/").lower()
+        return not any(name in argv_text for name in _HL_DB_PROCESS_NAMES)
     except Exception:
-        logger.exception("[RANKING ENTRY HL PATCH] install failed")
         return False
 
 
-__all__ = ["install"]
+def fill_high_low_from_snapshot(entry_row: Any, source_row: Any = None) -> Any:
+    """entry_row の high/low を ranking_snapshot から補完して返す。
+
+    補完不要 / 対象外 / 失敗時は entry_row をそのまま返す。
+    """
+    try:
+        if not high_low_fill_enabled() or not isinstance(entry_row, dict):
+            return entry_row
+        src = str(
+            entry_row.get("source")
+            or (source_row.get("source") if isinstance(source_row, dict) else "")
+            or ""
+        ).upper()
+        symbol = _normalize_symbol(
+            entry_row.get("symbol")
+            or (source_row.get("symbol") if isinstance(source_row, dict) else "")
+        )
+        if not symbol or not _needs_high_low(entry_row):
+            return entry_row
+        hl = _calc_from_snapshot(symbol)
+        if not hl:
+            return entry_row
+        for k, v in hl.items():
+            if k in {"open", "high", "low", "close", "open_price", "high_price", "low_price", "close_price"}:
+                if _safe_float(entry_row.get(k), 0.0) <= 0:
+                    entry_row[k] = v
+            else:
+                entry_row[k] = v
+        entry_row["ranking_high_low_filled"] = True
+        if not entry_row.get("source") and src:
+            entry_row["source"] = src
+        return entry_row
+    except Exception:
+        logger.debug("[RANKING ENTRY HL] fill from snapshot failed", exc_info=True)
+        return entry_row
+
+
+__all__ = ["high_low_fill_enabled", "fill_high_low_from_snapshot"]

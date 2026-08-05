@@ -149,7 +149,9 @@ def _patch_entry_gate() -> bool:
 
 def _patch_high_low_snapshot_zero_range() -> bool:
     try:
-        import core.startup.ranking_entry_high_low_from_snapshot_patch as hl
+        # 旧 core/startup/ranking_entry_high_low_from_snapshot_patch は
+        # trading/ranking/ranking_entry_high_low.py へ本文化済み。
+        import trading.ranking.ranking_entry_high_low as hl
 
         cur = getattr(hl, "_needs_high_low", None)
         if not callable(cur):
