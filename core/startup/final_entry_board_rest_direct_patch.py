@@ -247,12 +247,10 @@ def _install_once(log_patch: bool = True) -> bool:
     global _INSTALLED
     try:
         _set_default_env()
-        import core.startup.final_entry_safety_guard_patch as fsg
-        cur = getattr(fsg, "_try_get_bid_ask_from_api", None)
-        if getattr(cur, "_final_entry_board_rest_direct_v41", False):
-            _INSTALLED = True
-            return True
-        fsg._try_get_bid_ask_from_api = _make_try_get_bid_ask_from_api()
+        # final_entry_safety_guard_patch は本文化済みで _try_get_bid_ask_from_api を
+        # 持たないため、差し替え先が存在しない (従来も空モジュールへ書き込んでいて
+        # 誰も読んでいなかった)。実効は上の env 既定値のみ。
+        # 板取得本体は trading/handlers/entry_controller._final_guard_try_get_bid_ask_from_api。
         _INSTALLED = True
         if log_patch:
             logger.warning(

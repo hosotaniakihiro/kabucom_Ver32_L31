@@ -381,14 +381,10 @@ def _install_entry_direction_confirm_guard() -> bool:
 
 
 def _install_final_entry_safety_guard() -> bool:
-    try:
-        from core.startup import final_entry_safety_guard_patch as p
-        ok = p.install()
-        logger.warning("[LOW MOVE GUARD] final_entry_safety_guard_patch installed=%s", ok)
-        return bool(ok)
-    except Exception as e:
-        logger.warning("[LOW MOVE GUARD] final_entry_safety_guard_patch install failed: %s", e, exc_info=False)
-        return False
+    # final_entry_safety_guard_patch は trading/handlers/entry_controller.py の
+    # _final_guard_* 群へインライン化済み。パッチ側は install() が True を返すだけの
+    # 空スタブになっていたのでファイルごと削除した。
+    return True
 
 
 def _install_entry_price_improvement_patch() -> bool:

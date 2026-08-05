@@ -363,7 +363,10 @@ def _wrap_call_board_guard(target: Any) -> bool:
 
 def _patch_once() -> bool:
     try:
-        import core.startup.final_entry_safety_guard_patch as target
+        # final_entry_safety_guard_patch は本文化済みで _board_guard /
+        # _call_board_guard を持たないため、以下の env 既定値だけが実効になる。
+        # 板ガード本体は trading/handlers/entry_controller._final_guard_board_ok。
+        target = None
         os.environ.setdefault("ENTRY_SUMMARY_AI_DELEGATE_BOARD_TO_ORDER_BUILDER", "1")
         os.environ.setdefault("ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY", "0")
         # final_entry_safety_guard_patch の内側 wrapper 用。成行許可ではなく、order_builder の安全指値fallbackに進ませる。

@@ -296,8 +296,11 @@ def install() -> bool:
     if _INSTALLED:
         return True
     try:
-        import core.startup.final_entry_safety_guard_patch as fg
-        cur = getattr(fg, "_liquidity_guard", None)
+        # final_entry_safety_guard_patch は本文化済みで _liquidity_guard を持たないため、
+        # ラップ対象が存在しない (従来もここで False を返していた)。
+        # 流動性ガード本体は trading/handlers/entry_controller._final_guard_liquidity_ok。
+        fg = None
+        cur = None
         if not callable(cur):
             logger.warning("[FINAL TONOSAMA LIQ] target missing")
             return False

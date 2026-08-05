@@ -217,21 +217,9 @@ def _patch_once() -> bool:
     except Exception:
         logger.debug("[BOARD IMBALANCE ADVISORY] board_wall patch skipped", exc_info=True)
 
-    try:
-        import core.startup.final_entry_safety_guard_patch as fsg
-        cur = getattr(fsg, "_board_guard", None)
-        if _is_ours(cur):
-            ok = True
-        elif callable(cur):
-            _ORIG_FSG_BOARD_GUARD = getattr(cur, "_original_fsg", cur)
-            _advisory_board_guard._original_fsg = _ORIG_FSG_BOARD_GUARD  # type: ignore[attr-defined]
-            fsg._board_guard = _advisory_board_guard
-            if hasattr(fsg, "_patched_board_guard"):
-                fsg._patched_board_guard = _advisory_board_guard
-            changed = True
-            ok = True
-    except Exception:
-        logger.debug("[BOARD IMBALANCE ADVISORY] final guard patch skipped", exc_info=True)
+    # final_entry_safety_guard_patch は本文化済みで _board_guard を持たないため、
+    # ここでのラップ対象は存在しない (従来も何もせず通過していた)。
+    # 板ガード本体は trading/handlers/entry_controller._final_guard_board_ok。
 
     if changed:
         _rate_limited_patch_log("[BOARD IMBALANCE ADVISORY] patched/recovered board guard v3")

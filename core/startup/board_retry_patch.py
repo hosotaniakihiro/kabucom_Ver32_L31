@@ -313,37 +313,10 @@ def _install_final_safety_side_aware_board() -> bool:
     global _SIDE_PATCHED
     if _SIDE_PATCHED:
         return True
-    try:
-        import core.startup.final_entry_safety_guard_patch as fg
-        fn = getattr(fg, "_try_get_bid_ask_from_api", None)
-        if callable(fn) and not getattr(fn, "_board_retry_side_v19", False):
-            orig = _unwrap_original(fn)
-
-            def wrapped(symbol: str, *args, **kwargs):
-                side = kwargs.pop("side", "") if "side" in kwargs else ""
-                source = kwargs.pop("source", "") if "source" in kwargs else ""
-                side, source = _infer_context_side_source(side, source)
-                try:
-                    out = orig(symbol, *args, side=side, source=source, **kwargs)
-                except TypeError:
-                    try:
-                        out = orig(symbol, side=side, source=source)
-                    except TypeError:
-                        out = orig(symbol)
-                if _is_valid_board(out):
-                    return out
-                return _fetch_board_rest(symbol, side=side, source=source) or out
-
-            wrapped._board_retry_side_v19 = True  # type: ignore[attr-defined]
-            wrapped._board_retry_side_v18 = True  # type: ignore[attr-defined]
-            wrapped._original = orig  # type: ignore[attr-defined]
-            fg._try_get_bid_ask_from_api = wrapped
-            _SIDE_PATCHED = True
-            logger.warning("[BOARD RETRY] patched final_entry_safety_guard _try_get_bid_ask_from_api side-aware v19")
-        return True
-    except Exception:
-        logger.exception("[BOARD RETRY] patch final_entry_safety_guard side-aware failed")
-        return False
+    # final_entry_safety_guard_patch は本文化済みで _try_get_bid_ask_from_api を
+    # 持たなくなったため、side-aware ラップの対象が存在しない。
+    # 板取得本体は trading/handlers/entry_controller._final_guard_try_get_bid_ask_from_api。
+    return True
 
 
 def _install_ma5_opening_relax() -> bool:

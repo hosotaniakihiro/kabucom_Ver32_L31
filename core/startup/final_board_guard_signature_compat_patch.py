@@ -113,32 +113,10 @@ def _mark_signature_safe(fn: Any) -> Any:
 
 def _apply(reason: str = "install") -> bool:
     global _LAST_TARGET_ID
-    try:
-        import core.startup.final_entry_safety_guard_patch as fsg
-        cur = getattr(fsg, "_board_guard", None)
-        if not callable(cur):
-            logger.warning("[FINAL BOARD GUARD SIG COMPAT] target _board_guard missing reason=%s version=%s", reason, VERSION)
-            return False
-        base = _unwrap(cur)
-        if not callable(base):
-            base = cur
-        _mark_signature_safe(base)
-        try:
-            fsg._board_guard = base
-            fsg._patched_board_guard = base
-        except Exception:
-            pass
-        cur_id = id(base)
-        if _LAST_TARGET_ID != cur_id or _is_legacy_wrapper(cur):
-            logger.warning(
-                "[FINAL BOARD GUARD SIG COMPAT] native guard marked reason=%s unwrapped=%s cur=%s base=%s version=%s",
-                reason, _is_legacy_wrapper(cur), getattr(cur, "__name__", type(cur).__name__), getattr(base, "__name__", type(base).__name__), VERSION,
-            )
-        _LAST_TARGET_ID = cur_id
-        return True
-    except Exception:
-        logger.exception("[FINAL BOARD GUARD SIG COMPAT] apply failed reason=%s version=%s", reason, VERSION)
-        return False
+    # final_entry_safety_guard_patch は本文化済みで _board_guard を持たないため、
+    # 署名互換化の対象が存在しない (従来もこの分岐で False を返していた)。
+    logger.warning("[FINAL BOARD GUARD SIG COMPAT] target _board_guard missing reason=%s version=%s", reason, VERSION)
+    return False
 
 
 def _latest_age_sec(df: Any) -> tuple[bool, float | None, Any, int, int]:

@@ -220,7 +220,6 @@ def _patched_board_guard(row: dict, symbol: str, side: str) -> bool:
 
     try:
         from trading.board.board_signal import analyze_entry_board_imbalance
-        import core.startup.final_entry_safety_guard_patch as fsg
 
         detail = analyze_entry_board_imbalance(
             symbol,
@@ -228,11 +227,9 @@ def _patched_board_guard(row: dict, symbol: str, side: str) -> bool:
             exchange=_env_int("ENTRY_BOARD_EXCHANGE", _env_int("EXIT_BOARD_WALL_EXCHANGE", 1)),
         )
         if detail:
-            reason = str(detail.get("reason") or "entry_board_imbalance")
-            try:
-                fsg._log_ng(reason, symbol, side, **detail)
-            except Exception:
-                logger.warning("[BOARD ENTRY IMBALANCE PATCH] NG symbol=%s side=%s detail=%s", symbol, side, detail)
+            # 旧 final_entry_safety_guard_patch._log_ng は本文化により消滅しており、
+            # 実際にはこの fallback ログだけが出ていた。
+            logger.warning("[BOARD ENTRY IMBALANCE PATCH] NG symbol=%s side=%s detail=%s", symbol, side, detail)
             return False
     except Exception:
         logger.debug("[BOARD ENTRY IMBALANCE PATCH] analyze failed symbol=%s side=%s", symbol, side, exc_info=True)
@@ -244,36 +241,11 @@ def _install_entry_board_imbalance_guard() -> bool:
     global _ENTRY_INSTALLED, _ORIG_BOARD_GUARD
     if _ENTRY_INSTALLED:
         return True
-    try:
-        import core.startup.final_entry_safety_guard_patch as fsg
-
-        cur = getattr(fsg, "_board_guard", None)
-        if not callable(cur):
-            logger.warning("[BOARD ENTRY IMBALANCE PATCH] final_entry_safety_guard._board_guard unavailable")
-            return False
-        if getattr(cur, "_board_entry_imbalance_patch", False):
-            _ENTRY_INSTALLED = True
-            return True
-
-        _ORIG_BOARD_GUARD = cur
-        _patched_board_guard._board_entry_imbalance_patch = True  # type: ignore[attr-defined]
-        _patched_board_guard._original = cur  # type: ignore[attr-defined]
-        fsg._board_guard = _patched_board_guard
-        _ENTRY_INSTALLED = True
-        logger.warning(
-            "[BOARD ENTRY IMBALANCE PATCH] installed enabled=%s levels=%s buy_min_ratio=%s sell_max_ratio=%s wall_reject=%s wall_ratio=%s wall_min_qty=%s",
-            _env_bool("ENTRY_BOARD_IMBALANCE_ENABLED", True),
-            os.getenv("ENTRY_BOARD_IMBALANCE_LEVELS", "5"),
-            os.getenv("ENTRY_BOARD_BUY_MIN_BID_ASK_RATIO", "0.70"),
-            os.getenv("ENTRY_BOARD_SELL_MAX_BID_ASK_RATIO", "1.30"),
-            _env_bool("ENTRY_BOARD_WALL_REJECT_ENABLED", True),
-            os.getenv("ENTRY_BOARD_WALL_REJECT_RATIO", "3.00"),
-            os.getenv("ENTRY_BOARD_WALL_MIN_QTY", "1500"),
-        )
-        return True
-    except Exception:
-        logger.exception("[BOARD ENTRY IMBALANCE PATCH] install failed")
-        return False
+    # final_entry_safety_guard_patch は本文化済みで _board_guard を持たないため、
+    # ラップ対象が存在しない (従来もこの分岐で False を返していた)。
+    # 板ガード本体は trading/handlers/entry_controller._final_guard_board_ok。
+    logger.warning("[BOARD ENTRY IMBALANCE PATCH] final_entry_safety_guard._board_guard unavailable")
+    return False
 
 
 def install() -> bool:

@@ -43,21 +43,10 @@ def _restore_final_guard_board_guard() -> bool:
     final_entry_safety_guard v10 の _board_guard へ戻す。
     新規プロセスでは通常何もしない。
     """
-    try:
-        import core.startup.final_entry_safety_guard_patch as fsg
-        cur = getattr(fsg, "_board_guard", None)
-        if getattr(cur, "_board_missing_failopen_v16", False):
-            # final_entry_safety_guard_patch.py 由来の元関数があれば戻す。
-            old = getattr(cur, "_original_board_guard", None)
-            if callable(old):
-                fsg._board_guard = old
-                fsg._patched_board_guard = old
-                logger.warning("[BOARD MISSING FAILOPEN] restored original final guard board guard version=%s", VERSION)
-                return True
-        return True
-    except Exception:
-        logger.exception("[BOARD MISSING FAILOPEN] restore final guard failed")
-        return False
+    # final_entry_safety_guard_patch は本文化済みで _board_guard を持たなくなったため、
+    # ここでの復元対象は存在しない (旧V1.6が同一プロセス内で上書きしていた場合のみの処理)。
+    # 板ガード本体は trading/handlers/entry_controller._final_guard_board_ok が担当する。
+    return True
 
 
 def _install_board_guard_signature_compat() -> bool:

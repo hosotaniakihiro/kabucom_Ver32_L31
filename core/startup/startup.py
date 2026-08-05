@@ -244,12 +244,9 @@ def _install_entrypoint_runtime_patches() -> None:
     except Exception:
         logger.exception("[startup.entrypoint] REST full board entry patch install failed")
 
-    try:
-        from core.startup.final_entry_safety_guard_patch import install as install_final_entry_safety_guard_patch
-
-        install_final_entry_safety_guard_patch()
-    except Exception:
-        logger.exception("[startup.entrypoint] final entry safety guard install failed")
+    # final_entry_safety_guard_patch は trading/handlers/entry_controller.py の
+    # _final_guard_* 群 (時間帯/流動性/直近反転/板) へインライン化済み
+    # (パッチ側は空スタブだったので削除した)。
 
     try:
         from core.startup.final_entry_board_rest_direct_patch import install as install_final_entry_board_rest_direct_patch

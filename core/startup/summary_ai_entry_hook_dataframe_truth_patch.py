@@ -430,8 +430,11 @@ def _install_final_entry_board_guard_compat(force: bool = False, reason: str = "
     """
     global _BOARD_COMPAT_PATCHED, _ORIGINAL_FINAL_BOARD_GUARD
     try:
-        import core.startup.final_entry_safety_guard_patch as target
-        cur = getattr(target, "_board_guard", None)
+        # final_entry_safety_guard_patch は本文化済みで _board_guard を持たないため、
+        # 互換ラップの対象が存在しない (従来もここで False を返していた)。
+        # 板ガード本体は trading/handlers/entry_controller._final_guard_board_ok。
+        target = None
+        cur = None
         if not callable(cur):
             logger.warning("[FINAL ENTRY BOARD GUARD COMPAT] target _board_guard not callable")
             return False
@@ -480,13 +483,8 @@ def _board_guard_watcher() -> None:
     loops = int(max(1, _env_float("FINAL_ENTRY_BOARD_GUARD_COMPAT_WATCH_LOOPS", 120)))
     sleep = max(0.2, _env_float("FINAL_ENTRY_BOARD_GUARD_COMPAT_WATCH_SEC", 0.5))
     for i in range(loops):
-        try:
-            import core.startup.final_entry_safety_guard_patch as target
-            cur = getattr(target, "_board_guard", None)
-            if callable(cur) and not (_is_our_board_compat(cur) or getattr(cur, "_final_board_guard_signature_v2", False) or getattr(cur, "_final_board_guard_signature_runtime", False)):
-                _install_final_entry_board_guard_compat(force=True, reason=f"watcher:{i}")
-        except Exception:
-            logger.debug("[FINAL ENTRY BOARD GUARD COMPAT] watcher failed", exc_info=True)
+        # final_entry_safety_guard_patch は本文化済みで _board_guard を持たないため、
+        # watcher が再ラップすべき対象は現れない (従来も毎回 None を見ていた)。
         time.sleep(sleep)
 
 

@@ -167,9 +167,11 @@ def _make_adapter(orig):
 def _patch_once() -> bool:
     global _INSTALLED, _ORIG
     try:
-        import core.startup.final_entry_safety_guard_patch as fsg
-
-        cur = getattr(fsg, "_board_guard", None) or getattr(fsg, "_patched_board_guard", None)
+        # final_entry_safety_guard_patch は本文化済みで _board_guard /
+        # _patched_board_guard を持たないため、署名アダプタの対象が存在しない
+        # (従来もここで False を返していた)。
+        fsg = None
+        cur = None
         if not callable(cur):
             return False
 
