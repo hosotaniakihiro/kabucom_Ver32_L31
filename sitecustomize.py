@@ -278,8 +278,6 @@ SYNC_MAIN_PATCHES = [
 ]
 
 BACKGROUND_MAIN_PATCHES = [
-    ("core.startup.summary_db_date_guard_patch", "SUMMARY_DB_DATE_GUARD", "DISABLE_SUMMARY_DB_DATE_GUARD_PATCH"),
-    ("core.startup.summary_save_quality_guard_patch", "SUMMARY_SAVE_QUALITY_GUARD", "DISABLE_SUMMARY_SAVE_QUALITY_GUARD"),
     # tonosama_5sec_advisory_patch は trading/entry/tonosama/runner._apply_climax_guards
     # へ本文化済み。残っていた中継 install (entry_order_5s_breakout_optional_patch) を
     # ここから直接行う。

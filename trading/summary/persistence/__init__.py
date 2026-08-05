@@ -94,9 +94,30 @@ def _install_vwap_state_summary_patch_on_import() -> None:
         logger.exception("[SUMMARY PERSISTENCE] VWAP state summary patch install failed")
 
 
+def _install_summary_save_guards_on_import() -> None:
+    """保存前3段ガード (quality / date / lock pressure) を最外周へ被せる。
+
+    旧 core/startup の summary_save_quality_guard_patch /
+    summary_db_date_guard_patch / summary_db_lock_pressure_patch を
+    trading/summary/persistence/summary_save_guards.py へ集約したもの。
+
+    必ず上の enrichment 系 (daily_mtf / ma_cross / vwap) の "後" に呼ぶこと。
+    quality guard は enrichment で vwap 等の列が付く前の df を見る必要があり、
+    内側に入ると「指標あり」と誤判定して不完全データを保存してしまう。
+    """
+    try:
+        from trading.summary.persistence.summary_save_guards import install as install_guards
+
+        ok = install_guards()
+        logger.warning("[SUMMARY PERSISTENCE] summary save guards installed=%s", ok)
+    except Exception:
+        logger.exception("[SUMMARY PERSISTENCE] summary save guards install failed")
+
+
 _install_daily_mtf_patch_on_import()
 _install_ma_cross_state_summary_patch_on_import()
 _install_vwap_state_summary_patch_on_import()
+_install_summary_save_guards_on_import()
 
 
 # ============================================================

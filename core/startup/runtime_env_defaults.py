@@ -126,6 +126,20 @@ DB_DEFAULTS: Dict[str, str] = {
     "SQLITE_CACHE_SPILL_OFF": "1",
     "SQLITE_WAL_AUTOCHECKPOINT": "1000",
     "SQLITE_SYNCHRONOUS": "NORMAL",
+    # 旧 core/startup/summary_db_lock_pressure_patch.py の install() が
+    # setdefault していた値。upsert_executor が import 時に読むため、
+    # sitecustomize から最も早く適用されるここで確定させる。
+    # 同パッチは SQLITE_BUSY_TIMEOUT_MS も 45000 で setdefault していたが、
+    # apply_site_defaults がこの dict を先に適用するため上の 5000 が勝っており
+    # 実際には不発だった。挙動を変えないためここには入れない。
+    "SUMMARY_REALTIME_FORCE_LATEST_ONLY": "1",
+    "SUMMARY_REALTIME_SKIP_IF_BUSY": "1",
+    "SUMMARY_REALTIME_LOCK_TIMEOUT_SEC": "2.0",
+    "SUMMARY_REALTIME_LATEST_ONLY_ROW_THRESHOLD": "500",
+    "SUMMARY_UPSERT_WAL_CHECKPOINT": "0",
+    "SUMMARY_UPSERT_CHUNK_SIZE": "250",
+    "SUMMARY_UPSERT_RETRY": "6",
+    "SUMMARY_UPSERT_LOCK_BACKOFF_MAX_SEC": "1.2",
 }
 
 HELPER_DEFAULTS: Dict[str, str] = {

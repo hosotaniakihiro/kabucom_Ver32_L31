@@ -297,7 +297,12 @@ def _install_full_pipeline_stability(context: str) -> bool:
 
 
 def _install_summary_db_lock_pressure(context: str) -> bool:
-    return _safe_install("summary DB lock pressure", context, DB_CONTEXTS | TRADING_CONTEXTS | GENERIC_HELPER_CONTEXTS, "DISABLE_SUMMARY_DB_LOCK_PRESSURE_PATCH", "summary_db_lock_pressure_patch")
+    # summary_db_lock_pressure_patch は
+    # trading/summary/persistence/summary_save_guards.py へ集約済み
+    # (同パッケージの __init__.py が enrichment の後に install する)。
+    # install() が setdefault していた env は runtime_env_defaults.DB_DEFAULTS へ移した。
+    # 無効化は従来どおり DISABLE_SUMMARY_DB_LOCK_PRESSURE_PATCH で行える。
+    return True
 
 
 def _install_intraday_load_guard(context: str) -> bool:
