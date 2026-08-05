@@ -280,7 +280,10 @@ SYNC_MAIN_PATCHES = [
 BACKGROUND_MAIN_PATCHES = [
     ("core.startup.summary_db_date_guard_patch", "SUMMARY_DB_DATE_GUARD", "DISABLE_SUMMARY_DB_DATE_GUARD_PATCH"),
     ("core.startup.summary_save_quality_guard_patch", "SUMMARY_SAVE_QUALITY_GUARD", "DISABLE_SUMMARY_SAVE_QUALITY_GUARD"),
-    ("core.startup.tonosama_5sec_advisory_patch", "TONOSAMA_5SEC_ADVISORY", "DISABLE_TONOSAMA_5SEC_ADVISORY_PATCH"),
+    # tonosama_5sec_advisory_patch は trading/entry/tonosama/runner._apply_climax_guards
+    # へ本文化済み。残っていた中継 install (entry_order_5s_breakout_optional_patch) を
+    # ここから直接行う。
+    ("core.startup.entry_order_5s_breakout_optional_patch", "ENTRY_ORDER_5S_OPTIONAL", "DISABLE_TONOSAMA_5SEC_ADVISORY_PATCH"),
     ("core.startup.tonosama_datetime_tz_guard_patch", "TONOSAMA_DT_TZ_GUARD", "DISABLE_TONOSAMA_DT_TZ_GUARD_PATCH"),
     ("core.startup.tonosama_history_missing_guard_patch", "TONOSAMA_HISTORY_MISSING_GUARD", "DISABLE_TONOSAMA_HISTORY_MISSING_GUARD_PATCH"),
     ("core.startup.ranking_entry_flat_price_guard_patch", "RANKING_FLAT_PRICE_DB_FALLBACK", "DISABLE_RANKING_FLAT_PRICE_PATCH"),

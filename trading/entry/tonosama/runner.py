@@ -273,6 +273,31 @@ def _diagnose_base_frame(x: pd.DataFrame) -> None:
 
 
 def _apply_climax_guards(x: pd.DataFrame, *, stage: str, sample_cols: list[str]) -> pd.DataFrame:
+    """クライマックス/ヒゲ反転ガード。
+
+    旧 core/startup/tonosama_5sec_advisory_patch V3 がこの関数をラップして
+    fail-open (例外時は入力をそのまま返す) にしていた。ガードで例外が出たときに
+    tonosama_loop ごと落として殿様エントリーを丸ごと止めないための保険なので、
+    その挙動を本文へ取り込んだ。
+    判定ロジック自体は既に本体側でベクトル化されており、パッチが持っていた
+    「Series 真偽値エラー時のベクトル化フォールバック」は本文と同一だったため
+    不要になった (同じ式なので再実行しても同じ例外になる)。
+    """
+    try:
+        return _apply_climax_guards_core(x, stage=stage, sample_cols=sample_cols)
+    except ValueError as e:
+        # Series 真偽値の曖昧さは本文がベクトル化済みで起きないはずなので、
+        # 握りつぶさず表に出す (旧パッチも同じ式で再実行して結局伝播していた)。
+        if "truth value of a Series is ambiguous" in str(e):
+            raise
+        logger.exception("[TONOSAMA] climax guard failed stage=%s -> fail-open", stage)
+        return x if x is not None else pd.DataFrame()
+    except Exception:
+        logger.exception("[TONOSAMA] climax guard failed stage=%s -> fail-open", stage)
+        return x if x is not None else pd.DataFrame()
+
+
+def _apply_climax_guards_core(x: pd.DataFrame, *, stage: str, sample_cols: list[str]) -> pd.DataFrame:
     if x is None or x.empty:
         return pd.DataFrame()
 
