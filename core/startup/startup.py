@@ -236,12 +236,9 @@ def _install_entrypoint_runtime_patches() -> None:
     except Exception:
         logger.exception("[startup.entrypoint] summary entry duplicate pending registered patch install failed")
 
-    try:
-        from core.startup.entry_execute_timeout_guard_patch import install as install_entry_execute_timeout_guard_patch
-
-        install_entry_execute_timeout_guard_patch()
-    except Exception:
-        logger.exception("[startup.entrypoint] entry execute timeout guard install failed")
+    # entry_execute_timeout_guard_patch は
+    # trading/handlers/entry_controller._execute_best_candidate 本体へ
+    # インライン化済み (パッチ側は空スタブだったので削除した)。
 
     try:
         from core.startup.rest_full_board_entry_patch import install as install_rest_full_board_entry_patch

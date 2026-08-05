@@ -261,10 +261,7 @@ DB_SYNC_PATCHES = [
 
 SYNC_MAIN_PATCHES = [
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
-    ("core.startup.entry_log_skip_reason_collision_patch", "ENTRY_LOG_SKIP_GUARD", "DISABLE_ENTRY_LOG_SKIP_GUARD"),
-    ("core.startup.entry_controller_pipeline_lock_wait_patch", "ENTRY_CONTROLLER_LOCK_WAIT", "DISABLE_ENTRY_CONTROLLER_LOCK_WAIT_PATCH"),
     ("core.startup.entry_controller_source_prefilter_patch", "ENTRY_CONTROLLER_SOURCE_PREFILTER", "DISABLE_ENTRY_CONTROLLER_SOURCE_PREFILTER_PATCH"),
-    ("core.startup.entry_execute_timeout_guard_patch", "ENTRY_EXECUTE_TIMEOUT_GUARD", "DISABLE_ENTRY_EXECUTE_TIMEOUT_GUARD_PATCH"),
     ("core.startup.summary_ai_blowoff_prefilter_patch", "SUMMARY_AI_BLOWOFF_PREFILTER", "DISABLE_SUMMARY_AI_BLOWOFF_PREFILTER_PATCH"),
     ("core.startup.summary_ai_runtime_consistency_patch", "SUMMARY_AI_RUNTIME_CONSISTENCY", "DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH"),
     ("core.startup.summary_main_push_db_refresh_patch", "SUMMARY_MAIN_PUSH_DB_REFRESH", "DISABLE_SUMMARY_MAIN_PUSH_DB_REFRESH_PATCH"),

@@ -2509,13 +2509,14 @@ def _pipeline_snapshot_pending_count() -> tuple[dict, int]:
 
 
 def _pipeline_inflight_count() -> int:
-    try:
-        import core.startup.entry_execute_timeout_guard_patch as eg
-        inflight = getattr(eg, "_INFLIGHT", {})
-        if isinstance(inflight, dict):
-            return sum(1 for info in inflight.values() if isinstance(info, dict) and not bool(info.get("done")))
-    except Exception:
-        pass
+    """実行中の候補数。
+
+    旧 core/startup/entry_execute_timeout_guard_patch が持っていた _INFLIGHT
+    レジストリを参照していたが、そのパッチの機能は _execute_best_candidate 本体
+    (timeout 付きで _execute_best_candidate_core を呼ぶ形) へインライン化され、
+    レジストリ自体が無くなった。以降この関数は常に 0 を返していたため、
+    その挙動を明示する。
+    """
     return 0
 
 

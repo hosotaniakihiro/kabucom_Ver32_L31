@@ -223,7 +223,6 @@ def _install_main_runtime_patches():
         ("core.startup.volatility_filter_tonosama_entryrow_rescue_patch", "install"),
         ("core.startup.board_wall_stall_exit_patch", "install"),
         ("core.startup.ranking_entry_filter_rescue_patch", "install"),
-        ("core.startup.entry_log_skip_reason_collision_patch", "install"),
     ]
     for mod_name, fn_name in patches:
         try:
