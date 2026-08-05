@@ -1,3 +1,18 @@
+# ============================================================
+# File   : trading/yahoo/pipeline/complement/db_warmup.py
+# ------------------------------------------------------------
+# Yahoo補完パイプラインへ渡す前に、summary DB から直近の足を読み出して
+# 取得済みDataFrameへ混ぜる (warmup) 処理。
+#
+# 旧 core/startup/yahoo_complement_db_warmup_patch.py が
+# trading/yahoo/pipeline/complement/runner.py の
+# run_yahoo_complement_pipeline / run_yahoo_complement_once を
+# monkeypatch して同じことをしていたものを本文側へ移設した。
+#
+# 旧パッチは sitecustomize の BACKGROUND_MAIN_PATCHES 経由 = main.py 専用
+# だったため、yahoo_complement_runner.py 等のDB専用プロセスでは適用されて
+# いなかった。本文化後も warmup_scope_enabled() で同じスコープを保つ。
+# ============================================================
 from __future__ import annotations
 
 import datetime as dt
@@ -241,71 +256,66 @@ def _merge_db_warmup(df_yahoo: pd.DataFrame, *, base_dir: Optional[str], summary
         return df_yahoo
 
 
-def _patch_once() -> bool:
+# ============================================================
+# スコープ判定 + 公開入口
+# ============================================================
+
+import sys  # noqa: E402
+
+_WARMUP_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+
+
+def warmup_scope_enabled() -> bool:
+    """このプロセスで DB warmup を適用するか。
+
+    旧パッチは sitecustomize の BACKGROUND_MAIN_PATCHES 経由でのみ install
+    されており main.py 専用だった。
+    YAHOO_COMPLEMENT_DB_WARMUP_SCOPE_ENABLED=1/0 で明示的に上書きできる。
+    CORE_STARTUP_FORCE_FULL_INIT_PATCHES=1 のときは DB プロセスでも適用する。
+    """
     try:
-        if not _env_bool("YAHOO_COMPLEMENT_DB_WARMUP_ENABLED", True):
-            logger.warning("[YAHOO DB WARMUP] disabled by env")
-            return False
-        import trading.yahoo.pipeline.complement.runner as runner
-
-        cur = getattr(runner, "run_yahoo_complement_pipeline", None)
-        if not callable(cur):
-            return False
-        if getattr(cur, "_yahoo_db_warmup_v1", False):
+        raw = os.getenv("YAHOO_COMPLEMENT_DB_WARMUP_SCOPE_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return _env_bool("YAHOO_COMPLEMENT_DB_WARMUP_SCOPE_ENABLED", True)
+        if _env_bool("CORE_STARTUP_FORCE_FULL_INIT_PATCHES", False):
             return True
-        orig_pipeline = getattr(cur, "_original", cur)
-        orig_once = getattr(getattr(runner, "run_yahoo_complement_once", None), "_original", getattr(runner, "run_yahoo_complement_once", None))
-
-        def patched_pipeline(df_yahoo: pd.DataFrame, *args, **kwargs):
-            merged = _merge_db_warmup(
-                df_yahoo,
-                base_dir=kwargs.get("base_dir"),
-                summary_db_path=kwargs.get("summary_db_path"),
-                date_yyyymmdd=kwargs.get("date_yyyymmdd"),
-                now=kwargs.get("now"),
-            )
-            return orig_pipeline(merged, *args, **kwargs)
-
-        patched_pipeline._yahoo_db_warmup_v1 = True  # type: ignore[attr-defined]
-        patched_pipeline._original = orig_pipeline  # type: ignore[attr-defined]
-        runner.run_yahoo_complement_pipeline = patched_pipeline
-
-        if callable(orig_once):
-            def patched_once(df_yahoo: pd.DataFrame, *args, **kwargs):
-                merged = _merge_db_warmup(
-                    df_yahoo,
-                    base_dir=kwargs.get("base_dir"),
-                    summary_db_path=kwargs.get("summary_db_path"),
-                    date_yyyymmdd=kwargs.get("date_yyyymmdd"),
-                    now=None,
-                )
-                return orig_once(merged, *args, **kwargs)
-
-            patched_once._yahoo_db_warmup_v1 = True  # type: ignore[attr-defined]
-            patched_once._original = orig_once  # type: ignore[attr-defined]
-            runner.run_yahoo_complement_once = patched_once
-
-        logger.warning("[YAHOO DB WARMUP] patched runner complement pipeline v1")
-        return True
+        argv_text = " ".join(str(x) for x in sys.argv).replace("\\", "/").lower()
+        return not any(name in argv_text for name in _WARMUP_DB_PROCESS_NAMES)
     except Exception:
-        logger.exception("[YAHOO DB WARMUP] patch failed")
         return False
 
 
-def install() -> bool:
-    global _DONE
-    with _INSTALL_LOCK:
-        if _DONE:
-            return _patch_once()
-        ok = _patch_once()
-        _DONE = True
-        logger.warning("[YAHOO DB WARMUP] installed v1 ok=%s", ok)
-        return bool(ok)
+def merge_db_warmup(
+    df_yahoo: pd.DataFrame,
+    *,
+    base_dir: Optional[str] = None,
+    summary_db_path: Optional[str] = None,
+    date_yyyymmdd: Optional[str] = None,
+    now: Optional[dt.datetime] = None,
+) -> pd.DataFrame:
+    """summary DB の直近足を df_yahoo へ混ぜて返す。
+
+    対象外プロセス / 無効時は df_yahoo をそのまま返す。
+    """
+    if not warmup_scope_enabled():
+        return df_yahoo
+    if not _env_bool("YAHOO_COMPLEMENT_DB_WARMUP_ENABLED", True):
+        return df_yahoo
+    return _merge_db_warmup(
+        df_yahoo,
+        base_dir=base_dir,
+        summary_db_path=summary_db_path,
+        date_yyyymmdd=date_yyyymmdd,
+        now=now,
+    )
 
 
-try:
-    install()
-except Exception:
-    logger.exception("[YAHOO DB WARMUP] auto install failed")
-
-__all__ = ["install"]
+__all__ = ["merge_db_warmup", "warmup_scope_enabled"]

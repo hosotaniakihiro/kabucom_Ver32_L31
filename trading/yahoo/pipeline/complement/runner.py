@@ -75,6 +75,7 @@ from .diff import (
 )
 from .resample import build_interval_frame
 from .compute import compute_summary_frame
+from . import db_warmup as _db_warmup
 from .save import (
     finalize_and_save,
     finalize_for_upsert_if_possible,
@@ -586,6 +587,17 @@ def run_yahoo_complement_pipeline(
       - df_yahoo自体が直近数本しかない場合、5分足MACD/RSIに必要な履歴は作れない
       - その場合、呼び出し側のYahoo取得範囲を warmup_minutes 以上に広げる必要がある
     """
+    # summary DB の直近足を混ぜて warmup を厚くする
+    # (旧 core/startup/yahoo_complement_db_warmup_patch.py から移設)。
+    # 対象外プロセス / 無効時は df_yahoo がそのまま返る。
+    df_yahoo = _db_warmup.merge_db_warmup(
+        df_yahoo,
+        base_dir=base_dir,
+        summary_db_path=summary_db_path,
+        date_yyyymmdd=date_yyyymmdd,
+        now=now,
+    )
+
     started = time.time()
     now = now or dt.datetime.now()
     date_yyyymmdd = date_yyyymmdd or today_yyyymmdd(now)
@@ -709,6 +721,17 @@ def run_yahoo_complement_once(
     scheduler から呼びやすい入口。
     Yahoo 1分足DataFrameを受け取り、1分/3分/5分を差分上書き保存する。
     """
+    # 旧 yahoo_complement_db_warmup_patch は once / pipeline の両方をラップして
+    # いたため、この経路では warmup merge が2回走っていた (2回目は
+    # run_yahoo_complement_pipeline 側)。merge は symbol+datetime の
+    # drop_duplicates(keep="last") なので冪等。挙動を変えないため両方に置く。
+    df_yahoo = _db_warmup.merge_db_warmup(
+        df_yahoo,
+        base_dir=base_dir,
+        summary_db_path=summary_db_path,
+        date_yyyymmdd=date_yyyymmdd,
+        now=None,
+    )
     return run_yahoo_complement_pipeline(
         df_yahoo=df_yahoo,
         intervals=DEFAULT_INTERVALS,
