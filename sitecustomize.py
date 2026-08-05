@@ -283,7 +283,6 @@ BACKGROUND_MAIN_PATCHES = [
     ("core.startup.entry_order_5s_breakout_optional_patch", "ENTRY_ORDER_5S_OPTIONAL", "DISABLE_TONOSAMA_5SEC_ADVISORY_PATCH"),
     ("core.startup.tonosama_datetime_tz_guard_patch", "TONOSAMA_DT_TZ_GUARD", "DISABLE_TONOSAMA_DT_TZ_GUARD_PATCH"),
     ("core.startup.tonosama_history_missing_guard_patch", "TONOSAMA_HISTORY_MISSING_GUARD", "DISABLE_TONOSAMA_HISTORY_MISSING_GUARD_PATCH"),
-    ("core.startup.ranking_entry_flat_price_guard_patch", "RANKING_FLAT_PRICE_DB_FALLBACK", "DISABLE_RANKING_FLAT_PRICE_PATCH"),
     ("core.startup.ranking_entry_source_db_fallback_patch", "RANKING_ENTRY_SOURCE_DB_FALLBACK", "DISABLE_RANKING_ENTRY_SOURCE_DB_FALLBACK_PATCH"),
     ("trading.handlers.short_mtf_direction_guard", "SHORT_MTF_2OF3_GUARD", "DISABLE_SHORT_MTF_2OF3_GUARD_PATCH"),
     ("core.startup.entry_controller_tonosama_ai_bridge_patch", "TONOSAMA_AI_BRIDGE", "DISABLE_TONOSAMA_AI_BRIDGE_PATCH"),

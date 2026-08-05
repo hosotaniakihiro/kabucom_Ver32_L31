@@ -863,6 +863,22 @@ def _calc_ranking_only_score(row: Dict[str, Any], side: str, prev_price: float, 
 
 
 def _passes_ranking_only_filters(row: Dict[str, Any], side: str, prev_h: Dict[str, Any], score: float, parts: Dict[str, float]) -> Tuple[bool, str]:
+    """ランキング単独条件のフィルタ。
+
+    旧 core/startup/ranking_entry_flat_price_guard_patch V1.4 がこの関数を
+    ラップして「volume/turnover 単位補修 + flat price 救済」を行っていた。
+    その処理は trading/ranking/ranking_flat_price_guard.py へ移設済み。
+    """
+    from trading.ranking import ranking_flat_price_guard as _flat
+
+    if _flat.flat_price_guard_enabled():
+        return _flat.apply_flat_price_guard(
+            _passes_ranking_only_filters_core, row, side, prev_h, score, parts
+        )
+    return _passes_ranking_only_filters_core(row, side, prev_h, score, parts)
+
+
+def _passes_ranking_only_filters_core(row: Dict[str, Any], side: str, prev_h: Dict[str, Any], score: float, parts: Dict[str, float]) -> Tuple[bool, str]:
     cfg_rank = RANKING_ENTRY_CONFIG["RANKING"]
     cfg_vol = RANKING_ENTRY_CONFIG["VOLUME"]
     cfg_price = RANKING_ENTRY_CONFIG["PRICE"]

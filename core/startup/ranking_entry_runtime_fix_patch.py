@@ -247,19 +247,14 @@ def _patched_save_ranking_pseudo_technicals(rows: List[Dict[str, Any]], *args, *
 
 
 def _reinstall_db_fallback_patch() -> bool:
-    try:
-        import core.startup.ranking_entry_flat_price_guard_patch as flat
-        # 後段patch順で getter wrapper が外れた場合に再wrapさせる。
-        try:
-            setattr(flat, "_PATCHED", False)
-        except Exception:
-            pass
-        ok = bool(flat.install())
-        logger.warning("[RANKING ENTRY FIX] reinstalled ranking DB fallback patch=%s", ok)
-        return ok
-    except Exception:
-        logger.exception("[RANKING ENTRY FIX] reinstall ranking DB fallback failed")
-        return False
+    # ranking_entry_flat_price_guard_patch は
+    # trading/ranking/ranking_flat_price_guard.py へ本文化済み。
+    # _passes_ranking_only_filters 本体から直接呼ばれるため、
+    # 後段パッチで wrapper が外れることが無くなり再install が不要になった。
+    # (旧パッチが持っていた _get_ranking_source_df の wrapper は、
+    #  ranking_entry_source_db_fallback_patch が本体を直接掴んでいたため
+    #  元々バイパスされていて実効ゼロだった)
+    return True
 
 
 def install() -> bool:

@@ -214,7 +214,6 @@ def _install_main_runtime_patches():
         ("core.startup.summary_ai_async_direct_dispatch_patch", "install"),
         ("core.startup.entry_order_mtf_slope_fill_patch", "install"),
         ("core.startup.summary_ai_entry_controller_bridge_patch", "install"),
-        ("core.startup.ranking_entry_flat_price_guard_patch", "install"),
         ("core.startup.board_retry_patch", "install"),
         ("core.startup.board_missing_failopen_runtime_patch", "install"),
         ("core.startup.tonosama_5sec_stopped_relax_patch", "install"),
