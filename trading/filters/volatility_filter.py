@@ -40,6 +40,7 @@ import datetime as dt
 import glob
 import logging
 import os
+import sys
 import sqlite3
 from typing import Any
 
@@ -873,6 +874,15 @@ def _range_5m_filter_from_entry_row(entry_row: Any, min_pct: float = DEFAULT_RAN
     5m値幅が確認できない場合は止める。
     ただしランキング由来でranking_snapshotの新鮮な変動率が十分なら起動直後のみ救済する。
     """
+    # 旧 core/startup/summary_ai_low_move_softpass_patch V3.5 から移設。
+    # SUMMARY_AI の1分即時候補で entry_row 自体のレンジが十分かつ
+    # ranking snapshot の実変動も十分なら、5m代替レンジによる二重ブロックを避ける。
+    # ガード自体は緩和しない (両方満たす場合だけ通す)。
+    from trading.filters import summary_ai_range_bridge as _range_bridge
+
+    if _range_bridge.allow_by_1m_range_bridge(sys.modules[__name__], entry_row):
+        return True
+
     entry_row = _range5m_repair_summary_ai_row(entry_row)
     if min_pct == DEFAULT_RANGE_5M_MIN_PCT and _looks_ranking_entry(entry_row):
         min_pct = _env_float("RANKING_ENTRY_RANGE_5M_MIN_PCT", 0.006)
