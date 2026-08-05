@@ -20,6 +20,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import sys
 import time
 from typing import Any
 
@@ -62,6 +63,7 @@ from .time_guard import is_market_time
 from .volume_surge import build_scalping_feature_df
 from .five_sec_features import build_5sec_features
 from .scoring import prepare_entry_scores, calc_final_score_safe
+from . import fast_score_prefilter as _fast_score
 from .ai_gate import ai_check_tonosama_entry
 from .pending_writer import (
     has_tonosama_pending,
@@ -423,12 +425,54 @@ def build_feature_df_with_5sec() -> pd.DataFrame:
     if x.empty:
         logger.info("[TONOSAMA ENTRY] no candidates after primary filters base_rows=%s primary_rows=%s diag=%s elapsed=%.3fs", base_rows, primary_rows, _LAST_FILTER_DIAG, time.perf_counter() - started)
         return pd.DataFrame()
+    # 旧 core/startup/tonosama_fast_score_prefilter_patch V5.2 から移設。
+    # 5秒足の特徴量を作る前にスコアで足切りし、zero-surge 銘柄は救済する。
+    _fsp_on = _fast_score.prefilter_enabled()
+    _fsp_th = _fast_score.score_threshold(sys.modules[__name__]) if _fsp_on else 0.0
+    if _fsp_on:
+        x = _fast_score.zero_surge_score_rescue(x, threshold=_fsp_th)
+
     try:
         x = prepare_entry_scores(x)
+        if _fsp_on:
+            x = _fast_score.zero_surge_score_rescue(x, threshold=_fsp_th)
         if "_tonosama_score" in x.columns:
             x = x.sort_values("_tonosama_score", ascending=False)
     except Exception:
         logger.warning("[TONOSAMA ENTRY] pre 5sec prepare_entry_scores failed", exc_info=True)
+
+    if _fsp_on and "_tonosama_score" in x.columns:
+        _fsp_sample_cols = [
+            "symbol", "symbolname", "close", "_latest_volume",
+            "_body_change_pct", "_signed_body_change_pct", "_intrabar_range_pct",
+            "_close_position_pct", "_upper_wick_pct", "_lower_wick_pct",
+            "_max_volume_surge_ratio", "_max_price_change_pct", "_slope",
+            "_tonosama_score", "score", "final_score", "score_mtf", "mtf", "_volume_surge_failopen",
+        ]
+        before = x.copy()
+        x = x[pd.to_numeric(x["_tonosama_score"], errors="coerce").fillna(0.0) >= _fsp_th]
+        try:
+            _log_filter_step(
+                stage="pre_5sec_score",
+                before=before,
+                after=x,
+                reason="tonosama_score_below_min_final_pre_5sec",
+                threshold={"MIN_FINAL_SCORE": MIN_FINAL_SCORE, "effective_threshold": _fsp_th},
+                sample_cols=_fsp_sample_cols,
+            )
+        except Exception:
+            logger.warning(
+                "[TONOSAMA FAST SCORE PREFILTER] pre_5sec before=%s after=%s threshold=%.3f",
+                len(before), len(x), _fsp_th,
+            )
+        if x.empty:
+            logger.info(
+                "[TONOSAMA ENTRY] no candidates after fast score prefilter base_rows=%s primary_rows=%s "
+                "threshold=%.3f elapsed=%.3fs",
+                base_rows, primary_rows, _fsp_th, time.perf_counter() - started,
+            )
+            return pd.DataFrame()
+
     max_5sec = int(MAX_5SEC_FEATURE_SYMBOLS or 0)
     if max_5sec <= 0:
         max_5sec = int(MAX_CANDIDATES or 80)
@@ -458,6 +502,8 @@ def build_feature_df_with_5sec() -> pd.DataFrame:
         if c in x.columns:
             x[c] = pd.to_numeric(x[c], errors="coerce")
     x = prepare_entry_scores(x)
+    if _fsp_on:
+        x = _fast_score.zero_surge_score_rescue(x, threshold=_fsp_th)
     logger.info("[TONOSAMA ENTRY] feature build done base_rows=%s primary_rows=%s five_sec_rows=%s feature_missing=%s pre_5sec_head=%s post_5sec_head=%s elapsed=%.3fs", base_rows, primary_rows, len(x), feature_missing, before_head, _sample_rows(x, ["symbol", "symbolname", "close", "_latest_volume", "_body_change_pct", "_signed_body_change_pct", "_intrabar_range_pct", "_close_position_pct", "_upper_wick_pct", "_lower_wick_pct", "_max_volume_surge_ratio", "_max_price_change_pct", "_slope", "_tonosama_score", "has_5sec_bar", "price_change_5s_pct", "volume_surge_ratio_5s"], limit=12), time.perf_counter() - started)
     return x
 

@@ -293,7 +293,9 @@ BACKGROUND_MAIN_PATCHES = [
     ("core.startup.entry_controller_tonosama_ai_bridge_patch", "TONOSAMA_AI_BRIDGE", "DISABLE_TONOSAMA_AI_BRIDGE_PATCH"),
     ("core.startup.final_entry_tonosama_liquidity_patch", "FINAL_TONOSAMA_LIQUIDITY", "DISABLE_FINAL_TONOSAMA_LIQUIDITY_PATCH"),
     ("core.startup.final_entry_board_guard_signature_runtime_patch", "FINAL_BOARD_GUARD_SIGNATURE", "DISABLE_FINAL_BOARD_GUARD_SIGNATURE_PATCH"),
-    ("core.startup.tonosama_fast_score_prefilter_patch", "TONOSAMA_FAST_SCORE_PREFILTER", "DISABLE_TONOSAMA_FAST_SCORE_PREFILTER_PATCH"),
+    # tonosama_fast_score_prefilter_patch は trading/entry/tonosama/fast_score_prefilter.py
+    # へ本文化済み。残っていた中継 install (tonosama_range_from_history_patch) をここで直接行う。
+    ("core.startup.tonosama_range_from_history_patch", "TONOSAMA_RANGE_FROM_HISTORY", "DISABLE_TONOSAMA_FAST_SCORE_PREFILTER_PATCH"),
     ("core.startup.tonosama_fresh_summary_wait_fix_patch", "TONOSAMA_FRESH_SUMMARY_WAIT_FIX", "DISABLE_TONOSAMA_FRESH_SUMMARY_WAIT_FIX_PATCH"),
     ("core.startup.summary_ai_entry_hook_dataframe_truth_patch", "SUMMARY_AI_DF_TRUTH_PATCH", "DISABLE_SUMMARY_AI_DF_TRUTH_PATCH"),
     ("core.startup.summary_ai_candidate_refill_patch", "SUMMARY_AI_CANDIDATE_REFILL", "DISABLE_SUMMARY_AI_CANDIDATE_REFILL_PATCH"),

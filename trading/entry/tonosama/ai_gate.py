@@ -274,6 +274,27 @@ def _fallback_when_ai_disconnected(features: dict) -> tuple[bool, float, str]:
 
 
 def ai_check_tonosama_entry(row: pd.Series) -> tuple[bool, float, str]:
+    """殿様エントリーのAI判定。
+
+    旧 core/startup/tonosama_fast_score_prefilter_patch V5.2 が
+    この関数をラップして行っていた
+      - スコア足切りによる AI 短絡 (final_score_low_pre_ai)
+      - SELL の高値掴みブロック
+      - AI NG の soft rescue
+    を本文へ取り込んだ。
+    """
+    from . import fast_score_prefilter as _fast_score
+    from . import runner as _runner
+
+    short = _fast_score.ai_short_circuit_reason(row, _runner)
+    if short is not None:
+        return short
+
+    ok, prob, reason = _ai_check_tonosama_entry_core(row)
+    return _fast_score.post_ai_adjust(row, ok, prob, reason)
+
+
+def _ai_check_tonosama_entry_core(row: pd.Series) -> tuple[bool, float, str]:
     features = build_ai_features(row)
     for module_name, func_name in [
         ("trading.entry.tonosama_ai", "judge_tonosama_entry"),
