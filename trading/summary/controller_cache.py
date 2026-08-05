@@ -330,7 +330,138 @@ def _build_display_ready_mask(df: pd.DataFrame) -> pd.Series:
         return pd.Series(False, index=idx)
 
 
+_DUPCOL_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+
+
+def _dupcol_guard_enabled() -> bool:
+    """重複カラム一意化ガードをこのプロセスで使うか。
+
+    旧 core/startup/summary_controller_concat_duplicate_columns_patch は
+    sitecustomize の BACKGROUND_MAIN_PATCHES 経由 = main.py 専用で、
+    DB専用子プロセスでは適用されていなかった。本文化後も同じスコープを保つ。
+    SUMMARY_CONTROLLER_DUPCOL_GUARD_ENABLED=1/0 で明示的に上書きできる。
+    """
+    import os
+    import sys
+
+    try:
+        raw = os.getenv("SUMMARY_CONTROLLER_DUPCOL_GUARD_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return str(raw).strip().lower() in {"1", "true", "yes", "y", "on", "enable", "enabled"}
+        if str(os.getenv("CORE_STARTUP_FORCE_FULL_INIT_PATCHES", "")).strip().lower() in {
+            "1", "true", "yes", "y", "on", "enable", "enabled",
+        }:
+            return True
+        argv_text = " ".join(str(x) for x in sys.argv).replace("\\", "/").lower()
+        return not any(name in argv_text for name in _DUPCOL_DB_PROCESS_NAMES)
+    except Exception:
+        return False
+
+
+def _dedupe_duplicate_columns(df: pd.DataFrame, *, context: str = "") -> pd.DataFrame:
+    """DataFrame.columns を一意にする。
+
+    (旧 core/startup/summary_controller_concat_duplicate_columns_patch.py から移設)
+
+    normalize_fn / MTF attach / daily MA attach の合成過程で close / close_price /
+    score / score_mtf / mtf / display_ready などが同名カラムとして重複することがあり、
+    pd.concat(axis=0) が
+      InvalidIndexError: Reindexing only valid with uniquely valued Index objects
+    で落ちる。重複時は先頭列を優先し、先頭が欠損の行だけ後続の同名列で補完する。
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+
+    try:
+        if df.columns.is_unique:
+            return df
+    except Exception:
+        return df
+
+    try:
+        out = df.copy()
+        cols = list(out.columns)
+        seen: dict[str, list[int]] = {}
+        order: list[str] = []
+
+        for i, c in enumerate(cols):
+            name = str(c)
+            if name not in seen:
+                seen[name] = []
+                order.append(name)
+            seen[name].append(i)
+
+        dup_names = [name for name, idxs in seen.items() if len(idxs) > 1]
+
+        if dup_names:
+            logger.warning(
+                "[SUMMARY CONTROLLER DUPCOL] duplicate columns detected context=%s dup_count=%s dup_names=%s cols_before=%s",
+                context, len(dup_names), dup_names[:30], len(cols),
+            )
+
+        series_list = []
+        new_cols = []
+
+        for name in order:
+            idxs = seen[name]
+            if len(idxs) == 1:
+                s = out.iloc[:, idxs[0]]
+            else:
+                block = out.iloc[:, idxs]
+                try:
+                    s = block.bfill(axis=1).iloc[:, 0]
+                except Exception:
+                    s = block.iloc[:, 0]
+            series_list.append(pd.Series(s).reset_index(drop=True))
+            new_cols.append(name)
+
+        fixed = pd.concat(series_list, axis=1, ignore_index=True)
+        fixed.columns = new_cols
+        fixed.index = out.index
+
+        if dup_names:
+            logger.warning(
+                "[SUMMARY CONTROLLER DUPCOL] duplicate columns fixed context=%s cols_after=%s rows=%s",
+                context, len(fixed.columns), len(fixed),
+            )
+
+        return fixed
+
+    except Exception:
+        logger.exception("[SUMMARY CONTROLLER DUPCOL] failed to dedupe duplicate columns context=%s", context)
+        try:
+            return df.loc[:, ~df.columns.duplicated()].copy()
+        except Exception:
+            return df
+
+
+def _attach_display_ready_with_dedupe(df: pd.DataFrame) -> pd.DataFrame:
+    """display_ready 付与の前後で columns を一意化する。
+
+    旧 summary_controller_concat_duplicate_columns_patch がこの形で
+    attach_display_ready をラップしていたので本文へ取り込んだ。
+    concat_frames からはこちらを直接呼ぶ (外側 patch を経由させない)。
+    """
+    df = _dedupe_duplicate_columns(df, context="attach_display_ready:before")
+    out = _attach_display_ready_core(df)
+    return _dedupe_duplicate_columns(out, context="attach_display_ready:after")
+
+
 def attach_display_ready(df: pd.DataFrame) -> pd.DataFrame:
+    if _dupcol_guard_enabled():
+        return _attach_display_ready_with_dedupe(df)
+    return _attach_display_ready_core(df)
+
+
+def _attach_display_ready_core(df: pd.DataFrame) -> pd.DataFrame:
     """
     display_ready 列を付与する。
     technical_ready は変更しない。
@@ -381,23 +512,46 @@ def concat_frames(
     frames: list[pd.DataFrame],
     normalize_fn: Callable[[pd.DataFrame], pd.DataFrame],
 ) -> pd.DataFrame:
-    xs = []
-    for x in frames:
-        df = normalize_fn(x)
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            df = attach_display_ready(df)
-            xs.append(df)
+    if not _dupcol_guard_enabled():
+        return _concat_frames_core(frames, normalize_fn)
+
+    # 旧 summary_controller_concat_duplicate_columns_patch から移設。
+    # 各段で columns を一意化し、InvalidIndexError を防ぐ。
+    # attach_display_ready は「この関数内で定義された版」を直接呼んでいたため、
+    # 後から attach_display_ready をラップする patch (summary_controller_ready_mtf 等)
+    # の効果はここには入らない。その関係を保つため
+    # _attach_display_ready_with_dedupe を直接呼ぶ。
+    xs: list[pd.DataFrame] = []
+
+    for i, x in enumerate(frames or []):
+        try:
+            df = normalize_fn(x)
+            df = _dedupe_duplicate_columns(df, context=f"concat:normalized:{i}")
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                df = _attach_display_ready_with_dedupe(df)
+                df = _dedupe_duplicate_columns(df, context=f"concat:ready:{i}")
+                xs.append(df)
+        except Exception:
+            logger.exception("[SUMMARY CONTROLLER DUPCOL] normalize/ready failed frame_index=%s", i)
 
     if not xs:
         return pd.DataFrame()
 
     try:
+        xs = [
+            _dedupe_duplicate_columns(x, context=f"concat:pre:{i}")
+            for i, x in enumerate(xs)
+            if isinstance(x, pd.DataFrame) and not x.empty
+        ]
         out = pd.concat(xs, axis=0, ignore_index=True, sort=False)
+        out = _dedupe_duplicate_columns(out, context="concat:post_concat")
         out = normalize_fn(out)
-        out = attach_display_ready(out)
+        out = _dedupe_duplicate_columns(out, context="concat:post_normalize")
+        out = _attach_display_ready_with_dedupe(out)
+        out = _dedupe_duplicate_columns(out, context="concat:final")
         return out
     except Exception:
-        logger.exception("[summary_controller] concat frames failed")
+        logger.exception("[SUMMARY CONTROLLER DUPCOL] concat frames failed even after dupcol guard")
         return pd.DataFrame()
 
 
@@ -1091,3 +1245,31 @@ __all__ = [
     "choose_merged_cache_payload",
     "should_overwrite_merged_summary",
 ]
+
+def _concat_frames_core(
+    frames: list[pd.DataFrame],
+    normalize_fn: Callable[[pd.DataFrame], pd.DataFrame],
+) -> pd.DataFrame:
+    """重複カラムガードを使わない従来実装。
+
+    旧 summary_controller_concat_duplicate_columns_patch が install されない
+    プロセス (DB専用子プロセス) ではこちらが使われていた。
+    """
+    xs = []
+    for x in frames:
+        df = normalize_fn(x)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            df = attach_display_ready(df)
+            xs.append(df)
+
+    if not xs:
+        return pd.DataFrame()
+
+    try:
+        out = pd.concat(xs, axis=0, ignore_index=True, sort=False)
+        out = normalize_fn(out)
+        out = attach_display_ready(out)
+        return out
+    except Exception:
+        logger.exception("[summary_controller] concat frames failed")
+        return pd.DataFrame()
