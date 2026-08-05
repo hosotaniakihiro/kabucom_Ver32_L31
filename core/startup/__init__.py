@@ -713,9 +713,12 @@ def _install_entry_runtime_init_patches() -> None:
     # _exit_board_runtime_enabled() が担う。
 
     try:
-        from .summary_existing_null_repair_patch import install as install_summary_existing_null_repair_patch
+        # 旧 core/startup/summary_existing_null_repair_patch.py。
+        # monkeypatch ではない補修ユーティリティなので
+        # trading/summary/existing_null_repair.py へ移設した。
+        from trading.summary.existing_null_repair import install as install_summary_existing_null_repair
 
-        install_summary_existing_null_repair_patch()
+        install_summary_existing_null_repair()
     except Exception:
         logger.exception("[core.startup] summary existing null repair patch install failed")
 

@@ -1,10 +1,23 @@
 # ============================================================
-# File   : core/startup/summary_existing_null_repair_patch.py
+# File   : trading/summary/existing_null_repair.py
 # Version: V1.1-SKIP-HEAVY-IN-MAIN-PROCESS
 # ------------------------------------------------------------
 # 目的:
 #   既に summaryYYYYMMDD.db に入っている stock_summary_1min/3min/5min の
 #   NULL項目を再計算・補修する。
+#
+# 旧 core/startup/summary_existing_null_repair_patch.py から移設。
+# monkeypatch ではなく独立した補修ユーティリティなので core/startup ではなく
+# ここに置く。import 時に install() が走り、対象プロセスなら BG スレッドで
+# 起動時補修を行う (呼び出しは core/startup/__init__.py から)。
+#
+# 注意:
+#   install() は main プロセスでは自分でスキップし、
+#   core/startup/__init__.py の呼び出し自体も DB専用子プロセス
+#   (main_database.py 等) ではスキップされる。そのため既定構成では
+#   起動時の重い補修はどのプロセスでも走らない。
+#   走らせたい場合は SUMMARY_EXISTING_NULL_REPAIR_RUN_IN_MAIN=1 を指定するか、
+#   run_repair() を明示的に呼ぶこと。
 #
 # V1.1:
 #   - main.py 側では起動時の重い全DB NULL補修を既定でスキップ
