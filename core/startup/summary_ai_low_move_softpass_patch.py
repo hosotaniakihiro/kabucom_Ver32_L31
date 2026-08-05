@@ -310,14 +310,10 @@ def _install_summary_ai_executor_rolling_retry() -> bool:
 
 
 def _install_blowoff_prefilter() -> bool:
-    try:
-        from core.startup.summary_ai_blowoff_prefilter_patch import install as _install
-        ok = bool(_install())
-        logger.warning("[LOW MOVE GUARD] chained SUMMARY_AI blowoff prefilter installed=%s version=%s", ok, VERSION)
-        return ok
-    except Exception:
-        logger.exception("[LOW MOVE GUARD] chained SUMMARY_AI blowoff prefilter install failed")
-        return False
+    # summary_ai_blowoff_prefilter_patch は
+    # trading/summary/pipeline/blowoff_prefilter.py へ本文化済みで、
+    # entry_pipeline._filter_blowoff が常に呼ぶため install 不要になった。
+    return True
 
 
 def _set_timeout_defaults() -> None:

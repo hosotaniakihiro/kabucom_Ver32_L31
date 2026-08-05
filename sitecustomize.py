@@ -271,7 +271,6 @@ os.environ["SUMMARY_AI_VOL_RESCUE_MIN_ABS_SLOPE"] = os.getenv(
 SYNC_MAIN_PATCHES = [
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
     ("core.startup.summary_ai_volatility_rescue_patch", "SUMMARY_AI_VOLATILITY_RESCUE", "DISABLE_ENTRY_CONTROLLER_SOURCE_PREFILTER_PATCH"),
-    ("core.startup.summary_ai_blowoff_prefilter_patch", "SUMMARY_AI_BLOWOFF_PREFILTER", "DISABLE_SUMMARY_AI_BLOWOFF_PREFILTER_PATCH"),
     ("core.startup.summary_ai_runtime_consistency_patch", "SUMMARY_AI_RUNTIME_CONSISTENCY", "DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH"),
     ("core.startup.summary_main_push_db_refresh_patch", "SUMMARY_MAIN_PUSH_DB_REFRESH", "DISABLE_SUMMARY_MAIN_PUSH_DB_REFRESH_PATCH"),
     ("core.startup.summary_main_direct_push_force_patch", "SUMMARY_FORCE_DIRECT_1M_SYNC", "DISABLE_SUMMARY_FORCE_DIRECT_1M_PATCH"),

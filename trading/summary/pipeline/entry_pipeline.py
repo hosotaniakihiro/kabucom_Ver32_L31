@@ -25,6 +25,7 @@ from global_state import global_data
 
 from trading.summary.summary_entry import run_summary_entry_executor
 from trading.ai.blowoff_top_detector import detect_blowoff_top
+from trading.summary.pipeline import blowoff_prefilter as _blowoff_prefilter
 from trading.ai.liquidity_shock_detector import allow_liquidity_entry
 from AI.sell_credit_guard import can_sell_symbol
 
@@ -465,6 +466,20 @@ def _allow_summary_ai_blowoff_rescue(row: dict, *, symbol: str) -> bool:
 
 
 def _filter_blowoff(rows: List[Any], df_summary: pd.DataFrame | None) -> List[Any]:
+    """blowoff (吹き上げ天井) 候補を除外する。
+
+    旧 core/startup/summary_ai_blowoff_prefilter_patch V10 がこの関数を
+    「RSI過熱 + 値幅 + 高値圏 + 方向」の複合条件で判定する厳格版へ
+    差し替えていたので、その実装を trading/summary/pipeline/blowoff_prefilter.py
+    へ移設し、有効時はそちらを使う。
+    無効時 (DB専用子プロセス等) は従来の symbol 一致 + rescue 版を使う。
+    """
+    if _blowoff_prefilter.blowoff_prefilter_enabled():
+        return _blowoff_prefilter.filter_blowoff_strict(rows, df_summary)
+    return _filter_blowoff_legacy(rows, df_summary)
+
+
+def _filter_blowoff_legacy(rows: List[Any], df_summary: pd.DataFrame | None) -> List[Any]:
     try:
         if df_summary is None or not isinstance(df_summary, pd.DataFrame) or df_summary.empty:
             return rows

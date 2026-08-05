@@ -394,28 +394,10 @@ def _patch_executor_selection() -> bool:
 
 
 def _install_blowoff_prefilter() -> bool:
-    if not _env_bool("SUMMARY_AI_EXECUTOR_BLOWOFF_PREFILTER", True):
-        return False
-    try:
-        import trading.entry.summary_ai.executor as ex
-        cur = getattr(ex, "execute_ai_ok_entries_bulk", None)
-        if callable(cur) and _chain_has_marker(cur, _BLOWOFF_MARKERS):
-            return False
-
-        from core.startup import summary_ai_blowoff_prefilter_patch as bp
-        fn = getattr(bp, "install", None)
-        if not callable(fn):
-            return False
-        try:
-            ok = bool(fn(reason="runtime_consistency"))
-        except TypeError:
-            ok = bool(fn())
-        if ok:
-            logger.warning("[SUMMARY AI RUNTIME CONSISTENCY] blowoff prefilter installed via=%s version=%s", getattr(bp, "VERSION", "unknown"), VERSION)
-        return bool(ok)
-    except Exception:
-        logger.debug("[SUMMARY AI RUNTIME CONSISTENCY] blowoff prefilter install not ready", exc_info=True)
-        return False
+    # summary_ai_blowoff_prefilter_patch は
+    # trading/summary/pipeline/blowoff_prefilter.py へ本文化済みで、
+    # entry_pipeline._filter_blowoff が常に呼ぶため install 不要になった。
+    return bool(_env_bool("SUMMARY_AI_EXECUTOR_BLOWOFF_PREFILTER", True))
 
 
 def _install_fast_order_builder() -> bool:
