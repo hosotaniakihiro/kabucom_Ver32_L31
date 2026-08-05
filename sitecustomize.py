@@ -259,9 +259,18 @@ DB_SYNC_PATCHES = [
 # trading/ranking/ranking_technical_store.py の attach_ranking_technicals
 # (_copy_snapshot_technical_aliases) へ本文化済みのため削除した。
 
+# entry_controller_source_prefilter_patch は本文化済みで空スタブになっており、
+# 実体は「この env を先に確定させてから summary_ai_volatility_rescue_patch を
+# install する」だけの中継だった。rescue 側は setdefault で読むため、
+# import より前にここで確定させる必要がある。
+os.environ["SUMMARY_AI_VOL_RESCUE_MIN_ABS_SLOPE"] = os.getenv(
+    "SUMMARY_AI_VOL_RESCUE_MIN_ABS_SLOPE_OPERATOR",
+    "0.0002",
+)
+
 SYNC_MAIN_PATCHES = [
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
-    ("core.startup.entry_controller_source_prefilter_patch", "ENTRY_CONTROLLER_SOURCE_PREFILTER", "DISABLE_ENTRY_CONTROLLER_SOURCE_PREFILTER_PATCH"),
+    ("core.startup.summary_ai_volatility_rescue_patch", "SUMMARY_AI_VOLATILITY_RESCUE", "DISABLE_ENTRY_CONTROLLER_SOURCE_PREFILTER_PATCH"),
     ("core.startup.summary_ai_blowoff_prefilter_patch", "SUMMARY_AI_BLOWOFF_PREFILTER", "DISABLE_SUMMARY_AI_BLOWOFF_PREFILTER_PATCH"),
     ("core.startup.summary_ai_runtime_consistency_patch", "SUMMARY_AI_RUNTIME_CONSISTENCY", "DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH"),
     ("core.startup.summary_main_push_db_refresh_patch", "SUMMARY_MAIN_PUSH_DB_REFRESH", "DISABLE_SUMMARY_MAIN_PUSH_DB_REFRESH_PATCH"),

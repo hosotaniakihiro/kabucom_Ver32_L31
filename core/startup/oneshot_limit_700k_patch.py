@@ -317,14 +317,21 @@ def _install_summary_parallel_intervals_patch() -> bool:
 
 
 def _install_entry_pipeline_bucket_filter_patch() -> bool:
+    # entry_controller_pipeline_bucket_filter_patch は本文化済みで空スタブになっており、
+    # 実体は env 既定値の設定 + summary_ai_atr_failopen_patch の install だけの
+    # 中継だったため、その中身をここへ移して直接呼ぶ。
     try:
         os.environ.setdefault("ENTRY_PIPELINE_BUCKET_PREFILTER", "1")
-        from core.startup import entry_controller_pipeline_bucket_filter_patch as p
+        os.environ.setdefault("SUMMARY_AI_ATR_FAILOPEN_ENABLED", "1")
+        os.environ.setdefault("SUMMARY_AI_ATR_FAILOPEN_MIN_VOLUME", "30000")
+        os.environ.setdefault("SUMMARY_AI_ATR_FAILOPEN_MIN_TURNOVER", "10000000")
+        os.environ.setdefault("SUMMARY_AI_ATR_FAILOPEN_MIN_PRICE", "1500")
+        from core.startup import summary_ai_atr_failopen_patch as p
         ok = p.install()
-        logger.warning("[ONESHOT LIMIT PATCH] entry_pipeline_bucket_filter_patch installed=%s", ok)
+        logger.warning("[ONESHOT LIMIT PATCH] summary_ai_atr_failopen_patch installed=%s", ok)
         return bool(ok)
     except Exception:
-        logger.exception("[ONESHOT LIMIT PATCH] entry_pipeline_bucket_filter_patch install failed")
+        logger.exception("[ONESHOT LIMIT PATCH] summary_ai_atr_failopen_patch install failed")
         return False
 
 
