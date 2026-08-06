@@ -8,11 +8,19 @@ REM ------------------------------------------------------------
 REM 夜間Yahoo日足 + 1m/3m/5m summary バッチを実行し、ログをファイル保存する。
 REM ============================================================
 
-REM 2026-08-06: 旧パス F:\Users\hosot\PycharmProjects\kabucom_Ver32_L31 は存在せず
-REM バッチが起動できない状態だったため、現行のリポジトリ配置に修正。
-set PROJECT_ROOT=W:\BUSINESS\事業\04_株式自動売買システム\ソースコード
-
-cd /d "%PROJECT_ROOT%"
+REM 2026-08-06: old path F:\Users\hosot\PycharmProjects\kabucom_Ver32_L31 does
+REM             not exist, so this bat could not start at all. Fixed to use
+REM             the current repository layout.
+REM NOTE: keep lines in this file ASCII-only, and never write the repository
+REM       path literally. This file is UTF-8 but cmd.exe reads it as CP932,
+REM       so Japanese bytes break line parsing and a literal Japanese path
+REM       makes "cd" fail with
+REM       "The filename, directory name, or volume label syntax is incorrect".
+REM       This bat lives in
+REM         <root>\TaskSchedule\SubScript\run_night_yahoo_full_summary\
+REM       so the repository root is three levels up.
+cd /d "%~dp0..\..\.."
+set "PROJECT_ROOT=%CD%"
 
 if not exist logs mkdir logs
 
@@ -24,12 +32,13 @@ echo START %date% %time%>> "%LOG_FILE%"
 echo ============================================================>> "%LOG_FILE%"
 
 REM ---- Daily DB build/update options ----
-REM 特定日までのDBを作りたい場合だけ END_DATE を指定する。
-REM 2026-08-06: 2026-06-24 が固定されたままだったため解除。
-REM             指定しなければ最新営業日まで更新される。
+REM Set END_DATE only when you want to build the DB up to a specific date.
+REM 2026-08-06: 2026-06-24 was left pinned here, so the batch could never
+REM             produce current data. Unset it; without END_DATE the batch
+REM             updates up to the latest market date.
 REM set NIGHT_YAHOO_DAILY_END_DATE=2026-06-24
-REM FORCE_FULL=1 は 5.1GB のDBを毎回作り直すため既定の差分更新(0)に戻す。
-REM 全銘柄を作り直したいときだけ 1 にする。
+REM FORCE_FULL=1 rebuilds the whole 5.1GB DB every run. Back to the
+REM default incremental update (0). Set 1 only for a full rebuild.
 set NIGHT_YAHOO_DAILY_FORCE_FULL=0
 set NIGHT_YAHOO_DIRECT_ONLY=1
 set NIGHT_YAHOO_DIRECT_TIMEOUT=10
@@ -37,22 +46,24 @@ set NIGHT_YAHOO_DAILY_SYMBOL_TIMEOUT_SEC=30
 set NIGHT_YAHOO_DAILY_FULLCOL_REPAIR=1
 
 REM ---- Minute (summary) catch-up options ----
-REM 2026-08-06: summary DB の格納状況を見て、欠損している日から
-REM             最新営業日までの分足をまとめて取り直すようにした。
-REM   - 未指定なら自動判定 (格納量が基準の50%未満の日を未完了とみなす)
-REM   - Yahoo の 1m は約30日前までしか取得できないため、それ以前は対象外
-REM   - 1リクエスト最大8日のため7日窓に分割して取得する
-REM 判定のしきい値を変えたい場合:
+REM 2026-08-06: the batch now looks at what is already stored in the summary
+REM             DBs and re-fetches minute bars from the oldest incomplete day
+REM             up to the latest market date.
+REM   - auto-detect by default (a day whose stored volume is below 50 percent
+REM     of the reference is treated as incomplete)
+REM   - Yahoo serves 1m data for about 30 days only; older days are skipped
+REM   - one request covers at most 8 days, so it is split into 7-day windows
+REM To change the threshold:
 REM set NIGHT_YAHOO_CATCHUP_MIN_RATIO=0.5
-REM 特定日から取り直したい場合:
+REM To re-fetch from a specific date:
 REM set NIGHT_YAHOO_START_DATE=2026-08-05
-REM 従来どおり最新営業日1日だけにしたい場合:
+REM To keep the old behaviour (latest market date only):
 REM set NIGHT_YAHOO_DISABLE_CATCHUP=1
 
-REM summaryまで実行したくない場合は 1 にする。
+REM Set 1 to skip the summary stage.
 REM set NIGHT_YAHOO_SKIP_SUMMARY=1
 
-REM 稼働中プロセスと同じ .venv を使う (旧: WindowsApps\python3.11.exe)
+REM Use the same .venv as the running processes (was: WindowsApps python3.11)
 "%PROJECT_ROOT%\.venv\Scripts\python.exe" ^
 "%PROJECT_ROOT%\TaskSchedule\SubScript\run_night_yahoo_full_summary\main.py" ^
 >> "%LOG_FILE%" 2>&1
