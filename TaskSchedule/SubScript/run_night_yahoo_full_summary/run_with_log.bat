@@ -24,10 +24,13 @@ echo START %date% %time%>> "%LOG_FILE%"
 echo ============================================================>> "%LOG_FILE%"
 
 REM ---- Daily DB build/update options ----
-REM 前日までのDBを作る場合はEND_DATEを指定する。
-REM 必要に応じてここを書き換える。
-set NIGHT_YAHOO_DAILY_FORCE_FULL=1
-set NIGHT_YAHOO_DAILY_END_DATE=2026-06-24
+REM 特定日までのDBを作りたい場合だけ END_DATE を指定する。
+REM 2026-08-06: 2026-06-24 が固定されたままだったため解除。
+REM             指定しなければ最新営業日まで更新される。
+REM set NIGHT_YAHOO_DAILY_END_DATE=2026-06-24
+REM FORCE_FULL=1 は 5.1GB のDBを毎回作り直すため既定の差分更新(0)に戻す。
+REM 全銘柄を作り直したいときだけ 1 にする。
+set NIGHT_YAHOO_DAILY_FORCE_FULL=0
 set NIGHT_YAHOO_DIRECT_ONLY=1
 set NIGHT_YAHOO_DIRECT_TIMEOUT=10
 set NIGHT_YAHOO_DAILY_SYMBOL_TIMEOUT_SEC=30
