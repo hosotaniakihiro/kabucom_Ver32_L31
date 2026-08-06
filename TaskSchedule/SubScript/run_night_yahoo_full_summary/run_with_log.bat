@@ -36,6 +36,19 @@ set NIGHT_YAHOO_DIRECT_TIMEOUT=10
 set NIGHT_YAHOO_DAILY_SYMBOL_TIMEOUT_SEC=30
 set NIGHT_YAHOO_DAILY_FULLCOL_REPAIR=1
 
+REM ---- Minute (summary) catch-up options ----
+REM 2026-08-06: summary DB の格納状況を見て、欠損している日から
+REM             最新営業日までの分足をまとめて取り直すようにした。
+REM   - 未指定なら自動判定 (格納量が基準の50%未満の日を未完了とみなす)
+REM   - Yahoo の 1m は約30日前までしか取得できないため、それ以前は対象外
+REM   - 1リクエスト最大8日のため7日窓に分割して取得する
+REM 判定のしきい値を変えたい場合:
+REM set NIGHT_YAHOO_CATCHUP_MIN_RATIO=0.5
+REM 特定日から取り直したい場合:
+REM set NIGHT_YAHOO_START_DATE=2026-08-05
+REM 従来どおり最新営業日1日だけにしたい場合:
+REM set NIGHT_YAHOO_DISABLE_CATCHUP=1
+
 REM summaryまで実行したくない場合は 1 にする。
 REM set NIGHT_YAHOO_SKIP_SUMMARY=1
 
