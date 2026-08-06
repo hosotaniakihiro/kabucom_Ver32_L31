@@ -33,7 +33,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -45,6 +45,11 @@ from data_collectors.config import HEARTBEAT_INTERVAL_SEC, RESTART_DELAY_SEC
 from data_collectors.logging_setup import setup_logging
 
 _STOP = False
+
+# 子プロセスの起動自体に失敗し続ける場合の再試行間隔の上限。
+# NAS が一時的に見えなくなっても、復帰したら自動で立ち上がるようにする。
+RESTART_MAX_DELAY_SEC = 60.0
+
 _TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 _FALSE = {"0", "false", "no", "n", "off", "disable", "disabled"}
 _CAPTURE_THREADS: list[threading.Thread] = []
@@ -370,6 +375,25 @@ def _start_child(logger: logging.Logger, name: str, path: Path) -> subprocess.Po
     return proc
 
 
+def _start_child_safe(logger: logging.Logger, name: str, path: Path) -> Optional[subprocess.Popen]:
+    """_start_child の失敗を監視ループの外へ伝播させない版。
+
+    ソースコードも .venv も NAS 上にあるため、一過性のSMB障害で
+    _check_file / Popen が例外になることがある
+    (実例 2026-08-06 12:44:56: ranking_collector の起動中に例外 ->
+     監視ループを抜けて finally に入り、全プロセスが停止した)。
+
+    1つの子の起動失敗でシステム全体を落とさないよう、ここで受け止めて
+    None を返す。呼び出し側が間隔を空けて再試行する。
+    """
+    try:
+        return _start_child(logger, name, path)
+    except Exception:
+        logger.exception("[DATA COLLECTORS] child start failed name=%s path=%s -> retry later", name, path)
+        _safe_heartbeat(f"collector_{name}", status="START_FAILED", detail={"path": str(path)})
+        return None
+
+
 def _terminate_child(logger: logging.Logger, name: str, proc: subprocess.Popen) -> None:
     if proc.poll() is not None:
         _safe_mark_stop(f"collector_{name}", {"pid": proc.pid, "returncode": proc.poll(), "already_stopped": True})
@@ -407,7 +431,22 @@ def main() -> int:
 
     _run_db_prepare(logger)
     _start_summary_null_repair(logger)
-    procs: Dict[str, subprocess.Popen] = {}
+    procs: Dict[str, Optional[subprocess.Popen]] = {}
+    # 起動に失敗した子の次回再試行時刻。起動できるまで監視ループ内で粘る。
+    retry_at: Dict[str, float] = {}
+    fail_counts: Dict[str, int] = {}
+
+    def _schedule_retry(name: str) -> None:
+        n = fail_counts.get(name, 0) + 1
+        fail_counts[name] = n
+        # 連続失敗が続く間は間隔を伸ばす (最大 RESTART_MAX_DELAY_SEC)。
+        delay = min(RESTART_DELAY_SEC * (2 ** min(n - 1, 5)), RESTART_MAX_DELAY_SEC)
+        retry_at[name] = time.time() + delay
+        logger.warning(
+            "[DATA COLLECTORS] child start retry scheduled name=%s consecutive_failures=%s next_in=%.1fs",
+            name, n, delay,
+        )
+
     try:
         for name, path in specs.items():
             if name == "ranking_collector":
@@ -418,12 +457,32 @@ def main() -> int:
                         delay_sec,
                     )
                     time.sleep(delay_sec)
-            procs[name] = _start_child(logger, name, path)
+            proc = _start_child_safe(logger, name, path)
+            procs[name] = proc
+            if proc is None:
+                _schedule_retry(name)
+            else:
+                fail_counts[name] = 0
             time.sleep(1.0)
+
         last_hb = 0.0
         while not _STOP:
             now = time.time()
             for name, proc in list(procs.items()):
+                if proc is None:
+                    # 起動できていない子。再試行時刻になったら立ち上げ直す。
+                    if _STOP or now < retry_at.get(name, 0.0):
+                        continue
+                    new_proc = _start_child_safe(logger, name, specs[name])
+                    procs[name] = new_proc
+                    if new_proc is None:
+                        _schedule_retry(name)
+                    else:
+                        fail_counts[name] = 0
+                        retry_at.pop(name, None)
+                        logger.warning("[DATA COLLECTORS] child recovered name=%s pid=%s", name, new_proc.pid)
+                    continue
+
                 rc = proc.poll()
                 if rc is None:
                     continue
@@ -433,18 +492,36 @@ def main() -> int:
                 if _STOP:
                     continue
                 time.sleep(RESTART_DELAY_SEC)
-                procs[name] = _start_child(logger, name, specs[name])
+                new_proc = _start_child_safe(logger, name, specs[name])
+                procs[name] = new_proc
+                if new_proc is None:
+                    _schedule_retry(name)
+                else:
+                    fail_counts[name] = 0
+
             if now - last_hb >= HEARTBEAT_INTERVAL_SEC:
                 last_hb = now
                 _safe_heartbeat(
                     "data_collectors_runner",
                     status="RUNNING",
-                    detail={"children": {name: {"pid": proc.pid, "returncode": proc.poll()} for name, proc in procs.items()}},
+                    detail={
+                        "children": {
+                            name: (
+                                {"pid": p.pid, "returncode": p.poll()}
+                                if p is not None
+                                else {"pid": None, "returncode": None, "state": "start_failed",
+                                      "consecutive_failures": fail_counts.get(name, 0)}
+                            )
+                            for name, p in procs.items()
+                        }
+                    },
                 )
             time.sleep(1.0)
     finally:
         logger.warning("[DATA COLLECTORS] stopping children")
         for name, proc in list(procs.items()):
+            if proc is None:
+                continue
             try:
                 _terminate_child(logger, name, proc)
             except Exception:
