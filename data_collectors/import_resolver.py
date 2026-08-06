@@ -17,13 +17,22 @@ logger = logging.getLogger(__name__)
 Candidate = Tuple[str, str]
 
 
-def resolve_callable(candidates: Sequence[Candidate], *, required: bool = False) -> Optional[Callable]:
+def resolve_callable(
+    candidates: Sequence[Candidate],
+    *,
+    required: bool = False,
+    warn_if_missing: bool = True,
+) -> Optional[Callable]:
     """
     candidates:
         [
           ("module.path", "function_name"),
           ...
         ]
+
+    warn_if_missing:
+        False にすると「見つからないのが正常」なケースで WARNING を出さない。
+        (呼び出し側が既定値で動作することを把握している場合に使う)
     """
     errors: list[str] = []
 
@@ -38,7 +47,12 @@ def resolve_callable(candidates: Sequence[Candidate], *, required: bool = False)
         except Exception as e:
             errors.append(f"{module_name}.{attr_name}: {type(e).__name__}: {e}")
 
-    logger.warning("[IMPORT RESOLVER] no callable resolved. candidates=%s errors=%s", candidates, errors)
+    logger.log(
+        logging.WARNING if (required or warn_if_missing) else logging.INFO,
+        "[IMPORT RESOLVER] no callable resolved. candidates=%s errors=%s",
+        candidates,
+        errors,
+    )
 
     if required:
         raise ImportError("no callable resolved: " + " | ".join(errors))

@@ -51,6 +51,14 @@ PUSH_START_CANDIDATES = [
     ("trading.push.push_stream.core", "start_push_stream"),
 ]
 
+# ローテーション時間の外部設定用フック。
+# 現行の trading/push/push_stream/rotation.py は rotation_core / rotation_settings への
+# 互換ラッパーであり、これらの関数は存在しない (=常に未解決になる)。
+# ローテーション値は rotation_settings.py 側が環境変数既定値として保持しており
+#   PUSH_ROTATION_HOLD_SEC=4.8 / PUSH_ROTATION_UNREGISTER_WAIT_SEC=0.2
+# は data_collectors/config.py の PUSH_REGISTER_SEC / PUSH_SWITCH_GAP_SEC と一致する。
+# したがって未解決でも挙動は仕様どおり。将来 rotation 側に設定関数が追加された
+# 場合に自動的に使われるよう、候補リスト自体は残す。
 ROTATION_CONFIG_CANDIDATES = [
     ("trading.push.push_stream.rotation", "set_rotation_timing"),
     ("trading.push.push_stream.rotation", "configure_rotation"),
@@ -295,11 +303,16 @@ def schedule_symbol_seed_refresh() -> None:
 
 
 def configure_push_rotation_if_supported() -> None:
-    fn = resolve_callable(ROTATION_CONFIG_CANDIDATES, required=False)
+    fn = resolve_callable(ROTATION_CONFIG_CANDIDATES, required=False, warn_if_missing=False)
     if fn is None:
         logger.info(
-            "[PUSH RUNTIME] rotation config function not found; "
-            "use existing rotation_settings defaults/env."
+            "[PUSH RUNTIME] rotation config function not found (想定内); "
+            "rotation_settings.py の既定値/環境変数をそのまま使用する "
+            "(register=%.2fs switch_gap=%.2fs batch=%s total=%s)",
+            PUSH_REGISTER_SEC,
+            PUSH_SWITCH_GAP_SEC,
+            PUSH_BATCH_SIZE,
+            PUSH_TARGET_TOTAL,
         )
         return
 

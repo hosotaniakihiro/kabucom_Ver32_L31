@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+import time
 from typing import Dict
 
 import numpy as np
@@ -80,8 +81,158 @@ def _safe_num(s: pd.Series, default: float = 0.0) -> pd.Series:
 
 def _read_table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
     cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info({table_name})")
+    cur.execute(f'PRAGMA table_info("{table_name}")')
     return {str(row[1]) for row in cur.fetchall()}
+
+
+# ------------------------------------------------------------
+# SQLite 接続まわり
+#
+# stock_analysis.db は NAS 上にあり、夜間バッチ
+# (scripts/night_yahoo_daily_*) が PRAGMA journal_mode=WAL で書き込む。
+# ここは純粋な読み取りなので、
+#   - read-only (mode=ro) で開く      : 書き込みロックを取らない / hot journal 復旧を試みない
+#   - 明示的に close する             : `with sqlite3.connect(...)` は close しないため接続が残る
+#   - busy_timeout + 短い retry       : 一時的な locked は待って読み直す
+# という方針にする。trading/daily/daily_signal_loader.py と同じ read-only 方式。
+# ------------------------------------------------------------
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(str(v).strip()))
+    except Exception:
+        return int(default)
+
+
+def _is_locked_error(exc: BaseException) -> bool:
+    msg = str(exc or "").lower()
+    return ("database is locked" in msg) or ("database table is locked" in msg) or ("database is busy" in msg)
+
+
+def _connect_readonly(db_path: str) -> sqlite3.Connection:
+    """読み取り専用で開く。呼び出し側が必ず close すること。"""
+    timeout_sec = max(0.5, _env_float("DAILY_MTF_SQLITE_TIMEOUT_SEC", 5.0))
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=timeout_sec)
+    try:
+        busy_ms = max(0, _env_int("DAILY_MTF_SQLITE_BUSY_TIMEOUT_MS", int(timeout_sec * 1000)))
+        conn.execute(f"PRAGMA busy_timeout={busy_ms}")
+    except Exception:
+        logger.debug("[DAILY MTF LOADER] busy_timeout set failed", exc_info=True)
+    return conn
+
+
+# 連続失敗時に NAS へ読みに行き続けないためのクールダウン。
+# 呼び出し元 (daily_mtf_summary_patch / daily_runtime_patch) は
+# 空DFをキャッシュしない作りなので、これが無いと保存のたびに再接続してしまう。
+_LAST_FAILURE_TS: float = 0.0
+_LAST_FAILURE_REASON: str = ""
+
+
+def _failure_cooldown_active() -> bool:
+    # 呼び出し元 (daily_mtf_summary_patch) の成功時キャッシュTTLと同じ 300 秒。
+    # ロックが続く間、保存のたびに NAS へ行って数十秒止まるのを防ぐ。
+    cooldown = _env_float("DAILY_MTF_LOAD_FAILURE_COOLDOWN_SEC", 300.0)
+    if cooldown <= 0 or _LAST_FAILURE_TS <= 0:
+        return False
+    remain = cooldown - (time.monotonic() - _LAST_FAILURE_TS)
+    if remain <= 0:
+        return False
+    logger.warning(
+        "[DAILY MTF LOADER] skip read during failure cooldown remain=%.1fs last_reason=%s "
+        "(DAILY_MTF_LOAD_FAILURE_COOLDOWN_SEC=0 で無効化できます)",
+        remain,
+        _LAST_FAILURE_REASON,
+    )
+    return True
+
+
+def _mark_failure(reason: str) -> None:
+    global _LAST_FAILURE_TS, _LAST_FAILURE_REASON
+    _LAST_FAILURE_TS = time.monotonic()
+    _LAST_FAILURE_REASON = str(reason)[:200]
+
+
+def _clear_failure() -> None:
+    global _LAST_FAILURE_TS, _LAST_FAILURE_REASON
+    _LAST_FAILURE_TS = 0.0
+    _LAST_FAILURE_REASON = ""
+
+
+def _read_latest_raw(db_path: str, table_name: str) -> pd.DataFrame:
+    """read-only 接続で latest テーブルを読む。locked のときだけ短く retry する。
+
+    retry を使い切っても読めなければ例外をそのまま送出する (握り潰さない)。
+    """
+    # NAS(SMB)上でロックされている場合、busy_timeout に関係なく
+    # 1試行あたり実測で 20 秒前後ブロックする。retry を増やすと
+    # summary 保存側を長時間止めてしまうため、retry は最小限にし、
+    # 継続的なロックは下のクールダウンで受け止める。
+    retries = max(0, _env_int("DAILY_MTF_SQLITE_LOCK_RETRIES", 1))
+    sleep_base = max(0.05, _env_float("DAILY_MTF_SQLITE_LOCK_SLEEP_BASE_SEC", 0.2))
+
+    attempt = 0
+    while True:
+        conn = None
+        try:
+            conn = _connect_readonly(db_path)
+            existing_cols = _read_table_columns(conn, table_name)
+            missing = [c for c in _REQUIRED_COLUMNS if c not in existing_cols]
+            if missing:
+                logger.warning(
+                    "[DAILY MTF LOADER] required columns missing table=%s missing=%s existing=%s",
+                    table_name,
+                    missing,
+                    sorted(existing_cols),
+                )
+                return pd.DataFrame()
+
+            sql = f"""
+                SELECT
+                    stock_code,
+                    stock_name,
+                    market,
+                    date,
+                    close,
+                    MA_5,
+                    MA_25,
+                    MA_75,
+                    MA_5_Slope,
+                    MA_25_Slope,
+                    MA_75_Slope
+                FROM {table_name}
+            """
+            return pd.read_sql_query(sql, conn)
+
+        except Exception as e:
+            if not _is_locked_error(e) or attempt >= retries:
+                raise
+            attempt += 1
+            wait = sleep_base * (2 ** (attempt - 1))
+            logger.warning(
+                "[DAILY MTF LOADER] locked -> retry %s/%s in %.2fs db=%s table=%s err=%s",
+                attempt, retries, wait, db_path, table_name, e,
+            )
+            time.sleep(wait)
+
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    logger.debug("[DAILY MTF LOADER] close failed", exc_info=True)
 
 
 def load_daily_mtf_latest_df(
@@ -117,42 +268,21 @@ def load_daily_mtf_latest_df(
         logger.warning("[DAILY MTF LOADER] db not found: %s", db_path)
         return pd.DataFrame()
 
-    try:
-        with sqlite3.connect(db_path, timeout=30) as conn:
-            existing_cols = _read_table_columns(conn, table_name)
-            missing = [c for c in _REQUIRED_COLUMNS if c not in existing_cols]
-            if missing:
-                logger.warning(
-                    "[DAILY MTF LOADER] required columns missing table=%s missing=%s existing=%s",
-                    table_name,
-                    missing,
-                    sorted(existing_cols),
-                )
-                return pd.DataFrame()
+    if _failure_cooldown_active():
+        return pd.DataFrame()
 
-            sql = f"""
-                SELECT
-                    stock_code,
-                    stock_name,
-                    market,
-                    date,
-                    close,
-                    MA_5,
-                    MA_25,
-                    MA_75,
-                    MA_5_Slope,
-                    MA_25_Slope,
-                    MA_75_Slope
-                FROM {table_name}
-            """
-            df = pd.read_sql_query(sql, conn)
-    except Exception:
+    try:
+        df = _read_latest_raw(db_path, table_name)
+    except Exception as e:
+        _mark_failure(f"{type(e).__name__}: {e}")
         logger.exception(
             "[DAILY MTF LOADER] failed to read db=%s table=%s",
             db_path,
             table_name,
         )
         return pd.DataFrame()
+
+    _clear_failure()
 
     if df.empty:
         logger.warning("[DAILY MTF LOADER] empty db=%s table=%s", db_path, table_name)
