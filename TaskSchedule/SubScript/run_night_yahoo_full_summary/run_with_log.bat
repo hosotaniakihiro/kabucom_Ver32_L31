@@ -22,6 +22,12 @@ REM       so the repository root is three levels up.
 cd /d "%~dp0..\..\.."
 set "PROJECT_ROOT=%CD%"
 
+REM Log messages contain emoji (e.g. the INIT ENGINES line). With stdout
+REM redirected to a file, Python defaults to CP932 here and the logging
+REM handler raises UnicodeEncodeError for every such line. It does not stop
+REM the batch but floods the log, so force UTF-8 for stdout/stderr.
+set "PYTHONIOENCODING=utf-8"
+
 if not exist logs mkdir logs
 
 set LOG_FILE=%PROJECT_ROOT%\logs\night_yahoo_full_summary.log
