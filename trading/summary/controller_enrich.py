@@ -187,7 +187,12 @@ def _read_ranking_df_from_db(limit: int = 20000) -> pd.DataFrame:
         if not path or not Path(path).exists():
             return pd.DataFrame()
 
-        with sqlite3.connect(str(path), timeout=2.0) as conn:
+        # ranking DB は NAS 上にあり ranking_collector が毎分書き込む。
+        # ここは純粋な読み取りなので read-only で開いて書き込みロックを取らない。
+        # `with sqlite3.connect(...)` は close しないため使わず finally で閉じる。
+        conn = None
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
             conn.execute("PRAGMA busy_timeout=2000;")
             table = "ranking_snapshot_1min"
             if not _table_exists(conn, table):
@@ -217,6 +222,12 @@ def _read_ranking_df_from_db(limit: int = 20000) -> pd.DataFrame:
                 time_col,
             )
             return df
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    logger.debug("[SUMMARY ENRICH][RANKING] db close failed", exc_info=True)
 
     except Exception:
         logger.exception("[SUMMARY ENRICH][RANKING] db read failed")
