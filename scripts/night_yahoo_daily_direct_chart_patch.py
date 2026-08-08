@@ -98,21 +98,47 @@ def _chart_url(ticker: str, *, start: Optional[str], period: str) -> str:
     return f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(ticker)}?{q}"
 
 
-def _fetch_chart(ticker: str, *, start: Optional[str], period: str, timeout: float = 10.0) -> pd.DataFrame:
+_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json,text/plain,*/*",
+    "Connection": "close",
+}
+
+
+def _http_get(url: str, timeout: float) -> bytes:
+    """Yahoo Chart API を叩く。
+
+    この環境では Norton の SSL/TLS スキャンが HTTPS を傍受しており、
+    OpenSSL を使う urllib は Norton の証明書を
+      "Basic Constraints of CA cert not marked critical"
+    で拒否するため到達できない (2026-08-08 実測)。
+    curl_cffi は Windows 証明書ストアを足した CA バンドル
+    (scripts/yahoo_ca_bundle.py) を渡せば通るので、あればそちらを使う。
+    curl_cffi が無い環境では従来どおり urllib を使う。
+    """
+    try:
+        from curl_cffi import requests as _creq
+    except Exception:
+        _creq = None
+
+    if _creq is not None:
+        verify = os.environ.get("CURL_CA_BUNDLE") or os.environ.get("SSL_CERT_FILE") or True
+        r = _creq.get(url, headers=_HEADERS, timeout=timeout, impersonate="chrome", verify=verify)
+        if r.status_code >= 400:
+            raise RuntimeError(f"http_status={r.status_code}")
+        return r.content
+
     socket.setdefaulttimeout(timeout)
+    req = urllib.request.Request(url, headers=_HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _fetch_chart(ticker: str, *, start: Optional[str], period: str, timeout: float = 10.0) -> pd.DataFrame:
     url = _chart_url(ticker, start=start, period=period)
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json,text/plain,*/*",
-            "Connection": "close",
-        },
-    )
     t0 = time.time()
     LOG.info("[NIGHT YAHOO DIRECT CHART] request begin ticker=%s timeout=%.1fs", ticker, timeout)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = resp.read()
+    body = _http_get(url, timeout)
     LOG.info("[NIGHT YAHOO DIRECT CHART] request done ticker=%s bytes=%s elapsed=%.1fs", ticker, len(body), time.time() - t0)
     payload = json.loads(body.decode("utf-8", errors="replace"))
     chart = payload.get("chart") or {}

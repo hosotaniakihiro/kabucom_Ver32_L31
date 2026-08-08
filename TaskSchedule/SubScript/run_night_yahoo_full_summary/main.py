@@ -27,6 +27,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# この環境では Norton の SSL/TLS スキャンが HTTPS を傍受しており、
+# Norton のルートCAが certifi に無いため Yahoo へ到達できない。
+# Windows 証明書ストアを足した CA バンドルを最初に用意する。
+# (yfinance/curl_cffi はこれで通る。urllib 直叩きは通らない)
+from scripts.yahoo_ca_bundle import install as _install_ca_bundle  # noqa: E402
+_install_ca_bundle()
+
 # 夜間は他プロセスと競合しない前提なので、Yahoo保存は少し待つ。
 os.environ.setdefault("YAHOO_SUMMARY_LOCK_TIMEOUT_SEC", "30")
 os.environ.setdefault("YAHOO_SUMMARY_SKIP_IF_BUSY", "0")
