@@ -329,6 +329,15 @@ def _choose_conflict_columns(con: sqlite3.Connection, table: str, work: pd.DataF
     return _key_columns_for_table(work, interval=interval, table_cols=table_cols)
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = str(os.environ.get(name, "")).strip().lower()
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
 def _direct_sqlite_upsert_summary_df(df: pd.DataFrame, *, interval: int, db_path: Optional[str] = None) -> int:
     """
     summary_saver_bulk / recovery.persistence が使えない、または保存確認できない場合の最終保険。
@@ -505,6 +514,28 @@ def save_summary_df(df: pd.DataFrame, *, interval: int) -> int:
         (out["source"].iloc[0] if "source" in out.columns and not out.empty else None),
         (pd.to_datetime(out["datetime"], errors="coerce").max() if "datetime" in out.columns and not out.empty else None),
     )
+
+    # --------------------------------------------------------
+    # 0. 直接SQLite書き込みだけを使うモード (既定は無効)
+    #
+    # recovery.persistence / bulk の経路は SQLAlchemy エンジン経由で、
+    # database/session.py が date.today() から DB を決めるため、
+    # 常に「今日」の summaryYYYYMMDD.db を開く。
+    # 過去日を埋めるバックフィルではこれが
+    #   - 目的の日付とは別のDB(=今日)を開く
+    #   - 稼働中プロセスが同じ今日のDBを掴んでいると database is locked で待つ
+    # という二重の無駄になる (2026-08-08 実測: 3銘柄501行が20分経っても
+    # 1行も保存されなかった)。
+    # 夜間バッチのように足の日付ごとに保存したい場合はこれを 1 にする。
+    # --------------------------------------------------------
+    if _env_bool("YAHOO_SUMMARY_DIRECT_ONLY", False):
+        direct_saved = _direct_sqlite_upsert_summary_df(out, interval=interval, db_path=db_path)
+        verified = _count_existing_rows_for_keys(out, interval=interval, db_path=db_path) if direct_saved > 0 else 0
+        logger.info(
+            "[YAHOO SAVE] direct-only result interval=%s rows=%s saved=%s verified_sample=%s db=%s",
+            interval, len(out), direct_saved, verified, db_path,
+        )
+        return direct_saved
 
     # --------------------------------------------------------
     # 1. recovery.persistence.upsert_summary_df を試す

@@ -37,6 +37,24 @@ _install_ca_bundle()
 # 夜間は他プロセスと競合しない前提なので、Yahoo保存は少し待つ。
 os.environ.setdefault("YAHOO_SUMMARY_LOCK_TIMEOUT_SEC", "30")
 os.environ.setdefault("YAHOO_SUMMARY_SKIP_IF_BUSY", "0")
+
+# summary_save_guards の lock pressure ガードは、save_reason が空だと
+# 「リアルタイム保存」とみなして
+#   latest_only=True (銘柄ごとに最新1本だけ) / skip_if_busy=True /
+#   ロック待ち上限2秒
+# に切り詰める。夜間バッチは過去分のバックフィルなので、これに当たると
+# 取得した過去の足がほぼ保存されない (2026-08-08 に実測)。
+# 夜間バッチのプロセス内でのみ無効化する。
+os.environ.setdefault("SUMMARY_REALTIME_FORCE_LATEST_ONLY", "0")
+os.environ.setdefault("SUMMARY_REALTIME_SKIP_IF_BUSY", "0")
+os.environ.setdefault("SUMMARY_REALTIME_LOCK_TIMEOUT_SEC", "60")
+
+# summary 保存は足の日付ごとの DB へ直接書く。
+# 既定の recovery.persistence / bulk 経路は SQLAlchemy エンジン経由で、
+# database/session.py が date.today() から DB を決めるため、過去日を埋める
+# バックフィルでも「今日」の summaryYYYYMMDD.db を開いてしまう。
+# 稼働中プロセスが同じ今日のDBを掴んでいると database is locked で止まる。
+os.environ.setdefault("YAHOO_SUMMARY_DIRECT_ONLY", "1")
 os.environ.setdefault("NIGHT_YAHOO_BATCH_SIZE", "80")
 os.environ.setdefault("NIGHT_YAHOO_PAUSE_SEC", "1.0")
 os.environ.setdefault("NIGHT_YAHOO_INTERVALS", "1,3,5")
