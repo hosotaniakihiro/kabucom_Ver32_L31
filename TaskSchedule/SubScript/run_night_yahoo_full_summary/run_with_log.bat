@@ -70,7 +70,10 @@ REM Set 1 to skip the summary stage.
 REM set NIGHT_YAHOO_SKIP_SUMMARY=1
 
 REM Use the same .venv as the running processes (was: WindowsApps python3.11)
-"%PROJECT_ROOT%\.venv\Scripts\python.exe" ^
+REM -u (unbuffered) is required. With stdout redirected to a file Python
+REM block-buffers, so a multi-hour run shows nothing in the log until it
+REM ends and progress cannot be checked.
+"%PROJECT_ROOT%\.venv\Scripts\python.exe" -u ^
 "%PROJECT_ROOT%\TaskSchedule\SubScript\run_night_yahoo_full_summary\main.py" ^
 >> "%LOG_FILE%" 2>&1
 
