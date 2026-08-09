@@ -88,63 +88,11 @@ def _is_ranking_row(row: Any) -> bool:
 
 
 def _patch_entry_gate() -> bool:
-    try:
-        import AI.entry_gate as eg
-
-        cur = getattr(eg, "ai_final_entry_check", None)
-        if not callable(cur):
-            return False
-        if getattr(cur, "_ranking_runtime_rescue_v1", False):
-            return True
-        orig = cur
-
-        @wraps(orig)
-        def patched_ai_final_entry_check(row: dict) -> dict:
-            result = orig(row)
-            try:
-                if not _env_bool("RANKING_ENTRY_MTF_LOW_FAIL_OPEN", True):
-                    return result
-                if not isinstance(result, dict) or bool(result.get("allow")):
-                    return result
-                if not _is_ranking_row(row):
-                    return result
-                reason = str(result.get("reason") or "")
-                if reason != "mtf_low" and not reason.startswith("mtf_low"):
-                    return result
-
-                conf = max(
-                    _safe_float(result.get("confidence"), 0.0),
-                    _env_float("RANKING_ENTRY_MTF_LOW_RESCUE_CONFIDENCE", 0.72),
-                )
-                lot_multiplier = max(0.5, min(2.0, 0.5 + conf))
-                rescued = {
-                    "allow": True,
-                    "confidence": conf,
-                    "lot_multiplier": lot_multiplier,
-                    "reason": f"{reason}|ranking_mtf_low_failopen",
-                    "model_used": str(result.get("model_used") or "MTF") + "+RANKING_MTF_RESCUE",
-                }
-                logger.warning(
-                    "[RANKING ENTRY RUNTIME RESCUE] mtf_low rescued symbol=%s side=%s conf=%.3f score=%s source=%s",
-                    row.get("symbol"),
-                    row.get("side") or row.get("entry_decision"),
-                    conf,
-                    row.get("score") or row.get("final_score") or row.get("score_total"),
-                    row.get("source"),
-                )
-                return rescued
-            except Exception:
-                logger.exception("[RANKING ENTRY RUNTIME RESCUE] entry gate wrapper failed; return original result")
-                return result
-
-        patched_ai_final_entry_check._ranking_runtime_rescue_v1 = True  # type: ignore[attr-defined]
-        patched_ai_final_entry_check._original = orig  # type: ignore[attr-defined]
-        eg.ai_final_entry_check = patched_ai_final_entry_check
-        logger.warning("[RANKING ENTRY RUNTIME RESCUE] AI.entry_gate patched for ranking mtf_low fail-open")
-        return True
-    except Exception:
-        logger.debug("[RANKING ENTRY RUNTIME RESCUE] entry_gate patch skipped", exc_info=True)
-        return False
+    # 2026-08-09: AI.entry_gate.ai_final_entry_check への monkeypatch は
+    # AI/entry_gate.py (_ranking_entry_mtf_low_failopen 等) へ native統合済み。
+    # この関数はもう何もwrapしない (呼び出し元との互換のため関数自体とキーは
+    # 残すが常に True を返すだけの no-op)。
+    return True
 
 
 def _patch_high_low_snapshot_zero_range() -> bool:

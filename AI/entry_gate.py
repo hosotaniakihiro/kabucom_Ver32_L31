@@ -342,7 +342,7 @@ def apply_mtf_boost(entry_row, mtf_summary):
     return entry_row
 
 
-def ai_final_entry_check(row: dict) -> dict:
+def _ai_final_entry_check_core(row: dict) -> dict:
     if not isinstance(row, dict):
         return _block("invalid_row")
 
@@ -507,3 +507,328 @@ def ai_final_entry_check(row: dict) -> dict:
         ),
         model_used=("RANKING_LGBM+MTF" if is_ranking else "MTF"),
     )
+
+
+# ============================================================
+# ai_final_entry_check の最終合成レイヤー
+# ------------------------------------------------------------
+# 以下は元 core/startup/ranking_entry_runtime_rescue_patch.py
+# (_patch_entry_gate) と core/startup/low_volatility_entry_guard_patch.py
+# (_patch_ai_entry_gate) が実運用で `AI.entry_gate.ai_final_entry_check`
+# へ monkeypatch していた内容を native化したもの。
+#
+# 実運用での適用順序 (usercustomize.py -> core.startup.runtime_env_defaults_patch
+# .install() -> _install_ranking_entry_runtime_rescue() が先、
+# _install_low_volatility_entry_guard() が後、いずれも Python 起動時に
+# 同期的に実行され、trading.handlers.entry_controller 等の import より前に
+# 完了する) と同じく、
+#   低ボラガード ( RANKING mtf_low 救済 ( _ai_final_entry_check_core ) )
+# の順で適用する。ヘルパー関数名は本体の既存ヘルパー (_env_bool 等) と
+# 挙動が微妙に異なる (truthy/falsy集合や数値パースの細部) ため、
+# 元パッチと完全に同一の挙動を保つ目的で _low_vol_ / _rank_rescue_
+# 接頭辞を付けて独立させている。
+# ============================================================
+
+
+def _rank_rescue_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _rank_rescue_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _rank_rescue_safe_float(v, default: float = 0.0) -> float:
+    try:
+        if v is None:
+            return default
+        return float(str(v).strip().replace(",", "").replace("%", ""))
+    except Exception:
+        return default
+
+
+def _rank_rescue_norm_text(v) -> str:
+    try:
+        return str(v or "").strip().upper()
+    except Exception:
+        return ""
+
+
+def _rank_rescue_is_ranking_row(row) -> bool:
+    if not isinstance(row, dict):
+        return False
+    source = _rank_rescue_norm_text(row.get("source") or row.get("entry_source") or row.get("candidate_source") or row.get("pipeline_source"))
+    entry_type = _rank_rescue_norm_text(row.get("entry_type") or row.get("entryType"))
+    if "RANKING" in source or "RANKING" in entry_type:
+        return True
+    ranking_keys = {
+        "rank",
+        "ranking_type",
+        "ranking_kind",
+        "rank_type",
+        "source_rank",
+        "change_percentage",
+        "change_rate",
+        "change_ratio",
+        "ranking_snapshot_high",
+        "ranking_snapshot_low",
+    }
+    return bool(set(row.keys()) & ranking_keys)
+
+
+def _ranking_entry_mtf_low_failopen(row: dict, result: dict) -> dict:
+    """RANKING行がmtf_lowのみで拒否された場合の救済 (元 ranking_entry_runtime_rescue_patch)。"""
+    try:
+        if not _rank_rescue_env_bool("RANKING_ENTRY_MTF_LOW_FAIL_OPEN", True):
+            return result
+        if not isinstance(result, dict) or bool(result.get("allow")):
+            return result
+        if not _rank_rescue_is_ranking_row(row):
+            return result
+        reason = str(result.get("reason") or "")
+        if reason != "mtf_low" and not reason.startswith("mtf_low"):
+            return result
+
+        conf = max(
+            _rank_rescue_safe_float(result.get("confidence"), 0.0),
+            _rank_rescue_env_float("RANKING_ENTRY_MTF_LOW_RESCUE_CONFIDENCE", 0.72),
+        )
+        lot_multiplier = max(0.5, min(2.0, 0.5 + conf))
+        rescued = {
+            "allow": True,
+            "confidence": conf,
+            "lot_multiplier": lot_multiplier,
+            "reason": f"{reason}|ranking_mtf_low_failopen",
+            "model_used": str(result.get("model_used") or "MTF") + "+RANKING_MTF_RESCUE",
+        }
+        logger.warning(
+            "[RANKING ENTRY RUNTIME RESCUE] mtf_low rescued symbol=%s side=%s conf=%.3f score=%s source=%s",
+            row.get("symbol"),
+            row.get("side") or row.get("entry_decision"),
+            conf,
+            row.get("score") or row.get("final_score") or row.get("score_total"),
+            row.get("source"),
+        )
+        return rescued
+    except Exception:
+        logger.exception("[RANKING ENTRY RUNTIME RESCUE] entry gate wrapper failed; return original result")
+        return result
+
+
+def _low_vol_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _low_vol_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).strip().replace(",", ""))
+    except Exception:
+        return float(default)
+
+
+def _low_vol_safe_float(v, default=None):
+    try:
+        if v is None:
+            return default
+        if isinstance(v, bool):
+            return float(v)
+        s = str(v).strip().replace(",", "").replace("%", "")
+        if not s or s.lower() in {"none", "nan", "null", "na", "n/a"}:
+            return default
+        x = float(s)
+        if math.isnan(x) or math.isinf(x):
+            return default
+        return x
+    except Exception:
+        return default
+
+
+def _low_vol_norm_symbol(v) -> str:
+    try:
+        s = str(v or "").strip()
+        if s.endswith(".0"):
+            s = s[:-2]
+        return s
+    except Exception:
+        return ""
+
+
+def _low_vol_norm_side(v) -> str:
+    try:
+        s = str(v or "").strip().upper()
+        return s if s in {"BUY", "SELL"} else ""
+    except Exception:
+        return ""
+
+
+def _low_vol_merged_dicts(row) -> list:
+    out: list = []
+    if isinstance(row, dict):
+        out.append(row)
+        for k in ("ai_row", "source_row", "row", "summary_row", "candidate", "entry_row", "_raw", "entry_conditions"):
+            v = row.get(k)
+            if isinstance(v, dict):
+                out.append(v)
+    return out
+
+
+def _low_vol_pick(row, *keys):
+    for d in _low_vol_merged_dicts(row):
+        for k in keys:
+            if k in d:
+                return d.get(k)
+    return None
+
+
+def _low_vol_abs_pct_value(row, *keys):
+    vals: list = []
+    for k in keys:
+        v = _low_vol_safe_float(_low_vol_pick(row, k), None)
+        if v is None:
+            continue
+        vals.append(abs(float(v)))
+    if not vals:
+        return None
+    return max(vals)
+
+
+def _low_vol_range_pct(row):
+    explicit = _low_vol_abs_pct_value(row, "range_pct", "price_range_pct", "hl_range_pct", "high_low_range_pct", "intraday_range_pct", "display_range_pct")
+    if explicit is not None:
+        return explicit
+    high = _low_vol_safe_float(_low_vol_pick(row, "high", "high_price", "ranking_snapshot_high", "day_high", "today_high", "intraday_high", "session_high"), None)
+    low = _low_vol_safe_float(_low_vol_pick(row, "low", "low_price", "ranking_snapshot_low", "day_low", "today_low", "intraday_low", "session_low"), None)
+    close = _low_vol_safe_float(_low_vol_pick(row, "close", "close_price", "price", "current_price"), None)
+    if high is None or low is None or close is None or close <= 0:
+        return None
+    if high <= 0 or low <= 0 or high < low:
+        return None
+    return abs(high - low) / close * 100.0
+
+
+def _low_vol_atr_pct(row):
+    explicit = _low_vol_abs_pct_value(row, "atr_pct", "atr_percent", "atr_rate", "atr_ratio_pct", "display_atr_pct")
+    if explicit is not None:
+        return explicit
+    atr = _low_vol_safe_float(_low_vol_pick(row, "atr", "ATR", "atr_1m", "atr_3m", "atr_5m"), None)
+    close = _low_vol_safe_float(_low_vol_pick(row, "close", "close_price", "price", "current_price"), None)
+    if atr is None or close is None or close <= 0 or atr < 0:
+        return None
+    return atr / close * 100.0
+
+
+def _low_vol_change_pct(row):
+    return _low_vol_abs_pct_value(
+        row,
+        "change_pct", "change_rate", "change_ratio", "change_percentage",
+        "price_change_pct", "price_change_rate", "price_change_1m", "price_change_3m",
+        "price_change_5m", "pct_change_1m", "pct_change_3m", "pct_change_5m",
+        "return_1m", "return_3m", "return_5m", "momentum_pct",
+    )
+
+
+def _low_vol_slope_abs(row):
+    return _low_vol_abs_pct_value(row, "slope", "display_slope", "slope_1m", "slope_3m", "slope_5m", "slope_atr_scaled", "display_slope_atr_scaled")
+
+
+def _low_vol_block(row) -> tuple:
+    if not _low_vol_env_bool("ENTRY_LOW_VOLATILITY_GUARD_ENABLED", True):
+        return False, "", {}
+
+    min_range_pct = _low_vol_env_float("ENTRY_MIN_RANGE_PCT", 0.25)
+    min_atr_pct = _low_vol_env_float("ENTRY_MIN_ATR_PCT", 0.12)
+    min_change_pct = _low_vol_env_float("ENTRY_MIN_ABS_CHANGE_PCT", 0.20)
+    min_slope_abs = _low_vol_env_float("ENTRY_MIN_ABS_SLOPE_FOR_VOL", 0.0010)
+    min_evidence = int(max(1.0, _low_vol_env_float("ENTRY_LOW_VOL_MIN_EVIDENCE_COUNT", 2.0)))
+
+    rng = _low_vol_range_pct(row)
+    atr = _low_vol_atr_pct(row)
+    chg = _low_vol_change_pct(row)
+    slp = _low_vol_slope_abs(row)
+
+    evidence: list = []
+    if rng is not None:
+        evidence.append(("range_pct", rng, min_range_pct))
+    if atr is not None:
+        evidence.append(("atr_pct", atr, min_atr_pct))
+    if chg is not None:
+        evidence.append(("change_pct", chg, min_change_pct))
+    if slp is not None:
+        evidence.append(("slope_abs", slp, min_slope_abs))
+
+    if _low_vol_env_bool("ENTRY_LOW_VOL_ZERO_AS_MISSING", True) and evidence:
+        positive_evidence = [(name, val, th) for name, val, th in evidence if abs(float(val)) > 1e-12]
+        if not positive_evidence:
+            return False, "", {"reason": "zero_volatility_fields_treated_as_missing", "range_pct": rng, "atr_pct": atr, "change_pct": chg, "slope_abs": slp, "evidence_count": len(evidence)}
+        evidence = positive_evidence
+
+    if len(evidence) < min_evidence:
+        return False, "", {"evidence_count": len(evidence), "range_pct": rng, "atr_pct": atr, "change_pct": chg, "slope_abs": slp}
+
+    small = [(name, val, th) for name, val, th in evidence if val < th]
+    if len(small) != len(evidence):
+        return False, "", {"range_pct": rng, "atr_pct": atr, "change_pct": chg, "slope_abs": slp, "evidence_count": len(evidence)}
+
+    detail = {
+        "symbol": _low_vol_norm_symbol(_low_vol_pick(row, "symbol", "Symbol")),
+        "side": _low_vol_norm_side(_low_vol_pick(row, "side", "ai_side", "entry_decision")),
+        "range_pct": rng, "atr_pct": atr, "change_pct": chg, "slope_abs": slp,
+        "thresholds": {"min_range_pct": min_range_pct, "min_atr_pct": min_atr_pct, "min_abs_change_pct": min_change_pct, "min_abs_slope": min_slope_abs},
+        "evidence_count": len(evidence),
+    }
+    return True, "low_volatility", detail
+
+
+def _low_vol_block_result(row, original=None) -> dict:
+    blocked, reason, detail = _low_vol_block(row)
+    if not blocked:
+        return original or {"allow": True, "reason": "ok"}
+    logger.warning("[LOW VOL ENTRY GUARD] blocked symbol=%s side=%s detail=%s", detail.get("symbol"), detail.get("side"), detail)
+    return {"allow": False, "confidence": 0.0, "lot_multiplier": 0.0, "reason": reason, "model_used": "LOW_VOLATILITY_GUARD", "detail": detail}
+
+
+def _low_volatility_entry_guard(row: dict, result: dict) -> dict:
+    """低ボラ銘柄の最終ガード (元 low_volatility_entry_guard_patch._patch_ai_entry_gate)。"""
+    try:
+        if isinstance(result, dict) and not bool(result.get("allow")):
+            return result
+        blocked, _, _ = _low_vol_block(row)
+        if blocked:
+            return _low_vol_block_result(row, result if isinstance(result, dict) else None)
+        return result
+    except Exception:
+        logger.exception("[LOW VOL ENTRY GUARD] AI.entry_gate wrapper failed; return original result")
+        return result
+
+
+def ai_final_entry_check(row: dict) -> dict:
+    """AI最終エントリーゲート (唯一の判断場所)。
+
+    実運用の monkeypatch 適用順序 (ranking mtf_low 救済が先、低ボラガードが
+    最後に外側からラップ) と同じ合成順序を native実装として保持する。
+    """
+    result = _ai_final_entry_check_core(row)
+    result = _ranking_entry_mtf_low_failopen(row, result)
+    result = _low_volatility_entry_guard(row, result)
+    return result

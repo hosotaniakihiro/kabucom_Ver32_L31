@@ -239,39 +239,11 @@ def _block_result(row: Any, original: dict[str, Any] | None = None) -> dict[str,
 
 
 def _patch_ai_entry_gate() -> bool:
-    try:
-        import AI.entry_gate as eg
-        cur = getattr(eg, "ai_final_entry_check", None)
-        if not callable(cur):
-            return False
-        if getattr(cur, "_low_volatility_guard_v3", False):
-            return True
-        orig = getattr(cur, "_original", cur)
-
-        @wraps(orig)
-        def patched_ai_final_entry_check(row: dict) -> dict:
-            result = orig(row)
-            try:
-                if isinstance(result, dict) and not bool(result.get("allow")):
-                    return result
-                blocked, _, _ = _low_vol_block(row)
-                if blocked:
-                    return _block_result(row, result if isinstance(result, dict) else None)
-                return result
-            except Exception:
-                logger.exception("[LOW VOL ENTRY GUARD] AI.entry_gate wrapper failed; return original result")
-                return result
-
-        patched_ai_final_entry_check._low_volatility_guard_v1 = True  # type: ignore[attr-defined]
-        patched_ai_final_entry_check._low_volatility_guard_v2 = True  # type: ignore[attr-defined]
-        patched_ai_final_entry_check._low_volatility_guard_v3 = True  # type: ignore[attr-defined]
-        patched_ai_final_entry_check._original = orig  # type: ignore[attr-defined]
-        eg.ai_final_entry_check = patched_ai_final_entry_check
-        logger.warning("[LOW VOL ENTRY GUARD] AI.entry_gate patched v3")
-        return True
-    except Exception:
-        logger.debug("[LOW VOL ENTRY GUARD] AI.entry_gate patch skipped", exc_info=True)
-        return False
+    # 2026-08-09: AI.entry_gate.ai_final_entry_check への monkeypatch は
+    # AI/entry_gate.py (_low_volatility_entry_guard / _low_vol_block 等) へ
+    # native統合済み。この関数はもう何もwrapしない (呼び出し元との互換のため
+    # 関数自体とキーは残すが常に True を返すだけの no-op)。
+    return True
 
 
 def _patch_summary_ai_selection() -> bool:
