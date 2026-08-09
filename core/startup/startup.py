@@ -929,12 +929,9 @@ def _install_entrypoint_runtime_patches() -> None:
     except Exception:
         logger.exception("[startup.entrypoint] final entry direct REST board fallback install failed")
 
-    try:
-        from core.startup.exit_limit_pending_close_runtime_patch import install as install_exit_limit_pending_close_patch
-
-        install_exit_limit_pending_close_patch()
-    except Exception:
-        logger.exception("[startup.entrypoint] exit limit pending close patch install failed")
+    # exit_limit_pending_close_runtime_patch は trading/exit/executor.py の
+    # _close_db_position (native化した _mark_db_position_closing 分岐) へ
+    # インライン化済みのため install 呼び出しを削除した。
 
     try:
         from core.startup.exit_unfilled_reprice_runtime_patch import install as install_exit_unfilled_reprice_patch
@@ -944,18 +941,18 @@ def _install_entrypoint_runtime_patches() -> None:
         logger.exception("[startup.entrypoint] exit unfilled reprice patch install failed")
 
     try:
-        from core.startup.exit_order_fill_confirm_runtime_patch import install as install_exit_order_fill_confirm_patch
+        from trading.exit.executor import start_exit_fill_confirm_loop
 
-        install_exit_order_fill_confirm_patch()
+        start_exit_fill_confirm_loop()
     except Exception:
-        logger.exception("[startup.entrypoint] exit order fill confirm patch install failed")
+        logger.exception("[startup.entrypoint] exit order fill confirm loop start failed")
 
     try:
-        from core.startup.exit_closing_stale_reconcile_runtime_patch import install as install_exit_closing_stale_reconcile_patch
+        from trading.exit.executor import start_exit_closing_stale_reconcile_loop
 
-        install_exit_closing_stale_reconcile_patch()
+        start_exit_closing_stale_reconcile_loop()
     except Exception:
-        logger.exception("[startup.entrypoint] exit closing stale reconcile patch install failed")
+        logger.exception("[startup.entrypoint] exit closing stale reconcile loop start failed")
 
     try:
         install_board_runtime_self_check()

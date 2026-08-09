@@ -777,7 +777,71 @@ def _restore_open_status(symbol: str, pos: dict[str, Any]) -> None:
         logger.warning("[EXIT_EXECUTOR] failed to restore OPEN status symbol=%s", symbol, exc_info=True)
 
 
+# 旧 core/startup/exit_limit_pending_close_runtime_patch.py 由来。
+# 指値EXITは注文受付だけではまだ未約定のことがあるため、原則DBはCLOSEDに
+# せずCLOSINGへ据え置く (実約定確認は _exit_fill_confirm_loop / 失敗時の
+# 救済は _exit_closing_reconcile_loop に任せる)。
+EXIT_LIMIT_PENDING_CLOSE_ENABLED = _exit_board_env_bool("EXIT_LIMIT_PENDING_CLOSE_ENABLED", True)
+EXIT_MARK_CLOSED_ON_ORDER_ACCEPT = _exit_board_env_bool("EXIT_MARK_CLOSED_ON_ORDER_ACCEPT", False)
+
+
+def _mark_db_position_closing(*, symbol: str, exit_price: float, pnl: float, reason: str, order_id: str) -> bool:
+    """旧 exit_limit_pending_close_runtime_patch._mark_db_closing 相当。
+
+    返済注文受付直後はまだ未約定のことがあるため、DBはCLOSEDにせず
+    CLOSINGへ据え置く。OPEN/CLOSING いずれの行も対象にする
+    (再送・多重呼び出しで既にCLOSING化済みの行も更新できるようにするため)。
+    """
+    session = Session_position()
+    try:
+        db_pos = (
+            session.query(Position)
+            .filter(Position.symbol == str(symbol))
+            .filter(Position.status.in_(["OPEN", "CLOSING"]))
+            .first()
+        )
+        if not db_pos:
+            logger.warning("[EXIT LIMIT PENDING CLOSE] DB open/closing position not found symbol=%s", symbol)
+            session.rollback()
+            return False
+        now = dt.datetime.now()
+        db_pos.status = "CLOSING"
+        for attr, value in [
+            ("exit_price", _safe_float(exit_price)),
+            ("updated_at", now),
+            ("pnl", _safe_float(pnl)),
+            ("exit_reason", reason),
+            ("close_reason", reason),
+            ("exit_order_id", order_id),
+            ("order_id", order_id),
+        ]:
+            try:
+                if hasattr(db_pos, attr):
+                    setattr(db_pos, attr, value)
+            except Exception:
+                pass
+        session.commit()
+        logger.warning(
+            "[EXIT LIMIT PENDING CLOSE] DB marked CLOSING symbol=%s exit_price=%.4f pnl=%.4f order_id=%s reason=%s",
+            symbol, _safe_float(exit_price), _safe_float(pnl), order_id, reason,
+        )
+        return True
+    except Exception:
+        session.rollback()
+        logger.exception("[EXIT LIMIT PENDING CLOSE] DB mark closing failed symbol=%s", symbol)
+        return False
+    finally:
+        session.close()
+
+
 def _close_db_position(*, symbol: str, exit_price: float, pnl: float, reason: str, order_id: str) -> bool:
+    # 板タッチ指値EXIT運用では、注文受付直後にDBをCLOSED確定すると未約定の
+    # まま建玉が閉じた扱いになるため、既定ではCLOSINGへ据え置く
+    # (旧 exit_limit_pending_close_runtime_patch)。成行運用へ戻したい場合は
+    # EXIT_MARK_CLOSED_ON_ORDER_ACCEPT=1 で従来通りの即時CLOSEDに戻せる。
+    if EXIT_LIMIT_PENDING_CLOSE_ENABLED and not EXIT_MARK_CLOSED_ON_ORDER_ACCEPT:
+        return _mark_db_position_closing(symbol=symbol, exit_price=exit_price, pnl=pnl, reason=reason, order_id=order_id)
+
     session = Session_position()
     try:
         db_pos = (
@@ -933,4 +997,553 @@ def execute_exit(symbol: str, reason: str, exit_price: float) -> bool:
             return False
 
 
-__all__ = ["set_exit_order_sender", "execute_exit"]
+# ============================================================
+# 旧 core/startup/exit_order_fill_confirm_runtime_patch.py 由来。
+#
+# 指値EXITを注文受付時点でCLOSINGにした後、kabusapi/orders を監視して
+# 全約定ならpositions.dbを正式CLOSEDに確定するバックグラウンドループ。
+#
+# 目的:
+#   - 未約定のままCLOSEDにしない
+#   - 約定済みなのにCLOSINGで残さない
+#   - 部分約定はCLOSING維持
+# ============================================================
+
+EXIT_FILL_CONFIRM_ENABLED = _exit_board_env_bool("EXIT_FILL_CONFIRM_ENABLED", True)
+
+_exit_fill_confirm_installed = False
+_exit_fill_confirm_thread_started = False
+
+
+def _exit_fill_confirm_order_id(v: Any) -> str:
+    return str(v or "").strip()
+
+
+def _exit_fill_confirm_remaining(order: dict[str, Any]) -> tuple[float, float, float]:
+    qty = _safe_float(order.get("OrderQty", order.get("Qty", 0)), 0.0)
+    cum = _safe_float(order.get("CumQty", order.get("ContractedQty", 0)), 0.0)
+    leaves = _safe_float(order.get("LeavesQty", 0), 0.0)
+    if leaves <= 0 and qty > 0:
+        leaves = max(qty - cum, 0.0)
+    if qty <= 0 and leaves > 0:
+        qty = leaves + cum
+    return qty, cum, leaves
+
+
+def _exit_fill_confirm_is_filled(order: dict[str, Any]) -> bool:
+    state = str(order.get("State") or "").strip()
+    qty, cum, leaves = _exit_fill_confirm_remaining(order)
+    # kabuS APIでは状態値の詳細が環境差で揺れるため、数量を主判定にする。
+    if qty > 0 and cum >= qty and leaves <= 0:
+        return True
+    if leaves <= 0 and cum > 0 and state not in {"1", "2", "3", "4"}:
+        return True
+    return False
+
+
+def _exit_fill_confirm_find_order(orders: list[dict], wanted_order_id: str, symbol: str) -> Optional[dict]:
+    wanted_order_id = _exit_fill_confirm_order_id(wanted_order_id)
+    symbol = _normalize_symbol(symbol)
+    for o in orders or []:
+        if not isinstance(o, dict):
+            continue
+        oid = _exit_fill_confirm_order_id(o.get("OrderId") or o.get("ID"))
+        if wanted_order_id and oid == wanted_order_id:
+            return o
+    # order_idが空/欠落した古いDB行向けの補助。返済注文だけを拾う。
+    for o in orders or []:
+        if not isinstance(o, dict):
+            continue
+        if _normalize_symbol(o.get("Symbol")) != symbol:
+            continue
+        try:
+            if int(float(o.get("CashMargin") or 0)) == 3:
+                return o
+        except Exception:
+            pass
+    return None
+
+
+def _exit_fill_confirm_close_db_and_memory(symbol: str, order_id: str, order: dict) -> bool:
+    symbol = _normalize_symbol(symbol)
+    session = None
+    try:
+        session = Session_position()
+        row = (
+            session.query(Position)
+            .filter(Position.symbol == symbol)
+            .filter(Position.status == "CLOSING")
+            .first()
+        )
+        if not row:
+            session.rollback()
+            return False
+        now = dt.datetime.now()
+        avg_price = _safe_float(getattr(row, "avg_price", 0) or getattr(row, "entry_price", 0) or getattr(row, "price", 0), 0.0)
+        qty = _safe_float(getattr(row, "qty", 0), 0.0)
+        exit_price = _safe_float(order.get("Price"), 0.0) or _safe_float(getattr(row, "exit_price", 0), 0.0)
+        side = str(getattr(row, "side", "") or "").upper()
+        pnl = 0.0
+        if qty > 0 and avg_price > 0 and exit_price > 0:
+            pnl = (exit_price - avg_price) * qty if side == "BUY" else (avg_price - exit_price) * qty
+        row.status = "CLOSED"
+        for attr, value in [
+            ("exit_price", exit_price),
+            ("exit_time", now),
+            ("closed_time", now),
+            ("close_time", now),
+            ("updated_at", now),
+            ("pnl", pnl),
+            ("exit_order_id", order_id),
+            ("order_id", order_id),
+        ]:
+            try:
+                if hasattr(row, attr):
+                    setattr(row, attr, value)
+            except Exception:
+                pass
+        session.commit()
+        try:
+            positions = getattr(global_data, "open_positions", None)
+            if isinstance(positions, dict):
+                positions.pop(symbol, None)
+        except Exception:
+            pass
+        logger.warning("[EXIT FILL CONFIRM] CLOSED confirmed symbol=%s order_id=%s exit_price=%.4f pnl=%.4f", symbol, order_id, exit_price, pnl)
+        return True
+    except Exception:
+        try:
+            if session is not None:
+                session.rollback()
+        except Exception:
+            pass
+        logger.exception("[EXIT FILL CONFIRM] close DB failed symbol=%s order_id=%s", symbol, order_id)
+        return False
+    finally:
+        try:
+            if session is not None:
+                session.close()
+        except Exception:
+            pass
+
+
+def _exit_fill_confirm_closing_rows() -> list[dict]:
+    out: list[dict] = []
+    session = None
+    try:
+        session = Session_position()
+        rows = session.query(Position).filter(Position.status == "CLOSING").all()
+        for r in rows or []:
+            sym = _normalize_symbol(getattr(r, "symbol", ""))
+            oid = _exit_fill_confirm_order_id(getattr(r, "exit_order_id", "") or getattr(r, "order_id", ""))
+            if sym:
+                out.append({"symbol": sym, "order_id": oid})
+    except Exception:
+        logger.debug("[EXIT FILL CONFIRM] load CLOSING rows failed", exc_info=True)
+    finally:
+        try:
+            if session is not None:
+                session.close()
+        except Exception:
+            pass
+    return out
+
+
+def _exit_fill_confirm_loop() -> None:
+    try:
+        import force_cancel_loop as fcl
+    except Exception:
+        logger.exception("[EXIT FILL CONFIRM] import force_cancel_loop failed")
+        return
+    get_orders = getattr(fcl, "get_orders", None)
+    if not callable(get_orders):
+        logger.warning("[EXIT FILL CONFIRM] get_orders missing")
+        return
+    interval = max(0.5, _exit_board_env_float("EXIT_FILL_CONFIRM_INTERVAL_SEC", 1.0))
+    logger.warning("[EXIT FILL CONFIRM] loop start interval=%.2fs", interval)
+    while True:
+        try:
+            rows = _exit_fill_confirm_closing_rows()
+            if not rows:
+                time.sleep(interval)
+                continue
+            orders = get_orders() or []
+            for row in rows:
+                sym = row.get("symbol") or ""
+                oid = row.get("order_id") or ""
+                order = _exit_fill_confirm_find_order(orders, oid, sym)
+                if order and _exit_fill_confirm_is_filled(order):
+                    _exit_fill_confirm_close_db_and_memory(sym, oid or _exit_fill_confirm_order_id(order.get("OrderId") or order.get("ID")), order)
+                elif order:
+                    qty, cum, leaves = _exit_fill_confirm_remaining(order)
+                    logger.info("[EXIT FILL CONFIRM] still closing symbol=%s order_id=%s cum=%.0f leaves=%.0f qty=%.0f", sym, oid, cum, leaves, qty)
+                else:
+                    logger.debug("[EXIT FILL CONFIRM] order not found yet symbol=%s order_id=%s", sym, oid)
+        except Exception:
+            logger.exception("[EXIT FILL CONFIRM] loop error")
+        time.sleep(interval)
+
+
+def start_exit_fill_confirm_loop() -> bool:
+    """CLOSING建玉の約定確認バックグラウンドループを起動する (冪等)。"""
+    global _exit_fill_confirm_installed, _exit_fill_confirm_thread_started
+    if _exit_fill_confirm_installed:
+        return True
+    if not EXIT_FILL_CONFIRM_ENABLED:
+        logger.warning("[EXIT FILL CONFIRM] disabled")
+        return False
+    if not _exit_fill_confirm_thread_started:
+        threading.Thread(target=_exit_fill_confirm_loop, daemon=True, name="exit_fill_confirm_loop").start()
+        _exit_fill_confirm_thread_started = True
+    _exit_fill_confirm_installed = True
+    logger.warning("[EXIT FILL CONFIRM] installed interval=%.2f", _exit_board_env_float("EXIT_FILL_CONFIRM_INTERVAL_SEC", 1.0))
+    return True
+
+
+# ============================================================
+# 旧 core/startup/exit_closing_stale_reconcile_runtime_patch.py 由来。
+#
+# CLOSINGのまま長時間残った建玉を救済するバックグラウンドループ。
+#
+# 方針:
+#   - positions.db の CLOSING が一定秒数以上残ったら確認対象
+#   - 原則、ブローカーREST建玉取得に成功した時だけOPEN/CLOSEDへ救済
+#   - ブローカー建玉に同銘柄が残っていなければ CLOSED 確定
+#   - ブローカー建玉に同銘柄が残っていれば OPEN に戻す
+#   - ブローカー取得に失敗した場合は何もしない
+#   - 現物保有銘柄 (既定 147A) は対象から除外する
+# ============================================================
+
+EXIT_CLOSING_RECONCILE_ENABLED = _exit_board_env_bool("EXIT_CLOSING_RECONCILE_ENABLED", True)
+_EXIT_CLOSING_RECONCILE_DEFAULT_IGNORE_SYMBOLS = "147A"
+
+_exit_closing_reconcile_installed = False
+_exit_closing_reconcile_thread_started = False
+
+
+def _exit_closing_reconcile_ignored_symbols() -> set[str]:
+    raw = os.getenv("EXIT_CLOSING_RECONCILE_IGNORE_SYMBOLS", _EXIT_CLOSING_RECONCILE_DEFAULT_IGNORE_SYMBOLS)
+    out: set[str] = set()
+    for part in str(raw or "").replace(";", ",").split(","):
+        sym = _normalize_symbol(part)
+        if sym:
+            out.add(sym)
+    return out
+
+
+def _exit_closing_reconcile_is_ignored_symbol(sym: str) -> bool:
+    return bool(sym) and sym in _exit_closing_reconcile_ignored_symbols()
+
+
+def _exit_closing_reconcile_int_or_none(v: Any) -> Optional[int]:
+    try:
+        if v in (None, ""):
+            return None
+        return int(float(str(v).strip()))
+    except Exception:
+        return None
+
+
+def _exit_closing_reconcile_is_cash_position(p: dict) -> bool:
+    """kabuS /positions の現物を検出する。
+
+    MarginTradeType=0 は現物。Product/ProductType=0/1 も現物側として扱う。
+    フィールドが無い場合は信用か不明なので除外しない。
+    """
+    margin_trade_type = _exit_closing_reconcile_int_or_none(
+        p.get("MarginTradeType")
+        or p.get("margin_trade_type")
+        or p.get("MarginType")
+        or p.get("marginType")
+    )
+    if margin_trade_type == 0:
+        return True
+
+    product = _exit_closing_reconcile_int_or_none(
+        p.get("Product")
+        or p.get("product")
+        or p.get("ProductType")
+        or p.get("product_type")
+    )
+    if product in {0, 1}:
+        return True
+
+    return False
+
+
+def _exit_closing_reconcile_row_age_sec(row: Any) -> float:
+    now = dt.datetime.now()
+    for attr in ("updated_at", "exit_time", "created_at", "entry_time"):
+        try:
+            raw = getattr(row, attr, None)
+        except Exception:
+            raw = None
+        if not raw:
+            continue
+        try:
+            if isinstance(raw, dt.datetime):
+                return max(0.0, (now - raw.replace(tzinfo=None)).total_seconds())
+            s = str(raw).strip().replace("T", " ")
+            if "+" in s:
+                s = s.split("+", 1)[0]
+            if s.endswith("Z"):
+                s = s[:-1]
+            return max(0.0, (now - dt.datetime.fromisoformat(s)).total_seconds())
+        except Exception:
+            pass
+    return 999999.0
+
+
+def _exit_closing_reconcile_extract_position_rows(ret: Any) -> list[dict]:
+    if isinstance(ret, dict):
+        rows = ret.get("Positions") or ret.get("positions") or ret.get("Data") or ret.get("data") or []
+    else:
+        rows = ret
+    if isinstance(rows, list):
+        return [x for x in rows if isinstance(x, dict)]
+    return []
+
+
+def _exit_closing_reconcile_rows_to_open_symbols(rows: list[dict]) -> set[str]:
+    out: set[str] = set()
+    ignored = _exit_closing_reconcile_ignored_symbols()
+    skipped_cash = 0
+    skipped_ignored = 0
+    for p in rows or []:
+        sym = _normalize_symbol(p.get("Symbol") or p.get("symbol") or p.get("Code") or p.get("code"))
+        if not sym:
+            continue
+        if sym in ignored:
+            skipped_ignored += 1
+            continue
+        if _exit_closing_reconcile_is_cash_position(p):
+            skipped_cash += 1
+            continue
+        qty = _safe_float(
+            p.get("LeavesQty")
+            or p.get("HoldQty")
+            or p.get("Qty")
+            or p.get("qty")
+            or p.get("LeavesQuantity")
+            or p.get("HoldQuantity"),
+            0.0,
+        )
+        if sym and qty > 0:
+            out.add(sym)
+    if skipped_cash or skipped_ignored:
+        logger.debug(
+            "[EXIT CLOSING RECONCILE] filtered broker positions cash=%s ignored=%s ignore_symbols=%s",
+            skipped_cash,
+            skipped_ignored,
+            sorted(ignored),
+        )
+    return out
+
+
+def _exit_closing_reconcile_get_token() -> Optional[str]:
+    try:
+        from token_manager import get_valid_token, refresh_token
+        return get_valid_token() or refresh_token()
+    except Exception:
+        logger.debug("[EXIT CLOSING RECONCILE] token unavailable", exc_info=True)
+        return None
+
+
+def _exit_closing_reconcile_fetch_positions_rest_direct() -> tuple[bool, set[str]]:
+    token = _exit_closing_reconcile_get_token()
+    if not token:
+        return False, set()
+    base = os.getenv("KABUSAPI_BASE_URL", "http://localhost:18080/kabusapi").rstrip("/")
+    # 信用建玉だけを判定対象にしたいので product=2 を先に試す。
+    # all/product=0 は環境差吸収用の補助。ただし _rows_to_open_symbols で現物は除外する。
+    urls = [
+        f"{base}/positions?{urllib.parse.urlencode({'product': 2})}",
+        f"{base}/positions",
+        f"{base}/positions?{urllib.parse.urlencode({'product': 0})}",
+    ]
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={"X-API-KEY": token}, method="GET")
+            with urllib.request.urlopen(req, timeout=_exit_board_env_float("EXIT_CLOSING_RECONCILE_REST_TIMEOUT_SEC", 1.5)) as res:
+                raw = json.loads(res.read().decode("utf-8", errors="replace"))
+            rows = _exit_closing_reconcile_extract_position_rows(raw)
+            symbols = _exit_closing_reconcile_rows_to_open_symbols(rows)
+            logger.info("[EXIT CLOSING RECONCILE] REST positions ok url=%s rows=%s credit_symbols=%s ignored=%s", url, len(rows), sorted(symbols)[:20], sorted(_exit_closing_reconcile_ignored_symbols()))
+            return True, symbols
+        except Exception:
+            logger.debug("[EXIT CLOSING RECONCILE] direct REST positions failed url=%s", url, exc_info=True)
+            continue
+    return False, set()
+
+
+def _exit_closing_reconcile_load_broker_open_symbols() -> tuple[bool, set[str]]:
+    # 1. まずブローカーREST helperを試す。
+    candidates = [
+        ("kabu_api.positions", "get_positions"),
+        ("kabu_api.position", "get_positions"),
+        ("kabu_api.get_positions", "get_positions"),
+        ("kabu_api.api_positions", "get_positions"),
+    ]
+    for mod_name, fn_name in candidates:
+        try:
+            mod = __import__(mod_name, fromlist=[fn_name])
+            fn = getattr(mod, fn_name, None)
+            if not callable(fn):
+                continue
+            ret = fn()
+            rows = _exit_closing_reconcile_extract_position_rows(ret)
+            symbols = _exit_closing_reconcile_rows_to_open_symbols(rows)
+            logger.info("[EXIT CLOSING RECONCILE] helper positions ok module=%s rows=%s credit_symbols=%s ignored=%s", mod_name, len(rows), sorted(symbols)[:20], sorted(_exit_closing_reconcile_ignored_symbols()))
+            return True, symbols
+        except Exception:
+            continue
+
+    # 2. helperが無い/失敗する場合は直接REST。
+    ok, symbols = _exit_closing_reconcile_fetch_positions_rest_direct()
+    if ok:
+        return True, symbols
+
+    # 3. 最後の補助: 明示許可時だけメモリを見る。デフォルトでは使わない。
+    if not _exit_board_env_bool("EXIT_CLOSING_RECONCILE_ALLOW_MEMORY_FALLBACK", False):
+        return False, set()
+    symbols = set()
+    ignored = _exit_closing_reconcile_ignored_symbols()
+    try:
+        positions = getattr(global_data, "open_positions", None)
+        if isinstance(positions, dict):
+            for k, v in positions.items():
+                sym = _normalize_symbol(k or (v.get("symbol") if isinstance(v, dict) else ""))
+                if not sym or sym in ignored:
+                    continue
+                if sym:
+                    status = str(v.get("status") if isinstance(v, dict) else "OPEN").upper()
+                    if status not in {"CLOSED", "CLOSE", "EXITED", "DONE", "CANCELED", "CANCELLED", "REJECTED"}:
+                        symbols.add(sym)
+            logger.warning("[EXIT CLOSING RECONCILE] memory fallback used credit_symbols=%s ignored=%s", sorted(symbols)[:20], sorted(ignored))
+            return True, symbols
+    except Exception:
+        logger.debug("[EXIT CLOSING RECONCILE] memory fallback failed", exc_info=True)
+    return False, set()
+
+
+def _exit_closing_reconcile_close_row(row: Any, reason: str) -> None:
+    now = dt.datetime.now()
+    row.status = "CLOSED"
+    for attr, value in [
+        ("closed_time", now),
+        ("close_time", now),
+        ("exit_time", now),
+        ("updated_at", now),
+        ("exit_reason", reason),
+        ("close_reason", reason),
+    ]:
+        try:
+            if hasattr(row, attr):
+                setattr(row, attr, value)
+        except Exception:
+            pass
+
+
+def _exit_closing_reconcile_open_row(row: Any, reason: str) -> None:
+    row.status = "OPEN"
+    for attr, value in [
+        ("updated_at", dt.datetime.now()),
+        ("exit_reason", reason),
+        ("close_reason", reason),
+    ]:
+        try:
+            if hasattr(row, attr):
+                setattr(row, attr, value)
+        except Exception:
+            pass
+
+
+def _exit_closing_reconcile_loop() -> None:
+    interval = max(1.0, _exit_board_env_float("EXIT_CLOSING_RECONCILE_INTERVAL_SEC", 5.0))
+    stale_sec = max(2.0, _exit_board_env_float("EXIT_CLOSING_STALE_SEC", 20.0))
+    logger.warning("[EXIT CLOSING RECONCILE] loop start interval=%.1fs stale_sec=%.1fs rest_first=True ignored=%s", interval, stale_sec, sorted(_exit_closing_reconcile_ignored_symbols()))
+
+    while True:
+        session = None
+        try:
+            ok, broker_symbols = _exit_closing_reconcile_load_broker_open_symbols()
+            if not ok:
+                logger.debug("[EXIT CLOSING RECONCILE] broker REST symbols unavailable -> skip")
+                time.sleep(interval)
+                continue
+            session = Session_position()
+            rows = session.query(Position).filter(Position.status == "CLOSING").all()
+            changed = 0
+            for row in rows or []:
+                sym = _normalize_symbol(getattr(row, "symbol", ""))
+                if not sym:
+                    continue
+                if _exit_closing_reconcile_is_ignored_symbol(sym):
+                    logger.debug("[EXIT CLOSING RECONCILE] ignored CLOSING symbol=%s", sym)
+                    continue
+                age = _exit_closing_reconcile_row_age_sec(row)
+                if age < stale_sec:
+                    continue
+                if sym in broker_symbols:
+                    _exit_closing_reconcile_open_row(row, "closing_stale_broker_rest_still_open")
+                    changed += 1
+                    logger.warning("[EXIT CLOSING RECONCILE] stale CLOSING -> OPEN symbol=%s age=%.1fs broker_open=True source=REST", sym, age)
+                else:
+                    _exit_closing_reconcile_close_row(row, "closing_stale_broker_rest_flat_confirmed")
+                    changed += 1
+                    logger.warning("[EXIT CLOSING RECONCILE] stale CLOSING -> CLOSED symbol=%s age=%.1fs broker_open=False source=REST", sym, age)
+                    try:
+                        positions = getattr(global_data, "open_positions", None)
+                        if isinstance(positions, dict):
+                            positions.pop(sym, None)
+                    except Exception:
+                        pass
+            if changed:
+                session.commit()
+            else:
+                session.rollback()
+        except Exception:
+            try:
+                if session is not None:
+                    session.rollback()
+            except Exception:
+                pass
+            logger.exception("[EXIT CLOSING RECONCILE] loop error")
+        finally:
+            try:
+                if session is not None:
+                    session.close()
+            except Exception:
+                pass
+        time.sleep(interval)
+
+
+def start_exit_closing_stale_reconcile_loop() -> bool:
+    """CLOSINGのまま長時間残った建玉を救済するバックグラウンドループを起動する (冪等)。"""
+    global _exit_closing_reconcile_installed, _exit_closing_reconcile_thread_started
+    if _exit_closing_reconcile_installed:
+        return True
+    if not EXIT_CLOSING_RECONCILE_ENABLED:
+        logger.warning("[EXIT CLOSING RECONCILE] disabled")
+        return False
+    if not _exit_closing_reconcile_thread_started:
+        threading.Thread(target=_exit_closing_reconcile_loop, daemon=True, name="exit_closing_reconcile_loop").start()
+        _exit_closing_reconcile_thread_started = True
+    _exit_closing_reconcile_installed = True
+    logger.warning(
+        "[EXIT CLOSING RECONCILE] installed stale_sec=%.1f interval=%.1f rest_timeout=%.1f memory_fallback=%s ignored=%s",
+        _exit_board_env_float("EXIT_CLOSING_STALE_SEC", 20.0),
+        _exit_board_env_float("EXIT_CLOSING_RECONCILE_INTERVAL_SEC", 5.0),
+        _exit_board_env_float("EXIT_CLOSING_RECONCILE_REST_TIMEOUT_SEC", 1.5),
+        _exit_board_env_bool("EXIT_CLOSING_RECONCILE_ALLOW_MEMORY_FALLBACK", False),
+        sorted(_exit_closing_reconcile_ignored_symbols()),
+    )
+    return True
+
+
+__all__ = [
+    "set_exit_order_sender",
+    "execute_exit",
+    "start_exit_fill_confirm_loop",
+    "start_exit_closing_stale_reconcile_loop",
+]
