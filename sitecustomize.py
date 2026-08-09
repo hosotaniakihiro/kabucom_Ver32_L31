@@ -307,8 +307,10 @@ BACKGROUND_MAIN_PATCHES = [
     ("core.startup.final_entry_tonosama_liquidity_patch", "FINAL_TONOSAMA_LIQUIDITY", "DISABLE_FINAL_TONOSAMA_LIQUIDITY_PATCH"),
     ("core.startup.final_entry_board_guard_signature_runtime_patch", "FINAL_BOARD_GUARD_SIGNATURE", "DISABLE_FINAL_BOARD_GUARD_SIGNATURE_PATCH"),
     # tonosama_fast_score_prefilter_patch は trading/entry/tonosama/fast_score_prefilter.py
-    # へ本文化済み。残っていた中継 install (tonosama_range_from_history_patch) をここで直接行う。
-    ("core.startup.tonosama_range_from_history_patch", "TONOSAMA_RANGE_FROM_HISTORY", "DISABLE_TONOSAMA_FAST_SCORE_PREFILTER_PATCH"),
+    # へ本文化済み。中継していた tonosama_range_from_history_patch も
+    # trading/entry/tonosama/runner.py (_repair_intrabar_range_from_history) へ
+    # 本文化済みのため、ここでの install は不要になった。
+    # スコープと env 条件は runner._range_repair_enabled() が再現している。
     ("trading.entry.tonosama.fresh_summary_wait", "TONOSAMA_FRESH_SUMMARY_WAIT_FIX", "DISABLE_TONOSAMA_FRESH_SUMMARY_WAIT_FIX_PATCH"),
     ("core.startup.summary_ai_entry_hook_dataframe_truth_patch", "SUMMARY_AI_DF_TRUTH_PATCH", "DISABLE_SUMMARY_AI_DF_TRUTH_PATCH"),
     ("core.startup.summary_ai_candidate_refill_patch", "SUMMARY_AI_CANDIDATE_REFILL", "DISABLE_SUMMARY_AI_CANDIDATE_REFILL_PATCH"),

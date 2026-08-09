@@ -124,7 +124,122 @@ def _first_existing(df: pd.DataFrame, names: list[str]) -> str | None:
     return None
 
 
+# ============================================================
+# 履歴からの値幅補修 (旧 core/startup/tonosama_range_from_history_patch.py)
+# ------------------------------------------------------------
+# 最新の PUSH 1分足が one-tick bar (high == low == close) になると
+# _intrabar_range_pct が 0 になり、実際には 3m/5m の履歴で値動きが
+# 証明できている銘柄まで strict filter で落ちてしまう。
+# volume_surge.py が既に作っている履歴カラムからだけ補修する。
+# fail-open ではない。履歴にも値動きの根拠が無い行はそのまま落とす。
+# ============================================================
+_RANGE_REPAIR_VERSION = "V1-TONOSAMA-RANGE-FROM-HISTORY-STRICT"
+
+_RANGE_REPAIR_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+
+_RANGE_REPAIR_HISTORY_COLS = (
+    "intrabar_range_pct_3m",
+    "intrabar_range_pct_5m",
+    "range_pct_3m",
+    "range_pct_5m",
+    "price_change_pct_3m",
+    "price_change_pct_5m",
+    "prev_3m_last_delta_pct",
+    "prev_5m_last_delta_pct",
+    "_max_price_change_pct",
+)
+
+
+def _range_repair_enabled() -> bool:
+    """このプロセスで履歴からの値幅補修を行うか。
+
+    旧パッチは sitecustomize の BACKGROUND_MAIN_PATCHES 経由 = main.py 専用
+    (SITECUSTOMIZE_ENABLE_FULL_NONMAIN=1 の明示時を含む) で install されていた。
+    そのスコープと install 条件 2 つをそのまま再現する。
+    TONOSAMA_RANGE_REPAIR_SCOPE_ENABLED=1/0 で明示的に上書きできる。
+    """
+    try:
+        raw = os.getenv("TONOSAMA_RANGE_REPAIR_SCOPE_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return _env_bool("TONOSAMA_RANGE_REPAIR_SCOPE_ENABLED", True)
+        # sitecustomize._install_module の disabled_env は "1" 完全一致で判定していた
+        if str(os.environ.get("DISABLE_TONOSAMA_FAST_SCORE_PREFILTER_PATCH", "")).strip() == "1":
+            return False
+        if not _env_bool("TONOSAMA_RANGE_FROM_HISTORY_PATCH_ENABLED", True):
+            return False
+        if _env_bool("CORE_STARTUP_FORCE_FULL_INIT_PATCHES", False):
+            return True
+        argv = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        if any(a.endswith("/main.py") or a == "main.py" for a in argv):
+            return True
+        if any(name in " ".join(argv) for name in _RANGE_REPAIR_DB_PROCESS_NAMES):
+            return False
+        return _env_bool("SITECUSTOMIZE_ENABLE_FULL_NONMAIN", False)
+    except Exception:
+        return False
+
+
+def _range_repair_num(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    """inf を落としてから fillna する。runner._num_series とは意図的に別実装。"""
+    if df is None or df.empty or col not in df.columns:
+        return pd.Series(default, index=df.index if df is not None else None, dtype="float64")
+    return pd.to_numeric(df[col], errors="coerce").replace([float("inf"), -float("inf")], pd.NA).fillna(default)
+
+
+def _best_history_move_pct(x: pd.DataFrame) -> pd.Series:
+    vals = []
+    for col in _RANGE_REPAIR_HISTORY_COLS:
+        if col in x.columns:
+            vals.append(_range_repair_num(x, col, 0.0).abs())
+    if not vals:
+        return pd.Series(0.0, index=x.index, dtype="float64")
+    m = vals[0]
+    for s in vals[1:]:
+        m = m.combine(s, max)
+    return m.fillna(0.0)
+
+
+def _repair_intrabar_range_from_history(x: pd.DataFrame) -> pd.DataFrame:
+    if x is None or x.empty:
+        return x
+    y = x.copy()
+    if "_intrabar_range_pct" not in y.columns:
+        return y
+    cur = _range_repair_num(y, "_intrabar_range_pct", 0.0).abs()
+    hist = _best_history_move_pct(y)
+    # _intrabar_range_pct も price_change_pct_* も percent 単位なのでそのまま入れ替えてよい
+    needs = cur <= 0.0
+    repairable = needs & (hist > 0.0)
+    if repairable.any():
+        y.loc[repairable, "_intrabar_range_pct"] = hist.loc[repairable]
+        try:
+            logger.warning(
+                "[TONOSAMA RANGE REPAIR] repaired rows=%s version=%s sample=%s",
+                int(repairable.sum()),
+                _RANGE_REPAIR_VERSION,
+                y.loc[repairable, [c for c in ["symbol", "symbolname", "close", "_intrabar_range_pct", "_max_price_change_pct", "price_change_pct_3m", "price_change_pct_5m"] if c in y.columns]].head(12).to_dict("records"),
+            )
+        except Exception:
+            pass
+    return y
+
+
 def _ensure_actual_movement_cols(df: pd.DataFrame) -> pd.DataFrame:
+    out = _ensure_actual_movement_cols_core(df)
+    if _range_repair_enabled():
+        return _repair_intrabar_range_from_history(out)
+    return out
+
+
+def _ensure_actual_movement_cols_core(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     x = df.copy()
