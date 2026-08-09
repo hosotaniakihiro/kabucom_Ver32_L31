@@ -25,25 +25,17 @@ def install_audit_logging() -> bool:
         ok_all = False
 
     try:
-        from core.startup.position_trade_reason_schema_patch import install as install_position_reason_schema
-        ok_all = bool(install_position_reason_schema()) and ok_all
+        # native of core/startup/position_trade_reason_schema_patch.install()
+        from trading.audit_logging.recorder import ensure_position_trade_reason_schema
+        ensure_position_trade_reason_schema()
     except Exception:
         logger.exception('[AUDIT INSTALL] position reason schema patch failed')
         ok_all = False
 
-    try:
-        from core.startup.audit_full_trade_link_patch import install as install_audit_full_link
-        ok_all = bool(install_audit_full_link()) and ok_all
-    except Exception:
-        logger.exception('[AUDIT INSTALL] audit full trade link patch failed')
-        ok_all = False
-
-    try:
-        from core.startup.audit_full_trade_link_no_duplicate_patch import install as install_audit_compact_writer
-        ok_all = bool(install_audit_compact_writer()) and ok_all
-    except Exception:
-        logger.exception('[AUDIT INSTALL] audit compact writer patch failed')
-        ok_all = False
+    # audit_full_trade_link_patch / audit_full_trade_link_no_duplicate_patch:
+    # native化済み。recorder.record_*/ensure_audit_db が最終合成後の挙動
+    # (entry_id/reason_code/ranking_snapshot等の拡張列へ1件だけ書き込む) を
+    # 直接実装しているため、ここでの動的パッチ適用は不要。
 
     try:
         from trading.audit_logging.entry_controller_audit_patch import install as install_entry_controller_patch
