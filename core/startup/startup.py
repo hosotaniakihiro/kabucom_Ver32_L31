@@ -18,10 +18,17 @@
 
 from __future__ import annotations
 
+import collections
 import configparser
+import datetime as dt
+import json
 import logging
 import os
+import threading
+import time
+import urllib.request
 from pathlib import Path
+from typing import Any
 
 from core.startup.startup_orchestrator import run_system_startup
 
@@ -494,6 +501,327 @@ def install_board_runtime_safety_clamp() -> bool:
     return True
 
 
+# ============================================================
+# board REST API monitor
+# (旧 core/startup/board_rest_api_monitor_patch.py V1 から移設)
+# ------------------------------------------------------------
+# RESTフル板導入後のAPI呼び出し状況を監視する。
+# urllib.request.urlopen を軽くwrapし、kabusapi /board /positions の
+# 呼び出し回数・失敗回数・平均時間を1分ごとにログ出力する。
+#
+# 注意:
+#   - 挙動は変えない。監視だけ。
+#   - URLがkabusapi以外なら集計しない。
+# ============================================================
+_board_rest_api_monitor_installed = False
+_board_rest_api_monitor_orig_urlopen = None
+_board_rest_api_monitor_lock = threading.RLock()
+_board_rest_api_monitor_counters: dict[str, dict[str, float]] = collections.defaultdict(
+    lambda: {"ok": 0.0, "ng": 0.0, "total_ms": 0.0, "max_ms": 0.0}
+)
+_board_rest_api_monitor_recent: collections.deque = collections.deque(maxlen=2000)
+
+
+def _board_rest_api_monitor_env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return bool(default)
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _board_rest_api_monitor_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        return float(v) if v not in (None, "") else float(default)
+    except Exception:
+        return float(default)
+
+
+def _board_rest_api_monitor_url_of(req: Any) -> str:
+    try:
+        if isinstance(req, str):
+            return req
+        if hasattr(req, "full_url"):
+            return str(req.full_url)
+        if hasattr(req, "get_full_url"):
+            return str(req.get_full_url())
+    except Exception:
+        pass
+    return ""
+
+
+def _board_rest_api_monitor_kind(url: str) -> str | None:
+    u = str(url or "").lower()
+    if "kabusapi" not in u:
+        return None
+    if "/board/" in u or u.endswith("/board"):
+        return "board"
+    if "/positions" in u:
+        return "positions"
+    if "/orders" in u:
+        return "orders"
+    return None
+
+
+def _board_rest_api_monitor_record(kind: str, ok: bool, elapsed_ms: float) -> None:
+    now = time.time()
+    with _board_rest_api_monitor_lock:
+        d = _board_rest_api_monitor_counters[kind]
+        if ok:
+            d["ok"] += 1
+        else:
+            d["ng"] += 1
+        d["total_ms"] += float(elapsed_ms)
+        d["max_ms"] = max(float(d.get("max_ms", 0.0)), float(elapsed_ms))
+        _board_rest_api_monitor_recent.append((now, kind, ok, float(elapsed_ms)))
+
+
+def _board_rest_api_monitor_snapshot_window(sec: float) -> dict[str, dict[str, float]]:
+    cutoff = time.time() - sec
+    out: dict[str, dict[str, float]] = collections.defaultdict(
+        lambda: {"ok": 0.0, "ng": 0.0, "total_ms": 0.0, "max_ms": 0.0}
+    )
+    with _board_rest_api_monitor_lock:
+        for ts, kind, ok, ms in list(_board_rest_api_monitor_recent):
+            if ts < cutoff:
+                continue
+            d = out[kind]
+            if ok:
+                d["ok"] += 1
+            else:
+                d["ng"] += 1
+            d["total_ms"] += ms
+            d["max_ms"] = max(d["max_ms"], ms)
+    return dict(out)
+
+
+def _board_rest_api_monitor_format_stats(stats: dict[str, dict[str, float]]) -> str:
+    parts = []
+    for kind in ("board", "positions", "orders"):
+        d = stats.get(kind, {})
+        ok = int(d.get("ok", 0))
+        ng = int(d.get("ng", 0))
+        total = ok + ng
+        avg = (d.get("total_ms", 0.0) / total) if total else 0.0
+        mx = d.get("max_ms", 0.0)
+        parts.append(f"{kind}:total={total} ok={ok} ng={ng} avg_ms={avg:.1f} max_ms={mx:.1f}")
+    return " | ".join(parts)
+
+
+def _board_rest_api_monitor_report_loop() -> None:
+    interval = max(10.0, _board_rest_api_monitor_env_float("BOARD_REST_API_MONITOR_INTERVAL_SEC", 60.0))
+    warn_board_per_min = max(1.0, _board_rest_api_monitor_env_float("BOARD_REST_API_MONITOR_WARN_BOARD_PER_MIN", 120.0))
+    while True:
+        try:
+            stats = _board_rest_api_monitor_snapshot_window(interval)
+            line = _board_rest_api_monitor_format_stats(stats)
+            board_total = int(stats.get("board", {}).get("ok", 0) + stats.get("board", {}).get("ng", 0))
+            if board_total >= warn_board_per_min:
+                logger.warning(
+                    "[BOARD REST API MONITOR] HIGH_USAGE window=%.0fs %s warn_board_per_min=%.0f",
+                    interval, line, warn_board_per_min,
+                )
+            else:
+                logger.info("[BOARD REST API MONITOR] window=%.0fs %s", interval, line)
+        except Exception:
+            logger.exception("[BOARD REST API MONITOR] report loop error")
+        time.sleep(interval)
+
+
+def install_board_rest_api_monitor() -> bool:
+    global _board_rest_api_monitor_installed, _board_rest_api_monitor_orig_urlopen
+    if _board_rest_api_monitor_installed:
+        return True
+    if not _board_rest_api_monitor_env_bool("BOARD_REST_API_MONITOR_ENABLED", True):
+        logger.warning("[BOARD REST API MONITOR] disabled")
+        return False
+    old = urllib.request.urlopen
+    if getattr(old, "_board_rest_api_monitor_wrapped", False):
+        _board_rest_api_monitor_installed = True
+        return True
+    _board_rest_api_monitor_orig_urlopen = old
+
+    def wrapped_urlopen(req, *args, **kwargs):
+        url = _board_rest_api_monitor_url_of(req)
+        k = _board_rest_api_monitor_kind(url)
+        if not k:
+            return old(req, *args, **kwargs)
+        start = time.perf_counter()
+        try:
+            ret = old(req, *args, **kwargs)
+            _board_rest_api_monitor_record(k, True, (time.perf_counter() - start) * 1000.0)
+            return ret
+        except Exception:
+            _board_rest_api_monitor_record(k, False, (time.perf_counter() - start) * 1000.0)
+            raise
+
+    wrapped_urlopen._board_rest_api_monitor_wrapped = True  # type: ignore[attr-defined]
+    wrapped_urlopen._original = old  # type: ignore[attr-defined]
+    urllib.request.urlopen = wrapped_urlopen
+    threading.Thread(target=_board_rest_api_monitor_report_loop, daemon=True, name="board_rest_api_monitor_loop").start()
+    _board_rest_api_monitor_installed = True
+    logger.warning(
+        "[BOARD REST API MONITOR] installed interval=%.0fs warn_board_per_min=%.0f",
+        _board_rest_api_monitor_env_float("BOARD_REST_API_MONITOR_INTERVAL_SEC", 60.0),
+        _board_rest_api_monitor_env_float("BOARD_REST_API_MONITOR_WARN_BOARD_PER_MIN", 120.0),
+    )
+    return True
+
+
+# ============================================================
+# board runtime self check
+# (旧 core/startup/board_runtime_self_check_patch.py V1.1 から移設)
+# ------------------------------------------------------------
+# マーケット時間外でも確認できる起動時セルフチェック。
+# APIは叩かず、runtime patchが実際にwrap/起動されているかを確認する。
+#
+# V1.1:
+#   - runtime/diagnostics/board_runtime_self_check.json に結果保存
+#   - ログが流れても後から確認できるようにする
+# ============================================================
+_board_runtime_self_check_installed = False
+
+
+def _board_runtime_self_check_b(name: str) -> bool:
+    return str(os.getenv(name, "")).strip().lower() in {"1", "true", "yes", "y", "on", "enabled"}
+
+
+def _board_runtime_self_check_has_attr(obj: Any, attr: str) -> bool:
+    try:
+        return bool(getattr(obj, attr, False))
+    except Exception:
+        return False
+
+
+def _board_runtime_self_check_chain_has(fn: Any, attr: str, limit: int = 30) -> bool:
+    seen: set[int] = set()
+    cur = fn
+    for _ in range(limit):
+        if not callable(cur):
+            return False
+        ident = id(cur)
+        if ident in seen:
+            return False
+        seen.add(ident)
+        if _board_runtime_self_check_has_attr(cur, attr):
+            return True
+        cur = getattr(cur, "_original", None) or getattr(cur, "_rest_full_board_original", None)
+    return False
+
+
+def _board_runtime_self_check_entry_order_builder() -> dict:
+    out = {"available": False, "rest_full_board_wrapped": False}
+    try:
+        import trading.handlers.entry_order_builder as eob
+        fn = getattr(eob, "build_entry_order", None)
+        out["available"] = callable(fn)
+        out["rest_full_board_wrapped"] = _board_runtime_self_check_chain_has(fn, "_rest_full_board_patch") if callable(fn) else False
+    except Exception as e:
+        out["error"] = repr(e)
+    return out
+
+
+def _board_runtime_self_check_exit_executor() -> dict:
+    out = {
+        "available": False,
+        "limit_board_touch_wrapped": False,
+        "pending_close_wrapped": False,
+    }
+    try:
+        import trading.exit.executor as ex
+        close_payload = getattr(ex, "_build_kabu_close_payload", None)
+        close_db = getattr(ex, "_close_db_position", None)
+        out["available"] = callable(close_payload) or callable(close_db)
+        if callable(close_payload):
+            out["limit_board_touch_wrapped"] = (
+                # 本文化済み (trading/exit/executor._apply_exit_limit_board_touch)
+                _board_runtime_self_check_chain_has(close_payload, "_exit_limit_board_touch_builtin")
+                or _board_runtime_self_check_chain_has(close_payload, "_exit_limit_board_touch_wrapped_v11")
+                or _board_runtime_self_check_chain_has(close_payload, "_exit_limit_board_touch_wrapped")
+            )
+        out["pending_close_wrapped"] = _board_runtime_self_check_chain_has(close_db, "_exit_limit_pending_close_wrapped") if callable(close_db) else False
+    except Exception as e:
+        out["error"] = repr(e)
+    return out
+
+
+def _board_runtime_self_check_global_data_retry_hook() -> dict:
+    out = {"add_entry_inflight_wrapped": False}
+    try:
+        from global_state import global_data
+        fn = getattr(global_data, "add_entry_inflight", None)
+        out["add_entry_inflight_wrapped"] = _board_runtime_self_check_chain_has(fn, "_summary_retry_add_wrapped") if callable(fn) else False
+    except Exception as e:
+        out["error"] = repr(e)
+    return out
+
+
+def _board_runtime_self_check_urlopen_monitor() -> dict:
+    fn = urllib.request.urlopen
+    return {
+        "urlopen_wrapped": _board_runtime_self_check_has_attr(fn, "_board_rest_api_monitor_wrapped"),
+        "monitor_enabled_env": _board_runtime_self_check_b("BOARD_REST_API_MONITOR_ENABLED"),
+    }
+
+
+def _board_runtime_self_check_diagnostics_path() -> Path:
+    raw = os.getenv("BOARD_RUNTIME_SELF_CHECK_PATH", "").strip()
+    if raw:
+        return Path(raw)
+    return Path("runtime") / "diagnostics" / "board_runtime_self_check.json"
+
+
+def _board_runtime_self_check_save_result(payload: dict) -> None:
+    try:
+        p = _board_runtime_self_check_diagnostics_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        logger.warning("[BOARD RUNTIME SELF CHECK] saved path=%s", p)
+    except Exception:
+        logger.exception("[BOARD RUNTIME SELF CHECK] save diagnostics failed")
+
+
+def install_board_runtime_self_check() -> bool:
+    global _board_runtime_self_check_installed
+    if _board_runtime_self_check_installed:
+        return True
+    checks = {
+        "entry_order_builder": _board_runtime_self_check_entry_order_builder(),
+        "exit_executor": _board_runtime_self_check_exit_executor(),
+        "summary_retry": _board_runtime_self_check_global_data_retry_hook(),
+        "urlopen_monitor": _board_runtime_self_check_urlopen_monitor(),
+        "env": {
+            "entry_rest": _board_runtime_self_check_b("ENTRY_REST_FULL_BOARD_ENABLED"),
+            "entry_double_check": _board_runtime_self_check_b("ENTRY_REST_FULL_BOARD_DOUBLE_CHECK_ENABLED"),
+            "exit_rest": _board_runtime_self_check_b("EXIT_REST_FULL_BOARD_ENABLED"),
+            "exit_reprice": _board_runtime_self_check_b("EXIT_UNFILLED_REPRICE_ENABLED"),
+            "exit_fill_confirm": _board_runtime_self_check_b("EXIT_FILL_CONFIRM_ENABLED"),
+            "exit_closing_reconcile": _board_runtime_self_check_b("EXIT_CLOSING_RECONCILE_ENABLED"),
+            "api_monitor": _board_runtime_self_check_b("BOARD_REST_API_MONITOR_ENABLED"),
+        },
+    }
+    ok = True
+    try:
+        ok = bool(checks["entry_order_builder"].get("rest_full_board_wrapped"))
+        ok = ok and bool(checks["exit_executor"].get("limit_board_touch_wrapped"))
+        ok = ok and bool(checks["exit_executor"].get("pending_close_wrapped"))
+        ok = ok and bool(checks["urlopen_monitor"].get("urlopen_wrapped"))
+    except Exception:
+        ok = False
+
+    payload = {
+        "ok": bool(ok),
+        "checked_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "checks": checks,
+        "diagnostics_path": str(_board_runtime_self_check_diagnostics_path()),
+    }
+    _board_runtime_self_check_save_result(payload)
+    level = logger.warning if ok else logger.error
+    level("[BOARD RUNTIME SELF CHECK] ok=%s checks=%s", ok, checks)
+    _board_runtime_self_check_installed = True
+    return ok
+
+
 def _install_entrypoint_runtime_patches() -> None:
     try:
         install_board_settings_env_bridge()
@@ -511,8 +839,6 @@ def _install_entrypoint_runtime_patches() -> None:
         logger.exception("[startup.entrypoint] board runtime diagnostics install failed")
 
     try:
-        from core.startup.board_rest_api_monitor_patch import install as install_board_rest_api_monitor
-
         install_board_rest_api_monitor()
     except Exception:
         logger.exception("[startup.entrypoint] board REST API monitor install failed")
@@ -632,8 +958,6 @@ def _install_entrypoint_runtime_patches() -> None:
         logger.exception("[startup.entrypoint] exit closing stale reconcile patch install failed")
 
     try:
-        from core.startup.board_runtime_self_check_patch import install as install_board_runtime_self_check
-
         install_board_runtime_self_check()
     except Exception:
         logger.exception("[startup.entrypoint] board runtime self check install failed")
