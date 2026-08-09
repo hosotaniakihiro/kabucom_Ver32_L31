@@ -822,6 +822,115 @@ def install_board_runtime_self_check() -> bool:
     return ok
 
 
+# ============================================================
+# final entry board REST direct env defaults
+# (旧 core/startup/final_entry_board_rest_direct_patch.py V4.1 から移設)
+# ------------------------------------------------------------
+# 目的:
+#   SUMMARY_AI / TONOSAMA の発注直前に PUSH 板が無い場合に使われる
+#   REST /board 直接フォールバック (trading/handlers/entry_controller の
+#   _final_guard_try_get_bid_ask_from_api や core/startup/board_retry_patch.py
+#   の _fetch_board_rest が読む ENTRY_BOARD_REST_DIRECT_* env) を、
+#   起動時に強制的に有効化する。
+#
+# 注意:
+#   - 旧パッチが提供していた _try_get_bid_ask_from_api という関数差し替え
+#     ロジックは、差し替え先 (final_entry_safety_guard 側の同名関数) が
+#     既に本文化されて存在しないため、旧パッチ自身のコード内コメントにも
+#     ある通り事実上デッドコードだった (誰も呼んでいなかった)。
+#     実効なのは下記の env 強制設定と、起動直後しばらく再適用するループのみ。
+#   - ENTRY_BOARD_REST_DIRECT_ENABLED は setdefault ではなく毎回 "1" に
+#     上書きする (旧パッチと同じ挙動)。DISABLE_ENTRY_BOARD_REST_DIRECT_PATCH=1
+#     の場合のみ何もしない。
+# ============================================================
+_ENTRY_BOARD_REST_DIRECT_TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+_ENTRY_BOARD_REST_DIRECT_FALSE = {"0", "false", "no", "n", "off", "ng", "disable", "disabled", ""}
+_entry_board_rest_direct_watcher_started = False
+
+
+def _entry_board_rest_direct_env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    s = str(raw).strip().lower()
+    if s in _ENTRY_BOARD_REST_DIRECT_TRUE:
+        return True
+    if s in _ENTRY_BOARD_REST_DIRECT_FALSE:
+        return False
+    return bool(default)
+
+
+def _entry_board_rest_direct_env_float(name: str, default: float) -> float:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return float(default)
+        return float(str(raw).replace(",", ""))
+    except Exception:
+        return float(default)
+
+
+def _entry_board_rest_direct_env_int(name: str, default: int) -> int:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return int(default)
+        return int(float(str(raw).replace(",", "")))
+    except Exception:
+        return int(default)
+
+
+def _entry_board_rest_direct_patch_disabled() -> bool:
+    return os.getenv("DISABLE_ENTRY_BOARD_REST_DIRECT_PATCH", "").strip() == "1"
+
+
+def _set_entry_board_rest_direct_env_defaults() -> None:
+    if _entry_board_rest_direct_patch_disabled():
+        return
+    # 旧バージョンが残した 0 を上書きする。明示停止は DISABLE_ENTRY_BOARD_REST_DIRECT_PATCH=1 に統一。
+    os.environ["ENTRY_BOARD_REST_DIRECT_ENABLED"] = "1"
+    os.environ.setdefault("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", "0.6")
+    os.environ.setdefault("ENTRY_BOARD_REST_EXCHANGES", "1")
+    os.environ.setdefault("ENTRY_BOARD_REST_DIRECT_LEVELS", "5")
+
+
+def _install_entry_board_rest_direct_env_defaults_once(log_patch: bool = True) -> bool:
+    try:
+        _set_entry_board_rest_direct_env_defaults()
+        if log_patch:
+            logger.warning(
+                "[FINAL ENTRY BOARD REST DIRECT] installed direct_enabled=%s disabled=%s timeout=%.3f hard_block=%s allow_without_board=%s",
+                _entry_board_rest_direct_env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", True),
+                _entry_board_rest_direct_patch_disabled(),
+                _entry_board_rest_direct_env_float("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", 0.6),
+                _entry_board_rest_direct_env_bool("ENTRY_BOARD_MISSING_HARD_BLOCK", True),
+                _entry_board_rest_direct_env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", False),
+            )
+        return True
+    except Exception:
+        logger.exception("[FINAL ENTRY BOARD REST DIRECT] install_once failed")
+        return False
+
+
+def _entry_board_rest_direct_watcher() -> None:
+    loops = max(1, _entry_board_rest_direct_env_int("ENTRY_BOARD_REST_DIRECT_WATCH_LOOPS", 30))
+    sleep_sec = max(0.5, _entry_board_rest_direct_env_float("ENTRY_BOARD_REST_DIRECT_WATCH_SLEEP_SEC", 1.0))
+    for i in range(loops):
+        ok = _install_entry_board_rest_direct_env_defaults_once(log_patch=False)
+        if i in (0, loops - 1):
+            logger.warning("[FINAL ENTRY BOARD REST DIRECT] enforce i=%s/%s ok=%s", i, loops, ok)
+        time.sleep(sleep_sec)
+
+
+def install_entry_board_rest_direct_env_defaults() -> bool:
+    global _entry_board_rest_direct_watcher_started
+    ok = _install_entry_board_rest_direct_env_defaults_once(log_patch=True)
+    if not _entry_board_rest_direct_watcher_started:
+        _entry_board_rest_direct_watcher_started = True
+        threading.Thread(target=_entry_board_rest_direct_watcher, name="final-entry-board-rest-direct-enforcer", daemon=True).start()
+    return bool(ok)
+
+
 def _install_entrypoint_runtime_patches() -> None:
     try:
         install_board_settings_env_bridge()
@@ -923,11 +1032,9 @@ def _install_entrypoint_runtime_patches() -> None:
     # (パッチ側は空スタブだったので削除した)。
 
     try:
-        from core.startup.final_entry_board_rest_direct_patch import install as install_final_entry_board_rest_direct_patch
-
-        install_final_entry_board_rest_direct_patch()
+        install_entry_board_rest_direct_env_defaults()
     except Exception:
-        logger.exception("[startup.entrypoint] final entry direct REST board fallback install failed")
+        logger.exception("[startup.entrypoint] final entry direct REST board fallback env defaults install failed")
 
     # exit_limit_pending_close_runtime_patch は trading/exit/executor.py の
     # _close_db_position (native化した _mark_db_position_closing 分岐) へ
