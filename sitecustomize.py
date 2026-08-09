@@ -268,6 +268,33 @@ os.environ["SUMMARY_AI_VOL_RESCUE_MIN_ABS_SLOPE"] = os.getenv(
 )
 
 
+def _apply_final_board_guard_signature_env_defaults() -> None:
+    """final_entry_board_guard_signature_runtime_patch が持っていた env 既定値。
+
+    このパッチは final_entry_safety_guard_patch の _board_guard /
+    _call_board_guard / _board_missing_fallback_ok を包み直すものだったが、
+    ホストがコミット 46ddd54 で本文化されて属性ごと消えたため、
+    _patch_once() の中で実効だったのはこの 6 件の setdefault だけになっていた
+    (ラップは 3 つとも target=None で失敗し、install() は常に False を返す)。
+
+    順序について: このうち ENTRY_ALLOW_ENTRY_WITHOUT_BOARD は
+    entry_controller._final_guard_board_ok (板データ無しエントリーの許可) を
+    左右する load-bearing な値。他に同じキーを書くのは
+      - 同値の setdefault (entry_final_filter_failopen "1" /
+        entry_count_unblock "0" / runtime_env_defaults の MIN_* 3 件)
+      - 後から実行されるハード代入 (board_missing_failopen_runtime 等)
+      - sitecustomize より後に走る usercustomize の setdefault "0"
+    だけなので、background loop の先頭へ前倒ししても最終値は変わらない。
+    """
+    os.environ.setdefault("ENTRY_SUMMARY_AI_DELEGATE_BOARD_TO_ORDER_BUILDER", "1")
+    os.environ.setdefault("ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY", "0")
+    # 成行許可ではなく、order_builder の安全指値 fallback へ進ませるための既定値。
+    os.environ.setdefault("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", "1")
+    os.environ.setdefault("ENTRY_ALLOW_WITHOUT_BOARD_MIN_VOLUME", os.getenv("ENTRY_SUMMARY_AI_DELEGATE_MIN_VOLUME", "30000"))
+    os.environ.setdefault("ENTRY_ALLOW_WITHOUT_BOARD_MIN_TURNOVER", os.getenv("ENTRY_SUMMARY_AI_DELEGATE_MIN_TURNOVER", "10000000"))
+    os.environ.setdefault("ENTRY_ALLOW_WITHOUT_BOARD_MIN_SCORE", os.getenv("ENTRY_SUMMARY_AI_DELEGATE_MIN_SCORE", "0.90"))
+
+
 def _apply_summary_ai_vol_rescue_env_defaults() -> None:
     """summary_ai_volatility_rescue_patch (V5 strict stub) が持っていた env 既定値。
 
@@ -308,7 +335,11 @@ BACKGROUND_MAIN_PATCHES = [
     # final_entry_safety_guard_patch._liquidity_guard が本文化で消えており、
     # install() が常に False を返す完全な死にコードだった。
     # 流動性ガード本体は trading/handlers/entry_controller._final_guard_liquidity_ok。
-    ("core.startup.final_entry_board_guard_signature_runtime_patch", "FINAL_BOARD_GUARD_SIGNATURE", "DISABLE_FINAL_BOARD_GUARD_SIGNATURE_PATCH"),
+    # final_entry_board_guard_signature_runtime_patch は削除済み。
+    # ラップ対象の final_entry_safety_guard_patch._board_guard / _call_board_guard が
+    # 本文化で消えており、実効は env 既定値 6 件だけだった。
+    # それを _apply_final_board_guard_signature_env_defaults() として
+    # background loop / full non-main の先頭で設定する。
     # tonosama_fast_score_prefilter_patch は trading/entry/tonosama/fast_score_prefilter.py
     # へ本文化済み。中継していた tonosama_range_from_history_patch も
     # trading/entry/tonosama/runner.py (_repair_intrabar_range_from_history) へ
@@ -369,6 +400,7 @@ def _install_optional_rescue_patches() -> None:
 
 def _background_main_patch_loop() -> None:
     logger.warning("[SITECUSTOMIZE] main background patches start count=%s", len(BACKGROUND_MAIN_PATCHES))
+    _apply_final_board_guard_signature_env_defaults()
     _install_patch_list(BACKGROUND_MAIN_PATCHES)
     _install_optional_rescue_patches()
     _install_liq_empty_fallback_only_if_enabled()
@@ -376,8 +408,10 @@ def _background_main_patch_loop() -> None:
     # Final re-apply after all background patches because several summary/controller patches re-wrap runner_core.job_summary.
     _install_module("core.startup.summary_main_push_db_refresh_patch", "SUMMARY_MAIN_PUSH_DB_REFRESH_BG_LAST", disabled_env="DISABLE_SUMMARY_MAIN_PUSH_DB_REFRESH_PATCH")
     _install_module("core.startup.summary_main_direct_push_force_patch", "SUMMARY_FORCE_DIRECT_1M_BG_LAST", disabled_env="DISABLE_SUMMARY_FORCE_DIRECT_1M_PATCH")
-    # Final board signature re-apply after all background patches because some entry guards replace _board_guard.
-    _install_module("core.startup.final_entry_board_guard_signature_runtime_patch", "FINAL_BOARD_GUARD_SIGNATURE_LAST", disabled_env="DISABLE_FINAL_BOARD_GUARD_SIGNATURE_PATCH")
+    # 旧: 全 background パッチの後で board signature を再適用していた
+    # (一部の entry guard が _board_guard を差し替えるため)。ホストが本文化されて
+    # ラップ対象が無くなり、実効は env 既定値だけなので再適用は不要になった。
+    # setdefault は冪等なので loop 先頭の 1 回で足りる。
     # Last Summary-AI consistency pass must run after board/signature and candidate-refill patches.
     _install_module("core.startup.summary_ai_runtime_consistency_patch", "SUMMARY_AI_RUNTIME_CONSISTENCY_LAST", disabled_env="DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH")
     logger.warning("[SITECUSTOMIZE] main background patches done")
@@ -408,6 +442,7 @@ elif _is_main_py_process() and _env_on("SITECUSTOMIZE_MAIN_LITE", True):
 elif _env_on("SITECUSTOMIZE_ENABLE_FULL_NONMAIN", False):
     logger.warning("[SITECUSTOMIZE] full non-main mode enabled by env; installing trading patches argv=%s", sys.argv)
     _apply_summary_ai_vol_rescue_env_defaults()
+    _apply_final_board_guard_signature_env_defaults()
     _install_patch_list(SYNC_MAIN_PATCHES + BACKGROUND_MAIN_PATCHES)
     _install_optional_rescue_patches()
     _install_liq_empty_fallback_only_if_enabled()
