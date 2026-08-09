@@ -18,12 +18,164 @@
 
 from __future__ import annotations
 
+import configparser
 import logging
 import os
+from pathlib import Path
 
 from core.startup.startup_orchestrator import run_system_startup
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# board settings -> env bridge
+# (旧 core/startup/board_settings_env_bridge_patch.py V1.3 から移設)
+# ------------------------------------------------------------
+# RESTフル板/返済指値/未約定管理のruntime patchは os.getenv() を読む。
+# そのため settings.ini に書いた値を起動時に os.environ へ反映する。
+#
+# 優先順位:
+#   1. 既存の環境変数があれば上書きしない
+#   2. settings.ini の [board_runtime] / [entry] / [exit] / [DEFAULT]
+#   3. このファイル内の安全デフォルト
+# ============================================================
+_BOARD_SETTINGS_ENV_DEFAULTS = {
+    # Entry REST full board
+    "ENTRY_REST_FULL_BOARD_ENABLED": "1",
+    "ENTRY_REST_FULL_BOARD_SOURCES": "SUMMARY_AI,RANKING,TONOSAMA,EARLY_SCALP,ENTRY",
+    "ENTRY_REST_FULL_BOARD_EXCHANGE": "1",
+    "ENTRY_REST_FULL_BOARD_DEPTH": "10",
+    "ENTRY_REST_FULL_BOARD_THICK_MIN_QTY": "500",
+    "ENTRY_REST_FULL_BOARD_MAX_SPREAD_PCT": "0.15",
+    "ENTRY_REST_FULL_BOARD_STRICT_GUARD": "1",
+    "ENTRY_REST_FULL_BOARD_CACHE_SEC": "0.8",
+    "ENTRY_REST_FULL_BOARD_MIN_INTERVAL_SEC": "0.7",
+    "ENTRY_REST_FULL_BOARD_TIMEOUT_SEC": "0.8",
+    "ENTRY_REST_FULL_BOARD_IMBALANCE_GUARD_ENABLED": "1",
+    "ENTRY_REST_FULL_BOARD_IMBALANCE_STRICT": "1",
+    "ENTRY_REST_FULL_BOARD_IMBALANCE_DEPTH": "5",
+    "ENTRY_REST_FULL_BOARD_MIN_SAME_SIDE_TOTAL": "300",
+    "ENTRY_REST_FULL_BOARD_MAX_OPPOSITE_RATIO": "2.5",
+    "ENTRY_REST_FULL_BOARD_RATIO_MIN_DENOM": "100",
+    "ENTRY_REST_FULL_BOARD_DOUBLE_CHECK_ENABLED": "1",
+    "ENTRY_REST_FULL_BOARD_DOUBLE_CHECK_STRICT": "1",
+    "ENTRY_REST_FULL_BOARD_DOUBLE_CHECK_WAIT_SEC": "0.25",
+    "ENTRY_REST_FULL_BOARD_DOUBLE_CHECK_MIN_REMAIN_RATIO": "0.60",
+    "ENTRY_REST_FULL_BOARD_DOUBLE_CHECK_FAIL_OPEN": "1",
+    "ENTRY_REST_REPRICE_RETRY_ONCE": "1",
+    "ENTRY_SUMMARY_RETRY_MAX_ROUNDS": "1",
+    "ENTRY_SUMMARY_RETRY_SYMBOL_COOLDOWN_SEC": "4.0",
+
+    # Exit REST full board / pending close
+    "EXIT_REST_FULL_BOARD_ENABLED": "1",
+    "EXIT_REST_FULL_BOARD_EXCHANGE": "1",
+    "EXIT_REST_FULL_BOARD_DEPTH": "10",
+    "EXIT_REST_FULL_BOARD_THICK_MIN_QTY": "500",
+    "EXIT_REST_FULL_BOARD_CACHE_SEC": "0.8",
+    "EXIT_REST_FULL_BOARD_MIN_INTERVAL_SEC": "0.7",
+    "EXIT_REST_FULL_BOARD_TIMEOUT_SEC": "0.8",
+    "EXIT_REST_FULL_BOARD_MAX_SPREAD_PCT": "0.15",
+    "EXIT_REST_FULL_BOARD_STRICT_SPREAD": "0",
+    "EXIT_REST_FULL_BOARD_MAX_TICKS_AWAY": "0",
+    "EXIT_LIMIT_BOARD_TOUCH_ENABLED": "1",
+    "EXIT_LIMIT_FALLBACK_MARKET_IF_NO_BOARD": "1",
+    "EXIT_LIMIT_PENDING_CLOSE_ENABLED": "1",
+    "EXIT_MARK_CLOSED_ON_ORDER_ACCEPT": "0",
+
+    # Exit unfilled / fill confirm / stale reconcile
+    "EXIT_UNFILLED_REPRICE_ENABLED": "1",
+    "EXIT_UNFILLED_CANCEL_SEC": "1.2",
+    "EXIT_UNFILLED_CHECK_INTERVAL_SEC": "0.5",
+    "EXIT_UNFILLED_REPRICE_MAX_ROUNDS": "1",
+    "EXIT_UNFILLED_REPRICE_MARKET_ON_FINAL": "1",
+    "EXIT_FILL_CONFIRM_ENABLED": "1",
+    "EXIT_FILL_CONFIRM_INTERVAL_SEC": "1.0",
+    "EXIT_CLOSING_RECONCILE_ENABLED": "1",
+    "EXIT_CLOSING_STALE_SEC": "20",
+    "EXIT_CLOSING_RECONCILE_INTERVAL_SEC": "5",
+    "EXIT_CLOSING_RECONCILE_REST_TIMEOUT_SEC": "1.5",
+    "EXIT_CLOSING_RECONCILE_ALLOW_MEMORY_FALLBACK": "0",
+
+    # REST API monitor
+    "BOARD_REST_API_MONITOR_ENABLED": "1",
+    "BOARD_REST_API_MONITOR_INTERVAL_SEC": "60",
+    "BOARD_REST_API_MONITOR_WARN_BOARD_PER_MIN": "120",
+
+    # Self check
+    "BOARD_RUNTIME_SELF_CHECK_PATH": "runtime/diagnostics/board_runtime_self_check.json",
+}
+
+_BOARD_SETTINGS_ENV_SECTIONS = ("board_runtime", "entry", "exit", "DEFAULT")
+_board_settings_env_bridge_installed = False
+
+
+def _read_board_settings_ini() -> configparser.ConfigParser:
+    conf = configparser.ConfigParser()
+    paths = [
+        Path("settings.ini"),
+        Path("settings.local.ini"),
+    ]
+    for p in paths:
+        try:
+            if p.exists():
+                conf.read(str(p), encoding="utf-8")
+        except Exception:
+            logger.debug("[BOARD SETTINGS ENV] failed to read %s", p, exc_info=True)
+    return conf
+
+
+def _lookup_board_settings_ini(conf: configparser.ConfigParser, key: str) -> str | None:
+    # そのままの大文字キーと小文字キーの両方を許容する。
+    keys = [key, key.lower()]
+    for sec in _BOARD_SETTINGS_ENV_SECTIONS:
+        try:
+            if sec == "DEFAULT":
+                source = conf.defaults()
+                for k in keys:
+                    if k in source:
+                        return str(source[k]).strip()
+                continue
+            if not conf.has_section(sec):
+                continue
+            for k in keys:
+                if conf.has_option(sec, k):
+                    return str(conf.get(sec, k)).strip()
+        except Exception:
+            continue
+    return None
+
+
+def install_board_settings_env_bridge() -> bool:
+    global _board_settings_env_bridge_installed
+    if _board_settings_env_bridge_installed:
+        return True
+    conf = _read_board_settings_ini()
+    applied = 0
+    kept = 0
+    for key, default in _BOARD_SETTINGS_ENV_DEFAULTS.items():
+        if key in os.environ and str(os.environ.get(key, "")).strip() != "":
+            kept += 1
+            continue
+        value = _lookup_board_settings_ini(conf, key)
+        if value is None or value == "":
+            value = default
+        os.environ[key] = str(value)
+        applied += 1
+    _board_settings_env_bridge_installed = True
+    logger.warning(
+        "[BOARD SETTINGS ENV] installed applied=%s kept_existing_env=%s entry_rest=%s exit_rest=%s exit_reconcile=%s reconcile_rest_timeout=%s memory_fallback=%s api_monitor=%s self_check_path=%s",
+        applied,
+        kept,
+        os.environ.get("ENTRY_REST_FULL_BOARD_ENABLED"),
+        os.environ.get("EXIT_REST_FULL_BOARD_ENABLED"),
+        os.environ.get("EXIT_CLOSING_RECONCILE_ENABLED"),
+        os.environ.get("EXIT_CLOSING_RECONCILE_REST_TIMEOUT_SEC"),
+        os.environ.get("EXIT_CLOSING_RECONCILE_ALLOW_MEMORY_FALLBACK"),
+        os.environ.get("BOARD_REST_API_MONITOR_ENABLED"),
+        os.environ.get("BOARD_RUNTIME_SELF_CHECK_PATH"),
+    )
+    return True
 
 
 # 起動時にRESTフル板/未約定/返済CLOSING関連の実効設定を1回だけまとめてログ出力する。
@@ -144,8 +296,6 @@ def _log_board_runtime_diagnostics() -> bool:
 
 def _install_entrypoint_runtime_patches() -> None:
     try:
-        from core.startup.board_settings_env_bridge_patch import install as install_board_settings_env_bridge
-
         install_board_settings_env_bridge()
     except Exception:
         logger.exception("[startup.entrypoint] board settings env bridge install failed")
