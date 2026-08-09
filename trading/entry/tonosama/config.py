@@ -1,6 +1,6 @@
 # ============================================================
 # File   : trading/entry/tonosama/config.py
-# Version: Ver2.11-INSTALL-RUNTIME-BUDGET-PATCH
+# Version: Ver2.12-NATIVE-ALERT-LIQ-AND-RUNTIME-BUDGET
 # ------------------------------------------------------------
 # 方針:
 #   - volume_surge.py / history guard で履歴不足fail-openを許可した後、
@@ -14,6 +14,16 @@
 #   - Ver2.11:
 #     TONOSAMAの古いdaemon threadが100秒超走り続ける問題を防ぐため、
 #     runtime budget patch を遅延installする。
+#   - Ver2.12:
+#     アラート流動性ガード (旧 core/startup/tonosama_alert_liquidity_guard_patch.py) を
+#     pending_writer.add_tonosama_pending() へ native化。
+#     runtime budget guard (旧 core/startup/tonosama_runtime_budget_patch.py) を
+#     runner.build_tonosama_entries() へ native化。
+#     どちらも起動時モンキーパッチではなくなったため、ここでの install 呼び出しは不要。
+#     (日中流動性ガード tonosama_intraday_liquidity_patch は、実運用の import 順序では
+#     install() が volume_surge/runner 未ロード時点で一度だけ呼ばれ、リトライ機構が
+#     無いため実際にはフィルタが一度も適用されない = 現状ノーオペであることを確認済み。
+#     native化すると挙動が変わってしまうため、今回は意図的に手を付けていない。)
 # ============================================================
 
 from __future__ import annotations
@@ -65,28 +75,6 @@ def _install_intraday_liquidity_guard() -> None:
         install()
     except Exception:
         # config import時に落ちると殿様全体が止まるため、ここでは握りつぶす。
-        pass
-
-
-def _install_alert_liquidity_guard() -> None:
-    try:
-        if str(os.getenv("TONOSAMA_ALERT_LIQ_GUARD", "1")).strip().lower() in {"0", "false", "no", "off"}:
-            return
-        from core.startup.tonosama_alert_liquidity_guard_patch import install
-        install()
-    except Exception:
-        # config import時に落ちると殿様全体が止まるため、ここでは握りつぶす。
-        pass
-
-
-def _install_runtime_budget_guard() -> None:
-    try:
-        if str(os.getenv("TONOSAMA_RUNTIME_BUDGET_GUARD", "1")).strip().lower() in {"0", "false", "no", "off"}:
-            return
-        from core.startup.tonosama_runtime_budget_patch import install
-        install(retry=True)
-    except Exception:
-        # runner import中でも安全にするため、ここでは握りつぶす。
         pass
 
 
@@ -180,10 +168,3 @@ MAX_CANDIDATES = _env_int("TONOSAMA_MAX_CANDIDATES", 40)
 SCHEDULER_INTERVAL_SEC = _env_int("TONOSAMA_SCHEDULER_INTERVAL_SEC", 15)
 DISCORD_NOTIFY_ON_PENDING = _env_bool("TONOSAMA_DISCORD_NOTIFY_ON_PENDING", True)
 MAX_5SEC_FEATURE_SYMBOLS = _env_int("TONOSAMA_MAX_5SEC_FEATURE_SYMBOLS", 20)
-
-# 重要: pending_writer.py は config.py から TONOSAMA_EXPIRE_SEC 等をimportする。
-# そのため、pending_writerを触るアラート流動性ガードは定数定義完了後にinstallする。
-_install_alert_liquidity_guard()
-
-# runner.py import中は build_tonosama_entries が未定義のため、retry threadで遅延installする。
-_install_runtime_budget_guard()

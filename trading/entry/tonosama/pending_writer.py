@@ -460,7 +460,106 @@ def build_pending_entry(row: pd.Series, *, final_score: float, ai_prob: float, a
     }
 
 
+# ============================================================
+# PENDING/Discordアラート直前の最終流動性ガード
+# (旧 core/startup/tonosama_alert_liquidity_guard_patch.py)
+# ------------------------------------------------------------
+# 発注最終ガードとは別に、出来高・売買代金が少ない銘柄の通知だけ先に
+# 出てしまう問題を防ぐ。add_tonosama_pending() の最初に判定し、
+# reject の場合は元の add_pending 処理 (climax reject 等) を一切
+# 実行せずに False を返す。
+# ============================================================
+def _alert_liq_max_num(*values: Any) -> float:
+    m = 0.0
+    for v in values:
+        try:
+            m = max(m, safe_float(v, 0.0))
+        except Exception:
+            pass
+    return float(m)
+
+
+def _alert_liq_should_reject(entry: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+    """Return (reject, reason, detail)."""
+    if not _env_bool("TONOSAMA_ALERT_LIQ_GUARD", True):
+        return False, "disabled", {}
+    if not _is_tonosama_entry(entry):
+        return False, "not_tonosama", {}
+
+    cond = entry.get("entry_conditions") or {}
+    if not isinstance(cond, dict):
+        cond = {}
+
+    min_latest_volume = _env_float("TONOSAMA_ALERT_MIN_LATEST_VOLUME", _env_float("ENTRY_MIN_VOLUME", 30000.0))
+    min_turnover = _env_float("TONOSAMA_ALERT_MIN_TURNOVER", _env_float("ENTRY_MIN_TURNOVER", 10000000.0))
+    min_recent_bar_volume = _env_float("TONOSAMA_ALERT_MIN_RECENT_BAR_VOLUME", min_latest_volume)
+    reject_missing = _env_bool("TONOSAMA_ALERT_REJECT_VOLUME_MISSING", True)
+
+    price = _alert_liq_max_num(entry.get("price"), cond.get("close"), cond.get("close_price"), cond.get("price"))
+    latest_volume = _alert_liq_max_num(
+        entry.get("volume"),
+        entry.get("latest_volume"),
+        cond.get("latest_volume"),
+        cond.get("volume"),
+        cond.get("_latest_volume"),
+    )
+    volume_3m = _alert_liq_max_num(cond.get("volume_3m"), entry.get("volume_3m"))
+    volume_5m = _alert_liq_max_num(cond.get("volume_5m"), entry.get("volume_5m"))
+    recent_bar_volume = max(latest_volume, volume_3m, volume_5m)
+    turnover = _alert_liq_max_num(
+        entry.get("turnover"),
+        entry.get("trading_value"),
+        cond.get("turnover"),
+        cond.get("turnover_raw"),
+        cond.get("trading_value"),
+        cond.get("売買代金"),
+    )
+    if turnover <= 0 and price > 0 and recent_bar_volume > 0:
+        turnover = price * recent_bar_volume
+
+    detail = {
+        "symbol": entry.get("symbol"),
+        "side": entry.get("side"),
+        "price": price,
+        "latest_volume": latest_volume,
+        "volume_3m": volume_3m,
+        "volume_5m": volume_5m,
+        "recent_bar_volume": recent_bar_volume,
+        "turnover": turnover,
+        "min_latest_volume": min_latest_volume,
+        "min_recent_bar_volume": min_recent_bar_volume,
+        "min_turnover": min_turnover,
+    }
+
+    if reject_missing and latest_volume <= 0 and volume_3m <= 0 and volume_5m <= 0:
+        return True, "alert_volume_missing", detail
+    if latest_volume < min_latest_volume:
+        return True, "alert_latest_volume_low", detail
+    if recent_bar_volume < min_recent_bar_volume:
+        return True, "alert_recent_bar_volume_low", detail
+    if turnover < min_turnover:
+        return True, "alert_turnover_low", detail
+    return False, "ok", detail
+
+
 def add_tonosama_pending(entry: dict[str, Any]) -> bool:
+    reject, reason, detail = _alert_liq_should_reject(entry)
+    if reject:
+        logger.warning(
+            "[TONOSAMA ALERT LIQ GUARD] reject symbol=%s side=%s reason=%s latest_volume=%.0f volume_3m=%.0f volume_5m=%.0f turnover=%.0f min_latest=%.0f min_recent=%.0f min_turnover=%.0f price=%.1f",
+            detail.get("symbol"),
+            detail.get("side"),
+            reason,
+            safe_float(detail.get("latest_volume"), 0.0),
+            safe_float(detail.get("volume_3m"), 0.0),
+            safe_float(detail.get("volume_5m"), 0.0),
+            safe_float(detail.get("turnover"), 0.0),
+            safe_float(detail.get("min_latest_volume"), 0.0),
+            safe_float(detail.get("min_recent_bar_volume"), 0.0),
+            safe_float(detail.get("min_turnover"), 0.0),
+            safe_float(detail.get("price"), 0.0),
+        )
+        return False
     try:
         prune_expired_tonosama_pending(entry.get("symbol"), reason="TONOSAMA_BEFORE_ADD_EXPIRED")
         reject, ma_info = _climax_reject_reason(entry)

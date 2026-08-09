@@ -102,6 +102,16 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
 def _num_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
     if df is None or df.empty or col not in df.columns:
         return pd.Series(default, index=df.index if df is not None else None, dtype="float64")
@@ -694,49 +704,240 @@ def iter_tonosama_candidate_rows() -> pd.DataFrame:
     return out
 
 
+# ============================================================
+# candidate優先度ソート (旧 core/startup/tonosama_runtime_budget_patch.py)
+# ------------------------------------------------------------
+# 予算内で評価しきれる件数に絞る前に、購入可能価格帯を優先しつつ
+# score/出来高/値幅/出来高急増率が高い順へ並べ替える。
+# ============================================================
+def _prioritize_candidates(candidates: pd.DataFrame) -> pd.DataFrame:
+    try:
+        if candidates is None or candidates.empty:
+            return candidates
+        df = candidates.copy()
+
+        price = pd.to_numeric(df.get("close"), errors="coerce").fillna(0.0)
+        min_price = _env_float("ENTRY_MIN_PRICE", _env_float("TONOSAMA_ENTRY_MIN_PRICE", 1500.0))
+        max_price = _env_float("ENTRY_MAX_PRICE", _env_float("TONOSAMA_ENTRY_MAX_PRICE", 7000.0))
+        budget = _env_float("ENTRY_BUDGET_YEN", _env_float("TRADE_BUDGET_YEN", 700000.0))
+        lot_size = max(1.0, _env_float("ENTRY_LOT_SIZE", 100.0))
+        affordable_max = min(max_price, budget / lot_size) if budget > 0 else max_price
+
+        if _env_bool("TONOSAMA_RUNTIME_PRIORITIZE_PRICE_ELIGIBLE", True):
+            df["__prio_price_ok"] = (price >= min_price) & (price <= affordable_max)
+        else:
+            df["__prio_price_ok"] = True
+
+        df["__prio_score"] = df.get("_tonosama_score", 0).map(lambda x: abs(safe_float(x, 0.0)))
+        df["__prio_volume"] = df.get("_latest_volume", 0).map(lambda x: safe_float(x, 0.0))
+        df["__prio_range"] = df.get("_intrabar_range_pct", 0).map(lambda x: safe_float(x, 0.0))
+        df["__prio_surge"] = df.get("_max_volume_surge_ratio", 0).map(lambda x: safe_float(x, 0.0))
+        eligible = int(df["__prio_price_ok"].sum())
+        df = df.sort_values(
+            ["__prio_price_ok", "__prio_score", "__prio_volume", "__prio_range", "__prio_surge"],
+            ascending=[False, False, False, False, False],
+            kind="mergesort",
+        )
+        logger.warning(
+            "[TONOSAMA RUNTIME BUDGET] priority rows=%s price_eligible=%s min_price=%.1f max_price=%.1f affordable_max=%.1f",
+            len(df), eligible, min_price, max_price, affordable_max,
+        )
+        return df.drop(columns=[c for c in ("__prio_price_ok", "__prio_score", "__prio_volume", "__prio_range", "__prio_surge") if c in df.columns])
+    except Exception:
+        logger.debug("[TONOSAMA RUNTIME BUDGET] prioritize failed", exc_info=True)
+        return candidates
+
+
 def build_tonosama_entries() -> int:
-    started = time.perf_counter()
-    candidates = iter_tonosama_candidate_rows()
-    if candidates.empty:
-        logger.info("[TONOSAMA ENTRY] build done candidates=0 registered=0 elapsed=%.3fs", time.perf_counter() - started)
+    """殿様候補をAI評価しpendingへ登録する (旧 core/startup/tonosama_runtime_budget_patch.py 統合済み)。
+
+    timeout wrapper では実行中のPythonスレッドを強制停止できないため、
+    ここで時間予算 (TONOSAMA_LOOP_TIME_BUDGET_SEC, 下限25秒) と評価件数上限
+    (TONOSAMA_RUNTIME_MAX_EVAL_CANDIDATES, 下限12件) を見ながら自分で早期終了する。
+    registered=0 の間は時間切れだけでは止めず、最低1件登録できるまで続ける。
+    """
+    build_started = time.perf_counter()
+    raw_budget = _env_float("TONOSAMA_LOOP_TIME_BUDGET_SEC", 25.0)
+    raw_max_eval = _env_int("TONOSAMA_RUNTIME_MAX_EVAL_CANDIDATES", 12)
+    budget_sec = max(25.0, raw_budget)
+    max_eval = max(12, raw_max_eval)
+    min_remain = max(1.5, _env_float("TONOSAMA_RUNTIME_MIN_REMAIN_SEC", 1.5))
+    return_after_first = _env_bool("TONOSAMA_RUNTIME_RETURN_AFTER_FIRST_PENDING", True)
+
+    try:
+        candidates = iter_tonosama_candidate_rows()
+    except Exception:
+        logger.exception("[TONOSAMA RUNTIME BUDGET] iter_tonosama_candidate_rows failed")
         return 0
+
+    candidate_elapsed = time.perf_counter() - build_started
+    try:
+        empty = bool(candidates is None or candidates.empty)
+    except Exception:
+        empty = True
+    if empty:
+        logger.info("[TONOSAMA RUNTIME BUDGET] build done candidates=0 registered=0 candidate_elapsed=%.3fs", candidate_elapsed)
+        return 0
+
+    try:
+        total_candidates = int(len(candidates))
+        candidates = _prioritize_candidates(candidates).head(max_eval).reset_index(drop=True)
+    except Exception:
+        total_candidates = 0
+        try:
+            candidates = candidates.head(max_eval).reset_index(drop=True)
+        except Exception:
+            pass
+
+    eval_started = time.perf_counter()
+    deadline = eval_started + budget_sec
     registered = 0
     ai_ng = 0
     duplicate = 0
     low_score = 0
     no_symbol = 0
+    evaluated = 0
+    time_budget_stop = False
     final_low_samples: list[dict[str, Any]] = []
-    for _, row in candidates.iterrows():
+    add_fail_samples: list[dict[str, Any]] = []
+
+    def _remaining() -> float:
+        return deadline - time.perf_counter()
+
+    def _log_done() -> None:
+        logger.info(
+            "[TONOSAMA RUNTIME BUDGET] build done total_candidates=%s candidates=%s evaluated=%s evaluated_max=%s registered=%s duplicate=%s ai_ng=%s low_score=%s no_symbol=%s stopped=%s budget_sec=%.1f raw_budget=%.1f max_eval=%s raw_max_eval=%s candidate_elapsed=%.3fs eval_elapsed=%.3fs total_elapsed=%.3fs return_after_first=%s low_score_samples=%s add_fail_samples=%s",
+            total_candidates, len(candidates), evaluated, max_eval, registered, duplicate, ai_ng, low_score, no_symbol, time_budget_stop,
+            budget_sec, raw_budget, max_eval, raw_max_eval, candidate_elapsed, time.perf_counter() - eval_started, time.perf_counter() - build_started,
+            return_after_first, final_low_samples[:10], add_fail_samples[:10],
+        )
+
+    for idx, row in candidates.iterrows():
+        now = time.perf_counter()
+        # registered=0 の間は、時間切れだけでは止めない。
+        if now >= deadline and registered > 0:
+            time_budget_stop = True
+            logger.warning(
+                "[TONOSAMA RUNTIME BUDGET] stop before candidate budget_sec=%.1f raw_budget=%.1f eval_elapsed=%.3fs registered=%s idx=%s evaluated_limit=%s total_candidates=%s",
+                budget_sec, raw_budget, now - eval_started, registered, idx, max_eval, total_candidates,
+            )
+            break
+
         if registered >= MAX_PENDING_PER_LOOP:
             break
+
         symbol = normalize_symbol(row.get("symbol"))
         if not symbol:
             no_symbol += 1
             continue
-        if has_tonosama_pending(symbol):
-            duplicate += 1
-            continue
+        evaluated += 1
+
+        try:
+            if has_tonosama_pending(symbol):
+                duplicate += 1
+                continue
+        except Exception:
+            logger.debug("[TONOSAMA RUNTIME BUDGET] has_pending failed symbol=%s", symbol, exc_info=True)
+
         raw_score = safe_float(row.get("_tonosama_score"), 0.0)
         if raw_score <= 0:
             low_score += 1
             final_low_samples.append({"symbol": symbol, "reason": "raw_score_le_zero", "raw_score": raw_score})
             continue
-        ai_ok, ai_prob, ai_reason = ai_check_tonosama_entry(row)
+
+        if registered > 0 and _remaining() <= min_remain:
+            time_budget_stop = True
+            logger.warning(
+                "[TONOSAMA RUNTIME BUDGET] stop before AI due reserve symbol=%s remaining=%.3fs registered=%s min_remain=%.3fs",
+                symbol, _remaining(), registered, min_remain,
+            )
+            break
+
+        try:
+            ai_ok, ai_prob, ai_reason = ai_check_tonosama_entry(row)
+        except Exception:
+            ai_ng += 1
+            logger.warning("[TONOSAMA RUNTIME BUDGET] ai_check failed symbol=%s", symbol, exc_info=True)
+            continue
+
         if not ai_ok:
             ai_ng += 1
-            logger.info("[TONOSAMA ENTRY AI NG] symbol=%s prob=%.3f reason=%s surge=%.2f price_chg=%.2f body=%.3f range=%.3f close_pos=%.1f upper_wick=%.1f lower_wick=%.1f vol=%.0f 5s=%.3f slope=%.6f", symbol, ai_prob, ai_reason, safe_float(row.get("_max_volume_surge_ratio"), 0.0), safe_float(row.get("_max_price_change_pct"), 0.0), safe_float(row.get("_body_change_pct"), 0.0), safe_float(row.get("_intrabar_range_pct"), 0.0), safe_float(row.get("_close_position_pct"), 50.0), safe_float(row.get("_upper_wick_pct"), 0.0), safe_float(row.get("_lower_wick_pct"), 0.0), safe_float(row.get("_latest_volume"), 0.0), safe_float(row.get("price_change_5s_pct"), 0.0), safe_float(row.get("_slope"), 0.0))
+            logger.info(
+                "[TONOSAMA ENTRY AI NG] symbol=%s prob=%.3f reason=%s surge=%.2f price_chg=%.2f body=%.3f range=%.3f close_pos=%.1f upper_wick=%.1f lower_wick=%.1f vol=%.0f 5s=%.3f slope=%.6f",
+                symbol, ai_prob, ai_reason,
+                safe_float(row.get("_max_volume_surge_ratio"), 0.0),
+                safe_float(row.get("_max_price_change_pct"), 0.0),
+                safe_float(row.get("_body_change_pct"), 0.0),
+                safe_float(row.get("_intrabar_range_pct"), 0.0),
+                safe_float(row.get("_close_position_pct"), 50.0),
+                safe_float(row.get("_upper_wick_pct"), 0.0),
+                safe_float(row.get("_lower_wick_pct"), 0.0),
+                safe_float(row.get("_latest_volume"), 0.0),
+                safe_float(row.get("price_change_5s_pct"), 0.0),
+                safe_float(row.get("_slope"), 0.0),
+            )
             continue
-        final_score = calc_final_score_safe(row, raw_score=raw_score, ai_prob=ai_prob)
+
+        try:
+            final_score = calc_final_score_safe(row, raw_score=raw_score, ai_prob=ai_prob)
+        except Exception:
+            logger.warning("[TONOSAMA RUNTIME BUDGET] final_score failed symbol=%s", symbol, exc_info=True)
+            low_score += 1
+            continue
+
         if final_score < MIN_FINAL_SCORE:
             low_score += 1
-            final_low_samples.append({"symbol": symbol, "reason": "final_score_low", "final_score": round(final_score, 4), "min_final_score": MIN_FINAL_SCORE, "raw_score": round(raw_score, 4), "ai_prob": round(ai_prob, 4)})
+            final_low_samples.append({
+                "symbol": symbol,
+                "reason": "final_score_low",
+                "final_score": round(final_score, 4),
+                "min_final_score": MIN_FINAL_SCORE,
+                "raw_score": round(raw_score, 4),
+                "ai_prob": round(ai_prob, 4),
+            })
             continue
-        entry = build_pending_entry(row, final_score=final_score, ai_prob=ai_prob, ai_reason=ai_reason)
-        if add_tonosama_pending(entry):
-            registered += 1
-            logger.info("🔥 TONOSAMA PENDING %s score=%.2f price=%.1f vol=%.0f body=%.3f%% range=%.3f%% close_pos=%.1f%% upper_wick=%.1f%% lower_wick=%.1f%% surge=%.2fx price_chg=%.2f%% tf=%s 5s=%.3f%% slope=%.6f ai_prob=%.3f", symbol, final_score, safe_float(row.get("close"), 0.0), safe_float(row.get("_latest_volume"), 0.0), safe_float(row.get("_body_change_pct"), 0.0), safe_float(row.get("_intrabar_range_pct"), 0.0), safe_float(row.get("_close_position_pct"), 50.0), safe_float(row.get("_upper_wick_pct"), 0.0), safe_float(row.get("_lower_wick_pct"), 0.0), safe_float(row.get("_max_volume_surge_ratio"), 0.0), safe_float(row.get("_max_price_change_pct"), 0.0), str(row.get("_surge_tf", "")), safe_float(row.get("price_change_5s_pct"), 0.0), safe_float(row.get("_slope"), 0.0), ai_prob)
-            notify_discord_tonosama_pending(entry)
-    logger.info("[TONOSAMA ENTRY] build done candidates=%s registered=%s duplicate=%s ai_ng=%s low_score=%s no_symbol=%s low_score_samples=%s elapsed=%.3fs", len(candidates), registered, duplicate, ai_ng, low_score, no_symbol, final_low_samples[:15], time.perf_counter() - started)
+
+        try:
+            entry = build_pending_entry(row, final_score=final_score, ai_prob=ai_prob, ai_reason=ai_reason)
+            ok = bool(add_tonosama_pending(entry))
+            if ok:
+                registered += 1
+                logger.info(
+                    "🔥 TONOSAMA PENDING %s score=%.2f price=%.1f vol=%.0f body=%.3f%% range=%.3f%% close_pos=%.1f%% upper_wick=%.1f%% lower_wick=%.1f%% surge=%.2fx price_chg=%.2f%% tf=%s 5s=%.3f%% slope=%.6f ai_prob=%.3f",
+                    symbol, final_score,
+                    safe_float(row.get("close"), 0.0),
+                    safe_float(row.get("_latest_volume"), 0.0),
+                    safe_float(row.get("_body_change_pct"), 0.0),
+                    safe_float(row.get("_intrabar_range_pct"), 0.0),
+                    safe_float(row.get("_close_position_pct"), 50.0),
+                    safe_float(row.get("_upper_wick_pct"), 0.0),
+                    safe_float(row.get("_lower_wick_pct"), 0.0),
+                    safe_float(row.get("_max_volume_surge_ratio"), 0.0),
+                    safe_float(row.get("_max_price_change_pct"), 0.0),
+                    str(row.get("_surge_tf", "")),
+                    safe_float(row.get("price_change_5s_pct"), 0.0),
+                    safe_float(row.get("_slope"), 0.0),
+                    ai_prob,
+                )
+                try:
+                    notify_discord_tonosama_pending(entry)
+                except Exception:
+                    logger.warning("[TONOSAMA RUNTIME BUDGET] notify failed symbol=%s", symbol, exc_info=True)
+                if return_after_first:
+                    time_budget_stop = True
+                    logger.warning(
+                        "[TONOSAMA RUNTIME BUDGET] return after first pending symbol=%s registered=%s evaluated=%s elapsed=%.3fs",
+                        symbol, registered, evaluated, time.perf_counter() - build_started,
+                    )
+                    break
+            else:
+                add_fail_samples.append({"symbol": symbol, "side": entry.get("side"), "score": round(final_score, 4)})
+        except Exception:
+            add_fail_samples.append({"symbol": symbol, "reason": "exception"})
+            logger.warning("[TONOSAMA RUNTIME BUDGET] add failed symbol=%s", symbol, exc_info=True)
+            continue
+
+    _log_done()
     return registered
 
 
