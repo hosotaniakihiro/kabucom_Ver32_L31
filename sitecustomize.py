@@ -304,7 +304,10 @@ BACKGROUND_MAIN_PATCHES = [
     ("core.startup.ranking_entry_source_db_fallback_patch", "RANKING_ENTRY_SOURCE_DB_FALLBACK", "DISABLE_RANKING_ENTRY_SOURCE_DB_FALLBACK_PATCH"),
     ("trading.handlers.short_mtf_direction_guard", "SHORT_MTF_2OF3_GUARD", "DISABLE_SHORT_MTF_2OF3_GUARD_PATCH"),
     ("core.startup.entry_controller_tonosama_ai_bridge_patch", "TONOSAMA_AI_BRIDGE", "DISABLE_TONOSAMA_AI_BRIDGE_PATCH"),
-    ("core.startup.final_entry_tonosama_liquidity_patch", "FINAL_TONOSAMA_LIQUIDITY", "DISABLE_FINAL_TONOSAMA_LIQUIDITY_PATCH"),
+    # final_entry_tonosama_liquidity_patch は削除済み。ラップ対象だった
+    # final_entry_safety_guard_patch._liquidity_guard が本文化で消えており、
+    # install() が常に False を返す完全な死にコードだった。
+    # 流動性ガード本体は trading/handlers/entry_controller._final_guard_liquidity_ok。
     ("core.startup.final_entry_board_guard_signature_runtime_patch", "FINAL_BOARD_GUARD_SIGNATURE", "DISABLE_FINAL_BOARD_GUARD_SIGNATURE_PATCH"),
     # tonosama_fast_score_prefilter_patch は trading/entry/tonosama/fast_score_prefilter.py
     # へ本文化済み。中継していた tonosama_range_from_history_patch も
