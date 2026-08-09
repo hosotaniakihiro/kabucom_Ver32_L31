@@ -261,16 +261,34 @@ DB_SYNC_PATCHES = [
 
 # entry_controller_source_prefilter_patch は本文化済みで空スタブになっており、
 # 実体は「この env を先に確定させてから summary_ai_volatility_rescue_patch を
-# install する」だけの中継だった。rescue 側は setdefault で読むため、
-# import より前にここで確定させる必要がある。
+# install する」だけの中継だった。この値を読んでいたのは旧 V4 rescue 実装。
 os.environ["SUMMARY_AI_VOL_RESCUE_MIN_ABS_SLOPE"] = os.getenv(
     "SUMMARY_AI_VOL_RESCUE_MIN_ABS_SLOPE_OPERATOR",
     "0.0002",
 )
 
+
+def _apply_summary_ai_vol_rescue_env_defaults() -> None:
+    """summary_ai_volatility_rescue_patch (V5 strict stub) が持っていた env 既定値。
+
+    V5 は何もラップしない strict stub で、実体はこの 4 つの setdefault と
+    install ログだけだった。パッチファイルは削除し、install されていたのと
+    同じ位置・同じスコープ (main lite / full non-main) で env だけを設定する。
+
+    Note: この 4 つと SUMMARY_AI_VOL_RESCUE_MIN_ABS_SLOPE は、現時点で
+    リポジトリ内に読み手が存在しない (読んでいたのは削除済みの V4 実装だけ)。
+    挙動を変えないため残しているが、消しても実害はない。
+    """
+    os.environ.setdefault("SUMMARY_AI_VOL_RESCUE_ENABLED", "0")
+    os.environ.setdefault("SUMMARY_AI_ZERO_SCORE_PUSH_BOOTSTRAP_ENABLED", "0")
+    os.environ.setdefault("SUMMARY_AI_DB_FRESH_INPUT_ENABLED", "1")
+    os.environ.setdefault("SUMMARY_AI_VOL_RESCUE_WATCH_LOOPS", "0")
+
+
 SYNC_MAIN_PATCHES = [
     ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
-    ("core.startup.summary_ai_volatility_rescue_patch", "SUMMARY_AI_VOLATILITY_RESCUE", "DISABLE_ENTRY_CONTROLLER_SOURCE_PREFILTER_PATCH"),
+    # summary_ai_volatility_rescue_patch は削除済み (env 既定値のみのstubだった)。
+    # 代わりに _apply_summary_ai_vol_rescue_env_defaults() を install 前に呼ぶ。
     ("core.startup.summary_ai_runtime_consistency_patch", "SUMMARY_AI_RUNTIME_CONSISTENCY", "DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH"),
     ("core.startup.summary_main_push_db_refresh_patch", "SUMMARY_MAIN_PUSH_DB_REFRESH", "DISABLE_SUMMARY_MAIN_PUSH_DB_REFRESH_PATCH"),
     ("core.startup.summary_main_direct_push_force_patch", "SUMMARY_FORCE_DIRECT_1M_SYNC", "DISABLE_SUMMARY_FORCE_DIRECT_1M_PATCH"),
@@ -378,11 +396,13 @@ if _is_database_process():
     _install_summary_mtf_catchup_safely()
     logger.warning("[SITECUSTOMIZE] database context detected; DB minimal patches installed=%s heavy entry/rescue patches skipped argv=%s", len(DB_SYNC_PATCHES), sys.argv)
 elif _is_main_py_process() and _env_on("SITECUSTOMIZE_MAIN_LITE", True):
+    _apply_summary_ai_vol_rescue_env_defaults()
     _install_patch_list(SYNC_MAIN_PATCHES)
     threading.Thread(target=_background_main_patch_loop, name="sitecustomize-main-bg-patches", daemon=True).start()
     logger.warning("[SITECUSTOMIZE] main lite mode enabled sync=%s background=%s", len(SYNC_MAIN_PATCHES), len(BACKGROUND_MAIN_PATCHES))
 elif _env_on("SITECUSTOMIZE_ENABLE_FULL_NONMAIN", False):
     logger.warning("[SITECUSTOMIZE] full non-main mode enabled by env; installing trading patches argv=%s", sys.argv)
+    _apply_summary_ai_vol_rescue_env_defaults()
     _install_patch_list(SYNC_MAIN_PATCHES + BACKGROUND_MAIN_PATCHES)
     _install_optional_rescue_patches()
     _install_liq_empty_fallback_only_if_enabled()
