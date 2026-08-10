@@ -378,7 +378,14 @@ RANKING_RESCUE_PATCHES = [
 ]
 
 TONOSAMA_EXTRA_RESCUE_PATCHES = [
-    ("core.startup.low_movement_tonosama_no_highlow_patch", "LOW_MOVE_TONOSAMA_FALLBACK", "DISABLE_LOW_MOVE_TONOSAMA_FALLBACK_PATCH"),
+    # low_movement_tonosama_no_highlow_patch は
+    # core/startup/low_movement_entry_guard_patch.py へマージ済み
+    # (_range_pct_from_row_core + _no_highlow_range_pct)。ホストがまだ
+    # core/startup 配下のパッチなので本文化ではなく統合だが、
+    # モンキーパッチは 1 段減った。
+    # opt-in スコープと env 既定値は
+    # low_movement_entry_guard_patch._no_highlow_scope_enabled() /
+    # _no_highlow_apply_env_defaults() が再現している。
     ("core.startup.tonosama_pending_warning_relax_patch", "TONOSAMA_PENDING_WARNING_RELAX", "DISABLE_TONOSAMA_PENDING_WARNING_RELAX_PATCH"),
     # tonosama_price_change_or_range_patch / tonosama_volume_surge_zero_rescue_patch /
     # tonosama_slope_range_rescue_patch の 3 件は trading/entry/tonosama/runner.py へ

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -153,7 +154,7 @@ def _is_ranking_entry(row_or_entry: Any) -> bool:
     return src == "RANKING" or et == "RANKING" or rank_type is not None
 
 
-def _range_pct_from_row(row: dict) -> float:
+def _range_pct_from_row_core(row: dict) -> float:
     raw = _first(
         row,
         (
@@ -174,6 +175,246 @@ def _range_pct_from_row(row: dict) -> float:
     if v > 1.0:
         return v / 100.0
     return v
+
+
+# ============================================================
+# TONOSAMA: top-level high/low 欠損時の range_pct 救済
+#   旧 core/startup/low_movement_tonosama_no_highlow_patch.py (V5)
+# ------------------------------------------------------------
+# TONOSAMA pending が entry_controller に渡るとき top-level の high/low が
+# 欠けるため、LOW MOVE GUARD で落ちてしまう。nested な raw / entry_conditions
+# 側にレンジや出来高の根拠があればそれを使う。
+#
+# V5 で range_5m_filter 側の救済は
+# trading/filters/volatility_filter._range_5m_filter_from_entry_row (V6) へ
+# インライン化済みなので、残っていたのは _range_pct_from_row の救済だけ。
+#
+# 旧パッチは sitecustomize の TONOSAMA_EXTRA_RESCUE_PATCHES = opt-in グループ
+# (既定 OFF) で install されていたので、そのスコープを再現する。
+# ============================================================
+_NO_HIGHLOW_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+_NO_HIGHLOW_DB_PROCESS_ENVS = (
+    "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+    "AUTOSTOCK_SUMMARY_DB_WRITER",
+    "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+    "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
+)
+_NO_HIGHLOW_NESTED_KEYS = ("_raw", "raw", "candidate_raw", "source_row", "entry_conditions", "conditions", "metrics", "features", "detail", "ai_detail")
+_NO_HIGHLOW_NESTED_KEYS2 = ("_raw", "raw", "entry_conditions", "conditions", "metrics", "features", "detail", "ai_detail")
+_NO_HIGHLOW_ENV_APPLIED = False
+
+
+def _no_highlow_env_float(name: str, default: float) -> float:
+    """旧パッチの _env_float。カンマ除去をしない点が本ファイルの _env_float と違う。"""
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _no_highlow_scope_enabled() -> bool:
+    """このプロセスで TONOSAMA no-high/low 救済を使うか。
+
+    旧パッチは sitecustomize の TONOSAMA_EXTRA_RESCUE_PATCHES (opt-in、既定 OFF)
+    経由で、main lite の background loop か SITECUSTOMIZE_ENABLE_FULL_NONMAIN=1
+    のときだけ install されていた。
+    LOW_MOVE_TONOSAMA_NO_HIGHLOW_SCOPE_ENABLED=1/0 で明示上書きできる。
+    """
+    try:
+        raw = os.getenv("LOW_MOVE_TONOSAMA_NO_HIGHLOW_SCOPE_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return _env_bool("LOW_MOVE_TONOSAMA_NO_HIGHLOW_SCOPE_ENABLED", False)
+        if str(os.environ.get("DISABLE_LOW_MOVE_TONOSAMA_FALLBACK_PATCH", "")).strip() == "1":
+            return False
+        if not (
+            _env_bool("SITECUSTOMIZE_ENABLE_RESCUE_PATCHES", False)
+            or _env_bool("SITECUSTOMIZE_ENABLE_TONOSAMA_EXTRA_RESCUE_PATCHES", False)
+            or _env_bool("USERCUSTOMIZE_ENABLE_TONOSAMA_RESCUE_PATCHES", False)
+        ):
+            return False
+        argv_list = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        argv = " ".join(argv_list)
+        if any(name in argv for name in _NO_HIGHLOW_DB_PROCESS_NAMES):
+            return False
+        if any(_env_bool(name, False) for name in _NO_HIGHLOW_DB_PROCESS_ENVS):
+            return False
+        if any(a.endswith("/main.py") or a == "main.py" for a in argv_list) and _env_bool("SITECUSTOMIZE_MAIN_LITE", True):
+            return True
+        return _env_bool("SITECUSTOMIZE_ENABLE_FULL_NONMAIN", False)
+    except Exception:
+        return False
+
+
+def _no_highlow_apply_env_defaults() -> None:
+    """旧 install() の env setdefault を、有効なときだけ 1 度だけ再現する。
+
+    LOW_MOVE_TONOSAMA_MIN_ENTRY_PRICE だけは _low_movement_guard():449 が
+    _range_pct_from_row より前に読むので、ガード本体の先頭からも呼ぶ。
+    旧パッチが設定していた TONOSAMA_VOL_RANGE_RESCUE_* 4 件は V5 の
+    インライン化で読み手が消えた死に設定なので移していない。
+    """
+    global _NO_HIGHLOW_ENV_APPLIED
+    if _NO_HIGHLOW_ENV_APPLIED:
+        return
+    _NO_HIGHLOW_ENV_APPLIED = True
+    try:
+        os.environ.setdefault("LOW_MOVE_TONOSAMA_MIN_ENTRY_PRICE", "300")
+        os.environ.setdefault("LOW_MOVE_TONOSAMA_ALLOW_NO_HIGHLOW_FALLBACK", "1")
+        os.environ.setdefault("LOW_MOVE_TONOSAMA_NO_HIGHLOW_FALLBACK_RANGE_PCT", "0.012")
+        os.environ.setdefault("LOW_MOVE_TONOSAMA_NO_HIGHLOW_USE_RAW_VOLUME_SIGNAL", "1")
+        os.environ.setdefault("LOW_MOVE_TONOSAMA_NO_HIGHLOW_ALLOW_STRONG_SCORE", "1")
+        os.environ.setdefault("LOW_MOVE_TONOSAMA_NO_HIGHLOW_STRONG_SCORE_MIN", "2.0")
+    except Exception:
+        logger.exception("[LOW MOVE TONOSAMA FALLBACK] env defaults failed")
+
+
+def _no_highlow_sf(v: Any, default: float = 0.0) -> float:
+    """旧パッチの _sf。%/カンマ除去と "nan"/"none"/"nat"/"<na>" の扱いが
+    本ファイルの _safe_float と違うのでそのまま残す。"""
+    try:
+        if v is None or str(v).strip() == "":
+            return default
+        s = str(v).replace(",", "").replace("%", "").strip()
+        if s.lower() in {"nan", "none", "nat", "<na>"}:
+            return default
+        x = float(s)
+        if x != x:
+            return default
+        return x
+    except Exception:
+        return default
+
+
+def _no_highlow_as_dict(v: Any) -> dict:
+    try:
+        if isinstance(v, dict):
+            return dict(v)
+        if hasattr(v, "to_dict"):
+            d = v.to_dict()
+            return dict(d) if isinstance(d, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _no_highlow_nested_dicts(row: Any) -> list:
+    base = _no_highlow_as_dict(row)
+    out: list = []
+    if base:
+        out.append(base)
+    for k in _NO_HIGHLOW_NESTED_KEYS:
+        d = _no_highlow_as_dict(base.get(k)) if base else {}
+        if d:
+            out.append(d)
+            for kk in _NO_HIGHLOW_NESTED_KEYS2:
+                dd = _no_highlow_as_dict(d.get(kk))
+                if dd:
+                    out.append(dd)
+    return out
+
+
+def _no_highlow_max_from_keys(row: Any, keys: tuple[str, ...]) -> float:
+    m = 0.0
+    for d in _no_highlow_nested_dicts(row):
+        for k in keys:
+            if k in d:
+                m = max(m, _no_highlow_sf(d.get(k), 0.0))
+    return float(m)
+
+
+def _no_highlow_first_text(row: Any, keys: tuple[str, ...]) -> str:
+    for d in _no_highlow_nested_dicts(row):
+        for k in keys:
+            v = d.get(k)
+            if v is not None and str(v).strip() != "":
+                return str(v).strip()
+    return ""
+
+
+def _no_highlow_symbol(row: Any) -> str:
+    return _no_highlow_first_text(row, ("symbol", "Symbol", "銘柄コード", "code", "stock_code"))
+
+
+def _no_highlow_score(row: Any) -> float:
+    return _no_highlow_max_from_keys(row, ("_tonosama_score", "pending_score", "score", "score_total", "final_score", "display_score", "score_buy", "score_sell", "score_raw"))
+
+
+def _no_highlow_direct_range_signal(row: Any) -> float:
+    rng = _no_highlow_max_from_keys(row, ("_intrabar_range_pct", "intrabar_range_pct", "range_pct", "row_range_pct", "range_1m_pct", "range_3m_pct", "range_5m_pct"))
+    if rng > 0:
+        return rng / 100.0 if rng > 1.0 else rng
+    hi = _no_highlow_max_from_keys(row, ("high", "high_price", "current_high", "high_1m", "high_3m", "high_5m"))
+    lo = _no_highlow_max_from_keys(row, ("low", "low_price", "current_low", "low_1m", "low_3m", "low_5m"))
+    close = _no_highlow_max_from_keys(row, ("close", "close_price", "current_price", "price"))
+    if hi > 0 and lo > 0 and close > 0 and hi > lo:
+        return (hi - lo) / close
+    return 0.0
+
+
+def _no_highlow_volume_signal(row: Any) -> float:
+    signal = _no_highlow_max_from_keys(row, ("_max_volume_surge_ratio", "max_volume_surge_ratio", "volume_surge_ratio", "volume_speed", "dominant_ratio", "volume_surge_ratio_5s"))
+    if signal > 0:
+        return signal
+    volume = _no_highlow_max_from_keys(row, ("volume", "latest_volume", "_latest_volume", "volume_1m", "volume_3m", "volume_5m", "latest_5sec_volume", "volume_raw"))
+    turnover = _no_highlow_max_from_keys(row, ("turnover", "turnover_raw", "trading_value", "trading_value_raw", "売買代金"))
+    min_vol = _no_highlow_env_float("LOW_MOVE_TONOSAMA_NO_HIGHLOW_MIN_ABS_VOLUME", _no_highlow_env_float("TONOSAMA_ALERT_MIN_LATEST_VOLUME", 30000.0))
+    min_turnover = _no_highlow_env_float("LOW_MOVE_TONOSAMA_NO_HIGHLOW_MIN_TURNOVER", _no_highlow_env_float("TONOSAMA_ALERT_MIN_TURNOVER", 10000000.0))
+    if volume >= min_vol or turnover >= min_turnover:
+        return _no_highlow_env_float("LOW_MOVE_TONOSAMA_NO_HIGHLOW_INFERRED_VOLUME_SIGNAL", 1.0)
+    return 0.0
+
+
+def _no_highlow_range_pct(row: dict) -> float:
+    """core が 0 を返したときの TONOSAMA 救済。旧 _patched_range_pct_from_row 相当。"""
+    if not _env_bool("LOW_MOVE_TONOSAMA_ALLOW_NO_HIGHLOW_FALLBACK", True):
+        return 0.0
+    if not _is_tonosama_entry(row):
+        return 0.0
+    d_range = _no_highlow_direct_range_signal(row)
+    if d_range > 0:
+        logger.warning("[LOW MOVE TONOSAMA FALLBACK] use nested range_pct=%.4f symbol=%s", d_range, _no_highlow_symbol(row))
+        return float(d_range)
+    score = _no_highlow_score(row)
+    volume_sig = _no_highlow_volume_signal(row) if _env_bool("LOW_MOVE_TONOSAMA_NO_HIGHLOW_USE_RAW_VOLUME_SIGNAL", True) else 0.0
+    min_score = _no_highlow_env_float("LOW_MOVE_TONOSAMA_NO_HIGHLOW_MIN_SCORE", 0.01)
+    min_vol = _no_highlow_env_float("LOW_MOVE_TONOSAMA_NO_HIGHLOW_MIN_VOLUME_SIGNAL", 1.0)
+    strong_score_min = _no_highlow_env_float("LOW_MOVE_TONOSAMA_NO_HIGHLOW_STRONG_SCORE_MIN", 2.0)
+    ok_by_volume = score >= min_score and volume_sig >= min_vol
+    ok_by_strong_score = _env_bool("LOW_MOVE_TONOSAMA_NO_HIGHLOW_ALLOW_STRONG_SCORE", True) and score >= strong_score_min
+    if not (ok_by_volume or ok_by_strong_score):
+        logger.warning("[LOW MOVE TONOSAMA FALLBACK] no high/low denied score=%.4f volume_signal=%.4f symbol=%s", score, volume_sig, _no_highlow_symbol(row))
+        return 0.0
+    fallback = _no_highlow_env_float("LOW_MOVE_TONOSAMA_NO_HIGHLOW_FALLBACK_RANGE_PCT", _no_highlow_env_float("LOW_MOVE_TONOSAMA_STRONG_RANGE_PCT", 0.012))
+    logger.warning("[LOW MOVE TONOSAMA FALLBACK] use fallback range_pct=%.4f score=%.4f volume_signal=%.4f symbol=%s", fallback, score, volume_sig, _no_highlow_symbol(row))
+    return float(fallback)
+
+
+def _range_pct_from_row(row: dict) -> float:
+    if not _no_highlow_scope_enabled():
+        return _range_pct_from_row_core(row)
+    _no_highlow_apply_env_defaults()
+    try:
+        v = _range_pct_from_row_core(row)
+        if v and v > 0:
+            return float(v)
+        return _no_highlow_range_pct(row)
+    except Exception:
+        logger.exception("[LOW MOVE TONOSAMA FALLBACK] patched range failed")
+        try:
+            return _range_pct_from_row_core(row)
+        except Exception:
+            return 0.0
 
 
 def _turnover_from_row(row: dict, *, close: float) -> float:
@@ -433,6 +674,10 @@ def _call_entry_direction_confirm(entry_row: Any) -> bool:
 
 
 def _low_movement_guard(entry_row: Any) -> bool:
+    # LOW_MOVE_TONOSAMA_MIN_ENTRY_PRICE は下の :449 相当で読むので、
+    # _range_pct_from_row より先にここで既定値を確定させる。
+    if _no_highlow_scope_enabled():
+        _no_highlow_apply_env_defaults()
     row = _row_to_dict(entry_row)
     symbol = _norm_symbol(_first(row, ("symbol", "code", "stock_code"), ""))
     source_tonosama = _is_tonosama_entry(row)
