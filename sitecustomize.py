@@ -325,7 +325,14 @@ BACKGROUND_MAIN_PATCHES = [
     # tonosama_5sec_advisory_patch は trading/entry/tonosama/runner._apply_climax_guards
     # へ本文化済み。残っていた中継 install (entry_order_5s_breakout_optional_patch) を
     # ここから直接行う。
-    ("core.startup.entry_order_5s_breakout_optional_patch", "ENTRY_ORDER_5S_OPTIONAL", "DISABLE_TONOSAMA_5SEC_ADVISORY_PATCH"),
+    # entry_order_5s_breakout_optional_patch は trading/handlers/entry_order_builder.py へ
+    # 本文化済み (_five_sec_optional_fallback_order)。NO_5S_BREAKOUT を返すのは
+    # build_entry_order の 1 箇所だけなので、そこに直接置いた。
+    # install スコープと DISABLE_TONOSAMA_5SEC_ADVISORY_PATCH /
+    # ENTRY_ORDER_5S_BREAKOUT_OPTIONAL_ENABLED の判定は
+    # entry_order_builder._five_sec_optional_scope_enabled() が再現している。
+    # entry_controller への別名差し替えは不要 (entry_controller.py:118 が
+    # from-import で同じ関数オブジェクトを束縛しているため)。
     ("core.startup.tonosama_datetime_tz_guard_patch", "TONOSAMA_DT_TZ_GUARD", "DISABLE_TONOSAMA_DT_TZ_GUARD_PATCH"),
     ("core.startup.tonosama_history_missing_guard_patch", "TONOSAMA_HISTORY_MISSING_GUARD", "DISABLE_TONOSAMA_HISTORY_MISSING_GUARD_PATCH"),
     # ranking_entry_source_db_fallback_patch は trading/ranking/entry_from_ranking.py へ

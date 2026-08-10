@@ -33,6 +33,7 @@ import datetime as dt
 import logging
 import math
 import os
+import sys
 import time
 from typing import Dict, Any, Optional, Tuple
 
@@ -513,6 +514,197 @@ def five_sec_breakout(symbol: str, side: str) -> Optional[float]:
     return None
 
 
+# ============================================================
+# 5秒足ブレイク無しの LIMIT フォールバック
+#   旧 core/startup/entry_order_5s_breakout_optional_patch.py (V1)
+# ------------------------------------------------------------
+# RANKING / TONOSAMA / EARLY_SCALP が「5秒足ブレイクが無い」だけを理由に
+# NO_5S_BREAKOUT で注文生成 NG になるのを緩和する。ユーザー方針は
+# 「5秒足は必須にしない」。LOW_LIQUIDITY / QTY_ZERO など他の NG 理由は
+# 変更しない。SUMMARY_AI は既存の5秒足ガード/板touch系を尊重して原則対象外。
+#
+# 旧パッチは build_entry_order を外側からラップしていたが、
+# NO_5S_BREAKOUT を返すのは下の 1 箇所だけなので、そこに直接置いた。
+# これによりラップ順のレース (summary_ai_fast_order_builder_patch が
+# _original を辿って 5s ラッパーを捨てうる問題) も解消する。
+# 一方でフォールバック注文は rest_full_board / entry_limit_passive など
+# 外側のラッパーを通るようになる = ガードが増える方向の差異がある。
+# ============================================================
+_FIVE_SEC_OPTIONAL_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+_FIVE_SEC_OPTIONAL_DB_PROCESS_ENVS = (
+    "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+    "AUTOSTOCK_SUMMARY_DB_WRITER",
+    "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+    "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
+)
+_FIVE_SEC_OPTIONAL_DEFAULT_SOURCES = "RANKING,TONOSAMA,EARLY_SCALP,ENTRY"
+
+
+def _5s_env_bool(name: str, default: bool = True) -> bool:
+    """旧パッチの _env_bool。真値集合に "enable" を含まない点をそのまま残す。"""
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _5s_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _five_sec_optional_scope_enabled() -> bool:
+    """このプロセスで NO_5S_BREAKOUT フォールバックを使うか。
+
+    旧パッチは sitecustomize の BACKGROUND_MAIN_PATCHES 経由 =
+    main lite の background loop か SITECUSTOMIZE_ENABLE_FULL_NONMAIN=1 の
+    ときだけ install されていた。DISABLE 名が実体とズレている
+    (DISABLE_TONOSAMA_5SEC_ADVISORY_PATCH) のは削除済みパッチの名残だが、
+    運用で使われうるのでそのまま再現する。
+    ENTRY_ORDER_5S_BREAKOUT_OPTIONAL_SCOPE_ENABLED=1/0 で明示上書きできる。
+    """
+    try:
+        raw = os.getenv("ENTRY_ORDER_5S_BREAKOUT_OPTIONAL_SCOPE_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return _5s_env_bool("ENTRY_ORDER_5S_BREAKOUT_OPTIONAL_SCOPE_ENABLED", False)
+        if str(os.environ.get("DISABLE_TONOSAMA_5SEC_ADVISORY_PATCH", "")).strip() == "1":
+            return False
+        if not _5s_env_bool("ENTRY_ORDER_5S_BREAKOUT_OPTIONAL_ENABLED", True):
+            return False
+        argv_list = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        argv = " ".join(argv_list)
+        if any(name in argv for name in _FIVE_SEC_OPTIONAL_DB_PROCESS_NAMES):
+            return False
+        if any(_5s_env_bool(name, False) for name in _FIVE_SEC_OPTIONAL_DB_PROCESS_ENVS):
+            return False
+        if any(a.endswith("/main.py") or a == "main.py" for a in argv_list) and _5s_env_bool("SITECUSTOMIZE_MAIN_LITE", True):
+            return True
+        return _5s_env_bool("SITECUSTOMIZE_ENABLE_FULL_NONMAIN", False)
+    except Exception:
+        return False
+
+
+def _five_sec_optional_source_allowed(source: str) -> bool:
+    src = str(source or "").upper()
+    allowed = {
+        s.strip().upper()
+        for s in os.getenv("ENTRY_ORDER_5S_BREAKOUT_OPTIONAL_SOURCES", _FIVE_SEC_OPTIONAL_DEFAULT_SOURCES).split(",")
+        if s.strip()
+    }
+    return "ALL" in allowed or src in allowed
+
+
+def _five_sec_optional_row_to_dict(row: Any) -> Dict[str, Any]:
+    try:
+        if isinstance(row, dict):
+            return row
+        if hasattr(row, "to_dict"):
+            d = row.to_dict()
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    return {}
+
+
+def _five_sec_optional_fallback_order(*, symbol: str, side: str, source: str, entry_row: Any, qty_override: Optional[int]) -> Optional[Dict[str, Any]]:
+    """NO_5S_BREAKOUT の代わりに返す注文。適用対象外なら None。
+
+    旧パッチは NG 側の理由も差し替えていた (NO_PRICE_SOURCE_AFTER_NO_5S_BREAKOUT
+    など) ので、dict を返したらそのまま返す。
+    """
+    if not _five_sec_optional_scope_enabled():
+        return None
+    source_u = str(source or "").upper()
+    if not _five_sec_optional_source_allowed(source_u):
+        return None
+    if source_u == "SUMMARY_AI" and not _5s_env_bool("ENTRY_ORDER_5S_BREAKOUT_OPTIONAL_FOR_SUMMARY", False):
+        return None
+
+    side_u = str(side or "").upper()
+    symbol_s = str(symbol or "").strip()
+    row = _five_sec_optional_row_to_dict(entry_row)
+    base_price = _safe_float(_first(row, ("close_price", "price", "current_price", "close", "vwap"), 0.0), 0.0)
+    if base_price <= 0:
+        return {"ok": False, "reason": "NO_PRICE_SOURCE_AFTER_NO_5S_BREAKOUT", "detail": {"symbol": symbol_s, "side": side_u, "source": source_u}}
+
+    try:
+        price = float(_round_price(base_price, side_u))
+    except Exception:
+        price = float(base_price)
+
+    volume = _safe_float(_first(row, ("volume", "Volume", "出来高"), 0.0), 0.0)
+    trading_value = price * volume if price > 0 else 0.0
+    min_turnover = _5s_env_float("ENTRY_ORDER_5S_FALLBACK_MIN_TRADING_VALUE", 3_000_000.0)
+    if trading_value < min_turnover:
+        return {
+            "ok": False,
+            "reason": "LOW_LIQUIDITY_AFTER_NO_5S_BREAKOUT",
+            "detail": {"symbol": symbol_s, "side": side_u, "source": source_u, "price": price, "volume": volume, "trading_value": trading_value, "min_trading_value": min_turnover},
+        }
+
+    if qty_override is not None:
+        qty = int(qty_override)
+        if qty <= 0:
+            return {"ok": False, "reason": "INVALID_QTY_OVERRIDE", "detail": {"qty_override": qty_override}}
+    else:
+        try:
+            qty = int(calculate_qty_by_budget(price))
+        except Exception:
+            qty = 0
+        if qty <= 0 and side_u == "BUY":
+            qty = 100
+    if qty <= 0:
+        return {"ok": False, "reason": "QTY_ZERO_AFTER_NO_5S_BREAKOUT", "detail": {"symbol": symbol_s, "side": side_u, "price": price, "base_price": base_price}}
+
+    detail = {
+        "order_type": "LIMIT",
+        "price": price,
+        "base_price": base_price,
+        "qty": qty,
+        "spread_pct": None,
+        "max_spread_pct": None,
+        "board": False,
+        "price_source": "close_limit_fallback_no_5s_breakout",
+        "fallback_from": "NO_5S_BREAKOUT",
+        "five_sec_breakout_optional": True,
+        "source": source_u,
+        "symbol": symbol_s,
+        "side": side_u,
+        "trading_value": trading_value,
+    }
+    if qty_override is not None:
+        detail["qty_override"] = True
+    logger.warning(
+        "[ENTRY ORDER 5S OPTIONAL] ALLOW_NO_5S_BREAKOUT symbol=%s side=%s source=%s price=%.4f base=%.4f qty=%s volume=%.0f trading_value=%.0f",
+        symbol_s,
+        side_u,
+        source_u,
+        price,
+        base_price,
+        qty,
+        volume,
+        trading_value,
+    )
+    return _ok(**detail)
+
+
 def build_entry_order(*, symbol: str, side: str, source: str, entry_row: Dict[str, Any], qty_override: Optional[int] = None) -> Dict[str, Any]:
     price = None
     base_price = None
@@ -575,6 +767,11 @@ def build_entry_order(*, symbol: str, side: str, source: str, entry_row: Dict[st
     else:
         base_price = five_sec_breakout(symbol, side)
         if not base_price:
+            fallback = _five_sec_optional_fallback_order(
+                symbol=symbol, side=side, source=source, entry_row=entry_row, qty_override=qty_override
+            )
+            if fallback is not None:
+                return fallback
             return _ng("NO_5S_BREAKOUT")
         price = _round_price(base_price, side)
         order_type = "STOP"
