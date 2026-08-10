@@ -367,9 +367,14 @@ RANKING_RESCUE_PATCHES = [
 TONOSAMA_EXTRA_RESCUE_PATCHES = [
     ("core.startup.low_movement_tonosama_no_highlow_patch", "LOW_MOVE_TONOSAMA_FALLBACK", "DISABLE_LOW_MOVE_TONOSAMA_FALLBACK_PATCH"),
     ("core.startup.tonosama_pending_warning_relax_patch", "TONOSAMA_PENDING_WARNING_RELAX", "DISABLE_TONOSAMA_PENDING_WARNING_RELAX_PATCH"),
-    ("core.startup.tonosama_price_change_or_range_patch", "TONOSAMA_PRICE_RANGE_RESCUE", "DISABLE_TONOSAMA_PRICE_RANGE_PATCH"),
-    ("core.startup.tonosama_volume_surge_zero_rescue_patch", "TONOSAMA_VOLUME_SURGE_ZERO_RESCUE", "DISABLE_TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_PATCH"),
-    ("core.startup.tonosama_slope_range_rescue_patch", "TONOSAMA_SLOPE_RANGE_RESCUE", "DISABLE_TONOSAMA_SLOPE_RANGE_RESCUE_PATCH"),
+    # tonosama_price_change_or_range_patch / tonosama_volume_surge_zero_rescue_patch /
+    # tonosama_slope_range_rescue_patch の 3 件は trading/entry/tonosama/runner.py へ
+    # 本文化済み (_rescue_max_price_change_pct / _rescue_max_volume_surge_ratio / _rescue_slope)。
+    # 3 件とも runner._num_series() を多段ラップしていたが補正対象カラムが排他なので、
+    # _num_series 側の col 分岐で等価になる。
+    # opt-in スコープと DISABLE_* / *_ENABLED 条件、install 時の env 副作用は
+    # runner._tonosama_extra_rescue_enabled() と
+    # runner._apply_tonosama_rescue_env_defaults() が再現している。
 ]
 
 SUMMARY_AI_RESCUE_PATCHES = [

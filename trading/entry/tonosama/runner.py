@@ -112,10 +112,34 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
-def _num_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+def _num_series_core(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
     if df is None or df.empty or col not in df.columns:
         return pd.Series(default, index=df.index if df is not None else None, dtype="float64")
     return pd.to_numeric(df[col], errors="coerce").fillna(default)
+
+
+def _num_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    """数値列の取得。opt-in の TONOSAMA extra rescue が有効な列だけ補正する。
+
+    旧 core/startup の rescue パッチ 3 種がこの関数を多段ラップしていた。
+    詳細は下の「TONOSAMA extra rescue」節を参照。
+    """
+    s = _num_series_core(df, col, default)
+    if col not in _TONOSAMA_RESCUE_COLS:
+        return s
+    if not _tonosama_extra_rescue_enabled():
+        return s
+    _apply_tonosama_rescue_env_defaults()
+    try:
+        if col == "_max_price_change_pct" and _rescue_patch_on("DISABLE_TONOSAMA_PRICE_RANGE_PATCH"):
+            return _rescue_max_price_change_pct(df, s)
+        if col == "_max_volume_surge_ratio" and _rescue_patch_on("DISABLE_TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_PATCH"):
+            return _rescue_max_volume_surge_ratio(df, s)
+        if col == "_slope" and _rescue_patch_on("DISABLE_TONOSAMA_SLOPE_RANGE_RESCUE_PATCH"):
+            return _rescue_slope(df, s)
+    except Exception:
+        logger.exception("[TONOSAMA EXTRA RESCUE] failed -> original series col=%s", col)
+    return s
 
 
 def _bool_series(df: pd.DataFrame, col: str, default: bool = False) -> pd.Series:
@@ -240,6 +264,290 @@ def _repair_intrabar_range_from_history(x: pd.DataFrame) -> pd.DataFrame:
         except Exception:
             pass
     return y
+
+
+# ============================================================
+# TONOSAMA extra rescue
+#   旧 core/startup/tonosama_price_change_or_range_patch.py   (V2)
+#   旧 core/startup/tonosama_volume_surge_zero_rescue_patch.py (V1)
+#   旧 core/startup/tonosama_slope_range_rescue_patch.py       (V1)
+# ------------------------------------------------------------
+# 3 パッチとも runner._num_series() を多段ラップしていたが、補正対象カラムが
+#   _max_price_change_pct / _max_volume_surge_ratio / _slope
+# と排他なので、_num_series 側で col ごとに分岐すれば等価になる。
+# (install 順は price -> volume -> slope だったが、互いに素なので順序非依存)
+#
+# これらは sitecustomize の TONOSAMA_EXTRA_RESCUE_PATCHES = opt-in グループで、
+# 既定 OFF。install されたときだけ効いていたので、有効条件とプロセススコープを
+# _tonosama_extra_rescue_enabled() で再現する。
+# TONOSAMA_EXTRA_RESCUE_SCOPE_ENABLED=1/0 で明示的に上書きできる。
+# ============================================================
+_TONOSAMA_RESCUE_COLS = frozenset({"_max_price_change_pct", "_max_volume_surge_ratio", "_slope"})
+
+# sitecustomize._is_database_process() の env 側判定
+_TONOSAMA_RESCUE_DB_PROCESS_ENVS = (
+    "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+    "AUTOSTOCK_SUMMARY_DB_WRITER",
+    "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+    "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
+)
+
+_TONOSAMA_RESCUE_ENV_APPLIED = False
+
+
+def _rescue_patch_on(disable_env: str) -> bool:
+    """sitecustomize._install_module の disabled_env 判定 ("1" 完全一致) を再現する。"""
+    try:
+        return str(os.environ.get(disable_env, "")).strip() != "1"
+    except Exception:
+        return True
+
+
+def _tonosama_rescue_process_scope_ok() -> bool:
+    """sitecustomize が optional rescue を install するプロセスか。
+
+    _install_optional_rescue_patches() の呼び出し元は
+      - main lite (argv に main.py かつ SITECUSTOMIZE_MAIN_LITE) の background loop
+      - SITECUSTOMIZE_ENABLE_FULL_NONMAIN=1
+    の 2 経路のみ。DB プロセスは先に分岐して除外される。
+    """
+    try:
+        argv_list = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        argv = " ".join(argv_list)
+        if any(name in argv for name in _RANGE_REPAIR_DB_PROCESS_NAMES):
+            return False
+        if any(_env_bool(name, False) for name in _TONOSAMA_RESCUE_DB_PROCESS_ENVS):
+            return False
+        if any(a.endswith("/main.py") or a == "main.py" for a in argv_list) and _env_bool("SITECUSTOMIZE_MAIN_LITE", True):
+            return True
+        return _env_bool("SITECUSTOMIZE_ENABLE_FULL_NONMAIN", False)
+    except Exception:
+        return False
+
+
+def _tonosama_extra_rescue_enabled() -> bool:
+    try:
+        raw = os.getenv("TONOSAMA_EXTRA_RESCUE_SCOPE_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return _env_bool("TONOSAMA_EXTRA_RESCUE_SCOPE_ENABLED", False)
+        if not (
+            _env_bool("SITECUSTOMIZE_ENABLE_RESCUE_PATCHES", False)
+            or _env_bool("SITECUSTOMIZE_ENABLE_TONOSAMA_EXTRA_RESCUE_PATCHES", False)
+            or _env_bool("USERCUSTOMIZE_ENABLE_TONOSAMA_RESCUE_PATCHES", False)
+        ):
+            return False
+        return _tonosama_rescue_process_scope_ok()
+    except Exception:
+        return False
+
+
+def _apply_tonosama_rescue_env_defaults() -> None:
+    """旧 install() が持っていた env 副作用を、有効なときだけ 1 度だけ再現する。
+
+    旧構成では sitecustomize の background loop で install した時点で設定していた。
+    これらのキーを読むのは本節のコードだけなので、初回参照時に遅延適用してよい。
+    """
+    global _TONOSAMA_RESCUE_ENV_APPLIED
+    if _TONOSAMA_RESCUE_ENV_APPLIED:
+        return
+    _TONOSAMA_RESCUE_ENV_APPLIED = True
+    try:
+        if _rescue_patch_on("DISABLE_TONOSAMA_PRICE_RANGE_PATCH"):
+            # V2 は surge 不要。runtime_env_defaults の 3.0 をここで 0 へ倒していた。
+            os.environ["TONOSAMA_PRICE_CHANGE_OR_RANGE_MIN_SURGE"] = os.environ.get(
+                "TONOSAMA_PRICE_CHANGE_OR_RANGE_MIN_SURGE_FORCE", "0.0"
+            )
+        if _rescue_patch_on("DISABLE_TONOSAMA_SLOPE_RANGE_RESCUE_PATCH"):
+            os.environ.setdefault("TONOSAMA_SLOPE_RANGE_RESCUE_ENABLED", "1")
+            os.environ.setdefault("TONOSAMA_SLOPE_RANGE_RESCUE_MIN_RANGE_PCT", "4.0")
+            os.environ.setdefault("TONOSAMA_SLOPE_RANGE_RESCUE_MIN_VOLUME", "500000")
+            os.environ.setdefault("TONOSAMA_SLOPE_RANGE_RESCUE_MIN_SURGE", "0.0")
+            os.environ.setdefault("TONOSAMA_SLOPE_RANGE_RESCUE_MIN_ABS_SCORE", "0.0")
+    except Exception:
+        logger.exception("[TONOSAMA EXTRA RESCUE] env defaults failed")
+
+
+def _rescue_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    """rescue パッチ 3 種が持っていた _series()。_num_series と違い astype(float) する。"""
+    if df is None or df.empty or col not in df.columns:
+        return pd.Series(default, index=df.index if df is not None else None, dtype="float64")
+    return pd.to_numeric(df[col], errors="coerce").fillna(default).astype(float)
+
+
+def _rescue_series_safe(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    """volume surge rescue の _series() だけは例外を握り潰す実装だった。差異を残す。"""
+    try:
+        return _rescue_series(df, col, default)
+    except Exception:
+        return pd.Series(default, index=df.index if df is not None else None, dtype="float64")
+
+
+def _rescue_max_price_change_pct(df: pd.DataFrame, s: pd.Series) -> pd.Series:
+    """レンジ・出来高・終値位置が有効なら price_change_low_abs を通して後段guardへ渡す。"""
+    if not _env_bool("TONOSAMA_PRICE_CHANGE_OR_RANGE_ENABLED", True):
+        return s
+    if df is None or df.empty:
+        return s
+
+    min_price_change = float(MIN_PRICE_CHANGE_PCT or 0.2)
+
+    range_pct = _rescue_series(df, "_intrabar_range_pct", 0.0)
+    volume = _rescue_series(df, "_latest_volume", 0.0)
+    surge = _rescue_series(df, "_max_volume_surge_ratio", 0.0)
+    close_pos = _rescue_series(df, "_close_position_pct", 50.0)
+    signed_body = _rescue_series(df, "_signed_body_change_pct", 0.0)
+    slope = _rescue_series(df, "_slope", 0.0)
+    score = _rescue_series(df, "score", 0.0)
+    final_score = _rescue_series(df, "final_score", 0.0)
+
+    min_range = _env_float("TONOSAMA_PRICE_CHANGE_OR_RANGE_MIN_RANGE_PCT", 3.0)
+    min_volume = _env_float("TONOSAMA_PRICE_CHANGE_OR_RANGE_MIN_VOLUME", 50000.0)
+    min_surge = _env_float("TONOSAMA_PRICE_CHANGE_OR_RANGE_MIN_SURGE", 0.0)
+    min_abs_slope = _env_float("TONOSAMA_PRICE_CHANGE_OR_RANGE_MIN_ABS_SLOPE", 0.0)
+    min_abs_score = _env_float("TONOSAMA_PRICE_CHANGE_OR_RANGE_MIN_ABS_SCORE", 0.0)
+
+    range_ok = range_pct >= min_range
+    volume_ok = volume >= min_volume
+    surge_ok = surge >= min_surge
+    slope_ok = slope.abs() >= min_abs_slope
+    score_ok = (score.abs() >= min_abs_score) | (final_score.abs() >= min_abs_score)
+
+    # close_pos条件: 極端に上下へ寄っている候補だけでなく、レンジが十分なら中間でも後段guardへ渡す。
+    body_or_position_ok = (signed_body.abs() > 0) | (close_pos >= 20.0) | (close_pos <= 80.0) | range_ok
+    rescue = (s.abs() < min_price_change) & range_ok & volume_ok & surge_ok & slope_ok & score_ok & body_or_position_ok
+    if not rescue.any():
+        return s
+
+    out = s.copy()
+    # signed_bodyが0なら score/final_score の符号を使う。全部0なら正方向で閾値だけ満たす。
+    sign_base = signed_body.copy()
+    sign_base = sign_base.where(sign_base != 0, score)
+    sign_base = sign_base.where(sign_base != 0, final_score)
+    sign = sign_base.apply(lambda x: 1.0 if float(x) >= 0 else -1.0)
+    out.loc[rescue] = sign.loc[rescue] * min_price_change
+    try:
+        sample_cols = [
+            "symbol", "symbolname", "close", "_latest_volume", "_intrabar_range_pct",
+            "_max_volume_surge_ratio", "_max_price_change_pct", "_close_position_pct",
+            "_signed_body_change_pct", "score", "final_score",
+        ]
+        sample = df.loc[rescue, [c for c in sample_cols if c in df.columns]].head(10).to_dict("records")
+    except Exception:
+        sample = []
+    logger.warning(
+        "[TONOSAMA PRICE/RANGE RESCUE] rescued=%s min_price_change=%.3f min_range=%.3f min_volume=%.0f min_surge=%.2f min_abs_score=%.3f sample=%s",
+        int(rescue.sum()), min_price_change, min_range, min_volume, min_surge, min_abs_score, sample,
+    )
+    return out
+
+
+def _rescue_max_volume_surge_ratio(df: pd.DataFrame, s: pd.Series) -> pd.Series:
+    """surge計算だけが 0.0 になり volume_surge_low で全落ちするケースを救済する。"""
+    if not _env_bool("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_ENABLED", True):
+        return s
+    if df is None or df.empty:
+        return s
+
+    min_surge = float(MIN_VOLUME_SURGE_RATIO or 3.0)
+
+    latest_volume = _rescue_series_safe(df, "_latest_volume", 0.0)
+    intrabar_range = _rescue_series_safe(df, "_intrabar_range_pct", 0.0)
+    body_change = _rescue_series_safe(df, "_body_change_pct", 0.0)
+    mtf = _rescue_series_safe(df, "mtf", 0.0)
+    score_mtf = _rescue_series_safe(df, "score_mtf", 0.0)
+    final_score = _rescue_series_safe(df, "final_score", 0.0)
+    score = _rescue_series_safe(df, "score", 0.0)
+
+    min_volume = _env_float("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_MIN_VOLUME", 500000.0)
+    min_range = _env_float("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_MIN_RANGE_PCT", 4.0)
+    min_body = _env_float("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_MIN_BODY_PCT", 0.0)
+    min_abs_score = _env_float("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_MIN_ABS_SCORE", 0.8)
+    min_mtf = _env_float("TONOSAMA_VOLUME_SURGE_ZERO_RESCUE_MIN_MTF", 1.0)
+
+    volume_ok = latest_volume >= min_volume
+    range_ok = intrabar_range >= min_range
+    body_ok = body_change >= min_body
+    score_ok = final_score.abs().combine(score.abs(), max) >= min_abs_score
+    mtf_ok = mtf.abs().combine(score_mtf.abs(), max) >= min_mtf
+    rescue = (s <= 0) & volume_ok & range_ok & body_ok & score_ok & mtf_ok
+    if not rescue.any():
+        return s
+
+    out = s.copy()
+    out.loc[rescue] = min_surge
+    try:
+        sample_cols = [
+            "symbol", "symbolname", "close", "_latest_volume", "_intrabar_range_pct",
+            "_body_change_pct", "_max_volume_surge_ratio", "score", "final_score", "mtf", "score_mtf",
+        ]
+        sample = df.loc[rescue, [c for c in sample_cols if c in df.columns]].head(10).to_dict("records")
+    except Exception:
+        sample = []
+    logger.warning(
+        "[TONOSAMA VOLUME SURGE ZERO RESCUE] rescued=%s min_surge=%.2f min_volume=%.0f min_range=%.3f min_abs_score=%.3f min_mtf=%.3f sample=%s",
+        int(rescue.sum()), min_surge, min_volume, min_range, min_abs_score, min_mtf, sample,
+    )
+    return out
+
+
+def _rescue_slope(df: pd.DataFrame, s: pd.Series) -> pd.Series:
+    """PUSH/ランキング由来の1分特徴で slope が微小なとき slope_abs_too_small を救済する。"""
+    if not _env_bool("TONOSAMA_SLOPE_RANGE_RESCUE_ENABLED", True):
+        return s
+    if df is None or df.empty:
+        return s
+
+    min_slope = float(MIN_SLOPE or 0.001)
+
+    range_pct = _rescue_series(df, "_intrabar_range_pct", 0.0)
+    volume = _rescue_series(df, "_latest_volume", 0.0)
+    close_pos = _rescue_series(df, "_close_position_pct", 50.0)
+    signed_body = _rescue_series(df, "_signed_body_change_pct", 0.0)
+    score = _rescue_series(df, "score", 0.0)
+    final_score = _rescue_series(df, "final_score", 0.0)
+    price_chg = _rescue_series(df, "_max_price_change_pct", 0.0)
+    surge = _rescue_series(df, "_max_volume_surge_ratio", 0.0)
+
+    min_range = _env_float("TONOSAMA_SLOPE_RANGE_RESCUE_MIN_RANGE_PCT", 4.0)
+    min_volume = _env_float("TONOSAMA_SLOPE_RANGE_RESCUE_MIN_VOLUME", 500000.0)
+    min_abs_score = _env_float("TONOSAMA_SLOPE_RANGE_RESCUE_MIN_ABS_SCORE", 0.0)
+    min_surge = _env_float("TONOSAMA_SLOPE_RANGE_RESCUE_MIN_SURGE", 0.0)
+    close_pos_low = _env_float("TONOSAMA_SLOPE_RANGE_RESCUE_CLOSE_POS_LOW", 15.0)
+    close_pos_high = _env_float("TONOSAMA_SLOPE_RANGE_RESCUE_CLOSE_POS_HIGH", 85.0)
+
+    range_ok = range_pct >= min_range
+    volume_ok = volume >= min_volume
+    score_ok = (score.abs() >= min_abs_score) | (final_score.abs() >= min_abs_score)
+    surge_ok = surge >= min_surge
+    close_pos_ok = (close_pos <= close_pos_low) | (close_pos >= close_pos_high) | range_ok
+
+    rescue = (s.abs() < min_slope) & range_ok & volume_ok & score_ok & surge_ok & close_pos_ok
+    if not rescue.any():
+        return s
+
+    out = s.copy()
+    sign_base = signed_body.copy()
+    sign_base = sign_base.where(sign_base != 0, price_chg)
+    sign_base = sign_base.where(sign_base != 0, score)
+    sign_base = sign_base.where(sign_base != 0, final_score)
+    # close_pos が高値圏ならBUY方向、安値圏ならSELL方向の仮符号。
+    sign_base = sign_base.where(sign_base != 0, close_pos - 50.0)
+    sign = sign_base.apply(lambda x: 1.0 if float(x) >= 0 else -1.0)
+    out.loc[rescue] = sign.loc[rescue] * min_slope
+    try:
+        sample_cols = [
+            "symbol", "symbolname", "close", "_latest_volume", "_intrabar_range_pct",
+            "_max_volume_surge_ratio", "_max_price_change_pct", "_slope",
+            "_close_position_pct", "_signed_body_change_pct", "score", "final_score",
+        ]
+        sample = df.loc[rescue, [c for c in sample_cols if c in df.columns]].head(10).to_dict("records")
+    except Exception:
+        sample = []
+    logger.warning(
+        "[TONOSAMA SLOPE/RANGE RESCUE] rescued=%s min_slope=%.6f min_range=%.3f min_volume=%.0f min_surge=%.2f min_abs_score=%.3f sample=%s",
+        int(rescue.sum()), min_slope, min_range, min_volume, min_surge, min_abs_score, sample,
+    )
+    return out
 
 
 def _ensure_actual_movement_cols(df: pd.DataFrame) -> pd.DataFrame:
