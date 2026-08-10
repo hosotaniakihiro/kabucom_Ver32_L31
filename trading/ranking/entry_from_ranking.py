@@ -22,6 +22,8 @@ from __future__ import annotations
 import logging
 import datetime as dt
 import os
+import sqlite3
+import sys
 import time
 from collections import Counter
 from typing import Dict, Any, Optional, Tuple, List
@@ -229,7 +231,7 @@ def _clip(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
-def _get_ranking_source_df() -> Optional[pd.DataFrame]:
+def _get_ranking_source_df_core() -> Optional[pd.DataFrame]:
     snapshot = getattr(global_data, "latest_ranking_snapshot", None)
     if isinstance(snapshot, list) and snapshot:
         logger.info("[RANKING ENTRY LOOP] source=latest_ranking_snapshot rows=%s", len(snapshot))
@@ -243,6 +245,500 @@ def _get_ranking_source_df() -> Optional[pd.DataFrame]:
 
     logger.warning("[RANKING ENTRY LOOP] ranking source dataframe not found")
     return None
+
+
+# ============================================================
+# ランキング入力の DB フォールバック
+#   旧 core/startup/ranking_entry_source_db_fallback_patch.py (V4)
+# ------------------------------------------------------------
+# global_data.latest_ranking_* が空、または古いときに、当日の
+# rankingYYYYMMDD.db を rowid DESC で安く読み直す。DB 自体が遅延して
+# いても同日行があれば fail-open で返し、最終 entry/liquidity/board
+# ガードに判断を委ねる。
+#
+# 旧パッチは _get_ranking_source_df を「完全置換」していた (元関数を
+# 一度も呼ばない) ので、本文化でも置換のまま _rsrc_* 側へ移した。
+# 元の実装は _get_ranking_source_df_core() として残してあり、
+# パッチが install されないプロセス (DB / helper) ではそちらが動く。
+# ============================================================
+_RSRC_LAST_DB_DF: Optional[pd.DataFrame] = None
+_RSRC_LAST_DB_TS: float = 0.0
+_RSRC_LAST_DB_KEY: Optional[Tuple[str, str]] = None
+_RSRC_ENV_APPLIED = False
+
+# sitecustomize._is_database_process() 相当
+_RSRC_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+_RSRC_DB_PROCESS_ENVS = (
+    "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+    "AUTOSTOCK_SUMMARY_DB_WRITER",
+    "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+    "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
+)
+
+_RSRC_DATETIME_COLS = ("datetime", "snapshot_time", "time", "created_at", "received_at", "inserted_at", "date")
+
+
+def _rsrc_scope_enabled() -> bool:
+    """このプロセスで DB フォールバックを使うか。
+
+    旧パッチは sitecustomize の BACKGROUND_MAIN_PATCHES 経由で install
+    されていた = main lite の background loop か
+    SITECUSTOMIZE_ENABLE_FULL_NONMAIN=1 のときだけ。そのスコープと
+    disabled_env ("1" 完全一致) をそのまま再現する。
+    RANKING_ENTRY_SOURCE_DB_FALLBACK_SCOPE_ENABLED=1/0 で明示上書きできる。
+    """
+    try:
+        raw = os.getenv("RANKING_ENTRY_SOURCE_DB_FALLBACK_SCOPE_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return _env_bool("RANKING_ENTRY_SOURCE_DB_FALLBACK_SCOPE_ENABLED", False)
+        if str(os.environ.get("DISABLE_RANKING_ENTRY_SOURCE_DB_FALLBACK_PATCH", "")).strip() == "1":
+            return False
+        argv_list = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        argv = " ".join(argv_list)
+        if any(name in argv for name in _RSRC_DB_PROCESS_NAMES):
+            return False
+        if any(_env_bool(name, False) for name in _RSRC_DB_PROCESS_ENVS):
+            return False
+        if any(a.endswith("/main.py") or a == "main.py" for a in argv_list) and _env_bool("SITECUSTOMIZE_MAIN_LITE", True):
+            return True
+        return _env_bool("SITECUSTOMIZE_ENABLE_FULL_NONMAIN", False)
+    except Exception:
+        return False
+
+
+def _rsrc_apply_env_defaults() -> None:
+    """旧 install() の env setdefault 10 件を、有効なときだけ 1 度だけ再現する。
+
+    これらのキーの読み手は本節と tonosama_history_failclose_strict_patch
+    だけで、後者は os.environ[k]=v のハード代入なので順序に依存しない。
+    """
+    global _RSRC_ENV_APPLIED
+    if _RSRC_ENV_APPLIED:
+        return
+    _RSRC_ENV_APPLIED = True
+    try:
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED", "1")
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_MAX_AGE_SEC", "300")
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_MAX_AGE_SEC", "300")
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_FAILOPEN_STALE", "1")
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_FAILOPEN_MAX_AGE_SEC", "1800")
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_FAILOPEN_STALE_GLOBAL", "1")
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_FAILOPEN_GLOBAL_MAX_AGE_SEC", "1800")
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_LOOKBACK_MIN", "30")
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_MAX_ROWS", "900")
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_SCAN_ROWS", "1500")
+    except Exception:
+        logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] env defaults failed", exc_info=False)
+
+
+def _rsrc_quote(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _rsrc_resolve_db_path() -> Optional[str]:
+    try:
+        from ats.ats_ranking.db_path import resolve_ranking_db_path
+        p = resolve_ranking_db_path()
+        if p:
+            return str(p)
+    except Exception as e:
+        logger.debug("[RANKING ENTRY SOURCE DB FALLBACK] ats resolve failed: %s", e, exc_info=False)
+
+    for key in ("RANKING_DB_PATH", "ATS_RANKING_DB_PATH", "KABU_RANKING_DB_PATH"):
+        try:
+            p = os.environ.get(key, "").strip()
+            if p:
+                return p
+        except Exception:
+            pass
+
+    try:
+        today = dt.datetime.now().strftime("%Y%m%d")
+        p = rf"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\ranking\ranking{today}.db"
+        if os.path.exists(p):
+            return p
+    except Exception:
+        pass
+    return None
+
+
+def _rsrc_table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+    try:
+        return [str(r[1]) for r in conn.execute(f"PRAGMA table_info({_rsrc_quote(table)})").fetchall()]
+    except Exception:
+        return []
+
+
+def _rsrc_table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    try:
+        return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", (table,)).fetchone() is not None
+    except Exception:
+        return False
+
+
+def _rsrc_find_col(cols: List[str], candidates: Tuple[str, ...]) -> Optional[str]:
+    lower = {c.lower(): c for c in cols}
+    for cand in candidates:
+        if cand in cols:
+            return cand
+        if cand.lower() in lower:
+            return lower[cand.lower()]
+    return None
+
+
+def _rsrc_first_datetime_col(df: pd.DataFrame) -> Optional[str]:
+    for c in _RSRC_DATETIME_COLS:
+        if c in df.columns:
+            return c
+    return None
+
+
+def _rsrc_latest_info(df: pd.DataFrame) -> Tuple[Optional[dt.datetime], Optional[float], str]:
+    try:
+        if df is None or df.empty:
+            return None, None, "empty"
+        col = _rsrc_first_datetime_col(df)
+        if not col:
+            return None, None, "no_datetime_col"
+        s = pd.to_datetime(df[col], errors="coerce").dropna()
+        if s.empty:
+            return None, None, f"bad_datetime_col={col}"
+        latest = s.max().to_pydatetime().replace(tzinfo=None)
+        age = max(0.0, (dt.datetime.now() - latest).total_seconds())
+        return latest, age, col
+    except Exception:
+        return None, None, "latest_error"
+
+
+def _rsrc_fresh_enough(df: pd.DataFrame, *, label: str) -> bool:
+    latest, age, col = _rsrc_latest_info(df)
+    max_age = max(30.0, _env_float("RANKING_ENTRY_SOURCE_MAX_AGE_SEC", 300.0))
+    if age is not None and age <= max_age:
+        logger.info("[RANKING ENTRY SOURCE DB FALLBACK] fresh source=%s rows=%s latest=%s age=%.1fs col=%s max_age=%.1fs", label, len(df), latest, age, col, max_age)
+        return True
+    logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] stale/unknown source=%s rows=%s latest=%s age=%s col=%s max_age=%.1fs -> try DB refresh", label, 0 if df is None else len(df), latest, None if age is None else round(age, 1), col, max_age)
+    return False
+
+
+def _rsrc_read_global_data_source() -> pd.DataFrame:
+    try:
+        snapshot = getattr(global_data, "latest_ranking_snapshot", None)
+        if isinstance(snapshot, list) and snapshot:
+            df = pd.DataFrame(snapshot)
+            if not df.empty:
+                df.attrs["_ranking_source_name"] = "latest_ranking_snapshot"
+                return df
+    except Exception as e:
+        logger.debug("[RANKING ENTRY SOURCE DB FALLBACK] direct snapshot read failed: %s", e, exc_info=False)
+
+    for name in (
+        "latest_ranking_raw",
+        "latest_ranking_df",
+        "ranking_raw_df",
+        "ranking_snapshot_df",
+        "ranking_df",
+    ):
+        try:
+            df = getattr(global_data, name, None)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                out = df.copy()
+                out.attrs["_ranking_source_name"] = name
+                return out
+        except Exception as e:
+            logger.debug("[RANKING ENTRY SOURCE DB FALLBACK] direct attr read failed name=%s err=%s", name, e, exc_info=False)
+    return pd.DataFrame()
+
+
+def _rsrc_cache_get(db_path: str, table: str) -> pd.DataFrame:
+    ttl = _env_float("RANKING_ENTRY_SOURCE_DB_CACHE_TTL_SEC", 10.0)
+    if _RSRC_LAST_DB_DF is not None and _RSRC_LAST_DB_KEY == (db_path, table) and (time.time() - _RSRC_LAST_DB_TS) <= ttl:
+        logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] cache hit table=%s rows=%s age=%.1fs", table, len(_RSRC_LAST_DB_DF), time.time() - _RSRC_LAST_DB_TS)
+        return _RSRC_LAST_DB_DF.copy()
+    return pd.DataFrame()
+
+
+def _rsrc_cache_put(db_path: str, table: str, df: pd.DataFrame) -> None:
+    global _RSRC_LAST_DB_DF, _RSRC_LAST_DB_TS, _RSRC_LAST_DB_KEY
+    try:
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            _RSRC_LAST_DB_DF = df.copy()
+            _RSRC_LAST_DB_TS = time.time()
+            _RSRC_LAST_DB_KEY = (db_path, table)
+    except Exception:
+        pass
+
+
+def _rsrc_trim_recent(df: pd.DataFrame, dt_col: Optional[str], lookback_min: int, max_rows: int) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if dt_col and dt_col in df.columns:
+        tmp = df.copy()
+        tmp[dt_col] = pd.to_datetime(tmp[dt_col], errors="coerce")
+        tmp = tmp.dropna(subset=[dt_col])
+        if not tmp.empty:
+            latest = tmp[dt_col].max()
+            cutoff = latest - pd.Timedelta(minutes=max(1, lookback_min))
+            recent = tmp[tmp[dt_col] >= cutoff]
+            if not recent.empty:
+                return recent.sort_values(dt_col, ascending=False, kind="stable").head(max_rows).copy()
+            return tmp.sort_values(dt_col, ascending=False, kind="stable").head(max_rows).copy()
+    return df.head(max_rows).copy()
+
+
+def _rsrc_candidate_tables(conn: sqlite3.Connection) -> List[str]:
+    configured = [x.strip() for x in os.environ.get("RANKING_ENTRY_SOURCE_DB_TABLES", "").split(",") if x.strip()]
+    base = configured or [
+        os.environ.get("RANKING_ENTRY_SOURCE_DB_TABLE", "ranking_snapshot_1min").strip() or "ranking_snapshot_1min",
+        "ranking_snapshot",
+        "ranking_raw_1min",
+        "ranking_raw",
+        "ranking_summary_1min",
+        "ranking_summary_5min",
+    ]
+    out: List[str] = []
+    for t in base:
+        if t and t not in out and _rsrc_table_exists(conn, t):
+            out.append(t)
+    return out
+
+
+def _rsrc_load_from_ranking_db() -> pd.DataFrame:
+    if not _env_bool("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED", True):
+        return pd.DataFrame()
+
+    db_path = _rsrc_resolve_db_path()
+    if not db_path or not os.path.exists(db_path):
+        logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] db missing path=%s", db_path)
+        return pd.DataFrame()
+
+    lookback_min = max(1, _env_int("RANKING_ENTRY_SOURCE_DB_LOOKBACK_MIN", 30))
+    max_rows = max(100, _env_int("RANKING_ENTRY_SOURCE_DB_MAX_ROWS", 900))
+    scan_rows = max(max_rows, _env_int("RANKING_ENTRY_SOURCE_DB_SCAN_ROWS", 1500))
+    sqlite_timeout = max(0.2, _env_float("RANKING_ENTRY_SOURCE_DB_SQLITE_TIMEOUT_SEC", 1.2))
+    busy_timeout_ms = max(200, int(_env_float("RANKING_ENTRY_SOURCE_DB_BUSY_TIMEOUT_MS", 900.0)))
+
+    t0 = time.perf_counter()
+    best = pd.DataFrame()
+    best_table = ""
+    try:
+        with sqlite3.connect(str(db_path), timeout=sqlite_timeout) as conn:
+            try:
+                conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+                conn.execute("PRAGMA query_only=ON")
+            except Exception:
+                pass
+
+            tables = _rsrc_candidate_tables(conn)
+            if not tables:
+                logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] no candidate table db=%s", db_path)
+                return pd.DataFrame()
+
+            for table in tables:
+                cached = _rsrc_cache_get(str(db_path), table)
+                if isinstance(cached, pd.DataFrame) and not cached.empty:
+                    return cached
+                cols = _rsrc_table_columns(conn, table)
+                if not cols:
+                    continue
+                dt_col = _rsrc_find_col(cols, _RSRC_DATETIME_COLS)
+                try:
+                    raw = pd.read_sql_query(f"SELECT * FROM {_rsrc_quote(table)} ORDER BY rowid DESC LIMIT ?", conn, params=(scan_rows,))
+                except Exception as e:
+                    logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] table read failed table=%s err=%s", table, e, exc_info=False)
+                    continue
+                if raw is None or raw.empty:
+                    continue
+                df = _rsrc_trim_recent(raw, dt_col, lookback_min, max_rows)
+                if df.empty:
+                    continue
+                latest, age, col = _rsrc_latest_info(df)
+                logger.warning(
+                    "[RANKING ENTRY SOURCE DB FALLBACK] table candidate db=%s table=%s raw_rows=%s rows=%s latest=%s age=%s col=%s lookback_min=%s scan_rows=%s",
+                    db_path, table, len(raw), len(df), latest, None if age is None else round(age, 1), col, lookback_min, scan_rows,
+                )
+                if best.empty:
+                    best = df
+                    best_table = table
+                else:
+                    b_latest, _b_age, _ = _rsrc_latest_info(best)
+                    if latest is not None and (b_latest is None or latest > b_latest):
+                        best = df
+                        best_table = table
+
+        if best is None or best.empty:
+            logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] db read empty db=%s", db_path)
+            return pd.DataFrame()
+
+        latest, age, col = _rsrc_latest_info(best)
+        elapsed = time.perf_counter() - t0
+        max_age = max(30.0, _env_float("RANKING_ENTRY_SOURCE_DB_MAX_AGE_SEC", 300.0))
+        failopen_max_age = max(max_age, _env_float("RANKING_ENTRY_SOURCE_DB_FAILOPEN_MAX_AGE_SEC", 1800.0))
+        same_day = bool(latest is not None and latest.date() == dt.datetime.now().date())
+        stale = bool(age is None or age > max_age)
+        allow_stale = bool(stale and same_day and age is not None and age <= failopen_max_age and _env_bool("RANKING_ENTRY_SOURCE_DB_FAILOPEN_STALE", True))
+
+        if stale and not allow_stale:
+            logger.warning(
+                "[RANKING ENTRY SOURCE DB FALLBACK] db latest stale and not allowed table=%s rows=%s latest=%s age=%s max_age=%.1fs failopen_max=%.1fs same_day=%s",
+                best_table, len(best), latest, None if age is None else round(age, 1), max_age, failopen_max_age, same_day,
+            )
+            return pd.DataFrame()
+
+        logger.warning(
+            "[RANKING ENTRY SOURCE DB FALLBACK] loaded v4 db=%s table=%s rows=%s latest=%s age=%s stale=%s allow_stale=%s elapsed=%.3fs cols=%s",
+            db_path, best_table, len(best), latest, None if age is None else round(age, 1), stale, allow_stale, elapsed, list(best.columns)[:20],
+        )
+        _rsrc_cache_put(str(db_path), best_table, best)
+        return best
+    except Exception as e:
+        logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] db load failed db=%s err=%s", db_path, e, exc_info=False)
+        return pd.DataFrame()
+
+
+def _rsrc_publish_to_global_data(df: pd.DataFrame, *, source: str) -> None:
+    try:
+        out = df.copy()
+        setattr(global_data, "latest_ranking_df", out)
+        setattr(global_data, "ranking_snapshot_df", out)
+        try:
+            setattr(global_data, "latest_ranking_snapshot", out.to_dict("records"))
+        except Exception:
+            pass
+        logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] published source=%s rows=%s latest=%s", source, len(out), _rsrc_latest_info(out)[0])
+    except Exception:
+        pass
+
+
+def _get_ranking_source_df_with_db_fallback() -> Optional[pd.DataFrame]:
+    direct = _rsrc_read_global_data_source()
+    direct_name = str(getattr(direct, "attrs", {}).get("_ranking_source_name", "global_data")) if isinstance(direct, pd.DataFrame) else "global_data"
+
+    if isinstance(direct, pd.DataFrame) and not direct.empty and _rsrc_fresh_enough(direct, label=direct_name):
+        return direct
+
+    fb = _rsrc_load_from_ranking_db()
+    if isinstance(fb, pd.DataFrame) and not fb.empty:
+        _rsrc_publish_to_global_data(fb, source="db_fallback_v4")
+        return fb
+
+    if isinstance(direct, pd.DataFrame) and not direct.empty and _env_bool("RANKING_ENTRY_SOURCE_FAILOPEN_STALE_GLOBAL", True):
+        latest, age, col = _rsrc_latest_info(direct)
+        max_age = _env_float("RANKING_ENTRY_SOURCE_FAILOPEN_GLOBAL_MAX_AGE_SEC", 1800.0)
+        same_day = latest is not None and latest.date() == dt.datetime.now().date()
+        if same_day and age is not None and age <= max_age:
+            logger.warning(
+                "[RANKING ENTRY SOURCE DB FALLBACK] fail-open stale global source=%s rows=%s latest=%s age=%.1fs col=%s max_age=%.1fs",
+                direct_name, len(direct), latest, age, col, max_age,
+            )
+            return direct
+
+    logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] ranking source dataframe not found after direct+db fallback")
+    return None
+
+
+# ------------------------------------------------------------
+# 入力行数の prefilter (旧 core/startup/ranking_entry_source_prefilter_patch_v2.py)
+# ------------------------------------------------------------
+# 旧構成では core/startup/__init__.py が _get_ranking_source_df をこの prefilter で
+# 包んでいたが、その後 ranking_entry_source_db_fallback_patch が同じ属性を
+# 「完全置換」していたため、main.py では prefilter は捨てられていた。
+# 残っていたのは DB フォールバックが install されないプロセス
+# (= 非DB かつ非main のヘルパー) だけ。その条件をそのまま再現する。
+# ------------------------------------------------------------
+_RSRC_PREFILTER_RANK_COLS = ("rank_position", "No", "Rank", "rank")
+_RSRC_PREFILTER_PRICE_COLS = ("price", "current_price", "CurrentPrice", "close")
+_RSRC_PREFILTER_SCORE_COLS = ("ranking_score_total", "score", "entry_score", "total_score", "final_score")
+_RSRC_PREFILTER_VOLUME_COLS = ("volume", "trading_volume", "TradingVolume")
+_RSRC_PREFILTER_TURNOVER_COLS = ("turnover", "trading_value", "TradingValue")
+_RSRC_PREFILTER_SYMBOL_COLS = ("symbol", "Symbol", "code", "stock_code")
+
+
+def _rsrc_prefilter_bool(name: str, default: bool = True) -> bool:
+    """旧 prefilter の _b(): 真値集合が runner 側の _env_bool より狭い ({'1','true','yes','on'})。"""
+    v = os.getenv(name)
+    return default if v is None or str(v).strip() == "" else str(v).lower() in {"1", "true", "yes", "on"}
+
+
+def _rsrc_prefilter_num(df: pd.DataFrame, names: Tuple[str, ...], default: float = 0.0) -> pd.Series:
+    for n in names:
+        if n in df.columns:
+            return pd.to_numeric(df[n], errors="coerce").fillna(default)
+    return pd.Series(default, index=df.index)
+
+
+def _rsrc_prefilter_col(df: pd.DataFrame, names: Tuple[str, ...]) -> Optional[str]:
+    for n in names:
+        if n in df.columns:
+            return n
+    return None
+
+
+def _rsrc_prefilter(df):
+    if not isinstance(df, pd.DataFrame) or df.empty or not _rsrc_prefilter_bool("RANKING_ENTRY_SOURCE_PREFILTER_ENABLED", True):
+        return df
+    if len(df) <= _env_int("RANKING_ENTRY_SOURCE_PREFILTER_SKIP_UNDER_ROWS", 300):
+        return df
+    before = len(df)
+    rank = _rsrc_prefilter_num(df, _RSRC_PREFILTER_RANK_COLS, 999999)
+    price = _rsrc_prefilter_num(df, _RSRC_PREFILTER_PRICE_COLS, 0)
+    score = _rsrc_prefilter_num(df, _RSRC_PREFILTER_SCORE_COLS, 0)
+    vol = _rsrc_prefilter_num(df, _RSRC_PREFILTER_VOLUME_COLS, 0)
+    turn = _rsrc_prefilter_num(df, _RSRC_PREFILTER_TURNOVER_COLS, 0)
+    minv = _env_float("RANKING_ENTRY_PREFILTER_MIN_VOLUME", 15000)
+    fixedv = vol.where(~((vol > 0) & (vol < minv)), vol * 1000.0)
+    fixedt = turn.where(turn >= price * fixedv, price * fixedv)
+    mask = (rank <= _env_int("RANKING_ENTRY_PREFILTER_MAX_RANK", 25)) | (score >= _env_float("RANKING_ENTRY_PREFILTER_MIN_SCORE", 55))
+    mask &= (price >= _env_float("RANKING_ENTRY_PREFILTER_MIN_PRICE", 300)) & (price <= _env_float("RANKING_ENTRY_PREFILTER_MAX_PRICE", 12000))
+    mask &= (fixedv >= minv) | (fixedt >= _env_float("RANKING_ENTRY_PREFILTER_MIN_TURNOVER", 5000000)) | (rank <= _env_int("RANKING_ENTRY_PREFILTER_KEEP_RANK", 20))
+    out = df.loc[mask].copy()
+    if out.empty:
+        return df
+    out["_pf_rank"] = rank.loc[out.index]
+    out["_pf_score"] = score.loc[out.index]
+    out = out.sort_values(["_pf_score", "_pf_rank"], ascending=[False, True])
+    sc = _rsrc_prefilter_col(out, _RSRC_PREFILTER_SYMBOL_COLS)
+    if sc:
+        out = out.drop_duplicates(subset=[sc], keep="first")
+    out = out.head(_env_int("RANKING_ENTRY_PREFILTER_MAX_ROWS", 250)).drop(columns=["_pf_rank", "_pf_score"], errors="ignore")
+    logger.warning("[RANKING ENTRY PREFILTER] before=%s after=%s", before, len(out))
+    return out.reset_index(drop=True)
+
+
+def _rsrc_prefilter_scope_enabled() -> bool:
+    """prefilter を適用するプロセスか。
+
+    旧 prefilter は core/startup/__init__.py の
+    _install_entry_runtime_init_patches() から install されていた
+    (= DB コンテキストではスキップ)。さらに main.py では後から
+    db_fallback に属性ごと置換されて無効化されていた。
+    """
+    try:
+        if _rsrc_scope_enabled():
+            return False
+        if _env_bool("CORE_STARTUP_FORCE_FULL_INIT_PATCHES", False):
+            return True
+        argv = " ".join(str(x) for x in sys.argv).replace("\\", "/").lower()
+        return not any(name in argv for name in _RSRC_DB_PROCESS_NAMES)
+    except Exception:
+        return False
+
+
+def _get_ranking_source_df() -> Optional[pd.DataFrame]:
+    if _rsrc_scope_enabled():
+        _rsrc_apply_env_defaults()
+        return _get_ranking_source_df_with_db_fallback()
+    df = _get_ranking_source_df_core()
+    if _rsrc_prefilter_scope_enabled():
+        return _rsrc_prefilter(df)
+    return df
 
 
 def _normalize_rank_type(v: Any) -> str:

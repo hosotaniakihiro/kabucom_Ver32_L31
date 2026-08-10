@@ -240,17 +240,14 @@ def _install_entry_runtime_init_patches() -> None:
             "RANKING_ENTRY_MIN_TURNOVER", float(_vol_cfg.get("MIN_TURNOVER", 10000000))
         )
 
-        try:
-            from .ranking_entry_source_prefilter_patch_v2 import install as _install_rank_prefilter
-
-            _prefilter_ok = _install_rank_prefilter()
-        except Exception:
-            logger.exception("[RANKING ENTRY UNIT FIX] source prefilter install failed")
-            _prefilter_ok = False
-
+        # ranking_entry_source_prefilter_patch_v2 は
+        # trading/ranking/entry_from_ranking.py へ本文化済み (_rsrc_prefilter)。
+        # 適用スコープ (DBコンテキストは除外、main.py では db fallback 側が
+        # 属性ごと置換していたので不適用) は
+        # entry_from_ranking._rsrc_prefilter_scope_enabled() が再現している。
         logger.warning(
-            "[RANKING ENTRY UNIT FIX] config applied price_min %.1f->%.1f min_volume=%.1f min_turnover=%.1f prefilter=%s",
-            _old_price_min, _price_cfg["MIN"], _vol_cfg["MIN_VOLUME"], _vol_cfg["MIN_TURNOVER"], _prefilter_ok,
+            "[RANKING ENTRY UNIT FIX] config applied price_min %.1f->%.1f min_volume=%.1f min_turnover=%.1f prefilter=inlined",
+            _old_price_min, _price_cfg["MIN"], _vol_cfg["MIN_VOLUME"], _vol_cfg["MIN_TURNOVER"],
         )
     except Exception:
         logger.exception("[core.startup] ranking entry volume unit patch install failed")

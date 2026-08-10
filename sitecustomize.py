@@ -328,7 +328,13 @@ BACKGROUND_MAIN_PATCHES = [
     ("core.startup.entry_order_5s_breakout_optional_patch", "ENTRY_ORDER_5S_OPTIONAL", "DISABLE_TONOSAMA_5SEC_ADVISORY_PATCH"),
     ("core.startup.tonosama_datetime_tz_guard_patch", "TONOSAMA_DT_TZ_GUARD", "DISABLE_TONOSAMA_DT_TZ_GUARD_PATCH"),
     ("core.startup.tonosama_history_missing_guard_patch", "TONOSAMA_HISTORY_MISSING_GUARD", "DISABLE_TONOSAMA_HISTORY_MISSING_GUARD_PATCH"),
-    ("core.startup.ranking_entry_source_db_fallback_patch", "RANKING_ENTRY_SOURCE_DB_FALLBACK", "DISABLE_RANKING_ENTRY_SOURCE_DB_FALLBACK_PATCH"),
+    # ranking_entry_source_db_fallback_patch は trading/ranking/entry_from_ranking.py へ
+    # 本文化済み (_get_ranking_source_df_with_db_fallback)。元関数を一度も呼ばない
+    # 完全置換だったので、本文側も _rsrc_scope_enabled() が真なら置換のまま動く。
+    # install スコープ (main lite / full non-main、DBプロセス除外) と
+    # env setdefault 10 件は entry_from_ranking 側が再現している。
+    # 同じ属性を包んでいた ranking_entry_source_prefilter_patch_v2 も
+    # 同時に本文化した (main.py では置換で捨てられていた挙動を維持)。
     ("trading.handlers.short_mtf_direction_guard", "SHORT_MTF_2OF3_GUARD", "DISABLE_SHORT_MTF_2OF3_GUARD_PATCH"),
     ("core.startup.entry_controller_tonosama_ai_bridge_patch", "TONOSAMA_AI_BRIDGE", "DISABLE_TONOSAMA_AI_BRIDGE_PATCH"),
     # final_entry_tonosama_liquidity_patch は削除済み。ラップ対象だった
