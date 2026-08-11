@@ -476,9 +476,18 @@ TONOSAMA_EXTRA_RESCUE_PATCHES = [
     # runner._apply_tonosama_rescue_env_defaults() が再現している。
 ]
 
-SUMMARY_AI_RESCUE_PATCHES = [
-    ("core.startup.summary_ai_liquidity_rescue_patch", "SUMMARY_AI_LIQ_RESCUE", "DISABLE_SUMMARY_AI_LIQ_RESCUE_PATCH"),
-]
+# summary_ai_liquidity_rescue_patch は削除した。
+# 後半のゼロスコア救済 (attach_display_like_columns のラップ) は
+# trading/entry/summary_ai/candidates.py へ本文化済み
+# (_apply_zero_score_rescue。opt-in スコープは
+#  candidates._zero_score_rescue_scope_enabled() が再現する)。
+# 前半の executor._filter_blocked_ai_ok_items のラップは移していない:
+# executor.py:1664 が import 時に起動する core filter watcher が
+# 0.5 秒ごとに _ensure_core_filter() でモジュール属性を base へ戻し、
+# 一度戻すと誰も再 install しないため、install 直後の 0.5 秒未満しか
+# 生存できない実質的な死にラッパーだった。
+# グループ自体は将来の追加用に残す。
+SUMMARY_AI_RESCUE_PATCHES: list = []
 
 
 def _install_patch_list(items) -> None:

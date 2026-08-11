@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from typing import Any, Optional
 
 import pandas as pd
@@ -388,7 +389,7 @@ def _apply_score_config_flags(df: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def attach_display_like_columns(df: pd.DataFrame) -> pd.DataFrame:
+def attach_display_like_columns_core(df: pd.DataFrame) -> pd.DataFrame:
     out = safe_df(df)
     if out.empty:
         return out
@@ -437,6 +438,193 @@ def attach_display_like_columns(df: pd.DataFrame) -> pd.DataFrame:
             logger.debug("[SUMMARY AI CANDIDATES] datetime normalize failed", exc_info=True)
     out = _apply_score_config_flags(out)
     return out.reset_index(drop=True)
+
+
+# ============================================================
+# SUMMARY AI candidate zero-score rescue
+#   旧 core/startup/summary_ai_liquidity_rescue_patch.py の後半 (V1)
+# ------------------------------------------------------------
+# score が全ゼロ / slope が全ゼロのとき、候補抽出そのものが成立しなくなる。
+# MTF + 現在足方向 + MACD方向 + レンジから候補抽出用のスコアと疑似 slope を
+# 作って、抽出だけは通るようにする。実売買の判定は後段ガードが行う。
+#
+# 旧パッチは sitecustomize の SUMMARY_AI_RESCUE_PATCHES = opt-in グループ
+# (既定 OFF) で install されていた。そのスコープを再現する。
+# ============================================================
+_ZERO_SCORE_RESCUE_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+_ZERO_SCORE_RESCUE_DB_PROCESS_ENVS = (
+    "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+    "AUTOSTOCK_SUMMARY_DB_WRITER",
+    "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+    "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
+)
+
+
+def _zero_score_rescue_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _zero_score_rescue_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _zero_score_rescue_scope_enabled() -> bool:
+    """このプロセスでゼロスコア救済を使うか。
+
+    旧パッチは SUMMARY_AI_RESCUE_PATCHES (opt-in、既定 OFF) 経由で、
+    main lite の background loop か SITECUSTOMIZE_ENABLE_FULL_NONMAIN=1 の
+    ときだけ install されていた。
+    SUMMARY_AI_ZERO_SCORE_RESCUE_SCOPE_ENABLED=1/0 で明示上書きできる。
+    """
+    try:
+        raw = os.getenv("SUMMARY_AI_ZERO_SCORE_RESCUE_SCOPE_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return _zero_score_rescue_env_bool("SUMMARY_AI_ZERO_SCORE_RESCUE_SCOPE_ENABLED", False)
+        if str(os.environ.get("DISABLE_SUMMARY_AI_LIQ_RESCUE_PATCH", "")).strip() == "1":
+            return False
+        if not (
+            _zero_score_rescue_env_bool("SITECUSTOMIZE_ENABLE_RESCUE_PATCHES", False)
+            or _zero_score_rescue_env_bool("SITECUSTOMIZE_ENABLE_SUMMARY_AI_RESCUE_PATCHES", False)
+        ):
+            return False
+        argv_list = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        argv = " ".join(argv_list)
+        if any(name in argv for name in _ZERO_SCORE_RESCUE_DB_PROCESS_NAMES):
+            return False
+        if any(_zero_score_rescue_env_bool(name, False) for name in _ZERO_SCORE_RESCUE_DB_PROCESS_ENVS):
+            return False
+        if any(a.endswith("/main.py") or a == "main.py" for a in argv_list) and _zero_score_rescue_env_bool("SITECUSTOMIZE_MAIN_LITE", True):
+            return True
+        return _zero_score_rescue_env_bool("SITECUSTOMIZE_ENABLE_FULL_NONMAIN", False)
+    except Exception:
+        return False
+
+
+def _apply_zero_score_rescue(out: pd.DataFrame) -> pd.DataFrame:
+    if not _zero_score_rescue_env_bool("SUMMARY_AI_ZERO_SCORE_RESCUE_ENABLED", True):
+        return out
+    try:
+        import numpy as np
+
+        if out is None or not isinstance(out, pd.DataFrame) or out.empty:
+            return out
+
+        work = out.copy()
+
+        def num(col: str, default: float = 0.0):
+            if col in work.columns:
+                return pd.to_numeric(work[col], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(default)
+            return pd.Series(default, index=work.index, dtype="float64")
+
+        buy = num("ai_disp_buy_score")
+        sell = num("ai_disp_sell_score").abs()
+        slope = num("ai_disp_slope")
+        close = num("ai_disp_close")
+        volume = num("ai_disp_volume")
+        turnover = num("ai_disp_turnover")
+        open_px = num("open", np.nan)
+        if open_px.isna().all():
+            open_px = num("open_price", np.nan)
+        high = num("high", np.nan)
+        if high.isna().all():
+            high = num("high_price", np.nan)
+        low = num("low", np.nan)
+        if low.isna().all():
+            low = num("low_price", np.nan)
+        mtf = num("ai_disp_mtf")
+        macd = num("ai_disp_macd")
+        sig = num("ai_disp_signal")
+
+        min_vol = _zero_score_rescue_env_float("SUMMARY_AI_ZERO_SCORE_RESCUE_MIN_VOLUME", 3000.0)
+        min_turnover = _zero_score_rescue_env_float("SUMMARY_AI_ZERO_SCORE_RESCUE_MIN_TURNOVER", 1000000.0)
+        min_score = _zero_score_rescue_env_float("SUMMARY_AI_ZERO_SCORE_RESCUE_MIN_SCORE", 4.1)
+
+        liquid = (volume >= min_vol) | (turnover >= min_turnover)
+        price_ok = close > 0
+        delta_pct = ((close - open_px) / open_px.replace(0, np.nan) * 100.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        range_pct = ((high - low) / close.replace(0, np.nan) * 100.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        macd_bias = (macd - sig).fillna(0.0)
+
+        # score が全ゼロなら、MTF + 現在足方向 + MACD方向 + レンジを候補抽出用スコアへ変換する。
+        score_all_zero = float(buy.abs().sum() + sell.abs().sum()) <= 0.000001
+        if score_all_zero:
+            buy_dir = liquid & price_ok & ((delta_pct > 0) | (macd_bias > 0))
+            sell_dir = liquid & price_ok & ((delta_pct < 0) | (macd_bias < 0))
+            base_strength = mtf.clip(lower=0.0) + range_pct.clip(lower=0.0, upper=3.0) + macd_bias.abs().clip(lower=0.0, upper=2.0)
+            rescued_buy = base_strength.where(buy_dir, 0.0).clip(lower=0.0)
+            rescued_sell = base_strength.where(sell_dir, 0.0).clip(lower=0.0)
+            rescued_buy = rescued_buy.where(rescued_buy <= 0.0, rescued_buy.clip(lower=min_score))
+            rescued_sell = rescued_sell.where(rescued_sell <= 0.0, rescued_sell.clip(lower=min_score))
+            work["ai_disp_buy_score"] = rescued_buy
+            work["ai_disp_sell_score"] = rescued_sell
+            work["score_buy"] = rescued_buy
+            work["buy_score"] = rescued_buy
+            work["score_sell"] = rescued_sell
+            work["sell_score"] = rescued_sell
+            work["score_total"] = rescued_buy - rescued_sell
+            work["total_score"] = work["score_total"]
+            work["final_score"] = work["score_total"]
+            work["display_score"] = work["score_total"]
+            work["ai_disp_total_score"] = work["score_total"]
+            work["ai_disp_final_score"] = work["score_total"]
+
+        # slope が全ゼロなら、同じ足の OHLC から候補抽出用の疑似slopeを作る。
+        slope_all_zero = float(slope.abs().sum()) <= 0.000001
+        if slope_all_zero:
+            pseudo_slope = delta_pct.where(delta_pct.abs() > 0.0, macd_bias / 10.0)
+            work["ai_disp_slope"] = pseudo_slope
+            if "slope" in work.columns:
+                work["slope"] = pseudo_slope
+            if "slope_atr_scaled" in work.columns:
+                work["slope_atr_scaled"] = pseudo_slope
+            if "score_slope" in work.columns:
+                work["score_slope"] = pseudo_slope
+
+        if score_all_zero or slope_all_zero:
+            try:
+                rb = pd.to_numeric(work.get("ai_disp_buy_score", 0.0), errors="coerce").fillna(0.0)
+                rs = pd.to_numeric(work.get("ai_disp_sell_score", 0.0), errors="coerce").fillna(0.0)
+                ps = pd.to_numeric(work.get("ai_disp_slope", 0.0), errors="coerce").fillna(0.0)
+                logger.warning(
+                    "[SUMMARY AI ZERO SCORE RESCUE] applied rows=%s score_all_zero=%s slope_all_zero=%s buy_pos=%s sell_pos=%s slope_nonzero=%s min_vol=%s min_turnover=%s",
+                    len(work), score_all_zero, slope_all_zero,
+                    int((rb > 0).sum()), int((rs > 0).sum()), int((ps.abs() > 0).sum()),
+                    min_vol, min_turnover,
+                )
+            except Exception:
+                pass
+
+        return work.reset_index(drop=True)
+    except Exception:
+        logger.exception("[SUMMARY AI ZERO SCORE RESCUE] failed; returning original dataframe")
+        return out
+
+
+def attach_display_like_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = attach_display_like_columns_core(df)
+    if not _zero_score_rescue_scope_enabled():
+        return out
+    return _apply_zero_score_rescue(out)
 
 
 def filter_common_stock_rows(df: pd.DataFrame, *, require_buy_target: bool = False, exclude_etf_fund: bool = True, allowed_market_types: Optional[set[str]] = None) -> pd.DataFrame:
