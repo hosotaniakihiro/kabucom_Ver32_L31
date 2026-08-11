@@ -634,7 +634,67 @@ def _calc_one_symbol(g: pd.DataFrame) -> pd.DataFrame:
     return g
 
 
+def _ranking_filter_rescue_period_volume_from_cumulative(
+    df: pd.DataFrame, *, volume_col: str = "volume", datetime_col: str = "datetime"
+) -> pd.DataFrame:
+    """累計出来高を symbol + 当日単位で差分化し、対象足出来高へ変換する。
+
+    旧 core/startup/ranking_entry_filter_rescue_patch V1.7 の
+    _period_volume_from_cumulative を移設 (summary_incremental_engine._build_bars
+    にも同名ロジックを複製している。パッチ側も1つの関数を2箇所から使っていたのを
+    本文化にあたりファイルごとに複製した)。
+    """
+    if df is None or getattr(df, "empty", True) or volume_col not in df.columns:
+        return df
+    out = df.copy()
+    raw = pd.to_numeric(out[volume_col], errors="coerce").fillna(0.0)
+    out["_raw_cumulative_volume"] = raw
+    if "symbol" not in out.columns or datetime_col not in out.columns:
+        out["_period_volume"] = raw.clip(lower=0.0)
+        return out
+    dt_s = pd.to_datetime(out[datetime_col], errors="coerce")
+    out["_trade_date_for_volume"] = dt_s.dt.date
+    out["_volume_order"] = range(len(out))
+    out = out.sort_values(["symbol", "_trade_date_for_volume", datetime_col, "_volume_order"], kind="stable")
+    prev = out.groupby(["symbol", "_trade_date_for_volume"], sort=False)["_raw_cumulative_volume"].shift(1)
+    diff = out["_raw_cumulative_volume"] - prev
+    # 初回行は直前累計が不明なので0扱い。累計リセット/異常なマイナスも0にする。
+    period = diff.where(prev.notna(), 0.0)
+    period = period.where(period >= 0, 0.0).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    out["_period_volume"] = period
+    out = out.sort_values("_volume_order", kind="stable").drop(columns=["_volume_order", "_trade_date_for_volume"], errors="ignore")
+    return out
+
+
 def _calculate_technicals(history: pd.DataFrame) -> pd.DataFrame:
+    """ランキング履歴からテクニカル指標を計算する (期間出来高補正版)。
+
+    旧 core/startup/ranking_entry_filter_rescue_patch V1.7 が (env gate なしで
+    無条件に) この関数を差し替え、volume を累計値から期間出来高 (diff) に、
+    turnover を close×期間出来高に補正してから計算する形にしていた。常時有効
+    だったためそのまま本文化する。_calculate_technicals_core は補正前の
+    計算本体。
+    """
+    h = history.copy() if isinstance(history, pd.DataFrame) else pd.DataFrame()
+    if h.empty:
+        return _calculate_technicals_core(history)
+    if "datetime" in h.columns:
+        h["datetime"] = pd.to_datetime(h["datetime"], errors="coerce")
+        h = h.dropna(subset=["datetime"]).copy()
+    if "volume" in h.columns:
+        h = _ranking_filter_rescue_period_volume_from_cumulative(h, volume_col="volume", datetime_col="datetime")
+        h["cumulative_volume"] = h.get("_raw_cumulative_volume", h["volume"])
+        h["volume"] = h["_period_volume"]
+    if "turnover" in h.columns:
+        # 売買代金も累計の可能性が高い。volume差分×closeを優先して期間代金にする。
+        close = pd.to_numeric(h.get("close", 0), errors="coerce").fillna(0.0)
+        vol = pd.to_numeric(h.get("volume", 0), errors="coerce").fillna(0.0)
+        h["cumulative_turnover"] = pd.to_numeric(h["turnover"], errors="coerce").fillna(0.0)
+        h["turnover"] = close * vol
+    return _calculate_technicals_core(h)
+
+
+def _calculate_technicals_core(history: pd.DataFrame) -> pd.DataFrame:
     if history.empty:
         return history
     out = []

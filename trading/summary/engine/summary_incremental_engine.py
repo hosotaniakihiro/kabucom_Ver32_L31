@@ -252,7 +252,43 @@ def _add_indicators(df: pd.DataFrame, interval: int) -> pd.DataFrame:
 # builders
 # ============================================================
 
-def _build_bars(push_df: pd.DataFrame, interval: int) -> pd.DataFrame:
+def _ranking_filter_rescue_period_volume_from_cumulative(
+    df: pd.DataFrame, *, volume_col: str = "volume", datetime_col: str = "datetime"
+) -> pd.DataFrame:
+    """累計出来高を symbol + 当日単位で差分化し、対象足出来高へ変換する。
+
+    旧 core/startup/ranking_entry_filter_rescue_patch V1.7 の
+    _period_volume_from_cumulative を移設 (_build_bars / ranking_technical_store
+    ._calculate_technicals の双方で個別に使うため、本ファイルにも複製している)。
+    """
+    if df is None or getattr(df, "empty", True) or volume_col not in df.columns:
+        return df
+    out = df.copy()
+    raw = pd.to_numeric(out[volume_col], errors="coerce").fillna(0.0)
+    out["_raw_cumulative_volume"] = raw
+    if "symbol" not in out.columns or datetime_col not in out.columns:
+        out["_period_volume"] = raw.clip(lower=0.0)
+        return out
+    dt_s = pd.to_datetime(out[datetime_col], errors="coerce")
+    out["_trade_date_for_volume"] = dt_s.dt.date
+    out["_volume_order"] = range(len(out))
+    out = out.sort_values(["symbol", "_trade_date_for_volume", datetime_col, "_volume_order"], kind="stable")
+    prev = out.groupby(["symbol", "_trade_date_for_volume"], sort=False)["_raw_cumulative_volume"].shift(1)
+    diff = out["_raw_cumulative_volume"] - prev
+    # 初回行は直前累計が不明なので0扱い。累計リセット/異常なマイナスも0にする。
+    period = diff.where(prev.notna(), 0.0)
+    period = period.where(period >= 0, 0.0).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    out["_period_volume"] = period
+    out = out.sort_values("_volume_order", kind="stable").drop(columns=["_volume_order", "_trade_date_for_volume"], errors="ignore")
+    return out
+
+
+def _build_bars_core(push_df: pd.DataFrame, interval: int) -> pd.DataFrame:
+    """期間出来高補正 (下記 _build_bars 参照) より前の素の足生成ロジック。
+
+    現在は _build_bars から呼ばれない (下の補正版が常時有効だったため)。
+    比較・参照用に残している。
+    """
     ticks = _normalize_push_df(push_df)
     if ticks.empty:
         return pd.DataFrame()
@@ -305,6 +341,73 @@ def _build_bars(push_df: pd.DataFrame, interval: int) -> pd.DataFrame:
 
     out = _add_indicators(bars, interval)
     _log_df_state("built_bars", out, interval)
+    return out
+
+
+def _build_bars(push_df: pd.DataFrame, interval: int) -> pd.DataFrame:
+    """PUSH tick DataFrame から足を作る (期間出来高補正版)。
+
+    旧 core/startup/ranking_entry_filter_rescue_patch V1.7 が (env gate なしで
+    無条件に) この関数を差し替え、1分/3分/5分足の volume を「当日累計出来高の
+    max」ではなく「symbol+当日単位で累計出来高を diff した期間出来高の sum」に
+    補正していた。ranking/tonosama 側の出来高フィルタが累計値のまま誤判定しない
+    ための補正で、常時有効だったためそのまま本文化する。
+    """
+    ticks = _normalize_push_df(push_df)
+    if ticks.empty:
+        return pd.DataFrame()
+
+    interval_n = int(interval)
+    freq = f"{interval_n}min"
+    work = ticks.copy()
+    work["datetime"] = pd.to_datetime(work["datetime"], errors="coerce")
+    work = work.dropna(subset=["datetime"]).copy()
+    work = work.sort_values(["symbol", "datetime"], kind="stable")
+    work = _ranking_filter_rescue_period_volume_from_cumulative(work, volume_col="volume", datetime_col="datetime")
+    work["_slot"] = work["datetime"].dt.floor(freq)
+    work = work.dropna(subset=["_slot"]).copy()
+
+    def _last_text(s: pd.Series):
+        x = s.dropna().astype(str)
+        return x.iloc[-1] if not x.empty else ""
+
+    bars = (
+        work.groupby(["symbol", "_slot"], as_index=False)
+        .agg(
+            symbolname=("symbolname", _last_text),
+            open=("close", "first"),
+            high=("high", "max"),
+            low=("low", "min"),
+            close=("close", "last"),
+            volume=("_period_volume", "sum"),
+            cumulative_volume=("_raw_cumulative_volume", "max"),
+            tick_count=("close", "count"),
+            first_tick_at=("datetime", "min"),
+            last_tick_at=("datetime", "max"),
+        )
+        .rename(columns={"_slot": "datetime"})
+    )
+
+    for c in ("open", "high", "low", "close", "volume", "cumulative_volume"):
+        if c in bars.columns:
+            bars[c] = pd.to_numeric(bars[c], errors="coerce")
+
+    bars["open_price"] = bars["open"]
+    bars["high_price"] = bars["high"]
+    bars["low_price"] = bars["low"]
+    bars["close_price"] = bars["close"]
+    bars["price"] = bars["close"]
+    bars["current_price"] = bars["close"]
+    bars["date"] = pd.to_datetime(bars["datetime"], errors="coerce").dt.strftime("%Y-%m-%d")
+    bars["time"] = pd.to_datetime(bars["datetime"], errors="coerce").dt.strftime("%H:%M:%S")
+    bars["start_time"] = bars["time"]
+    bars["end_time"] = bars["time"]
+    bars["time_range"] = pd.to_datetime(bars["datetime"], errors="coerce").dt.strftime("%H:%M")
+    bars = bars.dropna(subset=["symbol", "datetime", "close"]).copy()
+    bars = bars.sort_values(["symbol", "datetime"], kind="stable").reset_index(drop=True)
+
+    out = _add_indicators(bars, interval_n)
+    _log_df_state("built_bars_period_volume_guard", out, interval_n)
     return out
 
 

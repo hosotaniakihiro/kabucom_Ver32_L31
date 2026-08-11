@@ -230,7 +230,11 @@ def _install_main_runtime_patches():
         # pending_writer._five_sec_relax_scope_enabled() が再現している。
         ("core.startup.volatility_filter_tonosama_entryrow_rescue_patch", "install"),
         ("core.startup.board_wall_stall_exit_patch", "install"),
-        ("core.startup.ranking_entry_filter_rescue_patch", "install"),
+        # ranking_entry_filter_rescue_patch は trading/ranking/entry_from_ranking.py
+        # (_passes_ranking_only_filters の再帰救済ラップ) と
+        # trading/summary/engine/summary_incremental_engine.py._build_bars /
+        # trading/ranking/ranking_technical_store.py._calculate_technicals
+        # (期間出来高補正) へ本文化済みのため削除。
     ]
     for mod_name, fn_name in patches:
         try:
