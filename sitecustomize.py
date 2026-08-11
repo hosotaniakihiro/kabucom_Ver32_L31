@@ -383,9 +383,16 @@ BACKGROUND_MAIN_PATCHES = [
     #                     (V10 で job_summary のラップは撤去済み)
 ]
 
-ENTRY_FAILOPEN_PATCHES = [
-    ("core.startup.entry_direction_recursion_failopen_patch", "ENTRY_DIRECTION_RECURSION_FAILOPEN", "DISABLE_ENTRY_DIRECTION_RECURSION_FAILOPEN_PATCH"),
-]
+# entry_direction_recursion_failopen_patch は削除した。二重ゲートで既定 OFF
+# (runtime_env_defaults.py:98 SITECUSTOMIZE_ENABLE_ENTRY_FAILOPEN_PATCHES="0" と
+#  同:108 ENTRY_DIRECTION_RECURSION_FAILOPEN_ENABLED="0")。
+# さらに仮に両方を 1 にしても、install() が old (= failclosed / failopen_runtime v5 の
+# ラッパー) を退避するだけで一度も呼ばず、base の _direction_confirm を直呼びする
+# ため、下の 2 層をまとめて無効化してしまう実装だった (*args/**kwargs も破棄)。
+# 再帰時 fail-open の意図は entry_direction_failclosed_patch の
+# ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN が担っている。
+# グループ自体は将来の追加用に残す。
+ENTRY_FAILOPEN_PATCHES: list = []
 
 # ranking_entry_final_rescue_patch は trading/handlers/entry_controller.py へ
 # 本文化済み (_ranking_final_rescue_atr + _ranking_rescue_apply_env_defaults)。
