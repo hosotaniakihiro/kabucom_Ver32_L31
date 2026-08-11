@@ -55,8 +55,8 @@ from utils.business_day_utils import is_market_open
 
 from core.startup.startup_flags import reset_startup_flags, set_summary_unique_index_bootstrap_flags
 from core.startup.startup_runtime import safe_migration_phase
-from core.startup.anchor_bootstrap import bootstrap_anchor
-from core.startup.background_bootstrap import bootstrap_background
+from core.startup.bootstrap.anchor import bootstrap_anchor
+from core.startup.bootstrap.background import bootstrap_background
 from core.startup.runtime_mode import enter_realtime_combat_mode
 from core.startup.closed_day.display import display_closed_day_summary_priority
 

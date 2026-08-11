@@ -41,7 +41,7 @@ def _run_install(label: str, module_name: str, fn_name: str = "install") -> bool
 
 def _install_symbol_flags_bootstrap() -> bool:
     try:
-        mod = importlib.import_module("core.startup.symbol_flags_bootstrap")
+        mod = importlib.import_module("core.startup.bootstrap.symbol_flags")
         fn = getattr(mod, "install_symbol_flags_cache", None)
         ok = bool(fn(force=True)) if callable(fn) else False
         logger.warning("[FAST STARTUP PATCH] symbol_flags_bootstrap installed=%s", ok)

@@ -34,7 +34,7 @@ from global_state import global_data
 
 from core.startup.push.storage_bootstrap import is_push_storage_running
 from core.startup.summary.runtime import get_summary_bootstrap_state
-from core.startup.schedule_loop import get_schedule_loop_status
+from core.startup.bootstrap.schedule_loop import get_schedule_loop_status
 from core.startup.scheduler.startup import log_scheduler_snapshot
 
 logger = logging.getLogger(__name__)

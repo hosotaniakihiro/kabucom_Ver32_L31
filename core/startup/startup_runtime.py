@@ -30,7 +30,7 @@ from pathlib import Path
 from sqlalchemy.engine import Engine
 
 from global_state import global_data
-from core.startup.db_bootstrap import bootstrap_database
+from core.startup.bootstrap.db import bootstrap_database
 
 logger = logging.getLogger(__name__)
 

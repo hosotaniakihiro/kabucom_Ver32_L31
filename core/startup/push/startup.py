@@ -32,7 +32,7 @@ from core.startup.push.storage_bootstrap import (
     start_push_storage,
     is_push_storage_running,
 )
-from core.startup.symbol_bootstrap import bootstrap_symbols
+from core.startup.bootstrap.symbol import bootstrap_symbols
 
 from core.startup.startup_config import (
     PUSH_DIR,

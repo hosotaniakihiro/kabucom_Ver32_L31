@@ -13,7 +13,7 @@ import logging
 
 from global_state import global_data
 from core.startup.scheduler.bootstrap import register_scheduler_safe
-from core.startup.schedule_loop import start_schedule_run_pending_loop_safe, get_schedule_loop_status
+from core.startup.bootstrap.schedule_loop import start_schedule_run_pending_loop_safe, get_schedule_loop_status
 from core.startup.scheduler.helpers import safe_schedule_snapshot, log_scheduler_snapshot, has_schedule_tag
 from core.startup.scheduler.market_guard import (
     is_market_time,
