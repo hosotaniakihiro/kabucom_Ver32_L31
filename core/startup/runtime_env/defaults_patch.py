@@ -235,7 +235,17 @@ def _install_summary_db_realtime_priority(context: str) -> bool:
 
 
 def _install_push_summary_db_latest_source(context: str) -> bool:
-    return _safe_install("push summary DB latest source", context, DB_CONTEXTS | GENERIC_HELPER_CONTEXTS, "DISABLE_PUSH_SUMMARY_DB_SOURCE_PATCH", "push_summary_db_latest_source_patch")
+    # push_summary_db_latest_source_patch は trading/summary/engine/push_summary_engine.py の
+    # _resolve_push_source_df() へ native化済み (_push_summary_db_latest_source_scope_enabled()
+    # がここと同じ DB_CONTEXTS|GENERIC_HELPER_CONTEXTS 判定を再現する)。ここでは有効/無効の
+    # 状態をログへ反映するためだけに判定結果を返す。
+    if context not in (DB_CONTEXTS | GENERIC_HELPER_CONTEXTS):
+        return False
+    if os.environ.get("DISABLE_PUSH_SUMMARY_DB_SOURCE_PATCH", "").strip() == "1":
+        return False
+    if not env_bool("PUSH_SUMMARY_DB_SOURCE_ENABLED", True):
+        return False
+    return True
 
 
 def _install_ranking_entry_runtime_rescue(context: str) -> bool:

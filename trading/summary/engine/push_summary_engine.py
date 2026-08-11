@@ -20,6 +20,7 @@ import importlib
 import logging
 import os
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -548,7 +549,7 @@ def _get_from_global_data(candidates: list[str]) -> Any:
     return None
 
 
-def _resolve_push_source_df() -> pd.DataFrame:
+def _resolve_push_source_df_core() -> pd.DataFrame:
     df = _get_from_global_data(["stream_data", "push_df", "push_data", "latest_push_df", "push_snapshot_df"])
     if (not isinstance(df, pd.DataFrame)) or df.empty:
         getter = _safe_attr(global_data, "get_push_df", None)
@@ -563,6 +564,225 @@ def _resolve_push_source_df() -> pd.DataFrame:
     _log_df_stats("resolved push source", out)
     out = _push_summary_db_source_augment(out)
     return out
+
+
+# --- push_summary_db_latest_source_patch (native化, 元 core/startup/push_summary_db_latest_source_patch.py) ---
+# data_collectors_runner / summary_database 等、push_receiver とは別プロセスでは
+# process-local の global_data.push_df が古いまま残り、PUSH DB (push{YYYYMMDD}.db) には
+# 最新行が保存されているのに1分PUSH summaryが古いデータを再利用してしまう問題への対処。
+#
+# 注意: この節が読む push{YYYYMMDD}.db の stream_data_raw/stream_data テーブルは、
+# 上の _push_summary_db_source_augment() (別の未記録コミットで本文化済みの
+# 旧 push_summary_db_source_patch、既定OFFの PUSH_SUMMARY_DB_SOURCE_FALLBACK gate)
+# が読むテーブルと同じだが、env変数名・列選択・既定値が異なる独立した実装であり、
+# 意図的に重複させたまま移植した (旧パッチ自身が「original呼び出し後にさらに
+# 自前のDB読み込みで比較・置換する」設計だったため、native化でもその二重構造を
+# そのまま保持する)。
+_PUSH_SUMMARY_DB_LATEST_SOURCE_TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+
+
+def _push_summary_db_latest_source_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in _PUSH_SUMMARY_DB_LATEST_SOURCE_TRUE
+    except Exception:
+        return bool(default)
+
+
+def _push_summary_db_latest_source_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
+
+
+def _push_summary_db_latest_source_env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(str(v).replace(",", "")))
+    except Exception:
+        return int(default)
+
+
+def _push_summary_db_latest_source_argv_context() -> str:
+    """core/startup/runtime_env/defaults_patch.py の _argv_context() と同一の判定を再現する。"""
+    try:
+        text = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+        if "main_database.py" in text:
+            return "main_database"
+        if text.endswith("main.py") or "/main.py" in text:
+            return "main"
+        if "db_prepare_runner.py" in text:
+            return "db_prepare"
+        if "push_receiver_runner.py" in text:
+            return "push_receiver"
+        if "summary_database_runner.py" in text:
+            return "summary_database"
+        if "ranking_collector_runner.py" in text:
+            return "ranking_collector"
+        if "yahoo_complement_runner.py" in text:
+            return "yahoo_complement"
+        if "data_collectors_runner.py" in text:
+            return "main_database"
+        if text:
+            return "helper"
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _push_summary_db_latest_source_scope_enabled() -> bool:
+    """旧パッチの root importer だった DB_CONTEXTS|GENERIC_HELPER_CONTEXTS
+    ({"main_database","db_prepare","push_receiver","summary_database",
+      "ranking_collector","yahoo_complement","helper"}、実質 "main.py以外") を再現する。
+    """
+    try:
+        if str(os.environ.get("DISABLE_PUSH_SUMMARY_DB_SOURCE_PATCH", "")).strip() == "1":
+            return False
+        if not _push_summary_db_latest_source_env_bool("PUSH_SUMMARY_DB_SOURCE_ENABLED", True):
+            return False
+        raw = os.getenv("PUSH_SUMMARY_DB_LATEST_SOURCE_SCOPE_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return _push_summary_db_latest_source_env_bool("PUSH_SUMMARY_DB_LATEST_SOURCE_SCOPE_ENABLED", False)
+        return _push_summary_db_latest_source_argv_context() not in {"main", "unknown"}
+    except Exception:
+        return False
+
+
+def _push_summary_db_latest_source_push_db_path() -> Path:
+    ymd = os.getenv("KABU_TODAY") or os.getenv("TARGET_DATE") or dt.datetime.now().strftime("%Y%m%d")
+    try:
+        from config.paths import get_path
+        root = Path(get_path("raw_push"))
+    except Exception:
+        root = Path(os.getenv("PUSH_DB_DIR", r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\push"))
+    return root / f"push{ymd}.db"
+
+
+def _push_summary_db_latest_source_latest_dt(df: Any):
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return None
+        for c in ("datetime", "current_price_time", "CurrentPriceTime", "received_at", "time"):
+            if c in df.columns:
+                s = pd.to_datetime(df[c], errors="coerce")
+                if s.notna().any():
+                    ts = s.max()
+                    try:
+                        return ts.tz_localize(None)
+                    except Exception:
+                        return ts
+    except Exception:
+        pass
+    return None
+
+
+def _push_summary_db_latest_source_age_sec(ts: Any) -> float:
+    try:
+        if ts is None or pd.isna(ts):
+            return 999999.0
+        t = pd.Timestamp(ts)
+        try:
+            t = t.tz_localize(None)
+        except Exception:
+            pass
+        return max(0.0, (dt.datetime.now() - t.to_pydatetime()).total_seconds())
+    except Exception:
+        return 999999.0
+
+
+def _push_summary_db_latest_source_read_recent() -> pd.DataFrame:
+    db = _push_summary_db_latest_source_push_db_path()
+    if not db.exists():
+        return pd.DataFrame()
+    lookback_min = max(1, _push_summary_db_latest_source_env_int("PUSH_SUMMARY_DB_SOURCE_LOOKBACK_MIN", 20))
+    limit = max(100, _push_summary_db_latest_source_env_int("PUSH_SUMMARY_DB_SOURCE_LIMIT", 20000))
+    busy_ms = max(100, _push_summary_db_latest_source_env_int("PUSH_SUMMARY_DB_SOURCE_BUSY_TIMEOUT_MS", 1000))
+    cutoff = (dt.datetime.now() - dt.timedelta(minutes=lookback_min)).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with sqlite3.connect(str(db), timeout=max(0.5, busy_ms / 1000.0)) as conn:
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute(f"PRAGMA busy_timeout={busy_ms}")
+            table = "stream_data_raw"
+            try:
+                conn.execute("SELECT 1 FROM stream_data_raw LIMIT 1").fetchone()
+            except Exception:
+                table = "stream_data"
+            sql = f"""
+                SELECT *
+                  FROM {table}
+                 WHERE datetime >= ?
+                 ORDER BY datetime DESC
+                 LIMIT ?
+            """
+            df = pd.read_sql_query(sql, conn, params=(cutoff, int(limit)))
+    except Exception:
+        logger.exception("[PUSH SUMMARY DB SOURCE] read db failed db=%s", db)
+        return pd.DataFrame()
+
+    if df.empty:
+        logger.warning("[PUSH SUMMARY DB SOURCE] db recent empty db=%s cutoff=%s table=stream_data/raw", db, cutoff)
+        return df
+    try:
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+        df = df.dropna(subset=["datetime", "symbol"]).copy()
+        df["symbol"] = df["symbol"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+        if "price" in df.columns:
+            df["current_price"] = pd.to_numeric(df.get("current_price", df["price"]), errors="coerce").combine_first(pd.to_numeric(df["price"], errors="coerce"))
+            df["close"] = pd.to_numeric(df["price"], errors="coerce").combine_first(pd.to_numeric(df["current_price"], errors="coerce"))
+        if "volume" in df.columns:
+            df["trading_volume"] = pd.to_numeric(df.get("trading_volume", df["volume"]), errors="coerce").combine_first(pd.to_numeric(df["volume"], errors="coerce"))
+        df["source"] = "push_stream_raw_db_latest_patch"
+    except Exception:
+        logger.exception("[PUSH SUMMARY DB SOURCE] normalize failed")
+    logger.warning(
+        "[PUSH SUMMARY DB SOURCE] loaded db rows=%s symbols=%s latest_dt=%s db=%s",
+        len(df), df["symbol"].nunique() if "symbol" in df.columns else 0, _push_summary_db_latest_source_latest_dt(df), db,
+    )
+    return df.reset_index(drop=True)
+
+
+def _push_summary_db_latest_source_better_df(a: pd.DataFrame, b: pd.DataFrame) -> pd.DataFrame:
+    """Return fresher/non-empty source. b is DB source."""
+    if not isinstance(b, pd.DataFrame) or b.empty:
+        return a
+    if not isinstance(a, pd.DataFrame) or a.empty:
+        return b
+    a_dt = _push_summary_db_latest_source_latest_dt(a)
+    b_dt = _push_summary_db_latest_source_latest_dt(b)
+    a_age = _push_summary_db_latest_source_age_sec(a_dt)
+    b_age = _push_summary_db_latest_source_age_sec(b_dt)
+    stale_sec = max(30.0, _push_summary_db_latest_source_env_float("PUSH_SUMMARY_DB_SOURCE_REPLACE_IF_OLDER_SEC", 180.0))
+    if b_dt is not None and (a_dt is None or b_dt > a_dt or a_age > stale_sec):
+        logger.warning(
+            "[PUSH SUMMARY DB SOURCE] replace push source old_latest=%s old_age=%.1fs db_latest=%s db_age=%.1fs old_rows=%s db_rows=%s",
+            a_dt, a_age, b_dt, b_age, len(a), len(b),
+        )
+        return b
+    return a
+
+
+def _resolve_push_source_df() -> pd.DataFrame:
+    base = pd.DataFrame()
+    try:
+        base = _resolve_push_source_df_core()
+    except Exception:
+        logger.exception("[PUSH SUMMARY DB SOURCE] original resolve failed")
+    if not _push_summary_db_latest_source_scope_enabled():
+        return base
+    try:
+        db_df = _push_summary_db_latest_source_read_recent()
+        return _push_summary_db_latest_source_better_df(base, db_df)
+    except Exception:
+        logger.exception("[PUSH SUMMARY DB SOURCE] patched resolve failed")
+        return base
 
 
 def _resolve_summary_source_df(interval: int, *, push_df: pd.DataFrame) -> pd.DataFrame:
