@@ -644,8 +644,115 @@ def _tonosama_entry_cooldown_seconds() -> float:
         return 45.0
 
 
+# --- tonosama_orphan_timeout_prune_patch (native化, 元 core/startup/tonosama_orphan_timeout_prune_patch.py V2) ---
+# Tonosama pending build が timeout した後、古い daemon thread が is_alive=True のまま
+# 残り続けて次回スケジュールを永続skipする症状を防ぐ。一定時間を超えた timeout orphan は
+# 切り離し、次サイクルを許可する。
+
+_TONOSAMA_ORPHAN_PRUNE_FIRST_SEEN: dict[int, float] = {}
+_TONOSAMA_ORPHAN_PRUNE_WATCHER_STARTED = False
+_TONOSAMA_ORPHAN_PRUNE_TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+_TONOSAMA_ORPHAN_PRUNE_FALSE = {"0", "false", "no", "n", "off", "ng", "disable", "disabled", ""}
+
+
+def _tonosama_orphan_prune_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None:
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in _TONOSAMA_ORPHAN_PRUNE_TRUE:
+            return True
+        if s in _TONOSAMA_ORPHAN_PRUNE_FALSE:
+            return False
+    except Exception:
+        pass
+    return bool(default)
+
+
+def _tonosama_orphan_thread_key(th: threading.Thread) -> int:
+    try:
+        return int(th.ident or id(th))
+    except Exception:
+        return id(th)
+
+
+def _tonosama_prune_orphan_if_stale(*, reason: str) -> bool:
+    global _TONOSAMA_ENTRY_RUNNING, _TONOSAMA_ENTRY_STARTED_AT, _TONOSAMA_ENTRY_COOLDOWN_UNTIL, _TONOSAMA_ENTRY_TIMEOUT_STREAK, _TONOSAMA_ENTRY_ORPHAN_THREAD
+    if not _tonosama_orphan_prune_env_bool("TONOSAMA_ORPHAN_TIMEOUT_PRUNE_ENABLED", True):
+        return False
+    try:
+        th = _TONOSAMA_ENTRY_ORPHAN_THREAD
+        if th is None:
+            return False
+        if not getattr(th, "is_alive", lambda: False)():
+            _TONOSAMA_ENTRY_ORPHAN_THREAD = None
+            _TONOSAMA_ENTRY_RUNNING = False
+            _TONOSAMA_ENTRY_STARTED_AT = None
+            _TONOSAMA_ENTRY_COOLDOWN_UNTIL = None
+            _TONOSAMA_ENTRY_TIMEOUT_STREAK = 0
+            logger.warning("[TONOSAMA ORPHAN PRUNE] cleared dead orphan reason=%s thread=%s", reason, getattr(th, "name", None))
+            return True
+        key = _tonosama_orphan_thread_key(th)
+        now = time.monotonic()
+        first = _TONOSAMA_ORPHAN_PRUNE_FIRST_SEEN.setdefault(key, now)
+        age = now - first
+        # 30秒周期の次回実行で解除できるよう、既定は20秒にする。
+        max_age = max(5.0, _env_float("TONOSAMA_ORPHAN_THREAD_MAX_ALIVE_SEC", 20.0))
+        if age < max_age:
+            logger.warning("[TONOSAMA ORPHAN PRUNE] keep live orphan reason=%s thread=%s orphan_age=%.1fs max_age=%.1fs", reason, getattr(th, "name", None), age, max_age)
+            return False
+        # Python thread は安全に kill できない。daemon orphan として切り離し、次サイクルを許可する。
+        _TONOSAMA_ENTRY_ORPHAN_THREAD = None
+        _TONOSAMA_ENTRY_RUNNING = False
+        _TONOSAMA_ENTRY_STARTED_AT = None
+        _TONOSAMA_ENTRY_COOLDOWN_UNTIL = None
+        _TONOSAMA_ENTRY_TIMEOUT_STREAK = 0
+        try:
+            _TONOSAMA_ORPHAN_PRUNE_FIRST_SEEN.pop(key, None)
+        except Exception:
+            pass
+        logger.warning("[TONOSAMA ORPHAN PRUNE] detached stale live orphan reason=%s thread=%s orphan_age=%.1fs max_age=%.1fs -> next cycle allowed", reason, getattr(th, "name", None), age, max_age)
+        return True
+    except Exception:
+        logger.exception("[TONOSAMA ORPHAN PRUNE] prune failed reason=%s", reason)
+        return False
+
+
+def _tonosama_orphan_prune_watcher() -> None:
+    loops = int(max(1.0, _env_float("TONOSAMA_ORPHAN_PRUNE_WATCHER_LOOPS", 240.0)))
+    sec = max(1.0, _env_float("TONOSAMA_ORPHAN_PRUNE_WATCHER_SEC", 2.0))
+    for i in range(loops):
+        try:
+            _tonosama_prune_orphan_if_stale(reason=f"watcher:{i}")
+        except Exception:
+            logger.exception("[TONOSAMA ORPHAN PRUNE] watcher failed")
+        time.sleep(sec)
+
+
+def start_tonosama_orphan_prune_watcher() -> bool:
+    """起動直後にstale orphanを速やかに解除するバックグラウンドウォッチャーを起動する (冪等)。
+
+    _run_tonosama_entry_safe() 自体は毎回呼び出し時に _tonosama_prune_orphan_if_stale()
+    を実行するため、このウォッチャーが無くても次サイクルで解除されるが、
+    Tonosamaのスケジュール間隔 (数十秒) より速く (既定2秒間隔) 解除したい場合の
+    追加の安全網として旧パッチから移植した。
+    """
+    global _TONOSAMA_ORPHAN_PRUNE_WATCHER_STARTED
+    if not _tonosama_orphan_prune_env_bool("TONOSAMA_ORPHAN_TIMEOUT_PRUNE_ENABLED", True):
+        logger.warning("[TONOSAMA ORPHAN PRUNE] disabled by env")
+        return False
+    _tonosama_prune_orphan_if_stale(reason="install")
+    if not _TONOSAMA_ORPHAN_PRUNE_WATCHER_STARTED and _tonosama_orphan_prune_env_bool("TONOSAMA_ORPHAN_PRUNE_WATCHER_ENABLED", True):
+        _TONOSAMA_ORPHAN_PRUNE_WATCHER_STARTED = True
+        threading.Thread(target=_tonosama_orphan_prune_watcher, name="tonosama-orphan-prune-watcher", daemon=True).start()
+    logger.warning("[TONOSAMA ORPHAN PRUNE] installed max_alive=%s", os.getenv("TONOSAMA_ORPHAN_THREAD_MAX_ALIVE_SEC", "20"))
+    return True
+
+
 def _run_tonosama_entry_safe() -> int:
     global _TONOSAMA_ENTRY_RUNNING, _TONOSAMA_ENTRY_STARTED_AT, _TONOSAMA_ENTRY_COOLDOWN_UNTIL, _TONOSAMA_ENTRY_TIMEOUT_STREAK, _TONOSAMA_ENTRY_ORPHAN_THREAD
+    _tonosama_prune_orphan_if_stale(reason="before_run")
     started_dt = dt.datetime.now()
     started = time.perf_counter()
     with _TONOSAMA_ENTRY_LOCK:

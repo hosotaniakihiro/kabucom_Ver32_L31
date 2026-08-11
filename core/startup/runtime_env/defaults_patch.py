@@ -191,7 +191,22 @@ def _install_summary_parallel_executor_reset(context: str) -> bool:
 
 
 def _install_tonosama_orphan_timeout_prune(context: str) -> bool:
-    return _safe_install("tonosama orphan timeout prune", context, TRADING_CONTEXTS, "DISABLE_TONOSAMA_ORPHAN_TIMEOUT_PRUNE_PATCH", "tonosama_orphan_timeout_prune_patch")
+    # tonosama_orphan_timeout_prune_patch は trading/entry_exit/tasks.py の
+    # start_tonosama_orphan_prune_watcher() へ native化済み。
+    try:
+        if context not in TRADING_CONTEXTS:
+            return False
+        if os.environ.get("DISABLE_TONOSAMA_ORPHAN_TIMEOUT_PRUNE_PATCH", "").strip() == "1":
+            logger.warning("[RUNTIME ENV DEFAULTS PATCH] tonosama orphan timeout prune disabled by env")
+            return False
+        from trading.entry_exit.tasks import start_tonosama_orphan_prune_watcher
+
+        ok = bool(start_tonosama_orphan_prune_watcher())
+        logger.warning("[RUNTIME ENV DEFAULTS PATCH] tonosama orphan timeout prune install ok=%s context=%s", ok, context)
+        return ok
+    except Exception:
+        logger.exception("[RUNTIME ENV DEFAULTS PATCH] tonosama orphan timeout prune install failed")
+        return False
 
 
 def _install_entry_fire_rescue(context: str) -> bool:
