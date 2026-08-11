@@ -67,7 +67,7 @@ from core.startup.startup_config import (
     init_runtime_flags,
     refresh_token_safe,
 )
-from core.startup.push_startup import (
+from core.startup.push.startup import (
     start_push_stack_before_scheduler,
     start_push_stream_fallback_safe,
 )

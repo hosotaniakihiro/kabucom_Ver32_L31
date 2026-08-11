@@ -167,7 +167,7 @@ def install() -> bool:
     if _INSTALLED:
         return True
     try:
-        import core.startup.push_bootstrap as pb
+        import core.startup.push.bootstrap as pb
         cur = getattr(pb, "_load_push_db", None)
         if getattr(cur, "_push_bootstrap_fast_restore_v1", False):
             _INSTALLED = True

@@ -27,8 +27,8 @@ from typing import Any, Callable, Optional
 
 from global_state import global_data
 
-from core.startup.push_bootstrap import bootstrap_push
-from core.startup.push_storage_bootstrap import (
+from core.startup.push.bootstrap import bootstrap_push
+from core.startup.push.storage_bootstrap import (
     start_push_storage,
     is_push_storage_running,
 )
@@ -110,7 +110,7 @@ def start_push_storage_safe() -> None:
         if not running:
             logger.warning(
                 "⚠ push storage bootstrap completed but writer is not running. "
-                "Check core.startup.push_storage_bootstrap and push_db_writer logs."
+                "Check core.startup.push.storage_bootstrap and push_db_writer logs."
             )
     except Exception:
         try:
@@ -184,7 +184,7 @@ def install_real_push_symbols_safe() -> list[str]:
     inspect_global_push_symbols("before-bridge")
 
     try:
-        from core.startup.push_symbol_bridge import install_real_push_symbols
+        from core.startup.push.symbol_bridge import install_real_push_symbols
     except Exception:
         logger.exception(
             "❌ push_symbol_bridge import failed. Create core/startup/push_symbol_bridge.py first."
@@ -243,11 +243,11 @@ def install_real_push_symbols_safe() -> list[str]:
 
 def resolve_push_stream_start_callable() -> Optional[Callable[..., Any]]:
     candidates = (
-        ("core.startup.push_stream_bootstrap", "start_push_stream_runner_safe"),
-        ("core.startup.push_stream_bootstrap", "start_push_stream_bootstrap"),
-        ("core.startup.push_stream_bootstrap", "bootstrap_push_stream"),
-        ("core.startup.push_stream_bootstrap", "run_push_stream_bootstrap"),
-        ("core.startup.push_stream_bootstrap", "start_push_stream"),
+        ("core.startup.push.stream_bootstrap", "start_push_stream_runner_safe"),
+        ("core.startup.push.stream_bootstrap", "start_push_stream_bootstrap"),
+        ("core.startup.push.stream_bootstrap", "bootstrap_push_stream"),
+        ("core.startup.push.stream_bootstrap", "run_push_stream_bootstrap"),
+        ("core.startup.push.stream_bootstrap", "start_push_stream"),
     )
 
     for module_name, func_name in candidates:

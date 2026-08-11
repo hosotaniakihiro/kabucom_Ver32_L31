@@ -96,8 +96,8 @@ _DYNAMIC_SYMBOL_PROVIDERS: Tuple[Tuple[str, str], ...] = (
     ("trading.ranking.active_symbol_manager", "get_current_active_symbols"),
     ("core.startup.symbol_bootstrap", "get_active_symbols"),
     ("core.startup.symbol_bootstrap", "get_monitor_symbols"),
-    ("core.startup.push_bootstrap", "get_push_symbols"),
-    ("core.startup.push_stream_bootstrap", "get_push_symbols"),
+    ("core.startup.push.bootstrap", "get_push_symbols"),
+    ("core.startup.push.stream_bootstrap", "get_push_symbols"),
     ("optional.batch.daily_watchlist", "get_daily_watchlist_symbols"),
     ("optional.batch.daily_watchlist", "load_daily_watchlist_symbols"),
 )

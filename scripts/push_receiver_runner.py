@@ -27,7 +27,7 @@ def _start_push_storage_for_database_process(logger: logging.Logger) -> None:
     main_database.py 側では writer_ready/flush_alive/total_flushed が進む。
     """
     try:
-        from core.startup.push_storage_bootstrap import start_push_storage
+        from core.startup.push.storage_bootstrap import start_push_storage
 
         start_push_storage(buffer_size=500)
         logger.warning(

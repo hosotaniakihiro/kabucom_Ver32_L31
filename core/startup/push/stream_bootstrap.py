@@ -148,7 +148,7 @@ def _install_real_symbols_before_start() -> list[str]:
     push stream 起動前に実銘柄100件を注入する。
     """
     try:
-        from core.startup.push_symbol_bridge import install_real_push_symbols
+        from core.startup.push.symbol_bridge import install_real_push_symbols
     except Exception:
         logger.exception("[push_stream_bootstrap] import push_symbol_bridge failed")
         return []

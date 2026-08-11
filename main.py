@@ -107,7 +107,7 @@ websocket.enableTrace(False)
 logging.getLogger("websocket").setLevel(logging.CRITICAL)
 
 import trading.push.push_stream as push_stream
-from core.startup.push_storage_bootstrap import start_push_storage
+from core.startup.push.storage_bootstrap import start_push_storage
 from optional.batch.optional_main import optional_main
 from core.bootstrap.load_symbol_map import build_symbol_name_map
 from global_state import global_data

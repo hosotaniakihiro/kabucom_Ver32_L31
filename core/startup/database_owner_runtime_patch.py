@@ -181,7 +181,7 @@ def _patch_summary_runner_core() -> bool:
 
 def _patch_push_storage_bootstrap() -> bool:
     try:
-        import core.startup.push_storage_bootstrap as psb
+        import core.startup.push.storage_bootstrap as psb
 
         def _should_skip_push_storage_start_in_main() -> bool:
             return _is_main_process()

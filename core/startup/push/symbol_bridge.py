@@ -1,12 +1,13 @@
 # ============================================================
-# File   : core/startup/push_symbol_bridge.py
+# File   : core/startup/push/symbol_bridge.py
+#          (旧 core/startup/push_symbol_bridge.py)
 # Version: PRODUCTION-STABLE-REV3.0-COMPAT-WRAPPER
 # ------------------------------------------------------------
 # Purpose:
 #   既存import互換を維持する薄いラッパー。
 #
 #   既存:
-#     from core.startup.push_symbol_bridge import install_real_push_symbols
+#     from core.startup.push.symbol_bridge import install_real_push_symbols
 #
 #   は変更不要。
 #
@@ -16,18 +17,18 @@
 
 from __future__ import annotations
 
-from .push_symbol_bridge_modules.normalize import (
+from ..push_symbol_bridge_modules.normalize import (
     clean_symbols,
 )
-from .push_symbol_bridge_modules.rotation import (
+from ..push_symbol_bridge_modules.rotation import (
     DEFAULT_MAX_SYMBOLS,
     DEFAULT_REGISTER_LIMIT,
     split_register_rotation,
 )
-from .push_symbol_bridge_modules.providers import (
+from ..push_symbol_bridge_modules.providers import (
     resolve_real_push_symbols,
 )
-from .push_symbol_bridge_modules.service import (
+from ..push_symbol_bridge_modules.service import (
     VERSION,
     install_real_push_symbols,
 )
