@@ -531,6 +531,15 @@ def check_entry_direction_confirm(entry_row: Any = None, *args, **kwargs) -> boo
     low_movement_entry_guard_patch など、単一ラッパー側から呼ぶための公開関数。
     ここでは元ATR/RANGEフィルタを呼ばないため、二重パッチ再帰が発生しない。
     """
+    # 旧 core/startup/entry_direction_failclosed_patch.py (V1.1) はこの関数を
+    # 外側からラップし、RecursionError を ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN、
+    # 一般例外を ENTRY_DIRECTION_CONFIRM_ERROR_FAIL_OPEN で fail-open させる意図だった。
+    # しかし下の try/except が先に両方を捕まえて False を返すため、外側ラッパーの
+    # except には一度も到達しない = 完全な no-op だった (env にも他の読み手なし)。
+    # 挙動を変えないため env は配線せず、fail-safe NG のままにしてある。
+    # fail-open を本当に有効にしたい場合は、ここを env 判定へ変えたうえで
+    # entry_final_filter_failopen_patch:196 の
+    # ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN='1' が効くようになる点に注意すること。
     if entry_row is None:
         return True
     try:

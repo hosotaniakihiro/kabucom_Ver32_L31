@@ -263,7 +263,11 @@ def install() -> bool:
             logger.warning('[ENTRY FINAL FILTER FAILOPEN] range_5m_filter wrapper installed v2.4')
     except Exception:
         logger.exception('[ENTRY FINAL FILTER FAILOPEN] range_5m wrapper install failed')
-    for mod_name, label in [('core.startup.entry_direction_failclosed_patch','direction guarded patch'),('core.startup.pending_protect_push_patch','pending protect push patch'),('core.startup.board_retry_patch','board retry patch'),('trading.handlers.short_mtf_direction_guard','short MTF daily optional guard'),('core.startup.entry_ma5_breakout_count_patch','MA5 breakout count patch')]:
+    # entry_direction_failclosed_patch は削除した。
+    # entry_direction_confirm_guard_patch.check_entry_direction_confirm が
+    # RecursionError も一般例外も自分で捕まえて False を返すため、
+    # 外側からラップしていたあのパッチの except には一度も到達しなかった。
+    for mod_name, label in [('core.startup.pending_protect_push_patch','pending protect push patch'),('core.startup.board_retry_patch','board retry patch'),('trading.handlers.short_mtf_direction_guard','short MTF daily optional guard'),('core.startup.entry_ma5_breakout_count_patch','MA5 breakout count patch')]:
         try:
             mod = __import__(mod_name, fromlist=['install']); fn = getattr(mod, 'install', None); ok = fn() if callable(fn) else False
             logger.warning('[ENTRY FINAL FILTER FAILOPEN] %s installed=%s', label, ok)
