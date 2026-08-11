@@ -262,10 +262,11 @@ def _install_strict_liquidity_patch() -> bool:
         os.environ.setdefault("SUMMARY_AI_STRICT_LIQ_ENABLED", "1")
         os.environ.setdefault("SUMMARY_AI_LIQ_MIN_LATEST_VOLUME", "30000")
         os.environ.setdefault("SUMMARY_AI_LIQ_MIN_AVG_VOLUME", "30000")
-        from core.startup import summary_ai_strict_liquidity_extra_patch as p
-        ok = p.install()
-        logger.warning("[ONESHOT LIMIT PATCH] summary_ai_strict_liquidity_patch installed=%s", ok)
-        return bool(ok)
+        # summary_ai_strict_liquidity_extra_patch は削除した。
+        # 実体は executor._filter_blocked_ai_ok_items のラップだけで、
+        # core filter watcher に即座に剥がされる死にコードだった。
+        # 上の env 3 件は他に読み手が無いが、運用値として残しておく。
+        return True
     except Exception:
         logger.exception("[ONESHOT LIMIT PATCH] summary_ai_strict_liquidity_patch install failed")
         return False
