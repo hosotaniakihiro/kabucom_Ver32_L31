@@ -398,7 +398,15 @@ TONOSAMA_EXTRA_RESCUE_PATCHES = [
     # opt-in スコープと env 既定値は
     # low_movement_entry_guard_patch._no_highlow_scope_enabled() /
     # _no_highlow_apply_env_defaults() が再現している。
-    ("core.startup.tonosama_pending_warning_relax_patch", "TONOSAMA_PENDING_WARNING_RELAX", "DISABLE_TONOSAMA_PENDING_WARNING_RELAX_PATCH"),
+    # tonosama_pending_warning_relax_patch は
+    # trading/entry/tonosama/pending_writer.py へ本文化済み (_warning_relax_stage)。
+    # main.py から入る tonosama_5sec_stopped_relax_patch と同じシンボルを
+    # 互いに _original 剥がしで奪い合っていたので、2 件セットで
+    # _climax_reject_reason の直列ステージへ畳んだ。
+    # opt-in スコープと DISABLE_TONOSAMA_PENDING_WARNING_RELAX_PATCH は
+    # pending_writer._warning_relax_scope_enabled() が再現している。
+    # install 時のモジュール定数書き換え (REJECT_ZERO_5SEC_FINAL / MIN_FINAL_5SEC_CHANGE_PCT)
+    # は pending_writer._effective_zero_5sec_guard() が実効値として返す。
     # tonosama_price_change_or_range_patch / tonosama_volume_surge_zero_rescue_patch /
     # tonosama_slope_range_rescue_patch の 3 件は trading/entry/tonosama/runner.py へ
     # 本文化済み (_rescue_max_price_change_pct / _rescue_max_volume_surge_ratio / _rescue_slope)。

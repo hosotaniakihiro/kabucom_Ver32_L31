@@ -216,7 +216,10 @@ def _install_main_runtime_patches():
         ("core.startup.summary_ai_entry_controller_bridge_patch", "install"),
         ("core.startup.board_retry_patch", "install"),
         ("core.startup.board_missing_failopen_runtime_patch", "install"),
-        ("core.startup.tonosama_5sec_stopped_relax_patch", "install"),
+        # tonosama_5sec_stopped_relax_patch は
+        # trading/entry/tonosama/pending_writer.py へ本文化済み
+        # (_five_sec_relax_stage)。main.py 専用スコープは
+        # pending_writer._five_sec_relax_scope_enabled() が再現している。
         ("core.startup.volatility_filter_tonosama_entryrow_rescue_patch", "install"),
         ("core.startup.board_wall_stall_exit_patch", "install"),
         ("core.startup.ranking_entry_filter_rescue_patch", "install"),
