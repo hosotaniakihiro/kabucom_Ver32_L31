@@ -381,9 +381,13 @@ ENTRY_FAILOPEN_PATCHES = [
     ("core.startup.entry_direction_recursion_failopen_patch", "ENTRY_DIRECTION_RECURSION_FAILOPEN", "DISABLE_ENTRY_DIRECTION_RECURSION_FAILOPEN_PATCH"),
 ]
 
-RANKING_RESCUE_PATCHES = [
-    ("core.startup.ranking_entry_final_rescue_patch", "RANKING_FINAL_RESCUE", "DISABLE_RANKING_FINAL_RESCUE_PATCH"),
-]
+# ranking_entry_final_rescue_patch は trading/handlers/entry_controller.py へ
+# 本文化済み (_ranking_final_rescue_atr + _ranking_rescue_apply_env_defaults)。
+# range_5m_filter 側の softpass は volatility_filter へインライン化済み、
+# ai_final_entry_check のラップは常時 no-op だったので移していない。
+# opt-in スコープは entry_controller._ranking_rescue_scope_enabled() が再現する。
+# グループ自体は将来の追加用に残す。
+RANKING_RESCUE_PATCHES: list = []
 
 TONOSAMA_EXTRA_RESCUE_PATCHES = [
     # low_movement_tonosama_no_highlow_patch は

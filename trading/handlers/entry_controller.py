@@ -447,6 +447,326 @@ def _resolve_entry_scores(entry_row: dict, side: str) -> tuple[float, float]:
 
 
 # ============================================================
+# RANKING の最終段 ATR 救済
+#   旧 core/startup/ranking_entry_final_rescue_patch.py (V1.4)
+# ------------------------------------------------------------
+# RANKING pending が entry_controller まで到達しているのに、最終段で
+# 全落ちして注文が出ない問題を緩和する。range_5m_filter 側の softpass は
+# trading/filters/volatility_filter._range_5m_filter_from_entry_row (V6) へ
+# インライン化済みなので、残っていたのは ATR 救済と env 強制の2つ。
+#
+# 旧パッチは opt-in の RANKING_RESCUE_PATCHES グループ (既定 OFF) で
+# install されていた。そのスコープを再現する。
+#
+# 本文化にあたっての意図的な差分 2 点 (どちらも opt-in を ON にしたときだけ顕在化):
+#  1) 旧 patched_ai (ec.ai_final_entry_check のラップ) は移していない。
+#     install() が RANKING_FINAL_RESCUE_AI_FAILOPEN="0" をハード代入してから
+#     ラップするため、本体は常に早期 return する完全な no-op だった。
+#     実質的な効果は getattr(cur, "_original_ai_final_entry_check", cur) で
+#     summary_ai_entry_controller_bridge_patch のラッパーを剥がして捨てることだけ。
+#     本文化ではその破壊を再現しない。
+#  2) 旧 patched_atr は getattr(cur, "_original_atr_1m_filter", cur) で
+#     entry_final_filter_failopen_patch のラッパーを 1 段剥がしていた。
+#     どのラッパーが最上位かは install 順のレース次第で不定だったため、
+#     本文化では剥がさず、チェーン全体の結果に対して救済を掛ける。
+# ============================================================
+_RANKING_RESCUE_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+_RANKING_RESCUE_DB_PROCESS_ENVS = (
+    "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+    "AUTOSTOCK_SUMMARY_DB_WRITER",
+    "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+    "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
+)
+
+# install() が setdefault ではなくハード代入していたもの。
+# sitecustomize / usercustomize の読み込み順に依存させないための意図的な force。
+_RANKING_RESCUE_FORCED_ENV = {
+    "RANKING_FINAL_RESCUE_MIN_SCORE": "50",
+    "RANKING_FINAL_RESCUE_MIN_TURNOVER": "30000000",
+    "RANKING_FINAL_RESCUE_MIN_DAY_ABS_PCT": "0.0",
+    "RANKING_FINAL_RESCUE_ATR_SOFTPASS": "1",
+    "RANKING_FINAL_RESCUE_RANGE_SOFTPASS": "1",
+    "LOW_MOVE_RANKING_ZERO_ATR_SOFTPASS": "1",
+    "LOW_MOVE_RANKING_ZERO_ATR_MIN_SCORE": "50",
+    "LOW_MOVE_RANKING_MIN_SCORE_FOR_NO_HIGHLOW": "50",
+    "LOW_MOVE_RANKING_ZERO_ATR_MIN_TURNOVER": "30000000",
+    "LOW_MOVE_RANKING_ZERO_ATR_MIN_DAY_ABS_PCT": "0.0",
+    "LOW_MOVE_RANKING_MIN_ATR_RATIO": "0.0",
+    "LOW_MOVE_RANKING_MIN_ABS_SLOPE": "0.0",
+    "RANKING_ENTRY_RESCUE_MIN_TURNOVER": "30000000",
+    "RANKING_ENTRY_RESCUE_RECURSION_MIN_TURNOVER": "30000000",
+}
+
+_RANKING_RESCUE_ENV_APPLIED = False
+
+
+def _ranking_rescue_scope_enabled() -> bool:
+    """このプロセスで RANKING final rescue を使うか。
+
+    旧パッチは sitecustomize の RANKING_RESCUE_PATCHES = opt-in グループ
+    (既定 OFF) 経由で、main lite の background loop か
+    SITECUSTOMIZE_ENABLE_FULL_NONMAIN=1 のときだけ install されていた。
+    RANKING_FINAL_RESCUE_SCOPE_ENABLED=1/0 で明示上書きできる。
+    """
+    try:
+        raw = os.getenv("RANKING_FINAL_RESCUE_SCOPE_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return _env_bool("RANKING_FINAL_RESCUE_SCOPE_ENABLED", False)
+        if str(os.environ.get("DISABLE_RANKING_FINAL_RESCUE_PATCH", "")).strip() == "1":
+            return False
+        if not (
+            _env_bool("SITECUSTOMIZE_ENABLE_RESCUE_PATCHES", False)
+            or _env_bool("SITECUSTOMIZE_ENABLE_RANKING_FINAL_RESCUE_PATCH", False)
+            or _env_bool("USERCUSTOMIZE_ENABLE_RANKING_RESCUE_PATCHES", False)
+        ):
+            return False
+        argv_list = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        argv = " ".join(argv_list)
+        if any(name in argv for name in _RANKING_RESCUE_DB_PROCESS_NAMES):
+            return False
+        if any(_env_bool(name, False) for name in _RANKING_RESCUE_DB_PROCESS_ENVS):
+            return False
+        if any(a.endswith("/main.py") or a == "main.py" for a in argv_list) and _env_bool("SITECUSTOMIZE_MAIN_LITE", True):
+            return True
+        return _env_bool("SITECUSTOMIZE_ENABLE_FULL_NONMAIN", False)
+    except Exception:
+        return False
+
+
+def _ranking_rescue_apply_env_defaults() -> None:
+    """旧 install() の env 副作用を、有効なときだけ 1 度だけ再現する。
+
+    LOW_MOVE_RANKING_* / RANKING_ENTRY_RESCUE_* は
+    low_movement_entry_guard_patch や ranking_entry_filter_rescue_patch が
+    ガード実行時に読む。range_5m_filter の softpass (volatility_filter) も
+    RANKING_FINAL_RESCUE_MIN_SCORE 等を atr_1m_filter より前に読むため、
+    このモジュールの import 時点で確定させる。
+    他の書き手はすべて setdefault なので、先に確定させても上書きされない。
+    """
+    global _RANKING_RESCUE_ENV_APPLIED
+    if _RANKING_RESCUE_ENV_APPLIED:
+        return
+    _RANKING_RESCUE_ENV_APPLIED = True
+    try:
+        changed = {}
+        for k, v in _RANKING_RESCUE_FORCED_ENV.items():
+            old = os.environ.get(k)
+            os.environ[k] = v
+            if old != v:
+                changed[k] = (old, v)
+        if changed:
+            logger.warning("[RANKING FINAL RESCUE] forced early ranking rescue env changed=%s", changed)
+
+        os.environ.setdefault("RANKING_FINAL_RESCUE_MIN_VOLUME", "30000")
+        os.environ.setdefault("RANKING_FINAL_RESCUE_SOFTPASS_MAX_RANGE_PCT", "0.0025")
+        os.environ.setdefault("RANKING_FINAL_RESCUE_ATR_FAILOPEN", "1")
+        os.environ.setdefault("RANKING_FINAL_RESCUE_ATR_MIN_RATIO", "0.0005")
+        # RANKING_FINAL_RESCUE_RANGE_ERROR_FAILOPEN / _AI_FAILOPEN / _AI_CONFIDENCE /
+        # _AI_REASONS は読み手が旧 patched_ai (常時 no-op) だけだったので移していない。
+    except Exception:
+        logger.exception("[RANKING FINAL RESCUE] env defaults failed")
+
+
+def _ranking_rescue_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
+
+
+def _ranking_rescue_row_dict(v: Any) -> dict:
+    try:
+        if isinstance(v, dict):
+            return v
+        if hasattr(v, "to_dict"):
+            d = v.to_dict()
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _ranking_rescue_sf(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
+
+
+def _ranking_rescue_is_ranking_row(row: Any) -> bool:
+    d = _ranking_rescue_row_dict(row)
+    try:
+        src = str(d.get("source") or d.get("pipeline_source") or d.get("entry_source") or "").strip().upper()
+        et = str(d.get("entry_type") or d.get("type") or d.get("strategy") or "").strip().upper()
+        return src == "RANKING" or et == "RANKING" or d.get("rank_type") is not None
+    except Exception:
+        return False
+
+
+def _ranking_rescue_score(row: Any) -> float:
+    d = _ranking_rescue_row_dict(row)
+    return max(
+        _ranking_rescue_sf(d.get("pending_score"), 0.0),
+        _ranking_rescue_sf(d.get("score"), 0.0),
+        _ranking_rescue_sf(d.get("score_buy"), 0.0),
+        _ranking_rescue_sf(d.get("score_sell"), 0.0),
+        _ranking_rescue_sf(d.get("ranking_score"), 0.0),
+        _ranking_rescue_sf(d.get("final_score"), 0.0),
+        _ranking_rescue_sf(d.get("display_score"), 0.0),
+        _ranking_rescue_sf(d.get("score_total"), 0.0),
+    )
+
+
+def _ranking_rescue_price(row: Any) -> float:
+    d = _ranking_rescue_row_dict(row)
+    return _ranking_rescue_sf(d.get("close_price") or d.get("close") or d.get("price") or d.get("current_price"), 0.0)
+
+
+def _ranking_rescue_atr(row: Any) -> float:
+    d = _ranking_rescue_row_dict(row)
+    return _ranking_rescue_sf(d.get("atr_1m") or d.get("atr") or d.get("ATR") or d.get("atr14") or d.get("atr_14"), 0.0)
+
+
+def _ranking_rescue_volume(row: Any) -> float:
+    d = _ranking_rescue_row_dict(row)
+    return _ranking_rescue_sf(d.get("volume") or d.get("Volume") or d.get("trading_volume"), 0.0)
+
+
+def _ranking_rescue_turnover(row: Any) -> float:
+    d = _ranking_rescue_row_dict(row)
+    price = _ranking_rescue_price(row)
+    vol = _ranking_rescue_volume(row)
+    explicit = _ranking_rescue_sf(
+        d.get("turnover")
+        or d.get("turnover_raw")
+        or d.get("trading_value")
+        or d.get("trading_amount")
+        or d.get("turnover_value")
+        or d.get("amount"),
+        0.0,
+    )
+    if explicit > 0:
+        return explicit
+    if price > 0 and vol > 0:
+        return price * vol
+    return 0.0
+
+
+def _ranking_rescue_day_pct(row: Any) -> float:
+    d = _ranking_rescue_row_dict(row)
+    return _ranking_rescue_sf(
+        d.get("day_change_pct")
+        or d.get("change_pct")
+        or d.get("change_percentage")
+        or d.get("change_rate")
+        or d.get("day")
+        or d.get("day_pct"),
+        0.0,
+    )
+
+
+def _ranking_rescue_high_low_close(row: Any) -> tuple[float, float, float]:
+    d = _ranking_rescue_row_dict(row)
+    high = _ranking_rescue_sf(d.get("high_price") or d.get("high") or d.get("High"), 0.0)
+    low = _ranking_rescue_sf(d.get("low_price") or d.get("low") or d.get("Low"), 0.0)
+    return high, low, _ranking_rescue_price(row)
+
+
+def _ranking_rescue_range_pct(row: Any) -> float:
+    high, low, close = _ranking_rescue_high_low_close(row)
+    if high > 0 and low > 0 and close > 0 and high >= low:
+        return max(0.0, (high - low) / close)
+    return 0.0
+
+
+def _ranking_rescue_ok(row: Any) -> bool:
+    if not _ranking_rescue_is_ranking_row(row):
+        return False
+    sc = _ranking_rescue_score(row)
+    price = _ranking_rescue_price(row)
+    vol = _ranking_rescue_volume(row)
+    min_score = _ranking_rescue_env_float("RANKING_FINAL_RESCUE_MIN_SCORE", 50.0)
+    min_volume = _ranking_rescue_env_float("RANKING_FINAL_RESCUE_MIN_VOLUME", 30000.0)
+    if price <= 0:
+        return False
+    if sc < min_score:
+        return False
+    if min_volume > 0 and vol < min_volume:
+        return False
+    return True
+
+
+def _ranking_rescue_low_move_soft_ok(row: Any) -> bool:
+    if not _ranking_rescue_ok(row):
+        return False
+
+    turnover = _ranking_rescue_turnover(row)
+    day_abs = abs(_ranking_rescue_day_pct(row))
+    min_turnover = _ranking_rescue_env_float("RANKING_FINAL_RESCUE_MIN_TURNOVER", 30000000.0)
+    min_day_abs = _ranking_rescue_env_float("RANKING_FINAL_RESCUE_MIN_DAY_ABS_PCT", 0.0)
+    if min_turnover > 0 and turnover < min_turnover:
+        return False
+    if min_day_abs > 0 and day_abs < min_day_abs:
+        return False
+
+    high, low, close = _ranking_rescue_high_low_close(row)
+    atr = _ranking_rescue_atr(row)
+    if atr <= 0:
+        return True
+    if not (high > 0 and low > 0 and close > 0 and high > low):
+        return True
+
+    max_range = _ranking_rescue_env_float("RANKING_FINAL_RESCUE_SOFTPASS_MAX_RANGE_PCT", 0.0025)
+    return _ranking_rescue_range_pct(row) <= max_range
+
+
+def _ranking_final_rescue_atr(entry_row: Any, ret: Any) -> Any:
+    """atr_1m_filter の結果に噛ませる。旧 patched_atr の後段そのもの。"""
+    if not _ranking_rescue_scope_enabled():
+        return ret
+    try:
+        if bool(ret):
+            return ret
+        if not _env_bool("RANKING_FINAL_RESCUE_ATR_FAILOPEN", True):
+            return ret
+        if not _ranking_rescue_ok(entry_row):
+            return ret
+        price = _ranking_rescue_price(entry_row)
+        atr = _ranking_rescue_atr(entry_row)
+        ratio = (atr / price) if price > 0 else 0.0
+        min_ratio = _ranking_rescue_env_float("RANKING_FINAL_RESCUE_ATR_MIN_RATIO", 0.0005)
+        if atr > 0 and ratio >= min_ratio:
+            logger.warning(
+                "[RANKING FINAL RESCUE] ATR fail-open symbol=%s score=%.3f atr=%.6f price=%.3f ratio=%.6f min_ratio=%.6f",
+                _ranking_rescue_row_dict(entry_row).get("symbol"), _ranking_rescue_score(entry_row), atr, price, ratio, min_ratio,
+            )
+            return True
+        if _env_bool("RANKING_FINAL_RESCUE_ATR_SOFTPASS", True) and _ranking_rescue_low_move_soft_ok(entry_row):
+            logger.warning(
+                "[RANKING FINAL RESCUE] ATR soft-pass symbol=%s score=%.3f atr=%.6f price=%.3f ratio=%.6f turnover=%.0f day=%.3f range_pct=%.6f",
+                _ranking_rescue_row_dict(entry_row).get("symbol"), _ranking_rescue_score(entry_row), atr, price, ratio,
+                _ranking_rescue_turnover(entry_row), _ranking_rescue_day_pct(entry_row), _ranking_rescue_range_pct(entry_row),
+            )
+            return True
+        return ret
+    except Exception:
+        return ret
+
+
+# ============================================================
 # TONOSAMA 専用ゲートのブリッジ
 #   旧 core/startup/entry_controller_tonosama_ai_bridge_patch.py (V3)
 # ------------------------------------------------------------
@@ -1369,7 +1689,7 @@ def _build_scored_candidates(
                     continue
 
             try:
-                if not atr_1m_filter(entry_row):
+                if not _ranking_final_rescue_atr(entry_row, atr_1m_filter(entry_row)):
                     _log_skip(symbol, "ATR_1M_FILTER_NG", side=side)
                     continue
             except Exception:
@@ -3343,3 +3663,16 @@ def _run_entry_pipeline_core(
 
     finally:
         _pipeline_lock.release()
+
+
+# ============================================================
+# RANKING final rescue の env 強制 (旧 install() 冒頭の
+# _force_ranking_zero_atr_defaults() + setdefault 群)
+# ------------------------------------------------------------
+# volatility_filter の range_5m_filter softpass など atr_1m_filter より
+# 前に走る経路もこれらのキーを読むため、モジュール import の時点で確定させる。
+# 定義順の都合でファイル末尾に置いてある (_env_bool がここより前に無いと
+# _ranking_rescue_scope_enabled() が NameError を握り潰して False になる)。
+# ============================================================
+if _ranking_rescue_scope_enabled():
+    _ranking_rescue_apply_env_defaults()
