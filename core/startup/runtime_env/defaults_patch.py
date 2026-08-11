@@ -231,7 +231,17 @@ def _install_summary_pending_stale_guard(context: str) -> bool:
 
 
 def _install_summary_db_realtime_priority(context: str) -> bool:
-    return _safe_install("summary DB realtime priority", context, DB_CONTEXTS, "DISABLE_SUMMARY_DB_REALTIME_PRIORITY_PATCH", "summary_db_realtime_priority_patch")
+    # summary_db_realtime_priority_patch は scheduler_jobs/summary/time_utils.py の
+    # resolve_target_intervals() へ native化済み (_summary_db_realtime_priority_enabled()
+    # がここと同じ DB_CONTEXTS 相当のargv/env判定を再現し、module import時にenvデフォルトも
+    # 適用済み)。ここでは有効/無効の状態をログへ反映するためだけに判定結果を返す。
+    if context not in DB_CONTEXTS:
+        return False
+    if os.environ.get("DISABLE_SUMMARY_DB_REALTIME_PRIORITY_PATCH", "").strip() == "1":
+        return False
+    if not env_bool("SUMMARY_DB_REALTIME_PRIORITY_ENABLED", True):
+        return False
+    return True
 
 
 def _install_push_summary_db_latest_source(context: str) -> bool:
