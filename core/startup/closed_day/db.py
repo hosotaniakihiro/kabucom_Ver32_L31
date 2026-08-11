@@ -1,5 +1,6 @@
 # ============================================================
-# File   : core/startup/closed_day_db.py
+# File   : core/startup/closed_day/db.py
+#          (旧 core/startup/closed_day_db.py)
 # Version: REV1.0-CLOSED-DAY-DB-FALLBACK
 # ------------------------------------------------------------
 # 【概要】

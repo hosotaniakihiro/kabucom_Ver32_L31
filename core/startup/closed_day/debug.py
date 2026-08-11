@@ -1,5 +1,6 @@
 # ============================================================
-# File   : core/startup/display_debug.py
+# File   : core/startup/closed_day/debug.py
+#          (旧 core/startup/display_debug.py)
 # Version: REV1.0-STARTUP-DISPLAY-DEBUG
 # ------------------------------------------------------------
 # ✔ startup display debug / closed-day profile を分離

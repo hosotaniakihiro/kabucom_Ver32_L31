@@ -58,7 +58,7 @@ from core.startup.startup_runtime import safe_migration_phase
 from core.startup.anchor_bootstrap import bootstrap_anchor
 from core.startup.background_bootstrap import bootstrap_background
 from core.startup.runtime_mode import enter_realtime_combat_mode
-from core.startup.closed_day_display import display_closed_day_summary_priority
+from core.startup.closed_day.display import display_closed_day_summary_priority
 
 from core.startup.startup_config import (
     SUMMARY_DIR,

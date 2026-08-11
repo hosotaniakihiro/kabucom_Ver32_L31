@@ -1,5 +1,6 @@
 # ============================================================
-# File   : core/startup/closed_day_display.py
+# File   : core/startup/closed_day/display.py
+#          (旧 core/startup/closed_day_display.py)
 # Version: REV1.0-CLOSED-DAY-DISPLAY
 # ------------------------------------------------------------
 # 【概要】
@@ -20,9 +21,9 @@ import logging
 import pandas as pd
 
 from global_state import global_data
-from core.startup.display_debug import log_display_input
+from core.startup.closed_day.debug import log_display_input
 from core.startup.summary_runtime import rebuild_closed_day_summaries_all
-from core.startup.closed_day_db import normalize_closed_day_db_df, get_latest_db_summary
+from core.startup.closed_day.db import normalize_closed_day_db_df, get_latest_db_summary
 
 try:
     from core.startup.merged_summary_access import get_summary_history_safe
