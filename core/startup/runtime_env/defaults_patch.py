@@ -292,7 +292,15 @@ def _install_normal_exit_scalp_align(context: str) -> bool:
 
 
 def _install_tonosama_pending_candidate_audit(context: str) -> bool:
-    return _safe_install("tonosama pending candidate audit", context, TRADING_CONTEXTS, "DISABLE_TONOSAMA_PENDING_CANDIDATE_AUDIT_PATCH", "tonosama_pending_candidate_audit_patch")
+    # tonosama_pending_candidate_audit_patch は trading/entry/tonosama/pending_writer.py の
+    # add_tonosama_pending() へ native化済み (scope判定は _pending_audit_scope_enabled()
+    # がここと同じ TRADING_CONTEXTS={"main"} 相当のargv判定を再現する)。ここでは有効/無効の
+    # 状態をログへ反映するためだけに判定結果を返す。
+    if context not in TRADING_CONTEXTS:
+        return False
+    if os.environ.get("DISABLE_TONOSAMA_PENDING_CANDIDATE_AUDIT_PATCH", "").strip() == "1":
+        return False
+    return True
 
 
 def _install_daytrade_credit_force_close(context: str) -> bool:

@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import os
 import sys
@@ -1017,7 +1018,7 @@ def _alert_liq_should_reject(entry: dict[str, Any]) -> tuple[bool, str, dict[str
     return False, "ok", detail
 
 
-def add_tonosama_pending(entry: dict[str, Any]) -> bool:
+def _add_tonosama_pending_core(entry: dict[str, Any]) -> bool:
     reject, reason, detail = _alert_liq_should_reject(entry)
     if reject:
         logger.warning(
@@ -1068,6 +1069,211 @@ def add_tonosama_pending(entry: dict[str, Any]) -> bool:
     except Exception:
         logger.exception("[TONOSAMA ENTRY] add_pending failed symbol=%s", entry.get("symbol"))
         return False
+
+
+# --- tonosama_pending_candidate_audit_patch (native化, 元 core/startup/tonosama_pending_candidate_audit_patch.py) ---
+# TONOSAMA pending entry が受理された時に、entry_conditions を含むフルスナップショットを
+# audit.candidate_history へ記録する (fail-safe: 監査ログ書き込み失敗は発注を止めない)。
+_PENDING_AUDIT_VERSION = "V1-TONOSAMA-PENDING-CANDIDATE-AUDIT"
+_PENDING_AUDIT_TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+
+
+def _pending_audit_env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in _PENDING_AUDIT_TRUE
+    except Exception:
+        return bool(default)
+
+
+def _pending_audit_norm_symbol(v: Any) -> str:
+    try:
+        s = str(v or "").strip()
+        if s.endswith(".0"):
+            s = s[:-2]
+        return s
+    except Exception:
+        return ""
+
+
+def _pending_audit_safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or v == "":
+            return float(default)
+        x = float(v)
+        if x != x:
+            return float(default)
+        return x
+    except Exception:
+        return float(default)
+
+
+def _pending_audit_json_default(v: Any):
+    try:
+        if isinstance(v, pd.Timestamp):
+            if pd.isna(v):
+                return None
+            return v.to_pydatetime().isoformat()
+    except Exception:
+        pass
+    try:
+        import numpy as np  # type: ignore
+        if isinstance(v, np.generic):
+            return v.item()
+    except Exception:
+        pass
+    if isinstance(v, (dt.datetime, dt.date, dt.time)):
+        return v.isoformat()
+    return str(v)
+
+
+def _pending_audit_snapshot_for_entry(entry: dict[str, Any]) -> str:
+    cond = entry.get("entry_conditions") or {}
+    if not isinstance(cond, dict):
+        cond = {"entry_conditions_raw": str(cond)}
+
+    payload: dict[str, Any] = {
+        "audit_kind": "TONOSAMA_PENDING_CANDIDATE",
+        "version": _PENDING_AUDIT_VERSION,
+        "source": "TONOSAMA",
+        "entry_type": entry.get("entry_type") or "TONOSAMA",
+        "symbol": _pending_audit_norm_symbol(entry.get("symbol")),
+        "symbolname": entry.get("symbolname"),
+        "side": str(entry.get("side") or cond.get("side") or "").upper(),
+        "price": _pending_audit_safe_float(entry.get("price"), 0.0),
+        "raw_score": _pending_audit_safe_float(entry.get("raw_score"), 0.0),
+        "final_score": _pending_audit_safe_float(entry.get("final_score") or entry.get("score"), 0.0),
+        "display_score": _pending_audit_safe_float(entry.get("display_score") or entry.get("final_score"), 0.0),
+        "score": _pending_audit_safe_float(entry.get("score"), 0.0),
+        "score_buy": _pending_audit_safe_float(entry.get("score_buy"), 0.0),
+        "score_sell": _pending_audit_safe_float(entry.get("score_sell"), 0.0),
+        "ai_prob": _pending_audit_safe_float(entry.get("ai_prob"), 0.0),
+        "ai_reason": cond.get("ai_reason"),
+        "reason": cond.get("reason"),
+        "reason_code": cond.get("reason_code"),
+        "created_at": entry.get("created_at"),
+        "expire_at": entry.get("expire_at") or cond.get("expire_at"),
+        "entry_conditions": cond,
+        # Flat aliases for easy SQL/JSON inspection.
+        "feature_dt": cond.get("feature_dt"),
+        "five_sec_dt": cond.get("five_sec_dt"),
+        "five_sec_dt_valid": cond.get("five_sec_dt_valid"),
+        "surge_tf": cond.get("surge_tf"),
+        "volume_surge_ratio_3m": cond.get("volume_surge_ratio_3m"),
+        "volume_surge_ratio_5m": cond.get("volume_surge_ratio_5m"),
+        "max_volume_surge_ratio": cond.get("max_volume_surge_ratio"),
+        "price_change_pct_3m": cond.get("price_change_pct_3m"),
+        "price_change_pct_5m": cond.get("price_change_pct_5m"),
+        "max_price_change_pct": cond.get("max_price_change_pct"),
+        "price_change_5s_pct": cond.get("price_change_5s_pct"),
+        "latest_volume": cond.get("latest_volume"),
+        "volume_3m": cond.get("volume_3m"),
+        "volume_5m": cond.get("volume_5m"),
+        "has_5sec_bar": cond.get("has_5sec_bar"),
+        "latest_5sec_volume": cond.get("latest_5sec_volume"),
+        "volume_surge_ratio_5s": cond.get("volume_surge_ratio_5s"),
+        "is_5sec_confirm_ok": cond.get("is_5sec_confirm_ok"),
+        "prev_3m_up_streak": cond.get("prev_3m_up_streak"),
+        "prev_5m_up_streak": cond.get("prev_5m_up_streak"),
+        "prev_3m_down_streak": cond.get("prev_3m_down_streak"),
+        "prev_5m_down_streak": cond.get("prev_5m_down_streak"),
+        "close_position_pct": cond.get("close_position_pct"),
+        "upper_wick_pct": cond.get("upper_wick_pct"),
+        "lower_wick_pct": cond.get("lower_wick_pct"),
+        "slope": cond.get("slope"),
+        "rsi": cond.get("rsi"),
+        "macd": cond.get("macd"),
+        "signal": cond.get("signal"),
+        "mtf": cond.get("mtf"),
+        "score_mtf": cond.get("score_mtf"),
+    }
+    text = json.dumps(payload, ensure_ascii=False, default=_pending_audit_json_default, separators=(",", ":"))
+    max_len = int(float(os.environ.get("TONOSAMA_AUDIT_TECHNICAL_SNAPSHOT_MAX_CHARS", "20000")))
+    if max_len > 0 and len(text) > max_len:
+        text = text[:max_len] + "...TRUNCATED"
+    return text
+
+
+def _pending_audit_record_tonosama_candidate(entry: dict[str, Any]) -> None:
+    try:
+        if not isinstance(entry, dict):
+            return
+        source = str(entry.get("source") or "").strip().upper()
+        entry_type = str(entry.get("entry_type") or "").strip().upper()
+        if source != "TONOSAMA" and entry_type != "TONOSAMA":
+            return
+        cond = entry.get("entry_conditions") or {}
+        if not isinstance(cond, dict):
+            cond = {}
+        from trading.audit_logging.recorder import record_candidate_event
+
+        side = str(entry.get("side") or cond.get("side") or "").upper()
+        final_score = _pending_audit_safe_float(entry.get("final_score") or entry.get("display_score") or entry.get("score"), 0.0)
+        reason = str(cond.get("reason") or cond.get("ai_reason") or "TONOSAMA pending accepted")
+        ai_reason = cond.get("ai_reason")
+        ai_result = json.dumps(
+            {
+                "kind": "TONOSAMA",
+                "ai_prob": _pending_audit_safe_float(entry.get("ai_prob"), 0.0),
+                "ai_reason": ai_reason,
+                "reason_code": cond.get("reason_code"),
+            },
+            ensure_ascii=False,
+            default=_pending_audit_json_default,
+            separators=(",", ":"),
+        )
+        record_candidate_event(
+            datetime=dt.datetime.now().isoformat(timespec="seconds"),
+            symbol=_pending_audit_norm_symbol(entry.get("symbol")),
+            side=side,
+            source="TONOSAMA",
+            interval_min=0,
+            score_buy=_pending_audit_safe_float(entry.get("score_buy"), 0.0),
+            score_sell=_pending_audit_safe_float(entry.get("score_sell"), 0.0),
+            score_total=final_score,
+            final_score=final_score,
+            ai_result=ai_result,
+            reason=reason,
+            technical_snapshot=_pending_audit_snapshot_for_entry(entry),
+        )
+        logger.info(
+            "[TONOSAMA AUDIT] candidate_history recorded symbol=%s side=%s score=%s reason_code=%s",
+            _pending_audit_norm_symbol(entry.get("symbol")), side, final_score, cond.get("reason_code"),
+        )
+    except Exception:
+        logger.debug("[TONOSAMA AUDIT] record candidate failed", exc_info=True)
+
+
+def _pending_audit_scope_enabled() -> bool:
+    """tonosama_pending_candidate_audit_patch は core/startup/runtime_env/defaults_patch.py の
+    TRADING_CONTEXTS ({"main"}) 経由でのみ install されていた (main.py プロセス以外では
+    常に無効だった)。TONOSAMA_PENDING_CANDIDATE_AUDIT_SCOPE_ENABLED で明示上書き可。
+    """
+    try:
+        if str(os.environ.get("DISABLE_TONOSAMA_PENDING_CANDIDATE_AUDIT_PATCH", "")).strip() == "1":
+            return False
+        raw = os.getenv("TONOSAMA_PENDING_CANDIDATE_AUDIT_SCOPE_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return _pending_audit_env_bool("TONOSAMA_PENDING_CANDIDATE_AUDIT_SCOPE_ENABLED", False)
+        argv_list = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        return any(a.endswith("/main.py") or a == "main.py" for a in argv_list)
+    except Exception:
+        return False
+
+
+def add_tonosama_pending(entry: dict[str, Any]) -> bool:
+    if not _pending_audit_scope_enabled():
+        return _add_tonosama_pending_core(entry)
+    ok = False
+    try:
+        ok = bool(_add_tonosama_pending_core(entry))
+        return ok
+    finally:
+        # Record only accepted pending entries, not rejected final-guard rows.
+        if ok and _pending_audit_env_bool("TONOSAMA_AUDIT_RECORD_PENDING_ACCEPTED", True):
+            _pending_audit_record_tonosama_candidate(entry)
 
 
 __all__ = ["has_tonosama_pending", "build_pending_entry", "add_tonosama_pending", "prune_expired_tonosama_pending"]
