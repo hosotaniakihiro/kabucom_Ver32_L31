@@ -236,7 +236,9 @@ def _install_summary_mtf_catchup_safely() -> None:
         os.environ.setdefault("SUMMARY_MTF_STARTUP_CATCHUP_ENABLED", "1")
         os.environ.setdefault("SUMMARY_MTF_CATCHUP_INTERVALS", "3,5")
         os.environ.setdefault("SUMMARY_MTF_CATCHUP_RUN_ASYNC", "1")
-        _install_module("core.startup.summary_multiframe_startup_catchup_patch", "SUMMARY_MTF_CATCHUP")
+        # summary_multiframe_startup_catchup_patch は trading/summary/mtf_startup_catchup.py へ
+        # 移設済み (モンキーパッチではなく db_prepare 専用のバッチジョブだったため)。
+        _install_module("trading.summary.mtf_startup_catchup", "SUMMARY_MTF_CATCHUP")
     except Exception:
         _write_boot_evidence("SUMMARY_MTF_CATCHUP_EXCEPTION", traceback.format_exc())
 

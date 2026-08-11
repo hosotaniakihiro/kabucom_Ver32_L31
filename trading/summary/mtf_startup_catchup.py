@@ -1,5 +1,6 @@
 # ============================================================
-# File   : core/startup/summary_multiframe_startup_catchup_patch.py
+# File   : trading/summary/mtf_startup_catchup.py
+#          (旧 core/startup/summary_multiframe_startup_catchup_patch.py)
 # Version: V1.4-TIME-RANGE-NOT-NULL-FIX
 # ------------------------------------------------------------
 # 起動時にDB内の1分足サマリーから、3分足・5分足サマリーを差分再集計する。
@@ -651,9 +652,11 @@ def install() -> bool:
     return True
 
 
-try:
-    install()
-except Exception as e:
-    logger.warning("[SUMMARY MTF CATCHUP] auto install failed err=%s", e, exc_info=False)
+# import 時の自動 install は撤去した。
+# 旧構成では import しただけで DISABLE_SUMMARY_MTF_CATCHUP の判定を経ずに
+# catchup スレッドが立つ可能性があった (実際には sitecustomize の
+# _install_summary_mtf_catchup_safely() が gate を通してから import するので
+# 顕在化していなかったが、本体ツリーへ移動して誤 import されやすくなるため)。
+# install() は _INSTALLED ガード付きの冪等な関数なので、呼び出し側で明示的に呼ぶ。
 
 __all__ = ["install", "run_catchup"]
