@@ -257,7 +257,12 @@ def _is_trade_restricted(symbol: str) -> bool:
     return bool(_is_trade_restricted_symbol(symbol)[0])
 
 
-def _is_sell_reject_cached(symbol: str, side: str) -> tuple[bool, Any]:
+def _sell_credit_prefilter_norm_symbol(v: Any) -> str:
+    s = str(v or "").strip()
+    return s[:-2] if s.endswith(".0") else s
+
+
+def _is_sell_reject_cached_core(symbol: str, side: str) -> tuple[bool, Any]:
     if side != "SELL":
         return False, None
     try:
@@ -269,6 +274,41 @@ def _is_sell_reject_cached(symbol: str, side: str) -> tuple[bool, Any]:
                 return True, "sell_reject_cache"
     except Exception:
         pass
+    return False, None
+
+
+def _is_sell_reject_cached(symbol: str, side: str) -> tuple[bool, Any]:
+    """SELL却下キャッシュ + 信用売り可否ガード (公開エントリポイント)。
+
+    旧 core/startup/summary_ai_sell_credit_prefilter_patch がこの関数を
+    (_is_sell_reject_cached_core の逐語的な再実装 + 信用売り可否チェック追加で)
+    無条件に差し替えていた。_is_sell_reject_cached_core は素の却下キャッシュ判定のみで
+    到達不能 (旧パッチは _original を保持するだけで一度も委譲していなかった)。
+    """
+    symbol_s = _sell_credit_prefilter_norm_symbol(symbol)
+    side_s = _norm_side(side)
+    if side_s != "SELL" or not symbol_s:
+        return False, None
+
+    try:
+        from AI.sell_order_reject_cache import is_sell_rejected, get_sell_reject_reason
+        if is_sell_rejected(symbol_s):
+            return True, {"reason": "sell_reject_cache", "detail": str(get_sell_reject_reason(symbol_s))}
+    except Exception:
+        pass
+
+    try:
+        from AI.sell_credit_guard import can_sell_symbol
+        if not can_sell_symbol(symbol_s, default=False):
+            logger.warning(
+                "[SUMMARY AI EXECUTOR] SELL candidate removed before approved symbol=%s reason=sell_credit_guard_ng",
+                symbol_s,
+            )
+            return True, {"reason": "sell_credit_guard_ng"}
+    except Exception:
+        logger.exception("[SUMMARY AI EXECUTOR] sell credit guard failed fail-open symbol=%s", symbol_s)
+        return False, None
+
     return False, None
 
 

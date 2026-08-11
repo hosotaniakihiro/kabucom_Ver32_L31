@@ -182,31 +182,21 @@ def _install_aligned_summary_display_patch() -> bool:
         return False
 
 
-def _install_push_flush_auto_recover_patch() -> bool:
-    try:
-        os.environ.setdefault("PUSH_STREAM_AUTO_RECOVER_FLUSH", "1")
-        from core.startup import push_flush_auto_recover_patch as p
-        ok = p.install()
-        logger.warning("[ONESHOT LIMIT PATCH] push_flush_auto_recover_patch installed=%s", ok)
-        return bool(ok)
-    except Exception:
-        logger.exception("[ONESHOT LIMIT PATCH] push_flush_auto_recover_patch install failed")
-        return False
+# push_flush_auto_recover_patch は削除した。実体は trading/push/push_stream/monitor.py
+# ._monitor_worker の setattr 差し替えのみだったが、trading/push/push_stream/runner.py が
+# 起動時に `from .monitor import _monitor_worker` でこの関数を名前解決していたため
+# (このパッチのinstall()が走るより前に完了する)、setattr後もrunner.py側の束縛は
+# 差し替え前の元関数を指したままだった。実際に import 順序をシミュレートし、
+# monitor._monitor_worker が置き換わった後も runner._monitor_worker は
+# 旧来のオリジナル (現在の trading/push/push_stream/monitor.py Ver1.5、
+# WS stale watchdog・memory-only判定込みの上位互換) を指し続けることを確認済み
+# (=このパッチは実運用で一度も効いていなかった)。
 
-
-def _install_summary_ai_symbol_risk_patch() -> bool:
-    try:
-        os.environ.setdefault("SUMMARY_AI_PRE_FILTER_DAILY_RISK", "1")
-        os.environ.setdefault("SUMMARY_AI_PRE_FILTER_DAILY_RISK_SCOPE", "symbol_only")
-        os.environ.setdefault("ENTRY_GLOBAL_MAX_DAILY_LOSS_YEN", "-50000")
-        os.environ.setdefault("ENTRY_GLOBAL_MAX_CONSECUTIVE_LOSSES", "20")
-        from core.startup import summary_ai_daily_risk_symbol_only_patch as p
-        ok = p.install()
-        logger.warning("[ONESHOT LIMIT PATCH] summary_ai_symbol_risk_patch installed=%s", ok)
-        return bool(ok)
-    except Exception:
-        logger.exception("[ONESHOT LIMIT PATCH] summary_ai_symbol_risk_patch install failed")
-        return False
+# summary_ai_daily_risk_symbol_only_patch は削除した。ラップ対象の置換後ロジックは
+# 「旧 entry_daily_risk_runtime_patch._risk_block_reason がインライン化で消滅済みのため
+# 常に fail-open (False, "", {}) を返すだけ」であり、これは
+# trading/entry/summary_ai/executor.py の現行ネイティブ _daily_risk_block_reason と
+# 入出力が完全に一致することを確認済み (実質的に無効化のみを目的とした空パッチ)。
 
 
 def _install_summary_ai_executor_result_patch() -> bool:
@@ -220,15 +210,9 @@ def _install_summary_ai_executor_result_patch() -> bool:
         return False
 
 
-def _install_summary_ai_sell_credit_prefilter_patch() -> bool:
-    try:
-        from core.startup import summary_ai_sell_credit_prefilter_patch as p
-        ok = p.install()
-        logger.warning("[ONESHOT LIMIT PATCH] summary_ai_sell_credit_prefilter_patch installed=%s", ok)
-        return bool(ok)
-    except Exception:
-        logger.exception("[ONESHOT LIMIT PATCH] summary_ai_sell_credit_prefilter_patch install failed")
-        return False
+# summary_ai_sell_credit_prefilter_patch は trading/entry/summary_ai/executor.py の
+# _is_sell_reject_cached へ本文化済みのため削除 (SELL却下キャッシュ判定 + 信用売り
+# 可否ガードを公開関数へ直接実装)。
 
 
 def _install_summary_ai_async_entry_patch() -> bool:
@@ -245,16 +229,9 @@ def _install_summary_ai_async_entry_patch() -> bool:
         return False
 
 
-def _install_summary_ai_dedupe_fix_patch() -> bool:
-    try:
-        os.environ.setdefault("SUMMARY_AI_PREORDER_DEDUPE_ENABLED", "0")
-        from core.startup import summary_ai_dedupe_fix_runtime_patch as p
-        ok = p.install()
-        logger.warning("[ONESHOT LIMIT PATCH] summary_ai_dedupe_fix_patch installed=%s", ok)
-        return bool(ok)
-    except Exception:
-        logger.exception("[ONESHOT LIMIT PATCH] summary_ai_dedupe_fix_patch install failed")
-        return False
+# summary_ai_dedupe_fix_runtime_patch は trading/entry/summary_ai/runner.py の
+# _apply_optional_entry_dedupe_guard へ本文化済みのため削除 (SUMMARY_AI_PREORDER_DEDUPE_ENABLED
+# 既定OFF時はdedupe/cooldown判定を丸ごとスキップする挙動を公開関数へ直接実装)。
 
 
 def _install_strict_liquidity_patch() -> bool:
@@ -407,7 +384,7 @@ def install() -> bool:
     ok_fresh_quote = _install_entry_fresh_quote_guard_patch()
 
     ok_async_entry = _install_summary_ai_async_entry_patch()
-    ok_dedupe_fix = _install_summary_ai_dedupe_fix_patch()
+    # summary_ai_dedupe_fix_runtime_patch は runner.py へ本文化済み (上記コメント参照)。
     ok_strict_liq = _install_strict_liquidity_patch()
     ok_watchlist_liq = _install_watchlist_recent_liquidity_patch()
     ok_watchlist_bulk = _install_watchlist_recent_liquidity_bulk_patch()
@@ -421,7 +398,7 @@ def install() -> bool:
     ok_display = _install_aligned_summary_display_patch()
     ok_threshold = _install_entry_threshold_patch()
     ok_qty_minlot = _install_entry_qty_minlot_patch()
-    ok_push_flush = _install_push_flush_auto_recover_patch()
+    # push_flush_auto_recover_patch は削除済み (上記コメント参照。実運用で無効だったことを確認済み)。
 
     ok_main = False
     try:
@@ -433,9 +410,10 @@ def install() -> bool:
     except Exception:
         logger.exception("[ONESHOT LIMIT PATCH] install failed")
 
-    ok_symbol_risk = _install_summary_ai_symbol_risk_patch()
+    # summary_ai_daily_risk_symbol_only_patch は削除済み (上記コメント参照。ネイティブ版と
+    # 入出力完全一致を確認済み)。
     ok_executor_result = _install_summary_ai_executor_result_patch()
-    ok_sell_credit_prefilter = _install_summary_ai_sell_credit_prefilter_patch()
+    # summary_ai_sell_credit_prefilter_patch は削除済み (上記コメント参照)。
 
     _INSTALLED = bool(
         ok_budget_700k
@@ -444,7 +422,6 @@ def install() -> bool:
         or ok_open_pos_throttle
         or ok_fresh_quote
         or ok_async_entry
-        or ok_dedupe_fix
         or ok_strict_liq
         or ok_watchlist_liq
         or ok_watchlist_bulk
@@ -457,10 +434,7 @@ def install() -> bool:
         or ok_display
         or ok_threshold
         or ok_qty_minlot
-        or ok_push_flush
         or ok_main
-        or ok_symbol_risk
         or ok_executor_result
-        or ok_sell_credit_prefilter
     )
     return _INSTALLED

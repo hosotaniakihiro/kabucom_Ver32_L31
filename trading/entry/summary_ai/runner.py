@@ -597,7 +597,38 @@ def _apply_tonosama_filter_before_candidate_build(
 # optional dedupe guard
 # ============================================================
 
+os.environ.setdefault("SUMMARY_AI_PREORDER_DEDUPE_ENABLED", "0")
+
+
 def _apply_optional_entry_dedupe_guard(ai_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """事前重複/クールダウンガード (公開エントリポイント)。
+
+    旧 core/startup/summary_ai_dedupe_fix_runtime_patch が、
+    SUMMARY_AI_PREORDER_DEDUPE_ENABLED (既定 "0"=OFF) が無効な間は
+    dedupe/cooldown 判定を完全にスキップして ai_results をそのまま返すよう、
+    この関数を無条件に差し替えていた (AI_OKでも実発注が失敗すると、
+    次回候補が dedupe_skip で消えてしまう問題への対処)。有効時のみ
+    _apply_optional_entry_dedupe_guard_core (entry_dedupe_guard 使用) を呼ぶ。
+    """
+    if not ai_results:
+        return ai_results
+
+    if not _env_bool("SUMMARY_AI_PREORDER_DEDUPE_ENABLED", False):
+        try:
+            ok_symbols = [str(x.get("symbol")) for x in ai_results if isinstance(x, dict) and bool(x.get("allow"))]
+        except Exception:
+            ok_symbols = []
+        logger.info(
+            "[SUMMARY AI RUNNER] pre-order dedupe skipped ai_results=%s ai_ok_symbols=%s",
+            len(ai_results),
+            ok_symbols[:30],
+        )
+        return ai_results
+
+    return _apply_optional_entry_dedupe_guard_core(ai_results)
+
+
+def _apply_optional_entry_dedupe_guard_core(ai_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     entry_dedupe_guard.py が存在する場合だけ使う。
     存在しない環境でも runner が落ちないようにする。
