@@ -495,6 +495,12 @@ def _install_patch_list(items) -> None:
         _install_module(module_name, label, disabled_env=disabled_env)
 
 
+# 2026-08-11 時点で下の 4 グループはすべて空になった。
+# (ENTRY failopen / RANKING final rescue / TONOSAMA extra rescue / SUMMARY AI rescue)
+# 中身はそれぞれ本体モジュールへ本文化するか、実質的な死にコードとして削除済み。
+# 有効/無効の判定は各本体側の *_scope_enabled() が同じ env を見て再現している。
+# この関数は将来 opt-in パッチを足すときの枠組みとして残してあり、
+# 現状は "skipped count=0" のログを 4 行出すだけの no-op。
 def _install_optional_rescue_patches() -> None:
     all_rescue = _env_on("SITECUSTOMIZE_ENABLE_RESCUE_PATCHES", False)
     groups = [
