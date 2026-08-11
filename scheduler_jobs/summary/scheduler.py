@@ -53,6 +53,7 @@
 
 from __future__ import annotations
 
+import atexit
 import datetime as dt
 import logging
 import os
@@ -355,7 +356,169 @@ _push_fallback_reason: Optional[str] = None
 _push_fallback_thread_name: Optional[str] = None
 
 
-def _run_with_timeout(
+# ============================================================
+# shutdown / executor-recovery guard
+# 旧 core/startup/summary_scheduler_shutdown_guard_patch.py (V2) を本文化。
+#   - interpreter shutdown 中に ThreadPoolExecutor.submit() へ新規投入して
+#     落ちるのを防ぐ (該当tickをskipしてNoneを返す)。
+#   - 稼働中に _timeout_executor 自体がshutdown済みになった場合は、
+#     suppressするのではなく executor を再生成して同じjobを再投入する。
+# ============================================================
+
+_summary_scheduler_shutdown_guard_event = threading.Event()
+_summary_scheduler_shutdown_guard_recover_lock = threading.RLock()
+
+
+def _summary_scheduler_shutdown_guard_mark_shutdown() -> None:
+    try:
+        _summary_scheduler_shutdown_guard_event.set()
+    except Exception:
+        pass
+
+
+try:
+    atexit.register(_summary_scheduler_shutdown_guard_mark_shutdown)
+except Exception:
+    pass
+
+
+def _summary_scheduler_shutdown_guard_is_interpreter_shutdown() -> bool:
+    try:
+        if _summary_scheduler_shutdown_guard_event.is_set():
+            return True
+        is_finalizing = getattr(sys, "is_finalizing", None)
+        if callable(is_finalizing) and is_finalizing():
+            return True
+    except Exception:
+        return True
+    return False
+
+
+def _summary_scheduler_shutdown_guard_is_executor_shutdown_error(exc: BaseException) -> bool:
+    try:
+        msg = str(exc)
+    except Exception:
+        return False
+    return (
+        "cannot schedule new futures after interpreter shutdown" in msg
+        or "cannot schedule new futures after shutdown" in msg
+    )
+
+
+def _summary_scheduler_shutdown_guard_safe_label(args: tuple, kwargs: dict) -> str:
+    try:
+        return str(kwargs.get("label") or "")
+    except Exception:
+        return ""
+
+
+def _summary_scheduler_shutdown_guard_reset_timeout_executor(*, reason: str, label: str) -> bool:
+    global _timeout_executor
+    try:
+        with _summary_scheduler_shutdown_guard_recover_lock:
+            old = _timeout_executor
+            try:
+                if old is not None:
+                    old.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            new_exec = ThreadPoolExecutor(max_workers=4, thread_name_prefix="summary-timeout-guard-recovered")
+            _timeout_executor = new_exec
+            logger.warning(
+                "[SUMMARY SCHEDULER SHUTDOWN GUARD] recovered _timeout_executor label=%s reason=%s new=%s",
+                label,
+                reason,
+                new_exec,
+            )
+            return True
+    except Exception:
+        logger.exception("[SUMMARY SCHEDULER SHUTDOWN GUARD] executor recovery failed label=%s reason=%s", label, reason)
+        return False
+
+
+def _summary_scheduler_shutdown_guard_wrap_tick(fn: Callable[..., Any], *, name: str, args: tuple, kwargs: dict) -> Any:
+    if _summary_scheduler_shutdown_guard_is_interpreter_shutdown():
+        try:
+            logger.warning("[SUMMARY SCHEDULER SHUTDOWN GUARD] skip tick during interpreter shutdown name=%s", name)
+        except Exception:
+            pass
+        return None
+    try:
+        return fn(*args, **kwargs)
+    except RuntimeError as e:
+        if _summary_scheduler_shutdown_guard_is_executor_shutdown_error(e):
+            if _summary_scheduler_shutdown_guard_is_interpreter_shutdown():
+                try:
+                    logger.warning(
+                        "[SUMMARY SCHEDULER SHUTDOWN GUARD] suppress RuntimeError during interpreter shutdown name=%s error=%s",
+                        name,
+                        e,
+                    )
+                except Exception:
+                    pass
+                return None
+            logger.warning(
+                "[SUMMARY SCHEDULER SHUTDOWN GUARD] RuntimeError outside interpreter shutdown name=%s error=%s -> propagate to timeout wrapper/retry",
+                name,
+                e,
+            )
+        raise
+
+
+def _run_with_timeout(*args: Any, **kwargs: Any) -> tuple[bool, bool, Any]:
+    """_run_with_timeout_core の shutdown/executor-recovery ガード版 (公開エントリポイント)。
+
+    旧 core/startup/summary_scheduler_shutdown_guard_patch.py V2 の
+    _run_with_timeout_guarded を移設。interpreter shutdown中はskipし、
+    executor自体がshutdown済み (RuntimeError) の場合は _timeout_executor を
+    再生成して1回だけ再試行する。
+    """
+    label = _summary_scheduler_shutdown_guard_safe_label(args, kwargs)
+    if _summary_scheduler_shutdown_guard_is_interpreter_shutdown():
+        try:
+            logger.warning(
+                "[SUMMARY SCHEDULER SHUTDOWN GUARD] skip _run_with_timeout during interpreter shutdown label=%s",
+                label,
+            )
+        except Exception:
+            pass
+        return False, False, None
+    try:
+        return _run_with_timeout_core(*args, **kwargs)
+    except RuntimeError as e:
+        if not _summary_scheduler_shutdown_guard_is_executor_shutdown_error(e):
+            raise
+        if _summary_scheduler_shutdown_guard_is_interpreter_shutdown():
+            try:
+                logger.warning(
+                    "[SUMMARY SCHEDULER SHUTDOWN GUARD] suppress executor submit RuntimeError during interpreter shutdown label=%s error=%s",
+                    label,
+                    e,
+                )
+            except Exception:
+                pass
+            return False, False, None
+        logger.warning(
+            "[SUMMARY SCHEDULER SHUTDOWN GUARD] executor submit RuntimeError outside interpreter shutdown label=%s error=%s -> recover/retry",
+            label,
+            e,
+        )
+        if _summary_scheduler_shutdown_guard_reset_timeout_executor(reason=str(e), label=label):
+            try:
+                return _run_with_timeout_core(*args, **kwargs)
+            except RuntimeError as e2:
+                if _summary_scheduler_shutdown_guard_is_executor_shutdown_error(e2):
+                    logger.warning(
+                        "[SUMMARY SCHEDULER SHUTDOWN GUARD] retry still failed label=%s error=%s -> return failed",
+                        label,
+                        e2,
+                    )
+                    return False, False, None
+                raise
+        return False, False, None
+
+
+def _run_with_timeout_core(
     fn: Callable[..., Any],
     *,
     timeout_sec: float,
@@ -542,7 +705,11 @@ def _call_job_compat(
             return fn(display=True)
 
 
-def _invoke_job(
+def _invoke_job(*args: Any, **kwargs: Any) -> None:
+    return _summary_scheduler_shutdown_guard_wrap_tick(_invoke_job_core, name="_invoke_job", args=args, kwargs=kwargs)
+
+
+def _invoke_job_core(
     fn,
     *,
     label: str,
@@ -614,7 +781,11 @@ def _invoke_job(
 # source runners
 # ============================================================
 
-def _run_push_summary_tick(now: Optional[dt.datetime] = None) -> None:
+def _run_push_summary_tick(*args: Any, **kwargs: Any) -> None:
+    return _summary_scheduler_shutdown_guard_wrap_tick(_run_push_summary_tick_core, name="_run_push_summary_tick", args=args, kwargs=kwargs)
+
+
+def _run_push_summary_tick_core(now: Optional[dt.datetime] = None) -> None:
     try:
         now = _now(now)
         minute = now.minute
@@ -732,7 +903,11 @@ def _mark_push_fallback_done() -> None:
         _push_fallback_thread_name = None
 
 
-def _push_fallback_worker(now: dt.datetime, *, reason: str) -> None:
+def _push_fallback_worker(*args: Any, **kwargs: Any) -> None:
+    return _summary_scheduler_shutdown_guard_wrap_tick(_push_fallback_worker_core, name="_push_fallback_worker", args=args, kwargs=kwargs)
+
+
+def _push_fallback_worker_core(now: dt.datetime, *, reason: str) -> None:
     t0 = time.perf_counter()
     thread_name = threading.current_thread().name
 
@@ -781,7 +956,11 @@ def _push_fallback_worker(now: dt.datetime, *, reason: str) -> None:
         _mark_push_fallback_done()
 
 
-def _run_push_fallback_when_unified_blocked(now: dt.datetime, *, reason: str) -> None:
+def _run_push_fallback_when_unified_blocked(*args: Any, **kwargs: Any) -> None:
+    return _summary_scheduler_shutdown_guard_wrap_tick(_run_push_fallback_when_unified_blocked_core, name="_run_push_fallback_when_unified_blocked", args=args, kwargs=kwargs)
+
+
+def _run_push_fallback_when_unified_blocked_core(now: dt.datetime, *, reason: str) -> None:
     """
     unified parent tick / ranking / yahoo 側の重い処理が詰まっても、
     最新20分を埋めるために PUSH summary だけは独立実行する。
@@ -891,7 +1070,11 @@ def _run_push_fallback_when_unified_blocked(now: dt.datetime, *, reason: str) ->
         )
 
 
-def _run_ranking_summary_tick(now: Optional[dt.datetime] = None) -> None:
+def _run_ranking_summary_tick(*args: Any, **kwargs: Any) -> None:
+    return _summary_scheduler_shutdown_guard_wrap_tick(_run_ranking_summary_tick_core, name="_run_ranking_summary_tick", args=args, kwargs=kwargs)
+
+
+def _run_ranking_summary_tick_core(now: Optional[dt.datetime] = None) -> None:
     try:
         now = _now(now)
         minute = now.minute
@@ -952,7 +1135,11 @@ def _call_unified_runner(now: dt.datetime, ranking_enabled: bool, run_entry: boo
     )
 
 
-def _run_summary_tick(now: Optional[dt.datetime] = None) -> None:
+def _run_summary_tick(*args: Any, **kwargs: Any) -> None:
+    return _summary_scheduler_shutdown_guard_wrap_tick(_run_summary_tick_core, name="_run_summary_tick", args=args, kwargs=kwargs)
+
+
+def _run_summary_tick_core(now: Optional[dt.datetime] = None) -> None:
     """
     毎分 :00 に1回だけ呼ばれる統合親tick。
 
@@ -1199,7 +1386,11 @@ def register_summary_tasks() -> None:
 # manual / debug entry
 # ============================================================
 
-def run_summary_tick_once(now: Optional[dt.datetime] = None) -> None:
+def run_summary_tick_once(*args: Any, **kwargs: Any) -> None:
+    return _summary_scheduler_shutdown_guard_wrap_tick(run_summary_tick_once_core, name="run_summary_tick_once", args=args, kwargs=kwargs)
+
+
+def run_summary_tick_once_core(now: Optional[dt.datetime] = None) -> None:
     try:
         logger.info(
             "[summary.scheduler] run_summary_tick_once called ranking_enabled=%s run_entry=%s "

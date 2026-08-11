@@ -200,7 +200,11 @@ def _install_main_runtime_patches():
         logger.exception("[MAIN RUNTIME PATCH] stale 100368 sell reject cache cleanup failed")
 
     patches = [
-        ("core.startup.summary_scheduler_shutdown_guard_patch", "install"),
+        # summary_scheduler_shutdown_guard_patch は
+        # scheduler_jobs/summary/scheduler.py へ本文化済みのため削除
+        # (_run_with_timeout/_invoke_job/_run_push_summary_tick/_run_ranking_summary_tick/
+        # _run_summary_tick/_run_push_fallback_when_unified_blocked/_push_fallback_worker/
+        # run_summary_tick_once の8関数を shutdown/executor-recovery guard 込みで公開名に維持)。
         ("core.startup.nas_sqlite_io_guard_patch", "install"),
         # entry_controller_runtime_reject_patch は trading/handlers/entry_controller.py の
         # cleanup_stale_100368_sell_reject_cache() へ native化済み (直接呼び出しは下記)。
