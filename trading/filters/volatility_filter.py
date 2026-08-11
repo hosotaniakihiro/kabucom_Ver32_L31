@@ -298,7 +298,7 @@ def _entry_row_source_text(entry_row: Any) -> str:
     return " ".join(vals).lower()
 
 
-def _looks_ranking_entry(entry_row: Any) -> bool:
+def _looks_ranking_entry_core(entry_row: Any) -> bool:
     text = _entry_row_source_text(entry_row)
     if "ranking" in text or "rank" in text or "ランキング" in text:
         return True
@@ -315,6 +315,88 @@ def _looks_ranking_entry(entry_row: Any) -> bool:
         "change_ratio",
     }
     return bool(set(row.keys()) & ranking_keys)
+
+
+# --- summary_ai_no_ranking_rescue_scan_patch (native化, 元 core/startup/summary_ai_no_ranking_rescue_scan_patch.py) ---
+# SUMMARY_AI 由来の候補行は reason に rankScore を含むため、素の _looks_ranking_entry_core /
+# _ranking_move_rescue_core だけでは誤って Ranking 由来と判定され、陳腐化した ranking DB を
+# スキャンする rescue 経路に入ってしまう。SUMMARY_AI 行は明示的に除外し、Ranking 固有の識別子
+# (ranking/rank_type 等のトークンや列) がある場合のみ Ranking 由来として扱う。
+_NO_RANK_RESCUE_SUMMARY_TOKENS = ("summary", "summary_ai", "push", "stock_summary", "src=summary")
+_NO_RANK_RESCUE_RANKING_TOKENS = ("ranking", "ランキング", "rank_type", "ranking_type")
+
+
+def _no_rank_rescue_row_to_dict(row: Any) -> dict:
+    try:
+        if row is None:
+            return {}
+        if isinstance(row, dict):
+            return dict(row)
+        if hasattr(row, "to_dict"):
+            v = row.to_dict()
+            if isinstance(v, dict):
+                return dict(v)
+    except Exception:
+        pass
+    return {}
+
+
+def _no_rank_rescue_is_summary_ai_row(entry_row: Any) -> bool:
+    row = _no_rank_rescue_row_to_dict(entry_row)
+    text_parts: list = []
+    for key in (
+        "source",
+        "entry_source",
+        "candidate_source",
+        "pipeline_source",
+        "entry_type",
+        "reason",
+        "ai_reason",
+        "skip_reason",
+        "model_used",
+    ):
+        try:
+            v = row.get(key)
+            if v is not None:
+                text_parts.append(str(v))
+        except Exception:
+            pass
+    text = " ".join(text_parts).lower()
+    if any(tok in text for tok in _NO_RANK_RESCUE_SUMMARY_TOKENS):
+        return True
+    try:
+        if bool(row.get("ai_gate_allow")) or bool(row.get("preapproved")) or bool(row.get("summary_ai_ok")):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _no_rank_rescue_has_explicit_ranking_identity(entry_row: Any) -> bool:
+    row = _no_rank_rescue_row_to_dict(entry_row)
+    text_parts: list = []
+    for key in ("source", "entry_source", "candidate_source", "pipeline_source", "rank_type", "ranking_type"):
+        v = row.get(key)
+        if v is not None:
+            text_parts.append(str(v))
+    text = " ".join(text_parts).lower()
+    if any(tok in text for tok in _NO_RANK_RESCUE_RANKING_TOKENS):
+        return True
+    # reason='rankScore=...' はランキング由来と見なさない (SUMMARY_AI の reason には常に rankScore が入るため)。
+    ranking_keys = {"rank", "ranking_type", "ranking_kind", "rank_type", "source_rank", "change_percentage", "change_rate", "change_ratio"}
+    return bool(set(row.keys()) & ranking_keys)
+
+
+def _looks_ranking_entry(entry_row: Any) -> bool:
+    if _no_rank_rescue_is_summary_ai_row(entry_row):
+        # SUMMARY_AI 行は reason に rankScore を含むが、Ranking 由来ではない。
+        return False
+    if _no_rank_rescue_has_explicit_ranking_identity(entry_row):
+        return True
+    try:
+        return bool(_looks_ranking_entry_core(entry_row))
+    except Exception:
+        return False
 
 
 def _ranking_db_candidate_paths() -> list[str]:
@@ -486,7 +568,7 @@ def _latest_ranking_snapshot_move(symbol: str) -> dict[str, Any] | None:
     return None
 
 
-def _ranking_move_rescue(entry_row: Any, *, min_pct: float, label: str) -> bool:
+def _ranking_move_rescue_core(entry_row: Any, *, min_pct: float, label: str) -> bool:
     if not _env_bool("RANKING_STARTUP_VOL_RESCUE", True):
         return False
     if not _looks_ranking_entry(entry_row):
@@ -517,6 +599,22 @@ def _ranking_move_rescue(entry_row: Any, *, min_pct: float, label: str) -> bool:
         close,
     )
     return bool(ok)
+
+
+def _ranking_move_rescue(entry_row: Any, *, min_pct: float, label: str) -> bool:
+    # summary_ai_no_ranking_rescue_scan_patch (native化): SUMMARY_AI 由来の行は
+    # 陳腐化した ranking DB スキャンによる rescue の対象にしない。
+    if _no_rank_rescue_is_summary_ai_row(entry_row):
+        row = _no_rank_rescue_row_to_dict(entry_row)
+        logger.info(
+            "[SUMMARY AI NO RANKING RESCUE] skip stale ranking DB scan symbol=%s label=%s source=%s entry_type=%s",
+            row.get("symbol") or row.get("Symbol"),
+            label,
+            row.get("source"),
+            row.get("entry_type"),
+        )
+        return False
+    return bool(_ranking_move_rescue_core(entry_row, min_pct=min_pct, label=label))
 
 
 def _entry_row_range_ok(entry_row: Any, min_pct: float = DEFAULT_ENTRY_ROW_RANGE_MIN_PCT) -> bool:
