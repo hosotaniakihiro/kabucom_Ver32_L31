@@ -291,7 +291,7 @@ def _apply_freshness(df: pd.DataFrame, fresh_minutes: float = DEFAULT_FRESH_MINU
     return out
 
 
-def _apply_min_liquidity(df: pd.DataFrame, *, min_price: float = MIN_PRICE, min_trading_value: float = MIN_TRADING_VALUE, min_volume: float = MIN_VOLUME, min_tick_count: float = MIN_TICK_COUNT, strict: bool = False) -> pd.DataFrame:
+def _apply_min_liquidity_core(df: pd.DataFrame, *, min_price: float = MIN_PRICE, min_trading_value: float = MIN_TRADING_VALUE, min_volume: float = MIN_VOLUME, min_tick_count: float = MIN_TICK_COUNT, strict: bool = False) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     out = df.copy()
@@ -310,6 +310,105 @@ def _apply_min_liquidity(df: pd.DataFrame, *, min_price: float = MIN_PRICE, min_
     apply_cond("volume", min_volume)
     apply_cond("tick_count", min_tick_count)
     logger.info("[PUSH RANKING SELECTOR] liquidity filter before=%d after=%d min_price=%.1f min_value=%.1f min_volume=%.1f min_tick=%.1f strict=%s", before, len(out), min_price, min_trading_value, min_volume, min_tick_count, strict)
+    return out
+
+
+# ============================================================
+# 流動性フィルタが全件 0 件になったときの段階緩和
+#   旧 core/startup/liquidity_empty_fallback_patch.py (V1)
+# ------------------------------------------------------------
+# 代金列の単位違いや未補完で after=0 になり、
+#   [PUSH RANKING SELECTOR] liquidity filter before=2753 after=0
+# のまま候補が消えるのを防ぐ。完全な unfiltered には落とさず、
+# turnover_5m -> turnover_1m -> price+volume -> price のみ、と段階的に緩める。
+#
+# 旧パッチは ENABLE_LIQ_EMPTY_FALLBACK_PATCH が真のときだけ install される
+# opt-in (既定 OFF) だった。そのスコープを _liq_empty_fallback_enabled() で再現する。
+# ============================================================
+_LIQ_RELAX_STEPS = (
+    ("turnover_5m", 5_000_000.0, None, None),
+    ("turnover_1m", 1_000_000.0, None, 0.0),
+    ("price_volume_only", 0.0, None, 0.0),
+    ("price_only", 0.0, 0.0, 0.0),
+)
+
+
+def _liq_empty_fallback_enabled() -> bool:
+    """旧 sitecustomize._install_liq_empty_fallback_only_if_enabled() の判定を再現する。
+
+    ENABLE_LIQ_EMPTY_FALLBACK_PATCH が真のときだけ install されていた (既定 OFF)。
+    無効時は sitecustomize が DISABLE_LIQ_EMPTY_FALLBACK_PATCH=1 を setdefault する。
+    """
+    try:
+        if str(os.environ.get("DISABLE_LIQ_EMPTY_FALLBACK_PATCH", "")).strip() == "1":
+            return False
+        v = os.environ.get("ENABLE_LIQ_EMPTY_FALLBACK_PATCH")
+        if v is None or str(v).strip() == "":
+            return False
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return False
+
+
+def _apply_min_liquidity(
+    df: pd.DataFrame,
+    *,
+    min_price: float = None,
+    min_trading_value: float = None,
+    min_volume: float = None,
+    min_tick_count: float = None,
+    strict: bool = False,
+) -> pd.DataFrame:
+    # 既定値はモジュール定数を「呼び出し時に」読む。
+    # (旧パッチが getattr(rs, "MIN_PRICE", ...) で解決していた挙動に合わせる)
+    if min_price is None:
+        min_price = float(MIN_PRICE)
+    if min_trading_value is None:
+        min_trading_value = float(MIN_TRADING_VALUE)
+    if min_volume is None:
+        min_volume = float(MIN_VOLUME)
+    if min_tick_count is None:
+        min_tick_count = float(MIN_TICK_COUNT)
+
+    before = 0 if df is None else len(df)
+    out = _apply_min_liquidity_core(
+        df,
+        min_price=min_price,
+        min_trading_value=min_trading_value,
+        min_volume=min_volume,
+        min_tick_count=min_tick_count,
+        strict=strict,
+    )
+    if not _liq_empty_fallback_enabled():
+        return out
+    if out is not None and not out.empty:
+        return out
+    if df is None or getattr(df, "empty", True):
+        return pd.DataFrame()
+
+    for label, tv, vol, tick in _LIQ_RELAX_STEPS:
+        vol = min_volume if vol is None else vol
+        tick = min_tick_count if tick is None else tick
+        try:
+            cand = _apply_min_liquidity_core(
+                df,
+                min_price=min_price,
+                min_trading_value=tv,
+                min_volume=vol,
+                min_tick_count=tick,
+                strict=False,
+            )
+        except Exception:
+            logger.debug("[LIQ EMPTY FALLBACK] selector relax failed step=%s", label, exc_info=True)
+            continue
+        if cand is not None and not cand.empty:
+            logger.warning(
+                "[LIQ EMPTY FALLBACK] PUSH selector liquidity relaxed step=%s before=%d after=%d original_min_value=%.1f min_price=%.1f min_volume=%.1f",
+                label, before, len(cand), float(min_trading_value), float(min_price), float(vol),
+            )
+            return cand
+
+    logger.warning("[LIQ EMPTY FALLBACK] PUSH selector liquidity still empty before=%d -> keep original empty", before)
     return out
 
 

@@ -311,7 +311,7 @@ def _vwap_guard(df: pd.DataFrame) -> pd.DataFrame:
 # main filter
 # ============================================================
 
-def apply_liquidity_filter(
+def apply_liquidity_filter_core(
     df: pd.DataFrame,
     *,
     min_volume: int = MIN_VOLUME,
@@ -382,6 +382,98 @@ def apply_liquidity_filter(
     except Exception:
         logger.exception("[liquidity_filter] failed context=%s", context)
         return pd.DataFrame()
+
+
+# ============================================================
+# 流動性フィルタが全件 0 件になったときの段階緩和
+#   旧 core/startup/liquidity_empty_fallback_patch.py (V1)
+# ------------------------------------------------------------
+# [ranking_pipeline] empty after apply_liquidity_filter で候補が全部消えるのを防ぐ。
+# 代金 (turnover) のみを段階的に緩め、price は落とさない。
+#
+# 旧パッチは ENABLE_LIQ_EMPTY_FALLBACK_PATCH が真のときだけ install される
+# opt-in (既定 OFF) だった。そのスコープを _liq_empty_fallback_enabled() で再現する。
+# ============================================================
+def _liq_empty_fallback_enabled() -> bool:
+    """旧 sitecustomize._install_liq_empty_fallback_only_if_enabled() の判定を再現する。"""
+    try:
+        if str(os.environ.get("DISABLE_LIQ_EMPTY_FALLBACK_PATCH", "")).strip() == "1":
+            return False
+        v = os.environ.get("ENABLE_LIQ_EMPTY_FALLBACK_PATCH")
+        if v is None or str(v).strip() == "":
+            return False
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return False
+
+
+def apply_liquidity_filter(
+    df: pd.DataFrame,
+    *,
+    min_volume: int = None,
+    min_turnover: int = None,
+    min_price: float = None,
+    max_price: float = None,
+    require_price: bool = None,
+    context: str = "",
+) -> pd.DataFrame:
+    # 既定値はモジュール定数を「呼び出し時に」読む。
+    # (旧パッチが getattr(lf, "MIN_VOLUME", ...) で解決していた挙動に合わせる)
+    if min_volume is None:
+        min_volume = int(MIN_VOLUME)
+    if min_turnover is None:
+        min_turnover = int(MIN_TURNOVER)
+    if min_price is None:
+        min_price = float(MIN_PRICE)
+    if max_price is None:
+        max_price = float(MAX_PRICE)
+    if require_price is None:
+        require_price = bool(REQUIRE_PRICE_COLUMN)
+
+    before = 0 if df is None else len(df)
+    out = apply_liquidity_filter_core(
+        df,
+        min_volume=min_volume,
+        min_turnover=min_turnover,
+        min_price=min_price,
+        max_price=max_price,
+        require_price=require_price,
+        context=context,
+    )
+    if not _liq_empty_fallback_enabled():
+        return out
+    if out is not None and not out.empty:
+        return out
+    if df is None or getattr(df, "empty", True):
+        return pd.DataFrame()
+
+    for label, turnover, volume in (
+        ("turnover_1m", 1_000_000, min_volume),
+        ("price_volume_only", 0, min_volume),
+        ("price_only", 0, 0),
+    ):
+        try:
+            cand = apply_liquidity_filter_core(
+                df,
+                min_volume=volume,
+                min_turnover=turnover,
+                min_price=min_price,
+                max_price=max_price,
+                require_price=require_price,
+                context=f"{context}|fallback:{label}" if context else f"fallback:{label}",
+            )
+        except Exception:
+            logger.debug("[LIQ EMPTY FALLBACK] ranking relax failed step=%s", label, exc_info=True)
+            continue
+        if cand is not None and not cand.empty:
+            logger.warning(
+                "[LIQ EMPTY FALLBACK] ranking liquidity relaxed step=%s context=%s before=%d after=%d original_min_turnover=%s min_price=%.1f min_volume=%s",
+                label, context, before, len(cand), min_turnover, float(min_price), volume,
+            )
+            return cand
+
+    logger.warning("[LIQ EMPTY FALLBACK] ranking liquidity still empty context=%s before=%d", context, before)
+    return out
 
 
 # ============================================================

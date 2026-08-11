@@ -191,13 +191,57 @@ def _install_module(module_name: str, label: str, *, disabled_env: str | None = 
             pass
 
 
+def _is_database_like_process() -> bool:
+    """旧 core/startup/liquidity_empty_fallback_patch._is_database_like_process()。
+
+    _is_database_process() より狭く、main_database / data_collectors_runner /
+    push_receiver_runner の 3 つだけを見る。判定基準が違うのでそのまま残す。
+    """
+    try:
+        argv = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+        if any(x in argv for x in ("main_database.py", "data_collectors_runner.py", "push_receiver_runner.py")):
+            return True
+    except Exception:
+        pass
+    return str(os.environ.get("AUTOSTOCK_DATA_COLLECTORS_PROCESS", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _enable_push_db_writer_env_if_database_process() -> None:
+    """旧 liquidity_empty_fallback_patch.install() が持っていた env 強制。
+
+    DB 系プロセスで PUSH DB writer を明示的に有効化し、memory_only 誤判定を避ける。
+    ENABLE_LIQ_EMPTY_FALLBACK_PATCH が真のときだけ走る点も旧構成どおり。
+    """
+    if not _is_database_like_process():
+        return
+    os.environ["AUTOSTOCK_DATA_COLLECTORS_PROCESS"] = "1"
+    os.environ["AUTOSTOCK_MAIN_DATABASE_PROCESS"] = "1"
+    os.environ["AUTOSTOCK_EXTERNAL_DATA_COLLECTORS"] = "1"
+    os.environ["PUSH_STREAM_DB_WRITE"] = "1"
+    os.environ["PUSH_STREAM_ORDER_BOOK_WRITE"] = os.environ.get("PUSH_STREAM_ORDER_BOOK_WRITE", "1")
+    os.environ["AUTOSTOCK_SUMMARY_SAVE_OWNER"] = os.environ.get("AUTOSTOCK_SUMMARY_SAVE_OWNER", "database")
+    os.environ["AUTOSTOCK_SUMMARY_DB_WRITER"] = os.environ.get("AUTOSTOCK_SUMMARY_DB_WRITER", "1")
+    logger.warning(
+        "[LIQ EMPTY FALLBACK] database-like process detected -> PUSH DB writer env forced on argv=%s",
+        sys.argv[:3],
+    )
+
+
 def _install_liq_empty_fallback_only_if_enabled() -> None:
     if not _env_on("ENABLE_LIQ_EMPTY_FALLBACK_PATCH", False):
         os.environ.setdefault("DISABLE_LIQ_EMPTY_FALLBACK_PATCH", "1")
         _write_boot_evidence("LIQ_EMPTY_FALLBACK_DISABLED_BY_DEFAULT")
         return
     os.environ.pop("DISABLE_LIQ_EMPTY_FALLBACK_PATCH", None)
-    _install_module("core.startup.liquidity_empty_fallback_patch", "LIQ_EMPTY_FALLBACK")
+    # 段階緩和のロジック本体は
+    #   trading/push/subscription_manager/ranking_selector._apply_min_liquidity
+    #   trading/ranking/filters/liquidity_filter.apply_liquidity_filter
+    # へ本文化済み。両モジュールの _liq_empty_fallback_enabled() が
+    # ENABLE_LIQ_EMPTY_FALLBACK_PATCH / DISABLE_LIQ_EMPTY_FALLBACK_PATCH を見て
+    # 有効/無効を判定するので、install 呼び出しは不要になった。
+    # install() が持っていた env 強制だけをここへ移す。
+    _enable_push_db_writer_env_if_database_process()
+    _write_boot_evidence("LIQ_EMPTY_FALLBACK_ENABLED")
 
 
 def _install_runtime_defaults() -> None:
