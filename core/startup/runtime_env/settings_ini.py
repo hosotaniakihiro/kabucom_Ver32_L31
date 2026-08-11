@@ -68,7 +68,9 @@ def _project_root_candidates() -> list[Path]:
 
     try:
         here = Path(__file__).resolve()
-        candidates.extend([here.parents[2], here.parents[1], Path.cwd()])
+        # core/startup/runtime_env/settings_ini.py -> repo root は parents[3]
+        # (旧 core/startup/settings_ini_loader.py のときは parents[2] だった)
+        candidates.extend([here.parents[3], here.parents[2], here.parents[1], Path.cwd()])
     except Exception:
         candidates.append(Path.cwd())
 

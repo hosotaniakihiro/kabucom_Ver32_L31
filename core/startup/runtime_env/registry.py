@@ -3,7 +3,7 @@
 Registry metadata for centralized runtime environment defaults.
 
 This module does not set any environment variables.  It documents how
-core.startup.runtime_env_defaults is grouped so future migration to
+core.startup.runtime_env.defaults is grouped so future migration to
 settings.ini can be done category-by-category instead of by searching
 through startup files.
 """

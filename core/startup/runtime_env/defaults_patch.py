@@ -25,11 +25,11 @@ import os
 import sys
 from typing import Callable, Dict
 
-from .runtime_env_default_registry import SITE_GROUP_ORDER, USER_GROUP_ORDER
-from .runtime_env_default_registry import VERSION as REGISTRY_VERSION
-from .runtime_settings_ini_loader import VERSION as SETTINGS_INI_VERSION
-from .runtime_settings_ini_loader import load_settings_ini
-from . import runtime_env_defaults as _defaults
+from .registry import SITE_GROUP_ORDER, USER_GROUP_ORDER
+from .registry import VERSION as REGISTRY_VERSION
+from .settings_loader import VERSION as SETTINGS_INI_VERSION
+from .settings_loader import load_settings_ini
+from . import defaults as _defaults
 
 logger = logging.getLogger(__name__)
 VERSION = "REV33-RUNTIME-ENV-DEFAULTS-VOL-FILTER-RESCUE-TIMEBOX"
@@ -147,7 +147,7 @@ def _install_strict_entry_defaults(context: str) -> bool:
         if os.environ.get("DISABLE_STRICT_ENTRY_DEFAULTS_PATCH", "").strip() == "1":
             logger.warning("[RUNTIME ENV DEFAULTS PATCH] strict entry defaults disabled by env")
             return False
-        from . import tonosama_history_failclose_strict_patch
+        from .. import tonosama_history_failclose_strict_patch
         ok = bool(tonosama_history_failclose_strict_patch.install())
         logger.warning("[RUNTIME ENV DEFAULTS PATCH] strict entry defaults installed ok=%s context=%s", ok, context)
         return ok
@@ -169,7 +169,7 @@ def _force_install_summary_ai_safety_guard(context: str) -> bool:
         os.environ.setdefault("SUMMARY_STALE_DB_FALLBACK_MAX_AGE_SEC", "420")
         os.environ.setdefault("TONOSAMA_DISABLE_HISTORY_FAILOPEN", "1")
         os.environ.setdefault("TONOSAMA_REQUIRE_TECHNICAL_READY", "1")
-        from . import summary_ai_candidate_refill_patch
+        from .. import summary_ai_candidate_refill_patch
         ok = bool(summary_ai_candidate_refill_patch.install())
         logger.warning("[RUNTIME ENV DEFAULTS PATCH] forced SUMMARY AI SAFETY GUARD ok=%s context=%s", ok, context)
         return ok
@@ -208,7 +208,7 @@ def _install_summary_pending_stale_guard(context: str) -> bool:
         os.environ.setdefault("SUMMARY_SKIP_STALE_PENDING_ENABLED", "1")
         os.environ.setdefault("SUMMARY_SKIP_MISSING_DATETIME_PENDING", "1")
         os.environ.setdefault("SUMMARY_ENTRY_PENDING_MAX_AGE_SEC", "180")
-        from . import summary_entry_pending_existing_fix_patch
+        from .. import summary_entry_pending_existing_fix_patch
         return bool(summary_entry_pending_existing_fix_patch.install())
     except Exception:
         logger.exception("[RUNTIME ENV DEFAULTS PATCH] summary pending stale guard install failed")
@@ -234,11 +234,11 @@ def _install_low_volatility_entry_guard(context: str) -> bool:
         if os.environ.get("DISABLE_LOW_VOLATILITY_ENTRY_GUARD", "").strip() == "1":
             logger.warning("[RUNTIME ENV DEFAULTS PATCH] low volatility entry guard disabled by env")
             return False
-        from . import low_volatility_entry_guard_patch
+        from .. import low_volatility_entry_guard_patch
         base_ok = bool(low_volatility_entry_guard_patch.install())
         strict_ok = False
         try:
-            from . import low_volatility_entry_guard_strict_patch
+            from .. import low_volatility_entry_guard_strict_patch
             strict_ok = bool(low_volatility_entry_guard_strict_patch.install())
         except Exception:
             logger.exception("[RUNTIME ENV DEFAULTS PATCH] strict low volatility guard install failed")

@@ -247,7 +247,7 @@ def _install_liq_empty_fallback_only_if_enabled() -> None:
 def _install_runtime_defaults() -> None:
     try:
         _ensure_project_root()
-        mod = __import__("core.startup.runtime_env_defaults_patch", fromlist=["install"])
+        mod = __import__("core.startup.runtime_env.defaults_patch", fromlist=["install"])
         ok = bool(getattr(mod, "install")())
         os.environ["ENTRY_SHORT_MTF_REQUIRE_ALL"] = "0"
         _write_boot_evidence("CENTRAL_RUNTIME_DEFAULTS_SET", {"ok": ok})

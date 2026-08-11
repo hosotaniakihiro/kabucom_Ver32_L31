@@ -27,7 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from core.startup.runtime_env_default_registry import (  # noqa: E402
+from core.startup.runtime_env.registry import (  # noqa: E402
     ENV_KEY_TO_CATEGORY,
     GROUP_BY_NAME,
     KEY_CATEGORY_BY_NAME,
@@ -35,7 +35,7 @@ from core.startup.runtime_env_default_registry import (  # noqa: E402
     USER_GROUP_ORDER,
     VERSION as REGISTRY_VERSION,
 )
-from core.startup.runtime_settings_ini_loader import (  # noqa: E402
+from core.startup.runtime_env.settings_loader import (  # noqa: E402
     VERSION as LOADER_VERSION,
     _KNOWN_SECTIONS,  # diagnostic script; ok to inspect loader metadata
     _env_name,

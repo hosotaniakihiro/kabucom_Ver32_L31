@@ -105,8 +105,10 @@ _SKIP_ENV_NAMES = {
 
 
 def _repo_root() -> Path:
-    # core/startup/runtime_settings_ini_loader.py -> repo root is parents[2]
-    return Path(__file__).resolve().parents[2]
+    # core/startup/runtime_env/settings_loader.py -> repo root is parents[3]
+    # (旧 core/startup/runtime_settings_ini_loader.py のときは parents[2] だった。
+    #  サブパッケージへ移したので 1 段深くなっている。)
+    return Path(__file__).resolve().parents[3]
 
 
 def _env_on(name: str, default: str = "0") -> bool:

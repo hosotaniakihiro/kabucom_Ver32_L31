@@ -203,7 +203,7 @@ def _install_summary_ai_emp_prob_gate() -> bool:
 
 def _install_runtime_defaults() -> bool:
     try:
-        from core.startup.runtime_env_defaults_patch import install as _install_defaults
+        from core.startup.runtime_env.defaults_patch import install as _install_defaults
 
         ok = bool(_install_defaults())
         logger.warning("[USERCUSTOMIZE] centralized runtime defaults ok=%s", ok)

@@ -48,7 +48,7 @@ def _safe_int(v, default: int = 0) -> int:
 def _env_bool_cfg(key: str, default: bool = True) -> bool:
     v = _cfg(key, "1" if default else "0")
     try:
-        from core.startup.settings_ini_loader import get_setting
+        from core.startup.runtime_env.settings_ini import get_setting
         if v is None or str(v).strip() == "":
             v = get_setting(key, "1" if default else "0")
     except Exception:

@@ -517,7 +517,7 @@ def _ai_final_entry_check_core(row: dict) -> dict:
 # (_patch_ai_entry_gate) が実運用で `AI.entry_gate.ai_final_entry_check`
 # へ monkeypatch していた内容を native化したもの。
 #
-# 実運用での適用順序 (usercustomize.py -> core.startup.runtime_env_defaults_patch
+# 実運用での適用順序 (usercustomize.py -> core.startup.runtime_env.defaults_patch
 # .install() -> _install_ranking_entry_runtime_rescue() が先、
 # _install_low_volatility_entry_guard() が後、いずれも Python 起動時に
 # 同期的に実行され、trading.handlers.entry_controller 等の import より前に
