@@ -247,48 +247,15 @@ def _patch_ai_entry_gate() -> bool:
 
 
 def _patch_summary_ai_selection() -> bool:
-    try:
-        from trading.entry.summary_ai import executor as e
-        cur = getattr(e, "_filter_blocked_ai_ok_items", None)
-        if not callable(cur):
-            return False
-        if getattr(cur, "_low_volatility_guard_v3", False):
-            return True
-        orig = getattr(cur, "_original", cur)
+    """executor._filter_blocked_ai_ok_items のラップは撤去した。
 
-        @wraps(orig)
-        def patched_filter_blocked_ai_ok_items(ok_items):
-            if not _env_bool("ENTRY_LOW_VOLATILITY_GUARD_ENABLED", True):
-                return orig(ok_items)
-            kept = []
-            skipped = []
-            try:
-                for item in list(ok_items or []):
-                    if not isinstance(item, dict):
-                        kept.append(item)
-                        continue
-                    blocked, reason, detail = _low_vol_block(item)
-                    if blocked:
-                        skipped.append({"reason": reason, **detail})
-                        continue
-                    kept.append(item)
-                if skipped:
-                    logger.warning("[LOW VOL ENTRY GUARD] SUMMARY_AI prefilter before=%s after=%s skipped=%s", len(ok_items or []), len(kept), skipped[:50])
-                return orig(kept)
-            except Exception:
-                logger.exception("[LOW VOL ENTRY GUARD] SUMMARY_AI prefilter failed; fail-open to original")
-                return orig(ok_items)
-
-        patched_filter_blocked_ai_ok_items._low_volatility_guard_v1 = True  # type: ignore[attr-defined]
-        patched_filter_blocked_ai_ok_items._low_volatility_guard_v2 = True  # type: ignore[attr-defined]
-        patched_filter_blocked_ai_ok_items._low_volatility_guard_v3 = True  # type: ignore[attr-defined]
-        patched_filter_blocked_ai_ok_items._original = orig  # type: ignore[attr-defined]
-        e._filter_blocked_ai_ok_items = patched_filter_blocked_ai_ok_items
-        logger.warning("[LOW VOL ENTRY GUARD] SUMMARY_AI executor prefilter patched v3 zero_as_missing=%s", _env_bool("ENTRY_LOW_VOL_ZERO_AS_MISSING", True))
-        return True
-    except Exception:
-        logger.debug("[LOW VOL ENTRY GUARD] SUMMARY_AI executor patch skipped", exc_info=True)
-        return False
+    executor.py:1664 の core filter watcher が 0.5 秒ごとに _ensure_core_filter() で
+    モジュール属性を _base_filter_blocked_ai_ok_items へ戻し、一度戻すと誰も
+    再 install しない。install 直後 0.5 秒未満しか生存できない死にラッパーだった
+    (実測確認済み)。low volatility ガード本体 (_low_vol_block) は
+    AI/entry_gate.py 側の判定で引き続き使われている。
+    """
+    return True
 
 
 def _patch_entry_order_builder_low_move() -> bool:

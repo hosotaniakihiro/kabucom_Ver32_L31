@@ -420,45 +420,16 @@ def _patch_ai_gate() -> bool:
 
 
 def _patch_sell_credit_prefilter() -> bool:
-    try:
-        from trading.entry.summary_ai import executor as e
+    """executor._filter_blocked_ai_ok_items のラップは撤去した。
 
-        cur = getattr(e, "_filter_blocked_ai_ok_items", None)
-        if not callable(cur):
-            return False
-        if getattr(cur, "_entry_fire_rescue_sell_credit_v4", False):
-            return True
-        orig = getattr(cur, "_original", cur)
-
-        @wraps(orig)
-        def patched_filter_blocked_ai_ok_items(ok_items):
-            if not _env_bool("SUMMARY_AI_SELL_CREDIT_PREFILTER", True):
-                return orig(ok_items)
-            if not ok_items:
-                return orig(ok_items)
-            try:
-                kept, skipped = _prefilter_sell_credit_ng_candidates(ok_items)
-                if skipped:
-                    logger.warning(
-                        "[ENTRY FIRE RESCUE] SUMMARY_AI SELL credit approved-stage safety filter before=%s after=%s skipped=%s",
-                        len(ok_items),
-                        len(kept) if hasattr(kept, "__len__") else -1,
-                        skipped[:80],
-                    )
-                return orig(kept)
-            except Exception:
-                logger.exception("[ENTRY FIRE RESCUE] SELL credit prefilter failed; fail-open to original")
-                return orig(ok_items)
-
-        patched_filter_blocked_ai_ok_items._entry_fire_rescue_sell_credit_v4 = True  # type: ignore[attr-defined]
-        patched_filter_blocked_ai_ok_items._entry_fire_rescue_sell_credit_v3 = True  # type: ignore[attr-defined]
-        patched_filter_blocked_ai_ok_items._entry_fire_rescue_sell_credit_v2 = True  # type: ignore[attr-defined]
-        patched_filter_blocked_ai_ok_items._original = orig  # type: ignore[attr-defined]
-        e._filter_blocked_ai_ok_items = patched_filter_blocked_ai_ok_items
-        return True
-    except Exception:
-        logger.debug("[ENTRY FIRE RESCUE] sell credit prefilter patch skipped", exc_info=True)
-        return False
+    executor.py:1664 が import 時に起動する core filter watcher が 0.5 秒ごとに
+    _ensure_core_filter() でモジュール属性を _base_filter_blocked_ai_ok_items へ
+    戻し、一度戻すと誰も再 install しない。install 直後 0.5 秒未満しか生存できず、
+    SUMMARY_AI 実行時には必ず消えている死にラッパーだった (実測確認済み)。
+    SELL 信用の事前フィルタが本当に必要なら
+    executor._base_filter_blocked_ai_ok_items 本体へ入れること。
+    """
+    return True
 
 
 def _patch_ranking_timeout_controller() -> bool:

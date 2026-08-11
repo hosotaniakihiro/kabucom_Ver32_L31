@@ -293,63 +293,12 @@ def _install_summary_ai_approval_diag_and_price_floor() -> bool:
             _patched_entry_price_bounds._original = cur_bounds  # type: ignore[attr-defined]
             exec_mod._entry_price_bounds = _patched_entry_price_bounds
 
-        orig_filter = getattr(exec_mod, "_filter_blocked_ai_ok_items", None)
-        if callable(orig_filter) and not getattr(orig_filter, "_summary_ai_approval_diag_v1", False):
-            def _patched_filter_blocked_ai_ok_items(ok_items):
-                try:
-                    if not ok_items:
-                        return []
-                    kept = []
-                    skipped = []
-                    min_price, max_price, price_diag = exec_mod._entry_price_bounds()
-                    for item in ok_items:
-                        symbol = exec_mod._pick_symbol(item)
-                        side = exec_mod._row_side(item)
-                        price = exec_mod._pick_price(item)
-                        reason = ""
-                        detail: dict[str, Any] = {}
-                        if price > 0 and min_price > 0 and price < min_price:
-                            reason = "price_below_entry_min_price"
-                            detail = {"price": price, "min_price": min_price, "max_price": max_price, "min_notional_100": round(price * 100, 1)}
-                        elif price > 0 and max_price > 0 and price > max_price:
-                            reason = "price_over_entry_max_price"
-                            detail = {"price": price, "min_price": min_price, "max_price": max_price, "min_notional_100": round(price * 100, 1)}
-                        else:
-                            daily_blocked, daily_reason, daily_detail = exec_mod._daily_risk_block_reason(symbol, side)
-                            if daily_blocked:
-                                reason = str(daily_reason or "DAILY_RISK_BLOCK")
-                                detail = {"source": "daily_risk_pre_approval", "detail": daily_detail}
-                            else:
-                                restricted, until = exec_mod._is_trade_restricted_symbol(symbol)
-                                if restricted:
-                                    reason = "trade_restricted"
-                                    detail = {"until": str(until)}
-                                else:
-                                    sell_rejected, reject_reason = exec_mod._is_sell_reject_cached(symbol, side)
-                                    if sell_rejected:
-                                        reason = "sell_reject_cache"
-                                        detail = {"detail": str(reject_reason)}
-                        if reason:
-                            row = {"symbol": symbol, "side": side, "reason": reason, **detail}
-                            skipped.append(row)
-                            logger.warning("[SUMMARY AI APPROVAL DIAG] skipped symbol=%s side=%s reason=%s detail=%s", symbol, side, reason, detail)
-                        else:
-                            kept.append(item)
-                    counts: dict[str, int] = {}
-                    for s in skipped:
-                        r = str(s.get("reason") or "UNKNOWN")
-                        counts[r] = counts.get(r, 0) + 1
-                    if skipped:
-                        logger.warning("[SUMMARY AI APPROVAL DIAG] filter result before=%s after=%s skipped=%s counts=%s min_price=%s max_price=%s price_diag=%s skipped_head=%s", len(ok_items), len(kept), len(skipped), counts, min_price, max_price, price_diag, skipped[:80])
-                    else:
-                        logger.info("[SUMMARY AI APPROVAL DIAG] filter passed before=%s after=%s min_price=%s max_price=%s price_diag=%s", len(ok_items), len(kept), min_price, max_price, price_diag)
-                    return kept
-                except Exception:
-                    logger.exception("[SUMMARY AI APPROVAL DIAG] patched filter failed; fallback original")
-                    return orig_filter(ok_items)
-            _patched_filter_blocked_ai_ok_items._summary_ai_approval_diag_v1 = True  # type: ignore[attr-defined]
-            _patched_filter_blocked_ai_ok_items._original = orig_filter  # type: ignore[attr-defined]
-            exec_mod._filter_blocked_ai_ok_items = _patched_filter_blocked_ai_ok_items
+        # executor._filter_blocked_ai_ok_items のラップ (承認前 diag フィルタ) は撤去した。
+        # executor.py:1664 の core filter watcher が 0.5 秒ごとに _ensure_core_filter() で
+        # モジュール属性を _base_filter_blocked_ai_ok_items へ戻し、一度戻すと誰も
+        # 再 install しない。install 直後 0.5 秒未満しか生存できない死にラッパーだった
+        # (実測確認済み)。price bound / daily risk / trade restricted / sell reject の
+        # 各判定は executor 本体側にも実装があるので機能欠落はない。
 
         _SUMMARY_AI_APPROVAL_DIAG_PATCHED = True
         logger.warning("[SUMMARY AI APPROVAL DIAG] installed price_min_override=%.0f executor_default_min=%s", min_override, getattr(exec_mod, "DEFAULT_MIN_PRICE_FOR_ENTRY", None))
