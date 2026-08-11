@@ -201,13 +201,54 @@ def _install_runtime_defaults() -> bool:
         return False
 
 
-def _install_summary_pending_age_relax() -> bool:
+def _pending_age_relax_safe_float(v, default: float) -> float:
     try:
-        from core.startup.summary_entry_pending_age_relax_patch import install as _install_age_relax
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
 
-        ok = bool(_install_age_relax())
-        logger.warning("[USERCUSTOMIZE] summary pending age relax ok=%s max_age=%s", ok, os.getenv("SUMMARY_ENTRY_PENDING_MAX_AGE_SEC"))
-        return ok
+
+def _pending_age_relax_raise_min_env(name: str, minimum: float):
+    old = os.environ.get(name)
+    cur = _pending_age_relax_safe_float(old, minimum)
+    if old is None or cur < minimum:
+        os.environ[name] = str(int(minimum) if float(minimum).is_integer() else minimum)
+    return old, os.environ.get(name, "")
+
+
+def _install_summary_pending_age_relax() -> bool:
+    # core/startup/summary_entry_pending_age_relax_patch.py (V1-SUMMARY-PENDING-AGE-900S) を native化。
+    # SUMMARY_AI 承認行が pending 登録に届いても、既定の age limit (180s) が厳しすぎて
+    # no_pending_registered として弾かれていた問題への対処。pending 登録の stale 判定 window
+    # のみを緩和し (下限900s)、stale 保護自体は無効化しない。
+    try:
+        minimum = _pending_age_relax_safe_float(os.environ.get("SUMMARY_ENTRY_PENDING_RELAX_MIN_AGE_SEC"), 900.0)
+        changed = {}
+        for name in (
+            "SUMMARY_ENTRY_PENDING_MAX_AGE_SEC",
+            "SUMMARY_AI_PENDING_MAX_AGE_SEC",
+            "SUMMARY_AI_MAX_CANDIDATE_AGE_SEC",
+            "ENTRY_CANDIDATE_MAX_AGE_SEC",
+        ):
+            old, new = _pending_age_relax_raise_min_env(name, minimum)
+            changed[name] = {"old": old, "new": new}
+
+        # summary_entry_pending_existing_fix_patch は env 値を都度動的に読むので、
+        # 再installしても無害 (念のため未installなら確実に有効化しておく)。
+        try:
+            from core.startup import summary_entry_pending_existing_fix_patch
+
+            summary_entry_pending_existing_fix_patch.install()
+        except Exception:
+            logger.debug("[USERCUSTOMIZE] summary pending age relax: existing fix install check skipped", exc_info=True)
+
+        logger.warning(
+            "[USERCUSTOMIZE] summary pending age relax ok=True max_age=%s (min_age=%s changed=%s)",
+            os.getenv("SUMMARY_ENTRY_PENDING_MAX_AGE_SEC"), minimum, changed,
+        )
+        return True
     except Exception:
         logger.exception("[USERCUSTOMIZE] summary pending age relax failed")
         return False
