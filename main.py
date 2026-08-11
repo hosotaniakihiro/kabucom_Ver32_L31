@@ -192,10 +192,18 @@ def _factory_position_state():
 
 
 def _install_main_runtime_patches():
+    try:
+        from trading.handlers.entry_controller import cleanup_stale_100368_sell_reject_cache
+
+        cleanup_stale_100368_sell_reject_cache()
+    except Exception:
+        logger.exception("[MAIN RUNTIME PATCH] stale 100368 sell reject cache cleanup failed")
+
     patches = [
         ("core.startup.summary_scheduler_shutdown_guard_patch", "install"),
         ("core.startup.nas_sqlite_io_guard_patch", "install"),
-        ("core.startup.entry_controller_runtime_reject_patch", "install"),
+        # entry_controller_runtime_reject_patch は trading/handlers/entry_controller.py の
+        # cleanup_stale_100368_sell_reject_cache() へ native化済み (直接呼び出しは下記)。
         ("core.startup.fast_startup_runtime_patch", "install"),
         ("core.startup.summary_main_memory_latest_1m_patch", "install"),
         ("core.startup.summary_mtf_diff_from_1m_patch", "install"),

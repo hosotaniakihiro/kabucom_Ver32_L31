@@ -2581,6 +2581,42 @@ def _kabu_norm_code(v: Any) -> str:
         return ""
 
 
+def cleanup_stale_100368_sell_reject_cache() -> int:
+    """core/startup/entry_controller_runtime_reject_patch.py (V6) の native化。
+
+    古いバージョンや起動時パッチで 100368 (信用新規抑止) が sell_order_reject_cache に
+    入っていた場合、起動直後に削除する。100368 は銘柄個別SELL NGではなく、API側の
+    信用新規抑止応答として扱うため、キャッシュに残すと翌サイクル以降の候補が
+    不当に消える。main.py の起動シーケンスから1回だけ呼ばれる想定。
+    """
+    removed = 0
+    try:
+        from global_state import global_data
+
+        cache = getattr(global_data, "sell_order_reject_cache", None)
+        if not isinstance(cache, dict):
+            return 0
+
+        for sym, rec in list(cache.items()):
+            if not isinstance(rec, dict):
+                continue
+            code = _kabu_norm_code(rec.get("code"))
+            msg = str(rec.get("message") or "")
+            if code == KABU_CODE_CREDIT_NEW_ORDER_SUPPRESSED or ("信用新規" in msg and "抑止" in msg):
+                cache.pop(sym, None)
+                removed += 1
+
+        if removed:
+            logger.warning(
+                "[ENTRY REJECT PATCH] stale 100368 sell reject cache cleaned removed=%s",
+                removed,
+            )
+        return removed
+    except Exception:
+        logger.exception("[ENTRY REJECT PATCH] stale 100368 cache cleanup failed")
+        return removed
+
+
 def _kabu_last_send_error() -> dict:
     try:
         from kabu_api.send_order import get_last_send_order_error
