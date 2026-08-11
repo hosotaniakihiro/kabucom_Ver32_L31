@@ -192,14 +192,8 @@ def _install_summary_controller_ready_mtf_patch() -> None:
         logger.exception("[STARTUP.RUNTIME] summary controller ready mtf patch install failed")
 
 
-def _install_ranking_entry_runtime_fix_patch() -> None:
-    try:
-        from core.startup.ranking_entry_runtime_fix_patch import install as install_ranking_fix
-        ok = install_ranking_fix()
-        logger.warning("[STARTUP.RUNTIME] ranking entry runtime fix patch installed=%s", ok)
-    except Exception:
-        logger.exception("[STARTUP.RUNTIME] ranking entry runtime fix patch install failed")
-
+# ranking_entry_runtime_fix_patch は trading/ranking/entry_from_ranking.py の
+# _normalize_ranking_row_for_entry() / save_ranking_pseudo_technicals() へ native化済み。
 
 def _restore_summary_db_seed_after_bootstrap(summary_db_path) -> None:
     try:
@@ -212,7 +206,6 @@ def _restore_summary_db_seed_after_bootstrap(summary_db_path) -> None:
     _install_push_summary_history_patch()
     _install_global_context_summary_repair_patch()
     _install_summary_controller_ready_mtf_patch()
-    _install_ranking_entry_runtime_fix_patch()
 
 
 def safe_migration_phase(summary_dir, ranking_dir) -> None:

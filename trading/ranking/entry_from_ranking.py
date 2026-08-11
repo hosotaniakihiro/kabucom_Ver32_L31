@@ -54,11 +54,11 @@ from config.ranking_entry_config import RANKING_ENTRY_CONFIG, is_time_allowed
 
 try:
     from trading.ranking.ranking_technical_store import (
-        save_ranking_pseudo_technicals,
+        save_ranking_pseudo_technicals as _save_ranking_pseudo_technicals_core,
         attach_ranking_technicals,
     )
 except Exception:  # pragma: no cover
-    save_ranking_pseudo_technicals = None
+    _save_ranking_pseudo_technicals_core = None
     attach_ranking_technicals = None
 
 logger = logging.getLogger(__name__)
@@ -1006,7 +1006,7 @@ def _normalize_ranking_entry_units(row: Dict[str, Any]) -> Dict[str, Any]:
     return row
 
 
-def _normalize_ranking_row_for_entry(row: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_ranking_row_for_entry_core(row: Dict[str, Any]) -> Dict[str, Any]:
     row = dict(row)
     symbol = str(_first(row, ("symbol", "Symbol", "code", "コード", "銘柄コード"), "")).strip()
     if symbol.endswith(".0") and symbol[:-2].isdigit():
@@ -1054,6 +1054,211 @@ def _normalize_ranking_row_for_entry(row: Dict[str, Any]) -> Dict[str, Any]:
         row = _normalize_ranking_entry_units(row)
 
     return row
+
+
+# --- ranking_entry_runtime_fix_patch (native化, 元 core/startup/ranking_entry_runtime_fix_patch.py V1.3) ---
+# ranking_technical attached symbols=0 や、出来高ランキング値が表示単位のままでMIN_VOLUMEに
+# 届かずVOLUME_NGになる問題への対処。V1.3時点で残っていたのは (a) 単位補正が二重適用されない
+# ようにする再補正抑止フラグと、(b) technical不足銘柄をsummary historyから補うfallbackの2点。
+# (旧パッチが持っていた ranking_entry_flat_price_guard_patch 再installロジックは、
+# 差し替え対象が既に entry_from_ranking.py へ直接本文化されており当時から no-op だった)
+def _ranking_entry_fix_env_bool(name: str, default: bool = True) -> bool:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return bool(default)
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _ranking_entry_fix_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _ranking_entry_fix_flag_on(v: Any) -> bool:
+    try:
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        return False
+
+
+def _ranking_entry_fix_looks_already_yen_turnover(turnover: float, *, min_turnover: float) -> bool:
+    if turnover <= 0:
+        return False
+    yen_floor = _ranking_entry_fix_env_float("RANKING_ENTRY_TURNOVER_YEN_FLOOR", 100000.0)
+    if turnover >= yen_floor:
+        return True
+    if turnover >= min_turnover:
+        return True
+    return False
+
+
+def _normalize_ranking_row_for_entry(row: Dict[str, Any]) -> Dict[str, Any]:
+    out = _normalize_ranking_row_for_entry_core(row)
+    try:
+        if not _ranking_entry_fix_env_bool("RANKING_ENTRY_NORMALIZE_VOLUME_UNITS", True):
+            return out
+
+        if _ranking_entry_fix_flag_on(out.get("ranking_entry_units_finalized")):
+            return out
+
+        # NOTE: _normalize_ranking_row_for_entry_core は _ranking_unit_fix_enabled()
+        # (DBプロセス除外) を満たす限り常に ranking_entry_units_finalized=1 を設定して
+        # 完了する (旧 ranking_entry_volume_unit_patch 由来、既に本文化済み) ため、
+        # ここに到達するのは DBプロセス等でスコープ外だったケースのみ。
+        # 旧パッチ自身のフォールバック補正ロジックをそのまま保持する。
+        min_volume, min_turnover = _ranking_entry_volume_thresholds()
+        volume_mul = _ranking_entry_fix_env_float("RANKING_ENTRY_VOLUME_UNIT_MULTIPLIER", 1000.0)
+        turnover_mul = _ranking_entry_fix_env_float("RANKING_ENTRY_TURNOVER_UNIT_MULTIPLIER", 1000000.0)
+
+        price = _safe_float(out.get("price") or out.get("current_price") or out.get("close_price"), 0.0)
+        volume = _safe_float(out.get("volume") if out.get("volume") is not None else out.get("trading_volume"), 0.0)
+        turnover = _safe_float(out.get("turnover") if out.get("turnover") is not None else out.get("trading_value"), 0.0)
+        raw_volume = volume
+        raw_turnover = turnover
+
+        already_volume_fixed = _ranking_entry_fix_flag_on(out.get("ranking_volume_unit_fixed")) or _safe_float(out.get("ranking_volume_unit_multiplier"), 0.0) > 1
+        already_turnover_fixed = _ranking_entry_fix_flag_on(out.get("ranking_turnover_unit_fixed")) or _safe_float(out.get("ranking_turnover_unit_multiplier"), 0.0) > 1
+
+        if (not already_volume_fixed) and volume > 0 and volume < min_volume and volume_mul > 1:
+            candidate_volume = volume * volume_mul
+            if candidate_volume >= min_volume:
+                volume = candidate_volume
+                out["volume"] = volume
+                out["trading_volume"] = volume
+                out["ranking_volume_raw"] = raw_volume
+                out["ranking_volume_unit_multiplier"] = volume_mul
+                out["ranking_volume_unit_fixed"] = 1
+
+        implied_turnover = price * volume if price > 0 and volume > 0 else 0.0
+
+        if not already_turnover_fixed:
+            if turnover > 0 and turnover < min_turnover and turnover_mul > 1:
+                if (not _ranking_entry_fix_looks_already_yen_turnover(turnover, min_turnover=min_turnover)) and implied_turnover > 0:
+                    candidate_turnover = turnover * turnover_mul
+                    upper = implied_turnover * _ranking_entry_fix_env_float("RANKING_ENTRY_TURNOVER_IMPLIED_MAX_RATIO", 20.0)
+                    if candidate_turnover >= min_turnover and candidate_turnover <= max(upper, min_turnover):
+                        turnover = max(candidate_turnover, implied_turnover)
+                        out["ranking_turnover_raw"] = raw_turnover
+                        out["ranking_turnover_unit_multiplier"] = turnover_mul
+                        out["ranking_turnover_unit_fixed"] = 1
+                elif implied_turnover > turnover:
+                    turnover = implied_turnover
+            elif implied_turnover > turnover:
+                turnover = implied_turnover
+
+        if turnover > 0:
+            out["turnover"] = turnover
+            out["trading_value"] = turnover
+
+        if raw_volume != volume or raw_turnover != turnover:
+            logger.info(
+                "[RANKING ENTRY FIX] normalized units symbol=%s price=%s volume %s->%s turnover %s->%s min_volume=%s min_turnover=%s already_vol=%s already_turn=%s",
+                out.get("symbol"), price, raw_volume, volume, raw_turnover, turnover, min_volume, min_turnover,
+                already_volume_fixed, already_turnover_fixed,
+            )
+    except Exception:
+        logger.exception("[RANKING ENTRY FIX] normalize row wrapper failed")
+    return out
+
+
+def _ranking_entry_fix_get_gc_history(tf: int) -> pd.DataFrame:
+    try:
+        from core.global_context.context import global_context as GC
+        try:
+            df = GC.get_summary_history(tf, source="push")
+        except TypeError:
+            df = GC.get_summary_history(tf)
+        if isinstance(df, pd.DataFrame):
+            return df.copy()
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+_RANKING_ENTRY_FIX_TECH_COLS = (
+    "ma5", "ma25", "ma75", "rsi", "macd", "signal", "macd_hist", "hist",
+    "atr", "slope", "slope_atr_scaled", "vwap", "score_buy", "score_sell",
+    "score_total", "ranking_tech_score", "technical_ready", "symbol_hist_len",
+)
+
+
+def _ranking_entry_fix_nonzero(v: Any) -> bool:
+    try:
+        return abs(float(v)) > 1e-12
+    except Exception:
+        return False
+
+
+def _ranking_entry_fix_latest_summary_tech_map(symbols: set) -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
+    for tf in (1, 3, 5):
+        df = _ranking_entry_fix_get_gc_history(tf)
+        if df.empty or "symbol" not in df.columns:
+            continue
+        work = df.copy()
+        work["symbol"] = work["symbol"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+        work = work[work["symbol"].isin(symbols)].copy()
+        if work.empty:
+            continue
+        if "datetime" in work.columns:
+            work["datetime"] = pd.to_datetime(work["datetime"], errors="coerce")
+            work = work.sort_values(["symbol", "datetime"], kind="stable")
+        latest = work.groupby("symbol", as_index=False).tail(1)
+        for _, r in latest.iterrows():
+            sym = str(r.get("symbol") or "").strip()
+            if not sym or sym in result:
+                continue
+            tech: Dict[str, Any] = {}
+            for c in _RANKING_ENTRY_FIX_TECH_COLS:
+                if c in r.index:
+                    tech[c] = r.get(c)
+            if "hist" in tech and "macd_hist" not in tech:
+                tech["macd_hist"] = tech.get("hist")
+            if "ranking_tech_score" not in tech:
+                tech["ranking_tech_score"] = _safe_float(tech.get("score_total"), 0.0)
+            ready = any(_ranking_entry_fix_nonzero(tech.get(c)) for c in ("macd", "signal", "rsi", "slope", "slope_atr_scaled", "score_total"))
+            tech["ranking_tech_ready"] = 1 if ready else 0
+            tech["ranking_tech_reason"] = f"SUMMARY_HISTORY_FALLBACK_TF{tf}" if ready else f"SUMMARY_HISTORY_FALLBACK_WEAK_TF{tf}"
+            tech["ranking_tech_datetime"] = r.get("datetime") if "datetime" in r.index else None
+            tech["ranking_tech_db"] = "summary_history_cache"
+            result[sym] = tech
+    return result
+
+
+def save_ranking_pseudo_technicals(rows: List[Dict[str, Any]], *args, **kwargs) -> Dict[str, Dict[str, Any]]:
+    base: Dict[str, Dict[str, Any]] = {}
+    try:
+        if callable(_save_ranking_pseudo_technicals_core):
+            base = _save_ranking_pseudo_technicals_core(rows, *args, **kwargs) or {}
+    except Exception:
+        logger.exception("[RANKING ENTRY FIX] original save_ranking_pseudo_technicals failed")
+        base = {}
+
+    try:
+        symbols = {str(r.get("symbol") or "").strip() for r in rows or [] if str(r.get("symbol") or "").strip()}
+        missing = {s for s in symbols if s not in base}
+        fallback = _ranking_entry_fix_latest_summary_tech_map(missing)
+        if fallback:
+            merged = dict(base)
+            merged.update(fallback)
+            logger.warning(
+                "[RANKING ENTRY FIX] technical fallback attached base=%s fallback=%s total=%s missing_symbols=%s",
+                len(base), len(fallback), len(merged), len(missing),
+            )
+            return merged
+        logger.warning(
+            "[RANKING ENTRY FIX] technical fallback none base=%s symbols=%s missing=%s",
+            len(base), len(symbols), len(missing),
+        )
+        return base
+    except Exception:
+        logger.exception("[RANKING ENTRY FIX] fallback tech map failed")
+        return base
 
 
 def _prepare_rows(ranking_df: pd.DataFrame) -> List[Dict[str, Any]]:
