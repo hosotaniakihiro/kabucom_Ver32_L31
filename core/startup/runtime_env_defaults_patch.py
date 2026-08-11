@@ -313,8 +313,38 @@ def _install_yahoo_parallel_empty_cooldown(context: str) -> bool:
     return _safe_install("yahoo parallel empty cooldown", context, DB_CONTEXTS | TRADING_CONTEXTS | GENERIC_HELPER_CONTEXTS, "DISABLE_YAHOO_PARALLEL_EMPTY_COOLDOWN_PATCH", "yahoo_parallel_empty_cooldown_patch")
 
 
+_RANKING_LEGACY_FLUSH_CONTEXTS = DB_CONTEXTS | TRADING_CONTEXTS | GENERIC_HELPER_CONTEXTS
+
+
 def _install_ranking_legacy_inline_flush(context: str) -> bool:
-    return _safe_install("ranking legacy inline flush", context, DB_CONTEXTS | TRADING_CONTEXTS | GENERIC_HELPER_CONTEXTS, "DISABLE_RANKING_LEGACY_INLINE_FLUSH_PATCH", "ranking_legacy_inline_flush_patch")
+    """旧 core/startup/ranking_legacy_inline_flush_patch.py を畳んだもの。
+
+    あのファイルは自称 compatibility wrapper で、env を 8 件 setdefault してから
+    ranking_writer_lock_buffer_relief_patch を install するだけの中継だった
+    (モジュール属性の書き換えはゼロ)。唯一の呼び出し元がここだったので直接呼ぶ。
+    env 適用のタイミングは旧構成と同じ「context 一致かつ DISABLE でない場合のみ、
+    relief patch の install 直前」に揃えてある。
+    """
+    if context not in _RANKING_LEGACY_FLUSH_CONTEXTS:
+        return False
+    if os.environ.get("DISABLE_RANKING_LEGACY_INLINE_FLUSH_PATCH", "").strip() == "1":
+        logger.warning("[RUNTIME ENV DEFAULTS PATCH] ranking legacy inline flush disabled by env")
+        return False
+    try:
+        os.environ.setdefault("RANKING_WRITER_DISABLE_LEGACY_ON_LOCK_RELIEF", "1")
+        os.environ.setdefault("RANKING_WRITER_RETRY_KEEP_LEGACY", "0")
+        os.environ.setdefault("RANKING_WRITER_RETRY_LEGACY_MAX_ROWS", "0")
+        os.environ.setdefault("RANKING_WRITER_RETRY_RAW_MAX_ROWS", "3000")
+        os.environ.setdefault("RANKING_WRITER_RETRY_SNAPSHOT_MAX_ROWS", "3000")
+        os.environ.setdefault("RANKING_WRITER_BUFFER_SIZE", "1000")
+        os.environ.setdefault("RANKING_WRITER_FLUSH_ON_THRESHOLD", "0")
+        os.environ.setdefault("RANKING_DB_WRITER_BUSY_TIMEOUT_MS", "30000")
+    except Exception:
+        logger.exception("[RUNTIME ENV DEFAULTS PATCH] ranking legacy inline flush env failed")
+    return _safe_install(
+        "ranking writer lock buffer relief", context, _RANKING_LEGACY_FLUSH_CONTEXTS,
+        "DISABLE_RANKING_LEGACY_INLINE_FLUSH_PATCH", "ranking_writer_lock_buffer_relief_patch",
+    )
 
 
 def install() -> bool:
