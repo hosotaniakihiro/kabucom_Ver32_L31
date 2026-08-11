@@ -1040,12 +1040,14 @@ def _install_entrypoint_runtime_patches() -> None:
     # _close_db_position (native化した _mark_db_position_closing 分岐) へ
     # インライン化済みのため install 呼び出しを削除した。
 
+    # exit_unfilled_reprice_runtime_patch は trading/exit/executor.py の
+    # start_exit_unfilled_reprice_loop() へ native化済み。
     try:
-        from core.startup.exit_unfilled_reprice_runtime_patch import install as install_exit_unfilled_reprice_patch
+        from trading.exit.executor import start_exit_unfilled_reprice_loop
 
-        install_exit_unfilled_reprice_patch()
+        start_exit_unfilled_reprice_loop()
     except Exception:
-        logger.exception("[startup.entrypoint] exit unfilled reprice patch install failed")
+        logger.exception("[startup.entrypoint] exit unfilled reprice loop start failed")
 
     try:
         from trading.exit.executor import start_exit_fill_confirm_loop

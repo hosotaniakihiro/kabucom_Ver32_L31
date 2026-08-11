@@ -1541,9 +1541,272 @@ def start_exit_closing_stale_reconcile_loop() -> bool:
     return True
 
 
+# ============================================================
+# exit_unfilled_reprice_runtime_patch (native化)
+# 返済指値が未約定で残った場合、短時間で取消し、建玉をOPENへ戻して
+# execute_exit() をもう一度呼ぶ。最終fallbackで成行を使う場合も、
+# EXIT_REST_FULL_BOARD_ENABLED / EXIT_LIMIT_BOARD_TOUCH_ENABLED は
+# その1回だけ一時的にOFFにし、呼び出し後に必ず復元する。
+# ============================================================
+_exit_unfilled_reprice_installed = False
+_exit_unfilled_reprice_thread_started = False
+_exit_unfilled_reprice_first_seen: dict[str, float] = {}
+_exit_unfilled_reprice_cancel_sent: dict[str, float] = {}
+_exit_unfilled_reprice_retry_rounds: dict[str, int] = {}
+_exit_unfilled_reprice_lock = threading.RLock()
+
+
+def _exit_unfilled_reprice_env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return bool(default)
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _exit_unfilled_reprice_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        return float(v) if v not in (None, "") else float(default)
+    except Exception:
+        return float(default)
+
+
+def _exit_unfilled_reprice_env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        return int(float(v)) if v not in (None, "") else int(default)
+    except Exception:
+        return int(default)
+
+
+def _exit_unfilled_reprice_f(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v) if v not in (None, "") else float(default)
+    except Exception:
+        return float(default)
+
+
+def _exit_unfilled_reprice_i(v: Any, default: int = 0) -> int:
+    try:
+        return int(float(v)) if v not in (None, "") else int(default)
+    except Exception:
+        return int(default)
+
+
+def _exit_unfilled_reprice_sym(v: Any) -> str:
+    s = str(v or "").strip()
+    return s[:-2] if s.endswith(".0") else s
+
+
+def _exit_unfilled_reprice_remaining(order: dict[str, Any]) -> tuple[float, float, float]:
+    qty = _exit_unfilled_reprice_f(order.get("OrderQty", order.get("Qty", 0)), 0.0)
+    cum = _exit_unfilled_reprice_f(order.get("CumQty", order.get("ContractedQty", 0)), 0.0)
+    leaves = _exit_unfilled_reprice_f(order.get("LeavesQty", 0), 0.0)
+    if leaves <= 0 and qty > 0:
+        leaves = max(qty - cum, 0.0)
+    if qty <= 0 and leaves > 0:
+        qty = leaves + cum
+    return qty, cum, leaves
+
+
+def _exit_unfilled_reprice_order_elapsed(order_id: str, order: dict[str, Any], now_ts: float) -> float:
+    for key in ("OrderTime", "RecvTime", "ReceivedTime", "RegisterTime", "UpdateTime"):
+        raw = order.get(key)
+        if not raw:
+            continue
+        try:
+            s = str(raw).strip().replace("T", " ")
+            if "+" in s:
+                s = s.split("+", 1)[0]
+            if s.endswith("Z"):
+                s = s[:-1]
+            t = dt.datetime.fromisoformat(s)
+            return max(0.0, (dt.datetime.now() - t).total_seconds())
+        except Exception:
+            pass
+    if order_id not in _exit_unfilled_reprice_first_seen:
+        _exit_unfilled_reprice_first_seen[order_id] = now_ts
+        logger.warning("[EXIT UNFILLED REPRICE] first_seen order_id=%s symbol=%s", order_id, order.get("Symbol"))
+    return max(0.0, now_ts - _exit_unfilled_reprice_first_seen[order_id])
+
+
+def _exit_unfilled_reprice_is_close_limit_order(order: dict[str, Any], cancelable_states: set[int]) -> bool:
+    state = _exit_unfilled_reprice_i(order.get("State"), 0)
+    price = _exit_unfilled_reprice_f(order.get("Price"), 0.0)
+    front = _exit_unfilled_reprice_i(order.get("FrontOrderType"), 0)
+    cash_margin = _exit_unfilled_reprice_i(order.get("CashMargin"), 0)
+    qty, cum, leaves = _exit_unfilled_reprice_remaining(order)
+    is_limit = front == 20 or (front != 10 and price > 0)
+    is_open = leaves > 0 or (qty > 0 and cum < qty)
+    is_close = cash_margin == 3
+    return bool(is_close and is_limit and is_open and state in cancelable_states)
+
+
+def _exit_unfilled_reprice_restore_position_open(symbol: str) -> None:
+    symbol = _exit_unfilled_reprice_sym(symbol)
+    try:
+        session = Session_position()
+        try:
+            row = (
+                session.query(Position)
+                .filter(Position.symbol == symbol)
+                .filter(Position.status == "CLOSING")
+                .first()
+            )
+            if row:
+                row.status = "OPEN"
+                if hasattr(row, "updated_at"):
+                    row.updated_at = dt.datetime.now()
+                session.commit()
+                logger.warning("[EXIT UNFILLED REPRICE] DB restored OPEN symbol=%s", symbol)
+            else:
+                session.rollback()
+        finally:
+            session.close()
+    except Exception:
+        logger.exception("[EXIT UNFILLED REPRICE] DB restore OPEN failed symbol=%s", symbol)
+
+    try:
+        pos = getattr(global_data, "open_positions", None)
+        if isinstance(pos, dict):
+            p = pos.get(symbol)
+            if isinstance(p, dict):
+                p["status"] = "OPEN"
+                p["updated_at"] = dt.datetime.now()
+    except Exception:
+        logger.debug("[EXIT UNFILLED REPRICE] memory restore skipped", exc_info=True)
+
+
+def _exit_unfilled_reprice_execute_with_optional_market(symbol: str, *, reason: str, exit_price: float, market_fallback: bool) -> None:
+    if not market_fallback:
+        execute_exit(symbol, reason=reason, exit_price=exit_price)
+        return
+
+    saved = {
+        "EXIT_REST_FULL_BOARD_ENABLED": os.environ.get("EXIT_REST_FULL_BOARD_ENABLED"),
+        "EXIT_LIMIT_BOARD_TOUCH_ENABLED": os.environ.get("EXIT_LIMIT_BOARD_TOUCH_ENABLED"),
+    }
+    try:
+        os.environ["EXIT_REST_FULL_BOARD_ENABLED"] = "0"
+        os.environ["EXIT_LIMIT_BOARD_TOUCH_ENABLED"] = "0"
+        logger.warning("[EXIT UNFILLED REPRICE] temporary MARKET fallback enabled symbol=%s reason=%s", symbol, reason)
+        execute_exit(symbol, reason=reason, exit_price=exit_price)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        logger.warning("[EXIT UNFILLED REPRICE] restored exit board env after MARKET fallback symbol=%s", symbol)
+
+
+def _exit_unfilled_reprice_retry_exit(symbol: str, order: dict[str, Any]) -> None:
+    symbol = _exit_unfilled_reprice_sym(symbol)
+    if not symbol:
+        return
+    market_fallback = False
+    with _exit_unfilled_reprice_lock:
+        r = _exit_unfilled_reprice_retry_rounds.get(symbol, 0)
+        max_rounds = _exit_unfilled_reprice_env_int("EXIT_UNFILLED_REPRICE_MAX_ROUNDS", 1)
+        if r >= max_rounds:
+            if _exit_unfilled_reprice_env_bool("EXIT_UNFILLED_REPRICE_MARKET_ON_FINAL", True):
+                market_fallback = True
+                logger.warning("[EXIT UNFILLED REPRICE] final retry will use one-shot MARKET fallback symbol=%s round=%s", symbol, r)
+            else:
+                logger.warning("[EXIT UNFILLED REPRICE] max retry reached symbol=%s round=%s", symbol, r)
+                return
+        _exit_unfilled_reprice_retry_rounds[symbol] = r + 1
+
+    try:
+        ref_price = _exit_unfilled_reprice_f(order.get("Price"), 0.0)
+        reason = f"unfilled_exit_reprice_round_{_exit_unfilled_reprice_retry_rounds.get(symbol, 0)}"
+        if market_fallback:
+            reason += "_market_fallback"
+        logger.warning("[EXIT UNFILLED REPRICE] retry execute_exit symbol=%s ref_price=%s reason=%s market=%s", symbol, ref_price, reason, market_fallback)
+        _exit_unfilled_reprice_execute_with_optional_market(symbol, reason=reason, exit_price=ref_price if ref_price > 0 else 1.0, market_fallback=market_fallback)
+    except Exception:
+        logger.exception("[EXIT UNFILLED REPRICE] retry execute_exit failed symbol=%s", symbol)
+
+
+def _exit_unfilled_reprice_loop() -> None:
+    try:
+        import force_cancel_loop as fcl
+    except Exception:
+        logger.exception("[EXIT UNFILLED REPRICE] import force_cancel_loop failed")
+        return
+    get_orders = getattr(fcl, "get_orders", None)
+    cancel_order = getattr(fcl, "cancel_order", None)
+    if not callable(get_orders) or not callable(cancel_order):
+        logger.warning("[EXIT UNFILLED REPRICE] get_orders/cancel_order missing")
+        return
+
+    interval = max(0.2, _exit_unfilled_reprice_env_float("EXIT_UNFILLED_CHECK_INTERVAL_SEC", 0.5))
+    cancel_after = max(0.5, _exit_unfilled_reprice_env_float("EXIT_UNFILLED_CANCEL_SEC", 1.2))
+    cancelable_states = set(getattr(fcl, "CANCELABLE_STATES", {1, 2, 3, 4}))
+    logger.warning("[EXIT UNFILLED REPRICE] loop start interval=%.2fs cancel_after=%.2fs", interval, cancel_after)
+
+    while True:
+        active: set[str] = set()
+        try:
+            now_ts = time.time()
+            for order in get_orders() or []:
+                if not isinstance(order, dict):
+                    continue
+                order_id = str(order.get("OrderId") or order.get("ID") or "").strip()
+                if not order_id:
+                    continue
+                active.add(order_id)
+                if not _exit_unfilled_reprice_is_close_limit_order(order, cancelable_states):
+                    continue
+                symbol = _exit_unfilled_reprice_sym(order.get("Symbol"))
+                qty, cum, leaves = _exit_unfilled_reprice_remaining(order)
+                elapsed = _exit_unfilled_reprice_order_elapsed(order_id, order, now_ts)
+                logger.warning("[EXIT UNFILLED REPRICE] watch order_id=%s symbol=%s elapsed=%.2fs remain=%.0f qty=%.0f cum=%.0f price=%s", order_id, symbol, elapsed, leaves, qty, cum, order.get("Price"))
+                if elapsed < cancel_after:
+                    continue
+                if now_ts - _exit_unfilled_reprice_cancel_sent.get(order_id, 0.0) < 1.0:
+                    continue
+                logger.warning("[EXIT UNFILLED REPRICE] cancel close order_id=%s symbol=%s elapsed=%.2fs", order_id, symbol, elapsed)
+                cancel_order(order_id)
+                _exit_unfilled_reprice_cancel_sent[order_id] = now_ts
+                _exit_unfilled_reprice_restore_position_open(symbol)
+                if _exit_unfilled_reprice_env_bool("EXIT_UNFILLED_REPRICE_ENABLED", True):
+                    _exit_unfilled_reprice_retry_exit(symbol, order)
+                time.sleep(0.1)
+            for oid in list(_exit_unfilled_reprice_first_seen.keys()):
+                if oid not in active:
+                    _exit_unfilled_reprice_first_seen.pop(oid, None)
+                    _exit_unfilled_reprice_cancel_sent.pop(oid, None)
+        except Exception:
+            logger.exception("[EXIT UNFILLED REPRICE] loop error")
+        time.sleep(interval)
+
+
+def start_exit_unfilled_reprice_loop() -> bool:
+    """返済指値未約定の取消・再発注 (一時MARKET fallback込み) ループを起動する (冪等)。"""
+    global _exit_unfilled_reprice_installed, _exit_unfilled_reprice_thread_started
+    if _exit_unfilled_reprice_installed:
+        return True
+    if not _exit_unfilled_reprice_env_bool("EXIT_UNFILLED_REPRICE_ENABLED", True):
+        logger.warning("[EXIT UNFILLED REPRICE] disabled")
+        return False
+    if not _exit_unfilled_reprice_thread_started:
+        threading.Thread(target=_exit_unfilled_reprice_loop, daemon=True, name="exit_unfilled_reprice_loop").start()
+        _exit_unfilled_reprice_thread_started = True
+    _exit_unfilled_reprice_installed = True
+    logger.warning(
+        "[EXIT UNFILLED REPRICE] installed cancel_sec=%.2f max_rounds=%s market_on_final=%s temp_market=True",
+        _exit_unfilled_reprice_env_float("EXIT_UNFILLED_CANCEL_SEC", 1.2),
+        _exit_unfilled_reprice_env_int("EXIT_UNFILLED_REPRICE_MAX_ROUNDS", 1),
+        _exit_unfilled_reprice_env_bool("EXIT_UNFILLED_REPRICE_MARKET_ON_FINAL", True),
+    )
+    return True
+
+
 __all__ = [
     "set_exit_order_sender",
     "execute_exit",
     "start_exit_fill_confirm_loop",
     "start_exit_closing_stale_reconcile_loop",
+    "start_exit_unfilled_reprice_loop",
 ]
