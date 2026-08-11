@@ -121,7 +121,8 @@ def _background_heavy() -> None:
         # 実体は executor._filter_blocked_ai_ok_items のラップだけで、
         # executor.py:1664 の core filter watcher が install 直後 0.5 秒以内に
         # base へ戻し二度と再 install されないため、完全な死にコードだった。
-        lambda: _run_install("entry_affordability_runtime_patch", "core.startup.entry_affordability_runtime_patch"),
+        # entry_affordability_runtime_patch は trading/entry/summary_ai/candidates.py の
+        # build_summary_ai_entry_candidates() へ native化済みのため削除した。
         lambda: _run_install("push_summary_direct_ohlc_runtime_patch", "core.startup.push_summary_direct_ohlc_runtime_patch"),
         lambda: _run_install("summary_main_direct_push_force_patch:bg-final", "core.startup.summary_main_direct_push_force_patch"),
     ]

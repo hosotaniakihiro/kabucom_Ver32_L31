@@ -802,7 +802,7 @@ def _sell_candidates_from_prepared(df: pd.DataFrame, *, interval: int | str, top
     return out
 
 
-def build_summary_ai_entry_candidates(summary_df: pd.DataFrame, *, interval: int | str = 1, top_n: int = DEFAULT_TOP_N, min_buy_score: float = DEFAULT_MIN_BUY_SCORE, max_sell_score: float = DEFAULT_MAX_SELL_SCORE, min_volume: float = DEFAULT_MIN_VOLUME, min_price: float = DEFAULT_MIN_PRICE, require_buy_target: bool = False, exclude_etf_fund: bool = True, source: str = "SUMMARY") -> pd.DataFrame:
+def _build_summary_ai_entry_candidates_core(summary_df: pd.DataFrame, *, interval: int | str = 1, top_n: int = DEFAULT_TOP_N, min_buy_score: float = DEFAULT_MIN_BUY_SCORE, max_sell_score: float = DEFAULT_MAX_SELL_SCORE, min_volume: float = DEFAULT_MIN_VOLUME, min_price: float = DEFAULT_MIN_PRICE, require_buy_target: bool = False, exclude_etf_fund: bool = True, source: str = "SUMMARY") -> pd.DataFrame:
     top_n = _resolve_top_n(top_n)
     base = _prepare_base(summary_df, require_buy_target=require_buy_target, exclude_etf_fund=exclude_etf_fund)
     if base.empty:
@@ -817,6 +817,123 @@ def build_summary_ai_entry_candidates(summary_df: pd.DataFrame, *, interval: int
     out = pd.concat(frames, ignore_index=True, sort=False)
     logger.warning("[SUMMARY AI CANDIDATES] BUY_SELL_COMBINED_READY interval=%s source=%s buy_count=%s sell_count=%s total=%s top_n_each=%s buy_symbols=%s sell_symbols=%s", interval, source, len(buy_df) if isinstance(buy_df, pd.DataFrame) else 0, len(sell_df) if isinstance(sell_df, pd.DataFrame) else 0, len(out), top_n, _safe_symbols(buy_df, top_n), _safe_symbols(sell_df, top_n))
     return out.reset_index(drop=True)
+
+
+# --- entry_affordability_runtime_patch (native化, 元 core/startup/entry_affordability_runtime_patch.py) ---
+# AIに確認する前に、対象価格帯外/最低1単元でも予算上限を超える銘柄を除外する。
+def _entry_affordability_safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or v == "":
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def _entry_affordability_pick_price_from_row(row: Any) -> float:
+    try:
+        for key in (
+            "ai_disp_close",
+            "close_price",
+            "price",
+            "current_price",
+            "close",
+            "last_price",
+            "CurrentPrice",
+        ):
+            try:
+                v = row.get(key)
+            except Exception:
+                v = None
+            p = _entry_affordability_safe_float(v, 0.0)
+            if p > 0:
+                return p
+    except Exception:
+        pass
+    return 0.0
+
+
+def _entry_affordability_symbol_from_row(row: Any) -> str:
+    try:
+        s = str(row.get("symbol") or "").strip()
+        if s.endswith(".0"):
+            s = s[:-2]
+        return s
+    except Exception:
+        return ""
+
+
+def _entry_affordability_filter_candidates_df(df, *, label: str):
+    try:
+        from trading.entry.entry_budget import can_afford_min_lot, log_entry_budget_config
+    except Exception:
+        logger.exception("[ENTRY AFFORDABILITY PATCH] import failed")
+        return df
+
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return df
+
+        log_entry_budget_config(prefix="[ENTRY AFFORDABILITY PATCH]")
+
+        keep_idx: list[Any] = []
+        skipped: list[dict[str, Any]] = []
+
+        for idx, row in df.iterrows():
+            price = _entry_affordability_pick_price_from_row(row)
+            ok, diag = can_afford_min_lot(price)
+            if ok:
+                keep_idx.append(idx)
+                continue
+
+            skipped.append(
+                {
+                    "symbol": _entry_affordability_symbol_from_row(row),
+                    "side": str(row.get("side") or row.get("ai_side") or ""),
+                    "price": round(float(diag.get("price") or price or 0.0), 2),
+                    "min_price": round(float(diag.get("min_price") or 0.0), 2),
+                    "max_price": round(float(diag.get("max_price") or 0.0), 2),
+                    "configured_max_price": round(float(diag.get("configured_max_price") or 0.0), 2),
+                    "affordable_max_price": round(float(diag.get("affordable_max_price") or 0.0), 2),
+                    "budget_yen": round(float(diag.get("budget_yen") or 0.0), 0),
+                    "lot_size": int(diag.get("lot_size") or 0),
+                    "min_notional": round(float(diag.get("min_notional") or 0.0), 0),
+                    "reason": str(diag.get("reason") or "price_range_or_budget_ng"),
+                }
+            )
+
+        if not skipped:
+            return df
+
+        out = df.loc[keep_idx].copy().reset_index(drop=True)
+        logger.warning(
+            "[ENTRY AFFORDABILITY PATCH] AI_PRE_FILTER label=%s before=%s after=%s skipped=%s",
+            label,
+            len(df),
+            len(out),
+            skipped[:80],
+        )
+        return out
+
+    except Exception:
+        logger.exception("[ENTRY AFFORDABILITY PATCH] filter failed label=%s", label)
+        return df
+
+
+def build_summary_ai_entry_candidates(summary_df: pd.DataFrame, *, interval: int | str = 1, top_n: int = DEFAULT_TOP_N, min_buy_score: float = DEFAULT_MIN_BUY_SCORE, max_sell_score: float = DEFAULT_MAX_SELL_SCORE, min_volume: float = DEFAULT_MIN_VOLUME, min_price: float = DEFAULT_MIN_PRICE, require_buy_target: bool = False, exclude_etf_fund: bool = True, source: str = "SUMMARY") -> pd.DataFrame:
+    df = _build_summary_ai_entry_candidates_core(
+        summary_df,
+        interval=interval,
+        top_n=top_n,
+        min_buy_score=min_buy_score,
+        max_sell_score=max_sell_score,
+        min_volume=min_volume,
+        min_price=min_price,
+        require_buy_target=require_buy_target,
+        exclude_etf_fund=exclude_etf_fund,
+        source=source,
+    )
+    return _entry_affordability_filter_candidates_df(df, label="summary_ai_candidates_after_build_before_ai_gate")
 
 
 def build_summary_ai_sell_entry_candidates(summary_df: pd.DataFrame, *, interval: int | str = 1, top_n: int = DEFAULT_TOP_N, min_sell_score: float = 0.01, max_buy_score: float = 2.0, min_volume: float = DEFAULT_MIN_VOLUME, min_price: float = DEFAULT_MIN_PRICE, require_buy_target: bool = False, exclude_etf_fund: bool = True, source: str = "SUMMARY") -> pd.DataFrame:
