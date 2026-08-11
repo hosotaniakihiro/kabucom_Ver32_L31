@@ -225,21 +225,10 @@ def _merge_latest_over_history(cc, interval: int, hist: pd.DataFrame, latest: pd
     return out
 
 
-def _install_chained_health_patches() -> bool:
-    ok = False
-    try:
-        if os.environ.get("DISABLE_SUMMARY_SPOOL_QUARANTINE_PATCH", "").strip() != "1":
-            from . import summary_spool_quarantine_patch
-            ok = bool(summary_spool_quarantine_patch.install()) or ok
-    except Exception:
-        logger.exception("[SUMMARY LATEST PREFER PATCH] spool quarantine chain install failed")
-    try:
-        if os.environ.get("DISABLE_PUSH_MTF_VOLUME_FALLBACK_PATCH", "").strip() != "1":
-            from . import push_mtf_volume_fallback_patch
-            ok = bool(push_mtf_volume_fallback_patch.install()) or ok
-    except Exception:
-        logger.exception("[SUMMARY LATEST PREFER PATCH] push MTF volume fallback chain install failed")
-    return ok
+# summary_spool_quarantine_patch は trading/summary/persistence/summary_save_spool.py の
+# flush_summary_spool() へ、push_mtf_volume_fallback_patch は
+# scheduler_jobs/summary/safe_io.py の _prepare_summary_for_output() へ、
+# それぞれ native化済みのため _install_chained_health_patches() は削除した。
 
 
 def install() -> bool:
@@ -318,16 +307,14 @@ def install() -> bool:
         except Exception:
             logger.debug("[SUMMARY LATEST PREFER PATCH] summary_controller binding patch skipped", exc_info=True)
 
-        health_ok = _install_chained_health_patches()
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY LATEST PREFER PATCH] installed version=%s intervals=%s lag_sec=%s wall_lag_sec=%s min_symbols=%s health=%s",
+            "[SUMMARY LATEST PREFER PATCH] installed version=%s intervals=%s lag_sec=%s wall_lag_sec=%s min_symbols=%s",
             VERSION,
             os.environ.get("SUMMARY_FORCE_LATEST_INTERVALS", "1,3,5"),
             _env_int("SUMMARY_FORCE_LATEST_WHEN_HISTORY_LAG_SEC", 120),
             _env_int("SUMMARY_FORCE_LATEST_WALL_LAG_SEC", 180),
             _env_int("SUMMARY_FORCE_LATEST_MIN_SYMBOLS", 20),
-            health_ok,
         )
         return True
     except Exception:

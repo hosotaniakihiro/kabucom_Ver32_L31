@@ -571,12 +571,147 @@ def _log_save_column_health(df: pd.DataFrame, interval: int, source: str, stage:
         logger.exception("[SUMMARY SAVE HEALTH] failed source=%s interval=%s stage=%s", source, interval, stage)
 
 
-def _prepare_summary_for_output(df: pd.DataFrame, interval: int, source: str, context: str) -> pd.DataFrame:
+def _prepare_summary_for_output_core(df: pd.DataFrame, interval: int, source: str, context: str) -> pd.DataFrame:
     out = _calculate_core_technical_columns(df, interval, source)
     out = _enrich_for_display(out, interval, source.upper(), context)
     out = _fill_ranking_type_aliases(out)
     _log_save_column_health(out, interval, source, context)
     return out
+
+
+# --- push_mtf_volume_fallback_patch (native化, 元 core/startup/push_mtf_volume_fallback_patch.py) ---
+# summary_recovery_resample_3m由来の行がclose/scoreはあるがvolume/rsi/macd/slope/mtfが全て0の
+# ケースで、表示側の流動性フィルタが全行を除去してしまう問題への対処。PUSH interval 3/5 かつ
+# volume<=0 かつ price>0 の行だけ、代替出来高列 (または売買代金からの逆算、それも無ければ
+# 既定30000) で補う。保守的な措置で、最終エントリーの厳格な流動性ガードは別途そのまま働く。
+_PUSH_MTF_VOLUME_FALLBACK_TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+
+
+def _push_mtf_volume_fallback_env_bool(name: str, default: bool = True) -> bool:
+    raw = str(os.getenv(name, "")).strip().lower()
+    if raw in _PUSH_MTF_VOLUME_FALLBACK_TRUE:
+        return True
+    if raw in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+        return False
+    return bool(default)
+
+
+def _push_mtf_volume_fallback_env_float(name: str, default: float) -> float:
+    try:
+        return float(str(os.getenv(name, str(default))).strip())
+    except Exception:
+        return float(default)
+
+
+def _push_mtf_volume_fallback_as_num(s: Any, default: float = 0.0):
+    try:
+        return pd.to_numeric(s, errors="coerce").fillna(default).astype("float64")
+    except Exception:
+        try:
+            return pd.Series(default, index=getattr(s, "index", None), dtype="float64")
+        except Exception:
+            return pd.Series(dtype="float64")
+
+
+def _push_mtf_volume_fallback_pick_price(df: Any):
+    for c in ("close_price", "close", "price", "current_price", "CurrentPrice"):
+        if c in getattr(df, "columns", []):
+            p = _push_mtf_volume_fallback_as_num(df[c], 0.0)
+            if p.gt(0).any():
+                return p
+    return pd.Series(0.0, index=df.index, dtype="float64")
+
+
+def _push_mtf_volume_fallback_pick_alt_volume(df: Any, price: Any):
+    for c in (
+        "trading_volume", "TradingVolume", "volume_1m", "raw_volume", "push_volume",
+        "vol", "出来高", "day_volume", "recent_volume", "latest_volume",
+    ):
+        if c in getattr(df, "columns", []):
+            v = _push_mtf_volume_fallback_as_num(df[c], 0.0)
+            if v.gt(0).any():
+                return v
+
+    for c in (
+        "turnover", "trading_value", "TradingValue", "Turnover", "売買代金",
+        "ranking_turnover", "ranking_trading_value",
+    ):
+        if c in getattr(df, "columns", []):
+            t = _push_mtf_volume_fallback_as_num(df[c], 0.0)
+            if t.gt(0).any():
+                return (t / price.replace(0, pd.NA)).fillna(0.0)
+
+    fallback_volume = _push_mtf_volume_fallback_env_float("PUSH_MTF_ZERO_VOLUME_FALLBACK_VOLUME", 30000.0)
+    return pd.Series(float(fallback_volume), index=df.index, dtype="float64")
+
+
+def _push_mtf_volume_fallback_fix(df: Any, interval: int, source: str, stage: str):
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return df
+        if str(source or "").strip().lower() != "push":
+            return df
+        if int(interval) not in {3, 5}:
+            return df
+
+        out = df.copy()
+        if "volume" not in out.columns:
+            out["volume"] = 0.0
+        vol = _push_mtf_volume_fallback_as_num(out["volume"], 0.0)
+        price = _push_mtf_volume_fallback_pick_price(out)
+        mask = vol.le(0) & price.gt(0)
+        if not bool(mask.any()):
+            return df
+
+        alt_vol = _push_mtf_volume_fallback_pick_alt_volume(out, price).reindex(out.index).fillna(0.0)
+        before_zero = int(vol.le(0).sum())
+        out.loc[mask, "volume"] = alt_vol.loc[mask].clip(lower=0.0)
+
+        new_vol = _push_mtf_volume_fallback_as_num(out["volume"], 0.0)
+        if "turnover" not in out.columns:
+            out["turnover"] = 0.0
+        turn = _push_mtf_volume_fallback_as_num(out["turnover"], 0.0)
+        turn_mask = mask & turn.le(0)
+        out.loc[turn_mask, "turnover"] = (price.loc[turn_mask] * new_vol.loc[turn_mask]).fillna(0.0)
+        if "trading_value" in out.columns:
+            tv = _push_mtf_volume_fallback_as_num(out["trading_value"], 0.0)
+            tv_mask = mask & tv.le(0)
+            out.loc[tv_mask, "trading_value"] = out.loc[tv_mask, "turnover"]
+        else:
+            out["trading_value"] = out["turnover"]
+
+        if "display_ready" in out.columns:
+            try:
+                out.loc[mask, "display_ready"] = 1
+            except Exception:
+                pass
+        if "technical_ready" in out.columns:
+            try:
+                out.loc[mask, "technical_ready"] = out.loc[mask, "technical_ready"].replace(0, 1)
+            except Exception:
+                pass
+
+        after_zero = int(_push_mtf_volume_fallback_as_num(out["volume"], 0.0).le(0).sum())
+        logger.warning(
+            "[PUSH MTF VOLUME FALLBACK] fixed interval=%s stage=%s rows=%s zero_before=%s zero_after=%s fallback_volume=%s",
+            interval,
+            stage,
+            int(mask.sum()),
+            before_zero,
+            after_zero,
+            os.getenv("PUSH_MTF_ZERO_VOLUME_FALLBACK_VOLUME", "30000"),
+        )
+        return out
+    except Exception:
+        logger.exception("[PUSH MTF VOLUME FALLBACK] fix failed interval=%s source=%s stage=%s", interval, source, stage)
+        return df
+
+
+def _prepare_summary_for_output(df: pd.DataFrame, interval: int, source: str, context: str) -> pd.DataFrame:
+    out = _prepare_summary_for_output_core(df, interval, source, context)
+    if not _push_mtf_volume_fallback_env_bool("PUSH_MTF_VOLUME_FALLBACK_ENABLED", True):
+        return out
+    return _push_mtf_volume_fallback_fix(out, int(interval), str(source), str(context))
 
 
 # ============================================================
