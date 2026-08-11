@@ -88,7 +88,7 @@ def _patch_entry_max_approved() -> bool:
 
 def _patch_ranking_bootstrap() -> bool:
     try:
-        import core.startup.scheduler_bootstrap as sb
+        import core.startup.scheduler.bootstrap as sb
         old_lookback = getattr(sb, "_DEFAULT_RANKING_LOOKBACK_MINUTES", None)
         new_lookback = _env_int("FAST_STARTUP_RANKING_LOOKBACK_MIN", 60)
         if new_lookback > 0:

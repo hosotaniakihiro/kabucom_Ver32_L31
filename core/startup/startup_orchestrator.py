@@ -71,7 +71,7 @@ from core.startup.push_startup import (
     start_push_stack_before_scheduler,
     start_push_stream_fallback_safe,
 )
-from core.startup.scheduler_startup import (
+from core.startup.scheduler.startup import (
     start_scheduler_stack_before_restore,
     register_scheduler_fallback_safe,
     ensure_schedule_loop_running_safe,

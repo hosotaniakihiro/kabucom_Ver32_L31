@@ -34,13 +34,13 @@ logger = logging.getLogger(__name__)
 
 RANKING_START_CANDIDATES = [
     # DB writer 起動候補。取得job登録は本ファイルで別途行う。
-    ("core.startup.scheduler_ranking_bootstrap", "start_ranking_db_writer_safe"),
+    ("core.startup.scheduler.ranking_bootstrap", "start_ranking_db_writer_safe"),
     ("trading.ranking.ranking_db_writer", "ensure_ranking_writer_started"),
 
     # startup thin wrapper / 旧名候補
-    ("core.startup.scheduler_startup", "start_ranking_db_writer_safe"),
-    ("core.startup.scheduler_startup", "start_ranking_db_writer"),
-    ("core.startup.scheduler_startup", "bootstrap_ranking_db_writer"),
+    ("core.startup.scheduler.startup", "start_ranking_db_writer_safe"),
+    ("core.startup.scheduler.startup", "start_ranking_db_writer"),
+    ("core.startup.scheduler.startup", "bootstrap_ranking_db_writer"),
 
     # ranking writer 旧名候補
     ("trading.ranking.ranking_db_writer", "start_ranking_db_writer"),

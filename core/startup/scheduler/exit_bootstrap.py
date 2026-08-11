@@ -45,8 +45,8 @@ from typing import Any
 import schedule
 
 from global_state import global_data
-from core.startup.scheduler_helpers import has_schedule_tag, log_scheduler_snapshot
-from core.startup.scheduler_market_guard import is_market_time_for_exit
+from core.startup.scheduler.helpers import has_schedule_tag, log_scheduler_snapshot
+from core.startup.scheduler.market_guard import is_market_time_for_exit
 
 logger = logging.getLogger(__name__)
 
