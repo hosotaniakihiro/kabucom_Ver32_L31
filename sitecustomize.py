@@ -343,7 +343,15 @@ BACKGROUND_MAIN_PATCHES = [
     # 同じ属性を包んでいた ranking_entry_source_prefilter_patch_v2 も
     # 同時に本文化した (main.py では置換で捨てられていた挙動を維持)。
     ("trading.handlers.short_mtf_direction_guard", "SHORT_MTF_2OF3_GUARD", "DISABLE_SHORT_MTF_2OF3_GUARD_PATCH"),
-    ("core.startup.entry_controller_tonosama_ai_bridge_patch", "TONOSAMA_AI_BRIDGE", "DISABLE_TONOSAMA_AI_BRIDGE_PATCH"),
+    # entry_controller_tonosama_ai_bridge_patch は trading/handlers/entry_controller.py へ
+    # 本文化済み (_tonosama_bridge_ai_result / _tonosama_bridge_pass_check)。
+    # 旧パッチは ec.ai_final_entry_check と ec._passes_ai_gate をモジュール属性ごと
+    # 差し替えていたが、どちらも読み手は entry_controller 内の呼び出し 1 箇所だけなので、
+    # 呼び出し側で結果に噛ませる形にした。これで summary_ai_entry_controller_bridge_patch /
+    # entry_volume_direction_guard_patch / entry_controller_final_gate_relax_patch の
+    # 上に載る = 旧構成と同じ最外周の位置を保てる。
+    # install スコープと DISABLE_TONOSAMA_AI_BRIDGE_PATCH の判定は
+    # entry_controller._tonosama_bridge_scope_enabled() が再現している。
     # final_entry_tonosama_liquidity_patch は削除済み。ラップ対象だった
     # final_entry_safety_guard_patch._liquidity_guard が本文化で消えており、
     # install() が常に False を返す完全な死にコードだった。

@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import datetime as dt
 import queue
 import sqlite3
@@ -443,6 +444,305 @@ def _resolve_entry_scores(entry_row: dict, side: str) -> tuple[float, float]:
     if side == "BUY" and score_buy <= 0:
         score_buy = score
     return score_buy, score_sell
+
+
+# ============================================================
+# TONOSAMA 専用ゲートのブリッジ
+#   旧 core/startup/entry_controller_tonosama_ai_bridge_patch.py (V3)
+# ------------------------------------------------------------
+# TONOSAMA は先に allow_tonosama_entry() / allow_sell_tonosama_entry() で
+# 専用判定を通しているのに、その後 SUMMARY 用の汎用 AI.entry_gate も通るため
+# low_turnover などで落ちてしまう。TONOSAMA の場合だけ「専用判定済み」として
+# AI 結果を OK に置き換える。SUMMARY / RANKING には影響させない。
+#
+# ただし ENTRY VOLUME DIRECTION GUARD や 3m5m candle guard の hard_reject は
+# 尊重する (V2)。TONOSAMA_DEDICATED_GATE_OK / TONOSAMA_OK が理由に入っていれば
+# 古い reject フラグが残っていても NG 扱いしない (V3)。
+#
+# 旧パッチは ec.ai_final_entry_check / ec._passes_ai_gate をモジュール属性ごと
+# 差し替えていた。どちらも読み手は下の呼び出し 1 箇所だけなので、
+# 呼び出し側で結果に噛ませる形にした。これで
+#   summary_ai_entry_controller_bridge_patch / entry_volume_direction_guard_patch
+#   entry_controller_final_gate_relax_patch
+# など他のラッパーの上に載る = 旧構成と同じ最外周の位置を保てる。
+# ============================================================
+_TONOSAMA_BRIDGE_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+_TONOSAMA_BRIDGE_DB_PROCESS_ENVS = (
+    "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+    "AUTOSTOCK_SUMMARY_DB_WRITER",
+    "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+    "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
+)
+
+_TONOSAMA_BRIDGE_REJECT_TOKENS = (
+    "HARD_REJECT",
+    "VOLUME_DIRECTION_REJECT",
+    "TONOSAMA_BUY_REJECT",
+    "TONOSAMA_SELL_REJECT",
+    "TONOSAMA_REJECT",
+    "REJECT_3M5M",
+    "3M5M_CANDLE_REJECT",
+    "NO_STRONG_3M5M",
+    "MA5_DOWN_AND_PRICE_BELOW",
+    "MA5_UP_AND_PRICE_ABOVE",
+    "VOLUME_SURGE_AFTER_UP_MOVE",
+    "VOLUME_SURGE_AFTER_DOWN_MOVE",
+)
+
+_TONOSAMA_BRIDGE_OK_TOKENS = (
+    "TONOSAMA_DEDICATED_GATE_OK",
+    "TONOSAMA_OK",
+    "RULE_OK",
+)
+
+
+def _tonosama_bridge_scope_enabled() -> bool:
+    """このプロセスで TONOSAMA ブリッジを使うか。
+
+    旧パッチは sitecustomize の BACKGROUND_MAIN_PATCHES 経由 (既定 ON) で、
+    main lite の background loop か SITECUSTOMIZE_ENABLE_FULL_NONMAIN=1 の
+    ときだけ install されていた。
+    ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE_SCOPE_ENABLED=1/0 で明示上書きできる。
+    """
+    try:
+        raw = os.getenv("ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE_SCOPE_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return _env_bool("ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE_SCOPE_ENABLED", False)
+        if str(os.environ.get("DISABLE_TONOSAMA_AI_BRIDGE_PATCH", "")).strip() == "1":
+            return False
+        argv_list = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        argv = " ".join(argv_list)
+        if any(name in argv for name in _TONOSAMA_BRIDGE_DB_PROCESS_NAMES):
+            return False
+        if any(_env_bool(name, False) for name in _TONOSAMA_BRIDGE_DB_PROCESS_ENVS):
+            return False
+        if any(a.endswith("/main.py") or a == "main.py" for a in argv_list) and _env_bool("SITECUSTOMIZE_MAIN_LITE", True):
+            return True
+        return _env_bool("SITECUSTOMIZE_ENABLE_FULL_NONMAIN", False)
+    except Exception:
+        return False
+
+
+def _tonosama_bridge_sf(v: Any, default: float = 0.0) -> float:
+    """旧パッチの _sf。カンマ除去をしない点が本ファイルの _safe_float と違う。"""
+    try:
+        if v is None or str(v).strip() == "":
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def _tonosama_bridge_su(v: Any) -> str:
+    try:
+        return str(v or "").strip().upper()
+    except Exception:
+        return ""
+
+
+def _tonosama_bridge_is_tonosama(row: Any) -> bool:
+    try:
+        return isinstance(row, dict) and (
+            _tonosama_bridge_su(row.get("source")) == "TONOSAMA"
+            or _tonosama_bridge_su(row.get("entry_type")) == "TONOSAMA"
+        )
+    except Exception:
+        return False
+
+
+def _tonosama_bridge_score(row: dict, side: str) -> float:
+    base = _tonosama_bridge_sf(row.get("score"), 0.0)
+    raw = _tonosama_bridge_sf(row.get("_tonosama_score"), 0.0)
+    buy = _tonosama_bridge_sf(row.get("score_buy"), base)
+    sell = _tonosama_bridge_sf(row.get("score_sell"), 0.0)
+    if _tonosama_bridge_su(side) == "SELL":
+        return max(abs(base), abs(raw), abs(sell))
+    return max(base, raw, buy)
+
+
+def _tonosama_bridge_joined_text(*vals: Any) -> str:
+    try:
+        return " ".join(str(v or "") for v in vals).upper()
+    except Exception:
+        return ""
+
+
+def _tonosama_bridge_txt_contains_reject(*vals: Any) -> bool:
+    text = _tonosama_bridge_joined_text(*vals)
+    return any(tok in text for tok in _TONOSAMA_BRIDGE_REJECT_TOKENS)
+
+
+def _tonosama_bridge_txt_contains_ok(*vals: Any) -> bool:
+    text = _tonosama_bridge_joined_text(*vals)
+    return any(tok in text for tok in _TONOSAMA_BRIDGE_OK_TOKENS)
+
+
+def _tonosama_bridge_is_hard_reject(ai: Any) -> tuple[bool, str]:
+    if not isinstance(ai, dict):
+        return False, ""
+    try:
+        reason_text = _tonosama_bridge_joined_text(
+            ai.get("reason"),
+            ai.get("gate_reason"),
+            ai.get("ai_reason"),
+            ai.get("detail"),
+        )
+
+        # 最重要: TONOSAMA専用ゲートOKは、古い reject フラグが残っていてもNG扱いしない。
+        if _tonosama_bridge_txt_contains_ok(reason_text):
+            return False, ""
+
+        for k in ("hard_reject", "volume_direction_reject", "reject", "is_reject"):
+            if bool(ai.get(k)):
+                return True, str(ai.get("reason") or ai.get("gate_reason") or ai.get("ai_reason") or k)
+
+        # 明示的なFalse系を尊重する。ただし理由がOKなら上で除外済み。
+        for k in ("allow", "allowed", "is_allowed", "ai_allow", "passed", "ok"):
+            if k in ai and ai.get(k) is False:
+                reason = str(ai.get("reason") or ai.get("gate_reason") or ai.get("ai_reason") or k)
+                if _tonosama_bridge_txt_contains_reject(reason, ai.get("detail"), ai.get("volume_direction")):
+                    return True, reason
+
+        if _tonosama_bridge_txt_contains_reject(ai.get("reason"), ai.get("gate_reason"), ai.get("ai_reason"), ai.get("detail"), ai.get("volume_direction")):
+            return True, str(ai.get("reason") or ai.get("gate_reason") or ai.get("ai_reason") or "TONOSAMA_HARD_REJECT_REASON")
+    except Exception:
+        pass
+    return False, ""
+
+
+def _tonosama_bridge_force_ng(reason: str, ai: Any | None = None) -> dict:
+    out = dict(ai) if isinstance(ai, dict) else {}
+    for k in ("allow", "allowed", "is_allowed", "ai_allow", "passed", "ok"):
+        out[k] = False
+    for k in ("confidence", "ai_confidence", "conf"):
+        out[k] = 0.0
+    out["reason"] = reason or out.get("reason") or "TONOSAMA_HARD_REJECT"
+    out["gate_reason"] = reason or out.get("gate_reason") or "TONOSAMA_HARD_REJECT"
+    out["ai_reason"] = reason or out.get("ai_reason") or "TONOSAMA_HARD_REJECT"
+    out["hard_reject"] = True
+    out["tonosama_bridge_respected_reject"] = True
+    return out
+
+
+def _tonosama_bridge_force_ok(row: dict, side: str) -> dict:
+    s = _tonosama_bridge_score(row, side)
+    reason = "TONOSAMA_DEDICATED_GATE_OK"
+    return {
+        "allow": True,
+        "allowed": True,
+        "is_allowed": True,
+        "ai_allow": True,
+        "passed": True,
+        "ok": True,
+        "reject": False,
+        "is_reject": False,
+        "hard_reject": False,
+        "volume_direction_reject": False,
+        "confidence": 1.0,
+        "ai_confidence": 1.0,
+        "conf": 1.0,
+        "reason": reason,
+        "gate_reason": reason,
+        "ai_reason": reason,
+        "detail": reason,
+        "lot_multiplier": 1.0,
+        "score": s,
+    }
+
+
+def _tonosama_bridge_ai_result(row: dict, orig_ai: Any):
+    """ai_final_entry_check() の結果に噛ませる。旧 _ai_check の後段そのもの。"""
+    if not _tonosama_bridge_scope_enabled():
+        return orig_ai
+    try:
+        hard, reason = _tonosama_bridge_is_hard_reject(orig_ai)
+        if hard:
+            logger.warning(
+                "[TONOSAMA AI BRIDGE] keep NG reason=%s source=%s entry_type=%s symbol=%s side=%s",
+                reason,
+                row.get("source") if isinstance(row, dict) else None,
+                row.get("entry_type") if isinstance(row, dict) else None,
+                row.get("symbol") if isinstance(row, dict) else None,
+                row.get("side") if isinstance(row, dict) else None,
+            )
+            return _tonosama_bridge_force_ng(reason, orig_ai)
+
+        if _env_bool("ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE", True) and _tonosama_bridge_is_tonosama(row):
+            side = _tonosama_bridge_su(row.get("entry_decision") or row.get("side"))
+            return _tonosama_bridge_force_ok(row, side)
+        return orig_ai
+    except Exception:
+        logger.debug("[TONOSAMA AI BRIDGE] ai check bridge failed", exc_info=True)
+        return orig_ai
+
+
+def _tonosama_bridge_pass_check(row: dict, ai: dict, side: str):
+    """_passes_ai_gate() の前段。旧 _pass_check 相当。
+
+    ブリッジが判断しないケースは、モジュール属性の _passes_ai_gate を
+    呼び直す (entry_controller_final_gate_relax_patch のラッパーを尊重するため)。
+    """
+    if not _tonosama_bridge_scope_enabled():
+        return _passes_ai_gate(row, ai, side=side)
+    try:
+        if _env_bool("ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE", True) and _tonosama_bridge_is_tonosama(row) and _tonosama_bridge_txt_contains_ok(
+            ai.get("reason") if isinstance(ai, dict) else None,
+            ai.get("gate_reason") if isinstance(ai, dict) else None,
+            ai.get("ai_reason") if isinstance(ai, dict) else None,
+            ai.get("detail") if isinstance(ai, dict) else None,
+        ):
+            s = _tonosama_bridge_score(row, side)
+            min_s = _tonosama_bridge_sf(os.getenv("ENTRY_CONTROLLER_TONOSAMA_MIN_SCORE"), 0.01)
+            if s < min_s:
+                return False, f"TONOSAMA_SCORE_LOW:{s:.3f}<{min_s:.3f}"
+            logger.warning(
+                "[TONOSAMA AI BRIDGE] accept dedicated ok source=%s entry_type=%s symbol=%s side=%s score=%.4f",
+                row.get("source"),
+                row.get("entry_type"),
+                row.get("symbol"),
+                side,
+                s,
+            )
+            return True, f"TONOSAMA_OK score={s:.3f}"
+
+        hard, reason = _tonosama_bridge_is_hard_reject(ai)
+        if hard:
+            logger.warning(
+                "[TONOSAMA AI BRIDGE] reject preserved source=%s entry_type=%s symbol=%s side=%s reason=%s",
+                row.get("source") if isinstance(row, dict) else None,
+                row.get("entry_type") if isinstance(row, dict) else None,
+                row.get("symbol") if isinstance(row, dict) else None,
+                side,
+                reason,
+            )
+            return False, reason or "TONOSAMA_HARD_REJECT"
+
+        if _env_bool("ENTRY_CONTROLLER_TONOSAMA_AI_BRIDGE", True) and _tonosama_bridge_is_tonosama(row):
+            s = _tonosama_bridge_score(row, side)
+            min_s = _tonosama_bridge_sf(os.getenv("ENTRY_CONTROLLER_TONOSAMA_MIN_SCORE"), 0.01)
+            if s < min_s:
+                return False, f"TONOSAMA_SCORE_LOW:{s:.3f}<{min_s:.3f}"
+            logger.warning(
+                "[TONOSAMA AI BRIDGE] accept source=%s entry_type=%s symbol=%s side=%s score=%.4f ai_reason=%s",
+                row.get("source"),
+                row.get("entry_type"),
+                row.get("symbol"),
+                side,
+                s,
+                ai.get("reason") if isinstance(ai, dict) else "",
+            )
+            return True, f"TONOSAMA_OK score={s:.3f}"
+    except Exception:
+        logger.exception("[TONOSAMA AI BRIDGE] pass bridge failed")
+    return _passes_ai_gate(row, ai, side=side)
 
 
 def _passes_ai_gate(entry_row: dict, ai: dict, side: str) -> tuple[bool, str]:
@@ -1084,9 +1384,9 @@ def _build_scored_candidates(
                 logger.exception("RANGE_5M_FILTER failed symbol=%s", symbol)
                 continue
 
-            ai = ai_final_entry_check(entry_row)
+            ai = _tonosama_bridge_ai_result(entry_row, ai_final_entry_check(entry_row))
 
-            ai_ok, ai_msg = _passes_ai_gate(entry_row, ai, side=side)
+            ai_ok, ai_msg = _tonosama_bridge_pass_check(entry_row, ai, side=side)
             if not ai_ok:
                 _log_skip(
                     symbol,
