@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import logging
 import datetime as dt
+import os
+import sys
 from types import SimpleNamespace
 from typing import Any, Iterable
 
@@ -45,6 +47,45 @@ TONO_STOP_LOSS = -0.002      # -0.20%
 TONO_TAKE_PROFIT = 0.003    # +0.30%
 TONO_TRAIL_GAP = 0.0015     # -0.15%
 TONO_MAX_HOLD_SEC = 90      # AI 未指定時の最大保持秒数
+
+
+def _tonosama_exit_infer_env_float(name: str, default: float) -> float:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _tonosama_exit_infer_scope_enabled() -> bool:
+    """tonosama_exit_source_infer_patch (native化) の旧scope判定を再現する。
+
+    旧パッチは core/startup/runtime_env/defaults_patch.py の
+    TRADING_CONTEXTS={"main"} 経由でのみ install() されていた
+    (main.py プロセス以外では常に無効)。
+    """
+    try:
+        if str(os.environ.get("DISABLE_TONOSAMA_EXIT_SOURCE_INFER_PATCH", "")).strip() == "1":
+            return False
+        raw = os.getenv("TONOSAMA_EXIT_SOURCE_INFER_SCOPE_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return str(raw).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+        argv_list = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        return any(a.endswith("/main.py") or a == "main.py" for a in argv_list)
+    except Exception:
+        return False
+
+
+if _tonosama_exit_infer_scope_enabled():
+    # Scalp-oriented TONOSAMA defaults (native化, 元 tonosama_exit_source_infer_patch.py)。
+    # 既存の env 値があれば優先する。DISABLE_TONOSAMA_EXIT_SOURCE_INFER_PATCH=1 の場合や
+    # main.py プロセス以外では、このファイル本来のデフォルト値のまま変更しない。
+    TONO_STOP_LOSS = -abs(_tonosama_exit_infer_env_float("TONOSAMA_EXIT_STOP_LOSS_PCT", 0.0030))       # -0.30%
+    TONO_TAKE_PROFIT = abs(_tonosama_exit_infer_env_float("TONOSAMA_EXIT_TAKE_PROFIT_PCT", 0.0020))   # +0.20%
+    TONO_TRAIL_GAP = abs(_tonosama_exit_infer_env_float("TONOSAMA_EXIT_TRAIL_GAP_PCT", 0.0020))       # high/low from best -0.20%
+    TONO_MAX_HOLD_SEC = int(_tonosama_exit_infer_env_float("TONOSAMA_EXIT_MAX_HOLD_SEC", 60.0))
 
 # ============================================================
 # 通常 EXIT フォールバックパラメータ
@@ -81,13 +122,98 @@ def _safe_int(x, default=0):
         return default
 
 
-def _get(obj: Any, name: str, default=None):
+def _get_core(obj: Any, name: str, default=None):
     try:
         if isinstance(obj, dict):
             return obj.get(name, default)
         return getattr(obj, name, default)
     except Exception:
         return default
+
+
+# --- tonosama_exit_source_infer_patch (native化, 元 core/startup/tonosama_exit_source_infer_patch.py) ---
+# Position ORM モデルに entry_source/entry_mode 列が無く、DB建玉が TONOSAMA (殿様イナゴ)
+# 由来であっても遅いNORMAL exitへ落ちてしまう問題への対処。既存のexit pipelineは変えず、
+# _get() だけに reason/source/history からTONOSAMAメタデータを推測するfallbackを持たせる。
+_TONOSAMA_EXIT_INFER_HINTS = (
+    "tonosama",
+    "殿様",
+    "イナゴ",
+    "出来高急増",
+    "volume_surge",
+    "volume surge",
+    "tonosama_entry",
+    "tonosama entry",
+)
+
+
+def _tonosama_exit_infer_text(v: Any) -> str:
+    try:
+        if v is None:
+            return ""
+        return str(v)
+    except Exception:
+        return ""
+
+
+def _tonosama_exit_infer_iter_history_text(pos: Any) -> list[str]:
+    texts: list[str] = []
+    try:
+        histories = _get_core(pos, "histories", None)
+        if histories:
+            for h in list(histories)[-5:]:
+                for name in ("reason", "action", "side", "symbolname"):
+                    texts.append(_tonosama_exit_infer_text(_get_core(h, name, "")))
+    except Exception:
+        pass
+    return texts
+
+
+def _tonosama_exit_infer_looks_tonosama_position(pos: Any) -> bool:
+    texts: list[str] = []
+    for name in (
+        "entry_source",
+        "source",
+        "entry_mode",
+        "entry_type",
+        "trigger_type",
+        "reason",
+        "entry_reason",
+        "entry_comment",
+        "source_reason",
+        "mode",
+    ):
+        texts.append(_tonosama_exit_infer_text(_get_core(pos, name, "")))
+    texts.extend(_tonosama_exit_infer_iter_history_text(pos))
+
+    joined = " ".join(t for t in texts if t).lower()
+    if not joined:
+        return False
+    return any(h.lower() in joined for h in _TONOSAMA_EXIT_INFER_HINTS)
+
+
+def _get(obj: Any, name: str, default=None):
+    if not _tonosama_exit_infer_scope_enabled():
+        return _get_core(obj, name, default)
+
+    # First keep the original behavior 100% intact.
+    v = _get_core(obj, name, default)
+    if v not in (None, ""):
+        return v
+
+    # Only synthesize TONOSAMA metadata for fields used by run_exit_pipeline.
+    try:
+        lname = str(name or "").lower()
+        if lname in {"entry_source", "source"} and _tonosama_exit_infer_looks_tonosama_position(obj):
+            return "ranking"
+        if lname in {"entry_mode", "entry_type", "trigger_type"} and _tonosama_exit_infer_looks_tonosama_position(obj):
+            return "TONOSAMA"
+        if lname == "hold_limit_sec" and _tonosama_exit_infer_looks_tonosama_position(obj):
+            return _tonosama_exit_infer_env_float("TONOSAMA_EXIT_MAX_HOLD_SEC", 60.0)
+    except Exception:
+        pass
+
+    return default
 
 
 def _set(obj: Any, name: str, value: Any) -> None:

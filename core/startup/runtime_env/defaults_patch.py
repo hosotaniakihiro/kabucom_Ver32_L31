@@ -284,7 +284,15 @@ def _install_strict_final_liq_pushdb_fallback(context: str) -> bool:
 
 
 def _install_tonosama_exit_source_infer(context: str) -> bool:
-    return _safe_install("tonosama exit infer", context, TRADING_CONTEXTS, "DISABLE_TONOSAMA_EXIT_SOURCE_INFER_PATCH", "tonosama_exit_source_infer_patch")
+    # tonosama_exit_source_infer_patch は trading/handlers/exit_handler.py の
+    # _get()/TONO_* 定数へ native化済み (_tonosama_exit_infer_scope_enabled() が
+    # ここと同じ TRADING_CONTEXTS={"main"} 相当のargv判定を module import 時に再現する)。
+    # ここでは有効/無効の状態をログへ反映するためだけに判定結果を返す。
+    if context not in TRADING_CONTEXTS:
+        return False
+    if os.environ.get("DISABLE_TONOSAMA_EXIT_SOURCE_INFER_PATCH", "").strip() == "1":
+        return False
+    return True
 
 
 def _install_normal_exit_scalp_align(context: str) -> bool:
