@@ -76,7 +76,7 @@ from core.startup.scheduler.startup import (
     register_scheduler_fallback_safe,
     ensure_schedule_loop_running_safe,
 )
-from core.startup.summary_startup import (
+from core.startup.summary.startup import (
     run_startup_summary_restore_safe,
     start_summary_fast_boot_safe,
     run_mtf_history_bootstrap_startup_safe,

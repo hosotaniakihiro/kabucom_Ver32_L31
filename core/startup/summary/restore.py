@@ -22,7 +22,7 @@
 #   - global_data には tail + new を格納
 #
 # 【呼び出し例】
-#   from core.startup.startup_summary_restore import restore_startup_summary_minimal_tail
+#   from core.startup.summary.restore import restore_startup_summary_minimal_tail
 #
 #   restore_startup_summary_minimal_tail(
 #       intervals=(1, 3, 5),

@@ -159,7 +159,7 @@ def _warmup_multiday_ma75_cache(logger: logging.Logger) -> Any:
     try:
         logger.info("[SUMMARY DB RUNNER] multiday MA75 warmup start")
 
-        from core.startup.startup_push_incremental_ma75 import build_push_incremental_ma75_on_startup
+        from core.startup.summary.push_incremental_ma75 import build_push_incremental_ma75_on_startup
 
         result = build_push_incremental_ma75_on_startup(
             intervals=(1, 3, 5),

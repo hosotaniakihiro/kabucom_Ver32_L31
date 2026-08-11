@@ -7,7 +7,7 @@
 #
 # 【目的】
 #   既存コード:
-#       from core.startup.summary_runtime import ...
+#       from core.startup.summary.runtime import ...
 #   を壊さず、新パッケージ:
 #       core.startup.summary_runtime_pkg
 #   へ委譲する。

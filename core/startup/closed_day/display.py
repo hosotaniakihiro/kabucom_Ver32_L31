@@ -22,11 +22,11 @@ import pandas as pd
 
 from global_state import global_data
 from core.startup.closed_day.debug import log_display_input
-from core.startup.summary_runtime import rebuild_closed_day_summaries_all
+from core.startup.summary.runtime import rebuild_closed_day_summaries_all
 from core.startup.closed_day.db import normalize_closed_day_db_df, get_latest_db_summary
 
 try:
-    from core.startup.merged_summary_access import get_summary_history_safe
+    from core.startup.summary.merged_access import get_summary_history_safe
 except Exception:
     get_summary_history_safe = None
 

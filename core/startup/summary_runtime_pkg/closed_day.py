@@ -25,7 +25,7 @@ from trading.summary.engine.guards.enhance_guard import enhance_guard
 from trading.summary.engine.internal.scoring_guard import finalize_scoring
 
 from core.startup.closed_day.debug import log_closed_day_summary_state
-from core.startup.merged_summary_access import (
+from core.startup.summary.merged_access import (
     get_push_merged_summary_safe,
     set_push_merged_summary_safe,
 )

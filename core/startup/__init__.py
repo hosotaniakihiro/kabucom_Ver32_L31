@@ -733,7 +733,7 @@ else:
     _install_entry_runtime_init_patches()
 
 from .startup import system_startup
-from .summary_bootstrap import (
+from .summary.bootstrap import (
     bootstrap_summary,
     run_bootstrap_incremental_rebuild_if_available,
 )

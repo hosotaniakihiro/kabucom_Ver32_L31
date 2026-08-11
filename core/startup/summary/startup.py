@@ -21,8 +21,8 @@ from typing import Any
 
 from global_state import global_data
 
-from core.startup.summary_runtime import run_bootstrap_summary_fast_boot
-from core.startup.mtf_history_bootstrap_runner import run_mtf_history_bootstrap_safe
+from core.startup.summary.runtime import run_bootstrap_summary_fast_boot
+from core.startup.summary.mtf_history_runner import run_mtf_history_bootstrap_safe
 from core.startup.startup_config import resolve_attr
 
 logger = logging.getLogger(__name__)
@@ -63,7 +63,7 @@ def run_push_incremental_ma75_startup_safe(*, force: bool = False) -> Any:
         pass
 
     try:
-        from core.startup.startup_push_incremental_ma75 import build_push_incremental_ma75_on_startup
+        from core.startup.summary.push_incremental_ma75 import build_push_incremental_ma75_on_startup
 
         result = build_push_incremental_ma75_on_startup(
             intervals=(1, 3, 5),
@@ -142,7 +142,7 @@ def run_startup_summary_restore_safe() -> Any:
 
     try:
         restore_fn = resolve_attr(
-            "core.startup.startup_summary_restore",
+            "core.startup.summary.restore",
             "restore_startup_summary_minimal_tail",
         )
 

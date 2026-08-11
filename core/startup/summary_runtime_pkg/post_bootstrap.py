@@ -19,7 +19,7 @@ import logging
 
 import pandas as pd
 
-from core.startup.merged_summary_access import (
+from core.startup.summary.merged_access import (
     get_push_merged_summary_safe,
     set_push_merged_summary_safe,
 )

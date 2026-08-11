@@ -20,7 +20,7 @@ import threading
 
 from global_state import global_data
 
-from core.startup.summary_bootstrap import bootstrap_summary
+from core.startup.summary.bootstrap import bootstrap_summary
 
 from . import state
 from .state import (

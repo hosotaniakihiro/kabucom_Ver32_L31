@@ -57,7 +57,7 @@ from trading.aggregation.higher_tf.incremental_higher_tf_engine import (
 from trading.handlers.entry_controller import run_entry_pipeline
 from trading.ranking.active_symbol_manager import update_active_symbols
 
-from core.startup.merged_summary_access import (
+from core.startup.summary.merged_access import (
     get_push_merged_summary_safe,
     set_push_merged_summary_safe,
 )
@@ -123,7 +123,7 @@ def _get_summary_bootstrap_state() -> dict[str, bool]:
     import 失敗時は global_data の flags から fallback する。
     """
     try:
-        from core.startup.summary_runtime import get_summary_bootstrap_state
+        from core.startup.summary.runtime import get_summary_bootstrap_state
         state = get_summary_bootstrap_state()
         if isinstance(state, dict):
             return {
