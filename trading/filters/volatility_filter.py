@@ -42,6 +42,7 @@ import logging
 import os
 import sys
 import sqlite3
+import time
 from typing import Any
 
 import pandas as pd
@@ -485,7 +486,7 @@ def _row_change_ratio(row: dict[str, Any]) -> float:
     return 0.0
 
 
-def _latest_ranking_snapshot_move(symbol: str) -> dict[str, Any] | None:
+def _latest_ranking_snapshot_move_core(symbol: str) -> dict[str, Any] | None:
     symbol = _normalize_symbol(symbol)
     if not symbol:
         return None
@@ -566,6 +567,181 @@ def _latest_ranking_snapshot_move(symbol: str) -> dict[str, Any] | None:
             logger.debug("[VOL FILTER] ranking rescue db scan failed path=%s", path, exc_info=True)
             continue
     return None
+
+
+# --- volatility_filter_ranking_rescue_timebox_patch (native化, 元 core/startup/volatility_filter_ranking_rescue_timebox_patch.py) ---
+# SUMMARY_AI direct snapshot が volatility_filter 内で ranking rescue が複数の陳腐化した
+# ranking DB (NAS上) をスキャンする際にハングしうる問題への対処。厳格な fail-closed 挙動は
+# 維持したまま (ATR/range/board/order の各ガードは緩めない)、新鮮な ranking move を素早く
+# 読めない場合は rescue を適用しない。旧関数 (_latest_ranking_snapshot_move_core) は
+# 複数の古いDBを glob するため 10-100秒スタールしうるのに対し、この版は固定6テーブルのみを
+# 対象にし、全体デッドライン (既定0.35秒) を超えたら即座に諦める。
+_VOL_FILTER_RESCUE_TIMEBOX_TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+
+
+def _vol_filter_rescue_timebox_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in _VOL_FILTER_RESCUE_TIMEBOX_TRUE
+    except Exception:
+        return bool(default)
+
+
+def _vol_filter_rescue_timebox_parse_dt(v: Any):
+    try:
+        if v is None:
+            return None
+        if isinstance(v, dt.datetime):
+            return v.replace(tzinfo=None)
+        ts = pd.to_datetime(v, errors="coerce")
+        if ts is None or getattr(ts, "isna", lambda: False)():
+            return None
+        x = ts.to_pydatetime()
+        return x.replace(tzinfo=None) if isinstance(x, dt.datetime) else None
+    except Exception:
+        return None
+
+
+def _vol_filter_rescue_timebox_coerce_ratio(v: Any) -> float:
+    try:
+        if v is None:
+            return 0.0
+        if isinstance(v, str):
+            s = v.replace("％", "%").replace("+", "").replace("%", "").strip()
+            if not s:
+                return 0.0
+            x = float(s.replace(",", ""))
+        else:
+            x = float(v)
+        return x / 100.0 if abs(x) > 1.0 else x
+    except Exception:
+        return 0.0
+
+
+def _vol_filter_rescue_timebox_row_ratio(d: dict[str, Any]) -> float:
+    for k in ("change_ratio", "change_rate", "change_percentage", "change_percent", "騰落率", "変化率"):
+        if k in d:
+            r = _vol_filter_rescue_timebox_coerce_ratio(d.get(k))
+            if r:
+                return r
+    try:
+        price = float(d.get("current_price") or d.get("price") or d.get("close") or d.get("close_price") or 0)
+        prev = float(d.get("previous_close") or d.get("prev_close") or d.get("base_price") or d.get("reference_price") or 0)
+        if price > 0 and prev > 0:
+            return (price - prev) / prev
+    except Exception:
+        pass
+    return 0.0
+
+
+def _vol_filter_rescue_timebox_candidate_paths() -> list[str]:
+    today = dt.datetime.now().strftime("%Y%m%d")
+    out: list[str] = []
+    for p in (os.getenv("RANKING_DB_PATH"), os.getenv("KABU_RANKING_DB_PATH"), os.getenv("ATS_RANKING_DB_PATH")):
+        if p:
+            out.append(str(p))
+    # 古いDBを glob しない (glob すると 10-100秒スタールしうるため)。
+    for d_ in (
+        os.getenv("RANKING_DB_DIR"),
+        os.getenv("KABU_RANKING_DB_DIR"),
+        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\ranking",
+        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\Ranking",
+    ):
+        if d_:
+            out.append(os.path.join(str(d_), f"ranking{today}.db"))
+    seen: set[str] = set()
+    return [p for p in out if p and not (p in seen or seen.add(p))]
+
+
+def _latest_ranking_snapshot_move_fast(symbol: str) -> dict[str, Any] | None:
+    symbol = _normalize_symbol(symbol)
+    if not symbol:
+        return None
+    max_age = _env_float("RANKING_RESCUE_MAX_AGE_SEC", 360.0)
+    deadline = time.perf_counter() + max(0.05, _env_float("VOL_FILTER_RANKING_RESCUE_TIMEBOX_SEC", 0.35))
+    now_dt = dt.datetime.now()
+    tables = ("ranking_snapshot_1min", "ranking", "値上がり率_ALL", "値下がり率_ALL", "売買高急増_ALL", "売買代金急増_ALL")
+    for path in _vol_filter_rescue_timebox_candidate_paths():
+        if time.perf_counter() > deadline:
+            logger.warning("[VOL FILTER RESCUE TIMEBOX] deadline reached before path symbol=%s path=%s", symbol, path)
+            return None
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            conn = sqlite3.connect(path, timeout=max(0.05, _env_float("VOL_FILTER_RANKING_RESCUE_SQLITE_TIMEOUT_SEC", 0.12)))
+            conn.row_factory = sqlite3.Row
+            try:
+                existing = {r[0] for r in conn.execute("select name from sqlite_master where type='table'").fetchall()}
+                for table in tables:
+                    if time.perf_counter() > deadline:
+                        logger.warning("[VOL FILTER RESCUE TIMEBOX] deadline reached symbol=%s path=%s table=%s", symbol, path, table)
+                        return None
+                    if table not in existing:
+                        continue
+                    try:
+                        cols = [r[1] for r in conn.execute(f'pragma table_info("{table}")').fetchall()]
+                        if "symbol" not in cols:
+                            continue
+                        order_col = next((c for c in ("datetime", "snapshot_time", "received_at", "created_at", "inserted_at", "id") if c in cols), None)
+                        sql = f'select * from "{table}" where cast(symbol as text)=?'
+                        if order_col:
+                            sql += f' order by "{order_col}" desc'
+                        sql += " limit 1"
+                        row = conn.execute(sql, (symbol,)).fetchone()
+                        if row is None:
+                            continue
+                        d = dict(row)
+                        dt_value = None
+                        for c in ("datetime", "snapshot_time", "received_at", "created_at", "inserted_at"):
+                            if c in d:
+                                dt_value = _vol_filter_rescue_timebox_parse_dt(d.get(c))
+                                if dt_value is not None:
+                                    break
+                        age_sec = abs((now_dt - dt_value).total_seconds()) if dt_value is not None else None
+                        if age_sec is not None and age_sec > max_age:
+                            logger.info("[VOL FILTER] ranking rescue stale-fast symbol=%s table=%s age=%.1fs max=%.1fs path=%s", symbol, table, age_sec, max_age, path)
+                            continue
+                        ratio = _vol_filter_rescue_timebox_row_ratio(d)
+                        return {"symbol": symbol, "ratio": ratio, "abs_ratio": abs(ratio), "price": float(d.get("current_price") or d.get("price") or d.get("close") or d.get("close_price") or 0), "table": table, "path": path, "datetime": dt_value.isoformat() if dt_value else None, "age_sec": age_sec}
+                    except Exception:
+                        logger.debug("[VOL FILTER RESCUE TIMEBOX] table scan failed symbol=%s path=%s table=%s", symbol, path, table, exc_info=True)
+                        continue
+            finally:
+                conn.close()
+        except Exception:
+            logger.debug("[VOL FILTER RESCUE TIMEBOX] db scan failed symbol=%s path=%s", symbol, path, exc_info=True)
+            continue
+    return None
+
+
+def _vol_filter_rescue_timebox_scope_enabled() -> bool:
+    """volatility_filter_ranking_rescue_timebox_patch (native化) の旧scope判定を再現する。
+
+    旧パッチは core/startup/runtime_env/defaults_patch.py の TRADING_CONTEXTS={"main"}
+    経由でのみ install() が呼ばれ (DISABLE_VOL_FILTER_RANKING_RESCUE_TIMEBOX_PATCH=1でも
+    install()自体が呼ばれない)、install() 内部でも重ねて
+    VOL_FILTER_RANKING_RESCUE_TIMEBOX_ENABLED (既定True) を確認していた。
+    """
+    try:
+        if str(os.environ.get("DISABLE_VOL_FILTER_RANKING_RESCUE_TIMEBOX_PATCH", "")).strip() == "1":
+            return False
+        if not _vol_filter_rescue_timebox_env_bool("VOL_FILTER_RANKING_RESCUE_TIMEBOX_ENABLED", True):
+            return False
+        raw = os.getenv("VOL_FILTER_RANKING_RESCUE_TIMEBOX_SCOPE_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return _vol_filter_rescue_timebox_env_bool("VOL_FILTER_RANKING_RESCUE_TIMEBOX_SCOPE_ENABLED", False)
+        argv_list = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        return any(a.endswith("/main.py") or a == "main.py" for a in argv_list)
+    except Exception:
+        return False
+
+
+def _latest_ranking_snapshot_move(symbol: str) -> dict[str, Any] | None:
+    if not _vol_filter_rescue_timebox_scope_enabled():
+        return _latest_ranking_snapshot_move_core(symbol)
+    return _latest_ranking_snapshot_move_fast(symbol)
 
 
 def _ranking_move_rescue_core(entry_row: Any, *, min_pct: float, label: str) -> bool:

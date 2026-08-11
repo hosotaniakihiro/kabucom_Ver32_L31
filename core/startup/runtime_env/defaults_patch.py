@@ -264,7 +264,17 @@ def _install_low_volatility_entry_guard(context: str) -> bool:
 
 
 def _install_vol_filter_ranking_rescue_timebox(context: str) -> bool:
-    return _safe_install("volatility ranking rescue timebox", context, TRADING_CONTEXTS, "DISABLE_VOL_FILTER_RANKING_RESCUE_TIMEBOX_PATCH", "volatility_filter_ranking_rescue_timebox_patch")
+    # volatility_filter_ranking_rescue_timebox_patch は trading/filters/volatility_filter.py の
+    # _latest_ranking_snapshot_move() へ native化済み (_vol_filter_rescue_timebox_scope_enabled()
+    # がここと同じ TRADING_CONTEXTS={"main"} + 両env判定を再現する)。ここでは有効/無効の
+    # 状態をログへ反映するためだけに判定結果を返す。
+    if context not in TRADING_CONTEXTS:
+        return False
+    if os.environ.get("DISABLE_VOL_FILTER_RANKING_RESCUE_TIMEBOX_PATCH", "").strip() == "1":
+        return False
+    if not env_bool("VOL_FILTER_RANKING_RESCUE_TIMEBOX_ENABLED", True):
+        return False
+    return True
 
 
 def _install_push_registration_recovery(context: str) -> bool:
