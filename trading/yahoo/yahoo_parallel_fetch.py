@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import sys
 import time
 import pandas as pd
 
@@ -95,7 +97,7 @@ def _fetch_worker(
 # parallel fetch
 # ============================================================
 
-def parallel_fetch_symbols(
+def parallel_fetch_symbols_core(
     symbols,
     *,
     start_dt,
@@ -249,3 +251,91 @@ def parallel_fetch_symbols(
         pass
 
     return result
+
+
+# --- yahoo_parallel_empty_cooldown_patch (native化, 元 core/startup/yahoo_parallel_empty_cooldown_patch.py) ---
+# Yahoo並列取得が連続して0件を返し続ける状態を検知したら、一定時間クールダウンして
+# 無駄なリクエストを止める。
+_YAHOO_PARALLEL_EMPTY_COOLDOWN_STATE = {"empty_count": 0, "cooldown_until": 0.0}
+
+
+def _yahoo_parallel_empty_cooldown_env_int(name: str, default: int, *, min_value: int | None = None, max_value: int | None = None) -> int:
+    try:
+        v = int(float(str(os.getenv(name, str(default))).replace(",", "")))
+    except Exception:
+        v = int(default)
+    if min_value is not None:
+        v = max(v, min_value)
+    if max_value is not None:
+        v = min(v, max_value)
+    return int(v)
+
+
+def _yahoo_parallel_empty_cooldown_scope_enabled() -> bool:
+    """旧パッチの root importer だった DB_CONTEXTS|TRADING_CONTEXTS|GENERIC_HELPER_CONTEXTS
+    (実質 argv が空/未知の場合以外は常に有効) を再現する。
+    """
+    try:
+        if str(os.environ.get("DISABLE_YAHOO_PARALLEL_EMPTY_COOLDOWN_PATCH", "")).strip() == "1":
+            return False
+        return bool(" ".join(str(x) for x in sys.argv).strip())
+    except Exception:
+        return False
+
+
+def parallel_fetch_symbols(
+    symbols,
+    *,
+    start_dt,
+    end_dt,
+    fetch_func,
+):
+    if not _yahoo_parallel_empty_cooldown_scope_enabled():
+        return parallel_fetch_symbols_core(symbols, start_dt=start_dt, end_dt=end_dt, fetch_func=fetch_func)
+
+    syms = list(symbols or [])
+    now_ts = time.time()
+    threshold = _yahoo_parallel_empty_cooldown_env_int("YAHOO_PARALLEL_EMPTY_BATCH_THRESHOLD", 2, min_value=1, max_value=20)
+    cooldown_sec = _yahoo_parallel_empty_cooldown_env_int("YAHOO_PARALLEL_EMPTY_BATCH_COOLDOWN_SEC", 900, min_value=0, max_value=7200)
+    min_symbols = _yahoo_parallel_empty_cooldown_env_int("YAHOO_PARALLEL_EMPTY_MIN_SYMBOLS", 20, min_value=1, max_value=1000)
+
+    state = _YAHOO_PARALLEL_EMPTY_COOLDOWN_STATE
+    if len(syms) >= min_symbols and state["cooldown_until"] > now_ts:
+        logger.warning(
+            "[YAHOO PARALLEL EMPTY COOLDOWN] skipped remain=%.0fs symbols=%d empty_count=%d",
+            state["cooldown_until"] - now_ts,
+            len(syms),
+            state["empty_count"],
+        )
+        return []
+
+    ret = parallel_fetch_symbols_core(symbols, start_dt=start_dt, end_dt=end_dt, fetch_func=fetch_func)
+    try:
+        result_len = len(ret or [])
+    except Exception:
+        result_len = 0
+
+    if len(syms) >= min_symbols and result_len == 0:
+        state["empty_count"] += 1
+        if cooldown_sec > 0 and state["empty_count"] >= threshold:
+            state["cooldown_until"] = now_ts + cooldown_sec
+            logger.warning(
+                "[YAHOO PARALLEL EMPTY COOLDOWN] cooldown start empty_count=%d threshold=%d cooldown=%ss symbols=%d",
+                state["empty_count"],
+                threshold,
+                cooldown_sec,
+                len(syms),
+            )
+    else:
+        if state["empty_count"]:
+            logger.info("[YAHOO PARALLEL EMPTY COOLDOWN] reset empty_count=%d result_frames=%d", state["empty_count"], result_len)
+        state["empty_count"] = 0
+        state["cooldown_until"] = 0.0
+    return ret
+
+
+if _yahoo_parallel_empty_cooldown_scope_enabled():
+    # 旧パッチの install() が行っていた env のsetdefaultを、モジュールimport時に1回だけ適用する。
+    os.environ.setdefault("YAHOO_PARALLEL_EMPTY_BATCH_THRESHOLD", "2")
+    os.environ.setdefault("YAHOO_PARALLEL_EMPTY_BATCH_COOLDOWN_SEC", "900")
+    os.environ.setdefault("YAHOO_PARALLEL_EMPTY_MIN_SYMBOLS", "20")

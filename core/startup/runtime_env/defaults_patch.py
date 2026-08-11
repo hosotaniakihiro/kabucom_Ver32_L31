@@ -371,7 +371,15 @@ def _install_intraday_load_guard(context: str) -> bool:
 
 
 def _install_yahoo_parallel_empty_cooldown(context: str) -> bool:
-    return _safe_install("yahoo parallel empty cooldown", context, DB_CONTEXTS | TRADING_CONTEXTS | GENERIC_HELPER_CONTEXTS, "DISABLE_YAHOO_PARALLEL_EMPTY_COOLDOWN_PATCH", "yahoo_parallel_empty_cooldown_patch")
+    # yahoo_parallel_empty_cooldown_patch は trading/yahoo/yahoo_parallel_fetch.py の
+    # parallel_fetch_symbols() へ native化済み (_yahoo_parallel_empty_cooldown_scope_enabled()
+    # がここと同じ DB_CONTEXTS|TRADING_CONTEXTS|GENERIC_HELPER_CONTEXTS 相当の判定を再現する)。
+    # ここでは有効/無効の状態をログへ反映するためだけに判定結果を返す。
+    if context not in (DB_CONTEXTS | TRADING_CONTEXTS | GENERIC_HELPER_CONTEXTS):
+        return False
+    if os.environ.get("DISABLE_YAHOO_PARALLEL_EMPTY_COOLDOWN_PATCH", "").strip() == "1":
+        return False
+    return True
 
 
 _RANKING_LEGACY_FLUSH_CONTEXTS = DB_CONTEXTS | TRADING_CONTEXTS | GENERIC_HELPER_CONTEXTS
