@@ -373,8 +373,14 @@ BACKGROUND_MAIN_PATCHES = [
     ("trading.filters.summary_ai_range_bridge", "SUMMARY_AI_LOW_MOVE_SOFTPASS", "DISABLE_SUMMARY_AI_LOW_MOVE_SOFTPASS_PATCH"),
     ("core.startup.summary_mtf_early_ready_patch", "SUMMARY_MTF_EARLY_READY", "DISABLE_SUMMARY_MTF_EARLY_READY_PATCH"),
     ("trading.audit_logging.install_audit_logging", "AUDIT_LOGGING", "DISABLE_AUDIT_LOGGING"),
-    ("core.startup.summary_main_push_db_refresh_patch", "SUMMARY_MAIN_PUSH_DB_REFRESH_BG", "DISABLE_SUMMARY_MAIN_PUSH_DB_REFRESH_PATCH"),
-    ("core.startup.summary_main_direct_push_force_patch", "SUMMARY_FORCE_DIRECT_1M_BG_FINAL", "DISABLE_SUMMARY_FORCE_DIRECT_1M_PATCH"),
+    # summary_main_push_db_refresh_patch / summary_main_direct_push_force_patch の
+    # background 再適用は削除した。どちらも冪等な no-op で、SYNC_MAIN_PATCHES
+    # (上の 2 件) が先に走った時点で完了している:
+    #   push_db_refresh   install() 冒頭が `if _PATCHED: return True`
+    #                     (その前の _install_context_stale_guard() はフラグを
+    #                      立てて True を返すだけの死にコード)
+    #   direct_push_force install() は env setdefault 5 件とログだけ
+    #                     (V10 で job_summary のラップは撤去済み)
 ]
 
 ENTRY_FAILOPEN_PATCHES = [
@@ -450,9 +456,13 @@ def _background_main_patch_loop() -> None:
     _install_optional_rescue_patches()
     _install_liq_empty_fallback_only_if_enabled()
     _install_summary_mtf_catchup_safely()
-    # Final re-apply after all background patches because several summary/controller patches re-wrap runner_core.job_summary.
-    _install_module("core.startup.summary_main_push_db_refresh_patch", "SUMMARY_MAIN_PUSH_DB_REFRESH_BG_LAST", disabled_env="DISABLE_SUMMARY_MAIN_PUSH_DB_REFRESH_PATCH")
-    _install_module("core.startup.summary_main_direct_push_force_patch", "SUMMARY_FORCE_DIRECT_1M_BG_LAST", disabled_env="DISABLE_SUMMARY_FORCE_DIRECT_1M_PATCH")
+    # 旧: 「several summary/controller patches re-wrap runner_core.job_summary」
+    # という理由で background パッチの後に 2 件を再適用していたが、
+    # このコメントは陳腐化していた。job_summary を再ラップするコードは
+    # リポジトリに 1 つも残っていない (git grep 'job_summary =' の実結果は
+    # ログ文字列 1 件のみ)。3-way race は runner_core.py:300-324 の
+    # tier1/tier2/tier3 固定順で解消済み。
+    # 2 件とも冪等な no-op なので再適用ごと削除した。
     # 旧: 全 background パッチの後で board signature を再適用していた
     # (一部の entry guard が _board_guard を差し替えるため)。ホストが本文化されて
     # ラップ対象が無くなり、実効は env 既定値だけなので再適用は不要になった。
