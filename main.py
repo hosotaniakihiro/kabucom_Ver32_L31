@@ -209,7 +209,7 @@ def _install_main_runtime_patches():
         # entry_controller_runtime_reject_patch は trading/handlers/entry_controller.py の
         # cleanup_stale_100368_sell_reject_cache() へ native化済み (直接呼び出しは下記)。
         ("core.startup.fast_startup_runtime_patch", "install"),
-        ("core.startup.summary_main_memory_latest_1m_patch", "install"),
+        ("scheduler_jobs.summary.memory_latest_1m", "install"),
         ("core.startup.summary_mtf_diff_from_1m_patch", "install"),
         ("core.startup.entry_qty_min_lot_runtime_patch", "install"),
         ("core.startup.low_movement_entry_guard_patch", "install"),

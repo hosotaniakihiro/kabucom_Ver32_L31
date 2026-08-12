@@ -10,7 +10,7 @@
 #
 # V6:
 #   - job_summary/run_push_summary_job/job_1m への差し替えを撤去した。
-#     summary_main_direct_push_force_patch.py・summary_main_memory_latest_1m_patch.py
+#     scheduler_jobs/summary/direct_push_1m.py・scheduler_jobs/summary/memory_latest_1m.py
 #     と合わせて3本が同じ3関数を奪い合っていた (それぞれ再代入するだけの
 #     total-overwrite方式で、direct_push_force側の永続watcherがstale原本
 #     キャッシュを使って毎回再上書きしてしまうバグにより、実質的に

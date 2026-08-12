@@ -1,16 +1,29 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-# File   : core/startup/summary_main_memory_latest_1m_patch.py
-# Version: V4-JOB-SUMMARY-WRAP-REMOVED
+# File   : scheduler_jobs/summary/memory_latest_1m.py
+# Version: V3-MAIN-MEMORY-NO-STALE-COERCE  (VERSION 定数と一致させること。ログに出る)
 # ------------------------------------------------------------
 # main.py は PUSH DB 保存をしない前提のまま、PUSHメモリDFから
 # 最新1分足 summary を高速生成する。
+#
+# 移設 (2026-08-12):
+#   - core/startup/summary_main_memory_latest_1m_patch.py から移設した。
+#     V4 で job_summary のラップを撤去した時点でモンキーパッチは無くなり、
+#     _build_memory_1m_summary / _load_push_memory_df を提供するライブラリ +
+#     env 既定値 6 件の install() だけになっていたので、
+#     利用側と同じ scheduler_jobs/summary/ 配下へ置く。
+#   - 末尾の auto install は残す (env の setdefault のみで冪等)。
+#     install() は _is_entry_only_context() で非 main を弾くので、
+#     import されても main 以外では env を触らない。
+#   - このモジュールの関数を差し替える側は core/startup に残っている:
+#       summary_main_push_db_refresh_patch  -> _load_push_memory_df
+#       summary_mtf_diff_from_1m_patch      -> _publish_latest
 #
 # V4:
 #   - job_summary/run_push_summary_job/job_1m への再代入、および
 #     scheduler.job_push_summary_1m のエイリアス同期を撤去した。
 #     このファイル・summary_main_1m_light_tick_patch.py・
-#     summary_main_direct_push_force_patch.py の3本が同じ3関数を
+#     scheduler_jobs/summary/direct_push_1m.py の3本が同じ3関数を
 #     total-overwrite方式で奪い合っていた「3-way race」の一部
 #     (詳細は scheduler_jobs/summary/direct_push_1m.py のコメント参照)。
 #     _build_memory_1m_summary はそのままライブラリ関数として維持し、

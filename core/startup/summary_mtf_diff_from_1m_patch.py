@@ -9,7 +9,7 @@
 #   3m/5mを軽量生成する。
 #
 # V1.9:
-#   - summary_main_memory_latest_1m_patch._publish_latest をwrapし、
+#   - scheduler_jobs.summary.memory_latest_1m._publish_latest をwrapし、
 #     latestだけでなく set_summary_history(tf=1) にも必ず保存。
 #   - 09:39ログの MERGED SET tf=1 rows>0 だが SUMMARY HISTORY GET tf=1 rows=0
 #     になる状態を解消。
@@ -321,9 +321,9 @@ def _publish_to_global(interval: int, df_hist: pd.DataFrame, df_latest: pd.DataF
 
 
 def _patch_memory_latest_publish_history() -> bool:
-    """summary_main_memory_latest_1m_patch は latest だけを publish するため、history 保存を補う。"""
+    """memory_latest_1m は latest だけを publish するため、history 保存を補う。"""
     try:
-        import core.startup.summary_main_memory_latest_1m_patch as mem
+        import scheduler_jobs.summary.memory_latest_1m as mem
         old = getattr(mem, "_publish_latest", None)
         if not callable(old):
             return False

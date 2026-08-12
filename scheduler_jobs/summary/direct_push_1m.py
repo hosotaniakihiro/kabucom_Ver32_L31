@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : scheduler_jobs/summary/direct_push_1m.py
-# Version: V11-MOVED-OUT-OF-CORE-STARTUP
+# Version: V10-JOB-SUMMARY-WRAP-REMOVED  (VERSION 定数と一致させること。ログに出る)
 # ------------------------------------------------------------
 # main.py の1分PUSH summary tickを軽量経路に固定する。
 #
-# V11:
+# 移設 (2026-08-12):
 #   - core/startup/summary_main_direct_push_force_patch.py から移設した。
 #     V10 で job_summary のラップを撤去した時点でモンキーパッチは無くなり、
 #     runner_core.job_summary が tier1 として直接呼ぶライブラリ +
@@ -23,7 +23,7 @@
 #   初回成功時に1度だけキャッシュし、以降の watcher 呼び出しではそのまま
 #   古いキャッシュを使い回していた。このパッチは sitecustomize.py の
 #   SYNC_MAIN_PATCHES で最も早く (main.py 起動前に) install されるため、
-#   summary_main_1m_light_tick_patch / summary_main_memory_latest_1m_patch が
+#   summary_main_1m_light_tick_patch / memory_latest_1m が
 #   後から重ね書きしても、次の watcher tick (最大2秒後、確実に main.py の
 #   起動シーケンス中に発生する) で「まだ自分の目印が付いていない」と判定し、
 #   古いキャッシュ原本を土台に自分自身を re-install していた。結果、
@@ -304,7 +304,7 @@ def _build_from_process_memory(now: dt.datetime) -> pd.DataFrame:
 
 def _build_direct_inner(now: dt.datetime) -> pd.DataFrame:
     try:
-        from core.startup.summary_main_memory_latest_1m_patch import _build_memory_1m_summary
+        from .memory_latest_1m import _build_memory_1m_summary
         df = _build_memory_1m_summary(now=now)
         if isinstance(df, pd.DataFrame) and not df.empty:
             return df.reset_index(drop=True)
@@ -483,7 +483,7 @@ def _submit_ai(df: pd.DataFrame, now: dt.datetime, run_entry: bool) -> None:
 
 def tier1_build_and_publish(now: dt.datetime, *, run_entry: bool) -> pd.DataFrame:
     """scheduler_jobs/summary/runner_core.py の job_summary (tier1) から直接呼ばれる。
-    memory直接ビルド (_build_direct、内部で summary_main_memory_latest_1m_patch を使う) を
+    memory直接ビルド (_build_direct、内部で memory_latest_1m を使う) を
     タイムアウト付きで試し、成功時のみ _store/_submit_ai を行う。呼び出し元の事前条件
     (_is_main_py() 相当・interval==1) は runner_core.py 側で確認済みの前提。"""
     if not _env_bool("SUMMARY_FORCE_DIRECT_PATCH_ENABLED", True):

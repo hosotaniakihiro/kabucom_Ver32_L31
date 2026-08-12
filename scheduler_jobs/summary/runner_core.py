@@ -304,7 +304,7 @@ def job_ranking_5m(display: bool = True, now: Optional[dt.datetime] = None, run_
 # job_summary/job_1m/run_push_summary_job は、以前は core/startup/ の3本の
 # runtime patch (summary_main_direct_push_force_patch.py
 #  = 現 scheduler_jobs/summary/direct_push_1m.py /
-# summary_main_1m_light_tick_patch.py / summary_main_memory_latest_1m_patch.py)
+# summary_main_1m_light_tick_patch.py / memory_latest_1m.py)
 # がそれぞれ total-overwrite 方式で奪い合っていた ("3-way race")。
 #
 # 発見した不具合: summary_main_direct_push_force_patch.py は再適用用の

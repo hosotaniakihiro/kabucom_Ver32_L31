@@ -286,7 +286,7 @@ def install() -> bool:
         logger.warning("[SUMMARY MAIN PUSH DB REFRESH] disabled by env version=%s", VERSION)
         return False
     try:
-        import core.startup.summary_main_memory_latest_1m_patch as target
+        import scheduler_jobs.summary.memory_latest_1m as target
         cur = getattr(target, "_load_push_memory_df", None)
         if not callable(cur):
             logger.warning("[SUMMARY MAIN PUSH DB REFRESH] target loader unavailable context_guard=%s version=%s", context_guard_ok, VERSION)
