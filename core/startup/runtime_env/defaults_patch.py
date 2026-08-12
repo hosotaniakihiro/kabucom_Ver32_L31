@@ -275,13 +275,13 @@ def _install_low_volatility_entry_guard(context: str) -> bool:
             return False
         from .. import low_volatility_entry_guard_patch
         base_ok = bool(low_volatility_entry_guard_patch.install())
-        strict_ok = False
-        try:
-            from .. import low_volatility_entry_guard_strict_patch
-            strict_ok = bool(low_volatility_entry_guard_strict_patch.install())
-        except Exception:
-            logger.exception("[RUNTIME ENV DEFAULTS PATCH] strict low volatility guard install failed")
-        return bool(base_ok or strict_ok)
+        # low_volatility_entry_guard_strict_patch は削除した。
+        # 唯一のラップ対象 low_volatility_entry_guard_patch._low_vol_block は
+        # 同モジュール内の _block_result からしか呼ばれず、その _block_result には
+        # リポジトリ全体で呼び出し元が無い (AI/entry_gate.py 側は独自の
+        # _low_vol_block / _low_vol_block_result を持つ本文化済み実装)。
+        # strict が併せて行っていた base.install() も直上で既に実行済み。
+        return bool(base_ok)
     except Exception:
         logger.exception("[RUNTIME ENV DEFAULTS PATCH] low volatility entry guard install failed")
         return False
