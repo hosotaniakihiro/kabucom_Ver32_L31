@@ -30,24 +30,11 @@ logger = logging.getLogger(__name__)
 VERSION = "V1.7-BOARD-GUARD-COMPAT-REMOVED"
 
 _PATCHED = False
-_ORIGINAL_RESULT_TO_DICT = None
 _WEAK_SUMMARY_AI_PATCHED = False
 _ORIGINAL_RUN_AI_GATE_FOR_CANDIDATES = None
 _PUSH_LIQUIDITY_CAP_PATCHED = False
 _SUMMARY_AI_APPROVAL_DIAG_PATCHED = False
 _ORIGINAL_ENTRY_PRICE_BOUNDS = None
-
-_KEYS_MAY_BE_DF = (
-    "candidates",
-    "buy_candidates",
-    "sell_candidates",
-    "ai_results",
-    "ai_ok",
-    "buy_ai_ok",
-    "sell_ai_ok",
-    "approved_rows",
-)
-
 
 # -----------------------------
 # small helpers
@@ -84,72 +71,6 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
 def _append_reason(base: Any, extra: str) -> str:
     b = str(base or "").strip()
     return f"{b}|{extra}" if b else str(extra)
-
-
-# -----------------------------
-# result DataFrame truth patch
-# -----------------------------
-def _df_to_records(v: Any) -> Any:
-    try:
-        import pandas as pd
-        if isinstance(v, pd.DataFrame):
-            if v.empty:
-                return []
-            try:
-                if not v.columns.is_unique:
-                    dup = [str(c) for c in v.columns[v.columns.duplicated()].unique().tolist()]
-                    logger.warning(
-                        "[SUMMARY AI HOOK DF TRUTH PATCH] duplicate columns before records dup=%s cols=%s rows=%s",
-                        dup[:30], len(v.columns), len(v),
-                    )
-                    v = v.loc[:, ~v.columns.duplicated()].copy()
-            except Exception:
-                pass
-            return v.to_dict(orient="records")
-        if v is None:
-            return []
-        if isinstance(v, tuple):
-            return list(v)
-        return v
-    except Exception:
-        logger.exception("[SUMMARY AI HOOK DF TRUTH PATCH] value normalization failed type=%s", type(v).__name__)
-        return [] if v is None else v
-
-
-def _normalize_result_dict(d: Any) -> dict[str, Any]:
-    if not isinstance(d, dict):
-        return {}
-    out = dict(d)
-    converted: dict[str, int] = {}
-    for key in _KEYS_MAY_BE_DF:
-        if key in out:
-            before = out.get(key)
-            after = _df_to_records(before)
-            out[key] = after
-            try:
-                if type(before).__name__ != type(after).__name__:
-                    converted[key] = len(after) if hasattr(after, "__len__") else -1
-            except Exception:
-                converted[key] = -1
-    if not isinstance(out.get("execution"), dict):
-        out["execution"] = {} if out.get("execution") is None else {"raw_execution": str(out.get("execution"))[:500]}
-    if converted:
-        logger.warning("[SUMMARY AI HOOK DF TRUTH PATCH] normalized result DataFrame/list fields converted=%s", converted)
-    return out
-
-
-def _patched_result_to_dict(result: Any) -> dict[str, Any]:
-    try:
-        if callable(_ORIGINAL_RESULT_TO_DICT):
-            d = _ORIGINAL_RESULT_TO_DICT(result)
-        elif isinstance(result, dict):
-            d = result
-        else:
-            d = {}
-        return _normalize_result_dict(d)
-    except Exception:
-        logger.exception("[SUMMARY AI HOOK DF TRUTH PATCH] patched _result_to_dict failed")
-        return {"candidates": [], "ai_results": [], "ai_ok": [], "sell_ai_ok": [], "execution": {"executed": False, "skip_reason": "result_to_dict_exception"}}
 
 
 # -----------------------------
@@ -324,34 +245,24 @@ def _install_ranking_precheck_pending_failopen() -> bool:
 
 
 def install() -> bool:
-    global _PATCHED, _ORIGINAL_RESULT_TO_DICT
+    global _PATCHED
     ok_rank_precheck = _install_ranking_precheck_pending_failopen()
     ok_weak_ai = _install_summary_ai_weak_filter()
     ok_liq_cap = _install_push_liquidity_rotation_cap()
     ok_approval_diag = _install_summary_ai_approval_diag_and_price_floor()
+    # summary_ai_entry_hook_v20._result_to_dict の差し替えは撤去した。
+    # DataFrame -> records 正規化と execution の dict 化は
+    # scheduler_jobs/summary/summary_ai_entry_hook_v20.py 本体へ本文化済み
+    # (_result_to_dict_core + _normalize_result_dict、
+    #  スコープは同ファイルの _df_truth_scope_enabled() が再現)。
     if _PATCHED:
         return True and ok_rank_precheck and ok_weak_ai and ok_liq_cap and ok_approval_diag
-    try:
-        import scheduler_jobs.summary.summary_ai_entry_hook_v20 as target
-        cur = getattr(target, "_result_to_dict", None)
-        if not callable(cur):
-            logger.warning("[SUMMARY AI HOOK DF TRUTH PATCH] target _result_to_dict not callable")
-            return bool(ok_rank_precheck and ok_weak_ai and ok_liq_cap and ok_approval_diag)
-        if getattr(cur, "_summary_ai_hook_df_truth_patch", False):
-            _PATCHED = True
-            return True and ok_rank_precheck and ok_weak_ai and ok_liq_cap and ok_approval_diag
-        _ORIGINAL_RESULT_TO_DICT = cur
-        _patched_result_to_dict._summary_ai_hook_df_truth_patch = True  # type: ignore[attr-defined]
-        target._result_to_dict = _patched_result_to_dict
-        _PATCHED = True
-        logger.warning(
-            "[SUMMARY AI HOOK DF TRUTH PATCH] installed ranking_precheck_failopen=%s weak_ai=%s liq_cap=%s approval_diag=%s version=%s",
-            ok_rank_precheck, ok_weak_ai, ok_liq_cap, ok_approval_diag, VERSION,
-        )
-        return True and ok_rank_precheck and ok_weak_ai and ok_liq_cap and ok_approval_diag
-    except Exception:
-        logger.exception("[SUMMARY AI HOOK DF TRUTH PATCH] install failed")
-        return bool(ok_rank_precheck and ok_weak_ai and ok_liq_cap and ok_approval_diag)
+    _PATCHED = True
+    logger.warning(
+        "[SUMMARY AI HOOK DF TRUTH PATCH] installed ranking_precheck_failopen=%s weak_ai=%s liq_cap=%s approval_diag=%s version=%s",
+        ok_rank_precheck, ok_weak_ai, ok_liq_cap, ok_approval_diag, VERSION,
+    )
+    return True and ok_rank_precheck and ok_weak_ai and ok_liq_cap and ok_approval_diag
 
 
 try:

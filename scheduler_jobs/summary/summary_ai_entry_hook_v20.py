@@ -21,6 +21,7 @@ import importlib
 import inspect
 import logging
 import os
+import sys
 from collections import Counter
 from typing import Any, Callable, Optional
 
@@ -132,7 +133,7 @@ def _filter_kwargs(fn: Callable[..., Any], kwargs: dict[str, Any]) -> dict[str, 
         return dict(kwargs)
 
 
-def _result_to_dict(result: Any) -> dict[str, Any]:
+def _result_to_dict_core(result: Any) -> dict[str, Any]:
     if isinstance(result, dict):
         return result
     if isinstance(result, pd.DataFrame):
@@ -158,6 +159,147 @@ def _result_to_dict(result: Any) -> dict[str, Any]:
         "approved_rows": [],
         "execution": {"executed": False, "skip_reason": f"runner_returned_{type(result).__name__}"},
     }
+
+
+# ------------------------------------------------------------
+# DataFrame truth value 正規化
+# (旧 core/startup/summary_ai_entry_hook_dataframe_truth_patch.py を本文化)
+#
+#   _result_to_dict() の戻り値に DataFrame が残っていると、下流の
+#   `x or y` / `if x:` で "truth value of a DataFrame is ambiguous" になる。
+#   そこで DataFrame は records へ落とし、execution は必ず dict にする。
+#
+#   旧パッチは sitecustomize の BACKGROUND_MAIN_PATCHES 経由 = main.py 専用
+#   (SITECUSTOMIZE_ENABLE_FULL_NONMAIN=1 の明示時を含む) で install されていた。
+#   このモジュールは runner_core.py 経由で DB 系プロセスからも import されるため、
+#   _df_truth_scope_enabled() で当時のスコープを保つ。
+# ------------------------------------------------------------
+
+_DF_TRUTH_KEYS_MAY_BE_DF = (
+    "candidates",
+    "buy_candidates",
+    "sell_candidates",
+    "ai_results",
+    "ai_ok",
+    "buy_ai_ok",
+    "sell_ai_ok",
+    "approved_rows",
+)
+
+_DF_TRUTH_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+
+
+def _df_truth_env_on(name: str, default: bool = False) -> bool:
+    """sitecustomize._env_on と同じ解釈。
+
+    runner_utils.env_bool とは意図的に別実装: env_bool は空文字を False、
+    "ok"/"enable"/"enabled" を default 扱いにするので、
+    SITECUSTOMIZE_* の判定に流用するとスコープがずれる。
+    """
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _df_truth_scope_enabled() -> bool:
+    """このプロセスで result 正規化を行うか (旧 install スコープの再現)。
+
+    SUMMARY_AI_DF_TRUTH_SCOPE_ENABLED=1/0 で明示的に上書きできる。
+    """
+    try:
+        raw = os.getenv("SUMMARY_AI_DF_TRUTH_SCOPE_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return _df_truth_env_on("SUMMARY_AI_DF_TRUTH_SCOPE_ENABLED", True)
+        # sitecustomize._install_module の disabled_env は "1" 完全一致で判定していた
+        if str(os.environ.get("DISABLE_SUMMARY_AI_DF_TRUTH_PATCH", "")).strip() == "1":
+            return False
+        argv_parts = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        argv = " ".join(argv_parts)
+        # sitecustomize は database context を main.py 判定より先に見る
+        if any(name in argv for name in _DF_TRUTH_DB_PROCESS_NAMES):
+            return False
+        is_main_py = any(a.endswith("/main.py") or a == "main.py" for a in argv_parts)
+        if is_main_py and _df_truth_env_on("SITECUSTOMIZE_MAIN_LITE", True):
+            return True
+        return _df_truth_env_on("SITECUSTOMIZE_ENABLE_FULL_NONMAIN", False)
+    except Exception:
+        return False
+
+
+def _df_to_records(v: Any) -> Any:
+    try:
+        if isinstance(v, pd.DataFrame):
+            if v.empty:
+                return []
+            try:
+                if not v.columns.is_unique:
+                    dup = [str(c) for c in v.columns[v.columns.duplicated()].unique().tolist()]
+                    logger.warning(
+                        "[SUMMARY AI HOOK DF TRUTH] duplicate columns before records dup=%s cols=%s rows=%s",
+                        dup[:30], len(v.columns), len(v),
+                    )
+                    v = v.loc[:, ~v.columns.duplicated()].copy()
+            except Exception:
+                pass
+            return v.to_dict(orient="records")
+        if v is None:
+            return []
+        if isinstance(v, tuple):
+            return list(v)
+        return v
+    except Exception:
+        logger.exception("[SUMMARY AI HOOK DF TRUTH] value normalization failed type=%s", type(v).__name__)
+        return [] if v is None else v
+
+
+def _normalize_result_dict(d: Any) -> dict[str, Any]:
+    if not isinstance(d, dict):
+        return {}
+    out = dict(d)
+    converted: dict[str, int] = {}
+    for key in _DF_TRUTH_KEYS_MAY_BE_DF:
+        if key in out:
+            before = out.get(key)
+            after = _df_to_records(before)
+            out[key] = after
+            try:
+                if type(before).__name__ != type(after).__name__:
+                    converted[key] = len(after) if hasattr(after, "__len__") else -1
+            except Exception:
+                converted[key] = -1
+    if not isinstance(out.get("execution"), dict):
+        out["execution"] = {} if out.get("execution") is None else {"raw_execution": str(out.get("execution"))[:500]}
+    if converted:
+        logger.warning("[SUMMARY AI HOOK DF TRUTH] normalized result DataFrame/list fields converted=%s", converted)
+    return out
+
+
+def _result_to_dict(result: Any) -> dict[str, Any]:
+    if not _df_truth_scope_enabled():
+        return _result_to_dict_core(result)
+    try:
+        return _normalize_result_dict(_result_to_dict_core(result))
+    except Exception:
+        logger.exception("[SUMMARY AI HOOK DF TRUTH] normalized _result_to_dict failed")
+        return {
+            "candidates": [],
+            "ai_results": [],
+            "ai_ok": [],
+            "sell_ai_ok": [],
+            "execution": {"executed": False, "skip_reason": "result_to_dict_exception"},
+        }
 
 
 def _payload(result_dict: dict[str, Any], *keys: str, default: Any = None) -> Any:
