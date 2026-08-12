@@ -592,6 +592,45 @@ def build_light_1m_summary(interval: int, *, now: dt.datetime, display: bool = T
         return pd.DataFrame()
 
 
+def skip_sync_save_in_main(df: pd.DataFrame, interval: int, *, source: str) -> bool:
+    """main (entry-only) では 1m summary の同期 DB 保存をスキップするか。
+
+    True を返したら呼び出し側は保存せずに return する。
+    保存の担当は main_database.py 側。
+
+    旧構成では install() が scheduler_jobs.summary.runner_core._save_summary_if_owner
+    を _save_light で差し替えていた。ラッパは呼び出しのたびに
+    _is_entry_only_context() と SUMMARY_MAIN_SKIP_SYNC_SAVE を見ていたので、
+    その判定をそのままこの関数へ移し、runner_core 側から直接呼ぶ形にした。
+    """
+    if _is_entry_only_context() and _env_bool("SUMMARY_MAIN_SKIP_SYNC_SAVE", True):
+        logger.warning(
+            "[SUMMARY MAIN LIGHT TICK] sync save skipped in main interval=%s source=%s rows=%s reason=database_owner_main_database",
+            interval, source, len(df) if isinstance(df, pd.DataFrame) else 0,
+        )
+        return True
+    return False
+
+
+def handle_push_ai_entry_in_main(df: pd.DataFrame, interval: int, now: dt.datetime, run_entry: bool) -> bool:
+    """main (entry-only) では同期 AI hook の代わりに非同期 submit する。
+
+    True を返したら呼び出し側は同期 hook を実行せずに return する。
+
+    旧構成では install() が scheduler_jobs.summary.runner_core
+    ._run_push_ai_entry_before_display を _ai_light で「置換」していた
+    (元実装は一切呼ばない)。install() 自体が _is_entry_only_context() で
+    非 main を弾いていたので、その条件をこの関数の入口へ移した。
+    実際に submit するかどうかは _submit_async_ai 側が
+    SUMMARY_MAIN_ASYNC_AI_ENTRY / run_entry / interval で再判定する
+    (旧ラッパと同じく、submit しなくても同期 hook へは戻さない)。
+    """
+    if not _is_entry_only_context():
+        return False
+    _submit_async_ai(df, interval=int(interval), now=now, run_entry=run_entry, reason="original_ai_hook_async")
+    return True
+
+
 def install() -> bool:
     global _INSTALLED
     if _INSTALLED:
@@ -617,27 +656,9 @@ def install() -> bool:
         _install_history_patch()
         _install_no_raw_db_watchdog()
 
-        import scheduler_jobs.summary.runner_core as rc
-        orig_ai = getattr(rc, "_run_push_ai_entry_before_display", None)
-        orig_save = getattr(rc, "_save_summary_if_owner", None)
-
-        if callable(orig_save) and not getattr(orig_save, "_main_light_tick_wrapped", False):
-            def _save_light(df: pd.DataFrame, interval: int, *, source: str) -> None:
-                if _is_entry_only_context() and _env_bool("SUMMARY_MAIN_SKIP_SYNC_SAVE", True):
-                    logger.warning("[SUMMARY MAIN LIGHT TICK] sync save skipped in main interval=%s source=%s rows=%s reason=database_owner_main_database", interval, source, len(df) if isinstance(df, pd.DataFrame) else 0)
-                    return None
-                return orig_save(df, interval, source=source)
-            _save_light._main_light_tick_wrapped = True  # type: ignore[attr-defined]
-            _save_light._original = orig_save  # type: ignore[attr-defined]
-            rc._save_summary_if_owner = _save_light
-
-        if callable(orig_ai) and not getattr(orig_ai, "_main_light_tick_wrapped", False):
-            def _ai_light(df: pd.DataFrame, interval: int, now: dt.datetime, run_entry: bool) -> None:
-                _submit_async_ai(df, interval=int(interval), now=now, run_entry=run_entry, reason="original_ai_hook_async")
-                return None
-            _ai_light._main_light_tick_wrapped = True  # type: ignore[attr-defined]
-            _ai_light._original = orig_ai  # type: ignore[attr-defined]
-            rc._run_push_ai_entry_before_display = _ai_light
+        # runner_core._save_summary_if_owner / _run_push_ai_entry_before_display
+        # への差し替えは撤去した。runner_core 側が skip_sync_save_in_main() /
+        # handle_push_ai_entry_in_main() を tier1/tier2 と同じ形で直接呼ぶ。
 
         # job_summary/run_push_summary_job/job_1m の差し替えは撤去した。
         # scheduler_jobs/summary/runner_core.py の job_summary (tier2) が
@@ -660,4 +681,12 @@ try:
 except Exception:
     logger.exception("[SUMMARY MAIN LIGHT TICK] auto install failed")
 
-__all__ = ["VERSION", "install", "build_light_1m_summary", "_is_entry_only_context", "_env_bool"]
+__all__ = [
+    "VERSION",
+    "install",
+    "build_light_1m_summary",
+    "skip_sync_save_in_main",
+    "handle_push_ai_entry_in_main",
+    "_is_entry_only_context",
+    "_env_bool",
+]

@@ -164,7 +164,29 @@ def _summary_save_enabled() -> bool:
     return True
 
 
+def _main_light_tick_skip_sync_save(df: pd.DataFrame, interval: int, *, source: str) -> bool:
+    """main (entry-only) では 1m summary の同期保存を飛ばす。
+
+    旧 core/startup/summary_main_1m_light_tick_patch が
+    _save_summary_if_owner をラップして実現していたものを、
+    tier1/tier2 と同じ「呼び出し側から直接呼ぶ」形へ置き換えた。
+    """
+    try:
+        from core.startup.summary_main_1m_light_tick_patch import skip_sync_save_in_main
+    except Exception:
+        logger.debug("[summary.runners] light tick save-skip import failed", exc_info=True)
+        return False
+    try:
+        return bool(skip_sync_save_in_main(df, interval, source=source))
+    except Exception:
+        logger.exception("[summary.runners] light tick save-skip failed interval=%s", interval)
+        return False
+
+
 def _save_summary_if_owner(df: pd.DataFrame, interval: int, *, source: str) -> None:
+    if _main_light_tick_skip_sync_save(df, interval, source=source):
+        return
+
     if _summary_save_enabled():
         logger.info(
             "[summary.runners] DB save enabled interval=%s source=%s owner=%s db_process=%s",
@@ -190,7 +212,30 @@ def _save_summary_if_owner(df: pd.DataFrame, interval: int, *, source: str) -> N
 # AI before display
 # ============================================================
 
+def _main_light_tick_async_ai(df: pd.DataFrame, interval: int, now: dt.datetime, run_entry: bool) -> bool:
+    """main (entry-only) では PUSH AI hook を同期実行せず非同期 submit へ回す。
+
+    旧 core/startup/summary_main_1m_light_tick_patch が
+    _run_push_ai_entry_before_display を「置換」して実現していたもの
+    (元実装は一切呼ばれなかった) を、tier1/tier2 と同じ形へ置き換えた。
+    True を返したら同期 hook は実行しない = 旧構成と同じ。
+    """
+    try:
+        from core.startup.summary_main_1m_light_tick_patch import handle_push_ai_entry_in_main
+    except Exception:
+        logger.debug("[summary.runners] light tick async-ai import failed", exc_info=True)
+        return False
+    try:
+        return bool(handle_push_ai_entry_in_main(df, interval, now, run_entry))
+    except Exception:
+        logger.exception("[summary.runners] light tick async-ai failed interval=%s now=%s", interval, now)
+        return False
+
+
 def _run_push_ai_entry_before_display(df: pd.DataFrame, interval: int, now: dt.datetime, run_entry: bool) -> None:
+    if _main_light_tick_async_ai(df, interval, now, run_entry):
+        return
+
     if run_entry and interval in (1, 3, 5):
         logger.info("[summary.runners] push AI entry requested before display interval=%s now=%s source=SUMMARY hook=v20", interval, now)
         run_summary_ai_entry_safe(interval=interval, now=now, df=df, source="SUMMARY")
