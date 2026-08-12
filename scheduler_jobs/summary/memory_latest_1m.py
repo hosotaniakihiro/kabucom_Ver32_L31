@@ -17,7 +17,8 @@
 #     import されても main 以外では env を触らない。
 #   - このモジュールの関数を差し替える側は core/startup に残っている:
 #       summary_main_push_db_refresh_patch  -> _load_push_memory_df
-#       summary_mtf_diff_from_1m_patch      -> _publish_latest
+#       (summary_mtf_diff_from_1m_patch の _publish_latest 差し替えは撤去済み。
+#        history ブリッジは _publish_latest から直接呼ぶ)
 #
 # V4:
 #   - job_summary/run_push_summary_job/job_1m への再代入、および
@@ -494,6 +495,33 @@ def _build_memory_1m_summary(*, now: dt.datetime) -> pd.DataFrame:
 
 
 def _publish_latest(df: pd.DataFrame) -> None:
+    """latest を global へ publish し、続けて 1m history ブリッジを呼ぶ。
+
+    旧構成では core/startup/summary_mtf_diff_from_1m_patch がこのシンボルを
+    差し替えて history 保存を足していた。差し替えをやめ、こちらから
+    publish_1m_history_bridge() を直接呼ぶ形にした。
+    旧ラッパは finally でブリッジを走らせていたので、core が例外を投げても
+    ブリッジを実行し、例外はそのまま呼び出し元へ伝播させる。
+    """
+    try:
+        _publish_latest_core(df)
+    finally:
+        _publish_1m_history_bridge_safe(df)
+
+
+def _publish_1m_history_bridge_safe(df: pd.DataFrame) -> None:
+    try:
+        from core.startup.summary_mtf_diff_from_1m_patch import publish_1m_history_bridge
+    except Exception:
+        logger.debug("[SUMMARY MAIN MEMORY 1M] history bridge import failed", exc_info=True)
+        return
+    try:
+        publish_1m_history_bridge(df)
+    except Exception:
+        logger.exception("[SUMMARY MAIN MEMORY 1M] history bridge failed")
+
+
+def _publish_latest_core(df: pd.DataFrame) -> None:
     if not isinstance(df, pd.DataFrame) or df.empty:
         return
     try:

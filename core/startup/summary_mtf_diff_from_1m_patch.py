@@ -320,39 +320,32 @@ def _publish_to_global(interval: int, df_hist: pd.DataFrame, df_latest: pd.DataF
         return False
 
 
-def _patch_memory_latest_publish_history() -> bool:
-    """memory_latest_1m は latest だけを publish するため、history 保存を補う。"""
+def publish_1m_history_bridge(df: pd.DataFrame) -> bool:
+    """memory_latest_1m は latest だけを publish するため、history 保存を補う。
+
+    旧構成では install() が memory_latest_1m._publish_latest を差し替えていた。
+    差し替えをやめ、memory_latest_1m 側から直接この関数を呼ぶ形にした
+    (runner_core の tier1/tier2 と同じ「呼び出し側から呼ぶ」方式)。
+
+    有効条件は旧 install スコープの再現: _INSTALLED が True
+    (= SUMMARY_MTF_DIFF_FROM_1M_ENABLED を通り、SummaryController.diff_update の
+     差し替えまで到達している) ときだけ history を publish する。
+    """
+    if not _INSTALLED:
+        return False
     try:
-        import scheduler_jobs.summary.memory_latest_1m as mem
-        old = getattr(mem, "_publish_latest", None)
-        if not callable(old):
+        hist = _normalize_summary_df(df, interval=1)
+        if hist.empty:
             return False
-        if getattr(old, "_summary_mtf_memory_history_bridge_v19", False):
-            return True
-
-        def _publish_latest_with_history(df: pd.DataFrame) -> None:
-            try:
-                old(df)
-            finally:
-                try:
-                    hist = _normalize_summary_df(df, interval=1)
-                    if not hist.empty:
-                        latest = _latest_by_symbol(hist)
-                        _publish_to_global(1, hist, latest, require_mtf_ready=False)
-                        logger.warning(
-                            "[SUMMARY MTF DIFF 1M PATCH] memory 1m history bridge published hist_rows=%s latest_rows=%s latest_dt=%s version=%s",
-                            len(hist),
-                            len(latest),
-                            hist["datetime"].max() if "datetime" in hist.columns else None,
-                            VERSION,
-                        )
-                except Exception:
-                    logger.exception("[SUMMARY MTF DIFF 1M PATCH] memory 1m history bridge failed")
-
-        _publish_latest_with_history._summary_mtf_memory_history_bridge_v19 = True  # type: ignore[attr-defined]
-        _publish_latest_with_history._original = old  # type: ignore[attr-defined]
-        mem._publish_latest = _publish_latest_with_history
-        logger.warning("[SUMMARY MTF DIFF 1M PATCH] memory 1m _publish_latest history bridge installed version=%s", VERSION)
+        latest = _latest_by_symbol(hist)
+        _publish_to_global(1, hist, latest, require_mtf_ready=False)
+        logger.warning(
+            "[SUMMARY MTF DIFF 1M PATCH] memory 1m history bridge published hist_rows=%s latest_rows=%s latest_dt=%s version=%s",
+            len(hist),
+            len(latest),
+            hist["datetime"].max() if "datetime" in hist.columns else None,
+            VERSION,
+        )
         return True
     except Exception:
         logger.exception("[SUMMARY MTF DIFF 1M PATCH] memory history bridge install failed")
@@ -616,7 +609,6 @@ def install() -> bool:
             logger.warning("[SUMMARY MTF DIFF 1M PATCH] diff_update unavailable")
             return False
         if getattr(cur, "_summary_mtf_diff_from_1m_v19", False):
-            _patch_memory_latest_publish_history()
             _INSTALLED = True
             return True
         _ORIG_DIFF_UPDATE = getattr(cur, "_original", cur)
@@ -631,9 +623,8 @@ def install() -> bool:
                 setattr(inst.__class__, "diff_update", _patched_diff_update)
         except Exception:
             pass
-        bridge_ok = _patch_memory_latest_publish_history()
         _INSTALLED = True
-        logger.warning("[SUMMARY MTF DIFF 1M PATCH] installed %s publish_1m=True memory_history_bridge=%s cached_1m_mtf_fallback=True reject_zero_volume=%s min_1m_rows=%s min_mtf_rows=%s main_nas_skip=%s interval1_skip=%s", VERSION, bridge_ok, _env_bool("SUMMARY_MTF_REJECT_ZERO_VOLUME", True), os.getenv("SUMMARY_MTF_FALLBACK_MIN_1M_ROWS", "auto"), os.getenv("SUMMARY_MTF_FALLBACK_MIN_MTF_ROWS", "2"), _main_should_skip_nas_diff_update(3), _main_should_skip_nas_diff_update(1))
+        logger.warning("[SUMMARY MTF DIFF 1M PATCH] installed %s publish_1m=True memory_history_bridge=%s cached_1m_mtf_fallback=True reject_zero_volume=%s min_1m_rows=%s min_mtf_rows=%s main_nas_skip=%s interval1_skip=%s", VERSION, True, _env_bool("SUMMARY_MTF_REJECT_ZERO_VOLUME", True), os.getenv("SUMMARY_MTF_FALLBACK_MIN_1M_ROWS", "auto"), os.getenv("SUMMARY_MTF_FALLBACK_MIN_MTF_ROWS", "2"), _main_should_skip_nas_diff_update(3), _main_should_skip_nas_diff_update(1))
         return True
     except Exception:
         logger.exception("[SUMMARY MTF DIFF 1M PATCH] install failed")
