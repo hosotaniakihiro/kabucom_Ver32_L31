@@ -223,7 +223,7 @@ def _normalize_df(df: pd.DataFrame, *, table_name: str = "") -> pd.DataFrame:
     return out
 
 
-def _load_ranking_df(*, db_path: Optional[str | os.PathLike] = None, yyyymmdd: Any = None) -> pd.DataFrame:
+def __load_ranking_df_core(*, db_path: Optional[str | os.PathLike] = None, yyyymmdd: Any = None) -> pd.DataFrame:
     path = _resolve_ranking_db_path(db_path=db_path, yyyymmdd=yyyymmdd)
     if not path:
         logger.warning("[PUSH RANKING SELECTOR] ranking db path unresolved")
@@ -700,3 +700,25 @@ __all__ = [
     "split_push_ranking_symbols_for_rotation",
     "pick_push_ranking_symbols_for_rotation",
 ]
+
+
+# ============================================================
+# NAS/SMB sqlite I/O ガード (旧 core/startup/nas_sqlite_io_guard_patch.py)
+# ============================================================
+
+def _load_ranking_df(*, db_path=None, yyyymmdd=None) -> pd.DataFrame:
+    from utils import nas_sqlite_io_guard as _guard
+
+    path = None
+    try:
+        path = db_path
+        if path is None:
+            path = _resolve_ranking_db_path(db_path=None, yyyymmdd=yyyymmdd)
+        if path and _guard.is_bad(path):
+            logger.warning("[NAS SQLITE IO GUARD] skip ranking_selector bad path=%s", path)
+            return pd.DataFrame()
+        return _load_ranking_df_core(db_path=db_path, yyyymmdd=yyyymmdd)
+    except Exception as e:
+        if path and _guard.handle_error(path, e):
+            return pd.DataFrame()
+        raise

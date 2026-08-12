@@ -61,7 +61,7 @@ def safe_float(v: Any, default: float = 0.0) -> float:
 # symbol_flags target sets
 # ============================================================
 
-def read_symbol_flags_target_sets(
+def _read_symbol_flags_target_sets_core(
     db_path: Optional[str] = None,
 ) -> tuple[Set[str], Set[str]]:
     """
@@ -186,7 +186,7 @@ def filter_by_symbol_flags_targets(
 # common stock filter
 # ============================================================
 
-def read_symbol_flags_keep_set(db_path: str) -> Set[str]:
+def _read_symbol_flags_keep_set_core(db_path: str) -> Set[str]:
     keep: Set[str] = set()
 
     with sqlite3.connect(db_path) as conn:
@@ -453,3 +453,38 @@ def apply_freshness_filter(symbols: Sequence[str]) -> List[str]:
         )
 
     return filtered
+
+
+# ============================================================
+# NAS/SMB sqlite I/O ガード (旧 core/startup/nas_sqlite_io_guard_patch.py)
+# ------------------------------------------------------------
+# I/O 失敗時は空集合を返して pass-through させ、購読更新自体は止めない。
+# ============================================================
+
+def read_symbol_flags_target_sets(db_path: Optional[str] = None) -> tuple[Set[str], Set[str]]:
+    from utils import nas_sqlite_io_guard as _guard
+
+    path = db_path or globals().get("SYMBOL_FLAGS_DB_PATH", "")
+    if path and _guard.is_bad(path):
+        logger.warning("[NAS SQLITE IO GUARD] skip symbol_flags target bad path=%s", path)
+        return set(), set()
+    try:
+        return _read_symbol_flags_target_sets_core(db_path=db_path)
+    except Exception as e:
+        if _guard.handle_error(path, e):
+            return set(), set()
+        raise
+
+
+def read_symbol_flags_keep_set(db_path: str) -> Set[str]:
+    from utils import nas_sqlite_io_guard as _guard
+
+    if db_path and _guard.is_bad(db_path):
+        logger.warning("[NAS SQLITE IO GUARD] skip symbol_flags keep bad path=%s", db_path)
+        return set()
+    try:
+        return _read_symbol_flags_keep_set_core(db_path)
+    except Exception as e:
+        if _guard.handle_error(db_path, e):
+            return set()
+        raise

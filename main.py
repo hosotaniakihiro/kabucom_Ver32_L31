@@ -205,7 +205,13 @@ def _install_main_runtime_patches():
         # (_run_with_timeout/_invoke_job/_run_push_summary_tick/_run_ranking_summary_tick/
         # _run_summary_tick/_run_push_fallback_when_unified_blocked/_push_fallback_worker/
         # run_summary_tick_once の8関数を shutdown/executor-recovery guard 込みで公開名に維持)。
-        ("core.startup.nas_sqlite_io_guard_patch", "install"),
+        # nas_sqlite_io_guard_patch は各ホストへ本文化済み:
+        #   utils/nas_sqlite_io_guard.py (共有ネガティブキャッシュ+スコープ判定) を
+        #   ranking_selector._load_ranking_df /
+        #   ranking_source_selector.read_ranking_df_from_db /
+        #   filters.read_symbol_flags_target_sets / read_symbol_flags_keep_set /
+        #   ats.ats_ranking.db_path._db_has_usable_ranking_tables
+        #   の各公開関数が直接使う。
         # entry_controller_runtime_reject_patch は trading/handlers/entry_controller.py の
         # cleanup_stale_100368_sell_reject_cache() へ native化済み (直接呼び出しは下記)。
         ("core.startup.fast_startup_runtime_patch", "install"),

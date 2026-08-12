@@ -123,7 +123,7 @@ def _today_ranking_db_path(now: Optional[dt.datetime] = None) -> Path:
 # DB inspection
 # ============================================================
 
-def _db_has_usable_ranking_tables(db_path: str) -> bool:
+def __db_has_usable_ranking_tables_core(db_path: str) -> bool:
     """
     ranking DB が実データを持っているかを確認する。
 
@@ -497,3 +497,21 @@ __all__ = [
     "get_today_ranking_db_path",
     "invalidate_ranking_db_path_cache",
 ]
+
+
+# ============================================================
+# NAS/SMB sqlite I/O ガード (旧 core/startup/nas_sqlite_io_guard_patch.py)
+# ============================================================
+
+def _db_has_usable_ranking_tables(db_path: str) -> bool:
+    from utils import nas_sqlite_io_guard as _guard
+
+    if db_path and _guard.is_bad(db_path):
+        logger.warning("[NAS SQLITE IO GUARD] skip ats usable check bad path=%s", db_path)
+        return False
+    try:
+        return _db_has_usable_ranking_tables_core(db_path)
+    except Exception as e:
+        if _guard.handle_error(db_path, e):
+            return False
+        raise

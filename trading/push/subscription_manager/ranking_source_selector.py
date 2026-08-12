@@ -249,7 +249,7 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
-def read_ranking_df_from_db(path: str) -> Tuple[pd.DataFrame, List[str]]:
+def _read_ranking_df_from_db_core(path: str) -> Tuple[pd.DataFrame, List[str]]:
     read_tables: List[str] = []
 
     # read-only 接続はDBを新規作成しないため、存在しない場合は
@@ -810,3 +810,21 @@ def select_subscription_symbols_from_ranking_df(
     )
 
     return result[:limit]
+
+
+# ============================================================
+# NAS/SMB sqlite I/O ガード (旧 core/startup/nas_sqlite_io_guard_patch.py)
+# ============================================================
+
+def read_ranking_df_from_db(path: str) -> Tuple[pd.DataFrame, List[str]]:
+    from utils import nas_sqlite_io_guard as _guard
+
+    if path and _guard.is_bad(path):
+        logger.warning("[NAS SQLITE IO GUARD] skip ranking_source_selector bad path=%s", path)
+        return pd.DataFrame(), []
+    try:
+        return _read_ranking_df_from_db_core(path)
+    except Exception as e:
+        if _guard.handle_error(path, e):
+            return pd.DataFrame(), []
+        raise
