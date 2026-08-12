@@ -4,8 +4,8 @@ RANKING pre-filter シグナル版の本体は
 trading/entry/summary_ai/runner.py._apply_ranking_pre_filter へ本文化済み。
 
 このモジュールに残っているのは、旧 V4 の install() が併せて行っていた
-2件の連鎖install (ranking_summary_fast_entry / exit_stagnation) とその
-リトライ watcher のみ。両者を本文化した時点でこのファイルごと削除する。
+連鎖install (exit_stagnation) とそのリトライ watcher のみ。
+これを本文化した時点でこのファイルごと削除する。
 """
 from __future__ import annotations
 
@@ -44,17 +44,6 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
-def _install_fast_ranking_summary() -> bool:
-    try:
-        from core.startup.ranking_summary_fast_entry_patch import install as _install_fast
-        ok = bool(_install_fast())
-        logger.warning("[SUMMARY AI RANKING PREFILTER SIGNAL] fast ranking summary patch ok=%s version=%s", ok, VERSION)
-        return ok
-    except Exception:
-        logger.exception("[SUMMARY AI RANKING PREFILTER SIGNAL] fast ranking summary patch failed version=%s", VERSION)
-        return False
-
-
 def _install_exit_stagnation() -> bool:
     try:
         from core.startup.exit_stagnation_favorable_then_market_patch import install as _install_exit_stagnation
@@ -71,7 +60,6 @@ def _watcher() -> None:
     sleep_sec = max(0.5, _env_float("SUMMARY_AI_RANKING_PREFILTER_WATCHER_SLEEP", 1.0))
     for i in range(loops):
         try:
-            _install_fast_ranking_summary()
             _install_exit_stagnation()
         except Exception:
             logger.debug("[SUMMARY AI RANKING PREFILTER SIGNAL] watcher loop failed", exc_info=True)
@@ -81,17 +69,16 @@ def _watcher() -> None:
 
 def install() -> bool:
     global _INSTALLED, _WATCHER_STARTED
-    fast_ok = _install_fast_ranking_summary()
     exit_ok = _install_exit_stagnation()
-    _INSTALLED = bool(fast_ok or exit_ok)
-    if (fast_ok or exit_ok) and not _WATCHER_STARTED:
+    _INSTALLED = bool(exit_ok)
+    if exit_ok and not _WATCHER_STARTED:
         _WATCHER_STARTED = True
         try:
             threading.Thread(target=_watcher, name="summary-ai-ranking-prefilter-signal-watch", daemon=True).start()
             logger.warning("[SUMMARY AI RANKING PREFILTER SIGNAL] watcher started version=%s", VERSION)
         except Exception:
             logger.exception("[SUMMARY AI RANKING PREFILTER SIGNAL] watcher start failed version=%s", VERSION)
-    return bool(fast_ok or exit_ok)
+    return bool(exit_ok)
 
 
 try:

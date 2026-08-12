@@ -41,6 +41,26 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
+# RANKING SUMMARY BG 既定値
+# ------------------------------------------------------------
+# 旧 core/startup/ranking_summary_fast_entry_patch.py の install() が
+# 設定していた env 既定値を本文化。
+#
+# main.py での ranking summary 構築が数分かかると、BG の timeout/cooldown に
+# 引っかかって RANKING AI hook が走らなくなるため、timeout と stale を伸ばし
+# cooldown を短くして経路を生かす。読み手はこのモジュール内の
+# _ranking_bg_env_float() のみ。
+# lookback の打ち切り自体は
+# scheduler_jobs/summary/ranking_summary_jobs.job_ranking_summary_all 側。
+# ============================================================
+
+os.environ.setdefault("RANKING_SUMMARY_BG_TIMEOUT_SEC", "180")
+os.environ.setdefault("RANKING_SUMMARY_BG_COOLDOWN_SEC", "30")
+os.environ.setdefault("RANKING_SUMMARY_INTERNAL_STALE_SEC", "240")
+os.environ.setdefault("RANKING_SUMMARY_BG_STALE_SEC", "240")
+
+
+# ============================================================
 # module state
 # ============================================================
 

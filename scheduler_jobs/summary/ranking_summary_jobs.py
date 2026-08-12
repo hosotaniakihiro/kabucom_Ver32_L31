@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 import threading
 import time
 from typing import Optional
@@ -368,7 +369,7 @@ def job_ranking_summary_5m(
     )
 
 
-def job_ranking_summary_all(
+def _job_ranking_summary_all_core(
     *,
     force: bool = False,
     trade_date=None,
@@ -422,6 +423,56 @@ def job_ranking_summary_all(
         results[5] = pd.DataFrame()
 
     return results
+
+
+# ============================================================
+# RANKING SUMMARY FAST ENTRY ROUTE
+# ------------------------------------------------------------
+# 旧 core/startup/ranking_summary_fast_entry_patch.py
+# (V1-RANKING-SUMMARY-FAST-ENTRY-ROUTE) を本文化。
+#
+# main.py での ranking summary 構築が数分かかると BG timeout/cooldown により
+# RANKING AI hook が走らなくなるため、スケジュール実行 (run_entry=True) の
+# 場合だけ lookback を短く打ち切って経路を生かす。
+# BG timeout/cooldown/stale 側の既定値は core/startup/scheduler/bootstrap.py
+# のモジュール冒頭で設定している。
+# ============================================================
+
+_RANKING_SUMMARY_FAST_ENTRY_VERSION = "V1-RANKING-SUMMARY-FAST-ENTRY-ROUTE"
+
+os.environ.setdefault("RANKING_SUMMARY_ENTRY_LOOKBACK_MIN", "20")
+
+
+def _ranking_summary_fast_entry_env_int(name: str, default: int) -> int:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return int(default)
+        return max(1, int(float(raw)))
+    except Exception:
+        return int(default)
+
+
+def job_ranking_summary_all(*args, **kwargs):
+    try:
+        if kwargs.get("run_entry", True):
+            cap = _ranking_summary_fast_entry_env_int("RANKING_SUMMARY_ENTRY_LOOKBACK_MIN", 20)
+            old = kwargs.get("lookback_minutes", 240)
+            try:
+                old_i = int(old)
+            except Exception:
+                old_i = 240
+            if old_i > cap:
+                kwargs["lookback_minutes"] = cap
+            logger.warning(
+                "[RANKING SUMMARY FAST ENTRY] lookback capped old=%s new=%s version=%s",
+                old,
+                kwargs.get("lookback_minutes"),
+                _RANKING_SUMMARY_FAST_ENTRY_VERSION,
+            )
+    except Exception:
+        pass
+    return _job_ranking_summary_all_core(*args, **kwargs)
 
 
 def run_ranking_summary_job(**kwargs):
