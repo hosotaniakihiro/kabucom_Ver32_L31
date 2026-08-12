@@ -168,12 +168,27 @@ def clear_runtime_memory() -> None:
 
 
 def _install_push_summary_history_patch() -> None:
-    try:
-        from core.startup.push_summary_history_runtime_patch import install as install_push_history
-        ok = install_push_history()
-        logger.warning("[STARTUP.RUNTIME] push summary history patch installed=%s", ok)
-    except Exception:
-        logger.exception("[STARTUP.RUNTIME] push summary history patch install failed")
+    # push_summary_history_runtime_patch は削除した。実質デッドだったため。
+    #
+    # 理由: あのパッチは差し替え対象を
+    #   import trading.summary.engine.push_summary_engine as pse
+    # で取っていたが、trading/summary/engine/__init__.py:13 が
+    # `from .push_summary_engine import (..., push_summary_engine, ...)` で
+    # サブモジュールと同名の「関数」をパッケージ名前空間へ入れているため、
+    # `import a.b.c as x` の getattr(sys.modules['a.b'], 'c') が
+    # モジュールではなく関数を返していた。
+    # その結果 getattr(pse, "_resolve_summary_source_df", None) 等がすべて None になり、
+    # _resolve_summary_source_df / _store_push_merged_summary / public 6 関数
+    # (build_summary / build_push_summary / push_summary_engine /
+    #  run_push_summary_engine / run_summary_engine / run) のラップが
+    # 1 つも成立していなかった (実測確認済み)。
+    # install() は True を返し "installed V4" もログへ出るので、
+    # ログ上は動いているように見えていた点に注意。
+    #
+    # 同じ書き方をしていた summary_main_1m_light_tick_patch._install_history_patch も
+    # 同じ理由で不発だったため併せて撤去した。
+    # 履歴補完 / mtf-rebuild を本当に有効化するかは別途の仕様判断。
+    return
 
 
 def _install_global_context_summary_repair_patch() -> None:
