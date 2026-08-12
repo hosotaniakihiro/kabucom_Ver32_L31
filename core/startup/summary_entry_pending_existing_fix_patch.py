@@ -198,7 +198,7 @@ def _is_summary_ai_entry(entry: Dict[str, Any]) -> bool:
     return False
 
 
-def _stale_summary_reason(entry: Dict[str, Any]) -> str | None:
+def _stale_summary_reason_base(entry: Dict[str, Any]) -> str | None:
     if not _env_bool("SUMMARY_SKIP_STALE_PENDING_ENABLED", True):
         return None
     if not _is_summary_ai_entry(entry):
@@ -419,3 +419,125 @@ try:
     install()
 except Exception as e:
     logger.exception("[SUMMARY ENTRY PENDING FIX] auto install failed err=%s", e)
+
+
+# ============================================================
+# fresh dispatch pending rescue
+# ------------------------------------------------------------
+# 旧 core/startup/summary_entry_stale_pending_rescue_patch.py を統合。
+# (このモジュール自体がまだパッチなので「本文化」ではなくホストへの統合)
+#
+# SUMMARY AI direct dispatch 直後に作られた候補は、summary足の datetime が
+# 古くても created_at / pending_refreshed_at が新しければ stale_skipped で
+# 捨てない。ヘルパは本モジュール既存のものと実装が違うため、旧パッチの
+# ものを _stale_rescue_* として移植した (流用しない)。
+# ============================================================
+
+_STALE_RESCUE_TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+
+
+_STALE_RESCUE_FALSE = {"0", "false", "no", "n", "off", "ng", "disable", "disabled", ""}
+
+
+def _stale_rescue_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        raw = os.getenv(name)
+        if raw is None:
+            return bool(default)
+        s = str(raw).strip().lower()
+        if s in _STALE_RESCUE_TRUE:
+            return True
+        if s in _STALE_RESCUE_FALSE:
+            return False
+    except Exception:
+        pass
+    return bool(default)
+
+
+def _stale_rescue_env_float(name: str, default: float) -> float:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return float(default)
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
+def _stale_rescue_as_dt(v: Any) -> dt.datetime | None:
+    try:
+        if v is None or str(v).strip() == "":
+            return None
+        if hasattr(v, "to_pydatetime"):
+            v = v.to_pydatetime()
+        if isinstance(v, dt.datetime):
+            return v.replace(tzinfo=None)
+        s = str(v).strip()
+        if s.lower() in {"nat", "nan", "none", "null"}:
+            return None
+        try:
+            return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            pass
+        try:
+            import pandas as pd  # type: ignore
+            p = pd.to_datetime(v, errors="coerce")
+            if str(p) == "NaT":
+                return None
+            if hasattr(p, "to_pydatetime"):
+                p = p.to_pydatetime()
+            if isinstance(p, dt.datetime):
+                return p.replace(tzinfo=None)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return None
+
+
+def _stale_rescue_fresh_runtime_age(entry: dict[str, Any]) -> tuple[float | None, str]:
+    for key in ("pending_refreshed_at", "created_at", "queued_at", "approved_at", "built_at", "updated_at"):
+        ts = _stale_rescue_as_dt(entry.get(key))
+        if ts is None:
+            continue
+        try:
+            return max(0.0, (dt.datetime.now() - ts).total_seconds()), key
+        except Exception:
+            continue
+    return None, ""
+
+
+def _stale_summary_reason(entry: Dict[str, Any]) -> str | None:
+    try:
+        if not _stale_rescue_env_bool("SUMMARY_ENTRY_STALE_RESCUE_ENABLED", True):
+            return _stale_summary_reason_base(entry)
+
+        is_summary = False
+        try:
+            fn = globals().get("_is_summary_ai_entry")
+            is_summary = bool(fn(entry)) if callable(fn) else False
+        except Exception:
+            is_summary = False
+
+        if is_summary:
+            runtime_age, runtime_key = _stale_rescue_fresh_runtime_age(entry)
+            fresh_limit = _stale_rescue_env_float("SUMMARY_ENTRY_FRESH_DISPATCH_MAX_AGE_SEC", 45.0)
+            if runtime_age is not None and runtime_age <= fresh_limit:
+                _identity_fn = globals().get("_identity")
+                logger.warning(
+                    "[SUMMARY ENTRY STALE RESCUE] allow fresh runtime candidate symbol=%s identity=%s runtime_key=%s runtime_age=%.1fs limit=%.1fs bar_datetime=%s score=%s side=%s",
+                    entry.get("symbol"),
+                    _identity_fn(entry) if callable(_identity_fn) else "",
+                    runtime_key,
+                    runtime_age,
+                    fresh_limit,
+                    entry.get("datetime"),
+                    entry.get("score", entry.get("final_score")),
+                    entry.get("side") or entry.get("entry_decision") or entry.get("ai_side"),
+                )
+                return None
+
+        return _stale_summary_reason_base(entry)
+    except Exception:
+        logger.debug("[SUMMARY ENTRY STALE RESCUE] rescued stale check failed", exc_info=True)
+        return _stale_summary_reason_base(entry)

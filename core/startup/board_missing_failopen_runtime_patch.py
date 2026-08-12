@@ -107,15 +107,14 @@ def _install_summary_ai_lock_retry() -> bool:
 
 
 def _install_summary_entry_stale_rescue() -> bool:
-    try:
-        from core.startup import summary_entry_stale_pending_rescue_patch as sr
-        fn = getattr(sr, "install", None)
-        ok = bool(fn()) if callable(fn) else False
-        logger.warning("[BOARD MISSING FAILOPEN] summary_entry_stale_rescue installed=%s", ok)
-        return ok
-    except Exception:
-        logger.exception("[BOARD MISSING FAILOPEN] summary_entry_stale_rescue install failed")
-        return False
+    """fresh dispatch 直後の pending を stale で捨てない救済。
+
+    旧 core/startup/summary_entry_stale_pending_rescue_patch.py は
+    core/startup/summary_entry_pending_existing_fix_patch.py の
+    _stale_summary_reason 本体へ統合済み (ヘルパは同ファイルの
+    _stale_rescue_* が旧パッチの実装を保持)。事前installは不要になった。
+    """
+    return True
 
 
 def install() -> bool:
