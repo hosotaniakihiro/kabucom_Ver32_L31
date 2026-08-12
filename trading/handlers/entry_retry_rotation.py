@@ -8,7 +8,7 @@
 # パッチではなく trading/handlers/ 配下へ移設した (ロジックは無変更)。
 # ============================================================
 # ============================================================
-# File   : core/startup/entry_summary_retry_rotation_runtime_patch.py
+# (旧ヘッダ) core/startup/entry_summary_retry_rotation_runtime_patch.py
 # Version: V2-EXECUTE-BEST-CANDIDATE-WRAP-REMOVED
 # ------------------------------------------------------------
 # SUMMARY_AIでAI_OKになった候補を、未約定2秒キャンセル後に
