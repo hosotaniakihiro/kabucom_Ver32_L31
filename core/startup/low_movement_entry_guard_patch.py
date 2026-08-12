@@ -600,14 +600,11 @@ def _install_ranking_direction_guard() -> bool:
 
 
 def _install_scoring_flag_pattern_bridge() -> bool:
-    try:
-        from core.startup import scoring_flag_pattern_bridge_patch as p
-        ok = p.install()
-        logger.warning("[LOW MOVE GUARD] scoring_flag_pattern_bridge_patch installed=%s", ok)
-        return bool(ok)
-    except Exception as e:
-        logger.warning("[LOW MOVE GUARD] scoring_flag_pattern_bridge_patch install failed: %s", e, exc_info=False)
-        return False
+    # scoring_flag_pattern_bridge_patch は
+    # trading/scoring/core/detail_score_builder.build_detail_scores() の
+    # 末尾へ本文化済み (attach_flag_and_pattern_scores を直接呼ぶ)。
+    # ファイルごと削除したので、ここは install 成功と同じ True を返す。
+    return True
 
 
 def _install_entry_direction_confirm_guard() -> bool:

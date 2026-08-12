@@ -849,4 +849,20 @@ def build_detail_scores(
         int((pd.to_numeric(out["direction_penalty"], errors="coerce").fillna(0.0) != 0).sum()),
     )
 
+    # --------------------------------------------------------
+    # flags / patterns ブリッジ
+    # (旧 core/startup/scoring_flag_pattern_bridge_patch.py を本文化)
+    #   trading/scoring/flags と trading/scoring/patterns の結果を
+    #   score_base / direction_penalty へ反映する。
+    #   bridge 側が落ちてもスコア本体は返す (fail-soft)。
+    # --------------------------------------------------------
+    try:
+        from trading.scoring.core.flag_pattern_score_bridge import (
+            attach_flag_and_pattern_scores,
+        )
+
+        out = attach_flag_and_pattern_scores(out)
+    except Exception:
+        logger.exception("[DETAIL SCORE] flag/pattern bridge attach failed")
+
     return out
