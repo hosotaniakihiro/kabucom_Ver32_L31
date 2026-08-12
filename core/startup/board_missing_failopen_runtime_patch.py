@@ -73,14 +73,36 @@ def _patch_entry_order_builder_safe() -> bool:
 
 
 def _install_summary_ai_lock_retry() -> bool:
+    """controller busy 時のリトライ設定を確定させる。
+
+    旧 core/startup/summary_ai_lock_retry_runtime_patch.py を本文化。
+    同パッチの関数差し替え
+    (summary_ai_async_entry_patch._is_retryable_controller_busy) は読み手が
+    1つも無く死んでいた (実際の判定は
+    trading/entry/summary_ai/executor.py:_async_is_retryable_controller_busy)。
+    実効は下記の env ハード代入だけなので、呼び出し位置を変えずにここへ移した。
+
+    summary_ai_async_entry_patch は :41-45 で同じキーを setdefault し、
+    install() 内 (:316-317) で STALE_SEC を 20 以下へクランプするが、
+    この関数はその後に走るため 35 / 0.8 が最終値になる。
+    実際の install 順をスタブ module で再現して確認済み。
+    """
     try:
-        from core.startup import summary_ai_lock_retry_runtime_patch as lr
-        fn = getattr(lr, "install", None)
-        ok = bool(fn()) if callable(fn) else False
-        logger.warning("[BOARD MISSING FAILOPEN] summary_ai_lock_retry installed=%s", ok)
-        return ok
+        os.environ["SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK"] = "1"
+        os.environ["SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY"] = "1"
+        os.environ["SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX"] = os.getenv("SUMMARY_AI_LOCK_RETRY_MAX", "3")
+        os.environ["SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_SLEEP_SEC"] = os.getenv("SUMMARY_AI_LOCK_RETRY_SLEEP", "0.8")
+        os.environ["SUMMARY_AI_ASYNC_ENTRY_STALE_SEC"] = os.getenv("SUMMARY_AI_LOCK_RETRY_STALE", "35")
+        logger.warning(
+            "[BOARD MISSING FAILOPEN] summary_ai_lock_retry env applied retry_max=%s sleep=%s stale=%s reentrant=%s",
+            os.environ.get("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX"),
+            os.environ.get("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_SLEEP_SEC"),
+            os.environ.get("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC"),
+            os.environ.get("SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK"),
+        )
+        return True
     except Exception:
-        logger.exception("[BOARD MISSING FAILOPEN] summary_ai_lock_retry install failed")
+        logger.exception("[BOARD MISSING FAILOPEN] summary_ai_lock_retry env apply failed")
         return False
 
 
