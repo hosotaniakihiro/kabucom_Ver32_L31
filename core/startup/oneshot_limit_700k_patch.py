@@ -88,16 +88,19 @@ def _install_entry_budget_700k_env_override() -> bool:
 
 
 def _install_push_bootstrap_fast_restore_patch() -> bool:
+    """PUSH bootstrap 高速復元の env 既定値を設定する。
+
+    復元ロジック自体は core/startup/push/bootstrap.py._load_push_db へ
+    本文化済み (スコープは同ファイルの _push_fast_scope_enabled() が再現)。
+    ここは既定値の設定タイミングを従来どおりに保つために残している。
+    """
     try:
         os.environ.setdefault("PUSH_BOOTSTRAP_FAST_RESTORE", "1")
         os.environ.setdefault("PUSH_BOOTSTRAP_FAST_MAX_ROWS", "3000")
         os.environ.setdefault("PUSH_BOOTSTRAP_FAST_LOOKBACK_MINUTES", "45")
-        from core.startup import push_bootstrap_fast_restore_patch as p
-        ok = p.install()
-        logger.warning("[ONESHOT LIMIT PATCH] push_bootstrap_fast_restore_patch installed=%s", ok)
-        return bool(ok)
+        return True
     except Exception:
-        logger.exception("[ONESHOT LIMIT PATCH] push_bootstrap_fast_restore_patch install failed")
+        logger.exception("[ONESHOT LIMIT PATCH] push bootstrap fast restore env defaults failed")
         return False
 
 

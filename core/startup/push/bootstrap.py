@@ -217,7 +217,7 @@ def _resolve_sqlite_datetime_column(cols: set[str]) -> str | None:
     return None
 
 
-def _load_push_db(db_path: str) -> pd.DataFrame:
+def _load_push_db_full(db_path: str) -> pd.DataFrame:
     started = dt.datetime.now()
     cutoff_dt = started - dt.timedelta(minutes=max(RESTORE_LOOKBACK_MINUTES, 1))
     cutoff_text = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -434,6 +434,172 @@ def _normalize_push_df_for_summary(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     return out.reset_index(drop=True)
+
+
+
+
+# ============================================================
+# PUSH bootstrap 高速復元
+# ------------------------------------------------------------
+# 旧 core/startup/push_bootstrap_fast_restore_patch.py を本文化。
+#
+# 起動時の push DB 復元は全列フルスキャンだと重いため、必要最小列だけを
+# 直近 N 分 / 最大 M 行に絞って読む。失敗時は従来の _load_push_db_full()
+# へフォールバックする。板列は起動復元では重いので読まない。
+#
+# 適用スコープは旧 install 導線 (oneshot_limit_700k_patch <- main.py) を
+# 再現する。push_receiver_runner 等の別プロセスでは従来どおり full 版。
+# 無効化は従来どおり PUSH_BOOTSTRAP_FAST_RESTORE=0。
+# ============================================================
+
+_PUSH_FAST_MIN_COL_CANDIDATES = [
+    "symbol", "symbolname", "datetime", "date", "time",
+    "price", "current_price", "close", "close_price",
+    "volume", "trading_value", "turnover", "turnover_yen",
+    "vwap", "previousclose", "opening_price", "high_price", "low_price",
+]
+
+_PUSH_FAST_DT_COL_CANDIDATES = [
+    "datetime", "timestamp", "current_price_time", "received_at", "inserted_at", "time",
+]
+
+_PUSH_FAST_SCOPE: Optional[bool] = None
+
+
+def _push_fast_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok"}
+    except Exception:
+        return bool(default)
+
+
+def _push_fast_env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return max(1, int(float(v)))
+    except Exception:
+        return int(default)
+
+
+def _push_fast_scope_enabled() -> bool:
+    """旧パッチが install されていたプロセスかどうか (main.py のみ)。"""
+    global _PUSH_FAST_SCOPE
+    if _PUSH_FAST_SCOPE is not None:
+        return _PUSH_FAST_SCOPE
+    enabled = False
+    try:
+        import sys
+
+        argv_text = " ".join(str(x) for x in sys.argv).replace("\\", "/").lower()
+        db_names = (
+            "main_database.py", "data_collectors_runner.py", "db_prepare_runner.py",
+            "push_receiver_runner.py", "yahoo_complement_runner.py",
+            "summary_database_runner.py", "ranking_collector_runner.py",
+        )
+        if not any(n in argv_text for n in db_names):
+            enabled = "main.py" in argv_text
+    except Exception:
+        enabled = False
+    _PUSH_FAST_SCOPE = enabled
+    return enabled
+
+
+def _push_fast_table_cols(conn: sqlite3.Connection, table: str = "stream_data") -> list:
+    try:
+        return [str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall() if len(r) >= 2]
+    except Exception:
+        return []
+
+
+def _push_fast_q(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _push_fast_select_cols(cols: list) -> list:
+    lower_to_real = {c.lower(): c for c in cols}
+    out: list = []
+    for c in _PUSH_FAST_MIN_COL_CANDIDATES:
+        real = lower_to_real.get(c.lower())
+        if real and real not in out:
+            out.append(real)
+    return out
+
+
+def _push_fast_dt_col(cols: list):
+    lower_to_real = {c.lower(): c for c in cols}
+    for c in _PUSH_FAST_DT_COL_CANDIDATES:
+        if c.lower() in lower_to_real:
+            return lower_to_real[c.lower()]
+    return None
+
+
+def _load_push_db(db_path: str) -> pd.DataFrame:
+    if not _push_fast_scope_enabled() or not _push_fast_env_bool("PUSH_BOOTSTRAP_FAST_RESTORE", True):
+        return _load_push_db_full(db_path)
+
+    started = dt.datetime.now()
+    max_rows = _push_fast_env_int("PUSH_BOOTSTRAP_FAST_MAX_ROWS", 3000)
+    lookback_min = _push_fast_env_int("PUSH_BOOTSTRAP_FAST_LOOKBACK_MINUTES", 45)
+    cutoff_dt = started - dt.timedelta(minutes=lookback_min)
+    cutoff_text = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        with sqlite3.connect(db_path, timeout=3.0) as conn:
+            try:
+                conn.execute("PRAGMA busy_timeout=3000")
+                conn.execute("PRAGMA query_only=ON")
+            except Exception:
+                pass
+
+            cols = _push_fast_table_cols(conn, "stream_data")
+            selected = _push_fast_select_cols(cols)
+            dcol = _push_fast_dt_col(cols)
+            if not selected:
+                raise RuntimeError("no selectable columns")
+
+            select_sql = ", ".join(_push_fast_q(c) for c in selected)
+            if dcol and dcol.lower() != "time":
+                sql = f"""
+                    SELECT {select_sql}
+                    FROM stream_data
+                    WHERE {_push_fast_q(dcol)} >= ?
+                    ORDER BY rowid DESC
+                    LIMIT ?
+                """
+                params: Any = (cutoff_text, max_rows)
+                df = pd.read_sql(sql, conn, params=params)
+                mode = f"dt_col={dcol} cutoff={cutoff_text}"
+            else:
+                sql = f"""
+                    SELECT {select_sql}
+                    FROM stream_data
+                    ORDER BY rowid DESC
+                    LIMIT ?
+                """
+                params = (max_rows,)
+                df = pd.read_sql(sql, conn, params=params)
+                mode = "latest_rowid"
+
+        logger.warning(
+            "[PUSH BOOTSTRAP FAST] restore done rows=%s cols=%s max_rows=%s lookback=%s mode=%s elapsed=%.3fs db=%s",
+            len(df) if isinstance(df, pd.DataFrame) else 0,
+            list(df.columns) if isinstance(df, pd.DataFrame) else [],
+            max_rows,
+            lookback_min,
+            mode,
+            (dt.datetime.now() - started).total_seconds(),
+            db_path,
+        )
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+    except Exception as e:
+        logger.warning("[PUSH BOOTSTRAP FAST] failed err=%s -> fallback original", e, exc_info=False)
+        return _load_push_db_full(db_path)
 
 
 def bootstrap_push(push_dir: str):
