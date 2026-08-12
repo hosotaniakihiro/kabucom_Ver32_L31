@@ -229,7 +229,11 @@ def _install_main_runtime_patches():
         ("core.startup.summary_ai_more_candidates_patch", "install"),
         ("core.startup.summary_ai_async_entry_patch", "install"),
         # async entry が executor を差し替えた後で、V5 direct dispatch を必ず重ねる。
-        ("core.startup.summary_ai_async_direct_dispatch_patch", "install"),
+        # summary_ai_async_direct_dispatch_patch は本文化済み:
+        #   _positive_result の strict 化 -> trading/entry/summary_ai/executor.py
+        #   (_strict_result_executed / _strict_positive_enabled)。
+        #   price floor 2500 の上書きは 2026-08-11 のユーザー判断
+        #   「エントリー最低価格は200円」により移植せず破棄した。
         ("core.startup.entry_order_mtf_slope_fill_patch", "install"),
         ("core.startup.summary_ai_entry_controller_bridge_patch", "install"),
         ("core.startup.board_retry_patch", "install"),

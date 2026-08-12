@@ -157,17 +157,6 @@ def _install_final_gate_relax_patch() -> bool:
         return False
 
 
-def _install_direct_dispatch_patch() -> bool:
-    try:
-        from core.startup.summary_ai_async_direct_dispatch_patch import install as install_direct
-        ok = bool(install_direct())
-        logger.warning("[SUMMARY AI MORE CANDIDATES PATCH] summary_ai_async_direct_dispatch_patch installed=%s", ok)
-        return ok
-    except Exception:
-        logger.exception("[SUMMARY AI MORE CANDIDATES PATCH] summary_ai_async_direct_dispatch_patch install failed")
-        return False
-
-
 def _install_approved_row_range_repair_patch(reason: str = "install") -> bool:
     global _APPROVED_ROW_RANGE_REPAIR_INSTALLED
     if _APPROVED_ROW_RANGE_REPAIR_INSTALLED:
@@ -458,7 +447,7 @@ def install() -> bool:
 
     # controller enrich は trading/summary/summary_controller.py へ本文化済み。
     _install_final_gate_relax_patch()
-    _install_direct_dispatch_patch()
+    # direct dispatch は trading/entry/summary_ai/executor.py へ本文化済み。
     _install_approved_row_range_repair_patch()
     _install_range_pct_repair_patch()
     _install_sell_short_ok_filter_patch()

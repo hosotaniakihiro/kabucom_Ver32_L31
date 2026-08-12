@@ -49,6 +49,7 @@ import datetime as dt
 import logging
 import math
 import os
+import sys
 import threading
 import time
 from collections import deque
@@ -490,7 +491,93 @@ def _has_real_order_evidence(result: Any) -> bool:
     return bool(result)
 
 
+# ============================================================
+# _positive_result の strict 化
+# ------------------------------------------------------------
+# 旧 core/startup/summary_ai_async_direct_dispatch_patch.py
+# (_strict_result_executed) を本文化。
+#
+# 「approved だけでは True にせず、実際に発注/約定した証跡があるときだけ True」
+# にする。_has_real_order_evidence との主な違い:
+#   - result["executed"] が False なら他のキーを見ずに False
+#   - executed_count / order_count 等の件数キーも証跡として見る
+#   - result / pipeline_result / direct_dispatch_result へ再帰する
+#   - list/tuple/set は len>0 ではなく要素ごとの再帰判定
+#
+# 適用スコープは旧 install 導線 (main.py の runtime patches) を再現する。
+# 無効化は従来どおり SUMMARY_AI_DIRECT_DISPATCH_ON_QUEUED_ASYNC=0。
+# ============================================================
+
+_STRICT_POSITIVE_SCOPE: Optional[bool] = None
+
+
+def _strict_positive_enabled() -> bool:
+    global _STRICT_POSITIVE_SCOPE
+    if _STRICT_POSITIVE_SCOPE is not None:
+        return _STRICT_POSITIVE_SCOPE
+    enabled = False
+    try:
+        if _env_bool("SUMMARY_AI_DIRECT_DISPATCH_ON_QUEUED_ASYNC", True):
+            argv_text = " ".join(str(x) for x in sys.argv).replace("\\", "/").lower()
+            db_names = (
+                "main_database.py", "data_collectors_runner.py", "db_prepare_runner.py",
+                "push_receiver_runner.py", "yahoo_complement_runner.py",
+                "summary_database_runner.py", "ranking_collector_runner.py",
+            )
+            if not any(n in argv_text for n in db_names):
+                enabled = "main.py" in argv_text
+    except Exception:
+        enabled = False
+    _STRICT_POSITIVE_SCOPE = enabled
+    return enabled
+
+
+def _strict_result_executed(result: Any) -> bool:
+    """発注/約定の証跡があるときだけ True。approved だけでは True にしない。"""
+    try:
+        if result is None:
+            return False
+        if isinstance(result, bool):
+            return bool(result)
+        if isinstance(result, dict):
+            if result.get("executed") is False:
+                return False
+            for key in ("executed", "order_sent", "order_submitted", "success", "entry_executed"):
+                if bool(result.get(key)):
+                    return True
+            for key in ("executed_count", "order_count", "submitted_count", "sent_count", "entries"):
+                if _strict_safe_int(result.get(key), 0) > 0:
+                    return True
+            for key in ("order_id", "OrderId", "orders", "order_ids", "sent_orders", "executed_symbols"):
+                v = result.get(key)
+                if isinstance(v, (list, tuple, set, dict)) and len(v) > 0:
+                    return True
+                if v and not isinstance(v, (list, tuple, set, dict)):
+                    return True
+            for key in ("result", "pipeline_result", "direct_dispatch_result"):
+                child = result.get(key)
+                if child is not result and _strict_result_executed(child):
+                    return True
+            return False
+        if isinstance(result, (list, tuple, set)):
+            return any(_strict_result_executed(x) for x in result)
+        return False
+    except Exception:
+        return False
+
+
+def _strict_safe_int(v: Any, default: int = 0) -> int:
+    try:
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(str(v).replace(",", "")))
+    except Exception:
+        return int(default)
+
+
 def _positive_result(result: Any) -> bool:
+    if _strict_positive_enabled():
+        return _strict_result_executed(result)
     return _has_real_order_evidence(result)
 
 
