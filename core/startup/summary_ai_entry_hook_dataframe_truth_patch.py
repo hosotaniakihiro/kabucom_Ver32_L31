@@ -1,36 +1,36 @@
 # ============================================================
 # File   : core/startup/summary_ai_entry_hook_dataframe_truth_patch.py
-# Version: V1.6-BOARD-GUARD-NO-SELF-RECURSION
+# Version: V1.7-BOARD-GUARD-COMPAT-REMOVED
 # ------------------------------------------------------------
 # 【目的】
 #   scheduler_jobs.summary.summary_ai_entry_hook_v20.run_summary_ai_entry_safe で
 #   DataFrame truth value ambiguous が出る問題を防止する。
 #
-# V1.6:
-#   - V1.5 の FINAL ENTRY BOARD GUARD COMPAT が、自分自身の
-#     _board_guard_compat を base として再ラップし、RecursionError になる問題を修正。
-#   - final_entry_safety_guard v11(signature_tolerant=True) / FINAL_BOARD_GUARD_SIGNATURE
-#     が入っている場合は、summary_ai側では board_guard を再ラップしない。
-#   - どうしても旧3引数版が残る場合だけ、自己ラップを除外して最小限に互換化する。
+# V1.7:
+#   - FINAL ENTRY BOARD GUARD COMPAT 一式 (_install_final_entry_board_guard_compat /
+#     _call_board_guard_flexible / _unwrap_board_guard / _is_our_board_compat /
+#     watcher スレッド) を撤去した。ラップ対象だった
+#     final_entry_safety_guard_patch._board_guard は 46ddd54 の本文化で消滅しており、
+#     関数は冒頭の `cur = None` → `if not callable(cur): return False` で
+#     即 return する到達不能コードになっていた。watcher も 120 回 × 0.5 秒
+#     ただ sleep するだけのスレッドだった。
+#     板ガード本体は trading/handlers/entry_controller._final_guard_board_ok。
+#   - これに伴い install() が常に False を返す問題も解消した
+#     (副作用は効いているのに戻り値だけ False という状態だった)。
 # ============================================================
 
 from __future__ import annotations
 
 import logging
 import os
-import threading
-import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V1.6-BOARD-GUARD-NO-SELF-RECURSION"
+VERSION = "V1.7-BOARD-GUARD-COMPAT-REMOVED"
 
 _PATCHED = False
 _ORIGINAL_RESULT_TO_DICT = None
-_BOARD_COMPAT_PATCHED = False
-_ORIGINAL_FINAL_BOARD_GUARD = None
-_BOARD_COMPAT_WATCHER_STARTED = False
 _WEAK_SUMMARY_AI_PATCHED = False
 _ORIGINAL_RUN_AI_GATE_FOR_CANDIDATES = None
 _PUSH_LIQUIDITY_CAP_PATCHED = False
@@ -309,144 +309,6 @@ def _install_summary_ai_approval_diag_and_price_floor() -> bool:
 
 
 # -----------------------------
-# Board guard compatibility
-# -----------------------------
-def _is_our_board_compat(fn: Any) -> bool:
-    return bool(
-        getattr(fn, "_final_entry_board_guard_compat_v15", False)
-        or getattr(fn, "_final_entry_board_guard_compat_v16", False)
-        or getattr(fn, "_final_entry_board_guard_compat", False)
-    )
-
-
-def _unwrap_board_guard(fn: Any) -> Any:
-    """Unwrap board guard safely. Never return our own compat wrapper as base."""
-    seen: set[int] = set()
-    cur = fn
-    while callable(cur) and id(cur) not in seen:
-        seen.add(id(cur))
-        # 自分自身の compat wrapper は必ず剥がす。
-        if _is_our_board_compat(cur):
-            nxt = getattr(cur, "_final_entry_board_guard_compat_original", None) or getattr(cur, "_original", None)
-            if callable(nxt) and nxt is not cur:
-                cur = nxt
-                continue
-            break
-        # 他の安全な signature wrapper はそのまま使ってよい。
-        if getattr(cur, "_final_board_guard_signature_v2", False) or getattr(cur, "_final_board_guard_signature_runtime", False):
-            break
-        nxt = getattr(cur, "_original", None) or getattr(cur, "_original_board_guard", None)
-        if callable(nxt) and nxt is not cur:
-            cur = nxt
-            continue
-        break
-    return cur
-
-
-def _call_board_guard_flexible(fn: Any, row: Any, item: dict | None, symbol: str | None, side: str | None) -> bool:
-    base = _unwrap_board_guard(fn)
-    if _is_our_board_compat(base):
-        logger.warning("[FINAL ENTRY BOARD GUARD COMPAT] self recursion prevented symbol=%s side=%s version=%s", symbol, side, VERSION)
-        return False
-    item_d = item if isinstance(item, dict) else {}
-    sym = str(symbol or "")
-    sd = str(side or "").upper()
-    attempts = (
-        (row, item_d, sym, sd),
-        (row, sym, sd),
-        (row, item_d, sym),
-        (row, item_d),
-        (row,),
-    )
-    last_err: Exception | None = None
-    for args in attempts:
-        try:
-            return bool(base(*args))
-        except TypeError as e:
-            last_err = e
-            continue
-        except RecursionError:
-            logger.exception("[FINAL ENTRY BOARD GUARD COMPAT] recursion blocked symbol=%s side=%s version=%s", sym, sd, VERSION)
-            return False
-    logger.warning("[FINAL ENTRY BOARD GUARD COMPAT] incompatible board_guard signature symbol=%s side=%s err=%s version=%s", sym, sd, last_err, VERSION)
-    return False
-
-
-def _install_final_entry_board_guard_compat(force: bool = False, reason: str = "install") -> bool:
-    """
-    v11/signature runtime が有効なら追加ラップしない。
-    旧3引数版が戻った時だけ、自己ラップを避けて互換化する。
-    """
-    global _BOARD_COMPAT_PATCHED, _ORIGINAL_FINAL_BOARD_GUARD
-    try:
-        # final_entry_safety_guard_patch は本文化済みで _board_guard を持たないため、
-        # 互換ラップの対象が存在しない (従来もここで False を返していた)。
-        # 板ガード本体は trading/handlers/entry_controller._final_guard_board_ok。
-        target = None
-        cur = None
-        if not callable(cur):
-            logger.warning("[FINAL ENTRY BOARD GUARD COMPAT] target _board_guard not callable")
-            return False
-
-        # final_entry_safety_guard v11 は _board_guard 自体が4引数対応。ここでは触らない。
-        ver = str(getattr(target, "VERSION", ""))
-        if "v11" in ver.lower() or "signature" in ver.lower():
-            _BOARD_COMPAT_PATCHED = True
-            logger.warning("[FINAL ENTRY BOARD GUARD COMPAT] skipped reason=%s target_signature_tolerant version=%s target_version=%s", reason, VERSION, ver)
-            return True
-
-        if getattr(cur, "_final_board_guard_signature_v2", False) or getattr(cur, "_final_board_guard_signature_runtime", False):
-            _BOARD_COMPAT_PATCHED = True
-            logger.warning("[FINAL ENTRY BOARD GUARD COMPAT] skipped reason=%s final_signature_runtime_present version=%s", reason, VERSION)
-            return True
-
-        if _is_our_board_compat(cur) and not force:
-            _BOARD_COMPAT_PATCHED = True
-            return True
-
-        base = _unwrap_board_guard(cur)
-        if not callable(base) or _is_our_board_compat(base):
-            logger.warning("[FINAL ENTRY BOARD GUARD COMPAT] no safe base; skip reason=%s cur=%s base=%s version=%s", reason, getattr(cur, "__name__", repr(cur)), getattr(base, "__name__", repr(base)), VERSION)
-            _BOARD_COMPAT_PATCHED = True
-            return True
-
-        _ORIGINAL_FINAL_BOARD_GUARD = base
-
-        def _board_guard_compat(row: dict, item: dict | None = None, symbol: str | None = None, side: str | None = None, *args, **kwargs) -> bool:
-            return _call_board_guard_flexible(base, row, item, symbol, side)
-
-        _board_guard_compat._final_entry_board_guard_compat = True  # type: ignore[attr-defined]
-        _board_guard_compat._final_entry_board_guard_compat_v16 = True  # type: ignore[attr-defined]
-        _board_guard_compat._final_entry_board_guard_compat_original = base  # type: ignore[attr-defined]
-        _board_guard_compat._original = base  # type: ignore[attr-defined]
-        target._board_guard = _board_guard_compat
-        _BOARD_COMPAT_PATCHED = True
-        logger.warning("[FINAL ENTRY BOARD GUARD COMPAT] installed v1.6 reason=%s base=%s version=%s", reason, getattr(base, "__name__", repr(base)), VERSION)
-        return True
-    except Exception:
-        logger.exception("[FINAL ENTRY BOARD GUARD COMPAT] install failed reason=%s version=%s", reason, VERSION)
-        return False
-
-
-def _board_guard_watcher() -> None:
-    loops = int(max(1, _env_float("FINAL_ENTRY_BOARD_GUARD_COMPAT_WATCH_LOOPS", 120)))
-    sleep = max(0.2, _env_float("FINAL_ENTRY_BOARD_GUARD_COMPAT_WATCH_SEC", 0.5))
-    for i in range(loops):
-        # final_entry_safety_guard_patch は本文化済みで _board_guard を持たないため、
-        # watcher が再ラップすべき対象は現れない (従来も毎回 None を見ていた)。
-        time.sleep(sleep)
-
-
-def _ensure_board_guard_watcher() -> None:
-    global _BOARD_COMPAT_WATCHER_STARTED
-    if _BOARD_COMPAT_WATCHER_STARTED:
-        return
-    _BOARD_COMPAT_WATCHER_STARTED = True
-    threading.Thread(target=_board_guard_watcher, name="final-entry-board-guard-compat-watch", daemon=True).start()
-    logger.warning("[FINAL ENTRY BOARD GUARD COMPAT] watcher started version=%s", VERSION)
-
-
-# -----------------------------
 # ranking precheck helper
 # -----------------------------
 def _install_ranking_precheck_pending_failopen() -> bool:
@@ -463,35 +325,33 @@ def _install_ranking_precheck_pending_failopen() -> bool:
 
 def install() -> bool:
     global _PATCHED, _ORIGINAL_RESULT_TO_DICT
-    ok_board = _install_final_entry_board_guard_compat(reason="install")
-    _ensure_board_guard_watcher()
     ok_rank_precheck = _install_ranking_precheck_pending_failopen()
     ok_weak_ai = _install_summary_ai_weak_filter()
     ok_liq_cap = _install_push_liquidity_rotation_cap()
     ok_approval_diag = _install_summary_ai_approval_diag_and_price_floor()
     if _PATCHED:
-        return True and ok_board and ok_rank_precheck and ok_weak_ai and ok_liq_cap and ok_approval_diag
+        return True and ok_rank_precheck and ok_weak_ai and ok_liq_cap and ok_approval_diag
     try:
         import scheduler_jobs.summary.summary_ai_entry_hook_v20 as target
         cur = getattr(target, "_result_to_dict", None)
         if not callable(cur):
             logger.warning("[SUMMARY AI HOOK DF TRUTH PATCH] target _result_to_dict not callable")
-            return bool(ok_board and ok_rank_precheck and ok_weak_ai and ok_liq_cap and ok_approval_diag)
+            return bool(ok_rank_precheck and ok_weak_ai and ok_liq_cap and ok_approval_diag)
         if getattr(cur, "_summary_ai_hook_df_truth_patch", False):
             _PATCHED = True
-            return True and ok_board and ok_rank_precheck and ok_weak_ai and ok_liq_cap and ok_approval_diag
+            return True and ok_rank_precheck and ok_weak_ai and ok_liq_cap and ok_approval_diag
         _ORIGINAL_RESULT_TO_DICT = cur
         _patched_result_to_dict._summary_ai_hook_df_truth_patch = True  # type: ignore[attr-defined]
         target._result_to_dict = _patched_result_to_dict
         _PATCHED = True
         logger.warning(
-            "[SUMMARY AI HOOK DF TRUTH PATCH] installed board_compat=%s ranking_precheck_failopen=%s weak_ai=%s liq_cap=%s approval_diag=%s version=%s",
-            ok_board, ok_rank_precheck, ok_weak_ai, ok_liq_cap, ok_approval_diag, VERSION,
+            "[SUMMARY AI HOOK DF TRUTH PATCH] installed ranking_precheck_failopen=%s weak_ai=%s liq_cap=%s approval_diag=%s version=%s",
+            ok_rank_precheck, ok_weak_ai, ok_liq_cap, ok_approval_diag, VERSION,
         )
-        return True and ok_board and ok_rank_precheck and ok_weak_ai and ok_liq_cap and ok_approval_diag
+        return True and ok_rank_precheck and ok_weak_ai and ok_liq_cap and ok_approval_diag
     except Exception:
         logger.exception("[SUMMARY AI HOOK DF TRUTH PATCH] install failed")
-        return bool(ok_board and ok_rank_precheck and ok_weak_ai and ok_liq_cap and ok_approval_diag)
+        return bool(ok_rank_precheck and ok_weak_ai and ok_liq_cap and ok_approval_diag)
 
 
 try:
