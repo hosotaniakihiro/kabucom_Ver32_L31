@@ -116,7 +116,13 @@ def _background_heavy() -> None:
         lambda: _run_install("open_position_broker_merge_patch", "core.startup.open_position_broker_merge_patch"),
         lambda: _run_install("exit_executor_broker_position_patch", "core.startup.exit_executor_broker_position_patch"),
         lambda: _run_install("exit_trail_03_runtime_patch", "core.startup.exit_trail_03_runtime_patch"),
-        lambda: _run_install("entry_unfilled_cancel_2s_runtime_patch", "core.startup.entry_unfilled_cancel_2s_runtime_patch"),
+        # entry_unfilled_cancel_2s_runtime_patch は削除した。
+        # 唯一の効果が force_cancel_loop.start_force_cancel_loop の差し替えだったが、
+        # main.py:117 が import 節で `from force_cancel_loop import
+        # start_force_cancel_loop` と束縛し、main.py:472 でその束縛を使うため、
+        # この install (main.py:217 の fast_startup 経由 = import より後) は
+        # 実際のスレッド起動関数に届いていなかった。
+        # モジュール属性経由で呼ぶ箇所は存在しない (git grep 済み)。
         # entry_liquidity_runtime_patch / summary_ai_liquidity_runtime_patch は削除した。
         # 実体は executor._filter_blocked_ai_ok_items のラップだけで、
         # executor.py:1664 の core filter watcher が install 直後 0.5 秒以内に
