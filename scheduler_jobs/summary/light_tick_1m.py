@@ -284,14 +284,23 @@ def _prepare_ai_submit_df(df: pd.DataFrame, *, interval: int, now: dt.datetime, 
 
 
 def _install_no_raw_db_watchdog() -> bool:
-    try:
-        from core.startup.summary_main_no_raw_db_fallback_watchdog_patch import install as _install
-        ok = bool(_install())
-        logger.warning("[SUMMARY MAIN LIGHT TICK] no raw DB fallback watchdog install ok=%s", ok)
-        return ok
-    except Exception:
-        logger.exception("[SUMMARY MAIN LIGHT TICK] no raw DB fallback watchdog install failed")
-        return False
+    """main.py 1分足の raw/DB fallback 禁止ガード。
+
+    旧 core/startup/summary_main_no_raw_db_fallback_watchdog_patch は削除した。
+    同パッチの _patch_loader_once() は、fallback_loader 側に
+    _main_1m_raw_db_fallback_blocked() が存在する場合はラップせず即 return する
+    設計で、その関数は fallback_loader.py:546 に既に本文化済みだったため、
+    差し替えは一度も行われていなかった (45回×1秒の watchdog も同じ早期returnを
+    繰り返すだけだった)。
+    残っていた env setdefault 3件も実効が無いことを確認済み:
+      - SUMMARY_MAIN_DISABLE_RAW_DB_FALLBACK: fallback_loader.py:111 が
+        モジュール読み込み時に同じ "1" を setdefault 済み。読み手の既定も True。
+      - SUMMARY_MAIN_SKIP_PUSH_DB_FALLBACK: 下の _install_light_tick 側で
+        同じ "1" を setdefault 済み。読み手の既定も True。
+      - PUSH_SUMMARY_RAW_DB_FALLBACK_ENABLED_IN_MAIN: 読み手がリポジトリに存在しない。
+    ガード本体は scheduler_jobs/summary/fallback_loader.py が持っている。
+    """
+    return True
 
 
 def _submit_async_ai(df: pd.DataFrame, *, interval: int, now: dt.datetime, run_entry: bool, reason: str) -> None:
