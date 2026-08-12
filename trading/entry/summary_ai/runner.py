@@ -269,7 +269,95 @@ def _resolve_summary_df(
 
 # ============================================================
 # ranking pre-filter
+# ------------------------------------------------------------
+# 旧 core/startup/summary_ai_ranking_prefilter_signal_patch.py
+# (V4-RANKING-PREFILTER-SIGNAL-FAST-ENTRY-EXIT-STAGNATION) を本文化。
+#
+# 旧パッチは _apply_ranking_pre_filter を「元実装を一切呼ばない完全な差し替え」
+# として上書きし、さらに watcher スレッドが毎秒 install を再適用していたため、
+# 同じ属性を奪い合っていた
+#   - summary_ai_ranking_prefilter_score_fallback_patch
+#   - summary_ai_ranking_best_rank_bridge_patch
+# は実運用では一度も実効しなかった (両者とも `_original` を辿って素の実装を
+# 掴み直す設計のため、後勝ちで signal 版に置き換えられる)。
+# 実際の install 順 (usercustomize.py 615->616 / strict_board_rest 332->333) を
+# 再現したシミュレーションで、最終的に残るのが signal 版であることと、
+# 元実装が呼ばれないことを確認済み。
+#
+# 低スコア行を無条件通過させる fail-open ではない。既存の ranking シグナル
+# 列 (display_score / score_buy / best_rank / rank_type 等) が存在する場合に
+# 限って ranking_score / ranking_momentum へ橋渡しする。
 # ============================================================
+
+_RANKING_PREFILTER_VERSION = "V4-RANKING-PREFILTER-SIGNAL-FAST-ENTRY-EXIT-STAGNATION"
+
+
+def _rpf_env_float(name: str, default: float) -> float:
+    """ranking pre-filter 用 env 読み出し (カンマ区切りを許容する)。"""
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        x = float(str(v).replace(",", ""))
+        if math.isnan(x) or math.isinf(x):
+            return float(default)
+        return x
+    except Exception:
+        return float(default)
+
+
+def _rpf_num_series(df: Any, col: str):
+    if col not in df.columns:
+        return pd.Series(0.0, index=df.index)
+    s = df[col]
+    try:
+        if getattr(s, "dtype", None) == object:
+            s = (
+                s.astype(str)
+                .str.replace("％", "%", regex=False)
+                .str.replace("%", "", regex=False)
+                .str.replace(",", "", regex=False)
+                .str.replace("+", "", regex=False)
+            )
+    except Exception:
+        pass
+    return pd.to_numeric(s, errors="coerce").fillna(0.0).astype(float)
+
+
+def _rpf_num_first(df: Any, cols: tuple[str, ...]):
+    out = pd.Series(0.0, index=df.index)
+    for col in cols:
+        if col in df.columns:
+            v = _rpf_num_series(df, col)
+            out = out.where(out.abs() > 0, v)
+    return out.fillna(0.0)
+
+
+def _rpf_str_series(df: Any, col: str):
+    if col not in df.columns:
+        return pd.Series("", index=df.index)
+    return df[col].astype(str).fillna("").str.strip()
+
+
+def _rpf_pct_to_ratio(s: Any):
+    x = s.fillna(0.0).astype(float)
+    try:
+        return x.where(x.abs() <= 1.0, x / 100.0)
+    except Exception:
+        return x
+
+
+def _rpf_max_series(*series: Any):
+    frames = []
+    for s in series:
+        try:
+            frames.append(pd.to_numeric(s, errors="coerce").fillna(0.0).astype(float))
+        except Exception:
+            pass
+    if not frames:
+        return None
+    return pd.concat(frames, axis=1).max(axis=1).fillna(0.0)
+
 
 def _apply_ranking_pre_filter(
     df: pd.DataFrame,
@@ -284,58 +372,105 @@ def _apply_ranking_pre_filter(
     RANKING/RANKING_SUMMARY用のAI前フィルタ。
 
     本物ATR/slopeは使わない。
-    以下のいずれかがプラスなら通す:
-      - ranking_score
-      - ranking_momentum
-      - price_delta_pct
-      - price_delta
-      - rank_improve
-      - volume_delta
+    ranking_score / ranking_momentum が全0でも、既存の ranking シグナル列
+    (display_score / score_buy / score_sell / best_rank / rank_type、
+     値幅・出来高急増列) から署名を再構成して判定する。
     """
-    if df is None or df.empty:
+    if df is None or getattr(df, "empty", True):
         return pd.DataFrame()
 
     if not enabled:
         return df
 
     out = df.copy()
-
     min_score = (
         float(min_ranking_score)
         if min_ranking_score is not None
-        else _env_float("RANKING_AI_MIN_SCORE", 0.0)
+        else _rpf_env_float("RANKING_AI_MIN_SCORE", 0.0)
     )
     min_mom = (
         float(min_ranking_momentum)
         if min_ranking_momentum is not None
-        else _env_float("RANKING_AI_MIN_MOMENTUM", 0.0)
+        else _rpf_env_float("RANKING_AI_MIN_MOMENTUM", 0.0)
     )
 
-    for c in (
-        "ranking_score",
-        "ranking_momentum",
-        "price_delta_pct",
-        "price_delta",
-        "rank_improve",
-        "volume_delta",
-    ):
-        if c not in out.columns:
-            out[c] = 0.0
-        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
+    ranking_score = _rpf_num_series(out, "ranking_score")
+    ranking_momentum = _rpf_num_series(out, "ranking_momentum")
+    price_delta_pct = _rpf_num_series(out, "price_delta_pct")
+    price_delta = _rpf_num_series(out, "price_delta")
+    rank_improve = _rpf_num_series(out, "rank_improve")
+    volume_delta = _rpf_num_series(out, "volume_delta")
 
-    before = len(out)
+    score_cols = (
+        "score_buy", "buy_score", "score_sell", "sell_score", "score_total",
+        "final_score", "display_score", "score", "pending_score", "priority",
+        "score_mtf", "mtf_score", "rank_strength", "summary_ai_priority",
+    )
+    score_signal = pd.Series(0.0, index=out.index)
+    present_score_cols: list[str] = []
+    for col in score_cols:
+        if col in out.columns:
+            present_score_cols.append(col)
+            score_signal = _rpf_max_series(score_signal, _rpf_num_series(out, col).abs())
+
+    rank_cols = (
+        "best_rank", "best_rank_position", "rank_position", "rank",
+        "ranking_rank", "rank_no", "display_rank", "順位",
+    )
+    rank_value = _rpf_num_first(out, rank_cols)
+    present_rank_cols = [c for c in rank_cols if c in out.columns]
+    max_rank = int(max(1, _rpf_env_float("RANKING_AI_PREFILTER_MAX_BEST_RANK", 50.0)))
+    best_rank_signal = (rank_value > 0) & (rank_value <= max_rank)
+    rank_score_signal = (
+        ((float(max_rank) + 1.0 - rank_value) / float(max_rank))
+        .where(best_rank_signal, 0.0)
+        .clip(lower=0.0)
+    )
+
+    rank_type = (
+        _rpf_str_series(out, "rank_type")
+        if "rank_type" in out.columns
+        else _rpf_str_series(out, "ranking_type")
+    )
+    ranking_type_signal = rank_type.ne("") & ~rank_type.str.lower().isin({"nan", "none", "<na>", "0"})
+
+    change_signal = pd.Series(0.0, index=out.index)
+    for col in ("change_rate", "change_ratio", "change_percentage", "change_pct", "騰落率", "rate"):
+        if col in out.columns:
+            change_signal = _rpf_max_series(change_signal, _rpf_pct_to_ratio(_rpf_num_series(out, col)))
+
+    range_signal = pd.Series(False, index=out.index)
+    for col in ("range_pct", "intraday_range_pct", "day_range_pct", "_intrabar_range_pct", "_max_price_change_pct"):
+        if col in out.columns:
+            rv = _rpf_pct_to_ratio(_rpf_num_series(out, col).abs())
+            range_signal = range_signal | (rv >= _rpf_env_float("RANKING_AI_PREFILTER_MIN_RANGE_PCT", 0.0015))
+
+    volume_signal = pd.Series(False, index=out.index)
+    for col in ("volume_surge_ratio", "volume_surge_ratio_1m", "volume_surge_ratio_3m", "volume_surge_ratio_5m"):
+        if col in out.columns:
+            volume_signal = volume_signal | (
+                _rpf_num_series(out, col) >= _rpf_env_float("RANKING_AI_PREFILTER_MIN_SURGE_RATIO", 1.2)
+            )
+
+    out["ranking_score"] = _rpf_max_series(ranking_score, score_signal, rank_score_signal)
+    out["ranking_momentum"] = _rpf_max_series(ranking_momentum, price_delta_pct, change_signal.clip(lower=0.0))
+    out["price_delta_pct"] = _rpf_max_series(price_delta_pct, change_signal)
+    out["rank_improve"] = _rpf_max_series(rank_improve, best_rank_signal.astype(float) * 0.001)
+    out["volume_delta"] = _rpf_max_series(volume_delta, volume_signal.astype(float) * 0.001)
 
     mask = (
         (out["ranking_score"] > min_score)
         | (out["ranking_momentum"] > min_mom)
         | (out["price_delta_pct"] > 0)
-        | (out["price_delta"] > 0)
+        | (price_delta > 0)
         | (out["rank_improve"] > 0)
         | (out["volume_delta"] > 0)
+        | (ranking_type_signal & (range_signal | volume_signal | (score_signal > 0)))
     )
 
-    skipped_df = out[~mask].copy()
-    out = out[mask].copy()
+    before = len(out)
+    skipped_df = out.loc[~mask].copy()
+    out = out.loc[mask].copy()
 
     try:
         skipped_head = (
@@ -343,35 +478,27 @@ def _apply_ranking_pre_filter(
                 [
                     c
                     for c in (
-                        "symbol",
-                        "ranking_score",
-                        "ranking_momentum",
-                        "price_delta_pct",
-                        "rank_improve",
-                        "volume_delta",
+                        "symbol", "ranking_score", "ranking_momentum", "display_score",
+                        "score_buy", "score_sell", "best_rank", "best_rank_position",
+                        "rank_position", "rank", "rank_type", "range_pct",
                     )
                     if c in skipped_df.columns
                 ]
             ]
-            .head(30)
+            .head(20)
             .to_dict(orient="records")
         )
     except Exception:
         skipped_head = []
 
-    logger.info(
-        "[SUMMARY AI RUNNER] RANKING_PRE_FILTER result source=%s interval=%s "
-        "before=%s after=%s skipped=%s min_score=%.4f min_momentum=%.4f skipped_head=%s",
-        source,
-        interval,
-        before,
-        len(out),
-        before - len(out),
-        min_score,
-        min_mom,
-        skipped_head,
+    logger.warning(
+        "[SUMMARY AI RANKING PREFILTER SIGNAL] result source=%s interval=%s before=%s after=%s "
+        "skipped=%s min_score=%.4f min_mom=%.4f score_cols=%s rank_cols=%s max_rank=%s "
+        "signal_rows=%s version=%s skipped_head=%s",
+        source, interval, before, len(out), before - len(out), min_score, min_mom,
+        present_score_cols, present_rank_cols, max_rank, int(mask.sum()),
+        _RANKING_PREFILTER_VERSION, skipped_head,
     )
-
     return out
 
 

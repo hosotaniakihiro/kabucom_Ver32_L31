@@ -329,17 +329,18 @@ def install() -> bool:
         _install_board_wrappers()
         return True
     try:
-        ranking_prefilter = _safe_install("core.startup.summary_ai_ranking_prefilter_score_fallback_patch", "ranking_prefilter_score_fallback")
-        best_rank_bridge = _safe_install("core.startup.summary_ai_ranking_best_rank_bridge_patch", "best_rank_bridge")
+        # ranking prefilter の score fallback / best_rank bridge は、いずれも
+        # runner._apply_ranking_pre_filter を `_original` まで辿って掴み直す
+        # 設計だったため、直後に install される prefilter signal 版に必ず
+        # 上書きされ、実運用で一度も実効していなかった。signal 版の挙動は
+        # trading/entry/summary_ai/runner.py へ本文化済みのため両者とも削除した。
         fast_entry = _safe_install("core.startup.ranking_summary_fast_entry_patch", "ranking_summary_fast_entry")
         board_defer = _safe_install("core.startup.summary_ai_board_missing_defer_patch", "board_missing_defer")
         _apply_hard_board_policy()
         board_wrappers = _install_board_wrappers()
         _INSTALLED = True
         logger.warning(
-            "[SUMMARY AI STRICT BOARD REST] installed REST board check for push-rotation missing; hard block remains ranking_prefilter=%s best_rank_bridge=%s fast_entry=%s board_defer=%s board_wrappers=%s close_limit_fallback=0 version=%s",
-            ranking_prefilter,
-            best_rank_bridge,
+            "[SUMMARY AI STRICT BOARD REST] installed REST board check for push-rotation missing; hard block remains fast_entry=%s board_defer=%s board_wrappers=%s close_limit_fallback=0 version=%s",
             fast_entry,
             board_defer,
             board_wrappers,
