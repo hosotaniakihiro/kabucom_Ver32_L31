@@ -33,7 +33,7 @@ import pandas as pd
 from global_state import global_data
 
 from trading.logger.timeframe_logger import log_tf_close
-from trading.ranking.ranking_pipeline import run_ranking_pipeline
+from trading.ranking.ranking_pipeline import run_ranking_pipeline as _run_ranking_pipeline_impl
 from trading.summary.controller_cache import (
     choose_merged_cache_payload,
     dedupe_symbol_datetime,
@@ -57,9 +57,9 @@ from trading.summary.controller_utils import normalize_summary_df
 from trading.summary.engine.summary_engine import run_summary_engine
 from trading.summary.notify.discord_notifier import notify_entry_signals
 from trading.summary.notify.tonosama_notifier import notify_tonosama
-from trading.summary.persistence.summary_persistence import save_summary
-from trading.summary.pipeline.ai_pipeline import run_ai_pipeline
-from trading.summary.pipeline.entry_pipeline import run_entry_pipeline
+from trading.summary.persistence.summary_persistence import save_summary as _save_summary_persisted
+from trading.summary.pipeline.ai_pipeline import run_ai_pipeline as _run_ai_pipeline_impl
+from trading.summary.pipeline.entry_pipeline import run_entry_pipeline as _run_entry_pipeline_impl
 from trading.summary.pipeline.fetch_pipeline import run_fetch_pipeline
 from trading.summary.pipeline.indicator_pipeline import run_indicator_pipeline
 from trading.summary.summary_logger_bridge import (
@@ -242,7 +242,103 @@ def _build_reason_from_row(row: pd.Series, side: str) -> str:
     return "-"
 
 
+def _controller_enrich_runtime(df: Any, *, interval: int, context: str) -> Any:
+    """旧 core/startup/summary_controller_enrich_runtime_patch.py の _enrich_df。
+
+    本ファイル下部の _enrich() とは意図的に別実装。旧パッチは
+    enrich_summary_latest() だけを呼び、intraday MTF 補完や score alias 修復は
+    行わないため、挙動を変えないようパッチ側のロジックをそのまま移植した。
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    try:
+        from trading.summary.controller_enrich import enrich_summary_latest
+
+        out = enrich_summary_latest(df, interval=interval, context=context)
+        logger.info(
+            "[SUMMARY CONTROLLER ENRICH PATCH] context=%s interval=%s rows=%s cols=%s",
+            context,
+            interval,
+            len(out) if isinstance(out, pd.DataFrame) else None,
+            len(out.columns) if isinstance(out, pd.DataFrame) else None,
+        )
+        return out
+    except Exception:
+        logger.exception(
+            "[SUMMARY CONTROLLER ENRICH PATCH] enrich failed context=%s interval=%s",
+            context,
+            interval,
+        )
+        return df
+
+
+def _controller_enrich_detect_interval(args: tuple, kwargs: dict, default: int = 1) -> int:
+    """旧パッチ _detect_interval の移植。args 中の最初の整数を interval とみなす。"""
+    try:
+        if "interval" in kwargs:
+            return int(kwargs.get("interval") or default)
+        for v in args:
+            if isinstance(v, int):
+                return int(v)
+            if isinstance(v, str) and v.isdigit():
+                return int(v)
+    except Exception:
+        pass
+    return int(default)
+
+
+def _controller_enrich_df_first(fn, context: str, args: tuple, kwargs: dict):
+    """旧パッチ _patch_df_first_func の移植。
+
+    先頭の位置引数が DataFrame ならそれを、無ければ df_latest / df kwarg を
+    補強してから元の関数へ渡す。
+    """
+    interval = _controller_enrich_detect_interval(args, kwargs, default=1)
+    if args and isinstance(args[0], pd.DataFrame):
+        args = (_controller_enrich_runtime(args[0], interval=interval, context=context),) + tuple(args[1:])
+    elif isinstance(kwargs.get("df_latest"), pd.DataFrame):
+        kwargs = dict(kwargs)
+        kwargs["df_latest"] = _controller_enrich_runtime(kwargs["df_latest"], interval=interval, context=context)
+    elif isinstance(kwargs.get("df"), pd.DataFrame):
+        kwargs = dict(kwargs)
+        kwargs["df"] = _controller_enrich_runtime(kwargs["df"], interval=interval, context=context)
+    return fn(*args, **kwargs)
+
+
+def run_ranking_pipeline(*args: Any, **kwargs: Any):
+    return _controller_enrich_df_first(
+        _run_ranking_pipeline_impl, "before-ranking-pipeline", args, kwargs
+    )
+
+
+def run_ai_pipeline(*args: Any, **kwargs: Any):
+    return _controller_enrich_df_first(
+        _run_ai_pipeline_impl, "before-ai-pipeline", args, kwargs
+    )
+
+
+def run_entry_pipeline(*args: Any, **kwargs: Any):
+    return _controller_enrich_df_first(
+        _run_entry_pipeline_impl, "before-entry-pipeline", args, kwargs
+    )
+
+
+def save_summary(df: Any, interval: int = 1, *args: Any, **kwargs: Any):
+    """保存直前に df を補強してから永続化層へ渡す。
+
+    旧 summary_controller_enrich_runtime_patch が sc_mod.save_summary を
+    差し替えて行っていた処理の本文化。呼び出し側 (diff_update) は既に
+    _enrich() 済みの df を渡すが、旧パッチ適用時も同じく二重に補強されて
+    いたため、その合成挙動をそのまま維持する。
+    """
+    df = _controller_enrich_runtime(df, interval=int(interval or 1), context="before-save")
+    return _save_summary_persisted(df, interval, *args, **kwargs)
+
+
 def _safe_run_display(interval: int, df_latest: pd.DataFrame) -> None:
+    df_latest = _controller_enrich_runtime(
+        df_latest, interval=int(interval or 1), context="before-display"
+    )
     try:
         push_fn, _ranking_fn = _resolve_display_functions_once()
         if callable(push_fn):

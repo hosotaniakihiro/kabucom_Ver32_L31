@@ -146,17 +146,6 @@ def _sort_candidates_local(items: list[Any]) -> list[Any]:
     return sorted(items, key=_score_for_side_local, reverse=True)
 
 
-def _install_controller_enrich_patch() -> bool:
-    try:
-        from core.startup.summary_controller_enrich_runtime_patch import install as install_enrich
-        ok = bool(install_enrich())
-        logger.warning("[SUMMARY AI MORE CANDIDATES PATCH] summary_controller_enrich_runtime_patch installed=%s", ok)
-        return ok
-    except Exception:
-        logger.exception("[SUMMARY AI MORE CANDIDATES PATCH] summary_controller_enrich_runtime_patch install failed")
-        return False
-
-
 def _install_final_gate_relax_patch() -> bool:
     try:
         from core.startup.entry_controller_final_gate_relax_patch import install as install_relax
@@ -467,7 +456,7 @@ def _clamp_summary_ai_scores(kwargs: dict[str, Any]) -> dict[str, tuple[float | 
 def install() -> bool:
     global _INSTALLED
 
-    _install_controller_enrich_patch()
+    # controller enrich は trading/summary/summary_controller.py へ本文化済み。
     _install_final_gate_relax_patch()
     _install_direct_dispatch_patch()
     _install_approved_row_range_repair_patch()
