@@ -216,10 +216,51 @@ def _calc_from_snapshot(symbol: str) -> dict[str, Any]:
         return {}
 
 
+_ZERO_RANGE_RESCUE: bool | None = None
+
+
+def _zero_range_rescue_enabled() -> bool:
+    """high == low == close の行も補完対象に含めるか。
+
+    旧 core/startup/ranking_entry_runtime_rescue_patch.py
+    (V1-RANKING-ENTRY-MTF-LOW-AND-ZERO-RANGE-RESCUE) の本文化。
+    ranking 起動直後の行は high == low == close になることがあり、
+    レンジ0のままだとボラティリティ/レンジフィルタに落とされるため補完する。
+
+    適用スコープは旧パッチの導線をそのまま再現している:
+      - core/startup/runtime_env/defaults_patch._safe_install() 経由で
+        context が TRADING_CONTEXTS ({"main"}) のときだけ install されていた
+      - DISABLE_RANKING_ENTRY_RUNTIME_RESCUE_PATCH=1 で無効化
+      - patch 側の RANKING_ENTRY_RUNTIME_RESCUE_ENABLED (既定True) でも無効化
+    判定は install 時に1度だけ行われていたため、ここでも初回呼び出しで確定させる。
+    """
+    global _ZERO_RANGE_RESCUE
+    if _ZERO_RANGE_RESCUE is not None:
+        return _ZERO_RANGE_RESCUE
+    enabled = False
+    try:
+        if str(os.getenv("DISABLE_RANKING_ENTRY_RUNTIME_RESCUE_PATCH", "")).strip() != "1":
+            raw = os.getenv("RANKING_ENTRY_RUNTIME_RESCUE_ENABLED")
+            on = True
+            if raw is not None and str(raw).strip() != "":
+                on = str(raw).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+            if on:
+                argv_text = " ".join(str(x) for x in sys.argv).replace("\\", "/").lower()
+                if not any(name in argv_text for name in _HL_DB_PROCESS_NAMES):
+                    enabled = "main.py" in argv_text
+    except Exception:
+        enabled = False
+    _ZERO_RANGE_RESCUE = enabled
+    return enabled
+
+
 def _needs_high_low(entry_row: dict[str, Any]) -> bool:
     high = _safe_float(entry_row.get("high") or entry_row.get("high_price"), 0.0)
     low = _safe_float(entry_row.get("low") or entry_row.get("low_price"), 0.0)
     close = _safe_float(entry_row.get("close") or entry_row.get("close_price") or entry_row.get("price"), 0.0)
+    if _zero_range_rescue_enabled():
+        # レンジ0 (high == low) も補完対象に含める
+        return close > 0 and (high <= 0 or low <= 0 or high <= low)
     return close > 0 and (high <= 0 or low <= 0 or high < low)
 
 

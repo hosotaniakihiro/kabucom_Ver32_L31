@@ -259,7 +259,11 @@ def _install_push_summary_db_latest_source(context: str) -> bool:
 
 
 def _install_ranking_entry_runtime_rescue(context: str) -> bool:
-    return _safe_install("ranking entry runtime rescue", context, TRADING_CONTEXTS, "DISABLE_RANKING_ENTRY_RUNTIME_RESCUE_PATCH", "ranking_entry_runtime_rescue_patch")
+    # ranking entry runtime rescue (レンジ0行の high/low 補完) は
+    # trading/ranking/ranking_entry_high_low._needs_high_low へ本文化済み。
+    # 適用スコープ (context=main / DISABLE_RANKING_ENTRY_RUNTIME_RESCUE_PATCH /
+    # RANKING_ENTRY_RUNTIME_RESCUE_ENABLED) も同関数側で再現している。
+    return context in TRADING_CONTEXTS
 
 
 def _install_low_volatility_entry_guard(context: str) -> bool:
