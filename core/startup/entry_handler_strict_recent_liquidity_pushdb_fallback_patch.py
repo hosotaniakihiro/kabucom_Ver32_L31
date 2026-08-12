@@ -110,7 +110,10 @@ def _push_db_liquidity_values(symbol: str, bars: int) -> dict[str, Any]:
     sym = _norm_symbol(symbol)
     try:
         import pandas as pd
-        from core.startup import summary_main_push_db_refresh_patch as refresh
+        # 旧 core/startup/summary_main_push_db_refresh_patch は
+        # scheduler_jobs/summary/memory_latest_1m.py へ本文化した。
+        # _read_push_db_recent はそのまま移設されている。
+        from scheduler_jobs.summary import memory_latest_1m as refresh
 
         reader = getattr(refresh, "_read_push_db_recent", None)
         if not callable(reader):

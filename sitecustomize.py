@@ -363,7 +363,11 @@ SYNC_MAIN_PATCHES = [
     # summary_ai_volatility_rescue_patch は削除済み (env 既定値のみのstubだった)。
     # 代わりに _apply_summary_ai_vol_rescue_env_defaults() を install 前に呼ぶ。
     ("core.startup.summary_ai_runtime_consistency_patch", "SUMMARY_AI_RUNTIME_CONSISTENCY", "DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH"),
-    ("core.startup.summary_main_push_db_refresh_patch", "SUMMARY_MAIN_PUSH_DB_REFRESH", "DISABLE_SUMMARY_MAIN_PUSH_DB_REFRESH_PATCH"),
+    # summary_main_push_db_refresh_patch は削除した。
+    # _load_push_memory_df の stale 時 PUSH DB 再取得は
+    # scheduler_jobs/summary/memory_latest_1m.py へ本文化済み
+    # (スコープは同ファイルの _push_db_refresh_enabled() が再現。
+    #  DISABLE_SUMMARY_MAIN_PUSH_DB_REFRESH_PATCH=1 も従来どおり効く)。
     ("scheduler_jobs.summary.direct_push_1m", "SUMMARY_FORCE_DIRECT_1M_SYNC", "DISABLE_SUMMARY_FORCE_DIRECT_1M_PATCH"),
 ]
 

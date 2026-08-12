@@ -44,9 +44,11 @@ import datetime as dt
 import logging
 import os
 import re
+import sqlite3
 import sys
 import time
 from functools import wraps
+from pathlib import Path
 from typing import Any, Optional
 
 import pandas as pd
@@ -223,7 +225,7 @@ def _to_naive_datetime_any(values: Any, *, now: dt.datetime, date_values: Any = 
         return pd.Series(pd.NaT, index=s.index)
 
 
-def _load_push_memory_df() -> pd.DataFrame:
+def _load_push_memory_df_core() -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
     gd = _global_data()
     if gd is not None:
@@ -561,6 +563,225 @@ try:
     install()
 except Exception:
     logger.exception("[SUMMARY MAIN MEMORY 1M] auto install failed")
+
+
+# ============================================================
+# PUSH DB からの再取得 (stale 時のフォールバック)
+# 旧 core/startup/summary_main_push_db_refresh_patch.py V2 を本文化。
+#
+# 旧構成は _load_push_memory_df をモジュール属性ごと差し替えていた。
+# install 元は sitecustomize:366 (SYNC_MAIN) の 1 箇所で、
+# ラッパ自身も _is_main_py() を見て非 main では base をそのまま返していた。
+# その 2 条件 (+ DISABLE_SUMMARY_MAIN_PUSH_DB_REFRESH_PATCH=="1") を
+# _push_db_refresh_enabled() が再現する。
+#
+# 注意: _push_db_refresh_env_bool は旧パッチ側の _env_bool をそのまま持ち込んだもの。
+# このファイルの _env_bool は「未知の値 -> default」だが、旧パッチ版は
+# 「TRUE 集合に無ければ False」で解釈が違うため共用しないこと。
+# ============================================================
+
+
+def _push_db_refresh_enabled() -> bool:
+    """このプロセスで PUSH DB フォールバックを行うか (旧 install スコープの再現)。"""
+    try:
+        if str(os.environ.get("DISABLE_SUMMARY_MAIN_PUSH_DB_REFRESH_PATCH", "")).strip() == "1":
+            return False
+        return _is_main_py()
+    except Exception:
+        return False
+
+def _push_db_refresh_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is not None and str(v).strip() != "":
+            return float(str(v).replace(",", "").strip())
+    except Exception:
+        pass
+    return float(default)
+
+
+def _nas_root() -> str:
+    for name in ("AUTOSTOCK_NAS_ROOT", "AUTO_STOCK_NAS_ROOT", "AUTOSTOCK_DATA_ROOT"):
+        v = os.getenv(name)
+        if v and str(v).strip():
+            return str(v).strip()
+    return r"\\192.168.0.22\AutoStockBuyAndSell"
+
+
+def _today_yyyymmdd() -> str:
+    return dt.datetime.now().strftime("%Y%m%d")
+
+
+def _push_db_path() -> Path:
+    explicit = os.getenv("PUSH_DB_PATH") or os.getenv("AUTOSTOCK_PUSH_DB_PATH")
+    if explicit and str(explicit).strip():
+        return Path(str(explicit).strip())
+    return Path(_nas_root()) / "raw_data" / "kabu_station" / "push" / f"push{_today_yyyymmdd()}.db"
+
+
+def _safe_dt_series(values: Any) -> pd.Series:
+    try:
+        s = values if isinstance(values, pd.Series) else pd.Series(values)
+        out = pd.to_datetime(s, errors="coerce")
+        try:
+            if getattr(out.dt, "tz", None) is not None:
+                out = out.dt.tz_convert("Asia/Tokyo").dt.tz_localize(None)
+        except Exception:
+            try:
+                out = out.dt.tz_localize(None)
+            except Exception:
+                pass
+        return out
+    except Exception:
+        return pd.Series(pd.NaT, index=getattr(values, "index", None))
+
+
+def _latest_dt(df: Any) -> Any:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+    for c in ("datetime", "received_at", "time", "current_price_time", "PriceTime", "updated_at", "created_at"):
+        if c in df.columns:
+            try:
+                x = _safe_dt_series(df[c]).max()
+                if pd.notna(x):
+                    return pd.Timestamp(x).tz_localize(None)
+            except Exception:
+                continue
+    return None
+
+
+def _stale_sec(df: pd.DataFrame) -> float | None:
+    try:
+        latest = _latest_dt(df)
+        if latest is None or pd.isna(latest):
+            return None
+        return (pd.Timestamp(dt.datetime.now()).tz_localize(None) - pd.Timestamp(latest).tz_localize(None)).total_seconds()
+    except Exception:
+        return None
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    try:
+        rows = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+        return [str(r[1]) for r in rows]
+    except Exception:
+        return []
+
+
+def _existing_tables(conn: sqlite3.Connection) -> list[str]:
+    try:
+        rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        return [str(r[0]) for r in rows]
+    except Exception:
+        return []
+
+
+def _quote(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _read_push_db_recent() -> pd.DataFrame:
+    if not _push_db_refresh_env_bool("SUMMARY_MAIN_PUSH_DB_REFRESH_ENABLED", True):
+        return pd.DataFrame()
+    path = _push_db_path()
+    if not path.exists():
+        logger.warning("[SUMMARY MAIN PUSH DB REFRESH] db missing path=%s version=%s", path, VERSION)
+        return pd.DataFrame()
+
+    limit = max(100, _env_int("SUMMARY_MAIN_PUSH_DB_REFRESH_LIMIT", 5000))
+    timeout = max(0.05, _env_float("SUMMARY_MAIN_PUSH_DB_REFRESH_TIMEOUT_SEC", 0.8))
+    tables_prefer = ["stream_data_raw", "stream_data", "push_stream", "push_ticks", "ticks"]
+    try:
+        conn = sqlite3.connect(str(path), timeout=timeout)
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("PRAGMA busy_timeout=%d" % int(timeout * 1000))
+        except Exception:
+            pass
+        tables = _existing_tables(conn)
+        for table in tables_prefer + [t for t in tables if t not in tables_prefer]:
+            if table not in tables:
+                continue
+            cols = _table_columns(conn, table)
+            if not cols:
+                continue
+            dt_col = next((c for c in ("datetime", "received_at", "created_at", "updated_at", "time") if c in cols), None)
+            sym_col = next((c for c in ("symbol", "code", "Symbol", "銘柄コード") if c in cols), None)
+            price_col = next((c for c in ("current_price", "price", "close", "CurrentPrice", "Price", "現在値") if c in cols), None)
+            if sym_col is None or price_col is None:
+                continue
+            order = f"ORDER BY {_quote(dt_col)} DESC" if dt_col else ""
+            sql = f"SELECT * FROM {_quote(table)} {order} LIMIT {int(limit)}"
+            try:
+                df = pd.read_sql_query(sql, conn)
+            except Exception:
+                continue
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+            latest = _latest_dt(df)
+            logger.warning(
+                "[SUMMARY MAIN PUSH DB REFRESH] loaded table=%s rows=%s latest=%s path=%s version=%s",
+                table, len(df), latest, path, VERSION,
+            )
+            return df
+        logger.warning("[SUMMARY MAIN PUSH DB REFRESH] no usable table path=%s tables=%s version=%s", path, tables[:20], VERSION)
+        return pd.DataFrame()
+    except Exception:
+        logger.warning("[SUMMARY MAIN PUSH DB REFRESH] db read failed path=%s version=%s", path, VERSION, exc_info=True)
+        return pd.DataFrame()
+    finally:
+        try:
+            conn.close()  # type: ignore[name-defined]
+        except Exception:
+            pass
+
+
+def _load_push_memory_df() -> pd.DataFrame:
+    """PUSH メモリ DF を返す。main では stale 時に PUSH DB から取り直す。"""
+    base = pd.DataFrame()
+    try:
+        base = _load_push_memory_df_core()
+    except Exception:
+        logger.warning("[SUMMARY MAIN PUSH DB REFRESH] original memory loader failed", exc_info=True)
+
+    if not _push_db_refresh_enabled():
+        return base
+
+    max_stale = max(10.0, _env_float("SUMMARY_MAIN_PUSH_DB_REFRESH_MAX_STALE_SEC", 75.0))
+    stale = _stale_sec(base)
+    if isinstance(base, pd.DataFrame) and not base.empty and stale is not None and stale <= max_stale:
+        return base
+
+    db_df = _read_push_db_recent()
+    if db_df.empty:
+        logger.warning(
+            "[SUMMARY MAIN PUSH DB REFRESH] keep memory because db empty memory_rows=%s memory_stale=%s max_stale=%.1f",
+            len(base) if isinstance(base, pd.DataFrame) else 0,
+            None if stale is None else round(float(stale), 1),
+            max_stale,
+        )
+        return base
+
+    db_stale = _stale_sec(db_df)
+    logger.warning(
+        "[SUMMARY MAIN PUSH DB REFRESH] using db rows=%s db_stale=%s memory_rows=%s memory_stale=%s max_stale=%.1f",
+        len(db_df),
+        None if db_stale is None else round(float(db_stale), 1),
+        len(base) if isinstance(base, pd.DataFrame) else 0,
+        None if stale is None else round(float(stale), 1),
+        max_stale,
+    )
+    return db_df
 
 
 __all__ = ["VERSION", "install", "_build_memory_1m_summary", "_load_push_memory_df"]
