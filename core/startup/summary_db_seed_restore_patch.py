@@ -51,7 +51,7 @@ def _env_bool(name: str, default: bool = True) -> bool:
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 
 
-def _env_int(name: str, default: int) -> int:
+def _env_int_base(name: str, default: int) -> int:
     try:
         v = os.getenv(name)
         if v is None or str(v).strip() == "":
@@ -222,7 +222,7 @@ def _count_summary_rows(path: Path) -> int:
         return 0
 
 
-def _resolve_previous_seed_db_path(current_path: Path) -> Optional[Path]:
+def _resolve_previous_seed_db_path_base(current_path: Path) -> Optional[Path]:
     if not _env_bool("SUMMARY_DB_SEED_RESTORE_PREV_FALLBACK", True):
         return None
     if current_path is None:
@@ -839,3 +839,81 @@ def restore_summary_db_seed(db_path: Any = None, *, force: bool = False) -> dict
 
 
 __all__ = ["restore_summary_db_seed"]
+
+
+# ============================================================
+# main.py 起動時の seed restore 軽量化
+# ------------------------------------------------------------
+# 旧 core/startup/summary_seed_restore_main_fast_patch.py を統合。
+# (このモジュール自体がまだパッチなので「本文化」ではなくホストへの統合)
+#
+#   - main.py では bars/rows/lookback の既定値を軽い値に差し替える
+#   - main.py では前日 summary DB の重い COUNT scan を丸ごと省く
+# main_database.py / force 系は従来どおり。判定ヘルパは旧パッチのものを
+# そのまま移植した (本モジュール既存の _is_main_py_context とは別実装)。
+# ============================================================
+
+def _main_fast_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return bool(default)
+        return str(raw).strip().lower() in {"1", "true", "yes", "y", "on", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _main_fast_is_main_py() -> bool:
+    try:
+        argv = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+        if "main_database.py" in argv:
+            return False
+        if any(x in argv for x in (
+            "summary_database_runner.py",
+            "yahoo_complement_runner.py",
+            "ranking_collector_runner.py",
+            "push_receiver_runner.py",
+            "data_collectors_runner.py",
+        )):
+            return False
+        if any(os.getenv(k) == "1" for k in (
+            "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+            "AUTOSTOCK_SUMMARY_DB_WRITER",
+            "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+            "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
+        )):
+            return False
+        return "main.py" in argv
+    except Exception:
+        return False
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        if _main_fast_is_main_py() and _main_fast_env_bool("SUMMARY_DB_SEED_RESTORE_MAIN_FAST_DEFAULTS", True):
+            if name == "SUMMARY_DB_SEED_RESTORE_BARS_PER_SYMBOL":
+                raw = os.getenv(name)
+                return int(float(raw)) if raw not in (None, "") else int(os.getenv("SUMMARY_DB_SEED_RESTORE_MAIN_BARS_PER_SYMBOL", "30"))
+            if name == "SUMMARY_DB_SEED_RESTORE_MAX_ROWS_PER_TF":
+                raw = os.getenv(name)
+                return int(float(raw)) if raw not in (None, "") else int(os.getenv("SUMMARY_DB_SEED_RESTORE_MAIN_MAX_ROWS_PER_TF", "9000"))
+            if name == "SUMMARY_DB_SEED_RESTORE_PREV_LOOKBACK_DAYS":
+                raw = os.getenv(name)
+                return int(float(raw)) if raw not in (None, "") else int(os.getenv("SUMMARY_DB_SEED_RESTORE_MAIN_PREV_LOOKBACK_DAYS", "1"))
+    except Exception:
+        pass
+    return _env_int_base(name, default)
+
+
+def _resolve_previous_seed_db_path(current_path: Path) -> Optional[Path]:
+    try:
+        if _main_fast_is_main_py() and _main_fast_env_bool("SUMMARY_DB_SEED_RESTORE_SKIP_PREV_SCAN_IN_MAIN", True):
+            if not _main_fast_env_bool("SUMMARY_DB_SEED_RESTORE_ALLOW_PREV_AS_PUSH_HISTORY", False):
+                logger.warning(
+                    "[SUMMARY SEED MAIN FAST] skip previous summary DB scan in main.py current=%s allow_prev_as_push_history=0",
+                    current_path,
+                )
+                return None
+    except Exception:
+        pass
+    return _resolve_previous_seed_db_path_base(current_path)

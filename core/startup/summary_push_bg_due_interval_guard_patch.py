@@ -150,14 +150,16 @@ def _install_display_first_patch() -> bool:
 
 
 def _install_seed_fast_patch() -> bool:
-    try:
-        from core.startup.summary_seed_restore_main_fast_patch import install as install_seed_fast
-        ok = bool(install_seed_fast())
-        logger.warning("[SUMMARY PUSH BG DUE GUARD] seed restore main-fast patch installed=%s", ok)
-        return ok
-    except Exception:
-        logger.exception("[SUMMARY PUSH BG DUE GUARD] seed restore main-fast patch install failed")
-        return False
+    """seed restore の main.py 軽量化。
+
+    旧 core/startup/summary_seed_restore_main_fast_patch.py は
+    core/startup/summary_db_seed_restore_patch.py の _env_int /
+    _resolve_previous_seed_db_path 本体へ統合済み (判定は同ファイルの
+    _main_fast_is_main_py / _main_fast_env_bool が再現)。
+    ホスト側は install を持たないライブラリ (restore_summary_db_seed を
+    公開するだけ) なので、ここでの事前installは不要になった。
+    """
+    return True
 
 
 def _run_task_direct_thread(task, *, bg_key: str, interval: int) -> bool:
