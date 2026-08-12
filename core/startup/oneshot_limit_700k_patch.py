@@ -200,14 +200,14 @@ def _install_aligned_summary_display_patch() -> bool:
 
 
 def _install_summary_ai_executor_result_patch() -> bool:
-    try:
-        from core.startup import summary_ai_executor_result_patch as p
-        ok = p.install()
-        logger.warning("[ONESHOT LIMIT PATCH] summary_ai_executor_result_patch installed=%s", ok)
-        return bool(ok)
-    except Exception:
-        logger.exception("[ONESHOT LIMIT PATCH] summary_ai_executor_result_patch install failed")
-        return False
+    # summary_ai_executor_result_patch は削除した。
+    # あのパッチは trading/entry/summary_ai/executor へ
+    # _is_positive_order_result という「本体に存在しない」属性を新設していただけで、
+    # executor.py もその他のモジュールもこの名前を一度も読まない (git grep 済み)。
+    # 実際に使われている厳格判定は executor._dd_strict_result_executed (ネイティブ) と、
+    # entry_pipeline / summary_entry の _result_executed
+    # (summary_ai_entry_controller_bridge_patch が差し替え) の方。
+    return True
 
 
 # summary_ai_sell_credit_prefilter_patch は trading/entry/summary_ai/executor.py の

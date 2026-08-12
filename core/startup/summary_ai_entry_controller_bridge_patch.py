@@ -11,7 +11,8 @@
 #     no-order時の1回リトライ (旧 _make_run_entry_pipeline_wrapper) は
 #     trading/handlers/entry_controller.py の run_entry_pipeline 本体 (Ver2.8) へ
 #     インライン化したため撤去した。ai_final_entry_check への preapproved bridge と、
-#     3モジュールの _result_executed/_is_positive_order_result strict化は維持する。
+#     entry_pipeline / summary_entry の _result_executed strict化は維持する
+#     (executor._is_positive_order_result は読み手ゼロだったので撤去済み)。
 #
 # V1.5 (旧):
 #   - pending_count 減少だけでは executed=True にしない。
@@ -142,19 +143,11 @@ def _summary_ai_result(row: dict) -> dict:
 
 def _install_strict_result_judges() -> bool:
     ok = True
-    try:
-        import trading.entry.summary_ai.executor as executor
-        old = getattr(executor, "_is_positive_order_result", None)
-        if callable(old) and not getattr(old, "_summary_ai_strict_order_v15", False):
-            def _patched_positive_order_result(result: Any) -> bool:
-                return _strict_order_executed(result)
-            _patched_positive_order_result._summary_ai_strict_order_v15 = True  # type: ignore[attr-defined]
-            _patched_positive_order_result._original = old  # type: ignore[attr-defined]
-            executor._is_positive_order_result = _patched_positive_order_result
-            logger.warning("[SUMMARY AI ENTRY BRIDGE] summary_ai.executor strict real-order judge installed")
-    except Exception:
-        ok = False
-        logger.exception("[SUMMARY AI ENTRY BRIDGE] executor strict judge install failed")
+    # trading.entry.summary_ai.executor._is_positive_order_result への差し替えは撤去した。
+    # あの属性は summary_ai_executor_result_patch (削除済み) が新設していただけで、
+    # executor.py 本体にも他のどのモジュールにも読み手が無い。
+    # executor 側で実際に使われている厳格判定はネイティブの
+    # _dd_strict_result_executed なので、ここでラップする対象は存在しない。
 
     try:
         import trading.summary.pipeline.entry_pipeline as ep
