@@ -314,7 +314,21 @@ def _install_strict_final_liquidity_guard(context: str) -> bool:
 
 
 def _install_strict_final_liq_pushdb_fallback(context: str) -> bool:
-    return _safe_install("strict final liquidity pushdb fallback", context, TRADING_CONTEXTS, "DISABLE_ENTRY_HANDLER_STRICT_RECENT_LIQ_PUSHDB_FALLBACK_PATCH", "entry_handler_strict_recent_liquidity_pushdb_fallback_patch")
+    """旧 entry_handler_strict_recent_liquidity_pushdb_fallback_patch の導線。
+
+    同パッチは削除した。ラップ対象の
+    entry_handler_strict_recent_liquidity_patch._global_context_liquidity_values は
+    リポジトリのどこにも定義が無く、install() が
+    `if not callable(current): return False` で必ず抜けていたため、
+    PUSH DB フォールバックは一度も適用されていなかった。
+
+    実効のあった唯一の副作用は install() 冒頭の base.install() 呼び出しなので、
+    ゲート名 (DISABLE_ENTRY_HANDLER_STRICT_RECENT_LIQ_PUSHDB_FALLBACK_PATCH) と
+    スコープをそのままに、base を直接 install する形へ置き換えた。
+    上の _install_strict_final_liq_guard と二重になるが、install() は
+    _INSTALLED ガードで冪等。片方だけ env で無効化された場合の挙動も従来どおり。
+    """
+    return _safe_install("strict final liquidity guard (via pushdb fallback route)", context, TRADING_CONTEXTS, "DISABLE_ENTRY_HANDLER_STRICT_RECENT_LIQ_PUSHDB_FALLBACK_PATCH", "entry_handler_strict_recent_liquidity_patch")
 
 
 def _install_tonosama_exit_source_infer(context: str) -> bool:
