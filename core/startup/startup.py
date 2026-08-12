@@ -962,12 +962,12 @@ def _install_entrypoint_runtime_patches() -> None:
     # summary_seed_recent_merged_guard_patch は core/startup/summary_db_seed_restore_patch.py の
     # _publish_interval (SUMMARY_SEED_RECENT_MERGED_GUARD_ENABLED gate 込み) へ native化済み。
 
-    try:
-        from core.startup.daily_mtf_daily_src_alias_patch import install as install_daily_mtf_src_alias_patch
-
-        install_daily_mtf_src_alias_patch()
-    except Exception:
-        logger.exception("[startup.entrypoint] daily mtf src alias patch install failed")
+    # daily_mtf_daily_src_alias_patch は削除した。
+    # ラップ対象 trading/summary/mtf/daily_ma_mtf.attach_daily_ma_mtf_to_summary の
+    # 読み手は3経路とも `from .daily_ma_mtf import ...` 形式で、しかもパッチ自身の
+    # `import trading.summary.mtf.daily_ma_mtf` がパッケージ __init__ を先に走らせる
+    # ため、install() が属性を差し替える時点で全ての束縛が既に元関数を掴んでいた。
+    # モジュール属性経由で呼ぶ箇所は1つも無く、ラッパは一度も実行されていなかった。
 
     try:
         from core.startup.summary_controller_publish_mtf_merged_patch import install as install_publish_mtf_merged_patch
