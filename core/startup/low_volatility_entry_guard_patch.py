@@ -259,60 +259,18 @@ def _patch_summary_ai_selection() -> bool:
 
 
 def _patch_entry_order_builder_low_move() -> bool:
-    global _ENTRY_ORDER_PATCHED
-    if _ENTRY_ORDER_PATCHED:
-        return True
-    try:
-        import trading.handlers.entry_order_builder as eob
-        cur = getattr(eob, "_low_move_hard_block", None)
-        if not callable(cur):
-            return False
-        if getattr(cur, "_entry_order_day_range_repair_v3", False):
-            _ENTRY_ORDER_PATCHED = True
-            return True
-        orig = getattr(cur, "_original", cur)
+    """entry_order_builder._low_move_hard_block の day-range repair。
 
-        @wraps(orig)
-        def patched_low_move_hard_block(entry_row: dict, *, symbol: str, source: str):
-            res = orig(entry_row, symbol=symbol, source=source)
-            try:
-                if not isinstance(res, dict) or res.get("reason") != "LOW_MOVE_RANGE_TOO_SMALL":
-                    return res
-                if str(source or "").upper() != "SUMMARY_AI":
-                    return res
-                row = entry_row or {}
-                best_range, high, low, method = _best_range_fraction(row)
-                min_range = float(getattr(eob, "ENTRY_ORDER_MIN_RANGE_PCT", _env_float("ENTRY_ORDER_MIN_RANGE_PCT", 0.006)))
-                if best_range >= min_range:
-                    logger.warning(
-                        "[LOW VOL ENTRY GUARD] entry_order_builder low-move repaired symbol=%s source=%s range_pct=%.6f min=%.6f high=%.2f low=%.2f method=%s original=%s version=%s",
-                        symbol,
-                        source,
-                        best_range,
-                        min_range,
-                        high,
-                        low,
-                        method,
-                        res,
-                        VERSION,
-                    )
-                    return None
-                return res
-            except Exception:
-                logger.exception("[LOW VOL ENTRY GUARD] entry_order_builder low-move repair failed; return original")
-                return res
+    このラッパは実運用で一度も効いていなかった。同じ属性を
+    summary_ai_range_consistency_patch が後から `_original` を辿って
+    掴み直して差し替えるため (install順: range_repair -> low_vol ->
+    range_consistency)。スタブmoduleでの合成順シミュレーションで確認済み。
 
-        patched_low_move_hard_block._entry_order_day_range_repair_v3 = True  # type: ignore[attr-defined]
-        patched_low_move_hard_block._original = orig  # type: ignore[attr-defined]
-        eob._low_move_hard_block = patched_low_move_hard_block
-        _ENTRY_ORDER_PATCHED = True
-        logger.warning("[LOW VOL ENTRY GUARD] entry_order_builder low-move day-range repair patched v3")
-        return True
-    except Exception:
-        logger.debug("[LOW VOL ENTRY GUARD] entry_order_builder patch skipped", exc_info=True)
-        return False
-
-
+    range_consistency 側は trading/handlers/entry_order_builder.py の
+    _low_move_hard_block へ本文化済み。ここでラップを復活させると、
+    今まで無効だったガードが有効になり挙動が変わるため、意図的に何もしない。
+    """
+    return True
 def install() -> bool:
     global _INSTALLED
     if _INSTALLED:

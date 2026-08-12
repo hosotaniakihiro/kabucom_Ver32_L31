@@ -229,12 +229,16 @@ def _repair_summary_ai_low_move_range(kwargs: dict[str, Any], eob: Any) -> bool:
 
 
 def _install_range_consistency_chain() -> bool:
-    try:
-        from core.startup.summary_ai_range_consistency_patch import install as _install_range_consistency
-        return bool(_install_range_consistency())
-    except Exception:
-        logger.exception("[SUMMARY AI FAST ORDER BUILDER] range consistency chain install failed version=%s", VERSION)
-        return False
+    """SUMMARY_AI レンジ整合による低変動ガード再判定。
+
+    旧 core/startup/summary_ai_range_consistency_patch.py は
+    trading/handlers/entry_order_builder._low_move_hard_block へ本文化済み。
+    同属性を奪い合っていた low_volatility_entry_guard_patch /
+    summary_ai_order_builder_range_repair_patch のラッパは、いずれも本パッチの
+    install 順の関係で一度も効いておらず、本文化に合わせて撤去した
+    (残しておくと今まで無効だったガードが有効になってしまうため)。
+    """
+    return True
 
 
 def _install_strict_board_rest_chain() -> bool:

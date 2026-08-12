@@ -389,35 +389,12 @@ def install() -> bool:
     if _INSTALLED:
         return True or ctrl_ok
     try:
-        from trading.handlers import entry_order_builder as eob
-        cur = getattr(eob, "_low_move_hard_block", None)
-        if not callable(cur):
-            logger.warning("[SUMMARY AI ORDER RANGE REPAIR] target missing version=%s", VERSION)
-            return bool(ctrl_ok)
-        if getattr(cur, "_summary_ai_order_range_repair_v5", False):
-            _INSTALLED = True
-            return True
-
-        _ORIGINAL_LOW_MOVE = getattr(cur, "_original", cur)
-
-        def _patched_low_move_hard_block(entry_row, *, symbol: str, source: str):
-            row = _row_dict(entry_row)
-            if not _source_is_summary_ai(source, row):
-                return _ORIGINAL_LOW_MOVE(entry_row, symbol=symbol, source=source)
-            repaired, diag = _repair_row(entry_row, symbol=str(symbol or row.get("symbol") or ""), source=str(source or row.get("source") or ""))
-            if diag.get("repaired") or diag.get("atr_repaired"):
-                logger.warning("[SUMMARY AI ORDER RANGE REPAIR] repaired before strict low-move guard detail=%s version=%s", diag, VERSION)
-                _update_original_row(entry_row, repaired)
-                return _ORIGINAL_LOW_MOVE(repaired, symbol=symbol, source=source)
-            return _ORIGINAL_LOW_MOVE(entry_row, symbol=symbol, source=source)
-
-        _patched_low_move_hard_block._summary_ai_order_range_repair_v1 = True  # type: ignore[attr-defined]
-        _patched_low_move_hard_block._summary_ai_order_range_repair_v2 = True  # type: ignore[attr-defined]
-        _patched_low_move_hard_block._summary_ai_order_range_repair_v3 = True  # type: ignore[attr-defined]
-        _patched_low_move_hard_block._summary_ai_order_range_repair_v4 = True  # type: ignore[attr-defined]
-        _patched_low_move_hard_block._summary_ai_order_range_repair_v5 = True  # type: ignore[attr-defined]
-        _patched_low_move_hard_block._original = _ORIGINAL_LOW_MOVE  # type: ignore[attr-defined]
-        eob._low_move_hard_block = _patched_low_move_hard_block
+        # entry_order_builder._low_move_hard_block のラップは撤去した。
+        # 実運用では直後に install される summary_ai_range_consistency_patch が
+        # `_original` を辿って素の実装を掴み直すため、このラッパは一度も
+        # 効いていなかった (合成順シミュレーションで確認済み)。
+        # range_consistency 側のロジックは
+        # trading/handlers/entry_order_builder._low_move_hard_block へ本文化済み。
         _INSTALLED = True
         logger.warning("[SUMMARY AI ORDER RANGE REPAIR] installed version=%s", VERSION)
         return True

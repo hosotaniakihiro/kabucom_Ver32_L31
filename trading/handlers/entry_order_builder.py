@@ -254,7 +254,7 @@ def _get_board_with_retry(symbol: str, *, source: str, side: str) -> Optional[Di
         time.sleep(interval)
 
 
-def _low_move_hard_block(entry_row: Dict[str, Any], *, symbol: str, source: str) -> Optional[Dict[str, Any]]:
+def _low_move_hard_block_core(entry_row: Dict[str, Any], *, symbol: str, source: str) -> Optional[Dict[str, Any]]:
     if not ENTRY_ORDER_LOW_MOVE_GUARD_ENABLED:
         return None
     if not _source_uses_low_move_guard(source):
@@ -832,3 +832,120 @@ def build_entry_order(*, symbol: str, side: str, source: str, entry_row: Dict[st
         detail["forced_min_qty"] = True
         detail["liquidity_class"] = "LOW"
     return _ok(**detail)
+
+
+# ============================================================
+# SUMMARY_AI レンジ整合による低変動ガードの再判定
+# ------------------------------------------------------------
+# 旧 core/startup/summary_ai_range_consistency_patch.py (V1) を本文化。
+#
+# SUMMARY_AI 経路で LOW_MOVE_RANGE_TOO_SMALL / LOW_MOVE_ATR_TOO_SMALL に
+# なった行について、entry_row 内の別ソースの high/low からレンジを取り直し、
+# 閾値を満たすなら high/low/range_pct/atr を整合させたうえで通過させる。
+# 低変動ガード自体は緩めない (閾値は ENTRY_ORDER_MIN_RANGE_PCT /
+# ENTRY_ORDER_MIN_ATR_RATIO をそのまま使う)。
+#
+# 【重要】この関数を消す/順序を変える場合は
+# core/startup/low_volatility_entry_guard_patch.py と
+# core/startup/summary_ai_order_builder_range_repair_patch.py の
+# _low_move_hard_block ラッパ (現在は死にコード) を必ず同時に確認すること。
+# 3者とも `getattr(cur, "_original", cur)` で素の実装を掴み直す設計のため、
+# 本文化前は「最後に install された旧 range_consistency」だけが効いていた。
+# ============================================================
+
+def _rc_f(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or str(v).strip() == "":
+            return float(default)
+        x = float(str(v).replace(",", ""))
+        if math.isnan(x) or math.isinf(x):
+            return float(default)
+        return x
+    except Exception:
+        return float(default)
+
+
+def _rc_first(d: dict[str, Any], keys: tuple[str, ...]) -> float:
+    for k in keys:
+        try:
+            x = _rc_f(d.get(k), 0.0)
+            if x > 0:
+                return x
+        except Exception:
+            pass
+    return 0.0
+
+
+def _rc_best_range(row: dict[str, Any], close: float) -> tuple[str, float, float, float]:
+    cond = row.get("entry_conditions") if isinstance(row.get("entry_conditions"), dict) else {}
+    candidates: list[tuple[str, float, float, float]] = []
+
+    for label, src in (("bar", row), ("row_day", row), ("conditions_day", cond), ("recent", row)):
+        if label == "bar":
+            hi = _rc_first(src, ("high_price", "high"))
+            lo = _rc_first(src, ("low_price", "low"))
+        elif label == "recent":
+            hi = _rc_first(src, ("recent_high", "range_high", "high_1m_max"))
+            lo = _rc_first(src, ("recent_low", "range_low", "low_1m_min"))
+        else:
+            hi = _rc_first(src, ("day_high", "today_high", "session_high", "intraday_high", "HighPrice"))
+            lo = _rc_first(src, ("day_low", "today_low", "session_low", "intraday_low", "LowPrice"))
+        if hi > 0 and lo > 0:
+            h, l = max(hi, lo), min(hi, lo)
+            candidates.append((label, h, l, _ratio(close, h, l)))
+
+    explicit = max(
+        _rc_first(row, ("range_pct", "intraday_range_pct", "summary_ai_range_repair_pct")),
+        _rc_first(cond, ("range_pct", "intraday_range_pct", "day_range_pct")),
+    )
+    if explicit > 0:
+        width = close * explicit
+        candidates.append(("explicit", close + width / 2.0, max(0.01, close - width / 2.0), explicit))
+
+    if not candidates:
+        return ("missing", 0.0, 0.0, 0.0)
+    return max(candidates, key=lambda x: x[3])
+
+
+_RC_VERSION = "V1-SUMMARY-AI-RANGE-CONSISTENCY"
+
+
+def _low_move_hard_block(entry_row: Dict[str, Any], *, symbol: str, source: str) -> Optional[Dict[str, Any]]:
+    result = _low_move_hard_block_core(entry_row, symbol=symbol, source=source)
+    if result is None:
+        return None
+    try:
+        if str(source or "").upper() != "SUMMARY_AI" or not isinstance(entry_row, dict):
+            return result
+        reason = str(result.get("reason") if isinstance(result, dict) else "").upper()
+        if reason not in {"LOW_MOVE_RANGE_TOO_SMALL", "LOW_MOVE_ATR_TOO_SMALL"}:
+            return result
+        close = _rc_first(entry_row, ("close_price", "close", "price", "current_price"))
+        if close <= 0:
+            return result
+        min_range = _rc_f(globals().get("ENTRY_ORDER_MIN_RANGE_PCT", 0.006), 0.006)
+        min_atr = _rc_f(globals().get("ENTRY_ORDER_MIN_ATR_RATIO", 0.0035), 0.0035)
+        label, high, low, rpct = _rc_best_range(entry_row, close)
+        width = max(0.0, high - low)
+        atr0 = _rc_first(entry_row, ("atr_1m", "atr", "ATR", "atr14", "atr_14"))
+        atr = max(atr0, width)
+        atr_ratio = atr / close if close > 0 and atr > 0 else 0.0
+        if rpct >= min_range and atr_ratio >= min_atr:
+            entry_row["high"] = high
+            entry_row["high_price"] = high
+            entry_row["low"] = low
+            entry_row["low_price"] = low
+            entry_row["range_pct"] = rpct
+            entry_row["intraday_range_pct"] = rpct
+            entry_row["atr"] = atr
+            entry_row["atr_1m"] = atr
+            entry_row["ATR"] = atr
+            logger.warning(
+                "[SUMMARY AI RANGE CONSISTENCY] allow symbol=%s reason=%s source=%s high=%.2f low=%.2f range_pct=%.6f atr_ratio=%.6f min_range=%.6f min_atr=%.6f version=%s",
+                symbol, reason, label, high, low, rpct, atr_ratio, min_range, min_atr, _RC_VERSION,
+            )
+            return None
+        return result
+    except Exception:
+        logger.exception("[SUMMARY AI RANGE CONSISTENCY] failed symbol=%s version=%s", symbol, _RC_VERSION)
+        return result
