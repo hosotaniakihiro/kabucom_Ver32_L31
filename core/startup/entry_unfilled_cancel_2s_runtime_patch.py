@@ -132,7 +132,7 @@ def _clear_inflight(symbol: str, order_id: str) -> None:
 
 def _requeue_summary_ai(symbol: str, order_id: str) -> bool:
     try:
-        from core.startup.entry_summary_retry_rotation_runtime_patch import on_unfilled_order_cancelled
+        from trading.handlers.entry_retry_rotation import on_unfilled_order_cancelled
         return bool(on_unfilled_order_cancelled(symbol, order_id))
     except Exception:
         logger.exception("[ENTRY CANCEL 2S] summary retry requeue failed symbol=%s order_id=%s", symbol, order_id)

@@ -1777,7 +1777,7 @@ def _build_scored_candidates(
 #  core/startup/final_entry_duplicate_cooldown_patch.py [重複発注クールダウン] +
 #  core/startup/entry_execute_timeout_guard_patch.py [経過候補ガード+タイムアウト実行] +
 #  trading/audit_logging/entry_controller_audit_patch.py [監査ログ] +
-#  core/startup/entry_summary_retry_rotation_runtime_patch.py [未約定キャンセル後の再queue用item記憶])
+#  trading/handlers/entry_retry_rotation.py [未約定キャンセル後の再queue用item記憶])
 #
 # 発見した不具合と対応:
 #   - entry_daily_risk_runtime_patch は final_entry_safety_guard_patch の
@@ -1787,7 +1787,7 @@ def _build_scored_candidates(
 #     (銘柄別上限・日次損失上限・連敗停止が常に無効)。本文化で修復し有効化する。
 #   - final_entry_duplicate_cooldown_patch はどこからも import されておらず
 #     完全なデッドコードだった。本文化して実際に機能させる。
-#   - entry_summary_retry_rotation_runtime_patch は対象の item を
+#   - entry_retry_rotation は対象の item を
 #     threading.local() 経由で受け渡していたが、entry_execute_timeout_guard_patch
 #     が別スレッドで発注本体を実行するため、そのスレッドからは空に見え
 #     再queue用の記憶が機能しないケースがあった。本文化で item を直接渡す形にして解消。
@@ -2652,7 +2652,7 @@ def _kabu_is_100033_error(err: dict) -> bool:
 
 def _remember_order_for_summary_retry(order_id: str, symbol: str, side: str, entry: Any) -> None:
     try:
-        from core.startup.entry_summary_retry_rotation_runtime_patch import remember_order_for_retry
+        from trading.handlers.entry_retry_rotation import remember_order_for_retry
         remember_order_for_retry(order_id, symbol, side, entry)
     except Exception:
         logger.debug("[ENTRY CONTROLLER] summary retry remember failed order_id=%s symbol=%s", order_id, symbol, exc_info=True)

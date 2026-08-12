@@ -1,4 +1,13 @@
 # ============================================================
+# File   : trading/handlers/entry_retry_rotation.py
+# ------------------------------------------------------------
+# 旧 core/startup/entry_summary_retry_rotation_runtime_patch.py。
+# execute_best_candidate のラップは既に撤去済みで、install() は設定値を
+# ログに出すだけ。実体は on_unfilled_order_cancelled /
+# remember_order_for_retry を提供する通常のライブラリモジュールだったため、
+# パッチではなく trading/handlers/ 配下へ移設した (ロジックは無変更)。
+# ============================================================
+# ============================================================
 # File   : core/startup/entry_summary_retry_rotation_runtime_patch.py
 # Version: V2-EXECUTE-BEST-CANDIDATE-WRAP-REMOVED
 # ------------------------------------------------------------
