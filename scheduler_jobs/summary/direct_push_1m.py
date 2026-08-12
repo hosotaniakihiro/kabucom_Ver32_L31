@@ -23,18 +23,18 @@
 #   初回成功時に1度だけキャッシュし、以降の watcher 呼び出しではそのまま
 #   古いキャッシュを使い回していた。このパッチは sitecustomize.py の
 #   SYNC_MAIN_PATCHES で最も早く (main.py 起動前に) install されるため、
-#   summary_main_1m_light_tick_patch / memory_latest_1m が
+#   light_tick_1m / memory_latest_1m が
 #   後から重ね書きしても、次の watcher tick (最大2秒後、確実に main.py の
 #   起動シーケンス中に発生する) で「まだ自分の目印が付いていない」と判定し、
 #   古いキャッシュ原本を土台に自分自身を re-install していた。結果、
 #   後続2パッチの job_summary ロジックは毎回確実に奪われ、
-#   summary_main_1m_light_tick_patch の「本物のrunnerパイプラインを使う、
+#   light_tick_1m の「本物のrunnerパイプラインを使う、
 #   より正確な高速経路」は事実上一度も選ばれなかった。
 #
 #   本文化にあたり、_build_direct / _store / _submit_ai 等はライブラリ関数として
 #   維持し、scheduler_jobs/summary/runner_core.py の job_summary から
 #   tier1 (memory直接+このファイルのhardening) として直接呼ぶ形にした。
-#   tier2 として summary_main_1m_light_tick_patch.build_light_1m_summary
+#   tier2 として light_tick_1m.build_light_1m_summary
 #   (本物のrunnerパイプライン) を明示的に重ね、tier1が空/失敗の場合だけ
 #   フォールバックするようにして、3本の奪い合いを解消した。
 #

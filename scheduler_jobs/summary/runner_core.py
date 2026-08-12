@@ -167,12 +167,12 @@ def _summary_save_enabled() -> bool:
 def _main_light_tick_skip_sync_save(df: pd.DataFrame, interval: int, *, source: str) -> bool:
     """main (entry-only) では 1m summary の同期保存を飛ばす。
 
-    旧 core/startup/summary_main_1m_light_tick_patch が
+    旧 core/startup/summary_main_1m_light_tick_patch (現 .light_tick_1m) が
     _save_summary_if_owner をラップして実現していたものを、
     tier1/tier2 と同じ「呼び出し側から直接呼ぶ」形へ置き換えた。
     """
     try:
-        from core.startup.summary_main_1m_light_tick_patch import skip_sync_save_in_main
+        from .light_tick_1m import skip_sync_save_in_main
     except Exception:
         logger.debug("[summary.runners] light tick save-skip import failed", exc_info=True)
         return False
@@ -215,13 +215,13 @@ def _save_summary_if_owner(df: pd.DataFrame, interval: int, *, source: str) -> N
 def _main_light_tick_async_ai(df: pd.DataFrame, interval: int, now: dt.datetime, run_entry: bool) -> bool:
     """main (entry-only) では PUSH AI hook を同期実行せず非同期 submit へ回す。
 
-    旧 core/startup/summary_main_1m_light_tick_patch が
+    旧 core/startup/summary_main_1m_light_tick_patch (現 .light_tick_1m) が
     _run_push_ai_entry_before_display を「置換」して実現していたもの
     (元実装は一切呼ばれなかった) を、tier1/tier2 と同じ形へ置き換えた。
     True を返したら同期 hook は実行しない = 旧構成と同じ。
     """
     try:
-        from core.startup.summary_main_1m_light_tick_patch import handle_push_ai_entry_in_main
+        from .light_tick_1m import handle_push_ai_entry_in_main
     except Exception:
         logger.debug("[summary.runners] light tick async-ai import failed", exc_info=True)
         return False
@@ -349,7 +349,7 @@ def job_ranking_5m(display: bool = True, now: Optional[dt.datetime] = None, run_
 # job_summary/job_1m/run_push_summary_job は、以前は core/startup/ の3本の
 # runtime patch (summary_main_direct_push_force_patch.py
 #  = 現 scheduler_jobs/summary/direct_push_1m.py /
-# summary_main_1m_light_tick_patch.py / memory_latest_1m.py)
+# light_tick_1m.py / memory_latest_1m.py)
 # がそれぞれ total-overwrite 方式で奪い合っていた ("3-way race")。
 #
 # 発見した不具合: summary_main_direct_push_force_patch.py は再適用用の
@@ -357,13 +357,13 @@ def job_ranking_5m(display: bool = True, now: Optional[dt.datetime] = None, run_
 # 古い "original" 参照を使い回していたため、他の2本が後から重ね書きしても
 # 次の watcher tick (main.py 起動シーケンス中に確実に発生する) で古い原本を
 # 土台に自分自身を再インストールし、他の2本のロジックを毎回確実に奪っていた。
-# 結果、summary_main_1m_light_tick_patch.py の「本物のPUSH summary runner
+# 結果、light_tick_1m.py の「本物のPUSH summary runner
 # パイプラインを使う、より正確な高速経路」は事実上一度も選ばれなかった。
 #
 # 本文化により、tier1/tier2 として明示的に優先順位を固定した:
 #   tier1: scheduler_jobs.summary.direct_push_1m.tier1_build_and_publish
 #          (memory直接ビルド + タイムアウト保護 + 保存 + AI投入のhardening)
-#   tier2: summary_main_1m_light_tick_patch.build_light_1m_summary
+#   tier2: scheduler_jobs.summary.light_tick_1m.build_light_1m_summary
 #          (本物のPUSH summary runnerパイプライン、保存/表示のみスキップ)
 #   tier3: _job_summary_original_heavy (このファイルの元来の重い実装)
 # いずれも interval==1 かつ各パッチ自身の実行コンテキスト判定
@@ -391,7 +391,7 @@ def _job_summary_tier1_direct_memory(now: dt.datetime, *, run_entry: bool) -> pd
 
 def _job_summary_tier2_light_runner(interval: int, now: dt.datetime, *, display: bool, run_entry: bool, **kwargs) -> pd.DataFrame:
     try:
-        from core.startup.summary_main_1m_light_tick_patch import (
+        from .light_tick_1m import (
             _is_entry_only_context as _tier2_is_entry_only_context,
             _env_bool as _tier2_env_bool,
             build_light_1m_summary,

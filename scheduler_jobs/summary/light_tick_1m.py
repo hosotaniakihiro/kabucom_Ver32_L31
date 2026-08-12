@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-# File   : core/startup/summary_main_1m_light_tick_patch.py
-# Version: V6-JOB-SUMMARY-WRAP-REMOVED
+# File   : scheduler_jobs/summary/light_tick_1m.py
+# Version: V5-MAIN-1M-LIGHT-AI-SCORED-FRESH-GUARD  (VERSION 定数と一致。ログに出る)
 # ------------------------------------------------------------
 # main.py is entry-only: do not wait for/save/display heavy summary work.
 # It only calculates PUSH 1m quickly, submits Summary-AI asynchronously, reads

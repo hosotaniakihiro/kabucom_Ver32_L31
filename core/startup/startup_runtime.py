@@ -185,7 +185,8 @@ def _install_push_summary_history_patch() -> None:
     # install() は True を返し "installed V4" もログへ出るので、
     # ログ上は動いているように見えていた点に注意。
     #
-    # 同じ書き方をしていた summary_main_1m_light_tick_patch._install_history_patch も
+    # 同じ書き方をしていた light_tick_1m (旧 summary_main_1m_light_tick_patch)
+    # の _install_history_patch も
     # 同じ理由で不発だったため併せて撤去した。
     # 履歴補完 / mtf-rebuild を本当に有効化するかは別途の仕様判断。
     return

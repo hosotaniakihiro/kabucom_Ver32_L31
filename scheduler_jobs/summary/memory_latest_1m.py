@@ -22,7 +22,7 @@
 # V4:
 #   - job_summary/run_push_summary_job/job_1m への再代入、および
 #     scheduler.job_push_summary_1m のエイリアス同期を撤去した。
-#     このファイル・summary_main_1m_light_tick_patch.py・
+#     このファイル・scheduler_jobs/summary/light_tick_1m.py・
 #     scheduler_jobs/summary/direct_push_1m.py の3本が同じ3関数を
 #     total-overwrite方式で奪い合っていた「3-way race」の一部
 #     (詳細は scheduler_jobs/summary/direct_push_1m.py のコメント参照)。
@@ -529,7 +529,7 @@ def _submit_async_ai(df: pd.DataFrame, *, now: dt.datetime, run_entry: bool) -> 
     if not (_env_bool("SUMMARY_MAIN_MEMORY_ASYNC_AI", True) and run_entry and isinstance(df, pd.DataFrame) and not df.empty):
         return
     try:
-        from core.startup.summary_main_1m_light_tick_patch import _submit_async_ai as submit_ai
+        from .light_tick_1m import _submit_async_ai as submit_ai
         submit_ai(df, interval=1, now=now, run_entry=run_entry, reason="memory_latest_1m")
     except Exception:
         logger.debug("[SUMMARY MAIN MEMORY 1M] async ai submit skipped", exc_info=True)
