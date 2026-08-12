@@ -302,7 +302,8 @@ def job_ranking_5m(display: bool = True, now: Optional[dt.datetime] = None, run_
 # ============================================================
 #
 # job_summary/job_1m/run_push_summary_job は、以前は core/startup/ の3本の
-# runtime patch (summary_main_direct_push_force_patch.py /
+# runtime patch (summary_main_direct_push_force_patch.py
+#  = 現 scheduler_jobs/summary/direct_push_1m.py /
 # summary_main_1m_light_tick_patch.py / summary_main_memory_latest_1m_patch.py)
 # がそれぞれ total-overwrite 方式で奪い合っていた ("3-way race")。
 #
@@ -315,7 +316,7 @@ def job_ranking_5m(display: bool = True, now: Optional[dt.datetime] = None, run_
 # パイプラインを使う、より正確な高速経路」は事実上一度も選ばれなかった。
 #
 # 本文化により、tier1/tier2 として明示的に優先順位を固定した:
-#   tier1: summary_main_direct_push_force_patch.tier1_build_and_publish
+#   tier1: scheduler_jobs.summary.direct_push_1m.tier1_build_and_publish
 #          (memory直接ビルド + タイムアウト保護 + 保存 + AI投入のhardening)
 #   tier2: summary_main_1m_light_tick_patch.build_light_1m_summary
 #          (本物のPUSH summary runnerパイプライン、保存/表示のみスキップ)
@@ -326,7 +327,7 @@ def job_ranking_5m(display: bool = True, now: Optional[dt.datetime] = None, run_
 
 def _job_summary_tier1_direct_memory(now: dt.datetime, *, run_entry: bool) -> pd.DataFrame:
     try:
-        from core.startup.summary_main_direct_push_force_patch import (
+        from .direct_push_1m import (
             _is_main_py as _tier1_is_main_py,
             _env_bool as _tier1_env_bool,
             tier1_build_and_publish,

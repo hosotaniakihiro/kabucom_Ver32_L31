@@ -12,9 +12,9 @@
 #     このファイル・summary_main_1m_light_tick_patch.py・
 #     summary_main_direct_push_force_patch.py の3本が同じ3関数を
 #     total-overwrite方式で奪い合っていた「3-way race」の一部
-#     (詳細は summary_main_direct_push_force_patch.py のコメント参照)。
+#     (詳細は scheduler_jobs/summary/direct_push_1m.py のコメント参照)。
 #     _build_memory_1m_summary はそのままライブラリ関数として維持し、
-#     summary_main_direct_push_force_patch.py の tier1_build_and_publish
+#     scheduler_jobs/summary/direct_push_1m.py の tier1_build_and_publish
 #     経由 (旧来と同じ呼び出し方) で scheduler_jobs/summary/runner_core.py
 #     の job_summary から間接的に使われ続ける。
 #
@@ -537,7 +537,7 @@ def install() -> bool:
         os.environ.setdefault("SUMMARY_MAIN_MEMORY_NO_HEAVY_FALLBACK_WHEN_RAW_EXISTS", "1")
         os.environ.setdefault("SUMMARY_MAIN_MEMORY_COERCE_OLD_TICKS_TO_NOW", "0")
         _INSTALLED = True
-        logger.warning("[SUMMARY MAIN MEMORY 1M] installed=%s version=%s coerce_old=%s (job_summary wrap removed; _build_memory_1m_summary now used as a library by summary_main_direct_push_force_patch.tier1_build_and_publish)", True, VERSION, _env_bool("SUMMARY_MAIN_MEMORY_COERCE_OLD_TICKS_TO_NOW", False))
+        logger.warning("[SUMMARY MAIN MEMORY 1M] installed=%s version=%s coerce_old=%s (job_summary wrap removed; _build_memory_1m_summary now used as a library by scheduler_jobs.summary.direct_push_1m.tier1_build_and_publish)", True, VERSION, _env_bool("SUMMARY_MAIN_MEMORY_COERCE_OLD_TICKS_TO_NOW", False))
         return True
     except Exception:
         logger.exception("[SUMMARY MAIN MEMORY 1M] install failed")

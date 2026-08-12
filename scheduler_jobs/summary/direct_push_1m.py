@@ -1,9 +1,19 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-# File   : core/startup/summary_main_direct_push_force_patch.py
-# Version: V10-JOB-SUMMARY-WRAP-REMOVED
+# File   : scheduler_jobs/summary/direct_push_1m.py
+# Version: V11-MOVED-OUT-OF-CORE-STARTUP
 # ------------------------------------------------------------
 # main.py の1分PUSH summary tickを軽量経路に固定する。
+#
+# V11:
+#   - core/startup/summary_main_direct_push_force_patch.py から移設した。
+#     V10 で job_summary のラップを撤去した時点でモンキーパッチは無くなり、
+#     runner_core.job_summary が tier1 として直接呼ぶライブラリ +
+#     env 既定値 5 件の install() だけになっていたので、
+#     利用側と同じ scheduler_jobs/summary/ 配下へ置く。
+#   - 末尾の auto install は残す。monkeypatch を伴わず env の setdefault のみで
+#     冪等なため、import されたプロセスで必ず既定値が入る従来の挙動を保つ。
+#     (sitecustomize / fast_startup_runtime_patch からの install も従来どおり)
 #
 # V10:
 #   - job_summary/run_push_summary_job/job_1m への再代入 + 180秒間2秒毎に

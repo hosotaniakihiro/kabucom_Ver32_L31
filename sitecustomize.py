@@ -364,7 +364,7 @@ SYNC_MAIN_PATCHES = [
     # 代わりに _apply_summary_ai_vol_rescue_env_defaults() を install 前に呼ぶ。
     ("core.startup.summary_ai_runtime_consistency_patch", "SUMMARY_AI_RUNTIME_CONSISTENCY", "DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH"),
     ("core.startup.summary_main_push_db_refresh_patch", "SUMMARY_MAIN_PUSH_DB_REFRESH", "DISABLE_SUMMARY_MAIN_PUSH_DB_REFRESH_PATCH"),
-    ("core.startup.summary_main_direct_push_force_patch", "SUMMARY_FORCE_DIRECT_1M_SYNC", "DISABLE_SUMMARY_FORCE_DIRECT_1M_PATCH"),
+    ("scheduler_jobs.summary.direct_push_1m", "SUMMARY_FORCE_DIRECT_1M_SYNC", "DISABLE_SUMMARY_FORCE_DIRECT_1M_PATCH"),
 ]
 
 BACKGROUND_MAIN_PATCHES = [
@@ -419,7 +419,7 @@ BACKGROUND_MAIN_PATCHES = [
     ("trading.filters.summary_ai_range_bridge", "SUMMARY_AI_LOW_MOVE_SOFTPASS", "DISABLE_SUMMARY_AI_LOW_MOVE_SOFTPASS_PATCH"),
     ("core.startup.summary_mtf_early_ready_patch", "SUMMARY_MTF_EARLY_READY", "DISABLE_SUMMARY_MTF_EARLY_READY_PATCH"),
     ("trading.audit_logging.install_audit_logging", "AUDIT_LOGGING", "DISABLE_AUDIT_LOGGING"),
-    # summary_main_push_db_refresh_patch / summary_main_direct_push_force_patch の
+    # summary_main_push_db_refresh_patch / direct_push_1m (旧 summary_main_direct_push_force_patch) の
     # background 再適用は削除した。どちらも冪等な no-op で、SYNC_MAIN_PATCHES
     # (上の 2 件) が先に走った時点で完了している:
     #   push_db_refresh   install() 冒頭が `if _PATCHED: return True`

@@ -112,7 +112,7 @@ def _background_heavy() -> None:
     jobs: list[Callable[[], bool]] = [
         _install_symbol_flags_bootstrap,
         lambda: _run_install("summary_mtf_push_raw_fallback_patch", "core.startup.summary_mtf_push_raw_fallback_patch"),
-        lambda: _run_install("summary_main_direct_push_force_patch:bg", "core.startup.summary_main_direct_push_force_patch"),
+        lambda: _run_install("direct_push_1m:bg", "scheduler_jobs.summary.direct_push_1m"),
         lambda: _run_install("open_position_broker_merge_patch", "core.startup.open_position_broker_merge_patch"),
         lambda: _run_install("exit_executor_broker_position_patch", "core.startup.exit_executor_broker_position_patch"),
         lambda: _run_install("exit_trail_03_runtime_patch", "core.startup.exit_trail_03_runtime_patch"),
@@ -124,7 +124,7 @@ def _background_heavy() -> None:
         # entry_affordability_runtime_patch は trading/entry/summary_ai/candidates.py の
         # build_summary_ai_entry_candidates() へ native化済みのため削除した。
         lambda: _run_install("push_summary_direct_ohlc_runtime_patch", "core.startup.push_summary_direct_ohlc_runtime_patch"),
-        lambda: _run_install("summary_main_direct_push_force_patch:bg-final", "core.startup.summary_main_direct_push_force_patch"),
+        lambda: _run_install("direct_push_1m:bg-final", "scheduler_jobs.summary.direct_push_1m"),
     ]
     logger.warning("[FAST STARTUP PATCH] background heavy installs start count=%s", len(jobs))
     for job in jobs:
@@ -157,7 +157,7 @@ def install() -> bool:
     _patch_entry_max_approved()
     _patch_ranking_bootstrap()
     _run_install("summary_mtf_push_raw_fallback_patch", "core.startup.summary_mtf_push_raw_fallback_patch")
-    _run_install("summary_main_direct_push_force_patch", "core.startup.summary_main_direct_push_force_patch")
+    _run_install("direct_push_1m", "scheduler_jobs.summary.direct_push_1m")
 
     if _env_bool("FAST_STARTUP_ASYNC_HEAVY_PATCHES", True):
         if not _BG_STARTED:
@@ -168,7 +168,7 @@ def install() -> bool:
         _background_heavy()
 
     # Last synchronous re-apply.  Other startup patches may have wrapped job_summary above.
-    _run_install("summary_main_direct_push_force_patch:final", "core.startup.summary_main_direct_push_force_patch")
+    _run_install("direct_push_1m:final", "scheduler_jobs.summary.direct_push_1m")
 
     _PATCHED = True
     logger.warning("[FAST STARTUP PATCH] installed %s raw_push_mtf=True async_heavy=%s", VERSION, _env_bool("FAST_STARTUP_ASYNC_HEAVY_PATCHES", True))
