@@ -264,7 +264,8 @@ def install() -> bool:
     except Exception:
         logger.exception('[ENTRY FINAL FILTER FAILOPEN] range_5m wrapper install failed')
     # entry_direction_failclosed_patch は削除した。
-    # entry_direction_confirm_guard_patch.check_entry_direction_confirm が
+    # trading/entry/direction_confirm._check_entry_direction_confirm_core()
+    # (旧 entry_direction_confirm_guard_patch.check_entry_direction_confirm) が
     # RecursionError も一般例外も自分で捕まえて False を返すため、
     # 外側からラップしていたあのパッチの except には一度も到達しなかった。
     for mod_name, label in [('core.startup.pending_protect_push_patch','pending protect push patch'),('core.startup.board_retry_patch','board retry patch'),('trading.handlers.short_mtf_direction_guard','short MTF daily optional guard'),('core.startup.entry_ma5_breakout_count_patch','MA5 breakout count patch')]:

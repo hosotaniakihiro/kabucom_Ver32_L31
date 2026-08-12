@@ -608,14 +608,11 @@ def _install_scoring_flag_pattern_bridge() -> bool:
 
 
 def _install_entry_direction_confirm_guard() -> bool:
-    try:
-        from core.startup import entry_direction_confirm_guard_patch as p
-        ok = p.install()
-        logger.warning("[LOW MOVE GUARD] entry_direction_confirm_guard_patch pure_guard_installed=%s", ok)
-        return bool(ok)
-    except Exception as e:
-        logger.warning("[LOW MOVE GUARD] entry_direction_confirm_guard_patch install failed: %s", e, exc_info=False)
-        return False
+    # entry_direction_confirm_guard_patch は trading/entry/direction_confirm.py へ
+    # 本文化済み (monkeypatch を一切しない純ライブラリだった)。判定は
+    # _call_entry_direction_confirm() が同モジュールを直接 import して呼ぶ。
+    # ファイルごと削除したので、ここは install 成功と同じ True を返す。
+    return True
 
 
 def _install_final_entry_safety_guard() -> bool:
@@ -637,30 +634,22 @@ def _install_entry_price_improvement_patch() -> bool:
 
 
 def _install_ma_cross_state_runtime_patch() -> bool:
-    try:
-        from core.startup import ma_cross_state_runtime_patch as p
-        ok = p.install()
-        logger.warning("[LOW MOVE GUARD] ma_cross_state_runtime_patch installed=%s", ok)
-        return bool(ok)
-    except Exception as e:
-        logger.warning("[LOW MOVE GUARD] ma_cross_state_runtime_patch install failed: %s", e, exc_info=False)
-        return False
+    # ma_cross_state_runtime_patch は trading/entry/direction_confirm.py の
+    # _apply_ma_cross_state() へ本文化済み (方向強度計算の 2 段目)。
+    # ファイルごと削除したので、ここは install 成功と同じ True を返す。
+    return True
 
 
 def _install_vwap_state_runtime_patch() -> bool:
-    try:
-        from core.startup import vwap_state_runtime_patch as p
-        ok = p.install()
-        logger.warning("[LOW MOVE GUARD] vwap_state_runtime_patch installed=%s", ok)
-        return bool(ok)
-    except Exception as e:
-        logger.warning("[LOW MOVE GUARD] vwap_state_runtime_patch install failed: %s", e, exc_info=False)
-        return False
+    # vwap_state_runtime_patch は trading/entry/direction_confirm.py の
+    # _apply_vwap_state() へ本文化済み (方向強度計算の 3 段目 = 最外周)。
+    # ファイルごと削除したので、ここは install 成功と同じ True を返す。
+    return True
 
 
 def _call_entry_direction_confirm(entry_row: Any) -> bool:
     try:
-        from core.startup.entry_direction_confirm_guard_patch import check_entry_direction_confirm
+        from trading.entry.direction_confirm import check_entry_direction_confirm
         return bool(check_entry_direction_confirm(entry_row))
     except RecursionError:
         logger.error("[LOW MOVE GUARD] entry_direction_confirm recursion detected. fail-safe NG.", exc_info=False)

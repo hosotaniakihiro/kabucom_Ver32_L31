@@ -325,15 +325,13 @@ def _install_summary_entry_pending_existing_fix_patch() -> bool:
 
 
 def _install_entry_direction_failopen_patch() -> bool:
-    try:
-        os.environ.setdefault("ENTRY_DIRECTION_FAILOPEN_FOR_SUMMARY_AI", "1")
-        from core.startup import entry_direction_failopen_runtime_patch as p
-        ok = p.install()
-        logger.warning("[ONESHOT LIMIT PATCH] entry_direction_failopen_patch installed=%s", ok)
-        return bool(ok)
-    except Exception:
-        logger.exception("[ONESHOT LIMIT PATCH] entry_direction_failopen_patch install failed")
-        return False
+    # entry_direction_failopen_runtime_patch (Ver05) は
+    # trading/entry/direction_confirm.check_entry_direction_confirm() へ本文化済み。
+    # pure guard を _check_entry_direction_confirm_core() へ退避し、公開版が
+    # fail-open / 逆トレンド反転レイヤになっている (旧 install 後と同じ合成)。
+    # env 既定値だけは install 時に効いていたのでここへ残す。
+    os.environ.setdefault("ENTRY_DIRECTION_FAILOPEN_FOR_SUMMARY_AI", "1")
+    return True
 
 
 def _install_exit_profit_protect_patch() -> bool:
