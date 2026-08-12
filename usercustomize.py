@@ -133,15 +133,24 @@ def _install_summary_ai_fast_order_builder() -> bool:
         return False
 
 
-def _install_summary_ai_ranking_prefilter_signal() -> bool:
-    try:
-        from core.startup.summary_ai_ranking_prefilter_signal_patch import install as _install_prefilter
+def _install_exit_no_progress_monitor() -> bool:
+    """建玉が5分で利確/損切の70%水準に届かない場合の返済監視を起動する。
 
-        ok = bool(_install_prefilter())
-        logger.warning("[USERCUSTOMIZE] summary AI ranking prefilter signal ok=%s", ok)
+    旧 core/startup/summary_ai_ranking_prefilter_signal_patch.install() が
+    連鎖起動していたもの。prefilter 本体は
+    trading/entry/summary_ai/runner.py へ本文化済みのため、ここでは
+    監視スレッドの起動だけを行う。
+    (呼び出し元の _uc_delayed_watchlist_patch_loop が毎秒呼び直すため、
+     旧パッチの watcher スレッドと同じリトライ性を保つ)
+    """
+    try:
+        from trading.exit.no_progress_monitor import install as _install_exit_monitor
+
+        ok = bool(_install_exit_monitor())
+        logger.warning("[USERCUSTOMIZE] exit no-progress monitor ok=%s", ok)
         return ok
     except Exception:
-        logger.exception("[USERCUSTOMIZE] summary AI ranking prefilter signal failed")
+        logger.exception("[USERCUSTOMIZE] exit no-progress monitor failed")
         return False
 
 
@@ -269,7 +278,7 @@ def _install_summary_mtf_duplicate_datetime_guard() -> bool:
 _install_runtime_defaults()
 _patch_entry_order_builder_logger()
 _install_summary_ai_fast_order_builder()
-_install_summary_ai_ranking_prefilter_signal()
+_install_exit_no_progress_monitor()
 _install_summary_ai_board_rest_cooldown()
 _install_summary_ai_emp_prob_gate()
 _install_summary_pending_age_relax()
@@ -601,7 +610,7 @@ def _uc_delayed_watchlist_patch_loop() -> None:
             _uc_patch_watchlist_recent_liq_rotation_failopen()
             _patch_entry_order_builder_logger()
             _install_summary_ai_fast_order_builder()
-            _install_summary_ai_ranking_prefilter_signal()
+            _install_exit_no_progress_monitor()
             _install_summary_ai_board_rest_cooldown()
             _install_summary_ai_emp_prob_gate()
         except Exception:
@@ -613,7 +622,7 @@ def _uc_delayed_watchlist_patch_loop() -> None:
 if _is_main_py():
     _patch_entry_order_builder_logger()
     _install_summary_ai_fast_order_builder()
-    _install_summary_ai_ranking_prefilter_signal()
+    _install_exit_no_progress_monitor()
     _install_summary_ai_board_rest_cooldown()
     _install_summary_ai_emp_prob_gate()
     _uc_patch_tonosama_recent_volume_display()

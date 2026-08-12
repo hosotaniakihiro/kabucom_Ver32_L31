@@ -1,4 +1,20 @@
 # -*- coding: utf-8 -*-
+# ============================================================
+# File   : trading/exit/no_progress_monitor.py
+# Version: V2-EXIT-NO-70PCT-PROGRESS-5MIN-FAVORABLE-THEN-MARKET
+# ------------------------------------------------------------
+# 旧 core/startup/exit_stagnation_favorable_then_market_patch.py。
+# モンキーパッチは一切行わず、独立した建玉監視スレッドを起動するだけの
+# モジュールだったため、パッチではなく通常の機能モジュールとして
+# trading/exit/ 配下へ移設した (ロジックは無変更)。
+#
+# 内容: 信用建玉が一定時間 (既定300秒) 経っても利確/損切の70%水準に
+# 到達しない場合、まず有利側の指値で返済を試み、約定しなければ
+# キャンセルして成行で返済する。
+#
+# 起動は usercustomize.py (main.py プロセスのみ) から install() を呼ぶ。
+# import 時にも install() が走る点は旧パッチと同じ。
+# ============================================================
 from __future__ import annotations
 
 import json
