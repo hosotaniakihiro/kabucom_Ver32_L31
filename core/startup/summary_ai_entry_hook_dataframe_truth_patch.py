@@ -156,22 +156,14 @@ def _install_summary_ai_weak_filter() -> bool:
 # PUSH rotation cap
 # -----------------------------
 def _install_push_liquidity_rotation_cap() -> bool:
-    global _PUSH_LIQUIDITY_CAP_PATCHED
-    if _PUSH_LIQUIDITY_CAP_PATCHED:
-        return True
-    try:
-        import trading.push.subscription_manager.liquidity_guard as liq
-        liq.ROTATION_PRESERVE_FULL_POOL = False
-        liq.ROTATION_MIN_SURVIVOR_COUNT = int(_env_float("PUSH_REGISTER_LIQUIDITY_ROTATION_MIN_SURVIVOR_COUNT_EFFECTIVE", 50.0))
-        liq.ROTATION_MIN_SURVIVOR_RATIO = _env_float("PUSH_REGISTER_LIQUIDITY_ROTATION_MIN_SURVIVOR_RATIO_EFFECTIVE", 0.50)
-        liq.MIN_SURVIVOR_COUNT = min(int(getattr(liq, "MIN_SURVIVOR_COUNT", 50)), 50)
-        liq.MIN_SURVIVOR_RATIO = min(float(getattr(liq, "MIN_SURVIVOR_RATIO", 0.50)), 0.50)
-        _PUSH_LIQUIDITY_CAP_PATCHED = True
-        logger.warning("[PUSH LIQUIDITY ROTATION CAP] installed preserve_full_pool=%s rotation_min_keep=%s rotation_min_ratio=%.3f", getattr(liq, "ROTATION_PRESERVE_FULL_POOL", None), getattr(liq, "ROTATION_MIN_SURVIVOR_COUNT", None), float(getattr(liq, "ROTATION_MIN_SURVIVOR_RATIO", 0.0)))
-        return True
-    except Exception:
-        logger.exception("[PUSH LIQUIDITY ROTATION CAP] install failed")
-        return False
+    # trading/push/subscription_manager/liquidity_guard.py 本体へ本文化した。
+    #   MIN_SURVIVOR_COUNT / MIN_SURVIVOR_RATIO … min(env, 50) / min(env, 0.50) の cap
+    #   ROTATION_* 3 件 … ソース既定を実運用値 (50 / 0.50 / False) へ揃えた
+    # 旧構成では main.py だけがここでハード代入していたが、
+    # runtime_env/defaults.py:90-92 の PUSH_DEFAULTS が全プロセスへ
+    # 同じ env 既定値を入れているため既定構成では値が一致しており、
+    # 本文化しても差分は出ない (プロセス別に実測確認済み)。
+    return True
 
 
 # -----------------------------

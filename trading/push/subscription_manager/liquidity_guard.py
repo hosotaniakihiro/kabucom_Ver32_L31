@@ -74,15 +74,26 @@ MIN_DAY_TURNOVER = _env_float("PUSH_REGISTER_MIN_DAY_TURNOVER", 10000000.0)
 CACHE_TTL_SEC = _env_float("PUSH_REGISTER_LIQUIDITY_CACHE_TTL_SEC", 20.0)
 MIN_COVERAGE_RATIO = _env_float("PUSH_REGISTER_LIQUIDITY_MIN_COVERAGE_RATIO", 0.20)
 
-# 通常登録は最低50件を守る。A/B rotation母集団は下の ROTATION_MIN_SURVIVOR_COUNT で100件を守る。
-MIN_SURVIVOR_COUNT = _env_int("PUSH_REGISTER_LIQUIDITY_MIN_SURVIVOR_COUNT", 50)
-MIN_SURVIVOR_RATIO = _env_float("PUSH_REGISTER_LIQUIDITY_MIN_SURVIVOR_RATIO", 0.50)
+# 通常登録は最低50件を守る。50 を上限にするのは、これ以上を「必ず残す」と
+# PUSH 登録の母集団が絞れなくなるため (旧 rotation cap パッチの上限をそのまま採用)。
+MIN_SURVIVOR_COUNT = min(_env_int("PUSH_REGISTER_LIQUIDITY_MIN_SURVIVOR_COUNT", 50), 50)
+MIN_SURVIVOR_RATIO = min(_env_float("PUSH_REGISTER_LIQUIDITY_MIN_SURVIVOR_RATIO", 0.50), 0.50)
 RESCUE_MISSING_SYMBOLS = _env_bool("PUSH_REGISTER_LIQUIDITY_RESCUE_MISSING_SYMBOLS", True)
 
-# A/B 50銘柄ローテーション用。100銘柄入力を50へ削ると B=0 になりローテーションが壊れる。
-ROTATION_MIN_SURVIVOR_COUNT = _env_int("PUSH_REGISTER_LIQUIDITY_ROTATION_MIN_SURVIVOR_COUNT", 100)
-ROTATION_MIN_SURVIVOR_RATIO = _env_float("PUSH_REGISTER_LIQUIDITY_ROTATION_MIN_SURVIVOR_RATIO", 1.00)
-ROTATION_PRESERVE_FULL_POOL = _env_bool("PUSH_REGISTER_LIQUIDITY_ROTATION_PRESERVE_FULL_POOL", True)
+# A/B 50銘柄ローテーション用。
+#
+# 既定値について (旧 core/startup/summary_ai_entry_hook_dataframe_truth_patch
+# ._install_push_liquidity_rotation_cap() を本文化):
+#   元のソース既定は 100 / 1.00 / True (「100銘柄入力を50へ削ると B=0 になり
+#   ローテーションが壊れる」という意図) だったが、実運用では
+#   core/startup/runtime_env/defaults.py:90-92 の PUSH_DEFAULTS が
+#   env で 0 / 50 / 0.50 を設定しており、さらに main.py では上記パッチが
+#   同じ値をハード代入していた。つまりソース既定は誰も使っていなかった。
+#   ここでソース既定を実運用値へ揃え、env 上書きは従来どおり効くようにする。
+#   これで main.py だけ値が違うという非対称も解消する。
+ROTATION_MIN_SURVIVOR_COUNT = _env_int("PUSH_REGISTER_LIQUIDITY_ROTATION_MIN_SURVIVOR_COUNT", 50)
+ROTATION_MIN_SURVIVOR_RATIO = _env_float("PUSH_REGISTER_LIQUIDITY_ROTATION_MIN_SURVIVOR_RATIO", 0.50)
+ROTATION_PRESERVE_FULL_POOL = _env_bool("PUSH_REGISTER_LIQUIDITY_ROTATION_PRESERVE_FULL_POOL", False)
 
 DEFAULT_ROOT = r"\\192.168.0.22\AutoStockBuyAndSell"
 
