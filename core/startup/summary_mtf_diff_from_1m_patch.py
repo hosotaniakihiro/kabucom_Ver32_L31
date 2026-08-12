@@ -36,7 +36,6 @@ logger = logging.getLogger(__name__)
 
 VERSION = "V1.9-MAIN-MEMORY-1M-HISTORY-BRIDGE"
 _INSTALLED = False
-_ORIG_DIFF_UPDATE = None
 _LAST_MAIN_SKIP_LOG: dict[int, float] = {}
 
 
@@ -539,8 +538,14 @@ def _log_main_skip(interval: int, rows: int) -> None:
         pass
 
 
-def _invoke_original_diff_update(self, interval_i: int, *args, **kwargs):
-    orig = _ORIG_DIFF_UPDATE
+def _invoke_original_diff_update(orig, self, interval_i: int, *args, **kwargs):
+    """本来の diff_update 実装を、その署名に合わせて呼ぶ。
+
+    旧構成では install 時に退避したモジュールグローバルを見ていたが、
+    本文化により呼び出し側から original を受け取る形にした。
+    SummaryController.diff_update は (self, interval) しか取らないので、
+    display= のような余分な kwarg はここで落とす (旧挙動の維持)。
+    """
     if not callable(orig):
         return pd.DataFrame()
     try:
@@ -557,11 +562,20 @@ def _invoke_original_diff_update(self, interval_i: int, *args, **kwargs):
     return orig(self, interval_i)
 
 
-def _patched_diff_update(self, interval: int, *args, **kwargs):
+def diff_update_with_mtf(self, interval: int, original, *args, **kwargs):
+    """SummaryController.diff_update を MTF ブリッジ込みで実行する。
+
+    旧構成では install() がこの処理で SummaryController.diff_update を
+    差し替えていた (クラス属性 + インスタンスの __class__ への setattr の 2 段)。
+    差し替えをやめ、summary_controller 側から original を渡して呼ぶ形にした。
+    ヘルパ (_repair_mtf_from_1m / _cached_1m_history_from_global 等) は
+    このモジュールに残してあるので、summary_mtf_duplicate_datetime_guard_patch /
+    summary_mtf_push_raw_fallback_patch のラップは従来どおり効く。
+    """
     interval_i = int(interval)
     try:
         if interval_i == 1:
-            out = _invoke_original_diff_update(self, interval_i, *args, **kwargs)
+            out = _invoke_original_diff_update(original, self, interval_i, *args, **kwargs)
             if isinstance(out, pd.DataFrame) and not out.empty:
                 published = _publish_1m_from_any(out, reason="original_diff_update")
                 return published if not published.empty else out
@@ -573,7 +587,7 @@ def _patched_diff_update(self, interval: int, *args, **kwargs):
             fallback = _resample_cached_1m_to_mtf(interval_i)
             _log_main_skip(interval_i, _safe_len(fallback))
             return fallback
-        out = _invoke_original_diff_update(self, interval_i, *args, **kwargs)
+        out = _invoke_original_diff_update(original, self, interval_i, *args, **kwargs)
         if isinstance(out, pd.DataFrame) and not out.empty and interval_i in (3, 5):
             hist = _normalize_summary_df(out, interval=interval_i)
             _publish_to_global(interval_i, hist, _latest_by_symbol(hist), require_mtf_ready=True)
@@ -592,7 +606,7 @@ def _patched_diff_update(self, interval: int, *args, **kwargs):
 
 
 def install() -> bool:
-    global _INSTALLED, _ORIG_DIFF_UPDATE
+    global _INSTALLED
     if _INSTALLED:
         return True
     try:
@@ -608,21 +622,12 @@ def install() -> bool:
         if not callable(cur):
             logger.warning("[SUMMARY MTF DIFF 1M PATCH] diff_update unavailable")
             return False
-        if getattr(cur, "_summary_mtf_diff_from_1m_v19", False):
-            _INSTALLED = True
-            return True
-        _ORIG_DIFF_UPDATE = getattr(cur, "_original", cur)
-        _patched_diff_update._summary_mtf_diff_from_1m_v19 = True  # type: ignore[attr-defined]
-        _patched_diff_update._summary_mtf_diff_from_1m_v18 = True  # type: ignore[attr-defined]
-        _patched_diff_update._summary_mtf_diff_from_1m_v17 = True  # type: ignore[attr-defined]
-        _patched_diff_update._original = _ORIG_DIFF_UPDATE  # type: ignore[attr-defined]
-        cls.diff_update = _patched_diff_update
-        try:
-            inst = getattr(sc, "summary_controller", None)
-            if inst is not None:
-                setattr(inst.__class__, "diff_update", _patched_diff_update)
-        except Exception:
-            pass
+        # SummaryController.diff_update への差し替えは撤去した。
+        # summary_controller.diff_update が _mtf_diff_update_hook() 経由で
+        # diff_update_with_mtf() を直接呼ぶ (呼び出し側から呼ぶ方式)。
+        # ここでの cls / cur のチェックは _INSTALLED のスコープを旧構成と
+        # 一致させるために残してある (publish_1m_history_bridge も
+        # _INSTALLED で有効判定するため)。
         _INSTALLED = True
         logger.warning("[SUMMARY MTF DIFF 1M PATCH] installed %s publish_1m=True memory_history_bridge=%s cached_1m_mtf_fallback=True reject_zero_volume=%s min_1m_rows=%s min_mtf_rows=%s main_nas_skip=%s interval1_skip=%s", VERSION, True, _env_bool("SUMMARY_MTF_REJECT_ZERO_VOLUME", True), os.getenv("SUMMARY_MTF_FALLBACK_MIN_1M_ROWS", "auto"), os.getenv("SUMMARY_MTF_FALLBACK_MIN_MTF_ROWS", "2"), _main_should_skip_nas_diff_update(3), _main_should_skip_nas_diff_update(1))
         return True
@@ -637,4 +642,4 @@ except Exception:
     logger.exception("[SUMMARY MTF DIFF 1M PATCH] auto install failed")
 
 
-__all__ = ["install", "VERSION"]
+__all__ = ["install", "VERSION", "diff_update_with_mtf", "publish_1m_history_bridge"]

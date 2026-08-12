@@ -734,7 +734,27 @@ class SummaryController:
             logger.exception("[summary_controller] engine failed")
         return pd.DataFrame()
 
-    def diff_update(self, interval: int) -> pd.DataFrame:
+    def diff_update(self, interval: int, *args, **kwargs) -> pd.DataFrame:
+        """MTF ブリッジ込みの diff_update 入口。
+
+        旧構成では core/startup/summary_mtf_diff_from_1m_patch.install() が
+        SummaryController.diff_update をクラス属性ごと差し替えて
+        1m/3m/5m の publish と NAS スキップ時の再サンプリングを足していた。
+        差し替えをやめ、こちらから diff_update_with_mtf() を直接呼ぶ形にした。
+
+        ブリッジが無効/未 install のときは _diff_update_core をそのまま呼ぶ。
+        そのとき *args/**kwargs もそのまま渡すので、display= のような
+        余分な引数は従来どおり TypeError になる (パッチ未適用時の挙動を維持)。
+        """
+        hook = _mtf_diff_update_hook()
+        if hook is None:
+            return self._diff_update_core(interval, *args, **kwargs)
+        # 未束縛の関数を渡すこと。ブリッジ側の _invoke_original_diff_update は
+        # orig(self, interval) と呼ぶため、束縛メソッドを渡すと self が二重になる
+        # (旧構成は getattr(cls, "diff_update") = 未束縛を退避していた)。
+        return hook(self, interval, type(self)._diff_update_core, *args, **kwargs)
+
+    def _diff_update_core(self, interval: int) -> pd.DataFrame:
         df_latest = pd.DataFrame()
         hist_payload = pd.DataFrame()
         try:
@@ -905,3 +925,23 @@ class SummaryController:
 
 
 summary_controller = SummaryController()
+
+
+def _mtf_diff_update_hook():
+    """core/startup/summary_mtf_diff_from_1m_patch の MTF ブリッジを取得する。
+
+    install() が成功している (= SUMMARY_MTF_DIFF_FROM_1M_ENABLED を通っている)
+    ときだけ関数を返す。旧構成で差し替えが起きる条件と同じ。
+    取得できない場合は None を返し、呼び出し側は素の実装を使う。
+    """
+    try:
+        from core.startup import summary_mtf_diff_from_1m_patch as _mtf
+    except Exception:
+        return None
+    try:
+        if not getattr(_mtf, "_INSTALLED", False):
+            return None
+        fn = getattr(_mtf, "diff_update_with_mtf", None)
+        return fn if callable(fn) else None
+    except Exception:
+        return None
