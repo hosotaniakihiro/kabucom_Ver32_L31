@@ -308,7 +308,10 @@ def _install_push_registration_recovery(context: str) -> bool:
 
 
 def _install_common_day_position_guard(context: str) -> bool:
-    return _safe_install("common day position guard", context, TRADING_CONTEXTS, "DISABLE_COMMON_ENTRY_DAY_POSITION_GUARD", "common_entry_day_position_guard_patch")
+    # common_entry_day_position_guard_patch と pending_protect_push_patch は
+    # trading/entry/pending_manager.add_pending へ2層まとめて本文化済み
+    # (native <- common_day_position_guard <- pending_protect_push の順序を保持)。
+    return context in TRADING_CONTEXTS
 
 
 def _install_strict_final_liquidity_guard(context: str) -> bool:
