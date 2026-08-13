@@ -273,15 +273,68 @@ def _install_summary_pending_age_relax() -> bool:
         return False
 
 
-def _install_summary_mtf_duplicate_datetime_guard() -> bool:
+def _summary_mtf_guard_is_db_collector_context() -> bool:
+    """旧 summary_mtf_duplicate_datetime_guard_patch._is_database_collector_context。"""
     try:
-        from core.startup.summary_mtf_duplicate_datetime_guard_patch import install as _install_guard
+        argv = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+        if any(
+            x in argv
+            for x in (
+                "main_database.py",
+                "db_prepare_runner.py",
+                "ranking_collector_runner.py",
+                "push_receiver_runner.py",
+                "yahoo_complement_runner.py",
+                "summary_database_runner.py",
+                "data_collectors_runner.py",
+            )
+        ):
+            return True
+        return any(
+            os.getenv(k) == "1"
+            for k in (
+                "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+                "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+                "AUTOSTOCK_SUMMARY_DB_WRITER",
+                "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
+            )
+        )
+    except Exception:
+        return False
 
-        ok = bool(_install_guard())
-        logger.warning("[USERCUSTOMIZE] summary MTF duplicate datetime guard ok=%s", ok)
+
+def _install_summary_mtf_duplicate_datetime_guard() -> bool:
+    """旧 core/startup/summary_mtf_duplicate_datetime_guard_patch を削除して直呼びにした。
+
+    旧 install() の 3 つのサブ処理のうち、生きていたのは 3 だけだった:
+
+      1. summary_mtf_diff_from_1m_patch._repair_mtf_from_1m のラップ
+         -> 同モジュールはこのヘルパを既に持っていない (571行のコメント参照)。
+            getattr が None を返し「target repair missing」を出して False。
+            付随する install フック (_install_target_install_hook) も、
+            フック先で同じ _patch_target_repair を再試行するだけなので
+            ログ以外の効果が無かった。
+      2. summary_ai_candidate_refill_patch._push_writer_state のラップ
+         -> 同モジュールにこの属性は存在しない。「target missing」で False。
+      3. main_entry_runtime_operator_fix_patch の中継 install (main.py のみ)
+         -> **これだけが実効**。しかもこのパッチを install しているのは
+            リポジトリ全体でここ 1 箇所だけなので、そのまま残す。
+
+    1 と 2 の対象属性はリポジトリ全体を検索しても定義箇所が無い
+    (動的 setattr も含めて 0 件) ため、復活する余地も無い。
+    """
+    if not ("main.py" in " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+            and not _summary_mtf_guard_is_db_collector_context()):
+        return False
+    try:
+        from core.startup import main_entry_runtime_operator_fix_patch as p
+
+        fn = getattr(p, "install", None)
+        ok = bool(fn()) if callable(fn) else False
+        logger.warning("[USERCUSTOMIZE] main entry runtime fix installed=%s", ok)
         return ok
     except Exception:
-        logger.exception("[USERCUSTOMIZE] summary MTF duplicate datetime guard failed")
+        logger.exception("[USERCUSTOMIZE] main entry runtime fix failed")
         return False
 
 
