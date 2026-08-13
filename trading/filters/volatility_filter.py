@@ -1236,7 +1236,7 @@ def _range_5m_filter_from_entry_row_core(entry_row: Any, min_pct: float = DEFAUL
 # ATR(1分) ベース 実効ボラフィルタ
 # ==========================================================
 
-def atr_1m_filter(
+def _atr_1m_filter_core(
     entry_row: Any = None,
     *,
     df_1m: pd.DataFrame | None = None,
@@ -1475,3 +1475,197 @@ def range_5m_filter(
         "min_pct": min_pct,
         "price": close,
     }
+
+
+# ============================================================
+# TONOSAMA entry_row / pending レンジ救済
+# (旧 core/startup/volatility_filter_tonosama_entryrow_rescue_patch.py を本文化)
+# ------------------------------------------------------------
+# ATR が NG でも、TONOSAMA の pending / entry_row のレンジ比率が十分なら
+# 通す層。ネイティブは _atr_1m_filter_core へ改名した。
+#
+# 実 install 順を測定した結果、この層は entry_controller.atr_1m_filter を
+# 包む 6 パッチの中で **最後に入り、それまでの層をすべて捨てて native の上に
+# 載せ直す**ものだった (旧 install の
+# `_ORIG_ATR = getattr(cur_atr, "_original", cur_atr)`)。
+# したがって本文へ組み込むのが実挙動と一致する。
+#
+# 旧 install は entry_controller.atr_1m_filter へも同じ関数を代入していたが、
+# entry_controller.py:121 が from-import で束縛しているので、
+# 本文化後は最初からこの実装を掴む。
+# ============================================================
+
+_TVR_INSTALLED = False
+_TVR_ORIG_ATR = None
+
+
+def _tvr_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _tvr_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _tvr_row_to_dict(row: Any) -> dict[str, Any]:
+    try:
+        if row is None:
+            return {}
+        if isinstance(row, dict):
+            return dict(row)
+        if isinstance(row, pd.Series):
+            return row.to_dict()
+        if hasattr(row, "to_dict"):
+            v = row.to_dict()
+            if isinstance(v, dict):
+                return dict(v)
+    except Exception:
+        pass
+    return {}
+
+
+def _tvr_f(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", "").replace("%", ""))
+    except Exception:
+        return float(default)
+
+
+def _tvr_first(row: dict[str, Any], keys: tuple[str, ...], default: Any = None) -> Any:
+    for k in keys:
+        try:
+            v = row.get(k)
+            if v is not None and str(v).strip() != "":
+                return v
+        except Exception:
+            pass
+    return default
+
+
+def _tvr_norm_symbol(v: Any) -> str:
+    try:
+        s = str(v or "").strip()
+        return s[:-2] if s.endswith(".0") else s
+    except Exception:
+        return ""
+
+
+def _tvr_is_tonosama(row: dict[str, Any]) -> bool:
+    s = str(row.get("source") or row.get("pipeline_source") or row.get("entry_type") or "").upper()
+    return "TONOSAMA" in s
+
+
+def _tvr_extract_symbol(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
+    for key in ("symbol", "code", "stock_code"):
+        if kwargs.get(key) is not None:
+            return _tvr_norm_symbol(kwargs.get(key))
+    for obj in args:
+        if isinstance(obj, (str, int)):
+            s = _tvr_norm_symbol(obj)
+            if s:
+                return s
+    row = _tvr_row_to_dict(args[0]) if args else _tvr_row_to_dict(kwargs.get("entry_row"))
+    return _tvr_norm_symbol(row.get("symbol") or row.get("Symbol"))
+
+
+def _tvr_entry_row_from_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    if kwargs.get("entry_row") is not None:
+        return kwargs.get("entry_row")
+    if args:
+        if isinstance(args[0], pd.DataFrame):
+            return None
+        return args[0]
+    return None
+
+
+def _tvr_pending_entry_for_symbol(symbol: str) -> dict[str, Any]:
+    sym = _tvr_norm_symbol(symbol)
+    if not sym:
+        return {}
+    try:
+        from global_state import global_data
+        root = getattr(global_data, "pending_entries", None)
+        if isinstance(root, dict):
+            bucket = root.get(sym) or root.get(str(sym))
+            entries = bucket if isinstance(bucket, (list, tuple, set)) else ([bucket] if bucket is not None else [])
+            for e in entries:
+                d = _tvr_row_to_dict(e)
+                if d and _tvr_is_tonosama(d):
+                    return d
+    except Exception:
+        pass
+    try:
+        import trading.entry.pending_manager as pm
+        iter_entries = getattr(pm, "iter_entries", None)
+        if callable(iter_entries):
+            for s, e in list(iter_entries()):
+                if _tvr_norm_symbol(s) == sym:
+                    d = _tvr_row_to_dict(e)
+                    if d and _tvr_is_tonosama(d):
+                        return d
+    except Exception:
+        pass
+    return {}
+
+
+def _tvr_entryrow_range_ratio(row: dict[str, Any]) -> tuple[float, dict[str, Any]]:
+    close = _tvr_f(_tvr_first(row, ("close_price", "close", "price", "current_price"), 0.0), 0.0)
+    high = _tvr_f(_tvr_first(row, ("high_price", "high", "High"), 0.0), 0.0)
+    low = _tvr_f(_tvr_first(row, ("low_price", "low", "Low"), 0.0), 0.0)
+    intrabar_pct = _tvr_f(_tvr_first(row, ("_intrabar_range_pct", "intrabar_range_pct", "range_pct", "row_range_pct"), 0.0), 0.0)
+    ratio_from_ohlc = ((high - low) / close) if high > 0 and low > 0 and close > 0 and high >= low else 0.0
+    ratio_from_pct = intrabar_pct / 100.0 if intrabar_pct > 0 else 0.0
+    ratio = max(ratio_from_ohlc, ratio_from_pct)
+    return ratio, {"close": close, "high": high, "low": low, "intrabar_pct": intrabar_pct, "ratio": ratio}
+
+
+def _tvr_tonosama_vol_rescue(row_obj: Any, *, caller: str, symbol: str = "") -> tuple[bool, dict[str, Any]]:
+    row = _tvr_row_to_dict(row_obj)
+    if not row and symbol:
+        row = _tvr_pending_entry_for_symbol(symbol)
+    if not row:
+        return False, {"reason": "row_missing", "symbol": symbol, "caller": caller}
+    if not _tvr_is_tonosama(row):
+        return False, {"reason": "not_tonosama", "symbol": symbol, "caller": caller, "source": row.get("source") or row.get("entry_type")}
+    ratio, diag = _tvr_entryrow_range_ratio(row)
+    min_ratio = _tvr_env_float("TONOSAMA_VOL_ENTRYROW_RESCUE_MIN_RANGE_RATIO", 0.006)
+    min_pct = _tvr_env_float("TONOSAMA_VOL_ENTRYROW_RESCUE_MIN_INTRABAR_PCT", 0.6)
+    ok = ratio >= min_ratio or _tvr_f(diag.get("intrabar_pct"), 0.0) >= min_pct
+    diag.update({
+        "caller": caller,
+        "symbol": _tvr_norm_symbol(row.get("symbol") or row.get("Symbol") or symbol),
+        "side": row.get("side"),
+        "source": row.get("source") or row.get("entry_type"),
+        "min_ratio": min_ratio,
+        "min_intrabar_pct": min_pct,
+        "ok": ok,
+    })
+    return bool(ok), diag
+
+
+def atr_1m_filter(*args, **kwargs):
+    if _tvr_env_bool("TONOSAMA_VOL_ENTRYROW_RESCUE_ENABLED", True):
+        try:
+            row_obj = _tvr_entry_row_from_call(args, kwargs)
+            symbol = _tvr_extract_symbol(args, kwargs)
+            ok, diag = _tvr_tonosama_vol_rescue(row_obj, caller="atr_1m_filter", symbol=symbol)
+            if ok:
+                logger.warning("[VOL FILTER TONOSAMA RESCUE] allow ATR by pending/entry_row range diag=%s", diag)
+                return True
+        except Exception:
+            logger.exception("[VOL FILTER TONOSAMA RESCUE] rescue check failed; fall through to core")
+    return _atr_1m_filter_core(*args, **kwargs)

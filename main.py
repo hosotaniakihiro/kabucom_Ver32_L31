@@ -272,7 +272,11 @@ def _install_main_runtime_patches():
         # trading/entry/tonosama/pending_writer.py へ本文化済み
         # (_five_sec_relax_stage)。main.py 専用スコープは
         # pending_writer._five_sec_relax_scope_enabled() が再現している。
-        ("core.startup.volatility_filter_tonosama_entryrow_rescue_patch", "install"),
+        # volatility_filter_tonosama_entryrow_rescue_patch は
+        # trading/filters/volatility_filter.py の atr_1m_filter へ本文化済み (_tvr_*)。
+        # 実 install 順の測定で、この層が atr_1m_filter を包む 6 パッチの中で
+        # 最後に入り native の上へ載せ直す = 実質の最内層だと確認したうえで畳んだ。
+        # entry_controller.py:121 の from-import が最初からこの実装を掴む。
         # board_wall_stall_exit_patch は trading/handlers/exit_handler.py へ本文化済み
         # (_bfe_* / run_exit_pipeline / check_normal_exit / check_tonosama_exit)。
         # entry board imbalance guard は元から no-op だったので移していない。
