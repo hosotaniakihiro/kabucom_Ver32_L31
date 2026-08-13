@@ -977,14 +977,14 @@ def apply_oneshot_limit_defaults() -> bool:
         logger.exception("[ENTRY THRESHOLD PATCH] install failed")
 
     for _mod_name, _label in (
-        ("core.startup.summary_ai_async_entry_patch", "summary_ai_async_entry"),
+        ("trading.entry.summary_ai.direct_snapshot", "summary_ai_async_entry"),
         # summary_parallel_intervals は scheduler_jobs/summary/parallel_intervals.py へ
         # 移設済みで、env 既定値も import 時に入るため連鎖 install は不要。
         ("core.startup.exit_board_profit_runtime_patch", "exit_board_profit"),
     ):
         try:
             _m = __import__(_mod_name, fromlist=["install"])
-            _fn = getattr(_m, "install", None)
+            _fn = getattr(_m, "install", None) or getattr(_m, "apply_async_entry_defaults", None)
             _ok = bool(_fn()) if callable(_fn) else False
             logger.warning("[ONESHOT LIMIT PATCH] %s installed=%s", _label, _ok)
         except Exception:

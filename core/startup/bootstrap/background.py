@@ -129,12 +129,16 @@ def _install_summary_ai_async_entry_patch() -> None:
         return
 
     try:
-        from core.startup import summary_ai_async_entry_patch as p
-        ok = bool(p.install())
+        # summary_ai_async_entry_patch は
+        # trading/entry/summary_ai/direct_snapshot.py へ本文化済み
+        # (summary_entry.execute_entry_pipeline が委譲する)。
+        # ここでは env の調整だけを走らせる。
+        from trading.entry.summary_ai import direct_snapshot as p
+        ok = bool(p.apply_async_entry_defaults())
         _SUMMARY_AI_ASYNC_PATCH_STARTED = ok
-        logger.warning("[background] summary_ai_async_entry_patch installed=%s", ok)
+        logger.warning("[background] summary_ai async entry defaults applied=%s", ok)
     except Exception:
-        logger.exception("[background] summary_ai_async_entry_patch install failed")
+        logger.exception("[background] summary_ai async entry defaults failed")
 
 
 # ============================================================

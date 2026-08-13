@@ -3691,12 +3691,12 @@ def apply_strict_board_rest_policy() -> bool:
     global _SBR_INSTALLED
     try:
         # summary_ai_board_missing_defer_patch は
-        # core/startup/summary_ai_async_entry_patch.py の
+        # trading/entry/summary_ai/direct_snapshot.py の
         # _summary_ai_direct_snapshot_execute へ本文化済み (_bmd_*)。
         # env / 定数の適用も同ファイルの _bmd_apply_runtime_policies() が
         # import 時に行うので、ここでは import するだけでよい。
         try:
-            import core.startup.summary_ai_async_entry_patch as _ap  # noqa: F401
+            import trading.entry.summary_ai.direct_snapshot as _ap  # noqa: F401
 
             board_defer = True
         except Exception:

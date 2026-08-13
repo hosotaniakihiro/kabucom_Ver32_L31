@@ -220,10 +220,10 @@ def _break_async_direct_cycle() -> bool:
         return False
     try:
         from trading.entry.summary_ai import executor as exec_mod
-        try:
-            from core.startup import summary_ai_async_entry_patch as async_patch
-        except Exception:
-            async_patch = None
+        # summary_ai_async_entry_patch は direct_snapshot.py へ本文化済み。
+        # Ver13 で execute_ai_ok_entries_bulk の差し替えが撤去された時点で
+        # _ORIG_EXECUTE は存在しなくなっており、この参照は常に None だった。
+        async_patch = None
         try:
             from core.startup import summary_ai_async_direct_dispatch_patch as direct_patch
         except Exception:

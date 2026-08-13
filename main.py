@@ -271,7 +271,7 @@ def _install_main_runtime_patches():
         # entry_ma5_third_bar_slope_guard_patch は entry_controller._build_scored_candidates
         # 本体へインライン化済みのため削除。
         ("core.startup.summary_ai_more_candidates_patch", "install"),
-        ("core.startup.summary_ai_async_entry_patch", "install"),
+        ("trading.entry.summary_ai.direct_snapshot", "apply_async_entry_defaults"),
         # async entry が executor を差し替えた後で、V5 direct dispatch を必ず重ねる。
         # summary_ai_async_direct_dispatch_patch は本文化済み:
         #   _positive_result の strict 化 -> trading/entry/summary_ai/executor.py

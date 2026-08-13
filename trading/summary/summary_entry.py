@@ -461,7 +461,7 @@ def _register_pending_entries_core(entries: List[Dict[str, Any]]) -> int:
         return registered
 
 
-def execute_entry_pipeline(entries: List[Dict[str, Any]], *, pipeline_source: str | None = None, interval: int | None = None) -> Dict[str, Any]:
+def _execute_entry_pipeline_core(entries: List[Dict[str, Any]], *, pipeline_source: str | None = None, interval: int | None = None) -> Dict[str, Any]:
     try:
         if not entries:
             logger.info("[SUMMARY_ENTRY] entry pipeline skipped reason=no_entries")
@@ -1150,3 +1150,28 @@ def register_pending_entries(entries: List[Dict[str, Any]], *args: Any, **kwargs
     except Exception:
         logger.exception("[SUMMARY AI DIRECT FRESHNESS] pending guard failed; use original")
         return _layer1(entries, *args, **kwargs)
+
+
+# ============================================================
+# SUMMARY-AI DIRECT SNAPSHOT
+# (旧 core/startup/summary_ai_async_entry_patch.py の本文化)
+# ------------------------------------------------------------
+# 旧 install() は
+#   se.execute_entry_pipeline = _summary_ai_direct_snapshot_execute
+# の 1 枚だけを被せていた (この属性を包む他パッチは無い)。
+# 実装本体は trading/entry/summary_ai/direct_snapshot.py にあり、
+# SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT が false のときは
+# _execute_entry_pipeline_core へ戻る。
+#
+# direct_snapshot を import できない場合は素の実装を使う
+# (旧構成でも install 失敗時は native のままだった)。
+# ============================================================
+
+
+def execute_entry_pipeline(entries: List[Dict[str, Any]], *, pipeline_source: str | None = None, interval: int | None = None) -> Dict[str, Any]:
+    try:
+        from trading.entry.summary_ai.direct_snapshot import _summary_ai_direct_snapshot_execute
+    except Exception:
+        logger.exception("[SUMMARY AI DIRECT SNAPSHOT] import failed; use core pipeline")
+        return _execute_entry_pipeline_core(entries, pipeline_source=pipeline_source, interval=interval)
+    return _summary_ai_direct_snapshot_execute(entries, pipeline_source=pipeline_source, interval=interval)

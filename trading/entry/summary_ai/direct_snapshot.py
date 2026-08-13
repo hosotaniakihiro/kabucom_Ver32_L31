@@ -1,23 +1,27 @@
+# -*- coding: utf-8 -*-
 # ============================================================
-# File   : core/startup/summary_ai_async_entry_patch.py
+# File   : trading/entry/summary_ai/direct_snapshot.py
 # Version: Ver13-EXECUTOR-QUEUE-INLINED
 # ------------------------------------------------------------
-# SUMMARY AI の実発注を非同期化し、entry_controller の lock 競合時も
-# retryable として扱う runtime patch。
+# 旧 core/startup/summary_ai_async_entry_patch.py を本文化した。
 #
-# Ver13:
-#   - execute_ai_ok_entries_bulk の sync/queue+worker ディスパッチ部分は
-#     trading/entry/summary_ai/executor.py 本体 (REV11) へインライン化したため、
-#     ここでの差し替えと専用queue/workerスレッドは撤去した
-#     (execute_entry_pipeline の direct snapshot 差し替えは維持)。
+# SUMMARY AI の実発注を direct snapshot 実行にし、entry_controller の
+# lock 競合時も reentrant 実行で候補評価・発注まで進める。
+# lock busy / 板欠けは retryable として上位へ返す。
 #
-# Ver12:
-#   - reason_chain に entry_controller_lock_timeout が含まれる場合は、
-#     上位に entry_pipeline_no_order / summary_entry_executor_no_order があっても
-#     retryable=True と判定する。
-#   - execute_entry_pipeline を direct snapshot 実行へ差し替え、
-#     lock busy 時も reentrant 実行で候補評価・発注まで進める。
-#   - queued_async は「未実行」だが worker で必ず実行する。
+# 旧 install() が実際に差し替えていたのは
+#   trading.summary.summary_entry.execute_entry_pipeline
+# の 1 枚だけで、他にこの属性を包むパッチは存在しない (実測済み)。
+# よって summary_entry 側を
+#   _execute_entry_pipeline_core (旧 native)
+#   execute_entry_pipeline       (この層へ委譲)
+# の 2 段にした。SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT が false のときの
+# フォールバック先だった `_ORIG` は _orig_summary_entry_pipeline() で
+# core 実装を遅延解決する (循環 import を避けるため関数内 import)。
+#
+# Ver13 で execute_ai_ok_entries_bulk の sync/queue+worker ディスパッチは
+# trading/entry/summary_ai/executor.py 本体 (REV11) へインライン化済み。
+# 旧 summary_ai_board_missing_defer_patch 由来の _bmd_* もここに同居する。
 # ============================================================
 
 from __future__ import annotations
@@ -31,20 +35,48 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-_INSTALLED = False
-_ORIG_SUMMARY_ENTRY_PIPELINE = None
+
+def _orig_summary_entry_pipeline():
+    """旧 _ORIG_SUMMARY_ENTRY_PIPELINE。summary_entry の素の実装を遅延解決する。"""
+    try:
+        from trading.summary import summary_entry as se
+
+        return getattr(se, "_execute_entry_pipeline_core", None)
+    except Exception:
+        logger.exception("[SUMMARY AI DIRECT SNAPSHOT] original summary entry pipeline missing")
+        return None
+
 
 os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY", "1")
+
+
 os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC", "0")
+
+
 os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX", "1")
+
+
 os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", "20")
+
+
 os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY", "1")
+
+
 os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX", "3")
+
+
 os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_SLEEP_SEC", "1.0")
+
+
 os.environ.setdefault("SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT", "1")
+
+
 os.environ.setdefault("SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK", "1")
 
+
 _TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+
+
 _FALSE = {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}
 
 
@@ -154,8 +186,9 @@ def _summary_ai_direct_snapshot_execute_core(entries: Any, *, pipeline_source: s
         return {"executed": False, "entries": len(rows), "skip_reason": "entry_controller_import_failed", "retryable": True, "result": None}
 
     if not _env_bool("SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT", True):
-        if callable(_ORIG_SUMMARY_ENTRY_PIPELINE):
-            return _ORIG_SUMMARY_ENTRY_PIPELINE(entries, pipeline_source=pipeline_source, interval=interval)
+        orig = _orig_summary_entry_pipeline()
+        if callable(orig):
+            return orig(entries, pipeline_source=pipeline_source, interval=interval)
         return {"executed": False, "entries": len(rows), "skip_reason": "direct_snapshot_disabled_no_original", "result": None}
 
     lock = getattr(ec, "_pipeline_lock", None)
@@ -274,80 +307,9 @@ def _summary_ai_direct_snapshot_execute_core(entries: Any, *, pipeline_source: s
             logger.debug("[SUMMARY AI DIRECT SNAPSHOT] lock release failed", exc_info=True)
 
 
-def _install_summary_entry_snapshot_patch() -> bool:
-    global _ORIG_SUMMARY_ENTRY_PIPELINE
-    try:
-        from trading.summary import summary_entry as se
-        current = getattr(se, "execute_entry_pipeline", None)
-        if getattr(current, "_summary_ai_direct_snapshot_v12", False):
-            return True
-        _ORIG_SUMMARY_ENTRY_PIPELINE = getattr(current, "_original", None) or current
-        if not callable(_ORIG_SUMMARY_ENTRY_PIPELINE):
-            logger.warning("[SUMMARY AI DIRECT SNAPSHOT] original summary entry pipeline missing")
-            return False
-
-        def _patched_execute_entry_pipeline(entries, *, pipeline_source: str | None = None, interval: int | None = None):
-            return _summary_ai_direct_snapshot_execute(entries, pipeline_source=pipeline_source, interval=interval)
-
-        _patched_execute_entry_pipeline._summary_ai_direct_snapshot_v12 = True  # type: ignore[attr-defined]
-        _patched_execute_entry_pipeline._summary_ai_direct_snapshot_v11 = True  # type: ignore[attr-defined]
-        _patched_execute_entry_pipeline._original = _ORIG_SUMMARY_ENTRY_PIPELINE  # type: ignore[attr-defined]
-        se.execute_entry_pipeline = _patched_execute_entry_pipeline
-        logger.warning("[SUMMARY AI DIRECT SNAPSHOT] installed v12 enabled=%s reentrant_lock=%s", _env_bool("SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT", True), _env_bool("SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK", True))
-        return True
-    except Exception:
-        logger.exception("[SUMMARY AI DIRECT SNAPSHOT] install failed")
-        return False
-
-
-# execute_ai_ok_entries_bulk の sync/queue+worker ディスパッチ
-# (旧 _patched_execute_ai_ok_entries_bulk / _run_worker_loop) は
-# trading/entry/summary_ai/executor.py 本体 (REV11) へインライン化済み。
-
-
-def install() -> bool:
-    global _INSTALLED
-    if _INSTALLED:
-        return True
-    try:
-        if os.getenv("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC") is None or str(os.getenv("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC")).strip() == "1":
-            os.environ["SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC"] = "0"
-        os.environ["SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX"] = str(max(1, min(_env_int("SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX", 1), 3)))
-        if _env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 20.0) > 20:
-            os.environ["SUMMARY_AI_ASYNC_ENTRY_STALE_SEC"] = "20"
-        _install_summary_entry_snapshot_patch()
-        _INSTALLED = True
-        logger.warning("[SUMMARY AI ASYNC ENTRY] installed v13 (executor dispatch inlined) direct_sync=%s snapshot_direct=%s reentrant_lock=%s", _env_bool("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC", False), _env_bool("SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT", True), _env_bool("SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK", True))
-        return True
-    except Exception:
-        logger.exception("[SUMMARY AI ASYNC ENTRY] install failed")
-        return False
-
-
-try:
-    install()
-except Exception:
-    logger.exception("[SUMMARY AI ASYNC ENTRY] auto install failed")
-
-__all__ = ["install"]
-
-
-# ============================================================
-# BOARD MISSING DEFER
-# (旧 core/startup/summary_ai_board_missing_defer_patch.py を本文化)
-# ------------------------------------------------------------
-# direct snapshot 実行の結果を見て、
-#   - entry_controller のロック待ちで落ちた -> retryable として遅延
-#   - 板が取れずに落ちた注文がある         -> その銘柄を deferred に積む
-# を判定する。ネイティブは *_core へ改名した。
-#
-# 旧 install の他のサブ処理:
-#   _install_pending_liq_patch / _install_memory_liq_patch は既に本文化済みの
-#   空スタブ、_install_fast_builder_log_patch も読み手の無いマーカーだけ。
-#   env / 定数の適用は _bmd_apply_runtime_policies() が担う。
-# ============================================================
-
 _BMD_VERSION = "V6-BOARD-MISSING-DEFER-NO-REENTRANT-LOCK"
+
+
 _BMD__INSTALLED = False
 
 
@@ -529,3 +491,34 @@ def _summary_ai_direct_snapshot_execute(entries: Any, *, pipeline_source: str | 
 
 
 _bmd_apply_runtime_policies()
+
+def apply_async_entry_defaults() -> bool:
+    """旧 install() の env 調整部分。差し替えは本文化済みなので env だけ。"""
+    try:
+        if os.getenv("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC") is None or str(os.getenv("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC")).strip() == "1":
+            os.environ["SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC"] = "0"
+        os.environ["SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX"] = str(max(1, min(_env_int("SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX", 1), 3)))
+        if _env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 20.0) > 20:
+            os.environ["SUMMARY_AI_ASYNC_ENTRY_STALE_SEC"] = "20"
+        logger.warning(
+            "[SUMMARY AI ASYNC ENTRY] defaults applied v13 (dispatch/pipeline inlined) direct_sync=%s snapshot_direct=%s reentrant_lock=%s",
+            _env_bool("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC", False),
+            _env_bool("SUMMARY_AI_DIRECT_ENTRY_SNAPSHOT", True),
+            _env_bool("SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK", True),
+        )
+        return True
+    except Exception:
+        logger.exception("[SUMMARY AI ASYNC ENTRY] defaults apply failed")
+        return False
+
+
+try:
+    apply_async_entry_defaults()
+except Exception:
+    logger.exception("[SUMMARY AI ASYNC ENTRY] auto defaults failed")
+
+
+__all__ = [
+    "apply_async_entry_defaults",
+    "_summary_ai_direct_snapshot_execute",
+]
