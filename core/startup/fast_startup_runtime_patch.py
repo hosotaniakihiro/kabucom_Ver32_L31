@@ -158,7 +158,9 @@ def install() -> bool:
     _run_install("summary_parallel_intervals_runtime_patch", "core.startup.summary_parallel_intervals_runtime_patch")
     _run_install("summary_parallel_main_scope:post", "core.startup.summary_parallel_main_scope")
     _run_install("light_tick_1m", "scheduler_jobs.summary.light_tick_1m")
-    _run_install("tonosama_datetime_tz_guard_patch", "core.startup.tonosama_datetime_tz_guard_patch")
+    # tonosama_datetime_tz_guard_patch は
+    # core/startup/tonosama_history_missing_guard_patch.py へ統合済み
+    # (_tzg_* / _load_raw1_history / _resample_1m_to_interval / _compute_surge_features)。
 
     # main_skip_summary_push_bg_patch は
     # core/startup/summary_parallel_intervals_runtime_patch.py へ統合済み

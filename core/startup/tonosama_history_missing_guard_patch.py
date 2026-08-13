@@ -14,13 +14,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import logging
 import os
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -409,7 +410,7 @@ def _call_global_data_history(interval: int) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def _load_raw1_history(vs: Any, *, interval: int = 1) -> pd.DataFrame:
+def _load_raw1_history_core(vs: Any, *, interval: int = 1) -> pd.DataFrame:
     frames: list[tuple[str, pd.DataFrame]] = []
     if _env_bool("TONOSAMA_RAW1_HISTORY_RESAMPLE", True):
         frames.append(("push_raw_db_history", _load_push_raw_db_1m_history()))
@@ -459,7 +460,7 @@ def _load_raw1_history(vs: Any, *, interval: int = 1) -> pd.DataFrame:
     return enough
 
 
-def _resample_1m_to_interval(vs: Any, interval: int) -> pd.DataFrame:
+def _resample_1m_to_interval_core(vs: Any, interval: int) -> pd.DataFrame:
     try:
         if not _env_bool("TONOSAMA_RAW1_RESAMPLE_FALLBACK", True):
             return pd.DataFrame()
@@ -556,7 +557,7 @@ def _has_real_surge_ratio(df: pd.DataFrame, interval: int) -> bool:
         return False
 
 
-def _compute_surge_features(vs: Any, df: pd.DataFrame, *, interval: int, source_label: str) -> pd.DataFrame:
+def _compute_surge_features_core(vs: Any, df: pd.DataFrame, *, interval: int, source_label: str) -> pd.DataFrame:
     try:
         x = vs.normalize_summary_base(df, interval=interval)
         if x is None or x.empty:
@@ -842,3 +843,241 @@ except Exception:
 
 
 __all__ = ["install"]
+
+
+# ============================================================
+# TONOSAMA DT TZ GUARD (旧 core/startup/tonosama_datetime_tz_guard_patch.py)
+# ------------------------------------------------------------
+# 旧パッチはこのモジュールの _load_raw1_history を完全置換し、
+# _resample_1m_to_interval / _compute_surge_features を
+# 「pd.to_datetime を安全版へ一時差し替えして呼ぶ」ラッパーで包んでいた。
+# tz 付き / naive が混在した datetime で pandas の concat / drop_duplicates /
+# sort が落ちる問題への対策。
+#
+# 旧パッチは sitecustomize の BACKGROUND_MAIN_PATCHES (既定 ON) と
+# fast_startup_runtime_patch の両方から install されていたため、実質常時 ON。
+# ここでは同じ既定のまま、記録されているキルスイッチ
+# DISABLE_TONOSAMA_DT_TZ_GUARD_PATCH を _tzg_enabled() で見る。
+#
+# 意図的な差分: 旧 fast_startup_runtime_patch 経由の install は
+# DISABLE_TONOSAMA_DT_TZ_GUARD_PATCH を見ずに必ず適用していた。
+# 本文化後はどの経路でも同じ env が効く (キルスイッチが実際に効くようになる)。
+# ============================================================
+
+_TONOSAMA_DT_TZ_GUARD_PATCHED = True
+_ORIGINAL_TO_DATETIME = pd.to_datetime
+
+
+def _tzg_enabled() -> bool:
+    return not _env_bool("DISABLE_TONOSAMA_DT_TZ_GUARD_PATCH", False)
+
+
+def _tzg_normalize_one_datetime(v: Any) -> Any:
+    try:
+        x = _ORIGINAL_TO_DATETIME(v, errors="coerce")
+        if pd.isna(x):
+            return pd.NaT
+        tzinfo = getattr(x, "tzinfo", None)
+        if tzinfo is not None:
+            try:
+                return x.tz_convert("Asia/Tokyo").tz_localize(None)
+            except Exception:
+                try:
+                    return x.tz_localize(None)
+                except Exception:
+                    return pd.NaT
+        return x
+    except Exception:
+        return pd.NaT
+
+
+def _tzg_normalize_dt_jst_naive_series(s: Any) -> pd.Series:
+    try:
+        if isinstance(s, pd.Series):
+            out = s.map(_tzg_normalize_one_datetime)
+            return _ORIGINAL_TO_DATETIME(out, errors="coerce")
+        out = pd.Series(s).map(_tzg_normalize_one_datetime)
+        return _ORIGINAL_TO_DATETIME(out, errors="coerce")
+    except Exception:
+        try:
+            return _ORIGINAL_TO_DATETIME(s, errors="coerce")
+        except Exception:
+            return pd.Series(pd.NaT, index=getattr(s, "index", None))
+
+
+def _tzg_safe_to_datetime(arg: Any, *args: Any, **kwargs: Any) -> Any:
+    """
+    pandas.to_datetime compatible wrapper.
+
+    Important:
+    - tz-naive values are treated as already-JST wall-clock time and are not shifted.
+    - tz-aware values are converted to Asia/Tokyo, then made tz-naive.
+    - explicit utc=True calls are delegated to pandas unchanged.
+    """
+    try:
+        if bool(kwargs.get("utc", False)):
+            return _ORIGINAL_TO_DATETIME(arg, *args, **kwargs)
+        if isinstance(arg, pd.Series):
+            return _tzg_normalize_dt_jst_naive_series(arg)
+        if isinstance(arg, pd.Index):
+            return pd.DatetimeIndex(_tzg_normalize_dt_jst_naive_series(pd.Series(arg)))
+        if isinstance(arg, (list, tuple)):
+            return pd.DatetimeIndex(_tzg_normalize_dt_jst_naive_series(pd.Series(arg)))
+        return _tzg_normalize_one_datetime(arg)
+    except Exception:
+        return _ORIGINAL_TO_DATETIME(arg, *args, **kwargs)
+
+
+@contextlib.contextmanager
+def _tzg_temporary_safe_to_datetime(pd_module: Any):
+    old = getattr(pd_module, "to_datetime", None)
+    try:
+        pd_module.to_datetime = _tzg_safe_to_datetime
+        yield
+    finally:
+        try:
+            if old is not None:
+                pd_module.to_datetime = old
+        except Exception:
+            pass
+
+
+def _tzg_normalize_summary_datetime_df(df: Any) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame) or df.empty or "datetime" not in df.columns:
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    x = df.copy()
+    try:
+        x["datetime"] = _tzg_normalize_dt_jst_naive_series(x["datetime"])
+        if "symbol" in x.columns:
+            x["symbol"] = x["symbol"].astype(str).str.strip()
+            x = x[x["symbol"] != ""].copy()
+        x = x.dropna(subset=["datetime"])
+        if "symbol" in x.columns and not x.empty:
+            x = x.sort_values(["symbol", "datetime"], kind="stable").reset_index(drop=True)
+        elif not x.empty:
+            x = x.sort_values(["datetime"], kind="stable").reset_index(drop=True)
+    except Exception:
+        logger.debug("[TONOSAMA DT TZ GUARD] dataframe datetime normalize failed", exc_info=True)
+    return x
+
+
+def _tzg_safe_df(obj: Any) -> pd.DataFrame:
+    return obj if isinstance(obj, pd.DataFrame) else pd.DataFrame()
+
+
+def _load_raw1_history_tz_safe(vs: Any, *, interval: int = 1) -> pd.DataFrame:
+    frames: list[tuple[str, pd.DataFrame]] = []
+    try:
+        if _env_bool("TONOSAMA_RAW1_HISTORY_RESAMPLE", True):
+            frames.append(("push_raw_db_history", _tzg_safe_df(_load_push_raw_db_1m_history())))
+            frames.append(("global_context_history", _tzg_safe_df(_call_gc_history(1))))
+            frames.append(("global_data_history", _tzg_safe_df(_call_global_data_history(1))))
+        try:
+            frames.append(("merged_latest", _tzg_safe_df(vs.load_merged_summary(1))))
+        except Exception:
+            logger.debug("[TONOSAMA DT TZ GUARD] merged latest load failed", exc_info=True)
+
+        norm_parts: list[pd.DataFrame] = []
+        stats: list[dict[str, Any]] = []
+        for label, df in frames:
+            try:
+                if df is None or df.empty:
+                    stats.append({"source": label, "rows": 0, "symbols": 0, "latest": None})
+                    continue
+                with _tzg_temporary_safe_to_datetime(pd):
+                    x = vs.normalize_summary_base(df, interval=1)
+                if x is None or x.empty or "datetime" not in x.columns:
+                    stats.append({"source": label, "rows": len(df), "symbols": 0, "latest": None, "normalized": 0})
+                    continue
+                x = _tzg_normalize_summary_datetime_df(x)
+                if x.empty or "symbol" not in x.columns or "datetime" not in x.columns:
+                    continue
+                x = x.dropna(subset=["symbol", "datetime"])
+                if x.empty:
+                    continue
+                x["_raw1_source"] = label
+                norm_parts.append(x)
+                stats.append({
+                    "source": label,
+                    "rows": len(x),
+                    "symbols": int(x["symbol"].nunique()) if "symbol" in x.columns else 0,
+                    "latest": str(x["datetime"].max()),
+                })
+            except Exception:
+                logger.debug("[TONOSAMA DT TZ GUARD] normalize failed source=%s", label, exc_info=True)
+
+        if not norm_parts:
+            logger.warning("[TONOSAMA RAW1 HISTORY] no usable 1m history interval=%s stats=%s", interval, stats)
+            return pd.DataFrame()
+
+        out = pd.concat(norm_parts, ignore_index=True, sort=False)
+        out = _tzg_normalize_summary_datetime_df(out)
+        if out.empty or "symbol" not in out.columns or "datetime" not in out.columns:
+            return pd.DataFrame()
+        out = out.drop_duplicates(subset=["symbol", "datetime"], keep="last")
+        out = out.sort_values(["symbol", "datetime"], kind="stable").reset_index(drop=True)
+
+        min_bars = _raw1_min_bars_for_interval(interval)
+        counts = out.groupby("symbol")["datetime"].transform("count") if not out.empty else pd.Series(dtype="int64")
+        enough = out[counts >= min_bars].copy()
+        if enough.empty:
+            logger.warning(
+                "[TONOSAMA RAW1 HISTORY] insufficient 1m history interval=%s rows=%s symbols=%s min_bars=%s stats=%s tz_guard=v2",
+                interval,
+                len(out),
+                int(out["symbol"].nunique()) if "symbol" in out.columns else 0,
+                min_bars,
+                stats,
+            )
+            return out
+        logger.warning(
+            "[TONOSAMA RAW1 HISTORY] loaded interval=%s rows=%s symbols=%s usable_rows=%s usable_symbols=%s min_bars=%s latest=%s stats=%s tz_guard=v2",
+            interval,
+            len(out),
+            int(out["symbol"].nunique()) if "symbol" in out.columns else 0,
+            len(enough),
+            int(enough["symbol"].nunique()) if "symbol" in enough.columns else 0,
+            min_bars,
+            enough["datetime"].max(),
+            stats,
+        )
+        return enough.reset_index(drop=True)
+    except Exception:
+        logger.exception("[TONOSAMA DT TZ GUARD] safe _load_raw1_history failed interval=%s", interval)
+        return pd.DataFrame()
+
+
+# _normalize_dt_jst_naive_series は旧パッチがこのモジュールへ setattr していた
+# 名前。外部の読み手は無いが、名前ごと残しておく。
+_normalize_dt_jst_naive_series = _tzg_normalize_dt_jst_naive_series
+
+
+def _load_raw1_history(vs: Any, *, interval: int = 1) -> pd.DataFrame:
+    """TZ GUARD 有効時は concat/sort を通らない安全版を使う (旧パッチ v2)。"""
+    if _tzg_enabled():
+        return _load_raw1_history_tz_safe(vs, interval=interval)
+    return _load_raw1_history_core(vs, interval=interval)
+
+
+def _resample_1m_to_interval(vs: Any, interval: int) -> pd.DataFrame:
+    if not _tzg_enabled():
+        return _resample_1m_to_interval_core(vs, interval)
+    try:
+        with _tzg_temporary_safe_to_datetime(pd):
+            out = _resample_1m_to_interval_core(vs, interval)
+        return _tzg_normalize_summary_datetime_df(out)
+    except Exception:
+        logger.exception("[TONOSAMA DT TZ GUARD] wrapped function failed name=%s", "_resample_1m_to_interval")
+        return pd.DataFrame()
+
+
+def _compute_surge_features(vs: Any, df: pd.DataFrame, *, interval: int, source_label: str) -> pd.DataFrame:
+    if not _tzg_enabled():
+        return _compute_surge_features_core(vs, df, interval=interval, source_label=source_label)
+    try:
+        with _tzg_temporary_safe_to_datetime(pd):
+            out = _compute_surge_features_core(vs, df, interval=interval, source_label=source_label)
+        return _tzg_normalize_summary_datetime_df(out)
+    except Exception:
+        logger.exception("[TONOSAMA DT TZ GUARD] wrapped function failed name=%s", "_compute_surge_features")
+        return pd.DataFrame()

@@ -383,7 +383,8 @@ BACKGROUND_MAIN_PATCHES = [
     # entry_order_builder._five_sec_optional_scope_enabled() が再現している。
     # entry_controller への別名差し替えは不要 (entry_controller.py:118 が
     # from-import で同じ関数オブジェクトを束縛しているため)。
-    ("core.startup.tonosama_datetime_tz_guard_patch", "TONOSAMA_DT_TZ_GUARD", "DISABLE_TONOSAMA_DT_TZ_GUARD_PATCH"),
+    # tonosama_datetime_tz_guard_patch は tonosama_history_missing_guard_patch へ統合済み。
+    # DISABLE_TONOSAMA_DT_TZ_GUARD_PATCH は統合先の _tzg_enabled() が見ている。
     ("core.startup.tonosama_history_missing_guard_patch", "TONOSAMA_HISTORY_MISSING_GUARD", "DISABLE_TONOSAMA_HISTORY_MISSING_GUARD_PATCH"),
     # ranking_entry_source_db_fallback_patch は trading/ranking/entry_from_ranking.py へ
     # 本文化済み (_get_ranking_source_df_with_db_fallback)。元関数を一度も呼ばない
