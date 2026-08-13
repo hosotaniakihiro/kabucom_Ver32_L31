@@ -954,3 +954,32 @@ __all__ = [
     "build_summary_ai_sell_entry_candidates",
     "attach_display_like_columns",
 ]
+
+
+# ============================================================
+# ENTRY FIRE RESCUE のしきい値緩和
+# (旧 core/startup/entry_fire_rescue_runtime_patch._patch_candidates)
+# ------------------------------------------------------------
+# 旧パッチは install 時にこの 4 定数を env 由来の値で「より緩い側へ」
+# 寄せていた (min は min()、max は max())。同じ計算を import 時に行う。
+# 適用スコープは entry_fire_rescue.scope_enabled() (main.py のみ)。
+# ============================================================
+
+
+def _efr_apply_threshold_relax() -> None:
+    global DEFAULT_MIN_BUY_SCORE, DEFAULT_MAX_SELL_SCORE
+    global DEFAULT_MIN_BUY_SLOPE, DEFAULT_MAX_SELL_SLOPE
+    try:
+        from .entry_fire_rescue import scope_enabled as _efr_scope, _env_float as _efr_env_float
+
+        if not _efr_scope():
+            return
+        DEFAULT_MIN_BUY_SCORE = min(float(DEFAULT_MIN_BUY_SCORE), _efr_env_float("SUMMARY_AI_MIN_BUY_SCORE", 0.12))
+        DEFAULT_MAX_SELL_SCORE = min(float(DEFAULT_MAX_SELL_SCORE), _efr_env_float("SUMMARY_AI_MIN_SELL_SCORE", 0.12))
+        DEFAULT_MIN_BUY_SLOPE = min(float(DEFAULT_MIN_BUY_SLOPE), _efr_env_float("SUMMARY_AI_MIN_BUY_SLOPE", 0.0))
+        DEFAULT_MAX_SELL_SLOPE = max(float(DEFAULT_MAX_SELL_SLOPE), _efr_env_float("SUMMARY_AI_MAX_SELL_SLOPE", 0.0))
+    except Exception:
+        logger.debug("[ENTRY FIRE RESCUE] candidates threshold relax skipped", exc_info=True)
+
+
+_efr_apply_threshold_relax()

@@ -355,7 +355,7 @@ def _print_summary_ai_top20_console(results: list[dict[str, Any]], *, interval: 
         logger.exception("[SUMMARY AI TOP20 RESULT] console print failed interval=%s source=%s", interval, source)
 
 
-def run_ai_gate_for_candidates(candidates_df: pd.DataFrame, *, interval: int | str = 1, source: str = "SUMMARY", min_ai_confidence: float = DEFAULT_MIN_AI_CONFIDENCE, default_dominant_ratio: float = 1.0, side: str = "BUY", use_daily_cache: bool = True, daily_filter_buy: bool = False, daily_hard_block_exit_warn: bool = False, daily_min_score: Optional[float] = None) -> List[Dict[str, Any]]:
+def _run_ai_gate_for_candidates_core(candidates_df: pd.DataFrame, *, interval: int | str = 1, source: str = "SUMMARY", min_ai_confidence: float = DEFAULT_MIN_AI_CONFIDENCE, default_dominant_ratio: float = 1.0, side: str = "BUY", use_daily_cache: bool = True, daily_filter_buy: bool = False, daily_hard_block_exit_warn: bool = False, daily_min_score: Optional[float] = None) -> List[Dict[str, Any]]:
     df = safe_df(candidates_df)
     if df.empty:
         logger.warning("[SUMMARY AI GATE] skipped empty candidates interval=%s source=%s side=%s", interval, source, side)
@@ -715,3 +715,51 @@ def _wk_apply_weak_summary_ai_filter(results):
     if blocked:
         logger.warning("[SUMMARY AI WEAK FILTER] blocked weak AI_OK count=%s", blocked)
     return results
+
+
+# ============================================================
+# ENTRY FIRE RESCUE (旧 core/startup/entry_fire_rescue_runtime_patch._patch_ai_gate)
+# ------------------------------------------------------------
+# 前段: SELL 信用が組めない候補を AI 前に落とす
+# 後段: AI_NG の score_low のうち実スコアが閾値以上のものを救済する
+#
+# 旧パッチは run_ai_gate_for_candidates を差し替えたうえで runner 側の
+# from-import 束縛も自分のラッパーで上書きしていた。本文化して関数本体に
+# 組み込んだので、runner.py:43 の from-import が最初からこの層を掴む
+# = 旧構成と同じ (旧構成でも runner 経路にはこの層だけが載っていた)。
+#
+# 適用スコープは entry_fire_rescue.scope_enabled() (main.py のみ)。
+# ============================================================
+
+
+def run_ai_gate_for_candidates(*args, **kwargs):
+    try:
+        from .entry_fire_rescue import scope_enabled as _efr_scope, prefilter_sell_credit, rescue_score_low
+    except Exception:
+        logger.exception("[ENTRY FIRE RESCUE] helper import failed; run native gate")
+        return _run_ai_gate_for_candidates_core(*args, **kwargs)
+
+    if not _efr_scope():
+        return _run_ai_gate_for_candidates_core(*args, **kwargs)
+
+    call_args = list(args)
+    call_kwargs = dict(kwargs)
+    candidate_obj = call_args[0] if call_args else call_kwargs.get("candidates_df")
+    try:
+        filtered_obj, skipped = prefilter_sell_credit(candidate_obj)
+        if skipped:
+            if call_args:
+                call_args[0] = filtered_obj
+            else:
+                call_kwargs["candidates_df"] = filtered_obj
+            logger.warning(
+                "[ENTRY FIRE RESCUE] SUMMARY_AI SELL credit pre-AI filter before=%s after=%s skipped=%s",
+                len(candidate_obj) if hasattr(candidate_obj, "__len__") else -1,
+                len(filtered_obj) if hasattr(filtered_obj, "__len__") else -1,
+                skipped[:80],
+            )
+    except Exception:
+        logger.exception("[ENTRY FIRE RESCUE] SELL credit pre-filter failed; keep original candidates")
+
+    results = _run_ai_gate_for_candidates_core(*call_args, **call_kwargs)
+    return rescue_score_low(results)

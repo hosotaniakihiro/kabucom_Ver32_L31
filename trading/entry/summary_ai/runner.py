@@ -806,7 +806,7 @@ def _apply_optional_entry_dedupe_guard_core(ai_results: list[dict[str, Any]]) ->
 # main public runner
 # ============================================================
 
-def run_summary_ai_entry_from_df(
+def _run_summary_ai_entry_from_df_core(
     summary_df: Optional[pd.DataFrame] = None,
     *,
     df: Optional[pd.DataFrame] = None,
@@ -1316,3 +1316,50 @@ __all__ = [
     "run_summary_ai_gate",
     "run_ai_gate_once",
 ]
+
+
+# ============================================================
+# ENTRY FIRE RESCUE (旧 core/startup/entry_fire_rescue_runtime_patch._patch_runner)
+# ------------------------------------------------------------
+# 1 以上のスコアしきい値が渡ってきたら env 由来の緩い値へ置き換え、
+# 傾きフィルタの既定も env で切り替える。ネイティブは
+# _run_summary_ai_entry_from_df_core へ改名した。
+# 適用スコープは entry_fire_rescue.scope_enabled() (main.py のみ)。
+# ============================================================
+
+
+def run_summary_ai_entry_from_df(*args, **kwargs):
+    try:
+        from .entry_fire_rescue import (
+            scope_enabled as _efr_scope,
+            _env_bool as _efr_env_bool,
+            _env_float as _efr_env_float,
+            _safe_float as _efr_safe_float,
+        )
+
+        if _efr_scope():
+            min_buy = _efr_env_float("SUMMARY_AI_MIN_BUY_SCORE", _efr_env_float("SUMMARY_ENTRY_MIN_SCORE", 0.12))
+            min_sell = _efr_env_float("SUMMARY_AI_MIN_SELL_SCORE", _efr_env_float("SUMMARY_ENTRY_MIN_SCORE", 0.12))
+            if "min_buy_score" not in kwargs or _efr_safe_float(kwargs.get("min_buy_score"), 999.0) >= 1.0:
+                kwargs["min_buy_score"] = min_buy
+            if "max_sell_score" not in kwargs or _efr_safe_float(kwargs.get("max_sell_score"), 999.0) >= 1.0:
+                kwargs["max_sell_score"] = min_sell
+            kwargs.setdefault("use_pre_slope_filter", not _efr_env_bool("ENTRY_BYPASS_SLOPE_FILTER", True))
+    except Exception:
+        logger.exception("[ENTRY FIRE RESCUE] runner kwargs relax failed; keep original kwargs")
+    return _run_summary_ai_entry_from_df_core(*args, **kwargs)
+
+
+def _efr_apply_top10_slope() -> None:
+    global DEFAULT_MIN_TOP10_SLOPE
+    try:
+        from .entry_fire_rescue import scope_enabled as _efr_scope
+
+        if not _efr_scope():
+            return
+        DEFAULT_MIN_TOP10_SLOPE = min(float(DEFAULT_MIN_TOP10_SLOPE), 0.0)
+    except Exception:
+        logger.debug("[ENTRY FIRE RESCUE] top10 slope relax skipped", exc_info=True)
+
+
+_efr_apply_top10_slope()

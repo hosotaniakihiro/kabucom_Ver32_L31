@@ -213,7 +213,16 @@ def _install_tonosama_orphan_timeout_prune(context: str) -> bool:
 
 
 def _install_entry_fire_rescue(context: str) -> bool:
-    return _safe_install("entry fire rescue", context, TRADING_CONTEXTS, "DISABLE_ENTRY_FIRE_RESCUE_PATCH", "entry_fire_rescue_runtime_patch")
+    # entry_fire_rescue_runtime_patch は本文化済み:
+    #   trading/entry/summary_ai/candidates.py    しきい値の緩和
+    #   trading/entry/summary_ai/runner.py        run_summary_ai_entry_from_df の
+    #                                            kwargs 既定値 / DEFAULT_MIN_TOP10_SLOPE
+    #   trading/entry/summary_ai/ai_gate_runner.py SELL 信用の事前フィルタ /
+    #                                            score_low 救済
+    # 共有ヘルパと env 既定値は trading/entry/summary_ai/entry_fire_rescue.py へ移設。
+    # スコープ (TRADING_CONTEXTS = main のみ) と DISABLE_ENTRY_FIRE_RESCUE_PATCH /
+    # ENTRY_FIRE_RESCUE_ENABLED は同モジュールの scope_enabled() が再現する。
+    return True
 
 
 def _install_summary_pending_stale_guard(context: str) -> bool:
