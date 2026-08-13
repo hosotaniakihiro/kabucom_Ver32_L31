@@ -1,4 +1,29 @@
 # -*- coding: utf-8 -*-
+# ============================================================
+# File   : trading/entry/summary_ai/emp_prob_gate.py
+# ------------------------------------------------------------
+# 旧 core/startup/summary_ai_emp_prob_gate_patch.py を移設した
+# (パッチではなく summary_ai の解析モジュール)。
+#
+# AI が allow=True を出した後に summary DB の 1 分足履歴から
+#   - 5 分以内に利確方向へ先に到達した確率
+#   - 5 分以内に損切方向へ先に到達した確率 / 期待値
+#   - 日中高値/安値の更新回数ガード
+#   - MA5 / VWAP からの乖離ガード
+# を確認して AI_OK を最終判定する。
+#
+# 旧パッチは ai_gate_runner.run_ai_gate_for_candidates を差し替えていたが、
+# 実測の結果その属性を見るのは ai_gate_runner.py 内部の 1 箇所だけで、
+# 実行経路 (runner.py:1066) には届いていなかった
+# (entry_fire_rescue_runtime_patch が runner 側の束縛を上書きするため)。
+# 関数本体に組み込むと runner 経路にも効いてしまうので、
+# ai_gate_runner.py の内部呼び出し直後で apply_emp_prob_gate() を呼ぶ形にした。
+# 順序も旧構成と同じ (emp_prob が内側、df_truth weak filter が外側)。
+#
+# 旧 install() が持っていた _watch() 再install ウォッチャーは、
+# 差し替える属性が無くなったので不要になった。
+# ============================================================
+
 from __future__ import annotations
 
 import datetime as dt
@@ -7,7 +32,6 @@ import os
 import sqlite3
 import threading
 import time
-from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -399,80 +423,6 @@ def _check_extension(item: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
     return True, "extension_ok:" + ",".join(checks), st
 
 
-def _patch() -> bool:
-    try:
-        from trading.entry.summary_ai import ai_gate_runner as agr
-        cur = getattr(agr, "run_ai_gate_for_candidates", None)
-        if not callable(cur):
-            return False
-        if getattr(cur, "_summary_ai_emp_prob_gate_v3", False):
-            return True
-
-        @wraps(cur)
-        def wrapped(*args: Any, **kwargs: Any):
-            res = cur(*args, **kwargs)
-            if not isinstance(res, list):
-                return res
-            if not any(_env_bool(k, True) for k in ("SUMMARY_AI_EMP_PROB_GATE_ENABLED", "SUMMARY_AI_HIGHLOW_UPDATE_GUARD_ENABLED", "SUMMARY_AI_EXTENSION_GUARD_ENABLED")):
-                return res
-            out = []
-            blocked = passed = fail_open = highlow_blocked = extension_blocked = 0
-            for item in res:
-                if not isinstance(item, dict) or not bool(item.get("allow")):
-                    out.append(item)
-                    continue
-                x = dict(item)
-                ok = True
-                reason = ""
-                if _env_bool("SUMMARY_AI_EMP_PROB_GATE_ENABLED", True):
-                    ok, reason, st = _check(x)
-                    x["emp_prob"] = st
-                    x["p_target_5m"] = st.get("p_target_5m")
-                    x["p_risk_5m"] = st.get("p_risk_5m")
-                    x["emp_expected_value"] = st.get("expected_value")
-                    x["reason"] = _add_reason(x.get("reason"), reason)
-                    if "fail_open" in reason:
-                        fail_open += 1
-                if ok and _env_bool("SUMMARY_AI_HIGHLOW_UPDATE_GUARD_ENABLED", True):
-                    hl_ok, hl_reason, hl_st = _check_highlow(x)
-                    x["highlow_update"] = hl_st
-                    x["reason"] = _add_reason(x.get("reason"), hl_reason)
-                    if "fail_open" in hl_reason:
-                        fail_open += 1
-                    if not hl_ok:
-                        highlow_blocked += 1
-                    ok = bool(hl_ok)
-                    reason = hl_reason
-                if ok and _env_bool("SUMMARY_AI_EXTENSION_GUARD_ENABLED", True):
-                    ex_ok, ex_reason, ex_st = _check_extension(x)
-                    x["extension_guard"] = ex_st
-                    x["reason"] = _add_reason(x.get("reason"), ex_reason)
-                    if "fail_open" in ex_reason:
-                        fail_open += 1
-                    if not ex_ok:
-                        extension_blocked += 1
-                    ok = bool(ex_ok)
-                    reason = ex_reason
-                if ok:
-                    passed += 1
-                else:
-                    x["allow"] = False
-                    blocked += 1
-                    logger.warning("[SUMMARY AI EMP/HIGHLOW/EXT] AI_OK->NG symbol=%s side=%s reason=%s emp=%s highlow=%s extension=%s", x.get("symbol"), x.get("side"), reason, x.get("emp_prob"), x.get("highlow_update"), x.get("extension_guard"))
-                out.append(x)
-            logger.warning("[SUMMARY AI EMP/HIGHLOW/EXT] result total=%s passed=%s blocked=%s highlow_blocked=%s extension_blocked=%s fail_open=%s version=%s", len(res), passed, blocked, highlow_blocked, extension_blocked, fail_open, VERSION)
-            return out
-
-        wrapped._summary_ai_emp_prob_gate_v3 = True  # type: ignore[attr-defined]
-        wrapped._summary_ai_emp_prob_gate_v2 = True  # type: ignore[attr-defined]
-        wrapped._summary_ai_emp_prob_gate_v1 = True  # type: ignore[attr-defined]
-        wrapped._original = cur  # type: ignore[attr-defined]
-        agr.run_ai_gate_for_candidates = wrapped
-        logger.warning("[SUMMARY AI EMP/HIGHLOW/EXT] patched version=%s", VERSION)
-        return True
-    except Exception:
-        logger.exception("[SUMMARY AI EMP/HIGHLOW/EXT] patch failed")
-        return False
 
 
 def _defaults() -> None:
@@ -502,30 +452,78 @@ def _defaults() -> None:
     os.environ.setdefault("SUMMARY_AI_MAX_VWAP_EXTENSION", "0.0060")
 
 
-def _watch() -> None:
-    for _ in range(max(1, _env_int("SUMMARY_AI_EMP_PROB_WATCH_LOOPS", 120))):
-        _patch()
-        time.sleep(max(0.5, _env_float("SUMMARY_AI_EMP_PROB_WATCH_INTERVAL", 1.0)))
 
 
-def install() -> bool:
-    global _INSTALLED, _WATCHER_STARTED
-    if os.environ.get("DISABLE_SUMMARY_AI_EMP_PROB_GATE_PATCH", "").strip() == "1":
-        return False
-    _defaults()
-    ok = _patch()
-    if not _WATCHER_STARTED and _env_bool("SUMMARY_AI_EMP_PROB_WATCHER", True):
-        _WATCHER_STARTED = True
-        threading.Thread(target=_watch, name="summary-ai-emp-highlow-ext-watch", daemon=True).start()
-    _INSTALLED = bool(ok or _WATCHER_STARTED)
-    logger.warning("[SUMMARY AI EMP/HIGHLOW/EXT] installed ok=%s enabled=%s highlow=%s extension=%s min_p=%s max_risk=%s samples=%s buy_high_3m=%s buy_high_5m=%s max_ma5_3m=%s max_ma5_5m=%s max_vwap=%s version=%s", _INSTALLED, os.environ.get("SUMMARY_AI_EMP_PROB_GATE_ENABLED"), os.environ.get("SUMMARY_AI_HIGHLOW_UPDATE_GUARD_ENABLED"), os.environ.get("SUMMARY_AI_EXTENSION_GUARD_ENABLED"), os.environ.get("SUMMARY_AI_EMP_PROB_MIN_TARGET_PROB"), os.environ.get("SUMMARY_AI_EMP_PROB_MAX_RISK_PROB"), os.environ.get("SUMMARY_AI_EMP_PROB_MIN_SAMPLES"), os.environ.get("SUMMARY_AI_BUY_MAX_DAY_HIGH_UPDATES_3M"), os.environ.get("SUMMARY_AI_BUY_MAX_DAY_HIGH_UPDATES_5M"), os.environ.get("SUMMARY_AI_MAX_MA5_EXTENSION_3M"), os.environ.get("SUMMARY_AI_MAX_MA5_EXTENSION_5M"), os.environ.get("SUMMARY_AI_MAX_VWAP_EXTENSION"), VERSION)
-    return _INSTALLED
 
 
-try:
-    install()
-except Exception:
-    logger.exception("[SUMMARY AI EMP/HIGHLOW/EXT] auto install failed")
 
 
 __all__ = ["VERSION", "install"]
+
+
+def apply_emp_prob_gate(results):
+    """AI_OK に実績確率 / 高安更新 / 乖離のガードを掛ける (旧 wrapped の本体)。"""
+    if os.environ.get("DISABLE_SUMMARY_AI_EMP_PROB_GATE_PATCH", "").strip() == "1":
+        return results
+    res = results
+    if not isinstance(res, list):
+        return res
+    if not any(_env_bool(k, True) for k in ("SUMMARY_AI_EMP_PROB_GATE_ENABLED", "SUMMARY_AI_HIGHLOW_UPDATE_GUARD_ENABLED", "SUMMARY_AI_EXTENSION_GUARD_ENABLED")):
+        return res
+    out = []
+    blocked = passed = fail_open = highlow_blocked = extension_blocked = 0
+    for item in res:
+        if not isinstance(item, dict) or not bool(item.get("allow")):
+            out.append(item)
+            continue
+        x = dict(item)
+        ok = True
+        reason = ""
+        if _env_bool("SUMMARY_AI_EMP_PROB_GATE_ENABLED", True):
+            ok, reason, st = _check(x)
+            x["emp_prob"] = st
+            x["p_target_5m"] = st.get("p_target_5m")
+            x["p_risk_5m"] = st.get("p_risk_5m")
+            x["emp_expected_value"] = st.get("expected_value")
+            x["reason"] = _add_reason(x.get("reason"), reason)
+            if "fail_open" in reason:
+                fail_open += 1
+        if ok and _env_bool("SUMMARY_AI_HIGHLOW_UPDATE_GUARD_ENABLED", True):
+            hl_ok, hl_reason, hl_st = _check_highlow(x)
+            x["highlow_update"] = hl_st
+            x["reason"] = _add_reason(x.get("reason"), hl_reason)
+            if "fail_open" in hl_reason:
+                fail_open += 1
+            if not hl_ok:
+                highlow_blocked += 1
+            ok = bool(hl_ok)
+            reason = hl_reason
+        if ok and _env_bool("SUMMARY_AI_EXTENSION_GUARD_ENABLED", True):
+            ex_ok, ex_reason, ex_st = _check_extension(x)
+            x["extension_guard"] = ex_st
+            x["reason"] = _add_reason(x.get("reason"), ex_reason)
+            if "fail_open" in ex_reason:
+                fail_open += 1
+            if not ex_ok:
+                extension_blocked += 1
+            ok = bool(ex_ok)
+            reason = ex_reason
+        if ok:
+            passed += 1
+        else:
+            x["allow"] = False
+            blocked += 1
+            logger.warning("[SUMMARY AI EMP/HIGHLOW/EXT] AI_OK->NG symbol=%s side=%s reason=%s emp=%s highlow=%s extension=%s", x.get("symbol"), x.get("side"), reason, x.get("emp_prob"), x.get("highlow_update"), x.get("extension_guard"))
+        out.append(x)
+    logger.warning("[SUMMARY AI EMP/HIGHLOW/EXT] result total=%s passed=%s blocked=%s highlow_blocked=%s extension_blocked=%s fail_open=%s version=%s", len(res), passed, blocked, highlow_blocked, extension_blocked, fail_open, VERSION)
+    return out
+
+
+def apply_env_defaults() -> None:
+    """旧 install() の env setdefault を再現する。"""
+    if os.environ.get("DISABLE_SUMMARY_AI_EMP_PROB_GATE_PATCH", "").strip() == "1":
+        return
+    _defaults()
+
+
+apply_env_defaults()

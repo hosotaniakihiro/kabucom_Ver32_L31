@@ -461,6 +461,14 @@ def run_push_summary_ai_entry(summary_df: Optional[pd.DataFrame] = None, *, df: 
         return {"candidates": [], "ai_results": [], "ai_ok": [], "approved_rows": [], "execution": {"executed": False, "orders": [], "skip_reason": "empty_df"}}
     candidates_df = base_df.head(top_n).copy()
     ai_results = run_ai_gate_for_candidates(candidates_df, interval=interval, source=source, min_ai_confidence=float(min_ai_confidence), default_dominant_ratio=default_dominant_ratio, side=side_s)
+    # 旧 summary_ai_emp_prob_gate_patch。実測した合成順どおり
+    # emp_prob が内側、df_truth weak filter が外側。
+    try:
+        from .emp_prob_gate import apply_emp_prob_gate as _apply_emp_prob_gate
+
+        ai_results = _apply_emp_prob_gate(ai_results)
+    except Exception:
+        logger.exception("[SUMMARY AI EMP/HIGHLOW/EXT] gate failed; keep original results")
     ai_results = _wk_apply_weak_summary_ai_filter(ai_results)
     ai_ok = [r for r in ai_results if bool(r.get("allow"))]
     if side_s != "BUY":

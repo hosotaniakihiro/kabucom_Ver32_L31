@@ -196,9 +196,14 @@ def _install_summary_ai_emp_prob_gate() -> bool:
     実測ベースの確率で AI_OK を最終確認する。
     """
     try:
-        from core.startup.summary_ai_emp_prob_gate_patch import install as _install_emp_prob_gate
+        # summary_ai_emp_prob_gate_patch は
+        # trading/entry/summary_ai/emp_prob_gate.py へ移設し、
+        # ai_gate_runner.py の内部呼び出し直後で apply_emp_prob_gate() を
+        # 呼ぶ形へ本文化した。env 既定値は同モジュールが import 時に入れる。
+        from trading.entry.summary_ai import emp_prob_gate as _emp_prob_gate
 
-        ok = bool(_install_emp_prob_gate())
+        _emp_prob_gate.apply_env_defaults()
+        ok = True
         logger.warning(
             "[USERCUSTOMIZE] summary AI empirical probability gate ok=%s enabled=%s min_p=%s max_risk=%s samples=%s",
             ok,
