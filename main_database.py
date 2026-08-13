@@ -528,53 +528,16 @@ def _sqlite_pragmas_patched_connect(database: Any, *args: Any, **kwargs: Any) ->
 
 
 def _sqlite_pragmas_install_summary_spool_flush_patch() -> bool:
+    """spool flush の bulk-first 化は
+    trading/summary/persistence/summary_save_spool._save_direct へ本文化済み。
+
+    本体側が旧マーカー _summary_spool_flush_bulk_patch を関数属性として
+    立てているため、仮にこのコピーが残っていても二重ラップにはならない。
+    無効化スイッチ DISABLE_SUMMARY_SPOOL_FLUSH_BULK_PATCH も本体側が見る。
+    """
     global _SQLITE_PRAGMAS_SPOOL_FLUSH_PATCHED
-    if _SQLITE_PRAGMAS_SPOOL_FLUSH_PATCHED:
-        return True
-    if _sqlite_pragmas_env_bool("DISABLE_SUMMARY_SPOOL_FLUSH_BULK_PATCH", False):
-        return False
-
-    try:
-        import trading.summary.persistence.summary_save_spool as spool
-        import trading.summary.persistence.summary_saver_bulk as saver
-
-        old = getattr(spool, "_save_direct", None)
-        if not callable(old):
-            return False
-        if getattr(old, "_summary_spool_flush_bulk_patch", False):
-            _SQLITE_PRAGMAS_SPOOL_FLUSH_PATCHED = True
-            return True
-
-        def _patched_save_direct(df: Any, *, interval: int, source: str, date_yyyymmdd: str) -> int:
-            try:
-                saved = saver.bulk_upsert_summary(
-                    df,
-                    interval=int(interval),
-                    lock_timeout_sec=float(os.getenv("SUMMARY_SPOOL_FLUSH_LOCK_TIMEOUT_SEC", "8.0")),
-                    skip_if_busy=True,
-                    latest_only=True,
-                    save_reason="spool_recovery_flush",
-                )
-                if int(saved or 0) > 0:
-                    return int(saved)
-            except Exception:
-                logger.exception(
-                    "[SUMMARY SAVE SPOOL PATCH] bulk flush failed interval=%s source=%s date=%s -> fallback direct",
-                    interval,
-                    source,
-                    date_yyyymmdd,
-                )
-            return int(old(df, interval=interval, source=source, date_yyyymmdd=date_yyyymmdd) or 0)
-
-        _patched_save_direct._summary_spool_flush_bulk_patch = True  # type: ignore[attr-defined]
-        _patched_save_direct._original = old  # type: ignore[attr-defined]
-        spool._save_direct = _patched_save_direct
-        _SQLITE_PRAGMAS_SPOOL_FLUSH_PATCHED = True
-        logger.warning("[SUMMARY SAVE SPOOL PATCH] installed bulk_flush=True (main_database.py own copy)")
-        return True
-    except Exception:
-        logger.exception("[SUMMARY SAVE SPOOL PATCH] install failed (main_database.py own copy)")
-        return False
+    _SQLITE_PRAGMAS_SPOOL_FLUSH_PATCHED = True
+    return True
 
 
 def _install_sqlite_memory_pragmas() -> bool:
@@ -588,11 +551,11 @@ def _install_sqlite_memory_pragmas() -> bool:
     if not _sqlite_pragmas_env_bool("SQLITE_MEMORY_PRAGMAS_ENABLED", True):
         return bool(spool_ok)
 
-    if getattr(sqlite3.connect, "__module__", "") == "core.startup.sqlite_memory_pragmas_patch":
+    if getattr(sqlite3.connect, "__module__", "") == "core.startup.sqlite_memory_pragmas":
         _SQLITE_PRAGMAS_INSTALLED = True
         logger.warning(
             "[SQLITE MEMORY PRAGMAS] skip own wrap: sqlite3.connect already wrapped by "
-            "sitecustomize's core.startup.sqlite_memory_pragmas_patch"
+            "sitecustomize's core.startup.sqlite_memory_pragmas"
         )
         return True
 

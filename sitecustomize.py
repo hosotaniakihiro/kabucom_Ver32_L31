@@ -288,7 +288,7 @@ def _install_summary_mtf_catchup_safely() -> None:
 
 
 DB_SYNC_PATCHES = [
-    ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
+    ("core.startup.sqlite_memory_pragmas", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
 ]
 
 # push_summary_fallback_and_active_price_patch (REV5) はインライン化済み。
@@ -359,7 +359,7 @@ def _apply_summary_ai_vol_rescue_env_defaults() -> None:
 
 
 SYNC_MAIN_PATCHES = [
-    ("core.startup.sqlite_memory_pragmas_patch", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
+    ("core.startup.sqlite_memory_pragmas", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
     # summary_ai_volatility_rescue_patch は削除済み (env 既定値のみのstubだった)。
     # 代わりに _apply_summary_ai_vol_rescue_env_defaults() を install 前に呼ぶ。
     ("core.startup.summary_ai_runtime_consistency_patch", "SUMMARY_AI_RUNTIME_CONSISTENCY", "DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH"),

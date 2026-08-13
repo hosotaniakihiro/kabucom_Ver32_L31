@@ -243,7 +243,7 @@ def _read_spool(path: Path) -> tuple[dict, pd.DataFrame]:
     return meta, pd.DataFrame(rows)
 
 
-def _save_direct(df: pd.DataFrame, *, interval: int, source: str, date_yyyymmdd: str) -> int:
+def _save_direct_core(df: pd.DataFrame, *, interval: int, source: str, date_yyyymmdd: str) -> int:
     work = _norm_df(df, source=source)
     if work.empty:
         logger.warning("[SUMMARY SAVE SPOOL] empty dataframe interval=%s source=%s date=%s", interval, source, date_yyyymmdd)
@@ -522,3 +522,64 @@ def flush_summary_spool(*, max_files: int = 50) -> dict:
 
 
 __all__ = ["spool_summary_df", "flush_summary_spool"]
+
+
+# ============================================================
+# spool flush の bulk-first 化
+# (旧 core/startup/sqlite_memory_pragmas_patch._install_summary_spool_flush_patch
+#  と main_database.py の同内容コピーを本文化)
+# ------------------------------------------------------------
+# 直接 DELETE+INSERT する旧経路は、spool の payload に新しい列や
+# pandas/numpy のスカラ型が混じると失敗し、failed_files が消えなくなる。
+# bulk 経路は列の正規化 / latest_only / owner guard / retry IO を
+# すでに持っているので、先に bulk を試して 0 件のときだけ direct へ落とす。
+#
+# summary_saver_bulk は循環 import を避けるため関数内で import する
+# (旧パッチも install() の中で import していた)。
+#
+# 旧マーカー _summary_spool_flush_bulk_patch を関数属性として立ててある。
+# これにより旧 installer 側 (main_database.py) が残っていても
+# 「すでにラップ済み」と判定して二重ラップしない。
+# ============================================================
+
+
+def _spool_flush_bulk_disabled() -> bool:
+    try:
+        v = os.getenv("DISABLE_SUMMARY_SPOOL_FLUSH_BULK_PATCH")
+        if v is None or str(v).strip() == "":
+            return False
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return False
+
+
+def _save_direct(df: pd.DataFrame, *, interval: int, source: str, date_yyyymmdd: str) -> int:
+    if _spool_flush_bulk_disabled():
+        return _save_direct_core(df, interval=interval, source=source, date_yyyymmdd=date_yyyymmdd)
+    try:
+        import trading.summary.persistence.summary_saver_bulk as saver
+
+        # Ranking column repair now runs unconditionally inside
+        # summary_saver_bulk._get_table_columns_from_engine itself.
+        saved = saver.bulk_upsert_summary(
+            df,
+            interval=int(interval),
+            lock_timeout_sec=float(os.getenv("SUMMARY_SPOOL_FLUSH_LOCK_TIMEOUT_SEC", "8.0")),
+            skip_if_busy=True,
+            latest_only=True,
+            save_reason="spool_recovery_flush",
+        )
+        if int(saved or 0) > 0:
+            return int(saved)
+    except Exception:
+        logger.exception(
+            "[SUMMARY SAVE SPOOL PATCH] bulk flush failed interval=%s source=%s date=%s -> fallback direct",
+            interval,
+            source,
+            date_yyyymmdd,
+        )
+    return int(_save_direct_core(df, interval=interval, source=source, date_yyyymmdd=date_yyyymmdd) or 0)
+
+
+_save_direct._summary_spool_flush_bulk_patch = True  # type: ignore[attr-defined]
+_save_direct._original = _save_direct_core  # type: ignore[attr-defined]

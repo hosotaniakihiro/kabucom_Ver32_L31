@@ -1,4 +1,14 @@
 # ============================================================
+# ------------------------------------------------------------
+# 旧 core/startup/sqlite_memory_pragmas_patch.py から改名した
+# (パッチではなく stdlib 用の設定モジュール)。
+#
+# sqlite3.connect は標準ライブラリなので本体モジュールへ畳めない。
+# 関数ラップのうち本体へ畳めた分は移設済み:
+#   trading/summary/persistence/summary_save_spool._save_direct
+#     (bulk-first 化。旧 _install_summary_spool_flush_patch と
+#      main_database.py の同内容コピーの両方をここから撤去した)
+# ------------------------------------------------------------
 # File   : core/startup/sqlite_memory_pragmas_patch.py
 # Version: SQLITE-MEMORY-PRAGMAS-PATCH-V5-UNIFIED-CONNECT
 # ------------------------------------------------------------
@@ -393,87 +403,29 @@ def _patched_connect(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connec
     return conn
 
 
-def _install_summary_spool_flush_patch() -> bool:
-    """Patch spool flush to use the robust bulk upsert path.
-
-    The old direct DELETE+INSERT path can fail and keep failed_files forever when the spool
-    payload has newer columns or pandas/numpy scalar types.  The bulk path already normalizes
-    columns, handles latest_only, owner guard, and retry IO patches.
-    """
-    global _SUMMARY_SPOOL_FLUSH_PATCHED
-    if _SUMMARY_SPOOL_FLUSH_PATCHED:
-        return True
-    if _env_bool("DISABLE_SUMMARY_SPOOL_FLUSH_BULK_PATCH", False):
-        return False
-
-    try:
-        import trading.summary.persistence.summary_save_spool as spool
-        import trading.summary.persistence.summary_saver_bulk as saver
-
-        old = getattr(spool, "_save_direct", None)
-        if not callable(old):
-            return False
-        if getattr(old, "_summary_spool_flush_bulk_patch", False):
-            _SUMMARY_SPOOL_FLUSH_PATCHED = True
-            return True
-
-        def _patched_save_direct(df: Any, *, interval: int, source: str, date_yyyymmdd: str) -> int:
-            try:
-                # Ranking column repair now runs unconditionally inside
-                # summary_saver_bulk._get_table_columns_from_engine itself.
-                saved = saver.bulk_upsert_summary(
-                    df,
-                    interval=int(interval),
-                    lock_timeout_sec=float(os.getenv("SUMMARY_SPOOL_FLUSH_LOCK_TIMEOUT_SEC", "8.0")),
-                    skip_if_busy=True,
-                    latest_only=True,
-                    save_reason="spool_recovery_flush",
-                )
-                if int(saved or 0) > 0:
-                    return int(saved)
-            except Exception:
-                logger.exception(
-                    "[SUMMARY SAVE SPOOL PATCH] bulk flush failed interval=%s source=%s date=%s -> fallback direct",
-                    interval,
-                    source,
-                    date_yyyymmdd,
-                )
-            return int(old(df, interval=interval, source=source, date_yyyymmdd=date_yyyymmdd) or 0)
-
-        _patched_save_direct._summary_spool_flush_bulk_patch = True  # type: ignore[attr-defined]
-        _patched_save_direct._original = old  # type: ignore[attr-defined]
-        spool._save_direct = _patched_save_direct
-        _SUMMARY_SPOOL_FLUSH_PATCHED = True
-        logger.warning("[SUMMARY SAVE SPOOL PATCH] installed bulk_flush=True")
-        return True
-    except Exception:
-        logger.exception("[SUMMARY SAVE SPOOL PATCH] install failed")
-        return False
 
 
 def install() -> bool:
     global _INSTALLED
 
     _force_summary_lock_env()
-    spool_ok = _install_summary_spool_flush_patch()
 
     if _INSTALLED:
         return True
     if not _env_bool("SQLITE_MEMORY_PRAGMAS_ENABLED", True):
-        return bool(spool_ok)
+        return False
     try:
         sqlite3.connect = _patched_connect  # type: ignore[assignment]
         _INSTALLED = True
         logger.warning(
-            "[SQLITE MEMORY PRAGMAS] installed temp_store=%s cache_kb=%s mmap=%s spill_off=%s summary_busy_ms=%s spool_bulk=%s",
+            "[SQLITE MEMORY PRAGMAS] installed temp_store=%s cache_kb=%s mmap=%s spill_off=%s summary_busy_ms=%s",
             os.getenv("SQLITE_MEMORY_TEMP_STORE", "MEMORY"),
             os.getenv("SQLITE_MEMORY_CACHE_KB", "-65536"),
             os.getenv("SQLITE_MMAP_SIZE_BYTES", "268435456"),
             os.getenv("SQLITE_CACHE_SPILL_OFF", "1"),
             os.getenv("SUMMARY_SQLITE_BUSY_TIMEOUT_MS", "60000"),
-            spool_ok,
         )
         return True
     except Exception:
         logger.exception("[SQLITE MEMORY PRAGMAS] install failed")
-        return bool(spool_ok)
+        return False
