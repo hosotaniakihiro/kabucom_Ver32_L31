@@ -131,7 +131,10 @@ def _background_heavy() -> None:
         # base へ戻し二度と再 install されないため、完全な死にコードだった。
         # entry_affordability_runtime_patch は trading/entry/summary_ai/candidates.py の
         # build_summary_ai_entry_candidates() へ native化済みのため削除した。
-        lambda: _run_install("push_summary_direct_ohlc_runtime_patch", "core.startup.push_summary_direct_ohlc_runtime_patch"),
+        # push_summary_direct_ohlc_runtime_patch は
+        # trading/summary/engine/push_summary_engine.py へ本文化済み
+        # (_normalize_push_source_df / _build_direct_ohlc_from_push_source。
+        #  スコープは同ファイルの _pdo_scope_enabled() が再現)。
         lambda: _run_install("direct_push_1m:bg-final", "scheduler_jobs.summary.direct_push_1m"),
     ]
     logger.warning("[FAST STARTUP PATCH] background heavy installs start count=%s", len(jobs))

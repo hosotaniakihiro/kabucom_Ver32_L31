@@ -435,7 +435,7 @@ def _coalesce_numeric_columns(df: pd.DataFrame, target: str, candidates: list[st
     return out
 
 
-def _normalize_push_source_df(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_push_source_df_core(df: pd.DataFrame) -> pd.DataFrame:
     out = _safe_copy_df(df)
     if out.empty:
         return out
@@ -878,7 +878,7 @@ def _calc_rsi_direct(close: pd.Series, period: int = 14) -> pd.Series:
         return pd.Series([50.0] * len(close), index=close.index)
 
 
-def _build_direct_ohlc_from_push_source(push_df: pd.DataFrame, *, interval: int) -> pd.DataFrame:
+def _build_direct_ohlc_from_push_source_core(push_df: pd.DataFrame, *, interval: int) -> pd.DataFrame:
     ticks = _normalize_push_source_df(push_df)
     if ticks.empty:
         logger.warning("[PUSH SUMMARY ENGINE][DIRECT OHLC] normalized ticks empty interval=%s", interval)
@@ -1140,3 +1140,378 @@ def run_summary_engine(interval: int = 1) -> pd.DataFrame:
 
 def run(interval: int = 1) -> pd.DataFrame:
     return build_summary(interval=interval)
+
+
+# ============================================================
+# PUSH source の堅牢な列正規化 + direct OHLC フォールバック
+# ------------------------------------------------------------
+# 旧 core/startup/push_summary_direct_ohlc_runtime_patch.py を本文化。
+# 旧パッチは _normalize_push_source_df / _build_direct_ohlc_from_push_source を
+# **完全置換**しており (元関数を一度も呼ばない)、元実装は
+# *_core として残してある (スコープ外プロセス用のフォールバック)。
+#
+# 適用スコープは旧 install 導線 (fast_startup_runtime_patch <- main.py) を
+# _pdo_scope_enabled() で再現する。
+#
+# 【注意】この2関数を差し替える実行時パッチは他に無いことを確認済み
+# (静的収集 + 変数名 setattr の目視の2段階チェック)。
+# ============================================================
+
+
+
+def _pdo_safe_copy_df(value) -> pd.DataFrame:
+    if isinstance(value, pd.DataFrame):
+        return value.copy()
+    try:
+        return pd.DataFrame(value).copy()
+    except Exception:
+        return pd.DataFrame()
+
+
+def _pdo_key(s: str) -> str:
+    return re.sub(r"[^0-9a-zA-Z一-龥ぁ-んァ-ヶー_]", "", str(s)).lower()
+
+
+def _pdo_find_col(df: pd.DataFrame, names: Iterable[str]) -> Optional[str]:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+    direct = {str(c): c for c in df.columns}
+    lowered = {str(c).lower(): c for c in df.columns}
+    keyed = {_pdo_key(str(c)): c for c in df.columns}
+    for name in names:
+        s = str(name)
+        if s in direct:
+            return direct[s]
+        if s.lower() in lowered:
+            return lowered[s.lower()]
+        k = _pdo_key(s)
+        if k in keyed:
+            return keyed[k]
+    return None
+
+
+def _pdo_num(df: pd.DataFrame, names: Iterable[str]) -> pd.Series:
+    out = pd.Series([pd.NA] * len(df), index=df.index, dtype="object")
+    for name in names:
+        c = _pdo_find_col(df, [name])
+        if c is None:
+            continue
+        try:
+            s = pd.to_numeric(df[c], errors="coerce")
+            out = out.combine_first(s)
+        except Exception:
+            continue
+    return pd.to_numeric(out, errors="coerce")
+
+
+def _pdo_str_series(df: pd.DataFrame, names: Iterable[str], default: str = "") -> pd.Series:
+    c = _pdo_find_col(df, names)
+    if c is None:
+        return pd.Series([default] * len(df), index=df.index, dtype="object")
+    try:
+        return df[c].astype(str)
+    except Exception:
+        return pd.Series([default] * len(df), index=df.index, dtype="object")
+
+
+def _pdo_dt_series(df: pd.DataFrame, names: Iterable[str]) -> pd.Series:
+    out = pd.Series([pd.NaT] * len(df), index=df.index, dtype="datetime64[ns]")
+    for name in names:
+        c = _pdo_find_col(df, [name])
+        if c is None:
+            continue
+        try:
+            s = pd.to_datetime(df[c], errors="coerce")
+            try:
+                s = s.dt.tz_localize(None)
+            except Exception:
+                pass
+            out = out.combine_first(s)
+        except Exception:
+            continue
+    return pd.to_datetime(out, errors="coerce")
+
+
+def _pdo_normalize_push_source_df(df: pd.DataFrame) -> pd.DataFrame:
+    raw = _pdo_safe_copy_df(df)
+    if raw.empty:
+        return raw
+
+    out = raw.copy()
+
+    # symbol
+    if "symbol" not in out.columns:
+        out["symbol"] = _pdo_str_series(
+            out,
+            [
+                "symbol", "Symbol", "SYMBOL", "code", "Code", "銘柄コード",
+                "symbol_code", "SymbolCode", "IssueCode", "issue_code",
+            ],
+        )
+    out["symbol"] = (
+        out["symbol"].astype(str)
+        .str.strip()
+        .str.replace(r"\.0$", "", regex=True)
+    )
+    out = out[out["symbol"].ne("") & out["symbol"].ne("nan")].copy()
+    if out.empty:
+        logger.warning("[PUSH DIRECT OHLC PATCH] normalize empty after symbol filter raw_cols=%s", list(raw.columns))
+        return out
+
+    # datetime
+    out["datetime"] = _pdo_dt_series(
+        out,
+        [
+            "datetime", "Datetime", "date_time", "timestamp", "Timestamp",
+            "CurrentPriceTime", "current_price_time", "currentpricetime",
+            "PriceTime", "price_time", "ReceivedAt", "received_at",
+            "inserted_at", "created_at", "time", "Time", "時刻", "現在値時刻",
+        ],
+    )
+    if out["datetime"].isna().all():
+        # 最終防衛: PUSHが来ているなら現在時刻でバー化する。
+        out["datetime"] = pd.Timestamp.now().floor("s")
+        logger.warning("[PUSH DIRECT OHLC PATCH] datetime all NaT -> filled now rows=%d", len(out))
+
+    # price candidates
+    close = _pdo_num(
+        out,
+        [
+            "close", "close_price", "Close", "ClosePrice", "price", "Price",
+            "current_price", "CurrentPrice", "currentprice", "現在値", "現値",
+            "last_price", "LastPrice", "lastprice", "約定値", "ExecutionPrice",
+            "price_current", "current", "last",
+        ],
+    )
+    bid = _pdo_num(
+        out,
+        [
+            "bid", "bid_price", "BidPrice", "BestBid", "best_bid", "Buy1Price",
+            "buy1_price", "買気配", "買気配値", "最良買気配", "Bid1Price",
+        ],
+    )
+    ask = _pdo_num(
+        out,
+        [
+            "ask", "ask_price", "AskPrice", "BestAsk", "best_ask", "Sell1Price",
+            "sell1_price", "売気配", "売気配値", "最良売気配", "Ask1Price",
+        ],
+    )
+    mid = None
+    try:
+        mid = (bid + ask) / 2.0
+        mid = mid.where((bid > 0) & (ask > 0))
+    except Exception:
+        mid = pd.Series([pd.NA] * len(out), index=out.index)
+
+    close = close.combine_first(mid).combine_first(bid).combine_first(ask)
+
+    open_ = _pdo_num(out, ["open", "open_price", "Open", "OpenPrice", "始値"])
+    high = _pdo_num(out, ["high", "high_price", "High", "HighPrice", "高値"])
+    low = _pdo_num(out, ["low", "low_price", "Low", "LowPrice", "安値"])
+
+    close = close.combine_first(open_).combine_first(high).combine_first(low)
+    open_ = open_.combine_first(close)
+    high = high.combine_first(close)
+    low = low.combine_first(close)
+
+    out["close"] = pd.to_numeric(close, errors="coerce")
+    out["open"] = pd.to_numeric(open_, errors="coerce")
+    out["high"] = pd.to_numeric(high, errors="coerce")
+    out["low"] = pd.to_numeric(low, errors="coerce")
+
+    out["close_price"] = out["close"]
+    out["open_price"] = out["open"]
+    out["high_price"] = out["high"]
+    out["low_price"] = out["low"]
+    out["price"] = out["close"]
+    out["current_price"] = out["close"]
+
+    vol = _pdo_num(
+        out,
+        [
+            "volume", "Volume", "trading_volume", "TradingVolume", "出来高",
+            "CumVolume", "cum_volume", "last_cum_volume", "CurrentVolume",
+            "current_volume", "売買数量", "TradingVolumeToday",
+        ],
+    )
+    out["volume"] = pd.to_numeric(vol, errors="coerce").fillna(0.0)
+    out["trading_volume"] = out["volume"]
+
+    if "symbolname" not in out.columns:
+        out["symbolname"] = _pdo_str_series(
+            out,
+            ["symbolname", "SymbolName", "symbol_name", "name", "Name", "銘柄名", "IssueName"],
+            default="",
+        )
+    out["symbolname"] = out["symbolname"].replace({"": pd.NA, "nan": pd.NA}).fillna(out["symbol"])
+
+    out["source"] = out.get("source", "push_stream")
+
+    before = len(out)
+    out = out.dropna(subset=["datetime", "symbol", "close"]).copy()
+    out = out[pd.to_numeric(out["close"], errors="coerce") > 0].copy()
+
+    latest = out["datetime"].max() if not out.empty else None
+    logger.warning(
+        "[PUSH DIRECT OHLC PATCH] normalized raw_rows=%d out_rows=%d dropped=%d cols=%d symbols=%d latest=%s price_nonnull=%d sample_cols=%s",
+        len(raw),
+        len(out),
+        before - len(out),
+        len(out.columns),
+        int(out["symbol"].nunique()) if not out.empty and "symbol" in out.columns else 0,
+        latest,
+        int(out["close"].notna().sum()) if "close" in out.columns else 0,
+        list(raw.columns)[:20],
+    )
+    return out.reset_index(drop=True)
+
+
+def _pdo_calc_rsi_direct(close: pd.Series, period: int = 14) -> pd.Series:
+    try:
+        delta = close.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=1).mean()
+        avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=1).mean()
+        rs = avg_gain / avg_loss.replace(0, pd.NA)
+        return pd.to_numeric(100 - (100 / (1 + rs)), errors="coerce").fillna(50.0)
+    except Exception:
+        return pd.Series([50.0] * len(close), index=close.index)
+
+
+def _pdo_build_direct_ohlc_from_push_source(push_df: pd.DataFrame, *, interval: int) -> pd.DataFrame:
+    ticks = _pdo_normalize_push_source_df(push_df)
+    if ticks.empty:
+        logger.warning("[PUSH DIRECT OHLC PATCH] direct OHLC skipped normalized empty interval=%s", interval)
+        return pd.DataFrame()
+
+    try:
+        ticks["datetime"] = pd.to_datetime(ticks["datetime"], errors="coerce")
+        ticks["_slot"] = ticks["datetime"].dt.floor(f"{int(interval)}min")
+        ticks = ticks.sort_values(["symbol", "datetime"], kind="stable")
+    except Exception:
+        logger.exception("[PUSH DIRECT OHLC PATCH] slot build failed interval=%s", interval)
+        return pd.DataFrame()
+
+    def _last_nonempty(s: pd.Series):
+        x = s.dropna()
+        return x.iloc[-1] if not x.empty else ""
+
+    try:
+        bars = (
+            ticks.groupby(["symbol", "_slot"], as_index=False)
+            .agg(
+                symbolname=("symbolname", _last_nonempty),
+                open=("close", "first"),
+                high=("close", "max"),
+                low=("close", "min"),
+                close=("close", "last"),
+                volume=("volume", "max"),
+                tick_count=("close", "count"),
+                first_tick_at=("datetime", "min"),
+                last_tick_at=("datetime", "max"),
+            )
+            .rename(columns={"_slot": "datetime"})
+        )
+    except Exception:
+        logger.exception("[PUSH DIRECT OHLC PATCH] groupby OHLC failed interval=%s", interval)
+        return pd.DataFrame()
+
+    if bars.empty:
+        return pd.DataFrame()
+
+    for c in ("open", "high", "low", "close", "volume"):
+        bars[c] = pd.to_numeric(bars[c], errors="coerce")
+    bars = bars.dropna(subset=["symbol", "datetime", "close"]).copy()
+    bars = bars[bars["close"] > 0].copy()
+    if bars.empty:
+        return pd.DataFrame()
+
+    parts: list[pd.DataFrame] = []
+    for _sym, one in bars.groupby("symbol", sort=False):
+        one = one.copy().sort_values("datetime", kind="stable")
+        close = pd.to_numeric(one["close"], errors="coerce")
+        prev_close = close.shift(1)
+        pct = (close - prev_close) / prev_close.replace(0, pd.NA)
+        intrabar = (close - pd.to_numeric(one["open"], errors="coerce")) / pd.to_numeric(one["open"], errors="coerce").replace(0, pd.NA)
+
+        one["rsi"] = _pdo_calc_rsi_direct(close)
+        ema12 = close.ewm(span=12, adjust=False, min_periods=1).mean()
+        ema26 = close.ewm(span=26, adjust=False, min_periods=1).mean()
+        one["macd"] = (ema12 - ema26).fillna(0.0)
+        one["signal"] = one["macd"].ewm(span=9, adjust=False, min_periods=1).mean().fillna(0.0)
+        one["hist"] = (one["macd"] - one["signal"]).fillna(0.0)
+        one["slope"] = pct.combine_first(intrabar).fillna(0.0)
+        one["slope_atr_scaled"] = one["slope"]
+        one["mtf"] = 0.0
+        one["score_slope"] = one["slope"] * 100.0
+        one["score_mtf"] = 0.0
+        tick_bonus = pd.to_numeric(one.get("tick_count", 1), errors="coerce").fillna(1).clip(lower=1) * 0.0001
+        base = (one["score_slope"].abs() + tick_bonus).fillna(0.0001)
+        signed = base.where(one["score_slope"] >= 0, -base)
+        one["score"] = signed
+        one["score_total"] = signed
+        one["final_score"] = signed
+        one["display_score"] = signed
+        one["score_buy"] = signed.clip(lower=0)
+        one["score_sell"] = (-signed).clip(lower=0)
+        one["technical_ready"] = True
+        one["display_ready"] = True
+        one["symbol_hist_len"] = range(1, len(one) + 1)
+        one["source"] = "push_stream_direct_ohlc_runtime_patch"
+        one["interval"] = int(interval)
+        one["open_price"] = one["open"]
+        one["high_price"] = one["high"]
+        one["low_price"] = one["low"]
+        one["close_price"] = one["close"]
+        one["current_price"] = one["close"]
+        one["price"] = one["close"]
+        parts.append(one)
+
+    out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    logger.warning(
+        "[PUSH DIRECT OHLC PATCH] built interval=%s rows=%d symbols=%d latest=%s",
+        interval,
+        len(out),
+        int(out["symbol"].nunique()) if not out.empty and "symbol" in out.columns else 0,
+        out["datetime"].max() if not out.empty and "datetime" in out.columns else None,
+    )
+    return out.reset_index(drop=True)
+
+
+_PDO_SCOPE = None
+
+
+def _pdo_scope_enabled() -> bool:
+    global _PDO_SCOPE
+    if _PDO_SCOPE is not None:
+        return _PDO_SCOPE
+    enabled = False
+    try:
+        import sys as _sys
+
+        argv_text = " ".join(str(x) for x in _sys.argv).replace("\\", "/").lower()
+        db_names = (
+            "main_database.py", "data_collectors_runner.py", "db_prepare_runner.py",
+            "push_receiver_runner.py", "yahoo_complement_runner.py",
+            "summary_database_runner.py", "ranking_collector_runner.py",
+        )
+        if not any(n in argv_text for n in db_names):
+            enabled = "main.py" in argv_text
+    except Exception:
+        enabled = False
+    _PDO_SCOPE = enabled
+    return enabled
+
+
+def _normalize_push_source_df(df: pd.DataFrame) -> pd.DataFrame:
+    if _pdo_scope_enabled():
+        return _pdo_normalize_push_source_df(df)
+    return _normalize_push_source_df_core(df)
+
+
+def _build_direct_ohlc_from_push_source(push_df: pd.DataFrame, *, interval: int) -> pd.DataFrame:
+    if _pdo_scope_enabled():
+        return _pdo_build_direct_ohlc_from_push_source(push_df, interval=interval)
+    return _build_direct_ohlc_from_push_source_core(push_df, interval=interval)
