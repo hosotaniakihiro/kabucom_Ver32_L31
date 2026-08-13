@@ -203,71 +203,49 @@ def _startup_bootstrap_token(original_refresh) -> str:
     return token
 
 
-def _patch_token_manager() -> bool:
-    global _ORIG_REFRESH
-    try:
-        import token_manager  # type: ignore
-    except Exception:
-        logger.exception("[TOKEN STARTUP ONCE] import token_manager failed")
-        return False
+def refresh_token_startup_once(orig, apipassword=None, *args, **kwargs):
+    """旧 refresh_token_startup_once (token_manager.refresh_token 差し替え)。
 
-    if getattr(token_manager, "_TOKEN_STARTUP_ONCE_POLICY_PATCHED", False):
-        return True
-
-    original = getattr(token_manager, "refresh_token", None)
-    if not callable(original):
-        logger.warning("[TOKEN STARTUP ONCE] token_manager.refresh_token missing")
-        return False
-    _ORIG_REFRESH = original
-
-    startup_token = _startup_bootstrap_token(original)
-
-    def refresh_token_startup_once(apipassword=None, *args, **kwargs):
-        if _env_bool("KABU_TOKEN_ALLOW_RUNTIME_REFRESH", False) or _env_bool("KABU_TOKEN_FORCE_REFRESH", False):
-            if _is_child_process() and not _env_bool("KABU_TOKEN_ALLOW_CHILD_REFRESH", False):
-                token = _read_settings_token()
-                if token:
-                    _publish_env_token(token)
-                logger.warning(
-                    "[TOKEN STARTUP ONCE] child forced refresh blocked; using settings.ini token token_len=%d argv=%s",
-                    len(token),
-                    _argv_text(),
-                )
-                return token
-            token = original(apipassword=apipassword) if apipassword is not None else original()
-            try:
-                _publish_env_token(str(token or ""))
-            except Exception:
-                pass
-            return token
-
-        token = _read_settings_token()
-        if token:
-            _publish_env_token(token)
+    起動時に 1 回だけ取得した settings.ini のトークンを使い、実行中の
+    再取得は原則抑止する。子プロセスからの強制 refresh もブロックする。
+    orig は素の token_manager.refresh_token。
+    """
+    if _env_bool("KABU_TOKEN_ALLOW_RUNTIME_REFRESH", False) or _env_bool("KABU_TOKEN_FORCE_REFRESH", False):
+        if _is_child_process() and not _env_bool("KABU_TOKEN_ALLOW_CHILD_REFRESH", False):
+            token = _read_settings_token()
+            if token:
+                _publish_env_token(token)
             logger.warning(
-                "[TOKEN STARTUP ONCE] runtime refresh suppressed; using settings.ini token token_len=%d",
+                "[TOKEN STARTUP ONCE] child forced refresh blocked; using settings.ini token token_len=%d argv=%s",
                 len(token),
+                _argv_text(),
             )
             return token
+        token = orig(apipassword=apipassword) if apipassword is not None else orig()
+        try:
+            _publish_env_token(str(token or ""))
+        except Exception:
+            pass
+        return token
 
-        logger.error(
-            "[TOKEN STARTUP ONCE] runtime refresh suppressed but settings.ini token is empty; restart parent with KABU_TOKEN_REFRESH_ON_STARTUP=1 or fix settings.ini"
+    token = _read_settings_token()
+    if token:
+        _publish_env_token(token)
+        logger.warning(
+            "[TOKEN STARTUP ONCE] runtime refresh suppressed; using settings.ini token token_len=%d",
+            len(token),
         )
-        return ""
+        return token
 
-    try:
-        refresh_token_startup_once._original = original  # type: ignore[attr-defined]
-        refresh_token_startup_once._token_startup_once_policy = True  # type: ignore[attr-defined]
-        token_manager.refresh_token = refresh_token_startup_once  # type: ignore[attr-defined]
-        token_manager._TOKEN_STARTUP_ONCE_POLICY_PATCHED = True  # type: ignore[attr-defined]
-        token = startup_token or _read_settings_token()
-        if token:
-            _publish_env_token(token)
-        logger.warning("[TOKEN STARTUP ONCE] token_manager patched no_runtime_refresh=True parent_only=True token_len=%d", len(token))
-        return True
-    except Exception:
-        logger.exception("[TOKEN STARTUP ONCE] token_manager patch failed")
-        return False
+    logger.error(
+        "[TOKEN STARTUP ONCE] runtime refresh suppressed but settings.ini token is empty; restart parent with KABU_TOKEN_REFRESH_ON_STARTUP=1 or fix settings.ini"
+    )
+    return ""
+
+
+def bootstrap_startup_token(orig) -> str:
+    """旧 install() 内の _startup_bootstrap_token(original)。"""
+    return _startup_bootstrap_token(orig)
 
 
 def _patch_requests_no_401_refresh() -> bool:
@@ -308,8 +286,18 @@ def _patch_requests_no_401_refresh() -> bool:
         return False
 
 
-def install() -> bool:
-    global _INSTALLED
+_ENABLED = False
+
+
+def startup_policy_enabled() -> bool:
+    """旧 install() が走ったか。token_manager.refresh_token が見る。"""
+    return bool(_ENABLED)
+
+
+def enable_token_startup_policy() -> bool:
+    """旧 install()。token_manager.refresh_token の差し替えは本文化済みなので、
+    env 既定値・起動時ブートストラップ・requests の 401 再取得抑止だけを行う。"""
+    global _INSTALLED, _ENABLED
     if _INSTALLED:
         return True
     if os.environ.get("DISABLE_TOKEN_STARTUP_ONCE_POLICY_PATCH", "").strip() == "1":
@@ -322,9 +310,25 @@ def install() -> bool:
     os.environ.setdefault("KABU_TOKEN_REFRESH_ON_STARTUP", "1")
     os.environ.setdefault("KABU_TOKEN_PARENT_ONLY_REFRESH", "1")
 
-    ok_tm = _patch_token_manager()
+    ok_tm = False
+    try:
+        import token_manager  # type: ignore
+
+        if not getattr(token_manager, "_TOKEN_STARTUP_ONCE_POLICY_PATCHED", False):
+            core = getattr(token_manager, "_refresh_token_core", None)
+            startup_token = bootstrap_startup_token(core) if callable(core) else ""
+            token_manager._TOKEN_STARTUP_ONCE_POLICY_PATCHED = True  # type: ignore[attr-defined]
+            token = startup_token or _read_settings_token()
+            if token:
+                _publish_env_token(token)
+            logger.warning("[TOKEN STARTUP ONCE] token policy active no_runtime_refresh=True parent_only=True token_len=%d", len(token))
+        ok_tm = True
+    except Exception:
+        logger.exception("[TOKEN STARTUP ONCE] token policy bootstrap failed")
+
     ok_req = _patch_requests_no_401_refresh()
-    _INSTALLED = bool(ok_tm or ok_req)
+    _ENABLED = True
+    _INSTALLED = True
     logger.warning(
         "[TOKEN STARTUP ONCE] installed version=%s token_manager=%s requests=%s auth_retry=%s startup_refresh=%s parent_only=%s child=%s",
         VERSION,
@@ -335,7 +339,7 @@ def install() -> bool:
         os.environ.get("KABU_TOKEN_PARENT_ONLY_REFRESH"),
         _is_child_process(),
     )
-    return _INSTALLED
+    return True
 
 
-__all__ = ["VERSION", "install"]
+__all__ = ["VERSION", "enable_token_startup_policy", "startup_policy_enabled", "refresh_token_startup_once"]

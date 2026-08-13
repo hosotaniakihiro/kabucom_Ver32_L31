@@ -104,8 +104,11 @@ def _install_token_startup_once_policy() -> bool:
         if os.environ.get("DISABLE_TOKEN_STARTUP_ONCE_POLICY_PATCH", "").strip() == "1":
             logger.warning("[FULL PIPELINE STABILITY] startup-once token policy disabled by env")
             return False
-        from . import token_startup_once_policy_patch
-        return bool(token_startup_once_policy_patch.install())
+        # token_startup_once_policy_patch は kabu_api/token_startup_policy.py へ本文化済み
+        # (refresh_token の置き換えは token_manager 側が持つ)。
+        from kabu_api import token_startup_policy
+
+        return bool(token_startup_policy.enable_token_startup_policy())
     except Exception:
         logger.exception("[FULL PIPELINE STABILITY] startup-once token policy install failed")
         return False

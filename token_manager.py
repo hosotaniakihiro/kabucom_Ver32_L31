@@ -405,7 +405,7 @@ def get_valid_token():
     return _publish_token(token)
 
 
-def refresh_token(apipassword=None):
+def _refresh_token_core(apipassword=None):
     """Refresh token only when it is safe to issue a new kabu Station token.
 
     Child runners must not call /token. Parent processes also avoid issuing a new
@@ -599,3 +599,36 @@ try:
     install_requests_401_retry_patch()
 except Exception:
     pass
+
+
+# ============================================================
+# TOKEN STARTUP ONCE POLICY
+# (旧 core/startup/token_startup_once_policy_patch.py を本文化)
+# ------------------------------------------------------------
+# 起動時に 1 回だけ取得したトークンを使い、実行中の再取得は原則抑止する。
+# 旧 install() は refresh_token をこの層で**置き換えて**いた
+# (KABU_TOKEN_ALLOW_RUNTIME_REFRESH / KABU_TOKEN_FORCE_REFRESH が真の
+#  ときだけ素の実装を呼ぶ)。素の実装は _refresh_token_core として残す。
+#
+# この層は最内周。旧構成では実 install 順で
+#   _refresh_token_core
+#     <- この層 (startup once)
+#       <- full_pipeline_stability_runtime_patch の publish ラッパー
+#         <- entry_count_unblock_runtime_patch の publish ラッパー
+# となっており、外側 2 つは現時点ではまだ runtime patch のまま
+# token_manager.refresh_token を包む (順序は変わらない)。
+#
+# ポリシーの有効化 (env 既定値・起動時ブートストラップ・requests の
+# 401 再取得抑止) は kabu_api/token_startup_policy.py の
+# enable_token_startup_policy() が行う。
+# ============================================================
+
+
+def refresh_token(apipassword=None, *args, **kwargs):
+    try:
+        from kabu_api import token_startup_policy as _tsp
+    except Exception:
+        return _refresh_token_core(apipassword)
+    if not _tsp.startup_policy_enabled():
+        return _refresh_token_core(apipassword)
+    return _tsp.refresh_token_startup_once(_refresh_token_core, apipassword, *args, **kwargs)
