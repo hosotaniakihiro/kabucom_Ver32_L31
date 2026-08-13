@@ -177,7 +177,7 @@ def _install_exit_no_progress_monitor() -> bool:
 def _install_summary_ai_board_rest_cooldown() -> bool:
     """Summary-AI 経路の REST 板クールダウン回避と、連鎖する戦略オーバレイ。
 
-    クールダウン回避本体は core/startup/board_retry_patch.py の
+    クールダウン回避本体は kabu_api/board_retry.py の
     _fetch_board_rest へ統合済み。ここでは旧パッチが併せて行っていた
     3つの戦略 install を、同じ位置・同じ順序で実行する。
     """

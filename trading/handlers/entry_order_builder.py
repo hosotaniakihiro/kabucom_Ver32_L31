@@ -47,7 +47,11 @@ import pandas as pd
 from global_state import global_data
 from trading.exit.symbol_trade_guard import is_entry_blocked
 from utils_common import (
-    get_latest_bid_ask,
+    # 旧 board_retry_patch の retry 層は「モジュール先頭の from-import が
+    # install() より先に走る」ため、この束縛には一度も掛かっていなかった。
+    # 本文化でその挙動が変わらないよう core 実装を明示的に束縛する。
+    # (retry 層を通したい呼び出しは関数内 import 側 = _epi_* を参照)
+    _get_latest_bid_ask_core as get_latest_bid_ask,
     calculate_qty_by_budget,
     get_tick_size,
 )
@@ -3382,11 +3386,11 @@ def apply_entry_final_filter_defaults() -> bool:
     except Exception:
         logger.exception("[ENTRY FINAL FILTER FAILOPEN] entry_order_builder constant patch failed")
 
-    for mod_name, label in (("core.startup.board_retry_patch", "board retry patch"),
+    for mod_name, label in (("kabu_api.board_retry", "board retry env defaults"),
                             ("trading.handlers.short_mtf_direction_guard", "short MTF daily optional guard")):
         try:
             mod = __import__(mod_name, fromlist=["install"])
-            fn = getattr(mod, "install", None)
+            fn = getattr(mod, "install", None) or getattr(mod, "apply_env_defaults", None)
             ok = fn() if callable(fn) else False
             logger.warning("[ENTRY FINAL FILTER FAILOPEN] %s installed=%s", label, ok)
         except Exception:

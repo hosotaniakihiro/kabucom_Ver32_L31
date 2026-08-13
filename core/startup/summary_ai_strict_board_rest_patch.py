@@ -174,7 +174,7 @@ def _infer_source_from_stack() -> tuple[str, str]:
 
 def _fetch_rest_board(symbol: Any, *, side: str = "", source: str = "") -> Any:
     try:
-        from core.startup import board_retry_patch as brp
+        from kabu_api import board_retry as brp
         old_enabled = os.environ.get("ENTRY_BOARD_REST_DIRECT_ENABLED")
         old_timeout = os.environ.get("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC")
         desired_timeout = max(1.0, _env_float("SUMMARY_AI_REST_BOARD_TIMEOUT_SEC", 2.0))

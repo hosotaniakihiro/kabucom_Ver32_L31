@@ -148,7 +148,7 @@ def resolve_entry_price(
 # 🔵 PUSH限定・板情報取得
 # ============================================================
 
-def get_latest_bid_ask(symbol: str):
+def _get_latest_bid_ask_core(symbol: str):
 
     symbol = normalize_symbol(symbol)
 
@@ -206,6 +206,26 @@ def get_latest_bid_ask(symbol: str):
     except Exception:
         logger.error("❌ get_latest_bid_ask error", exc_info=True)
         return None
+
+
+# ------------------------------------------------------------
+# BOARD RETRY (旧 core/startup/board_retry_patch.py の本文化)
+# ------------------------------------------------------------
+# 旧 install() が
+#   utils_common.get_latest_bid_ask = _wrap_get_latest_bid_ask(native)
+# としていた 1 枚を、ここで native に固定した。
+# リトライ本体・REST フォールバック・cooldown は kabu_api/board_retry.py。
+#
+# board_retry を import できない環境 (単体利用など) では素の PUSH 実装に
+# フォールバックする。旧構成でも install 失敗時は native のままだった。
+# ------------------------------------------------------------
+
+def get_latest_bid_ask(symbol: str, *args, **kwargs):
+    try:
+        from kabu_api.board_retry import retry_fetch_board
+    except Exception:
+        return _get_latest_bid_ask_core(symbol)
+    return retry_fetch_board(_get_latest_bid_ask_core, symbol, *args, **kwargs)
 
 
 # ============================================================

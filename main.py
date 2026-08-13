@@ -293,7 +293,7 @@ def _install_main_runtime_patches():
         #   ai_final_entry_check ラッパー -> trading/handlers/entry_controller.py (_bri_*)
         #   _result_executed 厳格判定   -> trading/summary/pipeline/entry_pipeline.py
         #                                  trading/summary/summary_entry.py
-        ("core.startup.board_retry_patch", "install"),
+        ("kabu_api.board_retry", "apply_env_defaults"),
         ("core.startup.board_safety_defaults", "install"),
         # tonosama_5sec_stopped_relax_patch は
         # trading/entry/tonosama/pending_writer.py へ本文化済み

@@ -1,5 +1,5 @@
 # ============================================================
-# File   : core/startup/board_retry_patch.py
+# File   : kabu_api/board_retry.py
 # Version: V1.9-SUMMARY-AI-REST-COOLDOWN-SHORT
 # ------------------------------------------------------------
 # 板取得リトライを軽量化する。
@@ -13,6 +13,32 @@
 #     REST /board を再確認できるようにする。
 #   - cooldown中でもキャッシュに有効板があれば返す。
 #   - 板なし発注はしない。RESTでも板が無ければ従来通り hard block。
+#
+# ------------------------------------------------------------
+# 旧 core/startup/board_retry_patch.py から移設し、本文化した。
+#
+# 旧 install() は utils_common.get_latest_bid_ask を
+# `_unwrap_original()` で native まで巻き戻してから包み直していた。
+# 巻き戻す相手 (utils_common 側の他ラッパー) はリポジトリに存在せず、
+# 実質「native を 1 枚だけ包む」だけだったので、
+# utils_common.get_latest_bid_ask 側を
+#   _get_latest_bid_ask_core (native) + get_latest_bid_ask (retry ラッパー)
+# の 2 段に本文化し、こちらは retry_fetch_board() を提供するだけにした。
+#
+# 注意 (from-import バイパスの保存):
+#   trading/handlers/entry_order_builder.py は
+#   `from utils_common import get_latest_bid_ask` を**モジュール先頭**で
+#   行うため、旧構成では install() より前に束縛が済んでおり
+#   retry 層は一度も掛かっていなかった (install() は同ファイルの
+#   apply_entry_final_filter_defaults から呼ばれるので、eob の import は
+#   必ず先)。本文化でここが変わらないよう、eob 側は
+#   `_get_latest_bid_ask_core` を import するようにしてある。
+#   utils_common 内部の呼び出しと関数内 import の呼び出し元
+#   (exit/executor, no_progress_monitor, entry_controller, eob:_epi_*) は
+#   旧構成どおり retry 層を通る。
+#
+# 残る install() 相当は環境変数の既定値設定だけなので
+# apply_env_defaults() に改名した。
 # ============================================================
 from __future__ import annotations
 
@@ -293,20 +319,15 @@ def _retry_fetch_board(original, symbol: Any, *args, source: str = "", side: str
     return last_board
 
 
-def _wrap_get_latest_bid_ask(original):
-    original = _unwrap_original(original)
-    if getattr(original, "_board_retry_v19", False):
-        return original
 
-    def _get_latest_bid_ask_retry(symbol: Any, *args, **kwargs):
-        return _retry_fetch_board(original, symbol, *args, **kwargs)
+def retry_fetch_board(original, symbol: Any, *args, source: str = "", side: str = "", **kwargs):
+    """utils_common.get_latest_bid_ask から呼ばれる公開 API。
 
-    _get_latest_bid_ask_retry._board_retry_v19 = True  # type: ignore[attr-defined]
-    _get_latest_bid_ask_retry._board_retry_v18 = True  # type: ignore[attr-defined]
-    _get_latest_bid_ask_retry._board_retry_v17 = True  # type: ignore[attr-defined]
-    _get_latest_bid_ask_retry._board_retry_v16 = True  # type: ignore[attr-defined]
-    _get_latest_bid_ask_retry._original = original  # type: ignore[attr-defined]
-    return _get_latest_bid_ask_retry
+    旧 _wrap_get_latest_bid_ask() が作っていたラッパーの中身と同じ
+    (`_retry_fetch_board(original, symbol, *args, **kwargs)`)。
+    """
+    return _retry_fetch_board(original, symbol, *args, source=source, side=side, **kwargs)
+
 
 
 def _install_final_safety_side_aware_board() -> bool:
@@ -331,22 +352,16 @@ def _install_daily_src_duplicate_cleanup() -> bool:
     return True
 
 
-def install() -> bool:
+def apply_env_defaults() -> bool:
     global _PATCHED
     os.environ.setdefault("ENTRY_BOARD_REST_DIRECT_ENABLED", "0")
     os.environ.setdefault("ENTRY_BOARD_RETRY_COUNT", "1")
     os.environ.setdefault("ENTRY_BOARD_RETRY_WAIT_SEC", "0.2")
     os.environ.setdefault("SUMMARY_AI_BOARD_REST_ERROR_COOLDOWN_SEC", "2.0")
     os.environ.setdefault("SUMMARY_AI_BOARD_REST_MAX_COOLDOWN_SKIP_SEC", "2.5")
-    try:
-        import utils_common
-        old = getattr(utils_common, "get_latest_bid_ask", None)
-        if callable(old) and not getattr(old, "_board_retry_v19", False):
-            utils_common.get_latest_bid_ask = _wrap_get_latest_bid_ask(old)
-            _PATCHED = True
-            logger.warning("[BOARD RETRY] patched utils_common.get_latest_bid_ask v19")
-    except Exception:
-        logger.exception("[BOARD RETRY] patch utils_common.get_latest_bid_ask failed")
+    # utils_common.get_latest_bid_ask への差し替えは本文化済み
+    # (utils_common 側が _get_latest_bid_ask_core を retry_fetch_board で包む)。
+    _PATCHED = True
     _install_final_safety_side_aware_board()
     _install_ma5_opening_relax()
     _install_daily_src_duplicate_cleanup()
@@ -355,12 +370,12 @@ def install() -> bool:
 
 
 try:
-    install()
+    apply_env_defaults()
 except Exception:
-    logger.exception("[BOARD RETRY] auto install failed")
+    logger.exception("[BOARD RETRY] auto env defaults failed")
 
 
-__all__ = ["install", "_fetch_board_rest"]
+__all__ = ["apply_env_defaults", "retry_fetch_board", "_fetch_board_rest"]
 
 
 # ============================================================
