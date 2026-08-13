@@ -1,3 +1,19 @@
+# ============================================================
+# File   : core/startup/board_safety_defaults.py
+# ------------------------------------------------------------
+# 旧 core/startup/board_missing_failopen_runtime_patch.py。
+# 関数のモンキーパッチはもう1つも残っておらず、実体は
+#   - 板なし発注を復活させないための env ハード代入 (安全側)
+#   - entry_order_builder.ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY = True
+#   - controller busy 時のリトライ env (旧 summary_ai_lock_retry_runtime_patch)
+#   - final_board_guard_signature_compat_patch の連鎖install
+# だけなので、パッチではなく通常モジュールへ改名した (ロジックは無変更)。
+#
+# **実行位置は変えていない**: 同じ env/定数を
+# summary_ai_strict_board_rest_patch / tonosama_history_failclose_strict_patch も
+# 書くため後勝ちになる。main.py の patches リスト内の同じ位置で install() が
+# 呼ばれ続けるようにしてある。
+# ============================================================
 # -*- coding: utf-8 -*-
 # ============================================================
 # File   : core/startup/board_missing_failopen_runtime_patch.py

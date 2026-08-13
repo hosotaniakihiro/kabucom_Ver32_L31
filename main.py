@@ -264,7 +264,7 @@ def _install_main_runtime_patches():
         ("core.startup.entry_order_mtf_slope_fill_patch", "install"),
         ("core.startup.summary_ai_entry_controller_bridge_patch", "install"),
         ("core.startup.board_retry_patch", "install"),
-        ("core.startup.board_missing_failopen_runtime_patch", "install"),
+        ("core.startup.board_safety_defaults", "install"),
         # tonosama_5sec_stopped_relax_patch は
         # trading/entry/tonosama/pending_writer.py へ本文化済み
         # (_five_sec_relax_stage)。main.py 専用スコープは
