@@ -134,7 +134,7 @@ def _display_executor() -> ThreadPoolExecutor:
 # save owner gate
 # ============================================================
 
-def _is_database_process() -> bool:
+def _is_database_process_core() -> bool:
     return any(
         _env_true(name)
         for name in (
@@ -145,7 +145,7 @@ def _is_database_process() -> bool:
     )
 
 
-def _summary_save_enabled() -> bool:
+def _summary_save_enabled_core() -> bool:
     mode = _env_flag_value("AUTOSTOCK_SUMMARY_SAVE_MODE")
     if mode in ("disabled", "disable", "calculate_only", "calc_only", "no_save", "skip", "off"):
         return False
@@ -590,3 +590,35 @@ __all__ = [
     "run_push_summary_job",
     "run_ranking_summary_job",
 ]
+
+
+# ============================================================
+# DATABASE OWNER OVERRIDE
+# (旧 core/startup/database_owner_runtime_patch._patch_summary_runner_core)
+# ------------------------------------------------------------
+# 旧パッチは install 時にこの 2 つを**完全置換**していた。
+# 素の実装は *_core として残し、有効時だけ委譲する。
+# ============================================================
+
+
+def _dbo_owner():
+    try:
+        from data_collectors import database_owner as _m
+
+        return _m if _m.owner_override_enabled() else None
+    except Exception:
+        return None
+
+
+def _is_database_process() -> bool:
+    _m = _dbo_owner()
+    if _m is None:
+        return _is_database_process_core()
+    return _m.is_database_process_gate()
+
+
+def _summary_save_enabled() -> bool:
+    _m = _dbo_owner()
+    if _m is None:
+        return _summary_save_enabled_core()
+    return _m.summary_save_enabled()

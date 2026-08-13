@@ -461,7 +461,25 @@ def _install_daytrade_credit_force_close(context: str) -> bool:
 
 
 def _install_database_owner(context: str) -> bool:
-    return _safe_install("database owner", context, DB_CONTEXTS | TRADING_CONTEXTS | GENERIC_HELPER_CONTEXTS, "DISABLE_DATABASE_OWNER_RUNTIME_PATCH", "database_owner_runtime_patch")
+    # database_owner_runtime_patch は本文化済み:
+    #   data_collectors/database_owner.py (判定本体)
+    #   data_collectors/split_mode.py / scheduler_jobs/summary/runner_core.py /
+    #   core/startup/push/storage_bootstrap.py が呼び出し時に委譲する。
+    # スコープ判定 (context / DISABLE env) は旧 _safe_install と同じにする。
+    try:
+        if context not in (DB_CONTEXTS | TRADING_CONTEXTS | GENERIC_HELPER_CONTEXTS):
+            return False
+        if os.environ.get("DISABLE_DATABASE_OWNER_RUNTIME_PATCH", "").strip() == "1":
+            logger.warning("[RUNTIME ENV DEFAULTS PATCH] database owner disabled by env")
+            return False
+        from data_collectors import database_owner as _dbo
+
+        ok = bool(_dbo.enable_owner_override())
+        logger.warning("[RUNTIME ENV DEFAULTS PATCH] database owner install ok=%s context=%s", ok, context)
+        return ok
+    except Exception:
+        logger.exception("[RUNTIME ENV DEFAULTS PATCH] database owner install failed")
+        return False
 
 
 def _install_entry_count_unblock(context: str) -> bool:

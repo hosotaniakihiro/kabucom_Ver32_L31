@@ -64,7 +64,7 @@ def _argv_context() -> str:
     return "unknown"
 
 
-def is_data_collector_process() -> bool:
+def _is_data_collector_process_core() -> bool:
     return (
         _env_bool("AUTOSTOCK_DATA_COLLECTORS_PROCESS", False)
         or _env_bool("AUTOSTOCK_MAIN_DATABASE_PROCESS", False)
@@ -78,7 +78,7 @@ def force_main_db_writes_enabled() -> bool:
     return _env_bool("AUTOSTOCK_FORCE_MAIN_DB_WRITES", False)
 
 
-def external_data_collectors_enabled() -> bool:
+def _external_data_collectors_enabled_core() -> bool:
     """
     外部データ収集プロセス分離モードの親フラグ。
 
@@ -88,7 +88,7 @@ def external_data_collectors_enabled() -> bool:
     return _env_bool("AUTOSTOCK_EXTERNAL_DATA_COLLECTORS", True)
 
 
-def main_memory_only_enabled() -> bool:
+def _main_memory_only_enabled_core() -> bool:
     """
     main.py をエントリー専用・メモリ専用として扱うか。
     V6既定では main.py はDB writerを持たない。
@@ -112,7 +112,7 @@ def _database_owner_default_enabled() -> bool:
     return True
 
 
-def yahoo_complement_owner() -> str:
+def _yahoo_complement_owner_core() -> str:
     """
     Yahoo補完の取得・DB保存をどちらのプロセスが担当するか。
 
@@ -131,7 +131,7 @@ def yahoo_complement_owner() -> str:
     return owner
 
 
-def summary_save_owner() -> str:
+def _summary_save_owner_core() -> str:
     """
     定時サマリーDB保存をどちらのプロセスが担当するか。
 
@@ -150,7 +150,7 @@ def summary_save_owner() -> str:
     return owner
 
 
-def should_skip_data_collector_work_in_main() -> bool:
+def _should_skip_data_collector_work_in_main_core() -> bool:
     """
     True の場合、main.py側では以下を起動しない。
       - PUSH DB writer
@@ -168,7 +168,7 @@ def should_skip_data_collector_work_in_main() -> bool:
     return True
 
 
-def should_run_yahoo_complement_in_this_process() -> bool:
+def _should_run_yahoo_complement_in_this_process_core() -> bool:
     """Yahoo補完の取得・DB保存ジョブをこのプロセスで動かしてよいか。"""
     owner = yahoo_complement_owner()
 
@@ -183,7 +183,7 @@ def should_run_yahoo_complement_in_this_process() -> bool:
     return False
 
 
-def should_run_summary_save_in_this_process() -> bool:
+def _should_run_summary_save_in_this_process_core() -> bool:
     """summary DB保存をこのプロセスで動かしてよいか。"""
     owner = summary_save_owner()
 
@@ -198,15 +198,15 @@ def should_run_summary_save_in_this_process() -> bool:
     return False
 
 
-def should_skip_yahoo_complement_in_main() -> bool:
+def _should_skip_yahoo_complement_in_main_core() -> bool:
     return not is_data_collector_process() and not should_run_yahoo_complement_in_this_process()
 
 
-def should_skip_summary_save_in_this_process() -> bool:
+def _should_skip_summary_save_in_this_process_core() -> bool:
     return not should_run_summary_save_in_this_process()
 
 
-def mark_as_data_collector_process() -> None:
+def _mark_as_data_collector_process_core() -> None:
     os.environ["AUTOSTOCK_DATA_COLLECTORS_PROCESS"] = "1"
     os.environ.setdefault("AUTOSTOCK_EXTERNAL_DATA_COLLECTORS", "1")
     os.environ["AUTOSTOCK_YAHOO_COMPLEMENT_OWNER"] = "database"
@@ -230,3 +230,92 @@ __all__ = [
     "should_skip_summary_save_in_this_process",
     "force_main_db_writes_enabled",
 ]
+
+
+# ============================================================
+# DATABASE OWNER OVERRIDE
+# (旧 core/startup/database_owner_runtime_patch.py の
+#  _patch_split_mode を本文化)
+# ------------------------------------------------------------
+# 旧パッチはここの 11 関数を install 時に**完全置換**していた
+# (元関数は一度も呼ばない)。素の実装は *_core として残し、
+# 有効時だけ data_collectors/database_owner.py の実装へ委譲する。
+# 有効化のスコープ判定は旧構成どおり
+# core/startup/runtime_env/defaults_patch._install_database_owner() 側。
+# ============================================================
+
+
+def _dbo():
+    try:
+        from data_collectors import database_owner as _m
+
+        return _m if _m.owner_override_enabled() else None
+    except Exception:
+        return None
+
+
+def is_data_collector_process() -> bool:
+    _m = _dbo()
+    if _m is None:
+        return _is_data_collector_process_core()
+    return _m.is_data_collector_process()
+
+def external_data_collectors_enabled() -> bool:
+    _m = _dbo()
+    if _m is None:
+        return _external_data_collectors_enabled_core()
+    return _m.external_data_collectors_enabled()
+
+def main_memory_only_enabled() -> bool:
+    _m = _dbo()
+    if _m is None:
+        return _main_memory_only_enabled_core()
+    return _m.main_memory_only_enabled()
+
+def yahoo_complement_owner() -> str:
+    _m = _dbo()
+    if _m is None:
+        return _yahoo_complement_owner_core()
+    return _m.yahoo_complement_owner()
+
+def summary_save_owner() -> str:
+    _m = _dbo()
+    if _m is None:
+        return _summary_save_owner_core()
+    return _m.summary_save_owner()
+
+def should_skip_data_collector_work_in_main() -> bool:
+    _m = _dbo()
+    if _m is None:
+        return _should_skip_data_collector_work_in_main_core()
+    return _m.should_skip_data_collector_work_in_main()
+
+def should_run_yahoo_complement_in_this_process() -> bool:
+    _m = _dbo()
+    if _m is None:
+        return _should_run_yahoo_complement_in_this_process_core()
+    return _m.should_run_yahoo_complement_in_this_process()
+
+def should_run_summary_save_in_this_process() -> bool:
+    _m = _dbo()
+    if _m is None:
+        return _should_run_summary_save_in_this_process_core()
+    return _m.should_run_summary_save_in_this_process()
+
+def should_skip_yahoo_complement_in_main() -> bool:
+    _m = _dbo()
+    if _m is None:
+        return _should_skip_yahoo_complement_in_main_core()
+    return _m.should_skip_yahoo_complement_in_main()
+
+def should_skip_summary_save_in_this_process() -> bool:
+    _m = _dbo()
+    if _m is None:
+        return _should_skip_summary_save_in_this_process_core()
+    return _m.should_skip_summary_save_in_this_process()
+
+def mark_as_data_collector_process() -> None:
+    _m = _dbo()
+    if _m is None:
+        return _mark_as_data_collector_process_core()
+    return _m.mark_as_data_collector_process()

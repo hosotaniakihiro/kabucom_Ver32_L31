@@ -31,7 +31,7 @@ _storage_lock = threading.RLock()
 _stream_writer_instance: Optional[Any] = None
 
 
-def _should_skip_push_storage_start_in_main() -> bool:
+def _should_skip_push_storage_start_in_main_core() -> bool:
     try:
         from data_collectors.split_mode import should_skip_data_collector_work_in_main
         return bool(should_skip_data_collector_work_in_main())
@@ -168,3 +168,22 @@ __all__ = [
     "is_push_storage_running",
     "get_stream_writer",
 ]
+
+
+# ============================================================
+# DATABASE OWNER OVERRIDE
+# (旧 core/startup/database_owner_runtime_patch._patch_push_storage_bootstrap)
+# ------------------------------------------------------------
+# 旧パッチは install 時にこれを**完全置換**していた。
+# 素の実装は *_core として残し、有効時だけ委譲する。
+# ============================================================
+
+
+def _should_skip_push_storage_start_in_main() -> bool:
+    try:
+        from data_collectors import database_owner as _m
+    except Exception:
+        return _should_skip_push_storage_start_in_main_core()
+    if not _m.owner_override_enabled():
+        return _should_skip_push_storage_start_in_main_core()
+    return _m.should_skip_push_storage_start_in_main()
