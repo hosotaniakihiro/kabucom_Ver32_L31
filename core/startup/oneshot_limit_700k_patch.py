@@ -259,10 +259,10 @@ def _install_watchlist_recent_liquidity_patch() -> bool:
         os.environ.setdefault("WATCHLIST_RECENT_LIQ_MIN_TURNOVER_YEN", "1000000")
         os.environ.setdefault("WATCHLIST_RECENT_LIQ_BARS", "5")
         os.environ.setdefault("WATCHLIST_RECENT_LIQ_PROTECT_BYPASS", "1")
-        from core.startup import watchlist_recent_liquidity_guard_patch as p
-        ok = p.install()
-        logger.warning("[ONESHOT LIMIT PATCH] watchlist_recent_liquidity_patch installed=%s", ok)
-        return bool(ok)
+        # watchlist_recent_liquidity_guard_patch は
+        # trading/ranking/active_symbols/recent_liquidity.py へ本文化済み。
+        # ここでは env 既定値だけ入れる。
+        return True
     except Exception:
         logger.exception("[ONESHOT LIMIT PATCH] watchlist_recent_liquidity_patch install failed")
         return False
@@ -272,10 +272,8 @@ def _install_watchlist_recent_liquidity_bulk_patch() -> bool:
     try:
         os.environ.setdefault("WATCHLIST_RECENT_LIQ_CACHE_TTL_SEC", "10")
         os.environ.setdefault("WATCHLIST_RECENT_LIQ_BULK_LOG_SEC", "0.5")
-        from core.startup import watchlist_recent_liquidity_bulk_patch as p
-        ok = p.install()
-        logger.warning("[ONESHOT LIMIT PATCH] watchlist_recent_liquidity_bulk_patch installed=%s", ok)
-        return bool(ok)
+        # watchlist_recent_liquidity_bulk_patch も同じく本文化済み。
+        return True
     except Exception:
         logger.exception("[ONESHOT LIMIT PATCH] watchlist_recent_liquidity_bulk_patch install failed")
         return False

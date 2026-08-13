@@ -788,7 +788,7 @@ def _trim_to_max(
     return set(sorted(items, key=sort_key, reverse=True)[:MAX_ACTIVE_SYMBOLS])
 
 
-def update_active_symbols(force: bool = False) -> List[str]:
+def _update_active_symbols_core(force: bool = False) -> List[str]:
     try:
         return _update_active_symbols_impl(force=force)
     except Exception:
@@ -957,7 +957,7 @@ def _update_active_symbols_impl(force: bool = False) -> List[str]:
     return active_list
 
 
-def get_active_symbols(*args, **kwargs) -> List[str]:
+def _get_active_symbols_core(*args, **kwargs) -> List[str]:
     del args, kwargs
     symbols = dedupe_keep_order(getattr(global_data, "symbols_active", []))
     if not symbols:
@@ -977,27 +977,27 @@ def get_active_symbols(*args, **kwargs) -> List[str]:
     return symbols[:MAX_ACTIVE_SYMBOLS]
 
 
-def get_current_active_symbols(*args, **kwargs) -> List[str]:
+def _get_current_active_symbols_core(*args, **kwargs) -> List[str]:
     return get_active_symbols()
 
 
-def get_monitor_symbols(*args, **kwargs) -> List[str]:
+def _get_monitor_symbols_core(*args, **kwargs) -> List[str]:
     return get_active_symbols()[:MAX_ACTIVE_SYMBOLS]
 
 
-def get_push_symbols(*args, **kwargs) -> List[str]:
+def _get_push_symbols_core(*args, **kwargs) -> List[str]:
     return get_active_symbols()[:MAX_ACTIVE_SYMBOLS]
 
 
-def get_register_symbols(*args, **kwargs) -> List[str]:
+def _get_register_symbols_core(*args, **kwargs) -> List[str]:
     return get_active_symbols()[:MAX_ACTIVE_SYMBOLS]
 
 
-def get_subscription_symbols(*args, **kwargs) -> List[str]:
+def _get_subscription_symbols_core(*args, **kwargs) -> List[str]:
     return get_active_symbols()[:MAX_ACTIVE_SYMBOLS]
 
 
-def get_rotation_symbols(*args, **kwargs) -> List[str]:
+def _get_rotation_symbols_core(*args, **kwargs) -> List[str]:
     return get_active_symbols()[:MAX_ACTIVE_SYMBOLS]
 
 
@@ -1026,3 +1026,70 @@ def debug_active_symbols() -> dict:
     }
     logger.info("[ACTIVE DEBUG] %s", payload)
     return payload
+
+
+# ============================================================
+# WATCHLIST RECENT LIQUIDITY GUARD
+# (旧 core/startup/watchlist_recent_liquidity_guard_patch.py と
+#  同 _bulk_patch、usercustomize の fail-open ラッパーを本文化)
+# ------------------------------------------------------------
+# 直近の出来高・売買代金が細い銘柄を watchlist から落とす。
+# 3 層の合成 (guard の per-symbol <- bulk が完全置換 <- uc の min_keep
+# fail-open) は trading/ranking/active_symbols/recent_liquidity.py の
+# filter_symbols() が持っている。
+#
+# 旧 install はここの 8 関数と互換ラッパー
+# (trading/ranking/active_symbol_manager) の同名を差し替えていたが、
+# 互換側は trading.ranking.active_symbols から from-import しているので
+# 本文化すれば自動で追従する。
+# ============================================================
+
+from trading.ranking.active_symbols.recent_liquidity import filter_symbols as _wrl_filter
+
+
+def update_active_symbols(force: bool = False) -> List[str]:
+    symbols = _update_active_symbols_core(force)
+    filtered = _wrl_filter(symbols, context="active.update_active_symbols")
+    try:
+        from trading.ranking.active_symbols.reflect import reflect_active_to_global
+
+        reflect_active_to_global(filtered)
+    except Exception:
+        logger.debug("[WATCHLIST RECENT LIQ] reflect after update failed", exc_info=True)
+    return filtered
+
+
+
+def get_active_symbols(*args, **kwargs) -> List[str]:
+    return _wrl_filter(_get_active_symbols_core(*args, **kwargs), context="active.get_active_symbols")
+
+
+
+def get_current_active_symbols(*args, **kwargs) -> List[str]:
+    return _wrl_filter(_get_current_active_symbols_core(*args, **kwargs), context="active.get_current_active_symbols")
+
+
+
+def get_monitor_symbols(*args, **kwargs) -> List[str]:
+    return _wrl_filter(_get_monitor_symbols_core(*args, **kwargs), context="active.get_monitor_symbols")
+
+
+
+def get_push_symbols(*args, **kwargs) -> List[str]:
+    return _wrl_filter(_get_push_symbols_core(*args, **kwargs), context="active.get_push_symbols")
+
+
+
+def get_register_symbols(*args, **kwargs) -> List[str]:
+    return _wrl_filter(_get_register_symbols_core(*args, **kwargs), context="active.get_register_symbols")
+
+
+
+def get_subscription_symbols(*args, **kwargs) -> List[str]:
+    return _wrl_filter(_get_subscription_symbols_core(*args, **kwargs), context="active.get_subscription_symbols")
+
+
+
+def get_rotation_symbols(*args, **kwargs) -> List[str]:
+    return _wrl_filter(_get_rotation_symbols_core(*args, **kwargs), context="active.get_rotation_symbols")
+

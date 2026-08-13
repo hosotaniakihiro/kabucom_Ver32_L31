@@ -465,7 +465,7 @@ def _filter_liquidity_with_timeout(cleaned: List[str]) -> Any:
     )
 
 
-def apply_register_liquidity_guard(targets: Sequence[str]) -> List[str]:
+def _apply_register_liquidity_guard_core(targets: Sequence[str]) -> List[str]:
     cleaned, raw_count, filler_count, invalid_count = clean_symbol_list(targets)
 
     if not cleaned:
@@ -896,3 +896,24 @@ def resolve_register_targets() -> List[str]:
         len(targets_clean), a_count, b_count, time.monotonic() - t0, targets_clean[:10], a_head, b_head,
     )
     return targets
+
+
+# ============================================================
+# WATCHLIST RECENT LIQUIDITY GUARD (PUSH 登録側)
+# (旧 watchlist_recent_liquidity_guard_patch + usercustomize の
+#  apply fail-open ラッパーを本文化)
+# ------------------------------------------------------------
+# rotation.py:46 が from-import で束縛しているので、本文化すれば
+# _apply_register_liquidity_guard も自動で追従する。
+# ============================================================
+
+
+def apply_register_liquidity_guard(targets: Sequence[str]) -> List[str]:
+    from trading.ranking.active_symbols.recent_liquidity import (
+        apply_failopen_min_keep as _wrl_failopen,
+        filter_symbols as _wrl_filter,
+    )
+
+    base = _apply_register_liquidity_guard_core(targets)
+    out = _wrl_filter(base, context="push.rotation.apply_register_liquidity_guard")
+    return _wrl_failopen(list(targets or []), out)

@@ -601,98 +601,18 @@ def _uc_is_push_rotation_context(context: str) -> bool:
 
 
 def _uc_patch_watchlist_recent_liq_rotation_failopen() -> bool:
-    if not _is_main_py():
-        return False
+    """watchlist_recent_liquidity の 3 層は本文化済み。
 
-    try:
-        try:
-            from core.startup.watchlist_recent_liquidity_bulk_patch import install as _bulk_install
-
-            _bulk_install()
-        except Exception:
-            logger.exception("[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] bulk install before wrap failed")
-
-        import core.startup.watchlist_recent_liquidity_guard_patch as base
-
-        orig_filter = getattr(base, "_filter_symbols", None)
-        if not callable(orig_filter):
-            logger.warning("[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] base _filter_symbols missing")
-            return False
-
-        if getattr(orig_filter, "_uc_push_rotation_failopen_v1", False):
-            return True
-
-        def _patched_filter_symbols(symbols: Iterable[Any], *, context: str) -> list[str]:
-            items = _uc_dedupe_symbols(symbols)
-            out = orig_filter(items, context=context)
-            out_items = _uc_dedupe_symbols(out)
-
-            if _uc_is_push_rotation_context(context) and items:
-                min_keep = max(1, min(len(items), _env_int("UC_PUSH_ROTATION_LIQ_FAILOPEN_MIN_KEEP", 50)))
-                if len(out_items) < min_keep:
-                    logger.warning(
-                        "[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] context=%s before=%s after=%s min_keep=%s -> keep original targets",
-                        context,
-                        len(items),
-                        len(out_items),
-                        min_keep,
-                    )
-                    return items
-
-            return out_items
-
-        _patched_filter_symbols._uc_push_rotation_failopen_v1 = True  # type: ignore[attr-defined]
-        _patched_filter_symbols._original = orig_filter  # type: ignore[attr-defined]
-        base._filter_symbols = _patched_filter_symbols
-
-        try:
-            import trading.push.push_stream.rotation_symbols as rot_sym
-
-            old_apply = getattr(rot_sym, "apply_register_liquidity_guard", None)
-
-            if callable(old_apply) and not getattr(old_apply, "_uc_push_rotation_apply_failopen_v1", False):
-
-                def _patched_apply_register_liquidity_guard(targets):
-                    items = _uc_dedupe_symbols(targets)
-                    out = old_apply(targets)
-                    out_items = _uc_dedupe_symbols(out)
-
-                    if items:
-                        min_keep = max(1, min(len(items), _env_int("UC_PUSH_ROTATION_LIQ_FAILOPEN_MIN_KEEP", 50)))
-                        if len(out_items) < min_keep:
-                            logger.warning(
-                                "[USERCUSTOMIZE][PUSH ROTATION APPLY FAILOPEN] before=%s after=%s min_keep=%s -> keep original targets",
-                                len(items),
-                                len(out_items),
-                                min_keep,
-                            )
-                            return items
-
-                    return out_items
-
-                _patched_apply_register_liquidity_guard._uc_push_rotation_apply_failopen_v1 = True  # type: ignore[attr-defined]
-                _patched_apply_register_liquidity_guard._original = old_apply  # type: ignore[attr-defined]
-                rot_sym.apply_register_liquidity_guard = _patched_apply_register_liquidity_guard
-
-                try:
-                    import trading.push.push_stream.rotation as rot
-
-                    rot._apply_register_liquidity_guard = _patched_apply_register_liquidity_guard
-                except Exception:
-                    pass
-
-        except Exception:
-            logger.exception("[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] rotation apply wrap failed")
-
-        logger.warning(
-            "[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] installed min_keep=%s",
-            os.getenv("UC_PUSH_ROTATION_LIQ_FAILOPEN_MIN_KEEP", "50"),
-        )
-        return True
-
-    except Exception:
-        logger.exception("[USERCUSTOMIZE][PUSH ROTATION LIQ FAILOPEN] install failed")
-        return False
+    guard の per-symbol 実装 / bulk の完全置換 / ここにあった min_keep
+    fail-open ラッパーは、まとめて
+    trading/ranking/active_symbols/recent_liquidity.py の
+    filter_symbols() / apply_failopen_min_keep() に入れた。
+    呼び出し側は
+      trading/ranking/active_symbols/manager.py の 8 関数
+      trading/push/push_stream/rotation_symbols.apply_register_liquidity_guard
+    が本文で直接呼ぶ (互換ラッパーと rotation.py は from-import で追従)。
+    """
+    return True
 
 
 def _uc_delayed_watchlist_patch_loop() -> None:
