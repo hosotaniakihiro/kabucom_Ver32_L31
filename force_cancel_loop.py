@@ -223,7 +223,7 @@ def _refresh_headers_after_401(context: str):
     return _direct_token_fallback(context)
 
 
-def _safe_get_headers(context):
+def _safe_get_headers_core(context):
     global _LAST_TOKEN_WARN_AT
     try:
         return get_headers()
@@ -397,3 +397,24 @@ def start_force_cancel_loop(interval_sec=30):
             logger.exception("[FORCE_CANCEL LOOP ERROR]")
 
         time.sleep(interval_sec)
+
+
+# ============================================================
+# KABU API TOKEN RUNTIME
+# (旧 core/startup/kabu_api_token_runtime_patch._patch_force_cancel_loop)
+# ------------------------------------------------------------
+# 旧パッチは install 時にこれを**完全置換**していた (元関数は呼ばない)。
+# 素の実装は *_core として残し、有効時だけ委譲する。
+# 併せて生やしていた _has_api_token は、このファイルに定義も参照も無い
+# 不活性な属性だったので引き継がない。
+# ============================================================
+
+
+def _safe_get_headers(context):
+    try:
+        from kabu_api import token_runtime as _tr
+    except Exception:
+        return _safe_get_headers_core(context)
+    if not _tr.token_runtime_enabled():
+        return _safe_get_headers_core(context)
+    return _tr.safe_get_headers(context)

@@ -413,7 +413,7 @@ def _install_ranking_entry_companion_patches() -> bool:
         return True
     ok_any = False
     for module_name in (
-        "core.startup.kabu_api_token_runtime_patch",
+        "kabu_api.token_runtime",
         # ranking_entry_push_fallback_patch は
         # trading/ranking/entry_from_ranking._get_ranking_source_df へ本文化済み
         # (スコープは同ファイルの _rpf2_scope_enabled() が再現)。
@@ -421,7 +421,7 @@ def _install_ranking_entry_companion_patches() -> bool:
         try:
             import importlib
             mod = importlib.import_module(module_name)
-            fn = getattr(mod, "install", None)
+            fn = getattr(mod, "install", None) or getattr(mod, "enable_token_runtime", None)
             ok = bool(fn()) if callable(fn) else False
             ok_any = ok_any or ok
             logger.info("[RANKING ENTRY SCHEDULE] companion patch %s installed=%s", module_name, ok)

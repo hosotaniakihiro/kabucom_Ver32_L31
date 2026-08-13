@@ -33,7 +33,7 @@ _POS_CACHE_TTL = 5.0   # 秒（429対策の要）
 # ============================================================
 # ① /positions API（retry + cache + 429 safe）
 # ============================================================
-def get_positions():
+def _get_positions_core():
     """
     kabuステーション /positions を安全に取得する。
 
@@ -123,7 +123,7 @@ def _get_positions_impl():
 # ============================================================
 # ② Position DB と完全同期（信用建玉のみ）
 # ============================================================
-def sync_positions_from_kabus():
+def _sync_positions_from_kabus_core():
     """
     信用建玉のみを Position DB に完全ミラー同期する
     ※ 429 / API失敗時でもシステムは止めない
@@ -231,3 +231,38 @@ def sync_positions_from_kabus():
 
     finally:
         session.close()
+
+
+# ============================================================
+# KABU API TOKEN RUNTIME
+# (旧 core/startup/kabu_api_token_runtime_patch._patch_positions_module)
+# ------------------------------------------------------------
+# 旧構成:
+#   get_positions              -> **完全置換** (token 解決 + 401/429 リトライ +
+#                                 キャッシュ退避。素の実装は呼ばない)
+#   sync_positions_from_kabus  -> token が取れないときだけ素の実装を呼ばない包み
+# 素の実装は *_core として残し、有効時だけ委譲する。
+# ============================================================
+
+
+def _token_runtime():
+    try:
+        from kabu_api import token_runtime as _tr
+
+        return _tr if _tr.token_runtime_enabled() else None
+    except Exception:
+        return None
+
+
+def get_positions():
+    _tr = _token_runtime()
+    if _tr is None:
+        return _get_positions_core()
+    return _tr.get_positions_with_token()
+
+
+def sync_positions_from_kabus():
+    _tr = _token_runtime()
+    if _tr is None:
+        return _sync_positions_from_kabus_core()
+    return _tr.sync_positions_with_token(_sync_positions_from_kabus_core)
