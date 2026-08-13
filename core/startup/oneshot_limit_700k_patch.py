@@ -304,12 +304,17 @@ def _install_entry_pipeline_bucket_filter_patch() -> bool:
         os.environ.setdefault("SUMMARY_AI_ATR_FAILOPEN_MIN_VOLUME", "30000")
         os.environ.setdefault("SUMMARY_AI_ATR_FAILOPEN_MIN_TURNOVER", "10000000")
         os.environ.setdefault("SUMMARY_AI_ATR_FAILOPEN_MIN_PRICE", "1500")
-        from core.startup import summary_ai_atr_failopen_patch as p
-        ok = p.install()
-        logger.warning("[ONESHOT LIMIT PATCH] summary_ai_atr_failopen_patch installed=%s", ok)
-        return bool(ok)
+        # summary_ai_atr_failopen_patch は削除した。
+        # 実 install 順で測定した結果、同パッチが包む
+        # entry_controller.atr_1m_filter は main.py:275 の
+        # volatility_filter_tonosama_entryrow_rescue_patch が
+        # native まで巻き戻して被せ直すため、この層は捨てられていた
+        # (main.py:250 -> ここ, main.py:275 -> tonosama の順)。
+        # 復元する側も居ないので完全な死にラッパー。
+        # env 既定値 (上の setdefault) は他所でも読まれるため残してある。
+        return True
     except Exception:
-        logger.exception("[ONESHOT LIMIT PATCH] summary_ai_atr_failopen_patch install failed")
+        logger.exception("[ONESHOT LIMIT PATCH] entry pipeline bucket filter defaults failed")
         return False
 
 
