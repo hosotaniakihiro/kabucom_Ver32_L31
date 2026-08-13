@@ -417,7 +417,10 @@ def _install_fast_order_builder() -> bool:
         ok = True
         for _mod_name, _label in (
             ("core.startup.summary_ai_strict_board_rest_patch", "strict board policy"),
-            ("core.startup.breakout_support_resistance_guard_patch", "breakout SR guard"),
+            # breakout_support_resistance_guard_patch は本文化済み:
+            #   trading/handlers/entry_order_builder.build_entry_order (_bsr_*)
+            #   trading/entry/summary_ai/executor の
+            #     _base_filter_blocked_ai_ok_items / _sort_key
         ):
             try:
                 _m = __import__(_mod_name, fromlist=["install"])

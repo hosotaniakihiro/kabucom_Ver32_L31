@@ -35,7 +35,7 @@ import math
 import os
 import sys
 import time
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Iterable, Optional, Tuple
 
 from global_state import global_data
 from trading.exit.symbol_trade_guard import is_entry_blocked
@@ -1233,7 +1233,7 @@ def _fob_apply_env_and_constants() -> None:
         logger.exception("[SUMMARY AI FAST ORDER BUILDER] env/constant apply failed")
 
 
-def build_entry_order(*args, **kwargs):
+def _build_entry_order_fob(*args, **kwargs):
     if not _fob_scope_enabled():
         return _build_entry_order_core(*args, **kwargs)
     summary_like = _fob_is_summary_ai_order(kwargs)
@@ -1266,3 +1266,232 @@ def build_entry_order(*args, **kwargs):
 
 
 _fob_apply_env_and_constants()
+
+
+# ============================================================
+# BREAKOUT SUPPORT/RESISTANCE GUARD (発注側)
+# (旧 core/startup/breakout_support_resistance_guard_patch.py を本文化)
+# ------------------------------------------------------------
+# 支持線/抵抗線の直前や未確定ブレイクでの発注を止める。
+# 実 install 順の測定で、この層は build_entry_order を包む 7 パッチの
+# うち fast_order_builder のすぐ外側だった。同じ位置に置いている:
+#   _build_entry_order_core (native)
+#     <- _build_entry_order_fob   (SUMMARY_AI fast path)
+#       <- build_entry_order      (この層)
+# ============================================================
+
+_BSR_VERSION = "V1-BREAKOUT-SUPPORT-RESISTANCE-GUARD"
+_BSR__INSTALLED = False
+_BSR__ORIG_BASE_FILTER = None
+_BSR__ORIG_SORT_KEY = None
+_BSR__ORIG_BUILD_ORDER = None
+
+
+def _bsr_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _bsr_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
+
+
+def _bsr_safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
+
+
+def _bsr_norm_side(v: Any) -> str:
+    s = str(v or "").strip().upper()
+    if s in {"SELL", "SHORT", "1", "売", "売り"}:
+        return "SELL"
+    return "BUY"
+
+
+def _bsr_as_dict(v: Any) -> dict[str, Any]:
+    return dict(v) if isinstance(v, dict) else {}
+
+
+def _bsr_iter_sources(item: dict[str, Any]) -> Iterable[dict[str, Any]]:
+    yield item
+    for k in ("entry_row", "source_row", "ai_row", "row", "conditions", "entry_conditions"):
+        d = item.get(k)
+        if isinstance(d, dict):
+            yield d
+
+
+def _bsr_first(item: dict[str, Any], names: tuple[str, ...]) -> float:
+    for d in _bsr_iter_sources(item):
+        for n in names:
+            x = _bsr_safe_float(d.get(n), 0.0)
+            if x > 0:
+                return x
+    return 0.0
+
+
+def _bsr_pick_symbol(item: dict[str, Any]) -> str:
+    for d in _bsr_iter_sources(item):
+        v = d.get("symbol") or d.get("Symbol") or d.get("code") or d.get("銘柄コード")
+        if v:
+            s = str(v).strip()
+            if s.endswith(".0") and s[:-2].isdigit():
+                s = s[:-2]
+            return s
+    return ""
+
+
+def _bsr_pick_side(item: dict[str, Any]) -> str:
+    for d in _bsr_iter_sources(item):
+        v = d.get("side") or d.get("entry_decision") or d.get("ai_side")
+        if v:
+            return _bsr_norm_side(v)
+    return "BUY"
+
+
+def _bsr_pick_price(item: dict[str, Any]) -> float:
+    return _bsr_first(item, ("price", "close_price", "current_price", "close", "last_price", "display_price", "CurrentPrice"))
+
+
+def _bsr_pick_volume(item: dict[str, Any]) -> float:
+    return _bsr_first(item, ("volume", "vol", "latest_volume", "display_volume", "Volume", "TradingVolume"))
+
+
+def _bsr_pick_recent_avg_volume(item: dict[str, Any]) -> float:
+    return _bsr_first(item, ("avg_volume_5", "volume_ma5", "avg_5m_volume", "recent_avg_volume", "volume_avg", "rolling_volume_avg"))
+
+
+def _bsr_pick_level(item: dict[str, Any], names: tuple[str, ...]) -> float:
+    return _bsr_first(item, names)
+
+
+def _bsr_level_names() -> dict[str, tuple[str, ...]]:
+    return {
+        "prev_high": ("prev_high", "previous_high", "prev_day_high", "previous_day_high", "yesterday_high", "prior_high", "daily_prev_high", "前日高値"),
+        "prev_low": ("prev_low", "previous_low", "prev_day_low", "previous_day_low", "yesterday_low", "prior_low", "daily_prev_low", "前日安値"),
+        "resistance": ("resistance", "resistance_price", "upper_resistance", "recent_high", "recent_swing_high", "breakout_high", "rolling_high", "high_20", "high_10", "day_high", "today_high", "session_high", "intraday_high"),
+        "support": ("support", "support_price", "lower_support", "recent_low", "recent_swing_low", "breakdown_low", "rolling_low", "low_20", "low_10", "day_low", "today_low", "session_low", "intraday_low"),
+    }
+
+
+def _bsr_score(item: dict[str, Any]) -> float:
+    side = _bsr_pick_side(item)
+    keys = ("sell_score", "score_total", "final_score", "score") if side == "SELL" else ("buy_score", "score_total", "final_score", "score")
+    return max(_bsr_safe_float(item.get(k), 0.0) for k in keys)
+
+
+def _bsr_diagnose(item: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    side = _bsr_pick_side(item)
+    symbol = _bsr_pick_symbol(item)
+    price = _bsr_pick_price(item)
+    if price <= 0:
+        return True, {"reason": "no_price", "symbol": symbol, "side": side}
+    names = _bsr_level_names()
+    prev_high = _bsr_pick_level(item, names["prev_high"])
+    prev_low = _bsr_pick_level(item, names["prev_low"])
+    resistance = max(prev_high, _bsr_pick_level(item, names["resistance"]))
+    support_candidates = [x for x in (prev_low, _bsr_pick_level(item, names["support"])) if x > 0]
+    support = min(support_candidates) if support_candidates else 0.0
+    near_pct = _bsr_env_float("BREAKOUT_SR_NEAR_BLOCK_PCT", 0.0015)
+    break_pct = _bsr_env_float("BREAKOUT_SR_BREAK_CONFIRM_PCT", 0.0005)
+    strong_break_pct = _bsr_env_float("BREAKOUT_SR_STRONG_BREAK_PCT", 0.0020)
+    require_volume = _bsr_env_bool("BREAKOUT_SR_REQUIRE_VOLUME_FOR_BREAK", False)
+    vol = _bsr_pick_volume(item)
+    avg_vol = _bsr_pick_recent_avg_volume(item)
+    volume_ok = True
+    if require_volume and avg_vol > 0 and vol > 0:
+        volume_ok = vol >= avg_vol * _bsr_env_float("BREAKOUT_SR_VOLUME_RATIO", 1.15)
+    detail = {
+        "symbol": symbol,
+        "side": side,
+        "price": price,
+        "prev_high": prev_high,
+        "prev_low": prev_low,
+        "resistance": resistance,
+        "support": support,
+        "near_pct": near_pct,
+        "break_pct": break_pct,
+        "strong_break_pct": strong_break_pct,
+        "volume": vol,
+        "avg_volume": avg_vol,
+        "volume_ok": volume_ok,
+        "score": _bsr_score(item),
+    }
+    if side == "BUY":
+        if resistance > 0:
+            gap = (resistance - price) / price
+            break_margin = (price - resistance) / resistance if resistance > 0 else 0.0
+            detail.update({"gap_to_resistance_pct": gap, "break_margin_pct": break_margin})
+            if 0 <= gap <= near_pct:
+                detail["reason"] = "near_resistance_block"
+                return False, detail
+            if break_margin >= break_pct and volume_ok:
+                detail["reason"] = "resistance_breakout_ok"
+                return True, detail
+            if break_margin >= strong_break_pct:
+                detail["reason"] = "strong_resistance_breakout_ok"
+                return True, detail
+        detail["reason"] = "no_resistance_level_or_not_near"
+        return True, detail
+    # SELL
+    if support > 0:
+        gap = (price - support) / price
+        break_margin = (support - price) / support if support > 0 else 0.0
+        detail.update({"gap_to_support_pct": gap, "break_margin_pct": break_margin})
+        if 0 <= gap <= near_pct:
+            detail["reason"] = "near_support_block"
+            return False, detail
+        if break_margin >= break_pct and volume_ok:
+            detail["reason"] = "support_breakdown_ok"
+            return True, detail
+        if break_margin >= strong_break_pct:
+            detail["reason"] = "strong_support_breakdown_ok"
+            return True, detail
+    detail["reason"] = "no_support_level_or_not_near"
+    return True, detail
+
+
+def _bsr_breakout_bonus(item: dict[str, Any]) -> float:
+    if not isinstance(item, dict):
+        return 0.0
+    ok, detail = _bsr_diagnose(item)
+    reason = str(detail.get("reason") or "")
+    if not ok:
+        return -1.0 * _bsr_env_float("BREAKOUT_SR_BLOCK_SORT_PENALTY", 1000.0)
+    if "strong_" in reason:
+        return _bsr_env_float("BREAKOUT_SR_STRONG_BONUS", 0.30)
+    if "breakout_ok" in reason or "breakdown_ok" in reason:
+        return _bsr_env_float("BREAKOUT_SR_BREAK_BONUS", 0.15)
+    return 0.0
+
+
+def build_entry_order(*args, **kwargs):
+    try:
+        row = kwargs.get("entry_row") if isinstance(kwargs.get("entry_row"), dict) else {}
+        item = dict(row)
+        item.setdefault("symbol", kwargs.get("symbol"))
+        item.setdefault("side", kwargs.get("side"))
+        if _bsr_env_bool("BREAKOUT_SR_ORDER_BUILDER_GUARD", True) and item:
+            ok, detail = _bsr_diagnose(item)
+            if not ok:
+                logger.warning("[BREAKOUT SR GUARD] ORDER_BUILD_NG detail=%s", detail)
+                return {"ok": False, "reason": str(detail.get("reason") or "BREAKOUT_SR_GUARD_NG").upper(), "detail": detail}
+            row["breakout_sr_detail"] = detail
+            row["breakout_sr_reason"] = detail.get("reason")
+    except Exception:
+        logger.debug("[BREAKOUT SR GUARD] order builder precheck failed; fail-open", exc_info=True)
+    return _build_entry_order_fob(*args, **kwargs)
