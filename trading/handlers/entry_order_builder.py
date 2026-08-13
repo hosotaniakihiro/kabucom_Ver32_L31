@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import inspect
 import json
 import logging
 import math
@@ -51,7 +52,7 @@ from utils_common import (
     # install() より先に走る」ため、この束縛には一度も掛かっていなかった。
     # 本文化でその挙動が変わらないよう core 実装を明示的に束縛する。
     # (retry 層を通したい呼び出しは関数内 import 側 = _epi_* を参照)
-    _get_latest_bid_ask_core as get_latest_bid_ask,
+    _get_latest_bid_ask_core as _sbr_orig_get_latest_bid_ask,
     calculate_qty_by_budget,
     get_tick_size,
 )
@@ -221,7 +222,7 @@ def _source_uses_low_move_guard(source: str) -> bool:
     return src in ENTRY_ORDER_LOW_MOVE_SOURCES
 
 
-def _get_board_with_retry(symbol: str, *, source: str, side: str) -> Optional[Dict[str, Any]]:
+def _get_board_with_retry_core(symbol: str, *, source: str, side: str) -> Optional[Dict[str, Any]]:
     """
     A/Bローテーションでは、対象銘柄が未登録側にいる瞬間だけ板が取れない。
     SUMMARY_AIの発注直前だけ短時間待って再取得し、即スキップを減らす。
@@ -3396,3 +3397,323 @@ def apply_entry_final_filter_defaults() -> bool:
         except Exception:
             logger.exception("[ENTRY FINAL FILTER FAILOPEN] %s install failed", label)
     return True
+
+
+# ============================================================
+# SUMMARY-AI STRICT BOARD REST CHECK
+# (旧 core/startup/summary_ai_strict_board_rest_patch.py を本文化)
+# ------------------------------------------------------------
+# PUSH ローテーションで板が欠けたときだけ REST /board で実在確認する。
+# 方針は厳格のまま:
+#   - PUSH の板欠けだけでは低流動と判定しない
+#   - REST に実際の bid/ask があればそれを板ソースとして使う
+#   - REST でも板が無ければ STRICT_BOARD_MISSING を維持
+#   - 板が取れないときに close/current/vwap で救済することはしない
+#
+# 実測した合成:
+#   utils_common._get_latest_bid_ask_core   (native)
+#     <- _sbr_get_latest_bid_ask            この層 (= 旧 eob.get_latest_bid_ask)
+#   _get_board_with_retry_core              (eob native)
+#     <- _get_board_with_retry              この層
+# 旧 install() は両方とも `_unwrap_original()` で native まで巻き戻して
+# から包んでいたが、eob のこの 2 属性を包む他パッチは存在しないため
+# 巻き戻しは no-op だった (実測済み)。よって上記の 1 枚被せと等価。
+#
+# なお eob native の _get_board_with_retry_core はモジュールグローバルの
+# get_latest_bid_ask を呼ぶので、旧構成と同じく
+# 「retry ループの各回が strict REST チェックを通る」入れ子になる。
+# ============================================================
+
+_SBR_VERSION = "V10-SUMMARY-AI-FORCE-REST-BOARD-CHECK-ON-MISSING"
+_SBR_INSTALLED = False
+
+
+def _sbr_env_bool(name: str, default: bool = False) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _sbr_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
+
+
+def _sbr_safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
+
+
+def _sbr_extract_bid_ask(board: Any) -> tuple[float, float, float, float]:
+    if isinstance(board, (tuple, list)) and len(board) >= 2:
+        return _sbr_safe_float(board[0]), _sbr_safe_float(board[1]), 0.0, 0.0
+    if not isinstance(board, dict):
+        return 0.0, 0.0, 0.0, 0.0
+    buy1 = board.get("Buy1") if isinstance(board.get("Buy1"), dict) else {}
+    sell1 = board.get("Sell1") if isinstance(board.get("Sell1"), dict) else {}
+    bid = _sbr_safe_float(board.get("bid_price") or board.get("bid") or board.get("best_bid") or board.get("BidPrice") or board.get("BestBid") or buy1.get("Price"), 0.0)
+    ask = _sbr_safe_float(board.get("ask_price") or board.get("ask") or board.get("best_ask") or board.get("AskPrice") or board.get("BestAsk") or sell1.get("Price"), 0.0)
+    bid_qty = _sbr_safe_float(board.get("bid_qty") or board.get("BidQty") or board.get("bid_volume") or board.get("BestBidQty") or buy1.get("Qty"), 0.0)
+    ask_qty = _sbr_safe_float(board.get("ask_qty") or board.get("AskQty") or board.get("ask_volume") or board.get("BestAskQty") or sell1.get("Qty"), 0.0)
+    return bid, ask, bid_qty, ask_qty
+
+
+def _sbr_valid_board(board: Any) -> bool:
+    try:
+        bid, ask, _, _ = _sbr_extract_bid_ask(board)
+        return bid > 0 and ask > 0
+    except Exception:
+        return False
+
+
+def _sbr_summary_like(source: str) -> bool:
+    s = str(source or "").strip().upper()
+    return s in {"SUMMARY_AI", "SUMMARY", "PUSH_SUMMARY", "STOCK_SUMMARY", "PUSH", "SUMMARY_AI_ORDER_BUILDER"}
+
+
+def _sbr_norm_side(v: Any) -> str:
+    s = str(v or "").strip().upper()
+    if s in {"BUY", "LONG", "2", "買", "買い"}:
+        return "BUY"
+    if s in {"SELL", "SHORT", "1", "売", "売り"}:
+        return "SELL"
+    return s
+
+
+def _sbr_row_summary_like(row: Any) -> bool:
+    if not isinstance(row, dict):
+        return False
+    joined = "|".join(
+        str(row.get(k) or "").upper()
+        for k in ("source", "entry_source", "entry_type", "pipeline_source", "reason", "ai_reason", "model_used")
+    )
+    if "SUMMARY_AI" in joined or "SRC=SUMMARY" in joined:
+        return True
+    if str(row.get("source") or "").strip().upper() in {"SUMMARY", "SUMMARY_AI", "PUSH_SUMMARY", "PUSH"}:
+        return True
+    if str(row.get("entry_type") or "").strip().upper() == "SUMMARY_AI":
+        return True
+    try:
+        if bool(row.get("ai_gate_allow") or row.get("preapproved") or row.get("summary_ai_ok")):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _sbr_apply_hard_board_policy() -> None:
+    os.environ["ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY"] = "1"
+    os.environ["ENTRY_BOARD_MISSING_HARD_BLOCK"] = "1"
+    os.environ["ENTRY_LIMIT_ALLOW_WITHOUT_BOARD"] = "0"
+    os.environ["ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"] = "0"
+    # Disable price/close fallback. REST board verification is still allowed.
+    os.environ["SUMMARY_AI_ALLOW_BOARD_REST_RESCUE"] = "0"
+    os.environ["SUMMARY_AI_CLOSE_LIMIT_FALLBACK_ON_BOARD_MISSING"] = "0"
+    os.environ["SUMMARY_AI_BOARD_MISSING_LIMIT_FALLBACK"] = "0"
+    os.environ.setdefault("SUMMARY_AI_REST_BOARD_CHECK_ON_MISSING", "1")
+    os.environ.setdefault("SUMMARY_AI_REST_BOARD_TIMEOUT_SEC", "2.0")
+    # 旧パッチは entry_order_builder を import して setattr していたが、
+    # 本文化でこのモジュール自身が対象になったので globals() へ直接入れる
+    # (モジュール辞書は同じオブジェクトなので効果は同一)。
+    for name, value in (
+        ("ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY", True),
+        ("ENTRY_BOARD_MISSING_HARD_BLOCK", True),
+        ("ENTRY_LIMIT_ALLOW_WITHOUT_BOARD", False),
+        ("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", False),
+    ):
+        try:
+            globals()[name] = value
+        except Exception:
+            pass
+
+
+def _sbr_infer_source_from_stack() -> tuple[str, str]:
+    source = ""
+    side = ""
+    summary_stack = False
+    try:
+        for frame in inspect.stack(context=0)[:18]:
+            fn = str(getattr(frame, "function", ""))
+            filename = str(getattr(frame, "filename", "")).replace("\\", "/").lower()
+            loc = getattr(frame, "frame", None).f_locals if getattr(frame, "frame", None) is not None else {}
+            row = loc.get("entry_row") or loc.get("row") or loc.get("row_d")
+            item = loc.get("item") or loc.get("item_d")
+            if isinstance(item, dict) and not isinstance(row, dict):
+                row = item.get("entry") if isinstance(item.get("entry"), dict) else item
+            if _sbr_row_summary_like(row):
+                summary_stack = True
+                source = str(loc.get("source") or loc.get("entry_source") or (row.get("source") if isinstance(row, dict) else "") or source or "SUMMARY_AI")
+                side = _sbr_norm_side(loc.get("side") or loc.get("entry_side") or (row.get("side") if isinstance(row, dict) else "") or (row.get("entry_decision") if isinstance(row, dict) else "") or side)
+            if filename.endswith("trading/handlers/entry_order_builder.py") and fn in {"_get_board_with_retry", "build_entry_order"}:
+                summary_stack = True
+                source = str(loc.get("source") or loc.get("entry_source") or source or "SUMMARY_AI_ORDER_BUILDER")
+                side = _sbr_norm_side(loc.get("side") or loc.get("entry_side") or side)
+                break
+            if not side:
+                side = _sbr_norm_side(loc.get("side") or loc.get("entry_side") or loc.get("ai_side"))
+            if not source:
+                source = str(loc.get("source") or loc.get("entry_source") or "")
+    except Exception:
+        pass
+    if summary_stack and not _sbr_summary_like(source):
+        source = "SUMMARY_AI_ORDER_BUILDER"
+    return source or "", side or ""
+
+
+def _sbr_fetch_rest_board(symbol: Any, *, side: str = "", source: str = "") -> Any:
+    try:
+        from kabu_api import board_retry as brp
+        old_enabled = os.environ.get("ENTRY_BOARD_REST_DIRECT_ENABLED")
+        old_timeout = os.environ.get("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC")
+        desired_timeout = max(1.0, _sbr_env_float("SUMMARY_AI_REST_BOARD_TIMEOUT_SEC", 2.0))
+        os.environ["ENTRY_BOARD_REST_DIRECT_ENABLED"] = "1"
+        if _sbr_env_float("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", 0.0) < desired_timeout:
+            os.environ["ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC"] = str(desired_timeout)
+        try:
+            logger.warning(
+                "[SUMMARY AI STRICT BOARD REST] REST board check start symbol=%s side=%s source=%s timeout=%.2fs version=%s",
+                symbol,
+                side,
+                source,
+                _sbr_env_float("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", desired_timeout),
+                _SBR_VERSION,
+            )
+            return brp._fetch_board_rest(str(symbol), side=side, source=source or "SUMMARY_AI_REST_BOARD_CHECK")
+        finally:
+            if old_enabled is None:
+                os.environ.pop("ENTRY_BOARD_REST_DIRECT_ENABLED", None)
+            else:
+                os.environ["ENTRY_BOARD_REST_DIRECT_ENABLED"] = old_enabled
+            if old_timeout is None:
+                os.environ.pop("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", None)
+            else:
+                os.environ["ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC"] = old_timeout
+    except Exception:
+        logger.exception("[SUMMARY AI STRICT BOARD REST] REST board check failed symbol=%s side=%s source=%s version=%s", symbol, side, source, _SBR_VERSION)
+        return None
+
+
+def _sbr_board_or_rest_check(board: Any, symbol: Any, *, side: str = "", source: str = "", inferred: str = "") -> Any:
+    if _sbr_valid_board(board):
+        return board
+    if not _sbr_env_bool("SUMMARY_AI_REST_BOARD_CHECK_ON_MISSING", True):
+        return board
+    stack_source, stack_side = _sbr_infer_source_from_stack()
+    if not source or not _sbr_summary_like(source):
+        source = stack_source or source
+    side = side or stack_side
+    if not source and str(inferred or "") in {"_get_board_with_retry", "get_latest_bid_ask"}:
+        # _get_board_with_retry often receives no source kwarg. When it is reached from the
+        # Summary-AI order builder, keep the strict policy but still verify via REST /board.
+        source = "SUMMARY_AI_ORDER_BUILDER"
+    source_u = str(source or "").strip().upper()
+    if not _sbr_summary_like(source_u):
+        logger.debug(
+            "[SUMMARY AI STRICT BOARD REST] REST board check skipped non-summary source symbol=%s side=%s source=%s inferred=%s version=%s",
+            symbol,
+            side,
+            source_u,
+            inferred,
+            _SBR_VERSION,
+        )
+        return board
+    rest = _sbr_fetch_rest_board(symbol, side=side, source=source_u or "SUMMARY_AI_REST_BOARD_CHECK")
+    if _sbr_valid_board(rest):
+        bid, ask, bid_qty, ask_qty = _sbr_extract_bid_ask(rest)
+        logger.warning(
+            "[SUMMARY AI STRICT BOARD REST] REST board verified after push-missing symbol=%s side=%s source=%s bid=%s ask=%s bid_qty=%s ask_qty=%s version=%s",
+            symbol, side, source_u, bid, ask, bid_qty, ask_qty, _SBR_VERSION,
+        )
+        return rest
+    logger.warning(
+        "[SUMMARY AI STRICT BOARD REST] board missing confirmed by REST symbol=%s side=%s source=%s inferred=%s hard_block=1 version=%s",
+        symbol, side, source_u, inferred, _SBR_VERSION,
+    )
+    return board
+
+# 旧 install() は _unwrap_original() で native を掴んでいた。
+# 本文化では素の実装をそのまま束縛する。
+_SBR_ORIG_GET_LATEST_BID_ASK = _sbr_orig_get_latest_bid_ask
+_SBR_ORIG_GET_BOARD_WITH_RETRY = _get_board_with_retry_core
+
+
+def get_latest_bid_ask(symbol: Any, *args: Any, **kwargs: Any):
+    """旧 _patched_get_latest_bid_ask (eob.get_latest_bid_ask 差し替え)。"""
+    source = str(kwargs.get("source") or "").strip().upper()
+    side = _sbr_norm_side(kwargs.get("side"))
+    inferred = "get_latest_bid_ask"
+    if not source:
+        inferred_source, inferred_side = _sbr_infer_source_from_stack()
+        inferred = inferred_source or inferred
+        source = inferred_source
+        side = side or inferred_side
+    try:
+        board = _SBR_ORIG_GET_LATEST_BID_ASK(symbol, *args, **kwargs)
+    except TypeError:
+        board = _SBR_ORIG_GET_LATEST_BID_ASK(symbol)
+    return _sbr_board_or_rest_check(board, symbol, side=side, source=source, inferred=inferred)
+
+
+def _get_board_with_retry(symbol: Any, *args: Any, **kwargs: Any):
+    """旧 _patched_get_board_with_retry (eob._get_board_with_retry 差し替え)。"""
+    source = str(kwargs.get("source") or "").strip().upper()
+    side = _sbr_norm_side(kwargs.get("side"))
+    if not source:
+        inferred_source, inferred_side = _sbr_infer_source_from_stack()
+        source = inferred_source
+        side = side or inferred_side
+    try:
+        board = _SBR_ORIG_GET_BOARD_WITH_RETRY(symbol, *args, **kwargs)
+    except TypeError:
+        board = _SBR_ORIG_GET_BOARD_WITH_RETRY(symbol)
+    return _sbr_board_or_rest_check(board, symbol, side=side, source=source, inferred="_get_board_with_retry")
+
+
+def apply_strict_board_rest_policy() -> bool:
+    """旧 summary_ai_strict_board_rest_patch.install() の残り。
+
+    board wrapper の設置は本文化で不要になったので、env / 定数の強制と
+    連鎖していた board missing defer の import だけを行う。
+    """
+    global _SBR_INSTALLED
+    try:
+        # summary_ai_board_missing_defer_patch は
+        # core/startup/summary_ai_async_entry_patch.py の
+        # _summary_ai_direct_snapshot_execute へ本文化済み (_bmd_*)。
+        # env / 定数の適用も同ファイルの _bmd_apply_runtime_policies() が
+        # import 時に行うので、ここでは import するだけでよい。
+        try:
+            import core.startup.summary_ai_async_entry_patch as _ap  # noqa: F401
+
+            board_defer = True
+        except Exception:
+            board_defer = False
+            logger.exception("[SUMMARY AI STRICT BOARD REST] board missing defer import failed")
+        _sbr_apply_hard_board_policy()
+        if not _SBR_INSTALLED:
+            _SBR_INSTALLED = True
+            logger.warning(
+                "[SUMMARY AI STRICT BOARD REST] installed REST board check for push-rotation missing; hard block remains board_defer=%s board_wrappers=native close_limit_fallback=0 version=%s",
+                board_defer,
+                _SBR_VERSION,
+            )
+        return True
+    except Exception:
+        logger.exception("[SUMMARY AI STRICT BOARD REST] install failed version=%s", _SBR_VERSION)
+        return False
+
+
+_sbr_apply_hard_board_policy()

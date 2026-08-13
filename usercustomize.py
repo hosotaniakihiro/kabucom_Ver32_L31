@@ -125,22 +125,21 @@ def _install_summary_ai_fast_order_builder() -> bool:
         # 旧 install が連鎖していた 2 つはここから直接呼ぶ。
         import trading.handlers.entry_order_builder as _eob  # noqa: F401
 
+        # summary_ai_strict_board_rest_patch は eob へ本文化済み
+        # (_sbr_* / get_latest_bid_ask / _get_board_with_retry)。
+        # 板 wrapper の設置は不要になったので、残る env・定数の強制
+        # (と連鎖していた board missing defer の import) だけを呼ぶ。
+        # breakout_support_resistance_guard_patch も本文化済み:
+        #   trading/handlers/entry_order_builder.build_entry_order (_bsr_*)
+        #   trading/entry/summary_ai/executor の
+        #     _base_filter_blocked_ai_ok_items / _sort_key
         ok = True
-        for _mod_name, _label in (
-            ("core.startup.summary_ai_strict_board_rest_patch", "strict board policy"),
-            # breakout_support_resistance_guard_patch は本文化済み:
-            #   trading/handlers/entry_order_builder.build_entry_order (_bsr_*)
-            #   trading/entry/summary_ai/executor の
-            #     _base_filter_blocked_ai_ok_items / _sort_key
-        ):
-            try:
-                _m = __import__(_mod_name, fromlist=["install"])
-                _fn = getattr(_m, "install", None)
-                _r = bool(_fn()) if callable(_fn) else False
-                logger.warning("[USERCUSTOMIZE] %s chain installed=%s", _label, _r)
-            except Exception:
-                ok = False
-                logger.exception("[USERCUSTOMIZE] %s chain install failed", _label)
+        try:
+            _r = bool(_eob.apply_strict_board_rest_policy())
+            logger.warning("[USERCUSTOMIZE] strict board policy chain installed=%s", _r)
+        except Exception:
+            ok = False
+            logger.exception("[USERCUSTOMIZE] strict board policy chain install failed")
         logger.warning(
             "[USERCUSTOMIZE] summary AI fast order builder ok=%s retry_sec=%s retry_interval=%s",
             ok,
