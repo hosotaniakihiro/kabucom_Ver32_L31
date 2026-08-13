@@ -186,7 +186,11 @@ def _install_summary_ai_direct_timeout_continue(context: str) -> bool:
 
 
 def _install_summary_ai_atr_1m_filter_repair(context: str) -> bool:
-    return _safe_install("summary AI ATR 1m filter repair", context, TRADING_CONTEXTS, "DISABLE_SUMMARY_AI_ATR_1M_FILTER_REPAIR_PATCH", "summary_ai_atr_1m_filter_repair_patch")
+    # summary_ai_atr_1m_filter_repair_patch は
+    # trading/handlers/entry_controller.py の atr_1m_filter へ本文化済み (_ar1_*)。
+    # 旧 install の watcher (60 loops x 1s) は、この属性を包む他パッチが
+    # 無くなったため不要になった。
+    return True
 
 
 def _install_summary_parallel_executor_reset(context: str) -> bool:
