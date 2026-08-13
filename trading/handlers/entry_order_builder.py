@@ -2061,7 +2061,7 @@ def _elp_apply_constants() -> None:
     _aggressive_limit_price = _elp_board_touch_limit_price
 
 
-def _build_entry_order_elp(*args, **kwargs):
+def build_entry_order(*args, **kwargs):
     ret = _build_entry_order_epi(*args, **kwargs)
     try:
         src = str(kwargs.get("source") or "").upper()
@@ -2100,245 +2100,20 @@ def _build_entry_order_elp(*args, **kwargs):
 _elp_apply_constants()
 
 
-# ============================================================
-# ENTRY ORDER MTF SLOPE FILL
-# (旧 core/startup/entry_order_mtf_slope_fill_patch.py を本文化)
 # ------------------------------------------------------------
-# 発注前に entry_row の MTF (3m/5m) の傾き・high/low を summary DB から
-# 補ってから本体へ渡す。前段フィルタで「データ欠け」を理由に落ちるのを防ぐ。
+# entry_order_mtf_slope_fill_patch について
+# ------------------------------------------------------------
+# 同パッチの build_entry_order ラッパー (発注前に entry_row の 3m/5m 傾きと
+# high/low を summary DB から補う前処理) は **移植していない**。
 #
-# チェーン (すべて本ファイル内):
-#   _build_entry_order_core (native)
-#     <- _build_entry_order_fob  SUMMARY_AI fast path
-#       <- _build_entry_order_bsr 支持線/抵抗線ガード
-#         <- _build_entry_order_epi 指値の有利側寄せ
-#           <- _build_entry_order_elp 板タッチ + SUMMARY_AI 厳格ガード
-#             <- build_entry_order    この層 (前処理)
+# 実 install 順で直後に入る entry_order_short_mtf_neutral_rescue_patch が
+#   _ORIGINAL = getattr(original, "_original", original)
+# で 1 段剥がすため、mtf 層は捨てられて一度も実行されていなかった。
+# HEAD~1 の両パッチを実 install 順で組み立てて build_entry_order を呼び、
+# 前処理に到達しないことを実測で確認済み。
 #
-# 旧 install が連鎖していた summary_no_overlap / short_mtf_neutral_rescue は
-# 呼び出し元へ移した。
-# ============================================================
-
-_MTF__INSTALLED = False
-_MTF__ORIGINAL = None
-
-
-def _mtf_today() -> str:
-    return dt.datetime.now().strftime("%Y%m%d")
-
-
-def _mtf_summary_db_path() -> str:
-    base = os.getenv(
-        "SUMMARY_DB_DIR",
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary",
-    )
-    return os.getenv("SUMMARY_DB_PATH", str(Path(base) / f"summary{_mtf_today()}.db"))
-
-
-def _mtf_norm_symbol(v: Any) -> str:
-    s = str(v or "").strip()
-    if s.endswith(".0"):
-        s = s[:-2]
-    if s.endswith(".T"):
-        s = s[:-2]
-    return s
-
-
-def _mtf_qident(name: Any) -> str:
-    return '"' + str(name).replace('"', '""') + '"'
-
-
-def _mtf_safe_float_or_none(v: Any) -> Optional[float]:
-    try:
-        if v is None:
-            return None
-        s = str(v).strip()
-        if not s or s.lower() in {"nan", "none", "<na>"}:
-            return None
-        x = float(s)
-        if x != x:
-            return None
-        return x
-    except Exception:
-        return None
-
-
-def _mtf_is_missing(v: Any) -> bool:
-    return _mtf_safe_float_or_none(v) is None
-
-
-def _mtf_table_exists(conn: sqlite3.Connection, table: str) -> bool:
-    try:
-        return conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-            (table,),
-        ).fetchone() is not None
-    except Exception:
-        return False
-
-
-def _mtf_cols(conn: sqlite3.Connection, table: str) -> set[str]:
-    try:
-        return {str(r[1]) for r in conn.execute(f"PRAGMA table_info({_mtf_qident(table)})").fetchall()}
-    except Exception:
-        return set()
-
-
-def _mtf_read_latest_summary_values(symbol: str, interval: int) -> dict[str, Any]:
-    path = _mtf_summary_db_path()
-    table = f"stock_summary_{int(interval)}min"
-    if not symbol or not Path(path).exists():
-        return {}
-
-    try:
-        with sqlite3.connect(path, timeout=1.0) as conn:
-            conn.execute("PRAGMA busy_timeout=1000;")
-            if not _mtf_table_exists(conn, table):
-                return {}
-            cols = _mtf_cols(conn, table)
-            if "symbol" not in cols or "datetime" not in cols:
-                return {}
-
-            want = [
-                "symbol", "datetime", "slope", "slope_atr_scaled", "score_slope",
-                "mtf", "score_mtf", "mtf_score", "score_mtf_daily", "score_mtf_short",
-                "ranking_score", "ranking_score_total", "ranking_type", "rank", "change_rate", "turnover",
-            ]
-            select_cols = [c for c in want if c in cols]
-            if not select_cols:
-                return {}
-
-            select_cols_sql = ", ".join(_mtf_qident(c) for c in select_cols)
-            sql = (
-                f"SELECT {select_cols_sql} "
-                f"FROM {_mtf_qident(table)} WHERE CAST({_mtf_qident('symbol')} AS TEXT)=? "
-                f"ORDER BY {_mtf_qident('datetime')} DESC LIMIT 1"
-            )
-            row = conn.execute(sql, (symbol,)).fetchone()
-            if not row:
-                return {}
-            return dict(zip(select_cols, row))
-    except Exception:
-        logger.debug(
-            "[ENTRY ORDER MTF SLOPE FILL] read latest summary failed symbol=%s interval=%s path=%s",
-            symbol,
-            interval,
-            path,
-            exc_info=True,
-        )
-        return {}
-
-
-def _mtf_try_enrich_one_row(row: dict[str, Any]) -> dict[str, Any]:
-    try:
-        from trading.summary.controller_enrich import enrich_summary_latest
-
-        interval = int(float(row.get("interval") or 1))
-        df = pd.DataFrame([row])
-        out = enrich_summary_latest(df, interval=interval, context="entry-order-prebuild")
-        if isinstance(out, pd.DataFrame) and not out.empty:
-            merged = dict(row)
-            enriched = out.iloc[0].to_dict()
-            for k, v in enriched.items():
-                if k not in merged or merged.get(k) in (None, ""):
-                    merged[k] = v
-                elif k in {"mtf", "score_mtf", "mtf_score", "ranking_score", "ranking_score_total"}:
-                    old = _mtf_safe_float_or_none(merged.get(k))
-                    new = _mtf_safe_float_or_none(v)
-                    if (old is None or old == 0.0) and new not in (None, 0.0):
-                        merged[k] = new
-            return merged
-    except Exception:
-        logger.debug("[ENTRY ORDER MTF SLOPE FILL] enrich one row failed", exc_info=True)
-    return row
-
-
-def _mtf_fill_entry_row(entry_row: Any, *, symbol: str, side: str, source: str) -> Any:
-    if not isinstance(entry_row, dict):
-        return entry_row
-    if str(source or "").upper() != "SUMMARY_AI":
-        return entry_row
-
-    row = dict(entry_row)
-    symbol = _mtf_norm_symbol(symbol or row.get("symbol"))
-    row["symbol"] = symbol
-
-    row = _mtf_try_enrich_one_row(row)
-
-    filled = {}
-    for iv in (1, 3, 5):
-        vals = _mtf_read_latest_summary_values(symbol, iv)
-        slope_val = _mtf_safe_float_or_none(vals.get("slope_atr_scaled")) if vals else None
-        if slope_val is None and vals:
-            slope_val = _mtf_safe_float_or_none(vals.get("slope"))
-        if slope_val is None and iv == int(float(row.get("interval") or 1)):
-            slope_val = _mtf_safe_float_or_none(row.get("slope_atr_scaled"))
-            if slope_val is None:
-                slope_val = _mtf_safe_float_or_none(row.get("slope"))
-
-        if slope_val is not None:
-            for key in (f"slope_atr_scaled_{iv}m", f"slope_{iv}m"):
-                if _mtf_is_missing(row.get(key)):
-                    row[key] = slope_val
-                    filled[key] = slope_val
-
-        if vals:
-            for key in ("mtf", "score_mtf", "mtf_score"):
-                cand = None
-                for src_key in (key, "score_mtf", "score_mtf_daily", "mtf_score"):
-                    cand = _mtf_safe_float_or_none(vals.get(src_key))
-                    if cand not in (None, 0.0):
-                        break
-                old = _mtf_safe_float_or_none(row.get(key))
-                if (old is None or old == 0.0) and cand not in (None, 0.0):
-                    row[key] = cand
-                    filled[key] = cand
-            for key in ("ranking_score", "ranking_score_total", "rank", "change_rate", "turnover"):
-                old = _mtf_safe_float_or_none(row.get(key))
-                cand = _mtf_safe_float_or_none(vals.get(key))
-                if (old is None or old == 0.0) and cand not in (None, 0.0):
-                    row[key] = cand
-                    filled[key] = cand
-            for key in ("ranking_type",):
-                if not str(row.get(key) or "").strip() and str(vals.get(key) or "").strip():
-                    row[key] = vals.get(key)
-                    filled[key] = vals.get(key)
-
-    current_slope = _mtf_safe_float_or_none(row.get("slope_atr_scaled"))
-    if current_slope is None:
-        current_slope = _mtf_safe_float_or_none(row.get("slope"))
-    if current_slope is not None:
-        for iv in (1, 3, 5):
-            for key in (f"slope_atr_scaled_{iv}m", f"slope_{iv}m"):
-                if _mtf_is_missing(row.get(key)):
-                    row[key] = current_slope
-                    filled[key] = current_slope
-
-    if filled:
-        logger.info(
-            "[ENTRY ORDER MTF SLOPE FILL] symbol=%s side=%s source=%s filled=%s",
-            symbol,
-            side,
-            source,
-            filled,
-        )
-    return row
-
-
-def build_entry_order(*args, **kwargs):
-    try:
-        entry_row = kwargs.get("entry_row")
-        symbol = kwargs.get("symbol")
-        side = kwargs.get("side")
-        source = kwargs.get("source")
-        if isinstance(entry_row, dict):
-            kwargs = dict(kwargs)
-            kwargs["entry_row"] = _mtf_fill_entry_row(
-                entry_row,
-                symbol=str(symbol or entry_row.get("symbol") or ""),
-                side=str(side or entry_row.get("side") or entry_row.get("entry_decision") or ""),
-                source=str(source or entry_row.get("source") or ""),
-            )
-    except Exception:
-        logger.exception("[ENTRY ORDER MTF SLOPE FILL] prefill failed")
-    return _build_entry_order_elp(*args, **kwargs)
+# 本文へ組み込むと「今まで動いていなかった前埋め」が有効になり、
+# 前段フィルタの通過率が変わってしまうため、意図的に移していない。
+# 有効化したい場合は旧パッチの _fill_entry_row 相当をここへ足すこと
+# (env: 旧パッチは無条件だった)。
+# ------------------------------------------------------------
