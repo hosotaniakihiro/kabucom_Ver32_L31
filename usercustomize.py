@@ -244,14 +244,9 @@ def _install_summary_pending_age_relax() -> bool:
             old, new = _pending_age_relax_raise_min_env(name, minimum)
             changed[name] = {"old": old, "new": new}
 
-        # summary_entry_pending_existing_fix_patch は env 値を都度動的に読むので、
-        # 再installしても無害 (念のため未installなら確実に有効化しておく)。
-        try:
-            from core.startup import summary_entry_pending_existing_fix_patch
-
-            summary_entry_pending_existing_fix_patch.install()
-        except Exception:
-            logger.debug("[USERCUSTOMIZE] summary pending age relax: existing fix install check skipped", exc_info=True)
+        # summary_entry_pending_existing_fix_patch は
+        # trading/summary/summary_entry.register_pending_entries へ本文化済み。
+        # env 値は都度動的に読むので、ここでの再install は不要になった。
 
         logger.warning(
             "[USERCUSTOMIZE] summary pending age relax ok=True max_age=%s (min_age=%s changed=%s)",

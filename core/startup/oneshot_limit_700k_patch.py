@@ -314,14 +314,12 @@ def _install_entry_pipeline_bucket_filter_patch() -> bool:
 
 
 def _install_summary_entry_pending_existing_fix_patch() -> bool:
-    try:
-        from core.startup import summary_entry_pending_existing_fix_patch as p
-        ok = p.install()
-        logger.warning("[ONESHOT LIMIT PATCH] summary_entry_pending_existing_fix_patch installed=%s", ok)
-        return bool(ok)
-    except Exception:
-        logger.exception("[ONESHOT LIMIT PATCH] summary_entry_pending_existing_fix_patch install failed")
-        return False
+    """summary_entry_pending_existing_fix_patch は
+    trading/summary/summary_entry.register_pending_entries へ本文化済み
+    (native <- existing_fix <- direct_timeout_continue の2層。
+     スコープは同ファイルの _rpe_scope_enabled() が再現)。
+    """
+    return True
 
 
 def _install_entry_direction_failopen_patch() -> bool:

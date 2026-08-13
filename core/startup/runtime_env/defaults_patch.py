@@ -179,7 +179,10 @@ def _force_install_summary_ai_safety_guard(context: str) -> bool:
 
 
 def _install_summary_ai_direct_timeout_continue(context: str) -> bool:
-    return _safe_install("summary AI direct timeout continue", context, TRADING_CONTEXTS, "DISABLE_SUMMARY_AI_DIRECT_TIMEOUT_CONTINUE_PATCH", "summary_ai_direct_timeout_continue_patch")
+    # summary_ai_direct_timeout_continue_patch の pending freshness guard は
+    # trading/summary/summary_entry.register_pending_entries へ本文化済み
+    # (executor 側の direct timeout continue 本体は以前から executor.py に本文化済み)。
+    return context in TRADING_CONTEXTS
 
 
 def _install_summary_ai_atr_1m_filter_repair(context: str) -> bool:
