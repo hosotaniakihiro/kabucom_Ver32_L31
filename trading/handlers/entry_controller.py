@@ -99,7 +99,7 @@ from trading.handlers.entry_handler import (
 )
 
 from AI.entry_row_builder import build_entry_row
-from AI.entry_gate import ai_final_entry_check
+from AI.entry_gate import ai_final_entry_check as _ai_final_entry_check_core
 from AI.entry_gate_tonosama import allow_tonosama_entry
 from AI.entry_gate_sell_tonosama import allow_sell_tonosama_entry
 
@@ -3971,3 +3971,274 @@ def _passes_ai_gate(entry_row: dict, ai: dict, side: str):
     except Exception:
         logger.exception("[ENTRY FINAL GATE RELAX] patched gate failed -> fallback original")
         return _passes_ai_gate_core(entry_row, ai, side)
+
+
+# ============================================================
+# ai_final_entry_check の2層ガード (旧 core/startup の2パッチを本文化)
+# ------------------------------------------------------------
+# 実 install 順を実測した結果、実行時の合成は
+#   native <- summary_ai_entry_controller_bridge <- entry_volume_direction_guard
+# の2層 (main.py:265 の patches -> startup.py:991 の順) だった。同じ順で重ねる。
+#
+#   1層目 _bri_*: SUMMARY_AI 由来の行は事前承認済み AI 結果を再利用する
+#   2層目 _vdg_*: 出来高方向ガード (逆行時の warn-only / 強制 reject)
+#
+# 旧パッチは ec.ai_final_entry_check (モジュール属性) だけを差し替えており、
+# AI.entry_gate 側は素のままだった。ここでも entry_controller 内の名前だけを
+# 束ね直し、native は _ai_final_entry_check_core として import している。
+# 他モジュールは AI.entry_gate から直接 import しているので影響しない。
+#
+# ヘルパは2パッチのものを _bri_ / _vdg_ で名前空間を分けて移植した。
+# ============================================================
+
+_BRI_VERSION = "V15-SUMMARY-AI-ENTRY-BRIDGE"
+_VDG_VERSION = "V3-ENTRY-VOLUME-DIRECTION-GUARD"
+
+
+def _ai_final_entry_check_bridge(entry_row):
+    """1層目: SUMMARY_AI 事前承認結果の再利用 (旧 bridge patch)。"""
+    try:
+        if isinstance(entry_row, dict) and _bri_is_summary_ai_row(entry_row):
+            result = _bri_summary_ai_result(entry_row)
+            logger.info(
+                "[SUMMARY AI ENTRY BRIDGE] preapproved AI reused symbol=%s side=%s conf=%s score_buy=%s score_sell=%s source=%s interval=%s",
+                entry_row.get("symbol"),
+                entry_row.get("side") or entry_row.get("entry_decision"),
+                result.get("confidence"),
+                entry_row.get("score_buy", entry_row.get("buy_score")),
+                entry_row.get("score_sell", entry_row.get("sell_score")),
+                entry_row.get("source"),
+                entry_row.get("interval"),
+            )
+            return result
+    except Exception:
+        logger.exception("[SUMMARY AI ENTRY BRIDGE] preapproved check failed; fallback original")
+    return _ai_final_entry_check_core(entry_row)
+
+
+def _bri_safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or v == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _bri_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return max(0.0, float(v))
+    except Exception:
+        return float(default)
+
+
+def _bri_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
+
+
+def _bri_norm_source(v: Any) -> str:
+    try:
+        return str(v or "").strip().upper()
+    except Exception:
+        return ""
+
+
+def _bri_has_payload(v: Any) -> bool:
+    if isinstance(v, (list, tuple, set, dict)):
+        return len(v) > 0
+    return bool(v)
+
+
+def _bri_is_summary_ai_row(row: Any) -> bool:
+    if not isinstance(row, dict):
+        return False
+    entry_type = _bri_norm_source(row.get("entry_type"))
+    source = _bri_norm_source(row.get("source"))
+    reason = _bri_norm_source(row.get("reason") or row.get("ai_reason"))
+    return entry_type == "SUMMARY_AI" or source == "SUMMARY" or "SRC=SUMMARY" in reason
+
+
+def _bri_summary_ai_result(row: dict) -> dict:
+    confidence = max(
+        _bri_safe_float(row.get("ai_confidence"), 0.0),
+        _bri_safe_float(row.get("confidence"), 0.0),
+        1.0,
+    )
+    lot_multiplier = max(_bri_safe_float(row.get("lot_multiplier"), 1.0), 1.0)
+    reason = str(row.get("ai_reason") or row.get("reason") or "SUMMARY_AI_PREAPPROVED")
+    return {
+        "allow": True,
+        "confidence": confidence,
+        "lot_multiplier": lot_multiplier,
+        "reason": "SUMMARY_AI_PREAPPROVED|" + reason,
+        "source": "SUMMARY_AI_PREAPPROVED_BRIDGE",
+    }
+
+
+def _vdg_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return bool(default)
+        return str(raw).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _vdg_safe_symbol(row: Any) -> str:
+    try:
+        if isinstance(row, dict):
+            return str(row.get("symbol") or row.get("Symbol") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _vdg_source(row: Any) -> str:
+    try:
+        if isinstance(row, dict):
+            return str(row.get("source") or row.get("pipeline_source") or row.get("entry_type") or "").strip().upper()
+    except Exception:
+        pass
+    return ""
+
+
+def _vdg_merge_reason(new_reason: Any, old_reason: Any) -> str:
+    nr = str(new_reason or "").strip()
+    old = str(old_reason or "").strip()
+    if nr and old and nr not in old:
+        return f"{nr};{old}"
+    return nr or old
+
+
+def _vdg_reason_text(ai: Any) -> str:
+    if not isinstance(ai, dict):
+        return ""
+    vals = []
+    for k in ("reason", "gate_reason", "ai_reason", "detail"):
+        v = ai.get(k)
+        if v is not None:
+            vals.append(str(v))
+    return ";".join(vals)
+
+
+def _vdg_is_tonosama_dedicated_ok(entry_row: Any, ai: Any) -> bool:
+    try:
+        if _vdg_source(entry_row) != "TONOSAMA":
+            return False
+        text = _vdg_reason_text(ai)
+        return "TONOSAMA_DEDICATED_GATE_OK" in text
+    except Exception:
+        return False
+
+
+def _vdg_is_tonosama_soft_candle_reason(reason: str) -> bool:
+    r = str(reason or "")
+    return r in {
+        "TONOSAMA_BUY_REJECT_NO_STRONG_3M5M_BULLISH_CANDLE",
+        "TONOSAMA_SELL_REJECT_NO_STRONG_3M5M_BEARISH_CANDLE",
+    }
+
+
+def _vdg_mark_warn_only(ai: Any, reason: str, vd: dict) -> dict:
+    out = dict(ai) if isinstance(ai, dict) else {}
+    # Original AI gate result is preserved.  Add visibility only.
+    out["volume_direction"] = vd
+    out["volume_direction_warn"] = True
+    out["volume_direction_warn_reason"] = reason
+    out["hard_reject"] = False
+    return out
+
+
+def _vdg_force_reject_ai(ai: Any, reason: str, vd: dict) -> dict:
+    if isinstance(ai, dict):
+        out = dict(ai)
+    else:
+        out = {}
+
+    for k in ("allow", "allowed", "is_allowed", "ai_allow", "passed", "ok"):
+        out[k] = False
+    for k in ("confidence", "ai_confidence", "conf"):
+        out[k] = 0.0
+    out["reason"] = _vdg_merge_reason(reason, out.get("reason"))
+    out["gate_reason"] = _vdg_merge_reason(reason, out.get("gate_reason"))
+    out["ai_reason"] = _vdg_merge_reason(reason, out.get("ai_reason"))
+    out["detail"] = _vdg_merge_reason(reason, out.get("detail"))
+    out["volume_direction"] = vd
+    out["volume_direction_reject"] = True
+    out["hard_reject"] = True
+    return out
+
+
+def ai_final_entry_check(entry_row: dict, *args: Any, **kwargs: Any):
+    ai = _ai_final_entry_check_bridge(entry_row, *args, **kwargs)
+    if not _vdg_env_bool("ENTRY_VOLUME_DIRECTION_GUARD", True):
+        return ai
+    try:
+        from trading.entry.volume_direction_guard import evaluate_volume_direction
+
+        vd = evaluate_volume_direction(entry_row if isinstance(entry_row, dict) else {})
+        if isinstance(ai, dict):
+            ai = dict(ai)
+            ai["volume_direction"] = vd
+        if not vd.get("ok", True):
+            symbol = _vdg_safe_symbol(entry_row)
+            reason = str(vd.get("reason") or "ENTRY_VOLUME_DIRECTION_REJECT")
+
+            if _vdg_env_bool("ENTRY_VOLUME_DIRECTION_TONOSAMA_DEDICATED_OK_WARN_ONLY", True) and _vdg_is_tonosama_dedicated_ok(entry_row, ai) and _vdg_is_tonosama_soft_candle_reason(reason):
+                logger.warning(
+                    "[ENTRY VOLUME DIRECTION GUARD] warn-only TONOSAMA dedicated-ok symbol=%s side=%s reason=%s vol=%.3f move=%.3f trend=%.3f dir=%s source=%s interval=%s",
+                    symbol,
+                    vd.get("side"),
+                    reason,
+                    float(vd.get("volume_surge_ratio") or 0.0),
+                    float(vd.get("price_change_pct") or 0.0),
+                    float(vd.get("trend_score") or 0.0),
+                    vd.get("trend_direction"),
+                    entry_row.get("source") if isinstance(entry_row, dict) else None,
+                    entry_row.get("interval") if isinstance(entry_row, dict) else None,
+                )
+                return _vdg_mark_warn_only(ai, reason, vd)
+
+            logger.warning(
+                "[ENTRY VOLUME DIRECTION GUARD] hard reject symbol=%s side=%s reason=%s vol=%.3f move=%.3f trend=%.3f dir=%s source=%s interval=%s",
+                symbol,
+                vd.get("side"),
+                reason,
+                float(vd.get("volume_surge_ratio") or 0.0),
+                float(vd.get("price_change_pct") or 0.0),
+                float(vd.get("trend_score") or 0.0),
+                vd.get("trend_direction"),
+                entry_row.get("source") if isinstance(entry_row, dict) else None,
+                entry_row.get("interval") if isinstance(entry_row, dict) else None,
+            )
+            return _vdg_force_reject_ai(ai, reason, vd)
+        if vd.get("action") == "WARN":
+            logger.warning(
+                "[ENTRY VOLUME DIRECTION GUARD] warn-only symbol=%s side=%s reason=%s vol=%.3f move=%.3f trend=%.3f dir=%s",
+                _vdg_safe_symbol(entry_row),
+                vd.get("side"),
+                vd.get("reason"),
+                float(vd.get("volume_surge_ratio") or 0.0),
+                float(vd.get("price_change_pct") or 0.0),
+                float(vd.get("trend_score") or 0.0),
+                vd.get("trend_direction"),
+            )
+        return ai
+    except Exception:
+        logger.exception("[ENTRY VOLUME DIRECTION GUARD] evaluation failed")
+        return ai

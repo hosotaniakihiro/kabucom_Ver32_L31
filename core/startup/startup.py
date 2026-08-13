@@ -987,12 +987,8 @@ def _install_entrypoint_runtime_patches() -> None:
     # trading/handlers/entry_controller.py へインライン化済み
     # (パッチ側は空スタブだったので削除した)。
 
-    try:
-        from core.startup.entry_volume_direction_guard_patch import install as install_entry_volume_direction_guard
-
-        install_entry_volume_direction_guard()
-    except Exception:
-        logger.exception("[startup.entrypoint] entry volume direction guard install failed")
+    # entry_volume_direction_guard_patch は trading/handlers/entry_controller.py の
+    # ai_final_entry_check (2層目 _vdg_*) へインライン化済みなので撤去した。
 
     # ranking_entry_fast_runtime_patch は trading/ranking/entry_from_ranking.py
     # (_light_prefilter_rows) と trading/ranking/ranking_technical_store.py

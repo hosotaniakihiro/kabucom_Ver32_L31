@@ -234,33 +234,51 @@ def _copy_if_present(*, src: Dict[str, Any], dst: Dict[str, Any], keys: Iterable
         logger.debug("[SUMMARY_ENTRY] _copy_if_present failed", exc_info=True)
 
 
+# ------------------------------------------------------------
+# 旧 core/startup/summary_ai_entry_controller_bridge_patch.py の
+# _strict_order_executed をここへ本文化 (V1.5)。
+# 旧パッチは install 時にこの関数をまるごと差し替えていた (合成ではない)。
+# approved/registered/entries や executed フラグだけでは成功扱いせず、
+# 実注文の根拠 (件数キー / order 系キー) が取れたときだけ True を返す。
+# ------------------------------------------------------------
+_STRICT_ORDER_KEYS = ("order_id", "OrderId", "orders", "order_ids", "sent_orders", "executed_symbols")
+_STRICT_EXECUTED_COUNT_KEYS = ("executed_count", "order_count", "submitted_count", "sent_count")
+
+
+def _strict_has_payload(v: Any) -> bool:
+    if isinstance(v, (list, tuple, set, dict)):
+        return len(v) > 0
+    return bool(v)
+
+
 def _result_executed(result: Any) -> bool:
+    """実注文が確認できた場合だけ True。approved/registered/entries/pending減少だけでは成功扱いしない。"""
     try:
         if result is None:
             return False
         if isinstance(result, bool):
-            return result
+            # 既存の真偽戻り値は尊重。ただし wrapper が作った dict の executed は下で order根拠付きだけを見る。
+            return bool(result)
         if isinstance(result, dict):
-            if bool(result.get("executed")):
-                return True
-            for key in ("executed_count", "approved_count", "order_count"):
+            for key in _STRICT_EXECUTED_COUNT_KEYS:
                 try:
                     if int(result.get(key) or 0) > 0:
                         return True
                 except Exception:
                     pass
-            for key in ("order_id", "OrderId", "orders", "order_ids", "sent_orders", "executed_symbols"):
-                v = result.get(key)
-                if isinstance(v, (list, tuple, set, dict)):
-                    if len(v) > 0:
-                        return True
-                elif v:
+            for key in _STRICT_ORDER_KEYS:
+                if _strict_has_payload(result.get(key)):
+                    return True
+            for key in ("result", "pipeline_result", "order_result"):
+                child = result.get(key)
+                if child is not result and _result_executed(child):
                     return True
             return False
         if isinstance(result, (list, tuple, set)):
-            return len(result) > 0
-        return bool(result)
+            return any(_result_executed(x) for x in result)
+        return False
     except Exception:
+        logger.exception("[SUMMARY AI ENTRY BRIDGE] strict order result judgement failed result=%s", result)
         return False
 
 
