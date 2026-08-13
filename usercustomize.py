@@ -162,10 +162,13 @@ def _install_summary_ai_board_rest_cooldown() -> bool:
     3つの戦略 install を、同じ位置・同じ順序で実行する。
     """
     results = {}
+    # fibonacci_ev / nve_projection のオーバーレイは
+    # core/startup/summary_ai_strategy_mode_patch.py の
+    # _classify / _strategy_enabled へ本文化済み (合成順も同じ)。
+    # 有効/無効は SUMMARY_AI_FIB_EV_STRATEGY_ENABLED /
+    # SUMMARY_AI_NVE_STRATEGY_ENABLED を各層が見る。
     for label, mod_name in (
         ("strategy_mode", "core.startup.summary_ai_strategy_mode_patch"),
-        ("fibonacci_ev", "core.startup.summary_ai_fibonacci_ev_strategy_patch"),
-        ("nve_projection", "core.startup.summary_ai_nve_projection_strategy_patch"),
     ):
         try:
             import importlib

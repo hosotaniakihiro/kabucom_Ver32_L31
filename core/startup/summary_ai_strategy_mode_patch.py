@@ -133,7 +133,7 @@ def _trend_alignment(row: dict[str, Any], side: str) -> tuple[int, list[str]]:
     return aligned, reasons
 
 
-def _classify(row: dict[str, Any]) -> dict[str, Any]:
+def _classify_core(row: dict[str, Any]) -> dict[str, Any]:
     side = _side(row)
     close = _num(row, "close_price", "price", "current_price", "close", "last_price")
     high = _num(row, "high", "high_price", "HighPrice", "day_high")
@@ -267,7 +267,7 @@ def _enrich(row: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
-def _strategy_enabled(row: dict[str, Any]) -> tuple[bool, str]:
+def _strategy_enabled_core(row: dict[str, Any]) -> tuple[bool, str]:
     if not _env_bool("SUMMARY_AI_STRATEGY_MODE_GUARD_ENABLED", True):
         return True, "disabled"
     mode = str(row.get("strategy_mode") or "").strip().upper()
@@ -399,3 +399,545 @@ except Exception:
 
 
 __all__ = ["VERSION", "install"]
+
+
+# ============================================================
+# 戦略オーバーレイ 2 段
+# (旧 core/startup/summary_ai_fibonacci_ev_strategy_patch.py と
+#  旧 core/startup/summary_ai_nve_projection_strategy_patch.py を本文化)
+# ------------------------------------------------------------
+# 旧構成は usercustomize.py の 3 連 install:
+#   strategy_mode -> fibonacci_ev -> nve_projection
+# の順で、どちらも本モジュールの _classify / _strategy_enabled を
+# closure で捕まえて合成していた。よって実行時は
+#   native <- fibonacci_ev <- nve_projection
+# の 2 層。同じ順序で重ねている。
+#
+# 有効/無効は旧 install() と同じ env をそれぞれの層が見る:
+#   SUMMARY_AI_FIB_EV_STRATEGY_ENABLED (既定 True)
+#   SUMMARY_AI_NVE_STRATEGY_ENABLED    (既定 True)
+# ============================================================
+
+_FIB_INSTALLED = False
+
+
+_FIB_ORIG_CLASSIFY = None
+
+
+_FIB_ORIG_STRATEGY_ENABLED = None
+
+
+def _fib_env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _fib_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
+
+
+def _fib_f(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or v == "":
+            return float(default)
+        if isinstance(v, str):
+            s = v.strip().replace(",", "").replace("円", "").replace("株", "").replace("%", "")
+            if s == "" or s.lower() in {"none", "nan", "null", "<na>", "pd.na", "-", "－", "—"}:
+                return float(default)
+            v = s
+        x = float(v)
+        if x != x:
+            return float(default)
+        return x
+    except Exception:
+        return float(default)
+
+
+def _fib_side(row: dict[str, Any]) -> str:
+    try:
+        s = str(row.get("side") or row.get("ai_side") or row.get("entry_decision") or "BUY").strip().upper()
+        return "SELL" if s in {"SELL", "SHORT", "1", "売", "売り"} else "BUY"
+    except Exception:
+        return "BUY"
+
+
+def _fib_first(row: dict[str, Any], keys: tuple[str, ...], default: Any = None) -> Any:
+    for k in keys:
+        try:
+            v = row.get(k)
+            if v is not None and str(v).strip() != "":
+                return v
+        except Exception:
+            pass
+    for root_key in ("source_row", "ai_row", "_raw", "raw", "features", "metrics"):
+        raw = row.get(root_key)
+        if isinstance(raw, dict):
+            for k in keys:
+                v = raw.get(k)
+                if v is not None and str(v).strip() != "":
+                    return v
+    return default
+
+
+def _fib_num(row: dict[str, Any], *keys: str, default: float = 0.0) -> float:
+    return _fib_f(_fib_first(row, tuple(keys), default), default)
+
+
+def _fib_pct_distance(price: float, level: float) -> float:
+    if price <= 0 or level <= 0:
+        return 999.0
+    return abs(price - level) / price
+
+
+def _fib_levels(row: dict[str, Any]) -> tuple[float, float, float]:
+    close = _fib_num(row, "close_price", "price", "current_price", "close", "last_price")
+    high = _fib_num(
+        row,
+        "swing_high", "recent_high", "intraday_high", "day_high", "today_high", "range_high",
+        "high_1m_max", "high", "high_price", "HighPrice",
+    )
+    low = _fib_num(
+        row,
+        "swing_low", "recent_low", "intraday_low", "day_low", "today_low", "range_low",
+        "low_1m_min", "low", "low_price", "LowPrice",
+    )
+    return close, high, low
+
+
+def _fib_ev_from_row(row: dict[str, Any]) -> tuple[float | None, dict[str, Any]]:
+    # Direct EV / expectancy columns first.
+    for key in (
+        "expected_value", "expectancy", "ev", "EV", "e_value", "e_calc", "e_calculated",
+        "emp_expected_value", "summary_ai_expected_value", "prob_expected_value",
+    ):
+        raw = _fib_first(row, (key,), None)
+        if raw is not None and str(raw).strip() != "":
+            return _fib_f(raw, 0.0), {"source": key}
+
+    # Otherwise compute a small EV from empirical target/risk probabilities if present.
+    p_target = _fib_num(row, "target_prob", "take_profit_prob", "tp_prob", "emp_target_prob", "prob_take", "p_take", default=-1.0)
+    p_risk = _fib_num(row, "risk_prob", "stop_loss_prob", "sl_prob", "emp_risk_prob", "prob_stop", "p_stop", default=-1.0)
+    take = _fib_num(row, "take_profit_pct", "target_pct", "tp_pct", default=_fib_env_float("SUMMARY_AI_EV_DEFAULT_TAKE_PCT", 0.002))
+    stop = _fib_num(row, "stop_loss_pct", "risk_pct", "sl_pct", default=_fib_env_float("SUMMARY_AI_EV_DEFAULT_STOP_PCT", 0.003))
+    # Accept 0-100 or 0-1 probability forms.
+    if p_target > 1.0:
+        p_target /= 100.0
+    if p_risk > 1.0:
+        p_risk /= 100.0
+    if p_target >= 0.0 and p_risk >= 0.0:
+        ev = p_target * abs(take) - p_risk * abs(stop)
+        return ev, {"source": "computed_prob", "p_target": p_target, "p_risk": p_risk, "take": take, "stop": stop}
+    return None, {"source": "missing"}
+
+
+def _fib_overlay(row: dict[str, Any], tags: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(row, dict) or not isinstance(tags, dict):
+        return tags
+    side = _fib_side(row)
+    close, high, low = _fib_levels(row)
+    rng = high - low if high > low else 0.0
+    reasons = [x for x in str(tags.get("strategy_reasons") or "").split("/") if x]
+    fib_score = 0.0
+    fib_zone = "NONE"
+    fib_retrace = 0.0
+    fib_extension = 0.0
+    near = _fib_env_float("SUMMARY_AI_FIB_NEAR_PCT", 0.0035)
+
+    if close > 0 and rng > 0:
+        if side == "BUY":
+            fib382 = high - rng * 0.382
+            fib500 = high - rng * 0.500
+            fib618 = high - rng * 0.618
+            ext1272 = high + rng * 0.272
+            ext1618 = high + rng * 0.618
+            fib_retrace = (high - close) / rng
+            fib_extension = (close - high) / rng if close > high else 0.0
+            if fib382 >= close >= fib618:
+                fib_score += 1.0
+                fib_zone = "BUY_PULLBACK_382_618"
+                reasons.append("fib_buy_pullback_382_618")
+            if _fib_pct_distance(close, fib500) <= near:
+                fib_score += 0.5
+                fib_zone = "BUY_PULLBACK_500"
+                reasons.append("fib_buy_near_50")
+            if close > high:
+                fib_score += 0.4
+                fib_zone = "BUY_EXTENSION_BREAKOUT"
+                reasons.append("fib_buy_extension_breakout")
+            if close >= ext1272:
+                fib_score -= 0.3
+                reasons.append("fib_buy_extension_1272_caution")
+            if close >= ext1618:
+                fib_score -= 0.8
+                reasons.append("fib_buy_extension_1618_overheat")
+                # Overextension is more useful as REVERSAL/exit caution than a fresh BUY add.
+                tags["strategy_reversal_score"] = round(_fib_f(tags.get("strategy_reversal_score"), 0.0) + 0.8, 4)
+        else:
+            fib382 = low + rng * 0.382
+            fib500 = low + rng * 0.500
+            fib618 = low + rng * 0.618
+            ext1272 = low - rng * 0.272
+            ext1618 = low - rng * 0.618
+            fib_retrace = (close - low) / rng
+            fib_extension = (low - close) / rng if close < low else 0.0
+            if fib382 <= close <= fib618:
+                fib_score += 1.0
+                fib_zone = "SELL_PULLBACK_382_618"
+                reasons.append("fib_sell_pullback_382_618")
+            if _fib_pct_distance(close, fib500) <= near:
+                fib_score += 0.5
+                fib_zone = "SELL_PULLBACK_500"
+                reasons.append("fib_sell_near_50")
+            if close < low:
+                fib_score += 0.4
+                fib_zone = "SELL_EXTENSION_BREAKOUT"
+                reasons.append("fib_sell_extension_breakout")
+            if close <= ext1272:
+                fib_score -= 0.3
+                reasons.append("fib_sell_extension_1272_caution")
+            if close <= ext1618:
+                fib_score -= 0.8
+                reasons.append("fib_sell_extension_1618_overheat")
+                tags["strategy_reversal_score"] = round(_fib_f(tags.get("strategy_reversal_score"), 0.0) + 0.8, 4)
+
+        mode = str(tags.get("strategy_mode") or "").upper()
+        if "PULLBACK" in fib_zone:
+            tags["strategy_pullback_score"] = round(_fib_f(tags.get("strategy_pullback_score"), 0.0) + max(0.0, fib_score), 4)
+            # Prefer PULLBACK when it becomes clearly stronger than breakout.
+            if _fib_f(tags.get("strategy_pullback_score"), 0.0) >= _fib_env_float("SUMMARY_AI_STRATEGY_PULLBACK_MIN", 2.0):
+                if mode not in {"REVERSAL", "WATCH_ONLY_REVERSAL"}:
+                    tags["strategy_mode"] = "PULLBACK"
+        elif "EXTENSION_BREAKOUT" in fib_zone:
+            tags["strategy_breakout_score"] = round(_fib_f(tags.get("strategy_breakout_score"), 0.0) + max(0.0, fib_score), 4)
+        elif fib_score < 0:
+            # Do not fully block here; let the strategy guard / blowoff / exit checks do final safety.
+            tags["strategy_breakout_score"] = round(_fib_f(tags.get("strategy_breakout_score"), 0.0) + fib_score, 4)
+
+    ev, ev_detail = _fib_ev_from_row(row)
+    ev_score = 0.0
+    if ev is not None:
+        min_positive = _fib_env_float("SUMMARY_AI_EV_POSITIVE_MIN", 0.0)
+        if ev > min_positive:
+            ev_score = min(0.8, ev / max(0.0001, _fib_env_float("SUMMARY_AI_EV_SCORE_UNIT", 0.002)))
+            reasons.append("ev_positive")
+        elif ev < _fib_env_float("SUMMARY_AI_EV_NEGATIVE_MAX", -0.0005):
+            ev_score = -0.8
+            reasons.append("ev_negative")
+        # EV is strategy-agnostic quality. Apply to the current winning trend-follow mode.
+        mode = str(tags.get("strategy_mode") or "").upper()
+        if mode == "PULLBACK":
+            tags["strategy_pullback_score"] = round(_fib_f(tags.get("strategy_pullback_score"), 0.0) + ev_score, 4)
+        elif mode in {"BREAKOUT", ""}:
+            tags["strategy_breakout_score"] = round(_fib_f(tags.get("strategy_breakout_score"), 0.0) + ev_score, 4)
+        elif mode == "REVERSAL":
+            tags["strategy_reversal_score"] = round(_fib_f(tags.get("strategy_reversal_score"), 0.0) + ev_score, 4)
+
+    # Recompute mode/score after overlay, but keep disabled reversal as watch-only unless explicitly enabled.
+    scores = {
+        "BREAKOUT": _fib_f(tags.get("strategy_breakout_score"), 0.0),
+        "PULLBACK": _fib_f(tags.get("strategy_pullback_score"), 0.0),
+        "REVERSAL": _fib_f(tags.get("strategy_reversal_score"), 0.0),
+    }
+    mode = max(scores, key=scores.get)
+    if mode == "REVERSAL" and not _fib_env_bool("SUMMARY_AI_STRATEGY_ENABLE_REVERSAL", False):
+        if scores[mode] < _fib_env_float("SUMMARY_AI_STRATEGY_REVERSAL_STRONG_MIN", 3.2):
+            mode = "WATCH_ONLY_REVERSAL"
+    tags.update({
+        "strategy_mode": mode,
+        "strategy_score": round(scores.get(mode.replace("WATCH_ONLY_", ""), scores.get(mode, 0.0)), 4),
+        "strategy_fib_score": round(fib_score, 4),
+        "strategy_fib_zone": fib_zone,
+        "strategy_fib_retrace": round(fib_retrace, 4),
+        "strategy_fib_extension": round(fib_extension, 4),
+        "strategy_expected_value": None if ev is None else round(float(ev), 6),
+        "strategy_ev_score": round(ev_score, 4),
+        "strategy_ev_detail": ev_detail,
+        "strategy_reasons": "/".join(dict.fromkeys(reasons))[:700],
+    })
+    return tags
+
+
+_NVE_INSTALLED = False
+
+
+_NVE_ORIG_CLASSIFY = None
+
+
+_NVE_ORIG_STRATEGY_ENABLED = None
+
+
+def _nve_env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _nve_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
+
+
+def _nve_f(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or v == "":
+            return float(default)
+        if isinstance(v, str):
+            s = v.strip().replace(",", "").replace("円", "").replace("株", "").replace("%", "")
+            if s == "" or s.lower() in {"none", "nan", "null", "<na>", "pd.na", "-", "－", "—"}:
+                return float(default)
+            v = s
+        x = float(v)
+        if x != x:
+            return float(default)
+        return x
+    except Exception:
+        return float(default)
+
+
+def _nve_side(row: dict[str, Any]) -> str:
+    try:
+        s = str(row.get("side") or row.get("ai_side") or row.get("entry_decision") or "BUY").strip().upper()
+        return "SELL" if s in {"SELL", "SHORT", "1", "売", "売り"} else "BUY"
+    except Exception:
+        return "BUY"
+
+
+def _nve_first(row: dict[str, Any], keys: tuple[str, ...], default: Any = None) -> Any:
+    for k in keys:
+        try:
+            v = row.get(k)
+            if v is not None and str(v).strip() != "":
+                return v
+        except Exception:
+            pass
+    for root_key in ("source_row", "ai_row", "_raw", "raw", "features", "metrics"):
+        raw = row.get(root_key)
+        if isinstance(raw, dict):
+            for k in keys:
+                v = raw.get(k)
+                if v is not None and str(v).strip() != "":
+                    return v
+    return default
+
+
+def _nve_num(row: dict[str, Any], *keys: str, default: float = 0.0) -> float:
+    return _nve_f(_nve_first(row, tuple(keys), default), default)
+
+
+def _nve_levels(row: dict[str, Any]) -> tuple[float, float, float]:
+    close = _nve_num(row, "close_price", "price", "current_price", "close", "last_price")
+    high = _nve_num(
+        row,
+        "swing_high", "recent_high", "intraday_high", "day_high", "today_high", "range_high",
+        "high_1m_max", "high", "high_price", "HighPrice",
+    )
+    low = _nve_num(
+        row,
+        "swing_low", "recent_low", "intraday_low", "day_low", "today_low", "range_low",
+        "low_1m_min", "low", "low_price", "LowPrice",
+    )
+    return close, high, low
+
+
+def _nve_near_pct(price: float, target: float) -> float:
+    if price <= 0 or target <= 0:
+        return 999.0
+    return abs(price - target) / price
+
+
+def _nve_projection(close: float, high: float, low: float, side: str) -> dict[str, float]:
+    rng = high - low
+    if close <= 0 or high <= 0 or low <= 0 or rng <= 0:
+        return {}
+    if side == "BUY":
+        a = low
+        b = high
+        c = close
+        return {
+            "n": c + (b - a),
+            "v": b + max(0.0, b - c),
+            "e": b + (b - a),
+            "range": rng,
+            "progress_to_n": (close - c) / max(1e-9, (c + (b - a)) - c),
+        }
+    a = high
+    b = low
+    c = close
+    return {
+        "n": c - (a - b),
+        "v": b - max(0.0, c - b),
+        "e": b - (a - b),
+        "range": rng,
+        "progress_to_n": (c - close) / max(1e-9, c - (c - (a - b))),
+    }
+
+
+def _nve_target_room_pct(close: float, target: float, side: str) -> float:
+    if close <= 0 or target <= 0:
+        return 0.0
+    if side == "BUY":
+        return (target - close) / close
+    return (close - target) / close
+
+
+def _nve_overlay(row: dict[str, Any], tags: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(row, dict) or not isinstance(tags, dict):
+        return tags
+    close, high, low = _nve_levels(row)
+    side = _nve_side(row)
+    proj = _nve_projection(close, high, low, side)
+    reasons = [x for x in str(tags.get("strategy_reasons") or "").split("/") if x]
+    nve_score = 0.0
+    nve_zone = "NONE"
+    nearest_name = ""
+    nearest_dist = 999.0
+    room_to_n = room_to_v = room_to_e = 0.0
+
+    if proj:
+        n = proj["n"]
+        v = proj["v"]
+        e = proj["e"]
+        room_to_n = _nve_target_room_pct(close, n, side)
+        room_to_v = _nve_target_room_pct(close, v, side)
+        room_to_e = _nve_target_room_pct(close, e, side)
+        distances = {"N": _nve_near_pct(close, n), "V": _nve_near_pct(close, v), "E": _nve_near_pct(close, e)}
+        nearest_name = min(distances, key=distances.get)
+        nearest_dist = float(distances[nearest_name])
+        near_pct = _nve_env_float("SUMMARY_AI_NVE_TARGET_NEAR_PCT", 0.0035)
+        min_room = _nve_env_float("SUMMARY_AI_NVE_MIN_ROOM_PCT", 0.0020)
+
+        # Positive: target room still exists. This helps avoid buying after the move is already exhausted.
+        if room_to_n >= min_room:
+            nve_score += 0.6
+            reasons.append("n_value_room")
+        if room_to_v >= min_room:
+            nve_score += 0.4
+            reasons.append("v_value_room")
+        if room_to_e >= min_room:
+            nve_score += 0.3
+            reasons.append("e_value_room")
+
+        # Near targets: treat as take-profit / caution zone for fresh entry.
+        if nearest_dist <= near_pct:
+            nve_zone = f"NEAR_{nearest_name}_VALUE"
+            reasons.append(f"near_{nearest_name.lower()}_value_target")
+            if nearest_name == "N":
+                nve_score -= 0.2
+            elif nearest_name == "V":
+                nve_score -= 0.4
+            elif nearest_name == "E":
+                nve_score -= 0.8
+                reasons.append("e_value_overextension_caution")
+                tags["strategy_reversal_score"] = round(_nve_f(tags.get("strategy_reversal_score"), 0.0) + 0.6, 4)
+
+        # Already beyond targets: do not chase; strong E overshoot is reversal/exit caution.
+        if side == "BUY":
+            if close >= n:
+                nve_score -= 0.25; reasons.append("above_n_value_caution")
+            if close >= v:
+                nve_score -= 0.45; reasons.append("above_v_value_caution")
+            if close >= e:
+                nve_score -= 0.9; reasons.append("above_e_value_overheat")
+                tags["strategy_reversal_score"] = round(_nve_f(tags.get("strategy_reversal_score"), 0.0) + 0.9, 4)
+        else:
+            if close <= n:
+                nve_score -= 0.25; reasons.append("below_n_value_caution")
+            if close <= v:
+                nve_score -= 0.45; reasons.append("below_v_value_caution")
+            if close <= e:
+                nve_score -= 0.9; reasons.append("below_e_value_overheat")
+                tags["strategy_reversal_score"] = round(_nve_f(tags.get("strategy_reversal_score"), 0.0) + 0.9, 4)
+
+        mode = str(tags.get("strategy_mode") or "").upper()
+        if mode == "PULLBACK":
+            tags["strategy_pullback_score"] = round(_nve_f(tags.get("strategy_pullback_score"), 0.0) + nve_score, 4)
+        elif mode == "REVERSAL":
+            tags["strategy_reversal_score"] = round(_nve_f(tags.get("strategy_reversal_score"), 0.0) + nve_score, 4)
+        else:
+            tags["strategy_breakout_score"] = round(_nve_f(tags.get("strategy_breakout_score"), 0.0) + nve_score, 4)
+
+        scores = {
+            "BREAKOUT": _nve_f(tags.get("strategy_breakout_score"), 0.0),
+            "PULLBACK": _nve_f(tags.get("strategy_pullback_score"), 0.0),
+            "REVERSAL": _nve_f(tags.get("strategy_reversal_score"), 0.0),
+        }
+        mode2 = max(scores, key=scores.get)
+        if mode2 == "REVERSAL" and not _nve_env_bool("SUMMARY_AI_STRATEGY_ENABLE_REVERSAL", False):
+            if scores[mode2] < _nve_env_float("SUMMARY_AI_STRATEGY_REVERSAL_STRONG_MIN", 3.2):
+                mode2 = "WATCH_ONLY_REVERSAL"
+        tags["strategy_mode"] = mode2
+        tags["strategy_score"] = round(scores.get(mode2.replace("WATCH_ONLY_", ""), scores.get(mode2, 0.0)), 4)
+        tags["strategy_n_value"] = round(n, 4)
+        tags["strategy_v_value"] = round(v, 4)
+        tags["strategy_e_value"] = round(e, 4)
+
+    tags.update({
+        "strategy_nve_score": round(nve_score, 4),
+        "strategy_nve_zone": nve_zone,
+        "strategy_nve_nearest": nearest_name,
+        "strategy_nve_nearest_dist_pct": round(nearest_dist, 6) if nearest_dist < 900 else None,
+        "strategy_n_room_pct": round(room_to_n, 6),
+        "strategy_v_room_pct": round(room_to_v, 6),
+        "strategy_e_room_pct": round(room_to_e, 6),
+        "strategy_reasons": "/".join(dict.fromkeys(reasons))[:900],
+    })
+    return tags
+
+
+def _classify(row: dict[str, Any]) -> dict[str, Any]:
+    tags = _classify_core(row)
+    if _fib_env_bool("SUMMARY_AI_FIB_EV_STRATEGY_ENABLED", True):
+        try:
+            tags = _fib_overlay(row, dict(tags or {}))
+        except Exception:
+            logger.debug("[SUMMARY AI FIB EV] overlay failed row=%s", row, exc_info=True)
+    if _nve_env_bool("SUMMARY_AI_NVE_STRATEGY_ENABLED", True):
+        try:
+            tags = _nve_overlay(row, dict(tags or {}))
+        except Exception:
+            logger.debug("[SUMMARY AI NVE] overlay failed row=%s", row, exc_info=True)
+    return tags
+
+
+def _strategy_enabled(row: dict[str, Any]) -> tuple[bool, str]:
+    ok, reason = _strategy_enabled_core(row)
+
+    # 1層目: 期待値がはっきり負なら弾く (旧 fibonacci_ev)
+    if ok and _fib_env_bool("SUMMARY_AI_FIB_EV_STRATEGY_ENABLED", True):
+        ev = row.get("strategy_expected_value")
+        if ev is not None and _fib_env_bool("SUMMARY_AI_EV_BLOCK_NEGATIVE", True):
+            if _fib_f(ev, 0.0) < _fib_env_float("SUMMARY_AI_EV_BLOCK_BELOW", -0.0005):
+                return False, "ev_negative"
+
+    # 2層目: 目標が E 値寄り / N 値までの余地が無いなら弾く (旧 nve_projection)
+    if ok and _nve_env_bool("SUMMARY_AI_NVE_STRATEGY_ENABLED", True):
+        if not _nve_env_bool("SUMMARY_AI_NVE_BLOCK_EXHAUSTED", True):
+            return ok, reason
+        zone = str(row.get("strategy_nve_zone") or "").upper()
+        room_n = _nve_f(row.get("strategy_n_room_pct"), 0.0)
+        if zone == "NEAR_E_VALUE":
+            return False, "near_e_value_target"
+        if room_n < _nve_env_float("SUMMARY_AI_NVE_MIN_ENTRY_ROOM_PCT", 0.0010):
+            return False, "n_value_room_too_small"
+
+    return ok, reason
