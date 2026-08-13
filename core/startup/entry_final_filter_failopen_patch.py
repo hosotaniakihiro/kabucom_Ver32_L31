@@ -234,7 +234,7 @@ def install() -> bool:
     # (旧 entry_direction_confirm_guard_patch.check_entry_direction_confirm) が
     # RecursionError も一般例外も自分で捕まえて False を返すため、
     # 外側からラップしていたあのパッチの except には一度も到達しなかった。
-    for mod_name, label in [('core.startup.board_retry_patch','board retry patch'),('trading.handlers.short_mtf_direction_guard','short MTF daily optional guard'),('core.startup.entry_ma5_breakout_count_patch','MA5 breakout count patch')]:
+    for mod_name, label in [('core.startup.board_retry_patch','board retry patch'),('trading.handlers.short_mtf_direction_guard','short MTF daily optional guard')]:
         try:
             mod = __import__(mod_name, fromlist=['install']); fn = getattr(mod, 'install', None); ok = fn() if callable(fn) else False
             logger.warning('[ENTRY FINAL FILTER FAILOPEN] %s installed=%s', label, ok)
