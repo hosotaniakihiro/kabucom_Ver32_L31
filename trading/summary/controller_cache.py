@@ -36,6 +36,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import warnings
 from typing import Callable
 
@@ -1115,7 +1116,7 @@ def candidate_is_immature(df: pd.DataFrame) -> bool:
         return False
 
 
-def choose_merged_cache_payload(
+def _choose_merged_cache_payload_core(
     interval: int,
     df_hist: pd.DataFrame,
     df_latest: pd.DataFrame,
@@ -1273,3 +1274,326 @@ def _concat_frames_core(
     except Exception:
         logger.exception("[summary_controller] concat frames failed")
         return pd.DataFrame()
+
+
+# ============================================================
+# SUMMARY LATEST PREFER (旧 core/startup/summary_latest_prefer_patch.py)
+# ------------------------------------------------------------
+# history が遅れているときに latest 側を優先して merged payload を作る層。
+#
+# 旧パッチは choose_merged_cache_payload を差し替えたうえで、
+# trading/summary/summary_controller.py の from-import 束縛
+# (38行) も明示的に上書きしていた。本文化して本体に組み込んだので
+# from-import が最初から合成後の関数を掴む = 上書きは不要になった。
+#
+# 実 install 順の実測:
+#   sitecustomize.py:555 _install_runtime_defaults()
+#     -> runtime_env/defaults_patch -> full_pipeline_stability_runtime_patch
+#     -> summary_latest_prefer_patch  (ここが先)
+#   sitecustomize.py:568 背景スレッド -> BACKGROUND_MAIN_PATCHES
+#     -> summary_mtf_early_ready_patch (後)
+# よって controller_cache 上の合成は
+#   native <- latest_prefer <- mtf_early_ready(history-first)
+# だった。
+#
+# ただし choose_merged_cache_payload の呼び出し元はリポジトリ全体で
+# trading/summary/summary_controller.py の 2 箇所だけで、そこは
+# latest_prefer が上書きした sc 側の束縛を使う。つまり
+# summary_mtf_early_ready_patch の history-first ラッパーは
+# **誰からも呼ばれない死んだラッパー**である。
+# そのため latest_prefer だけを単独で本文化しても層順は壊れない。
+# (mtf 側のラッパーは引き続き cc の属性を包むが、呼び手が居ないまま)
+# ============================================================
+
+_LP_REALTIME_TIME_COLS = (
+    "received_at", "recv_at", "recv_time", "last_recv", "last_recv_at", "last_received_at",
+    "push_received_at", "push_time", "tick_time", "quote_time", "current_price_time",
+    "CurrentPriceTime", "price_time", "event_time", "updated_at", "created_at",
+    "timestamp", "time_stamp",
+)
+
+
+def _lp_env_int(name: str, default: int) -> int:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(str(v).strip()))
+    except Exception:
+        return int(default)
+
+
+def _lp_safe_symbol_count(df: pd.DataFrame) -> int:
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty or "symbol" not in df.columns:
+            return 0
+        s = df["symbol"].fillna("").astype(str).str.strip()
+        s = s[(s != "") & (s.str.lower() != "nan") & (s.str.lower() != "none")]
+        return int(s.nunique())
+    except Exception:
+        return 0
+
+
+def _lp_to_naive_datetime_series(s) -> pd.Series:
+    try:
+        out = pd.to_datetime(s, errors="coerce")
+        try:
+            out = out.dt.tz_localize(None)
+        except Exception:
+            try:
+                out = out.dt.tz_convert(None)
+            except Exception:
+                pass
+        return out
+    except Exception:
+        return pd.Series(dtype="datetime64[ns]")
+
+
+def _lp_safe_latest_dt(df: pd.DataFrame):
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return None
+        for c in ("datetime", "end_time", "snapshot_time", "tick_time"):
+            if c in df.columns:
+                s = _lp_to_naive_datetime_series(df[c]).dropna()
+                if not s.empty:
+                    return s.max()
+    except Exception:
+        return None
+    return None
+
+
+def _lp_safe_realtime_dt(df: pd.DataFrame):
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return None
+        best = None
+        for c in _LP_REALTIME_TIME_COLS:
+            if c not in df.columns:
+                continue
+            s = _lp_to_naive_datetime_series(df[c]).dropna()
+            if s.empty:
+                continue
+            mx = s.max()
+            if best is None or mx > best:
+                best = mx
+        return best
+    except Exception:
+        return None
+
+
+def _lp_floor_to_interval_min(s: pd.Series, interval: int) -> pd.Series:
+    try:
+        interval_i = max(1, int(interval))
+        return s.dt.floor(f"{interval_i}min")
+    except Exception:
+        try:
+            return s.dt.floor("min")
+        except Exception:
+            return s
+
+
+def _lp_numeric_nonzero(df: pd.DataFrame, cols: tuple[str, ...]) -> int:
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return 0
+        best = 0
+        for c in cols:
+            if c in df.columns:
+                s = pd.to_numeric(df[c], errors="coerce").fillna(0)
+                best = max(best, int((s != 0).sum()))
+        return best
+    except Exception:
+        return 0
+
+
+def _lp_numeric_nonnull(df: pd.DataFrame, cols: tuple[str, ...]) -> int:
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return 0
+        best = 0
+        for c in cols:
+            if c in df.columns:
+                s = pd.to_numeric(df[c], errors="coerce")
+                best = max(best, int(s.notna().sum()))
+        return best
+    except Exception:
+        return 0
+
+
+def _lp_latest_is_usable(df: pd.DataFrame, min_symbols: int) -> bool:
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return False
+        symbols = _lp_safe_symbol_count(df)
+        close_nonnull = _lp_numeric_nonnull(df, ("close", "close_price", "price", "current_price", "last_price"))
+        score_nonzero = _lp_numeric_nonzero(df, ("score", "score_total", "final_score", "display_score", "score_buy", "score_sell"))
+        return symbols >= int(min_symbols) and close_nonnull >= max(1, min_symbols // 2) and (score_nonzero >= 0)
+    except Exception:
+        return False
+
+
+def _lp_promote_latest_datetime(latest: pd.DataFrame, interval: int, min_symbols: int) -> pd.DataFrame:
+    try:
+        if not _lp_latest_is_usable(latest, min_symbols) or "datetime" not in latest.columns:
+            return latest
+        max_future_sec = _lp_env_int("SUMMARY_REALTIME_PROMOTE_MAX_FUTURE_SEC", 60)
+        max_wall_lag_sec = _lp_env_int("SUMMARY_REALTIME_PROMOTE_MAX_WALL_LAG_SEC", 900)
+        min_promote_sec = _lp_env_int("SUMMARY_REALTIME_PROMOTE_MIN_SEC", 60)
+        now = pd.Timestamp.now().tz_localize(None)
+        base_dt = _lp_to_naive_datetime_series(latest["datetime"])
+        best_col = None
+        best_max = None
+        best_s = None
+        for c in _LP_REALTIME_TIME_COLS:
+            if c not in latest.columns:
+                continue
+            s = _lp_to_naive_datetime_series(latest[c])
+            valid = s.dropna()
+            if valid.empty:
+                continue
+            mx = valid.max()
+            if best_max is None or mx > best_max:
+                best_col = c
+                best_max = mx
+                best_s = s
+        if best_s is None or best_max is None:
+            return latest
+        if best_max > now + pd.Timedelta(seconds=max_future_sec):
+            return latest
+        if (now - best_max).total_seconds() > float(max_wall_lag_sec):
+            return latest
+        new_dt = _lp_floor_to_interval_min(best_s, interval)
+        delta = (new_dt - base_dt).dt.total_seconds()
+        mask = base_dt.notna() & new_dt.notna() & (delta >= float(min_promote_sec))
+        if not bool(mask.any()):
+            return latest
+        out = latest.copy()
+        before = base_dt.max()
+        out.loc[mask, "datetime"] = new_dt[mask]
+        for c in ("end_time", "snapshot_time"):
+            if c in out.columns:
+                try:
+                    out.loc[mask, c] = new_dt[mask]
+                except Exception:
+                    pass
+        after = _lp_safe_latest_dt(out)
+        logger.warning(
+            "[SUMMARY LATEST PREFER PATCH] promoted realtime datetime interval=%s col=%s rows=%s before=%s after=%s realtime_max=%s now=%s",
+            interval, best_col, int(mask.sum()), before, after, best_max, now,
+        )
+        return out
+    except Exception:
+        logger.exception("[SUMMARY LATEST PREFER PATCH] realtime promote failed interval=%s", interval)
+        return latest
+
+
+def _lp_merge_latest_over_history(interval: int, hist: pd.DataFrame, latest: pd.DataFrame, normalize_fn: Callable[[pd.DataFrame], pd.DataFrame]) -> pd.DataFrame:
+    frames = []
+    try:
+        h = normalize_fn(hist)
+        if isinstance(h, pd.DataFrame) and not h.empty:
+            frames.append(h)
+    except Exception:
+        pass
+    try:
+        l = normalize_fn(latest)
+        if isinstance(l, pd.DataFrame) and not l.empty:
+            frames.append(l)
+    except Exception:
+        pass
+    if not frames:
+        return pd.DataFrame()
+    out = concat_frames(frames, normalize_fn=normalize_fn)
+    out = dedupe_symbol_datetime(out, normalize_fn=normalize_fn)
+    out = limit_history_rows_per_symbol(out, interval, normalize_fn=normalize_fn)
+    out = attach_display_ready(out)
+    return out
+
+
+def choose_merged_cache_payload(
+    interval: int,
+    df_hist: pd.DataFrame,
+    df_latest: pd.DataFrame,
+    normalize_fn: Callable[[pd.DataFrame], pd.DataFrame],
+) -> pd.DataFrame:
+    if not _lp_enabled():
+        return _choose_merged_cache_payload_core(interval, df_hist, df_latest, normalize_fn)
+    try:
+        interval_i = int(interval)
+        intervals = {int(x) for x in str(os.environ.get("SUMMARY_FORCE_LATEST_INTERVALS", "1,3,5")).replace(";", ",").split(",") if str(x).strip().isdigit()}
+        if interval_i not in intervals:
+            return _choose_merged_cache_payload_core(interval, df_hist, df_latest, normalize_fn)
+        lag_sec = _lp_env_int("SUMMARY_FORCE_LATEST_WHEN_HISTORY_LAG_SEC", 120)
+        wall_lag_sec = _lp_env_int("SUMMARY_FORCE_LATEST_WALL_LAG_SEC", 180)
+        min_symbols = _lp_env_int("SUMMARY_FORCE_LATEST_MIN_SYMBOLS", 20)
+        hist = normalize_fn(df_hist)
+        latest = normalize_fn(df_latest)
+        latest = _lp_promote_latest_datetime(latest, interval_i, min_symbols)
+        hist_dt = _lp_safe_latest_dt(hist)
+        latest_dt = _lp_safe_latest_dt(latest)
+        realtime_dt = _lp_safe_realtime_dt(latest)
+        hist_symbols = _lp_safe_symbol_count(hist)
+        latest_symbols = _lp_safe_symbol_count(latest)
+        latest_usable = _lp_latest_is_usable(latest, min_symbols)
+        force_latest = False
+        reason = None
+        delta_sec = None
+        if hist_dt is not None and latest_dt is not None:
+            delta_sec = float((latest_dt - hist_dt).total_seconds())
+            force_latest = delta_sec >= float(lag_sec) and latest_usable
+            if force_latest:
+                reason = "latest_newer_than_history"
+        elif latest_dt is not None and latest_usable:
+            force_latest = True
+            reason = "latest_only"
+        if not force_latest and latest_dt is not None and latest_usable:
+            now = pd.Timestamp.now().tz_localize(None)
+            wall_lag = float((now - latest_dt).total_seconds())
+            realtime_lag = None if realtime_dt is None else float((now - realtime_dt).total_seconds())
+            if wall_lag >= float(wall_lag_sec) and (realtime_dt is None or realtime_lag <= float(max(wall_lag_sec, 300))):
+                force_latest = True
+                reason = "wall_lag_latest_usable"
+        if force_latest:
+            payload = _lp_merge_latest_over_history(interval_i, hist, latest, normalize_fn)
+            logger.warning(
+                "[SUMMARY LATEST PREFER PATCH] force latest interval=%s reason=%s hist_dt=%s latest_dt=%s realtime_dt=%s delta_sec=%s hist_symbols=%s latest_symbols=%s rows=%s payload_latest_dt=%s lag_sec=%s",
+                interval_i, reason, hist_dt, latest_dt, realtime_dt, delta_sec,
+                hist_symbols, latest_symbols,
+                len(payload) if isinstance(payload, pd.DataFrame) else 0,
+                _lp_safe_latest_dt(payload), lag_sec,
+            )
+            return payload
+        return _choose_merged_cache_payload_core(interval, df_hist, df_latest, normalize_fn)
+    except Exception:
+        logger.exception("[SUMMARY LATEST PREFER PATCH] patched choose failed interval=%s", interval)
+        return _choose_merged_cache_payload_core(interval, df_hist, df_latest, normalize_fn)
+
+
+def _lp_enabled() -> bool:
+    """旧 install 経路のキルスイッチを再現する。
+
+    summary_latest_prefer_patch は
+      runtime_env/defaults_patch -> full_pipeline_stability_runtime_patch
+      -> _install_summary_latest_prefer()
+    の順に入っていたので、その 2 つの DISABLE env をどちらも見る。
+    """
+    if str(os.environ.get("DISABLE_SUMMARY_LATEST_PREFER_PATCH", "")).strip() == "1":
+        return False
+    if str(os.environ.get("DISABLE_FULL_PIPELINE_STABILITY_PATCH", "")).strip() == "1":
+        return False
+    return True
+
+
+def _lp_apply_env_defaults() -> None:
+    """旧 install() の env setdefault を再現する。"""
+    os.environ.setdefault("SUMMARY_SPOOL_QUARANTINE_ENABLED", "1")
+    os.environ.setdefault("SUMMARY_SPOOL_QUARANTINE_EMPTY", "1")
+    os.environ.setdefault("SUMMARY_SPOOL_QUARANTINE_OLD", "1")
+    os.environ.setdefault("SUMMARY_SPOOL_QUARANTINE_MAX_AGE_DAYS", "2")
+    os.environ.setdefault("PUSH_MTF_VOLUME_FALLBACK_ENABLED", "1")
+    os.environ.setdefault("PUSH_MTF_ZERO_VOLUME_FALLBACK_VOLUME", "30000")
+
+
+if _lp_enabled():
+    _lp_apply_env_defaults()

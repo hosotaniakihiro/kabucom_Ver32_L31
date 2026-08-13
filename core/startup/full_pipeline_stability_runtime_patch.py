@@ -251,15 +251,16 @@ def _install_summary_recovery_defaults() -> bool:
 
 
 def _install_summary_latest_prefer() -> bool:
-    try:
-        if os.environ.get("DISABLE_SUMMARY_LATEST_PREFER_PATCH", "").strip() == "1":
-            logger.warning("[FULL PIPELINE STABILITY] summary latest prefer disabled by env")
-            return False
-        from . import summary_latest_prefer_patch
-        return bool(summary_latest_prefer_patch.install())
-    except Exception:
-        logger.exception("[FULL PIPELINE STABILITY] summary latest prefer install failed")
-        return False
+    """summary_latest_prefer_patch は trading/summary/controller_cache.py へ本文化済み。
+
+    choose_merged_cache_payload 本体に組み込んだので install は不要。
+    キルスイッチ DISABLE_SUMMARY_LATEST_PREFER_PATCH /
+    DISABLE_FULL_PIPELINE_STABILITY_PATCH は controller_cache._lp_enabled() が
+    そのまま見ている。summary_controller.py:38 の from-import も
+    最初から合成後の関数を掴むため、旧 install が行っていた
+    sc.choose_merged_cache_payload の上書きも要らなくなった。
+    """
+    return True
 
 
 def _install_entry_exit_congestion_defaults() -> bool:
