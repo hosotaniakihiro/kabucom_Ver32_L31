@@ -437,7 +437,11 @@ BACKGROUND_MAIN_PATCHES = [
     # trading/summary/controller_cache.py / controller_projection.py へ本文化済み
     # (trading/summary/controller_layers.apply_layers の 1 層目)。
     # DISABLE_SUMMARY_MTF_EARLY_READY_PATCH は controller_layers.neutral_enabled() が見る。
-    ("core.startup.summary_mtf_push_raw_fallback_patch", "SUMMARY_MTF_EARLY_READY", "DISABLE_SUMMARY_MTF_EARLY_READY_PATCH"),
+    # summary_mtf_push_raw_fallback_patch は
+    # core/startup/summary_mtf_diff_from_1m_patch.py の
+    # _cached_1m_history_from_global へ本文化済み (_prf_*)。
+    # 同モジュールを import すれば env 既定値と bootstrap も走る。
+    ("core.startup.summary_mtf_diff_from_1m_patch", "SUMMARY_MTF_EARLY_READY", "DISABLE_SUMMARY_MTF_EARLY_READY_PATCH"),
     ("core.startup.summary_ai_order_builder_range_repair_patch", "SUMMARY_MTF_EARLY_READY", "DISABLE_SUMMARY_MTF_EARLY_READY_PATCH"),
     ("trading.audit_logging.install_audit_logging", "AUDIT_LOGGING", "DISABLE_AUDIT_LOGGING"),
     # summary_main_push_db_refresh_patch / direct_push_1m (旧 summary_main_direct_push_force_patch) の
