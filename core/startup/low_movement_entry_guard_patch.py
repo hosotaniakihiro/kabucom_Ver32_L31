@@ -623,14 +623,13 @@ def _install_final_entry_safety_guard() -> bool:
 
 
 def _install_entry_price_improvement_patch() -> bool:
-    try:
-        from core.startup import entry_price_improvement_patch as p
-        ok = p.install()
-        logger.warning("[LOW MOVE GUARD] entry_price_improvement_patch installed=%s", ok)
-        return bool(ok)
-    except Exception as e:
-        logger.warning("[LOW MOVE GUARD] entry_price_improvement_patch install failed: %s", e, exc_info=False)
-        return False
+    """entry_price_improvement_patch は
+    trading/handlers/entry_order_builder.build_entry_order へ本文化済み (_epi_*)。
+
+    実 install 順の測定で breakout SR ガードのすぐ外側だと確認したうえで、
+    同じ位置に固定した。install は不要になった。
+    """
+    return True
 
 
 def _install_ma_cross_state_runtime_patch() -> bool:
