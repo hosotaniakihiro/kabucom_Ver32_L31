@@ -80,7 +80,7 @@ def _find_execution(order_id: str, token: str):
 # ============================================================
 # 信用返済（ClosePositions）
 # ============================================================
-def send_credit_close_order(
+def _send_credit_close_order_core(
     symbol, qty, hold_id, side, exchange, margin_type, account_type
 ):
 
@@ -222,7 +222,7 @@ def send_cash_close_order(symbol, qty, side, exchange):
 # ============================================================
 # Position から EXIT 実行（完全対応）
 # ============================================================
-def process_exit(position: Position, exit_price: float, reason: str):
+def _process_exit_core(position: Position, exit_price: float, reason: str):
 
     symbol = position.symbol
     qty = position.qty
@@ -301,3 +301,72 @@ def execute_buy_to_close_order(*args, **kwargs):
     """
     print("[COMPAT] execute_buy_to_close_order called")
     return None
+
+# ============================================================
+# EXIT の 3 段構成
+# ------------------------------------------------------------
+# 旧構成 (実 install 順で測定):
+#   _process_exit_core                    素の実装
+#     <- daytrade_credit_force_close      建玉の margin_trade_type を補正
+#     <- exit_board_profit_runtime        板を見て利確指値 -> 失敗時フォールバック
+#
+# daytrade は runtime_env/defaults_patch (sitecustomize 経由) で先に入り、
+# exit_board は main.py:264 の buy_sell_entry.apply_oneshot_limit_defaults の
+# 連鎖で後から入って daytrade ラッパーを掴んでいた。同じ順序で並べてある。
+#
+# 旧 exit_board は from-import 済みの trading/handlers/exit_handler.process_exit
+# にも同じ関数を代入していたが、本文化では close.py 側が最終形を持つので
+# 先頭 from-import がそのまま最外周を束縛する。
+# (trading/handlers/opening_exit_handler.py も同じ from-import を持つが、
+#  リポジトリ全体で import 元が無い到達不能モジュール)
+# ============================================================
+
+
+def _daytrade_credit():
+    try:
+        from kabu_api import daytrade_credit as _m
+
+        return _m if _m.daytrade_enabled() else None
+    except Exception:
+        return None
+
+
+def _exit_board_profit():
+    try:
+        from kabu_api import exit_board_profit as _m
+
+        return _m if _m.exit_board_enabled() else None
+    except Exception:
+        return None
+
+
+def send_credit_close_order(
+    symbol, qty, hold_id, side, exchange, margin_type, account_type
+):
+    _m = _daytrade_credit()
+    if _m is None:
+        return _send_credit_close_order_core(
+            symbol, qty, hold_id, side, exchange, margin_type, account_type
+        )
+    return _m.send_credit_close_order_respect_margin(
+        _send_credit_close_order_core,
+        symbol, qty, hold_id, side, exchange, margin_type, account_type,
+    )
+
+
+def _process_exit_daytrade(position: Position, exit_price: float, reason: str):
+    """daytrade 層。建玉に margin_trade_type が無ければ補ってから返済する。"""
+    _m = _daytrade_credit()
+    if _m is not None:
+        _m.apply_position_margin_type(position)
+    return _process_exit_core(position, exit_price, reason)
+
+
+def process_exit(position: Position, exit_price: float, reason: str):
+    """板利確層 (最外周)。"""
+    _m = _exit_board_profit()
+    if _m is None:
+        return _process_exit_daytrade(position, exit_price, reason)
+    return _m.board_exit_then_fallback_or_orig(
+        _process_exit_daytrade, position, exit_price, reason
+    )

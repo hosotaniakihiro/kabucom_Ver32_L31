@@ -1,5 +1,5 @@
 # ============================================================
-# File   : core/startup/exit_board_profit_runtime_patch.py
+# File   : kabu_api/exit_board_profit.py
 # Version: Ver01-BOARD-AWARE-PROFIT-EXIT
 # ------------------------------------------------------------
 # 板を見て、利益が出る範囲で厚い板の1ティック手前に返済指値を置く。
@@ -37,7 +37,6 @@ from token_manager import get_valid_token
 logger = logging.getLogger(__name__)
 
 _INSTALLED = False
-_ORIG_PROCESS_EXIT = None
 API_URL = "http://localhost:18080/kabusapi"
 
 
@@ -417,33 +416,33 @@ def _current_board_price(symbol: str, fallback: float) -> float:
     return _safe_float(row.get("price") or row.get("close"), fallback)
 
 
-def _board_exit_then_fallback(pos: Any, exit_price: float, reason: str) -> dict[str, Any] | None:
-    if not callable(_ORIG_PROCESS_EXIT):
+def _board_exit_then_fallback(orig, pos: Any, exit_price: float, reason: str) -> dict[str, Any] | None:
+    if not callable(orig):
         return None
 
     if not _env_bool("EXIT_BOARD_PROFIT_ENABLED", True):
-        return _ORIG_PROCESS_EXIT(_as_obj(pos), exit_price, reason)
+        return orig(_as_obj(pos), exit_price, reason)
 
     reasons = _env_set(
         "EXIT_BOARD_PROFIT_REASONS",
         "PROFIT_TAKE_FAST,PROFIT_PROTECT_FLOOR,PROFIT_PROTECT_GIVEBACK,NORMAL_TAKE_PROFIT,NORMAL_TRAIL,TONOSAMA_TRAIL,TONOSAMA_TAKE",
     )
     if str(reason or "").upper() not in reasons:
-        return _ORIG_PROCESS_EXIT(_as_obj(pos), exit_price, reason)
+        return orig(_as_obj(pos), exit_price, reason)
 
     current = _current_board_price(_symbol(pos), exit_price)
     if _pnl_rate(pos, current) < _env_float("EXIT_BOARD_MIN_PROFIT_PCT", 0.0010):
         logger.warning("[EXIT BOARD PROFIT] skip board limit no enough profit symbol=%s pnl=%.4f reason=%s", _symbol(pos), _pnl_rate(pos, current), reason)
-        return _ORIG_PROCESS_EXIT(_as_obj(pos), exit_price, reason)
+        return orig(_as_obj(pos), exit_price, reason)
 
     limit_price, diag = _choose_profit_limit_price(pos, current)
     if limit_price <= 0:
         logger.warning("[EXIT BOARD PROFIT] no limit price symbol=%s diag=%s -> fallback market", _symbol(pos), diag)
-        return _ORIG_PROCESS_EXIT(_as_obj(pos), exit_price, reason)
+        return orig(_as_obj(pos), exit_price, reason)
 
     sent = _send_limit_close_order(pos, limit_price)
     if not sent:
-        return _ORIG_PROCESS_EXIT(_as_obj(pos), exit_price, reason)
+        return orig(_as_obj(pos), exit_price, reason)
 
     order_id = sent["order_id"]
     token = get_valid_token()
@@ -471,46 +470,43 @@ def _board_exit_then_fallback(pos: Any, exit_price: float, reason: str) -> dict[
                 _symbol(pos), order_id, cur, limit_price, _pnl_rate(pos, cur), reason,
             )
             _cancel_order(order_id)
-            return _ORIG_PROCESS_EXIT(_as_obj(pos), cur, reason + "_BOARD_REVERSE_FALLBACK")
+            return orig(_as_obj(pos), cur, reason + "_BOARD_REVERSE_FALLBACK")
 
     logger.warning("[EXIT BOARD PROFIT] TIMEOUT cancel+fallback symbol=%s order_id=%s", _symbol(pos), order_id)
     _cancel_order(order_id)
     cur = _current_board_price(_symbol(pos), current)
-    return _ORIG_PROCESS_EXIT(_as_obj(pos), cur, reason + "_BOARD_TIMEOUT_FALLBACK")
+    return orig(_as_obj(pos), cur, reason + "_BOARD_TIMEOUT_FALLBACK")
 
 
-def _patched_process_exit(position: Any, exit_price: float, reason: str):
+def board_exit_then_fallback_or_orig(orig, position: Any, exit_price: float, reason: str):
+    """旧 _patched_process_exit (kabu_api.close.process_exit 差し替え)。
+
+    orig は 1 枚内側の実装 (旧構成では daytrade の margin 補正ラッパー)。
+    """
     try:
-        return _board_exit_then_fallback(position, exit_price, reason)
+        return _board_exit_then_fallback(orig, position, exit_price, reason)
     except Exception as e:
         logger.warning("[EXIT BOARD PROFIT] patched process_exit failed symbol=%s err=%s -> fallback", _symbol(position), e, exc_info=False)
-        if callable(_ORIG_PROCESS_EXIT):
-            return _ORIG_PROCESS_EXIT(_as_obj(position), exit_price, reason)
+        if callable(orig):
+            return orig(_as_obj(position), exit_price, reason)
         return None
 
 
-def install() -> bool:
-    global _INSTALLED, _ORIG_PROCESS_EXIT
-    if _INSTALLED:
+_ENABLED = False
+
+
+def exit_board_enabled() -> bool:
+    """旧 install() が走ったか。kabu_api/close.py の process_exit が見る。"""
+    return bool(_ENABLED)
+
+
+def enable_exit_board_profit() -> bool:
+    """旧 install()。差し替えは本文化済みなのでフラグを立てるだけ。"""
+    global _ENABLED
+    if _ENABLED:
         return True
-
     try:
-        import kabu_api.close as close_mod
-        import trading.handlers.exit_handler as exit_handler
-
-        cur = getattr(close_mod, "process_exit", None)
-        if getattr(cur, "_exit_board_profit_patch_v1", False):
-            _INSTALLED = True
-            return True
-
-        _ORIG_PROCESS_EXIT = cur
-        _patched_process_exit._exit_board_profit_patch_v1 = True  # type: ignore[attr-defined]
-
-        close_mod.process_exit = _patched_process_exit
-        # exit_handler は from kabu_api.close import process_exit で参照を持っているため差し替える
-        exit_handler.process_exit = _patched_process_exit
-
-        _INSTALLED = True
+        _ENABLED = True
         logger.warning(
             "[EXIT BOARD PROFIT] installed enabled=%s min_profit=%.4f thick_mult=%.2f min_thick=%s wait=%.2fs reverse_gap=%.4f",
             _env_bool("EXIT_BOARD_PROFIT_ENABLED", True),
@@ -522,13 +518,8 @@ def install() -> bool:
         )
         return True
     except Exception as e:
-        logger.exception("[EXIT BOARD PROFIT] install failed err=%s", e)
+        logger.exception("[EXIT BOARD PROFIT] enable failed err=%s", e)
         return False
 
 
-try:
-    install()
-except Exception as e:
-    logger.exception("[EXIT BOARD PROFIT] auto install failed err=%s", e)
-
-__all__ = ["install"]
+__all__ = ["enable_exit_board_profit", "exit_board_enabled", "board_exit_then_fallback_or_orig"]

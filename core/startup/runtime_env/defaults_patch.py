@@ -457,7 +457,25 @@ def _install_tonosama_pending_candidate_audit(context: str) -> bool:
 
 
 def _install_daytrade_credit_force_close(context: str) -> bool:
-    return _safe_install("daytrade credit force close", context, TRADING_CONTEXTS, "DISABLE_DAYTRADE_CREDIT_FORCE_CLOSE_PATCH", "daytrade_credit_force_close_patch")
+    # daytrade_credit_force_close_patch は本文化済み:
+    #   kabu_api/close.py            _process_exit_daytrade / send_credit_close_order
+    #   kabu_api/buy_sell_entry.py   _make_payload
+    #   kabu_api/daytrade_credit.py  判定本体と強制返済スレッド
+    # スコープ判定 (context / DISABLE env) は旧 _safe_install と同じにする。
+    try:
+        if context not in TRADING_CONTEXTS:
+            return False
+        if os.environ.get("DISABLE_DAYTRADE_CREDIT_FORCE_CLOSE_PATCH", "").strip() == "1":
+            logger.warning("[RUNTIME ENV DEFAULTS PATCH] daytrade credit force close disabled by env")
+            return False
+        from kabu_api import daytrade_credit as _dc
+
+        ok = bool(_dc.enable_daytrade_credit())
+        logger.warning("[RUNTIME ENV DEFAULTS PATCH] daytrade credit force close install ok=%s context=%s", ok, context)
+        return ok
+    except Exception:
+        logger.exception("[RUNTIME ENV DEFAULTS PATCH] daytrade credit force close install failed")
+        return False
 
 
 def _install_database_owner(context: str) -> bool:

@@ -241,7 +241,7 @@ def _enforce_oneshot_rule(symbol, price, qty):
 # Payload Builder
 # ============================================================
 
-def _make_payload(
+def _make_payload_core(
     symbol,
     side,
     qty,
@@ -980,13 +980,75 @@ def apply_oneshot_limit_defaults() -> bool:
         ("trading.entry.summary_ai.direct_snapshot", "summary_ai_async_entry"),
         # summary_parallel_intervals は scheduler_jobs/summary/parallel_intervals.py へ
         # 移設済みで、env 既定値も import 時に入るため連鎖 install は不要。
-        ("core.startup.exit_board_profit_runtime_patch", "exit_board_profit"),
+        ("kabu_api.exit_board_profit", "exit_board_profit"),
     ):
         try:
             _m = __import__(_mod_name, fromlist=["install"])
-            _fn = getattr(_m, "install", None) or getattr(_m, "apply_async_entry_defaults", None)
+            _fn = (getattr(_m, "install", None)
+                   or getattr(_m, "apply_async_entry_defaults", None)
+                   or getattr(_m, "enable_exit_board_profit", None))
             _ok = bool(_fn()) if callable(_fn) else False
             logger.warning("[ONESHOT LIMIT PATCH] %s installed=%s", _label, _ok)
         except Exception:
             logger.exception("[ONESHOT LIMIT PATCH] %s install failed", _label)
     return True
+
+
+# ============================================================
+# デイトレ信用 / 制度信用の切り替え
+# (旧 core/startup/daytrade_credit_force_close_patch._patch_buy_sell_entry_payload)
+# ------------------------------------------------------------
+# 旧ラッパーは既定値が素の実装と違った (exchange=1 / margin_type=None)。
+# 呼び出し側が省略したときの値が変わらないよう、sentinel で
+# 「省略された」ことを検出してから層ごとの既定値を入れる。
+# ============================================================
+
+_MP_UNSET = object()
+
+
+def _daytrade_credit_layer():
+    try:
+        from kabu_api import daytrade_credit as _m
+
+        return _m if _m.daytrade_enabled() else None
+    except Exception:
+        return None
+
+
+def _make_payload(
+    symbol,
+    side,
+    qty,
+    price,
+    *,
+    exchange=_MP_UNSET,
+    margin_type=_MP_UNSET,
+    cash_margin=2,
+    front_order_type=20,
+    stop_price=None,
+):
+    _m = _daytrade_credit_layer()
+    if _m is None:
+        return _make_payload_core(
+            symbol,
+            side,
+            qty,
+            price,
+            exchange=(None if exchange is _MP_UNSET else exchange),
+            margin_type=(1 if margin_type is _MP_UNSET else margin_type),
+            cash_margin=cash_margin,
+            front_order_type=front_order_type,
+            stop_price=stop_price,
+        )
+    return _m.make_payload_daytrade_cutoff(
+        _make_payload_core,
+        symbol,
+        side,
+        qty,
+        price,
+        exchange=(1 if exchange is _MP_UNSET else exchange),
+        margin_type=(None if margin_type is _MP_UNSET else margin_type),
+        cash_margin=cash_margin,
+        front_order_type=front_order_type,
+        stop_price=stop_price,
+    )

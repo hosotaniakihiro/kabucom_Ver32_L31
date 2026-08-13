@@ -39,9 +39,6 @@ VERSION = "DAYTRADE-CREDIT-FORCE-CLOSE-V3-CUTOFF-1500-SYSTEM-MARGIN"
 _INSTALLED = False
 _THREAD_STARTED = False
 _FORCE_CLOSE_DONE_DATE: str | None = None
-_ORIG_BSE_MAKE_PAYLOAD = None
-_ORIG_CLOSE_SEND_CREDIT_CLOSE_ORDER = None
-_ORIG_CLOSE_PROCESS_EXIT = None
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -154,117 +151,75 @@ def _set_daytrade_env_defaults() -> None:
     os.environ.setdefault("DAYTRADE_FORCE_CLOSE_FORCE_MARGIN_TYPE", "0")
 
 
-def _patch_buy_sell_entry_payload() -> bool:
-    """Use day-trade margin before cutoff and system margin at/after cutoff."""
-    global _ORIG_BSE_MAKE_PAYLOAD
+def make_payload_daytrade_cutoff(orig, symbol, side, qty, price, *, exchange=1, margin_type=None, cash_margin=2, front_order_type=20, stop_price=None):
+    """旧 _make_payload_daytrade_cutoff (kabu_api.buy_sell_entry._make_payload 差し替え)。
+
+    cutoff 前はデイトレ信用、cutoff 以降は制度信用を使う。
+    """
+    mt, mode = _entry_margin_type_for_now(margin_type)
+    cm = _safe_int(cash_margin, 2)
+    payload = orig(
+        symbol,
+        side,
+        qty,
+        price,
+        exchange=exchange,
+        margin_type=mt,
+        cash_margin=cm,
+        front_order_type=front_order_type,
+        stop_price=stop_price,
+    )
     try:
-        import kabu_api.buy_sell_entry as bse
-        if getattr(bse, "_daytrade_credit_payload_patched_v3", False):
-            return True
-        orig = getattr(bse, "_make_payload", None)
-        if not callable(orig):
-            return False
-        _ORIG_BSE_MAKE_PAYLOAD = orig
-
-        def _make_payload_daytrade_cutoff(symbol, side, qty, price, *, exchange=1, margin_type=None, cash_margin=2, front_order_type=20, stop_price=None):
-            mt, mode = _entry_margin_type_for_now(margin_type)
-            cm = _safe_int(cash_margin, 2)
-            payload = orig(
-                symbol,
-                side,
-                qty,
-                price,
-                exchange=exchange,
-                margin_type=mt,
-                cash_margin=cm,
-                front_order_type=front_order_type,
-                stop_price=stop_price,
-            )
-            try:
-                if int(payload.get("CashMargin", cm)) == 2:
-                    payload["MarginTradeType"] = mt
-                    payload["DelivType"] = 0
-                    payload["AccountType"] = _env_int("KABU_ORDER_ACCOUNT_TYPE", _safe_int(payload.get("AccountType"), 4))
-            except Exception:
-                pass
-            logger.warning(
-                "[CREDIT ENTRY MARGIN MODE] symbol=%s side=%s cash_margin=%s margin_type=%s mode=%s cutoff=%s front_order_type=%s",
-                symbol,
-                side,
-                payload.get("CashMargin"),
-                payload.get("MarginTradeType"),
-                mode,
-                os.environ.get("ENTRY_DAYTRADE_CUTOFF_TIME", "15:00:00"),
-                payload.get("FrontOrderType"),
-            )
-            return payload
-
-        bse._make_payload = _make_payload_daytrade_cutoff
-        bse._daytrade_credit_payload_patched = True
-        bse._daytrade_credit_payload_patched_v2 = True
-        bse._daytrade_credit_payload_patched_v3 = True
-        return True
+        if int(payload.get("CashMargin", cm)) == 2:
+            payload["MarginTradeType"] = mt
+            payload["DelivType"] = 0
+            payload["AccountType"] = _env_int("KABU_ORDER_ACCOUNT_TYPE", _safe_int(payload.get("AccountType"), 4))
     except Exception:
-        logger.exception("[DAYTRADE CREDIT] buy_sell_entry payload patch failed")
-        return False
+        pass
+    logger.warning(
+        "[CREDIT ENTRY MARGIN MODE] symbol=%s side=%s cash_margin=%s margin_type=%s mode=%s cutoff=%s front_order_type=%s",
+        symbol,
+        side,
+        payload.get("CashMargin"),
+        payload.get("MarginTradeType"),
+        mode,
+        os.environ.get("ENTRY_DAYTRADE_CUTOFF_TIME", "15:00:00"),
+        payload.get("FrontOrderType"),
+    )
+    return payload
 
 
-def _patch_close_defaults() -> bool:
-    """Respect the actual position MarginTradeType on repayment orders."""
-    global _ORIG_CLOSE_SEND_CREDIT_CLOSE_ORDER, _ORIG_CLOSE_PROCESS_EXIT
+def send_credit_close_order_respect_margin(orig_send, symbol, qty, hold_id, side, exchange, margin_type, account_type):
+    """旧 send_credit_close_order_respect_margin (kabu_api.close.send_credit_close_order 差し替え)。
+
+    建玉の実 MarginTradeType を尊重し、取れないときだけ既定へ倒す。
+    """
+    mt = _safe_int(margin_type, 0)
+    if mt <= 0:
+        # Fallback only. Existing day-trade positions from this system normally have MarginTradeType=3.
+        mt = _env_int("KABU_DAYTRADE_MARGIN_TYPE", 3)
+    logger.warning(
+        "[CREDIT CLOSE MARGIN MODE] symbol=%s side=%s qty=%s hold_id=%s margin_type=%s order=MARKET",
+        symbol,
+        side,
+        qty,
+        hold_id,
+        mt,
+    )
+    return orig_send(symbol, qty, hold_id, side, exchange, mt, account_type)
+
+
+def apply_position_margin_type(position) -> None:
+    """旧 process_exit_respect_margin の前処理部分。
+
+    建玉に margin_trade_type が無ければデイトレ信用を入れてから返済する。
+    """
     try:
-        import kabu_api.close as close_mod
-        if getattr(close_mod, "_daytrade_credit_close_patched_v3", False):
-            return True
-
-        # If V1/V2 was already installed, bypass its wrapper and call the true original when available.
-        base_orig = None
-        try:
-            from core.startup import daytrade_credit_force_close_patch as self_mod
-            base_orig = getattr(self_mod, "_ORIG_CLOSE_SEND_CREDIT_CLOSE_ORDER", None)
-        except Exception:
-            base_orig = None
-
-        orig_send = base_orig if callable(base_orig) else getattr(close_mod, "send_credit_close_order", None)
-        orig_process = getattr(close_mod, "process_exit", None)
-        if not callable(orig_send) or not callable(orig_process):
-            return False
-        _ORIG_CLOSE_SEND_CREDIT_CLOSE_ORDER = orig_send
-        _ORIG_CLOSE_PROCESS_EXIT = orig_process
-
-        def send_credit_close_order_respect_margin(symbol, qty, hold_id, side, exchange, margin_type, account_type):
-            mt = _safe_int(margin_type, 0)
-            if mt <= 0:
-                # Fallback only. Existing day-trade positions from this system normally have MarginTradeType=3.
-                mt = _env_int("KABU_DAYTRADE_MARGIN_TYPE", 3)
-            logger.warning(
-                "[CREDIT CLOSE MARGIN MODE] symbol=%s side=%s qty=%s hold_id=%s margin_type=%s order=MARKET",
-                symbol,
-                side,
-                qty,
-                hold_id,
-                mt,
-            )
-            return orig_send(symbol, qty, hold_id, side, exchange, mt, account_type)
-
-        def process_exit_respect_margin(position, exit_price: float, reason: str):
-            try:
-                mt = _safe_int(getattr(position, "margin_trade_type", 0), 0)
-                if mt <= 0:
-                    setattr(position, "margin_trade_type", _env_int("KABU_DAYTRADE_MARGIN_TYPE", 3))
-            except Exception:
-                pass
-            return orig_process(position, exit_price, reason)
-
-        close_mod.send_credit_close_order = send_credit_close_order_respect_margin
-        close_mod.process_exit = process_exit_respect_margin
-        close_mod._daytrade_credit_close_patched = True
-        close_mod._daytrade_credit_close_patched_v2 = True
-        close_mod._daytrade_credit_close_patched_v3 = True
-        return True
+        mt = _safe_int(getattr(position, "margin_trade_type", 0), 0)
+        if mt <= 0:
+            setattr(position, "margin_trade_type", _env_int("KABU_DAYTRADE_MARGIN_TYPE", 3))
     except Exception:
-        logger.exception("[DAYTRADE CREDIT] close defaults patch failed")
-        return False
+        pass
 
 
 def _position_side_to_close_side(p: dict[str, Any]) -> int:
@@ -390,23 +345,29 @@ def _start_force_close_thread() -> bool:
         return False
 
 
-def install() -> bool:
-    global _INSTALLED
+_ENABLED = False
+
+
+def daytrade_enabled() -> bool:
+    """旧 install() が走ったか。kabu_api/close.py と buy_sell_entry.py が見る。"""
+    return bool(_ENABLED)
+
+
+def enable_daytrade_credit() -> bool:
+    """旧 install()。関数差し替えは本文化済みなので env 既定値と監視スレッドだけ。"""
+    global _INSTALLED, _ENABLED
     if _INSTALLED:
         return True
     if os.environ.get("DISABLE_DAYTRADE_CREDIT_FORCE_CLOSE_PATCH", "").strip() == "1":
         logger.warning("[DAYTRADE CREDIT] disabled by env")
         return False
     _set_daytrade_env_defaults()
-    payload_ok = _patch_buy_sell_entry_payload()
-    close_ok = _patch_close_defaults()
     thread_ok = _start_force_close_thread()
-    _INSTALLED = bool(payload_ok or close_ok or thread_ok)
+    _ENABLED = True
+    _INSTALLED = True
     logger.warning(
-        "[DAYTRADE CREDIT] installed version=%s payload=%s close=%s force_close_thread=%s daytrade_margin_type=%s system_margin_type=%s cutoff=%s close_time=%s only_margin_type=%s",
+        "[DAYTRADE CREDIT] installed version=%s payload=native close=native force_close_thread=%s daytrade_margin_type=%s system_margin_type=%s cutoff=%s close_time=%s only_margin_type=%s",
         VERSION,
-        payload_ok,
-        close_ok,
         thread_ok,
         os.environ.get("KABU_DAYTRADE_MARGIN_TYPE"),
         os.environ.get("KABU_SYSTEM_MARGIN_TYPE"),
@@ -414,7 +375,15 @@ def install() -> bool:
         os.environ.get("DAYTRADE_FORCE_CLOSE_TIME"),
         os.environ.get("DAYTRADE_FORCE_CLOSE_ONLY_MARGIN_TYPE"),
     )
-    return _INSTALLED
+    return True
 
 
-__all__ = ["VERSION", "install", "_force_close_positions_once"]
+__all__ = [
+    "VERSION",
+    "enable_daytrade_credit",
+    "daytrade_enabled",
+    "make_payload_daytrade_cutoff",
+    "send_credit_close_order_respect_margin",
+    "apply_position_margin_type",
+    "_force_close_positions_once",
+]
