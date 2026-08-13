@@ -1004,12 +1004,12 @@ def _install_entrypoint_runtime_patches() -> None:
     # 削除済みモジュールを import し続けており、起動のたびに
     # ImportError を except で拾って exception ログを出していたため除去した。
 
-    try:
-        from core.startup.summary_entry_pending_duplicate_registered_patch import install as install_summary_entry_pending_duplicate_registered_patch
-
-        install_summary_entry_pending_duplicate_registered_patch()
-    except Exception:
-        logger.exception("[startup.entrypoint] summary entry duplicate pending registered patch install failed")
+    # summary_entry_pending_duplicate_registered_patch は削除した (全体が死にコード)。
+    # register_pending_entries を包むが、直後に install される
+    # summary_ai_direct_timeout_continue_patch が `getattr(cur, "_original", cur)` で
+    # existing_fix の wrapper を掴み直すため、このラッパは必ず捨てられていた。
+    # 機能チェーン (_direct_add_pending / _protect_symbol 等) はすべてその
+    # ラッパからしか呼ばれず、env 書き込みも他属性の差し替えも無い。
 
     # entry_execute_timeout_guard_patch は
     # trading/handlers/entry_controller._execute_best_candidate 本体へ
