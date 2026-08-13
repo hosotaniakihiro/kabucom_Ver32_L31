@@ -200,12 +200,12 @@ def _install_global_context_summary_repair_patch() -> None:
 
 
 def _install_summary_controller_ready_mtf_patch() -> None:
-    try:
-        from core.startup.summary_controller_ready_mtf_patch import install as install_ready_mtf
-        ok = install_ready_mtf()
-        logger.warning("[STARTUP.RUNTIME] summary controller ready mtf patch installed=%s", ok)
-    except Exception:
-        logger.exception("[STARTUP.RUNTIME] summary controller ready mtf patch install failed")
+    """summary_controller_ready_mtf_patch は
+    trading/summary/controller_cache.py / controller_projection.py へ本文化済み
+    (trading/summary/controller_layers.apply_layers の 3 層目 = 最外周)。
+    install は不要になった。
+    """
+    return None
 
 
 # ranking_entry_runtime_fix_patch は trading/ranking/entry_from_ranking.py の

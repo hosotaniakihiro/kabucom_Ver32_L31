@@ -456,7 +456,7 @@ def _attach_display_ready_with_dedupe(df: pd.DataFrame) -> pd.DataFrame:
     return _dedupe_duplicate_columns(out, context="attach_display_ready:after")
 
 
-def attach_display_ready(df: pd.DataFrame) -> pd.DataFrame:
+def _attach_display_ready_core(df: pd.DataFrame) -> pd.DataFrame:
     if _dupcol_guard_enabled():
         return _attach_display_ready_with_dedupe(df)
     return _attach_display_ready_core(df)
@@ -1597,3 +1597,23 @@ def _lp_apply_env_defaults() -> None:
 
 if _lp_enabled():
     _lp_apply_env_defaults()
+
+
+# ============================================================
+# controller 層の 3 段ラッパー
+# (旧 core/startup の summary_controller_neutral_score_guard_patch /
+#  summary_controller_publish_mtf_merged_patch /
+#  summary_controller_ready_mtf_patch を本文化)
+# ------------------------------------------------------------
+# 各パッチの _ORIGINALS を実測した結果、合成は
+#   native <- neutral_score_guard <- publish_mtf_merged <- ready_mtf
+# の 3 層 (5 関数すべて同じ、捨てられている層は無い)。
+# その順序を trading/summary/controller_layers.apply_layers() が再現する。
+# ネイティブは *_core へ改名した。
+# ============================================================
+
+
+def attach_display_ready(*args, **kwargs):
+    from trading.summary.controller_layers import apply_layers as _apply_layers
+
+    return _apply_layers(_attach_display_ready_core, "attach_display_ready", "trading.summary.controller_cache.attach_display_ready", args, kwargs)

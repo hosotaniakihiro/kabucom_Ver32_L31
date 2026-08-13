@@ -969,12 +969,9 @@ def _install_entrypoint_runtime_patches() -> None:
     # ため、install() が属性を差し替える時点で全ての束縛が既に元関数を掴んでいた。
     # モジュール属性経由で呼ぶ箇所は1つも無く、ラッパは一度も実行されていなかった。
 
-    try:
-        from core.startup.summary_controller_publish_mtf_merged_patch import install as install_publish_mtf_merged_patch
-
-        install_publish_mtf_merged_patch()
-    except Exception:
-        logger.exception("[startup.entrypoint] publish mtf merged patch install failed")
+    # summary_controller_publish_mtf_merged_patch は
+    # trading/summary/controller_cache.py / controller_projection.py へ本文化済み
+    # (trading/summary/controller_layers.apply_layers の 2 層目)。
 
     try:
         from core.startup.summary_push_bg_due_interval_guard_patch import install as install_push_bg_due_guard

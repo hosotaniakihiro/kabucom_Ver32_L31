@@ -433,7 +433,10 @@ BACKGROUND_MAIN_PATCHES = [
     # 本文化済み (_emr_*)。controller_cache の history-first ラッパーは
     # 呼び手が居ない死んだラッパーだったので移していない。
     # 残りは下記 3 つの中継 install だけだったので、ここへ直接並べた。
-    ("core.startup.summary_controller_neutral_score_guard_patch", "SUMMARY_MTF_EARLY_READY", "DISABLE_SUMMARY_MTF_EARLY_READY_PATCH"),
+    # summary_controller_neutral_score_guard_patch は
+    # trading/summary/controller_cache.py / controller_projection.py へ本文化済み
+    # (trading/summary/controller_layers.apply_layers の 1 層目)。
+    # DISABLE_SUMMARY_MTF_EARLY_READY_PATCH は controller_layers.neutral_enabled() が見る。
     ("core.startup.summary_mtf_push_raw_fallback_patch", "SUMMARY_MTF_EARLY_READY", "DISABLE_SUMMARY_MTF_EARLY_READY_PATCH"),
     ("core.startup.summary_ai_order_builder_range_repair_patch", "SUMMARY_MTF_EARLY_READY", "DISABLE_SUMMARY_MTF_EARLY_READY_PATCH"),
     ("trading.audit_logging.install_audit_logging", "AUDIT_LOGGING", "DISABLE_AUDIT_LOGGING"),

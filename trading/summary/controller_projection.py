@@ -346,7 +346,7 @@ def _build_display_ready_mask(df: pd.DataFrame) -> pd.Series:
         return pd.Series(False, index=idx)
 
 
-def rebuild_display_ready(df: pd.DataFrame) -> pd.DataFrame:
+def _rebuild_display_ready_core(df: pd.DataFrame) -> pd.DataFrame:
     """
     display_ready を再構築する。
 
@@ -675,7 +675,7 @@ def _apply_soft_technical_ready(out: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def rebuild_technical_ready(df: pd.DataFrame) -> pd.DataFrame:
+def _rebuild_technical_ready_core(df: pd.DataFrame) -> pd.DataFrame:
     """
     technical_ready は厳格に判定する。
 
@@ -801,7 +801,7 @@ def source_priority_series(df: pd.DataFrame) -> pd.Series:
 # latest projection
 # ==========================================================
 
-def latest_row_per_symbol(
+def _latest_row_per_symbol_core(
     df: pd.DataFrame,
     normalize_fn: Callable[[pd.DataFrame], pd.DataFrame],
 ) -> pd.DataFrame:
@@ -823,7 +823,7 @@ def latest_row_per_symbol(
         return rebuild_display_ready(out)
 
 
-def latest_row_per_symbol_mature_first(
+def _latest_row_per_symbol_mature_first_core(
     df: pd.DataFrame,
     normalize_fn: Callable[[pd.DataFrame], pd.DataFrame],
 ) -> pd.DataFrame:
@@ -959,3 +959,41 @@ __all__ = [
     "latest_row_per_symbol",
     "latest_row_per_symbol_mature_first",
 ]
+
+
+# ============================================================
+# controller 層の 3 段ラッパー
+# (旧 core/startup の summary_controller_neutral_score_guard_patch /
+#  summary_controller_publish_mtf_merged_patch /
+#  summary_controller_ready_mtf_patch を本文化)
+# ------------------------------------------------------------
+# 各パッチの _ORIGINALS を実測した結果、合成は
+#   native <- neutral_score_guard <- publish_mtf_merged <- ready_mtf
+# の 3 層 (5 関数すべて同じ、捨てられている層は無い)。
+# その順序を trading/summary/controller_layers.apply_layers() が再現する。
+# ネイティブは *_core へ改名した。
+# ============================================================
+
+
+def rebuild_display_ready(*args, **kwargs):
+    from trading.summary.controller_layers import apply_layers as _apply_layers
+
+    return _apply_layers(_rebuild_display_ready_core, "rebuild_display_ready", "trading.summary.controller_projection.rebuild_display_ready", args, kwargs)
+
+
+def rebuild_technical_ready(*args, **kwargs):
+    from trading.summary.controller_layers import apply_layers as _apply_layers
+
+    return _apply_layers(_rebuild_technical_ready_core, "rebuild_technical_ready", "trading.summary.controller_projection.rebuild_technical_ready", args, kwargs)
+
+
+def latest_row_per_symbol(*args, **kwargs):
+    from trading.summary.controller_layers import apply_layers as _apply_layers
+
+    return _apply_layers(_latest_row_per_symbol_core, "latest_row_per_symbol", "trading.summary.controller_projection.latest_row_per_symbol", args, kwargs)
+
+
+def latest_row_per_symbol_mature_first(*args, **kwargs):
+    from trading.summary.controller_layers import apply_layers as _apply_layers
+
+    return _apply_layers(_latest_row_per_symbol_mature_first_core, "latest_row_per_symbol_mature_first", "trading.summary.controller_projection.latest_row_per_symbol_mature_first", args, kwargs)
