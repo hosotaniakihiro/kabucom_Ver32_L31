@@ -303,23 +303,12 @@ def install() -> bool:
             logger.warning("[SUMMARY AI STRATEGY MODE] target build_approved_row missing version=%s", VERSION)
             return False
 
-        if not getattr(cur_build, "_summary_ai_strategy_mode_v1", False):
-            _ORIG_BUILD_APPROVED_ROW = cur_build
-            @wraps(cur_build)
-            def _build_approved_row_with_strategy(ai_ok_item: dict[str, Any]):
-                row = cur_build(ai_ok_item)
-                if isinstance(row, dict):
-                    _enrich(row)
-                    logger.warning(
-                        "[SUMMARY AI STRATEGY MODE] approved symbol=%s side=%s mode=%s score=%s breakout=%s pullback=%s reversal=%s reasons=%s version=%s",
-                        row.get("symbol"), row.get("side"), row.get("strategy_mode"), row.get("strategy_score"),
-                        row.get("strategy_breakout_score"), row.get("strategy_pullback_score"), row.get("strategy_reversal_score"),
-                        row.get("strategy_reasons"), VERSION,
-                    )
-                return row
-            _build_approved_row_with_strategy._summary_ai_strategy_mode_v1 = True  # type: ignore[attr-defined]
-            _build_approved_row_with_strategy._original = cur_build  # type: ignore[attr-defined]
-            ex.build_approved_row = _build_approved_row_with_strategy
+        # build_approved_row のラップは撤去した。
+        # 旧 summary_ai_approved_row_range_repair_patch が install 時に
+        # `getattr(cur, "_original", cur)` で素の実装を掴み直すため、
+        # install順 (strategy_mode -> range_repair) によりこのラッパは
+        # 実運用で必ず捨てられていた (合成順シミュレーションで確認済み)。
+        # range_repair 側は trading/entry/summary_ai/executor.py へ本文化済み。
 
         if callable(cur_quality) and not getattr(cur_quality, "_summary_ai_strategy_quality_v1", False):
             _ORIG_PASSES_QUALITY = cur_quality

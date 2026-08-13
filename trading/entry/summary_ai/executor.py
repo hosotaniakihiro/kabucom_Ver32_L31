@@ -665,7 +665,7 @@ def _retryable_no_tradable(result: Any) -> bool:
         return False
 
 
-def build_approved_row(ai_ok_item: Dict[str, Any]) -> Dict[str, Any]:
+def build_approved_row_core(ai_ok_item: Dict[str, Any]) -> Dict[str, Any]:
     ai_row = _as_dict(ai_ok_item.get("ai_row"))
     src = _as_dict(ai_ok_item.get("source_row"))
     side = _pick_side(ai_ok_item)
@@ -1811,3 +1811,205 @@ __all__ = [
     "_entry_price_bounds",
     "_positive_result",
 ]
+
+
+# ============================================================
+# approved row のレンジ補修
+# ------------------------------------------------------------
+# 旧 core/startup/summary_ai_approved_row_range_repair_patch.py を本文化。
+# AI承認行の high/low/range/atr を元 item 側の値とマージして整合させる。
+#
+# 【重要】同じ build_approved_row を summary_ai_strategy_mode_patch も包むが、
+# 旧 range_repair は `getattr(cur, "_original", cur)` で素の実装を掴み直す
+# 設計だったため、install順 (strategy_mode -> range_repair) により
+# strategy_mode 側の build_approved_row ラッパは実運用では捨てられていた。
+# 本文化に合わせて strategy_mode 側の当該ラッパも撤去してある
+# (残すと今まで無効だった enrich が有効化されてしまう)。
+# 合成順シミュレーションで確認済み。
+#
+# 適用スコープは旧 install 導線 (summary_ai_more_candidates_patch <- main.py) と
+# env SUMMARY_AI_APPROVED_ROW_RANGE_REPAIR (既定True) を再現する。
+# ============================================================
+
+def _arr_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return bool(default)
+        s = str(raw).strip().lower()
+        if s in _TRUE:
+            return True
+        if s in _FALSE:
+            return False
+    except Exception:
+        pass
+    return bool(default)
+
+
+def _arr_safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or str(v).strip() == "":
+            return float(default)
+        x = float(str(v).replace(",", ""))
+        if x != x or x in (float("inf"), float("-inf")):
+            return float(default)
+        return float(x)
+    except Exception:
+        return float(default)
+
+
+def _arr_row_dict(row: Any) -> dict[str, Any]:
+    try:
+        if isinstance(row, dict):
+            return row
+        if hasattr(row, "to_dict"):
+            d = row.to_dict()
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    return {}
+
+
+def _arr_get_first(d: dict[str, Any], names: tuple[str, ...], default: float = 0.0) -> float:
+    for name in names:
+        try:
+            if name in d:
+                x = _arr_safe_float(d.get(name), 0.0)
+                if x > 0:
+                    return x
+        except Exception:
+            continue
+    return float(default)
+
+
+def _arr_put(row: Any, key: str, value: float) -> None:
+    try:
+        if isinstance(row, dict):
+            row[key] = value
+            return
+        if hasattr(row, "__setitem__"):
+            row[key] = value
+            return
+        setattr(row, key, value)
+    except Exception:
+        pass
+
+
+def _arr_merge_sources(approved_row: Any, item: Any) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    try:
+        merged.update(_arr_row_dict(item))
+    except Exception:
+        pass
+    try:
+        merged.update(_arr_row_dict(approved_row))
+    except Exception:
+        pass
+    return merged
+
+
+def _arr_repair_approved_row_range(approved_row: Any, item: Any = None) -> Any:
+    try:
+        if approved_row is None:
+            return approved_row
+        d = _arr_merge_sources(approved_row, item)
+        symbol = str(d.get("symbol") or d.get("Symbol") or "").strip()
+
+        close = _arr_get_first(d, (
+            "close", "close_price", "current_price", "price", "last_price", "ai_disp_close",
+            "entry_price", "limit_price",
+        ))
+        if close <= 0:
+            return approved_row
+
+        high = _arr_get_first(d, ("high", "high_price", "bar_high", "summary_high"))
+        low = _arr_get_first(d, ("low", "low_price", "bar_low", "summary_low"))
+        current_range_ok = high > 0 and low > 0 and high >= low and abs(high - low) > 1e-9
+        if current_range_ok:
+            return approved_row
+
+        range_high = _arr_get_first(d, (
+            "day_high", "today_high", "intraday_high", "session_high",
+            "range_high", "ranking_high", "snapshot_high", "high_price_day",
+            "ai_disp_day_high", "ai_disp_high",
+        ))
+        range_low = _arr_get_first(d, (
+            "day_low", "today_low", "intraday_low", "session_low",
+            "range_low", "ranking_low", "snapshot_low", "low_price_day",
+            "ai_disp_day_low", "ai_disp_low",
+        ))
+
+        if not (range_high > 0 and range_low > 0 and range_high >= range_low):
+            return approved_row
+        if abs(range_high - range_low) <= 1e-9:
+            return approved_row
+
+        # 発注直前価格が日中レンジ外に少し出ている場合でも、high/lowが破綻しないよう包含する。
+        repaired_high = max(float(range_high), float(close))
+        repaired_low = min(float(range_low), float(close))
+        if repaired_high <= 0 or repaired_low <= 0 or repaired_high < repaired_low:
+            return approved_row
+
+        _arr_put(approved_row, "high", repaired_high)
+        _arr_put(approved_row, "low", repaired_low)
+        _arr_put(approved_row, "range_high", repaired_high)
+        _arr_put(approved_row, "range_low", repaired_low)
+        _arr_put(approved_row, "day_high", repaired_high)
+        _arr_put(approved_row, "day_low", repaired_low)
+        try:
+            range_pct = abs(repaired_high - repaired_low) / max(float(close), 1.0)
+            _arr_put(approved_row, "range_pct", range_pct)
+            _arr_put(approved_row, "intraday_range_pct", range_pct)
+            _arr_put(approved_row, "day_range_pct", range_pct)
+            _arr_put(approved_row, "summary_ai_approved_row_range_repaired", True)
+            _arr_put(approved_row, "summary_ai_approved_row_range_repair_version", _ARR_VERSION)
+        except Exception:
+            pass
+
+        logger.warning(
+            "[SUMMARY AI APPROVED ROW RANGE REPAIR] repaired symbol=%s close=%s old_high=%s old_low=%s new_high=%s new_low=%s version=%s",
+            symbol,
+            close,
+            high,
+            low,
+            repaired_high,
+            repaired_low,
+            _ARR_VERSION,
+        )
+        return approved_row
+    except Exception:
+        logger.exception("[SUMMARY AI APPROVED ROW RANGE REPAIR] repair failed; return original")
+        return approved_row
+
+
+_ARR_VERSION = "V1-SUMMARY-AI-APPROVED-ROW-RANGE-REPAIR"
+_ARR_SCOPE: Optional[bool] = None
+
+
+def _arr_enabled() -> bool:
+    global _ARR_SCOPE
+    if _ARR_SCOPE is not None:
+        return _ARR_SCOPE
+    enabled = False
+    try:
+        if _arr_env_bool("SUMMARY_AI_APPROVED_ROW_RANGE_REPAIR", True):
+            argv_text = " ".join(str(x) for x in sys.argv).replace("\\", "/").lower()
+            db_names = (
+                "main_database.py", "data_collectors_runner.py", "db_prepare_runner.py",
+                "push_receiver_runner.py", "yahoo_complement_runner.py",
+                "summary_database_runner.py", "ranking_collector_runner.py",
+            )
+            if not any(n in argv_text for n in db_names):
+                enabled = "main.py" in argv_text
+    except Exception:
+        enabled = False
+    _ARR_SCOPE = enabled
+    return enabled
+
+
+def build_approved_row(ai_ok_item: Dict[str, Any]) -> Dict[str, Any]:
+    row = build_approved_row_core(ai_ok_item)
+    if not _arr_enabled():
+        return row
+    return _arr_repair_approved_row_range(row, ai_ok_item)

@@ -157,19 +157,14 @@ def _install_final_gate_relax_patch() -> bool:
         return False
 
 
-def _install_approved_row_range_repair_patch(reason: str = "install") -> bool:
-    global _APPROVED_ROW_RANGE_REPAIR_INSTALLED
-    if _APPROVED_ROW_RANGE_REPAIR_INSTALLED:
-        return True
-    try:
-        from core.startup.summary_ai_approved_row_range_repair_patch import install as install_range_repair
-        ok = bool(install_range_repair())
-        _APPROVED_ROW_RANGE_REPAIR_INSTALLED = ok
-        logger.warning("[SUMMARY AI MORE CANDIDATES PATCH] approved row range repair installed=%s reason=%s version=%s", ok, reason, VERSION)
-        return ok
-    except Exception:
-        logger.exception("[SUMMARY AI MORE CANDIDATES PATCH] approved row range repair install failed reason=%s", reason)
-        return False
+def _install_approved_row_range_repair_patch() -> bool:
+    """approved row のレンジ補修。
+
+    旧 core/startup/summary_ai_approved_row_range_repair_patch.py は
+    trading/entry/summary_ai/executor.build_approved_row へ本文化済み
+    (スコープと env ゲートは同ファイルの _arr_enabled() が再現)。
+    """
+    return True
 
 
 def _install_range_pct_repair_patch(reason: str = "install") -> bool:
