@@ -122,7 +122,7 @@ from trading.filters.volatility_filter import (
     range_5m_filter,
 )
 
-from trading.entry.lot_sizer import calculate_entry_quantity
+from trading.entry.lot_sizer import calculate_entry_quantity as _calculate_entry_quantity_base
 
 from trading.risk.boost_engine import BoostEngine
 from trading.monitor.boost_monitor import BoostMonitor
@@ -3712,3 +3712,158 @@ def _run_entry_pipeline_core(
 # ============================================================
 if _ranking_rescue_scope_enabled():
     _ranking_rescue_apply_env_defaults()
+
+
+# ============================================================
+# 最小単元フォールバック (発注数量)
+# ------------------------------------------------------------
+# 旧 core/startup/entry_qty_min_lot_runtime_patch.py の
+# calculate_entry_quantity ラップを本文化。
+#
+# lot_sizer が 0 株を返したとき、予算内で最小単元が買えるなら最小単元だけ
+# 発注する。買えない/価格レンジ外なら 0 のまま。
+# 無効化は従来どおり ENTRY_MIN_LOT_FALLBACK_WHEN_AFFORDABLE=0。
+#
+# 旧パッチは ec.calculate_entry_quantity (モジュール属性) を差し替えており、
+# :2849 の呼び出しがそれを見ていた。ここで公開名を定義するのは等価。
+# ヘルパは本ファイル既存の _safe_float / _safe_int / _env_bool と実装が
+# 異なるため、旧パッチのものを _qty_* として移植した (流用しない)。
+#
+# 適用スコープは旧 install 導線 (main.py:220) を再現する。
+# ============================================================
+
+def _qty_safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or v == "":
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def _qty_safe_int(v: Any, default: int = 0) -> int:
+    try:
+        if v is None or v == "":
+            return default
+        return int(float(v))
+    except Exception:
+        return default
+
+
+def _qty_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "ng"}:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
+
+
+def _qty_get_budget() -> float:
+    try:
+        from trading.entry.entry_budget import get_max_entry_oneshot_yen
+        v = float(get_max_entry_oneshot_yen())
+        if v > 0:
+            return v
+    except Exception:
+        pass
+    return _qty_safe_float(os.getenv("MAX_ENTRY_ONESHOT_YEN"), 700000.0)
+
+
+def _qty_get_lot() -> int:
+    try:
+        from trading.entry.entry_budget import get_order_lot_size
+        v = int(get_order_lot_size())
+        if v > 0:
+            return v
+    except Exception:
+        pass
+    return _qty_safe_int(os.getenv("ORDER_LOT_SIZE"), 100)
+
+
+def _qty_price_range_ok(price: float) -> bool:
+    try:
+        from trading.entry.entry_budget import can_afford_min_lot
+        ok, diag = can_afford_min_lot(price)
+        if not ok:
+            logger.warning("[ENTRY QTY MINLOT PATCH] affordability NG price=%s diag=%s", price, diag)
+        return bool(ok)
+    except Exception:
+        min_price = _qty_safe_float(os.getenv("ENTRY_MIN_PRICE"), 3000.0)
+        max_price = _qty_safe_float(os.getenv("ENTRY_MAX_PRICE"), 7000.0)
+        return bool(price >= min_price and price <= max_price)
+
+
+_QTY_MINLOT_SCOPE = None
+
+
+def _qty_minlot_enabled() -> bool:
+    global _QTY_MINLOT_SCOPE
+    if _QTY_MINLOT_SCOPE is not None:
+        return _QTY_MINLOT_SCOPE
+    enabled = False
+    try:
+        import sys as _sys
+
+        argv_text = " ".join(str(x) for x in _sys.argv).replace("\\", "/").lower()
+        db_names = (
+            "main_database.py", "data_collectors_runner.py", "db_prepare_runner.py",
+            "push_receiver_runner.py", "yahoo_complement_runner.py",
+            "summary_database_runner.py", "ranking_collector_runner.py",
+        )
+        if not any(n in argv_text for n in db_names):
+            enabled = "main.py" in argv_text
+    except Exception:
+        enabled = False
+    _QTY_MINLOT_SCOPE = enabled
+    return enabled
+
+
+def calculate_entry_quantity(*, symbol: str, price: float, confidence: float, lot_multiplier: float, atr=None) -> int:
+    qty = 0
+    try:
+        qty = int(_calculate_entry_quantity_base(
+            symbol=symbol, price=price, confidence=confidence, lot_multiplier=lot_multiplier, atr=atr
+        ))
+    except Exception:
+        logger.exception("[ENTRY QTY MINLOT PATCH] original lot_sizer failed symbol=%s", symbol)
+        qty = 0
+
+    if qty > 0:
+        return qty
+    if not _qty_minlot_enabled():
+        return 0
+    if not _qty_env_bool("ENTRY_MIN_LOT_FALLBACK_WHEN_AFFORDABLE", True):
+        return 0
+
+    p = _qty_safe_float(price, 0.0)
+    if p <= 0:
+        return 0
+
+    budget = _qty_get_budget()
+    lot = _qty_get_lot()
+    if lot <= 0:
+        lot = 100
+
+    if not _qty_price_range_ok(p):
+        return 0
+
+    max_qty = int((budget // p) // lot * lot)
+    if max_qty < lot:
+        logger.warning(
+            "[ENTRY QTY MINLOT PATCH] cannot afford min lot symbol=%s price=%.1f budget=%.0f lot=%s max_qty=%s",
+            symbol, p, budget, lot, max_qty,
+        )
+        return 0
+
+    logger.warning(
+        "[ENTRY QTY MINLOT PATCH] qty 0 -> min lot fallback symbol=%s price=%.1f qty=%s budget=%.0f lot=%s confidence=%s multiplier=%s atr=%s",
+        symbol, p, lot, budget, lot, confidence, lot_multiplier, atr,
+    )
+    return int(lot)

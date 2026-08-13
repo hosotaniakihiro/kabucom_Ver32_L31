@@ -289,22 +289,11 @@ def install() -> bool:
 
     if _INSTALLED:
         return bool(env_ok or display_ok or True)
-    try:
-        import trading.handlers.entry_controller as ec
-        old = getattr(ec, "calculate_entry_quantity", None)
-        if callable(old) and getattr(old, "_entry_qty_minlot_patch_v1", False):
-            _INSTALLED = True
-            logger.warning("[ENTRY QTY MINLOT PATCH] already installed")
-            return True
-        _ORIGINAL = old
-        _patched_calculate_entry_quantity._entry_qty_minlot_patch_v1 = True  # type: ignore[attr-defined]
-        ec.calculate_entry_quantity = _patched_calculate_entry_quantity
-        _INSTALLED = True
-        logger.warning("[ENTRY QTY MINLOT PATCH] installed")
-        return True
-    except Exception:
-        logger.exception("[ENTRY QTY MINLOT PATCH] install failed")
-        return bool(env_ok or display_ok)
+    # calculate_entry_quantity の最小単元フォールバックは
+    # trading/handlers/entry_controller.py へ本文化済み
+    # (スコープは同ファイルの _qty_minlot_enabled() が再現)。
+    _INSTALLED = True
+    return bool(env_ok or display_ok or True)
 
 
 try:
