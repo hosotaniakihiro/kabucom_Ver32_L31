@@ -23,6 +23,7 @@ import logging
 import math
 import datetime as dt
 import os
+from typing import Any
 
 from AI.predict_mtf import predict_mtf
 from AI.train.entry.entry_immediate_profit import predict_immediate_profit
@@ -219,7 +220,7 @@ def _resolve_min_score_for_side(*, source: str, is_ranking: bool, decision: str 
     return _cfg_float("MIN_ENTRY_SCORE", 4.0, env_name="MIN_ENTRY_SCORE")
 
 
-def _summary_mtf_status(row: dict, *, source: str, interval: int) -> tuple[str, str]:
+def _summary_mtf_status_core(row: dict, *, source: str, interval: int) -> tuple[str, str]:
     """
     MTF判定前の状態確認。
     戻り値: (status, reason)
@@ -832,3 +833,168 @@ def ai_final_entry_check(row: dict) -> dict:
     result = _ranking_entry_mtf_low_failopen(row, result)
     result = _low_volatility_entry_guard(row, result)
     return result
+
+
+# ============================================================
+# SUMMARY MTF EARLY READY
+# (旧 core/startup/summary_mtf_early_ready_patch.py を本文化)
+# ------------------------------------------------------------
+# SUMMARY 由来の行で MTF が "block" になったとき、MA5 が実質そろって
+# いれば "skip" へ fail-open する層。ネイティブは
+# _summary_mtf_status_core へ改名した。
+#
+# 旧パッチの他のサブ処理:
+#  - controller_cache.choose_merged_cache_payload の history-first ラッパー
+#    -> choose_merged_cache_payload の呼び出し元はリポジトリ全体で
+#       trading/summary/summary_controller.py の 2 箇所だけで、そこは
+#       from-import 束縛 (38行) を使う。旧 summary_latest_prefer_patch が
+#       その束縛も上書きしていたため、history-first ラッパーは
+#       誰からも呼ばれない死んだラッパーだった。よって移していない。
+#  - neutral_score_guard / push_raw_fallback / order_builder_range_repair の
+#    中継 install -> sitecustomize の patch リストへ直接並べた。
+# ============================================================
+
+def _emr_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _emr_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _emr_safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None:
+            return default
+        s = str(v).strip()
+        if not s or s.lower() in {"nan", "none", "nat", "<na>"}:
+            return default
+        return float(s.replace(",", ""))
+    except Exception:
+        return default
+
+
+def _emr_bool_like(v: Any, default: bool = False) -> bool:
+    try:
+        if isinstance(v, bool):
+            return v
+        if v is None:
+            return default
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "ng", ""}:
+            return False
+        return default
+    except Exception:
+        return default
+
+
+def _emr_side_of(row: dict[str, Any]) -> str:
+    s = str(row.get("entry_decision") or row.get("side") or "").strip().upper()
+    return s if s in {"BUY", "SELL"} else ""
+
+
+def _emr_score_of(row: dict[str, Any], side: str) -> float:
+    if side == "BUY":
+        return max(
+            _emr_safe_float(row.get("buy_score"), 0.0),
+            _emr_safe_float(row.get("score_buy"), 0.0),
+            _emr_safe_float(row.get("score"), 0.0),
+            _emr_safe_float(row.get("final_score"), 0.0),
+        )
+    if side == "SELL":
+        return max(
+            _emr_safe_float(row.get("sell_score"), 0.0),
+            _emr_safe_float(row.get("score_sell"), 0.0),
+            abs(_emr_safe_float(row.get("score"), 0.0)),
+            abs(_emr_safe_float(row.get("final_score"), 0.0)),
+        )
+    return abs(_emr_safe_float(row.get("score"), 0.0))
+
+
+def _emr_early_ma5_ready(row: dict[str, Any], *, interval: int, reason: str) -> tuple[bool, str]:
+    if not _emr_env_bool("SUMMARY_MTF_EARLY_READY_ENABLED", True):
+        return False, "disabled"
+
+    if int(interval or 1) not in {3, 5}:
+        return False, "not_3m_5m"
+
+    if "hist_short" not in str(reason or ""):
+        return False, "not_hist_short"
+
+    technical_ready = _emr_bool_like(row.get("technical_ready"), False)
+    display_ready = _emr_bool_like(row.get("display_ready"), technical_ready)
+    if not technical_ready or not display_ready:
+        return False, "not_ready_flags"
+
+    hist = _emr_safe_float(row.get("symbol_hist_len"), 0.0)
+    min_hist = _emr_env_float("SUMMARY_MTF_EARLY_HIST_MIN", 5.0)
+    if hist < min_hist:
+        return False, f"hist_too_short:{hist:.0f}<{min_hist:.0f}"
+
+    side = _emr_side_of(row)
+    if not side:
+        return False, "side_missing"
+
+    close = _emr_safe_float(row.get("close_price") or row.get("close") or row.get("price"), 0.0)
+    ma5 = _emr_safe_float(row.get("ma5") or row.get("ma_5"), 0.0)
+    slope = _emr_safe_float(row.get("slope_atr_scaled"), _emr_safe_float(row.get("slope"), 0.0))
+    score = _emr_score_of(row, side)
+
+    min_score = _emr_env_float("SUMMARY_MTF_EARLY_MIN_SCORE", 1.0)
+    min_slope = abs(_emr_env_float("SUMMARY_MTF_EARLY_MIN_SLOPE", 0.0001))
+
+    if score < min_score:
+        return False, f"score_low:{score:.3f}<{min_score:.3f}"
+
+    if close <= 0 or ma5 <= 0:
+        if side == "BUY" and slope >= min_slope:
+            return True, f"early_mtf_buy_slope_only:hist={hist:.0f}:slope={slope:.5f}:score={score:.2f}"
+        if side == "SELL" and slope <= -min_slope:
+            return True, f"early_mtf_sell_slope_only:hist={hist:.0f}:slope={slope:.5f}:score={score:.2f}"
+        return False, "ma5_or_close_missing"
+
+    if side == "BUY":
+        if close >= ma5 and slope >= -min_slope:
+            return True, f"early_mtf_buy_ma5_ready:hist={hist:.0f}:close={close:.2f}:ma5={ma5:.2f}:slope={slope:.5f}:score={score:.2f}"
+        return False, f"buy_ma5_direction_ng:close={close:.2f}:ma5={ma5:.2f}:slope={slope:.5f}"
+
+    if side == "SELL":
+        if close <= ma5 and slope <= min_slope:
+            return True, f"early_mtf_sell_ma5_ready:hist={hist:.0f}:close={close:.2f}:ma5={ma5:.2f}:slope={slope:.5f}:score={score:.2f}"
+        return False, f"sell_ma5_direction_ng:close={close:.2f}:ma5={ma5:.2f}:slope={slope:.5f}"
+
+    return False, "side_ng"
+
+
+def _summary_mtf_status(row: dict, *, source: str, interval: int) -> tuple[str, str]:
+    status, reason = _summary_mtf_status_core(row, source=source, interval=interval)
+    try:
+        if source == "SUMMARY" and status == "block":
+            ok, detail = _emr_early_ma5_ready(row, interval=int(interval), reason=str(reason))
+            if ok:
+                logger.warning(
+                    "[SUMMARY MTF EARLY READY PATCH] fail-open SUMMARY MTF symbol=%s interval=%s side=%s original=%s detail=%s",
+                    row.get("symbol"), interval, _emr_side_of(row), reason, detail,
+                )
+                return "skip", detail
+            logger.info(
+                "[SUMMARY MTF EARLY READY PATCH] keep block symbol=%s interval=%s side=%s original=%s detail=%s",
+                row.get("symbol"), interval, _emr_side_of(row), reason, detail,
+            )
+    except Exception:
+        logger.exception("[SUMMARY MTF EARLY READY PATCH] decision failed symbol=%s", row.get("symbol") if isinstance(row, dict) else None)
+    return status, reason

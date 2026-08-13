@@ -422,7 +422,13 @@ BACKGROUND_MAIN_PATCHES = [
     ("core.startup.summary_ai_candidate_refill_patch", "SUMMARY_AI_CANDIDATE_REFILL", "DISABLE_SUMMARY_AI_CANDIDATE_REFILL_PATCH"),
     ("core.startup.summary_ai_runtime_consistency_patch", "SUMMARY_AI_RUNTIME_CONSISTENCY_BG", "DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH"),
     ("trading.filters.summary_ai_range_bridge", "SUMMARY_AI_LOW_MOVE_SOFTPASS", "DISABLE_SUMMARY_AI_LOW_MOVE_SOFTPASS_PATCH"),
-    ("core.startup.summary_mtf_early_ready_patch", "SUMMARY_MTF_EARLY_READY", "DISABLE_SUMMARY_MTF_EARLY_READY_PATCH"),
+    # summary_mtf_early_ready_patch は AI/entry_gate.py の _summary_mtf_status へ
+    # 本文化済み (_emr_*)。controller_cache の history-first ラッパーは
+    # 呼び手が居ない死んだラッパーだったので移していない。
+    # 残りは下記 3 つの中継 install だけだったので、ここへ直接並べた。
+    ("core.startup.summary_controller_neutral_score_guard_patch", "SUMMARY_MTF_EARLY_READY", "DISABLE_SUMMARY_MTF_EARLY_READY_PATCH"),
+    ("core.startup.summary_mtf_push_raw_fallback_patch", "SUMMARY_MTF_EARLY_READY", "DISABLE_SUMMARY_MTF_EARLY_READY_PATCH"),
+    ("core.startup.summary_ai_order_builder_range_repair_patch", "SUMMARY_MTF_EARLY_READY", "DISABLE_SUMMARY_MTF_EARLY_READY_PATCH"),
     ("trading.audit_logging.install_audit_logging", "AUDIT_LOGGING", "DISABLE_AUDIT_LOGGING"),
     # summary_main_push_db_refresh_patch / direct_push_1m (旧 summary_main_direct_push_force_patch) の
     # background 再適用は削除した。どちらも冪等な no-op で、SYNC_MAIN_PATCHES
