@@ -222,7 +222,7 @@ def _consecutive_true_counts(values: pd.Series) -> pd.Series:
     return pd.Series(out, index=values.index, dtype="int64")
 
 
-def add_volume_surge_features(df: pd.DataFrame, *, interval: int) -> pd.DataFrame:
+def _add_volume_surge_features_core(df: pd.DataFrame, *, interval: int) -> pd.DataFrame:
     x = normalize_summary_base(df, interval=interval)
     x = _filter_recent_rows(x, interval=interval, label="feature_source")
     if x.empty:
@@ -408,6 +408,41 @@ def build_scalping_feature_df() -> pd.DataFrame:
     except Exception:
         pass
     return out.reset_index(drop=True)
+
+
+# ============================================================
+# RAW1 履歴 resample フォールバック
+# (旧 core/startup/tonosama_history_missing_guard_patch.py の
+#  _patch_volume_surge_rolling_before_recent を本文化)
+# ------------------------------------------------------------
+# 旧パッチは install 時に vs.add_volume_surge_features を 1 枚だけ包んで
+# いた (この属性を包む他パッチは無い)。ネイティブは *_core へ改名し、
+# ここが公開名を持つ。上の build_scalping_feature_df からの呼び出しも
+# モジュールグローバル経由なので、旧構成と同じくこの層を通る。
+#
+# 適用スコープは sitecustomize のパッチ一覧と同じで、
+# DISABLE_TONOSAMA_HISTORY_MISSING_GUARD_PATCH=1 のときだけ素の実装に戻す。
+# (旧 install はこの差し替えを TONOSAMA_HISTORY_MISSING_GUARD_ENABLED の
+#  判定より前に行っていたので、そちらは見ない)
+# ============================================================
+
+
+def _hg_surge_guard_enabled() -> bool:
+    try:
+        return str(os.environ.get("DISABLE_TONOSAMA_HISTORY_MISSING_GUARD_PATCH", "")).strip() != "1"
+    except Exception:
+        return True
+
+
+def add_volume_surge_features(df: pd.DataFrame, *, interval: int) -> pd.DataFrame:
+    if not _hg_surge_guard_enabled():
+        return _add_volume_surge_features_core(df, interval=interval)
+    try:
+        from trading.entry.tonosama.history_missing_guard import add_volume_surge_features_guarded
+    except Exception:
+        logger.exception("[TONOSAMA SURGE ROLLING PATCH] guard import failed; use core")
+        return _add_volume_surge_features_core(df, interval=interval)
+    return add_volume_surge_features_guarded(df, interval=interval)
 
 
 __all__ = ["build_scalping_feature_df", "add_volume_surge_features"]

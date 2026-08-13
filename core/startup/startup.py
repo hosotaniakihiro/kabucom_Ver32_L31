@@ -953,9 +953,14 @@ def _install_entrypoint_runtime_patches() -> None:
         logger.exception("[startup.entrypoint] board REST API monitor install failed")
 
     try:
-        from core.startup.tonosama_history_missing_guard_patch import install as install_tonosama_history_guard
+        # tonosama_history_missing_guard_patch は本文化済み:
+        #   閾値      -> trading/filters/volatility_filter.py
+        #   surge     -> trading/entry/tonosama/volume_surge.py
+        #   build     -> trading/entry/tonosama/runner.py
+        # 残るのは env 既定値の適用だけ。
+        from trading.entry.tonosama.history_missing_guard import apply_history_guard_defaults
 
-        install_tonosama_history_guard()
+        apply_history_guard_defaults()
     except Exception:
         logger.exception("[startup.entrypoint] tonosama history missing guard install failed")
 

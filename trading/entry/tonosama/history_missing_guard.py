@@ -1,5 +1,5 @@
 # ============================================================
-# File   : core/startup/tonosama_history_missing_guard_patch.py
+# File   : trading/entry/tonosama/history_missing_guard.py
 # Version: V5.3-PUSH-RAW-DB-CACHED-RESAMPLE-TIMEBOX
 # ------------------------------------------------------------
 # 目的:
@@ -27,8 +27,6 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 _PATCHED = False
-_ORIGINAL_BUILD = None
-_ORIGINAL_ADD_SURGE = None
 
 _TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
 _FALSE = {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}
@@ -159,14 +157,6 @@ def _raw1_min_bars_for_interval(interval: int) -> int:
     return max(1, _env_int("TONOSAMA_RAW1_HISTORY_MIN_BARS", 8))
 
 
-def _patch_volatility_filter_thresholds() -> None:
-    # trading/filters/volatility_filter.py へ本文化した。
-    # 旧処理は vf.DEFAULT_* の代入と、_entry_row_range_ok /
-    # _atr_1m_filter_from_entry_row / _range_5m_filter_from_entry_row の
-    # __defaults__ 書き換え。vf 側が import 時に同じ env で同じ 3 関数だけを
-    # その値で定義するようにしたので、ここでは何もしない。
-    # DISABLE_TONOSAMA_HISTORY_MISSING_GUARD_PATCH=1 の扱いも vf 側が持つ。
-    return None
 
 
 def _first_existing(df: pd.DataFrame, names: list[str]) -> str | None:
@@ -613,53 +603,52 @@ def _compute_surge_features_core(vs: Any, df: pd.DataFrame, *, interval: int, so
         return pd.DataFrame()
 
 
-def _patch_volume_surge_rolling_before_recent() -> None:
-    global _ORIGINAL_ADD_SURGE
+def _orig_add_volume_surge_features():
+    """旧 _ORIGINAL_ADD_SURGE。volume_surge の素の実装を遅延解決する。"""
     try:
         import trading.entry.tonosama.volume_surge as vs
-        cur = getattr(vs, "add_volume_surge_features", None)
-        if not callable(cur):
-            logger.warning("[TONOSAMA SURGE ROLLING PATCH] target add_volume_surge_features not callable")
-            return
-        if getattr(cur, "_raw1_resample_fallback_patch_v53", False):
-            return
 
-        _ORIGINAL_ADD_SURGE = cur
-
-        def _patched_add_volume_surge_features(df: pd.DataFrame, *, interval: int) -> pd.DataFrame:
-            interval_i = int(interval)
-            try:
-                out = _compute_surge_features(vs, df, interval=interval_i, source_label="summary_db")
-                if not out.empty and _has_real_surge_ratio(out, interval_i):
-                    return out
-                if not out.empty:
-                    logger.warning("[TONOSAMA SURGE ROLLING PATCH] ignore no-ratio summary_db interval=%sm rows=%s", interval_i, len(out))
-
-                if interval_i in (3, 5):
-                    rebuilt = _resample_1m_to_interval(vs, interval_i)
-                    out = _compute_surge_features(vs, rebuilt, interval=interval_i, source_label="raw1_history_resample")
-                    if not out.empty and _has_real_surge_ratio(out, interval_i):
-                        logger.warning("[TONOSAMA SURGE ROLLING PATCH] recovered %sm surge ratio from raw1 history rows=%s", interval_i, len(out))
-                        return out
-                    if not out.empty:
-                        logger.warning("[TONOSAMA SURGE ROLLING PATCH] raw1 history resample has no real ratio interval=%sm rows=%s -> empty", interval_i, len(out))
-                        return pd.DataFrame()
-
-                original = _ORIGINAL_ADD_SURGE(df, interval=interval_i) if callable(_ORIGINAL_ADD_SURGE) else pd.DataFrame()
-                if not original.empty and not _has_real_surge_ratio(original, interval_i):
-                    logger.warning("[TONOSAMA SURGE ROLLING PATCH] suppress original no-ratio failopen source interval=%sm rows=%s", interval_i, len(original))
-                    return pd.DataFrame()
-                return original
-            except Exception:
-                logger.exception("[TONOSAMA SURGE ROLLING PATCH] patched add_volume_surge_features failed interval=%s", interval_i)
-                return _ORIGINAL_ADD_SURGE(df, interval=interval_i) if callable(_ORIGINAL_ADD_SURGE) else pd.DataFrame()
-
-        _patched_add_volume_surge_features._raw1_resample_fallback_patch_v53 = True  # type: ignore[attr-defined]
-        _patched_add_volume_surge_features._original = cur  # type: ignore[attr-defined]
-        vs.add_volume_surge_features = _patched_add_volume_surge_features
-        logger.warning("[TONOSAMA SURGE ROLLING PATCH] installed raw1 history resample fallback v5.3")
+        return getattr(vs, "_add_volume_surge_features_core", None)
     except Exception:
-        logger.exception("[TONOSAMA SURGE ROLLING PATCH] install failed")
+        logger.exception("[TONOSAMA SURGE ROLLING PATCH] original add_volume_surge_features missing")
+        return None
+
+
+def add_volume_surge_features_guarded(df: "pd.DataFrame", *, interval: int) -> "pd.DataFrame":
+    """旧 _patched_add_volume_surge_features (vs.add_volume_surge_features 差し替え)。
+
+    summary_db 由来で surge ratio が取れないときに raw1 履歴の resample から
+    作り直す。作り直しても実 ratio が無ければ空を返して failopen を防ぐ。
+    """
+    import trading.entry.tonosama.volume_surge as vs
+
+    _orig = _orig_add_volume_surge_features()
+    interval_i = int(interval)
+    try:
+        out = _compute_surge_features(vs, df, interval=interval_i, source_label="summary_db")
+        if not out.empty and _has_real_surge_ratio(out, interval_i):
+            return out
+        if not out.empty:
+            logger.warning("[TONOSAMA SURGE ROLLING PATCH] ignore no-ratio summary_db interval=%sm rows=%s", interval_i, len(out))
+
+        if interval_i in (3, 5):
+            rebuilt = _resample_1m_to_interval(vs, interval_i)
+            out = _compute_surge_features(vs, rebuilt, interval=interval_i, source_label="raw1_history_resample")
+            if not out.empty and _has_real_surge_ratio(out, interval_i):
+                logger.warning("[TONOSAMA SURGE ROLLING PATCH] recovered %sm surge ratio from raw1 history rows=%s", interval_i, len(out))
+                return out
+            if not out.empty:
+                logger.warning("[TONOSAMA SURGE ROLLING PATCH] raw1 history resample has no real ratio interval=%sm rows=%s -> empty", interval_i, len(out))
+                return pd.DataFrame()
+
+        original = _orig(df, interval=interval_i) if callable(_orig) else pd.DataFrame()
+        if not original.empty and not _has_real_surge_ratio(original, interval_i):
+            logger.warning("[TONOSAMA SURGE ROLLING PATCH] suppress original no-ratio failopen source interval=%sm rows=%s", interval_i, len(original))
+            return pd.DataFrame()
+        return original
+    except Exception:
+        logger.exception("[TONOSAMA SURGE ROLLING PATCH] patched add_volume_surge_features failed interval=%s", interval_i)
+        return _orig(df, interval=interval_i) if callable(_orig) else pd.DataFrame()
 
 
 def _sample(df: pd.DataFrame, limit: int = 8) -> list[dict[str, Any]]:
@@ -759,48 +748,42 @@ def _pass_history_missing_failopen(df: pd.DataFrame, *, stage: str) -> pd.DataFr
     return kept
 
 
-def _patched_build_scalping_feature_df(*args, **kwargs):
-    df = _ORIGINAL_BUILD(*args, **kwargs) if callable(_ORIGINAL_BUILD) else pd.DataFrame()
+def build_scalping_feature_df_guarded(original, *args, **kwargs):
+    """旧 _patched_build_scalping_feature_df (runner.build_scalping_feature_df 差し替え)。
+
+    original は runner が from-import で束縛していた素の実装
+    (volume_surge 側の failclose ラッパーとは別束縛。実測済み)。
+    """
+    df = original(*args, **kwargs) if callable(original) else pd.DataFrame()
     if isinstance(df, pd.DataFrame):
         return _pass_history_missing_failopen(df, stage="build_scalping_feature_df")
     return df
 
 
-def install() -> bool:
-    global _PATCHED, _ORIGINAL_BUILD
+def guard_enabled() -> bool:
+    """旧 install() の TONOSAMA_HISTORY_MISSING_GUARD_ENABLED 判定。
+
+    偽のときは runner 側のラッパーを掛けない (旧 install も同じ位置で return した)。
+    """
+    return _env_bool("TONOSAMA_HISTORY_MISSING_GUARD_ENABLED", True)
+
+
+def apply_history_guard_defaults() -> bool:
+    """旧 install() の残り。関数差し替えは本文化済みなので env 既定値だけ。
+
+    volatility_filter のしきい値は trading/filters/volatility_filter.py へ、
+    add_volume_surge_features / build_scalping_feature_df のラップは
+    volume_surge.py / runner.py へ本文化済み。
+    """
+    global _PATCHED
     if _PATCHED:
         return True
-
-    _enable_controlled_history_fallback_defaults()
-    _patch_volatility_filter_thresholds()
-    _patch_volume_surge_rolling_before_recent()
-
-    if not _env_bool("TONOSAMA_HISTORY_MISSING_GUARD_ENABLED", True):
-        logger.warning("[TONOSAMA HISTORY GUARD] disabled by env")
-        return False
-
     try:
-        import trading.entry.tonosama.runner as runner
-    except Exception:
-        logger.exception("[TONOSAMA HISTORY GUARD] import runner failed")
-        return False
-
-    try:
-        cur = getattr(runner, "build_scalping_feature_df", None)
-        if not callable(cur):
-            logger.warning("[TONOSAMA HISTORY GUARD] target build_scalping_feature_df not callable")
-            return False
-        if getattr(cur, "_tonosama_history_guard_patch_v53", False):
-            _PATCHED = True
-            return True
-
-        _ORIGINAL_BUILD = cur
-        _patched_build_scalping_feature_df._tonosama_history_guard_patch_v53 = True  # type: ignore[attr-defined]
-        _patched_build_scalping_feature_df._original = cur  # type: ignore[attr-defined]
-        runner.build_scalping_feature_df = _patched_build_scalping_feature_df
+        _enable_controlled_history_fallback_defaults()
         _PATCHED = True
         logger.warning(
-            "[TONOSAMA HISTORY GUARD] installed v5.3 raw1_resample=%s raw1_history=%s push_raw_db_history=%s lookback_min=%s raw_limit=%s cache_sec=%.1f timeout=%.2f busy_ms=%s min_bars_3m=%s min_bars_5m=%s ratio_min_periods=%s quality_guard=%s",
+            "[TONOSAMA HISTORY GUARD] defaults applied v5.3 guard_enabled=%s raw1_resample=%s raw1_history=%s push_raw_db_history=%s lookback_min=%s raw_limit=%s cache_sec=%.1f timeout=%.2f busy_ms=%s min_bars_3m=%s min_bars_5m=%s ratio_min_periods=%s quality_guard=%s",
+            guard_enabled(),
             _env_bool("TONOSAMA_RAW1_RESAMPLE_FALLBACK", True),
             _env_bool("TONOSAMA_RAW1_HISTORY_RESAMPLE", True),
             _env_bool("TONOSAMA_PUSH_RAW_DB_HISTORY_ENABLED", True),
@@ -816,17 +799,22 @@ def install() -> bool:
         )
         return True
     except Exception:
-        logger.exception("[TONOSAMA HISTORY GUARD] install failed")
+        logger.exception("[TONOSAMA HISTORY GUARD] defaults apply failed")
         return False
 
 
 try:
-    install()
+    apply_history_guard_defaults()
 except Exception:
-    logger.exception("[TONOSAMA HISTORY GUARD] auto install failed")
+    logger.exception("[TONOSAMA HISTORY GUARD] auto defaults failed")
 
 
-__all__ = ["install"]
+__all__ = [
+    "apply_history_guard_defaults",
+    "guard_enabled",
+    "add_volume_surge_features_guarded",
+    "build_scalping_feature_df_guarded",
+]
 
 
 # ============================================================

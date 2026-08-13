@@ -60,7 +60,11 @@ from .config import (
     SELLING_CLIMAX_MIN_PRICE_DROP_PCT,
 )
 from .time_guard import is_market_time
-from .volume_surge import build_scalping_feature_df
+# 旧 tonosama_history_missing_guard_patch は runner のこの束縛
+# (= import 時に掴んだ素の実装。volume_surge 側の failclose ラッパーとは
+#  別束縛であることを実測済み) を包んでいた。本文化でも core を束縛し、
+# 下の build_scalping_feature_df がガード層になる。
+from .volume_surge import build_scalping_feature_df as _build_scalping_feature_df_core
 from .five_sec_features import build_5sec_features
 from .scoring import prepare_entry_scores, calc_final_score_safe
 from . import fast_score_prefilter as _fast_score
@@ -844,6 +848,33 @@ def _apply_primary_filters(x: pd.DataFrame) -> pd.DataFrame:
     _LAST_FILTER_DIAG = {"stage": "primary", "base_rows": base_rows, "primary_rows": len(x), "thresholds": {"MIN_PRICE": MIN_PRICE, "MIN_LATEST_VOLUME": MIN_LATEST_VOLUME, "MIN_BODY_CHANGE_PCT": MIN_BODY_CHANGE_PCT, "MIN_INTRABAR_RANGE_PCT": MIN_INTRABAR_RANGE_PCT, "MIN_VOLUME_SURGE_RATIO": MIN_VOLUME_SURGE_RATIO, "MIN_PRICE_CHANGE_PCT": MIN_PRICE_CHANGE_PCT, "MIN_SLOPE": MIN_SLOPE, "MAX_BUY_PRICE_CHANGE_PCT": MAX_BUY_PRICE_CHANGE_PCT, "MAX_SELL_PRICE_DROP_PCT": MAX_SELL_PRICE_DROP_PCT, "BUY_REJECTED_CLOSE_POSITION_PCT": BUY_REJECTED_CLOSE_POSITION_PCT, "SELL_REJECTED_CLOSE_POSITION_PCT": SELL_REJECTED_CLOSE_POSITION_PCT}, "survivors": _sample_rows(x, sample_cols, limit=12)}
     logger.warning("[TONOSAMA FILTER SUMMARY] stage=primary base_rows=%s primary_rows=%s survivors=%s thresholds=%s", base_rows, len(x), _LAST_FILTER_DIAG.get("survivors"), _LAST_FILTER_DIAG.get("thresholds"))
     return x
+
+
+# ============================================================
+# HISTORY MISSING GUARD
+# (旧 core/startup/tonosama_history_missing_guard_patch.py の
+#  runner.build_scalping_feature_df 差し替えを本文化)
+# ------------------------------------------------------------
+# 履歴欠損 / failopen 行を落とす。旧 install はこのラップだけを行い、
+# TONOSAMA_HISTORY_MISSING_GUARD_ENABLED が偽なら掛けずに return して
+# いたので、その判定を guard_enabled() で再現する。
+# DISABLE_TONOSAMA_HISTORY_MISSING_GUARD_PATCH=1 でモジュールごと
+# 無効化されていた分も、import 失敗時は core へ落とすことで揃う。
+# ============================================================
+
+
+def build_scalping_feature_df() -> pd.DataFrame:
+    try:
+        from trading.entry.tonosama.history_missing_guard import (
+            build_scalping_feature_df_guarded,
+            guard_enabled,
+        )
+    except Exception:
+        logger.exception("[TONOSAMA HISTORY GUARD] import failed; use core build_scalping_feature_df")
+        return _build_scalping_feature_df_core()
+    if not guard_enabled():
+        return _build_scalping_feature_df_core()
+    return build_scalping_feature_df_guarded(_build_scalping_feature_df_core)
 
 
 def build_feature_df_with_5sec() -> pd.DataFrame:

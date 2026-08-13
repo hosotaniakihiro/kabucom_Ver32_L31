@@ -605,7 +605,7 @@ def _patch_tonosama_memory_history_once() -> bool:
         return True
     try:
         import pandas as pd
-        import core.startup.tonosama_history_missing_guard_patch as th
+        import trading.entry.tonosama.history_missing_guard as th
         cur = getattr(th, "_load_push_raw_db_1m_history", None)
         if not callable(cur):
             return False
