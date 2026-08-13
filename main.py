@@ -245,7 +245,7 @@ def _install_main_runtime_patches():
         #   - 発注数量の最小単元フォールバック -> trading/handlers/entry_controller.py
         #   - PIPE SUMMARY 表示整形            -> core/global_context/context.py
         #   - SUMMARY AI しきい値の env 既定値 -> 直下の _apply_summary_ai_threshold_env()
-        ("core.startup.low_movement_entry_guard_patch", "install"),
+        ("trading.entry.low_movement_guard", "install"),
         # entry_final_filter_failopen_patch は本文化済み:
         #   env 既定値 53 件 + entry_order_builder の 4 定数 + 連鎖 install 2 件
         #     -> trading/handlers/entry_order_builder.apply_entry_final_filter_defaults()

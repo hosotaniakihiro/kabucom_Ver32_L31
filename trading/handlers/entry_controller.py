@@ -4616,7 +4616,7 @@ def _range_5m_filter_low_move(entry_row=None, *args, **kwargs):
             return allow
         if not bool(allow):
             return False
-        from core.startup.low_movement_entry_guard_patch import _apply_all_entry_guards
+        from trading.entry.low_movement_guard import _apply_all_entry_guards
 
         return _apply_all_entry_guards(entry_row)
     except RecursionError:

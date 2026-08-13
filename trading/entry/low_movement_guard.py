@@ -1,5 +1,5 @@
 # ============================================================
-# File   : core/startup/low_movement_entry_guard_patch.py
+# File   : trading/entry/low_movement_guard.py
 # Version: Ver16-RANKING-ZERO-ATR-TURNOVER-DAY-SOFTPASS
 # ------------------------------------------------------------
 # あまり動かない銘柄へのエントリーを発注直前で止める。
@@ -24,6 +24,18 @@
 #   - _row_to_dict() で _raw dict を展開し、top-level 欠損項目だけ補完
 # ============================================================
 
+# ------------------------------------------------------------
+# 旧 core/startup/low_movement_entry_guard_patch.py から移設した。
+#
+# 他モジュールの関数差し替えは全て無くなっている:
+#   - atr_1m_filter のラップは撤去済み (下記 install() のコメント参照)
+#   - range_5m_filter のラップは entry_controller へ本文化済み
+#   - _install_* の 7 サブ install はいずれも本文化完了の空スタブ
+# 残る install() の実効は環境変数の既定値設定だけで、モジュール本体は
+# _apply_all_entry_guards を提供するライブラリなので *_patch.py を外した。
+#
+# 呼び出し元: trading/handlers/entry_controller.py (_apply_all_entry_guards)
+# ------------------------------------------------------------
 from __future__ import annotations
 
 import logging
