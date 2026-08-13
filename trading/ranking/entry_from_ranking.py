@@ -731,7 +731,7 @@ def _rsrc_prefilter_scope_enabled() -> bool:
         return False
 
 
-def _get_ranking_source_df() -> Optional[pd.DataFrame]:
+def _get_ranking_source_df_pre_push_fallback() -> Optional[pd.DataFrame]:
     if _rsrc_scope_enabled():
         _rsrc_apply_env_defaults()
         return _get_ranking_source_df_with_db_fallback()
@@ -1989,3 +1989,218 @@ def entry_from_ranking():
 
 def run_ranking_entry_pipeline():
     return entry_from_ranking()
+
+
+# ============================================================
+# ranking source が空のときの PUSH summary フォールバック
+# ------------------------------------------------------------
+# 旧 core/startup/ranking_entry_push_fallback_patch.py を本文化。
+# ranking source DF が空なら、PUSH summary から ranking 相当の DF を
+# 組み立てて返す。無効化は RANKING_ENTRY_PUSH_SUMMARY_FALLBACK_ENABLED=0。
+#
+# 適用スコープは旧 install 導線
+# (trading/entry_exit/tasks.py の ranking entry companion patch, main.py 経路)
+# を _rpf2_scope_enabled() で再現する。
+# ============================================================
+
+def _rpf2_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return bool(default)
+        return str(raw).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _rpf2_env_int(name: str, default: int) -> int:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return int(default)
+        return int(float(raw))
+    except Exception:
+        return int(default)
+
+
+def _rpf2_num(s: pd.Series | Any, default: float = 0.0):
+    try:
+        return pd.to_numeric(s, errors="coerce").fillna(default)
+    except Exception:
+        return default
+
+
+def _rpf2_latest_per_symbol(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    if "datetime" in out.columns:
+        out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+        out = out.sort_values(["symbol", "datetime"], kind="stable").groupby("symbol", as_index=False).tail(1)
+    else:
+        out = out.drop_duplicates(subset=["symbol"], keep="last")
+    return out
+
+
+def _rpf2_get_push_summary_df() -> pd.DataFrame:
+    candidates = []
+    try:
+        from global_state import global_data
+        for fn_name in ("get_push_merged_summary", "get_merged_summary", "get_multi_summary", "get_summary"):
+            try:
+                fn = getattr(global_data, fn_name, None)
+                if not callable(fn):
+                    continue
+                if fn_name in {"get_merged_summary", "get_multi_summary"}:
+                    df = fn(1, source="push")
+                else:
+                    df = fn(1)
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    candidates.append((fn_name, df))
+            except TypeError:
+                try:
+                    df = fn(1)
+                    if isinstance(df, pd.DataFrame) and not df.empty:
+                        candidates.append((fn_name, df))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        from core.global_context.context import global_context as GC
+        for call in (
+            lambda: GC.get_merged_summary(1, source="push"),
+            lambda: GC.get_push_merged_summary(1),
+            lambda: GC.summary.to_dataframe(1),
+        ):
+            try:
+                df = call()
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    candidates.append(("GC", df))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if not candidates:
+        return pd.DataFrame()
+    name, df = max(candidates, key=lambda x: len(x[1]))
+    latest = _rpf2_latest_per_symbol(df)
+    logger.warning("[RANKING PUSH FALLBACK] source=%s rows=%s latest_rows=%s", name, len(df), len(latest))
+    return latest
+
+
+def _rpf2_build_ranking_like_from_push(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or "symbol" not in df.columns:
+        return pd.DataFrame()
+
+    out = df.copy()
+    out["symbol"] = out["symbol"].astype(str).str.strip()
+    out = out[out["symbol"] != ""]
+    if out.empty:
+        return pd.DataFrame()
+
+    price = _rpf2_num(out.get("price", out.get("close", out.get("current_price", 0.0))), 0.0)
+    close = _rpf2_num(out.get("close", price), 0.0)
+    open_ = _rpf2_num(out.get("open", out.get("open_price", close)), close)
+    volume = _rpf2_num(out.get("volume", 0.0), 0.0)
+    turnover = _rpf2_num(out.get("turnover", price * volume), 0.0)
+    if isinstance(turnover, (int, float)):
+        turnover = price * volume
+    score_buy = _rpf2_num(out.get("score_buy", out.get("buy_score", 0.0)), 0.0)
+    score_sell = _rpf2_num(out.get("score_sell", out.get("sell_score", 0.0)), 0.0)
+    score_total = _rpf2_num(out.get("score_total", out.get("final_score", out.get("score", 0.0))), 0.0)
+    slope = _rpf2_num(out.get("slope", 0.0), 0.0)
+    mtf = _rpf2_num(out.get("mtf", out.get("score_mtf", out.get("mtf_score", 0.0))), 0.0)
+
+    day_change_pct = ((close - open_) / open_.replace(0, pd.NA) * 100.0).fillna(0.0)
+    side = pd.Series("BUY", index=out.index)
+    side = side.mask((score_sell > score_buy) | ((score_buy <= 0) & (slope < 0)), "SELL")
+
+    strength = pd.concat([
+        score_buy.abs(),
+        score_sell.abs(),
+        score_total.abs(),
+        slope.abs() * 1000.0,
+        mtf.abs(),
+    ], axis=1).max(axis=1).fillna(0.0)
+    out["_strength"] = strength
+    out = out.sort_values("_strength", ascending=False, kind="stable")
+    max_rows = max(10, _rpf2_env_int("RANKING_PUSH_FALLBACK_MAX_ROWS", 80))
+    out = out.head(max_rows).copy()
+
+    out["price"] = price.loc[out.index].replace(0, close.loc[out.index])
+    out["current_price"] = out["price"]
+    out["volume"] = volume.loc[out.index]
+    out["turnover"] = turnover.loc[out.index]
+    out["trading_value"] = out["turnover"]
+    out["day_change_pct"] = day_change_pct.loc[out.index]
+    out["side"] = side.loc[out.index]
+    out["rank_position"] = range(1, len(out) + 1)
+    out["rank"] = out["rank_position"]
+    out["rank_type"] = out["side"].map({"BUY": "売買代金急増", "SELL": "値下がり率"}).fillna("売買代金急増")
+    out["ranking_source"] = "push_summary_fallback"
+    out["ranking_name"] = out.get("symbolname", out["symbol"])
+
+    logger.warning(
+        "[RANKING PUSH FALLBACK] built ranking-like df rows=%s buy=%s sell=%s symbols=%s",
+        len(out),
+        int((out["side"] == "BUY").sum()),
+        int((out["side"] == "SELL").sum()),
+        out["symbol"].nunique(),
+    )
+    return out
+
+
+_RPF2_SCOPE = None
+
+
+def _rpf2_scope_enabled() -> bool:
+    global _RPF2_SCOPE
+    if _RPF2_SCOPE is not None:
+        return _RPF2_SCOPE
+    enabled = False
+    try:
+        import sys as _sys
+
+        argv_text = " ".join(str(x) for x in _sys.argv).replace("\\", "/").lower()
+        db_names = (
+            "main_database.py", "data_collectors_runner.py", "db_prepare_runner.py",
+            "push_receiver_runner.py", "yahoo_complement_runner.py",
+            "summary_database_runner.py", "ranking_collector_runner.py",
+        )
+        if not any(n in argv_text for n in db_names):
+            enabled = "main.py" in argv_text
+    except Exception:
+        enabled = False
+    _RPF2_SCOPE = enabled
+    return enabled
+
+
+def _get_ranking_source_df() -> Optional[pd.DataFrame]:
+    df = None
+    try:
+        df = _get_ranking_source_df_pre_push_fallback()
+    except Exception:
+        logger.exception("[RANKING PUSH FALLBACK] original _get_ranking_source_df failed")
+        df = None
+
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        return df
+    if not _rpf2_scope_enabled():
+        return df
+    if not _rpf2_env_bool("RANKING_ENTRY_PUSH_SUMMARY_FALLBACK_ENABLED", True):
+        return df
+
+    push_df = _rpf2_get_push_summary_df()
+    fb = _rpf2_build_ranking_like_from_push(push_df)
+    if fb.empty:
+        logger.warning(
+            "[RANKING PUSH FALLBACK] fallback empty; original_empty=%s",
+            df is None or (isinstance(df, pd.DataFrame) and df.empty),
+        )
+        return df
+    return fb

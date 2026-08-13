@@ -223,7 +223,7 @@ def _normalize_df(df: pd.DataFrame, *, table_name: str = "") -> pd.DataFrame:
     return out
 
 
-def __load_ranking_df_core(*, db_path: Optional[str | os.PathLike] = None, yyyymmdd: Any = None) -> pd.DataFrame:
+def _load_ranking_df_core(*, db_path: Optional[str | os.PathLike] = None, yyyymmdd: Any = None) -> pd.DataFrame:
     path = _resolve_ranking_db_path(db_path=db_path, yyyymmdd=yyyymmdd)
     if not path:
         logger.warning("[PUSH RANKING SELECTOR] ranking db path unresolved")

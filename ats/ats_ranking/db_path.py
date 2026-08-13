@@ -123,7 +123,7 @@ def _today_ranking_db_path(now: Optional[dt.datetime] = None) -> Path:
 # DB inspection
 # ============================================================
 
-def __db_has_usable_ranking_tables_core(db_path: str) -> bool:
+def _db_has_usable_ranking_tables_core(db_path: str) -> bool:
     """
     ranking DB が実データを持っているかを確認する。
 
