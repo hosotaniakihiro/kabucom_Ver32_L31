@@ -154,9 +154,9 @@ def install() -> bool:
     if _PATCHED:
         return True
 
-    _run_install("summary_parallel_timeout_relief_patch:pre", "core.startup.summary_parallel_timeout_relief_patch")
+    _run_install("summary_parallel_main_scope:pre", "core.startup.summary_parallel_main_scope")
     _run_install("summary_parallel_intervals_runtime_patch", "core.startup.summary_parallel_intervals_runtime_patch")
-    _run_install("summary_parallel_timeout_relief_patch:post", "core.startup.summary_parallel_timeout_relief_patch")
+    _run_install("summary_parallel_main_scope:post", "core.startup.summary_parallel_main_scope")
     _run_install("light_tick_1m", "scheduler_jobs.summary.light_tick_1m")
     _run_install("tonosama_datetime_tz_guard_patch", "core.startup.tonosama_datetime_tz_guard_patch")
 

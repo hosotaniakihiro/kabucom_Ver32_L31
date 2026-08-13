@@ -577,7 +577,60 @@ def _should_run_1m(now: Optional[dt.datetime] = None) -> bool:
     return True
 
 
+# ------------------------------------------------------------
+# main.py 1m-only スコープ
+# (旧 core/startup/summary_parallel_timeout_relief_patch.py の
+#  _patch_scheduler_module を本文化)
+#
+# 旧パッチは main.py プロセスでのみ install され、_run_flags を (1,0,0) に、
+# _should_run_3m / _should_run_5m を常に False へ差し替えていた。
+# entry 判定を軽く保ち、3m/5m の重い PUSH は main_database.py / raw fallback /
+# cache に任せるため。
+#
+# 発動条件は旧構成と同じ:
+#   - core/startup/summary_parallel_main_scope.install() が走った
+#     (= SUMMARY_MAIN_PUSH_1M_ONLY を "1" に強制した) こと
+#   - かつ現プロセスが main.py であること
+# env は子プロセスへ継承されるので argv 判定を併用する
+# (main_database.py 側では従来どおり 3m/5m を回す)。
+#
+# _run_flags / should_run_3m / should_run_5m は下位の _should_run_* へ委譲
+# しているため、ここだけ塞げば旧パッチと同じ (1,0,0) になる。
+# _parent_timeout_sec / _child_timeout_sec は summary_parallel_main_scope が
+# SUMMARY_PARENT_TICK_TIMEOUT_SEC=30 / SUMMARY_CHILD_JOB_TIMEOUT_SEC=20 を
+# 強制するため、本体の _env_float 実装のままで旧パッチと同値になる。
+# ------------------------------------------------------------
+_MAIN_1M_ONLY_SCOPE: Optional[bool] = None
+
+
+def _main_1m_only_scope() -> bool:
+    global _MAIN_1M_ONLY_SCOPE
+    if _MAIN_1M_ONLY_SCOPE is not None:
+        return _MAIN_1M_ONLY_SCOPE
+    enabled = False
+    try:
+        v = os.getenv("SUMMARY_MAIN_PUSH_1M_ONLY")
+        if v is not None and str(v).strip().lower() in {
+            "1", "true", "yes", "y", "on", "ok", "enable", "enabled",
+        }:
+            argv = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+            enabled = "main.py" in argv and "main_database.py" not in argv
+    except Exception:
+        enabled = False
+    if enabled:
+        logger.warning(
+            "[SUMMARY PARALLEL TIMEOUT RELIEF] scheduler forced main 1m-only run_flags=(1,0,0) "
+            "child_timeout=%s parent_timeout=%s",
+            os.getenv("SUMMARY_CHILD_JOB_TIMEOUT_SEC", "20"),
+            os.getenv("SUMMARY_PARENT_TICK_TIMEOUT_SEC", "30"),
+        )
+    _MAIN_1M_ONLY_SCOPE = enabled
+    return enabled
+
+
 def _should_run_3m(now: Optional[dt.datetime] = None) -> bool:
+    if _main_1m_only_scope():
+        return False
     n = _now(now)
     try:
         return bool(should_run_interval(3, now=n))
@@ -586,6 +639,8 @@ def _should_run_3m(now: Optional[dt.datetime] = None) -> bool:
 
 
 def _should_run_5m(now: Optional[dt.datetime] = None) -> bool:
+    if _main_1m_only_scope():
+        return False
     n = _now(now)
     try:
         return bool(should_run_interval(5, now=n))
