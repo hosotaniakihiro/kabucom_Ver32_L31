@@ -114,37 +114,26 @@ def _install_token_startup_once_policy() -> bool:
         return False
 
 
-def _install_token_unifier() -> bool:
-    """Make token results immediately visible to legacy modules."""
+def publish_token_result(name: str, ret: Any) -> Any:
+    """旧 _install_token_unifier のラッパー本体。
+
+    token_manager.<name> の戻り値からトークンを取り出して各所へ配る。
+    戻り値はそのまま返す。
+    """
+    token = ret
+    if isinstance(ret, dict):
+        token = ret.get("Token") or ret.get("token") or ret.get("api_key") or ret.get("APIKey")
+    _publish_token(token, source=f"token_manager.{name}")
+    return ret
+
+
+def publish_loaded_token() -> bool:
+    """旧 _install_token_unifier の末尾。既に読み込み済みのトークンを配る。"""
     ok = False
     try:
         import token_manager  # type: ignore
     except Exception:
         return False
-
-    for name in ("refresh_token", "get_token", "get_valid_token", "ensure_token"):
-        fn = getattr(token_manager, name, None)
-        if not callable(fn) or getattr(fn, "_full_pipeline_stability_wrapped", False):
-            continue
-
-        @wraps(fn)
-        def _wrapped(*args: Any, __fn: Callable[..., Any] = fn, __name: str = name, **kwargs: Any) -> Any:
-            ret = __fn(*args, **kwargs)
-            # Some functions return the token directly; some return dict-like payloads.
-            token = ret
-            if isinstance(ret, dict):
-                token = ret.get("Token") or ret.get("token") or ret.get("api_key") or ret.get("APIKey")
-            _publish_token(token, source=f"token_manager.{__name}")
-            return ret
-
-        setattr(_wrapped, "_full_pipeline_stability_wrapped", True)
-        try:
-            setattr(token_manager, name, _wrapped)
-            ok = True
-        except Exception:
-            logger.exception("[FULL PIPELINE STABILITY] failed to wrap token_manager.%s", name)
-
-    # Publish any already-loaded token at startup.
     for attr in ("API_TOKEN", "api_token", "TOKEN", "token"):
         try:
             token = getattr(token_manager, attr, None)
@@ -156,58 +145,36 @@ def _install_token_unifier() -> bool:
     return ok
 
 
-def _install_yahoo_differential_reflect() -> bool:
-    """Skip expensive all-symbol reflect passes before/after empty downloads.
+def reflect_saved_yahoo_differential(orig, *args: Any, **kwargs: Any) -> Any:
+    """旧 _reflect_wrapper (download_flow.reflect_saved_yahoo_to_summary_db 差し替え)。
 
-    Download itself is already differential. The heavy part in live trading is
-    repeated reflect_saved_yahoo_to_summary_db(..., symbols=reflect_symbols) for
-    pre-download and empty-download cases. This wrapper leaves post-download
-    reflection intact, but prevents no-new-data runs from recalculating all
-    current ranking symbols.
+    pre-download / empty-download の全銘柄 reflect を飛ばす。
+    post-download の反映はそのまま通す。
     """
+    label = str(kwargs.get("label") or "")
+    symbols = kwargs.get("symbols")
     try:
-        from trading.yahoo.complement import download_flow  # type: ignore
+        if symbols is None and len(args) >= 2:
+            # Do not mutate positional args; only use for diagnostics.
+            symbols = args[1]
     except Exception:
-        return False
+        symbols = None
+    count = len(symbols) if isinstance(symbols, (list, tuple, set)) else None
 
-    target = getattr(download_flow, "reflect_saved_yahoo_to_summary_db", None)
-    if not callable(target) or getattr(target, "_full_pipeline_stability_wrapped", False):
-        return False
+    skip_pre = _truthy(os.environ.get("YAHOO_LIVE_SKIP_PRE_DOWNLOAD_REFLECT", "1"))
+    skip_empty = _truthy(os.environ.get("YAHOO_LIVE_SKIP_EMPTY_DOWNLOAD_REFLECT", "1"))
+    is_pre = "pre-download" in label or "pre_download" in label
+    is_empty = "empty-download" in label or "empty_download" in label
+    if (is_pre and skip_pre) or (is_empty and skip_empty):
+        logger.warning(
+            "[FULL PIPELINE STABILITY][YAHOO] reflect skipped label=%s symbols=%s reason=%s",
+            label,
+            count,
+            "pre_download" if is_pre else "empty_download",
+        )
+        return {"ok": True, "skipped": True, "label": label, "symbols": count, "reason": "differential_reflect"}
 
-    @wraps(target)
-    def _reflect_wrapper(*args: Any, **kwargs: Any) -> Any:
-        label = str(kwargs.get("label") or "")
-        symbols = kwargs.get("symbols")
-        try:
-            if symbols is None and len(args) >= 2:
-                # Do not mutate positional args; only use for diagnostics.
-                symbols = args[1]
-        except Exception:
-            symbols = None
-        count = len(symbols) if isinstance(symbols, (list, tuple, set)) else None
-
-        skip_pre = _truthy(os.environ.get("YAHOO_LIVE_SKIP_PRE_DOWNLOAD_REFLECT", "1"))
-        skip_empty = _truthy(os.environ.get("YAHOO_LIVE_SKIP_EMPTY_DOWNLOAD_REFLECT", "1"))
-        is_pre = "pre-download" in label or "pre_download" in label
-        is_empty = "empty-download" in label or "empty_download" in label
-        if (is_pre and skip_pre) or (is_empty and skip_empty):
-            logger.warning(
-                "[FULL PIPELINE STABILITY][YAHOO] reflect skipped label=%s symbols=%s reason=%s",
-                label,
-                count,
-                "pre_download" if is_pre else "empty_download",
-            )
-            return {"ok": True, "skipped": True, "label": label, "symbols": count, "reason": "differential_reflect"}
-
-        return target(*args, **kwargs)
-
-    setattr(_reflect_wrapper, "_full_pipeline_stability_wrapped", True)
-    try:
-        download_flow.reflect_saved_yahoo_to_summary_db = _reflect_wrapper
-        return True
-    except Exception:
-        logger.exception("[FULL PIPELINE STABILITY] yahoo reflect wrapper install failed")
-        return False
+    return orig(*args, **kwargs)
 
 
 def _install_push_rotation_defaults() -> bool:
@@ -288,48 +255,24 @@ def _install_entry_exit_congestion_defaults() -> bool:
 
 
 def _install_register_ops_guard() -> bool:
-    """Best-effort wrapper: if clear/unregister failed, do not immediately pile on register."""
-    try:
-        from trading.push.subscription_manager import register_ops  # type: ignore
-    except Exception:
-        return False
-
-    ok = False
-    for name in ("refresh_subscriptions", "register_symbols", "register_items"):
-        fn = getattr(register_ops, name, None)
-        if not callable(fn) or getattr(fn, "_full_pipeline_stability_wrapped", False):
-            continue
-
-        @wraps(fn)
-        def _wrapped(*args: Any, __fn: Callable[..., Any] = fn, __name: str = name, **kwargs: Any) -> Any:
-            try:
-                kwargs.setdefault("wait_after_clear_sec", float(os.environ.get("PUSH_ROTATION_WAIT_AFTER_CLEAR_SEC", "0.2")))
-            except Exception:
-                pass
-            ret = __fn(*args, **kwargs)
-            try:
-                if isinstance(ret, dict):
-                    content = ret.get("content") or ret.get("vendor_body") or ret
-                    text = str(content)
-                    if "APIキー不一致" in text or "4001009" in text:
-                        logger.warning("[FULL PIPELINE STABILITY] API key mismatch observed; runtime token refresh is disabled by startup-once policy")
-                    if "レジスト数エラー" in text or "4002006" in text:
-                        os.environ["PUSH_REGISTER_FORCE_UNREGISTER_ALL_NEXT"] = "1"
-            except Exception:
-                pass
-            return ret
-
-        setattr(_wrapped, "_full_pipeline_stability_wrapped", True)
-        try:
-            setattr(register_ops, name, _wrapped)
-            ok = True
-        except Exception:
-            logger.exception("[FULL PIPELINE STABILITY] failed to wrap register_ops.%s", name)
-    return ok
+    # 旧 install はここで register_ops の refresh_subscriptions /
+    # register_symbols / register_items を包もうとしていたが、
+    # trading/push/subscription_manager/register_ops.py にはどの名前も
+    # 定義も再エクスポートも無く、常に False を返す不活性な処理だった。
+    return False
 
 
-def install() -> bool:
-    global _INSTALLED
+_ENABLED = False
+
+
+def pipeline_stability_enabled() -> bool:
+    """旧 install() が走ったか。token_manager / download_flow が見る。"""
+    return bool(_ENABLED)
+
+
+def enable_pipeline_stability() -> bool:
+    """旧 install()。関数差し替えは本文化済みなので env と publish だけ。"""
+    global _INSTALLED, _ENABLED
     if _INSTALLED:
         return True
     try:
@@ -337,9 +280,9 @@ def install() -> bool:
             logger.warning("[FULL PIPELINE STABILITY] disabled by env")
             return False
         context = _argv_context()
-        yahoo_ok = _install_yahoo_differential_reflect()
         token_policy_ok = _install_token_startup_once_policy()
-        token_ok = _install_token_unifier()
+        _ENABLED = True
+        token_ok = publish_loaded_token()
         push_env_ok = _install_push_rotation_defaults()
         push_guard_ok = _install_register_ops_guard()
         summary_ok = _install_summary_recovery_defaults()
@@ -347,10 +290,9 @@ def install() -> bool:
         entry_ok = _install_entry_exit_congestion_defaults()
         _INSTALLED = True
         logger.warning(
-            "[FULL PIPELINE STABILITY] installed version=%s context=%s yahoo_diff=%s token_policy=%s token=%s push_env=%s push_guard=%s summary_recovery=%s summary_latest=%s entry_exit=%s",
+            "[FULL PIPELINE STABILITY] installed version=%s context=%s yahoo_diff=native token_policy=%s token=%s push_env=%s push_guard=%s summary_recovery=%s summary_latest=%s entry_exit=%s",
             VERSION,
             context,
-            yahoo_ok,
             token_policy_ok,
             token_ok,
             push_env_ok,
@@ -365,4 +307,10 @@ def install() -> bool:
         return False
 
 
-__all__ = ["VERSION", "install"]
+__all__ = [
+    "VERSION",
+    "enable_pipeline_stability",
+    "pipeline_stability_enabled",
+    "publish_token_result",
+    "reflect_saved_yahoo_differential",
+]

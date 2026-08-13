@@ -593,7 +593,7 @@ def _latest_push_summary_age_sec() -> tuple[float | None, dt.datetime | None, in
     return best
 
 
-def _wait_fresh_push_summary_before_tonosama() -> bool:
+def _wait_fresh_push_summary_before_tonosama_core() -> bool:
     if not _env_bool("TONOSAMA_WAIT_FRESH_PUSH_SUMMARY", True):
         return True
     max_age = max(30.0, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_MAX_AGE_SEC", 180.0))
@@ -1052,3 +1052,26 @@ def register_entry_exit_tasks(*args: Any, **kwargs: Any) -> bool:
 
 
 __all__ = ["register_entry_exit_tasks", "_run_tonosama_entry_safe", "_run_ranking_entry_safe"]
+
+
+# ============================================================
+# TONOSAMA stale wait fail-open
+# (旧 core/startup/entry_count_unblock_runtime_patch._patch_tonosama_wait_once)
+# ------------------------------------------------------------
+# push summary が古くても、行数が足りていれば TONOSAMA を通す。
+# 旧パッチは install 時にこれを包み、対象が未 import のときのために
+# リトライスレッドまで持っていたが、本文化で呼び出し時分岐になったので不要。
+# ============================================================
+
+
+def _wait_fresh_push_summary_before_tonosama():
+    try:
+        from trading.entry import entry_count_unblock as _ecu
+    except Exception:
+        return _wait_fresh_push_summary_before_tonosama_core()
+    if not _ecu.entry_count_unblock_enabled():
+        return _wait_fresh_push_summary_before_tonosama_core()
+    return _ecu.wait_fresh_push_summary_stale_failopen(
+        _wait_fresh_push_summary_before_tonosama_core,
+        _latest_push_summary_age_sec,
+    )

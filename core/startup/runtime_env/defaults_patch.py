@@ -501,11 +501,45 @@ def _install_database_owner(context: str) -> bool:
 
 
 def _install_entry_count_unblock(context: str) -> bool:
-    return _safe_install("entry count unblock", context, TRADING_CONTEXTS | {"main_database"}, "DISABLE_ENTRY_COUNT_UNBLOCK_PATCH", "entry_count_unblock_runtime_patch")
+    # entry_count_unblock_runtime_patch は本文化済み:
+    #   token_manager.refresh_token / get_valid_token の最外周層
+    #   trading/entry_exit/tasks._wait_fresh_push_summary_before_tonosama
+    # スコープ判定 (context / DISABLE env) は旧 _safe_install と同じにする。
+    try:
+        if context not in (TRADING_CONTEXTS | {"main_database"}):
+            return False
+        if os.environ.get("DISABLE_ENTRY_COUNT_UNBLOCK_PATCH", "").strip() == "1":
+            logger.warning("[RUNTIME ENV DEFAULTS PATCH] entry count unblock disabled by env")
+            return False
+        from trading.entry import entry_count_unblock as _ecu
+
+        ok = bool(_ecu.enable_entry_count_unblock())
+        logger.warning("[RUNTIME ENV DEFAULTS PATCH] entry count unblock install ok=%s context=%s", ok, context)
+        return ok
+    except Exception:
+        logger.exception("[RUNTIME ENV DEFAULTS PATCH] entry count unblock install failed")
+        return False
 
 
 def _install_full_pipeline_stability(context: str) -> bool:
-    return _safe_install("full pipeline stability", context, DB_CONTEXTS | TRADING_CONTEXTS | GENERIC_HELPER_CONTEXTS, "DISABLE_FULL_PIPELINE_STABILITY_PATCH", "full_pipeline_stability_runtime_patch")
+    # full_pipeline_stability_runtime_patch は本文化済み:
+    #   token_manager.refresh_token / get_valid_token の publish 層
+    #   trading/yahoo/complement/download_flow.reflect_saved_yahoo_to_summary_db
+    # スコープ判定 (context / DISABLE env) は旧 _safe_install と同じにする。
+    try:
+        if context not in (DB_CONTEXTS | TRADING_CONTEXTS | GENERIC_HELPER_CONTEXTS):
+            return False
+        if os.environ.get("DISABLE_FULL_PIPELINE_STABILITY_PATCH", "").strip() == "1":
+            logger.warning("[RUNTIME ENV DEFAULTS PATCH] full pipeline stability disabled by env")
+            return False
+        from kabu_api import pipeline_stability as _ps
+
+        ok = bool(_ps.enable_pipeline_stability())
+        logger.warning("[RUNTIME ENV DEFAULTS PATCH] full pipeline stability install ok=%s context=%s", ok, context)
+        return ok
+    except Exception:
+        logger.exception("[RUNTIME ENV DEFAULTS PATCH] full pipeline stability install failed")
+        return False
 
 
 def _install_summary_db_lock_pressure(context: str) -> bool:

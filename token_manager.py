@@ -395,7 +395,7 @@ def _publish_token(token: Any) -> str | None:
     return token_s
 
 
-def get_valid_token():
+def _get_valid_token_core():
     global API_TOKEN
     if API_TOKEN:
         return API_TOKEN
@@ -613,10 +613,9 @@ except Exception:
 # この層は最内周。旧構成では実 install 順で
 #   _refresh_token_core
 #     <- この層 (startup once)
-#       <- full_pipeline_stability_runtime_patch の publish ラッパー
-#         <- entry_count_unblock_runtime_patch の publish ラッパー
-# となっており、外側 2 つは現時点ではまだ runtime patch のまま
-# token_manager.refresh_token を包む (順序は変わらない)。
+#       <- _refresh_token_publish        (full_pipeline_stability)
+#         <- refresh_token               (entry_count_unblock)
+# となっており、外側 2 つも本文化済み (下の 2 節)。
 #
 # ポリシーの有効化 (env 既定値・起動時ブートストラップ・requests の
 # 401 再取得抑止) は kabu_api/token_startup_policy.py の
@@ -624,7 +623,7 @@ except Exception:
 # ============================================================
 
 
-def refresh_token(apipassword=None, *args, **kwargs):
+def _refresh_token_startup_once(apipassword=None, *args, **kwargs):
     try:
         from kabu_api import token_startup_policy as _tsp
     except Exception:
@@ -632,3 +631,74 @@ def refresh_token(apipassword=None, *args, **kwargs):
     if not _tsp.startup_policy_enabled():
         return _refresh_token_core(apipassword)
     return _tsp.refresh_token_startup_once(_refresh_token_core, apipassword, *args, **kwargs)
+
+
+# ------------------------------------------------------------
+# FULL PIPELINE STABILITY の token publish 層
+# (旧 core/startup/full_pipeline_stability_runtime_patch._install_token_unifier)
+# ------------------------------------------------------------
+# 取得結果を legacy モジュール群 (global_data / register_ops など) へ
+# 即座に配る。旧構成では startup once の 1 枚外側に入っていた。
+# ------------------------------------------------------------
+
+
+def _pipeline_stability():
+    try:
+        from kabu_api import pipeline_stability as _ps
+
+        return _ps if _ps.pipeline_stability_enabled() else None
+    except Exception:
+        return None
+
+
+def _refresh_token_publish(apipassword=None, *args, **kwargs):
+    ret = _refresh_token_startup_once(apipassword, *args, **kwargs)
+    _ps = _pipeline_stability()
+    if _ps is None:
+        return ret
+    return _ps.publish_token_result("refresh_token", ret)
+
+
+def _get_valid_token_publish(*args, **kwargs):
+    ret = _get_valid_token_core(*args, **kwargs)
+    _ps = _pipeline_stability()
+    if _ps is None:
+        return ret
+    return _ps.publish_token_result("get_valid_token", ret)
+
+
+# ------------------------------------------------------------
+# ENTRY COUNT UNBLOCK の token 層 (最外周)
+# (旧 core/startup/entry_count_unblock_runtime_patch._patch_token_manager)
+# ------------------------------------------------------------
+# refresh_token: 取れたトークンを global_data 等へ配る
+# get_valid_token: env に十分な長さのトークンがあればそれを優先する
+#
+# 旧構成の実 install 順は runtime_env/defaults_patch の
+#   _install_full_pipeline_stability -> _install_entry_count_unblock
+# だったので、この層が publish 層のさらに外側になる。
+# ------------------------------------------------------------
+
+
+def _entry_count_unblock():
+    try:
+        from trading.entry import entry_count_unblock as _ecu
+
+        return _ecu if _ecu.entry_count_unblock_enabled() else None
+    except Exception:
+        return None
+
+
+def refresh_token(apipassword=None, *args, **kwargs):
+    ret = _refresh_token_publish(apipassword, *args, **kwargs)
+    _ecu = _entry_count_unblock()
+    if _ecu is None:
+        return ret
+    return _ecu.refresh_token_publish(ret)
+
+
+def get_valid_token(*args, **kwargs):
+    _ecu = _entry_count_unblock()
+    if _ecu is None:
+        return _get_valid_token_publish(*args, **kwargs)
+    return _ecu.get_valid_token_env_first(_get_valid_token_publish, *args, **kwargs)
