@@ -640,7 +640,9 @@ def _patch_tonosama_memory_history_once() -> bool:
 
 def _patch_summary_parallel_attrs() -> None:
     try:
-        import core.startup.summary_parallel_intervals_runtime_patch as sp
+        # summary_parallel_intervals_runtime_patch は
+        # scheduler_jobs/summary/parallel_intervals.py へ移設済み。
+        import scheduler_jobs.summary.parallel_intervals as sp
         for attr, value in {
             "SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC": 18.0,
             "SUMMARY_PARALLEL_TIMEOUT_SEC": 18.0,

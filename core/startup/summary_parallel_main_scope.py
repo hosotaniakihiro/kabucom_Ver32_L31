@@ -60,7 +60,7 @@ _DEFAULT_ENV = {
     "SUMMARY_LATEST_PREFER_HEALTH": "1",
 }
 
-# summary_parallel_intervals_runtime_patch 側で上書きする timeout 定数。
+# scheduler_jobs/summary/parallel_intervals.py 側で上書きする timeout 定数。
 _MODULE_TIMEOUT_ATTRS = (
     "SUMMARY_PARALLEL_TIMEOUT_SEC",
     "SUMMARY_PARALLEL_MIN_TIMEOUT_SEC",
@@ -106,9 +106,9 @@ def _force(name: str, value: str) -> tuple[str | None, str]:
 
 
 def _tune_summary_parallel_module() -> bool:
-    """summary_parallel_intervals_runtime_patch が既に import 済みなら定数も揃える。"""
+    """scheduler_jobs/summary/parallel_intervals.py の timeout 定数も揃える。"""
     try:
-        import core.startup.summary_parallel_intervals_runtime_patch as target
+        import scheduler_jobs.summary.parallel_intervals as target
     except Exception:
         return False
 

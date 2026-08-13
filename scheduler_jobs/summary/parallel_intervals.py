@@ -17,6 +17,17 @@
 #     5分足待ちによる親tick timeoutを防ぐ。
 # ============================================================
 
+# ------------------------------------------------------------
+# 旧 core/startup/summary_parallel_intervals_runtime_patch.py から移設。
+#
+# 旧 install() は scheduler_jobs.summary の time_locked_runner / runners /
+# scheduler の 3 モジュールへ run_time_locked_summary_jobs を差し替えていたが、
+# runners.py:41 と scheduler.py:76 は time_locked_runner から from-import して
+# いるので、本体 (time_locked_runner.run_time_locked_summary_jobs) が
+# ここの run_parallel_interval_tick() を呼ぶ形にすれば 3 つとも追従する。
+#
+# env 既定値 9 件は apply_env_defaults() が担う。
+# ------------------------------------------------------------
 from __future__ import annotations
 
 import datetime as dt
@@ -399,66 +410,8 @@ def _patched_run_time_locked_summary_jobs_legacy(*, now: Optional[dt.datetime] =
             _RUNNING_KEYS.discard(key)
 
 
-def install() -> bool:
-    global _INSTALLED, _ORIG_TIME_LOCKED
-
-    # 軽量既定: 環境変数で明示された時だけ全足/長足BGを有効化する。
-    _setdefault_env("SUMMARY_PARALLEL_FORCE_1_3_5", "0")
-    _setdefault_env("SUMMARY_PUSH_BG_ALL_INTERVALS", "0")
-    _setdefault_env("SUMMARY_PUSH_BG_LONG_INTERVALS", "0")
-    _setdefault_env("SUMMARY_PUSH_DISPLAY_ALL_INTERVALS", "0")
-    _setdefault_env("SUMMARY_MAIN_WAIT_PUSH_1M_ONLY", "1")
-    _setdefault_env("SUMMARY_MAIN_BG_LONG_PUSH_ENABLED", "0")
-    _setdefault_env("SUMMARY_PARALLEL_TIMEOUT_MIN_SEC", "30")
-    _setdefault_env("SUMMARY_PARALLEL_INTERVAL_WORKERS", "1")
-    _setdefault_env("SUMMARY_PUSH_BG_INTERVAL_WORKERS", "1")
-
-    if _INSTALLED:
-        _ensure_timeout_min()
-        return True
-
-    _ensure_timeout_min()
-
-    try:
-        import scheduler_jobs.summary.time_locked_runner as tlr
-        import scheduler_jobs.summary.runners as runners
-        import scheduler_jobs.summary.scheduler as scheduler
-        cur = getattr(tlr, "run_time_locked_summary_jobs", None)
-        if getattr(cur, "_summary_parallel_intervals_v12", False):
-            _INSTALLED = True
-            return True
-        _ORIG_TIME_LOCKED = cur
-        _patched_run_time_locked_summary_jobs._summary_parallel_intervals_v12 = True  # type: ignore[attr-defined]
-        tlr.run_time_locked_summary_jobs = _patched_run_time_locked_summary_jobs
-        runners.run_time_locked_summary_jobs = _patched_run_time_locked_summary_jobs
-        scheduler.run_time_locked_summary_jobs = _patched_run_time_locked_summary_jobs
-        _INSTALLED = True
-        logger.warning(
-            "[SUMMARY PARALLEL] installed v12 enabled=%s workers=%s bg_workers=%s timeout=%.1f ranking_parallel=%s force_1_3_5=%s push_all_intervals=%s push_bg_all=%s push_bg_long=%s main_entry_only=%s main_wait_1m_only=%s min_timeout=%s cap_enabled=%s",
-            _env_bool("SUMMARY_PARALLEL_INTERVALS_ENABLED", True),
-            _env_int("SUMMARY_PARALLEL_INTERVAL_WORKERS", 1),
-            _env_int("SUMMARY_PUSH_BG_INTERVAL_WORKERS", 1),
-            _env_float("SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC", 30.0),
-            _env_bool("SUMMARY_PARALLEL_RANKING_ENABLED", True),
-            _force_all_targets_enabled(),
-            _push_all_intervals_enabled(),
-            _push_bg_all_intervals_enabled(),
-            _push_bg_long_intervals_enabled(),
-            _is_main_entry_only_process(),
-            _main_wait_push_1m_only_enabled(),
-            os.getenv("SUMMARY_PARALLEL_TIMEOUT_MIN_SEC"),
-            _main_tick_timeout_cap_enabled(),
-        )
-        return True
-    except Exception as e:
-        logger.exception("[SUMMARY PARALLEL] install failed err=%s", e)
-        return False
 
 
-try:
-    install()
-except Exception as e:
-    logger.exception("[SUMMARY PARALLEL] auto install failed err=%s", e)
 
 __all__ = ["install"]
 
@@ -883,7 +836,7 @@ def _rst_reset_global_executor(reason: str) -> None:
         logger.exception("[SUMMARY PARALLEL RESET] global executor reset failed reason=%s", reason)
 
 
-def _patched_run_time_locked_summary_jobs(*, now: Optional[dt.datetime] = None, run_push: bool = True, run_ranking: bool = True, display: bool = True, run_entry: bool = True) -> dict[str, dict[int, pd.DataFrame]]:
+def run_parallel_interval_tick(*, now: Optional[dt.datetime] = None, run_push: bool = True, run_ranking: bool = True, display: bool = True, run_entry: bool = True) -> dict[str, dict[int, pd.DataFrame]]:
     if not _rst_env_bool("SUMMARY_PARALLEL_INTERVALS_ENABLED", True):
         orig = _ORIG_TIME_LOCKED
         if callable(orig):
@@ -969,3 +922,20 @@ def _patched_run_time_locked_summary_jobs(*, now: Optional[dt.datetime] = None, 
                 pass
         with _RUNNING_LOCK:
             _RUNNING_KEYS.discard(key)
+
+
+def apply_env_defaults() -> None:
+    """旧 install() 冒頭の軽量既定値。"""
+    _setdefault_env("SUMMARY_PARALLEL_FORCE_1_3_5", "0")
+    _setdefault_env("SUMMARY_PUSH_BG_ALL_INTERVALS", "0")
+    _setdefault_env("SUMMARY_PUSH_BG_LONG_INTERVALS", "0")
+    _setdefault_env("SUMMARY_PUSH_DISPLAY_ALL_INTERVALS", "0")
+    _setdefault_env("SUMMARY_MAIN_WAIT_PUSH_1M_ONLY", "1")
+    _setdefault_env("SUMMARY_MAIN_BG_LONG_PUSH_ENABLED", "0")
+    _setdefault_env("SUMMARY_PARALLEL_TIMEOUT_MIN_SEC", "30")
+    _setdefault_env("SUMMARY_PARALLEL_INTERVAL_WORKERS", "1")
+    _setdefault_env("SUMMARY_PUSH_BG_INTERVAL_WORKERS", "1")
+    _ensure_timeout_min()
+
+
+apply_env_defaults()

@@ -978,7 +978,8 @@ def apply_oneshot_limit_defaults() -> bool:
 
     for _mod_name, _label in (
         ("core.startup.summary_ai_async_entry_patch", "summary_ai_async_entry"),
-        ("core.startup.summary_parallel_intervals_runtime_patch", "summary_parallel_intervals"),
+        # summary_parallel_intervals は scheduler_jobs/summary/parallel_intervals.py へ
+        # 移設済みで、env 既定値も import 時に入るため連鎖 install は不要。
         ("core.startup.exit_board_profit_runtime_patch", "exit_board_profit"),
     ):
         try:

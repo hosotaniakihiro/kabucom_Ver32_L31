@@ -104,7 +104,7 @@ def _push_targets_from_time_locked_targets(targets: list[int]) -> list[int]:
     return sorted(list(dict.fromkeys(int(x) for x in (targets or []))))
 
 
-def run_time_locked_summary_jobs(
+def _run_time_locked_summary_jobs_core(
     *,
     now: Optional[dt.datetime] = None,
     run_push: bool = True,
@@ -260,3 +260,32 @@ def run_time_locked_summary_jobs(
         )
 
     return out
+
+
+# ============================================================
+# SUMMARY PARALLEL INTERVALS
+# (旧 core/startup/summary_parallel_intervals_runtime_patch.py を本文化)
+# ------------------------------------------------------------
+# 旧パッチは run_time_locked_summary_jobs を time_locked_runner / runners /
+# scheduler の 3 モジュールへ差し替えていた。実装は
+# scheduler_jobs/summary/parallel_intervals.py へ移設し、ここから呼ぶ。
+# runners.py:41 / scheduler.py:76 は本モジュールから from-import しているので
+# 自動で追従する。
+#
+# 旧 core/startup/summary_parallel_executor_reset_patch も同 module へ
+# 本文化済みで、run_parallel_interval_tick がその実装 (tick ごとに
+# ローカル executor を立て、timeout 時はグローバル executor を作り直す)。
+# SUMMARY_PARALLEL_INTERVALS_ENABLED=0 のときだけ native を直接呼ぶ。
+# ============================================================
+
+
+def run_time_locked_summary_jobs(*args, **kwargs):
+    try:
+        from scheduler_jobs.summary import parallel_intervals as _pi
+
+        if _pi._ORIG_TIME_LOCKED is None:
+            _pi._ORIG_TIME_LOCKED = _run_time_locked_summary_jobs_core
+        return _pi.run_parallel_interval_tick(*args, **kwargs)
+    except Exception:
+        logger.exception("[SUMMARY PARALLEL] tick failed; fall back to core")
+        return _run_time_locked_summary_jobs_core(*args, **kwargs)
