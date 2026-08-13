@@ -273,15 +273,17 @@ def _install_low_volatility_entry_guard(context: str) -> bool:
         if os.environ.get("DISABLE_LOW_VOLATILITY_ENTRY_GUARD", "").strip() == "1":
             logger.warning("[RUNTIME ENV DEFAULTS PATCH] low volatility entry guard disabled by env")
             return False
-        from .. import low_volatility_entry_guard_patch
-        base_ok = bool(low_volatility_entry_guard_patch.install())
-        # low_volatility_entry_guard_strict_patch は削除した。
-        # 唯一のラップ対象 low_volatility_entry_guard_patch._low_vol_block は
-        # 同モジュール内の _block_result からしか呼ばれず、その _block_result には
-        # リポジトリ全体で呼び出し元が無い (AI/entry_gate.py 側は独自の
-        # _low_vol_block / _low_vol_block_result を持つ本文化済み実装)。
-        # strict が併せて行っていた base.install() も直上で既に実行済み。
-        return bool(base_ok)
+        # low_volatility_entry_guard_patch は削除した (完全に不活性だったため)。
+        #   - _patch_ai_entry_gate      : AI/entry_gate.py へ本文化済みで no-op
+        #   - _patch_summary_ai_selection: executor の core filter watcher に
+        #                                  剥がされる死にラッパで撤去済み
+        #   - _patch_entry_order_builder_low_move:
+        #       _low_move_hard_block は install 順で summary_ai_range_consistency に
+        #       必ず上書きされる死にラッパだったため撤去 (本文化時に確認)
+        #   - 残っていた os.environ.setdefault("ENTRY_LOW_VOL_ZERO_AS_MISSING","1") も、
+        #     唯一の実効読み手 AI/entry_gate.py:780 が既定 True で読むため実効ゼロ
+        # 低ボラガード本体は AI/entry_gate.py (_low_vol_block 等) が持っている。
+        return True
     except Exception:
         logger.exception("[RUNTIME ENV DEFAULTS PATCH] low volatility entry guard install failed")
         return False
