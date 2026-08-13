@@ -442,7 +442,12 @@ BACKGROUND_MAIN_PATCHES = [
     # _cached_1m_history_from_global へ本文化済み (_prf_*)。
     # 同モジュールを import すれば env 既定値と bootstrap も走る。
     ("core.startup.summary_mtf_diff_from_1m_patch", "SUMMARY_MTF_EARLY_READY", "DISABLE_SUMMARY_MTF_EARLY_READY_PATCH"),
-    ("core.startup.summary_ai_order_builder_range_repair_patch", "SUMMARY_MTF_EARLY_READY", "DISABLE_SUMMARY_MTF_EARLY_READY_PATCH"),
+    # summary_ai_order_builder_range_repair_patch は削除した。
+    # 共有ライブラリ部分 (_repair_row / _update_original_row) は
+    # trading/filters/summary_ai_range_repair.py へ移設し、呼び出し元 2 箇所が
+    # 直接 import する。install していた atr_1m_filter のラップは、実 install 順の
+    # 測定で volatility_filter_tonosama_entryrow_rescue_patch に巻き戻されて
+    # 一度も到達していない死にラッパーだったため移していない。
     ("trading.audit_logging.install_audit_logging", "AUDIT_LOGGING", "DISABLE_AUDIT_LOGGING"),
     # summary_main_push_db_refresh_patch / direct_push_1m (旧 summary_main_direct_push_force_patch) の
     # background 再適用は削除した。どちらも冪等な no-op で、SYNC_MAIN_PATCHES

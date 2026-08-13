@@ -150,7 +150,7 @@ def _repair_summary_ai_atr_row(entry_row: Any) -> tuple[Any, dict]:
     base = _row_dict(entry_row)
     symbol = _safe_str(base.get('symbol'))
     try:
-        from core.startup import summary_ai_order_builder_range_repair_patch as repair_mod
+        from trading.filters import summary_ai_range_repair as repair_mod
         repair_fn = getattr(repair_mod, '_repair_row', None)
         if not callable(repair_fn):
             return entry_row, {'repaired': False, 'reason': 'repair_fn_missing'}

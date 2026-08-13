@@ -1,22 +1,23 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-# File   : core/startup/summary_ai_order_builder_range_repair_patch.py
-# Version: V5-SUMMARY-AI-ATR-REPAIR-MULTI-SOURCE-HISTORY
+# File   : trading/filters/summary_ai_range_repair.py
 # ------------------------------------------------------------
-# SUMMARY_AI の直接スナップショット経路で row が
-# high == low == close / atr == 0 のまま entry_controller と
-# entry_order_builder に渡り、ATR_1M_FILTER_NG / LOW_MOVE_RANGE_TOO_SMALL /
-# LOW_MOVE_NO_ATR / LOW_MOVE_ATR_TOO_SMALL で落ちる問題を補正する。
+# 旧 core/startup/summary_ai_order_builder_range_repair_patch.py の
+# 共有ライブラリ部分を移設した (パッチではない)。
 #
-# 重要:
-#   - 閾値は緩和しない。
-#   - fail-open しない。
-#   - day_high/day_low または global_context の履歴でレンジが確認できる時だけ補完する。
+# SUMMARY_AI 由来の entry_row について、global_context / DF から
+# high/low/close/ATR を補って作り直す。呼び出し元は 2 つ:
+#   trading/filters/volatility_filter.py (_range_5m_filter_from_entry_row)
+#   core/startup/entry_final_filter_failopen_patch.py
 #
-# V5:
-#   - global_context の push だけでなく summary / legacy / ranking / push-cache も検索。
-#   - 1分履歴が複数本ある場合は ATR(14) を計算して atr_1m を補完。
+# 旧 install の _install_entry_controller_filter_repair (atr_1m_filter の
+# ラップ) は**移していない**。実 install 順の測定で、この層は直後に入る
+# volatility_filter_tonosama_entryrow_rescue_patch が native まで
+# 巻き戻して被せ直すため一度も到達していなかった。
+# 同 rescue は volatility_filter.atr_1m_filter へ本文化済みなので、
+# ここでラップを残すと「今まで効いていなかった補修」が有効になってしまう。
 # ============================================================
+
 from __future__ import annotations
 
 import logging
@@ -345,68 +346,10 @@ def _update_original_row(entry_row: Any, repaired: dict[str, Any]) -> None:
         pass
 
 
-def _install_entry_controller_filter_repair() -> bool:
-    try:
-        import trading.filters.volatility_filter as vf
-        import trading.handlers.entry_controller as ec
-
-        if not getattr(vf.atr_1m_filter, "_summary_ai_entry_controller_repair_v5", False):
-            orig_atr = getattr(vf.atr_1m_filter, "_original", vf.atr_1m_filter)
-
-            def _patched_atr_1m_filter(entry_row, *args, **kwargs):
-                row = _row_dict(entry_row)
-                if _source_is_summary_ai(row.get("source"), row):
-                    symbol = str(row.get("symbol") or "")
-                    repaired, diag = _repair_row(entry_row, symbol=symbol, source=str(row.get("source") or "SUMMARY"))
-                    if diag.get("repaired") or diag.get("atr_repaired"):
-                        logger.warning("[SUMMARY AI ENTRY CTRL ATR REPAIR] repaired before atr_1m_filter detail=%s version=%s", diag, VERSION)
-                        _update_original_row(entry_row, repaired)
-                        return orig_atr(repaired, *args, **kwargs)
-                return orig_atr(entry_row, *args, **kwargs)
-
-            _patched_atr_1m_filter._summary_ai_entry_controller_repair_v4 = True  # type: ignore[attr-defined]
-            _patched_atr_1m_filter._summary_ai_entry_controller_repair_v5 = True  # type: ignore[attr-defined]
-            _patched_atr_1m_filter._original = orig_atr  # type: ignore[attr-defined]
-            vf.atr_1m_filter = _patched_atr_1m_filter
-            ec.atr_1m_filter = _patched_atr_1m_filter
-
-        # range_5m_filter向けのSUMMARY_AI履歴補完(_repair_row呼び出し)は
-        # trading/filters/volatility_filter.py の _range5m_repair_summary_ai_row
-        # (_range_5m_filter_from_entry_row 本体、V6) へインライン化済み。
-        # _repair_row 自体は entry_final_filter_failopen_patch.py も外部から
-        # 呼び出す共有ライブラリのためここに残置する。
-
-        logger.warning("[SUMMARY AI ENTRY CTRL ATR REPAIR] installed version=%s", VERSION)
-        return True
-    except Exception:
-        logger.exception("[SUMMARY AI ENTRY CTRL ATR REPAIR] install failed version=%s", VERSION)
-        return False
 
 
-def install() -> bool:
-    global _INSTALLED, _ORIGINAL_LOW_MOVE
-    ctrl_ok = _install_entry_controller_filter_repair()
-    if _INSTALLED:
-        return True or ctrl_ok
-    try:
-        # entry_order_builder._low_move_hard_block のラップは撤去した。
-        # 実運用では直後に install される summary_ai_range_consistency_patch が
-        # `_original` を辿って素の実装を掴み直すため、このラッパは一度も
-        # 効いていなかった (合成順シミュレーションで確認済み)。
-        # range_consistency 側のロジックは
-        # trading/handlers/entry_order_builder._low_move_hard_block へ本文化済み。
-        _INSTALLED = True
-        logger.warning("[SUMMARY AI ORDER RANGE REPAIR] installed version=%s", VERSION)
-        return True
-    except Exception:
-        logger.exception("[SUMMARY AI ORDER RANGE REPAIR] install failed version=%s", VERSION)
-        return bool(ctrl_ok)
 
 
-try:
-    install()
-except Exception:
-    logger.exception("[SUMMARY AI ORDER RANGE REPAIR] auto install failed")
 
 
 __all__ = ["install", "VERSION"]

@@ -928,7 +928,7 @@ def _range5m_repair_summary_ai_row(entry_row: Any) -> Any:
         source = str(row.get("source") or "").strip().upper()
         if source != "SUMMARY_AI" and source != "SUMMARY":
             return entry_row
-        from core.startup import summary_ai_order_builder_range_repair_patch as repair_mod
+        from trading.filters import summary_ai_range_repair as repair_mod
         repair_fn = getattr(repair_mod, "_repair_row", None)
         update_fn = getattr(repair_mod, "_update_original_row", None)
         if not callable(repair_fn):
