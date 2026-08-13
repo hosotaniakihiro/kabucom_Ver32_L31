@@ -147,13 +147,38 @@ def _sort_candidates_local(items: list[Any]) -> list[Any]:
 
 
 def _install_final_gate_relax_patch() -> bool:
+    """SUMMARY / TONOSAMA 最終ゲート緩和の閾値定数。
+
+    _passes_ai_gate のラップ本体は trading/handlers/entry_controller.py へ
+    本文化済み。ここに残しているのは旧 install() が併せて上書きしていた
+    4定数で、同じ定数を core/startup/__init__.py / oneshot_limit_700k_patch /
+    tonosama_history_failclose_strict_patch も書いて**後勝ち**になるため、
+    実行位置を変えずにここで設定する。
+    """
     try:
-        from core.startup.entry_controller_final_gate_relax_patch import install as install_relax
-        ok = bool(install_relax())
-        logger.warning("[SUMMARY AI MORE CANDIDATES PATCH] entry_controller_final_gate_relax_patch installed=%s", ok)
-        return ok
+        if os.environ.get("ENTRY_CONTROLLER_FINAL_GATE_RELAX_ENABLED", "").strip() in {"0", "false", "no", "off"}:
+            return False
+        import trading.handlers.entry_controller as ec
+
+        def _f(name: str, default: float) -> float:
+            try:
+                v = os.getenv(name)
+                return float(default) if v is None or str(v).strip() == "" else float(v)
+            except Exception:
+                return float(default)
+
+        ec.MIN_SUMMARY_SCORE_BUY = _f("ENTRY_CONTROLLER_SUMMARY_BUY_MIN_SCORE", 1.0)
+        ec.MIN_COMPOSITE_SCORE_BUY = _f("ENTRY_CONTROLLER_SUMMARY_BUY_MIN_COMPOSITE", 1.0)
+        ec.MIN_SUMMARY_SCORE_SELL = _f("ENTRY_CONTROLLER_SUMMARY_SELL_MIN_SCORE", 1.0)
+        ec.MIN_COMPOSITE_SCORE_SELL = _f("ENTRY_CONTROLLER_SUMMARY_SELL_MIN_COMPOSITE", 1.0)
+        logger.warning(
+            "[SUMMARY AI MORE CANDIDATES PATCH] final gate relax constants applied buy=%s/%s sell=%s/%s",
+            ec.MIN_SUMMARY_SCORE_BUY, ec.MIN_COMPOSITE_SCORE_BUY,
+            ec.MIN_SUMMARY_SCORE_SELL, ec.MIN_COMPOSITE_SCORE_SELL,
+        )
+        return True
     except Exception:
-        logger.exception("[SUMMARY AI MORE CANDIDATES PATCH] entry_controller_final_gate_relax_patch install failed")
+        logger.exception("[SUMMARY AI MORE CANDIDATES PATCH] final gate relax constants failed")
         return False
 
 

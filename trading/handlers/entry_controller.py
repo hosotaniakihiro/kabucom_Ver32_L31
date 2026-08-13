@@ -1065,7 +1065,7 @@ def _tonosama_bridge_pass_check(row: dict, ai: dict, side: str):
     return _passes_ai_gate(row, ai, side=side)
 
 
-def _passes_ai_gate(entry_row: dict, ai: dict, side: str) -> tuple[bool, str]:
+def _passes_ai_gate_core(entry_row: dict, ai: dict, side: str) -> tuple[bool, str]:
     if not isinstance(ai, dict):
         return False, "AI_RESULT_INVALID"
 
@@ -3867,3 +3867,107 @@ def calculate_entry_quantity(*, symbol: str, price: float, confidence: float, lo
         symbol, p, lot, budget, lot, confidence, lot_multiplier, atr,
     )
     return int(lot)
+
+
+# ============================================================
+# SUMMARY / TONOSAMA 経路の最終ゲート緩和
+# ------------------------------------------------------------
+# 旧 core/startup/entry_controller_final_gate_relax_patch.py を本文化。
+# SUMMARY / TONOSAMA 由来の行だけ、env で指定した閾値で再判定する。
+# それ以外の経路は従来の _passes_ai_gate_core をそのまま使う。
+#
+# 旧パッチが併せて上書きしていた MIN_SUMMARY_SCORE_* / MIN_COMPOSITE_SCORE_* の
+# 4定数は、同じ定数を core/startup/__init__.py / oneshot_limit_700k_patch /
+# tonosama_history_failclose_strict_patch も書いて**後勝ち**になるため、
+# 実行位置を変えないよう呼び出し元 (summary_ai_more_candidates_patch) に残した。
+# ============================================================
+
+def _fgr_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _fgr_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _fgr_src(row: dict) -> str:
+    try:
+        vals = [
+            row.get("source"),
+            row.get("entry_type"),
+            row.get("pipeline_source"),
+            row.get("reason"),
+            row.get("ai_reason"),
+        ]
+        return "|".join(str(v or "").upper() for v in vals)
+    except Exception:
+        return ""
+
+
+def _fgr_is_summary_or_tonosama(row: Any) -> bool:
+    if not isinstance(row, dict):
+        return False
+    s = _fgr_src(row)
+    return "SUMMARY" in s or "SUMMARY_AI" in s or "TONOSAMA" in s
+
+
+def _passes_ai_gate(entry_row: dict, ai: dict, side: str):
+    try:
+        if not _fgr_is_summary_or_tonosama(entry_row):
+            return _passes_ai_gate_core(entry_row, ai, side)
+        if not isinstance(ai, dict):
+            return False, "AI_RESULT_INVALID"
+        allow = bool(ai.get("allow", False))
+        if not allow:
+            return False, f"AI_ALLOW_FALSE:{_safe_str(ai.get('reason'))}"
+        side_n = str(side or "").upper()
+        confidence = _safe_float(ai.get("confidence"), 0.0)
+        score_buy, score_sell = _resolve_entry_scores(entry_row, side=side_n)
+        src = _fgr_src(entry_row)
+        if "TONOSAMA" in src:
+            min_buy = _fgr_env_float("ENTRY_CONTROLLER_TONOSAMA_BUY_MIN_SCORE", 0.01)
+            min_sell = _fgr_env_float("ENTRY_CONTROLLER_TONOSAMA_SELL_MIN_SCORE", 0.01)
+            min_comp_buy = _fgr_env_float("ENTRY_CONTROLLER_TONOSAMA_BUY_MIN_COMPOSITE", min_buy)
+            min_comp_sell = _fgr_env_float("ENTRY_CONTROLLER_TONOSAMA_SELL_MIN_COMPOSITE", min_sell)
+        else:
+            min_buy = _fgr_env_float("ENTRY_CONTROLLER_SUMMARY_BUY_MIN_SCORE", 1.0)
+            min_sell = _fgr_env_float("ENTRY_CONTROLLER_SUMMARY_SELL_MIN_SCORE", 1.0)
+            min_comp_buy = _fgr_env_float("ENTRY_CONTROLLER_SUMMARY_BUY_MIN_COMPOSITE", min_buy)
+            min_comp_sell = _fgr_env_float("ENTRY_CONTROLLER_SUMMARY_SELL_MIN_COMPOSITE", min_sell)
+
+        if side_n == "BUY":
+            if confidence < MIN_AI_CONFIDENCE_BUY:
+                return False, f"BUY_CONF_LOW:{confidence:.3f}"
+            composite = confidence * score_buy
+            if score_buy < min_buy:
+                return False, f"BUY_SCORE_LOW_RELAXED:{score_buy:.3f}<min={min_buy:.3f}"
+            if composite < min_comp_buy:
+                return False, f"BUY_COMPOSITE_LOW_RELAXED:{composite:.3f}<min={min_comp_buy:.3f}"
+            return True, f"BUY_OK_RELAXED conf={confidence:.3f} score_buy={score_buy:.3f} comp={composite:.3f} src={src}"
+
+        if side_n == "SELL":
+            if confidence < MIN_AI_CONFIDENCE_SELL:
+                return False, f"SELL_CONF_LOW:{confidence:.3f}"
+            composite = confidence * score_sell
+            if score_sell < min_sell:
+                return False, f"SELL_SCORE_LOW_RELAXED:{score_sell:.3f}<min={min_sell:.3f}"
+            if composite < min_comp_sell:
+                return False, f"SELL_COMPOSITE_LOW_RELAXED:{composite:.3f}<min={min_comp_sell:.3f}"
+            return True, f"SELL_OK_RELAXED conf={confidence:.3f} score_sell={score_sell:.3f} comp={composite:.3f} src={src}"
+
+        return False, f"SIDE_INVALID:{side}"
+    except Exception:
+        logger.exception("[ENTRY FINAL GATE RELAX] patched gate failed -> fallback original")
+        return _passes_ai_gate_core(entry_row, ai, side)
