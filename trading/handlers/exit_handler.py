@@ -717,7 +717,7 @@ def execute_exit(pos: Position, exit_price: float, reason: str):
 # ============================================================
 # EXIT パイプライン（唯一の入口）
 # ============================================================
-def run_exit_pipeline():
+def run_exit_pipeline_core():
     sp = Session_position()
     try:
         db_positions = _load_db_open_positions(sp)
@@ -1077,7 +1077,7 @@ def _check_normal_exit_scalp_align(pos: Any, price: float, now: dt.datetime):
     return None
 
 
-def check_normal_exit(pos: Any, price: float, now: dt.datetime):
+def check_normal_exit_core(pos: Any, price: float, now: dt.datetime):
     if not _cne_scope_enabled():
         return _check_normal_exit_core(pos, price, now)
     reason = _epp_profit_protect_reason(pos, price, now, label="NORMAL")
@@ -1086,10 +1086,183 @@ def check_normal_exit(pos: Any, price: float, now: dt.datetime):
     return _check_normal_exit_scalp_align(pos, price, now)
 
 
-def check_tonosama_exit(pos, price: float, now: dt.datetime):
+def check_tonosama_exit_core(pos, price: float, now: dt.datetime):
     if not _cne_scope_enabled():
         return _check_tonosama_exit_core(pos, price, now)
     reason = _epp_profit_protect_reason(pos, price, now, label="TONOSAMA")
     if reason:
         return reason
     return _check_tonosama_exit_core(pos, price, now)
+
+
+# ============================================================
+# 旧 core/startup/board_wall_stall_exit_patch.py を本文化
+# ------------------------------------------------------------
+# 旧パッチ install() は3つのことをしていた:
+#
+#  1) _install_entry_board_imbalance_guard()
+#     -> final_entry_safety_guard._board_guard は本文化済みで存在せず、
+#        常に False を返すだけの no-op だった。_patched_board_guard は
+#        一度も呼ばれない死にコードなので移していない。
+#        板ガード本体は trading/handlers/entry_controller._final_guard_board_ok。
+#
+#  2) _install_exit_pipeline_temp_stop()
+#     -> _bfe_exit_temp_disabled() が真なら run_exit_pipeline を no-op 化。
+#        AUTOSTOCK_TEMP_DISABLE_EXIT は既定 True なので通常はこちらが有効。
+#
+#  3) check_normal_exit / check_tonosama_exit の板崩れ / 板食い停滞 EXIT
+#     -> _bfe_exit_temp_disabled() が偽のときだけ install されていた。
+#        つまり 2) と 3) は排他。本文でも同じ排他条件で分岐する。
+#
+# 旧パッチは main.py:276 の patches リストから install され、この2関数の
+# 最外周ラッパーだった (他に同じ属性を包むパッチは残っていない)。
+# ここでもネイティブを *_core へ改名し最外周として被せている。
+#
+# 意図的な差分: 旧パッチは main.py が from-import 済みの
+# __main__.run_exit_pipeline を setattr で差し替えていた。本文化後は
+# from-import 自体がガード付きの関数を束縛するので setattr は不要。
+# 副次的に trading/experimental/scheduler.py の from-import にも
+# 同じガードが効く (EXIT 停止という運用意図に沿う向きの差分)。
+# ============================================================
+
+def _bfe_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None:
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", ""}:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
+
+
+def _bfe_env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
+def _bfe_exit_temp_disabled() -> bool:
+    # 今回の運用要望: EXITを一時停止。解除したい時だけ AUTOSTOCK_TEMP_DISABLE_EXIT=0 を指定する。
+    return _bfe_env_bool("AUTOSTOCK_TEMP_DISABLE_EXIT", True) or _bfe_env_bool("EXIT_TEMP_STOP", False)
+
+
+def _bfe_get(obj: Any, name: str, default=None):
+    try:
+        if isinstance(obj, dict):
+            return obj.get(name, default)
+        return getattr(obj, name, default)
+    except Exception:
+        return default
+
+
+def _bfe_position_symbol(pos: Any) -> str:
+    return str(
+        _bfe_get(pos, "symbol")
+        or _bfe_get(pos, "Symbol")
+        or _bfe_get(pos, "stock_code")
+        or ""
+    ).strip()
+
+
+def _bfe_position_side(pos: Any) -> str:
+    return str(_bfe_get(pos, "side") or _bfe_get(pos, "Side") or "BUY").upper()
+
+
+def _bfe_board_fast_exit_reason(pos: Any, price: float) -> str | None:
+    """支え板崩壊EXIT → 壁食われ失速EXIT の順で確認する。"""
+    if _bfe_exit_temp_disabled():
+        return None
+
+    symbol = _bfe_position_symbol(pos)
+    side = _bfe_position_side(pos)
+    if not symbol or price <= 0:
+        return None
+
+    try:
+        from trading.board.board_signal import analyze_exit_board_collapse
+
+        detail = analyze_exit_board_collapse(
+            symbol,
+            position_side=side,
+            current_price=float(price),
+            exchange=_bfe_env_int("EXIT_BOARD_WALL_EXCHANGE", 1),
+        )
+        if detail:
+            reason = str(detail.get("reason") or "BOARD_SUPPORT_COLLAPSE_EXIT")
+            logger.warning(
+                "[BOARD FAST EXIT PATCH] EXIT symbol=%s side=%s price=%s reason=%s detail=%s",
+                symbol,
+                side,
+                price,
+                reason,
+                detail,
+            )
+            return reason
+    except Exception:
+        logger.debug("[BOARD FAST EXIT PATCH] collapse analyze failed symbol=%s", symbol, exc_info=True)
+
+    if not _bfe_env_bool("EXIT_BOARD_WALL_STALL_ENABLED", True):
+        return None
+    try:
+        from trading.board.board_state import analyze_wall_eaten_stall
+
+        detail = analyze_wall_eaten_stall(
+            symbol,
+            position_side=side,
+            current_price=float(price),
+            exchange=_bfe_env_int("EXIT_BOARD_WALL_EXCHANGE", 1),
+        )
+        if not detail:
+            return None
+
+        reason = str(detail.get("reason") or "BOARD_WALL_EATEN_STALL_EXIT")
+        logger.warning(
+            "[BOARD WALL STALL EXIT PATCH] EXIT symbol=%s side=%s price=%s reason=%s detail=%s",
+            symbol,
+            side,
+            price,
+            reason,
+            detail,
+        )
+        return reason
+    except Exception:
+        logger.debug("[BOARD WALL STALL EXIT PATCH] analyze failed symbol=%s", symbol, exc_info=True)
+        return None
+
+
+def run_exit_pipeline():
+    if _bfe_exit_temp_disabled():
+        logger.warning(
+            "[EXIT TEMP STOP] run_exit_pipeline skipped AUTOSTOCK_TEMP_DISABLE_EXIT=%s EXIT_TEMP_STOP=%s",
+            os.getenv("AUTOSTOCK_TEMP_DISABLE_EXIT"),
+            os.getenv("EXIT_TEMP_STOP"),
+        )
+        return None
+    return run_exit_pipeline_core()
+
+
+def check_normal_exit(pos: Any, price: float, now: dt.datetime):
+    if _bfe_exit_temp_disabled():
+        return None
+    reason = _bfe_board_fast_exit_reason(pos, price)
+    if reason:
+        return reason
+    return check_normal_exit_core(pos, price, now)
+
+
+def check_tonosama_exit(pos, price: float, now: dt.datetime):
+    if _bfe_exit_temp_disabled():
+        return None
+    reason = _bfe_board_fast_exit_reason(pos, price)
+    if reason:
+        return reason
+    return check_tonosama_exit_core(pos, price, now)

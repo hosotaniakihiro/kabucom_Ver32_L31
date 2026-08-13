@@ -273,7 +273,9 @@ def _install_main_runtime_patches():
         # (_five_sec_relax_stage)。main.py 専用スコープは
         # pending_writer._five_sec_relax_scope_enabled() が再現している。
         ("core.startup.volatility_filter_tonosama_entryrow_rescue_patch", "install"),
-        ("core.startup.board_wall_stall_exit_patch", "install"),
+        # board_wall_stall_exit_patch は trading/handlers/exit_handler.py へ本文化済み
+        # (_bfe_* / run_exit_pipeline / check_normal_exit / check_tonosama_exit)。
+        # entry board imbalance guard は元から no-op だったので移していない。
         # ranking_entry_filter_rescue_patch は trading/ranking/entry_from_ranking.py
         # (_passes_ranking_only_filters の再帰救済ラップ) と
         # trading/summary/engine/summary_incremental_engine.py._build_bars /
