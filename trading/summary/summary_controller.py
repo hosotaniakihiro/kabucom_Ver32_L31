@@ -112,7 +112,7 @@ def _thread_name() -> str:
         return "unknown"
 
 
-def _enter_interval(interval: int) -> bool:
+def _enter_interval_core(interval: int) -> bool:
     interval = int(interval)
     now = dt.datetime.now()
 
@@ -1041,3 +1041,98 @@ def _mtf_diff_update_hook():
         return fn if callable(fn) else None
     except Exception:
         return None
+
+
+# ============================================================
+# INFLIGHT STALE CLEAR
+# (旧 core/startup/summary_no_overlap_runtime_patch.py の
+#  _patch_summary_controller_inflight_stale_clear を本文化)
+# ------------------------------------------------------------
+# timeout した worker スレッドが残した per-interval の diff_update
+# inflight ロックを、規定秒数を超えていたら入場前に解放する。
+# ネイティブは _enter_interval_core へ改名した。
+#
+# 旧パッチの本体だった run_time_locked_summary_jobs のラッパーは
+# 移していない。実呼び出しで確認したところ、既定 (=1) では
+# summary_parallel_executor_reset_patch がティック処理を丸ごと
+# 再実装して _ORIG を呼ばず、SUMMARY_PARALLEL_INTERVALS_ENABLED=0 でも
+# native を直接呼ぶため、どちらの設定でも no_overlap のラッパーには
+# 一度も入らない = 死んだラッパーだった。
+#
+# env 既定値 5 件 (_sno_set_default_env) は旧 install() と同じ setdefault。
+# ============================================================
+
+def _sno_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
+
+
+def _sno_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return max(1.0, float(v))
+    except Exception:
+        return float(default)
+
+
+def _sno_set_default_env() -> None:
+    """未設定時だけ、安全側のデフォルト値を入れる。"""
+    defaults = {
+        "SUMMARY_PARALLEL_INTERVAL_WORKERS": "1",
+        "SUMMARY_PARALLEL_RANKING_ENABLED": "0",
+        "SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC": "25",
+        "SUMMARY_PARALLEL_SKIP_IF_ANY_RUNNING": "1",
+        "SUMMARY_CONTROLLER_INFLIGHT_STALE_CLEAR_SEC": "45",
+    }
+    for k, v in defaults.items():
+        if os.getenv(k) is None or str(os.getenv(k)).strip() == "":
+            os.environ[k] = v
+            logger.warning("[SUMMARY NO OVERLAP] default env set %s=%s", k, v)
+
+
+def _enter_interval(interval: int) -> bool:
+    try:
+        interval_i = int(interval)
+    except Exception:
+        interval_i = interval
+    stale_sec = _sno_env_float("SUMMARY_CONTROLLER_INFLIGHT_STALE_CLEAR_SEC", 45.0)
+    try:
+        now = dt.datetime.now()
+        with _SUMMARY_INFLIGHT_GUARD:
+            meta = _SUMMARY_INFLIGHT.get(interval_i)
+            if meta and bool(meta.get("running", False)):
+                started_at = meta.get("started_at")
+                held_sec = 0.0
+                try:
+                    if isinstance(started_at, dt.datetime):
+                        held_sec = max(0.0, (now - started_at).total_seconds())
+                except Exception:
+                    held_sec = 0.0
+                if held_sec >= stale_sec:
+                    logger.error(
+                        "[SUMMARY NO OVERLAP][INFLIGHT STALE CLEAR] interval=%s held=%.3fs stale_sec=%.1f holder_tid=%s holder_thread=%s -> clear stale running flag",
+                        interval_i,
+                        held_sec,
+                        stale_sec,
+                        meta.get("tid"),
+                        meta.get("thread"),
+                    )
+                    _SUMMARY_INFLIGHT[interval_i] = {"running": False, "started_at": None, "tid": None, "thread": None}
+    except Exception:
+        logger.exception("[SUMMARY NO OVERLAP][INFLIGHT STALE CLEAR] pre-clear failed interval=%s", interval)
+    return _enter_interval_core(interval)
+
+
+_sno_set_default_env()

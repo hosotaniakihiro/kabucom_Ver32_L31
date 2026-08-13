@@ -35,13 +35,15 @@ _ORIGINAL = None
 
 
 def _install_summary_no_overlap_guard() -> None:
-    try:
-        from core.startup import summary_no_overlap_runtime_patch as snop
-        fn = getattr(snop, "install", None)
-        ok = fn() if callable(fn) else False
-        logger.warning("[ENTRY ORDER MTF SLOPE FILL] chained summary_no_overlap install=%s", ok)
-    except Exception:
-        logger.exception("[ENTRY ORDER MTF SLOPE FILL] chained summary_no_overlap install failed")
+    """summary_no_overlap_runtime_patch は本文化済み。
+
+    inflight stale clear と env 既定値 5 件は
+    trading/summary/summary_controller.py の _enter_interval / _sno_* へ移した。
+    run_time_locked_summary_jobs のラッパーは実呼び出しで死にコードと確認
+    できたため移していない (summary_parallel_executor_reset_patch が
+    ティックを丸ごと再実装しており、どの設定でも到達しない)。
+    """
+    return None
 
 
 def _install_short_mtf_neutral_rescue() -> None:
