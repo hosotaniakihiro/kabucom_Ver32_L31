@@ -1831,6 +1831,13 @@ __all__ = [
 # env SUMMARY_AI_APPROVED_ROW_RANGE_REPAIR (既定True) を再現する。
 # ============================================================
 
+# _arr_env_bool が参照する真偽値セット。
+# 本文化時に定義を移し忘れており、NameError が try/except に飲まれて
+# env 指定が常に既定値へ落ちていたので補った。
+_TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+_FALSE = {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}
+
+
 def _arr_env_bool(name: str, default: bool = True) -> bool:
     try:
         raw = os.getenv(name)
@@ -2013,3 +2020,100 @@ def build_approved_row(ai_ok_item: Dict[str, Any]) -> Dict[str, Any]:
     if not _arr_enabled():
         return row
     return _arr_repair_approved_row_range(row, ai_ok_item)
+
+
+# ============================================================
+# SUMMARY AI 承認の最低価格 (旧
+# core/startup/summary_ai_entry_hook_dataframe_truth_patch.py の
+# _install_summary_ai_approval_diag_and_price_floor を本文化)
+# ------------------------------------------------------------
+# 2026-08-11 のユーザー判断「エントリー最低価格は 200 円」がここに載っている。
+# SUMMARY_AI_APPROVAL_MIN_PRICE_OVERRIDE (既定 200.0) を
+#   - env SUMMARY_AI_ENTRY_MIN_PRICE / ENTRY_MIN_PRICE へハード代入
+#   - DEFAULT_MIN_PRICE_FOR_ENTRY (ソース既定 3000.0) を上書き
+# の 2 つへ反映する。2500 へ戻したい場合は
+# SUMMARY_AI_APPROVAL_MIN_PRICE_OVERRIDE=2500 を指定する。
+#
+# 旧パッチはさらに _entry_price_bounds をラップしていたが、この属性は
+# リポジトリ全体で読み手が無い (executor 内の呼び出しも __all__ の記載だけ)。
+# 死んだラッパーなので移していない。実際に効いていたのは上の 2 つ。
+#
+# 適用スコープは旧 install 元 (sitecustomize BACKGROUND_MAIN_PATCHES) と
+# 同じく _dft_scope_enabled() で判定する。DB プロセスでは従来どおり
+# ソース既定の 3000.0 のまま。
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 旧 core/startup/summary_ai_entry_hook_dataframe_truth_patch.py の
+# install スコープ (sitecustomize BACKGROUND_MAIN_PATCHES) の再現。
+# scheduler_jobs/summary/summary_ai_entry_hook_v20._df_truth_scope_enabled と
+# 同じ判定。SUMMARY_AI_DF_TRUTH_SCOPE_ENABLED=1/0 で明示上書きできる。
+# ------------------------------------------------------------
+_DFT_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+
+
+def _dft_env_on(name: str, default: bool = False) -> bool:
+    """sitecustomize._env_on と同じ解釈。"""
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        return bool(default)
+
+
+def _dft_scope_enabled() -> bool:
+    try:
+        raw = os.getenv("SUMMARY_AI_DF_TRUTH_SCOPE_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return _dft_env_on("SUMMARY_AI_DF_TRUTH_SCOPE_ENABLED", True)
+        # sitecustomize._install_module の disabled_env は "1" 完全一致で判定していた
+        if str(os.environ.get("DISABLE_SUMMARY_AI_DF_TRUTH_PATCH", "")).strip() == "1":
+            return False
+        argv_parts = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        argv = " ".join(argv_parts)
+        # sitecustomize は database context を main.py 判定より先に見る
+        if any(name in argv for name in _DFT_DB_PROCESS_NAMES):
+            return False
+        is_main_py = any(a.endswith("/main.py") or a == "main.py" for a in argv_parts)
+        if is_main_py and _dft_env_on("SITECUSTOMIZE_MAIN_LITE", True):
+            return True
+        return _dft_env_on("SITECUSTOMIZE_ENABLE_FULL_NONMAIN", False)
+    except Exception:
+        return False
+
+
+
+def _dft_apply_entry_price_floor() -> None:
+    global DEFAULT_MIN_PRICE_FOR_ENTRY
+    if not _dft_scope_enabled():
+        return
+    try:
+        raw = os.getenv("SUMMARY_AI_APPROVAL_MIN_PRICE_OVERRIDE")
+        min_override = float(raw) if raw not in (None, "") else 200.0
+    except Exception:
+        min_override = 200.0
+    min_override = max(0.0, min_override)
+    os.environ["SUMMARY_AI_ENTRY_MIN_PRICE"] = str(min_override)
+    os.environ["ENTRY_MIN_PRICE"] = str(min_override)
+    try:
+        DEFAULT_MIN_PRICE_FOR_ENTRY = float(min_override)
+    except Exception:
+        pass
+    logger.warning(
+        "[SUMMARY AI APPROVAL DIAG] installed price_min_override=%.0f executor_default_min=%s",
+        min_override, DEFAULT_MIN_PRICE_FOR_ENTRY,
+    )
+
+
+_dft_apply_entry_price_floor()

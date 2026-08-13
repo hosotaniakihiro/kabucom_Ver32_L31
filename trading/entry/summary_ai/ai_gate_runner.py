@@ -21,6 +21,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import sys
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -460,6 +461,7 @@ def run_push_summary_ai_entry(summary_df: Optional[pd.DataFrame] = None, *, df: 
         return {"candidates": [], "ai_results": [], "ai_ok": [], "approved_rows": [], "execution": {"executed": False, "orders": [], "skip_reason": "empty_df"}}
     candidates_df = base_df.head(top_n).copy()
     ai_results = run_ai_gate_for_candidates(candidates_df, interval=interval, source=source, min_ai_confidence=float(min_ai_confidence), default_dominant_ratio=default_dominant_ratio, side=side_s)
+    ai_results = _wk_apply_weak_summary_ai_filter(ai_results)
     ai_ok = [r for r in ai_results if bool(r.get("allow"))]
     if side_s != "BUY":
         logger.warning("[SUMMARY AI ENTRY] side=%s evaluated only; real BUY entry skipped ai_ok=%s", side_s, len(ai_ok))
@@ -542,3 +544,166 @@ __all__ = [
     "run",
     "start",
 ]
+
+
+# ============================================================
+# SUMMARY AI WEAK FILTER
+# (旧 core/startup/summary_ai_entry_hook_dataframe_truth_patch.py の
+#  _install_summary_ai_weak_filter を本文化)
+# ------------------------------------------------------------
+# AI_OK でも 3m/5m の裏付けが弱い候補を AI_NG へ倒す層。
+#
+# **呼び出し位置が重要**: 旧パッチはモジュール属性
+# ai_gate_runner.run_ai_gate_for_candidates を差し替えていたが、
+# 実運用の呼び出し経路は 2 つに分かれている。
+#
+#   trading/entry/summary_ai/runner.py:1066
+#     -> runner.py:43 の from-import 束縛を使う。
+#        entry_fire_rescue_runtime_patch が install 時に runner 側の束縛を
+#        自分のラッパーで上書きするため、この経路には
+#        entry_fire_rescue しか載っていない (実測: 2 層)。
+#   ai_gate_runner.py の内部呼び出し (下の 1 箇所)
+#     -> モジュール属性を見るので 4 層すべてが載る
+#        (実測: df_truth weak <- emp_prob <- entry_fire_rescue <- native)
+#
+# したがって関数本体に組み込むと runner 経路にも効いてしまい、
+# 今まで弾かれていなかった候補が弾かれるようになる。
+# 挙動を変えないため、モジュール属性ではなく
+# **内部呼び出しの直後**に噛ませている。順序も旧構成と同じ
+# (emp_prob / entry_fire_rescue の結果に対して最後に適用)。
+# ============================================================
+
+def _wk_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
+
+
+def _wk_env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _wk_safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
+
+
+def _wk_append_reason(base: Any, extra: str) -> str:
+    b = str(base or "").strip()
+    return f"{b}|{extra}" if b else str(extra)
+
+
+def _wk_weak_summary_ai_ng(item: dict[str, Any]) -> tuple[bool, str]:
+    if not _wk_env_bool("SUMMARY_AI_WEAK_SIGNAL_FILTER_ENABLED", True):
+        return False, "disabled"
+    try:
+        source = str(item.get("source") or item.get("source_name") or "").upper()
+        reason = str(item.get("reason") or "")
+        ai_row = item.get("ai_row") if isinstance(item.get("ai_row"), dict) else {}
+        source_row = item.get("source_row") if isinstance(item.get("source_row"), dict) else {}
+        src_from_reason = "src=SUMMARY" in reason or "src=PUSH" in reason
+        is_summary_like = src_from_reason or source in {"SUMMARY", "PUSH", "PUSH_SUMMARY", "SUMMARY_AI"}
+        if not is_summary_like:
+            return False, "not_summary_like"
+        rank_score = _wk_safe_float(ai_row.get("rankScore", ai_row.get("rank_score", source_row.get("rankScore", source_row.get("rank_score", 0.0)))), 0.0)
+        score_mtf = max(
+            abs(_wk_safe_float(ai_row.get("score_mtf", source_row.get("score_mtf", 0.0)), 0.0)),
+            abs(_wk_safe_float(ai_row.get("mtf_score", source_row.get("mtf_score", 0.0)), 0.0)),
+            abs(_wk_safe_float(ai_row.get("mtf", source_row.get("mtf", 0.0)), 0.0)),
+        )
+        reason_has_zero_3m5m = ("3m=0.00" in reason or "3m=0" in reason) and ("5m=0.00" in reason or "5m=0" in reason)
+        if reason_has_zero_3m5m and abs(rank_score) <= 1e-9:
+            return True, "weak_summary_ai_zero_rank_and_zero_3m5m"
+        v3 = max(abs(_wk_safe_float(ai_row.get(k, source_row.get(k, 0.0)), 0.0)) for k in ("score_3m", "score_total_3m", "final_score_3m"))
+        v5 = max(abs(_wk_safe_float(ai_row.get(k, source_row.get(k, 0.0)), 0.0)) for k in ("score_5m", "score_total_5m", "final_score_5m"))
+        if abs(rank_score) <= 1e-9 and score_mtf <= 1e-9 and v3 <= 1e-9 and v5 <= 1e-9:
+            return True, "weak_summary_ai_no_rank_mtf_3m_5m"
+        return False, "ok"
+    except Exception:
+        logger.exception("[SUMMARY AI WEAK FILTER] check failed")
+        return False, "exception_fail_open"
+
+
+# ------------------------------------------------------------
+# 旧 core/startup/summary_ai_entry_hook_dataframe_truth_patch.py の
+# install スコープ (sitecustomize BACKGROUND_MAIN_PATCHES) の再現。
+# scheduler_jobs/summary/summary_ai_entry_hook_v20._df_truth_scope_enabled と
+# 同じ判定。SUMMARY_AI_DF_TRUTH_SCOPE_ENABLED=1/0 で明示上書きできる。
+# ------------------------------------------------------------
+_DFT_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+
+
+def _dft_env_on(name: str, default: bool = False) -> bool:
+    """sitecustomize._env_on と同じ解釈。"""
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        return bool(default)
+
+
+def _dft_scope_enabled() -> bool:
+    try:
+        raw = os.getenv("SUMMARY_AI_DF_TRUTH_SCOPE_ENABLED")
+        if raw is not None and str(raw).strip() != "":
+            return _dft_env_on("SUMMARY_AI_DF_TRUTH_SCOPE_ENABLED", True)
+        # sitecustomize._install_module の disabled_env は "1" 完全一致で判定していた
+        if str(os.environ.get("DISABLE_SUMMARY_AI_DF_TRUTH_PATCH", "")).strip() == "1":
+            return False
+        argv_parts = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        argv = " ".join(argv_parts)
+        # sitecustomize は database context を main.py 判定より先に見る
+        if any(name in argv for name in _DFT_DB_PROCESS_NAMES):
+            return False
+        is_main_py = any(a.endswith("/main.py") or a == "main.py" for a in argv_parts)
+        if is_main_py and _dft_env_on("SITECUSTOMIZE_MAIN_LITE", True):
+            return True
+        return _dft_env_on("SITECUSTOMIZE_ENABLE_FULL_NONMAIN", False)
+    except Exception:
+        return False
+
+
+def _wk_apply_weak_summary_ai_filter(results):
+    """AI_OK のうち 3m/5m の裏付けが弱いものを AI_NG へ倒す。"""
+    if not _dft_scope_enabled():
+        return results
+    if not isinstance(results, list):
+        return results
+    blocked = 0
+    for item in results:
+        if not isinstance(item, dict) or not bool(item.get("allow")):
+            continue
+        ng, why = _wk_weak_summary_ai_ng(item)
+        if not ng:
+            continue
+        item["allow"] = False
+        item["reason"] = _wk_append_reason(item.get("reason"), why)
+        blocked += 1
+        logger.warning("[SUMMARY AI WEAK FILTER] AI_OK -> AI_NG symbol=%s side=%s reason=%s", item.get("symbol"), item.get("side") or item.get("ai_side"), why)
+    if blocked:
+        logger.warning("[SUMMARY AI WEAK FILTER] blocked weak AI_OK count=%s", blocked)
+    return results

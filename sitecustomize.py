@@ -418,7 +418,14 @@ BACKGROUND_MAIN_PATCHES = [
     # 本文化済みのため、ここでの install は不要になった。
     # スコープと env 条件は runner._range_repair_enabled() が再現している。
     ("trading.entry.tonosama.fresh_summary_wait", "TONOSAMA_FRESH_SUMMARY_WAIT_FIX", "DISABLE_TONOSAMA_FRESH_SUMMARY_WAIT_FIX_PATCH"),
-    ("core.startup.summary_ai_entry_hook_dataframe_truth_patch", "SUMMARY_AI_DF_TRUTH_PATCH", "DISABLE_SUMMARY_AI_DF_TRUTH_PATCH"),
+    # summary_ai_entry_hook_dataframe_truth_patch は本文化済み:
+    #   weak filter  -> trading/entry/summary_ai/ai_gate_runner.py の内部呼び出し直後
+    #                   (_wk_*)。モジュール属性ではなく呼び出し位置に置いてある。
+    #                   runner.py:1066 経路には元から効いていなかったため
+    #                   (entry_fire_rescue が runner 側の束縛を上書きする)。
+    #   price floor  -> trading/entry/summary_ai/executor.py (_dft_apply_entry_price_floor)
+    # スコープ判定 _dft_scope_enabled() は DISABLE_SUMMARY_AI_DF_TRUTH_PATCH を
+    # そのまま見る。
     ("core.startup.summary_ai_candidate_refill_patch", "SUMMARY_AI_CANDIDATE_REFILL", "DISABLE_SUMMARY_AI_CANDIDATE_REFILL_PATCH"),
     ("core.startup.summary_ai_runtime_consistency_patch", "SUMMARY_AI_RUNTIME_CONSISTENCY_BG", "DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH"),
     ("trading.filters.summary_ai_range_bridge", "SUMMARY_AI_LOW_MOVE_SOFTPASS", "DISABLE_SUMMARY_AI_LOW_MOVE_SOFTPASS_PATCH"),
