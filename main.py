@@ -264,7 +264,11 @@ def _install_main_runtime_patches():
         #   (_strict_result_executed / _strict_positive_enabled)。
         #   price floor 2500 の上書きは 2026-08-11 のユーザー判断
         #   「エントリー最低価格は200円」により移植せず破棄した。
-        ("core.startup.entry_order_mtf_slope_fill_patch", "install"),
+        # entry_order_mtf_slope_fill_patch は
+        # trading/handlers/entry_order_builder.py へ本文化済み (_mtf_*)。
+        # 旧 install が連鎖していた 2 件をここへ移した
+        # (summary_no_overlap は本文化済みで空スタブ)。
+        ("core.startup.entry_order_short_mtf_neutral_rescue_patch", "install"),
         # summary_ai_entry_controller_bridge_patch は本文化済みなので削除した。
         #   ai_final_entry_check ラッパー -> trading/handlers/entry_controller.py (_bri_*)
         #   _result_executed 厳格判定   -> trading/summary/pipeline/entry_pipeline.py
