@@ -248,7 +248,10 @@ def _install_main_runtime_patches():
         ("core.startup.low_movement_entry_guard_patch", "install"),
         ("core.startup.entry_final_filter_failopen_patch", "install"),
         ("core.startup.oneshot_limit_700k_patch", "install"),
-        ("core.startup.entry_limit_passive_runtime_patch", "install"),
+        # entry_limit_passive_runtime_patch は
+        # trading/handlers/entry_order_builder.py へ本文化済み (_elp_*)。
+        # 定数の上書きと _aggressive_limit_price の差し替えは
+        # 同ファイルの _elp_apply_constants() が import 時に行う。
         # discord_summary_display_compact_patch / discord_summary_kwarg_safety_patch は
         # scheduler_jobs/summary/display.py 本体へインライン化済みのため削除。
         # entry_ma5_third_bar_slope_guard_patch は entry_controller._build_scored_candidates

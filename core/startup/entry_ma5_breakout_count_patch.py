@@ -514,8 +514,11 @@ def install() -> bool:
         logger.exception("[MA5 BREAKOUT] patch entry_order_builder failed")
 
     try:
-        import core.startup.entry_limit_passive_runtime_patch as elp
-        ok_any = _patch_guard_function(elp, "_summary_ai_strict_guard", "entry_limit_passive") or ok_any
+        # entry_limit_passive_runtime_patch は
+        # trading/handlers/entry_order_builder.py へ本文化済み (_elp_*)。
+        # 同じガード関数を包む対象名だけ差し替える。
+        import trading.handlers.entry_order_builder as elp
+        ok_any = _patch_guard_function(elp, "_elp_summary_ai_strict_guard", "entry_limit_passive") or ok_any
     except Exception:
         logger.exception("[MA5 BREAKOUT] patch entry_limit_passive failed")
 

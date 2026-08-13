@@ -1807,7 +1807,7 @@ def _epi_patch_order_result(result: dict, *, symbol: str, side: str, source: str
     return result
 
 
-def build_entry_order(*args, **kwargs):
+def _build_entry_order_epi(*args, **kwargs):
     result = _build_entry_order_bsr(*args, **kwargs)
     try:
         return _epi_patch_order_result(
@@ -1820,3 +1820,277 @@ def build_entry_order(*args, **kwargs):
     except Exception:
         logger.exception("[ENTRY PRICE IMPROVE] patch failed; keep original result")
         return result
+
+
+# ============================================================
+# ENTRY LIMIT BOARD TOUCH
+# (旧 core/startup/entry_limit_passive_runtime_patch.py を本文化)
+# ------------------------------------------------------------
+# SUMMARY_AI の LIMIT 注文を「BUY=ask / SELL=bid の板タッチ」に寄せ、
+# 板が取れないときは fallback 指値にする。さらに SUMMARY_AI 向けの
+# 厳格ガード (_elp_summary_ai_strict_guard) を通す。
+#
+# チェーン (すべて本ファイル内):
+#   _build_entry_order_core (native)
+#     <- _build_entry_order_fob  SUMMARY_AI fast path
+#       <- _build_entry_order_bsr 支持線/抵抗線ガード
+#         <- _build_entry_order_epi 指値の有利側寄せ
+#           <- build_entry_order    この層
+#
+# 旧 install が行っていた定数の上書き 3 件と
+# _aggressive_limit_price の差し替えは _elp_apply_constants() が担う。
+# _chain_contains による二重ラップ防止は、順序が固定になったので不要。
+# ============================================================
+
+_ELP__INSTALLED = False
+
+
+def _elp_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None:
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", ""}:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
+
+
+def _elp_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _elp_safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or v == "":
+            return float(default)
+        x = float(v)
+        if math.isnan(x) or math.isinf(x):
+            return float(default)
+        return x
+    except Exception:
+        return float(default)
+
+
+def _elp_safe_float_or_none(v: Any) -> Optional[float]:
+    try:
+        if v is None or str(v).strip() == "":
+            return None
+        x = float(v)
+        if math.isnan(x) or math.isinf(x):
+            return None
+        return x
+    except Exception:
+        return None
+
+
+def _elp_row_to_dict(row: Any) -> dict:
+    try:
+        if row is None:
+            return {}
+        if isinstance(row, dict):
+            return row
+        if hasattr(row, "to_dict"):
+            d = row.to_dict()
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    return {}
+
+
+def _elp_first(row: dict, keys: tuple[str, ...], default: Any = None) -> Any:
+    for k in keys:
+        try:
+            v = row.get(k)
+            if v is not None and str(v).strip() != "":
+                return v
+        except Exception:
+            pass
+    return default
+
+
+def _elp_is_explicit_false(v: Any) -> bool:
+    try:
+        if v is None:
+            return False
+        s = str(v).strip().lower()
+        return s in {"0", "false", "no", "n", "off"}
+    except Exception:
+        return False
+
+
+def _elp_is_true(v: Any) -> bool:
+    try:
+        if v is None:
+            return False
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        return False
+
+
+def _elp_ng(reason: str, **detail: Any) -> Dict[str, Any]:
+    return {"ok": False, "reason": reason, "detail": detail}
+
+
+def _elp_summary_ai_strict_guard(*, symbol: str, side: str, row: dict, detail: dict) -> Optional[Dict[str, Any]]:
+    """SUMMARY_AI 新規エントリーの strict guard。
+
+    旧 core/startup/entry_mtf_short_required_daily_optional_patch V1.4 が
+    この関数を「短期MTF方向判定だけ行う」版へ差し替えていた。
+    その実装は trading/handlers/short_mtf_direction_guard.py へ移設済みで、
+    有効なプロセスではそちらを使う。
+    """
+    from trading.handlers import short_mtf_direction_guard as _short_mtf
+
+    if _short_mtf.short_mtf_guard_enabled():
+        return _short_mtf.summary_ai_strict_guard(symbol=symbol, side=side, row=row, detail=detail)
+    return _elp_summary_ai_strict_guard_legacy(symbol=symbol, side=side, row=row, detail=detail)
+
+
+def _elp_summary_ai_strict_guard_legacy(*, symbol: str, side: str, row: dict, detail: dict) -> Optional[Dict[str, Any]]:
+    side_u = str(side or "").upper()
+
+    board_ok = bool(detail.get("board"))
+    price_source = str(detail.get("price_source") or "")
+    if not board_ok or "fallback" in price_source.lower():
+        allow_without_board = _elp_env_bool("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", True)
+        strict_board = _elp_env_bool("ENTRY_STRICT_BOARD_REQUIRED", False)
+        if strict_board and not allow_without_board:
+            return _elp_ng(
+                "STRICT_BOARD_MISSING",
+                symbol=symbol,
+                side=side_u,
+                board=detail.get("board"),
+                price_source=price_source,
+                message="板が取れないためSUMMARY_AI新規エントリーを停止",
+            )
+        logger.warning(
+            "[ENTRY LIMIT BOARD TOUCH] BOARD_MISSING_ALLOW symbol=%s side=%s price_source=%s strict_board=%s allow_without_board=%s",
+            symbol,
+            side_u,
+            price_source,
+            strict_board,
+            allow_without_board,
+        )
+
+    if _elp_env_bool("ENTRY_STRICT_SUMMARY_REQUIRE_TECHNICAL_READY", True):
+        technical_ready = row.get("technical_ready")
+        usable_technical_ready = row.get("usable_technical_ready")
+        if _elp_is_explicit_false(technical_ready) and not _elp_is_true(usable_technical_ready):
+            return _elp_ng(
+                "STRICT_TECHNICAL_NOT_READY",
+                symbol=symbol,
+                side=side_u,
+                technical_ready=technical_ready,
+                usable_technical_ready=usable_technical_ready,
+                message="technical_ready=False のためSUMMARY_AI新規エントリーを停止",
+            )
+        if technical_ready is None:
+            logger.warning(
+                "[ENTRY LIMIT BOARD TOUCH] technical_ready missing -> continue to slope/MTF guard symbol=%s side=%s usable_technical_ready=%s",
+                symbol,
+                side_u,
+                usable_technical_ready,
+            )
+
+    slope = _elp_safe_float_or_none(_elp_first(row, ("slope_atr_scaled", "slope", "score_slope", "disp_slope"), None))
+    slope_eps = abs(_elp_env_float("ENTRY_STRICT_SUMMARY_SLOPE_EPS", 0.001))
+    if slope is None:
+        return _elp_ng("STRICT_SLOPE_MISSING", symbol=symbol, side=side_u, slope=slope)
+    if side_u == "BUY" and slope <= slope_eps:
+        return _elp_ng("STRICT_BUY_SLOPE_NOT_POSITIVE", symbol=symbol, side=side_u, slope=slope, min_slope=slope_eps)
+    if side_u == "SELL" and slope >= -slope_eps:
+        return _elp_ng("STRICT_SELL_SLOPE_NOT_NEGATIVE", symbol=symbol, side=side_u, slope=slope, max_slope=-slope_eps)
+
+    mtf_values = {
+        "mtf": _elp_safe_float_or_none(_elp_first(row, ("mtf", "score_mtf", "mtf_score", "score_mtf_merged"), None)),
+        "slope_1m": _elp_safe_float_or_none(_elp_first(row, ("slope_atr_scaled_1m", "slope_1m", "slope1m"), None)),
+        "slope_3m": _elp_safe_float_or_none(_elp_first(row, ("slope_atr_scaled_3m", "slope_3m", "slope3m"), None)),
+        "slope_5m": _elp_safe_float_or_none(_elp_first(row, ("slope_atr_scaled_5m", "slope_5m", "slope5m"), None)),
+    }
+    available = {k: v for k, v in mtf_values.items() if v is not None}
+    require_mtf = _elp_env_bool("ENTRY_STRICT_SUMMARY_REQUIRE_MTF_DATA", True)
+    mtf_eps = abs(_elp_env_float("ENTRY_STRICT_SUMMARY_MTF_EPS", 0.0))
+    if require_mtf and not available:
+        return _elp_ng("STRICT_MTF_MISSING", symbol=symbol, side=side_u, values=mtf_values)
+    if side_u == "BUY":
+        bad = {k: v for k, v in available.items() if v < -mtf_eps}
+        if bad:
+            return _elp_ng("STRICT_MTF_NOT_BUY_ALIGNED", symbol=symbol, side=side_u, bad=bad, values=mtf_values)
+    if side_u == "SELL":
+        bad = {k: v for k, v in available.items() if v > mtf_eps}
+        if bad:
+            return _elp_ng("STRICT_MTF_NOT_SELL_ALIGNED", symbol=symbol, side=side_u, bad=bad, values=mtf_values)
+
+    return None
+
+
+def _elp_board_touch_limit_price(base_price: float, side: str, ticks: int = 0) -> float:
+    p = _elp_safe_float(base_price, 0.0)
+    if p <= 0:
+        return p
+    side_u = str(side or "").upper()
+    return _round_price(p, side_u)
+
+
+_elp_board_touch_limit_price._entry_board_touch = True  # type: ignore[attr-defined]
+
+
+def _elp_apply_constants() -> None:
+    """旧 install() の定数上書きと _aggressive_limit_price 差し替えを再現する。"""
+    global SUMMARY_AGGRESSIVE_LIMIT_TICKS, ENTRY_ORDER_REQUIRE_MTF_DATA
+    global ENTRY_ORDER_SELL_IGNORE_POSITIVE_MTF, _aggressive_limit_price
+    SUMMARY_AGGRESSIVE_LIMIT_TICKS = 0
+    ENTRY_ORDER_REQUIRE_MTF_DATA = _elp_env_bool("ENTRY_STRICT_SUMMARY_REQUIRE_MTF_DATA", True)
+    ENTRY_ORDER_SELL_IGNORE_POSITIVE_MTF = False
+    _aggressive_limit_price = _elp_board_touch_limit_price
+
+
+def build_entry_order(*args, **kwargs):
+    ret = _build_entry_order_epi(*args, **kwargs)
+    try:
+        src = str(kwargs.get("source") or "").upper()
+        side = str(kwargs.get("side") or "").upper()
+        symbol = str(kwargs.get("symbol") or "").strip()
+        row = _elp_row_to_dict(kwargs.get("entry_row"))
+
+        if isinstance(ret, dict) and ret.get("ok"):
+            detail = ret.get("detail")
+            if isinstance(detail, dict) and src == "SUMMARY_AI" and detail.get("order_type") == "LIMIT":
+                detail["aggressive_limit_ticks"] = 0
+                detail["entry_limit_mode"] = "BOARD_TOUCH_OR_FALLBACK"
+                detail["price_rule"] = "BUY=ask / SELL=bid / board_missing=fallback_limit"
+                if detail.get("board"):
+                    detail["price_source"] = "board_bid_ask_touch"
+                else:
+                    detail["price_source"] = "summary_fallback_touch"
+
+                strict_ng = _elp_summary_ai_strict_guard(symbol=symbol, side=side, row=row, detail=detail)
+                if strict_ng is not None:
+                    logger.warning(
+                        "[ENTRY LIMIT BOARD TOUCH] NG symbol=%s side=%s reason=%s detail=%s",
+                        symbol, side, strict_ng.get("reason"), strict_ng.get("detail"),
+                    )
+                    return strict_ng
+
+                logger.warning(
+                    "[ENTRY LIMIT BOARD TOUCH] symbol=%s side=%s price=%s base=%s rule=%s guard=OK",
+                    symbol, side, detail.get("price"), detail.get("base_price"), detail.get("price_rule"),
+                )
+    except Exception:
+        logger.debug("[ENTRY LIMIT BOARD TOUCH] detail patch failed", exc_info=True)
+    return ret
+
+
+_elp_apply_constants()

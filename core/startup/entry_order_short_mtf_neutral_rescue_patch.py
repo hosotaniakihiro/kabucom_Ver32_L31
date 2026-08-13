@@ -232,13 +232,14 @@ class _TempShortMtfBypass:
                 setattr(obj, name, value)
             except Exception:
                 pass
-        for obj_name in ("core.startup.entry_limit_passive_runtime_patch",):
+        # entry_limit_passive_runtime_patch は entry_order_builder へ本文化済み。
+        for obj_name, guard_name in (("trading.handlers.entry_order_builder", "_elp_summary_ai_strict_guard"),):
             try:
                 mod = __import__(obj_name, fromlist=["dummy"])
-                old_strict = getattr(mod, "_summary_ai_strict_guard", None)
+                old_strict = getattr(mod, guard_name, None)
                 if callable(old_strict):
-                    self.attrs[(mod, "_summary_ai_strict_guard")] = old_strict
-                    setattr(mod, "_summary_ai_strict_guard", self._noop)
+                    self.attrs[(mod, guard_name)] = old_strict
+                    setattr(mod, guard_name, self._noop)
             except Exception:
                 pass
         for name, value in {
@@ -311,9 +312,9 @@ def _patch_direct_guards(eob: Any) -> list[str]:
     except Exception:
         logger.exception("[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] patch eob guard failed")
     try:
-        import core.startup.entry_limit_passive_runtime_patch as elp
-        if _patch_guard_function(elp, "_summary_ai_strict_guard"):
-            patched.append("entry_limit_passive_runtime_patch._summary_ai_strict_guard")
+        import trading.handlers.entry_order_builder as elp
+        if _patch_guard_function(elp, "_elp_summary_ai_strict_guard"):
+            patched.append("entry_order_builder._elp_summary_ai_strict_guard")
     except Exception:
         logger.debug("[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] entry_limit passive guard patch skipped", exc_info=True)
     return patched
