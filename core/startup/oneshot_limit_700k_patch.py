@@ -127,10 +127,12 @@ def _install_entry_fresh_quote_guard_patch() -> bool:
         os.environ.setdefault("ENTRY_FRESH_QUOTE_GUARD_ENABLED", "1")
         os.environ.setdefault("ENTRY_MAX_QUOTE_AGE_SEC", "8.0")
         os.environ.setdefault("ENTRY_ALLOW_QUOTE_WITHOUT_TIMESTAMP", "0")
-        from core.startup import entry_fresh_quote_guard_patch as p
-        ok = p.install()
-        logger.warning("[ONESHOT LIMIT PATCH] entry_fresh_quote_guard_patch installed=%s", ok)
-        return bool(ok)
+        # entry_fresh_quote_guard_patch は kabu_api/buy_sell_entry.py の
+        # get_latest_bid_ask へ本文化済み (_fqg_*)。
+        # 上の env 既定値だけここで入れておけばよい
+        # (有効/無効は同ファイルが ENTRY_FRESH_QUOTE_GUARD_ENABLED を見る)。
+        logger.warning("[ONESHOT LIMIT PATCH] entry_fresh_quote_guard is inlined; env defaults applied")
+        return True
     except Exception:
         logger.exception("[ONESHOT LIMIT PATCH] entry_fresh_quote_guard_patch install failed")
         return False

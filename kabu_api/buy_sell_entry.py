@@ -17,13 +17,14 @@
 # ✔ Ver28: 新規エントリー注文の Exchange を既定で SOR=9 に統一
 # ============================================================
 
+import datetime as dt
 import logging
 import configparser
 import os
-from typing import Optional
+from typing import Any, Optional
 
 from utils_common import (
-    get_latest_bid_ask,
+    get_latest_bid_ask as _get_latest_bid_ask_core,
     get_trading_unit,
 )
 
@@ -659,3 +660,218 @@ def buy_entry(symbol, qty=None, price=None):
 
 def sell_entry(symbol, qty=None, price=None):
     return execute_short_at_best_bid(symbol, qty=qty)
+
+
+# ============================================================
+# ENTRY FRESH QUOTE GUARD
+# (旧 core/startup/entry_fresh_quote_guard_patch.py を本文化)
+# ------------------------------------------------------------
+# 発注前の気配を PUSH の最新値から作り直し、古い気配での発注を防ぐ。
+# 鮮度が足りなければ None を返して呼び出し側に見送らせる。
+#
+# 実測: kabu_api.buy_sell_entry.get_latest_bid_ask を差し替えていたのは
+# このパッチだけで (board_retry_patch / summary_ai_strict_board_rest_patch は
+# 名前に言及するだけ)、しかも元関数を呼ばない**完全置換**だった。
+# よって本文でも同じく置換にしてある。
+# utils_common 側の実装は _get_latest_bid_ask_core として残してあるが、
+# 旧構成と同じくここからは呼ばない。
+#
+# 有効/無効は旧 install と同じ ENTRY_FRESH_QUOTE_GUARD_ENABLED (既定 True)。
+# ============================================================
+
+_FQG__INSTALLED = False
+_FQG__ORIG_BSE_GET_LATEST_BID_ASK = None
+
+
+def _fqg_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok"}
+    except Exception:
+        return bool(default)
+
+
+def _fqg_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _fqg_norm_symbol(v: Any) -> str:
+    try:
+        s = str(v or "").strip().upper()
+        if s.endswith(".T"):
+            s = s[:-2]
+        if s.endswith(".0") and s[:-2].isdigit():
+            s = s[:-2]
+        return s
+    except Exception:
+        return ""
+
+
+def _fqg_to_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or str(v).strip() == "":
+            return float(default)
+        x = float(v)
+        return float(default) if x != x else x
+    except Exception:
+        return float(default)
+
+
+def _fqg_parse_dt(v: Any) -> Optional[dt.datetime]:
+    if v is None:
+        return None
+    try:
+        import pandas as pd
+        t = pd.to_datetime(v, errors="coerce")
+        if pd.isna(t):
+            return None
+        # pandas Timestamp -> python datetime
+        if hasattr(t, "to_pydatetime"):
+            t = t.to_pydatetime()
+        if isinstance(t, dt.datetime):
+            # timezone awareの場合はnaiveに揃える
+            if t.tzinfo is not None:
+                t = t.astimezone().replace(tzinfo=None)
+            return t
+    except Exception:
+        pass
+    return None
+
+
+def _fqg_latest_push_quote(symbol: str) -> Optional[dict[str, Any]]:
+    symbol = _fqg_norm_symbol(symbol)
+    if not symbol:
+        return None
+    try:
+        from global_state import global_data
+
+        dfp = global_data.get_push_df()
+        if dfp is None or getattr(dfp, "empty", True):
+            return None
+
+        df = dfp.copy()
+        rename_map = {
+            "Symbol": "symbol",
+            "BidPrice": "bid_price",
+            "AskPrice": "ask_price",
+            "BidQty": "bid_qty",
+            "AskQty": "ask_qty",
+            "CurrentPrice": "current_price",
+            "CurrentPriceTime": "datetime",
+            "time": "datetime",
+            "DateTime": "datetime",
+            "datetime": "datetime",
+        }
+        for old, new in rename_map.items():
+            if old in df.columns and new not in df.columns:
+                df[new] = df[old]
+
+        if "symbol" not in df.columns:
+            return None
+        try:
+            df["_sym_norm"] = df["symbol"].map(_fqg_norm_symbol)
+            df_sym = df[df["_sym_norm"] == symbol]
+        except Exception:
+            df_sym = df[df["symbol"].astype(str) == symbol]
+
+        if df_sym.empty:
+            return None
+
+        dt_col = None
+        for c in ("datetime", "CurrentPriceTime", "time", "timestamp", "updated_at"):
+            if c in df_sym.columns:
+                dt_col = c
+                break
+
+        row = None
+        quote_dt = None
+        if dt_col:
+            import pandas as pd
+            x = df_sym.copy()
+            x["_quote_dt"] = pd.to_datetime(x[dt_col], errors="coerce")
+            x2 = x.dropna(subset=["_quote_dt"])
+            if not x2.empty:
+                row = x2.sort_values("_quote_dt").iloc[-1]
+                quote_dt = _fqg_parse_dt(row.get("_quote_dt"))
+        if row is None:
+            row = df_sym.iloc[-1]
+            quote_dt = None
+
+        ask = _fqg_to_float(row.get("ask_price"), 0.0)
+        bid = _fqg_to_float(row.get("bid_price"), 0.0)
+        cur = _fqg_to_float(row.get("current_price") or row.get("price") or row.get("CurrentPrice"), 0.0)
+        if ask <= 0 or bid <= 0:
+            return None
+
+        now = dt.datetime.now()
+        age_sec = None
+        if quote_dt is not None:
+            # 日付が無い時刻だけの場合、古い年になることがあるので当日補正
+            if quote_dt.year < 2000:
+                quote_dt = now.replace(hour=quote_dt.hour, minute=quote_dt.minute, second=quote_dt.second, microsecond=quote_dt.microsecond)
+            age_sec = max(0.0, (now - quote_dt).total_seconds())
+
+        return {
+            "symbol": symbol,
+            "ask_price": ask,
+            "bid_price": bid,
+            "ask_qty": int(_fqg_to_float(row.get("ask_qty"), 0.0)),
+            "bid_qty": int(_fqg_to_float(row.get("bid_qty"), 0.0)),
+            "current_price": cur,
+            "quote_dt": quote_dt,
+            "age_sec": age_sec,
+            "source": "push_df_fresh_guard",
+        }
+    except Exception as e:
+        logger.warning("[ENTRY FRESH QUOTE] read failed symbol=%s err=%s", symbol, e, exc_info=False)
+        return None
+
+
+def _fqg_fresh_quote(symbol: str, *, side: str) -> Optional[dict[str, Any]]:
+    q = _fqg_latest_push_quote(symbol)
+    max_age = _fqg_env_float("ENTRY_MAX_QUOTE_AGE_SEC", 8.0)
+    if not q:
+        logger.warning("[ENTRY FRESH QUOTE] SKIP no_quote symbol=%s side=%s", symbol, side)
+        return None
+    age = q.get("age_sec")
+    # datetimeが取れない場合は危険なので、デフォルトでは古い扱いにする
+    if age is None:
+        if _fqg_env_bool("ENTRY_ALLOW_QUOTE_WITHOUT_TIMESTAMP", False):
+            logger.warning("[ENTRY FRESH QUOTE] timestamp missing but allowed symbol=%s side=%s q=%s", symbol, side, q)
+            return q
+        logger.warning("[ENTRY FRESH QUOTE] SKIP no_timestamp symbol=%s side=%s q=%s", symbol, side, q)
+        return None
+    if float(age) > max_age:
+        logger.warning(
+            "[ENTRY FRESH QUOTE] SKIP stale_quote symbol=%s side=%s age=%.3fs max=%.3fs bid=%s ask=%s current=%s quote_dt=%s",
+            symbol, side, float(age), max_age, q.get("bid_price"), q.get("ask_price"), q.get("current_price"), q.get("quote_dt"),
+        )
+        return None
+    return q
+
+
+def get_latest_bid_ask(symbol: str):
+    if not _fqg_env_bool("ENTRY_FRESH_QUOTE_GUARD_ENABLED", True):
+        return _get_latest_bid_ask_core(symbol)
+    q = _fqg_fresh_quote(symbol, side="UNKNOWN")
+    if not q:
+        return None
+    return {
+        "symbol": q.get("symbol"),
+        "ask_price": q.get("ask_price"),
+        "bid_price": q.get("bid_price"),
+        "ask_qty": q.get("ask_qty", 0),
+        "bid_qty": q.get("bid_qty", 0),
+        "current_price": q.get("current_price", 0.0),
+        "age_sec": q.get("age_sec"),
+        "quote_dt": q.get("quote_dt"),
+        "source": q.get("source"),
+    }
