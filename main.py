@@ -240,7 +240,7 @@ def _install_main_runtime_patches():
         # cleanup_stale_100368_sell_reject_cache() へ native化済み (直接呼び出しは下記)。
         ("core.startup.fast_startup_runtime_patch", "install"),
         ("scheduler_jobs.summary.memory_latest_1m", "install"),
-        ("core.startup.summary_mtf_diff_from_1m_patch", "install"),
+        ("trading.summary.mtf_diff_from_1m", "install"),
         # entry_qty_min_lot_runtime_patch は3責務に分割して本文化済み:
         #   - 発注数量の最小単元フォールバック -> trading/handlers/entry_controller.py
         #   - PIPE SUMMARY 表示整形            -> core/global_context/context.py

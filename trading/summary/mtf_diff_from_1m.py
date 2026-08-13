@@ -1,5 +1,5 @@
 # ============================================================
-# File   : core/startup/summary_mtf_diff_from_1m_patch.py
+# File   : trading/summary/mtf_diff_from_1m.py
 # Version: V1.9-MAIN-MEMORY-1M-HISTORY-BRIDGE
 # ------------------------------------------------------------
 # 目的:
@@ -22,6 +22,20 @@
 #   - main_database.py 等の非mainプロセスでは original diff_update を優先。
 # ============================================================
 
+# ------------------------------------------------------------
+# 旧 core/startup/summary_mtf_diff_from_1m_patch.py から移設した。
+#
+# SummaryController.diff_update の差し替えは既に撤去済みで、
+# summary_controller.diff_update が _mtf_diff_update_hook() 経由で
+# diff_update_with_mtf() を直接呼ぶ「呼び出し側から呼ぶ」方式になっている。
+# 他モジュールの関数を差し替える処理は残っておらず
+# (global_data への setattr はデータ公開)、install() は
+# publish_1m_history_bridge / diff_update_with_mtf の有効判定フラグを
+# 立てるだけなので、*_patch.py の名前を外した。
+#
+# 先に本文化した summary_mtf_push_raw_fallback / tz guard 相当も
+# このモジュールに入っている。
+# ------------------------------------------------------------
 from __future__ import annotations
 
 import inspect
@@ -847,7 +861,8 @@ def _prf_bootstrap_worker() -> None:
             return
         if not _prf_is_main_py() and not _prf_env_bool("SUMMARY_MTF_PUSH_RAW_BOOTSTRAP_FORCE", False):
             return
-        import core.startup.summary_mtf_diff_from_1m_patch as base
+        # 旧 raw fallback パッチはこのモジュールを別 import して
+        # _resample_cached_1m_to_mtf を getattr していたが、本文化で同居したので直呼び。
         repeats = max(1, _prf_env_int("SUMMARY_MTF_PUSH_RAW_BOOTSTRAP_REPEATS", 1))
         delay = max(2.0, _prf_env_float("SUMMARY_MTF_PUSH_RAW_BOOTSTRAP_DELAY_SEC", 15.0))
         gap = max(10.0, _prf_env_float("SUMMARY_MTF_PUSH_RAW_BOOTSTRAP_GAP_SEC", 30.0))
@@ -855,8 +870,7 @@ def _prf_bootstrap_worker() -> None:
             time.sleep(delay if i == 0 else gap)
             for interval in (3, 5):
                 try:
-                    fn = getattr(base, "_resample_cached_1m_to_mtf", None)
-                    df = fn(interval) if callable(fn) else pd.DataFrame()
+                    df = _resample_cached_1m_to_mtf(interval)
                     logger.warning(
                         "[SUMMARY MTF PUSH RAW FALLBACK] bootstrap resample interval=%s rows=%s i=%s/%s version=%s",
                         interval,

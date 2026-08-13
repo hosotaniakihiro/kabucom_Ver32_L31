@@ -1031,7 +1031,7 @@ def _mtf_diff_update_hook():
     取得できない場合は None を返し、呼び出し側は素の実装を使う。
     """
     try:
-        from core.startup import summary_mtf_diff_from_1m_patch as _mtf
+        from trading.summary import mtf_diff_from_1m as _mtf
     except Exception:
         return None
     try:

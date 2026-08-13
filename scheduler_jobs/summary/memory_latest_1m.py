@@ -511,7 +511,7 @@ def _publish_latest(df: pd.DataFrame) -> None:
 
 def _publish_1m_history_bridge_safe(df: pd.DataFrame) -> None:
     try:
-        from core.startup.summary_mtf_diff_from_1m_patch import publish_1m_history_bridge
+        from trading.summary.mtf_diff_from_1m import publish_1m_history_bridge
     except Exception:
         logger.debug("[SUMMARY MAIN MEMORY 1M] history bridge import failed", exc_info=True)
         return

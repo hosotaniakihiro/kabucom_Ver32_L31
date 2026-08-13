@@ -441,7 +441,7 @@ BACKGROUND_MAIN_PATCHES = [
     # core/startup/summary_mtf_diff_from_1m_patch.py の
     # _cached_1m_history_from_global へ本文化済み (_prf_*)。
     # 同モジュールを import すれば env 既定値と bootstrap も走る。
-    ("core.startup.summary_mtf_diff_from_1m_patch", "SUMMARY_MTF_EARLY_READY", "DISABLE_SUMMARY_MTF_EARLY_READY_PATCH"),
+    ("trading.summary.mtf_diff_from_1m", "SUMMARY_MTF_EARLY_READY", "DISABLE_SUMMARY_MTF_EARLY_READY_PATCH"),
     # summary_ai_order_builder_range_repair_patch は削除した。
     # 共有ライブラリ部分 (_repair_row / _update_original_row) は
     # trading/filters/summary_ai_range_repair.py へ移設し、呼び出し元 2 箇所が
