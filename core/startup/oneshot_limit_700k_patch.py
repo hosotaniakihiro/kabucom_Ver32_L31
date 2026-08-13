@@ -163,14 +163,19 @@ def _install_entry_threshold_patch() -> bool:
 
 
 def _install_entry_qty_minlot_patch() -> bool:
+    """最小単元フォールバックの env 既定値。
+
+    entry_qty_min_lot_runtime_patch は3責務に分割して本文化済み
+    (数量フォールバック -> trading/handlers/entry_controller.py、
+     表示整形 -> core/global_context/context.py、
+     しきい値 env -> main.py)。
+    ここに残しているのは、この env 既定値を従来と同じ位置で設定するため。
+    """
     try:
         os.environ.setdefault("ENTRY_MIN_LOT_FALLBACK_WHEN_AFFORDABLE", "1")
-        from core.startup import entry_qty_min_lot_runtime_patch as p
-        ok = p.install()
-        logger.warning("[ONESHOT LIMIT PATCH] entry_qty_min_lot_runtime_patch installed=%s", ok)
-        return bool(ok)
+        return True
     except Exception:
-        logger.exception("[ONESHOT LIMIT PATCH] entry_qty_min_lot_runtime_patch install failed")
+        logger.exception("[ONESHOT LIMIT PATCH] entry qty minlot env default failed")
         return False
 
 
