@@ -998,12 +998,11 @@ def _install_entrypoint_runtime_patches() -> None:
     # (_light_prefilter_rows) と trading/ranking/ranking_technical_store.py
     # (readonly/memory-cache 版 attach/save) へ本文化済みのため install 呼び出しを削除した。
 
-    try:
-        from core.startup.tonosama_fast_score_prefilter_patch import install as install_tonosama_fast_score_prefilter
-
-        install_tonosama_fast_score_prefilter()
-    except Exception:
-        logger.exception("[startup.entrypoint] tonosama fast score prefilter install failed")
+    # tonosama_fast_score_prefilter_patch は
+    # trading/entry/tonosama/fast_score_prefilter.py へ本文化済み
+    # (install() を持たないライブラリなので呼び出しは不要)。
+    # 削除済みモジュールを import し続けており、起動のたびに
+    # ImportError を except で拾って exception ログを出していたため除去した。
 
     try:
         from core.startup.summary_entry_pending_duplicate_registered_patch import install as install_summary_entry_pending_duplicate_registered_patch

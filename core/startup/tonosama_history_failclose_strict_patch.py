@@ -214,7 +214,10 @@ def _patch_tonosama(reason: str) -> bool:
 def _patch_ranking_source(reason: str) -> bool:
     global _LAST_RANKING_FLAGS
     try:
-        import core.startup.ranking_entry_source_db_fallback_patch as _p  # noqa: F401
+        # ranking_entry_source_db_fallback_patch は
+        # trading/ranking/entry_from_ranking.py へ本文化済み。
+        # 削除済みモジュールの import が残っていたため除去した
+        # (import 失敗で except に落ち、以下の flags ログが出ていなかった)。
         flags = (os.environ.get("RANKING_ENTRY_SOURCE_DB_FAILOPEN_STALE"), os.environ.get("RANKING_ENTRY_SOURCE_FAILOPEN_STALE_GLOBAL"))
         if reason == "install" or _LAST_RANKING_FLAGS != flags or flags != ("0", "0"):
             logger.warning("[STRICT ENTRY DEFAULTS] ranking source fallback strict flags reason=%s db_failopen=%s global_failopen=%s version=%s", reason, flags[0], flags[1], VERSION)
