@@ -67,19 +67,24 @@ os.environ.setdefault("TONOSAMA_ALERT_MIN_RECENT_BAR_VOLUME", "30000")
 os.environ.setdefault("TONOSAMA_ALERT_MIN_TURNOVER", "10000000")
 
 
-def _install_intraday_liquidity_guard() -> None:
-    try:
-        if str(os.getenv("TONOSAMA_INTRADAY_LIQUIDITY_GUARD", "1")).strip().lower() in {"0", "false", "no", "off"}:
-            return
-        from core.startup.tonosama_intraday_liquidity_patch import install
-        install()
-    except Exception:
-        # config import時に落ちると殿様全体が止まるため、ここでは握りつぶす。
-        pass
-
-
-# intraday guard は runner import の遅延patchで、config初期化中でも安全。
-_install_intraday_liquidity_guard()
+# 日中流動性ガード (旧 core/startup/tonosama_intraday_liquidity_patch.py) は
+# ここから install していたが、フィルタが一度も適用されない完全なノーオペ
+# だったことを再検証したうえでパッチごと削除した。
+#
+#   - install() の呼び出しはこの 1 箇所だけで、リトライ機構が無い
+#   - この行が走る時点で config は初期化途中であり、
+#     VOLUME_AVG_LOOKBACK_BARS (下の 151 行付近) がまだ未定義。
+#     そのため _try_patch_volume_surge() は volume_surge を import せず False を返す
+#   - volume_surge は config を import する側なので、config より先に
+#     読み込まれることが無い。runner も同様に初期化途中で
+#     build_scalping_feature_df をまだ持たないため、
+#     _install_runner_lazy_hook() も hook を張れずに _DEFERRED=True で終わる
+#
+# 本文化するとこの「動いていなかったフィルタ」が有効になり、
+# TONOSAMA のエントリー候補が実際に絞られてしまう。挙動を変えないため
+# フィルタ本体は移植していない。
+# 有効化したい場合は volume_surge.build_scalping_feature_df へ
+# 明示的に組み込むこと (env TONOSAMA_INTRADAY_LIQUIDITY_GUARD)。
 
 
 def _env_float(name: str, default: float) -> float:
