@@ -181,23 +181,20 @@ def _install_summary_ai_board_rest_cooldown() -> bool:
     3つの戦略 install を、同じ位置・同じ順序で実行する。
     """
     results = {}
-    # fibonacci_ev / nve_projection のオーバーレイは
-    # core/startup/summary_ai_strategy_mode_patch.py の
-    # _classify / _strategy_enabled へ本文化済み (合成順も同じ)。
+    # strategy_mode は trading/entry/summary_ai/executor.py へ本文化済み
+    # (_sm_* / _sort_key / _passes_strict_candidate_quality)。
+    # fibonacci_ev / nve_projection のオーバーレイもその _sm_classify /
+    # _sm_strategy_enabled に取り込まれている (合成順も同じ)。
     # 有効/無効は SUMMARY_AI_FIB_EV_STRATEGY_ENABLED /
     # SUMMARY_AI_NVE_STRATEGY_ENABLED を各層が見る。
-    for label, mod_name in (
-        ("strategy_mode", "core.startup.summary_ai_strategy_mode_patch"),
-    ):
-        try:
-            import importlib
+    # install は不要になったので、モジュールが読めることだけ確認する。
+    try:
+        import trading.entry.summary_ai.executor as _ex  # noqa: F401
 
-            mod = importlib.import_module(mod_name)
-            fn = getattr(mod, "install", None)
-            results[label] = bool(fn()) if callable(fn) else False
-        except Exception:
-            results[label] = False
-            logger.exception("[USERCUSTOMIZE] chained %s install failed", label)
+        results["strategy_mode"] = True
+    except Exception:
+        results["strategy_mode"] = False
+        logger.exception("[USERCUSTOMIZE] chained strategy_mode import failed")
     ok = any(results.values())
     logger.warning("[USERCUSTOMIZE] summary AI board REST cooldown bypass ok=%s chained=%s", ok, results)
     return ok
