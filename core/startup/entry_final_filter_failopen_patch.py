@@ -203,46 +203,12 @@ def install() -> bool:
         import trading.handlers.entry_controller as ec
     except Exception:
         logger.exception('[ENTRY FINAL FILTER FAILOPEN] entry_controller import failed'); return False
-    try:
-        orig_atr = getattr(ec, 'atr_1m_filter', None)
-        if callable(orig_atr) and not getattr(orig_atr, '_summary_ai_atr_repair_wrapper_v25', False):
-            def _atr_summary_ai_repair_then_tonosama_failopen(entry_row: Any = None, *args, **kwargs):
-                try:
-                    ret = orig_atr(entry_row, *args, **kwargs)
-                    if _ret_ok(ret):
-                        return ret
-
-                    detail = _ret_detail(ret)
-                    if _is_summary_ai_entry(entry_row):
-                        repaired_row, diag = _repair_summary_ai_atr_row(entry_row)
-                        if isinstance(diag, dict) and (diag.get('repaired') or diag.get('atr_repaired')):
-                            ret2 = orig_atr(repaired_row, *args, **kwargs)
-                            logger.warning(
-                                '[ENTRY FINAL FILTER FAILOPEN] atr_1m_filter SUMMARY_AI repaired -> retry result=%s symbol=%s detail=%s',
-                                _ret_ok(ret2), _row_dict(entry_row).get('symbol'), diag,
-                            )
-                            if _ret_ok(ret2):
-                                return ret2
-                        else:
-                            logger.info('[ENTRY FINAL FILTER FAILOPEN] atr_1m_filter SUMMARY_AI repair no-op symbol=%s detail=%s diag=%s', _row_dict(entry_row).get('symbol'), detail, diag)
-
-                    if (not _ret_ok(ret)) and _env_bool('ATR_1M_FILTER_TONOSAMA_HISTORY_FAIL_OPEN', True):
-                        if _is_tonosama_entry(entry_row) and _looks_atr_history_gap(entry_row=entry_row, detail=detail):
-                            logger.warning('[ENTRY FINAL FILTER FAILOPEN] atr_1m_filter TONOSAMA history gap -> fail-open symbol=%s', _row_dict(entry_row).get('symbol'))
-                            return True
-                    return ret
-                except Exception as e:
-                    allow = _is_tonosama_entry(entry_row) and _env_bool('ATR_1M_FILTER_TONOSAMA_ERROR_FAIL_OPEN', False)
-                    logger.warning('[ENTRY FINAL FILTER FAILOPEN] atr_1m_filter error tonosama_fail_open=%s err=%s', allow, e, exc_info=False)
-                    return bool(allow)
-            _atr_summary_ai_repair_then_tonosama_failopen._tonosama_atr_failopen_wrapper_v23 = True
-            _atr_summary_ai_repair_then_tonosama_failopen._tonosama_atr_failopen_wrapper_v24 = True
-            _atr_summary_ai_repair_then_tonosama_failopen._summary_ai_atr_repair_wrapper_v25 = True
-            _atr_summary_ai_repair_then_tonosama_failopen._original_atr_1m_filter = orig_atr
-            setattr(ec, 'atr_1m_filter', _atr_summary_ai_repair_then_tonosama_failopen)
-            logger.warning('[ENTRY FINAL FILTER FAILOPEN] atr_1m_filter SUMMARY_AI repair + TONOSAMA wrapper installed v2.5')
-    except Exception:
-        logger.exception('[ENTRY FINAL FILTER FAILOPEN] atr_1m wrapper install failed')
+    # atr_1m_filter のラップは撤去した。
+    # 旧構成では main.py:275 の volatility_filter_tonosama_entryrow_rescue_patch が
+    # native まで巻き戻して被せ直すため、この層は一度も到達していなかった (実測済み)。
+    # 同 rescue は volatility_filter.atr_1m_filter へ本文化されて巻き戻す相手が
+    # 居なくなったので、ここを残すと「今まで効いていなかった SUMMARY_AI 補修 +
+    # TONOSAMA fail-open」が有効化されてしまう。
     try:
         orig_range = getattr(ec, 'range_5m_filter', None)
         if callable(orig_range) and not getattr(orig_range, '_range5m_failopen_wrapper_v24', False):

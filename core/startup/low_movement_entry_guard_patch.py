@@ -883,14 +883,15 @@ def install() -> bool:
         old_atr = getattr(ec, "atr_1m_filter", None)
         old_range = getattr(ec, "range_5m_filter", None)
 
-        if callable(old_atr) and not getattr(old_atr, "_low_move_guard_v16", False):
-            _ORIG_ATR_FILTER = getattr(old_atr, "_original", old_atr)
-            _patched_atr_1m_filter._low_move_guard_v16 = True  # type: ignore[attr-defined]
-            _patched_atr_1m_filter._original = _ORIG_ATR_FILTER  # type: ignore[attr-defined]
-            ec.atr_1m_filter = _patched_atr_1m_filter
-            logger.warning("[LOW MOVE GUARD] patched entry_controller.atr_1m_filter v16")
-        else:
-            logger.warning("[LOW MOVE GUARD] atr_1m_filter already wrapped v16 or missing")
+        # atr_1m_filter のラップは撤去した。
+        # 旧構成では main.py:275 の volatility_filter_tonosama_entryrow_rescue_patch が
+        # `_ORIG_ATR = getattr(cur_atr, "_original", cur_atr)` で native まで
+        # 巻き戻して被せ直すため、この層は一度も到達していなかった (実測済み)。
+        # 同 rescue は trading/filters/volatility_filter.atr_1m_filter へ
+        # 本文化されて巻き戻す相手が居なくなったので、ここを残すと
+        # 「今まで効いていなかった RANKING 救済」が有効化されてしまう。
+        # _patched_atr_1m_filter 自体は参照されない死にコードとして残置
+        # (再有効化したい場合の実装リファレンス)。
 
         if callable(old_range) and not getattr(old_range, "_low_move_guard_v16", False):
             _ORIG_RANGE_FILTER = getattr(old_range, "_original", old_range)
