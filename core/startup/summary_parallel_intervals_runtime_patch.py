@@ -327,7 +327,7 @@ def _submit_bg_push_interval_core(*, interval: int, now: dt.datetime, display: b
     logger.warning("[SUMMARY PARALLEL] bg push submitted key=%s interval=%s now=%s", bg_key, interval, now)
 
 
-def _patched_run_time_locked_summary_jobs(*, now: Optional[dt.datetime] = None, run_push: bool = True, run_ranking: bool = True, display: bool = True, run_entry: bool = True) -> dict[str, dict[int, pd.DataFrame]]:
+def _patched_run_time_locked_summary_jobs_legacy(*, now: Optional[dt.datetime] = None, run_push: bool = True, run_ranking: bool = True, display: bool = True, run_entry: bool = True) -> dict[str, dict[int, pd.DataFrame]]:
     if not _env_bool("SUMMARY_PARALLEL_INTERVALS_ENABLED", True):
         if callable(_ORIG_TIME_LOCKED):
             return _ORIG_TIME_LOCKED(now=now, run_push=run_push, run_ranking=run_ranking, display=display, run_entry=run_entry)
@@ -784,3 +784,188 @@ def _submit_bg_push_interval(*, interval: int, now: dt.datetime, display: bool, 
             if cur and cur[1] == bg_key:
                 _BGD_RUNNING_BY_INTERVAL.pop(iv, None)
         logger.exception("[SUMMARY PUSH BG DUE GUARD] submit failed key=%s interval=%s", bg_key, iv)
+
+
+# ============================================================
+# SUMMARY PARALLEL EXECUTOR RESET
+# (旧 core/startup/summary_parallel_executor_reset_patch.py を本文化)
+# ------------------------------------------------------------
+# tick ごとにローカル executor を立てて使い捨て、timeout 時は
+# グローバル executor を作り直す。同一 tick の多重起動も抑止する。
+#
+# **重要**: 旧パッチのラッパーはティック処理を丸ごと再実装しており、
+# 元関数 (_ORIG) を呼ぶのは SUMMARY_PARALLEL_INTERVALS_ENABLED が偽の
+# ときだけ。しかもその分岐は native (_ORIG_TIME_LOCKED) を直接呼ぶ。
+# 実呼び出しで確認済み。よってこのモジュール本来の
+# _patched_run_time_locked_summary_jobs_legacy は実行時に到達しない
+# (呼び出し元が無い)。同モジュールの _job_one_source /
+# _submit_bg_push_interval 等のヘルパは下から呼ばれるので生きている。
+#
+# 旧 install() の watcher (2 秒 x 90 回の再適用) は、この属性を包む
+# 他のパッチが無くなったため不要になり撤去した。
+# 有効/無効は SUMMARY_PARALLEL_EXECUTOR_RESET_PATCH_ENABLED ではなく、
+# 本文化後はこの実装が既定経路になる (旧構成でも既定 True だった)。
+# ============================================================
+
+_RST_VERSION = "V1-MAIN-TICK-LOCAL-EXECUTOR-RESET"
+_RST_TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+_RST_FALSE = {"0", "false", "no", "n", "off", "ng", "disable", "disabled", ""}
+
+
+def _rst_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None:
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in _RST_TRUE:
+            return True
+        if s in _RST_FALSE:
+            return False
+    except Exception:
+        pass
+    return bool(default)
+
+
+def _rst_env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return max(1, int(float(v)))
+    except Exception:
+        return int(default)
+
+
+def _rst_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return max(1.0, float(v))
+    except Exception:
+        return float(default)
+
+
+def _rst_use_local_executor() -> bool:
+    try:
+        if not _rst_env_bool("SUMMARY_PARALLEL_RESET_EXECUTOR_PER_TICK", True):
+            return False
+        fn = globals().get("_main_tick_timeout_cap_enabled")
+        return bool(fn()) if callable(fn) else True
+    except Exception:
+        return True
+
+
+def _rst_safe_latest(df: Any) -> str | None:
+    try:
+        fn = globals().get("_latest_dt_str")
+        if callable(fn):
+            return fn(df)
+    except Exception:
+        pass
+    return None
+
+
+def _rst_reset_global_executor(reason: str) -> None:
+    try:
+        ex = globals().get("_EXECUTOR")
+        if ex is not None:
+            try:
+                ex.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                ex.shutdown(wait=False)
+            except Exception:
+                pass
+        globals()["_EXECUTOR"] = None
+        logger.warning("[SUMMARY PARALLEL RESET] global executor reset reason=%s version=%s", reason, _RST_VERSION)
+    except Exception:
+        logger.exception("[SUMMARY PARALLEL RESET] global executor reset failed reason=%s", reason)
+
+
+def _patched_run_time_locked_summary_jobs(*, now: Optional[dt.datetime] = None, run_push: bool = True, run_ranking: bool = True, display: bool = True, run_entry: bool = True) -> dict[str, dict[int, pd.DataFrame]]:
+    if not _rst_env_bool("SUMMARY_PARALLEL_INTERVALS_ENABLED", True):
+        orig = _ORIG_TIME_LOCKED
+        if callable(orig):
+            return orig(now=now, run_push=run_push, run_ranking=run_ranking, display=display, run_entry=run_entry)
+        return {"push": {}, "ranking": {}}
+
+    _ensure_timeout_min()
+    n = (now or _now_naive()).replace(microsecond=0)
+    in_session = bool(_is_market_session(n))
+    push_targets, ranking_targets = _resolve_targets(n, in_session)
+    wait_push_targets, bg_push_targets = _split_push_wait_and_bg(push_targets, in_session=in_session)
+    out: dict[str, dict[int, pd.DataFrame]] = {"push": {}, "ranking": {}}
+
+    key = n.strftime("%Y%m%d%H%M")
+    with _RUNNING_LOCK:
+        if key in _RUNNING_KEYS:
+            logger.warning("[SUMMARY PARALLEL RESET] skipped reason=previous_same_tick_running key=%s", key)
+            return out
+        _RUNNING_KEYS.add(key)
+
+    t0 = time.perf_counter()
+    timeout = _rst_env_float("SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC", 25.0)
+    local_ex = None
+    ex = None
+    futures = []
+    use_local = _rst_use_local_executor()
+    try:
+        logger.warning(
+            "[SUMMARY PARALLEL RESET] tick start now=%s push_targets=%s wait_push_targets=%s bg_push_targets=%s ranking_targets=%s run_push=%s run_ranking=%s display=%s run_entry=%s local_executor=%s timeout=%.1f version=%s",
+            n, push_targets, wait_push_targets, bg_push_targets, ranking_targets, run_push, run_ranking, display, run_entry, use_local, timeout, "V-EXECUTOR-RESET",
+        )
+        if use_local:
+            workers = _rst_env_int("SUMMARY_PARALLEL_INTERVAL_WORKERS", 1)
+            local_ex = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="summary-main-tick-local")
+            ex = local_ex
+        else:
+            ex = _executor()
+
+        if run_push:
+            for interval in wait_push_targets:
+                futures.append(ex.submit(_job_one_source, source="push", interval=int(interval), now=n, display=display, run_entry=bool(run_entry) and in_session))
+            for interval in bg_push_targets:
+                _submit_bg_push_interval(interval=int(interval), now=n, display=display, run_entry=bool(run_entry) and in_session)
+
+        if run_ranking and in_session and _rst_env_bool("SUMMARY_PARALLEL_RANKING_ENABLED", True):
+            for interval in ranking_targets:
+                futures.append(ex.submit(_job_one_source, source="ranking", interval=int(interval), now=n, display=display, run_entry=False))
+        elif run_ranking:
+            logger.info("[SUMMARY PARALLEL RESET] ranking skipped targets=%s in_session=%s enabled=%s", ranking_targets, in_session, _rst_env_bool("SUMMARY_PARALLEL_RANKING_ENABLED", True))
+
+        if not futures:
+            logger.warning("[SUMMARY PARALLEL RESET] tick no wait futures now=%s elapsed=%.3fs", n, time.perf_counter() - t0)
+            return out
+
+        done_count = 0
+        try:
+            for fut in as_completed(futures, timeout=timeout):
+                source, interval, df = fut.result()
+                out.setdefault(source, {})[int(interval)] = df
+                done_count += 1
+        except FuturesTimeoutError:
+            logger.error("[SUMMARY PARALLEL RESET] tick timeout now=%s timeout=%.1fs done=%s total=%s wait_push_targets=%s ranking_targets=%s local_executor=%s", n, timeout, done_count, len(futures), wait_push_targets, ranking_targets, use_local)
+            for fut in futures:
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+            if not use_local:
+                _rst_reset_global_executor("timeout")
+
+        logger.warning(
+            "[SUMMARY PARALLEL RESET] tick done now=%s push_done=%s ranking_done=%s elapsed=%.3fs local_executor=%s",
+            n, sorted(out.get("push", {}).keys()), sorted(out.get("ranking", {}).keys()), time.perf_counter() - t0, use_local,
+        )
+        return out
+    finally:
+        if local_ex is not None:
+            try:
+                local_ex.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                local_ex.shutdown(wait=False)
+            except Exception:
+                pass
+        with _RUNNING_LOCK:
+            _RUNNING_KEYS.discard(key)

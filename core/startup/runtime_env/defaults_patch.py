@@ -190,7 +190,12 @@ def _install_summary_ai_atr_1m_filter_repair(context: str) -> bool:
 
 
 def _install_summary_parallel_executor_reset(context: str) -> bool:
-    return _safe_install("summary parallel executor reset", context, TRADING_CONTEXTS, "DISABLE_SUMMARY_PARALLEL_EXECUTOR_RESET_PATCH", "summary_parallel_executor_reset_patch")
+    # summary_parallel_executor_reset_patch は
+    # core/startup/summary_parallel_intervals_runtime_patch.py の
+    # _patched_run_time_locked_summary_jobs へ本文化済み (_rst_*)。
+    # 旧 install の watcher (2 秒 x 90 回) は、この属性を包む他パッチが
+    # 無くなったため不要になった。
+    return True
 
 
 def _install_tonosama_orphan_timeout_prune(context: str) -> bool:
