@@ -160,7 +160,10 @@ def install() -> bool:
     _run_install("light_tick_1m", "scheduler_jobs.summary.light_tick_1m")
     _run_install("tonosama_datetime_tz_guard_patch", "core.startup.tonosama_datetime_tz_guard_patch")
 
-    _run_install("main_skip_summary_push_bg_patch", "core.startup.main_skip_summary_push_bg_patch")
+    # main_skip_summary_push_bg_patch は
+    # core/startup/summary_parallel_intervals_runtime_patch.py へ統合済み
+    # (_split_push_wait_and_bg / _submit_bg_push_interval が
+    #  _msk_enabled() で main.py スキップを判定する)。
     # summary_display_label_guard_patch は scheduler_jobs/summary/display.py 本体へ
     # インライン化済みのため削除。
     _patch_summary_schema_bootstrap()

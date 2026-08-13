@@ -22,6 +22,8 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import sys
+from pathlib import Path
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
@@ -248,7 +250,7 @@ def _resolve_targets(now: dt.datetime, in_session: bool) -> tuple[list[int], lis
     return push_targets, ranking_targets
 
 
-def _split_push_wait_and_bg(push_targets: list[int], *, in_session: bool) -> tuple[list[int], list[int]]:
+def _split_push_wait_and_bg_core(push_targets: list[int], *, in_session: bool) -> tuple[list[int], list[int]]:
     targets = sorted({int(x) for x in push_targets if int(x) in {1, 3, 5}})
 
     # Ver12: main.py / entry-only では 5分足を同期で待たない。
@@ -304,7 +306,7 @@ def _job_one_source(*, source: str, interval: int, now: dt.datetime, display: bo
         return source, interval, pd.DataFrame()
 
 
-def _submit_bg_push_interval(*, interval: int, now: dt.datetime, display: bool, run_entry: bool) -> None:
+def _submit_bg_push_interval_core(*, interval: int, now: dt.datetime, display: bool, run_entry: bool) -> None:
     bg_key = f"{now.strftime('%Y%m%d%H%M')}:push:{int(interval)}"
     with _RUNNING_LOCK:
         if bg_key in _BG_RUNNING_KEYS:
@@ -459,3 +461,77 @@ except Exception as e:
     logger.exception("[SUMMARY PARALLEL] auto install failed err=%s", e)
 
 __all__ = ["install"]
+
+
+# ============================================================
+# main.py で summary PUSH BG をスキップする
+# ------------------------------------------------------------
+# 旧 core/startup/main_skip_summary_push_bg_patch.py をこのホストへ統合。
+# (このモジュール自体がまだパッチなので「本文化」ではなくホストへの統合)
+#
+# main.py プロセスでは wait/bg の push target を空にし、bg push interval の
+# 投入もスキップする。無効化は AUTOSTOCK_MAIN_SKIP_SUMMARY_PUSH_BG=0。
+# 判定ヘルパは旧パッチのものを _msk_* として移植した。
+# ============================================================
+
+os.environ.setdefault("AUTOSTOCK_MAIN_SKIP_SUMMARY_PUSH_BG", "1")
+
+def _msk_env_bool(name: str, default: bool = False) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "ng", "disable", "disabled"}:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
+
+
+def _msk_is_main_py() -> bool:
+    try:
+        if _msk_env_bool("AUTOSTOCK_MAIN_DATABASE_PROCESS", False):
+            return False
+        if _msk_env_bool("AUTOSTOCK_DATA_COLLECTORS_PROCESS", False):
+            return False
+        argv0 = Path(str(sys.argv[0] or "")).name.lower()
+        if argv0 == "main.py":
+            return True
+        role = str(os.getenv("SUMMARY_DB_WRITER_ROLE") or "").strip().lower()
+        return role in {"entry_only", "main_entry_only", "read_only", "no_save"} or _msk_env_bool("SUMMARY_MAIN_ENTRY_ONLY", False)
+    except Exception:
+        return False
+
+
+def _msk_enabled() -> bool:
+    return _msk_env_bool("AUTOSTOCK_MAIN_SKIP_SUMMARY_PUSH_BG", True) and _msk_is_main_py()
+
+
+def _split_push_wait_and_bg(push_targets: list[int], *, in_session: bool) -> tuple[list[int], list[int]]:
+    if _msk_enabled():
+        try:
+            logger.warning(
+                "[MAIN SKIP SUMMARY PUSH BG] skip wait/bg push targets in main.py targets=%s in_session=%s",
+                push_targets, in_session,
+            )
+        except Exception:
+            pass
+        return [], []
+    return _split_push_wait_and_bg_core(push_targets, in_session=in_session)
+
+
+def _submit_bg_push_interval(*, interval, now, display: bool, run_entry: bool) -> None:
+    if _msk_enabled():
+        logger.warning(
+            "[MAIN SKIP SUMMARY PUSH BG] skipped bg push interval=%s now=%s display=%s run_entry=%s",
+            interval, now, display, run_entry,
+        )
+        return None
+    try:
+        return _submit_bg_push_interval_core(interval=interval, now=now, display=display, run_entry=run_entry)
+    except Exception:
+        logger.exception("[MAIN SKIP SUMMARY PUSH BG] original bg submit failed")
+    return None
