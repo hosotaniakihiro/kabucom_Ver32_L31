@@ -255,7 +255,7 @@ def _load_db_open_position(symbol: str) -> Optional[dict[str, Any]]:
     return None
 
 
-def _get_open_position(symbol: str) -> tuple[Optional[dict[str, Any]], str]:
+def _get_open_position_core(symbol: str) -> tuple[Optional[dict[str, Any]], str]:
     symbol = _normalize_symbol(symbol)
 
     # 1. global_data.open_positions
@@ -834,7 +834,7 @@ def _mark_db_position_closing(*, symbol: str, exit_price: float, pnl: float, rea
         session.close()
 
 
-def _close_db_position(*, symbol: str, exit_price: float, pnl: float, reason: str, order_id: str) -> bool:
+def _close_db_position_core(*, symbol: str, exit_price: float, pnl: float, reason: str, order_id: str) -> bool:
     # 板タッチ指値EXIT運用では、注文受付直後にDBをCLOSED確定すると未約定の
     # まま建玉が閉じた扱いになるため、既定ではCLOSINGへ据え置く
     # (旧 exit_limit_pending_close_runtime_patch)。成行運用へ戻したい場合は
@@ -1810,3 +1810,146 @@ __all__ = [
     "start_exit_closing_stale_reconcile_loop",
     "start_exit_unfilled_reprice_loop",
 ]
+
+
+# ============================================================
+# broker 実建玉フォールバック (EXIT)
+# ------------------------------------------------------------
+# 旧 core/startup/exit_executor_broker_position_patch.py
+# (V1.0-BROKER-CREDIT-FALLBACK) を本文化。
+#
+#   - global_data.open_positions / GC.positions で建玉が見つからない場合に
+#     kabu Station の信用建玉から直接復元して EXIT 注文へ進ませる
+#   - broker 実建玉を正とするため、返済注文の受付後に positions.db へ
+#     行が無くても EXIT 失敗扱いにしない
+#
+# 適用スコープは旧 install 導線 (fast_startup_runtime_patch <- main.py) を
+# _broker_position_fallback_enabled() で再現する。
+# 記号正規化は本ファイル既存の _normalize_symbol と実装が異なるため、
+# 旧パッチのものを _bkp_normalize_symbol として別に移植した (流用しない)。
+# ============================================================
+
+_BROKER_POS_FALLBACK_SCOPE: Optional[bool] = None
+
+
+def _broker_position_fallback_enabled() -> bool:
+    global _BROKER_POS_FALLBACK_SCOPE
+    if _BROKER_POS_FALLBACK_SCOPE is not None:
+        return _BROKER_POS_FALLBACK_SCOPE
+    enabled = False
+    try:
+        argv_text = " ".join(str(x) for x in sys.argv).replace("\\", "/").lower()
+        db_names = (
+            "main_database.py", "data_collectors_runner.py", "db_prepare_runner.py",
+            "push_receiver_runner.py", "yahoo_complement_runner.py",
+            "summary_database_runner.py", "ranking_collector_runner.py",
+        )
+        if not any(n in argv_text for n in db_names):
+            enabled = "main.py" in argv_text
+    except Exception:
+        enabled = False
+    _BROKER_POS_FALLBACK_SCOPE = enabled
+    return enabled
+
+
+def _bkp_normalize_symbol(v: Any) -> str:
+    try:
+        if v is None:
+            return ""
+        s = str(v).strip()
+        if s.endswith(".0"):
+            s = s[:-2]
+        return s
+    except Exception:
+        return ""
+
+
+def _bkp_ensure_global_open_positions() -> dict[str, Any]:
+    try:
+        from global_state import global_data
+
+        d = getattr(global_data, "open_positions", None)
+        if isinstance(d, dict):
+            return d
+        d = {}
+        setattr(global_data, "open_positions", d)
+        return d
+    except Exception:
+        return {}
+
+
+def _bkp_read_broker_position(symbol: str) -> Optional[dict[str, Any]]:
+    symbol = _bkp_normalize_symbol(symbol)
+    if not symbol:
+        return None
+    try:
+        from trading.position.kabu_position_reader import read_kabu_open_positions
+
+        rows = read_kabu_open_positions() or {}
+        pos = rows.get(symbol) or rows.get(str(symbol))
+        if isinstance(pos, dict):
+            pos.setdefault("symbol", symbol)
+            pos.setdefault("status", "OPEN")
+            pos.setdefault("_position_source", "KABU.positions.credit_only.direct_exit_fallback")
+            return pos
+    except Exception:
+        logger.warning("[EXIT EXECUTOR BROKER PATCH] broker position read failed symbol=%s", symbol, exc_info=True)
+    return None
+
+
+def _bkp_is_broker_credit_memory_position(symbol: str) -> bool:
+    symbol = _bkp_normalize_symbol(symbol)
+    try:
+        positions = _bkp_ensure_global_open_positions()
+        pos = positions.get(symbol) or positions.get(str(symbol))
+        if not isinstance(pos, dict):
+            return False
+        src = str(pos.get("_position_source") or "").upper()
+        return src.startswith("KABU.POSITIONS") or "CREDIT_ONLY" in src
+    except Exception:
+        return False
+
+
+def _get_open_position(symbol: str) -> tuple[Optional[dict[str, Any]], str]:
+    pos, source = _get_open_position_core(symbol)
+    if pos is not None or not _broker_position_fallback_enabled():
+        return pos, source
+
+    s = _bkp_normalize_symbol(symbol)
+    broker_pos = _bkp_read_broker_position(s)
+    if isinstance(broker_pos, dict):
+        positions = _bkp_ensure_global_open_positions()
+        positions[s] = broker_pos
+        logger.warning(
+            "[EXIT EXECUTOR BROKER PATCH] position recovered from broker credit positions symbol=%s",
+            s,
+        )
+        return broker_pos, "KABU.positions.credit_only.direct_exit_fallback"
+
+    return None, ""
+
+
+def _close_db_position(*, symbol: str, exit_price: float, pnl: float, reason: str, order_id: str) -> bool:
+    ok = _close_db_position_core(
+        symbol=symbol,
+        exit_price=exit_price,
+        pnl=pnl,
+        reason=reason,
+        order_id=order_id,
+    )
+    if ok:
+        return True
+    if not _broker_position_fallback_enabled():
+        return False
+
+    # broker実建玉から返済した場合、positions.dbに行が無いことがある。
+    # 注文はすでに受け付け後なので、DB未存在だけでEXIT失敗扱いにしない。
+    if _bkp_is_broker_credit_memory_position(symbol):
+        logger.warning(
+            "[EXIT EXECUTOR BROKER PATCH] DB close missing ignored for broker credit position symbol=%s order_id=%s",
+            symbol,
+            order_id,
+        )
+        return True
+
+    return False

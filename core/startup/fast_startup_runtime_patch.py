@@ -114,7 +114,9 @@ def _background_heavy() -> None:
         lambda: _run_install("summary_mtf_push_raw_fallback_patch", "core.startup.summary_mtf_push_raw_fallback_patch"),
         lambda: _run_install("direct_push_1m:bg", "scheduler_jobs.summary.direct_push_1m"),
         lambda: _run_install("open_position_broker_merge_patch", "core.startup.open_position_broker_merge_patch"),
-        lambda: _run_install("exit_executor_broker_position_patch", "core.startup.exit_executor_broker_position_patch"),
+        # exit_executor_broker_position_patch は trading/exit/executor.py へ本文化済み
+        # (_get_open_position / _close_db_position の broker 実建玉フォールバック。
+        #  スコープは同ファイルの _broker_position_fallback_enabled() が再現)。
         lambda: _run_install("exit_trail_03_runtime_patch", "core.startup.exit_trail_03_runtime_patch"),
         # entry_unfilled_cancel_2s_runtime_patch は削除した。
         # 唯一の効果が force_cancel_loop.start_force_cancel_loop の差し替えだったが、
