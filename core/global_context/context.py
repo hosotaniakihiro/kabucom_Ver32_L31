@@ -1386,3 +1386,175 @@ __all__ = [
     "set_runtime",
     "get_runtime",
 ]
+
+
+# ============================================================
+# PIPE SUMMARY 表示整形
+# ------------------------------------------------------------
+# 旧 core/startup/entry_qty_min_lot_runtime_patch.py の
+# _install_pipe_summary_display_patch() を本文化。
+# _log_df_profile を、東アジア文字幅を考慮した整形テーブル出力へ置き換える。
+# ログ出力専用でエントリー判定には影響しない。
+#
+# 適用スコープは旧 install 導線 (main.py:220) を再現し、main.py プロセス
+# 以外では従来の _log_df_profile がそのまま使われる。
+# ============================================================
+
+def _pipe_safe_int(v: Any, default: int = 0) -> int:
+    try:
+        if v is None or v == "":
+            return default
+        return int(float(v))
+    except Exception:
+        return default
+
+
+def _pipe_summary_display_scope() -> bool:
+    try:
+        import sys as _sys
+
+        argv_text = " ".join(str(x) for x in _sys.argv).replace("\\", "/").lower()
+        db_names = (
+            "main_database.py", "data_collectors_runner.py", "db_prepare_runner.py",
+            "push_receiver_runner.py", "yahoo_complement_runner.py",
+            "summary_database_runner.py", "ranking_collector_runner.py",
+        )
+        if any(n in argv_text for n in db_names):
+            return False
+        return "main.py" in argv_text
+    except Exception:
+        return False
+
+
+def _install_pipe_summary_display() -> bool:
+    try:
+        import pandas as pd
+        import numpy as np
+        import unicodedata
+
+        symbolname_width = max(10, min(_pipe_safe_int(os.getenv("DISPLAY_SYMBOLNAME_WIDTH"), 18), 32))
+        score_cols = {"score", "score_total", "final_score", "display_score", "score_buy", "score_sell"}
+        slope_cols = {"slope", "slope_atr_scaled", "score_slope"}
+        two_cols = {"mtf", "score_mtf", "mtf_score", "macd", "signal"}
+        one_cols = {"open", "high", "low", "close", "rsi"}
+        widths = {
+            "symbol": 6, "symbolname": symbolname_width,
+            "score": 7, "score_total": 7, "final_score": 7, "display_score": 7,
+            "score_buy": 7, "score_sell": 7,
+            "slope": 8, "slope_atr_scaled": 8, "score_slope": 8,
+            "mtf": 6, "score_mtf": 6, "mtf_score": 6,
+            "open": 7, "high": 7, "low": 7, "close": 7,
+            "rsi": 5, "macd": 6, "signal": 6, "datetime": 19,
+        }
+        left_cols = {"symbol", "symbolname", "datetime"}
+
+        def _w(s: str) -> int:
+            total = 0
+            for ch in str(s):
+                total += 2 if unicodedata.east_asian_width(ch) in {"F", "W"} else 1
+            return total
+
+        def _pad(s: str, width: int, left: bool = False) -> str:
+            s = str(s)
+            pad = max(0, width - _w(s))
+            return s + " " * pad if left else " " * pad + s
+
+        def _clip(s: str, width: int) -> str:
+            s = str(s)
+            if _w(s) <= width:
+                return s
+            ell = "..."
+            out = ""
+            for ch in s:
+                if _w(out + ch + ell) > width:
+                    break
+                out += ch
+            return out + ell
+
+        def _num(v, default=np.nan):
+            try:
+                if v is None or (isinstance(v, str) and v.strip() == ""):
+                    return default
+                return float(v)
+            except Exception:
+                return default
+
+        def _fmt_num(v, width: int, digits: int) -> str:
+            x = _num(v)
+            if pd.isna(x):
+                return _pad("-", width, left=False)
+            return f"{x:{width}.{digits}f}"
+
+        def _cell(c: str, v) -> str:
+            if c in score_cols:
+                return _fmt_num(v, widths.get(c, 7), 2)
+            if c in slope_cols:
+                return _fmt_num(v, widths.get(c, 8), 4)
+            if c in two_cols:
+                return _fmt_num(v, widths.get(c, 6), 2)
+            if c in one_cols:
+                return _fmt_num(v, widths.get(c, 7), 1)
+            if c == "symbolname":
+                return _pad(_clip(str(v), widths[c]), widths[c], left=True)
+            if c == "symbol":
+                return _pad(str(v), widths[c], left=True)
+            if c == "datetime":
+                return _pad(str(v), widths[c], left=True)
+            return _pad(str(v), widths.get(c, max(8, len(c))), left=c in left_cols)
+
+        def _table(df) -> str:
+            try:
+                if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+                    return ""
+                cols = [str(c) for c in df.columns]
+                header = " | ".join(_pad(c, widths.get(c, max(8, len(c))), left=c in left_cols) for c in cols)
+                sep = "-+-".join("-" * widths.get(c, max(8, len(c))) for c in cols)
+                lines = [header, sep]
+                for _, r in df.iterrows():
+                    lines.append(" | ".join(_cell(c, r.get(c, "")) for c in cols))
+                return "\n".join(lines)
+            except Exception:
+                try:
+                    return df.to_string(index=False)
+                except Exception:
+                    return ""
+
+        def _patched_log_df_profile(prefix, tf, source, df):
+            try:
+                prof = _profile_df(df)
+                logger.info(
+                    "%s tf=%s source=%s rows=%s cols=%s unique_symbols=%s blank_symbolname=%s completed_summary=%s sample_cols=%s",
+                    prefix, tf, source, prof.get("rows"), prof.get("cols"), prof.get("unique_symbols"),
+                    prof.get("blank_symbolname"), prof.get("completed_summary"), prof.get("sample_cols"),
+                )
+                logger.info(
+                    "%s tf=%s source=%s nonzero score=%s slope=%s slope_atr_scaled=%s score_slope=%s mtf=%s score_mtf=%s mtf_score=%s rsi=%s macd=%s signal=%s close_nonnull=%s datetime_nonnull=%s",
+                    prefix, tf, source, prof.get("score_nonzero"), prof.get("slope_nonzero"),
+                    prof.get("slope_atr_scaled_nonzero"), prof.get("score_slope_nonzero"), prof.get("mtf_nonzero"),
+                    prof.get("score_mtf_nonzero"), prof.get("mtf_score_nonzero"), prof.get("rsi_nonzero"),
+                    prof.get("macd_nonzero"), prof.get("signal_nonzero"), prof.get("close_nonnull"), prof.get("datetime_nonnull"),
+                )
+                show_cols = [c for c in [
+                    "symbol", "symbolname", "score", "score_total", "final_score", "display_score",
+                    "score_buy", "score_sell", "slope", "slope_atr_scaled", "score_slope",
+                    "mtf", "score_mtf", "mtf_score", "open", "high", "low", "close", "rsi", "macd", "signal", "datetime"
+                ] if c in df.columns]
+                if show_cols and not df.empty:
+                    logger.info("%s tf=%s source=%s\n%s", prefix, tf, source, _table(df[show_cols].head(20)))
+            except Exception:
+                logger.exception("[PIPE SUMMARY DISPLAY PATCH] _log_df_profile failed prefix=%s tf=%s source=%s", prefix, tf, source)
+
+        _patched_log_df_profile._pipe_summary_display_patch_v1 = True
+        globals()["_log_df_profile"] = _patched_log_df_profile
+        logger.warning("[PIPE SUMMARY DISPLAY PATCH] installed symbolname_width=%s", symbolname_width)
+        return True
+    except Exception:
+        logger.exception("[PIPE SUMMARY DISPLAY PATCH] install failed")
+        return False
+
+
+if _pipe_summary_display_scope():
+    try:
+        _install_pipe_summary_display()
+    except Exception:
+        logger.exception("[PIPE SUMMARY DISPLAY PATCH] install failed")

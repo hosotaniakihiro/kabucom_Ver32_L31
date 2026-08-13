@@ -199,6 +199,30 @@ def _install_main_runtime_patches():
     except Exception:
         logger.exception("[MAIN RUNTIME PATCH] stale 100368 sell reject cache cleanup failed")
 
+    def _apply_summary_ai_threshold_env() -> None:
+        """旧 entry_qty_min_lot_runtime_patch._install_summary_ai_threshold_env()。
+
+        しきい値 env の既定値。旧パッチの install() 冒頭で毎回実行されていたので、
+        patches リストの処理直前という同じ位置で適用する。
+        """
+        defaults = {
+            "SUMMARY_AI_MIN_BUY": "1.00",
+            "SUMMARY_AI_MIN_SELL": "1.00",
+            "SUMMARY_AI_MIN_CONF": "0.55",
+            "MIN_ENTRY_SCORE_BUY_SUMMARY": "1.00",
+            "MIN_ENTRY_SCORE_SELL_SUMMARY": "1.00",
+            "MIN_SUMMARY_SCORE_BUY": "1.00",
+            "MIN_SUMMARY_SCORE_SELL": "1.00",
+            "MIN_COMPOSITE_SCORE_BUY": "0.50",
+            "MIN_COMPOSITE_SCORE_SELL": "0.80",
+            "SUMMARY_AI_TOP_N": "20",
+        }
+        for k, v in defaults.items():
+            os.environ.setdefault(k, v)
+        logger.warning("[SUMMARY AI THRESHOLD ENV PATCH] installed %s", defaults)
+
+    _apply_summary_ai_threshold_env()
+
     patches = [
         # summary_scheduler_shutdown_guard_patch は
         # scheduler_jobs/summary/scheduler.py へ本文化済みのため削除
@@ -217,7 +241,10 @@ def _install_main_runtime_patches():
         ("core.startup.fast_startup_runtime_patch", "install"),
         ("scheduler_jobs.summary.memory_latest_1m", "install"),
         ("core.startup.summary_mtf_diff_from_1m_patch", "install"),
-        ("core.startup.entry_qty_min_lot_runtime_patch", "install"),
+        # entry_qty_min_lot_runtime_patch は3責務に分割して本文化済み:
+        #   - 発注数量の最小単元フォールバック -> trading/handlers/entry_controller.py
+        #   - PIPE SUMMARY 表示整形            -> core/global_context/context.py
+        #   - SUMMARY AI しきい値の env 既定値 -> 直下の _apply_summary_ai_threshold_env()
         ("core.startup.low_movement_entry_guard_patch", "install"),
         ("core.startup.entry_final_filter_failopen_patch", "install"),
         ("core.startup.oneshot_limit_700k_patch", "install"),
