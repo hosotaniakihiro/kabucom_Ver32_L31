@@ -30,12 +30,15 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import math
 import os
 import sqlite3
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Dict, Any, Iterable, Optional, Tuple
 
@@ -2421,7 +2424,7 @@ def _smr_wrap_guard(name: str) -> bool:
     return True
 
 
-def build_entry_order(*args, **kwargs):
+def _build_entry_order_smr(*args, **kwargs):
     result = _build_entry_order_elp(*args, **kwargs)
     try:
         if not isinstance(result, dict) or bool(result.get("ok")):
@@ -2474,3 +2477,358 @@ def apply_short_mtf_guard_wraps() -> bool:
         except Exception:
             logger.exception("[ENTRY ORDER SHORT MTF NEUTRAL RESCUE] guard wrap failed name=%s", name)
     return ok
+
+
+# ============================================================
+# REST FULL BOARD ENTRY
+# (旧 core/startup/rest_full_board_entry_patch.py を本文化)
+# ------------------------------------------------------------
+# 出来上がった注文について kabu の REST /board を取り直し、
+# 板の厚み・偏りを見て指値を決め直す (必要なら NG にする)。
+# 実 install 順の測定で、この層は build_entry_order を包む 7 パッチの
+# **最外周** (startup.py:1009 = main.py:435 の system_startup 経由) だった。
+#
+# 最終チェーン (すべて本ファイル内):
+#   _build_entry_order_core (native)
+#     <- _build_entry_order_fob  SUMMARY_AI fast path
+#       <- _build_entry_order_bsr 支持線/抵抗線ガード
+#         <- _build_entry_order_epi 指値の有利側寄せ
+#           <- _build_entry_order_elp 板タッチ + SUMMARY_AI 厳格ガード
+#             <- _build_entry_order_smr 中立時の再試行
+#               <- build_entry_order    REST /board で指値を決め直す (この層)
+#
+# 有効/無効は旧 install と同じ ENTRY_REST_FULL_BOARD_ENABLED (既定 True)。
+# ============================================================
+
+_RFB__INSTALLED = False
+
+
+def _rfb_env_bool(name: str, default: bool = True) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return bool(default)
+    s = str(v).strip().lower()
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off", ""}:
+        return False
+    return bool(default)
+
+
+def _rfb_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        return float(v) if v not in (None, "") else float(default)
+    except Exception:
+        return float(default)
+
+
+def _rfb_safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        x = float(v)
+        return x if not math.isnan(x) and not math.isinf(x) else float(default)
+    except Exception:
+        return float(default)
+
+
+def _rfb_norm_symbol(v: Any) -> str:
+    s = str(v or "").strip()
+    return s[:-2] if s.endswith(".0") and s[:-2].isdigit() else s
+
+
+_RFB_CACHE: dict[str, tuple[float, dict]] = {}
+_RFB_LAST_CALL: dict[str, float] = {}
+
+
+def _rfb_norm_side(v: Any) -> str:
+    s = str(v or "").strip().upper()
+    if s in {"BUY", "LONG", "2", "買", "買い"}:
+        return "BUY"
+    if s in {"SELL", "SHORT", "1", "売", "売り"}:
+        return "SELL"
+    return s
+
+
+def _rfb_source_enabled(source: str) -> bool:
+    if not _rfb_env_bool("ENTRY_REST_FULL_BOARD_ENABLED", True):
+        return False
+    src = str(source or "").upper()
+    allowed = {x.strip().upper() for x in os.getenv("ENTRY_REST_FULL_BOARD_SOURCES", "SUMMARY_AI,RANKING,TONOSAMA,EARLY_SCALP,ENTRY").split(",") if x.strip()}
+    return "ALL" in allowed or src in allowed
+
+
+def _rfb_tick(price: float) -> float:
+    try:
+        from utils_common import get_tick_size
+        t = float(get_tick_size(price))
+        return t if t > 0 else 1.0
+    except Exception:
+        return 1.0
+
+
+def _rfb_round(price: float, side: str) -> float:
+    t = _rfb_tick(price)
+    return math.ceil(price / t) * t if side == "BUY" else math.floor(price / t) * t
+
+
+def _rfb_get_token() -> str | None:
+    try:
+        from token_manager import get_valid_token, refresh_token
+        return get_valid_token() or refresh_token()
+    except Exception:
+        logger.debug("[REST FULL BOARD] token unavailable", exc_info=True)
+        return None
+
+
+def _rfb_fetch_board(symbol: str, *, force: bool = False) -> dict | None:
+    now = time.monotonic()
+    cache_sec = _rfb_env_float("ENTRY_REST_FULL_BOARD_CACHE_SEC", 0.8)
+    cached = _RFB_CACHE.get(symbol)
+    if not force and cached and now - cached[0] <= cache_sec:
+        out = dict(cached[1])
+        out["cache_hit"] = True
+        return out
+
+    min_interval = _rfb_env_float("ENTRY_REST_FULL_BOARD_MIN_INTERVAL_SEC", 0.7)
+    if not force and cached and now - _RFB_LAST_CALL.get(symbol, 0.0) < min_interval:
+        out = dict(cached[1])
+        out["cache_hit"] = True
+        out["rate_limited_cache"] = True
+        return out
+
+    token = _rfb_get_token()
+    if not token:
+        return None
+    base = os.getenv("KABUSAPI_BASE_URL", "http://localhost:18080/kabusapi").rstrip("/")
+    exchange = os.getenv("ENTRY_REST_FULL_BOARD_EXCHANGE", "1")
+    url = f"{base}/board/{urllib.parse.quote(symbol + '@' + exchange)}"
+    req = urllib.request.Request(url, headers={"X-API-KEY": token}, method="GET")
+    _RFB_LAST_CALL[symbol] = now
+    try:
+        with urllib.request.urlopen(req, timeout=_rfb_env_float("ENTRY_REST_FULL_BOARD_TIMEOUT_SEC", 0.8)) as res:
+            raw = json.loads(res.read().decode("utf-8", errors="replace"))
+    except Exception:
+        logger.debug("[REST FULL BOARD] request failed symbol=%s force=%s", symbol, force, exc_info=True)
+        return None
+    if not isinstance(raw, dict):
+        return None
+
+    depth = int(_rfb_env_float("ENTRY_REST_FULL_BOARD_DEPTH", 10))
+    bids, asks = [], []
+    for i in range(1, max(1, depth) + 1):
+        b = raw.get(f"Buy{i}") if isinstance(raw.get(f"Buy{i}"), dict) else {}
+        a = raw.get(f"Sell{i}") if isinstance(raw.get(f"Sell{i}"), dict) else {}
+        bp, bq = _rfb_safe_float(b.get("Price")), _rfb_safe_float(b.get("Qty"))
+        ap, aq = _rfb_safe_float(a.get("Price")), _rfb_safe_float(a.get("Qty"))
+        if bp > 0 and bq > 0:
+            bids.append({"level": i, "price": bp, "qty": bq})
+        if ap > 0 and aq > 0:
+            asks.append({"level": i, "price": ap, "qty": aq})
+
+    bid = _rfb_safe_float(raw.get("BidPrice")) or (bids[0]["price"] if bids else 0.0)
+    ask = _rfb_safe_float(raw.get("AskPrice")) or (asks[0]["price"] if asks else 0.0)
+    if bid <= 0 or ask <= 0 or ask < bid:
+        return None
+    board = {"bid": bid, "ask": ask, "bids": bids, "asks": asks, "source": "rest_board", "force": bool(force)}
+    _RFB_CACHE[symbol] = (now, board)
+    return dict(board)
+
+
+def _rfb_sum_qty(levels: list[dict], n: int) -> float:
+    return sum(_rfb_safe_float(x.get("qty")) for x in levels[: max(1, n)])
+
+
+def _rfb_thick(levels: list[dict], fallback_price: float) -> dict:
+    min_qty = _rfb_env_float("ENTRY_REST_FULL_BOARD_THICK_MIN_QTY", 500.0)
+    usable = [x for x in levels if _rfb_safe_float(x.get("qty")) >= min_qty]
+    src = usable or levels or [{"level": 1, "price": fallback_price, "qty": 0.0}]
+    return max(src, key=lambda x: _rfb_safe_float(x.get("qty")))
+
+
+def _rfb_find_level_qty(levels: list[dict], price: float) -> float:
+    for lv in levels:
+        if abs(_rfb_safe_float(lv.get("price")) - float(price)) < 1e-9:
+            return _rfb_safe_float(lv.get("qty"))
+    return 0.0
+
+
+def _rfb_decide_price(board: dict, side: str) -> tuple[float, str, dict]:
+    bid, ask = _rfb_safe_float(board.get("bid")), _rfb_safe_float(board.get("ask"))
+    mid = (bid + ask) / 2.0
+    t = _rfb_tick(mid)
+    bids, asks = list(board.get("bids") or []), list(board.get("asks") or [])
+    touch = _rfb_env_bool("ENTRY_REST_FULL_BOARD_ALLOW_TOUCH_ASK_BID", True)
+    if side == "BUY":
+        lv = _rfb_thick(bids, bid)
+        p = max(_rfb_safe_float(lv.get("price")) + t, bid + t)
+        p = min(p, ask if touch else max(bid, ask - t))
+        mode = "REST_FULL_BOARD_BUY_THICK_BID_PLUS_TICK"
+    else:
+        lv = _rfb_thick(asks, ask)
+        p = min(_rfb_safe_float(lv.get("price")) - t, ask - t)
+        p = max(p, bid if touch else min(ask, bid + t))
+        mode = "REST_FULL_BOARD_SELL_THICK_ASK_MINUS_TICK"
+    n = int(_rfb_env_float("ENTRY_REST_FULL_BOARD_IMBALANCE_DEPTH", 5))
+    return _rfb_round(p, side), mode, {"bid": bid, "ask": ask, "tick": t, "thick_level": lv, "bid_total_topN": _rfb_sum_qty(bids, n), "ask_total_topN": _rfb_sum_qty(asks, n), "depth": n}
+
+
+def _rfb_imbalance_ng(board: dict, side: str) -> dict | None:
+    if not _rfb_env_bool("ENTRY_REST_FULL_BOARD_IMBALANCE_GUARD_ENABLED", True):
+        return None
+    n = int(_rfb_env_float("ENTRY_REST_FULL_BOARD_IMBALANCE_DEPTH", 5))
+    bids, asks = list(board.get("bids") or []), list(board.get("asks") or [])
+    bid_total = _rfb_sum_qty(bids, n)
+    ask_total = _rfb_sum_qty(asks, n)
+    min_same = _rfb_env_float("ENTRY_REST_FULL_BOARD_MIN_SAME_SIDE_TOTAL", 300.0)
+    max_opp_ratio = _rfb_env_float("ENTRY_REST_FULL_BOARD_MAX_OPPOSITE_RATIO", 2.5)
+    min_ratio_denom = max(1.0, _rfb_env_float("ENTRY_REST_FULL_BOARD_RATIO_MIN_DENOM", 100.0))
+
+    if side == "BUY":
+        ratio = ask_total / max(bid_total, min_ratio_denom)
+        if bid_total < min_same:
+            return {"reason": "REST_FULL_BOARD_BUY_SUPPORT_TOO_THIN", "bid_total_topN": bid_total, "ask_total_topN": ask_total, "depth": n, "min_same_side_total": min_same}
+        if ratio > max_opp_ratio:
+            return {"reason": "REST_FULL_BOARD_BUY_SELL_WALL_TOO_HEAVY", "bid_total_topN": bid_total, "ask_total_topN": ask_total, "opposite_ratio": ratio, "max_opposite_ratio": max_opp_ratio, "depth": n}
+    elif side == "SELL":
+        ratio = bid_total / max(ask_total, min_ratio_denom)
+        if ask_total < min_same:
+            return {"reason": "REST_FULL_BOARD_SELL_RESISTANCE_TOO_THIN", "bid_total_topN": bid_total, "ask_total_topN": ask_total, "depth": n, "min_same_side_total": min_same}
+        if ratio > max_opp_ratio:
+            return {"reason": "REST_FULL_BOARD_SELL_BUY_WALL_TOO_HEAVY", "bid_total_topN": bid_total, "ask_total_topN": ask_total, "opposite_ratio": ratio, "max_opposite_ratio": max_opp_ratio, "depth": n}
+    return None
+
+
+def _rfb_double_check_ng(symbol: str, first_board: dict, side: str) -> dict | None:
+    if not _rfb_env_bool("ENTRY_REST_FULL_BOARD_DOUBLE_CHECK_ENABLED", True):
+        return None
+    wait_sec = max(0.0, _rfb_env_float("ENTRY_REST_FULL_BOARD_DOUBLE_CHECK_WAIT_SEC", 0.25))
+    remain_ratio = max(0.0, min(1.0, _rfb_env_float("ENTRY_REST_FULL_BOARD_DOUBLE_CHECK_MIN_REMAIN_RATIO", 0.60)))
+    n = int(_rfb_env_float("ENTRY_REST_FULL_BOARD_IMBALANCE_DEPTH", 5))
+
+    first_bids = list(first_board.get("bids") or [])
+    first_asks = list(first_board.get("asks") or [])
+    if side == "BUY":
+        first_levels = first_bids
+        first_total = _rfb_sum_qty(first_bids, n)
+        thick1 = _rfb_thick(first_bids, _rfb_safe_float(first_board.get("bid")))
+        level_key = "bid"
+    else:
+        first_levels = first_asks
+        first_total = _rfb_sum_qty(first_asks, n)
+        thick1 = _rfb_thick(first_asks, _rfb_safe_float(first_board.get("ask")))
+        level_key = "ask"
+
+    thick_price = _rfb_safe_float(thick1.get("price"))
+    thick_qty1 = _rfb_safe_float(thick1.get("qty"))
+    if wait_sec > 0:
+        time.sleep(wait_sec)
+
+    second = _rfb_fetch_board(symbol, force=True)
+    if not second:
+        if _rfb_env_bool("ENTRY_REST_FULL_BOARD_DOUBLE_CHECK_FAIL_OPEN", True):
+            return None
+        return {"reason": "REST_FULL_BOARD_DOUBLE_CHECK_MISSING", "wait_sec": wait_sec, "first_total_topN": first_total, "thick_level_first": thick1}
+
+    second_bids = list(second.get("bids") or [])
+    second_asks = list(second.get("asks") or [])
+    if side == "BUY":
+        second_levels = second_bids
+        second_total = _rfb_sum_qty(second_bids, n)
+    else:
+        second_levels = second_asks
+        second_total = _rfb_sum_qty(second_asks, n)
+    thick_qty2 = _rfb_find_level_qty(second_levels, thick_price)
+
+    total_floor = first_total * remain_ratio
+    thick_floor = thick_qty1 * remain_ratio
+    if first_total > 0 and second_total < total_floor:
+        return {
+            "reason": f"REST_FULL_BOARD_{side}_SIDE_TOTAL_DISAPPEARED",
+            "wait_sec": wait_sec,
+            "remain_ratio": remain_ratio,
+            "first_total_topN": first_total,
+            "second_total_topN": second_total,
+            "depth": n,
+            "level_side": level_key,
+        }
+    if thick_qty1 > 0 and thick_qty2 < thick_floor:
+        return {
+            "reason": f"REST_FULL_BOARD_{side}_THICK_LEVEL_DISAPPEARED",
+            "wait_sec": wait_sec,
+            "remain_ratio": remain_ratio,
+            "thick_price": thick_price,
+            "thick_qty_first": thick_qty1,
+            "thick_qty_second": thick_qty2,
+            "thick_level_first": thick1,
+            "level_side": level_key,
+        }
+    logger.info(
+        "[REST FULL BOARD] DOUBLE_CHECK_OK symbol=%s side=%s wait=%.3f first_total=%.0f second_total=%.0f thick_price=%s qty %.0f->%.0f",
+        symbol, side, wait_sec, first_total, second_total, thick_price, thick_qty1, thick_qty2,
+    )
+    return None
+
+
+def _rfb_patch_result(ret: dict, *, symbol: str, side: str, source: str) -> dict:
+    if not isinstance(ret, dict) or not ret.get("ok") or not _rfb_source_enabled(source):
+        return ret
+    detail = ret.get("detail")
+    if not isinstance(detail, dict) or str(detail.get("order_type") or "").upper() != "LIMIT":
+        return ret
+    sym, side = _rfb_norm_symbol(symbol), _rfb_norm_side(side)
+    if side not in {"BUY", "SELL"} or not sym:
+        return ret
+    board = _rfb_fetch_board(sym)
+    if not board:
+        detail["rest_full_board"] = False
+        detail["rest_full_board_reason"] = "missing_keep_existing"
+        return ret
+    bid, ask = _rfb_safe_float(board.get("bid")), _rfb_safe_float(board.get("ask"))
+    spread_pct = ((ask - bid) / ((ask + bid) / 2.0)) * 100.0
+    max_spread = _rfb_env_float("ENTRY_REST_FULL_BOARD_MAX_SPREAD_PCT", _rfb_env_float("ENTRY_MAX_SPREAD_PCT", 0.15))
+    if spread_pct > max_spread and _rfb_env_bool("ENTRY_REST_FULL_BOARD_STRICT_GUARD", True):
+        return {"ok": False, "reason": "REST_FULL_BOARD_SPREAD_TOO_WIDE", "detail": {**detail, "bid": bid, "ask": ask, "spread_pct": spread_pct, "max_spread_pct": max_spread}}
+
+    imbalance_ng = _rfb_imbalance_ng(board, side)
+    if imbalance_ng is not None:
+        if _rfb_env_bool("ENTRY_REST_FULL_BOARD_IMBALANCE_STRICT", True):
+            logger.warning("[REST FULL BOARD] IMBALANCE_NG symbol=%s side=%s source=%s detail=%s", sym, side, source, imbalance_ng)
+            return {"ok": False, "reason": imbalance_ng.get("reason") or "REST_FULL_BOARD_IMBALANCE_NG", "detail": {**detail, **imbalance_ng, "rest_full_board": True, "spread_pct": spread_pct}}
+        detail["rest_full_board_imbalance_warning"] = imbalance_ng
+
+    double_ng = _rfb_double_check_ng(sym, board, side)
+    if double_ng is not None:
+        if _rfb_env_bool("ENTRY_REST_FULL_BOARD_DOUBLE_CHECK_STRICT", True):
+            logger.warning("[REST FULL BOARD] DOUBLE_CHECK_NG symbol=%s side=%s source=%s detail=%s", sym, side, source, double_ng)
+            return {"ok": False, "reason": double_ng.get("reason") or "REST_FULL_BOARD_DOUBLE_CHECK_NG", "detail": {**detail, **double_ng, "rest_full_board": True, "spread_pct": spread_pct}}
+        detail["rest_full_board_double_check_warning"] = double_ng
+
+    old = _rfb_safe_float(detail.get("price"))
+    new, mode, meta = _rfb_decide_price(board, side)
+    if new <= 0:
+        return ret
+    detail["price_before_rest_full_board"] = old
+    detail["price"] = new
+    detail["base_price"] = new
+    detail["price_source"] = "rest_full_board_price"
+    detail["rest_full_board"] = True
+    detail["rest_full_board_mode"] = mode
+    detail["rest_full_board_meta"] = {**meta, "spread_pct": spread_pct}
+    logger.warning("[REST FULL BOARD] symbol=%s side=%s source=%s mode=%s old=%s new=%s meta=%s cache=%s", sym, side, source, mode, old, new, detail["rest_full_board_meta"], bool(board.get("cache_hit")))
+    return ret
+
+
+def build_entry_order(*args, **kwargs):
+    ret = _build_entry_order_smr(*args, **kwargs)
+    if not _rfb_env_bool("ENTRY_REST_FULL_BOARD_ENABLED", True):
+        return ret
+    try:
+        return _rfb_patch_result(
+            ret,
+            symbol=kwargs.get("symbol", ""),
+            side=kwargs.get("side", ""),
+            source=kwargs.get("source", ""),
+        )
+    except Exception:
+        logger.exception("[REST FULL BOARD] patch failed; keep original")
+        return ret

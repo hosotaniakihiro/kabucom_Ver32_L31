@@ -1005,12 +1005,11 @@ def _install_entrypoint_runtime_patches() -> None:
     # trading/handlers/entry_controller._execute_best_candidate 本体へ
     # インライン化済み (パッチ側は空スタブだったので削除した)。
 
-    try:
-        from core.startup.rest_full_board_entry_patch import install as install_rest_full_board_entry_patch
-
-        install_rest_full_board_entry_patch()
-    except Exception:
-        logger.exception("[startup.entrypoint] REST full board entry patch install failed")
+    # rest_full_board_entry_patch は
+    # trading/handlers/entry_order_builder.py の build_entry_order へ本文化済み
+    # (_rfb_*)。実 install 順の測定で、この層は build_entry_order を包む
+    # 7 パッチの最外周だったので、本文でも最外周に置いてある。
+    # 有効/無効は同じ env ENTRY_REST_FULL_BOARD_ENABLED を見る。
 
     # final_entry_safety_guard_patch は trading/handlers/entry_controller.py の
     # _final_guard_* 群 (時間帯/流動性/直近反転/板) へインライン化済み
