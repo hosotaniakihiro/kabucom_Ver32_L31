@@ -204,7 +204,7 @@ def _get_token() -> str:
     return ""
 
 
-def _fetch_board_rest(symbol: str, side: str = "", source: str = "") -> dict[str, Any] | None:
+def _fetch_board_rest_core(symbol: str, side: str = "", source: str = "") -> dict[str, Any] | None:
     side, source = _infer_context_side_source(side, source)
     if not _env_bool("ENTRY_BOARD_REST_DIRECT_ENABLED", False):
         return None
@@ -361,3 +361,109 @@ except Exception:
 
 
 __all__ = ["install", "_fetch_board_rest"]
+
+
+# ============================================================
+# Summary-AI 経路の REST 板取得クールダウン回避
+# ------------------------------------------------------------
+# 旧 core/startup/summary_ai_board_rest_cooldown_patch.py をこのホストへ統合。
+# (このモジュール自体がまだパッチなので「本文化」ではなくホストへの統合)
+#
+# Summary-AI は候補ごとの発注直前確認なので、直前の別銘柄の板NGで残り候補を
+# 止めないよう、REST 前後で _REST_COOLDOWN_UNTIL をクリアする。
+# 連鎖していた strategy mode / fibonacci EV / NVE projection の install は
+# 呼び出し元 usercustomize.py へ移した。
+# ============================================================
+
+_BRC_VERSION = "V4-SUMMARY-AI-BOARD-REST-COOLDOWN"
+
+def _brc_summary_source(source: Any) -> bool:
+    s = str(source or "").strip().upper()
+    return s in {"SUMMARY", "SUMMARY_AI", "PUSH_SUMMARY", "STOCK_SUMMARY", "SUMMARY_AI_ORDER_BUILDER"} or "SUMMARY_AI" in s
+
+
+def _brc_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
+
+
+def _brc_valid_board(board: Any) -> bool:
+    if not isinstance(board, dict):
+        return False
+    buy1 = board.get("Buy1") if isinstance(board.get("Buy1"), dict) else {}
+    sell1 = board.get("Sell1") if isinstance(board.get("Sell1"), dict) else {}
+
+    def f(v: Any) -> float:
+        try:
+            if v is None or str(v).strip() == "":
+                return 0.0
+            return float(str(v).replace(",", ""))
+        except Exception:
+            return 0.0
+
+    bid = f(board.get("bid_price") or board.get("bid") or board.get("best_bid") or board.get("BidPrice") or board.get("BestBid") or buy1.get("Price"))
+    ask = f(board.get("ask_price") or board.get("ask") or board.get("best_ask") or board.get("AskPrice") or board.get("BestAsk") or sell1.get("Price"))
+    return bid > 0 and ask > 0
+
+
+def _fetch_board_rest(symbol: str, side: str = "", source: str = ""):
+    src = str(source or "")
+    is_summary = _brc_summary_source(src)
+    old_timeout = os.environ.get("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC")
+    if is_summary:
+        # Summary-AIは候補ごとの発注直前確認なので、直前の別銘柄NGで全候補を止めない。
+        try:
+            cooldown_until = float(globals().get("_REST_COOLDOWN_UNTIL", 0.0) or 0.0)
+        except Exception:
+            cooldown_until = 0.0
+        remaining = cooldown_until - time.time()
+        if remaining > 0:
+            globals()["_REST_COOLDOWN_UNTIL"] = 0.0
+            logger.warning(
+                "[SUMMARY AI BOARD REST COOLDOWN] cleared cooldown before REST symbol=%s side=%s source=%s remaining=%.1fs version=%s",
+                symbol,
+                side,
+                source,
+                remaining,
+                _BRC_VERSION,
+            )
+        desired_timeout = max(2.0, _brc_env_float("SUMMARY_AI_REST_BOARD_TIMEOUT_SEC", 2.0))
+        if _brc_env_float("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", 0.0) < desired_timeout:
+            os.environ["ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC"] = str(desired_timeout)
+    try:
+        board = _fetch_board_rest_core(symbol, side=side, source=source)
+    finally:
+        if is_summary:
+            # 通常の板なし/timeoutで設定されたcooldownは次候補へ持ち越さない。
+            try:
+                cooldown_until = float(globals().get("_REST_COOLDOWN_UNTIL", 0.0) or 0.0)
+            except Exception:
+                cooldown_until = 0.0
+            if cooldown_until > time.time():
+                globals()["_REST_COOLDOWN_UNTIL"] = 0.0
+                logger.warning(
+                    "[SUMMARY AI BOARD REST COOLDOWN] cleared cooldown after REST symbol=%s side=%s source=%s version=%s",
+                    symbol,
+                    side,
+                    source,
+                    _BRC_VERSION,
+                )
+            if old_timeout is None:
+                os.environ.pop("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC", None)
+            else:
+                os.environ["ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC"] = old_timeout
+    if is_summary:
+        logger.warning(
+            "[SUMMARY AI BOARD REST COOLDOWN] REST result symbol=%s side=%s source=%s valid=%s version=%s",
+            symbol,
+            side,
+            source,
+            _brc_valid_board(board),
+            _BRC_VERSION,
+        )
+    return board

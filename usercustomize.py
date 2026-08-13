@@ -155,15 +155,30 @@ def _install_exit_no_progress_monitor() -> bool:
 
 
 def _install_summary_ai_board_rest_cooldown() -> bool:
-    try:
-        from core.startup.summary_ai_board_rest_cooldown_patch import install as _install_cooldown
+    """Summary-AI 経路の REST 板クールダウン回避と、連鎖する戦略オーバレイ。
 
-        ok = bool(_install_cooldown())
-        logger.warning("[USERCUSTOMIZE] summary AI board REST cooldown bypass ok=%s", ok)
-        return ok
-    except Exception:
-        logger.exception("[USERCUSTOMIZE] summary AI board REST cooldown bypass failed")
-        return False
+    クールダウン回避本体は core/startup/board_retry_patch.py の
+    _fetch_board_rest へ統合済み。ここでは旧パッチが併せて行っていた
+    3つの戦略 install を、同じ位置・同じ順序で実行する。
+    """
+    results = {}
+    for label, mod_name in (
+        ("strategy_mode", "core.startup.summary_ai_strategy_mode_patch"),
+        ("fibonacci_ev", "core.startup.summary_ai_fibonacci_ev_strategy_patch"),
+        ("nve_projection", "core.startup.summary_ai_nve_projection_strategy_patch"),
+    ):
+        try:
+            import importlib
+
+            mod = importlib.import_module(mod_name)
+            fn = getattr(mod, "install", None)
+            results[label] = bool(fn()) if callable(fn) else False
+        except Exception:
+            results[label] = False
+            logger.exception("[USERCUSTOMIZE] chained %s install failed", label)
+    ok = any(results.values())
+    logger.warning("[USERCUSTOMIZE] summary AI board REST cooldown bypass ok=%s chained=%s", ok, results)
+    return ok
 
 
 def _install_summary_ai_emp_prob_gate() -> bool:
