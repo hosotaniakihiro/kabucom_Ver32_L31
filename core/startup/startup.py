@@ -973,12 +973,9 @@ def _install_entrypoint_runtime_patches() -> None:
     # trading/summary/controller_cache.py / controller_projection.py へ本文化済み
     # (trading/summary/controller_layers.apply_layers の 2 層目)。
 
-    try:
-        from core.startup.summary_push_bg_due_interval_guard_patch import install as install_push_bg_due_guard
-
-        install_push_bg_due_guard()
-    except Exception:
-        logger.exception("[startup.entrypoint] push bg due interval guard install failed")
+    # summary_push_bg_due_interval_guard_patch は
+    # core/startup/summary_parallel_intervals_runtime_patch.py の
+    # _submit_bg_push_interval へ本文化済み (_bgd_*)。
 
     # entry_pipeline_pending_root_prefilter_patch は
     # trading/handlers/entry_controller.py へインライン化済み

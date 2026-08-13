@@ -523,7 +523,7 @@ def _split_push_wait_and_bg(push_targets: list[int], *, in_session: bool) -> tup
     return _split_push_wait_and_bg_core(push_targets, in_session=in_session)
 
 
-def _submit_bg_push_interval(*, interval, now, display: bool, run_entry: bool) -> None:
+def _submit_bg_push_interval_legacy(*, interval, now, display: bool, run_entry: bool) -> None:
     if _msk_enabled():
         logger.warning(
             "[MAIN SKIP SUMMARY PUSH BG] skipped bg push interval=%s now=%s display=%s run_entry=%s",
@@ -535,3 +535,252 @@ def _submit_bg_push_interval(*, interval, now, display: bool, run_entry: bool) -
     except Exception:
         logger.exception("[MAIN SKIP SUMMARY PUSH BG] original bg submit failed")
     return None
+
+
+# ============================================================
+# SUMMARY PUSH BG DUE GUARD
+# (旧 core/startup/summary_push_bg_due_interval_guard_patch.py を本文化)
+# ------------------------------------------------------------
+# 3m/5m は due のときだけ、1m は専用スレッドで、同一 interval の
+# 多重起動は stale 判定で抑止する。場外は main.py で丸ごとスキップ。
+#
+# **重要**: 旧パッチのラッパーは元関数 (_submit_bg_push_interval) を
+# 一度も呼ばず、_job_one_source / _bg_executor を直接叩く完全置換だった。
+# つまりこのモジュールに前回畳んだ _msk_enabled() の main-skip 層は
+# 実行時には到達していなかった。上の _submit_bg_push_interval_legacy が
+# その旧経路で、現在は呼び出し元が無い。
+#
+# 旧 install() の _install_display_first_patch / _install_seed_fast_patch は
+# どちらも既に本文化済みで True を返すだけだった。
+# ============================================================
+
+_BGD_RUNNING_BY_INTERVAL: dict[int, tuple[float, str]] = {}
+_BGD_LOCK = threading.RLock()
+_BGD_SESSION_SKIP_LOGGED: dict[str, float] = {}
+
+
+def _bgd_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return bool(default)
+        return str(raw).strip().lower() in {"1", "true", "yes", "y", "on", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _bgd_env_float(name: str, default: float) -> float:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return float(default)
+        return max(1.0, float(raw))
+    except Exception:
+        return float(default)
+
+
+def _bgd_is_main_py_context() -> bool:
+    try:
+        argv = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+        if "main_database.py" in argv:
+            return False
+        if any(x in argv for x in (
+            "summary_database_runner.py",
+            "yahoo_complement_runner.py",
+            "ranking_collector_runner.py",
+            "push_receiver_runner.py",
+            "data_collectors_runner.py",
+        )):
+            return False
+        if any(os.getenv(k) == "1" for k in (
+            "AUTOSTOCK_MAIN_DATABASE_PROCESS",
+            "AUTOSTOCK_SUMMARY_DB_WRITER",
+            "AUTOSTOCK_DATA_COLLECTORS_PROCESS",
+            "AUTOSTOCK_RANKING_COLLECTOR_PROCESS",
+        )):
+            return False
+        return "main.py" in argv
+    except Exception:
+        return False
+
+
+def _bgd_is_market_session(now: dt.datetime) -> bool:
+    """JP cash session approximation for main.py background work."""
+    try:
+        t = now.time()
+        am_start = dt.time(9, 0)
+        am_end = dt.time(11, 30)
+        pm_start = dt.time(12, 30)
+        pm_end = dt.time(15, 30)
+        return (am_start <= t < am_end) or (pm_start <= t < pm_end)
+    except Exception:
+        return True
+
+
+def _bgd_should_skip_main_outside_session(now: dt.datetime, interval: int) -> tuple[bool, str]:
+    try:
+        if not _bgd_env_bool("SUMMARY_PUSH_BG_SKIP_OUTSIDE_SESSION_IN_MAIN", True):
+            return False, "disabled"
+        if not _bgd_is_main_py_context():
+            return False, "not_main"
+        if _bgd_is_market_session(now):
+            return False, "in_session"
+        if _bgd_env_bool("SUMMARY_PUSH_BG_ALLOW_OUTSIDE_SESSION_IN_MAIN", False):
+            return False, "allow_env"
+        return True, f"outside_session interval={interval} now={now}"
+    except Exception:
+        return False, "check_failed"
+
+
+def _bgd_log_session_skip_once(key: str, msg: str, *args) -> None:
+    try:
+        now_ts = time.time()
+        interval = _bgd_env_float("SUMMARY_PUSH_BG_SESSION_SKIP_LOG_INTERVAL_SEC", 60.0)
+        last = float(_BGD_SESSION_SKIP_LOGGED.get(key, 0.0) or 0.0)
+        if now_ts - last >= interval:
+            _BGD_SESSION_SKIP_LOGGED[key] = now_ts
+            logger.warning(msg, *args)
+    except Exception:
+        logger.warning(msg, *args)
+
+
+def _bgd_stale_sec_for_interval(interval: int) -> float:
+    iv = int(interval)
+    if iv == 1:
+        return _bgd_env_float("SUMMARY_PUSH_BG_INTERVAL_STALE_SEC_1M", 60.0)
+    if iv == 3:
+        return _bgd_env_float("SUMMARY_PUSH_BG_INTERVAL_STALE_SEC_3M", _bgd_env_float("SUMMARY_PUSH_BG_INTERVAL_STALE_SEC", 240.0))
+    if iv == 5:
+        return _bgd_env_float("SUMMARY_PUSH_BG_INTERVAL_STALE_SEC_5M", _bgd_env_float("SUMMARY_PUSH_BG_INTERVAL_STALE_SEC", 240.0))
+    return _bgd_env_float("SUMMARY_PUSH_BG_INTERVAL_STALE_SEC", 240.0)
+
+
+def _bgd_is_due(interval: int, now: dt.datetime) -> bool:
+    try:
+        iv = int(interval)
+        if iv <= 1:
+            return True
+        return int(now.minute) % iv == 0
+    except Exception:
+        return True
+
+
+def _bgd_run_task_direct_thread(task, *, bg_key: str, interval: int) -> bool:
+    try:
+        th = threading.Thread(
+            target=task,
+            name=f"summary-push-{int(interval)}m-{bg_key}",
+            daemon=True,
+        )
+        th.start()
+        logger.warning(
+            "[SUMMARY PUSH BG DUE GUARD] bg push dedicated thread started key=%s interval=%s thread=%s",
+            bg_key,
+            interval,
+            th.name,
+        )
+        return True
+    except Exception:
+        logger.exception("[SUMMARY PUSH BG DUE GUARD] dedicated thread start failed key=%s interval=%s", bg_key, interval)
+        return False
+
+
+def _submit_bg_push_interval(*, interval: int, now: dt.datetime, display: bool, run_entry: bool) -> None:
+    iv = int(interval)
+
+    skip_session, reason_session = _bgd_should_skip_main_outside_session(now, iv)
+    if skip_session:
+        _bgd_log_session_skip_once(
+            f"session:{iv}",
+            "[SUMMARY PUSH BG DUE GUARD] skipped reason=main_outside_session interval=%s now=%s detail=%s",
+            iv,
+            now,
+            reason_session,
+        )
+        return None
+
+    due_only = _bgd_env_bool("SUMMARY_PUSH_BG_LONG_INTERVAL_DUE_ONLY", True)
+    if due_only and iv in (3, 5) and not _bgd_is_due(iv, now):
+        logger.warning(
+            "[SUMMARY PUSH BG DUE GUARD] skipped reason=not_due interval=%s now=%s minute=%s",
+            iv,
+            now,
+            getattr(now, "minute", None),
+        )
+        return None
+
+    stale_sec = _bgd_stale_sec_for_interval(iv)
+    now_ts = time.time()
+    with _BGD_LOCK:
+        old = _BGD_RUNNING_BY_INTERVAL.get(iv)
+        if old:
+            started, key_old = old
+            elapsed = now_ts - float(started)
+            if elapsed < stale_sec:
+                logger.warning(
+                    "[SUMMARY PUSH BG DUE GUARD] skipped reason=interval_still_running interval=%s elapsed=%.1fs stale_sec=%.1fs key=%s",
+                    iv,
+                    elapsed,
+                    stale_sec,
+                    key_old,
+                )
+                return None
+
+            logger.warning(
+                "[SUMMARY PUSH BG DUE GUARD] stale interval running cleared interval=%s elapsed=%.1fs stale_sec=%.1fs key=%s",
+                iv,
+                elapsed,
+                stale_sec,
+                key_old,
+            )
+            _BGD_RUNNING_BY_INTERVAL.pop(iv, None)
+
+        bg_key = f"{now.strftime('%Y%m%d%H%M')}:push:{iv}"
+        _BGD_RUNNING_BY_INTERVAL[iv] = (now_ts, bg_key)
+
+    def _task() -> None:
+        try:
+            logger.warning(
+                "[SUMMARY PUSH BG DUE GUARD] bg push start key=%s interval=%s now=%s display=%s run_entry=%s stale_sec=%.1f dedicated=%s",
+                bg_key,
+                iv,
+                now,
+                display,
+                run_entry,
+                stale_sec,
+                iv == 1,
+            )
+            _job_one_source(source="push", interval=iv, now=now, display=display, run_entry=run_entry)
+        except Exception:
+            logger.exception("[SUMMARY PUSH BG DUE GUARD] bg push failed key=%s interval=%s", bg_key, iv)
+        finally:
+            with _BGD_LOCK:
+                cur = _BGD_RUNNING_BY_INTERVAL.get(iv)
+                if cur and cur[1] == bg_key:
+                    _BGD_RUNNING_BY_INTERVAL.pop(iv, None)
+            logger.warning("[SUMMARY PUSH BG DUE GUARD] bg push done key=%s interval=%s now=%s", bg_key, iv, now)
+
+    try:
+        if iv == 1 and _bgd_env_bool("SUMMARY_PUSH_1M_DEDICATED_THREAD", True):
+            ok = _bgd_run_task_direct_thread(_task, bg_key=bg_key, interval=iv)
+            if not ok:
+                with _BGD_LOCK:
+                    cur = _BGD_RUNNING_BY_INTERVAL.get(iv)
+                    if cur and cur[1] == bg_key:
+                        _BGD_RUNNING_BY_INTERVAL.pop(iv, None)
+            return None
+
+        _bg_executor().submit(_task)
+        logger.warning(
+            "[SUMMARY PUSH BG DUE GUARD] bg push submitted key=%s interval=%s now=%s stale_sec=%.1f",
+            bg_key,
+            iv,
+            now,
+            stale_sec,
+        )
+    except Exception:
+        with _BGD_LOCK:
+            cur = _BGD_RUNNING_BY_INTERVAL.get(iv)
+            if cur and cur[1] == bg_key:
+                _BGD_RUNNING_BY_INTERVAL.pop(iv, None)
+        logger.exception("[SUMMARY PUSH BG DUE GUARD] submit failed key=%s interval=%s", bg_key, iv)
