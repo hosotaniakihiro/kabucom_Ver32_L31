@@ -255,7 +255,13 @@ def _install_main_runtime_patches():
         #     -> tonosama rescue に巻き戻されて到達しない死にラッパーだったので撤去
         # 位置は旧 install と同じ (定数を書き戻す watcher との順序があるため)。
         ("trading.handlers.entry_order_builder", "apply_entry_final_filter_defaults"),
-        ("core.startup.oneshot_limit_700k_patch", "install"),
+        # oneshot_limit_700k_patch は本文化済み:
+        #   env 既定値 45 件 + MAX_ONESHOT=700000 + entry_controller の
+        #   スコアしきい値 4 定数 + 生きている連鎖 install 3 件
+        #     -> kabu_api.buy_sell_entry.apply_oneshot_limit_defaults()
+        #   他 15 個のサブ install は本文化済みの空スタブか env のみだった。
+        # 位置は旧 install と同じ (しきい値を書き戻す watcher との順序があるため)。
+        ("kabu_api.buy_sell_entry", "apply_oneshot_limit_defaults"),
         # entry_limit_passive_runtime_patch は
         # trading/handlers/entry_order_builder.py へ本文化済み (_elp_*)。
         # 定数の上書きと _aggressive_limit_price の差し替えは

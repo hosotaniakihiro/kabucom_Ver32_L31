@@ -875,3 +875,117 @@ def get_latest_bid_ask(symbol: str):
         "quote_dt": q.get("quote_dt"),
         "source": q.get("source"),
     }
+
+
+# ============================================================
+# ONESHOT LIMIT / 起動時 env 既定値
+# (旧 core/startup/oneshot_limit_700k_patch.py を本文化)
+# ------------------------------------------------------------
+# 旧パッチは 19 個のサブ install を持つランチャーだったが、実体は
+#   - env 既定値 45 件 (setdefault が中心)
+#   - entry_controller のスコアしきい値 4 定数
+#   - kabu_api.buy_sell_entry.MAX_ONESHOT = 700_000
+#   - 生きている連鎖 install 3 件
+# だけだった (他 15 個は本文化済みの空スタブか env のみ)。
+#
+# **import 時ではなく main.py の patches リストの旧位置 (:250) から呼ぶこと。**
+# entry_controller のしきい値は tonosama_history_failclose_strict_patch の
+# watcher が 3.0 へ書き戻す関係があり、位置を変えると最終値が変わる。
+# ============================================================
+
+_OL7_ENV_SET: list[str] = []
+
+
+def _ol7_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).strip())
+    except Exception:
+        return float(default)
+
+
+def apply_oneshot_limit_defaults() -> bool:
+    """旧 oneshot_limit_700k_patch.install() の実体。"""
+    global MAX_ONESHOT
+    os.environ.setdefault("MAX_ENTRY_ONESHOT_YEN", "700000")
+    os.environ.setdefault("ENTRY_LOW_PRICE_ONESHOT_YEN", "700000")
+    os.environ.setdefault("ENTRY_HIGH_PRICE_ONESHOT_YEN", "700000")
+    os.environ.setdefault("ENTRY_MAX_PRICE", "7000")
+    os.environ.setdefault("ORDER_LOT_SIZE", "100")
+    os.environ.setdefault("ENTRY_AFFORDABILITY_FILTER_ENABLED", "1")
+    os.environ.setdefault("PUSH_BOOTSTRAP_FAST_RESTORE", "1")
+    os.environ.setdefault("PUSH_BOOTSTRAP_FAST_MAX_ROWS", "3000")
+    os.environ.setdefault("PUSH_BOOTSTRAP_FAST_LOOKBACK_MINUTES", "45")
+    os.environ.setdefault("ENTRY_FRESH_QUOTE_GUARD_ENABLED", "1")
+    os.environ.setdefault("ENTRY_MAX_QUOTE_AGE_SEC", "8.0")
+    os.environ.setdefault("ENTRY_ALLOW_QUOTE_WITHOUT_TIMESTAMP", "0")
+    os.environ.setdefault("ENTRY_MIN_LOT_FALLBACK_WHEN_AFFORDABLE", "1")
+    os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY", "1")
+    os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_DROP_BUSY", "0")
+    os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX", "20")
+    os.environ.setdefault("SUMMARY_AI_STRICT_LIQ_ENABLED", "1")
+    os.environ.setdefault("SUMMARY_AI_LIQ_MIN_LATEST_VOLUME", "30000")
+    os.environ.setdefault("SUMMARY_AI_LIQ_MIN_AVG_VOLUME", "30000")
+    os.environ.setdefault("WATCHLIST_RECENT_LIQ_ENABLED", "1")
+    os.environ.setdefault("WATCHLIST_RECENT_LIQ_MIN_LATEST_VOLUME", "3000")
+    os.environ.setdefault("WATCHLIST_RECENT_LIQ_MIN_AVG_VOLUME", "3000")
+    os.environ.setdefault("WATCHLIST_RECENT_LIQ_MIN_TURNOVER_YEN", "1000000")
+    os.environ.setdefault("WATCHLIST_RECENT_LIQ_BARS", "5")
+    os.environ.setdefault("WATCHLIST_RECENT_LIQ_PROTECT_BYPASS", "1")
+    os.environ.setdefault("WATCHLIST_RECENT_LIQ_CACHE_TTL_SEC", "10")
+    os.environ.setdefault("WATCHLIST_RECENT_LIQ_BULK_LOG_SEC", "0.5")
+    os.environ.setdefault("SUMMARY_PARALLEL_INTERVALS_ENABLED", "1")
+    os.environ.setdefault("SUMMARY_PARALLEL_INTERVAL_WORKERS", "3")
+    os.environ.setdefault("SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC", "55")
+    os.environ.setdefault("SUMMARY_PARALLEL_RANKING_ENABLED", "1")
+    os.environ.setdefault("ENTRY_PIPELINE_BUCKET_PREFILTER", "1")
+    os.environ.setdefault("SUMMARY_AI_ATR_FAILOPEN_ENABLED", "1")
+    os.environ.setdefault("SUMMARY_AI_ATR_FAILOPEN_MIN_VOLUME", "30000")
+    os.environ.setdefault("SUMMARY_AI_ATR_FAILOPEN_MIN_TURNOVER", "10000000")
+    os.environ.setdefault("SUMMARY_AI_ATR_FAILOPEN_MIN_PRICE", "1500")
+    os.environ.setdefault("ENTRY_DIRECTION_FAILOPEN_FOR_SUMMARY_AI", "1")
+    os.environ.setdefault("EXIT_BOARD_PROFIT_ENABLED", "1")
+    os.environ.setdefault("EXIT_BOARD_MIN_PROFIT_PCT", "0.0010")
+    os.environ.setdefault("EXIT_BOARD_THICK_QTY_MULT", "3.0")
+    os.environ.setdefault("EXIT_BOARD_MIN_THICK_QTY", "1000")
+    os.environ.setdefault("EXIT_BOARD_MAX_WAIT_SEC", "2.0")
+    os.environ.setdefault("EXIT_BOARD_POLL_SEC", "0.25")
+    os.environ.setdefault("EXIT_BOARD_REVERSE_GAP_PCT", "0.0010")
+
+    try:
+        old_value = globals().get("MAX_ONESHOT")
+        MAX_ONESHOT = 700_000
+        logger.warning("[ONESHOT LIMIT PATCH] MAX_ONESHOT changed old=%s new=%s", old_value, MAX_ONESHOT)
+    except Exception:
+        logger.exception("[ONESHOT LIMIT PATCH] MAX_ONESHOT apply failed")
+
+    try:
+        import trading.handlers.entry_controller as ec
+
+        old = (getattr(ec, "MIN_SUMMARY_SCORE_BUY", None), getattr(ec, "MIN_COMPOSITE_SCORE_BUY", None),
+               getattr(ec, "MIN_SUMMARY_SCORE_SELL", None), getattr(ec, "MIN_COMPOSITE_SCORE_SELL", None))
+        ec.MIN_SUMMARY_SCORE_BUY = _ol7_env_float("MIN_SUMMARY_SCORE_BUY", 1.0)
+        ec.MIN_COMPOSITE_SCORE_BUY = _ol7_env_float("MIN_COMPOSITE_SCORE_BUY", 0.8)
+        ec.MIN_SUMMARY_SCORE_SELL = _ol7_env_float("MIN_SUMMARY_SCORE_SELL", 1.0)
+        ec.MIN_COMPOSITE_SCORE_SELL = _ol7_env_float("MIN_COMPOSITE_SCORE_SELL", 1.0)
+        logger.warning("[ENTRY THRESHOLD PATCH] installed BUY score %s->%s comp %s->%s SELL score %s->%s comp %s->%s",
+                       old[0], ec.MIN_SUMMARY_SCORE_BUY, old[1], ec.MIN_COMPOSITE_SCORE_BUY,
+                       old[2], ec.MIN_SUMMARY_SCORE_SELL, old[3], ec.MIN_COMPOSITE_SCORE_SELL)
+    except Exception:
+        logger.exception("[ENTRY THRESHOLD PATCH] install failed")
+
+    for _mod_name, _label in (
+        ("core.startup.summary_ai_async_entry_patch", "summary_ai_async_entry"),
+        ("core.startup.summary_parallel_intervals_runtime_patch", "summary_parallel_intervals"),
+        ("core.startup.exit_board_profit_runtime_patch", "exit_board_profit"),
+    ):
+        try:
+            _m = __import__(_mod_name, fromlist=["install"])
+            _fn = getattr(_m, "install", None)
+            _ok = bool(_fn()) if callable(_fn) else False
+            logger.warning("[ONESHOT LIMIT PATCH] %s installed=%s", _label, _ok)
+        except Exception:
+            logger.exception("[ONESHOT LIMIT PATCH] %s install failed", _label)
+    return True
