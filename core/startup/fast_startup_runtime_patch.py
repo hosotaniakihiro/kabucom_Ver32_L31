@@ -113,7 +113,10 @@ def _background_heavy() -> None:
         _install_symbol_flags_bootstrap,
         lambda: _run_install("summary_mtf_push_raw_fallback_patch", "core.startup.summary_mtf_push_raw_fallback_patch"),
         lambda: _run_install("direct_push_1m:bg", "scheduler_jobs.summary.direct_push_1m"),
-        lambda: _run_install("open_position_broker_merge_patch", "core.startup.open_position_broker_merge_patch"),
+        # open_position_broker_merge_patch は
+        # trading/position/open_position_sync.py へ本文化済み
+        # (stale_db_cleanup / sync_throttle と合わせて3層。
+        #  スコープは同ファイルの _ops_scope_enabled() が再現)。
         # exit_executor_broker_position_patch は trading/exit/executor.py へ本文化済み
         # (_get_open_position / _close_db_position の broker 実建玉フォールバック。
         #  スコープは同ファイルの _broker_position_fallback_enabled() が再現)。

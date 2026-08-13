@@ -105,29 +105,21 @@ def _install_push_bootstrap_fast_restore_patch() -> bool:
 
 
 def _install_open_position_stale_db_cleanup_patch() -> bool:
-    try:
-        os.environ.setdefault("OPEN_POSITION_AUTO_CLOSE_STALE_DB", "1")
-        os.environ.setdefault("OPEN_POSITION_STALE_DB_CLEAN_INTERVAL_SEC", "30")
-        from core.startup import open_position_stale_db_cleanup_patch as p
-        ok = p.install()
-        logger.warning("[ONESHOT LIMIT PATCH] open_position_stale_db_cleanup_patch installed=%s", ok)
-        return bool(ok)
-    except Exception:
-        logger.exception("[ONESHOT LIMIT PATCH] open_position_stale_db_cleanup_patch install failed")
-        return False
+    """open_position_stale_db_cleanup_patch は trading/position/open_position_sync.py へ本文化済み。
+
+    native <- broker_merge <- stale_db_cleanup <- sync_throttle の3層を
+    順序を保って畳んである (スコープは _ops_scope_enabled() が再現)。
+    """
+    return True
 
 
 def _install_open_position_sync_throttle_patch() -> bool:
-    try:
-        os.environ.setdefault("OPEN_POSITION_THROTTLE_ENABLED", "1")
-        os.environ.setdefault("OPEN_POSITION_EMPTY_THROTTLE_SEC", "5.0")
-        from core.startup import open_position_sync_throttle_patch as p
-        ok = p.install()
-        logger.warning("[ONESHOT LIMIT PATCH] open_position_sync_throttle_patch installed=%s", ok)
-        return bool(ok)
-    except Exception:
-        logger.exception("[ONESHOT LIMIT PATCH] open_position_sync_throttle_patch install failed")
-        return False
+    """open_position_sync_throttle_patch は trading/position/open_position_sync.py へ本文化済み。
+
+    native <- broker_merge <- stale_db_cleanup <- sync_throttle の3層を
+    順序を保って畳んである (スコープは _ops_scope_enabled() が再現)。
+    """
+    return True
 
 
 def _install_entry_fresh_quote_guard_patch() -> bool:
