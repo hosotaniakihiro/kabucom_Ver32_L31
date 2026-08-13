@@ -251,25 +251,14 @@ def _install_summary_recovery_defaults() -> bool:
 
 
 def _install_summary_latest_prefer() -> bool:
-    """summary latest prefer 関連の env 既定値を設定する。
-
-    latest 優先の判定本体は trading/summary/controller_cache.py の
-    choose_merged_cache_payload へ本文化済み (DISABLE_SUMMARY_LATEST_PREFER_PATCH=1
-    での無効化も同関数が引き継いでいる)。
-    ここに残しているのは、旧 install() が併せて行っていた
-    summary spool quarantine / push MTF volume fallback の env 既定値のみ。
-    どちらも本文化済みだが、設定タイミングを変えないためこの位置で行う。
-    """
     try:
-        os.environ.setdefault("SUMMARY_SPOOL_QUARANTINE_ENABLED", "1")
-        os.environ.setdefault("SUMMARY_SPOOL_QUARANTINE_EMPTY", "1")
-        os.environ.setdefault("SUMMARY_SPOOL_QUARANTINE_OLD", "1")
-        os.environ.setdefault("SUMMARY_SPOOL_QUARANTINE_MAX_AGE_DAYS", "2")
-        os.environ.setdefault("PUSH_MTF_VOLUME_FALLBACK_ENABLED", "1")
-        os.environ.setdefault("PUSH_MTF_ZERO_VOLUME_FALLBACK_VOLUME", "30000")
-        return os.environ.get("DISABLE_SUMMARY_LATEST_PREFER_PATCH", "").strip() != "1"
+        if os.environ.get("DISABLE_SUMMARY_LATEST_PREFER_PATCH", "").strip() == "1":
+            logger.warning("[FULL PIPELINE STABILITY] summary latest prefer disabled by env")
+            return False
+        from . import summary_latest_prefer_patch
+        return bool(summary_latest_prefer_patch.install())
     except Exception:
-        logger.exception("[FULL PIPELINE STABILITY] summary latest prefer env defaults failed")
+        logger.exception("[FULL PIPELINE STABILITY] summary latest prefer install failed")
         return False
 
 
