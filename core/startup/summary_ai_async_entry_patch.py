@@ -142,7 +142,7 @@ def _build_boost_active(ec: Any) -> bool:
         return False
 
 
-def _summary_ai_direct_snapshot_execute(entries: Any, *, pipeline_source: str | None = None, interval: int | None = None) -> dict[str, Any]:
+def _summary_ai_direct_snapshot_execute_core(entries: Any, *, pipeline_source: str | None = None, interval: int | None = None) -> dict[str, Any]:
     rows = _entries_to_list(entries)
     if not rows:
         return {"executed": False, "entries": 0, "skip_reason": "no_entries", "result": None}
@@ -330,3 +330,202 @@ except Exception:
     logger.exception("[SUMMARY AI ASYNC ENTRY] auto install failed")
 
 __all__ = ["install"]
+
+
+# ============================================================
+# BOARD MISSING DEFER
+# (旧 core/startup/summary_ai_board_missing_defer_patch.py を本文化)
+# ------------------------------------------------------------
+# direct snapshot 実行の結果を見て、
+#   - entry_controller のロック待ちで落ちた -> retryable として遅延
+#   - 板が取れずに落ちた注文がある         -> その銘柄を deferred に積む
+# を判定する。ネイティブは *_core へ改名した。
+#
+# 旧 install の他のサブ処理:
+#   _install_pending_liq_patch / _install_memory_liq_patch は既に本文化済みの
+#   空スタブ、_install_fast_builder_log_patch も読み手の無いマーカーだけ。
+#   env / 定数の適用は _bmd_apply_runtime_policies() が担う。
+# ============================================================
+
+_BMD_VERSION = "V6-BOARD-MISSING-DEFER-NO-REENTRANT-LOCK"
+_BMD__INSTALLED = False
+
+
+def _bmd_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+_BMD_DEFERRED: dict[tuple[str, str], float] = {}
+
+
+def _bmd_env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
+def _bmd_norm_symbol(v: Any) -> str:
+    s = str(v or "").strip()
+    if s.endswith(".0") and s[:-2].isdigit():
+        return s[:-2]
+    return s
+
+
+def _bmd_is_board_missing_result(v: Any) -> bool:
+    try:
+        text = str(v)
+        return "STRICT_BOARD_MISSING" in text or "板が取れない" in text or "board missing" in text.lower()
+    except Exception:
+        return False
+
+
+def _bmd_mark_deferred(symbol: str, side: str) -> int:
+    now = time.time()
+    ttl = max(1.0, _bmd_env_float("SUMMARY_AI_BOARD_MISSING_DEFER_TTL_SEC", 12.0))
+    key = (_bmd_norm_symbol(symbol), str(side or "").upper())
+    _BMD_DEFERRED[key] = now + ttl
+    return int(sum(1 for exp in _BMD_DEFERRED.values() if exp > now))
+
+
+def _bmd_apply_async_lock_policy() -> bool:
+    try:
+        old_reentrant = os.environ.get("SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK")
+        old_retry = os.environ.get("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX")
+        old_stale = os.environ.get("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC")
+        # Reentrant execution while entry_controller._pipeline_lock is held can stall the
+        # direct snapshot path before ORDER_BUILD_OK. Treat busy lock as retryable instead.
+        os.environ["SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK"] = "0"
+        os.environ["SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY"] = "1"
+        os.environ["SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX"] = str(max(5, _bmd_env_int("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX", 5)))
+        os.environ["SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_SLEEP_SEC"] = str(max(0.5, min(_bmd_env_float("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_SLEEP_SEC", 0.8), 1.5)))
+        os.environ["SUMMARY_AI_ASYNC_ENTRY_STALE_SEC"] = str(max(35.0, _bmd_env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 35.0)))
+        logger.warning(
+            "[SUMMARY AI BOARD MISSING DEFER] async lock policy applied reentrant %s->0 retry_max %s->%s stale %s->%s version=%s",
+            old_reentrant,
+            old_retry,
+            os.environ.get("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX"),
+            old_stale,
+            os.environ.get("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC"),
+            _BMD_VERSION,
+        )
+        return True
+    except Exception:
+        logger.exception("[SUMMARY AI BOARD MISSING DEFER] async lock policy failed version=%s", _BMD_VERSION)
+        return False
+
+
+def _bmd_apply_rest_timeout_relief() -> bool:
+    try:
+        timeout = max(1.2, min(_bmd_env_float("SUMMARY_AI_REST_BOARD_TIMEOUT_SEC", 1.5), 3.0))
+        cache_ttl = max(0.2, min(_bmd_env_float("SUMMARY_AI_REST_BOARD_CACHE_TTL_SEC", 1.0), 3.0))
+        old_timeout = os.environ.get("ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC")
+        old_cache = os.environ.get("ENTRY_BOARD_REST_CACHE_TTL_SEC")
+        os.environ["SUMMARY_AI_REST_BOARD_TIMEOUT_SEC"] = str(timeout)
+        os.environ["ENTRY_BOARD_REST_DIRECT_TIMEOUT_SEC"] = str(timeout)
+        os.environ["ENTRY_BOARD_REST_CACHE_TTL_SEC"] = str(cache_ttl)
+        logger.warning(
+            "[SUMMARY AI BOARD MISSING DEFER] REST timeout relief applied timeout %s->%s cache_ttl %s->%s hard_block=True version=%s",
+            old_timeout,
+            timeout,
+            old_cache,
+            cache_ttl,
+            _BMD_VERSION,
+        )
+        return True
+    except Exception:
+        logger.exception("[SUMMARY AI BOARD MISSING DEFER] REST timeout relief failed version=%s", _BMD_VERSION)
+        return False
+
+
+def _bmd_apply_full_rotation_retry() -> bool:
+    """Wait long enough to observe both A/B PUSH batches before hard-blocking."""
+    try:
+        retry_sec = max(10.0, _bmd_env_float("SUMMARY_AI_BOARD_FULL_ROTATION_RETRY_SEC", 10.5))
+        interval_sec = max(0.1, min(_bmd_env_float("SUMMARY_AI_BOARD_FULL_ROTATION_RETRY_INTERVAL_SEC", 0.2), 1.0))
+        os.environ["ENTRY_ORDER_BOARD_RETRY_SEC"] = str(retry_sec)
+        os.environ["ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC"] = str(interval_sec)
+        os.environ["SUMMARY_AI_BOARD_RETRY_REASON"] = "push_rotation_full_cycle_wait"
+        os.environ["SUMMARY_AI_BOARD_MISSING_DEFER_TTL_SEC"] = str(max(12.0, retry_sec + 2.0))
+        os.environ["ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY"] = "1"
+        os.environ["ENTRY_BOARD_MISSING_HARD_BLOCK"] = "1"
+        os.environ["ENTRY_LIMIT_ALLOW_WITHOUT_BOARD"] = "0"
+        os.environ["ENTRY_ALLOW_ENTRY_WITHOUT_BOARD"] = "0"
+        _bmd_apply_rest_timeout_relief()
+        _bmd_apply_async_lock_policy()
+        try:
+            from trading.handlers import entry_order_builder as eob
+            old_retry = getattr(eob, "ENTRY_ORDER_BOARD_RETRY_SEC", None)
+            old_interval = getattr(eob, "ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", None)
+            setattr(eob, "ENTRY_ORDER_BOARD_RETRY_SEC", retry_sec)
+            setattr(eob, "ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", interval_sec)
+            try:
+                setattr(eob, "ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY", True)
+            except Exception:
+                pass
+            logger.warning(
+                "[SUMMARY AI BOARD MISSING DEFER] full rotation retry applied retry_sec %s->%s interval %s->%s hard_block=True version=%s",
+                old_retry,
+                retry_sec,
+                old_interval,
+                interval_sec,
+                _BMD_VERSION,
+            )
+        except Exception:
+            logger.debug("[SUMMARY AI BOARD MISSING DEFER] eob full rotation retry skipped", exc_info=True)
+        return True
+    except Exception:
+        logger.exception("[SUMMARY AI BOARD MISSING DEFER] full rotation retry apply failed version=%s", _BMD_VERSION)
+        return False
+
+
+def _bmd_apply_runtime_policies() -> None:
+    """旧 install() の env 既定値と 3 つの policy 適用を再現する。"""
+    try:
+        os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY", "1")
+        os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX", "5")
+        os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", "35")
+        _bmd_apply_async_lock_policy()
+        _bmd_apply_rest_timeout_relief()
+        _bmd_apply_full_rotation_retry()
+    except Exception:
+        logger.exception("[SUMMARY AI BOARD MISSING DEFER] runtime policy apply failed")
+
+
+def _summary_ai_direct_snapshot_execute(entries: Any, *, pipeline_source: str | None = None, interval: int | None = None) -> dict[str, Any]:
+    result = _summary_ai_direct_snapshot_execute_core(entries, pipeline_source=pipeline_source, interval=interval)
+    try:
+        if isinstance(result, dict) and not bool(result.get("executed")):
+            if str(result.get("skip_reason") or "") == "entry_controller_lock_timeout":
+                result = dict(result)
+                result["retryable"] = True
+                result["skip_reason"] = "entry_controller_lock_busy_deferred"
+                logger.warning("[SUMMARY AI BOARD MISSING DEFER] snapshot lock busy deferred")
+                return result
+            order_results = result.get("result") or []
+            if isinstance(order_results, list):
+                deferred = 0
+                for r in order_results:
+                    if isinstance(r, dict) and not bool(r.get("ok")) and _bmd_is_board_missing_result(r):
+                        deferred = _bmd_mark_deferred(r.get("symbol"), r.get("side"))
+                if deferred:
+                    result = dict(result)
+                    result["retryable"] = True
+                    result["skip_reason"] = "board_missing_deferred"
+                    result["board_missing_deferred"] = deferred
+                    logger.warning("[SUMMARY AI BOARD MISSING DEFER] snapshot defer count=%s", deferred)
+    except Exception:
+        logger.debug("[SUMMARY AI BOARD MISSING DEFER] snapshot post process failed", exc_info=True)
+    return result
+
+
+_bmd_apply_runtime_policies()

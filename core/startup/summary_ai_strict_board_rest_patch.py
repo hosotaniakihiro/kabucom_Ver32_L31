@@ -337,7 +337,18 @@ def install() -> bool:
         # ranking_summary_fast_entry は
         # scheduler_jobs/summary/ranking_summary_jobs.job_ranking_summary_all と
         # core/startup/scheduler/bootstrap.py へ本文化済み。
-        board_defer = _safe_install("core.startup.summary_ai_board_missing_defer_patch", "board_missing_defer")
+        # summary_ai_board_missing_defer_patch は
+        # core/startup/summary_ai_async_entry_patch.py の
+        # _summary_ai_direct_snapshot_execute へ本文化済み (_bmd_*)。
+        # env / 定数の適用も同ファイルの _bmd_apply_runtime_policies() が
+        # import 時に行うので、ここでは import するだけでよい。
+        try:
+            import core.startup.summary_ai_async_entry_patch as _ap  # noqa: F401
+
+            board_defer = True
+        except Exception:
+            board_defer = False
+            logger.exception("[SUMMARY AI STRICT BOARD REST] board missing defer import failed")
         _apply_hard_board_policy()
         board_wrappers = _install_board_wrappers()
         _INSTALLED = True
