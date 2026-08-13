@@ -705,7 +705,7 @@ def _five_sec_optional_fallback_order(*, symbol: str, side: str, source: str, en
     return _ok(**detail)
 
 
-def build_entry_order(*, symbol: str, side: str, source: str, entry_row: Dict[str, Any], qty_override: Optional[int] = None) -> Dict[str, Any]:
+def _build_entry_order_core(*, symbol: str, side: str, source: str, entry_row: Dict[str, Any], qty_override: Optional[int] = None) -> Dict[str, Any]:
     price = None
     base_price = None
     spread_pct = None
@@ -876,6 +876,18 @@ def _rc_first(d: dict[str, Any], keys: tuple[str, ...]) -> float:
     return 0.0
 
 
+def _rc_ratio(close: float, high: float, low: float) -> float:
+    """旧 summary_ai_range_consistency_patch._ratio。
+
+    _low_move_hard_block を本文化した際に定義を移し忘れており、
+    _rc_best_range 内の呼び出しが NameError になっていたので補った
+    (原本 4777d87 の実装をそのまま復元)。
+    """
+    if close <= 0 or high <= 0 or low <= 0 or high < low:
+        return 0.0
+    return max(0.0, (high - low) / close)
+
+
 def _rc_best_range(row: dict[str, Any], close: float) -> tuple[str, float, float, float]:
     cond = row.get("entry_conditions") if isinstance(row.get("entry_conditions"), dict) else {}
     candidates: list[tuple[str, float, float, float]] = []
@@ -892,7 +904,7 @@ def _rc_best_range(row: dict[str, Any], close: float) -> tuple[str, float, float
             lo = _rc_first(src, ("day_low", "today_low", "session_low", "intraday_low", "LowPrice"))
         if hi > 0 and lo > 0:
             h, l = max(hi, lo), min(hi, lo)
-            candidates.append((label, h, l, _ratio(close, h, l)))
+            candidates.append((label, h, l, _rc_ratio(close, h, l)))
 
     explicit = max(
         _rc_first(row, ("range_pct", "intraday_range_pct", "summary_ai_range_repair_pct")),
@@ -949,3 +961,308 @@ def _low_move_hard_block(entry_row: Dict[str, Any], *, symbol: str, source: str)
     except Exception:
         logger.exception("[SUMMARY AI RANGE CONSISTENCY] failed symbol=%s version=%s", symbol, _RC_VERSION)
         return result
+
+
+# ============================================================
+# SUMMARY_AI FAST ORDER BUILDER
+# (旧 core/startup/summary_ai_fast_order_builder_patch.py を本文化)
+# ------------------------------------------------------------
+# SUMMARY_AI 由来の発注では
+#   - snapshot 由来の order kwargs を強制的に整える
+#   - 低変動レンジを合成レンジで補修する
+#   - 板待ちリトライ秒などのログを出す
+# を本体の前段で行う。ネイティブは _build_entry_order_core へ改名した。
+#
+# 実 install 順を測定した結果、この層は build_entry_order を包む 7 パッチの
+# **最内層** (_ORIGINAL_BUILD_ENTRY_ORDER が native を指す) だった。
+# 最内層を本文へ畳んでも外側 6 層の順序は変わらない。
+#
+# 旧 install の _ensure_entry_order_builder_logger は、eob.logger が
+# 無い場合の保険だった。本文化後は同じモジュール内なので不要。
+# ============================================================
+
+_FOB_VERSION = "V4.0-SUMMARY-AI-BREAKOUT-SR-GUARD"
+_FOB__INSTALLED = False
+_FOB__ORIGINAL_BUILD_ENTRY_ORDER = None
+_FOB__TRUE_SET = {"1", "true", "yes", "y", "on", "ok", "allow", "allowed", "enable", "enabled"}
+_FOB__SUMMARY_SOURCE_SET = {"SUMMARY", "SUMMARY_AI", "PUSH", "PUSH_SUMMARY", "STOCK_SUMMARY"}
+
+
+def _fob_safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or str(v).strip() == "":
+            return float(default)
+        x = float(str(v).replace(",", ""))
+        if math.isnan(x) or math.isinf(x):
+            return float(default)
+        return x
+    except Exception:
+        return float(default)
+
+
+def _fob_first(row: dict[str, Any], names: tuple[str, ...], default: Any = None) -> Any:
+    for name in names:
+        try:
+            v = row.get(name)
+            if v is not None and str(v).strip() != "":
+                return v
+        except Exception:
+            pass
+    return default
+
+
+def _fob_truthy(v: Any) -> bool:
+    try:
+        if isinstance(v, bool):
+            return v
+        return str(v or "").strip().lower() in _FOB__TRUE_SET
+    except Exception:
+        return False
+
+
+def _fob_row_from_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    row = kwargs.get("entry_row")
+    if isinstance(row, dict):
+        return row
+    row = {}
+    kwargs["entry_row"] = row
+    return row
+
+
+def _fob_is_summary_ai_order(kwargs: dict[str, Any]) -> bool:
+    try:
+        source = str(kwargs.get("source") or "").strip().upper()
+        row = kwargs.get("entry_row") if isinstance(kwargs.get("entry_row"), dict) else {}
+        row_source = str(row.get("source") or "").strip().upper()
+        entry_type = str(row.get("entry_type") or kwargs.get("entry_type") or "").strip().upper()
+        pipeline_source = str(row.get("pipeline_source") or "").strip().upper()
+        joined = "|".join(str(x or "").upper() for x in (source, row_source, entry_type, pipeline_source, row.get("reason"), row.get("ai_reason"), row.get("skip_reason")))
+        if source in _FOB__SUMMARY_SOURCE_SET or row_source in _FOB__SUMMARY_SOURCE_SET or pipeline_source == "SUMMARY":
+            return True
+        if "SUMMARY_AI" in joined or "SRC=SUMMARY" in joined:
+            return True
+        if _fob_truthy(row.get("ai_gate_allow")) or _fob_truthy(row.get("preapproved")) or _fob_truthy(row.get("summary_ai_ok")):
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _fob_coerce_summary_ai_snapshot_order(kwargs: dict[str, Any]) -> bool:
+    try:
+        if not _fob_is_summary_ai_order(kwargs):
+            return False
+        row = _fob_row_from_kwargs(kwargs)
+        symbol = kwargs.get("symbol") or row.get("symbol")
+        side = str(kwargs.get("side") or row.get("side") or row.get("entry_decision") or row.get("ai_side") or "").strip().upper()
+        old_source = str(kwargs.get("source") or row.get("source") or "").strip().upper()
+        if old_source and old_source != "SUMMARY_AI":
+            row.setdefault("original_source", old_source)
+        kwargs["source"] = "SUMMARY_AI"
+        row["source"] = "SUMMARY_AI"
+        row["entry_type"] = "SUMMARY_AI"
+        if side in {"BUY", "SELL"}:
+            kwargs["side"] = side
+            row.setdefault("side", side)
+            row.setdefault("entry_decision", side)
+            row.setdefault("ai_side", side)
+        price_f = _fob_safe_float(_fob_first(row, ("close_price", "price", "current_price", "close", "last_price", "vwap", "base_price", "display_price"), 0.0), 0.0)
+        if price_f > 0:
+            row.setdefault("close_price", price_f)
+            row.setdefault("price", price_f)
+            row.setdefault("current_price", price_f)
+            row.setdefault("close", price_f)
+        vol = _fob_safe_float(_fob_first(row, ("volume", "vol", "latest_volume", "display_volume", "_latest_volume"), 0.0), 0.0)
+        if vol <= 0:
+            turnover = _fob_safe_float(_fob_first(row, ("turnover", "trading_value", "sales_value", "display_turnover"), 0.0), 0.0)
+            if turnover > 0 and price_f > 0:
+                vol = turnover / price_f
+        if vol > 0:
+            row.setdefault("volume", vol)
+        logger.warning("[SUMMARY AI FAST ORDER BUILDER] snapshot normalized symbol=%s side=%s source %s->SUMMARY_AI price=%s volume=%s version=%s", symbol, side, old_source, row.get("close_price") or row.get("price") or row.get("current_price") or row.get("close"), row.get("volume"), _FOB_VERSION)
+        return True
+    except Exception:
+        logger.exception("[SUMMARY AI FAST ORDER BUILDER] snapshot normalize failed version=%s", _FOB_VERSION)
+        return False
+
+
+def _fob_range_pct(high: float, low: float, close: float) -> float:
+    try:
+        if close <= 0 or high <= 0 or low <= 0 or high < low:
+            return 0.0
+        return (high - low) / close
+    except Exception:
+        return 0.0
+
+
+def _fob_ranking_move_rescue_ok(row: dict[str, Any], *, min_range_pct: float) -> tuple[bool, str]:
+    try:
+        from trading.filters import volatility_filter as vf
+        fn = getattr(vf, "_ranking_move_rescue", None)
+        if not callable(fn):
+            return False, "no_rescue_func"
+        ok = bool(fn(row, min_pct=float(min_range_pct), label="fast_order_low_move"))
+        return ok, "ranking_move_rescue" if ok else "ranking_move_rescue_ng"
+    except Exception as e:
+        logger.debug("[SUMMARY AI FAST ORDER BUILDER] ranking move rescue check failed err=%s", e, exc_info=True)
+        return False, f"ranking_move_rescue_error:{e}"
+
+
+def _fob_apply_synthetic_range(row: dict[str, Any], *, close: float, min_range_pct: float, reason: str) -> None:
+    width = max(close * float(min_range_pct) * 1.05, close * 0.001, 1.0)
+    high = close + width / 2.0
+    low = max(0.01, close - width / 2.0)
+    pct = _fob_range_pct(high, low, close)
+    atr_proxy = max(_fob_safe_float(_fob_first(row, ("atr_1m", "atr", "ATR", "atr14", "atr_14"), 0.0), 0.0), max(0.0, high - low))
+    row.update({"high_price": high, "low_price": low, "high": high, "low": low, "range_pct": pct, "intraday_range_pct": pct, "summary_ai_range_repaired": True, "summary_ai_range_repair_reason": reason, "summary_ai_range_repair_pct": pct})
+    if atr_proxy > 0:
+        row["atr"] = atr_proxy
+        row["atr_1m"] = atr_proxy
+        row["ATR"] = atr_proxy
+
+
+def _fob_repair_summary_ai_low_move_range(kwargs: dict[str, Any]) -> bool:
+    try:
+        if not _fob_is_summary_ai_order(kwargs):
+            return False
+        row = kwargs.get("entry_row")
+        if not isinstance(row, dict):
+            return False
+        cond = row.get("entry_conditions") if isinstance(row.get("entry_conditions"), dict) else {}
+        close = _fob_safe_float(_fob_first(row, ("close_price", "close", "price", "current_price"), 0.0), 0.0)
+        if close <= 0:
+            return False
+        min_range_pct = _fob_safe_float(os.getenv("ENTRY_ORDER_MIN_RANGE_PCT", globals().get("ENTRY_ORDER_MIN_RANGE_PCT", 0.006)), 0.006)
+        cur_high = _fob_safe_float(_fob_first(row, ("high_price", "high"), 0.0), 0.0)
+        cur_low = _fob_safe_float(_fob_first(row, ("low_price", "low"), 0.0), 0.0)
+        if _fob_range_pct(cur_high, cur_low, close) >= min_range_pct:
+            return False
+        candidates: list[tuple[str, float, float, float]] = []
+        for label, src in (("row_day", row), ("conditions_day", cond)):
+            hi = _fob_safe_float(_fob_first(src, ("day_high", "today_high", "session_high", "intraday_high", "HighPrice", "high_3m", "high_5m"), 0.0), 0.0)
+            lo = _fob_safe_float(_fob_first(src, ("day_low", "today_low", "session_low", "intraday_low", "LowPrice", "low_3m", "low_5m"), 0.0), 0.0)
+            if hi > 0 and lo > 0:
+                h, l = max(hi, lo), min(hi, lo)
+                candidates.append((label, h, l, _fob_range_pct(h, l, close)))
+        for src_label, src in (("row", row), ("conditions", cond)):
+            rp = _fob_safe_float(_fob_first(src, ("range_pct", "intraday_range_pct", "day_range_pct", "summary_ai_range_repair_pct", "_intrabar_range_pct", "_max_price_change_pct"), 0.0), 0.0)
+            if rp > 1.0:
+                rp = rp / 100.0
+            if rp > 0:
+                width = close * rp
+                candidates.append((f"{src_label}_range_pct", close + width / 2.0, max(0.01, close - width / 2.0), rp))
+        best = None
+        for cand in candidates:
+            if cand[3] >= min_range_pct and (best is None or cand[3] > best[3]):
+                best = cand
+        if best is None:
+            rescue_ok, rescue_reason = _fob_ranking_move_rescue_ok(row, min_range_pct=min_range_pct)
+            if rescue_ok:
+                _fob_apply_synthetic_range(row, close=close, min_range_pct=min_range_pct, reason=rescue_reason)
+                logger.warning("[SUMMARY AI FAST ORDER BUILDER] range/atr repaired by ranking rescue symbol=%s side=%s close=%.2f min_range_pct=%.6f high=%.2f low=%.2f atr=%.4f version=%s", kwargs.get("symbol"), kwargs.get("side"), close, min_range_pct, row.get("high"), row.get("low"), row.get("atr"), _FOB_VERSION)
+                return True
+            logger.info("[SUMMARY AI FAST ORDER BUILDER] range repair not enough symbol=%s side=%s candidates=%s rescue=%s version=%s", kwargs.get("symbol"), kwargs.get("side"), candidates, rescue_reason, _FOB_VERSION)
+            return False
+        reason, high, low, pct = best
+        atr_proxy = max(_fob_safe_float(_fob_first(row, ("atr_1m", "atr", "ATR", "atr14", "atr_14"), 0.0), 0.0), max(0.0, high - low))
+        row.update({"high_price": high, "low_price": low, "high": high, "low": low, "range_pct": pct, "intraday_range_pct": pct, "summary_ai_range_repaired": True, "summary_ai_range_repair_reason": reason, "summary_ai_range_repair_pct": pct})
+        if atr_proxy > 0:
+            row["atr"] = atr_proxy
+            row["atr_1m"] = atr_proxy
+            row["ATR"] = atr_proxy
+        logger.warning("[SUMMARY AI FAST ORDER BUILDER] range/atr repaired symbol=%s side=%s reason=%s high=%.2f low=%.2f range_pct=%.6f atr=%.4f version=%s", kwargs.get("symbol"), kwargs.get("side"), reason, high, low, pct, atr_proxy, _FOB_VERSION)
+        return True
+    except Exception:
+        logger.exception("[SUMMARY AI FAST ORDER BUILDER] range repair failed symbol=%s side=%s version=%s", kwargs.get("symbol"), kwargs.get("side"), _FOB_VERSION)
+        return False
+
+
+_FOB_SCOPE: bool | None = None
+_FOB_DB_PROCESS_NAMES = (
+    "main_database.py",
+    "data_collectors_runner.py",
+    "db_prepare_runner.py",
+    "push_receiver_runner.py",
+    "yahoo_complement_runner.py",
+    "summary_database_runner.py",
+    "ranking_collector_runner.py",
+)
+
+
+def _fob_scope_enabled() -> bool:
+    """旧 install スコープ (main.py プロセス) の再現。
+
+    旧パッチは summary_ai_runtime_consistency_patch (sitecustomize の
+    BACKGROUND_MAIN_PATCHES) と summary_ai_board_missing_defer_patch から
+    install されており、どちらも main.py プロセス限定だった。
+    """
+    global _FOB_SCOPE
+    if _FOB_SCOPE is not None:
+        return _FOB_SCOPE
+    enabled = False
+    try:
+        argv_parts = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        argv = " ".join(argv_parts)
+        if not any(n in argv for n in _FOB_DB_PROCESS_NAMES):
+            enabled = any(x.endswith("/main.py") or x == "main.py" for x in argv_parts)
+    except Exception:
+        enabled = False
+    _FOB_SCOPE = enabled
+    return enabled
+
+
+def _fob_apply_env_and_constants() -> None:
+    """旧 install() の env 強制と eob 定数の上書きを再現する。"""
+    global ENTRY_ORDER_BOARD_RETRY_SEC, ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC
+    global ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY
+    if not _fob_scope_enabled():
+        return
+    try:
+        retry_sec = _fob_safe_float(os.getenv("SUMMARY_AI_PUSH_ROTATION_BOARD_RETRY_SEC", "10.5"), 10.5)
+        retry_sec = max(5.0, min(retry_sec, 12.0))
+        os.environ["ENTRY_ORDER_BOARD_RETRY_SEC"] = str(retry_sec)
+        os.environ.setdefault("ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", "0.2")
+        os.environ["SUMMARY_AI_BOARD_RETRY_REASON"] = "push_rotation_wait_2turns"
+        os.environ["ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY"] = "1"
+        os.environ["ENTRY_BOARD_MISSING_HARD_BLOCK"] = "1"
+        os.environ["ENTRY_LIMIT_ALLOW_WITHOUT_BOARD"] = "0"
+        ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY = True
+        ENTRY_ORDER_BOARD_RETRY_SEC = _fob_safe_float(os.environ.get("ENTRY_ORDER_BOARD_RETRY_SEC"), retry_sec)
+        ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC = _fob_safe_float(os.environ.get("ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC"), 0.2)
+    except Exception:
+        logger.exception("[SUMMARY AI FAST ORDER BUILDER] env/constant apply failed")
+
+
+def build_entry_order(*args, **kwargs):
+    if not _fob_scope_enabled():
+        return _build_entry_order_core(*args, **kwargs)
+    summary_like = _fob_is_summary_ai_order(kwargs)
+    symbol = kwargs.get("symbol")
+    side = kwargs.get("side")
+    if summary_like:
+        logger.info(
+            "[SUMMARY AI FAST ORDER BUILDER] start symbol=%s side=%s source=%s retry_sec=%s retry_interval=%s reason=push_rotation_wait_2turns",
+            symbol, side, kwargs.get("source"),
+            globals().get("ENTRY_ORDER_BOARD_RETRY_SEC"),
+            globals().get("ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC"),
+        )
+        _fob_coerce_summary_ai_snapshot_order(kwargs)
+        _fob_repair_summary_ai_low_move_range(kwargs)
+    result = _build_entry_order_core(*args, **kwargs)
+    if summary_like:
+        if isinstance(result, dict) and result.get("reason") == "STRICT_BOARD_MISSING":
+            logger.warning(
+                "[SUMMARY AI FAST ORDER BUILDER] board missing hard block kept after push rotation wait symbol=%s side=%s retry_sec=%s detail=%s",
+                symbol, side, globals().get("ENTRY_ORDER_BOARD_RETRY_SEC"), result.get("detail"),
+            )
+        logger.warning(
+            "[SUMMARY AI FAST ORDER BUILDER] done symbol=%s side=%s ok=%s reason=%s detail=%s",
+            symbol, side,
+            isinstance(result, dict) and result.get("ok"),
+            result.get("reason") if isinstance(result, dict) else type(result).__name__,
+            result.get("detail") if isinstance(result, dict) else None,
+        )
+    return result
+
+
+_fob_apply_env_and_constants()

@@ -118,9 +118,26 @@ def _install_summary_ai_fast_order_builder() -> bool:
         os.environ.setdefault("ENTRY_ORDER_BOARD_RETRY_SEC", "0.8")
         os.environ.setdefault("ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", "0.2")
 
-        from core.startup.summary_ai_fast_order_builder_patch import install as _install_fast_order
+        # summary_ai_fast_order_builder_patch は
+        # trading/handlers/entry_order_builder.py へ本文化済み (_fob_*)。
+        # env / 定数の適用は同ファイルの _fob_apply_env_and_constants() が
+        # import 時に行うので、ここでは import して走らせるだけでよい。
+        # 旧 install が連鎖していた 2 つはここから直接呼ぶ。
+        import trading.handlers.entry_order_builder as _eob  # noqa: F401
 
-        ok = bool(_install_fast_order())
+        ok = True
+        for _mod_name, _label in (
+            ("core.startup.summary_ai_strict_board_rest_patch", "strict board policy"),
+            ("core.startup.breakout_support_resistance_guard_patch", "breakout SR guard"),
+        ):
+            try:
+                _m = __import__(_mod_name, fromlist=["install"])
+                _fn = getattr(_m, "install", None)
+                _r = bool(_fn()) if callable(_fn) else False
+                logger.warning("[USERCUSTOMIZE] %s chain installed=%s", _label, _r)
+            except Exception:
+                ok = False
+                logger.exception("[USERCUSTOMIZE] %s chain install failed", _label)
         logger.warning(
             "[USERCUSTOMIZE] summary AI fast order builder ok=%s retry_sec=%s retry_interval=%s",
             ok,

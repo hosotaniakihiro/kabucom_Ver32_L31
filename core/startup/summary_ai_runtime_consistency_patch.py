@@ -407,13 +407,29 @@ def _install_fast_order_builder() -> bool:
     try:
         os.environ.setdefault("ENTRY_ORDER_BOARD_RETRY_SEC", "0.8")
         os.environ.setdefault("ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", "0.2")
-        from core.startup import summary_ai_fast_order_builder_patch as fp
-        fn = getattr(fp, "install", None)
-        ok = bool(fn()) if callable(fn) else False
-        _FAST_ORDER_ENSURED = bool(ok)
-        if ok:
-            logger.warning("[SUMMARY AI RUNTIME CONSISTENCY] fast order builder ensured via=%s version=%s", getattr(fp, "VERSION", "unknown"), VERSION)
-        return bool(ok)
+        # summary_ai_fast_order_builder_patch は
+        # trading/handlers/entry_order_builder.py へ本文化済み (_fob_*)。
+        # env / 定数の適用は同ファイルの _fob_apply_env_and_constants() が
+        # import 時に行う (スコープ判定も同ファイル)。
+        # 旧 install が連鎖していた 2 つはここから直接呼ぶ。
+        import trading.handlers.entry_order_builder as _eob  # noqa: F401  (env/定数の適用を確実に走らせる)
+
+        ok = True
+        for _mod_name, _label in (
+            ("core.startup.summary_ai_strict_board_rest_patch", "strict board policy"),
+            ("core.startup.breakout_support_resistance_guard_patch", "breakout SR guard"),
+        ):
+            try:
+                _m = __import__(_mod_name, fromlist=["install"])
+                _fn = getattr(_m, "install", None)
+                _r = bool(_fn()) if callable(_fn) else False
+                logger.warning("[SUMMARY AI RUNTIME CONSISTENCY] %s chain installed=%s", _label, _r)
+            except Exception:
+                ok = False
+                logger.exception("[SUMMARY AI RUNTIME CONSISTENCY] %s chain install failed", _label)
+        _FAST_ORDER_ENSURED = True
+        logger.warning("[SUMMARY AI RUNTIME CONSISTENCY] fast order builder inlined; chains installed ok=%s version=%s", ok, VERSION)
+        return True
     except Exception:
         logger.debug("[SUMMARY AI RUNTIME CONSISTENCY] fast order builder install not ready", exc_info=True)
         return False

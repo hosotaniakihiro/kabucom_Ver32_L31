@@ -214,9 +214,11 @@ def _install_async_snapshot_patch() -> bool:
 
 def _install_fast_builder_log_patch() -> bool:
     try:
-        import core.startup.summary_ai_fast_order_builder_patch as fb
-        setattr(fb, "SUMMARY_AI_BOARD_MISSING_DEFER_ENABLED", True)
-        logger.warning("[SUMMARY AI BOARD MISSING DEFER] fast builder marker set version=%s", VERSION)
+        # summary_ai_fast_order_builder_patch は
+        # trading/handlers/entry_order_builder.py へ本文化済み (_fob_*)。
+        # ここで立てていた SUMMARY_AI_BOARD_MISSING_DEFER_ENABLED マーカーは
+        # 旧パッチ側に読み手が無かったので移していない。
+        logger.warning("[SUMMARY AI BOARD MISSING DEFER] fast builder is inlined; marker skipped version=%s", VERSION)
         return True
     except Exception:
         logger.debug("[SUMMARY AI BOARD MISSING DEFER] fast builder marker skipped", exc_info=True)
