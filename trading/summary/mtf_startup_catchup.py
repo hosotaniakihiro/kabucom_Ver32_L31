@@ -494,7 +494,7 @@ def _run_indicator_fill_after_catchup() -> None:
     if not _env_bool("SUMMARY_MTF_INDICATOR_FILL_AFTER_CATCHUP", True):
         return
     try:
-        from core.startup.summary_mtf_indicator_fill_patch import run_fill
+        from trading.summary.mtf_indicator_fill import run_fill
         run_fill(reason="after_mtf_catchup")
     except Exception as e:
         logger.warning("[SUMMARY MTF CATCHUP] indicator fill failed err=%s", e, exc_info=True)

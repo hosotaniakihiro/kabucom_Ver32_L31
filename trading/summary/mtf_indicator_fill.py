@@ -1,4 +1,17 @@
 # ============================================================
+# File   : trading/summary/mtf_indicator_fill.py
+# ------------------------------------------------------------
+# 旧 core/startup/summary_mtf_indicator_fill_patch.py。
+# モンキーパッチは一切行わず、summary DB の MTF 指標 NULL を補完する
+# バックグラウンドジョブ (install() がスレッドを起動) と、手動実行用の
+# run_fill() を提供するだけのモジュールだったため、パッチではなく
+# trading/summary/ 配下へ移設した (ロジックは無変更)。
+#
+# 呼び出し元: trading/summary/mtf_startup_catchup.py (run_fill を遅延import)
+# main.py プロセスでは _is_main_process_split_mode() により install が
+# スキップされ、重いDB補完は main_database.py 側が担当する。
+# ============================================================
+# ============================================================
 # File   : core/startup/summary_mtf_indicator_fill_patch.py
 # Version: V2.1-SKIP-HEAVY-IN-MAIN-PROCESS
 # ------------------------------------------------------------
