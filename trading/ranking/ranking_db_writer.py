@@ -712,7 +712,7 @@ class RankingDBWriter:
     # add
     # ========================================================
 
-    def add_ranking_rows(
+    def _add_ranking_rows_core(
         self,
         *,
         raw_rows: list[dict] | None = None,
@@ -840,7 +840,7 @@ class RankingDBWriter:
     # flush
     # ========================================================
 
-    def flush(self) -> bool:
+    def _flush_core(self) -> bool:
         with self.lock:
             if not (self.raw_buffer or self.snapshot_buffer or self.legacy_buffer):
                 logger.debug("[RANKING DB WRITER] flush skipped empty")
@@ -1105,7 +1105,7 @@ def flush_ranking_writer() -> bool:
     return ranking_writer.flush()
 
 
-def add_ranking_rows_async(
+def _add_ranking_rows_async_core(
     *,
     raw_rows: list[dict] | None = None,
     snapshot_rows: list[dict] | None = None,
@@ -1130,3 +1130,440 @@ __all__ = [
     "flush_ranking_writer",
     "add_ranking_rows_async",
 ]
+
+
+# ============================================================
+# 旧 core/startup の2パッチを本文化
+#   ranking_writer_lock_buffer_relief_patch  (_rwr_*)
+#   ranking_legacy_save_patch                (_rls_*)
+# ------------------------------------------------------------
+# 実 install 順を実測した結果、実行時の合成は
+#   native <- relief <- legacy_save
+# の2層。relief は core/startup/runtime_env/defaults_patch.py 経由で
+# usercustomize/sitecustomize からインタプリタ起動時に入り、legacy_save は
+# core/startup/scheduler/ranking_bootstrap.start_ranking_db_writer_safe()
+# から後で入るため、legacy_save が最外周になる。
+#
+# 実測して分かった重要な点:
+#   relief の add ラッパーは self.enable_legacy_save = False を立てる
+#   (RANKING_WRITER_DISABLE_LEGACY_ON_LOCK_RELIEF 既定 1)。
+#   legacy_save のラッパーは内側を呼んだ後に enable_legacy_save を見るので、
+#   既定設定では legacy 行は 1 件も積まれない。
+#   RANKING_WRITER_DISABLE_LEGACY_ON_LOCK_RELIEF=0 にすると復活する。
+#   死にコードではないので env 条件ごとそのまま移した。
+#
+# legacy_save 層の適用スコープ: 旧構成では ranking_bootstrap 経由で
+# install されたプロセスだけが対象だった。enable_legacy_save_layer() を
+# ranking_bootstrap から呼ぶことで同じスコープを再現する。
+# relief 層は DB/TRADING/HELPER のほぼ全 context に入っていたので常時有効。
+# ============================================================
+
+_RWR_VERSION = "V5-RANKING-WRITER-PRESERVE-QUEUED-ROWS"
+_RLS_LAYER_ENABLED = False
+
+
+def enable_legacy_save_layer() -> bool:
+    """旧 ranking_legacy_save_patch.install() 相当。ranking_bootstrap から呼ぶ。"""
+    global _RLS_LAYER_ENABLED
+    if not _rls_env_bool("RANKING_LEGACY_SAVE_ENABLED", True):
+        logger.warning("[RANKING LEGACY SAVE PATCH] skipped by RANKING_LEGACY_SAVE_ENABLED=0")
+        return False
+    _RLS_LAYER_ENABLED = True
+    logger.warning(
+        "[RANKING LEGACY SAVE PATCH] installed V1.1: legacy rows are built from raw_rows or snapshot_rows and saved to market + ALL tables"
+    )
+    return True
+
+
+def _rls_env_bool(name: str, default: bool = True) -> bool:
+    v = os.environ.get(name)
+    if v is None or str(v).strip() == "":
+        return bool(default)
+    return str(v).strip().lower() in {"1", "true", "yes", "on", "y", "enable", "enabled"}
+
+
+def _rls_as_dict_rows(rows: Any) -> list[dict]:
+    out: list[dict] = []
+    for r in rows or []:
+        if isinstance(r, dict):
+            out.append(dict(r))
+        else:
+            try:
+                out.append(dict(r))
+            except Exception:
+                pass
+    return out
+
+
+def _rls_get_row_value(row: dict, *keys: str) -> Any:
+    for k in keys:
+        try:
+            v = row.get(k)
+            if v not in (None, ""):
+                return v
+        except Exception:
+            pass
+    return None
+
+
+def _rls_normalize_type(value: Any) -> str:
+    v = str(value or "").strip()
+    if not v:
+        return "UNKNOWN"
+
+    try:
+        type_map = globals().get("TYPE_TO_TABLE", {}) or {}
+        if v.isdigit():
+            return str(type_map.get(int(v), v))
+        try:
+            f = float(v)
+            if f.is_integer():
+                return str(type_map.get(int(f), v))
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return v
+
+
+def _rls_normalize_market(value: Any) -> str:
+    v = str(value or "ALL").strip() or "ALL"
+    try:
+        divisions = globals().get("EXCHANGE_DIVISIONS", {}) or {}
+        if v in divisions:
+            return v
+        reverse = {str(name): str(code) for code, name in divisions.items()}
+        if v in reverse:
+            return reverse[v]
+    except Exception:
+        pass
+    return v
+
+
+def _rls_minute_str(value: Any = None) -> str:
+    if value is None or value == "":
+        return dt.datetime.now().replace(second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, dt.datetime):
+        return value.replace(second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        s = str(value).strip().replace("T", " ")
+        if "+" in s:
+            s = s.split("+", 1)[0].strip()
+        if s.endswith("Z"):
+            s = s[:-1].strip()
+        if "." in s:
+            s = s.split(".", 1)[0]
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y/%m/%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y/%m/%d %H:%M",
+            "%Y%m%d %H:%M:%S",
+            "%Y%m%d %H:%M",
+            "%Y-%m-%d",
+            "%Y/%m/%d",
+            "%Y%m%d",
+        ):
+            try:
+                return dt.datetime.strptime(s, fmt).replace(second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pass
+        return dt.datetime.fromisoformat(s).replace(second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return dt.datetime.now().replace(second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _rls_build_legacy_rows(rows: list[dict], *, now_dt: Any, source: str) -> list[dict]:
+    """
+    writer 本体の raw/snapshot 保存には触らず、legacy_buffer 用の行だけを作る。
+    市場別行は market別と ALL の両方へ入れる。
+    """
+    out: list[dict] = []
+    batch_id = uuid.uuid4().hex
+    queued_at = dt.datetime.now().isoformat(timespec="seconds")
+    target_minute = _rls_minute_str(now_dt) if now_dt is not None else None
+
+    for src in rows:
+        try:
+            base = dict(src)
+            rt_value = _rls_get_row_value(base, "ranking_type", "rank_type", "category", "type", "Type", "ランキング種別")
+            mk_value = _rls_get_row_value(base, "market", "exchange", "Market", "市場")
+
+            ranking_type = _rls_normalize_type(rt_value)
+            market = _rls_normalize_market(mk_value)
+
+            base["ranking_type"] = ranking_type
+            base["rank_type"] = ranking_type
+            base["category"] = ranking_type
+            base["market"] = market
+            base["exchange"] = market
+            base.setdefault("_ranking_writer_source", source)
+            base.setdefault("_ranking_writer_batch_id", batch_id)
+            base.setdefault("_ranking_writer_queued_at", queued_at)
+            if target_minute is not None:
+                base.setdefault("datetime", target_minute)
+                base.setdefault("snapshot_time", target_minute)
+                base.setdefault("inserted_at", target_minute)
+
+            out.append(base)
+
+            # TP/TS/TG など市場別データも、ランキング種別_ALL に同時保存する。
+            if market != "ALL":
+                all_row = dict(base)
+                all_row["market"] = "ALL"
+                all_row["exchange"] = "ALL"
+                out.append(all_row)
+        except Exception:
+            logger.debug("[RANKING LEGACY SAVE PATCH] build legacy row skipped row=%r", src, exc_info=True)
+    return out
+
+
+def _rwr_env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(str(v).replace(",", "")))
+    except Exception:
+        return int(default)
+
+
+def _rwr_env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _rwr_trim_list(values: Any, limit: int) -> list:
+    try:
+        xs = list(values or [])
+        if limit <= 0:
+            return xs
+        if len(xs) <= limit:
+            return xs
+        return xs[-limit:]
+    except Exception:
+        return []
+
+
+def _rwr_set_default_or_cap(name: str, value: str) -> None:
+    try:
+        cur = os.getenv(name)
+        if cur is None or str(cur).strip() == "":
+            os.environ[name] = value
+            return
+        if int(float(str(cur).replace(",", ""))) > int(float(value)):
+            os.environ[name] = value
+    except Exception:
+        os.environ[name] = value
+
+
+def _rwr_set_default_or_floor(name: str, value: str) -> None:
+    try:
+        cur = os.getenv(name)
+        if cur is None or str(cur).strip() == "":
+            os.environ[name] = value
+            return
+        if float(str(cur).replace(",", "")) < float(value):
+            os.environ[name] = value
+    except Exception:
+        os.environ[name] = value
+
+
+def _rwr_set_default_preserve_nonempty(name: str, value: str) -> None:
+    try:
+        cur = os.getenv(name)
+        if cur is None or str(cur).strip() == "":
+            os.environ[name] = value
+    except Exception:
+        os.environ[name] = value
+
+
+def _rwr_buffer_lengths(writer) -> dict[str, int]:
+    return {
+        "raw": len(getattr(writer, "raw_buffer", []) or []),
+        "snapshot": len(getattr(writer, "snapshot_buffer", []) or []),
+        "legacy": len(getattr(writer, "legacy_buffer", []) or []),
+    }
+
+
+def _rwr_trim_buffers(writer, *, reason: str, allow_primary_trim: bool = False) -> dict[str, int]:
+    """Trim retry buffers only when it is safe.
+
+    Important: never erase newly queued raw/snapshot rows before the writer has
+    had a chance to flush them.  V4 did this via reason=after_add with limits=0.
+    """
+    keep_locked = _rwr_env_bool("RANKING_WRITER_KEEP_LOCKED_RETRY_ROWS", True)
+    raw_limit = _rwr_env_int("RANKING_WRITER_RETRY_RAW_MAX_ROWS", 300 if keep_locked else 0)
+    snapshot_limit = _rwr_env_int("RANKING_WRITER_RETRY_SNAPSHOT_MAX_ROWS", 300 if keep_locked else 0)
+    keep_legacy = _rwr_env_bool("RANKING_WRITER_RETRY_KEEP_LEGACY", False)
+    legacy_limit = _rwr_env_int("RANKING_WRITER_RETRY_LEGACY_MAX_ROWS", 0 if not keep_legacy else 300)
+
+    with writer.lock:
+        before = _rwr_buffer_lengths(writer)
+        if allow_primary_trim:
+            writer.raw_buffer = _rwr_trim_list(getattr(writer, "raw_buffer", []), raw_limit)
+            writer.snapshot_buffer = _rwr_trim_list(getattr(writer, "snapshot_buffer", []), snapshot_limit)
+        writer.legacy_buffer = _rwr_trim_list(getattr(writer, "legacy_buffer", []), legacy_limit)
+        after = _rwr_buffer_lengths(writer)
+        try:
+            writer._mark_runtime()
+        except Exception:
+            pass
+    if before != after:
+        logger.warning(
+            "[RANKING WRITER RELIEF] trimmed buffers reason=%s before=%s after=%s limits={raw:%s,snapshot:%s,legacy:%s} keep_locked=%s allow_primary_trim=%s",
+            reason, before, after, raw_limit, snapshot_limit, legacy_limit, keep_locked, allow_primary_trim,
+        )
+    return after
+
+
+def _rwr_drop_legacy_before_flush(writer) -> int:
+    if _rwr_env_bool("RANKING_WRITER_RETRY_KEEP_LEGACY", False):
+        return 0
+    with writer.lock:
+        legacy_n = len(getattr(writer, "legacy_buffer", []) or [])
+        if legacy_n:
+            writer.legacy_buffer = []
+            try:
+                writer.enable_legacy_save = False
+            except Exception:
+                pass
+            try:
+                writer._mark_runtime()
+            except Exception:
+                pass
+    if legacy_n:
+        logger.warning("[RANKING WRITER RELIEF] dropped legacy before primary flush legacy=%d reason=avoid_original_writer_delete_lock", legacy_n)
+    return legacy_n
+
+
+def _rwr_add_ranking_rows(self, *args, **kwargs):
+    """1層目 (内側): lock/buffer relief。"""
+    if _rwr_env_bool("RANKING_WRITER_DISABLE_LEGACY_ON_LOCK_RELIEF", True):
+        kwargs["save_legacy"] = False
+        try:
+            self.enable_legacy_save = False
+        except Exception:
+            pass
+    before = _rwr_buffer_lengths(self)
+    ret = self._add_ranking_rows_core(*args, **kwargs)
+    after = _rwr_buffer_lengths(self)
+    logger.info(
+        "[RANKING WRITER RELIEF] add preserved primary buffers before=%s after=%s reason=before_flush_no_trim version=%s",
+        before, after, _RWR_VERSION,
+    )
+    _rwr_trim_buffers(self, reason="after_add_legacy_only", allow_primary_trim=False)
+    return ret
+
+
+def _rls_add_ranking_rows(self, *args, **kwargs):
+    """2層目 (外側): legacy/category table 保存。"""
+    if not _RLS_LAYER_ENABLED:
+        return _rwr_add_ranking_rows(self, *args, **kwargs)
+
+    raw_rows = _rls_as_dict_rows(kwargs.get("raw_rows"))
+    snapshot_rows = _rls_as_dict_rows(kwargs.get("snapshot_rows"))
+    source = str(kwargs.get("source") or "scheduler_core")
+    now_dt = kwargs.get("now_dt")
+
+    # writer本体の legacy 作成は raw_rows 限定なので止め、ここで raw/snapshot どちらからでも作る。
+    kwargs["save_legacy"] = False
+    ret = _rwr_add_ranking_rows(self, *args, **kwargs)
+
+    if not getattr(self, "enable_legacy_save", True):
+        return ret
+
+    legacy_source = raw_rows if raw_rows else snapshot_rows
+    legacy_rows = _rls_build_legacy_rows(legacy_source, now_dt=now_dt, source=source)
+    if not legacy_rows:
+        return ret
+
+    with self.lock:
+        self.legacy_buffer.extend(legacy_rows)
+        self.total_queued_legacy += len(legacy_rows)
+        legacy_buffer_len = len(self.legacy_buffer)
+        try:
+            self._mark_runtime()
+        except Exception:
+            pass
+
+    logger.warning(
+        "[RANKING LEGACY SAVE PATCH] queued legacy rows=%d source=%s from=%s buffer_legacy=%d",
+        len(legacy_rows),
+        source,
+        "raw_rows" if raw_rows else "snapshot_rows",
+        legacy_buffer_len,
+    )
+
+    try:
+        if legacy_buffer_len >= int(getattr(self, "buffer_size", 1)) and _rls_env_bool("RANKING_WRITER_FLUSH_ON_THRESHOLD", False):
+            self.flush()
+    except Exception:
+        logger.debug("[RANKING LEGACY SAVE PATCH] flush after legacy queue failed", exc_info=True)
+
+    return ret
+
+
+def _rwr_flush(self, *args, **kwargs) -> bool:
+    dropped_legacy = _rwr_drop_legacy_before_flush(self)
+    ok = bool(self._flush_core(*args, **kwargs))
+    if not ok:
+        _rwr_trim_buffers(self, reason="flush_failed_retry_window", allow_primary_trim=True)
+    else:
+        _rwr_trim_buffers(self, reason="flush_ok_legacy_cleanup", allow_primary_trim=False)
+    if dropped_legacy:
+        logger.warning("[RANKING WRITER RELIEF] primary flush result after legacy split ok=%s dropped_legacy=%d", ok, dropped_legacy)
+    return ok
+
+
+RankingDBWriter.add_ranking_rows = _rls_add_ranking_rows
+RankingDBWriter.flush = _rwr_flush
+
+
+def add_ranking_rows_async(*args: Any, **kwargs: Any):
+    # class method 側で legacy を作るため、ここでは単に呼び出しを通す。
+    if _RLS_LAYER_ENABLED:
+        kwargs["save_legacy"] = False
+    return _add_ranking_rows_async_core(*args, **kwargs)
+
+
+def _rwr_apply_env_defaults() -> None:
+    """旧 relief install() の env 既定値と singleton チューニングを再現する。"""
+    try:
+        os.environ.setdefault("RANKING_WRITER_KEEP_LOCKED_RETRY_ROWS", "1")
+        _rwr_set_default_preserve_nonempty("RANKING_WRITER_RETRY_RAW_MAX_ROWS", "300")
+        _rwr_set_default_preserve_nonempty("RANKING_WRITER_RETRY_SNAPSHOT_MAX_ROWS", "300")
+        os.environ.setdefault("RANKING_WRITER_RETRY_KEEP_LEGACY", "0")
+        _rwr_set_default_or_cap("RANKING_WRITER_RETRY_LEGACY_MAX_ROWS", "0")
+        os.environ.setdefault("RANKING_WRITER_DISABLE_LEGACY_ON_LOCK_RELIEF", "1")
+        os.environ.setdefault("RANKING_WRITER_BUFFER_SIZE", "1000")
+        os.environ.setdefault("RANKING_WRITER_FLUSH_ON_THRESHOLD", "0")
+        _rwr_set_default_or_floor("RANKING_WRITER_BUSY_TIMEOUT_MS", "30000")
+        _rwr_set_default_or_floor("RANKING_WRITER_LOCK_RETRY_MAX", "6")
+        _rwr_set_default_or_floor("RANKING_WRITER_LOCK_RETRY_BASE_SEC", "1.0")
+        _rwr_set_default_or_floor("RANKING_WRITER_LOCK_RETRY_MAX_SLEEP_SEC", "5.0")
+        # Backward-compatible alias for older code/logs only.
+        os.environ.setdefault("RANKING_DB_WRITER_BUSY_TIMEOUT_MS", os.environ.get("RANKING_WRITER_BUSY_TIMEOUT_MS", "30000"))
+    except Exception:
+        logger.exception("[RANKING WRITER RELIEF] env defaults failed")
+
+    try:
+        w = ranking_writer
+        w.enable_legacy_save = False
+        w.buffer_size = max(int(getattr(w, "buffer_size", 1) or 1), _rwr_env_int("RANKING_WRITER_BUFFER_SIZE", 1000))
+        try:
+            w.busy_timeout_ms = max(int(getattr(w, "busy_timeout_ms", 0) or 0), _rwr_env_int("RANKING_WRITER_BUSY_TIMEOUT_MS", 30000))
+        except Exception:
+            pass
+        _rwr_drop_legacy_before_flush(w)
+        _rwr_trim_buffers(w, reason="install_legacy_only", allow_primary_trim=False)
+    except Exception:
+        logger.debug("[RANKING WRITER RELIEF] singleton tune skipped", exc_info=True)
+
+
+_rwr_apply_env_defaults()

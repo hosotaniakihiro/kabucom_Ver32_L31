@@ -34,8 +34,11 @@ def _should_skip_ranking_writer_start_in_main() -> bool:
 
 def _install_ranking_legacy_save_patch() -> bool:
     try:
-        from core.startup.ranking_legacy_save_patch import install
-        return bool(install())
+        # ranking_legacy_save_patch は trading/ranking/ranking_db_writer.py へ
+        # 本文化済み (_rls_*)。install スコープはここから
+        # enable_legacy_save_layer() を呼ぶことで再現している。
+        from trading.ranking.ranking_db_writer import enable_legacy_save_layer
+        return bool(enable_legacy_save_layer())
     except Exception as e:
         logger.exception("[startup.scheduler_startup] ranking legacy save patch install failed")
         try:

@@ -501,10 +501,10 @@ def _install_ranking_legacy_inline_flush(context: str) -> bool:
         os.environ.setdefault("RANKING_DB_WRITER_BUSY_TIMEOUT_MS", "30000")
     except Exception:
         logger.exception("[RUNTIME ENV DEFAULTS PATCH] ranking legacy inline flush env failed")
-    return _safe_install(
-        "ranking writer lock buffer relief", context, _RANKING_LEGACY_FLUSH_CONTEXTS,
-        "DISABLE_RANKING_LEGACY_INLINE_FLUSH_PATCH", "ranking_writer_lock_buffer_relief_patch",
-    )
+    # ranking_writer_lock_buffer_relief_patch は trading/ranking/ranking_db_writer.py へ
+    # 本文化済み (_rwr_*)。env 既定値と singleton チューニングは同モジュールの
+    # _rwr_apply_env_defaults() が import 時に行うため、ここでの install は不要。
+    return True
 
 
 def install() -> bool:
