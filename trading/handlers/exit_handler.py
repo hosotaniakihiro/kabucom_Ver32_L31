@@ -459,7 +459,7 @@ def build_5s_bar_fast(symbol):
 # ============================================================
 # TONOSAMA EXIT 判定（唯一）
 # ============================================================
-def check_tonosama_exit(pos: Position, price: float, now: dt.datetime):
+def _check_tonosama_exit_core(pos: Position, price: float, now: dt.datetime):
     accel = calc_exit_accel_for_tonosama(pos, price, now)
 
     entry_price = _position_entry_price(pos)
@@ -515,7 +515,7 @@ def check_tonosama_exit(pos: Position, price: float, now: dt.datetime):
 # ============================================================
 # 通常 EXIT 判定
 # ============================================================
-def check_normal_exit(pos: Any, price: float, now: dt.datetime):
+def _check_normal_exit_core(pos: Any, price: float, now: dt.datetime):
     entry_price = _position_entry_price(pos)
     if entry_price <= 0 or price <= 0:
         return None
@@ -781,3 +781,315 @@ def run_exit_pipeline():
         logger.error("❌ EXIT pipeline error %s", e, exc_info=True)
     finally:
         sp.close()
+
+
+# ============================================================
+# check_normal_exit / check_tonosama_exit の利確保護レイヤ
+# ------------------------------------------------------------
+# 旧 core/startup の2パッチを本文化。実行時の合成は (実 install 順で実測)
+#   check_normal_exit  : native <- normal_exit_scalp_align <- exit_profit_protect
+#   check_tonosama_exit: native <- exit_profit_protect
+# の順だった。同じ順序で重ねている。
+#
+# 3つ目の board_wall_stall_exit_patch も同じ2関数を包むが、
+# `AUTOSTOCK_TEMP_DISABLE_EXIT` (既定 True) による早期 return で
+# **既定では install されない**運用上の一時停止スイッチ配下にある。
+# 同パッチはそのまま残してあるので、スイッチを解除すれば従来どおり
+# この本文の外側に乗る。
+#
+# normal_exit_scalp_align が上書きしていた NORMAL_* 定数5件は、
+# 呼び出し元 (runtime_env/defaults_patch) で env 経由に移してある。
+# ============================================================
+
+_NES_VERSION = "V1-NORMAL-EXIT-PROFIT-FLOOR"
+_EPP_VERSION = "V1-EXIT-PROFIT-PROTECT"
+_CNE_SCOPE = None
+
+def _nes_env_float(name: str, default: float) -> float:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _nes_get(obj: Any, name: str, default=None):
+    try:
+        if isinstance(obj, dict):
+            return obj.get(name, default)
+        return getattr(obj, name, default)
+    except Exception:
+        return default
+
+
+def _nes_set(obj: Any, name: str, value: Any) -> None:
+    try:
+        if isinstance(obj, dict):
+            obj[name] = value
+        else:
+            setattr(obj, name, value)
+    except Exception:
+        pass
+
+
+def _nes_safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or v == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _nes_entry_price(pos: Any) -> float:
+    return _nes_safe_float(
+        _nes_get(pos, "avg_price")
+        or _nes_get(pos, "entry_price")
+        or _nes_get(pos, "price")
+        or _nes_get(pos, "current_price"),
+        0.0,
+    )
+
+
+def _nes_pnl_rate(pos: Any, price: float) -> float:
+    entry = _nes_entry_price(pos)
+    if entry <= 0 or price <= 0:
+        return 0.0
+    rate = (float(price) - entry) / entry
+    if _is_sell_side(pos):
+        rate = -rate
+    return rate
+
+
+def _epp_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "ok"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "ng"}:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
+
+
+def _epp_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _epp_get(obj: Any, name: str, default=None):
+    try:
+        if isinstance(obj, dict):
+            return obj.get(name, default)
+        return getattr(obj, name, default)
+    except Exception:
+        return default
+
+
+def _epp_set(obj: Any, name: str, value: Any) -> None:
+    try:
+        if isinstance(obj, dict):
+            obj[name] = value
+        else:
+            setattr(obj, name, value)
+    except Exception:
+        pass
+
+
+def _epp_safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _epp_symbol(pos: Any) -> str:
+    try:
+        return str(_epp_get(pos, "symbol") or _epp_get(pos, "Symbol") or _epp_get(pos, "stock_code") or "").strip()
+    except Exception:
+        return ""
+
+
+def _epp_side(pos: Any) -> str:
+    try:
+        return str(_epp_get(pos, "side") or _epp_get(pos, "Side") or "BUY").upper()
+    except Exception:
+        return "BUY"
+
+
+def _epp_entry_price(pos: Any) -> float:
+    return _epp_safe_float(
+        _epp_get(pos, "avg_price")
+        or _epp_get(pos, "entry_price")
+        or _epp_get(pos, "price")
+        or _epp_get(pos, "current_price"),
+        0.0,
+    )
+
+
+def _epp_entry_time(pos: Any) -> dt.datetime:
+    v = _epp_get(pos, "entry_time")
+    if isinstance(v, dt.datetime):
+        return v
+    try:
+        if v:
+            return dt.datetime.fromisoformat(str(v))
+    except Exception:
+        pass
+    return dt.datetime.now()
+
+
+def _epp_pnl_rate(pos: Any, price: float) -> float:
+    entry = _epp_entry_price(pos)
+    if entry <= 0 or price <= 0:
+        return 0.0
+    r = (price - entry) / entry
+    side = _epp_side(pos)
+    if side.startswith("SELL") or side.startswith("SHORT"):
+        r = -r
+    return r
+
+
+def _epp_update_max_profit(pos: Any, pnl_rate: float) -> float:
+    max_profit = _epp_safe_float(_epp_get(pos, "max_profit_rate"), 0.0)
+    max_profit = max(max_profit, pnl_rate)
+    _epp_set(pos, "max_profit_rate", max_profit)
+    return max_profit
+
+
+def _epp_profit_protect_reason(pos: Any, price: float, now: dt.datetime, *, label: str) -> str | None:
+    if not _epp_env_bool("EXIT_PROFIT_PROTECT_ENABLED", True):
+        return None
+
+    entry = _epp_entry_price(pos)
+    if entry <= 0 or price <= 0:
+        return None
+
+    hold_sec = (now - _epp_entry_time(pos)).total_seconds()
+    min_hold = _epp_env_float("EXIT_PROFIT_MIN_HOLD_SEC", 0.0)
+    if hold_sec < min_hold:
+        return None
+
+    pnl = _epp_pnl_rate(pos, price)
+    max_profit = _epp_update_max_profit(pos, pnl)
+
+    take_pct = _epp_env_float("EXIT_PROFIT_TAKE_PCT", 0.0030)
+    start_pct = _epp_env_float("EXIT_PROFIT_PROTECT_START_PCT", 0.0020)
+    floor_pct = _epp_env_float("EXIT_PROFIT_PROTECT_FLOOR_PCT", 0.0010)
+    giveback_pct = _epp_env_float("EXIT_PROFIT_GIVEBACK_PCT", 0.0010)
+
+    symbol = _epp_symbol(pos)
+    side = _epp_side(pos)
+
+    # 1) +0.30% 到達なら即利確
+    if pnl >= take_pct:
+        logger.warning(
+            "[EXIT PROFIT PROTECT] TAKE symbol=%s side=%s label=%s price=%.4f entry=%.4f pnl=%.4f max=%.4f take=%.4f hold=%.1fs",
+            symbol, side, label, price, entry, pnl, max_profit, take_pct, hold_sec,
+        )
+        return "PROFIT_TAKE_FAST"
+
+    # 2) 一度 +0.20% 以上乗ったら、+0.10%まで落ちた時点で逃げる
+    if max_profit >= start_pct and pnl <= floor_pct:
+        logger.warning(
+            "[EXIT PROFIT PROTECT] FLOOR symbol=%s side=%s label=%s price=%.4f entry=%.4f pnl=%.4f max=%.4f start=%.4f floor=%.4f hold=%.1fs",
+            symbol, side, label, price, entry, pnl, max_profit, start_pct, floor_pct, hold_sec,
+        )
+        return "PROFIT_PROTECT_FLOOR"
+
+    # 3) 高値利益から -0.10% 戻したら逃げる
+    if max_profit >= start_pct and (max_profit - pnl) >= giveback_pct:
+        logger.warning(
+            "[EXIT PROFIT PROTECT] GIVEBACK symbol=%s side=%s label=%s price=%.4f entry=%.4f pnl=%.4f max=%.4f giveback=%.4f hold=%.1fs",
+            symbol, side, label, price, entry, pnl, max_profit, giveback_pct, hold_sec,
+        )
+        return "PROFIT_PROTECT_GIVEBACK"
+
+    logger.debug(
+        "[EXIT PROFIT PROTECT] HOLD symbol=%s side=%s label=%s pnl=%.4f max=%.4f price=%.4f entry=%.4f hold=%.1fs",
+        symbol, side, label, pnl, max_profit, price, entry, hold_sec,
+    )
+    return None
+
+
+def _cne_scope_enabled() -> bool:
+    global _CNE_SCOPE
+    if _CNE_SCOPE is not None:
+        return _CNE_SCOPE
+    enabled = False
+    try:
+        import sys as _sys
+
+        argv_text = " ".join(str(x) for x in _sys.argv).replace("\\", "/").lower()
+        db_names = (
+            "main_database.py", "data_collectors_runner.py", "db_prepare_runner.py",
+            "push_receiver_runner.py", "yahoo_complement_runner.py",
+            "summary_database_runner.py", "ranking_collector_runner.py",
+        )
+        if not any(n in argv_text for n in db_names):
+            enabled = "main.py" in argv_text
+    except Exception:
+        enabled = False
+    _CNE_SCOPE = enabled
+    return enabled
+
+
+def _check_normal_exit_scalp_align(pos: Any, price: float, now: dt.datetime):
+    """旧 normal_exit_scalp_align_patch._patched_check_normal_exit。"""
+    try:
+        pnl_rate = _nes_pnl_rate(pos, float(price or 0.0))
+        max_profit_rate = max(_nes_safe_float(_nes_get(pos, "max_profit_rate"), 0.0), pnl_rate)
+        _nes_set(pos, "max_profit_rate", max_profit_rate)
+
+        breakeven_trigger = abs(_nes_env_float("NORMAL_PROFIT_FLOOR_BREAKEVEN_TRIGGER_PCT", 0.0020))
+        breakeven_floor = _nes_env_float("NORMAL_PROFIT_FLOOR_BREAKEVEN_PCT", 0.0005)
+        floor1_trigger = abs(_nes_env_float("NORMAL_PROFIT_FLOOR_1_TRIGGER_PCT", 0.0040))
+        floor1_rate = _nes_env_float("NORMAL_PROFIT_FLOOR_1_PCT", 0.0010)
+        floor2_trigger = abs(_nes_env_float("NORMAL_PROFIT_FLOOR_2_TRIGGER_PCT", 0.0060))
+        floor2_rate = _nes_env_float("NORMAL_PROFIT_FLOOR_2_PCT", 0.0025)
+
+        if max_profit_rate >= floor2_trigger and pnl_rate <= floor2_rate:
+            return "NORMAL_PROFIT_FLOOR_025"
+        if max_profit_rate >= floor1_trigger and pnl_rate <= floor1_rate:
+            return "NORMAL_PROFIT_FLOOR_010"
+        if max_profit_rate >= breakeven_trigger and pnl_rate <= breakeven_floor:
+            return "NORMAL_BREAKEVEN_STOP"
+    except Exception:
+        logger.exception("[NORMAL EXIT PROFIT FLOOR] precheck failed; fallback original")
+
+    try:
+        return _check_normal_exit_core(pos, price, now)
+    except Exception:
+        logger.exception("[NORMAL EXIT PROFIT FLOOR] original check failed")
+    return None
+
+
+def check_normal_exit(pos: Any, price: float, now: dt.datetime):
+    if not _cne_scope_enabled():
+        return _check_normal_exit_core(pos, price, now)
+    reason = _epp_profit_protect_reason(pos, price, now, label="NORMAL")
+    if reason:
+        return reason
+    return _check_normal_exit_scalp_align(pos, price, now)
+
+
+def check_tonosama_exit(pos, price: float, now: dt.datetime):
+    if not _cne_scope_enabled():
+        return _check_tonosama_exit_core(pos, price, now)
+    reason = _epp_profit_protect_reason(pos, price, now, label="TONOSAMA")
+    if reason:
+        return reason
+    return _check_tonosama_exit_core(pos, price, now)

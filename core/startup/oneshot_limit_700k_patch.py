@@ -335,20 +335,12 @@ def _install_entry_direction_failopen_patch() -> bool:
 
 
 def _install_exit_profit_protect_patch() -> bool:
-    try:
-        os.environ.setdefault("EXIT_PROFIT_PROTECT_ENABLED", "1")
-        os.environ.setdefault("EXIT_PROFIT_TAKE_PCT", "0.0030")
-        os.environ.setdefault("EXIT_PROFIT_PROTECT_START_PCT", "0.0020")
-        os.environ.setdefault("EXIT_PROFIT_PROTECT_FLOOR_PCT", "0.0010")
-        os.environ.setdefault("EXIT_PROFIT_GIVEBACK_PCT", "0.0010")
-        os.environ.setdefault("EXIT_PROFIT_MIN_HOLD_SEC", "0")
-        from core.startup import exit_profit_protect_runtime_patch as p
-        ok = p.install()
-        logger.warning("[ONESHOT LIMIT PATCH] exit_profit_protect_patch installed=%s", ok)
-        return bool(ok)
-    except Exception:
-        logger.exception("[ONESHOT LIMIT PATCH] exit_profit_protect_patch install failed")
-        return False
+    """exit_profit_protect_runtime_patch は
+    trading/handlers/exit_handler.py へ本文化済み
+    (check_normal_exit / check_tonosama_exit の利確保護レイヤ。
+     順序は native <- normal_exit_scalp_align <- exit_profit_protect)。
+    """
+    return True
 
 
 def _install_exit_board_profit_patch() -> bool:

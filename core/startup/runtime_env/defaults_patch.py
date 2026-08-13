@@ -378,7 +378,43 @@ def _install_tonosama_exit_source_infer(context: str) -> bool:
 
 
 def _install_normal_exit_scalp_align(context: str) -> bool:
-    return _safe_install("normal exit scalp align", context, TRADING_CONTEXTS, "DISABLE_NORMAL_EXIT_SCALP_ALIGN_PATCH", "normal_exit_scalp_align_patch")
+    """normal exit の scalp 整合。
+
+    normal_exit_scalp_align_patch / exit_profit_protect_runtime_patch の
+    check_normal_exit / check_tonosama_exit ラップは
+    trading/handlers/exit_handler.py へ本文化済み
+    (native <- normal_exit_scalp_align <- exit_profit_protect の順序を保持)。
+    ここに残しているのは、旧 install() が exit_handler の NORMAL_* 定数を
+    上書きしていた分。設定タイミングを変えないため同じ位置で行う。
+    """
+    try:
+        if context not in TRADING_CONTEXTS:
+            return False
+        if os.environ.get("DISABLE_NORMAL_EXIT_SCALP_ALIGN_PATCH", "").strip() == "1":
+            return False
+        import trading.handlers.exit_handler as eh
+
+        def _f(name: str, default: float) -> float:
+            try:
+                v = os.getenv(name)
+                return float(default) if v is None or str(v).strip() == "" else float(v)
+            except Exception:
+                return float(default)
+
+        eh.NORMAL_STOP_LOSS = -abs(_f("NORMAL_EXIT_STOP_LOSS_PCT", 0.0030))
+        eh.NORMAL_TAKE_PROFIT = abs(_f("NORMAL_EXIT_TAKE_PROFIT_PCT", 0.0080))
+        eh.NORMAL_TRAIL_START = abs(_f("NORMAL_EXIT_TRAIL_START_PCT", 0.0060))
+        eh.NORMAL_TRAIL_GAP = abs(_f("NORMAL_EXIT_TRAIL_GAP_PCT", 0.0030))
+        eh.NORMAL_MAX_HOLD_SEC = int(_f("NORMAL_EXIT_MAX_HOLD_SEC", 300.0))
+        logger.warning(
+            "[NORMAL EXIT PROFIT FLOOR] constants applied stop=%.4f take=%.4f trail_start=%.4f trail_gap=%.4f max_hold=%s",
+            eh.NORMAL_STOP_LOSS, eh.NORMAL_TAKE_PROFIT, eh.NORMAL_TRAIL_START,
+            eh.NORMAL_TRAIL_GAP, eh.NORMAL_MAX_HOLD_SEC,
+        )
+        return True
+    except Exception:
+        logger.exception("[RUNTIME ENV DEFAULTS PATCH] normal exit constants failed")
+        return False
 
 
 def _install_tonosama_pending_candidate_audit(context: str) -> bool:
