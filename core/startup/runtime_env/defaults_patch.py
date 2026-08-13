@@ -315,7 +315,34 @@ def _install_common_day_position_guard(context: str) -> bool:
 
 
 def _install_strict_final_liquidity_guard(context: str) -> bool:
-    return _safe_install("strict final liquidity guard", context, TRADING_CONTEXTS, "DISABLE_ENTRY_HANDLER_STRICT_RECENT_LIQ_PATCH", "entry_handler_strict_recent_liquidity_patch")
+    """strict final liquidity guard。
+
+    entry_handler_strict_recent_liquidity_patch は削除した。同patch の wrapper は
+    pending_fallback が `getattr(cur, "_original", cur)` で素の実装まで掘り返すため
+    実運用で捨てられており実効ゼロだった (実測)。
+    ただし install() 冒頭の env 既定値は **load-bearing** なのでここへ移した。
+    特に ENTRY_HANDLER_RECENT_LIQ_MIN_LATEST_VOLUME=3000 は、読み手である
+    pending fallback 側の既定が 1.0 のため、消すとしきい値が 3000 -> 1 に落ちる。
+    ガード本体と2層 (pending_fallback / memory) は
+    trading/handlers/entry_handler.py へ本文化済み。
+    """
+    try:
+        if context not in TRADING_CONTEXTS:
+            return False
+        if os.environ.get("DISABLE_ENTRY_HANDLER_STRICT_RECENT_LIQ_PATCH", "").strip() == "1":
+            return False
+        os.environ.setdefault("ENTRY_HANDLER_RECENT_LIQ_GUARD_ENABLED", "1")
+        os.environ.setdefault("ENTRY_HANDLER_RECENT_LIQ_REQUIRE_DATA", "1")
+        os.environ.setdefault("ENTRY_HANDLER_RECENT_LIQ_BARS", "5")
+        os.environ.setdefault("ENTRY_HANDLER_RECENT_LIQ_MIN_LATEST_VOLUME", "3000")
+        os.environ.setdefault("ENTRY_HANDLER_STRICT_MIN_LATEST_VOLUME", "3000")
+        os.environ.setdefault("ENTRY_HANDLER_STRICT_MIN_AVG_VOLUME", "3000")
+        os.environ.setdefault("ENTRY_HANDLER_STRICT_MIN_TURNOVER_YEN", "1000000")
+        os.environ.setdefault("ENTRY_HANDLER_STRICT_MAX_AGE_SEC", "180")
+        return True
+    except Exception:
+        logger.exception("[RUNTIME ENV DEFAULTS PATCH] strict final liquidity env defaults failed")
+        return False
 
 
 def _install_strict_final_liq_pushdb_fallback(context: str) -> bool:
@@ -333,7 +360,9 @@ def _install_strict_final_liq_pushdb_fallback(context: str) -> bool:
     上の _install_strict_final_liq_guard と二重になるが、install() は
     _INSTALLED ガードで冪等。片方だけ env で無効化された場合の挙動も従来どおり。
     """
-    return _safe_install("strict final liquidity guard (via pushdb fallback route)", context, TRADING_CONTEXTS, "DISABLE_ENTRY_HANDLER_STRICT_RECENT_LIQ_PUSHDB_FALLBACK_PATCH", "entry_handler_strict_recent_liquidity_patch")
+    # 旧 pushdb fallback 経路。strict patch は削除済みで、env 既定値は
+    # 上の _install_strict_final_liq_guard() が設定する。
+    return context in TRADING_CONTEXTS
 
 
 def _install_tonosama_exit_source_infer(context: str) -> bool:

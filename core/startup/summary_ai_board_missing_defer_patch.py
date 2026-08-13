@@ -148,25 +148,17 @@ def _apply_full_rotation_retry() -> bool:
 
 
 def _install_pending_liq_patch() -> bool:
-    try:
-        from core.startup.entry_handler_recent_liq_pending_fallback_patch import install as _install
-        ok = bool(_install())
-        logger.warning("[SUMMARY AI BOARD MISSING DEFER] chained pending_liq_fallback ok=%s version=%s", ok, VERSION)
-        return ok
-    except Exception:
-        logger.exception("[SUMMARY AI BOARD MISSING DEFER] chained pending_liq_fallback failed version=%s", VERSION)
-        return False
+    """entry_handler_recent_liq_pending_fallback_patch は
+    trading/handlers/entry_handler._final_recent_liquidity_ok へ本文化済み。
+    """
+    return True
 
 
 def _install_memory_liq_patch() -> bool:
-    try:
-        from core.startup.entry_handler_strict_recent_liquidity_memory_patch import install as _install
-        ok = bool(_install())
-        logger.warning("[SUMMARY AI BOARD MISSING DEFER] chained memory_liq_fallback ok=%s version=%s", ok, VERSION)
-        return ok
-    except Exception:
-        logger.exception("[SUMMARY AI BOARD MISSING DEFER] chained memory_liq_fallback failed version=%s", VERSION)
-        return False
+    """entry_handler_strict_recent_liquidity_memory_patch は
+    trading/handlers/entry_handler._final_recent_liquidity_ok へ本文化済み。
+    """
+    return True
 
 
 def _install_async_snapshot_patch() -> bool:

@@ -319,7 +319,7 @@ def _recent_liquidity_values(symbol: str, bars: int) -> dict[str, Any]:
         return {"ok_read": False, "reason": "exception", "error": str(e), "summary_db": path, "table": table}
 
 
-def _final_recent_liquidity_ok(symbol: str, side: str) -> tuple[bool, str, dict[str, Any]]:
+def _final_recent_liquidity_ok_core(symbol: str, side: str) -> tuple[bool, str, dict[str, Any]]:
     if not _env_bool("ENTRY_HANDLER_RECENT_LIQ_GUARD_ENABLED", True):
         return True, "disabled", {}
     bars = max(1, _env_int("ENTRY_HANDLER_RECENT_LIQ_BARS", 5))
@@ -495,3 +495,405 @@ def _unlock_entry(symbol: str):
 
 
 __all__ = ["place_entry_buy", "place_entry_sell", "_unlock_entry"]
+
+
+# ============================================================
+# _final_recent_liquidity_ok の2層ガード
+# ------------------------------------------------------------
+# 旧 core/startup の2パッチを本文化。実行時の合成は
+#   native <- pending_fallback <- memory
+# の2層だった (実測)。
+# 3つ目の entry_handler_strict_recent_liquidity_patch は、pending_fallback が
+# `getattr(cur, "_original", cur)` で素の実装まで掘り返すため wrapper が
+# 捨てられており実効ゼロだったので移植していない。ただし同パッチの
+# env 既定値4件は load-bearing なので呼び出し元へ移設済み
+# (特に ENTRY_HANDLER_RECENT_LIQ_MIN_LATEST_VOLUME=3000。
+#  pending_fallback 側の既定は 1.0 なので、消すとしきい値が落ちる)。
+#
+# スコープは旧 install 導線 (いずれも main.py 経由) を再現する。
+# ============================================================
+
+_PLFVERSION = "V1-ENTRY-FINAL-LIQ-PENDING-FALLBACK"
+_MLQVERSION = "V1-STRICT-RECENT-LIQ-MEMORY"
+_FRL_SCOPE = None
+
+def _plf_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return float(default)
+
+
+def _plf_norm_symbol(v: Any) -> str:
+    s = str(v or "").strip()
+    if s.endswith(".0") and s[:-2].isdigit():
+        return s[:-2]
+    return s
+
+
+def _plf_f(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or str(v).strip() == "":
+            return float(default)
+        x = float(str(v).replace(",", ""))
+        if x != x:
+            return float(default)
+        return x
+    except Exception:
+        return float(default)
+
+
+def _plf_parse_dt(v: Any) -> dt.datetime | None:
+    try:
+        if isinstance(v, dt.datetime):
+            return v.replace(tzinfo=None)
+        if v is None or str(v).strip() == "":
+            return None
+        s = str(v).strip()
+        # pandas Timestamp string / ISO-like string
+        try:
+            return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            pass
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+            try:
+                return dt.datetime.strptime(s, fmt)
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+
+def _plf_iter_pending_for_symbol(symbol: str):
+    try:
+        from global_state import global_data
+        root = getattr(global_data, "pending_entries", {}) or {}
+        sym = _plf_norm_symbol(symbol)
+        bucket = root.get(sym) or root.get(str(symbol)) or []
+        if isinstance(bucket, dict):
+            bucket = [bucket]
+        if isinstance(bucket, list):
+            for e in reversed(bucket):
+                if isinstance(e, dict):
+                    yield e
+    except Exception:
+        return
+
+
+def _plf_pending_liq_ok(symbol: str, side: str) -> tuple[bool, str, dict[str, Any]]:
+    min_latest_volume = _plf_env_float("ENTRY_HANDLER_RECENT_LIQ_MIN_LATEST_VOLUME", 1.0)
+    min_volume = _plf_env_float("ENTRY_HANDLER_RECENT_LIQ_MIN_VOLUME", _plf_env_float("SUMMARY_AI_LIQ_MIN_VOLUME", 30000.0))
+    min_turnover = _plf_env_float("ENTRY_HANDLER_RECENT_LIQ_MIN_TURNOVER_YEN", _plf_env_float("SUMMARY_AI_LIQ_MIN_TURNOVER_YEN", 1000000.0))
+    max_age = _plf_env_float("ENTRY_HANDLER_RECENT_LIQ_MAX_AGE_SEC", _plf_env_float("ENTRY_HANDLER_STRICT_LIQ_MAX_AGE_SEC", 180.0))
+    now = dt.datetime.now()
+    sym = _plf_norm_symbol(symbol)
+
+    best_detail: dict[str, Any] = {"symbol": sym, "side": side, "source": "pending_entry_row", "min_latest_volume": min_latest_volume, "min_volume": min_volume, "min_turnover": min_turnover, "max_age_sec": max_age}
+    for row in _plf_iter_pending_for_symbol(sym):
+        row_sym = _plf_norm_symbol(row.get("symbol") or sym)
+        if row_sym != sym:
+            continue
+        row_side = str(row.get("side") or row.get("entry_decision") or row.get("ai_side") or "").upper()
+        if row_side in {"BUY", "SELL"} and str(side or "").upper() in {"BUY", "SELL"} and row_side != str(side).upper():
+            continue
+        ts = None
+        for k in ("datetime", "dt", "time", "created_at", "updated_at"):
+            ts = _plf_parse_dt(row.get(k))
+            if ts is not None:
+                break
+        age = None if ts is None else max(0.0, (now - ts).total_seconds())
+        price = _plf_f(row.get("close_price") or row.get("price") or row.get("current_price") or row.get("close"), 0.0)
+        vol = _plf_f(row.get("volume") or row.get("vol") or row.get("latest_volume") or row.get("display_volume"), 0.0)
+        turnover = _plf_f(row.get("turnover") or row.get("trading_value") or row.get("turnover_yen") or row.get("display_turnover"), 0.0)
+        if turnover <= 0 and price > 0 and vol > 0:
+            turnover = price * vol
+        detail = dict(best_detail)
+        detail.update({"row_datetime": str(ts) if ts else None, "age_sec": age, "price": price, "latest_volume": vol, "volume_sum": vol, "turnover_sum": turnover, "entry_type": row.get("entry_type"), "row_source": row.get("source")})
+        if age is None:
+            best_detail = detail | {"ng": "pending_row_no_time"}
+            continue
+        if age > max_age:
+            best_detail = detail | {"ng": f"pending_row_stale:{age:.1f}>{max_age:.1f}"}
+            continue
+        if vol < min_latest_volume:
+            best_detail = detail | {"ng": f"pending_latest_volume_low:{vol:.0f}<{min_latest_volume:.0f}"}
+            continue
+        if vol < min_volume:
+            best_detail = detail | {"ng": f"pending_volume_low:{vol:.0f}<{min_volume:.0f}"}
+            continue
+        if turnover < min_turnover:
+            best_detail = detail | {"ng": f"pending_turnover_low:{turnover:.0f}<{min_turnover:.0f}"}
+            continue
+        logger.warning("[ENTRY FINAL LIQ PENDING FALLBACK] OK symbol=%s side=%s detail=%s version=%s", sym, side, detail, _PLFVERSION)
+        return True, "FINAL_LIQ_PENDING_ROW_OK", detail
+    return False, "FINAL_LIQ_PENDING_ROW_NG", best_detail
+
+
+def _mlq_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _mlq_env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
+def _mlq_f(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or v == "":
+            return float(default)
+        x = float(v)
+        if x != x:
+            return float(default)
+        return x
+    except Exception:
+        return float(default)
+
+
+def _mlq_norm_symbol(v: Any) -> str:
+    s = str(v or "").strip()
+    if s.endswith(".0") and s[:-2].isdigit():
+        return s[:-2]
+    return s
+
+
+def _mlq_parse_dt(v: Any):
+    if v is None:
+        return None
+    if isinstance(v, dt.datetime):
+        return v.replace(tzinfo=None)
+    try:
+        if hasattr(v, "to_pydatetime"):
+            x = v.to_pydatetime()
+            if isinstance(x, dt.datetime):
+                return x.replace(tzinfo=None)
+    except Exception:
+        pass
+    try:
+        s = str(v).strip()
+        if not s or s.lower() in {"nat", "none", "nan"}:
+            return None
+        return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def _mlq_memory_liquidity_values(symbol: str, bars: int) -> dict[str, Any]:
+    sym = _mlq_norm_symbol(symbol)
+    if not sym:
+        return {"ok_read": False, "reason": "symbol_missing", "source": "memory_summary"}
+    try:
+        import pandas as pd
+        from core.global_context import context as gc
+    except Exception as e:
+        return {"ok_read": False, "reason": "import_failed", "error": str(e), "source": "memory_summary"}
+
+    frames: list[tuple[str, Any]] = []
+    for src in ("push", "ranking", "legacy", "push-cache"):
+        try:
+            df = gc.get_summary_history(tf=1, source=src)
+            if df is not None and not getattr(df, "empty", True):
+                frames.append((f"history:{src}", df))
+        except Exception:
+            pass
+    for src in ("push", "ranking", "legacy", "push-cache"):
+        try:
+            df = gc.get_merged_summary(tf=1, source=src)
+            if df is not None and not getattr(df, "empty", True):
+                frames.append((f"merged:{src}", df))
+        except Exception:
+            pass
+    try:
+        df = gc.get_push_df()
+        if df is not None and not getattr(df, "empty", True):
+            frames.append(("push_df", df))
+    except Exception:
+        pass
+
+    best: dict[str, Any] | None = None
+    for source, df in frames:
+        try:
+            if "symbol" not in df.columns:
+                continue
+            x = df.copy()
+            x["_symbol_norm"] = x["symbol"].map(_mlq_norm_symbol)
+            x = x[x["_symbol_norm"] == sym].copy()
+            if x.empty:
+                continue
+            time_col = None
+            for c in ("datetime", "end_time", "start_time", "time", "created_at", "updated_at"):
+                if c in x.columns:
+                    time_col = c
+                    break
+            if time_col:
+                x["_dt"] = pd.to_datetime(x[time_col], errors="coerce").dt.tz_localize(None)
+                x = x.sort_values("_dt", ascending=True, na_position="first")
+            else:
+                x["_dt"] = pd.NaT
+            tail = x.tail(max(1, int(bars))).copy()
+            vol_col = next((c for c in ("volume", "latest_volume", "display_volume", "vol") if c in tail.columns), None)
+            price_col = next((c for c in ("close", "close_price", "price", "current_price") if c in tail.columns), None)
+            turnover_col = next((c for c in ("turnover", "trading_value", "display_turnover") if c in tail.columns), None)
+            if vol_col is None:
+                continue
+            vol = pd.to_numeric(tail[vol_col], errors="coerce").fillna(0.0)
+            price = pd.to_numeric(tail[price_col], errors="coerce").fillna(0.0) if price_col else pd.Series(0.0, index=tail.index)
+            if turnover_col:
+                turnover = pd.to_numeric(tail[turnover_col], errors="coerce").fillna(0.0)
+            else:
+                turnover = price * vol
+            if turnover.fillna(0).sum() <= 0 and price.fillna(0).gt(0).any():
+                turnover = price * vol
+            latest = tail.iloc[-1]
+            latest_dt = _mlq_parse_dt(latest.get("_dt"))
+            rows = int(len(tail))
+            out = {
+                "ok_read": True,
+                "source": source,
+                "rows": rows,
+                "latest_dt": latest_dt.isoformat(sep=" ") if latest_dt else None,
+                "latest_close": _mlq_f(latest.get(price_col) if price_col else 0.0),
+                "latest_volume": float(vol.iloc[-1]) if len(vol) else 0.0,
+                "volume_sum": float(vol.sum()),
+                "turnover_sum": float(turnover.sum()),
+            }
+            if best is None:
+                best = out
+            else:
+                bdt = _mlq_parse_dt(best.get("latest_dt"))
+                if latest_dt is not None and (bdt is None or latest_dt > bdt):
+                    best = out
+        except Exception:
+            logger.debug("[ENTRY FINAL LIQ MEMORY] source scan failed source=%s symbol=%s", source, sym, exc_info=True)
+            continue
+    if best is None:
+        return {"ok_read": False, "reason": "memory_no_rows", "source": "memory_summary"}
+    return best
+
+
+def _mlq_memory_ok(symbol: str, side: str, original_detail: Any) -> tuple[bool, str, dict[str, Any]]:
+    bars = max(1, _mlq_env_int("ENTRY_HANDLER_RECENT_LIQ_BARS", 5))
+    min_latest_volume = _mlq_env_float("ENTRY_HANDLER_STRICT_MIN_LATEST_VOLUME", _mlq_env_float("WATCHLIST_RECENT_LIQ_MIN_LATEST_VOLUME", 3000.0))
+    min_avg_volume = _mlq_env_float("ENTRY_HANDLER_STRICT_MIN_AVG_VOLUME", _mlq_env_float("WATCHLIST_RECENT_LIQ_MIN_AVG_VOLUME", 3000.0))
+    min_turnover = _mlq_env_float("ENTRY_HANDLER_STRICT_MIN_TURNOVER_YEN", _mlq_env_float("WATCHLIST_RECENT_LIQ_MIN_TURNOVER_YEN", 1000000.0))
+    max_age_sec = _mlq_env_float("ENTRY_HANDLER_STRICT_MAX_AGE_SEC", 180.0)
+    values = _mlq_memory_liquidity_values(symbol, bars)
+    latest_dt = _mlq_parse_dt(values.get("latest_dt")) if isinstance(values, dict) else None
+    age_sec = (dt.datetime.now() - latest_dt).total_seconds() if latest_dt else None
+    rows = int(values.get("rows") or 0) if isinstance(values, dict) else 0
+    latest_volume = _mlq_f(values.get("latest_volume") if isinstance(values, dict) else 0.0)
+    avg_volume = _mlq_f(values.get("volume_sum") if isinstance(values, dict) else 0.0) / max(1, rows)
+    turnover_sum = _mlq_f(values.get("turnover_sum") if isinstance(values, dict) else 0.0)
+    detail = {
+        "symbol": symbol,
+        "side": side,
+        "bars": bars,
+        "rows": rows,
+        "latest_volume": latest_volume,
+        "avg_volume": avg_volume,
+        "turnover_sum": turnover_sum,
+        "latest_dt": values.get("latest_dt") if isinstance(values, dict) else None,
+        "age_sec": age_sec,
+        "min_latest_volume": min_latest_volume,
+        "min_avg_volume": min_avg_volume,
+        "min_turnover": min_turnover,
+        "max_age_sec": max_age_sec,
+        "memory_values": values,
+        "original_detail": original_detail,
+    }
+    if not isinstance(values, dict) or not values.get("ok_read"):
+        return False, "STRICT_FINAL_LIQ_MEMORY_READ_NG", detail
+    if latest_dt is None or age_sec is None or age_sec > max_age_sec:
+        return False, f"STRICT_FINAL_LIQ_MEMORY_STALE:{float(age_sec or 0):.0f}>{max_age_sec:.0f}", detail
+    if latest_volume < min_latest_volume:
+        return False, f"STRICT_FINAL_LIQ_MEMORY_LATEST_VOLUME_LOW:{latest_volume:.0f}<{min_latest_volume:.0f}", detail
+    if avg_volume < min_avg_volume:
+        return False, f"STRICT_FINAL_LIQ_MEMORY_AVG_VOLUME_LOW:{avg_volume:.0f}<{min_avg_volume:.0f}", detail
+    if turnover_sum < min_turnover:
+        return False, f"STRICT_FINAL_LIQ_MEMORY_TURNOVER_LOW:{turnover_sum:.0f}<{min_turnover:.0f}", detail
+    logger.warning("[ENTRY FINAL LIQ MEMORY] stale DB bypassed by fresh memory source=%s symbol=%s side=%s age=%.1f latest_vol=%.0f avg_vol=%.0f turnover=%.0f version=%s", values.get("source"), symbol, side, float(age_sec), latest_volume, avg_volume, turnover_sum, _MLQVERSION)
+    return True, "STRICT_FINAL_LIQ_OK_MEMORY_FRESH", detail
+
+
+def _frl_scope_enabled() -> bool:
+    global _FRL_SCOPE
+    if _FRL_SCOPE is not None:
+        return _FRL_SCOPE
+    enabled = False
+    try:
+        import sys as _sys
+
+        argv_text = " ".join(str(x) for x in _sys.argv).replace("\\", "/").lower()
+        db_names = (
+            "main_database.py", "data_collectors_runner.py", "db_prepare_runner.py",
+            "push_receiver_runner.py", "yahoo_complement_runner.py",
+            "summary_database_runner.py", "ranking_collector_runner.py",
+        )
+        if not any(n in argv_text for n in db_names):
+            enabled = "main.py" in argv_text
+    except Exception:
+        enabled = False
+    _FRL_SCOPE = enabled
+    return enabled
+
+
+def _final_recent_liquidity_layer1_pending_fallback(symbol: str, side: str):
+    ok, reason, detail = _final_recent_liquidity_ok_core(symbol, side)
+    if ok:
+        return ok, reason, detail
+    reason_s = str(reason or "")
+    # Only rescue stale/missing DB reads with fresh pending row.
+    rescue_candidates = (
+        "STALE" in reason_s
+        or "READ_NG" in reason_s
+        or "NO_RECENT_ROWS" in reason_s
+        or "LATEST_VOLUME_LOW" in reason_s
+        or "VOLUME_LOW" in reason_s
+        or "TURNOVER_LOW" in reason_s
+    )
+    p_ok, p_reason, p_detail = _plf_pending_liq_ok(symbol, side)
+    merged = dict(detail or {})
+    merged["pending_row_check"] = p_detail
+    if rescue_candidates and p_ok:
+        logger.warning(
+            "[ENTRY FINAL LIQ PENDING FALLBACK] rescue symbol=%s side=%s original=%s pending=%s version=%s",
+            symbol, side, reason, p_detail, _PLFVERSION,
+        )
+        return True, p_reason, merged
+    return ok, reason, merged
+
+
+def _final_recent_liquidity_ok(symbol: str, side: str):
+    if not _frl_scope_enabled():
+        return _final_recent_liquidity_ok_core(symbol, side)
+
+    ok, reason, detail = _final_recent_liquidity_layer1_pending_fallback(symbol, side)
+    try:
+        if ok:
+            return ok, reason, detail
+        text = str(reason or "")
+        if text.startswith("STRICT_FINAL_LIQ_STALE"):
+            mem_ok, mem_reason, mem_detail = _mlq_memory_ok(symbol, side, detail)
+            if mem_ok:
+                return True, mem_reason, mem_detail
+            merged = dict(mem_detail)
+            merged["original_reason"] = reason
+            return False, reason, merged
+    except Exception:
+        logger.exception("[ENTRY FINAL LIQ MEMORY] wrapper failed symbol=%s side=%s", symbol, side)
+    return ok, reason, detail
