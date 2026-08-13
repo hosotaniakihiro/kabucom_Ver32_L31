@@ -20,8 +20,10 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import sys
 import threading
 import time
+from typing import Any, Iterable
 
 import schedule
 
@@ -234,7 +236,7 @@ def _run_yahoo_job_body(started_at: dt.datetime, worker_id: int) -> None:
                 _yahoo_detached_worker_ids.discard(worker_id)
 
 
-def _start_yahoo_worker(now: dt.datetime) -> bool:
+def _start_yahoo_worker_core(now: dt.datetime) -> bool:
     global _yahoo_running
     global _yahoo_started_at_epoch
     global _yahoo_worker_thread
@@ -354,3 +356,126 @@ def register_yahoo_tasks():
 
 
 __all__ = ["yahoo_minutely_complement_job", "register_yahoo_tasks", "get_yahoo_task_status"]
+
+
+# ============================================================
+# 旧 core/startup/intraday_load_guard_patch._patch_yahoo_tasks を本文化。
+# 日中の Yahoo 補完 worker が 1 分ごとに重複起動しないよう、
+# 最短起動間隔 (YAHOO_COMPLEMENT_MIN_START_GAP_SEC) でスロットルする。
+# 適用スコープは旧 _safe_install の allowed 集合
+# (DB|TRADING|HELPER = ほぼ全 context) を _ilg_scope_enabled() で再現。
+# ============================================================
+
+_ILG_TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+_ILG_CONTEXTS = {
+    "main_database", "db_prepare", "push_receiver", "summary_database",
+    "ranking_collector", "yahoo_complement", "main", "helper",
+}
+
+
+def _ilg_argv_context() -> str:
+    """core/startup/runtime_env/defaults_patch.py の _argv_context() と同一。"""
+    try:
+        text = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+        if "main_database.py" in text:
+            return "main_database"
+        if text.endswith("main.py") or "/main.py" in text:
+            return "main"
+        if "db_prepare_runner.py" in text:
+            return "db_prepare"
+        if "push_receiver_runner.py" in text:
+            return "push_receiver"
+        if "summary_database_runner.py" in text:
+            return "summary_database"
+        if "ranking_collector_runner.py" in text:
+            return "ranking_collector"
+        if "yahoo_complement_runner.py" in text:
+            return "yahoo_complement"
+        if "data_collectors_runner.py" in text:
+            return "main_database"
+        if text:
+            return "helper"
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _ilg_scope_enabled() -> bool:
+    if str(os.environ.get("DISABLE_INTRADAY_LOAD_GUARD_PATCH", "")).strip() == "1":
+        return False
+    if _ilg_env_bool("DISABLE_INTRADAY_LOAD_GUARD_PATCH", False):
+        return False
+    return _ilg_argv_context() in _ILG_CONTEXTS
+
+
+def _ilg_env_bool(name: str, default: bool = False) -> bool:
+    try:
+        raw = str(os.getenv(name, "")).strip().lower()
+        if raw in _ILG_TRUE:
+            return True
+        if raw in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+            return False
+    except Exception:
+        pass
+    return bool(default)
+
+
+def _ilg_env_int(name: str, default: int, *, min_value: int | None = None, max_value: int | None = None) -> int:
+    try:
+        v = int(float(str(os.getenv(name, str(default))).replace(",", "")))
+    except Exception:
+        v = int(default)
+    if min_value is not None:
+        v = max(v, min_value)
+    if max_value is not None:
+        v = min(v, max_value)
+    return int(v)
+
+
+def _ilg_norm_symbol(symbol: Any) -> str:
+    s = str(symbol or "").strip().upper()
+    if s.endswith(".T"):
+        s = s[:-2]
+    return s
+
+
+def _ilg_dedupe_limit(items: Iterable[Any], limit: int) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in items or []:
+        s = _ilg_norm_symbol(x)
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+        if len(out) >= limit:
+            break
+    return out
+
+
+_ilg_last_attempt_at = 0.0
+_ilg_skip_counter = 0
+
+
+def _start_yahoo_worker(now: dt.datetime) -> bool:
+    global _ilg_last_attempt_at, _ilg_skip_counter
+    if not _ilg_scope_enabled():
+        return _start_yahoo_worker_core(now)
+    min_gap = _ilg_env_int("YAHOO_COMPLEMENT_MIN_START_GAP_SEC", 240, min_value=0, max_value=3600)
+    now_ts = time.time()
+    if min_gap > 0 and _ilg_last_attempt_at > 0 and (now_ts - _ilg_last_attempt_at) < min_gap:
+        _ilg_skip_counter += 1
+        every = _ilg_env_int("YAHOO_COMPLEMENT_SKIP_LOG_EVERY", 5, min_value=1, max_value=100)
+        if _ilg_skip_counter == 1 or _ilg_skip_counter % every == 0:
+            logger.warning(
+                "[INTRADAY LOAD GUARD] Yahoo complement throttled elapsed=%.1fs min_gap=%ss skip_count=%s",
+                now_ts - _ilg_last_attempt_at,
+                min_gap,
+                _ilg_skip_counter,
+            )
+        return False
+    started = bool(_start_yahoo_worker_core(now))
+    if started:
+        _ilg_last_attempt_at = now_ts
+        _ilg_skip_counter = 0
+    return started

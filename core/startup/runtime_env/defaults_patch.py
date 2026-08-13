@@ -307,7 +307,13 @@ def _install_vol_filter_ranking_rescue_timebox(context: str) -> bool:
 
 
 def _install_push_registration_recovery(context: str) -> bool:
-    return _safe_install("push register recovery", context, {"main", "main_database", "push_receiver"}, "DISABLE_PUSH_REGISTER_RECOVERY_PATCH", "push_registration_recovery_patch")
+    # push_registration_recovery_patch は本文化済み:
+    #   trading/push/push_stream/rotation_symbols.resolve_monitor_symbols (topup)
+    #   trading/push/push_stream/rotation_symbols.resolve_register_targets (audit)
+    #   trading/push/subscription_manager/register_ops.run_* (audit)
+    # 各ホストが _prr_scope_enabled() で同じ context 集合
+    # {main, main_database, push_receiver} を再現している。
+    return True
 
 
 def _install_common_day_position_guard(context: str) -> bool:
@@ -458,7 +464,14 @@ def _install_summary_db_lock_pressure(context: str) -> bool:
 
 
 def _install_intraday_load_guard(context: str) -> bool:
-    return _safe_install("intraday load guard", context, DB_CONTEXTS | TRADING_CONTEXTS | GENERIC_HELPER_CONTEXTS, "DISABLE_INTRADAY_LOAD_GUARD_PATCH", "intraday_load_guard_patch")
+    # intraday_load_guard_patch の関数ラップは本体へ本文化済み:
+    #   core/yahoo_tasks._start_yahoo_worker                   (スロットル)
+    #   trading/push/push_stream/rotation_symbols.resolve_*    (100件クランプ)
+    #   trading/push/push_stream/rotation_stability_patch._d   (中間ログのクランプ)
+    # 各ホストが _ilg_scope_enabled() で同じ context 集合を再現している。
+    # env 既定値と yfinance.download (サードパーティ) だけ
+    # core/startup/intraday_load_guard.py へ移設した。
+    return _safe_install("intraday load guard", context, DB_CONTEXTS | TRADING_CONTEXTS | GENERIC_HELPER_CONTEXTS, "DISABLE_INTRADAY_LOAD_GUARD_PATCH", "intraday_load_guard")
 
 
 def _install_yahoo_parallel_empty_cooldown(context: str) -> bool:

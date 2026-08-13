@@ -24,7 +24,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Iterator, Optional, Sequence
+from typing import Any, Iterable, Iterator, Optional, Sequence
 
 from .globals_access import safe_get_global_data, safe_getattr
 from .symbols import dedupe_keep_order, normalize_symbol
@@ -860,7 +860,7 @@ def _register_once_with_content(symbols: Sequence[str], *, exchange: int = DEFAU
     return ok, content
 
 
-def run_register_chunks(symbols: Sequence[str], *, exchange: int = DEFAULT_EXCHANGE, chunk_size: int = REGISTER_CHUNK_SIZE) -> bool:
+def _run_register_chunks_core(symbols: Sequence[str], *, exchange: int = DEFAULT_EXCHANGE, chunk_size: int = REGISTER_CHUNK_SIZE) -> bool:
     del chunk_size
     normalized = _truncate_to_register_limit(symbols)
     if not normalized:
@@ -876,7 +876,7 @@ def run_register_chunks(symbols: Sequence[str], *, exchange: int = DEFAULT_EXCHA
     return False
 
 
-def run_refresh_sequence(
+def _run_refresh_sequence_core(
     current_symbols: Sequence[str],
     target_symbols: Sequence[str],
     *,
@@ -979,3 +979,117 @@ __all__ = [
     "run_register_chunks",
     "run_refresh_sequence",
 ]
+
+
+# ============================================================
+# 旧 core/startup/push_registration_recovery_patch._patch_register_ops を本文化。
+# 中身は監査ログのみで、戻り値は元関数のまま。
+#
+# 旧パッチは ro._http_json_request には触れない方針だった
+# (トークン処理は register_ops 側の正規実装が持つ)。その方針も変えていない。
+# _PUSH_REGISTER_RECOVERY_HTTP_DISABLED_V4 などのフラグは読み手が無いので移していない。
+#
+# 適用スコープは旧 _safe_install の allowed 集合
+# {main, main_database, push_receiver} を _prr_scope_enabled() で再現。
+# ============================================================
+
+_PRR_CONTEXTS = {"main", "main_database", "push_receiver"}
+
+
+def _prr_argv_context() -> str:
+    """core/startup/runtime_env/defaults_patch.py の _argv_context() と同一。"""
+    try:
+        text = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+        if "main_database.py" in text:
+            return "main_database"
+        if text.endswith("main.py") or "/main.py" in text:
+            return "main"
+        if "db_prepare_runner.py" in text:
+            return "db_prepare"
+        if "push_receiver_runner.py" in text:
+            return "push_receiver"
+        if "summary_database_runner.py" in text:
+            return "summary_database"
+        if "ranking_collector_runner.py" in text:
+            return "ranking_collector"
+        if "yahoo_complement_runner.py" in text:
+            return "yahoo_complement"
+        if "data_collectors_runner.py" in text:
+            return "main_database"
+        if text:
+            return "helper"
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _prr_scope_enabled() -> bool:
+    if str(os.environ.get("DISABLE_PUSH_REGISTER_RECOVERY_PATCH", "")).strip() == "1":
+        return False
+    return _prr_argv_context() in _PRR_CONTEXTS
+
+
+def _prr_env_int(name: str, default: int) -> int:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(str(v).replace(",", "")))
+    except Exception:
+        return int(default)
+
+
+def _prr_dedupe(items: Iterable[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in items or []:
+        s = str(x or "").strip().upper()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _prr_split_ab_counts(symbols: Sequence[str]) -> tuple[int, int, list[str], list[str]]:
+    chunk = max(1, _prr_env_int("PUSH_REGISTER_CHUNK_SIZE", 50))
+    a = list(symbols or [])[:chunk]
+    b = list(symbols or [])[chunk:chunk * 2]
+    return len(a), len(b), a[:10], b[:10]
+
+
+def run_register_chunks(symbols, *args, **kwargs) -> bool:
+    if not _prr_scope_enabled():
+        return _run_register_chunks_core(symbols, *args, **kwargs)
+    target = _prr_dedupe([str(x) for x in list(symbols or [])])
+    a_count, b_count, a_head, b_head = _prr_split_ab_counts(target)
+    t0 = time.monotonic()
+    logger.warning(
+        "[PUSH REGISTER RECOVERY][REGISTER AUDIT] register_chunks start target=%s A=%s B=%s head=%s A_head=%s B_head=%s",
+        len(target), a_count, b_count, target[:10], a_head, b_head,
+    )
+    ok = _run_register_chunks_core(symbols, *args, **kwargs)
+    logger.warning(
+        "[PUSH REGISTER RECOVERY][REGISTER AUDIT] register_chunks done ok=%s elapsed=%.3fs target=%s A=%s B=%s",
+        ok, time.monotonic() - t0, len(target), a_count, b_count,
+    )
+    return ok
+
+
+def run_refresh_sequence(current_symbols, target_symbols, *args, **kwargs) -> bool:
+    if not _prr_scope_enabled():
+        return _run_refresh_sequence_core(current_symbols, target_symbols, *args, **kwargs)
+    target = _prr_dedupe([str(x) for x in list(target_symbols or [])])
+    a_count, b_count, a_head, b_head = _prr_split_ab_counts(target)
+    t0 = time.monotonic()
+    logger.warning(
+        "[PUSH REGISTER RECOVERY][REGISTER AUDIT] refresh start current=%s target=%s A=%s B=%s clear_first=%s unregister_first=%s target_head=%s A_head=%s B_head=%s",
+        len(current_symbols or []), len(target), a_count, b_count,
+        kwargs.get("clear_first"), kwargs.get("unregister_first"), target[:10], a_head, b_head,
+    )
+    ok = _run_refresh_sequence_core(current_symbols, target_symbols, *args, **kwargs)
+    logger.warning(
+        "[PUSH REGISTER RECOVERY][REGISTER AUDIT] refresh done ok=%s elapsed=%.3fs target=%s A=%s B=%s",
+        ok, time.monotonic() - t0, len(target), a_count, b_count,
+    )
+    return ok

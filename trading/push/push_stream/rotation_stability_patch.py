@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as _dt
 import logging
 import os
+import sys
 import sqlite3
 from typing import Any, Iterable, Sequence
 
@@ -32,7 +33,7 @@ def _b(name: str, default: bool) -> bool:
     return str(v).lower() in {"1", "true", "yes", "on", "enabled"}
 
 
-def _d(xs: Iterable[Any]) -> list[str]:
+def _d_core(xs: Iterable[Any]) -> list[str]:
     out, seen = [], set()
     for x in xs or []:
         s = str(x).strip().upper()
@@ -564,3 +565,104 @@ def install() -> bool:
 
 install()
 __all__ = ["VERSION", "install"]
+
+
+# ============================================================
+# 旧 core/startup/intraday_load_guard_patch._patch_push_rotation_hard_clamp
+# を本文化。中間ログでも 100 件を超えないよう _d をクランプする。
+# 適用スコープは旧 _safe_install の allowed 集合
+# (DB|TRADING|HELPER = ほぼ全 context) を _ilg_scope_enabled() で再現。
+# ============================================================
+
+_ILG_TRUE = {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+_ILG_CONTEXTS = {
+    "main_database", "db_prepare", "push_receiver", "summary_database",
+    "ranking_collector", "yahoo_complement", "main", "helper",
+}
+
+
+def _ilg_argv_context() -> str:
+    """core/startup/runtime_env/defaults_patch.py の _argv_context() と同一。"""
+    try:
+        text = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
+        if "main_database.py" in text:
+            return "main_database"
+        if text.endswith("main.py") or "/main.py" in text:
+            return "main"
+        if "db_prepare_runner.py" in text:
+            return "db_prepare"
+        if "push_receiver_runner.py" in text:
+            return "push_receiver"
+        if "summary_database_runner.py" in text:
+            return "summary_database"
+        if "ranking_collector_runner.py" in text:
+            return "ranking_collector"
+        if "yahoo_complement_runner.py" in text:
+            return "yahoo_complement"
+        if "data_collectors_runner.py" in text:
+            return "main_database"
+        if text:
+            return "helper"
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _ilg_scope_enabled() -> bool:
+    if str(os.environ.get("DISABLE_INTRADAY_LOAD_GUARD_PATCH", "")).strip() == "1":
+        return False
+    if _ilg_env_bool("DISABLE_INTRADAY_LOAD_GUARD_PATCH", False):
+        return False
+    return _ilg_argv_context() in _ILG_CONTEXTS
+
+
+def _ilg_env_bool(name: str, default: bool = False) -> bool:
+    try:
+        raw = str(os.getenv(name, "")).strip().lower()
+        if raw in _ILG_TRUE:
+            return True
+        if raw in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+            return False
+    except Exception:
+        pass
+    return bool(default)
+
+
+def _ilg_env_int(name: str, default: int, *, min_value: int | None = None, max_value: int | None = None) -> int:
+    try:
+        v = int(float(str(os.getenv(name, str(default))).replace(",", "")))
+    except Exception:
+        v = int(default)
+    if min_value is not None:
+        v = max(v, min_value)
+    if max_value is not None:
+        v = min(v, max_value)
+    return int(v)
+
+
+def _ilg_norm_symbol(symbol: Any) -> str:
+    s = str(symbol or "").strip().upper()
+    if s.endswith(".T"):
+        s = s[:-2]
+    return s
+
+
+def _ilg_dedupe_limit(items: Iterable[Any], limit: int) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in items or []:
+        s = _ilg_norm_symbol(x)
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _d(xs: Iterable[Any]) -> list[str]:
+    if not _ilg_scope_enabled():
+        return _d_core(xs)
+    limit = _ilg_env_int("PUSH_ROTATION_TARGET_MAX_KEEP", 100, min_value=1, max_value=100)
+    return _ilg_dedupe_limit(xs or [], limit)
