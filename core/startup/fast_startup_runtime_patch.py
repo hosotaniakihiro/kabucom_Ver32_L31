@@ -120,7 +120,8 @@ def _background_heavy() -> None:
         # exit_executor_broker_position_patch は trading/exit/executor.py へ本文化済み
         # (_get_open_position / _close_db_position の broker 実建玉フォールバック。
         #  スコープは同ファイルの _broker_position_fallback_enabled() が再現)。
-        lambda: _run_install("exit_trail_03_runtime_patch", "core.startup.exit_trail_03_runtime_patch"),
+        # exit_trail_03_runtime_patch は trading/exit/exit_position_runner.py へ
+        # 本文化済み (_et3_* / _judge_* / _et3_apply_defaults)。
         # entry_unfilled_cancel_2s_runtime_patch は削除した。
         # 唯一の効果が force_cancel_loop.start_force_cancel_loop の差し替えだったが、
         # main.py:117 が import 節で `from force_cancel_loop import
