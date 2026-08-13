@@ -225,15 +225,15 @@ def _install_summary_ai_approval_diag_and_price_floor() -> bool:
 # ranking precheck helper
 # -----------------------------
 def _install_ranking_precheck_pending_failopen() -> bool:
-    try:
-        import core.startup.ranking_precheck_pending_failopen_patch as patch
-        fn = getattr(patch, "install", None)
-        ok = bool(fn()) if callable(fn) else False
-        logger.warning("[SUMMARY AI HOOK DF TRUTH PATCH] ranking precheck pending failopen installed=%s", ok)
-        return ok
-    except Exception:
-        logger.exception("[SUMMARY AI HOOK DF TRUTH PATCH] ranking precheck pending failopen install failed")
-        return False
+    """pending がある場合の RANKING precheck (strict)。
+
+    旧 core/startup/ranking_precheck_pending_failopen_patch.py は
+    trading/handlers/entry_precheck_ranking.precheck_ranking_entry へ本文化済み。
+    entry_controller:115 の from-import も公開名を直接掴むため、
+    旧パッチが行っていた二重の属性差し替えは不要になった。
+    スコープと env 既定値は同ファイル側が引き継いでいる。
+    """
+    return True
 
 
 def install() -> bool:
