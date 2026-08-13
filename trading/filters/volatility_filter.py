@@ -58,15 +58,60 @@ logger = logging.getLogger(__name__)
 
 # 1分ATR / 価格。
 # 旧 0.25% → 新 0.35%。ほとんど動かない銘柄を落とす。
-DEFAULT_ATR_1M_MIN_RATIO = 0.0035
+_BASE_ATR_1M_MIN_RATIO = 0.0035
 
 # 直近5分高安幅 / 価格。
 # 旧 0.8% → 新 1.2%。短期エントリー向けに強める。
-DEFAULT_RANGE_5M_MIN_PCT = 0.012
+_BASE_RANGE_5M_MIN_PCT = 0.012
 
 # entry_row 単体の high-low / close。
 # summary行そのものが動いていない場合に落とす。
-DEFAULT_ENTRY_ROW_RANGE_MIN_PCT = 0.006
+_BASE_ENTRY_ROW_RANGE_MIN_PCT = 0.006
+
+
+# ----------------------------------------------------------
+# TONOSAMA HISTORY GUARD 由来のしきい値緩和
+# (旧 core/startup/tonosama_history_missing_guard_patch.py
+#  _patch_volatility_filter_thresholds を本文化)
+# ----------------------------------------------------------
+# 旧パッチは install 時に
+#   vf.DEFAULT_* = env値
+#   _entry_row_range_ok / _atr_1m_filter_from_entry_row /
+#   _range_5m_filter_from_entry_row の __defaults__ = env値
+# の**この 3 関数だけ**を書き換えていた。
+# _range_5m_filter_from_entry_row_core / _atr_1m_filter_core /
+# range_5m_filter の既定値は import 時に束縛済みで書き換え対象外
+# だったため、そちらは _BASE_* を使い続ける (実測どおり)。
+#
+# 適用スコープは sitecustomize のパッチ一覧と同じで、
+# DISABLE_TONOSAMA_HISTORY_MISSING_GUARD_PATCH=1 のときだけ素の値に戻す。
+# ----------------------------------------------------------
+
+def _hg_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _hg_threshold_patch_enabled() -> bool:
+    try:
+        return str(os.environ.get("DISABLE_TONOSAMA_HISTORY_MISSING_GUARD_PATCH", "")).strip() != "1"
+    except Exception:
+        return True
+
+
+if _hg_threshold_patch_enabled():
+    DEFAULT_ATR_1M_MIN_RATIO = _hg_env_float("ENTRY_ATR_1M_MIN_RATIO", 0.0010)
+    DEFAULT_RANGE_5M_MIN_PCT = _hg_env_float("ENTRY_RANGE_5M_MIN_PCT", 0.008)
+    DEFAULT_ENTRY_ROW_RANGE_MIN_PCT = _hg_env_float("ENTRY_ROW_RANGE_MIN_PCT", 0.003)
+else:
+    DEFAULT_ATR_1M_MIN_RATIO = _BASE_ATR_1M_MIN_RATIO
+    DEFAULT_RANGE_5M_MIN_PCT = _BASE_RANGE_5M_MIN_PCT
+    DEFAULT_ENTRY_ROW_RANGE_MIN_PCT = _BASE_ENTRY_ROW_RANGE_MIN_PCT
 
 # 起動直後ranking救済用。ランキング由来の実変動率がこの値以上なら
 # summary高安が未成熟でも「動いている銘柄」として扱う。
@@ -1166,7 +1211,7 @@ def _range_5m_filter_from_entry_row(entry_row: Any, min_pct: float = DEFAULT_RAN
     return _range_5m_tonosama_and_ranking_rescue_chain(entry_row, min_pct=min_pct)
 
 
-def _range_5m_filter_from_entry_row_core(entry_row: Any, min_pct: float = DEFAULT_RANGE_5M_MIN_PCT) -> bool:
+def _range_5m_filter_from_entry_row_core(entry_row: Any, min_pct: float = _BASE_RANGE_5M_MIN_PCT) -> bool:
     symbol, close, high, low, _ = _extract_basic_prices(entry_row)
 
     # まず summary行そのものの高安幅を確認する。
@@ -1241,7 +1286,7 @@ def _atr_1m_filter_core(
     *,
     df_1m: pd.DataFrame | None = None,
     symbol: str | None = None,
-    min_ratio: float = DEFAULT_ATR_1M_MIN_RATIO,
+    min_ratio: float = _BASE_ATR_1M_MIN_RATIO,
 ):
     """
     1分足 ATR ベースの実効ボラティリティ判定。
@@ -1384,7 +1429,7 @@ def range_5m_filter(
     *,
     df_5m: pd.DataFrame | None = None,
     symbol: str | None = None,
-    min_pct: float = DEFAULT_RANGE_5M_MIN_PCT,
+    min_pct: float = _BASE_RANGE_5M_MIN_PCT,
 ):
     """
     直近5分足の高安値幅による実効ボラ判定。

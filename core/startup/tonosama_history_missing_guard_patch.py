@@ -160,29 +160,13 @@ def _raw1_min_bars_for_interval(interval: int) -> int:
 
 
 def _patch_volatility_filter_thresholds() -> None:
-    try:
-        import trading.filters.volatility_filter as vf
-        atr_min = _env_float("ENTRY_ATR_1M_MIN_RATIO", 0.0010)
-        range5_min = _env_float("ENTRY_RANGE_5M_MIN_PCT", 0.008)
-        row_range_min = _env_float("ENTRY_ROW_RANGE_MIN_PCT", 0.003)
-        vf.DEFAULT_ATR_1M_MIN_RATIO = atr_min
-        vf.DEFAULT_RANGE_5M_MIN_PCT = range5_min
-        vf.DEFAULT_ENTRY_ROW_RANGE_MIN_PCT = row_range_min
-        for name, defaults in (
-            ("_atr_1m_filter_from_entry_row", (atr_min,)),
-            ("_range_5m_filter_from_entry_row", (range5_min,)),
-            ("_entry_row_range_ok", (row_range_min,)),
-        ):
-            try:
-                getattr(vf, name).__defaults__ = defaults
-            except Exception:
-                pass
-        logger.warning(
-            "[VOL FILTER THRESHOLD PATCH] installed atr_min_ratio=%.6f range5_min_pct=%.6f entry_row_range_min_pct=%.6f",
-            atr_min, range5_min, row_range_min,
-        )
-    except Exception:
-        logger.exception("[VOL FILTER THRESHOLD PATCH] install failed")
+    # trading/filters/volatility_filter.py へ本文化した。
+    # 旧処理は vf.DEFAULT_* の代入と、_entry_row_range_ok /
+    # _atr_1m_filter_from_entry_row / _range_5m_filter_from_entry_row の
+    # __defaults__ 書き換え。vf 側が import 時に同じ env で同じ 3 関数だけを
+    # その値で定義するようにしたので、ここでは何もしない。
+    # DISABLE_TONOSAMA_HISTORY_MISSING_GUARD_PATCH=1 の扱いも vf 側が持つ。
+    return None
 
 
 def _first_existing(df: pd.DataFrame, names: list[str]) -> str | None:
