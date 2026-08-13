@@ -893,14 +893,9 @@ def install() -> bool:
         # _patched_atr_1m_filter 自体は参照されない死にコードとして残置
         # (再有効化したい場合の実装リファレンス)。
 
-        if callable(old_range) and not getattr(old_range, "_low_move_guard_v16", False):
-            _ORIG_RANGE_FILTER = getattr(old_range, "_original", old_range)
-            _patched_range_5m_filter._low_move_guard_v16 = True  # type: ignore[attr-defined]
-            _patched_range_5m_filter._original = _ORIG_RANGE_FILTER  # type: ignore[attr-defined]
-            ec.range_5m_filter = _patched_range_5m_filter
-            logger.warning("[LOW MOVE GUARD] patched entry_controller.range_5m_filter v16")
-        else:
-            logger.warning("[LOW MOVE GUARD] range_5m_filter already wrapped v16 or missing")
+        # range_5m_filter のラップは trading/handlers/entry_controller.py へ
+        # 本文化した (_range_5m_filter_low_move)。_apply_all_entry_guards は
+        # 引き続きこのモジュールのものを呼ぶ。
 
         _INSTALLED = True
         logger.warning(

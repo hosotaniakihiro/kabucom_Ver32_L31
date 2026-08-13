@@ -3317,3 +3317,78 @@ for _m5b_name, _m5b_src in (("_summary_mtf_direction_guard", "entry_order_builde
         _m5b_wrap_guard(_m5b_name, _m5b_src)
     except Exception:
         logger.exception("[MA5 BREAKOUT] guard wrap failed name=%s", _m5b_name)
+
+
+# ============================================================
+# ENTRY FINAL FILTER 既定値
+# (旧 core/startup/entry_final_filter_failopen_patch.py の env / 定数部分)
+# ------------------------------------------------------------
+# 旧 install が入れていた env 既定値 (setdefault のみ) と
+# entry_order_builder の 4 定数の上書きをここへ移した。
+# **import 時ではなく main.py の patches リストから呼ぶこと**
+# (旧 install と同じ :249 の位置。tonosama_history_failclose_strict_patch の
+#  watcher が同じ定数を書き戻す関係があるため、位置を変えると最終値が変わる)。
+#
+# range_5m_filter の fail-open ラップと atr_1m_filter のラップは
+# それぞれ trading/handlers/entry_controller.py へ本文化 / 撤去済み。
+# ============================================================
+
+_EFF_ENV_DEFAULTS = {
+'ENTRY_ALLOW_ENTRY_WITHOUT_BOARD':'1','ATR_1M_FILTER_TONOSAMA_HISTORY_FAIL_OPEN':'1','ATR_1M_FILTER_TONOSAMA_MIN_BARS':'14','PENDING_PROTECT_PUSH_SYMBOLS':'1','PENDING_PROTECT_PUSH_MAX_KEEP':'50','ENTRY_BOARD_RETRY_ENABLED':'1','ENTRY_BOARD_RETRY_WAIT_SEC':'4.5','ENTRY_BOARD_RETRY_COUNT':'1','ENTRY_BOARD_RETRY_EXTRA_WAIT_SEC':'0.3','ENTRY_BOARD_RETRY_EXTRA_COUNT':'1','ENTRY_BOARD_RETRY_SYMBOLS_ONLY_PENDING':'0','ENTRY_SHORT_MTF_REQUIRED':'1','ENTRY_SHORT_MTF_REQUIRE_ALL':'1','ENTRY_SHORT_MTF_SLOPE_EPS':'0.0','ENTRY_DAILY_MTF_OPTIONAL':'1','ENTRY_MA5_BREAKOUT_ENABLED':'1','ENTRY_MA5_BREAKOUT_TFS':'3,5','ENTRY_MA5_BREAKOUT_MIN_BAR':'1','ENTRY_MA5_BREAKOUT_MAX_BAR':'3','ENTRY_MA5_BREAKOUT_LOOKBACK':'20','ENTRY_MA5_BREAKOUT_REQUIRE_DATA':'1','ENTRY_MA5_BREAKOUT_DB_BACKFILL':'1','ENTRY_DIRECTION_CONFIRM_RECURSION_FAIL_OPEN':'1','ENTRY_DIRECTION_CONFIRM_ERROR_FAIL_OPEN':'0'
+}
+
+_EFF_SCALPING_DEFAULTS = {
+'ENTRY_MAX_DAILY_ENTRIES_PER_SYMBOL':'2','ENTRY_COUNT_SENT_ORDER_AS_DAILY_ENTRY':'1','ENTRY_WINNING_SYMBOL_REENTRY_ENABLED':'1','ENTRY_WINNING_SYMBOL_MAX_DAILY_ENTRIES':'4','ENTRY_WINNING_SYMBOL_MIN_DAILY_PNL':'1','ENTRY_WINNING_SYMBOL_REQUIRE_WIN_GT_LOSS':'1','ENTRY_WINNING_SYMBOL_IGNORE_SENT_ONLY':'1','ENTRY_STOP_AFTER_FIRST_LOSS_ONLY_IF_NET_NEGATIVE':'1',
+        'RANGE_5M_FILTER_NG_FAIL_OPEN':'1','LOW_MOVE_TONOSAMA_MIN_RANGE_PCT':'0.005','LOW_MOVE_TONOSAMA_STRONG_RANGE_PCT':'0.010','LOW_MOVE_MIN_RANGE_PCT_HIGH_PRICE':'0.005','LOW_MOVE_MIN_RANGE_PCT_LOW_PRICE':'0.010','LOW_MOVE_RANKING_MIN_RANGE_PCT_HIGH_PRICE':'0.005','LOW_MOVE_RANKING_MIN_RANGE_PCT_LOW_PRICE':'0.008','LOW_MOVE_RANKING_MIN_SCORE_FOR_NO_HIGHLOW':'55.0','LOW_MOVE_RANKING_MIN_ABS_SLOPE':'0.0005','LOW_MOVE_TONOSAMA_MIN_ABS_SLOPE':'0.00005','LOW_MOVE_MIN_ABS_SLOPE_HIGH_PRICE':'0.0001','LOW_MOVE_MIN_ABS_SLOPE_LOW_PRICE':'0.00015',
+        'ENTRY_ORDER_MIN_RANGE_PCT':'0.005','ENTRY_ORDER_MIN_ATR_RATIO':'0.0025','ENTRY_ORDER_REQUIRE_ATR':'0','ENTRY_ORDER_REQUIRE_HIGH_LOW':'0','ENTRY_DIRECTION_CONFIRM_MIN_STRENGTH':'1.0','ENTRY_DIRECTION_CONFIRM_STRICT':'0','ENTRY_ORDER_SHORT_MTF_NEUTRAL_MIN_SCORE':'1.0','ENTRY_ORDER_SHORT_MTF_NEUTRAL_EPS':'0.0',
+}
+
+
+_EFF_ENV_SET: list[str] = []
+
+
+def _eff_setdefault_env(name: str, value: str) -> None:
+    try:
+        cur = os.getenv(name)
+        if cur is None or str(cur).strip() == "":
+            os.environ[name] = str(value)
+            _EFF_ENV_SET.append(f"{name}={value}")
+    except Exception:
+        pass
+
+
+def apply_entry_final_filter_defaults() -> bool:
+    """旧 entry_final_filter_failopen_patch.install() の env / 定数部分。"""
+    _EFF_ENV_SET.clear()
+    for k, v in _EFF_ENV_DEFAULTS.items():
+        _eff_setdefault_env(k, v)
+    for k, v in _EFF_SCALPING_DEFAULTS.items():
+        _eff_setdefault_env(k, v)
+    if _EFF_ENV_SET:
+        logger.warning("[ENTRY FINAL FILTER FAILOPEN] env defaults set count=%s keys=%s",
+                       len(_EFF_ENV_SET), [x.split("=", 1)[0] for x in _EFF_ENV_SET])
+    global ENTRY_ORDER_MIN_RANGE_PCT, ENTRY_ORDER_MIN_ATR_RATIO
+    global ENTRY_ORDER_REQUIRE_ATR, ENTRY_ORDER_REQUIRE_HIGH_LOW
+    try:
+        ENTRY_ORDER_MIN_RANGE_PCT = _fob_safe_float(os.getenv("ENTRY_ORDER_MIN_RANGE_PCT"), 0.005)
+        ENTRY_ORDER_MIN_ATR_RATIO = _fob_safe_float(os.getenv("ENTRY_ORDER_MIN_ATR_RATIO"), 0.0025)
+        ENTRY_ORDER_REQUIRE_ATR = _bsr_env_bool("ENTRY_ORDER_REQUIRE_ATR", False)
+        ENTRY_ORDER_REQUIRE_HIGH_LOW = _bsr_env_bool("ENTRY_ORDER_REQUIRE_HIGH_LOW", False)
+        logger.warning(
+            "[ENTRY FINAL FILTER FAILOPEN] entry_order_builder constants patched min_range=%.4f min_atr=%.4f require_atr=%s require_high_low=%s",
+            ENTRY_ORDER_MIN_RANGE_PCT, ENTRY_ORDER_MIN_ATR_RATIO,
+            ENTRY_ORDER_REQUIRE_ATR, ENTRY_ORDER_REQUIRE_HIGH_LOW,
+        )
+    except Exception:
+        logger.exception("[ENTRY FINAL FILTER FAILOPEN] entry_order_builder constant patch failed")
+
+    for mod_name, label in (("core.startup.board_retry_patch", "board retry patch"),
+                            ("trading.handlers.short_mtf_direction_guard", "short MTF daily optional guard")):
+        try:
+            mod = __import__(mod_name, fromlist=["install"])
+            fn = getattr(mod, "install", None)
+            ok = fn() if callable(fn) else False
+            logger.warning("[ENTRY FINAL FILTER FAILOPEN] %s installed=%s", label, ok)
+        except Exception:
+            logger.exception("[ENTRY FINAL FILTER FAILOPEN] %s install failed", label)
+    return True

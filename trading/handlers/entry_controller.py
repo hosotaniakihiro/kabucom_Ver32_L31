@@ -120,7 +120,7 @@ from trading.handlers.entry_precheck_ranking import (
 from trading.handlers.entry_order_builder import build_entry_order
 from trading.filters.volatility_filter import (
     atr_1m_filter as _atr_1m_filter_core,
-    range_5m_filter,
+    range_5m_filter as _range_5m_filter_core,
 )
 
 from trading.entry.lot_sizer import calculate_entry_quantity as _calculate_entry_quantity_base
@@ -4577,3 +4577,66 @@ def atr_1m_filter(entry_row: Any = None, *args: Any, **kwargs: Any):
         except Exception:
             pass
     return retry
+
+
+# ============================================================
+# range_5m_filter の 2 層
+# (旧 core/startup/low_movement_entry_guard_patch と
+#  旧 core/startup/entry_final_filter_failopen_patch を本文化)
+# ------------------------------------------------------------
+# 実 install 順は main.py:248 (low_movement) -> :249 (failopen) で、
+# どちらも合成型だったので
+#   native <- low_movement (全ガード実行) <- failopen (NG の fail-open)
+# の順で本文へ入れた。
+#
+# 1層目は low_movement_entry_guard_patch._apply_all_entry_guards を呼ぶ。
+# 同パッチは他に 6 つのサブ install を持つため残っており、この関数だけを
+# 参照する (旧構成と同じ実装が動く)。
+#
+# 2層目は RANGE_5M_FILTER_NG_FAIL_OPEN が真なら False を True へ倒し、
+# RecursionError / 一般例外もそれぞれの env で fail-open する。
+# ============================================================
+
+
+def _r5m_env_bool(name: str, default: bool = True) -> bool:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return bool(default)
+        return str(raw).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _range_5m_filter_low_move(entry_row=None, *args, **kwargs):
+    """1層目: 本体の判定が通ったら _apply_all_entry_guards へ渡す。"""
+    try:
+        allow = _range_5m_filter_core(entry_row, *args, **kwargs)
+        if isinstance(allow, tuple):
+            return allow
+        if not bool(allow):
+            return False
+        from core.startup.low_movement_entry_guard_patch import _apply_all_entry_guards
+
+        return _apply_all_entry_guards(entry_row)
+    except RecursionError:
+        logger.error("[LOW MOVE GUARD] recursion detected in patched range filter. fail-safe NG. Check duplicate wrappers.", exc_info=False)
+        return False
+    except Exception as e:
+        logger.warning("[LOW MOVE GUARD] patched range filter failed: %s", e, exc_info=False)
+        return False
+
+
+def range_5m_filter(entry_row=None, *args, **kwargs):
+    """2層目: NG を env に応じて fail-open する。"""
+    try:
+        ret = _range_5m_filter_low_move(entry_row, *args, **kwargs)
+        if isinstance(ret, tuple):
+            return ret
+        if ret is False and _r5m_env_bool("RANGE_5M_FILTER_NG_FAIL_OPEN", True):
+            return True
+        return ret
+    except RecursionError:
+        return bool(_r5m_env_bool("RANGE_5M_FILTER_RECURSION_FAIL_OPEN", True))
+    except Exception:
+        return bool(_r5m_env_bool("RANGE_5M_FILTER_ERROR_FAIL_OPEN", True))

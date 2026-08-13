@@ -246,7 +246,15 @@ def _install_main_runtime_patches():
         #   - PIPE SUMMARY 表示整形            -> core/global_context/context.py
         #   - SUMMARY AI しきい値の env 既定値 -> 直下の _apply_summary_ai_threshold_env()
         ("core.startup.low_movement_entry_guard_patch", "install"),
-        ("core.startup.entry_final_filter_failopen_patch", "install"),
+        # entry_final_filter_failopen_patch は本文化済み:
+        #   env 既定値 53 件 + entry_order_builder の 4 定数 + 連鎖 install 2 件
+        #     -> trading/handlers/entry_order_builder.apply_entry_final_filter_defaults()
+        #   range_5m_filter の fail-open ラップ
+        #     -> trading/handlers/entry_controller.range_5m_filter (low_movement の外側)
+        #   atr_1m_filter のラップ
+        #     -> tonosama rescue に巻き戻されて到達しない死にラッパーだったので撤去
+        # 位置は旧 install と同じ (定数を書き戻す watcher との順序があるため)。
+        ("trading.handlers.entry_order_builder", "apply_entry_final_filter_defaults"),
         ("core.startup.oneshot_limit_700k_patch", "install"),
         # entry_limit_passive_runtime_patch は
         # trading/handlers/entry_order_builder.py へ本文化済み (_elp_*)。
