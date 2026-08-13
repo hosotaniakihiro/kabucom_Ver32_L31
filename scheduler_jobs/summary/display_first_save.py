@@ -1,20 +1,27 @@
+# -*- coding: utf-8 -*-
 # ============================================================
-# File   : core/startup/summary_main_skip_save_for_display_patch.py
-# Version: V5-MAIN-DISPLAY-FIRST-SPOOL-NO-DIRECT-DEFAULT
+# File   : scheduler_jobs/summary/display_first_save.py
 # ------------------------------------------------------------
-# 目的:
-#   main.py 側で1分足PUSHサマリーを表示・AI優先にし、NAS SQLiteへの重い直接保存で
-#   summary_parent_tick / entry / exit_loop を詰まらせない。
+# 旧 core/startup/summary_main_skip_save_for_display_patch.py を移設した
+# (パッチではなく summary 保存側のヘルパ)。
 #
-# V5 修正:
-#   ✔ main.py側の direct SQLite 保存をデフォルトOFFに変更
-#   ✔ main.pyはDBに直接BEGIN IMMEDIATEしない。必要時は jsonl.gz spool のみ
-#   ✔ direct保存は SUMMARY_MAIN_ASYNC_DIRECT_DB_SAVE=1 の明示時だけ許可
-#   ✔ 09:12データ保存に180秒級かかる症状を避ける
+# main.py では 1m の表示を優先し、DB への直接保存は非同期/spool へ回す。
+#
+# **設置位置が重要**: 旧パッチは
+# scheduler_jobs.summary.runner_core._save_summary_if_owner を差し替えていたが、
+# 同じ属性は core/startup/__init__.py の SUMMARY RUNNER READY FILL も包んでいる。
+# __init__.py の方は module レベル (733 行) で core.startup の import 時に走り、
+# 旧パッチは startup.py 経由なので後。つまり実行時は
+#   native <- ready_fill <- display_first
+# で display_first が最外周だった。
+# display_first が短絡するときは ready_fill も走らない。
+#
+# したがって runner_core 本体へ畳むと順序が反転する。
+# 本文化では core/startup/__init__.py の ready_fill ラッパー冒頭で
+# should_display_first() を見る形にして、旧構成と同じ順序を保っている。
 # ============================================================
 
 from __future__ import annotations
-
 import datetime as dt
 import logging
 import os
@@ -23,16 +30,17 @@ import sys
 import threading
 import time
 from typing import Any
-
 import pandas as pd
 
 logger = logging.getLogger(__name__)
-
 _PATCHED = False
 _ORIGINAL_SAVE = None
 _ASYNC_LOCK = threading.RLock()
-_RUNNING_KEYS: set[str] = set()
 _LAST_DISABLED_LOG_TS = 0.0
+__all__ = ["install"]
+
+
+_RUNNING_KEYS: set[str] = set()
 
 
 def _env_flag(name: str) -> str:
@@ -378,80 +386,20 @@ def _submit_async_save(df: pd.DataFrame, interval: int, source: str) -> None:
     logger.warning("[SUMMARY MAIN ASYNC SAVE] submitted key=%s thread=%s", key, th.name)
 
 
-def install() -> bool:
-    global _PATCHED, _ORIGINAL_SAVE
-    if _PATCHED:
-        return True
-
-    try:
-        # 起動時点でmain.py側direct保存を明示的にOFFにする。
-        os.environ.setdefault("SUMMARY_MAIN_ASYNC_DIRECT_DB_SAVE", "0")
-        os.environ.setdefault("SUMMARY_MAIN_ASYNC_SPOOL_ON_LOCK", "1")
-        os.environ.setdefault("SUMMARY_MAIN_SKIP_1M_SAVE_BEFORE_DISPLAY", "1")
-        os.environ.setdefault("SUMMARY_MAIN_SKIP_SAVE_BEFORE_DISPLAY_INTERVALS", "1")
-
-        import scheduler_jobs.summary.runner_core as rc
-
-        cur = getattr(rc, "_save_summary_if_owner", None)
-        if not callable(cur):
-            logger.warning("[SUMMARY MAIN DISPLAY-FIRST SAVE PATCH] target missing")
-            return False
-        if getattr(cur, "_summary_main_display_first_async_save_patch_v5", False):
-            _PATCHED = True
-            return True
-
-        _ORIGINAL_SAVE = cur
-
-        def _patched_save_summary_if_owner(df, interval: int, *, source: str):
-            try:
-                iv = int(interval)
-            except Exception:
-                iv = interval
-
-            if _should_display_first(int(iv), str(source)):
-                try:
-                    rows = len(df) if hasattr(df, "__len__") else 0
-                except Exception:
-                    rows = 0
-                logger.warning(
-                    "[SUMMARY MAIN DISPLAY-FIRST SAVE PATCH] display first; main DB direct save disabled by default interval=%s source=%s rows=%s role=%s direct=%s spool=%s",
-                    iv,
-                    source,
-                    rows,
-                    os.getenv("SUMMARY_DB_WRITER_ROLE", ""),
-                    os.getenv("SUMMARY_MAIN_ASYNC_DIRECT_DB_SAVE", "0"),
-                    _env_bool("SUMMARY_MAIN_ASYNC_SPOOL_ON_LOCK", True),
-                )
-                _submit_async_save(df, int(iv), str(source))
-                return None
-
-            return _ORIGINAL_SAVE(df, int(iv), source=source)
-
-        _patched_save_summary_if_owner._summary_main_display_first_async_save_patch = True  # type: ignore[attr-defined]
-        _patched_save_summary_if_owner._summary_main_display_first_async_save_patch_v4 = True  # type: ignore[attr-defined]
-        _patched_save_summary_if_owner._summary_main_display_first_async_save_patch_v5 = True  # type: ignore[attr-defined]
-        _patched_save_summary_if_owner._summary_main_skip_save_display_patch = True  # type: ignore[attr-defined]
-        _patched_save_summary_if_owner._original = cur  # type: ignore[attr-defined]
-        rc._save_summary_if_owner = _patched_save_summary_if_owner
-        _PATCHED = True
-        logger.warning(
-            "[SUMMARY MAIN DISPLAY-FIRST SAVE PATCH] installed v5 enabled=%s intervals=%s direct_default=%s spool_on_lock=%s",
-            _env_bool("SUMMARY_MAIN_SKIP_1M_SAVE_BEFORE_DISPLAY", True),
-            sorted(_skip_intervals()),
-            os.getenv("SUMMARY_MAIN_ASYNC_DIRECT_DB_SAVE", "0"),
-            _env_bool("SUMMARY_MAIN_ASYNC_SPOOL_ON_LOCK", True),
-        )
-        return True
-
-    except Exception:
-        logger.exception("[SUMMARY MAIN DISPLAY-FIRST SAVE PATCH] install failed")
-        return False
+def should_display_first(interval, source) -> bool:
+    return _should_display_first(int(interval), str(source))
 
 
-try:
-    install()
-except Exception:
-    logger.exception("[SUMMARY MAIN DISPLAY-FIRST SAVE PATCH] auto install failed")
+def submit_async_save(df, interval, source) -> None:
+    _submit_async_save(df, int(interval), str(source))
 
 
-__all__ = ["install"]
+def apply_env_defaults() -> None:
+    """旧 install() 冒頭の env setdefault を再現する。"""
+    os.environ.setdefault("SUMMARY_MAIN_ASYNC_DIRECT_DB_SAVE", "0")
+    os.environ.setdefault("SUMMARY_MAIN_ASYNC_SPOOL_ON_LOCK", "1")
+    os.environ.setdefault("SUMMARY_MAIN_SKIP_1M_SAVE_BEFORE_DISPLAY", "1")
+    os.environ.setdefault("SUMMARY_MAIN_SKIP_SAVE_BEFORE_DISPLAY_INTERVALS", "1")
+
+
+apply_env_defaults()

@@ -200,6 +200,33 @@ def _install_entry_runtime_init_patches() -> None:
             logger.warning("[SUMMARY RUNNER READY FILL] _save_summary_if_owner not callable")
         else:
             def _core_save_summary_if_owner_patched(df, interval: int, *, source: str) -> None:
+                # 旧 core/startup/summary_main_skip_save_for_display_patch.py を本文化。
+                # 旧構成では ready_fill(この関数) の **外側** に display-first ラッパーが
+                # 載っていた (__init__.py はモジュールレベルで先に走り、旧パッチは
+                # startup.py 経由で後だったため)。短絡時は ready_fill も走らない。
+                # 順序を保つため、この関数の冒頭で判定する。
+                try:
+                    from scheduler_jobs.summary.display_first_save import (
+                        should_display_first as _df_should,
+                        submit_async_save as _df_submit,
+                    )
+
+                    if _df_should(interval, source):
+                        try:
+                            _rows = len(df) if hasattr(df, "__len__") else 0
+                        except Exception:
+                            _rows = 0
+                        logger.warning(
+                            "[SUMMARY MAIN DISPLAY-FIRST SAVE PATCH] display first; main DB direct save disabled by default interval=%s source=%s rows=%s role=%s direct=%s",
+                            interval, source, _rows,
+                            os.getenv("SUMMARY_DB_WRITER_ROLE", ""),
+                            os.getenv("SUMMARY_MAIN_ASYNC_DIRECT_DB_SAVE", "0"),
+                        )
+                        _df_submit(df, interval, source)
+                        return None
+                except Exception:
+                    logger.exception("[SUMMARY MAIN DISPLAY-FIRST SAVE PATCH] display-first check failed; fall through to normal save")
+
                 try:
                     _core_ready_fill_inplace(df, interval=int(interval), source=str(source))
                 except Exception:

@@ -139,14 +139,13 @@ def _is_due(interval: int, now: dt.datetime) -> bool:
 
 
 def _install_display_first_patch() -> bool:
-    try:
-        from core.startup.summary_main_skip_save_for_display_patch import install as install_display_first
-        ok = bool(install_display_first())
-        logger.warning("[SUMMARY PUSH BG DUE GUARD] display-first save skip patch installed=%s", ok)
-        return ok
-    except Exception:
-        logger.exception("[SUMMARY PUSH BG DUE GUARD] display-first save skip patch install failed")
-        return False
+    """summary_main_skip_save_for_display_patch は本文化済み。
+
+    display-first 判定は core/startup/__init__.py の
+    SUMMARY RUNNER READY FILL ラッパー冒頭へ移した (旧構成と同じ最外周)。
+    ヘルパと env 既定値は scheduler_jobs/summary/display_first_save.py。
+    """
+    return True
 
 
 def _install_seed_fast_patch() -> bool:
