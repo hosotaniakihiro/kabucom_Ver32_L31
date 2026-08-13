@@ -959,7 +959,7 @@ def _install_entrypoint_runtime_patches() -> None:
     except Exception:
         logger.exception("[startup.entrypoint] tonosama history missing guard install failed")
 
-    # summary_seed_recent_merged_guard_patch は core/startup/summary_db_seed_restore_patch.py の
+    # summary_seed_recent_merged_guard_patch は core/startup/summary_db_seed_restore.py の
     # _publish_interval (SUMMARY_SEED_RECENT_MERGED_GUARD_ENABLED gate 込み) へ native化済み。
 
     # daily_mtf_daily_src_alias_patch は削除した。

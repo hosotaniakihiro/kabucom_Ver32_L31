@@ -1,5 +1,5 @@
 # ============================================================
-# File   : core/startup/summary_db_seed_restore_patch.py
+# File   : core/startup/summary_db_seed_restore.py
 # Version: V1.6-SKIP-IN-MAIN-PROCESS
 # ------------------------------------------------------------
 # 目的:
@@ -13,6 +13,14 @@
 #     fallback/rebuild 遅延を誘発していたため、main process では無効化。
 #   - force=True または SUMMARY_DB_SEED_RESTORE_RUN_IN_MAIN=1 の場合のみ main.py でも実行可能。
 # ============================================================
+# ------------------------------------------------------------
+# 旧 core/startup/summary_db_seed_restore_patch.py から改名した。
+# install() を持たず、他モジュールの関数を差し替えることもない
+# (global_data.summary_Nm_df への代入はデータ公開)。
+# restore_summary_db_seed() を公開するだけの通常ライブラリなので、
+# *_patch.py の名前を外した。呼び出し元は
+# core/startup/startup_runtime.py:216 の 1 箇所。
+# ------------------------------------------------------------
 from __future__ import annotations
 
 import datetime as dt

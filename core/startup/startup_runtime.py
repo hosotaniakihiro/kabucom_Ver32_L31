@@ -213,7 +213,7 @@ def _install_summary_controller_ready_mtf_patch() -> None:
 
 def _restore_summary_db_seed_after_bootstrap(summary_db_path) -> None:
     try:
-        from core.startup.summary_db_seed_restore_patch import restore_summary_db_seed
+        from core.startup.summary_db_seed_restore import restore_summary_db_seed
         result = restore_summary_db_seed(summary_db_path)
         logger.warning("[STARTUP.RUNTIME] summary DB seed restore result=%s", result)
     except Exception:
