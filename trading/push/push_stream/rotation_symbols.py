@@ -816,7 +816,41 @@ def _resolve_register_targets_clamped() -> List[str]:
     return _ilg_clamp(base)
 
 
+# ============================================================
+# ROTATION STABILITY / LIQUIDITY KEEP100
+# (旧 rotation_stability_patch.py と rotation_liquidity_keep100_patch.py)
+# ------------------------------------------------------------
+# 旧 install は
+#   resolve_monitor_symbols / resolve_register_targets を stability 版へ置換
+#   apply_register_liquidity_guard を stability -> keep100 の順に 2 段ラップ
+# していた。実装本体は rotation_stability.py に残し、ここは束縛だけを持つ。
+# ネイティブ実装は *_core にリネームしてある (stability 版は元実装を呼ばない)。
+# ============================================================
+
+
 def resolve_monitor_symbols() -> List[str]:
+    from . import rotation_stability
+
+    return rotation_stability.resolve_monitor_symbols()
+
+
+def resolve_register_targets() -> List[str]:
+    from . import rotation_stability
+
+    return rotation_stability.resolve_register_targets()
+
+
+def apply_register_liquidity_guard(targets: Sequence[str]) -> List[str]:
+    """keep100 -> stability fail-open -> ネイティブガード の順。"""
+    from . import rotation_liquidity_keep100, rotation_stability
+
+    def _stability(t):
+        return rotation_stability.apply_register_liquidity_guard(t, apply_register_liquidity_guard_core)
+
+    return rotation_liquidity_keep100.apply_keep100_guard(targets, _stability)
+
+
+def resolve_monitor_symbols_core() -> List[str]:
     """2層目: 100件までの topup (旧 push_registration_recovery_patch)。"""
     if not _prr_scope_enabled():
         return _resolve_monitor_symbols_clamped()
@@ -883,7 +917,7 @@ def resolve_monitor_symbols() -> List[str]:
     return out
 
 
-def resolve_register_targets() -> List[str]:
+def resolve_register_targets_core() -> List[str]:
     """2層目: audit ログのみ (戻り値は変えない / 旧 push_registration_recovery_patch)。"""
     if not _prr_scope_enabled():
         return _resolve_register_targets_clamped()
@@ -908,7 +942,7 @@ def resolve_register_targets() -> List[str]:
 # ============================================================
 
 
-def apply_register_liquidity_guard(targets: Sequence[str]) -> List[str]:
+def apply_register_liquidity_guard_core(targets: Sequence[str]) -> List[str]:
     from trading.ranking.active_symbols.recent_liquidity import (
         apply_failopen_min_keep as _wrl_failopen,
         filter_symbols as _wrl_filter,
@@ -917,3 +951,9 @@ def apply_register_liquidity_guard(targets: Sequence[str]) -> List[str]:
     base = _apply_register_liquidity_guard_core(targets)
     out = _wrl_filter(base, context="push.rotation.apply_register_liquidity_guard")
     return _wrl_failopen(list(targets or []), out)
+
+
+# 旧パッチが立てていた互換フラグ
+_STABILITY_PATCHED_TARGET_TOPUP = True
+_STABILITY_PATCHED_LIQ_FAILOPEN = True
+_LIQ_KEEP100_PATCHED = True

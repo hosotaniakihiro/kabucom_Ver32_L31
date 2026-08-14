@@ -413,3 +413,28 @@ def _rotation_worker() -> None:
 
 
 __all__ = ["VERSION", "enable_rotation", "_rotation_worker"]
+
+
+# ============================================================
+# ROTATION STABILITY (旧 rotation_stability_patch._patch_batches /
+#                     _patch_target_resolution の rotation_core 側束縛)
+# ------------------------------------------------------------
+# A=50 / B=50 のローテーション用バッチ生成と、登録ターゲット解決を
+# rotation_stability の実装へ委譲する。旧 install と同じ束縛を
+# import 時に張るだけで、実装は rotation_stability.py にある。
+# ============================================================
+
+
+def _build_protected_rotation_batches(targets):
+    from . import rotation_stability
+
+    return rotation_stability.build_protected_rotation_batches(targets)
+
+
+def resolve_register_targets():
+    from . import rotation_stability
+
+    return rotation_stability.resolve_register_targets()
+
+
+_STABILITY_PATCHED_BATCHES = True

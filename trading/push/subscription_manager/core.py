@@ -177,7 +177,7 @@ def _normalize_bool_optional(v: Any, default: bool) -> bool:
         return bool(default)
 
 
-def refresh_subscriptions(
+def refresh_subscriptions_core(
     symbols: Any = None,
     *,
     reason: str = "manual",
@@ -423,3 +423,25 @@ __all__ = [
     "start_symbol_subscription_manager",
     "stop_symbol_subscription_manager",
 ]
+
+
+# ============================================================
+# ROTATION STABILITY (旧 rotation_stability_patch._patch_refresh)
+# ------------------------------------------------------------
+# ローテーション / 寄付き時は clear -> register の順序を明示的に踏む。
+# 実装は trading/push/push_stream/rotation_stability.py にあり、
+# ここは公開名の束縛だけを持つ (ネイティブは *_core)。
+# ============================================================
+
+
+def refresh_subscriptions(symbols=None, **kwargs):
+    import sys
+
+    from trading.push.push_stream import rotation_stability
+
+    return rotation_stability.refresh_subscriptions(
+        refresh_subscriptions_core, sys.modules[__name__], symbols, **kwargs
+    )
+
+
+_STABILITY_PATCHED_ROTATION_CLEAR = True

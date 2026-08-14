@@ -32,16 +32,14 @@ from . import rotation_register as rotation_register
 from . import rotation_logging as rotation_logging
 
 try:
-    from . import rotation_stability_patch as rotation_stability_patch
-    rotation_stability_patch.install()
+    from . import rotation_stability as rotation_stability
 except Exception:
-    logger.exception("[push_stream] rotation_stability_patch install failed")
+    logger.exception("[push_stream] rotation_stability import failed")
 
 try:
-    from . import rotation_liquidity_keep100_patch as rotation_liquidity_keep100_patch
-    rotation_liquidity_keep100_patch.install()
+    from . import rotation_liquidity_keep100 as rotation_liquidity_keep100
 except Exception:
-    logger.exception("[push_stream] rotation_liquidity_keep100_patch install failed")
+    logger.exception("[push_stream] rotation_liquidity_keep100 import failed")
 
 from .transport import (
     set_refresh_callable,
@@ -425,8 +423,8 @@ __all__ = [
     "rotation_symbols",
     "rotation_register",
     "rotation_logging",
-    "rotation_stability_patch",
-    "rotation_liquidity_keep100_patch",
+    "rotation_stability",
+    "rotation_liquidity_keep100",
     "set_refresh_callable",
     "refresh_subscriptions",
     "get_ws_sender",
