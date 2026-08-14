@@ -340,7 +340,8 @@ def _install_summary_mtf_duplicate_datetime_guard() -> bool:
             ログ以外の効果が無かった。
       2. summary_ai_candidate_refill_patch._push_writer_state のラップ
          -> 同モジュールにこの属性は存在しない。「target missing」で False。
-      3. main_entry_runtime_operator_fix_patch の中継 install (main.py のみ)
+      3. main_entry_operator (旧 main_entry_runtime_operator_fix_patch) の
+         中継 install (main.py のみ)
          -> **これだけが実効**。しかもこのパッチを install しているのは
             リポジトリ全体でここ 1 箇所だけなので、そのまま残す。
 
@@ -351,7 +352,7 @@ def _install_summary_mtf_duplicate_datetime_guard() -> bool:
             and not _summary_mtf_guard_is_db_collector_context()):
         return False
     try:
-        from core.startup import main_entry_runtime_operator_fix_patch as p
+        from core.startup import main_entry_operator as p
 
         fn = getattr(p, "install", None)
         ok = bool(fn()) if callable(fn) else False

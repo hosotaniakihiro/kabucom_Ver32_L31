@@ -195,6 +195,35 @@ def _cache_key_for_push_db(path: str, now_i: dt.datetime, lookback_min: int, lim
 
 
 def _load_push_raw_db_1m_history() -> pd.DataFrame:
+    """1 分足履歴を メモリ -> PUSH raw DB -> fresh raw の順で取る。
+
+    旧 core/startup/main_entry_runtime_operator_fix_patch.
+    _patch_tonosama_memory_history_once() の本文化。
+    main.py は PUSH DB を保存しない (main_database.py が持つ) ため、
+    DB だけを見ると履歴が無いと判定されて Tonosama が止まる。
+    同パッチを包む相手は他に無かったのでラッパーごと本体へ畳んだ。
+    """
+    import datetime as _dt
+
+    try:
+        from trading.summary.push_raw_1m_source import load_fresh_raw_1m, load_push_memory_1m_history
+
+        mem = load_push_memory_1m_history()
+        if isinstance(mem, pd.DataFrame) and not mem.empty:
+            return mem
+        db = _load_push_raw_db_1m_history_core()
+        if isinstance(db, pd.DataFrame) and not db.empty:
+            return db
+        raw = load_fresh_raw_1m(_dt.datetime.now())
+        if isinstance(raw, pd.DataFrame) and not raw.empty:
+            return raw
+        return mem if isinstance(mem, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        logger.debug("[TONOSAMA PUSH RAW DB HISTORY] memory/fresh fallback unavailable", exc_info=True)
+        return _load_push_raw_db_1m_history_core()
+
+
+def _load_push_raw_db_1m_history_core() -> pd.DataFrame:
     if not _env_bool("TONOSAMA_PUSH_RAW_DB_HISTORY_ENABLED", True):
         return pd.DataFrame()
 
