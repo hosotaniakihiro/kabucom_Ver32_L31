@@ -121,6 +121,41 @@ ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY = str(os.getenv("ENTRY_ORDER_REQUIRE_BOARD
 }
 
 
+_FAST_ORDER_DEFAULTS_APPLIED = False
+
+
+def apply_fast_order_builder_defaults() -> bool:
+    """旧 summary_ai_runtime_consistency_patch._install_fast_order_builder() の本文化。
+
+    summary_ai_fast_order_builder_patch 本体は当ファイルへ本文化済み (_fob_*) で、
+    env/定数の適用も import 時の _fob_apply_env_and_constants() が行う。
+    ここに残っているのは板リトライの env 既定値 2 件と、
+    旧 install が連鎖していた strict board policy の適用だけ。
+    呼び出し元は trading/entry/summary_ai/direct_input_context (旧 install 導線)。
+    """
+    global _FAST_ORDER_DEFAULTS_APPLIED
+    if _FAST_ORDER_DEFAULTS_APPLIED:
+        return False
+    if str(os.getenv("SUMMARY_AI_FAST_ORDER_BUILDER_ENABLED", "1")).strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    try:
+        os.environ.setdefault("ENTRY_ORDER_BOARD_RETRY_SEC", "0.8")
+        os.environ.setdefault("ENTRY_ORDER_BOARD_RETRY_INTERVAL_SEC", "0.2")
+        ok = True
+        try:
+            r = bool(apply_strict_board_rest_policy())
+            logger.warning("[SUMMARY AI RUNTIME CONSISTENCY] strict board policy chain installed=%s", r)
+        except Exception:
+            ok = False
+            logger.exception("[SUMMARY AI RUNTIME CONSISTENCY] strict board policy chain install failed")
+        _FAST_ORDER_DEFAULTS_APPLIED = True
+        logger.warning("[SUMMARY AI RUNTIME CONSISTENCY] fast order builder inlined; chains installed ok=%s", ok)
+        return True
+    except Exception:
+        logger.exception("[SUMMARY AI RUNTIME CONSISTENCY] fast order builder defaults failed")
+        return False
+
+
 # 旧 tonosama_history_failclose_strict_patch._patch_order_builder() の定数表。
 STRICT_ORDER_CONSTANTS: dict[str, bool] = {
     "ENTRY_ORDER_REQUIRE_ATR": True,

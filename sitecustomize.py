@@ -362,7 +362,7 @@ SYNC_MAIN_PATCHES = [
     ("core.startup.sqlite_memory_pragmas", "SQLITE_MEMORY_PRAGMAS", "DISABLE_SQLITE_MEMORY_PRAGMAS_PATCH"),
     # summary_ai_volatility_rescue_patch は削除済み (env 既定値のみのstubだった)。
     # 代わりに _apply_summary_ai_vol_rescue_env_defaults() を install 前に呼ぶ。
-    ("core.startup.summary_ai_runtime_consistency_patch", "SUMMARY_AI_RUNTIME_CONSISTENCY", "DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH"),
+    ("trading.entry.summary_ai.direct_input_context", "SUMMARY_AI_RUNTIME_CONSISTENCY", "DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH"),
     # summary_main_push_db_refresh_patch は削除した。
     # _load_push_memory_df の stale 時 PUSH DB 再取得は
     # scheduler_jobs/summary/memory_latest_1m.py へ本文化済み
@@ -430,7 +430,7 @@ BACKGROUND_MAIN_PATCHES = [
     # (env 既定値 + runner のガード/候補補充ラップ。fallback stale guard は
     #  scheduler_jobs/summary/fallback_loader.select_best_candidate 本体へ本文化済み)。
     ("trading.entry.summary_ai.candidate_refill", "SUMMARY_AI_CANDIDATE_REFILL", "DISABLE_SUMMARY_AI_CANDIDATE_REFILL_PATCH"),
-    ("core.startup.summary_ai_runtime_consistency_patch", "SUMMARY_AI_RUNTIME_CONSISTENCY_BG", "DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH"),
+    ("trading.entry.summary_ai.direct_input_context", "SUMMARY_AI_RUNTIME_CONSISTENCY_BG", "DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH"),
     ("trading.filters.summary_ai_range_bridge", "SUMMARY_AI_LOW_MOVE_SOFTPASS", "DISABLE_SUMMARY_AI_LOW_MOVE_SOFTPASS_PATCH"),
     # summary_mtf_early_ready_patch は AI/entry_gate.py の _summary_mtf_status へ
     # 本文化済み (_emr_*)。controller_cache の history-first ラッパーは
@@ -569,7 +569,7 @@ def _background_main_patch_loop() -> None:
     # ラップ対象が無くなり、実効は env 既定値だけなので再適用は不要になった。
     # setdefault は冪等なので loop 先頭の 1 回で足りる。
     # Last Summary-AI consistency pass must run after board/signature and candidate-refill patches.
-    _install_module("core.startup.summary_ai_runtime_consistency_patch", "SUMMARY_AI_RUNTIME_CONSISTENCY_LAST", disabled_env="DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH")
+    _install_module("trading.entry.summary_ai.direct_input_context", "SUMMARY_AI_RUNTIME_CONSISTENCY_LAST", disabled_env="DISABLE_SUMMARY_AI_RUNTIME_CONSISTENCY_PATCH")
     logger.warning("[SITECUSTOMIZE] main background patches done")
 
 

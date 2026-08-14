@@ -251,6 +251,18 @@ def _get_scored_completed_push_summary() -> Any:
 
 
 def _get_push_1m_context() -> Any:
+    # 旧 summary_ai_runtime_consistency_patch._get_push_1m_context_direct_first()
+    # を本文化。いま SUMMARY_AI へ直接渡された 1m df が新鮮ならそれを最優先する
+    # (global_context の summary_history が古いだけで止められるのを防ぐ)。
+    try:
+        from .direct_input_context import resolve_direct_df
+
+        direct = resolve_direct_df()
+        if direct is not None:
+            return direct
+    except Exception:
+        logger.debug("[SUMMARY AI DIRECT INPUT GUARD] direct df resolve failed", exc_info=True)
+
     first_empty = None
     scored = _get_scored_completed_push_summary()
     if not _is_empty_df_like(scored):
