@@ -223,7 +223,79 @@ def _install_main_runtime_patches():
 
     _apply_summary_ai_threshold_env()
 
+    def _fast_startup_background_heavy() -> None:
+        """旧 fast_startup_runtime_patch._background_heavy()。
+
+        重い install を別スレッドへ逃がす。symbol_flags のキャッシュ構築のあと、
+        direct_push_1m を再適用して job_summary を包み直す
+        (他パッチが後から job_summary をラップしても直販路を残すため)。
+        旧 jobs リストのうち summary_mtf_push_raw_fallback_patch は
+        モジュールごと本文化済みで存在しないため落とした。
+        """
+        try:
+            from core.startup.bootstrap.symbol_flags import install_symbol_flags_cache
+
+            ok = bool(install_symbol_flags_cache(force=True))
+            logger.warning("[FAST STARTUP] symbol_flags_bootstrap installed=%s", ok)
+        except Exception:
+            logger.exception("[FAST STARTUP] symbol_flags_bootstrap install failed")
+
+        for label in ("bg", "bg-final"):
+            try:
+                from scheduler_jobs.summary import direct_push_1m
+
+                logger.warning("[FAST STARTUP] direct_push_1m:%s installed=%s", label, bool(direct_push_1m.install()))
+            except Exception:
+                logger.exception("[FAST STARTUP] direct_push_1m:%s install failed", label)
+        logger.warning("[FAST STARTUP] background heavy installs done")
+
+    def _start_fast_startup_background_heavy() -> bool:
+        """FAST_STARTUP_ASYNC_HEAVY_PATCHES=0 のときだけ同期実行する。"""
+        raw = os.getenv("FAST_STARTUP_ASYNC_HEAVY_PATCHES")
+        async_heavy = True
+        if raw is not None and str(raw).strip() != "":
+            async_heavy = str(raw).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+        if async_heavy:
+            Thread(
+                target=_fast_startup_background_heavy,
+                name="fast-startup-heavy-installs",
+                daemon=True,
+            ).start()
+            logger.warning("[FAST STARTUP] heavy installs scheduled background")
+        else:
+            _fast_startup_background_heavy()
+        return True
+
     patches = [
+        # fast_startup_runtime_patch は本文化して解体済み。
+        # 旧 install() の並びをそのままこの位置に展開してある。
+        #   - _patch_summary_schema_bootstrap
+        #       -> database/session.apply_fast_startup_schema_skip()
+        #   - _patch_entry_max_approved
+        #       -> trading/handlers/entry_controller.apply_fast_startup_entry_limits()
+        #   - _patch_ranking_bootstrap
+        #       -> core/startup/scheduler/bootstrap.apply_fast_startup_ranking_defaults()
+        #         (併せて掛かっていた _run_ranking_summary_all_job_safe の
+        #          「戻り値を捨てる」ラッパーは同関数本体へ畳み込み済み)
+        #   - _background_heavy
+        #       -> 直下の _start_fast_startup_background_heavy()
+        # 旧 install が呼んでいた summary_parallel_intervals_runtime_patch /
+        # entry_limit_passive_runtime_patch / summary_mtf_push_raw_fallback_patch は
+        # いずれも本文化でモジュールごと消えており、import 失敗で毎回 NG に
+        # なるだけの死に呼び出しだったため復元していない。
+        # summary_parallel_main_scope.install() は _INSTALLED で冪等なので、
+        # 旧 pre/post の 2 回呼びは 1 回へ畳んだ。
+        ("core.startup.summary_parallel_main_scope", "install"),
+        ("scheduler_jobs.summary.light_tick_1m", "install"),
+        ("database.session", "apply_fast_startup_schema_skip"),
+        ("trading.handlers.entry_controller", "apply_fast_startup_entry_limits"),
+        ("core.startup.scheduler.bootstrap", "apply_fast_startup_ranking_defaults"),
+        ("scheduler_jobs.summary.direct_push_1m", "install"),
+        _start_fast_startup_background_heavy,
+        # 最後にもう一度同期で direct_push_1m を再適用する。
+        # 上の install 群が job_summary を包み直している可能性があるため
+        # (旧 install() 末尾の "direct_push_1m:final" と同じ意図)。
+        ("scheduler_jobs.summary.direct_push_1m", "install"),
         # summary_scheduler_shutdown_guard_patch は
         # scheduler_jobs/summary/scheduler.py へ本文化済みのため削除
         # (_run_with_timeout/_invoke_job/_run_push_summary_tick/_run_ranking_summary_tick/
@@ -238,7 +310,6 @@ def _install_main_runtime_patches():
         #   の各公開関数が直接使う。
         # entry_controller_runtime_reject_patch は trading/handlers/entry_controller.py の
         # cleanup_stale_100368_sell_reject_cache() へ native化済み (直接呼び出しは下記)。
-        ("core.startup.fast_startup_runtime_patch", "install"),
         ("scheduler_jobs.summary.memory_latest_1m", "install"),
         ("trading.summary.mtf_diff_from_1m", "install"),
         # entry_qty_min_lot_runtime_patch は3責務に分割して本文化済み:
@@ -313,10 +384,19 @@ def _install_main_runtime_patches():
         # trading/ranking/ranking_technical_store.py._calculate_technicals
         # (期間出来高補正) へ本文化済みのため削除。
     ]
-    for mod_name, fn_name in patches:
+    for item in patches:
+        # 要素は ("module", "function") のほか、main.py 内で完結する処理を
+        # 並び順どおりに挟むための素の callable も許す。
+        if callable(item):
+            mod_name, fn_name = "main", getattr(item, "__name__", "<callable>")
+        else:
+            mod_name, fn_name = item
         try:
-            mod = importlib.import_module(mod_name)
-            fn = getattr(mod, fn_name, None)
+            if callable(item):
+                fn = item
+            else:
+                mod = importlib.import_module(mod_name)
+                fn = getattr(mod, fn_name, None)
             ok = fn() if callable(fn) else False
             logger.warning("[MAIN RUNTIME PATCH] %s.%s installed=%s", mod_name, fn_name, ok)
             heartbeat("main_runtime_patch", status="OK" if ok else "NG", detail={"module": mod_name, "fn": fn_name})

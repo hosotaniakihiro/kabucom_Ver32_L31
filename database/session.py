@@ -18,6 +18,7 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 import logging
+import os
 import sqlite3
 from typing import Any
 
@@ -55,6 +56,10 @@ _Session_ranking = None
 _Session_tosama = None
 
 _initialized = False
+
+# 旧 fast_startup_runtime_patch が _bootstrap_summary_schema を no-op へ
+# 差し替えていたのと同じ効果。apply_fast_startup_schema_skip() で True になる。
+_SKIP_SUMMARY_SCHEMA_BOOTSTRAP = False
 
 push_engine = None
 summary_engine = None
@@ -372,8 +377,35 @@ def _ensure_column(
         return False
 
 
+def _fss_env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return bool(default)
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
+
+
+def apply_fast_startup_schema_skip() -> bool:
+    """旧 fast_startup_runtime_patch._patch_summary_schema_bootstrap() の本文化。
+
+    旧パッチは _bootstrap_summary_schema を no-op 関数へ差し替えていたが、
+    ここでは同じ効果をフラグで表現する。呼び出し元は main.py の
+    _install_main_runtime_patches のみ (= 旧 install 導線と同じスコープ)。
+    FAST_STARTUP_SKIP_SUMMARY_SCHEMA_BOOTSTRAP=0 で従来どおり補完させられる
+    (旧パッチも同じ env で無効化できた)。
+    """
+    global _SKIP_SUMMARY_SCHEMA_BOOTSTRAP
+    if not _fss_env_bool("FAST_STARTUP_SKIP_SUMMARY_SCHEMA_BOOTSTRAP", True):
+        return False
+    _SKIP_SUMMARY_SCHEMA_BOOTSTRAP = True
+    logger.warning("[SCHEMA BOOTSTRAP] summary schema bootstrap disabled (fast startup)")
+    return True
+
+
 def _bootstrap_summary_schema(engine) -> None:
     """起動時に summary DB の不足列を database/models.py から補完する。"""
+    if _SKIP_SUMMARY_SCHEMA_BOOTSTRAP:
+        return
+
     model_columns = _summary_model_columns()
     targets = tuple(model_columns.keys()) or SUMMARY_TARGET_TABLES
 

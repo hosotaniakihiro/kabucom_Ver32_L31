@@ -147,8 +147,8 @@ def _install_strict_entry_defaults(context: str) -> bool:
         if os.environ.get("DISABLE_STRICT_ENTRY_DEFAULTS_PATCH", "").strip() == "1":
             logger.warning("[RUNTIME ENV DEFAULTS PATCH] strict entry defaults disabled by env")
             return False
-        from .. import tonosama_history_failclose_strict_patch
-        ok = bool(tonosama_history_failclose_strict_patch.install())
+        from .. import strict_entry_defaults
+        ok = bool(strict_entry_defaults.install())
         logger.warning("[RUNTIME ENV DEFAULTS PATCH] strict entry defaults installed ok=%s context=%s", ok, context)
         return ok
     except Exception:

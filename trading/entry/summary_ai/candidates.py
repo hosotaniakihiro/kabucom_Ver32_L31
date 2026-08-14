@@ -44,6 +44,31 @@ DEFAULT_MIN_BUY_SLOPE = 0.01
 DEFAULT_MAX_SELL_SLOPE = -0.01
 VERSION = "REV2.6-SUMMARY-1M-MOVEMENT-SCORE-BRIDGE-STRONG"
 
+# 旧 tonosama_history_failclose_strict_patch._patch_summary_ai() の定数表。
+STRICT_CANDIDATE_CONSTANTS: dict[str, float] = {
+    "DEFAULT_MIN_BUY_SCORE": 3.0,
+    "DEFAULT_MAX_SELL_SCORE": 3.0,
+    "DEFAULT_MIN_BUY_SLOPE": 0.0,
+    "DEFAULT_MAX_SELL_SLOPE": 0.0,
+}
+
+
+def apply_strict_candidate_constants() -> dict[str, tuple[Any, Any]]:
+    """旧 tonosama_history_failclose_strict_patch._patch_summary_ai() の定数部を本文化。
+
+    core/startup/strict_entry_defaults.py が install 時と watcher から毎秒呼ぶ。
+    これらは関数シグネチャの既定値としても使われるが、既定値は import 時に
+    束縛済みなので、実効があるのは実行時に globals() を読む経路
+    (_resolve_min_buy_slope / _resolve_max_sell_slope など) 側。
+    """
+    changed: dict[str, tuple[Any, Any]] = {}
+    for name, value in STRICT_CANDIDATE_CONSTANTS.items():
+        old = globals().get(name)
+        if old != value:
+            globals()[name] = value
+            changed[name] = (old, value)
+    return changed
+
 
 def _env_float(name: str, default: float) -> float:
     try:

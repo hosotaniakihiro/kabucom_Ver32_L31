@@ -121,6 +121,28 @@ ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY = str(os.getenv("ENTRY_ORDER_REQUIRE_BOARD
 }
 
 
+# 旧 tonosama_history_failclose_strict_patch._patch_order_builder() の定数表。
+STRICT_ORDER_CONSTANTS: dict[str, bool] = {
+    "ENTRY_ORDER_REQUIRE_ATR": True,
+    "ENTRY_ORDER_REQUIRE_HIGH_LOW": True,
+}
+
+
+def apply_strict_order_constants() -> Dict[str, Any]:
+    """旧 tonosama_history_failclose_strict_patch._patch_order_builder() の本文化。
+
+    core/startup/strict_entry_defaults.py が install 時と watcher から毎秒呼ぶ。
+    ATR / 高安が取れない銘柄を strict では必ず落とすための引き戻し。
+    """
+    changed: Dict[str, Any] = {}
+    for name, value in STRICT_ORDER_CONSTANTS.items():
+        old = globals().get(name)
+        if old != value:
+            globals()[name] = value
+            changed[name] = (old, value)
+    return changed
+
+
 def _ok(**kwargs) -> Dict[str, Any]:
     return {"ok": True, "reason": "OK", "detail": kwargs}
 

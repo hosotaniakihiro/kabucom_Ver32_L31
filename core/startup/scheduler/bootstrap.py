@@ -85,6 +85,35 @@ _DEFAULT_RANKING_TOP_N = 10
 _DEFAULT_RANKING_JOB_WARN_SECONDS = 45.0
 
 
+def apply_fast_startup_ranking_defaults() -> bool:
+    """旧 fast_startup_runtime_patch._patch_ranking_bootstrap() の本文化。
+
+    旧パッチは main.py:241 の _install_main_runtime_patches からのみ install され、
+    _DEFAULT_RANKING_LOOKBACK_MINUTES を FAST_STARTUP_RANKING_LOOKBACK_MIN
+    (既定 60) で上書きしていた。呼び出し元を main.py の patches リストに限る
+    ことでスコープを維持する。
+
+    旧パッチはあわせて _run_ranking_summary_all_job_safe を「戻り値を捨てて
+    None を返す」ラッパーで包んでいたが、そちらは同関数本体へ畳み込んだ
+    (schedule 側へ CancelJob 相当の戻り値を渡さないための保険)。
+    """
+    global _DEFAULT_RANKING_LOOKBACK_MINUTES
+    old = _DEFAULT_RANKING_LOOKBACK_MINUTES
+    try:
+        raw = os.getenv("FAST_STARTUP_RANKING_LOOKBACK_MIN")
+        val = 60 if raw is None or str(raw).strip() == "" else int(float(raw))
+    except Exception:
+        val = 60
+    if val > 0:
+        _DEFAULT_RANKING_LOOKBACK_MINUTES = int(val)
+    logger.warning(
+        "[FAST STARTUP] ranking bootstrap lookback %s->%s",
+        old,
+        _DEFAULT_RANKING_LOOKBACK_MINUTES,
+    )
+    return True
+
+
 # ============================================================
 # global_data helpers
 # ============================================================
@@ -1075,12 +1104,17 @@ def _run_ranking_summary_all_job_safe(*args: Any, **kwargs: Any):
     """
     global _RANKING_BG_RUNNING, _RANKING_BG_STARTED_AT
 
+    # 旧 fast_startup_runtime_patch._patch_ranking_bootstrap() が掛けていた
+    # 「戻り値を捨てて None を返す」ラッパーを本文へ畳み込んである。
+    # schedule 側へ CancelJob 相当の戻り値が渡ってジョブが消えるのを防ぐ。
     if not _ranking_bg_scope_enabled():
-        return _run_ranking_summary_all_job_sync()
+        _run_ranking_summary_all_job_sync()
+        return None
 
     _clear_ranking_job_running_if_stale(reason="direct_wrapper_entry")
     if not _ranking_bg_env_bool("RANKING_SUMMARY_SCHEDULE_BG", True):
-        return _run_ranking_summary_core_job()
+        _run_ranking_summary_core_job()
+        return None
 
     with _RANKING_BG_LOCK:
         _ranking_bg_clear_if_stale()

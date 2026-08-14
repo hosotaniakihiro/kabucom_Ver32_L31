@@ -181,6 +181,60 @@ MIN_COMPOSITE_SCORE_SELL = 1.0
 MAX_CANDIDATES_PER_SYMBOL = 10
 MAX_APPROVED_PER_RUN = 3
 
+
+def apply_fast_startup_entry_limits() -> bool:
+    """旧 fast_startup_runtime_patch._patch_entry_max_approved() の本文化。
+
+    旧パッチは main.py:241 の _install_main_runtime_patches からのみ install され、
+    MAX_APPROVED_PER_RUN を ENTRY_MAX_APPROVED_PER_RUN (既定 10) で上書きしていた。
+    呼び出し元を main.py の patches リストに限ることでスコープを維持する。
+    """
+    global MAX_APPROVED_PER_RUN
+    old = MAX_APPROVED_PER_RUN
+    try:
+        raw = os.getenv("ENTRY_MAX_APPROVED_PER_RUN")
+        val = 10 if raw is None or str(raw).strip() == "" else int(float(raw))
+    except Exception:
+        val = 10
+    if val <= 0:
+        val = 10
+    MAX_APPROVED_PER_RUN = int(val)
+    logger.warning(
+        "[FAST STARTUP] entry_controller.MAX_APPROVED_PER_RUN patched old=%s new=%s",
+        old,
+        MAX_APPROVED_PER_RUN,
+    )
+    return True
+
+
+# 旧 tonosama_history_failclose_strict_patch._patch_entry_controller() の定数表。
+# strict モードでのスコア/信頼度/承認上限の下限値。
+STRICT_ENTRY_CONSTANTS: dict[str, float | int] = {
+    "MIN_SUMMARY_SCORE_BUY": 3.0,
+    "MIN_SUMMARY_SCORE_SELL": 3.0,
+    "MIN_COMPOSITE_SCORE_BUY": 3.0,
+    "MIN_COMPOSITE_SCORE_SELL": 3.0,
+    "MIN_AI_CONFIDENCE_BUY": 0.60,
+    "MIN_AI_CONFIDENCE_SELL": 0.60,
+    "MAX_APPROVED_PER_RUN": 3,
+}
+
+
+def apply_strict_entry_constants() -> dict[str, tuple[Any, Any]]:
+    """旧 tonosama_history_failclose_strict_patch._patch_entry_controller() の本文化。
+
+    core/startup/strict_entry_defaults.py が install 時と watcher から毎秒呼ぶ。
+    他 install (fast_startup / more_candidates / oneshot_limit) が緩めた値を
+    strict 側へ引き戻すのが役目なので、毎回無条件に書き戻す。
+    """
+    changed: dict[str, tuple[Any, Any]] = {}
+    for name, value in STRICT_ENTRY_CONSTANTS.items():
+        old = globals().get(name)
+        if old != value:
+            globals()[name] = value
+            changed[name] = (old, value)
+    return changed
+
 # ==========================================================
 # Orchestrator
 # ==========================================================

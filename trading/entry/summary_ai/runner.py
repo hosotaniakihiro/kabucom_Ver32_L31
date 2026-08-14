@@ -36,6 +36,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+from functools import wraps
 from typing import Any, Callable, Dict, Optional
 
 import pandas as pd
@@ -1348,6 +1349,45 @@ def run_summary_ai_entry_from_df(*args, **kwargs):
     except Exception:
         logger.exception("[ENTRY FIRE RESCUE] runner kwargs relax failed; keep original kwargs")
     return _run_summary_ai_entry_from_df_core(*args, **kwargs)
+
+
+# ============================================================
+# STRICT ENTRY DEFAULTS
+# (旧 core/startup/tonosama_history_failclose_strict_patch._patch_summary_ai)
+# ------------------------------------------------------------
+# strict モードではスコアしきい値を 3.0 未満へ落とさせない。
+# core/startup/strict_entry_defaults.py が install 時と watcher から毎秒呼ぶ。
+#
+# 旧パッチと同じく「現在の run_summary_ai_entry_from_df の _original を取り出して
+# 包み直す」= 直前に掛かっていた外側ラッパーを 1 枚剥がす挙動をそのまま残す。
+# 実運用ではこれが最終決定権を持つ層なので、剥がす/剥がさないは観測挙動そのもの。
+# ============================================================
+
+
+def install_strict_kwargs_floor() -> bool:
+    """strict のスコア下限ラッパーを run_summary_ai_entry_from_df へ掛ける。"""
+    try:
+        cur = globals().get("run_summary_ai_entry_from_df")
+        if not callable(cur) or getattr(cur, "_strict_entry_defaults_runner_v4", False):
+            return True
+        orig = getattr(cur, "_original", cur)
+
+        @wraps(orig)
+        def wrapped(*args, **kwargs):
+            kwargs["min_buy_score"] = max(float(kwargs.get("min_buy_score", 0) or 0), 3.0)
+            kwargs["max_sell_score"] = max(float(kwargs.get("max_sell_score", 0) or 0), 3.0)
+            kwargs.setdefault("use_pre_slope_filter", True)
+            return orig(*args, **kwargs)
+
+        wrapped._strict_entry_defaults_runner_v3 = True  # type: ignore[attr-defined]
+        wrapped._strict_entry_defaults_runner_v4 = True  # type: ignore[attr-defined]
+        wrapped._original = orig  # type: ignore[attr-defined]
+        globals()["run_summary_ai_entry_from_df"] = wrapped
+        logger.warning("[STRICT ENTRY DEFAULTS] summary_ai runner strict wrapper installed")
+        return True
+    except Exception:
+        logger.debug("[STRICT ENTRY DEFAULTS] summary_ai runner strict wrapper skipped", exc_info=True)
+        return False
 
 
 def _efr_apply_top10_slope() -> None:

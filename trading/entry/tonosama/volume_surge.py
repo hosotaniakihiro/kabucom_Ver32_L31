@@ -16,6 +16,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+from functools import wraps
 
 import pandas as pd
 
@@ -408,6 +409,66 @@ def build_scalping_feature_df() -> pd.DataFrame:
     except Exception:
         pass
     return out.reset_index(drop=True)
+
+
+# ============================================================
+# STRICT ENTRY DEFAULTS
+# (旧 core/startup/tonosama_history_failclose_strict_patch._patch_tonosama)
+# ------------------------------------------------------------
+# strict モードでは history_missing / failopen の行をエントリー候補から落とす。
+# core/startup/strict_entry_defaults.py が install 時と watcher から毎秒呼ぶ。
+#
+# 旧パッチと同じく「現在の build_scalping_feature_df の _original を取り出して
+# 包み直す」= 直前に掛かっていた外側ラッパーを 1 枚剥がす挙動をそのまま残す。
+# 実測では usercustomize の recent volume 表示ラッパーがこれで剥がされて
+# 定常状態になるため、剥がす挙動そのものが観測挙動になっている。
+#
+# 旧パッチはあわせて _force_failopen_enabled / _failopen_reason を定数関数へ
+# 差し替えていたが、strict の env (TONOSAMA_FORCE_SURGE_FAILOPEN=0 ほか) を
+# 適用したネイティブ実装が同じ値・同じ文字列を返すため移していない。
+# ============================================================
+
+
+def install_strict_history_failclose() -> bool:
+    """strict の history_missing/failopen 行ドロップを build_scalping_feature_df へ掛ける。"""
+    try:
+        cur = globals().get("build_scalping_feature_df")
+        if not callable(cur) or getattr(cur, "_strict_no_history_failopen_v4", False):
+            return True
+        orig = getattr(cur, "_original", cur)
+
+        @wraps(orig)
+        def wrapped(*args, **kwargs):
+            out = orig(*args, **kwargs)
+            try:
+                if out is None or not isinstance(out, pd.DataFrame) or out.empty:
+                    return out
+                hist_missing = out.get("_volume_surge_history_missing", pd.Series(False, index=out.index)).fillna(False).astype(bool)
+                failopen = out.get("_volume_surge_failopen", pd.Series(False, index=out.index)).fillna(False).astype(bool)
+                bad = hist_missing | failopen
+                if bool(bad.any()):
+                    before = len(out)
+                    cols = [c for c in ["symbol", "symbolname", "_volume_surge_history_missing", "_volume_surge_failopen"] if c in out.columns]
+                    sample = out.loc[bad, cols].head(20).to_dict("records")
+                    out = out.loc[~bad].copy()
+                    logger.warning(
+                        "[STRICT ENTRY DEFAULTS] TONOSAMA drop history_missing/failopen rows before=%s after=%s dropped=%s sample=%s",
+                        before, len(out), int(bad.sum()), sample,
+                    )
+                return out
+            except Exception:
+                logger.exception("[STRICT ENTRY DEFAULTS] TONOSAMA strict drop failed; returning original output")
+                return out
+
+        wrapped._strict_no_history_failopen_v3 = True  # type: ignore[attr-defined]
+        wrapped._strict_no_history_failopen_v4 = True  # type: ignore[attr-defined]
+        wrapped._original = orig  # type: ignore[attr-defined]
+        globals()["build_scalping_feature_df"] = wrapped
+        logger.warning("[STRICT ENTRY DEFAULTS] TONOSAMA volume_surge strict wrapper installed")
+        return True
+    except Exception:
+        logger.debug("[STRICT ENTRY DEFAULTS] TONOSAMA volume_surge strict wrapper skipped", exc_info=True)
+        return False
 
 
 # ============================================================
