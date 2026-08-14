@@ -103,9 +103,9 @@ def _build_today_ranking_candidates_impl(
 
 def _load_today_ranking_db_fallback_symbols(target: int) -> List[str]:
     try:
-        from trading.ranking.active_symbols import db_ranking_fallback_patch as dbfb
+        from trading.ranking.active_symbols.db_ranking_fallback import load_symbols_from_ranking_db
 
-        return list(dbfb._load_symbols_from_ranking_db(max_rows=max(int(target) * 3, 300)) or [])[: int(target)]
+        return list(load_symbols_from_ranking_db(max_rows=max(int(target) * 3, 300)) or [])[: int(target)]
     except Exception:
         logger.debug("[ACTIVE SOURCE] today_ranking db fallback loader failed", exc_info=True)
         return []
@@ -1047,7 +1047,7 @@ def debug_active_symbols() -> dict:
 from trading.ranking.active_symbols.recent_liquidity import filter_symbols as _wrl_filter
 
 
-def update_active_symbols(force: bool = False) -> List[str]:
+def _update_active_symbols_wrl(force: bool = False) -> List[str]:
     symbols = _update_active_symbols_core(force)
     filtered = _wrl_filter(symbols, context="active.update_active_symbols")
     try:
@@ -1059,37 +1059,184 @@ def update_active_symbols(force: bool = False) -> List[str]:
     return filtered
 
 
-
-def get_active_symbols(*args, **kwargs) -> List[str]:
+def _get_active_symbols_wrl(*args, **kwargs) -> List[str]:
     return _wrl_filter(_get_active_symbols_core(*args, **kwargs), context="active.get_active_symbols")
 
 
+# ============================================================
+# PREMARKET GETTER GUARD
+# (旧 trading/ranking/active_symbols/getter_premarket_patch.py)
+# ------------------------------------------------------------
+# 寄前 SBI 由来の銘柄リストは寄付き前だけ有効。場中は、たとえ最後の
+# active リストが寄前 SBI 由来でも、通常のランキング由来ユニバースで
+# 再ガード/再構築して PUSH rotation がライブのランキングに追従するようにする。
+#
+# 旧パッチは manager の getter 7 本を丸ごと差し替えていた
+# (native の _wrl_filter 層は例外時フォールバックでしか呼ばれない)。
+# その構造をそのまま本文へ写してある。
+# ============================================================
+
+
+def _premarket_intraday_sbi_allowed() -> bool:
+    return _env_bool("ACTIVE_ALLOW_INTRADAY_PREMARKET_FALLBACK", False)
+
+
+def _apply_premarket_getter_defaults() -> None:
+    """旧 install() 冒頭の USE_PREMARKET_WHEN_TODAY_RANKING_EMPTY 抑止。"""
+    global USE_PREMARKET_WHEN_TODAY_RANKING_EMPTY
+    if _premarket_intraday_sbi_allowed():
+        return
+    try:
+        USE_PREMARKET_WHEN_TODAY_RANKING_EMPTY = False
+        os.environ["ACTIVE_USE_PREMARKET_WHEN_TODAY_RANKING_EMPTY"] = "0"
+    except Exception:
+        logger.debug("[ACTIVE GETTER PREMARKET] manager fallback override failed", exc_info=True)
+
+
+_apply_premarket_getter_defaults()
+
+
+def _get_active_symbols_premarket(*args, **kwargs) -> List[str]:
+    del args, kwargs
+    symbols = dedupe_keep_order(getattr(global_data, "symbols_active", []))
+    if not symbols:
+        symbols = dedupe_keep_order(get_global_attr("active_symbols", []))
+    if not symbols:
+        symbols = dedupe_keep_order(get_global_attr("monitor_symbols", []))
+
+    if not symbols:
+        return []
+
+    try:
+        current_is_premarket = bool(is_premarket_time(now_dt()))
+        source_premarket = bool(get_global_attr("active_symbol_premarket_mode", False))
+        preserve_premarket = _env_bool("ACTIVE_GETTER_PRESERVE_PREMARKET_MODE", True)
+        skip_guard_when_premarket = _env_bool("ACTIVE_GETTER_SKIP_PRICE_GUARD_FOR_PREMARKET", True)
+        allow_intraday_sbi_now = _premarket_intraday_sbi_allowed()
+
+        if (
+            current_is_premarket
+            and source_premarket
+            and preserve_premarket
+            and skip_guard_when_premarket
+        ):
+            # 寄前時間中だけ、寄前SBI由来リストを再ガードせず保持する。
+            logger.info(
+                "[ACTIVE GETTER PREMARKET] keep premarket symbols before open count=%d head=%s",
+                len(symbols),
+                symbols[:20],
+            )
+            return symbols[:MAX_ACTIVE_SYMBOLS]
+
+        if source_premarket and not current_is_premarket and not allow_intraday_sbi_now:
+            logger.info(
+                "[ACTIVE GETTER PREMARKET] market-hours ranking mode: re-guard former premarket symbols count=%d",
+                len(symbols),
+            )
+
+        premarket_mode = bool(current_is_premarket and source_premarket and preserve_premarket)
+        symbols = final_guard_min_price(
+            symbols,
+            protected=get_protected_symbols(),
+            liquidity_map=build_liquidity_map(),
+            premarket_mode=premarket_mode,
+        )
+    except Exception:
+        logger.debug("[ACTIVE GETTER PREMARKET] getter min price guard failed", exc_info=True)
+        try:
+            return _get_active_symbols_wrl()[:MAX_ACTIVE_SYMBOLS]
+        except Exception:
+            pass
+
+    return symbols[:MAX_ACTIVE_SYMBOLS]
+
+
+# ============================================================
+# TODAY RANKING DB FALLBACK
+# (旧 trading/ranking/active_symbols/db_ranking_fallback_patch.install())
+# ------------------------------------------------------------
+# 場中に today_ranking が 0 件になっても、当日の rankingYYYYMMDD.db から
+# active / push / register symbols を復元する。データ取得部は
+# trading/ranking/active_symbols/db_ranking_fallback.py に残してある。
+# 旧 install はここの getter 群をさらに包んでいたので、その順序
+# (db fallback <- premarket <- native) を本文でも保っている。
+# ============================================================
+
+
+def _db_fallback_symbols(target: int) -> List[str]:
+    try:
+        from .db_ranking_fallback import fallback_symbols
+
+        return list(fallback_symbols(target=target) or [])
+    except Exception:
+        logger.debug("[ACTIVE DB FALLBACK] fallback loader failed", exc_info=True)
+        return []
+
+
+def _db_fallback_target() -> int:
+    try:
+        return int(TARGET_ACTIVE_SYMBOLS or 100)
+    except Exception:
+        return 100
+
+
+def update_active_symbols(force: bool = False) -> List[str]:
+    symbols: List[str] = []
+    try:
+        symbols = list(_update_active_symbols_wrl(force=force) or [])
+    except Exception:
+        logger.exception("[ACTIVE DB FALLBACK] original update failed; try db fallback")
+        symbols = []
+
+    target = _db_fallback_target()
+    if len(symbols) >= target:
+        return symbols
+
+    fb = _db_fallback_symbols(target=target)
+    if fb:
+        logger.warning(
+            "[ACTIVE DB FALLBACK] recovered active symbols before=%d after=%d target=%d head=%s",
+            len(symbols),
+            len(fb),
+            target,
+            fb[:20],
+        )
+        return fb
+    return symbols
+
+
+def get_active_symbols(*args, **kwargs) -> List[str]:
+    symbols: List[str] = []
+    try:
+        symbols = list(_get_active_symbols_premarket(*args, **kwargs) or [])
+    except Exception:
+        logger.exception("[ACTIVE DB FALLBACK] original getter failed; try db fallback")
+        symbols = []
+    if symbols:
+        return symbols[:MAX_ACTIVE_SYMBOLS]
+    return _db_fallback_symbols(target=_db_fallback_target())
+
 
 def get_current_active_symbols(*args, **kwargs) -> List[str]:
-    return _wrl_filter(_get_current_active_symbols_core(*args, **kwargs), context="active.get_current_active_symbols")
-
+    return get_active_symbols(*args, **kwargs)
 
 
 def get_monitor_symbols(*args, **kwargs) -> List[str]:
-    return _wrl_filter(_get_monitor_symbols_core(*args, **kwargs), context="active.get_monitor_symbols")
-
+    return get_active_symbols(*args, **kwargs)[:MAX_ACTIVE_SYMBOLS]
 
 
 def get_push_symbols(*args, **kwargs) -> List[str]:
-    return _wrl_filter(_get_push_symbols_core(*args, **kwargs), context="active.get_push_symbols")
-
+    return get_monitor_symbols(*args, **kwargs)
 
 
 def get_register_symbols(*args, **kwargs) -> List[str]:
-    return _wrl_filter(_get_register_symbols_core(*args, **kwargs), context="active.get_register_symbols")
-
+    return get_monitor_symbols(*args, **kwargs)
 
 
 def get_subscription_symbols(*args, **kwargs) -> List[str]:
-    return _wrl_filter(_get_subscription_symbols_core(*args, **kwargs), context="active.get_subscription_symbols")
-
+    return get_monitor_symbols(*args, **kwargs)
 
 
 def get_rotation_symbols(*args, **kwargs) -> List[str]:
-    return _wrl_filter(_get_rotation_symbols_core(*args, **kwargs), context="active.get_rotation_symbols")
+    return get_monitor_symbols(*args, **kwargs)
 

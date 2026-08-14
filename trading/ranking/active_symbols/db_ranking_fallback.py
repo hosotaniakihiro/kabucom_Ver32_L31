@@ -1,5 +1,5 @@
 # ============================================================
-# File   : trading/ranking/active_symbols/db_ranking_fallback_patch.py
+# File   : trading/ranking/active_symbols/db_ranking_fallback.py
 # Version: Ver1.0-ACTIVE-SYMBOLS-DB-RANKING-FALLBACK
 # ------------------------------------------------------------
 # 目的:
@@ -187,85 +187,13 @@ def _fallback_symbols(*, target: int = 100) -> list[str]:
     return symbols
 
 
-def install() -> bool:
-    try:
-        from . import manager as m
-    except Exception:
-        logger.exception("[ACTIVE DB FALLBACK] manager import failed")
-        return False
+# 公開名 (旧 db_ranking_fallback_patch の install() は
+# trading/ranking/active_symbols/manager.py 本体へ本文化したので不要になった)
+load_symbols_from_ranking_db = _load_symbols_from_ranking_db
+fallback_symbols = _fallback_symbols
 
-    if getattr(m, "_ACTIVE_DB_FALLBACK_PATCHED", False):
-        return True
-
-    original_update = m.update_active_symbols
-    original_get_active = m.get_active_symbols
-
-    def update_active_symbols_patched(force: bool = False):
-        symbols = []
-        try:
-            symbols = list(original_update(force=force) or [])
-        except Exception:
-            logger.exception("[ACTIVE DB FALLBACK] original update failed; try db fallback")
-            symbols = []
-
-        try:
-            target = int(getattr(m, "TARGET_ACTIVE_SYMBOLS", 100) or 100)
-        except Exception:
-            target = 100
-
-        if len(symbols) >= target:
-            return symbols
-
-        fb = _fallback_symbols(target=target)
-        if fb:
-            logger.warning(
-                "[ACTIVE DB FALLBACK] recovered active symbols before=%d after=%d target=%d head=%s",
-                len(symbols),
-                len(fb),
-                target,
-                fb[:20],
-            )
-            return fb
-        return symbols
-
-    def get_active_symbols_patched(*args, **kwargs):
-        symbols = []
-        try:
-            symbols = list(original_get_active(*args, **kwargs) or [])
-        except Exception:
-            logger.exception("[ACTIVE DB FALLBACK] original getter failed; try db fallback")
-            symbols = []
-        if symbols:
-            return symbols[: getattr(m, "MAX_ACTIVE_SYMBOLS", 100)]
-        return _fallback_symbols(target=int(getattr(m, "TARGET_ACTIVE_SYMBOLS", 100) or 100))
-
-    def get_current_active_symbols_patched(*args, **kwargs):
-        return get_active_symbols_patched(*args, **kwargs)
-
-    def get_monitor_symbols_patched(*args, **kwargs):
-        return get_active_symbols_patched(*args, **kwargs)[: getattr(m, "MAX_ACTIVE_SYMBOLS", 100)]
-
-    def get_push_symbols_patched(*args, **kwargs):
-        return get_monitor_symbols_patched(*args, **kwargs)
-
-    def get_register_symbols_patched(*args, **kwargs):
-        return get_monitor_symbols_patched(*args, **kwargs)
-
-    def get_subscription_symbols_patched(*args, **kwargs):
-        return get_monitor_symbols_patched(*args, **kwargs)
-
-    def get_rotation_symbols_patched(*args, **kwargs):
-        return get_monitor_symbols_patched(*args, **kwargs)
-
-    m.update_active_symbols = update_active_symbols_patched
-    m.get_active_symbols = get_active_symbols_patched
-    m.get_current_active_symbols = get_current_active_symbols_patched
-    m.get_monitor_symbols = get_monitor_symbols_patched
-    m.get_push_symbols = get_push_symbols_patched
-    m.get_register_symbols = get_register_symbols_patched
-    m.get_subscription_symbols = get_subscription_symbols_patched
-    m.get_rotation_symbols = get_rotation_symbols_patched
-    m._ACTIVE_DB_FALLBACK_PATCHED = True
-
-    logger.warning("[ACTIVE DB FALLBACK] installed version=%s", VERSION)
-    return True
+__all__ = [
+    "VERSION",
+    "load_symbols_from_ranking_db",
+    "fallback_symbols",
+]

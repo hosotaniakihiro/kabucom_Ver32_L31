@@ -23,39 +23,14 @@ from .ranking_source import (
 from .liquidity import filter_liquid_symbols, is_liquid_symbol
 from .symbol_flags import load_symbol_flags_eligible_symbols
 
-# Passive getter calls after a premarket update must not re-run stricter
-# non-premarket price guarding and collapse 100 SBI symbols to zero.
-try:
-    from .getter_premarket_patch import install as _install_getter_premarket_patch
-
-    _install_getter_premarket_patch()
-except Exception:
-    pass
-
-# 場中に today_ranking が0件になる場合でも、当日の ranking DB から
-# active / push / register symbols を復元する。
-try:
-    from .db_ranking_fallback_patch import install as _install_db_ranking_fallback_patch
-
-    _install_db_ranking_fallback_patch()
-except Exception:
-    pass
-
-# Re-export patched callables from manager.
-try:
-    from .manager import (
-        update_active_symbols,
-        get_active_symbols,
-        get_current_active_symbols,
-        get_monitor_symbols,
-        get_push_symbols,
-        get_register_symbols,
-        get_subscription_symbols,
-        get_rotation_symbols,
-        debug_active_symbols,
-    )
-except Exception:
-    pass
+# getter_premarket_patch と db_ranking_fallback_patch は manager.py 本体へ
+# 本文化した。
+#   - 寄前 SBI 由来リストの扱い -> manager._get_active_symbols_premarket()
+#   - today_ranking 0 件時の DB 復元 -> manager.get_active_symbols /
+#     update_active_symbols (データ取得部は db_ranking_fallback.py)
+# 合成順 (db fallback <- premarket <- native) はそのまま。
+# install が無くなったので上の from .manager import が最終形になり、
+# 再 import も不要になった。
 
 __all__ = [
     "update_active_symbols",
