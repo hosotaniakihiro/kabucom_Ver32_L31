@@ -297,7 +297,101 @@ def _make_payload_core(
 # API SEND WRAPPER
 # ============================================================
 
+# 旧 trading/audit_logging/buy_sell_entry_audit_patch.py の本文化。
+# 発注送信の前後で audit DB へ記録する。売買ロジックと payload は変更しない。
+# 旧パッチは _send_order を外から包んでいたが、包む相手が他に無く、
+# 呼び出し元 6 箇所もすべてこのファイル内のモジュール名解決なので本体へ畳んだ。
+
+
+def _audit_side_from_payload(payload: Any) -> str:
+    try:
+        side = int(payload.get("Side"))
+        if side == 2:
+            return "BUY"
+        if side == 1:
+            return "SELL"
+    except Exception:
+        pass
+    return ""
+
+
+def _audit_order_type_from_payload(payload: Any) -> str:
+    try:
+        t = int(payload.get("FrontOrderType"))
+        if t == 10:
+            return "MARKET"
+        if t == 20:
+            return "LIMIT"
+        if t == 30:
+            return "STOP"
+    except Exception:
+        pass
+    try:
+        return str(payload.get("FrontOrderType") or "")
+    except Exception:
+        return ""
+
+
+def _audit_payload_get(payload: Any, key: str, default=None):
+    try:
+        if isinstance(payload, dict):
+            return payload.get(key, default)
+    except Exception:
+        pass
+    return default
+
+
+def _audit_order_sent_safe(**kwargs) -> None:
+    try:
+        from trading.audit_logging.order_exit_audit import audit_order_sent
+
+        audit_order_sent(**kwargs)
+    except Exception:
+        pass
+
+
 def _send_order(payload, symbol):
+    side = _audit_side_from_payload(payload if isinstance(payload, dict) else {})
+    order_type = _audit_order_type_from_payload(payload if isinstance(payload, dict) else {})
+    qty = _audit_payload_get(payload, "Qty", 0)
+    price = _audit_payload_get(payload, "Price", 0)
+
+    _audit_order_sent_safe(
+        symbol=symbol,
+        side=side,
+        qty=qty,
+        order_type=order_type,
+        price=price,
+        order_id="",
+        detail={"phase": "before_send_order_common"},
+    )
+
+    res = _send_order_core(payload, symbol)
+
+    if isinstance(res, dict) and res.get("OrderId"):
+        _audit_order_sent_safe(
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            order_type=order_type,
+            price=res.get("Price", price),
+            order_id=res.get("OrderId"),
+            detail={"phase": "order_id_received", "response": res},
+        )
+    else:
+        _audit_order_sent_safe(
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            order_type=order_type,
+            price=price,
+            order_id="",
+            detail={"phase": "send_order_failed_or_no_order_id", "response": res},
+        )
+    return res
+
+
+def _send_order_core(payload, symbol):
     try:
         logger.info(
             "[KABU PAYLOAD] symbol=%s exchange=%s sor=%s payload=%s",

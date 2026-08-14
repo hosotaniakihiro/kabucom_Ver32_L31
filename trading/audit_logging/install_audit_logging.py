@@ -37,19 +37,16 @@ def install_audit_logging() -> bool:
     # (entry_id/reason_code/ranking_snapshot等の拡張列へ1件だけ書き込む) を
     # 直接実装しているため、ここでの動的パッチ適用は不要。
 
-    try:
-        from trading.audit_logging.entry_controller_audit_patch import install as install_entry_controller_patch
-        ok_all = bool(install_entry_controller_patch()) and ok_all
-    except Exception:
-        logger.exception('[AUDIT INSTALL] entry_controller patch failed')
-        ok_all = False
+    # entry_controller_audit_patch は削除した。
+    #   candidate_history / order_history -> trading/handlers/entry_controller.py の
+    #     _audit_candidate_ok_safe / _audit_order_safe (Ver2.9)
+    #   ENTRY_SKIP -> 同ファイルの _log_skip 本体 (Ver2.7)
+    # へインライン化済みで、install() が True を返すだけの空スタブになっていた。
 
-    try:
-        from trading.audit_logging.buy_sell_entry_audit_patch import install as install_buy_sell_entry_patch
-        ok_all = bool(install_buy_sell_entry_patch()) and ok_all
-    except Exception:
-        logger.exception('[AUDIT INSTALL] buy_sell_entry patch failed')
-        ok_all = False
+    # buy_sell_entry_audit_patch は kabu_api/buy_sell_entry.py の _send_order 本体へ
+    # 本文化した (_audit_* ヘルパ + ネイティブを _send_order_core へ改名)。
+    # 同関数を包む相手は他に無く、呼び出し元 6 箇所も同ファイル内のモジュール名解決
+    # なので、install なしで従来と同じ範囲に効く。
 
     _INSTALLED = True
     logger.warning('[AUDIT INSTALL] audit logging installed full_trade_links=True compact_writer=True ok=%s', ok_all)
