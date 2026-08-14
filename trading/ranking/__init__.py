@@ -13,12 +13,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-try:
-    from .ranking_db_writer_lock_patch import install_ranking_db_writer_lock_patch
-
-    install_ranking_db_writer_lock_patch()
-except Exception:
-    logger.exception("[trading.ranking] ranking DB writer lock patch install failed")
+# ranking_db_writer_lock_patch は trading/ranking/ranking_db_writer.py 本体へ
+# 本文化した (_rdl_*)。RankingDBWriter.flush の差し替えも同ファイル末尾で
+# import 時に行うため、ここでの install は不要になった。
+# 合成順 (lock <- relief(_rwr_flush) <- _flush_core) は保持している。
 
 
 __all__ = []

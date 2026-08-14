@@ -1567,3 +1567,377 @@ def _rwr_apply_env_defaults() -> None:
 
 
 _rwr_apply_env_defaults()
+
+
+# ============================================================
+# RANKING DB WRITER LOCK / RETRY
+# (旧 trading/ranking/ranking_db_writer_lock_patch.py V6-LOW-LATENCY)
+# ------------------------------------------------------------
+# SQLite locked / cursor 再入 / commit 時未完了 SQL 対策。
+# 専用コネクションを開いて snapshot/raw を executemany で流し込む。
+# legacy 行があるときだけ、既存の relief 層 (_rwr_flush) へ委譲して
+# 旧カテゴリ別テーブルの作成/保存の互換性を保つ。
+#
+# 旧パッチは RankingDBWriter.flush を丸ごと差し替えていた
+# (orig_flush = そのとき束縛されていた _rwr_flush)。
+# その合成順 (lock <- relief <- _flush_core) を本文でも保っている。
+#
+# env 既定値:
+#   RANKING_WRITER_BUSY_TIMEOUT_MS=5000
+#   RANKING_WRITER_LOCK_RETRY_MAX=1
+#   RANKING_WRITER_LOCK_RETRY_BASE_SEC=0.20
+#   RANKING_WRITER_LOCK_RETRY_MAX_SLEEP_SEC=0.80
+#   RANKING_WRITER_SQL_BATCH_SIZE=1000
+# ============================================================
+
+RANKING_DB_WRITER_LOCK_VERSION = "PRODUCTION-STABLE-RANKING-DB-WRITER-LOCK-V6-LOW-LATENCY"
+
+
+def _rdl_env_int(name: str, default: int) -> int:
+    try:
+        v = os.environ.get(name)
+        return int(default) if v is None or str(v).strip() == "" else int(float(v))
+    except Exception:
+        return int(default)
+
+
+def _rdl_env_float(name: str, default: float) -> float:
+    try:
+        v = os.environ.get(name)
+        return float(default) if v is None or str(v).strip() == "" else float(v)
+    except Exception:
+        return float(default)
+
+
+def _rdl_env_bool(name: str, default: bool) -> bool:
+    try:
+        v = os.environ.get(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in {"1", "true", "yes", "on", "enable", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _rdl_is_locked_error(err: Any) -> bool:
+    s = str(err or "").lower()
+    return "database is locked" in s or "database table is locked" in s or "locked" in s
+
+
+def _rdl_is_statement_progress_error(err: Any) -> bool:
+    s = str(err or "").lower()
+    return "sql statements in progress" in s or "statements in progress" in s
+
+
+def _rdl_buffer_count(writer: Any) -> int:
+    try:
+        return (
+            len(getattr(writer, "raw_buffer", []) or [])
+            + len(getattr(writer, "snapshot_buffer", []) or [])
+            + len(getattr(writer, "legacy_buffer", []) or [])
+        )
+    except Exception:
+        return 0
+
+
+def _rdl_chunks(items: list[Any], size: int):
+    size = max(1, int(size or 1000))
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def _rdl_type_counts(target: Any, rows: list[dict]) -> dict[str, int]:
+    try:
+        return target._rdl_type_counts(rows)
+    except Exception:
+        return {}
+
+
+def _rdl_return_to_front(writer: Any, raw_rows: list[dict], snapshot_rows: list[dict], legacy_rows: list[dict]) -> None:
+    try:
+        with writer.lock:
+            writer.raw_buffer = list(raw_rows or []) + list(getattr(writer, "raw_buffer", []) or [])
+            writer.snapshot_buffer = list(snapshot_rows or []) + list(getattr(writer, "snapshot_buffer", []) or [])
+            writer.legacy_buffer = list(legacy_rows or []) + list(getattr(writer, "legacy_buffer", []) or [])
+            try:
+                writer._mark_runtime()
+            except Exception:
+                pass
+    except Exception:
+        logger.exception("[RANKING DB WRITER LOCK PATCH] return buffer failed")
+
+
+def _rdl_mark_flush_error(writer: Any, error: str, started_at: float) -> None:
+    try:
+        writer.total_flush_errors += 1
+        writer.last_error = error
+        writer.last_flush_elapsed_sec = time.time() - started_at
+        writer._mark_runtime()
+    except Exception:
+        pass
+
+
+def _rdl_exec_and_drain(cur: sqlite3.Cursor, sql: str) -> None:
+    cur.execute(sql)
+    try:
+        cur.fetchall()
+    except Exception:
+        pass
+
+
+def _rdl_resolve_db_path(writer: Any) -> Path:
+    try:
+        dbp = getattr(writer, "db_path", None)
+        if dbp:
+            return Path(dbp)
+    except Exception:
+        pass
+    try:
+        from database.paths.ranking_paths import get_ranking_db_path
+        return Path(get_ranking_db_path())
+    except Exception:
+        pass
+    try:
+        from trading.ranking.ranking_db_writer import _resolve_ranking_db_path
+        return Path(_resolve_ranking_db_path())
+    except Exception:
+        raise
+
+
+def _rdl_open_dedicated_connection(db_path: Path, busy_timeout_ms: int) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path), timeout=max(1.0, busy_timeout_ms / 1000.0), check_same_thread=False)
+    cur = conn.cursor()
+    try:
+        _rdl_exec_and_drain(cur, f"PRAGMA busy_timeout={int(busy_timeout_ms)};")
+        # journal_mode は接続ごとに再設定するとNASで非常に遅い場合がある。
+        # DB初期化側でWAL済みの想定。必要時だけ env で有効化する。
+        if _rdl_env_bool("RANKING_WRITER_SET_JOURNAL_EACH_FLUSH", False):
+            try:
+                _rdl_exec_and_drain(cur, "PRAGMA journal_mode=WAL;")
+            except sqlite3.OperationalError:
+                logger.debug("[RANKING DB WRITER LOCK PATCH] journal_mode pragma skipped", exc_info=True)
+        _rdl_exec_and_drain(cur, "PRAGMA synchronous=NORMAL;")
+        _rdl_exec_and_drain(cur, "PRAGMA temp_store=MEMORY;")
+        try:
+            _rdl_exec_and_drain(cur, f"PRAGMA cache_size={_rdl_env_int('RANKING_WRITER_CACHE_SIZE', -65536)};")
+        except Exception:
+            pass
+        try:
+            mmap_size = _rdl_env_int("RANKING_WRITER_MMAP_SIZE", 268435456)
+            if mmap_size > 0:
+                _rdl_exec_and_drain(cur, f"PRAGMA mmap_size={mmap_size};")
+        except Exception:
+            pass
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+    return conn
+
+
+def _rdl_flush(self, *args, **kwargs) -> bool:
+    busy_timeout_ms = _rdl_env_int("RANKING_WRITER_BUSY_TIMEOUT_MS", 5000)
+    retry_max = _rdl_env_int("RANKING_WRITER_LOCK_RETRY_MAX", 1)
+    retry_base_sec = _rdl_env_float("RANKING_WRITER_LOCK_RETRY_BASE_SEC", 0.20)
+    retry_max_sleep_sec = _rdl_env_float("RANKING_WRITER_LOCK_RETRY_MAX_SLEEP_SEC", 0.80)
+    batch_size = _rdl_env_int("RANKING_WRITER_SQL_BATCH_SIZE", 1000)
+    with self.lock:
+        if getattr(self, "_flush_v6_running", False):
+            logger.warning("[RANKING DB WRITER LOCK PATCH] flush skipped reason=already_running buffer=%s", _rdl_buffer_count(self))
+            return False
+        if not (self.raw_buffer or self.snapshot_buffer or self.legacy_buffer):
+            logger.debug("[RANKING DB WRITER] flush skipped empty")
+            return True
+        self._flush_v6_running = True
+        self._flush_v5_running = True
+        self._flush_v4_running = True
+        raw_rows = list(self.raw_buffer or [])
+        snapshot_rows = list(self.snapshot_buffer or [])
+        legacy_rows = list(self.legacy_buffer or [])
+        self.raw_buffer = []
+        self.snapshot_buffer = []
+        self.legacy_buffer = []
+
+    try:
+        # legacy rows は既存実装に任せる。旧カテゴリ別テーブル作成/保存の互換性を維持する。
+        if legacy_rows:
+            _rdl_return_to_front(self, raw_rows, snapshot_rows, legacy_rows)
+            return bool(_rwr_flush(self, *args, **kwargs))
+
+        t0 = time.time()
+        last_error = ""
+
+        snapshot_insert_sql = f"""
+        INSERT OR REPLACE INTO {quote_ident(SNAPSHOT_TABLE)} (
+            symbol, datetime, snapshot_time, symbolname, current_price, price,
+            change_percentage, change_rate, trading_volume, volume, trading_value,
+            turnover, tick_count, ranking_type, rank_type, category, market,
+            exchange, source, rank, created_at, inserted_at
+        ) VALUES ({','.join(['?'] * 22)})
+        """
+
+        raw_insert_sql = f"""
+        INSERT OR IGNORE INTO {quote_ident(RAW_TABLE)} (
+            ingest_id, symbol, datetime, snapshot_time, symbolname, current_price,
+            price, change_percentage, change_rate, change_ratio, trading_volume,
+            volume, trading_value, turnover, tick_count, ranking_type, rank_type,
+            category, market, exchange, source, rank, date, time, raw_json,
+            received_at, created_at, inserted_at, updated_at
+        ) VALUES ({','.join(['?'] * 29)})
+        """
+
+        snapshot_params: list[tuple] = []
+        for row in snapshot_rows:
+            try:
+                snapshot_params.append(normalize_snapshot_row(row))
+            except Exception:
+                logger.warning("[RANKING DB WRITER] snapshot normalize skipped row=%r", row, exc_info=True)
+
+        raw_params: list[tuple] = []
+        for row in raw_rows:
+            try:
+                raw_params.append(normalize_raw_row(row))
+            except Exception:
+                logger.warning("[RANKING DB WRITER] raw normalize skipped row=%r", row, exc_info=True)
+
+        db_path = _rdl_resolve_db_path(self)
+        last_snapshot = 0
+        last_raw = 0
+        for attempt in range(int(retry_max) + 1):
+            conn: sqlite3.Connection | None = None
+            cur: sqlite3.Cursor | None = None
+            committed = False
+            try:
+                conn = _rdl_open_dedicated_connection(db_path, busy_timeout_ms)
+                cur = conn.cursor()
+                logger.info(
+                    "[RANKING DB WRITER] flush prepare v6 dedicated-conn raw=%d snapshot=%d legacy=%d snapshot_types=%s raw_types=%s batch_size=%d db=%s",
+                    len(raw_rows), len(snapshot_rows), len(legacy_rows),
+                    _rdl_type_counts(target, snapshot_rows), _rdl_type_counts(target, raw_rows), batch_size, db_path,
+                )
+                conn.execute("BEGIN IMMEDIATE")
+                saved_snapshot = 0
+                saved_raw = 0
+                for part in _rdl_chunks(snapshot_params, batch_size):
+                    cur.executemany(snapshot_insert_sql, part)
+                    saved_snapshot += len(part)
+                for part in _rdl_chunks(raw_params, batch_size):
+                    cur.executemany(raw_insert_sql, part)
+                    saved_raw += len(part)
+                try:
+                    cur.close()
+                finally:
+                    cur = None
+                conn.commit()
+                committed = True
+                last_snapshot = saved_snapshot
+                last_raw = saved_raw
+                with self.lock:
+                    self.total_flushed_snapshot += saved_snapshot
+                    self.total_flushed_raw += saved_raw
+                    self.last_flush_at = dt.datetime.now().isoformat(timespec="seconds")
+                    self.last_flush_elapsed_sec = time.time() - t0
+                    self.last_error = None
+                    try:
+                        self._mark_runtime()
+                    except Exception:
+                        pass
+                logger.info(
+                    "[RANKING DB WRITER] flush done v6 snapshot=%d raw=%d legacy=0 elapsed=%.3fs buffer_after=%d",
+                    saved_snapshot, saved_raw, time.time() - t0, _rdl_buffer_count(self),
+                )
+                return True
+
+            except sqlite3.OperationalError as e:
+                last_error = str(e)
+                try:
+                    if conn is not None and not committed:
+                        conn.rollback()
+                except Exception:
+                    pass
+                retryable = _rdl_is_locked_error(e) or _rdl_is_statement_progress_error(e)
+                if not retryable:
+                    _rdl_return_to_front(self, raw_rows, snapshot_rows, legacy_rows)
+                    _rdl_mark_flush_error(self, last_error, t0)
+                    logger.exception("[RANKING DB WRITER] flush failed v6 non-retryable")
+                    return False
+                if attempt >= int(retry_max):
+                    _rdl_return_to_front(self, raw_rows, snapshot_rows, legacy_rows)
+                    _rdl_mark_flush_error(self, last_error, t0)
+                    logger.warning(
+                        "[RANKING DB WRITER LOCK PATCH] retryable persists v6 attempt=%s/%s returned_to_buffer=%s saved_snapshot=%s saved_raw=%s err=%s",
+                        attempt, retry_max, _rdl_buffer_count(self), last_snapshot, last_raw, e,
+                    )
+                    return False
+                sleep_sec = min(float(retry_max_sleep_sec), float(retry_base_sec) * (2 ** attempt))
+                logger.warning(
+                    "[RANKING DB WRITER LOCK PATCH] retry v6 attempt=%s/%s sleep=%.2fs rows snapshot=%d raw=%d buffer=%s err=%s",
+                    attempt + 1, retry_max, sleep_sec, len(snapshot_rows), len(raw_rows), _rdl_buffer_count(self), e,
+                )
+                time.sleep(sleep_sec)
+
+            except Exception as e:
+                last_error = str(e)
+                try:
+                    if conn is not None and not committed:
+                        conn.rollback()
+                except Exception:
+                    pass
+                _rdl_return_to_front(self, raw_rows, snapshot_rows, legacy_rows)
+                _rdl_mark_flush_error(self, last_error, t0)
+                logger.exception("[RANKING DB WRITER] flush failed v6 returned rows to buffer")
+                return False
+            finally:
+                try:
+                    if cur is not None:
+                        cur.close()
+                except Exception:
+                    pass
+                try:
+                    if conn is not None:
+                        conn.close()
+                except Exception:
+                    pass
+
+        _rdl_return_to_front(self, raw_rows, snapshot_rows, legacy_rows)
+        _rdl_mark_flush_error(self, last_error or "unknown flush failure", t0)
+        return False
+
+    finally:
+        try:
+            with self.lock:
+                self._flush_v6_running = False
+                self._flush_v5_running = False
+                self._flush_v4_running = False
+                self._flush_v3_running = False
+        except Exception:
+            try:
+                self._flush_v6_running = False
+                self._flush_v5_running = False
+                self._flush_v4_running = False
+                self._flush_v3_running = False
+            except Exception:
+                pass
+
+
+DEFAULT_BUSY_TIMEOUT_MS = _rdl_env_int("RANKING_WRITER_BUSY_TIMEOUT_MS", 5000)
+
+RankingDBWriter.flush = _rdl_flush
+RankingDBWriter._lock_retry_patch_v6_installed = True
+RankingDBWriter._lock_retry_patch_v5_installed = True
+RankingDBWriter._lock_retry_patch_v4_installed = True
+RankingDBWriter._lock_retry_patch_v3_installed = True
+RankingDBWriter._lock_retry_patch_v2_installed = True
+RankingDBWriter._lock_retry_patch_installed = True
+
+logger.warning(
+    "[RANKING DB WRITER LOCK] installed v6 low-latency busy_timeout_ms=%s retry_max=%s base=%.2fs max_sleep=%.2fs batch_size=%s journal_each_flush=%s",
+    _rdl_env_int("RANKING_WRITER_BUSY_TIMEOUT_MS", 5000),
+    _rdl_env_int("RANKING_WRITER_LOCK_RETRY_MAX", 1),
+    _rdl_env_float("RANKING_WRITER_LOCK_RETRY_BASE_SEC", 0.20),
+    _rdl_env_float("RANKING_WRITER_LOCK_RETRY_MAX_SLEEP_SEC", 0.80),
+    _rdl_env_int("RANKING_WRITER_SQL_BATCH_SIZE", 1000),
+    _rdl_env_bool("RANKING_WRITER_SET_JOURNAL_EACH_FLUSH", False),
+)
