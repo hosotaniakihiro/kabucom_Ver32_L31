@@ -645,11 +645,90 @@ def _apply_zero_score_rescue(out: pd.DataFrame) -> pd.DataFrame:
         return out
 
 
+# ============================================================
+# range_pct 補修
+# (旧 core/startup/summary_ai_more_candidates_patch._install_range_pct_repair_patch)
+# ------------------------------------------------------------
+# 1分足の high/low が close と同値へ潰れていても、day_high/day_low や
+# 始値-終値から実レンジを復元して range_pct 系の列へ書き戻す。
+# これが無いと SUMMARY AI LOW MOVE PREFILTER が range_pct=0 だけを見て
+# 候補を大量に落としてしまう。低変動ガード自体は緩めない。
+#
+# 旧パッチは attach_display_like_columns を外から包んでいたが、
+# 同じ属性を奪い合う相手が居ないので本体末尾へ畳んだ。
+# ============================================================
+
+_RANGE_PCT_REPAIR_VERSION = "Ver1.8-SUMMARY-AI-APPROVED-ROW-RANGE-REPAIR"
+
+
+def _rpr_series(df: pd.DataFrame, names: tuple[str, ...], default: float = 0.0):
+    for name in names:
+        try:
+            if name in df.columns:
+                return pd.to_numeric(df[name], errors="coerce").fillna(default).astype(float)
+        except Exception:
+            continue
+    return pd.Series(default, index=df.index, dtype="float64")
+
+
+def _rpr_fraction(s):
+    ss = pd.to_numeric(s, errors="coerce").fillna(0.0).astype(float).abs()
+    return ss.mask(ss > 1.0, ss / 100.0)
+
+
+def _repair_range_pct_columns(out: pd.DataFrame) -> pd.DataFrame:
+    if not _env_bool("SUMMARY_AI_RANGE_PCT_REPAIR_ENABLED", True):
+        return out
+    try:
+        if not isinstance(out, pd.DataFrame) or out.empty:
+            return out
+        close = _rpr_series(out, ("close", "close_price", "current_price", "price", "last_price", "ai_disp_close"), 0.0)
+        safe_close = close.where(close > 0, 1.0)
+        existing = _rpr_fraction(_rpr_series(out, ("range_pct", "intraday_range_pct", "day_range_pct", "summary_ai_movement_range_pct"), 0.0))
+
+        high = _rpr_series(out, ("high",), 0.0)
+        low = _rpr_series(out, ("low",), 0.0)
+        bar_rng = ((high - low) / safe_close).where((high > 0) & (low > 0) & (high >= low), 0.0).abs().fillna(0.0)
+
+        day_high = _rpr_series(out, ("day_high", "today_high", "intraday_high", "session_high", "high_price", "high_price_day", "range_high"), 0.0)
+        day_low = _rpr_series(out, ("day_low", "today_low", "intraday_low", "session_low", "low_price", "low_price_day", "range_low"), 0.0)
+        day_rng = ((day_high - day_low) / safe_close).where((day_high > 0) & (day_low > 0) & (day_high >= day_low), 0.0).abs().fillna(0.0)
+
+        open_ = _rpr_series(out, ("opening_price", "open_price", "open", "day_open"), 0.0)
+        open_rng = ((close - open_) / safe_close).where((open_ > 0) & (close > 0), 0.0).abs().fillna(0.0)
+
+        repaired = pd.concat([existing, bar_rng, day_rng, open_rng], axis=1).max(axis=1).fillna(0.0).astype(float)
+        improved = repaired > (existing + 1e-12)
+        if bool(improved.any()):
+            out = out.copy()
+            out["range_pct"] = repaired
+            out["intraday_range_pct"] = repaired
+            out["day_range_pct"] = repaired
+            out["ai_disp_range_pct"] = repaired
+            try:
+                samples = out.loc[improved, [c for c in ("symbol", "close", "close_price", "current_price", "high", "low", "high_price", "low_price", "day_high", "day_low", "open", "open_price", "range_pct") if c in out.columns]].head(12).to_dict(orient="records")
+            except Exception:
+                samples = []
+            logger.warning(
+                "[SUMMARY AI RANGE PCT REPAIR] repaired rows=%s before_pos=%s after_pos=%s max=%.6f samples=%s version=%s",
+                int(improved.sum()),
+                int((existing > 0).sum()),
+                int((repaired > 0).sum()),
+                float(repaired.max()) if len(repaired) else 0.0,
+                samples,
+                _RANGE_PCT_REPAIR_VERSION,
+            )
+        return out
+    except Exception:
+        logger.exception("[SUMMARY AI RANGE PCT REPAIR] repair failed; return original")
+        return out
+
+
 def attach_display_like_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = attach_display_like_columns_core(df)
-    if not _zero_score_rescue_scope_enabled():
-        return out
-    return _apply_zero_score_rescue(out)
+    if _zero_score_rescue_scope_enabled():
+        out = _apply_zero_score_rescue(out)
+    return _repair_range_pct_columns(out)
 
 
 def filter_common_stock_rows(df: pd.DataFrame, *, require_buy_target: bool = False, exclude_etf_fund: bool = True, allowed_market_types: Optional[set[str]] = None) -> pd.DataFrame:
@@ -789,7 +868,60 @@ def _buy_candidates_from_prepared(df: pd.DataFrame, *, interval: int | str, top_
     return out
 
 
+# ============================================================
+# SELL 候補の short_ok 事前フィルタ
+# (旧 core/startup/summary_ai_more_candidates_patch._install_sell_short_ok_filter_patch)
+# ------------------------------------------------------------
+# 空売り可否 (short_ok) が立っていない銘柄を SELL 候補の段階で落とす。
+# 旧パッチは _sell_candidates_from_prepared を外から包んでいたが、
+# 同じ属性を奪い合う相手が居ないので本体へ畳んだ。ネイティブは *_core へ改名。
+# ============================================================
+
+
+def _apply_sell_short_ok_prefilter(out: pd.DataFrame) -> pd.DataFrame:
+    if not _env_bool("SUMMARY_AI_SELL_SHORT_OK_PREFILTER", True):
+        return out
+    try:
+        from AI.sell_credit_guard import can_sell_symbol
+
+        if not isinstance(out, pd.DataFrame) or out.empty:
+            return out
+        before = len(out)
+        keep_idx: list[Any] = []
+        skipped: list[dict[str, Any]] = []
+        for idx, row in out.iterrows():
+            try:
+                row_dict = row.to_dict() if hasattr(row, "to_dict") else dict(row)
+                symbol = str(row_dict.get("symbol") or "").strip()
+                if can_sell_symbol(row_dict, default=False):
+                    keep_idx.append(idx)
+                else:
+                    skipped.append({"symbol": symbol, "reason": "short_ok_not_1"})
+            except Exception as e:
+                skipped.append({"symbol": str(getattr(row, "symbol", "")), "reason": f"guard_error:{e}"})
+        if len(keep_idx) == before:
+            return out
+        filtered = out.loc[keep_idx].copy().reset_index(drop=True) if keep_idx else out.iloc[0:0].copy()
+        kept_symbols = list(filtered["symbol"].astype(str).head(20)) if "symbol" in filtered.columns and not filtered.empty else []
+        logger.warning(
+            "[SUMMARY AI SELL SHORT_OK PREFILTER] filtered before=%s after=%s skipped=%s kept_symbols=%s",
+            before, len(filtered), skipped[:20], kept_symbols,
+        )
+        return filtered
+    except Exception:
+        logger.exception("[SUMMARY AI SELL SHORT_OK PREFILTER] failed; return original candidates")
+        return out
+
+
 def _sell_candidates_from_prepared(df: pd.DataFrame, *, interval: int | str, top_n: int, min_sell_score: float, max_buy_score: float, min_volume: float, min_price: float, source: str) -> pd.DataFrame:
+    out = _sell_candidates_from_prepared_core(
+        df, interval=interval, top_n=top_n, min_sell_score=min_sell_score,
+        max_buy_score=max_buy_score, min_volume=min_volume, min_price=min_price, source=source,
+    )
+    return _apply_sell_short_ok_prefilter(out)
+
+
+def _sell_candidates_from_prepared_core(df: pd.DataFrame, *, interval: int | str, top_n: int, min_sell_score: float, max_buy_score: float, min_volume: float, min_price: float, source: str) -> pd.DataFrame:
     if df.empty:
         return df
     top_n = _resolve_top_n(top_n)

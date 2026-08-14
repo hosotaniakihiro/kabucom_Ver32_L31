@@ -220,6 +220,43 @@ STRICT_ENTRY_CONSTANTS: dict[str, float | int] = {
 }
 
 
+def apply_final_gate_relax_constants() -> bool:
+    """旧 summary_ai_more_candidates_patch._install_final_gate_relax_patch() の本文化。
+
+    _passes_ai_gate のラップ本体は当ファイルへ本文化済み。ここは旧 install() が
+    併せて上書きしていた 4 定数だけ。同じ定数を core/startup/__init__.py /
+    kabu_api.buy_sell_entry.apply_oneshot_limit_defaults /
+    core/startup/strict_entry_defaults も書くため**後勝ち**になる。
+    呼び出し位置 (main.py の patches リスト) は旧 install と同じに保つこと。
+    """
+    global MIN_SUMMARY_SCORE_BUY, MIN_COMPOSITE_SCORE_BUY
+    global MIN_SUMMARY_SCORE_SELL, MIN_COMPOSITE_SCORE_SELL
+    try:
+        if os.environ.get("ENTRY_CONTROLLER_FINAL_GATE_RELAX_ENABLED", "").strip() in {"0", "false", "no", "off"}:
+            return False
+
+        def _f(name: str, default: float) -> float:
+            try:
+                v = os.getenv(name)
+                return float(default) if v is None or str(v).strip() == "" else float(v)
+            except Exception:
+                return float(default)
+
+        MIN_SUMMARY_SCORE_BUY = _f("ENTRY_CONTROLLER_SUMMARY_BUY_MIN_SCORE", 1.0)
+        MIN_COMPOSITE_SCORE_BUY = _f("ENTRY_CONTROLLER_SUMMARY_BUY_MIN_COMPOSITE", 1.0)
+        MIN_SUMMARY_SCORE_SELL = _f("ENTRY_CONTROLLER_SUMMARY_SELL_MIN_SCORE", 1.0)
+        MIN_COMPOSITE_SCORE_SELL = _f("ENTRY_CONTROLLER_SUMMARY_SELL_MIN_COMPOSITE", 1.0)
+        logger.warning(
+            "[SUMMARY AI MORE CANDIDATES] final gate relax constants applied buy=%s/%s sell=%s/%s",
+            MIN_SUMMARY_SCORE_BUY, MIN_COMPOSITE_SCORE_BUY,
+            MIN_SUMMARY_SCORE_SELL, MIN_COMPOSITE_SCORE_SELL,
+        )
+        return True
+    except Exception:
+        logger.exception("[SUMMARY AI MORE CANDIDATES] final gate relax constants failed")
+        return False
+
+
 def apply_strict_entry_constants() -> dict[str, tuple[Any, Any]]:
     """旧 tonosama_history_failclose_strict_patch._patch_entry_controller() の本文化。
 

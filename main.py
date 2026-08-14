@@ -341,7 +341,11 @@ def _install_main_runtime_patches():
         # scheduler_jobs/summary/display.py 本体へインライン化済みのため削除。
         # entry_ma5_third_bar_slope_guard_patch は entry_controller._build_scored_candidates
         # 本体へインライン化済みのため削除。
-        ("core.startup.summary_ai_more_candidates_patch", "install"),
+        # summary_ai_more_candidates_patch は trading/entry/summary_ai/more_candidates.py へ移設した
+        # (runner の候補数拡張 + スコア clamp と low move pool refill だけが残っている。
+        #  final gate relax 定数 -> entry_controller.apply_final_gate_relax_constants()、
+        #  range_pct 補修 / SELL short_ok 事前フィルタ -> candidates.py 本体へ本文化済み)。
+        ("trading.entry.summary_ai.more_candidates", "install"),
         ("trading.entry.summary_ai.direct_snapshot", "apply_async_entry_defaults"),
         # async entry が executor を差し替えた後で、V5 direct dispatch を必ず重ねる。
         # summary_ai_async_direct_dispatch_patch は本文化済み:
