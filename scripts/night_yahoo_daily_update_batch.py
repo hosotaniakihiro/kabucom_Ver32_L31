@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import importlib
 import logging
 import os
@@ -42,7 +43,7 @@ except Exception:
     DEFAULT_BASE_DIR = r"\\192.168.0.22\AutoStockBuyAndSell"
 
 LOG = logging.getLogger("night_yahoo_daily_update_batch")
-VERSION = "V5-NIGHT-YAHOO-DAILY-INCREMENTAL-END-DATE"
+VERSION = "V4-NIGHT-YAHOO-DAILY-INCREMENTAL-FULL-COLUMNS"
 
 DB_DIR_NAME = "daily_db"
 DB_FILE_NAME = "stock_analysis.db"
@@ -289,7 +290,34 @@ def _standardize_daily_core(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
 # ============================================================
 
 
+# ============================================================
+# STAGE LOG
+# (旧 scripts/night_yahoo_daily_stage_log_patch.py)
+# ------------------------------------------------------------
+# 銘柄ごとに fetch / compute / save のどこで待っているか分かるように
+# 各段の begin/done を出す。旧パッチは 3 関数の最外層に入っていたので
+# 同じ位置 (公開名) に置き、実装は *_staged へ委譲する。
+# ============================================================
+
+
+def _stage_sym_from_price_df(df: pd.DataFrame) -> str:
+    try:
+        if df is not None and not df.empty and "symbol" in df.columns:
+            return str(df["symbol"].dropna().iloc[0])
+    except Exception:
+        pass
+    return "?"
+
+
 def _fetch_daily_one(symbol: str, *, period: str, start: Optional[str]) -> pd.DataFrame:
+    t0 = time.time()
+    LOG.info("[NIGHT YAHOO DAILY STAGE] fetch begin symbol=%s start=%s period=%s", symbol, start or "-", period)
+    out = _fetch_daily_one_direct_chart(symbol, period=period, start=start)
+    LOG.info("[NIGHT YAHOO DAILY STAGE] fetch done symbol=%s rows=%s elapsed=%.1fs", symbol, 0 if out is None else len(out), time.time() - t0)
+    return out
+
+
+def _fetch_daily_one_direct_chart(symbol: str, *, period: str, start: Optional[str]) -> pd.DataFrame:
     from scripts.night_yahoo_daily_direct_chart import (
         fetch_chart as _dc_fetch_chart,
         normalize_symbol as _dc_normalize_symbol,
@@ -392,7 +420,110 @@ def _add_change_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# ============================================================
+# FULL COLUMNS
+# (旧 scripts/night_yahoo_daily_full_columns_patch.py V4)
+# ------------------------------------------------------------
+# 保存先テーブルが期待する全列 (EXPECTED_COLS) を必ず埋める。
+# 旧パッチは _run_indicator_pipeline / _save_symbol_df / process_symbol の
+# 3 つを包んでいたので、その 3 段構成をそのまま本文へ写した。
+# 列定義と enrich 本体は scripts/night_yahoo_daily_full_columns.py にある。
+# ============================================================
+
+
+def _fullcol():
+    from scripts import night_yahoo_daily_full_columns as _m
+
+    return _m
+
+
+# ============================================================
+# LIGHT COMPUTE
+# (旧 scripts/night_yahoo_daily_light_compute_patch.py)
+# ------------------------------------------------------------
+# 外部の重い日足計算パイプラインを使わず、full columns の
+# enrich_daily_columns だけで列を作る。compute で固まる問題の回避用。
+# 旧パッチは _run_indicator_pipeline を full columns 版ごと置き換えて
+# いたので、NIGHT_YAHOO_DAILY_LIGHT_COMPUTE (既定 1) で切り替える形にした。
+# 無効時は従来どおり full columns 版 (_run_indicator_pipeline_full_columns) を通す。
+# ============================================================
+
+
+def _light_compute_enabled() -> bool:
+    return str(os.environ.get("NIGHT_YAHOO_DAILY_LIGHT_COMPUTE", "1")).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _light_normalize_symbol(value: Any) -> str:
+    s = str(value or "").strip().upper()
+    if s.endswith(".T"):
+        s = s[:-2]
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s.zfill(4) if s.isdigit() and len(s) < 4 else s
+
+
 def _run_indicator_pipeline(price_df: pd.DataFrame, rec: dict[str, str]) -> pd.DataFrame:
+    symbol = str((rec or {}).get("symbol") or _stage_sym_from_price_df(price_df))
+    t0 = time.time()
+    LOG.info("[NIGHT YAHOO DAILY STAGE] compute begin symbol=%s rows=%s", symbol, 0 if price_df is None else len(price_df))
+    out = _run_indicator_pipeline_staged(price_df, rec)
+    LOG.info("[NIGHT YAHOO DAILY STAGE] compute done symbol=%s rows=%s cols=%s elapsed=%.1fs", symbol, 0 if out is None else len(out), 0 if out is None else len(out.columns), time.time() - t0)
+    return out
+
+
+def _run_indicator_pipeline_staged(price_df: pd.DataFrame, rec: dict[str, str]) -> pd.DataFrame:
+    if not _light_compute_enabled():
+        return _run_indicator_pipeline_full_columns(price_df, rec)
+
+    t0 = time.time()
+    if price_df is None or price_df.empty:
+        return pd.DataFrame()
+    p = price_df.copy()
+    p["date"] = pd.to_datetime(p["date"], errors="coerce")
+    p = p.dropna(subset=["date"]).copy()
+    symbol = _light_normalize_symbol((rec or {}).get("symbol") or (p["symbol"].iloc[0] if "symbol" in p.columns and not p.empty else ""))
+    stock_name = str((rec or {}).get("symbolname") or (rec or {}).get("stock_name") or "")
+    market = str((rec or {}).get("market") or "")
+
+    # full_columns側が期待する基本列へ正規化
+    p["stock_code"] = symbol
+    p["stock_name"] = stock_name
+    p["market"] = market
+    if "adj_close" not in p.columns and "close" in p.columns:
+        p["adj_close"] = p["close"]
+    for c in ["open", "high", "low", "close", "adj_close", "volume"]:
+        if c in p.columns:
+            p[c] = pd.to_numeric(p[c], errors="coerce")
+    base_cols = ["stock_code", "stock_name", "market", "date", "open", "high", "low", "close", "adj_close", "volume"]
+    p = p[[c for c in base_cols if c in p.columns]].copy()
+    out = _fullcol().enrich_daily_columns(p)
+    LOG.info(
+        "[NIGHT YAHOO DAILY LIGHT COMPUTE] done symbol=%s rows=%s cols=%s elapsed=%.1fs",
+        symbol, len(out), len(out.columns), time.time() - t0,
+    )
+    return out
+
+
+def _run_indicator_pipeline_full_columns(price_df: pd.DataFrame, rec: dict[str, str]) -> pd.DataFrame:
+    try:
+        out = _run_indicator_pipeline_core(price_df, rec)
+    except Exception:
+        LOG.warning("[NIGHT YAHOO DAILY FULLCOL] original pipeline failed, using fallback", exc_info=True)
+        # 元パイプライン失敗時も最低限の形を作る
+        p = price_df.copy()
+        p["date"] = pd.to_datetime(p["date"], errors="coerce")
+        out = p.copy()
+        out.insert(0, "market", rec.get("market", ""))
+        out.insert(0, "stock_name", rec.get("symbolname", ""))
+        out.insert(0, "stock_code", rec.get("symbol", ""))
+    try:
+        return _fullcol().enrich_daily_columns(out)
+    except Exception:
+        LOG.warning("[NIGHT YAHOO DAILY FULLCOL] enrich failed", exc_info=True)
+        return out
+
+
+def _run_indicator_pipeline_core(price_df: pd.DataFrame, rec: dict[str, str]) -> pd.DataFrame:
     if price_df is None or price_df.empty:
         return pd.DataFrame()
     df = price_df.copy().sort_values("date")
@@ -469,7 +600,145 @@ def _upsert_df(conn: sqlite3.Connection, table: str, df: pd.DataFrame, pk_cols: 
     return len(data)
 
 
+# ============================================================
+# CHUNKED SAVE
+# (旧 scripts/night_yahoo_daily_save_chunk_patch.py)
+# ------------------------------------------------------------
+# NAS/DB ロックで長時間止まらないよう、history を chunk 単位で
+# commit しながら保存する。旧パッチは _save_symbol_df を
+# **完全に置き換えて** いた (env ゲート無し) ため、
+# full columns の save 層と pandas safety の save 層は実運用では
+# 到達しない。両者はそれぞれ
+#   _save_symbol_df_full_columns / _save_symbol_df_safety
+# として残してあるが、通常経路からは呼ばれない。
+# ============================================================
+
+
+def _save_env_int(name: str, default: int) -> int:
+    try:
+        v = os.environ.get(name)
+        return int(default) if v is None or str(v).strip() == "" else int(float(v))
+    except Exception:
+        return int(default)
+
+
+def _save_env_float(name: str, default: float) -> float:
+    try:
+        v = os.environ.get(name)
+        return float(default) if v is None or str(v).strip() == "" else float(v)
+    except Exception:
+        return float(default)
+
+
 def _save_symbol_df(db_path: Path, df: pd.DataFrame) -> tuple[int, int]:
+    symbol = _stage_sym_from_price_df(df)
+    try:
+        if df is not None and not df.empty and "stock_code" in df.columns:
+            symbol = str(df["stock_code"].dropna().iloc[0])
+    except Exception:
+        pass
+    t0 = time.time()
+    LOG.info("[NIGHT YAHOO DAILY STAGE] save begin symbol=%s rows=%s cols=%s db=%s", symbol, 0 if df is None else len(df), 0 if df is None else len(df.columns), db_path)
+    out = _save_symbol_df_chunked(db_path, df)
+    LOG.info("[NIGHT YAHOO DAILY STAGE] save done symbol=%s result=%s elapsed=%.1fs", symbol, out, time.time() - t0)
+    return out
+
+
+def _save_symbol_df_chunked(db_path: Path, df: pd.DataFrame) -> tuple[int, int]:
+    if df is None or df.empty:
+        return 0, 0
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    chunk_size = max(10, _save_env_int("NIGHT_YAHOO_DAILY_SAVE_CHUNK_SIZE", 100))
+    timeout = _save_env_float("NIGHT_YAHOO_DAILY_SQLITE_TIMEOUT", 3.0)
+    busy_ms = max(500, _save_env_int("NIGHT_YAHOO_DAILY_SQLITE_BUSY_TIMEOUT_MS", 3000))
+    t0 = time.time()
+    LOG.info(
+        "[NIGHT YAHOO DAILY SAVE CHUNK] start rows=%s cols=%s chunk=%s timeout=%.1fs busy_ms=%s db=%s",
+        len(df), len(df.columns), chunk_size, timeout, busy_ms, db_path,
+    )
+    conn = sqlite3.connect(str(db_path), timeout=timeout)
+    hist_total = 0
+    lat = 0
+    try:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except Exception:
+            pass
+        conn.execute(f"PRAGMA busy_timeout={busy_ms}")
+        conn.execute("PRAGMA synchronous=NORMAL")
+
+        n = len(df)
+        for start in range(0, n, chunk_size):
+            end = min(start + chunk_size, n)
+            LOG.info(
+                "[NIGHT YAHOO DAILY SAVE CHUNK] history chunk %s-%s/%s begin elapsed=%.1fs",
+                start + 1, end, n, time.time() - t0,
+            )
+            part = df.iloc[start:end].copy()
+            try:
+                hist_total += int(_upsert_df(conn, DB_TABLE_HISTORY, part, ["stock_code", "date"]) or 0)
+                conn.commit()
+                LOG.info(
+                    "[NIGHT YAHOO DAILY SAVE CHUNK] history chunk %s-%s/%s committed elapsed=%.1fs",
+                    start + 1, end, n, time.time() - t0,
+                )
+            except sqlite3.OperationalError as e:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                LOG.warning(
+                    "[NIGHT YAHOO DAILY SAVE CHUNK] history chunk %s-%s/%s skipped sqlite error=%s elapsed=%.1fs",
+                    start + 1, end, n, e, time.time() - t0,
+                )
+                # NAS/DB lockで長時間止めない。次chunkへ進む。
+                continue
+
+        LOG.info("[NIGHT YAHOO DAILY SAVE CHUNK] latest begin elapsed=%.1fs", time.time() - t0)
+        latest = df.copy()
+        latest["date"] = pd.to_datetime(latest["date"], errors="coerce")
+        latest = latest.dropna(subset=["date"]).sort_values("date").tail(1)
+        latest["date"] = latest["date"].dt.strftime("%Y-%m-%d")
+        try:
+            lat = int(_upsert_df(conn, DB_TABLE_LATEST, latest, ["stock_code"]) or 0)
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            LOG.warning("[NIGHT YAHOO DAILY SAVE CHUNK] latest skipped sqlite error=%s elapsed=%.1fs", e, time.time() - t0)
+            lat = 0
+        LOG.info(
+            "[NIGHT YAHOO DAILY SAVE CHUNK] done history=%s latest=%s elapsed=%.1fs",
+            hist_total, lat, time.time() - t0,
+        )
+        return hist_total, lat
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _save_symbol_df_full_columns(db_path: Path, df: pd.DataFrame) -> tuple[int, int]:
+    """旧 full_columns 版の save (現行経路では chunk 版に置き換わって未使用)。"""
+    fc = _fullcol()
+    if df is not None and not df.empty:
+        df = fc.enrich_daily_columns(df)
+    result = _save_symbol_df_safety(db_path, df)
+    try:
+        with sqlite3.connect(str(db_path), timeout=20) as conn:
+            fc.ensure_columns(conn, DB_TABLE_HISTORY, fc.EXPECTED_COLS, df)
+            fc.ensure_columns(conn, DB_TABLE_LATEST, fc.EXPECTED_COLS, df)
+            conn.commit()
+    except Exception:
+        LOG.warning("[NIGHT YAHOO DAILY FULLCOL] schema ensure failed db=%s", db_path, exc_info=True)
+    return result
+
+
+def _save_symbol_df_safety(db_path: Path, df: pd.DataFrame) -> tuple[int, int]:
     from scripts.night_yahoo_pandas_safety import sanitize_columns
 
     return _save_symbol_df_core(db_path, sanitize_columns(df) if isinstance(df, pd.DataFrame) else df)
@@ -552,7 +821,73 @@ def _incr_load_warmup_prices(db_path, symbol, mod, rows):
     return _incr_helpers().load_warmup_prices(db_path, symbol, mod, rows)
 
 
+# ============================================================
+# SYMBOL TIMEOUT
+# (旧 scripts/night_yahoo_daily_timeout_patch.py)
+# ------------------------------------------------------------
+# 1 銘柄が固まってもバッチ全体を止めないよう、専用スレッドプールで
+# 実行して NIGHT_YAHOO_DAILY_SYMBOL_TIMEOUT_SEC (既定 90) で打ち切る。
+# 旧パッチは process_symbol の最外層に入っていたので同じ位置に置いた。
+# ============================================================
+
+_SYMBOL_TIMEOUT_EXECUTOR: Optional["concurrent.futures.ThreadPoolExecutor"] = None
+
+
+def _symbol_timeout_sec() -> float:
+    try:
+        return float(os.environ.get("NIGHT_YAHOO_DAILY_SYMBOL_TIMEOUT_SEC", "90"))
+    except Exception:
+        return 90.0
+
+
+def _symbol_timeout_executor() -> "concurrent.futures.ThreadPoolExecutor":
+    global _SYMBOL_TIMEOUT_EXECUTOR
+    if _SYMBOL_TIMEOUT_EXECUTOR is None:
+        workers = int(float(os.environ.get("NIGHT_YAHOO_DAILY_TIMEOUT_WORKERS", "4")))
+        workers = max(1, min(workers, 16))
+        _SYMBOL_TIMEOUT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="night-yahoo-daily"
+        )
+    return _SYMBOL_TIMEOUT_EXECUTOR
+
+
 def process_symbol(rec: dict[str, str], *, period: str, start: Optional[str], db_path: Path):
+    symbol = str((rec or {}).get("symbol", ""))
+    timeout = _symbol_timeout_sec()
+    fut = _symbol_timeout_executor().submit(_process_symbol_full_columns, rec, period=period, start=start, db_path=db_path)
+    try:
+        return fut.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        try:
+            fut.cancel()
+        except Exception:
+            pass
+        LOG.warning(
+            "[NIGHT YAHOO DAILY TIMEOUT] symbol timeout symbol=%s timeout=%.1fs -> skip",
+            symbol,
+            timeout,
+        )
+        return symbol, False, f"symbol timeout {timeout:.1f}s", 0
+
+
+def _process_symbol_full_columns(rec: dict[str, str], *, period: str, start: Optional[str], db_path: Path):
+    """full columns の repair 層 -> 差分更新層 の順。"""
+    symbol, success, msg, nrows = _process_symbol_incremental(rec, period=period, start=start, db_path=db_path)
+    repair_enabled = str(os.environ.get("NIGHT_YAHOO_DAILY_FULLCOL_REPAIR", "1")).strip().lower() not in {"0", "false", "no", "off"}
+    if repair_enabled and success and int(nrows or 0) == 0:
+        sym = str(symbol or rec.get("symbol", "")).strip()
+        fc = _fullcol()
+        if sym and fc.needs_latest_repair(Path(db_path), sym, sys.modules[__name__]):
+            try:
+                repaired = fc.repair_recent_rows(Path(db_path), sym, rec, sys.modules[__name__])
+                if repaired > 0:
+                    return symbol, True, f"{msg}; full-columns repaired rows={repaired}", repaired
+            except Exception:
+                LOG.warning("[NIGHT YAHOO DAILY FULLCOL] repair failed symbol=%s", sym, exc_info=True)
+    return symbol, success, msg, nrows
+
+
+def _process_symbol_incremental(rec: dict[str, str], *, period: str, start: Optional[str], db_path: Path):
     symbol = _incr_normalize_symbol(rec.get("symbol", ""))
     if not symbol:
         return symbol, False, "empty symbol", 0
@@ -642,6 +977,11 @@ def process_symbol(rec: dict[str, str], *, period: str, start: Optional[str], db
 
 # 旧パッチが立てていた互換フラグ (外部からの二重 install ガード用)
 _NIGHT_YAHOO_DAILY_INCREMENTAL_PATCHED = True
+_NIGHT_YAHOO_DAILY_FULL_COLUMNS_PATCHED = True
+_NIGHT_YAHOO_DAILY_LIGHT_COMPUTE_PATCHED = True
+_NIGHT_YAHOO_DAILY_CHUNK_SAVE_PATCHED = True
+_NIGHT_YAHOO_DAILY_STAGE_LOG_PATCHED = True
+_NIGHT_YAHOO_DAILY_TIMEOUT_PATCHED = True
 
 
 def _process_symbol_full_reload(rec: dict[str, str], *, period: str, start: Optional[str], db_path: Path) -> tuple[str, bool, str, int]:

@@ -1,5 +1,5 @@
 # ============================================================
-# File   : scripts/night_yahoo_daily_full_columns_patch.py
+# File   : scripts/night_yahoo_daily_full_columns.py
 # Version: V1-NIGHT-YAHOO-DAILY-FULL-COLUMNS
 # ------------------------------------------------------------
 # 夜間Yahoo日足DBに、テクニカル・ローソク足・売買シグナル・
@@ -22,7 +22,7 @@ from typing import Any, Optional
 import numpy as np
 import pandas as pd
 
-LOG = logging.getLogger("night_yahoo_daily_full_columns_patch")
+LOG = logging.getLogger("night_yahoo_daily_full_columns")
 VERSION = "V1-NIGHT-YAHOO-DAILY-FULL-COLUMNS"
 _INSTALLED = False
 
@@ -446,84 +446,18 @@ def _repair_recent_rows(db_path: Path, symbol: str, rec: dict[str, str], daily_m
     hist, _lat = daily_mod._save_symbol_df(db_path, computed)
     return int(hist or 0)
 
+ensure_columns = _ensure_columns
+needs_latest_repair = _needs_latest_repair
+load_recent_prices = _load_recent_prices
+repair_recent_rows = _repair_recent_rows
 
-def install(daily_mod: Any) -> bool:
-    global _INSTALLED
-    if _INSTALLED:
-        return True
-    if daily_mod is None:
-        return False
-    if getattr(daily_mod, "_NIGHT_YAHOO_DAILY_FULL_COLUMNS_PATCHED", False):
-        _INSTALLED = True
-        return True
+__all__ = [
+    "VERSION",
+    "EXPECTED_COLS",
+    "enrich_daily_columns",
+    "ensure_columns",
+    "needs_latest_repair",
+    "load_recent_prices",
+    "repair_recent_rows",
+]
 
-    original_pipeline = getattr(daily_mod, "_run_indicator_pipeline", None)
-    original_save = getattr(daily_mod, "_save_symbol_df", None)
-    original_process = getattr(daily_mod, "process_symbol", None)
-    if not callable(original_pipeline) or not callable(original_save) or not callable(original_process):
-        LOG.warning("[NIGHT YAHOO DAILY FULLCOL] install failed: required functions missing")
-        return False
-
-    def pipeline_full_columns(price_df: pd.DataFrame, rec: dict[str, str]) -> pd.DataFrame:
-        try:
-            out = original_pipeline(price_df, rec)
-        except Exception:
-            LOG.warning("[NIGHT YAHOO DAILY FULLCOL] original pipeline failed, using fallback", exc_info=True)
-            # 元パイプライン失敗時も最低限の形を作る
-            p = price_df.copy()
-            p["date"] = pd.to_datetime(p["date"], errors="coerce")
-            out = p.copy()
-            out.insert(0, "market", rec.get("market", ""))
-            out.insert(0, "stock_name", rec.get("symbolname", ""))
-            out.insert(0, "stock_code", rec.get("symbol", ""))
-        try:
-            return enrich_daily_columns(out)
-        except Exception:
-            LOG.warning("[NIGHT YAHOO DAILY FULLCOL] enrich failed", exc_info=True)
-            return out
-
-    def save_full_columns(db_path: Path, df: pd.DataFrame):
-        if df is not None and not df.empty:
-            df = enrich_daily_columns(df)
-        result = original_save(db_path, df)
-        try:
-            with sqlite3.connect(str(db_path), timeout=20) as conn:
-                _ensure_columns(conn, getattr(daily_mod, "DB_TABLE_HISTORY", "stock_analysis_history"), EXPECTED_COLS, df)
-                _ensure_columns(conn, getattr(daily_mod, "DB_TABLE_LATEST", "stock_analysis_latest"), EXPECTED_COLS, df)
-                conn.commit()
-        except Exception:
-            LOG.warning("[NIGHT YAHOO DAILY FULLCOL] schema ensure failed db=%s", db_path, exc_info=True)
-        return result
-
-    def process_symbol_full_columns(rec: dict[str, str], *, period: str, start: Optional[str], db_path: Path):
-        symbol, success, msg, nrows = original_process(rec, period=period, start=start, db_path=db_path)
-        repair_enabled = str(os.environ.get("NIGHT_YAHOO_DAILY_FULLCOL_REPAIR", "1")).strip().lower() not in {"0", "false", "no", "off"}
-        if repair_enabled and success and int(nrows or 0) == 0:
-            sym = str(symbol or rec.get("symbol", "")).strip()
-            if sym and _needs_latest_repair(Path(db_path), sym, daily_mod):
-                try:
-                    repaired = _repair_recent_rows(Path(db_path), sym, rec, daily_mod)
-                    if repaired > 0:
-                        return symbol, True, f"{msg}; full-columns repaired rows={repaired}", repaired
-                except Exception:
-                    LOG.warning("[NIGHT YAHOO DAILY FULLCOL] repair failed symbol=%s", sym, exc_info=True)
-        return symbol, success, msg, nrows
-
-    daily_mod._run_indicator_pipeline = pipeline_full_columns
-    daily_mod._save_symbol_df = save_full_columns
-    daily_mod.process_symbol = process_symbol_full_columns
-    daily_mod._NIGHT_YAHOO_DAILY_FULL_COLUMNS_PATCHED = True
-    try:
-        daily_mod.VERSION = "V4-NIGHT-YAHOO-DAILY-INCREMENTAL-FULL-COLUMNS"
-    except Exception:
-        pass
-
-    _INSTALLED = True
-    LOG.warning(
-        "[NIGHT YAHOO DAILY FULLCOL] installed version=%s expected_cols=%s sentinel=%s repair=%s",
-        VERSION,
-        len(EXPECTED_COLS),
-        ",".join(SENTINEL_COLS),
-        os.environ.get("NIGHT_YAHOO_DAILY_FULLCOL_REPAIR", "1"),
-    )
-    return True

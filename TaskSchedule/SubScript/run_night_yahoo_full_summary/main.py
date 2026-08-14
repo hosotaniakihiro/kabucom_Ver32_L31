@@ -100,20 +100,10 @@ from scripts.night_yahoo_pandas_safety import install_concat_guard as _install_c
 _install_concat_guard()
 
 from scripts import night_yahoo_daily_update_batch as _daily_batch
-from scripts import night_yahoo_daily_full_columns_patch as _daily_full_columns_patch
-from scripts import night_yahoo_daily_light_compute_patch as _daily_light_compute_patch
-from scripts import night_yahoo_daily_save_chunk_patch as _daily_save_chunk_patch
-from scripts import night_yahoo_daily_stage_log_patch as _daily_stage_log_patch
-from scripts import night_yahoo_daily_timeout_patch as _daily_timeout_patch
 
 # module読み込み後に、対象関数にも安全ラッパーを当てる。
 from scripts.night_yahoo_daily_direct_chart import apply_socket_timeout as _dc_apply_socket_timeout
 _dc_apply_socket_timeout()
-_daily_full_columns_patch.install(_daily_batch)
-_daily_light_compute_patch.install(_daily_batch)
-_daily_save_chunk_patch.install(_daily_batch)
-_daily_stage_log_patch.install(_daily_batch)
-_daily_timeout_patch.install(_daily_batch)
 
 daily_main = _daily_batch.main
 from scripts.night_yahoo_full_summary_batch import main as summary_main
