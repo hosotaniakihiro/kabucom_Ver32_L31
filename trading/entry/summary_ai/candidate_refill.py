@@ -14,17 +14,16 @@
 #   - _install_tonosama_failopen_guard は元から no-op だったので移していない
 #
 # runner のラップを本文へ畳まずここに残しているのは、実運用で
-#   strict_entry_defaults / more_candidates / runtime_consistency /
-#   final_board_guard_signature_compat
-# の 4 つが同じ run_summary_ai_entry_from_df を奪い合っており、
+#   core/startup/strict_entry_defaults
+#   trading/entry/summary_ai/more_candidates
+#   trading/entry/summary_ai/direct_input_context
+#   trading/entry/summary_ai/current_df_context
+# が同じ run_summary_ai_entry_from_df を奪い合っており、
 # 「install 順で最後に載った層が勝つ」こと自体が観測挙動だから。
 # ここを native 化すると層の剥がれ方が変わるため、install 位置ごと保存する。
 #
-# _summary_ai_entry_unsafe_reason は
-# core/startup/final_board_guard_signature_compat_patch がラップ対象にしている。
-#
 # 適用スコープ: 旧 install 元は
-# core/startup/runtime_env/defaults_patch._force_install_summary_ai_safety_guard()
+# core/startup/runtime_env/installer._force_install_summary_ai_safety_guard()
 # (context="main" のみ / DISABLE_SUMMARY_AI_SAFETY_GUARD=1 で無効化)。
 # ============================================================
 from __future__ import annotations

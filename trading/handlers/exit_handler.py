@@ -62,7 +62,7 @@ def _tonosama_exit_infer_env_float(name: str, default: float) -> float:
 def _tonosama_exit_infer_scope_enabled() -> bool:
     """tonosama_exit_source_infer_patch (native化) の旧scope判定を再現する。
 
-    旧パッチは core/startup/runtime_env/defaults_patch.py の
+    旧パッチは core/startup/runtime_env/installer.py の
     TRADING_CONTEXTS={"main"} 経由でのみ install() されていた
     (main.py プロセス以外では常に無効)。
     """
@@ -798,7 +798,7 @@ def run_exit_pipeline_core():
 # この本文の外側に乗る。
 #
 # normal_exit_scalp_align が上書きしていた NORMAL_* 定数5件は、
-# 呼び出し元 (runtime_env/defaults_patch) で env 経由に移してある。
+# 呼び出し元 (runtime_env/installer) で env 経由に移してある。
 # ============================================================
 
 _NES_VERSION = "V1-NORMAL-EXIT-PROFIT-FLOOR"

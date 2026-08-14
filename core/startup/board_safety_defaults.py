@@ -6,11 +6,12 @@
 #   - 板なし発注を復活させないための env ハード代入 (安全側)
 #   - entry_order_builder.ENTRY_ORDER_REQUIRE_BOARD_FOR_SUMMARY = True
 #   - controller busy 時のリトライ env (旧 summary_ai_lock_retry_runtime_patch)
-#   - final_board_guard_signature_compat_patch の連鎖install
+#   - trading/entry/summary_ai/current_df_context の連鎖install
+#     (旧 final_board_guard_signature_compat_patch)
 # だけなので、パッチではなく通常モジュールへ改名した (ロジックは無変更)。
 #
 # **実行位置は変えていない**: 同じ env/定数を
-# summary_ai_strict_board_rest_patch / tonosama_history_failclose_strict_patch も
+# summary_ai_strict_board_rest_patch / core/startup/strict_entry_defaults も
 # 書くため後勝ちになる。main.py の patches リスト内の同じ位置で install() が
 # 呼ばれ続けるようにしてある。
 # ============================================================
@@ -27,7 +28,8 @@
 # V1.8:
 #   - 後段patchで _board_guard が3引数版に戻り、
 #     final_entry_safety_guard が4引数呼びで TypeError になる問題を防ぐため、
-#     final_board_guard_signature_compat_patch を常時installする。
+#     旧 final_board_guard_signature_compat_patch を常時installしていた。
+#     同パッチは解体済みで、いまは current_df_context.install() を呼ぶ。
 # ============================================================
 from __future__ import annotations
 

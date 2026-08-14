@@ -1139,7 +1139,7 @@ __all__ = [
 # ------------------------------------------------------------
 # 実 install 順を実測した結果、実行時の合成は
 #   native <- relief <- legacy_save
-# の2層。relief は core/startup/runtime_env/defaults_patch.py 経由で
+# の2層。relief は core/startup/runtime_env/installer.py 経由で
 # usercustomize/sitecustomize からインタプリタ起動時に入り、legacy_save は
 # core/startup/scheduler/ranking_bootstrap.start_ranking_db_writer_safe()
 # から後で入るため、legacy_save が最外周になる。

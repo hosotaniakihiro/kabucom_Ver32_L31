@@ -241,7 +241,7 @@ __all__ = [
 # (元関数は一度も呼ばない)。素の実装は *_core として残し、
 # 有効時だけ data_collectors/database_owner.py の実装へ委譲する。
 # 有効化のスコープ判定は旧構成どおり
-# core/startup/runtime_env/defaults_patch._install_database_owner() 側。
+# core/startup/runtime_env/installer._install_database_owner() 側。
 # ============================================================
 
 

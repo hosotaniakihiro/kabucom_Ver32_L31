@@ -618,7 +618,7 @@ __all__ = [
 #   1層目 _ilg_*: intraday_load_guard_patch     … 100件ハードクランプ
 #   2層目 _prr_*: push_registration_recovery_patch … topup / audit ログ
 # ------------------------------------------------------------
-# 実 install 順は core/startup/runtime_env/defaults_patch.py の install() 内で
+# 実 install 順は core/startup/runtime_env/installer.py の install() 内で
 #   524行 intraday_load_guard -> 543行 push_registration_recovery
 # どちらも元関数を closure/_original で保持する合成型なので、
 #   native <- intraday clamp <- push_recovery
@@ -648,7 +648,7 @@ _PRR_CONTEXTS = {"main", "main_database", "push_receiver"}
 
 
 def _rot_argv_context() -> str:
-    """core/startup/runtime_env/defaults_patch.py の _argv_context() と同一。"""
+    """core/startup/runtime_env/installer.py の _argv_context() と同一。"""
     try:
         text = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
         if "main_database.py" in text:

@@ -236,19 +236,26 @@ def _install_entry_fire_rescue(context: str) -> bool:
 
 
 def _install_summary_pending_stale_guard(context: str) -> bool:
+    """pending の stale スキップ。
+
+    summary_entry_pending_existing_fix_patch は
+    trading/summary/summary_entry.register_pending_entries へ本文化済みで
+    (_pef_*)、env は都度動的に読む。旧 install 呼び出しは同モジュールが
+    消えたあとも残っており、毎回 ImportError で except に落ちていたので外した。
+    **load-bearing なのは下の env 既定値 3 件だけ**なのでそれは残す。
+    """
     try:
         if context not in TRADING_CONTEXTS:
             return False
         if os.environ.get("DISABLE_SUMMARY_ENTRY_PENDING_FIX_PATCH", "").strip() == "1":
-            logger.warning("[RUNTIME ENV DEFAULTS PATCH] summary pending stale guard disabled by env")
+            logger.warning("[RUNTIME ENV DEFAULTS] summary pending stale guard disabled by env")
             return False
         os.environ.setdefault("SUMMARY_SKIP_STALE_PENDING_ENABLED", "1")
         os.environ.setdefault("SUMMARY_SKIP_MISSING_DATETIME_PENDING", "1")
         os.environ.setdefault("SUMMARY_ENTRY_PENDING_MAX_AGE_SEC", "180")
-        from .. import summary_entry_pending_existing_fix_patch
-        return bool(summary_entry_pending_existing_fix_patch.install())
+        return True
     except Exception:
-        logger.exception("[RUNTIME ENV DEFAULTS PATCH] summary pending stale guard install failed")
+        logger.exception("[RUNTIME ENV DEFAULTS] summary pending stale guard env defaults failed")
         return False
 
 

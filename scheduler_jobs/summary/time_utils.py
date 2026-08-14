@@ -519,7 +519,7 @@ def resolve_target_intervals(now: Optional[dt.datetime] = None) -> list[int]:
     return resolve_target_intervals_core(now)
 
 
-# 旧パッチの install() はモジュールimport連鎖の早い段階 (core/startup/runtime_env/defaults_patch.py
+# 旧パッチの install() はモジュールimport連鎖の早い段階 (core/startup/runtime_env/installer.py
 # 経由) で1回だけ呼ばれ、DBプロセスならその場でenvデフォルトを強制していた。native化後も
 # 同じタイミング (このモジュールが最初にimportされた時点) で1回だけ適用する。
 if _summary_db_realtime_priority_enabled():

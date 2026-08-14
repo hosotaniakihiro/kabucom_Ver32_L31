@@ -18,7 +18,7 @@
 # あとから緩めた定数を strict 側へ引き戻す最終決定権を持つ層で、
 # 実測でも MAX_APPROVED_PER_RUN や MIN_SUMMARY_SCORE_* の定常値を決めている。
 #
-# install 元は core/startup/runtime_env/defaults_patch._install_strict_entry_defaults()
+# install 元は core/startup/runtime_env/installer._install_strict_entry_defaults()
 # (context="main" のみ / DISABLE_STRICT_ENTRY_DEFAULTS_PATCH=1 で無効化)。
 # ------------------------------------------------------------
 from __future__ import annotations

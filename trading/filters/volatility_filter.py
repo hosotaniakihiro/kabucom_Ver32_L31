@@ -764,7 +764,7 @@ def _latest_ranking_snapshot_move_fast(symbol: str) -> dict[str, Any] | None:
 def _vol_filter_rescue_timebox_scope_enabled() -> bool:
     """volatility_filter_ranking_rescue_timebox_patch (native化) の旧scope判定を再現する。
 
-    旧パッチは core/startup/runtime_env/defaults_patch.py の TRADING_CONTEXTS={"main"}
+    旧パッチは core/startup/runtime_env/installer.py の TRADING_CONTEXTS={"main"}
     経由でのみ install() が呼ばれ (DISABLE_VOL_FILTER_RANKING_RESCUE_TIMEBOX_PATCH=1でも
     install()自体が呼ばれない)、install() 内部でも重ねて
     VOL_FILTER_RANKING_RESCUE_TIMEBOX_ENABLED (既定True) を確認していた。

@@ -1247,7 +1247,7 @@ def _pending_audit_record_tonosama_candidate(entry: dict[str, Any]) -> None:
 
 
 def _pending_audit_scope_enabled() -> bool:
-    """tonosama_pending_candidate_audit_patch は core/startup/runtime_env/defaults_patch.py の
+    """tonosama_pending_candidate_audit_patch は core/startup/runtime_env/installer.py の
     TRADING_CONTEXTS ({"main"}) 経由でのみ install されていた (main.py プロセス以外では
     常に無効だった)。TONOSAMA_PENDING_CANDIDATE_AUDIT_SCOPE_ENABLED で明示上書き可。
     """

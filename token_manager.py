@@ -674,7 +674,7 @@ def _get_valid_token_publish(*args, **kwargs):
 # refresh_token: 取れたトークンを global_data 等へ配る
 # get_valid_token: env に十分な長さのトークンがあればそれを優先する
 #
-# 旧構成の実 install 順は runtime_env/defaults_patch の
+# 旧構成の実 install 順は runtime_env/installer の
 #   _install_full_pipeline_stability -> _install_entry_count_unblock
 # だったので、この層が publish 層のさらに外側になる。
 # ------------------------------------------------------------

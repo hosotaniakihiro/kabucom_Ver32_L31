@@ -11,7 +11,7 @@
 
 本文化では各ホストが呼び出し時に owner_override_enabled() を見て、
 真ならここの実装、偽なら素の実装を使う。有効化の導線とスコープ判定は
-旧構成と同じ core/startup/runtime_env/defaults_patch.py の
+旧構成と同じ core/startup/runtime_env/installer.py の
 _install_database_owner() 側に残してある
 (context in DB_CONTEXTS|TRADING_CONTEXTS|GENERIC_HELPER_CONTEXTS かつ
  DISABLE_DATABASE_OWNER_RUNTIME_PATCH != "1")。

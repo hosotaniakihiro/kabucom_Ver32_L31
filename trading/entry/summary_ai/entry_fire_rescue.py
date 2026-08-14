@@ -17,7 +17,7 @@
 # 旧 install() の _watch_loop() (最大24回の再install) は、差し替える
 # モジュール属性が無くなったため不要になり撤去した。
 #
-# 適用スコープ: 旧 install 元は core/startup/runtime_env/defaults_patch.py:216 の
+# 適用スコープ: 旧 install 元は core/startup/runtime_env/installer.py:216 の
 # _safe_install(..., TRADING_CONTEXTS, "DISABLE_ENTRY_FIRE_RESCUE_PATCH", ...) で、
 # TRADING_CONTEXTS は {"main"} のみ。scope_enabled() がそれを再現する。
 # ============================================================

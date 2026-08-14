@@ -612,7 +612,7 @@ def _push_summary_db_latest_source_env_int(name: str, default: int) -> int:
 
 
 def _push_summary_db_latest_source_argv_context() -> str:
-    """core/startup/runtime_env/defaults_patch.py の _argv_context() と同一の判定を再現する。"""
+    """core/startup/runtime_env/installer.py の _argv_context() と同一の判定を再現する。"""
     try:
         text = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
         if "main_database.py" in text:

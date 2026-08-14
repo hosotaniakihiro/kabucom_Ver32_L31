@@ -374,7 +374,7 @@ _ILG_CONTEXTS = {
 
 
 def _ilg_argv_context() -> str:
-    """core/startup/runtime_env/defaults_patch.py の _argv_context() と同一。"""
+    """core/startup/runtime_env/installer.py の _argv_context() と同一。"""
     try:
         text = " ".join(str(x).replace("\\", "/").lower() for x in sys.argv)
         if "main_database.py" in text:

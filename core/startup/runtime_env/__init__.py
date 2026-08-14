@@ -6,7 +6,7 @@
 # 設定レイヤーなのでまとめた。
 #   defaults.py         旧 runtime_env_defaults.py         (既定値の辞書群)
 #   registry.py         旧 runtime_env_default_registry.py (キーのメタデータ)
-#   defaults_patch.py   旧 runtime_env_defaults_patch.py   (適用 + サブパッチ dispatcher)
+#   installer.py        旧 runtime_env_defaults_patch.py   (適用 + install dispatcher)
 #   settings_loader.py  旧 runtime_settings_ini_loader.py  (settings.ini -> env)
 #   settings_ini.py     旧 settings_ini_loader.py          (get_setting 系)
 # ============================================================

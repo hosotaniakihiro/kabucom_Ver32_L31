@@ -228,7 +228,7 @@ def _zero_range_rescue_enabled() -> bool:
     レンジ0のままだとボラティリティ/レンジフィルタに落とされるため補完する。
 
     適用スコープは旧パッチの導線をそのまま再現している:
-      - core/startup/runtime_env/defaults_patch._safe_install() 経由で
+      - core/startup/runtime_env/installer._safe_install() 経由で
         context が TRADING_CONTEXTS ({"main"}) のときだけ install されていた
       - DISABLE_RANKING_ENTRY_RUNTIME_RESCUE_PATCH=1 で無効化
       - patch 側の RANKING_ENTRY_RUNTIME_RESCUE_ENABLED (既定True) でも無効化

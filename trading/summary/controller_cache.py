@@ -1288,7 +1288,7 @@ def _concat_frames_core(
 #
 # 実 install 順の実測:
 #   sitecustomize.py:555 _install_runtime_defaults()
-#     -> runtime_env/defaults_patch -> full_pipeline_stability_runtime_patch
+#     -> runtime_env/installer -> full_pipeline_stability_runtime_patch
 #     -> summary_latest_prefer_patch  (ここが先)
 #   sitecustomize.py:568 背景スレッド -> BACKGROUND_MAIN_PATCHES
 #     -> summary_mtf_early_ready_patch (後)
@@ -1574,7 +1574,7 @@ def _lp_enabled() -> bool:
     """旧 install 経路のキルスイッチを再現する。
 
     summary_latest_prefer_patch は
-      runtime_env/defaults_patch -> full_pipeline_stability_runtime_patch
+      runtime_env/installer -> full_pipeline_stability_runtime_patch
       -> _install_summary_latest_prefer()
     の順に入っていたので、その 2 つの DISABLE env をどちらも見る。
     """

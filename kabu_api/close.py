@@ -310,7 +310,7 @@ def execute_buy_to_close_order(*args, **kwargs):
 #     <- daytrade_credit_force_close      建玉の margin_trade_type を補正
 #     <- exit_board_profit_runtime        板を見て利確指値 -> 失敗時フォールバック
 #
-# daytrade は runtime_env/defaults_patch (sitecustomize 経由) で先に入り、
+# daytrade は runtime_env/installer (sitecustomize 経由) で先に入り、
 # exit_board は main.py:264 の buy_sell_entry.apply_oneshot_limit_defaults の
 # 連鎖で後から入って daytrade ラッパーを掴んでいた。同じ順序で並べてある。
 #
