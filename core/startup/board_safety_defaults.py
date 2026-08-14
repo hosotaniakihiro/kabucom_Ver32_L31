@@ -66,10 +66,30 @@ def _restore_final_guard_board_guard() -> bool:
 
 
 def _install_board_guard_signature_compat() -> bool:
+    """旧 final_board_guard_signature_compat_patch の install 導線。
+
+    同パッチは解体済み。中身の行方:
+      - _apply() の _board_guard 署名互換化
+          final_entry_safety_guard_patch が本文化済みで _board_guard を持たず、
+          「target missing」で常に False を返す死にコードだったので移していない。
+      - _install_summary_ai_low_move_prefilter_patch
+          -> trading/summary/pipeline/entry_pipeline._allow_summary_ai_liquidity 本体
+      - _install_entry_pipeline_exec_cap_patch
+          -> trading/summary/pipeline/entry_pipeline._cap_summary_ai_exec_rows()
+      - _install_current_df_freshness_patch
+          -> runner のラップは trading/entry/summary_ai/current_df_context.py
+             (読み手が candidate_refill 層 = ネイティブより外側なので畳めない)
+             unsafe_reason 側は candidate_refill._current_df_freshness_ok() へ本文化
+      - _install_summary_ai_selection_pool_patch
+          -> **移していない**。summary_ai_runtime_consistency_patch の watcher が
+             毎秒 _select_ai_ok_items を "protected" 版 (= ネイティブと同じ
+             _selected_pool[:cap]) へ書き戻すため、実運用では一度も効いていない。
+             実測でも定常状態の選択件数は cap どおり (pool 全量にならない)。
+    """
     try:
-        from core.startup import final_board_guard_signature_compat_patch as sig
-        fn = getattr(sig, "install", None)
-        ok = bool(fn()) if callable(fn) else False
+        from trading.entry.summary_ai import current_df_context as sig
+
+        ok = bool(sig.install())
         logger.warning("[BOARD MISSING FAILOPEN] board_guard_signature_compat installed=%s", ok)
         return ok
     except Exception:

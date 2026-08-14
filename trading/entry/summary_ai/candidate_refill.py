@@ -303,7 +303,33 @@ def _get_push_1m_context() -> Any:
     return first_empty
 
 
+def _current_df_freshness_ok() -> bool:
+    """旧 final_board_guard_signature_compat_patch._patched_unsafe_reason() の本文化。
+
+    global history が古くても、いま SUMMARY_AI へ渡されている df 自体が
+    新鮮でスコアを持っていれば安全とみなす。
+    df は trading/entry/summary_ai/current_df_context がスレッドローカルへ張る。
+    """
+    try:
+        from .current_df_context import latest_age_sec, current_df
+
+        df = current_df()
+        ok, age, latest, rows, score_nonzero = latest_age_sec(df)
+        max_age = _env_float("SUMMARY_AI_MAX_PUSH_1M_AGE_SEC", 120.0)
+        if ok and age is not None and age <= max_age and rows > 0 and score_nonzero > 0:
+            logger.warning(
+                "[SUMMARY AI SAFETY GUARD] current AI df freshness OK rows=%s latest=%s age=%.1f max=%.1f score_nonzero=%s version=%s",
+                rows, latest, age, max_age, score_nonzero, VERSION,
+            )
+            return True
+    except Exception:
+        logger.debug("[SUMMARY AI SAFETY GUARD] current AI df freshness check failed", exc_info=True)
+    return False
+
+
 def _summary_ai_entry_unsafe_reason() -> str | None:
+    if _current_df_freshness_ok():
+        return None
     if _env_bool("SUMMARY_AI_REQUIRE_FRESH_PUSH_1M", True):
         df = _get_push_1m_context()
         ok, age, latest, rows = _df_latest_age_sec(df)
