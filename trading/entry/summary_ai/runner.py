@@ -41,7 +41,8 @@ from typing import Any, Callable, Dict, Optional
 
 import pandas as pd
 
-from .ai_gate_runner import DEFAULT_MIN_AI_CONFIDENCE, run_ai_gate_for_candidates
+from .ai_gate_runner import DEFAULT_MIN_AI_CONFIDENCE
+from .ai_gate_runner import run_ai_gate_for_candidates as _run_ai_gate_for_candidates_base
 from .candidates import (
     DEFAULT_MAX_SELL_SCORE,
     DEFAULT_MIN_BUY_SCORE,
@@ -189,6 +190,56 @@ def _resolve_min_top10_slope() -> float:
         return _env_float("ENTRY_MIN_BUY_SLOPE", DEFAULT_MIN_TOP10_SLOPE)
 
     return float(DEFAULT_MIN_TOP10_SLOPE)
+
+
+# ============================================================
+# WEAK SIGNAL FILTER
+# (旧 trading/entry/summary_ai/weak_signal_filter_patch.py)
+# ------------------------------------------------------------
+# SUMMARY / PUSH 経路で、3m/5m の確認がどちらも 0 のまま allow=True になった
+# 行を落とす。旧パッチは runner.run_ai_gate_for_candidates を差し替えて
+# いたが、差し替える相手は他に無く、呼び出しも同ファイル内のモジュール名解決
+# なので本体へ畳んだ (ネイティブは ai_gate_runner 側の *_base を直接呼ぶ)。
+# ============================================================
+
+
+def _wsf_summary_like(source: Any) -> bool:
+    s = str(source or "").upper()
+    return ("SUMMARY" in s or "PUSH" in s) and "RANKING" not in s
+
+
+def _wsf_zero_confirm_reason(reason: str) -> bool:
+    r = str(reason or "")
+    return (
+        "rankScore=0.000" in r
+        and ("3m=0.00" in r or "3m=0.0" in r or "3m=0|" in r)
+        and ("5m=0.00" in r or "5m=0.0" in r or "5m=0|" in r)
+    )
+
+
+def run_ai_gate_for_candidates(*args: Any, **kwargs: Any):
+    results = _run_ai_gate_for_candidates_base(*args, **kwargs)
+    if not isinstance(results, list):
+        return results
+    if not _env_bool("SUMMARY_AI_REJECT_ZERO_3M5M_CONFIRM", True):
+        return results
+    source = kwargs.get("source", "")
+    if not _wsf_summary_like(source):
+        return results
+    out = []
+    changed = []
+    for row in results:
+        if isinstance(row, dict) and bool(row.get("allow")) and _wsf_zero_confirm_reason(str(row.get("reason") or "")):
+            new_row = dict(row)
+            new_row["allow"] = False
+            new_row["reason"] = f"{new_row.get('reason', '')}|zero_3m5m_confirm_ng"
+            changed.append(str(new_row.get("symbol") or ""))
+            out.append(new_row)
+        else:
+            out.append(row)
+    if changed:
+        logger.warning("[SUMMARY AI WEAK FILTER] zero 3m/5m confirmation ng source=%s symbols=%s", source, changed[:20])
+    return out
 
 
 def _select_slope_col(df: pd.DataFrame) -> Optional[str]:
