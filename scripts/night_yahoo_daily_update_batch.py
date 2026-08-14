@@ -42,7 +42,7 @@ except Exception:
     DEFAULT_BASE_DIR = r"\\192.168.0.22\AutoStockBuyAndSell"
 
 LOG = logging.getLogger("night_yahoo_daily_update_batch")
-VERSION = "V2-NIGHT-YAHOO-DAILY-YF-FALLBACK"
+VERSION = "V5-NIGHT-YAHOO-DAILY-INCREMENTAL-END-DATE"
 
 DB_DIR_NAME = "daily_db"
 DB_FILE_NAME = "stock_analysis.db"
@@ -223,7 +223,27 @@ def _call_if_exists(module_names: list[str], func_name: str, df: pd.DataFrame) -
         return df
 
 
+# ============================================================
+# PANDAS SAFETY (旧 scripts/night_yahoo_pandas_safety_patch.py)
+# ------------------------------------------------------------
+# yfinance/pandas の返却形揺れ (MultiIndex / 重複カラム) で
+# 全銘柄が連続失敗するのを防ぐ。旧パッチは _standardize_daily と
+# _save_symbol_df を外から包んでいたので、その 2 段構成を本文へ写した。
+# ============================================================
+
+
 def _standardize_daily(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    from scripts.night_yahoo_pandas_safety import fallback_standardize_daily, sanitize_columns
+
+    clean = sanitize_columns(raw) if isinstance(raw, pd.DataFrame) else raw
+    try:
+        return _standardize_daily_core(clean, symbol)
+    except Exception as e:
+        LOG.warning("[NIGHT YAHOO PANDAS SAFETY] standardize retry symbol=%s err=%s", symbol, e)
+        return fallback_standardize_daily(raw, symbol, _normalize_symbol)
+
+
+def _standardize_daily_core(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     if raw is None or raw.empty:
         return pd.DataFrame()
     df = raw.copy()
@@ -257,7 +277,61 @@ def _standardize_daily(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     return df[["symbol", "date", "open", "high", "low", "close", "adj_close", "volume"]].copy()
 
 
+# ============================================================
+# DIRECT CHART API
+# (旧 scripts/night_yahoo_daily_direct_chart_patch.py)
+# ------------------------------------------------------------
+# sitecustomize の yfinance fail-cache に引っ張られないよう、
+# Yahoo chart API を直接叩く経路を先に試し、駄目なら従来の
+# yfinance 経路 (_fetch_daily_one_core) へ落とす。
+# NIGHT_YAHOO_DIRECT_ONLY=1 のときは chart 失敗で即空を返す。
+# 取得ヘルパは scripts/night_yahoo_daily_direct_chart.py に残してある。
+# ============================================================
+
+
 def _fetch_daily_one(symbol: str, *, period: str, start: Optional[str]) -> pd.DataFrame:
+    from scripts.night_yahoo_daily_direct_chart import (
+        fetch_chart as _dc_fetch_chart,
+        normalize_symbol as _dc_normalize_symbol,
+        skip_symbols as _dc_skip_symbols,
+        timeout_sec as _dc_timeout,
+        to_yahoo_ticker as _dc_to_yahoo_ticker,
+    )
+
+    norm_symbol = _dc_normalize_symbol(symbol)
+    if norm_symbol in _dc_skip_symbols():
+        LOG.warning("[NIGHT YAHOO DIRECT CHART] skipped by NIGHT_YAHOO_DAILY_SKIP_SYMBOLS symbol=%s", norm_symbol)
+        return pd.DataFrame()
+    ticker = _dc_to_yahoo_ticker(norm_symbol)
+    errors: list[str] = []
+    if ticker:
+        try:
+            raw = _dc_fetch_chart(ticker, start=start, period=period, timeout=_dc_timeout())
+            if raw is not None and not raw.empty:
+                raw["symbol"] = norm_symbol
+                raw = raw.drop_duplicates(subset=["symbol", "date"], keep="last").sort_values("date")
+                LOG.info("[NIGHT YAHOO DIRECT CHART] ok symbol=%s ticker=%s rows=%s", norm_symbol, ticker, len(raw))
+                return raw[["symbol", "date", "open", "high", "low", "close", "adj_close", "volume"]].copy()
+            errors.append("chart_empty")
+        except Exception as e:
+            errors.append(f"chart_error={type(e).__name__}:{e}")
+            if str(os.environ.get("NIGHT_YAHOO_DIRECT_ONLY", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+                LOG.warning("[NIGHT YAHOO DIRECT CHART] no daily data symbol=%s ticker=%s reason=%s", norm_symbol, ticker, ";".join(errors))
+                return pd.DataFrame()
+
+    try:
+        out = _fetch_daily_one_core(norm_symbol, period=period, start=start)
+        if out is not None and not out.empty:
+            return out
+        errors.append("original_empty")
+    except Exception as e:
+        errors.append(f"original_error={type(e).__name__}:{e}")
+
+    LOG.warning("[NIGHT YAHOO DIRECT CHART] no daily data symbol=%s ticker=%s reason=%s", norm_symbol, ticker, ";".join(errors))
+    return pd.DataFrame()
+
+
+def _fetch_daily_one_core(symbol: str, *, period: str, start: Optional[str]) -> pd.DataFrame:
     if yf is None:
         raise RuntimeError("yfinance is not installed")
     ticker = _to_yahoo_ticker(symbol)
@@ -396,6 +470,12 @@ def _upsert_df(conn: sqlite3.Connection, table: str, df: pd.DataFrame, pk_cols: 
 
 
 def _save_symbol_df(db_path: Path, df: pd.DataFrame) -> tuple[int, int]:
+    from scripts.night_yahoo_pandas_safety import sanitize_columns
+
+    return _save_symbol_df_core(db_path, sanitize_columns(df) if isinstance(df, pd.DataFrame) else df)
+
+
+def _save_symbol_df_core(db_path: Path, df: pd.DataFrame) -> tuple[int, int]:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path), timeout=float(os.environ.get("NIGHT_YAHOO_DAILY_SQLITE_TIMEOUT", "60")))
     try:
@@ -430,7 +510,141 @@ def _record_run(db_path: Path, *, started_at: float, processed: int, failed: int
         conn.close()
 
 
-def process_symbol(rec: dict[str, str], *, period: str, start: Optional[str], db_path: Path) -> tuple[str, bool, str, int]:
+# ============================================================
+# INCREMENTAL UPDATE
+# (旧 scripts/night_yahoo_daily_incremental_patch.py V5-END-DATE)
+# ------------------------------------------------------------
+# DB の最新日以降だけを取得・計算・保存する差分更新。
+# 旧パッチは process_symbol を丸ごと置き換えていた
+# (元実装は一度も呼ばれない)。その構造をそのまま本文へ写し、
+# 元の全期間リロード版は _process_symbol_full_reload として残してある。
+# ヘルパは scripts/night_yahoo_daily_incremental.py に置いた。
+# ============================================================
+
+
+def _incr_helpers():
+    from scripts import night_yahoo_daily_incremental as _m
+
+    return _m
+
+
+def _incr_date_str(v):
+    return _incr_helpers().date_str(v)
+
+
+def _incr_normalize_symbol(v):
+    return _incr_helpers().normalize_symbol(v)
+
+
+def _incr_parse_end_date():
+    return _incr_helpers().parse_end_date()
+
+
+def _incr_merge_prices(warmup, new_rows, symbol):
+    return _incr_helpers().merge_prices(warmup, new_rows, symbol)
+
+
+def _incr_get_latest_date(db_path, symbol, mod):
+    return _incr_helpers().get_latest_date(db_path, symbol, mod)
+
+
+def _incr_load_warmup_prices(db_path, symbol, mod, rows):
+    return _incr_helpers().load_warmup_prices(db_path, symbol, mod, rows)
+
+
+def process_symbol(rec: dict[str, str], *, period: str, start: Optional[str], db_path: Path):
+    symbol = _incr_normalize_symbol(rec.get("symbol", ""))
+    if not symbol:
+        return symbol, False, "empty symbol", 0
+
+    force_full = str(os.environ.get("NIGHT_YAHOO_DAILY_FORCE_FULL", "0")).strip().lower() in {"1", "true", "yes", "on"}
+    warmup_rows = int(float(os.environ.get("NIGHT_YAHOO_DAILY_WARMUP_ROWS", "320")))
+    end_dt = _incr_parse_end_date()
+
+    latest_dt = None if force_full else _get_latest_date(Path(db_path), symbol, daily_mod)
+
+    # すでにDB最新日が上限日以上なら、保存対象なし。
+    if latest_dt is not None and end_dt is not None and latest_dt >= end_dt:
+        return symbol, True, f"up-to-date latest={_incr_date_str(latest_dt)} end={_incr_date_str(end_dt)}", 0
+
+    # 明示 start がある場合は従来どおりその日から。なければDB最新日の翌日から差分取得。
+    effective_start = start
+    if latest_dt is not None and not effective_start:
+        effective_start = _incr_date_str(latest_dt + pd.Timedelta(days=1))
+
+    # 開始日が上限日を超える場合は取得不要。
+    if effective_start and end_dt is not None:
+        try:
+            if pd.Timestamp(effective_start).normalize() > end_dt:
+                base = _incr_date_str(latest_dt) if latest_dt is not None else "-"
+                return symbol, True, f"up-to-date latest={base} end={_incr_date_str(end_dt)}", 0
+        except Exception:
+            pass
+
+    try:
+        raw_new = _fetch_daily_one(symbol, period=period, start=effective_start)
+        if raw_new is None or raw_new.empty:
+            if latest_dt is not None:
+                return symbol, True, f"up-to-date latest={_incr_date_str(latest_dt)}" + (f" end={_incr_date_str(end_dt)}" if end_dt is not None else ""), 0
+            return symbol, False, "no daily data", 0
+
+        raw_new["date"] = pd.to_datetime(raw_new["date"], errors="coerce").dt.normalize()
+        raw_new = raw_new.dropna(subset=["date"])
+
+        if end_dt is not None:
+            raw_new = raw_new[raw_new["date"] <= end_dt].copy()
+            if raw_new.empty:
+                base = _incr_date_str(latest_dt) if latest_dt is not None else "-"
+                return symbol, True, f"up-to-date latest={base} end={_incr_date_str(end_dt)}", 0
+
+        if latest_dt is not None:
+            raw_new = raw_new[raw_new["date"] > latest_dt].copy()
+            if raw_new.empty:
+                return symbol, True, f"up-to-date latest={_incr_date_str(latest_dt)}" + (f" end={_incr_date_str(end_dt)}" if end_dt is not None else ""), 0
+
+        warmup = pd.DataFrame()
+        if latest_dt is not None:
+            warmup = _incr_load_warmup_prices(Path(db_path), symbol, sys.modules[__name__], warmup_rows)
+
+        calc_prices = _incr_merge_prices(warmup, raw_new, symbol)
+        if end_dt is not None and not calc_prices.empty:
+            calc_prices = calc_prices[pd.to_datetime(calc_prices["date"], errors="coerce").dt.normalize() <= end_dt].copy()
+        if calc_prices.empty:
+            return symbol, False, "no calc prices", 0
+
+        computed = _run_indicator_pipeline(calc_prices, rec)
+        if computed.empty:
+            return symbol, False, "computed empty", 0
+
+        computed["date"] = pd.to_datetime(computed["date"], errors="coerce")
+        computed = computed.dropna(subset=["date"])
+        if end_dt is not None:
+            computed = computed[computed["date"].dt.normalize() <= end_dt].copy()
+
+        if latest_dt is not None:
+            save_df = computed[computed["date"].dt.normalize() > latest_dt].copy()
+        else:
+            save_df = computed.copy()
+
+        if save_df.empty:
+            base = _incr_date_str(latest_dt) if latest_dt is not None else "-"
+            return symbol, True, f"up-to-date latest={base}" + (f" end={_incr_date_str(end_dt)}" if end_dt is not None else ""), 0
+
+        save_df["date"] = save_df["date"].dt.strftime("%Y-%m-%d")
+        hist, lat = _save_symbol_df(Path(db_path), save_df)
+        new_min = pd.to_datetime(save_df["date"], errors="coerce").min()
+        new_max = pd.to_datetime(save_df["date"], errors="coerce").max()
+        return symbol, True, f"incremental saved new_rows={hist} latest={lat} range={_incr_date_str(new_min)}..{_incr_date_str(new_max)} db_latest_before={_incr_date_str(latest_dt) if latest_dt is not None else '-'}" + (f" end={_incr_date_str(end_dt)}" if end_dt is not None else ""), hist
+    except Exception as e:
+        LOG.warning("[NIGHT YAHOO DAILY INCR] symbol failed symbol=%s err=%s", symbol, e, exc_info=True)
+        return symbol, False, str(e), 0
+
+
+# 旧パッチが立てていた互換フラグ (外部からの二重 install ガード用)
+_NIGHT_YAHOO_DAILY_INCREMENTAL_PATCHED = True
+
+
+def _process_symbol_full_reload(rec: dict[str, str], *, period: str, start: Optional[str], db_path: Path) -> tuple[str, bool, str, int]:
     symbol = rec.get("symbol", "")
     try:
         raw = _fetch_daily_one(symbol, period=period, start=start)

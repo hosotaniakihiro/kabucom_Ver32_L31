@@ -77,18 +77,29 @@ os.environ.setdefault("NIGHT_YAHOO_DAILY_SAVE_CHUNK_SIZE", "500")
 os.environ.setdefault("NIGHT_YAHOO_DAILY_SQLITE_TIMEOUT", "10")
 os.environ.setdefault("NIGHT_YAHOO_DAILY_SQLITE_BUSY_TIMEOUT_MS", "10000")
 
+# 列追加が多い DataFrame に対して出る pandas PerformanceWarning を抑止する。
+# (旧 scripts/night_yahoo_daily_warning_filter_patch.py を本文化。
+#  DB 保存失敗の抑止ではなく、ログ大量出力による遅延を防ぐためのもの)
+import warnings as _warnings
+
+try:
+    from pandas.errors import PerformanceWarning as _PerformanceWarning
+
+    _warnings.filterwarnings("ignore", category=_PerformanceWarning)
+    _warnings.filterwarnings("ignore", message="DataFrame is highly fragmented.*")
+except Exception:
+    _warnings.filterwarnings("ignore", message="DataFrame is highly fragmented.*")
+
 # 夜間日足は sitecustomize の yfinance fail-cache 影響を受けることがあるため、
 # daily module を先に読み込み、直接 chart API・差分更新・full columns・light compute・chunk保存・timeoutを差し込む。
-from scripts import night_yahoo_daily_warning_filter_patch as _daily_warning_filter_patch
-_daily_warning_filter_patch.install()
 
 # pandas/yfinance の返却形揺れで銘柄ごとに連続失敗する問題を先に抑止する。
-from scripts import night_yahoo_pandas_safety_patch as _pandas_safety_patch
-_pandas_safety_patch.install()
+# モジュール単位のラッパーは各本体へ本文化済みで、残るグローバル副作用
+# (空リスト pd.concat の安全化) だけをここで入れる。
+from scripts.night_yahoo_pandas_safety import install_concat_guard as _install_concat_guard
+_install_concat_guard()
 
 from scripts import night_yahoo_daily_update_batch as _daily_batch
-from scripts import night_yahoo_daily_direct_chart_patch as _daily_chart_patch
-from scripts import night_yahoo_daily_incremental_patch as _daily_incremental_patch
 from scripts import night_yahoo_daily_full_columns_patch as _daily_full_columns_patch
 from scripts import night_yahoo_daily_light_compute_patch as _daily_light_compute_patch
 from scripts import night_yahoo_daily_save_chunk_patch as _daily_save_chunk_patch
@@ -96,15 +107,13 @@ from scripts import night_yahoo_daily_stage_log_patch as _daily_stage_log_patch
 from scripts import night_yahoo_daily_timeout_patch as _daily_timeout_patch
 
 # module読み込み後に、対象関数にも安全ラッパーを当てる。
-_pandas_safety_patch.install(_daily_batch, _daily_full_columns_patch)
-_daily_chart_patch.install()
-_daily_incremental_patch.install(_daily_batch)
+from scripts.night_yahoo_daily_direct_chart import apply_socket_timeout as _dc_apply_socket_timeout
+_dc_apply_socket_timeout()
 _daily_full_columns_patch.install(_daily_batch)
 _daily_light_compute_patch.install(_daily_batch)
 _daily_save_chunk_patch.install(_daily_batch)
 _daily_stage_log_patch.install(_daily_batch)
 _daily_timeout_patch.install(_daily_batch)
-_pandas_safety_patch.install(_daily_batch, _daily_full_columns_patch)
 
 daily_main = _daily_batch.main
 from scripts.night_yahoo_full_summary_batch import main as summary_main

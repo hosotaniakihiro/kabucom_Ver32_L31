@@ -1,5 +1,5 @@
 # ============================================================
-# File   : scripts/night_yahoo_daily_direct_chart_patch.py
+# File   : scripts/night_yahoo_daily_direct_chart.py
 # Version: V2-NIGHT-YAHOO-DAILY-DIRECT-CHART-SOCKET-TIMEOUT
 # ------------------------------------------------------------
 # 夜間の日足更新で yfinance.download が sitecustomize 等の影響で
@@ -23,7 +23,7 @@ from typing import Any, Optional
 
 import pandas as pd
 
-LOG = logging.getLogger("night_yahoo_daily_direct_chart_patch")
+LOG = logging.getLogger("night_yahoo_daily_direct_chart")
 VERSION = "V2-NIGHT-YAHOO-DAILY-DIRECT-CHART-SOCKET-TIMEOUT"
 _PATCHED = False
 
@@ -173,71 +173,27 @@ def _fetch_chart(ticker: str, *, start: Optional[str], period: str, timeout: flo
     df["volume"] = df["volume"].fillna(0)
     return df
 
-
-def install() -> bool:
-    global _PATCHED
-    if _PATCHED:
-        return True
+def apply_socket_timeout() -> None:
+    """旧 install() 冒頭の socket 既定タイムアウト設定。"""
     try:
         socket.setdefaulttimeout(_timeout())
     except Exception:
         pass
-    try:
-        import scripts.night_yahoo_daily_update_batch as target
-    except Exception:
-        LOG.warning("[NIGHT YAHOO DIRECT CHART] target import failed", exc_info=True)
-        return False
 
-    original_fetch = getattr(target, "_fetch_daily_one", None)
-    if not callable(original_fetch):
-        LOG.warning("[NIGHT YAHOO DIRECT CHART] original _fetch_daily_one missing")
-        return False
 
-    def patched_fetch_daily_one(symbol: str, *, period: str, start: Optional[str]):
-        norm_symbol = _normalize_symbol(symbol)
-        if norm_symbol in _skip_symbols():
-            LOG.warning("[NIGHT YAHOO DIRECT CHART] skipped by NIGHT_YAHOO_DAILY_SKIP_SYMBOLS symbol=%s", norm_symbol)
-            return pd.DataFrame()
-        ticker = _to_yahoo_ticker(norm_symbol)
-        errors: list[str] = []
-        if ticker:
-            try:
-                raw = _fetch_chart(
-                    ticker,
-                    start=start,
-                    period=period,
-                    timeout=_timeout(),
-                )
-                if raw is not None and not raw.empty:
-                    raw["symbol"] = norm_symbol
-                    raw = raw.drop_duplicates(subset=["symbol", "date"], keep="last").sort_values("date")
-                    LOG.info("[NIGHT YAHOO DIRECT CHART] ok symbol=%s ticker=%s rows=%s", norm_symbol, ticker, len(raw))
-                    return raw[["symbol", "date", "open", "high", "low", "close", "adj_close", "volume"]].copy()
-                errors.append("chart_empty")
-            except Exception as e:
-                errors.append(f"chart_error={type(e).__name__}:{e}")
-                if str(os.environ.get("NIGHT_YAHOO_DIRECT_ONLY", "0")).strip().lower() in {"1", "true", "yes", "on"}:
-                    LOG.warning("[NIGHT YAHOO DIRECT CHART] no daily data symbol=%s ticker=%s reason=%s", norm_symbol, ticker, ";".join(errors))
-                    return pd.DataFrame()
+fetch_chart = _fetch_chart
+timeout_sec = _timeout
+skip_symbols = _skip_symbols
+normalize_symbol = _normalize_symbol
+to_yahoo_ticker = _to_yahoo_ticker
 
-        try:
-            out = original_fetch(norm_symbol, period=period, start=start)
-            if out is not None and not out.empty:
-                return out
-            errors.append("original_empty")
-        except Exception as e:
-            errors.append(f"original_error={type(e).__name__}:{e}")
+__all__ = [
+    "VERSION",
+    "apply_socket_timeout",
+    "fetch_chart",
+    "timeout_sec",
+    "skip_symbols",
+    "normalize_symbol",
+    "to_yahoo_ticker",
+]
 
-        LOG.warning("[NIGHT YAHOO DIRECT CHART] no daily data symbol=%s ticker=%s reason=%s", norm_symbol, ticker, ";".join(errors))
-        return pd.DataFrame()
-
-    target._fetch_daily_one = patched_fetch_daily_one
-    _PATCHED = True
-    LOG.warning(
-        "[NIGHT YAHOO DIRECT CHART] installed version=%s timeout=%s direct_only=%s skip=%s",
-        VERSION,
-        os.environ.get("NIGHT_YAHOO_DIRECT_TIMEOUT", "10"),
-        os.environ.get("NIGHT_YAHOO_DIRECT_ONLY", "0"),
-        os.environ.get("NIGHT_YAHOO_DAILY_SKIP_SYMBOLS", ""),
-    )
-    return True

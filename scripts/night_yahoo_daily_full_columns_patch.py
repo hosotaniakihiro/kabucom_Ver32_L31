@@ -157,6 +157,29 @@ def _ensure_numeric(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def enrich_daily_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """旧 night_yahoo_pandas_safety_patch の enrich ラッパーを本文化した層。
+
+    列の正規化に失敗しても最低限の DataFrame を返して銘柄処理を継続する。
+    """
+    from scripts.night_yahoo_pandas_safety import sanitize_columns
+
+    clean = sanitize_columns(df) if isinstance(df, pd.DataFrame) else df
+    try:
+        return _enrich_daily_columns_core(clean)
+    except Exception as e:
+        LOG.warning("[NIGHT YAHOO PANDAS SAFETY] enrich fallback err=%s", e, exc_info=True)
+        out = clean.copy() if isinstance(clean, pd.DataFrame) else pd.DataFrame()
+        if out.empty:
+            return out
+        if "date" in out.columns:
+            out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        for col in EXPECTED_COLS:
+            if col not in out.columns:
+                out[col] = pd.NA
+        return out
+
+
+def _enrich_daily_columns_core(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
     out = df.copy()

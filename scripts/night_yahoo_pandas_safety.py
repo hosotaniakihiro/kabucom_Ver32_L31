@@ -1,5 +1,5 @@
 # ============================================================
-# File   : scripts/night_yahoo_pandas_safety_patch.py
+# File   : scripts/night_yahoo_pandas_safety.py
 # Version: V1-NIGHT-YAHOO-PANDAS-SAFETY
 # ------------------------------------------------------------
 # yfinance/pandasの返却形揺れで夜間Yahoo更新が全銘柄連続失敗する問題を抑止する。
@@ -16,7 +16,7 @@ from typing import Any
 
 import pandas as pd
 
-LOG = logging.getLogger("night_yahoo_pandas_safety_patch")
+LOG = logging.getLogger("night_yahoo_pandas_safety")
 VERSION = "V1-NIGHT-YAHOO-PANDAS-SAFETY"
 _INSTALLED = False
 _ORIG_CONCAT = None
@@ -90,60 +90,30 @@ def _fallback_standardize_daily(raw: pd.DataFrame, symbol: str, normalize_symbol
     df = df.drop_duplicates(subset=["symbol", "date"], keep="last").sort_values("date")
     return df[["symbol", "date", "open", "high", "low", "close", "adj_close", "volume"]].copy()
 
+def install_concat_guard() -> bool:
+    """pd.concat を空リスト安全版へ差し替える。
 
-def _patch_daily_module(daily_mod: Any) -> None:
-    if daily_mod is None or id(daily_mod) in _PATCHED:
-        return
-    normalize_symbol = getattr(daily_mod, "_normalize_symbol", lambda x: str(x or "").strip())
-    original_standardize = getattr(daily_mod, "_standardize_daily", None)
-    if callable(original_standardize):
-        def standardize_daily_safe(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
-            clean = _sanitize_columns(raw) if isinstance(raw, pd.DataFrame) else raw
-            try:
-                return original_standardize(clean, symbol)
-            except Exception as e:
-                LOG.warning("[NIGHT YAHOO PANDAS SAFETY] standardize retry symbol=%s err=%s", symbol, e)
-                return _fallback_standardize_daily(raw, symbol, normalize_symbol)
-        daily_mod._standardize_daily = standardize_daily_safe
-    original_save = getattr(daily_mod, "_save_symbol_df", None)
-    if callable(original_save):
-        def save_symbol_df_safe(db_path, df: pd.DataFrame):
-            return original_save(db_path, _sanitize_columns(df) if isinstance(df, pd.DataFrame) else df)
-        daily_mod._save_symbol_df = save_symbol_df_safe
-    _PATCHED.add(id(daily_mod))
-
-
-def _patch_full_columns_module(fullcol_mod: Any) -> None:
-    if fullcol_mod is None or id(fullcol_mod) in _PATCHED:
-        return
-    original_enrich = getattr(fullcol_mod, "enrich_daily_columns", None)
-    if callable(original_enrich):
-        def enrich_daily_columns_safe(df: pd.DataFrame) -> pd.DataFrame:
-            clean = _sanitize_columns(df) if isinstance(df, pd.DataFrame) else df
-            try:
-                return original_enrich(clean)
-            except Exception as e:
-                LOG.warning("[NIGHT YAHOO PANDAS SAFETY] enrich fallback err=%s", e, exc_info=True)
-                out = clean.copy() if isinstance(clean, pd.DataFrame) else pd.DataFrame()
-                if out.empty:
-                    return out
-                if "date" in out.columns:
-                    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.strftime("%Y-%m-%d")
-                for col in getattr(fullcol_mod, "EXPECTED_COLS", []):
-                    if col not in out.columns:
-                        out[col] = pd.NA
-                return out
-        fullcol_mod.enrich_daily_columns = enrich_daily_columns_safe
-    _PATCHED.add(id(fullcol_mod))
-
-
-def install(daily_mod: Any = None, fullcol_mod: Any = None) -> bool:
+    旧 install() の唯一のグローバル副作用。モジュール単位のラッパー
+    (_standardize_daily / _save_symbol_df / enrich_daily_columns) は
+    それぞれの本体へ本文化済み。
+    """
     global _INSTALLED, _ORIG_CONCAT
-    if not _INSTALLED:
-        _ORIG_CONCAT = pd.concat
-        pd.concat = _safe_concat
-        _INSTALLED = True
-        LOG.warning("[NIGHT YAHOO PANDAS SAFETY] installed version=%s", VERSION)
-    _patch_daily_module(daily_mod)
-    _patch_full_columns_module(fullcol_mod)
+    if _INSTALLED:
+        return True
+    _ORIG_CONCAT = pd.concat
+    pd.concat = _safe_concat
+    _INSTALLED = True
+    LOG.warning("[NIGHT YAHOO PANDAS SAFETY] installed version=%s", VERSION)
     return True
+
+
+sanitize_columns = _sanitize_columns
+fallback_standardize_daily = _fallback_standardize_daily
+
+__all__ = [
+    "VERSION",
+    "install_concat_guard",
+    "sanitize_columns",
+    "fallback_standardize_daily",
+]
+
