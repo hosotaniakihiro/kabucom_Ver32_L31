@@ -224,6 +224,43 @@ def _slot_aligned_latest_rows(
         return x.reset_index(drop=True)
 
 
+def _stale_fallback_max_age_sec() -> float:
+    """旧 summary_ai_candidate_refill_patch の SUMMARY_STALE_DB_FALLBACK_MAX_AGE_SEC。"""
+    try:
+        v = os.getenv("SUMMARY_STALE_DB_FALLBACK_MAX_AGE_SEC")
+        if v is None or str(v).strip() == "":
+            return 420.0
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return 420.0
+
+
+def _stale_fallback_latest_age_sec(df: pd.DataFrame) -> tuple[bool, Optional[float], Any, int]:
+    """旧 summary_ai_candidate_refill_patch._df_latest_age_sec() と同じ判定。"""
+    try:
+        if df is None or getattr(df, "empty", True):
+            return False, None, None, 0
+        cols = getattr(df, "columns", [])
+        dt_col = None
+        for c in ("datetime", "end_time", "last_update", "updated_at", "inserted_at"):
+            if c in cols:
+                dt_col = c
+                break
+        if not dt_col:
+            return False, None, None, len(df)
+        latest = pd.to_datetime(df[dt_col], errors="coerce").max()
+        if pd.isna(latest):
+            return False, None, None, len(df)
+        try:
+            latest_py = latest.to_pydatetime().replace(tzinfo=None)
+        except Exception:
+            latest_py = latest
+        age = (dt.datetime.now().replace(tzinfo=None) - latest_py).total_seconds()
+        return True, float(age), latest_py, len(df)
+    except Exception:
+        return False, None, None, 0
+
+
 def select_best_candidate(
     candidates: list[tuple[str, pd.DataFrame]],
     *,
@@ -325,7 +362,27 @@ def select_best_candidate(
         chosen_fresh,
         expected_slot,
     )
-    return chosen_df.reset_index(drop=True)
+    out = chosen_df.reset_index(drop=True)
+
+    # 旧 core/startup/summary_ai_candidate_refill_patch._install_stale_fallback_guard()
+    # を本文化。ranking 用途以外で、選んだ fallback が
+    # SUMMARY_STALE_DB_FALLBACK_MAX_AGE_SEC より古ければ空を返す。
+    # 旧パッチは select_best_candidate をラップしていたが、包む側が他に無く
+    # 生きた呼び出し元 (このファイル内の 4 箇所) は全てモジュール名解決なので、
+    # 本体末尾へ畳んでも到達範囲は変わらない。
+    if not for_ranking and not out.empty:
+        try:
+            ok, age, latest, rows = _stale_fallback_latest_age_sec(out)
+            max_age = _stale_fallback_max_age_sec()
+            if ok and age is not None and age > max_age:
+                logger.warning(
+                    "[SUMMARY FALLBACK STALE GUARD] dropped stale fallback rows=%s latest=%s age=%.1f max=%.1f",
+                    rows, latest, age, max_age,
+                )
+                return pd.DataFrame()
+        except Exception:
+            logger.exception("[SUMMARY FALLBACK STALE GUARD] check failed")
+    return out
 
 
 def today_summary_db_path(*, now: Optional[dt.datetime] = None) -> Optional[Path]:

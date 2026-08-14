@@ -182,12 +182,16 @@ def _install_final_gate_relax_patch() -> bool:
         return False
 
 
-def _install_approved_row_range_repair_patch() -> bool:
+def _install_approved_row_range_repair_patch(reason: str = "install") -> bool:
     """approved row のレンジ補修。
 
     旧 core/startup/summary_ai_approved_row_range_repair_patch.py は
     trading/entry/summary_ai/executor.build_approved_row へ本文化済み
     (スコープと env ゲートは同ファイルの _arr_enabled() が再現)。
+
+    本文化で中身は空になったが、呼び出し元 (watcher / 実行前フック) は
+    reason= を渡し続けているので引数は残す。落とすと
+    run_summary_ai_entry_from_df が毎回 TypeError で落ちる。
     """
     return True
 

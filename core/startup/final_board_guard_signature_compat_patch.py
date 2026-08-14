@@ -157,7 +157,7 @@ def _install_current_df_freshness_patch() -> bool:
         return True
     try:
         import trading.entry.summary_ai.runner as runner
-        import core.startup.summary_ai_candidate_refill_patch as guard
+        import trading.entry.summary_ai.candidate_refill as guard
         cur_run = getattr(runner, "run_summary_ai_entry_from_df", None)
         cur_reason = getattr(guard, "_summary_ai_entry_unsafe_reason", None)
         if not callable(cur_run) or not callable(cur_reason):

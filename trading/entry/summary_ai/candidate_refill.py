@@ -1,17 +1,31 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-# File   : core/startup/summary_ai_candidate_refill_patch.py
+# File   : trading/entry/summary_ai/candidate_refill.py
 # Version: V6-SUMMARY-AI-OHLC-SCORE-BOOTSTRAP
 # ------------------------------------------------------------
-# Purpose:
-#   SUMMARY_AI candidate refill + safety guards.
+# 旧 core/startup/summary_ai_candidate_refill_patch.py を summary_ai 側へ移設した
+# (パッチではなく summary_ai の候補補充/安全ガード本体)。
 #
-# V6:
-#   - scored completed summary が無い場合でも、fresh PUSH 1m の OHLC/volume から
-#     最低限の buy/sell score を作る。
-#   - score/slope/macd が全0の raw PUSH summary で candidates=0 になる症状を防ぐ。
-#   - 低出来高・低変動・板・発注直前の厳密ガードは後段に残す。
-#   - raw DB fallback は鮮度確認には使うが、AI入力では scored summary 優先。
+# 旧 install() の 3 つの責務のうち:
+#   - env 既定値              -> 下の apply_env_defaults()
+#   - runner のガード/補充ラップ -> 下の install_summary_ai_guard()
+#   - fallback stale guard    -> scheduler_jobs/summary/fallback_loader.py の
+#                                select_best_candidate() 本体へ本文化済み
+#   - _install_tonosama_failopen_guard は元から no-op だったので移していない
+#
+# runner のラップを本文へ畳まずここに残しているのは、実運用で
+#   strict_entry_defaults / more_candidates / runtime_consistency /
+#   final_board_guard_signature_compat
+# の 4 つが同じ run_summary_ai_entry_from_df を奪い合っており、
+# 「install 順で最後に載った層が勝つ」こと自体が観測挙動だから。
+# ここを native 化すると層の剥がれ方が変わるため、install 位置ごと保存する。
+#
+# _summary_ai_entry_unsafe_reason は
+# core/startup/final_board_guard_signature_compat_patch がラップ対象にしている。
+#
+# 適用スコープ: 旧 install 元は
+# core/startup/runtime_env/defaults_patch._force_install_summary_ai_safety_guard()
+# (context="main" のみ / DISABLE_SUMMARY_AI_SAFETY_GUARD=1 で無効化)。
 # ============================================================
 from __future__ import annotations
 
@@ -543,7 +557,7 @@ def _summarize_result(result: Any) -> dict[str, Any]:
     }
 
 
-def _install_summary_ai_guard() -> bool:
+def install_summary_ai_guard() -> bool:
     try:
         from trading.entry.summary_ai import runner as r
         cur = getattr(r, "run_summary_ai_entry_from_df", None)
@@ -612,53 +626,8 @@ def _install_summary_ai_guard() -> bool:
         return False
 
 
-def _install_stale_fallback_guard() -> bool:
-    try:
-        import pandas as pd
-        import scheduler_jobs.summary.fallback_loader as fl
-        cur = getattr(fl, "select_best_candidate", None)
-        if not callable(cur):
-            return False
-        if getattr(cur, "_summary_stale_fallback_guard_v1", False):
-            return True
-
-        @wraps(cur)
-        def patched_select_best_candidate(*args: Any, **kwargs: Any):
-            out = cur(*args, **kwargs)
-            try:
-                if out is None or getattr(out, "empty", True):
-                    return out
-                if bool(kwargs.get("for_ranking", False)):
-                    return out
-                ok, age, latest, rows = _df_latest_age_sec(out)
-                max_age = _env_float("SUMMARY_STALE_DB_FALLBACK_MAX_AGE_SEC", 420.0)
-                if ok and age is not None and age > max_age:
-                    logger.warning("[SUMMARY FALLBACK STALE GUARD] dropped stale fallback rows=%s latest=%s age=%.1f max=%.1f", rows, latest, age, max_age)
-                    return pd.DataFrame()
-            except Exception:
-                logger.exception("[SUMMARY FALLBACK STALE GUARD] check failed")
-            return out
-
-        patched_select_best_candidate._summary_stale_fallback_guard_v1 = True  # type: ignore[attr-defined]
-        patched_select_best_candidate._original = cur  # type: ignore[attr-defined]
-        fl.select_best_candidate = patched_select_best_candidate
-        logger.warning("[SUMMARY FALLBACK STALE GUARD] installed max_age=%s", _env_float("SUMMARY_STALE_DB_FALLBACK_MAX_AGE_SEC", 420.0))
-        return True
-    except Exception:
-        logger.exception("[SUMMARY FALLBACK STALE GUARD] install failed")
-        return False
-
-
-def _install_tonosama_failopen_guard() -> bool:
-    # Keep the previous public install contract, but do not add extra TONOSAMA filtering here.
-    return True
-
-
-def install() -> bool:
-    global _INSTALLED
-    if not _env_bool("SUMMARY_AI_CANDIDATE_REFILL_ENABLED", True):
-        logger.warning("[SUMMARY AI SAFETY GUARD] disabled by env")
-        return False
+def apply_env_defaults() -> None:
+    """旧 install() 冒頭の env 既定値。"""
     os.environ.setdefault("SUMMARY_AI_REQUIRE_PUSH_WRITER_READY", "1")
     os.environ.setdefault("SUMMARY_AI_REQUIRE_FRESH_PUSH_1M", "1")
     os.environ.setdefault("SUMMARY_AI_MAX_PUSH_1M_AGE_SEC", "120")
@@ -670,18 +639,23 @@ def install() -> bool:
     os.environ.setdefault("SUMMARY_AI_BOOTSTRAP_SCORE_FROM_OHLC", "1")
     os.environ.setdefault("SUMMARY_AI_BOOTSTRAP_MIN_RANGE_PCT", "0.0015")
     os.environ.setdefault("SUMMARY_STALE_DB_FALLBACK_MAX_AGE_SEC", "420")
-    ok_ai = _install_summary_ai_guard()
-    ok_fb = _install_stale_fallback_guard()
-    ok_tono = _install_tonosama_failopen_guard()
-    _INSTALLED = bool(ok_ai or ok_fb or ok_tono)
-    logger.warning("[SUMMARY AI SAFETY GUARD] install done ai=%s fallback=%s tonosama=%s version=%s", ok_ai, ok_fb, ok_tono, VERSION)
+
+
+def install() -> bool:
+    """旧 core/startup/summary_ai_candidate_refill_patch.install()。
+
+    旧 _install_stale_fallback_guard() は fallback_loader 本体へ移したので
+    呼び出しは無くなったが、ログの ok_fb / ok_tono は互換のため残している。
+    """
+    global _INSTALLED
+    if not _env_bool("SUMMARY_AI_CANDIDATE_REFILL_ENABLED", True):
+        logger.warning("[SUMMARY AI SAFETY GUARD] disabled by env")
+        return False
+    apply_env_defaults()
+    ok_ai = install_summary_ai_guard()
+    _INSTALLED = bool(ok_ai)
+    logger.warning("[SUMMARY AI SAFETY GUARD] install done ai=%s fallback=inlined tonosama=noop version=%s", ok_ai, VERSION)
     return _INSTALLED
 
 
-try:
-    install()
-except Exception:
-    logger.exception("[SUMMARY AI SAFETY GUARD] auto install failed")
-
-
-__all__ = ["VERSION", "install"]
+__all__ = ["VERSION", "install", "install_summary_ai_guard", "apply_env_defaults", "_summary_ai_entry_unsafe_reason"]

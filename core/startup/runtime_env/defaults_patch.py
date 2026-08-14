@@ -169,8 +169,9 @@ def _force_install_summary_ai_safety_guard(context: str) -> bool:
         os.environ.setdefault("SUMMARY_STALE_DB_FALLBACK_MAX_AGE_SEC", "420")
         os.environ.setdefault("TONOSAMA_DISABLE_HISTORY_FAILOPEN", "1")
         os.environ.setdefault("TONOSAMA_REQUIRE_TECHNICAL_READY", "1")
-        from .. import summary_ai_candidate_refill_patch
-        ok = bool(summary_ai_candidate_refill_patch.install())
+        from trading.entry.summary_ai import candidate_refill
+
+        ok = bool(candidate_refill.install())
         logger.warning("[RUNTIME ENV DEFAULTS PATCH] forced SUMMARY AI SAFETY GUARD ok=%s context=%s", ok, context)
         return ok
     except Exception:
