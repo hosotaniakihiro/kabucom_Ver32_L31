@@ -1,5 +1,5 @@
 # ============================================================
-# File   : trading/summary/mtf/daily_runtime_patch.py
+# File   : trading/summary/mtf/daily_runtime.py
 # Version: PRODUCTION-STABLE-DAILY-MTF-RUNTIME-PATCH-V1
 # ------------------------------------------------------------
 # Purpose:
@@ -227,8 +227,16 @@ def _patch_runner_function(mod: Any, func_name: str) -> bool:
     return True
 
 
-def install_daily_mtf_runtime_patch() -> None:
-    """summary AI runner 直前に日足MTFを自動mergeするpatchを入れる。"""
+def install_daily_mtf_runtime_merge() -> None:
+    """summary AI runner へ渡る直前に日足 MTF を自動 merge する層を入れる。
+
+    旧 install_daily_mtf_runtime_patch。ラップ対象の
+    run_summary_ai_entry_from_df 系は strict_entry_defaults /
+    more_candidates / direct_input_context などと同じ属性を奪い合うため、
+    ここだけ本文へ畳むと合成順が変わる。よって install 形のまま残し、
+    モジュール名だけパッチではない名前へ改めた。
+    呼び出し元は optional/batch/optional_main.py の 1 箇所のみ。
+    """
     global _INSTALLED
     if _INSTALLED:
         return
@@ -285,5 +293,5 @@ def install_daily_mtf_runtime_patch() -> None:
 __all__ = [
     "load_daily_mtf_runtime_df",
     "merge_daily_mtf_for_ai",
-    "install_daily_mtf_runtime_patch",
+    "install_daily_mtf_runtime_merge",
 ]

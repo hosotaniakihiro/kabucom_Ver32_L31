@@ -1,5 +1,5 @@
 # ============================================================
-# File   : trading/summary/controller_cache_safe_set_patch.py
+# File   : trading/summary/controller_cache_safe_set.py
 # Version: PRODUCTION-STABLE-CONTROLLER-CACHE-SAFE-SET-PATCH-V2
 # ------------------------------------------------------------
 # Purpose:
@@ -413,79 +413,44 @@ def enrich_candidate_with_existing_technicals(
     return merged
 
 
-def install_controller_cache_safe_set_patch() -> bool:
-    global _PATCHED
-
-    if _PATCHED:
-        return True
+def safe_global_set_merged_summary(orig_set, interval: int, df: pd.DataFrame) -> None:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return orig_set(interval, df)
 
     try:
-        from trading.summary import controller_cache as target
+        interval_i = int(interval)
+        existing = _read_existing_push_merged(interval_i)
+        payload = enrich_candidate_with_existing_technicals(
+            interval=interval_i,
+            candidate=df,
+            existing=existing,
+        )
+
+        if (
+            isinstance(existing, pd.DataFrame)
+            and not existing.empty
+            and _looks_entry_immature_latest_only(payload)
+            and _existing_is_better_for_entry(existing, payload)
+        ):
+            logger.warning(
+                "[summary_controller_safe_set_patch] blocked immature/latest-only merged overwrite interval=%s candidate=%s existing=%s",
+                interval_i,
+                _profile(payload),
+                _profile(existing),
+            )
+            return None
+
+        return orig_set(interval_i, payload)
     except Exception:
-        logger.exception("[summary_controller_safe_set_patch] import controller_cache failed")
-        return False
-
-    if getattr(target, "_safe_set_patch_v2_installed", False):
-        _PATCHED = True
-        return True
-
-    orig_set = getattr(target, "safe_global_set_merged_summary", None)
-    if not callable(orig_set):
-        logger.warning("[summary_controller_safe_set_patch] target safe_global_set_merged_summary not callable")
-        return False
-
-    def safe_global_set_merged_summary_patched(interval: int, df: pd.DataFrame) -> None:
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            return orig_set(interval, df)
-
-        try:
-            interval_i = int(interval)
-            existing = _read_existing_push_merged(interval_i)
-            payload = enrich_candidate_with_existing_technicals(
-                interval=interval_i,
-                candidate=df,
-                existing=existing,
-            )
-
-            if (
-                isinstance(existing, pd.DataFrame)
-                and not existing.empty
-                and _looks_entry_immature_latest_only(payload)
-                and _existing_is_better_for_entry(existing, payload)
-            ):
-                logger.warning(
-                    "[summary_controller_safe_set_patch] blocked immature/latest-only merged overwrite interval=%s candidate=%s existing=%s",
-                    interval_i,
-                    _profile(payload),
-                    _profile(existing),
-                )
-                return None
-
-            return orig_set(interval_i, payload)
-        except Exception:
-            logger.exception(
-                "[summary_controller_safe_set_patch] patched set failed interval=%s -> fallback original",
-                interval,
-            )
-            return orig_set(interval, df)
-
-    target.safe_global_set_merged_summary = safe_global_set_merged_summary_patched
-    target._safe_set_patch_v2_installed = True
-    # Backward-compatible marker: avoid another V1 installer treating this as unpatched.
-    target._safe_set_patch_v1_installed = True
-    _PATCHED = True
-
-    logger.warning("[summary_controller_safe_set_patch] installed V2")
-    return True
-
-
-try:
-    install_controller_cache_safe_set_patch()
-except Exception:
-    logger.exception("[summary_controller_safe_set_patch] auto install failed")
+        logger.exception(
+            "[summary_controller_safe_set_patch] patched set failed interval=%s -> fallback original",
+            interval,
+        )
+        return orig_set(interval, df)
 
 
 __all__ = [
-    "install_controller_cache_safe_set_patch",
+    "safe_global_set_merged_summary",
     "enrich_candidate_with_existing_technicals",
 ]
+

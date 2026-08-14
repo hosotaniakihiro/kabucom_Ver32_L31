@@ -1,5 +1,5 @@
 # ============================================================
-# File   : trading/summary/mtf/daily_mtf_summary_patch.py
+# File   : trading/summary/mtf/daily_mtf_summary.py
 # Version: PRODUCTION-STABLE-DAILY-MTF-SUMMARY-PATCH-REV1.2
 # ------------------------------------------------------------
 # Purpose:
@@ -183,110 +183,14 @@ def _pop_lock_timeout_aliases(kwargs: dict[str, Any], lock_timeout_sec: Any) -> 
     return lock_timeout_sec
 
 
-def install_daily_mtf_summary_patch() -> bool:
-    """
-    summary_saver_bulk の public API をラップして日足MTFを自動付与する。
-
-    Returns
-    -------
-    bool
-        True なら今回patch実施または既にpatch済み。
-        False ならpatch失敗。
-    """
-    global _PATCHED
-
-    if _PATCHED:
-        return True
-
+def prepare_df(saver, df, interval, *, save_reason=""):
+    """保存直前の日足 MTF 列付与 + スキーマ確認 (旧ラッパー内の処理)。"""
     try:
-        import trading.summary.persistence.summary_saver_bulk as saver
-
-        if getattr(saver, "_DAILY_MTF_PATCH_INSTALLED", False):
-            _PATCHED = True
-            return True
-
-        original_bulk: Callable[..., int] = saver.bulk_upsert_summary
-
-        def bulk_upsert_summary_with_daily_mtf(
-            df: pd.DataFrame,
-            interval: int,
-            lock_timeout_sec=None,
-            skip_if_busy: bool = False,
-            latest_only: bool = False,
-            save_reason: str = "",
-            *args,
-            **kwargs,
-        ) -> int:
-            interval_i = int(interval)
-
-            call_kwargs = dict(kwargs)
-            lock_timeout_sec2 = _pop_lock_timeout_aliases(call_kwargs, lock_timeout_sec)
-
-            try:
-                _ensure_summary_daily_mtf_columns(saver, interval_i)
-            except Exception:
-                logger.debug("[DAILY MTF PATCH] schema ensure outer failed", exc_info=True)
-
-            df2 = _attach_daily_mtf_safely(
-                df,
-                interval=interval_i,
-                save_reason=save_reason,
-            )
-
-            if lock_timeout_sec2 is not None:
-                call_kwargs["lock_timeout_sec"] = lock_timeout_sec2
-            call_kwargs["skip_if_busy"] = skip_if_busy
-            call_kwargs["latest_only"] = latest_only
-            call_kwargs["save_reason"] = save_reason
-
-            return original_bulk(
-                df=df2,
-                interval=interval_i,
-                *args,
-                **call_kwargs,
-            )
-
-        def save_summary_bulk_with_daily_mtf(
-            df: pd.DataFrame,
-            interval: int,
-            lock_timeout_sec=None,
-            skip_if_busy: bool = False,
-            latest_only: bool = False,
-            save_reason: str = "",
-            *args,
-            **kwargs,
-        ) -> int:
-            call_kwargs = dict(kwargs)
-            lock_timeout_sec2 = _pop_lock_timeout_aliases(call_kwargs, lock_timeout_sec)
-
-            return bulk_upsert_summary_with_daily_mtf(
-                df=df,
-                interval=interval,
-                lock_timeout_sec=lock_timeout_sec2,
-                skip_if_busy=skip_if_busy,
-                latest_only=latest_only,
-                save_reason=save_reason,
-                *args,
-                **call_kwargs,
-            )
-
-        saver.bulk_upsert_summary = bulk_upsert_summary_with_daily_mtf
-        saver.save_summary_bulk = save_summary_bulk_with_daily_mtf
-        saver.save_summary_df = save_summary_bulk_with_daily_mtf
-        saver._DAILY_MTF_PATCH_INSTALLED = True
-
-        _PATCHED = True
-
-        logger.warning(
-            "[DAILY MTF PATCH] installed summary_saver_bulk daily MTF wrapper"
-        )
-        return True
-
+        _ensure_summary_daily_mtf_columns(saver, int(interval))
     except Exception:
-        logger.exception("[DAILY MTF PATCH] install failed")
-        return False
+        logger.debug("[DAILY MTF PATCH] schema ensure outer failed", exc_info=True)
+    return _attach_daily_mtf_safely(df, interval=int(interval), save_reason=save_reason)
 
 
-__all__ = [
-    "install_daily_mtf_summary_patch",
-]
+__all__ = ["prepare_df"]
+

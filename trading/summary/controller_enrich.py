@@ -117,7 +117,7 @@ def attach_daily_mtf_for_display(df: pd.DataFrame, *, interval: int, context: st
         return out
 
     try:
-        from trading.summary.mtf.daily_runtime_patch import merge_daily_mtf_for_ai
+        from trading.summary.mtf.daily_runtime import merge_daily_mtf_for_ai
 
         before_nonzero = int((_num(out.get("score_mtf", pd.Series(index=out.index))) != 0).sum()) if "score_mtf" in out.columns else 0
         out = merge_daily_mtf_for_ai(out, source=f"SUMMARY_CONTROLLER_{context}_{interval}m")

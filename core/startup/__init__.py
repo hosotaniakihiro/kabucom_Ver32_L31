@@ -161,7 +161,7 @@ def _install_entry_runtime_init_patches() -> None:
             before_cols = set(df.columns)
 
             try:
-                from trading.summary.pipeline.indicator_short_history_patch import add_short_history_indicators
+                from trading.summary.pipeline.indicator_short_history import add_short_history_indicators
                 filled = add_short_history_indicators(df, interval=interval)
             except Exception:
                 logger.exception("[SUMMARY RUNNER READY FILL] add_short_history_indicators failed interval=%s source=%s", interval, source)

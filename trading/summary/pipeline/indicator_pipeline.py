@@ -680,7 +680,39 @@ def _maybe_run_downstream_scoring_pipeline(
 # public
 # ============================================================
 
+# ============================================================
+# SHORT HISTORY FALLBACK
+# (旧 trading/summary/pipeline/indicator_short_history_patch.py V4)
+# ------------------------------------------------------------
+# 履歴が短くて通常のテクニカルが NaN になる場合に、短履歴用の
+# 代替指標で埋める。旧パッチは run_indicator_pipeline /
+# indicator_pipeline / apply_indicator_pipeline の 3 つを差し替えて
+# いたので、同じ 3 つの公開名がこの層を通るようにした。
+# 計算本体は trading/summary/pipeline/indicator_short_history.py にある。
+# ============================================================
+
+_short_history_patch_v4_installed = True
+_short_history_patch_v3_installed = True
+_short_history_patch_v2_installed = True
+_short_history_patch_v1_installed = True
+
+
 def run_indicator_pipeline(
+    df: pd.DataFrame,
+    interval: Optional[int] = None,
+    run_downstream_scoring: bool = True,
+) -> pd.DataFrame:
+    out = run_indicator_pipeline_core(df=df, interval=interval, run_downstream_scoring=run_downstream_scoring)
+    try:
+        from trading.summary.pipeline.indicator_short_history import add_short_history_indicators
+
+        return add_short_history_indicators(out, interval=interval)
+    except Exception:
+        logger.exception("[IND SHORT PATCH] fallback failed interval=%s", interval)
+        return out
+
+
+def run_indicator_pipeline_core(
     df: pd.DataFrame,
     interval: Optional[int] = None,
     run_downstream_scoring: bool = True,

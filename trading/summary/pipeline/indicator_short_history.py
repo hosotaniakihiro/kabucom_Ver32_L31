@@ -1,5 +1,5 @@
 # ============================================================
-# File   : trading/summary/pipeline/indicator_short_history_patch.py
+# File   : trading/summary/pipeline/indicator_short_history.py
 # Version: PRODUCTION-STABLE-INDICATOR-SHORT-HISTORY-PATCH-V4-NAN-HIST-GUARD
 # ------------------------------------------------------------
 # Purpose:
@@ -385,62 +385,4 @@ def add_short_history_indicators(df: pd.DataFrame, *, interval: Any = None) -> p
     return out
 
 
-def install_indicator_short_history_patch() -> bool:
-    global _PATCHED
-    if _PATCHED:
-        return True
-
-    try:
-        from trading.summary.pipeline import indicator_pipeline as target
-    except Exception:
-        logger.exception("[IND SHORT PATCH] import target failed")
-        return False
-
-    orig_run = getattr(target, "run_indicator_pipeline", None)
-    if not callable(orig_run):
-        logger.warning("[IND SHORT PATCH] run_indicator_pipeline not callable")
-        return False
-
-    try:
-        seen = set()
-        while callable(getattr(orig_run, "_original", None)) and id(orig_run) not in seen:
-            seen.add(id(orig_run))
-            orig_run = getattr(orig_run, "_original")
-    except Exception:
-        pass
-
-    def run_indicator_pipeline_patched(df: pd.DataFrame, interval=None, run_downstream_scoring: bool = True) -> pd.DataFrame:
-        out = orig_run(df=df, interval=interval, run_downstream_scoring=run_downstream_scoring)
-        try:
-            return add_short_history_indicators(out, interval=interval)
-        except Exception:
-            logger.exception("[IND SHORT PATCH] fallback failed interval=%s", interval)
-            return out
-
-    run_indicator_pipeline_patched._original = orig_run  # type: ignore[attr-defined]
-
-    def indicator_pipeline_patched(df: pd.DataFrame, interval=None, run_downstream_scoring: bool = True) -> pd.DataFrame:
-        return run_indicator_pipeline_patched(df=df, interval=interval, run_downstream_scoring=run_downstream_scoring)
-
-    def apply_indicator_pipeline_patched(df: pd.DataFrame, interval=None, run_downstream_scoring: bool = True) -> pd.DataFrame:
-        return run_indicator_pipeline_patched(df=df, interval=interval, run_downstream_scoring=run_downstream_scoring)
-
-    target.run_indicator_pipeline = run_indicator_pipeline_patched
-    target.indicator_pipeline = indicator_pipeline_patched
-    target.apply_indicator_pipeline = apply_indicator_pipeline_patched
-    target._short_history_patch_v4_installed = True
-    target._short_history_patch_v3_installed = True
-    target._short_history_patch_v2_installed = True
-    target._short_history_patch_v1_installed = True
-    _PATCHED = True
-    logger.warning("[IND SHORT PATCH] installed V4 nan_hist_guard")
-    return True
-
-
-try:
-    install_indicator_short_history_patch()
-except Exception:
-    logger.exception("[IND SHORT PATCH] auto install failed")
-
-
-__all__ = ["install_indicator_short_history_patch", "add_short_history_indicators"]
+__all__ = ["add_short_history_indicators"]

@@ -135,14 +135,14 @@ def _connect_readonly(db_path: str) -> sqlite3.Connection:
 
 
 # 連続失敗時に NAS へ読みに行き続けないためのクールダウン。
-# 呼び出し元 (daily_mtf_summary_patch / daily_runtime_patch) は
+# 呼び出し元 (daily_mtf_summary / daily_runtime) は
 # 空DFをキャッシュしない作りなので、これが無いと保存のたびに再接続してしまう。
 _LAST_FAILURE_TS: float = 0.0
 _LAST_FAILURE_REASON: str = ""
 
 
 def _failure_cooldown_active() -> bool:
-    # 呼び出し元 (daily_mtf_summary_patch) の成功時キャッシュTTLと同じ 300 秒。
+    # 呼び出し元 (daily_mtf_summary) の成功時キャッシュTTLと同じ 300 秒。
     # ロックが続く間、保存のたびに NAS へ行って数十秒止まるのを防ぐ。
     cooldown = _env_float("DAILY_MTF_LOAD_FAILURE_COOLDOWN_SEC", 300.0)
     if cooldown <= 0 or _LAST_FAILURE_TS <= 0:

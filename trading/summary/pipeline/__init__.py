@@ -13,12 +13,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-try:
-    from .indicator_short_history_patch import install_indicator_short_history_patch
-
-    install_indicator_short_history_patch()
-except Exception:
-    logger.exception("[summary.pipeline] indicator short history patch install failed")
+# indicator_short_history_patch は indicator_pipeline.run_indicator_pipeline 本体へ
+# 本文化した (計算本体は indicator_short_history.py)。install は不要。
 
 from .summary_pipeline import run_summary_pipeline
 

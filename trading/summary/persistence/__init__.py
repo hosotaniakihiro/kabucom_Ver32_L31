@@ -29,69 +29,7 @@ logger = logging.getLogger(__name__)
 # summary save patches bootstrap
 # ============================================================
 
-def _install_daily_mtf_patch_on_import() -> None:
-    """
-    summary_saver_bulk の bulk_upsert_summary / save_summary_bulk / save_summary_df を
-    日足MA-MTF付与版へ安全にラップする。
 
-    ここで失敗しても、既存のsummary保存処理は止めない。
-    """
-    try:
-        from trading.summary.mtf.daily_mtf_summary_patch import (
-            install_daily_mtf_summary_patch,
-        )
-
-        ok = install_daily_mtf_summary_patch()
-        if ok:
-            logger.warning("[SUMMARY PERSISTENCE] daily MA-MTF patch installed")
-        else:
-            logger.warning("[SUMMARY PERSISTENCE] daily MA-MTF patch not installed")
-
-    except Exception:
-        logger.exception("[SUMMARY PERSISTENCE] daily MA-MTF patch install failed")
-
-
-def _install_ma_cross_state_summary_patch_on_import() -> None:
-    """
-    summary_saver_bulk の bulk_upsert_summary / save_summary_bulk / save_summary_df を
-    MAクロス状態DB保存版へ安全にラップする。
-    """
-    try:
-        from trading.summary.persistence.ma_cross_state_summary_patch import (
-            install_ma_cross_state_summary_patch,
-        )
-
-        ok = install_ma_cross_state_summary_patch()
-        if ok:
-            logger.warning("[SUMMARY PERSISTENCE] MA cross state summary patch installed")
-        else:
-            logger.warning("[SUMMARY PERSISTENCE] MA cross state summary patch not installed")
-
-    except Exception:
-        logger.exception("[SUMMARY PERSISTENCE] MA cross state summary patch install failed")
-
-
-def _install_vwap_state_summary_patch_on_import() -> None:
-    """
-    summary_saver_bulk の bulk_upsert_summary / save_summary_bulk / save_summary_df を
-    VWAP状態DB保存版へ安全にラップする。
-
-    保存前に vwap_state 等を DataFrame に追加し、
-    stock_summary_1min / 3min / 5min に不足列があれば ALTER TABLE で追加する。
-    """
-    try:
-        from trading.summary.persistence.vwap_state_summary_patch import (
-            install_vwap_state_summary_patch,
-        )
-
-        ok = install_vwap_state_summary_patch()
-        if ok:
-            logger.warning("[SUMMARY PERSISTENCE] VWAP state summary patch installed")
-        else:
-            logger.warning("[SUMMARY PERSISTENCE] VWAP state summary patch not installed")
-
-    except Exception:
-        logger.exception("[SUMMARY PERSISTENCE] VWAP state summary patch install failed")
 
 
 def _install_summary_save_guards_on_import() -> None:
@@ -114,9 +52,9 @@ def _install_summary_save_guards_on_import() -> None:
         logger.exception("[SUMMARY PERSISTENCE] summary save guards install failed")
 
 
-_install_daily_mtf_patch_on_import()
-_install_ma_cross_state_summary_patch_on_import()
-_install_vwap_state_summary_patch_on_import()
+# daily_mtf / ma_cross / vwap の 3 パッチは summary_saver_bulk._enrich_before_save() へ
+# 本文化した (適用順 vwap -> ma_cross -> daily_mtf を保持)。install は不要。
+# 3 段ガードだけは従来どおり enrichment の外側へ被せる。
 _install_summary_save_guards_on_import()
 
 

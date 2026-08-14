@@ -735,7 +735,69 @@ def _run_upsert_with_summary_db_lock(
 # public API
 # ============================================================
 
+# ============================================================
+# 保存前 enrichment (旧 3 パッチを本文化)
+# ------------------------------------------------------------
+#   trading/summary/persistence/vwap_state_summary_patch.py
+#   trading/summary/persistence/ma_cross_state_summary_patch.py
+#   trading/summary/mtf/daily_mtf_summary_patch.py
+# 旧構成では persistence/__init__ が daily_mtf -> ma_cross -> vwap の順に
+# install していたため、外側 (= 最後に入った vwap) から df へ適用され、
+# 実際の適用順は vwap -> ma_cross -> daily_mtf だった。その順序を保持する。
+# 各 prepare は失敗しても元 df を維持する (旧ラッパーと同じ)。
+#
+# さらに外側の 3 段ガード (quality/date/lock pressure) は
+# summary_save_guards.install() が実行時に被せる。この順序も従来どおり。
+# ============================================================
+
+_ma_cross_state_summary_patch = True
+_vwap_state_summary_patch = True
+
+
+def _enrich_before_save(df: pd.DataFrame, interval: int, *, save_reason: str = "") -> pd.DataFrame:
+    import sys
+
+    out = df
+    try:
+        from trading.summary.persistence import vwap_state_summary as _vw
+
+        out = _vw.prepare_df(out, int(interval))
+    except Exception:
+        logger.exception("[VWAP SUMMARY DB] prepare failed -> keep original df")
+    try:
+        from trading.summary.persistence import ma_cross_state_summary as _mac
+
+        out = _mac.prepare_df(out, int(interval))
+    except Exception:
+        logger.exception("[MA CROSS SUMMARY DB] prepare failed -> keep original df")
+    try:
+        from trading.summary.mtf import daily_mtf_summary as _mtf
+
+        out = _mtf.prepare_df(sys.modules[__name__], out, int(interval), save_reason=save_reason)
+    except Exception:
+        logger.exception("[DAILY MTF PATCH] prepare failed -> keep original df")
+    return out
+
+
 def bulk_upsert_summary(
+    df: pd.DataFrame,
+    interval: int,
+    lock_timeout_sec: float = DEFAULT_LOCK_TIMEOUT_SEC,
+    skip_if_busy: bool = False,
+    latest_only: bool = False,
+    save_reason: str = "",
+) -> int:
+    return bulk_upsert_summary_core(
+        _enrich_before_save(df, interval, save_reason=save_reason),
+        interval=interval,
+        lock_timeout_sec=lock_timeout_sec,
+        skip_if_busy=skip_if_busy,
+        latest_only=latest_only,
+        save_reason=save_reason,
+    )
+
+
+def bulk_upsert_summary_core(
     df: pd.DataFrame,
     interval: int,
     lock_timeout_sec: float = DEFAULT_LOCK_TIMEOUT_SEC,

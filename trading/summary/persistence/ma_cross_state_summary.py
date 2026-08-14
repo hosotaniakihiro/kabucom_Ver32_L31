@@ -1,5 +1,5 @@
 # ============================================================
-# File   : trading/summary/persistence/ma_cross_state_summary_patch.py
+# File   : trading/summary/persistence/ma_cross_state_summary.py
 # Version: Ver01-SAVE-MA-CROSS-STATE-TO-SUMMARY-DB
 # ------------------------------------------------------------
 # summary DB の stock_summary_1min / 3min / 5min へ、
@@ -462,54 +462,10 @@ def _patched_save_summary_df(df: pd.DataFrame, interval: int, *args, **kwargs):
     return _ORIG_SAVE_SUMMARY_DF(df2, interval, *args, **kwargs)
 
 
-def install_ma_cross_state_summary_patch() -> bool:
-    global _INSTALLED, _ORIG_BULK_UPSERT_SUMMARY, _ORIG_SAVE_SUMMARY_BULK, _ORIG_SAVE_SUMMARY_DF
-    with _PATCH_LOCK:
-        try:
-            import trading.summary.persistence.summary_saver_bulk as saver
-
-            cur = getattr(saver, "bulk_upsert_summary", None)
-            if getattr(cur, "_ma_cross_state_summary_patch", False):
-                _INSTALLED = True
-                return True
-            if not callable(cur):
-                logger.error("[MA CROSS SUMMARY DB] target bulk_upsert_summary unavailable")
-                return False
-
-            _ORIG_BULK_UPSERT_SUMMARY = cur
-            _ORIG_SAVE_SUMMARY_BULK = getattr(saver, "save_summary_bulk", None)
-            _ORIG_SAVE_SUMMARY_DF = getattr(saver, "save_summary_df", None)
-
-            _patched_bulk_upsert_summary._ma_cross_state_summary_patch = True  # type: ignore[attr-defined]
-            _patched_save_summary_bulk._ma_cross_state_summary_patch = True  # type: ignore[attr-defined]
-            _patched_save_summary_df._ma_cross_state_summary_patch = True  # type: ignore[attr-defined]
-
-            saver.bulk_upsert_summary = _patched_bulk_upsert_summary
-            saver.save_summary_bulk = _patched_save_summary_bulk
-            saver.save_summary_df = _patched_save_summary_df
-            _INSTALLED = True
-
-            logger.warning(
-                "[MA CROSS SUMMARY DB] patch installed enabled=%s schema_enabled=%s columns=%s",
-                _env_bool("SUMMARY_SAVE_MA_CROSS_STATE_ENABLED", True),
-                _env_bool("SUMMARY_SAVE_MA_CROSS_STATE_SCHEMA_ENABLED", True),
-                list(MA_CROSS_SUMMARY_COLUMNS.keys()),
-            )
-            return True
-
-        except Exception:
-            logger.exception("[MA CROSS SUMMARY DB] install failed")
-            return False
+def prepare_df(df, interval):
+    """保存直前の MA クロス状態列付与 + スキーマ確認 (旧 _prepare_df)。"""
+    return _prepare_df(df, interval)
 
 
-try:
-    install_ma_cross_state_summary_patch()
-except Exception:
-    logger.exception("[MA CROSS SUMMARY DB] auto install failed")
+__all__ = ["prepare_df"]
 
-
-__all__ = [
-    "install_ma_cross_state_summary_patch",
-    "attach_ma_cross_state_columns",
-    "MA_CROSS_SUMMARY_COLUMNS",
-]

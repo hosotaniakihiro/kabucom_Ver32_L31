@@ -426,7 +426,7 @@ def _rmt_merge_daily_mtf_early(df: pd.DataFrame, *, context: str) -> pd.DataFram
     if not _rmt_env_bool("SUMMARY_CONTROLLER_EARLY_DAILY_MTF", True):
         return out
     try:
-        from trading.summary.mtf.daily_runtime_patch import merge_daily_mtf_for_ai
+        from trading.summary.mtf.daily_runtime import merge_daily_mtf_for_ai
 
         before = _rmt_nonzero_count(out, "score_mtf")
         merged = merge_daily_mtf_for_ai(out, source=f"SUMMARY_CONTROLLER_EARLY-{context}")

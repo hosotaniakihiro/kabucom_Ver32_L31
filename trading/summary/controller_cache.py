@@ -730,7 +730,28 @@ def safe_global_get_merged_summary(
     return pd.DataFrame()
 
 
+# ============================================================
+# SAFE SET (旧 trading/summary/controller_cache_safe_set_patch.py V2)
+# ------------------------------------------------------------
+# 既存の merged summary を、未成熟 / latest-only の候補で上書きしない。
+# 既存テクニカルの引き継ぎも行う。実装は
+# trading/summary/controller_cache_safe_set.py にあり、ここは束縛だけ。
+# ネイティブ実装は *_core へ改名した。
+# ============================================================
+
+_safe_set_patch_v2_installed = True
+_safe_set_patch_v1_installed = True
+
+
 def safe_global_set_merged_summary(interval: int, df: pd.DataFrame) -> None:
+    from trading.summary.controller_cache_safe_set import (
+        safe_global_set_merged_summary as _safe_set,
+    )
+
+    return _safe_set(safe_global_set_merged_summary_core, interval, df)
+
+
+def safe_global_set_merged_summary_core(interval: int, df: pd.DataFrame) -> None:
     """
     PUSH由来 summary_controller 用 merged cache 保存。
     GlobalContext が source 指定に対応している場合は source="push" を明示する。
