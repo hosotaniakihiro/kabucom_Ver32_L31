@@ -9,6 +9,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# retry_io_patch は database/sqlite/retry.py 本体へ本文化した。
+# 同パッチは import 直後に retry の 6 名前を差し替えており、実運用では
+# パッチ側の実装しか使われていなかったため、install 導線ごと畳んである。
 from .retry import (
     DEFAULT_BUSY_TIMEOUT_MS,
     is_lock_error,
@@ -17,21 +20,6 @@ from .retry import (
     prepare_sqlite_connection,
     run_sql_many_with_retry,
 )
-
-try:
-    from .retry_io_patch import install_retry_io_patch
-
-    if install_retry_io_patch():
-        from .retry_io_patch import (
-            DEFAULT_BUSY_TIMEOUT_MS,
-            is_lock_error,
-            lock_sleep_seconds,
-            normal_sleep_seconds,
-            prepare_sqlite_connection,
-            run_sql_many_with_retry,
-        )
-except Exception:
-    logger.exception("[database.sqlite] retry_io_patch install failed")
 
 from .normalize import (
     is_null_like,
