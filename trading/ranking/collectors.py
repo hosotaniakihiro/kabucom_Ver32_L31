@@ -63,6 +63,26 @@ EXCHANGE_DIVISIONS = {
 # 既定では58秒に分散し、次の1分足更新に間に合う範囲でAPI呼び出しを平準化する。
 DEFAULT_SPREAD_WINDOW_SEC = 58.0
 
+# ============================================================
+# kabu Station ランキングAPI の単位 -> システム正準単位 (株 / 円)
+# ------------------------------------------------------------
+# /ranking の TradingVolume は「千株」、TradingValue は「百万円」で返る。
+# 一方 PUSH (websocket) の同名フィールドは「株」「円」の実数値で、
+# システム内の閾値 (PUSH_REGISTER_MIN_DAY_TURNOVER=10,000,000 や
+# WATCHLIST_RECENT_LIQ_MIN_TURNOVER_YEN=1,000,000 など) はすべて円建てである。
+#
+# 変換せずに保存していたため、ランキング由来の売買代金だけが 1/1,000,000 の
+# 桁で流動性判定に入り、ほぼ全銘柄が TURNOVER_LOW で落ちていた
+# (PUSH LIQUIDITY GUARD kept_before=0 / WATCHLIST RECENT LIQ 100->4)。
+#
+# 実データでの確認 (2026-08-17 10:5x, 同一銘柄・同一時刻):
+#   6701  PUSH volume=5,421,300 株   ranking trading_volume=5,415.7   -> x1000
+#   6701  PUSH value=26,114,286,600円 ranking trading_value=26,087.6  -> x1,000,000
+# ranking DB 全体でも trading_value / (price * trading_volume) は
+# 0.00091〜0.00117 (= 1/1000) に収まり、trading_volume の 91% が非整数だった。
+RANKING_API_VOLUME_TO_SHARES = 1_000.0      # 千株 -> 株
+RANKING_API_VALUE_TO_YEN = 1_000_000.0      # 百万円 -> 円
+
 _last_rank_state: dict[str, dict[str, Any]] = {}
 
 
@@ -435,6 +455,12 @@ def collect_ranking_rows(
                 ),
                 trading_value,
             )
+
+            # ここで正準単位 (株 / 円) へ揃える。以降の DB 保存・流動性判定・
+            # summary への enrich はすべてこの値を円建てとして扱う。
+            trading_volume *= RANKING_API_VOLUME_TO_SHARES
+            trading_value *= RANKING_API_VALUE_TO_YEN
+            turnover *= RANKING_API_VALUE_TO_YEN
 
             tick_count = safe_int(
                 first_non_empty(

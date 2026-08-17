@@ -174,14 +174,26 @@ def _wrl_recent_stats(symbol: str) -> dict[str, Any]:
         latest_dt = str(rows[0][0])
         latest_close = _wrl_f(rows[0][1], 0.0)
         volumes = [max(0.0, _wrl_f(r[2], 0.0)) for r in rows]
-        turnovers = [max(0.0, _wrl_f(r[3], 0.0)) for r in rows]
         latest_volume = volumes[0] if volumes else 0.0
         avg_volume = sum(volumes) / max(1, len(volumes))
         total_volume = sum(volumes)
-        total_turnover = sum(turnovers)
 
+        # summary DB の turnover 列はランキング由来の「当日累積」売買代金で、
+        # 1分足ごとの値ではない (volume=0 の分でも非0、分をまたいでも同値)。
+        # しかも enrich が届いた分しか入らず大半が NULL なので、これを bars 本
+        # 合計すると「データがある銘柄ほど不利」という逆転が起きていた。
+        # 直近 bars 本の売買代金は各足の close x volume で出す (常に円建て)。
+        total_turnover = 0.0
+        for r in rows:
+            c = _wrl_f(r[1], 0.0)
+            v = max(0.0, _wrl_f(r[2], 0.0))
+            if c > 0 and v > 0:
+                total_turnover += c * v
         if total_turnover <= 0 and latest_close > 0 and total_volume > 0:
             total_turnover = latest_close * total_volume
+
+        # 当日累積の売買代金は別指標として残す (累積なので max を取る)。
+        day_turnover = max((max(0.0, _wrl_f(r[3], 0.0)) for r in rows), default=0.0)
 
         stats = {
             "symbol": symbol,
@@ -192,6 +204,7 @@ def _wrl_recent_stats(symbol: str) -> dict[str, Any]:
             "avg_volume": avg_volume,
             "total_volume": total_volume,
             "total_turnover": total_turnover,
+            "day_turnover": day_turnover,
             "db": path,
         }
         _wrl_cache[symbol] = (now_ts, stats)
@@ -477,13 +490,23 @@ def _wbk_read_bulk_stats_sync(mod: Any, missing: List[str], symbols_total: int) 
         latest_dt = str(rs[0][0])
         latest_close = _wbk_as_float(rs[0][1], 0.0)
         volumes = [max(0.0, _wbk_as_float(r[2], 0.0)) for r in rs]
-        turnovers = [max(0.0, _wbk_as_float(r[3], 0.0)) for r in rs]
         latest_volume = volumes[0] if volumes else 0.0
         avg_volume = sum(volumes) / max(1, len(volumes))
         total_volume = sum(volumes)
-        total_turnover = sum(turnovers)
+
+        # 単体版 (_wrl_stats) と同じ理由で、直近 bars 本の売買代金は
+        # 各足の close x volume から出す。turnover 列は当日累積なので合計しない。
+        total_turnover = 0.0
+        for r in rs:
+            c = _wbk_as_float(r[1], 0.0)
+            v = max(0.0, _wbk_as_float(r[2], 0.0))
+            if c > 0 and v > 0:
+                total_turnover += c * v
         if total_turnover <= 0 and latest_close > 0 and total_volume > 0:
             total_turnover = latest_close * total_volume
+
+        day_turnover = max((max(0.0, _wbk_as_float(r[3], 0.0)) for r in rs), default=0.0)
+
         stats = {
             "symbol": s,
             "latest_dt": latest_dt,
@@ -493,6 +516,7 @@ def _wbk_read_bulk_stats_sync(mod: Any, missing: List[str], symbols_total: int) 
             "avg_volume": avg_volume,
             "total_volume": total_volume,
             "total_turnover": total_turnover,
+            "day_turnover": day_turnover,
             "db": path,
             "bulk": True,
         }
@@ -602,7 +626,11 @@ def _wbk_filter_symbols_bulk(symbols: Iterable[Any], *, context: str) -> List[st
 
     protected = _wrl_protected_symbols()
     protected_items = [s for s in items if s in protected]
-    stats_map, timed_out = _wbk_bulk_stats(mod, [s for s in items if s not in protected])
+    # 旧 patch では対象モジュールを mod として受け取っていた。本文化で同居した
+    # のに引数の書き換えが漏れて未定義参照になっていたので自モジュールを渡す。
+    stats_map, timed_out = _wbk_bulk_stats(
+        sys.modules[__name__], [s for s in items if s not in protected]
+    )
 
     if timed_out and _wrl_env_bool("WATCHLIST_RECENT_LIQ_FAIL_OPEN_ON_TIMEOUT", True):
         logger.warning(
