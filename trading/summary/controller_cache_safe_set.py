@@ -26,6 +26,7 @@ import logging
 from typing import Any
 
 import pandas as pd
+from trading.summary.bool_series import na_false_bool, na_false_bool_count
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +97,7 @@ def _safe_bool_true(df: pd.DataFrame, col: str) -> int:
     try:
         if not isinstance(df, pd.DataFrame) or df.empty or col not in df.columns:
             return 0
-        return int(pd.Series(df[col]).fillna(False).infer_objects(copy=False).astype(bool).sum())
+        return na_false_bool_count(df[col])
     except Exception:
         return 0
 

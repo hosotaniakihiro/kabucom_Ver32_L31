@@ -19,6 +19,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from trading.summary.bool_series import na_false_bool
 
 logger = logging.getLogger(__name__)
 
@@ -320,7 +321,7 @@ def safe_ready_count(df: pd.DataFrame) -> int:
     try:
         if not isinstance(df, pd.DataFrame) or df.empty or "technical_ready" not in df.columns:
             return 0
-        s = pd.Series(df["technical_ready"]).fillna(False).infer_objects(copy=False).astype(bool)
+        s = na_false_bool(df["technical_ready"])
         return int(s.sum())
     except Exception:
         return 0
@@ -335,7 +336,7 @@ def safe_ready_symbol_count(df: pd.DataFrame) -> int:
             or "technical_ready" not in df.columns
         ):
             return 0
-        ready = pd.Series(df["technical_ready"]).fillna(False).infer_objects(copy=False).astype(bool)
+        ready = na_false_bool(df["technical_ready"])
         return int(df.loc[ready, "symbol"].astype(str).nunique())
     except Exception:
         return 0
@@ -351,7 +352,7 @@ def profile_numeric_series(df: pd.DataFrame, col: str) -> str:
             return f"{col}={vc}"
 
         if col == "technical_ready":
-            s = pd.Series(df[col]).fillna(False).infer_objects(copy=False).astype(bool)
+            s = na_false_bool(df[col])
             return (
                 f"{col}: non_null={int(s.notna().sum())} "
                 f"nonzero={int(s.sum())} "
