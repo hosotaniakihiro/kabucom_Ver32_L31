@@ -896,7 +896,9 @@ def _process_symbol_incremental(rec: dict[str, str], *, period: str, start: Opti
     warmup_rows = int(float(os.environ.get("NIGHT_YAHOO_DAILY_WARMUP_ROWS", "320")))
     end_dt = _incr_parse_end_date()
 
-    latest_dt = None if force_full else _get_latest_date(Path(db_path), symbol, daily_mod)
+    # 旧 incremental patch では daily_mod (= このモジュール) を渡していた。
+    # 本文化の際に引数の書き換えが漏れて未定義参照になっていたので合わせる。
+    latest_dt = None if force_full else _incr_get_latest_date(Path(db_path), symbol, sys.modules[__name__])
 
     # すでにDB最新日が上限日以上なら、保存対象なし。
     if latest_dt is not None and end_dt is not None and latest_dt >= end_dt:

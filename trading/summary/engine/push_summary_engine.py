@@ -19,8 +19,10 @@ import datetime as dt
 import importlib
 import logging
 import os
+import re
 import sqlite3
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Callable, Optional
 

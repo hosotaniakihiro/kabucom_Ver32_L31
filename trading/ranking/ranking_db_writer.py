@@ -1646,9 +1646,15 @@ def _rdl_chunks(items: list[Any], size: int):
         yield items[i:i + size]
 
 
-def _rdl_type_counts(target: Any, rows: list[dict]) -> dict[str, int]:
+def _rdl_type_counts(rows: list[dict]) -> dict[str, int]:
+    """ログ用のランキング種別カウント。
+
+    旧 lock patch では別モジュールから ranking_db_writer を target として
+    受け取り target._type_counts(rows) を呼んでいた。本文化で同じモジュール
+    内に来たので、本来の実装 _type_counts(rows) を直接呼ぶ。
+    """
     try:
-        return target._rdl_type_counts(rows)
+        return _type_counts(rows)
     except Exception:
         return {}
 
@@ -1815,7 +1821,7 @@ def _rdl_flush(self, *args, **kwargs) -> bool:
                 logger.info(
                     "[RANKING DB WRITER] flush prepare v6 dedicated-conn raw=%d snapshot=%d legacy=%d snapshot_types=%s raw_types=%s batch_size=%d db=%s",
                     len(raw_rows), len(snapshot_rows), len(legacy_rows),
-                    _rdl_type_counts(target, snapshot_rows), _rdl_type_counts(target, raw_rows), batch_size, db_path,
+                    _rdl_type_counts(snapshot_rows), _rdl_type_counts(raw_rows), batch_size, db_path,
                 )
                 conn.execute("BEGIN IMMEDIATE")
                 saved_snapshot = 0

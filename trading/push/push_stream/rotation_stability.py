@@ -132,6 +132,8 @@ def _sqlite_symbols_from_db(path: str, *, max_rows: int = 250) -> list[str]:
         return []
 
 def _tr_clean(src: Any) -> tuple[list[str], int, int, int]:
+    from . import rotation_symbols
+
     try:
         return rotation_symbols.clean_symbol_list(src)
     except Exception:
@@ -163,6 +165,8 @@ def _tr_add(dst: list[str], src: Any, *, source: str) -> None:
     )
 
 def _tr_call(fn: Any) -> Any:
+    from . import rotation_symbols
+
     if not callable(fn):
         return None
     for caller in (
@@ -182,6 +186,8 @@ def _tr_call(fn: Any) -> Any:
     return None
 
 def _tr_collect_runtime_all(dst: list[str]) -> None:
+    from . import rotation_symbols
+
     for key in getattr(rotation_symbols, "_RUNTIME_SYMBOL_KEYS", ()):  # collect all, not first-hit only
         try:
             src = rotation_symbols._safe_get_runtime(key)
@@ -191,6 +197,8 @@ def _tr_collect_runtime_all(dst: list[str]) -> None:
             _tr_add(dst, src, source=f"runtime.{key}")
 
 def _tr_collect_global_data_all(dst: list[str]) -> None:
+    from . import rotation_symbols
+
     try:
         gd = rotation_symbols._get_global_data()
     except Exception:
@@ -273,6 +281,8 @@ def _tr_collect_active_symbol_manager(dst: list[str]) -> None:
             logger.debug("[PUSH ROTATION TARGET TOPUP] active getter failed name=%s", name, exc_info=True)
 
 def _tr_collect_dynamic_providers_all(dst: list[str]) -> None:
+    from . import rotation_symbols
+
     import importlib
 
     for module_name, func_name in getattr(rotation_symbols, "_DYNAMIC_SYMBOL_PROVIDERS", ()):
@@ -342,7 +352,11 @@ def resolve_monitor_symbols() -> list[str]:
 def resolve_register_targets() -> list[str]:
     from . import rotation_core, rotation_symbols
 
-    targets = resolve_monitor_symbols_patched()
+    # 旧実装 (rotation_stability_patch) では同じクロージャ内の
+    # resolve_monitor_symbols_patched() を直接呼んでいた。
+    # モジュール関数へ切り出した際に呼び出し側の改名が漏れていたので合わせる。
+    # rotation_symbols 経由にすると同じ実装へ二重に入るだけなので直接呼ぶ。
+    targets = resolve_monitor_symbols()
     targets, raw_count, filler_count, invalid_count = rotation_symbols.clean_symbol_list(targets)
 
     if not targets:
