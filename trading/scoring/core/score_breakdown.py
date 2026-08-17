@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import Any, Dict, Mapping, Optional
 
 import numpy as np
@@ -198,6 +199,19 @@ def _normalize_flag_key(key: str) -> str:
     if not k.startswith("flag_"):
         k = f"flag_{k}"
     return k
+
+
+def _min_flags_for_table() -> int:
+    """SCORE_TABLE 方式を採用するのに必要な最低一致数。
+
+    0 個のときだけ fallback という判定だと、たまたま 1〜2 個だけ一致したときに
+    「180 flag のうち 2 個だけで内訳を作る」という fallback より悪い状態へ
+    黙って切り替わる。既定は 10 個。
+    """
+    try:
+        return int(float(os.getenv("SCORE_BREAKDOWN_MIN_FLAGS", "10")))
+    except Exception:
+        return 10
 
 
 def _classify_flag(flag_name: str, weight: float) -> str:
@@ -385,11 +399,21 @@ def attach_score_breakdown(
 
     used_flags = 0
 
+    # score_config.ini のキーは _normalize_flag_key で必ず "flag_" 付きに揃えられるが、
+    # DataFrame 側 (flag_builder_buy/sell や conditions_long 由来) の列名は
+    # "bullish_engulfing" のように接頭辞なしで作られる。
+    # 接頭辞つきの名前だけで突き合わせていたため、列が存在していても
+    # used_flags=0 になっていた。両方の綴りを見る。
     for flag_col, weight in table.items():
-        if flag_col not in out.columns:
-            continue
+        col = flag_col
+        if col not in out.columns:
+            bare = flag_col[5:] if flag_col.startswith("flag_") else flag_col
+            if bare and bare in out.columns:
+                col = bare
+            else:
+                continue
 
-        flag_value = _num_series(out, flag_col, default=0.0)
+        flag_value = _num_series(out, col, default=0.0)
         contrib = flag_value * float(weight)
 
         category = _classify_flag(flag_col, weight)
@@ -407,13 +431,23 @@ def attach_score_breakdown(
 
         used_flags += 1
 
-    if used_flags == 0:
+    # 一部しか一致しない状態で table 方式に切り替えると、
+    # 180 flag 中 2 個だけで内訳を組み立てることになり fallback より劣化する。
+    # 実運用では flag_builder_buy/sell が pipeline から呼ばれておらず
+    # summary DF には ma5_above_ma25 / ma5_below_ma25 の 2 個しか存在しない
+    # (builder を通せば 71 個そろう)。十分な数がそろうまでは fallback を使う。
+    min_flags = max(1, _min_flags_for_table())
+    if used_flags < min_flags:
         score_base, score_trend, score_momentum, score_velocity, score_penalty = _fallback_breakdown(out)
         if debug:
             logger.warning(
-                "[SCORE BREAKDOWN] no matched flag columns; fallback used rows=%s table_flags=%s df_cols=%s",
+                "[SCORE BREAKDOWN] flag coverage too low; fallback used "
+                "rows=%s table_flags=%s matched_flags=%s min_flags=%s df_cols=%s "
+                "hint=flag_builder_buy/sell が pipeline 未接続の可能性",
                 len(out),
                 len(table),
+                used_flags,
+                min_flags,
                 len(out.columns),
             )
 

@@ -117,6 +117,40 @@ def _normalize_slope(slope: pd.Series) -> pd.Series:
 # public API
 # ============================================================
 
+def ensure_ma_slopes(df: pd.DataFrame) -> pd.DataFrame:
+    """ma5_slope / ma25_slope を保証生成する。
+
+    この2列は
+      - ranking_pipeline._ensure_trend の優先度2 (trend <- ma5_slope + ma25_slope)
+      - trading/ranking/features/mtf_score.py
+      - trading/ranking/scoring/score_builder.py
+    が参照しているのに、ranking 経路のどこも作っていなかった。
+    そのため常に「missing col=ma5_slope / ma25_slope」が出て、
+    参照側は 0 のまま動いていた (ranking DB の ma5_slope_1m 等も全 NULL)。
+
+    slope と同じ _compute_slope (symbol 単位の diff + 3本移動平均) で作る。
+    元になる ma5 / ma25 が無い場合は作らない (0 で埋めて「値がある」ふりをしない)。
+    """
+    if df is None or df.empty or "symbol" not in df.columns:
+        return df
+
+    try:
+        out = df
+        for ma_col, slope_col in (("ma5", "ma5_slope"), ("ma25", "ma25_slope")):
+            if slope_col in out.columns:
+                continue
+            if ma_col not in out.columns:
+                logger.warning("[slope] %s なし -> %s は作れない", ma_col, slope_col)
+                continue
+            if out is df:
+                out = df.copy()
+            out[slope_col] = _sanitize(_compute_slope(out, ma_col))
+        return out
+    except Exception:
+        logger.exception("[slope] ensure_ma_slopes failed")
+        return df
+
+
 def ensure_slope(
     df: pd.DataFrame,
     *,

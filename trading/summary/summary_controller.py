@@ -986,7 +986,16 @@ class SummaryController:
                 except Exception:
                     pass
                 try:
-                    df_entry = run_ranking_pipeline(_enrich(df_latest, interval=interval, context="before-ranking-pipeline"), interval)
+                    # run_ranking_pipeline は mom / trend / velocity / ma5_slope /
+                    # ma25_slope を symbol 単位の diff()/pct_change()/rolling() で作り、
+                    # そのあと自分で select_latest_rows() して銘柄あたり1行に畳む。
+                    # ここで df_latest (既に銘柄あたり1行) を渡していたため履歴が無く、
+                    # 実測で history stats min=1 max=1 short(<3)=204/204、
+                    # mom / trend / _score_velocity が全銘柄ゼロ、
+                    # [pre-latest] missing col=ma25_slope が毎分出ていた。
+                    # 履歴を持つ df_hist を渡す (戻り値は従来どおり銘柄あたり1行)。
+                    ranking_input = df_hist if isinstance(df_hist, pd.DataFrame) and not df_hist.empty else df_latest
+                    df_entry = run_ranking_pipeline(_enrich(ranking_input, interval=interval, context="before-ranking-pipeline"), interval)
                 except Exception:
                     logger.exception("[summary_controller] ranking failed")
                     return df_latest

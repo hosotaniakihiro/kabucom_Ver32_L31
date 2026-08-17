@@ -26,7 +26,7 @@ from trading.ranking.filters.market_filter_adapter import apply_market_filter
 from trading.ranking.filters.liquidity_filter import apply_liquidity_filter
 
 from trading.ranking.features.turnover import ensure_turnover
-from trading.ranking.features.slope import ensure_slope
+from trading.ranking.features.slope import ensure_ma_slopes, ensure_slope
 from trading.ranking.features.mtf_score import build_mtf_score
 
 from trading.ranking.engines.velocity import apply_velocity
@@ -309,6 +309,11 @@ def run_ranking_pipeline(df: pd.DataFrame, interval: int, *, regime: str | None 
             logger.warning("[ranking_pipeline] empty after apply_liquidity_filter")
             return df
 
+        # ma5_slope / ma25_slope は _ensure_trend / mtf_score / score_builder が
+        # 参照するのに、これまで ranking 経路のどこも作っていなかった。
+        # 診断ログより前に作っておく (診断が「無い」と言い続けるのを避ける)。
+        df = ensure_ma_slopes(df)
+
         # 最新行選択前の列診断
         _log_column_profile(
             df,
@@ -316,9 +321,10 @@ def run_ranking_pipeline(df: pd.DataFrame, interval: int, *, regime: str | None 
                 "volume",
                 "turnover",
                 "_score_base",
-                "_score_velocity",
-                "momentum",
-                "price_momentum",
+                # momentum / price_momentum / _score_velocity はこの下の
+                # _ensure_momentum / _ensure_velocity_debug_and_score が作るので、
+                # ここで「missing」と出るのは診断の置き場所の問題でしかなかった。
+                # 生成後を見る post-latest 側で確認する。
                 "ma5_slope",
                 "ma25_slope",
                 "slope",
@@ -356,6 +362,13 @@ def run_ranking_pipeline(df: pd.DataFrame, interval: int, *, regime: str | None 
             [
                 "mom",
                 "trend",
+                # momentum / price_momentum は _ensure_momentum の優先度2・3の
+                # 代替ソースで、trading/ai 側 (ranking_momentum_ai /
+                # microstructure_feature_engine) が付けたときだけ存在する。
+                # この経路では優先度1で mom が作れているので無くて正常。
+                # 「必須列が無い」と読める WARNING を出さないよう診断から外す。
+                "ma5_slope",
+                "ma25_slope",
                 "_score_base",
                 "_score_velocity",
                 "score",
