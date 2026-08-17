@@ -115,7 +115,7 @@ def main():
 
     print(f"1min rows: {len(df1)}")
     print(f"3min rows: {len(df3)}")
-    print(f( "5min rows: {len(df5)}") if df5 is not None else "5min empty")
+    print(f"5min rows: {len(df5)}" if df5 is not None else "5min empty")
 
     # --------------------------------------------
     # 1) 行数チェック（空なら NG）

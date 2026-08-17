@@ -23,7 +23,7 @@ from scoring.scoring_light import apply_scoring_light as apply_scoring
 
 # DB saver / loader
 from trading.summary.summary_saver import save_summary_to_db
-from trading.summary import summary_loader
+from trading.summary import summary_loader, summary_saver
 
 # test utilities
 from test_utils.create_test_db import create_test_summary_db

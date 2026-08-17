@@ -108,6 +108,15 @@ def _is_database_process() -> bool:
     )
 
 
+def _is_main_py_process() -> bool:
+    """argv が main.py で終わるか (旧 summary_db_date_guard_patch と同じ判定)。"""
+    try:
+        argv = [str(x).replace("\\", "/").lower() for x in sys.argv]
+        return any(x.endswith("/main.py") or x == "main.py" for x in argv)
+    except Exception:
+        return False
+
+
 def _main_only_enabled(override_env: str) -> bool:
     """旧 BACKGROUND_MAIN_PATCHES 相当のスコープ (main.py のみ)。"""
     try:
@@ -577,8 +586,8 @@ def _patched_should_auto_latest_only(save_reason: str) -> bool:
     if _lock_is_realtime_reason(save_reason):
         return True
     try:
-        if callable(_ORIGINAL_SHOULD_AUTO_LATEST_ONLY):
-            return bool(_ORIGINAL_SHOULD_AUTO_LATEST_ONLY(save_reason))
+        if callable(_ORIG_SHOULD_AUTO_LATEST_ONLY):
+            return bool(_ORIG_SHOULD_AUTO_LATEST_ONLY(save_reason))
     except Exception:
         logger.debug("[SUMMARY LOCK PRESSURE] original latest_only detector failed", exc_info=True)
     return False

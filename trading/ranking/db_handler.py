@@ -55,6 +55,11 @@ def save_ranking_from_df(session, df: pd.DataFrame):
     """
     DataFrameをRankingテーブルに保存
     """
+    # global_data / Ranking は import 漏れで未定義だった。
+    # module 直下へ置くと database <-> global_state で循環するため関数内で解決する。
+    from database.models import Ranking
+    from global_state import global_data
+
     if df is None or df.empty:
         return
 
