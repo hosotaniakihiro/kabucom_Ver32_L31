@@ -50,7 +50,7 @@ from typing import Optional
 
 from .constants import RANKING_DB_ROOT, PRIMARY_TABLES, CATEGORY_TABLE_SPECS
 from . import cache
-from .normalizer import _list_tables, _table_row_count
+from .normalizer import _list_tables, _table_has_any_row
 
 logger = logging.getLogger(__name__)
 
@@ -147,29 +147,26 @@ def _db_has_usable_ranking_tables_core(db_path: str) -> bool:
         with sqlite3.connect(str(p), timeout=3.0) as conn:
             tables = set(_list_tables(conn))
 
+            # 判定に必要なのは「1行でもあるか」だけ。COUNT(*) だと当日DBが
+            # 増えるほど NAS 越しの全走査が重くなる (実測: 1分Summary の 1 tick で
+            # 13 秒 / 48 秒がここに消えていた)。
             for table_name in PRIMARY_TABLES:
-                if table_name in tables:
-                    cnt = _table_row_count(conn, table_name)
-                    if cnt > 0:
-                        logger.info(
-                            "[ATS RANKING] usable db hit path=%s table=%s rows=%d",
-                            db_path,
-                            table_name,
-                            cnt,
-                        )
-                        return True
+                if table_name in tables and _table_has_any_row(conn, table_name):
+                    logger.info(
+                        "[ATS RANKING] usable db hit path=%s table=%s",
+                        db_path,
+                        table_name,
+                    )
+                    return True
 
             for table_name, _, _ in CATEGORY_TABLE_SPECS:
-                if table_name in tables:
-                    cnt = _table_row_count(conn, table_name)
-                    if cnt > 0:
-                        logger.info(
-                            "[ATS RANKING] usable db hit path=%s table=%s rows=%d",
-                            db_path,
-                            table_name,
-                            cnt,
-                        )
-                        return True
+                if table_name in tables and _table_has_any_row(conn, table_name):
+                    logger.info(
+                        "[ATS RANKING] usable db hit path=%s table=%s",
+                        db_path,
+                        table_name,
+                    )
+                    return True
 
     except Exception:
         logger.exception("[ATS RANKING] usable db check failed path=%s", db_path)
