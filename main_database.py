@@ -620,13 +620,13 @@ def _wal_checkpoint_summary_db_path() -> Path:
     return Path(summary_db_path())
 
 
-def _wal_checkpoint_once() -> bool:
+def _wal_checkpoint_once(force_mode: str | None = None) -> bool:
     db_path = _wal_checkpoint_summary_db_path()
     if not db_path.exists():
         logger.debug("[SUMMARY WAL CHECKPOINT] skip db missing path=%s", db_path)
         return False
 
-    mode = _wal_checkpoint_mode()
+    mode = force_mode if force_mode in _WAL_CHECKPOINT_MODES else _wal_checkpoint_mode()
     busy_timeout_ms = max(1000, _wal_checkpoint_env_int("SUMMARY_WAL_CHECKPOINT_BUSY_TIMEOUT_MS", 5000))
     wal_path = Path(str(db_path) + "-wal")
     try:
@@ -657,14 +657,59 @@ def _wal_checkpoint_once() -> bool:
 
 
 def _wal_checkpoint_loop() -> None:
+    """定期 WAL チェックポイント。
+
+    PASSIVE はリーダー/ライターがいると何も回収せずに諦める。
+    summary は毎分ジョブが走るため常時 busy になりがちで、
+    2026-08-17 は "skip busy" を繰り返したまま WAL が 373MB まで伸び、
+    SMB 越しの読み取りが "file is not a database" を 142 件出す原因になった。
+
+    そこで PASSIVE が連続で空振りし、かつ WAL が閾値を超えたときだけ
+    1 回だけ強いモード (既定 TRUNCATE) へ格上げする。
+    既定モード自体は PASSIVE のままで、通常時のロック競合は増やさない。
+    """
     initial_delay = max(0.0, _wal_checkpoint_env_float("SUMMARY_WAL_CHECKPOINT_INITIAL_DELAY_SEC", 20.0))
     interval = max(10.0, _wal_checkpoint_env_float("SUMMARY_WAL_CHECKPOINT_INTERVAL_SEC", 60.0))
     if initial_delay:
         time.sleep(initial_delay)
+
+    miss_streak = 0
     while True:
         if _wal_checkpoint_env_bool("SUMMARY_WAL_CHECKPOINT_ENABLED", True):
-            _wal_checkpoint_once()
+            ok = _wal_checkpoint_once()
+            miss_streak = 0 if ok else (miss_streak + 1)
+
+            if not ok and _wal_checkpoint_should_escalate(miss_streak):
+                mode = str(os.getenv("SUMMARY_WAL_CHECKPOINT_ESCALATE_MODE", "TRUNCATE")).strip().upper()
+                if mode not in _WAL_CHECKPOINT_MODES:
+                    mode = "TRUNCATE"
+                logger.warning(
+                    "[SUMMARY WAL CHECKPOINT] escalate mode=%s miss_streak=%s wal_mb=%.0f",
+                    mode, miss_streak, _wal_checkpoint_wal_size_mb(),
+                )
+                if _wal_checkpoint_once(force_mode=mode):
+                    miss_streak = 0
         time.sleep(interval)
+
+
+def _wal_checkpoint_wal_size_mb() -> float:
+    try:
+        wal = Path(str(_wal_checkpoint_summary_db_path()) + "-wal")
+        return wal.stat().st_size / (1024.0 * 1024.0) if wal.exists() else 0.0
+    except Exception:
+        return 0.0
+
+
+def _wal_checkpoint_should_escalate(miss_streak: int) -> bool:
+    """PASSIVE が続けて空振りし、WAL も膨らんでいるときだけ True。"""
+    try:
+        if not _wal_checkpoint_env_bool("SUMMARY_WAL_CHECKPOINT_ESCALATE_ENABLED", True):
+            return False
+        need_miss = max(1, _wal_checkpoint_env_int("SUMMARY_WAL_CHECKPOINT_ESCALATE_AFTER_MISSES", 5))
+        need_mb = max(1.0, _wal_checkpoint_env_float("SUMMARY_WAL_CHECKPOINT_ESCALATE_WAL_MB", 128.0))
+        return miss_streak >= need_miss and _wal_checkpoint_wal_size_mb() >= need_mb
+    except Exception:
+        return False
 
 
 def _install_summary_wal_checkpoint() -> None:

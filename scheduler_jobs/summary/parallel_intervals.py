@@ -50,6 +50,50 @@ _ORIG_TIME_LOCKED = None
 _RUNNING_LOCK = threading.RLock()
 _RUNNING_KEYS: set[str] = set()
 _BG_RUNNING_KEYS: set[str] = set()
+
+# 実行中のジョブ (source, interval) -> 投入時刻。
+# 親 tick は timeout=25s で待つのをやめて executor を reset するが、
+# 実行中の future はキャンセルできないのでワーカーは走り続ける。
+# ジョブが 60 秒 (tick 間隔) を超えると毎分1本ずつ積み上がり、
+# 2026-08-17 は大引け後に 1 本 7,000 秒超・timeout 322/324 tick まで悪化した。
+# 滞留したワーカーが summary DB を掴み続けるため
+# WAL チェックポイントが PASSIVE で skip busy を繰り返して WAL が 373MB まで伸び、
+# SMB 越しの読み取りが "file is not a database" を 142 件出す連鎖になっていた。
+# 同じ (source, interval) のジョブが走っている間は次を投げない。
+_INFLIGHT: dict[tuple[str, int], float] = {}
+
+
+def _inflight_try_acquire(source: str, interval: int, now_ts: float) -> bool:
+    key = (str(source), int(interval))
+    with _RUNNING_LOCK:
+        if key in _INFLIGHT:
+            return False
+        _INFLIGHT[key] = now_ts
+        return True
+
+
+def _inflight_release(source: str, interval: int) -> None:
+    with _RUNNING_LOCK:
+        _INFLIGHT.pop((str(source), int(interval)), None)
+
+
+def _inflight_age(source: str, interval: int, now_ts: float) -> float:
+    with _RUNNING_LOCK:
+        started = _INFLIGHT.get((str(source), int(interval)))
+    return (now_ts - started) if started else 0.0
+
+
+def inflight_snapshot() -> dict[str, float]:
+    """診断用: 実行中ジョブと経過秒。"""
+    import time as _t
+
+    now = _t.perf_counter()
+    with _RUNNING_LOCK:
+        return {"%s:%s" % (s, i): round(now - t0, 1) for (s, i), t0 in _INFLIGHT.items()}
+
+
+def _skip_when_busy_enabled() -> bool:
+    return _env_bool("SUMMARY_PARALLEL_SKIP_WHEN_BUSY", True)
 _EXECUTOR: ThreadPoolExecutor | None = None
 _BG_EXECUTOR: ThreadPoolExecutor | None = None
 
@@ -301,6 +345,18 @@ def _split_push_wait_and_bg_core(push_targets: list[int], *, in_session: bool) -
 
 def _job_one_source(*, source: str, interval: int, now: dt.datetime, display: bool, run_entry: bool) -> tuple[str, int, pd.DataFrame]:
     t0 = time.perf_counter()
+    try:
+        return _job_one_source_core(
+            source=source, interval=interval, now=now, display=display, run_entry=run_entry, t0=t0
+        )
+    finally:
+        # 親 tick が timeout で先に抜けても、ワーカーはここまで来て必ず解放する。
+        _inflight_release(source, interval)
+
+
+def _job_one_source_core(
+    *, source: str, interval: int, now: dt.datetime, display: bool, run_entry: bool, t0: float
+) -> tuple[str, int, pd.DataFrame]:
     try:
         from scheduler_jobs.summary.runner_core import job_summary, job_ranking_summary
         if source == "push":
@@ -875,20 +931,49 @@ def run_parallel_interval_tick(*, now: Optional[dt.datetime] = None, run_push: b
         else:
             ex = _executor()
 
+        skip_busy = _skip_when_busy_enabled()
+        now_ts = time.perf_counter()
+        skipped: list[str] = []
+
+        def _submit(source: str, interval: int, *, run_entry_flag: bool) -> None:
+            if skip_busy and not _inflight_try_acquire(source, interval, now_ts):
+                skipped.append("%s:%s(age=%.0fs)" % (source, interval, _inflight_age(source, interval, now_ts)))
+                return
+            futures.append(
+                ex.submit(
+                    _job_one_source,
+                    source=source,
+                    interval=int(interval),
+                    now=n,
+                    display=display,
+                    run_entry=run_entry_flag,
+                )
+            )
+
         if run_push:
             for interval in wait_push_targets:
-                futures.append(ex.submit(_job_one_source, source="push", interval=int(interval), now=n, display=display, run_entry=bool(run_entry) and in_session))
+                _submit("push", int(interval), run_entry_flag=bool(run_entry) and in_session)
             for interval in bg_push_targets:
                 _submit_bg_push_interval(interval=int(interval), now=n, display=display, run_entry=bool(run_entry) and in_session)
 
         if run_ranking and in_session and _rst_env_bool("SUMMARY_PARALLEL_RANKING_ENABLED", True):
             for interval in ranking_targets:
-                futures.append(ex.submit(_job_one_source, source="ranking", interval=int(interval), now=n, display=display, run_entry=False))
+                _submit("ranking", int(interval), run_entry_flag=False)
         elif run_ranking:
             logger.info("[SUMMARY PARALLEL RESET] ranking skipped targets=%s in_session=%s enabled=%s", ranking_targets, in_session, _rst_env_bool("SUMMARY_PARALLEL_RANKING_ENABLED", True))
 
+        if skipped:
+            logger.warning(
+                "[SUMMARY PARALLEL RESET] skipped busy jobs now=%s skipped=%s inflight=%s "
+                "reason=previous_job_still_running (SUMMARY_PARALLEL_SKIP_WHEN_BUSY)",
+                n, skipped, inflight_snapshot(),
+            )
+
         if not futures:
-            logger.warning("[SUMMARY PARALLEL RESET] tick no wait futures now=%s elapsed=%.3fs", n, time.perf_counter() - t0)
+            logger.warning(
+                "[SUMMARY PARALLEL RESET] tick no wait futures now=%s elapsed=%.3fs skipped=%s",
+                n, time.perf_counter() - t0, skipped,
+            )
             return out
 
         done_count = 0
