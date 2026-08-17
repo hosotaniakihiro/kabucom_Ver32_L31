@@ -24,6 +24,7 @@ import logging
 import os
 from typing import Any, Iterable
 
+import numpy as np
 import pandas as pd
 
 from .cache_writer import save_merged_summary
@@ -365,7 +366,7 @@ def _normalize_datetime_and_basic_columns(df: pd.DataFrame, interval: int, sourc
         vol = _as_num(out.get("volume", pd.Series(index=out.index)), 0.0)
         turn = _as_num(out.get("turnover", pd.Series(index=out.index)), 0.0)
         close = _as_num(out.get("close_price", pd.Series(index=out.index)), 0.0)
-        out["vwap"] = (turn / vol.replace(0, pd.NA)).fillna(close)
+        out["vwap"] = (turn / vol.replace(0, np.nan)).fillna(close)
 
     out = _fill_ranking_type_aliases(out)
     return out
@@ -412,8 +413,8 @@ def _calculate_core_technical_columns(df: pd.DataFrame, interval: int, source: s
         for _, g in out.groupby("symbol", sort=False):
             g = g.sort_values("datetime", kind="mergesort").copy()
             close = _as_num(g["close_price"], 0.0)
-            high = _as_num(g.get("high_price", close), 0.0).replace(0, pd.NA).fillna(close)
-            low = _as_num(g.get("low_price", close), 0.0).replace(0, pd.NA).fillna(close)
+            high = _as_num(g.get("high_price", close), 0.0).replace(0, np.nan).fillna(close)
+            low = _as_num(g.get("low_price", close), 0.0).replace(0, np.nan).fillna(close)
 
             ma5 = close.rolling(5, min_periods=1).mean().fillna(close)
             ma25 = close.rolling(25, min_periods=1).mean().fillna(close)
@@ -436,7 +437,13 @@ def _calculate_core_technical_columns(df: pd.DataFrame, interval: int, source: s
             delta = close.diff().fillna(0.0)
             gain = delta.clip(lower=0).rolling(14, min_periods=1).mean()
             loss = (-delta.clip(upper=0)).rolling(14, min_periods=1).mean()
-            rs = gain / loss.replace(0, pd.NA)
+            # 欠損を pd.NA で入れると dtype が object になり、その後の fillna が
+            # 暗黙ダウンキャストになる (FutureWarning: Downcasting object dtype
+            # arrays on .fillna ... 実測で 1 tick あたり約 3 万件出ていた)。
+            # float64 のまま扱える np.nan を使い、object 化させない。
+            # (astype("float64") で後から直そうとすると pd.NA が混じった時点で
+            #  例外になり、関数ごと except に落ちて元 df を返してしまう)
+            rs = gain / loss.replace(0, np.nan)
             rsi = (100 - (100 / (1 + rs))).fillna(50.0).clip(0, 100)
             _fill_missing_or_zero(g, "rsi", rsi)
 
@@ -446,12 +453,13 @@ def _calculate_core_technical_columns(df: pd.DataFrame, interval: int, source: s
             _fill_missing_or_zero(g, "atr", atr)
             _fill_missing_or_zero(g, f"atr_{int(interval)}m", atr)
 
-            pct1 = close.pct_change(1).replace([np.inf, -np.inf], pd.NA).fillna(0.0)
-            pct3 = close.pct_change(3).replace([np.inf, -np.inf], pd.NA).fillna(0.0)
-            pct5 = close.pct_change(5).replace([np.inf, -np.inf], pd.NA).fillna(0.0)
+            pct1 = close.pct_change(1).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            pct3 = close.pct_change(3).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            pct5 = close.pct_change(5).replace([np.inf, -np.inf], np.nan).fillna(0.0)
             slope = pct1 if ranking_mode else pct3
-            atr_pct = (atr / close.replace(0, pd.NA)).replace([np.inf, -np.inf], pd.NA).fillna(0.0)
-            slope_atr_scaled = (slope / atr_pct.replace(0, pd.NA)).replace([np.inf, -np.inf], pd.NA).fillna(0.0)
+            # 上の rsi と同じ理由で np.nan を使う。
+            atr_pct = (atr / close.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            slope_atr_scaled = (slope / atr_pct.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
             mtf_calc = ((pct1 * 0.50) + (pct3 * 0.30) + (pct5 * 0.20)).fillna(0.0)
             _fill_missing_or_zero(g, "slope", slope, zero_is_missing=ranking_mode)
             _fill_missing_or_zero(g, "slope_atr_scaled", slope_atr_scaled, zero_is_missing=ranking_mode)
@@ -649,7 +657,7 @@ def _push_mtf_volume_fallback_pick_alt_volume(df: Any, price: Any):
         if c in getattr(df, "columns", []):
             t = _push_mtf_volume_fallback_as_num(df[c], 0.0)
             if t.gt(0).any():
-                return (t / price.replace(0, pd.NA)).fillna(0.0)
+                return (t / price.replace(0, np.nan)).fillna(0.0)
 
     fallback_volume = _push_mtf_volume_fallback_env_float("PUSH_MTF_ZERO_VOLUME_FALLBACK_VOLUME", 30000.0)
     return pd.Series(float(fallback_volume), index=df.index, dtype="float64")

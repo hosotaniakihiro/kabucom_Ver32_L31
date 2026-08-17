@@ -182,7 +182,7 @@ def _safe_ready_count(df: pd.DataFrame) -> int:
     try:
         if not isinstance(df, pd.DataFrame) or df.empty or "technical_ready" not in df.columns:
             return 0
-        s = pd.Series(df["technical_ready"]).fillna(False).astype(bool)
+        s = pd.Series(df["technical_ready"]).fillna(False).infer_objects(copy=False).astype(bool)
         return int(s.sum())
     except Exception:
         return 0
@@ -197,7 +197,7 @@ def _safe_ready_symbol_count(df: pd.DataFrame) -> int:
             or "technical_ready" not in df.columns
         ):
             return 0
-        ready = pd.Series(df["technical_ready"]).fillna(False).astype(bool)
+        ready = pd.Series(df["technical_ready"]).fillna(False).infer_objects(copy=False).astype(bool)
         return int(df.loc[ready, "symbol"].astype(str).nunique())
     except Exception:
         return 0
@@ -208,7 +208,7 @@ def _safe_display_ready_count(df: pd.DataFrame) -> int:
         if not isinstance(df, pd.DataFrame) or df.empty:
             return 0
         if "display_ready" in df.columns:
-            return int(pd.Series(df["display_ready"]).fillna(False).astype(bool).sum())
+            return int(pd.Series(df["display_ready"]).fillna(False).infer_objects(copy=False).astype(bool).sum())
         return int(_build_display_ready_mask(df).sum())
     except Exception:
         return 0
@@ -219,7 +219,7 @@ def _safe_display_ready_symbol_count(df: pd.DataFrame) -> int:
         if not isinstance(df, pd.DataFrame) or df.empty or "symbol" not in df.columns:
             return 0
         if "display_ready" in df.columns:
-            ready = pd.Series(df["display_ready"]).fillna(False).astype(bool)
+            ready = pd.Series(df["display_ready"]).fillna(False).infer_objects(copy=False).astype(bool)
         else:
             ready = _build_display_ready_mask(df)
         return int(df.loc[ready, "symbol"].astype(str).nunique())
@@ -478,12 +478,12 @@ def _attach_display_ready_core(df: pd.DataFrame) -> pd.DataFrame:
 
         if "technical_ready" in out.columns:
             try:
-                tech_ready = pd.Series(out["technical_ready"]).fillna(False).astype(bool)
+                tech_ready = pd.Series(out["technical_ready"]).fillna(False).infer_objects(copy=False).astype(bool)
                 display_ready = display_ready | tech_ready
             except Exception:
                 pass
 
-        out["display_ready"] = display_ready.fillna(False).astype(bool)
+        out["display_ready"] = display_ready.fillna(False).infer_objects(copy=False).astype(bool)
 
         logger.info(
             "[summary_controller] attach_display_ready rows=%s cols=%s display_rows=%s display_symbols=%s score_nonzero=%s close_nonnull=%s",

@@ -87,8 +87,8 @@ def _hist_max(df: pd.DataFrame) -> int:
 def _bool_sum(value: Any, index: Any) -> int:
     try:
         if isinstance(value, pd.Series):
-            return int(value.reindex(index).fillna(False).astype(bool).sum())
-        return int(pd.Series(value, index=index).fillna(False).astype(bool).sum())
+            return int(value.reindex(index).fillna(False).infer_objects(copy=False).astype(bool).sum())
+        return int(pd.Series(value, index=index).fillna(False).infer_objects(copy=False).astype(bool).sum())
     except Exception:
         return 0
 
@@ -190,7 +190,7 @@ def _safe_bool_series(s: Any, index) -> pd.Series:
     try:
         if isinstance(s, pd.Series):
             if s.dtype == bool:
-                return s.reindex(index).fillna(False).astype(bool)
+                return s.reindex(index).fillna(False).infer_objects(copy=False).astype(bool)
             txt = s.reindex(index).astype(str).str.lower().str.strip()
             return txt.isin(["1", "true", "yes", "on"])
     except Exception:
@@ -352,8 +352,8 @@ def add_short_history_indicators(df: pd.DataFrame, *, interval: Any = None) -> p
         usable = close.notna() & score_any & (slope_any | indicator_any)
         old_ready = _safe_bool_series(out.get("technical_ready", pd.Series(False, index=out.index)), out.index)
         new_ready = old_ready | usable.fillna(False)
-        out["usable_technical_ready"] = usable.fillna(False).astype(bool)
-        out["technical_ready"] = new_ready.fillna(False).astype(bool)
+        out["usable_technical_ready"] = usable.fillna(False).infer_objects(copy=False).astype(bool)
+        out["technical_ready"] = new_ready.fillna(False).infer_objects(copy=False).astype(bool)
         out["display_ready"] = pd.Series(out.get("display_ready", True), index=out.index).fillna(True).astype(bool)
     except Exception:
         out["usable_technical_ready"] = False
@@ -376,8 +376,8 @@ def add_short_history_indicators(df: pd.DataFrame, *, interval: Any = None) -> p
             "score_mtf": n_score_mtf,
             "mtf_score": n_mtf_score,
             "neutral_default_score_suppressed": suppressed_neutral_scores,
-            "usable_ready": int(pd.Series(out.get("usable_technical_ready", False)).fillna(False).astype(bool).sum()),
-            "technical_ready": int(pd.Series(out.get("technical_ready", False)).fillna(False).astype(bool).sum()),
+            "usable_ready": int(pd.Series(out.get("usable_technical_ready", False)).fillna(False).infer_objects(copy=False).astype(bool).sum()),
+            "technical_ready": int(pd.Series(out.get("technical_ready", False)).fillna(False).infer_objects(copy=False).astype(bool).sum()),
         },
         before,
         after,

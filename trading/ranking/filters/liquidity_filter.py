@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 import numpy as np
 import pandas as pd
@@ -130,25 +130,38 @@ def _ensure_standard_columns(df: pd.DataFrame) -> pd.DataFrame:
     volume_col = _first_existing_col(out, VOLUME_COLUMNS)
     turnover_col = _first_existing_col(out, TURNOVER_COLUMNS)
 
+    # 1列ずつ代入すると 160 列超のフレームに最大 8 回 frame.insert が走り、
+    # pandas が PerformanceWarning (DataFrame is highly fragmented) を出す。
+    # 値は変えずに、まとめて 1 回で足す。
+    pending: dict[str, Any] = {}
+
     if price_col:
         price = _to_numeric_col(out, price_col, default=0.0)
         if "close" not in out.columns:
-            out["close"] = price
+            pending["close"] = price
         for alias in ("close_price", "current_price", "price"):
             if alias not in out.columns:
-                out[alias] = price
+                pending[alias] = price
 
     if volume_col:
         volume = _to_numeric_col(out, volume_col, default=0.0)
         if "volume" not in out.columns:
-            out["volume"] = volume
+            pending["volume"] = volume
         if "trading_volume" not in out.columns:
-            out["trading_volume"] = volume
+            pending["trading_volume"] = volume
 
-    if turnover_col and "turnover" not in out.columns:
-        out["turnover"] = _to_numeric_col(out, turnover_col, default=0.0)
-    if turnover_col and "trading_value" not in out.columns:
-        out["trading_value"] = _to_numeric_col(out, turnover_col, default=0.0)
+    if turnover_col:
+        turnover = _to_numeric_col(out, turnover_col, default=0.0)
+        if "turnover" not in out.columns:
+            pending["turnover"] = turnover
+        if "trading_value" not in out.columns:
+            pending["trading_value"] = turnover
+
+    if pending:
+        # assign でも内部的には1列ずつ挿入されるため、上流で既に断片化している
+        # 160列超のフレームでは PerformanceWarning が残る。
+        # pandas が案内するとおり concat で一度に連結する (値は変わらない)。
+        out = pd.concat([out, pd.DataFrame(pending, index=out.index)], axis=1)
 
     return out
 
@@ -175,8 +188,10 @@ def _ensure_turnover(df: pd.DataFrame) -> pd.DataFrame:
         repaired = existing.copy()
         repaired.loc[repair_mask] = computed.loc[repair_mask]
 
-        df["turnover"] = repaired
-        df["trading_value"] = repaired
+        # 2列を別々に代入すると 160 列超のフレームで frame.insert が2回走り
+        # PerformanceWarning (highly fragmented) になる。concat で一度に入れる。
+        new_cols = pd.DataFrame({"turnover": repaired, "trading_value": repaired}, index=df.index)
+        df = pd.concat([df.drop(columns=[c for c in ("turnover", "trading_value") if c in df.columns]), new_cols], axis=1)
 
         repaired_count = int(repair_mask.sum()) if len(df) else 0
         if repaired_count > 0:

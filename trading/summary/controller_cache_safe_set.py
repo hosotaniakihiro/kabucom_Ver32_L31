@@ -96,7 +96,7 @@ def _safe_bool_true(df: pd.DataFrame, col: str) -> int:
     try:
         if not isinstance(df, pd.DataFrame) or df.empty or col not in df.columns:
             return 0
-        return int(pd.Series(df[col]).fillna(False).astype(bool).sum())
+        return int(pd.Series(df[col]).fillna(False).infer_objects(copy=False).astype(bool).sum())
     except Exception:
         return 0
 
