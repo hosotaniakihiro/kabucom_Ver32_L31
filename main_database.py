@@ -620,10 +620,38 @@ def _wal_checkpoint_summary_db_path() -> Path:
     return Path(summary_db_path())
 
 
-def _wal_checkpoint_once(force_mode: str | None = None) -> bool:
-    db_path = _wal_checkpoint_summary_db_path()
+def _wal_checkpoint_targets() -> "list[tuple[str, Path]]":
+    """WAL チェックポイントの対象 DB。
+
+    当初は summary だけを見ていたが、2026-08-18 の後場に ranking DB の WAL が
+    282MB まで伸び (本体 444MB)、SMB 越しの読み取りが 1 回 4 秒 -> 13〜20 秒に
+    悪化して 1 tick が 333 秒になった。summary と同じ構造なので同じ扱いにする。
+
+    SUMMARY_WAL_CHECKPOINT_TARGETS で対象を絞れる (既定 summary,ranking,push)。
+    """
+    raw = str(os.getenv("SUMMARY_WAL_CHECKPOINT_TARGETS", "summary,ranking,push"))
+    want = [x.strip().lower() for x in raw.split(",") if x.strip()]
+
+    out: list[tuple[str, Path]] = []
+    for name in want:
+        try:
+            if name == "summary":
+                out.append((name, _wal_checkpoint_summary_db_path()))
+            elif name == "ranking":
+                from data_collectors.config import ranking_db_path
+                out.append((name, Path(ranking_db_path())))
+            elif name == "push":
+                from data_collectors.config import push_db_path
+                out.append((name, Path(push_db_path())))
+        except Exception:
+            logger.debug("[WAL CHECKPOINT] target resolve failed name=%s", name, exc_info=True)
+    return out
+
+
+def _wal_checkpoint_once(force_mode: str | None = None, db_path: "Path | None" = None, label: str = "SUMMARY") -> bool:
+    db_path = db_path if db_path is not None else _wal_checkpoint_summary_db_path()
     if not db_path.exists():
-        logger.debug("[SUMMARY WAL CHECKPOINT] skip db missing path=%s", db_path)
+        logger.debug("[%s WAL CHECKPOINT] skip db missing path=%s", label, db_path)
         return False
 
     mode = force_mode if force_mode in _WAL_CHECKPOINT_MODES else _wal_checkpoint_mode()
@@ -644,15 +672,15 @@ def _wal_checkpoint_once(force_mode: str | None = None) -> bool:
         finally:
             conn.close()
         logger.info(
-            "[SUMMARY WAL CHECKPOINT] done mode=%s db=%s wal_size=%s result=%s",
-            mode, db_path, wal_size, result,
+            "[%s WAL CHECKPOINT] done mode=%s db=%s wal_size=%s result=%s",
+            label, mode, db_path, wal_size, result,
         )
         return True
     except sqlite3.OperationalError as exc:
-        logger.warning("[SUMMARY WAL CHECKPOINT] skip busy mode=%s db=%s err=%s", mode, db_path, exc)
+        logger.warning("[%s WAL CHECKPOINT] skip busy mode=%s db=%s err=%s", label, mode, db_path, exc)
         return False
     except Exception:
-        logger.exception("[SUMMARY WAL CHECKPOINT] failed db=%s", db_path)
+        logger.exception("[%s WAL CHECKPOINT] failed db=%s", label, db_path)
         return False
 
 
@@ -673,41 +701,44 @@ def _wal_checkpoint_loop() -> None:
     if initial_delay:
         time.sleep(initial_delay)
 
-    miss_streak = 0
+    miss_streak: dict[str, int] = {}
     while True:
         if _wal_checkpoint_env_bool("SUMMARY_WAL_CHECKPOINT_ENABLED", True):
-            ok = _wal_checkpoint_once()
-            miss_streak = 0 if ok else (miss_streak + 1)
+            for name, db_path in _wal_checkpoint_targets():
+                label = name.upper()
+                ok = _wal_checkpoint_once(db_path=db_path, label=label)
+                miss_streak[name] = 0 if ok else (miss_streak.get(name, 0) + 1)
 
-            if not ok and _wal_checkpoint_should_escalate(miss_streak):
-                mode = str(os.getenv("SUMMARY_WAL_CHECKPOINT_ESCALATE_MODE", "TRUNCATE")).strip().upper()
-                if mode not in _WAL_CHECKPOINT_MODES:
-                    mode = "TRUNCATE"
-                logger.warning(
-                    "[SUMMARY WAL CHECKPOINT] escalate mode=%s miss_streak=%s wal_mb=%.0f",
-                    mode, miss_streak, _wal_checkpoint_wal_size_mb(),
-                )
-                if _wal_checkpoint_once(force_mode=mode):
-                    miss_streak = 0
+                if not ok and _wal_checkpoint_should_escalate(miss_streak[name], db_path=db_path):
+                    mode = str(os.getenv("SUMMARY_WAL_CHECKPOINT_ESCALATE_MODE", "TRUNCATE")).strip().upper()
+                    if mode not in _WAL_CHECKPOINT_MODES:
+                        mode = "TRUNCATE"
+                    logger.warning(
+                        "[%s WAL CHECKPOINT] escalate mode=%s miss_streak=%s wal_mb=%.0f",
+                        label, mode, miss_streak[name], _wal_checkpoint_wal_size_mb(db_path),
+                    )
+                    if _wal_checkpoint_once(force_mode=mode, db_path=db_path, label=label):
+                        miss_streak[name] = 0
         time.sleep(interval)
 
 
-def _wal_checkpoint_wal_size_mb() -> float:
+def _wal_checkpoint_wal_size_mb(db_path: "Path | None" = None) -> float:
     try:
-        wal = Path(str(_wal_checkpoint_summary_db_path()) + "-wal")
+        base = db_path if db_path is not None else _wal_checkpoint_summary_db_path()
+        wal = Path(str(base) + "-wal")
         return wal.stat().st_size / (1024.0 * 1024.0) if wal.exists() else 0.0
     except Exception:
         return 0.0
 
 
-def _wal_checkpoint_should_escalate(miss_streak: int) -> bool:
+def _wal_checkpoint_should_escalate(miss_streak: int, db_path: "Path | None" = None) -> bool:
     """PASSIVE が続けて空振りし、WAL も膨らんでいるときだけ True。"""
     try:
         if not _wal_checkpoint_env_bool("SUMMARY_WAL_CHECKPOINT_ESCALATE_ENABLED", True):
             return False
         need_miss = max(1, _wal_checkpoint_env_int("SUMMARY_WAL_CHECKPOINT_ESCALATE_AFTER_MISSES", 5))
         need_mb = max(1.0, _wal_checkpoint_env_float("SUMMARY_WAL_CHECKPOINT_ESCALATE_WAL_MB", 128.0))
-        return miss_streak >= need_miss and _wal_checkpoint_wal_size_mb() >= need_mb
+        return miss_streak >= need_miss and _wal_checkpoint_wal_size_mb(db_path) >= need_mb
     except Exception:
         return False
 

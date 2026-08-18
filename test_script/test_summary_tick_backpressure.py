@@ -83,11 +83,11 @@ def test_wal_escalation_requires_both_misses_and_size(monkeypatch):
     monkeypatch.setenv("SUMMARY_WAL_CHECKPOINT_ESCALATE_AFTER_MISSES", "5")
     monkeypatch.setenv("SUMMARY_WAL_CHECKPOINT_ESCALATE_WAL_MB", "128")
 
-    monkeypatch.setattr(MD, "_wal_checkpoint_wal_size_mb", lambda: 200.0)
+    monkeypatch.setattr(MD, "_wal_checkpoint_wal_size_mb", lambda p=None: 200.0)
     assert MD._wal_checkpoint_should_escalate(4) is False, "空振り回数が足りないのに格上げした"
     assert MD._wal_checkpoint_should_escalate(5) is True
 
-    monkeypatch.setattr(MD, "_wal_checkpoint_wal_size_mb", lambda: 10.0)
+    monkeypatch.setattr(MD, "_wal_checkpoint_wal_size_mb", lambda p=None: 10.0)
     assert MD._wal_checkpoint_should_escalate(50) is False, "WAL が小さいのに格上げした"
 
 
@@ -95,7 +95,7 @@ def test_wal_escalation_can_be_disabled(monkeypatch):
     import main_database as MD
 
     monkeypatch.setenv("SUMMARY_WAL_CHECKPOINT_ESCALATE_ENABLED", "0")
-    monkeypatch.setattr(MD, "_wal_checkpoint_wal_size_mb", lambda: 999.0)
+    monkeypatch.setattr(MD, "_wal_checkpoint_wal_size_mb", lambda p=None: 999.0)
     assert MD._wal_checkpoint_should_escalate(100) is False
 
 
@@ -104,3 +104,48 @@ def test_default_checkpoint_mode_stays_passive(monkeypatch):
 
     monkeypatch.delenv("SUMMARY_WAL_CHECKPOINT_MODE", raising=False)
     assert MD._wal_checkpoint_mode() == "PASSIVE", "通常時のモードを変えてはいけない"
+
+
+# ============================================================
+# WAL チェックポイントの対象 (2026-08-18)
+# ============================================================
+
+def test_checkpoint_targets_cover_ranking_and_push(monkeypatch):
+    """summary だけでなく ranking / push も対象にすること。
+
+    2026-08-18 後場、ranking DB の WAL が 282MB まで伸び (本体 444MB)、
+    SMB 越しの読み取りが 1 回 4 秒 -> 13〜20 秒に悪化して
+    1 tick が 333 秒になった。summary と同じ構造なので同じ扱いにする。
+    """
+    import main_database as MD
+
+    monkeypatch.delenv("SUMMARY_WAL_CHECKPOINT_TARGETS", raising=False)
+    names = [n for n, _ in MD._wal_checkpoint_targets()]
+    assert "summary" in names
+    assert "ranking" in names, "ranking DB が対象から漏れている"
+    assert "push" in names
+
+
+def test_checkpoint_targets_can_be_narrowed(monkeypatch):
+    import main_database as MD
+
+    monkeypatch.setenv("SUMMARY_WAL_CHECKPOINT_TARGETS", "summary")
+    assert [n for n, _ in MD._wal_checkpoint_targets()] == ["summary"]
+
+
+def test_escalation_is_evaluated_per_target(monkeypatch):
+    """対象ごとに WAL サイズを見て格上げ判定すること。"""
+    import main_database as MD
+    from pathlib import Path as _P
+
+    monkeypatch.setenv("SUMMARY_WAL_CHECKPOINT_ESCALATE_AFTER_MISSES", "5")
+    monkeypatch.setenv("SUMMARY_WAL_CHECKPOINT_ESCALATE_WAL_MB", "128")
+
+    big, small = _P("big.db"), _P("small.db")
+    monkeypatch.setattr(MD, "_wal_checkpoint_wal_size_mb",
+                        lambda p=None: 300.0 if p == big else 5.0)
+
+    assert MD._wal_checkpoint_should_escalate(5, db_path=big) is True
+    assert MD._wal_checkpoint_should_escalate(5, db_path=small) is False, (
+        "WAL が小さい対象まで格上げしている"
+    )
