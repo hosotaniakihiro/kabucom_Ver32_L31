@@ -1004,6 +1004,20 @@ def _process_symbol_full_reload(rec: dict[str, str], *, period: str, start: Opti
 
 def main(argv: Optional[list[str]] = None) -> int:
     _setup_logging()
+
+    # この環境では Norton の SSL/TLS スキャンが HTTPS を傍受しており、
+    # そのルートCAが certifi に無いため Yahoo へ到達できない
+    # (CertificateVerifyError / "possibly delisted; no price data found")。
+    # 対処は scripts/yahoo_ca_bundle.install() だが、これまで
+    # TaskSchedule のラッパー main.py にしか入っておらず、
+    # このバッチを直接起動すると必ず 0 件で終わっていた。
+    # どちらの入口から来ても効くように、ここでも入れる (install は冪等)。
+    try:
+        from scripts.yahoo_ca_bundle import install as _install_ca_bundle
+        _install_ca_bundle()
+    except Exception:
+        LOG.exception("[NIGHT YAHOO DAILY] CA bundle install failed; continue")
+
     parser = argparse.ArgumentParser(description="Nightly Yahoo daily data update batch")
     parser.add_argument("--period", default=os.environ.get("NIGHT_YAHOO_DAILY_PERIOD", "3y"), help="yfinance period when --start is omitted")
     parser.add_argument("--start", default=os.environ.get("NIGHT_YAHOO_DAILY_START", ""), help="optional yfinance start date YYYY-MM-DD")
