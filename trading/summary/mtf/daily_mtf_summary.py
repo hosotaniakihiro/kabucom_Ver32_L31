@@ -20,7 +20,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import pandas as pd
@@ -36,24 +38,68 @@ logger = logging.getLogger(__name__)
 _PATCHED = False
 _DAILY_CACHE_DF: Optional[pd.DataFrame] = None
 _DAILY_CACHE_TS: float = 0.0
-_DAILY_CACHE_TTL_SEC: float = 300.0
+_DAILY_CACHE_MTIME: Optional[float] = None
+
+# 日足 (stock_analysis_latest) は 1 日 1 回しか更新されない。
+# 旧実装は 300 秒 TTL だったため 1 日あたり 70 回以上、
+# 5.17GB の DB から WHERE も LIMIT も無い SELECT で 4,192 行を読み直していた
+# (実測 1 回 24 秒 = 1 日およそ 29 分)。
+# TTL を延ばしたうえで、DB ファイルの更新時刻が変わったら即座に読み直す。
+_DAILY_CACHE_TTL_SEC: float = 1800.0
+
+
+def _daily_cache_ttl_sec() -> float:
+    try:
+        return max(0.0, float(os.getenv("DAILY_MTF_CACHE_TTL_SEC", str(_DAILY_CACHE_TTL_SEC))))
+    except Exception:
+        return _DAILY_CACHE_TTL_SEC
+
+
+def _daily_db_mtime() -> Optional[float]:
+    """日足DBの更新時刻。取れなければ None (その場合は TTL だけで判断する)。"""
+    try:
+        from trading.summary.mtf.daily_mtf_loader import DEFAULT_DAILY_MTF_DB_PATH
+
+        raw = os.getenv("DAILY_MTF_DB_PATH") or DEFAULT_DAILY_MTF_DB_PATH
+        db = Path(str(raw))
+        return db.stat().st_mtime if db.exists() else None
+    except Exception:
+        return None
+
+
+def reset_daily_cache() -> None:
+    global _DAILY_CACHE_DF, _DAILY_CACHE_TS, _DAILY_CACHE_MTIME
+    _DAILY_CACHE_DF = None
+    _DAILY_CACHE_TS = 0.0
+    _DAILY_CACHE_MTIME = None
 
 
 def _get_cached_daily_df() -> pd.DataFrame:
+    """stock_analysis_latest を毎回読みに行かないためのキャッシュ。
+
+    日足は 1 日 1 回しか変わらないので TTL は長めにし、
+    DB ファイルの更新時刻が変わったときは TTL 内でも読み直す。
     """
-    stock_analysis_latest を毎回読みに行かないための軽いTTLキャッシュ。
-    ザラ場中に日足DBは頻繁更新されない想定なので5分キャッシュ。
-    """
-    global _DAILY_CACHE_DF, _DAILY_CACHE_TS
+    global _DAILY_CACHE_DF, _DAILY_CACHE_TS, _DAILY_CACHE_MTIME
 
     now = time.monotonic()
+    mtime = _daily_db_mtime()
+
     if _DAILY_CACHE_DF is not None and not _DAILY_CACHE_DF.empty:
-        if now - _DAILY_CACHE_TS <= _DAILY_CACHE_TTL_SEC:
+        fresh = (now - _DAILY_CACHE_TS) <= _daily_cache_ttl_sec()
+        unchanged = (mtime is None) or (_DAILY_CACHE_MTIME == mtime)
+        if fresh and unchanged:
             return _DAILY_CACHE_DF
+        if not unchanged:
+            logger.info(
+                "[DAILY MTF PATCH] daily db updated -> reload cache mtime=%s -> %s",
+                _DAILY_CACHE_MTIME, mtime,
+            )
 
     df = load_daily_mtf_latest_df()
     _DAILY_CACHE_DF = df
     _DAILY_CACHE_TS = now
+    _DAILY_CACHE_MTIME = mtime
     return df
 
 
