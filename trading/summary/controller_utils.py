@@ -43,7 +43,10 @@ def sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
             return df.copy()
 
         out = df.copy()
-        out = out.replace([np.inf, -np.inf], np.nan)
+        # 上と同じ理由で数値列だけに限定する (inf は数値列にしか入らない)。
+        _num_cols = out.select_dtypes(include=[np.number]).columns
+        if len(_num_cols) > 0:
+            out[_num_cols] = out[_num_cols].replace([np.inf, -np.inf], np.nan)
 
         try:
             if isinstance(out.columns, pd.MultiIndex):

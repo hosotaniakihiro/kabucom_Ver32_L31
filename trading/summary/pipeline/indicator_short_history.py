@@ -239,7 +239,20 @@ def _suppress_neutral_default_scores(out: pd.DataFrame) -> tuple[pd.DataFrame, i
                     out.loc[mask, col] = 0.0
             if "score_buy" in out.columns:
                 out.loc[mask, "score_buy"] = 0.0
-            out.loc[mask, "neutral_default_score_suppressed"] = True
+            # 既存列が float64 のことがあり、True を入れると将来の pandas で
+            # エラーになる。今の暗黙変換 (1.0) と同じ値を明示して入れる。
+            if "neutral_default_score_suppressed" not in out.columns:
+                out["neutral_default_score_suppressed"] = False
+            _ns = out["neutral_default_score_suppressed"]
+            if pd.api.types.is_bool_dtype(_ns):
+                _sup_val = True
+            elif pd.api.types.is_integer_dtype(_ns):
+                _sup_val = 1
+            elif pd.api.types.is_float_dtype(_ns):
+                _sup_val = 1.0
+            else:
+                _sup_val = True
+            out.loc[mask, "neutral_default_score_suppressed"] = _sup_val
         return out, n
     except Exception:
         logger.exception("[IND SHORT PATCH] neutral score suppress failed")

@@ -1137,7 +1137,20 @@ def _repair_merged_summary_from_history(gc: "GlobalContext", tf: Any, df: Any, s
         for col in ("macd", "signal", "rsi", "mtf", "score_mtf"):
             if col in out.columns:
                 ready = ready | (pd.to_numeric(out[col], errors="coerce").fillna(0) != 0)
-        out.loc[ready, "technical_ready"] = True
+        # technical_ready は DB 由来だと int64 になる。int64 列に True を入れると
+        # FutureWarning (Setting an item of incompatible dtype is deprecated) が出て
+        # 将来の pandas ではエラーになる。今は暗黙に 1 へ変換されているので、
+        # 同じ値になるよう列の dtype に合わせて入れる。
+        _tr = out["technical_ready"]
+        if pd.api.types.is_bool_dtype(_tr):
+            _true_val = True
+        elif pd.api.types.is_integer_dtype(_tr):
+            _true_val = 1
+        elif pd.api.types.is_float_dtype(_tr):
+            _true_val = 1.0
+        else:
+            _true_val = True
+        out.loc[ready, "technical_ready"] = _true_val
         if "symbol_hist_len" not in out.columns:
             out["symbol_hist_len"] = pd.NA
         out.loc[ready & out["symbol_hist_len"].isna(), "symbol_hist_len"] = 3
