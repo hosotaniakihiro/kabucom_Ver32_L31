@@ -16,7 +16,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
+import threading
+import time
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -179,7 +182,54 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
     return [str(r[1]) for r in cur.fetchall()]
 
 
+# ranking DB からの読み出しキャッシュ。
+#
+# _read_ranking_df_from_db は 1 tick で複数回呼ばれ (実測 5 回/tick)、
+# そのたびに NAS 上の ranking DB から SELECT * ... LIMIT 20000 を投げていた。
+# ranking_collector は 1 分に 1 回しか書かないので、同じ tick の中で
+# 読み直しても内容は変わらない。実測ではこの読み出しが 1 tick 88 秒のうち
+# 最大の繰り返しコストだった。
+_RANKING_DF_CACHE: "tuple[float, pd.DataFrame] | None" = None
+_RANKING_DF_LOCK = threading.RLock()
+
+
+def _ranking_df_cache_ttl() -> float:
+    try:
+        return max(0.0, float(os.getenv("SUMMARY_ENRICH_RANKING_DB_CACHE_TTL_SEC", "30")))
+    except Exception:
+        return 30.0
+
+
+def reset_ranking_df_cache() -> None:
+    global _RANKING_DF_CACHE
+    with _RANKING_DF_LOCK:
+        _RANKING_DF_CACHE = None
+
+
 def _read_ranking_df_from_db(limit: int = 20000) -> pd.DataFrame:
+    global _RANKING_DF_CACHE
+
+    ttl = _ranking_df_cache_ttl()
+    if ttl > 0:
+        with _RANKING_DF_LOCK:
+            cached = _RANKING_DF_CACHE
+        if cached is not None:
+            age = time.monotonic() - cached[0]
+            if age <= ttl:
+                logger.info(
+                    "[SUMMARY ENRICH][RANKING] db source cached rows=%s age=%.1fs ttl=%.0fs",
+                    len(cached[1]), age, ttl,
+                )
+                return cached[1].copy()
+
+    df = _read_ranking_df_from_db_uncached(limit=limit)
+    if ttl > 0 and isinstance(df, pd.DataFrame):
+        with _RANKING_DF_LOCK:
+            _RANKING_DF_CACHE = (time.monotonic(), df.copy())
+    return df
+
+
+def _read_ranking_df_from_db_uncached(limit: int = 20000) -> pd.DataFrame:
     try:
         from ats.ats_ranking.db_path import get_usable_ranking_db_path
 
