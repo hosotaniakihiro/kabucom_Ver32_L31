@@ -141,6 +141,18 @@ _CPU_GUARD_FORCE_DEFAULTS = {
     "SUMMARY_DATABASE_SLOW_TICK_SEC": "45",
     "SUMMARY_DATABASE_SKIP_NEXT_ON_SLOW_TICK": "1",
 
+    # 1分足の差分キャッシュ (trading/summary/engine/incremental/bar_cache.py)。
+    # 2026-08-19 の実測では tick データ量が日中に増えるほど tick が伸びる
+    #   09:19 normalized_push 13,930 行 -> 41 秒
+    #   10:35 normalized_push 20,000 行 -> 70 秒 (DB読みは上限 30,000 行)
+    # 毎分 直近20分ぶんの tick を読み直して全再計算する構造が原因。
+    # 差分キャッシュはこれを「前回の足以降だけ」にする。
+    #
+    # まず shadow で本番データの差分を採ってから on にする。
+    # shadow は新旧を両方計算するぶん重いので 10 tick に 1 回だけ比較する。
+    "SUMMARY_BAR_CACHE_MODE": "shadow",
+    "SUMMARY_BAR_CACHE_SHADOW_EVERY": "10",
+
     # MA75 warmupの起動負荷を抑える。
     "PUSH_INCREMENTAL_MA75_SUMMARY_LOOKBACK_DAYS": "1",
     "PUSH_INCREMENTAL_MA75_TAIL_ROWS": "90",
