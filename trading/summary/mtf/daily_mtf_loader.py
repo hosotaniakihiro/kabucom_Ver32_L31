@@ -32,7 +32,7 @@ import logging
 import os
 import sqlite3
 import time
-from typing import Dict
+from typing import Any, Dict
 
 import numpy as np
 import pandas as pd
@@ -312,16 +312,62 @@ def load_daily_mtf_latest_df(
         .reset_index(drop=True)
     )
 
+    latest_date = out["daily_date"].max() if "daily_date" in out.columns and not out.empty else None
+
     logger.info(
         "[DAILY MTF LOADER] loaded rows=%s symbols=%s latest_date=%s db=%s table=%s",
         len(out),
         out["symbol"].nunique() if "symbol" in out.columns else 0,
-        out["daily_date"].max() if "daily_date" in out.columns and not out.empty else None,
+        latest_date,
         db_path,
         table_name,
     )
 
+    _warn_if_stale(latest_date, db_path)
+
     return out
+
+
+def _stale_days_threshold() -> int:
+    try:
+        return max(1, int(float(os.getenv("DAILY_MTF_STALE_WARN_DAYS", "4"))))
+    except Exception:
+        return 4
+
+
+def _warn_if_stale(latest_date: Any, db_path: str) -> None:
+    """日足が古いまま判定に使われていないか監視する。
+
+    2026-08-18 に、日足DB が 2026-07-17 を最後に更新されておらず
+    (夜間バッチが TLS で失敗し、かつタスク登録も無かった)、
+    日足MTF が 1 か月前の値で判定していたことが分かった。
+    それでもログは INFO の "latest_date=2026-07-16" だけで、
+    古いことが分かる出力が無かったため気付けなかった。
+
+    休日を挟むと数日空くのは正常なので、既定は 4 日超で WARNING。
+    DAILY_MTF_STALE_WARN_DAYS で調整できる。
+    """
+    try:
+        if latest_date is None:
+            logger.warning("[DAILY MTF LOADER] latest_date unknown db=%s", db_path)
+            return
+
+        d = pd.to_datetime(latest_date, errors="coerce")
+        if pd.isna(d):
+            logger.warning("[DAILY MTF LOADER] latest_date unparsable value=%r db=%s", latest_date, db_path)
+            return
+
+        age_days = (pd.Timestamp.now().normalize() - d.normalize()).days
+        limit = _stale_days_threshold()
+        if age_days > limit:
+            logger.warning(
+                "[DAILY MTF STALE] 日足が %s 日前のまま判定に使われています "
+                "latest_date=%s age_days=%s limit=%s db=%s "
+                "hint=夜間バッチ (NightYahooDailyFullSummary) が動いているか確認してください",
+                age_days, d.date(), age_days, limit, db_path,
+            )
+    except Exception:
+        logger.debug("[DAILY MTF LOADER] stale check failed", exc_info=True)
 
 
 def load_daily_mtf_latest_map(
