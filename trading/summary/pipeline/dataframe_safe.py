@@ -135,7 +135,12 @@ def safe_to_datetime(value: Any) -> pd.Series:
                     fallback = pd.to_datetime(text.loc[remaining], errors="coerce")
                 ok = fallback.notna()
                 if ok.any():
-                    out.loc[fallback.index[ok]] = fallback.loc[fallback.index[ok]]
+                    # fallback は ISO の tz 付きを拾うので tz-aware になりうる。
+                    # tz-naive な out へそのまま入れると
+                    #   FutureWarning: Setting an item of incompatible dtype
+                    # になり、将来の pandas ではエラーになる。
+                    # どのみち最後に _drop_timezone するので、入れる前に外す。
+                    out.loc[fallback.index[ok]] = _drop_timezone(fallback).loc[fallback.index[ok]]
             except Exception:
                 pass
 
