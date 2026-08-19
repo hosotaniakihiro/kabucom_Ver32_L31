@@ -215,6 +215,20 @@ def compare_for_shadow(full: pd.DataFrame, cached: pd.DataFrame, interval: int) 
         a = full[cols].sort_values(_KEY, kind="stable").reset_index(drop=True)
         b = cached[cols].sort_values(_KEY, kind="stable").reset_index(drop=True)
 
+        # フル再構築は「直近 N 分の tick」しか見ていないため、窓の先頭にかかる足は
+        # tick が途中から始まっており open / volume / tick_count が本来と違う。
+        # キャッシュ側はその足を完全な状態で持っているので、ここを比べると
+        # 「キャッシュの方が正しいのに different」になる。
+        # 各 symbol の最古の足を比較対象から外す。
+        try:
+            a_dt = pd.to_datetime(a["datetime"], errors="coerce")
+            first_per_symbol = a_dt.groupby(a["symbol"]).transform("min")
+            boundary = a_dt <= first_per_symbol
+            info["excluded_boundary_rows"] = int(boundary.sum())
+            a = a[~boundary]
+        except Exception:
+            logger.debug("[BAR CACHE] boundary exclusion failed", exc_info=True)
+
         # キャッシュ側は古い足を保持しているぶん行数が多くなりうるので、
         # 共通の (symbol, datetime) だけを突き合わせる
         merged = a.merge(b, on=_KEY, how="inner", suffixes=("__f", "__c"))
