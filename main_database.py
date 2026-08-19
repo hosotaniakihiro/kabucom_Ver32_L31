@@ -148,10 +148,14 @@ _CPU_GUARD_FORCE_DEFAULTS = {
     # 毎分 直近20分ぶんの tick を読み直して全再計算する構造が原因。
     # 差分キャッシュはこれを「前回の足以降だけ」にする。
     #
-    # まず shadow で本番データの差分を採ってから on にする。
-    # shadow は新旧を両方計算するぶん重いので 10 tick に 1 回だけ比較する。
-    "SUMMARY_BAR_CACHE_MODE": "shadow",
-    "SUMMARY_BAR_CACHE_SHADOW_EVERY": "10",
+    # shadow で本番データを検証したうえで on にした (2026-08-19)。
+    #   OHLC / volume / tick_count は完全一致
+    #   差が出るのは ma5/ma25/ma75/rsi/macd などの指標のみで、
+    #   これはキャッシュ側が履歴を多く持つことによる
+    #   (cached 1,679〜1,839 本 vs full 969 本)。
+    # 20 分窓から作る従来方式では ma25 も ma75 も最大 20 本しか使えておらず、
+    # ma75 が名前どおりの期間で計算されていなかった。キャッシュ側の方が正しい。
+    "SUMMARY_BAR_CACHE_MODE": "on",
 
     # MA75 warmupの起動負荷を抑える。
     "PUSH_INCREMENTAL_MA75_SUMMARY_LOOKBACK_DAYS": "1",
