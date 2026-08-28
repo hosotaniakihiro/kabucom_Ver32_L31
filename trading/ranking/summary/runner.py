@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import time
 from typing import Iterable, Optional, Any
 
 import pandas as pd
@@ -100,9 +101,30 @@ def run_ranking_summary_once(
         use_discord,
     )
 
+    # P0-3: どの段で時間を使っているのかを必ず出す。
+    def _rs_stage():
+        try:
+            from scheduler_jobs.summary import stage_tracker as _st
+            return _st
+        except Exception:
+            return None
+
+    _st = _rs_stage()
+    _t_all = time.perf_counter()
+
+    # 終わらせられないと分かっている仕事は始めない。
+    # (始めてから捨てると、その時間がまるごと無駄になる)
+    if _st is not None and _st.should_stop("ranking_summary_before_base"):
+        logger.warning(
+            "[RANKING SUMMARY STAGE] cooperative stop before base_df interval=%s "
+            "(予算切れのため着手しない)", interval,
+        )
+        return pd.DataFrame()
+
     # --------------------------------------------------------
-    # 1. technical 前の base_df を構築
+    # 1. technical 前の base_df を構築 (ranking DB resolve/read/7 type load/aggregate)
     # --------------------------------------------------------
+    _t0 = time.perf_counter()
     base_df = build_ranking_summary_base_df(
         trade_date=trade_date,
         interval=interval,
@@ -131,10 +153,36 @@ def run_ranking_summary_once(
         base_df["datetime"].max() if "datetime" in base_df.columns else None,
     )
 
+    _el_base = time.perf_counter() - _t0
+    _log = logger.warning if _el_base >= 3.0 else logger.info
+    _log("[RANKING SUMMARY STAGE] interval=%s base_df=%.3fs rows=%s",
+         interval, _el_base, len(base_df) if base_df is not None else -1)
+
+    # base_df が出来ているなら捨てない。
+    # 予算が尽きていたら technical だけ飛ばして base_df を使う。
+    # これは同ファイルの "built empty -> use base_df fallback" と同じ扱い。
+    _skip_technical = False
+    if _st is not None and _st.should_stop("ranking_summary_after_base"):
+        if base_df is not None and not base_df.empty:
+            _skip_technical = True
+            logger.warning(
+                "[RANKING SUMMARY STAGE] budget exhausted after base_df interval=%s "
+                "elapsed=%.3fs rows=%s -> technical を飛ばして base_df を使う "
+                "(完成した行は捨てない; technical 列は欠落する)",
+                interval, time.perf_counter() - _t_all, len(base_df),
+            )
+        else:
+            logger.warning(
+                "[RANKING SUMMARY STAGE] cooperative stop after base_df interval=%s "
+                "elapsed=%.3fs (base_df も空)", interval, time.perf_counter() - _t_all,
+            )
+            return pd.DataFrame()
+
     # --------------------------------------------------------
     # 2. technical 指標付与
     # --------------------------------------------------------
-    df = call_external_technical(
+    _t0 = time.perf_counter()
+    df = pd.DataFrame() if _skip_technical else call_external_technical(
         base_df,
         interval=interval,
         trade_date=trade_date,
@@ -164,6 +212,12 @@ def run_ranking_summary_once(
             interval,
         )
         df = base_df.copy()
+
+    _el_tech = time.perf_counter() - _t0
+    _log = logger.warning if _el_tech >= 3.0 else logger.info
+    _log("[RANKING SUMMARY STAGE] interval=%s technical=%.3fs rows=%s total=%.3fs",
+         interval, _el_tech, len(df) if df is not None else -1,
+         time.perf_counter() - _t_all)
 
     # --------------------------------------------------------
     # 3. 必須列保証

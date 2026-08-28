@@ -6,6 +6,7 @@ import os
 import sys
 import sqlite3
 from typing import Any, Iterable, Sequence
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 VERSION = "V1.4-ROTATION-DB-FALLBACK-AB100"
@@ -70,7 +71,7 @@ def _iter_existing_db_paths(kind: str) -> list[str]:
         os.environ.get("AUTO_STOCK_ROOT"),
         os.environ.get("KABU_DATA_ROOT"),
         os.environ.get("RAW_DATA_ROOT"),
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data",
+        nas_path(r"raw_data"),
     ])
     paths: list[str] = []
     for root in roots:

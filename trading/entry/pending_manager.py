@@ -25,6 +25,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import time
 import traceback
 from typing import Dict, List, Any, Iterator, Tuple, Callable, Set
 
@@ -265,7 +266,29 @@ def _entry_age_sec(entry: Dict[str, Any]) -> float | None:
 def _prepare_new_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(entry)
     now = _now()
-    if _entry_created_at(out) is None:
+    # pending をキューへ載せた実時刻。足の datetime とは別物。
+    # 以前は _entry_created_at() が datetime 列 (足の時刻) を拾ってしまい、
+    # created_at が一度も打たれず、下流が「32秒前に作った候補」を
+    # 「253秒前の候補」と誤認して STALE_CANDIDATE_SKIP していた。
+    try:
+        import os as _os
+        _stamp = (_os.getenv("ENTRY_PENDING_CREATED_AT_STAMP") or "1").strip().lower() \
+            not in {"0", "false", "no", "off"}
+    except Exception:
+        _stamp = True
+    # P1: ここで candidate_id を確定させる。
+    # Ranking 側で既に打たれていればそれを維持し、無ければ発番する。
+    # 以降 Controller / Gate / executor / dry-run order まで同じ ID で追う。
+    try:
+        from trading.entry import candidate_id as _cid
+        _cid.ensure(out, stage="pending_created")
+    except Exception:
+        logger.debug("[PENDING] candidate_id stamp failed", exc_info=True)
+    if _stamp:
+        out["pending_created_at"] = now
+        if _parse_dt(out.get("created_at")) is None:
+            out["created_at"] = now
+    elif _entry_created_at(out) is None:
         out["created_at"] = now
     out["updated_at"] = now
     return out
@@ -559,6 +582,27 @@ def pop_entry(symbol: str, entry: Dict) -> None:
 # ============================================================
 # entry_controller 用: 条件一致 entry を安全に削除
 # ============================================================
+
+def _terminal_state_for_reason(reason) -> str:
+    """prune 理由から terminal state を決める。
+
+    P0-8: 判定・閾値は一切変えない。分類だけ。
+      expire / timeout / stale  -> EXPIRED
+      cancel                    -> CANCELLED
+      それ以外 (NG / reject 等) -> REJECTED
+    """
+    try:
+        from trading.entry import candidate_id as _cid
+    except Exception:
+        return "REJECTED"
+    r = str(reason or "").strip().lower()
+    if any(k in r for k in ("expire", "timeout", "stale", "too_old", "age")):
+        return _cid.STATE_EXPIRED
+    if any(k in r for k in ("cancel", "abort")):
+        return _cid.STATE_CANCELLED
+    return _cid.STATE_REJECTED
+
+
 def prune_entries(
     predicate: Callable[[str, Dict[str, Any]], bool],
     *,
@@ -588,6 +632,26 @@ def prune_entries(
 
                 if predicate(str(sym), entry):
                     removed += 1
+                    # P0-7/P0-8: prune は「消えた」ではなく明示的な決着。
+                    # terminal を記録しないと、後段の pending 件数差分監査が
+                    # pending_moved_without_order (= vanish) と誤検出する。
+                    # 2026-08-28 の 6030 / 3994 / 4443 / 4776 / 2590 はすべてこれ。
+                    try:
+                        from trading.entry import candidate_id as _cid
+
+                        _c = _cid.of(entry)
+                        _state = _terminal_state_for_reason(reason)
+                        if _c:
+                            _cid.mark_terminal(_c, _state, reason=str(reason or "prune"))
+                        else:
+                            _cid.mark_terminal_symbol(
+                                sym, _state, reason=str(reason or "prune")
+                            )
+                    except Exception:
+                        logger.debug(
+                            "[PENDING PRUNE] terminal mark failed symbol=%s reason=%s",
+                            sym, reason, exc_info=True,
+                        )
                     logger.info(
                         "🧹 pending pruned symbol=%s reason=%s identity=%s entry=%s",
                         sym,
@@ -665,6 +729,13 @@ __all__ = [
 import sys as _ap_sys
 
 import pandas as pd
+
+# 旧 common_entry_day_position_guard_patch._CACHE 相当。
+# symbol -> (monotonicではない wall clock 秒, metrics or None) の TTL キャッシュ。
+# 本文化の際に取り込み漏れており、_cdp_calc_day_metrics() が
+# 必ず NameError で落ちて日中位置ガードが fail-open していた。
+_CDP_CACHE: dict[str, tuple[float, dict[str, Any] | None]] = {}
+_CDP_CACHE_MAX = 4096
 
 def _cdp_env_bool(name: str, default: bool) -> bool:
     try:
@@ -796,19 +867,34 @@ def _cdp_load_symbol_1m_today(symbol: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _cdp_cache_put(symbol: str, now: float, metrics: dict[str, Any] | None) -> None:
+    """TTLキャッシュへ格納する。銘柄数は日中入れ替わるので上限を設ける。"""
+    try:
+        if len(_CDP_CACHE) >= _CDP_CACHE_MAX:
+            ttl = max(0.5, _cdp_env_float("COMMON_ENTRY_DAY_POSITION_CACHE_SEC", 3.0))
+            for k, v in list(_CDP_CACHE.items()):
+                if now - v[0] > ttl:
+                    _CDP_CACHE.pop(k, None)
+            if len(_CDP_CACHE) >= _CDP_CACHE_MAX:
+                _CDP_CACHE.clear()
+    except Exception:
+        pass
+    _CDP_CACHE[symbol] = (now, metrics)
+
+
 def _cdp_calc_day_metrics(symbol: str, price: float) -> dict[str, Any] | None:
     symbol = _cdp_norm_symbol(symbol)
     if not symbol:
         return None
     ttl = max(0.5, _cdp_env_float("COMMON_ENTRY_DAY_POSITION_CACHE_SEC", 3.0))
     now = time.time()
-    cached = _CACHE.get(symbol)
+    cached = _CDP_CACHE.get(symbol)
     if cached and now - cached[0] <= ttl:
         return cached[1]
 
     x = _cdp_load_symbol_1m_today(symbol)
     if x.empty:
-        _CACHE[symbol] = (now, None)
+        _cdp_cache_put(symbol, now, None)
         return None
 
     close_col = _cdp_first_existing(x, ["close", "close_1m", "close_price", "current_price", "price"])
@@ -817,7 +903,7 @@ def _cdp_calc_day_metrics(symbol: str, price: float) -> dict[str, Any] | None:
     low_col = _cdp_first_existing(x, ["low", "low_1m", "low_price"])
     vol_col = _cdp_first_existing(x, ["volume", "volume_1m", "latest_volume", "latest_1m_volume"])
     if close_col is None:
-        _CACHE[symbol] = (now, None)
+        _cdp_cache_put(symbol, now, None)
         return None
 
     close = pd.to_numeric(x[close_col], errors="coerce")
@@ -831,7 +917,7 @@ def _cdp_calc_day_metrics(symbol: str, price: float) -> dict[str, Any] | None:
         px = float(close.dropna().iloc[-1])
     valid_close = close.dropna()
     if px <= 0 or valid_close.empty:
-        _CACHE[symbol] = (now, None)
+        _cdp_cache_put(symbol, now, None)
         return None
 
     day_high = max(float(pd.concat([high_s, close], axis=1).max(axis=1).max()), px)
@@ -864,7 +950,7 @@ def _cdp_calc_day_metrics(symbol: str, price: float) -> dict[str, Any] | None:
         "latest_1m_dt": latest_dt,
         "rows_1m_today": int(len(x)),
     }
-    _CACHE[symbol] = (now, metrics)
+    _cdp_cache_put(symbol, now, metrics)
     return metrics
 
 

@@ -9,6 +9,7 @@ import datetime as dt
 from pathlib import Path
 
 from global_state import global_data
+from sqlite_cm import committing_connect
 
 
 def get_symbols_appeared_within(minutes: int) -> set[str]:
@@ -28,7 +29,7 @@ def get_symbols_appeared_within(minutes: int) -> set[str]:
     """
 
     symbols = set()
-    with sqlite3.connect(db_path) as conn:
+    with committing_connect(db_path) as conn:
         for (sym,) in conn.execute(sql, (since,)):
             symbols.add(str(sym))
 

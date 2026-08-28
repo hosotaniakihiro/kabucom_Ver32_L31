@@ -139,7 +139,10 @@ def wait_fresh_push_summary_stale_failopen(orig, latest_age) -> bool:
     except Exception:
         age, latest, rows = None, None, 0
     max_age = max(30.0, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_MAX_AGE_SEC", 180.0))
-    stale_fail_open = _env_bool("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_STALE", True)
+    # P0-4 stale_fail_open 監査: Entry の最終判断へ波及する経路は fail-close。
+    # owner は fresh_summary_wait.install() が env へ 0 を明示する 1 か所。
+    # ここは install 順に依存しないよう既定も 0 にする。
+    stale_fail_open = _env_bool("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_STALE", False)
     stale_max_age = max(max_age, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_STALE_FAIL_OPEN_MAX_AGE_SEC", 1800.0))
     min_rows = max(1, _env_int("TONOSAMA_WAIT_PUSH_SUMMARY_STALE_FAIL_OPEN_MIN_ROWS", 20))
     if age is not None and age <= max_age:

@@ -420,14 +420,23 @@ def _ai_final_entry_check_core(row: dict) -> dict:
         return _block("direction_mismatch")
 
     ranking_conf = 1.0
+    ranking_ai_used = False
     if is_ranking:
-        try:
-            r = predict_ranking_entry(row)
-            if r.get("action") and r.get("action") != decision:
-                return _block("ranking_ai_mismatch", r.get("confidence"), "RANKING_LGBM")
-            ranking_conf = _safe_float(r.get("confidence"), 1.0)
-        except Exception as e:
-            logger.warning("[RANKING AI SKIP] %s: %s", symbol, e)
+        if _ranking_ai_model_available():
+            try:
+                r = predict_ranking_entry(row)
+                if r.get("action") and r.get("action") != decision:
+                    return _block("ranking_ai_mismatch", r.get("confidence"), "RANKING_LGBM")
+                ranking_conf = _safe_float(r.get("confidence"), 1.0)
+                ranking_ai_used = True
+            except Exception as e:
+                # 例外は握り潰さない。ただし銘柄ごとに毎回出すと
+                # 30 分で 566 行になるので同一理由は抑制する。
+                _log_ranking_ai_skip_once(symbol, e)
+        else:
+            # モデル不在。fail-open で通すが、AI が満点を出したのとは
+            # 区別できるよう model_used に必ず残す。
+            ranking_ai_used = False
 
     mtf_conf = 1.0
     mtf_status, mtf_reason = _summary_mtf_status(row, source=source, interval=interval)
@@ -497,7 +506,7 @@ def _ai_final_entry_check_core(row: dict) -> dict:
         reason=(
             f"rankScore={ranking_score_final:.3f}|"
             f"mtf={mtf_conf:.2f}|"
-            f"rank={ranking_conf:.2f}|"
+            f"rank={ranking_conf:.2f}({'ai' if ranking_ai_used else 'failopen_no_model'})|"
             f"imm={immediate_p:.2f}|"
             f"dom={dominant_ratio:.2f}|"
             f"boost={momentum_boost:.2f}|"
@@ -506,7 +515,11 @@ def _ai_final_entry_check_core(row: dict) -> dict:
             f"src={source}|"
             f"minScore={MIN_SCORE:.2f}"
         ),
-        model_used=("RANKING_LGBM+MTF" if is_ranking else "MTF"),
+        # モデルが動いていないのに RANKING_LGBM と報告しないこと。
+        model_used=(
+            ("RANKING_LGBM+MTF" if ranking_ai_used else "RANKING_AI_ABSENT+MTF")
+            if is_ranking else "MTF"
+        ),
     )
 
 
@@ -539,6 +552,35 @@ def _rank_rescue_env_bool(name: str, default: bool = True) -> bool:
         return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "ok", "enable", "enabled"}
     except Exception:
         return bool(default)
+
+
+_RANKING_AI_SKIP_LOGGED: set = set()
+
+
+def _ranking_ai_model_available() -> bool:
+    try:
+        from AI.inference.ranking_entry_predictor import model_available
+
+        return bool(model_available())
+    except Exception:
+        logger.exception("[RANKING AI] model_available check failed -> treat as absent")
+        return False
+
+
+def _log_ranking_ai_skip_once(symbol, err) -> None:
+    """同じ理由の RANKING AI SKIP は 1 回だけ出す (握り潰しではない)。"""
+    try:
+        key = "%s:%s" % (type(err).__name__, str(err)[:200])
+        if key in _RANKING_AI_SKIP_LOGGED:
+            return
+        _RANKING_AI_SKIP_LOGGED.add(key)
+        logger.error(
+            "[RANKING AI SKIP] ranking AI 推論に失敗したので fail-open で通す "
+            "(以後同じ理由は抑制する) first_symbol=%s err=%s",
+            symbol, err,
+        )
+    except Exception:
+        logger.exception("[RANKING AI SKIP] log failed symbol=%s", symbol)
 
 
 def _rank_rescue_env_float(name: str, default: float) -> float:
@@ -607,15 +649,23 @@ def _ranking_entry_mtf_low_failopen(row: dict, result: dict) -> dict:
             _rank_rescue_env_float("RANKING_ENTRY_MTF_LOW_RESCUE_CONFIDENCE", 0.72),
         )
         lot_multiplier = max(0.5, min(2.0, 0.5 + conf))
+        # この confidence は AI 推論結果ではなく固定の fail-open 値。
+        # 値そのものは変えない (売買条件を勝手に緩めない) が、
+        # AI 出力と誤認されないよう出所を必ず残す。
         rescued = {
             "allow": True,
             "confidence": conf,
             "lot_multiplier": lot_multiplier,
             "reason": f"{reason}|ranking_mtf_low_failopen",
-            "model_used": str(result.get("model_used") or "MTF") + "+RANKING_MTF_RESCUE",
+            "model_used": "FALLBACK_NO_AI:RANKING_MTF_RESCUE(" + str(result.get("model_used") or "MTF") + ")",
+            "ai_inference": False,
+            "confidence_source": "fixed_failopen:RANKING_ENTRY_MTF_LOW_RESCUE_CONFIDENCE",
+            "ai_confidence": None,
         }
         logger.warning(
-            "[RANKING ENTRY RUNTIME RESCUE] mtf_low rescued symbol=%s side=%s conf=%.3f score=%s source=%s",
+            "[RANKING ENTRY RUNTIME RESCUE] mtf_low fail-open symbol=%s side=%s "
+            "confidence=%.3f source=FIXED_FAILOPEN (AI推論結果ではない) "
+            "model=FALLBACK_NO_AI score=%s row_source=%s",
             row.get("symbol"),
             row.get("side") or row.get("entry_decision"),
             conf,

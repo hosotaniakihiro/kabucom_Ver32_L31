@@ -482,31 +482,76 @@ def _patch_tonosama_runner_fast_loop() -> None:
         logger.warning("[TONOSAMA FAST LOOP PATCH] failed", exc_info=True)
 
 
-def _run_callable_with_timeout_thread(fn: Callable[..., Any], *, timeout_sec: float, name: str, args: tuple[Any, ...] = (), kwargs: Optional[dict[str, Any]] = None) -> tuple[bool, Any, Optional[threading.Thread]]:
+def _worker_guard():
+    try:
+        from trading.entry_exit import worker_guard
+        return worker_guard
+    except Exception:
+        logger.exception("[ENTRY WORKER] worker_guard import failed")
+        return None
+
+
+def _run_callable_with_timeout_thread(fn: Callable[..., Any], *, timeout_sec: float, name: str, args: tuple[Any, ...] = (), kwargs: Optional[dict[str, Any]] = None, guard_kind: Optional[str] = None, on_refused: Optional[Callable[[], None]] = None) -> tuple[bool, Any, Optional[threading.Thread]]:
     result: dict[str, Any] = {"done": False, "ret": None, "err": None}
     kwargs = kwargs or {}
+    wg = _worker_guard() if guard_kind else None
+    slot = None
+    if wg is not None and guard_kind:
+        slot = wg.begin(guard_kind, timeout_sec=float(timeout_sec or 1.0))
+        if slot is None:
+            # 前世代がまだ生きている。二重起動しない。
+            # 呼び出し側が握っているロック等はここで解放してもらう
+            # (解放しないと次サイクル以降も永久に起動できなくなる)。
+            logger.warning(
+                "[%s] skipped reason=previous_generation_alive kind=%s "
+                "(二重起動しない。timeout ではない)", name, guard_kind,
+            )
+            wg.log_snapshot("refused:%s" % name)
+            if callable(on_refused):
+                try:
+                    on_refused()
+                except Exception:
+                    logger.exception("[%s] on_refused failed", name)
+            return False, None, None
 
     def _target() -> None:
+        if wg is not None and slot is not None:
+            wg.bind_current(slot)
         try:
             result["ret"] = fn(*args, **kwargs)
             result["done"] = True
         except Exception as e:
             result["err"] = e
             result["done"] = True
+        finally:
+            if wg is not None and slot is not None:
+                wg.finish(slot, "worker_returned")
 
     th = threading.Thread(target=_target, daemon=True, name=f"entry-timeout-{name}")
+    if wg is not None and slot is not None:
+        wg.attach_thread(slot, th)
     th.start()
     th.join(max(0.1, float(timeout_sec or 0.1)))
     if th.is_alive():
-        logger.warning("[%s] timeout -> return to scheduler timeout_sec=%.3f thread_alive=True", name, timeout_sec)
+        if wg is not None and slot is not None:
+            # deadline を過ぎたので worker 自身に止まってもらう (協調キャンセル)
+            slot.cancel.set()
+        logger.warning(
+            "[%s] timeout -> return to scheduler timeout_sec=%.3f thread_alive=True "
+            "generation=%s thread=%s cancel_requested=%s",
+            name, timeout_sec,
+            getattr(slot, "generation", None), th.name, bool(slot is not None),
+        )
+        if wg is not None:
+            wg.log_snapshot("after_timeout:%s" % name)
         return False, None, th
     if result.get("err") is not None:
         raise result["err"]
     return True, result.get("ret"), None
 
 
-def _run_callable_with_timeout(fn: Callable[..., Any], *, timeout_sec: float, name: str, args: tuple[Any, ...] = (), kwargs: Optional[dict[str, Any]] = None) -> tuple[bool, Any]:
-    completed, ret, _th = _run_callable_with_timeout_thread(fn, timeout_sec=timeout_sec, name=name, args=args, kwargs=kwargs)
+def _run_callable_with_timeout(fn: Callable[..., Any], *, timeout_sec: float, name: str, args: tuple[Any, ...] = (), kwargs: Optional[dict[str, Any]] = None, guard_kind: Optional[str] = None, on_refused: Optional[Callable[[], None]] = None) -> tuple[bool, Any]:
+    completed, ret, _th = _run_callable_with_timeout_thread(fn, timeout_sec=timeout_sec, name=name, args=args, kwargs=kwargs, guard_kind=guard_kind, on_refused=on_refused)
     return completed, ret
 
 
@@ -519,9 +564,24 @@ def _dispatch_entry_controller(*, pipeline_source: str, interval: int | None, ti
     if interval is not None:
         kwargs["interval"] = interval
     logger.info("[%s] dispatch entry_controller pipeline_source=%s interval=%s timeout_sec=%.3f", reason, pipeline_source, interval, timeout_sec)
-    completed, _ret = _run_callable_with_timeout(controller_fn, timeout_sec=timeout_sec, name=f"{reason} CONTROLLER", kwargs=kwargs)
+    _ctl_kind = "ENTRY_CONTROLLER:%s" % (str(pipeline_source or "UNKNOWN").upper(),)
+    completed, _ret = _run_callable_with_timeout(
+        controller_fn, timeout_sec=timeout_sec, name=f"{reason} CONTROLLER",
+        kwargs=kwargs, guard_kind=_ctl_kind,
+    )
     if not completed:
-        logger.warning("[%s] controller timeout pipeline_source=%s interval=%s timeout_sec=%.3f", reason, pipeline_source, interval, timeout_sec)
+        _wg = _worker_guard()
+        _active = None
+        if _wg is not None:
+            try:
+                _active = [s for s in _wg.snapshot() if s.get("kind") == _ctl_kind]
+            except Exception:
+                logger.debug("[%s] controller snapshot failed", reason, exc_info=True)
+        logger.warning(
+            "[%s] controller timeout pipeline_source=%s interval=%s timeout_sec=%.3f "
+            "cancel requested (cooperative) active=%s",
+            reason, pipeline_source, interval, timeout_sec, _active,
+        )
         return False
     logger.info("[%s] controller done pipeline_source=%s interval=%s", reason, pipeline_source, interval)
     return True
@@ -599,7 +659,9 @@ def _wait_fresh_push_summary_before_tonosama_core() -> bool:
     max_age = max(30.0, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_MAX_AGE_SEC", 180.0))
     wait_sec = max(0.0, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_WAIT_SEC", 15.0))
     poll = max(0.25, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_POLL_SEC", 1.0))
-    fail_open_empty = _env_bool("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY", True)
+    # 追加P0-1: fresh summary 無しで Tonosama body を呼ばない (fail-close)。
+    # 既定は fresh_summary_wait.install() 側の owner と揃えて 0。
+    fail_open_empty = _env_bool("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY", False)
     deadline = time.perf_counter() + wait_sec
     last_age = None
     last_dt = None
@@ -787,7 +849,17 @@ def _run_tonosama_entry_safe() -> int:
             return 0
         before_pending = _pending_count_for_source("TONOSAMA")
         logger.info("[TONOSAMA ENTRY SCHEDULE] fire timeout_sec=%.3f before_pending=%s", TONOSAMA_ENTRY_TIMEOUT_SEC, before_pending)
-        completed, ret, timeout_thread = _run_callable_with_timeout_thread(fn, timeout_sec=TONOSAMA_ENTRY_TIMEOUT_SEC, name="TONOSAMA ENTRY SCHEDULE")
+        def _tonosama_release_on_refused() -> None:
+            global _TONOSAMA_ENTRY_RUNNING, _TONOSAMA_ENTRY_STARTED_AT
+            with _TONOSAMA_ENTRY_LOCK:
+                _TONOSAMA_ENTRY_RUNNING = False
+                _TONOSAMA_ENTRY_STARTED_AT = None
+
+        completed, ret, timeout_thread = _run_callable_with_timeout_thread(
+            fn, timeout_sec=TONOSAMA_ENTRY_TIMEOUT_SEC,
+            name="TONOSAMA ENTRY SCHEDULE", guard_kind="TONOSAMA_ENTRY",
+            on_refused=_tonosama_release_on_refused,
+        )
         after_pending = _pending_count_for_source("TONOSAMA")
         if not completed:
             with _TONOSAMA_ENTRY_LOCK:
@@ -833,6 +905,22 @@ def _ranking_entry_cooldown_seconds() -> float:
         return 90.0
 
 
+def _entry_worker_should_stop(label: str) -> bool:
+    """この worker が timeout/cancel されたかを自分で確認する (P0-3)。
+
+    Thread を外から kill する設計をやめ、各フェーズがこれを見て return する。
+    worker_guard が使えない環境では常に False (従来動作)。
+    """
+    wg = _worker_guard()
+    if wg is None:
+        return False
+    try:
+        return bool(wg.check(label=label))
+    except Exception:
+        logger.debug("[ENTRY WORKER] should_stop check failed label=%s", label, exc_info=True)
+        return False
+
+
 def _run_ranking_entry_safe_body(seq: int) -> int:
     """実際のビルド〜controller dispatchロジック本体。
 
@@ -861,6 +949,10 @@ def _run_ranking_entry_safe_body(seq: int) -> int:
     try:
         logger.info("[RANKING ENTRY SCHEDULE] fire at=%s seq=%s", started_dt.strftime("%Y-%m-%d %H:%M:%S"), seq)
 
+        if _entry_worker_should_stop("ranking_loop_start"):
+            logger.warning("[RANKING ENTRY SCHEDULE] cooperative stop at loop start seq=%s", seq)
+            return 0
+
         before_pending = _pending_count_for_source("RANKING")
         if before_pending > 0:
             pruned = _mark_and_prune_stuck_ranking_pending()
@@ -876,11 +968,21 @@ def _run_ranking_entry_safe_body(seq: int) -> int:
                 logger.warning("[RANKING ENTRY SCHEDULE] build skipped because pending remains count=%s", _pending_count_for_source("RANKING"))
                 return 0
 
+        # P0-3: 外側が timeout/cancel されていたら、重い build に入る前に降りる。
+        if _entry_worker_should_stop("ranking_before_build"):
+            logger.warning("[RANKING ENTRY SCHEDULE] cooperative stop before build seq=%s elapsed=%.3fs", seq, time.perf_counter() - started)
+            return 0
+
         build_fn = _resolve_callable("trading.ranking.entry_from_ranking", "run_ranking_entry_pipeline")
         if not callable(build_fn):
             logger.warning("[RANKING ENTRY SCHEDULE] skipped reason=ranking_entry_pipeline_unavailable")
             return 0
-        completed, created_ret = _run_callable_with_timeout(build_fn, timeout_sec=RANKING_ENTRY_BUILD_TIMEOUT_SEC, name="RANKING ENTRY BUILD")
+        # guard_kind を付けて build スレッドも世代管理下に置く。
+        # ここが guard 無しだと、外側を cancel しても build だけが走り続ける。
+        completed, created_ret = _run_callable_with_timeout(
+            build_fn, timeout_sec=RANKING_ENTRY_BUILD_TIMEOUT_SEC,
+            name="RANKING ENTRY BUILD", guard_kind="RANKING_ENTRY_BUILD",
+        )
         after_pending = _pending_count_for_source("RANKING")
         if not completed:
             created_by_pending = max(0, after_pending - before_pending)
@@ -904,6 +1006,10 @@ def _run_ranking_entry_safe_body(seq: int) -> int:
             _RANKING_ENTRY_COOLDOWN_UNTIL = None
         created = int(created_ret or 0)
         logger.info("[RANKING ENTRY SCHEDULE] pending build done created=%s before_pending=%s after_pending=%s", created, before_pending, after_pending)
+        # ここから先は発注に直結するので、止めるのは「まだ何も作れていない」ときだけ。
+        if created <= 0 and after_pending <= 0 and _entry_worker_should_stop("ranking_after_build"):
+            logger.warning("[RANKING ENTRY SCHEDULE] cooperative stop after build seq=%s (no pending to dispatch)", seq)
+            return 0
         if created > 0 or after_pending > before_pending or after_pending > 0:
             if created <= 0 and after_pending > 0:
                 logger.warning("[RANKING ENTRY SCHEDULE] dispatch existing ranking pending created=0 count=%s symbols=%s", after_pending, _pending_symbols_for_source("RANKING"))
@@ -978,12 +1084,40 @@ def _run_ranking_entry_safe() -> int:
             except RuntimeError:
                 pass
 
-    completed, ret = _run_callable_with_timeout(_inner, timeout_sec=RANKING_ENTRY_HARD_TIMEOUT_SEC, name="RANKING ENTRY HARD TIMEOUT")
+    def _release_on_refused() -> None:
+        """起動を拒否されたときは _inner が走らないので、ここで後始末する。"""
+        global _RANKING_ENTRY_RUN_STARTED_AT
+        _RANKING_ENTRY_RUN_STARTED_AT = 0.0
+        try:
+            _RANKING_ENTRY_RUN_LOCK.release()
+        except RuntimeError:
+            pass
+
+    completed, ret = _run_callable_with_timeout(
+        _inner, timeout_sec=RANKING_ENTRY_HARD_TIMEOUT_SEC,
+        name="RANKING ENTRY HARD TIMEOUT", guard_kind="RANKING_ENTRY",
+        on_refused=_release_on_refused,
+    )
     if not completed:
+        # P0-3: daemon worker を放置しない。
+        # _run_callable_with_timeout_thread 側で既に slot.cancel を立てている。
+        # 次の世代は worker_guard.begin() が前世代の生存中は起動を拒否するので、
+        # 同種の Entry worker が 2 本走ることはない。
+        _wg = _worker_guard()
+        alive = None
+        if _wg is not None:
+            try:
+                _wg.log_snapshot("RANKING ENTRY HARD TIMEOUT")
+                alive = [s for s in _wg.snapshot() if s.get("kind") == "RANKING_ENTRY"]
+            except Exception:
+                logger.debug("[RANKING ENTRY SCHEDULE] worker snapshot failed", exc_info=True)
         logger.warning(
-            "[RANKING ENTRY SCHEDULE] hard timeout seq=%s timeout_sec=%.1fs; return 0 to release scheduler slot, worker continues in daemon thread",
+            "[RANKING ENTRY SCHEDULE] hard timeout seq=%s timeout_sec=%.1fs; "
+            "cancel requested to worker (cooperative), scheduler slot released. "
+            "next generation is refused while this one is alive. active=%s",
             seq,
             RANKING_ENTRY_HARD_TIMEOUT_SEC,
+            alive,
         )
         try:
             _mark_and_prune_stuck_ranking_pending(reason="RANKING_ENTRY_HARD_TIMEOUT")
@@ -1038,7 +1172,7 @@ def register_entry_exit_tasks(*args: Any, **kwargs: Any) -> bool:
             interval_sec, _TAG_TONOSAMA_ENTRY, TONOSAMA_ENTRY_TIMEOUT_SEC, TONOSAMA_ENTRY_CONTROLLER_TIMEOUT_SEC,
             TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_SEC, TONOSAMA_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC,
             _env_bool("TONOSAMA_WAIT_FRESH_PUSH_SUMMARY", True),
-            _env_bool("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY", True),
+            _env_bool("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY", False),
             _env_bool("TONOSAMA_DISPATCH_CONTROLLER_ON_TIMEOUT_PENDING", False),
             ranking_interval_min, _TAG_RANKING_ENTRY, RANKING_ENTRY_BUILD_TIMEOUT_SEC, RANKING_ENTRY_CONTROLLER_TIMEOUT_SEC,
             RANKING_ENTRY_TIMEOUT_COOLDOWN_SEC, RANKING_ENTRY_TIMEOUT_COOLDOWN_MAX_SEC,

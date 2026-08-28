@@ -27,6 +27,7 @@ import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +96,7 @@ ROTATION_MIN_SURVIVOR_COUNT = _env_int("PUSH_REGISTER_LIQUIDITY_ROTATION_MIN_SUR
 ROTATION_MIN_SURVIVOR_RATIO = _env_float("PUSH_REGISTER_LIQUIDITY_ROTATION_MIN_SURVIVOR_RATIO", 0.50)
 ROTATION_PRESERVE_FULL_POOL = _env_bool("PUSH_REGISTER_LIQUIDITY_ROTATION_PRESERVE_FULL_POOL", False)
 
-DEFAULT_ROOT = r"\\192.168.0.22\AutoStockBuyAndSell"
+DEFAULT_ROOT = nas_root()
 
 _SYMBOL_COL_CANDIDATES = (
     "symbol",

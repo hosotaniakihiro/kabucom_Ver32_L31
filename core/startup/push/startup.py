@@ -305,9 +305,72 @@ def start_push_stream_memory_only_safe() -> bool:
         return False
 
 
+def start_push_price_db_feed_safe() -> bool:
+    """main.py 用。
+
+    PUSH WebSocket は push_receiver_runner.py に任せ、
+    main.py は push_receiver が書いた PUSH DB から latest_price_cache を供給する。
+
+    kabu Station の PUSH は 1 セッション 1 接続しか許容せず、
+    main.py が別途接続すると push_receiver と互いを切断し合って
+    再接続ループになる (2026-08-25 実測)。
+    """
+    logger.warning(
+        "\U0001F4E1 push stream websocket skipped in main process because "
+        "push_receiver_runner.py owns the kabu Station PUSH connection "
+        "(only one PUSH websocket is allowed per session)."
+    )
+
+    ok = False
+    try:
+        from trading.push.latest_price_db_feeder import start_latest_price_db_feeder
+
+        ok = bool(start_latest_price_db_feeder())
+    except Exception:
+        logger.exception("\u274C latest price db feeder start failed")
+        ok = False
+
+    try:
+        global_data.push_stream_running = False
+        global_data.push_stream_memory_only = False
+        global_data.push_stream_skipped_external = True
+        global_data.push_writer_running = False
+        global_data.push_storage_running = False
+        global_data.latest_price_db_feed_running = bool(ok)
+    except Exception:
+        pass
+
+    if not ok:
+        # 黙って握りつぶさない。ここが落ちると main の最新値供給が無くなる。
+        logger.error(
+            "\u274C latest_price_cache has no source in main process: "
+            "push websocket skipped and db feeder not running"
+        )
+    else:
+        logger.warning(
+            "\u2705 latest price db feed started "
+            "(source of latest_price_cache in main process)"
+        )
+
+    return bool(ok)
+
+
 def start_push_stream_runner_safe() -> bool:
-    if _external_data_collectors_mode() and _env_bool("MAIN_PUSH_WS_MEMORY_ONLY", True):
-        return start_push_stream_memory_only_safe()
+    if _external_data_collectors_mode():
+        # kabu Station の PUSH WebSocket は 1 セッション 1 接続しか許容しない。
+        # main.py と push_receiver_runner.py が両方つなぐと互いを切断し合い、
+        # 再接続ループになる (2026-08-25 実測: main.py 側だけで 13 分に 190 回)。
+        # 所有者は push_receiver_runner.py に一本化する。
+        if not _env_bool("MAIN_PUSH_WS_OWN_CONNECTION", False):
+            return start_push_price_db_feed_safe()
+
+        logger.warning(
+            "\u26A0 MAIN_PUSH_WS_OWN_CONNECTION=1: main process opens its own PUSH websocket. "
+            "kabu Station allows only one PUSH connection, so this will fight "
+            "push_receiver_runner.py and cause a reconnect loop."
+        )
+        if _env_bool("MAIN_PUSH_WS_MEMORY_ONLY", True):
+            return start_push_stream_memory_only_safe()
 
     fn = resolve_push_stream_start_callable()
 

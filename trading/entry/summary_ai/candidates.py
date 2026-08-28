@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 from typing import Any, Optional
 
 import pandas as pd
@@ -816,18 +817,82 @@ def _filter_fresh_candidate_rows(df: pd.DataFrame) -> pd.DataFrame:
         return out.reset_index(drop=True)
 
 
+def _keep_latest_slot_per_symbol(df: pd.DataFrame) -> pd.DataFrame:
+    """銘柄ごとの最新 datetime の行だけ残す (同着は全部残す)。
+
+    AI へ渡すのは銘柄あたり 1 行なので、履歴全体に重い列生成をかける
+    必要が無い。実測で 55,131 行 -> 数千行になり 75〜92 秒が消える。
+    同一 datetime の行は残すので、dedupe_one_row_per_symbol の
+    _ai_quality によるタイブレーク結果は変わらない。
+    """
+    out = safe_df(df)
+    if out.empty or "symbol" not in out.columns or "datetime" not in out.columns:
+        return out
+    if not _env_bool("SUMMARY_AI_CANDIDATE_LATEST_ONLY", True):
+        return out
+    before = len(out)
+    t0 = time.perf_counter()
+    try:
+        ts = pd.to_datetime(out["datetime"], errors="coerce")
+        try:
+            ts = ts.dt.tz_localize(None)
+        except Exception:
+            pass
+        work = out.copy()
+        work["_slot_dt"] = ts
+        valid = work[work["_slot_dt"].notna()]
+        if valid.empty:
+            logger.warning(
+                "[SUMMARY AI CANDIDATES] latest-slot trim skipped reason=datetime全欠損 rows=%s", before,
+            )
+            return out
+        mx = valid.groupby("symbol")["_slot_dt"].transform("max")
+        kept = valid[valid["_slot_dt"] == mx].drop(columns=["_slot_dt"])
+        # datetime が欠損している行は判定できないので落とさず残す
+        na_rows = work[work["_slot_dt"].isna()].drop(columns=["_slot_dt"])
+        if not na_rows.empty:
+            kept = pd.concat([kept, na_rows], ignore_index=True, sort=False)
+        kept = kept.reset_index(drop=True)
+    except Exception:
+        logger.exception("[SUMMARY AI CANDIDATES] latest-slot trim failed rows=%s -> 元のまま使う", before)
+        return out
+    logger.warning(
+        "[SUMMARY AI CANDIDATES] latest-slot trim rows=%s->%s symbols=%s elapsed=%.2fs",
+        before, len(kept),
+        int(kept["symbol"].nunique()) if "symbol" in kept.columns else 0,
+        time.perf_counter() - t0,
+    )
+    return kept
+
+
 def _prepare_base(summary_df: pd.DataFrame, *, require_buy_target: bool, exclude_etf_fund: bool) -> pd.DataFrame:
-    df = attach_display_like_columns(summary_df)
+    t_all = time.perf_counter()
+    n_in = len(safe_df(summary_df))
+    # 重い列生成の前に「銘柄ごとの最新足」まで絞る
+    df = _keep_latest_slot_per_symbol(summary_df)
+    t0 = time.perf_counter()
+    df = attach_display_like_columns(df)
+    t_disp = time.perf_counter() - t0
     if df.empty:
         return df
     df = filter_common_stock_rows(df, require_buy_target=require_buy_target, exclude_etf_fund=exclude_etf_fund)
+    if df.empty:
+        return df
+    # 先に銘柄あたり 1 行へ畳んでから鮮度を見る。
+    # 逆順だと「履歴の古い行が多いので全部落ちる」という誤判定になる。
+    df = dedupe_one_row_per_symbol(df)
     if df.empty:
         return df
     df = _filter_fresh_candidate_rows(df)
     if df.empty:
         logger.warning("[SUMMARY AI CANDIDATES] no fresh rows after freshness filter")
         return df
-    return dedupe_one_row_per_symbol(df)
+    logger.warning(
+        "[SUMMARY AI CANDIDATES] prepare_base done in_rows=%s out_rows=%s "
+        "attach_display=%.2fs total=%.2fs",
+        n_in, len(df), t_disp, time.perf_counter() - t_all,
+    )
+    return df
 
 
 def _buy_candidates_from_prepared(df: pd.DataFrame, *, interval: int | str, top_n: int, min_buy_score: float, max_sell_score: float, min_volume: float, min_price: float, source: str) -> pd.DataFrame:

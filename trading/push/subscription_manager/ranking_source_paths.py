@@ -16,6 +16,7 @@ import datetime as dt
 import logging
 import os
 from typing import List, Optional, Tuple
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -23,17 +24,16 @@ logger = logging.getLogger(__name__)
 REGISTER_MAX_SYMBOLS = 100
 
 RANKING_DB_BASE_DIRS = [
-    r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\ranking",
-    r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\Ranking",
+    nas_path(r"raw_data\kabu_station\ranking"),
+    nas_path(r"raw_data\kabu_station\Ranking"),
 ]
 
 SBI_PREMARKET_DIR = (
-    r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\SBI\SBI_yorimae_ranking"
+    nas_path(r"raw_data\SBI\SBI_yorimae_ranking")
 )
 
-SUBSCRIPTION_HISTORY_DB = (
-    r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\ranking"
-    r"\push_subscription_symbols_history.db"
+SUBSCRIPTION_HISTORY_DB = nas_path(
+    r"raw_data\kabu_station\ranking\push_subscription_symbols_history.db"
 )
 
 MARKET_OPEN = dt.time(9, 0)

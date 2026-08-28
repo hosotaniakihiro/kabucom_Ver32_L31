@@ -29,6 +29,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Iterable, List, Sequence
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +94,7 @@ def _wrl_today() -> str:
 def _wrl_summary_db_path() -> str:
     base = os.getenv(
         "SUMMARY_DB_DIR",
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary",
+        nas_path(r"raw_data\kabu_station\summary"),
     )
     return os.getenv("SUMMARY_DB_PATH", str(Path(base) / f"summary{_wrl_today()}.db"))
 
@@ -147,7 +149,7 @@ def _wrl_recent_stats(symbol: str) -> dict[str, Any]:
         return {}
 
     try:
-        with sqlite3.connect(path, timeout=1.0) as conn:
+        with committing_connect(path, timeout=1.0) as conn:
             conn.execute("PRAGMA busy_timeout=1000")
             sym_col = _wrl_col(conn, table, ["symbol", "code", "stock_code"])
             tm_col = _wrl_col(conn, table, ["datetime", "dt", "timestamp", "time"])
@@ -426,7 +428,7 @@ def _wbk_read_bulk_stats_sync(mod: Any, missing: List[str], symbols_total: int) 
     t0 = time.monotonic()
     deadline = t0 + max(0.2, _wbk_env_float("WATCHLIST_RECENT_LIQ_BULK_SQL_HARD_TIMEOUT_SEC", 2.0))
 
-    with sqlite3.connect(path, timeout=0.25) as conn:
+    with committing_connect(path, timeout=0.25) as conn:
         conn.execute("PRAGMA busy_timeout=250")
 
         def _progress_handler() -> int:

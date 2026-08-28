@@ -234,7 +234,7 @@ def _load_daily_watchlist_symbols(limit: int = 200) -> List[str]:
         return []
 
     try:
-        with sqlite3.connect(str(db_path), timeout=3.0) as con:
+        with committing_connect(str(db_path), timeout=3.0) as con:
             cur = con.cursor()
             try:
                 row = cur.execute("SELECT MAX(date) FROM daily_watchlist").fetchone()
@@ -1045,6 +1045,7 @@ def debug_active_symbols() -> dict:
 # ============================================================
 
 from trading.ranking.active_symbols.recent_liquidity import filter_symbols as _wrl_filter
+from sqlite_cm import committing_connect
 
 
 def _update_active_symbols_wrl(force: bool = False) -> List[str]:

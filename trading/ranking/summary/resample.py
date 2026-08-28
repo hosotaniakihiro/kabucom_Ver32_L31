@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import time as _time
 from typing import Iterable, Optional, Any
 
 import numpy as np
@@ -595,12 +596,22 @@ def build_ranking_summary_base_df(
         yp = default_yahoo_db_path(d)
         yahoo_db_path = yp if path_exists(yp) else None
 
+    _bd_t0 = _time.perf_counter()
+    _bd_stages = []
+
+    def _bd_mark(name: str, since: float) -> float:
+        el = _time.perf_counter() - since
+        _bd_stages.append((name, el))
+        return _time.perf_counter()
+
+    _bd_t = _bd_t0
     one = load_ranking_snapshot_1min(
         trade_date=d,
         lookback_minutes=lookback_minutes,
         symbols=symbols,
         ranking_db_path=ranking_db_path,
     )
+    _bd_t = _bd_mark("load", _bd_t)
 
     if one is None or one.empty:
         logger.warning(
@@ -636,12 +647,14 @@ def build_ranking_summary_base_df(
         return pd.DataFrame()
 
     # Yahoo補完
+    _bd_t = _time.perf_counter()
     one = apply_yahoo_fill(
         one,
         yahoo_db_path=yahoo_db_path,
         symbols=symbols,
         use_yahoo_fill=use_yahoo_fill,
     )
+    _bd_t = _bd_mark("yahoo_fill", _bd_t)
 
     if one is None or one.empty:
         logger.warning(
@@ -650,7 +663,9 @@ def build_ranking_summary_base_df(
         )
         return pd.DataFrame()
 
+    _bd_t = _time.perf_counter()
     one = _ensure_push_compatible_price_columns(one)
+    _bd_t = _bd_mark("price_cols", _bd_t)
 
     one = one.dropna(subset=["symbol", "datetime", "close"])
     one = one[one["symbol"] != ""]
@@ -663,13 +678,25 @@ def build_ranking_summary_base_df(
         return pd.DataFrame()
 
     # 同一 symbol/datetime を1行に集約
+    _bd_t = _time.perf_counter()
     one = _dedupe_1min_symbol_datetime(one)
+    _bd_t = _bd_mark("dedupe", _bd_t)
 
     # 1分出来高を作る
     one = _ensure_volume_1min(one)
+    _bd_t = _bd_mark("volume", _bd_t)
 
     # 1分の土台列
     one = _ensure_summary_base_columns(one, interval=1)
+    _bd_t = _bd_mark("base_cols", _bd_t)
+
+    _bd_total = _time.perf_counter() - _bd_t0
+    _bd_log = logger.warning if _bd_total >= 5.0 else logger.info
+    _bd_log(
+        "[RANKING SUMMARY BASE STAGE] interval=%s rows=%s total=%.3fs %s",
+        interval, len(one) if one is not None else -1, _bd_total,
+        " ".join("%s=%.3fs" % (n, e) for n, e in _bd_stages),
+    )
 
     # 1分はここで返す
     if interval == 1:

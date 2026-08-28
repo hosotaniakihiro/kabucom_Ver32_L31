@@ -758,6 +758,30 @@ def _enrich(df: Any, *, interval: int | None = None, context: str = "runtime") -
         return _repair_score_aliases(fallback, interval=interval, context=context)
 
 
+def _log_probe_enrich_enabled() -> bool:
+    """ログ専用 probe で enrich を通すか (既定 False)。"""
+    try:
+        v = os.getenv("SUMMARY_LOG_PROBE_ENRICH")
+        if v is None or str(v).strip() == "":
+            return False
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        return False
+
+
+def _enrich_for_log(df: Any, *, interval: int | None = None, context: str = "log") -> Any:
+    """ログを出すためだけの enrich。既定では enrich せず素の df を返す。
+
+    _enrich() は ranking DB (NAS) を読む。TTL 30 秒に対し読みが
+    数十秒〜100 秒超になる時間帯があり、ログ 1 行のために毎分の
+    Summary を止めていた (2026-08-26 実測)。
+    戻り値はログ関数にしか渡らないので、既定では素通しにする。
+    """
+    if _log_probe_enrich_enabled():
+        return _enrich(df, interval=interval, context=context)
+    return df
+
+
 def _call_global_setter(name: str, interval: int, df: pd.DataFrame) -> None:
     try:
         fn = getattr(global_data, name, None)
@@ -880,13 +904,13 @@ class SummaryController:
                     df_hist = normalize_summary_df(df_hist)
                     df_hist = _ensure_reason_and_ai_columns(df_hist, interval, "after-indicator-history")
                     log_df_state("after-indicator-history", interval, df_hist)
-                    log_scoring_probe("after-indicator-history", interval, _enrich(df_hist, interval=interval, context="log-after-indicator-history"))
+                    log_scoring_probe("after-indicator-history", interval, _enrich_for_log(df_hist, interval=interval, context="log-after-indicator-history"))
                     from trading.scoring.core.scoring_pipeline import run_scoring_pipeline
                     df_hist = run_scoring_pipeline(df_hist, interval=f"{interval}min")
                     df_hist = normalize_summary_df(df_hist)
                     df_hist = _ensure_reason_and_ai_columns(df_hist, interval, "after-scoring-history")
                     log_df_state("after-scoring-history", interval, df_hist)
-                    log_scoring_probe("after-scoring-history", interval, _enrich(df_hist, interval=interval, context="log-after-scoring-history"))
+                    log_scoring_probe("after-scoring-history", interval, _enrich_for_log(df_hist, interval=interval, context="log-after-scoring-history"))
                 except Exception:
                     logger.exception("[summary_controller] indicator/scoring failed interval=%s", interval)
                     try:
@@ -911,7 +935,7 @@ class SummaryController:
                     df_latest = rebuild_technical_ready(df_latest)
                     df_latest = _ensure_reason_and_ai_columns(df_latest, interval, "after-latest-projection")
                     log_df_state("after-latest-projection", interval, df_latest)
-                    log_scoring_probe("after-latest-projection", interval, _enrich(df_latest, interval=interval, context="log-after-latest-projection"))
+                    log_scoring_probe("after-latest-projection", interval, _enrich_for_log(df_latest, interval=interval, context="log-after-latest-projection"))
                 except Exception:
                     logger.exception("[summary_controller] latest projection failed interval=%s", interval)
                     df_latest = latest_row_per_symbol(base_df, normalize_summary_df)
@@ -962,7 +986,7 @@ class SummaryController:
                             logger.exception("[summary_controller] save failed interval=%s", interval)
                     except Exception:
                         logger.exception("[summary_controller] save failed interval=%s", interval)
-                log_scoring_probe("before-cache-sync", interval, _enrich(df_latest, interval=interval, context="log-before-cache-sync"))
+                log_scoring_probe("before-cache-sync", interval, _enrich_for_log(df_latest, interval=interval, context="log-before-cache-sync"))
                 try:
                     safe_global_set_history(interval, hist_payload)
                     safe_global_set_latest(interval, _enrich(df_latest.copy(), interval=interval, context="cache-latest"))

@@ -7,7 +7,7 @@
 #     日足 MA-MTF 用データを読み込む
 #
 # Source DB:
-#   \\192.168.0.22\kabu\stock_data\daily_db\stock_analysis.db
+#   \\192.168.0.22\AutoStockBuyAndSell\daily_db\stock_analysis.db
 #
 # Source table:
 #   stock_analysis_latest
@@ -36,13 +36,33 @@ from typing import Any, Dict
 
 import numpy as np
 import pandas as pd
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_DAILY_MTF_DB_PATH = (
-    r"\\192.168.0.22\kabu\stock_data\daily_db\stock_analysis.db"
+# 日足DB は夜間バッチ NightYahooDailyFullSummary が
+#   \\192.168.0.22\AutoStockBuyAndSell\daily_db\stock_analysis.db
+# へ書いている。以前ここは \\192.168.0.22\kabu\stock_data\daily_db\ を
+# 指しており、そちらは 2026-07-17 以降更新されていなかったため
+# [DAILY MTF BLOCKED] age_days=40 が解消しなかった (2026-08-25 実測)。
+# DAILY_MTF_DB_PATH で上書きできる。
+_DEFAULT_DAILY_MTF_DB_PATH_FALLBACK = (
+    nas_path(r"daily_db\stock_analysis.db")
 )
+
+
+def _resolve_default_daily_mtf_db_path() -> str:
+    try:
+        v = os.getenv("DAILY_MTF_DB_PATH")
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    except Exception:
+        pass
+    return _DEFAULT_DAILY_MTF_DB_PATH_FALLBACK
+
+
+DEFAULT_DAILY_MTF_DB_PATH = _resolve_default_daily_mtf_db_path()
 
 DEFAULT_DAILY_MTF_TABLE = "stock_analysis_latest"
 
@@ -323,9 +343,32 @@ def load_daily_mtf_latest_df(
         table_name,
     )
 
-    _warn_if_stale(latest_date, db_path)
+    stale_days = _warn_if_stale(latest_date, db_path)
+
+    # 古い日足をそのまま売買判定へ流さない (fail-closed)。
+    # 従来は警告を出しながら attach しており、40日前の値で
+    # score_mtf / daily_buy / daily_sell が付いていた。
+    if stale_days is not None and not _allow_stale_daily():
+        logger.error(
+            "[DAILY MTF BLOCKED] stale daily data is NOT used for entry scoring "
+            "latest_date=%s age_days=%s limit=%s rows=%s db=%s "
+            "(set DAILY_MTF_ALLOW_STALE=1 to override; fix NightYahooDailyFullSummary)",
+            latest_date, stale_days, _stale_days_threshold(), len(out), db_path,
+        )
+        return out.iloc[0:0].copy()
 
     return out
+
+
+def _allow_stale_daily() -> bool:
+    """古い日足でも従来どおり使うか (既定 False = 使わない)。"""
+    try:
+        v = os.getenv("DAILY_MTF_ALLOW_STALE")
+        if v is None or str(v).strip() == "":
+            return False
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        return False
 
 
 def _stale_days_threshold() -> int:
@@ -335,7 +378,7 @@ def _stale_days_threshold() -> int:
         return 4
 
 
-def _warn_if_stale(latest_date: Any, db_path: str) -> None:
+def _warn_if_stale(latest_date: Any, db_path: str):
     """日足が古いまま判定に使われていないか監視する。
 
     2026-08-18 に、日足DB が 2026-07-17 を最後に更新されておらず
@@ -350,12 +393,12 @@ def _warn_if_stale(latest_date: Any, db_path: str) -> None:
     try:
         if latest_date is None:
             logger.warning("[DAILY MTF LOADER] latest_date unknown db=%s", db_path)
-            return
+            return None
 
         d = pd.to_datetime(latest_date, errors="coerce")
         if pd.isna(d):
             logger.warning("[DAILY MTF LOADER] latest_date unparsable value=%r db=%s", latest_date, db_path)
-            return
+            return None
 
         age_days = (pd.Timestamp.now().normalize() - d.normalize()).days
         limit = _stale_days_threshold()
@@ -366,8 +409,11 @@ def _warn_if_stale(latest_date: Any, db_path: str) -> None:
                 "hint=夜間バッチ (NightYahooDailyFullSummary) が動いているか確認してください",
                 age_days, d.date(), age_days, limit, db_path,
             )
+            return int(age_days)
+        return None
     except Exception:
         logger.debug("[DAILY MTF LOADER] stale check failed", exc_info=True)
+        return None
 
 
 def load_daily_mtf_latest_map(

@@ -54,6 +54,7 @@ from database.migrate.ensure_summary_indexes import (
     ensure_summary_snapshot_indexes,
 )
 from database import session as db_session_module
+from sqlite_cm import committing_connect
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +138,7 @@ def _sqlite_table_exists(db_path: Path, table_name: str) -> bool:
         return False
     try:
         logger.info("[DBBOOT][sqlite_table_exists] open start path=%s table=%s", db_path, table_name)
-        with sqlite3.connect(str(db_path), timeout=10) as conn:
+        with committing_connect(str(db_path), timeout=10) as conn:
             cur = conn.cursor()
             cur.execute(
                 """
@@ -163,7 +164,7 @@ def _db_has_summary_data(db_path: Path) -> bool:
         return False
     try:
         logger.info("[DBBOOT][summary_data] connect start path=%s", db_path)
-        with sqlite3.connect(str(db_path), timeout=10) as conn:
+        with committing_connect(str(db_path), timeout=10) as conn:
             cur = conn.cursor()
             cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='stock_summary_1min'")
             if cur.fetchone() is None:
@@ -189,7 +190,7 @@ def _db_has_ranking_data(db_path: Path) -> bool:
         return False
     try:
         logger.info("[DBBOOT][ranking_data] connect start path=%s", db_path)
-        with sqlite3.connect(str(db_path), timeout=10) as conn:
+        with committing_connect(str(db_path), timeout=10) as conn:
             cur = conn.cursor()
             cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ranking_snapshot_1min'")
             if cur.fetchone() is None:

@@ -21,9 +21,10 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from nas_root import nas_path, nas_root
 
 
-DEFAULT_BASE_DIR = r"\\192.168.0.22\AutoStockBuyAndSell"
+DEFAULT_BASE_DIR = nas_root()
 
 DEFAULT_INTERVALS = (1, 3, 5)
 

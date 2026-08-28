@@ -1150,9 +1150,45 @@ def _bfe_env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _bfe_exit_temp_stop_flag(name: str) -> bool:
+    """EXIT 一時停止フラグ。明示的に真と書かれた時だけ True。
+
+    P0-12: 旧実装は _bfe_env_bool("AUTOSTOCK_TEMP_DISABLE_EXIT", True) で
+    「未設定 = 停止」だった。env が未設定 (None) の本番環境で EXIT が
+    恒久的に無効化され、2026-08-27 のログでは
+      [EXIT TEMP STOP] run_exit_pipeline skipped
+      AUTOSTOCK_TEMP_DISABLE_EXIT=None EXIT_TEMP_STOP=None
+    が 3,831 行出ていた。返済が一度も走らない状態。
+
+    停止するのは 1/true/on/yes/y と明示された時だけ。
+    None / '' / 0 / false / off / no は False (= EXIT 実行) とする。
+    未知の値も安全側 (EXIT を止めない) に倒す。
+    """
+    try:
+        v = os.getenv(name)
+        if v is None:
+            return False
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on"}:
+            return True
+        if s in {"", "0", "false", "no", "n", "off", "none", "null"}:
+            return False
+        logger.warning(
+            "[EXIT TEMP STOP] %s=%r を解釈できない -> EXIT は止めない (False)",
+            name, v,
+        )
+        return False
+    except Exception:
+        logger.exception("[EXIT TEMP STOP] %s の判定に失敗 -> False", name)
+        return False
+
+
 def _bfe_exit_temp_disabled() -> bool:
-    # 今回の運用要望: EXITを一時停止。解除したい時だけ AUTOSTOCK_TEMP_DISABLE_EXIT=0 を指定する。
-    return _bfe_env_bool("AUTOSTOCK_TEMP_DISABLE_EXIT", True) or _bfe_env_bool("EXIT_TEMP_STOP", False)
+    # EXIT を止めるのは明示指定があるときだけ。既定は「止めない」。
+    return (
+        _bfe_exit_temp_stop_flag("AUTOSTOCK_TEMP_DISABLE_EXIT")
+        or _bfe_exit_temp_stop_flag("EXIT_TEMP_STOP")
+    )
 
 
 def _bfe_get(obj: Any, name: str, default=None):

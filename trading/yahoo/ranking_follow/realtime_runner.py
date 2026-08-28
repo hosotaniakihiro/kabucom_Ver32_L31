@@ -26,6 +26,8 @@ import pandas as pd
 from .delta_window import make_download_window, make_summary_window
 from .df_cache import merge_raw_1m, merge_summary
 from .technical_calc import add_technicals, filter_calc_output_window, normalize_ohlcv
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +49,7 @@ def _resolve_yahoo_db_path(trade_date: dt.date | str) -> Path:
         return _to_path(get_yahoo_1min_db_path(trade_date))
     except Exception:
         d = pd.Timestamp(trade_date).strftime("%Y%m%d")
-        return Path(r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\yahoo\intraday") / f"yahoo_1min_{d}.db"
+        return Path(nas_path(r"raw_data\yahoo\intraday")) / f"yahoo_1min_{d}.db"
 
 
 def _resolve_ranking_db_path(trade_date: dt.date | str) -> Optional[Path]:
@@ -56,14 +58,14 @@ def _resolve_ranking_db_path(trade_date: dt.date | str) -> Optional[Path]:
         return _to_path(get_ranking_db_path(trade_date))
     except Exception:
         d = pd.Timestamp(trade_date).strftime("%Y%m%d")
-        p = Path(r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\ranking") / f"ranking{d}.db"
+        p = Path(nas_path(r"raw_data\kabu_station\ranking")) / f"ranking{d}.db"
         return p if p.exists() else p
 
 
 def _read_sql(db_path: Path, sql: str, params: Iterable[Any] = ()) -> pd.DataFrame:
     if not db_path.exists():
         return pd.DataFrame()
-    with sqlite3.connect(str(db_path), timeout=30) as con:
+    with committing_connect(str(db_path), timeout=30) as con:
         con.execute("PRAGMA busy_timeout=30000")
         return pd.read_sql_query(sql, con, params=list(params))
 

@@ -22,10 +22,12 @@ from typing import Any, List, Optional, Sequence, Set, Tuple
 
 from .globals_access import safe_get_global_data, safe_getattr
 from .symbols import dedupe_keep_order, normalize_symbol, safe_str
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
-SYMBOL_FLAGS_DB_PATH = r"\\192.168.0.22\AutoStockBuyAndSell\Basic\symbol_flags.db"
+SYMBOL_FLAGS_DB_PATH = nas_path(r"Basic\symbol_flags.db")
 COMMON_MARKETS = ("プライム", "スタンダード", "グロース")
 DEFAULT_REFRESH_INTERVAL_SEC = 30.0
 
@@ -76,7 +78,7 @@ def _read_symbol_flags_target_sets_core(
     buy_set: Set[str] = set()
     sell_set: Set[str] = set()
 
-    with sqlite3.connect(db_path) as conn:
+    with committing_connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
 
         rows = conn.execute("PRAGMA table_info(symbol_flags)").fetchall()
@@ -189,7 +191,7 @@ def filter_by_symbol_flags_targets(
 def _read_symbol_flags_keep_set_core(db_path: str) -> Set[str]:
     keep: Set[str] = set()
 
-    with sqlite3.connect(db_path) as conn:
+    with committing_connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
 
         rows = conn.execute("PRAGMA table_info(symbol_flags)").fetchall()

@@ -30,6 +30,7 @@ from typing import Iterable, Optional
 import pandas as pd
 
 from .replay_backtest_engine_v2 import ReplayBacktestConfig, ReplayBacktestEngineV2
+from sqlite_cm import committing_connect
 
 OUT_DIR = r'\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\backtest_replay'
 STATS_DB_DIR = r'\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\symbol_stats'
@@ -145,7 +146,7 @@ class SymbolPerformanceStatsBuilder:
         stats = self.build()
         stats.to_csv(csv_path, index=False, encoding='utf-8-sig')
 
-        with sqlite3.connect(db_path, timeout=30) as conn:
+        with committing_connect(db_path, timeout=30) as conn:
             conn.execute('PRAGMA journal_mode=WAL')
             conn.execute('PRAGMA synchronous=NORMAL')
             stats.to_sql('symbol_performance_latest', conn, if_exists='replace', index=False)

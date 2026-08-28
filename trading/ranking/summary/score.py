@@ -128,7 +128,9 @@ def _safe_numeric_series(
                 .str.replace(",", "", regex=False)
                 .str.replace("円", "", regex=False)
                 .str.strip()
-                .replace({"": np.nan, "None": np.nan, "none": np.nan, "NULL": np.nan, "null": np.nan, "nan": np.nan, "NaN": np.nan, "<NA>": np.nan, "pd.NA": np.nan})
+                # 文字列 Series へ np.nan を混ぜると object->float の暗黙ダウンキャスト。
+                # 直後の pd.to_numeric(errors="coerce") で同じ NaN になる。
+                .replace({"None": "", "none": "", "NULL": "", "null": "", "nan": "", "NaN": "", "<NA>": "", "pd.NA": ""})
             )
         out = pd.to_numeric(s, errors="coerce")
         if not isinstance(out, pd.Series):

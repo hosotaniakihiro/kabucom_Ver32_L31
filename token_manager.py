@@ -1,5 +1,5 @@
 # ============================================================
-# token_manager.py（Ver33-SETTINGS-DIRECT-WRITE-FALLBACK）
+# token_manager.py（Ver34-STARTUP-STALE-TOKEN-RECOVERY）
 # ------------------------------------------------------------
 # ・API認証設定は settings.ini に集約する
 # ・token 保存も settings.ini または config/settings.ini にだけ行う
@@ -19,6 +19,23 @@
 # ・Windowsで settings.ini への os.replace が WinError 5 になる環境向けに、
 #   同一ファイルへの直接上書き fallback を追加する。
 # ・atomic replace が失敗しても、直接書き込みで保存検証まで通れば起動を継続する。
+#
+# Ver34 (STARTUP-STALE-TOKEN-RECOVERY):
+# ・/token 失敗を型で区別する:
+#     TokenApiPasswordMismatch = /token 自体が 401 / Code=4001009 (apipassword 不一致)
+#     TokenApiTransportError   = kabu Station へ到達できない
+#     TokenApiError            = それ以外
+#   これで「cached token が古い」と「apipassword が違う」を混同しない。
+# ・request_fresh_token(): TTL / startup-once / parent-only の抑止層を明示的に
+#   バイパスして /token を 1 回だけ叩き、settings.ini へ保存検証してから
+#   token_manager / env / global_data / headers へ publish する。
+#   呼ぶのは kabu_api/token_bootstrap.py の起動時ステートマシンだけ。
+# ・TTL は「ファイルが新しい」ことしか証明しない。サーバ側で有効かどうかは
+#   read-only preflight でしか分からないので、起動時の有効判定は
+#   kabu_api/token_bootstrap.bootstrap_startup_token() が持つ。
+# ・TOKEN_SOURCE / TOKEN_ACTION をログに出す。token 値と apipassword 値は出さない
+#   (token_len / token_tail / api_password_source / password_present / password_len のみ)。
+# ・token_api_call_count() で「本当に /token を叩いたか」を機械的に確認できる。
 # ============================================================
 
 from __future__ import annotations
@@ -29,6 +46,7 @@ import os
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from configparser import ConfigParser
 from pathlib import Path
@@ -43,6 +61,74 @@ API_PASSWORD = None
 _CONFIG_FILE_PATH: str | None = None
 _REQUESTS_PATCHED = False
 _REQUESTS_PATCH_ORIGINAL = None
+
+# Ver34 observability: what produced the token currently held, and how many times
+# POST /token was actually issued by this process.  The old logs said
+# "parent startup bootstrap token refreshed/saved" even when nothing was fetched,
+# so the counter is the ground truth callers should log.
+LAST_TOKEN_SOURCE: str = ""
+LAST_TOKEN_ACTION: str = ""
+_TOKEN_API_CALL_COUNT = 0
+
+# TOKEN_SOURCE / TOKEN_ACTION vocabulary (shared with kabu_api.token_bootstrap).
+TOKEN_SOURCE_SETTINGS_INI_CACHED = "settings_ini_cached"
+TOKEN_SOURCE_FRESH_TOKEN_API = "fresh_token_api"
+TOKEN_SOURCE_STARTUP_401_RECOVERY = "startup_401_recovery"
+TOKEN_SOURCE_INHERITED_PARENT = "inherited_parent"
+
+TOKEN_ACTION_REUSED = "reused"
+TOKEN_ACTION_API_REQUESTED = "api_requested"
+TOKEN_ACTION_API_RECEIVED = "api_received"
+TOKEN_ACTION_SAVED = "saved"
+TOKEN_ACTION_PREFLIGHT_OK = "preflight_ok"
+TOKEN_ACTION_PREFLIGHT_NG = "preflight_ng"
+
+_APIPASSWORD_ENV_NAMES = (
+    "KABUSAPI_APIPASSWORD",
+    "AUKABU_APIPASSWORD",
+    "KABU_API_PASSWORD",
+    "KABUSAPI_PASSWORD",
+)
+
+
+class TokenApiError(RuntimeError):
+    """POST /token failed for a reason that is not an API password mismatch."""
+
+    kind = "token_api_error"
+
+    def __init__(self, message: str, status: int | None = None, code: str = "", body: str = ""):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.body = body
+
+
+class TokenApiPasswordMismatch(TokenApiError):
+    """POST /token itself was rejected (401/403 or Code=4001009).
+
+    This is case B: the apipassword does not match kabu Station.  It must never be
+    reported as a stale cached token (case A).
+    """
+
+    kind = "api_password_mismatch"
+
+
+class TokenApiTransportError(TokenApiError):
+    """POST /token never reached kabu Station (not running, port closed, timeout)."""
+
+    kind = "token_api_transport_error"
+
+
+def token_api_call_count() -> int:
+    """How many times this process actually issued POST /token."""
+    return int(_TOKEN_API_CALL_COUNT)
+
+
+def _mark_token_state(source: str, action: str) -> None:
+    global LAST_TOKEN_SOURCE, LAST_TOKEN_ACTION
+    LAST_TOKEN_SOURCE = str(source or "")
+    LAST_TOKEN_ACTION = str(action or "")
+
 
 _CHILD_MARKERS = (
     "push_receiver_runner.py",
@@ -219,27 +305,72 @@ def _require_section(conf: ConfigParser) -> str:
     )
 
 
-def _resolve_apipassword(conf: ConfigParser, sec: str | None, apipassword=None) -> str | None:
+def resolve_apipassword_with_source(
+    conf: ConfigParser | None = None, sec: str | None = None, apipassword=None
+) -> tuple[str | None, str]:
+    """Resolve the API password and report where it came from.
+
+    The value itself is never returned to logs -- only the source label, presence
+    and length are ever logged (see _log_apipassword_diagnostics).
+
+    Order changed in Ver34: settings.ini now beats the in-process API_PASSWORD
+    cache.  A stale runtime cache used to shadow a corrected settings.ini, which
+    made "API password mismatch" impossible to fix without restarting everything.
+    """
     global API_PASSWORD
     if apipassword:
         API_PASSWORD = str(apipassword)
-        return API_PASSWORD
-    if API_PASSWORD:
-        return str(API_PASSWORD)
+        return API_PASSWORD, "argument"
+
+    if conf is None:
+        conf = _load_settings()
+        sec = _get_section(conf)
     if sec:
         try:
             v = conf.get(sec, "apipassword", fallback=None)
             if v:
                 API_PASSWORD = str(v)
-                return API_PASSWORD
+                return API_PASSWORD, f"settings.ini[{sec}]"
         except Exception:
             pass
-    for env_name in ("KABUSAPI_APIPASSWORD", "AUKABU_APIPASSWORD", "KABU_API_PASSWORD", "KABUSAPI_PASSWORD"):
+
+    for env_name in _APIPASSWORD_ENV_NAMES:
         v = os.getenv(env_name)
         if v:
             API_PASSWORD = str(v)
-            return API_PASSWORD
-    return None
+            return API_PASSWORD, f"env:{env_name}"
+
+    if API_PASSWORD:
+        return str(API_PASSWORD), "runtime_cache"
+    return None, "none"
+
+
+def _resolve_apipassword(conf: ConfigParser, sec: str | None, apipassword=None) -> str | None:
+    password, _source = resolve_apipassword_with_source(conf, sec, apipassword)
+    return password
+
+
+def _log_apipassword_diagnostics(source: str, password: Any, reason: str) -> None:
+    """Log where the API password came from without ever logging the value."""
+    logger.warning(
+        "[TOKEN MANAGER] api_password_source=%s password_present=%s password_len=%d reason=%s",
+        source,
+        bool(password),
+        len(str(password or "")),
+        reason,
+    )
+
+
+def read_settings_token() -> str:
+    """Read the token straight out of settings.ini (no env, no runtime cache)."""
+    conf = _load_settings()
+    sec = _get_section(conf)
+    if not sec:
+        return ""
+    try:
+        return str(conf.get(sec, "token", fallback="") or "").strip()
+    except Exception:
+        return ""
 
 
 def _settings_file_age_sec() -> float | None:
@@ -395,6 +526,170 @@ def _publish_token(token: Any) -> str | None:
     return token_s
 
 
+def _parse_kabu_error(raw: str) -> tuple[str, str]:
+    """Extract (Code, Message) from a kabu Station error body."""
+    try:
+        data = json.loads(raw) if raw else {}
+        if isinstance(data, dict):
+            return str(data.get("Code") or ""), str(data.get("Message") or "")
+    except Exception:
+        pass
+    return "", str(raw or "")
+
+
+def _post_token_api(api_password: str, timeout: float = 5.0) -> str:
+    """POST /token exactly once and classify every failure mode.
+
+    Raises:
+        TokenApiPasswordMismatch -- /token itself rejected the password (case B)
+        TokenApiTransportError   -- kabu Station unreachable
+        TokenApiError            -- any other /token failure
+    """
+    global _TOKEN_API_CALL_COUNT
+
+    url = f"{API_URL}/token"
+    headers = {"Content-Type": "application/json"}
+    data = json.dumps({"APIPassword": str(api_password)}).encode()
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+
+    _TOKEN_API_CALL_COUNT += 1
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            raw = res.read().decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as e:
+        status = int(getattr(e, "code", 0) or 0)
+        raw = ""
+        try:
+            raw = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            raw = ""
+        code, message = _parse_kabu_error(raw)
+        if status in (401, 403) or code == "4001009" or "APIキー不一致" in message:
+            raise TokenApiPasswordMismatch(
+                f"POST /token rejected the APIPassword status={status} code={code} message={message}",
+                status=status,
+                code=code,
+                body=raw,
+            ) from e
+        raise TokenApiError(
+            f"POST /token failed status={status} code={code} message={message}",
+            status=status,
+            code=code,
+            body=raw,
+        ) from e
+    except Exception as e:
+        raise TokenApiTransportError(
+            f"POST /token could not reach kabu Station url={url} error={e}"
+        ) from e
+
+    try:
+        result = json.loads(raw) if raw else {}
+    except Exception as e:
+        raise TokenApiError(f"POST /token returned a non-JSON body len={len(raw)}") from e
+
+    token = str((result or {}).get("Token") or "").strip()
+    if token:
+        return token
+
+    code, message = _parse_kabu_error(raw)
+    if code == "4001009" or "APIキー不一致" in message:
+        raise TokenApiPasswordMismatch(
+            f"POST /token returned no token code={code} message={message}", code=code, body=raw
+        )
+    raise TokenApiError(
+        f"POST /token returned no token code={code} message={message}", code=code, body=raw
+    )
+
+
+def _publish_token_all_layers(token: str, name: str = "request_fresh_token") -> str:
+    """Publish one token to every holder: token_manager, env, global_data, headers.
+
+    Mirrors what refresh_token()'s wrapper layers do, so a token obtained outside
+    the layered refresh_token() path is not left half-published.
+    """
+    _publish_token(token)
+    _ps = _pipeline_stability()
+    if _ps is not None:
+        try:
+            _ps.publish_token_result(name, token)
+        except Exception:
+            logger.debug("[TOKEN MANAGER] pipeline_stability publish failed", exc_info=True)
+    _ecu = _entry_count_unblock()
+    if _ecu is not None:
+        try:
+            _ecu.refresh_token_publish(token)
+        except Exception:
+            logger.debug("[TOKEN MANAGER] entry_count_unblock publish failed", exc_info=True)
+    return token
+
+
+def request_fresh_token(apipassword=None, reason: str = "explicit") -> str:
+    """Issue POST /token once, save to settings.ini, publish everywhere.
+
+    Deliberately bypasses the TTL / startup-once / parent-only suppression layers:
+    the caller (the startup state machine in kabu_api.token_bootstrap) has already
+    proved with a read-only preflight that the cached token is dead, so those
+    guards would only keep the process unrecoverable.  This is the ONLY sanctioned
+    way to obtain a token outside the normal startup refresh, and the startup state
+    machine calls it at most once per process.
+    """
+    global API_PASSWORD
+
+    conf = _load_settings()
+    sec = _get_section(conf)
+    if not sec:
+        existing, tried = _diagnostic(conf)
+        raise TokenApiError(
+            "settings.ini に [aukabu] または [kabusapi] がありません。"
+            f" path={_CONFIG_FILE_PATH} existing={existing} tried={tried}"
+        )
+
+    api_password, pw_source = resolve_apipassword_with_source(conf, sec, apipassword)
+    _log_apipassword_diagnostics(pw_source, api_password, reason)
+    if not api_password:
+        raise TokenApiPasswordMismatch(
+            "settings.ini に apipassword がありません。"
+            f" path={_CONFIG_FILE_PATH} section={sec} api_password_source={pw_source}"
+        )
+
+    _mark_token_state(TOKEN_SOURCE_FRESH_TOKEN_API, TOKEN_ACTION_API_REQUESTED)
+    logger.warning(
+        "[TOKEN MANAGER] TOKEN_SOURCE=%s TOKEN_ACTION=%s reason=%s api_password_source=%s",
+        TOKEN_SOURCE_FRESH_TOKEN_API,
+        TOKEN_ACTION_API_REQUESTED,
+        reason,
+        pw_source,
+    )
+
+    token = _post_token_api(api_password)
+
+    _mark_token_state(TOKEN_SOURCE_FRESH_TOKEN_API, TOKEN_ACTION_API_RECEIVED)
+    logger.warning(
+        "[TOKEN MANAGER] TOKEN_SOURCE=%s TOKEN_ACTION=%s token_len=%d token_tail=%s",
+        TOKEN_SOURCE_FRESH_TOKEN_API,
+        TOKEN_ACTION_API_RECEIVED,
+        len(token),
+        _token_tail(token),
+    )
+
+    # settings.ini is canonical: verify the save before publishing, otherwise the
+    # requests hook can re-inject the old settings.ini token and 401 again.
+    _save_token(token)
+    _mark_token_state(TOKEN_SOURCE_FRESH_TOKEN_API, TOKEN_ACTION_SAVED)
+    logger.warning(
+        "[TOKEN MANAGER] TOKEN_SOURCE=%s TOKEN_ACTION=%s path=%s token_len=%d token_tail=%s",
+        TOKEN_SOURCE_FRESH_TOKEN_API,
+        TOKEN_ACTION_SAVED,
+        _CONFIG_FILE_PATH,
+        len(token),
+        _token_tail(token),
+    )
+
+    _publish_token_all_layers(token)
+    API_PASSWORD = str(api_password)
+    return token
+
+
 def _get_valid_token_core():
     global API_TOKEN
     if API_TOKEN:
@@ -416,8 +711,11 @@ def _refresh_token_core(apipassword=None):
 
     if _is_child_process() and not _env_bool("KABU_TOKEN_ALLOW_CHILD_REFRESH", False):
         token = get_valid_token()
+        _mark_token_state(TOKEN_SOURCE_SETTINGS_INI_CACHED, TOKEN_ACTION_REUSED)
         logger.warning(
-            "[TOKEN MANAGER] child refresh suppressed; using settings.ini token token_len=%d token_tail=%s argv=%s",
+            "[TOKEN MANAGER] TOKEN_SOURCE=%s TOKEN_ACTION=%s child refresh suppressed token_len=%d token_tail=%s argv=%s",
+            TOKEN_SOURCE_SETTINGS_INI_CACHED,
+            TOKEN_ACTION_REUSED,
             len(str(token or "")),
             _token_tail(token),
             _argv_text(),
@@ -426,8 +724,11 @@ def _refresh_token_core(apipassword=None):
 
     if (not _is_parent_process()) and _env_bool("KABU_TOKEN_PARENT_ONLY_REFRESH", True) and not _env_bool("KABU_TOKEN_ALLOW_NONPARENT_REFRESH", False):
         token = get_valid_token()
+        _mark_token_state(TOKEN_SOURCE_SETTINGS_INI_CACHED, TOKEN_ACTION_REUSED)
         logger.warning(
-            "[TOKEN MANAGER] non-parent refresh suppressed; using settings.ini token token_len=%d token_tail=%s argv=%s",
+            "[TOKEN MANAGER] TOKEN_SOURCE=%s TOKEN_ACTION=%s non-parent refresh suppressed token_len=%d token_tail=%s argv=%s",
+            TOKEN_SOURCE_SETTINGS_INI_CACHED,
+            TOKEN_ACTION_REUSED,
             len(str(token or "")),
             _token_tail(token),
             _argv_text(),
@@ -450,8 +751,15 @@ def _refresh_token_core(apipassword=None):
 
     if existing_token and not force_parent_refresh and ttl_sec > 0 and age_sec is not None and age_sec <= ttl_sec:
         token = _publish_token(existing_token)
+        _mark_token_state(TOKEN_SOURCE_SETTINGS_INI_CACHED, TOKEN_ACTION_REUSED)
+        # NOTE: TTL only says the local file is young.  It cannot say whether kabu
+        # Station still accepts this token -- only a preflight can.  The startup
+        # state machine in kabu_api.token_bootstrap owns that decision now.
         logger.warning(
-            "[TOKEN MANAGER] parent refresh skipped by ttl; using recent settings.ini token token_len=%d token_tail=%s age=%.1fs ttl=%.1fs argv=%s",
+            "[TOKEN MANAGER] TOKEN_SOURCE=%s TOKEN_ACTION=%s parent refresh skipped by ttl "
+            "(ttl proves file age only, not server-side validity) token_len=%d token_tail=%s age=%.1fs ttl=%.1fs argv=%s",
+            TOKEN_SOURCE_SETTINGS_INI_CACHED,
+            TOKEN_ACTION_REUSED,
             len(str(token or "")),
             _token_tail(token),
             age_sec,
@@ -460,36 +768,41 @@ def _refresh_token_core(apipassword=None):
         )
         return token
 
-    api_password = _resolve_apipassword(conf, sec, apipassword)
+    api_password, pw_source = resolve_apipassword_with_source(conf, sec, apipassword)
+    _log_apipassword_diagnostics(pw_source, api_password, "parent_refresh")
 
     if not api_password:
         existing, tried = _diagnostic(conf)
         raise ValueError(
             "settings.ini に apipassword がありません。"
-            f" path={_CONFIG_FILE_PATH} section={sec} existing={existing} tried={tried}"
+            f" path={_CONFIG_FILE_PATH} section={sec} api_password_source={pw_source}"
+            f" existing={existing} tried={tried}"
         )
 
-    url = f"{API_URL}/token"
-    headers = {"Content-Type": "application/json"}
-    data = json.dumps({"APIPassword": api_password}).encode()
-    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    _mark_token_state(TOKEN_SOURCE_FRESH_TOKEN_API, TOKEN_ACTION_API_REQUESTED)
+    logger.warning(
+        "[TOKEN MANAGER] TOKEN_SOURCE=%s TOKEN_ACTION=%s reason=parent_refresh api_password_source=%s",
+        TOKEN_SOURCE_FRESH_TOKEN_API,
+        TOKEN_ACTION_API_REQUESTED,
+        pw_source,
+    )
 
-    with urllib.request.urlopen(req, timeout=5) as res:
-        raw = res.read().decode()
-        result = json.loads(raw)
+    token = _post_token_api(api_password)
 
-    token = str(result.get("Token") or "").strip()
-    if not token:
-        raise ValueError("token を取得できませんでした")
+    _mark_token_state(TOKEN_SOURCE_FRESH_TOKEN_API, TOKEN_ACTION_API_RECEIVED)
 
     # 重要: settings.ini を canonical source にしているため、publish より先に保存検証する。
     # 保存に失敗した状態で API_TOKEN だけ更新すると、直後の requests フックが古い settings.ini token を再注入して 401 になる。
     _save_token(token)
     _publish_token(token)
     API_PASSWORD = str(api_password)
+    _mark_token_state(TOKEN_SOURCE_FRESH_TOKEN_API, TOKEN_ACTION_SAVED)
 
     logger.warning(
-        "[TOKEN MANAGER] parent token refreshed/saved token_len=%d token_tail=%s settings=%s argv=%s",
+        "[TOKEN MANAGER] TOKEN_SOURCE=%s TOKEN_ACTION=%s parent token refreshed/saved "
+        "token_len=%d token_tail=%s settings=%s argv=%s",
+        TOKEN_SOURCE_FRESH_TOKEN_API,
+        TOKEN_ACTION_SAVED,
         len(str(token or "")),
         _token_tail(token),
         os.environ.get("AUTOSTOCK_SETTINGS_INI_ACTIVE", _CONFIG_FILE_PATH or ""),

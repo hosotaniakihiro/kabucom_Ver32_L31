@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 from typing import Any
 
@@ -231,6 +232,49 @@ def _safe_update(con: sqlite3.Connection, sql: str) -> None:
         )
 
 
+_BACKFILL_SKIP_LOGGED = False
+
+
+def _backfill_alias_enabled() -> bool:
+    """旧DBの別名列を埋め直すか (既定 False)。
+
+    2026-08-25 実測: ranking20260825.db (525.9MB / 236,648 行) に対し、
+    5 本の述語のうち 1 本を EXISTS で確認するだけで 1420.5 秒かかり、
+    しかも該当行は 0 件だった。
+    実際には UPDATE が 5 本 x 2 呼び出し = 10 本走るため、
+    writer 起動のたびに数時間ブロックし ranking 収集が始まらなかった。
+    現行 writer は挿入時に別名列を両方埋めるので通常運用では不要。
+    """
+    try:
+        v = os.getenv("RANKING_SNAPSHOT_BACKFILL_ALIAS")
+        if v is None or str(v).strip() == "":
+            return False
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        return False
+
+
+def _backfill_alias_columns_if_enabled(con: sqlite3.Connection) -> None:
+    """既定ではスキップする。黙って変えず、1 度だけ理由を残す。"""
+    global _BACKFILL_SKIP_LOGGED
+
+    if _backfill_alias_enabled():
+        logger.warning(
+            "[RANKING SNAPSHOT SCHEMA] alias backfill ENABLED by "
+            "RANKING_SNAPSHOT_BACKFILL_ALIAS=1; this runs full-table UPDATEs "
+            "and can block for hours on a large NAS db"
+        )
+        _backfill_alias_columns(con)
+        return
+
+    if not _BACKFILL_SKIP_LOGGED:
+        _BACKFILL_SKIP_LOGGED = True
+        logger.warning(
+            "[RANKING SNAPSHOT SCHEMA] alias backfill skipped (full-table UPDATE x5). "
+            "set RANKING_SNAPSHOT_BACKFILL_ALIAS=1 to run it for a legacy db"
+        )
+
+
 def _backfill_alias_columns(con: sqlite3.Connection) -> None:
     """
     既存DBのカラム揺れを補完する。
@@ -312,7 +356,7 @@ def ensure_ranking_snapshot_table(con: sqlite3.Connection) -> None:
     )
 
     _ensure_required_columns(con)
-    _backfill_alias_columns(con)
+    _backfill_alias_columns_if_enabled(con)
 
 
 def patch_ranking_snapshot_schema(con: sqlite3.Connection) -> int:
@@ -321,7 +365,7 @@ def patch_ranking_snapshot_schema(con: sqlite3.Connection) -> int:
         return 0
 
     patched = _ensure_required_columns(con)
-    _backfill_alias_columns(con)
+    _backfill_alias_columns_if_enabled(con)
     return patched
 
 

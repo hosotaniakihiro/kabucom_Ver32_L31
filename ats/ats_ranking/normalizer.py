@@ -16,6 +16,8 @@ from global_state import global_data
 from config.paths import get_path
 
 from .constants import MARKET_CODE_TO_LABEL
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +182,7 @@ def _load_market_map(symbols: List[str]) -> Dict[str, str]:
     try:
         db_path = get_path("symbol_flags_db")
     except Exception:
-        db_path = r"\\192.168.0.22\AutoStockBuyAndSell\Basic\symbol_flags.db"
+        db_path = nas_path(r"Basic\symbol_flags.db")
 
     try:
         placeholders = ",".join("?" for _ in missing)
@@ -189,7 +191,7 @@ def _load_market_map(symbols: List[str]) -> Dict[str, str]:
             FROM symbol_flags
             WHERE symbol IN ({placeholders})
         """
-        with sqlite3.connect(str(db_path)) as conn:
+        with committing_connect(str(db_path)) as conn:
             rows = conn.execute(sql, missing).fetchall()
 
         for sym, market_type in rows:

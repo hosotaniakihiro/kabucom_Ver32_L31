@@ -24,10 +24,12 @@
 
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import logging
 import os
-from typing import Any, Dict
+import threading
+from typing import Any, Dict, Tuple
 
 from core.global_context.context import global_context as GC
 from global_state import global_data
@@ -122,6 +124,58 @@ def _safe_int(v: Any, default: int = 0) -> int:
         return int(default)
 
 
+# ============================================================
+# P0-2: DB read failure != positions empty
+# ------------------------------------------------------------
+# load_open_positions_from_db() は互換のため空 dict を返し続けるが、
+# 「読めなかった」ことをここに記録する。呼び出し元は db_read_ok() で
+# 空と失敗を区別し、ENTRY 判定は必ず fail-closed 側へ倒す。
+# ============================================================
+
+_DB_READ_LOCK = threading.Lock()
+_DB_READ_OK: bool = False
+_DB_READ_ERROR: str = ""
+_DB_READ_AT = None
+_DB_READ_OK_AT = None
+
+
+def _mark_db_read_ok() -> None:
+    global _DB_READ_OK, _DB_READ_ERROR, _DB_READ_AT, _DB_READ_OK_AT
+    with _DB_READ_LOCK:
+        _DB_READ_OK = True
+        _DB_READ_ERROR = ""
+        _DB_READ_AT = dt.datetime.now()
+        _DB_READ_OK_AT = _DB_READ_AT
+
+
+def _mark_db_read_failed(err: str) -> None:
+    global _DB_READ_OK, _DB_READ_ERROR, _DB_READ_AT
+    with _DB_READ_LOCK:
+        _DB_READ_OK = False
+        _DB_READ_ERROR = str(err or "")
+        _DB_READ_AT = dt.datetime.now()
+
+
+def db_read_ok() -> bool:
+    """直近の positions.db 読み取りが成功したか。"""
+    with _DB_READ_LOCK:
+        return bool(_DB_READ_OK)
+
+
+def db_read_status() -> dict:
+    with _DB_READ_LOCK:
+        age = None
+        if _DB_READ_OK_AT is not None:
+            age = (dt.datetime.now() - _DB_READ_OK_AT).total_seconds()
+        return {
+            "ok": bool(_DB_READ_OK),
+            "error": _DB_READ_ERROR,
+            "read_at": _DB_READ_AT,
+            "last_ok_at": _DB_READ_OK_AT,
+            "last_ok_age_sec": age,
+        }
+
+
 def _ensure_global_open_positions() -> Dict[str, Dict[str, Any]]:
     try:
         positions = getattr(global_data, "open_positions", None)
@@ -200,6 +254,82 @@ def _position_model_to_dict(p: Any) -> Dict[str, Any]:
     }
 
 
+class PositionsDbUnavailable(RuntimeError):
+    """positions.db が読めなかった。「建玉 0 件」とは決して同義ではない。"""
+
+
+def load_open_positions_from_db_strict() -> Dict[str, Dict[str, Any]]:
+    """positions テーブルから未クローズ建玉を読む。失敗は例外で伝える。
+
+    P0-2: 失敗を握り潰して {} を返してはならない。
+    DB read failure と positions empty は別物であり、
+    混同すると
+      - ENTRY が fail-open して二重建玉になる
+      - EXIT が「建玉なし」と判断して損切りに到達しない
+    という取り返しのつかない結果になる。
+
+    握り潰し版が要る呼び出し元は load_open_positions_from_db() を使うこと
+    (そちらも空 dict ではなく last-known を壊さない設計にしてある)。
+    """
+    try:
+        from database import Session_position
+        from database.models import Position
+    except Exception as e:  # noqa: BLE001
+        raise PositionsDbUnavailable(f"import DB modules failed: {e}") from e
+
+    session = None
+    try:
+        session = Session_position()
+        rows = session.query(Position).all()
+
+        out: Dict[str, Dict[str, Any]] = {}
+        skipped_closed = 0
+        skipped_qty = 0
+        skipped_price = 0
+
+        for p in rows or []:
+            symbol = _normalize_symbol(getattr(p, "symbol", ""))
+            if not symbol:
+                continue
+
+            status = _normalize_status(getattr(p, "status", ""))
+            if not _is_open_like_status(status):
+                skipped_closed += 1
+                continue
+
+            d = _position_model_to_dict(p)
+
+            if d.get("qty", 0) <= 0:
+                skipped_qty += 1
+                continue
+
+            if d.get("entry_price", 0.0) <= 0:
+                skipped_price += 1
+                continue
+
+            out[symbol] = d
+
+        logger.debug(
+            "[OPEN POSITION SYNC] strict DB scan rows=%d open_like=%d "
+            "skipped_closed=%d skipped_qty=%d skipped_price=%d symbols=%s",
+            len(rows or []), len(out), skipped_closed, skipped_qty, skipped_price,
+            sorted(out.keys()),
+        )
+        return out
+
+    except PositionsDbUnavailable:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise PositionsDbUnavailable(f"{type(e).__name__}: {e}") from e
+
+    finally:
+        try:
+            if session is not None:
+                session.close()
+        except Exception:
+            logger.debug("[OPEN POSITION SYNC] session close failed", exc_info=True)
+
+
 def load_open_positions_from_db() -> Dict[str, Dict[str, Any]]:
     """positions テーブルから未クローズ建玉/エントリー済み行を読む。"""
     try:
@@ -207,6 +337,7 @@ def load_open_positions_from_db() -> Dict[str, Dict[str, Any]]:
         from database.models import Position
     except Exception:
         logger.debug("[OPEN POSITION SYNC] import DB modules failed", exc_info=True)
+        _mark_db_read_failed("import DB modules failed")
         return {}
 
     session = None
@@ -256,10 +387,14 @@ def load_open_positions_from_db() -> Dict[str, Dict[str, Any]]:
         except Exception:
             pass
 
+        _mark_db_read_ok()
         return out
 
-    except Exception:
+    except Exception as e:  # noqa: BLE001
+        # P0-2: 空 dict を返すが、「読めなかった」ことを必ず記録する。
+        # 呼び出し元は db_read_ok() で empty と failure を区別できる。
         logger.exception("[OPEN POSITION SYNC] load from DB failed")
+        _mark_db_read_failed(f"{type(e).__name__}: {e}")
         return {}
 
     finally:
@@ -267,7 +402,7 @@ def load_open_positions_from_db() -> Dict[str, Dict[str, Any]]:
             if session is not None:
                 session.close()
         except Exception:
-            pass
+            logger.debug("[OPEN POSITION SYNC] session close failed", exc_info=True)
 
 
 def _sync_to_gc_positions(positions: Dict[str, Dict[str, Any]]) -> None:
@@ -379,12 +514,48 @@ def _sync_open_positions_from_db_core(*, force_log: bool = False) -> Dict[str, D
 
 
 def is_symbol_in_open_position(symbol: Any, *, sync: bool = True) -> bool:
+    """この銘柄を既に持っているか。
+
+    P0-2 fail-closed: 建玉状態が確定できないときは True を返す。
+    ENTRY 側はこの戻り値が True なら新規建玉を出さないので、
+    「分からない」を「持っていない」に倒して二重建玉を出すことを防ぐ。
+    """
     s = _normalize_symbol(symbol)
     if not s:
         return False
 
+    # 建玉状態が unknown (DB も broker も読めない) なら保有扱いにする。
+    try:
+        from trading.position.position_state_service import get_positions_state
+
+        state = get_positions_state(caller="is_symbol_in_open_position")
+        if not state.entry_allowed:
+            # キャッシュが古いだけかもしれないので、判断の前に必ず取り直す。
+            # ここは二重建玉を防ぐゲートなので、古い情報で判断しない。
+            state = get_positions_state(force=True, caller="is_symbol_in_open_position:verify")
+        if not state.positions_known:
+            logger.warning(
+                "[OPEN POSITION SYNC] 建玉状態 unknown のため symbol=%s を保有扱いにする "
+                "(fail-closed) db_ok=%s broker_ok=%s source=%s last_good_age=%.1fs",
+                s, state.db_ok, state.broker_ok, state.source_used,
+                0.0 if state.last_good_age == float("inf") else state.last_good_age,
+            )
+            return True
+        if s in {_normalize_symbol(k) for k in state.positions.keys()}:
+            return True
+    except Exception:
+        logger.debug("[OPEN POSITION SYNC] position state service unavailable", exc_info=True)
+
     if sync:
         positions = sync_open_positions_from_db()
+        # DB が読めていないなら空 dict は「建玉なし」ではない。
+        if not positions and not db_read_ok():
+            logger.warning(
+                "[OPEN POSITION SYNC] positions.db 読み取り失敗中のため symbol=%s を "
+                "保有扱いにする (fail-closed) err=%s",
+                s, db_read_status().get("error", ""),
+            )
+            return True
     else:
         positions = getattr(global_data, "open_positions", None)
         if not isinstance(positions, dict):
@@ -398,15 +569,19 @@ def is_symbol_in_open_position(symbol: Any, *, sync: bool = True) -> bool:
             if _normalize_symbol((p or {}).get("symbol")) == s:
                 return True
         except Exception:
-            pass
+            logger.debug("[OPEN POSITION SYNC] symbol compare failed", exc_info=True)
 
     return False
 
 
 __all__ = [
+    "PositionsDbUnavailable",
     "load_open_positions_from_db",
+    "load_open_positions_from_db_strict",
     "sync_open_positions_from_db",
     "is_symbol_in_open_position",
+    "db_read_ok",
+    "db_read_status",
 ]
 
 
@@ -435,6 +610,15 @@ os.environ.setdefault("OPEN_POSITION_KEEP_EXISTING_ON_PARSE_SUSPICIOUS", "0")
 
 _OPS_CACHE: Dict[str, Any] = {"ts": 0.0, "result": None, "empty_authoritative": False}
 _OPS_SCOPE = None
+
+# --- 2層目 _osc_* の module global -------------------------------------
+# 旧 core/startup/open_position_stale_db_cleanup_patch.py から本文化した際に
+# 取り込み漏れていた module global。cooldown 状態と CLOSED ステータス名。
+_OSC_CLOSED_STATUS = "CLOSED_BROKER_NOT_OPEN"
+_OSC_LAST_CLEAN_AT: "dt.datetime | None" = None
+# sync_open_positions_from_db は複数スレッドから呼ばれるため、cooldown判定と
+# DB UPDATE をまとめて直列化する。取得できなければ他スレッドが実行中なのでスキップ。
+_OSC_CLEAN_LOCK = threading.Lock()
 
 def _obm_env_bool(name: str, default: bool = False) -> bool:
     try:
@@ -818,7 +1002,7 @@ def _osc_status(v: Any) -> str:
 
 def _osc_is_open_like_status(v: Any) -> bool:
     st = _osc_status(v)
-    if st in {"CLOSED", "CLOSE", "EXITED", "EXIT", "DONE", "CANCELED", "CANCELLED", "REJECTED", "FAILED", CLOSED_STATUS}:
+    if st in {"CLOSED", "CLOSE", "EXITED", "EXIT", "DONE", "CANCELED", "CANCELLED", "REJECTED", "FAILED", _OSC_CLOSED_STATUS}:
         return False
     return True
 
@@ -833,19 +1017,33 @@ def _osc_safe_float(v: Any, default: float = 0.0) -> float:
 
 
 def _osc_cleanup_stale_db_positions() -> int:
-    global _LAST_CLEAN_AT
-
     if not _osc_env_bool("OPEN_POSITION_AUTO_CLOSE_STALE_DB", True):
         return 0
     if not _osc_broker_authoritative_active():
         return 0
 
+    # 他スレッドが cleanup 中なら二重にDBを叩かない。
+    if not _OSC_CLEAN_LOCK.acquire(blocking=False):
+        return 0
+    try:
+        return _osc_cleanup_stale_db_positions_locked()
+    finally:
+        _OSC_CLEAN_LOCK.release()
+
+
+def _osc_cleanup_stale_db_positions_locked() -> int:
+    global _OSC_LAST_CLEAN_AT
+
     # 毎秒UPDATEを打たない。DB scanは走っても、cleanupは少し間引く。
     cooldown = max(1, _osc_env_int("OPEN_POSITION_STALE_DB_CLEAN_INTERVAL_SEC", 30))
     now = dt.datetime.now()
-    if _LAST_CLEAN_AT is not None and (now - _LAST_CLEAN_AT).total_seconds() < cooldown:
-        return 0
-    _LAST_CLEAN_AT = now
+    last = _OSC_LAST_CLEAN_AT
+    if last is not None:
+        elapsed = (now - last).total_seconds()
+        # システム時計が巻き戻った場合は cooldown を持ち越さない。
+        if 0.0 <= elapsed < cooldown:
+            return 0
+    _OSC_LAST_CLEAN_AT = now
 
     broker_symbols = _osc_current_broker_symbols()
 
@@ -876,7 +1074,7 @@ def _osc_cleanup_stale_db_positions() -> int:
                 continue
 
             try:
-                setattr(p, "status", CLOSED_STATUS)
+                setattr(p, "status", _OSC_CLOSED_STATUS)
             except Exception:
                 pass
             try:
@@ -893,7 +1091,7 @@ def _osc_cleanup_stale_db_positions() -> int:
                 changed,
                 changed_symbols,
                 sorted(broker_symbols),
-                CLOSED_STATUS,
+                _OSC_CLOSED_STATUS,
             )
         return changed
     except Exception as e:

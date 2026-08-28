@@ -12,6 +12,7 @@ from configparser import ConfigParser
 from datetime import datetime
 import logging
 import os
+from sqlite_cm import committing_connect
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -35,7 +36,7 @@ def main():
     # --------------------------------------------------------
     # daily_watchlist 読み込み
     # --------------------------------------------------------
-    with sqlite3.connect(WATCH_DB) as conn:
+    with committing_connect(WATCH_DB) as conn:
         df_watch = pd.read_sql("""
             SELECT symbol, buy_flag, sell_flag
             FROM daily_watchlist
@@ -54,7 +55,7 @@ def main():
     # --------------------------------------------------------
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    with sqlite3.connect(FLAGS_DB) as conn:
+    with committing_connect(FLAGS_DB) as conn:
         cur = conn.cursor()
 
         # ① 全銘柄 OFF（DELETEしない！）

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+from sqlite_cm import committing_connect
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +122,7 @@ def load_ranking_snapshot_1min(
     path = str(db_path)
 
     try:
-        with sqlite3.connect(path, timeout=10) as con:
+        with committing_connect(path, timeout=10) as con:
             columns = _table_columns(con, table)
 
             if not columns:

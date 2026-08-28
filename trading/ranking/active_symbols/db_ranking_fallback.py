@@ -21,6 +21,7 @@ import sqlite3
 from typing import Iterable, Any
 
 from global_state import global_data
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +70,7 @@ def _iter_ranking_db_paths() -> list[str]:
         os.environ.get("AUTO_STOCK_ROOT"),
         os.environ.get("KABU_DATA_ROOT"),
         os.environ.get("RAW_DATA_ROOT"),
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data",
+        nas_path(r"raw_data"),
     ]
     paths: list[str] = []
     seen: set[str] = set()

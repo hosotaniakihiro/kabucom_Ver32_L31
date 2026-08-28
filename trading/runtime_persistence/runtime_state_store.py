@@ -15,16 +15,19 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import sqlite3
+import threading
 from datetime import datetime
 from typing import Any
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
-BASE_DIR = r'\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\runtime_state'
+BASE_DIR = nas_path(r'raw_data\kabu_station\runtime_state')
 
 
 # ============================================================
@@ -41,11 +44,83 @@ def get_runtime_state_db_path(trade_date: str | None = None) -> str:
     return os.path.join(BASE_DIR, f'runtime_state_{td}.db')
 
 
+# P0-1: 接続リーク対策。
+#
+# 旧実装は全関数が `with _connect(path) as conn:` の形で、close() がどこにも
+# 無かった。`with sqlite3.Connection` はトランザクションを commit/rollback
+# するだけで接続は閉じない (Python 公式仕様)。参照が traceback / cursor /
+# logger.exception のフレームに残ると接続は GC まで生き残り、
+# 実測で 1 接続あたり Win32 ハンドルを 3 個保持し続ける
+# (tests: 500 接続で +1502 handles、明示 close で +0)。
+#
+# BASE_DIR は NAS(SMB) なので、これが積み上がると SMB のオープン上限に当たり
+#   - sqlite3.OperationalError: unable to open database file (SQLITE_CANTOPEN)
+#   - sqlite3.OperationalError: disk I/O error          (SQLITE_IOERR)
+#   - OSError: [Errno 24] Too many open files           (ローカルパスでも発生)
+# が同時多発する。2026-08-27 15:21:44 以降の positions.db 障害はこれ。
+# この関数は必ず close() する。
+_CONN_OPENED = 0
+_CONN_CLOSED = 0
+_CONN_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
 def _connect(path: str):
+    global _CONN_OPENED, _CONN_CLOSED
     conn = sqlite3.connect(path, timeout=30)
-    conn.execute('PRAGMA journal_mode=WAL')
-    conn.execute('PRAGMA synchronous=NORMAL')
-    return conn
+    with _CONN_LOCK:
+        _CONN_OPENED += 1
+    try:
+        # journal_mode は DB ファイルに永続するので毎接続で投げ直さない。
+        # NAS 越しでは 1 PRAGMA が 1 往復になるため、接続あたりの
+        # 往復数をそのまま SMB 負荷として削る。
+        conn.execute('PRAGMA busy_timeout=30000')
+        conn.execute('PRAGMA synchronous=NORMAL')
+        yield conn
+        try:
+            conn.commit()
+        except Exception:
+            logger.debug('[RUNTIME STATE] commit failed path=%s', path, exc_info=True)
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            logger.debug('[RUNTIME STATE] rollback failed path=%s', path, exc_info=True)
+        raise
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            logger.debug('[RUNTIME STATE] close failed path=%s', path, exc_info=True)
+        else:
+            with _CONN_LOCK:
+                _CONN_CLOSED += 1
+
+
+def connection_stats() -> dict:
+    """診断用: この store が開いた/閉じた接続数。差分が増え続けたらリーク。"""
+    with _CONN_LOCK:
+        return {
+            'opened': _CONN_OPENED,
+            'closed': _CONN_CLOSED,
+            'outstanding': _CONN_OPENED - _CONN_CLOSED,
+        }
+
+
+# schema 作成は 1 日 1 回で足りる。旧実装は save_* のたびに
+# ensure_runtime_state_db() を呼んでいたため、1 回の保存で NAS へ
+# 接続が 2 本走っていた (実測 [RUNTIME STATE] schema ensured x420)。
+_SCHEMA_DONE: set[str] = set()
+_SCHEMA_LOCK = threading.Lock()
+
+
+def _ensured_path(trade_date: str | None = None) -> str:
+    path = get_runtime_state_db_path(trade_date)
+    with _SCHEMA_LOCK:
+        done = path in _SCHEMA_DONE
+    if done:
+        return path
+    return ensure_runtime_state_db(trade_date)
 
 
 # ============================================================
@@ -54,6 +129,10 @@ def _connect(path: str):
 
 def ensure_runtime_state_db(trade_date: str | None = None) -> str:
     path = get_runtime_state_db_path(trade_date)
+
+    with _SCHEMA_LOCK:
+        if path in _SCHEMA_DONE:
+            return path
 
     with _connect(path) as conn:
         conn.execute(
@@ -121,6 +200,9 @@ def ensure_runtime_state_db(trade_date: str | None = None) -> str:
 
         conn.commit()
 
+    with _SCHEMA_LOCK:
+        _SCHEMA_DONE.add(path)
+
     logger.info('[RUNTIME STATE] schema ensured path=%s', path)
     return path
 
@@ -142,7 +224,7 @@ def save_position_state(
     status: str = 'OPEN',
     trade_date: str | None = None,
 ):
-    path = ensure_runtime_state_db(trade_date)
+    path = _ensured_path(trade_date)
     now = datetime.now().isoformat()
 
     with _connect(path) as conn:
@@ -192,7 +274,7 @@ def save_pending_order_state(
     status: str = 'PENDING',
     trade_date: str | None = None,
 ):
-    path = ensure_runtime_state_db(trade_date)
+    path = _ensured_path(trade_date)
     now = datetime.now().isoformat()
 
     with _connect(path) as conn:
@@ -238,7 +320,7 @@ def save_smart_entry_state(
     payload: dict | None = None,
     trade_date: str | None = None,
 ):
-    path = ensure_runtime_state_db(trade_date)
+    path = _ensured_path(trade_date)
     now = datetime.now().isoformat()
 
     with _connect(path) as conn:
@@ -283,7 +365,7 @@ def save_portfolio_state(
     payload: dict | None = None,
     trade_date: str | None = None,
 ):
-    path = ensure_runtime_state_db(trade_date)
+    path = _ensured_path(trade_date)
     now = datetime.now().isoformat()
 
     with _connect(path) as conn:
@@ -317,7 +399,7 @@ def save_portfolio_state(
 # ============================================================
 
 def load_open_positions(trade_date: str | None = None) -> list[dict]:
-    path = ensure_runtime_state_db(trade_date)
+    path = _ensured_path(trade_date)
     with _connect(path) as conn:
         cur = conn.execute(
             '''
@@ -342,7 +424,7 @@ def load_open_positions(trade_date: str | None = None) -> list[dict]:
 
 
 def load_pending_orders(trade_date: str | None = None) -> list[dict]:
-    path = ensure_runtime_state_db(trade_date)
+    path = _ensured_path(trade_date)
     with _connect(path) as conn:
         cur = conn.execute(
             '''
@@ -365,7 +447,7 @@ def load_pending_orders(trade_date: str | None = None) -> list[dict]:
 
 
 def load_latest_portfolio_state(trade_date: str | None = None) -> dict:
-    path = ensure_runtime_state_db(trade_date)
+    path = _ensured_path(trade_date)
     with _connect(path) as conn:
         cur = conn.execute(
             '''
@@ -395,7 +477,7 @@ def load_latest_portfolio_state(trade_date: str | None = None) -> dict:
 # ============================================================
 
 def mark_position_closed(symbol: str, side: str, entry_time: Any, trade_date: str | None = None):
-    path = ensure_runtime_state_db(trade_date)
+    path = _ensured_path(trade_date)
     now = datetime.now().isoformat()
     with _connect(path) as conn:
         conn.execute(
@@ -415,7 +497,7 @@ def mark_position_closed(symbol: str, side: str, entry_time: Any, trade_date: st
 
 
 def mark_pending_order_done(order_id: str, status: str = 'DONE', trade_date: str | None = None):
-    path = ensure_runtime_state_db(trade_date)
+    path = _ensured_path(trade_date)
     now = datetime.now().isoformat()
     with _connect(path) as conn:
         conn.execute(

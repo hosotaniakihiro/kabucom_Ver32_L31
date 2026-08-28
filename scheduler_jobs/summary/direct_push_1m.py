@@ -200,6 +200,88 @@ def _candidate_push_frames() -> list[tuple[str, pd.DataFrame]]:
                     continue
                 except Exception:
                     break
+
+    # WebSocket の生バッファ (メモリのみ。NAS は読まない)。
+    # main.py は memory_only 運用で global_data.push_df を更新する flush が
+    # 動かないため、ここだけが新鮮なことがある
+    # (実測: global_data.push_df=13:08:20 のまま / live バッファは 6280 行と増加中)。
+    # memory_latest_1m._load_push_memory_df_core() と同じソース。
+    try:
+        from trading.push.push_stream import get_push_dataframe
+
+        v = get_push_dataframe()
+        if isinstance(v, pd.DataFrame) and not v.empty and id(v) not in seen:
+            seen.add(id(v))
+            frames.append(("push_stream.get_push_dataframe", v))
+    except Exception:
+        logger.debug("[SUMMARY FORCE DIRECT 1M] push_stream live buffer unavailable", exc_info=True)
+
+    # ------------------------------------------------------------
+    # P0-10 FAST LANE: メモリ候補が全部 stale なら PUSH DB を読む。
+    #
+    # 2026-08-27 15:24 の実測:
+    #   global_data.push_df              latest=14:08:10 rows=644
+    #   push_stream.get_push_dataframe   latest=14:08:10 rows=2488
+    #   push{YYYYMMDD}.db stream_data    latest=15:24:04  (最終的に 15:30:52)
+    # main.py 自身の WS バッファは last_recv が新しいのに datetime が
+    # 14:08:10 で止まっていた (WS が張り直しのたびに初期スナップショット
+    # だけ受けて live 更新を掴めていない。connection_generation 335->392)。
+    # 一方 push_receiver が書く PUSH DB は datetime == received_at で常に新鮮。
+    #
+    # そのため「メモリが古いときは DB を正とする」。
+    # heavy な historical worker は待たない。読むのは tail だけ。
+    # ------------------------------------------------------------
+    if _env_bool("SUMMARY_FORCE_DIRECT_PUSH_DB_FASTLANE", True):
+        st = _FastLaneStages("push_db_fastlane")
+        try:
+            max_age = max(30.0, _env_float("SUMMARY_FORCE_DIRECT_MAX_OUTPUT_AGE_SEC", 90.0))
+            now_ts = pd.Timestamp(dt.datetime.now())
+            fresh_enough = False
+            for _name, _df in frames:
+                latest = _latest_dt(_df)
+                if latest is None:
+                    continue
+                if float((now_ts - pd.Timestamp(latest)).total_seconds()) <= max_age:
+                    fresh_enough = True
+                    break
+            st.mark("freshness_scan", n=len(frames), fresh=fresh_enough)
+
+            if not fresh_enough:
+                from scheduler_jobs.summary.memory_latest_1m import _read_push_db_recent
+
+                db_df = _read_push_db_recent()
+                st.mark("push_db_read",
+                        rows=0 if not isinstance(db_df, pd.DataFrame) else len(db_df))
+                if isinstance(db_df, pd.DataFrame) and not db_df.empty:
+                    db_latest = _latest_dt(db_df)
+                    st.mark("latest_dt")
+                    logger.warning(
+                        "[SUMMARY FORCE DIRECT 1M] FAST LANE: メモリ候補が全部 stale なので "
+                        "PUSH DB を採用 db_rows=%s db_latest=%s memory=[%s] version=%s",
+                        len(db_df), db_latest,
+                        ", ".join("%s(latest=%s,rows=%s)" % (n, _latest_dt(d), len(d))
+                                  for n, d in frames[:4]),
+                        VERSION,
+                    )
+                    st.mark("log_memory_summary", n=min(4, len(frames)))
+                    # DB を先頭へ入れる。以降の best 選択で確実に候補に入る。
+                    frames.insert(0, ("push_db.stream_data.fastlane", db_df))
+                    # 直読みしている経路のために global_data.push_df も更新する。
+                    # 単調ガード (global_state.push_df setter) があるので
+                    # 古いフレームで潰されることはない。
+                    try:
+                        from global_state import global_data
+
+                        global_data.push_df = db_df
+                    except Exception:
+                        logger.debug("[SUMMARY FORCE DIRECT 1M] push_df writeback failed",
+                                     exc_info=True)
+                    st.mark("push_df_writeback")
+            st.emit(fresh_enough=fresh_enough, frames=len(frames))
+        except Exception:
+            st.emit(result="exception")
+            logger.exception("[SUMMARY FORCE DIRECT 1M] FAST LANE push DB read failed")
+
     return frames
 
 
@@ -251,17 +333,82 @@ def _normalize_push_ticks(df: pd.DataFrame, now: dt.datetime, *, source_name: st
         return pd.DataFrame()
 
 
+# ============================================================
+# P0-2: FAST LANE の段別計測
+# ------------------------------------------------------------
+# 2026-08-28 08:51 は入力 983 行に対して
+#   stream_data.fastlane  elapsed=41.202s
+#   SUMMARY FORCE DIRECT 1M elapsed=49.588s
+# だった。行数から見てアルゴリズムではないので、どの段で
+# 時間を使っているかを必ず名指しできるようにする。
+# 1 段 1 秒以上で WARNING。
+# ============================================================
+
+_FASTLANE_STAGE_WARN_SEC = 1.0
+
+
+class _FastLaneStages:
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self._t0 = time.perf_counter()
+        self._last = self._t0
+        self.marks: list = []
+        self.slow: list = []
+
+    def mark(self, name: str, **info) -> None:
+        now = time.perf_counter()
+        el = now - self._last
+        self._last = now
+        self.marks.append((name, el, info))
+        if el >= _FASTLANE_STAGE_WARN_SEC:
+            self.slow.append(name)
+            logger.warning(
+                "[FASTLANE STAGE] slow label=%s name=%s elapsed=%.3fs %s "
+                "(1 段で 1 秒以上かかっている)",
+                self.label, name, el,
+                " ".join("%s=%s" % kv for kv in info.items()),
+            )
+
+    @property
+    def total(self) -> float:
+        return time.perf_counter() - self._t0
+
+    def emit(self, **info) -> None:
+        parts = " ".join(
+            "%s=%.3fs%s" % (
+                n, e,
+                ("(" + ",".join("%s=%s" % kv for kv in i.items()) + ")") if i else "",
+            )
+            for n, e, i in self.marks
+        )
+        log = logger.warning if (self.total >= _FASTLANE_STAGE_WARN_SEC or self.slow) else logger.info
+        log(
+            "[FASTLANE STAGE] label=%s total=%.3fs stages=[%s] %s",
+            self.label, self.total, parts,
+            " ".join("%s=%s" % kv for kv in info.items()),
+        )
+
+
 def _build_from_process_memory(now: dt.datetime) -> pd.DataFrame:
     t0 = time.perf_counter()
     best_name = ""
     best_ticks = pd.DataFrame()
+    # P0-2: 段ごとに計測する。1 段 1 秒以上なら WARNING。
+    # 983 行の入力で 41 秒かかっていたのがどこかを名指しできるようにする。
+    st = _FastLaneStages("build_from_process_memory")
     try:
-        for name, df in _candidate_push_frames():
+        cands = _candidate_push_frames()
+        st.mark("candidate_frames", n=len(cands),
+                rows=sum(len(d) for _, d in cands))
+        for name, df in cands:
+            n_before = len(df)
             ticks = _normalize_push_ticks(df, now, source_name=name)
+            st.mark("normalize_ticks", src=name, rows_before=n_before, rows_after=len(ticks))
             if len(ticks) > len(best_ticks):
                 best_name = name
                 best_ticks = ticks
         if best_ticks.empty:
+            st.emit(result="no_ticks")
             return pd.DataFrame()
         rows = []
         for (sym, minute), g in best_ticks.sort_values("datetime").groupby(["symbol", "minute"], sort=False):
@@ -285,12 +432,18 @@ def _build_from_process_memory(now: dt.datetime) -> pd.DataFrame:
                 "turnover": vol * close if vol > 0 else 0.0,
                 "source": "SUMMARY",
             })
+        st.mark("ohlc_aggregate", tick_rows=len(best_ticks), bar_rows=len(rows))
         df = pd.DataFrame(rows)
         if df.empty:
+            st.emit(result="empty_bars")
             return pd.DataFrame()
         latest = df.sort_values(["symbol", "datetime"]).groupby("symbol", as_index=False).tail(1).reset_index(drop=True)
+        st.mark("latest_projection", rows_before=len(df), rows_after=len(latest),
+                symbols=int(latest["symbol"].nunique()) if "symbol" in latest.columns else -1)
         if not _is_fresh_df(latest, now, label=f"process_memory:{best_name}"):
+            st.emit(result="stale_output")
             return pd.DataFrame()
+        st.emit(result="ok", source=best_name, rows=len(latest))
         logger.warning(
             "[SUMMARY FORCE DIRECT 1M] built via fresh raw push memory fallback source=%s tick_rows=%s summary_rows=%s latest_dt=%s elapsed=%.3fs version=%s",
             best_name, len(best_ticks), len(latest), latest["datetime"].max() if "datetime" in latest.columns else None,
@@ -298,7 +451,8 @@ def _build_from_process_memory(now: dt.datetime) -> pd.DataFrame:
         )
         return latest
     except Exception:
-        logger.debug("[SUMMARY FORCE DIRECT 1M] process memory fallback failed", exc_info=True)
+        st.emit(result="exception")
+        logger.exception("[SUMMARY FORCE DIRECT 1M] process memory fallback failed")
         return pd.DataFrame()
 
 
@@ -313,8 +467,109 @@ def _build_direct_inner(now: dt.datetime) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+# 自分が最後に publish した latest_dt。fast path でのエコー採用を防ぐ。
+_LAST_PUBLISHED_LATEST: Any = None
+
+
+def _fresh_summary_candidates() -> list[tuple[str, pd.DataFrame]]:
+    """完成済み 1m summary の候補 (メモリ/GC のみ、NAS なし)。"""
+    out: list[tuple[str, pd.DataFrame]] = []
+    try:
+        from trading.entry.tonosama.fresh_summary_wait import _context_candidate_dfs
+
+        for name, df in _context_candidate_dfs():
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                out.append(("ctx." + str(name), df))
+    except Exception:
+        logger.debug("[SUMMARY FORCE DIRECT 1M] fresh summary enumerator unavailable", exc_info=True)
+
+    # 上記が使えない環境向けの最小限の直接参照。
+    for mod_name, obj_names in (("global_state", ("global_data",)),):
+        try:
+            mod = __import__(mod_name, fromlist=list(obj_names))
+            for on in obj_names:
+                obj = getattr(mod, on, None)
+                if obj is None:
+                    continue
+                for attr in ("latest_summary_1m_df", "summary_1m_latest_df", "summary_1m_df",
+                             "push_summary_1m_df", "push_merged_summary_1", "merged_summary_1"):
+                    try:
+                        v = getattr(obj, attr, None)
+                    except Exception:
+                        continue
+                    if isinstance(v, pd.DataFrame) and not v.empty:
+                        out.append(("%s.%s.%s" % (mod_name, on, attr), v))
+        except Exception:
+            continue
+    return out
+
+
+def _fresh_summary_fast_path(now: dt.datetime) -> pd.DataFrame:
+    """再構築する前に、既に fresh な完成済み summary があればそれを使う。
+
+    _LAST_PUBLISHED_LATEST は読むだけ (代入は _store 側)。
+    """
+
+    if not _env_bool("SUMMARY_FORCE_DIRECT_FRESH_SUMMARY_FASTPATH", True):
+        return pd.DataFrame()
+    try:
+        max_age = max(30.0, _env_float("SUMMARY_FORCE_DIRECT_FRESH_SUMMARY_MAX_AGE_SEC", 90.0))
+        min_rows = max(1, _env_int("SUMMARY_FORCE_DIRECT_FRESH_SUMMARY_MIN_ROWS", 1))
+        now_ts = pd.Timestamp(now)
+
+        rows_report: list[str] = []
+        best = None
+        best_name = ""
+        best_dt = None
+
+        for name, df in _fresh_summary_candidates():
+            latest = _latest_dt(df)
+            if latest is None:
+                rows_report.append("%s(latest=None)" % name)
+                continue
+            age = float((now_ts - latest).total_seconds())
+            try:
+                syms = int(df["symbol"].nunique()) if "symbol" in df.columns else 0
+            except Exception:
+                syms = 0
+            rows_report.append("%s(latest=%s age=%.1fs rows=%s symbols=%s)" % (name, latest, age, len(df), syms))
+            if age > max_age or len(df) < min_rows:
+                continue
+            # 自分が直前に出したものを食い戻さない。
+            if _LAST_PUBLISHED_LATEST is not None and latest <= _LAST_PUBLISHED_LATEST:
+                continue
+            if best_dt is None or latest > best_dt:
+                best, best_name, best_dt = df, name, latest
+
+        if best is None:
+            if rows_report:
+                logger.info(
+                    "[SUMMARY FORCE DIRECT 1M] fresh summary fastpath miss max_age=%.0fs candidates=%s version=%s",
+                    max_age, " | ".join(rows_report[:12]), VERSION,
+                )
+            return pd.DataFrame()
+
+        logger.warning(
+            "[SUMMARY FORCE DIRECT 1M] fresh summary fastpath hit source=%s latest=%s rows=%s "
+            "(skipped %.0fs rebuild) candidates=%s version=%s",
+            best_name, best_dt, len(best),
+            _env_float("SUMMARY_FORCE_DIRECT_BUILD_TIMEOUT_SEC", 6.0),
+            " | ".join(rows_report[:12]), VERSION,
+        )
+        return best.reset_index(drop=True)
+    except Exception:
+        logger.exception("[SUMMARY FORCE DIRECT 1M] fresh summary fastpath failed")
+        return pd.DataFrame()
+
+
 def _build_direct(now: dt.datetime) -> pd.DataFrame:
     t0 = time.perf_counter()
+
+    # 既に fresh な summary があるなら 6 秒の再構築を待たない。
+    fast = _fresh_summary_fast_path(now)
+    if isinstance(fast, pd.DataFrame) and not fast.empty:
+        return fast
+
     timeout = max(0.0, _env_float("SUMMARY_FORCE_DIRECT_BUILD_TIMEOUT_SEC", 6.0))
     df = pd.DataFrame()
     if timeout <= 0:
@@ -339,7 +594,63 @@ def _build_direct(now: dt.datetime) -> pd.DataFrame:
     if isinstance(df, pd.DataFrame) and not df.empty and not _is_fresh_df(df, now, label="robust_builder"):
         df = pd.DataFrame()
     if not isinstance(df, pd.DataFrame) or df.empty:
-        df = _build_from_process_memory(now)
+        # ------------------------------------------------------------
+        # P0-7: fallback も必ず時間で打ち切る。
+        #
+        # 旧実装では上の timeout は _build_direct_inner だけを縛っており、
+        # ここから先の _build_from_process_memory (FAST LANE の PUSH DB 読み)
+        # は**一切縛られていなかった**。そのため 2026-08-28 08:51 は
+        #     build timeout timeout=6.000s elapsed=8.380s
+        #     -> stream_data.fastlane elapsed=41.202s
+        #     -> SUMMARY FORCE DIRECT 1M elapsed=49.588s
+        # となり、6 秒の timeout が実質何も止めていなかった。
+        #
+        # timeout 値は増やさない。予算を使い切ったら
+        #   - fallback を打ち切る
+        #   - 前回の fresh projection を保持したまま空を返す
+        #   - 次 tick で再試行する
+        # とする。空を返しても呼び出し側は既存 merged を潰さない
+        # (stale なデータで Entry を fail-open させない)。
+        # ------------------------------------------------------------
+        total_budget = max(
+            timeout,
+            _env_float("SUMMARY_FORCE_DIRECT_TOTAL_BUDGET_SEC", max(2.0, timeout * 1.5)),
+        )
+        spent = time.perf_counter() - t0
+        remain = total_budget - spent
+        if remain <= 0.2:
+            logger.error(
+                "[SUMMARY FORCE DIRECT 1M] fallback 打ち切り reason=budget_exhausted "
+                "spent=%.3fs total_budget=%.3fs timeout=%.3fs now=%s version=%s "
+                "(前回の fresh projection を保持し、次 tick で再試行する)",
+                spent, total_budget, timeout, now, VERSION,
+            )
+            return pd.DataFrame()
+
+        box2: dict[str, Any] = {"df": pd.DataFrame()}
+
+        def _target2() -> None:
+            try:
+                box2["df"] = _build_from_process_memory(now)
+            except Exception:
+                logger.exception("[SUMMARY FORCE DIRECT 1M] process memory fallback failed")
+                box2["df"] = pd.DataFrame()
+
+        th2 = threading.Thread(
+            target=_target2, name="summary-force-direct-fallback", daemon=True
+        )
+        th2.start()
+        th2.join(remain)
+        if th2.is_alive():
+            logger.error(
+                "[SUMMARY FORCE DIRECT 1M] fallback timeout budget=%.3fs remain=%.3fs "
+                "elapsed=%.3fs now=%s version=%s "
+                "(process memory / PUSH DB fallback を打ち切った。"
+                "timeout は伸ばさない。次 tick で再試行する)",
+                total_budget, remain, time.perf_counter() - t0, now, VERSION,
+            )
+            return pd.DataFrame()
+        df = box2.get("df")
     if isinstance(df, pd.DataFrame) and not df.empty:
         logger.warning(
             "[SUMMARY FORCE DIRECT 1M] built via fresh robust/process memory rows=%s symbols=%s latest_dt=%s elapsed=%.3fs timeout=%.3fs version=%s",
@@ -425,6 +736,11 @@ def _store(df: pd.DataFrame) -> None:
         _assign_attrs(GC, hist, latest)
     except Exception:
         pass
+    global _LAST_PUBLISHED_LATEST
+    try:
+        _LAST_PUBLISHED_LATEST = _latest_dt(hist)
+    except Exception:
+        pass
     logger.warning(
         "[SUMMARY FORCE DIRECT 1M] fast attrs only tf=1 hist_rows=%s latest_rows=%s latest_dt=%s elapsed=%.3fs version=%s",
         len(hist), len(latest), hist["datetime"].max() if "datetime" in hist.columns else None, time.perf_counter() - t0, VERSION,
@@ -505,6 +821,20 @@ def tier1_build_and_publish(now: dt.datetime, *, run_entry: bool) -> pd.DataFram
 
 def install() -> bool:
     global _PATCHED
+    # ------------------------------------------------------------
+    # 二重 install を防ぐ (R17)
+    #
+    # _PATCHED を立てるだけで **判定していなかった** ため、
+    # モジュールが別名で 2 回 import されると install が 2 回走り、
+    # 「installed」ログも 2 回出ていた。
+    # light_tick_1m / memory_latest_1m と同じ形に揃える。
+    # ------------------------------------------------------------
+    if _PATCHED:
+        logger.info(
+            "[SUMMARY FORCE DIRECT 1M] already installed -> skip (version=%s)",
+            VERSION,
+        )
+        return False
     os.environ.setdefault("SUMMARY_FORCE_DIRECT_BUILD_TIMEOUT_SEC", "6")
     os.environ.setdefault("SUMMARY_FORCE_DIRECT_AI_MAX_ACTIVE", "3")
     os.environ.setdefault("SUMMARY_FORCE_DIRECT_MEMORY_LOOKBACK_SEC", "90")

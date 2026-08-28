@@ -165,7 +165,7 @@ def _get_gc_summary_row(symbol: str, tf: int) -> dict:
 
 def _summary_db_path() -> str:
     ymd = os.getenv("KABU_TODAY") or os.getenv("TARGET_DATE") or datetime.now().strftime("%Y%m%d")
-    root = os.getenv("SUMMARY_DB_DIR") or r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary"
+    root = os.getenv("SUMMARY_DB_DIR") or nas_path(r"raw_data\kabu_station\summary")
     return os.path.join(root, f"summary{ymd}.db")
 
 
@@ -199,7 +199,7 @@ def _get_db_short_slope(symbol: str, tf: int) -> Optional[float]:
              ORDER BY datetime DESC
              LIMIT 1
         """
-        with sqlite3.connect(db, timeout=1.0) as conn:
+        with committing_connect(db, timeout=1.0) as conn:
             conn.execute("PRAGMA query_only=ON")
             row = conn.execute(sql, (sym,)).fetchone()
 
@@ -321,6 +321,8 @@ def _strict_guard_short_mtf_only(*, symbol: str, side: str, row: dict, detail: d
 # ============================================================
 
 import sys  # noqa: E402
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 _SHORT_MTF_DB_PROCESS_NAMES = (
     "main_database.py",

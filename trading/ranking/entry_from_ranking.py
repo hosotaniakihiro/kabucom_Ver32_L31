@@ -19,15 +19,18 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import datetime as dt
 import os
 import sqlite3
 import sys
+import threading
 import time
 from collections import Counter
 from typing import Dict, Any, Optional, Tuple, List
 
+import numpy as np
 import pandas as pd
 
 from global_state import global_data
@@ -60,6 +63,9 @@ try:
 except Exception:  # pragma: no cover
     _save_ranking_pseudo_technicals_core = None
     attach_ranking_technicals = None
+
+# P0-2/P0-9: `with sqlite3.connect(...)` は close しないため必ずこちらを使う。
+from database.sqlite_util import readonly_connect
 
 logger = logging.getLogger(__name__)
 
@@ -328,9 +334,11 @@ def _rsrc_apply_env_defaults() -> None:
         os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED", "1")
         os.environ.setdefault("RANKING_ENTRY_SOURCE_MAX_AGE_SEC", "300")
         os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_MAX_AGE_SEC", "300")
-        os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_FAILOPEN_STALE", "1")
+        # P0-4: strict_entry_defaults.STRICT_ENV が owner (値は "0")。
+        # ここで "1" を seed すると install 順で fail-open になりうるので入れない。
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_FAILOPEN_STALE", "0")
         os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_FAILOPEN_MAX_AGE_SEC", "1800")
-        os.environ.setdefault("RANKING_ENTRY_SOURCE_FAILOPEN_STALE_GLOBAL", "1")
+        os.environ.setdefault("RANKING_ENTRY_SOURCE_FAILOPEN_STALE_GLOBAL", "0")
         os.environ.setdefault("RANKING_ENTRY_SOURCE_FAILOPEN_GLOBAL_MAX_AGE_SEC", "1800")
         os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_LOOKBACK_MIN", "30")
         os.environ.setdefault("RANKING_ENTRY_SOURCE_DB_MAX_ROWS", "900")
@@ -370,11 +378,87 @@ def _rsrc_resolve_db_path() -> Optional[str]:
     return None
 
 
-def _rsrc_table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+# P0-9: NAS 越しの metadata 往復を減らすためのスキーマキャッシュ。
+# 実測で probe_elapsed 253.9 秒のうち 232.9 秒が SQL ではなく
+# connect / sqlite_master / PRAGMA table_info の往復だった。
+# スキーマは日中変わらないので TTL 付きで覚える (恒久 skip にはしない)。
+_RSRC_SCHEMA_CACHE: Dict[str, Dict[str, Any]] = {}
+_RSRC_SCHEMA_LOCK = threading.Lock()
+
+# どの DB を読んでいるかは thread-local で持つ。
+# id(conn) をキーにすると、return / 例外で pop を取りこぼしたときに
+# id が再利用されて **別の接続に古い db_path が紐づく**。
+_RSRC_TLS = threading.local()
+
+
+def _rsrc_schema_ttl() -> float:
+    return max(0.0, _env_float("RANKING_ENTRY_SOURCE_DB_SCHEMA_TTL_SEC", 300.0))
+
+
+def _rsrc_schema_entry(db_path: str) -> Optional[Dict[str, Any]]:
+    ttl = _rsrc_schema_ttl()
+    if ttl <= 0 or not db_path:
+        return None
+    with _RSRC_SCHEMA_LOCK:
+        ent = _RSRC_SCHEMA_CACHE.get(db_path)
+        if not ent:
+            return None
+        if time.time() - float(ent.get("ts") or 0.0) > ttl:
+            # TTL 切れ。次回は実際に問い合わせ直す
+            _RSRC_SCHEMA_CACHE.pop(db_path, None)
+            return None
+        return ent
+
+
+def _rsrc_schema_store(db_path: str, *, tables=None, table=None, cols=None) -> None:
+    if _rsrc_schema_ttl() <= 0 or not db_path:
+        return
+    with _RSRC_SCHEMA_LOCK:
+        ent = _RSRC_SCHEMA_CACHE.get(db_path)
+        if not ent:
+            ent = {"ts": time.time(), "tables": None, "cols": {}}
+            _RSRC_SCHEMA_CACHE[db_path] = ent
+        if tables is not None:
+            ent["tables"] = list(tables)
+        if table is not None and cols is not None:
+            ent["cols"][str(table)] = list(cols)
+
+
+def _rsrc_current_db_path() -> str:
+    """いま読んでいる db_path。sqlite3.Connection には属性を付けられない。"""
+    return str(getattr(_RSRC_TLS, "db_path", "") or "")
+
+
+@contextlib.contextmanager
+def _rsrc_bind_db_path(db_path: str):
+    """db_path をこのスレッドに束ねる。return でも例外でも必ず元に戻す。"""
+    prev = getattr(_RSRC_TLS, "db_path", "")
+    _RSRC_TLS.db_path = str(db_path or "")
     try:
-        return [str(r[1]) for r in conn.execute(f"PRAGMA table_info({_rsrc_quote(table)})").fetchall()]
+        yield
+    finally:
+        _RSRC_TLS.db_path = prev
+
+
+def _rsrc_conn_db_path(conn) -> str:
+    """後方互換。conn は使わない (thread-local から取る)。"""
+    return _rsrc_current_db_path()
+
+
+def _rsrc_table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+    db_path = _rsrc_current_db_path()
+    ent = _rsrc_schema_entry(db_path)
+    if ent is not None:
+        hit = (ent.get("cols") or {}).get(str(table))
+        if hit:
+            return list(hit)
+    try:
+        cols = [str(r[1]) for r in conn.execute(f"PRAGMA table_info({_rsrc_quote(table)})").fetchall()]
     except Exception:
         return []
+    if cols:
+        _rsrc_schema_store(db_path, table=table, cols=cols)
+    return cols
 
 
 def _rsrc_table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -503,14 +587,327 @@ def _rsrc_candidate_tables(conn: sqlite3.Connection) -> List[str]:
         "ranking_summary_1min",
         "ranking_summary_5min",
     ]
+    db_path = _rsrc_current_db_path()
+    ent = _rsrc_schema_entry(db_path)
+    if ent is not None and ent.get("tables") is not None:
+        cached = [t for t in ent["tables"] if t in base]
+        # 候補リスト (env) が変わっていなければキャッシュを使う
+        if cached and len(cached) == len(ent["tables"]):
+            return list(cached)
+
+    _t0 = time.perf_counter()
     out: List[str] = []
     for t in base:
         if t and t not in out and _rsrc_table_exists(conn, t):
             out.append(t)
+    logger.info(
+        "[RANKING ENTRY SOURCE DB FALLBACK] candidate_tables probed n=%d/%d elapsed=%.3fs",
+        len(out), len(base), time.perf_counter() - _t0,
+    )
+    _rsrc_schema_store(db_path, tables=out)
     return out
 
 
+def _rsrc_last_good_df():
+    """TTL を無視して直近の成功結果を返す (df, age_sec)。"""
+    try:
+        if _RSRC_LAST_DB_DF is None:
+            return None, None
+        age = time.time() - float(_RSRC_LAST_DB_TS or 0.0)
+        return _RSRC_LAST_DB_DF, age
+    except Exception:
+        return None, None
+
+
+def _worker_guard_mod():
+    try:
+        from trading.entry_exit import worker_guard
+        return worker_guard
+    except Exception:
+        return None
+
+
+_RSRC_BG_LOCK = threading.Lock()
+_RSRC_BG_THREAD: list = [None]
+_RSRC_BG_SKIPPED: list = [0]
+
+
+def _rsrc_singleflight_enabled() -> bool:
+    return (os.environ.get("RANKING_ENTRY_DB_SINGLEFLIGHT", "1").strip().lower()
+            not in {"0", "false", "no", "off"})
+
+
+def _rsrc_db_deadline_sec() -> float:
+    """NAS ranking DB 読みに許す壁時計上限。
+
+    entry loop の budget (既定 30秒) を食いつぶさない値にする。
+    """
+    try:
+        return max(0.5, _env_float("RANKING_ENTRY_SOURCE_DB_DEADLINE_SEC", 8.0))
+    except Exception:
+        return 5.0
+
+
 def _rsrc_load_from_ranking_db() -> pd.DataFrame:
+    """deadline 付きの DB fallback。
+
+    sqlite の timeout / busy_timeout はロック待ちの上限だけで、
+    SMB の I/O 時間には効かない。実測で 174 秒かかったので、
+    別スレッド + join(deadline) で呼び出し側を必ず戻す。
+    """
+    if not _env_bool("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED", True):
+        return pd.DataFrame()
+
+    deadline = _rsrc_db_deadline_sec()
+    box: Dict[str, Any] = {"df": pd.DataFrame()}
+    t0 = time.perf_counter()
+
+    # 見捨てた背景リーダーが積み上がると NAS を潰す (実測 70〜170 秒の読みが並走)。
+    # 走っているものが 1 本でもあれば新しく起こさない。
+    if _rsrc_singleflight_enabled():
+        with _RSRC_BG_LOCK:
+            alive = _RSRC_BG_THREAD[0] is not None and _RSRC_BG_THREAD[0].is_alive()
+        if alive:
+            last, age = _rsrc_last_good_df()
+            _RSRC_BG_SKIPPED[0] += 1
+            logger.warning(
+                "[RANKING ENTRY SOURCE DB FALLBACK] background read already running "
+                "thread=%s -> 新しい読みは起こさない (skipped=%d) last-good rows=%s age=%s",
+                _RSRC_BG_THREAD[0].name if _RSRC_BG_THREAD[0] is not None else None,
+                _RSRC_BG_SKIPPED[0],
+                0 if last is None or last.empty else len(last),
+                "n/a" if age is None else ("%.1fs" % age),
+            )
+            return last if isinstance(last, pd.DataFrame) else pd.DataFrame()
+
+    def _target() -> None:
+        try:
+            box["df"] = _rsrc_load_from_ranking_db_core(deadline_at=t0 + deadline)
+        except Exception:
+            logger.debug("[RANKING ENTRY SOURCE DB FALLBACK] core read failed", exc_info=True)
+        finally:
+            with _RSRC_BG_LOCK:
+                if _RSRC_BG_THREAD[0] is threading.current_thread():
+                    _RSRC_BG_THREAD[0] = None
+
+    th = threading.Thread(target=_target, name="ranking-entry-db-fallback", daemon=True)
+    with _RSRC_BG_LOCK:
+        _RSRC_BG_THREAD[0] = th
+    th.start()
+    th.join(deadline)
+    if th.is_alive():
+        # 空を返すとランキング経路が丸ごと死むので、
+        # 直近の成功結果 (last-good) を返す。
+        # 見捨てたスレッドは後から完走して _rsrc_cache_put で埋めるので、
+        # 2 回目以降のループは即座に使える。
+        # 古さの可否は下流の既存ガードが判断する。
+        last, age = _rsrc_last_good_df()
+        logger.warning(
+            "[RANKING ENTRY SOURCE DB FALLBACK] deadline exceeded deadline=%.1fs elapsed=%.1fs -> use last-good rows=%s age=%s (entry budget protected; background read continues)",
+            deadline, time.perf_counter() - t0,
+            0 if last is None or last.empty else len(last),
+            "n/a" if age is None else ("%.1fs" % age),
+        )
+        return last if isinstance(last, pd.DataFrame) else pd.DataFrame()
+    return box.get("df") if isinstance(box.get("df"), pd.DataFrame) else pd.DataFrame()
+
+
+def _rsrc_pick_latest_table_enabled() -> bool:
+    return _env_bool("RANKING_ENTRY_SOURCE_DB_PICK_LATEST_TABLE", True)
+
+
+def _rsrc_query_budget_sec() -> float:
+    return max(0.2, _env_float("RANKING_ENTRY_SOURCE_DB_QUERY_BUDGET_SEC", 2.0))
+
+
+def _rsrc_budget_guard(conn: sqlite3.Connection, sec: float):
+    """SQLite クエリに実時間の上限を掛ける。
+
+    progress handler が 1 を返すと SQLite はそのクエリを中断し
+    OperationalError('interrupted') を投げる。
+    NAS が詰まったときに 120 秒待たされないための保険。
+    """
+    deadline = time.perf_counter() + max(0.05, float(sec))
+
+    def _h() -> int:
+        return 1 if time.perf_counter() > deadline else 0
+
+    try:
+        conn.set_progress_handler(_h, 2000)
+        return True
+    except Exception:
+        logger.debug("[RANKING ENTRY SOURCE DB FALLBACK] progress handler unavailable", exc_info=True)
+        return False
+
+
+def _rsrc_clear_budget_guard(conn: sqlite3.Connection) -> None:
+    try:
+        conn.set_progress_handler(None, 0)
+    except Exception:
+        pass
+
+
+def _rsrc_latest_per_table(conn: sqlite3.Connection, tables: List[str], *, budget_sec: float):
+    """各テーブルの MAX(datetime) だけを取る。
+
+    これは datetime index の covering scan なので極めて安い
+    (実測 0.004〜0.059 秒/テーブル)。
+    ここで最新テーブルを 1 本に絞ってから本体を読む。
+    """
+    out = []
+    for table in tables:
+        cols = _rsrc_table_columns(conn, table)
+        if not cols:
+            continue
+        dt_col = _rsrc_find_col(cols, _RSRC_DATETIME_COLS)
+        if not dt_col:
+            # datetime 列が無いテーブルは最新判定できない。従来経路に任せる。
+            out.append((table, None, None, cols))
+            continue
+        t0 = time.perf_counter()
+        guarded = _rsrc_budget_guard(conn, budget_sec)
+        try:
+            row = conn.execute(
+                'SELECT MAX(%s) FROM %s' % (_rsrc_quote(dt_col), _rsrc_quote(table))
+            ).fetchone()
+            mx = row[0] if row else None
+        except Exception as e:
+            logger.warning(
+                "[RANKING ENTRY SOURCE DB FALLBACK] latest probe failed table=%s err=%s elapsed=%.3fs",
+                table, e, time.perf_counter() - t0,
+            )
+            continue
+        finally:
+            if guarded:
+                _rsrc_clear_budget_guard(conn)
+        parsed = pd.to_datetime(mx, errors="coerce") if mx is not None else None
+        if parsed is not None and pd.isna(parsed):
+            parsed = None
+        logger.info(
+            "[RANKING ENTRY SOURCE DB FALLBACK] latest probe table=%s latest=%s elapsed=%.3fs cols=%d",
+            table, mx, time.perf_counter() - t0, len(cols),
+        )
+        out.append((table, parsed, dt_col, cols))
+    return out
+
+
+def _rsrc_read_one_table(conn: sqlite3.Connection, table: str, dt_col, cols, *,
+                         lookback_min: int, max_rows: int, budget_sec: float,
+                         latest=None):
+    """テーブル 1 本だけを読む。index 経路を先に試し、予算超過なら安い経路へ落とす。
+
+    「WHERE datetime>=? が常に速い」わけではない。
+    index が covering でないテーブルでは 1 行ごとのランダム参照になり、
+    SMB 越しでは rowid 順の連続読みより遅い。
+    なので予算を掛けて、超えたら rowid 経路へ落とす。
+    """
+    if dt_col:
+        cutoff = None
+        try:
+            # probe 済みなら引き直さない (NAS 往復を 1 回減らす)。
+            mx = latest
+            if mx is None:
+                latest_row = conn.execute(
+                    'SELECT MAX(%s) FROM %s' % (_rsrc_quote(dt_col), _rsrc_quote(table))
+                ).fetchone()
+                mx = pd.to_datetime(latest_row[0], errors="coerce") if latest_row else None
+            if mx is not None and not pd.isna(mx):
+                cutoff = (mx - pd.Timedelta(minutes=max(1, lookback_min))).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            logger.debug("[RANKING ENTRY SOURCE DB FALLBACK] cutoff calc failed table=%s", table, exc_info=True)
+
+        if cutoff is not None:
+            t0 = time.perf_counter()
+            guarded = _rsrc_budget_guard(conn, budget_sec)
+            try:
+                raw = pd.read_sql_query(
+                    'SELECT * FROM %s WHERE %s >= ? ORDER BY %s DESC LIMIT ?'
+                    % (_rsrc_quote(table), _rsrc_quote(dt_col), _rsrc_quote(dt_col)),
+                    conn, params=(cutoff, int(max_rows)),
+                )
+                logger.info(
+                    "[RANKING ENTRY SOURCE DB FALLBACK] indexed read table=%s rows=%s cutoff=%s elapsed=%.3fs",
+                    table, len(raw), cutoff, time.perf_counter() - t0,
+                )
+                return raw
+            except Exception as e:
+                # interrupted = 予算超過。握り潰さず理由を出して安い経路へ。
+                logger.warning(
+                    "[RANKING ENTRY SOURCE DB FALLBACK] indexed read aborted table=%s "
+                    "elapsed=%.3fs budget=%.1fs err=%s -> fallback to rowid scan",
+                    table, time.perf_counter() - t0, budget_sec, e,
+                )
+            finally:
+                if guarded:
+                    _rsrc_clear_budget_guard(conn)
+
+    scan_rows = max(max_rows, _env_int("RANKING_ENTRY_SOURCE_DB_SCAN_ROWS", 1500))
+    t0 = time.perf_counter()
+    guarded = _rsrc_budget_guard(conn, budget_sec)
+    try:
+        raw = pd.read_sql_query(
+            'SELECT * FROM %s ORDER BY rowid DESC LIMIT ?' % _rsrc_quote(table),
+            conn, params=(scan_rows,),
+        )
+        logger.info(
+            "[RANKING ENTRY SOURCE DB FALLBACK] rowid read table=%s rows=%s elapsed=%.3fs",
+            table, len(raw), time.perf_counter() - t0,
+        )
+        return raw
+    except Exception as e:
+        logger.warning(
+            "[RANKING ENTRY SOURCE DB FALLBACK] rowid read failed table=%s elapsed=%.3fs err=%s",
+            table, time.perf_counter() - t0, e,
+        )
+        return pd.DataFrame()
+    finally:
+        if guarded:
+            _rsrc_clear_budget_guard(conn)
+
+
+def _rsrc_load_pick_latest(conn: sqlite3.Connection, tables: List[str], *,
+                           lookback_min: int, max_rows: int, t0: float,
+                           db_path: str = ""):
+    """MAX(datetime) で最新テーブルを 1 本決め、それだけ読む (P0-4)。
+
+    戻り値: (df, table_name)
+    """
+    budget = _rsrc_query_budget_sec()
+    probes = _rsrc_latest_per_table(conn, tables, budget_sec=budget)
+    if not probes:
+        return pd.DataFrame(), ""
+
+    dated = [x for x in probes if x[1] is not None]
+    if dated:
+        dated.sort(key=lambda x: x[1], reverse=True)
+        table, latest, dt_col, cols = dated[0]
+    else:
+        table, latest, dt_col, cols = probes[0]
+
+    logger.warning(
+        "[RANKING ENTRY SOURCE DB FALLBACK] picked latest table=%s latest=%s "
+        "candidates=%s probe_elapsed=%.3fs",
+        table, latest,
+        [(t, str(l)) for t, l, _d, _c in probes],
+        time.perf_counter() - t0,
+    )
+
+    cached = _rsrc_cache_get(db_path or _rsrc_current_db_path(), table)
+    if isinstance(cached, pd.DataFrame) and not cached.empty:
+        return cached, table
+
+    raw = _rsrc_read_one_table(
+        conn, table, dt_col, cols,
+        lookback_min=lookback_min, max_rows=max_rows, budget_sec=budget,
+        latest=latest,
+    )
+    if raw is None or raw.empty:
+        return pd.DataFrame(), table
+    df = _rsrc_trim_recent(raw, dt_col, lookback_min, max_rows)
+    return df, table
+
+
+def _rsrc_load_from_ranking_db_core(*, deadline_at: float | None = None) -> pd.DataFrame:
     if not _env_bool("RANKING_ENTRY_SOURCE_DB_FALLBACK_ENABLED", True):
         return pd.DataFrame()
 
@@ -529,19 +926,40 @@ def _rsrc_load_from_ranking_db() -> pd.DataFrame:
     best = pd.DataFrame()
     best_table = ""
     try:
-        with sqlite3.connect(str(db_path), timeout=sqlite_timeout) as conn:
-            try:
-                conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
-                conn.execute("PRAGMA query_only=ON")
-            except Exception:
-                pass
+        # `with sqlite3.connect(...)` は close しない (transaction の CM)。
+        # ここは Entry hot path なので必ず closing 側を使う。
+        _t_conn = time.perf_counter()
+        with readonly_connect(str(db_path), timeout=sqlite_timeout,
+                              busy_timeout_ms=busy_timeout_ms) as conn, \
+                _rsrc_bind_db_path(str(db_path)):
+            _el_conn = time.perf_counter() - _t_conn
 
+            _t_tab = time.perf_counter()
             tables = _rsrc_candidate_tables(conn)
+            logger.info(
+                "[RANKING ENTRY SOURCE DB FALLBACK] phase connect=%.3fs candidate_tables=%.3fs tables=%s",
+                _el_conn, time.perf_counter() - _t_tab, tables,
+            )
             if not tables:
                 logger.warning("[RANKING ENTRY SOURCE DB FALLBACK] no candidate table db=%s", db_path)
                 return pd.DataFrame()
 
+            if _rsrc_pick_latest_table_enabled():
+                # P0-4: 全テーブルを SELECT * で読まない。
+                # MAX(datetime) で最新の 1 本を決めてから、それだけ読む。
+                best, best_table = _rsrc_load_pick_latest(
+                    conn, tables, lookback_min=lookback_min, max_rows=max_rows, t0=t0,
+                    db_path=str(db_path),
+                )
+                tables = []
+
             for table in tables:
+                if deadline_at is not None and time.perf_counter() >= deadline_at:
+                    logger.warning(
+                        "[RANKING ENTRY SOURCE DB FALLBACK] deadline hit while scanning tables next_table=%s scanned_rows=%s elapsed=%.1fs",
+                        table, len(best), time.perf_counter() - t0,
+                    )
+                    break
                 cached = _rsrc_cache_get(str(db_path), table)
                 if isinstance(cached, pd.DataFrame) and not cached.empty:
                     return cached
@@ -583,7 +1001,7 @@ def _rsrc_load_from_ranking_db() -> pd.DataFrame:
         failopen_max_age = max(max_age, _env_float("RANKING_ENTRY_SOURCE_DB_FAILOPEN_MAX_AGE_SEC", 1800.0))
         same_day = bool(latest is not None and latest.date() == dt.datetime.now().date())
         stale = bool(age is None or age > max_age)
-        allow_stale = bool(stale and same_day and age is not None and age <= failopen_max_age and _env_bool("RANKING_ENTRY_SOURCE_DB_FAILOPEN_STALE", True))
+        allow_stale = bool(stale and same_day and age is not None and age <= failopen_max_age and _env_bool("RANKING_ENTRY_SOURCE_DB_FAILOPEN_STALE", False))
 
         if stale and not allow_stale:
             logger.warning(
@@ -629,7 +1047,7 @@ def _get_ranking_source_df_with_db_fallback() -> Optional[pd.DataFrame]:
         _rsrc_publish_to_global_data(fb, source="db_fallback_v4")
         return fb
 
-    if isinstance(direct, pd.DataFrame) and not direct.empty and _env_bool("RANKING_ENTRY_SOURCE_FAILOPEN_STALE_GLOBAL", True):
+    if isinstance(direct, pd.DataFrame) and not direct.empty and _env_bool("RANKING_ENTRY_SOURCE_FAILOPEN_STALE_GLOBAL", False):
         latest, age, col = _rsrc_latest_info(direct)
         max_age = _env_float("RANKING_ENTRY_SOURCE_FAILOPEN_GLOBAL_MAX_AGE_SEC", 1800.0)
         same_day = latest is not None and latest.date() == dt.datetime.now().date()
@@ -1166,15 +1584,47 @@ def _normalize_ranking_row_for_entry(row: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _ranking_entry_fix_get_gc_history(tf: int) -> pd.DataFrame:
+# P0-9: symbol -> latest technical row の memory cache。
+# 7 銘柄のために tf=1/3/5 の全履歴を毎回引き直して 30 秒かかっていた。
+_RANKING_TECH_CACHE: Dict[int, Any] = {}
+_RANKING_TECH_CACHE_LOCK = threading.Lock()
+
+
+def _ranking_tech_cache_ttl() -> float:
+    """summary history fallback キャッシュの TTL。
+
+    RANKING_ENTRY_TECH_CACHE_TTL_SEC (既定 90 秒) は
+    ranking_technical_store の DB lookup キャッシュ用で別物。
+    こちらは Entry へ実際に渡る technical なので、既定は短い 30 秒にする。
+    """
+    try:
+        return max(0.0, _env_float("RANKING_ENTRY_TECH_FALLBACK_CACHE_TTL_SEC", 30.0))
+    except Exception:
+        return 30.0
+
+
+def _ranking_entry_fix_get_gc_history(tf: int, symbols: Optional[set] = None) -> pd.DataFrame:
+    """summary history を引く。
+
+    symbols が渡されたら **絞ってから copy** する。
+    全フレームを copy すると tf=1/3/5 ぶんで重い。
+    """
     try:
         from core.global_context.context import global_context as GC
         try:
             df = GC.get_summary_history(tf, source="push")
         except TypeError:
             df = GC.get_summary_history(tf)
-        if isinstance(df, pd.DataFrame):
-            return df.copy()
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return pd.DataFrame()
+        if symbols and "symbol" in df.columns:
+            try:
+                sym = df["symbol"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+                hit = df[sym.isin(symbols)]
+                return hit.copy()
+            except Exception:
+                logger.debug("[RANKING ENTRY FIX] symbol filter failed tf=%s", tf, exc_info=True)
+        return df.copy()
     except Exception:
         pass
     return pd.DataFrame()
@@ -1195,9 +1645,36 @@ def _ranking_entry_fix_nonzero(v: Any) -> bool:
 
 
 def _ranking_entry_fix_latest_summary_tech_map(symbols: set) -> Dict[str, Dict[str, Any]]:
+    # cache が効くなら history を引かない。
+    ttl = _ranking_tech_cache_ttl()
+    if ttl > 0 and symbols:
+        with _RANKING_TECH_CACHE_LOCK:
+            ent = _RANKING_TECH_CACHE.get(0)
+        if ent is not None:
+            ts, cached = ent
+            age = time.time() - ts
+            if age <= ttl:
+                hit = {s: cached[s] for s in symbols if s in cached}
+                # 部分ヒットで返すと欠けた銘柄の technical を捨てることになる。
+                # 全銘柄そろっている時だけ cache を使う。
+                if len(hit) == len(symbols):
+                    logger.info(
+                        "[RANKING ENTRY FIX] tech cache hit symbols=%d age=%.1fs "
+                        "(history を引き直さない)",
+                        len(hit), age,
+                    )
+                    return hit
+                logger.info(
+                    "[RANKING ENTRY FIX] tech cache partial hit=%d/%d age=%.1fs "
+                    "(欠けている銘柄があるので history から作り直す)",
+                    len(hit), len(symbols), age,
+                )
+
+    _t_tech = time.perf_counter()
     result: Dict[str, Dict[str, Any]] = {}
     for tf in (1, 3, 5):
-        df = _ranking_entry_fix_get_gc_history(tf)
+        # 必要銘柄だけに絞ってから copy する
+        df = _ranking_entry_fix_get_gc_history(tf, symbols=symbols)
         if df.empty or "symbol" not in df.columns:
             continue
         work = df.copy()
@@ -1227,6 +1704,19 @@ def _ranking_entry_fix_latest_summary_tech_map(symbols: set) -> Dict[str, Dict[s
             tech["ranking_tech_datetime"] = r.get("datetime") if "datetime" in r.index else None
             tech["ranking_tech_db"] = "summary_history_cache"
             result[sym] = tech
+
+    # 次回のために symbol -> latest technical をキャッシュする。
+    # 7 銘柄のたびに tf=1/3/5 の history を引き直さないための対策。
+    if _ranking_tech_cache_ttl() > 0 and result:
+        with _RANKING_TECH_CACHE_LOCK:
+            prev = _RANKING_TECH_CACHE.get(0)
+            merged = dict(prev[1]) if prev else {}
+            merged.update(result)
+            _RANKING_TECH_CACHE[0] = (time.time(), merged)
+    logger.info(
+        "[RANKING ENTRY FIX] tech map built symbols=%d/%d elapsed=%.3fs",
+        len(result), len(symbols or ()), time.perf_counter() - _t_tech,
+    )
     return result
 
 
@@ -1818,28 +2308,45 @@ def entry_from_ranking():
     if not is_time_allowed(started):
         logger.info("[RANKING ENTRY LOOP] skip reason=TIME_GUARD now=%s", started.strftime("%H:%M:%S"))
         return 0
+    _t_phase = time.perf_counter()
     ranking_df = _get_ranking_source_df()
+    _el_source = time.perf_counter() - _t_phase
     if ranking_df is None or ranking_df.empty:
-        logger.info("[RANKING ENTRY LOOP] skip reason=no_ranking_df")
+        logger.info("[RANKING ENTRY LOOP] skip reason=no_ranking_df elapsed=%.2fs", _el_source)
         return 0
     now = _now()
+    _t_phase = time.perf_counter()
     rows_all = _prepare_rows(ranking_df)
+    _el_prepare = time.perf_counter() - _t_phase
     if not rows_all:
         logger.info("[RANKING ENTRY LOOP] skip reason=no_normalized_rows")
         return 0
+    _t_phase = time.perf_counter()
     rows = _light_prefilter_rows(rows_all)
+    _el_prefilter = time.perf_counter() - _t_phase
+    logger.warning(
+        "[RANKING ENTRY LOOP] phase ranking_source=%.2fs prepare_rows=%.2fs prefilter=%.2fs raw=%s prefiltered=%s",
+        _el_source, _el_prepare, _el_prefilter, len(rows_all), len(rows),
+    )
     if not rows:
         logger.info("[RANKING ENTRY LOOP] skip reason=no_prefilter_rows raw_rows=%s", len(rows_all))
         return 0
 
     tech_map: Dict[str, Dict[str, Any]] = {}
+    _el_tech = 0.0
     cfg_tech = RANKING_ENTRY_CONFIG.get("TECHNICAL", {}) or {}
     if bool(cfg_tech.get("ENABLED", True)) and callable(save_ranking_pseudo_technicals):
+        _t_phase = time.perf_counter()
         try:
             tech_map = save_ranking_pseudo_technicals(rows)
         except Exception:
             logger.exception("[RANKING ENTRY LOOP] technical attach failed -> continue without tech")
             tech_map = {}
+        _el_tech = time.perf_counter() - _t_phase
+        logger.warning(
+            "[RANKING ENTRY LOOP] phase technical_attach=%.2fs symbols=%s",
+            _el_tech, len(tech_map),
+        )
         logger.info("[RANKING ENTRY LOOP] ranking_technical attached symbols=%s prefiltered_rows=%s raw_rows=%s", len(tech_map), len(rows), len(rows_all))
 
     created = 0
@@ -1851,7 +2358,18 @@ def entry_from_ranking():
     current_keys: set[str] = set()
     best_by_symbol_side: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
+    _wg = _worker_guard_mod()
+    _row_elapsed: List[Tuple[str, float]] = []
+    _t_scoring = time.perf_counter()
     for row in rows:
+        _row_t0 = time.perf_counter()
+        # scheduler が timeout したら worker 自身も止まる (daemon thread を残さない)
+        if _wg is not None and _wg.check(label="ranking_scoring_loop"):
+            logger.warning(
+                "[RANKING ENTRY LOOP] worker cancelled elapsed=%.3fs scored=%s candidates=%s",
+                time.perf_counter() - started_perf, len(_row_elapsed), len(best_by_symbol_side),
+            )
+            break
         if time.perf_counter() >= deadline and best_by_symbol_side:
             logger.warning(
                 "[RANKING ENTRY LOOP] stop scoring with candidates elapsed=%.3fs candidates=%s",
@@ -1902,12 +2420,30 @@ def entry_from_ranking():
         old_score = _safe_float(old["row"].get("score_total"), 0.0) if isinstance(old, dict) and isinstance(old.get("row"), dict) else 0.0
         if old is None or score > old_score:
             best_by_symbol_side[key] = {"row": row, "parts": parts, "prev_price": prev_price, "prev_rank": prev_rank, "consecutive": consecutive}
+        _row_elapsed.append((symbol, time.perf_counter() - _row_t0))
 
+    _el_scoring = time.perf_counter() - _t_scoring
+
+    # 1 銘柄ごとの所要時間を出す (どこで詰まったか特定するため)
+    try:
+        if _row_elapsed:
+            _slow = sorted(_row_elapsed, key=lambda x: -x[1])[:5]
+            logger.warning(
+                "[RANKING ENTRY LOOP] per-symbol elapsed n=%s total=%.2fs max=%.2fs slow=%s",
+                len(_row_elapsed), sum(x[1] for x in _row_elapsed),
+                _slow[0][1], [(s, round(e, 2)) for s, e in _slow],
+            )
+    except Exception:
+        logger.exception("[RANKING ENTRY LOOP] per-symbol elapsed log failed")
+
+    _t_phase = time.perf_counter()
     _reset_missing_histories(current_keys)
+    _el_reset = time.perf_counter() - _t_phase
 
     packs = list(best_by_symbol_side.items())
     packs.sort(key=lambda kv: _safe_float(kv[1]["row"].get("score_total"), 0.0), reverse=True)
 
+    _t_pending = time.perf_counter()
     for (symbol, side), pack in packs:
         if created >= max_pending:
             break
@@ -1977,7 +2513,20 @@ def entry_from_ranking():
         else:
             pending_reject += 1
 
+    _el_pending = time.perf_counter() - _t_pending
+
     elapsed = time.perf_counter() - started_perf
+    # どの phase にも計上されていない時間。ここが大きいなら計測点が足りない。
+    _phase_sum = _el_source + _el_prepare + _el_prefilter + _el_tech + _el_scoring + _el_reset + _el_pending
+    _unaccounted = elapsed - _phase_sum
+    _log_phase = logger.warning if _unaccounted > 2.0 else logger.info
+    _log_phase(
+        "[RANKING ENTRY LOOP] phase breakdown total=%.2fs phase_sum=%.2fs unaccounted=%.2fs "
+        "ranking_source=%.2fs prepare_rows=%.2fs prefilter=%.2fs technical_attach=%.2fs "
+        "scoring=%.2fs reset_histories=%.2fs pending_add=%.2fs",
+        elapsed, _phase_sum, _unaccounted, _el_source, _el_prepare, _el_prefilter,
+        _el_tech, _el_scoring, _el_reset, _el_pending,
+    )
     if reject_samples:
         logger.warning("[RANKING ENTRY LOOP] ranking_only_reject_counts=%s samples=%s", dict(reject_counts), reject_samples)
     logger.info(
@@ -2023,11 +2572,73 @@ def _rpf2_env_int(name: str, default: int) -> int:
         return int(default)
 
 
-def _rpf2_num(s: pd.Series | Any, default: float = 0.0):
+def _rpf2_num(s: pd.Series | Any, default: Any = 0.0, index=None) -> pd.Series:
+    """常に float64 Series を返す。
+
+    以前は to_numeric/fillna が失敗したときや、列が無くて
+    スカラーが渡ったときに float を返していた。その場合
+    呼び出し側の `.loc[out.index]` が AttributeError になる。
+    index を渡すとその index に揃える (欠損は default で埋める)。
+    default に Series を渡した場合は index 合わせで埋める。
+    """
+    if index is None:
+        if isinstance(s, pd.Series):
+            index = s.index
+        elif isinstance(default, pd.Series):
+            index = default.index
+
+    # default を Series / スカラーに正規化する
+    dser = None
+    dval = 0.0
+    if isinstance(default, pd.Series):
+        try:
+            dser = pd.to_numeric(default, errors="coerce")
+            if index is not None:
+                dser = dser.reindex(index)
+            dser = dser.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        except Exception:
+            logger.exception("[RANKING PUSH FALLBACK] _rpf2_num default coerce failed")
+            dser = None
+    else:
+        try:
+            dval = float(default)
+        except Exception:
+            dval = 0.0
+
     try:
-        return pd.to_numeric(s, errors="coerce").fillna(default)
+        if isinstance(s, pd.Series):
+            base = pd.to_numeric(s, errors="coerce")
+            if index is not None and not base.index.equals(index):
+                base = base.reindex(index)
+        elif (isinstance(s, (list, tuple, np.ndarray, pd.Index))
+              and index is not None and len(s) == len(index)):
+            base = pd.to_numeric(pd.Series(list(s), index=index), errors="coerce")
+        else:
+            # スカラー (列が存在しなかったケース)
+            try:
+                sval = float(s)
+            except Exception:
+                sval = float("nan")
+            if index is None:
+                index = pd.RangeIndex(0)
+            base = pd.Series(sval, index=index, dtype="float64")
     except Exception:
-        return default
+        # 握り潰さずログを残したうえで default だけの Series にする
+        logger.exception("[RANKING PUSH FALLBACK] _rpf2_num coerce failed")
+        base = pd.Series(np.nan,
+                         index=index if index is not None else pd.RangeIndex(0),
+                         dtype="float64")
+
+    base = base.replace([np.inf, -np.inf], np.nan)
+    if dser is not None:
+        base = base.fillna(dser).fillna(0.0)
+    else:
+        base = base.fillna(dval)
+    try:
+        return base.astype("float64")
+    except Exception:
+        logger.exception("[RANKING PUSH FALLBACK] _rpf2_num astype failed")
+        return pd.to_numeric(base, errors="coerce").fillna(0.0)
 
 
 def _rpf2_latest_per_symbol(df: pd.DataFrame) -> pd.DataFrame:
@@ -2098,25 +2709,36 @@ def _rpf2_build_ranking_like_from_push(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     out = df.copy()
+    # index が非一意だと後段の .loc[out.index] / .reindex が壊れる
+    # (summary 由来の df は index が重複しうる)
+    if not out.index.is_unique:
+        out = out.reset_index(drop=True)
     out["symbol"] = out["symbol"].astype(str).str.strip()
     out = out[out["symbol"] != ""]
     if out.empty:
         return pd.DataFrame()
 
-    price = _rpf2_num(out.get("price", out.get("close", out.get("current_price", 0.0))), 0.0)
-    close = _rpf2_num(out.get("close", price), 0.0)
-    open_ = _rpf2_num(out.get("open", out.get("open_price", close)), close)
-    volume = _rpf2_num(out.get("volume", 0.0), 0.0)
-    turnover = _rpf2_num(out.get("turnover", price * volume), 0.0)
-    if isinstance(turnover, (int, float)):
-        turnover = price * volume
-    score_buy = _rpf2_num(out.get("score_buy", out.get("buy_score", 0.0)), 0.0)
-    score_sell = _rpf2_num(out.get("score_sell", out.get("sell_score", 0.0)), 0.0)
-    score_total = _rpf2_num(out.get("score_total", out.get("final_score", out.get("score", 0.0))), 0.0)
-    slope = _rpf2_num(out.get("slope", 0.0), 0.0)
-    mtf = _rpf2_num(out.get("mtf", out.get("score_mtf", out.get("mtf_score", 0.0))), 0.0)
+    # _rpf2_num は常に out.index に揃った float64 Series を返す
+    idx = out.index
+    price = _rpf2_num(out.get("price", out.get("close", out.get("current_price", 0.0))), 0.0, index=idx)
+    close = _rpf2_num(out.get("close", price), 0.0, index=idx)
+    open_ = _rpf2_num(out.get("open", out.get("open_price", close)), close, index=idx)
+    volume = _rpf2_num(out.get("volume", 0.0), 0.0, index=idx)
+    turnover = _rpf2_num(out.get("turnover", price * volume), 0.0, index=idx)
+    score_buy = _rpf2_num(out.get("score_buy", out.get("buy_score", 0.0)), 0.0, index=idx)
+    score_sell = _rpf2_num(out.get("score_sell", out.get("sell_score", 0.0)), 0.0, index=idx)
+    score_total = _rpf2_num(out.get("score_total", out.get("final_score", out.get("score", 0.0))), 0.0, index=idx)
+    slope = _rpf2_num(out.get("slope", 0.0), 0.0, index=idx)
+    mtf = _rpf2_num(out.get("mtf", out.get("score_mtf", out.get("mtf_score", 0.0))), 0.0, index=idx)
 
-    day_change_pct = ((close - open_) / open_.replace(0, pd.NA) * 100.0).fillna(0.0)
+    # open_.replace(0, pd.NA) は pandas 2.x で object へのダウンキャスト
+    # FutureWarning を出すうえ inf を残す。where + inf 除去で書く。
+    open_safe = open_.where(open_ != 0.0)
+    day_change_pct = (
+        ((close - open_) / open_safe * 100.0)
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+    )
     side = pd.Series("BUY", index=out.index)
     side = side.mask((score_sell > score_buy) | ((score_buy <= 0) & (slope < 0)), "SELL")
 
@@ -2132,13 +2754,31 @@ def _rpf2_build_ranking_like_from_push(df: pd.DataFrame) -> pd.DataFrame:
     max_rows = max(10, _rpf2_env_int("RANKING_PUSH_FALLBACK_MAX_ROWS", 80))
     out = out.head(max_rows).copy()
 
-    out["price"] = price.loc[out.index].replace(0, close.loc[out.index])
+    # price が 0 / NaN / 負のときだけ close を使う。
+    # Series.replace(0, <Series>) は pandas が
+    #   ValueError: Series.replace cannot use dict-value and non-None to_replace
+    # で拒否する (Series は dict-like 扱い)。mask で書く。
+    px = price.reindex(out.index)
+    cl = close.reindex(out.index)
+    bad_px = (~np.isfinite(px)) | (px <= 0.0)
+    out["price"] = px.mask(bad_px, cl)
+    out["price"] = (
+        pd.to_numeric(out["price"], errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+    )
+    n_filled = int(bad_px.sum())
+    if n_filled:
+        logger.warning(
+            "[RANKING PUSH FALLBACK] price<=0/NaN rows=%s -> close で補完 (補完後も0=%s)",
+            n_filled, int((out["price"] <= 0.0).sum()),
+        )
     out["current_price"] = out["price"]
-    out["volume"] = volume.loc[out.index]
-    out["turnover"] = turnover.loc[out.index]
+    out["volume"] = volume.reindex(out.index).fillna(0.0)
+    out["turnover"] = turnover.reindex(out.index).fillna(0.0)
     out["trading_value"] = out["turnover"]
-    out["day_change_pct"] = day_change_pct.loc[out.index]
-    out["side"] = side.loc[out.index]
+    out["day_change_pct"] = day_change_pct.reindex(out.index).fillna(0.0)
+    out["side"] = side.reindex(out.index).fillna("BUY")
     out["rank_position"] = range(1, len(out) + 1)
     out["rank"] = out["rank_position"]
     out["rank_type"] = out["side"].map({"BUY": "売買代金急増", "SELL": "値下がり率"}).fillna("売買代金急増")

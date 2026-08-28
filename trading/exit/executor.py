@@ -1953,3 +1953,9 @@ def _close_db_position(*, symbol: str, exit_price: float, pnl: float, reason: st
         return True
 
     return False
+
+
+# 旧 core/startup/exit_limit_pending_close_runtime_patch.py が付けていた
+# _exit_limit_pending_close_wrapped マーカの後継 (本文化済み)。
+# BOARD RUNTIME SELF CHECK 用。
+_close_db_position._exit_limit_pending_close_builtin = True  # type: ignore[attr-defined]

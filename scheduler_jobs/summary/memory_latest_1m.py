@@ -47,12 +47,15 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 from functools import wraps
 from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
 import pandas as pd
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 VERSION = "V3-MAIN-MEMORY-NO-STALE-COERCE"
@@ -433,7 +436,8 @@ def _build_memory_1m_summary(*, now: dt.datetime) -> pd.DataFrame:
         diff = bars.groupby("symbol")["close"].diff()
         gain = diff.clip(lower=0).groupby(bars["symbol"]).transform(lambda s: s.rolling(14, min_periods=1).mean())
         loss = (-diff.clip(upper=0)).groupby(bars["symbol"]).transform(lambda s: s.rolling(14, min_periods=1).mean())
-        rs = gain / loss.replace(0, pd.NA)
+        # pd.NA だと object dtype になり fillna で暗黙ダウンキャスト警告になる。
+        rs = gain / loss.replace(0, np.nan)
         bars["rsi"] = (100 - (100 / (1 + rs))).fillna(50.0)
 
         bars["symbol_hist_len"] = bars.groupby("symbol").cumcount() + 1
@@ -643,7 +647,7 @@ def _nas_root() -> str:
         v = os.getenv(name)
         if v and str(v).strip():
             return str(v).strip()
-    return r"\\192.168.0.22\AutoStockBuyAndSell"
+    return nas_root()
 
 
 def _today_yyyymmdd() -> str:
@@ -718,7 +722,116 @@ def _quote(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
 
 
+# ============================================================
+# P0-2 / P0-4 / P0-6: PUSH DB 読み取りの計測・共有・増分化
+# ------------------------------------------------------------
+# 2026-08-28 08:51 の実測で、983 行しか無い入力に対して
+# stream_data.fastlane が 41.2 秒、tier1_direct_memory が 49.7 秒
+# かかっていた。行数から見てアルゴリズムの問題ではないので、
+# 各段を個別に測れるようにする。
+#
+#   P0-2 connect / tables / columns / execute / fetch / latest を個別計測
+#   P0-4 1 tick 内で同じ push DB を何度も開かない (短命キャッシュ)
+#   P0-6 last_rowid を保持し、前回以降の tick だけを取る (増分)
+#        取得した分はメモリのリングバッファへ積み、そこから返す
+# ============================================================
+
+_PUSH_DB_STAGE_WARN_SEC = 1.0
+
+_push_db_lock = threading.Lock()
+_push_db_cache_df: Optional[pd.DataFrame] = None
+_push_db_cache_at: float = 0.0
+_push_db_last_rowid: Optional[int] = None
+_push_db_cache_table: str = ""
+_push_db_cache_path: str = ""
+
+
+def _push_db_share_ttl() -> float:
+    """この秒数以内の再呼び出しは同じ結果を返す (同一 tick 内の重複 open 防止)。"""
+    return max(0.0, _env_float("SUMMARY_MAIN_PUSH_DB_SHARE_TTL_SEC", 5.0))
+
+
+def _push_db_ring_max() -> int:
+    """メモリリングバッファの上限行数。"""
+    return max(500, _env_int("SUMMARY_MAIN_PUSH_DB_RING_MAX_ROWS", 20000))
+
+
+def _push_db_incremental_enabled() -> bool:
+    return _push_db_refresh_env_bool("SUMMARY_MAIN_PUSH_DB_INCREMENTAL", True)
+
+
+class _StageTimer:
+    """段ごとの elapsed を測って 1 行にまとめて出す。1 段 >1 秒で WARNING。"""
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.marks: list = []
+        self._t0 = time.perf_counter()
+        self._last = self._t0
+        self.slow: list = []
+
+    def mark(self, name: str, **info) -> None:
+        now = time.perf_counter()
+        el = now - self._last
+        self._last = now
+        self.marks.append((name, el, info))
+        if el >= _PUSH_DB_STAGE_WARN_SEC:
+            self.slow.append((name, el, info))
+            logger.warning(
+                "[PUSH DB STAGE] slow stage label=%s name=%s elapsed=%.3fs %s "
+                "(1 段で 1 秒以上かかっている)",
+                self.label, name, el,
+                " ".join("%s=%s" % kv for kv in info.items()),
+            )
+
+    @property
+    def total(self) -> float:
+        return time.perf_counter() - self._t0
+
+    def emit(self, **info) -> None:
+        parts = " ".join(
+            "%s=%.3fs%s" % (
+                n, e,
+                ("(" + ",".join("%s=%s" % kv for kv in i.items()) + ")") if i else "",
+            )
+            for n, e, i in self.marks
+        )
+        log = logger.warning if (self.total >= _PUSH_DB_STAGE_WARN_SEC or self.slow) else logger.info
+        log(
+            "[PUSH DB STAGE] label=%s total=%.3fs stages=[%s] %s",
+            self.label, self.total, parts,
+            " ".join("%s=%s" % kv for kv in info.items()),
+        )
+
+
+def push_db_read_stats() -> dict:
+    """診断用: 増分カーソルとリングバッファの状態。"""
+    with _push_db_lock:
+        return {
+            "last_rowid": _push_db_last_rowid,
+            "ring_rows": 0 if _push_db_cache_df is None else len(_push_db_cache_df),
+            "table": _push_db_cache_table,
+            "path": _push_db_cache_path,
+            "age_sec": None if _push_db_cache_at <= 0 else round(time.monotonic() - _push_db_cache_at, 2),
+        }
+
+
+def reset_push_db_cursor() -> None:
+    """テスト用。カーソルとリングバッファを捨てる。"""
+    global _push_db_cache_df, _push_db_cache_at, _push_db_last_rowid
+    global _push_db_cache_table, _push_db_cache_path
+    with _push_db_lock:
+        _push_db_cache_df = None
+        _push_db_cache_at = 0.0
+        _push_db_last_rowid = None
+        _push_db_cache_table = ""
+        _push_db_cache_path = ""
+
+
 def _read_push_db_recent() -> pd.DataFrame:
+    global _push_db_cache_df, _push_db_cache_at, _push_db_last_rowid
+    global _push_db_cache_table, _push_db_cache_path
+
     if not _push_db_refresh_env_bool("SUMMARY_MAIN_PUSH_DB_REFRESH_ENABLED", True):
         return pd.DataFrame()
     path = _push_db_path()
@@ -726,17 +839,44 @@ def _read_push_db_recent() -> pd.DataFrame:
         logger.warning("[SUMMARY MAIN PUSH DB REFRESH] db missing path=%s version=%s", path, VERSION)
         return pd.DataFrame()
 
+    # ---- P0-4: 同一 tick 内の重複 open を避ける ----
+    ttl = _push_db_share_ttl()
+    with _push_db_lock:
+        cached = _push_db_cache_df
+        cached_at = _push_db_cache_at
+        same_path = (_push_db_cache_path == str(path))
+    if (
+        ttl > 0.0
+        and cached is not None
+        and same_path
+        and (time.monotonic() - cached_at) < ttl
+    ):
+        logger.info(
+            "[SUMMARY MAIN PUSH DB REFRESH] shared cache hit rows=%s age=%.2fs ttl=%.1fs "
+            "(同一 tick 内で push DB を開き直さない)",
+            len(cached), time.monotonic() - cached_at, ttl,
+        )
+        return cached.copy(deep=False)
+
     limit = max(100, _env_int("SUMMARY_MAIN_PUSH_DB_REFRESH_LIMIT", 5000))
     timeout = max(0.05, _env_float("SUMMARY_MAIN_PUSH_DB_REFRESH_TIMEOUT_SEC", 0.8))
     tables_prefer = ["stream_data_raw", "stream_data", "push_stream", "push_ticks", "ticks"]
+
+    st = _StageTimer("push_db_recent")
+    conn = None
     try:
         conn = sqlite3.connect(str(path), timeout=timeout)
+        st.mark("connect", path=path.name)
         try:
             conn.execute("PRAGMA query_only=ON")
             conn.execute("PRAGMA busy_timeout=%d" % int(timeout * 1000))
         except Exception:
-            pass
+            logger.debug("[SUMMARY MAIN PUSH DB REFRESH] pragma skipped", exc_info=True)
+        st.mark("pragma")
+
         tables = _existing_tables(conn)
+        st.mark("list_tables", n=len(tables))
+
         for table in tables_prefer + [t for t in tables if t not in tables_prefer]:
             if table not in tables:
                 continue
@@ -748,30 +888,195 @@ def _read_push_db_recent() -> pd.DataFrame:
             price_col = next((c for c in ("current_price", "price", "close", "CurrentPrice", "Price", "現在値") if c in cols), None)
             if sym_col is None or price_col is None:
                 continue
-            order = f"ORDER BY {_quote(dt_col)} DESC" if dt_col else ""
-            sql = f"SELECT * FROM {_quote(table)} {order} LIMIT {int(limit)}"
-            try:
-                df = pd.read_sql_query(sql, conn)
-            except Exception:
-                continue
-            if not isinstance(df, pd.DataFrame) or df.empty:
-                continue
-            latest = _latest_dt(df)
-            logger.warning(
-                "[SUMMARY MAIN PUSH DB REFRESH] loaded table=%s rows=%s latest=%s path=%s version=%s",
-                table, len(df), latest, path, VERSION,
+            st.mark("columns", table=table, n=len(cols))
+
+            # datetime 単独の index が無いため ORDER BY datetime DESC は全件ソートになる。
+            # tick は追記専用なので rowid 順 = 書き込み順であり、
+            # 「直近 N 行」を取る目的では rowid 順で十分かつ大幅に速い。
+            # 実測: datetime 順 21.0s -> rowid 順 3.8s (5000 行, 差は境界 1 行のみ)
+            order_dt = f"ORDER BY {_quote(dt_col)} DESC" if dt_col else ""
+            sql_dt = f"SELECT * FROM {_quote(table)} {order_dt} LIMIT {int(limit)}"
+
+            # ---- P0-6: 前回以降の rowid だけを取る ----
+            with _push_db_lock:
+                cursor_rowid = _push_db_last_rowid
+                prev_df = _push_db_cache_df
+                prev_table = _push_db_cache_table
+                prev_path = _push_db_cache_path
+            incremental = (
+                _push_db_incremental_enabled()
+                and cursor_rowid is not None
+                and prev_df is not None
+                and not prev_df.empty
+                and prev_table == table
+                and prev_path == str(path)
             )
-            return df
+
+            df = None
+            mode = "full"
+            if incremental:
+                sql_inc = (
+                    f"SELECT rowid AS _rowid_, * FROM {_quote(table)} "
+                    f"WHERE rowid > {int(cursor_rowid)} ORDER BY rowid ASC LIMIT {int(limit)}"
+                )
+                try:
+                    df = pd.read_sql_query(sql_inc, conn)
+                    mode = "incremental"
+                except Exception:
+                    logger.warning(
+                        "[SUMMARY MAIN PUSH DB REFRESH] incremental read failed table=%s "
+                        "-> full read へフォールバック",
+                        table, exc_info=True,
+                    )
+                    df = None
+
+            if df is None:
+                sql_full = (
+                    f"SELECT rowid AS _rowid_, * FROM {_quote(table)} "
+                    f"ORDER BY rowid DESC LIMIT {int(limit)}"
+                )
+                try:
+                    df = pd.read_sql_query(sql_full, conn)
+                    mode = "full"
+                except Exception:
+                    # WITHOUT ROWID テーブル等。理由を残して従来順で読み直す。
+                    logger.warning(
+                        "[SUMMARY MAIN PUSH DB REFRESH] rowid order failed table=%s -> fallback to datetime order",
+                        table, exc_info=True,
+                    )
+                    try:
+                        df = pd.read_sql_query(sql_dt, conn)
+                        mode = "datetime_order"
+                    except Exception:
+                        continue
+            st.mark("query_fetch", table=table, mode=mode, rows=0 if df is None else len(df))
+
+            if df is None or not isinstance(df, pd.DataFrame):
+                continue
+
+            new_rows = len(df)
+            max_rowid = None
+            if "_rowid_" in df.columns and new_rows:
+                try:
+                    max_rowid = int(pd.to_numeric(df["_rowid_"], errors="coerce").max())
+                except Exception:
+                    max_rowid = None
+                df = df.drop(columns=["_rowid_"], errors="ignore")
+
+            # ---- リングバッファへ合流 ----
+            if mode == "incremental":
+                if new_rows == 0:
+                    # 新しい tick が無い。前回のバッファをそのまま使う。
+                    out = prev_df
+                else:
+                    try:
+                        out = pd.concat([prev_df, df], ignore_index=True)
+                    except Exception:
+                        logger.warning(
+                            "[SUMMARY MAIN PUSH DB REFRESH] ring concat 失敗 -> 新規分のみ使う",
+                            exc_info=True,
+                        )
+                        out = df
+            else:
+                out = df
+
+            ring_max = _push_db_ring_max()
+            if isinstance(out, pd.DataFrame) and len(out) > ring_max:
+                out = out.tail(ring_max).reset_index(drop=True)
+            st.mark("ring_merge", mode=mode, new=new_rows,
+                    ring=0 if out is None else len(out))
+
+            if not isinstance(out, pd.DataFrame) or out.empty:
+                continue
+
+            latest = _latest_dt(out)
+            st.mark("latest_dt")
+
+            with _push_db_lock:
+                _push_db_cache_df = out
+                _push_db_cache_at = time.monotonic()
+                _push_db_cache_table = table
+                _push_db_cache_path = str(path)
+                if max_rowid is not None:
+                    if _push_db_last_rowid is None or max_rowid > _push_db_last_rowid:
+                        _push_db_last_rowid = max_rowid
+
+            st.emit(table=table, mode=mode, new_rows=new_rows, ring_rows=len(out),
+                    latest=latest, last_rowid=_push_db_last_rowid)
+            logger.warning(
+                "[SUMMARY MAIN PUSH DB REFRESH] loaded table=%s mode=%s new_rows=%s ring_rows=%s "
+                "latest=%s last_rowid=%s path=%s version=%s",
+                table, mode, new_rows, len(out), latest, _push_db_last_rowid, path, VERSION,
+            )
+            return out.copy(deep=False)
+
+        st.emit(result="no_usable_table")
         logger.warning("[SUMMARY MAIN PUSH DB REFRESH] no usable table path=%s tables=%s version=%s", path, tables[:20], VERSION)
         return pd.DataFrame()
     except Exception:
+        st.emit(result="error")
         logger.warning("[SUMMARY MAIN PUSH DB REFRESH] db read failed path=%s version=%s", path, VERSION, exc_info=True)
         return pd.DataFrame()
     finally:
         try:
-            conn.close()  # type: ignore[name-defined]
+            if conn is not None:
+                conn.close()
         except Exception:
-            pass
+            logger.debug("[SUMMARY MAIN PUSH DB REFRESH] close failed", exc_info=True)
+
+
+def _push_df_writeback_enabled() -> bool:
+    try:
+        v = os.getenv("SUMMARY_MAIN_PUSH_DF_WRITEBACK")
+        if v is None or str(v).strip() == "":
+            return True
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        return True
+
+
+def _writeback_push_df(db_df: pd.DataFrame, *, memory_stale, db_stale) -> None:
+    """PUSH DB から読んだ新しいフレームを global_data.push_df へ書き戻す。
+
+    main.py は自前の PUSH WebSocket を張らないので push_df を書く担当が
+    居ない。書き戻さないと push_df を直接読む経路 (push_summary_engine /
+    direct_push_1m / push_raw_1m_source) が古いフレームを掴み続ける。
+    古いもので上書きしないよう latest_dt を比較する。
+    """
+    if not _push_df_writeback_enabled():
+        return
+    if not isinstance(db_df, pd.DataFrame) or db_df.empty:
+        return
+    gd = _global_data()
+    if gd is None:
+        return
+    try:
+        cur = getattr(gd, "push_df", None)
+        cur_latest = _latest_dt(cur) if isinstance(cur, pd.DataFrame) else None
+        new_latest = _latest_dt(db_df)
+        if new_latest is None:
+            logger.warning(
+                "[SUMMARY MAIN PUSH DF WRITEBACK] skipped reason=db_latest_unknown rows=%s",
+                len(db_df),
+            )
+            return
+        if cur_latest is not None and new_latest <= cur_latest:
+            logger.info(
+                "[SUMMARY MAIN PUSH DF WRITEBACK] skipped reason=not_newer "
+                "current=%s db=%s", cur_latest, new_latest,
+            )
+            return
+        setattr(gd, "push_df", db_df)
+        logger.warning(
+            "[SUMMARY MAIN PUSH DF WRITEBACK] global_data.push_df 更新 rows=%s "
+            "latest %s -> %s memory_stale=%s db_stale=%s "
+            "(main.py は PUSH WS を張らないので DB から書き戻す)",
+            len(db_df), cur_latest, new_latest,
+            None if memory_stale is None else round(float(memory_stale), 1),
+            None if db_stale is None else round(float(db_stale), 1),
+        )
+    except Exception:
+        logger.exception("[SUMMARY MAIN PUSH DF WRITEBACK] failed rows=%s", len(db_df))
 
 
 def _load_push_memory_df() -> pd.DataFrame:
@@ -809,6 +1114,9 @@ def _load_push_memory_df() -> pd.DataFrame:
         None if stale is None else round(float(stale), 1),
         max_stale,
     )
+    # 読み直したものを push_df へ書き戻す。これをしないと push_df を
+    # 直接読む経路が古いフレームを掴み続ける (実測 2016 秒古いまま)。
+    _writeback_push_df(db_df, memory_stale=stale, db_stale=db_stale)
     return db_df
 
 

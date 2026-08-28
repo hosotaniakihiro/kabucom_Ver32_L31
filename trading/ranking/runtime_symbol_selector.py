@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Iterable, List, Optional, Sequence, Set, Tuple
 
 import pandas as pd
+from nas_root import nas_path, nas_root
 
 try:
     from utils.business_day_utils import (
@@ -97,7 +98,7 @@ MARGIN_TRUE_VALUES = {
 }
 
 DEFAULT_FLAG_DB_CANDIDATES = [
-    r"\\192.168.0.22\AutoStockBuyAndSell\Basic\symbol_flags.db",
+    nas_path(r"Basic\symbol_flags.db"),
     r"Y:\AutoStockBuyAndSell\Basic\symbol_flags.db",
     r"Y:\Basic\symbol_flags.db",
 ]

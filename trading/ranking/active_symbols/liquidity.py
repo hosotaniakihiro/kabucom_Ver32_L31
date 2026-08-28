@@ -49,6 +49,8 @@ from .config import (
 )
 from .normalize import dedupe_keep_order, normalize_symbol, to_float
 from .ranking_source import build_liquidity_map
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 VERSION = "Ver1.8-INLINE-REV5-PRICE-FALLBACK"
@@ -92,7 +94,7 @@ def _today() -> str:
 
 
 def _summary_db_path() -> str:
-    base = os.getenv("SUMMARY_DB_DIR", r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary")
+    base = os.getenv("SUMMARY_DB_DIR", nas_path(r"raw_data\kabu_station\summary"))
     return os.getenv("SUMMARY_DB_PATH", str(Path(base) / f"summary{_today()}.db"))
 
 
@@ -143,7 +145,7 @@ def _summary_price_fallback_map(symbols: Iterable[str]) -> Dict[str, Dict[str, f
     out: Dict[str, Dict[str, float]] = {}
     today_s = dt.datetime.now().strftime("%Y-%m-%d")
     try:
-        with sqlite3.connect(path, timeout=timeout_sec) as conn:
+        with committing_connect(path, timeout=timeout_sec) as conn:
             conn.execute(f"PRAGMA busy_timeout={busy_ms};")
             for table in ("stock_summary_1min", "stock_summary_3min", "stock_summary_5min"):
                 if len(out) >= len(cleaned):

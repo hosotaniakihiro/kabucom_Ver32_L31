@@ -31,6 +31,7 @@ import threading
 import time
 from typing import Any
 import pandas as pd
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 _PATCHED = False
@@ -158,7 +159,7 @@ def _summary_db_path(df: pd.DataFrame) -> str:
     ymd = _detect_yyyymmdd(df)
     base = os.getenv(
         "SUMMARY_DB_DIR",
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary",
+        nas_path(r"raw_data\kabu_station\summary"),
     )
     return os.path.join(base, f"summary{ymd}.db")
 

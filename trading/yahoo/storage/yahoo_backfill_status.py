@@ -48,10 +48,11 @@ import sqlite3
 import logging
 import datetime as dt
 from typing import Iterable, Optional, Callable, TypeVar
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_BASE_DIR = r"\\192.168.0.22\AutoStockBuyAndSell"
+DEFAULT_BASE_DIR = nas_root()
 
 SQLITE_TIMEOUT_SEC = 30.0
 SQLITE_BUSY_TIMEOUT_MS = 30000

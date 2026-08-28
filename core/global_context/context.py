@@ -48,6 +48,7 @@ import threading
 import warnings
 from typing import Any, Dict, Optional
 
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -1101,6 +1102,20 @@ def _repair_merged_summary_from_history(gc: "GlobalContext", tf: Any, df: Any, s
     if out.empty or source != "push" or "symbol" not in out.columns:
         return _safe_df(df)
 
+    # P0-8/P0-9: GC SUMMARY REPAIR は realtime 経路。履歴フレームを渡さない。
+    # 旧実装は rows=22851 を iterrows() で全走査していたため、
+    # 1 回の repair だけで数十秒かかっていた (実測ログ [GC SUMMARY REPAIR] rows=22851)。
+    # 補完対象は「銘柄あたり最新 1 行」だけで十分。
+    try:
+        from trading.summary.realtime_history_guard import to_latest_projection
+
+        out = to_latest_projection(out, caller="GC_SUMMARY_REPAIR", interval=tf)
+    except Exception:
+        logger.debug("[GC SUMMARY REPAIR] realtime guard unavailable tf=%s", tf, exc_info=True)
+
+    if out.empty:
+        return _safe_df(df)
+
     try:
         hist = gc.get_summary_history(tf, source="push")
     except Exception:
@@ -1108,6 +1123,31 @@ def _repair_merged_summary_from_history(gc: "GlobalContext", tf: Any, df: Any, s
     best = _merged_repair_best_map_from_history(hist)
     if not best:
         return out
+
+    # 代入前に受け側の列 dtype を広げておく。
+    # int64 / bool の列へ .at で float や NA を入れると
+    #   FutureWarning: Setting an item of incompatible dtype is deprecated
+    #                  and will raise an error in a future version
+    # になる (将来の pandas では例外)。
+    _fill_samples: Dict[str, list] = {}
+    for _vals in best.values():
+        if not isinstance(_vals, dict):
+            continue
+        for _c, _v in _vals.items():
+            _fill_samples.setdefault(_c, []).append(_v)
+    for _col, _samples in _fill_samples.items():
+        try:
+            if _col not in out.columns:
+                # 新規列は float64 で作る (fill 対象はすべて数値/フラグ列)。
+                out[_col] = np.nan
+                continue
+            _kind = getattr(out[_col].dtype, "kind", "")
+            if _kind in ("i", "u"):
+                out[_col] = out[_col].astype("float64")
+            elif _kind == "b" and any(not isinstance(_v, (bool, np.bool_)) for _v in _samples):
+                out[_col] = out[_col].astype("object")
+        except Exception:
+            logger.debug("[MERGED REPAIR] widen dtype failed col=%s", _col, exc_info=True)
 
     hits = fills = macd_fill = signal_fill = mtf_fill = 0
     for idx, row in out.iterrows():
@@ -1118,7 +1158,9 @@ def _repair_merged_summary_from_history(gc: "GlobalContext", tf: Any, df: Any, s
         hits += 1
         for col, val in vals.items():
             if col not in out.columns:
-                out[col] = pd.NA
+                # 上の事前広げで作られているはずだが保険。
+                # pd.NA だと object 列になるので np.nan (float64) で作る。
+                out[col] = np.nan
             cur = out.at[idx, col]
             if _merged_repair_zero_like(cur) and not _merged_repair_zero_like(val):
                 out.at[idx, col] = val
@@ -1220,6 +1262,13 @@ class GlobalContext:
         with self._lock:
             return self._ranking_df.copy()
 
+    def _invalidate_fresher_cache(self) -> None:
+        """summary ストアが更新されたら prefer-fresh の判定キャッシュを捨てる。"""
+        try:
+            self._fresher_cache.clear()
+        except Exception:
+            pass
+
     def set_summary_history(self, tf: Any, df: Any, source: str = "legacy", caller: Optional[str] = None) -> pd.DataFrame:
         with self._lock:
             src = str(source or "legacy").lower()
@@ -1238,6 +1287,7 @@ class GlobalContext:
                     latest = out["datetime"].max()
             except Exception:
                 pass
+            self._invalidate_fresher_cache()
             logger.info("[SUMMARY HISTORY SET] tf=%s source=%s caller=%s rows=%s symbols=%s latest_dt=%s completed=%s", tf, src, caller or _caller_name(2), len(out), out["symbol"].nunique() if "symbol" in out.columns and not out.empty else 0, latest, _is_completed_summary_df(out))
             _log_df_profile("[SUMMARY HISTORY STORED]", tf, src, out)
             return out
@@ -1268,16 +1318,141 @@ class GlobalContext:
                 logger.exception("[GC SUMMARY REPAIR] repair failed tf=%s source=%s", tf, src)
                 fixed = df
             out = _sanitize_summary_df(fixed, tf=tf, source=src, symbol_name_map=self.symbol_name_map)
-            self._merged_summary.setdefault(tf, {})[src] = out
+
+            # sanitize は読み出し側の鮮度フィルタ。その結果が空になったからといって
+            # 既存キャッシュを消してはいけない (実測: before=169 -> after=0 で
+            # merged tf=1 が rows=0 になり Entry が参照不能になっていた)。
+            prev = None
+            try:
+                prev = self._merged_summary.get(tf, {}).get(src)
+            except Exception:
+                prev = None
+            prev_rows = len(prev) if isinstance(prev, pd.DataFrame) else 0
+            allow_empty = _env_bool("SUMMARY_MERGED_ALLOW_EMPTY_OVERWRITE", False)
+            if (not allow_empty) and prev_rows > 0 and (not isinstance(out, pd.DataFrame) or out.empty):
+                prev_latest = None
+                try:
+                    if "datetime" in prev.columns:
+                        prev_latest = prev["datetime"].max()
+                except Exception:
+                    pass
+                logger.warning(
+                    "[MERGED SET] tf=%s source=%s caller=%s 空 sanitize 結果で既存を潰さない "
+                    "in_rows=%s sanitized_rows=0 kept_rows=%s kept_latest=%s "
+                    "(読み出し側の鮮度ガードはそのまま効く; "
+                    "SUMMARY_MERGED_ALLOW_EMPTY_OVERWRITE=1 で従来動作)",
+                    tf, src, caller or _caller_name(2),
+                    len(df) if isinstance(df, pd.DataFrame) else 0, prev_rows, prev_latest,
+                )
+                return prev
+
             latest = None
             try:
                 if "datetime" in out.columns and not out.empty:
                     latest = out["datetime"].max()
             except Exception:
                 pass
+
+            # sanitize 後に既存より古くなった場合も保存しない (逆行 publish 禁止)
+            if (not allow_empty) and prev_rows > 0 and latest is not None:
+                try:
+                    prev_latest = prev["datetime"].max() if "datetime" in prev.columns else None
+                except Exception:
+                    prev_latest = None
+                if prev_latest is not None and pd.notna(prev_latest) and pd.notna(latest) and latest < prev_latest:
+                    logger.warning(
+                        "[MERGED SET] tf=%s source=%s caller=%s 逆行 publish を拒否 "
+                        "new_latest=%s < kept_latest=%s new_rows=%s kept_rows=%s",
+                        tf, src, caller or _caller_name(2), latest, prev_latest, len(out), prev_rows,
+                    )
+                    return prev
+
+            self._merged_summary.setdefault(tf, {})[src] = out
+            self._invalidate_fresher_cache()
             logger.info("[MERGED SET] tf=%s source=%s caller=%s rows=%s symbols=%s latest_dt=%s completed=%s", tf, src, caller or _caller_name(2), len(out), out["symbol"].nunique() if "symbol" in out.columns and not out.empty else 0, latest, _is_completed_summary_df(out))
             _log_df_profile("[MERGED STORED]", tf, src, out)
             return out
+
+    _fresher_cache: Dict[Any, Any] = {}
+    _fresher_log_seen: Dict[Any, Any] = {}
+
+    def _memory_fresher_summary(self, tf: Any, current: Any, *, source: Any) -> Any:
+        """current が stale なら、メモリ内のより新しいフレームへ差し替える。
+
+        _merged_summary[tf][*] と _summary_history[tf][*] を見るだけで、
+        NAS などの重い取得は一切行わない。
+        """
+        try:
+            if not _env_bool("SUMMARY_MERGED_GET_PREFER_FRESH", True):
+                return current
+            try:
+                max_age = max(30.0, float(os.getenv("SUMMARY_MERGED_GET_MAX_AGE_SEC", "180") or 180))
+            except Exception:
+                max_age = 180.0
+
+            cur_latest = _overwrite_guard_latest_dt(current)
+            now_ts = pd.Timestamp.now()
+            if cur_latest is not None and not pd.isna(cur_latest):
+                cur_age = float((now_ts - pd.Timestamp(cur_latest)).total_seconds())
+                if cur_age <= max_age:
+                    return current
+            else:
+                cur_age = float("inf")
+
+            # get_merged_summary は毎秒何度も呼ばれるので、短い TTL で
+            # 全ストア走査 (全行 datetime パース) を繰り返さない。
+            try:
+                ttl = max(0.0, float(os.getenv("SUMMARY_MERGED_GET_PREFER_FRESH_TTL_SEC", "1.0") or 1.0))
+            except Exception:
+                ttl = 1.0
+            ck = (tf, str(source))
+            hit = self._fresher_cache.get(ck)
+            if hit is not None and ttl > 0:
+                ts, cached = hit
+                if (now_ts - ts).total_seconds() <= ttl:
+                    return cached if cached is not None else current
+
+            best = None
+            best_name = ""
+            best_dt = cur_latest
+            with self._lock:
+                stores = (
+                    ("merged", self._merged_summary.get(tf, {}) or {}),
+                    ("history", self._summary_history.get(tf, {}) or {}),
+                )
+                for kind, bucket in stores:
+                    for k, v in list(bucket.items()):
+                        if not isinstance(v, pd.DataFrame) or v.empty:
+                            continue
+                        cand = _overwrite_guard_latest_dt(v)
+                        if cand is None or pd.isna(cand):
+                            continue
+                        if best_dt is None or pd.isna(best_dt) or pd.Timestamp(cand) > pd.Timestamp(best_dt):
+                            best = v
+                            best_name = "%s[%s]" % (kind, k)
+                            best_dt = cand
+
+            if best is None:
+                if ttl > 0:
+                    self._fresher_cache[ck] = (now_ts, None)
+                return current
+            new_age = float((now_ts - pd.Timestamp(best_dt)).total_seconds())
+            out = best.copy()
+            if ttl > 0:
+                self._fresher_cache[ck] = (now_ts, out)
+            # 同じ差し替えが続く間はログを繰り返さない。
+            sig = (tf, str(source), best_name, str(best_dt))
+            if self._fresher_log_seen.get(ck) != sig:
+                self._fresher_log_seen[ck] = sig
+                logger.warning(
+                    "[MERGED GET PREFER FRESH] tf=%s source=%s stale_latest=%s stale_age=%.1fs "
+                    "-> fresh_source=%s fresh_latest=%s fresh_age=%.1fs rows=%s max_age=%.0fs",
+                    tf, source, cur_latest, cur_age, best_name, best_dt, new_age, len(best), max_age,
+                )
+            return out
+        except Exception:
+            logger.debug("[MERGED GET PREFER FRESH] failed tf=%s source=%s", tf, source, exc_info=True)
+            return current
 
     def get_merged_summary(self, tf: Any, source: Optional[str] = None) -> pd.DataFrame:
         # stale-guard は旧 core/startup/summary_stale_guard_patch.py から移設。
@@ -1285,6 +1460,8 @@ class GlobalContext:
         # 適用する (元のmonkeypatchと同じ位置関係)。
         df = self._get_merged_summary_impl(tf, source=source)
         src = source if source is not None else "push"
+        # 選ばれたスロットが古いときだけ、メモリ内のより新しいものへ差し替える。
+        df = self._memory_fresher_summary(tf, df, source=src)
         return drop_stale_summary_rows(df, source=src, tf=tf, label="merged_get")
 
     def _get_merged_summary_impl(self, tf: Any, source: Optional[str] = None) -> pd.DataFrame:
@@ -1547,13 +1724,37 @@ def _install_pipe_summary_display() -> bool:
                     prof.get("score_mtf_nonzero"), prof.get("mtf_score_nonzero"), prof.get("rsi_nonzero"),
                     prof.get("macd_nonzero"), prof.get("signal_nonzero"), prof.get("close_nonnull"), prof.get("datetime_nonnull"),
                 )
+                # P0-1: 表ダンプはネイティブ版と同じ env ゲートに従う。
+                #
+                # このパッチはゲートを持っておらず、[MERGED GET] /
+                # [MERGED STORED] / [SUMMARY HISTORY GET] のたびに
+                # 20 行 x 22 列の表を必ず出していた。2026-08-28 の実測では
+                #   表ダンプ 1,528,872 B = ログ全体 2,334,668 B の 65%
+                #   1 レコード平均 1,889 B
+                # で、保存先は NAS (\\192.168.0.22\...\Logs\console)。
+                # NAS への 1 行 flush は実測 mean 7.6〜11.1ms / p95 27〜38ms
+                # (ローカルの約 1000 倍) かかり、しかも
+                # logging.Handler.handle() の `with self.lock:` の中なので
+                # **全スレッドのログを止める**。
+                # 08:51 の 50 秒 tick では core.global_context.context の
+                # ログだけで 23.5 秒 (窓の 44.3%) を占めていた。
+                #
+                # 件数・非ゼロ数の行 (上の 2 本) は残す。表だけを既定 OFF にする。
+                # 見たいときは SUMMARY_CONTEXT_VERBOSE_TABLE_LOG=1。
+                if not _env_bool("SUMMARY_CONTEXT_VERBOSE_TABLE_LOG", False):
+                    return
                 show_cols = [c for c in [
                     "symbol", "symbolname", "score", "score_total", "final_score", "display_score",
                     "score_buy", "score_sell", "slope", "slope_atr_scaled", "score_slope",
                     "mtf", "score_mtf", "mtf_score", "open", "high", "low", "close", "rsi", "macd", "signal", "datetime"
                 ] if c in df.columns]
                 if show_cols and not df.empty:
-                    logger.info("%s tf=%s source=%s\n%s", prefix, tf, source, _table(df[show_cols].head(20)))
+                    head_n = 20
+                    try:
+                        head_n = max(1, int(float(os.getenv("SUMMARY_CONTEXT_VERBOSE_TABLE_ROWS", "20"))))
+                    except Exception:
+                        head_n = 20
+                    logger.info("%s tf=%s source=%s\n%s", prefix, tf, source, _table(df[show_cols].head(head_n)))
             except Exception:
                 logger.exception("[PIPE SUMMARY DISPLAY PATCH] _log_df_profile failed prefix=%s tf=%s source=%s", prefix, tf, source)
 

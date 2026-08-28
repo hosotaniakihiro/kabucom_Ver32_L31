@@ -144,7 +144,11 @@ def _db_has_usable_ranking_tables_core(db_path: str) -> bool:
         return False
 
     try:
-        with sqlite3.connect(str(p), timeout=3.0) as conn:
+        # P0-1/P0-6: `with sqlite3.connect(...)` は close しない (実測でリーク確認)。
+        # ここは「使える DB か」を見るだけの reader なので、
+        # read-only で開き、存在しなければ空 DB も作らない。
+        from database.sqlite_util import readonly_connect
+        with readonly_connect(str(p), timeout=3.0, busy_timeout_ms=3000) as conn:
             tables = set(_list_tables(conn))
 
             # 判定に必要なのは「1行でもあるか」だけ。COUNT(*) だと当日DBが

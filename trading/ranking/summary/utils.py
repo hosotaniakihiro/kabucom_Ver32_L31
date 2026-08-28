@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 import pandas as pd
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -92,20 +93,91 @@ def normalize_trade_date(
         return dt.date.today()
 
 
+# ============================================================
+# NAS root の表記ゆれ対策 (R17)
+# ------------------------------------------------------------
+# 2026-08-28 17:1x の実測:
+#   os.path.exists(UNC + r"\raw_data\kabu_station\ranking\ranking20260828.db")
+#       -> False  (3 回連続。SMB セッションが落ちている)
+#   os.path.exists(r"X:\raw_data\kabu_station\ranking\ranking20260828.db")
+#       -> True   (607.2MB)
+#
+# 同じ共有に UNC とドライブレターの 2 表記で触ると Windows は
+# 別セッションとして扱う (第14ラウンドで子プロセス起動でも同じ問題を確認済み)。
+# UNC 側のセッションが切れると path_exists() が False になり、
+# read_sqlite_table() が「db not found」で **空 DataFrame を返す**。
+# 「無かった」と「読めなかった」が同じ空フレームになるのは危険なので、
+# 到達可能な表記へ寄せる。
+#
+# ENV:
+#   AUTOSTOCK_NAS_ROOT           明示指定 (最優先)
+#   AUTOSTOCK_NAS_ROOT_FALLBACK  既定 "X:" (UNC が到達不能なときに使う)
+# ============================================================
+
+_NAS_ROOT_UNC = nas_root()
+_NAS_ROOT_CACHE: Optional[str] = None
+
+
+def _nas_root() -> str:
+    """到達可能な NAS root 表記を返す (プロセス内で 1 回だけ判定)。"""
+    global _NAS_ROOT_CACHE
+    if _NAS_ROOT_CACHE is not None:
+        return _NAS_ROOT_CACHE
+
+    explicit = str(os.getenv("AUTOSTOCK_NAS_ROOT", "")).strip()
+    if explicit:
+        _NAS_ROOT_CACHE = explicit.rstrip("\\/")
+        logger.warning(
+            "[RANKING SUMMARY UTILS] NAS root は env 指定を使う root=%s",
+            _NAS_ROOT_CACHE,
+        )
+        return _NAS_ROOT_CACHE
+
+    fallback = str(os.getenv("AUTOSTOCK_NAS_ROOT_FALLBACK", "X:")).strip().rstrip("\\/")
+
+    try:
+        if os.path.exists(_NAS_ROOT_UNC):
+            _NAS_ROOT_CACHE = _NAS_ROOT_UNC
+            return _NAS_ROOT_CACHE
+    except Exception:
+        logger.debug("[RANKING SUMMARY UTILS] UNC root probe failed", exc_info=True)
+
+    try:
+        if fallback and os.path.exists(fallback + "\\"):
+            _NAS_ROOT_CACHE = fallback
+            logger.warning(
+                "[RANKING SUMMARY UTILS] UNC root %s へ到達できないため %s を使う "
+                "(同一共有への二重 SMB セッションを避ける。"
+                "AUTOSTOCK_NAS_ROOT で明示指定できる)",
+                _NAS_ROOT_UNC, fallback,
+            )
+            return _NAS_ROOT_CACHE
+    except Exception:
+        logger.debug("[RANKING SUMMARY UTILS] fallback root probe failed", exc_info=True)
+
+    # どちらも駄目なら従来どおり UNC を返す (呼び出し側で not found として扱われる)
+    _NAS_ROOT_CACHE = _NAS_ROOT_UNC
+    logger.error(
+        "[RANKING SUMMARY UTILS] NAS root へ到達できない unc=%s fallback=%s "
+        "(ranking/yahoo DB は読めない見込み)",
+        _NAS_ROOT_UNC, fallback,
+    )
+    return _NAS_ROOT_CACHE
+
+
+def reset_nas_root_cache_for_test() -> None:
+    global _NAS_ROOT_CACHE
+    _NAS_ROOT_CACHE = None
+
+
 def default_ranking_db_path(trade_date: dt.date) -> str:
     ymd = trade_date.strftime("%Y%m%d")
-    return (
-        r"\\192.168.0.22\AutoStockBuyAndSell"
-        rf"\raw_data\kabu_station\ranking\ranking{ymd}.db"
-    )
+    return _nas_root() + rf"\raw_data\kabu_station\ranking\ranking{ymd}.db"
 
 
 def default_yahoo_db_path(trade_date: dt.date) -> str:
     ymd = trade_date.strftime("%Y%m%d")
-    return (
-        r"\\192.168.0.22\AutoStockBuyAndSell"
-        rf"\raw_data\yahoo\intraday\yahoo_1min_{ymd}.db"
-    )
+    return _nas_root() + rf"\raw_data\yahoo\intraday\yahoo_1min_{ymd}.db"
 
 
 def path_exists(path: Optional[str]) -> bool:
@@ -242,7 +314,9 @@ def combine_numeric_columns(
                     .str.replace(",", "", regex=False)
                     .str.replace("円", "", regex=False)
                     .str.strip()
-                    .replace({"": np.nan, "None": np.nan, "nan": np.nan, "NaN": np.nan, "<NA>": np.nan})
+                    # 文字列 Series へ np.nan を混ぜると object->float の暗黙ダウンキャスト。
+                    # 直後の pd.to_numeric(errors="coerce") で同じ NaN になる。
+                    .replace({"None": "", "nan": "", "NaN": "", "<NA>": ""})
                 )
 
             num = pd.to_numeric(s, errors="coerce")

@@ -20,10 +20,11 @@ import os
 import sqlite3
 from datetime import datetime
 from typing import Any
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
-BASE_DIR = r'\\192.168.0.22\AutoStockBuyAndSell\raw_data\news_learning'
+BASE_DIR = nas_path(r'raw_data\news_learning')
 
 
 def get_news_reaction_db_path() -> str:

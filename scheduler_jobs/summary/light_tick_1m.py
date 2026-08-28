@@ -353,22 +353,59 @@ def build_light_1m_summary(interval: int, *, now: dt.datetime, display: bool = T
     t0 = time.perf_counter()
     try:
         _install_no_raw_db_watchdog()
+        # P0-1: 重い段の手前で予算を確認できるように、tier2 の中を割る。
+        try:
+            from scheduler_jobs.summary import stage_tracker as _st
+        except Exception:
+            _st = None
+
         runner = rc.resolve_push_summary_runner()
         if not callable(runner):
             raise RuntimeError("push summary runner is not available")
         logger.warning("[SUMMARY MAIN LIGHT TICK] light job start interval=%s display=%s run_entry=%s now=%s", interval_i, display, run_entry, now_i)
-        result = rc.call_runner_with_optional_now(runner, interval=interval_i, now=now_i, **kwargs)
+
+        if _st is not None and _st.should_stop("light_before_runner"):
+            logger.warning("[SUMMARY MAIN LIGHT TICK] cooperative stop before runner interval=%s elapsed=%.3fs",
+                           interval_i, time.perf_counter() - t0)
+            return pd.DataFrame()
+
+        if _st is not None:
+            with _st.stage("light_push_runner"):
+                result = rc.call_runner_with_optional_now(runner, interval=interval_i, now=now_i, **kwargs)
+        else:
+            result = rc.call_runner_with_optional_now(runner, interval=interval_i, now=now_i, **kwargs)
         df, meta = rc.normalize_runner_output(result)
+
         if not isinstance(df, pd.DataFrame) or df.empty:
+            # fallback は NAS を触りうるので、予算が尽きていたらここで降りる。
+            if _st is not None and _st.should_stop("light_before_fallback"):
+                logger.warning("[SUMMARY MAIN LIGHT TICK] budget exhausted before fallback interval=%s elapsed=%.3fs",
+                               interval_i, time.perf_counter() - t0)
+                return pd.DataFrame()
             logger.warning("[SUMMARY MAIN LIGHT TICK] light runner empty interval=%s -> fallback", interval_i)
-            df = rc.fallback_push_summary_df(interval_i, now=now_i)
-        df = _normalize_df_light(df, now=now_i)
+            if _st is not None:
+                with _st.stage("light_fallback"):
+                    df = rc.fallback_push_summary_df(interval_i, now=now_i)
+            else:
+                df = rc.fallback_push_summary_df(interval_i, now=now_i)
+
+        if _st is not None:
+            with _st.stage("light_normalize"):
+                df = _normalize_df_light(df, now=now_i)
+        else:
+            df = _normalize_df_light(df, now=now_i)
         if not df.empty:
             try:
                 rc.log_job_result("job_summary(PUSH-LIGHT)", interval_i, df, meta if isinstance(meta, dict) else {})
             except Exception:
                 pass
-            _submit_async_ai(df, interval=interval_i, now=now_i, run_entry=run_entry, reason="early_after_runner")
+            # AI/Entry の submit は予算切れでも実行する。
+            # ここを飛ばすと候補が作られず発注が消えるため。
+            if _st is not None:
+                with _st.stage("light_ai_submit"):
+                    _submit_async_ai(df, interval=interval_i, now=now_i, run_entry=run_entry, reason="early_after_runner")
+            else:
+                _submit_async_ai(df, interval=interval_i, now=now_i, run_entry=run_entry, reason="early_after_runner")
         logger.warning("[SUMMARY MAIN LIGHT TICK] light job return interval=%s rows=%s elapsed=%.3fs display_skipped=%s", interval_i, len(df) if isinstance(df, pd.DataFrame) else 0, time.perf_counter() - t0, not _env_bool("SUMMARY_MAIN_LIGHT_DISPLAY", False))
         if _env_bool("SUMMARY_MAIN_LIGHT_DISPLAY", False):
             try:

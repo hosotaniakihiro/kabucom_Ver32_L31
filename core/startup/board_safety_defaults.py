@@ -124,6 +124,13 @@ def _install_summary_ai_lock_retry() -> bool:
     install() 内 (:316-317) で STALE_SEC を 20 以下へクランプするが、
     この関数はその後に走るため 35 / 0.8 が最終値になる。
     実際の install 順をスタブ module で再現して確認済み。
+
+    注意: SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK の
+    **起動時の最終決定権はこの関数** である。
+    trading/entry/summary_ai/direct_snapshot._bmd_apply_async_lock_policy() も
+    同じキーを 0 へ書くが、そちらは board-missing /
+    entry_controller lock timeout が実際に発生したときだけの
+    イベント駆動対処策で、import 時には走らない。
     """
     try:
         os.environ["SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK"] = "1"

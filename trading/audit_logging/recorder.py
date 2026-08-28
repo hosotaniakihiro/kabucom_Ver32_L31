@@ -44,12 +44,14 @@ import sqlite3
 import threading
 from datetime import datetime
 from typing import Any
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
 _LOCK = threading.Lock()
 
-BASE_DIR = r'\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\audit'
+BASE_DIR = nas_path(r'raw_data\kabu_station\audit')
 
 
 def _today():
@@ -109,7 +111,7 @@ def _ensure_extra_schema() -> None:
     """
     try:
         path = get_audit_db_path()
-        with sqlite3.connect(path, timeout=30) as conn:
+        with committing_connect(path, timeout=30) as conn:
             cur = conn.cursor()
             cur.execute('PRAGMA busy_timeout=30000')
             extras = {
@@ -173,7 +175,7 @@ def _insert_extra(table: str, values: dict) -> None:
     try:
         _ensure_extra_schema()
         path = get_audit_db_path()
-        with sqlite3.connect(path, timeout=30) as conn:
+        with committing_connect(path, timeout=30) as conn:
             cols_all = {str(r[1]) for r in conn.execute(f'PRAGMA table_info("{table}")').fetchall()}
             vals = {k: v for k, v in values.items() if k in cols_all}
             if not vals:
@@ -192,7 +194,7 @@ def _position_db_path() -> str:
         from config.paths import get_path
         return os.path.join(str(get_path('runtime_positions')), 'positions.db')
     except Exception:
-        return r'\\192.168.0.22\AutoStockBuyAndSell\runtime_positions\positions.db'
+        return nas_path(r'runtime_positions\positions.db')
 
 
 def _ensure_position_col(cur, table: str, col: str, ddl: str) -> bool:
@@ -222,7 +224,7 @@ def ensure_position_trade_reason_schema() -> dict:
     path = _position_db_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     added: dict = {}
-    with sqlite3.connect(path, timeout=30) as conn:
+    with committing_connect(path, timeout=30) as conn:
         cur = conn.cursor()
         cur.execute('PRAGMA busy_timeout=30000')
         try:

@@ -14,8 +14,9 @@ import sqlite3
 import threading
 from datetime import datetime
 from typing import Any
+from nas_root import nas_path, nas_root
 
-BASE_DIR = r'\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\audit'
+BASE_DIR = nas_path(r'raw_data\kabu_station\audit')
 _LOCK = threading.Lock()
 
 

@@ -968,7 +968,13 @@ def _run_refresh_sequence_core(
         return False
 
 
+# ats/ats_register_payload.py からも同じプロセス間ロックを取れるよう公開名を付ける。
+# (Kabu Station の register リストはセッション全体で 50 銘柄上限の共有資源なので、
+#  main.py 側の ATS 登録と push_receiver 側の rotation は同じロックで直列化する必要がある)
+registration_sequence_lock = _registration_sequence_lock
+
 __all__ = [
+    "registration_sequence_lock",
     "REGISTER_CHUNK_SIZE",
     "REGISTER_LIMIT",
     "DEFAULT_EXCHANGE",

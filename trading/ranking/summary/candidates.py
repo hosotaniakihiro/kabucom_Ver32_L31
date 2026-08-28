@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
 import pandas as pd
+from sqlite_cm import committing_connect
 
 logger = logging.getLogger(__name__)
 
@@ -235,7 +236,7 @@ def find_ranking_snapshot_table(
         return None
 
     try:
-        with sqlite3.connect(str(path), timeout=10.0) as con:
+        with committing_connect(str(path), timeout=10.0) as con:
             if _table_exists(con, preferred_table):
                 return preferred_table
 
@@ -273,7 +274,7 @@ def _read_table_recent(
         return pd.DataFrame()
 
     try:
-        with sqlite3.connect(str(path), timeout=10.0) as con:
+        with committing_connect(str(path), timeout=10.0) as con:
             pragma = pd.read_sql_query(f"PRAGMA table_info({table})", con)
             cols = pragma["name"].astype(str).tolist() if not pragma.empty else []
 
@@ -755,7 +756,7 @@ def get_latest_snapshot_datetime(
         return None
 
     try:
-        with sqlite3.connect(str(path), timeout=10.0) as con:
+        with committing_connect(str(path), timeout=10.0) as con:
             pragma = pd.read_sql_query(f"PRAGMA table_info({actual_table})", con)
             cols = pragma["name"].astype(str).tolist() if not pragma.empty else []
 

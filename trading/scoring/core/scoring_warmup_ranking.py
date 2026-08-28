@@ -21,6 +21,7 @@ import sqlite3
 from pathlib import Path
 
 from config.paths import get_path
+from sqlite_cm import committing_connect
 
 
 # ============================================================
@@ -59,7 +60,7 @@ def _load_previous_ranking(interval: int) -> pd.DataFrame:
     table_name = f"ranking_snapshot_{interval}min"
 
     try:
-        with sqlite3.connect(db_path) as conn:
+        with committing_connect(db_path) as conn:
             df = pd.read_sql(
                 f"SELECT symbol, rank FROM {table_name}",
                 conn

@@ -19,8 +19,35 @@ REM       "The filename, directory name, or volume label syntax is incorrect".
 REM       This bat lives in
 REM         <root>\TaskSchedule\SubScript\run_night_yahoo_full_summary\
 REM       so the repository root is three levels up.
-cd /d "%~dp0..\..\.."
+REM 2026-08-25: the task ran nightly with LastResult=1 but wrote nothing to
+REM   the log, so the failure could not be diagnosed at all. Two changes:
+REM   1) pushd instead of cd /d, so a UNC action path also works.
+REM      cd /d cannot make a UNC path the current directory; pushd maps a
+REM      temporary drive letter for it. W: is a mapped drive and does not
+REM      exist in a non-interactive (S4U) task logon session.
+REM   2) if the repository root cannot be reached, write the reason to a
+REM      local fallback log instead of dying silently.
+set "FALLBACK_LOG=%TEMP%\night_yahoo_full_summary_bootstrap.log"
+
+pushd "%~dp0..\..\.." 2>nul
+if errorlevel 1 goto no_root
+if not exist "%CD%\.venv\Scripts\python.exe" goto no_root
 set "PROJECT_ROOT=%CD%"
+goto root_ok
+
+:no_root
+echo.>> "%FALLBACK_LOG%"
+echo ============================================================>> "%FALLBACK_LOG%"
+echo START %date% %time% BOOTSTRAP FAILED>> "%FALLBACK_LOG%"
+echo dp0=%~dp0>> "%FALLBACK_LOG%"
+echo CD=%CD%>> "%FALLBACK_LOG%"
+echo repository root or .venv is not reachable from this task session.>> "%FALLBACK_LOG%"
+echo drives visible to this session:>> "%FALLBACK_LOG%"
+net use >> "%FALLBACK_LOG%" 2>&1
+echo ============================================================>> "%FALLBACK_LOG%"
+exit /b 1
+
+:root_ok
 
 REM Log messages contain emoji (e.g. the INIT ENGINES line). With stdout
 REM redirected to a file, Python defaults to CP932 here and the logging
@@ -78,6 +105,7 @@ REM ends and progress cannot be checked.
 >> "%LOG_FILE%" 2>&1
 
 set RET=%ERRORLEVEL%
+popd
 
 echo ============================================================>> "%LOG_FILE%"
 echo END %date% %time% exit=%RET%>> "%LOG_FILE%"

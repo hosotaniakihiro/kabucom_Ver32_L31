@@ -42,6 +42,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Iterable
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +107,7 @@ def _summary_db_path() -> str:
         return explicit
     base = os.getenv(
         "SUMMARY_DB_DIR",
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary",
+        nas_path(r"raw_data\kabu_station\summary"),
     )
     today = dt.datetime.now().strftime("%Y%m%d")
     return str(Path(base) / f"summary{today}.db")
@@ -357,7 +359,7 @@ def _load_one_table_df(path: str, table: str, interval: int, *, current_db: bool
         return pd.DataFrame()
     try:
         timeout = _env_float("SUMMARY_MTF_INDICATOR_SQLITE_TIMEOUT", 30.0)
-        with sqlite3.connect(path, timeout=timeout) as conn:
+        with committing_connect(path, timeout=timeout) as conn:
             _configure_connection(conn)
             if not _table_exists(conn, table):
                 return pd.DataFrame()
@@ -495,7 +497,7 @@ def _run_fill_impl(*, reason: str = "manual") -> dict[str, Any]:
         timeout = _env_float("SUMMARY_MTF_INDICATOR_SQLITE_TIMEOUT", 30.0)
         history_paths = _summary_db_paths_with_history(path)
         logger.warning("[SUMMARY MTF INDICATOR FILL] start reason=%s intervals=%s history_dbs=%s current=%s", reason, _parse_intervals(), [Path(p).name for p in history_paths], path)
-        with sqlite3.connect(path, timeout=timeout) as conn:
+        with committing_connect(path, timeout=timeout) as conn:
             _configure_connection(conn)
             for interval in _parse_intervals():
                 table = f"stock_summary_{interval}min"

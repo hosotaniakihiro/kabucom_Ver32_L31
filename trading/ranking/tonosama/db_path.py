@@ -16,11 +16,12 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_NAS_ROOT = r"\\192.168.0.22\AutoStockBuyAndSell"
+DEFAULT_NAS_ROOT = nas_root()
 
 
 def get_nas_root() -> str:

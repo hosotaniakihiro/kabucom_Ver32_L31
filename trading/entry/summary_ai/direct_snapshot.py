@@ -372,7 +372,9 @@ def _bmd_apply_async_lock_policy() -> bool:
         os.environ["SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_SLEEP_SEC"] = str(max(0.5, min(_bmd_env_float("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_SLEEP_SEC", 0.8), 1.5)))
         os.environ["SUMMARY_AI_ASYNC_ENTRY_STALE_SEC"] = str(max(35.0, _bmd_env_float("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", 35.0)))
         logger.warning(
-            "[SUMMARY AI BOARD MISSING DEFER] async lock policy applied reentrant %s->0 retry_max %s->%s stale %s->%s version=%s",
+            "[SUMMARY AI BOARD MISSING DEFER] async lock policy applied (event-driven remediation; "
+            "startup owner=core/startup/board_safety_defaults) "
+            "reentrant %s->0 retry_max %s->%s stale %s->%s version=%s",
             old_reentrant,
             old_retry,
             os.environ.get("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX"),
@@ -451,12 +453,26 @@ def _bmd_apply_full_rotation_retry() -> bool:
 
 
 def _bmd_apply_runtime_policies() -> None:
-    """旧 install() の env 既定値と 3 つの policy 適用を再現する。"""
+    """import 時に適用するのは **既定値だけ**。
+
+    以前はここで _bmd_apply_async_lock_policy() も呼んでおり、
+    まだ一度も board-missing / lock timeout が起きていない import 時点で
+    SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK を 0 へ落としていた。
+    直後に core/startup/board_safety_defaults が 1 へ戻すため、起動ログ上で
+    "reentrant 1->0" -> "reentrant=1" という意味の読めない往復が
+    毎回発生していた。
+
+    lock policy は「板が取れない / ロックが詰まったときの対処策」であって
+    既定値ではないので、実際にその事象が起きたときだけ
+    (_summary_ai_direct_snapshot_execute 内の 2 箇所) 適用する。
+
+    起動時の REENTRANT_LOCK の最終決定権は
+    core/startup/board_safety_defaults._install_summary_ai_lock_retry() (= 1)。
+    """
     try:
         os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY", "1")
         os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX", "5")
         os.environ.setdefault("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", "35")
-        _bmd_apply_async_lock_policy()
         _bmd_apply_rest_timeout_relief()
         _bmd_apply_full_rotation_retry()
     except Exception:

@@ -56,6 +56,8 @@ from utils_common import (
     calculate_qty_by_budget,
     get_tick_size,
 )
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -780,8 +782,11 @@ def _build_entry_order_core(*, symbol: str, side: str, source: str, entry_row: D
     spread_pct = None
     board = None
     price_source = None
-    side = side.upper()
-    source = source.upper()
+    # entry_type=None の RANKING 候補が来ても落ちないようにする。
+    # (RANKING の pending は entry_type=None なので、以前はここで
+    #  AttributeError: 'NoneType' object has no attribute 'upper' になっていた)
+    side = str(side or "").strip().upper()
+    source = str(source or "").strip().upper()
 
     trade_guard_ng = _trade_guard_block(symbol)
     if trade_guard_ng is not None:
@@ -2896,6 +2901,14 @@ def build_entry_order(*args, **kwargs):
         return ret
 
 
+# 旧 core/startup/rest_full_board_entry_patch.py が付けていた
+# _rest_full_board_patch マーカの後継。本文化後も
+# core/startup/startup.py の BOARD RUNTIME SELF CHECK がこの層の
+# 有効性 (= 誰かに build_entry_order を差し替えられていないこと)
+# を検出できるようにする。
+build_entry_order._rest_full_board_builtin = True  # type: ignore[attr-defined]
+
+
 # ============================================================
 # ENTRY MA5 BREAKOUT COUNT GUARD
 # (旧 core/startup/entry_ma5_breakout_count_patch.py を本文化)
@@ -2982,7 +2995,7 @@ def _m5b_parse_tfs() -> list[int]:
 
 def _m5b_summary_db_path() -> str:
     ymd = os.getenv("KABU_TODAY") or os.getenv("TARGET_DATE") or dt.datetime.now().strftime("%Y%m%d")
-    root = os.getenv("SUMMARY_DB_DIR") or r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary"
+    root = os.getenv("SUMMARY_DB_DIR") or nas_path(r"raw_data\kabu_station\summary")
     return os.path.join(root, f"summary{ymd}.db")
 
 
@@ -3063,7 +3076,7 @@ def _m5b_history_from_db(symbol: str, tf: int, limit: int) -> list[dict[str, Any
              ORDER BY datetime DESC
              LIMIT ?
         """
-        with sqlite3.connect(db, timeout=1.0) as conn:
+        with committing_connect(db, timeout=1.0) as conn:
             conn.execute("PRAGMA query_only=ON")
             got = conn.execute(sql, (sym, int(limit))).fetchall()
 

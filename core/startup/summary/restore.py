@@ -46,6 +46,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
 import pandas as pd
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +58,7 @@ VERSION = "PRODUCTION-STABLE-REV1.0-STARTUP-SUMMARY-RESTORE-MINIMAL-TAIL"
 # Constants
 # ============================================================
 
-DEFAULT_BASE_DIR = r"\\192.168.0.22\AutoStockBuyAndSell"
+DEFAULT_BASE_DIR = nas_root()
 DEFAULT_SUMMARY_DIR = rf"{DEFAULT_BASE_DIR}\raw_data\kabu_station\summary"
 DEFAULT_PUSH_DIR = rf"{DEFAULT_BASE_DIR}\raw_data\kabu_station\push"
 
@@ -530,7 +532,7 @@ def _resolve_latest_db(
 
 def _sqlite_table_exists(db_path: str, table: str) -> bool:
     try:
-        with sqlite3.connect(db_path, timeout=10) as conn:
+        with committing_connect(db_path, timeout=10) as conn:
             cur = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
                 (table,),
@@ -542,7 +544,7 @@ def _sqlite_table_exists(db_path: str, table: str) -> bool:
 
 def _get_table_columns(db_path: str, table: str) -> list[str]:
     try:
-        with sqlite3.connect(db_path, timeout=10) as conn:
+        with committing_connect(db_path, timeout=10) as conn:
             rows = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
         return [r[1] for r in rows]
     except Exception:
@@ -756,7 +758,7 @@ def _resolve_push_table(push_db_path: str) -> Optional[str]:
     ]
 
     try:
-        with sqlite3.connect(push_db_path, timeout=10) as conn:
+        with committing_connect(push_db_path, timeout=10) as conn:
             rows = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
@@ -1303,7 +1305,7 @@ def _sqlite_insert_or_replace_summary(
     rows = [tuple(x) for x in out.itertuples(index=False, name=None)]
 
     try:
-        with sqlite3.connect(summary_db_path, timeout=30) as conn:
+        with committing_connect(summary_db_path, timeout=30) as conn:
             conn.execute("PRAGMA busy_timeout=30000")
             conn.executemany(sql, rows)
             conn.commit()
@@ -1547,7 +1549,7 @@ def _format_display_df(df: pd.DataFrame) -> str:
 
 def _read_sql(db_path: str, sql: str, *, params: Optional[list[Any]] = None) -> pd.DataFrame:
     try:
-        with sqlite3.connect(db_path, timeout=30) as conn:
+        with committing_connect(db_path, timeout=30) as conn:
             conn.execute("PRAGMA busy_timeout=30000")
             return pd.read_sql_query(sql, conn, params=params or [])
     except Exception:

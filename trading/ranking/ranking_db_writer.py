@@ -133,6 +133,51 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return str(v).strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
+# ============================================================
+# R18: WAL checkpoint を commit 経路から外す
+# ------------------------------------------------------------
+# 第16ラウンドで push DB writer に対して特定した真因と同じ構造が
+# ranking 側にも残っていた。
+#   PRAGMA wal_autocheckpoint=1000 (= 約 4MB) を超えるたびに
+#   **commit の中で** checkpoint が走る。ranking DB は 607.2MB /
+#   WAL 399.4MB まで肥大していたため、この inline checkpoint が
+#   flush を詰まらせる (push 側の 13:43 停止と同じ経路)。
+# 対策も push と同じ: inline auto-checkpoint を止め、
+# 専用スレッドで定期的に PASSIVE checkpoint する。
+#
+# ENV:
+#   RANKING_DB_BG_CHECKPOINT               既定 on
+#   RANKING_DB_BG_CHECKPOINT_INTERVAL_SEC  既定 30 (最小 5)
+#   RANKING_DB_WAL_SIZE_LIMIT_MB           既定 64
+# ============================================================
+
+def _ranking_bg_checkpoint_enabled() -> bool:
+    v = os.getenv("RANKING_DB_BG_CHECKPOINT")
+    if v is None or str(v).strip() == "":
+        return True
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _ranking_bg_checkpoint_interval_sec() -> float:
+    try:
+        v = os.getenv("RANKING_DB_BG_CHECKPOINT_INTERVAL_SEC")
+        if v and str(v).strip():
+            return max(5.0, float(str(v).strip()))
+    except Exception:
+        pass
+    return 30.0
+
+
+def _ranking_wal_size_limit_bytes() -> int:
+    try:
+        v = os.getenv("RANKING_DB_WAL_SIZE_LIMIT_MB")
+        if v and str(v).strip():
+            return int(float(str(v).strip()) * 1024 * 1024)
+    except Exception:
+        pass
+    return 64 * 1024 * 1024
+
+
 def _resolve_ranking_db_path() -> Path:
     """
     ranking DB path を取得する。
@@ -442,6 +487,86 @@ def _ensure_columns_with_cursor(cur: Any, table: str, columns: tuple[tuple[str, 
 # ============================================================
 
 class RankingDBWriter:
+    # R18: 背景 checkpoint スレッド (プロセスで 1 本だけ)
+    _BG_CKPT_LOCK = threading.Lock()
+    _BG_CKPT_THREAD: Optional[threading.Thread] = None
+    _BG_CKPT_STATS: dict = {
+        "runs": 0, "busy": 0, "frames": None, "checkpointed": None,
+        "errors": 0, "last_elapsed": None, "last_at": None,
+    }
+
+    def _start_bg_checkpoint(self, db_path: str) -> None:
+        """WAL checkpoint を writer の commit 経路から外して専用スレッドで回す。"""
+        if not _ranking_bg_checkpoint_enabled():
+            return
+
+        # type(self) にすると サブクラスが独自の _BG_CKPT_THREAD を持ってしまい、
+        # 「プロセスで 1 本だけ」が崩れる。基底クラスに固定する。
+        cls = RankingDBWriter
+        with cls._BG_CKPT_LOCK:
+            th = cls._BG_CKPT_THREAD
+            if th is not None and th.is_alive():
+                return
+
+            interval = _ranking_bg_checkpoint_interval_sec()
+
+            def _loop() -> None:
+                logger.warning(
+                    "[RANKING DB CHECKPOINT] background checkpoint started interval=%.1fs db=%s "
+                    "(commit 経路から checkpoint を外した)",
+                    interval, db_path,
+                )
+                while True:
+                    time.sleep(interval)
+                    conn = None
+                    t0 = time.perf_counter()
+                    try:
+                        conn = sqlite3.connect(db_path, timeout=30.0)
+                        conn.execute("PRAGMA busy_timeout=%d" % int(DEFAULT_BUSY_TIMEOUT_MS))
+                        row = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                        el = time.perf_counter() - t0
+                        busy, frames, done = (row or (None, None, None))
+                        with cls._BG_CKPT_LOCK:
+                            s = cls._BG_CKPT_STATS
+                            s["runs"] += 1
+                            s["busy"] += 1 if busy else 0
+                            s["frames"] = frames
+                            s["checkpointed"] = done
+                            s["last_elapsed"] = round(el, 2)
+                            s["last_at"] = dt.datetime.now()
+                        try:
+                            wal_mb = round(os.path.getsize(db_path + "-wal") / 1024 / 1024, 1)
+                        except Exception:
+                            wal_mb = None
+                        log = logger.warning if (el >= 5.0 or busy) else logger.info
+                        log(
+                            "[RANKING DB CHECKPOINT] passive busy=%s log_frames=%s checkpointed=%s "
+                            "elapsed=%.2fs wal_mb=%s interval=%.1fs (commit をブロックしない)",
+                            busy, frames, done, el, wal_mb, interval,
+                        )
+                    except Exception:
+                        with cls._BG_CKPT_LOCK:
+                            cls._BG_CKPT_STATS["errors"] += 1
+                        logger.warning(
+                            "[RANKING DB CHECKPOINT] failed db=%s (次回再試行。取り込みは止めない)",
+                            db_path, exc_info=True,
+                        )
+                    finally:
+                        if conn is not None:
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
+
+            t = threading.Thread(target=_loop, name="ranking-db-checkpoint", daemon=True)
+            cls._BG_CKPT_THREAD = t
+            t.start()
+
+    @classmethod
+    def checkpoint_stats(cls) -> dict:
+        with cls._BG_CKPT_LOCK:
+            return dict(cls._BG_CKPT_STATS)
+
     def __init__(
         self,
         *,
@@ -535,7 +660,22 @@ class RankingDBWriter:
 
         self.cursor.execute("PRAGMA journal_mode=WAL;")
         self.cursor.execute("PRAGMA synchronous=NORMAL;")
-        self.cursor.execute(f"PRAGMA wal_autocheckpoint={DEFAULT_WAL_AUTOCHECKPOINT};")
+
+        # R18: 背景 checkpoint が有効なら inline auto-checkpoint を止める。
+        # 有効なまま (=1000) だと約 4MB ごとに commit の中で checkpoint が走り、
+        # WAL が肥大した ranking DB では flush が詰まる (第16ラウンドの push と同じ)。
+        bg_ckpt = _ranking_bg_checkpoint_enabled()
+        if bg_ckpt:
+            self.cursor.execute("PRAGMA wal_autocheckpoint=0;")
+            try:
+                self.cursor.execute(
+                    "PRAGMA journal_size_limit=%d;" % int(_ranking_wal_size_limit_bytes())
+                )
+            except Exception:
+                logger.debug("[RANKING DB WRITER] journal_size_limit set failed", exc_info=True)
+        else:
+            self.cursor.execute(f"PRAGMA wal_autocheckpoint={DEFAULT_WAL_AUTOCHECKPOINT};")
+
         self.cursor.execute(f"PRAGMA busy_timeout={DEFAULT_BUSY_TIMEOUT_MS};")
         self.cursor.execute("PRAGMA temp_store=MEMORY;")
         self.cursor.execute("PRAGMA cache_size=-50000;")
@@ -543,12 +683,17 @@ class RankingDBWriter:
         self._prepare_schema_safely()
 
         logger.info(
-            "[RANKING DB WRITER] connected db=%s buffer_size=%d flush_interval=%.3f wal_autocheckpoint=%d",
+            "[RANKING DB WRITER] connected db=%s buffer_size=%d flush_interval=%.3f "
+            "wal_autocheckpoint=%d bg_checkpoint=%s",
             db_path,
             self.buffer_size,
             self.flush_interval_sec,
-            DEFAULT_WAL_AUTOCHECKPOINT,
+            0 if bg_ckpt else DEFAULT_WAL_AUTOCHECKPOINT,
+            bg_ckpt,
         )
+
+        if bg_ckpt:
+            self._start_bg_checkpoint(str(db_path))
 
     def _ensure_connection(self) -> None:
         if self.conn is None or self.cursor is None:

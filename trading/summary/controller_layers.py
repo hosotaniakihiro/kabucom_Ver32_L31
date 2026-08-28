@@ -602,8 +602,31 @@ def repair(df: Any, *, context: str) -> Any:
     return _rmt_repair(df, context=context)
 
 
+def _realtime_projection(df, *, caller: str, interval=1):
+    """P0-9: realtime 経路へ履歴フレームを流さない。
+
+    attach_display_ready / rebuild_display_ready / rebuild_technical_ready /
+    GC SUMMARY REPAIR / SUMMARY PUBLISH MTF MERGED は全部この
+    apply_layers() を通る。ここが realtime 側の単一の入口なので、
+    22,851 行の履歴フレームはここで latest projection (349 行) に落とす。
+    """
+    try:
+        from trading.summary.realtime_history_guard import to_latest_projection
+
+        return to_latest_projection(df, caller=caller, interval=interval)
+    except Exception:
+        logger.exception("[REALTIME_HISTORY_LEAK] guard 失敗 caller=%s", caller)
+        return df
+
+
 def apply_layers(fn_core, name: str, key: str, args, kwargs):
     """旧 3 ラッパーの合成をそのまま再現する。"""
+    # 履歴フレームは重い段へ入る前に落とす。
+    # 22,851 行 x 281 列を毎 tick 通していたため
+    # light_push_runner が 390.9 秒 (予算 25 秒) かかっていた。
+    if args and isinstance(args[0], pd.DataFrame):
+        args = (_realtime_projection(args[0], caller=f"apply_layers:{name}"),) + tuple(args[1:])
+
     if name == "rebuild_technical_ready" and args and isinstance(args[0], pd.DataFrame):
         args = (repair(args[0], context=f"pre:{name}"),) + tuple(args[1:])
     new_args = args
@@ -611,6 +634,7 @@ def apply_layers(fn_core, name: str, key: str, args, kwargs):
         new_args = (neutralize(args[0], context=f"pre:{key}"),) + tuple(args[1:])
     ret = fn_core(*new_args, **kwargs)
     if isinstance(ret, pd.DataFrame):
+        ret = _realtime_projection(ret, caller=f"apply_layers:post:{name}")
         ret = neutralize(ret, context=f"post:{key}")
     ret = publish_if_repaired(ret, context=name, args=args, kwargs=kwargs)
     if isinstance(ret, pd.DataFrame):

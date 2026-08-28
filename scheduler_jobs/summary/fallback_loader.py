@@ -60,6 +60,8 @@ from .time_utils import (
     floor_to_interval,
     is_market_session,
 )
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -452,7 +454,7 @@ def load_latest_summary_from_db(
     params.append(int(limit_rows))
 
     try:
-        with sqlite3.connect(str(db_path), timeout=0.75) as conn:
+        with committing_connect(str(db_path), timeout=0.75) as conn:
             df = pd.read_sql_query(sql, conn, params=params)
     except Exception:
         logger.debug(
@@ -488,7 +490,7 @@ def _push_db_path() -> str:
         "PUSH_DB_DIR",
         os.getenv(
             "RAW_PUSH_DIR",
-            r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\push",
+            nas_path(r"raw_data\kabu_station\push"),
         ),
     )
     today_s = dt.datetime.now().strftime("%Y%m%d")
@@ -643,7 +645,7 @@ def _load_recent_push_raw_summary(interval_i: int, *, now_i: dt.datetime) -> pd.
     since = now_i - dt.timedelta(minutes=lookback_min)
 
     try:
-        with sqlite3.connect(str(p), timeout=timeout_sec) as conn:
+        with committing_connect(str(p), timeout=timeout_sec) as conn:
             conn.execute(f"PRAGMA busy_timeout={busy_ms};")
             table = "stream_data_raw" if _table_exists(conn, "stream_data_raw") else "stream_data"
             cols = _table_cols(conn, table)

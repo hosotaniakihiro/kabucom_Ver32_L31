@@ -89,6 +89,59 @@ def _get_push_df_safe() -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def _push_df_latest_dt(df: Any):
+    """push_df の最新時刻を返す (判定できなければ None)。"""
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return None
+        for col in ("datetime", "received_at", "time", "timestamp", "CurrentPriceTime"):
+            if col not in df.columns:
+                continue
+            s = pd.to_datetime(df[col], errors="coerce")
+            if s.notna().any():
+                ts = s.max()
+                try:
+                    ts = ts.tz_localize(None)
+                except Exception:
+                    pass
+                return ts
+    except Exception:
+        pass
+    return None
+
+
+def _should_skip_push_df_write(df: pd.DataFrame) -> bool:
+    """既存の push_df の方が新しければ上書きしない。
+
+    push_df の実質的な所有者は
+    trading/push/push_stream/runtime._sync_push_df_to_global() 。
+    こちら (旧 WS スタック) はさらに古い/小さいフレームで
+    それを潰さない。push_stream が動いていないプロセスでは
+    既存が古いままなので従来通りこちらが書く。
+    """
+    try:
+        import os
+
+        if str(os.getenv("PUSH_DF_SINGLE_OWNER", "1")).strip().lower() in {"0", "false", "no", "off"}:
+            return False
+        new_dt = _push_df_latest_dt(df)
+        if new_dt is None:
+            return False
+        cur_dt = _push_df_latest_dt(_get_push_df_safe())
+        if cur_dt is None:
+            return False
+        if cur_dt > new_dt:
+            logger.debug(
+                "[dataframe_manager] skip push_df write: existing is newer existing=%s incoming=%s",
+                cur_dt,
+                new_dt,
+            )
+            return True
+    except Exception:
+        logger.debug("[dataframe_manager] push_df owner check failed", exc_info=True)
+    return False
+
+
 def _set_push_df_safe(df: pd.DataFrame) -> bool:
     """
     global_data へ push_df を安全保存する。
@@ -99,6 +152,10 @@ def _set_push_df_safe(df: pd.DataFrame) -> bool:
       4. global_data.dataframes["push_df"] = df
     """
     df = _safe_dataframe(df)
+
+    # push_stream 側がもっと新しいフレームを書いているなら潰さない。
+    if _should_skip_push_df_write(df):
+        return True
 
     try:
         setter = _safe_getattr(global_data, "set_push_df", None)

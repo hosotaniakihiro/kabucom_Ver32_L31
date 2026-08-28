@@ -7,12 +7,21 @@ Operational policy requested by the operator:
 * Parent main.py / main_database.py may obtain a kabu Station token at startup.
 * Child/data-collector/helper processes must never call /token during bootstrap.
 * After startup, all API calls must read/use the token from settings.ini/runtime cache.
-* Do not refresh the token automatically on 401 / APIキー不一致.
+* Do not refresh the token automatically on 401 / APIキー不一致 **at runtime**.
+* Exception (V4): if the STARTUP preflight is rejected, the parent may issue one
+  fresh /token.  That is `startup stale token recovery = ON` /
+  `runtime arbitrary refresh = OFF`.  See kabu_api/token_bootstrap.py.
 
 This module used to call token_manager.refresh_token() at import/install time in every
 process.  In data collector children that was dangerous because even a successful
 /token call can invalidate the token being used by another process.  V3 makes the
 bootstrap parent-only and keeps child logs unambiguous.
+
+V4 replaces the TTL-only startup validity check with a read-only preflight.  TTL
+only proved that settings.ini was written recently; after a kabu Station restart
+the server had already dropped the token, so a "young" file meant a guaranteed
+401 with no recovery path.  Set KABU_TOKEN_STARTUP_PREFLIGHT_RECOVERY=0 to get
+the old TTL-only behaviour back.
 """
 from __future__ import annotations
 
@@ -23,7 +32,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-VERSION = "V3-TOKEN-STARTUP-PARENT-ONLY-NO-CHILD-BOOTSTRAP"
+VERSION = "V4-TOKEN-STARTUP-PREFLIGHT-STALE-RECOVERY"
 _INSTALLED = False
 _ORIG_REFRESH = None
 _ORIG_REQUEST = None
@@ -174,18 +183,97 @@ def _startup_bootstrap_token(original_refresh) -> str:
         if token:
             _publish_env_token(token)
         logger.warning(
-            "[TOKEN STARTUP ONCE] parent bootstrap disabled; using existing settings.ini token token_len=%d",
+            "[TOKEN STARTUP ONCE] TOKEN_SOURCE=settings_ini_cached TOKEN_ACTION=reused "
+            "parent bootstrap disabled token_len=%d",
             len(token),
         )
         return token
+
+    if _env_bool("KABU_TOKEN_STARTUP_PREFLIGHT_RECOVERY", True):
+        token = _startup_bootstrap_with_preflight()
+        if token:
+            return token
+        # Preflight-driven bootstrap could not produce a usable token.  Do NOT fall
+        # back to the TTL path: that is exactly the loop that used to hand a stale
+        # token to the rest of startup.  main_database.main() re-runs the same state
+        # machine and aborts with the real reason.
+        token = _read_settings_token()
+        if token:
+            _publish_env_token(token)
+        return token
+
+    return _startup_bootstrap_legacy_ttl(original_refresh)
+
+
+def _startup_bootstrap_with_preflight() -> str:
+    """Parent startup token decided by a read-only preflight, not by TTL.
+
+    Delegates to kabu_api.token_bootstrap, which recovers a stale cached token
+    with at most one POST /token per process.  This function never raises and
+    never aborts the process: the authoritative gate is main_database.main().
+    """
+    try:
+        from kabu_api import token_bootstrap as _tb
+        import token_manager  # type: ignore
+    except Exception:
+        logger.exception("[TOKEN STARTUP ONCE] preflight bootstrap unavailable; falling back")
+        return ""
+
+    calls_before = token_manager.token_api_call_count()
+    try:
+        result = _tb.bootstrap_startup_token(label="startup_policy")
+    except Exception:
+        logger.exception("[TOKEN STARTUP ONCE] preflight bootstrap raised")
+        return ""
+
+    calls_made = token_manager.token_api_call_count() - calls_before
+    if result.ok and result.token:
+        _publish_env_token(result.token)
+        os.environ["KABU_TOKEN_STARTUP_BOOTSTRAPPED"] = "1"
+        os.environ["KABU_TOKEN_STARTUP_SOURCE"] = str(result.source)
+        # Ground truth, not a guess: token_api_calls says whether /token was really
+        # called.  The old log claimed "refreshed/saved" even when it reused a token.
+        logger.warning(
+            "[TOKEN STARTUP ONCE] TOKEN_SOURCE=%s TOKEN_ACTION=preflight_ok "
+            "token_api_calls=%d token_len=%d token_tail=%s",
+            result.source,
+            calls_made,
+            _tb.token_len(result.token),
+            _tb.token_tail(result.token),
+        )
+        return result.token
+
+    logger.error(
+        "[TOKEN STARTUP ONCE] TOKEN_ACTION=preflight_ng startup bootstrap failed %s",
+        result.summary(),
+    )
+    return ""
+
+
+def _startup_bootstrap_legacy_ttl(original_refresh) -> str:
+    """Pre-Ver34 TTL-only bootstrap, kept behind KABU_TOKEN_STARTUP_PREFLIGHT_RECOVERY=0."""
+    try:
+        import token_manager  # type: ignore
+
+        calls_before = token_manager.token_api_call_count()
+    except Exception:
+        token_manager = None  # type: ignore
+        calls_before = 0
 
     try:
         token = str(original_refresh() or "").strip()
         if token:
             _publish_env_token(token)
             os.environ["KABU_TOKEN_STARTUP_BOOTSTRAPPED"] = "1"
+            calls_made = (
+                token_manager.token_api_call_count() - calls_before if token_manager else -1
+            )
             logger.warning(
-                "[TOKEN STARTUP ONCE] parent startup bootstrap token refreshed/saved token_len=%d",
+                "[TOKEN STARTUP ONCE] TOKEN_SOURCE=%s TOKEN_ACTION=%s legacy ttl bootstrap "
+                "token_api_calls=%d token_len=%d",
+                getattr(token_manager, "LAST_TOKEN_SOURCE", "") or "unknown",
+                getattr(token_manager, "LAST_TOKEN_ACTION", "") or "unknown",
+                calls_made,
                 len(token),
             )
             return token
@@ -197,7 +285,8 @@ def _startup_bootstrap_token(original_refresh) -> str:
     if token:
         _publish_env_token(token)
     logger.warning(
-        "[TOKEN STARTUP ONCE] fallback to existing settings.ini token after parent bootstrap failure token_len=%d",
+        "[TOKEN STARTUP ONCE] TOKEN_SOURCE=settings_ini_cached TOKEN_ACTION=reused "
+        "fallback after parent bootstrap failure token_len=%d",
         len(token),
     )
     return token
@@ -232,7 +321,8 @@ def refresh_token_startup_once(orig, apipassword=None, *args, **kwargs):
     if token:
         _publish_env_token(token)
         logger.warning(
-            "[TOKEN STARTUP ONCE] runtime refresh suppressed; using settings.ini token token_len=%d",
+            "[TOKEN STARTUP ONCE] TOKEN_SOURCE=settings_ini_cached TOKEN_ACTION=reused "
+            "runtime refresh suppressed (runtime arbitrary refresh = OFF) token_len=%d",
             len(token),
         )
         return token

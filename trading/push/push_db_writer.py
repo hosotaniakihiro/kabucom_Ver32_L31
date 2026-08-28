@@ -128,6 +128,41 @@ def _log_owner_guard_skip_once(action: str, extra: dict[str, Any] | None = None)
         )
 
 
+# ============================================================
+# P0-1: WAL checkpoint を commit から外すための設定
+# ============================================================
+
+def _push_bg_checkpoint_enabled() -> bool:
+    v = os.getenv("PUSH_DB_BG_CHECKPOINT")
+    if v is None or str(v).strip() == "":
+        return True
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _push_bg_checkpoint_interval_sec() -> float:
+    try:
+        v = os.getenv("PUSH_DB_BG_CHECKPOINT_INTERVAL_SEC")
+        if v and str(v).strip():
+            return max(5.0, float(str(v).strip()))
+    except Exception:
+        pass
+    return 30.0
+
+
+def _push_wal_size_limit_bytes() -> int:
+    """checkpoint 後に WAL ファイルをこのサイズまで切り詰める。
+
+    実測で push20260828.db-wal が 167.3MB まで肥大していた。
+    """
+    try:
+        v = os.getenv("PUSH_DB_WAL_SIZE_LIMIT_MB")
+        if v and str(v).strip():
+            return int(float(str(v).strip()) * 1024 * 1024)
+    except Exception:
+        pass
+    return 64 * 1024 * 1024
+
+
 class StreamDBWriter:
     # stream_data: 21基本 + 40板 + 1json + date + time = 64
     EXPECTED_COLUMN_COUNT = 64
@@ -141,6 +176,85 @@ class StreamDBWriter:
     BUSY_TIMEOUT_MS = 30000
     FLUSH_BUSY_RETRY_COUNT = 3
     FLUSH_BUSY_SLEEP_BASE_SEC = 0.35
+
+    # P0-1: 背景 checkpoint スレッド (プロセスで 1 本だけ)
+    _BG_CKPT_LOCK = threading.RLock()
+    _BG_CKPT_THREAD = None
+    _BG_CKPT_STATS = {
+        "runs": 0, "busy": 0, "frames": 0, "checkpointed": 0,
+        "last_elapsed": None, "last_at": None, "errors": 0,
+    }
+
+    def _start_bg_checkpoint(self, db_path: str) -> None:
+        """WAL checkpoint を writer の commit 経路から外して専用スレッドで回す。"""
+        if not _push_bg_checkpoint_enabled():
+            return
+        cls = type(self)
+        with cls._BG_CKPT_LOCK:
+            th = cls._BG_CKPT_THREAD
+            if th is not None and th.is_alive():
+                return
+
+            interval = _push_bg_checkpoint_interval_sec()
+
+            def _loop() -> None:
+                logger.warning(
+                    "[PUSH DB CHECKPOINT] background checkpoint started interval=%.1fs db=%s "
+                    "(commit 経路から checkpoint を外した)",
+                    interval, db_path,
+                )
+                while True:
+                    time.sleep(interval)
+                    conn = None
+                    t0 = time.perf_counter()
+                    try:
+                        conn = sqlite3.connect(db_path, timeout=30.0)
+                        conn.execute("PRAGMA busy_timeout=%d" % int(cls.BUSY_TIMEOUT_MS))
+                        row = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                        el = time.perf_counter() - t0
+                        busy, frames, done = (row or (None, None, None))
+                        with cls._BG_CKPT_LOCK:
+                            s = cls._BG_CKPT_STATS
+                            s["runs"] += 1
+                            s["busy"] += 1 if busy else 0
+                            s["frames"] = frames
+                            s["checkpointed"] = done
+                            s["last_elapsed"] = round(el, 2)
+                            s["last_at"] = dt.datetime.now()
+                        wal_mb = None
+                        try:
+                            wal_mb = round(os.path.getsize(db_path + "-wal") / 1024 / 1024, 1)
+                        except Exception:
+                            wal_mb = None
+                        log = logger.warning if (el >= 5.0 or busy) else logger.info
+                        log(
+                            "[PUSH DB CHECKPOINT] passive busy=%s log_frames=%s checkpointed=%s "
+                            "elapsed=%.2fs wal_mb=%s interval=%.1fs "
+                            "(commit をブロックしない)",
+                            busy, frames, done, el, wal_mb, interval,
+                        )
+                    except Exception:
+                        with cls._BG_CKPT_LOCK:
+                            cls._BG_CKPT_STATS["errors"] += 1
+                        logger.warning(
+                            "[PUSH DB CHECKPOINT] failed db=%s (次回再試行。tick 受信は止めない)",
+                            db_path, exc_info=True,
+                        )
+                    finally:
+                        if conn is not None:
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
+
+            t = threading.Thread(target=_loop, name="push-db-checkpoint", daemon=True)
+            cls._BG_CKPT_THREAD = t
+            t.start()
+
+    @classmethod
+    def checkpoint_stats(cls) -> dict:
+        with cls._BG_CKPT_LOCK:
+            return dict(cls._BG_CKPT_STATS)
 
     def __init__(
         self,
@@ -519,10 +633,50 @@ class StreamDBWriter:
 
         self.cursor.execute("PRAGMA journal_mode=WAL;")
         self.cursor.execute("PRAGMA synchronous=NORMAL;")
-        self.cursor.execute("PRAGMA wal_autocheckpoint=1000;")
+
+        # ============================================================
+        # P0-1: checkpoint を commit の経路から外す
+        # ------------------------------------------------------------
+        # 2026-08-28 14:00-15:20 の実測 (417 flush):
+        #   executemany push  mean=0.201s p95=0.618s
+        #   executemany raw   mean=0.255s p95=1.259s
+        #   commit            mean=8.999s p95=29.629s max=483.847s
+        #   -> commit だけで 3,743 秒 = 84 分の 74%
+        #   1 flush あたり平均 29 行しか書いていないのに commit が 9 秒。
+        #
+        # NAS 上に新規 DB を作って測ると commit は 3.5〜6.8 ms しかかからない。
+        # つまり NAS 固有の遅さではない。原因は **inline auto-checkpoint**。
+        #
+        #   wal_autocheckpoint=1000 (= 4MB) を超えるたびに、
+        #   commit した **writer スレッド自身が** WAL -> 本体 DB の
+        #   ページコピーを SMB 越しに同期実行する。
+        #   実測: PRAGMA wal_checkpoint(PASSIVE) は busy=0 で
+        #         12,229 frames を全部流せたが **33.27 秒**かかった。
+        #
+        # その間 tick は届き続けるので queue が 7,800 まで積み上がり、
+        # writer は永久に追いつけない (received 19,440 / flushed 11,593)。
+        #
+        # 対策: inline auto-checkpoint を止め、専用スレッドで定期的に
+        # PASSIVE checkpoint する。commit は 3.5ms 側へ戻る。
+        # PASSIVE なので writer/reader をブロックしない。
+        # journal_size_limit で WAL ファイル自体も切り詰める
+        # (実測 167.3MB まで肥大していた)。
+        #
+        # 従来動作へ戻す場合: PUSH_DB_BG_CHECKPOINT=0
+        # ============================================================
+        if _push_bg_checkpoint_enabled():
+            self.cursor.execute("PRAGMA wal_autocheckpoint=0;")
+            self.cursor.execute(
+                "PRAGMA journal_size_limit=%d;" % int(_push_wal_size_limit_bytes())
+            )
+        else:
+            self.cursor.execute("PRAGMA wal_autocheckpoint=1000;")
+
         self.cursor.execute(f"PRAGMA busy_timeout={int(self.BUSY_TIMEOUT_MS)};")
         self.cursor.execute("PRAGMA temp_store=MEMORY;")
         self.cursor.execute("PRAGMA cache_size=-50000;")
+
+        self._start_bg_checkpoint(db_path)
 
         self._ensure_table()
         if self.enable_raw_save:

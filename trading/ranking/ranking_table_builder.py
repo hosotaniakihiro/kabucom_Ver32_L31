@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from config.paths import get_path
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -46,19 +47,19 @@ def _safe_get_path(name: str) -> Optional[Path]:
 
 
 RANKING_DB_DIR: Path = _safe_get_path("raw_ranking") or Path(
-    r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\ranking"
+    nas_path(r"raw_data\kabu_station\ranking")
 )
 RANKING_DB: Path = RANKING_DB_DIR / f"ranking{_today_ymd()}.db"
 
 SUMMARY_DB_DIR: Path = (
     _safe_get_path("raw_summary")
     or _safe_get_path("summary")
-    or Path(r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary")
+    or Path(nas_path(r"raw_data\kabu_station\summary"))
 )
 SUMMARY_DB: Path = SUMMARY_DB_DIR / f"summary{_today_ymd()}.db"
 
 MASTER_DB: Path = _safe_get_path("symbol_master_db") or Path(
-    r"\\192.168.0.22\AutoStockBuyAndSell\Basic\symbol_master.db"
+    nas_path(r"Basic\symbol_master.db")
 )
 
 SNAPSHOT_TABLE = "ranking_snapshot_1min"

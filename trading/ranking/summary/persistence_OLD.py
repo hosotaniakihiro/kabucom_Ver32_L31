@@ -43,10 +43,12 @@ import time
 from typing import Optional, Dict, Any, List
 
 import pandas as pd
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_BASE_DIR = r"\\192.168.0.22\AutoStockBuyAndSell"
+DEFAULT_BASE_DIR = nas_root()
 DEFAULT_RANKING_DIR = os.path.join(
     DEFAULT_BASE_DIR,
     "raw_data",
@@ -1243,7 +1245,7 @@ def load_latest_ranking_summary(
 
     try:
         with _RANKING_SUMMARY_DB_LOCK:
-            with sqlite3.connect(path, timeout=10) as con:
+            with committing_connect(path, timeout=10) as con:
                 con.execute("PRAGMA busy_timeout=10000")
 
                 try:
@@ -1320,7 +1322,7 @@ def load_ranking_summary_at_latest_slot(
 
     try:
         with _RANKING_SUMMARY_DB_LOCK:
-            with sqlite3.connect(path, timeout=10) as con:
+            with committing_connect(path, timeout=10) as con:
                 con.execute("PRAGMA busy_timeout=10000")
 
                 try:
@@ -1407,7 +1409,7 @@ def get_ranking_summary_schema_columns(
         return []
 
     try:
-        with sqlite3.connect(path, timeout=10) as con:
+        with committing_connect(path, timeout=10) as con:
             con.execute("PRAGMA busy_timeout=10000")
             if not _table_exists(con, table):
                 return []

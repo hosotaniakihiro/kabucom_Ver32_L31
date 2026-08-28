@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import inspect
 import logging
 import os
 import threading
@@ -115,11 +116,30 @@ def _is_market_related_time(now: Optional[dt.datetime] = None) -> bool:
 
 
 def _should_run_by_clock(interval: int, now: Optional[dt.datetime] = None) -> bool:
+    """この interval を今走らせてよいか。
+
+    P0-5: ここも `now.minute % interval == 0` だった。
+    _job_ranking_summary_all_core 側のゲートだけ直しても、
+    こちらで二重に弾かれて 5m が作られないままだった
+    (実測 2026-08-27 09:12: `long tf due interval=5` の直後に
+     `skip by clock interval=5 now=09:12:16`)。
+
+    外側と同じ「前回作った足より新しい完成足があるか」で揃える。
+    _long_tf_due は force を見ないので、ここでは due 判定だけを使う。
+    """
     now = now or _now()
     interval = int(interval)
     if interval <= 1:
         return True
-    return now.minute % interval == 0
+    if not _long_tf_slot_gate_enabled():
+        return now.minute % interval == 0
+    due, why = _long_tf_due(now, interval, force=False)
+    if not due:
+        logger.info(
+            "[RANKING SUMMARY JOB] clock gate skip interval=%s reason=%s now=%s",
+            interval, why, now.strftime("%H:%M:%S"),
+        )
+    return due
 
 
 def _guard_duplicate_run(interval: int) -> bool:
@@ -369,6 +389,56 @@ def job_ranking_summary_5m(
     )
 
 
+# P0-5: 長い足を「最後に作った完成足」で管理する。
+_LONG_TF_LAST_SLOT: dict = {}
+_LONG_TF_SLOT_LOCK = threading.Lock()
+
+
+def _long_tf_slot_gate_enabled() -> bool:
+    v = os.getenv("RANKING_SUMMARY_LONG_TF_SLOT_GATE")
+    if v is None or str(v).strip() == "":
+        return True
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _latest_completed_slot(now: dt.datetime, interval: int) -> dt.datetime:
+    """直近の「完成した」足の開始時刻。
+
+    now=15:32:10, interval=5 -> 15:25 (15:30 の足はまだ確定していない)
+    """
+    iv = max(1, int(interval))
+    floored = now.replace(second=0, microsecond=0)
+    floored = floored - dt.timedelta(minutes=floored.minute % iv)
+    return floored - dt.timedelta(minutes=iv)
+
+
+def _long_tf_due(now: dt.datetime, interval: int, *, force: bool) -> tuple[bool, str]:
+    """この interval を今作るべきか。
+
+    戻り値: (作るか, 理由)
+    """
+    iv = int(interval)
+    if force:
+        return True, "force"
+    if not _long_tf_slot_gate_enabled():
+        due = (now.minute % iv == 0)
+        return due, "legacy_minute_mod:%s%%%s=%s" % (now.minute, iv, now.minute % iv)
+
+    slot = _latest_completed_slot(now, iv)
+    with _LONG_TF_SLOT_LOCK:
+        last = _LONG_TF_LAST_SLOT.get(iv)
+    if last is not None and slot <= last:
+        return False, "slot_unchanged:last=%s slot=%s" % (last, slot)
+    return True, "new_slot:last=%s slot=%s" % (last, slot)
+
+
+def _long_tf_mark_built(now: dt.datetime, interval: int) -> None:
+    iv = int(interval)
+    slot = _latest_completed_slot(now, iv)
+    with _LONG_TF_SLOT_LOCK:
+        _LONG_TF_LAST_SLOT[iv] = slot
+
+
 def _job_ranking_summary_all_core(
     *,
     force: bool = False,
@@ -394,8 +464,21 @@ def _job_ranking_summary_all_core(
         run_entry=run_entry,
     )
 
-    if force or now.minute % 3 == 0:
-        results[3] = job_ranking_summary_3m(
+    for iv, fn in ((3, job_ranking_summary_3m), (5, job_ranking_summary_5m)):
+        due, why = _long_tf_due(now, iv, force=force)
+        if not due:
+            logger.info(
+                "[RANKING SUMMARY JOB] long tf skipped interval=%s reason=%s now=%s",
+                iv, why, now.strftime("%H:%M:%S"),
+            )
+            results[iv] = pd.DataFrame()
+            continue
+        logger.warning(
+            "[RANKING SUMMARY JOB] long tf due interval=%s reason=%s now=%s",
+            iv, why, now.strftime("%H:%M:%S"),
+        )
+        _t0 = time.perf_counter()
+        results[iv] = fn(
             force=force,
             trade_date=trade_date,
             lookback_minutes=lookback_minutes,
@@ -405,22 +488,13 @@ def _job_ranking_summary_all_core(
             top_n=top_n,
             run_entry=run_entry,
         )
-    else:
-        results[3] = pd.DataFrame()
-
-    if force or now.minute % 5 == 0:
-        results[5] = job_ranking_summary_5m(
-            force=force,
-            trade_date=trade_date,
-            lookback_minutes=lookback_minutes,
-            use_yahoo_fill=use_yahoo_fill,
-            persist=persist,
-            display=display,
-            top_n=top_n,
-            run_entry=run_entry,
+        _rows = len(results[iv]) if isinstance(results[iv], pd.DataFrame) else -1
+        logger.warning(
+            "[RANKING SUMMARY JOB] long tf built interval=%s rows=%s elapsed=%.3fs",
+            iv, _rows, time.perf_counter() - _t0,
         )
-    else:
-        results[5] = pd.DataFrame()
+        if _rows > 0:
+            _long_tf_mark_built(now, iv)
 
     return results
 
@@ -442,6 +516,21 @@ _RANKING_SUMMARY_FAST_ENTRY_VERSION = "V1-RANKING-SUMMARY-FAST-ENTRY-ROUTE"
 
 os.environ.setdefault("RANKING_SUMMARY_ENTRY_LOOKBACK_MIN", "20")
 
+# 1分足 indicator が成立するのに必要な最低本数。
+# trading/summary/indicators/indicator_calculator.py の実装に合わせている:
+#   ema26 / macd     : min_periods=26
+#   signal           : macd から span=9 -> 実質 35
+#   ma25             : 25
+#   ma75             : rolling(75, min_periods=75)
+#   ma75_slope       : ma75 から 3 本 -> 実質 78
+#   slope_atr_scaled : ma75_slope 由来 -> 実質 78
+os.environ.setdefault("RANKING_SUMMARY_MIN_INDICATOR_LOOKBACK_MIN", "78")
+
+# lookback は「分」で切るが、値の来ない分があるため
+# 78 分 = 78 本にならない (実測: 78分で 67本)。
+# 欠損分のマージンを乗せて「本数」を満たす。
+os.environ.setdefault("RANKING_SUMMARY_INDICATOR_LOOKBACK_MARGIN_PCT", "35")
+
 
 def _ranking_summary_fast_entry_env_int(name: str, default: int) -> int:
     try:
@@ -453,25 +542,80 @@ def _ranking_summary_fast_entry_env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _filter_kwargs_for_core(fn, kwargs: dict) -> dict:
+    """core 関数が実際に受け取れる keyword だけを残す。
+
+    この wrapper は (*args, **kwargs) なので、呼び出し側の
+    core/startup/scheduler/bootstrap._call_with_supported_kwargs は
+    VAR_KEYWORD を見て "全部渡せる" と判断してしまう。
+    そのため topn / use_discord / announce_bridge / discord_sender /
+    return_details / sides などが core へそのまま到達して
+    TypeError: unexpected keyword argument になっていた。
+    フィルタはここ (実態を知っている側) で行う。
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return dict(kwargs)
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(kwargs)
+    accepted = {k: v for k, v in kwargs.items() if k in params}
+    dropped = sorted(set(kwargs) - set(accepted))
+    if dropped:
+        logger.info(
+            "[RANKING SUMMARY JOBS] dropped unsupported kwargs for %s: %s",
+            getattr(fn, "__name__", str(fn)),
+            dropped,
+        )
+    return accepted
+
+
 def job_ranking_summary_all(*args, **kwargs):
     try:
         if kwargs.get("run_entry", True):
             cap = _ranking_summary_fast_entry_env_int("RANKING_SUMMARY_ENTRY_LOOKBACK_MIN", 20)
+            # cap をさらに下回ると macd(26)/ma25/ma75(75)/slope(78) が
+            # 構造的に全 NaN になるので、indicator 要件を床にする。
+            # (実測: lookback=20 だと hist_max=20 / macd_nonnull=0 / signal_nonnull=0)
+            bars_needed = _ranking_summary_fast_entry_env_int("RANKING_SUMMARY_MIN_INDICATOR_LOOKBACK_MIN", 78)
+            margin_pct = _ranking_summary_fast_entry_env_int("RANKING_SUMMARY_INDICATOR_LOOKBACK_MARGIN_PCT", 35)
+            # 欠損分を見込んで分へ換算 (78本 * 1.35 → 106分)
+            floor = int(bars_needed * (100 + max(0, margin_pct)) / 100.0)
+            if cap < floor:
+                logger.warning(
+                    "[RANKING SUMMARY FAST ENTRY] lookback cap raised to indicator minimum cap=%s floor=%s "
+                    "(bars_needed=%s margin=%s%% ; macd=26 ma25=25 ma75=75 ma75_slope=78)",
+                    cap,
+                    floor,
+                    bars_needed,
+                    margin_pct,
+                )
+                cap = floor
             old = kwargs.get("lookback_minutes", 240)
             try:
                 old_i = int(old)
             except Exception:
                 old_i = 240
-            if old_i > cap:
-                kwargs["lookback_minutes"] = cap
+            # cap = 上限 (fast entry のための打ち切り)、
+            # floor = 下限 (indicator が成立するのに必要な本数)。
+            # 両方効かせないと、呼び出し側が既に floor 未満 (例: 60) のとき
+            # cap だけでは引き上げられず macd/signal/slope が全 NaN のままになる。
+            effective = max(int(floor), min(old_i, int(cap)))
+            kwargs["lookback_minutes"] = effective
             logger.warning(
-                "[RANKING SUMMARY FAST ENTRY] lookback capped old=%s new=%s version=%s",
+                "[RANKING SUMMARY FAST ENTRY] lookback capped old=%s new=%s indicator_floor=%s version=%s",
                 old,
                 kwargs.get("lookback_minutes"),
+                floor,
                 _RANKING_SUMMARY_FAST_ENTRY_VERSION,
             )
     except Exception:
         pass
+    # 旧名 top_n/topn 両方が渡ってくることがあるので、core が受ける
+    # top_n に寄せてから間引く (値は変えない)。
+    if "top_n" not in kwargs and "topn" in kwargs:
+        kwargs["top_n"] = kwargs["topn"]
+    kwargs = _filter_kwargs_for_core(_job_ranking_summary_all_core, kwargs)
     return _job_ranking_summary_all_core(*args, **kwargs)
 
 

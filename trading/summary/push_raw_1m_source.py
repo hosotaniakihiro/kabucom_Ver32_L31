@@ -26,6 +26,7 @@ import os
 import sqlite3
 import sys
 from typing import Any
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 VERSION = "V2-MAIN-ENTRY-FRESH-RAW-SUMMARYAI"
@@ -208,7 +209,21 @@ def _candidate_memory_frames() -> list[tuple[str, Any]]:
                     frames.append((f"{mod_name}.{attr}", val))
         except Exception:
             continue
-    return frames
+
+    # 同じ DataFrame オブジェクトが global_data.X / global_state.global_data.X /
+    # <module>.X のように何度も拾われる。正規化は重いので 1 回だけにする。
+    # 後段の pd.concat -> drop_duplicates(keep="last") は連結順で勝敗が決まるので、
+    # 優先順位を変えないよう「最後に現れた方」を残す (最初を残すと勝者が変わる)。
+    seen_ids: set[int] = set()
+    deduped: list[tuple[str, Any]] = []
+    for label, val in reversed(frames):
+        key = id(val)
+        if key in seen_ids:
+            continue
+        seen_ids.add(key)
+        deduped.append((label, val))
+    deduped.reverse()
+    return deduped
 
 
 def _load_push_memory_1m_history() -> Any:
@@ -216,15 +231,49 @@ def _load_push_memory_1m_history() -> Any:
         import pandas as pd
         if not _env_on("TONOSAMA_PUSH_MEMORY_HISTORY_ENABLED", True):
             return pd.DataFrame()
+        import time as _time
+
+        _t0 = _time.perf_counter()
+        cands = _candidate_memory_frames()
+        _t_scan = _time.perf_counter() - _t0
+
+        _t0 = _time.perf_counter()
         parts = []
-        for label, frame in _candidate_memory_frames():
+        norm_rows = 0
+        for label, frame in cands:
             norm = _normalize_memory_push_frame(frame, label=label)
             if isinstance(norm, pd.DataFrame) and not norm.empty:
                 parts.append(norm)
+                norm_rows += len(norm)
+        _t_norm = _time.perf_counter() - _t0
+
         if not parts:
+            logger.warning(
+                "[TONOSAMA PUSH MEMORY HISTORY] no usable frame candidates=%s scan=%.3fs normalize=%.3fs",
+                len(cands),
+                _t_scan,
+                _t_norm,
+            )
             return pd.DataFrame()
+
+        _t0 = _time.perf_counter()
         out = pd.concat(parts, ignore_index=True, sort=False)
         out = out.drop_duplicates(subset=["symbol", "datetime"], keep="last").sort_values(["symbol", "datetime"])
+        _t_merge = _time.perf_counter() - _t0
+
+        # 45 秒 timeout の内訳を次回ログで特定できるようにする
+        logger.warning(
+            "[TONOSAMA PUSH MEMORY HISTORY][TIMING] candidates=%s used=%s norm_rows=%s out_rows=%s "
+            "scan=%.3fs normalize=%.3fs merge=%.3fs total=%.3fs",
+            len(cands),
+            len(parts),
+            norm_rows,
+            len(out),
+            _t_scan,
+            _t_norm,
+            _t_merge,
+            _t_scan + _t_norm + _t_merge,
+        )
         nonzero = int((pd.to_numeric(out.get("volume", 0), errors="coerce").fillna(0) > 0).sum()) if "volume" in out.columns else 0
         if nonzero < _env_int("TONOSAMA_PUSH_MEMORY_HISTORY_MIN_VOLUME_NONZERO", 1):
             logger.warning("[TONOSAMA PUSH MEMORY HISTORY] rejected no usable volume rows=%s symbols=%s nonzero=%s", len(out), out["symbol"].nunique() if "symbol" in out.columns else 0, nonzero)
@@ -262,9 +311,9 @@ def _candidate_push_db_paths(now: dt.datetime | None = None) -> list[str]:
         if v:
             dirs.append(v)
     dirs.extend([
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\push",
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station",
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data",
+        nas_path(r"raw_data\kabu_station\push"),
+        nas_path(r"raw_data\kabu_station"),
+        nas_path(r"raw_data"),
         os.path.join(os.getcwd(), "raw_data", "kabu_station", "push"),
         os.path.join(os.getcwd(), "raw_data", "kabu_station"),
         os.getcwd(),

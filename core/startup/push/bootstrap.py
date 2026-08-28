@@ -30,6 +30,7 @@ from typing import Optional, Any
 import pandas as pd
 
 from global_state import global_data
+from sqlite_cm import committing_connect
 
 logger = logging.getLogger(__name__)
 
@@ -223,7 +224,7 @@ def _load_push_db_full(db_path: str) -> pd.DataFrame:
     cutoff_text = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
 
     try:
-        with sqlite3.connect(db_path, timeout=5.0) as conn:
+        with committing_connect(db_path, timeout=5.0) as conn:
             try:
                 conn.execute("PRAGMA busy_timeout=5000")
                 conn.execute("PRAGMA query_only=ON")
@@ -549,7 +550,7 @@ def _load_push_db(db_path: str) -> pd.DataFrame:
     cutoff_text = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
 
     try:
-        with sqlite3.connect(db_path, timeout=3.0) as conn:
+        with committing_connect(db_path, timeout=3.0) as conn:
             try:
                 conn.execute("PRAGMA busy_timeout=3000")
                 conn.execute("PRAGMA query_only=ON")

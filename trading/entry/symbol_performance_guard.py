@@ -20,10 +20,12 @@ import os
 import sqlite3
 from functools import lru_cache
 from typing import Any
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DB_PATH = r'\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\symbol_stats\symbol_performance_latest.db'
+DEFAULT_DB_PATH = nas_path(r'raw_data\kabu_station\symbol_stats\symbol_performance_latest.db')
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -110,7 +112,7 @@ def load_symbol_performance(symbol: str, db_path: str = SYMBOL_PERFORMANCE_DB_PA
         return {}
 
     try:
-        with sqlite3.connect(db_path, timeout=10) as conn:
+        with committing_connect(db_path, timeout=10) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.execute(
                 'SELECT * FROM symbol_performance_latest WHERE symbol=? LIMIT 1',

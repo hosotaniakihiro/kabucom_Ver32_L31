@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+import time
 
 import numpy as np
 import pandas as pd
@@ -274,6 +276,131 @@ def _finalize_score_columns(df: pd.DataFrame) -> pd.DataFrame:
 # main implementation
 # ============================================================
 
+def _flag_builder_enabled() -> bool:
+    try:
+        v = os.getenv("SCORE_FLAG_BUILDER_ENABLED")
+        if v is None or str(v).strip() == "":
+            return True
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        return True
+
+
+def _flag_builder_max_rows() -> int:
+    """行ごと評価なので上限を設ける。
+
+    実測 (2026-08-26): 130行 0.9s / 300行 2.1s / 644行 8.4s / 1000行 7.3s。
+    毎分 Summary の履歴込みフレームは 644 行あり 8.4 秒 x2 かかっていた。
+    上限を 400 にすると自動的に latest_per_symbol (152行) 評価へ落ち、
+    約 2 秒で済む。判定内容・閾値は変えていない。
+    """
+    try:
+        return max(1, int(float(os.getenv("SCORE_FLAG_BUILDER_MAX_ROWS", "400"))))
+    except Exception:
+        return 400
+
+
+def _attach_condition_flags(out: pd.DataFrame) -> pd.DataFrame:
+    """score_config.ini の flag に対応する 0/1 列を DataFrame へ生やす。
+
+    これが無いと score_breakdown が table_flags=180 / matched_flags=2 で
+    fallback に落ちる。実測で matched 2 -> 71 になる。
+    """
+    if not isinstance(out, pd.DataFrame) or out.empty:
+        return out
+    if not _flag_builder_enabled():
+        logger.warning("[SCORE FLAGS] skipped reason=SCORE_FLAG_BUILDER_ENABLED=0 rows=%s", len(out))
+        return out
+    if "datetime" not in out.columns or "symbol" not in out.columns:
+        logger.warning(
+            "[SCORE FLAGS] skipped reason=symbol/datetime 列が無い rows=%s cols=%s",
+            len(out), len(out.columns),
+        )
+        return out
+
+    limit = _flag_builder_max_rows()
+    n_before = len(out)
+    target = out
+    scope = "all_rows"
+    if n_before > limit:
+        # 履歴込みで数千〜万行になることがある (優先4 の履歴 seed 後は
+        # 246 銘柄 x 75 本 = 12,345 行)。全行に行ごと評価をかけると
+        # 毎分処理を潰すので、ENTRY 判定に効く「銘柄あたり最新足」だけに絞る。
+        try:
+            target = (
+                out.sort_values(["symbol", "datetime"], kind="stable")
+                .groupby("symbol", as_index=False)
+                .tail(1)
+            )
+            scope = "latest_per_symbol"
+        except Exception:
+            logger.exception("[SCORE FLAGS] latest-per-symbol 抽出に失敗 rows=%s", n_before)
+            return out
+        if len(target) > limit:
+            # 黙って諦めない。上限に当たったことを必ず残す。
+            logger.warning(
+                "[SCORE FLAGS] skipped reason=latest_per_symbol(%s)>%d rows=%s "
+                "(flag_builder は行ごと評価。SCORE_FLAG_BUILDER_MAX_ROWS で調整可)",
+                len(target), limit, n_before,
+            )
+            return out
+
+    t0 = time.perf_counter()
+    before_cols = set(out.columns)
+    n_target = len(target)
+    try:
+        from trading.indicators.flag_builder_buy import build_buy_flags
+        from trading.indicators.flag_builder_sell import build_sell_flags
+
+        built = build_buy_flags(target.copy())
+        built = build_sell_flags(built)
+    except Exception:
+        logger.exception("[SCORE FLAGS] flag builder failed rows=%s -> 元のフレームを使う", n_target)
+        return out
+
+    if not isinstance(built, pd.DataFrame) or built.empty:
+        logger.warning("[SCORE FLAGS] builder returned empty rows=%s -> 元のフレームを使う", n_target)
+        return out
+
+    # builder は datetime 欠損行を dropna する。行が黙って消えるのは危険なので
+    # 行数/index が変わったら結果ごと捨てる。
+    if len(built) != n_target or not built.index.equals(target.index):
+        logger.warning(
+            "[SCORE FLAGS] builder changed row set %s -> %s (index一致=%s) "
+            "-> 結果を破棄して元のフレームを使う",
+            n_target, len(built), built.index.equals(target.index),
+        )
+        return out
+
+    # 既存列は絶対に上書きしない。新規に生えた flag 列だけ取り込む。
+    new_cols = [c for c in built.columns if c not in before_cols]
+    if not new_cols:
+        logger.warning("[SCORE FLAGS] no new flag columns rows=%s", n_target)
+        return out
+    try:
+        # latest_per_symbol のときは対象外の行が NaN になる。
+        # 0 で埋めない (「評価していない」と「条件が立たなかった」を区別する)。
+        add = built[new_cols].reindex(out.index)
+        out = pd.concat([out, add], axis=1)
+    except Exception:
+        logger.exception("[SCORE FLAGS] flag column merge failed rows=%s", n_target)
+        return out
+
+    try:
+        nonzero = int(sum(
+            1 for c in new_cols
+            if float(pd.to_numeric(out[c], errors="coerce").fillna(0).abs().sum()) > 0.0
+        ))
+    except Exception:
+        nonzero = -1
+    logger.warning(
+        "[SCORE FLAGS] attached rows=%s scope=%s evaluated_rows=%s "
+        "new_flag_cols=%s nonzero_cols=%s elapsed=%.2fs",
+        len(out), scope, n_target, len(new_cols), nonzero, time.perf_counter() - t0,
+    )
+    return out
+
+
 def scoring_pipeline(df: pd.DataFrame, *args, **kwargs) -> pd.DataFrame:
     out = _ensure_dataframe(df)
 
@@ -284,6 +411,9 @@ def scoring_pipeline(df: pd.DataFrame, *args, **kwargs) -> pd.DataFrame:
     out = _normalize_passthrough_columns(out)
     out = _build_total_score(out)
     out = _finalize_score_columns(out)
+
+    # score_breakdown が SCORE_TABLE を使えるように flag 列を先に生やす。
+    out = _attach_condition_flags(out)
 
     try:
         from trading.scoring.core.score_breakdown import attach_score_breakdown

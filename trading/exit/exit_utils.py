@@ -366,6 +366,42 @@ def get_open_positions_safe() -> Dict[str, Dict[str, Any]]:
     except Exception:
         logger.exception("[POSITION_SNAPSHOT_ERROR] merge broker positions")
 
+    # ------------------------------------------------------------
+    # P0-2: DB read failure を positions empty に潰さない。
+    #
+    # 上の 4 ソースはいずれも失敗時に {} を返すので、merged が空でも
+    # 「建玉が無い」とは限らない。PositionStateService は
+    # db_ok / broker_ok / last-known を持っているので、
+    # merged が空のときだけそちらへ問い合わせて last-known を復元する。
+    # ------------------------------------------------------------
+    state = None
+    try:
+        from trading.position.position_state_service import get_positions_state
+
+        state = get_positions_state(caller="exit_utils.get_open_positions_safe")
+    except Exception:
+        logger.exception("[EXIT POS] position state service unavailable")
+
+    if state is not None:
+        if not merged and state.positions:
+            _merge_position_map(merged, state.positions, source="POSITION_STATE.%s" % state.source_used)
+            logger.warning(
+                "[EXIT LOOP] 4 ソースが空だったが建玉状態は unknown ではない -> "
+                "last-known を復元した source=%s count=%s symbols=%s "
+                "db_ok=%s broker_ok=%s last_good_age=%.1fs",
+                state.source_used, len(merged), sorted(merged.keys()),
+                state.db_ok, state.broker_ok,
+                0.0 if state.last_good_age == float("inf") else state.last_good_age,
+            )
+        logger.warning(
+            "[POSITIONS_STATE] db_ok=%s broker_ok=%s source_used=%s last_good_age=%s "
+            "entry_allowed=%s positions_known=%s count=%s symbols=%s caller=exit_loop",
+            state.db_ok, state.broker_ok, state.source_used,
+            "inf" if state.last_good_age == float("inf") else "%.1f" % state.last_good_age,
+            state.entry_allowed, state.positions_known,
+            len(merged), sorted(merged.keys()),
+        )
+
     try:
         _publish_open_positions_to_memory(merged)
     except Exception:
@@ -373,6 +409,14 @@ def get_open_positions_safe() -> Dict[str, Dict[str, Any]]:
 
     if merged:
         logger.info("[EXIT LOOP] open positions detected count=%s symbols=%s", len(merged), sorted(merged.keys()))
+    elif state is not None and not state.positions_known:
+        # 建玉状態そのものが分からない。0 件と言い切らない。
+        logger.error(
+            "[EXIT LOOP] 建玉状態 unknown (DB も broker も読めない)。"
+            "0 件とは扱わない db_err=%s broker_err=%s last_good_age=%s",
+            state.db_error[:120] or "-", state.broker_error[:120] or "-",
+            "inf" if state.last_good_age == float("inf") else "%.1f" % state.last_good_age,
+        )
     else:
         logger.warning("[EXIT LOOP] no open positions from DB/GC/global_data/broker")
 

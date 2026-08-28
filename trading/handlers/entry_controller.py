@@ -133,6 +133,8 @@ from AI.ranking_feature_builder import build_ranking_feature_1min
 from AI.ranking_entry_predictor import predict_ranking_entry
 
 from utils_common import normalize_symbol
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger("entry_controller")
 
@@ -191,9 +193,39 @@ def apply_fast_startup_entry_limits() -> bool:
     """
     global MAX_APPROVED_PER_RUN
     old = MAX_APPROVED_PER_RUN
+
+    # ------------------------------------------------------------
+    # P0-5 / settings owner 一本化 (R17)
+    #
+    # 実測ログでこの値は 3 -> 10 -> 3 と揺れていた。
+    #   1. モジュール定数            MAX_APPROVED_PER_RUN = 3
+    #   2. ここ (fast startup)       env 未設定でも 10 へ引き上げ
+    #   3. strict_entry_defaults     180 秒 watcher が 3 へ戻す
+    # 2 と 3 の間 (最大 180 秒) だけ承認上限が 3 -> 10 と緩む。
+    # 承認上限の正本は strict_entry_defaults なので、
+    # env が明示されていない限りここでは引き上げない。
+    #
+    # env が明示されていれば運用者の意図としてそのまま従う。
+    # 旧動作へ戻すには ENTRY_MAX_APPROVED_FAST_STARTUP_SEED=1。
+    # ------------------------------------------------------------
+    raw = os.getenv("ENTRY_MAX_APPROVED_PER_RUN")
+    explicit = raw is not None and str(raw).strip() != ""
+    legacy_seed = str(os.getenv("ENTRY_MAX_APPROVED_FAST_STARTUP_SEED", "")).strip().lower() in {
+        "1", "true", "yes", "y", "on",
+    }
+
+    if not explicit and not legacy_seed:
+        logger.warning(
+            "[FAST STARTUP] entry_controller.MAX_APPROVED_PER_RUN は据え置く value=%s "
+            "(正本は core/startup/strict_entry_defaults。env 未設定で 10 へ引き上げると "
+            "strict watcher が戻すまで承認上限が緩む。"
+            "ENTRY_MAX_APPROVED_FAST_STARTUP_SEED=1 で旧動作)",
+            MAX_APPROVED_PER_RUN,
+        )
+        return True
+
     try:
-        raw = os.getenv("ENTRY_MAX_APPROVED_PER_RUN")
-        val = 10 if raw is None or str(raw).strip() == "" else int(float(raw))
+        val = int(float(raw)) if explicit else 10
     except Exception:
         val = 10
     if val <= 0:
@@ -209,6 +241,31 @@ def apply_fast_startup_entry_limits() -> bool:
 
 # 旧 tonosama_history_failclose_strict_patch._patch_entry_controller() の定数表。
 # strict モードでのスコア/信頼度/承認上限の下限値。
+def _strict_threshold(name: str, fallback: float) -> float:
+    """strict 側が定める正本値を返す。
+
+    relax 系 env が未設定のときの既定値として使う。
+    参照順:
+      1. env ENTRY_CONTROLLER_<name>   (strict_entry_defaults.STRICT_ENV が hard-set)
+      2. env <name>                    (同上)
+      3. STRICT_ENTRY_CONSTANTS[name]  (このファイルの定数表)
+      4. fallback
+    """
+    import os as _os
+
+    for env_name in ("ENTRY_CONTROLLER_" + name, name):
+        try:
+            v = _os.getenv(env_name)
+            if v is not None and str(v).strip() != "":
+                return float(v)
+        except Exception:
+            pass
+    try:
+        return float(STRICT_ENTRY_CONSTANTS.get(name, fallback))
+    except Exception:
+        return float(fallback)
+
+
 STRICT_ENTRY_CONSTANTS: dict[str, float | int] = {
     "MIN_SUMMARY_SCORE_BUY": 3.0,
     "MIN_SUMMARY_SCORE_SELL": 3.0,
@@ -242,10 +299,13 @@ def apply_final_gate_relax_constants() -> bool:
             except Exception:
                 return float(default)
 
-        MIN_SUMMARY_SCORE_BUY = _f("ENTRY_CONTROLLER_SUMMARY_BUY_MIN_SCORE", 1.0)
-        MIN_COMPOSITE_SCORE_BUY = _f("ENTRY_CONTROLLER_SUMMARY_BUY_MIN_COMPOSITE", 1.0)
-        MIN_SUMMARY_SCORE_SELL = _f("ENTRY_CONTROLLER_SUMMARY_SELL_MIN_SCORE", 1.0)
-        MIN_COMPOSITE_SCORE_SELL = _f("ENTRY_CONTROLLER_SUMMARY_SELL_MIN_COMPOSITE", 1.0)
+        # 既定値をハードコード 1.0 ではなく strict の正本値にする。
+        # (ENTRY_CONTROLLER_SUMMARY_*_MIN_* はプロジェクト内のどこからも
+        #  設定されておらず、従来は必ず 1.0 に落ちて strict 3.0 と綱引きになっていた)
+        MIN_SUMMARY_SCORE_BUY = _f("ENTRY_CONTROLLER_SUMMARY_BUY_MIN_SCORE", _strict_threshold("MIN_SUMMARY_SCORE_BUY", 3.0))
+        MIN_COMPOSITE_SCORE_BUY = _f("ENTRY_CONTROLLER_SUMMARY_BUY_MIN_COMPOSITE", _strict_threshold("MIN_COMPOSITE_SCORE_BUY", 3.0))
+        MIN_SUMMARY_SCORE_SELL = _f("ENTRY_CONTROLLER_SUMMARY_SELL_MIN_SCORE", _strict_threshold("MIN_SUMMARY_SCORE_SELL", 3.0))
+        MIN_COMPOSITE_SCORE_SELL = _f("ENTRY_CONTROLLER_SUMMARY_SELL_MIN_COMPOSITE", _strict_threshold("MIN_COMPOSITE_SCORE_SELL", 3.0))
         logger.warning(
             "[SUMMARY AI MORE CANDIDATES] final gate relax constants applied buy=%s/%s sell=%s/%s",
             MIN_SUMMARY_SCORE_BUY, MIN_COMPOSITE_SCORE_BUY,
@@ -1939,7 +1999,7 @@ def _daily_risk_now_iso() -> str:
 def _daily_risk_db_path() -> str:
     base = os.getenv(
         "TRADE_GUARD_DB_DIR",
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\trade_guard",
+        nas_path(r"raw_data\trade_guard"),
     )
     return os.getenv("TRADE_GUARD_DB_PATH", str(Path(base) / f"trade_guard{_daily_risk_today()}.db"))
 
@@ -2523,7 +2583,7 @@ def _recent_liq_entry_row_values(row: dict) -> dict:
 def _recent_liq_summary_db_path() -> str:
     base = os.getenv(
         "SUMMARY_DB_DIR",
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary",
+        nas_path(r"raw_data\kabu_station\summary"),
     )
     return os.getenv("SUMMARY_DB_PATH", str(Path(base) / f"summary{_daily_risk_today()}.db"))
 
@@ -2545,7 +2605,7 @@ def _recent_liq_recent_values(symbol: str, bars: int) -> dict:
     if not symbol or not Path(path).exists():
         return {}
     try:
-        with sqlite3.connect(path, timeout=1.0) as conn:
+        with committing_connect(path, timeout=1.0) as conn:
             conn.execute("PRAGMA busy_timeout=1000")
             sym = _recent_liq_col(conn, table, ["symbol", "code", "stock_code"])
             tm = _recent_liq_col(conn, table, ["datetime", "dt", "timestamp", "time"])
@@ -2823,20 +2883,77 @@ def _execute_is_summary_ai_candidate(item: dict, row: dict) -> bool:
         return False
 
 
-def _execute_item_age_sec(item: dict, row: dict) -> tuple[float | None, str]:
+def _entry_timeline_log(stage: str, item: dict, row: dict, **extra) -> None:
+    """候補生成からの経過を 1 行で残す (値は変えない)。"""
+    try:
+        if not isinstance(item, dict):
+            return
+        row = _guard_row_to_dict(row) if not isinstance(row, dict) else row
+        symbol = normalize_symbol(item.get("symbol"))
+        side = _guard_norm_side(item.get("side"))
+        cand_age = _execute_candidate_age_sec(item, row)
+        bar_age = _execute_bar_age_sec(item, row)
+        pca = item.get("pending_created_at") or item.get("created_at")
+        bar_dt = item.get("datetime") or (row.get("datetime") if isinstance(row, dict) else None)
+        tail = ""
+        if extra:
+            tail = " " + " ".join("%s=%s" % (k, v) for k, v in extra.items())
+        # P1: 同じ候補を 1 本の ID で追えるようにする
+        try:
+            from trading.entry import candidate_id as _cid
+            _cid.note_item(item, stage, symbol=symbol, side=side,
+                           candidate_age=cand_age, bar_age=bar_age)
+            _cid_s = _cid.of(item)
+        except Exception:
+            _cid_s = None
+        logger.warning(
+            "[ENTRY TIMELINE] stage=%s candidate_id=%s symbol=%s side=%s candidate_age=%s bar_age=%s "
+            "pending_created_at=%s bar_dt=%s%s",
+            stage, _cid_s, symbol, side,
+            "n/a" if cand_age is None else "%.1fs" % cand_age,
+            "n/a" if bar_age is None else "%.1fs" % bar_age,
+            pca, bar_dt, tail,
+        )
+    except Exception:
+        logger.exception("[ENTRY TIMELINE] log failed stage=%s", stage)
+
+
+def _execute_candidate_age_sec(item: dict, row: dict) -> float | None:
+    """候補をキューへ載せてからの経過秒 (足の時刻ではない)。"""
     ai = item.get("ai") if isinstance(item.get("ai"), dict) else {}
     now = dt.datetime.now()
     if _execute_is_summary_ai_candidate(item, row):
-        ts = _execute_first_dt(item.get("updated_at"), row.get("updated_at"), ai.get("updated_at"), item.get("created_at"), row.get("created_at"), item.get("pending_created_at"))
-        if ts is not None:
-            return max(0.0, (now - ts).total_seconds()), "created_at"
-        return 0.0, "summary_ai_now_fallback"
-    ts = _execute_first_dt(item.get("created_at"), item.get("pending_created_at"), ai.get("created_at"))
-    if ts is not None:
-        return max(0.0, (now - ts).total_seconds()), "created_at"
+        ts = _execute_first_dt(
+            item.get("pending_created_at"), item.get("updated_at"), row.get("updated_at"),
+            ai.get("updated_at"), item.get("created_at"), row.get("created_at"),
+        )
+    else:
+        ts = _execute_first_dt(
+            item.get("pending_created_at"), item.get("created_at"),
+            ai.get("pending_created_at"), ai.get("created_at"),
+        )
+    if ts is None:
+        return None
+    return max(0.0, (now - ts).total_seconds())
+
+
+def _execute_bar_age_sec(item: dict, row: dict) -> float | None:
+    """候補が参照している足の古さ (データ鮮度)。"""
+    now = dt.datetime.now()
     ts = _execute_first_dt(item.get("datetime"), row.get("datetime"), item.get("entry_time"), row.get("entry_time"))
-    if ts is not None:
-        return max(0.0, (now - ts).total_seconds()), "datetime"
+    if ts is None:
+        return None
+    return max(0.0, (now - ts).total_seconds())
+
+
+def _execute_item_age_sec(item: dict, row: dict) -> tuple[float | None, str]:
+    """後方互換。候補の古さを優先し、無ければ足の古さを返す。"""
+    age = _execute_candidate_age_sec(item, row)
+    if age is not None:
+        return age, "created_at"
+    age = _execute_bar_age_sec(item, row)
+    if age is not None:
+        return age, "datetime"
     return None, "missing"
 
 
@@ -2858,20 +2975,41 @@ def _execute_prune_pending_for_symbol(symbol: str, side: str, reason: str) -> in
 
 
 def _execute_candidate_stale_ok(item: dict, row: dict, symbol: str, side: str) -> bool:
+    """候補の古さ と 足の古さ を別々に見る。上限値はどちらも従来のまま。"""
     if not _env_bool("ENTRY_EXECUTE_STALE_CANDIDATE_GUARD_ENABLED", True):
         return True
-    age, source = _execute_item_age_sec(item, row)
-    if age is None:
+
+    cand_age = _execute_candidate_age_sec(item, row)
+    bar_age = _execute_bar_age_sec(item, row)
+    cand_max = _env_float("ENTRY_EXECUTE_MAX_CANDIDATE_AGE_SEC", 90.0)
+    bar_max = _env_float("ENTRY_EXECUTE_MAX_BAR_AGE_SEC", 180.0)
+
+    reason = ""
+    if cand_age is not None and cand_age > cand_max:
+        reason = "candidate_age"
+    elif bar_age is not None and bar_age > bar_max:
+        reason = "bar_age"
+
+    if not reason:
+        logger.info(
+            "[ENTRY EXEC TIMEOUT GUARD] freshness OK symbol=%s side=%s "
+            "candidate_age=%s/%.0fs bar_age=%s/%.0fs",
+            symbol, side,
+            "n/a" if cand_age is None else "%.1fs" % cand_age, cand_max,
+            "n/a" if bar_age is None else "%.1fs" % bar_age, bar_max,
+        )
         return True
-    max_age = _env_float("ENTRY_EXECUTE_MAX_CANDIDATE_AGE_SEC", 90.0)
-    if source == "datetime":
-        max_age = _env_float("ENTRY_EXECUTE_MAX_BAR_AGE_SEC", 180.0)
-    if source == "summary_ai_now_fallback":
-        return True
-    if age <= max_age:
-        return True
+
     removed = _execute_prune_pending_for_symbol(symbol, side, "execute_candidate_stale")
-    logger.warning("[ENTRY EXEC TIMEOUT GUARD] STALE_CANDIDATE_SKIP symbol=%s side=%s age=%.1fs max_age=%.1fs pruned=%s", symbol, side, age, max_age, removed)
+    logger.warning(
+        "[ENTRY EXEC TIMEOUT GUARD] STALE_CANDIDATE_SKIP symbol=%s side=%s reason=%s "
+        "candidate_age=%s/max=%.0fs bar_age=%s/max=%.0fs pruned=%s "
+        "(candidate_age=候補をキューへ載せてからの秒数 / bar_age=参照している足の古さ)",
+        symbol, side, reason,
+        "n/a" if cand_age is None else "%.1f" % cand_age, cand_max,
+        "n/a" if bar_age is None else "%.1f" % bar_age, bar_max,
+        removed,
+    )
     return False
 
 
@@ -2986,10 +3124,14 @@ def _execute_best_candidate_dispatch(item: dict, boost_active: bool, *, symbol: 
         boost_active,
     )
 
+    # RANKING 候補は entry_type=None なので、実際の source を渡す。
+    # entry_order_builder 側で source は "SUMMARY_AI" との比較にしか
+    # 使われないため、RANKING の判定は従来 (空文字) と同じ。
+    order_source = entry_type or item.get("source") or entry_row.get("source") or ""
     order = build_entry_order(
         symbol=symbol,
         side=side,
-        source=entry_type,
+        source=order_source,
         entry_row=entry_row,
         qty_override=qty,
     )
@@ -3026,6 +3168,11 @@ def _execute_best_candidate_dispatch(item: dict, boost_active: bool, *, symbol: 
         order_type,
         order_price,
         "place_entry_buy" if side == "BUY" else "place_entry_sell",
+    )
+    # sendorder 直前。ここに到達していれば候補は発注処理まで届いている。
+    _entry_timeline_log(
+        "pre_sendorder", item, entry_row,
+        qty=order_qty, order_type=order_type, price=order_price,
     )
 
     order_id = (
@@ -3128,6 +3275,9 @@ def _execute_best_candidate(item: dict, boost_active: bool) -> bool:
     if not symbol or side not in {"BUY", "SELL"}:
         logger.warning("[ENTRY EXEC TIMEOUT GUARD] INVALID_SYMBOL_SIDE symbol=%s side=%s", symbol, side)
         return False
+    _entry_timeline_log("executor_reached", item, row,
+                        score=item.get("score") or item.get("score_buy"),
+                        source=item.get("source"))
     if not _execute_candidate_stale_ok(item, row, symbol, side):
         return False
 
@@ -3254,6 +3404,25 @@ def _pipeline_snapshot_pending_count() -> tuple[dict, int]:
     except Exception:
         pass
     return {}, 0
+
+
+def _pipeline_pending_candidate_ids() -> set:
+    """現在 pending にある candidate_id の集合 (P1)。
+
+    件数の差だけでは「どの候補が消費されたのか」が分からなかったため、
+    ID の集合そのものを取る。
+    """
+    out: set = set()
+    try:
+        from trading.entry import candidate_id as _cid
+        from trading.entry.pending_manager import iter_entries
+        for _sym, entry in iter_entries():
+            c = _cid.of(entry)
+            if c:
+                out.add(c)
+    except Exception:
+        logger.debug("[ENTRY PIPELINE] pending candidate id snapshot failed", exc_info=True)
+    return out
 
 
 def _pipeline_inflight_count() -> int:
@@ -3443,6 +3612,7 @@ def _should_retry_run_entry_pipeline_after_no_order(*, is_summary: bool, before_
 def _normalize_run_entry_pipeline_result(
     result: Any, *, before_root: dict, before_pending: int, before_inflight: int,
     waited_sec: float, is_summary: bool, retry_count: int,
+    before_ids: Optional[set] = None,
 ) -> dict:
     after_root, after_pending = _pipeline_snapshot_pending_count()
     after_inflight = _pipeline_inflight_count()
@@ -3462,11 +3632,32 @@ def _normalize_run_entry_pipeline_result(
     else:
         skip_reason = "entry_controller_no_order"
 
+    # P1: pending が減ったのに発注していないとき、
+    # 「どの候補が、どこまで進んで消えたのか」を必ず出す。
+    vanished = ()
+    if pending_decreased and not executed and before_ids:
+        try:
+            from trading.entry import candidate_id as _cid
+            after_ids = _pipeline_pending_candidate_ids()
+            vanished = tuple(sorted(set(before_ids) - set(after_ids)))
+            if vanished:
+                _cid.log_vanished(vanished, reason=skip_reason or "pending_moved_without_order")
+            else:
+                logger.warning(
+                    "[CANDIDATE VANISHED] pending decreased %s->%s but no candidate_id "
+                    "disappeared (before_ids=%d after_ids=%d). "
+                    "候補に ID が付く前に消費された可能性がある。",
+                    before_pending, after_pending, len(before_ids), len(after_ids),
+                )
+        except Exception:
+            logger.debug("[ENTRY PIPELINE] vanished candidate report failed", exc_info=True)
+
     out = dict(result) if isinstance(result, dict) else {"result": result}
     out.update({
         "executed": executed,
         "approved_count": approved_count,
         "skip_reason": skip_reason,
+        "vanished_candidate_ids": list(vanished),
         "pending_moved_without_order": bool(pending_decreased and not executed),
         "pending_before": before_root,
         "pending_after": after_root,
@@ -3510,6 +3701,8 @@ def run_entry_pipeline(*, pipeline_source: str | None = None, interval: int | No
     is_summary = source_u == "SUMMARY"
     before_root, before_pending = _pipeline_snapshot_pending_count()
     before_inflight = _pipeline_inflight_count()
+    # P1: 実行前の candidate_id 集合。あとで「どの候補が消えたか」を出すのに使う。
+    before_ids = _pipeline_pending_candidate_ids()
 
     waited_ok, waited_sec = _wait_entry_pipeline_lock_if_needed(source_u, before_pending=before_pending)
     if not waited_ok:
@@ -3532,6 +3725,7 @@ def run_entry_pipeline(*, pipeline_source: str | None = None, interval: int | No
     out = _normalize_run_entry_pipeline_result(
         result, before_root=before_root, before_pending=before_pending, before_inflight=before_inflight,
         waited_sec=waited_sec, is_summary=is_summary, retry_count=retry_count,
+        before_ids=before_ids,
     )
     logger.info("[ENTRY CONTROLLER] run_entry_pipeline return normalized %s", out)
     return out
@@ -4034,8 +4228,10 @@ def _passes_ai_gate(entry_row: dict, ai: dict, side: str):
             min_comp_buy = _fgr_env_float("ENTRY_CONTROLLER_TONOSAMA_BUY_MIN_COMPOSITE", min_buy)
             min_comp_sell = _fgr_env_float("ENTRY_CONTROLLER_TONOSAMA_SELL_MIN_COMPOSITE", min_sell)
         else:
-            min_buy = _fgr_env_float("ENTRY_CONTROLLER_SUMMARY_BUY_MIN_SCORE", 1.0)
-            min_sell = _fgr_env_float("ENTRY_CONTROLLER_SUMMARY_SELL_MIN_SCORE", 1.0)
+            # ここも同じ env を読むが未設定なので、
+            # 既定値を strict の正本値へ揃える (モジュール定数と一致させる)。
+            min_buy = _fgr_env_float("ENTRY_CONTROLLER_SUMMARY_BUY_MIN_SCORE", _strict_threshold("MIN_SUMMARY_SCORE_BUY", 3.0))
+            min_sell = _fgr_env_float("ENTRY_CONTROLLER_SUMMARY_SELL_MIN_SCORE", _strict_threshold("MIN_SUMMARY_SCORE_SELL", 3.0))
             min_comp_buy = _fgr_env_float("ENTRY_CONTROLLER_SUMMARY_BUY_MIN_COMPOSITE", min_buy)
             min_comp_sell = _fgr_env_float("ENTRY_CONTROLLER_SUMMARY_SELL_MIN_COMPOSITE", min_sell)
 

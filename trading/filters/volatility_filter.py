@@ -48,6 +48,7 @@ from typing import Any
 import pandas as pd
 
 from utils_common import safe_float
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -455,8 +456,8 @@ def _ranking_db_candidate_paths() -> list[str]:
     base_dirs = [
         os.environ.get("RANKING_DB_DIR"),
         os.environ.get("KABU_RANKING_DB_DIR"),
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\ranking",
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\Ranking",
+        nas_path(r"raw_data\kabu_station\ranking"),
+        nas_path(r"raw_data\kabu_station\Ranking"),
         os.path.join(os.getcwd(), "raw_data", "kabu_station", "ranking"),
         os.path.join(os.getcwd(), "raw_data", "kabu_station", "Ranking"),
     ]
@@ -691,8 +692,8 @@ def _vol_filter_rescue_timebox_candidate_paths() -> list[str]:
     for d_ in (
         os.getenv("RANKING_DB_DIR"),
         os.getenv("KABU_RANKING_DB_DIR"),
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\ranking",
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\Ranking",
+        nas_path(r"raw_data\kabu_station\ranking"),
+        nas_path(r"raw_data\kabu_station\Ranking"),
     ):
         if d_:
             out.append(os.path.join(str(d_), f"ranking{today}.db"))

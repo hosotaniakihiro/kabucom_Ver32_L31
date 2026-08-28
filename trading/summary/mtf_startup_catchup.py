@@ -31,6 +31,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Iterable
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +103,7 @@ def _summary_db_path() -> str:
         return explicit
     base = os.getenv(
         "SUMMARY_DB_DIR",
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary",
+        nas_path(r"raw_data\kabu_station\summary"),
     )
     today = dt.datetime.now().strftime("%Y%m%d")
     return str(Path(base) / f"summary{today}.db")
@@ -519,7 +521,7 @@ def run_catchup(*, reason: str = "manual") -> dict[str, Any]:
         return result
 
     try:
-        with sqlite3.connect(path, timeout=timeout_sec) as conn:
+        with committing_connect(path, timeout=timeout_sec) as conn:
             _apply_sqlite_pragmas(conn)
             logger.warning(
                 "[SUMMARY MTF CATCHUP] db open path=%s timeout=%.1fs busy_timeout_ms=%s skip_if_busy=%s chunk_size=%s",

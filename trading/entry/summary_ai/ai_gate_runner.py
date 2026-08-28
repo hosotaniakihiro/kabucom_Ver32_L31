@@ -30,6 +30,8 @@ import pandas as pd
 
 from .row_adapter import convert_summary_row_to_ai_gate_row
 from .utils import get_ai_final_entry_check, is_market_open, safe_df, safe_float, safe_str
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -192,7 +194,7 @@ def _price_allowed_for_direct_entry(symbol: str, price: float) -> tuple[bool, st
 
 
 def _summary_db_path() -> str:
-    base = os.getenv("SUMMARY_DB_DIR", r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary")
+    base = os.getenv("SUMMARY_DB_DIR", nas_path(r"raw_data\kabu_station\summary"))
     today = dt.datetime.now().strftime("%Y%m%d")
     return os.getenv("SUMMARY_DB_PATH", str(Path(base) / f"summary{today}.db"))
 
@@ -214,7 +216,7 @@ def _recent_volume_values(symbol: str, *, bars: int) -> dict[str, Any]:
     if not symbol or not Path(path).exists():
         return {"ok_read": False, "reason": "summary_db_missing", "summary_db": path, "table": table}
     try:
-        with sqlite3.connect(path, timeout=1.0) as conn:
+        with committing_connect(path, timeout=1.0) as conn:
             conn.execute("PRAGMA busy_timeout=1000")
             sym = _col(conn, table, ["symbol", "code", "stock_code"])
             tm = _col(conn, table, ["datetime", "dt", "timestamp", "time"])

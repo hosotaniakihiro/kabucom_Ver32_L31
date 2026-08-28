@@ -17,6 +17,7 @@ import datetime as dt
 import os
 from pathlib import Path
 from typing import Any
+from nas_root import nas_path, nas_root
 
 try:
     import pandas as pd  # type: ignore
@@ -24,7 +25,7 @@ except Exception:  # pragma: no cover
     pd = None  # type: ignore
 
 
-DEFAULT_BASE_DIR = r"\\192.168.0.22\AutoStockBuyAndSell"
+DEFAULT_BASE_DIR = nas_root()
 DEFAULT_YAHOO_INTRADAY_DIR = os.path.join(
     DEFAULT_BASE_DIR,
     "raw_data",

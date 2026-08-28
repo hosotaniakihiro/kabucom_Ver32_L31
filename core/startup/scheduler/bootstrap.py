@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import importlib
 import inspect
@@ -958,6 +959,14 @@ def _ranking_bg_check_timeout_or_cooldown_locked() -> bool:
             elapsed = _ranking_bg_elapsed_sec()
             timeout_sec = _ranking_bg_env_float("RANKING_SUMMARY_BG_TIMEOUT_SEC", 55.0)
             if elapsed >= timeout_sec:
+                # P0-3: timeout を宣言するだけで worker を放置しない。
+                # 必ず「降りろ」を届けてから cooldown に入る。
+                sent = ranking_bg_request_cancel("bg_timeout")
+                logger.warning(
+                    "[RANKING SUMMARY BG] timeout -> cancel requested elapsed=%.3fs "
+                    "timeout=%.1fs cancel_sent=%s",
+                    elapsed, timeout_sec, sent,
+                )
                 _ranking_bg_enter_cooldown("bg_timeout", elapsed=elapsed)
                 return True
             logger.warning(
@@ -1054,19 +1063,36 @@ def _run_ranking_summary_core_job() -> Any:
         if not callable(fn):
             logger.warning("[RANKING SUMMARY BG] core ranking job skipped function unavailable")
             return None
+        # P1: 旧実装は stage_sum=0 / unaccounted=14.4s で、
+        # BG のどこで時間を使っているかが全く分からなかった。
+        # 本体と announce を最低限 stage で割る。
+        _st_mod = _ranking_bg_stage_tracker()
+
+        def _stage(name: str):
+            if _st_mod is None:
+                return contextlib.nullcontext()
+            return _st_mod.stage(name)
+
         kwargs = _build_ranking_job_kwargs(force=False)
-        result = _call_with_supported_kwargs(fn, **kwargs)
+        with _stage("ranking_build_kwargs"):
+            pass
+        with _stage("ranking_job_all"):
+            result = _call_with_supported_kwargs(fn, **kwargs)
         elapsed = time.perf_counter() - perf_started
         try:
             _set_global_attr("last_ranking_summary_job_at", dt.datetime.now())
             _set_global_attr("last_ranking_summary_job_result", _summarize_result(result))
         except Exception:
-            pass
+            logger.debug("[RANKING SUMMARY BG] global attr set failed", exc_info=True)
         logger.warning("[RANKING SUMMARY BG] core ranking job done elapsed=%.3fs result=%s", elapsed, _summarize_result(result))
         try:
-            announce_results = _announce_ranking_summary_intervals_safe(top_n=10, use_discord=True, intervals=(1, 3, 5))
+            with _stage("ranking_announce"):
+                announce_results = _announce_ranking_summary_intervals_safe(top_n=10, use_discord=True, intervals=(1, 3, 5))
             _set_global_attr("last_ranking_summary_announce_results", announce_results)
-            logger.warning("[RANKING SUMMARY BG] announce done results=%s", announce_results)
+            logger.warning(
+                "[RANKING SUMMARY BG] announce done elapsed_total=%.3fs results=%s",
+                time.perf_counter() - perf_started, announce_results,
+            )
         except Exception:
             logger.exception("[RANKING SUMMARY BG] announce failed")
         return result
@@ -1077,19 +1103,76 @@ def _run_ranking_summary_core_job() -> Any:
         _set_ranking_job_running(False)
 
 
+_RANKING_BG_SEQ = 0
+_RANKING_BG_CTX = None
+
+
+def _ranking_bg_stage_tracker():
+    """P0-3: BG も Summary worker と同じ stage / deadline / cancel に乗せる。"""
+    try:
+        from scheduler_jobs.summary import stage_tracker as _st
+        return _st
+    except Exception:
+        logger.debug("[RANKING SUMMARY BG] stage_tracker unavailable", exc_info=True)
+        return None
+
+
+def _ranking_bg_budget_sec() -> float:
+    """BG の予算。完成条件は通常 10 秒以内。
+
+    ここは「これを超えたら自分から降りる」ハードな上限なので、
+    既存の timeout (180s) より内側に置く。timeout を伸ばす修正ではない。
+    """
+    try:
+        v = os.getenv("RANKING_SUMMARY_BG_BUDGET_SEC")
+        if v is not None and str(v).strip() != "":
+            return max(5.0, float(str(v).strip()))
+    except Exception:
+        pass
+    return 60.0
+
+
+def ranking_bg_request_cancel(reason: str) -> bool:
+    """走っている BG へ協調キャンセルを要求する (Thread は殺さない)。"""
+    _st = _ranking_bg_stage_tracker()
+    ctx = _RANKING_BG_CTX
+    if _st is None or ctx is None:
+        return False
+    try:
+        _st.cancel(ctx, reason=reason)
+        logger.warning("[RANKING SUMMARY BG] cancel requested reason=%s", reason)
+        return True
+    except Exception:
+        logger.debug("[RANKING SUMMARY BG] cancel failed", exc_info=True)
+        return False
+
+
 def _ranking_bg_task(started_at: dt.datetime) -> None:
     global _RANKING_BG_RUNNING, _RANKING_BG_STARTED_AT, _RANKING_BG_TIMEOUT_STREAK
+    global _RANKING_BG_SEQ, _RANKING_BG_CTX
     t0 = time.perf_counter()
+    _RANKING_BG_SEQ += 1
+    seq = _RANKING_BG_SEQ
+    _st = _ranking_bg_stage_tracker()
     try:
         _clear_ranking_job_running_if_stale(reason="bg_task_before_core")
-        logger.warning("[RANKING SUMMARY BG] bg start started_at=%s", started_at)
-        _run_ranking_summary_core_job()
+        logger.warning("[RANKING SUMMARY BG] bg start started_at=%s generation=%s", started_at, seq)
+        if _st is None:
+            _run_ranking_summary_core_job()
+        else:
+            with _st.worker("ranking_summary_bg", generation=seq,
+                            owner="bg:%s" % started_at,
+                            budget=_ranking_bg_budget_sec()) as ctx:
+                _RANKING_BG_CTX = ctx
+                _run_ranking_summary_core_job()
         elapsed = time.perf_counter() - t0
         _RANKING_BG_TIMEOUT_STREAK = 0
-        logger.warning("[RANKING SUMMARY BG] bg done elapsed=%.3fs", elapsed)
+        logger.warning("[RANKING SUMMARY BG] bg done elapsed=%.3fs generation=%s", elapsed, seq)
     except Exception:
-        logger.exception("[RANKING SUMMARY BG] bg failed elapsed=%.3fs", time.perf_counter() - t0)
+        logger.exception("[RANKING SUMMARY BG] bg failed elapsed=%.3fs generation=%s",
+                         time.perf_counter() - t0, seq)
     finally:
+        _RANKING_BG_CTX = None
         with _RANKING_BG_LOCK:
             _RANKING_BG_RUNNING = False
             _RANKING_BG_STARTED_AT = None

@@ -46,7 +46,12 @@ def test_alignment_reduces_future_warnings():
     seq = [TICK, BOARD, NOVALUE] * 6
     _, old_n = _accumulate(seq, align=False)
     _, new_n = _accumulate(seq, align=True)
-    assert old_n > 0, "前提が崩れている (旧実装で警告が出ない)"
+    if old_n == 0:
+        # pandas 3.0 で非推奨期間が終わり、旧実装でも FutureWarning が出なくなった。
+        # 「減らす」ことは検証できないので、代わりに「増やしていない」ことを見る。
+        # 値が変わっていないことは test_values_are_unchanged が担保する。
+        assert new_n == 0, "整列側だけ警告が出ている"
+        pytest.skip("pandas %s は該当の FutureWarning を出さない" % pd.__version__)
     assert new_n < old_n, "警告が減っていない"
 
 

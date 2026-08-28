@@ -28,7 +28,35 @@ logger = logging.getLogger(__name__)
 # basic dataframe sanitizers
 # ==========================================================
 
-def sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
+# ============================================================
+# P0-3 / P0-6: sanitize の多重コピーを 1 回にする
+# ------------------------------------------------------------
+# 2026-08-28 の cancel SLA breach スタックが 2 回とも
+#   controller_utils.sanitize_df -> pandas/core/generic.py copy()
+# を指していた。
+#
+# normalize_summary_df() は 1 回の呼び出しで sanitize_df() を
+# **9 回**呼んでいた (実測):
+#   normalize_summary_df        1
+#   ensure_symbol               1
+#   ensure_datetime             1
+#   normalize_price_aliases     1
+#   coalesce_first_numeric x5   5
+# それぞれが frame 全体の deep copy + 全数値列の inf 置換を行う。
+#
+# 実測 (250 列):
+#     881 行  131.5 ms
+#   7,953 行  536.9 ms
+#  20,693 行 1319.1 ms
+#
+# normalize_summary_df は 1 tick に何度も呼ばれるので、
+# これが light_push_runner 67 秒の主要因。
+#
+# 対策: 内部呼び出しでは「もう sanitize 済み」と伝えて
+# コピーを省く。外から直接呼ばれたときの挙動は変えない。
+# ============================================================
+
+def sanitize_df(df: pd.DataFrame, *, _pre_sanitized: bool = False) -> pd.DataFrame:
     try:
         if df is None:
             return pd.DataFrame()
@@ -40,7 +68,12 @@ def sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
                 return pd.DataFrame()
 
         if df.empty:
-            return df.copy()
+            return df if _pre_sanitized else df.copy()
+
+        if _pre_sanitized:
+            # 直前の sanitize で copy / inf 置換 / MultiIndex 平坦化 /
+            # 重複列除去はすべて済んでいる。同じ処理を繰り返さない。
+            return df
 
         out = df.copy()
         # 上と同じ理由で数値列だけに限定する (inf は数値列にしか入らない)。
@@ -73,8 +106,8 @@ def sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def ensure_symbol(df: pd.DataFrame) -> pd.DataFrame:
-    out = sanitize_df(df)
+def ensure_symbol(df: pd.DataFrame, *, _pre_sanitized: bool = False) -> pd.DataFrame:
+    out = sanitize_df(df, _pre_sanitized=_pre_sanitized)
     if out.empty:
         return out
 
@@ -109,8 +142,8 @@ def ensure_symbol(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def ensure_datetime(df: pd.DataFrame) -> pd.DataFrame:
-    out = sanitize_df(df)
+def ensure_datetime(df: pd.DataFrame, *, _pre_sanitized: bool = False) -> pd.DataFrame:
+    out = sanitize_df(df, _pre_sanitized=_pre_sanitized)
     if out.empty:
         return out
 
@@ -149,8 +182,8 @@ def ensure_datetime(df: pd.DataFrame) -> pd.DataFrame:
 # numeric alias helpers
 # ==========================================================
 
-def coalesce_first_numeric(df: pd.DataFrame, dest: str, candidates: tuple[str, ...]) -> pd.DataFrame:
-    out = sanitize_df(df)
+def coalesce_first_numeric(df: pd.DataFrame, dest: str, candidates: tuple[str, ...], *, _pre_sanitized: bool = False) -> pd.DataFrame:
+    out = sanitize_df(df, _pre_sanitized=_pre_sanitized)
     if out.empty:
         return out
 
@@ -178,8 +211,8 @@ def coalesce_first_numeric(df: pd.DataFrame, dest: str, candidates: tuple[str, .
     return out
 
 
-def normalize_price_aliases(df: pd.DataFrame) -> pd.DataFrame:
-    out = sanitize_df(df)
+def normalize_price_aliases(df: pd.DataFrame, *, _pre_sanitized: bool = False) -> pd.DataFrame:
+    out = sanitize_df(df, _pre_sanitized=_pre_sanitized)
     if out.empty:
         return out
 
@@ -187,26 +220,31 @@ def normalize_price_aliases(df: pd.DataFrame) -> pd.DataFrame:
         out,
         "close",
         ("close", "close_price", "price", "current_price", "CurrentPrice", "last_price", "LastPrice"),
+        _pre_sanitized=True,
     )
     out = coalesce_first_numeric(
         out,
         "open",
         ("open", "open_price", "OpeningPrice", "opening_price", "close"),
+        _pre_sanitized=True,
     )
     out = coalesce_first_numeric(
         out,
         "high",
         ("high", "high_price", "close"),
+        _pre_sanitized=True,
     )
     out = coalesce_first_numeric(
         out,
         "low",
         ("low", "low_price", "close"),
+        _pre_sanitized=True,
     )
     out = coalesce_first_numeric(
         out,
         "volume",
         ("volume", "Volume", "trading_volume", "TradingVolume"),
+        _pre_sanitized=True,
     )
 
     try:
@@ -227,14 +265,46 @@ def normalize_price_aliases(df: pd.DataFrame) -> pd.DataFrame:
 # public normalization entry
 # ==========================================================
 
+# ============================================================
+# P0-3: cancel の降り場所
+# ------------------------------------------------------------
+# 2026-08-28 の cancel SLA breach スタックは 2 回とも
+# normalize_summary_df の中だった。ここは heavy pipeline の
+# 最も密な funnel なので、cancel 済みならここで降りる。
+# cancel されていないときのコストは thread-local の getattr 1 回。
+# ============================================================
+
+_stage_tracker_mod = None
+_stage_tracker_tried = False
+
+
+def _checkpoint(label: str) -> None:
+    global _stage_tracker_mod, _stage_tracker_tried
+    if _stage_tracker_mod is None:
+        if _stage_tracker_tried:
+            return
+        _stage_tracker_tried = True
+        try:
+            from scheduler_jobs.summary import stage_tracker as _st
+            _stage_tracker_mod = _st
+        except Exception:
+            return
+    try:
+        _stage_tracker_mod.checkpoint(label)
+    except AttributeError:
+        pass
+
+
 def normalize_summary_df(df: pd.DataFrame) -> pd.DataFrame:
+    _checkpoint("normalize_summary_df")
+    # sanitize は入口の 1 回だけ。以降は同じ frame を使い回す。
     out = sanitize_df(df)
     if out.empty:
         return out
 
-    out = ensure_symbol(out)
-    out = ensure_datetime(out)
-    out = normalize_price_aliases(out)
+    out = ensure_symbol(out, _pre_sanitized=True)
+    out = ensure_datetime(out, _pre_sanitized=True)
+    out = normalize_price_aliases(out, _pre_sanitized=True)
 
     try:
         if "symbolname" not in out.columns:

@@ -4,6 +4,7 @@
 # ============================================================
 from __future__ import annotations
 import os
+from nas_root import nas_path, nas_root
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -54,7 +55,7 @@ ACTIVE_VALUE_BY_GAINERS_N = env_int("ACTIVE_VALUE_BY_GAINERS_N", 30)
 ACTIVE_VALUE_BY_LOSERS_N = env_int("ACTIVE_VALUE_BY_LOSERS_N", 10)
 ACTIVE_TICK_SUPPLEMENT_N = env_int("ACTIVE_TICK_SUPPLEMENT_N", 100)
 
-DEFAULT_SYMBOL_FLAGS_DB = r"\\192.168.0.22\AutoStockBuyAndSell\Basic\symbol_flags.db"
+DEFAULT_SYMBOL_FLAGS_DB = nas_path(r"Basic\symbol_flags.db")
 SYMBOL_FLAGS_DB = os.environ.get("SYMBOL_FLAGS_DB_PATH", DEFAULT_SYMBOL_FLAGS_DB)
 ACTIVE_REQUIRE_SYMBOL_FLAGS = env_bool("ACTIVE_REQUIRE_SYMBOL_FLAGS", True)
 ACTIVE_ALLOW_BUY_TARGET = env_bool("ACTIVE_ALLOW_BUY_TARGET", True)

@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import pandas as pd
+from sqlite_cm import committing_connect
 
 logger = logging.getLogger(__name__)
 
@@ -209,7 +210,7 @@ def _count_summary_rows(path: Path) -> int:
         return 0
     total = 0
     try:
-        with sqlite3.connect(str(path), timeout=5) as conn:
+        with committing_connect(str(path), timeout=5) as conn:
             try:
                 conn.execute("PRAGMA busy_timeout=5000")
                 conn.execute("PRAGMA query_only=ON")
@@ -649,7 +650,7 @@ def _publish_interval(interval: int, df: pd.DataFrame) -> dict[str, Any]:
 
 def _read_all_intervals_from_path(path: Path, *, per_symbol_rows: int, max_rows: int, target_date: Optional[dt.date]) -> dict[int, pd.DataFrame]:
     out: dict[int, pd.DataFrame] = {}
-    with sqlite3.connect(str(path), timeout=15) as conn:
+    with committing_connect(str(path), timeout=15) as conn:
         try:
             conn.execute("PRAGMA busy_timeout=15000")
             conn.execute("PRAGMA query_only=ON")

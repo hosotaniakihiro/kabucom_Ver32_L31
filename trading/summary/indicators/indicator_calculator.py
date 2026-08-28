@@ -48,6 +48,8 @@ from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 try:
     from pandas.errors import PerformanceWarning
@@ -729,7 +731,7 @@ def _summary_base_dirs() -> list[Path]:
         os.getenv("AUTO_STOCK_DB_DIR"),
         os.getenv("AUTO_STOCK_BUY_SELL_DIR"),
         os.getenv("AUTOSTOCK_DB_DIR"),
-        r"\\192.168.0.22\AutoStockBuyAndSell",
+        nas_root(),
     ]
     out: list[Path] = []
     seen: set[str] = set()
@@ -837,7 +839,7 @@ def _load_prevday_warmup_cached(db_path: str, table: str, symbols: tuple[str, ..
 
     frames: list[pd.DataFrame] = []
     try:
-        with sqlite3.connect(str(db_path), timeout=2.0) as conn:
+        with committing_connect(str(db_path), timeout=2.0) as conn:
             conn.execute("PRAGMA busy_timeout=2000;")
             try:
                 cols = [str(r[1]) for r in conn.execute(f'PRAGMA table_info("{table}")').fetchall()]

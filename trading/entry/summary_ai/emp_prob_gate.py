@@ -34,6 +34,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 VERSION = "V3-SUMMARY-AI-EMP-HIGHLOW-MA-VWAP-GATE"
@@ -88,7 +90,7 @@ def _side(v: Any) -> str:
 
 
 def _db_path() -> str:
-    base = os.environ.get("SUMMARY_DB_DIR", r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary")
+    base = os.environ.get("SUMMARY_DB_DIR", nas_path(r"raw_data\kabu_station\summary"))
     return os.environ.get("SUMMARY_DB_PATH", str(Path(base) / f"summary{dt.datetime.now().strftime('%Y%m%d')}.db"))
 
 
@@ -106,7 +108,7 @@ def _load_rows(symbol: str, limit: int) -> list[dict[str, float]]:
     if not symbol or not Path(path).exists():
         return []
     try:
-        with sqlite3.connect(path, timeout=1.0) as con:
+        with committing_connect(path, timeout=1.0) as con:
             con.execute("PRAGMA busy_timeout=1000")
             cols = {str(r[1]) for r in con.execute(f'PRAGMA table_info("{table}")').fetchall()}
             c_sym = _col(cols, ("symbol", "code", "stock_code"))
@@ -139,7 +141,7 @@ def _load_tf_rows(symbol: str, interval: int, limit: int) -> list[dict[str, floa
     if not symbol or not Path(path).exists():
         return []
     try:
-        with sqlite3.connect(path, timeout=1.0) as con:
+        with committing_connect(path, timeout=1.0) as con:
             con.execute("PRAGMA busy_timeout=1000")
             cols = {str(r[1]) for r in con.execute(f'PRAGMA table_info("{table}")').fetchall()}
             c_sym = _col(cols, ("symbol", "code", "stock_code"))

@@ -24,6 +24,7 @@ import sys
 import time
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 try:
@@ -587,11 +588,14 @@ def _ensure_actual_movement_cols_core(df: pd.DataFrame) -> pd.DataFrame:
         low_s = pd.to_numeric(x[low_col], errors="coerce")
         close_s = pd.to_numeric(x["_tonosama_close_for_move"], errors="coerce")
         open_s = pd.to_numeric(x[open_col], errors="coerce") if open_col else close_s
-        rng = (high_s - low_s).abs().replace(0, pd.NA)
-        x["_intrabar_range_pct"] = ((high_s - low_s).abs() / close_s.where(close_s > 0, pd.NA) * 100.0).replace([float("inf"), -float("inf")], pd.NA).fillna(0.0)
-        x["_close_position_pct"] = ((close_s - low_s) / rng * 100.0).replace([float("inf"), -float("inf")], pd.NA).fillna(50.0).clip(0.0, 100.0)
-        x["_upper_wick_pct"] = ((high_s - pd.concat([open_s, close_s], axis=1).max(axis=1)) / rng * 100.0).replace([float("inf"), -float("inf")], pd.NA).fillna(0.0).clip(lower=0.0)
-        x["_lower_wick_pct"] = ((pd.concat([open_s, close_s], axis=1).min(axis=1) - low_s) / rng * 100.0).replace([float("inf"), -float("inf")], pd.NA).fillna(0.0).clip(lower=0.0)
+        # float64 の Series へ pd.NA を入れると object dtype に昇格し、
+        # 続く fillna() が暗黙ダウンキャストで FutureWarning になる。
+        # np.nan なら float64 のままで、結果値は同じ。
+        rng = (high_s - low_s).abs().replace(0, np.nan)
+        x["_intrabar_range_pct"] = ((high_s - low_s).abs() / close_s.where(close_s > 0, np.nan) * 100.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        x["_close_position_pct"] = ((close_s - low_s) / rng * 100.0).replace([np.inf, -np.inf], np.nan).fillna(50.0).clip(0.0, 100.0)
+        x["_upper_wick_pct"] = ((high_s - pd.concat([open_s, close_s], axis=1).max(axis=1)) / rng * 100.0).replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0)
+        x["_lower_wick_pct"] = ((pd.concat([open_s, close_s], axis=1).min(axis=1) - low_s) / rng * 100.0).replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0)
     else:
         x["_intrabar_range_pct"] = 0.0
         x["_close_position_pct"] = 50.0
@@ -1103,6 +1107,10 @@ def build_tonosama_entries() -> int:
     min_remain = max(1.5, _env_float("TONOSAMA_RUNTIME_MIN_REMAIN_SEC", 1.5))
     return_after_first = _env_bool("TONOSAMA_RUNTIME_RETURN_AFTER_FIRST_PENDING", True)
 
+    _wg = _tono_worker_guard()
+    if _wg is not None and _wg.check(label="tonosama_before_candidates"):
+        logger.warning("[TONOSAMA RUNTIME BUDGET] cancelled before candidate build")
+        return 0
     try:
         candidates = iter_tonosama_candidate_rows()
     except Exception:
@@ -1110,6 +1118,17 @@ def build_tonosama_entries() -> int:
         return 0
 
     candidate_elapsed = time.perf_counter() - build_started
+    logger.warning(
+        "[TONOSAMA RUNTIME BUDGET] phase candidate_build=%.2fs rows=%s",
+        candidate_elapsed,
+        0 if candidates is None else (len(candidates) if hasattr(candidates, "__len__") else -1),
+    )
+    if _wg is not None and _wg.check(label="tonosama_after_candidates"):
+        logger.warning(
+            "[TONOSAMA RUNTIME BUDGET] cancelled after candidate build candidate_elapsed=%.2fs",
+            candidate_elapsed,
+        )
+        return 0
     try:
         empty = bool(candidates is None or candidates.empty)
     except Exception:
@@ -1152,6 +1171,14 @@ def build_tonosama_entries() -> int:
         )
 
     for idx, row in candidates.iterrows():
+        if _wg is not None and _wg.check(label="tonosama_candidate_loop"):
+            time_budget_stop = True
+            logger.warning(
+                "[TONOSAMA RUNTIME BUDGET] cancelled in candidate loop "
+                "eval_elapsed=%.2fs registered=%s evaluated=%s",
+                time.perf_counter() - eval_started, registered, evaluated,
+            )
+            break
         now = time.perf_counter()
         # registered=0 の間は、時間切れだけでは止めない。
         if now >= deadline and registered > 0:
@@ -1280,6 +1307,14 @@ def build_tonosama_entries() -> int:
     return registered
 
 
+def _tono_worker_guard():
+    try:
+        from trading.entry_exit import worker_guard
+        return worker_guard
+    except Exception:
+        return None
+
+
 def tonosama_loop() -> int:
     global _last_loop_at
     _last_loop_at = dt.datetime.now(); started = time.perf_counter()
@@ -1296,6 +1331,13 @@ def tonosama_loop() -> int:
                 update_active_symbols()
             except Exception:
                 logger.warning("[TONOSAMA ENTRY] update_active_symbols skipped/failed", exc_info=True)
+        _wg = _tono_worker_guard()
+        if _wg is not None and _wg.check(label="tonosama_loop_start"):
+            logger.warning(
+                "[TONOSAMA LOOP] cancelled before build elapsed=%.3fs",
+                time.perf_counter() - started,
+            )
+            return 0
         registered = build_tonosama_entries()
         logger.info("[TONOSAMA LOOP] done registered=%s elapsed=%.3fs", registered, time.perf_counter() - started)
         return registered

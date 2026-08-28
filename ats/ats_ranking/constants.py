@@ -3,7 +3,10 @@
 # Version: Ver1.0-ATS-RANKING-CONSTANTS
 # ============================================================
 
-RANKING_DB_ROOT = r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\ranking"
+
+from nas_root import nas_path, nas_root
+
+RANKING_DB_ROOT = nas_path(r"raw_data\kabu_station\ranking")
 
 PRIMARY_TABLES = [
     "ranking_snapshot_1min",

@@ -12,6 +12,7 @@
 
 from pathlib import Path
 import os
+from nas_root import nas_path, nas_root
 
 # ------------------------------------------------------------
 # Environment
@@ -20,8 +21,8 @@ ENV = os.getenv("KABU_ENV", "local")
 
 BASE_PATHS = {
     # "local": Path("X:/"),
-    "local": Path("//192.168.0.22/AutoStockBuyAndSell"),
-    "nas":   Path("//192.168.0.22/AutoStockBuyAndSell"),
+    "local": Path(nas_root()),
+    "nas":   Path(nas_root()),
 }
 
 BASE_DIR = BASE_PATHS.get(ENV)

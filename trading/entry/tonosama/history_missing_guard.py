@@ -25,6 +25,10 @@ from typing import Any, Callable
 
 import pandas as pd
 
+from trading.summary.bool_series import na_false_bool
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
+
 logger = logging.getLogger(__name__)
 _PATCHED = False
 
@@ -97,7 +101,7 @@ def _today() -> str:
 def _push_db_path() -> str:
     base = os.getenv(
         "PUSH_DB_DIR",
-        os.getenv("RAW_PUSH_DIR", r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\push"),
+        os.getenv("RAW_PUSH_DIR", nas_path(r"raw_data\kabu_station\push")),
     )
     return os.getenv("PUSH_DB_PATH", str(Path(base) / f"push{_today()}.db"))
 
@@ -259,7 +263,7 @@ def _load_push_raw_db_1m_history_core() -> pd.DataFrame:
     busy_ms = int(max(50, _env_float("TONOSAMA_PUSH_RAW_DB_HISTORY_BUSY_TIMEOUT_MS", 150)))
 
     try:
-        with sqlite3.connect(str(p), timeout=timeout_sec) as conn:
+        with committing_connect(str(p), timeout=timeout_sec) as conn:
             conn.execute(f"PRAGMA busy_timeout={busy_ms};")
             conn.execute("PRAGMA query_only=ON;")
             table = "stream_data_raw" if _table_exists(conn, "stream_data_raw") else "stream_data"
@@ -744,9 +748,10 @@ def _pass_history_missing_failopen(df: pd.DataFrame, *, stage: str) -> pd.DataFr
 
     try:
         x = df.copy()
-        missing = x.get("_volume_surge_history_missing", pd.Series(False, index=x.index)).fillna(False).astype(bool)
-        failopen = x.get("_volume_surge_failopen", pd.Series(False, index=x.index)).fillna(False).astype(bool)
-        affected_mask = (missing | failopen).fillna(False).astype(bool)
+        # 旧: fillna(False).astype(bool) は object dtype で暗黙ダウンキャスト警告。
+        missing = na_false_bool(x.get("_volume_surge_history_missing"), index=x.index)
+        failopen = na_false_bool(x.get("_volume_surge_failopen"), index=x.index)
+        affected_mask = na_false_bool(missing | failopen, index=x.index)
         affected = int(affected_mask.sum())
     except Exception:
         logger.debug("[TONOSAMA HISTORY GUARD] affected mask failed stage=%s", stage, exc_info=True)
@@ -832,6 +837,12 @@ def apply_history_guard_defaults() -> bool:
         return False
 
 
+# sitecustomize._install_module() が呼ぶ入口名。
+# 本文化の際に install() を apply_history_guard_defaults() へ改名したため、
+# 宣言しておかないと sitecustomize 側が "install なし" と見なして
+# 毎起動 ok=False を出していた。
+SITECUSTOMIZE_INSTALL = "apply_history_guard_defaults"
+
 try:
     apply_history_guard_defaults()
 except Exception:
@@ -839,6 +850,7 @@ except Exception:
 
 
 __all__ = [
+    "SITECUSTOMIZE_INSTALL",
     "apply_history_guard_defaults",
     "guard_enabled",
     "add_volume_surge_features_guarded",
@@ -1007,11 +1019,30 @@ def _load_raw1_history_tz_safe(vs: Any, *, interval: int = 1) -> pd.DataFrame:
             except Exception:
                 logger.debug("[TONOSAMA DT TZ GUARD] normalize failed source=%s", label, exc_info=True)
 
+        # 全 NA のフレームを含むと concat の FutureWarning になるので除く。
+        norm_parts = [x for x in norm_parts if isinstance(x, pd.DataFrame) and not x.empty and not x.isna().all().all()]
         if not norm_parts:
             logger.warning("[TONOSAMA RAW1 HISTORY] no usable 1m history interval=%s stats=%s", interval, stats)
             return pd.DataFrame()
 
-        out = pd.concat(norm_parts, ignore_index=True, sort=False)
+        # 一部のフレームだけ all-NA になっている列があると
+        #   FutureWarning: The behavior of DataFrame concatenation with
+        #   empty or all-NA entries is deprecated
+        # になる。object dtype の all-NA 列を float64 へ明示してから連結する。
+        # (int64/bool は NaN を入れられないので触らない。値・列集合は不変)
+        _aligned = []
+        for _f in norm_parts:
+            try:
+                _cast = {
+                    c: "float64"
+                    for c in _f.columns
+                    if _f[c].dtype == object and _f[c].isna().all()
+                }
+                _aligned.append(_f.astype(_cast) if _cast else _f)
+            except Exception:
+                _aligned.append(_f)
+
+        out = pd.concat(_aligned, ignore_index=True, sort=False)
         out = _tzg_normalize_summary_datetime_df(out)
         if out.empty or "symbol" not in out.columns or "datetime" not in out.columns:
             return pd.DataFrame()

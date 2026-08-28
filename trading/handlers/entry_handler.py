@@ -45,6 +45,8 @@ from kabu_api.buy_sell_entry import (
     execute_buy_stop,
     execute_short_stop,
 )
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 try:
     from trading.handlers.pending_order_monitor import register_pending_entry_order
@@ -253,7 +255,7 @@ def _normalize_args(symbol: str, symbolname: str, price: Optional[float], reason
 
 
 def _summary_db_path() -> str:
-    base = os.getenv("SUMMARY_DB_DIR", r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary")
+    base = os.getenv("SUMMARY_DB_DIR", nas_path(r"raw_data\kabu_station\summary"))
     today = dt.datetime.now().strftime("%Y%m%d")
     return os.getenv("SUMMARY_DB_PATH", str(Path(base) / f"summary{today}.db"))
 
@@ -275,7 +277,7 @@ def _recent_liquidity_values(symbol: str, bars: int) -> dict[str, Any]:
     if not symbol or not Path(path).exists():
         return {"ok_read": False, "reason": "summary_db_missing", "summary_db": path, "table": table}
     try:
-        with sqlite3.connect(path, timeout=1.0) as conn:
+        with committing_connect(path, timeout=1.0) as conn:
             conn.execute("PRAGMA busy_timeout=1000")
             sym = _col(conn, table, ["symbol", "code", "stock_code"])
             tm = _col(conn, table, ["datetime", "dt", "timestamp", "time"])

@@ -17,6 +17,7 @@ import logging
 import sqlite3
 from pathlib import Path
 from typing import Literal
+from sqlite_cm import committing_connect
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +115,7 @@ def checkpoint_sqlite_wal(
     before = get_sqlite_wal_status(path)
 
     try:
-        with sqlite3.connect(str(path), timeout=float(timeout)) as conn:
+        with committing_connect(str(path), timeout=float(timeout)) as conn:
             conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
             conn.execute("PRAGMA synchronous=NORMAL")
             result = conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchall()

@@ -142,7 +142,7 @@ def _calc_from_snapshot(symbol: str) -> dict[str, Any]:
     if not db_path:
         return {}
     try:
-        with sqlite3.connect(str(db_path), timeout=1.0) as conn:
+        with committing_connect(str(db_path), timeout=1.0) as conn:
             cols = _table_columns(conn, table)
             sym_col = _first_existing(cols, _SYMBOL_COL_CANDIDATES)
             time_col = _first_existing(cols, _TIME_COL_CANDIDATES)
@@ -270,6 +270,7 @@ def _needs_high_low(entry_row: dict[str, Any]) -> bool:
 # ============================================================
 
 import sys  # noqa: E402
+from sqlite_cm import committing_connect
 
 _HL_DB_PROCESS_NAMES = (
     "main_database.py",

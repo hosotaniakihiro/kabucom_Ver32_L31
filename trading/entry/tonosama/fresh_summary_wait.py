@@ -212,7 +212,27 @@ def _patched_wait_fresh_push_summary_before_tonosama() -> bool:
     max_age = max(30.0, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_MAX_AGE_SEC", 180.0))
     wait_sec = max(0.0, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_WAIT_SEC", 15.0))
     poll = max(0.25, _env_float("TONOSAMA_WAIT_PUSH_SUMMARY_POLL_SEC", 1.0))
-    fail_open_empty = _env_bool("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY", True)
+    # ============================================================
+    # 追加P0-A: fresh summary が無いときに Tonosama body を呼ばない
+    # ------------------------------------------------------------
+    # 2026-08-28 のログ:
+    #   [TONOSAMA FRESH SUMMARY WAIT FIX] latest=None age=None rows=0 source=none
+    #   [TONOSAMA ENTRY SCHEDULE] fresh push summary unavailable
+    #       -> fail-open to Tonosama body
+    # その後は
+    #   [TONOSAMA SURGE] base 1m recent empty -> skip TONOSAMA for safety
+    # で偶然止まっていたが、**二段目の guard に依存してはいけない**。
+    #
+    # fresh summary が unavailable / stale / unknown なら
+    # schedule 入口で terminal skip する (fail-close)。
+    # 既定を False にするだけで、判定・閾値・待ち時間は一切変えない。
+    # 昼休み/市場外の既存判定 (_is_lunch_reopen_grace 等) はそのまま。
+    #
+    # 戻したい場合だけ
+    #   TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY=1
+    # を明示する。
+    # ============================================================
+    fail_open_empty = _env_bool("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY", False)
     deadline = time.perf_counter() + wait_sec
     last_age = None
     last_dt = None
@@ -258,6 +278,17 @@ def _patched_wait_fresh_push_summary_before_tonosama() -> bool:
                 rows,
             )
             return True
+
+        if latest is None and not fail_open_empty:
+            # 追加P0-A: fresh summary が取れないなら Tonosama body を呼ばない。
+            # ここで terminal skip するので TONOSAMA_ENTRY worker は起動せず、
+            # pending も作られない。
+            logger.warning(
+                "[TONOSAMA ENTRY SCHEDULE] fresh push summary unavailable latest=None rows=%s "
+                "-> fail-close (Tonosama body を呼ばない) patched=1 fail_open_empty=0",
+                rows,
+            )
+            return False
 
         if time.perf_counter() >= deadline:
             if last_dt is None and fail_open_empty:
@@ -495,7 +526,45 @@ def _apply() -> bool:
         _patched_wait_fresh_push_summary_before_tonosama._tonosama_fresh_summary_wait_fix_v3 = True  # type: ignore[attr-defined]
         setattr(tasks, "_latest_push_summary_age_sec", _patched_latest_push_summary_age_sec)
         setattr(tasks, "_wait_fresh_push_summary_before_tonosama", _patched_wait_fresh_push_summary_before_tonosama)
-        os.environ.setdefault("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY", "1")
+        # ============================================================
+        # 追加P0-1: fail_open_empty の owner をここ 1 か所にする
+        # ------------------------------------------------------------
+        # 第15ラウンドで _env_bool(..., False) に直したのに、
+        # 2026-08-28 15:23 の起動ログでは
+        #   [TONOSAMA FRESH SUMMARY WAIT FIX] fail_open_empty=1
+        # だった。原因は **この installer 自身が env を "1" に
+        # setdefault していた**こと。既定値を直しても env が
+        # 実際に設定されるので効かない。
+        #
+        # fresh summary が取れない状態で Tonosama body を呼ぶのは
+        # fail-open なので、owner をここに一本化して 0 を明示する。
+        # setdefault ではなく代入にして、起動順に依存させない。
+        #
+        # 運用で戻す場合だけ、プロセス起動前に外から
+        #   TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY=1
+        # を渡し、TONOSAMA_ALLOW_EXTERNAL_FAIL_OPEN=1 を併せて指定する。
+        # ============================================================
+        _allow_external = str(
+            os.environ.get("TONOSAMA_ALLOW_EXTERNAL_FAIL_OPEN", "") or ""
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
+        _prev_empty = os.environ.get("TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY")
+        if not _allow_external:
+            os.environ["TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_EMPTY"] = "0"
+            if _prev_empty not in (None, "", "0"):
+                logger.warning(
+                    "[TONOSAMA FRESH SUMMARY WAIT FIX] fail_open_empty を上書きした "
+                    "before=%r after=0 (fresh summary 無しで Tonosama body を呼ばない。"
+                    "owner は fresh_summary_wait.install 1 か所。"
+                    "戻すには TONOSAMA_ALLOW_EXTERNAL_FAIL_OPEN=1 が必要)",
+                    _prev_empty,
+                )
+        else:
+            logger.warning(
+                "[TONOSAMA FRESH SUMMARY WAIT FIX] fail_open_empty の外部指定を許可した "
+                "value=%r (TONOSAMA_ALLOW_EXTERNAL_FAIL_OPEN=1)。"
+                "fresh 無しで Tonosama body が呼ばれうる",
+                _prev_empty,
+            )
         os.environ["TONOSAMA_WAIT_PUSH_SUMMARY_FAIL_OPEN_IF_STALE"] = "0"
         os.environ.setdefault("TONOSAMA_SKIP_WAIT_OUTSIDE_MARKET_SESSION", "1")
         os.environ.setdefault("TONOSAMA_SKIP_STALE_DURING_LUNCH_REOPEN", "1")

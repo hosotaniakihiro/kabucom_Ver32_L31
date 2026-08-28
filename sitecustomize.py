@@ -33,9 +33,10 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
-BOOT_EVIDENCE_DIR = Path(r"\\192.168.0.22\AutoStockBuyAndSell\Logs\boot_evidence")
+BOOT_EVIDENCE_DIR = Path(nas_path(r"Logs\boot_evidence"))
 
 
 def _ensure_project_root() -> str:
@@ -179,10 +180,26 @@ def _install_module(module_name: str, label: str, *, disabled_env: str | None = 
             return
         _ensure_project_root()
         mod = __import__(module_name, fromlist=["install"])
-        fn = getattr(mod, "install", None)
-        ok = bool(fn()) if callable(fn) else False
-        _write_boot_evidence(f"{label}_INSTALL_DONE", {"ok": ok})
-        logger.warning("[SITECUSTOMIZE] %s auto install ok=%s", label, ok)
+
+        # 本文化済みのモジュールは install() を持たず、
+        # import 時に自己適用するものがある
+        # (例: trading.entry.tonosama.history_missing_guard は
+        #  apply_history_guard_defaults() を import 時に呼んでいる)。
+        # 旧実装はそれを一律に ok=False と報告しており、
+        # 「本当の install 失敗」と区別がつかなかった。
+        entry_name = str(getattr(mod, "SITECUSTOMIZE_INSTALL", "") or "install")
+        fn = getattr(mod, entry_name, None)
+        if callable(fn):
+            ok = bool(fn())
+            status = "ok" if ok else "install_returned_false"
+        else:
+            # エントリポイントなし = import 時自己適用型。
+            # import は成功しているので適用済みとして扱う
+            # (適用側で失敗した場合はそのモジュール自身が例外ログを出す)。
+            ok = True
+            status = "self_applied_on_import"
+        _write_boot_evidence(f"{label}_INSTALL_DONE", {"ok": ok, "status": status, "entry": entry_name})
+        logger.warning("[SITECUSTOMIZE] %s auto install ok=%s status=%s entry=%s", label, ok, status, entry_name)
     except Exception:
         _write_boot_evidence(f"{label}_EXCEPTION", traceback.format_exc())
         try:

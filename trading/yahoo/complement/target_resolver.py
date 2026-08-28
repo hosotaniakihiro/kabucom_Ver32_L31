@@ -13,6 +13,8 @@ import pandas as pd
 
 from trading.yahoo.download.download_runner import resolve_target_symbols
 from .logging_utils import log_step
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +43,8 @@ except Exception:
         return out
 
 
-DEFAULT_NAS_ROOT = r"\\192.168.0.22\AutoStockBuyAndSell"
-DEFAULT_RANKING_DIR = r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\ranking"
+DEFAULT_NAS_ROOT = nas_root()
+DEFAULT_RANKING_DIR = nas_path(r"raw_data\kabu_station\ranking")
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -189,7 +191,7 @@ def _read_current_ranking_snapshot_symbols(
     lookback = max(0, lookback)
 
     try:
-        with sqlite3.connect(db_path, timeout=30) as conn:
+        with committing_connect(db_path, timeout=30) as conn:
             conn.row_factory = sqlite3.Row
             try:
                 conn.execute("PRAGMA busy_timeout=30000")

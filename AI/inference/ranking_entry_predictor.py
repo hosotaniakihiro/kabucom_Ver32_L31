@@ -18,13 +18,79 @@ import joblib
 import numpy as np
 import logging
 import math
+import os
 
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------
 # model path
 # ------------------------------------------------------------
-MODEL_FILE = Path("AI/model/ranking_entry_lgbm.pkl")
+# 以前は Path("AI/model/ranking_entry_lgbm.pkl") という相対パスで、
+# cwd 依存だった。リポジトリルート基準の絶対パスへ解決する。
+# env RANKING_ENTRY_MODEL_PATH で明示指定できる。
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+MODEL_FILENAME = "ranking_entry_lgbm.pkl"
+
+
+def _model_path_candidates() -> list[Path]:
+    out: list[Path] = []
+    try:
+        env = os.getenv("RANKING_ENTRY_MODEL_PATH")
+        if env and str(env).strip():
+            out.append(Path(str(env).strip()))
+    except Exception:
+        logger.exception("[RANKING AI] RANKING_ENTRY_MODEL_PATH read failed")
+    for rel in (
+        Path("AI") / "model" / MODEL_FILENAME,
+        Path("AI") / "models" / MODEL_FILENAME,
+    ):
+        out.append(_REPO_ROOT / rel)
+        out.append(Path.cwd() / rel)
+    # 重複除去 (順序維持)
+    seen: set[str] = set()
+    uniq: list[Path] = []
+    for c in out:
+        k = str(c)
+        if k not in seen:
+            seen.add(k)
+            uniq.append(c)
+    return uniq
+
+
+def resolve_model_file() -> Path | None:
+    for c in _model_path_candidates():
+        try:
+            if c.exists():
+                return c
+        except Exception:
+            logger.exception("[RANKING AI] model path check failed path=%s", c)
+    return None
+
+
+_MISSING_LOGGED = False
+
+
+def model_available() -> bool:
+    """モデルが実在するか。無いことを 1 回だけログに残す。"""
+    global _MISSING_LOGGED
+    if _model is not None:
+        return True
+    found = resolve_model_file()
+    if found is not None:
+        return True
+    if not _MISSING_LOGGED:
+        _MISSING_LOGGED = True
+        logger.error(
+            "[RANKING AI] model=ABSENT ranking entry LGBM モデルが見つからない。"
+            " 以後この銘柄群の ranking AI 推論は行わず fail-open で通す "
+            "(confidence は AI 出力ではない)。探した場所=%s "
+            "env RANKING_ENTRY_MODEL_PATH で明示指定できる。",
+            [str(x) for x in _model_path_candidates()],
+        )
+    return False
+
+
+MODEL_FILE = resolve_model_file() or (_REPO_ROOT / "AI" / "model" / MODEL_FILENAME)
 
 # ------------------------------------------------------------
 # singleton
@@ -40,10 +106,14 @@ def _load_model():
     """
     global _model, _label_encoder
 
-    if not MODEL_FILE.exists():
-        raise FileNotFoundError(f"❌ ranking entry model not found: {MODEL_FILE}")
+    found = resolve_model_file()
+    if found is None:
+        raise FileNotFoundError(
+            "ranking entry model not found (model=ABSENT): %s"
+            % [str(x) for x in _model_path_candidates()]
+        )
 
-    obj = joblib.load(MODEL_FILE)
+    obj = joblib.load(found)
 
     _model = obj.get("model")
     _label_encoder = obj.get("label_encoder")
@@ -51,7 +121,7 @@ def _load_model():
     if _model is None or _label_encoder is None:
         raise ValueError("❌ invalid model file (missing model or label_encoder)")
 
-    logger.info("✅ ranking_entry_lgbm model loaded")
+    logger.info("✅ ranking_entry_lgbm model loaded path=%s", found)
 
 
 # ------------------------------------------------------------

@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 import pandas as pd
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ logger = logging.getLogger(__name__)
 # defaults
 # ============================================================
 
-DEFAULT_BASE_DIR = r"\\192.168.0.22\AutoStockBuyAndSell"
+DEFAULT_BASE_DIR = nas_root()
 DEFAULT_SUMMARY_DIR = os.path.join(
     DEFAULT_BASE_DIR,
     "raw_data",

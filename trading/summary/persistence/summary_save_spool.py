@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ except AttributeError:  # pragma: no cover - old Python compatibility
 def _spool_dir() -> Path:
     base = os.getenv(
         "SUMMARY_SAVE_SPOOL_DIR",
-        r"\\192.168.0.22\AutoStockBuyAndSell\runtime\summary_save_spool",
+        nas_path(r"runtime\summary_save_spool"),
     )
     p = Path(base)
     p.mkdir(parents=True, exist_ok=True)
@@ -54,7 +55,7 @@ def _spool_dir() -> Path:
 def _summary_db_dir() -> str:
     return os.getenv(
         "SUMMARY_DB_DIR",
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary",
+        nas_path(r"raw_data\kabu_station\summary"),
     )
 
 

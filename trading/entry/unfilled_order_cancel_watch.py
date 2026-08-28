@@ -163,6 +163,25 @@ def _release_entry_inflight(symbol: str) -> None:
         pass
 
 
+def _notify_unfilled_cancelled(symbol: str, order_id: str) -> None:
+    """未約定キャンセル完了を SUMMARY 再queue 機構へ通知する。
+
+    失敗してもキャンセル処理本体には影響させない。
+    """
+    try:
+        from trading.handlers.entry_retry_rotation import on_unfilled_order_cancelled
+
+        requeued = on_unfilled_order_cancelled(symbol, order_id)
+        if requeued:
+            logger.warning(
+                "[ENTRY CANCEL WATCH] summary retry requeued symbol=%s order_id=%s",
+                symbol,
+                order_id,
+            )
+    except Exception:
+        logger.debug("[ENTRY CANCEL WATCH] summary retry notify failed symbol=%s order_id=%s", symbol, order_id, exc_info=True)
+
+
 def schedule_cancel_unfilled_entry_order(
     *,
     symbol: str,
@@ -241,6 +260,9 @@ def schedule_cancel_unfilled_entry_order(
             _release_entry_inflight(sym)
 
             if ok:
+                # キャンセルできた SUMMARY_AI 注文は pending へ戻して再挑戦させる。
+                # (on_unfilled_order_cancelled 側で enable/記憶有無/上限回数を判定する)
+                _notify_unfilled_cancelled(sym, oid)
                 logger.warning(
                     "[ENTRY CANCEL WATCH] canceled unfilled entry order symbol=%s side=%s order_id=%s wait=%.1fs",
                     sym,

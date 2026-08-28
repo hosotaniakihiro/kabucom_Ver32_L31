@@ -116,7 +116,6 @@ from trading.summary.realtime_engine import init_realtime_engine, process_realti
 from trading.handlers.exit_handler import build_5s_bar_fast, run_exit_pipeline
 from force_cancel_loop import start_force_cancel_loop
 from test_script.test_force_exit import run_force_exit_test
-from trading.positions.position_sync import PositionSyncManager
 from ats.ats_register import ats_register_loop, show_should_register_symbols
 from utils.business_day_utils import is_market_open
 from core.runtime.stream_orchestrator import StreamOrchestrator
@@ -205,6 +204,42 @@ def _install_main_runtime_patches():
         しきい値 env の既定値。旧パッチの install() 冒頭で毎回実行されていたので、
         patches リストの処理直前という同じ位置で適用する。
         """
+        # ============================================================
+        # P0-3 settings owner 一本化
+        # ------------------------------------------------------------
+        # ここは以前、閾値の「緩い」既定値を setdefault していた:
+        #   SUMMARY_AI_MIN_BUY=1.00 / MIN_CONF=0.55 / MIN_COMPOSITE_SCORE_BUY=0.50
+        # その後 strict_entry_defaults.STRICT_ENV が
+        #   3.00 / 0.60 / 3.00
+        # へ上書きするため、起動ログ上は
+        #   1.0/0.55 -> 3.0/0.60
+        # と閾値が動いて見えていた (2026-08-28 15:23 起動でも再現)。
+        #
+        # core/startup/startup.py の SETTINGS SOURCE OF TRUTH 表でも
+        # これらの owner は strict_entry_defaults.STRICT_ENV と宣言されている。
+        # つまりここは **二重の owner** であり、
+        # 起動順によっては緩い値が読まれうる (fail-open 側)。
+        #
+        # 閾値の owner は strict_entry_defaults 1 か所にする。
+        # ここでは閾値系 env を一切設定しない。
+        # 閾値そのものは変更していない (最終値は従来どおり STRICT の値)。
+        #
+        # どうしても旧挙動へ戻す場合だけ
+        #   SUMMARY_AI_THRESHOLD_LEGACY_SEED=1
+        # を指定する。
+        # ============================================================
+        legacy = str(
+            os.environ.get("SUMMARY_AI_THRESHOLD_LEGACY_SEED", "") or ""
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
+        if not legacy:
+            logger.warning(
+                "[SUMMARY AI THRESHOLD ENV PATCH] skipped: 閾値 env は "
+                "strict_entry_defaults.STRICT_ENV が唯一の owner。"
+                "ここでは設定しない (起動順で閾値が変わらないようにするため)。"
+                "旧挙動は SUMMARY_AI_THRESHOLD_LEGACY_SEED=1"
+            )
+            return
+
         defaults = {
             "SUMMARY_AI_MIN_BUY": "1.00",
             "SUMMARY_AI_MIN_SELL": "1.00",
@@ -219,7 +254,9 @@ def _install_main_runtime_patches():
         }
         for k, v in defaults.items():
             os.environ.setdefault(k, v)
-        logger.warning("[SUMMARY AI THRESHOLD ENV PATCH] installed %s", defaults)
+        logger.warning(
+            "[SUMMARY AI THRESHOLD ENV PATCH] installed (LEGACY SEED) %s", defaults
+        )
 
     _apply_summary_ai_threshold_env()
 
@@ -471,14 +508,70 @@ def _register_exit_scheduler():
                     return True
             except Exception:
                 pass
+        # P0-8: Exit の owner は一系統にする。
+        # exit_bootstrap の exit_loop_5s (5 秒ごと) が実働しており
+        # (実測 424 回正常完走)、ここで run_exit_pipeline を 1 秒ごとに
+        # 登録すると **2 系統が同時に返済注文を出す**ことになる。
+        # 既定では登録しない。切り替えたい場合だけ env で明示する。
+        _owner = (os.getenv("EXIT_PIPELINE_OWNER") or "exit_loop_5s").strip().lower()
+        if _owner != "run_exit_pipeline":
+            logger.warning(
+                "[EXIT SCHEDULER] run_exit_pipeline は登録しない owner=%s "
+                "(exit_bootstrap の exit_loop_5s が Exit owner。"
+                "二重に返済注文を出さないため。"
+                "EXIT_PIPELINE_OWNER=run_exit_pipeline で切り替え可能だが "
+                "その場合は exit_loop_5s 側を止めること)",
+                _owner,
+            )
+            heartbeat("exit_scheduler", status="OK",
+                      detail={"registered": False, "owner": _owner})
+            _audit_exit_owners(_owner)
+            return True
+
         schedule.every(1).seconds.do(run_exit_pipeline)
-        logger.warning("[EXIT SCHEDULER] run_exit_pipeline registered every 1s")
-        heartbeat("exit_scheduler", status="OK", detail={"registered_every_sec": 1})
+        logger.warning("[EXIT SCHEDULER] run_exit_pipeline registered every 1s owner=%s", _owner)
+        heartbeat("exit_scheduler", status="OK", detail={"registered_every_sec": 1, "owner": _owner})
+        _audit_exit_owners(_owner)
         return True
     except Exception:
         heartbeat("exit_scheduler", status="ERROR")
         logger.exception("[EXIT SCHEDULER] register failed")
         return False
+
+
+def _audit_exit_owners(owner: str) -> int:
+    """P0-13: EXIT を駆動しているジョブを列挙し、owner が 1 系統か確認する。
+
+    positions DB 障害時に 2 系統が同じ DB へ重複 SELECT を投げないよう、
+    Exit の scheduler owner は必ず 1 本にする。
+    次回ログでそのまま検証できるように、実際の登録内容を出す。
+    """
+    try:
+        exit_jobs = []
+        for job in list(schedule.jobs):
+            try:
+                fn = getattr(job, "job_func", None)
+                fname = getattr(getattr(fn, "func", fn), "__name__", str(fn))
+                tags = sorted(str(t) for t in (getattr(job, "tags", None) or set()))
+                if "exit" in tags or "exit" in fname.lower():
+                    exit_jobs.append({"func": fname, "tags": tags, "interval": str(job)})
+            except Exception:
+                logger.debug("[EXIT SCHEDULER] job audit skip", exc_info=True)
+
+        n = len(exit_jobs)
+        log = logger.warning if n == 1 else logger.error
+        log(
+            "[EXIT OWNER AUDIT] exit_scheduler_owner_count=%d owner=%s jobs=%s "
+            "(完成条件5: Exit scheduler owner = 1)",
+            n, owner, exit_jobs,
+        )
+        heartbeat("exit_owner_audit",
+                  status="OK" if n == 1 else "NG",
+                  detail={"count": n, "owner": owner})
+        return n
+    except Exception:
+        logger.exception("[EXIT OWNER AUDIT] failed")
+        return -1
 
 
 def _resolve_push_refresh_callable():
@@ -587,6 +680,19 @@ def main():
     logger.warning("[MAIN] start")
     mark_component_start("main")
     try:
+        # P0-6: 資源スナップショットを最初に立ち上げる。
+        # 2026-08-27 の disk I/O error は positions.db 固有の問題ではなく、
+        # プロセス全体のハンドル枯渇の症状だった
+        # (15:21:44 に push DB と positions.db が同時に CANTOPEN、
+        #  15:30:37 にローカルパスで Errno 24 Too many open files)。
+        # 次からは推測せずに handles / open_files / pool / thread で特定する。
+        try:
+            from core.diagnostics.resource_monitor import start_resource_monitor
+
+            start_resource_monitor()
+        except Exception:
+            logger.exception("resource monitor start failed")
+
         _install_main_runtime_patches()
         _install_summary_entry_runtime_context()
         system_startup()
@@ -607,10 +713,12 @@ def main():
             init_realtime_engine()
         except Exception:
             logger.exception("init_realtime_engine failed")
-        try:
-            PositionSyncManager().start()
-        except Exception:
-            logger.exception("PositionSyncManager start failed")
+        # PositionSyncManager は start() を持たない未完成クラスで、毎起動
+        # AttributeError を出していただけだった (maybe_sync/on_ws_reconnect も
+        # 呼び出し元なし)。建玉の broker 再同期は
+        # trading/position/open_position_sync.py の
+        # broker_credit_authoritative 経路が source of truth なので、
+        # 二重の position ポーラを復活させず呼び出しを削除する。
         try:
             Thread(target=ats_register_loop, daemon=True).start()
         except Exception:

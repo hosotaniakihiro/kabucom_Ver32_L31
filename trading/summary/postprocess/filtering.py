@@ -57,6 +57,8 @@ from .normalize import (
     pick_series,
     safe_series,
 )
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -477,8 +479,8 @@ def load_allowed_symbol_universe() -> set[str]:
         logger.debug("[POST.FILTER] market_filter universe load failed", exc_info=True)
 
     db_candidates = [
-        r"\\192.168.0.22\AutoStockBuyAndSell\Basic\symbol_flags.db",
-        r"\\192.168.0.22\AutoStockBuyAndSell\basic\symbol_flags.db",
+        nas_path(r"Basic\symbol_flags.db"),
+        nas_path(r"basic\symbol_flags.db"),
     ]
 
     sql = """
@@ -490,7 +492,7 @@ def load_allowed_symbol_universe() -> set[str]:
     for db_path in db_candidates:
         try:
             import sqlite3
-            with sqlite3.connect(db_path, timeout=15) as conn:
+            with committing_connect(db_path, timeout=15) as conn:
                 flags = pd.read_sql(sql, conn)
 
             if flags.empty or "symbol" not in flags.columns:

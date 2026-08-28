@@ -289,6 +289,61 @@ def _wait_while_rotation_registering() -> None:
         time.sleep(0.1)
 
 
+# ============================================================
+# 再接続バックオフの状態 (R17)
+# ============================================================
+
+_RECONNECT_CONSECUTIVE = 0
+_RECONNECT_TOTAL = 0
+
+
+def reconnect_stats() -> dict:
+    """WS 再接続の状況。storm 判定用。"""
+    return {
+        "consecutive_fast_deaths": _RECONNECT_CONSECUTIVE,
+        "total_reconnects": _RECONNECT_TOTAL,
+        "base_sec": _env_float("PUSH_STREAM_RECONNECT_BACKOFF_BASE_SEC", RECONNECT_WAIT_SEC),
+        "max_sec": _env_float("PUSH_STREAM_RECONNECT_BACKOFF_MAX_SEC", 30.0),
+        "min_healthy_sec": _env_float("PUSH_STREAM_WS_MIN_HEALTHY_SEC", 60.0),
+    }
+
+
+def reset_reconnect_stats_for_test() -> None:
+    global _RECONNECT_CONSECUTIVE, _RECONNECT_TOTAL
+    _RECONNECT_CONSECUTIVE = 0
+    _RECONNECT_TOTAL = 0
+
+
+def _note_disconnect_and_wait(
+    uptime: float,
+    *,
+    base: float,
+    max_wait: float,
+    min_healthy: float,
+) -> Tuple[float, str]:
+    """切断を記録し、次の再接続までの待機秒数を返す。
+
+    uptime >= min_healthy なら「正常な切断」として連続失敗を 0 に戻すので、
+    通常の切断からの復帰は base 秒のまま (= 遅くしない)。
+    即死が続くときだけ指数的に待つ。
+    """
+    global _RECONNECT_CONSECUTIVE, _RECONNECT_TOTAL
+
+    _RECONNECT_TOTAL += 1
+    if uptime >= min_healthy:
+        _RECONNECT_CONSECUTIVE = 0
+        verdict = "healthy_disconnect"
+    else:
+        _RECONNECT_CONSECUTIVE += 1
+        verdict = "fast_death"
+
+    if _RECONNECT_CONSECUTIVE <= 1:
+        wait_sec = base
+    else:
+        wait_sec = min(max_wait, base * (2.0 ** (_RECONNECT_CONSECUTIVE - 1)))
+    return float(wait_sec), verdict
+
+
 def _run_forever_loop() -> None:
     _safe_set_runtime("push_stream_running", True)
     ws_url = _resolve_ws_url()
@@ -301,6 +356,8 @@ def _run_forever_loop() -> None:
     )
 
     while not state._stop_event.is_set():
+        # 反復ごとに必ず初期化する (前回の値が残ると uptime を過大評価する)
+        _conn_started = time.monotonic()
         _wait_while_rotation_registering()
         try:
             _safe_set_runtime("push_ws_url", ws_url)
@@ -323,6 +380,7 @@ def _run_forever_loop() -> None:
                 callable(on_close),
             )
 
+            _conn_started = time.monotonic()
             _run_vendor_forever(ws_app)
 
         except Exception:
@@ -337,11 +395,62 @@ def _run_forever_loop() -> None:
         if state._stop_event.is_set():
             break
 
+        # ------------------------------------------------------------
+        # 再接続バックオフ (R17)
+        #
+        # 旧実装:
+        #     base     = max(0.1, env(BACKOFF_BASE_SEC, 0.5))
+        #     max_wait = max(base, env(BACKOFF_MAX_SEC, base))
+        #     wait_sec = min(max_wait, base)      # <- 常に base
+        # max_wait >= base なので min(max_wait, base) は必ず base になり、
+        # 名前に反して **バックオフしていなかった**。
+        # 失敗回数も数えていないため、接続が即死する状況では
+        # 0.5 秒間隔で永久に再接続を撃ち続ける。
+        # 2026-08-28 の実測では 84 分で 833 回 (9.9 回/分)、
+        # すべて code=None msg=None だった。
+        #
+        # 新実装:
+        #   - 直前の接続が min_healthy 秒もったら「正常な切断」とみなし
+        #     連続失敗カウンタを 0 に戻す -> 従来どおり base 秒で再接続。
+        #     (通常の切断からの復帰は遅くしない = timeout 延長ではない)
+        #   - 即死が続く場合だけ指数バックオフし、NAS/API を叩き続けない。
+        #   - 何秒もったか・連続何回目かをログに残し、次回ログで
+        #     サーバ側の弾き (別セッションが購読を奪った等) を判定できるようにする。
+        # ------------------------------------------------------------
         base = max(0.1, _env_float("PUSH_STREAM_RECONNECT_BACKOFF_BASE_SEC", RECONNECT_WAIT_SEC))
-        max_wait = max(base, _env_float("PUSH_STREAM_RECONNECT_BACKOFF_MAX_SEC", base))
-        wait_sec = min(max_wait, base)
-        logger.warning("[push_stream] reconnect after %.1fs vendor_ws=%s", wait_sec, _env_bool("PUSH_WS_VENDOR_RUN_FOREVER", True))
-        time.sleep(wait_sec)
+        max_wait = max(base, _env_float("PUSH_STREAM_RECONNECT_BACKOFF_MAX_SEC", 30.0))
+        min_healthy = max(0.0, _env_float("PUSH_STREAM_WS_MIN_HEALTHY_SEC", 60.0))
+
+        uptime = -1.0
+        try:
+            uptime = time.monotonic() - _conn_started
+        except Exception:
+            uptime = -1.0
+
+        wait_sec, verdict = _note_disconnect_and_wait(
+            uptime, base=base, max_wait=max_wait, min_healthy=min_healthy,
+        )
+
+        logger.warning(
+            "[push_stream] reconnect after %.1fs uptime=%.1fs verdict=%s "
+            "consecutive=%d total=%d base=%.1fs max=%.1fs min_healthy=%.0fs vendor_ws=%s "
+            "(即死が続く場合のみ指数バックオフ。正常切断は %.1fs で復帰)",
+            wait_sec, uptime, verdict,
+            _RECONNECT_CONSECUTIVE, _RECONNECT_TOTAL,
+            base, max_wait, min_healthy,
+            _env_bool("PUSH_WS_VENDOR_RUN_FOREVER", True),
+            base,
+        )
+        if _RECONNECT_CONSECUTIVE >= 5:
+            logger.error(
+                "[push_stream][WS RECONNECT STORM] 接続が %d 回連続で %.0f 秒未満で切れている。"
+                "サーバ側で弾かれている可能性が高い (別セッションが PUSH 購読を奪った / "
+                "認証失効 / 多重 websocket)。次の待機は %.1fs",
+                _RECONNECT_CONSECUTIVE, min_healthy, wait_sec,
+            )
+
+        if state._stop_event.wait(wait_sec):
+            break
 
     _safe_set_runtime("push_stream_running", False)
     logger.info("[push_stream] run loop stopped")

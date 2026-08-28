@@ -31,10 +31,12 @@ import logging
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
-SYMBOL_FLAGS_DB_PATH = Path(r"\\192.168.0.22\AutoStockBuyAndSell\Basic\symbol_flags.db")
+SYMBOL_FLAGS_DB_PATH = Path(nas_path(r"Basic\symbol_flags.db"))
 SYMBOL_FLAGS_TABLE = "symbol_flags"
 
 _TRUE_VALUES = {True, 1, "1", "true", "True", "TRUE", "yes", "Yes", "YES", "可能", "可"}
@@ -86,7 +88,7 @@ def load_symbol_flags_from_db(
     if not path.exists():
         raise FileNotFoundError(str(path))
 
-    with sqlite3.connect(str(path), timeout=5.0) as conn:
+    with committing_connect(str(path), timeout=5.0) as conn:
         conn.row_factory = None
         info = conn.execute(f"PRAGMA table_info({table})").fetchall()
         columns = [str(r[1]) for r in info]

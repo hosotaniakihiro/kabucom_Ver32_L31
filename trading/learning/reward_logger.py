@@ -14,6 +14,7 @@ import sqlite3
 import datetime as dt
 import threading
 import logging
+from sqlite_cm import committing_connect
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,7 @@ class RewardLogger:
         self._init_db()
 
     def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
+        with committing_connect(self.db_path) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS reward_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,7 +44,7 @@ class RewardLogger:
     def log(self, symbol: str, regime: str, cluster: str, reward: float):
         try:
             with self._lock:
-                with sqlite3.connect(self.db_path) as conn:
+                with committing_connect(self.db_path) as conn:
                     conn.execute(
                         "INSERT INTO reward_log VALUES (NULL,?,?,?,?,?)",
                         (

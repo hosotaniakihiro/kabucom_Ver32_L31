@@ -14,6 +14,7 @@ import sqlite3
 import logging
 from pathlib import Path
 from typing import Optional
+from sqlite_cm import committing_connect
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +84,7 @@ def update_entry_result(
         return
 
     try:
-        with sqlite3.connect(DB_FILE) as con:
+        with committing_connect(DB_FILE) as con:
             con.row_factory = sqlite3.Row
             cur = con.cursor()
 

@@ -22,11 +22,13 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence, Tuple
 
+import numpy as np
 import pandas as pd
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_NAS_ROOT = r"\\192.168.0.22\AutoStockBuyAndSell"
+DEFAULT_NAS_ROOT = nas_root()
 TABLE_CANDIDATES = ("ranking_snapshot_1min", "ranking_raw_1min", "ranking")
 
 GAINER_TOP_N = 50
@@ -223,6 +225,34 @@ def _normalize_df(df: pd.DataFrame, *, table_name: str = "") -> pd.DataFrame:
     return out
 
 
+def _align_all_na_dtypes_for_concat(frames: list) -> list:
+    """concat 前に all-NA 列の dtype を揃える。
+
+    trading/push/push_stream/dataframe._align_all_na_dtypes() の考え方を
+    複数フレーム向けに一般化したもの。
+
+    - object dtype の全 NA 列を float64 へ明示する (実測でこれだけで警告が消える)
+    - int64/bool 列は NaN を入れられないので触らない
+    - float64 は pandas が将来この連結で採用する型そのもの
+    値は全て NA のままなので、結果の値と列集合は変わらない。
+    """
+    out = []
+    for f in frames:
+        try:
+            cast = {}
+            for c in f.columns:
+                col = f[c]
+                # object dtype の全 NA 列だけを float64 へ。
+                # int64/bool 列を astype しようとすると NaN が入らず例外になるので触らない。
+                if col.dtype == object and col.isna().all():
+                    cast[c] = "float64"
+            out.append(f.astype(cast) if cast else f)
+        except Exception:
+            logger.debug("[PUSH RANKING SELECTOR] all-NA dtype align failed for one frame", exc_info=True)
+            out.append(f)
+    return out
+
+
 def _load_ranking_df_core(*, db_path: Optional[str | os.PathLike] = None, yyyymmdd: Any = None) -> pd.DataFrame:
     path = _resolve_ranking_db_path(db_path=db_path, yyyymmdd=yyyymmdd)
     if not path:
@@ -248,9 +278,17 @@ def _load_ranking_df_core(*, db_path: Optional[str | os.PathLike] = None, yyyymm
             ndf["_source_table"] = table
             frames.append(ndf)
             logger.info("[PUSH RANKING SELECTOR] loaded table=%s rows=%d path=%s", table, len(ndf), path)
+        # 全 NA のフレームを含むと
+        #   FutureWarning: The behavior of DataFrame concatenation with empty or all-NA entries
+        # になる。使えるデータが無いフレームだけ除く (情報は落ちない)。
+        frames = [f for f in frames if isinstance(f, pd.DataFrame) and not f.empty and not f.isna().all().all()]
         if not frames:
             logger.warning("[PUSH RANKING SELECTOR] no usable ranking tables path=%s tables=%s", path, tables)
             return pd.DataFrame()
+        # ranking テーブルごとに来る列が違うため、あるフレームでだけ
+        # 全 NA になる列ができる。そのまま concat すると dtype 判定が
+        # 将来変わるため、先に dtype を明示しておく。
+        frames = _align_all_na_dtypes_for_concat(frames)
         all_df = pd.concat(frames, ignore_index=True, sort=False)
         all_df = all_df[all_df["symbol"].astype(str).str.len() > 0].copy()
         logger.info("[PUSH RANKING SELECTOR] loaded total rows=%d symbols=%d path=%s", len(all_df), all_df["symbol"].nunique(), path)

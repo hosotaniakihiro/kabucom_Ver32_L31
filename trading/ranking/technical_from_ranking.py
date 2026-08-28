@@ -34,6 +34,7 @@ from typing import Iterable, Optional
 
 import numpy as np
 import pandas as pd
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,7 @@ logger = logging.getLogger(__name__)
 # Default paths
 # ============================================================
 
-DEFAULT_BASE_DIR = r"\\192.168.0.22\AutoStockBuyAndSell"
+DEFAULT_BASE_DIR = nas_root()
 DEFAULT_RANKING_DIR = os.path.join(
     DEFAULT_BASE_DIR,
     "raw_data",

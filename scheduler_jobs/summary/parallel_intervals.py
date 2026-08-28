@@ -60,27 +60,144 @@ _BG_RUNNING_KEYS: set[str] = set()
 # WAL チェックポイントが PASSIVE で skip busy を繰り返して WAL が 373MB まで伸び、
 # SMB 越しの読み取りが "file is not a database" を 142 件出す連鎖になっていた。
 # 同じ (source, interval) のジョブが走っている間は次を投げない。
-_INFLIGHT: dict[tuple[str, int], float] = {}
+class _InflightEntry:
+    """1 つの (source, interval) ジョブの実体を追跡する。
+
+    token は acquire ごとに一意。古いワーカーの finally が
+    新しい世代の登録を消さないようにするために使う。
+    """
+
+    __slots__ = ("token", "started_ts", "started_at", "owner", "future", "thread",
+                 "ctx", "cancel_requested")
+
+    def __init__(self, token: int, started_ts: float, started_at: Any, owner: str) -> None:
+        self.token = token
+        self.started_ts = started_ts
+        self.started_at = started_at
+        self.owner = owner
+        self.future: Any = None
+        self.thread: Any = None
+        # P0-1: stage_tracker の WorkerCtx。これを通じて worker へ cancel を届ける。
+        self.ctx: Any = None
+        self.cancel_requested = False
 
 
-def _inflight_try_acquire(source: str, interval: int, now_ts: float) -> bool:
+_INFLIGHT: dict[tuple[str, int], "_InflightEntry"] = {}
+_INFLIGHT_SEQ = 0
+
+
+def _inflight_try_acquire(source: str, interval: int, now_ts: float, *, owner: str = "") -> int | None:
+    """取得できたら token を返す。すでに実行中なら None。"""
+    global _INFLIGHT_SEQ
     key = (str(source), int(interval))
+    # _now_naive() は内部で import するのでロック内では呼ばない。
+    # (import ロックと _RUNNING_LOCK の獲得順が逆転しうる)
+    started_at = _now_naive()
     with _RUNNING_LOCK:
         if key in _INFLIGHT:
-            return False
-        _INFLIGHT[key] = now_ts
-        return True
+            return None
+        _INFLIGHT_SEQ += 1
+        token = _INFLIGHT_SEQ
+        _INFLIGHT[key] = _InflightEntry(token, now_ts, started_at, owner)
+        return token
 
 
-def _inflight_release(source: str, interval: int) -> None:
+def _inflight_attach_future(source: str, interval: int, token: int, future: Any) -> None:
+    key = (str(source), int(interval))
     with _RUNNING_LOCK:
-        _INFLIGHT.pop((str(source), int(interval)), None)
+        e = _INFLIGHT.get(key)
+        if e is not None and e.token == token:
+            e.future = future
+
+
+def _inflight_mark_thread(source: str, interval: int, token: int) -> None:
+    """ワーカーが実際に走り始めたことを記録する。"""
+    key = (str(source), int(interval))
+    with _RUNNING_LOCK:
+        e = _INFLIGHT.get(key)
+        if e is not None and e.token == token:
+            e.thread = threading.current_thread()
+
+
+def _inflight_attach_ctx(source: str, interval: int, token: int | None, ctx: Any) -> None:
+    """ワーカーの stage_tracker ctx を登録する (P0-1)。
+
+    これがあると parent 側から「降りろ」を届けられる。
+    """
+    if token is None or ctx is None:
+        return
+    key = (str(source), int(interval))
+    with _RUNNING_LOCK:
+        e = _INFLIGHT.get(key)
+        if e is not None and e.token == token:
+            e.ctx = ctx
+
+
+def _inflight_request_cancel(source: str, interval: int, *, reason: str,
+                             generation: Any = None) -> bool:
+    """走っているワーカーへ協調キャンセルを要求する (P0-1)。
+
+    Thread は殺さない。ワーカーが次のチェックポイントで自分から return する。
+    scheduler の登録だけ消してワーカーを放置するのは禁止なので、
+    「回収」ではなく「本人に降りてもらう」形にする。
+    """
+    key = (str(source), int(interval))
+    with _RUNNING_LOCK:
+        e = _INFLIGHT.get(key)
+        if e is None:
+            return False
+        if generation is not None and e.token != generation:
+            return False
+        ctx = e.ctx
+        already = e.cancel_requested
+        e.cancel_requested = True
+        token = e.token
+        owner = e.owner
+        age = time.time() - e.started_ts
+
+    if ctx is None:
+        logger.warning(
+            "[SUMMARY PARALLEL CANCEL] no ctx to cancel key=%s:%s generation=%s owner=%s "
+            "age=%.1fs reason=%s (worker は stage_tracker を持っていない)",
+            source, interval, token, owner, age, reason,
+        )
+        return False
+
+    _st = _stage_tracker()
+    if _st is None:
+        return False
+    try:
+        _st.cancel(ctx, reason=reason)
+    except Exception:
+        logger.debug("[SUMMARY PARALLEL CANCEL] cancel failed key=%s:%s", source, interval, exc_info=True)
+        return False
+    logger.warning(
+        "[SUMMARY PARALLEL CANCEL] requested key=%s:%s generation=%s owner=%s age=%.1fs "
+        "reason=%s already=%s (協調キャンセル; Thread は殺さない)",
+        source, interval, token, owner, age, reason, already,
+    )
+    return True
+
+
+def _inflight_release(source: str, interval: int, token: int | None = None) -> None:
+    """token 一致時のみ解放する。
+
+    token=None は acquire していない呼び出し元なので何もしない。
+    これがないと、古いワーカーの finally が新しい世代の登録を消してしまう。
+    """
+    if token is None:
+        return
+    key = (str(source), int(interval))
+    with _RUNNING_LOCK:
+        e = _INFLIGHT.get(key)
+        if e is not None and e.token == token:
+            _INFLIGHT.pop(key, None)
 
 
 def _inflight_age(source: str, interval: int, now_ts: float) -> float:
     with _RUNNING_LOCK:
-        started = _INFLIGHT.get((str(source), int(interval)))
-    return (now_ts - started) if started else 0.0
+        e = _INFLIGHT.get((str(source), int(interval)))
+    return (now_ts - e.started_ts) if e is not None else 0.0
 
 
 def inflight_snapshot() -> dict[str, float]:
@@ -89,7 +206,115 @@ def inflight_snapshot() -> dict[str, float]:
 
     now = _t.perf_counter()
     with _RUNNING_LOCK:
-        return {"%s:%s" % (s, i): round(now - t0, 1) for (s, i), t0 in _INFLIGHT.items()}
+        return {"%s:%s" % (s, i): round(now - e.started_ts, 1) for (s, i), e in _INFLIGHT.items()}
+
+
+def _inflight_diagnose(source: str, interval: int, now_ts: float) -> dict[str, Any]:
+    """実体 (future / thread) の状態を返す。
+
+    「worker がまだ生きている」「future だけ残っている」
+    「登録だけ残っている」を区別するための情報を全部載せる。
+    """
+    key = (str(source), int(interval))
+    with _RUNNING_LOCK:
+        e = _INFLIGHT.get(key)
+        if e is None:
+            return {"key": "%s:%s" % key, "state": "absent"}
+        fut = e.future
+        th = e.thread
+        info: dict[str, Any] = {
+            "key": "%s:%s" % key,
+            "generation": e.token,
+            "owner": e.owner,
+            "started_at": str(e.started_at),
+            "age": round(now_ts - e.started_ts, 1),
+            "cancel_requested": bool(e.cancel_requested),
+        }
+        ctx = e.ctx
+
+    # future / thread の問い合わせはロック外で行う
+    if fut is None:
+        info.update({"future": "not_submitted", "done": None, "running": None, "cancelled": None})
+    else:
+        try:
+            info.update({
+                "future": "attached",
+                "done": bool(fut.done()),
+                "running": bool(fut.running()),
+                "cancelled": bool(fut.cancelled()),
+            })
+        except Exception:
+            info.update({"future": "query_failed", "done": None, "running": None, "cancelled": None})
+
+    if th is None:
+        info.update({"thread": None, "thread_alive": None})
+    else:
+        try:
+            info.update({"thread": th.name, "thread_alive": bool(th.is_alive())})
+        except Exception:
+            info.update({"thread": "query_failed", "thread_alive": None})
+
+    # P0-1: どのステージに居るのかを診断に出す。
+    if ctx is not None:
+        try:
+            info.update({
+                "stages": ",".join("%s=%.2f" % (n, s) for n, s in getattr(ctx, "stages", [])) or "-",
+                "ctx_cancelled": bool(ctx.cancel.is_set()),
+                "stopped_reason": getattr(ctx, "stopped_reason", None),
+                "elapsed": round(getattr(ctx, "elapsed", 0.0), 1),
+            })
+        except Exception:
+            logger.debug("[SUMMARY PARALLEL] ctx snapshot failed", exc_info=True)
+
+    return info
+
+
+def _inflight_stale_reclaim_sec() -> float:
+    """この秒数を超えた登録は実体を確認して回収を検討する。"""
+    base = _env_float("SUMMARY_PARALLEL_INTERVAL_TIMEOUT_SEC", 25.0)
+    return max(30.0, _env_float("SUMMARY_PARALLEL_INFLIGHT_STALE_SEC", base * 2.0))
+
+
+def _inflight_try_reclaim(source: str, interval: int, info: dict[str, Any]) -> str | None:
+    """実体が死んでいる登録だけ回収する。戻り値は回収理由 (しなければ None)。
+
+    ワーカーが本当に走っている間は絶対に回収しない。
+    同じジョブを二重起動しないための一線。
+    """
+    if info.get("state") == "absent":
+        return None
+
+    age = float(info.get("age") or 0.0)
+    stale_sec = _inflight_stale_reclaim_sec()
+    reason = None
+
+    if info.get("cancelled"):
+        reason = "future_cancelled"
+    elif info.get("done"):
+        reason = "future_done_but_not_released"
+    elif (info.get("future") == "not_submitted" and age >= stale_sec
+          and not info.get("thread_alive")):
+        # thread_alive の確認を必ず入れる。future の attach に失敗しただけで
+        # ワーカー本体は走っている、という状態で回収すると二重起動になる。
+        reason = "never_submitted"
+    elif (info.get("running") is False and info.get("done") is False and age >= stale_sec
+          and not info.get("thread_alive")):
+        # queue に残ったまま executor が差し替えられた等。走っていないので回収してよい。
+        reason = "queued_but_executor_gone"
+    elif info.get("thread_alive") is False and age >= stale_sec:
+        reason = "worker_thread_dead"
+
+    if reason is None:
+        return None
+
+    key = (str(source), int(interval))
+    with _RUNNING_LOCK:
+        e = _INFLIGHT.get(key)
+        if e is None or e.token != info.get("generation"):
+            # 別世代に入れ替わっていたら触らない
+            return None
+        _INFLIGHT.pop(key, None)
+    return reason
 
 
 def _skip_when_busy_enabled() -> bool:
@@ -343,15 +568,90 @@ def _split_push_wait_and_bg_core(push_targets: list[int], *, in_session: bool) -
     return targets, []
 
 
-def _job_one_source(*, source: str, interval: int, now: dt.datetime, display: bool, run_entry: bool) -> tuple[str, int, pd.DataFrame]:
-    t0 = time.perf_counter()
+def _publish_skipped_long_targets(push_targets, wait_push_targets, bg_push_targets, *, now) -> None:
+    """wait にも bg にも入らなかった長足 (3/5) を summary DB から publish する。
+
+    main.py は長足を自分で計算しない方針なので、計算済みのものを
+    データ側 (main_database が書いた summaryYYYYMMDD.db) から読む。
+    黙って捨てると merged tf=3 / tf=5 が rows=0 のままになる。
+    """
     try:
-        return _job_one_source_core(
-            source=source, interval=interval, now=now, display=display, run_entry=run_entry, t0=t0
+        handled = {int(x) for x in (list(wait_push_targets or []) + list(bg_push_targets or []))}
+        dropped = sorted({int(x) for x in (push_targets or []) if int(x) in (3, 5)} - handled)
+        if not dropped:
+            return
+        from scheduler_jobs.summary.long_tf_db_publish import start_long_tf_db_publish_async
+
+        started = start_long_tf_db_publish_async(tuple(dropped), reason="tick_skipped_long:%s" % (now,))
+        logger.warning(
+            "[SUMMARY PARALLEL] long targets not computed in main.py -> summary DB から publish "
+            "dropped=%s started=%s (main.py は長足を計算しない方針)",
+            dropped, started,
         )
+    except Exception:
+        logger.exception("[SUMMARY PARALLEL] long tf db publish dispatch failed push_targets=%s", push_targets)
+
+
+def _stage_tracker():
+    """P0-2: ステージ別 elapsed / deadline / 協調キャンセル。取得できなければ None。"""
+    try:
+        from scheduler_jobs.summary import stage_tracker as _st
+        return _st
+    except Exception:
+        logger.debug("[SUMMARY PARALLEL] stage_tracker import failed", exc_info=True)
+        return None
+
+
+def _log_freshness_timeline(reason: str) -> None:
+    """P0-6: now / websocket / memory push / push db / raw / 1m OHLC /
+    history / merged の最新時刻を 1 行にまとめて出す。
+
+    どの段で鮮度が落ちたのかをログから直接読めるようにするための診断のみ。
+    鮮度判定 (STALE DROP 等) の挙動は変更しない。
+    """
+    try:
+        from scheduler_jobs.summary import freshness_timeline as _ft
+        _ft.log_timeline(reason)
+    except Exception:
+        logger.debug("[SUMMARY PARALLEL] freshness timeline failed reason=%s", reason, exc_info=True)
+
+
+def _job_one_source(*, source: str, interval: int, now: dt.datetime, display: bool, run_entry: bool, inflight_token: int | None = None) -> tuple[str, int, pd.DataFrame]:
+    t0 = time.perf_counter()
+    if inflight_token is not None:
+        # 実際に走り始めたワーカーを記録する (診断で thread_alive を見るため)
+        _inflight_mark_thread(source, interval, inflight_token)
+    # P0-2: ワーカー本体に予算を持たせ、どのステージで止まったかを必ず出す。
+    # scheduler 側の inflight メタデータを clear するだけでは
+    # ワーカーが走り続けてしまうため、ワーカー自身が降りられるようにする。
+    _st = _stage_tracker()
+    # now は None で呼ばれることがある (テスト・一部の内部経路)。
+    # 診断用の owner 文字列のために本処理を落とさない。
+    try:
+        owner = "tick:%s" % now.strftime("%Y%m%d%H%M%S")
+    except Exception:
+        owner = "tick:unknown"
+    # P0-7: worker() は SummaryWorkerCancelled を握り潰して with を抜けるので、
+    # cancel されたときでも戻り値の形 (source, interval, DataFrame) を保つ。
+    result = (source, int(interval), pd.DataFrame())
+    try:
+        if _st is None:
+            return _job_one_source_core(
+                source=source, interval=interval, now=now, display=display, run_entry=run_entry, t0=t0
+            )
+        with _st.worker("%s:%s" % (source, interval), generation=inflight_token, owner=owner) as _ctx:
+            # P0-1: parent から cancel を届けられるようにする。
+            _inflight_attach_ctx(source, interval, inflight_token, _ctx)
+            with _st.stage("freshness_timeline"):
+                _log_freshness_timeline("%s:%s" % (source, interval))
+            result = _job_one_source_core(
+                source=source, interval=interval, now=now, display=display, run_entry=run_entry, t0=t0
+            )
+        return result
     finally:
         # 親 tick が timeout で先に抜けても、ワーカーはここまで来て必ず解放する。
-        _inflight_release(source, interval)
+        # token 一致時のみ解放するので、古いワーカーが新しい世代を消すことはない。
+        _inflight_release(source, interval, inflight_token)
 
 
 def _job_one_source_core(
@@ -432,6 +732,7 @@ def _patched_run_time_locked_summary_jobs_legacy(*, now: Optional[dt.datetime] =
                 futures.append(ex.submit(_job_one_source, source="push", interval=int(interval), now=n, display=display, run_entry=bool(run_entry) and bool(in_session)))
             for interval in bg_push_targets:
                 _submit_bg_push_interval(interval=int(interval), now=n, display=display, run_entry=bool(run_entry) and bool(in_session))
+            _publish_skipped_long_targets(push_targets, wait_push_targets, bg_push_targets, now=n)
 
         if run_ranking and in_session and _env_bool("SUMMARY_PARALLEL_RANKING_ENABLED", True):
             for interval in ranking_targets:
@@ -935,26 +1236,66 @@ def run_parallel_interval_tick(*, now: Optional[dt.datetime] = None, run_push: b
         now_ts = time.perf_counter()
         skipped: list[str] = []
 
+        owner = "tick:%s" % n.strftime("%Y%m%d%H%M%S")
+
         def _submit(source: str, interval: int, *, run_entry_flag: bool) -> None:
-            if skip_busy and not _inflight_try_acquire(source, interval, now_ts):
-                skipped.append("%s:%s(age=%.0fs)" % (source, interval, _inflight_age(source, interval, now_ts)))
-                return
-            futures.append(
-                ex.submit(
+            token = None
+            if skip_busy:
+                token = _inflight_try_acquire(source, interval, now_ts, owner=owner)
+                if token is None:
+                    # 実体を必ず確認してからでないと skip も回収も判断できない
+                    info = _inflight_diagnose(source, interval, now_ts)
+                    # P0-1: 前世代がまだ走っているなら、まず「降りろ」を届ける。
+                    # 登録だけ消してワーカーを放置するのは禁止なので、
+                    # 回収の前に必ず協調キャンセルを要求する。
+                    if info.get("state") != "absent" and not info.get("cancel_requested"):
+                        _inflight_request_cancel(
+                            source, interval,
+                            reason="superseded_by_tick:%s" % owner,
+                            generation=info.get("generation"),
+                        )
+                    reclaimed = _inflight_try_reclaim(source, interval, info)
+                    if reclaimed:
+                        logger.error(
+                            "[SUMMARY PARALLEL RESET] stale inflight reclaimed reason=%s info=%s",
+                            reclaimed,
+                            info,
+                        )
+                        token = _inflight_try_acquire(source, interval, now_ts, owner=owner)
+                    if token is None:
+                        logger.warning(
+                            "[SUMMARY PARALLEL RESET] inflight busy detail %s "
+                            "(worker alive -> not reclaimed; double-start is forbidden)",
+                            info,
+                        )
+                        skipped.append("%s:%s(age=%.0fs)" % (source, interval, _inflight_age(source, interval, now_ts)))
+                        return
+            try:
+                fut = ex.submit(
                     _job_one_source,
                     source=source,
                     interval=int(interval),
                     now=n,
                     display=display,
                     run_entry=run_entry_flag,
+                    inflight_token=token,
                 )
-            )
+            except Exception:
+                # submit できなければ登録を残さない (残すと永久 skip になる)
+                _inflight_release(source, interval, token)
+                raise
+            if token is not None:
+                _inflight_attach_future(source, interval, token, fut)
+            futures.append(fut)
 
         if run_push:
             for interval in wait_push_targets:
                 _submit("push", int(interval), run_entry_flag=bool(run_entry) and in_session)
             for interval in bg_push_targets:
                 _submit_bg_push_interval(interval=int(interval), now=n, display=display, run_entry=bool(run_entry) and in_session)
+            # wait にも bg にも入らなかった 3分/5分は、計算済みのものを
+            # summary DB から読んで publish する (別スレッド)。
+            _publish_skipped_long_targets(push_targets, wait_push_targets, bg_push_targets, now=n)
 
         if run_ranking and in_session and _rst_env_bool("SUMMARY_PARALLEL_RANKING_ENABLED", True):
             for interval in ranking_targets:

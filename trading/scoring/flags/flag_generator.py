@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import logging
 import pandas as pd
+from typing import Any
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -378,6 +379,15 @@ def _safe_merge_flags(df_base, df_new):
 
         # pandasのindex自動整列で MultiIndex / RangeIndex 混在時に落ちるため、
         # 必ず位置ベースのSeriesに変換してから base の行数へ合わせる。
+        #
+        # DataFrame fragmentation 対策:
+        #   以前はここで df_base[c] = values を列の数だけ繰り返しており、
+        #   新規列 1 本ごとに block が増えて PerformanceWarning
+        #   ("DataFrame is highly fragmented") が大量に出ていた。
+        #   値・列名・型・列順を変えずに、新規列だけ 1 回の concat へまとめる。
+        #   (既存列の上書きは列を増やさないので従来通り個別代入)
+        prepared: "dict[Any, Any]" = {}
+
         for c in new_cols:
 
             try:
@@ -396,7 +406,7 @@ def _safe_merge_flags(df_base, df_new):
                     values.iloc[:new_len] = s.values
                     values = values.values
 
-                df_base[c] = values
+                prepared[c] = values
 
             except Exception:
                 logger.exception(
@@ -406,7 +416,19 @@ def _safe_merge_flags(df_base, df_new):
                     new_len,
                 )
                 if c not in df_base.columns:
-                    df_base[c] = 0
+                    prepared[c] = 0
+
+        # 既存列はその位置のまま上書きする (列順不変)
+        for c, values in prepared.items():
+            if c in df_base.columns:
+                df_base[c] = values
+
+        # 新規列は 1 回だけ concat する (new_cols の順番で末尾へ追加
+        #  = 従来の逐次代入と同じ列順)
+        added = {c: v for c, v in prepared.items() if c not in df_base.columns}
+        if added:
+            df_add = pd.DataFrame(added, index=df_base.index, columns=list(added.keys()))
+            df_base = pd.concat([df_base, df_add], axis=1, copy=False)
 
     except Exception:
 

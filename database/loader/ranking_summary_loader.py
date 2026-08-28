@@ -22,6 +22,7 @@ from database.schema.ranking_summary_schema import (
     table_name,
 )
 from database.sqlite import is_lock_error, quote_ident
+from sqlite_cm import committing_connect
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,7 @@ def load_latest_ranking_summary(
 
     try:
         with RANKING_SUMMARY_DB_LOCK:
-            with sqlite3.connect(path, timeout=10) as con:
+            with committing_connect(path, timeout=10) as con:
                 con.execute("PRAGMA busy_timeout=10000")
 
                 try:
@@ -116,7 +117,7 @@ def load_ranking_summary_at_latest_slot(
 
     try:
         with RANKING_SUMMARY_DB_LOCK:
-            with sqlite3.connect(path, timeout=10) as con:
+            with committing_connect(path, timeout=10) as con:
                 con.execute("PRAGMA busy_timeout=10000")
 
                 try:
@@ -195,7 +196,7 @@ def get_ranking_summary_schema_columns(
 
     try:
         with RANKING_SUMMARY_DB_LOCK:
-            with sqlite3.connect(path, timeout=10) as con:
+            with committing_connect(path, timeout=10) as con:
                 con.execute("PRAGMA busy_timeout=10000")
                 if not table_exists(con, table):
                     return []

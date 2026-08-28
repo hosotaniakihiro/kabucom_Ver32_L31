@@ -34,6 +34,8 @@ import time
 from typing import Any
 
 import pandas as pd
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 _RANKING_MA_CACHE: dict[str, tuple[float, dict[str, float]]] = {}
@@ -135,7 +137,7 @@ def _ranking_db_path() -> str:
     except Exception:
         pass
     today = dt.datetime.now().strftime("%Y%m%d")
-    root = os.getenv("AUTOSTOCK_ROOT", r"\\192.168.0.22\AutoStockBuyAndSell")
+    root = os.getenv("AUTOSTOCK_ROOT", nas_root())
     return os.path.join(root, "raw_data", "kabu_station", "ranking", f"ranking{today}.db")
 
 
@@ -163,7 +165,7 @@ def _ranking_snapshot_ma_from_db(symbol: str) -> dict[str, float]:
         if not db or not os.path.exists(db):
             return {}
         limit = int(max(6, _env_float("ENTRY_RANKING_MA5_LOOKBACK_ROWS", 20.0)))
-        with sqlite3.connect(db, timeout=1.0) as conn:
+        with committing_connect(db, timeout=1.0) as conn:
             table = "ranking_snapshot_1min"
             price_col = _find_price_col(conn, table)
             if not price_col:

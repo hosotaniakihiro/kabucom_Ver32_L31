@@ -25,6 +25,8 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +72,7 @@ _INTERVAL_TABLE_MAP = {
     60: "stock_summary_60min",
 }
 
-_DEFAULT_SUMMARY_ROOT = r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary"
+_DEFAULT_SUMMARY_ROOT = nas_path(r"raw_data\kabu_station\summary")
 
 _BASE_COLS = [
     "symbol",
@@ -227,7 +229,7 @@ def _read_sqlite_table(path: str, sql: str, params: Optional[tuple] = None) -> p
         return pd.DataFrame()
 
     try:
-        with sqlite3.connect(path, timeout=30) as conn:
+        with committing_connect(path, timeout=30) as conn:
             try:
                 conn.execute("PRAGMA journal_mode=WAL;")
             except Exception:

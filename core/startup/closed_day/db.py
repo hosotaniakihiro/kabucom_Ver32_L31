@@ -33,6 +33,7 @@ from sqlalchemy.engine import Engine
 from config.paths import get_path
 from global_state import global_data
 from core.startup.startup_runtime import resolve_summary_engine_dynamic
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ _INTERVAL_TABLE_MAP = {
     5: "stock_summary_5min",
 }
 
-_DEFAULT_SUMMARY_DIR = r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary"
+_DEFAULT_SUMMARY_DIR = nas_path(r"raw_data\kabu_station\summary")
 
 
 # ============================================================

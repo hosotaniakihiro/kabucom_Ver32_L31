@@ -1190,6 +1190,98 @@ def _call_unified_runner(now: dt.datetime, ranking_enabled: bool, run_entry: boo
     )
 
 
+# ============================================================
+# 追加P1-3: 大引け後の realtime 停止
+# ============================================================
+
+_EOD_FINAL_DONE_DATE = None
+_EOD_LOCK = threading.Lock()
+
+
+def _stop_after_close_enabled() -> bool:
+    v = os.getenv("SUMMARY_STOP_AFTER_MARKET_CLOSE")
+    if v is None or str(v).strip() == "":
+        return True
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _eod_grace_min() -> float:
+    """大引け後、EOD 最終処理のために realtime を許す猶予分数。"""
+    try:
+        v = os.getenv("SUMMARY_EOD_GRACE_MIN")
+        if v and str(v).strip():
+            return max(0.0, float(str(v).strip()))
+    except Exception:
+        pass
+    return 2.0
+
+
+def _is_after_market_close(now=None) -> bool:
+    """当日の取引時間が終わったか (11:30-12:30 の昼休みは含めない)。"""
+    try:
+        import datetime as _dt
+
+        from utils.business_day_utils import is_business_day
+
+        n = now or _dt.datetime.now()
+        if not is_business_day(n.date()):
+            return True
+        return n.time() >= _dt.time(15, 30)
+    except Exception:
+        return False
+
+
+def _summary_stop_after_market_close(now=None) -> bool:
+    """True を返したら realtime tick を起動しない。
+
+    大引け直後の猶予中だけ EOD final snapshot を 1 回実行する。
+    """
+    global _EOD_FINAL_DONE_DATE
+
+    if not _stop_after_close_enabled():
+        return False
+    if not _is_after_market_close(now):
+        return False
+
+    import datetime as _dt
+
+    n = now or _dt.datetime.now()
+    today = n.date()
+
+    with _EOD_LOCK:
+        already = (_EOD_FINAL_DONE_DATE == today)
+        if not already:
+            close_dt = _dt.datetime.combine(today, _dt.time(15, 30))
+            within_grace = (n - close_dt).total_seconds() <= _eod_grace_min() * 60.0
+            if within_grace:
+                _EOD_FINAL_DONE_DATE = today
+                logger.warning(
+                    "[SUMMARY EOD] 大引け後の最終 tick を 1 回だけ実行する now=%s "
+                    "grace_min=%.1f (以降 realtime worker は起動しない)",
+                    n, _eod_grace_min(),
+                )
+                return False
+            _EOD_FINAL_DONE_DATE = today
+            logger.warning(
+                "[SUMMARY EOD] 大引け猶予を過ぎているため EOD 最終 tick も行わない now=%s",
+                n,
+            )
+
+    logger.warning(
+        "[SUMMARY EOD] market closed -> realtime summary tick skip now=%s "
+        "(worker を起動しない。cache は保持。"
+        "SUMMARY_STOP_AFTER_MARKET_CLOSE=0 で従来動作)",
+        n,
+    )
+    return True
+
+
+def reset_eod_state_for_test() -> None:
+    global _EOD_FINAL_DONE_DATE
+    with _EOD_LOCK:
+        _EOD_FINAL_DONE_DATE = None
+
+
 def _run_summary_tick(*args: Any, **kwargs: Any) -> None:
     return _summary_scheduler_shutdown_guard_wrap_tick(_run_summary_tick_core, name="_run_summary_tick", args=args, kwargs=kwargs)
 
@@ -1205,6 +1297,26 @@ def _run_summary_tick_core(now: Optional[dt.datetime] = None) -> None:
       - fallback running が古い場合は stale reset して再投入できる。
     """
     global _unified_bg_running, _unified_bg_started_at
+
+    # ============================================================
+    # 追加P1-3: 大引け後に realtime worker を毎分起動しない
+    # ------------------------------------------------------------
+    # 2026-08-28 15:30 以降の実測:
+    #   EXIT は market closed skip
+    #   Tonosama は outside session で即 skip
+    # にもかかわらず summary_parent_tick / ranking_summary_all /
+    # push:1 realtime worker が動き続け、
+    # 15:32 / 15:34 に push:1 cancel SLA breach が再発していた。
+    #
+    # 場が閉じたら realtime Summary は要らない。
+    # EOD final snapshot を 1 回だけ実行し、以後の tick は起動しない。
+    #
+    # 実行しない = worker を作らない。既存 cache は保持する
+    # (翌営業日の startup には影響させない)。
+    # SUMMARY_STOP_AFTER_MARKET_CLOSE=0 で従来動作。
+    # ============================================================
+    if _summary_stop_after_market_close(now):
+        return
 
     # 旧 summary_scheduler_unified_stale_guard_patch から移設。
     # 前tickの unified running が残っていれば先に解除してから判定する。

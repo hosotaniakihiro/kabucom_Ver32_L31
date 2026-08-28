@@ -289,6 +289,21 @@ def register_pending_entry_order(*, order_id: str, symbol: str, side: str, qty: 
     return True
 
 
+def _notify_summary_retry(symbol: str, order_id: str) -> None:
+    """未約定キャンセル完了を SUMMARY 再queue 機構へ通知する。
+
+    失敗してもキャンセル処理本体には影響させない。
+    """
+    try:
+        from trading.handlers.entry_retry_rotation import on_unfilled_order_cancelled
+
+        requeued = on_unfilled_order_cancelled(symbol, order_id)
+        if requeued:
+            logger.warning("[ENTRY CANCEL WATCH] summary retry requeued symbol=%s order_id=%s", symbol, order_id)
+    except Exception:
+        logger.debug("[ENTRY CANCEL WATCH] summary retry notify failed symbol=%s order_id=%s", symbol, order_id, exc_info=True)
+
+
 def _cancel_pending_order(oid: str, info: dict, reason: str, detail: dict[str, Any] | None = None):
     symbol = str(info.get("symbol") or "").strip()
     logger.warning(
@@ -313,6 +328,10 @@ def _cancel_pending_order(oid: str, info: dict, reason: str, detail: dict[str, A
     allow_retry = _mark_cancel_and_decide_retry(symbol, reason)
     if not allow_retry:
         _mark_symbol_cancel_cooldown(symbol, reason=reason)
+    else:
+        # 既存のリトライ判断が OK のときだけ、SUMMARY_AI 候補を
+        # pending へ戻す (entry_retry_rotation 側でさらに上限回数を見る)。
+        _notify_summary_retry(symbol, oid)
 
     logger.warning(
         "[ENTRY CANCEL WATCH] cancel requested order_id=%s symbol=%s ok=%s allow_retry=%s cooldown_if_no_retry=%.1fs another_symbols_allowed=True",

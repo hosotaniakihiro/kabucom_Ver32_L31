@@ -26,7 +26,10 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+import numpy as np
 import pandas as pd
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +113,40 @@ def _push_summary_db_source_table_exists(conn: sqlite3.Connection, table_name: s
         return False
 
 
+
+def _push_db_effective_lookback_min(default_min: int, *, warm_env: str, cold_min: int) -> int:
+    """1分足キャッシュが温まっていれば、PUSH DB を読む窓を短くする。
+
+    2026-08-19 の実測:
+      差分キャッシュ (bar_cache) を on にしたことで足の組み立て入力は
+      ticks_in 20,000〜30,000 -> ticks_used 764〜1,072 (97%削減) になったが、
+      1 tick は 62〜85 秒のままでほとんど改善しなかった。
+      原因は「PUSH DB から読む行数自体は 20,000〜30,000 行のまま」で、
+      削減できていたのは読んだ後の足組み立てだけだったため。
+
+    キャッシュが足の履歴を保持している以上、毎 tick 20 分ぶん読む必要はない。
+    キャッシュが空 (起動直後) のときだけ従来どおり長く読み、
+    温まってからは直近ぶんだけ読む。
+
+    warm_env で明示指定があればそれを優先する。
+    """
+    try:
+        raw = os.getenv(warm_env)
+        if raw is not None and str(raw).strip() != "":
+            return max(1, int(float(raw)))
+    except Exception:
+        pass
+
+    try:
+        from trading.summary.engine.incremental import bar_cache
+
+        if bar_cache.get_mode() == "on" and bar_cache.cached_rows(1) > 0:
+            return max(1, int(cold_min))
+    except Exception:
+        logger.debug("[PUSH SUMMARY DB SOURCE] warm lookback check failed", exc_info=True)
+
+    return int(default_min)
+
 def _push_summary_db_source_read_recent_rows() -> pd.DataFrame:
     """summary_database_runner.py 専用: メモリ上のPUSH DFが空/古い場合に
     pushYYYYMMDD.dbの直近コミット済み行を読み直す (旧 push_summary_db_source_patch)。
@@ -124,6 +161,9 @@ def _push_summary_db_source_read_recent_rows() -> pd.DataFrame:
         return pd.DataFrame()
 
     lookback_min = max(3, _push_summary_db_source_env_int("PUSH_SUMMARY_DB_LOOKBACK_MIN", 20))
+    lookback_min = _push_db_effective_lookback_min(
+        lookback_min, warm_env="PUSH_SUMMARY_DB_WARM_LOOKBACK_MIN", cold_min=3
+    )
     max_rows = max(1000, _push_summary_db_source_env_int("PUSH_SUMMARY_DB_MAX_ROWS", 30000))
     busy_timeout_ms = max(1000, _push_summary_db_source_env_int("PUSH_SUMMARY_DB_BUSY_TIMEOUT_MS", 5000))
 
@@ -551,6 +591,80 @@ def _get_from_global_data(candidates: list[str]) -> Any:
     return None
 
 
+def _push_memory_stream_df() -> pd.DataFrame:
+    """PUSH WebSocket のメモリバッファを返す (NAS アクセスなし)。
+
+    memory_latest_1m._load_push_memory_df_core() と同じソース。
+    main.py は memory-only 運用なので、ここが唯一の新鮮な PUSH 経路になる。
+    """
+    try:
+        from trading.push.push_stream import get_push_dataframe
+
+        x = get_push_dataframe()
+        if isinstance(x, pd.DataFrame) and not x.empty:
+            return x
+    except Exception:
+        logger.debug("[PUSH SUMMARY ENGINE] push_stream memory df unavailable", exc_info=True)
+    return pd.DataFrame()
+
+
+def _push_source_max_age_sec() -> float:
+    """global_data 側を stale とみなす秒数。
+
+    既存の direct_push_1m と同じ既定値 (90秒) に揃える。
+    """
+    try:
+        raw = os.getenv("PUSH_SUMMARY_MEMORY_PREFER_MAX_AGE_SEC")
+        if raw is None or str(raw).strip() == "":
+            raw = os.getenv("SUMMARY_FORCE_DIRECT_MEMORY_LOOKBACK_SEC", "90")
+        return max(30.0, float(raw))
+    except Exception:
+        return 90.0
+
+
+def _prefer_fresh_push_memory(base: pd.DataFrame) -> pd.DataFrame:
+    """global_data 側が stale なら、より新しいメモリ PUSH を優先する。
+
+    起動時に core/startup/push/bootstrap が NAS の push DB から seed した
+    global_data.push_df は、push_receiver が落ちていた時間帯の古い
+    スナップショットのままになりうる。
+    それをそのまま使うと 1 tick 丸々を無駄に使った上で
+    後段の STALE DROP で全件捨てられる (= tick timeout)。
+    """
+    try:
+        mem = _push_memory_stream_df()
+        if not isinstance(mem, pd.DataFrame) or mem.empty:
+            return base
+
+        base_dt = _safe_latest_dt(base) if isinstance(base, pd.DataFrame) and not base.empty else None
+        mem_dt = _safe_latest_dt(mem)
+        if mem_dt is None:
+            return base
+
+        now = pd.Timestamp(dt.datetime.now())
+        base_age = float((now - pd.Timestamp(base_dt)).total_seconds()) if base_dt is not None else float("inf")
+        mem_age = float((now - pd.Timestamp(mem_dt)).total_seconds())
+        max_age = _push_source_max_age_sec()
+
+        # base が新鮮なら何もしない (従来動作)。
+        if base_age <= max_age:
+            return base
+        # memory も base と同等以上に古いなら差し替えても意味が無い。
+        if base_dt is not None and mem_dt <= base_dt:
+            return base
+
+        logger.warning(
+            "[PUSH SUMMARY ENGINE] prefer fresh push memory over stale global_data "
+            "base_latest=%s base_age=%.1fs mem_latest=%s mem_age=%.1fs max_age=%.0fs base_rows=%s mem_rows=%s",
+            base_dt, base_age, mem_dt, mem_age, max_age,
+            len(base) if isinstance(base, pd.DataFrame) else 0, len(mem),
+        )
+        return mem
+    except Exception:
+        logger.exception("[PUSH SUMMARY ENGINE] prefer fresh push memory failed")
+        return base
+
+
 def _resolve_push_source_df_core() -> pd.DataFrame:
     df = _get_from_global_data(["stream_data", "push_df", "push_data", "latest_push_df", "push_snapshot_df"])
     if (not isinstance(df, pd.DataFrame)) or df.empty:
@@ -561,6 +675,9 @@ def _resolve_push_source_df_core() -> pd.DataFrame:
                 logger.info("[PUSH SUMMARY ENGINE] get_push_df() used")
             except Exception:
                 logger.exception("[PUSH SUMMARY ENGINE] get_push_df() failed")
+
+    # global_data 側が stale だったらメモリ PUSH を優先する (NAS は読まない)。
+    df = _prefer_fresh_push_memory(df if isinstance(df, pd.DataFrame) else pd.DataFrame())
     out = _normalize_push_source_df(df)
     out = _filter_same_day(out, today_only=True)
     _log_df_stats("resolved push source", out)
@@ -664,7 +781,7 @@ def _push_summary_db_latest_source_push_db_path() -> Path:
         from config.paths import get_path
         root = Path(get_path("raw_push"))
     except Exception:
-        root = Path(os.getenv("PUSH_DB_DIR", r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\push"))
+        root = Path(os.getenv("PUSH_DB_DIR", nas_path(r"raw_data\kabu_station\push")))
     return root / f"push{ymd}.db"
 
 
@@ -705,11 +822,14 @@ def _push_summary_db_latest_source_read_recent() -> pd.DataFrame:
     if not db.exists():
         return pd.DataFrame()
     lookback_min = max(1, _push_summary_db_latest_source_env_int("PUSH_SUMMARY_DB_SOURCE_LOOKBACK_MIN", 20))
+    lookback_min = _push_db_effective_lookback_min(
+        lookback_min, warm_env="PUSH_SUMMARY_DB_SOURCE_WARM_LOOKBACK_MIN", cold_min=3
+    )
     limit = max(100, _push_summary_db_latest_source_env_int("PUSH_SUMMARY_DB_SOURCE_LIMIT", 20000))
     busy_ms = max(100, _push_summary_db_latest_source_env_int("PUSH_SUMMARY_DB_SOURCE_BUSY_TIMEOUT_MS", 1000))
     cutoff = (dt.datetime.now() - dt.timedelta(minutes=lookback_min)).strftime("%Y-%m-%d %H:%M:%S")
     try:
-        with sqlite3.connect(str(db), timeout=max(0.5, busy_ms / 1000.0)) as conn:
+        with committing_connect(str(db), timeout=max(0.5, busy_ms / 1000.0)) as conn:
             conn.execute("PRAGMA query_only=ON")
             conn.execute(f"PRAGMA busy_timeout={busy_ms}")
             table = "stream_data_raw"
@@ -1193,7 +1313,10 @@ def _pdo_find_col(df: pd.DataFrame, names: Iterable[str]) -> Optional[str]:
 
 
 def _pdo_num(df: pd.DataFrame, names: Iterable[str]) -> pd.Series:
-    out = pd.Series([pd.NA] * len(df), index=df.index, dtype="object")
+    # object dtype の全 NA Series へ combine_first すると
+    #   FutureWarning: The behavior of array concatenation with empty entries is deprecated
+    # になる。最後に pd.to_numeric するのだから最初から float64 で作る。
+    out = pd.Series(np.nan, index=df.index, dtype="float64")
     for name in names:
         c = _pdo_find_col(df, [name])
         if c is None:

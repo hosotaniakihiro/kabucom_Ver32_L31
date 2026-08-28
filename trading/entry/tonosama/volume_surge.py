@@ -23,6 +23,7 @@ import pandas as pd
 from .config import VOLUME_AVG_LOOKBACK_BARS
 from .summary_loader import load_merged_summary, normalize_summary_base
 from .utils import safe_float
+from trading.summary.bool_series import na_false_bool
 
 logger = logging.getLogger(__name__)
 
@@ -399,8 +400,10 @@ def build_scalping_feature_df() -> pd.DataFrame:
     elif "volume_surge_ratio_5m" in out.columns:
         out["_surge_tf"] = "5m"
     try:
-        history_missing = out.get("_volume_surge_history_missing", pd.Series(False, index=out.index)).fillna(False).astype(bool)
-        failopen_col = out.get("_volume_surge_failopen", pd.Series(False, index=out.index)).fillna(False).astype(bool)
+        # fillna(False).astype(bool) は object dtype のとき暗黙ダウンキャスト警告になる。
+        # プロジェクト既存の na_false_bool() は同じ結果を非推奨経路を通らずに返す。
+        history_missing = na_false_bool(out.get("_volume_surge_history_missing"), index=out.index)
+        failopen_col = na_false_bool(out.get("_volume_surge_failopen"), index=out.index)
         up3 = out.get("prev_3m_up_streak", pd.Series(0, index=out.index)).fillna(0)
         up5 = out.get("prev_5m_up_streak", pd.Series(0, index=out.index)).fillna(0)
         dn3 = out.get("prev_3m_down_streak", pd.Series(0, index=out.index)).fillna(0)

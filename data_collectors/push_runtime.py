@@ -382,6 +382,289 @@ def start_push_stream() -> bool:
         return False
 
 
+# ============================================================
+# P0-2 / P0-4: PUSH OWNER HEALTH
+# ------------------------------------------------------------
+# main.py は WS owner ではない。PUSH 接続の owner はこのプロセスだけ。
+# 2026-08-28 11:13 に PUSH DB の書き込みが止まったとき、
+# main 側からは「DB が古い」ことしか分からず、
+# WS が死んだのか writer が死んだのか区別できなかった。
+#
+# ここで owner 自身の健康状態を必ず出す。
+# 多重 WS は絶対に張らない (このプロセス内の再接続のみ)。
+# ============================================================
+
+_PUSH_HEALTH_INTERVAL_SEC = 10.0
+_PROCESS_START_TS = time.time()
+
+# DB 進捗プローブの前回値 (rowid が増えているかを見る)
+_db_probe_last_rowid = None
+_db_probe_last_at = 0.0
+_db_probe_last_grew_at = 0.0
+
+
+def _probe_push_db_progress() -> dict:
+    """push DB の MAX(rowid) / MAX(datetime) を直接見る。
+
+    writer 側の内部カウンタが取れなくても、
+    「DB が実際に伸びているか」はこれで断定できる。
+    WS 停止と writer 停止の切り分けに使う。
+    """
+    global _db_probe_last_rowid, _db_probe_last_at, _db_probe_last_grew_at
+
+    out: dict = {}
+    try:
+        from scheduler_jobs.summary.memory_latest_1m import _push_db_path
+
+        path = _push_db_path()
+    except Exception:
+        return out
+
+    import sqlite3
+
+    conn = None
+    try:
+        conn = sqlite3.connect(str(path), timeout=2.0)
+        conn.execute("PRAGMA query_only=ON")
+        # MAX(datetime) は全表スキャンになる (実測 543MB で 12.4 秒)。
+        # tick は追記専用なので rowid 最大行の datetime が最新。
+        row = conn.execute(
+            "SELECT rowid, datetime FROM stream_data_raw ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+    except Exception:
+        return out
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    if not row:
+        return out
+
+    max_rowid, max_dt = row[0], row[1]
+    now_m = time.monotonic()
+    out["db_path"] = str(path)
+    out["db_max_rowid"] = max_rowid
+    out["db_max_datetime"] = str(max_dt) if max_dt else None
+
+    if _db_probe_last_rowid is not None and max_rowid is not None:
+        delta = int(max_rowid) - int(_db_probe_last_rowid)
+        out["db_rowid_delta"] = delta
+        if delta > 0:
+            _db_probe_last_grew_at = now_m
+    if _db_probe_last_grew_at > 0.0:
+        out["db_last_grew_age"] = round(now_m - _db_probe_last_grew_at, 1)
+        # writer が生きているかは「DB が伸びた時刻」で測る
+        out["last_write_age"] = out["db_last_grew_age"]
+
+    _db_probe_last_rowid = max_rowid
+    _db_probe_last_at = now_m
+    return out
+
+
+def _push_health_snapshot() -> dict:
+    snap: dict = {
+        "pid": os.getpid(),
+        "uptime_sec": round(time.time() - _PROCESS_START_TS, 1),
+        "ws_connected": None,
+        "ws_thread_alive": None,
+        "last_recv_at": None,
+        "last_recv_age": None,
+        "last_write_at": None,
+        "last_write_age": None,
+        "received_total": None,
+        "written_total": None,
+        "queue": None,
+        "registered_count": None,
+        "rotation": None,
+        "token_tail": None,
+        "db_path": None,
+    }
+    now = time.time()
+
+    def _age_of(v) -> Any:
+        """datetime / epoch のどちらでも秒齢にする。"""
+        if v is None:
+            return None
+        try:
+            if hasattr(v, "timestamp"):
+                return round(now - v.timestamp(), 1)
+            return round(now - float(v), 1)
+        except Exception:
+            return None
+
+    # trading/push/push_stream/state.py の実際の名前に合わせる。
+    # (前回は connected / total_received 等と推測して書いたため
+    #  全項目が None になっていた。2026-08-28 13:58 のログで判明。)
+    try:
+        from trading.push.push_stream import state as _st
+
+        ev = getattr(_st, "_connected_event", None)
+        snap["ws_connected"] = bool(ev.is_set()) if ev is not None else None
+        th = getattr(_st, "_ws_thread", None)
+        snap["ws_thread_alive"] = bool(th.is_alive()) if th is not None else None
+
+        snap["received_total"] = getattr(_st, "_total_received", None)
+        snap["written_total"] = getattr(_st, "_total_flushed", None)
+        snap["dropped_total"] = getattr(_st, "_total_dropped", None)
+        snap["error_total"] = getattr(_st, "_total_errors", None)
+
+        q = getattr(_st, "_push_queue", None)
+        try:
+            snap["queue"] = q.qsize() if q is not None else None
+        except Exception:
+            snap["queue"] = None
+
+        lr = getattr(_st, "_last_message_at", None)
+        snap["last_recv_at"] = str(lr) if lr is not None else None
+        snap["last_recv_age"] = _age_of(lr)
+
+        lf = getattr(_st, "_last_flush_at", None)
+        snap["last_flush_at"] = str(lf) if lf is not None else None
+        snap["last_flush_age"] = _age_of(lf)
+
+        lc = getattr(_st, "_last_connect_at", None)
+        snap["last_connect_at"] = str(lc) if lc is not None else None
+        ld = getattr(_st, "_last_disconnect_at", None)
+        snap["last_disconnect_at"] = str(ld) if ld is not None else None
+        le = getattr(_st, "_last_error_at", None)
+        snap["last_error_at"] = str(le) if le is not None else None
+
+        snap["rotation_enabled"] = getattr(_st, "_rotation_enabled", None)
+
+        flush_th = getattr(_st, "_flush_thread", None)
+        snap["flush_thread_alive"] = (
+            bool(flush_th.is_alive()) if flush_th is not None else None
+        )
+        snap["writer_ready"] = getattr(_st, "_stream_writer", None) is not None
+
+        df = getattr(_st, "_push_df", None)
+        try:
+            snap["memory_rows"] = len(df) if df is not None else None
+        except Exception:
+            snap["memory_rows"] = None
+    except Exception:
+        logger.debug("[PUSH OWNER HEALTH] push_stream state unavailable", exc_info=True)
+
+    # 登録銘柄数は subscription 側から取る。
+    try:
+        from trading.push.push_stream import rotation_core as _rc
+
+        regs = getattr(_rc, "_LAST_REGISTERED", None) or getattr(_rc, "_last_registered", None)
+        if regs is not None:
+            snap["registered_count"] = len(regs)
+            snap["registered_head"] = list(regs)[:5]
+    except Exception:
+        logger.debug("[PUSH OWNER HEALTH] rotation state unavailable", exc_info=True)
+
+    # DB writer 側 (実際に push DB へ書けているか)。
+    # last_write_age は「WS は受けているが writer が死んだ」を切り分ける鍵。
+    try:
+        from trading.push import push_db_writer as _w
+
+        for cand in ("LAST_WRITE_AT", "_LAST_WRITE_AT", "_last_write_at"):
+            lw = getattr(_w, cand, None)
+            if lw is not None:
+                snap["last_write_at"] = str(lw)
+                snap["last_write_age"] = _age_of(lw)
+                break
+        for cand in ("TOTAL_WRITTEN", "_TOTAL_WRITTEN", "_total_written"):
+            tw = getattr(_w, cand, None)
+            if tw is not None:
+                snap["written_total"] = tw
+                break
+        for cand in ("WRITE_FAIL_TOTAL", "_WRITE_FAIL_TOTAL", "_write_fail_total"):
+            wf = getattr(_w, cand, None)
+            if wf is not None:
+                snap["write_fail_total"] = wf
+                break
+        for cand in ("LAST_DB_PATH", "_LAST_DB_PATH", "_last_db_path"):
+            dp = getattr(_w, cand, None)
+            if dp:
+                snap["db_path"] = str(dp)
+                break
+    except Exception:
+        logger.debug("[PUSH OWNER HEALTH] push_db_writer state unavailable", exc_info=True)
+
+    # writer 側の名前が取れない場合の最後の砦: DB の MAX(rowid) を直接見る。
+    # これが増えていなければ「書けていない」と断定できる。
+    if snap.get("last_write_age") is None:
+        try:
+            snap.update(_probe_push_db_progress())
+        except Exception:
+            logger.debug("[PUSH OWNER HEALTH] db progress probe failed", exc_info=True)
+
+    try:
+        tok = str(os.getenv("API_TOKEN") or "")
+        snap["token_tail"] = tok[-4:] if tok else None
+    except Exception:
+        snap["token_tail"] = None
+
+    snap["rotation"] = "A/B batch=%s target=%s" % (PUSH_BATCH_SIZE, PUSH_TARGET_TOTAL)
+    return snap
+
+
+def _classify_push_fault(snap: dict) -> str:
+    """P0-4: WS 停止 / writer 停止 / reader 停止 を区別する。
+
+    A: WS fresh  / write stale -> writer_problem
+    B: WS stale  / write stale -> websocket_or_subscription_problem
+    C: WS fresh  / write fresh -> owner_ok (main が古いなら reader_problem)
+    """
+    thr = 10.0
+    recv_age = snap.get("last_recv_age")
+    write_age = snap.get("last_write_age")
+    recv_stale = recv_age is None or recv_age > thr
+    write_stale = write_age is None or write_age > thr
+
+    if not recv_stale and write_stale:
+        return "writer_problem"
+    if recv_stale and write_stale:
+        return "websocket_or_subscription_problem"
+    if not recv_stale and not write_stale:
+        return "owner_ok"
+    return "unknown"
+
+
+def _log_push_owner_health() -> dict:
+    snap = _push_health_snapshot()
+    fault = _classify_push_fault(snap)
+    snap["fault"] = fault
+    log = logger.warning if fault not in ("owner_ok",) else logger.info
+    log(
+        "[PUSH OWNER HEALTH] pid=%s uptime=%ss ws_connected=%s ws_thread_alive=%s "
+        "flush_thread_alive=%s writer_ready=%s "
+        "last_recv_at=%s last_recv_age=%s last_write_age=%s last_flush_age=%s "
+        "received_total=%s written_total=%s dropped_total=%s error_total=%s "
+        "write_fail_total=%s queue=%s memory_rows=%s "
+        "registered_count=%s registered_head=%s rotation=%s rotation_enabled=%s "
+        "last_connect_at=%s last_disconnect_at=%s last_error_at=%s "
+        "db_max_rowid=%s db_rowid_delta=%s db_max_datetime=%s "
+        "token_tail=%s db_path=%s fault=%s",
+        snap.get("pid"), snap.get("uptime_sec"),
+        snap.get("ws_connected"), snap.get("ws_thread_alive"),
+        snap.get("flush_thread_alive"), snap.get("writer_ready"),
+        snap.get("last_recv_at"), snap.get("last_recv_age"),
+        snap.get("last_write_age"), snap.get("last_flush_age"),
+        snap.get("received_total"), snap.get("written_total"),
+        snap.get("dropped_total"), snap.get("error_total"),
+        snap.get("write_fail_total"), snap.get("queue"), snap.get("memory_rows"),
+        snap.get("registered_count"), snap.get("registered_head"),
+        snap.get("rotation"), snap.get("rotation_enabled"),
+        snap.get("last_connect_at"), snap.get("last_disconnect_at"),
+        snap.get("last_error_at"),
+        snap.get("db_max_rowid"), snap.get("db_rowid_delta"), snap.get("db_max_datetime"),
+        snap.get("token_tail"), snap.get("db_path"), fault,
+    )
+    try:
+        write_heartbeat("push_owner_health", status="alive", **snap)
+    except Exception:
+        logger.debug("[PUSH OWNER HEALTH] heartbeat write failed", exc_info=True)
+    return snap
+
+
 def run_forever() -> int:
     logger.info("[PUSH RUNTIME] START")
     logger.info(
@@ -419,27 +702,63 @@ def run_forever() -> int:
         return 1
 
     last_hb = 0.0
+    last_health = 0.0
 
+    # P0-1: この while ループを絶対に抜けさせない。
+    #
+    # 旧実装は write_heartbeat() / logger.info() が try の外にあった。
+    # heartbeat の書き先は NAS (X:\logs\console\*.heartbeat.json) なので、
+    # SMB 障害時にここで例外が出るとループを抜けてプロセスが終了し、
+    # PUSH owner が居なくなる。
+    # 2026-08-28 11:11:14 を最後に heartbeat ログが止まり、
+    # 11:12:23 から interpreter shutdown が始まっていた
+    # (heartbeat 間隔も 30s -> 114s/62s/53s と伸びていた)。
+    # ループ本体は BaseException 以外すべて飲み込む。
     while True:
         try:
-            schedule.run_pending()
-        except Exception:
-            logger.exception("[PUSH RUNTIME] schedule.run_pending failed")
+            try:
+                schedule.run_pending()
+            except Exception:
+                logger.exception("[PUSH RUNTIME] schedule.run_pending failed")
 
-        now = time.time()
-        if now - last_hb >= 30:
-            write_heartbeat(
-                "push_receiver",
-                status="alive",
-                subscription_loop_started=sub_loop_ok,
-                push_started=push_ok,
-                rotation_enabled=True,
-                register_seconds=PUSH_REGISTER_SEC,
-                switch_gap_seconds=PUSH_SWITCH_GAP_SEC,
-                batch_size=PUSH_BATCH_SIZE,
-                target_total=PUSH_TARGET_TOTAL,
-            )
-            logger.info("[PUSH RUNTIME] heartbeat alive")
-            last_hb = now
+            now = time.time()
+
+            if now - last_health >= _PUSH_HEALTH_INTERVAL_SEC:
+                last_health = now
+                try:
+                    _log_push_owner_health()
+                except Exception:
+                    logger.exception("[PUSH OWNER HEALTH] snapshot failed")
+
+            if now - last_hb >= 30:
+                last_hb = now
+                try:
+                    write_heartbeat(
+                        "push_receiver",
+                        status="alive",
+                        subscription_loop_started=sub_loop_ok,
+                        push_started=push_ok,
+                        rotation_enabled=True,
+                        register_seconds=PUSH_REGISTER_SEC,
+                        switch_gap_seconds=PUSH_SWITCH_GAP_SEC,
+                        batch_size=PUSH_BATCH_SIZE,
+                        target_total=PUSH_TARGET_TOTAL,
+                    )
+                except Exception:
+                    # NAS が書けなくても PUSH 受信は続ける。
+                    logger.warning(
+                        "[PUSH RUNTIME] heartbeat write failed (NAS?) -> 受信は継続する",
+                        exc_info=True,
+                    )
+                try:
+                    logger.info("[PUSH RUNTIME] heartbeat alive")
+                except Exception:
+                    pass
+        except Exception:
+            # ここに来ても絶対に return しない。owner が消える方が危険。
+            try:
+                logger.exception("[PUSH RUNTIME] main loop iteration failed; continue")
+            except Exception:
+                pass
 
         time.sleep(1.0)

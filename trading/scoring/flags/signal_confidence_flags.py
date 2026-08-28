@@ -40,7 +40,12 @@ def _flag(expr):
     try:
         return expr.fillna(False).astype(int)
     except Exception:
-        return pd.Series(0, index=df.index)
+        # 旧実装はここでスコープ外の df を参照しており、
+        # fallback のはずが NameError になっていた。
+        try:
+            return pd.Series(0, index=expr.index, dtype="int64")
+        except Exception:
+            return pd.Series(dtype="int64")
 
 
 def generate_signal_confidence_flags(df: pd.DataFrame) -> pd.DataFrame:

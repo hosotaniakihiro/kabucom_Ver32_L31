@@ -42,6 +42,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Iterable
+from sqlite_cm import committing_connect
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +107,7 @@ def _summary_db_path() -> str:
         return explicit
     base = os.getenv(
         "SUMMARY_DB_DIR",
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\kabu_station\summary",
+        nas_path(r"raw_data\kabu_station\summary"),
     )
     today = dt.datetime.now().strftime("%Y%m%d")
     return str(Path(base) / f"summary{today}.db")
@@ -507,7 +509,7 @@ def _run_repair_impl(*, reason: str) -> dict[str, Any]:
     limit_rows = max(1000, _env_int("SUMMARY_EXISTING_NULL_REPAIR_MAX_ROWS", 300000))
     total = 0
     try:
-        with sqlite3.connect(path, timeout=_env_float("SUMMARY_EXISTING_NULL_REPAIR_SQLITE_TIMEOUT", 30.0)) as conn:
+        with committing_connect(path, timeout=_env_float("SUMMARY_EXISTING_NULL_REPAIR_SQLITE_TIMEOUT", 30.0)) as conn:
             _configure_connection(conn)
             for interval in _parse_intervals():
                 table = f"stock_summary_{interval}min"

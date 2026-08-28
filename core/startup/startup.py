@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import collections
 import configparser
+import importlib
 import datetime as dt
 import json
 import logging
@@ -715,7 +716,12 @@ def _board_runtime_self_check_entry_order_builder() -> dict:
         import trading.handlers.entry_order_builder as eob
         fn = getattr(eob, "build_entry_order", None)
         out["available"] = callable(fn)
-        out["rest_full_board_wrapped"] = _board_runtime_self_check_chain_has(fn, "_rest_full_board_patch") if callable(fn) else False
+        out["rest_full_board_wrapped"] = (
+            # 本文化済み (trading/handlers/entry_order_builder.build_entry_order)
+            _board_runtime_self_check_chain_has(fn, "_rest_full_board_builtin")
+            # 旧 core/startup/rest_full_board_entry_patch.py の monkeypatch
+            or _board_runtime_self_check_chain_has(fn, "_rest_full_board_patch")
+        ) if callable(fn) else False
     except Exception as e:
         out["error"] = repr(e)
     return out
@@ -739,20 +745,49 @@ def _board_runtime_self_check_exit_executor() -> dict:
                 or _board_runtime_self_check_chain_has(close_payload, "_exit_limit_board_touch_wrapped_v11")
                 or _board_runtime_self_check_chain_has(close_payload, "_exit_limit_board_touch_wrapped")
             )
-        out["pending_close_wrapped"] = _board_runtime_self_check_chain_has(close_db, "_exit_limit_pending_close_wrapped") if callable(close_db) else False
+        out["pending_close_wrapped"] = (
+            # 本文化済み (trading/exit/executor._close_db_position)
+            _board_runtime_self_check_chain_has(close_db, "_exit_limit_pending_close_builtin")
+            # 旧 core/startup/exit_limit_pending_close_runtime_patch.py の monkeypatch
+            or _board_runtime_self_check_chain_has(close_db, "_exit_limit_pending_close_wrapped")
+        ) if callable(close_db) else False
     except Exception as e:
         out["error"] = repr(e)
     return out
 
 
 def _board_runtime_self_check_global_data_retry_hook() -> dict:
-    out = {"add_entry_inflight_wrapped": False}
+    """SUMMARY_AI 未約定キャンセル後の再queue経路が生きているか。
+
+    旧実装 (V1) は global_data.add_entry_inflight を monkeypatch して
+    threading.local() 経由で item を受け渡していたが、発注本体が
+    別スレッドで走るために機能しないバグがあり、
+    trading/handlers/entry_retry_rotation.py V2 で意図的に撤去されて
+    entry_controller._execute_best_candidate からの直接呼び出しに
+    置き換えられている。ここではその新方式を検査する。
+    (add_entry_inflight_wrapped は旧実装が残存していないかの参考値)
+    """
+    out = {
+        "remember_order_for_retry_available": False,
+        "entry_controller_wired": False,
+        "add_entry_inflight_wrapped": False,
+    }
     try:
         from global_state import global_data
         fn = getattr(global_data, "add_entry_inflight", None)
         out["add_entry_inflight_wrapped"] = _board_runtime_self_check_chain_has(fn, "_summary_retry_add_wrapped") if callable(fn) else False
     except Exception as e:
-        out["error"] = repr(e)
+        out["error_global_data"] = repr(e)
+    try:
+        from trading.handlers.entry_retry_rotation import remember_order_for_retry
+        out["remember_order_for_retry_available"] = callable(remember_order_for_retry)
+    except Exception as e:
+        out["error_retry_rotation"] = repr(e)
+    try:
+        import trading.handlers.entry_controller as ec
+        out["entry_controller_wired"] = callable(getattr(ec, "_remember_order_for_summary_retry", None))
+    except Exception as e:
+        out["error_entry_controller"] = repr(e)
     return out
 
 
@@ -806,6 +841,8 @@ def install_board_runtime_self_check() -> bool:
         ok = ok and bool(checks["exit_executor"].get("limit_board_touch_wrapped"))
         ok = ok and bool(checks["exit_executor"].get("pending_close_wrapped"))
         ok = ok and bool(checks["urlopen_monitor"].get("urlopen_wrapped"))
+        ok = ok and bool(checks["summary_retry"].get("remember_order_for_retry_available"))
+        ok = ok and bool(checks["summary_retry"].get("entry_controller_wired"))
     except Exception:
         ok = False
 
@@ -820,6 +857,155 @@ def install_board_runtime_self_check() -> bool:
     level("[BOARD RUNTIME SELF CHECK] ok=%s checks=%s", ok, checks)
     _board_runtime_self_check_installed = True
     return ok
+
+
+
+# ============================================================
+# SETTINGS SOURCE OF TRUTH DUMP
+# ------------------------------------------------------------
+# 目的:
+#   同じ設定が settings.ini / os.environ / module定数 / startup patch /
+#   watcher から何度も書き換えられており、「結局いくつで動いているのか」が
+#   ログから読めなかった。ここで **確定後の最終値** を 1 箇所へまとめて出し、
+#   runtime/diagnostics/settings_source_of_truth.json へも残す。
+#
+# ここは値を **一切書き換えない**。読むだけの診断である。
+#
+# 優先順位 (実測にもとづく確定仕様):
+#   1. core/startup/strict_entry_defaults.STRICT_ENV
+#        install 時 + 起動後 180 秒の watcher が毎秒 os.environ へ強制代入。
+#        entry / summary_ai の閾値はここが最終決定権を持つ。
+#        (fast_startup / more_candidates / oneshot_limit が緩めた値を引き戻す)
+#   2. core/startup/board_safety_defaults
+#        board / lock 系 env の起動時最終決定権。
+#   3. 各モジュールの os.environ.setdefault
+#        1 と 2 が触らないキーの既定値。
+#   4. module 定数 (entry_controller.MIN_* など)
+#        strict_entry_defaults が apply_strict_entry_constants() で
+#        毎秒書き戻すため、実効値は 1 と一致する。
+#   5. 実行中のイベント駆動 remediation
+#        (summary_ai/direct_snapshot._bmd_apply_async_lock_policy など)
+#        board missing / lock timeout が実際に起きたときだけ 1 を上書きする。
+#        起動時には走らない。
+# ============================================================
+
+_SETTINGS_SOT_DONE = False
+
+# (キー, 誰が最終決定権を持つか)
+_SETTINGS_SOT_ENV_KEYS: list[tuple[str, str]] = [
+    # --- summary_ai / entry 閾値 ---
+    ("MIN_ENTRY_SCORE", "strict_entry_defaults.STRICT_ENV"),
+    ("SUMMARY_AI_MIN_SCORE", "strict_entry_defaults.STRICT_ENV"),
+    ("SUMMARY_ENTRY_MIN_SCORE", "strict_entry_defaults.STRICT_ENV"),
+    ("SUMMARY_AI_MIN_BUY", "strict_entry_defaults.STRICT_ENV"),
+    ("SUMMARY_AI_MIN_SELL", "strict_entry_defaults.STRICT_ENV"),
+    ("SUMMARY_AI_MIN_BUY_SCORE", "strict_entry_defaults.STRICT_ENV"),
+    ("SUMMARY_AI_MIN_SELL_SCORE", "strict_entry_defaults.STRICT_ENV"),
+    ("SUMMARY_AI_MIN_CONF", "strict_entry_defaults.STRICT_ENV"),
+    ("ENTRY_GATE_MIN_SCORE", "strict_entry_defaults.STRICT_ENV"),
+    ("MIN_SUMMARY_SCORE_BUY", "strict_entry_defaults.STRICT_ENV"),
+    ("MIN_SUMMARY_SCORE_SELL", "strict_entry_defaults.STRICT_ENV"),
+    ("MIN_COMPOSITE_SCORE_BUY", "strict_entry_defaults.STRICT_ENV"),
+    ("MIN_COMPOSITE_SCORE_SELL", "strict_entry_defaults.STRICT_ENV"),
+    ("ENTRY_CONTROLLER_MIN_SUMMARY_SCORE_BUY", "strict_entry_defaults.STRICT_ENV"),
+    ("ENTRY_CONTROLLER_MIN_SUMMARY_SCORE_SELL", "strict_entry_defaults.STRICT_ENV"),
+    ("ENTRY_CONTROLLER_MIN_COMPOSITE_SCORE_BUY", "strict_entry_defaults.STRICT_ENV"),
+    ("ENTRY_CONTROLLER_MIN_COMPOSITE_SCORE_SELL", "strict_entry_defaults.STRICT_ENV"),
+    ("ENTRY_CONTROLLER_MIN_AI_CONFIDENCE_BUY", "strict_entry_defaults.STRICT_ENV"),
+    ("ENTRY_CONTROLLER_MIN_AI_CONFIDENCE_SELL", "strict_entry_defaults.STRICT_ENV"),
+    # --- summary_ai async / lock ---
+    ("ENTRY_MAX_APPROVED_PER_RUN", "strict_entry_defaults.STRICT_ENV (fast startup は env 明示時のみ従う / R17)"),
+    ("SUMMARY_AI_DIRECT_SNAPSHOT_REENTRANT_LOCK", "board_safety_defaults (runtime remediation may set 0 on board-missing)"),
+    ("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY", "board_safety_defaults"),
+    ("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_MAX", "board_safety_defaults"),
+    ("SUMMARY_AI_ASYNC_ENTRY_LOCK_RETRY_SLEEP_SEC", "board_safety_defaults"),
+    ("SUMMARY_AI_ASYNC_ENTRY_STALE_SEC", "direct_snapshot.apply_async_entry_defaults (clamps >20 -> 20)"),
+    ("SUMMARY_AI_ASYNC_ENTRY_DIRECT_SYNC", "direct_snapshot.apply_async_entry_defaults"),
+    ("SUMMARY_AI_ASYNC_ENTRY_QUEUE_MAX", "direct_snapshot.apply_async_entry_defaults"),
+    # --- board ---
+    ("ENTRY_REST_FULL_BOARD_ENABLED", "core/startup/startup._BOARD_ENV_DEFAULTS"),
+    ("EXIT_REST_FULL_BOARD_ENABLED", "core/startup/startup._BOARD_ENV_DEFAULTS"),
+    ("ENTRY_BOARD_MISSING_HARD_BLOCK", "strict_entry_defaults.STRICT_ENV"),
+    ("ENTRY_ALLOW_ENTRY_WITHOUT_BOARD", "strict_entry_defaults.STRICT_ENV"),
+    ("ENTRY_LIMIT_ALLOW_WITHOUT_BOARD", "strict_entry_defaults.STRICT_ENV"),
+    # --- summary warmup ---
+    ("SUMMARY_WARMUP_REQUIRED_BARS_1M", "bootstrap_orchestrator.WARMUP_REQUIRED_BARS_1M"),
+    ("SUMMARY_SEED_MIN_BARS_1M", "db_seed_multiday_sqlite"),
+    ("SUMMARY_SEED_EXTRA_LOOKBACK_DAYS", "db_seed_multiday_sqlite"),
+]
+
+# (モジュール, 属性) — module 定数の実効値
+_SETTINGS_SOT_MODULE_ATTRS: list[tuple[str, str]] = [
+    ("trading.handlers.entry_controller", "MIN_SUMMARY_SCORE_BUY"),
+    ("trading.handlers.entry_controller", "MIN_SUMMARY_SCORE_SELL"),
+    ("trading.handlers.entry_controller", "MIN_COMPOSITE_SCORE_BUY"),
+    ("trading.handlers.entry_controller", "MIN_COMPOSITE_SCORE_SELL"),
+    ("trading.handlers.entry_controller", "MIN_AI_CONFIDENCE_BUY"),
+    ("trading.handlers.entry_controller", "MIN_AI_CONFIDENCE_SELL"),
+    ("trading.handlers.entry_controller", "MAX_APPROVED_PER_RUN"),
+    ("trading.summary.recovery.bootstrap_orchestrator", "WARMUP_REQUIRED_BARS_1M"),
+    ("trading.summary.recovery.bootstrap_orchestrator", "SNAPSHOT_PRELOAD_MIN_BARS_1M"),
+    ("trading.summary.recovery.bootstrap_orchestrator", "SNAPSHOT_PRELOAD_BUFFER_BARS_1M"),
+    ("trading.exit.executor", "EXIT_LIMIT_PENDING_CLOSE_ENABLED"),
+    ("trading.exit.executor", "EXIT_MARK_CLOSED_ON_ORDER_ACCEPT"),
+]
+
+
+def _settings_sot_path() -> Path:
+    raw = os.getenv("SETTINGS_SOURCE_OF_TRUTH_PATH", "").strip()
+    if raw:
+        return Path(raw)
+    return Path("runtime") / "diagnostics" / "settings_source_of_truth.json"
+
+
+def dump_settings_source_of_truth(*, reason: str = "startup") -> dict:
+    """確定後の設定値を 1 箇所にまとめて出す (値は変更しない)。"""
+    global _SETTINGS_SOT_DONE
+
+    env_values: dict[str, Any] = {}
+    for key, owner in _SETTINGS_SOT_ENV_KEYS:
+        env_values[key] = {"value": os.environ.get(key), "owner": owner}
+
+    module_values: dict[str, Any] = {}
+    for mod_name, attr in _SETTINGS_SOT_MODULE_ATTRS:
+        label = f"{mod_name}.{attr}"
+        try:
+            mod = importlib.import_module(mod_name)
+            module_values[label] = getattr(mod, attr, None)
+        except Exception as e:
+            module_values[label] = f"<unavailable: {e!r}>"
+
+    payload = {
+        "reason": reason,
+        "checked_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "priority_order": [
+            "1. core/startup/strict_entry_defaults.STRICT_ENV (install + 180s watcher, hard assign)",
+            "2. core/startup/board_safety_defaults (board/lock env, startup)",
+            "3. per-module os.environ.setdefault",
+            "4. module constants (rewritten back by strict watcher)",
+            "5. runtime event-driven remediation (board missing / lock timeout)",
+        ],
+        "env": env_values,
+        "module_constants": module_values,
+    }
+
+    try:
+        p = _settings_sot_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, default=str), encoding="utf-8")
+        logger.warning("[SETTINGS SOURCE OF TRUTH] saved path=%s reason=%s", p, reason)
+    except Exception:
+        logger.exception("[SETTINGS SOURCE OF TRUTH] save failed")
+
+    logger.warning(
+        "[SETTINGS SOURCE OF TRUTH] reason=%s env=%s",
+        reason,
+        {k: v["value"] for k, v in env_values.items()},
+    )
+    logger.warning("[SETTINGS SOURCE OF TRUTH] reason=%s module_constants=%s", reason, module_values)
+
+    _SETTINGS_SOT_DONE = True
+    return payload
 
 
 # ============================================================
@@ -1056,6 +1242,11 @@ def _install_entrypoint_runtime_patches() -> None:
         install_board_runtime_self_check()
     except Exception:
         logger.exception("[startup.entrypoint] board runtime self check install failed")
+
+    try:
+        dump_settings_source_of_truth(reason="startup")
+    except Exception:
+        logger.exception("[startup.entrypoint] settings source of truth dump failed")
 
 
 def system_startup():

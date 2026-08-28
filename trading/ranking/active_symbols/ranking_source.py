@@ -47,6 +47,7 @@ from .normalize import (
     today_date_str,
     to_float,
 )
+from sqlite_cm import committing_connect
 
 logger = logging.getLogger(__name__)
 _DB_CACHE: dict[str, Any] = {"ts": 0.0, "data": {}}
@@ -74,7 +75,7 @@ def _read_latest_ranking_from_db(limit_per_type: int = 250) -> Dict[Any, pd.Data
             return {}
 
         tables: list[str] = []
-        with sqlite3.connect(str(db_path), timeout=3.0) as conn:
+        with committing_connect(str(db_path), timeout=3.0) as conn:
             conn.execute("PRAGMA query_only=ON")
             conn.execute("PRAGMA busy_timeout=3000")
             try:

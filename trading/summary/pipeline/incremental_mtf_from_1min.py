@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from sqlite_cm import committing_connect
 
 logger = logging.getLogger(__name__)
 
@@ -325,7 +326,7 @@ def build_incremental_mtf_from_1m(interval: int) -> dict[str, Any]:
     allow_partial = _env_bool("SUMMARY_MTF_DIFF_ALLOW_PARTIAL_BAR", False)
 
     try:
-        with sqlite3.connect(str(db_path), timeout=8) as conn:
+        with committing_connect(str(db_path), timeout=8) as conn:
             try:
                 conn.execute("PRAGMA busy_timeout=8000")
                 conn.execute("PRAGMA query_only=ON")

@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime as dt
 import os
 from pathlib import Path
+from nas_root import nas_path, nas_root
 
 
 def find_project_root() -> Path:
@@ -15,7 +16,7 @@ def find_project_root() -> Path:
 
 
 PROJECT_ROOT = find_project_root()
-DEFAULT_BASE_DIR = r"\\192.168.0.22\AutoStockBuyAndSell"
+DEFAULT_BASE_DIR = nas_root()
 BASE_DIR = Path(os.environ.get("KABU_BASE_DIR", DEFAULT_BASE_DIR))
 
 RAW_DATA_DIR = BASE_DIR / "raw_data" / "kabu_station"

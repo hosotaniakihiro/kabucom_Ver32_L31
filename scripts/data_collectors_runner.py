@@ -343,7 +343,129 @@ def _start_summary_null_repair(logger: logging.Logger) -> None:
         logger.exception("[DATA COLLECTORS] summary existing-null repair start failed")
 
 
+# ============================================================
+# P0-1: SMB 障害と アプリ障害を区別する
+# ------------------------------------------------------------
+# 2026-08-28 11:13 に PUSH DB の書き込みが止まった原因。
+#
+# 子プロセスが自分のスクリプトすら読めずに即死していた:
+#   OSError: [WinError 6] ハンドルが無効です。:
+#       'W:\...\.venv\Lib\site-packages\pytz'
+#   python.exe: can't open file
+#       '\\192.168.0.22\business\...\scripts\push_receiver_runner.py'
+#
+# 親ログの実測 (09:39-12:07 の 1 プロセス分):
+#   WinError 4  (Too many open files in system) : 183 回
+#   WinError 6  (ハンドルが無効)                :  42 回
+#   WinError 59 (予期しないネットワークエラー)   :  14 回
+#   can't open file                             : 102 回
+#   push_receiver の start child                : 152 回
+#
+# つまり W: (ソース + .venv がある SMB 共有) のハンドル/セッションが
+# 枯渇し、子プロセスが起動できなくなっていた。
+#
+# 悪化させていたのは再起動ループ自身:
+#   11:13:17 started -> 11:13:24 exited(rc=2)
+#   11:13:29 started -> 11:13:35 exited(rc=2)
+#   11:13:40 started -> 11:13:46 exited(rc=2)
+# 「起動には成功したがすぐ死んだ」場合は fail_counts が増えず、
+# backoff が一切かからずに 5 秒間隔で回り続けていた。
+# 1 回の spawn は NAS 上の venv から pandas/numpy/sqlalchemy を
+# import するので数千回の SMB open を伴う。
+# つまり **リトライが SMB 枯渇を悪化させる自己増幅ループ**だった。
+#
+# 対策:
+#   1. spawn 前に安価な健全性プローブを行い、読めないなら spawn しない
+#   2. 「起動直後に死んだ」も失敗として backoff に数える
+#   3. SMB 由来の失敗を app 由来と分けてログに出す
+# ============================================================
+
+# 子がこの秒数生き延びたら「起動成功」とみなす。
+CHILD_MIN_HEALTHY_SEC = _env_float("AUTOSTOCK_CHILD_MIN_HEALTHY_SEC", 30.0)
+
+# SMB 障害を示す Windows エラー番号。
+_SMB_WINERRORS = {4, 6, 59, 64, 121, 1450}
+
+
+def _looks_like_smb_fault(exc: BaseException) -> bool:
+    try:
+        we = getattr(exc, "winerror", None)
+        if we is not None and int(we) in _SMB_WINERRORS:
+            return True
+        errno_v = getattr(exc, "errno", None)
+        if errno_v in (24,):          # EMFILE
+            return True
+        text = str(exc)
+        if any(("WinError %d" % w) in text for w in _SMB_WINERRORS):
+            return True
+        return "can't open file" in text
+    except Exception:
+        return False
+
+
+def _probe_paths_readable(logger: logging.Logger, name: str, path: Path) -> bool:
+    """spawn 前の安価なプローブ。
+
+    spawn は NAS 上の venv から数千ファイルを読むので非常に高価。
+    SMB が死んでいるときに spawn を繰り返すと枯渇を悪化させるだけなので、
+    まずインタプリタとスクリプトが読めるかだけ確かめる。
+    """
+    if not _env_bool("AUTOSTOCK_CHILD_SPAWN_PROBE", True):
+        return True
+    for label, p in (("interpreter", Path(_python_exe())), ("script", path)):
+        try:
+            with open(p, "rb") as f:
+                f.read(1)
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "[DATA COLLECTORS] spawn probe failed name=%s target=%s path=%s "
+                "smb_fault=%s err=%r (SMB が読めないので spawn しない。"
+                "spawn は NAS venv から数千ファイルを読むため、"
+                "枯渇中の再試行は状況を悪化させる)",
+                name, label, p, _looks_like_smb_fault(e), e,
+            )
+            return False
+    return True
+
+
+def _normalized_child_path(path: Path) -> Path:
+    """インタプリタと同じ共有表記へ揃える。
+
+    2026-08-28 の実測では
+        interpreter = W:\\...\\.venv\\Scripts\\python.exe      (ドライブレター)
+        script      = \\\\192.168.0.22\\business\\...\\xxx.py   (UNC)
+    と **同じ共有に 2 種類の表記**で触っていた。
+    Windows はこれを別セッションとして扱うので、SMB のセッション/
+    ハンドルを二重に消費する。インタプリタ側の表記へ揃える。
+    """
+    if not _env_bool("AUTOSTOCK_CHILD_PATH_NORMALIZE", True):
+        return path
+    try:
+        # .resolve() を使わないこと。
+        # マップドライブ (W:) を resolve すると UNC へ展開されてしまい、
+        # 「インタプリタ側の表記」が失われて正規化できなくなる
+        # (実測: Path('W:\\...\\python.exe').resolve()
+        #        -> '\\\\192.168.0.22\\business\\...')。
+        exe_s = str(_python_exe())
+        path_s = str(path)
+        # W:\...\ソースコード\.venv\Scripts\python.exe -> W:\...\ソースコード
+        marker = os.sep + ".venv" + os.sep
+        if marker not in exe_s:
+            return path
+        exe_root = exe_s.split(marker)[0]
+        root_s = str(PROJECT_ROOT)
+        if path_s.startswith(root_s) and exe_root and exe_root != root_s:
+            tail = path_s[len(root_s):].lstrip("\\/")
+            cand = Path(exe_root) / tail
+            if cand.exists():
+                return cand
+    except Exception:
+        pass
+    return path
+
+
 def _start_child(logger: logging.Logger, name: str, path: Path) -> subprocess.Popen:
+    path = _normalized_child_path(path)
     _check_file(path)
     cmd = [_python_exe(), str(path)]
     env = _build_env()
@@ -386,11 +508,19 @@ def _start_child_safe(logger: logging.Logger, name: str, path: Path) -> Optional
     1つの子の起動失敗でシステム全体を落とさないよう、ここで受け止めて
     None を返す。呼び出し側が間隔を空けて再試行する。
     """
+    if not _probe_paths_readable(logger, name, path):
+        _safe_heartbeat(f"collector_{name}", status="START_SKIPPED_SMB",
+                        detail={"path": str(path), "reason": "spawn_probe_failed"})
+        return None
     try:
         return _start_child(logger, name, path)
-    except Exception:
-        logger.exception("[DATA COLLECTORS] child start failed name=%s path=%s -> retry later", name, path)
-        _safe_heartbeat(f"collector_{name}", status="START_FAILED", detail={"path": str(path)})
+    except Exception as e:  # noqa: BLE001
+        logger.exception(
+            "[DATA COLLECTORS] child start failed name=%s path=%s smb_fault=%s -> retry later",
+            name, path, _looks_like_smb_fault(e),
+        )
+        _safe_heartbeat(f"collector_{name}", status="START_FAILED",
+                        detail={"path": str(path), "smb_fault": _looks_like_smb_fault(e)})
         return None
 
 
@@ -435,6 +565,7 @@ def main() -> int:
     # 起動に失敗した子の次回再試行時刻。起動できるまで監視ループ内で粘る。
     retry_at: Dict[str, float] = {}
     fail_counts: Dict[str, int] = {}
+    started_at: Dict[str, Optional[float]] = {}
 
     def _schedule_retry(name: str) -> None:
         n = fail_counts.get(name, 0) + 1
@@ -463,6 +594,7 @@ def main() -> int:
                 _schedule_retry(name)
             else:
                 fail_counts[name] = 0
+                started_at[name] = time.time()
             time.sleep(1.0)
 
         last_hb = 0.0
@@ -478,19 +610,55 @@ def main() -> int:
                     if new_proc is None:
                         _schedule_retry(name)
                     else:
-                        fail_counts[name] = 0
                         retry_at.pop(name, None)
+                        started_at[name] = time.time()
                         logger.warning("[DATA COLLECTORS] child recovered name=%s pid=%s", name, new_proc.pid)
                     continue
 
                 rc = proc.poll()
                 if rc is None:
+                    # 十分に生きたら「起動成功」として失敗カウンタを落とす。
+                    started = started_at.get(name)
+                    if started is not None and (now - started) >= CHILD_MIN_HEALTHY_SEC:
+                        if fail_counts.get(name):
+                            logger.warning(
+                                "[DATA COLLECTORS] child healthy name=%s pid=%s alive=%.1fs "
+                                "-> reset consecutive_failures (was %s)",
+                                name, proc.pid, now - started, fail_counts.get(name),
+                            )
+                        fail_counts[name] = 0
+                        started_at[name] = None      # 一度だけ判定する
                     continue
-                logger.error("[DATA COLLECTORS] child exited name=%s pid=%s returncode=%s -> restart", name, proc.pid, rc)
-                _safe_heartbeat(f"collector_{name}", status="EXITED", detail={"pid": proc.pid, "returncode": rc})
+
+                lifetime = None
+                started = started_at.get(name)
+                if started is not None:
+                    lifetime = now - started
+                started_at.pop(name, None)
+
+                died_fast = lifetime is not None and lifetime < CHILD_MIN_HEALTHY_SEC
+                logger.error(
+                    "[DATA COLLECTORS] child exited name=%s pid=%s returncode=%s "
+                    "lifetime=%s died_fast=%s -> restart",
+                    name, proc.pid, rc,
+                    None if lifetime is None else round(lifetime, 1), died_fast,
+                )
+                _safe_heartbeat(f"collector_{name}", status="EXITED",
+                                detail={"pid": proc.pid, "returncode": rc,
+                                        "lifetime_sec": lifetime, "died_fast": died_fast})
                 _safe_mark_stop(f"collector_{name}", {"pid": proc.pid, "returncode": rc})
                 if _STOP:
                     continue
+
+                if died_fast:
+                    # P0-1: 「起動はできたが即死」も失敗として backoff する。
+                    # 旧実装はここで backoff せず 5 秒間隔で回り続けていた。
+                    # 1 spawn = NAS venv から数千ファイルの import なので、
+                    # SMB 枯渇中にこれを繰り返すと自分で状況を悪化させる。
+                    procs[name] = None
+                    _schedule_retry(name)
+                    continue
+
                 time.sleep(RESTART_DELAY_SEC)
                 new_proc = _start_child_safe(logger, name, specs[name])
                 procs[name] = new_proc
@@ -498,6 +666,7 @@ def main() -> int:
                     _schedule_retry(name)
                 else:
                     fail_counts[name] = 0
+                    started_at[name] = time.time()
 
             if now - last_hb >= HEARTBEAT_INTERVAL_SEC:
                 last_hb = now

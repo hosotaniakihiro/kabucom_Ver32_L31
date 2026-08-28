@@ -186,17 +186,19 @@ def _safe_numeric_series(
                 .str.replace(",", "", regex=False)
                 .str.replace("円", "", regex=False)
                 .str.strip()
+                # 文字列 Series へ np.nan を入れると object->float の
+                # 暗黙ダウンキャスト (非推奨) になるので空文字へ寄せる。
+                # 直後の pd.to_numeric(errors="coerce") で同じ NaN になる。
                 .replace(
                     {
-                        "": np.nan,
-                        "None": np.nan,
-                        "none": np.nan,
-                        "NULL": np.nan,
-                        "null": np.nan,
-                        "nan": np.nan,
-                        "NaN": np.nan,
-                        "<NA>": np.nan,
-                        "pd.NA": np.nan,
+                        "None": "",
+                        "none": "",
+                        "NULL": "",
+                        "null": "",
+                        "nan": "",
+                        "NaN": "",
+                        "<NA>": "",
+                        "pd.NA": "",
                     }
                 )
             )
@@ -733,7 +735,26 @@ def _merge_indicator_output(base_df: pd.DataFrame, ind_df: pd.DataFrame) -> pd.D
         if alt in out.columns:
             if c in out.columns:
                 try:
-                    out[c] = out[c].combine_first(out[alt])
+                    # 片方が全 NA だと combine_first が空連結の
+                    # FutureWarning を出す。結果は自明なので先に分岐する。
+                    if out[alt].isna().all():
+                        pass
+                    elif out[c].isna().all():
+                        out[c] = out[alt]
+                    else:
+                        a = out[c]
+                        b = out[alt]
+                        # int64 と float64 を混ぜた combine_first だけが
+                        # 空連結の FutureWarning を出す。技術指標列は
+                        # float が本来の型なので、両方数値なら float64 へ揃える。
+                        if (
+                            pd.api.types.is_numeric_dtype(a)
+                            and pd.api.types.is_numeric_dtype(b)
+                            and a.dtype != b.dtype
+                        ):
+                            a = a.astype("float64")
+                            b = b.astype("float64")
+                        out[c] = a.combine_first(b)
                 except Exception:
                     out[c] = out[c].where(out[c].notna(), out[alt])
                 out.drop(columns=[alt], inplace=True, errors="ignore")

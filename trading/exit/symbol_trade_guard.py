@@ -40,6 +40,7 @@ import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+from nas_root import nas_path, nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +82,7 @@ def _today() -> str:
 def _default_db_path() -> str:
     base = os.getenv(
         "TRADE_GUARD_DB_DIR",
-        r"\\192.168.0.22\AutoStockBuyAndSell\raw_data\trade_guard",
+        nas_path(r"raw_data\trade_guard"),
     )
     return str(Path(base) / f"trade_guard{_today()}.db")
 
