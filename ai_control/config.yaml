@@ -1,0 +1,112 @@
+# ============================================================
+# File   : ai_control/config.yaml
+# Purpose:
+#   - supervisor.py の動作設定
+#   - 第1段階（監視 → Codex解析 → task.json 生成）で使う値のみを持つ
+# ------------------------------------------------------------
+# 第2段階以降で claude / restart / test のセクションを足す。
+# ============================================================
+
+paths:
+  # 空文字なら supervisor.py の 1 つ上（= ソースコード直下）を使う
+  project_dir: ""
+  # console_tee.py が書き出す NAS 上のログディレクトリ
+  log_dir: "//192.168.0.22/AutoStockBuyAndSell/Logs/console"
+  # プロジェクトの venv。第3段階（compileall / pytest）で使う
+  python: ".venv/Scripts/python.exe"
+
+watch:
+  # 起動ごとに <prefix>_<日時>_<PID>.log が新規作成されるため、
+  # prefix ごとに「最新の 1 本」を追う
+  prefixes:
+    - console
+    - main_database
+    - push_receiver_runner
+    - summary_database_runner
+    - ranking_collector_runner
+  suffix: ".log"
+
+  # NAS への I/O 予算。ログの NAS 書き込みは本体の実行時間を実測 25% 食っていた
+  # （core/logging/console_tee.py のコメント参照）ので、監視側は控えめにする。
+  poll_interval_sec: 10        # 既知ファイルの stat + 追記読み取り
+  rescan_interval_sec: 60      # ディレクトリを走査して新しいログを見つける間隔
+  max_read_bytes_per_poll: 262144   # 1 ポーリングで読む上限。超過分は読み飛ばす
+
+  # supervisor 起動時に既存ファイルのどこから読むか
+  #   end       … 末尾から（過去ログを解析しない。通常はこちら）
+  #   beginning … 先頭から（過去ログの検証用）
+  start_at: end
+
+  # 全ログが一定時間伸びなければ「停止」とみなす。0 で無効
+  stall_seconds: 300
+
+evidence:
+  # トリガ行の前後を何行 Codex に渡すか
+  context_lines_before: 300
+  context_lines_after: 80
+  # 証拠テキストの上限（文字）。超えたら前方を削る
+  max_evidence_chars: 60000
+
+codex:
+  bin: "codex"
+  # 診断役は絶対にファイルを書けない。指示文ではなくサンドボックスで縛る
+  sandbox: "read-only"
+  timeout_sec: 420
+  # 空なら codex の既定モデル
+  model: ""
+
+limits:
+  # 同じ症状を何秒間は再解析しないか
+  cooldown_sec_per_signature: 1800
+  # 1 時間あたりの Codex 起動上限
+  max_analyses_per_hour: 6
+  # 同じ症状を通算何回まで解析するか。超えたら SAFE_STOP
+  max_same_signature: 3
+
+triggers:
+  - name: traceback
+    severity: HIGH
+    pattern: '^\s*Traceback \(most recent call last\):'
+
+  - name: critical
+    severity: HIGH
+    pattern: '\[CRITICAL\]'
+
+  - name: db_lock
+    severity: HIGH
+    pattern: 'database is locked|database table is locked|SQLITE_BUSY'
+
+  - name: unauthorized
+    severity: HIGH
+    # 生の "401" は株価・数量と衝突するため単独では拾わない
+    pattern: '401 Unauthorized|Unauthorized|認証に失敗|トークンが無効'
+
+  - name: push_disconnect
+    severity: HIGH
+    # 実装が実際に出す文言に合わせる (trading/push/push_stream/ws_callbacks.py,
+    # transport.py)。"--- DISCONNECTED expected_rotation ---" は正常系なので
+    # 末尾のダッシュまで含めて区別する。
+    pattern: '--- DISCONNECTED --- |\[push_stream\] mark ws disconnected|ws socket already closed'
+
+  - name: memory_error
+    severity: HIGH
+    pattern: 'MemoryError|Cannot allocate memory'
+
+  # 窓内で min_count 回出て初めてトリガ。単発の ERROR では起こさない
+  - name: error_burst
+    severity: MEDIUM
+    pattern: '\[ERROR\]'
+    min_count: 5
+    window_sec: 120
+
+# ------------------------------------------------------------
+# 既知の良性行。トリガ判定より先に落とす。
+# 実ログ (2026-08-28) で誤検出したものを登録している。
+# ------------------------------------------------------------
+exclude_patterns:
+  # websocket のコールバック登録ログ。"error=True close=True" を含むだけ
+  - 'websocket callbacks wired'
+  # ヘルスログ。ws_disconnect 系のカウンタを常時出している
+  - '\[PUSH OWNER HEALTH\]'
+  # 正常なローテーション切断
+  - '--- DISCONNECTED expected_rotation ---'

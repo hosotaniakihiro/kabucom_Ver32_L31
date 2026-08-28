@@ -1,0 +1,6 @@
+# supervisor が生成する実行時データ。コミットしない
+inbox/
+history/
+status/
+locks/
+__pycache__/

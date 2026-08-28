@@ -1,0 +1,101 @@
+# ============================================================
+# File   : ai_control/policy.yaml
+# Purpose:
+#   - 修正を GREEN / YELLOW / RED に分類する規則
+#   - 第1段階では「分類して task.json に書く」ところまで。
+#     実際に修正を止めるゲートは第2段階以降で使う。
+# ------------------------------------------------------------
+# 判定は二重化する:
+#   1. Codex が申告する category
+#   2. Codex が挙げた files のパス（red_path_patterns / yellow_path_patterns）
+#   どちらか一方でも上位（危険側）に該当したら、危険側を採用する。
+#   Codex の自己申告だけを信じない、という点がこの設計の要。
+# ============================================================
+
+# GREEN: 自動修正 → テスト → 自動再起動まで許す
+auto_fix:
+  - logging
+  - retry
+  - exception_handling
+  - memory_cleanup
+  - display
+
+# YELLOW: 自動修正はするが DRY-RUN 起動までで止める（本番復帰は人が判断）
+dry_run_only:
+  - ranking
+  - summary
+  - push
+  - database_writer
+  - scheduler
+
+# RED: 自動修正を禁止。Codex の診断だけ残して人間に上げる
+manual_approval:
+  - order
+  - entry
+  - exit
+  - position
+  - capital
+  - authentication
+  - database_schema
+
+# ------------------------------------------------------------
+# パスによる強制分類（category より優先。fnmatch で照合）
+# ------------------------------------------------------------
+red_path_patterns:
+  # 発注・約定・建玉
+  - "order_executor.py"
+  - "sell.py"
+  - "SEND_exit_order.py"
+  - "cancel_order.py"
+  - "force_cancel_loop.py"
+  - "exit_logic.py"
+  - "should_exit_position.py"
+  - "exit_handler_short.py"
+  - "Position.py"
+  - "kabus_position_sync.py"
+  - "evaluate_entry*.py"
+  - "evaluate_signals.py"
+  - "evaluate_combined.py"
+  - "trading/entry/*"
+  - "trading/entry_exit/*"
+  - "trading/exit/*"
+  - "trading/execution/*"
+  - "trading/position/*"
+  - "trading/positions/*"
+  - "trading/portfolio/*"
+  - "trading/risk/*"
+  - "trading/handlers/exit_handler*"
+  - "ats/*"
+  # 認証・接続情報・設定
+  - "kabu_api/*"
+  - "certs/*"
+  - "config/*"
+  - "settings.py"
+  - "*.ini"
+  - "*.env"
+  # スキーマ
+  - "database/*schema*"
+  - "*migration*"
+
+yellow_path_patterns:
+  - "trading/ranking/*"
+  - "trading/ranking_summary/*"
+  - "trading/summary/*"
+  - "trading/push/*"
+  - "trading/push_summary/*"
+  - "database/*"
+  - "scheduler_jobs/*"
+  - "trading/scheduler/*"
+  - "main_database.py"
+  - "push_db_writer_fullsave.py"
+  - "push_to_summary.py"
+
+# ------------------------------------------------------------
+# どの分類でも Claude Code に絶対にさせないこと（第2段階でプロンプトへ転記）
+# ------------------------------------------------------------
+never:
+  - "git reset --hard / git checkout -- による破棄"
+  - "DB スキーマ変更・テーブル削除・NAS 上の DB ファイル削除"
+  - "settings.ini / config 配下 / 認証情報の変更"
+  - "指示されていない仕様変更・リファクタリング"
+  - "テストを通すためにテスト側を書き換えること"
