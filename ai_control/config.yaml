@@ -110,3 +110,52 @@ exclude_patterns:
   - '\[PUSH OWNER HEALTH\]'
   # 正常なローテーション切断
   - '--- DISCONNECTED expected_rotation ---'
+
+# ============================================================
+# 第2段階: Codex の指示書 → Claude Code 自動修正
+# ============================================================
+
+claude:
+  bin: "claude"
+  timeout_sec: 900
+  max_turns: 30
+  # 編集の確認プロンプトを出さない。Bash は claude_client.py 側で禁止している
+  permission_mode: "acceptEdits"
+  model: ""
+
+repair:
+  enabled: true
+
+  # Codex の確信度がこれ未満なら Claude に渡さない
+  min_confidence: 0.7
+
+  # 自動修正を許す分類。RED は絶対に入れないこと
+  allow_levels: [GREEN, YELLOW]
+
+  # 無限修正ループ防止
+  max_repairs_per_hour: 5
+  max_same_signature: 3
+
+  # repair.lock の有効期限。これを過ぎたロックは異常終了とみなして奪う
+  lock_timeout_sec: 3600
+
+  # 本番の作業ツリーの外に置くこと（稼働中プロセスに見せない）。
+  # ★ NAS 上には置かないこと。2026-08-28 に NAS 上へ作ろうとして
+  #    git worktree add が 600 秒でタイムアウトした（2111 ファイル / 16.5MB）。
+  #    worktree は毎回 git から作り直す使い捨てなので、ローカルディスクで良い。
+  worktree_dir: "C:/Users/hosot/AppData/Local/ai_fix_worktree"
+
+  # worktree の作成・リセットにかける上限
+  worktree_timeout_sec: 900
+
+  # 第2段階では本番へ反映しない。第4段階で扱う
+  apply_to_production: false
+
+tests:
+  # compileall は常に実行する（コードを実行しないので安全）
+  compile_timeout_sec: 300
+  # import smoke はコードを実行する。tests_runner.py の denylist で
+  # 起動系・発注系・バッチ・テストスクリプトを除外している
+  import_smoke: true
+  import_timeout_sec: 90
+  max_import_modules: 12

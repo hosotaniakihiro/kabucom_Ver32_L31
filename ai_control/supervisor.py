@@ -40,6 +40,7 @@ sys.path.insert(0, str(HERE))
 from codex_client import CodexClient           # noqa: E402
 from logtail import LogTailer                  # noqa: E402
 from policy import Policy                      # noqa: E402
+from repair import Repairer                    # noqa: E402
 from triggers import RateLimiter, TriggerEngine, TriggerHit  # noqa: E402
 
 
@@ -109,6 +110,11 @@ class Supervisor:
         self.buffers: Dict[str, Deque[str]] = defaultdict(lambda: deque(maxlen=buf_len))
         self.pending: Dict[str, _Pending] = {}
 
+        self.repairer = Repairer(
+            here=HERE, project_dir=self.project_dir, cfg=cfg, policy=policy
+        )
+        self.repair_enabled = (not args.no_repair) and self.repairer.enabled
+
         self.state_path = HERE / "status" / "state.json"
         self.inbox_path = HERE / "inbox" / "task.json"
         self.history_dir = HERE / "history"
@@ -151,7 +157,11 @@ class Supervisor:
             _log("codex       = 無効 (--no-codex)")
         else:
             _log("codex       = " + self.codex.bin_path + " -s " + self.codex.sandbox)
-        _log("第1段階: 監視と診断のみ。本体の修正・再起動は行いません。")
+        if self.repair_enabled:
+            _log("第2段階: 有効。GREEN/YELLOW は worktree 上で Claude Code が修正します。")
+            _log("           本番への反映と main.py の再起動は行いません。")
+        else:
+            _log("第2段階: 無効。監視と診断のみ。")
 
         if not self.log_dir.exists():
             _log("!! ログディレクトリが見えません: " + str(self.log_dir))
@@ -285,9 +295,36 @@ class Supervisor:
             "Codex 完了 (%.0fs): status=%s category=%s confidence=%s"
             % (took, task.get("status"), task.get("category"), task.get("confidence"))
         )
-        self._write_task(h, task, prompt)
+        doc = self._write_task(h, task, prompt)
         self.limiter.commit(h.signature)
         self.dispatched += 1
+
+        if self.repair_enabled:
+            self._run_repair(doc)
+
+    # -- 第2段階 -------------------------------------------------
+
+    def _run_repair(self, doc: dict) -> None:
+        _log("修復判定を開始します。")
+        try:
+            out = self.repairer.repair(doc)
+        except Exception as e:  # 修復側の事故で監視を止めない
+            _log("!! 修復処理が例外で終了しました: %r" % (e,))
+            return
+
+        _log("修復結果: %s — %s" % (out.verdict, out.reason))
+        if out.claude_invoked:
+            _log("  Claude 起動: あり / 変更 %d ファイル" % len(out.changed_files))
+            for f in out.changed_files[:10]:
+                _log("    - " + f)
+            if out.diff_stat:
+                for line in out.diff_stat.strip().splitlines()[-1:]:
+                    _log("  " + line.strip())
+            if out.tests:
+                _log("  テスト: %s" % ("合格" if out.tests.get("ok") else "不合格"))
+            if out.branch:
+                _log("  ブランチ: %s  commit=%s" % (out.branch, out.commit or "(なし)"))
+        _log("  監査ログ: %s" % out.audit_path)
 
     # -- 出力 ---------------------------------------------------
 
@@ -344,6 +381,7 @@ class Supervisor:
 
         level = cls["level"] if cls else "-"
         _log("書き出し: %s.json  分類=%s  next_action=%s" % (base, level, next_action))
+        return doc
 
     # -- リプレイ（既存ログでの検証用） ---------------------------
 
@@ -400,12 +438,21 @@ def main() -> int:
     ap.add_argument("--once", action="store_true", help="1件処理したら終了する")
     ap.add_argument("--replay", default="", help="既存のログファイルで検証する")
     ap.add_argument("--list-only", action="store_true", help="replay で検出だけして解析しない")
+    ap.add_argument("--no-repair", action="store_true", help="第2段階（Claude Code 修正）を行わない")
+    ap.add_argument("--repair-from", default="", help="既存の task.json を読んで修復だけ実行する")
     args = ap.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
     pol = Policy(yaml.safe_load(Path(args.policy).read_text(encoding="utf-8")))
 
     sup = Supervisor(cfg, pol, args)
+
+    if args.repair_from:
+        doc = json.loads(Path(args.repair_from).read_text(encoding="utf-8"))
+        _log("repair-from: " + args.repair_from)
+        sup._run_repair(doc)
+        return 0
+
     if args.replay:
         return sup.replay(Path(args.replay))
     return sup.run()
