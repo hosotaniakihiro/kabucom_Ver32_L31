@@ -48,6 +48,8 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+
+import requests
 from configparser import ConfigParser
 from pathlib import Path
 from typing import Any
@@ -550,19 +552,22 @@ def _post_token_api(api_password: str, timeout: float = 5.0) -> str:
     url = f"{API_URL}/token"
     headers = {"Content-Type": "application/json"}
     data = json.dumps({"APIPassword": str(api_password)}).encode()
-    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-
+    # urllib.request は毎回 "Connection: close" を送る。kabu Station は
+    # このヘッダーが付いた POST /token に応答を返さず、5 秒でタイムアウト
+    # させる (2026-08-29 実測。誤ったパスワードでも keep-alive なら
+    # 0.01 秒で 4001013 が返る)。requests は keep-alive で送るので通る。
     _TOKEN_API_CALL_COUNT += 1
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as res:
-            raw = res.read().decode("utf-8", errors="ignore")
-    except urllib.error.HTTPError as e:
-        status = int(getattr(e, "code", 0) or 0)
-        raw = ""
-        try:
-            raw = e.read().decode("utf-8", errors="ignore")
-        except Exception:
-            raw = ""
+        res = requests.post(url, data=data, headers=headers, timeout=timeout)
+    except Exception as e:
+        raise TokenApiTransportError(
+            f"POST /token could not reach kabu Station url={url} error={e}"
+        ) from e
+
+    status = int(res.status_code)
+    raw = res.text or ""
+
+    if status >= 400:
         code, message = _parse_kabu_error(raw)
         if status in (401, 403) or code == "4001009" or "APIキー不一致" in message:
             raise TokenApiPasswordMismatch(
@@ -570,17 +575,13 @@ def _post_token_api(api_password: str, timeout: float = 5.0) -> str:
                 status=status,
                 code=code,
                 body=raw,
-            ) from e
+            )
         raise TokenApiError(
             f"POST /token failed status={status} code={code} message={message}",
             status=status,
             code=code,
             body=raw,
-        ) from e
-    except Exception as e:
-        raise TokenApiTransportError(
-            f"POST /token could not reach kabu Station url={url} error={e}"
-        ) from e
+        )
 
     try:
         result = json.loads(raw) if raw else {}

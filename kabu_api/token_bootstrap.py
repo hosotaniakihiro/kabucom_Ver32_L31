@@ -50,8 +50,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import urllib.error
 import urllib.request
+
+import requests
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
@@ -81,6 +84,25 @@ PF_OK = "ok"
 PF_ACCEPTED_NON_AUTH = "accepted_non_auth"
 PF_AUTH_REJECTED = "auth_rejected"
 PF_TRANSPORT_ERROR = "transport_error"
+
+# R18: 「TCP すら繋がらない」と「繋がったのに応答が返らない」を区別する。
+#
+# 2026-08-28 23:3x の実測 (kabu Station は起動・ログイン済み):
+#   誤パスワードの POST /token       -> HTTP 401  (99 ms)
+#   dummy キーの GET /wallet/cash    -> HTTP 401  (6 ms)
+#   失効トークンの GET /wallet/cash  -> 12 秒ハング後に RST (WinError 10054)
+#   正パスワードの POST /token       -> 12 秒ハング後に RST
+# 「門前払いは速いが実処理だけがハングする」状態があり、
+# 失効トークンが 401 ではなく RST として返ってくる。
+# 旧実装はこれを「kabu Station に繋がらない」と扱って abort し、
+# トークン再取得を試みないため **自力で復旧できなかった**。
+PF_NO_RESPONSE = "no_response"
+
+# http_get_json が transport 失敗の内容へ付ける接頭辞。
+# 独自の request_fn を渡す既存呼び出しは接頭辞を持たないので、
+# その場合は従来どおり unreachable 扱いになる (後方互換)。
+TRANSPORT_UNREACHABLE = "unreachable"
+TRANSPORT_NO_RESPONSE = "no_response"
 PF_EMPTY_TOKEN = "empty_token"
 
 # ---- bootstrap failure kinds -------------------------------------------
@@ -90,6 +112,7 @@ FAIL_API_PASSWORD_MISMATCH = "api_password_mismatch"
 FAIL_TOKEN_API_TRANSPORT = "token_api_transport_error"
 FAIL_TOKEN_API_ERROR = "token_api_error"
 FAIL_PREFLIGHT_TRANSPORT = "preflight_transport_error"
+FAIL_PREFLIGHT_NO_RESPONSE = "preflight_no_response"
 FAIL_FRESH_TOKEN_REJECTED = "fresh_token_rejected"
 FAIL_RECOVERY_DISABLED = "cached_token_rejected_recovery_disabled"
 FAIL_RECOVERY_ALREADY_USED = "cached_token_rejected_recovery_already_used"
@@ -100,6 +123,39 @@ _LOG_PREFIX = "[TOKEN BOOTSTRAP]"
 # rejection) is allowed once per process.  Both the import-time policy bootstrap
 # and main_database.main() run the state machine, and they must share this.
 _STARTUP_RECOVERY_ATTEMPTED = False
+
+# R18: 上のフラグは「/token が成功した」ときだけ立てる。
+# 失敗した試行で食い潰すと、後続の本番 bootstrap が 1 度も呼べなくなる
+# (2026-08-29 10:11 に main_database が実際にこれで abort した)。
+# ループ防止は試行回数の上限で行う。
+_STARTUP_TOKEN_CALLS = 0
+_DEFAULT_STARTUP_TOKEN_MAX_CALLS = 2
+
+
+def startup_token_max_calls() -> int:
+    """1 プロセスで許す POST /token の最大試行回数。"""
+    try:
+        v = os.getenv("KABU_TOKEN_STARTUP_MAX_CALLS")
+        if v and str(v).strip():
+            return max(1, int(str(v).strip()))
+    except Exception:
+        pass
+    return _DEFAULT_STARTUP_TOKEN_MAX_CALLS
+
+
+def startup_token_calls() -> int:
+    return int(_STARTUP_TOKEN_CALLS)
+
+
+def _startup_recovery_exhausted() -> bool:
+    """もう /token を呼んではいけないか。
+
+    - 既に成功して取得済み          -> True (取り直す理由がない)
+    - 試行回数が上限に達している    -> True (ループ防止)
+    """
+    if _STARTUP_RECOVERY_ATTEMPTED:
+        return True
+    return _STARTUP_TOKEN_CALLS >= startup_token_max_calls()
 
 
 def token_tail(token: Any) -> str:
@@ -117,8 +173,9 @@ def startup_recovery_attempted() -> bool:
 
 def reset_startup_state() -> None:
     """Test hook. Never called by production code."""
-    global _STARTUP_RECOVERY_ATTEMPTED
+    global _STARTUP_RECOVERY_ATTEMPTED, _STARTUP_TOKEN_CALLS
     _STARTUP_RECOVERY_ATTEMPTED = False
+    _STARTUP_TOKEN_CALLS = 0
 
 
 def _env_float(name: str, default: float) -> float:
@@ -158,41 +215,73 @@ def is_api_key_mismatch(content: Any) -> bool:
 # ============================================================
 
 
+def classify_transport_error(exc: BaseException) -> str:
+    """transport 例外を unreachable / no_response に分類する。
+
+    unreachable  : listen していない (接続拒否・名前解決失敗)
+    no_response  : 接続はできたが応答が返らない (タイムアウト・接続リセット)
+    """
+    reason = getattr(exc, "reason", None)
+    cause = reason if isinstance(reason, BaseException) else exc
+
+    if isinstance(cause, ConnectionRefusedError):
+        return TRANSPORT_UNREACHABLE
+    if isinstance(cause, (ConnectionResetError, TimeoutError, socket.timeout)):
+        return TRANSPORT_NO_RESPONSE
+    if isinstance(cause, socket.gaierror):
+        return TRANSPORT_UNREACHABLE
+
+    text = str(cause).lower()
+    if ("timed out" in text or "timeout" in text
+            or "reset" in text or "10054" in text or "10060" in text):
+        return TRANSPORT_NO_RESPONSE
+    if ("refused" in text or "10061" in text
+            or "getaddrinfo" in text or "name or service" in text):
+        return TRANSPORT_UNREACHABLE
+    return TRANSPORT_UNREACHABLE
+
+
 def http_get_json(url: str, token: str, timeout: float = 5.0) -> tuple[bool, int | None, Any]:
     """GET url with X-API-KEY.
 
     Returns (ok, status, content).  status is None when the request never reached
     kabu Station (transport error).
     """
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Content-Type": "application/json",
-            "X-API-KEY": str(token or ""),
-        },
-        method="GET",
-    )
+    # urllib.request は毎回 "Connection: close" を送る。kabu Station は
+    # このヘッダーを付けたリクエストに応答を返さず、接続を掴んだまま
+    # タイムアウトさせる (2026-08-29 実測)。
+    #
+    #   最小ヘッダー                -> HTTP 401  0.01s
+    #   + Content-Type              -> HTTP 401  0.00s
+    #   + Accept-Encoding: identity -> HTTP 401  0.00s
+    #   + Connection: close         -> 応答なし  5.00s  ★これだけが原因
+    #
+    # そのため起動時の preflight は必ず no_response となり、
+    # main_database.py が毎回 abort していた。
+    # requests は keep-alive で送るので影響を受けない。実際
+    # kabu_api/positions.py など他の呼び出しは requests で正常に動いている。
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as res:
-            raw = res.read().decode("utf-8", errors="ignore")
-            try:
-                content = json.loads(raw) if raw else {}
-            except Exception:
-                content = raw
-            return True, int(getattr(res, "status", 200) or 200), content
-    except urllib.error.HTTPError as e:
-        raw = ""
-        try:
-            raw = e.read().decode("utf-8", errors="ignore")
-        except Exception:
-            raw = ""
-        try:
-            content = json.loads(raw) if raw else str(e)
-        except Exception:
-            content = raw or str(e)
-        return False, int(getattr(e, "code", 0) or 0), content
-    except Exception as e:  # URLError / timeout / socket error
-        return False, None, str(e)
+        res = requests.get(
+            url,
+            headers={
+                "Content-Type": "application/json",
+                "X-API-KEY": str(token or ""),
+            },
+            timeout=timeout,
+        )
+    except Exception as e:  # ConnectionError / Timeout / socket error
+        # R18: 呼び出し側が unreachable / no_response を判別できるよう接頭辞を付ける
+        return False, None, "%s: %s" % (classify_transport_error(e), e)
+
+    raw = res.text or ""
+    try:
+        content = json.loads(raw) if raw else {}
+    except Exception:
+        content = raw
+
+    if 200 <= res.status_code < 300:
+        return True, int(res.status_code), content
+    return False, int(res.status_code), content
 
 
 @dataclass
@@ -209,7 +298,13 @@ class PreflightResult:
 
     @property
     def is_transport_error(self) -> bool:
-        return self.kind == PF_TRANSPORT_ERROR
+        # no_response も transport の一種 (既存呼び出しの互換のため True のまま)
+        return self.kind in (PF_TRANSPORT_ERROR, PF_NO_RESPONSE)
+
+    @property
+    def is_no_response(self) -> bool:
+        """接続はできたが応答が返らない (listen はしている)。"""
+        return self.kind == PF_NO_RESPONSE
 
     def detail(self) -> str:
         return (
@@ -293,12 +388,16 @@ def preflight_token(
                 ok=True, kind=PF_ACCEPTED_NON_AUTH, endpoint=endpoint, status=status, content=content
             )
 
+        kind = (PF_NO_RESPONSE
+                if str(content or "").startswith(TRANSPORT_NO_RESPONSE + ":")
+                else PF_TRANSPORT_ERROR)
         transport_failure = PreflightResult(
-            ok=False, kind=PF_TRANSPORT_ERROR, endpoint=endpoint, status=None, content=content
+            ok=False, kind=kind, endpoint=endpoint, status=None, content=content
         )
         logger.error(
-            "%s %s TOKEN_ACTION=%s endpoint=%s transport_error=%s",
-            _LOG_PREFIX, label, ACTION_PREFLIGHT_NG, endpoint, safe_content_text(content),
+            "%s %s TOKEN_ACTION=%s endpoint=%s kind=%s transport_error=%s",
+            _LOG_PREFIX, label, ACTION_PREFLIGHT_NG, endpoint, kind,
+            safe_content_text(content),
         )
 
     if auth_failure is not None:
@@ -405,7 +504,7 @@ def bootstrap_startup_token(
       * POST /token itself rejected -> api_password_mismatch (case B), which is
         never reported as a stale-cache problem (case A).
     """
-    global _STARTUP_RECOVERY_ATTEMPTED
+    global _STARTUP_RECOVERY_ATTEMPTED, _STARTUP_TOKEN_CALLS
 
     read_cached = read_cached_token or _default_read_cached_token
     do_request = request_fresh_token or _default_request_fresh_token
@@ -439,9 +538,24 @@ def bootstrap_startup_token(
                 ok=True, token=cached, source=cached_source, token_api_calls=0, preflight=pf
             )
 
-        if pf.is_transport_error:
+        if pf.is_no_response:
+            # R18: TCP は繋がっているのに応答が返らない。
+            # 失効トークンに対して 401 ではなく RST / タイムアウトを返す実機が
+            # あるため、「失効かもしれない」として再取得の対象にする。
+            # (kabu Station が listen していることは認証エラーの即答で分かる)
             logger.error(
-                "%s %s abort: kabu API preflight could not connect. %s "
+                "%s %s cached token got NO RESPONSE (connected but reset/timeout). %s "
+                "kabu Station は listen しているので失効トークンの可能性がある。"
+                "トークン再取得を 1 回だけ試みる。",
+                _LOG_PREFIX, label, pf.detail(),
+            )
+            no_recovery_kind = FAIL_PREFLIGHT_NO_RESPONSE
+
+        elif pf.is_transport_error:
+            # TCP すら繋がらない = kabu Station が listen していない。
+            # ここでトークンを取り直しても意味がないので従来どおり abort する。
+            logger.error(
+                "%s %s abort: kabu API preflight could not connect (TCP unreachable). %s "
                 "Confirm kabu Station API is listening on localhost:18080.",
                 _LOG_PREFIX, label, pf.detail(),
             )
@@ -450,20 +564,25 @@ def bootstrap_startup_token(
                 failure_kind=FAIL_PREFLIGHT_TRANSPORT, detail=pf.detail(), preflight=pf,
             )
 
-        # Auth rejected -> the cached token is stale on the server side.
-        logger.error(
-            "%s %s cached token rejected by kabu API (stale cached token). %s",
-            _LOG_PREFIX, label, pf.detail(),
-        )
+        else:
+            # Auth rejected -> the cached token is stale on the server side.
+            logger.error(
+                "%s %s cached token rejected by kabu API (stale cached token). %s",
+                _LOG_PREFIX, label, pf.detail(),
+            )
+            no_recovery_kind = FAIL_RECOVERY_DISABLED
+
         if not allow_startup_recovery:
             return BootstrapResult(
                 ok=False, token=cached, source=cached_source, token_api_calls=0,
-                failure_kind=FAIL_RECOVERY_DISABLED, detail=pf.detail(), preflight=pf,
+                failure_kind=no_recovery_kind, detail=pf.detail(), preflight=pf,
             )
-        if _STARTUP_RECOVERY_ATTEMPTED:
+        if _startup_recovery_exhausted():
             logger.error(
-                "%s %s startup token recovery already used once in this process; not calling /token again.",
-                _LOG_PREFIX, label,
+                "%s %s startup token recovery exhausted in this process "
+                "(succeeded=%s calls=%d max=%d); not calling /token again.",
+                _LOG_PREFIX, label, _STARTUP_RECOVERY_ATTEMPTED,
+                _STARTUP_TOKEN_CALLS, startup_token_max_calls(),
             )
             return BootstrapResult(
                 ok=False, token=cached, source=cached_source, token_api_calls=0,
@@ -477,18 +596,21 @@ def bootstrap_startup_token(
                 ok=False, token="", source="", token_api_calls=0,
                 failure_kind=FAIL_NO_TOKEN, detail="no cached token and recovery disabled",
             )
-        if _STARTUP_RECOVERY_ATTEMPTED:
+        if _startup_recovery_exhausted():
             logger.error(
-                "%s %s no cached token and startup /token already used once in this process.",
-                _LOG_PREFIX, label,
+                "%s %s no cached token and startup /token exhausted "
+                "(succeeded=%s calls=%d max=%d).",
+                _LOG_PREFIX, label, _STARTUP_RECOVERY_ATTEMPTED,
+                _STARTUP_TOKEN_CALLS, startup_token_max_calls(),
             )
             return BootstrapResult(
                 ok=False, token="", source="", token_api_calls=0,
                 failure_kind=FAIL_RECOVERY_ALREADY_USED, detail="no cached token",
             )
 
-    # ---- exactly one POST /token --------------------------------------
-    _STARTUP_RECOVERY_ATTEMPTED = True
+    # ---- POST /token --------------------------------------------------
+    # R18: フラグは「成功したら」立てる。ここでは試行回数だけ進める。
+    _STARTUP_TOKEN_CALLS += 1
     logger.warning(
         "%s %s TOKEN_SOURCE=%s TOKEN_ACTION=%s",
         _LOG_PREFIX, label, recovery_source, ACTION_API_REQUESTED,
@@ -540,6 +662,10 @@ def bootstrap_startup_token(
             failure_kind=FAIL_TOKEN_API_ERROR, detail="empty token returned by /token",
         )
 
+    # R18: ここまで来たら /token は成功している。以後この プロセスで
+    # 取り直す理由は無いのでフラグを立てる (ループ防止は従来どおり)。
+    _STARTUP_RECOVERY_ATTEMPTED = True
+
     logger.warning(
         "%s %s TOKEN_SOURCE=%s TOKEN_ACTION=%s token_len=%d token_tail=%s",
         _LOG_PREFIX, label, recovery_source, ACTION_API_RECEIVED, token_len(fresh), token_tail(fresh),
@@ -569,6 +695,11 @@ def bootstrap_startup_token(
 
 
 __all__ = [
+    "PF_NO_RESPONSE",
+    "TRANSPORT_UNREACHABLE",
+    "TRANSPORT_NO_RESPONSE",
+    "FAIL_PREFLIGHT_NO_RESPONSE",
+    "classify_transport_error",
     "VERSION",
     "KABU_API_BASE_URL",
     "DEFAULT_PREFLIGHT_ENDPOINTS",
