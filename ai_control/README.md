@@ -116,10 +116,28 @@ Codex が申告する `category` だけを信じない。`policy.yaml` の `red_
 | `push_disconnect` | 初版は誤検出16件。`websocket callbacks wired`（`error=True close=True` を含むだけ）と `[PUSH OWNER HEALTH]` に当たっていた。実装が出す文言（`--- DISCONNECTED --- ` / `[push_stream] mark ws disconnected`）に直し、`exclude_patterns` を追加。残った11件は本物の切断 WARNING |
 | `error_burst` | 726KB のログで2件。妥当 |
 | その他 | 検出0件（この日のログには該当なし） |
+| `data_collectors_runner` | **2026-08-29 追加**。46MB のログで 4,391 件検出したが、大半が重複だった。この系統は子プロセス（`ranking_collector` / `summary_database` / `push_receiver`）のログを `[CHILD:xxx]` で包んで再出力する多重化ログで、子はそれぞれ自分のログを持つ。`exclude_patterns` に `\[CHILD:...\]` を追加して 4,391 → **0 件**。runner 自身が出す行（子の起動・停止・異常終了）は残る |
+| `yahoo_complement_runner` | **2026-08-29 追加**。1.9MB で 1 件（`db_lock`）。妥当 |
 
 `--- DISCONNECTED expected_rotation ---` は正常系なので除外している。
 
 トリガを変えたら必ず `--replay <logfile> --list-only` で誤検出量を確認すること。
+
+## 監視系統の取りこぼし（2026-08-29）
+
+再起動後にログディレクトリを見直したところ、監視対象から
+`data_collectors_runner` と `yahoo_complement_runner` が漏れていた。
+**新しいプロセスが増えたら `watch.prefixes` を更新すること。**
+漏れていると、その系統の異常は永久に検出されない。
+
+確認方法:
+
+```powershell
+# 当日動いているログ系統を一覧する
+ls \192.168.0.22\AutoStockBuyAndSell\Logs\console | ForEach-Object {
+  $_.Name -replace '_\d{8}_\d{6}_\d+\.log$',''
+} | Sort-Object -Unique
+```
 
 ## 実測値
 
@@ -228,6 +246,22 @@ worktree は毎回 git から作り直す使い捨てなので、ローカルデ
 git が `dubious ownership` で実行を拒否する。
 `worktree.py` の `_git()` が `-c safe.directory=...` を毎回付けて回避している。
 **グローバル設定は書き換えていない。**
+
+## 監視系統の取りこぼし（2026-08-29）
+
+再起動後にログディレクトリを見直したところ、監視対象から
+`data_collectors_runner` と `yahoo_complement_runner` が漏れていた。
+**新しいプロセスが増えたら `watch.prefixes` を更新すること。**
+漏れていると、その系統の異常は永久に検出されない。
+
+確認方法:
+
+```powershell
+# 当日動いているログ系統を一覧する
+ls \192.168.0.22\AutoStockBuyAndSell\Logs\console | ForEach-Object {
+  $_.Name -replace '_\d{8}_\d{6}_\d+\.log$',''
+} | Sort-Object -Unique
+```
 
 ## 実測値
 

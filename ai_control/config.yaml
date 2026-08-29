@@ -24,6 +24,10 @@ watch:
     - push_receiver_runner
     - summary_database_runner
     - ranking_collector_runner
+    # 2026-08-29 の再起動後に、監視から漏れていたことが判明して追加した。
+    # data_collectors_runner は 10 時間で 46MB と最も活発。
+    - data_collectors_runner
+    - yahoo_complement_runner
   suffix: ".log"
 
   # NAS への I/O 予算。ログの NAS 書き込みは本体の実行時間を実測 25% 食っていた
@@ -110,6 +114,13 @@ exclude_patterns:
   - '\[PUSH OWNER HEALTH\]'
   # 正常なローテーション切断
   - '--- DISCONNECTED expected_rotation ---'
+  # data_collectors_runner は子プロセスのログを [CHILD:xxx] で包んで再出力する
+  # 多重化ログ。子 (ranking_collector / summary_database / push_receiver) は
+  # それぞれ自分のログを持っており、そちらを個別に監視している。
+  # ここを除外しないと同じ事象を二重に検出する。
+  # 実測 (2026-08-29): 46MB のログで 4,391 件検出のうち大半がこの重複だった。
+  # runner 自身が出す行 (子の起動・停止・異常終了) は除外されない。
+  - '\[CHILD:[a-z_]+\]'
 
 # ============================================================
 # 第2段階: Codex の指示書 → Claude Code 自動修正
