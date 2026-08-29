@@ -29,6 +29,25 @@ _POS_CACHE = None
 _POS_CACHE_TIME = 0.0
 _POS_CACHE_TTL = 5.0   # 秒（429対策の要）
 
+# ------------------------------------------------------------
+# 取得の健全性
+# ------------------------------------------------------------
+# get_positions() は「例外は絶対に投げない」契約なので、失敗しても
+# キャッシュか空リストを返す。呼び出し側から見ると
+#     取得に失敗した            -> []
+#     本当に建玉がゼロだった    -> []
+# が区別できない。実際 trading/exit/executor.py の closing reconcile は
+# 例外が出なければ取得成功と扱うため、401 の直後に
+#     [EXIT CLOSING RECONCILE] helper positions ok rows=0
+# と記録していた（2026-08-29 の 401 障害で確認）。
+#
+# 戻り値の型を変えると 7 箇所の呼び出し元に影響が出るため、ここでは
+# 契約を変えずに「直近の取得が信用できるか」を別途公開する。
+# 判断に使いたい呼び出し元は positions_fetch_healthy() を見る。
+_POS_FETCH_HEALTHY = True      # 直近の取得が信用できるか
+_POS_LAST_FAILURE = ""         # "auth" / "http" / "network" / "bad_response" / ""
+_POS_LAST_OK_TIME = 0.0        # 最後に本当に取得できた時刻
+
 
 # ============================================================
 # ① /positions API（retry + cache + 429 safe）
@@ -57,6 +76,7 @@ def _get_positions_impl():
     """
 
     global _POS_CACHE, _POS_CACHE_TIME
+    global _POS_FETCH_HEALTHY, _POS_LAST_FAILURE, _POS_LAST_OK_TIME
 
     now = time.time()
 
@@ -91,6 +111,12 @@ def _get_positions_impl():
             if res.status_code == 429:
                 logger.warning("⚠ /positions rate limited (429) → skip this cycle")
                 time.sleep(0.5)
+                # 429 は正常な抑制信号なので失敗扱いにはしない。
+                # ただしキャッシュが無いときの [] は「建玉ゼロ」ではなく
+                # 「まだ一度も取れていない」なので、そこだけは不健全にする。
+                if _POS_CACHE is None:
+                    _POS_FETCH_HEALTHY = False
+                    _POS_LAST_FAILURE = "rate_limited_no_cache"
                 return _POS_CACHE or []
 
             res.raise_for_status()
@@ -98,10 +124,15 @@ def _get_positions_impl():
             positions = res.json()
             if not isinstance(positions, list):
                 logger.error(f"❌ /positions 不正レスポンス: {positions}")
+                _POS_FETCH_HEALTHY = False
+                _POS_LAST_FAILURE = "bad_response"
                 return _POS_CACHE or []
 
             _POS_CACHE = positions
             _POS_CACHE_TIME = now
+            _POS_FETCH_HEALTHY = True
+            _POS_LAST_FAILURE = ""
+            _POS_LAST_OK_TIME = now
             return positions
 
         except requests.exceptions.ReadTimeout:
@@ -112,12 +143,57 @@ def _get_positions_impl():
             logger.warning(f"⚠ get_positions connection error retry={i+1}")
             time.sleep(0.5)
 
+        except requests.exceptions.HTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            _POS_FETCH_HEALTHY = False
+            if status in (401, 403):
+                # 認証失敗。これを一般例外に混ぜて traceback で流すと、
+                # 呼び出し側は「例外が出なかった＝取得成功」と読み、
+                # 建玉ゼロと区別できなくなる。専用の行にして目に見えるようにする。
+                _POS_LAST_FAILURE = "auth"
+                logger.error(
+                    "❌ [POSITIONS AUTH FAILED] /positions が %s を返した。"
+                    "建玉は取得できていない。戻り値は %s であり、建玉ゼロを意味しない。"
+                    " 判断に使う側は positions_fetch_healthy() を見ること。",
+                    status,
+                    "直前のキャッシュ" if _POS_CACHE else "空リスト",
+                )
+            else:
+                _POS_LAST_FAILURE = "http"
+                logger.error("❌ get_positions HTTP error status=%s", status, exc_info=True)
+            return _POS_CACHE or []
+
         except Exception:
+            _POS_FETCH_HEALTHY = False
+            _POS_LAST_FAILURE = "unexpected"
             logger.error("❌ get_positions unexpected error", exc_info=True)
             return _POS_CACHE or []
 
+    _POS_FETCH_HEALTHY = False
+    _POS_LAST_FAILURE = "network"
     logger.warning("⚠ get_positions failed after retries → use cache")
     return _POS_CACHE or []
+
+
+def positions_fetch_healthy() -> bool:
+    """直近の /positions 取得が信用できるか。
+
+    False のとき、get_positions() が返した空リストは
+    「建玉がゼロ」ではなく「取得できなかった」を意味する。
+    建玉の有無で判断を分ける処理は、必ずこれを見ること。
+    """
+    return bool(_POS_FETCH_HEALTHY)
+
+
+def positions_health() -> dict:
+    """取得の健全性を詳しく返す（ログ・診断用）。"""
+    return {
+        "healthy": bool(_POS_FETCH_HEALTHY),
+        "last_failure": _POS_LAST_FAILURE,
+        "last_ok_time": _POS_LAST_OK_TIME,
+        "has_cache": _POS_CACHE is not None,
+        "cache_rows": len(_POS_CACHE) if isinstance(_POS_CACHE, list) else None,
+    }
 
 
 # ============================================================

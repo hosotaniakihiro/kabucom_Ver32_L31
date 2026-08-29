@@ -126,6 +126,15 @@ triggers:
     severity: HIGH
     pattern: 'MemoryError|Cannot allocate memory'
 
+  # 建玉が取れていないのに空リストが返っている状態。
+  # kabu_api/positions.py がこの行を出す。2026-08-29 の 401 障害では
+  # 401 が一般 traceback に紛れ、直後に
+  #   [EXIT CLOSING RECONCILE] helper positions ok rows=0
+  # と記録されていた（取得失敗を建玉ゼロと誤認していた）。
+  - name: positions_auth_failed
+    severity: HIGH
+    pattern: '\[POSITIONS AUTH FAILED\]'
+
   # 窓内で min_count 回出て初めてトリガ。単発の ERROR では起こさない
   - name: error_burst
     severity: MEDIUM
