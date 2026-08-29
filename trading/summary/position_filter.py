@@ -97,7 +97,53 @@ def _resolve_allow_orders_runtime() -> tuple[bool, str]:
     return True, "default_live_true"
 
 
+def _auth_gate_blocked() -> tuple[bool, str]:
+    """認証が壊れている「確たる証拠」があるか。
+
+    なぜここに置くか:
+        allow_orders は発注可否の唯一の関門ではない。
+        core/startup/startup_orchestrator.py:196-198 は市場が開いていれば
+        認証結果と無関係に allow_orders=True にするし、仮に False にしても
+        下の _ensure_allow_orders_if_possible() が env を見て True へ戻す
+        (既定は default_live_true)。つまり ENTRY を実際に止められるのは
+        この関数だけである。
+
+    なぜ「証明できないから止める」にしないか:
+        起動直後やモジュール未初期化で健全性が不明な瞬間は必ずある。
+        そこで止める設計にすると、実害の無い状態で全発注が止まりうる。
+        ここでは 401/403 を実際に観測したときだけ止める。
+        今日より緩くはならず、今日より確実に危険を捕まえる。
+
+    2026-08-29 の障害:
+        /positions が 401 を返し続けたが allow_orders は True のままで、
+        建玉も注文も読めないのに発注可能な状態だった。
+    """
+    if _env_bool("ENTRY_AUTH_GATE_ENABLED", True) is False:
+        return False, ""
+    try:
+        from kabu_api.positions import positions_health
+
+        h = positions_health()
+        if h.get("last_failure") == "auth" and not h.get("healthy"):
+            return True, "kabu API が /positions に 401/403 を返している（建玉を読めていない）"
+    except Exception:
+        # 健全性を取れないこと自体は止める理由にしない
+        return False, ""
+    return False, ""
+
+
 def _ensure_allow_orders_if_possible(symbol: str, side: str, source: str) -> bool:
+    # 認証が壊れている証拠があるなら、allow_orders の値によらず止める。
+    # 建玉を読めていない状態での新規建ては、二重建てや過大ポジションになる。
+    blocked, why = _auth_gate_blocked()
+    if blocked:
+        logger.error(
+            "⛔ [ENTRY BLOCKED: AUTH] 認証異常のため ENTRY を止めた: %s side=%s source=%s reason=%s"
+            " （解除したい場合のみ ENTRY_AUTH_GATE_ENABLED=0）",
+            symbol, side, source, why,
+        )
+        return False
+
     try:
         current = bool(getattr(global_data, "allow_orders", False))
         if current:
