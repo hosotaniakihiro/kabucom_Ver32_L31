@@ -1,0 +1,54 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "verdict",
+    "revised_confidence",
+    "claims",
+    "refuted_summary",
+    "uncommitted_impact",
+    "remaining_unknowns"
+  ],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["DIAGNOSIS_HOLDS", "DIAGNOSIS_NEEDS_REVISION", "DIAGNOSIS_WRONG"]
+    },
+    "revised_confidence": {
+      "type": "number",
+      "description": "検証後の確信度 0.0-1.0。下がるなら正直に下げる。"
+    },
+    "claims": {
+      "type": "array",
+      "description": "診断の主張を1つずつ検証した結果。",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["claim", "status", "evidence"],
+        "properties": {
+          "claim": { "type": "string" },
+          "status": {
+            "type": "string",
+            "enum": ["CONFIRMED", "REFUTED", "UNVERIFIABLE"]
+          },
+          "evidence": {
+            "type": "string",
+            "description": "ファイル名と行番号、実際のコードを引用して示す。"
+          }
+        }
+      }
+    },
+    "refuted_summary": {
+      "type": "string",
+      "description": "覆った主張の要約。無ければ空文字。修正担当にそのまま渡される。"
+    },
+    "uncommitted_impact": {
+      "type": "string",
+      "description": "稼働中の未コミット差分が診断を変えるか。差分が無ければ「なし」。"
+    },
+    "remaining_unknowns": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

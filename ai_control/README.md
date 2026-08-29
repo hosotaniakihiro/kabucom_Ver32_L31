@@ -20,7 +20,7 @@ Codex に修正させないのは指示文ではなく `-s read-only` サンド�
 
 | 段階 | 内容 | 状態 |
 |---|---|---|
-| 1 | ログ監視 → Codex 解析 → `inbox/task.json` 生成 | **実装済み** |
+| 1 | ログ監視 → Codex 解析 → **自己検証** → `inbox/task.json` 生成 | **実装済み** |
 | 2 | `task.json` → Claude Code 自動修正（worktree 上） | **実装済み** |
 | 3 | DRY-RUN 起動・本番反映の判断 | 未着手 |
 | 4 | `main.py` の自動停止・再起動 | 未着手 |
@@ -43,6 +43,9 @@ rollback の基準点はタグ **`baseline-20260828`**（commit `ca5520e`）。
 
 # 既存ログで 1 件だけ実際に Codex にかける
 .venv\Scripts\python.exe ai_control\supervisor.py --replay <logfile> --once
+
+# 自己検証を止めて、診断 1 回だけにする（Codex 呼び出しを半分にする）
+.venv\Scripts\python.exe ai_control\supervisor.py --no-verify
 
 # 第2段階（Claude Code 修正）を止めて、監視と診断だけにする
 .venv\Scripts\python.exe ai_control\supervisor.py --no-repair
@@ -69,6 +72,8 @@ rollback の基準点はタグ **`baseline-20260828`**（commit `ca5520e`）。
 | `config.yaml` | 監視対象・トリガ・除外・上限 |
 | `policy.yaml` | 分類規則と禁止事項 |
 | `codex_prompt.md` | 診断役へのプロンプト雛形 |
+| `verify_prompt.md` | 検証役へのプロンプト雛形（診断を自分で裏取りさせる） |
+| `verify_schema.json` | 検証結果の形式（`--output-schema` で強制） |
 | `task_schema.json` | Codex の出力形式（`--output-schema` で強制） |
 | `inbox/task.json` | 最新の指示書。第2段階はこれを読む |
 | `history/` | 全指示書とプロンプトの記録 |
@@ -371,3 +376,79 @@ Claude Code の修正（+19 / -1、1 ファイル）:
 
 GREEN と YELLOW の差は「本番へ反映してよいと機械が言うか」だけで、
 **第2段階ではどちらも本番に反映しない**。反映は人の操作。
+
+## 診断の自己検証（第1段階の2パス目）
+
+1 回目の診断は、**思い込みで `CONFIRMED` を書く**ことがある。そこで
+同じ Codex にもう一度、**自分の診断を検証させる**。
+
+```
+ログ → Codex 診断 (task_schema.json)
+         → Codex 検証 (verify_schema.json)  ← 主張を1つずつ CONFIRMED/REFUTED/UNVERIFIABLE
+         → confidence を付け直す
+         → policy 分類 → 第2段階のゲート
+```
+
+検証役には、診断では渡していないものを 1 つ足して渡す。
+**稼働中の作業ツリーの未コミット差分**である。診断役が読むのは HEAD なので、
+実際に動いているコードとのズレはここでしか見えない。
+
+### なぜ入れたか（2026-08-29 の実測）
+
+kabu Station API の 401 を解析させた診断（confidence 0.91）を検証させたところ、
+**主張 2 件が `REFUTED` になり、confidence が 0.72 に下がった**。
+
+| 覆った主張 | 検証で分かったこと |
+|---|---|
+| 「認証は `run_system_startup()` が最初」 | `sitecustomize.py:600-602` から `bootstrap_startup_token()` が先に走る |
+| 「未コミット版 `token_bootstrap.py` がトークンを無効化した可能性」 | あの差分は回復挙動を変えるだけで、無効化する処理は無い |
+
+どちらも修正方針を左右する。検証が無ければ、この誤った前提のまま
+修正担当へ渡っていた。
+
+同時に、コードから決められないもの（実行時のスレッド順序、実際の時刻）が
+`UNVERIFIABLE` として切り分けられ、`enable_token_runtime()` が
+**リポジトリのどこからも呼ばれていない**という新事実も出てきた。
+
+### 判定の扱い
+
+| verdict | 扱い |
+|---|---|
+| `DIAGNOSIS_HOLDS` | `revised_confidence` を採用 |
+| `DIAGNOSIS_NEEDS_REVISION` | `revised_confidence` を採用（下がればゲートで落ちる） |
+| `DIAGNOSIS_WRONG` | **status を `NEED_MORE_INFO` へ落とし、confidence を 0.3 以下にする**。修正へ進ませない |
+| 検証が失敗（`UNVERIFIED`） | confidence を **0.5 に下げる**。安全網が無い状態で自動修正させない |
+| 検証が無効（`--no-verify` / `enabled: false`） | 診断をそのまま使う |
+
+`REFUTED` と `UNVERIFIABLE` の内容は、修正担当（Claude Code）の
+プロンプトへ **「この前提を使ってはいけません」** として明示的に渡される。
+
+### コスト
+
+診断 1 件あたり Codex の呼び出しが **2 回**になる。
+検証するのは `status=FIX_REQUIRED` のときだけで、
+`NO_ACTION` / `NEED_MORE_INFO` はどのみち修正へ進まないので呼ばない。
+
+### 未コミット差分の渡し方でしくじった記録（2026-08-29）
+
+最初の実装は「診断が `files` に挙げたファイル」だけの未コミット差分を探し、
+見つからなければ **「未コミットの変更はありません」と検証役に断言**していた。
+
+401 の検証で実害が出た。診断は `kabu_api/token_bootstrap.py` を `files` に
+挙げなかったが、そのファイルには 170 行の未コミット変更が実在した。
+検証役は「変更なし」という誤った前提を渡され、
+
+> 本番の kabu_api/token_bootstrap.py にはHEAD外変更があり、差分確認が必要である
+
+という主張を `REFUTED` にした。**この否認は誤りで、原因は監視側のバグである。**
+
+いまは `_uncommitted_section()` が
+
+1. 作業ツリーの未コミットファイルを**全部**列挙し
+2. 診断が挙げたものを先に、それ以外を後ろに置いて
+3. `max_diff_chars` まで詰める
+
+という順で渡す。上限に当たっても重要な側は必ず残る。
+差分が取れない場合も「変更なし」とは言わず、ファイル名だけでも渡す。
+
+**検証役に嘘の前提を渡すと、検証は嘘の結論を出す。** ここは削らない。

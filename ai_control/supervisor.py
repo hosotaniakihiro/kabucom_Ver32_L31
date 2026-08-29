@@ -41,7 +41,9 @@ from codex_client import CodexClient           # noqa: E402
 from logtail import LogTailer                  # noqa: E402
 from policy import Policy                      # noqa: E402
 from repair import Repairer                    # noqa: E402
-from worktree import ReadOnlyWorktree, WorktreeError, uncommitted_files  # noqa: E402
+from worktree import (                          # noqa: E402
+    ReadOnlyWorktree, WorktreeError, uncommitted_diff, uncommitted_files,
+)
 from triggers import RateLimiter, TriggerEngine, TriggerHit  # noqa: E402
 
 
@@ -134,6 +136,12 @@ class Supervisor:
         )
 
         self.prompt_template = (HERE / "codex_prompt.md").read_text(encoding="utf-8")
+        self.verify_template = (HERE / "verify_prompt.md").read_text(encoding="utf-8")
+
+        vf = cx.get("verify") or {}
+        self.verify_enabled = (not args.no_verify) and bool(vf.get("enabled", True))
+        self.verify_timeout_sec = float(vf.get("timeout_sec", 420))
+        self.verify_max_diff_chars = int(vf.get("max_diff_chars", 40000))
 
         buf_len = self.n_before + self.n_after + 200
         self.buffers: Dict[str, Deque[str]] = defaultdict(lambda: deque(maxlen=buf_len))
@@ -187,6 +195,7 @@ class Supervisor:
         else:
             _log("codex       = " + self.codex.bin_path + " -s " + self.codex.sandbox)
             _log("codex root  = " + str(self.codex.project_dir))
+            _log("自己検証    = " + ("有効（診断ごとに Codex を2回呼びます）" if self.verify_enabled else "無効"))
         if self.repair_enabled:
             _log("第2段階: 有効。GREEN/YELLOW は worktree 上で Claude Code が修正します。")
             _log("           本番への反映と main.py の再起動は行いません。")
@@ -364,7 +373,10 @@ class Supervisor:
             "Codex 完了 (%.0fs): status=%s category=%s confidence=%s"
             % (took, task.get("status"), task.get("category"), task.get("confidence"))
         )
-        doc = self._write_task(h, task, prompt)
+
+        verification = self._verify(task)
+
+        doc = self._write_task(h, task, prompt, verification=verification)
         self.limiter.commit(h.signature)
         self.dispatched += 1
 
@@ -395,6 +407,147 @@ class Supervisor:
                 _log("  ブランチ: %s  commit=%s" % (out.branch, out.commit or "(なし)"))
         _log("  監査ログ: %s" % out.audit_path)
 
+    # -- 診断の自己検証 --------------------------------------------
+
+    def _uncommitted_section(self, named_files: List[str]) -> str:
+        """稼働中の未コミット差分を、検証役へ渡す形にまとめる。
+
+        診断が挙げたファイルの差分だけを渡すと、**関係するのに診断が
+        挙げなかった**未コミットファイルが落ちる。実際 2026-08-29 の 401 では、
+        原因に深く関わる kabu_api/token_bootstrap.py が診断の files に
+        入っておらず、検証役に届かなかった。
+
+        そこで「診断が挙げたもの」を先に、「それ以外の未コミット」を後ろに
+        置き、上限まで詰める。上限に当たっても、重要な側は必ず残る。
+        """
+        dirty = uncommitted_files(self.project_dir)
+        if not dirty:
+            return (
+                "本番の作業ツリーに未コミットの変更はありません。"
+                "あなたが読む内容と稼働中の内容は一致します。"
+            )
+
+        named = [f for f in dirty if f in set(named_files)]
+        others = [f for f in dirty if f not in set(named_files)]
+
+        cap = self.verify_max_diff_chars
+        parts = []
+        used = 0
+        if named:
+            d = uncommitted_diff(self.project_dir, named, max_chars=cap)
+            if d.strip():
+                parts.append("# 診断が対象に挙げたファイルの未コミット差分\n" + d)
+                used += len(d)
+        if others and used < cap:
+            d = uncommitted_diff(self.project_dir, others, max_chars=cap - used)
+            if d.strip():
+                parts.append(
+                    "# 診断は挙げていないが、稼働中に変更されている他のファイル\n" + d
+                )
+
+        if not parts:
+            return (
+                "本番の作業ツリーには未コミットの変更がありますが、差分を取得できませんでした。\n"
+                "変更されているファイル: " + ", ".join(dirty[:30])
+            )
+
+        return (
+            "稼働中の本番作業ツリーには、あなたが読んでいる HEAD に入っていない\n"
+            "変更があります。以下がその差分です。**この差分が診断を変えるか**を\n"
+            "判断し、`uncommitted_impact` に書いてください。\n\n"
+            "```diff\n" + "\n\n".join(parts) + "\n```"
+        )
+
+    def _verify(self, task: dict) -> Optional[dict]:
+        """診断を Codex 自身に検証させ、確信度を付け直させる。
+
+        1 回目の診断は、思い込みで CONFIRMED を書くことがある。実測では
+        1 回の検証で主張 2 件が REFUTED になり、confidence 0.91 -> 0.72 に
+        下がった（2026-08-29、401 の解析）。修正担当へ渡す前にここで落とす。
+
+        検証するのは FIX_REQUIRED のときだけ。NO_ACTION / NEED_MORE_INFO は
+        どのみち修正へ進まないので、Codex をもう 1 回呼ぶ意味がない。
+        """
+        if not self.verify_enabled:
+            return None
+        if (task or {}).get("status") != "FIX_REQUIRED":
+            return None
+
+        files = task.get("files") or []
+        unc = self._uncommitted_section(files)
+
+        def bullets(items):
+            items = items or []
+            return "\n".join("- " + str(x) for x in items) if items else "（なし）"
+
+        vp = self.verify_template
+        vp = vp.replace("{{SUMMARY}}", str(task.get("summary", "")))
+        vp = vp.replace("{{CATEGORY}}", str(task.get("category", "")))
+        vp = vp.replace("{{SEVERITY}}", str(task.get("severity", "")))
+        vp = vp.replace("{{CONFIDENCE}}", str(task.get("confidence", "")))
+        vp = vp.replace("{{ROOT_CAUSE}}", str(task.get("root_cause", "")))
+        vp = vp.replace("{{FILES}}", bullets(files))
+        vp = vp.replace("{{INSTRUCTIONS}}", bullets(task.get("instructions")))
+        vp = vp.replace("{{EVIDENCE_LINES}}", "\n".join(task.get("evidence_lines") or []))
+        vp = vp.replace("{{UNCOMMITTED_SECTION}}", unc)
+
+        _log("診断の自己検証を開始します (prompt %d 文字)" % len(vp))
+        t0 = time.time()
+        res = self.codex.run(vp, HERE / "verify_schema.json", timeout_sec=self.verify_timeout_sec)
+        took = time.time() - t0
+
+        if not res.ok:
+            _log("!! 検証に失敗 (%.0fs): %s — 診断は未検証のまま扱います" % (took, res.error))
+            return {"verdict": "UNVERIFIED", "error": res.error}
+
+        v = res.task or {}
+        counts = {}
+        for c in v.get("claims") or []:
+            counts[c.get("status")] = counts.get(c.get("status"), 0) + 1
+        _log(
+            "検証完了 (%.0fs): %s  confidence %s -> %s  (%s)"
+            % (
+                took, v.get("verdict"), task.get("confidence"), v.get("revised_confidence"),
+                " / ".join("%s %d" % (k, n) for k, n in sorted(counts.items())) or "主張なし",
+            )
+        )
+        return v
+
+    @staticmethod
+    def _apply_verification(task: dict, v: Optional[dict]) -> dict:
+        """検証結果を診断へ反映する。task は破壊的に更新する。"""
+        if not v:
+            # 検証を明示的に無効にしている場合。診断をそのまま使う。
+            return task
+
+        verdict = v.get("verdict")
+
+        if verdict in (None, "UNVERIFIED"):
+            # 検証しようとして失敗した。安全網が無い状態で自動修正へ進ませない。
+            # 既定の閾値 (repair.min_confidence = 0.7) を下回る値に落として
+            # 人間の判断へ回す。
+            task["confidence_before_verification"] = task.get("confidence")
+            try:
+                task["confidence"] = min(float(task.get("confidence") or 0.0), 0.5)
+            except (TypeError, ValueError):
+                task["confidence"] = 0.5
+            return task
+
+        task["confidence_before_verification"] = task.get("confidence")
+
+        if verdict == "DIAGNOSIS_WRONG":
+            # 根幹が誤っていた。修正へ進ませない。
+            task["status"] = "NEED_MORE_INFO"
+            task["confidence"] = min(
+                float(v.get("revised_confidence") or 0.0), 0.3
+            )
+        else:
+            try:
+                task["confidence"] = float(v.get("revised_confidence"))
+            except (TypeError, ValueError):
+                pass
+        return task
+
     # -- 出力 ---------------------------------------------------
 
     def _write_task(
@@ -404,7 +557,13 @@ class Supervisor:
         prompt: str,
         note: str = "",
         raw: str = "",
-    ) -> None:
+        verification: Optional[dict] = None,
+    ) -> dict:
+        # 検証結果は分類より先に反映する。confidence が下がると
+        # 第2段階のゲートで落ちるため、順序を逆にしてはいけない。
+        if task:
+            task = self._apply_verification(task, verification)
+
         cls = None
         if task:
             cls = self.policy.classify(task.get("category", ""), task.get("files") or [])
@@ -430,6 +589,7 @@ class Supervisor:
                 "detected_at": dt.datetime.fromtimestamp(hit.detected_at).isoformat(timespec="seconds"),
             },
             "codex": task,
+            "verification": verification,
             "policy": cls,
             "note": note,
             "raw_output": raw[:4000] if raw else "",
@@ -507,6 +667,7 @@ def main() -> int:
     ap.add_argument("--once", action="store_true", help="1件処理したら終了する")
     ap.add_argument("--replay", default="", help="既存のログファイルで検証する")
     ap.add_argument("--list-only", action="store_true", help="replay で検出だけして解析しない")
+    ap.add_argument("--no-verify", action="store_true", help="診断の自己検証を行わない")
     ap.add_argument("--no-repair", action="store_true", help="第2段階（Claude Code 修正）を行わない")
     ap.add_argument("--repair-from", default="", help="既存の task.json を読んで修復だけ実行する")
     args = ap.parse_args()

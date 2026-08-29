@@ -66,6 +66,13 @@ class CodexClient:
         self.out_dir = Path(out_dir) if out_dir else None
 
     def diagnose(self, prompt: str) -> CodexResult:
+        """診断（task_schema.json に従わせる）。"""
+        return self.run(prompt, self.schema_path)
+
+    def run(self, prompt: str, schema_path: Optional[Path] = None,
+            timeout_sec: Optional[float] = None) -> CodexResult:
+        """任意のスキーマで codex exec を1回実行する。"""
+        import time
         out_dir = None
         if self.out_dir is not None:
             try:
@@ -86,7 +93,7 @@ class CodexClient:
             "-C", str(self.project_dir),
             "-s", self.sandbox,
             "--color", "never",
-            "--output-schema", str(self.schema_path),
+            "--output-schema", str(schema_path or self.schema_path),
             "-o", str(out_path),
         ]
         if self.model:
@@ -99,11 +106,11 @@ class CodexClient:
                 input=prompt.encode("utf-8"),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                timeout=self.timeout_sec,
+                timeout=float(timeout_sec or self.timeout_sec),
             )
         except subprocess.TimeoutExpired:
             out_path.unlink(missing_ok=True)
-            return CodexResult(ok=False, task=None, raw="", error=f"codex timed out after {self.timeout_sec}s")
+            return CodexResult(ok=False, task=None, raw="", error="codex timed out after %.0fs" % float(timeout_sec or self.timeout_sec))
         except OSError as e:
             out_path.unlink(missing_ok=True)
             return CodexResult(ok=False, task=None, raw="", error=f"failed to launch codex: {e}")

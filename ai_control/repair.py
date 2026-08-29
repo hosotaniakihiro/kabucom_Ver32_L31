@@ -110,6 +110,41 @@ class RepairLock:
         return False
 
 
+def _verification_text(v: Optional[dict]) -> str:
+    """検証結果を修正担当向けの文章にする。
+
+    覆った主張をここで明示しないと、Claude は誤った前提のまま直してしまう。
+    """
+    if not v:
+        return "（検証は行われていません。診断をそのまま信じないでください。）"
+    if v.get("verdict") == "UNVERIFIED":
+        return "（検証を試みましたが失敗しました: %s。診断をそのまま信じないでください。）" % v.get("error", "")
+
+    lines = ["- 判定: **%s**" % v.get("verdict")]
+    if v.get("revised_confidence") is not None:
+        lines.append("- 検証後の確信度: %s" % v.get("revised_confidence"))
+
+    refuted = [c for c in (v.get("claims") or []) if c.get("status") == "REFUTED"]
+    unver = [c for c in (v.get("claims") or []) if c.get("status") == "UNVERIFIABLE"]
+
+    if v.get("refuted_summary"):
+        lines += ["", "**覆った主張:**", str(v["refuted_summary"])]
+    if refuted:
+        lines += ["", "**REFUTED（この前提を使ってはいけません）:**"]
+        for c in refuted:
+            lines.append("- %s" % c.get("claim"))
+            lines.append("  - 根拠: %s" % str(c.get("evidence", ""))[:500])
+    if unver:
+        lines += ["", "**UNVERIFIABLE（コードからは確認できていません）:**"]
+        for c in unver:
+            lines.append("- %s" % c.get("claim"))
+    if v.get("uncommitted_impact"):
+        lines += ["", "**稼働中の未コミット変更の影響:** %s" % v["uncommitted_impact"]]
+    if v.get("remaining_unknowns"):
+        lines += ["", "**残る不明点:**"] + ["- %s" % u for u in v["remaining_unknowns"]]
+    return "\n".join(lines)
+
+
 class Repairer:
     def __init__(
         self,
@@ -232,6 +267,7 @@ class Repairer:
         out = out.replace("{{FILES}}", bullets(task.get("files")))
         out = out.replace("{{INSTRUCTIONS}}", bullets(task.get("instructions")))
         out = out.replace("{{FORBIDDEN}}", bullets(task.get("forbidden")))
+        out = out.replace("{{VERIFICATION}}", _verification_text(doc.get("verification")))
         out = out.replace("{{TRIGGER_NAME}}", str(trig.get("name", "")))
         out = out.replace("{{LOG_FILE}}", str(trig.get("log_file", "")))
         out = out.replace("{{MATCHED_LINE}}", str(trig.get("matched_line", "")))

@@ -260,3 +260,30 @@ def uncommitted_files(repo_dir: Path, timeout: float = 300.0) -> List[str]:
     if rc != 0:
         return []
     return [ln[3:].strip().strip('"') for ln in out.splitlines() if len(ln) > 3]
+
+
+def uncommitted_diff(repo_dir: Path, files: Optional[List[str]] = None,
+                     max_chars: int = 40000, timeout: float = 300.0) -> str:
+    """本番作業ツリーの未コミット差分を返す。
+
+    診断用 checkout は HEAD の内容なので、稼働中の実コードとの差分を
+    検証役へ明示的に渡すために使う。
+    """
+    args = ["git", "diff", "--"]
+    args += list(files) if files else ["."]
+    try:
+        rc, out = _run(args, cwd=Path(repo_dir), timeout=timeout)
+    except WorktreeError:
+        return ""
+    if rc != 0:
+        return ""
+    # _run は stderr を stdout に混ぜている。git の CRLF 警告が差分に紛れると
+    # 検証役に渡すノイズになるので落とす。
+    out = "\n".join(
+        ln for ln in out.splitlines()
+        if not ln.startswith("warning: in the working copy of ")
+        and not ln.startswith("warning: LF will be replaced")
+    )
+    if len(out) > max_chars:
+        return out[:max_chars] + "\n...(以下省略)..."
+    return out

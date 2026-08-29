@@ -48,6 +48,10 @@ DB schema / migration。
 {{EVIDENCE_LINES}}
 ```
 
+### 検証結果（Codex 自身による裏取り）
+
+{{VERIFICATION}}
+
 ### 対象ファイル（Codex の見立て）
 
 {{FILES}}

@@ -28,6 +28,8 @@ watch:
     # data_collectors_runner は 10 時間で 46MB と最も活発。
     - data_collectors_runner
     - yahoo_complement_runner
+    # 起動のたびに動く準備プロセス。2026-08-29 の再起動で存在に気づいて追加
+    - db_prepare_runner
   suffix: ".log"
 
   # NAS への I/O 予算。ログの NAS 書き込みは本体の実行時間を実測 25% 食っていた
@@ -68,6 +70,24 @@ codex:
   #   と報告された。
   #   空文字にすると本番ディレクトリを直接渡す (推奨しない)。
   worktree_dir: "C:/Users/hosot/AppData/Local/ai_diag_worktree"
+
+  # ★ 診断の自己検証（Codex に自分の診断を検証させる 2 回目の呼び出し）
+  #
+  #   1 回目の診断は、思い込みで CONFIRMED を書くことがある。
+  #   2026-08-29 の 401 解析では、1 回の検証で主張 2 件が REFUTED になり、
+  #   confidence が 0.91 -> 0.72 に下がった。覆ったのは
+  #     - 「認証は run_system_startup() が最初」→ sitecustomize から先に走っていた
+  #     - 「未コミット版 token_bootstrap.py がトークンを無効化した可能性」
+  #   の 2 件で、どちらも修正方針を左右する。
+  #
+  #   検証するのは status=FIX_REQUIRED のときだけ。
+  #   NO_ACTION / NEED_MORE_INFO はどのみち修正へ進まないので呼ばない。
+  #   DIAGNOSIS_WRONG なら status を NEED_MORE_INFO へ落として修正させない。
+  verify:
+    enabled: true
+    timeout_sec: 420
+    # 稼働中の未コミット差分を検証役へ渡す量の上限
+    max_diff_chars: 40000
 
 limits:
   # 同じ症状を何秒間は再解析しないか
