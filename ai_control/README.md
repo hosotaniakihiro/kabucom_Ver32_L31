@@ -452,3 +452,54 @@ kabu Station API の 401 を解析させた診断（confidence 0.91）を検証�
 差分が取れない場合も「変更なし」とは言わず、ファイル名だけでも渡す。
 
 **検証役に嘘の前提を渡すと、検証は嘘の結論を出す。** ここは削らない。
+
+## Codex にできないこと（2026-08-29 に判明）
+
+Codex は read-only サンドボックスで動くため、**実験ができない**。
+ログとソースを読んで推論することはできるが、
+「リクエストを投げて挙動を比べる」ことはできない。
+
+この日、起動時のトークン検証が必ず 5 秒でタイムアウトし
+`main_database.py` が abort し続ける障害が約 2 時間続いた。
+原因は `urllib.request` が必ず送る `Connection: close` で、
+kabu Station がこのヘッダーの付いたリクエストに応答を返さないことだった。
+
+Codex は 401 の診断で「トークンが無効になった理由はコードからは特定できない」
+と `UNVERIFIABLE` を返していた。**これは正しい判断だった。**
+答えがコードの外（HTTP ヘッダーと相手サーバーの相性）にあったからである。
+
+特定できたのは `http.client` でヘッダーを 1 つずつ変えて実測したときだけ:
+
+| 送ったヘッダー | 結果 |
+|---|---|
+| 最小 (X-API-KEY のみ) | HTTP 401 **0.01s** |
+| + `Content-Type` | HTTP 401 0.00s |
+| + `Accept-Encoding: identity` | HTTP 401 0.00s |
+| **+ `Connection: close`** | **応答なし 5.00s** |
+
+### この日の誤診の記録
+
+同じ障害について、実測にたどり着くまでに 3 回外している。
+
+| 立てた仮説 | 実際 |
+|---|---|
+| ポート除外 18080 が原因 | 除外は kabu Station 自身のもの。無関係 |
+| kabu Station が応答していない | `requests` からは 0.01 秒で応答していた |
+| `main.py` の飽和が原因 | 単独起動でも同じだった |
+
+ログとコードを読むだけでは届かない障害がある、ということ。
+**パイプラインが `NEED_MORE_INFO` や `UNVERIFIABLE` を返したときは、
+それ以上ログを読ませても答えは出ない。** 実験に切り替える合図として扱う。
+
+### 追加したトリガ
+
+この障害クラスを次回は機械的に捕まえるため、以下を追加した。
+
+| トリガ | 拾うもの |
+|---|---|
+| `startup_abort` | `[MAIN DATABASE] abort` — 起動できずに落ちた |
+| `token_preflight_failed` | `preflight_ng` / `TOKEN REQUEST FAILED` / `got NO RESPONSE` — abort の一歩手前 |
+| `entry_blocked_auth` | `[ENTRY BLOCKED: AUTH]` — 認証異常で発注を止めた |
+| `positions_auth_failed` | `[POSITIONS AUTH FAILED]` — 401 を建玉ゼロと誤認する経路 |
+
+実ログで検証済み。障害時のログで 6 件検出、復旧後のログで 0 件。

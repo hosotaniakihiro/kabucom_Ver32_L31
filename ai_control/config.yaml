@@ -135,6 +135,25 @@ triggers:
     severity: HIGH
     pattern: '\[POSITIONS AUTH FAILED\]'
 
+  # 発注が認証異常で止められた。止まったこと自体は正しい動作だが、
+  # 止まり続けると売買機会を失うので必ず人に届ける。
+  - name: entry_blocked_auth
+    severity: HIGH
+    pattern: '\[ENTRY BLOCKED: AUTH\]'
+
+  # 起動できずに落ちた。2026-08-29 はこれが約2時間続いた。
+  # main_database が abort すると DB/PUSH/ranking が全部立たない。
+  - name: startup_abort
+    severity: HIGH
+    pattern: '\[MAIN DATABASE\] abort|abort because token bootstrap'
+
+  # 起動時のトークン検証が通らなかった。abort の一歩手前で捕まえる。
+  # kind=no_response は「接続はできたが応答が返らない」。
+  # 2026-08-29 は urllib の Connection: close が原因だった。
+  - name: token_preflight_failed
+    severity: HIGH
+    pattern: 'TOKEN_ACTION=preflight_ng|TOKEN REQUEST FAILED|got NO RESPONSE'
+
   # 窓内で min_count 回出て初めてトリガ。単発の ERROR では起こさない
   - name: error_burst
     severity: MEDIUM
