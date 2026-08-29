@@ -179,3 +179,84 @@ class FixWorktree:
             return None
         rc, sha = _run(self._git("rev-parse", "HEAD"), cwd=self.worktree_dir, timeout=self.timeout_sec)
         return sha.strip() if rc == 0 else None
+
+
+class ReadOnlyWorktree:
+    r"""Codex に読ませるための、ローカルディスク上の checkout。
+
+    なぜ必要か:
+        本番リポジトリは NAS (UNC \192.168.0.22\...) にある。
+        codex exec の read-only サンドボックスは、ドライブレター (W:) でも
+        UNC でも、-c sandbox_permissions=["disk-full-read-access"] を付けても
+        ネットワークドライブを読めない（2026-08-29 に実測）。
+        その結果 Codex は「ソースを読んで裏を取る」ことができず、
+        ログだけの推測しか返せていなかった。
+
+        ローカルディスク上の worktree なら読めることを実測で確認したので、
+        診断役にはこちらを見せる。
+
+    注意:
+        ここは HEAD の内容であり、稼働中プロセスが実行している作業ツリー
+        （未コミットの変更を含む）とは一致しないことがある。
+        そのズレはプロンプトに明記して Codex に伝える。
+    """
+
+    def __init__(self, repo_dir: Path, worktree_dir: Path, timeout_sec: float = 900.0) -> None:
+        self.repo_dir = Path(repo_dir).resolve()
+        self.worktree_dir = Path(worktree_dir).resolve()
+        self.timeout_sec = float(timeout_sec)
+        if self.worktree_dir == self.repo_dir:
+            raise WorktreeError("診断用 worktree のパスが本番リポジトリと同一です")
+        try:
+            self.worktree_dir.relative_to(self.repo_dir)
+        except ValueError:
+            pass
+        else:
+            raise WorktreeError(
+                "診断用 worktree を本番リポジトリの内側に作ることはできません: %s" % self.worktree_dir
+            )
+
+    def _git(self, *args: str) -> List[str]:
+        return [
+            "git",
+            "-c", "safe.directory=" + self.worktree_dir.as_posix(),
+            "-c", "safe.directory=" + self.repo_dir.as_posix(),
+            *args,
+        ]
+
+    def sync(self, commit: str) -> Path:
+        """commit の内容にそろえて返す。失敗したら例外。"""
+        if not (self.worktree_dir / ".git").exists():
+            self.worktree_dir.parent.mkdir(parents=True, exist_ok=True)
+            rc, out = _run(
+                self._git("worktree", "add", "--detach", str(self.worktree_dir), commit),
+                cwd=self.repo_dir,
+                timeout=self.timeout_sec,
+            )
+            if rc != 0:
+                raise WorktreeError("診断用 worktree add に失敗: " + out.strip())
+
+        rc, out = _run(self._git("rev-parse", "--show-toplevel"), cwd=self.worktree_dir, timeout=self.timeout_sec)
+        if rc != 0 or Path(out.strip()).resolve() != self.worktree_dir:
+            raise WorktreeError("診断用 worktree が想定と違います: " + out.strip())
+
+        rc, out = _run(
+            self._git("checkout", "--detach", commit), cwd=self.worktree_dir, timeout=self.timeout_sec
+        )
+        if rc != 0:
+            raise WorktreeError("診断用 worktree の checkout に失敗: " + out.strip())
+
+        _run(self._git("reset", "--hard", commit), cwd=self.worktree_dir, timeout=self.timeout_sec)
+        _run(self._git("clean", "-fdx"), cwd=self.worktree_dir, timeout=self.timeout_sec)
+        return self.worktree_dir
+
+
+def uncommitted_files(repo_dir: Path, timeout: float = 300.0) -> List[str]:
+    """本番作業ツリーの未コミット変更を返す。診断のズレを伝えるために使う。"""
+    try:
+        rc, out = _run(["git", "status", "--porcelain"], cwd=Path(repo_dir), timeout=timeout)
+    except WorktreeError:
+        return []
+    if rc != 0:
+        return []
+    return [ln[3:].strip().strip('"') for ln in out.splitlines() if len(ln) > 3]

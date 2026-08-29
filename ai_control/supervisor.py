@@ -41,7 +41,21 @@ from codex_client import CodexClient           # noqa: E402
 from logtail import LogTailer                  # noqa: E402
 from policy import Policy                      # noqa: E402
 from repair import Repairer                    # noqa: E402
+from worktree import ReadOnlyWorktree, WorktreeError, uncommitted_files  # noqa: E402
 from triggers import RateLimiter, TriggerEngine, TriggerHit  # noqa: E402
+
+
+def _git_head(repo_dir: Path) -> tuple:
+    """本番リポジトリの HEAD を返す。"""
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=str(repo_dir),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 1, ""
+    return proc.returncode, proc.stdout.decode("utf-8", errors="replace").strip()
 
 
 def _log(msg: str) -> None:
@@ -95,9 +109,24 @@ class Supervisor:
         )
 
         cx = cfg["codex"]
+
+        # Codex にはローカルの checkout を見せる（NAS は読めない）
+        self.diag_worktree = None
+        diag_dir = (cx.get("worktree_dir") or "").strip()
+        if diag_dir:
+            try:
+                self.diag_worktree = ReadOnlyWorktree(
+                    self.project_dir,
+                    Path(diag_dir),
+                    float((cfg.get("repair") or {}).get("worktree_timeout_sec", 900)),
+                )
+            except WorktreeError as e:
+                _log("!! 診断用 worktree を用意できません（本番ディレクトリを使います）: %s" % e)
+
+        codex_root = self.diag_worktree.worktree_dir if self.diag_worktree else self.project_dir
         self.codex = CodexClient(
             bin_path=cx.get("bin", "codex"),
-            project_dir=self.project_dir,
+            project_dir=codex_root,
             schema_path=HERE / "task_schema.json",
             sandbox=cx.get("sandbox", "read-only"),
             timeout_sec=cx.get("timeout_sec", 420),
@@ -157,6 +186,7 @@ class Supervisor:
             _log("codex       = 無効 (--no-codex)")
         else:
             _log("codex       = " + self.codex.bin_path + " -s " + self.codex.sandbox)
+            _log("codex root  = " + str(self.codex.project_dir))
         if self.repair_enabled:
             _log("第2段階: 有効。GREEN/YELLOW は worktree 上で Claude Code が修正します。")
             _log("           本番への反映と main.py の再起動は行いません。")
@@ -242,6 +272,44 @@ class Supervisor:
 
     # -- 解析 ---------------------------------------------------
 
+    def _sync_diag_worktree(self) -> str:
+        """Codex に見せる checkout を本番 HEAD にそろえ、ズレの注意書きを返す。"""
+        if self.diag_worktree is None:
+            return (
+                "> 注意: あなたの作業ディレクトリは本番そのものです。"
+                "読み取りに失敗する場合は、その旨を root_cause に必ず書いてください。"
+            )
+        try:
+            rc, head = _git_head(self.project_dir)
+            if not head:
+                return "> 注意: 本番 HEAD を取得できませんでした。"
+            self.diag_worktree.sync(head)
+        except WorktreeError as e:
+            _log("!! 診断用 worktree の同期に失敗: %s" % e)
+            return "> 注意: 診断用 checkout の同期に失敗しました。内容が古い可能性があります。"
+
+        dirty = uncommitted_files(self.project_dir)
+        note = [
+            "> **あなたが読んでいるソースについて**",
+            ">",
+            "> 作業ディレクトリは本番そのものではなく、本番リポジトリの HEAD (`%s`) を" % head[:12],
+            "> ローカルディスクへ checkout したものです。読み取りは自由に行えます。",
+        ]
+        if dirty:
+            note += [
+                ">",
+                "> ただし、稼働中のプロセスが実行しているのは本番の作業ツリーであり、",
+                "> 次のファイルには **HEAD に入っていない未コミットの変更があります**。",
+                "> これらのファイルについては、あなたが読む内容と実際に動いている内容が",
+                "> 食い違う可能性があります。断定する前にその点を考慮してください。",
+                ">",
+            ]
+            for f in dirty[:30]:
+                note.append("> - `%s`" % f)
+            if len(dirty) > 30:
+                note.append("> - ...ほか %d 件" % (len(dirty) - 30))
+        return "\n".join(note)
+
     def _build_prompt(self, pend: _Pending) -> str:
         evidence = "\n".join(pend.before + ["", ">>> ここから後続 <<<", ""] + pend.after)
         if len(evidence) > self.max_evidence_chars:
@@ -255,6 +323,7 @@ class Supervisor:
         out = out.replace("{{LOG_FILE}}", h.file_name)
         out = out.replace("{{MATCHED_LINE}}", h.line)
         out = out.replace("{{EVIDENCE}}", evidence)
+        out = out.replace("{{WORKTREE_NOTE}}", self._sync_diag_worktree())
         return out
 
     def _dispatch(self, pend: _Pending) -> None:

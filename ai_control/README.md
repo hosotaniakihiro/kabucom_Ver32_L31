@@ -139,6 +139,36 @@ ls \192.168.0.22\AutoStockBuyAndSell\Logs\console | ForEach-Object {
 } | Sort-Object -Unique
 ```
 
+## Codex には NAS を読ませられない（2026-08-29 に判明）
+
+`codex exec` の read-only サンドボックスは、**ネットワークドライブを読めない**。
+ドライブレター (`W:`)、UNC (`\192.168.0.22\...`)、
+`-c sandbox_permissions=["disk-full-read-access"]` のいずれでも読めなかった。
+
+これに気づかないまま運用していた間、**Codex はソースを読めず、ログだけで
+推測していた**。401 の解析で Codex 自身が
+「UNCパスがPermissionDeniedとなり、実際に読んで裏取りできなかった」と
+報告して発覚した。
+
+対策として、`ReadOnlyWorktree` がローカルディスクに本番 HEAD の checkout を
+作り、Codex にはそちらを見せる（`codex.worktree_dir`）。
+
+同じ 401 を、条件だけ変えて解析させた結果:
+
+| Codex の作業ルート | status | confidence |
+|---|---|---|
+| NAS（ソースを読めない） | `NEED_MORE_INFO` | 0.35 |
+| ローカル checkout（読める） | `FIX_REQUIRED` | **0.91** |
+
+### HEAD と稼働中コードのズレを Codex に伝える
+
+診断用 checkout は HEAD の内容だが、**稼働中のプロセスが実行しているのは
+本番の作業ツリー**（未コミットの変更を含む）である。
+`supervisor.py` は `git status --porcelain` で未コミットのファイル名を集め、
+プロンプトに「これらは読む内容と動いている内容が食い違う可能性がある」と
+明記する。実際に Codex はこれを読み取り、未コミットの
+`kabu_api/token_bootstrap.py` を上書きしないよう指示に含めてきた。
+
 ## 実測値
 
 - `codex exec` 1 回あたり **約 6 分**（プロンプト約 62,000 文字、reasoning effort high）
@@ -262,6 +292,36 @@ ls \192.168.0.22\AutoStockBuyAndSell\Logs\console | ForEach-Object {
   $_.Name -replace '_\d{8}_\d{6}_\d+\.log$',''
 } | Sort-Object -Unique
 ```
+
+## Codex には NAS を読ませられない（2026-08-29 に判明）
+
+`codex exec` の read-only サンドボックスは、**ネットワークドライブを読めない**。
+ドライブレター (`W:`)、UNC (`\192.168.0.22\...`)、
+`-c sandbox_permissions=["disk-full-read-access"]` のいずれでも読めなかった。
+
+これに気づかないまま運用していた間、**Codex はソースを読めず、ログだけで
+推測していた**。401 の解析で Codex 自身が
+「UNCパスがPermissionDeniedとなり、実際に読んで裏取りできなかった」と
+報告して発覚した。
+
+対策として、`ReadOnlyWorktree` がローカルディスクに本番 HEAD の checkout を
+作り、Codex にはそちらを見せる（`codex.worktree_dir`）。
+
+同じ 401 を、条件だけ変えて解析させた結果:
+
+| Codex の作業ルート | status | confidence |
+|---|---|---|
+| NAS（ソースを読めない） | `NEED_MORE_INFO` | 0.35 |
+| ローカル checkout（読める） | `FIX_REQUIRED` | **0.91** |
+
+### HEAD と稼働中コードのズレを Codex に伝える
+
+診断用 checkout は HEAD の内容だが、**稼働中のプロセスが実行しているのは
+本番の作業ツリー**（未コミットの変更を含む）である。
+`supervisor.py` は `git status --porcelain` で未コミットのファイル名を集め、
+プロンプトに「これらは読む内容と動いている内容が食い違う可能性がある」と
+明記する。実際に Codex はこれを読み取り、未コミットの
+`kabu_api/token_bootstrap.py` を上書きしないよう指示に含めてきた。
 
 ## 実測値
 

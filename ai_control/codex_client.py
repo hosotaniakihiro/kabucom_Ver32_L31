@@ -48,6 +48,7 @@ class CodexClient:
         sandbox: str = "read-only",
         timeout_sec: float = 420.0,
         model: str = "",
+        out_dir: Optional[Path] = None,
     ) -> None:
         # Windows では codex は codex.CMD というシムなので、PATH 上の実体まで
         # 解決しておかないと subprocess が [WinError 2] で落ちる。
@@ -58,10 +59,22 @@ class CodexClient:
         self.sandbox = sandbox
         self.timeout_sec = float(timeout_sec)
         self.model = model or ""
+        # 出力用の一時ファイルは作業ルートとは別に置く。
+        # project_dir は診断用 worktree を指すことがあり、そこに
+        # ai_control/locks があるとは限らない（gitignore 済み）。
+        # 既定はシステムの一時ディレクトリ（ローカル・高速）。
+        self.out_dir = Path(out_dir) if out_dir else None
 
     def diagnose(self, prompt: str) -> CodexResult:
+        out_dir = None
+        if self.out_dir is not None:
+            try:
+                self.out_dir.mkdir(parents=True, exist_ok=True)
+                out_dir = str(self.out_dir)
+            except OSError:
+                out_dir = None
         out_fd = tempfile.NamedTemporaryFile(
-            prefix="codex_out_", suffix=".json", delete=False, dir=str(self.project_dir / "ai_control" / "locks")
+            prefix="codex_out_", suffix=".json", delete=False, dir=out_dir
         )
         out_path = Path(out_fd.name)
         out_fd.close()

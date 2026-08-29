@@ -59,6 +59,16 @@ codex:
   # 空なら codex の既定モデル
   model: ""
 
+  # ★ Codex にはローカルディスク上の checkout を見せる。
+  #   codex exec の read-only サンドボックスは、ドライブレター (W:) でも
+  #   UNC でも、-c sandbox_permissions=["disk-full-read-access"] を付けても
+  #   ネットワークドライブを読めない (2026-08-29 実測)。
+  #   NAS を作業ルートにすると Codex はソースを読めず、ログだけの推測しか
+  #   返せない。実際 401 の解析で「UNCパスがPermissionDeniedで裏取りできない」
+  #   と報告された。
+  #   空文字にすると本番ディレクトリを直接渡す (推奨しない)。
+  worktree_dir: "C:/Users/hosot/AppData/Local/ai_diag_worktree"
+
 limits:
   # 同じ症状を何秒間は再解析しないか
   cooldown_sec_per_signature: 1800
