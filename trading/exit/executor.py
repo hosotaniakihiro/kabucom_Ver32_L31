@@ -26,13 +26,13 @@ import sys
 import threading
 import time
 import urllib.parse
-import urllib.request
 from typing import Any, Callable, Optional
 
 from core.global_context.context import global_context as GC
 from database import Session_position
 from database.models import Position
 from global_state import global_data
+from kabu_api import kabu_http
 from kabu_api.send_order import send_order_common
 
 logger = logging.getLogger(__name__)
@@ -481,11 +481,16 @@ def _exit_board_fetch_rest(symbol: str, exchange: int) -> Optional[dict]:
     base = os.getenv("KABUSAPI_BASE_URL", "http://localhost:18080/kabusapi").rstrip("/")
     ex = str(os.getenv("EXIT_REST_FULL_BOARD_EXCHANGE", str(exchange or 1)) or exchange or 1)
     url = f"{base}/board/{urllib.parse.quote(str(symbol) + '@' + ex)}"
-    req = urllib.request.Request(url, headers={"X-API-KEY": token}, method="GET")
     _EXIT_BOARD_LAST_CALL[symbol] = now
     try:
-        with urllib.request.urlopen(req, timeout=_exit_board_env_float("EXIT_REST_FULL_BOARD_TIMEOUT_SEC", 0.8)) as res:
-            raw = json.loads(res.read().decode("utf-8", errors="replace"))
+        # urllib.request の "Connection: close" では kabu Station が応答を
+        # 返さない (詳細は kabu_api/kabu_http.py)。板読みも requests 経由にする。
+        raw = kabu_http.request_json(
+            url,
+            method="GET",
+            api_key=token,
+            timeout=_exit_board_env_float("EXIT_REST_FULL_BOARD_TIMEOUT_SEC", 0.8),
+        )
     except Exception:
         logger.debug("[EXIT REST FULL BOARD] request failed symbol=%s", symbol, exc_info=True)
         return None
@@ -1363,9 +1368,14 @@ def _exit_closing_reconcile_fetch_positions_rest_direct() -> tuple[bool, set[str
     ]
     for url in urls:
         try:
-            req = urllib.request.Request(url, headers={"X-API-KEY": token}, method="GET")
-            with urllib.request.urlopen(req, timeout=_exit_board_env_float("EXIT_CLOSING_RECONCILE_REST_TIMEOUT_SEC", 1.5)) as res:
-                raw = json.loads(res.read().decode("utf-8", errors="replace"))
+            # urllib.request の "Connection: close" では kabu Station が応答を
+            # 返さない (詳細は kabu_api/kabu_http.py)。
+            raw = kabu_http.request_json(
+                url,
+                method="GET",
+                api_key=token,
+                timeout=_exit_board_env_float("EXIT_CLOSING_RECONCILE_REST_TIMEOUT_SEC", 1.5),
+            )
             rows = _exit_closing_reconcile_extract_position_rows(raw)
             symbols = _exit_closing_reconcile_rows_to_open_symbols(rows)
             logger.info("[EXIT CLOSING RECONCILE] REST positions ok url=%s rows=%s credit_symbols=%s ignored=%s", url, len(rows), sorted(symbols)[:20], sorted(_exit_closing_reconcile_ignored_symbols()))

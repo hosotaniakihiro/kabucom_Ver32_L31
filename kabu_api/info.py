@@ -43,15 +43,18 @@ def get_latest_price(symbol):
         return None
 
 def fetch_orders():
-    """注文一覧を取得"""
-    import urllib.request, json
+    """注文一覧を取得
+
+    このモジュールの他の関数は requests を使っており、ここだけ urllib
+    だった。urllib は "Connection: close" を送るため kabu Station が
+    応答を返さない (詳細は kabu_api/kabu_http.py)。
+    """
+    from kabu_api import kabu_http
+
     token = get_valid_token()
     url = f"{API_URL}/orders"
-    headers = {"Content-Type": "application/json", "X-API-KEY": token}
     try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req) as res:
-            return json.loads(res.read())
+        return kabu_http.request_json(url, method="GET", api_key=token)
     except Exception as e:
         print(f"❌ fetch_orders エラー: {e}")
         return []

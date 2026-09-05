@@ -7,7 +7,6 @@
 
 import time
 import threading
-import urllib.request
 import json
 import sys
 import os
@@ -15,22 +14,23 @@ import os
 from token_manager import get_valid_token
 from global_state import global_data
 
+from kabu_api import kabu_http
+
 # kabuステ市場コード一覧
 MARKETS = ["1", "3", "5", "6"]
 
 
 def try_board(symbol, market, token):
-    """特定市場で board を試行取得"""
+    """特定市場で board を試行取得
+
+    urllib.request の "Connection: close" では kabu Station が応答を
+    返さない (詳細は kabu_api/kabu_http.py)。timeout=2 のまま無応答に
+    なると 1 秒周期のループが銘柄数×市場数ぶん詰まる。
+    """
     url = f"http://localhost:18080/kabusapi/board/{symbol}@{market}"
-
-    req = urllib.request.Request(url, method="GET")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("X-API-KEY", token)
-
     try:
-        with urllib.request.urlopen(req, timeout=2) as res:
-            return json.loads(res.read())
-    except:
+        return kabu_http.request_json(url, method="GET", api_key=token, timeout=2)
+    except Exception:
         return None
 
 

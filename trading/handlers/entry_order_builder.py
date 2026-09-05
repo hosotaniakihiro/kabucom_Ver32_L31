@@ -39,12 +39,14 @@ import sqlite3
 import sys
 import time
 import urllib.error
-import urllib.request
+# urllib.parse は従来 urllib.request 経由で入っていた。request を外すので明示する。
+import urllib.parse
 from pathlib import Path
 from typing import Dict, Any, Iterable, Optional, Tuple
 
 import pandas as pd
 
+from kabu_api import kabu_http
 from global_state import global_data
 from trading.exit.symbol_trade_guard import is_entry_blocked
 from utils_common import (
@@ -962,6 +964,29 @@ def _rc_ratio(close: float, high: float, low: float) -> float:
     return max(0.0, (high - low) / close)
 
 
+# ------------------------------------------------------------
+# range_pct の単位境界
+# ------------------------------------------------------------
+# この関数群の内部計算は比率 (0-1)。
+# entry_row["range_pct"] などの **列** は percent (1.88% = 1.88)。
+# 換算は下の 2 つでだけ行い、各所で 100 を掛けたり割ったりしない。
+_RC_RANGE_PCT_SCALE = 100.0
+
+
+def _rc_percent_to_ratio(v: float) -> float:
+    try:
+        return max(0.0, float(v)) / _RC_RANGE_PCT_SCALE
+    except Exception:
+        return 0.0
+
+
+def _rc_ratio_to_percent(v: float) -> float:
+    try:
+        return max(0.0, float(v)) * _RC_RANGE_PCT_SCALE
+    except Exception:
+        return 0.0
+
+
 def _rc_best_range(row: dict[str, Any], close: float) -> tuple[str, float, float, float]:
     cond = row.get("entry_conditions") if isinstance(row.get("entry_conditions"), dict) else {}
     candidates: list[tuple[str, float, float, float]] = []
@@ -980,10 +1005,13 @@ def _rc_best_range(row: dict[str, Any], close: float) -> tuple[str, float, float
             h, l = max(hi, lo), min(hi, lo)
             candidates.append((label, h, l, _rc_ratio(close, h, l)))
 
-    explicit = max(
+    # range_pct 列は percent 単位 (trading/entry/summary_ai/range_defs.py が定義)。
+    # この関数の内部計算は比率 (0-1) なので、読み込む境界で 1 回だけ換算する。
+    explicit_pct = max(
         _rc_first(row, ("range_pct", "intraday_range_pct", "summary_ai_range_repair_pct")),
         _rc_first(cond, ("range_pct", "intraday_range_pct", "day_range_pct")),
     )
+    explicit = _rc_percent_to_ratio(explicit_pct)
     if explicit > 0:
         width = close * explicit
         candidates.append(("explicit", close + width / 2.0, max(0.01, close - width / 2.0), explicit))
@@ -1021,8 +1049,10 @@ def _low_move_hard_block(entry_row: Dict[str, Any], *, symbol: str, source: str)
             entry_row["high_price"] = high
             entry_row["low"] = low
             entry_row["low_price"] = low
-            entry_row["range_pct"] = rpct
-            entry_row["intraday_range_pct"] = rpct
+            # 書き戻しは canonical な percent 単位で行う。
+            rpct_percent = _rc_ratio_to_percent(rpct)
+            entry_row["range_pct"] = rpct_percent
+            entry_row["intraday_range_pct"] = rpct_percent
             entry_row["atr"] = atr
             entry_row["atr_1m"] = atr
             entry_row["ATR"] = atr
@@ -2669,11 +2699,16 @@ def _rfb_fetch_board(symbol: str, *, force: bool = False) -> dict | None:
     base = os.getenv("KABUSAPI_BASE_URL", "http://localhost:18080/kabusapi").rstrip("/")
     exchange = os.getenv("ENTRY_REST_FULL_BOARD_EXCHANGE", "1")
     url = f"{base}/board/{urllib.parse.quote(symbol + '@' + exchange)}"
-    req = urllib.request.Request(url, headers={"X-API-KEY": token}, method="GET")
     _RFB_LAST_CALL[symbol] = now
     try:
-        with urllib.request.urlopen(req, timeout=_rfb_env_float("ENTRY_REST_FULL_BOARD_TIMEOUT_SEC", 0.8)) as res:
-            raw = json.loads(res.read().decode("utf-8", errors="replace"))
+        # urllib.request の "Connection: close" では kabu Station が応答を
+        # 返さない (詳細は kabu_api/kabu_http.py)。板読みも requests 経由にする。
+        raw = kabu_http.request_json(
+            url,
+            method="GET",
+            api_key=token,
+            timeout=_rfb_env_float("ENTRY_REST_FULL_BOARD_TIMEOUT_SEC", 0.8),
+        )
     except Exception:
         logger.debug("[REST FULL BOARD] request failed symbol=%s force=%s", symbol, force, exc_info=True)
         return None

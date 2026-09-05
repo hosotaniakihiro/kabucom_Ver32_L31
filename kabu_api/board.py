@@ -1,5 +1,4 @@
 # kabu_api/board.py
-import urllib.request
 import json
 import time
 import sys
@@ -11,6 +10,8 @@ if BASE_DIR not in sys.path:
 
 from token_manager import get_valid_token
 
+from kabu_api import kabu_http
+
 # kabuステ仕様の市場リスト
 MARKET_LIST = ["1", "3", "5", "6"]
 
@@ -19,16 +20,17 @@ _cache_ttl = 5  # 秒
 
 
 def _try_get_board(symbol, market, token, timeout):
-    """内部関数：特定市場で board 取得"""
-    url = f"http://localhost:18080/kabusapi/board/{symbol}@{market}"
-    req = urllib.request.Request(url, method="GET")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("X-API-KEY", token)
+    """内部関数：特定市場で board 取得
 
+    urllib.request は "Connection: close" を送り、kabu Station が応答を
+    返さなくなる (詳細は kabu_api/kabu_http.py)。ここは失敗を None に
+    畳んでいたため、無応答が「その市場には無い」と区別できずに
+    4 市場総当たりを最後まで空振りさせていた。
+    """
+    url = f"http://localhost:18080/kabusapi/board/{symbol}@{market}"
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as res:
-            return json.loads(res.read())
-    except:
+        return kabu_http.request_json(url, method="GET", api_key=token, timeout=timeout)
+    except Exception:
         return None
 
 

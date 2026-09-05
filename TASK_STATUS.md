@@ -6196,3 +6196,1133 @@ import しただけで前日 DB (`summary20260827.db`) の末尾 120 bars を
    incremental cache の回帰は R18 の 22 件で一部しかカバーできていない
 6. `summary_seed_bootstrap.py` に `if __name__ == "__main__"` ガードを付ける
    (import だけで本番 DB を書くのは事故のもと)
+
+---
+
+## 第18ラウンド 追記 — 場後の起動スモーク (2026-08-28 23:1x〜23:3x)
+
+`main_database.py` を本番と同じ env
+(`AUTOSTOCK_DATA_COLLECTORS_PROCESS=1` / `AUTOSTOCK_MAIN_DATABASE_PROCESS=1` /
+`AUTOSTOCK_SUMMARY_SAVE_OWNER=database`) で 4 回起動した。
+
+### 検証できたこと — 変更 150 ファイルは実ブート経路を通る
+
+| 項目 | 結果 |
+|---|---|
+| sitecustomize → runtime defaults → `MAIN DATABASE BOOT START` | **到達** (約 75 秒) |
+| Traceback / ImportError / NameError | **0 件** |
+| `console_tee` の出力先 (`nas_path()` 経由) | 正常 (`X:\logs\console\main_database_*.log`) |
+| `sqlite_memory_pragmas` の `sqlite3.connect` ラップ | 従来どおり install (99 箇所置換後も競合なし) |
+
+`_open_connection()` 経路の PRAGMA も、本番 ranking DB を触らないよう
+一時 DB へ差し替えて検証した (`test_r18_ranking_ckpt.py` [4])。
+
+| 確認 | 結果 |
+|---|---|
+| `journal_mode=WAL` | 維持 |
+| `wal_autocheckpoint=0` (inline 停止) | ✓ |
+| `journal_size_limit` | ✓ 33,554,432 |
+| 背景スレッド起動 | ✓ |
+| `RANKING_DB_BG_CHECKPOINT=0` で従来値 1000 | ✓ |
+
+### 検証できなかったこと — kabu Station 側でブロックされた
+
+token preflight ゲートより後 (ranking writer 実稼働 / `[RESOURCE]` の
+`sqlite_cm` 推移 / collectors) は到達できていない。
+
+### kabu Station の状態 (実測)
+
+| リクエスト | 結果 |
+|---|---|
+| `POST /token` 空ボディ | HTTP 415 / 400 (107 ms) |
+| `POST /token` **誤**パスワード (18080) | HTTP 401 (99 ms) |
+| `POST /token` **誤**パスワード (18081 検証) | HTTP 401 (12 ms) |
+| `GET /wallet/cash` dummy キー | HTTP 401 (6 ms) |
+| `GET /wallet/cash` **キャッシュ済みトークン** | **10.0 秒ハング後に RST** (WinError 10054) |
+| `POST /token` **正**パスワード (timeout 60 秒) | **12.1 秒ハング後に RST** (WinError 10054) |
+
+**門前払い (認証エラー) は 100ms 以内で返るが、実処理を伴うリクエストだけが
+ハングして接続を切られる。** タイムアウト設定の問題ではない
+(60 秒待っても 12 秒で RST される)。kabu Station は起動・ログイン済みだが、
+トークン発行と口座照会を処理できない状態だった。
+
+### 併せて判明したコード側の弱点 (未修正)
+
+`kabu_api/token_bootstrap.py` の cached トークン検証:
+
+```python
+if pf.is_transport_error:
+    abort                      # ← トークン再取得を試みない
+# Auth rejected -> the cached token is stale on the server side.
+    → POST /token で自動再取得
+```
+
+**401/403 なら「失効」と判定して自動再取得するが、
+タイムアウト / 接続リセットは「kabu Station に繋がらない」と判定して abort する。**
+今回のように失効トークンに対してサーバが 401 ではなく RST を返す場合、
+システムは自力で復旧できない。
+
+またログの
+`Confirm kabu Station API is listening on localhost:18080.` は誤解を招く。
+**API は listen しており 401 も返している**。区別できていないのは
+「TCP が繋がらない」と「繋がったが応答が返らない」で、
+この 2 つを別の failure_kind にすると原因究明が速くなる。
+
+### 実施した操作 (記録)
+
+`settings.ini` の `[aukabu] token` (失効・tail=bcd2) を空にした。
+アプリ自身の「cached が空 -> POST /token -> 保存」経路へ入れるため。
+バックアップはローカルの scratchpad に退避 (API パスワードを含むため NAS には置かない)。
+**現在 settings.ini の token は空**。次回の起動時にアプリが取得し直す。
+
+---
+
+## 第18ラウンド 追記2 — 本番稼働での確認と追加修正 (2026-08-28 23:3x〜)
+
+`main_database.py` + `main.py` が本番構成で稼働した状態で、
+第18ラウンドの変更を実ログで確認できた。
+
+### 完成条件に対する実測 (稼働中)
+
+| 観点 | 実測 |
+|---|---|
+| ranking writer の inline checkpoint 停止 | `[RANKING DB WRITER] connected ... wal_autocheckpoint=0 bg_checkpoint=True` |
+| 背景 checkpoint | 30 秒ごと `passive busy=0 elapsed=0.07〜0.69s` **errors なし** |
+| `sqlite_cm` | `opened=8 closed=8 close_failed=0 **outstanding=0**` |
+| engine 接続 | 全 DB で `outstanding=0` (positions.db は 194 open / 194 close) |
+| handles | 366 → 374 → 371 → 371 (`peak=374`、増加傾向なし) |
+| threads | 59〜62 で安定 |
+
+`wal_mb=0.0` / `checkpointed=0` は場後で ranking データが流れていないため。
+機構が動いてエラーを出さないことまでは確認できた。
+**場中の実効果 (WAL 肥大時の checkpoint 時間) は翌営業日に持ち越し。**
+
+### 追加修正1 — token preflight の「繋がらない」と「応答が返らない」の分離
+
+今夜の起動が 3 回連続で止まった原因そのもの。実測は追記1 のとおりで、
+**失効トークンに対して kabu Station が 401 ではなく「12 秒ハング後に RST」を返す**。
+旧実装はこれを `transport_error` = 「kabu Station に繋がらない」と扱って abort し、
+トークン再取得を試みないため **自力復旧できなかった**。
+
+`kabu_api/token_bootstrap.py`:
+
+- `classify_transport_error()` を新設し、transport 例外を分類する
+  - `unreachable` : 接続拒否 / 名前解決失敗 (listen していない)
+  - `no_response` : タイムアウト / 接続リセット (繋がったが応答が返らない)
+- `PF_NO_RESPONSE` / `FAIL_PREFLIGHT_NO_RESPONSE` を追加
+- `PreflightResult.is_no_response` を追加
+  (`is_transport_error` は両方で True のまま = 既存呼び出しと互換)
+- `bootstrap_startup_token()` の cached 分岐を 3 つに分けた
+
+| preflight 結果 | 旧 | 新 |
+|---|---|---|
+| 401 / 403 (失効) | /token を 1 回 | 変更なし |
+| **RST / timeout** | **abort** | **/token を 1 回 (失効の可能性)** |
+| 接続拒否 (listen していない) | abort | 変更なし (取り直しても無意味なので) |
+
+`http_get_json()` が transport 失敗の内容へ `unreachable:` / `no_response:` の
+接頭辞を付ける。独自 `request_fn` を渡す既存呼び出しは接頭辞を持たないので
+従来どおり `unreachable` 扱いになる (後方互換)。
+
+ログの `Confirm kabu Station API is listening on localhost:18080.` は
+本当に listen していない場合だけ出るようになった。
+
+### 追加修正2 — push_db_writer の `cls = type(self)`
+
+第18ラウンドで ranking 側を直したときにテストが検出した穴。
+`type(self)` だとサブクラスが独自の `_BG_CKPT_THREAD` を持ち
+「プロセスで 1 本だけ」が崩れる。push 側も基底クラス固定にした。
+
+### 追加修正3 — r13 の時刻依存テストを SKIP 扱いへ
+
+`test_r13_fixes.py` の「heavy rebuild は background で走っている」は
+場中しか通らない。場後は push DB が古く `_fresh_input_hopeless()` が
+tier1 の前に MISS を返すため heavy bg へ到達しない
+(第14ラウンド P0-6 の設計どおり)。
+
+FAIL のままだと本物の回帰と区別できないので、
+`_fresh_input_hopeless()` が理由を返しているときだけ
+**理由付きの SKIP** として別枠に出すようにした。黙って PASS にはしない。
+
+---
+
+## 第18ラウンド 追記3 — 起動不能の真因と本番実測 (2026-08-29)
+
+### P0 真因 — 失敗した /token が one-shot ガードを食い潰していた
+
+2026-08-29 10:11 の実機ログ:
+
+```
+main_database/cached preflight_ng status=401 {"Code": 4001007, "ログイン認証エラー"}
+main_database cached token rejected by kabu API (stale cached token).
+main_database startup token recovery already used once in this process; not calling /token again.
+abort: failure_kind=cached_token_rejected_recovery_already_used
+```
+
+**失効は正しく検出できているのに `/token` を呼べずに abort していた。**
+
+`_STARTUP_RECOVERY_ATTEMPTED` は「プロセスで 1 回だけ /token を許す」ガードだが、
+sitecustomize 段階の `startup_policy` が先に bootstrap を回して消費する。
+しかも **その試行が失敗していても消費される**ため、
+本番の `main_database` は `/token` を一度も呼べない。
+昨夜の 4 回の起動失敗もすべてこの構造だった。
+
+#### 修正 (`kabu_api/token_bootstrap.py`)
+
+ガードを 2 つに分けた。
+
+| | 旧 | 新 |
+|---|---|---|
+| フラグ `_STARTUP_RECOVERY_ATTEMPTED` | /token を**呼ぶ前**に立てる | **成功したときだけ**立てる |
+| ループ防止 | 上のフラグ | `_STARTUP_TOKEN_CALLS` の**上限**(既定 2) |
+
+- `startup_token_max_calls()` / `startup_token_calls()` を追加
+- ENV `KABU_TOKEN_STARTUP_MAX_CALLS` (既定 2・最低 1)
+- `reset_startup_state()` は両方を戻す
+
+これで「sitecustomize が失敗 -> main_database が取り直す」が通る。
+失敗が続いても上限で打ち切るのでループはしない。
+
+#### 本番で確認
+
+再起動 (10:15) 後:
+
+```
+[TOKEN BOOTSTRAP] main_database TOKEN_SOURCE=settings_ini_cached TOKEN_ACTION=reused token_tail=da8f
+[TOKEN BOOTSTRAP] main_database/cached TOKEN_ACTION=preflight_ok endpoint=/positions status=200
+[TOKEN BOOTSTRAP] main_database RESULT TOKEN_ACTION=preflight_ok token_api_calls=0
+```
+
+**main.py の 401 は 0 件**。全プロセス (main_database / main / push_receiver /
+summary_database / yahoo_complement / ranking_collector) が稼働。
+
+### 本番実測1 — 夜間 10.5 時間 (2026-08-28 23:34 -> 08-29 10:09)
+
+| 観点 | 実測 | 判定 |
+|---|---|---|
+| `sqlite_cm` | **6,945 接続で outstanding 最大 2 / close_failed 0** | **達成** (漏れなし) |
+| handles | 335 -> 410 (最大 418) | 暴走なし |
+| **WS 切断/再接続** | **全ログで 0 回** | **達成** (R17 のバックオフ) |
+| `[RANKING DB CHECKPOINT]` | 1,257 回 p50=0.01s p95=0.22s errors=0 | 動作確認 |
+| disk I/O error | 1 件 (09:53 positions.db `fail_count=1 critical=False`)。同時刻 handles=412 / outstanding=0 なので**資源枯渇ではない** | 一過性 |
+
+### 本番実測2 — 場中 38 分 (2026-08-29 10:19-10:57)
+
+| 観点 | 実測 |
+|---|---|
+| `[RANKING DB CHECKPOINT]` | 53 回 **全 53 回が実際に flush**、`wal_mb` 最大 **13.3MB** |
+| incremental cache | `delta merged read=152.9ms delta_rows=2714 -> total_rows=12364 symbols=562 **mem=34.0MB**` |
+| `sqlite_cm` | outstanding 最大 2 / close_failed 0 |
+| I/O エラー | 0 |
+
+**ranking DB の WAL は 13.3MB に収まっている** (第16ラウンド時点では 399.4MB)。
+inline auto-checkpoint を外して背景 PASSIVE へ移した効果が本番で確認できた。
+
+### 変更前 / 変更後の比較 (どちらも場中)
+
+RSS と Ranking Summary BG は、変更前の同条件ログ
+(`console_20260828_094022_82112.log` 09:40-12:08) と突き合わせた。
+
+#### RSS — **変更由来ではない (訂正)**
+
+| | 変更前 8/28 (136 分) | 変更後 8/29 (36 分) |
+|---|---|---|
+| RSS 最大 | **7,401.8 MB** | 5,160.4 MB |
+| RSS 推移 | 1623→3864→5308→5605→3576→2723 (振動) | 689→2029→3707→2202→5008 (振動) |
+| **handles 最大** | **537** | **391** |
+
+変更前から 2〜7GB で振動しており単調増加ではない。**handles はむしろ改善** (537->391)。
+
+**注意**: 第7/第17ラウンドの「RSS < 500MB 目安」は
+**30 分 dry-run ハーネスでの値**であり、実 main.py の実測ではなかった。
+実 main.py は変更前から場中に数 GB を使う。完成条件の見直しが要る。
+
+#### Ranking Summary BG — テールは大幅改善、中央値は悪化
+
+| | 変更前 8/28 | 変更後 8/29 |
+|---|---|---|
+| **max** | **1,341.2s (22 分)** | **125.8s** |
+| p95 | 369.6s | 94.9s |
+| p50 | 0.3s | 19.4s |
+| 10 秒未満の割合 | 71% | 38% |
+| `bg_still_running` スキップ | 60 回 | 12 回 |
+
+旧は「ほとんど即終了 + 最大 22 分の長いテール」という二峰性だった。
+新は分布が均され、**テールが 10 分の 1** になった一方で中央値は遅くなった。
+**どちらも完成条件 (<10 秒) は未達。**
+BG は main tick を待たせない設計 (第13ラウンド P0-2) なので
+テール短縮の価値は大きいが、目標には届いていない。
+
+### テストスイートの注意 — 同時実行で揺れる
+
+12 スイートを連続実行しながら本番システムが NAS を使っていると、
+`test_r16_fixes.py` (commit レイテンシの実測) と `test_r13_fixes.py` が
+稀に FAIL する。**単独実行では r16 は 3 回連続 17/17、r13 は 53/53**。
+コード回帰ではなく計測の揺れなので、
+性能系スイートは本番停止中に走らせること。
+
+### 変更ファイル (追記3)
+
+| ファイル | 内容 |
+|---|---|
+| `kabu_api/token_bootstrap.py` | one-shot ガードを「成功 1 回」+「試行上限」へ分離 |
+| `test_script/p0_round18/test_r18_token_no_response.py` | one-shot ガードの検証を追加 (42 件) |
+
+### 次ラウンドへの持ち越し (更新)
+
+1. **Ranking Summary BG < 10 秒** — 未達 (p50 19.4s / p95 94.9s)。
+   旧実装より tail は 10 分の 1 になったが目標未達
+2. **RSS の完成条件を実測ベースで引き直す** — 「<500MB」は dry-run の値。
+   実 main.py は変更前から場中 2〜7GB。まず正しい基準値を決める
+3. **`[RANKING DB CHECKPOINT]` の p95=15.35s / max=20.65s** (場中)。
+   背景スレッドなので commit は止めないが、NAS 上の PASSIVE checkpoint 自体が遅い
+4. WS 切断そのものの原因断定 (夜間は 0 回。場中の実測が必要)
+5. cold read 66 秒
+6. R17 のテストファイル 3 本が消えている件
+
+---
+
+## 第18ラウンド 追記4 — Ranking Summary BG の内訳を特定 (2026-08-29 場中)
+
+完成条件で唯一はっきり未達なのが Ranking Summary BG (<10 秒)。
+場中 74 分の実ログから内訳を確定させた。
+
+### 変更前 / 変更後 (どちらも場中)
+
+| | 変更前 8/28 (09:40-12:08) | 変更後 8/29 (10:19-11:33) |
+|---|---|---|
+| **max** | **1,341.2s (22 分)** | **125.8s** |
+| p95 | 369.6s | 95.1s |
+| **p50** | **0.3s** | **64.9s** |
+| 10 秒未満の割合 | 71% | 21% |
+| `bg_still_running` スキップ | 60 回 | 32 回 |
+
+**tail は 10.6 倍改善したが、中央値は 0.3 秒 -> 64.9 秒に悪化した。**
+旧実装は「ほとんど即終了 + 最大 22 分の長いテール」という二峰性で、
+新実装は分布が均された。BG は main tick を待たせない設計
+(第13ラウンド P0-2) なので tail 短縮の価値は大きいが、目標は未達。
+
+### 内訳 (実測)
+
+`[SUMMARY STAGE] worker end kind=ranking_summary_bg` は
+`stages=[ranking_build_kwargs=0.000, ranking_job_all=68.713, ranking_announce=0.038]`
+としか出ておらず、68 秒が丸ごと 1 ステージだった。
+`_job_ranking_summary_all_core` は 1m / 3m / 5m を **逐次** 実行する。
+
+| interval | base_df | technical | runner 合計 | 外側の実測 | runner 後 (未計測だった) |
+|---|---|---|---|---|---|
+| **1m** | **1.9-2.6s** | 9.1-10.8s | 11.6-13.4s | 約 28-35s | **約 16-22s** |
+| **3m** | **14.9-15.8s** | 6.0-6.9s | 21.0-22.8s | 33-36s | 約 12s |
+| **5m** | **13.8-15.0s** | 10.3-11.0s | 24.8-25.3s | 41-42s | 約 16s |
+
+BG 1 回 = 1m + (3m または 5m) で 64-69 秒。3 本とも due なら 125 秒。
+
+### ここから分かること
+
+1. **incremental cache は 1m にしか効いていない。**
+   1m の `base_df` は **1.9-2.6 秒**まで落ちているのに、
+   3m / 5m は **14.9-15.8 秒**かかったまま。
+   第17/第18ラウンドで入れた delta read + ring buffer は
+   1m 経路だけを通る。**3m/5m へ広げるのが最大のレバー。**
+
+2. **runner の後段に 12-22 秒あるのに名前が付いていなかった。**
+   `run_ranking_summary_once()` が返ってから `_run_interval()` を抜けるまで
+   (cache 格納 / persist / display / AI hook / entry)。
+   1m ではここが runner 本体 (12 秒) より長い。
+
+3. `technical` は 1m で 30,348-31,472 行に対し 9.1-10.8 秒。
+   3m/5m は行数が少ない (6,182-10,678) 分だけ速い。
+
+### 入れた計測 (`scheduler_jobs/summary/ranking_summary_jobs.py`)
+
+`_run_interval()` に runner 本体と後段の切り分けを追加した。
+
+```
+[RANKING SUMMARY STAGE] interval=N leg_total=X.XXXs runner=Y.YYYs post_runner=Z.ZZZs
+    (post_runner = cache/persist/display/AI hook/entry)
+```
+
+`finally` で出すので途中で return / 例外になっても必ず記録される。
+**次回起動時から出力される。**
+
+### 次ラウンドの優先順位 (更新)
+
+1. **incremental cache を 3m / 5m へ広げる** — `base_df` 15 秒 x 2 本が消える見込み。
+   BG 64-69 秒のうち最大 30 秒。効果が最も大きく、機構は既にある
+2. **post_runner (12-22 秒) の中身を割る** — 上の計測で次回ログから分かる
+3. `technical` 9-11 秒 (1m / 3 万行) の削減
+4. 1m / 3m / 5m の**逐次実行**を見直す (並列化 or 間引き)
+
+---
+
+## 第18ラウンド 追記5 — Ranking Summary BG の短縮 (2026-08-29)
+
+追記4 で特定した内訳のうち、**per-symbol ループ**を潰した。
+
+### 訂正: incremental cache は 3m/5m にも効いていた
+
+追記4 で「incremental cache は 1m にしか効いていない」と書いたが誤り。
+`[RANKING SUMMARY BASE STAGE]` を見ると 3m/5m も `load=0.000s`
+(キャッシュヒット) で **total=1.0-1.7 秒**だった。
+
+`base_df=15s` との差 **約 13.5 秒は resample 処理**で、
+`BASE STAGE` のログ行より後ろにあるため計測されていなかった
+(1m はログ直後に return するので発生しない)。
+
+### 真因1 — 3m/5m の resample が per-symbol ループ
+
+```python
+for symbol, g in one.groupby("symbol", sort=False):
+    r = resample_symbol_frame(g, interval=interval)   # 562 回
+frames.append(r) -> pd.concat(frames)
+```
+
+各銘柄で
+`_ensure_push_compatible_price_columns()` + `_ensure_summary_base_columns()` を
+やり直し、40 集約の `.resample().agg()` を回していた。
+
+**ローカル実測 (562 銘柄 x 120 分):**
+
+| interval | ループ | ベクトル化 | 倍率 |
+|---|---|---|---|
+| 3m | 12.31s | **0.43s** | **28.4 倍** |
+| 5m | 11.91s | **0.39s** | **30.4 倍** |
+
+出力は **69 列すべて一致**。
+
+#### 実装 (`trading/ranking/summary/resample.py`)
+
+`resample_all_symbols()` を新設。
+
+- 列補完は全体で **1 回だけ**
+- バケットは `datetime.dt.ceil("<interval>min")`
+  (`resample(origin="start_day", label="right", closed="right")` と同値。
+   1 日 = 1440 分は 3 でも 5 でも割り切れるので境界が一致する)
+- `groupby(["symbol", bucket]).agg()` を 1 回
+
+例外時は従来の per-symbol ループへ自動で戻る。
+ENV `RANKING_RESAMPLE_VECTORIZED=0` で旧実装に固定できる。
+`[RANKING SUMMARY RESAMPLE] stage interval=N mode=vectorized elapsed=...` を追加。
+
+### 真因2 — technical にも per-symbol ループが 2 箇所
+
+`trading/ranking/technical_from_ranking.py`
+
+| 関数 | ループ | ベクトル化 | 倍率 |
+|---|---|---|---|
+| `add_ranking_indicators` | 0.84s | 0.68s | 1.2 倍 |
+| `add_ranking_indicator_flags` | 0.61s | **0.02s** | **25.9 倍** |
+
+`add_ranking_indicator_flags` は `shift(1)` と論理演算だけなので
+`groupby.shift` で完全にベクトル化できた。
+`add_ranking_indicators` は RSI/MACD の計算自体が銘柄単位なので
+`groupby.transform` へ寄せて copy/sort/concat を削っただけ (1.2 倍)。
+出力は全 26 列一致。
+
+**注意**: 合成データ 67,440 行でこの 2 関数の合計は 1.45 秒。
+**本番の `technical=9-11 秒` の主因はここではない。** 別途の特定が要る。
+
+### 追加した計測
+
+`_run_interval()` の後段を割る。次回起動時から出る。
+
+```
+[RANKING SUMMARY STAGE] interval=N leg_total=X runner=Y post_runner=Z
+[RANKING SUMMARY STAGE] interval=N post_cache=X post_ai_hook=Y rows=N
+```
+
+post_runner の中身は `_store_ranking_summary_cache()` と
+`_run_ranking_ai_hook_v20()` (entry 評価) の 2 つだけ。
+
+### 見込みと、残る距離
+
+| leg | 変更前 | 見込み |
+|---|---|---|
+| 1m | 28-35s | 変わらず (resample を通らない) |
+| 3m | 33-36s | **21-24s** |
+| 5m | 41-42s | **29-30s** |
+| BG 合計 (1m + 長 TF 1 本) | 64-69s | **50-56s** |
+
+**完成条件 <10 秒には届かない。** 残る内訳は
+
+1. 1m leg の `post_runner` 16-22 秒 (= AI hook。次回ログで確定する)
+2. `technical` 9-11 秒 (per-symbol ループ以外の要因)
+3. 1m / 3m / 5m を **逐次**実行している構造そのもの
+
+1 と 3 は entry 評価の呼び出し回数・順序に触るため、
+**売買挙動が変わりうる**。数値だけを見て勝手に変えるべきではない。
+次ラウンドで方針を決めてから着手する。
+
+---
+
+## 第20ラウンド — 2026-09-01 場中の読み取り API 全滅と、その周辺の作り込み
+
+対象ログ: `X:\logs\console\console_20260901_102907_74088.log` の
+**12:53:05 〜 12:55:37**、および同時刻の
+`ranking_collector_runner_20260901_103054_31748.log`。
+
+### 前提 — 一次原因は kabu Station 側
+
+この時間帯、localhost:18080 の **読み取り API がすべて無応答**だった。
+
+| API | 実測 |
+|---|---|
+| `/orders` | Read timeout の反復、`429 {"Code":4001006,"Message":"API実行回数エラー"}` |
+| `/positions` | 約 3 秒 timeout を反復。`broker_ok=False` が窓内 741 件すべて |
+| `/ranking` | 28 呼び出しすべてが 5s x 2 = 約 10.4s で timeout。1 サイクル 305 秒 |
+
+`ranking20260901.db` は全 32 テーブルが **0 行**。
+テーブルは作られているが INSERT が 1 件も無い = 収集できていない。
+**アプリ側の保存経路の不具合ではなく、上流が返っていない。**
+
+以下はそこに重なっていた **アプリ側の増幅要因と設計不備** の修正。
+
+### P0-1 — schedule を 2 箇所から回していた (EXIT 二重起動)
+
+```
+12:53:05,932 [EXIT SCHEDULER] exit_loop_5s start        <- main.py の run_pending
+12:53:06,175 [startup.schedule_loop] due jobs detected
+12:53:06,176 [EXIT SCHEDULER] exit_loop_5s start        <- dispatcher thread
+```
+
+`schedule` の default scheduler はプロセスで 1 つ。それを
+
+* `core/startup/bootstrap/schedule_loop.py` の dispatcher thread
+* `main.py` の `while True: schedule.run_pending()`
+
+の **両方** が回していた。dispatcher 側の「前回がまだ実行中なら skip」は
+自分が dispatch した分しか見ないので、main.py 側は止められない。
+244 ms ずれた `exit_loop_5s` が常時 2 本走り、
+`[EXIT LOOP]` と `[POSITIONS_STATE]` が毎回 2 行ずつ出ていたのはこのため。
+
+**修正**: `schedule_loop.acquire_run_pending_owner()` / `may_run_pending_here()`
+で駆動の所有者を 1 プロセス 1 名義にした。dispatcher が生きている間は
+main loop は `run_pending()` を呼ばない (`SCHEDULE_RUN_PENDING_OWNER` で明示切替可)。
+`run_exit_loop_market_guarded()` にも非再入ロックを入れたが、これは保険で、
+根本は駆動側の一本化。
+
+### P0-2 — EXIT の 1 回転で /positions を 3 回叩いていた
+
+`exit_utils.get_open_positions_safe()` が
+
+1. `_read_broker_open_positions_safe()` -> `read_kabu_open_positions()` を直接
+2. `get_positions_state()` -> `PositionStateService` -> また `read_kabu_open_positions()`
+
+と二重に読み、さらに `forced_position_check` 分が乗っていた。
+無応答時は 1 本 3 秒なので、5 秒ジョブが **8.9 秒** になる。
+これが `job skipped because previous still running` の直接原因。
+
+**修正**: 建玉の取得元を `PositionStateService` 1 本にした。
+`PositionsState` に `broker_positions` を足し、EXIT はそれを broker 由来として
+マージする (DB 由来と取り違えない)。二重駆動の解消と合わせて
+1 回転あたりの `/positions` は **6 本 -> 1 本**。
+
+### P0-3 — /positions の read owner が 2 系統あった
+
+| 経路 | 旧実装 |
+|---|---|
+| `trading/position/kabu_position_reader.py` | urllib / `product=2` / timeout 3s |
+| `kabu_api/positions.py` | requests / product 指定なし / **timeout 10s x 3 回 + sleep = 1 呼び出し最大 31 秒** |
+
+**修正**: `kabu_api/positions_read_cache.py` を新設し、両方をここへ集約。
+singleflight / TTL 共有 / 失敗時の指数バックオフ / last-known-good /
+呼び出し元別の診断カウンタを持つ。`kabu_api/positions.py` の 3 回リトライは
+撤去した (待ちはキャッシュ側のバックオフが持つ)。
+
+### P0-4 — 間隔・timeout・backoff の数値が各所に散っていた
+
+`kabu_api/rest_limits.py` を新設し、API 種別ごとの
+`cache_ttl_sec / min_interval_sec / timeout_sec / backoff_sec` の
+**唯一の持ち主** にした。解決順序は ENV -> `settings.ini [API_RATE_LIMIT]` -> 既定。
+`orders_read_cache` / `positions_read_cache` / `position_state_service` /
+`kabu_position_reader` / `kabu_api.positions` はここだけを見る。
+起動時に `[REST LIMITS]` で実効値を 1 回出す。
+
+### P0-5 — TurnOver を読んでいなかった (ranking の売買代金が常に 0)
+
+`trading/ranking/collectors.py` が売買代金を
+`Turnover` -> `TradingValue` の順で探していた。
+kabu Station `/ranking` の実フィールドは **`TurnOver`** (O が大文字) で、
+`TradingValue` は応答に存在しない。
+つまり **ranking 由来の行の turnover は常に 0** で、
+Ranking Entry の prefilter がそれを見て弾き続けていた
+(`[RANKING ENTRY PREFILTER] rejects={'PREFILTER_VOLUME': 15, ...}`)。
+
+この穴は回帰テスト (`test_r20_fixes.py [5]`) を書いて初めて見つかった。
+
+### P0-6 — Summary-AI に 3 分足 / 5 分足を繋ぐ処理が存在しなかった
+
+```
+[SUMMARY AI GATE] AI_OK side=BUY symbol=9856 ... 3m=NA|5m=NA|mtf_data=DATA_NOT_READY
+[SUMMARY AI WEAK FILTER] zero 3m/5m confirmation ng kind=data_missing
+    by_row_kind={'data_not_ready_attach_missing': 7}
+```
+
+`AI/entry_gate.py` と `row_adapter.py` は `score_3m` / `score_5m` を読むのに、
+**その列を書く処理がリポジトリのどこにも無かった** (`score_3m` の書き手ゼロ)。
+一方 3 分足 / 5 分足のデータ自体は同じログの中にある:
+
+```
+[SUMMARY HISTORY GET] tf=3 source=push rows=195
+[SUMMARY HISTORY GET] tf=5 source=push rows=206
+[MERGED GET]          tf=3 source=push rows=47 / tf=5 rows=46
+```
+
+つまり「無かった」のではなく「繋がっていなかった」。
+
+**修正**: `trading/entry/summary_ai/mtf_attach.py` を新設。
+銘柄コード (int / `9856.0` / str を正規化) と **確定足の時刻** をキーに
+3m / 5m を付ける。未確定足と stale 足は採用しない。
+本当に無ければ列を作らない (欠損を 0 として通さない = 従来どおり fail-closed)。
+`3m_ready` / `5m_ready` / 採用足時刻 / データソースを候補ごとにログへ出す。
+
+### P0-7 — Tonosama の MIN_LATEST_VOLUME が設定値を無視していた
+
+```python
+MIN_LATEST_VOLUME = _env_float_floor("TONOSAMA_MIN_LATEST_VOLUME", 50000.0, 50000.0)
+#                                                                           ^^^^^ floor
+```
+
+第 3 引数が floor なので、ENV / settings で 10000 を指定しても
+`max(50000, 10000) = 50000` になり **設定値が一切効かない**。
+ログでは base 39 行が 1 行残らず `latest_volume_low` で落ちていた。
+
+**修正**: 想定値 (出来高 10,000 / 売買代金 3,000,000 円) を既定かつ floor にした。
+`pending_writer` と `ai_gate` に直書きされていた 50000 も config 参照へ変更。
+`_latest_volume` = **最新の確定 1 分足の出来高**、
+`_latest_turnover` = **その足の売買代金** と意味を分けて列名も分けた。
+起動時に `[TONOSAMA CONFIG]` で実効値と意味を 1 回だけ出す。
+
+### P0-8 — slope はあるのに _slope が無い
+
+```
+[TONOSAMA FILTER WARN] stage=primary missing _slope -> slope filter skipped
+```
+
+base summary には `slope` 列があるのに、フィルタは `_slope` を見ていた。
+**傾きフィルターが一度も効いていなかった。**
+`_ensure_actual_movement_cols_core()` (入力境界) で
+`slope / slope_atr_scaled / score_slope / ma75_slope` から `_slope` を
+**1 回だけ** 作るようにした。`_slope_source` に由来を残す。
+
+### P0-9 — 再計算が計算済みの MACD を NaN で塗り潰していた
+
+```
+input      interval=1 col=macd non_null=50 nonzero=46
+[IND] interval=1min hist_median=12.0 min_macd=26
+after-main interval=1 col=macd non_null=0
+```
+
+1 分足の履歴が 12〜14 本しか渡っておらず MACD の必要本数 26 に届かない。
+`indicator_calculator` は仕様どおり未成熟を NaN にするが、その NaN が
+**すでに計算済みだった macd / signal / rsi / slope / atr / ma25 / ma75 を上書き** し、
+続く `indicator_short_history` がそれを 0 で埋めていた。
+これが `macd=0 signal=0` の正体で、`technical_ready` も 0 になっていた。
+
+**修正**: `_preserve_prior_indicator_values()` を入れ、
+「新しい値が NaN で、古い値があるとき」だけ古い値を残す。
+再計算できた値は必ず優先する。復元行は `*_carried_over` で区別できる。
+`IND_PRESERVE_PRIOR_ON_SHORT_HISTORY=0` で従来動作へ戻せる。
+
+### P0-10 — range_pct に 2 つの単位が混在していた
+
+| 場所 | 旧 |
+|---|---|
+| `range_defs.compute_intrabar_range_pct` | 比率 (0.0188) |
+| `executor._pick_range_pct` | 比率 |
+| `executor._blowoff_range_pct_value` | `raw * 100 if raw <= 0.5 else raw` (推測変換) |
+| `SUMMARY_AI_BLOWOFF_DANGER_RANGE_PCT` | **2.5 = 2.5% のつもり** |
+
+`0.0188 >= 2.5` は成立しないので、**blowoff 危険判定は一度も発火していなかった**。
+
+**修正**: `range_pct` を **percent (1.88% = 1.88)** に統一。
+`range_defs` / `summary_ai/executor` / `summary_ai/candidates` /
+`handlers/entry_order_builder` の計算・閾値・ログ・列名を揃えた。
+閾値の既定も percent へ (`0.005 -> 0.5`, `0.004 -> 0.4`)。
+古い比率表記が設定に残っていても `_as_percent_threshold()` が
+**入力境界で 1 回だけ** 換算し、そのことをログに出す。
+内部が比率のままの `entry_order_builder` は
+`_rc_percent_to_ratio` / `_rc_ratio_to_percent` の 2 箇所でだけ変換する。
+
+### P0-11 — PUSH 停滞 (約 101 秒) を検知していなかった
+
+`[MAIN PRICE DB FEED LATENCY] rows=0 rowid_delta=0` が 50 サイクル続き、
+警告 1 行だけ出してひとりでに再開していた。その間 Summary-AI と Tonosama は
+更新の止まった `12:52:00` の足を新しい足として扱っていた。
+
+**修正**: `trading/push/push_stall_guard.py` を新設。
+市場時間 / 購読銘柄数 / WS 接続状態を見たうえで、
+**安全な再接続を 1 回だけ** 要求し、cool-down 中は連打しない。
+購読 0 件のときは「再接続では直らない」と明示して再接続しない。
+`data_is_stale()` で下流へ stale を渡さない判定を提供する。
+再接続の実体は `push_stream.runner.request_reconnect()` = **現接続を閉じるだけ**。
+新しい接続をここで作らない (二重 WS を張らないため)。
+所有者でないプロセス (main.py) は要求そのものを出さない。
+
+### P0-12 — positions.db の open 回数
+
+2 分半で約 153 増えていた (接続漏れは無し / `outstanding=0`)。
+内訳は「同じ 1 回転で何度も読んでいた」ことで、
+二重駆動 (P0-1) と二重読み (P0-2) の帰結。
+加えて `load_open_positions_from_db_strict()` に
+**TTL 内の重複読み取りをまとめる短期キャッシュ** を入れた
+(TTL は `rest_limits` の positions ポリシーと同じ値。失敗はキャッシュしない)。
+接続プールは変えていない (NAS 上の SQLite で長時間接続を持ち回さない方針は維持)。
+
+### Discord (第19ラウンド分の確認)
+
+`utils/alerts_util.py` の webhook マスク / 通信ブレーカー / CA バンドル合成は
+第19ラウンドで入っており、本ラウンドでも回帰テストが通ることを確認した。
+`verify=False` は使っていない。TLS 失敗の実体は
+**この PC のセキュリティソフトによる TLS 傍受** で、
+差し替え後の証明書の発行元が Windows 証明書ストアにしか無いことによる
+(`utils/ca_bundle.py` が certifi + Windows ROOT を合成する)。
+
+### 追加した回帰テスト
+
+`test_script/p0_round20/test_r20_fixes.py` (101 チェック)
+
+1. `/positions` の同時 8 スレッドが実 GET 1 本に集約される
+2. `/orders` の同時 8 スレッド + 2 経路 x 3 回が実 GET 1 本
+3. 間隔 / TTL / timeout / backoff が `rest_limits` 1 箇所で決まる
+4. schedule の駆動所有者が 1 つ / EXIT loop が二重起動しない
+5. Ranking API 応答 -> raw / snapshot 保存 -> Summary 読取 (turnover 込み)
+6. Ranking 代替経路が通常ランキングと区別されている / breaker
+7. Summary-AI 候補への 3m/5m 付与 (型不一致 / 未確定足 / 欠損の扱い)
+8. Tonosama の実効閾値 10,000 / 3,000,000 と起動ログ
+9. `slope` 列が `_slope` としてフィルターへ渡る
+10. MACD / signal が計算され、短履歴で消されない
+11. `range_pct` の単位が閾値 2.5 と一致する
+12. PUSH 停滞検知 / 1 回だけの再接続 / 復旧 / stale ゲート
+13. positions.db の重複読み取りがまとまる
+14. EXIT 1 回転で broker `/positions` を二重に読まない
+
+実注文 / 取消 / 返済 / Discord 送信 / kabu Station への本番リクエストは
+1 件も発生しない (すべてモック)。
+
+### 未解決 / 持ち越し
+
+1. **kabu Station 本体の無応答** はアプリ側では直せない。
+   本修正は「読めない相手を叩き続けて障害を増幅しない」ところまで。
+2. 1 分足の履歴が 12〜14 本しか無い (`hist_median=12` / MACD は 26 本必要)。
+   warmup の供給そのものは別途。P0-9 は「消さない」だけで「増やす」ではない。
+3. `test_r16_fixes.py` の commit レイテンシ 2 件は本番稼働中に走らせると FAIL する
+   (今回も同様。単独実行では 17/17)。第18ラウンドの注意書きどおり。
+4. 第18ラウンドからの持ち越し (Ranking Summary BG < 10 秒 など) は変わらず未達。
+
+---
+
+## 第21ラウンド — Smart App Control による numba ブロックで main.py が起動不能 (2026-09-02)
+
+### 症状
+
+2026-09-02 08:42:55 / 08:46:39 の 2 回、`main.py` が **終了コード 1** で即停止。
+他の 5 プロセス (main_database / push_receiver / yahoo_complement /
+summary_database / ranking_collector) は 08:39-08:40 に正常起動していた。
+
+```
+main.py:116
+  from trading.handlers.exit_handler import build_5s_bar_fast, run_exit_pipeline
+    -> trading/handlers/exit_handler.py:  from numba import njit
+       -> numba/core/dispatcher.py -> numba._dispatcher
+          -> ImportError: DLL load failed while importing _devicearray:
+             アプリケーション制御ポリシーによってこのファイルがブロックされました。
+```
+
+先行して `core/startup/runtime_env/installer.py` の
+`_install_normal_exit_scalp_align()` も同じ import で失敗し、
+`[RUNTIME ENV DEFAULTS PATCH] normal exit constants failed` を出していた
+(こちらは try/except 済みで startup は止めていない)。
+
+### 根本原因 — Windows Smart App Control (SAC)
+
+| 調査 | 結果 |
+|---|---|
+| `HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy` | `VerifiedAndReputablePolicyState = 1` (**強制**) |
+| CodeIntegrity/Operational | **Event 3033 / 3077**、Policy ID `{0283ac0f-fff1-49ae-ada1-8a933130cad6}` (SAC base policy) |
+| ブロック対象 | `.venv\Lib\site-packages\numba\_devicearray.cp313-win_amd64.pyd` (12,288 bytes / 未署名) |
+| エラーコード | `WinError 4551` |
+| AppLocker | 不在 (Home edition。cmdlet 自体が無い) |
+| Microsoft Defender | **Passive Mode** / numba の検出 0 件 |
+| Norton | 該当なし (Defender が passive = Norton が実 AV だが検疫記録なし) |
+
+**同じ numba の他の .pyd は全部ロードできる**:
+
+```
+LOAD FAIL _devicearray.cp313-win_amd64.pyd -> [WinError 4551]
+LOAD OK   _dispatcher.cp313-win_amd64.pyd
+LOAD OK   _dynfunc.cp313-win_amd64.pyd
+LOAD OK   _helperlib.cp313-win_amd64.pyd
+LOAD OK   mviewbuf.cp313-win_amd64.pyd
+```
+
+`_dispatcher.pyd` も未署名なのに通るので、**署名ではなくファイル単位の評価 (ISG)** で
+弾かれている。C:\ へコピーしても同じ 4551 で落ちるため、
+**NAS (W:) やネットワークパスは無関係**。`llvmlite.binding` は正常。
+
+環境: Python 3.13.14 / numba 0.66.0 / llvmlite 0.48.0 / numpy 2.4.6
+
+つまり **numba を入れ直しても再発しうる**。高速化のためだけの依存で
+売買システム全体が起動しないのは設計の誤り。
+
+### 修正 — numba を任意依存へ格下げ
+
+プロジェクト全体 2,113 個の .py を走査した結果、
+numba の import は **`trading/handlers/exit_handler.py` の 1 箇所だけ**だった。
+用途も `calc_ohlc(prices)` の 1 関数のみで、中身は
+
+```python
+return prices[0], prices.max(), prices.min(), prices[-1]
+```
+
+JIT の有無で結果が変わらない式なので、identity decorator へ落として問題ない。
+
+**`core/compat/numba_compat.py` (新設)** を唯一の窓口にした。
+
+- import 時に絶対に例外を投げない
+- `NUMBA_AVAILABLE` / `njit` / `status()` / `log_status_once()` を公開
+- numba があれば `numba.njit` そのもの (挙動は完全に従来どおり)
+- 無ければ identity decorator。`@njit` と `@njit(cache=True)` の両方の書き方に対応
+- `AUTOSTOCK_DISABLE_NUMBA=1` で明示的に切れる (切り分け用)
+- 状態は `[NUMBA COMPAT]` で **1 回だけ** ログ (traceback は出さない)
+
+`exit_handler.py` は自前の try/except をやめて compat 層を再エクスポートするだけにし、
+「numba をどう扱うか」の分岐が二重にならないようにした。
+**EXIT 判定・発注・取消・返済のロジック、計算式は一切変更していない。**
+
+### installer.py
+
+`_install_normal_exit_scalp_align()` は元から try/except + `return False` で、
+startup 全体を止める作りではなかった (変更不要)。
+numba fallback により import が通るようになり、実測で
+
+```
+[NORMAL EXIT PROFIT FLOOR] constants applied
+    stop=-0.0030 take=0.0080 trail_start=0.0060 trail_gap=0.0030 max_hold=300
+```
+
+が正常に適用されるようになった (`normal exit constants failed` は解消)。
+
+### 付随修正 — /positions の token 未配布時の分類
+
+起動直後に 1 度だけ
+
+```
+[POSITIONS READ] /positions read failed streak=1
+  err=AttributeError: 'GlobalDataCompat' has no attribute 'token_value'
+```
+
+が出ていた。トークンが配られる前の一過性だが、第20ラウンドで入れた
+共有 read キャッシュがこれを `unexpected` と分類して健全性フラグを落とし、
+バックオフしていた。`getattr(global_data, "token_value", None)` にして
+`token_missing` (健全性を落とさない一過性) に分類し直した。
+
+### 変更ファイル
+
+| ファイル | 内容 |
+|---|---|
+| `core/compat/__init__.py` | 新規。任意依存を吸収するパッケージ |
+| `core/compat/numba_compat.py` | 新規。numba 判定と fallback の唯一の持ち主 |
+| `trading/handlers/exit_handler.py` | 自前 fallback を廃し compat 層へ委譲 (再エクスポート) |
+| `kabu_api/positions.py` | token_value を getattr にし token_missing へ分類 |
+| `test_script/p0_round20/test_r20_fixes.py` | `[15]` を追加 (13 チェック) |
+
+### テスト結果
+
+| 項目 | 結果 |
+|---|---|
+| A `import trading.handlers.exit_handler` | **OK** |
+| B `from ... import build_5s_bar_fast, run_exit_pipeline` | **EXIT IMPORT OK** |
+| C main.py 起動 | **`[MAIN] start` 到達 / 終了コード 1 にならない** |
+| token preflight | `preflight_ok endpoint=/positions status=200` |
+| EXIT pipeline | `[EXIT CLOSING RECONCILE] ... rows=1` が約 6 秒周期で継続 |
+| Summary / Ranking / Entry | `[RANKING SUMMARY STAGE] rows=1880` / `[IMPORT OK] ranking entry pipeline loaded` |
+| round20 | **PASS=114 FAIL=0** (101 + 新規 13) |
+| round19 | **PASS=66 FAIL=0** |
+| positions_auth (health / entry_auth_gate) | 10/10 / 11/11 |
+| test_no_undefined_names | EXIT=0 |
+
+`[15]` は「numba の直接 import が compat 層以外に無い」ことも毎回検査するので、
+将来 `from numba import ...` を素で足すと落ちる。
+
+### 手動対応が必要な項目
+
+SAC はコード側では解決できない。**勝手に無効化していない。** 選択肢:
+
+1. **何もしない (推奨)** — JIT 無しで動作継続。`calc_ohlc` は 1 本 5 秒足の
+   OHLC を返すだけで、numpy のまま実行しても実測差は無視できる。
+2. Windows セキュリティ > アプリとブラウザー制御 > Smart App Control を
+   「オフ」にする。**一度オフにすると再有効化には Windows の再インストールが必要**。
+3. 署名済み配布の numba (conda-forge など) へ入れ替える。ただし
+   別ファイルが同じ理由で弾かれる可能性は残る。
+
+### 未解決 / 注意
+
+- SAC の判定は Microsoft 側の評価で変わるため、**別の .pyd が突然弾かれうる**。
+  同種の障害は「その依存を任意依存にする」で対処すること。
+- 本ラウンドの検証中、`start_all.py` 経由と PyCharm 経由で **main.py が同時に
+  2 インスタンス**起動している時間帯があった。PUSH WS は 1 セッションのみ、
+  EXIT も所有者 1 つが前提なので、常用しないこと。
+
+---
+
+## 第22ラウンド — PUSH WebSocket reconnect storm の原因特定 (2026-09-02)
+
+対象ログ: `push_receiver_runner_20260902_091338_25404.log` (09:14-10:34)
+
+### 症状
+
+```
+10:09:10 [push_stream] reconnect after 15.0s uptime=4.3s verdict=fast_death consecutive=170
+10:09:10 [push_stream][WS RECONNECT STORM] 接続が 170 回連続で 60 秒未満で切れている
+```
+
+WS uptime を 23 サイクル実測: **min=1.0s max=6.0s avg=4.1s**。
+
+### 切り分けで否定した仮説
+
+| 仮説 | 結果 |
+|---|---|
+| 多重 WebSocket / 別プロセスが購読を奪った | **否定**。`owner_pid=25404 role=push_receiver owner=True active_ws=0/1`。netstat でも 18080 への WS は push_receiver の 1 本のみ |
+| main.py が register/unregister を撃っている | **否定**。main.py のログに register/unregister の HTTP は 0 件 (`[SUB MANAGER] resolved` はトークン解決のみ) |
+| token 再取得で WS が無効化された | **否定**。`settings.ini` は 08:39:56 以降 未更新、token_tail=b7ad が全ログで一貫 |
+| 受信スレッドの飢餓 (summary/DB 処理に食われた) | **否定**。重い処理を含むサイクルは 7/23 のみ。残り 16 サイクルは無負荷でも同じ 4 秒で切断 |
+| monitor の stale watchdog / rotation が閉じている | **否定**。`WS STALE RECOVER` 0 件、`PUSH_ROTATION_CLOSE_WS_BEFORE_REGISTER=0` で close していない |
+| コードが古いまま動いている | **否定**。push_stream 配下の mtime は全て 09-01 以前、プロセス起動は 09:11 |
+
+`--- DISCONNECTED --- code=None msg=None` かつ `on_error` 0 件 =
+**kabu Station 側がクローズフレーム無しで TCP を切っている**。
+
+### 根本原因1 — 銘柄登録を行う経路が 1 つも無かった (相互ロック)
+
+```
+09:15:10 [push_stream] refresh call reason=rotation_A size=50 ...
+09:15:10 [push_stream] refresh skipped reason=rotation_A ws_not_ready      <- ここ
+09:15:10 [push_stream] rotation A register returned ok=False
+09:15:10 [push_stream] rotation A register failed -> backoff 180.0s failure_count=1
+```
+
+`transport._call_refresh()` には
+
+```python
+if not allow_ws_closed and (not connected_event.is_set() or not _is_ws_alive()):
+    return None                       # -> 呼び出し側は ok=False = 失敗扱い
+```
+
+があり、`allow_ws_closed = _is_rotation_reason(reason) and _env_bool("PUSH_ROTATION_REGISTER_WITH_WS_CLOSED", True)`。
+
+**`core/startup/runtime_env/defaults.py` が この env を `"0"` に固定していた。**
+
+rotation の登録は **REST の `PUT /kabusapi/register`** であって WebSocket を使わない
+(transport.py REV1.6 のコメントがまさにそう書いている)。
+それを WS の生死で止めていたため:
+
+* `PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH=1` により on_open でも登録しない
+* rotation は「WS が生きていないと登録しない」
+* WS は登録が無いから kabu Station に切られる
+
+= **登録できない → 切られる → 切れているから登録できない**。
+起動直後 (09:15:10) の 1 回目から失敗し、この run では登録が一度も成功していない。
+
+### 根本原因2 — 登録 0 件でも backoff が 10 分まで伸びる
+
+失敗のたび 180s → 270s → 405s → 600s。
+確定登録が 0 件 = PUSH 全断なのに、次の試行まで最大 10 分待っていた。
+
+### 副次的に判明 — storm が NAS を枯渇させていた
+
+reconnect のたびに ranking DB / symbol_flags を NAS から読み直すため、
+storm 中は SMB セッションが枯渇し `Too many open files` が頻発していた。
+**トレーディングスタックを停止した 36 秒後に NAS は正常化した**
+(10:56:49 停止 → 10:57:25 復旧)。NAS 障害は storm の結果であって原因ではない。
+
+### 修正
+
+| ファイル | 内容 |
+|---|---|
+| `core/startup/runtime_env/defaults.py` | `PUSH_ROTATION_REGISTER_WITH_WS_CLOSED` を `"0"` → `"1"`。REST 登録は WS に依存しないという本来の設計値へ戻す |
+| `trading/push/push_stream/transport.py` | rotation の refresh が ws_not_ready で skip されたら **ERROR** で「reconnect storm になる」「env=1 にせよ」と明示。runtime フラグにも残す |
+| `trading/push/push_stream/rotation_core.py` | 確定登録が 0 件のときは failure backoff を 30 秒で頭打ちにする (`PUSH_ROTATION_FAILURE_BACKOFF_EMPTY_MAX_SEC`)。1 件でも登録できていれば従来どおり |
+
+`PUSH_STREAM_SKIP_AFTER_OPEN_REFRESH` は変更していない (設計を勝手に変えない)。
+
+### 修正前 / 修正後 (実測)
+
+| | 修正前 09:14-10:34 | 修正後 11:17-11:33 |
+|---|---|---|
+| WS uptime | min=1.0s max=6.0s **avg=4.1s** | min=3.9s max=**111.9s** avg=14.6s |
+| 60 秒以上 | **0 サイクル** | **1 サイクル (111.9s)** |
+| 20 秒以上 | 0 サイクル | 3 サイクル |
+| consecutive | 170 まで単調増加 | healthy_disconnect で 0 にリセットされる |
+| register 実行 | **skip で 0 回** | 5 回実行 (約 30-60 秒ごと) |
+| backoff | 180 → 600s | 30s 固定 (登録 0 件時) |
+
+### 残る原因 — kabu Station 側 (コードでは直せない)
+
+登録は **実行されるようになったが timeout する**。
+
+```
+11:19:28 [PUSH REG STATE] register failed label=clear_register reason=timed out confirmed=0
+```
+
+同時刻のエンドポイント別の状況:
+
+| エンドポイント | 状態 |
+|---|---|
+| `GET /ranking` | **正常** (`api_calls=28 api_success=28`) |
+| `GET /positions` | timeout (`[POSITIONS READ] backoff 中 streak=7`, `broker_ok=False`) |
+| `PUT /register` | timeout (5/5) |
+
+第18ラウンドで記録した kabu Station の挙動
+「門前払い (認証エラー) は 100ms 以内で返るが、**実処理を伴うリクエストだけがハングして
+接続を切られる**」と同じ症状。ranking はキャッシュ応答なので通り、
+建玉照会と銘柄登録だけが刺さる。
+
+**kabu Station の再起動 (手動) が必要。**
+登録が通れば、上の 2 つの修正により PUSH は自動で復旧する
+(30 秒ごとに再登録を試みる)。
+
+### 追加した回帰テスト
+
+`test_script/p0_round22/test_r22_push_rotation_register.py` (23 チェック)
+
+1. 出荷時の既定値で rotation の REST 登録が WS 閉でも許可される
+2. on_open など WS 送信に依存する refresh は従来どおり WS 必須のまま
+3. WS 閉のまま rotation refresh が実際に呼ばれる (戻り値が None にならない)
+4. 旧設定に戻した場合は ERROR で理由と直し方が残る
+5. 確定登録 0 件なら backoff 30 秒以下 / 1 件でもあれば従来どおり 180-600 秒
+
+### 未着手 (PUSH 復旧が前提のもの)
+
+指示の 2/3/5 (warmup history / technical_ready / AI PASSED=0) は、
+いずれも **PUSH tick が来ていないことの下流**。
+実測 `total_received=8869` (16 分 / 100 銘柄) は正常時の数十分の一で、
+1 分足が積み上がらないため
+
+    symbol_hist_len が 1-3 -> SHORT_PATCH=208/228 (0.91)
+    -> ma25/ma75/macd/signal non_null=0 -> technical_ready=0 -> AI PASSED=0
+
+という連鎖になる。PUSH を直さずに history 供給側だけを直しても
+評価できないため、本ラウンドでは触っていない。
+
+指示の 4 (ranking_score) は、実ログ上
+`[SUMMARY ENRICH][RANKING] context=scheduler-push-after_calc_before_db rows=27 hit=13
+ranking_score_nonzero 0->13` が出ており、
+**display 直前ではなく DB 保存前の enrich 段階で注入されている**ことまでは確認した。
+scoring / AI との前後関係の完全なトレースは未了。
+
+指示の 6 (価格フィルタ) は調査のみ実施:
+`settings.ini` の `[entry_filter_1min/3min/5min]` はいずれも
+`min_price=200 / max_price=7000`。**2500 は settings.ini にもコードにも存在しない**。
+したがってログの `200 < close <= 7000` は現行設定どおりで、勝手には変更していない。
+ハードコード既定値は `MIN_PRICE=200.0` が 7 箇所、`MAX_PRICE=7000.0` が 2 箇所
+(display_runner / display_sorting / summary_ai_entry_hook_v20 / summary_ai.candidates /
+trade_universe_filter x2 / yahoo.ranking_follow)。
+TONOSAMA だけ `MIN_PRICE=300` (floor 300) で分裂している。
+
+## 第23ラウンド — register の timeout は kabu Station ではなく urllib だった (2026-09-04)
+
+### 症状
+
+第22ラウンドで「kabu Station の再起動が必要」と結論した状態が、再起動しても直らなかった。
+
+* 09:35-10:43 の run: `PUT /register` が **27 回すべて timed out、成功 0 回**。
+  受信できていた 171,174 tick は 09-02 に保存された `last_good=50` の残存登録による分で、
+  rotation の残り 50 銘柄は最後まで入っていない。`health_status=RECONNECT_STORM`
+* kabu Station を 11:13 に手動再起動 → 11:37 の run でも `err=timed out` のまま
+  (`REGISTER AUDIT refresh done ok=False elapsed=20.489s confirmed=0`)
+
+### 切り分け
+
+同じ時刻に、エンドポイントではなく **HTTP クライアントで結果が割れていた**。
+
+| 呼び出し | クライアント | 結果 |
+|---|---|---|
+| `GET /positions` (token preflight) | requests | **200 / 0.77s** |
+| `GET /wallet/cash` | requests | **200 / 0.25s** |
+| `GET /ranking` | requests | **200** (raw_rows=50) |
+| `PUT /register` | **urllib** | timed out (10s) |
+| `GET /positions` (kabu_position_reader) | **urllib** | timed out |
+
+「kabu Station は実処理を伴うリクエストだけハングする」という第18/20/22ラウンドの
+見立ては誤りで、**urllib で叩いていた経路だけが落ちていた**。
+
+### 根本原因 — urllib.request が送る `Connection: close`
+
+2026-08-29 の commit dddb0a7 で実測済みの現象がそのまま残っていた。
+
+```
+最小ヘッダー (X-API-KEY のみ)  -> HTTP 401  0.01s
++ Content-Type                -> HTTP 401  0.00s
++ Accept-Encoding: identity   -> HTTP 401  0.00s
++ Connection: close           -> 応答なし  5.00s   ★これだけ
+```
+
+`urllib.request` は毎回 `Connection: close` を送る。kabu Station はこのヘッダーが
+付いたリクエストに応答を返さず、接続を掴んだままタイムアウトさせる。
+dddb0a7 では token 系 (`token_bootstrap.py` / `token_manager.py`) だけを requests へ
+移したため、**残り 5 箇所の urllib 経路が取り残されていた**。
+
+### 修正
+
+| ファイル | 内容 |
+|---|---|
+| `kabu_api/kabu_http.py` (新規) | kabu Station 宛 HTTP の共通入口。requests で送り、非 2xx は urllib 時代と同じ `urllib.error.HTTPError` (`.code` / `.read()` 付き) にして送出する。理由をここ 1 箇所に集約 |
+| `trading/push/subscription_manager/register_ops.py` | `PUT /register` `/unregister/all` を kabu_http へ。`_build_request` (urllib 版) は削除 |
+| `trading/position/kabu_position_reader.py` | `GET /positions` を kabu_http へ。401/429 の扱いは従来どおり |
+| `trading/exit/executor.py` | EXIT の板読み・引け際の建玉照合 (2 箇所) |
+| `trading/handlers/entry_order_builder.py` | ENTRY の板読み。`urllib.parse` は request 経由で入っていたので明示 import に変更 |
+| `kabu_api/board.py` | 板取得 (4 市場総当たり)。無応答を「その市場には無い」と区別できず空振りしていた |
+| `kabu_api/board_fetcher.py` | 1 秒周期の板キャッシュ更新ループ |
+| `kabu_api/info.py` | `fetch_orders()` = `GET /orders`。同じファイルの他の関数は requests なのにここだけ urllib だった |
+| `ats/ats_api.py` | ATS の PUT。ステータスコードを返す契約なので `kabu_http.request_text()` を追加して対応 |
+
+URL・ヘッダー・timeout・戻り値・例外の型は変えていない。
+
+最初の調査は `trading/` 配下しか見ておらず 5 箇所と報告したが、実際は 9 箇所だった。
+`core/startup/startup.py` の `[BOARD REST API MONITOR]` は urlopen を wrap して
+回数を数えるだけの監視層なので修正対象ではない (呼び出しが requests へ移った結果、
+今後この監視は board/positions を 0 と表示する)。
+
+root 直下の以下は kabu Station 宛の urllib が残っているが、本体から import されておらず
+今日のログにも現れない単体実行用の旧ツールのため、本ラウンドでは触っていない:
+`register_cycle.py` (2 箇所) / `kabus_position_sync.py` / `Position.py` /
+`yoryoku_genbutsu.py` / `yoryoku_shinyou.py`
+
+### 修正前 / 修正後 (実測)
+
+| | 修正前 11:37 | 修正後 12:06 |
+|---|---|---|
+| register の応答 | `err=timed out` (10s) | `Code 4002006` を **1.0s** で返す |
+| unregister/all | timed out | `ok=True {'RegistList': []}` |
+| refresh 全体 | `ok=False elapsed=20.489s` | **`ok=True elapsed=5.046s`** |
+| confirmed_registered | 0 | **50** |
+| rotation A/B | 一度も成功せず | 12:13 A `ok=True` / 12:14 B `ok=True` (約 60 秒ごとに交代) |
+| health_status | RECONNECT_STORM | **HEALTHY** (last_recv_age=0.4s) |
+| `/positions` の実測 | `[BOARD REST API MONITOR] positions:total=2 ok=0 ng=2 avg_ms=3012.3` (毎回ちょうど timeout 値 3.0s で全滅) | `[POSITIONS READ STATS] fetches=741 fetch_errors=0` |
+| PUSH 受信 (後場) | 10:40:53 で停止 | 13:27 時点 received_total=187,387 継続中 |
+
+register が通ったのは 8/19 以降で初めて。第22ラウンドで入れた
+「WS 閉でも REST 登録を許可する」「登録 0 件なら backoff 30 秒」の 2 つは、
+この修正で本来の意図どおりに機能するようになった。
+
+### 追加した回帰テスト
+
+`test_script/p0_round23/test_r23_kabu_http_no_connection_close.py` (17 件)
+
+1. requests へ渡すヘッダーに `Connection` を混ぜない
+2. 非 2xx が `urllib.error.HTTPError` で上がり `.code` / `.read()` が使える
+3. 空応答を例外にしない
+4. register_ops / kabu_position_reader が `urlopen` を呼んでいない
+5. 8 モジュールが `urllib.request` を import していない (再発すると元の書き方に戻るため)
+6. `/positions` の 401 は 1 回だけ token を取り直す / 429 では取り直さない
+7. `request_text` が本文を文字列のまま返す (ATS がそれを前提にしている)
+
+`p0_round22` (5 件) も通過を確認済み。
+
+### 残る課題
+
+* **発注は今日もゼロ**。10:11 に 338A が `score=3.9642 < min_score=4.0` で 1 件 block されただけ。
+  PUSH が通るようになった状態での ENTRY 評価はまだ観測できていない
+* 第22ラウンドの「未着手」項目 (warmup history / technical_ready / AI PASSED=0) は
+  PUSH 復旧が前提だったので、次の場中に再評価する
