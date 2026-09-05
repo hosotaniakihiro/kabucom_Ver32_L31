@@ -486,15 +486,24 @@ def load_latest_summary_from_db(
 
 
 def _push_db_path() -> str:
-    base = os.getenv(
-        "PUSH_DB_DIR",
-        os.getenv(
-            "RAW_PUSH_DIR",
-            nas_path(r"raw_data\kabu_station\push"),
-        ),
-    )
+    explicit = os.getenv("PUSH_DB_PATH")
+    if explicit and str(explicit).strip():
+        return str(explicit).strip()
+
+    base = os.getenv("PUSH_DB_DIR") or os.getenv("RAW_PUSH_DIR")
+    if not base:
+        # 2026-09-05: writer がローカルへ書くようになったので、既定の
+        # 置き場所は push_db_location に聞く。NAS 固定のままにすると
+        # 場中ずっと前日の複製を読むことになる。
+        try:
+            from trading.push import push_db_location
+
+            return str(push_db_location.push_db_path())
+        except Exception:
+            base = nas_path(r"raw_data\kabu_station\push")
+
     today_s = dt.datetime.now().strftime("%Y%m%d")
-    return os.getenv("PUSH_DB_PATH", str(Path(base) / f"push{today_s}.db"))
+    return str(Path(base) / f"push{today_s}.db")
 
 
 def _qident(name: Any) -> str:

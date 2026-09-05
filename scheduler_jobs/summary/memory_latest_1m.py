@@ -658,16 +658,27 @@ def _push_db_path() -> Path:
     explicit = os.getenv("PUSH_DB_PATH") or os.getenv("AUTOSTOCK_PUSH_DB_PATH")
     if explicit and str(explicit).strip():
         return Path(str(explicit).strip())
+    # 2026-09-05: writer がローカルへ書くようになったので、読み手も同じ
+    # 解決関数を通す。ここを NAS 固定のままにすると、場中ずっと前日の
+    # NAS 複製を読んでしまう。
+    try:
+        from trading.push import push_db_location
+
+        return push_db_location.push_db_path()
+    except Exception:
+        pass
     return Path(_nas_root()) / "raw_data" / "kabu_station" / "push" / f"push{_today_yyyymmdd()}.db"
 
 
 def _safe_dt_series(values: Any) -> pd.Series:
     try:
         s = values if isinstance(values, pd.Series) else pd.Series(values)
-        out = pd.to_datetime(s, errors="coerce")
+        out = _to_datetime_iso_fast(s)
+        if out is None:
+            out = pd.to_datetime(s, errors="coerce")
         try:
             if getattr(out.dt, "tz", None) is not None:
-                out = out.dt.tz_convert("Asia/Tokyo").dt.tz_localize(None)
+                out = _drop_tz_to_jst(out)
         except Exception:
             try:
                 out = out.dt.tz_localize(None)
@@ -676,6 +687,113 @@ def _safe_dt_series(values: Any) -> pd.Series:
         return out
     except Exception:
         return pd.Series(pd.NaT, index=getattr(values, "index", None))
+
+
+_PUSH_DT_COLUMNS = ("datetime", "received_at", "time", "current_price_time", "PriceTime", "updated_at", "created_at")
+
+
+def _drop_tz_to_jst(series):
+    """tz 付き Series を tz-naive JST の壁時計へ落とす。
+
+    2026-09-02 実測: s.dt.tz_convert("Asia/Tokyo") は初回だけ 1.4932s かかる
+    (NAS 上の .venv から tz データベースを読むため)。PUSH DB の datetime は
+    すべて固定オフセット +09:00 なので、その場合は tz_convert を挟まずに
+    tz_localize(None) するだけでよい。値が同じことは実測で確認済み
+    (equal: True / 1500 行)。0.0001s。
+    """
+    try:
+        tz = series.dt.tz
+    except Exception:
+        return series
+    if tz is None:
+        return series
+    try:
+        off = tz.utcoffset(None)
+    except Exception:
+        off = None
+    if off is not None and off == dt.timedelta(hours=9):
+        return series.dt.tz_localize(None)
+    return series.dt.tz_convert("Asia/Tokyo").dt.tz_localize(None)
+
+
+def _to_datetime_iso_fast(values: Any):
+    """ISO8601 文字列列を高速に datetime へ変換する。
+
+    2026-09-02 実測 (push20260902.db, 1500 行 / 12 列):
+        format 指定なし  ring_merge = 6.164s
+        format="ISO8601"           = 0.01s 台
+    pandas は format を推定できないと 1 要素ずつ dateutil で解析する
+    ("Could not infer format ... falling back to dateutil" の UserWarning)。
+    stream_data_raw の datetime / received_at は
+        2026-09-02T15:41:37.505281+09:00
+        2026-09-02T15:41:37.505281
+    のどちらかなので ISO8601 で読める。
+    読めない列は従来どおり推定に落として挙動を変えない。
+    """
+    try:
+        col = values if isinstance(values, pd.Series) else pd.Series(values)
+    except Exception:
+        return None
+    if col.dtype.kind == "M":
+        return col
+    try:
+        out = pd.to_datetime(col, errors="coerce", format="ISO8601")
+        # ISO8601 で 1 件も読めなかった列は ISO タイムスタンプ列ではない
+        # (time='15:41:37' など)。dateutil の 1 要素ずつ解析へは落とさない。
+        # 実測: dateutil 経路は 1500 行 x 3 列で 2.0-6.2 秒かかる。
+        if out.notna().any() or not col.notna().any():
+            return out
+        return None
+    except Exception:
+        return None
+
+
+def _normalize_dt_columns(df: Any) -> Any:
+    """PUSH DB から読んだフレームの時刻列を tz-naive JST に揃える。
+
+    PUSH DB の stream_data_raw は datetime だけ +09:00 付きの ISO 文字列で、
+    received_at は naive という不揃いな保存形式になっている
+    (実測: '2026-08-31T11:02:17.437863+09:00' / '2026-08-31T11:02:17.437863')。
+    そのまま global_data.push_df へ渡すと、WS 経路が作る tz-naive フレームと
+    比較できず push_df setter が
+      TypeError: Cannot compare tz-naive and tz-aware timestamps
+    で落ちる。
+
+    正準形は websocket_handlers.dataframe_manager.make_tz_naive() と同じ
+    「tz を外した JST の壁時計」。+09:00 は JST 表記なので Asia/Tokyo へ
+    変換してから tz を落とせば値は変わらない。DB は書き換えない。
+
+    ring buffer へ concat する前に通すこと。naive と aware を concat すると
+    列が object dtype に落ちて、以後の比較が同じ理由で壊れる。
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    out = df
+    copied = False
+    for col in _PUSH_DT_COLUMNS:
+        if col not in out.columns:
+            continue
+        s = _to_datetime_iso_fast(out[col])
+        if s is None:
+            continue
+        try:
+            tz = getattr(s.dt, "tz", None)
+        except Exception:
+            tz = None
+        if tz is None:
+            # naive の列には触らない。文字列列を datetime へ作り替えると
+            # time='11:02:17' のような列の中身が変わってしまう。
+            # ここでやるのは「tz を外すこと」だけ。
+            continue
+        try:
+            s = _drop_tz_to_jst(s)
+        except Exception:
+            continue
+        if not copied:
+            out = out.copy(deep=False)
+            copied = True
+        out[col] = s
+    return out
 
 
 def _latest_dt(df: Any) -> Any:
@@ -702,24 +820,139 @@ def _stale_sec(df: pd.DataFrame) -> float | None:
         return None
 
 
-def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+# ============================================================
+# schema キャッシュ
+# ------------------------------------------------------------
+# PUSH DB は 1 日 1 ファイルで、日中にテーブルや列が増減しない。
+# それにもかかわらず 1 回の読み取りごとに
+#   SELECT name FROM sqlite_master   (list_tables)
+#   PRAGMA table_info(...)           (columns)
+# を NAS 越しに実行していた。
+#
+# 実測 (2026-08-31 12:55, 同一クエリ・同一行数):
+#   total=0.339s  list_tables=0.027s columns=0.033s query_fetch=0.096s (空いている時)
+#   total=5.742s  list_tables=0.415s columns=0.696s query_fetch=3.552s (writer と競合時)
+# 競合時は schema 取得だけで約 1.1 秒使っている。
+#
+# ファイルパス単位でキャッシュする。日付が変われば path が変わるので
+# 自動的に無効化される。SUMMARY_MAIN_PUSH_DB_SCHEMA_CACHE=0 で従来動作。
+# ============================================================
+
+_push_db_schema_lock = threading.Lock()
+_push_db_schema_cache: dict[str, dict] = {}
+
+
+def _schema_cache_enabled() -> bool:
+    return _env_bool("SUMMARY_MAIN_PUSH_DB_SCHEMA_CACHE", True)
+
+
+def _table_columns(conn: sqlite3.Connection, table: str, *, cache_key: str = "") -> list[str]:
+    if cache_key and _schema_cache_enabled():
+        with _push_db_schema_lock:
+            entry = _push_db_schema_cache.get(cache_key)
+            if entry is not None:
+                cols = entry.get("columns", {}).get(table)
+                if cols is not None:
+                    return list(cols)
     try:
         rows = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
-        return [str(r[1]) for r in rows]
+        out = [str(r[1]) for r in rows]
     except Exception:
         return []
+    if cache_key and _schema_cache_enabled() and out:
+        with _push_db_schema_lock:
+            entry = _push_db_schema_cache.setdefault(cache_key, {"tables": None, "columns": {}})
+            entry["columns"][table] = list(out)
+    return out
 
 
-def _existing_tables(conn: sqlite3.Connection) -> list[str]:
+def _existing_tables(conn: sqlite3.Connection, *, cache_key: str = "") -> list[str]:
+    if cache_key and _schema_cache_enabled():
+        with _push_db_schema_lock:
+            entry = _push_db_schema_cache.get(cache_key)
+            if entry is not None and entry.get("tables") is not None:
+                return list(entry["tables"])
     try:
         rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-        return [str(r[0]) for r in rows]
+        out = [str(r[0]) for r in rows]
     except Exception:
         return []
+    if cache_key and _schema_cache_enabled() and out:
+        with _push_db_schema_lock:
+            entry = _push_db_schema_cache.setdefault(cache_key, {"tables": None, "columns": {}})
+            entry["tables"] = list(out)
+    return out
+
+
+def _schema_cached(cache_key: str, kind: str) -> bool:
+    """この呼び出しでキャッシュが効いたか (ログ用)。"""
+    if not cache_key or not _schema_cache_enabled():
+        return False
+    with _push_db_schema_lock:
+        entry = _push_db_schema_cache.get(cache_key)
+        if entry is None:
+            return False
+        if kind == "tables":
+            return entry.get("tables") is not None
+        return bool(entry.get("columns"))
+
+
+def reset_push_db_schema_cache() -> None:
+    """テスト用。"""
+    with _push_db_schema_lock:
+        _push_db_schema_cache.clear()
 
 
 def _quote(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
+
+
+# ============================================================
+# P2: SELECT * が raw_json まで NAS から引いていた
+# ------------------------------------------------------------
+# stream_data_raw は 66 列あり、その中の raw_json は tick の生 JSON
+# (実測 平均 2011 bytes/行) をそのまま持っている。行本体は b-tree の
+# leaf に収まるが raw_json は overflow page へ溢れるため、SELECT * は
+# 1 行ごとに追加のページ読みを NAS(SMB) 越しに発生させる。
+#
+# 同じ WHERE / ORDER BY / LIMIT で列だけ変えた実測 (2026-08-31):
+#   push20260828.db (569MB, WALなし) 増分678行
+#       SELECT *        0.232s
+#       必要列のみ      0.003s      (約 77 倍)
+#   push20260824.db (433MB)         増分678行
+#       SELECT *        0.181s
+#       必要列のみ      0.004s
+#   push20260831.db 全件5000行 (full mode)
+#       SELECT *        6.099s
+#       必要列のみ      2.637s
+# full mode では 5000 行 x 2KB = 約 10MB を毎回 NAS から引いていた。
+#
+# raw_json を push_df 側で読んでいる箇所は無い (grep 済み。書き込みと
+# ranking 系テーブルの同名列だけ)。取得列から外す。
+# 列を外すだけで DB schema は変更しない。
+# SUMMARY_MAIN_PUSH_DB_EXCLUDE_COLUMNS="" で従来の SELECT * に戻せる。
+# ============================================================
+
+_PUSH_DB_DEFAULT_EXCLUDE_COLUMNS = "raw_json"
+
+
+def _push_db_excluded_columns() -> set[str]:
+    v = os.getenv("SUMMARY_MAIN_PUSH_DB_EXCLUDE_COLUMNS")
+    if v is None:
+        v = _PUSH_DB_DEFAULT_EXCLUDE_COLUMNS
+    return {c.strip().lower() for c in str(v).split(",") if c.strip()}
+
+
+def _push_db_select_list(cols: list[str]) -> tuple[str, list[str]]:
+    """取得する列の SELECT 句を作る。除外できない場合は '*' を返す。"""
+    excluded = _push_db_excluded_columns()
+    if not excluded:
+        return "*", []
+    keep = [c for c in cols if str(c).lower() not in excluded]
+    dropped = [c for c in cols if str(c).lower() in excluded]
+    if not dropped or not keep:
+        return "*", []
+    return ", ".join(_quote(c) for c in keep), dropped
 
 
 # ============================================================
@@ -737,6 +970,178 @@ def _quote(name: str) -> str:
 # ============================================================
 
 _PUSH_DB_STAGE_WARN_SEC = 1.0
+
+# ============================================================
+# 2026-09-02 P0: PUSH DB 読み取りの中断可能化・増分固定・接続再利用
+# ------------------------------------------------------------
+# 本番実測 (2026-09-02 15:0x, push20260902.db 631MB / WAL 196MB):
+#   [PUSH DB STAGE] query_fetch=880.344s mode=full rows=5000
+#   [PUSH DB STAGE] connect=2.684s
+# 5000 行 DESC 全件読みが 1 回 15 分近くかかっていた。
+#
+# 悪循環になっていた:
+#   full scan (880s) が読み取りトランザクションを開きっぱなし
+#     -> wal_checkpoint(PASSIVE) が 1 フレームも進めない
+#        (実測 log_frames=41055 checkpointed=0)
+#     -> WAL が 196MB まで膨らむ
+#     -> ページ解決が更に遅くなる -> full scan が更に長引く
+#   しかも full scan が tick 内に終わらないので _push_db_last_rowid が
+#   一度も seed されず、**毎回 mode=full** に戻り続けていた
+#   (本番ログ: mode=incremental は 0 件)。
+#
+# 対策 (stale 判定・閾値・fail-closed は変更しない):
+#   1. cursor が無いときは full scan せず MAX(rowid) で seed する
+#      (MAX(rowid) 実測 0.109s / DESC LIMIT 1 実測 0.028s)
+#   2. 以降は必ず WHERE rowid > ? ORDER BY rowid ASC LIMIT ?
+#   3. SELECT は 1 分足生成に要る列だけ (66 列 -> 11 列)
+#   4. set_progress_handler で SQLite 実行中でも中断できるようにする
+#      (deadline / cancel event。Future.cancel() では止まらないため)
+#   5. 接続を使い回して NAS の connect コスト (2-4 秒) を毎回払わない
+# ============================================================
+
+_push_db_conn: Optional[sqlite3.Connection] = None
+_push_db_conn_path: str = ""
+_push_db_conn_lock = threading.RLock()
+_push_db_cancel = threading.local()
+
+# 1 分足生成に必要な列だけ。stream_data_raw は 66 列あり、
+# 板 40 列と raw_json は 1 分足には一切使わない。
+_PUSH_DB_WANTED_COLUMNS = (
+    "symbol", "symbolname",
+    "price", "current_price", "close", "close_price",
+    "datetime", "received_at", "date", "time",
+    "volume", "trading_volume", "trading_value",
+    "opening_price", "high_price", "low_price",
+)
+# これが取れないと _normalize_push_ticks が成立しないので narrow を諦める。
+_PUSH_DB_ESSENTIAL_ANY = (
+    ("symbol", "code", "Symbol"),
+    ("price", "current_price", "close", "close_price", "CurrentPrice"),
+    ("datetime", "received_at", "time", "created_at"),
+)
+
+
+def push_db_set_cancel(event, deadline_sec: float | None = None) -> None:
+    """このスレッドの PUSH DB 読み取りに中断条件を設定する。
+
+    event.is_set() か deadline 超過で、実行中の SQLite クエリごと中断する。
+    Future.cancel() は既に走っている worker を止められないので、
+    「timeout 後に裏で worker が生き残る」を防ぐにはこちらが要る。
+    """
+    _push_db_cancel.event = event
+    _push_db_cancel.deadline = (
+        None if deadline_sec is None else (time.monotonic() + float(deadline_sec))
+    )
+
+
+def push_db_clear_cancel() -> None:
+    _push_db_cancel.event = None
+    _push_db_cancel.deadline = None
+
+
+def _push_db_query_deadline_sec() -> float:
+    """1 回のクエリの上限。0 以下で無効。
+
+    これは「timeout を伸ばす」ものではなく、
+    880 秒走り続けるクエリを打ち切るための上限。
+    """
+    return max(0.0, _env_float("SUMMARY_MAIN_PUSH_DB_QUERY_DEADLINE_SEC", 8.0))
+
+
+def _install_progress_handler(conn: sqlite3.Connection) -> None:
+    ev = getattr(_push_db_cancel, "event", None)
+    dl = getattr(_push_db_cancel, "deadline", None)
+    hard = _push_db_query_deadline_sec()
+    hard_deadline = (time.monotonic() + hard) if hard > 0 else None
+    if dl is not None and hard_deadline is not None:
+        dl = min(dl, hard_deadline)
+    elif dl is None:
+        dl = hard_deadline
+    if ev is None and dl is None:
+        return
+
+    def _handler() -> int:
+        try:
+            if ev is not None and ev.is_set():
+                return 1
+            if dl is not None and time.monotonic() > dl:
+                return 1
+        except Exception:
+            return 0
+        return 0
+
+    try:
+        # 1000 VDBE 命令ごとに判定。NAS の 1 ページ読みより十分細かい。
+        conn.set_progress_handler(_handler, 1000)
+    except Exception:
+        logger.debug("[SUMMARY MAIN PUSH DB REFRESH] progress handler 設定に失敗", exc_info=True)
+
+
+def _push_db_get_conn(path) -> sqlite3.Connection:
+    """読み取り専用接続を使い回す。NAS の connect は 2-4 秒かかることがある。"""
+    global _push_db_conn, _push_db_conn_path
+    want = str(path)
+    if _push_db_conn is not None and _push_db_conn_path == want:
+        try:
+            _push_db_conn.execute("SELECT 1").fetchone()
+            return _push_db_conn
+        except Exception:
+            logger.warning("[SUMMARY MAIN PUSH DB REFRESH] 既存接続が死んでいたので張り直す", exc_info=True)
+            try:
+                _push_db_conn.close()
+            except Exception:
+                pass
+            _push_db_conn = None
+
+    timeout = max(0.05, _env_float("SUMMARY_MAIN_PUSH_DB_REFRESH_TIMEOUT_SEC", 0.8))
+    conn = sqlite3.connect(want, timeout=timeout, check_same_thread=False)
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA busy_timeout=%d" % int(timeout * 1000))
+        conn.execute("PRAGMA cache_size=-8000")
+    except Exception:
+        logger.debug("[SUMMARY MAIN PUSH DB REFRESH] pragma skipped", exc_info=True)
+    _push_db_conn = conn
+    _push_db_conn_path = want
+    return conn
+
+
+def push_db_close_conn() -> None:
+    global _push_db_conn, _push_db_conn_path
+    with _push_db_conn_lock:
+        if _push_db_conn is not None:
+            try:
+                _push_db_conn.close()
+            except Exception:
+                pass
+        _push_db_conn = None
+        _push_db_conn_path = ""
+
+
+def _push_db_bootstrap_rows() -> int:
+    """cursor が無いときに遡る行数。full scan の代わり。"""
+    return max(100, _env_int("SUMMARY_MAIN_PUSH_DB_BOOTSTRAP_ROWS", 1500))
+
+
+def _push_db_narrow_select(cols: list[str]) -> tuple[str, list[str], bool]:
+    """1 分足に要る列だけの SELECT 句を作る。
+
+    戻り値: (select_list, 採用した列, narrow できたか)
+    """
+    lower = {str(c).lower(): c for c in cols}
+    keep: list[str] = []
+    for want in _PUSH_DB_WANTED_COLUMNS:
+        real = lower.get(want.lower())
+        if real is not None and real not in keep:
+            keep.append(real)
+    for group in _PUSH_DB_ESSENTIAL_ANY:
+        if not any(lower.get(g.lower()) in keep for g in group):
+            return "", [], False
+    if not keep:
+        return "", [], False
+    return ", ".join(_quote(c) for c in keep), keep, True
+
+
 
 _push_db_lock = threading.Lock()
 _push_db_cache_df: Optional[pd.DataFrame] = None
@@ -828,7 +1233,102 @@ def reset_push_db_cursor() -> None:
         _push_db_cache_path = ""
 
 
+_PUSH_DB_PROBE_LOCK = threading.Lock()
+_PUSH_DB_PROBE_AT: float = 0.0
+_PUSH_DB_PROBE_RESULT: dict = {}
+
+
+def push_db_probe(*, max_age_sec: float = 1.0) -> dict:
+    """PUSH DB の最新状態を最小コストで返す。
+
+    返す値:
+        max_rowid / latest_datetime / latest_received_at / elapsed / cached
+
+    2026-09-02 P0:
+      旧 freshness probe は毎回 sqlite3.connect していた。NAS 上の
+      631MB / WAL 196MB という状態では connect だけで 2-4 秒かかり、
+      Summary の fresh_input_probe が 15.397 秒になっていた。
+      共有接続 + rowid DESC LIMIT 1 の 1 クエリに統一する。
+      実測 (contention 無し): connect 0.127s / MAX(rowid) 0.109s /
+      rowid DESC LIMIT 1 0.028s。
+      閾値 (300 秒) は変更していない。
+    """
+    global _PUSH_DB_PROBE_AT, _PUSH_DB_PROBE_RESULT
+    now_m = time.monotonic()
+    with _PUSH_DB_PROBE_LOCK:
+        if _PUSH_DB_PROBE_AT > 0.0 and (now_m - _PUSH_DB_PROBE_AT) < max(0.0, max_age_sec):
+            out = dict(_PUSH_DB_PROBE_RESULT)
+            out["cached"] = True
+            return out
+
+    out = {
+        "max_rowid": None,
+        "latest_datetime": None,
+        "latest_received_at": None,
+        "elapsed": None,
+        "cached": False,
+        "error": None,
+    }
+    t0 = time.perf_counter()
+    path = _push_db_path()
+    if not path.exists():
+        out["error"] = "db_missing"
+        out["elapsed"] = round(time.perf_counter() - t0, 3)
+        return out
+
+    # 重い読み取りが走っている間は probe も待たせない。
+    wait = max(0.05, _env_float("SUMMARY_MAIN_PUSH_DB_PROBE_WAIT_SEC", 1.5))
+    if not _push_db_conn_lock.acquire(timeout=wait):
+        out["error"] = "busy"
+        out["elapsed"] = round(time.perf_counter() - t0, 3)
+        with _PUSH_DB_PROBE_LOCK:
+            if _PUSH_DB_PROBE_RESULT:
+                prev = dict(_PUSH_DB_PROBE_RESULT)
+                prev["cached"] = True
+                prev["error"] = "busy_used_cache"
+                return prev
+        return out
+    try:
+        conn = _push_db_get_conn(path)
+        _install_progress_handler(conn)
+        row = conn.execute(
+            "SELECT rowid, datetime, received_at FROM stream_data_raw "
+            "ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        if row:
+            out["max_rowid"] = row[0]
+            out["latest_datetime"] = row[1]
+            out["latest_received_at"] = row[2]
+    except Exception as exc:
+        out["error"] = type(exc).__name__
+        logger.debug("[PUSH DB PROBE] failed", exc_info=True)
+    finally:
+        try:
+            if _push_db_conn is not None:
+                _push_db_conn.set_progress_handler(None, 0)
+        except Exception:
+            pass
+        try:
+            _push_db_conn_lock.release()
+        except Exception:
+            pass
+
+    out["elapsed"] = round(time.perf_counter() - t0, 3)
+    with _PUSH_DB_PROBE_LOCK:
+        _PUSH_DB_PROBE_AT = time.monotonic()
+        _PUSH_DB_PROBE_RESULT = dict(out)
+    return out
+
+
 def _read_push_db_recent() -> pd.DataFrame:
+    """PUSH DB の直近 tick を返す。
+
+    Ver2.0 (2026-09-02 P0):
+      - full scan を廃止。cursor が無ければ MAX(rowid) から seed する。
+      - 1 分足に要る列だけ SELECT する (66 列 -> 11 列)。
+      - set_progress_handler で SQLite 実行中でも中断できる。
+      - 接続を使い回す (NAS の connect は 2-4 秒かかることがある)。
+    """
     global _push_db_cache_df, _push_db_cache_at, _push_db_last_rowid
     global _push_db_cache_table, _push_db_cache_path
 
@@ -858,97 +1358,112 @@ def _read_push_db_recent() -> pd.DataFrame:
         )
         return cached.copy(deep=False)
 
+    # ---- 同時に複数スレッドが同じ DB を叩かない ----
+    # 待てないときは古い共有キャッシュを返す (無ければ空)。
+    # 空を返しても呼び出し側の stale 判定は緩めない。
+    lock_wait = max(0.1, _env_float("SUMMARY_MAIN_PUSH_DB_LOCK_WAIT_SEC", 3.0))
+    if not _push_db_conn_lock.acquire(timeout=lock_wait):
+        with _push_db_lock:
+            cached = _push_db_cache_df
+        logger.warning(
+            "[SUMMARY MAIN PUSH DB REFRESH] 他スレッドが読み取り中 wait=%.1fs "
+            "-> 共有キャッシュを返す rows=%s (同時 full read を作らない)",
+            lock_wait, 0 if cached is None else len(cached),
+        )
+        return cached.copy(deep=False) if cached is not None else pd.DataFrame()
+
     limit = max(100, _env_int("SUMMARY_MAIN_PUSH_DB_REFRESH_LIMIT", 5000))
-    timeout = max(0.05, _env_float("SUMMARY_MAIN_PUSH_DB_REFRESH_TIMEOUT_SEC", 0.8))
     tables_prefer = ["stream_data_raw", "stream_data", "push_stream", "push_ticks", "ticks"]
 
     st = _StageTimer("push_db_recent")
-    conn = None
     try:
-        conn = sqlite3.connect(str(path), timeout=timeout)
+        conn = _push_db_get_conn(path)
         st.mark("connect", path=path.name)
-        try:
-            conn.execute("PRAGMA query_only=ON")
-            conn.execute("PRAGMA busy_timeout=%d" % int(timeout * 1000))
-        except Exception:
-            logger.debug("[SUMMARY MAIN PUSH DB REFRESH] pragma skipped", exc_info=True)
-        st.mark("pragma")
+        _install_progress_handler(conn)
+        st.mark("progress_handler")
 
-        tables = _existing_tables(conn)
-        st.mark("list_tables", n=len(tables))
+        schema_key = str(path)
+        tables = _existing_tables(conn, cache_key=schema_key)
+        st.mark("list_tables", n=len(tables), cached=_schema_cached(schema_key, "tables"))
 
         for table in tables_prefer + [t for t in tables if t not in tables_prefer]:
             if table not in tables:
                 continue
-            cols = _table_columns(conn, table)
+            cols = _table_columns(conn, table, cache_key=schema_key)
             if not cols:
                 continue
-            dt_col = next((c for c in ("datetime", "received_at", "created_at", "updated_at", "time") if c in cols), None)
             sym_col = next((c for c in ("symbol", "code", "Symbol", "銘柄コード") if c in cols), None)
             price_col = next((c for c in ("current_price", "price", "close", "CurrentPrice", "Price", "現在値") if c in cols), None)
             if sym_col is None or price_col is None:
                 continue
             st.mark("columns", table=table, n=len(cols))
 
-            # datetime 単独の index が無いため ORDER BY datetime DESC は全件ソートになる。
-            # tick は追記専用なので rowid 順 = 書き込み順であり、
-            # 「直近 N 行」を取る目的では rowid 順で十分かつ大幅に速い。
-            # 実測: datetime 順 21.0s -> rowid 順 3.8s (5000 行, 差は境界 1 行のみ)
-            order_dt = f"ORDER BY {_quote(dt_col)} DESC" if dt_col else ""
-            sql_dt = f"SELECT * FROM {_quote(table)} {order_dt} LIMIT {int(limit)}"
+            # P2 強化: 1 分足に要る列だけ引く。板 40 列と raw_json は使わない。
+            select_list, kept_cols, narrow = _push_db_narrow_select(cols)
+            if not narrow:
+                select_list, dropped_cols = _push_db_select_list(cols)
+                kept_cols = []
+            else:
+                dropped_cols = [c for c in cols if c not in kept_cols]
 
-            # ---- P0-6: 前回以降の rowid だけを取る ----
             with _push_db_lock:
                 cursor_rowid = _push_db_last_rowid
                 prev_df = _push_db_cache_df
                 prev_table = _push_db_cache_table
                 prev_path = _push_db_cache_path
-            incremental = (
-                _push_db_incremental_enabled()
-                and cursor_rowid is not None
-                and prev_df is not None
+
+            ring_usable = (
+                prev_df is not None
                 and not prev_df.empty
                 and prev_table == table
                 and prev_path == str(path)
             )
+            if not ring_usable:
+                cursor_rowid = None
 
-            df = None
-            mode = "full"
-            if incremental:
-                sql_inc = (
-                    f"SELECT rowid AS _rowid_, * FROM {_quote(table)} "
-                    f"WHERE rowid > {int(cursor_rowid)} ORDER BY rowid ASC LIMIT {int(limit)}"
-                )
+            # ---- P0-6 改: cursor が無ければ MAX(rowid) で seed する ----
+            #      full scan には絶対に戻さない。
+            mode = "incremental"
+            if cursor_rowid is None or not _push_db_incremental_enabled():
                 try:
-                    df = pd.read_sql_query(sql_inc, conn)
-                    mode = "incremental"
+                    row = conn.execute(
+                        "SELECT MAX(rowid) FROM %s" % _quote(table)
+                    ).fetchone()
+                    max_rowid_now = int(row[0]) if row and row[0] is not None else 0
                 except Exception:
                     logger.warning(
-                        "[SUMMARY MAIN PUSH DB REFRESH] incremental read failed table=%s "
-                        "-> full read へフォールバック",
+                        "[SUMMARY MAIN PUSH DB REFRESH] MAX(rowid) 取得に失敗 table=%s "
+                        "(WITHOUT ROWID か接続断)",
                         table, exc_info=True,
                     )
-                    df = None
+                    max_rowid_now = None
+                if max_rowid_now is None:
+                    st.mark("seed_failed", table=table)
+                    continue
+                cursor_rowid = max(0, max_rowid_now - _push_db_bootstrap_rows())
+                mode = "seeded"
+                ring_usable = False
+                st.mark("seed_rowid", table=table, max_rowid=max_rowid_now, cursor=cursor_rowid)
 
-            if df is None:
-                sql_full = (
-                    f"SELECT rowid AS _rowid_, * FROM {_quote(table)} "
-                    f"ORDER BY rowid DESC LIMIT {int(limit)}"
+            sql_inc = (
+                "SELECT rowid AS _rowid_, %s FROM %s WHERE rowid > %d ORDER BY rowid ASC LIMIT %d"
+                % (select_list, _quote(table), int(cursor_rowid), int(limit))
+            )
+            try:
+                df = pd.read_sql_query(sql_inc, conn)
+            except Exception as exc:
+                # progress handler による中断もここに来る。full scan へは落とさない。
+                st.mark("query_aborted", table=table, mode=mode)
+                st.emit(result="aborted", table=table, mode=mode, err=type(exc).__name__)
+                logger.warning(
+                    "[SUMMARY MAIN PUSH DB REFRESH] クエリ中断/失敗 table=%s mode=%s cursor=%s "
+                    "-> 前回の共有キャッシュを返す (full scan へは戻さない)",
+                    table, mode, cursor_rowid, exc_info=True,
                 )
-                try:
-                    df = pd.read_sql_query(sql_full, conn)
-                    mode = "full"
-                except Exception:
-                    # WITHOUT ROWID テーブル等。理由を残して従来順で読み直す。
-                    logger.warning(
-                        "[SUMMARY MAIN PUSH DB REFRESH] rowid order failed table=%s -> fallback to datetime order",
-                        table, exc_info=True,
-                    )
-                    try:
-                        df = pd.read_sql_query(sql_dt, conn)
-                        mode = "datetime_order"
-                    except Exception:
-                        continue
+                with _push_db_lock:
+                    cached = _push_db_cache_df
+                return cached.copy(deep=False) if cached is not None else pd.DataFrame()
+
             st.mark("query_fetch", table=table, mode=mode, rows=0 if df is None else len(df))
 
             if df is None or not isinstance(df, pd.DataFrame):
@@ -963,10 +1478,11 @@ def _read_push_db_recent() -> pd.DataFrame:
                     max_rowid = None
                 df = df.drop(columns=["_rowid_"], errors="ignore")
 
+            df = _normalize_dt_columns(df)
+
             # ---- リングバッファへ合流 ----
-            if mode == "incremental":
+            if ring_usable:
                 if new_rows == 0:
-                    # 新しい tick が無い。前回のバッファをそのまま使う。
                     out = prev_df
                 else:
                     try:
@@ -1000,13 +1516,19 @@ def _read_push_db_recent() -> pd.DataFrame:
                 if max_rowid is not None:
                     if _push_db_last_rowid is None or max_rowid > _push_db_last_rowid:
                         _push_db_last_rowid = max_rowid
+                elif mode == "seeded":
+                    # 新規 0 行でも seed 位置は覚えて、次回 full には戻らない。
+                    _push_db_last_rowid = int(cursor_rowid)
 
             st.emit(table=table, mode=mode, new_rows=new_rows, ring_rows=len(out),
-                    latest=latest, last_rowid=_push_db_last_rowid)
+                    latest=latest, last_rowid=_push_db_last_rowid,
+                    cols=len(kept_cols) if kept_cols else "exclude_list")
             logger.warning(
                 "[SUMMARY MAIN PUSH DB REFRESH] loaded table=%s mode=%s new_rows=%s ring_rows=%s "
-                "latest=%s last_rowid=%s path=%s version=%s",
-                table, mode, new_rows, len(out), latest, _push_db_last_rowid, path, VERSION,
+                "latest=%s last_rowid=%s sel_cols=%s dropped=%s path=%s version=%s",
+                table, mode, new_rows, len(out), latest, _push_db_last_rowid,
+                len(kept_cols) if kept_cols else "exclude_list", len(dropped_cols),
+                path, VERSION,
             )
             return out.copy(deep=False)
 
@@ -1019,10 +1541,14 @@ def _read_push_db_recent() -> pd.DataFrame:
         return pd.DataFrame()
     finally:
         try:
-            if conn is not None:
-                conn.close()
+            if _push_db_conn is not None:
+                _push_db_conn.set_progress_handler(None, 0)
         except Exception:
-            logger.debug("[SUMMARY MAIN PUSH DB REFRESH] close failed", exc_info=True)
+            pass
+        try:
+            _push_db_conn_lock.release()
+        except Exception:
+            pass
 
 
 def _push_df_writeback_enabled() -> bool:
@@ -1047,6 +1573,20 @@ def _writeback_push_df(db_df: pd.DataFrame, *, memory_stale, db_stale) -> None:
         return
     if not isinstance(db_df, pd.DataFrame) or db_df.empty:
         return
+    # 2026-09-02 P0: timeout 済みの古い worker が数百秒後に生き返って
+    # global_data.push_df を上書きするのを止める。
+    try:
+        from scheduler_jobs.summary.direct_push_1m import _worker_generation_is_current
+
+        if not _worker_generation_is_current():
+            logger.warning(
+                "[SUMMARY MAIN PUSH DF WRITEBACK][STALE WORKER BLOCKED] "
+                "古い世代の worker からの書き戻しを止めた rows=%s",
+                len(db_df),
+            )
+            return
+    except Exception:
+        logger.debug("[SUMMARY MAIN PUSH DF WRITEBACK] 世代確認に失敗", exc_info=True)
     gd = _global_data()
     if gd is None:
         return
@@ -1120,4 +1660,8 @@ def _load_push_memory_df() -> pd.DataFrame:
     return db_df
 
 
-__all__ = ["VERSION", "install", "_build_memory_1m_summary", "_load_push_memory_df"]
+__all__ = [
+    "VERSION", "install", "_build_memory_1m_summary", "_load_push_memory_df",
+    "push_db_read_stats", "push_db_set_cancel", "push_db_clear_cancel",
+    "push_db_close_conn", "reset_push_db_cursor", "push_db_probe",
+]

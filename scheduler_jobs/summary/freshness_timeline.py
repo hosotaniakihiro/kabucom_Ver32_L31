@@ -236,10 +236,21 @@ _PUSHDB_LOCK = threading.Lock()
 
 
 def _pushdb_read_now() -> Optional[dt.datetime]:
-    """NAS 上の push DB から最新時刻を読む。background からだけ呼ぶ。"""
+    """push DB から最新時刻を読む。background からだけ呼ぶ。
+
+    2026-09-05: 置き場所は push_db_location が決める (既定はローカル)。
+    ここを NAS 固定にすると、鮮度チェックが前日の複製を見て
+    「PUSH が止まっている」と誤判定する。
+    """
     import sqlite3
     path = os.path.join(r"X:\raw_data\kabu_station\push",
                         "push%s.db" % dt.datetime.now().strftime("%Y%m%d"))
+    try:
+        from trading.push import push_db_location
+
+        path = str(push_db_location.push_db_path())
+    except Exception:
+        pass
     path = os.getenv("PUSH_DB_PATH", path)
     if not os.path.exists(path):
         return None
