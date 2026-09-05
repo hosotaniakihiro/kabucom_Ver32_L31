@@ -7467,3 +7467,92 @@ NAS 側が正となる。
 * SUMMARY の SLA 超過 142 件 (`cancel SLA breach` 71+71 / `tick timeout` 37)
 * エントリーが 1 件も閾値を超えない (16 件すべて score_low。0.15-2.07 vs 閾値 3.0)。
   PUSH のデータ欠けが直ってから判断する
+
+## 第25ラウンド — ログをローカルへ逃がし、NAS 処理に締め切りを付ける (2026-09-05)
+
+### きっかけ
+
+「最近 NAS がハングすることがある」との報告。第24ラウンドで push DB は
+ローカルへ移したが、守れたのはそこだけだった。
+
+**ログを NAS へ直接書いていると、NAS がハングした瞬間に logging が
+ブロックして全プロセスが止まる。しかも同時に調査手段そのものを失う。**
+
+`console_tee` は既に非同期ライタを持っていて 1 行ごとの SMB 往復は避けて
+いたが、NAS がハングすればライタスレッドが固まり、キューが溢れて
+`[CONSOLE TEE] queue overflow -> N 行を破棄した` になる。
+
+### 修正
+
+| ファイル | 内容 |
+|---|---|
+| `utils/nas_guard.py` (新規) | NAS に触る処理を別スレッドへ出し、締め切りで見切る共通部品。同時実行を 1 本に絞る slot 付き |
+| `trading/push/push_db_location.py` | 第24ラウンドで書いた見切り処理を nas_guard へ寄せた (重複した並行制御を 1 箇所に) |
+| `data_collectors/config.py` | `LOG_DIR` の既定を `X:\logs\console` から `%LOCALAPPDATA%\autostock\logs\console` へ |
+| `data_collectors/log_mirror.py` (新規) | ローカルのログを NAS へ **差分だけ追記**ミラーする。既定 5 分ごと、上限 60 秒 |
+| `data_collectors/logging_setup.py` | 書いたログをミラーに登録 |
+| `main_database.py` | 同上 |
+| `core/logging/console_tee.py` | 既定の出力先をローカルへ。**既定値を import 時ではなく呼び出し時に決める** (import しただけで NAS に触らないため) |
+
+ログは append-only なので、前回どこまで送ったかを覚えておけば差分だけ送れる。
+1 日 60MB を毎回まるごと送らずに済む。実測で 18 バイト -> 9 バイトと
+差分だけが飛び、最終的な内容が一致することを確認した。
+
+NAS 上のログは今までどおり `X:\logs\console` で見られる (数分遅れる)。
+
+環境変数:
+
+    KABU_CONSOLE_LOG_DIR          従来どおり NAS へ直接書きたいとき
+    KABU_LOG_MIRROR_TO_NAS        0 でミラーしない
+    KABU_LOG_MIRROR_INTERVAL_SEC  既定 300
+    KABU_LOG_MIRROR_TIMEOUT_SEC   既定 60
+    KABU_LOG_NAS_DIR              ミラー先 (既定 X:\logs\console)
+
+### 追加した回帰テスト
+
+`test_script/p0_round25/test_r25_log_local_and_nas_guard.py` (13 件)
+
+1. nas_guard が終わらない処理を見切って呼び出し側に返ること
+2. 詰まっている間は重ねないこと / 成功後は slot が解放されること
+3. `LOG_DIR` の既定がローカルで、NAS でも UNC でもないこと
+4. `console_tee` の既定が **import 時に評価されない**こと
+5. ミラーが差分だけ送ること / 縮んだら送り直すこと
+6. ミラーが固まっても呼び出し側が返ること
+
+p0_round23 / 24 と合わせて **47 件通過**。
+
+### やらなかったこと — ranking DB と summary DB
+
+同じ扱いに広げようとしたが、**パス解決の散らばり方が push とは桁違い**だった。
+
+| DB | パス解決サイト数 |
+|---|---|
+| push | **4** (writer + 読み手 3) |
+| ranking | **30** |
+| summary | **36** |
+
+push は 4 箇所を 1 つの解決関数に集約でき、「writer と読み手が同じ場所を返す」
+ことをテストで固定できた。ranking は 30 箇所がそれぞれ独自にパスを組み立てて
+おり (ハードコードされた候補リストを持つものもある)、**1 箇所でも漏らすと
+その読み手だけが古い NAS 側を読む**。ranking DB は銘柄選定を駆動しているので、
+古いデータを黙って読む状態は「読めない」より悪い。
+
+場中に検証できない状況で 30 + 36 箇所を一度に移すのは危険と判断して、
+本ラウンドでは触っていない。やるなら ranking だけで 1 ラウンド、
+場中の実データで確認しながら進めるべき。
+
+なお ranking DB の WAL は 2026-09-04 実測で 201MB / 49,511 frames あり、
+NAS への書き込み量としては無視できない。優先度は高い。
+
+### 現状の NAS 依存
+
+| 対象 | 状態 |
+|---|---|
+| push DB | ローカル + 複製 (第24ラウンド) |
+| コンソールログ | ローカル + 差分ミラー (本ラウンド) |
+| ranking DB | **NAS 直書きのまま** |
+| summary DB | **NAS 直書きのまま** |
+| heartbeat json | ローカル (LOG_DIR に従うため本ラウンドで移動) |
+
+NAS がハングした場合、ranking / summary の書き込みは止まる。ただしログは
+残るので、**次は何が起きたか追える**ようになった。

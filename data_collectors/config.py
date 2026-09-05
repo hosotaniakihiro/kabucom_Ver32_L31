@@ -25,9 +25,20 @@ RANKING_DIR = RAW_DATA_DIR / "ranking"
 SUMMARY_DIR = RAW_DATA_DIR / "summary"
 SUBSCRIPTION_DIR = RAW_DATA_DIR / "push_subscription"
 
-# コンソールログはNASではなく、指定されたローカル/共有ドライブへ保存する。
-# 変更したい場合は KABU_CONSOLE_LOG_DIR を設定する。
-LOG_DIR = Path(os.environ.get("KABU_CONSOLE_LOG_DIR", r"X:\logs\console"))
+# 2026-09-05: コンソールログの書き込み先をローカルへ移した。
+#
+# NAS へ直接書いていると、NAS がハングした瞬間に logging がブロックして
+# 全プロセスが止まる。しかも同時に調査手段 (ログ) も失う。
+# NAS 上のログは data_collectors/log_mirror.py が定期的に追記ミラーするので、
+# X:\logs\console でも今までどおり見られる (数分遅れる)。
+#
+# 従来どおり NAS へ直接書きたい場合は KABU_CONSOLE_LOG_DIR を設定する。
+def _default_console_log_dir() -> Path:
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or r"C:\Temp"
+    return Path(base) / "autostock" / "logs" / "console"
+
+
+LOG_DIR = Path(os.environ.get("KABU_CONSOLE_LOG_DIR") or _default_console_log_dir())
 
 
 def trade_date_yyyymmdd() -> str:

@@ -55,4 +55,14 @@ def setup_logging(name: str, *, also_file: bool = True) -> logging.Logger:
         _INSTALLED_FILE_KEYS.add(name)
         logging.getLogger(__name__).warning("[DATA COLLECTORS LOG] save to: %s", log_path)
 
+        # 書き先はローカル。NAS へは定期的に差分を追記ミラーする
+        # (NAS がハングしても logging が止まらないようにするため)。
+        try:
+            from data_collectors import log_mirror
+
+            log_mirror.register(log_path)
+            log_mirror.start_background_mirror()
+        except Exception:
+            logging.getLogger(__name__).debug("[DATA COLLECTORS LOG] mirror 起動に失敗", exc_info=True)
+
     return logging.getLogger(name)

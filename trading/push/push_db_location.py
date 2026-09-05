@@ -50,6 +50,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from utils.nas_guard import run_with_deadline
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -236,46 +238,39 @@ def sync_to_nas(
         out["error"] = "source が無い"
         return out
 
-    # 前の複製がまだ NAS で詰まっているなら重ねない。
-    # ただし停止時など「取りこぼしたくない」経路は slot_wait_sec だけ待つ
-    # (定期複製の最中に停止すると、その日の最後のぶんが NAS へ渡らないため)。
-    if slot_wait_sec > 0:
-        got = _SYNC_SLOT.acquire(blocking=True, timeout=float(slot_wait_sec))
-    else:
-        got = _SYNC_SLOT.acquire(blocking=False)
-    if not got:
-        out["skipped"] = True
-        out["error"] = "前回の複製がまだ終わっていない (NAS が詰まっている可能性)"
-        logger.warning(
-            "[PUSH DB NAS SYNC] skip reason=%s (前回の複製が未完了。NAS を確認する)", reason
-        )
-        return out
-
+    # 締め切り付きで実行する。NAS のハングで呼び出し側を固めない
+    # (詳細は utils/nas_guard.py)。停止時など取りこぼしたくない経路は
+    # slot_wait_sec だけ前の複製の完了を待つ。
     limit = float(timeout_sec) if timeout_sec is not None else sync_timeout_sec()
 
-    def _worker() -> None:
-        try:
-            _do_backup(source, date, pages, sleep_sec, out)
-        finally:
-            _SYNC_SLOT.release()
-
-    th = threading.Thread(target=_worker, daemon=True, name="push_db_nas_sync_once")
-    th.start()
-    th.join(timeout=limit)
+    guard = run_with_deadline(
+        lambda: _do_backup(source, date, pages, sleep_sec, out),
+        timeout_sec=limit,
+        slot=_SYNC_SLOT,
+        slot_wait_sec=slot_wait_sec,
+        label="push_db_nas_sync:%s" % reason,
+        thread_name="push_db_nas_sync_once",
+    )
 
     out["elapsed_sec"] = time.perf_counter() - started
 
-    if th.is_alive():
-        # 生きているスレッドは放置する。NAS が返ってくれば勝手に終わり、
-        # そのとき _SYNC_SLOT が解放されて次の複製が動けるようになる。
+    if guard["skipped"]:
+        out["skipped"] = True
+        out["error"] = guard["error"]
+        return out
+
+    if guard["timed_out"]:
         out["timed_out"] = True
-        out["error"] = "%.0f 秒で完了しなかった (NAS のハングを疑う)" % limit
+        out["error"] = guard["error"]
         logger.error(
             "[PUSH DB NAS SYNC] 時間切れ reason=%s %.0fs src=%s "
             "(ローカルの DB は無事。NAS が戻ってから複製し直すこと)",
             reason, limit, source,
         )
         return out
+
+    if not out["ok"] and guard["error"]:
+        out["error"] = guard["error"]
 
     if out["ok"]:
         logger.warning(

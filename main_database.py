@@ -122,6 +122,16 @@ def _ensure_basic_logging() -> None:
                 root.addHandler(fh)
                 _MAIN_DATABASE_LOG_FILE_INSTALLED = True
                 logging.getLogger(__name__).warning("[MAIN DATABASE LOG] save to: %s", log_path)
+
+                # 書き先はローカル。NAS へは差分を追記ミラーする
+                # (NAS がハングしても logging を止めないため)。
+                try:
+                    from data_collectors import log_mirror
+
+                    log_mirror.register(log_path)
+                    log_mirror.start_background_mirror()
+                except Exception:
+                    logging.getLogger(__name__).debug("[MAIN DATABASE LOG] mirror 起動に失敗", exc_info=True)
             except Exception:
                 logging.getLogger(__name__).exception("[MAIN DATABASE LOG] file handler install failed")
     except Exception:
@@ -465,11 +475,59 @@ def _sqlite_pragmas_force_summary_lock_env() -> None:
     _sqlite_pragmas_setdefault_env("SUMMARY_MTF_CATCHUP_UPSERT_CHUNK_SIZE", "100")
 
 
+# ============================================================
+# 2026-09-03: journal_mode は「読んでから、必要なときだけ」変える
+# ------------------------------------------------------------
+# 起動のたびに無条件で
+#     PRAGMA journal_mode=WAL
+# を投げると、SMB 上の DB では -shm のロック交渉に入るため、
+# 他の writer/reader が居るだけで
+#     sqlite3.OperationalError: locking protocol   (SQLITE_PROTOCOL)
+# になりうる。実際 2026-09-03 に db_prepare がこれで異常終了し、
+# main_database.py が exit code 1 で落ちた。
+#
+# journal_mode は DB 全体の永続設定なので、一度 WAL なら二度と設定しなくてよい。
+# 読むだけ (PRAGMA journal_mode) は排他を必要としない。
+# ============================================================
+
+
+def _md_ensure_journal_mode_wal_if_needed(conn, label: str = "db") -> str:
+    """既に WAL なら何もしない。戻り値は最終的な journal_mode。
+
+    設定に失敗しても例外にしない (呼び出し側は続行してよい)。
+    """
+    current = ""
+    try:
+        row = conn.execute("PRAGMA journal_mode").fetchone()
+        if row and row[0] is not None:
+            current = str(row[0]).strip().lower()
+    except Exception:
+        logger.debug("[SQLITE PRAGMA] %s journal_mode read failed", label, exc_info=True)
+        return ""
+
+    if current == "wal":
+        return current
+
+    try:
+        row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        after = str(row[0]).strip().lower() if row and row[0] is not None else ""
+        logger.info("[SQLITE PRAGMA] %s journal_mode %s -> %s", label, current or "unknown", after or "?")
+        return after or current
+    except Exception as e:
+        logger.warning(
+            "[SQLITE PRAGMA] %s journal_mode=WAL skipped (current=%s) err=%s "
+            "(設定失敗だけでは落とさない)",
+            label, current or "unknown", e,
+        )
+        return current
+
+
 def _sqlite_pragmas_configure_summary_connection_extra(conn: sqlite3.Connection) -> None:
     busy_ms = max(60000, _sqlite_pragmas_env_int("SUMMARY_SQLITE_BUSY_TIMEOUT_MS", 60000))
+    # journal_mode は毎回投げない (既に WAL なら読むだけで終わる)。
+    _md_ensure_journal_mode_wal_if_needed(conn, "summary")
     pragmas = [
         f"PRAGMA busy_timeout={busy_ms}",
-        "PRAGMA journal_mode=WAL",
         "PRAGMA synchronous=NORMAL",
         "PRAGMA wal_autocheckpoint=1000",
     ]
@@ -514,6 +572,15 @@ def _sqlite_pragmas_apply_pragmas(conn: sqlite3.Connection, database: Any) -> No
     try:
         mmap_bytes = max(0, _sqlite_pragmas_env_int("SQLITE_MMAP_SIZE_BYTES", 268435456))
         if mmap_bytes:
+            # 2026-09-02 P0: NAS 上の DB では mmap を使わない
+            # (SMB の mmap ページフォルトは EXCEPTION_IN_PAGE_ERROR で
+            #  プロセスごと落ちる。core/startup/sqlite_memory_pragmas.py 参照)
+            try:
+                from core.startup.sqlite_memory_pragmas import resolve_mmap_size_bytes
+
+                mmap_bytes = resolve_mmap_size_bytes(database, mmap_bytes)
+            except Exception:
+                pass
             conn.execute(f"PRAGMA mmap_size={mmap_bytes}")
     except Exception:
         pass
@@ -694,7 +761,9 @@ def _wal_checkpoint_once(force_mode: str | None = None, db_path: "Path | None" =
         conn = sqlite3.connect(str(db_path), timeout=max(1.0, busy_timeout_ms / 1000.0))
         try:
             conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
-            conn.execute("PRAGMA journal_mode=WAL")
+            # checkpoint 前に journal_mode を設定し直す必要はない。
+            # 既に WAL ならこの行が locking protocol / malformed を拾うだけ損。
+            _md_ensure_journal_mode_wal_if_needed(conn, "checkpoint")
             result = conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
             conn.commit()
         finally:
@@ -906,9 +975,27 @@ def _install_push_summary_realtime() -> None:
         logger.exception("[MAIN DATABASE] push summary bootstrap rebuild schedule failed; continue")
 
 
+class SettingsIniCorrupted(RuntimeError):
+    """settings.ini exists but ConfigParser cannot parse it.
+
+    Kept distinct from "apipassword is empty": a broken file is never a valid
+    configuration, so it must not be reported as a password/token problem.
+    """
+
+
 def _read_api_password_from_settings() -> str:
     conf = ConfigParser()
-    conf.read(str(PROJECT_ROOT / "settings.ini"), encoding="utf-8")
+    path = PROJECT_ROOT / "settings.ini"
+    try:
+        # utf-8-sig: a BOM in front of [aukabu] breaks the first section header the
+        # same way a stray character does.
+        conf.read(str(path), encoding="utf-8-sig")
+    except Exception as e:
+        from token_manager import describe_parsing_error
+
+        raise SettingsIniCorrupted(
+            "settings.ini cannot be parsed path=%s detail=%s" % (path, describe_parsing_error(e))
+        ) from e
 
     if conf.has_section("aukabu"):
         return conf.get("aukabu", "apipassword", fallback="")
@@ -993,6 +1080,16 @@ def _bootstrap_kabu_token_for_data_collectors() -> bool:
     api_password = ""
     try:
         api_password = _read_api_password_from_settings()
+    except SettingsIniCorrupted as e:
+        # 破損したファイルで先へ進むと password_present=False → apipassword 不一致に
+        # 見えてしまう。壊れた行を名指しして、ここで止める。
+        logger.error(
+            "[MAIN DATABASE] abort: settings.ini is corrupted, so nothing could be read from it. "
+            "This is NOT a stale token and NOT an API password mismatch. "
+            "Fix the reported line (a settings.ini.*.bak next to it may hold the previous copy). %s",
+            e,
+        )
+        return False
     except Exception:
         logger.exception("[MAIN DATABASE] settings.ini apipassword read failed")
     logger.warning(
@@ -1060,6 +1157,56 @@ def _bootstrap_kabu_token_for_data_collectors() -> bool:
     return True
 
 
+def _acquire_single_instance_or_report(role: str) -> bool:
+    """このマシンで role が唯一のインスタンスかを確定する。
+
+    OS ファイルロックを取れなかった場合は False を返す。
+    ロックが取れない = 別の生きたプロセスがハンドルを握っている、なので
+    holder meta の鮮度に関わらず起動しない (安全側)。
+    ガード自体が使えない場合 (モジュール import 失敗・例外) だけ
+    True を返して従来どおり起動する = 誤検知で本番を落とさない。
+    無関係な python プロセスには一切触らない (kill もしない)。
+    """
+    try:
+        from core.process_lock import acquire_single_instance, describe_holder
+    except Exception:
+        logger.exception("[MAIN DATABASE] single instance guard unavailable -> 多重起動チェックなしで続行")
+        return True
+
+    try:
+        ok, holder = acquire_single_instance(role)
+    except Exception:
+        logger.exception("[MAIN DATABASE] single instance guard failed -> 多重起動チェックなしで続行")
+        return True
+
+    if ok:
+        return True
+
+    state = str(holder.get("holder_state", "unknown"))
+    if state == "alive":
+        logger.error(
+            "[MAIN DATABASE][DUPLICATE START BLOCKED] 既に %s が起動しているので "
+            "このプロセスは子プロセスを一切起動せずに終了する。holder: %s "
+            "(kabu Station の PUSH は 1 セッション 1 接続。2 ツリー走らせると "
+            "後発の push_receiver が ws_owner lock を取れず永久に受信できない)",
+            role, describe_holder(holder),
+        )
+        logger.error(
+            "[MAIN DATABASE][DUPLICATE START BLOCKED] 意図的に 2 本目を起動したい場合は "
+            "AUTOSTOCK_SINGLE_INSTANCE_LOCK=0 を設定する (非推奨)"
+        )
+        return False
+
+    # meta は古いが OS ロックは誰かが握っている、という矛盾した状態。
+    # 起動は止めるが、状態をそのまま出して原因を追えるようにする。
+    logger.error(
+        "[MAIN DATABASE][DUPLICATE START BLOCKED] %s のロックを取得できなかった "
+        "(holder meta は最新ではない state=%s)。holder: %s",
+        role, state, describe_holder(holder),
+    )
+    return False
+
+
 def main() -> int:
     _ensure_basic_logging()
 
@@ -1072,6 +1219,24 @@ def main() -> int:
     logger.info("========== MAIN DATABASE BOOT START ==========")
     logger.info("[MAIN DATABASE] PROJECT_ROOT=%s", PROJECT_ROOT)
     logger.info("[MAIN DATABASE] cwd=%s", os.getcwd())
+
+    # ------------------------------------------------------------
+    # 多重起動ガード (2026-09-03)
+    # ------------------------------------------------------------
+    # main_database.py を 2 回起動しても誰も止めていなかった。
+    # 実測: tree A 10:47:06 (main_database 12608) と
+    #       tree B 11:08:56 (main_database 19972) が同時に走り、
+    #       それぞれが push_receiver / summary / yahoo / ranking を
+    #       1 セットずつ持っていた。
+    #
+    # kabu Station の PUSH は 1 セッション 1 接続なので、
+    # ws_owner の single-owner lock が 2 本目の WebSocket を拒否する。
+    # その結果 tree B の push_receiver は永久に受信できない。
+    # ロックを緩めるのではなく、ツリーごと二重に立ち上げるのをここで止める。
+    #
+    # AUTOSTOCK_SINGLE_INSTANCE_LOCK=0 で従来どおり多重起動できる。
+    if not _acquire_single_instance_or_report("main_database"):
+        return 0
 
     # Order matters.  Everything above the token gate must be env-only setup with
     # no threads, no sockets and no DB traffic; everything that costs something is

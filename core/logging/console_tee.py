@@ -271,8 +271,24 @@ def _force_timestamp_formatter(handler: logging.Handler, *, level: int | None = 
         pass
 
 
+def _default_console_log_dir() -> Path:
+    """既定の出力先。
+
+    2026-09-05: NAS (`Logs\\console`) からローカルへ変えた。NAS がハングすると
+    tee のライタスレッドが固まり、キューが溢れてログを捨て始める
+    (`[CONSOLE TEE] queue overflow`)。ログが失われると調査手段も失う。
+    NAS へは data_collectors/log_mirror.py が差分を追記ミラーする。
+    """
+    try:
+        from data_collectors.config import LOG_DIR
+
+        return Path(LOG_DIR)
+    except Exception:
+        return Path(nas_path(r"Logs\console"))
+
+
 def setup_console_tee(
-    log_dir: str | Path = nas_path(r"Logs\console"),
+    log_dir: str | Path | None = None,
     *,
     prefix: str = "console",
     level: int = logging.INFO,
@@ -280,6 +296,10 @@ def setup_console_tee(
     """
     stdout / stderr / logging を tee 化する。
     既存の logging.StreamHandler も tee 側へ付け替える。
+
+    log_dir を省略するとローカルの既定 (data_collectors.config.LOG_DIR) を使う。
+    既定値を import 時ではなく呼び出し時に決めるのは、import だけで NAS に
+    触らないようにするためでもある。
     """
     global _console_file, _console_path, _async_writer
 
@@ -287,12 +307,21 @@ def setup_console_tee(
         rebind_logging_streams_to_console_tee(force_formatter=True)
         return _console_path
 
-    log_dir = Path(log_dir)
+    log_dir = Path(log_dir) if log_dir is not None else _default_console_log_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
 
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     pid = os.getpid()
     _console_path = log_dir / f"{prefix}_{ts}_{pid}.log"
+
+    # NAS へは差分を追記ミラーする (ローカルに書くようにしたため)
+    try:
+        from data_collectors import log_mirror
+
+        log_mirror.register(_console_path)
+        log_mirror.start_background_mirror()
+    except Exception:
+        pass
 
     # 行バッファ (buffering=1) をやめる。flush はライタスレッドが行う。
     # 1 行ごとに SMB 往復させないことがこの変更の目的。
