@@ -163,6 +163,21 @@ def _push_wal_size_limit_bytes() -> int:
     return 64 * 1024 * 1024
 
 
+def _push_nas_sync_stop_timeout_sec() -> float:
+    """停止時に NAS 複製を待つ上限。
+
+    NAS がハングしていると停止できなくなるので上限を切る。健全なら
+    520MB で 15 秒ほどなので既定 120 秒は十分な余裕がある。
+    """
+    try:
+        v = os.getenv("PUSH_DB_NAS_SYNC_STOP_TIMEOUT_SEC")
+        if v is not None and str(v).strip() != "":
+            return max(5.0, float(str(v).strip()))
+    except Exception:
+        pass
+    return 120.0
+
+
 def _push_db_write_raw_json() -> bool:
     """stream_data / stream_data_raw の raw_json 列を実際に保存するか。
 
@@ -227,9 +242,11 @@ class StreamDBWriter:
                 return
 
             def _loop() -> None:
+                # 複製先の解決は NAS に触る (mkdir)。ここで固まると定期複製が
+                # 一度も回らなくなるので、ログのためだけに待たない。
                 logger.warning(
-                    "[PUSH DB NAS SYNC] 定期複製を開始 interval=%.0fmin src=%s dst=%s",
-                    interval / 60.0, db_path, push_db_location.nas_push_db_path(),
+                    "[PUSH DB NAS SYNC] 定期複製を開始 interval=%.0fmin timeout=%.0fs src=%s",
+                    interval / 60.0, push_db_location.sync_timeout_sec(), db_path,
                 )
                 while True:
                     time.sleep(interval)
@@ -1063,23 +1080,55 @@ class StreamDBWriter:
         self.conn = None
         self.cursor = None
 
-        # 前日ぶんを NAS へ確定複製してから今日の DB を開く。
-        # ここを飛ばすと前日のローカル DB が NAS へ渡らないまま残る。
-        self._sync_to_nas_safe(reason="rotate", date=prev_date)
+        # 前日ぶんを NAS へ複製する。ただし **この場で待たない**。
+        # ここは writer のロックを握ったまま呼ばれるので、NAS がハングすると
+        # 取り込みごと止まる。前日のファイルはもう変化しないので、
+        # 複製は別スレッドに任せて今日の DB を先に開く。
+        self._sync_to_nas_safe(reason="rotate", date=prev_date, wait=False)
 
         self.current_date = today
         self._open_connection()
 
-    def _sync_to_nas_safe(self, *, reason: str, date: Optional[dt.date] = None) -> None:
-        """NAS への複製。失敗しても取り込みは止めない。"""
+    def _sync_to_nas_safe(
+        self,
+        *,
+        reason: str,
+        date: Optional[dt.date] = None,
+        wait: bool = True,
+        timeout_sec: Optional[float] = None,
+        slot_wait_sec: float = 0.0,
+    ) -> None:
+        """NAS への複製。失敗しても取り込みは止めない。
+
+        ``wait=False`` のときは投げっぱなしにする。ロックを握っている
+        経路 (ローテーション) から呼ぶときは必ずこちらを使う。
+        NAS のハングで PUSH の取り込みが止まるのが一番まずい。
+        """
         try:
             from trading.push import push_db_location
 
             if not push_db_location.local_staging_enabled():
                 return
-            push_db_location.sync_to_nas(reason=reason, date=date)
+
+            def _run() -> None:
+                try:
+                    push_db_location.sync_to_nas(
+                        reason=reason,
+                        date=date,
+                        timeout_sec=timeout_sec,
+                        slot_wait_sec=slot_wait_sec,
+                    )
+                except Exception:
+                    logger.exception("[PUSH DB WRITER] NAS 複製に失敗 reason=%s", reason)
+
+            if wait:
+                _run()
+            else:
+                threading.Thread(
+                    target=_run, daemon=True, name=f"push_db_nas_sync_{reason}"
+                ).start()
         except Exception:
-            logger.exception("[PUSH DB WRITER] NAS 複製に失敗 reason=%s", reason)
+            logger.exception("[PUSH DB WRITER] NAS 複製の起動に失敗 reason=%s", reason)
 
     # ========================================================
     # DIRECT ADD
@@ -1629,7 +1678,15 @@ class StreamDBWriter:
 
         # 接続を閉じてから複製する。大引け後の停止で今日ぶんが NAS へ渡る。
         # ここで失敗しても、ローカルの DB は残るので後から手動で複製できる。
-        self._sync_to_nas_safe(reason="stop")
+        #
+        # 待つが、無限には待たない。NAS がハングしていると停止できなくなる。
+        # 定期複製の最中に停止した場合は、それが終わるのを少しだけ待ってから
+        # 最後のぶんを流す (待たないとその日の終盤が NAS へ渡らない)。
+        self._sync_to_nas_safe(
+            reason="stop",
+            timeout_sec=_push_nas_sync_stop_timeout_sec(),
+            slot_wait_sec=_push_nas_sync_stop_timeout_sec(),
+        )
 
     def _loop(self) -> None:
         logger.info("[PUSH DB WRITER] writer loop started")

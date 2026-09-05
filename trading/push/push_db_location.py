@@ -45,6 +45,7 @@ import datetime as dt
 import logging
 import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -59,9 +60,14 @@ __all__ = [
     "nas_push_db_path",
     "sync_to_nas",
     "nas_sync_interval_sec",
+    "sync_timeout_sec",
 ]
 
 _DEFAULT_SYNC_INTERVAL_MIN = 30.0
+
+# 複製は同時に 1 本だけ。NAS が詰まっている間に要求を重ねると
+# SMB のセッションを食い潰す (2026-09-02 の storm で実際に枯渇した)。
+_SYNC_SLOT = threading.Semaphore(1)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -145,46 +151,22 @@ def nas_push_db_path(date: Optional[dt.date] = None) -> Path:
     return nas_push_db_dir() / f"push{_today_yyyymmdd(date)}.db"
 
 
-def sync_to_nas(
-    src: Optional[Path] = None,
-    *,
-    date: Optional[dt.date] = None,
-    reason: str = "",
-    pages: int = 2000,
-    sleep_sec: float = 0.0,
-) -> dict:
-    """ローカルの push DB を NAS へ複製する。
+def sync_timeout_sec() -> float:
+    """複製 1 回に許す時間。超えたら諦めてローカルを優先する。"""
+    return max(5.0, _env_float("PUSH_DB_NAS_SYNC_TIMEOUT_SEC", 180.0))
 
-    稼働中の DB を shutil.copy すると壊れるので sqlite3 のオンライン
-    バックアップ API を使う。``pages`` ずつ進めるので、writer を
-    長時間止めない。
 
-    戻り値は結果の dict。失敗しても例外は投げない (複製に失敗しても
-    ローカルの取り込みは続けるべきなので)。
+def _do_backup(source: Path, date: Optional[dt.date], pages: int, sleep_sec: float, out: dict) -> None:
+    """実際の複製。NAS に触るのは全部この中 (呼び出し側スレッドを固めないため)。
+
+    NAS のパス解決は mkdir を伴うので、これも NAS がハングすれば止まる。
+    だからパス解決ごとこのワーカーの中に置く。
     """
-    started = time.perf_counter()
-    out = {
-        "ok": False, "reason": reason, "src": None, "dst": None,
-        "bytes": 0, "elapsed_sec": 0.0, "error": "",
-    }
-
-    if not local_staging_enabled():
-        out["ok"] = True
-        out["error"] = "local staging 無効のため複製不要"
-        return out
-
-    source = Path(src) if src else push_db_path(date)
-    out["src"] = str(source)
-    if not source.exists():
-        out["error"] = "source が無い"
-        return out
-
-    dst = nas_push_db_path(date)
-    out["dst"] = str(dst)
-
     src_conn = None
     dst_conn = None
     try:
+        dst = nas_push_db_path(date)
+        out["dst"] = str(dst)
         dst.parent.mkdir(parents=True, exist_ok=True)
         # 書き込み中の DB が相手なので read-only では開かない
         # (WAL の読み取りに -shm への書き込みが要る)。
@@ -199,10 +181,6 @@ def sync_to_nas(
             pass
     except Exception as e:
         out["error"] = "%s: %s" % (type(e).__name__, e)
-        logger.warning(
-            "[PUSH DB NAS SYNC] 失敗 reason=%s src=%s dst=%s err=%s",
-            reason, source, dst, out["error"],
-        )
     finally:
         for c in (dst_conn, src_conn):
             try:
@@ -211,10 +189,102 @@ def sync_to_nas(
             except Exception:
                 pass
 
+
+def sync_to_nas(
+    src: Optional[Path] = None,
+    *,
+    date: Optional[dt.date] = None,
+    reason: str = "",
+    pages: int = 2000,
+    sleep_sec: float = 0.0,
+    timeout_sec: Optional[float] = None,
+    slot_wait_sec: float = 0.0,
+) -> dict:
+    """ローカルの push DB を NAS へ複製する。
+
+    稼働中の DB を shutil.copy すると壊れるので sqlite3 のオンライン
+    バックアップ API を使う。``pages`` ずつ進めるので、writer を
+    長時間止めない。
+
+    **NAS がハングしても呼び出し側を固めない。** SMB のハングは
+    sqlite3 の timeout では抜けられず、OS の I/O でブロックする。
+    そこで実処理は daemon スレッドへ出し、``timeout_sec`` で見切る。
+    見切ったスレッドは放置される (daemon なのでプロセス終了を妨げない)。
+    ローカルの DB はそのまま残るので、後から複製し直せる。
+
+    複製が詰まっている間に次の複製を重ねると SMB のセッションを
+    さらに食うので、実行中なら新しい要求はスキップする。
+
+    戻り値は結果の dict。失敗しても例外は投げない (複製に失敗しても
+    ローカルの取り込みは続けるべきなので)。
+    """
+    started = time.perf_counter()
+    out = {
+        "ok": False, "reason": reason, "src": None, "dst": None,
+        "bytes": 0, "elapsed_sec": 0.0, "error": "", "timed_out": False,
+        "skipped": False,
+    }
+
+    if not local_staging_enabled():
+        out["ok"] = True
+        out["error"] = "local staging 無効のため複製不要"
+        return out
+
+    source = Path(src) if src else push_db_path(date)
+    out["src"] = str(source)
+    if not source.exists():
+        out["error"] = "source が無い"
+        return out
+
+    # 前の複製がまだ NAS で詰まっているなら重ねない。
+    # ただし停止時など「取りこぼしたくない」経路は slot_wait_sec だけ待つ
+    # (定期複製の最中に停止すると、その日の最後のぶんが NAS へ渡らないため)。
+    if slot_wait_sec > 0:
+        got = _SYNC_SLOT.acquire(blocking=True, timeout=float(slot_wait_sec))
+    else:
+        got = _SYNC_SLOT.acquire(blocking=False)
+    if not got:
+        out["skipped"] = True
+        out["error"] = "前回の複製がまだ終わっていない (NAS が詰まっている可能性)"
+        logger.warning(
+            "[PUSH DB NAS SYNC] skip reason=%s (前回の複製が未完了。NAS を確認する)", reason
+        )
+        return out
+
+    limit = float(timeout_sec) if timeout_sec is not None else sync_timeout_sec()
+
+    def _worker() -> None:
+        try:
+            _do_backup(source, date, pages, sleep_sec, out)
+        finally:
+            _SYNC_SLOT.release()
+
+    th = threading.Thread(target=_worker, daemon=True, name="push_db_nas_sync_once")
+    th.start()
+    th.join(timeout=limit)
+
     out["elapsed_sec"] = time.perf_counter() - started
+
+    if th.is_alive():
+        # 生きているスレッドは放置する。NAS が返ってくれば勝手に終わり、
+        # そのとき _SYNC_SLOT が解放されて次の複製が動けるようになる。
+        out["timed_out"] = True
+        out["error"] = "%.0f 秒で完了しなかった (NAS のハングを疑う)" % limit
+        logger.error(
+            "[PUSH DB NAS SYNC] 時間切れ reason=%s %.0fs src=%s "
+            "(ローカルの DB は無事。NAS が戻ってから複製し直すこと)",
+            reason, limit, source,
+        )
+        return out
+
     if out["ok"]:
         logger.warning(
             "[PUSH DB NAS SYNC] 完了 reason=%s %.1fMB %.1fs src=%s dst=%s",
-            reason, out["bytes"] / 1024 / 1024, out["elapsed_sec"], source, dst,
+            reason, out["bytes"] / 1024 / 1024, out["elapsed_sec"], source, out["dst"],
+        )
+    else:
+        logger.warning(
+            "[PUSH DB NAS SYNC] 失敗 reason=%s src=%s dst=%s err=%s",
+            reason, source, out["dst"], out["error"],
         )
     return out

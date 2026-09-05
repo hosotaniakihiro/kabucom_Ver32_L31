@@ -185,3 +185,82 @@ def test_writer_syncs_on_stop_and_rotate():
 
     assert "_sync_to_nas_safe" in inspect.getsource(StreamDBWriter.stop)
     assert "_sync_to_nas_safe" in inspect.getsource(StreamDBWriter._rotate_if_needed_locked)
+
+
+# ============================================================
+# 5. NAS がハングしても取り込みを止めないこと
+#    (2026-09-05 のユーザー報告: 最近 NAS がハングすることがある)
+#    SMB のハングは sqlite3 の timeout では抜けられず OS の I/O で
+#    ブロックするので、時間で見切れることを固定しておく。
+# ============================================================
+
+def test_sync_gives_up_when_nas_hangs(loc, monkeypatch):
+    """複製が終わらなくても呼び出し側は返ってくること。"""
+    import threading
+    import time as _time
+
+    _make_db(loc.push_db_path(), rows=10).close()
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def _hang(*a, **k):
+        started.set()
+        release.wait(30)          # NAS が返ってこない状態を作る
+        # 解放されたら静かに終わる (放置スレッドが例外を出すと
+        # pytest が warning を出すだけで、検証したいことではない)
+
+    monkeypatch.setattr(loc, "_do_backup", lambda *a, **k: _hang())
+
+    t0 = _time.perf_counter()
+    res = loc.sync_to_nas(reason="hang", timeout_sec=1.0)
+    elapsed = _time.perf_counter() - t0
+
+    assert started.wait(5), "複製ワーカーが起動していない"
+    assert res["timed_out"] is True
+    assert res["ok"] is False
+    assert elapsed < 10, f"見切りに {elapsed:.1f}s かかった (呼び出し側が固まっている)"
+    release.set()
+
+
+def test_second_sync_is_skipped_while_one_is_stuck(loc, monkeypatch):
+    """詰まっている間に複製を重ねない (SMB セッションを食い潰さないため)。"""
+    import threading
+
+    _make_db(loc.push_db_path(), rows=10).close()
+
+    release = threading.Event()
+    monkeypatch.setattr(loc, "_do_backup", lambda *a, **k: release.wait(30))
+
+    first = loc.sync_to_nas(reason="stuck", timeout_sec=0.5)
+    assert first["timed_out"] is True
+
+    second = loc.sync_to_nas(reason="next", timeout_sec=0.5)
+    assert second["skipped"] is True, "詰まっているのに複製を重ねている"
+    release.set()
+
+
+def test_rotate_does_not_wait_for_nas():
+    """ローテーションは writer のロックを握ったまま呼ばれる。
+
+    ここで NAS を待つと、日付が変わる瞬間に NAS がハングしたとき
+    PUSH の取り込みごと止まる。必ず wait=False で投げること。
+    """
+    import inspect
+
+    from trading.push.push_db_writer import StreamDBWriter
+
+    src = inspect.getsource(StreamDBWriter._rotate_if_needed_locked)
+    assert "wait=False" in src, "ローテーションが NAS の複製を待っている"
+
+
+def test_stop_sync_has_a_deadline():
+    """停止時の複製は待つが、無限には待たない。"""
+    import inspect
+
+    from trading.push import push_db_writer as m
+
+    src = inspect.getsource(m.StreamDBWriter.stop)
+    assert "timeout_sec=" in src, "停止時の複製に上限が無い"
+    assert "slot_wait_sec=" in src, "定期複製と重なったとき最後のぶんを取りこぼす"
+    assert m._push_nas_sync_stop_timeout_sec() > 0
