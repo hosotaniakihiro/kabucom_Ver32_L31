@@ -7637,3 +7637,97 @@ read-only で開くので稼働中でも安全。第24ラウンドで push DB �
 1 日 34 サンプルの結果であり、**これだけで設定を変えるべきではない**。
 リプレイツールは日付を指定して過去日にも使える (`--date 20260904`)。
 NAS 上に 09-01 以降の push DB があるので、複数日で確認してから判断する。
+
+## 第27ラウンド — エントリー 0 件の真因は ranking DB の NAS 読み取りだった (2026-09-07)
+
+### 追跡
+
+第26ラウンドで「全フィルタを通過した 4 件が発注されていない」を本命と
+した。その 4 件を追うと RANKING 経路に行き着き、そこで止まっていた。
+
+```
+[RANKING ENTRY SOURCE DB FALLBACK] indexed read aborted
+    table=ranking_snapshot_1min elapsed=2.104s budget=2.0s err=interrupted
+[RANKING ENTRY SOURCE DB FALLBACK] rowid read failed elapsed=2.168s err=interrupted
+[RANKING ENTRY SOURCE DB FALLBACK] deadline exceeded deadline=8.0s elapsed=8.0s
+    -> use last-good rows=0
+[RANKING ENTRY LOOP] skip reason=no_ranking_df          (本日 64 回)
+-> [RANKING ENTRY SCHEDULE] pending build done created=0 (80 回中 77 回)
+-> 発注 0
+```
+
+**ranking DB は NAS 上で 427MB + WAL 129MB**。`ranking_snapshot_1min` の
+読み取りが 2 秒の予算にも 8 秒の締切にも間に合わず、`err=interrupted`
+で打ち切られる。読めないので候補が作れず、`AI_OK` が 3,924 件出ていても
+発注に至らない。
+
+**障害時の堅牢性の話ではなく、平常時に毎日エントリーを止めていた。**
+第25ラウンドで「ranking は 30 箇所あるので別ラウンド」と保留した部分が、
+そのまま当事者だった。
+
+### 移行が現実的だった理由
+
+30 箇所と数えたが、実際には**根が 2 つの定数**に集約されていた:
+
+| 定数 | 役割 |
+|---|---|
+| `database/paths/ranking_paths.py: DEFAULT_RANKING_DIR` | writer (`get_ranking_db_path`) |
+| `ats/ats_ranking/constants.py: RANKING_DB_ROOT` | ATS リゾルバ。`entry_from_ranking` が最優先で使う |
+
+残りは独自に候補リストを組む 5 箇所だけだった。
+
+### 修正
+
+| ファイル | 内容 |
+|---|---|
+| `trading/ranking/ranking_db_location.py` (新規) | 置き場所の判断を集約。既定ローカル、NAS へは複製。`utils/nas_guard.py` で締め切り付き |
+| `database/paths/ranking_paths.py` | 既定を resolver 経由に。**引数のデフォルトに固定していたのを None 経由へ** (import 時に決まると env 切り替えが効かない) |
+| `ats/ats_ranking/constants.py` | `RANKING_DB_ROOT` を resolver 経由に |
+| `trading/ranking/ranking_db_writer.py` | 停止時の NAS 複製 + 場中の定期複製スレッド |
+| `trading/filters/volatility_filter.py` | 候補リストの先頭にローカルを追加 (2 箇所) |
+| `trading/push/subscription_manager/ranking_source_paths.py` | `RANKING_DB_BASE_DIRS` の先頭へ |
+| `trading/push/subscription_manager/ranking_selector.py` | resolver 経由 |
+| `trading/push/push_stream/rotation_stability.py` | 候補の先頭へ |
+| `trading/handlers/entry_precheck_ranking.py` | resolver 経由 |
+| `trading/entry/volume_direction_guard.py` | resolver 経由 |
+
+読み手は「ローカル → NAS」の候補順にしてあるので、移行から漏れても
+NAS 側に落ちて動き続ける。ただし NAS 側は複製なので最大で複製間隔ぶん
+古い。**古いデータを黙って読む状態は「読めない」より悪い**ので、
+回帰テストで「writer と読み手が同じ場所を返す」ことを固定した。
+
+### 追加した回帰テスト
+
+`test_script/p0_round27/test_r27_ranking_db_local_staging.py` (13 件)
+
+1. 既定がローカル / `RANKING_DB_LOCAL_STAGING=0` で戻せる / env 指定が最優先
+2. 候補リストの先頭が必ずローカル
+3. **writer (`get_ranking_db_path`) と ATS リゾルバが同じパスを返す**
+4. **既定値が import 時に固定されていない** (env 切り替えが効くこと)
+5. 移行から漏れた読み手が無いこと (5 モジュールが resolver を経由)
+6. 複製が全行を運び integrity_check=ok / 失敗しても既存の複製を壊さない
+7. NAS がハングしても呼び出し側が返る / 一時ファイルを残さない
+
+### 環境変数
+
+    RANKING_DB_LOCAL_STAGING          0 で従来どおり NAS 直書き
+    RANKING_DB_LOCAL_DIR              既定 %LOCALAPPDATA%\autostock\ranking
+    RANKING_DB_NAS_SYNC_INTERVAL_MIN  既定 30
+    RANKING_DB_NAS_SYNC_TIMEOUT_SEC   既定 180
+
+### 本日の運用実績 (ローカル化済みの push DB / ログ)
+
+* PUSH 受信 431,989 / **dropped 0** / register 成功のみ
+* 12:24 に X: と Y: のマッピングが外れる NAS 障害が発生
+  (`STATUS_IN_PAGE_ERROR` で ranking_collector と push_receiver が 1 回ずつ異常終了)
+* **ローカルへ移した push DB とログは無傷**。ログが生きていたので障害を追跡できた
+* 再マップだけでは復旧せず (古い SQLite 接続を掴んだまま)、再起動が必要だった。
+  これは手順書に追記すべき
+
+### 明日の確認事項
+
+1. `[RANKING ENTRY LOOP] skip reason=no_ranking_df` が出ないこと
+2. `[RANKING ENTRY SCHEDULE] pending build done created=` が 0 以外になること
+3. `[RANKING DB NAS SYNC] 完了` が 30 分ごとに出ること
+4. 大引け後に NAS 側の `ranking20260908.db` が揃うこと
+5. 発注が出た場合、第26ラウンドのリプレイと突き合わせる

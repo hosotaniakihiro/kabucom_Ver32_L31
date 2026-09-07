@@ -38,7 +38,17 @@ try:
 except Exception:  # pragma: no cover - runtime fallback
     get_usable_ranking_db_path = None
 
-RANKING_DB_DIR = get_path("raw_ranking")
+def _ranking_db_dir():
+    """2026-09-07: ranking DB をローカルへ移したので、そちらを見る。"""
+    try:
+        from trading.ranking import ranking_db_location
+
+        return ranking_db_location.ranking_db_dir()
+    except Exception:
+        return get_path("raw_ranking")
+
+
+RANKING_DB_DIR = _ranking_db_dir()
 SNAPSHOT_TABLE = "ranking_snapshot_1min"
 RAW_FALLBACK_TABLES = (
     "ranking_raw_1min",

@@ -79,6 +79,13 @@ def _iter_existing_db_paths(kind: str) -> list[str]:
             continue
         root = str(root).rstrip("\\/")
         if kind == "ranking":
+            # 2026-09-07: ローカルを先に見る (ranking DB をローカルへ移したため)
+            try:
+                from trading.ranking import ranking_db_location
+
+                paths.append(str(ranking_db_location.ranking_db_dir() / f"ranking{ymd}.db"))
+            except Exception:
+                pass
             paths.extend([
                 rf"{root}\kabu_station\ranking\ranking{ymd}.db",
                 rf"{root}\ranking\ranking{ymd}.db",

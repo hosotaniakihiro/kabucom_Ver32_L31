@@ -490,10 +490,68 @@ class RankingDBWriter:
     # R18: 背景 checkpoint スレッド (プロセスで 1 本だけ)
     _BG_CKPT_LOCK = threading.Lock()
     _BG_CKPT_THREAD: Optional[threading.Thread] = None
+
+    # 2026-09-07: 場中の NAS 複製スレッド (プロセスで 1 本だけ)
+    _BG_NAS_SYNC_LOCK = threading.Lock()
+    _BG_NAS_SYNC_THREAD: Optional[threading.Thread] = None
     _BG_CKPT_STATS: dict = {
         "runs": 0, "busy": 0, "frames": None, "checkpointed": None,
         "errors": 0, "last_elapsed": None, "last_at": None,
     }
+
+    def _start_bg_nas_sync(self, db_path: str) -> None:
+        """場中の定期複製。ranking DB をローカルへ移したので NAS へ複製する。
+
+        複製は 1 回で数十秒かかりうるので flush ループには載せない。
+        NAS がハングしても取り込みを止めない (utils/nas_guard.py)。
+        """
+        try:
+            from trading.ranking import ranking_db_location
+        except Exception:
+            logger.exception("[RANKING DB NAS SYNC] ranking_db_location を読めない")
+            return
+
+        if not ranking_db_location.local_staging_enabled():
+            return
+        interval = ranking_db_location.nas_sync_interval_sec()
+        if interval <= 0:
+            logger.warning("[RANKING DB NAS SYNC] 定期複製は無効 (停止時のみ複製する)")
+            return
+
+        cls = RankingDBWriter
+        with cls._BG_NAS_SYNC_LOCK:
+            th = cls._BG_NAS_SYNC_THREAD
+            if th is not None and th.is_alive():
+                return
+
+            def _loop() -> None:
+                logger.warning(
+                    "[RANKING DB NAS SYNC] 定期複製を開始 interval=%.0fmin timeout=%.0fs src=%s",
+                    interval / 60.0, ranking_db_location.sync_timeout_sec(), db_path,
+                )
+                while True:
+                    time.sleep(interval)
+                    try:
+                        ranking_db_location.sync_to_nas(reason="periodic")
+                    except Exception:
+                        logger.exception("[RANKING DB NAS SYNC] 定期複製で例外")
+
+            t = threading.Thread(target=_loop, daemon=True, name="ranking_db_nas_sync")
+            t.start()
+            cls._BG_NAS_SYNC_THREAD = t
+
+    def _sync_to_nas_safe(self, *, reason: str, timeout_sec=None) -> None:
+        """NAS への複製。失敗しても取り込みは止めない。"""
+        try:
+            from trading.ranking import ranking_db_location
+
+            if not ranking_db_location.local_staging_enabled():
+                return
+            ranking_db_location.sync_to_nas(
+                reason=reason, timeout_sec=timeout_sec, slot_wait_sec=timeout_sec or 0.0
+            )
+        except Exception:
+            logger.exception("[RANKING DB WRITER] NAS 複製に失敗 reason=%s", reason)
 
     def _start_bg_checkpoint(self, db_path: str) -> None:
         """WAL checkpoint を writer の commit 経路から外して専用スレッドで回す。"""
@@ -694,6 +752,7 @@ class RankingDBWriter:
 
         if bg_ckpt:
             self._start_bg_checkpoint(str(db_path))
+            self._start_bg_nas_sync(str(db_path))
 
     def _ensure_connection(self) -> None:
         if self.conn is None or self.cursor is None:
@@ -826,6 +885,10 @@ class RankingDBWriter:
             self.cursor = None
             self._started = False
             self._mark_runtime()
+
+        # 接続を閉じてから複製する。大引け後の停止で今日ぶんが NAS へ渡る。
+        # 待つが無限には待たない (NAS がハングすると停止できなくなる)。
+        self._sync_to_nas_safe(reason="stop", timeout_sec=120.0)
 
     def _loop(self) -> None:
         logger.info("[RANKING DB WRITER] loop started")
@@ -1876,6 +1939,14 @@ def _rdl_open_dedicated_connection(db_path: Path, busy_timeout_ms: int) -> sqlit
             pass
         try:
             mmap_size = _rdl_env_int("RANKING_WRITER_MMAP_SIZE", 268435456)
+            # 2026-09-02 P0: NAS 上では mmap を使わない
+            # (SMB の mmap ページフォルト = EXCEPTION_IN_PAGE_ERROR でプロセス即死)
+            try:
+                from core.startup.sqlite_memory_pragmas import resolve_mmap_size_bytes
+
+                mmap_size = int(resolve_mmap_size_bytes(db_path, mmap_size))
+            except Exception:
+                pass
             if mmap_size > 0:
                 _rdl_exec_and_drain(cur, f"PRAGMA mmap_size={mmap_size};")
         except Exception:

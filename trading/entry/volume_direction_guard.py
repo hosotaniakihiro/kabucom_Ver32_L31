@@ -136,6 +136,14 @@ def _ranking_db_path() -> str:
             return str(p)
     except Exception:
         pass
+    # 2026-09-07: ranking DB はローカルへ移した。ここを NAS 固定にすると
+    # この経路だけ複製 (最大で複製間隔ぶん古い) を読むことになる。
+    try:
+        from trading.ranking import ranking_db_location
+
+        return str(ranking_db_location.ranking_db_path())
+    except Exception:
+        pass
     today = dt.datetime.now().strftime("%Y%m%d")
     root = os.getenv("AUTOSTOCK_ROOT", nas_root())
     return os.path.join(root, "raw_data", "kabu_station", "ranking", f"ranking{today}.db")

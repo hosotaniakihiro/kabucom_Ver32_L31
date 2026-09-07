@@ -87,7 +87,24 @@ def _get_nas_root() -> str:
 
 def _default_ranking_db_path(yyyymmdd: Any = None) -> str:
     d = _normalize_yyyymmdd(yyyymmdd)
+    # 2026-09-07: ranking DB はローカルへ移した。ここを NAS 固定にすると
+    # この経路だけ複製 (最大で複製間隔ぶん古い) を読むことになる。
+    try:
+        from trading.ranking import ranking_db_location
+
+        return str(ranking_db_location.ranking_db_path(_as_date(d)))
+    except Exception:
+        pass
     return str(Path(_get_nas_root()) / "raw_data" / "kabu_station" / "ranking" / f"ranking{d}.db")
+
+
+def _as_date(yyyymmdd: str):
+    import datetime as _dt
+
+    try:
+        return _dt.datetime.strptime(str(yyyymmdd), "%Y%m%d").date()
+    except Exception:
+        return None
 
 
 def _resolve_ranking_db_path(db_path: Optional[str | os.PathLike] = None, yyyymmdd: Any = None) -> Optional[str]:

@@ -88,6 +88,21 @@ _BASE_ENTRY_ROW_RANGE_MIN_PCT = 0.006
 # DISABLE_TONOSAMA_HISTORY_MISSING_GUARD_PATCH=1 のときだけ素の値に戻す。
 # ----------------------------------------------------------
 
+def _local_ranking_dir_first() -> str:
+    """ranking DB のローカル置き場。解決できなければ空文字。
+
+    2026-09-07: ranking DB をローカルへ移した。候補リストの先頭に
+    入れておかないと、この経路だけ NAS の複製 (最大で複製間隔ぶん古い)
+    を読むことになる。
+    """
+    try:
+        from trading.ranking import ranking_db_location
+
+        return str(ranking_db_location.ranking_db_dir())
+    except Exception:
+        return ""
+
+
 def _hg_env_float(name: str, default: float) -> float:
     try:
         v = os.getenv(name)
@@ -456,6 +471,7 @@ def _ranking_db_candidate_paths() -> list[str]:
     base_dirs = [
         os.environ.get("RANKING_DB_DIR"),
         os.environ.get("KABU_RANKING_DB_DIR"),
+        _local_ranking_dir_first(),   # 2026-09-07: ローカルを先に見る
         nas_path(r"raw_data\kabu_station\ranking"),
         nas_path(r"raw_data\kabu_station\Ranking"),
         os.path.join(os.getcwd(), "raw_data", "kabu_station", "ranking"),
@@ -692,6 +708,7 @@ def _vol_filter_rescue_timebox_candidate_paths() -> list[str]:
     for d_ in (
         os.getenv("RANKING_DB_DIR"),
         os.getenv("KABU_RANKING_DB_DIR"),
+        _local_ranking_dir_first(),   # 2026-09-07: ローカルを先に見る
         nas_path(r"raw_data\kabu_station\ranking"),
         nas_path(r"raw_data\kabu_station\Ranking"),
     ):

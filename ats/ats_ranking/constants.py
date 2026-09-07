@@ -6,7 +6,25 @@
 
 from nas_root import nas_path, nas_root
 
-RANKING_DB_ROOT = nas_path(r"raw_data\kabu_station\ranking")
+
+def _ranking_db_root() -> str:
+    """ranking DB の置き場所。
+
+    2026-09-07: 既定を NAS からローカルへ移した。NAS 越しの
+    `ranking_snapshot_1min` 読み取りが 2 秒の予算に間に合わず
+    err=interrupted になり、候補が作れずエントリーが 0 件だった。
+    ここは ats/ats_ranking/db_path.py が使う唯一の根で、
+    trading/ranking/entry_from_ranking.py もそれを経由している。
+    """
+    try:
+        from trading.ranking import ranking_db_location
+
+        return str(ranking_db_location.ranking_db_dir())
+    except Exception:
+        return nas_path(r"raw_data\kabu_station\ranking")
+
+
+RANKING_DB_ROOT = _ranking_db_root()
 
 PRIMARY_TABLES = [
     "ranking_snapshot_1min",
