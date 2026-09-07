@@ -230,6 +230,19 @@ class StreamDBWriter:
 
         if not push_db_location.local_staging_enabled():
             return
+
+        # 2026-09-07: 実際に PUSH DB を書いているプロセスだけが複製する。
+        # main_database と push_receiver の両方がこのスレッドを立てており、
+        # 同じ NAS ファイルへ 2 本の複製が走っていた (09:19 に 0.0MB と
+        # 78.5MB が 17 秒差で完了)。add_push_row には既にオーナーガードが
+        # あるのに、複製側には無かった。
+        if _should_skip_push_db_writer_here():
+            logger.warning(
+                "[PUSH DB NAS SYNC] このプロセスは PUSH DB の書き手ではないので定期複製しない pid=%s",
+                os.getpid(),
+            )
+            return
+
         interval = push_db_location.nas_sync_interval_sec()
         if interval <= 0:
             logger.warning("[PUSH DB NAS SYNC] 定期複製は無効 (停止時とローテーション時のみ複製する)")

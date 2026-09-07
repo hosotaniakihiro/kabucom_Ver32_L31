@@ -264,3 +264,74 @@ def test_stop_sync_has_a_deadline():
     assert "timeout_sec=" in src, "停止時の複製に上限が無い"
     assert "slot_wait_sec=" in src, "定期複製と重なったとき最後のぶんを取りこぼす"
     assert m._push_nas_sync_stop_timeout_sec() > 0
+
+
+# ============================================================
+# 6. 複製が同時に 2 本走っても NAS の複製を壊さないこと
+#    (2026-09-07 実測: main_database と push_receiver が両方
+#     定期複製スレッドを立てており、同じ NAS ファイルへ
+#     0.0MB と 78.5MB が 17 秒差で完了していた)
+# ============================================================
+
+def test_sync_writes_via_tmp_and_replaces(loc):
+    """直接 dst へ書かない。出来上がってから置き換える。"""
+    import inspect
+
+    src = inspect.getsource(loc._do_backup)
+    assert "os.replace" in src, "一時ファイルからの置き換えになっていない"
+    assert ".tmp" in src
+
+
+def test_sync_leaves_no_tmp_behind(loc):
+    conn = _make_db(loc.push_db_path(), rows=50)
+    try:
+        assert loc.sync_to_nas(reason="tmp")["ok"] is True
+    finally:
+        conn.close()
+    leftovers = [p.name for p in loc.nas_push_db_path().parent.iterdir() if ".tmp" in p.name]
+    assert leftovers == [], f"一時ファイルが残っている: {leftovers}"
+
+
+def test_existing_copy_survives_a_failed_sync(loc, monkeypatch):
+    """複製に失敗しても、前回の正常な複製を壊さない。
+
+    直接 dst へ backup していると、失敗や空の複製で NAS 側が壊れる。
+    """
+    conn = _make_db(loc.push_db_path(), rows=777)
+    try:
+        assert loc.sync_to_nas(reason="first")["ok"] is True
+        dst = loc.nas_push_db_path()
+        good = dst.stat().st_size
+
+        real_connect = sqlite3.connect
+
+        def _fail_on_tmp(path, *a, **k):
+            if ".tmp" in str(path):
+                raise OSError("複製先に書けない")
+            return real_connect(path, *a, **k)
+
+        monkeypatch.setattr(sqlite3, "connect", _fail_on_tmp)
+        res = loc.sync_to_nas(reason="second")
+        assert res["ok"] is False
+    finally:
+        conn.close()
+
+    assert dst.stat().st_size == good, "失敗した複製が既存の複製を壊した"
+    check = sqlite3.connect(str(dst))
+    try:
+        assert check.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 777
+        assert check.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        check.close()
+
+
+def test_only_the_push_db_owner_starts_periodic_sync():
+    """書き手でないプロセスは定期複製スレッドを立てない。"""
+    import inspect
+
+    from trading.push.push_db_writer import StreamDBWriter
+
+    src = inspect.getsource(StreamDBWriter._start_bg_nas_sync)
+    assert "_should_skip_push_db_writer_here" in src, (
+        "複製側にオーナーガードが無い (2 プロセスが同じ NAS ファイルを書く)"
+    )

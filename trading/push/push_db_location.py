@@ -166,21 +166,47 @@ def _do_backup(source: Path, date: Optional[dt.date], pages: int, sleep_sec: flo
     """
     src_conn = None
     dst_conn = None
+    tmp: Optional[Path] = None
     try:
         dst = nas_push_db_path(date)
         out["dst"] = str(dst)
         dst.parent.mkdir(parents=True, exist_ok=True)
+
+        # 2026-09-07: 完成品を作ってから置き換える。
+        #
+        # 本番で複製が 2 回走っているのを観測した (main_database と
+        # push_receiver がどちらも定期複製スレッドを持っていた)。
+        #   09:19:03 reason=periodic  0.0MB
+        #   09:19:20 reason=periodic 78.5MB
+        # 直接 dst へ backup していると、順序次第で中身の薄いほうが
+        # 後に書かれて NAS の複製が壊れる。プロセスごとに一時ファイルを
+        # 作り、出来上がってから os.replace で差し替える (同一共有内なら原子的)。
+        tmp = dst.with_name(dst.name + ".tmp%d" % os.getpid())
+        for suf in ("", "-wal", "-shm"):
+            q = Path(str(tmp) + suf)
+            if q.exists():
+                try:
+                    q.unlink()
+                except Exception:
+                    pass
+
         # 書き込み中の DB が相手なので read-only では開かない
         # (WAL の読み取りに -shm への書き込みが要る)。
         src_conn = sqlite3.connect(str(source), timeout=60.0)
-        dst_conn = sqlite3.connect(str(dst), timeout=60.0)
+        dst_conn = sqlite3.connect(str(tmp), timeout=60.0)
         src_conn.backup(dst_conn, pages=int(pages), sleep=float(sleep_sec))
         dst_conn.commit()
+        dst_conn.close()
+        dst_conn = None
+
+        size = tmp.stat().st_size
+        if size <= 0:
+            raise OSError("複製が空になった (置き換えない)")
+
+        os.replace(str(tmp), str(dst))
+        tmp = None
         out["ok"] = True
-        try:
-            out["bytes"] = dst.stat().st_size
-        except Exception:
-            pass
+        out["bytes"] = size
     except Exception as e:
         out["error"] = "%s: %s" % (type(e).__name__, e)
     finally:
@@ -190,6 +216,15 @@ def _do_backup(source: Path, date: Optional[dt.date], pages: int, sleep_sec: flo
                     c.close()
             except Exception:
                 pass
+        # 失敗した一時ファイルを残さない
+        if tmp is not None:
+            for suf in ("", "-wal", "-shm"):
+                q = Path(str(tmp) + suf)
+                try:
+                    if q.exists():
+                        q.unlink()
+                except Exception:
+                    pass
 
 
 def sync_to_nas(
