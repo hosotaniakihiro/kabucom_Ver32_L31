@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import time
 from typing import Any, List
@@ -143,7 +144,25 @@ def _init_order_book_writer() -> Any:
 
     try:
         if OrderBookDBWriter is not None:
-            writer = OrderBookDBWriter()
+            # ------------------------------------------------------------
+            # 2026-09-03 P0: OrderBook writer が 100 行ごとに commit していた。
+            #
+            # 本番実測 (12:51 後場、SMB):
+            #   push DB   executemany 500 行 = 0.098s / commit = 8.0s
+            #   OrderBook 100 行ごとに commit -> 1000 行の flush で
+            #             [OrderBookDB] flushed rows=100 が 10 本以上並び、
+            #             これが flush サイクル全体を律速していた
+            #             (flushed_per_min が 0 のまま queue が 5,451 まで増加)。
+            # commit のコストは行数にほぼ依存しないので、まとめる。
+            # ------------------------------------------------------------
+            try:
+                _ob_buf = int(os.getenv("PUSH_ORDER_BOOK_BUFFER_SIZE", "1000"))
+            except Exception:
+                _ob_buf = 1000
+            try:
+                writer = OrderBookDBWriter(buffer_size=max(1, _ob_buf))
+            except TypeError:
+                writer = OrderBookDBWriter()
             try:
                 start = getattr(writer, "start", None)
                 if callable(start):
@@ -331,12 +350,16 @@ def _flush_rows(rows: List[dict]) -> bool:
 
 
 def _flush_worker() -> None:
+    from . import start_trace
+
     if _should_skip_push_stream_db_work_here():
         _safe_set_runtime("push_writer_running", False)
+        start_trace.abort(5, "flush_worker_skipped_main_memory_only")
         logger.warning("[push_stream] flush worker not started in main memory-only mode")
         return
 
     _safe_set_runtime("push_writer_running", True)
+    start_trace.trace(5, phase="worker_loop_entered", writer_ready=state._stream_writer is not None)
     logger.info("[push_stream] flush worker started")
 
     batch: List[dict] = []
@@ -351,10 +374,33 @@ def _flush_worker() -> None:
             except queue.Empty:
                 pass
 
+            # ------------------------------------------------------------
+            # 2026-09-03 P0: queue から一気に汲む。
+            #
+            # 旧実装は 1 ループ 1 行しか取らないため、
+            #   - 100 行の batch を作るのに 100 ループ必要
+            #   - しかも直前の commit が 12 秒かかると、次のループで
+            #     「時間条件」が即成立し **1 行だけの batch を commit** していた
+            # 実測ログはまさに buffer=1 と buffer=100 が交互に並び、
+            # 高価な commit の半分が 1 行のために使われていた。
+            # ------------------------------------------------------------
+            if len(batch) < FLUSH_BATCH_SIZE:
+                try:
+                    while len(batch) < FLUSH_BATCH_SIZE:
+                        batch.append(state._push_queue.get_nowait())
+                except queue.Empty:
+                    pass
+
             now_ts = time.time()
+            pending = 0
+            try:
+                pending = state._push_queue.qsize()
+            except Exception:
+                pending = 0
             should_flush = (
                 len(batch) >= FLUSH_BATCH_SIZE
-                or bool(batch and (now_ts - last_flush_ts) >= FLUSH_INTERVAL_SEC)
+                or bool(batch and (now_ts - last_flush_ts) >= FLUSH_INTERVAL_SEC and pending == 0)
+                or bool(batch and (now_ts - last_flush_ts) >= FLUSH_INTERVAL_SEC * 5)
             )
 
             if should_flush:
@@ -362,7 +408,9 @@ def _flush_worker() -> None:
                 if ok:
                     batch = []
                     consecutive_failures = 0
-                    last_flush_ts = now_ts
+                    # commit 後の時刻を使う。commit 前の now_ts を使うと、
+                    # 12 秒かかった直後に時間条件が即成立して 1 行 commit になる。
+                    last_flush_ts = time.time()
                 else:
                     consecutive_failures += 1
                     _requeue_rows(batch, reason=f"flush_failed_{consecutive_failures}")

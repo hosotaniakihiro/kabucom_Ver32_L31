@@ -260,7 +260,22 @@ def _call_refresh(force: bool = True, reason: str = "on_open", **kwargs) -> Any:
         return None
 
     if not allow_ws_closed and (not state._connected_event.is_set() or not _is_ws_alive()):
-        logger.warning("[push_stream] refresh skipped reason=%s ws_not_ready", reason_s)
+        if _is_rotation_reason(reason_s):
+            # rotation の登録は REST (PUT /kabusapi/register) なので本来 WS の生死とは無関係。
+            # ここへ来るのは PUSH_ROTATION_REGISTER_WITH_WS_CLOSED=0 のときだけで、
+            # そうすると「登録できない -> kabu Station が PUSH を切る -> 切れているから
+            # 登録できない」の相互ロックになり reconnect storm になる
+            # (2026-09-02 実測: generation=171 まで継続)。設定ミスとして目立たせる。
+            logger.error(
+                "[push_stream] refresh skipped reason=%s ws_not_ready "
+                "(rotation の登録は REST なので WS 不要。"
+                "PUSH_ROTATION_REGISTER_WITH_WS_CLOSED=1 にしないと"
+                "銘柄登録の経路が無くなり reconnect storm になる)",
+                reason_s,
+            )
+            _safe_set_runtime("push_rotation_register_blocked_by_ws_guard", True)
+        else:
+            logger.warning("[push_stream] refresh skipped reason=%s ws_not_ready", reason_s)
         return None
 
     skip, skip_reason = _refresh_recent_or_running(reason_s)

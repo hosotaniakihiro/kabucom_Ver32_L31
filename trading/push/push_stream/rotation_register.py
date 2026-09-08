@@ -170,7 +170,26 @@ def register_symbols(symbols: Iterable[str], force: bool = False, **kwargs: Any)
     cleaned, raw_count, filler_count, invalid_count = clean_symbol_list(symbols)
     items = cleaned[:DEFAULT_REGISTER_CHUNK_SIZE]
 
+    from . import start_trace
+
+    start_trace.trace(
+        10,
+        size=len(items),
+        raw=raw_count,
+        filler=filler_count,
+        invalid=invalid_count,
+        head=items[:5],
+        reason=str(kwargs.get("reason") or "rotation"),
+    )
+
     if not items:
+        start_trace.abort(
+            10,
+            "empty_after_filter",
+            raw=raw_count,
+            filler=filler_count,
+            invalid=invalid_count,
+        )
         logger.warning(
             "[push_stream] register_symbols skipped: empty_after_filter raw=%d filler=%d invalid=%d",
             raw_count,
@@ -179,6 +198,7 @@ def register_symbols(symbols: Iterable[str], force: bool = False, **kwargs: Any)
         )
         return False
     if not callable(state._refresh_callable):
+        start_trace.abort(10, "refresh_callable_missing", size=len(items))
         logger.warning(
             "[push_stream] register_symbols skipped: refresh callable missing size=%d head=%s",
             len(items),
@@ -235,9 +255,14 @@ def register_symbols(symbols: Iterable[str], force: bool = False, **kwargs: Any)
             result,
             len(items),
         )
+        if ok:
+            start_trace.trace(11, size=len(items), reason=reason, label=label)
+        else:
+            start_trace.abort(11, "refresh_result_not_ok", size=len(items), reason=reason, result=repr(result))
         return ok
 
     except Exception:
+        start_trace.abort(11, "refresh_call_exception", size=len(items), reason=reason)
         logger.exception(
             "[push_stream] refresh call failed reason=%s size=%d",
             reason,

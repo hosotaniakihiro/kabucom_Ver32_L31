@@ -240,6 +240,18 @@ def on_message(ws: websocket.WebSocketApp, message: Any) -> None:
         _safe_set_runtime("last_push_received_at", _safe_iso(state._last_message_at))
         state._total_received += 1
 
+        try:
+            from . import start_trace
+
+            start_trace.trace_once(
+                "conn:%s:first_message" % current_connection_generation(),
+                12,
+                bytes=raw_len,
+                received_total=state._total_received,
+            )
+        except Exception:
+            pass
+
         payload = _parse_message(message)
         row = _normalize_push_row(payload)
         if not row:
@@ -504,6 +516,12 @@ def on_open(ws: websocket.WebSocketApp) -> None:
     state._connected_event.set()
     _install_sender(ws)
     _safe_set_runtime("ws_connected", True)
+    try:
+        from . import start_trace
+
+        start_trace.trace_once("conn:%s:on_open" % conn_gen, 9, connection_generation=conn_gen)
+    except Exception:
+        logger.debug("[push_stream] start trace 09 failed", exc_info=True)
 
     # 重要:
     # main.py memory-only mode では rotation_enabled=False のことがある。

@@ -475,6 +475,39 @@ def _feed_backoff_sec(fail_streak: int, interval: float) -> float:
     return max(interval, min(cap, ladder[idx]))
 
 
+def _request_push_reconnect_once() -> bool:
+    """PUSH の再接続を「所有プロセスだけが」1 回行う。
+
+    kabu Station の PUSH は 1 セッションしか張れない。
+    このプロセスが所有者でないなら **絶対に接続しない**
+    (2 本目を張ると互いを切り合い、数秒おきの切断が延々と続く)。
+    所有していない場合は False を返し、呼び出し側はログだけ残す。
+    """
+    try:
+        from trading.push.push_stream.ownership import is_push_owner
+
+        owner, role, reason = is_push_owner()
+        if not owner:
+            logger.error(
+                "[MAIN PRICE DB FEED] PUSH 停滞を検知したが、このプロセスは PUSH 所有者ではない "
+                "role=%s reason=%s -> 再接続しない (二重 WS を張らない)。"
+                "push_receiver_runner.py 側を確認すること",
+                role, reason,
+            )
+            return False
+    except Exception:
+        logger.exception("[MAIN PRICE DB FEED] PUSH 所有者判定に失敗 -> 安全側 (再接続しない)")
+        return False
+
+    try:
+        from trading.push.push_stream.runner import request_reconnect
+
+        return bool(request_reconnect(reason="push_stall_guard"))
+    except Exception:
+        logger.exception("[MAIN PRICE DB FEED] PUSH 再接続要求に失敗")
+        return False
+
+
 def _loop() -> None:
     interval = max(0.5, _env_float("MAIN_PUSH_PRICE_DB_FEED_INTERVAL_SEC", 2.0))
     logger.warning(
@@ -486,6 +519,18 @@ def _loop() -> None:
     fail_streak = 0
     idle_streak = 0
     wait_sec = interval
+
+    # PUSH 停滞の検知。実際に WS を張り直すのは所有プロセス側なので、
+    # ここでは「止まっている」ことを 1 回だけ通知し、下流へ stale を
+    # 渡さないための状態を持たせるだけにする。
+    try:
+        from trading.push import push_stall_guard
+    except Exception:
+        push_stall_guard = None  # type: ignore[assignment]
+        logger.debug("[MAIN PRICE DB FEED] push_stall_guard 読み込み失敗", exc_info=True)
+    if push_stall_guard is not None:
+        push_stall_guard.mark_started()
+
     while not _STOP.is_set():
         try:
             _, updated = feed_once()
@@ -506,8 +551,14 @@ def _loop() -> None:
                         idle_streak,
                         interval,
                     )
+                if push_stall_guard is not None:
+                    # 市場時間 / 購読銘柄数 / WS 状態を見たうえで、
+                    # 必要なら 1 回だけ再接続を要求する (連打しない)。
+                    push_stall_guard.check(request_reconnect=_request_push_reconnect_once)
             else:
                 idle_streak = 0
+                if push_stall_guard is not None:
+                    push_stall_guard.note_tick(updated)
         except Exception as e:
             fail_streak += 1
             wait_sec = _feed_backoff_sec(fail_streak, interval)
@@ -549,6 +600,15 @@ def start_latest_price_db_feeder() -> bool:
             logger.info("[MAIN PRICE DB FEED] already running version=%s", VERSION)
             return True
         _STOP.clear()
+        # main.py 側でも PUSH パイプラインの E2E 1 行ログを出す。
+        # (main.py は PUSH WS を張らないので DB より先の段だけが埋まる)
+        try:
+            from trading.push.push_pipeline_probe import start_pipeline_probe
+
+            start_pipeline_probe()
+        except Exception:
+            logger.debug("[MAIN PRICE DB FEED] pipeline probe start failed", exc_info=True)
+
         _THREAD = threading.Thread(target=_loop, name="main-latest-price-db-feed", daemon=True)
         _THREAD.start()
 

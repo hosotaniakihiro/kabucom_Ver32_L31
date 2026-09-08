@@ -22,6 +22,7 @@ from __future__ import annotations
 import importlib
 import logging
 import os
+import sys
 import threading
 import time
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -48,6 +49,16 @@ from .monitor import _monitor_worker
 from .rotation_core import _rotation_worker, enable_rotation
 from .ws_callbacks import on_open, on_message, on_error, on_close
 from .constants import RECONNECT_WAIT_SEC
+from .ws_owner import (
+    acquire_push_ws_owner,
+    active_ws_instance_count,
+    is_push_ws_owner,
+    owned_elsewhere,
+    ownership_snapshot,
+    register_ws_instance,
+    unregister_ws_instance,
+)
+from . import start_trace
 
 logger = logging.getLogger(__name__)
 
@@ -223,7 +234,59 @@ def _set_refresh_callable_preserve(refresh_callable: Optional[Any]) -> bool:
         return callable(existing)
 
 
+def _safe_ppid() -> int:
+    try:
+        return int(os.getppid())
+    except Exception:
+        return -1
+
+
+def _resolve_ws_owner_role() -> str:
+    """このプロセスの PUSH 所有者ロール名 (ログ・ロックメタ用)。"""
+    explicit = os.environ.get("PUSH_WS_OWNER_ROLE")
+    if explicit:
+        return str(explicit).strip()
+    try:
+        argv0 = os.path.basename(str(sys.argv[0] or "")).lower()
+    except Exception:
+        argv0 = ""
+    if "push_receiver" in argv0:
+        return "push_receiver"
+    if "main_database" in argv0:
+        return "main_database"
+    if argv0.startswith("main"):
+        return "main"
+    return argv0 or "unknown"
+
+
+def _rotation_disabled_by_env() -> bool:
+    """rotation を env で明示的に禁止しているか。
+
+    main.py の memory-only fallback は PUSH_ROTATION_ENABLED=0 /
+    PUSH_STREAM_ENABLE_ROTATION=0 を立ててから WS を張るが、
+    呼び出し側が enable_rotate=True を渡していたため env が無視され、
+    所有者でない main.py でも rotation worker が起動して
+    unregister/all を 7 秒おきに撃っていた (2026-08-31 実測)。
+    env の明示 OFF は引数より強くする。
+    """
+    for name in ("PUSH_ROTATION_ENABLED", "PUSH_STREAM_ENABLE_ROTATION"):
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        if str(raw).strip().lower() in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+            logger.warning("[push_stream] rotation disabled by env %s=%s", name, raw)
+            return True
+    return False
+
+
 def _set_rotation_preserve(enable_rotate: Optional[bool]) -> bool:
+    if _rotation_disabled_by_env():
+        try:
+            enable_rotation(False)
+        except Exception:
+            logger.exception("[push_stream] enable_rotation(False) failed")
+        return False
+
     if enable_rotate is None:
         current = bool(getattr(state, "_rotation_enabled", False))
         logger.info("[push_stream] preserve rotation enabled=%s", current)
@@ -314,6 +377,27 @@ def reset_reconnect_stats_for_test() -> None:
     _RECONNECT_TOTAL = 0
 
 
+def _reconnect_backoff_ladder() -> list:
+    """即死が続くときの待機秒ラダー (既定 1,2,4,8,15 秒で頭打ち)。
+
+    従来は base * 2**(n-1) を max_wait で頭打ちにしていたが、
+    max_wait の既定が 1.0 秒だったため 300 回連続の即死でも
+    1 秒間隔で再接続を撃ち続け、kabu Station とローカル資源を
+    無駄に叩いていた (2026-08-31 実測 consecutive=316 / next wait=1.0s)。
+    """
+    raw = os.environ.get("PUSH_STREAM_RECONNECT_BACKOFF_LADDER_SEC", "1,2,4,8,15")
+    out = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(max(0.0, float(part)))
+        except Exception:
+            continue
+    return out or [1.0, 2.0, 4.0, 8.0, 15.0]
+
+
 def _note_disconnect_and_wait(
     uptime: float,
     *,
@@ -338,9 +422,12 @@ def _note_disconnect_and_wait(
         verdict = "fast_death"
 
     if _RECONNECT_CONSECUTIVE <= 1:
+        # 単発の切断はこれまで通り即復帰する (遅くしない)。
         wait_sec = base
     else:
-        wait_sec = min(max_wait, base * (2.0 ** (_RECONNECT_CONSECUTIVE - 1)))
+        ladder = _reconnect_backoff_ladder()
+        idx = min(len(ladder) - 1, _RECONNECT_CONSECUTIVE - 2)
+        wait_sec = min(max_wait, max(base, ladder[idx]))
     return float(wait_sec), verdict
 
 
@@ -372,6 +459,8 @@ def _run_forever_loop() -> None:
             with state._ws_state_lock:
                 state._ws_app = ws_app
 
+            start_trace.trace(6, ws_url=ws_url, ws_app=hex(id(ws_app)))
+
             logger.info(
                 "[push_stream] websocket callbacks wired open=%s message=%s error=%s close=%s",
                 callable(on_open),
@@ -381,7 +470,29 @@ def _run_forever_loop() -> None:
             )
 
             _conn_started = time.monotonic()
-            _run_vendor_forever(ws_app)
+            instance_id = register_ws_instance()
+            try:
+                active = active_ws_instance_count()
+                if active > 1:
+                    logger.error(
+                        "[push_stream][MULTI_WS_DETECTED] 同一プロセス内で websocket が %d 本走っている "
+                        "pid=%s ws_instance_id=%s receiver_thread_id=%s (kabu Station の PUSH は 1 接続のみ)",
+                        active, os.getpid(), instance_id, threading.get_ident(),
+                    )
+                _safe_set_runtime("push_ws_instance_id", instance_id)
+                _safe_set_runtime("active_ws_instance_count", active)
+                logger.info(
+                    "[push_stream] ws instance start ws_instance_id=%s active_ws_instance_count=%s "
+                    "receiver_thread_id=%s pid=%s",
+                    instance_id, active, threading.get_ident(), os.getpid(),
+                )
+                # 接続世代が変わったら 09/12 をもう一度出せるようにする。
+                start_trace.reset_once("conn:")
+                start_trace.trace(8, ws_instance_id=instance_id, active_ws=active, ws_url=ws_url)
+                _run_vendor_forever(ws_app)
+            finally:
+                unregister_ws_instance()
+                _safe_set_runtime("active_ws_instance_count", active_ws_instance_count())
 
         except Exception:
             logger.exception("[push_stream] run_forever crashed")
@@ -418,7 +529,7 @@ def _run_forever_loop() -> None:
         #     サーバ側の弾き (別セッションが購読を奪った等) を判定できるようにする。
         # ------------------------------------------------------------
         base = max(0.1, _env_float("PUSH_STREAM_RECONNECT_BACKOFF_BASE_SEC", RECONNECT_WAIT_SEC))
-        max_wait = max(base, _env_float("PUSH_STREAM_RECONNECT_BACKOFF_MAX_SEC", 30.0))
+        max_wait = max(base, _env_float("PUSH_STREAM_RECONNECT_BACKOFF_MAX_SEC", 15.0))
         min_healthy = max(0.0, _env_float("PUSH_STREAM_WS_MIN_HEALTHY_SEC", 60.0))
 
         uptime = -1.0
@@ -462,8 +573,19 @@ def start_push_stream(
     order_book_writer: Any = None,
     refresh_callable: Optional[Any] = None,
     enable_rotate: Optional[bool] = None,
-) -> None:
-    """PUSH WebSocket をバックグラウンド起動する。"""
+) -> Dict[str, Any]:
+    """PUSH WebSocket をバックグラウンド起動する。
+
+    戻り値 (2026-09-03 追加):
+        {"started": bool, "reason": str, ...}
+
+    旧実装は起動できなくても None を返して終わっていたため、
+    呼び出し側 (data_collectors.push_runtime) が
+    「例外が出なかった = 起動成功」と誤認し、
+    WebSocket が 1 本も無いまま heartbeat だけ出し続けていた
+    (2026-09-03 実測 pid=41016 / active_ws=0 / uptime 1186s)。
+    起動しなかった理由を必ず返す。
+    """
     with state._runtime_lock:
         if state._ws_thread is not None and state._ws_thread.is_alive():
             logger.info(
@@ -472,7 +594,68 @@ def start_push_stream(
                 bool(getattr(state, "_rotation_enabled", False)),
                 get_status(),
             )
-            return
+            return {"started": True, "reason": "already_running"}
+
+        # ------------------------------------------------------------
+        # role による所有権の指定 (ws_owner のファイルロックより前に効かせる)
+        #
+        # ws_owner.acquire_push_ws_owner() は「先に取った者勝ち」なので、
+        # main.py が先に起動すると main.py が PUSH を所有してしまい、
+        # PUSH DB writer を持つ push_receiver が締め出される。
+        # 所有してよい role は push_receiver だけ、と先に決める。
+        # silent skip にせず必ず WARNING を出す。
+        # ------------------------------------------------------------
+        from .ownership import is_push_owner, log_owner_banner, warn_non_owner_call
+
+        log_owner_banner()
+        role_owner, _role, _reason = is_push_owner()
+        if not role_owner:
+            warn_non_owner_call("start_push_stream")
+            start_trace.abort(
+                2, "role_not_push_receiver:%s" % _reason, resolved_role=_role,
+            )
+            try:
+                enable_rotation(False)
+            except Exception:
+                logger.debug("[push_stream] disable rotation for non-owner failed", exc_info=True)
+            _safe_set_runtime("push_ws_owner", False)
+            _safe_set_runtime("push_stream_running", False)
+            return {"started": False, "reason": "role_not_push_receiver:%s" % _reason, "role": _role}
+
+        owner_role = _resolve_ws_owner_role()
+        owner_ok, holder = acquire_push_ws_owner(owner_role)
+        if not owner_ok:
+            start_trace.abort(
+                2,
+                "ws_owner_lock_held_by_other_process",
+                holder_pid=holder.get("pid"),
+                holder_argv=holder.get("argv"),
+                holder_acquired_at=holder.get("acquired_at"),
+                holder_pid_alive=holder.get("pid_alive"),
+            )
+            logger.error(
+                "[push_stream][MULTI_WS_DETECTED] PUSH WebSocket の所有権を取得できなかったので "
+                "websocket も rotation も起動しない。"
+                "process_id=%s parent_pid=%s ws_owner_role=%s holder=%s "
+                "(kabu Station の PUSH は 1 セッション 1 接続。2 本張ると互いを切り合う)",
+                os.getpid(), _safe_ppid(), owner_role, holder,
+            )
+            try:
+                enable_rotation(False)
+            except Exception:
+                logger.debug("[push_stream] enable_rotation(False) failed", exc_info=True)
+            _safe_set_runtime("push_stream_running", False)
+            _safe_set_runtime("push_stream_ws_skipped_multi_owner", True)
+            _safe_set_runtime("push_ws_owner", False)
+            return {
+                "started": False,
+                "reason": "ws_owner_lock_held_by_other_process",
+                "holder": holder,
+            }
+
+        _safe_set_runtime("push_ws_owner", True)
+        _safe_set_runtime("push_ws_owner_role", owner_role)
+        start_trace.trace(2, owner_role=owner_role, lock_acquired=True)
 
         if ws_url:
             _safe_set_runtime("push_ws_url", ws_url)
@@ -501,9 +684,23 @@ def start_push_stream(
 
         if db_write_enabled:
             state._stream_writer = stream_writer if stream_writer is not None else _init_stream_writer()
+            start_trace.trace(
+                4,
+                writer_ready=state._stream_writer is not None,
+                writer_type=type(state._stream_writer).__name__,
+                injected=stream_writer is not None,
+            )
+            if state._stream_writer is None:
+                start_trace.abort(4, "stream_writer_init_returned_none")
         else:
             state._stream_writer = None
             _safe_set_runtime("push_stream_db_write_enabled", False)
+            start_trace.abort(
+                4,
+                "db_write_disabled",
+                force_memory_only=force_memory_only,
+                stream_writer_arg=repr(stream_writer),
+            )
             logger.warning("[push_stream] DB write disabled; WebSocket updates memory df/latest cache only")
 
         if order_book_write_enabled:
@@ -531,13 +728,54 @@ def start_push_stream(
         )
 
         if db_write_enabled:
-            _start_thread_if_needed(attr_name="_flush_thread", target=_flush_worker, name="push-flush-worker")
+            _flush_th = _start_thread_if_needed(
+                attr_name="_flush_thread", target=_flush_worker, name="push-flush-worker"
+            )
+            start_trace.trace(
+                5,
+                flush_thread_alive=bool(_flush_th is not None and _flush_th.is_alive()),
+                flush_thread_id=getattr(_flush_th, "ident", None),
+            )
         else:
             state._flush_thread = None
             _safe_set_runtime("push_writer_running", False)
+            start_trace.abort(5, "db_write_disabled_no_flush_worker")
             logger.warning("[push_stream] flush worker not started because db_write_enabled=False")
 
         _start_thread_if_needed(attr_name="_monitor_thread", target=_monitor_worker, name="push-monitor-worker")
+
+        # 2026-09-02 P0: global_data.push_df 同期を WS 読み取りスレッドから外す。
+        # memory_only (main.py) でも必要なので db_write_enabled とは無関係に起動する。
+        try:
+            from .runtime import _global_sync_worker
+
+            _start_thread_if_needed(
+                attr_name="_gsync_thread", target=_global_sync_worker, name="push-global-sync"
+            )
+        except Exception:
+            logger.exception("[push_stream] global sync worker start failed")
+
+        # PUSH -> WS -> queue -> writer -> DB -> feeder -> Summary を 1 行で出す。
+        try:
+            from trading.push.push_pipeline_probe import start_pipeline_probe
+
+            start_pipeline_probe()
+        except Exception:
+            logger.exception("[push_stream] pipeline probe start failed")
+
+        if rotation_enabled and not is_push_ws_owner():
+            elsewhere, holder = owned_elsewhere()
+            logger.error(
+                "[push_stream][MULTI_WS_DETECTED] rotation worker を起動しない: "
+                "このプロセスは PUSH WebSocket の所有者ではない pid=%s owned_elsewhere=%s holder=%s "
+                "(register/unregister は所有プロセスだけが行う)",
+                os.getpid(), elsewhere, holder,
+            )
+            try:
+                enable_rotation(False)
+            except Exception:
+                logger.debug("[push_stream] enable_rotation(False) failed", exc_info=True)
+            rotation_enabled = False
 
         if rotation_enabled:
             _start_thread_if_needed(attr_name="_rotate_thread", target=_rotation_worker, name="push-rotation-worker")
@@ -545,7 +783,16 @@ def start_push_stream(
             state._rotate_thread = None
             logger.warning("[push_stream] rotation worker not started because rotation_enabled=False")
 
-        _start_thread_if_needed(attr_name="_ws_thread", target=_run_forever_loop, name="push-ws-thread")
+        ws_th = _start_thread_if_needed(
+            attr_name="_ws_thread", target=_run_forever_loop, name="push-ws-thread"
+        )
+        start_trace.trace(
+            7,
+            ws_thread_id=getattr(ws_th, "ident", None),
+            ws_thread_alive=bool(ws_th is not None and ws_th.is_alive()),
+            rotation_enabled=rotation_enabled,
+            db_write=db_write_enabled,
+        )
         _sync_runtime_status_after_start()
 
         logger.info(
@@ -556,6 +803,36 @@ def start_push_stream(
             db_write_enabled,
             force_memory_only,
         )
+
+        ws_thread = getattr(state, "_ws_thread", None)
+        snapshot = ownership_snapshot(owner_role)
+        logger.warning(
+            "[push_stream][WS OWNERSHIP] process_id=%s parent_pid=%s ws_owner_role=%s is_ws_owner=%s "
+            "connection_generation=%s ws_instance_id=%s receiver_thread_id=%s receiver_thread_alive=%s "
+            "active_ws_instance_count=%s lock_path=%s rotation_enabled=%s",
+            snapshot.get("process_id"),
+            snapshot.get("parent_pid"),
+            snapshot.get("ws_owner_role"),
+            snapshot.get("is_ws_owner"),
+            snapshot.get("connection_generation"),
+            _safe_get_runtime("push_ws_instance_id", None),
+            getattr(ws_thread, "ident", None),
+            bool(ws_thread is not None and ws_thread.is_alive()),
+            snapshot.get("active_ws_instance_count"),
+            snapshot.get("lock_path"),
+            bool(getattr(state, "_rotation_enabled", False)),
+        )
+
+        return {
+            "started": bool(ws_thread is not None and ws_thread.is_alive()),
+            "reason": "ok",
+            "ws_thread_alive": bool(ws_thread is not None and ws_thread.is_alive()),
+            "flush_thread_alive": bool(state._flush_thread is not None and state._flush_thread.is_alive()),
+            "writer_ready": state._stream_writer is not None,
+            "rotation_enabled": bool(getattr(state, "_rotation_enabled", False)),
+            "db_write": bool(db_write_enabled),
+            "memory_only": bool(force_memory_only),
+        }
 
 
 def stop_push_stream(wait: float = 5.0) -> None:
@@ -570,7 +847,7 @@ def stop_push_stream(wait: float = 5.0) -> None:
             logger.exception("[push_stream] ws close failed")
 
         started = time.time()
-        for th in [state._ws_thread, state._flush_thread, state._monitor_thread, state._rotate_thread]:
+        for th in [state._ws_thread, state._flush_thread, state._monitor_thread, state._rotate_thread, getattr(state, '_gsync_thread', None)]:
             try:
                 if th is not None and th.is_alive():
                     remain = max(0.1, wait - (time.time() - started))
@@ -612,6 +889,62 @@ def get_status() -> Dict[str, Any]:
     }
 
 
+_LAST_RECONNECT_REQUEST_AT = 0.0
+_RECONNECT_REQUEST_LOCK = threading.Lock()
+
+
+def request_reconnect(*, reason: str = "", min_interval_sec: float = 60.0) -> bool:
+    """現在の WebSocket を 1 回だけ閉じて、run loop に張り直させる。
+
+    新しい接続をここで作らない。閉じるだけで _run_forever_loop が
+    バックオフ付きで再接続する (二重 WS を作らないための唯一の作法)。
+
+    連打防止:
+      min_interval_sec 以内の再要求は False を返して何もしない。
+      PUSH 停滞のたびに close を撃つと、kabu Station 側から見て
+      短時間に何度も切断・再接続する形になり、状況を悪くする。
+    """
+    global _LAST_RECONNECT_REQUEST_AT
+
+    if state._ws_thread is None or not getattr(state._ws_thread, "is_alive", lambda: False)():
+        logger.warning("[push_stream] reconnect 要求を無視: push_stream の run loop が動いていない reason=%s", reason)
+        return False
+
+    now = time.monotonic()
+    with _RECONNECT_REQUEST_LOCK:
+        if (now - _LAST_RECONNECT_REQUEST_AT) < float(min_interval_sec):
+            logger.warning(
+                "[push_stream] reconnect 要求を無視: %ss 以内に要求済み reason=%s (連打しない)",
+                min_interval_sec, reason,
+            )
+            return False
+        _LAST_RECONNECT_REQUEST_AT = now
+
+    with state._ws_state_lock:
+        ws_app = state._ws_app
+
+    if ws_app is None:
+        logger.warning("[push_stream] reconnect 要求: ws_app が無い (再接続待ち中) reason=%s", reason)
+        return False
+
+    logger.error(
+        "[push_stream] reconnect 要求を受け付けた reason=%s -> 現接続を閉じて run loop に張り直させる "
+        "(新規接続はここで作らない。二重 WS を避けるため)",
+        reason,
+    )
+    try:
+        ws_app.close()
+        return True
+    except Exception:
+        logger.exception("[push_stream] reconnect 要求の close に失敗 reason=%s", reason)
+        return False
+
+
+def reset_reconnect_request_for_test() -> None:
+    global _LAST_RECONNECT_REQUEST_AT
+    _LAST_RECONNECT_REQUEST_AT = 0.0
+
+
 def start(*args: Any, **kwargs: Any) -> None:
     return start_push_stream(*args, **kwargs)
 
@@ -620,4 +953,5 @@ def run_background(*args: Any, **kwargs: Any) -> None:
     return start_push_stream(*args, **kwargs)
 
 
-__all__ = ["start_push_stream", "stop_push_stream", "get_status", "start", "run_background"]
+__all__ = ["start_push_stream", "stop_push_stream", "get_status", "start", "run_background",
+           "request_reconnect", "reset_reconnect_request_for_test"]

@@ -163,6 +163,64 @@ class GlobalDataCompat(_LegacyGlobalData):
             return True
         return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
 
+    # ------------------------------------------------------------
+    # push_df の時刻正準形: tz-naive の JST 実時刻
+    # ------------------------------------------------------------
+    # このシステムは push 系の時刻を全て「tz を外した JST の壁時計」で
+    # 持つことに揃えている:
+    #   websocket_handlers.dataframe_manager.make_tz_naive()
+    #       WS 経路。tz_convert("Asia/Tokyo") -> tz_localize(None)
+    #   scheduler_jobs.summary.memory_latest_1m._safe_dt_series()
+    #       PUSH DB 経路。同じ変換
+    #   PUSH DB stream_data_raw.received_at
+    #       naive の ISO 文字列
+    #
+    # ところが同じ表の datetime 列だけは +09:00 付きで保存されている
+    # (実測: datetime='2026-08-31T11:02:17.437863+09:00' /
+    #        received_at='2026-08-31T11:02:17.437863')。
+    # pd.to_datetime はこれを datetime64[us, UTC+09:00] にするので、
+    # ここで tz を落とさずに返すと
+    #   WS 由来の cur_latest = tz-naive
+    #   PUSH DB 由来の new_latest = tz-aware
+    # となり、下の比較が
+    #   TypeError: Cannot compare tz-naive and tz-aware timestamps
+    # で落ちる (実際に [SUMMARY MAIN PUSH DF WRITEBACK] failed rows=5981)。
+    #
+    # setter は push_df の唯一の入口なので、書き手が誰であっても
+    # ここで正準形へ寄せる。+09:00 は JST 表記なので Asia/Tokyo へ
+    # 変換してから tz を外せば壁時計の値は変わらない。
+    # ------------------------------------------------------------
+
+    @staticmethod
+    def _to_naive_jst(ts) -> Any:
+        """tz 付き Timestamp を JST の tz-naive に寄せる。naive はそのまま。"""
+        if ts is None:
+            return None
+        try:
+            if getattr(ts, "tzinfo", None) is not None:
+                return ts.tz_convert("Asia/Tokyo").tz_localize(None)
+        except Exception:
+            try:
+                return ts.tz_localize(None)
+            except Exception:
+                return ts
+        return ts
+
+    @staticmethod
+    def _naive_jst_series(values) -> Any:
+        """列を丸ごと JST の tz-naive へ寄せる (混在オフセットも吸収する)。"""
+        s = pd.to_datetime(values, errors="coerce")
+        try:
+            if getattr(s.dt, "tz", None) is not None:
+                return s.dt.tz_convert("Asia/Tokyo").dt.tz_localize(None)
+            return s
+        except Exception:
+            # object dtype (行ごとにオフセットが違う) の場合は要素単位で寄せる。
+            try:
+                return s.map(GlobalDataCompat._to_naive_jst)
+            except Exception:
+                return s
+
     @staticmethod
     def _push_df_latest(df) -> Any:
         try:
@@ -170,9 +228,9 @@ class GlobalDataCompat(_LegacyGlobalData):
                 return None
             for col in ("datetime", "received_at", "time"):
                 if col in df.columns:
-                    ts = pd.to_datetime(df[col], errors="coerce").max()
+                    ts = GlobalDataCompat._naive_jst_series(df[col]).max()
                     if not pd.isna(ts):
-                        return ts
+                        return GlobalDataCompat._to_naive_jst(ts)
             return None
         except Exception:
             return None

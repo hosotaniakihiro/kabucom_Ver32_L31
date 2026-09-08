@@ -13,6 +13,8 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import threading
+import time
 from typing import Any, Optional
 
 import pandas as pd
@@ -168,7 +170,7 @@ def _normalize_time_column(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def merge_push_db_and_runtime_df(db_df: Any, runtime_df: Any) -> pd.DataFrame:
+def merge_push_db_and_runtime_df(db_df: Any, runtime_df: Any, *, left_normalized: bool = False) -> pd.DataFrame:
     """
     DB復元済みPUSH df と WebSocket受信中PUSH df をマージする。
 
@@ -179,7 +181,13 @@ def merge_push_db_and_runtime_df(db_df: Any, runtime_df: Any) -> pd.DataFrame:
       - 価格列がある場合は symbol + datetime + price 系でも補助的に安定化
       - 最後は時刻順に並べ、メモリ保護で末尾だけ残す
     """
-    left = _normalize_time_column(_normalize_symbol_column(_as_dataframe(db_df)))
+    # left_normalized=True は「left は前回この関数が返したもの (正規化済み)」の意味。
+    # 2026-09-02 実測: 20,000 行で 1 回 5.484s -> 増分マージで 0.2s 台。
+    # 旧実装は毎回 left/right 双方に copy + 全行 regex + to_datetime をかけていた。
+    if left_normalized and isinstance(db_df, pd.DataFrame):
+        left = db_df
+    else:
+        left = _normalize_time_column(_normalize_symbol_column(_as_dataframe(db_df)))
     right = _normalize_time_column(_normalize_symbol_column(_as_dataframe(runtime_df)))
 
     frames = [x for x in (left, right) if isinstance(x, pd.DataFrame) and not x.empty]
@@ -227,7 +235,103 @@ def merge_push_db_and_runtime_df(db_df: Any, runtime_df: Any) -> pd.DataFrame:
     return merged.reset_index(drop=True)
 
 
-def _sync_push_df_to_global() -> None:
+# ============================================================
+# global_data.push_df 同期
+# ------------------------------------------------------------
+# 2026-09-02 P0: 旧実装はこの関数を on_message から **1 tick ごと** に
+# 呼んでいた。中身は最大 10 万行に対する copy 8 回 + regex 2 回 +
+# sort 2 回 + drop_duplicates で、tick あたりのコストが行数に比例する。
+# その結果 WS 読み取りスレッドが詰まり kabu Station に切断され続けた。
+#
+# Ver2.0 では
+#   - on_message からは呼ばない (dataframe._append_df は deque へ積むだけ)
+#   - 専用スレッドが seq の変化を見て間引いて呼ぶ
+#   - 1 回の同期が interval より長引いたら interval を自動で伸ばす
+# とする。閾値・stale 判定・fail-closed には触れていない。
+# ============================================================
+
+_GSYNC_LOCK = threading.Lock()
+
+
+def _gsync_interval_sec() -> float:
+    try:
+        return max(0.2, float(os.environ.get("PUSH_STREAM_GLOBAL_SYNC_INTERVAL_SEC", "2.0")))
+    except Exception:
+        return 2.0
+
+
+def _gsync_max_interval_sec() -> float:
+    try:
+        return max(1.0, float(os.environ.get("PUSH_STREAM_GLOBAL_SYNC_MAX_INTERVAL_SEC", "15.0")))
+    except Exception:
+        return 15.0
+
+
+def push_global_sync_stats() -> dict:
+    """診断用。E2E 1 行ログが読む。"""
+    try:
+        return {
+            "rows": len(state._push_rows),
+            "seq": int(state._push_rows_seq),
+            "synced_seq": int(state._gsync_last_seq),
+            "last_sync_age": None if state._gsync_last_at <= 0 else round(time.monotonic() - state._gsync_last_at, 2),
+            "last_sync_elapsed": round(float(state._gsync_last_elapsed), 3),
+            "thread_alive": bool(state._gsync_thread is not None and state._gsync_thread.is_alive()),
+        }
+    except Exception:
+        return {}
+
+
+def _global_sync_worker() -> None:
+    """global_data.push_df を間引いて更新する。WS スレッドは絶対に待たせない。"""
+    logger.info("[push_stream] global sync worker started interval=%.2fs", _gsync_interval_sec())
+    interval = _gsync_interval_sec()
+    while not state._stop_event.is_set():
+        try:
+            state._stop_event.wait(interval)
+            if state._stop_event.is_set():
+                break
+            with state._df_lock:
+                seq = int(state._push_rows_seq)
+            if seq == state._gsync_last_seq:
+                continue
+            t0 = time.perf_counter()
+            _sync_push_df_to_global(reason="worker")
+            el = time.perf_counter() - t0
+            state._gsync_last_seq = seq
+            state._gsync_last_at = time.monotonic()
+            state._gsync_last_elapsed = el
+            base = _gsync_interval_sec()
+            # 1 回の同期が interval を超えるほど重いなら間引きを強める。
+            want = base if el <= base else min(_gsync_max_interval_sec(), max(base, el * 2.0))
+            if abs(want - interval) > 0.05:
+                logger.warning(
+                    "[push_stream] global sync interval %.2fs -> %.2fs (last sync %.3fs, rows=%d) "
+                    "(同期が重いので間引く。WS 受信は止めない)",
+                    interval, want, el, len(state._push_rows),
+                )
+                interval = want
+        except Exception:
+            logger.exception("[push_stream] global sync worker loop failed")
+            state._stop_event.wait(1.0)
+    logger.info("[push_stream] global sync worker stopped")
+
+
+def _sync_push_df_to_global(reason: str = "") -> None:
+    if not _GSYNC_LOCK.acquire(blocking=False):
+        # 前回の同期がまだ走っている。重ねて回さない。
+        logger.debug("[push_stream] global sync already running; skip reason=%s", reason)
+        return
+    try:
+        _sync_push_df_to_global_inner()
+    finally:
+        try:
+            _GSYNC_LOCK.release()
+        except Exception:
+            pass
+
+
+def _sync_push_df_to_global_inner() -> None:
     try:
         if global_data is None:
             return
@@ -238,16 +342,45 @@ def _sync_push_df_to_global() -> None:
             return
 
         with state._df_lock:
-            runtime_df = state._push_df.copy() if isinstance(state._push_df, pd.DataFrame) else pd.DataFrame()
+            seq = int(state._push_rows_seq)
+            rows = list(state._push_rows)
 
-        try:
-            getter = getattr(global_data, "get_push_df", None)
-            existing_df = getter() if callable(getter) else getattr(global_data, "push_df", pd.DataFrame())
-        except Exception:
-            existing_df = getattr(global_data, "push_df", pd.DataFrame())
+        # ---- 増分マージの可否判定 ----
+        # get_push_df() は実装によって copy() を返すので同一性判定に使えない。
+        # 素の属性 global_data.push_df は前回 setattr したオブジェクトそのものなので、
+        # これが前回の出力と同一なら「誰も外から差し替えていない」と断定できる。
+        # 同一でなければ従来どおり全体を作り直す (取りこぼしを作らない)。
+        raw_attr = getattr(global_data, "push_df", None)
+        incremental = (
+            state._gsync_last_out is not None
+            and raw_attr is state._gsync_last_out
+            and state._gsync_merged_upto_seq >= 0
+            and seq >= state._gsync_merged_upto_seq
+        )
+        if incremental:
+            existing_df = state._gsync_last_out
+        else:
+            try:
+                getter = getattr(global_data, "get_push_df", None)
+                existing_df = getter() if callable(getter) else raw_attr
+            except Exception:
+                existing_df = raw_attr
+            if existing_df is None:
+                existing_df = pd.DataFrame()
+        if incremental:
+            n_new = min(len(rows), seq - state._gsync_merged_upto_seq)
+            if n_new <= 0:
+                return
+            runtime_df = pd.DataFrame(rows[-n_new:])
+        else:
+            runtime_df = pd.DataFrame(rows) if rows else pd.DataFrame()
 
-        merged = merge_push_db_and_runtime_df(existing_df, runtime_df)
+        merged = merge_push_db_and_runtime_df(
+            existing_df, runtime_df, left_normalized=incremental
+        )
         setter(merged)
+        state._gsync_last_out = merged
+        state._gsync_merged_upto_seq = seq
 
         # 旧コード互換: global_data.push_df 直参照にも同じものを置く。
         try:
@@ -278,4 +411,6 @@ __all__ = [
     "_ensure_runtime_flags",
     "merge_push_db_and_runtime_df",
     "_sync_push_df_to_global",
+    "_global_sync_worker",
+    "push_global_sync_stats",
 ]

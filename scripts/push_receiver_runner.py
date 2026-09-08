@@ -1,6 +1,27 @@
 # ============================================================
 # File   : scripts/push_receiver_runner.py
 # Version: DATA-COLLECTORS-PUSH-RECEIVER-RUNNER-V4-START-PUSH-STORAGE
+# ------------------------------------------------------------
+# PUSH パイプラインの所有関係 (2026-09-03 整理)
+#
+#   このプロセス (role=push_receiver) だけが以下すべてを所有する。
+#   分割して別プロセスに持たせない。
+#
+#     WebSocket 接続        trading/push/push_stream/runner._run_forever_loop
+#                           -> state._ws_thread (1 本のみ / ws_owner ロックで排他)
+#     receive queue         state._push_queue   (on_message が put)
+#     tick リング           state._push_rows    (メモリ df の材料)
+#     flush worker          state._flush_thread (queue -> StreamDBWriter)
+#     PUSH DB writer        trading/push/push_db_writer.stream_writer (singleton)
+#                           -> state._stream_writer に **同じ実体** を注入する
+#
+#   注意:
+#     push_db_writer.stream_writer (モジュール singleton) が start 済みでも、
+#     state._stream_writer が None なら flush は 1 行も進まない。
+#     health の writer_ready=False はこの state 側を見ている。
+#     2026-09-03 の障害では runner が ws_owner ロックを取れずに
+#     途中 return したため、singleton は起動済みなのに
+#     state._stream_writer / _flush_thread が未設定のままだった。
 # ============================================================
 
 from __future__ import annotations
