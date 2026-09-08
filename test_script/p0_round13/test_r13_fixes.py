@@ -35,9 +35,21 @@ os.environ["ALLOW_ORDERS"] = "0"
 RESULTS: list = []
 
 
+SKIPPED: list = []
+
+
 def check(name: str, ok: bool, detail: str = "") -> None:
     RESULTS.append((name, bool(ok), detail))
     print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f"  -- {detail}" if detail else ""))
+
+
+def skip(name: str, reason: str) -> None:
+    """環境依存で判定できない項目。PASS/FAIL のどちらにも数えない。
+
+    黙って PASS にすると本物の回帰を見逃すので、理由付きで別枠に出す。
+    """
+    SKIPPED.append((name, reason))
+    print(f"[SKIP] {name}  -- {reason}")
 
 
 def section(t: str) -> None:
@@ -281,7 +293,20 @@ def test_no_sync_heavy_fallback() -> None:
     check("空を返す (既存 merged を潰さない / Entry は fresh 無しで fail-closed)",
           isinstance(out, pd.DataFrame) and out.empty, f"rows={len(out)}")
     heavy_started.wait(3)
-    check("heavy rebuild は background で走っている", heavy_started.is_set())
+    # R18: 場後は fresh input が無く、tier1 の前に
+    # `_fresh_input_hopeless()` が MISS を返すため heavy bg へ到達しない
+    # (第14ラウンド P0-6 の設計どおり)。環境依存なので SKIP にする。
+    stale_reason = ""
+    try:
+        stale_reason = rc._fresh_input_hopeless(dt.datetime.now()) or ""
+    except Exception as e:
+        stale_reason = ""
+        print(f"  (fresh input 判定に失敗: {type(e).__name__}: {e})")
+    if stale_reason and not heavy_started.is_set():
+        skip("heavy rebuild は background で走っている",
+             f"fresh input が無く tier1 前に MISS するため場中のみ判定可能 reason={stale_reason}")
+    else:
+        check("heavy rebuild は background で走っている", heavy_started.is_set())
 
     st = rc.fast_path_stats()
     check("FAST_PATH の miss が計上される", st["misses"] >= 1, str(st))
@@ -511,7 +536,10 @@ def main() -> int:
     section("SUMMARY")
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     failed = [n for n, ok, _ in RESULTS if not ok]
-    print(f"total={len(RESULTS)} passed={passed} failed={len(failed)}")
+    print(f"total={len(RESULTS)} passed={passed} failed={len(failed)}"
+          + (f" skipped={len(SKIPPED)}" if SKIPPED else ""))
+    for nm, why in SKIPPED:
+        print(f"  SKIPPED: {nm}  -- {why}")
     for n in failed:
         print("  FAILED:", n)
     return 0 if not failed else 1

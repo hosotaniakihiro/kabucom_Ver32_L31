@@ -18,8 +18,19 @@ S = r"W:/BUSINESS/事業/04_株式自動売買システム/ソースコード"
 sys.path.insert(0, S)
 
 import kabu_api.positions as P                      # noqa: E402
+import trading.position.position_state_service as PSS   # noqa: E402
 import trading.summary.position_filter as PF        # noqa: E402
 from global_state import global_data                # noqa: E402
+
+# ここで見たいのは「認証ゲート」だけ。
+# can_entry_symbol には建玉状態ゲート (POSITIONS_UNKNOWN) も入っているので、
+# 実機の kabu Station / positions.db に結果が左右されないよう
+# 「DB も broker も正常・建玉なし」に固定する。
+# 建玉状態ゲート自体は test_script/p0_round19/test_r19_rest_overload.py で検証する。
+os.environ["POSITION_STATE_CACHE_TTL_SEC"] = "0.01"
+PSS._read_db_positions_raising = lambda: {}
+PSS._read_broker_positions = lambda: ({}, True, "")
+PSS.reset_for_test()
 
 results = []
 

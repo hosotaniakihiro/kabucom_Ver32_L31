@@ -27,6 +27,16 @@ class _Resp:
 def run():
     import kabu_api.positions as P
     import requests
+    from kabu_api import positions_read_cache as PRC
+
+    def _reset_shared_read_cache():
+        """/positions の共有 read キャッシュ (singleflight + TTL) を空にする。
+
+        2026-09-01 に実 GET を kabu_api.positions_read_cache へ集約したため、
+        シナリオごとに旧 _POS_CACHE だけでなくこちらも戻さないと、
+        直前シナリオの応答が TTL 内で返ってしまう。
+        """
+        PRC.reset_for_test()
 
     # token を通す
     from global_state import global_data
@@ -35,6 +45,7 @@ def run():
     results = []
 
     def scenario(name, responses, expect_healthy, expect_failure):
+        _reset_shared_read_cache()
         P._POS_CACHE = None
         P._POS_CACHE_TIME = 0.0
         P._POS_FETCH_HEALTHY = True
@@ -59,6 +70,7 @@ def run():
     scenario("429 (キャッシュ無し)", [_Resp(429)], False, "rate_limited_no_cache")
 
     def scenario_with_cache(name, responses, expect_healthy, expect_failure):
+        _reset_shared_read_cache()
         P._POS_CACHE = [{"Symbol": "9984"}]
         P._POS_CACHE_TIME = 0.0
         P._POS_FETCH_HEALTHY = True
@@ -78,6 +90,7 @@ def run():
 
     print()
     print("★ 重要: 401 と「建玉ゼロ」の区別")
+    _reset_shared_read_cache()
     P._POS_CACHE = None
     P._POS_FETCH_HEALTHY = True
     P._POS_LAST_FAILURE = ""
@@ -85,6 +98,7 @@ def run():
     a = P._get_positions_impl()
     print("  建玉ゼロ : ret=%s  healthy=%s" % (a, P.positions_fetch_healthy()))
 
+    _reset_shared_read_cache()
     P._POS_CACHE = None
     P._POS_CACHE_TIME = 0.0
     P._POS_FETCH_HEALTHY = True
@@ -98,6 +112,7 @@ def run():
 
     print()
     print("=== 例外を投げないという既存契約 ===")
+    _reset_shared_read_cache()
     P._POS_CACHE = None
     requests.get = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
     try:
